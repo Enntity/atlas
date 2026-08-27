@@ -71,6 +71,20 @@ fn render_holo_template(messages: &[serde_json::Value], enable_thinking: bool) -
 }
 
 #[test]
+fn chat_templates_support_loop_controls() {
+    let env = super::jinja_helpers::build_jinja_env(
+        "{% for item in items %}{{ item }}{% break %}{% endfor %}",
+    )
+    .expect("Hugging Face templates using break must compile");
+    let rendered = env
+        .get_template("chat")
+        .unwrap()
+        .render(minijinja::context! { items => ["first", "second"] })
+        .expect("loop-control template renders");
+    assert_eq!(rendered, "first");
+}
+
+#[test]
 fn normalize_tool_call_arguments_parses_string_to_dict() {
     // The shape opencode sends back on the second turn: assistant
     // message with tool_calls whose function.arguments is a JSON
