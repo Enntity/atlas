@@ -58,8 +58,13 @@ request at 1,016 total tokens. Use a 2,048-token launch before increasing the
 decode sample to 128 tokens.
 
 The first dual-Spark validation produced 11.407 seconds time-to-first-token
-(87.66 prompt tokens/s) and 4.15 decode tokens/s. This is a bring-up receipt,
-not an optimized performance claim.
+(87.66 prompt tokens/s) and 4.15 decode tokens/s. Profiling showed that KDA
+layers were sending single-token MoE work through the prefill dispatcher. After
+routing decode through Atlas's single-token MoE path, the same safe launch and
+1,000-token prompt produced 5.873 seconds time-to-first-token (170.26 prompt
+tokens/s) and 9.42 decode tokens/s. A separate 100-token, 64-output-token run
+repeated at 9.52 decode tokens/s. These are bring-up receipts from two DGX
+Sparks, not general performance claims.
 
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model

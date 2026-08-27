@@ -498,7 +498,7 @@ impl Qwen3AttentionLayer {
         let comb = ctx.buffers.hc_comb();
         let diag_all =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
-        let diag_this = self.attn_layer_idx == 0 || diag_all;
+        let diag_this = diag_all;
 
         if is_first_layer {
             ops::hc_expand(

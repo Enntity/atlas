@@ -438,7 +438,7 @@ impl Qwen3AttentionLayer {
         let comb = ctx.buffers.hc_comb();
         let diag_all =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
-        let diag_this = self.attn_layer_idx == 0 || diag_all;
+        let diag_this = diag_all;
 
         // 1. Expand single-stream embedding into hc_mult copies on first layer.
         if is_first_layer {

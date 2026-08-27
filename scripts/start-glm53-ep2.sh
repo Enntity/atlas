@@ -23,6 +23,7 @@ MODEL_MOUNT="${MODEL_MOUNT:-}"
 CONTAINER_MEMORY="${CONTAINER_MEMORY:-114g}"
 NCCL_IFNAME="${NCCL_IFNAME:-enp1s0f1np1}"
 NCCL_HCA="${NCCL_HCA:-rocep1s0f1}"
+PROFILE="${PROFILE:-0}"
 
 if (( MAX_SEQ_LEN > 2048 )); then
   echo "ERROR: initial GLM-5.3 Atlas support is capped at 2048 tokens." >&2
@@ -91,6 +92,9 @@ COMMON_SERVE_ARGS=(
   --kv-cache-dtype bf16
   --oom-guard-mb "$OOM_GUARD_MB"
 )
+if [[ "$PROFILE" == "1" ]]; then
+  COMMON_SERVE_ARGS+=(--profile)
+fi
 
 echo "Atlas GLM-5.3 dual-Spark safe bring-up"
 echo "  model: $MODEL"
@@ -99,6 +103,7 @@ echo "  context/concurrency: $MAX_SEQ_LEN / 1"
 echo "  GPU budget: $GPU_MEM_UTIL; OOM guard: ${OOM_GUARD_MB} MiB"
 echo "  container memory ceiling: $CONTAINER_MEMORY"
 echo "  NCCL: $NCCL_IFNAME / $NCCL_HCA"
+echo "  profiler: $PROFILE"
 
 # Never leave one stale rank in an old communicator.
 docker rm -f atlas-glm53-ep0 2>/dev/null || true

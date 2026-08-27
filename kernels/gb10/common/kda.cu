@@ -48,7 +48,11 @@ extern "C" __global__ void kda_recurrent_bf16(
     __shared__ float inv_k;
     __shared__ float beta;
 
-    float* row = state + ((unsigned long long)head * dim + vrow) * dim;
+    // H is [key_dim, value_dim], with value_dim contiguous. Each thread owns
+    // one value column, so every warp reads and writes adjacent FP32 elements.
+    // The original [value_dim, key_dim] traversal issued one 32-byte memory
+    // transaction per lane for every state access on decode.
+    float* H = state + (unsigned long long)head * dim * dim;
     const float a = expf(a_log[head]);
     const float scale = rsqrtf((float)dim);
 
@@ -86,19 +90,35 @@ extern "C" __global__ void kda_recurrent_bf16(
 
         if (vrow < dim) {
             float dot_k = 0.0f;
-            for (unsigned int k = 0; k < dim; ++k) {
-                float s = row[k] * gate_exp[k];
-                row[k] = s;
-                dot_k += s * (kv[k] * inv_k);
+            #pragma unroll 4
+            for (unsigned int k = 0; k < dim; k += 4) {
+                float h0 = H[(unsigned long long)(k + 0) * dim + vrow] * gate_exp[k + 0];
+                float h1 = H[(unsigned long long)(k + 1) * dim + vrow] * gate_exp[k + 1];
+                float h2 = H[(unsigned long long)(k + 2) * dim + vrow] * gate_exp[k + 2];
+                float h3 = H[(unsigned long long)(k + 3) * dim + vrow] * gate_exp[k + 3];
+                dot_k += h0 * (kv[k + 0] * inv_k) + h1 * (kv[k + 1] * inv_k)
+                       + h2 * (kv[k + 2] * inv_k) + h3 * (kv[k + 3] * inv_k);
             }
             const unsigned long long vbase = qbase + (unsigned long long)2 * heads * dim;
             float delta = ((float)qkv[vbase + (unsigned long long)head * dim + vrow]
                            - dot_k) * beta;
             float out = 0.0f;
-            for (unsigned int k = 0; k < dim; ++k) {
-                float s = row[k] + delta * (kv[k] * inv_k);
-                row[k] = s;
-                out += s * (qv[k] * inv_q);
+            #pragma unroll 4
+            for (unsigned int k = 0; k < dim; k += 4) {
+                float h0 = H[(unsigned long long)(k + 0) * dim + vrow] * gate_exp[k + 0]
+                         + delta * (kv[k + 0] * inv_k);
+                float h1 = H[(unsigned long long)(k + 1) * dim + vrow] * gate_exp[k + 1]
+                         + delta * (kv[k + 1] * inv_k);
+                float h2 = H[(unsigned long long)(k + 2) * dim + vrow] * gate_exp[k + 2]
+                         + delta * (kv[k + 2] * inv_k);
+                float h3 = H[(unsigned long long)(k + 3) * dim + vrow] * gate_exp[k + 3]
+                         + delta * (kv[k + 3] * inv_k);
+                H[(unsigned long long)(k + 0) * dim + vrow] = h0;
+                H[(unsigned long long)(k + 1) * dim + vrow] = h1;
+                H[(unsigned long long)(k + 2) * dim + vrow] = h2;
+                H[(unsigned long long)(k + 3) * dim + vrow] = h3;
+                out += h0 * (qv[k + 0] * inv_q) + h1 * (qv[k + 1] * inv_q)
+                     + h2 * (qv[k + 2] * inv_q) + h3 * (qv[k + 3] * inv_q);
             }
             output[((unsigned long long)t * heads + head) * dim + vrow] =
                 __float2bfloat16(out);

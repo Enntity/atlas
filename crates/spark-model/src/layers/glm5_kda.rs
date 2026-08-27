@@ -206,6 +206,7 @@ impl Glm5KdaLayer {
         hidden: DevicePtr,
         state: &mut dyn LayerState,
         tokens: usize,
+        decode: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -408,8 +409,13 @@ impl Glm5KdaLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
-        self.ffn.forward_prefill(normed, tokens, ctx, stream)?;
-        self.hc_post(ctx.buffers.moe_output(), m, ctx, stream)?;
+        let ffn_out = if decode {
+            self.ffn.forward(normed, ctx, stream)?
+        } else {
+            self.ffn.forward_prefill(normed, tokens, ctx, stream)?;
+            ctx.buffers.moe_output()
+        };
+        self.hc_post(ffn_out, m, ctx, stream)?;
 
         if self.layer_idx + 1 == ctx.config.num_hidden_layers {
             ops::hc_contract(
@@ -445,7 +451,7 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.forward_inner(hidden, state, 1, ctx, stream)
+        self.forward_inner(hidden, state, 1, true, ctx, stream)
     }
 
     fn prefill(
@@ -463,7 +469,7 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.forward_inner(hidden, state, num_tokens, ctx, stream)
+        self.forward_inner(hidden, state, num_tokens, false, ctx, stream)
     }
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
