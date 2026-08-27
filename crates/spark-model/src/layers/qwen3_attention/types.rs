@@ -27,6 +27,9 @@ pub struct Qwen3AttentionLayer {
     pub(super) post_attn_norm: DenseWeight,
     pub(super) ffn: FfnComponent,
     pub(super) attn_layer_idx: usize,
+    /// Absolute transformer block index; differs from the KV-layer index in
+    /// hybrid architectures such as GLM-5.
+    pub(super) block_idx: usize,
     /// Startup-static LoRA adapter overlay for the K/V/O projections (v0;
     /// q_proj excluded — gated Q+gate interleave). Installed
     /// post-construction via `set_lora_weights`; `None` = base-only.
@@ -111,6 +114,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) hc_expand_k: KernelHandle,
     /// HC `hc_head` kernel handle (NULL when HC disabled).
     pub(super) hc_head_k: KernelHandle,
+    /// Non-learned final mean contraction used by GLM-5 mHC.
+    pub(super) hc_contract_k: KernelHandle,
     // ── Transposed weights for prefill GEMM ──
     /// Fused [q|k|v] transposed twin (N = q_proj_dim + 2*kv_dim). Present only
     /// when the three projections share one `weight_scale_2` — the GEMM applies

@@ -431,8 +431,8 @@ impl Qwen3AttentionLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let hc = self.hc.as_ref().unwrap();
         let hc_mult = hc.hc_mult as u32;
-        let is_first_layer = self.attn_layer_idx == 0;
-        let is_last_layer = self.attn_layer_idx + 1 == ctx.config.num_hidden_layers;
+        let is_first_layer = self.block_idx == 0;
+        let is_last_layer = self.block_idx + 1 == ctx.config.num_hidden_layers;
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
@@ -557,22 +557,35 @@ impl Qwen3AttentionLayer {
                 hc_mult,
                 stream,
             )?;
-            if is_last_layer && let Some(ref head) = hc.head {
-                ops::hc_head(
-                    ctx.gpu,
-                    self.hc_head_k,
-                    hc_streams,
-                    head.hc_fn,
-                    head.hc_scale,
-                    head.hc_base,
-                    hidden,
-                    1,
-                    h as u32,
-                    hc_mult,
-                    eps,
-                    hc.hc_eps,
-                    stream,
-                )?;
+            if is_last_layer {
+                if let Some(ref head) = hc.head {
+                    ops::hc_head(
+                        ctx.gpu,
+                        self.hc_head_k,
+                        hc_streams,
+                        head.hc_fn,
+                        head.hc_scale,
+                        head.hc_base,
+                        hidden,
+                        1,
+                        h as u32,
+                        hc_mult,
+                        eps,
+                        hc.hc_eps,
+                        stream,
+                    )?;
+                } else if ctx.config.model_type == "glm5_next" {
+                    ops::hc_contract(
+                        ctx.gpu,
+                        self.hc_contract_k,
+                        hc_streams,
+                        hidden,
+                        1,
+                        h as u32,
+                        hc_mult,
+                        stream,
+                    )?;
+                }
             }
             return Ok(());
         }
@@ -742,6 +755,17 @@ impl Qwen3AttentionLayer {
                     &format!("V4-decode L{} hc_head", self.attn_layer_idx),
                 );
             }
+        } else if is_last_layer && ctx.config.model_type == "glm5_next" {
+            ops::hc_contract(
+                ctx.gpu,
+                self.hc_contract_k,
+                hc_streams,
+                hidden,
+                1,
+                h as u32,
+                hc_mult,
+                stream,
+            )?;
         } else if is_last_layer {
             tracing::warn!(
                 "V4-decode L{}: hc_head SKIPPED (no head weights)",

@@ -24,6 +24,7 @@ impl ModelConfig {
             linear_num_value_heads: 32,
             linear_value_head_dim: 128,
             linear_conv_kernel_dim: 4,
+            kda_gate_lower_bound: 0.0,
             num_experts: 512,
             num_experts_per_tok: 10,
             moe_intermediate_size: 512,

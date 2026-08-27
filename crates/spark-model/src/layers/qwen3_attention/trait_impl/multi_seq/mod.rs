@@ -130,8 +130,8 @@ impl Qwen3AttentionLayer {
         let n = c.n;
         let hc = self.hc.as_ref().unwrap();
         let hc_mult = hc.hc_mult as u32;
-        let is_first_layer = self.attn_layer_idx == 0;
-        let is_last_layer = self.attn_layer_idx + 1 == ctx.config.num_hidden_layers;
+        let is_first_layer = self.block_idx == 0;
+        let is_last_layer = self.block_idx + 1 == ctx.config.num_hidden_layers;
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();

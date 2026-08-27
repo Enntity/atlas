@@ -52,6 +52,22 @@ extern "C" __global__ void hc_expand(
     }
 }
 
+// GLM-5 has no learned HC head: contract the final residual highway by mean.
+extern "C" __global__ void hc_contract(
+    const float* __restrict__ streams,
+    __nv_bfloat16* __restrict__ hidden,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    const unsigned int t = blockIdx.x;
+    for (unsigned int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+        float sum = 0.0f;
+        const float* x = streams + (size_t)t * hc_mult * hidden_size + d;
+        for (unsigned int i = 0; i < hc_mult; ++i) sum += x[(size_t)i * hidden_size];
+        hidden[(size_t)t * hidden_size + d] = __float2bfloat16(sum / (float)hc_mult);
+    }
+}
+
 // ── hc_pre ──
 // streams [T, hc, H] -> y_out [T, H] (collapsed), post_out [T, hc],
 // comb_out [T, hc, hc].  Grid: (T,1,1)  Block: (256,1,1).

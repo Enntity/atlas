@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+pub fn kda_pack_qkv(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    planes: DevicePtr,
+    packed: DevicePtr,
+    tokens: u32,
+    dim: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(tokens * 3 * dim, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(planes)
+        .arg_ptr(packed)
+        .arg_u32(tokens)
+        .arg_u32(dim)
+        .launch(stream)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn kda_recurrent(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    qkv: DevicePtr,
+    raw_gate: DevicePtr,
+    raw_beta: DevicePtr,
+    a_log: DevicePtr,
+    dt_bias: DevicePtr,
+    state: DevicePtr,
+    output: DevicePtr,
+    tokens: u32,
+    heads: u32,
+    dim: u32,
+    lower_bound: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([heads, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(qkv)
+        .arg_ptr(raw_gate)
+        .arg_ptr(raw_beta)
+        .arg_ptr(a_log)
+        .arg_ptr(dt_bias)
+        .arg_ptr(state)
+        .arg_ptr(output)
+        .arg_u32(tokens)
+        .arg_u32(heads)
+        .arg_u32(dim)
+        .arg_f32(lower_bound)
+        .launch(stream)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn kda_sigmoid_gated_norm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate: DevicePtr,
+    weight: DevicePtr,
+    output: DevicePtr,
+    tokens: u32,
+    heads: u32,
+    dim: u32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([tokens * heads, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate)
+        .arg_ptr(weight)
+        .arg_ptr(output)
+        .arg_u32(heads)
+        .arg_u32(dim)
+        .arg_f32(eps)
+        .launch(stream)
+}

@@ -49,6 +49,12 @@ impl Qwen3AttentionLayer {
         self.hc = Some(hc);
     }
 
+    /// Set the absolute block index when attention layers are sparse in the
+    /// model schedule. KV-cache indexing remains `attn_layer_idx`.
+    pub fn set_block_idx(&mut self, block_idx: usize) {
+        self.block_idx = block_idx;
+    }
+
     /// Set per-layer dimension overrides for heterogeneous models (Gemma-4).
     /// Full-attention layers have different Q/KV head counts and head_dim
     /// than sliding layers.

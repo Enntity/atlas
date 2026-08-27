@@ -66,6 +66,11 @@ pub struct ModelConfig {
     /// 1D causal-conv kernel size on the SSM input (typically 3 or 4).
     #[serde(default = "default_conv_kernel")]
     pub linear_conv_kernel_dim: usize,
+    /// Bounded KDA decay-gate lower bound. `0.0` selects the regular GDN
+    /// `-exp(A) * softplus(.)` gate; GLM-5.3 sets `-5.0` and uses
+    /// `lower_bound * sigmoid(exp(A) * (. + dt_bias))` per key channel.
+    #[serde(default)]
+    pub kda_gate_lower_bound: f32,
 
     // ── MoE ──
     #[serde(default)]
@@ -588,8 +593,8 @@ pub use parsers::{
     parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{
-    parse_deepseek_v4, parse_gemma4_params, parse_laguna, parse_minimax_m2, parse_step3p7,
-    parse_vision_config,
+    parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_laguna, parse_minimax_m2,
+    parse_step3p7, parse_vision_config,
 };
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {

@@ -32,6 +32,27 @@ pub fn hc_expand(
         .launch(stream)
 }
 
+/// Average the final FP32 HC streams into the BF16 model hidden state.
+pub fn hc_contract(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    streams: DevicePtr,
+    hidden: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(streams)
+        .arg_ptr(hidden)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .launch(stream)
+}
+
 /// Collapse `hc_mult` streams to one (RMS-rescaled mix → sigmoid `pre`
 /// weighted sum) and emit `post` / `comb` (Sinkhorn) for the matching
 /// `hc_post`. One block per token.

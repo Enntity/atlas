@@ -11,7 +11,14 @@ use atlas_core::config::ModelConfig;
 use crate::cli;
 
 pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
-    if config.model_type == "minimax_m2" || config.model_type == "step3p7" {
+    if config.model_type == "glm5_next" {
+        // The EP loader has already removed the remote half of the routed
+        // experts. ModelOpt tensors are kept packed/zero-copy and the GLM
+        // loader deliberately omits transposed MoE copies, so the generic
+        // 1.30x NVFP4 estimate is not representative. Keep 5% for CUDA
+        // metadata and the few BF16 dense/shared weights quantized at load.
+        Some(1.05)
+    } else if config.model_type == "minimax_m2" || config.model_type == "step3p7" {
         Some(1.02)
     } else if config
         .quantization_config

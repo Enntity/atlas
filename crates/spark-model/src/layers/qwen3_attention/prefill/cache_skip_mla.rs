@@ -166,7 +166,7 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
         let k_rope_buf = ctx.buffers.ssm_ba();
-        if use_tc {
+        if mla_rope > 0 && use_tc {
             ops::dense_gemm_tc(
                 ctx.gpu,
                 self.dense_gemm_tc_k,
@@ -178,7 +178,7 @@ impl Qwen3AttentionLayer {
                 h,
                 stream,
             )?;
-        } else {
+        } else if mla_rope > 0 {
             ops::dense_gemm(
                 ctx.gpu,
                 self.dense_gemm_k,
@@ -192,37 +192,39 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
-        // Q rope extract → RoPE
+        // Q rope extract → RoPE. GLM-5 has a zero-width RoPE partition.
         let q_rope_tmp = ctx.buffers.ssm_conv_out_f32();
-        ops::mla_q_rope_extract_batched(
-            ctx.gpu,
-            self.mla_q_rope_extract_batched_k,
-            qg_out,
-            q_rope_tmp,
-            n,
-            nq,
-            hd,
-            mla_nope,
-            mla_rope,
-            nq * hd,
-            stream,
-        )?;
-        let rope_meta = ctx.attn_metadata.expect("MLA prefill requires metadata");
-        ops::rope_yarn(
-            ctx.gpu,
-            self.rope_yarn_k,
-            q_rope_tmp,
-            k_rope_buf,
-            rope_meta.positions,
-            n,
-            nq,
-            1,
-            mla_rope,
-            mla_rope,
-            mla.yarn_inv_freq,
-            ctx.config.rope_theta as f32,
-            stream,
-        )?;
+        if mla_rope > 0 {
+            ops::mla_q_rope_extract_batched(
+                ctx.gpu,
+                self.mla_q_rope_extract_batched_k,
+                qg_out,
+                q_rope_tmp,
+                n,
+                nq,
+                hd,
+                mla_nope,
+                mla_rope,
+                nq * hd,
+                stream,
+            )?;
+            let rope_meta = ctx.attn_metadata.expect("MLA prefill requires metadata");
+            ops::rope_yarn(
+                ctx.gpu,
+                self.rope_yarn_k,
+                q_rope_tmp,
+                k_rope_buf,
+                rope_meta.positions,
+                n,
+                nq,
+                1,
+                mla_rope,
+                mla_rope,
+                mla.yarn_inv_freq,
+                ctx.config.rope_theta as f32,
+                stream,
+            )?;
+        }
 
         let mla_cache_dim = kv_lora + mla_rope;
         // Cache assembly (needed for decode regardless of path)
@@ -291,19 +293,21 @@ impl Qwen3AttentionLayer {
             nkv * (mla_nope + mla_v_dim),
             stream,
         )?;
-        ops::mla_q_rope_writeback_batched(
-            ctx.gpu,
-            self.mla_q_rope_writeback_batched_k,
-            q_rope_tmp,
-            qg_out,
-            n,
-            nq,
-            hd,
-            mla_nope,
-            mla_rope,
-            nq * hd,
-            stream,
-        )?;
+        if mla_rope > 0 {
+            ops::mla_q_rope_writeback_batched(
+                ctx.gpu,
+                self.mla_q_rope_writeback_batched_k,
+                q_rope_tmp,
+                qg_out,
+                n,
+                nq,
+                hd,
+                mla_nope,
+                mla_rope,
+                nq * hd,
+                stream,
+            )?;
+        }
         let attn_out_fb = ctx.buffers.attn_output();
         ops::prefill_attention_64(
             ctx.gpu,

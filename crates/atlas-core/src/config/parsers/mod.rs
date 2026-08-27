@@ -5,6 +5,7 @@
 
 mod deepseek_v4;
 mod gemma4;
+mod glm5_next;
 mod laguna;
 mod lora;
 mod minimax;
@@ -15,6 +16,7 @@ mod vision;
 
 pub(crate) use deepseek_v4::parse_deepseek_v4;
 pub(crate) use gemma4::parse_gemma4_params;
+pub(crate) use glm5_next::parse_glm5_next;
 pub(crate) use laguna::parse_laguna;
 pub use lora::{PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_peft_adapter_config};
 pub(crate) use minimax::parse_minimax_m2;

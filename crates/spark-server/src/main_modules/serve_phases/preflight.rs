@@ -24,6 +24,24 @@ pub(crate) fn preflight_reserve(
     config: &ModelConfig,
     free_mem: usize,
 ) -> Result<ReservePreflight> {
+    if config.model_type == "glm5_next" {
+        anyhow::ensure!(
+            args.max_seq_len <= 2048,
+            "GLM-5 initial Atlas support is intentionally capped at --max-seq-len 2048: index_topk=2048 makes dense MLA exact only within this window"
+        );
+        anyhow::ensure!(
+            args.max_batch_size == 1 && args.max_num_seqs == 1,
+            "GLM-5 initial Atlas support requires --max-batch-size 1 --max-num-seqs 1"
+        );
+        anyhow::ensure!(
+            !(args.speculative || args.self_speculative || args.ngram_speculative),
+            "GLM-5 initial Atlas support does not support speculative decoding"
+        );
+        anyhow::ensure!(
+            args.world_size == 2 && args.tp_size == 1 && args.ep_size == 2,
+            "GLM-5 dual-Spark support requires --world-size 2 --tp-size 1 --ep-size 2"
+        );
+    }
     let h_state_bytes = config.ssm_h_state_bytes();
     let conv_state_bytes = config.ssm_conv_state_bytes();
     let spec_on_pool = args.speculative || args.self_speculative || args.ngram_speculative;
