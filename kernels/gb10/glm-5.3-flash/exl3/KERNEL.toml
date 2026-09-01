@@ -1,0 +1,30 @@
+[build]
+# The Mia checkpoint uses EXL3 only for routed expert matrices. All other GLM
+# paths in this target consume the checkpoint's native BF16/F32 tensors.
+# Future NVFP4 expert support belongs in a sibling `nvfp4` target, not behind a
+# quant compatibility exception.
+# ExLlamaV3 marks three explicitly-defaulted aggregate constructors
+# `__device__`; CUDA 13 emits diagnostic 20012 because that annotation is a
+# no-op. Keep the pinned vendor bytes intact and suppress only that diagnostic.
+extra_nvcc_flags = ["--fmad=false", "-diag-suppress=20012"]
+
+[modules]
+glm53_kda_decode = "glm53_kda"
+glm53_kda_verify_fused_conv_gate_norm = "glm53_kda"
+glm53_kda_verify_prepare = "glm53_kda_verify_tiled"
+glm53_kda_verify_recurrent_tiled = "glm53_kda_verify_tiled"
+glm53_kda_verify_norm = "glm53_kda_verify_tiled"
+glm53_kda_prefill = "glm53_kda_prefill"
+glm53_kda_projection = "glm53_kda_projection"
+glm53_dsa_index = "glm53_dsa"
+glm53_dsa_prefill = "glm53_dsa_prefill"
+glm53_dsa_prefill_fast = "glm53_dsa_prefill_fast"
+glm53_dsa_prefill_tc = "glm53_dsa_prefill_tc"
+glm53_dsa_projection = "glm53_dsa_projection"
+glm53_dsa_verify_multi = "glm53_dsa_verify_multi"
+glm53_residual = "glm53_residual"
+glm53_exl3_moe = "glm53_exl3_moe"
+glm53_exl3_fat = "glm53_exl3_fat"
+glm53_router = "glm53_router"
+hyper_connection = "hyper_connection"
+dflash2_native = "dflash2_native"
