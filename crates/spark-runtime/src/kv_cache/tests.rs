@@ -77,6 +77,23 @@ fn test_exhaust() {
 }
 
 #[test]
+fn batch_allocation_is_atomic_on_exhaustion() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = PagedKvCache::new(test_config(), 4, &gpu).unwrap();
+    let held = cache.try_alloc_blocks(3).unwrap();
+    assert_eq!(cache.num_free_blocks(), 1);
+
+    assert!(cache.try_alloc_blocks(2).is_none());
+    assert_eq!(cache.num_free_blocks(), 1, "failed batch mutated the pool");
+    for &block in &held {
+        assert_eq!(cache.ref_count(block), 1);
+    }
+
+    cache.free_blocks(&held);
+    assert_eq!(cache.num_free_blocks(), 4);
+}
+
+#[test]
 fn test_compute_num_blocks() {
     let cfg = test_config();
     // Each block: 16384 bytes * 12 layers = 196608 bytes

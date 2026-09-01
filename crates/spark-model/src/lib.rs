@@ -41,6 +41,13 @@ pub use vision_item::VisionItem;
 pub mod weight_loader;
 pub mod weight_map;
 
+/// Whether the pinned native FlashKDA prefill bridge can be loaded. GLM-5.3
+/// cannot safely fall back to the generic GDN recurrence because its state
+/// transition and chunk ABI differ.
+pub fn glm53_flash_kda_available() -> bool {
+    layers::ops::glm5_flash_kda::available()
+}
+
 /// True when the checkpoint ships **HF-vanilla** RMSNorm weights — i.e. the norm
 /// weight is used as `out = x * w / rms`, not Qwen3-Next's offset-from-1
 /// `out = x * (1 + w) / rms`.
@@ -62,7 +69,7 @@ pub fn ships_vanilla_norm_weights(config: &atlas_core::config::ModelConfig) -> b
 /// The dispatch predicate itself, on the bare `model_type`, so it is unit-testable
 /// without constructing a full `ModelConfig`.
 pub fn model_type_ships_vanilla_norm_weights(model_type: &str) -> bool {
-    matches!(model_type, "deepseek_v4" | "laguna")
+    matches!(model_type, "deepseek_v4" | "laguna" | "glm5_next")
 }
 
 #[cfg(test)]
@@ -76,6 +83,7 @@ mod norm_convention_tests {
     fn vanilla_norm_models_are_explicit() {
         assert!(vanilla("deepseek_v4"));
         assert!(vanilla("laguna"));
+        assert!(vanilla("glm5_next"));
         for other in [
             "qwen3_next",
             "qwen3_5_moe",

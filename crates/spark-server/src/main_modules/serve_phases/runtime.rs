@@ -13,6 +13,7 @@ use atlas_core::config::ModelConfig;
 use crate::cli;
 
 pub(crate) fn load_eos_tokens(model_dir: &Path, config: &ModelConfig) -> Vec<u32> {
+    let configured = || configured_eos_tokens(config);
     let gen_config_path = model_dir.join("generation_config.json");
     if let Ok(gen_json) = std::fs::read_to_string(&gen_config_path) {
         if let Ok(gen_cfg) = serde_json::from_str::<serde_json::Value>(&gen_json) {
@@ -26,7 +27,7 @@ pub(crate) fn load_eos_tokens(model_dir: &Path, config: &ModelConfig) -> Vec<u32
                         tracing::info!("EOS tokens (from generation_config.json): {:?}", ids);
                         ids
                     } else {
-                        vec![config.eos_token_id]
+                        configured()
                     }
                 }
                 Some(serde_json::Value::Number(n)) => {
@@ -34,13 +35,22 @@ pub(crate) fn load_eos_tokens(model_dir: &Path, config: &ModelConfig) -> Vec<u32
                     tracing::info!("EOS token (from generation_config.json): {}", id);
                     vec![id]
                 }
-                _ => vec![config.eos_token_id],
+                _ => configured(),
             };
         }
-        return vec![config.eos_token_id];
+        return configured();
     }
-    tracing::info!("EOS token (from config.json): {}", config.eos_token_id);
-    vec![config.eos_token_id]
+    let ids = configured();
+    tracing::info!("EOS tokens (from config.json): {:?}", ids);
+    ids
+}
+
+fn configured_eos_tokens(config: &ModelConfig) -> Vec<u32> {
+    if config.eos_token_ids.is_empty() {
+        vec![config.eos_token_id]
+    } else {
+        config.eos_token_ids.clone()
+    }
 }
 
 pub(crate) struct SamplingDefaults {
@@ -481,3 +491,6 @@ mod sampling_defaults_tests {
         assert_eq!(d.min_p, 0.31);
     }
 }
+
+#[cfg(test)]
+mod eos_tests;

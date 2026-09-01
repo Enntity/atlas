@@ -455,7 +455,6 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
-
             // EP all-reduce per-token partial output
             if let Some(comm) = ctx.comm
                 && ctx.config.ep_world_size > 1

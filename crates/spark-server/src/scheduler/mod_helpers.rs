@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::api::InferenceRequest;
-use crate::scheduling_policy::{ActiveSeqTiming, PendingRequestInfo, SchedulingPolicy};
+use crate::scheduling_policy::{PendingRequestInfo, SchedulingPolicy};
 
 /// Install --high-speed-swap orchestrator after bind_gpu_to_thread.
 pub(super) fn install_high_speed_swap(
@@ -100,6 +100,7 @@ pub(super) fn drain_pending_requests(
     active: &[ActiveSeq],
     prefilling: &[PrefillInProgress],
     policy: &dyn SchedulingPolicy,
+    allow_prefill_this_iteration: bool,
     max_batch_size: usize,
     // True when spilled/requeued sequences are parked awaiting resume. They
     // wait on KV BLOCKS, not on the request condvar — blocking here with an
@@ -186,15 +187,7 @@ pub(super) fn drain_pending_requests(
         }
     }
 
-    // Ask policy whether to accept prefills this iteration.
-    let timings: Vec<ActiveSeqTiming> = active
-        .iter()
-        .map(|a| ActiveSeqTiming {
-            last_token_time: a.last_token_time,
-        })
-        .collect();
-
-    if g.requests.is_empty() || !policy.should_prefill(&timings) {
+    if g.requests.is_empty() || !allow_prefill_this_iteration {
         return Vec::new();
     }
 

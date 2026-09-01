@@ -39,6 +39,7 @@ fn pool(gpu: &MockGpuBackend) -> SsmStatePool {
     SsmStatePool::new(
         &tiny_config(),
         MAX_SLOTS,
+        4096,
         true,
         NUM_INTERMEDIATES,
         NUM_DRAFTS,

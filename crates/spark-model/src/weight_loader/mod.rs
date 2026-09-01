@@ -17,6 +17,7 @@
 pub(crate) mod deepseek_v4;
 pub mod dflash_loader;
 mod gemma4;
+mod glm5_next;
 mod laguna;
 mod minimax;
 mod nemotron;
@@ -29,10 +30,11 @@ mod step3p7;
 
 pub use deepseek_v4::DeepSeekV4WeightLoader;
 pub use dflash_loader::{
-    DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, load_dflash_weights,
-    store_has_dflash_weights,
+    Dflash2SelectorWeights, DflashConfig, DflashDynamicConvWeights, DflashLayerWeights,
+    DflashSubConfig, DflashWeights, load_dflash_weights, store_has_dflash_weights,
 };
 pub use gemma4::Gemma4WeightLoader;
+pub use glm5_next::Glm5NextWeightLoader;
 pub use laguna::LagunaWeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
 pub use nemotron::NemotronHWeightLoader;
@@ -208,6 +210,22 @@ pub trait ModelWeightLoader {
         gpu: &dyn GpuBackend,
         layer_kv_dtypes: &[KvCacheDtype],
     ) -> Result<Vec<Box<dyn TransformerLayer>>>;
+
+    /// Mutable appliance-build hook for load-time weight replacement.
+    ///
+    /// Ordinary loaders only borrow checkpoint tensors and inherit this
+    /// implementation. Fixed-shape engines may replace several source
+    /// allocations with one packed/fused allocation while keeping the
+    /// `WeightStore` teardown ledger exact.
+    fn load_layers_mut(
+        &self,
+        store: &mut WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+        layer_kv_dtypes: &[KvCacheDtype],
+    ) -> Result<Vec<Box<dyn TransformerLayer>>> {
+        self.load_layers(store, config, gpu, layer_kv_dtypes)
+    }
 
     /// Per-(layer, role) weight precision schedule (C.3, 2026-04-25).
     /// Default impl returns the empty schedule (every lookup yields

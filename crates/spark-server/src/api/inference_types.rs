@@ -328,6 +328,8 @@ pub struct InferenceResponse {
     /// carried by Atlas's self-drafted MTP predictions. 0 when speculation is
     /// off or nothing was accepted.
     pub accepted_prediction_tokens: usize,
+    /// Speculative-decode draft tokens REJECTED for this request.
+    pub rejected_prediction_tokens: usize,
     /// Prompt-token logprobs (legacy /v1/completions `logprobs` + `echo`):
     /// one entry per prompt position i in [0, prompt_len-1) scoring token
     /// i+1. Empty unless requested. The handler prepends the null entry
@@ -356,6 +358,8 @@ pub enum StreamEvent {
         /// Accepted speculative draft tokens (for usage details — see
         /// [`InferenceResponse::accepted_prediction_tokens`]).
         accepted_prediction_tokens: usize,
+        /// Rejected speculative draft tokens (for usage details).
+        rejected_prediction_tokens: usize,
         /// Server-side guard that force-finished the sequence (e.g.
         /// "fuzzy_repetition"), if any — dump/observability only, never
         /// part of the OpenAI wire format.

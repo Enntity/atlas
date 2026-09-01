@@ -23,6 +23,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::weights::WeightStore;
 
 mod deepseek_v4;
+mod glm5_next;
 
 /// Run all model-agnostic + model-type-specific pre-flight checks.
 ///
@@ -50,6 +51,7 @@ pub fn preflight(store: &WeightStore, config: &ModelConfig, use_speculative: boo
     // `config` (which already carries the parsed `config.json` values).
     check_quant_method(config)?;
     deepseek_v4::check_native_dspark_checkpoint(store, config, use_speculative)?;
+    glm5_next::check_checkpoint_contract(store, config)?;
     check_embedding_and_head(store)?;
     let max_layer_idx = check_layer_count(store, config)?;
     check_expert_count(store, config)?;
@@ -82,7 +84,7 @@ fn check_quant_method(config: &ModelConfig) -> Result<()> {
     if qc.quant_method.is_empty() {
         return Ok(());
     }
-    const KNOWN_METHODS: &[&str] = &["compressed-tensors", "modelopt", "fp8"];
+    const KNOWN_METHODS: &[&str] = &["compressed-tensors", "modelopt", "fp8", "exl3"];
     if !KNOWN_METHODS.contains(&qc.quant_method.as_str()) {
         bail!(
             "Pre-flight: checkpoint declares quant_method={:?} which Atlas doesn't \

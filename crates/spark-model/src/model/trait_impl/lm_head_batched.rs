@@ -154,17 +154,29 @@ impl TransformerModel {
                 }
             }
         } else {
-            ops::dense_gemm(
-                self.gpu.as_ref(),
-                self.dense_gemm_kernel,
-                normed,
-                &self.lm_head_weight,
-                logits,
-                padded_n as u32,
-                v as u32,
-                h as u32,
-                stream,
-            )?;
+            if self.config.model_type == "glm5_next" && padded_n > 1 {
+                ops::cublas_bf16_proj_dense(
+                    normed,
+                    self.lm_head_weight.weight,
+                    logits,
+                    padded_n as u32,
+                    v as u32,
+                    h as u32,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm(
+                    self.gpu.as_ref(),
+                    self.dense_gemm_kernel,
+                    normed,
+                    &self.lm_head_weight,
+                    logits,
+                    padded_n as u32,
+                    v as u32,
+                    h as u32,
+                    stream,
+                )?;
+            }
         }
         Ok(logits)
     }

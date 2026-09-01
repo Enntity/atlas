@@ -74,6 +74,14 @@ ENV CUTE_DSL_ARCH=sm_121a
 
 WORKDIR /build
 
+# FlashKDA changes rarely and does not depend on the Atlas Rust/kernel tree.
+# Keep it above the high-churn COPY instructions so source-only iterations reuse
+# the pinned AOT bridge instead of paying its rebuild cost on every edit.
+COPY 3rdparty_patches/flash_kda/ 3rdparty_patches/flash_kda/
+RUN FLASH_KDA_SOURCE=/opt/FlashKDA-atlas \
+    FLASH_KDA_OUTPUT=/usr/local/lib \
+    bash 3rdparty_patches/flash_kda/rebuild.sh
+
 # ── Optional: compile a release spark-server (skip when used as a build sandbox) ─
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
@@ -82,16 +90,22 @@ COPY kernels/ kernels/
 COPY jinja-templates/ jinja-templates/
 COPY 3rdparty_patches/ 3rdparty_patches/
 
-ENV ATLAS_TARGET_HW=gb10
-ENV ATLAS_TARGET_MODEL=*
-ENV ATLAS_TARGET_QUANT=*
+ARG ATLAS_TARGET_HW=gb10
+ARG ATLAS_TARGET_MODEL=*
+ARG ATLAS_TARGET_QUANT=*
+ENV ATLAS_TARGET_HW=${ATLAS_TARGET_HW}
+ENV ATLAS_TARGET_MODEL=${ATLAS_TARGET_MODEL}
+ENV ATLAS_TARGET_QUANT=${ATLAS_TARGET_QUANT}
 # Native FP4 GEMM + cuBLASLt BF16 prefill projections on by default (matches prod).
 ENV ATLAS_CUTLASS_NVFP4_GEMM=1
 
 # CUDARC_CUDA_VERSION=13000: the vendored cudarc 0.19.2 tops out at 13.1 in its
 # nvcc-version table, so `nvcc --version` (13.2) panics without the pin. Same
 # value every CI workflow pins.
-RUN CUDARC_CUDA_VERSION=13000 cargo build --release -p spark-server
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    CUDARC_CUDA_VERSION=13000 cargo build --release -p spark-server && \
+    cp /build/target/release/spark /build/spark
 
 # Re-link the GDN AOT shared lib from committed artifacts (gdn_holo_0.o is the
 # AOT-exported bf16 kernel; gdn_transpose.o is the k<->v state transpose). No
@@ -116,11 +130,13 @@ RUN apt-get update -qq && \
     dpkg --compare-versions "$NCCL_VER" ge "2.28" || \
       { echo "ERROR: NCCL $NCCL_VER < 2.28" >&2; exit 1; }
 
-COPY --from=builder /build/target/release/spark /usr/local/bin/spark
+COPY --from=builder /build/spark /usr/local/bin/spark
 COPY --from=builder /build/jinja-templates/ /jinja-templates/
 # GDN-FlashInfer runtime libs (only loaded when ATLAS_GDN_FLASHINFER=1).
 COPY --from=builder /usr/local/lib/libatlasgdn.so /usr/local/lib/libatlasgdn.so
 COPY --from=builder /usr/local/lib/libcute_dsl_runtime.so /usr/local/lib/libcute_dsl_runtime.so
+COPY --from=builder /usr/local/lib/libatlas_glm53_flash_kda.so /usr/local/lib/libatlas_glm53_flash_kda.so
+COPY --from=builder /build/3rdparty_patches/flash_kda/LICENSE /usr/local/share/licenses/FlashKDA/LICENSE
 COPY LICENSE /LICENSE
 COPY README.md /README.md
 
@@ -129,5 +145,6 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/compat:/usr/local/cuda/lib64
 ENV CUTE_DSL_ARCH=sm_121a
 # GDN-FlashInfer is opt-in (FLA recurrence is the validated default).
 ENV ATLAS_GDN_FLASHINFER=0
+ENV ATLAS_GLM53_FLASH_KDA_LIB=/usr/local/lib/libatlas_glm53_flash_kda.so
 EXPOSE 8888
 ENTRYPOINT ["spark"]

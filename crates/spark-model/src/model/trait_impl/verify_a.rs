@@ -268,6 +268,9 @@ impl TransformerModel {
     }
 
     pub(super) fn checkpoint_ssm_states_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        if self.config.model_type == "glm5_next" {
+            return self.glm_checkpoint_dispatch(seq, self.gpu.default_stream(), false);
+        }
         use crate::layer::SsmLayerState;
 
         let stream = self.gpu.default_stream();
@@ -325,6 +328,15 @@ impl TransformerModel {
         seq: &mut SequenceState,
         num_accepted: usize,
     ) -> Result<()> {
+        if self.config.model_type == "glm5_next" {
+            return self.glm_restore_dispatch(
+                seq,
+                num_accepted,
+                self.gpu.default_stream(),
+                false,
+                false,
+            );
+        }
         use crate::layer::SsmLayerState;
 
         // PRE-VALIDATION PASS — no GPU work is enqueued until every SSM layer
@@ -438,7 +450,6 @@ impl TransformerModel {
     }
 
     /// Phase-C decode-time boundary snapshot save.
-    ///
     /// Copies the sequence's live SSM state (the active `SsmStatePool`
     /// slot `seq.slot_idx`) into the decode-rollback ring slot
     /// `(seq.slot_idx, ring_slot)` of [`SsmSnapshotPool`]. Reuses the
@@ -465,7 +476,6 @@ impl TransformerModel {
     }
 
     /// Phase-C decode-time boundary snapshot restore.
-    ///
     /// Inverse of [`Self::save_decode_ssm_snapshot_dispatch`]: copies the
     /// ring snapshot `(seq.slot_idx, ring_slot)` back into the live
     /// `SsmStatePool` slot, undoing every recurrent update the dropped

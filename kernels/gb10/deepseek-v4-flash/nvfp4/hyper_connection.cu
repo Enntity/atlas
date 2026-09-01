@@ -23,6 +23,13 @@
 #define HC_MAX_MULT 4
 #define HC_MAX_MIX 24 // (2 + HC_MAX_MULT) * HC_MAX_MULT
 
+// DeepSeek ships FP32 function weights. GLM reuses the same mHC algorithm
+// but stores this large matrix in BF16; its target wrapper overrides only
+// this input type while leaving base/scale and the residual highway FP32.
+#ifndef HC_FN_TYPE
+#define HC_FN_TYPE float
+#endif
+
 // Block-wide sum reduction over red[0..HC_BLOCK).
 __device__ __forceinline__ float hc_block_reduce(float* red, unsigned int tid) {
     for (unsigned int s = HC_BLOCK / 2; s > 0; s >>= 1) {
@@ -57,7 +64,7 @@ extern "C" __global__ void hc_expand(
 // comb_out [T, hc, hc].  Grid: (T,1,1)  Block: (256,1,1).
 extern "C" __global__ void hc_pre(
     const float* __restrict__ streams,  // [T, hc, H] FP32 highway (mHC)
-    const float* __restrict__ hc_fn,    // [mix_hc, hc*H]
+    const HC_FN_TYPE* __restrict__ hc_fn, // [mix_hc, hc*H]
     const float* __restrict__ hc_scale, // [3]
     const float* __restrict__ hc_base,  // [mix_hc]
     __nv_bfloat16* __restrict__ y_out,
@@ -98,10 +105,10 @@ extern "C" __global__ void hc_pre(
 
     // Pass 2: mixes[m] = (sum_k fn[m,k] * x[k]) * rsqrt
     for (unsigned int m = 0; m < mix_hc; ++m) {
-        const float* fn_row = hc_fn + (size_t)m * hc_dim;
+        const HC_FN_TYPE* fn_row = hc_fn + (size_t)m * hc_dim;
         float acc = 0.f;
         for (unsigned int k = tid; k < hc_dim; k += HC_BLOCK) {
-            acc += fn_row[k] * (float)x[k];
+            acc += (float)fn_row[k] * (float)x[k];
         }
         red[tid] = acc;
         __syncthreads();

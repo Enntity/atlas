@@ -6,7 +6,7 @@ use super::*;
 
 mod deepseek_v4;
 use serde_json::json;
-
+mod glm5_next;
 mod laguna;
 mod mistral_effort;
 mod qwen_dense;

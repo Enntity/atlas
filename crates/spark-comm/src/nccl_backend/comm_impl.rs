@@ -91,6 +91,32 @@ impl CommBackend for NcclBackend {
         Ok(())
     }
 
+    fn all_reduce_direct(&self, ptr: u64, bytes: usize, compute_stream: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            bytes.is_multiple_of(ALL_REDUCE_DTYPE_BYTES),
+            "all-reduce payload {bytes} is not BF16-aligned"
+        );
+        let count = bytes / ALL_REDUCE_DTYPE_BYTES;
+        let comm = *self.comm.lock();
+        let result = unsafe {
+            nccl::ncclAllReduce(
+                ptr as *const _,
+                ptr as *mut _,
+                count,
+                NcclDataType::Bfloat16,
+                NcclRedOp::Sum,
+                comm,
+                compute_stream,
+            )
+        };
+        nccl::check_nccl(result, "ncclAllReduce (direct)")?;
+        self.check_async_error(comm);
+        Ok(())
+    }
+
     fn register_buffer(&self, ptr: u64, bytes: usize) -> Result<u64> {
         let mut handle: *mut c_void = ptr::null_mut();
         let comm = *self.comm.lock();
@@ -185,13 +211,17 @@ impl CommBackend for NcclBackend {
 
         let elapsed = start.elapsed();
         if elapsed.as_secs() >= COLLECTIVE_TIMEOUT_SECS {
-            tracing::error!(
-                "NCCL broadcast took {:.1}s (threshold: {}s) \
-                 — marking communicator unhealthy",
+            // A synchronous collective measures peer rendezvous as well as
+            // transfer time. In the EP worker command loop, waiting here for
+            // the next request is normal idle time and is not evidence of a
+            // failed communicator. Async NCCL status below remains the health
+            // authority; this duration is diagnostic only.
+            tracing::debug!(
+                "NCCL broadcast returned after {:.1}s (diagnostic threshold: {}s; \
+                 duration may include peer rendezvous)",
                 elapsed.as_secs_f64(),
                 COLLECTIVE_TIMEOUT_SECS,
             );
-            self.unhealthy.store(true, Ordering::Release);
         }
 
         // Also check for async errors.

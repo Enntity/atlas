@@ -371,8 +371,16 @@ impl RdmaWeightLoader {
 
             // SAFETY: the bounce now holds `len` valid bytes landed by the READ.
             let src = unsafe { std::slice::from_raw_parts(rail.bounce_ptr, len) };
-            let dtype = WeightDtype::from_safetensors_str(&rec.dtype)
-                .with_context(|| format!("tensor {}", rec.name))?;
+            let (dtype, needs_f16_conversion) =
+                WeightDtype::from_safetensors_str_for_tensor(&rec.dtype, &rec.name)
+                    .with_context(|| format!("tensor {}", rec.name))?;
+            if needs_f16_conversion {
+                bail!(
+                    "RDMA base-weight staging cannot normalize ordinary F16 tensor {}; \
+                     EXL3 raw F16 tensors are supported",
+                    rec.name
+                );
+            }
             let shape: Vec<usize> = rec.shape.iter().map(|&d| d as usize).collect();
 
             let ptr = match gpu.alloc(len) {

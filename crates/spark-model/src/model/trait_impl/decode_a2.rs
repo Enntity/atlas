@@ -16,7 +16,9 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::super::block_mgmt::{ensure_blocks_through_decode, extract_layer_refs};
 use super::super::types::TransformerModel;
-use crate::layer::{ForwardContext, LayerState, SsmLayerState};
+use crate::layer::{
+    ForwardContext, GlmSparseMlaLayerState, KdaLayerState, LayerState, SsmLayerState,
+};
 use crate::layers::ops;
 use crate::traits::{Model, SequenceState};
 
@@ -317,6 +319,15 @@ impl TransformerModel {
         // 1d. Upload metadata with fixed stride (active + padding)
         let metadata = self.upload_batch_metadata_fixed(seqs, dispatch_n, &mut kv_cache, stream)?;
 
+        // GLM KDA/DSA kernels consume indirect per-layer state tables. Keep
+        // the table addresses stable inside the graph and refresh their
+        // contents here, before capture/replay. Capturing the former H2D
+        // copies retained pointers to temporary host Vecs and crashed the
+        // first batch-size-2 replay with CUDA_ERROR_ILLEGAL_ADDRESS.
+        if use_graphs {
+            self.stage_glm_graph_metadata(seqs, dispatch_n, stream)?;
+        }
+
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
@@ -384,11 +395,30 @@ impl TransformerModel {
             // scheduler invariant ("active occupies contiguous slots
             // [0..n)") ever drifts.
             let dummy_ssm_slot = self.ssm_pool.dummy_slot();
+            let is_glm = self.ssm_pool.is_glm();
             for _pad_pos in n..padded_n {
                 let mut dummy: Vec<Box<dyn LayerState>> = Vec::with_capacity(self.layers.len());
                 let mut ssm_idx = 0usize;
+                let mut dsa_idx = 0usize;
                 for (li, layer) in self.layers.iter().enumerate() {
-                    if self.config.layer_type(li) == LayerType::LinearAttention {
+                    if is_glm && self.config.layer_type(li) == LayerType::LinearAttention {
+                        dummy.push(Box::new(KdaLayerState {
+                            slot_idx: dummy_ssm_slot,
+                            slot_capacity: self.ssm_pool.max_slots + 1,
+                            current: self.ssm_pool.kda_state(ssm_idx, dummy_ssm_slot),
+                            checkpoint: None,
+                            intermediates: Vec::new(),
+                        }));
+                        ssm_idx += 1;
+                    } else if is_glm && self.config.layer_type(li) == LayerType::FullAttention {
+                        dummy.push(Box::new(GlmSparseMlaLayerState {
+                            slot_idx: dummy_ssm_slot,
+                            current: self.ssm_pool.glm_dsa_state(dsa_idx, dummy_ssm_slot),
+                            checkpoint: None,
+                            intermediates: Vec::new(),
+                        }));
+                        dsa_idx += 1;
+                    } else if self.config.layer_type(li) == LayerType::LinearAttention {
                         dummy.push(Box::new(SsmLayerState {
                             h_state: self.ssm_pool.h_state(ssm_idx, dummy_ssm_slot),
                             conv_state: self.ssm_pool.conv_state(ssm_idx, dummy_ssm_slot),

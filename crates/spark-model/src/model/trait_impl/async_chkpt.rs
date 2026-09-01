@@ -30,6 +30,9 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
     pub(super) fn start_checkpoint_async_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        if self.config.model_type == "glm5_next" {
+            return self.glm_checkpoint_dispatch(seq, self.secondary_stream, true);
+        }
         use crate::layer::SsmLayerState;
 
         let stream = self.secondary_stream;
@@ -82,6 +85,9 @@ impl TransformerModel {
         seq: &mut SequenceState,
         num_accepted: usize,
     ) -> Result<()> {
+        if self.config.model_type == "glm5_next" {
+            return self.glm_restore_dispatch(seq, num_accepted, self.secondary_stream, true, true);
+        }
         use crate::layer::SsmLayerState;
 
         let stream = self.secondary_stream;
@@ -227,6 +233,9 @@ impl TransformerModel {
         num_accepted: usize,
         k: usize,
     ) -> Result<()> {
+        if self.config.model_type == "glm5_next" {
+            return self.glm_commit_accepted_prefix_dispatch(seq, num_accepted, k);
+        }
         use crate::layer::SsmLayerState;
 
         // Width invariant. Together with the `num_accepted == 0` guard below

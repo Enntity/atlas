@@ -20,7 +20,8 @@ use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::types::{PinnedMetaStaging, TransformerModel};
 use crate::layer::{
-    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
+    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, GlmSparseMlaLayerState, KdaLayerState,
+    LayerState, SsmLayerState, TransformerLayer,
 };
 use crate::layers::ops;
 use crate::speculative::DraftProposer;
@@ -221,15 +222,31 @@ impl TransformerModel {
         // on every completion was an extra eager step per request. Policy is
         // pinned by `decode_graph_key` tests (`*_graph_on_free` → Retain).
         //
-        // verify_kgamma / fused still drop below: they bake a per-occupant
-        // LoRA adapter index (`lora_baked_graph_on_free` → DropThisSlot).
-        // verify_kgamma_graph + fused_graph are keyed by (slot, K). They now
-        // capture the LoRA bgmv-vs-installed-pair branch and read the per-seq
-        // seq_slot buffer, so a freed slot's entries MUST be destroyed — else a
-        // reused slot replays a stale adapter index (multi-adapter + DFlash
-        // spec-decode output corruption). Drop every K for this slot.
-        for graph_map in [&self.verify_kgamma_graph, &self.fused_graph] {
-            let mut cache = graph_map.lock();
+        // Only LoRA graphs bake a per-occupant adapter index. Base-model graph
+        // addresses remain stable across slot reuse and should be retained.
+        // Drop every slot-keyed verify/fused graph only on the LoRA path.
+        if self.lora.is_some() {
+            let mut cache = self.verify_kgamma_graph.lock();
+            let keys: Vec<(usize, usize, u32)> = cache
+                .keys()
+                .filter(|k| k.0 == seq.slot_idx)
+                .copied()
+                .collect();
+            for k in keys {
+                if let Some(graph) = cache.remove(&k)
+                    && let Err(e) = self.gpu.destroy_graph(graph)
+                {
+                    tracing::error!(
+                        "free_sequence: destroy_graph(kgamma[{},{},{}]): {e:#}",
+                        k.0,
+                        k.1,
+                        k.2
+                    );
+                }
+            }
+        }
+        if self.lora.is_some() {
+            let mut cache = self.fused_graph.lock();
             let keys: Vec<(usize, usize)> = cache
                 .keys()
                 .filter(|k| k.0 == seq.slot_idx)
@@ -240,7 +257,7 @@ impl TransformerModel {
                     && let Err(e) = self.gpu.destroy_graph(graph)
                 {
                     tracing::error!(
-                        "free_sequence: destroy_graph(kgamma/fused[{},{}]): {e:#}",
+                        "free_sequence: destroy_graph(fused[{},{}]): {e:#}",
                         k.0,
                         k.1
                     );
@@ -332,9 +349,25 @@ impl TransformerModel {
         let num_intermediates = self.ssm_pool.num_intermediates;
         let h_intermediates = self.ssm_pool.h_inter_count(new_slot);
         let mut ssm_layer_idx = 0usize;
+        let mut dsa_layer_idx = 0usize;
         for (i, state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) == LayerType::LinearAttention {
-                if let Some(ssm) = state.as_any_mut().downcast_mut::<SsmLayerState>() {
+                if let Some(kda) = state.as_any_mut().downcast_mut::<KdaLayerState>() {
+                    kda.slot_idx = new_slot;
+                    kda.current = self.ssm_pool.kda_state(ssm_layer_idx, new_slot);
+                    if has_mtp {
+                        kda.checkpoint =
+                            Some(self.ssm_pool.kda_checkpoint(ssm_layer_idx, new_slot));
+                        kda.intermediates.clear();
+                        for token_idx in 0..h_intermediates {
+                            kda.intermediates.push(self.ssm_pool.kda_intermediate(
+                                ssm_layer_idx,
+                                new_slot,
+                                token_idx,
+                            ));
+                        }
+                    }
+                } else if let Some(ssm) = state.as_any_mut().downcast_mut::<SsmLayerState>() {
                     ssm.h_state = self.ssm_pool.h_state(ssm_layer_idx, new_slot);
                     ssm.conv_state = self.ssm_pool.conv_state(ssm_layer_idx, new_slot);
                     // Stage-3 f16-SIZED pool: the FP32 prefill staging blob is
@@ -378,6 +411,28 @@ impl TransformerModel {
                     }
                 }
                 ssm_layer_idx += 1;
+            } else if self.ssm_pool.is_glm()
+                && self.config.layer_type(i) == LayerType::FullAttention
+            {
+                let dsa = state
+                    .as_any_mut()
+                    .downcast_mut::<GlmSparseMlaLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected GLM sparse-MLA state at layer {i}"))?;
+                dsa.slot_idx = new_slot;
+                dsa.current = self.ssm_pool.glm_dsa_state(dsa_layer_idx, new_slot);
+                if has_mtp {
+                    dsa.checkpoint =
+                        Some(self.ssm_pool.glm_dsa_checkpoint(dsa_layer_idx, new_slot));
+                    dsa.intermediates.clear();
+                    for token_idx in 0..h_intermediates {
+                        dsa.intermediates.push(self.ssm_pool.glm_dsa_intermediate(
+                            dsa_layer_idx,
+                            new_slot,
+                            token_idx,
+                        ));
+                    }
+                }
+                dsa_layer_idx += 1;
             }
         }
 

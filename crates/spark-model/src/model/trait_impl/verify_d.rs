@@ -177,7 +177,9 @@ impl TransformerModel {
         let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1");
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        let use_graphs = self.comm.is_none()
+        let ep_graphs = std::env::var("ATLAS_EP_GRAPHS").is_ok_and(|v| v == "1" || v == "true");
+        let use_graphs = (self.comm.is_none() || ep_graphs)
+            && !self.profile
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -194,7 +196,7 @@ impl TransformerModel {
             levers: &self.levers,
             stats: &self.stats,
             attn_metadata: Some(metadata),
-            profile: false,
+            profile: self.profile,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
@@ -204,6 +206,10 @@ impl TransformerModel {
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
         };
 
+        if use_graphs {
+            self.stage_glm_verify_graph_metadata(seq, k, stream)?;
+        }
+
         // ── Phase 2: CUDA graph capture / replay ──
 
         let mut graph_cache = if use_graphs {
@@ -212,7 +218,12 @@ impl TransformerModel {
             None
         };
 
-        let cache_key = (seq.slot_idx, k);
+        let pool_bucket = crate::layers::glm5::dsa_verify_pool_bucket(
+            seq.seq_len.saturating_add(k),
+            self.config.index_kpool,
+            self.buffers.glm_layout().dsa_max_pools,
+        );
+        let cache_key = (seq.slot_idx, k, pool_bucket);
         let cached_for_slot = graph_cache
             .as_ref()
             .and_then(|c| c.get(&cache_key).copied());
@@ -234,12 +245,16 @@ impl TransformerModel {
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {
-                    if hss_engaged {
+                    if hss_engaged || self.config.model_type == "glm5_next" {
                         // HSS path: decode_multi_seq's paged-decode kernel
                         // reads K/V from HBM only, missing the long-context
                         // history on disk. Fall back to decode_batched
                         // (sequential single-token decodes via the HSS
                         // orchestrator). See verify_b.rs for full rationale.
+                        // GLM uses the same branch for a different reason:
+                        // sparse MLA owns learned index state per sequence,
+                        // so K verify rows must update the real state in
+                        // position order rather than K fake EmptyLayerStates.
                         layer.decode_batched(
                             hidden,
                             residual,
@@ -286,29 +301,11 @@ impl TransformerModel {
                         stream,
                     )?;
                 }
-                // DFlash intermediate hidden capture: snapshot each capture
-                // layer's output at position k-1 (last verify token) into
-                // dflash_hidden_save[slot] while hidden_states still holds
-                // this layer's activation — mirrors verify_b.rs for K=2.
-                // Must be inside the graph capture region so the per-layer
-                // intermediate (not the final-layer-only post-loop value) is
-                // recorded. Under ATLAS_DFLASH_EAGLE_FIX=1 OR
-                // ATLAS_DFLASH_UNIFIED_CTX=1, capture ALL k verify rows so
-                // the scheduler can append rows 0..=num_accepted to ctx
-                // after the accept walk (EAGLE order). UNIFIED_CTX requires
-                // the same full capture: commit_ctx copies scratch rows
-                // 0..=num_accepted — with only the k-1 capture, row 0 holds
-                // the WRONG token's hidden and rows 1.. are stale garbage
-                // (2026-07-09 accept-collapse root cause: EAGLE_FIX=0 under
-                // UNIFIED=1 starved this capture and poisoned drafter ctx).
-                let capture_all = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref()
-                    == Some("1")
-                    || std::env::var("ATLAS_DFLASH_UNIFIED_CTX").ok().as_deref() == Some("1");
-                if capture_all {
-                    self.try_dflash_capture_all(layer_idx, k, stream)?;
-                } else {
-                    self.try_dflash_capture(layer_idx, k - 1, stream)?;
-                }
+                // Capture every verify row at every requested target layer.
+                // The scheduler chooses rows 0..=accepted only after the
+                // target verdict is known; capturing merely k-1 makes partial
+                // rejection condition the drafter on a rejected token.
+                self.try_dflash_capture_all(layer_idx, k, stream)?;
             }
 
             // Final norm [K, H]
@@ -348,9 +345,10 @@ impl TransformerModel {
                 let graph = self.gpu.end_capture(stream)?;
                 if graph.0 != 0 {
                     tracing::info!(
-                        "Captured CUDA graph for K=γ verify (slot={} K={})",
+                        "Captured CUDA graph for K=γ verify (slot={} K={} pools={})",
                         seq.slot_idx,
-                        k
+                        k,
+                        pool_bucket
                     );
                     if let Some(ref mut cache) = graph_cache {
                         cache.insert(cache_key, graph);
@@ -383,5 +381,15 @@ impl TransformerModel {
         seq.seq_len += k;
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn kgamma_graph_key_includes_sparse_pool_geometry() {
+        let source = include_str!("verify_d.rs");
+        assert!(source.contains("let cache_key = (seq.slot_idx, k, pool_bucket)"));
+        assert!(source.contains("dsa_verify_pool_bucket("));
     }
 }

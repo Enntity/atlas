@@ -101,14 +101,23 @@ impl ChatTokenizer {
 
         let jinja_env = super::jinja_helpers::build_jinja_env(&chat_template)?;
 
-        // Load OpenAI-variant template if it exists (jinja-templates/openai/{model_type}.jinja).
-        // This variant gates historical <think> wrappers on enable_thinking, preventing
-        // spontaneous thinking during tool-use when thinking is disabled.
-        let openai_jinja_env = super::jinja_helpers::load_openai_template(model_type, repo_root)
-            .and_then(|tmpl| {
+        // Load an OpenAI-variant template when present. GLM-5.3's checkpoint
+        // template does not consume `enable_thinking` and always leaves an
+        // open `<think>` at the generation boundary, so derive its variant
+        // from the exact checkpoint bytes. Fail closed if that upstream
+        // anchor changes: silently falling back would accept thinking=false
+        // while continuing to reason.
+        let openai_jinja_env =
+            if let Some(tmpl) = super::jinja_helpers::load_openai_template(model_type, repo_root) {
                 tracing::info!("Loaded OpenAI-variant Jinja template for {model_type}");
                 super::jinja_helpers::build_jinja_env(&tmpl).ok()
-            });
+            } else if model_type == "glm5_next" {
+                let tmpl = super::glm5_next::derive_openai_template(&chat_template)?;
+                tracing::info!("Derived GLM-5.3 OpenAI template from checkpoint template");
+                Some(super::jinja_helpers::build_jinja_env(&tmpl)?)
+            } else {
+                None
+            };
         let chat_encoding = if model_type == "deepseek_v4" {
             tracing::info!("Using checkpoint-native DeepSeek-V4 message encoding");
             ChatEncoding::DeepseekV4

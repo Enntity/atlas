@@ -411,6 +411,14 @@ impl TransformerModel {
                 .collect(),
         );
         drain(
+            "dflash_verify_batched_graphs",
+            self.dflash_verify_batched_graphs
+                .lock()
+                .drain()
+                .map(|(_, g)| g)
+                .collect(),
+        );
+        drain(
             "fused_graph",
             self.fused_graph.lock().drain().map(|(_, g)| g).collect(),
         );

@@ -4,28 +4,243 @@
 
 use super::*;
 
+/// Verify several equal-width GLM DFlash blocks in one target weight sweep.
+/// Rows stay sequence-major so each KDA/DSA lane advances causally while the
+/// 288-expert EXL3 weights are streamed only once.
+pub fn step_verify_dflash_batched(
+    model: &dyn Model,
+    batch: &mut [&mut ActiveSeq],
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    num_drafts: usize,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    dflash_verify_raw_argmax: bool,
+) {
+    let n = batch.len();
+    if n < 2 {
+        return;
+    }
+    let drafts = batch
+        .iter_mut()
+        .map(|active| {
+            active.pending_draft_conf.clear();
+            std::mem::take(&mut active.pending_drafts)
+        })
+        .collect::<Vec<_>>();
+    let draft_count = drafts[0].len();
+    let k = draft_count + 1;
+    if !drafts.iter().all(|tokens| tokens.len() == draft_count)
+        || !model.can_batch_verify_dflash(n, k)
+    {
+        tracing::error!("invalid DFlash verify batch shape n={n} k={k}");
+        for (active, pending) in batch.iter_mut().zip(drafts) {
+            active.pending_drafts = pending;
+        }
+        return;
+    }
+    if let Err(error) = model.sync_secondary() {
+        tracing::error!("batched DFlash sync_secondary: {error:#}");
+        for active in batch.iter_mut() {
+            active.finished = true;
+        }
+        return;
+    }
+    let mut tokens = Vec::with_capacity(n * k);
+    for (active, pending) in batch.iter().zip(&drafts) {
+        tokens.push(active.last_token);
+        tokens.extend_from_slice(pending);
+    }
+    let seq_ids = batch
+        .iter()
+        .map(|active| active.seq.slot_idx as u32)
+        .collect::<Vec<_>>();
+    if let Err(error) = model.ep_broadcast_dflash_verify_batch(&seq_ids, &tokens, k) {
+        tracing::error!("broadcast batched DFlash verify: {error:#}");
+        for active in batch.iter_mut() {
+            active.finished = true;
+        }
+        return;
+    }
+    let started = std::time::Instant::now();
+    let verdicts = {
+        let mut seqs = batch
+            .iter_mut()
+            .map(|active| &mut active.seq)
+            .collect::<Vec<_>>();
+        match model.decode_verify_dflash_batched(&tokens, k, &mut seqs, 0) {
+            Ok(verdicts) => verdicts,
+            Err(error) => {
+                tracing::error!("decode_verify_dflash_batched: {error:#}");
+                for active in batch.iter_mut() {
+                    active.finished = true;
+                }
+                return;
+            }
+        }
+    };
+    let verify_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let mut accepted = Vec::with_capacity(n);
+    let mut picked = Vec::with_capacity(n);
+    for (sequence, active) in batch.iter_mut().enumerate() {
+        active.last_token_time = Instant::now();
+        let raw = &verdicts[sequence * k..(sequence + 1) * k];
+        let verified = if dflash_verify_raw_argmax && !sched.levers.dflash_masked_verify {
+            raw.to_vec()
+        } else {
+            crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
+                model, raw, active, verify_ctx, 0,
+            )
+        };
+        let count = drafts[sequence]
+            .iter()
+            .zip(&verified)
+            .take_while(|(draft, target)| draft == target)
+            .count();
+        accepted.push(count);
+        picked.push(verified);
+    }
+    let accepted_wire = accepted
+        .iter()
+        .map(|&value| value as u32)
+        .collect::<Vec<_>>();
+    if let Err(error) = model.ep_broadcast_tokens(&accepted_wire) {
+        tracing::error!("broadcast batched DFlash verdicts: {error:#}");
+        for active in batch.iter_mut() {
+            active.finished = true;
+        }
+        return;
+    }
+
+    // Commit every sequence's recurrent rollback and DFlash context before
+    // any proposer runs. The shared capture remains sequence-major.
+    let mut propose_indexes = Vec::new();
+    for sequence in 0..n {
+        let active = &mut batch[sequence];
+        let num_accepted = accepted[sequence];
+        crate::scheduler::adaptive_spec::record_verify(active, num_accepted, sched);
+        let pre_verify_len = active.seq.seq_len.saturating_sub(k);
+        let target_seq_len = pre_verify_len + num_accepted + 1;
+        active.seq.seq_len = target_seq_len;
+        active.seq.tokens.truncate(target_seq_len);
+        if let Err(error) = model.commit_ctx_from_row(
+            &mut active.seq,
+            sequence * k,
+            num_accepted + 1,
+            pre_verify_len,
+        ) {
+            tracing::error!("commit_ctx_from_row: {error:#}");
+            active.finished = true;
+            continue;
+        }
+        if let Err(error) = model.commit_accepted_prefix(&mut active.seq, num_accepted + 1, k) {
+            tracing::error!("commit_accepted_prefix (batched DFlash): {error:#}");
+            active.finished = true;
+        }
+    }
+
+    for sequence in 0..n {
+        let active = &mut batch[sequence];
+        if active.finished {
+            continue;
+        }
+        let num_accepted = accepted[sequence];
+        for &token in drafts[sequence].iter().take(num_accepted) {
+            emit_token(active, token, None, sched);
+            if active.finished {
+                break;
+            }
+        }
+        if active.finished {
+            continue;
+        }
+        if let Some(&bonus) = picked[sequence].get(num_accepted) {
+            emit_token(active, bonus, None, sched);
+            active.last_token = bonus;
+        }
+        crate::metrics::SPEC_DECODE_VERIFY
+            .with_label_values(&[
+                "dflash_batched",
+                if num_accepted == draft_count {
+                    "accept_all"
+                } else {
+                    "accept_partial"
+                },
+            ])
+            .inc();
+        if let Err(error) = model.trim_proposer_state(&mut active.seq, num_accepted, 0) {
+            tracing::error!("trim_proposer_state (batched DFlash): {error:#}");
+        }
+        if crate::scheduler::adaptive_spec::spec_allowed(active, sched) {
+            propose_indexes.push(sequence);
+        }
+    }
+    if propose_indexes.len() >= 2 && model.mtp_propose_batch_max() >= propose_indexes.len() {
+        let propose_started = std::time::Instant::now();
+        let propose_count = propose_indexes.len();
+        let tokens = propose_indexes
+            .iter()
+            .map(|&index| batch[index].last_token)
+            .collect::<Vec<_>>();
+        let positions = propose_indexes
+            .iter()
+            .map(|&index| batch[index].seq.seq_len)
+            .collect::<Vec<_>>();
+        let stash = vec![0usize; propose_indexes.len()];
+        let mut wanted = propose_indexes.iter().copied().peekable();
+        let mut seqs = Vec::with_capacity(propose_indexes.len());
+        for (index, active) in batch.iter_mut().enumerate() {
+            if wanted.peek().copied() == Some(index) {
+                seqs.push(&mut active.seq);
+                wanted.next();
+            }
+        }
+        match model
+            .run_mtp_propose_batched(&tokens, &positions, &stash, num_drafts, &mut seqs, 0, None)
+        {
+            Ok(Some(next)) => {
+                for (&index, drafts) in propose_indexes.iter().zip(next) {
+                    batch[index].pending_drafts = drafts;
+                }
+                propose_indexes.clear();
+            }
+            Ok(None) => {}
+            Err(error) => tracing::error!("DFlash batch propose: {error:#}"),
+        }
+        tracing::info!(
+            "DFLASH BATCH propose: n={} gamma={} proposer_ms={:.1}",
+            propose_count,
+            num_drafts,
+            propose_started.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+    for index in propose_indexes {
+        let active = &mut batch[index];
+        let grammar_mask = mtp_grammar_mask_for(active);
+        match model.run_mtp_propose_multi(
+            active.last_token,
+            active.seq.seq_len,
+            num_drafts,
+            &mut active.seq,
+            0,
+            grammar_mask.as_deref(),
+        ) {
+            Ok(next) if !next.is_empty() => active.pending_drafts = next,
+            Ok(_) => {}
+            Err(error) => tracing::error!("DFlash serial re-propose fallback: {error:#}"),
+        }
+    }
+    tracing::info!(
+        "DFLASH BATCH verify: n={} K={} target_ms={:.1} accepted={:?}",
+        n,
+        k,
+        verify_ms,
+        accepted,
+    );
+}
+
 /// DFlash γ-token verify with accept-prefix.
-///
-/// Phase 3 minimal-viable implementation: routes `[last_token, drafts...]`
-/// through the eager `decode_verify_dflash` path (which today defaults to
-/// `decode_verify`) and finds the first index where draft ≠ verified
-/// argmax. Tokens 0..first_mismatch are accepted; the verified token at
-/// the mismatch position becomes the bonus token; subsequent drafts are
-/// dropped.
-///
-/// Deferred to Phase 6 (full integration):
-///   * EP=2 broadcast of verify-cmd + drafts (drafter currently runs only
-///     on rank 0; verify on a single-rank target is correct, but EP=2 needs
-///     the broadcast pattern from `step_verify_k2`).
-///   * Per-position logprobs extraction.
-///   * SSM `commit_verify_state_async(num_accepted, k)` loop. Without it,
-///     hybrid models (Qwen3.6-A3B has GDN layers) will see SSM state drift
-///     after γ-verify. Single-token decode unaffected; γ-verify only
-///     correct on pure-attention targets until this is wired.
-///   * `save_hidden_for_mtp` / `save_hidden_for_dflash` hook on the
-///     accepted bonus token (the next propose() needs the latest hidden).
-///   * Sliding-window state rollback for sliding-attention layers
-///     (Gemma-4-style; not used by Qwen3.6 targets).
+/// Single-sequence fallback: routes `[last_token, drafts...]` through the
+/// fixed-width verifier. The GLM TP2 path commits KV, KDA, and sparse-index
+/// rollback state atomically.
 pub fn step_verify_dflash(
     model: &dyn Model,
     a: &mut ActiveSeq,
@@ -46,10 +261,29 @@ pub fn step_verify_dflash(
     tokens.push(a.last_token);
     tokens.extend_from_slice(drafts);
 
-    // STEP-TIMING (ATLAS_DFLASH_STEP_TIMING=1): split the ~0.88s/step into
-    // verify (target M=1+γ forward) vs propose (drafter forward, tail below).
-    // The ledger never had this split — it guessed "FFN + double sweep". This
-    // measures it. Gated so the hot path pays nothing when the env is unset.
+    // EP/TP2: the worker must enter the same K-row GLM target forward before
+    // rank 0 reaches the first MoE all-reduce. K is checkpoint-defined (γ=8
+    // for GLM DFlash2), so carry it explicitly instead of inventing another
+    // fixed-width command.
+    if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF5) {
+        tracing::error!("EP broadcast DFlash verify cmd: {e:#}");
+        a.finished = true;
+        return;
+    }
+    if let Err(e) = model.ep_broadcast_cmd(tokens.len() as u32) {
+        tracing::error!("EP broadcast DFlash verify width: {e:#}");
+        a.finished = true;
+        return;
+    }
+    for &token in &tokens {
+        if let Err(e) = model.ep_broadcast_cmd(token) {
+            tracing::error!("EP broadcast DFlash verify token: {e:#}");
+            a.finished = true;
+            return;
+        }
+    }
+
+    // Optionally split step timing into target verify and draft proposal.
     let step_timing = std::env::var("ATLAS_DFLASH_STEP_TIMING").ok().as_deref() == Some("1");
     let t_verify = std::time::Instant::now();
     let verified_argmax = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
@@ -67,11 +301,7 @@ pub fn step_verify_dflash(
     };
     a.last_token_time = Instant::now();
 
-    // DFlash drafter proposes on raw argmax; when dflash_verify_raw_argmax is set
-    // (process-wide DFlash mode), skip the rep_pen/DRY pipeline so verifier and
-    // drafter judge on the SAME (GOLD) basis. For non-DFlash callers (unreachable
-    // today since step_verify_dflash is only dispatched at drafts.len()>=4 which
-    // only DFlash produces), apply the full pre-sample pipeline as in K=2/3/4.
+    // Keep verifier and drafter on the same raw-argmax basis in DFlash mode.
     let verified = if dflash_verify_raw_argmax && !sched.levers.dflash_masked_verify {
         verified_argmax
     } else {
@@ -84,26 +314,54 @@ pub fn step_verify_dflash(
         )
     };
 
-    // `decode_verify` already advanced `seq.seq_len` by `tokens.len()` and
-    // pushed all γ+1 tokens into `seq.tokens`. The accept-prefix logic below
-    // determines how many to keep — the rest must be rolled back so the
-    // KV cache, SSM state, and emitted token sequence stay consistent.
+    let standard_verdict = if dflash_verify_raw_argmax && !sched.levers.dflash_masked_verify {
+        model
+            .dflash_sparse_distribution(&a.seq)
+            .and_then(|distribution| {
+                match crate::scheduler::dflash_rejection::standard_rejection(
+                    model,
+                    a,
+                    drafts,
+                    &distribution,
+                ) {
+                    Ok(verdict) => verdict,
+                    Err(error) => {
+                        tracing::warn!(
+                            "DFlash2 standard rejection reference failed; using raw equality: {error:#}"
+                        );
+                        None
+                    }
+                }
+            })
+    } else {
+        None
+    };
 
     // Accept-prefix: drafts[i] is "accepted" iff drafts[i] == verified[i].
     // verified[i] is the target's argmax at position i (i.e. its
     // prediction for what should follow `tokens[i]`). drafts[i] was the
     // proposer's guess for the same slot. First mismatch terminates the
     // accepted prefix; verified[first_mismatch] becomes the bonus token.
-    let mut num_accepted = 0usize;
-    for i in 0..drafts.len() {
-        if i + 1 >= verified.len() {
-            break;
+    let num_accepted = if let Some(verdict) = standard_verdict.as_ref() {
+        verdict.accepted
+    } else {
+        let mut accepted = 0usize;
+        for i in 0..drafts.len() {
+            if i + 1 >= verified.len() {
+                break;
+            }
+            if drafts[i] == verified[i] {
+                accepted += 1;
+            } else {
+                break;
+            }
         }
-        if drafts[i] == verified[i] {
-            num_accepted += 1;
-        } else {
-            break;
-        }
+        accepted
+    };
+    if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
+        tracing::error!("EP broadcast DFlash accepted prefix: {e:#}");
+        a.finished = true;
+        return;
     }
 
     // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling
@@ -129,26 +387,12 @@ pub fn step_verify_dflash(
         }
     }
 
-    // EAGLE-fix (ATLAS_DFLASH_EAGLE_FIX=1): append one ctx slot per committed
-    // position (rows 0..=num_accepted at N..=N+num_accepted), with the bonus
-    // generator (row num_accepted) freshest. Fixes the ctx-undercount (was 1
-    // slot/step regardless of num_accepted) and the EAGLE conditioning shift.
-    // Sets skip_next_decode_append so the propose below does NOT re-append row 0.
-    // Unified ctx commit (ATLAS_DFLASH_UNIFIED_CTX=1): ONE unconditional
-    // commit at the K=gamma point — rows 0..=num_accepted at RoPE base
-    // pre_verify_len. Structural replacement for dflash_eagle_kgamma_append.
-    if sched.levers.dflash_unified_ctx {
-        if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len) {
-            tracing::error!("commit_ctx (kgamma): {e:#}");
-        }
-    } else {
-        let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
-        if eagle_fix
-            && let Err(e) =
-                model.dflash_eagle_kgamma_append(&mut a.seq, num_accepted, pre_verify_len)
-        {
-            tracing::error!("dflash_eagle_kgamma_append: {e:#}");
-        }
+    // Commit every target-confirmed row in EAGLE order: accepted drafts plus
+    // the bonus generator. The verify graph captured all K rows per target
+    // layer, so partial rejection never conditions the next proposal on a
+    // rejected tail row.
+    if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len) {
+        tracing::error!("commit_ctx (kgamma): {e:#}");
     }
 
     // Emit accepted drafts.
@@ -163,7 +407,9 @@ pub fn step_verify_dflash(
     // at the first mismatch, or the next-prediction past the full-accept case).
     let bonus_idx = num_accepted;
     if bonus_idx < verified.len() {
-        let bonus = verified[bonus_idx];
+        let bonus = standard_verdict
+            .as_ref()
+            .map_or(verified[bonus_idx], |verdict| verdict.bonus);
         emit_token(a, bonus, None, sched);
         if a.finished {
             return;
@@ -205,16 +451,6 @@ pub fn step_verify_dflash(
         return;
     }
 
-    // DFlash hidden is captured per-layer inside the verify graph
-    // (verify_d.rs try_dflash_capture at position k-1), mirroring verify_b.rs.
-    // No post-loop save needed; calling save_dflash_hidden_for_propose here
-    // would overwrite the correct per-layer intermediates with a repeated
-    // final-layer hidden, collapsing all 5 slots to the same value.
-    let bonus_token_idx = total_accepted.saturating_sub(1);
-    if let Err(e) = model.save_hidden_for_mtp(bonus_token_idx, 0) {
-        tracing::error!("save_hidden_for_mtp (dflash): {e:#}");
-    }
-
     if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
         tracing::error!("trim_proposer_state: {e:#}");
     }
@@ -224,10 +460,15 @@ pub fn step_verify_dflash(
     let _mtp_grammar_mask = mtp_grammar_mask_for(a);
     let t_propose = std::time::Instant::now();
     if crate::scheduler::adaptive_spec::spec_allowed(a, sched) {
+        let next_num_drafts =
+            crate::scheduler::adaptive_spec::configured_dflash_depth_limit(a, num_drafts);
+        if let Err(error) = model.configure_dflash_sampling(&mut a.seq, a.temperature, a.seed) {
+            tracing::error!("configure DFlash sampling: {error:#}");
+        }
         match model.run_mtp_propose_multi(
             a.last_token,
             a.seq.seq_len,
-            num_drafts,
+            next_num_drafts,
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),

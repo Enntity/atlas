@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::{SafetensorsLoader, WeightLoader, WeightStore};
+use super::{SafetensorsLoader, TensorLoadPolicy, WeightLoader, WeightStore};
 use crate::gpu::GpuBackend;
 
 impl WeightLoader for SafetensorsLoader {
@@ -78,7 +78,8 @@ impl WeightLoader for SafetensorsLoader {
         //   NVFP4 (Sehyo): ~2.0x  (store aliased + transposed/predequant copies)
         //   FP8 native:    ~1.5x  (store stays FP8, only attention prefill gets NVFP4 copies)
         {
-            let estimated = estimate_load_bytes(&shard_files, &skip_fn)?;
+            let estimated =
+                estimate_load_bytes_with_policy(&shard_files, &skip_fn, self.tensor_load_policy)?;
             let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn)?;
             let overhead_multiplier: f64 =
                 self.peak_memory_multiplier
@@ -124,15 +125,28 @@ impl WeightLoader for SafetensorsLoader {
                 oom_reserve_bytes,
                 &skip_fn,
                 self.peak_memory_multiplier,
+                self.tensor_load_policy,
             )?
         } else if shard_files.len() == 1 {
-            load_single(&shard_files[0], gpu, oom_reserve_bytes, &skip_fn)?
+            load_single(
+                &shard_files[0],
+                gpu,
+                oom_reserve_bytes,
+                &skip_fn,
+                self.tensor_load_policy,
+            )?
         } else {
             tracing::info!("Loading {} unindexed safetensor shards", shard_files.len());
             let initial_free = gpu.free_memory()?;
             let mut combined = HashMap::new();
             for (i, shard) in shard_files.iter().enumerate() {
-                let map = load_single(shard, gpu, oom_reserve_bytes, &skip_fn)?;
+                let map = load_single(
+                    shard,
+                    gpu,
+                    oom_reserve_bytes,
+                    &skip_fn,
+                    self.tensor_load_policy,
+                )?;
                 let free_now = gpu.free_memory().unwrap_or(0);
                 let used = initial_free.saturating_sub(free_now);
                 tracing::info!(
@@ -157,7 +171,13 @@ impl WeightLoader for SafetensorsLoader {
         let no_skip = |_: &str| false;
         let extra = model_dir.join("extra_weights.safetensors");
         if extra.exists() {
-            let extra_weights = load_single(&extra, gpu, oom_reserve_bytes, &no_skip)?;
+            let extra_weights = load_single(
+                &extra,
+                gpu,
+                oom_reserve_bytes,
+                &no_skip,
+                self.tensor_load_policy,
+            )?;
             tracing::info!(
                 "Loaded {} extra weight tensors from extra_weights.safetensors",
                 extra_weights.len()
@@ -246,6 +266,15 @@ pub(crate) fn estimate_load_bytes(
     files: &[std::path::PathBuf],
     skip_fn: &dyn Fn(&str) -> bool,
 ) -> Result<usize> {
+    estimate_load_bytes_with_policy(files, skip_fn, TensorLoadPolicy::Replicated)
+}
+
+pub(crate) fn estimate_load_bytes_with_policy(
+    files: &[std::path::PathBuf],
+    skip_fn: &dyn Fn(&str) -> bool,
+    policy: TensorLoadPolicy,
+) -> Result<usize> {
+    policy.validate()?;
     let mut total = 0usize;
     for path in files {
         for (name, shape, dtype) in read_safetensor_header(path)? {
@@ -265,7 +294,7 @@ pub(crate) fn estimate_load_bytes(
                 | safetensors::Dtype::F8_E5M2 => 1,
                 _ => 2,
             };
-            total += numel * elem_bytes;
+            total += policy.resident_bytes(&name, numel * elem_bytes);
         }
     }
     Ok(total)

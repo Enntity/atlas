@@ -24,8 +24,18 @@ pub(crate) fn preflight_reserve(
     config: &ModelConfig,
     free_mem: usize,
 ) -> Result<ReservePreflight> {
-    let h_state_bytes = config.ssm_h_state_bytes();
-    let conv_state_bytes = config.ssm_conv_state_bytes();
+    let glm_plan = (config.model_type == "glm5_next")
+        .then(|| atlas_core::glm5::Glm53FlashPlan::from_config(config))
+        .transpose()?;
+    // GLM KDA is not Qwen GDN. Never reserve the generic SSM pool for it:
+    // doing so both lies about the three independent convolution histories and
+    // double-counts state once the dedicated pool is allocated.
+    let h_state_bytes = glm_plan
+        .as_ref()
+        .map_or_else(|| config.ssm_h_state_bytes(), |_| 0);
+    let conv_state_bytes = glm_plan
+        .as_ref()
+        .map_or_else(|| config.ssm_conv_state_bytes(), |_| 0);
     let spec_on_pool = args.speculative || args.self_speculative || args.ngram_speculative;
     ssm_h_fp16_preconditions(args, config)?;
     // SSM state pool = per-seq live state (max_batch blobs) + MTP verify
@@ -56,8 +66,16 @@ pub(crate) fn preflight_reserve(
     );
     let ssm_pool_bytes = spark_model::ssm_reserve::ssm_pool_reserve_bytes(
         args.max_batch_size,
-        config.num_ssm_layers() * h_state_bytes,
-        config.num_ssm_layers() * conv_state_bytes,
+        if glm_plan.is_some() {
+            0
+        } else {
+            config.num_ssm_layers() * h_state_bytes
+        },
+        if glm_plan.is_some() {
+            0
+        } else {
+            config.num_ssm_layers() * conv_state_bytes
+        },
         spec_on_pool,
         args.resolved_num_drafts(),
         mtp_state_slots,
@@ -72,6 +90,16 @@ pub(crate) fn preflight_reserve(
         // is the separate term below.
         spark_model::ssm_reserve::ssm_rollback_mode(),
     );
+    let glm_state_pool_bytes = glm_plan
+        .as_ref()
+        .map(|plan| {
+            // BF16 latent/index cache for initial bring-up. One additional
+            // non-claimable slot keeps padded collective rows on stable,
+            // isolated addresses.
+            plan.state_pool_bytes(args.max_batch_size, 1, args.max_seq_len, 2)
+        })
+        .transpose()?
+        .unwrap_or(0);
     // Replay-mode verify-window input ring (EXPERIMENTAL scaffold): sized by
     // the SAME SSOT `SsmStatePool::new` allocates through. K ceiling is the
     // MTP `num_drafts + 1` — matching this preflight's existing convention
@@ -104,7 +132,9 @@ pub(crate) fn preflight_reserve(
     // explicitly passes `--max-prefill-tokens N` (anything other than the
     // default 8192), respect it — no hard cap. Otherwise default to 8192 to
     // bound GDN persistent-buffer reservation for unbounded `max_seq_len`.
-    let ssm_prefill_chunk: usize = if config.num_ssm_layers() > 0 {
+    let ssm_prefill_chunk: usize = if glm_plan.is_some() {
+        0
+    } else if config.num_ssm_layers() > 0 {
         if args.max_prefill_tokens != 8192 && args.max_prefill_tokens > 0 {
             args.max_seq_len.min(args.max_prefill_tokens)
         } else {
@@ -166,9 +196,13 @@ pub(crate) fn preflight_reserve(
         )
         .slots
     };
-    let ssm_snapshot_bytes = (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
-        * config.num_ssm_layers()
-        * (h_state_bytes + conv_state_bytes);
+    let ssm_snapshot_bytes = if glm_plan.is_some() {
+        0
+    } else {
+        (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
+            * config.num_ssm_layers()
+            * (h_state_bytes + conv_state_bytes)
+    };
     let cuda_headroom: usize =
         if args.speculative || args.self_speculative || args.ngram_speculative {
             4 * 1024 * 1024 * 1024
@@ -180,7 +214,7 @@ pub(crate) fn preflight_reserve(
         let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
         let nv = config.linear_num_value_heads;
         let conv_dim = key_dim * 2 + value_dim;
-        if conv_dim > 0 && config.num_ssm_layers() > 0 {
+        if glm_plan.is_none() && conv_dim > 0 && config.num_ssm_layers() > 0 {
             let sl = max_batch_tokens_pre;
             sl * conv_dim * 2 + sl * nv * 2 * 4 + sl * value_dim * 2 + sl * value_dim * 2
         } else {
@@ -188,6 +222,7 @@ pub(crate) fn preflight_reserve(
         }
     };
     let inference_reserve: usize = ssm_pool_bytes
+        + glm_state_pool_bytes
         + ssm_h_stage_bytes
         + ssm_replay_ring
         + ssm_snapshot_bytes
@@ -275,6 +310,14 @@ pub(crate) fn preflight_reserve(
             -1
         },
     );
+    if glm_state_pool_bytes > 0 {
+        tracing::info!(
+            "GLM-5.3 state reserve: {} MB ({} claimable + 1 collective-padding slot, context={})",
+            glm_state_pool_bytes / (1024 * 1024),
+            args.max_batch_size,
+            args.max_seq_len,
+        );
+    }
     Ok(ReservePreflight {
         inference_reserve,
         buffer_arena_bytes,

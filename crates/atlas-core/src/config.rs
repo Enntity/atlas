@@ -66,6 +66,10 @@ pub struct ModelConfig {
     /// 1D causal-conv kernel size on the SSM input (typically 3 or 4).
     #[serde(default = "default_conv_kernel")]
     pub linear_conv_kernel_dim: usize,
+    /// Lower bound applied by GLM-5 KDA's learned forget gate. Zero means
+    /// the recurrent family does not use the bounded KDA gate.
+    #[serde(default)]
+    pub kda_gate_lower_bound: f32,
 
     // ── MoE ──
     #[serde(default)]
@@ -123,6 +127,10 @@ pub struct ModelConfig {
     pub bos_token_id: u32,
     #[serde(default, deserialize_with = "nullable_u32")]
     pub eos_token_id: u32,
+    /// Complete stop-token set when the checkpoint declares multiple EOS IDs.
+    /// `eos_token_id` remains the primary ID for older call sites.
+    #[serde(default)]
+    pub eos_token_ids: Vec<u32>,
     #[serde(default)]
     pub tie_word_embeddings: bool,
     /// CLI override (`--lm-head-dtype`) for LM-head quantization, set at serve time
@@ -278,6 +286,24 @@ pub struct ModelConfig {
     /// Maximum compressed-history rows selected per query by the semantic indexer.
     #[serde(default)]
     pub index_topk: usize,
+    /// Number of raw history rows pooled into one DSA index row.
+    #[serde(default)]
+    pub index_kpool: usize,
+    /// Whether DSA always appends the visible incomplete tail after top-k.
+    #[serde(default)]
+    pub index_kpool_always_select_tail: bool,
+    /// Whether DSA stores the learned k-pooled index instead of raw rows.
+    #[serde(default)]
+    pub index_kpool_compress: bool,
+    /// Whether target and MTP layers share the same semantic index.
+    #[serde(default)]
+    pub index_share_for_mtp_iteration: bool,
+    /// GLM-5 indexer RoPE channel layout.
+    #[serde(default)]
+    pub indexer_rope_interleave: bool,
+    /// Per-layer semantic-index algorithm declared by the checkpoint.
+    #[serde(default)]
+    pub indexer_types: Vec<String>,
     /// Number of hash-based attention layers (DeepSeek-V4 HCA). 0 = none.
     #[serde(default)]
     pub num_hash_layers: usize,
@@ -588,8 +614,8 @@ pub use parsers::{
     parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{
-    parse_deepseek_v4, parse_gemma4_params, parse_laguna, parse_minimax_m2, parse_step3p7,
-    parse_vision_config,
+    parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_laguna, parse_minimax_m2,
+    parse_step3p7, parse_vision_config,
 };
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {

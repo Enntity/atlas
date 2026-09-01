@@ -608,7 +608,8 @@ pub struct ServeArgs {
     #[arg(long, num_args = 0..=1, default_missing_value = "<auto>", value_name = "PATH")]
     pub dump: Option<String>,
 
-    /// Scheduling policy: fifo (default) or slai (SLO-aware).
+    /// Scheduling policy: fifo (default), slai (SLO-aware), or
+    /// phase-interleave (collective-safe decode/prefill slabs).
     /// SLAI prioritizes decode for sequences nearing TBT deadline
     /// and orders prefills shortest-prompt-first.
     #[arg(long, default_value = "fifo")]
@@ -618,6 +619,22 @@ pub struct ServeArgs {
     /// Sequences approaching this deadline trigger decode-first priority.
     #[arg(long, default_value_t = 100)]
     pub tbt_deadline_ms: u64,
+
+    /// Decode-only scheduler iterations per phase-interleave cycle. Required
+    /// with `--scheduling-policy phase-interleave`.
+    #[arg(long)]
+    pub phase_decode_steps: Option<usize>,
+
+    /// Prefill-slab scheduler iterations per phase-interleave cycle. Required
+    /// with `--scheduling-policy phase-interleave`.
+    #[arg(long)]
+    pub phase_prefill_steps: Option<usize>,
+
+    /// Maximum prefill tokens in one phase-interleaved slab while decode is
+    /// active. Defaults to `--max-prefill-tokens` when omitted. A smaller
+    /// value reduces inter-token stalls without shrinking solo-prefill chunks.
+    #[arg(long)]
+    pub phase_prefill_slice_tokens: Option<usize>,
 
     /// Maximum tokens to prefill per scheduler iteration (chunked prefill).
     /// Long prompts are split into chunks of this size, interleaved with

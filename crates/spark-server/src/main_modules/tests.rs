@@ -30,8 +30,35 @@ fn test_cli_parse_positional_model() {
             assert_eq!(args.gpu_memory_utilization, 0.90);
             assert_eq!(args.scheduling_policy, "fifo");
             assert_eq!(args.tbt_deadline_ms, 100);
+            assert_eq!(args.phase_decode_steps, None);
+            assert_eq!(args.phase_prefill_steps, None);
+            assert_eq!(args.phase_prefill_slice_tokens, None);
         }
     }
+}
+
+#[test]
+fn test_cli_parse_phase_interleave_policy() {
+    let cli = Cli::try_parse_from([
+        "spark",
+        "serve",
+        "zai-org/GLM-5.3-Flash",
+        "--scheduling-policy",
+        "phase-interleave",
+        "--phase-decode-steps",
+        "4",
+        "--phase-prefill-steps",
+        "1",
+        "--phase-prefill-slice-tokens",
+        "32",
+    ])
+    .unwrap();
+    let Command::Serve(args) = cli.command else {
+        unreachable!("this test parses a serve command")
+    };
+    assert_eq!(args.phase_decode_steps, Some(4));
+    assert_eq!(args.phase_prefill_steps, Some(1));
+    assert_eq!(args.phase_prefill_slice_tokens, Some(32));
 }
 
 #[test]

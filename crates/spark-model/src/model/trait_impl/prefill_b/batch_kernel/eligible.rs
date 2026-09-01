@@ -56,12 +56,13 @@ impl TransformerModel {
         // that added the restriction) and the batched paged-attention kernel
         // indexing Q/O at `b * max_len` on a buffer packed by sum(len), with a
         // scalar kv_len at the max. The kernels are now cu_seqlens-aware.
-        let varlen = varlen_prefill_enabled();
+        let glm_native = self.config.model_type == "glm5_next";
+        let varlen = glm_native || varlen_prefill_enabled();
         // Effective staged length per stream. `peek_matched_tokens` is a
         // read-only probe: no refs taken, no LRU touch, no hit/miss counted, so
         // it is safe to call from a pure pre-flight check.
         let bs = self.kv_cache.lock().block_size();
-        let effective_arena = effective_arena_charge_enabled();
+        let effective_arena = effective_arena_charge_enabled() && !glm_native;
         let eff = |s: &PrefillSlice<'_>| -> usize {
             if !effective_arena {
                 return s.chunk_len;
@@ -85,10 +86,20 @@ impl TransformerModel {
         check_kernel_batched_eligible(
             streams
                 .iter()
-                .map(|s| (s.chunk_len, eff(s), s.chunk_start, s.is_last_chunk)),
+                // GLM's native cu_seqlens/state-table kernels support ragged
+                // offsets and mixed final chunks. Normalize only the generic
+                // admission geometry; the real values stay on PrefillSlice.
+                .map(|s| {
+                    (
+                        s.chunk_len,
+                        eff(s),
+                        if glm_native { 0 } else { s.chunk_start },
+                        if glm_native { false } else { s.is_last_chunk },
+                    )
+                }),
             streams.len(),
             self.buffers.max_batch_tokens(),
-            config_is_mla(&self.config),
+            config_is_mla(&self.config) && !glm_native,
             self.config.head_dim,
             self.buffers.scratch_bytes(),
             self.config.num_experts_per_tok,

@@ -22,6 +22,8 @@ mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]
 mod dispatch_proj;
 // Row-wise FP8 routing, split out when it took dispatch_proj.rs over the cap.
+#[path = "ops/dflash2.rs"]
+mod dflash2;
 #[path = "ops/dispatch_proj_rowwise.rs"]
 mod dispatch_proj_rowwise;
 #[path = "ops/embeddings.rs"]
@@ -64,6 +66,34 @@ mod gemv_q2;
 mod gemv_q2_vec;
 #[path = "ops/gemv_sw.rs"]
 mod gemv_sw;
+#[path = "ops/glm5_dsa.rs"]
+mod glm5_dsa;
+#[path = "ops/glm5_dsa_prefill.rs"]
+mod glm5_dsa_prefill;
+#[path = "ops/glm5_dsa_prefill_tc.rs"]
+mod glm5_dsa_prefill_tc;
+#[path = "ops/glm5_dsa_projection.rs"]
+mod glm5_dsa_projection;
+#[path = "ops/glm5_dsa_verify_multi.rs"]
+mod glm5_dsa_verify_multi;
+#[path = "ops/glm5_exl3.rs"]
+mod glm5_exl3;
+#[cfg(unix)]
+#[path = "ops/glm5_flash_kda.rs"]
+pub mod glm5_flash_kda;
+#[cfg(not(unix))]
+#[path = "ops/glm5_flash_kda_absent.rs"]
+pub mod glm5_flash_kda;
+#[path = "ops/glm5_kda.rs"]
+mod glm5_kda;
+#[path = "ops/glm5_kda_prefill.rs"]
+mod glm5_kda_prefill;
+#[path = "ops/glm5_kda_projection.rs"]
+mod glm5_kda_projection;
+#[path = "ops/glm5_residual.rs"]
+mod glm5_residual;
+#[path = "ops/glm5_router.rs"]
+mod glm5_router;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
 #[path = "ops/kv_cache.rs"]
@@ -143,6 +173,7 @@ mod wide_prefill;
 
 pub use activations::*;
 pub use derived_weights::{Derivation, DerivedWeights};
+pub use dflash2::*;
 pub use dispatch_config::GemmDispatch;
 pub use dispatch_helpers::*;
 pub use dispatch_proj::*;
@@ -160,6 +191,17 @@ pub use gemm_quant::*;
 pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
+pub use glm5_dsa::*;
+pub use glm5_dsa_prefill::*;
+pub use glm5_dsa_prefill_tc::*;
+pub use glm5_dsa_projection::*;
+pub use glm5_dsa_verify_multi::*;
+pub use glm5_exl3::*;
+pub use glm5_kda::*;
+pub use glm5_kda_prefill::*;
+pub use glm5_kda_projection::*;
+pub use glm5_residual::*;
+pub use glm5_router::*;
 pub use hyper_connection::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;

@@ -292,17 +292,35 @@ impl TransformerModel {
                 stream,
             )?;
         } else {
-            ops::dense_gemm(
-                self.gpu.as_ref(),
-                self.dense_gemm_kernel,
-                hidden,
-                &self.lm_head_weight,
-                logits,
-                num_tokens,
-                v,
-                h,
-                stream,
-            )?;
+            if self.config.model_type == "glm5_next" && num_tokens > 1 {
+                // GLM DFlash always verifies several rows at once. The generic
+                // fallback below is the original scalar 16x16 CUDA GEMM; it
+                // leaves GB10 tensor cores idle and measured as a ~29 ms tail
+                // at the 4x8 verifier shape. GLM's attention projections
+                // already use this cached cuBLASLt BF16 path for the identical
+                // [M,K] x [N,K]^T contract.
+                ops::cublas_bf16_proj_dense(
+                    hidden,
+                    self.lm_head_weight.weight,
+                    logits,
+                    num_tokens,
+                    v,
+                    h,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm(
+                    self.gpu.as_ref(),
+                    self.dense_gemm_kernel,
+                    hidden,
+                    &self.lm_head_weight,
+                    logits,
+                    num_tokens,
+                    v,
+                    h,
+                    stream,
+                )?;
+            }
         }
         // Feature-2: overlay overridden logit columns AFTER the base projection,
         // BEFORE softcap. Uniform-active route (seq_slot NULL); BF16 logits.

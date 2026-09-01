@@ -423,7 +423,7 @@ pub(super) async fn responses_endpoint_stream(
                             "reasoning_tokens": usage.reasoning_tokens,
                             "audio_tokens": 0,
                             "accepted_prediction_tokens": usage.accepted_prediction_tokens,
-                            "rejected_prediction_tokens": 0,
+                            "rejected_prediction_tokens": usage.rejected_prediction_tokens,
                         },
                     }));
                 }

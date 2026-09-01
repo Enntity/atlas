@@ -17,6 +17,7 @@ pub(super) fn start_new_requests(
     new_reqs: Vec<InferenceRequest>,
     chunked: bool,
     always_mixed: bool,
+    defer_new_prefill: bool,
     max_prefill_tokens: usize,
     max_batch_tokens: usize,
     eos_tokens: &[u32],
@@ -53,12 +54,14 @@ pub(super) fn start_new_requests(
     // A request admitted alone with nothing in flight keeps the inline
     // chunk-0 (and its `max_batch_tokens` solo budget) — deferral there
     // would only shrink its first chunk. Vision excluded per request, same
-    // shared-buffer reason as codispatch; EP excluded like every batched path.
+    // shared-buffer reason as codispatch. Multi-rank is admitted only when the
+    // model owns a rank-symmetric native batch command (GLM-5.3 TP2+EP2).
     let want_varlen_defer = chunked
-        && !model.is_ep()
+        && (!model.is_ep() || model.supports_native_batched_prefill())
         && active.is_empty()
         && (new_reqs.len() >= 2 || !prefilling.is_empty())
-        && spark_model::layers::ops::prefill_varlen_enabled();
+        && (spark_model::layers::ops::prefill_varlen_enabled()
+            || model.supports_native_batched_prefill());
     // Always-mixed chunk-0 fuse: when decodes are active and ATLAS_HOLO_ALWAYS_MIXED
     // is on, DEFER a new request's chunk-0 (admit it to `prefilling` with
     // chunk_offset=0, skip the inline blocking prefill) so it runs this SAME tick
@@ -67,7 +70,9 @@ pub(super) fn start_new_requests(
     // first chunk (the residual ~3.6s burst stall). Mutually exclusive with
     // want_codispatch (which requires active.is_empty()). EP/vision excluded (per
     // request, below) — same constraints as the fused mixed path.
-    let mixed_defer = always_mixed && chunked && !active.is_empty() && !model.is_ep();
+    let mixed_defer = chunked
+        && !active.is_empty()
+        && ((always_mixed && !model.is_ep()) || model.supports_dflash_prefill_fusion());
 
     // ── Vision co-dispatch pre-pass (ATLAS_VISION_CODISPATCH, default on) ──
     // Batch every single-chunk-fit image request's ViT encode into ONE
@@ -234,8 +239,9 @@ pub(super) fn start_new_requests(
     for (req_idx, req) in new_reqs.into_iter().enumerate() {
         let precomputed_beam_hyp = beam_hyps[req_idx].take();
         if chunked {
-            let defer =
-                want_codispatch || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels());
+            let defer = want_codispatch
+                || ((mixed_defer || want_varlen_defer || defer_new_prefill)
+                    && !req.has_image_pixels());
             // Pre-encoded by the co-dispatch pre-pass? (num_images>0 ⇒ batched)
             let slice = vision_slices[req_idx];
             let vision_slice = if slice.num_images > 0 {

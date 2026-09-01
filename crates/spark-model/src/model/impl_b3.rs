@@ -263,108 +263,6 @@ impl TransformerModel {
 
     // Proposer-wiring accessors live in impl_b3_accessors.rs (500-LoC cap).
 
-    /// DFlash prefill capture: copy `proc_count` tokens × hidden_size BF16
-    /// from `self.buffers.hidden_states()` (filled by the just-completed
-    /// prefill layer) into the per-sequence DFlash accumulator. Called
-    /// inside the prefill layer loop after each layer. No-op when:
-    ///   - DFlash is disabled (capture_layers empty)
-    ///   - `layer_idx` is not in `dflash_capture_layers`
-    ///   - The seq has no `DflashProposerState`
-    ///   - Rank > 0 under EP/TP (drafter is rank-0 only)
-    ///
-    /// Layout: writes `hidden[t]` BF16 into
-    /// `acc[(chunk_start + t) * 5 * h + slot_idx * h]` for each t.
-    /// Per-layer call performs `proc_count` strided d2d_async copies —
-    /// at typical prefill of 128–4096 tokens × 5 capture layers, total
-    /// 640–20480 launches per prefill. Acceptable launch overhead for
-    /// first land; replace with a strided-scatter kernel if profiling
-    /// shows it's a bottleneck.
-    pub(super) fn try_dflash_prefill_capture_layer(
-        &self,
-        seq: &mut crate::traits::SequenceState,
-        layer_idx: usize,
-        chunk_start: usize,
-        proc_count: usize,
-        stream: u64,
-    ) -> Result<()> {
-        if self.dflash_capture_layers.is_empty() {
-            return Ok(());
-        }
-        let slot_idx = match self
-            .dflash_capture_layers
-            .iter()
-            .position(|&l| l == layer_idx)
-        {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        if let Some(ref c) = self.comm
-            && c.rank() != 0
-        {
-            return Ok(());
-        }
-        let dstate = match seq.proposer_state.as_mut() {
-            Some(ps) => match ps
-                .as_any_mut()
-                .downcast_mut::<crate::layers::DflashProposerState>()
-            {
-                Some(s) => s,
-                None => return Ok(()),
-            },
-            None => return Ok(()),
-        };
-        let h = self.config.hidden_size;
-        let bf16 = 2usize;
-        let n_capture = self.dflash_capture_layers.len();
-        let acc_base = dstate.ctx_hidden_acc;
-        let max_ctx = dstate.max_ctx_len;
-        let src_base = self.buffers.hidden_states();
-        for t in 0..proc_count {
-            let abs_pos = chunk_start + t;
-            if abs_pos >= max_ctx {
-                break; // accumulator full; drop later positions
-            }
-            let src = src_base.offset(t * h * bf16);
-            let dst_offset = abs_pos * n_capture * h * bf16 + slot_idx * h * bf16;
-            self.gpu
-                .copy_d2d_async(src, acc_base.offset(dst_offset), h * bf16, stream)?;
-        }
-        Ok(())
-    }
-
-    /// After prefill completes, advance the seq's DFlash `ctx_len` to
-    /// `chunk_start + proc_count` so the drafter sees all captured prompt
-    /// positions on the first propose() call.
-    pub(super) fn update_dflash_ctx_len_after_prefill(
-        &self,
-        seq: &mut crate::traits::SequenceState,
-        chunk_start: usize,
-        proc_count: usize,
-    ) -> Result<()> {
-        if self.dflash_capture_layers.is_empty() {
-            return Ok(());
-        }
-        if let Some(ref c) = self.comm
-            && c.rank() != 0
-        {
-            return Ok(());
-        }
-        if let Some(ps) = seq.proposer_state.as_mut()
-            && let Some(dstate) = ps
-                .as_any_mut()
-                .downcast_mut::<crate::layers::DflashProposerState>()
-        {
-            let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
-            dstate.ctx_len = new_len;
-            // Phase I (v2): seed per-slot fixed positions for the prompt
-            // captures. Prefill slot i holds prompt position i, so the
-            // fixed rope position is simply its index. Keep parallel to
-            // ctx_len. Re-seed idempotently across prefill chunks.
-            dstate.ctx_positions = (0..new_len).map(|i| i as i32).collect();
-        }
-        Ok(())
-    }
-
     /// DFlash 5-layer hidden capture. Called inside each per-layer loop after
     /// `layer.decode(...)` returns. No-op when DFlash is disabled (the buffer
     /// is `None`) or when `layer_idx` is not in `dflash_capture_layers`.
@@ -467,6 +365,77 @@ impl TransformerModel {
             let src = self.buffers.hidden_states().offset(t * h * bf16);
             let dst_slot = dst.offset(t * ctx_slot_bytes + slot * h * bf16);
             self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn commit_ctx_rows_dispatch(
+        &self,
+        seq: &mut crate::traits::SequenceState,
+        capture_row: usize,
+        num_committed: usize,
+        base_pos: usize,
+    ) -> Result<()> {
+        if num_committed == 0 {
+            return Ok(());
+        }
+        let base = match self.dflash_hidden_save {
+            Some(pointer) => pointer,
+            None => return Ok(()),
+        };
+        let proposer = match seq.proposer_state.as_mut() {
+            Some(proposer) => proposer.as_mut(),
+            None => return Ok(()),
+        };
+        let state = match proposer
+            .as_any_mut()
+            .downcast_mut::<crate::layers::DflashProposerState>()
+        {
+            Some(state) => state,
+            None => return Ok(()),
+        };
+        let capture_layers = self.dflash_capture_layers.len();
+        if capture_layers == 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            capture_row + num_committed <= self.dflash_hidden_save_rows,
+            "DFlash context commit exceeds capture rows"
+        );
+        let ctx_slot_bytes = capture_layers * self.config.hidden_size * 2;
+        let stream = self.gpu.default_stream();
+        if state.ctx_len + num_committed > state.max_ctx_len {
+            let keep = (state.max_ctx_len / 2).min(state.max_ctx_len.saturating_sub(num_committed));
+            let drop_n = state.ctx_len.saturating_sub(keep);
+            if drop_n > 0 {
+                self.gpu.copy_d2d_async(
+                    state.ctx_hidden_acc.offset(drop_n * ctx_slot_bytes),
+                    state.ctx_hidden_acc,
+                    keep * ctx_slot_bytes,
+                    stream,
+                )?;
+                state.ctx_positions.drain(..drop_n);
+                state.ctx_len = keep;
+                state.ctx_committed = 0;
+            }
+        }
+        debug_assert_eq!(state.ctx_positions.len(), state.ctx_len);
+        for token in 0..num_committed {
+            let source = base.offset((capture_row + token) * ctx_slot_bytes);
+            let destination = state.ctx_hidden_acc.offset(state.ctx_len * ctx_slot_bytes);
+            self.gpu
+                .copy_d2d_async(source, destination, ctx_slot_bytes, stream)?;
+            state.ctx_positions.push((base_pos + token) as i32);
+            state.ctx_len += 1;
+        }
+        state.skip_next_decode_append = true;
+        if self.stats.once("log:dflash_unified_ctx") {
+            tracing::info!(
+                "DFlash UNIFIED_CTX ACTIVE: first commit_ctx rows={} base_pos={} ctx_len={}",
+                num_committed,
+                base_pos,
+                state.ctx_len,
+            );
         }
         Ok(())
     }

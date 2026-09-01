@@ -34,7 +34,9 @@
 use anyhow::{Result, bail};
 use spark_runtime::gpu::DevicePtr;
 
-use super::{MixedBatchResult, MixedForwardResult, PrefillSlice, SequenceState};
+use super::{
+    DflashPrefillResult, MixedBatchResult, MixedForwardResult, PrefillSlice, SequenceState,
+};
 
 /// One beam-search request for a translation model (NLLB). Carries the resolved
 /// per-request parameters the scheduler stamps onto the sequence; the model runs
@@ -742,6 +744,53 @@ pub trait Model: Send + Sync {
         self.decode_verify_graphed_kgamma(tokens, seq, stream)
     }
 
+    /// Whether this model can verify equal-width DFlash blocks from several
+    /// sequences in one target weight sweep.
+    fn can_batch_verify_dflash(&self, _num_sequences: usize, _k: usize) -> bool {
+        false
+    }
+
+    /// Sequence-major DFlash target verification. `tokens` contains
+    /// `seqs.len() * k` rows; the result has the same layout.
+    fn decode_verify_dflash_batched(
+        &self,
+        _tokens: &[u32],
+        _k: usize,
+        _seqs: &mut [&mut SequenceState],
+        _stream: u64,
+    ) -> Result<Vec<u32>> {
+        bail!("batched DFlash verification is unsupported")
+    }
+
+    /// Whether the fixed GLM appliance can co-dispatch an arriving prompt
+    /// slice with one active DFlash target block.  This is intentionally a
+    /// narrow capability: both blocks have the same causal width and share
+    /// one layer/FFN weight sweep.
+    fn supports_dflash_prefill_fusion(&self) -> bool {
+        false
+    }
+
+    /// Maximum prompt rows that can accompany a target block of this width.
+    fn dflash_prefill_capacity(&self, _target_rows: usize) -> usize {
+        0
+    }
+
+    /// Verify `target_tokens` and advance an equal-width prompt slice in one
+    /// GLM weight sweep.  The prompt state is committed in full; only the
+    /// target block is subject to speculative rollback by the scheduler.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_verify_dflash_with_prefill(
+        &self,
+        _target_tokens: &[u32],
+        _target_seq: &mut SequenceState,
+        _prefill_tokens: &[u32],
+        _prefill_seq: &mut SequenceState,
+        _prefill_total_len: usize,
+        _stream: u64,
+    ) -> Result<DflashPrefillResult> {
+        bail!("DFlash/prefill fusion is unsupported")
+    }
+
     /// DFlash fused decode+verify: one M=(1+k) forward replacing separate
     /// M=1 decode + M=k verify on the DFlash path.
     ///
@@ -844,6 +893,22 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// Batched-verifier form of [`Self::commit_ctx`]. `capture_row` selects
+    /// the first row in the shared sequence-major hidden capture.
+    fn commit_ctx_from_row(
+        &self,
+        seq: &mut SequenceState,
+        capture_row: usize,
+        num_committed: usize,
+        base_pos: usize,
+    ) -> Result<()> {
+        if capture_row == 0 {
+            self.commit_ctx(seq, num_committed, base_pos)
+        } else {
+            bail!("offset DFlash context commit is unsupported")
+        }
+    }
+
     /// Run the MTP proposer for one draft token off the saved hidden state.
     /// `None` when no proposer is wired.
     fn run_mtp_propose(
@@ -872,6 +937,25 @@ pub trait Model: Send + Sync {
         stream: u64,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>>;
+
+    /// Set the request sampling contract consumed by a DFlash2 proposal.
+    /// Default no-op keeps every other proposer unchanged.
+    fn configure_dflash_sampling(
+        &self,
+        _seq: &mut SequenceState,
+        _temperature: f32,
+        _seed: Option<u64>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Sparse proposal distribution retained by the last DFlash2 propose.
+    fn dflash_sparse_distribution(
+        &self,
+        _seq: &SequenceState,
+    ) -> Option<crate::speculative::SparseDraftDistribution> {
+        None
+    }
 
     /// Read the draft token ID stored on GPU by the last `run_mtp_propose_multi`
     /// call (which used `embed_from_argmax` to write the draft embedding and
@@ -966,6 +1050,24 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// True when an MLA-family model carries every attention state needed
+    /// across prompt chunks. Ordinary MLA remains fail-closed because Atlas
+    /// has no paged-MLA prefill kernel. GLM-5.3 is the exception: its custom
+    /// sparse-MLA implementation persists latent, pooled-key, tail-key,
+    /// tail-gate, and tail-metadata state at absolute token positions.
+    fn supports_chunked_mla_prefill(&self) -> bool {
+        false
+    }
+
+    /// True when the model has a real stacked-token prefill implementation,
+    /// including rank-symmetric worker dispatch for a multi-rank world.
+    /// This is deliberately a capability, not a scheduler environment knob:
+    /// admitting a model without the matching worker/state kernels would
+    /// desynchronize collectives.
+    fn supports_native_batched_prefill(&self) -> bool {
+        false
+    }
+
     /// Tokens per paged-KV block, or `None` when the model has no paged KV.
     /// The scheduler uses this to land a prefill chunk boundary exactly on the
     /// block boundary a warm turn will match at (see
@@ -1008,6 +1110,39 @@ pub trait Model: Send + Sync {
     /// Uses a single NCCL broadcast instead of per-token broadcasts.
     fn ep_broadcast_tokens(&self, _tokens: &[u32]) -> Result<Vec<u32>> {
         Ok(Vec::new()) // no-op for non-EP models
+    }
+
+    /// Start one worker-side multi-sequence DFlash verifier. The worker
+    /// receives verdicts later through [`Self::ep_broadcast_tokens`].
+    fn ep_broadcast_dflash_verify_batch(
+        &self,
+        _seq_ids: &[u32],
+        _tokens: &[u32],
+        _k: usize,
+    ) -> Result<()> {
+        bail!("batched EP DFlash verification is unsupported")
+    }
+
+    /// Start one worker-side GLM heterogeneous verifier/prefill pass. The
+    /// worker receives the active lane's speculative verdict in a later
+    /// [`Self::ep_broadcast_tokens`] call.
+    #[allow(clippy::too_many_arguments)]
+    fn ep_broadcast_dflash_prefill(
+        &self,
+        _target_seq_id: u32,
+        _prefill_seq_id: u32,
+        _target_tokens: &[u32],
+        _prefill_tokens: &[u32],
+        _prefill_total_len: usize,
+    ) -> Result<()> {
+        bail!("EP DFlash/prefill fusion is unsupported")
+    }
+
+    /// Broadcast one complete multi-sequence prefill operation to EP/TP
+    /// workers. Implementations must preserve stream order exactly because
+    /// tensor-parallel reductions operate row-for-row across ranks.
+    fn ep_broadcast_prefill_batch(&self, _streams: &[PrefillSlice<'_>]) -> Result<()> {
+        bail!("native EP batched prefill is not implemented for this model")
     }
 
     /// Trim the MTP proposer's KV cache after verification.

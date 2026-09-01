@@ -37,6 +37,8 @@ use crate::weight_map::{DenseWeight, dense};
 /// `serde_json::from_str` works directly on the raw file.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DflashConfig {
+    #[serde(default)]
+    pub architectures: Vec<String>,
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
     pub intermediate_size: usize,
@@ -57,12 +59,50 @@ pub struct DflashConfig {
     /// Drafter base RoPE θ. Defaults to 10M (matches Qwen3.6-DFlash).
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
+    #[serde(default)]
+    pub rope_parameters: Option<DflashRopeParameters>,
+    #[serde(default = "default_rms_norm_eps")]
+    pub rms_norm_eps: f32,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
     /// HF-style `rope_scaling` block. `None` ⇒ plain RoPE (the v2 2026-04-27
     /// Qwen3.6-DFlash drafter ships `rope_scaling: null`). When present and
     /// `rope_type == "yarn"`, the drafter's YaRN parameters are used to
     /// build the inv_freq table at construction time.
     #[serde(default)]
     pub rope_scaling: Option<DflashRopeScaling>,
+}
+
+impl DflashConfig {
+    pub fn is_dflash2(&self) -> bool {
+        self.architectures.iter().any(|a| a == "DFlash2DraftModel")
+    }
+
+    pub fn effective_block_size(&self) -> usize {
+        self.dflash_config
+            .as_ref()
+            .and_then(|c| c.block_size)
+            .unwrap_or(self.block_size)
+    }
+
+    pub fn effective_rope_theta(&self) -> f32 {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|p| p.rope_theta)
+            .unwrap_or(self.rope_theta)
+    }
+}
+
+fn default_rms_norm_eps() -> f32 {
+    1.0e-6
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DflashRopeParameters {
+    #[serde(default)]
+    pub rope_theta: Option<f32>,
+    #[serde(default)]
+    pub rope_type: Option<String>,
 }
 
 fn default_rope_theta() -> f32 {
@@ -95,6 +135,8 @@ fn default_block_size() -> usize {
 /// Nested `dflash_config` block in the drafter's `config.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DflashSubConfig {
+    #[serde(default)]
+    pub block_size: Option<usize>,
     /// Token id used to fill the γ "to-be-predicted" positions during draft
     /// inference. `248070` for Qwen3.6-DFlash.
     pub mask_token_id: u32,
@@ -102,6 +144,14 @@ pub struct DflashSubConfig {
     /// `[1, 10, 19, 28, 37]` for Qwen3.6-35B-A3B-DFlash. Order matters:
     /// shallow-to-deep concatenation is what `fc` expects.
     pub target_layer_ids: Vec<usize>,
+    #[serde(default)]
+    pub conv_group_size: Option<usize>,
+    #[serde(default)]
+    pub conv_kernel_size: Option<usize>,
+    #[serde(default)]
+    pub selector_rank: Option<usize>,
+    #[serde(default)]
+    pub selector_top_k: Option<usize>,
 }
 
 /// Raw weight bundle for the DFlash drafter, post-load.
@@ -128,6 +178,7 @@ pub struct DflashWeights {
     pub norm: DenseWeight,
 
     pub layers: Vec<DflashLayerWeights>,
+    pub dflash2_selector: Option<Dflash2SelectorWeights>,
 
     /// Present iff the drafter has a draft-id → target-id mapping (i.e.
     /// `draft_vocab_size != target_vocab_size`). Absent for
@@ -149,6 +200,21 @@ pub struct DflashLayerWeights {
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
     pub down_proj: DenseWeight,
+    pub attention_conv: Option<DflashDynamicConvWeights>,
+    pub mlp_conv: Option<DflashDynamicConvWeights>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DflashDynamicConvWeights {
+    pub base_kernel: DenseWeight,
+    pub kernel_projection: DenseWeight,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Dflash2SelectorWeights {
+    pub hidden_projection: DenseWeight,
+    pub predecessor_codebook: DenseWeight,
+    pub successor_codebook: DenseWeight,
 }
 
 /// Probe a [`WeightStore`] for the presence of DFlash drafter weights.
@@ -232,6 +298,29 @@ pub fn load_dflash_weights(
         .context("DFlash drafter: load norm.weight")?;
 
     let layer_count = drafter_config.num_hidden_layers;
+    let dflash2 = drafter_config.is_dflash2();
+    if dflash2 {
+        let sub = drafter_config
+            .dflash_config
+            .as_ref()
+            .context("DFlash2 config is missing dflash_config")?;
+        anyhow::ensure!(
+            sub.conv_kernel_size == Some(2),
+            "DFlash2 requires conv_kernel_size=2"
+        );
+        anyhow::ensure!(
+            sub.conv_group_size.is_some_and(|v| v > 0),
+            "DFlash2 conv_group_size is missing"
+        );
+        anyhow::ensure!(
+            sub.selector_rank.is_some_and(|v| v > 0),
+            "DFlash2 selector_rank is missing"
+        );
+        anyhow::ensure!(
+            sub.selector_top_k == Some(16),
+            "native DFlash2 selector requires selector_top_k=16"
+        );
+    }
     let mut layers = Vec::with_capacity(layer_count);
     for i in 0..layer_count {
         let lp = format!("{prefix}layers.{i}");
@@ -250,6 +339,31 @@ pub fn load_dflash_weights(
             gate_proj: dense(drafter_store, &format!("{lp}.mlp.gate_proj.weight"))?,
             up_proj: dense(drafter_store, &format!("{lp}.mlp.up_proj.weight"))?,
             down_proj: dense(drafter_store, &format!("{lp}.mlp.down_proj.weight"))?,
+            attention_conv: dflash2
+                .then(|| {
+                    Ok::<_, anyhow::Error>(DflashDynamicConvWeights {
+                        base_kernel: dense(
+                            drafter_store,
+                            &format!("{lp}.attention_conv.base_kernel"),
+                        )?,
+                        kernel_projection: dense(
+                            drafter_store,
+                            &format!("{lp}.attention_conv.kernel_projection.weight"),
+                        )?,
+                    })
+                })
+                .transpose()?,
+            mlp_conv: dflash2
+                .then(|| {
+                    Ok::<_, anyhow::Error>(DflashDynamicConvWeights {
+                        base_kernel: dense(drafter_store, &format!("{lp}.mlp_conv.base_kernel"))?,
+                        kernel_projection: dense(
+                            drafter_store,
+                            &format!("{lp}.mlp_conv.kernel_projection.weight"),
+                        )?,
+                    })
+                })
+                .transpose()?,
         };
         layers.push(layer);
     }
@@ -272,12 +386,31 @@ pub fn load_dflash_weights(
         None
     };
 
+    let dflash2_selector = dflash2
+        .then(|| {
+            Ok::<_, anyhow::Error>(Dflash2SelectorWeights {
+                hidden_projection: dense(
+                    drafter_store,
+                    &format!("{prefix}candidate_selector.hidden_projection.weight"),
+                )?,
+                predecessor_codebook: dense(
+                    drafter_store,
+                    &format!("{prefix}candidate_selector.predecessor_codebook"),
+                )?,
+                successor_codebook: dense(
+                    drafter_store,
+                    &format!("{prefix}candidate_selector.successor_codebook"),
+                )?,
+            })
+        })
+        .transpose()?;
+
     tracing::info!(
         "DFlash drafter loaded: {} layers, hidden={}, vocab={}, γ={}, target_layers={:?}",
         layers.len(),
         drafter_config.hidden_size,
         drafter_config.vocab_size,
-        drafter_config.block_size,
+        drafter_config.effective_block_size(),
         drafter_config
             .dflash_config
             .as_ref()
@@ -291,6 +424,7 @@ pub fn load_dflash_weights(
         hidden_norm,
         norm,
         layers,
+        dflash2_selector,
         draft_id_to_target_id,
     }))
 }
@@ -327,5 +461,29 @@ mod tests {
         let sub = config.dflash_config.expect("dflash_config present");
         assert_eq!(sub.mask_token_id, 248070);
         assert_eq!(sub.target_layer_ids, vec![1, 10, 19, 28, 37]);
+    }
+
+    #[test]
+    fn parse_glm53_dflash2_contract() {
+        let json = r#"{
+          "architectures":["DFlash2DraftModel"], "hidden_size":4096,
+          "num_hidden_layers":5, "intermediate_size":12288,
+          "num_attention_heads":32, "num_key_value_heads":8, "head_dim":128,
+          "vocab_size":154880, "rms_norm_eps":1e-5, "sliding_window":2048,
+          "rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},
+          "dflash_config":{"block_size":8,"conv_group_size":16,
+          "conv_kernel_size":2,"mask_token_id":154856,"selector_rank":256,
+          "selector_top_k":16,"target_layer_ids":[5,14,24,33,42]}}
+        "#;
+        let config = parse_dflash_config(json).expect("parse GLM DFlash2 config");
+        assert!(config.is_dflash2());
+        assert_eq!(config.effective_block_size(), 8);
+        assert_eq!(config.effective_rope_theta(), 10_000.0);
+        assert_eq!(config.rms_norm_eps, 1.0e-5);
+        let sub = config.dflash_config.expect("nested config");
+        assert_eq!(sub.conv_group_size, Some(16));
+        assert_eq!(sub.conv_kernel_size, Some(2));
+        assert_eq!(sub.selector_rank, Some(256));
+        assert_eq!(sub.selector_top_k, Some(16));
     }
 }

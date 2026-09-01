@@ -167,8 +167,9 @@ pub(crate) fn maybe_run_ep_worker(
     let rank = args.rank;
     let model_owned = model.take().expect("EP worker requires owned model");
     let model_has_proposer = model_owned.has_proposer();
-    if !args.speculative && !args.self_speculative && !args.ngram_speculative && model_has_proposer
-    {
+    let spec_mode =
+        args.speculative || args.self_speculative || args.ngram_speculative || args.dflash;
+    if proposer_flag_mismatch(model_has_proposer, spec_mode) {
         let override_set = matches!(
             std::env::var("ATLAS_ALLOW_SPEC_MISMATCH").as_deref(),
             Ok("1") | Ok("true")
@@ -186,11 +187,7 @@ pub(crate) fn maybe_run_ep_worker(
             "EP worker (rank {rank}) running WITHOUT speculative flags but \
              ATLAS_ALLOW_SPEC_MISMATCH=1 — head must NOT issue MTP commands."
         );
-    } else if !model_has_proposer
-        && !args.speculative
-        && !args.self_speculative
-        && !args.ngram_speculative
-    {
+    } else if !model_has_proposer && !spec_mode {
         tracing::info!(
             "EP worker (rank {rank}): checkpoint has no MTP weights; \
              spec-mismatch guard auto-skipped (head can't use MTP either)."
@@ -271,6 +268,22 @@ pub(crate) fn maybe_run_ep_worker(
     });
     handle.join().expect("EP worker thread panicked");
     Ok(true)
+}
+
+fn proposer_flag_mismatch(model_has_proposer: bool, spec_mode: bool) -> bool {
+    model_has_proposer && !spec_mode
+}
+
+#[cfg(test)]
+mod tests {
+    use super::proposer_flag_mismatch;
+
+    #[test]
+    fn dflash_counts_as_an_explicit_worker_spec_mode() {
+        assert!(!proposer_flag_mismatch(true, true));
+        assert!(proposer_flag_mismatch(true, false));
+        assert!(!proposer_flag_mismatch(false, false));
+    }
 }
 
 #[cfg(test)]

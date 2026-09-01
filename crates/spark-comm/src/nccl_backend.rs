@@ -69,8 +69,9 @@ mod recv_buffer;
 use recv_buffer::ensure_payload_fits;
 pub use recv_buffer::{ALL_REDUCE_DTYPE_BYTES, required_recv_bytes};
 
-/// Timeout threshold for a single synchronous collective operation.
-/// If a broadcast + stream sync takes longer than this, mark the communicator unhealthy.
+/// Diagnostic threshold for a synchronous broadcast. The elapsed time may
+/// include a legitimate wait for the peer, so only NCCL async status controls
+/// communicator health.
 pub(super) const COLLECTIVE_TIMEOUT_SECS: u64 = 30;
 
 /// NCCL communication backend for multi-GPU / multi-node EP.

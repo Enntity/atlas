@@ -118,7 +118,7 @@ fn set_direct_flag(opts: &mut OpenOptions) {
 #[cfg(not(target_os = "linux"))]
 fn set_direct_flag(_opts: &mut OpenOptions) {}
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn preallocate(file: &File, size: u64) -> Result<()> {
     // posix_fallocate is portable across ext4/xfs and reserves space without
     // writing zeros; FALLOC_FL_KEEP_SIZE would be wrong here because we *do*
@@ -131,11 +131,11 @@ fn preallocate(file: &File, size: u64) -> Result<()> {
     Ok(())
 }
 
-// Windows: `set_len` extends the file to the requested size. NTFS keeps the
-// tail sparse until written, so this reserves the RANGE rather than the blocks
-// -- weaker than posix_fallocate, and the honest trade for not requiring the
-// SE_MANAGE_VOLUME privilege that SetFileValidData needs.
-#[cfg(windows)]
+// Non-Linux: `set_len` extends the file to the requested size. This is weaker
+// than Linux `posix_fallocate` (it may remain sparse), but is the portable
+// fallback on macOS and Windows and is sufficient for an unreachable CUDA
+// storage tier during host-side type checking.
+#[cfg(not(target_os = "linux"))]
 fn preallocate(file: &File, size: u64) -> Result<()> {
     file.set_len(size)
         .with_context(|| format!("set_len({size})"))?;

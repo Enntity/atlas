@@ -7,8 +7,11 @@ use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::super::{WeightDtype, WeightTensor, evict_page_cache, f16_to_bf16_bytes};
-use super::{SafetensorsIndex, check_oom_guard, estimate_has_fp8, estimate_load_bytes};
+use super::super::{
+    TensorLoadPolicy, WeightDtype, WeightTensor, evict_page_cache, f16_to_bf16_bytes,
+    is_exl3_raw_tensor,
+};
+use super::{SafetensorsIndex, check_oom_guard, estimate_has_fp8, estimate_load_bytes_with_policy};
 use crate::gpu::GpuBackend;
 
 pub(super) fn load_sharded(
@@ -18,6 +21,7 @@ pub(super) fn load_sharded(
     oom_reserve_bytes: usize,
     skip_fn: &dyn Fn(&str) -> bool,
     peak_multiplier_override: Option<f64>,
+    tensor_load_policy: TensorLoadPolicy,
 ) -> Result<HashMap<String, WeightTensor>> {
     let index_json = std::fs::read_to_string(index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
@@ -37,7 +41,7 @@ pub(super) fn load_sharded(
     // Pre-flight: estimate bytes from index with model-building overhead.
     let shard_files: Vec<std::path::PathBuf> =
         shard_to_tensors.keys().map(|s| model_dir.join(s)).collect();
-    let estimated = estimate_load_bytes(&shard_files, skip_fn)?;
+    let estimated = estimate_load_bytes_with_policy(&shard_files, skip_fn, tensor_load_policy)?;
     let has_fp8 = estimate_has_fp8(&shard_files, skip_fn)?;
     let overhead_multiplier: f64 =
         peak_multiplier_override.unwrap_or(if has_fp8 { 1.5 } else { 1.3 });
@@ -103,12 +107,16 @@ pub(super) fn load_sharded(
             // F16 shards: convert bytes to BF16 before upload (same length,
             // different bit layout). WeightDtype stays closed to store dtypes.
             let converted: Vec<u8>;
-            let (data, dtype): (&[u8], _) = if view.dtype() == safetensors::Dtype::F16 {
-                converted = f16_to_bf16_bytes(view.data());
-                (&converted, WeightDtype::BF16)
-            } else {
-                (view.data(), WeightDtype::from_safetensors(view.dtype())?)
-            };
+            let (data, dtype): (&[u8], _) =
+                if view.dtype() == safetensors::Dtype::F16 && !is_exl3_raw_tensor(name) {
+                    converted = f16_to_bf16_bytes(view.data());
+                    (&converted, WeightDtype::BF16)
+                } else {
+                    (view.data(), WeightDtype::from_safetensors(view.dtype())?)
+                };
+
+            let prepared = tensor_load_policy.prepare(name, &shape, dtype, data)?;
+            let data = prepared.data.as_ref();
 
             // Try GPU alloc first; if OOM, fall back to managed (UVM) memory.
             // On GB10 unified memory, managed alloc uses Linux swap for overflow.
@@ -138,7 +146,14 @@ pub(super) fn load_sharded(
                 }
             };
 
-            weights.insert(name.clone(), WeightTensor { ptr, shape, dtype });
+            weights.insert(
+                name.clone(),
+                WeightTensor {
+                    ptr,
+                    shape: prepared.shape,
+                    dtype,
+                },
+            );
         }
 
         // Drop mmap before evicting page cache — releases the mapping first.
@@ -177,6 +192,7 @@ pub(super) fn load_single(
     gpu: &dyn GpuBackend,
     oom_reserve_bytes: usize,
     skip_fn: &dyn Fn(&str) -> bool,
+    tensor_load_policy: TensorLoadPolicy,
 ) -> Result<HashMap<String, WeightTensor>> {
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
@@ -190,17 +206,27 @@ pub(super) fn load_single(
         let shape: Vec<usize> = view.shape().to_vec();
         // F16: convert to BF16 at load — see load_sharded above.
         let converted: Vec<u8>;
-        let (data, dtype): (&[u8], _) = if view.dtype() == safetensors::Dtype::F16 {
-            converted = f16_to_bf16_bytes(view.data());
-            (&converted, WeightDtype::BF16)
-        } else {
-            (view.data(), WeightDtype::from_safetensors(view.dtype())?)
-        };
+        let (data, dtype): (&[u8], _) =
+            if view.dtype() == safetensors::Dtype::F16 && !is_exl3_raw_tensor(&name) {
+                converted = f16_to_bf16_bytes(view.data());
+                (&converted, WeightDtype::BF16)
+            } else {
+                (view.data(), WeightDtype::from_safetensors(view.dtype())?)
+            };
 
+        let prepared = tensor_load_policy.prepare(&name, &shape, dtype, data)?;
+        let data = prepared.data.as_ref();
         let ptr = gpu.alloc(data.len())?;
         gpu.copy_h2d(data, ptr)?;
 
-        weights.insert(name, WeightTensor { ptr, shape, dtype });
+        weights.insert(
+            name,
+            WeightTensor {
+                ptr,
+                shape: prepared.shape,
+                dtype,
+            },
+        );
     }
 
     // Drop mmap before evicting page cache.

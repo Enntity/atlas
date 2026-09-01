@@ -44,6 +44,56 @@ fn test_ssm_layer_state_mut() {
 }
 
 #[test]
+fn test_kda_layer_state_keeps_three_convolution_histories_distinct() {
+    let pointers = KdaStatePointers {
+        recurrent: DevicePtr(0x1000),
+        q_conv: DevicePtr(0x2000),
+        k_conv: DevicePtr(0x3000),
+        v_conv: DevicePtr(0x4000),
+    };
+    let state: Box<dyn LayerState> = Box::new(KdaLayerState {
+        slot_idx: 3,
+        slot_capacity: 9,
+        current: pointers,
+        checkpoint: Some(pointers),
+        intermediates: vec![pointers],
+    });
+    assert!(state.as_any().downcast_ref::<SsmLayerState>().is_none());
+    let kda = state.as_any().downcast_ref::<KdaLayerState>().unwrap();
+    assert_eq!(kda.slot_idx, 3);
+    assert_eq!(kda.current.recurrent, DevicePtr(0x1000));
+    assert_eq!(kda.current.q_conv, DevicePtr(0x2000));
+    assert_eq!(kda.current.k_conv, DevicePtr(0x3000));
+    assert_eq!(kda.current.v_conv, DevicePtr(0x4000));
+}
+
+#[test]
+fn test_glm_sparse_mla_state_is_one_atomic_image() {
+    let pointers = GlmSparseMlaStatePointers {
+        latent_cache: DevicePtr(0x1000),
+        pooled_keys: DevicePtr(0x2000),
+        tail_keys: DevicePtr(0x3000),
+        tail_gates: DevicePtr(0x4000),
+        tail_metadata: DevicePtr(0x5000),
+    };
+    let state: Box<dyn LayerState> = Box::new(GlmSparseMlaLayerState {
+        slot_idx: 5,
+        current: pointers,
+        checkpoint: Some(pointers),
+        intermediates: vec![pointers],
+    });
+    assert!(state.as_any().downcast_ref::<EmptyLayerState>().is_none());
+    let sparse = state
+        .as_any()
+        .downcast_ref::<GlmSparseMlaLayerState>()
+        .unwrap();
+    assert_eq!(sparse.slot_idx, 5);
+    assert_eq!(sparse.current.latent_cache, DevicePtr(0x1000));
+    assert_eq!(sparse.current.pooled_keys, DevicePtr(0x2000));
+    assert_eq!(sparse.current.tail_metadata, DevicePtr(0x5000));
+}
+
+#[test]
 fn test_forward_context_lifetime() {
     use spark_runtime::gpu::mock::MockGpuBackend;
 

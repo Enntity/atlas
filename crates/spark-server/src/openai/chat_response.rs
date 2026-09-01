@@ -82,8 +82,8 @@ pub struct CompletionTokensDetails {
     /// tokens that matched generation" meaning, with the server as the
     /// predictor. 0 when speculation is off or nothing was accepted.
     pub accepted_prediction_tokens: usize,
-    /// Predicted-output tokens that were rejected. Always 0 on Atlas —
-    /// rejected MTP drafts are not client-billable and are not reported here.
+    /// Speculative-decode draft tokens rejected by verification. This is a
+    /// compute/accounting counter; it does not affect billable output tokens.
     pub rejected_prediction_tokens: usize,
 }
 

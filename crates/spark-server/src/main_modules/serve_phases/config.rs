@@ -73,6 +73,62 @@ pub(crate) fn load_model_config(model_dir: &Path) -> Result<(ModelConfig, String
     Ok((config, config_json))
 }
 
+/// Fail-closed bring-up contract for the initial GLM-5.3 execution path.
+/// Every rejected feature needs architecture state that the first native path
+/// deliberately does not snapshot or migrate yet.
+pub(crate) fn validate_glm53_runtime(args: &cli::ServeArgs, config: &ModelConfig) -> Result<()> {
+    let ep_protocol_v2 = matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"));
+    validate_glm53_runtime_contract(args, config, ep_protocol_v2)
+}
+
+fn validate_glm53_runtime_contract(
+    args: &cli::ServeArgs,
+    config: &ModelConfig,
+    ep_protocol_v2: bool,
+) -> Result<()> {
+    if config.model_type != "glm5_next" {
+        return Ok(());
+    }
+    let plan = atlas_core::glm5::Glm53FlashPlan::from_config(config)?;
+    plan.validate_bootstrap_topology(args.ep_size, args.tp_size)?;
+    if args.world_size != 2 {
+        anyhow::bail!("GLM-5.3-Flash bootstrap requires --world-size 2");
+    }
+    if !ep_protocol_v2 {
+        anyhow::bail!(
+            "GLM-5.3-Flash concurrency requires ATLAS_EP_PROTOCOL=v2 on both ranks; \
+             EP v1 silently forces max_batch_size=1"
+        );
+    }
+    if args.scheduling_policy != "phase-interleave" {
+        anyhow::bail!(
+            "GLM-5.3-Flash requires --scheduling-policy phase-interleave until \
+             same-forward KDA/DSA prefill+decode has passed the two-Spark latency gate"
+        );
+    }
+    if args.max_prefill_tokens == 0 {
+        anyhow::bail!(
+            "GLM-5.3-Flash requires chunked prefill; set --max-prefill-tokens explicitly"
+        );
+    }
+    if args.enable_prefix_caching {
+        anyhow::bail!(
+            "GLM-5.3-Flash prefix caching is disabled until KV, KDA, and semantic-index state restore atomically"
+        );
+    }
+    if args.speculative || args.self_speculative || args.ngram_speculative {
+        anyhow::bail!(
+            "GLM-5.3-Flash supports only its checkpoint-matched DFlash2 proposer; use --dflash"
+        );
+    }
+    if args.swap_space_gb > 0 || args.high_speed_swap {
+        anyhow::bail!(
+            "GLM-5.3-Flash state spilling is disabled until KV, KDA, and semantic-index state migrate atomically"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_model_dir(args: &cli::ServeArgs) -> Result<std::path::PathBuf> {
     use crate::model_resolver;
     if let Some(ref path) = args.model_from_path {
@@ -166,7 +222,101 @@ pub(crate) fn apply_model_default_num_drafts(
 
 #[cfg(test)]
 mod tests {
-    use super::{NumDraftsSource, resolve_num_drafts};
+    use super::{NumDraftsSource, resolve_num_drafts, validate_glm53_runtime_contract};
+    use atlas_core::config::{LayerType, ModelConfig};
+    use clap::Parser;
+
+    fn glm_config() -> ModelConfig {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "glm5_next".to_string();
+        config.num_hidden_layers = 45;
+        config.layer_types = (0..45)
+            .map(|index| {
+                if (index + 1) % 4 == 0 {
+                    LayerType::FullAttention
+                } else {
+                    LayerType::LinearAttention
+                }
+            })
+            .collect();
+        config.linear_num_key_heads = 64;
+        config.linear_num_value_heads = 64;
+        config.linear_key_head_dim = 128;
+        config.linear_value_head_dim = 128;
+        config.linear_conv_kernel_dim = 4;
+        config.kv_lora_rank = 512;
+        config.index_head_dim = 128;
+        config.index_topk = 2048;
+        config.index_kpool = 4;
+        config.mlp_only_layers = vec![0, 1, 2];
+        config
+    }
+
+    fn glm_args(extra: &[&str]) -> crate::cli::ServeArgs {
+        let mut argv = vec![
+            "spark",
+            "serve",
+            "zai-org/GLM-5.3-Flash",
+            "--world-size",
+            "2",
+            "--ep-size",
+            "2",
+            "--tp-size",
+            "1",
+            "--scheduling-policy",
+            "phase-interleave",
+            "--phase-decode-steps",
+            "4",
+            "--phase-prefill-steps",
+            "1",
+            "--swap-space-gb",
+            "0",
+        ];
+        argv.extend_from_slice(extra);
+        let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+        let crate::cli::Command::Serve(args) = cli.command else {
+            unreachable!("test parses a serve command")
+        };
+        args
+    }
+
+    #[test]
+    fn glm_bootstrap_contract_accepts_only_the_state_safe_lane() {
+        let result = validate_glm53_runtime_contract(&glm_args(&[]), &glm_config(), true);
+        assert!(result.is_ok(), "{result:?}");
+
+        let prefix = validate_glm53_runtime_contract(
+            &glm_args(&["--enable-prefix-caching"]),
+            &glm_config(),
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(prefix.contains("prefix caching"));
+
+        let protocol = validate_glm53_runtime_contract(&glm_args(&[]), &glm_config(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(protocol.contains("ATLAS_EP_PROTOCOL=v2"));
+    }
+
+    #[test]
+    fn glm_bootstrap_contract_refuses_wrong_topology_and_scheduler() {
+        let mut wrong_topology = glm_args(&[]);
+        wrong_topology.ep_size = 1;
+        wrong_topology.tp_size = 2;
+        let topology = validate_glm53_runtime_contract(&wrong_topology, &glm_config(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(topology.contains("EP=2 and TP=1"));
+
+        let mut fifo = glm_args(&[]);
+        fifo.scheduling_policy = "fifo".to_string();
+        let scheduler = validate_glm53_runtime_contract(&fifo, &glm_config(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(scheduler.contains("phase-interleave"));
+    }
 
     /// The observed dgx2 bug: `--num-drafts 1` on a model with
     /// `default_num_drafts = 3` must serve 1 (K=2), not 3 (K=4).

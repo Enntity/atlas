@@ -373,6 +373,11 @@ impl ModelConfig {
     /// this model exactly. DeepSeek V4 compression also carries a prompt-built
     /// pool and ring that are not represented by KV blocks today.
     pub fn kv_only_prefix_cache_is_safe(&self) -> bool {
+        if self.model_type == "glm5_next" {
+            // GLM resumption also needs every KDA recurrent+conv state and
+            // DSA indexer/k-pool/tail state. None is in the radix KV entry.
+            return false;
+        }
         self.model_type != "deepseek_v4" || self.compress_ratios.iter().all(|&ratio| ratio == 0)
     }
 }
@@ -400,5 +405,12 @@ mod tests {
         config.model_type = "deepseek_v4".to_string();
         config.compress_ratios = vec![0; 3];
         assert!(config.kv_only_prefix_cache_is_safe());
+    }
+
+    #[test]
+    fn glm_prefix_cache_is_not_complete_without_kda_and_index_state() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "glm5_next".to_string();
+        assert!(!config.kv_only_prefix_cache_is_safe());
     }
 }

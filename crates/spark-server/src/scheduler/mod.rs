@@ -21,6 +21,9 @@ mod decode_logits_content;
 mod decode_logits_seq;
 mod decode_logits_step;
 mod decode_step;
+mod dflash_bootstrap_step;
+mod dflash_prefill_step;
+mod dflash_rejection;
 mod emit_step;
 mod fast_greedy;
 #[cfg(test)]
@@ -82,6 +85,7 @@ use decode_logits_content::*;
 use decode_logits_seq::*;
 use decode_logits_step::*;
 use decode_step::*;
+use dflash_bootstrap_step::*;
 use emit_step::*;
 pub use helpers::WatchdogParams;
 pub(crate) use helpers::parse_disable_watchdogs;
@@ -132,6 +136,7 @@ use crate::api::{GrammarSpec, InferenceRequest, InferenceResponse, StreamEvent};
 use crate::grammar::{GrammarEngine, GrammarState};
 use crate::ngram::NgramProposer;
 use crate::scheduling_policy::SchedulingPolicy;
+use crate::scheduling_policy::{ActiveSeqTiming, PhaseInterleaveController};
 
 /// A runtime LoRA adapter control command, applied by the scheduler at a
 /// QUIESCENT point (no in-flight decode) so it never races a graph replay or a
@@ -335,6 +340,10 @@ pub fn run(
     // `admission` module docs and ATLAS_KV_ADMIT_WATERMARK).
     let admit_watermark = admission::resolve_admit_watermark(sched.limits.max_seq_len);
 
+    let mut phase_interleave = policy
+        .phase_interleave_config()
+        .map(PhaseInterleaveController::new);
+
     let pending = Arc::new((
         Mutex::new(PendingQueue {
             requests: Vec::new(),
@@ -407,6 +416,23 @@ pub fn run(
 
     let mut snapshot_steps: u64 = 0;
     loop {
+        // Resolve the prefill phase ONCE for this scheduler iteration. Both
+        // admission and continued chunks consume this same decision; calling a
+        // stateful cadence independently at each site would accidentally grant
+        // two slabs or skip one. With no phase controller this is exactly the
+        // existing policy decision.
+        let timings: Vec<ActiveSeqTiming> = active
+            .iter()
+            .map(|a| ActiveSeqTiming {
+                last_token_time: a.last_token_time,
+            })
+            .collect();
+        let has_prefill_work = !prefilling.is_empty() || !pending.0.lock().requests.is_empty();
+        let phase_allows_prefill = phase_interleave.as_mut().is_none_or(|controller| {
+            controller.allow_prefill(!active.is_empty(), has_prefill_work)
+        });
+        let allow_prefill_this_iteration = phase_allows_prefill && policy.should_prefill(&timings);
+
         // ── Drain pending → start prefill (chunked or full) ──
         // The `t_loop_*` brackets attribute the out-of-step GAP the
         // ATLAS_MTP_TIMING summary reports (see mtp_timing::Phase::Gap): each
@@ -418,6 +444,7 @@ pub fn run(
             &active,
             &prefilling,
             &*policy,
+            allow_prefill_this_iteration,
             max_batch_size,
             // Parked sequences (spilled or requeued) are waiting on blocks,
             // not on new requests — never block on the request condvar while
@@ -599,6 +626,7 @@ pub fn run(
             new_reqs,
             chunked,
             always_mixed,
+            phase_interleave.is_some() && (!active.is_empty() || !prefilling.is_empty()),
             max_prefill_tokens,
             max_batch_tokens,
             &eos_tokens,
@@ -624,10 +652,13 @@ pub fn run(
             &mut prefilling,
             max_prefill_tokens,
             max_batch_tokens,
+            allow_prefill_this_iteration,
             always_mixed,
             prefill_stream,
             prefill_event,
             use_mtp,
+            num_drafts,
+            dflash_verify_raw_argmax,
             use_self_speculative,
             use_ngram_speculative,
             think_end_token,
@@ -809,6 +840,8 @@ pub fn run(
                     {
                         let lens_before: Vec<usize> =
                             active.iter().map(|a| a.seq.seq_len).collect();
+                        let drafts_before: Vec<usize> =
+                            active.iter().map(|a| a.pending_drafts.len()).collect();
                         step_mtp(
                             &*model,
                             &mut active,
@@ -817,9 +850,13 @@ pub fn run(
                             &verify_ctx,
                             dflash_verify_raw_argmax,
                         );
-                        for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
+                        for ((a, &b), &offered) in active
+                            .iter_mut()
+                            .zip(lens_before.iter())
+                            .zip(drafts_before.iter())
+                        {
                             a.mtp_acct
-                                .record_verify_emitted(a.seq.seq_len.saturating_sub(b));
+                                .record_verify_emitted(a.seq.seq_len.saturating_sub(b), offered);
                         }
                     } else {
                         match gate.next_step() {
@@ -902,6 +939,8 @@ pub fn run(
                                 // biases the gate toward serial decode.
                                 let lens_before: Vec<usize> =
                                     active.iter().map(|a| a.seq.seq_len).collect();
+                                let drafts_before: Vec<usize> =
+                                    active.iter().map(|a| a.pending_drafts.len()).collect();
                                 let t0 = std::time::Instant::now();
                                 step_mtp(
                                     &*model,
@@ -917,9 +956,15 @@ pub fn run(
                                     .map(|(a, &b)| a.seq.seq_len.saturating_sub(b))
                                     .sum();
                                 gate.record_verify_step(t0.elapsed(), emitted, active.len());
-                                for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
-                                    a.mtp_acct
-                                        .record_verify_emitted(a.seq.seq_len.saturating_sub(b));
+                                for ((a, &b), &offered) in active
+                                    .iter_mut()
+                                    .zip(lens_before.iter())
+                                    .zip(drafts_before.iter())
+                                {
+                                    a.mtp_acct.record_verify_emitted(
+                                        a.seq.seq_len.saturating_sub(b),
+                                        offered,
+                                    );
                                 }
                             }
                         }
@@ -941,6 +986,8 @@ pub fn run(
                 } else {
                     // Gate bypassed (ATLAS_MTP_GATE_FORCE=1): plain MTP.
                     let lens_before: Vec<usize> = active.iter().map(|a| a.seq.seq_len).collect();
+                    let drafts_before: Vec<usize> =
+                        active.iter().map(|a| a.pending_drafts.len()).collect();
                     step_mtp(
                         &*model,
                         &mut active,
@@ -949,9 +996,13 @@ pub fn run(
                         &verify_ctx,
                         dflash_verify_raw_argmax,
                     );
-                    for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
+                    for ((a, &b), &offered) in active
+                        .iter_mut()
+                        .zip(lens_before.iter())
+                        .zip(drafts_before.iter())
+                    {
                         a.mtp_acct
-                            .record_verify_emitted(a.seq.seq_len.saturating_sub(b));
+                            .record_verify_emitted(a.seq.seq_len.saturating_sub(b), offered);
                     }
                 }
             } else {

@@ -28,7 +28,7 @@ pub fn build_model(
     // weight pointer, and it used to be a local in `startup()` that was dropped
     // once the layers had copied pointers out of it: the memory stayed live
     // with nothing able to free it. The model owns it now, so `teardown` can.
-    store: WeightStore,
+    mut store: WeightStore,
     gpu: Box<dyn GpuBackend>,
     max_batch_tokens: usize,
     kv_block_size: usize,
@@ -153,7 +153,8 @@ pub fn build_model(
     // "use global num_kv_heads/head_dim for all layers" (backward compatible).
     config.kv_layer_dims = loader.kv_layer_dims(&config);
 
-    let mut layers = loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
+    let mut layers =
+        loader.load_layers_mut(&mut store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
     let embed = loader.load_embedding(&store, &config, gpu.as_ref())?;
     let final_norm = loader.load_final_norm(&store, &config, gpu.as_ref())?;
     let lm_head = loader.load_lm_head(&store, &config, gpu.as_ref())?;
@@ -279,7 +280,13 @@ pub fn build_model(
     // ── Step 5: Size KV cache from actual free memory ──
     // MLA absorbed: cache compressed latent [kv_lora + rope] instead of expanded [nkv * hd]
     // This gives 12.8x smaller KV cache AND better precision (no expand→cache→read roundtrip)
-    let (kv_num_heads, kv_head_dim) = if config.kv_lora_rank > 0 {
+    let glm_metadata_only = config.model_type == "glm5_next";
+    let (kv_num_heads, kv_head_dim) = if glm_metadata_only {
+        tracing::info!(
+            "GLM DSA cache is owned by the atomic latent/index state pool; paged KV retains logical block IDs only"
+        );
+        (1, config.kv_lora_rank)
+    } else if config.kv_lora_rank > 0 {
         let mla_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim;
         tracing::info!(
             "MLA absorbed KV cache: 1 head × {} dims ({}+{}) per token (vs {} heads × {})",
@@ -297,10 +304,22 @@ pub fn build_model(
         block_size: kv_block_size,
         num_kv_heads: kv_num_heads,
         head_dim: kv_head_dim,
-        num_layers: config.num_attention_layers(),
+        num_layers: if glm_metadata_only {
+            0
+        } else {
+            config.num_attention_layers()
+        },
         dtype: kv_dtype,
-        layer_dtypes: layer_dtypes.clone(),
-        layer_dims: config.kv_layer_dims.clone(),
+        layer_dtypes: if glm_metadata_only {
+            Vec::new()
+        } else {
+            layer_dtypes.clone()
+        },
+        layer_dims: if glm_metadata_only {
+            Vec::new()
+        } else {
+            config.kv_layer_dims.clone()
+        },
         cache_blocks_per_seq: hss_cache_blocks_per_seq,
     };
 
@@ -398,74 +417,87 @@ pub fn build_model(
     // budget-driven sum. This is the *whole point* of the HBM-shrink
     // feature — the production cache becomes write staging only; older
     // blocks live on disk under the orchestrator's control.
-    let num_kv_blocks = match hss_cache_blocks_per_seq {
-        Some(cap) => {
-            // Phase 6.3 (original): pool = max_batch × cap + 1 dummy + 1 spare per seq.
-            // Issue #31 (2026-05-08): the cap×bs sizing assumed prefill would
-            // fit in cap blocks AND the slide-during-prefill path would handle
-            // any overflow. Live-tested: slides during prefill produce silently
-            // wrong attention output (the orchestrator-fed disk-read path is
-            // wired up for DECODE attention only — Phase 6.2.a — not for
-            // prefill — Phase 6.2.b deferred). The companion change in
-            // `block_mgmt::ensure_blocks_through_prefill` removes the broken
-            // slide; this change resizes the pool so prefill can grow up to
-            // `max_seq_len` blocks without hitting "no free blocks". HBM-shrink
-            // remains in effect post-prefill: the FIRST decode step finds
-            // bt_len > cap and slides down via the orchestrator-aware path
-            // (which IS correct).
-            //
-            // Sizing rationale:
-            //   * Per-seq blocks: `max(cap + 1, ceil(max_seq_len / block_size))`
-            //     so prefill of any prompt up to max_seq_len fits in HBM.
-            //   * +1 dummy slot for OOB-safe paged-kernel reads.
-            //
-            // For multi-seq HSS where the user wanted strict HBM-shrink, this
-            // increases pool size by `(max_seq_len_blocks - cap) × max_batch`
-            // bytes per block. The existing post-load OOM check (line 304+)
-            // catches infeasible configs at startup with a clear message.
-            let max_seq_blocks = max_seq_len.div_ceil(kv_block_size);
-            let per_seq = (cap as usize + 1).max(max_seq_blocks);
-            let n = max_batch_size * per_seq + 1;
-            tracing::info!(
-                "--high-speed-swap: HBM cache sized to {n} blocks ({} batch × max(cap={cap}+1, max_seq_len_blocks={max_seq_blocks}) + 1 dummy); \
+    let num_kv_blocks = if glm_metadata_only {
+        let blocks_per_sequence = max_seq_len.div_ceil(kv_block_size);
+        let blocks = max_batch_size
+            .checked_mul(blocks_per_sequence)
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("GLM logical page count overflow"))?;
+        tracing::info!(
+            "GLM logical paging: {blocks} metadata-only blocks ({} sequences x {blocks_per_sequence} + 1 dummy), zero generic K/V bytes",
+            max_batch_size,
+        );
+        blocks
+    } else {
+        match hss_cache_blocks_per_seq {
+            Some(cap) => {
+                // Phase 6.3 (original): pool = max_batch × cap + 1 dummy + 1 spare per seq.
+                // Issue #31 (2026-05-08): the cap×bs sizing assumed prefill would
+                // fit in cap blocks AND the slide-during-prefill path would handle
+                // any overflow. Live-tested: slides during prefill produce silently
+                // wrong attention output (the orchestrator-fed disk-read path is
+                // wired up for DECODE attention only — Phase 6.2.a — not for
+                // prefill — Phase 6.2.b deferred). The companion change in
+                // `block_mgmt::ensure_blocks_through_prefill` removes the broken
+                // slide; this change resizes the pool so prefill can grow up to
+                // `max_seq_len` blocks without hitting "no free blocks". HBM-shrink
+                // remains in effect post-prefill: the FIRST decode step finds
+                // bt_len > cap and slides down via the orchestrator-aware path
+                // (which IS correct).
+                //
+                // Sizing rationale:
+                //   * Per-seq blocks: `max(cap + 1, ceil(max_seq_len / block_size))`
+                //     so prefill of any prompt up to max_seq_len fits in HBM.
+                //   * +1 dummy slot for OOB-safe paged-kernel reads.
+                //
+                // For multi-seq HSS where the user wanted strict HBM-shrink, this
+                // increases pool size by `(max_seq_len_blocks - cap) × max_batch`
+                // bytes per block. The existing post-load OOM check (line 304+)
+                // catches infeasible configs at startup with a clear message.
+                let max_seq_blocks = max_seq_len.div_ceil(kv_block_size);
+                let per_seq = (cap as usize + 1).max(max_seq_blocks);
+                let n = max_batch_size * per_seq + 1;
+                tracing::info!(
+                    "--high-speed-swap: HBM cache sized to {n} blocks ({} batch × max(cap={cap}+1, max_seq_len_blocks={max_seq_blocks}) + 1 dummy); \
                  prefill grows monotonically, decode shrinks to cap × bs and streams older blocks from disk via the orchestrator",
-                max_batch_size
-            );
-            n
-        }
-        None => {
-            if kv_budget == 0 {
-                anyhow::bail!(
-                    "No memory left for KV cache: total GPU = {:.1} GB, \
+                    max_batch_size
+                );
+                n
+            }
+            None => {
+                if kv_budget == 0 {
+                    anyhow::bail!(
+                        "No memory left for KV cache: total GPU = {:.1} GB, \
                      --gpu-memory-utilization {:.0}% → budget {:.1} GB, \
                      but {:.1} GB already consumed + {:.1} GB inference reserve \
                      = {:.1} GB committed.  Raise --gpu-memory-utilization or \
                      use a smaller model.",
+                        total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+                        gpu_memory_utilization * 100.0,
+                        total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
+                        used_so_far as f64 / (1024.0 * 1024.0 * 1024.0),
+                        inference_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
+                        (used_so_far + inference_reserve) as f64 / (1024.0 * 1024.0 * 1024.0),
+                    );
+                }
+                let n = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+                let max_kv_tokens = n * kv_block_size;
+                tracing::info!(
+                    "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
+                 {:.1} GB pre-KV + {:.1} GB reserve → {:.1} GB for KV \
+                 → {} blocks × {} tok/block = {} max KV tokens",
                     total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                     gpu_memory_utilization * 100.0,
                     total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
                     used_so_far as f64 / (1024.0 * 1024.0 * 1024.0),
                     inference_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
-                    (used_so_far + inference_reserve) as f64 / (1024.0 * 1024.0 * 1024.0),
+                    kv_budget as f64 / (1024.0 * 1024.0 * 1024.0),
+                    n,
+                    kv_block_size,
+                    max_kv_tokens,
                 );
+                n
             }
-            let n = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
-            let max_kv_tokens = n * kv_block_size;
-            tracing::info!(
-                "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
-                 {:.1} GB pre-KV + {:.1} GB reserve → {:.1} GB for KV \
-                 → {} blocks × {} tok/block = {} max KV tokens",
-                total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
-                gpu_memory_utilization * 100.0,
-                total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
-                used_so_far as f64 / (1024.0 * 1024.0 * 1024.0),
-                inference_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
-                kv_budget as f64 / (1024.0 * 1024.0 * 1024.0),
-                n,
-                kv_block_size,
-                max_kv_tokens,
-            );
-            n
         }
     };
     let _max_kv_tokens = num_kv_blocks * kv_block_size;
@@ -617,6 +649,7 @@ pub fn build_model(
                 args.window_size,
                 model.gpu_backend(),
                 max_seq_len,
+                max_batch_size,
             )?;
             model.set_dflash_proposer(std::sync::Arc::new(head));
             tracing::info!("DFlash drafter installed as the active proposer");

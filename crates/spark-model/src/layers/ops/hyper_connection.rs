@@ -72,6 +72,62 @@ pub fn hc_pre(
         .launch(stream)
 }
 
+/// GLM-5.3 tensor-core mHC stage 1: one FP32 residual sum-of-squares per row.
+pub fn glm53_hc_pre_sqsum(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    streams: DevicePtr,
+    sqsum: DevicePtr,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(streams)
+        .arg_ptr(sqsum)
+        .launch(stream)
+}
+
+/// GLM-5.3 tensor-core mHC stage 3: scale the GEMM logits, run the tiny
+/// sigmoid/Sinkhorn problem, collapse four FP32 highway streams to BF16, and
+/// produce the following sublayer RMSNorm without another launch or memory
+/// read.
+#[allow(clippy::too_many_arguments)]
+pub fn glm53_hc_pre_finish_norm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    streams: DevicePtr,
+    mix: DevicePtr,
+    sqsum: DevicePtr,
+    hc_scale: DevicePtr,
+    hc_base: DevicePtr,
+    y_out: DevicePtr,
+    norm_weight: DevicePtr,
+    norm_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    num_tokens: u32,
+    norm_epsilon: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(streams)
+        .arg_ptr(mix)
+        .arg_ptr(sqsum)
+        .arg_ptr(hc_scale)
+        .arg_ptr(hc_base)
+        .arg_ptr(y_out)
+        .arg_ptr(norm_weight)
+        .arg_ptr(norm_out)
+        .arg_ptr(post_out)
+        .arg_ptr(comb_out)
+        .arg_f32(norm_epsilon)
+        .launch(stream)
+}
+
 /// Expand the sublayer output back into `hc_mult` streams, mixing the saved
 /// residual streams through the doubly-stochastic `comb`. `out` may alias
 /// `residual`. One block per token.

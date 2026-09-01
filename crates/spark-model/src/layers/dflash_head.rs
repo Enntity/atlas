@@ -17,7 +17,7 @@
 //! degenerates to single-token decode (acceptance ~100% but no speedup).
 
 use parking_lot::Mutex;
-use std::any::Any;
+use std::{any::Any, collections::HashMap};
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -93,6 +93,8 @@ pub struct DflashKernels {
     /// for `fp8_gemm_n128_row_scaled` when M=γ=16. Single warp per CTA,
     /// no wasted M_TILE rows. Used by the lm_head GEMM.
     pub fp8_gemm_n128_row_scaled_m16: KernelHandle,
+    pub dflash2_dynamic_conv: KernelHandle,
+    pub dflash2_select_path: KernelHandle,
 }
 
 /// Per-step scratch buffers for the γ-block forward.
@@ -131,6 +133,11 @@ pub struct DflashScratch {
     /// kernel reads at entry. Host writes via `copy_h2d` BEFORE entering the
     /// captured region so the graph itself sees a stable device pointer.
     pub option_b_indirect_args_dev: DevicePtr,
+    /// Four stable graph-visible block tables. Per-sequence allocator
+    /// addresses are copied here before proposal so captured graphs never
+    /// bake a request-owned pointer that can be freed and reused.
+    pub option_b_block_tables_dev: DevicePtr,
+    pub option_b_max_blocks: usize,
     /// Phase E.2: pinned host buffer (`γ × 4` bytes) for the per-propose
     /// draft-token D2H copy. Allocated once at construction via
     /// `gpu.alloc_host_pinned`; the async D2H lands here without touching
@@ -152,6 +159,24 @@ pub struct DflashScratch {
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
     pub position_ids: DevicePtr,
+    /// `[gamma, selector_rank]` BF16. Null for DFlash1.
+    pub selector_hidden: DevicePtr,
+    /// DFlash2 selector's top-16 token IDs for each useful draft row.
+    /// Capacity is `4 * gamma * 16` so the batched C<=4 path can use
+    /// sequence-major slices without another allocation.
+    pub selector_candidate_ids: DevicePtr,
+    /// Full DFlash2 transition scores `[row, prev=16, curr=16]` in FP32.
+    /// Keeping the predecessor axis is required because a probabilistically
+    /// sampled predecessor changes the next row's realized draft distribution.
+    pub selector_edge_scores: DevicePtr,
+}
+
+/// One DFlash block result. DFlash1 fills only `tokens`; DFlash2 also returns
+/// the realized sparse proposal distribution used by standard rejection.
+pub(super) struct DflashBlockOutput {
+    pub tokens: Vec<u32>,
+    pub candidate_ids: Vec<u32>,
+    pub candidate_scores: Vec<f32>,
 }
 
 /// Drafter-side weight precision. Defaults to BF16. **Phase G (2026-05-28)**
@@ -190,6 +215,8 @@ pub struct DflashLayer {
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
     pub down_proj: DenseWeight,
+    pub attention_conv: Option<crate::weight_loader::DflashDynamicConvWeights>,
+    pub mlp_conv: Option<crate::weight_loader::DflashDynamicConvWeights>,
 
     // Phase G — optional FP8 mirrors of the seven dense-GEMM weights.
     // Populated at load time when `ATLAS_DFLASH_DRAFTER_FP8=1`, consumed
@@ -249,6 +276,16 @@ pub struct DflashProposerState {
     /// Width (bytes) of one `ctx_hidden_acc` slot — `5 * target_hidden * bf16`.
     /// Stored to avoid re-deriving on every append.
     pub ctx_slot_bytes: usize,
+    /// Sampling controls for the next DFlash2 selector walk. They are written
+    /// by the scheduler immediately before propose so proposal and target
+    /// verification use the same request temperature/seed contract.
+    pub sample_temperature: f32,
+    pub sample_seed: u64,
+    /// Sparse q distribution from the most recent DFlash2 proposal, flattened
+    /// as `[num_drafts, 16]`. Scores are pre-temperature, matching vLLM's
+    /// cached draft-logit contract.
+    pub last_candidate_ids: Vec<u32>,
+    pub last_candidate_scores: Vec<f32>,
 
     // ─── Phase 2 Option B fields (paged KV cache for ctx) ───────────────
     /// Device-side block table for the drafter's paged KV cache. Allocated
@@ -323,6 +360,9 @@ pub struct BlockDiffusionDraftHead {
     /// Target-side hidden_size (used for the `fc` projection input width:
     /// `target_layer_ids.len() * target_hidden_size`).
     pub target_hidden_size: usize,
+    pub dflash2_selector: Option<crate::weight_loader::Dflash2SelectorWeights>,
+    pub dflash2_conv_groups: usize,
+    pub dflash2_selector_rank: usize,
 
     // === Weights shared with the target ===
     /// Target's embed_tokens GPU pointer. The drafter's checkpoint has no
@@ -419,20 +459,13 @@ pub struct BlockDiffusionDraftHead {
     /// (degraded quality, ablation only).
     pub ctx_window: usize,
 
-    // === Phase D (CUDA graph capture) → Phase F (piecewise) ===
-    /// Per-subgraph captured handles. `None` until warm-up completes and
-    /// the first capture pass lands; on the capture pass we fill this
-    /// `Vec` with `2 × num_layers + 1` handles laid out as
-    /// `[pre_0, post_0, pre_1, post_1, ..., pre_{N-1}, post_{N-1}, tail]`.
-    /// Slot index = `layer_idx * 2 + half` for the layer halves
-    /// (half = 0 for pre_attn, 1 for post_attn) and `num_layers * 2` for
-    /// the tail (final norm + lm_head + argmax). `GraphHandle(0)` is the
-    /// "empty capture" sentinel and means that slot replays eager.
-    ///
-    /// Phase F.2 (2026-05-28): replaces the single full-region capture
-    /// with one capture per subgraph. Attention is NEVER captured —
-    /// it's the natural sync barrier between captured subgraphs
-    /// (vLLM piecewise convention). See design doc §15.
+    // === Full CUDA graph capture ===
+    /// One complete fixed-shape proposer graph. `None` until warm-up and the
+    /// first successful capture; the vector shape is retained for serialized
+    /// state compatibility, but only slot zero is used. Indirect attention
+    /// arguments and a stable block-table staging allocation keep request
+    /// addresses and dynamic lengths outside the captured graph.
+    /// `GraphHandle(0)` is the empty-capture sentinel and replays eagerly.
     pub propose_graphs: Mutex<Option<Vec<spark_runtime::gpu::GraphHandle>>>,
     /// When set, all `forward_block` calls run eagerly. Mirrors target-model
     /// `TransformerModel::suppress_graphs` so external code can disable
@@ -446,17 +479,27 @@ pub struct BlockDiffusionDraftHead {
     /// subgraph captures on the same propose call after the warmup target
     /// is hit.
     pub propose_warmup_count: std::sync::atomic::AtomicUsize,
+    /// Full proposer graphs for the fixed concurrent widths. Inputs and block
+    /// tables are staged into stable scratch before replay; no request-owned
+    /// address is captured.
+    pub propose_batch_graphs: Mutex<HashMap<(usize, usize), spark_runtime::gpu::GraphHandle>>,
+    pub propose_batch_warmups: Mutex<HashMap<(usize, usize), usize>>,
 
     // Quantization mode (BF16 only for Phase 1).
     pub quant: DflashQuantization,
 }
 
+mod dflash2;
 mod forward_block;
+mod forward_block_batch;
+mod forward_block_batch_layer;
 mod forward_block_layer;
 mod forward_block_layer_paged;
 mod from_weights;
 mod precompute_ctx_kv;
+mod prepare;
 mod propose;
+mod propose_batch;
 
 impl DraftProposer for BlockDiffusionDraftHead {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
@@ -482,6 +525,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             skip_next_decode_append: false,
             max_ctx_len: self.max_seq_len,
             ctx_slot_bytes,
+            sample_temperature: 0.0,
+            sample_seed: 0xD5A5_53F1_A5E2_0001,
+            last_candidate_ids: Vec::new(),
+            last_candidate_scores: Vec::new(),
             // Phase 2 Option B: lazily allocated on first propose when
             // ATLAS_DFLASH_OPTION_B=1. None until then to keep alloc_state
             // cheap for sequences that never use Option B.
@@ -491,6 +538,38 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_committed: 0,
             ctx_positions: Vec::new(),
         }))
+    }
+
+    fn configure_sampling(
+        &self,
+        state: &mut dyn ProposerState,
+        temperature: f32,
+        seed: Option<u64>,
+    ) -> Result<()> {
+        let dstate = state
+            .as_any_mut()
+            .downcast_mut::<DflashProposerState>()
+            .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        dstate.sample_temperature = temperature.max(0.0);
+        dstate.sample_seed = seed.unwrap_or(0xD5A5_53F1_A5E2_0001);
+        Ok(())
+    }
+
+    fn sparse_draft_distribution(
+        &self,
+        state: &dyn ProposerState,
+    ) -> Option<crate::speculative::SparseDraftDistribution> {
+        let dstate = state.as_any().downcast_ref::<DflashProposerState>()?;
+        if dstate.last_candidate_ids.is_empty()
+            || dstate.last_candidate_ids.len() != dstate.last_candidate_scores.len()
+        {
+            return None;
+        }
+        Some(crate::speculative::SparseDraftDistribution {
+            top_k: 16,
+            candidate_ids: dstate.last_candidate_ids.clone(),
+            scores: dstate.last_candidate_scores.clone(),
+        })
     }
 
     fn propose(
@@ -518,6 +597,40 @@ impl DraftProposer for BlockDiffusionDraftHead {
             grammar_bitmask,
             target_hidden_stack,
         )
+    }
+
+    fn propose_batch(
+        &self,
+        last_tokens: &[u32],
+        _target_hiddens: &[DevicePtr],
+        positions: &[usize],
+        num_drafts: usize,
+        states: &mut [&mut dyn ProposerState],
+        ctx: &crate::layer::ForwardContext,
+        stream: u64,
+        _out_conf: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<Option<Vec<Vec<u32>>>> {
+        // The native batched selector currently performs the greedy path walk.
+        // Preserve exact sampling semantics by falling back to the serial path
+        // whenever any request has a non-zero temperature.
+        for state in states.iter() {
+            let Some(dflash) = state.as_any().downcast_ref::<DflashProposerState>() else {
+                return Ok(None);
+            };
+            if dflash.sample_temperature > 0.0 {
+                return Ok(None);
+            }
+        }
+        self.propose_drafts_batch(last_tokens, positions, num_drafts, states, ctx, stream)
+            .map(Some)
+    }
+
+    fn propose_batch_max(
+        &self,
+        _buffers: &spark_runtime::buffers::BufferArena,
+        _config: &atlas_core::config::ModelConfig,
+    ) -> usize {
+        4
     }
 
     fn after_verify(

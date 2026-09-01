@@ -8,6 +8,8 @@
 //! block-scaled is the follow-up once the end-to-end win is proven.
 
 use anyhow::{Result, bail};
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -29,6 +31,7 @@ const CUDA_R_16BF: i32 = 14;
 const CUDA_R_32F: i32 = 0;
 const CUDA_R_8F_E4M3: i32 = 28;
 const CUBLAS_COMPUTE_32F: i32 = 68;
+const CUBLAS_COMPUTE_32F_FAST_TF32: i32 = 77;
 const CUBLAS_OP_N: i32 = 0;
 const CUBLAS_OP_T: i32 = 1;
 const DESC_TRANSA: u32 = 3;
@@ -113,7 +116,23 @@ struct Ctx {
     handle: cublasLtHandle_t,
     workspace: u64,
     ws_size: usize,
+    bf16_plans: Mutex<HashMap<(u32, u32, u32), Box<MatmulPlan>>>,
+    tf32_plans: Mutex<HashMap<(u32, u32, u32), Box<MatmulPlan>>>,
 }
+
+struct MatmulPlan {
+    desc: cublasLtMatmulDesc_t,
+    layout_weight: cublasLtMatrixLayout_t,
+    layout_act: cublasLtMatrixLayout_t,
+    layout_out: cublasLtMatrixLayout_t,
+    algo: [u8; 128],
+}
+
+// Plans are immutable after construction and calls are serialized by the
+// scheduler plus the plan-cache mutex. The raw handles are process-context
+// objects owned for the process lifetime, like the cuBLASLt handle itself.
+unsafe impl Send for MatmulPlan {}
+unsafe impl Sync for MatmulPlan {}
 // cuBLASLt handle + device workspace are process-global; matmul is invoked
 // serially from the single-threaded scheduler forward.
 unsafe impl Send for Ctx {}
@@ -150,6 +169,8 @@ fn ctx() -> Result<&'static Ctx> {
         handle,
         workspace: ws,
         ws_size,
+        bf16_plans: Mutex::new(HashMap::new()),
+        tf32_plans: Mutex::new(HashMap::new()),
     });
     Ok(CTX.get().unwrap())
 }
@@ -212,110 +233,193 @@ pub fn bf16_gemm_act_weight_t(
     stream: u64,
 ) -> Result<()> {
     let ctx = ctx()?;
-    unsafe {
-        let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
-        chk(
-            cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
-            "DescCreate",
-        )?;
-        let ta = CUBLAS_OP_T;
-        let tb = CUBLAS_OP_N;
-        chk(
-            cublasLtMatmulDescSetAttribute(
-                desc,
-                DESC_TRANSA,
-                &ta as *const i32 as *const c_void,
-                4,
-            ),
-            "TRANSA",
-        )?;
-        chk(
-            cublasLtMatmulDescSetAttribute(
-                desc,
-                DESC_TRANSB,
-                &tb as *const i32 as *const c_void,
-                4,
-            ),
-            "TRANSB",
-        )?;
-        // A = weight stored row-major [N,K] == col-major [K,N], ld=K, opT → [N,K]
-        // B = act    stored row-major [M,K] == col-major [K,M], ld=K, opN → [K,M]
-        // D = out    row-major [M,N]        == col-major [N,M], ld=N
-        let mut la: cublasLtMatrixLayout_t = std::ptr::null_mut();
-        let mut lb: cublasLtMatrixLayout_t = std::ptr::null_mut();
-        let mut ld_: cublasLtMatrixLayout_t = std::ptr::null_mut();
-        chk(
-            cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, k as u64, n as u64, k as i64),
-            "LayoutA",
-        )?;
-        chk(
-            cublasLtMatrixLayoutCreate(&mut lb, CUDA_R_16BF, k as u64, m as u64, k as i64),
-            "LayoutB",
-        )?;
-        chk(
-            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64),
-            "LayoutD",
-        )?;
-        let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
-        chk(cublasLtMatmulPreferenceCreate(&mut pref), "PrefCreate")?;
-        let ws_size = ctx.ws_size;
-        chk(
-            cublasLtMatmulPreferenceSetAttribute(
-                pref,
-                PREF_MAX_WORKSPACE_BYTES,
-                &ws_size as *const usize as *const c_void,
-                std::mem::size_of::<usize>(),
-            ),
-            "PrefWorkspace",
-        )?;
-        // cublasLtMatmulHeuristicResult_t = { algo[64B], workspaceSize, state,
-        // wavesCount, reserved[4] } ≈ 96B; algo at offset 0. 128B for margin.
-        let mut result = [0u8; 128];
-        let mut returned: i32 = 0;
-        chk(
-            cublasLtMatmulAlgoGetHeuristic(
-                ctx.handle,
-                desc,
-                la,
-                lb,
-                ld_,
-                ld_,
-                pref,
-                1,
-                result.as_mut_ptr() as *mut c_void,
-                &mut returned,
-            ),
-            "AlgoGetHeuristic",
-        )?;
-        if returned < 1 {
-            bail!("cuBLASLt: no algorithm for {m}x{n}x{k}");
+    let key = (m, n, k);
+    let mut plans = ctx.bf16_plans.lock();
+    let plan = match plans.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Box::new(build_bf16_plan(ctx, m, n, k)?))
         }
+    };
+    unsafe {
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
         let status = cublasLtMatmul(
             ctx.handle,
-            desc,
+            plan.desc,
             &alpha as *const f32 as *const c_void,
             weight as *const c_void,
-            la,
+            plan.layout_weight,
             act as *const c_void,
-            lb,
+            plan.layout_act,
             &beta as *const f32 as *const c_void,
             out as *const c_void,
-            ld_,
+            plan.layout_out,
             out as *mut c_void,
-            ld_,
-            result.as_ptr() as *const c_void,
+            plan.layout_out,
+            plan.algo.as_ptr() as *const c_void,
             ctx.workspace as *mut c_void,
             ctx.ws_size,
             stream as *mut c_void,
         );
-        cublasLtMatmulPreferenceDestroy(pref);
-        cublasLtMatrixLayoutDestroy(la);
-        cublasLtMatrixLayoutDestroy(lb);
-        cublasLtMatrixLayoutDestroy(ld_);
-        cublasLtMatmulDescDestroy(desc);
         chk(status, "Matmul")?;
     }
     Ok(())
+}
+
+fn build_bf16_plan(ctx: &Ctx, m: u32, n: u32, k: u32) -> Result<MatmulPlan> {
+    build_plan(ctx, m, n, k, CUDA_R_16BF, CUDA_R_16BF, CUBLAS_COMPUTE_32F)
+}
+
+/// Row-major `out[M,N] = act[M,K] @ weight[N,K]T` for FP32 buffers using
+/// TF32 tensor cores. GLM mHC is the intended fixed-shape consumer: its BF16
+/// checkpoint function matrix is widened exactly once at load, while the FP32
+/// residual highway is rounded to TF32 only for this learned 24-row mix GEMM.
+pub fn tf32_gemm_act_weight_t(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    let ctx = ctx()?;
+    let key = (m, n, k);
+    let mut plans = ctx.tf32_plans.lock();
+    let plan = match plans.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => entry.insert(Box::new(build_plan(
+            ctx,
+            m,
+            n,
+            k,
+            CUDA_R_32F,
+            CUDA_R_32F,
+            CUBLAS_COMPUTE_32F_FAST_TF32,
+        )?)),
+    };
+    unsafe {
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let status = cublasLtMatmul(
+            ctx.handle,
+            plan.desc,
+            &alpha as *const f32 as *const c_void,
+            weight as *const c_void,
+            plan.layout_weight,
+            act as *const c_void,
+            plan.layout_act,
+            &beta as *const f32 as *const c_void,
+            out as *const c_void,
+            plan.layout_out,
+            out as *mut c_void,
+            plan.layout_out,
+            plan.algo.as_ptr() as *const c_void,
+            ctx.workspace as *mut c_void,
+            ctx.ws_size,
+            stream as *mut c_void,
+        );
+        chk(status, "TF32 Matmul")?;
+    }
+    Ok(())
+}
+
+fn build_plan(
+    ctx: &Ctx,
+    m: u32,
+    n: u32,
+    k: u32,
+    input_dtype: i32,
+    output_dtype: i32,
+    compute_type: i32,
+) -> Result<MatmulPlan> {
+    unsafe {
+        let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
+        chk(
+            cublasLtMatmulDescCreate(&mut desc, compute_type, CUDA_R_32F),
+            "DescCreate",
+        )?;
+        for (attribute, value, label) in [
+            (DESC_TRANSA, CUBLAS_OP_T, "TRANSA"),
+            (DESC_TRANSB, CUBLAS_OP_N, "TRANSB"),
+        ] {
+            chk(
+                cublasLtMatmulDescSetAttribute(
+                    desc,
+                    attribute,
+                    &value as *const i32 as *const c_void,
+                    size_of::<i32>(),
+                ),
+                label,
+            )?;
+        }
+
+        // A = weight row-major [N,K] == column-major [K,N], transposed.
+        // B = activation row-major [M,K] == column-major [K,M].
+        // D = output row-major [M,N] == column-major [N,M].
+        let mut layout_weight: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut layout_act: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut layout_out: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        chk(
+            cublasLtMatrixLayoutCreate(
+                &mut layout_weight,
+                input_dtype,
+                k as u64,
+                n as u64,
+                k as i64,
+            ),
+            "LayoutA",
+        )?;
+        chk(
+            cublasLtMatrixLayoutCreate(&mut layout_act, input_dtype, k as u64, m as u64, k as i64),
+            "LayoutB",
+        )?;
+        chk(
+            cublasLtMatrixLayoutCreate(&mut layout_out, output_dtype, n as u64, m as u64, n as i64),
+            "LayoutD",
+        )?;
+        let mut preference: cublasLtMatmulPreference_t = std::ptr::null_mut();
+        chk(
+            cublasLtMatmulPreferenceCreate(&mut preference),
+            "PrefCreate",
+        )?;
+        chk(
+            cublasLtMatmulPreferenceSetAttribute(
+                preference,
+                PREF_MAX_WORKSPACE_BYTES,
+                &ctx.ws_size as *const usize as *const c_void,
+                size_of::<usize>(),
+            ),
+            "PrefWorkspace",
+        )?;
+        let mut algo = [0u8; 128];
+        let mut returned = 0;
+        chk(
+            cublasLtMatmulAlgoGetHeuristic(
+                ctx.handle,
+                desc,
+                layout_weight,
+                layout_act,
+                layout_out,
+                layout_out,
+                preference,
+                1,
+                algo.as_mut_ptr() as *mut c_void,
+                &mut returned,
+            ),
+            "AlgoGetHeuristic",
+        )?;
+        cublasLtMatmulPreferenceDestroy(preference);
+        if returned < 1 {
+            bail!("cuBLASLt: no algorithm for {m}x{n}x{k}");
+        }
+        Ok(MatmulPlan {
+            desc,
+            layout_weight,
+            layout_act,
+            layout_out,
+            algo,
+        })
+    }
 }

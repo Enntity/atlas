@@ -424,6 +424,30 @@ impl TransformerModel {
         self.run_mtp_propose_inner(token, position, num_drafts, seq, grammar_bitmask)
     }
 
+    pub(super) fn configure_dflash_sampling_dispatch(
+        &self,
+        seq: &mut SequenceState,
+        temperature: f32,
+        seed: Option<u64>,
+    ) -> Result<()> {
+        let Some(proposer) = self.proposer.as_ref() else {
+            return Ok(());
+        };
+        let Some(state) = seq.proposer_state.as_mut() else {
+            return Ok(());
+        };
+        proposer.configure_sampling(state.as_mut(), temperature, seed)
+    }
+
+    pub(super) fn dflash_sparse_distribution_dispatch(
+        &self,
+        seq: &SequenceState,
+    ) -> Option<crate::speculative::SparseDraftDistribution> {
+        let proposer = self.proposer.as_ref()?;
+        let state = seq.proposer_state.as_ref()?;
+        proposer.sparse_draft_distribution(state.as_ref())
+    }
+
     /// Batched cross-sequence propose (batched K=4 verify path). Target
     /// hiddens are read DIRECTLY from the verify stash rows (`stash_idx[i]`),
     /// so the single-slot `mtp_hidden_save` is never involved. The catchup /
@@ -448,7 +472,8 @@ impl TransformerModel {
         if crate::speculative::draft_conf_tau() > 0.0 {
             return Ok(None);
         }
-        if self.verify_hidden_stash.is_null() {
+        let proposer_batch_max = proposer.propose_batch_max(&self.buffers, &self.config);
+        if self.verify_hidden_stash.is_null() && proposer_batch_max <= 1 {
             return Ok(None);
         }
         let stream = self.gpu.default_stream();
@@ -479,10 +504,14 @@ impl TransformerModel {
             self.ensure_drafter_context(proposer, seq, &ctx, stream);
         }
         let h = self.config.hidden_size;
-        let hiddens: Vec<spark_runtime::gpu::DevicePtr> = stash_idx
-            .iter()
-            .map(|&i| self.verify_hidden_stash.offset(i * h * 2))
-            .collect();
+        let hiddens: Vec<spark_runtime::gpu::DevicePtr> = if self.verify_hidden_stash.is_null() {
+            vec![spark_runtime::gpu::DevicePtr::NULL; seqs.len()]
+        } else {
+            stash_idx
+                .iter()
+                .map(|&i| self.verify_hidden_stash.offset(i * h * 2))
+                .collect()
+        };
         let mut states: Vec<&mut dyn crate::speculative::ProposerState> = Vec::new();
         for seq in seqs.iter_mut() {
             match seq.proposer_state.as_mut() {

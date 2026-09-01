@@ -23,10 +23,13 @@ pub(super) fn promote_completed_prefills(
     // needs it for the budget-derived `finish_reason` decision.
     max_seq_len: usize,
 ) {
-    // Process in reverse order so swap_remove indices stay valid.
+    // Process in reverse order so indices stay valid while preserving the
+    // order of every still-prefilling request. `swap_remove` made a FIFO
+    // phase policy LIFO after each completion by moving the newest request
+    // into slot zero.
     completed_indices.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
     for (idx, maybe_token) in completed_indices {
-        let mut p = prefilling.swap_remove(idx);
+        let mut p = prefilling.remove(idx);
         let Some(first) = maybe_token else {
             // Error path: free the sequence.
             let mut seq = p.seq;

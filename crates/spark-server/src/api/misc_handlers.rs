@@ -254,7 +254,11 @@ pub async fn tokenize(
             .iter()
             .map(|m| serde_json::json!({"role": m.role, "content": m.content.text}))
             .collect();
-        match state.tokenizer.apply_chat_template_jinja_with_effort(
+        // Match the actual /v1/chat/completions path. Some checkpoints (GLM-5.3
+        // in particular) need an OpenAI-facing variant to honor
+        // `enable_thinking=false`; using the raw checkpoint template here made
+        // /tokenize report token IDs that were never sent to the model.
+        match state.tokenizer.apply_chat_template_openai_with_effort(
             &json_messages,
             None,
             false,

@@ -79,6 +79,8 @@ pub struct Usage {
     /// field's meaning is "predicted tokens that matched generation", which
     /// Atlas's self-drafted MTP predictions are). 0 when speculation is off.
     pub accepted_prediction_tokens: usize,
+    /// Speculative-decode draft tokens rejected by verification.
+    pub rejected_prediction_tokens: usize,
     /// Atlas perf extensions; encoders may ignore.
     pub time_to_first_token_ms: f64,
     pub response_tokens_per_second: f64,

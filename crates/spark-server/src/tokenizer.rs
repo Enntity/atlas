@@ -64,6 +64,7 @@ fn normalize_tool_call_arguments(messages: &[serde_json::Value]) -> Vec<serde_js
 mod chat_impl;
 mod chat_render;
 mod deepseek_v4;
+mod glm5_next;
 mod jinja_helpers;
 mod message_preprocess;
 

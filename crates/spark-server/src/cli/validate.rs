@@ -147,6 +147,52 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         &args.scheduling_policy,
         SCHEDULING_POLICIES,
     );
+    let interleave = args.scheduling_policy == "phase-interleave";
+    if interleave {
+        if args.phase_decode_steps.is_none_or(|steps| steps == 0) {
+            v.push(Violation::new(
+                "phase-interleave without a positive --phase-decode-steps",
+                "the scheduler needs an explicit decode service budget; zero would starve streaming responses",
+                "set --phase-decode-steps to a positive integer (start with 4 for GLM-5.3)",
+            ));
+        }
+        if args.phase_prefill_steps.is_none_or(|steps| steps == 0) {
+            v.push(Violation::new(
+                "phase-interleave without a positive --phase-prefill-steps",
+                "the scheduler needs an explicit prefill service budget; zero would reproduce unbounded TTFT",
+                "set --phase-prefill-steps to a positive integer (start with 1 for GLM-5.3)",
+            ));
+        }
+        if args
+            .phase_prefill_slice_tokens
+            .is_some_and(|tokens| tokens == 0)
+        {
+            v.push(Violation::new(
+                "phase-interleave with a zero-token prefill slice",
+                "a zero-sized slab can never advance a waiting prompt",
+                "set --phase-prefill-slice-tokens to a positive integer",
+            ));
+        }
+        if args
+            .phase_prefill_slice_tokens
+            .is_some_and(|tokens| tokens > args.max_prefill_tokens)
+        {
+            v.push(Violation::new(
+                "phase prefill slice exceeds --max-prefill-tokens",
+                "the overlap slab must fit inside the allocated prefill arena",
+                "set --phase-prefill-slice-tokens at or below --max-prefill-tokens",
+            ));
+        }
+    } else if args.phase_decode_steps.is_some()
+        || args.phase_prefill_steps.is_some()
+        || args.phase_prefill_slice_tokens.is_some()
+    {
+        v.push(Violation::new(
+            "phase step flags with a non-interleaved scheduling policy",
+            "those values would be silently ignored by fifo/slai",
+            "select --scheduling-policy phase-interleave or remove the phase flags",
+        ));
+    }
     if let Some(parser) = args.tool_call_parser.as_deref() {
         check_enum(&mut v, "--tool-call-parser", parser, TOOL_CALL_PARSERS);
     }

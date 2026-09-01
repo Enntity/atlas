@@ -129,6 +129,15 @@ fn resolve_name(model_type: &str, hidden: usize, refs: &[&str]) -> Option<&'stat
         .map(|i| parsed[i].name)
 }
 
+#[test]
+fn glm53_checkpoint_resolves_only_to_its_exact_target() {
+    assert_eq!(
+        resolve_name("glm5_next", 4096, &["zai-org/GLM-5.3-Flash"]),
+        Some("glm-5.3-flash")
+    );
+    assert_eq!(resolve_name("glm5_next", 5120, &["GLM-5.3-Flash"]), None);
+}
+
 // ── The dense-27B family ──
 
 #[test]

@@ -68,7 +68,9 @@ pub(super) fn batch_decode_graph_cap(decode_meta_rows: usize) -> usize {
 /// `(layer, slot)` for the life of the process, plus staging buffers that
 /// decode refreshes before every replay. A new occupant of the same slot
 /// can legally replay them. Graphs that bake a per-occupant LoRA adapter
-/// index (`verify_kgamma` / `fused`) cannot.
+/// index (`verify_kgamma` / `fused`) cannot when LoRA is installed. Without
+/// LoRA those graphs contain no occupant-specific adapter state and are as
+/// reusable as the other slot-keyed graphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FreeSlotGraphPolicy {
     Retain,
@@ -87,8 +89,12 @@ pub(super) fn verify_k_graph_on_free() -> FreeSlotGraphPolicy {
     FreeSlotGraphPolicy::Retain
 }
 
-pub(super) fn lora_baked_graph_on_free() -> FreeSlotGraphPolicy {
-    FreeSlotGraphPolicy::DropThisSlot
+pub(super) fn lora_baked_graph_on_free(has_lora: bool) -> FreeSlotGraphPolicy {
+    if has_lora {
+        FreeSlotGraphPolicy::DropThisSlot
+    } else {
+        FreeSlotGraphPolicy::Retain
+    }
 }
 
 /// Insert `graph` at `key`, evicting the LRU entry when at `cap` and the key
@@ -220,9 +226,10 @@ mod tests {
         assert_eq!(batch_decode_graphs_on_free(), FreeSlotGraphPolicy::Retain);
         assert_eq!(verify_k_graph_on_free(), FreeSlotGraphPolicy::Retain);
         assert_eq!(
-            lora_baked_graph_on_free(),
+            lora_baked_graph_on_free(true),
             FreeSlotGraphPolicy::DropThisSlot
         );
+        assert_eq!(lora_baked_graph_on_free(false), FreeSlotGraphPolicy::Retain);
     }
 
     #[test]
@@ -265,7 +272,8 @@ mod tests {
 
     /// NEGATIVE: `free_sequence_dispatch` must not drain slot-keyed decode
     /// graphs. Recapturing on every completion was the cost this PR removes.
-    /// LoRA-baked `verify_kgamma` / `fused` still drop (adapter index baked).
+    /// LoRA-baked `verify_kgamma` / `fused` are only touched inside the LoRA
+    /// guard; a base model retains them across slot occupants.
     ///
     /// PROVEN BY: restoring `self.decode_graph.lock()` or
     /// `self.batch_decode_graphs.lock()` inside `free_sequence_dispatch`
@@ -293,7 +301,18 @@ mod tests {
         );
         assert!(
             body.contains("verify_kgamma_graph") && body.contains("fused_graph"),
-            "LoRA-baked graphs still drop"
+            "LoRA-baked graph caches must still have a guarded drop path"
+        );
+        let lora_guard = body.find("if self.lora.is_some()").expect("LoRA guard");
+        let verify_cache = body
+            .find("self.verify_kgamma_graph.lock()")
+            .expect("verify K=gamma graph cache");
+        let fused_cache = body
+            .find("self.fused_graph.lock()")
+            .expect("fused graph cache");
+        assert!(
+            lora_guard < verify_cache && lora_guard < fused_cache,
+            "base models must retain occupant-independent K=gamma graphs"
         );
     }
 }

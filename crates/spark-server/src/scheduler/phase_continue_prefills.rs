@@ -43,6 +43,24 @@ use run_batched_mixed::run_batched_mixed_step;
 use run_batched_prefill::run_batched_prefill_step;
 use run_standard::run_standard_chunk_loop;
 
+pub(super) fn requires_single_chunk_mla(model: &dyn Model) -> bool {
+    model.is_mla() && !model.supports_chunked_mla_prefill()
+}
+
+fn should_use_twophase(
+    always_mixed: bool,
+    active_is_empty: bool,
+    is_ep: bool,
+    chunk_offset: usize,
+    prompt_len: usize,
+    max_prefill_tokens: usize,
+) -> bool {
+    !is_ep
+        && (!always_mixed || active_is_empty)
+        && chunk_offset == 0
+        && prompt_len > max_prefill_tokens
+}
+
 /// Shared per-chunk InnerQ poll used by every prefill path (standard /
 /// batched-prefill / batched-mixed). `maybe_finalize` is idempotent post
 /// activation, and a no-op when `TURBO_INNERQ` was not set at startup —
@@ -62,10 +80,13 @@ pub(super) fn continue_in_progress_prefills(
     prefilling: &mut Vec<PrefillInProgress>,
     max_prefill_tokens: usize,
     max_batch_tokens: usize,
+    allow_prefill_this_iteration: bool,
     always_mixed: bool,
     prefill_stream: u64,
     prefill_event: u64,
     use_mtp: bool,
+    num_drafts: usize,
+    dflash_verify_raw_argmax: bool,
     use_self_speculative: bool,
     use_ngram_speculative: bool,
     think_end_token: Option<u32>,
@@ -79,6 +100,46 @@ pub(super) fn continue_in_progress_prefills(
     let mut did_mixed_step = false;
 
     if prefilling.is_empty() {
+        return did_mixed_step;
+    }
+
+    let mut completed_indices = Vec::new();
+
+    // GLM's speculative lane is not a generic "mixed forward": it combines
+    // one causal target-verification block with an equal-width slice of the
+    // arriving prompt.  Run it before the ordinary phase gate because this
+    // step also services the active stream; suppressing it would fall back to
+    // the very standalone prompt sweep this path exists to remove.
+    if use_mtp
+        && crate::scheduler::dflash_prefill_step::try_step_dflash_prefill(
+            model,
+            active,
+            prefilling,
+            &mut completed_indices,
+            sched,
+            num_drafts,
+            think_end_token,
+            think_start_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            dflash_verify_raw_argmax,
+        )
+    {
+        promote_completed_prefills(
+            model,
+            prefilling,
+            completed_indices,
+            active,
+            think_end_token,
+            think_start_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            sched.limits.max_seq_len,
+        );
+        return true;
+    }
+
+    if !active.is_empty() && !allow_prefill_this_iteration {
         return did_mixed_step;
     }
 
@@ -116,7 +177,7 @@ pub(super) fn continue_in_progress_prefills(
         // single-stream mixed path (run_standard) requires: active decode,
         // not EP, not a single-active speculative path.
         let fusable_mixed = !active.is_empty() && !model.is_ep() && !single_active_with_spec;
-        let slas_ok = active.is_empty() || policy.should_prefill(&timings);
+        let slas_ok = active.is_empty() || allow_prefill_this_iteration;
         // Genuine suppress: nothing to fuse and policy says wait.
         if !slas_ok && !fusable_mixed {
             return did_mixed_step;
@@ -146,13 +207,18 @@ pub(super) fn continue_in_progress_prefills(
         }
     } else {
         // Resting production path — unchanged binary gate.
-        let do_chunks = active.is_empty() || policy.should_prefill(&timings);
+        let do_chunks = active.is_empty() || allow_prefill_this_iteration;
         if !do_chunks {
             return did_mixed_step;
         }
+        // Multi-rank EP cannot fuse decode and prefill in one forward, but it
+        // can bound the standalone prefill slab. Keep the full arena-sized
+        // chunk when no decode is active and use the phase policy's smaller
+        // overlap slice only when streaming responses need service.
+        if model.is_ep() && !active.is_empty() {
+            slice_budget = policy.prefill_slice_budget(&timings, max_prefill_tokens);
+        }
     }
-
-    let mut completed_indices = Vec::new();
 
     // Q12 batched-prefill paths. Two branches fire when 2+ streams are
     // prefilling concurrently (replaces the FIFO `prefilling.first_mut()`
@@ -184,8 +250,8 @@ pub(super) fn continue_in_progress_prefills(
     let can_batch_prefill_only = !q12_dispatch_disabled
         && !any_collecting
         && prefilling.len() >= 2
-        && active.is_empty()
-        && !model.is_ep();
+        && (active.is_empty() || model.supports_native_batched_prefill())
+        && (!model.is_ep() || model.supports_native_batched_prefill());
     // When ATLAS_HOLO_ALWAYS_MIXED is on, COLLAPSE the multi-prefill+decode
     // case onto the single-stream fused path below (FIFO head prefill fused
     // with all active decodes via mixed_forward, sized by the slice budget)
@@ -207,7 +273,11 @@ pub(super) fn continue_in_progress_prefills(
             sched,
             prefilling,
             &mut completed_indices,
-            max_prefill_tokens,
+            if active.is_empty() {
+                max_prefill_tokens
+            } else {
+                slice_budget
+            },
             max_batch_tokens,
             prefill_stream,
             prefill_event,
@@ -280,9 +350,18 @@ pub(super) fn continue_in_progress_prefills(
         // byte-identical to today (the `active.is_empty()` guard only applies
         // when always-mixed is enabled; otherwise the original two-phase
         // condition is preserved exactly).
-        let use_twophase = (!always_mixed || active.is_empty())
-            && p.chunk_offset == 0
-            && p.prompt_tokens.len() > max_prefill_tokens;
+        // EP workers execute one explicit command per chunk. The two-phase
+        // helper loops over all chunks only on rank 0, so using it under EP
+        // leaves workers waiting for a command while rank 0 enters MoE
+        // collectives. Keep EP on the standard per-chunk protocol.
+        let use_twophase = should_use_twophase(
+            always_mixed,
+            active.is_empty(),
+            model.is_ep(),
+            p.chunk_offset,
+            p.prompt_tokens.len(),
+            max_prefill_tokens,
+        );
         if use_twophase {
             tracing::info!(
                 "Two-phase prefill: {} tokens, chunk_size={}",
@@ -373,4 +452,16 @@ pub(super) fn continue_in_progress_prefills(
     );
 
     did_mixed_step
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_use_twophase;
+
+    #[test]
+    fn ep_never_enters_head_only_twophase_prefill() {
+        assert!(!should_use_twophase(false, false, true, 0, 498, 128));
+        assert!(!should_use_twophase(false, true, true, 0, 498, 128));
+        assert!(should_use_twophase(false, true, false, 0, 498, 128));
+    }
 }

@@ -163,6 +163,26 @@ impl PagedKvCache {
         Some(idx)
     }
 
+    /// Atomically allocate `count` independent blocks.
+    ///
+    /// Unlike a caller-side loop around [`Self::try_alloc_block`], failure
+    /// leaves the pool untouched. This matters for lazily-grown per-sequence
+    /// block tables: a partial allocation must never be lost when the caller
+    /// retries after admission pressure subsides.
+    #[track_caller]
+    pub fn try_alloc_blocks(&mut self, count: usize) -> Option<Vec<u32>> {
+        if self.free_blocks.len() < count {
+            return None;
+        }
+        let mut blocks = Vec::with_capacity(count);
+        for _ in 0..count {
+            // The length preflight above and exclusive `&mut self` make this
+            // infallible for the duration of this allocation transaction.
+            blocks.push(self.try_alloc_block().expect("preflighted free block"));
+        }
+        Some(blocks)
+    }
+
     /// Increment reference count on a block (for prefix cache sharing).
     #[track_caller]
     pub fn inc_ref(&mut self, block_idx: u32) {

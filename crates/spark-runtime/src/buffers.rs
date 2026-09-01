@@ -11,10 +11,15 @@ use atlas_core::config::ModelConfig;
 
 mod accessors;
 pub mod decode_meta;
+mod glm;
 mod sizes;
 mod sizes_q12;
 mod sizes_q2;
 pub use decode_meta::{DECODE_META_MAX_ROWS, DECODE_META_MIN_ROWS, DecodeMetaLayout};
+pub use glm::{
+    GLM53_EXL3_LOCK_BYTES, GLM53_VERIFY_MAX_BATCH_ROWS, GLM53_VERIFY_MAX_ROWS,
+    GLM53_VERIFY_MAX_SEQS, GlmWorkspaceLayout,
+};
 pub use sizes::BufferSizes;
 pub use sizes_q2::q2_dequant_scratch_bytes;
 pub use sizes_q12::{
@@ -90,6 +95,10 @@ pub struct BufferArena {
     /// GDN FLA chunked-prefill scratch (W|U|S|uc sub-divided). NULL unless the
     /// model is a 128-dim-linear-head GDN model (ATLAS_GDN_FLA path).
     gdn_fla_scratch: DevicePtr,
+    /// Shared GLM KDA/DSA workspace. NULL for every other model family.
+    glm_workspace: DevicePtr,
+    /// Typed offsets inside `glm_workspace`; zero-sized for non-GLM models.
+    glm_layout: GlmWorkspaceLayout,
     /// Mamba-2 SSD chunked-scan scratch (dt | dA_cumsum | CB). NULL unless the model
     /// has Mamba-2 SSM layers.
     ssd_scratch: DevicePtr,
@@ -197,6 +206,13 @@ impl BufferArena {
         } else {
             DevicePtr::NULL
         };
+        let glm_layout =
+            GlmWorkspaceLayout::from_config(config, max_batch_tokens, max_seq_len, max_batch_size)?;
+        let glm_workspace = if glm_layout.total_bytes > 0 {
+            gpu.alloc(glm_layout.total_bytes)?
+        } else {
+            DevicePtr::NULL
+        };
         let token_ids = gpu.alloc(sizes.token_ids)?;
         // Shared dense-FFN activation-quant scratch (MMQ/int8 prefill). Sized 0
         // for MoE models → NULL → per-layer ensure_* path stays inert.
@@ -255,7 +271,7 @@ impl BufferArena {
         tracing::info!(
             "Buffer arena: {} tokens × {:.1} MB total (attn_out={:.1}MB, ssm_deint={:.1}MB, kv_lora_rank={})",
             max_batch_tokens,
-            sizes.total_bytes() as f64 / (1024.0 * 1024.0),
+            (sizes.total_bytes() + glm_layout.total_bytes) as f64 / (1024.0 * 1024.0),
             sizes.attn_output as f64 / (1024.0 * 1024.0),
             sizes.ssm_deinterleaved as f64 / (1024.0 * 1024.0),
             config.kv_lora_rank,
@@ -288,6 +304,8 @@ impl BufferArena {
             hc_post,
             hc_comb,
             gdn_fla_scratch,
+            glm_workspace,
+            glm_layout,
             ssd_scratch,
             token_ids,
             ffn_act_q8,
@@ -328,6 +346,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             max_batch_tokens: _,
             // Layout, not an allocation — derived from `--max-batch-size`.
             decode_meta: _,
+            glm_layout: _,
             hidden_states,
             residual,
             norm_output,
@@ -354,6 +373,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             hc_post,
             hc_comb,
             gdn_fla_scratch,
+            glm_workspace,
             ssd_scratch,
             token_ids,
             ffn_act_q8,
@@ -397,6 +417,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             *hc_post,
             *hc_comb,
             *gdn_fla_scratch,
+            *glm_workspace,
             *ssd_scratch,
             *token_ids,
             *ffn_act_q8,
@@ -445,6 +466,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
         *hc_post = DevicePtr::NULL;
         *hc_comb = DevicePtr::NULL;
         *gdn_fla_scratch = DevicePtr::NULL;
+        *glm_workspace = DevicePtr::NULL;
         *ssd_scratch = DevicePtr::NULL;
         *token_ids = DevicePtr::NULL;
         *ffn_act_q8 = DevicePtr::NULL;

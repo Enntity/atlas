@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use super::super::sample_first_token;
 use super::super::types::PrefillInProgress;
-use super::prefill_waves::{WaveGeom, plan_prefill_waves};
+use super::prefill_waves::{WaveGeom, plan_native_glm_waves, plan_prefill_waves};
 
 pub(super) fn run_batched_prefill_step(
     model: &dyn Model,
@@ -30,6 +30,10 @@ pub(super) fn run_batched_prefill_step(
 ) {
     // Per-chunk InnerQ finalize poll — see `phase_continue_prefills::poll_innerq`.
     super::poll_innerq(model);
+    // The EP packed command requires a deterministic row order on both ranks.
+    // Slot order is stable across the fixed GLM state pools and also makes the
+    // worker's safe ascending slot walk borrow each sequence exactly once.
+    prefilling.sort_by_key(|p| p.seq.slot_idx);
     // Build per-stream chunk_len (capped at max_prefill_tokens) and
     // is_last_chunk flag, then construct PrefillSlice borrowing each
     // stream's prompt_tokens and seq.
@@ -47,7 +51,8 @@ pub(super) fn run_batched_prefill_step(
     // redundant; per-stream geometry is what the cu_seqlens path wants).
     // Precedence: when both `--prefill-varlen-batch` and the codispatch env
     // are set, varlen wins.
-    let varlen = spark_model::layers::ops::prefill_varlen_enabled();
+    let native_batch = model.supports_native_batched_prefill();
+    let varlen = spark_model::layers::ops::prefill_varlen_enabled() || native_batch;
     // Co-dispatch (ATLAS_PREFILL_CODISPATCH=1): when all streams are at chunk 0
     // and equal-length, give them ONE shared geometry so the kernel-batched path
     // is eligible (check_kernel_batched_eligible requires identical chunk_len /
@@ -57,7 +62,7 @@ pub(super) fn run_batched_prefill_step(
         && std::env::var("ATLAS_PREFILL_CODISPATCH")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
-        && !model.is_mla()
+        && !super::requires_single_chunk_mla(model)
         && n >= 2
         && prefilling.iter().all(|p| p.chunk_offset == 0)
         && prefilling
@@ -82,7 +87,7 @@ pub(super) fn run_batched_prefill_step(
             // Same MLA correctness gate as `run_standard_chunk_loop` — MLA
             // models lack a paged-MLA prefill kernel so multi-chunk prefill
             // silently corrupts attention. Force single-chunk for MLA.
-            let effective_max = if model.is_mla() {
+            let effective_max = if super::requires_single_chunk_mla(model) {
                 remaining
             } else {
                 max_prefill_tokens
@@ -106,7 +111,13 @@ pub(super) fn run_batched_prefill_step(
     // back-to-back within this tick, so every stream still advances one
     // chunk per tick. Flag OFF ⇒ exactly one wave holding every stream — the
     // pre-wave dispatch, byte-identical (pinned in prefill_waves tests).
-    let wave_cap = max_prefill_tokens.min(max_batch_tokens).max(1);
+    // `max_prefill_tokens` is a PER-STREAM overlap slice for native GLM.
+    // The combined stacked pass may fill the whole token arena.
+    let wave_cap = if native_batch {
+        max_batch_tokens.max(1)
+    } else {
+        max_prefill_tokens.min(max_batch_tokens).max(1)
+    };
     let geoms: Vec<WaveGeom> = prefilling
         .iter()
         .enumerate()
@@ -116,7 +127,11 @@ pub(super) fn run_batched_prefill_step(
             is_last: is_last_flags[i],
         })
         .collect();
-    let waves = plan_prefill_waves(&geoms, varlen, wave_cap);
+    let waves = if native_batch {
+        plan_native_glm_waves(&geoms, wave_cap)
+    } else {
+        plan_prefill_waves(&geoms, varlen, wave_cap)
+    };
     let n_waves = waves.len();
     if varlen {
         // Engagement proof for serve-log diagnosis: one INFO line per tick
@@ -156,6 +171,16 @@ pub(super) fn run_batched_prefill_step(
                 is_last_chunk: is_last_flags[i],
             })
             .collect();
+
+        if model.is_ep()
+            && let Err(e) = model.ep_broadcast_prefill_batch(&slices)
+        {
+            tracing::error!("EP batched prefill broadcast failed: {e:#}");
+            for &i in &wave {
+                completed_indices.push((i, None));
+            }
+            return;
+        }
 
         let logits_per_stream = match model.prefill_batch_chunk(&mut slices, prefill_stream) {
             Ok(v) => v,

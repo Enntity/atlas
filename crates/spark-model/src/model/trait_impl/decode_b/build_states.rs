@@ -13,7 +13,7 @@
 use anyhow::Result;
 
 use super::super::super::types::TransformerModel;
-use crate::layer::{LayerState, SsmLayerState};
+use crate::layer::{GlmSparseMlaLayerState, KdaLayerState, LayerState, SsmLayerState};
 use crate::traits::SequenceState;
 use atlas_core::config::LayerType;
 
@@ -57,11 +57,30 @@ impl TransformerModel {
         // dedicated `dummy_slot()` (see SsmStatePool) so pad SSM kernel
         // writes can never collide with another claimed sequence.
         let dummy_ssm_slot = self.ssm_pool.dummy_slot();
+        let is_glm = self.ssm_pool.is_glm();
         for _pad_pos in n_decode..padded_n {
             let mut dummy: Vec<Box<dyn LayerState>> = Vec::with_capacity(self.layers.len());
             let mut ssm_idx = 0usize;
+            let mut dsa_idx = 0usize;
             for (li, layer) in self.layers.iter().enumerate() {
-                if self.config.layer_type(li) == LayerType::LinearAttention {
+                if is_glm && self.config.layer_type(li) == LayerType::LinearAttention {
+                    dummy.push(Box::new(KdaLayerState {
+                        slot_idx: dummy_ssm_slot,
+                        slot_capacity: self.ssm_pool.max_slots + 1,
+                        current: self.ssm_pool.kda_state(ssm_idx, dummy_ssm_slot),
+                        checkpoint: None,
+                        intermediates: Vec::new(),
+                    }));
+                    ssm_idx += 1;
+                } else if is_glm && self.config.layer_type(li) == LayerType::FullAttention {
+                    dummy.push(Box::new(GlmSparseMlaLayerState {
+                        slot_idx: dummy_ssm_slot,
+                        current: self.ssm_pool.glm_dsa_state(dsa_idx, dummy_ssm_slot),
+                        checkpoint: None,
+                        intermediates: Vec::new(),
+                    }));
+                    dsa_idx += 1;
+                } else if self.config.layer_type(li) == LayerType::LinearAttention {
                     dummy.push(Box::new(SsmLayerState {
                         h_state: self.ssm_pool.h_state(ssm_idx, dummy_ssm_slot),
                         conv_state: self.ssm_pool.conv_state(ssm_idx, dummy_ssm_slot),

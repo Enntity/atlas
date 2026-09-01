@@ -194,6 +194,20 @@ impl BlockDiffusionDraftHead {
             stream,
         )?;
 
+        let projection_input = if let Some(conv) = layer.attention_conv.as_ref() {
+            self.dflash2_conv_prepare(
+                conv,
+                self.scratch.norm_buf,
+                self.scratch.mlp_intermediate,
+                self.scratch.stream_acc,
+                ctx,
+                stream,
+            )?;
+            self.scratch.stream_acc
+        } else {
+            self.scratch.norm_buf
+        };
+
         // id259 per-layer dump: post-input_norm (γ × h).
         if args.block_dump {
             self.block_dump_buf(
@@ -253,7 +267,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.q_proj,
             &layer.q_proj_fp8,
-            self.scratch.norm_buf,
+            projection_input,
             self.scratch.q_buf,
             q_dim,
             h,
@@ -302,7 +316,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.k_proj,
             &layer.k_proj_fp8,
-            self.scratch.norm_buf,
+            projection_input,
             self.scratch.k_buf,
             kv_dim,
             h,
@@ -347,7 +361,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.v_proj,
             &layer.v_proj_fp8,
-            self.scratch.norm_buf,
+            projection_input,
             self.scratch.v_buf,
             kv_dim,
             h,
@@ -584,7 +598,7 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             16, // cache_block_size
-            0,  // sliding_window — drafter not windowed for now
+            self.window_size.unwrap_or(0) as u32,
             inv_sqrt_d,
             stream,
         )?;
@@ -889,6 +903,20 @@ impl BlockDiffusionDraftHead {
             q_dim,
         )?;
 
+        let attention_output = if let Some(conv) = layer.attention_conv.as_ref() {
+            self.dflash2_conv_finish(
+                conv,
+                self.scratch.stream_acc,
+                self.scratch.mlp_intermediate,
+                self.scratch.attn_out,
+                ctx,
+                stream,
+            )?;
+            self.scratch.attn_out
+        } else {
+            self.scratch.stream_acc
+        };
+
         // 3h. First residual add: hidden = residual + attn_output.
         // dflash.py:138  hidden_states = residual + hidden_states
         //   stream_buf (residual = pre-3a noise hidden states)
@@ -898,7 +926,7 @@ impl BlockDiffusionDraftHead {
             gpu,
             self.kernels.residual_add,
             self.scratch.stream_buf,
-            self.scratch.stream_acc,
+            attention_output,
             g * h,
             stream,
         )?;
@@ -921,6 +949,20 @@ impl BlockDiffusionDraftHead {
             stream,
         )?;
 
+        let mlp_input = if let Some(conv) = layer.mlp_conv.as_ref() {
+            self.dflash2_conv_prepare(
+                conv,
+                self.scratch.norm_buf,
+                self.scratch.q_buf,
+                self.scratch.stream_acc,
+                ctx,
+                stream,
+            )?;
+            self.scratch.stream_acc
+        } else {
+            self.scratch.norm_buf
+        };
+
         // 3j. MLP: gate_proj + up_proj + silu_mul + down_proj — γ rows.
         // dflash.py:141  hidden_states = self.mlp(hidden_states)
         //   Qwen3MLP: down_proj(silu(gate_proj(x)) * up_proj(x)).
@@ -930,7 +972,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.gate_proj,
             &layer.gate_proj_fp8,
-            self.scratch.norm_buf,
+            mlp_input,
             self.scratch.mlp_intermediate,
             inter,
             h,
@@ -938,7 +980,7 @@ impl BlockDiffusionDraftHead {
         gemm_swap(
             &layer.up_proj,
             &layer.up_proj_fp8,
-            self.scratch.norm_buf,
+            mlp_input,
             self.scratch.mlp_up,
             inter,
             h,
@@ -961,6 +1003,20 @@ impl BlockDiffusionDraftHead {
             inter,
         )?;
 
+        let mlp_output = if let Some(conv) = layer.mlp_conv.as_ref() {
+            self.dflash2_conv_finish(
+                conv,
+                self.scratch.stream_acc,
+                self.scratch.q_buf,
+                self.scratch.norm_buf,
+                ctx,
+                stream,
+            )?;
+            self.scratch.norm_buf
+        } else {
+            self.scratch.stream_acc
+        };
+
         // 3k. Second residual add: hidden = (residual + attn) + mlp_output.
         // dflash.py:142  hidden_states = residual + hidden_states
         //   stream_buf (= residual + attn_output, the line-139 residual)
@@ -971,7 +1027,7 @@ impl BlockDiffusionDraftHead {
             gpu,
             self.kernels.residual_add,
             self.scratch.stream_buf,
-            self.scratch.stream_acc,
+            mlp_output,
             g * h,
             stream,
         )?;

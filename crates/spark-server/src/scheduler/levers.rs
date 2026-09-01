@@ -42,7 +42,6 @@ pub struct SchedLevers {
     pub dflash_seam_serial: bool,
     pub dflash_adaptive: bool,
     pub dflash_serial_append: bool,
-    pub dflash_unified_ctx: bool,
     pub dflash_spec_think: bool,
     /// Mean accepted drafts below which adaptive speculation suspends.
     pub dflash_adaptive_min: f32,
@@ -144,7 +143,6 @@ impl SchedLevers {
             dflash_seam_serial: opt_in("ATLAS_DFLASH_SEAM_SERIAL"),
             dflash_adaptive: opt_in("ATLAS_DFLASH_ADAPTIVE"),
             dflash_serial_append: opt_in("ATLAS_DFLASH_SERIAL_APPEND"),
-            dflash_unified_ctx: opt_in("ATLAS_DFLASH_UNIFIED_CTX"),
             dflash_spec_think: opt_in("ATLAS_DFLASH_SPEC_THINK"),
             dflash_adaptive_min: num("ATLAS_DFLASH_ADAPTIVE_MIN", 2.0),
             dflash_adaptive_reprobe: num("ATLAS_DFLASH_ADAPTIVE_REPROBE", 256),
@@ -188,7 +186,6 @@ impl SchedLevers {
             dflash_seam_serial: false,
             dflash_adaptive: false,
             dflash_serial_append: false,
-            dflash_unified_ctx: false,
             dflash_spec_think: false,
             dflash_adaptive_min: 2.0,
             dflash_adaptive_reprobe: 256,

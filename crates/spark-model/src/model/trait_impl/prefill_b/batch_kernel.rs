@@ -75,10 +75,10 @@ impl TransformerModel {
     ) -> Result<KernelBatchResult> {
         let n = streams.len();
         let chunk_len = streams[0].chunk_len;
-        let is_last_chunk = streams[0].is_last_chunk;
+        let glm_native = self.config.model_type == "glm5_next";
         let h = self.config.hidden_size;
         let dtype_bytes = 2usize;
-        let varlen = varlen_prefill_enabled();
+        let varlen = glm_native || varlen_prefill_enabled();
         // DEFECT 2 fix: the stacked hidden buffer MUST be packed by the same
         // cu_seqlens SSOT (Σ proc_count) that Phase1/GDN/Phase3/attn + the staged
         // BatchedAttnMetadata (stage_batched.rs) and GdnPrefillBuffers.total_len
@@ -136,10 +136,16 @@ impl TransformerModel {
                 let through = (s.chunk_start + s.chunk_len).div_ceil(bs);
                 // Blocks this stream already has, plus the ones its prefix match
                 // will hand it (reused, never allocated).
-                let matched_blocks =
+                // GLM recurrent KDA + learned DSA index state cannot be
+                // reconstructed from KV blocks, so native GLM prefill never
+                // credits a KV-only prefix match.
+                let matched_blocks = if glm_native {
+                    0
+                } else {
                     self.prefix_cache
                         .peek_matched_tokens(s.prompt_tokens, bs, s.seq.adapter_id)
-                        / bs;
+                        / bs
+                };
                 let have = s.seq.block_table.len() + matched_blocks;
                 needed += through.saturating_sub(have);
             }
@@ -174,11 +180,14 @@ impl TransformerModel {
         // plan has released its exact radix references and may safely take the
         // established per-stream path. Once admitted, Phase A consumes these
         // reservations instead of walking the cache again.
-        let reserved_prefix_matches =
+        let reserved_prefix_matches = if glm_native {
+            Vec::new()
+        } else {
             match self.prefill_b_reserve_batched_prefix_matches(streams, kv_cache.block_size()) {
                 Some(matches) => matches,
                 None => return Ok(KernelBatchResult::NotAdmitted),
-            };
+            }
+        };
 
         // Zero shared buffers once (instead of N times in per-stream).
         if self.comm.is_some() {
@@ -291,20 +300,25 @@ impl TransformerModel {
 
             // Prefix-cache lookup, EP-sync, Marconi restore. Cache-admitted
             // batches consume their preflight reservation exactly once.
-            let reserved_match = if self.prefix_cache.is_active() && chunk_start == 0 {
+            let reserved_match = if !glm_native && self.prefix_cache.is_active() && chunk_start == 0
+            {
                 Some(reserved_prefix_matches[b].clone())
             } else {
                 None
             };
-            let (kv_write_start, marconi_skip) = self.prefill_b_prefix_lookup(
-                tokens,
-                seq,
-                chunk_start,
-                total,
-                &mut kv_cache,
-                stream,
-                reserved_match,
-            )?;
+            let (kv_write_start, marconi_skip) = if glm_native {
+                (0, false)
+            } else {
+                self.prefill_b_prefix_lookup(
+                    tokens,
+                    seq,
+                    chunk_start,
+                    total,
+                    &mut kv_cache,
+                    stream,
+                    reserved_match,
+                )?
+            };
 
             // Block allocation through end of chunk.
             let bs = kv_cache.block_size();
@@ -329,7 +343,7 @@ impl TransformerModel {
                     seq,
                     chunk_start,
                     cl,
-                    is_last_chunk,
+                    slice.is_last_chunk,
                     kv_write_start,
                     marconi_skip,
                     hidden_b,
@@ -360,7 +374,7 @@ impl TransformerModel {
                         per_stream[0].proc_count
                     );
                 }
-                if per_stream[0].effective_seq_len_start != effective_seq_len_start {
+                if !glm_native && per_stream[0].effective_seq_len_start != effective_seq_len_start {
                     anyhow::bail!(
                         "kernel-batched: stream {b} effective_seq_len_start={} \
                          differs from stream 0={}. Caller should fall back.",
@@ -414,7 +428,7 @@ impl TransformerModel {
             }
             match (needs_paged, layout.needs_paged) {
                 (None, p) => needs_paged = Some(p),
-                (Some(prev), p) if prev != p => anyhow::bail!(
+                (Some(prev), p) if prev != p && !glm_native => anyhow::bail!(
                     "kernel-batched: stream {b} needs_paged={p} mismatch with stream 0"
                 ),
                 _ => {}
@@ -558,6 +572,10 @@ impl TransformerModel {
 
         // Per-stream kv_write_starts vector for attention dispatcher.
         let kv_write_starts: Vec<usize> = per_stream.iter().map(|m| m.kv_write_start_eff).collect();
+        let position_starts: Vec<usize> = per_stream
+            .iter()
+            .map(|m| m.effective_seq_len_start)
+            .collect();
 
         // Outer layer loop with mixed dispatch.
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -565,7 +583,25 @@ impl TransformerModel {
             let mut seqs_vec: Vec<&mut SequenceState> =
                 streams.iter_mut().map(|s| &mut *s.seq).collect();
 
-            if layer.is_ssm_layer() {
+            if glm_native {
+                self.prefill_glm_batched_layer(
+                    layer.as_ref(),
+                    layer_idx,
+                    hidden_base,
+                    _residual_base,
+                    &mut seqs_vec,
+                    &meta,
+                    &ctx,
+                    stream,
+                )?;
+                self.try_dflash_batched_prefill_capture_layer(
+                    &mut seqs_vec,
+                    layer_idx,
+                    &meta,
+                    &position_starts,
+                    stream,
+                )?;
+            } else if layer.is_ssm_layer() {
                 let proc_starts: Vec<usize> = per_stream.iter().map(|m| m.proc_start).collect();
                 self.prefill_ssm_batched_layer(
                     layer.as_ref(),
@@ -616,7 +652,7 @@ impl TransformerModel {
                 .extend_from_slice(&tokens[chunk_start..chunk_start + cl]);
             seq.seq_len = chunk_start + cl;
 
-            let logits = if is_last_chunk {
+            let logits = if slice.is_last_chunk {
                 self.prefill_b_finalize_last_at(
                     tokens,
                     seq,

@@ -212,7 +212,7 @@ impl TransformerModel {
             self.try_dflash_prefill_capture_layer(
                 seq,
                 i,
-                layer_kv_write_start,
+                effective_seq_len_start,
                 proc_count,
                 stream,
             )?;

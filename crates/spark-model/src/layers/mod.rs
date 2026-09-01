@@ -5,6 +5,7 @@ pub mod dense_ffn;
 pub mod dflash_head;
 pub mod ep_dispatch;
 pub mod fp8_calibration;
+pub mod glm5;
 pub mod moe;
 pub mod mtp_head;
 pub(crate) mod mtp_meta;
@@ -57,6 +58,7 @@ pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
 pub use dflash_head::{
     BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,
 };
+pub use glm5::Glm5Layer;
 pub use moe::MoeLayer;
 pub use mtp_head::{MtpHead, MtpQuantization, mtp_drafter_prefill_enabled};
 pub use nemotron_mamba2::NemotronMamba2Layer;

@@ -24,7 +24,7 @@ use crate::layer::{
 };
 use crate::layers::ops;
 use crate::speculative::DraftProposer;
-use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
+use crate::traits::{ChunkedPrefillPageMetadata, EP_PREFILL_BATCH_CMD, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
@@ -349,6 +349,64 @@ impl TransformerModel {
         Ok(())
     }
 
+    pub(super) fn ep_broadcast_dflash_verify_batch_dispatch(
+        &self,
+        seq_ids: &[u32],
+        tokens: &[u32],
+        k: usize,
+    ) -> Result<()> {
+        if !self.multi_rank_protocol_active() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.ep_protocol_v2,
+            "batched DFlash requires EP protocol v2"
+        );
+        anyhow::ensure!(
+            !seq_ids.is_empty() && tokens.len() == seq_ids.len() * k,
+            "batched DFlash wire matrix must be n*k"
+        );
+        self.ep_broadcast_seq_and_cmd(0, 0xFFFFFFDF, true)?;
+        self.ep_broadcast_u32(seq_ids.len() as u32)?;
+        self.ep_broadcast_u32(k as u32)?;
+        self.ep_broadcast_tokens(seq_ids)?;
+        self.ep_broadcast_tokens(tokens)?;
+        Ok(())
+    }
+
+    pub(super) fn ep_broadcast_dflash_prefill_dispatch(
+        &self,
+        target_seq_id: u32,
+        prefill_seq_id: u32,
+        target_tokens: &[u32],
+        prefill_tokens: &[u32],
+        prefill_total_len: usize,
+    ) -> Result<()> {
+        if !self.multi_rank_protocol_active() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.ep_protocol_v2,
+            "DFlash/prefill requires EP protocol v2"
+        );
+        anyhow::ensure!(
+            target_seq_id != prefill_seq_id
+                && target_tokens.len() >= 2
+                && !prefill_tokens.is_empty(),
+            "invalid DFlash/prefill wire lanes"
+        );
+        self.ep_broadcast_seq_and_cmd(0, crate::traits::EP_DFLASH_PREFILL_CMD, true)?;
+        self.ep_broadcast_u32(target_tokens.len() as u32)?;
+        self.ep_broadcast_u32(prefill_tokens.len() as u32)?;
+        self.ep_broadcast_u32(prefill_total_len as u32)?;
+        self.ep_broadcast_tokens(&[target_seq_id, prefill_seq_id])?;
+        let mut tokens = Vec::with_capacity(target_tokens.len() + prefill_tokens.len());
+        tokens.extend_from_slice(target_tokens);
+        tokens.extend_from_slice(prefill_tokens);
+        self.ep_broadcast_tokens(&tokens)?;
+        Ok(())
+    }
+
     /// Receive a `(seq_id, cmd)` pair from rank 0. Worker-side counterpart
     /// of [`Self::ep_broadcast_seq_and_cmd`].
     ///
@@ -400,6 +458,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF0: prefill start → chunk_len, chunk_start, full_len, then full_len tokens
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
+    /// - 0xFFFFFFF5: variable-width DFlash verify → K, K tokens, accepted drafts
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let (seq_id, cmd) = self.ep_recv_seq_and_cmd(self.ep_protocol_v2)?;
@@ -415,6 +474,22 @@ impl TransformerModel {
         // + tokens off the wire and dispatches the matched compute.
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
+        }
+
+        if cmd == 0xFFFFFFDF {
+            return self.ep_worker_dflash_verify_batch(slots);
+        }
+
+        if cmd == crate::traits::EP_DFLASH_PREFILL_CMD {
+            return self.ep_worker_dflash_prefill(slots);
+        }
+
+        // Native multi-sequence prefill carries its own ordered slot list in
+        // one packed payload, so it must dispatch before the single-slot
+        // lookup below. Both ranks then enter one identical stacked-token
+        // layer loop and preserve TP collective row order.
+        if cmd == EP_PREFILL_BATCH_CMD {
+            return self.ep_worker_prefill_batch(slots);
         }
 
         let slot_idx = seq_id as usize;
@@ -568,6 +643,30 @@ impl TransformerModel {
                     }
                 }
             }
+            0xFFFFFFF5 => {
+                let k = self.ep_broadcast_u32(0)? as usize;
+                anyhow::ensure!(
+                    (2..=32).contains(&k),
+                    "EP DFlash verify width {k} is invalid"
+                );
+                let mut tokens = Vec::with_capacity(k);
+                for _ in 0..k {
+                    tokens.push(self.ep_broadcast_u32(0)?);
+                }
+                self.sync_secondary()?;
+                self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
+                let accepted_drafts = self.ep_broadcast_u32(0)? as usize;
+                anyhow::ensure!(
+                    accepted_drafts < k,
+                    "EP DFlash accepted draft count {accepted_drafts} exceeds width {k}"
+                );
+                let total_accepted = accepted_drafts + 1;
+                let target_len = seq.seq_len - k + total_accepted;
+                seq.seq_len = target_len;
+                seq.tokens.truncate(target_len);
+                self.commit_accepted_prefix(seq, total_accepted, k)?;
+                self.trim_proposer_state(seq, accepted_drafts, stream)?;
+            }
             token => {
                 // Regular decode
                 self.decode(token, seq, stream)?;
@@ -639,6 +738,108 @@ impl TransformerModel {
 
         let stream = self.gpu.default_stream();
         self.decode_batch_compute_main(&tokens, &mut refs, stream)?;
+        Ok(true)
+    }
+
+    fn ep_worker_dflash_verify_batch(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
+        let n = self.ep_broadcast_u32(0)? as usize;
+        let k = self.ep_broadcast_u32(0)? as usize;
+        anyhow::ensure!(
+            self.can_batch_verify_dflash(n, k),
+            "worker received unsupported DFlash batch {n}x{k}"
+        );
+        let seq_ids = self.ep_broadcast_tokens(&vec![0u32; n])?;
+        let tokens = self.ep_broadcast_tokens(&vec![0u32; n * k])?;
+        let mut seen = std::collections::HashSet::new();
+        for &id in &seq_ids {
+            anyhow::ensure!(
+                (id as usize) < slots.len(),
+                "DFlash batch slot {id} exceeds worker capacity"
+            );
+            anyhow::ensure!(seen.insert(id), "duplicate DFlash batch slot {id}");
+        }
+        let mut slot_refs: Vec<(usize, &mut SequenceState)> = slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_mut().map(|seq| (index, seq)))
+            .collect();
+        let mut seqs = Vec::with_capacity(n);
+        for &id in &seq_ids {
+            let index = id as usize;
+            let position = slot_refs
+                .iter()
+                .position(|(candidate, _)| *candidate == index)
+                .ok_or_else(|| anyhow::anyhow!("DFlash batch slot {index} is not allocated"))?;
+            seqs.push(slot_refs.swap_remove(position).1);
+        }
+        self.sync_secondary()?;
+        self.decode_verify_dflash_batched_dispatch(
+            &tokens,
+            k,
+            &mut seqs,
+            self.gpu.default_stream(),
+        )?;
+        let accepted = self.ep_broadcast_tokens(&vec![0u32; n])?;
+        for (seq, &accepted_drafts) in seqs.iter_mut().zip(&accepted) {
+            let accepted_drafts = accepted_drafts as usize;
+            anyhow::ensure!(accepted_drafts < k, "invalid DFlash accepted width");
+            let total_accepted = accepted_drafts + 1;
+            let target_len = seq.seq_len - k + total_accepted;
+            seq.seq_len = target_len;
+            seq.tokens.truncate(target_len);
+            self.commit_accepted_prefix(seq, total_accepted, k)?;
+            self.trim_proposer_state(seq, accepted_drafts, self.gpu.default_stream())?;
+        }
+        Ok(true)
+    }
+
+    fn ep_worker_dflash_prefill(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
+        let target_k = self.ep_broadcast_u32(0)? as usize;
+        let prefill_k = self.ep_broadcast_u32(0)? as usize;
+        let prefill_total_len = self.ep_broadcast_u32(0)? as usize;
+        let seq_ids = self.ep_broadcast_tokens(&[0u32; 2])?;
+        let tokens = self.ep_broadcast_tokens(&vec![0u32; target_k + prefill_k])?;
+        anyhow::ensure!(seq_ids[0] != seq_ids[1], "duplicate DFlash/prefill slot");
+        let target_idx = seq_ids[0] as usize;
+        let prefill_idx = seq_ids[1] as usize;
+        anyhow::ensure!(
+            target_idx < slots.len() && prefill_idx < slots.len(),
+            "DFlash/prefill slot exceeds worker capacity"
+        );
+
+        let mut slot_refs: Vec<(usize, &mut SequenceState)> = slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_mut().map(|seq| (index, seq)))
+            .collect();
+        let target_pos = slot_refs
+            .iter()
+            .position(|(index, _)| *index == target_idx)
+            .ok_or_else(|| anyhow::anyhow!("DFlash target slot {target_idx} is not allocated"))?;
+        let target_seq = slot_refs.swap_remove(target_pos).1;
+        let prefill_pos = slot_refs
+            .iter()
+            .position(|(index, _)| *index == prefill_idx)
+            .ok_or_else(|| anyhow::anyhow!("DFlash prefill slot {prefill_idx} is not allocated"))?;
+        let prefill_seq = slot_refs.swap_remove(prefill_pos).1;
+
+        self.sync_secondary()?;
+        self.decode_verify_dflash_with_prefill_dispatch(
+            &tokens[..target_k],
+            target_seq,
+            &tokens[target_k..],
+            prefill_seq,
+            prefill_total_len,
+            self.gpu.default_stream(),
+        )?;
+        let accepted_drafts = self.ep_broadcast_u32(0)? as usize;
+        anyhow::ensure!(accepted_drafts < target_k, "invalid fused DFlash verdict");
+        let total_accepted = accepted_drafts + 1;
+        let target_len = target_seq.seq_len - target_k + total_accepted;
+        target_seq.seq_len = target_len;
+        target_seq.tokens.truncate(target_len);
+        self.commit_accepted_prefix(target_seq, total_accepted, target_k)?;
+        self.trim_proposer_state(target_seq, accepted_drafts, self.gpu.default_stream())?;
         Ok(true)
     }
 }

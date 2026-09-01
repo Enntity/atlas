@@ -18,8 +18,8 @@
 
 use crate::gpu::GpuBackend;
 use crate::weights::{
-    WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
-    estimate_load_bytes, evict_page_cache, f16_to_bf16_bytes, parse_expert_index,
+    TensorLoadPolicy, WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
+    estimate_load_bytes_with_policy, evict_page_cache, f16_to_bf16_bytes, parse_expert_index,
 };
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -39,6 +39,8 @@ pub struct FastSafetensorsLoader {
     pub ep_world_size: usize,
     pub num_experts: usize,
     pub peak_memory_multiplier: Option<f64>,
+    /// Host-side final-layout slicing applied before GPU allocation.
+    pub tensor_load_policy: TensorLoadPolicy,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
     pub try_direct_io: bool,
@@ -76,6 +78,7 @@ impl FastSafetensorsLoader {
             ep_world_size: 1,
             num_experts: 0,
             peak_memory_multiplier: None,
+            tensor_load_policy: TensorLoadPolicy::Replicated,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
@@ -88,6 +91,7 @@ impl FastSafetensorsLoader {
             ep_world_size,
             num_experts,
             peak_memory_multiplier: None,
+            tensor_load_policy: TensorLoadPolicy::Replicated,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
@@ -131,7 +135,8 @@ impl WeightLoader for FastSafetensorsLoader {
 
         // Pre-flight OOM estimate (identical to SafetensorsLoader).
         {
-            let estimated = estimate_load_bytes(&shard_files, &skip_fn)?;
+            let estimated =
+                estimate_load_bytes_with_policy(&shard_files, &skip_fn, self.tensor_load_policy)?;
             let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn)?;
             let mult = self
                 .peak_memory_multiplier
@@ -201,6 +206,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
+                self.tensor_load_policy,
                 &mut weights,
                 &mut offload_logged,
             )?;
@@ -243,6 +249,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
+                self.tensor_load_policy,
                 &mut weights,
                 &mut extra_offload,
             )?;
@@ -271,6 +278,7 @@ fn load_shard_fast(
     try_direct_io: bool,
     direct_io_tensor_cap: usize,
     prefetch_shards: bool,
+    tensor_load_policy: TensorLoadPolicy,
     out: &mut HashMap<String, WeightTensor>,
     offload_logged: &mut bool,
 ) -> Result<()> {
@@ -358,7 +366,10 @@ fn load_shard_fast(
             raw
         };
 
-        let ptr = match gpu.alloc(meta.len) {
+        let prepared = tensor_load_policy.prepare(&meta.name, &meta.shape, meta.dtype, src)?;
+        let src = prepared.data.as_ref();
+        let resident_len = src.len();
+        let ptr = match gpu.alloc(resident_len) {
             Ok(p) => {
                 gpu.copy_h2d(src, p)?;
                 p
@@ -368,13 +379,13 @@ fn load_shard_fast(
                     tracing::warn!(
                         "GPU alloc failed for {} ({} bytes) — switching to managed (UVM) memory",
                         meta.name,
-                        meta.len
+                        resident_len
                     );
                     *offload_logged = true;
                 }
-                let p = gpu.alloc_managed(meta.len)?;
+                let p = gpu.alloc_managed(resident_len)?;
                 unsafe {
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), p.0 as *mut u8, meta.len);
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), p.0 as *mut u8, resident_len);
                 }
                 p
             }
@@ -384,7 +395,7 @@ fn load_shard_fast(
             meta.name.clone(),
             WeightTensor {
                 ptr,
-                shape: meta.shape.clone(),
+                shape: prepared.shape,
                 dtype: meta.dtype,
             },
         );

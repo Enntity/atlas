@@ -269,31 +269,16 @@ pub fn start_chunked_prefill(
         return Ok(StartPrefillResult::Finished);
     }
 
-    // Deferred co-dispatch: setup + EP broadcast, then return InProgress at
-    // chunk 0 WITHOUT prefilling — the batched step packs >=2 streams into one
-    // forward. Vision is excluded upstream, so no chunk-0 embedding injection.
+    // Deferred admission: setup, then return InProgress at chunk 0 WITHOUT
+    // prefilling. The actual standard/batched prefill step owns the EP command
+    // broadcast. Existing co-dispatch only reaches this on a single rank; phase
+    // interleaving also reaches it under EP, where broadcasting here and again
+    // in `run_standard_chunk_loop` would desynchronize the worker protocol.
     if defer {
         debug_assert!(
             image_pixels.is_empty(),
             "vision must be excluded from co-dispatch"
         );
-        if let Err(e) = (|| -> Result<()> {
-            // EP: broadcast chunk 0 to worker (no-op on single-GPU; the batched
-            // step does NOT re-broadcast, so this stays the only broadcast site).
-            model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
-            model.ep_broadcast_cmd(chunk_len as u32)?;
-            model.ep_broadcast_cmd(0)?; // chunk_start
-            model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
-            model.ep_broadcast_tokens(&prompt_tokens)?;
-            Ok(())
-        })() {
-            let msg = format!("deferred prefill EP broadcast failed: {e:#}");
-            send_error_to_sink(&mut sink, &msg);
-            if let Err(fe) = model.free_sequence(&mut seq) {
-                tracing::error!("prefill_a_step: free_sequence (deferred broadcast error): {fe:#}");
-            }
-            return Err(e);
-        }
         // chunk_offset = 0 (deferred co-dispatch: nothing prefilled yet).
         return Ok(StartPrefillResult::InProgress(
             super::prefill_a_step_params::build_prefill_in_progress(

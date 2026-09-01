@@ -62,6 +62,28 @@ use crate::layer::{
 use crate::traits::SequenceState;
 
 impl TransformerModel {
+    /// Run one GLM KDA/DSA layer over the packed rows of every prefilling
+    /// request. State pointer tables preserve request boundaries while the
+    /// projections, HC blocks, shared experts, router, and TP reductions run
+    /// once over the combined M.
+    pub(in crate::model) fn prefill_glm_batched_layer(
+        &self,
+        layer: &dyn TransformerLayer,
+        layer_idx: usize,
+        hidden_stacked: DevicePtr,
+        residual_stacked: DevicePtr,
+        seqs: &mut [&mut SequenceState],
+        meta: &BatchedAttnMetadata,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let states = seqs
+            .iter()
+            .map(|seq| &*seq.layer_states[layer_idx] as &(dyn LayerState + '_))
+            .collect::<Vec<_>>();
+        layer.prefill_glm_batched(hidden_stacked, residual_stacked, &states, meta, ctx, stream)
+    }
+
     /// Run one attention layer over N stacked-input streams.
     ///
     /// `hidden_stacked` and `residual_stacked` are at the arena's

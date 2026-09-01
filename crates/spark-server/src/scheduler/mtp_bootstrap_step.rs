@@ -93,7 +93,6 @@ pub(super) fn can_batch_bootstrap(
         && !dflash_verify_raw_argmax
         && !bootstrap_batch_disabled()
         && spark_model::speculative::mtp_multi_seq_mode()
-        && !sched.levers.dflash_unified_ctx
         && !sched.levers.dflash_serial_append
         // FP32-lm_head models (Gemma-4 dense) are excluded: `logits_ptr_is_fp32`
         // is an exact-pointer identity against the FP32 scratch buffer, so a

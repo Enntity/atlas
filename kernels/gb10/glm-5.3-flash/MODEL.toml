@@ -1,0 +1,54 @@
+# GLM-5.3-Flash target identity and serving defaults.
+#
+# The EXL3 target quantizes only the routed expert gate/up/down matrices.
+# Dense projections, the shared expert, KDA/DSA, and hyperconnection tensors
+# retain the BF16/F32 dtypes declared by the checkpoint.
+
+[model]
+name = "glm-5.3-flash"
+hf_id = "zai-org/GLM-5.3-Flash"
+params = "106B"
+active_params = "12B"
+architecture = "KDA + sparse NoPE-MLA + MoE + mHC"
+match_names = ["glm-5.3-flash"]
+
+layers_total = 45
+layers_linear_attention = 34
+layers_full_attention = 11
+hidden_dim = 4096
+head_dim = 256
+q_heads = 64
+kv_heads = 64
+vocab_size = 154880
+max_position_embeddings = 1048576
+moe_experts = 288
+moe_topk = 8
+moe_intermediate = 2048
+mtp_layers = 1
+
+[[model_types]]
+model_type = "glm5_next"
+hidden_size = 4096
+
+[sampling.thinking]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[sampling.coding]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[sampling.general]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.0
+
+[behavior]
+thinking_default = true
+default_kv_dtype = "bf16"
+enable_loop_watchdog = true

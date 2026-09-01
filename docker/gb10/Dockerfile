@@ -29,6 +29,14 @@ ENV RUSTUP_TOOLCHAIN=stable
 
 WORKDIR /build
 
+# GLM-5.3 Flash KDA is independent of the Rust/kernel source tree.  Build it
+# before copying those frequently-changing inputs so ordinary engine edits reuse
+# this expensive pinned-source layer instead of recompiling FlashKDA every time.
+COPY 3rdparty_patches/flash_kda/ 3rdparty_patches/flash_kda/
+RUN FLASH_KDA_SOURCE=/opt/FlashKDA-atlas \
+    FLASH_KDA_OUTPUT=/usr/local/lib \
+    bash 3rdparty_patches/flash_kda/rebuild.sh
+
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY vendor/ vendor/
@@ -40,11 +48,17 @@ COPY jinja-templates/ jinja-templates/
 # full-tree local build succeeds. Copy just the fixtures, not all of tests/.
 COPY tests/fixtures/ tests/fixtures/
 
-ENV ATLAS_TARGET_HW=gb10
-ENV ATLAS_TARGET_MODEL=*
-ENV ATLAS_TARGET_QUANT=*
+ARG ATLAS_TARGET_HW=gb10
+ARG ATLAS_TARGET_MODEL=*
+ARG ATLAS_TARGET_QUANT=*
+ENV ATLAS_TARGET_HW=${ATLAS_TARGET_HW}
+ENV ATLAS_TARGET_MODEL=${ATLAS_TARGET_MODEL}
+ENV ATLAS_TARGET_QUANT=${ATLAS_TARGET_QUANT}
 
-RUN cargo build --release -p spark-server
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    CUDARC_CUDA_VERSION=13000 cargo build --release -p spark-server && \
+    cp /build/target/release/spark /build/spark
 
 # ── Runtime stage ────────────────────────────────────────────────
 FROM nvidia/cuda:13.0.0-runtime-ubuntu24.04@sha256:95318efecfd68ab3d109da5277863257b06137c84f34a87f38de970d5cd035d3
@@ -75,12 +89,15 @@ RUN apt-get update -qq && \
     dpkg --compare-versions "$NCCL_VER" ge "2.28" || \
       { echo "ERROR: NCCL $NCCL_VER < 2.28 — symmetric memory APIs unavailable" >&2; exit 1; }
 
-COPY --from=builder /build/target/release/spark /usr/local/bin/spark
+COPY --from=builder /build/spark /usr/local/bin/spark
 COPY --from=builder /build/jinja-templates/ /jinja-templates/
+COPY --from=builder /usr/local/lib/libatlas_glm53_flash_kda.so /usr/local/lib/libatlas_glm53_flash_kda.so
+COPY --from=builder /build/3rdparty_patches/flash_kda/LICENSE /usr/local/share/licenses/FlashKDA/LICENSE
 COPY LICENSE /LICENSE
 COPY README.md /README.md
 
 ENV RUST_LOG=info
+ENV ATLAS_GLM53_FLASH_KDA_LIB=/usr/local/lib/libatlas_glm53_flash_kda.so
 EXPOSE 8888
 
 ENTRYPOINT ["spark"]

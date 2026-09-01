@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
@@ -16,10 +16,12 @@ use super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
+use super::glm_state_pool::GlmStatePools;
 use super::ssm_snapshot::SsmSnapshotPool;
 use super::types::{PinnedMetaStaging, TransformerModel};
 use crate::layer::{
-    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
+    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, GlmSparseMlaStatePointers,
+    KdaStatePointers, LayerState, SsmLayerState, TransformerLayer,
 };
 use crate::layers::ops;
 use crate::speculative::DraftProposer;
@@ -32,6 +34,9 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 /// all SSM layers. This enables CUDA graph capture at batch sizes > 1 because
 /// the graph embeds memory addresses that remain stable across replays.
 pub(crate) struct SsmStatePool {
+    /// GLM's sparse-MLA latent/index image. KDA uses the common h/conv
+    /// allocations below so slot ownership and compaction remain atomic.
+    glm: Option<GlmStatePools>,
     pub(super) h_state_pools: Vec<DevicePtr>,
     pub(super) conv_state_pools: Vec<DevicePtr>,
     /// Per-slot K=3 intermediate checkpoint pools (only allocated when has_mtp).
@@ -170,6 +175,7 @@ impl SsmStatePool {
     pub(super) fn new(
         config: &ModelConfig,
         max_slots: usize,
+        max_seq_len: usize,
         has_mtp: bool,
         num_intermediates: usize,
         num_drafts: usize,
@@ -181,7 +187,28 @@ impl SsmStatePool {
 
         let h_bytes = config.ssm_h_state_bytes();
         let h_stored_bytes = crate::ssm_reserve::ssm_h_stored_bytes(h_bytes, h_f16_pool);
-        let conv_bytes = config.ssm_conv_state_bytes();
+        let glm = (config.model_type == "glm5_next")
+            .then(|| {
+                GlmStatePools::new(
+                    config,
+                    max_slots,
+                    max_seq_len,
+                    has_mtp,
+                    num_intermediates,
+                    gpu,
+                )
+            })
+            .transpose()?;
+        // Generic SSM stores one convolution image including the current
+        // width. GLM owns three independent histories and persists only the
+        // preceding kernel-1 positions.
+        let conv_bytes = match &glm {
+            Some(glm) => glm
+                .kda_history_bytes
+                .checked_mul(3)
+                .context("GLM KDA convolution pool size overflow")?,
+            None => config.ssm_conv_state_bytes(),
+        };
         let num_ssm_layers = config.num_ssm_layers();
 
         // Reserve one extra slot at index `max_slots` as a dedicated
@@ -339,6 +366,7 @@ impl SsmStatePool {
         );
 
         Ok(Self {
+            glm,
             h_state_pools,
             conv_state_pools,
             h_intermediate_pools,
@@ -458,6 +486,9 @@ impl SsmStatePool {
             gpu.memset_async(self.h_state(i, idx), 0, self.h_stored_bytes, stream)?;
             gpu.memset_async(self.conv_state(i, idx), 0, self.conv_bytes, stream)?;
         }
+        if let Some(glm) = &self.glm {
+            glm.zero_slot(idx, gpu, stream)?;
+        }
         Ok(())
     }
 
@@ -478,6 +509,91 @@ impl SsmStatePool {
 
     pub(super) fn conv_state(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
         self.conv_state_pools[ssm_layer_idx].offset(slot * self.conv_bytes)
+    }
+
+    pub(super) fn is_glm(&self) -> bool {
+        self.glm.is_some()
+    }
+
+    pub(super) fn kda_state(&self, kda_layer_idx: usize, slot: usize) -> KdaStatePointers {
+        let glm = self
+            .glm
+            .as_ref()
+            .expect("kda_state is only valid for a GLM state pool");
+        let conv = self.conv_state(kda_layer_idx, slot);
+        KdaStatePointers {
+            recurrent: self.h_state(kda_layer_idx, slot),
+            q_conv: conv,
+            k_conv: conv.offset(glm.kda_history_bytes),
+            v_conv: conv.offset(glm.kda_history_bytes * 2),
+        }
+    }
+
+    pub(super) fn kda_checkpoint(&self, kda_layer_idx: usize, slot: usize) -> KdaStatePointers {
+        let glm = self
+            .glm
+            .as_ref()
+            .expect("kda_checkpoint is only valid for a GLM state pool");
+        let conv = self.conv_checkpoint(kda_layer_idx, slot);
+        KdaStatePointers {
+            recurrent: self.h_checkpoint(kda_layer_idx, slot),
+            q_conv: conv,
+            k_conv: conv.offset(glm.kda_history_bytes),
+            v_conv: conv.offset(glm.kda_history_bytes * 2),
+        }
+    }
+
+    pub(super) fn kda_intermediate(
+        &self,
+        kda_layer_idx: usize,
+        slot: usize,
+        token_idx: usize,
+    ) -> KdaStatePointers {
+        let glm = self
+            .glm
+            .as_ref()
+            .expect("kda_intermediate is only valid for a GLM state pool");
+        let conv = self.conv_intermediate(kda_layer_idx, slot, token_idx);
+        KdaStatePointers {
+            recurrent: self.h_intermediate(kda_layer_idx, slot, token_idx),
+            q_conv: conv,
+            k_conv: conv.offset(glm.kda_history_bytes),
+            v_conv: conv.offset(glm.kda_history_bytes * 2),
+        }
+    }
+
+    pub(super) fn glm_dsa_state(
+        &self,
+        dsa_layer_idx: usize,
+        slot: usize,
+    ) -> GlmSparseMlaStatePointers {
+        self.glm
+            .as_ref()
+            .expect("glm_dsa_state is only valid for a GLM state pool")
+            .dsa_state(dsa_layer_idx, slot)
+    }
+
+    pub(super) fn glm_dsa_checkpoint(
+        &self,
+        dsa_layer_idx: usize,
+        slot: usize,
+    ) -> GlmSparseMlaStatePointers {
+        self.glm
+            .as_ref()
+            .expect("glm_dsa_checkpoint is only valid for a GLM state pool")
+            .dsa_checkpoint(dsa_layer_idx, slot)
+    }
+
+    pub(super) fn glm_dsa_intermediate(
+        &self,
+        dsa_layer_idx: usize,
+        slot: usize,
+        token_idx: usize,
+    ) -> GlmSparseMlaStatePointers {
+        self.glm
+            .as_ref()
+            .expect("glm_dsa_intermediate is only valid for a GLM state pool")
+            .dsa_intermediate(dsa_layer_idx, slot, token_idx)
     }
 
     /// DEBUG (env-gated): PER-LAYER fingerprint of h_state + conv_state for a
@@ -666,6 +782,9 @@ impl SsmStatePool {
                 gpu.memset(self.conv_checkpoint(i, slot), 0, self.conv_bytes)?;
             }
         }
+        if let Some(glm) = &self.glm {
+            glm.reset_slot(slot, gpu)?;
+        }
         Ok(())
     }
 
@@ -732,6 +851,9 @@ impl SsmStatePool {
                     stream,
                 )?;
             }
+        }
+        if let Some(glm) = &self.glm {
+            glm.copy_slot(from, to, gpu, stream)?;
         }
         Ok(())
     }
@@ -824,6 +946,11 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for SsmStatePool {
 
     fn release(&mut self, gpu: &dyn GpuBackend) -> anyhow::Result<()> {
         let mut first_error = None;
+        if let Some(glm) = &mut self.glm
+            && let Err(error) = glm.release(gpu)
+        {
+            first_error = Some(error);
+        }
         for pool in [
             &mut self.h_state_pools,
             &mut self.conv_state_pools,
@@ -895,6 +1022,7 @@ mod h_stored_geometry_tests {
         SsmStatePool::new(
             &config,
             SLOTS,
+            4096,
             true,
             4,
             3,
@@ -974,6 +1102,7 @@ mod h_stored_geometry_tests {
         let p = SsmStatePool::new(
             &config,
             4,
+            4096,
             true,
             4,
             3,
@@ -1092,6 +1221,7 @@ mod slot_guard_tests {
     /// required to validate the exactly-once release invariant.
     fn bare_pool(max_slots: usize) -> Arc<SsmStatePool> {
         Arc::new(SsmStatePool {
+            glm: None,
             h_state_pools: Vec::new(),
             conv_state_pools: Vec::new(),
             h_intermediate_pools: Vec::new(),
@@ -1220,5 +1350,75 @@ mod slot_guard_tests {
         let mut sorted = free.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 1], "both slots free, exactly once each");
+    }
+}
+
+#[cfg(test)]
+mod glm_geometry_tests {
+    use super::*;
+    use atlas_core::config::{LayerType, ModelConfig};
+    use spark_runtime::gpu::mock::MockGpuBackend;
+
+    fn tiny_glm_config() -> ModelConfig {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "glm5_next".to_string();
+        config.num_hidden_layers = 45;
+        config.layer_types = (0..45)
+            .map(|layer| {
+                if (layer + 1) % 4 == 0 {
+                    LayerType::FullAttention
+                } else {
+                    LayerType::LinearAttention
+                }
+            })
+            .collect();
+        config.linear_num_key_heads = 2;
+        config.linear_num_value_heads = 2;
+        config.linear_key_head_dim = 4;
+        config.linear_value_head_dim = 4;
+        config.linear_conv_kernel_dim = 4;
+        config.kv_lora_rank = 8;
+        config.index_head_dim = 4;
+        config.index_topk = 8;
+        config.index_kpool = 4;
+        config.mlp_only_layers = vec![0, 1, 2];
+        config
+    }
+
+    #[test]
+    fn glm_slots_have_three_distinct_histories_and_one_dsa_image() {
+        let config = tiny_glm_config();
+        let gpu = MockGpuBackend::new();
+        let pool = SsmStatePool::new(
+            &config,
+            2,
+            8,
+            false,
+            0,
+            0,
+            false,
+            crate::ssm_reserve::SsmRollbackMode::Snapshot,
+            &gpu,
+        )
+        .unwrap();
+
+        assert!(pool.is_glm());
+        let kda = pool.kda_state(0, 1);
+        let one_history = 2 * 4 * 3 * size_of::<f32>();
+        assert_eq!(kda.k_conv.0 - kda.q_conv.0, one_history as u64);
+        assert_eq!(kda.v_conv.0 - kda.k_conv.0, one_history as u64);
+        assert_eq!(pool.conv_bytes, 3 * one_history);
+
+        let dsa0 = pool.glm_dsa_state(0, 0);
+        let dsa1 = pool.glm_dsa_state(0, 1);
+        assert_eq!(
+            dsa1.latent_cache.0 - dsa0.latent_cache.0,
+            (8 * 8 * 2) as u64
+        );
+        assert_eq!(
+            dsa1.pooled_keys.0 - dsa0.pooled_keys.0,
+            (8 / 4 * 4 * 2) as u64
+        );
+        assert_eq!(dsa1.tail_metadata.0 - dsa0.tail_metadata.0, 16);
     }
 }

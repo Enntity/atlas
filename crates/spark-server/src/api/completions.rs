@@ -424,6 +424,7 @@ pub(super) async fn completions_stream(
                 reasoning_tokens,
                 cached_prompt_tokens,
                 accepted_prediction_tokens,
+                rejected_prediction_tokens,
                 guard_stop: _,
             } => {
                 let tps = if decode_time_ms > 0.0 {
@@ -443,7 +444,7 @@ pub(super) async fn completions_stream(
                         reasoning_tokens: reasoning_tokens as usize,
                         audio_tokens: 0,
                         accepted_prediction_tokens,
-                        rejected_prediction_tokens: 0,
+                        rejected_prediction_tokens,
                     }),
                     time_to_first_token_ms,
                     response_tokens_per_second: tps,

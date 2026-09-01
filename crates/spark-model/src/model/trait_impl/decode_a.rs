@@ -238,6 +238,10 @@ impl TransformerModel {
             && !dump_step0
             && !lora_eager;
 
+        if use_graphs {
+            self.stage_glm_graph_metadata_single(seq, stream)?;
+        }
+
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),

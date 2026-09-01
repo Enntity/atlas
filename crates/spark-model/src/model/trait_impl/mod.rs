@@ -14,7 +14,9 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::types::{PinnedMetaStaging, TransformerModel};
 use crate::layer::{AttnMetadataDev, LayerState};
 use crate::speculative::DraftProposer;
-use crate::traits::{ChunkedPrefillPageMetadata, Model, PrefillSlice, SequenceState};
+use crate::traits::{
+    ChunkedPrefillPageMetadata, DflashPrefillResult, Model, PrefillSlice, SequenceState,
+};
 use crate::weight_map::{DenseWeight, MtpWeights};
 
 mod async_chkpt;
@@ -26,8 +28,11 @@ mod decode_b;
 mod decode_b2;
 mod decode_checkpoint;
 mod decode_graph_key;
+mod dflash_prefill_capture;
 mod drafter_prefill;
 mod ep_misc;
+mod glm_graph_metadata;
+mod glm_rollback;
 mod graph_borrow;
 mod lm_head_batched;
 mod meta;
@@ -43,6 +48,7 @@ mod verify_b;
 mod verify_c;
 mod verify_c2;
 mod verify_d;
+mod verify_d_multi;
 mod verify_e;
 pub(in crate::model) mod verify_e2;
 mod verify_fused;
@@ -445,6 +451,49 @@ impl Model for TransformerModel {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream)
     }
+    fn can_batch_verify_dflash(&self, num_sequences: usize, k: usize) -> bool {
+        self.config.model_type == "glm5_next"
+            && (2..=spark_runtime::buffers::GLM53_VERIFY_MAX_SEQS).contains(&num_sequences)
+            && (2..=spark_runtime::buffers::GLM53_VERIFY_MAX_ROWS).contains(&k)
+    }
+    fn decode_verify_dflash_batched(
+        &self,
+        tokens: &[u32],
+        k: usize,
+        seqs: &mut [&mut SequenceState],
+        _stream: u64,
+    ) -> Result<Vec<u32>> {
+        self.decode_verify_dflash_batched_dispatch(tokens, k, seqs, _stream)
+    }
+    fn supports_dflash_prefill_fusion(&self) -> bool {
+        self.config.model_type == "glm5_next"
+            && self.proposer.is_some()
+            && std::env::var("ATLAS_GLM_DFLASH_PREFILL_FUSION")
+                .ok()
+                .as_deref()
+                != Some("0")
+    }
+    fn dflash_prefill_capacity(&self, target_rows: usize) -> usize {
+        self.buffers.max_batch_tokens().saturating_sub(target_rows)
+    }
+    fn decode_verify_dflash_with_prefill(
+        &self,
+        target_tokens: &[u32],
+        target_seq: &mut SequenceState,
+        prefill_tokens: &[u32],
+        prefill_seq: &mut SequenceState,
+        prefill_total_len: usize,
+        _stream: u64,
+    ) -> Result<DflashPrefillResult> {
+        self.decode_verify_dflash_with_prefill_dispatch(
+            target_tokens,
+            target_seq,
+            prefill_tokens,
+            prefill_seq,
+            prefill_total_len,
+            _stream,
+        )
+    }
     fn decode_and_verify_fused(
         &self,
         tokens: &[u32],
@@ -573,85 +622,17 @@ impl Model for TransformerModel {
         num_committed: usize,
         base_pos: usize,
     ) -> Result<()> {
-        if num_committed == 0 {
-            return Ok(());
-        }
-        let base = match self.dflash_hidden_save {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        let prop = match seq.proposer_state.as_mut() {
-            Some(p) => p.as_mut(),
-            None => return Ok(()),
-        };
-        // Graceful no-op for non-DFlash proposers (shared bootstrap path).
-        let d = match prop
-            .as_any_mut()
-            .downcast_mut::<crate::layers::DflashProposerState>()
-        {
-            Some(d) => d,
-            None => return Ok(()),
-        };
-        let n_layers = self.dflash_capture_layers.len();
-        if n_layers == 0 {
-            return Ok(());
-        }
-        let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
-        let stream = self.gpu.default_stream();
+        self.commit_ctx_rows_dispatch(seq, 0, num_committed, base_pos)
+    }
 
-        // Watermark slide FIRST, on the ctx_len (row-index) axis. If the
-        // incoming rows would exceed capacity, keep the NEWEST rows and drop
-        // the oldest (mirrors dflash_serial_ctx_append). keep is clamped so
-        // drop_n >= keep — the single D2D copy's src/dst can never overlap.
-        // ctx_committed resets to 0 (next propose re-precomputes the slid
-        // rows chunk-wise); ctx_positions values (absolute RoPE positions)
-        // are preserved by the drain, so stamps stay exact across the slide.
-        if d.ctx_len + num_committed > d.max_ctx_len {
-            let keep = (d.max_ctx_len / 2).min(d.max_ctx_len.saturating_sub(num_committed));
-            let drop_n = d.ctx_len.saturating_sub(keep);
-            if drop_n > 0 {
-                let src = d.ctx_hidden_acc.offset(drop_n * ctx_slot_bytes);
-                let dst0 = d.ctx_hidden_acc.offset(0);
-                self.gpu
-                    .copy_d2d_async(src, dst0, keep * ctx_slot_bytes, stream)?;
-                d.ctx_positions.drain(..drop_n);
-                d.ctx_len = keep;
-                d.ctx_committed = 0;
-                tracing::info!(
-                    "DFlash UNIFIED_CTX watermark: slid ctx window (dropped {} oldest, keep {})",
-                    drop_n,
-                    keep,
-                );
-            }
-        }
-
-        // Append num_committed rows at the TAIL (ctx_len axis). dst uses
-        // ctx_len (acc row index); base_pos stamps ctx_positions (RoPE axis).
-        // Conflating the two axes is the DDD §4.1 landmine: they coincide
-        // only until the first slide — and the sliding prompts ARE the reds.
-        debug_assert_eq!(d.ctx_positions.len(), d.ctx_len);
-        for t in 0..num_committed {
-            let row = base.offset(t * ctx_slot_bytes);
-            let dst = d.ctx_hidden_acc.offset(d.ctx_len * ctx_slot_bytes);
-            self.gpu.copy_d2d_async(row, dst, ctx_slot_bytes, stream)?;
-            d.ctx_positions.push((base_pos + t) as i32);
-            d.ctx_len += 1;
-        }
-        // Freshest ctx slot = row (num_committed-1) = the bonus generator
-        // (EAGLE order, matches kgamma_append). Block the next propose()'s
-        // internal decode-append so this capture is never double-appended.
-        d.skip_next_decode_append = true;
-
-        // One-shot activation log so A/B runs can confirm the path is live.
-        if self.stats.once("log:dflash_unified_ctx") {
-            tracing::info!(
-                "DFlash UNIFIED_CTX ACTIVE: first commit_ctx rows={} base_pos={} ctx_len={}",
-                num_committed,
-                base_pos,
-                d.ctx_len,
-            );
-        }
-        Ok(())
+    fn commit_ctx_from_row(
+        &self,
+        seq: &mut SequenceState,
+        capture_row: usize,
+        num_committed: usize,
+        base_pos: usize,
+    ) -> Result<()> {
+        self.commit_ctx_rows_dispatch(seq, capture_row, num_committed, base_pos)
     }
 
     fn dflash_serial_ctx_append(&self, seq: &mut SequenceState) -> Result<()> {
@@ -756,6 +737,20 @@ impl Model for TransformerModel {
             grammar_bitmask,
         )
     }
+    fn configure_dflash_sampling(
+        &self,
+        seq: &mut SequenceState,
+        temperature: f32,
+        seed: Option<u64>,
+    ) -> Result<()> {
+        self.configure_dflash_sampling_dispatch(seq, temperature, seed)
+    }
+    fn dflash_sparse_distribution(
+        &self,
+        seq: &SequenceState,
+    ) -> Option<crate::speculative::SparseDraftDistribution> {
+        self.dflash_sparse_distribution_dispatch(seq)
+    }
     fn read_deferred_draft_token(&self) -> Result<u32> {
         self.read_deferred_draft_token_dispatch()
     }
@@ -827,6 +822,13 @@ impl Model for TransformerModel {
     fn is_mla(&self) -> bool {
         self.is_mla_dispatch()
     }
+    fn supports_chunked_mla_prefill(&self) -> bool {
+        self.config.model_type == "glm5_next"
+    }
+
+    fn supports_native_batched_prefill(&self) -> bool {
+        self.config.model_type == "glm5_next"
+    }
 
     fn kv_block_size(&self) -> Option<usize> {
         Some(self.kv_cache.lock().block_size())
@@ -850,6 +852,33 @@ impl Model for TransformerModel {
     }
     fn ep_broadcast_tokens(&self, tokens: &[u32]) -> Result<Vec<u32>> {
         self.ep_broadcast_tokens_dispatch(tokens)
+    }
+    fn ep_broadcast_dflash_verify_batch(
+        &self,
+        seq_ids: &[u32],
+        tokens: &[u32],
+        k: usize,
+    ) -> Result<()> {
+        self.ep_broadcast_dflash_verify_batch_dispatch(seq_ids, tokens, k)
+    }
+    fn ep_broadcast_dflash_prefill(
+        &self,
+        target_seq_id: u32,
+        prefill_seq_id: u32,
+        target_tokens: &[u32],
+        prefill_tokens: &[u32],
+        prefill_total_len: usize,
+    ) -> Result<()> {
+        self.ep_broadcast_dflash_prefill_dispatch(
+            target_seq_id,
+            prefill_seq_id,
+            target_tokens,
+            prefill_tokens,
+            prefill_total_len,
+        )
+    }
+    fn ep_broadcast_prefill_batch(&self, streams: &[PrefillSlice<'_>]) -> Result<()> {
+        self.ep_broadcast_prefill_batch_dispatch(streams)
     }
     fn default_stream(&self) -> u64 {
         self.default_stream_dispatch()

@@ -13,6 +13,11 @@
 
 use std::time::{Duration, Instant};
 
+mod phase_interleave;
+pub use phase_interleave::{
+    PhaseInterleaveConfig, PhaseInterleaveController, PhaseInterleavePolicy,
+};
+
 /// Metadata about a pending request for selection decisions.
 pub struct PendingRequestInfo {
     /// Number of prompt tokens (determines prefill cost).
@@ -56,6 +61,16 @@ pub trait SchedulingPolicy: Send {
         // Default (FIFO / unaware): inject the full chunk — same as today.
         let _ = active_timings;
         full_chunk
+    }
+
+    /// Optional collective-safe phase-interleave schedule.
+    ///
+    /// Models whose prefill kernels make same-forward decode unacceptably
+    /// expensive can alternate whole decode and prefill commands instead. The
+    /// scheduler evaluates this once per iteration, so admission and continued
+    /// prefill observe one coherent decision.
+    fn phase_interleave_config(&self) -> Option<PhaseInterleaveConfig> {
+        None
     }
 
     /// Policy name for logging.

@@ -139,6 +139,14 @@ pub(crate) fn load_model(
     // ModelOpt-exported checkpoints drop a sibling `hf_quant_config.json`
     // whose TOP LEVEL is already the quantization block.
     serve_phases::merge_sidecar_quant_config(&model_dir, &mut config);
+    serve_phases::validate_glm53_runtime(&args, &config)?;
+    if config.model_type == "glm5_next" && !spark_model::glm53_flash_kda_available() {
+        anyhow::bail!(
+            "GLM-5.3-Flash requires the pinned FlashKDA bridge; set \
+             ATLAS_GLM53_FLASH_KDA_LIB to libatlas_glm53_flash_kda.so or use \
+             the GB10 image, which bundles it"
+        );
+    }
 
     // Vision area bound, resolved ONCE and installed on the config before
     // anything derived from it exists.
@@ -368,6 +376,16 @@ pub(crate) fn load_model(
 
     let (gpu, free_mem) = serve_phases::init_gpu_backend(&args, &ptx_set)?;
 
+    // GLM-5.3's kernel surface is large and architecture-specific. Resolve the
+    // exact same handle set used by layer construction before reading any
+    // checkpoint tensors; otherwise a stale target is discovered only after
+    // each EP rank has paid the full 90 GiB load cost.
+    if config.model_type == "glm5_next" {
+        spark_model::layers::glm5::validate_kernel_contract(gpu.as_ref())
+            .context("GLM-5.3 kernel contract failed before weight loading")?;
+        tracing::info!("GLM-5.3 kernel contract passed before weight loading");
+    }
+
     // ── Pre-load reserve preflight ──
     let serve_phases::ReservePreflight {
         inference_reserve,
@@ -413,6 +431,29 @@ pub(crate) fn load_model(
     // Unconditional: the serde(skip) default is 0.0, and the CLI default (2.0)
     // is the real one. Validated ≥ 1.0 in `validate_serve_args`.
     config.fp8_kv_headroom = args.fp8_kv_headroom;
+
+    // Validate the head rank's tokenizer and official Jinja template before
+    // either EP rank materializes 90 GiB of weights. Community checkpoints can
+    // legitimately use optional Jinja language features; discovering a parser
+    // mismatch after model construction needlessly makes both ranks pay the
+    // full load and NCCL tax. Workers do not render prompts, so they skip this.
+    let prepared_head_tokenizer = if args.rank == 0 {
+        let eos_tokens = serve_phases::load_eos_tokens(&model_dir, &config);
+        let supports_thinking = config.capabilities().supports_thinking;
+        let tokenizer = ChatTokenizer::from_model_dir(
+            &model_dir,
+            eos_tokens[0],
+            supports_thinking,
+            &config.model_type,
+            Some(std::path::Path::new(".")),
+            args.disable_template_overrides,
+        )
+        .context("tokenizer/template preflight failed before weight loading")?;
+        tracing::info!("Tokenizer/template contract passed before weight loading");
+        Some((eos_tokens, tokenizer))
+    } else {
+        None
+    };
 
     // 3. Load model weights
     spark_runtime::progress::phase(5, "weight load");
@@ -696,8 +737,9 @@ pub(crate) fn load_model(
     }
     let model = model_opt.expect("head retains model on rank 0");
 
-    // Build EOS token list from generation_config.json (authoritative) or config.json fallback
-    let mut eos_tokens = serve_phases::load_eos_tokens(&model_dir, &config);
+    let (mut eos_tokens, tokenizer) = prepared_head_tokenizer
+        .expect("rank 0 preloads its tokenizer before weight materialization");
+    let supports_thinking = config.capabilities().supports_thinking;
 
     // Read default sampling parameters from generation_config.json.
     let serve_phases::SamplingDefaults {
@@ -710,19 +752,9 @@ pub(crate) fn load_model(
 
     // 6. Load tokenizer
     spark_runtime::progress::phase(8, "tokenizer");
-    // Thinking support is derived from model capabilities, not hardcoded model names.
-    // Models with SSM layers or Qwen3.5-style architecture support <think> tokens.
-    // The --enable-thinking flag controls OPEN-ENDED vs CLOSED thinking.
-    let caps = config.capabilities();
-    let supports_thinking = caps.supports_thinking;
-    let tokenizer = ChatTokenizer::from_model_dir(
-        &model_dir,
-        eos_tokens[0],
-        supports_thinking,
-        &config.model_type,
-        Some(std::path::Path::new(".")), // repo root for override templates
-        args.disable_template_overrides,
-    )?;
+    // Tokenizer/template parsing was deliberately completed before checkpoint
+    // materialization. Phase 8 retains its positional meaning for progress UI;
+    // from here onward we only derive runtime parser/token IDs from that object.
 
     // (AM1 attractor-mask registration removed 2026-06-03 — see
     // decode_logits_seq.rs / compile_tools.rs; `lean` was an Atlas-only
@@ -847,8 +879,37 @@ pub(crate) fn load_model(
             );
             Box::new(scheduling_policy::SlaiPolicy::new(args.tbt_deadline_ms))
         }
+        "phase-interleave" => {
+            let config = scheduling_policy::PhaseInterleaveConfig::new(
+                args.phase_decode_steps
+                    .context("--phase-decode-steps is required for phase-interleave")?,
+                args.phase_prefill_steps
+                    .context("--phase-prefill-steps is required for phase-interleave")?,
+                args.phase_prefill_slice_tokens
+                    .unwrap_or(args.max_prefill_tokens),
+            )
+            .map_err(anyhow::Error::msg)?;
+            if std::env::var("ATLAS_HOLO_ALWAYS_MIXED").is_ok() {
+                anyhow::bail!(
+                    "phase-interleave is incompatible with ATLAS_HOLO_ALWAYS_MIXED; \
+                     remove the environment variable so EP ranks execute separate, \
+                     identically ordered prefill and decode commands"
+                );
+            }
+            tracing::info!(
+                "Scheduling policy: phase-interleave (decode_steps={}, prefill_steps={}, prefill_slice_tokens={}, TBT deadline={}ms)",
+                config.decode_steps,
+                config.prefill_steps,
+                config.prefill_slice_tokens,
+                args.tbt_deadline_ms,
+            );
+            Box::new(scheduling_policy::PhaseInterleavePolicy::new(
+                config,
+                args.tbt_deadline_ms,
+            ))
+        }
         other => anyhow::bail!(
-            "Unknown scheduling policy '{}'. Supported: fifo, slai",
+            "Unknown scheduling policy '{}'. Supported: fifo, slai, phase-interleave",
             other,
         ),
     };

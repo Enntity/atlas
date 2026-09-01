@@ -10,8 +10,30 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+fn tensor_load_policy(config: &ModelConfig) -> spark_runtime::weights::TensorLoadPolicy {
+    if config.model_type == "glm5_next" && config.tp_world_size == 2 {
+        spark_runtime::weights::TensorLoadPolicy::Glm53Tp2 {
+            rank: config.tp_rank,
+        }
+    } else {
+        spark_runtime::weights::TensorLoadPolicy::Replicated
+    }
+}
+
 pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
-    if config.model_type == "minimax_m2" || config.model_type == "step3p7" {
+    if config.model_type == "minimax_m2"
+        || config.model_type == "step3p7"
+        || (config.model_type == "glm5_next"
+            && config
+                .quantization_config
+                .as_ref()
+                .is_some_and(|qc| qc.quant_method == "exl3"))
+    {
+        // GLM-5.3 EXL3 keeps routed experts in their checkpoint-native packed
+        // layout and the model builder only uploads small pointer tables.  It
+        // does not create the transposed or pre-dequantized weight copies that
+        // the generic 1.3x safetensors estimate reserves.  On EP2 the generic
+        // multiplier rejects the ~91 GiB rank-local TP2 store despite ~115 GiB free.
         Some(1.02)
     } else if config
         .quantization_config
@@ -21,6 +43,38 @@ pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
         Some(1.05)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quant_multiplier;
+    use atlas_core::config::{ModelConfig, QuantizationConfig};
+
+    #[test]
+    fn glm_exl3_uses_alias_only_builder_multiplier() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "glm5_next".to_string();
+        config.quantization_config = Some(QuantizationConfig {
+            quant_method: "exl3".to_string(),
+            quant_algo: String::new(),
+            format: String::new(),
+            ignore_modules: Vec::new(),
+        });
+        assert_eq!(quant_multiplier(&config), Some(1.02));
+    }
+
+    #[test]
+    fn non_exl3_glm_keeps_generic_estimate() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "glm5_next".to_string();
+        config.quantization_config = Some(QuantizationConfig {
+            quant_method: "fp8".to_string(),
+            quant_algo: String::new(),
+            format: String::new(),
+            ignore_modules: Vec::new(),
+        });
+        assert_eq!(quant_multiplier(&config), Some(1.05));
     }
 }
 
@@ -35,6 +89,7 @@ pub(crate) fn load_weight_store(
 ) -> Result<spark_runtime::weights::WeightStore> {
     use spark_runtime::weights::WeightLoader;
     let mult = quant_multiplier(config);
+    let tensor_load_policy = tensor_load_policy(config);
 
     // GGUF checkpoints are dequantized to BF16 by a dedicated loader; take that
     // path whenever a .gguf file is present (fast/safetensors loaders can't read it).
@@ -69,6 +124,7 @@ pub(crate) fn load_weight_store(
                 spark_runtime::fast_weights::FastSafetensorsLoader::new()
             };
             loader.peak_memory_multiplier = mult;
+            loader.tensor_load_policy = tensor_load_policy;
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
                     .ok()
@@ -91,6 +147,7 @@ pub(crate) fn load_weight_store(
             spark_runtime::weights::SafetensorsLoader::new()
         };
         loader.peak_memory_multiplier = mult;
+        loader.tensor_load_policy = tensor_load_policy;
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?

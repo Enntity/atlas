@@ -34,10 +34,15 @@ pub(crate) fn evict_page_cache(_file: &std::fs::File) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightDtype {
     BF16,
+    /// Raw IEEE-754 half precision for kernels that consume the original bits.
+    FP16,
     FP32,
     FP8E4M3,
     FP8E8M0,
     UInt8,
+    /// Raw signed containers used by EXL3's packed representation.
+    Int16,
+    Int32,
     Int64,
     /// Keep-packed PrismML ternary Q2_0 (ggml id 42): raw on-disk blocks stay
     /// 2-bit in VRAM (fp16 scale + 2-bit codes per group of `group` elements),
@@ -58,10 +63,13 @@ impl WeightDtype {
     pub fn byte_size(self) -> usize {
         match self {
             Self::BF16 => 2,
+            Self::FP16 => 2,
             Self::FP32 => 4,
             Self::FP8E4M3 => 1,
             Self::FP8E8M0 => 1,
             Self::UInt8 => 1,
+            Self::Int16 => 2,
+            Self::Int32 => 4,
             Self::Int64 => 8,
             Self::PackedQ2_0 { .. } => 0,
         }
@@ -70,6 +78,7 @@ impl WeightDtype {
     fn from_safetensors(dtype: safetensors::Dtype) -> Result<Self> {
         match dtype {
             safetensors::Dtype::BF16 => Ok(Self::BF16),
+            safetensors::Dtype::F16 => Ok(Self::FP16),
             safetensors::Dtype::F32 => Ok(Self::FP32),
             safetensors::Dtype::U8 => Ok(Self::UInt8),
             // I8: raw 1-byte container for 4-bit-packed NVFP4 (DeepSeek-V4 MTP
@@ -77,6 +86,8 @@ impl WeightDtype {
             safetensors::Dtype::I8 => Ok(Self::UInt8),
             safetensors::Dtype::F8_E4M3 => Ok(Self::FP8E4M3),
             safetensors::Dtype::F8_E8M0 => Ok(Self::FP8E8M0),
+            safetensors::Dtype::I16 => Ok(Self::Int16),
+            safetensors::Dtype::I32 => Ok(Self::Int32),
             safetensors::Dtype::I64 => Ok(Self::Int64),
             other => bail!("Unsupported safetensors dtype: {other:?}"),
         }
@@ -90,6 +101,7 @@ impl WeightDtype {
     pub fn from_safetensors_str(s: &str) -> Result<Self> {
         Ok(match s {
             "F32" => Self::FP32,
+            "F16" => Self::FP16,
             "BF16" => Self::BF16,
             "U8" => Self::UInt8,
             // I8 is a 1-byte raw container (packed NVFP4); signedness is
@@ -97,20 +109,39 @@ impl WeightDtype {
             "I8" => Self::UInt8,
             "F8_E4M3" => Self::FP8E4M3,
             "F8_E8M0" => Self::FP8E8M0,
+            "I16" => Self::Int16,
+            "I32" => Self::Int32,
             "I64" => Self::Int64,
             other => bail!("Unsupported safetensors dtype '{other}'"),
         })
     }
+
+    /// Resolve the store representation for one named safetensors tensor.
+    /// Ordinary F16 checkpoints retain Atlas's historical F16-to-BF16
+    /// normalization. EXL3 scale vectors must remain raw CUDA `half` values.
+    pub fn from_safetensors_str_for_tensor(s: &str, name: &str) -> Result<(Self, bool)> {
+        if s == "F16" && !is_exl3_raw_tensor(name) {
+            return Ok((Self::BF16, true));
+        }
+        Ok((Self::from_safetensors_str(s)?, false))
+    }
+}
+
+/// EXL3 suffixes whose on-disk representation is part of the CUDA ABI.
+pub fn is_exl3_raw_tensor(name: &str) -> bool {
+    name.ends_with(".trellis")
+        || name.ends_with(".suh")
+        || name.ends_with(".svh")
+        || name.ends_with(".mcg")
 }
 
 /// Convert a little-endian IEEE-754 half-precision (F16) tensor byte buffer
 /// to BF16 bytes. F16 and BF16 are both 2 bytes/element but have different
 /// bit layouts (5-bit vs 8-bit exponent), so the bytes cannot be
 /// reinterpreted — each value goes f16 → f32 (exact) → bf16
-/// (round-to-nearest-even). Shared by both disk loaders so F16 checkpoints
-/// (e.g. centml modelopt W4A4 exports, which ship all unquantized tensors as
-/// F16) land in the store as BF16; [`WeightDtype`] itself stays closed to
-/// store-legal dtypes and F16 can never appear on the RDMA wire.
+/// (round-to-nearest-even). Shared by both disk loaders so ordinary F16
+/// checkpoints (e.g. centml modelopt W4A4 exports) land in the store as BF16.
+/// EXL3 raw scale vectors are exempt and remain [`WeightDtype::FP16`].
 pub(crate) fn f16_to_bf16_bytes(src: &[u8]) -> Vec<u8> {
     use half::{bf16, f16};
     debug_assert_eq!(src.len() % 2, 0, "F16 tensor byte length must be even");
@@ -189,6 +220,27 @@ impl WeightStore {
             .ok_or_else(|| anyhow::anyhow!("Weight '{name}' not found in store"))
     }
 
+    /// Remove one tensor from the ownership ledger and return it to a
+    /// model-specific load-time transform.
+    ///
+    /// The caller becomes responsible for either freeing the allocation or
+    /// inserting it back. This is intentionally mutable so derived appliance
+    /// layouts cannot leave stale pointers behind for teardown to double-free.
+    pub fn take_tensor(&mut self, name: &str) -> Result<WeightTensor> {
+        self.weights
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("Weight '{name}' not found in store"))
+    }
+
+    /// Add a model-owned derived tensor to the teardown ledger.
+    pub fn insert_tensor(&mut self, name: String, tensor: WeightTensor) -> Result<()> {
+        if self.weights.contains_key(&name) {
+            bail!("Weight '{name}' already exists in store");
+        }
+        self.weights.insert(name, tensor);
+        Ok(())
+    }
+
     /// Check if a weight exists.
     pub fn contains(&self, name: &str) -> bool {
         self.weights.contains_key(name)
@@ -253,6 +305,8 @@ pub struct SafetensorsLoader {
     /// Set from QuantFormat::peak_memory_multiplier() in the caller.
     /// When None, the pre-flight uses its own heuristic (1.3x NVFP4 / 1.5x FP8).
     pub peak_memory_multiplier: Option<f64>,
+    /// Host-side final-layout slicing applied before GPU allocation.
+    pub tensor_load_policy: TensorLoadPolicy,
 }
 
 impl Default for SafetensorsLoader {
@@ -269,6 +323,7 @@ impl SafetensorsLoader {
             ep_world_size: 1,
             num_experts: 0,
             peak_memory_multiplier: None,
+            tensor_load_policy: TensorLoadPolicy::Replicated,
         }
     }
 
@@ -279,6 +334,7 @@ impl SafetensorsLoader {
             ep_world_size,
             num_experts,
             peak_memory_multiplier: None,
+            tensor_load_policy: TensorLoadPolicy::Replicated,
         }
     }
 
@@ -323,9 +379,11 @@ pub fn parse_expert_index(name: &str) -> Option<usize> {
 pub mod adapter;
 mod gguf;
 mod loader;
+mod tensor_load;
+pub use tensor_load::TensorLoadPolicy;
 pub mod mlx_int8;
 pub use gguf::{GgufLoader, config_from_gguf_dir, find_gguf};
-pub(crate) use loader::estimate_load_bytes;
+pub(crate) use loader::{estimate_load_bytes, estimate_load_bytes_with_policy};
 // Platform-independent: consumed by the unix-only fast-weights (O_DIRECT) path
 // AND by the GGUF loader, which builds everywhere. Gating this on `unix` broke
 // the Windows CUDA build the moment `gguf.rs` started using it.
@@ -335,55 +393,7 @@ pub(crate) use loader::check_oom_guard;
 pub(crate) use loader::estimate_has_fp8;
 
 #[cfg(test)]
-mod from_str_tests {
-    use super::WeightDtype;
-
-    #[test]
-    fn from_safetensors_str_matches_disk_mapping() {
-        // The RDMA weight peer publishes these raw header strings; the client
-        // must resolve them to the exact WeightDtype the disk loaders use, else
-        // byte_size/shape diverge and logits break. Locks the closed mapping.
-        use WeightDtype::*;
-        for (s, want) in [
-            ("F32", FP32),
-            ("BF16", BF16),
-            ("U8", UInt8),
-            ("I8", UInt8), // packed NVFP4 raw container
-            ("F8_E4M3", FP8E4M3),
-            ("F8_E8M0", FP8E8M0),
-            ("I64", Int64),
-        ] {
-            assert_eq!(
-                WeightDtype::from_safetensors_str(s).unwrap(),
-                want,
-                "dtype {s}"
-            );
-        }
-        // F16 is converted to BF16 at disk-load; a store (and therefore a
-        // peer manifest) can never contain it, so the wire mapping rejects it.
-        assert!(WeightDtype::from_safetensors_str("F16").is_err());
-        assert!(WeightDtype::from_safetensors_str("bogus").is_err());
-    }
-
-    #[test]
-    fn f16_bytes_convert_to_bf16_via_f32() {
-        use half::{bf16, f16};
-        // Cover sign, exact powers of two, a value needing mantissa rounding
-        // (f16 has 10 mantissa bits, bf16 only 7), f16 max, and a subnormal.
-        let vals = [0.0f32, 1.0, -1.5, 0.1, 65504.0, -6.1035156e-5];
-        let src: Vec<u8> = vals
-            .iter()
-            .flat_map(|v| f16::from_f32(*v).to_le_bytes())
-            .collect();
-        let out = super::f16_to_bf16_bytes(&src);
-        assert_eq!(out.len(), src.len());
-        for (i, v) in vals.iter().enumerate() {
-            let got = bf16::from_le_bytes([out[2 * i], out[2 * i + 1]]);
-            let want = bf16::from_f32(f16::from_f32(*v).to_f32());
-            assert_eq!(got, want, "value {v}");
-        }
-    }
-}
+mod from_str_tests;
 
 #[cfg(test)]
 mod packed_q2_tests;

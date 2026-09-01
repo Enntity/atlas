@@ -18,7 +18,7 @@ impl BlockDiffusionDraftHead {
         last_token: u32,
         _target_hidden: DevicePtr,
         position: usize,
-        _num_drafts: usize,
+        num_drafts: usize,
         state: &mut dyn ProposerState,
         ctx: &ForwardContext,
         _stream: u64,
@@ -283,40 +283,8 @@ impl BlockDiffusionDraftHead {
             // Lazy block table init. ctx slots come from precompute over the
             // accumulated target hiddens; γ slots come from the layer body.
             // We need ceil((max_ctx_len + γ) / block_size) blocks.
-            const BLOCK_SIZE: usize = 16;
-            let blocks_needed = (dstate.max_ctx_len + self.gamma + 1).div_ceil(BLOCK_SIZE);
-            if dstate.block_table_dev.is_none() {
-                let mut cache = self.kv_cache.lock();
-                dstate.block_table.clear();
-                for _ in 0..blocks_needed {
-                    match cache.try_alloc_block() {
-                        Some(b) => dstate.block_table.push(b),
-                        None => {
-                            anyhow::bail!(
-                                "DFlash Option B: paged KV cache exhausted at block {}/{}",
-                                dstate.block_table.len(),
-                                blocks_needed
-                            );
-                        }
-                    }
-                }
-                drop(cache);
-                // Copy block_table to device.
-                let bt_bytes: Vec<u8> = dstate
-                    .block_table
-                    .iter()
-                    .flat_map(|b| b.to_le_bytes())
-                    .collect();
-                let bt_dev = ctx.gpu.alloc(bt_bytes.len())?;
-                ctx.gpu.copy_h2d(&bt_bytes, bt_dev)?;
-                dstate.block_table_dev = Some(bt_dev);
-                dstate.max_ctx_count_drafter = blocks_needed * BLOCK_SIZE;
-                tracing::info!(
-                    "DFlash Option B: allocated {} blocks ({} slots) for drafter paged cache",
-                    blocks_needed,
-                    dstate.max_ctx_count_drafter
-                );
-            }
+            const BLOCK_SIZE: usize = super::prepare::DFLASH_BLOCK_SIZE;
+            self.ensure_paged_capacity(dstate, ctx)?;
             // Phase I (v2) — incremental ctx precompute (design doc §18).
             // Only the new tail [ctx_committed..ctx_len) needs its K/V
             // computed; slots [0..ctx_committed) are already valid in the
@@ -447,10 +415,50 @@ impl BlockDiffusionDraftHead {
             } else {
                 dstate.ctx_count_drafter as u32
             };
-            Some((dstate.block_table_dev.unwrap(), effective_ctx_count))
+            anyhow::ensure!(
+                dstate.block_table.len() <= self.scratch.option_b_max_blocks,
+                "DFlash block table exceeds graph-stable capacity"
+            );
+            let block_bytes = dstate
+                .block_table
+                .iter()
+                .flat_map(|block| block.to_le_bytes())
+                .collect::<Vec<_>>();
+            ctx.gpu.copy_h2d_async(
+                &block_bytes,
+                self.scratch.option_b_block_tables_dev,
+                _stream,
+            )?;
+            Some((self.scratch.option_b_block_tables_dev, effective_ctx_count))
         } else {
             None
         };
+
+        // A solo request can change depth after its recent accept rate is
+        // known. Reuse the same row-specialized implementation as the native
+        // concurrent proposer so γ=7 actually executes eight rows rather than
+        // computing the configured 17 and merely truncating the result. The
+        // serial kernel retains the stochastic path; the specialized graph is
+        // therefore selected only for greedy requests.
+        let block_rows = super::propose_batch::requested_block_rows(num_drafts, self.gamma);
+        if block_rows < self.gamma && dstate.sample_temperature == 0.0 {
+            let paged = [option_b_arg.ok_or_else(|| {
+                anyhow::anyhow!("row-specialized DFlash proposal requires Option B")
+            })?];
+            let mut proposed = self.forward_block_batch(
+                &[last_token],
+                &[position],
+                &paged,
+                block_rows,
+                ctx,
+                _stream,
+            )?;
+            let drafts = proposed.pop().unwrap_or_default();
+            dstate.last_candidate_ids.clear();
+            dstate.last_candidate_scores.clear();
+            dstate.last_num_drafted = drafts.len();
+            return Ok(drafts);
+        }
 
         let drafts = self
             .forward_block(
@@ -466,6 +474,8 @@ impl BlockDiffusionDraftHead {
                     None
                 },
                 option_b_arg,
+                dstate.sample_temperature,
+                dstate.sample_seed,
             )
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
@@ -480,10 +490,15 @@ impl BlockDiffusionDraftHead {
         // and the WY17 strided layout (inter_stride_floats = h_bytes/4) maps
         // 1:1 to ssm_pool.h_intermediate(layer, slot, i). Override with
         // ATLAS_DFLASH_DRAFT_CAP=N (N=1 to force K=2 path for ablation).
+        dstate.last_candidate_ids = drafts.candidate_ids;
+        dstate.last_candidate_scores = drafts.candidate_scores;
+        let drafts = drafts.tokens;
+
         let cap: usize = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(self.gamma);
+            .unwrap_or(num_drafts)
+            .min(self.gamma.saturating_sub(1));
 
         // ATLAS_DFLASH_VERIFY_TRACE=1: log all γ drafts BEFORE the cap so we
         // can see whether the drafter echoes only at position 0 or across
@@ -516,6 +531,9 @@ impl BlockDiffusionDraftHead {
         };
 
         let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
+        let sparse_rows = drafts.len();
+        dstate.last_candidate_ids.truncate(sparse_rows * 16);
+        dstate.last_candidate_scores.truncate(sparse_rows * 16);
         dstate.last_num_drafted = drafts.len();
         Ok(drafts)
     }

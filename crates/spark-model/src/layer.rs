@@ -100,6 +100,85 @@ impl LayerState for SsmLayerState {
     }
 }
 
+/// Device pointers comprising one GLM-5 KDA state image.
+///
+/// KDA has three independently convolved streams; collapsing them into the
+/// single GDN convolution buffer is an architecture error even when the total
+/// byte count happens to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdaStatePointers {
+    /// Recurrent matrix `[num_heads, value_dim, key_dim]` in FP32.
+    /// This matches FlashKDA so chunk-prefill state feeds decode without a transpose.
+    pub recurrent: DevicePtr,
+    /// Q causal-convolution history `[num_heads * head_dim, kernel - 1]` in FP32.
+    pub q_conv: DevicePtr,
+    /// K causal-convolution history `[num_heads * head_dim, kernel - 1]` in FP32.
+    pub k_conv: DevicePtr,
+    /// V causal-convolution history `[num_heads * head_dim, kernel - 1]` in FP32.
+    pub v_conv: DevicePtr,
+}
+
+/// Persistent state for one GLM-5 KDA layer and sequence slot.
+pub struct KdaLayerState {
+    /// Physical persistent-state slot. FlashKDA maps packed logical sequences
+    /// back to these stable slots without gathering the 4 MiB recurrent image.
+    pub slot_idx: usize,
+    /// Physical slots in the owning recurrent pool, including its padding slot.
+    pub slot_capacity: usize,
+    pub current: KdaStatePointers,
+    /// Exact speculative/checkpoint image; absent until a caller reserves it.
+    pub checkpoint: Option<KdaStatePointers>,
+    /// Per-verification-position images needed for exact rollback.
+    pub intermediates: Vec<KdaStatePointers>,
+}
+
+impl LayerState for KdaLayerState {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// Device pointers comprising one sparse NoPE-MLA/index state image.
+///
+/// The latent cache and learned semantic index advance together. Keeping them
+/// in one value prevents code from treating the index as disposable metadata
+/// while restoring only the attention cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlmSparseMlaStatePointers {
+    /// Normalized 512-wide MLA latent cache.
+    pub latent_cache: DevicePtr,
+    /// One 128-wide learned key per complete four-token pool.
+    pub pooled_keys: DevicePtr,
+    /// Raw key lanes for the incomplete pool (at most three tokens).
+    pub tail_keys: DevicePtr,
+    /// Raw compression-gate lanes for the incomplete pool.
+    pub tail_gates: DevicePtr,
+    /// Validity and absolute-position metadata for the incomplete pool.
+    pub tail_metadata: DevicePtr,
+}
+
+/// Persistent state for one GLM sparse NoPE-MLA layer and sequence slot.
+pub struct GlmSparseMlaLayerState {
+    pub slot_idx: usize,
+    pub current: GlmSparseMlaStatePointers,
+    pub checkpoint: Option<GlmSparseMlaStatePointers>,
+    pub intermediates: Vec<GlmSparseMlaStatePointers>,
+}
+
+impl LayerState for GlmSparseMlaLayerState {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 /// Pre-uploaded attention metadata device pointers.
 ///
 /// Uploaded once per decode step in the model loop, reused across all

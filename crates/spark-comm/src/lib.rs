@@ -56,6 +56,16 @@ pub trait CommBackend: Send + Sync {
         self.all_reduce(ptr, bytes)
     }
 
+    /// Submit one backend-native all-reduce directly on `compute_stream`.
+    ///
+    /// This deliberately bypasses composed fast paths such as the two-rank
+    /// send/recv + local-add implementation. It is useful for medium-sized,
+    /// latency-sensitive tensors where the native collective is cheaper than
+    /// an extra receive buffer, reduction kernel, and cross-stream events.
+    fn all_reduce_direct(&self, ptr: u64, bytes: usize, compute_stream: u64) -> Result<()> {
+        self.all_reduce_async(ptr, bytes, compute_stream)
+    }
+
     /// Pre-register a GPU buffer with the communication backend.
     ///
     /// For NCCL over IB/RoCE, this caches the IB memory registration
@@ -205,6 +215,7 @@ mod tests {
         assert_eq!(comm.rank(), 0);
         assert_eq!(comm.world_size(), 1);
         comm.all_reduce(0x1000, 1024).unwrap();
+        comm.all_reduce_direct(0x1000, 1024, 7).unwrap();
         comm.all_gather(0x1000, 0x2000, 512).unwrap();
         comm.reduce_scatter(0x1000, 0x2000, 512).unwrap();
         comm.broadcast(0x1000, 256, 0).unwrap();

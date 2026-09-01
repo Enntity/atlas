@@ -291,6 +291,22 @@ pub trait TransformerLayer: Send + Sync {
         anyhow::bail!("prefill_inner_batched_q12: not implemented for this layer type")
     }
 
+    /// Native GLM-5.3 stacked-token prefill. Every layer is stateful (KDA or
+    /// sparse DSA), so unlike generic Q12 this hook receives the per-request
+    /// layer states as well as packed cu_seqlens/positions metadata.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_glm_batched(
+        &self,
+        _hidden_stacked: DevicePtr,
+        _residual_stacked: DevicePtr,
+        _states: &[&(dyn LayerState + '_)],
+        _meta: &BatchedAttnMetadata,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("prefill_glm_batched: only implemented for GLM-5.3 layers")
+    }
+
     /// Q12 Path B: batched GDN recurrence across N streams.
     ///
     /// Runs the same WY32 / persistent / split4 GDN kernel as
@@ -563,6 +579,42 @@ pub trait TransformerLayer: Send + Sync {
         _stream: u64,
     ) -> Result<()> {
         anyhow::bail!("decode_verify_multi: unsupported for this layer type")
+    }
+
+    /// Fixed GLM DFlash appliance: `n` equal-width causal token blocks in
+    /// sequence-major row order. Dense/EXL3 work is shared across all rows;
+    /// recurrent and sparse-index state remains independently ordered per
+    /// sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_verify_glm_multi<'a, 'b: 'a>(
+        &self,
+        _hidden: DevicePtr,
+        _rows_per_seq: usize,
+        _seq_lens: &[usize],
+        _states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("decode_verify_glm_multi: unsupported for this layer type")
+    }
+
+    /// GLM-only heterogeneous layer pass: keep speculative verification and
+    /// prompt-prefill attention on their native stateful kernels, then run the
+    /// combined rows through one shared FFN/MoE sweep.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_verify_glm_with_prefill(
+        &self,
+        _hidden: DevicePtr,
+        _verify_rows: usize,
+        _verify_seq_len: usize,
+        _verify_state: &mut (dyn LayerState + 'static),
+        _prefill_rows: usize,
+        _prefill_seq_len: usize,
+        _prefill_state: &mut (dyn LayerState + 'static),
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("decode_verify_glm_with_prefill: unsupported for this layer type")
     }
 
     /// Allocate per-sequence state for this layer.

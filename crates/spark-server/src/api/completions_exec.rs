@@ -68,6 +68,7 @@ pub(super) async fn run_blocking(
     let mut sum_cached = 0usize;
     let mut sum_reasoning = 0usize;
     let mut sum_accepted = 0usize;
+    let mut sum_rejected = 0usize;
     let mut last_ttft = 0.0f64;
     let mut last_tps = 0.0f64;
 
@@ -182,6 +183,7 @@ pub(super) async fn run_blocking(
             sum_cached += response.cached_prompt_tokens as usize;
             sum_reasoning += response.reasoning_tokens as usize;
             sum_accepted += response.accepted_prediction_tokens;
+            sum_rejected += response.rejected_prediction_tokens;
             last_ttft = response.time_to_first_token_ms;
             last_tps = if response.decode_time_ms > 0.0 {
                 (response.output_tokens.len().saturating_sub(1)) as f64
@@ -211,7 +213,7 @@ pub(super) async fn run_blocking(
             reasoning_tokens: sum_reasoning,
             audio_tokens: 0,
             accepted_prediction_tokens: sum_accepted,
-            rejected_prediction_tokens: 0,
+            rejected_prediction_tokens: sum_rejected,
         }),
         time_to_first_token_ms: last_ttft,
         response_tokens_per_second: last_tps,

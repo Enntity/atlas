@@ -83,17 +83,31 @@ impl TransformerModel {
             gpu.kernel("norm", "rms_norm")?
         };
         let dense_gemv_kernel = gpu.kernel("gemv", "dense_gemv_bf16")?;
+        let has_nvfp4_lm_head = lm_head_nvfp4.is_some();
+        let has_fp8_lm_head = lm_head_fp8.is_some();
         // FP32-output dense GEMV — the FP32 logits path required an FP32
         // residual stream, which no longer exists, so this stays
         // KernelHandle(0) and the BF16 path is always taken.
         let dense_gemv_fp32out_kernel = KernelHandle(0);
-        let w4a16_gemv_kernel = gpu.kernel("w4a16_gemv", "w4a16_gemv")?;
-        let w4a16_gemv_logits_kernel = gpu.kernel("w4a16_gemv", "w4a16_gemv_logits")?;
+        let w4a16_gemv_kernel = if has_nvfp4_lm_head {
+            gpu.kernel("w4a16_gemv", "w4a16_gemv")?
+        } else {
+            KernelHandle(0)
+        };
+        let w4a16_gemv_logits_kernel = if has_nvfp4_lm_head {
+            gpu.kernel("w4a16_gemv", "w4a16_gemv_logits")?
+        } else {
+            KernelHandle(0)
+        };
         // lm_head shares the tile GEMM, so route it through the same resolver as
         // the SSM/attention sites — it picks the 3-deep pipeline variant when
         // present. lm_head launches 1938 CTAs and already sits at ~83% of
         // achievable, so the expected gain here is small; measured, not assumed.
-        let w4a16_gemm_t_kernel = crate::layers::tgemm_kernel(gpu.as_ref());
+        let w4a16_gemm_t_kernel = if has_nvfp4_lm_head {
+            crate::layers::tgemm_kernel(gpu.as_ref())
+        } else {
+            KernelHandle(0)
+        };
         // Lossless BF16-MMA sibling for lm_head, OPT-IN via ATLAS_LMHEAD_LOSSLESS=1.
         // Measured cost 1.81% at C=16 (129.68 -> 127.33). Default is the faster
         // FP8-activation path because the accuracy question it addresses CANNOT
@@ -101,35 +115,59 @@ impl TransformerModel {
         // is throughput needed to REACH parity. The risk is real but indirect:
         // the bf16-floor finding was superseded on the WEIGHT axis, and this is
         // the ACTIVATION axis, which was never examined. Re-decide at parity.
-        let w4a16_gemm_t_bf16_kernel = if std::env::var("ATLAS_LMHEAD_LOSSLESS").is_ok() {
-            crate::layers::try_kernel(gpu.as_ref(), "w4a16", "w4a16_gemm_t_m128_bf16_v2")
+        let w4a16_gemm_t_bf16_kernel =
+            if has_nvfp4_lm_head && std::env::var("ATLAS_LMHEAD_LOSSLESS").is_ok() {
+                crate::layers::try_kernel(gpu.as_ref(), "w4a16", "w4a16_gemm_t_m128_bf16_v2")
+            } else {
+                KernelHandle(0)
+            };
+        let w4a16_gemm_kernel = if has_nvfp4_lm_head {
+            gpu.kernel("w4a16", "w4a16_gemm")?
         } else {
-            spark_runtime::gpu::KernelHandle(0)
+            KernelHandle(0)
         };
-        let w4a16_gemm_kernel = gpu.kernel("w4a16", "w4a16_gemm")?;
-        let w4a16_gemv_batch2_kernel = gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?;
+        let w4a16_gemv_batch2_kernel = if has_nvfp4_lm_head {
+            gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?
+        } else {
+            KernelHandle(0)
+        };
         // Narrow batched-GEMV family (M=4..8) for the K=3..8 verify lm_head
         // (try_kernel per tier: 0-handle on targets that predate a tier;
         // dispatch widens, then falls back to the GEMM).
-        let w4a16_batchm = crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu.as_ref());
+        let w4a16_batchm = if has_nvfp4_lm_head {
+            crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu.as_ref())
+        } else {
+            crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::default()
+        };
         // M<=16 batched GEMV for the wide BATCHED-DECODE lm_head. The SSM mixer
         // already carries this handle (qwen3_ssm/mod.rs); the model level did
         // not, so the decode head had no arm above 8 and fell to the M64-tile
         // GEMM. Same try_kernel contract: 0-handle -> dispatch falls back.
-        let w4a16_gemv_batch16_kernel =
-            crate::layers::try_kernel(gpu.as_ref(), "w4a16_gemv", "w4a16_gemv_batch16");
-        // FP8 E4M3 LUT GEMV for the `--lm-head-dtype fp8` head. Loaded
-        // unconditionally (a handle is cheap); only invoked when `lm_head_fp8`
-        // is set, so the NVFP4/BF16 paths never touch it.
-        let dense_gemv_fp8w_kernel = gpu.kernel("gemv_fp8w", "dense_gemv_fp8w")?;
+        let w4a16_gemv_batch16_kernel = if has_nvfp4_lm_head {
+            crate::layers::try_kernel(gpu.as_ref(), "w4a16_gemv", "w4a16_gemv_batch16")
+        } else {
+            KernelHandle(0)
+        };
+        // FP8 E4M3 LUT GEMV for the `--lm-head-dtype fp8` head. Do not issue
+        // optional-format lookups on a BF16 head: the kernel audit treats a
+        // zero handle as a real unresolved dispatch contract.
+        let dense_gemv_fp8w_kernel = if has_fp8_lm_head {
+            gpu.kernel("gemv_fp8w", "dense_gemv_fp8w")?
+        } else {
+            KernelHandle(0)
+        };
         // FP8 dual-GEMV (batch=2): present on images that ship the kernel;
         // try_kernel keeps the handle 0 on older sets so dispatch falls back
         // to the per-token loop.
-        let dense_gemv_fp8w_batch2_kernel = crate::layers::try_kernel(
-            gpu.as_ref(),
-            "dense_gemv_fp8w_batch2",
-            "dense_gemv_fp8w_batch2",
-        );
+        let dense_gemv_fp8w_batch2_kernel = if has_fp8_lm_head {
+            crate::layers::try_kernel(
+                gpu.as_ref(),
+                "dense_gemv_fp8w_batch2",
+                "dense_gemv_fp8w_batch2",
+            )
+        } else {
+            KernelHandle(0)
+        };
         let dense_gemm_kernel = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let dense_gemv_batchm_kernel = gpu
             .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
@@ -198,6 +236,7 @@ impl TransformerModel {
         let ssm_pool = std::sync::Arc::new(SsmStatePool::new(
             &config,
             max_batch_size,
+            max_seq_len,
             has_mtp,
             num_intermediates,
             num_drafts,
@@ -460,7 +499,9 @@ impl TransformerModel {
         let dflash_hidden_save_rows = if dflash_capture_layers.is_empty() {
             0
         } else {
-            dflash_kgamma.max(2)
+            dflash_kgamma
+                .max(2)
+                .saturating_mul(max_batch_size.min(spark_runtime::buffers::GLM53_VERIFY_MAX_SEQS))
         };
         let dflash_hidden_save = if dflash_capture_layers.is_empty() {
             None
@@ -769,6 +810,7 @@ impl TransformerModel {
             // key describes zero, so the first verify step always uploads.
             verify_wy_cache: Mutex::new(None),
             verify_kgamma_graph: Mutex::new(std::collections::HashMap::new()),
+            dflash_verify_batched_graphs: Mutex::new(std::collections::HashMap::new()),
             fused_graph: Mutex::new(std::collections::HashMap::new()),
             prefix_cache,
             secondary_stream,

@@ -76,9 +76,34 @@ pub(super) fn plan_prefill_waves(
     waves.into_iter().map(|(_, _, members)| members).collect()
 }
 
+/// GLM's native KDA/DSA kernels carry per-stream `cu_seqlens`, positions,
+/// state pointers, and finalization flags, so unlike the generic Q12 path it
+/// may combine different chunk offsets and last-chunk states. Pack in FIFO
+/// order up to the physical token arena.
+pub(super) fn plan_native_glm_waves(geoms: &[WaveGeom], wave_token_cap: usize) -> Vec<Vec<usize>> {
+    if geoms.is_empty() {
+        return Vec::new();
+    }
+    debug_assert!(wave_token_cap > 0);
+    let mut waves = Vec::<Vec<usize>>::new();
+    let mut totals = Vec::<usize>::new();
+    for (index, geom) in geoms.iter().enumerate() {
+        if let Some((wave, total)) = waves.last_mut().zip(totals.last_mut())
+            && *total + geom.chunk_len <= wave_token_cap
+        {
+            wave.push(index);
+            *total += geom.chunk_len;
+        } else {
+            waves.push(vec![index]);
+            totals.push(geom.chunk_len);
+        }
+    }
+    waves
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{WaveGeom, plan_prefill_waves};
+    use super::{WaveGeom, plan_native_glm_waves, plan_prefill_waves};
 
     fn g(chunk_start: usize, chunk_len: usize, is_last: bool) -> WaveGeom {
         WaveGeom {
@@ -101,6 +126,17 @@ mod tests {
     fn empty_streams_no_waves() {
         assert!(plan_prefill_waves(&[], true, 2048).is_empty());
         assert!(plan_prefill_waves(&[], false, 2048).is_empty());
+    }
+
+    #[test]
+    fn native_glm_packs_ragged_offsets_and_final_flags() {
+        let geoms = [
+            g(128, 128, false),
+            g(0, 128, false),
+            g(384, 114, true),
+            g(0, 128, false),
+        ];
+        assert_eq!(plan_native_glm_waves(&geoms, 512), vec![vec![0, 1, 2, 3]]);
     }
 
     #[test]

@@ -4,6 +4,58 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerifyDispatch {
+    Variable,
+    K4,
+    K3,
+    K2,
+}
+
+fn apply_glm_dflash_depth_ladder(n_active: usize, max_drafts: usize, enabled: bool) -> usize {
+    if enabled && n_active >= 2 {
+        max_drafts.min(7)
+    } else {
+        max_drafts
+    }
+}
+
+fn glm_dflash_drafts_for_width(n_active: usize, max_drafts: usize) -> usize {
+    apply_glm_dflash_depth_ladder(
+        n_active,
+        max_drafts,
+        crate::scheduler::adaptive_spec::dflash_depth_ladder_enabled(),
+    )
+}
+
+/// Pick the verifier from the proposal that was actually produced.
+///
+/// DFlash bootstrap and steady-state must share this rule. In particular,
+/// every proposal wider than the legacy K=4 envelope belongs on the
+/// variable-width verifier; routing it through K4 silently truncates the
+/// proposal and, for GLM, bypasses the fixed-address recurrent-state path.
+fn verify_dispatch(
+    proposal_len: usize,
+    requested_drafts: usize,
+    dflash_verify_raw_argmax: bool,
+) -> VerifyDispatch {
+    // DFlash's verifier is variable-width, including after a grammar boundary
+    // truncates an ordinary gamma-block to only one, two, or three drafts.
+    // The legacy K2/K3/K4 verifiers allocate scratch LayerState and therefore
+    // are not valid for GLM's fixed-address KDA/DSA state pool.  Sending a
+    // shortened GLM block there terminates the sequence and can leave the TP
+    // worker inside a different collective, wedging the next request.
+    if dflash_verify_raw_argmax || proposal_len >= 4 {
+        VerifyDispatch::Variable
+    } else if requested_drafts >= 3 && proposal_len >= 3 {
+        VerifyDispatch::K4
+    } else if requested_drafts >= 2 && proposal_len >= 2 {
+        VerifyDispatch::K3
+    } else {
+        VerifyDispatch::K2
+    }
+}
+
 /// MTP-aware step: bootstrap sequences without drafts, then verify via CUDA graph.
 /// Supports K=2 (num_drafts=1) and K=3 (num_drafts=2).
 ///
@@ -50,7 +102,12 @@ pub fn step_mtp(
     // wants k=2, same binary, same boot). `adaptive_rung::drafts_for`
     // returns the static ladder at every other width.
     let ladder_nd = if dflash_verify_raw_argmax {
-        num_drafts
+        let width_limit = glm_dflash_drafts_for_width(active.len(), num_drafts);
+        if active.len() == 1 {
+            crate::scheduler::adaptive_spec::configured_dflash_depth_limit(&active[0], width_limit)
+        } else {
+            width_limit
+        }
     } else {
         crate::scheduler::adaptive_rung::drafts_for(active.len(), num_drafts)
     };
@@ -78,7 +135,24 @@ pub fn step_mtp(
             tracing::error!("bootstrap sync_secondary: {e:#}");
         }
     }
-    // Batched form: ONE `decode_batch` for every draftless sequence plus a
+    // DFlash-native form: ONE cross-sequence proposal immediately feeds the
+    // existing equal-width Phase-B verifier. This preserves the fused target
+    // pass while removing the per-sequence bootstrap loop.
+    if dflash_verify_raw_argmax && bootstrap_idxs.len() >= 2 {
+        let consumed =
+            step_dflash_bootstrap_batched(model, active, sched, &bootstrap_idxs, ladder_nd);
+        if !consumed.is_empty() {
+            for &index in &consumed {
+                if !active[index].pending_drafts.is_empty() {
+                    verify_idxs.push(index);
+                }
+            }
+            bootstrap_idxs.retain(|index| consumed.binary_search(index).is_err());
+            verify_idxs.sort_unstable();
+        }
+    }
+
+    // Generic batched form: ONE `decode_batch` for every draftless sequence plus a
     // batched cross-sequence propose, replacing n M=1 weight sweeps of the
     // target and n of the drafter. Falls back to the per-sequence loop below
     // whenever the envelope does not hold (`mtp_bootstrap_step`); kill switch
@@ -107,9 +181,12 @@ pub fn step_mtp(
             let eff = if a.grammar_state.is_some() {
                 1
             } else {
-                num_drafts
+                ladder_nd
             };
             let _gmask = mtp_grammar_mask_for(a);
+            if let Err(error) = model.configure_dflash_sampling(&mut a.seq, a.temperature, a.seed) {
+                tracing::error!("configure DFlash sampling: {error:#}");
+            }
             match model.run_mtp_propose_multi(
                 a.last_token,
                 a.seq.seq_len,
@@ -119,36 +196,43 @@ pub fn step_mtp(
                 _gmask.as_deref(),
             ) {
                 Ok(init) if !init.is_empty() => {
-                    if eff >= 3 && init.len() >= 3 {
-                        step_verify_k4(
+                    match verify_dispatch(init.len(), eff, dflash_verify_raw_argmax) {
+                        VerifyDispatch::Variable => step_verify_dflash(
                             model,
                             a,
                             sched,
                             &init,
-                            num_drafts,
+                            eff,
                             verify_ctx,
                             dflash_verify_raw_argmax,
-                        );
-                    } else if eff >= 2 && init.len() >= 2 {
-                        step_verify_k3(
+                        ),
+                        VerifyDispatch::K4 => step_verify_k4(
                             model,
                             a,
                             sched,
                             &init,
-                            num_drafts,
+                            eff,
                             verify_ctx,
                             dflash_verify_raw_argmax,
-                        );
-                    } else {
-                        step_verify_k2(
+                        ),
+                        VerifyDispatch::K3 => step_verify_k3(
                             model,
                             a,
                             sched,
                             &init,
-                            num_drafts,
+                            eff,
                             verify_ctx,
                             dflash_verify_raw_argmax,
-                        );
+                        ),
+                        VerifyDispatch::K2 => step_verify_k2(
+                            model,
+                            a,
+                            sched,
+                            &init,
+                            eff,
+                            verify_ctx,
+                            dflash_verify_raw_argmax,
+                        ),
                     }
                     continue;
                 }
@@ -261,21 +345,13 @@ pub fn step_mtp(
         let was_suspended = crate::scheduler::adaptive_spec::is_suspended(a, sched);
         let will_propose = crate::scheduler::adaptive_spec::spec_allowed(a, sched);
         let reprobe_resume = was_suspended && will_propose;
-        if sched.levers.dflash_unified_ctx {
-            // Unified ctx commit: same complement-gate as the old serial
-            // append — fire iff propose() will NOT run (or re-probe resume),
-            // so commit and propose decode-append never both cover a token.
-            if !will_propose || reprobe_resume {
-                let base_pos = a.seq.seq_len.saturating_sub(1);
-                if let Err(e) = model.commit_ctx(&mut a.seq, 1, base_pos) {
-                    tracing::error!("commit_ctx (mtp serial): {e:#}");
-                }
+        // Commit iff propose() will not consume this decode capture (or on a
+        // re-probe seam). The hook is a no-op for non-DFlash proposers.
+        if !will_propose || reprobe_resume {
+            let base_pos = a.seq.seq_len.saturating_sub(1);
+            if let Err(e) = model.commit_ctx(&mut a.seq, 1, base_pos) {
+                tracing::error!("commit_ctx (mtp serial): {e:#}");
             }
-        } else if sched.levers.dflash_serial_append
-            && (!will_propose || reprobe_resume)
-            && let Err(e) = model.dflash_serial_ctx_append(&mut a.seq)
-        {
-            tracing::error!("dflash_serial_ctx_append: {e:#}");
         }
 
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
@@ -341,11 +417,76 @@ pub fn step_mtp(
     // additionally self-gates (non-EP, non-HSS, no LoRA) via
     // `can_batch_verify(&ks)`. Kill switch `ATLAS_NO_MTP_BATCH_VERIFY`
     // (PRESENCE check) forces the serialized loop for A/B.
+    // GLM DFlash uses a different batch geometry from legacy MTP: every
+    // sequence contributes one equal-width causal block and all blocks share
+    // a single target/EXL3 weight sweep. Group by the proposal width so no
+    // padding token can mutate recurrent state.
+    let mut dflash_consumed = vec![false; active.len()];
+    if dflash_verify_raw_argmax
+        && verify_idxs.len() >= 2
+        && spark_model::speculative::mtp_multi_seq_mode()
+        && !batch_verify_disabled()
+    {
+        let mut widths = verify_idxs
+            .iter()
+            .filter_map(|&index| {
+                let active = &active[index];
+                (active.grammar_state.is_none() && active.pending_drafts.len() >= 4)
+                    .then_some(active.pending_drafts.len())
+            })
+            .collect::<Vec<_>>();
+        widths.sort_unstable();
+        widths.dedup();
+        for width in widths {
+            let candidates = verify_idxs
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    !dflash_consumed[index]
+                        && active[index].grammar_state.is_none()
+                        && active[index].pending_drafts.len() == width
+                })
+                .collect::<Vec<_>>();
+            for chunk in candidates.chunks(spark_runtime::buffers::GLM53_VERIFY_MAX_SEQS) {
+                if chunk.len() < 2 || !model.can_batch_verify_dflash(chunk.len(), width + 1) {
+                    continue;
+                }
+                let mut refs = Vec::with_capacity(chunk.len());
+                let mut iterator = active.iter_mut();
+                let mut consumed_through = 0usize;
+                for &index in chunk {
+                    let sequence = iterator
+                        .nth(index - consumed_through)
+                        .expect("DFlash batch index is active");
+                    consumed_through = index + 1;
+                    refs.push(sequence);
+                }
+                step_verify_dflash_batched(
+                    model,
+                    &mut refs,
+                    sched,
+                    ladder_nd,
+                    verify_ctx,
+                    dflash_verify_raw_argmax,
+                );
+                for &index in chunk {
+                    dflash_consumed[index] = true;
+                }
+            }
+        }
+    }
+
     let mut serial_idxs: Vec<usize> = Vec::new();
     let mut batchable_idxs: Vec<usize> = Vec::new();
-    if verify_idxs.len() >= 2
+    if dflash_verify_raw_argmax {
+        serial_idxs.extend(
+            verify_idxs
+                .iter()
+                .copied()
+                .filter(|&index| !dflash_consumed[index]),
+        );
+    } else if verify_idxs.len() >= 2
         && spark_model::speculative::mtp_multi_seq_mode()
-        && !dflash_verify_raw_argmax
         && !batch_verify_disabled()
         && ladder_nd >= 1
     {
@@ -497,49 +638,76 @@ pub fn step_mtp(
         // K=4 cleanly, so γ-block verify routes through `step_verify_dflash`.
         // MTP keeps using the existing graphed paths; this dispatch is purely
         // additive.
-        if drafts.len() >= 4 {
-            step_verify_dflash(
+        match verify_dispatch(drafts.len(), ladder_nd, dflash_verify_raw_argmax) {
+            VerifyDispatch::Variable => step_verify_dflash(
                 model,
                 a,
                 sched,
                 &drafts,
-                num_drafts,
+                ladder_nd,
                 verify_ctx,
                 dflash_verify_raw_argmax,
-            );
-        } else if num_drafts >= 3 && drafts.len() >= 3 {
-            step_verify_k4(
+            ),
+            VerifyDispatch::K4 => step_verify_k4(
                 model,
                 a,
                 sched,
                 &drafts,
-                num_drafts,
+                ladder_nd,
                 verify_ctx,
                 dflash_verify_raw_argmax,
-            );
-        } else if num_drafts >= 2 && drafts.len() >= 2 {
-            step_verify_k3(
+            ),
+            VerifyDispatch::K3 => step_verify_k3(
                 model,
                 a,
                 sched,
                 &drafts,
-                num_drafts,
+                ladder_nd,
                 verify_ctx,
                 dflash_verify_raw_argmax,
-            );
-        } else {
-            step_verify_k2(
+            ),
+            VerifyDispatch::K2 => step_verify_k2(
                 model,
                 a,
                 sched,
                 &drafts,
-                num_drafts,
+                ladder_nd,
                 verify_ctx,
                 dflash_verify_raw_argmax,
-            );
+            ),
         }
     }
     sched
         .timing
         .record(crate::scheduler::mtp_timing::Phase::StepOuter, t_step_outer);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VerifyDispatch, apply_glm_dflash_depth_ladder, verify_dispatch};
+
+    #[test]
+    fn dflash_bootstrap_uses_variable_width_verifier() {
+        assert_eq!(verify_dispatch(7, 7, true), VerifyDispatch::Variable);
+        assert_eq!(verify_dispatch(4, 7, true), VerifyDispatch::Variable);
+        assert_eq!(verify_dispatch(3, 7, true), VerifyDispatch::Variable);
+        assert_eq!(verify_dispatch(2, 7, true), VerifyDispatch::Variable);
+        assert_eq!(verify_dispatch(1, 7, true), VerifyDispatch::Variable);
+    }
+
+    #[test]
+    fn short_proposals_keep_legacy_verifiers() {
+        assert_eq!(verify_dispatch(3, 7, false), VerifyDispatch::K4);
+        assert_eq!(verify_dispatch(2, 7, false), VerifyDispatch::K3);
+        assert_eq!(verify_dispatch(1, 7, false), VerifyDispatch::K2);
+    }
+
+    #[test]
+    fn glm_dflash_depth_ladder_uses_deep_solo_and_shallow_concurrent_blocks() {
+        assert_eq!(apply_glm_dflash_depth_ladder(1, 16, true), 16);
+        assert_eq!(apply_glm_dflash_depth_ladder(2, 16, true), 7);
+        assert_eq!(apply_glm_dflash_depth_ladder(4, 16, true), 7);
+        assert_eq!(apply_glm_dflash_depth_ladder(4, 7, true), 7);
+        assert_eq!(apply_glm_dflash_depth_ladder(4, 16, false), 16);
+    }
 }

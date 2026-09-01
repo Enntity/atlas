@@ -188,6 +188,7 @@ pub struct RequestAccept {
     mtp_steps: u64,
     d1: u64,
     na: u64,
+    rejected: u64,
     pub regime_reprobes: u64,
 }
 
@@ -196,12 +197,16 @@ impl RequestAccept {
         self.serial_steps = self.serial_steps.saturating_add(1);
     }
 
-    /// `emitted` is tokens committed this verify (1 + accepted drafts).
+    /// `emitted` is tokens committed this verify (1 + accepted drafts), and
+    /// `offered` is the number of draft tokens presented to the verifier.
     /// `d1_match` agrees with `emitted > 1` today (see [`record`]).
-    pub fn record_verify_emitted(&mut self, emitted: usize) {
+    pub fn record_verify_emitted(&mut self, emitted: usize, offered: usize) {
         self.mtp_steps = self.mtp_steps.saturating_add(1);
-        let accepted = emitted.saturating_sub(1) as u64;
+        let accepted = emitted.saturating_sub(1).min(offered) as u64;
         self.na = self.na.saturating_add(accepted);
+        self.rejected = self
+            .rejected
+            .saturating_add((offered as u64).saturating_sub(accepted));
         if accepted > 0 {
             self.d1 = self.d1.saturating_add(1);
         }
@@ -213,6 +218,13 @@ impl RequestAccept {
     /// that matched generation", and `na` is exactly that sum.
     pub fn accepted_total(&self) -> u64 {
         self.na
+    }
+
+    /// Total draft tokens REJECTED for this request. A bootstrap MTP step has
+    /// `offered == 0` and therefore contributes neither accepted nor rejected
+    /// predictions.
+    pub fn rejected_total(&self) -> u64 {
+        self.rejected
     }
 
     pub fn note_regime_reprobe(&mut self) {
@@ -353,10 +365,10 @@ mod tests {
     fn mtp_run_reports_p1_mean_na_tok_step() {
         let mut a = RequestAccept::default();
         for _ in 0..7 {
-            a.record_verify_emitted(2); // 1 draft, d1 match
+            a.record_verify_emitted(2, 1); // 1 draft, d1 match
         }
         for _ in 0..3 {
-            a.record_verify_emitted(1); // reject
+            a.record_verify_emitted(1, 1); // reject
         }
         assert!((a.mtp_frac() - 1.0).abs() < 1e-9);
         assert!((a.p1() - 0.7).abs() < 1e-9);
@@ -364,6 +376,7 @@ mod tests {
         // 7 verifies each accepting 1 draft: the per-request total the usage
         // field reports is the raw sum, not a rate.
         assert_eq!(a.accepted_total(), 7);
+        assert_eq!(a.rejected_total(), 3);
         assert!((a.tok_step() - 1.7).abs() < 1e-9);
         a.note_regime_reprobe();
         assert!(a.done_suffix().contains("mean_na=0.700"));

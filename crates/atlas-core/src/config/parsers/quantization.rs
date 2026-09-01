@@ -38,7 +38,7 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
     //                      propagated when producer.name=="modelopt".
     //   format           — compressed-tensors only
     //                      (e.g. "nvfp4-pack-quantized").
-    let quant_method = qc
+    let mut quant_method = qc
         .get("quant_method")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
@@ -64,9 +64,15 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
         .to_string();
     let format = qc
         .get("format")
+        .or_else(|| qc.get("fmt"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
+    // Some native FP8 exporters declare only `fmt=e4m3`; the tensor layout
+    // (`weight` + `weight_scale_inv`) is the same native FP8 contract.
+    if quant_method.is_empty() && format.eq_ignore_ascii_case("e4m3") {
+        quant_method = "fp8".to_string();
+    }
 
     // Ignore list: ModelOpt calls it `ignore`, compressed-tensors calls
     // it `ignore` too at the top level but also has `targets` inside
@@ -89,6 +95,21 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
                 && !ignore_modules.contains(&s.to_string())
             {
                 ignore_modules.push(s.to_string());
+            }
+        }
+    }
+    // Official GLM-5.3-Flash terminology. These entries are correctness
+    // constraints: listed tensors remain BF16 and must not be dispatched to
+    // a block-scaled FP8 loader merely because neighboring weights are FP8.
+    if let Some(arr) = qc
+        .get("modules_to_not_convert")
+        .and_then(serde_json::Value::as_array)
+    {
+        for value in arr {
+            if let Some(module) = value.as_str()
+                && !ignore_modules.iter().any(|existing| existing == module)
+            {
+                ignore_modules.push(module.to_string());
             }
         }
     }
@@ -230,5 +251,29 @@ mod tests {
         assert_eq!(qc.quant_method, "modelopt");
         assert_eq!(qc.quant_algo, "MIXED_PRECISION");
         assert!(qc.ignore_modules.is_empty());
+    }
+
+    #[test]
+    fn glm_native_fp8_schema_preserves_modules_to_not_convert() {
+        let raw = serde_json::json!({
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "modules_to_not_convert": [
+                    "lm_head",
+                    "model.layers.0.self_attn.A_log"
+                ]
+            }
+        });
+        let qc = parse_quantization_config(&raw).expect("GLM native FP8 must parse");
+        assert_eq!(qc.quant_method, "fp8");
+        assert_eq!(qc.format, "e4m3");
+        assert_eq!(
+            qc.ignore_modules,
+            vec![
+                "lm_head".to_string(),
+                "model.layers.0.self_attn.A_log".to_string()
+            ]
+        );
     }
 }

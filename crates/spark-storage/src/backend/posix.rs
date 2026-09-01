@@ -94,7 +94,7 @@ impl PosixBackend {
     /// tier deliberately does not use. A no-op there means a Windows run of
     /// the timing tests may read from RAM -- which is why this is a test
     /// helper and not a correctness primitive.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub fn drop_pagecache(&self) {
         for layer in 0..self.layout.spec.num_layers {
             let fd = self.layout.fd(layer);
@@ -102,7 +102,7 @@ impl PosixBackend {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     pub fn drop_pagecache(&self) {}
 }
 

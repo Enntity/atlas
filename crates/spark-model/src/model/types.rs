@@ -320,9 +320,17 @@ pub struct TransformerModel {
     /// unconditional re-stage.
     pub(super) verify_wy_cache: Mutex<Option<Vec<u64>>>,
     /// Cached CUDA graphs for DFlash K=γ verification, keyed by
-    /// `(seq.slot_idx, K)`. K is `tokens.len()` (γ+1 typically). One graph
-    /// per (slot, K) — different γ values coexist via the K dimension.
-    pub(super) verify_kgamma_graph: Mutex<std::collections::HashMap<(usize, usize), GraphHandle>>,
+    /// `(seq.slot_idx, K, DSA pool bucket)`. The sparse-attention max-pool
+    /// launch geometry is captured; omitting it truncated later replays to the
+    /// first short context's history. K is `tokens.len()` (γ+1 typically).
+    pub(super) verify_kgamma_graph:
+        Mutex<std::collections::HashMap<(usize, usize, u32), GraphHandle>>,
+    /// Fixed-shape CUDA graphs for the native concurrent DFlash target sweep.
+    /// Every recurrent/sparse state pointer is read indirectly from a staged
+    /// fixed-address table, so slot identity is deliberately absent. The graph
+    /// geometry is fully described by `(num_sequences, rows, DSA pool bucket)`.
+    pub(super) dflash_verify_batched_graphs:
+        Mutex<std::collections::HashMap<(usize, usize, u32), GraphHandle>>,
     /// Cached CUDA graphs for the DFlash decode+verify fused pass, keyed by
     /// `(seq.slot_idx, M)` where M = tokens.len() = 1 + num_drafts.
     /// Replaces the separate `decode_graph` (M=1) + `verify{k}_graph` (M=k)

@@ -13,6 +13,9 @@ pub enum SsmArchitecture {
     None,
     /// Gated Delta Networks (Qwen3.5 family)
     Gdn,
+    /// Kimi Delta Attention as used by GLM-5.3-Flash. KDA has three
+    /// convolution histories and a different recurrent update from GDN.
+    Kda,
     /// Mamba-2 (Nemotron-H family)
     Mamba2,
 }
@@ -25,6 +28,8 @@ pub enum AttentionType {
     /// Multi-head Latent Attention — compressed KV via low-rank projection.
     /// (Mistral Small 4, DeepSeek-V2/V3)
     Mla,
+    /// GLM-5 sparse NoPE MLA plus learned semantic index/k-pool/tail state.
+    Glm5SparseNope,
 }
 
 /// Feature flags derived from model config at parse time.
@@ -78,7 +83,9 @@ impl ModelCapabilities {
         let has_mtp = config.mtp_num_hidden_layers > 0;
         let has_nested = config.nested_config;
 
-        let ssm_arch = if has_mamba2 {
+        let ssm_arch = if config.model_type == "glm5_next" {
+            SsmArchitecture::Kda
+        } else if has_mamba2 {
             SsmArchitecture::Mamba2
         } else if has_ssm {
             SsmArchitecture::Gdn
@@ -97,7 +104,9 @@ impl ModelCapabilities {
             has_mtp,
             ssm_architecture: ssm_arch,
             has_nested_config: has_nested,
-            attention_type: if config.kv_lora_rank > 0 {
+            attention_type: if config.model_type == "glm5_next" {
+                AttentionType::Glm5SparseNope
+            } else if config.kv_lora_rank > 0 {
                 AttentionType::Mla
             } else {
                 AttentionType::Standard

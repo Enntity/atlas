@@ -120,25 +120,8 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
             continue;
         }
         let dtype_str = info["dtype"].as_str().unwrap_or("BF16");
-        let (dtype, from_f16) = match dtype_str {
-            "F32" => (WeightDtype::FP32, false),
-            "BF16" => (WeightDtype::BF16, false),
-            // F16 is not store-legal (WeightDtype is closed to store dtypes):
-            // stage as BF16 and mark for byte conversion in the copy loop.
-            // centml modelopt W4A4 exports ship all unquantized tensors as F16.
-            "F16" => (WeightDtype::BF16, true),
-            "U8" => (WeightDtype::UInt8, false),
-            // I8 is a 1-byte raw container; DeepSeek-V4-Flash-NVFP4 ships its MTP
-            // experts' 4-bit-packed weights as I8 (vs U8 for the main layers).
-            // Signedness is irrelevant for packed FP4 — the dequant kernel extracts
-            // nibbles by bit ops — so treat I8 as raw bytes (UInt8), matching the
-            // NVFP4 expert path.
-            "I8" => (WeightDtype::UInt8, false),
-            "F8_E4M3" => (WeightDtype::FP8E4M3, false),
-            "F8_E8M0" => (WeightDtype::FP8E8M0, false),
-            "I64" => (WeightDtype::Int64, false),
-            other => bail!("Unsupported safetensors dtype '{other}' for tensor {name}"),
-        };
+        let (dtype, from_f16) = WeightDtype::from_safetensors_str_for_tensor(dtype_str, name)
+            .with_context(|| format!("unsupported safetensors dtype for tensor {name}"))?;
         let shape: Vec<usize> = info["shape"]
             .as_array()
             .map(|a| {

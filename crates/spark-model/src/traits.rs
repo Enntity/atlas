@@ -10,6 +10,13 @@ use spark_runtime::gpu::DevicePtr;
 use crate::layer::LayerState;
 use crate::speculative::ProposerState;
 
+/// Rank-symmetric worker command for one native multi-sequence prefill pass.
+/// The payload is packed and broadcast once; see `model/ep_prefill_batch.rs`.
+pub const EP_PREFILL_BATCH_CMD: u32 = 0xFFFF_FFE1;
+
+/// Rank-symmetric GLM heterogeneous target-verify + prompt-prefill command.
+pub const EP_DFLASH_PREFILL_CMD: u32 = 0xFFFF_FFDE;
+
 /// Result of a mixed forward pass (decode + prefill in one pass).
 pub struct MixedForwardResult {
     /// Logits for decode sequences: [N, vocab_size] BF16.
@@ -17,6 +24,15 @@ pub struct MixedForwardResult {
     pub decode_logits: DevicePtr,
     /// Logits for the prefill sequence's last token: [1, vocab_size] BF16.
     /// NULL if `is_last_chunk` was false (intermediate chunk, no logits).
+    pub prefill_logits: DevicePtr,
+}
+
+/// Result of one GLM target-verification block co-dispatched with an
+/// equal-width prompt slice.  The target verdicts are copied to the host;
+/// `prefill_logits` remains on-device for the scheduler's ordinary first-token
+/// sampler when the slice completes the prompt.
+pub struct DflashPrefillResult {
+    pub target_argmax: Vec<u32>,
     pub prefill_logits: DevicePtr,
 }
 

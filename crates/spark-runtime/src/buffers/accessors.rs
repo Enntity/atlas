@@ -158,6 +158,13 @@ impl BufferArena {
     pub fn hc_comb(&self) -> DevicePtr {
         self.hc_comb
     }
+    /// Shared GLM KDA/DSA transient workspace; NULL for non-GLM models.
+    pub fn glm_workspace(&self) -> DevicePtr {
+        self.glm_workspace
+    }
+    pub fn glm_layout(&self) -> super::GlmWorkspaceLayout {
+        self.glm_layout
+    }
     pub fn max_batch_tokens(&self) -> usize {
         self.max_batch_tokens
     }

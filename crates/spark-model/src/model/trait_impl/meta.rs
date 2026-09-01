@@ -20,12 +20,15 @@ use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::types::{PinnedMetaStaging, TransformerModel};
 use crate::layer::{
-    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
+    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, GlmSparseMlaLayerState, KdaLayerState,
+    LayerState, SsmLayerState, TransformerLayer,
 };
 use crate::layers::ops;
 use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
+
+mod logits;
 
 impl TransformerModel {
     pub(super) fn vocab_size_dispatch(&self) -> usize {
@@ -173,6 +176,12 @@ impl TransformerModel {
     ) -> Result<()> {
         use spark_runtime::kernel_args::KernelLaunch;
 
+        // GLM KDA uses a bounded decay by construction and stores a distinct
+        // typed recurrent ABI. The generic SSM clamp/norm kernel would both
+        // downcast the wrong state and alter the official recurrence.
+        if self.ssm_pool.is_glm() {
+            return Ok(());
+        }
         let num_ssm = self.ssm_pool.num_ssm_layers;
         if num_ssm == 0 || self.ssm_state_norm_kernel.0 == 0 {
             return Ok(());
@@ -265,10 +274,51 @@ impl TransformerModel {
         // attention layers use their own alloc_state (EmptyLayerState).
         // When MTP is available, pre-allocate checkpoint + K=2 intermediate
         // buffers so CUDA graph capture doesn't trigger lazy allocation.
+        let is_glm = self.ssm_pool.is_glm();
         let mut ssm_layer_idx = 0usize;
+        let mut dsa_layer_idx = 0usize;
         let mut layer_states: Vec<Box<dyn LayerState>> = Vec::with_capacity(self.layers.len());
         for (i, layer) in self.layers.iter().enumerate() {
-            if self.config.layer_type(i) == LayerType::LinearAttention {
+            if is_glm && self.config.layer_type(i) == LayerType::LinearAttention {
+                let mut state = KdaLayerState {
+                    slot_idx: slot,
+                    slot_capacity: self.ssm_pool.max_slots + 1,
+                    current: self.ssm_pool.kda_state(ssm_layer_idx, slot),
+                    checkpoint: None,
+                    intermediates: Vec::new(),
+                };
+                if has_mtp {
+                    state.checkpoint = Some(self.ssm_pool.kda_checkpoint(ssm_layer_idx, slot));
+                    for token_idx in 0..self.ssm_pool.h_inter_count(slot) {
+                        state.intermediates.push(self.ssm_pool.kda_intermediate(
+                            ssm_layer_idx,
+                            slot,
+                            token_idx,
+                        ));
+                    }
+                }
+                layer_states.push(Box::new(state));
+                ssm_layer_idx += 1;
+            } else if is_glm && self.config.layer_type(i) == LayerType::FullAttention {
+                let mut state = GlmSparseMlaLayerState {
+                    slot_idx: slot,
+                    current: self.ssm_pool.glm_dsa_state(dsa_layer_idx, slot),
+                    checkpoint: None,
+                    intermediates: Vec::new(),
+                };
+                if has_mtp {
+                    state.checkpoint = Some(self.ssm_pool.glm_dsa_checkpoint(dsa_layer_idx, slot));
+                    for token_idx in 0..self.ssm_pool.h_inter_count(slot) {
+                        state.intermediates.push(self.ssm_pool.glm_dsa_intermediate(
+                            dsa_layer_idx,
+                            slot,
+                            token_idx,
+                        ));
+                    }
+                }
+                layer_states.push(Box::new(state));
+                dsa_layer_idx += 1;
+            } else if self.config.layer_type(i) == LayerType::LinearAttention {
                 // Layer-independent (one FP32 staging blob per SLOT), so it is
                 // the same pointer for every SSM layer of this sequence.
                 let stage = self.ssm_pool.h_prefill_stage(slot);
@@ -378,123 +428,5 @@ impl TransformerModel {
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: vec![0; num_attn_layers],
         })
-    }
-
-    pub(super) fn copy_logits_to_host_dispatch(
-        &self,
-        logits_ptr: DevicePtr,
-        dst: &mut [u8],
-    ) -> Result<()> {
-        self.gpu.copy_d2h(logits_ptr, dst)
-    }
-
-    pub(super) fn logits_ptr_is_fp32_dispatch(&self, logits_ptr: DevicePtr) -> bool {
-        self.use_fp32_logits && logits_ptr.0 == self.logits_fp32_buf.0
-    }
-
-    pub(super) fn logits_buffer_ptr_dispatch(&self) -> DevicePtr {
-        self.buffers.logits()
-    }
-
-    pub(super) fn argmax_on_device_dispatch(
-        &self,
-        logits_ptr: DevicePtr,
-        _stream: u64,
-    ) -> Result<u32> {
-        // Use backend's default stream (same as decode) to avoid implicit
-        // sync overhead from legacy default stream (handle 0).
-        let stream = self.gpu.default_stream();
-        // Use first 4 bytes of scratch buffer for the u32 output
-        let out_ptr = self.buffers.scratch();
-        // Dispatch by buffer dtype: when the logits pointer is the model's
-        // FP32 scratch (single-token decode lm_head with use_fp32_logits),
-        // run argmax_fp32; otherwise the buffer is BF16 (prefill /
-        // batched-decode / non-Gemma-4 paths) and argmax_bf16 applies.
-        // The kernel arg layout is identical (ptr, ptr, u32), so dispatch
-        // is just a kernel-handle swap.
-        let is_fp32 = self.use_fp32_logits && logits_ptr.0 == self.logits_fp32_buf.0;
-        let kernel = if is_fp32 {
-            self.argmax_logits_kernel
-        } else {
-            self.argmax_kernel
-        };
-        ops::argmax_bf16(
-            self.gpu.as_ref(),
-            kernel,
-            logits_ptr,
-            out_ptr,
-            self.config.vocab_size as u32,
-            stream,
-        )?;
-        // D2H: copy 4 bytes (single u32) instead of vocab_size*2 = 304KB
-        let mut buf = [0u8; 4];
-        self.gpu.copy_d2h(out_ptr, &mut buf)?;
-        let gpu_token = u32::from_le_bytes(buf);
-
-        Ok(gpu_token)
-    }
-
-    pub(super) fn argmax_batch_dispatch(
-        &self,
-        logits_ptr: DevicePtr,
-        n: usize,
-        _stream: u64,
-    ) -> Result<Vec<u32>> {
-        let stream = self.gpu.default_stream();
-        let v = self.config.vocab_size;
-        let bf16 = 2usize;
-        let out_ptr = self.buffers.scratch();
-        // ONE launch, one block per row. The single-row `argmax_bf16` is a one-CTA
-        // reduction (grid [1,1,1]), so n calls on the same stream serialise n
-        // single-SM scans: measured 16 x 100.6 us = 1.6 ms per decode step at n=16.
-        // The batched kernel runs the identical per-row body, so ties resolve the
-        // same way — byte-identical. Falls back to the loop when the kernel set
-        // lacks the batched entry.
-        fn argmax_batch_enabled() -> bool {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var("ATLAS_NO_ARGMAX_BATCH").ok().as_deref() != Some("1"))
-        }
-        if self.argmax_batch_kernel.0 != 0 && argmax_batch_enabled() {
-            ops::argmax_bf16_batch(
-                self.gpu.as_ref(),
-                self.argmax_batch_kernel,
-                logits_ptr,
-                out_ptr,
-                v as u32,
-                n as u32,
-                v as u32,
-                stream,
-            )?;
-        } else {
-            for i in 0..n {
-                let logits_i = logits_ptr.offset(i * v * bf16);
-                let out_i = out_ptr.offset(i * 4);
-                ops::argmax_bf16(
-                    self.gpu.as_ref(),
-                    self.argmax_kernel,
-                    logits_i,
-                    out_i,
-                    v as u32,
-                    stream,
-                )?;
-            }
-        }
-        let mut buf = vec![0u8; n * 4];
-        self.gpu.copy_d2h(out_ptr, &mut buf)?;
-        let mut results = Vec::with_capacity(n);
-        for i in 0..n {
-            results.push(u32::from_le_bytes([
-                buf[i * 4],
-                buf[i * 4 + 1],
-                buf[i * 4 + 2],
-                buf[i * 4 + 3],
-            ]));
-        }
-        Ok(results)
-    }
-
-    pub(super) fn hidden_after_norm_dispatch(&self) -> DevicePtr {
-        // norm_output() holds the post-final-norm hidden state from the last decode
-        self.buffers.norm_output()
     }
 }

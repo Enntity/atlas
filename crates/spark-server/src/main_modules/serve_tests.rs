@@ -132,9 +132,10 @@ fn compat_self_pair() {
 }
 
 #[test]
-fn compat_nvfp4_handles_fp8_and_bf16() {
+fn compat_nvfp4_handles_fp8_and_bf16_but_not_exl3() {
     assert!(quant_pair_compatible("nvfp4", "fp8"));
     assert!(quant_pair_compatible("nvfp4", "bf16"));
+    assert!(!quant_pair_compatible("nvfp4", "exl3"));
 }
 
 #[test]

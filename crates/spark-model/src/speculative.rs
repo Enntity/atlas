@@ -29,6 +29,16 @@ pub trait ProposerState: Send + Sync {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
+/// Sparse proposal distribution retained by DFlash2 for standard rejection
+/// sampling. Each draft row has exactly `top_k` candidate IDs and raw
+/// (pre-temperature) selector scores.
+#[derive(Clone, Debug)]
+pub struct SparseDraftDistribution {
+    pub top_k: usize,
+    pub candidate_ids: Vec<u32>,
+    pub scores: Vec<f32>,
+}
+
 /// A draft token proposer for speculative decoding.
 ///
 /// The engine calls `propose()` after each target decode to get draft tokens,
@@ -292,6 +302,26 @@ pub trait DraftProposer: Send + Sync {
     /// across its drafts), when the proposer computes it (`draft_conf_tau` >
     /// 0). `None` = not computed; callers must not gate on it then.
     fn last_confidence(&self) -> Option<f32> {
+        None
+    }
+
+    /// Configure request sampling for the next proposal. Non-DFlash
+    /// proposers ignore this; DFlash2 uses it for its probabilistic selector
+    /// walk before standard rejection sampling.
+    fn configure_sampling(
+        &self,
+        _state: &mut dyn ProposerState,
+        _temperature: f32,
+        _seed: Option<u64>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Sparse q distribution produced by the most recent proposal.
+    fn sparse_draft_distribution(
+        &self,
+        _state: &dyn ProposerState,
+    ) -> Option<SparseDraftDistribution> {
         None
     }
 

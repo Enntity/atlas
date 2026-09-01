@@ -26,9 +26,12 @@ const ENUMERATED: &[&str] = &[
 /// Flags whose values are only self-consistent beside another flag.
 /// `--ssm-h-dtype f16` alone is a validate-level error (the FP16 h-state
 /// twins live on the fused-norm arm), so its round trip carries the arm.
-fn companions(flag: &str) -> &'static [&'static str] {
-    match flag {
-        "ssm-h-dtype" => &["--gdn-fused-norm"],
+fn companions(flag: &str, value: &str) -> &'static [&'static str] {
+    match (flag, value) {
+        ("ssm-h-dtype", _) => &["--gdn-fused-norm"],
+        ("scheduling-policy", "phase-interleave") => {
+            &["--phase-decode-steps", "4", "--phase-prefill-steps", "1"]
+        }
         _ => &[],
     }
 }
@@ -39,7 +42,7 @@ fn round_trip(flag: &str, value: &str) -> Result<(), String> {
         .to_vec();
     argv.push(format!("--{flag}"));
     argv.push(value.to_string());
-    argv.extend(companions(flag).iter().map(|s| s.to_string()));
+    argv.extend(companions(flag, value).iter().map(|s| s.to_string()));
     let cli = crate::cli::Cli::try_parse_from(argv).map_err(|e| e.to_string())?;
     let crate::cli::Command::Serve(args) = cli.command else {
         unreachable!("this test parses a serve command");

@@ -36,10 +36,12 @@ use spark_runtime::weights::WeightStore;
 use crate::weight_map::Nvfp4Variant;
 
 mod compressed_tensors;
+mod exl3;
 mod fp8_blockscaled;
 mod modelopt;
 
 pub use compressed_tensors::CompressedTensorsFormat;
+pub use exl3::Exl3Format;
 pub use fp8_blockscaled::Fp8BlockScaledFormat;
 pub use modelopt::ModeloptFormat;
 
@@ -122,6 +124,12 @@ pub fn detect_quant_format(config: &ModelConfig, store: &WeightStore) -> Box<dyn
                     ignore.len(),
                 );
                 return Box::new(Fp8BlockScaledFormat::new(ignore));
+            }
+            "exl3" => {
+                tracing::info!(
+                    "QuantFormat: EXL3 routed experts with architecture-native dense tensors"
+                );
+                return Box::new(Exl3Format);
             }
             other if !other.is_empty() => {
                 tracing::warn!(
@@ -214,7 +222,27 @@ pub(crate) fn module_matches_pattern(path: &str, pattern: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::module_matches_pattern as m;
+    use super::{detect_quant_format, module_matches_pattern as m};
+    use atlas_core::config::{ModelConfig, QuantizationConfig};
+    use spark_runtime::weights::WeightStore;
+
+    #[test]
+    fn exl3_config_does_not_fall_through_to_nvfp4_heuristics() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "glm5_next".to_string();
+        config.quantization_config = Some(QuantizationConfig {
+            quant_method: "exl3".to_string(),
+            quant_algo: String::new(),
+            format: String::new(),
+            ignore_modules: Vec::new(),
+        });
+        let format = detect_quant_format(&config, &WeightStore::empty());
+        assert_eq!(format.name(), "exl3");
+        assert_eq!(
+            format.base_variant(),
+            crate::weight_map::Nvfp4Variant::Bf16Raw
+        );
+    }
 
     #[test]
     fn exact_match() {

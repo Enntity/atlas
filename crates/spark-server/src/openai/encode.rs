@@ -34,7 +34,7 @@ pub(crate) fn encode_chat_response(
             reasoning_tokens: ir.usage.reasoning_tokens,
             audio_tokens: 0,
             accepted_prediction_tokens: ir.usage.accepted_prediction_tokens,
-            rejected_prediction_tokens: 0,
+            rejected_prediction_tokens: ir.usage.rejected_prediction_tokens,
         }),
         time_to_first_token_ms: ir.usage.time_to_first_token_ms,
         response_tokens_per_second: ir.usage.response_tokens_per_second,

@@ -132,7 +132,7 @@ fn wire_usage(u: &crate::ir::Usage) -> Usage {
             reasoning_tokens: u.reasoning_tokens,
             audio_tokens: 0,
             accepted_prediction_tokens: u.accepted_prediction_tokens,
-            rejected_prediction_tokens: 0,
+            rejected_prediction_tokens: u.rejected_prediction_tokens,
         }),
         time_to_first_token_ms: u.time_to_first_token_ms,
         response_tokens_per_second: u.response_tokens_per_second,
@@ -285,6 +285,7 @@ mod tests {
             cached_prompt_tokens: 2,
             reasoning_tokens: 3,
             accepted_prediction_tokens: 4,
+            rejected_prediction_tokens: 2,
             time_to_first_token_ms: 12.5,
             response_tokens_per_second: 40.0,
         };
@@ -317,7 +318,7 @@ mod tests {
             p[0]
         );
         assert!(
-            p[0].contains("\"rejected_prediction_tokens\":0"),
+            p[0].contains("\"rejected_prediction_tokens\":2"),
             "payload: {}",
             p[0]
         );
