@@ -171,6 +171,9 @@ pub struct DenseFfnLayer {
     // (no requant), BF16 activations quantized to NVFP4 each call into ffn_act_a/scale.
     // KernelHandle(0) on miss → arm never taken (default-off byte-identical).
     w4a4_gemm_k: KernelHandle,
+    // M-fast W4A4 schedule keeps weight panels resident in L2 across the
+    // 128-token M tiles. Prefer it for long prefills when the target ships it.
+    w4a4_gemm_mfast_k: KernelHandle,
     quantize_nvfp4_k: KernelHandle,
     // Q4_K MMQ prefill (ATLAS_FFN_MMQ): vendored llama Q4_K W4A8 GEMM. Weights
     // materialized NVFP4→bf16→Q4_K once (lazy, cached in the OnceLocks); activations
@@ -357,6 +360,7 @@ impl DenseFfnLayer {
             int8_up: std::sync::OnceLock::new(),
             int8_down: std::sync::OnceLock::new(),
             w4a4_gemm_k: super::try_kernel(gpu, "w4a4", "w4a4_gemm"),
+            w4a4_gemm_mfast_k: super::try_kernel(gpu, "w4a4", "w4a4_gemm_mfast"),
             quantize_nvfp4_k: super::try_kernel(gpu, "quantize_nvfp4", "quantize_bf16_to_nvfp4"),
             q4k_mmq_nc_k: super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_nc"),
             q4k_mmq_wc_k: super::try_kernel(gpu, "q4k_mmq", "atlas_q4k_mmq128_wc"),
@@ -2008,7 +2012,7 @@ impl DenseFfnLayer {
         // W4A4 native-FP4 prefill (ATLAS_FP4_PREFILL) — HIGHEST priority. NVFP4 weights
         // used directly (no requant); BF16 activations quantized to NVFP4 each GEMM into
         // the shared scratch. Native FP4 tensor cores (sm_121a). Lossy (cos ~0.99 vs fp32).
-        let fp4_prefill = self.w4a4_gemm_k.0 != 0
+        let fp4_prefill = (self.w4a4_gemm_mfast_k.0 != 0 || self.w4a4_gemm_k.0 != 0)
             && self.quantize_nvfp4_k.0 != 0
             && std::env::var_os("ATLAS_FP4_PREFILL").is_some();
         if fp4_prefill {
@@ -2019,7 +2023,7 @@ impl DenseFfnLayer {
             // through the call path to prevent one repeated INFO line.
             if ctx.stats.once("log:ffn_fp4_prefill") {
                 tracing::info!(
-                    "[atlas] ATLAS_FP4_PREFILL=1: dense-FFN prefill via w4a4_gemm (native FP4 MMA sm_121a, W4A4)"
+                    "[atlas] ATLAS_FP4_PREFILL=1: dense-FFN prefill via native W4A4 GEMM (M-fast schedule when available, sm_121a)"
                 );
             }
         }
@@ -2139,18 +2143,33 @@ impl DenseFfnLayer {
                     // native NVFP4 weight `$w` (no requant). sm_121a FP4 MMA.
                     _ if fp4_prefill => {
                         let _ = $in;
-                        ops::w4a4_gemm(
-                            ctx.gpu,
-                            self.w4a4_gemm_k,
-                            nvfp4_a_packed,
-                            nvfp4_a_scale,
-                            $w,
-                            $out,
-                            m,
-                            $n,
-                            $k,
-                            stream,
-                        )?;
+                        if self.w4a4_gemm_mfast_k.0 != 0 {
+                            ops::w4a4_gemm_mfast(
+                                ctx.gpu,
+                                self.w4a4_gemm_mfast_k,
+                                nvfp4_a_packed,
+                                nvfp4_a_scale,
+                                $w,
+                                $out,
+                                m,
+                                $n,
+                                $k,
+                                stream,
+                            )?;
+                        } else {
+                            ops::w4a4_gemm(
+                                ctx.gpu,
+                                self.w4a4_gemm_k,
+                                nvfp4_a_packed,
+                                nvfp4_a_scale,
+                                $w,
+                                $out,
+                                m,
+                                $n,
+                                $k,
+                                stream,
+                            )?;
+                        }
                     }
                     // int8 W4A8 fast prefill (ATLAS_INT8_PREFILL) — next priority.
                     // Independent of `$wt`/the transposed copies: requant reads the

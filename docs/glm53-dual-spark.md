@@ -25,6 +25,7 @@ WORKER_IP=169.254.128.113 \
 SSH_TARGET=mangokid@192.168.8.187 \
 MODEL=/var/tmp/models/glm53-flash-nvfp4 \
 TP_SIZE=2 \
+FP4_PREFILL=1 \
 ./scripts/start-glm53-ep2.sh
 ```
 
@@ -45,6 +46,14 @@ projection dispatch are enabled by default. Their diagnostic fallbacks are
 KDA Q/K/V and row-parallel output projections keep independent decode-native
 NVFP4 weights plus transposed M=128 prefill twins. The output twins add about
 0.3 GiB per rank across all 34 KDA layers without changing decode numerics.
+
+`FP4_PREFILL=1` enables Atlas's native W4A4 tensor-core path for GLM's first
+three dense FFN layers. It quantizes each BF16 activation to NVFP4 once for the
+gate/up pair and once for the down projection, then uses the M-fast schedule so
+CTAs sharing a weight panel reuse it from L2. This is opt-in because activation
+quantization is lossy. Hybrid dense/MoE models allocate about 78 MiB of shared
+scratch per rank at the guarded 1,280-token test size; pure MoE models still
+allocate none.
 
 This checkpoint declares 1M model context, but initial Atlas support does not.
 GLM's full-attention layers select 2,048 tokens using an indexer. Atlas currently
@@ -81,7 +90,8 @@ requests with profiling disabled. Medians on the same two Sparks are:
 
 | Atlas path | Prefill tok/s | Decode tok/s | Disposition |
 |---|---:|---:|---|
-| Unified layout + prequantized NVFP4 activation path (v18) | **834.67** | 12.7–12.9 | Current prefill baseline |
+| Unified layout + prequantized NVFP4 activation path (v18) | 834.67 | 12.7–12.9 | BF16-activation dense-FFN baseline |
+| Dense FFN M-fast W4A4 (v30) | **942.86** | 12.83 | Current fastest prefill; opt-in |
 | Equal-memory grouped MMQ (v19) | 795.1 | 14.30 | Decode gain, prefill regression; experimental only |
 | Native grouped CUTLASS NVFP4 (v23) | 725.57 | **14.67** | Decode gain, prefill regression; experimental only |
 | CUTLASS with reused exact-tile offset snapshot (v24) | 723.14 | 14.62 | Neutral; confirms the extra D2H was not the bottleneck |
@@ -90,6 +100,13 @@ The external comparison target is approximately 1,500 prefill tok/s and 20
 decode tok/s. Optional MMQ and CUTLASS routes remain disabled by default; they
 are diagnostic branches, not recommended launch settings. These are controlled
 receipts from two DGX Sparks, not general performance claims.
+
+The v30 result is the median of `943.507, 940.538, 929.662, 942.860,
+942.878` prompt tok/s after one warm-up, a 13.0% gain over v18. The median TTFT
+was 1,060.603 ms and median decode was 12.83 tok/s. A 968-token needle prompt
+returned the exact middle-of-prompt recovery code `SAPPHIRE-7319`; a separate
+deterministic arithmetic check returned 703 with the correct derivation. With
+profiling enabled, the 1K model pass fell from 1,198.6 ms to 1,082.8 ms.
 
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model

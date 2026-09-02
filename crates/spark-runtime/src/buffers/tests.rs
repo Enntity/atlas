@@ -9,10 +9,14 @@ fn mixed_dense_moe_sizes_for_widest_ffn() {
     cfg.num_experts = 256;
     cfg.num_experts_per_tok = 10;
     cfg.moe_intermediate_size = 1_024;
+    cfg.mlp_only_layers = vec![0, 1, 2];
 
     let sizes = BufferSizes::from_config(&cfg, 4, 4096, 16, 32);
     assert_eq!(sizes.expert_gate_out, 4 * 12_288 * 2);
     assert_eq!(sizes.expert_up_out, 4 * 12_288 * 2);
+    assert_eq!(sizes.ffn_act_a, 4 * 12_288);
+    assert_eq!(sizes.ffn_act_scale, 4 * (12_288 / 32) * 4);
+    assert_eq!(sizes.ffn_act_q8, 4 * 12_288 * 4 + (1 << 20));
 }
 use crate::gpu::mock::MockGpuBackend;
 

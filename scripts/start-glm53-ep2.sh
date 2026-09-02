@@ -37,6 +37,7 @@ NVFP4_PREQUANT_MOE="${NVFP4_PREQUANT_MOE:-0}"
 NVFP4_FUSED_SILU_QUANT="${NVFP4_FUSED_SILU_QUANT:-0}"
 NVFP4_MMQ_MOE="${NVFP4_MMQ_MOE:-0}"
 NVFP4_CUTLASS_MOE="${NVFP4_CUTLASS_MOE:-0}"
+FP4_PREFILL="${FP4_PREFILL:-0}"
 MOE_PREFILL_EXACT_TILES="${MOE_PREFILL_EXACT_TILES:-1}"
 MOE_PREFILL_MAX_LOAD_FACTOR="${MOE_PREFILL_MAX_LOAD_FACTOR:-8}"
 DUMP_EXPERT_IDS="${DUMP_EXPERT_IDS:-0}"
@@ -49,6 +50,11 @@ fi
 
 if [[ "$TP_SIZE" != "1" && "$TP_SIZE" != "2" ]]; then
   echo "ERROR: dual-Spark GLM-5.3 supports TP_SIZE=1 or overlapping TP_SIZE=2." >&2
+  exit 2
+fi
+
+if [[ "$FP4_PREFILL" != "0" && "$FP4_PREFILL" != "1" ]]; then
+  echo "ERROR: FP4_PREFILL must be 0 or 1." >&2
   exit 2
 fi
 
@@ -98,6 +104,11 @@ NCCL_ENV=(
   -e NCCL_DEBUG=WARN
 )
 
+OPTIONAL_ENV=()
+if [[ "$FP4_PREFILL" == "1" ]]; then
+  OPTIONAL_ENV=(-e ATLAS_FP4_PREFILL=1)
+fi
+
 COMMON_SERVE_ARGS=(
   serve "$MODEL"
   --world-size 2
@@ -139,6 +150,7 @@ echo "  NVFP4 MoE prequant FP4: $NVFP4_PREQUANT_MOE"
 echo "  NVFP4 fused SiLU + quant: $NVFP4_FUSED_SILU_QUANT"
 echo "  NVFP4 equal-memory grouped MMQ: $NVFP4_MMQ_MOE"
 echo "  NVFP4 grouped CUTLASS MoE: $NVFP4_CUTLASS_MOE"
+echo "  dense FFN native FP4 prefill: $FP4_PREFILL"
 echo "  MoE exact grid / fallback load factor: $MOE_PREFILL_EXACT_TILES / $MOE_PREFILL_MAX_LOAD_FACTOR"
 echo "  tool-call parser override: ${TOOL_CALL_PARSER:-model default}"
 
@@ -153,11 +165,15 @@ if (( ${#MOUNT_FLAGS[@]} )); then
 fi
 printf -v REMOTE_RDMA '%q ' "${RDMA_FLAGS[@]}"
 printf -v REMOTE_NCCL '%q ' "${NCCL_ENV[@]}"
+REMOTE_OPTIONAL_ENV=""
+if (( ${#OPTIONAL_ENV[@]} )); then
+  printf -v REMOTE_OPTIONAL_ENV '%q ' "${OPTIONAL_ENV[@]}"
+fi
 printf -v REMOTE_SERVE '%q ' "${COMMON_SERVE_ARGS[@]}"
 ssh "$SSH_TARGET" "docker run -d \
   --name atlas-glm53-ep1 --gpus all --ipc=host --network host \
   --memory $CONTAINER_MEMORY --memory-swap $CONTAINER_MEMORY \
-  $REMOTE_RDMA $REMOTE_NCCL -e RUST_LOG=info \
+  $REMOTE_RDMA $REMOTE_NCCL $REMOTE_OPTIONAL_ENV -e RUST_LOG=info \
   -e ATLAS_KDA_REGRESIDENT_PREFILL=$KDA_REGRESIDENT_PREFILL \
   -e ATLAS_UNIFIED_MOE_LAYOUT=$UNIFIED_MOE_LAYOUT \
   -e ATLAS_CUBLAS_GEMM=$CUBLAS_GEMM \
@@ -182,6 +198,7 @@ docker run -d \
   --memory-swap "$CONTAINER_MEMORY" \
   "${RDMA_FLAGS[@]}" \
   "${NCCL_ENV[@]}" \
+  "${OPTIONAL_ENV[@]}" \
   -e RUST_LOG=info \
   -e ATLAS_KDA_REGRESIDENT_PREFILL="$KDA_REGRESIDENT_PREFILL" \
   -e ATLAS_UNIFIED_MOE_LAYOUT="$UNIFIED_MOE_LAYOUT" \

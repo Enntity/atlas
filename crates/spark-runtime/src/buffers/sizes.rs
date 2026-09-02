@@ -66,7 +66,8 @@ pub struct BufferSizes {
     /// `ffn_act_q8`: q8_1_mmq activations `m*kpad*4 + 1MB` (Q4_K path).
     /// `ffn_act_a`: int8 `[m,K]` / NVFP4 packed `[m,K/2]` activations.
     /// `ffn_act_scale`: int8 `[m,K/32]*4` / NVFP4 `[m,K/16]` group scales.
-    /// 0 for MoE models (dense FFN prefill path is Dense-only).
+    /// 0 only when the model has no dense FFN layers. Hybrid dense/MoE models
+    /// (for example GLM-5) still need this scratch for `mlp_only_layers`.
     pub ffn_act_q8: usize,
     pub ffn_act_a: usize,
     pub ffn_act_scale: usize,
@@ -345,8 +346,10 @@ impl BufferSizes {
         // Dense-FFN activation-quant scratch, shared across all layers (SSOT).
         // Sized for the largest projection K = max(hidden, intermediate); the
         // dense_ffn prefill paths pass `h.max(inter)` to the requant kernels.
-        // 0 for MoE (num_experts>0) — those never take the dense_ffn MMQ path.
-        let (ffn_act_q8, ffn_act_a, ffn_act_scale) = if config.num_experts == 0 {
+        // Pure MoE models never take the dense_ffn path, but hybrid models do:
+        // GLM-5 has routed experts globally plus three `mlp_only_layers`.
+        let has_dense_ffn = config.num_experts == 0 || !config.mlp_only_layers.is_empty();
+        let (ffn_act_q8, ffn_act_a, ffn_act_scale) = if has_dense_ffn {
             let kmax = h.max(config.intermediate_size);
             let kpad = kmax.div_ceil(256) * 256;
             (
