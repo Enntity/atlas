@@ -307,7 +307,13 @@ impl Qwen3AttentionLayer {
 
         // Q_rope scatter (rope half of q_full → strided absorbed layout).
         let q_rope_direct = buffers.ssm_conv_out_f32();
-        if self.mla_q_rope_scatter_k.0 != 0 {
+        // GLM-5 full-attention layers use zero-width RoPE. Match the
+        // single-sequence MLA path and skip the empty projection entirely:
+        // launching any of these kernels with `mla_rope == 0` produces an
+        // invalid zero-width CUDA grid during concurrent decode.
+        if d.mla_rope == 0 {
+            // No RoPE slice to scatter into the absorbed-Q layout.
+        } else if self.mla_q_rope_scatter_k.0 != 0 {
             ops::mla_q_rope_scatter(
                 gpu,
                 self.mla_q_rope_scatter_k,
@@ -382,49 +388,51 @@ impl Qwen3AttentionLayer {
         // `k_rope_single` reuses `ssm_ba` — safe: `q_latent` (the prior
         // `ssm_ba` user) was fully consumed by the `wq_b` GEMV above.
         let k_rope_single = buffers.ssm_ba();
-        ops::dense_gemv(
-            gpu,
-            self.dense_gemv_k,
-            normed,
-            &mla.wkv_a_rope,
-            k_rope_single,
-            d.mla_rope,
-            d.h,
-            stream,
-        )?;
-        ops::rope_yarn(
-            gpu,
-            self.rope_yarn_k,
-            q_rope_direct,
-            k_rope_single,
-            meta.positions,
-            1,
-            d.nq,
-            1,
-            d.mla_rope,
-            d.mla_rope,
-            mla.yarn_inv_freq,
-            c.fwd.config.rope_theta as f32,
-            stream,
-        )?;
-        if self.mla_q_rope_writeback_k.0 != 0 {
-            ops::mla_q_rope_writeback(
+        if d.mla_rope > 0 {
+            ops::dense_gemv(
                 gpu,
-                self.mla_q_rope_writeback_k,
-                q_rope_direct,
-                q_absorbed_buf,
-                d.nq,
+                self.dense_gemv_k,
+                normed,
+                &mla.wkv_a_rope,
+                k_rope_single,
                 d.mla_rope,
-                d.kv_lora,
-                d.mla_cache_dim,
+                d.h,
                 stream,
             )?;
-        } else {
-            for head_idx in 0..d.nq as usize {
-                let src = q_rope_direct.offset(head_idx * mla.rope * 2);
-                let dst = q_absorbed_buf
-                    .offset((head_idx * d.mla_cache_dim as usize + mla.kv_lora_rank) * 2);
-                gpu.copy_d2d_async(src, dst, mla.rope * 2, stream)?;
+            ops::rope_yarn(
+                gpu,
+                self.rope_yarn_k,
+                q_rope_direct,
+                k_rope_single,
+                meta.positions,
+                1,
+                d.nq,
+                1,
+                d.mla_rope,
+                d.mla_rope,
+                mla.yarn_inv_freq,
+                c.fwd.config.rope_theta as f32,
+                stream,
+            )?;
+            if self.mla_q_rope_writeback_k.0 != 0 {
+                ops::mla_q_rope_writeback(
+                    gpu,
+                    self.mla_q_rope_writeback_k,
+                    q_rope_direct,
+                    q_absorbed_buf,
+                    d.nq,
+                    d.mla_rope,
+                    d.kv_lora,
+                    d.mla_cache_dim,
+                    stream,
+                )?;
+            } else {
+                for head_idx in 0..d.nq as usize {
+                    let src = q_rope_direct.offset(head_idx * mla.rope * 2);
+                    let dst = q_absorbed_buf
+                        .offset((head_idx * d.mla_cache_dim as usize + mla.kv_lora_rank) * 2);
+                    gpu.copy_d2d_async(src, dst, mla.rope * 2, stream)?;
+                }
             }
         }
 

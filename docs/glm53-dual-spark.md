@@ -63,6 +63,58 @@ Startup therefore rejects values above 2,048 rather than silently changing the
 model. KDA recurrent state is FP32 and allocated for one sequence; increasing
 concurrency multiplies that state and should follow a measured memory audit.
 
+## Guarded concurrency launch
+
+The first validated concurrency step keeps the exact per-sequence limit at
+2,048 and admits five sequence slots, for a 10,240-token aggregate admission
+envelope. At most three sequences execute in one decode batch:
+
+```bash
+MAX_SEQ_LEN=2048 \
+MAX_BATCH_SIZE=3 \
+MAX_NUM_SEQS=5 \
+./scripts/start-glm53-ep2.sh
+```
+
+This is deliberately not advertised as a 10K per-request context. Serving one
+sequence beyond 2,048 requires GLM's semantic indexer; increasing only the
+allocation limit would silently run a different attention algorithm. Batch
+sizes above one also require the v2 EP protocol; the launcher enables it on
+both ranks automatically.
+
+GLM uses zero-width RoPE in its MLA layers. The multi-sequence path must skip
+that empty projection, as the single-sequence path already does, or it launches
+a CUDA kernel with a zero-width grid. Distributed decode also keeps the EP
+protocol's exact batch width: rounding three live requests to Atlas's generic
+four-row CUDA-graph bucket wastes a full KDA/MLA pass on a dummy row.
+
+The concurrency receipt uses simultaneous streaming requests with identical
+1,000-token prompts and 96 requested output tokens. Each cell has one warm-up
+and two measured repetitions. `Aggregate window` divides all completion tokens
+by the interval from the first emitted token to the last completed stream;
+`sum receipts` sums the server-reported per-session decode rates.
+
+| Concurrent sessions | Per-session decode (median tok/s) | Sum receipts (tok/s) | Aggregate window (tok/s) | Median TTFT |
+|---:|---:|---:|---:|---:|
+| 1 | 12.573 | 12.573 | 12.706 | 1.066 s |
+| 2 | 6.625 | 13.251 | 12.820 | 1.068 s |
+| 3 | 4.575 | 13.761 | 13.136 | 1.066 s |
+
+Aggregate window throughput is monotonic through C=3, although the gain is
+still small: C=3 is 3.4% above C=1. Before exact-width EP dispatch, C=3 was
+10.571 tok/s because it executed the padded fourth row; the fix raises that
+long-run point to 13.1--13.5 tok/s depending on the decode length. The next
+decode optimization should batch GLM KDA and MLA weight reads instead of
+running most mixer projections once per sequence.
+
+Reproduce the table on the head node with:
+
+```bash
+python3 scripts/benchmark_glm53_concurrency.py \
+  --prompt-tokens 1000 --output-tokens 96 \
+  --max-concurrency 3 --repetitions 2
+```
+
 ## 1K prompt benchmark
 
 After `/health` is ready, run the included Python receipt on the head node:

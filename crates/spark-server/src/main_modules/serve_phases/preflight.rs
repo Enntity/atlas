@@ -23,6 +23,12 @@ fn glm5_dual_spark_parallelism(world: usize, tp: usize, ep: usize) -> bool {
     world == 2 && ep == 2 && matches!(tp, 1 | 2)
 }
 
+fn glm5_concurrency_supported(max_batch: usize, max_num_seqs: usize, ep_v2: bool) -> bool {
+    (1..=3).contains(&max_batch)
+        && (max_batch..=5).contains(&max_num_seqs)
+        && (max_batch == 1 || ep_v2)
+}
+
 pub(crate) fn preflight_reserve(
     args: &cli::ServeArgs,
     config: &ModelConfig,
@@ -33,9 +39,11 @@ pub(crate) fn preflight_reserve(
             args.max_seq_len <= 2048,
             "GLM-5 initial Atlas support is intentionally capped at --max-seq-len 2048: index_topk=2048 makes dense MLA exact only within this window"
         );
+        let ep_v2 = matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"));
         anyhow::ensure!(
-            args.max_batch_size == 1 && args.max_num_seqs == 1,
-            "GLM-5 initial Atlas support requires --max-batch-size 1 --max-num-seqs 1"
+            glm5_concurrency_supported(args.max_batch_size, args.max_num_seqs, ep_v2),
+            "GLM-5 dual-Spark concurrency supports --max-batch-size 1..=3 and \
+             --max-num-seqs max_batch..=5; batches above one require ATLAS_EP_PROTOCOL=v2"
         );
         anyhow::ensure!(
             !(args.speculative || args.self_speculative || args.ngram_speculative),
@@ -308,7 +316,7 @@ pub(crate) fn preflight_reserve(
 
 #[cfg(test)]
 mod tests {
-    use super::glm5_dual_spark_parallelism;
+    use super::{glm5_concurrency_supported, glm5_dual_spark_parallelism};
 
     #[test]
     fn glm5_accepts_ep_fallback_and_overlapping_tp2_only() {
@@ -317,6 +325,16 @@ mod tests {
         assert!(!glm5_dual_spark_parallelism(2, 2, 1));
         assert!(!glm5_dual_spark_parallelism(4, 2, 2));
         assert!(!glm5_dual_spark_parallelism(2, 4, 2));
+    }
+
+    #[test]
+    fn glm5_concurrency_is_bounded_and_requires_ep_v2() {
+        assert!(glm5_concurrency_supported(1, 1, false));
+        assert!(glm5_concurrency_supported(3, 5, true));
+        assert!(!glm5_concurrency_supported(2, 5, false));
+        assert!(!glm5_concurrency_supported(4, 5, true));
+        assert!(!glm5_concurrency_supported(3, 2, true));
+        assert!(!glm5_concurrency_supported(3, 6, true));
     }
 }
 

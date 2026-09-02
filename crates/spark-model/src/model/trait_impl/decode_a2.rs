@@ -38,6 +38,19 @@ fn multiseq_graphs_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_NO_DECODE_GRAPHS_MULTISEQ").as_deref() != Ok("1"))
 }
 
+/// EP peers receive the exact batch width in the decode-batch protocol, and
+/// both ranks capture/replay the same width. Keep that width exact instead of
+/// rounding 3 live GLM requests up to the generic 4-row graph bucket: the
+/// dummy fourth row otherwise runs every KDA/MLA layer and consumes 25% of
+/// the distributed decode work without producing a token.
+fn decode_dispatch_width(n: usize, glm5_distributed: bool) -> usize {
+    if glm5_distributed {
+        n
+    } else {
+        crate::traits::padded_batch_n(n)
+    }
+}
+
 impl TransformerModel {
     pub(super) fn decode_batch_dispatch(
         &self,
@@ -206,9 +219,11 @@ impl TransformerModel {
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
 
-        // Pad to the nearest captured graph size — SSOT ladder in
-        // `traits::padded_batch_n` (now includes 12 and 16 for the C-sweep).
-        let padded_n = crate::traits::padded_batch_n(n);
+        // Local serving uses the generic captured-graph ladder. Distributed
+        // EP uses the exact protocol width so C=3 does not execute a dummy
+        // fourth row on both ranks.
+        let glm5_distributed = self.comm.is_some() && self.config.model_type == "glm5_next";
+        let padded_n = decode_dispatch_width(n, glm5_distributed);
 
         // CUDA graphs for multi-sequence decode (ATLAS_DECODE_GRAPHS_MULTISEQ=1).
         //
@@ -564,5 +579,16 @@ impl TransformerModel {
         }
 
         Ok(self.decode_logits_ptr())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_dispatch_width;
+
+    #[test]
+    fn distributed_decode_keeps_exact_protocol_width() {
+        assert_eq!(decode_dispatch_width(3, true), 3);
+        assert_eq!(decode_dispatch_width(3, false), 4);
     }
 }

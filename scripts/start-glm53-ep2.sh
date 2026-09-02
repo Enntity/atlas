@@ -19,6 +19,8 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 PORT="${PORT:-8888}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
+MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-1}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 TP_SIZE="${TP_SIZE:-1}"
 OOM_GUARD_MB="${OOM_GUARD_MB:-4096}"
 MODEL_MOUNT="${MODEL_MOUNT:-}"
@@ -55,6 +57,16 @@ fi
 
 if [[ "$FP4_PREFILL" != "0" && "$FP4_PREFILL" != "1" ]]; then
   echo "ERROR: FP4_PREFILL must be 0 or 1." >&2
+  exit 2
+fi
+
+if (( MAX_BATCH_SIZE < 1 || MAX_BATCH_SIZE > 3 )); then
+  echo "ERROR: validated GLM-5 dual-Spark MAX_BATCH_SIZE range is 1..3." >&2
+  exit 2
+fi
+
+if (( MAX_NUM_SEQS < MAX_BATCH_SIZE || MAX_NUM_SEQS > 5 )); then
+  echo "ERROR: validated GLM-5 MAX_NUM_SEQS range is MAX_BATCH_SIZE..5." >&2
   exit 2
 fi
 
@@ -104,6 +116,10 @@ NCCL_ENV=(
   -e NCCL_DEBUG=WARN
 )
 
+if (( MAX_BATCH_SIZE > 1 )); then
+  NCCL_ENV+=(-e ATLAS_EP_PROTOCOL=v2)
+fi
+
 OPTIONAL_ENV=()
 if [[ "$FP4_PREFILL" == "1" ]]; then
   OPTIONAL_ENV=(-e ATLAS_FP4_PREFILL=1)
@@ -118,8 +134,8 @@ COMMON_SERVE_ARGS=(
   --master-port "$MASTER_PORT"
   --max-seq-len "$MAX_SEQ_LEN"
   --max-prefill-tokens "$MAX_SEQ_LEN"
-  --max-batch-size 1
-  --max-num-seqs 1
+  --max-batch-size "$MAX_BATCH_SIZE"
+  --max-num-seqs "$MAX_NUM_SEQS"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
   --kv-cache-dtype bf16
   --oom-guard-mb "$OOM_GUARD_MB"
@@ -134,7 +150,7 @@ fi
 echo "Atlas GLM-5.3 dual-Spark safe bring-up"
 echo "  model: $MODEL"
 echo "  image: $IMAGE"
-echo "  context/concurrency: $MAX_SEQ_LEN / 1"
+echo "  per-sequence context / active / admitted: $MAX_SEQ_LEN / $MAX_BATCH_SIZE / $MAX_NUM_SEQS"
 echo "  parallelism: TP=$TP_SIZE / EP=2 on two physical ranks"
 echo "  GPU budget: $GPU_MEM_UTIL; OOM guard: ${OOM_GUARD_MB} MiB"
 echo "  container memory ceiling: $CONTAINER_MEMORY"
