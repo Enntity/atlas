@@ -205,6 +205,111 @@ extern "C" __global__ void hc_pre(
     }
 }
 
+// Finalize an mHC pre block after a batched TF32 GEMM has produced
+// raw_mix[t,m] = dot(streams[t], hc_fn[m]).  Keeping the large MxNxK product
+// separate lets cuBLASLt reuse both operands across tokens/mix rows instead of
+// hc_pre rereading the same 16K-float highway 24 times per token.
+// Grid: (T,1,1)  Block: (256,1,1).
+extern "C" __global__ void hc_pre_from_raw_mix(
+    const float* __restrict__ streams,
+    const float* __restrict__ raw_mix,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const unsigned int hc = hc_mult;
+    const unsigned int hc_dim = hc * H;
+    const unsigned int mix_hc = (2 + hc) * hc;
+    const float* x = streams + (size_t)t * hc_dim;
+
+    __shared__ float red[HC_BLOCK];
+    __shared__ float s_rsqrt;
+    __shared__ float s_mix[HC_MAX_MIX];
+    __shared__ float s_pre[HC_MAX_MULT];
+
+    float ss = 0.f;
+    for (unsigned int k = tid; k < hc_dim; k += HC_BLOCK) {
+        float v = x[k];
+        ss += v * v;
+    }
+    red[tid] = ss;
+    __syncthreads();
+    float ssum = hc_block_reduce(red, tid);
+    if (tid == 0) s_rsqrt = rsqrtf(ssum / (float)hc_dim + norm_eps);
+    if (tid < mix_hc) s_mix[tid] = raw_mix[(size_t)t * mix_hc + tid];
+    __syncthreads();
+
+    if (tid == 0) {
+        float comb[HC_MAX_MULT * HC_MAX_MULT];
+        for (unsigned int i = 0; i < hc; ++i) {
+            float pr = s_mix[i] * s_rsqrt * hc_scale[0] + hc_base[i];
+            s_pre[i] = 1.f / (1.f + expf(-pr)) + hc_eps;
+            float po = s_mix[hc + i] * s_rsqrt * hc_scale[1] + hc_base[hc + i];
+            post_out[(size_t)t * hc + i] = 2.f * (1.f / (1.f + expf(-po)));
+        }
+        for (unsigned int i = 0; i < hc; ++i)
+            for (unsigned int j = 0; j < hc; ++j)
+                comb[i * hc + j] = s_mix[2 * hc + i * hc + j] * s_rsqrt
+                    * hc_scale[2] + hc_base[2 * hc + i * hc + j];
+        for (unsigned int i = 0; i < hc; ++i) {
+            float mx = -1e30f;
+            for (unsigned int j = 0; j < hc; ++j) mx = fmaxf(mx, comb[i * hc + j]);
+            float sum = 0.f;
+            for (unsigned int j = 0; j < hc; ++j) {
+                float e = expf(comb[i * hc + j] - mx);
+                comb[i * hc + j] = e;
+                sum += e;
+            }
+            for (unsigned int j = 0; j < hc; ++j)
+                comb[i * hc + j] = comb[i * hc + j] / sum + hc_eps;
+        }
+        for (unsigned int j = 0; j < hc; ++j) {
+            float c = hc_eps;
+            for (unsigned int i = 0; i < hc; ++i) c += comb[i * hc + j];
+            for (unsigned int i = 0; i < hc; ++i) comb[i * hc + j] /= c;
+        }
+        for (unsigned int it = 0; it + 1 < sinkhorn_iters; ++it) {
+            for (unsigned int i = 0; i < hc; ++i) {
+                float r = hc_eps;
+                for (unsigned int j = 0; j < hc; ++j) r += comb[i * hc + j];
+                for (unsigned int j = 0; j < hc; ++j) comb[i * hc + j] /= r;
+            }
+            for (unsigned int j = 0; j < hc; ++j) {
+                float c = hc_eps;
+                for (unsigned int i = 0; i < hc; ++i) c += comb[i * hc + j];
+                for (unsigned int i = 0; i < hc; ++i) comb[i * hc + j] /= c;
+            }
+        }
+        // Atlas's FP32 highway relies on an exact final column projection.
+        for (unsigned int j = 0; j < hc; ++j) {
+            float c = 0.f;
+            for (unsigned int i = 0; i < hc; ++i) c += comb[i * hc + j];
+            float inv = (c > 0.f) ? (1.f / c) : 0.f;
+            for (unsigned int i = 0; i < hc; ++i) comb[i * hc + j] *= inv;
+        }
+        for (unsigned int i = 0; i < hc; ++i)
+            for (unsigned int j = 0; j < hc; ++j)
+                comb_out[(size_t)t * hc * hc + i * hc + j] = comb[i * hc + j];
+    }
+    __syncthreads();
+
+    for (unsigned int d = tid; d < H; d += HC_BLOCK) {
+        float acc = 0.f;
+        for (unsigned int i = 0; i < hc; ++i) acc += s_pre[i] * x[i * H + d];
+        y_out[(size_t)t * H + d] = __float2bfloat16(acc);
+    }
+}
+
 // ── hc_post ──
 // out[t,j,d] = post[t,j]*block_out[t,d] + sum_i comb[t,i,j]*residual[t,i,d].
 // `out` may alias `residual` (all hc residual values are read before write).

@@ -423,6 +423,25 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+        } else if self.nvfp4_mmq_layout {
+            prof!("exp_mmq", {
+                self.dispatch_nvfp4_mmq_decode(
+                    ctx,
+                    expert_input,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_down_out,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    shared_out,
+                    indices_dev,
+                    h,
+                    inter,
+                    top_k,
+                    single_seq_decode,
+                    stream,
+                )
+            })?;
         } else if self.use_t_layout_for_decode() {
             prof!("exp_unified_t", {
                 self.dispatch_unified_t_decode(

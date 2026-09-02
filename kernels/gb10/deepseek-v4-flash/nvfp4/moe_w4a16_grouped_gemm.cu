@@ -762,6 +762,230 @@ extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_e8m0(
         expert_offsets, sorted_token_ids, num_experts, N, K);
 }
 
+// M=32 specialization for sparse routed-expert down projections.  GLM-5.3
+// Flash assigns only ~28 rows/local expert on average for a 1K-token prefill,
+// so the M=64 kernel spends close to half of each CTA on predicated rows.  Two
+// warps cover exactly 32 rows while preserving the proven N=128/K=64 MMA and
+// dequantization layout above.  This is a separate opt-in entry so other model
+// families and decode remain on the established M=64 path.
+__device__ __forceinline__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_m32_impl(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ B_packed_ptrs,
+    const unsigned long long* __restrict__ B_scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K
+) {
+    constexpr unsigned int M_TILE_32 = 32;
+    const unsigned int expert_id = blockIdx.z;
+    if (expert_id >= num_experts) return;
+
+    const int m_start = expert_offsets[expert_id];
+    const int m_end = expert_offsets[expert_id + 1];
+    const int M_expert = m_end - m_start;
+    if (M_expert <= 0) return;
+
+    const int cta_m_local = blockIdx.y * M_TILE_32;
+    if (cta_m_local >= M_expert) return;
+
+    const unsigned int cta_m = m_start + cta_m_local;
+    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
+    const unsigned char* B_expert =
+        (const unsigned char*)B_packed_ptrs[expert_id];
+    const unsigned char* S_expert =
+        (const unsigned char*)B_scale_ptrs[expert_id];
+    const float scale2 = scale2_vals[expert_id];
+    if (B_expert == 0) return;
+
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ __nv_bfloat16 smem_A_m32[2][M_TILE_32][K_STEP_T64 + PAD_T64];
+    __shared__ unsigned char smem_Bp_m32[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
+    __shared__ unsigned char smem_Bs_m32[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
+    __shared__ unsigned char smem_B_fp8_m32[N_TILE_LG][K_STEP_T64 + 16];
+    __shared__ float smem_LUT_m32[16];
+    __shared__ int smem_tok_m32[M_TILE_32];
+
+    if (threadIdx.x < 16) smem_LUT_m32[threadIdx.x] = E2M1_LUT_MOE[threadIdx.x];
+    if (threadIdx.x < M_TILE_32) {
+        const int local_row = threadIdx.x;
+        if (sorted_token_ids && (cta_m_local + local_row) < (unsigned int)M_expert)
+            smem_tok_m32[local_row] = sorted_token_ids[cta_m + local_row];
+        else
+            smem_tok_m32[local_row] = (int)(cta_m + local_row);
+    }
+    __syncthreads();
+
+    float acc[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    const unsigned int ast_m32 = K_STEP_T64 + PAD_T64;
+    const unsigned int M_eff = (unsigned int)M_expert;
+
+    // 64 threads: four rounds cover 32 A rows and all 32 packed-B K rows.
+    #define M32_ISSUE_LOADS(buf, kb) do { \
+        { \
+            unsigned int a_row_base = threadIdx.x >> 3; \
+            unsigned int a_col = (threadIdx.x & 7) << 3; \
+            unsigned int gc = (kb) + a_col; \
+            _Pragma("unroll") \
+            for (int rnd = 0; rnd < 4; rnd++) { \
+                unsigned int row = rnd * 8 + a_row_base; \
+                bool valid = (cta_m_local + row) < M_eff && (gc + 7 < K); \
+                unsigned int a_row = (unsigned int)smem_tok_m32[row]; \
+                moe_cp_async_pred_16(&smem_A_m32[(buf)][row][a_col], \
+                    &A[(unsigned long long)a_row * K + gc], valid); \
+            } \
+        } \
+        { \
+            unsigned int kp = threadIdx.x >> 3; \
+            unsigned int ns = (threadIdx.x & 7) << 4; \
+            unsigned int gns = cta_n + ns; \
+            _Pragma("unroll") \
+            for (int rnd = 0; rnd < 4; rnd++) { \
+                unsigned int kp_cur = rnd * 8 + kp; \
+                unsigned int gke = (kb) + (kp_cur << 1); \
+                moe_cp_async_pred_16(&smem_Bp_m32[(buf)][kp_cur][ns], \
+                    &B_expert[(unsigned long long)(gke >> 1) * N + gns], \
+                    (gke + 1 < K) && (gns + 15 < N)); \
+                if (kp_cur < K_STEP_T64 / GROUP_SIZE) { \
+                    unsigned int sg = (kb) / GROUP_SIZE + kp_cur; \
+                    moe_cp_async_pred_16(&smem_Bs_m32[(buf)][kp_cur][ns], \
+                        &S_expert[(unsigned long long)sg * N + gns], \
+                        (gns + 15 < N)); \
+                } \
+            } \
+        } \
+    } while(0)
+
+    // Each of 64 threads dequantizes two N columns to retain the exact M=64
+    // B tile and MMA layout.
+    #define M32_DEQUANT(buf) do { \
+        _Pragma("unroll") \
+        for (int nr = 0; nr < 2; nr++) { \
+            unsigned int my_n = threadIdx.x + nr * 64; \
+            float sv[K_STEP_T64 / GROUP_SIZE]; \
+            _Pragma("unroll") \
+            for (int g = 0; g < K_STEP_T64 / GROUP_SIZE; g++) \
+                sv[g] = mx_block_scale<false>(smem_Bs_m32[(buf)][g][my_n], scale2); \
+            _Pragma("unroll") \
+            for (int kp = 0; kp < K_STEP_T64 / 2; kp++) { \
+                float s = sv[kp / (GROUP_SIZE / 2)]; \
+                unsigned char packed = smem_Bp_m32[(buf)][kp][my_n]; \
+                float lo = smem_LUT_m32[packed & 0xF] * s; \
+                float hi = smem_LUT_m32[packed >> 4] * s; \
+                unsigned short fp8_pair; \
+                asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
+                             : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+                *(unsigned short*)&smem_B_fp8_m32[my_n][kp * 2] = fp8_pair; \
+            } \
+        } \
+    } while(0)
+
+    #define M32_COMPUTE_MMA(a_buf) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A_m32[(a_buf)]; \
+        unsigned int fr0 = warp_m_offset + group_id, fr1 = fr0 + 8; \
+        unsigned int a0 = moe_bf16x4_to_e4m3x4(&sA[fr0 * ast_m32 + tid * 4]); \
+        unsigned int a1 = moe_bf16x4_to_e4m3x4(&sA[fr1 * ast_m32 + tid * 4]); \
+        unsigned int a2 = moe_bf16x4_to_e4m3x4(&sA[fr0 * ast_m32 + 16 + tid * 4]); \
+        unsigned int a3 = moe_bf16x4_to_e4m3x4(&sA[fr1 * ast_m32 + 16 + tid * 4]); \
+        _Pragma("unroll") \
+        for (int nt = 0; nt < 16; nt++) { \
+            unsigned int nc = nt * 8 + group_id; \
+            unsigned int b0 = *(const unsigned int*)&smem_B_fp8_m32[nc][4 * tid]; \
+            unsigned int b1 = *(const unsigned int*)&smem_B_fp8_m32[nc][16 + 4 * tid]; \
+            asm volatile( \
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+                 "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3])); \
+        } \
+        unsigned int a4 = moe_bf16x4_to_e4m3x4(&sA[fr0 * ast_m32 + 32 + tid * 4]); \
+        unsigned int a5 = moe_bf16x4_to_e4m3x4(&sA[fr1 * ast_m32 + 32 + tid * 4]); \
+        unsigned int a6 = moe_bf16x4_to_e4m3x4(&sA[fr0 * ast_m32 + 48 + tid * 4]); \
+        unsigned int a7 = moe_bf16x4_to_e4m3x4(&sA[fr1 * ast_m32 + 48 + tid * 4]); \
+        _Pragma("unroll") \
+        for (int nt = 0; nt < 16; nt++) { \
+            unsigned int nc = nt * 8 + group_id; \
+            unsigned int b0 = *(const unsigned int*)&smem_B_fp8_m32[nc][32 + 4 * tid]; \
+            unsigned int b1 = *(const unsigned int*)&smem_B_fp8_m32[nc][48 + 4 * tid]; \
+            asm volatile( \
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
+                :"r"(a4),"r"(a5),"r"(a6),"r"(a7),"r"(b0),"r"(b1), \
+                 "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3])); \
+        } \
+    } while(0)
+
+    M32_ISSUE_LOADS(0, 0);
+    moe_cp_async_commit();
+    moe_cp_async_wait_all();
+    __syncthreads();
+    M32_DEQUANT(0);
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = K_STEP_T64; k_base < K; k_base += K_STEP_T64) {
+        int nxt = 1 - cur;
+        M32_ISSUE_LOADS(nxt, k_base);
+        moe_cp_async_commit();
+        M32_COMPUTE_MMA(cur);
+        moe_cp_async_wait_all();
+        __syncthreads();
+        M32_DEQUANT(nxt);
+        __syncthreads();
+        cur = nxt;
+    }
+    M32_COMPUTE_MMA(cur);
+
+    #undef M32_ISSUE_LOADS
+    #undef M32_DEQUANT
+    #undef M32_COMPUTE_MMA
+
+    #pragma unroll
+    for (int nt = 0; nt < 16; nt++) {
+        unsigned int c0 = cta_n + nt * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + warp_m_offset + group_id;
+        unsigned int r1 = r0 + 8;
+        bool r0v = (int)(warp_m_offset + group_id + cta_m_local) < M_expert;
+        bool r1v = (int)(warp_m_offset + group_id + 8 + cta_m_local) < M_expert;
+        if (r0v && c0 < N) C[r0 * N + c0] = __float2bfloat16(acc[nt][0]);
+        if (r0v && c1 < N) C[r0 * N + c1] = __float2bfloat16(acc[nt][1]);
+        if (r1v && c0 < N) C[r1 * N + c0] = __float2bfloat16(acc[nt][2]);
+        if (r1v && c1 < N) C[r1 * N + c1] = __float2bfloat16(acc[nt][3]);
+    }
+}
+
+extern "C" __global__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_m32(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ B_packed_ptrs,
+    const unsigned long long* __restrict__ B_scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts, unsigned int N, unsigned int K
+) {
+    moe_w4a16_grouped_gemm_ptrtable_t_k64_m32_impl(
+        A, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
+        expert_offsets, sorted_token_ids, num_experts, N, K);
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // K64 fused gate+up MoE GEMM — same K64 pipeline as down GEMM above.
 //
@@ -1490,5 +1714,224 @@ extern "C" __global__ void moe_fp8_grouped_gemm_ptrtable_t(
         if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
         if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
         if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+    }
+}
+
+// Pre-quantized native-FP4 grouped GEMM for sparse MoE prefill.
+//
+// Unlike the older experimental W4A4 MoE arm, A is quantized exactly once by
+// the common `quantize_bf16_to_nvfp4` kernel.  Every output-column CTA then
+// loads the compact E2M1 values/scales instead of repeating BF16->FP4
+// quantization.  B remains in Atlas's shared transposed pointer-table layout,
+// so this adds no persistent weight copy.  Gate and up use two launches with
+// the same pre-quantized A; down reuses the entry after quantizing SiLU output.
+extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64(
+    const unsigned char* __restrict__ A_packed,
+    const unsigned char* __restrict__ A_scale,
+    const unsigned long long* __restrict__ B_packed_ptrs,
+    const unsigned long long* __restrict__ B_scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int expert_id = blockIdx.z;
+    if (expert_id >= num_experts) return;
+
+    const int m_start = expert_offsets[expert_id];
+    const int m_end = expert_offsets[expert_id + 1];
+    const int M_expert = m_end - m_start;
+    if (M_expert <= 0) return;
+
+    const int cta_m_local = blockIdx.y * M_TILE;
+    if (cta_m_local >= M_expert) return;
+
+    const unsigned int cta_m = m_start + cta_m_local;
+    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
+    const unsigned char* B_expert =
+        (const unsigned char*)B_packed_ptrs[expert_id];
+    const unsigned char* S_expert =
+        (const unsigned char*)B_scale_ptrs[expert_id];
+    const float scale2 = scale2_vals[expert_id];
+    if (B_expert == 0) return;
+
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    // A is already compact FP4. Keep each row 16-byte aligned because the
+    // loader issues 16-byte cp.async operations for both halves of the row.
+    // (A 36-byte stride faults as CUDA_ERROR_MISALIGNED_ADDRESS on row 1.)
+    __shared__ unsigned char smem_Ap_pq[2][M_TILE][K_STEP_T64 / 2 + 16];
+    __shared__ unsigned char smem_As_pq[2][M_TILE][K_STEP_T64 / GROUP_SIZE];
+    // B checkpoint layout is [K/2,N]; load it coalesced, then transpose the
+    // 32-byte K run required by the native block-scaled MMA.
+    __shared__ unsigned char smem_BpT_pq[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
+    __shared__ unsigned char smem_Bp_pq[N_TILE_LG][K_STEP_T64 / 2 + 16];
+    __shared__ unsigned char smem_Bs_pq[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
+    __shared__ int smem_tok_pq[M_TILE];
+
+    if (threadIdx.x < M_TILE) {
+        const int local_row = threadIdx.x;
+        if (sorted_token_ids && (cta_m_local + local_row) < (unsigned int)M_expert)
+            smem_tok_pq[local_row] = sorted_token_ids[cta_m + local_row];
+        else
+            smem_tok_pq[local_row] = (int)(cta_m + local_row);
+    }
+    __syncthreads();
+
+    float acc[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    const unsigned int M_eff = (unsigned int)M_expert;
+    const unsigned int num_groups = K / GROUP_SIZE;
+
+    #define PQ4_ISSUE_LOADS(buf, kb) do { \
+        { \
+            /* 128 threads x 16 B = 64 rows x 32 packed K bytes. */ \
+            unsigned int row = threadIdx.x >> 1; \
+            unsigned int col = (threadIdx.x & 1) << 4; \
+            bool valid = (cta_m_local + row) < M_eff && ((kb) + col * 2 + 31 < K); \
+            unsigned int a_row = (unsigned int)smem_tok_pq[row]; \
+            moe_cp_async_pred_16(&smem_Ap_pq[(buf)][row][col], \
+                &A_packed[(unsigned long long)a_row * (K / 2) + (kb) / 2 + col], \
+                valid); \
+        } \
+        { \
+            /* 256 scale bytes: two jobs/thread. */ \
+            _Pragma("unroll") \
+            for (int job = 0; job < 2; job++) { \
+                unsigned int jid = threadIdx.x + job * 128; \
+                unsigned int row = jid >> 2; \
+                unsigned int grp = jid & 3; \
+                bool valid = (cta_m_local + row) < M_eff; \
+                unsigned int a_row = (unsigned int)smem_tok_pq[row]; \
+                smem_As_pq[(buf)][row][grp] = valid \
+                    ? A_scale[(unsigned long long)a_row * (K / GROUP_SIZE) \
+                        + (kb) / GROUP_SIZE + grp] \
+                    : 0; \
+            } \
+        } \
+        { \
+            unsigned int kp = threadIdx.x >> 3; \
+            unsigned int ns = (threadIdx.x & 7) << 4; \
+            unsigned int gns = cta_n + ns; \
+            _Pragma("unroll") \
+            for (int rnd = 0; rnd < 2; rnd++) { \
+                unsigned int kp_cur = rnd * 16 + kp; \
+                unsigned int gke = (kb) + (kp_cur << 1); \
+                moe_cp_async_pred_16(&smem_BpT_pq[(buf)][kp_cur][ns], \
+                    &B_expert[(unsigned long long)(gke >> 1) * N + gns], \
+                    (gke + 1 < K) && (gns + 15 < N)); \
+            } \
+        } \
+        { \
+            unsigned int g = threadIdx.x >> 5; \
+            unsigned int nn = threadIdx.x & 31; \
+            unsigned int sg = (kb) / GROUP_SIZE + g; \
+            _Pragma("unroll") \
+            for (int rnd = 0; rnd < 4; rnd++) { \
+                unsigned int n_cur = rnd * 32 + nn; \
+                unsigned int gns = cta_n + n_cur; \
+                bool valid = (gns < N) && (sg < num_groups); \
+                smem_Bs_pq[(buf)][g][n_cur] = valid \
+                    ? S_expert[(unsigned long long)sg * N + gns] : 0; \
+            } \
+        } \
+    } while(0)
+
+    #define PQ4_TRANSPOSE(buf) do { \
+        unsigned int my_n = threadIdx.x; \
+        _Pragma("unroll") \
+        for (int q = 0; q < (K_STEP_T64 / 2) / 4; q++) { \
+            unsigned int w = (unsigned int)smem_BpT_pq[(buf)][q * 4 + 0][my_n] \
+                | ((unsigned int)smem_BpT_pq[(buf)][q * 4 + 1][my_n] << 8) \
+                | ((unsigned int)smem_BpT_pq[(buf)][q * 4 + 2][my_n] << 16) \
+                | ((unsigned int)smem_BpT_pq[(buf)][q * 4 + 3][my_n] << 24); \
+            *(unsigned int*)&smem_Bp_pq[my_n][q * 4] = w; \
+        } \
+    } while(0)
+
+    #define PQ4_FRAG(P, ROW, KK) (*(const unsigned int*)&(P)[(ROW)][(KK) / 2])
+    #define PQ4_COMPUTE_MMA(a_buf, b_buf) do { \
+        unsigned int ra = warp_m_offset + group_id; \
+        unsigned int a0 = PQ4_FRAG(smem_Ap_pq[(a_buf)], ra,     tid * 8); \
+        unsigned int a1 = PQ4_FRAG(smem_Ap_pq[(a_buf)], ra + 8, tid * 8); \
+        unsigned int a2 = PQ4_FRAG(smem_Ap_pq[(a_buf)], ra,     32 + tid * 8); \
+        unsigned int a3 = PQ4_FRAG(smem_Ap_pq[(a_buf)], ra + 8, 32 + tid * 8); \
+        unsigned int sfa_m = (lane_id & 1) * 8 + (lane_id >> 2); \
+        unsigned int sfa = (unsigned int)smem_As_pq[(a_buf)][warp_m_offset + sfa_m][0] \
+            | ((unsigned int)smem_As_pq[(a_buf)][warp_m_offset + sfa_m][1] << 8) \
+            | ((unsigned int)smem_As_pq[(a_buf)][warp_m_offset + sfa_m][2] << 16) \
+            | ((unsigned int)smem_As_pq[(a_buf)][warp_m_offset + sfa_m][3] << 24); \
+        _Pragma("unroll") \
+        for (int nt = 0; nt < 16; nt++) { \
+            unsigned int nc = nt * 8 + group_id; \
+            unsigned int b0 = PQ4_FRAG(smem_Bp_pq, nc, tid * 8); \
+            unsigned int b1 = PQ4_FRAG(smem_Bp_pq, nc, 32 + tid * 8); \
+            unsigned int sfn = nt * 8 + (lane_id >> 2); \
+            unsigned int sfb = (unsigned int)smem_Bs_pq[(b_buf)][0][sfn] \
+                | ((unsigned int)smem_Bs_pq[(b_buf)][1][sfn] << 8) \
+                | ((unsigned int)smem_Bs_pq[(b_buf)][2][sfn] << 16) \
+                | ((unsigned int)smem_Bs_pq[(b_buf)][3][sfn] << 24); \
+            unsigned short bidA = 0, tidA_ = 0, bidB = 0, tidB_ = 0; \
+            asm volatile( \
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13}," \
+                "{%14},{%15,%16},{%17},{%18,%19};" \
+                :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3]) \
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1), \
+                 "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3]), \
+                 "r"(sfa),"h"(bidA),"h"(tidA_),"r"(sfb),"h"(bidB),"h"(tidB_)); \
+        } \
+    } while(0)
+
+    PQ4_ISSUE_LOADS(0, 0);
+    moe_cp_async_commit();
+    moe_cp_async_wait_all();
+    __syncthreads();
+    PQ4_TRANSPOSE(0);
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = K_STEP_T64; k_base < K; k_base += K_STEP_T64) {
+        int nxt = 1 - cur;
+        PQ4_ISSUE_LOADS(nxt, k_base);
+        moe_cp_async_commit();
+        PQ4_COMPUTE_MMA(cur, cur);
+        moe_cp_async_wait_all();
+        __syncthreads();
+        PQ4_TRANSPOSE(nxt);
+        __syncthreads();
+        cur = nxt;
+    }
+    PQ4_COMPUTE_MMA(cur, cur);
+
+    #undef PQ4_ISSUE_LOADS
+    #undef PQ4_TRANSPOSE
+    #undef PQ4_FRAG
+    #undef PQ4_COMPUTE_MMA
+
+    #pragma unroll
+    for (int nt = 0; nt < 16; nt++) {
+        unsigned int c0 = cta_n + nt * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + warp_m_offset + group_id;
+        unsigned int r1 = r0 + 8;
+        bool r0v = (int)(warp_m_offset + group_id + cta_m_local) < M_expert;
+        bool r1v = (int)(warp_m_offset + group_id + 8 + cta_m_local) < M_expert;
+        if (r0v && c0 < N) C[r0 * N + c0] = __float2bfloat16(acc[nt][0] * scale2);
+        if (r0v && c1 < N) C[r0 * N + c1] = __float2bfloat16(acc[nt][1] * scale2);
+        if (r1v && c0 < N) C[r1 * N + c0] = __float2bfloat16(acc[nt][2] * scale2);
+        if (r1v && c1 < N) C[r1 * N + c1] = __float2bfloat16(acc[nt][3] * scale2);
     }
 }

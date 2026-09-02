@@ -1,8 +1,10 @@
 # GLM-5.3-Flash-NVFP4 on two DGX Sparks
 
 Atlas support targets the exact `LibertAIDAI/GLM-5.3-Flash-NVFP4` checkpoint and
-uses pure expert parallelism (`TP=1`, `EP=2`). Routed experts are split between
-the two ranks; attention, KDA, shared-expert, and dense weights are replicated.
+uses expert parallelism (`EP=2`). Set `TP_SIZE=2` to overlap tensor parallelism
+on the same two physical ranks: routed experts remain EP-sharded while MLA and
+KDA heads are split between the Sparks and their row projections are summed
+once per mixer. `TP_SIZE=1` preserves the original pure-EP fallback.
 
 ## Safe first launch
 
@@ -22,6 +24,7 @@ HEAD_IP=169.254.179.82 \
 WORKER_IP=169.254.128.113 \
 SSH_TARGET=mangokid@192.168.8.187 \
 MODEL=/var/tmp/models/glm53-flash-nvfp4 \
+TP_SIZE=2 \
 ./scripts/start-glm53-ep2.sh
 ```
 
@@ -33,7 +36,15 @@ The launcher intentionally starts with:
 - a 92% total GPU-memory budget and 4 GiB OOM guard;
 - a 114 GiB container memory ceiling, leaving host headroom if loading runs away;
 - no speculative decoding or prefix cache;
+- cuBLASLt BF16 projection dispatch for checkpoint-native MLA matrices;
 - the worker rank first and no automatic restart policy.
+
+The KDA register-resident prefill path, unified MoE layout, and cuBLASLt
+projection dispatch are enabled by default. Their diagnostic fallbacks are
+`KDA_REGRESIDENT_PREFILL=0`, `UNIFIED_MOE_LAYOUT=0`, and `CUBLAS_GEMM=0`.
+KDA Q/K/V and row-parallel output projections keep independent decode-native
+NVFP4 weights plus transposed M=128 prefill twins. The output twins add about
+0.3 GiB per rank across all 34 KDA layers without changing decode numerics.
 
 This checkpoint declares 1M model context, but initial Atlas support does not.
 GLM's full-attention layers select 2,048 tokens using an indexer. Atlas currently
@@ -63,8 +74,22 @@ layers were sending single-token MoE work through the prefill dispatcher. After
 routing decode through Atlas's single-token MoE path, the same safe launch and
 1,000-token prompt produced 5.873 seconds time-to-first-token (170.26 prompt
 tokens/s) and 9.42 decode tokens/s. A separate 100-token, 64-output-token run
-repeated at 9.52 decode tokens/s. These are bring-up receipts from two DGX
-Sparks, not general performance claims.
+repeated at 9.52 decode tokens/s.
+
+The optimization campaign uses one warm-up followed by five measured 1,000-token
+requests with profiling disabled. Medians on the same two Sparks are:
+
+| Atlas path | Prefill tok/s | Decode tok/s | Disposition |
+|---|---:|---:|---|
+| Unified layout + prequantized NVFP4 activation path (v18) | **834.67** | 12.7–12.9 | Current prefill baseline |
+| Equal-memory grouped MMQ (v19) | 795.1 | 14.30 | Decode gain, prefill regression; experimental only |
+| Native grouped CUTLASS NVFP4 (v23) | 725.57 | **14.67** | Decode gain, prefill regression; experimental only |
+| CUTLASS with reused exact-tile offset snapshot (v24) | 723.14 | 14.62 | Neutral; confirms the extra D2H was not the bottleneck |
+
+The external comparison target is approximately 1,500 prefill tok/s and 20
+decode tok/s. Optional MMQ and CUTLASS routes remain disabled by default; they
+are diagnostic branches, not recommended launch settings. These are controlled
+receipts from two DGX Sparks, not general performance claims.
 
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model

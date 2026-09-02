@@ -1,35 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Routed grouped-GEMM phase of `MoeLayer::forward_prefill`.
-//!
-//! Hoisted from `forward_prefill.rs` to keep that file under the 500 LoC
-//! cap. The single entry point [`MoeLayer::run_routed_grouped_gemm`]
-//! mirrors the original block 1:1 — same control flow, same kernel
-//! launches, same buffer wiring. Covers steps 4-6 of the prefill
-//! pipeline: grid sizing, grouped gate+up GEMM, SiLU, grouped down GEMM.
+//! Covers grid sizing, grouped gate/up GEMM, SiLU, and grouped down GEMM.
 
 use super::*;
 
-/// Whether the single-launch CUTLASS grouped NVFP4 gate_up path is enabled
-/// (`ATLAS_HOLO_MOE_GROUPED_CUTLASS=1`). Off by default; falls back to the
-/// hand-rolled fused FP4/FP8 grouped kernels when unset.
+/// Whether the single-launch CUTLASS grouped NVFP4 path is enabled. The
+/// model-neutral name is used by new integrations; retain the Holo variable
+/// as a compatibility alias for existing recipes.
 fn grouped_cutlass_gate_up_enabled() -> bool {
-    std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS")
+    env_flag("ATLAS_MOE_GROUPED_CUTLASS") || env_flag("ATLAS_HOLO_MOE_GROUPED_CUTLASS")
+}
+
+fn grouped_cutlass_down_enabled() -> bool {
+    env_flag("ATLAS_MOE_GROUPED_CUTLASS") || env_flag("ATLAS_HOLO_MOE_GROUPED_DOWN")
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
         .ok()
-        .as_deref()
-        == Some("1")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 impl MoeLayer {
     /// Routed-expert grouped-GEMM path: upper-bound grid sizing → grouped
     /// gate+up GEMM → SiLU+mul → grouped down GEMM.
     ///
-    /// Writes the routed expert outputs into `ctx.buffers.expert_down_out()`.
-    /// `t0` carries the running profile timer so per-step timing output
-    /// matches the original inline pipeline exactly.
+    /// Writes routed expert outputs into `ctx.buffers.expert_down_out()`.
     #[allow(clippy::too_many_arguments)]
-    // `cutlass_grouped_host` is guarded by `.is_some()` in the enclosing `if`;
-    // `.expect` after that is intentional.
     #[allow(clippy::unnecessary_unwrap)]
     pub(super) fn run_routed_grouped_gemm(
         &self,
@@ -87,17 +85,27 @@ impl MoeLayer {
             Some("1") => true,
             _ => self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4,
         } && !ctx.graph_capture;
+        // Keep the host copy when exact sizing already paid for it. The
+        // CUTLASS grouped path also needs these offsets to build its problem
+        // list; copying them again would introduce a second stream-draining
+        // D2H boundary in every MoE layer.
+        let mut exact_eoff: Option<Vec<i32>> = None;
         let max_m_tiles = if exact_tiles {
             let mut offsets = vec![0u8; (ne + 1) * 4];
             ctx.gpu
                 .copy_d2h_on_stream(expert_offsets, &mut offsets, stream)?;
+            let eoff: Vec<i32> = offsets
+                .chunks_exact(4)
+                .map(|raw| i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+                .collect();
             let mut prev = 0u32;
             let mut max_rows = 0u32;
-            for raw in offsets.chunks_exact(4).skip(1) {
-                let cur = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            for &cur in eoff.iter().skip(1) {
+                let cur = cur as u32;
                 max_rows = max_rows.max(cur.saturating_sub(prev));
                 prev = cur;
             }
+            exact_eoff = Some(eoff);
             max_rows.div_ceil(64).max(1).min(worst_case_m_tiles)
         } else {
             std::env::var("ATLAS_MOE_PREFILL_MAX_LOAD_FACTOR")
@@ -131,17 +139,7 @@ impl MoeLayer {
         // dense token_to_perm over exactly [0, total_expanded), and grouped
         // kernels write every row that can be referenced by unpermute_reduce.
         // Skipping the memset removes ~138 MB/layer of scratch clears on Holo.
-        let force_zero = std::env::var("ATLAS_MOE_PREFILL_ZERO").ok().as_deref() == Some("1");
-        if ctx.comm.is_some() || force_zero {
-            let gate_bytes = total_expanded as usize * inter as usize * 2;
-            let up_bytes = gate_bytes;
-            let down_bytes = total_expanded as usize * h as usize * 2;
-            ctx.gpu
-                .memset_async(expert_gate_out, 0, gate_bytes, stream)?;
-            ctx.gpu.memset_async(expert_up_out, 0, up_bytes, stream)?;
-            ctx.gpu
-                .memset_async(ctx.buffers.expert_down_out(), 0, down_bytes, stream)?;
-        }
+        self.prepare_ep_prefill_outputs(total_expanded, inter, h, ctx, stream)?;
         // Host expert_offsets from the CUTLASS gate_up, reused by down to skip
         // a second D2H + host-blocking synchronize.
         let mut cutlass_eoff: Option<Vec<i32>> = None;
@@ -151,7 +149,22 @@ impl MoeLayer {
             // transposed ones, so it must be reachable when gate_ptrs_t is
             // absent — that is exactly the originals-only layout a
             // checkpoint-native model runs in.
-            if grouped_cutlass_gate_up_enabled() && self.cutlass_grouped_host.is_some() {
+            if self.nvfp4_mmq_layout {
+                self.run_nvfp4_mmq_gate_up(
+                    expert_input,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    total_expanded,
+                    h,
+                    inter,
+                    num_experts,
+                    max_m_tiles,
+                    ctx,
+                    stream,
+                )?;
+            } else if grouped_cutlass_gate_up_enabled() && self.cutlass_grouped_host.is_some() {
                 // ── SINGLE-LAUNCH CUTLASS grouped NVFP4 gate_up
                 // (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1) ── one
                 // GemmUniversalMode::kGrouped launch over all active experts in
@@ -165,6 +178,7 @@ impl MoeLayer {
                 // silu+down+unpermute are unchanged.
                 cutlass_eoff = Some(ops::moe_grouped_gate_up_cutlass(
                     ctx.gpu,
+                    exact_eoff.as_deref(),
                     self.cutlass_grouped_host.as_ref().expect("checked above"),
                     expert_input,
                     sorted_token_ids,
@@ -203,6 +217,23 @@ impl MoeLayer {
                         inter,
                         h,
                         max_m_tiles,
+                        stream,
+                    )?;
+                } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
+                    self.prequant_fp4_gate_up(
+                        expert_input,
+                        gp,
+                        up,
+                        expert_gate_out,
+                        expert_up_out,
+                        expert_offsets,
+                        sorted_token_ids,
+                        n,
+                        h,
+                        inter,
+                        num_experts,
+                        max_m_tiles,
+                        ctx,
                         stream,
                     )?;
                 } else if self.gateup_fp4 && self.moe_fused_gate_up_t_k64_fp4.0 != 0 {
@@ -336,6 +367,25 @@ impl MoeLayer {
         // 6. Activation+mul for routed experts + grouped down GEMM (K64 pipelined).
         let expert_down_out = ctx.buffers.expert_down_out();
         if max_m_tiles > 0 {
+            if self.nvfp4_mmq_layout {
+                self.run_nvfp4_mmq_silu_down(
+                    expert_input,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_down_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    total_expanded,
+                    h,
+                    inter,
+                    num_experts,
+                    max_m_tiles,
+                    ctx,
+                    stream,
+                )?;
+                prof_step!("grouped_silu_down");
+                return Ok(());
+            }
             // Feature-1: fold the routed-expert gate/up_proj LoRA deltas onto the
             // sorted `expert_gate_out`/`expert_up_out` BEFORE `silu_mul` consumes
             // them in place (x = token-major `expert_input`, gathered per sorted
@@ -351,15 +401,29 @@ impl MoeLayer {
                 ctx,
                 stream,
             )?;
-            ops::silu_mul(
-                ctx.gpu,
-                self.moe_act_mul,
-                expert_gate_out,
-                expert_up_out,
-                expert_gate_out,
-                total_expanded * inter,
-                stream,
-            )?;
+            let fused_nvfp4_down = self.nvfp4_prequant_moe
+                && self.nvfp4_fused_silu_quant
+                && self.silu_mul_quant_nvfp4_k.0 != 0;
+            if fused_nvfp4_down {
+                self.fused_silu_prequant_fp4_down(
+                    expert_gate_out,
+                    expert_up_out,
+                    total_expanded,
+                    inter,
+                    ctx,
+                    stream,
+                )?;
+            } else {
+                ops::silu_mul(
+                    ctx.gpu,
+                    self.moe_act_mul,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_gate_out,
+                    total_expanded * inter,
+                    stream,
+                )?;
+            }
             // ── FP4 down (ATLAS_HOLO_MOE_DOWN_FP4) ── single block-scaled FP4
             // MMA per k64 tile (mxf4nvf4.scale_vec::4X.m16n8k64), reading the
             // post-SiLU intermediate (expert_gate_out) and the per-expert FP4
@@ -373,7 +437,7 @@ impl MoeLayer {
                     .cutlass_grouped_host
                     .as_ref()
                     .and_then(|t| t.down.as_ref())
-                && std::env::var("ATLAS_HOLO_MOE_GROUPED_DOWN").ok().as_deref() == Some("1")
+                && grouped_cutlass_down_enabled()
             {
                 // ── CUTLASS grouped NVFP4 down (ATLAS_HOLO_MOE_GROUPED_CUTLASS
                 //    + ATLAS_HOLO_MOE_GROUPED_DOWN) ──
@@ -415,6 +479,34 @@ impl MoeLayer {
                         h,
                         inter,
                         max_m_tiles,
+                        stream,
+                    )?;
+                } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
+                    if !fused_nvfp4_down {
+                        let a_packed = expert_up_out;
+                        let a_scale = a_packed.offset(total_expanded as usize * inter as usize / 2);
+                        ops::quantize_bf16_to_nvfp4(
+                            ctx.gpu,
+                            self.quantize_nvfp4_k,
+                            expert_gate_out,
+                            a_packed,
+                            a_scale,
+                            total_expanded,
+                            inter,
+                            stream,
+                        )?;
+                    }
+                    self.prequant_fp4_down(
+                        expert_up_out,
+                        dp,
+                        expert_down_out,
+                        expert_offsets,
+                        total_expanded,
+                        h,
+                        inter,
+                        num_experts,
+                        max_m_tiles,
+                        ctx,
                         stream,
                     )?;
                 } else if self.down_fp4 && self.moe_down_t_k64_fp4.0 != 0 {
@@ -470,22 +562,41 @@ impl MoeLayer {
                             stream,
                         )?;
                     } else {
-                        ops::moe_w4a16_grouped_gemm_ptrtable_n128(
-                            ctx.gpu,
-                            self.moe_grouped_gemm_t_k64,
-                            expert_gate_out,
-                            dp.packed_ptrs,
-                            dp.scale_ptrs,
-                            dp.scale2_vals,
-                            expert_down_out,
-                            expert_offsets,
-                            DevicePtr(0),
-                            num_experts,
-                            h,
-                            inter,
-                            max_m_tiles,
-                            stream,
-                        )?;
+                        if self.nvfp4_down_m32 && self.moe_grouped_gemm_t_k64_m32.0 != 0 {
+                            ops::moe_w4a16_grouped_gemm_ptrtable_k64_m32_n128(
+                                ctx.gpu,
+                                self.moe_grouped_gemm_t_k64_m32,
+                                expert_gate_out,
+                                dp.packed_ptrs,
+                                dp.scale_ptrs,
+                                dp.scale2_vals,
+                                expert_down_out,
+                                expert_offsets,
+                                DevicePtr(0),
+                                num_experts,
+                                h,
+                                inter,
+                                max_m_tiles,
+                                stream,
+                            )?;
+                        } else {
+                            ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+                                ctx.gpu,
+                                self.moe_grouped_gemm_t_k64,
+                                expert_gate_out,
+                                dp.packed_ptrs,
+                                dp.scale_ptrs,
+                                dp.scale2_vals,
+                                expert_down_out,
+                                expert_offsets,
+                                DevicePtr(0),
+                                num_experts,
+                                h,
+                                inter,
+                                max_m_tiles,
+                                stream,
+                            )?;
+                        }
                     }
                 }
             } else {

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Safe initial GLM-5.3-Flash-NVFP4 bring-up on two DGX Sparks using pure EP.
+# Safe GLM-5.3-Flash-NVFP4 bring-up on two DGX Sparks using EP2, optionally
+# composed with overlapping TP2 on the same two ranks.
 #
 # Usage:
 #   HEAD_IP=169.254.179.82 WORKER_IP=169.254.128.113 \
@@ -18,6 +19,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 PORT="${PORT:-8888}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
+TP_SIZE="${TP_SIZE:-1}"
 OOM_GUARD_MB="${OOM_GUARD_MB:-4096}"
 MODEL_MOUNT="${MODEL_MOUNT:-}"
 CONTAINER_MEMORY="${CONTAINER_MEMORY:-114g}"
@@ -25,10 +27,28 @@ NCCL_IFNAME="${NCCL_IFNAME:-enp1s0f1np1}"
 NCCL_HCA="${NCCL_HCA:-rocep1s0f1}"
 PROFILE="${PROFILE:-0}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-}"
+KDA_REGRESIDENT_PREFILL="${KDA_REGRESIDENT_PREFILL:-1}"
+UNIFIED_MOE_LAYOUT="${UNIFIED_MOE_LAYOUT:-1}"
+CUBLAS_GEMM="${CUBLAS_GEMM:-1}"
+HC_CUBLAS_PREFILL="${HC_CUBLAS_PREFILL:-1}"
+NVFP4_GATE_UP_M128="${NVFP4_GATE_UP_M128:-0}"
+NVFP4_DOWN_M32="${NVFP4_DOWN_M32:-0}"
+NVFP4_PREQUANT_MOE="${NVFP4_PREQUANT_MOE:-0}"
+NVFP4_FUSED_SILU_QUANT="${NVFP4_FUSED_SILU_QUANT:-0}"
+NVFP4_MMQ_MOE="${NVFP4_MMQ_MOE:-0}"
+NVFP4_CUTLASS_MOE="${NVFP4_CUTLASS_MOE:-0}"
+MOE_PREFILL_EXACT_TILES="${MOE_PREFILL_EXACT_TILES:-1}"
+MOE_PREFILL_MAX_LOAD_FACTOR="${MOE_PREFILL_MAX_LOAD_FACTOR:-8}"
+DUMP_EXPERT_IDS="${DUMP_EXPERT_IDS:-0}"
 
 if (( MAX_SEQ_LEN > 2048 )); then
   echo "ERROR: initial GLM-5.3 Atlas support is capped at 2048 tokens." >&2
   echo "Its sparse-attention layers use exact dense attention only while seq_len <= index_topk (2048)." >&2
+  exit 2
+fi
+
+if [[ "$TP_SIZE" != "1" && "$TP_SIZE" != "2" ]]; then
+  echo "ERROR: dual-Spark GLM-5.3 supports TP_SIZE=1 or overlapping TP_SIZE=2." >&2
   exit 2
 fi
 
@@ -81,7 +101,7 @@ NCCL_ENV=(
 COMMON_SERVE_ARGS=(
   serve "$MODEL"
   --world-size 2
-  --tp-size 1
+  --tp-size "$TP_SIZE"
   --ep-size 2
   --master-addr "$HEAD_IP"
   --master-port "$MASTER_PORT"
@@ -104,10 +124,22 @@ echo "Atlas GLM-5.3 dual-Spark safe bring-up"
 echo "  model: $MODEL"
 echo "  image: $IMAGE"
 echo "  context/concurrency: $MAX_SEQ_LEN / 1"
+echo "  parallelism: TP=$TP_SIZE / EP=2 on two physical ranks"
 echo "  GPU budget: $GPU_MEM_UTIL; OOM guard: ${OOM_GUARD_MB} MiB"
 echo "  container memory ceiling: $CONTAINER_MEMORY"
 echo "  NCCL: $NCCL_IFNAME / $NCCL_HCA"
 echo "  profiler: $PROFILE"
+echo "  KDA register-resident prefill: $KDA_REGRESIDENT_PREFILL"
+echo "  unified MoE layout: $UNIFIED_MOE_LAYOUT"
+echo "  cuBLASLt BF16 projections: $CUBLAS_GEMM"
+echo "  cuBLASLt TF32 mHC prefill: $HC_CUBLAS_PREFILL"
+echo "  NVFP4 MoE gate/up M128: $NVFP4_GATE_UP_M128"
+echo "  NVFP4 MoE down M32: $NVFP4_DOWN_M32"
+echo "  NVFP4 MoE prequant FP4: $NVFP4_PREQUANT_MOE"
+echo "  NVFP4 fused SiLU + quant: $NVFP4_FUSED_SILU_QUANT"
+echo "  NVFP4 equal-memory grouped MMQ: $NVFP4_MMQ_MOE"
+echo "  NVFP4 grouped CUTLASS MoE: $NVFP4_CUTLASS_MOE"
+echo "  MoE exact grid / fallback load factor: $MOE_PREFILL_EXACT_TILES / $MOE_PREFILL_MAX_LOAD_FACTOR"
 echo "  tool-call parser override: ${TOOL_CALL_PARSER:-model default}"
 
 # Never leave one stale rank in an old communicator.
@@ -126,6 +158,19 @@ ssh "$SSH_TARGET" "docker run -d \
   --name atlas-glm53-ep1 --gpus all --ipc=host --network host \
   --memory $CONTAINER_MEMORY --memory-swap $CONTAINER_MEMORY \
   $REMOTE_RDMA $REMOTE_NCCL -e RUST_LOG=info \
+  -e ATLAS_KDA_REGRESIDENT_PREFILL=$KDA_REGRESIDENT_PREFILL \
+  -e ATLAS_UNIFIED_MOE_LAYOUT=$UNIFIED_MOE_LAYOUT \
+  -e ATLAS_CUBLAS_GEMM=$CUBLAS_GEMM \
+  -e ATLAS_HC_CUBLAS_PREFILL=$HC_CUBLAS_PREFILL \
+  -e ATLAS_NVFP4_GATE_UP_M128=$NVFP4_GATE_UP_M128 \
+  -e ATLAS_NVFP4_DOWN_M32=$NVFP4_DOWN_M32 \
+  -e ATLAS_NVFP4_PREQUANT_MOE=$NVFP4_PREQUANT_MOE \
+  -e ATLAS_NVFP4_FUSED_SILU_QUANT=$NVFP4_FUSED_SILU_QUANT \
+  -e ATLAS_NVFP4_MMQ_MOE=$NVFP4_MMQ_MOE \
+  -e ATLAS_MOE_GROUPED_CUTLASS=$NVFP4_CUTLASS_MOE \
+  -e ATLAS_MOE_PREFILL_EXACT_TILES=$MOE_PREFILL_EXACT_TILES \
+  -e ATLAS_MOE_PREFILL_MAX_LOAD_FACTOR=$MOE_PREFILL_MAX_LOAD_FACTOR \
+  -e ATLAS_DUMP_EXPERT_IDS=$DUMP_EXPERT_IDS \
   $REMOTE_MOUNT $IMAGE $REMOTE_SERVE --rank 1 --port 0"
 
 docker run -d \
@@ -138,6 +183,19 @@ docker run -d \
   "${RDMA_FLAGS[@]}" \
   "${NCCL_ENV[@]}" \
   -e RUST_LOG=info \
+  -e ATLAS_KDA_REGRESIDENT_PREFILL="$KDA_REGRESIDENT_PREFILL" \
+  -e ATLAS_UNIFIED_MOE_LAYOUT="$UNIFIED_MOE_LAYOUT" \
+  -e ATLAS_CUBLAS_GEMM="$CUBLAS_GEMM" \
+  -e ATLAS_HC_CUBLAS_PREFILL="$HC_CUBLAS_PREFILL" \
+  -e ATLAS_NVFP4_GATE_UP_M128="$NVFP4_GATE_UP_M128" \
+  -e ATLAS_NVFP4_DOWN_M32="$NVFP4_DOWN_M32" \
+  -e ATLAS_NVFP4_PREQUANT_MOE="$NVFP4_PREQUANT_MOE" \
+  -e ATLAS_NVFP4_FUSED_SILU_QUANT="$NVFP4_FUSED_SILU_QUANT" \
+  -e ATLAS_NVFP4_MMQ_MOE="$NVFP4_MMQ_MOE" \
+  -e ATLAS_MOE_GROUPED_CUTLASS="$NVFP4_CUTLASS_MOE" \
+  -e ATLAS_MOE_PREFILL_EXACT_TILES="$MOE_PREFILL_EXACT_TILES" \
+  -e ATLAS_MOE_PREFILL_MAX_LOAD_FACTOR="$MOE_PREFILL_MAX_LOAD_FACTOR" \
+  -e ATLAS_DUMP_EXPERT_IDS="$DUMP_EXPERT_IDS" \
   "${MOUNT_FLAGS[@]}" \
   "$IMAGE" "${COMMON_SERVE_ARGS[@]}" --rank 0 --port "$PORT"
 

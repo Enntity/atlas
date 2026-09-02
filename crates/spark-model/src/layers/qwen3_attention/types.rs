@@ -108,6 +108,8 @@ pub struct Qwen3AttentionLayer {
     pub(crate) hc: Option<HcWeights>,
     /// HC `hc_pre` kernel handle (NULL when HC disabled).
     pub(super) hc_pre_k: KernelHandle,
+    /// Finalizer for the prefill-only batched TF32 mHC pre-mix.
+    pub(super) hc_pre_from_raw_mix_k: KernelHandle,
     /// HC `hc_post` kernel handle (NULL when HC disabled).
     pub(super) hc_post_k: KernelHandle,
     /// HC `hc_expand` kernel handle (NULL when HC disabled).

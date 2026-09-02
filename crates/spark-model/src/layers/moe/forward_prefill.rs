@@ -383,16 +383,16 @@ impl MoeLayer {
 
         // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
         let output = ctx.buffers.moe_output();
-        ops::moe_unpermute_reduce_indexed(
-            ctx.gpu,
-            self.moe_unpermute_reduce,
+        self.unpermute_ep_prefill(
             expert_down_out,
             output,
             token_to_perm,
+            indices_dev,
             weights_dev,
             h,
             n,
             top_k,
+            ctx,
             stream,
         )?;
 

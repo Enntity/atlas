@@ -514,24 +514,7 @@ impl Qwen3AttentionLayer {
         }
 
         // ── Attention sublayer ──
-        ops::hc_pre(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            hc.attn.hc_fn,
-            hc.attn.hc_scale,
-            hc.attn.hc_base,
-            hidden,
-            post,
-            comb,
-            n,
-            h as u32,
-            hc_mult,
-            hc.sinkhorn_iters as u32,
-            eps,
-            hc.hc_eps,
-            stream,
-        )?;
+        self.hc_pre_prefill(&hc.attn, hc, hidden, n, ctx, stream)?;
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -729,24 +712,7 @@ impl Qwen3AttentionLayer {
         }
 
         // ── FFN sublayer ──
-        ops::hc_pre(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            hc.ffn.hc_fn,
-            hc.ffn.hc_scale,
-            hc.ffn.hc_base,
-            hidden,
-            post,
-            comb,
-            n,
-            h as u32,
-            hc_mult,
-            hc.sinkhorn_iters as u32,
-            eps,
-            hc.hc_eps,
-            stream,
-        )?;
+        self.hc_pre_prefill(&hc.ffn, hc, hidden, n, ctx, stream)?;
         if diag_this {
             super::diag_norm(
                 ctx.gpu,

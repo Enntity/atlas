@@ -19,6 +19,10 @@ pub(crate) struct ReservePreflight {
     pub(crate) max_batch_tokens_pre: usize,
 }
 
+fn glm5_dual_spark_parallelism(world: usize, tp: usize, ep: usize) -> bool {
+    world == 2 && ep == 2 && matches!(tp, 1 | 2)
+}
+
 pub(crate) fn preflight_reserve(
     args: &cli::ServeArgs,
     config: &ModelConfig,
@@ -38,8 +42,8 @@ pub(crate) fn preflight_reserve(
             "GLM-5 initial Atlas support does not support speculative decoding"
         );
         anyhow::ensure!(
-            args.world_size == 2 && args.tp_size == 1 && args.ep_size == 2,
-            "GLM-5 dual-Spark support requires --world-size 2 --tp-size 1 --ep-size 2"
+            glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size),
+            "GLM-5 dual-Spark support requires --world-size 2 --ep-size 2 and either --tp-size 1 (EP fallback) or --tp-size 2 (overlapping TP+EP)"
         );
     }
     let h_state_bytes = config.ssm_h_state_bytes();
@@ -300,6 +304,20 @@ pub(crate) fn preflight_reserve(
         ssm_prefill_chunk,
         max_batch_tokens_pre,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glm5_dual_spark_parallelism;
+
+    #[test]
+    fn glm5_accepts_ep_fallback_and_overlapping_tp2_only() {
+        assert!(glm5_dual_spark_parallelism(2, 1, 2));
+        assert!(glm5_dual_spark_parallelism(2, 2, 2));
+        assert!(!glm5_dual_spark_parallelism(2, 2, 1));
+        assert!(!glm5_dual_spark_parallelism(4, 2, 2));
+        assert!(!glm5_dual_spark_parallelism(2, 4, 2));
+    }
 }
 
 /// Initialize the GPU backend for the active feature.

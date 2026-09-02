@@ -116,6 +116,39 @@ extern "C" __global__ void moe_unpermute_reduce_indexed(
     }
 }
 
+// EP-aware indexed reduce. Each rank accumulates only the expert IDs it owns;
+// the following cross-rank all-reduce reconstructs the complete routed output.
+// Skipping remote IDs makes initialization of their unwritten rows unnecessary.
+extern "C" __global__ void moe_unpermute_reduce_indexed_ep(
+    const __nv_bfloat16* __restrict__ expert_output,
+    __nv_bfloat16* __restrict__ output,
+    const int* __restrict__ token_to_perm,
+    const int* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    unsigned int hidden_size,
+    unsigned int num_tokens,
+    unsigned int topk,
+    unsigned int local_expert_start,
+    unsigned int local_expert_end
+) {
+    unsigned int token = blockIdx.x;
+    if (token >= num_tokens) return;
+
+    for (unsigned int c = threadIdx.x; c < hidden_size; c += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned int k = 0; k < topk; k++) {
+            unsigned int slot = token * topk + k;
+            int expert = topk_ids[slot];
+            if (expert >= (int)local_expert_start && expert < (int)local_expert_end) {
+                int perm_row = token_to_perm[slot];
+                float value = __bfloat162float(expert_output[perm_row * hidden_size + c]);
+                acc += topk_weights[slot] * value;
+            }
+        }
+        output[token * hidden_size + c] = __float2bfloat16(acc);
+    }
+}
+
 // Batched blend: for each token, compute sigmoid(dot(normed, gate_weight)) and
 // blend shared expert output into routed output.
 //

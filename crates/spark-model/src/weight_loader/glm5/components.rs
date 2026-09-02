@@ -7,7 +7,8 @@ use spark_runtime::weights::WeightStore;
 
 use crate::layers::dense_ffn::DenseFfnWeights;
 use crate::layers::qwen3_attention::{HcSiteWeights, HcWeights};
-use crate::layers::{DenseFfnLayer, FfnComponent, Glm5KdaWeights, MoeLayer};
+use crate::layers::{DenseFfnLayer, FfnComponent, Glm5KdaWeights, Glm5Projection, MoeLayer};
+use crate::tp_shard::{TpGdnDims, TpShardKind, shard_dense_bf16, shard_gdn_value_vector};
 use crate::weight_map::{
     DenseWeight, ExpertWeight, MoeWeights, Nvfp4Variant, QuantizeCtx, dense_auto, dense_keep_f32,
     quantize_to_nvfp4, quantized_any,
@@ -208,13 +209,39 @@ fn load_moe(
         router_pre_norm: None,
         correction_bias: Some(DenseWeight { weight: bias.ptr }),
     };
-    Ok(FfnComponent::Moe(MoeLayer::new(
-        weights,
-        config.num_experts,
-        None,
-        gpu,
-        config,
-    )?))
+    let mut layer = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
+    let mmq_moe = env_flag("ATLAS_NVFP4_MMQ_MOE");
+    let cutlass_moe = env_flag("ATLAS_MOE_GROUPED_CUTLASS");
+    anyhow::ensure!(
+        !(mmq_moe && cutlass_moe),
+        "ATLAS_NVFP4_MMQ_MOE and ATLAS_MOE_GROUPED_CUTLASS are mutually exclusive"
+    );
+    if mmq_moe {
+        layer.repack_nvfp4_mmq_unified(gpu, config)?;
+    } else if cutlass_moe {
+        // CUTLASS consumes the checkpoint-native packed weights and adds only
+        // its block-scale swizzle. Avoid materializing the much larger Atlas
+        // transposed expert twins in this mode.
+        layer.build_cutlass_grouped_sfb(gpu, config, gpu.default_stream())?;
+    } else if unified_moe_layout_enabled(std::env::var("ATLAS_UNIFIED_MOE_LAYOUT").ok().as_deref())
+    {
+        // Replace the decode-native expert storage with Atlas' transposed
+        // layout one layer at a time. The transpose helper frees each source
+        // phase before advancing, and EP slabs contain only locally owned
+        // experts, so peak memory stays bounded on dual GB10.
+        layer.transpose_for_prefill_unified(gpu, config)?;
+    }
+    Ok(FfnComponent::Moe(layer))
+}
+
+fn unified_moe_layout_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 pub(super) fn load_kda_weights(
@@ -222,34 +249,148 @@ pub(super) fn load_kda_weights(
     lp: &str,
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
+    qctx: QuantizeCtx,
 ) -> Result<Glm5KdaWeights> {
     let p = format!("{lp}.self_attn");
     let load = |name: &str| dense_auto(store, &format!("{p}.{name}.weight"), gpu);
-    let p_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let dims = TpGdnDims::from_config(config);
+    let p_dim = dims.local_key_dim();
+    let load_tp_dense =
+        |name: &str, n: usize, k: usize, kind: TpShardKind| -> Result<DenseWeight> {
+            let source = load(name)?;
+            let (local, _, _) =
+                shard_dense_bf16(source.weight, n, k, kind, dims.tp_rank, dims.tp_size, gpu)?;
+            if local != source.weight {
+                gpu.free(source.weight)?;
+            }
+            Ok(DenseWeight { weight: local })
+        };
+    let load_hot = |name: &str,
+                    n: usize,
+                    k: usize,
+                    kind: TpShardKind,
+                    transpose_prefill: bool|
+     -> Result<Glm5Projection> {
+        let dense = load_tp_dense(name, n, k, kind)?;
+        let local_n = if kind == TpShardKind::ColumnParallel {
+            n / dims.tp_size
+        } else {
+            n
+        };
+        let local_k = if kind == TpShardKind::RowParallel {
+            k / dims.tp_size
+        } else {
+            k
+        };
+        let decode_nvfp4 = quantize_to_nvfp4(
+            &dense,
+            local_n,
+            local_k,
+            gpu,
+            qctx.absmax_k,
+            qctx.quantize_k,
+            qctx.stream,
+        )?;
+        // Quantization synchronizes internally, so the checkpoint-native BF16
+        // source is no longer needed. Releasing it keeps the safe 92% memory
+        // budget viable on GB10 instead of retaining two projection copies.
+        gpu.free(dense.weight)?;
+        let prefill_nvfp4_t = transpose_prefill
+            .then(|| decode_nvfp4.transpose_for_gemm(gpu, local_n, local_k))
+            .transpose()?;
+        Ok(Glm5Projection {
+            nvfp4: decode_nvfp4,
+            prefill_nvfp4_t,
+        })
+    };
     let width = config.linear_conv_kernel_dim;
-    let conv_bytes = p_dim * width * 2;
-    let conv_ptr = gpu.alloc(3 * conv_bytes)?;
+    let local_conv_bytes = p_dim * width * 2;
+    let conv_ptr = gpu.alloc(3 * local_conv_bytes)?;
     for (slot, name) in ["q_conv1d", "k_conv1d", "v_conv1d"].iter().enumerate() {
-        let weight = load(name)?;
+        let weight = load_tp_dense(
+            name,
+            dims.full_key_dim(),
+            width,
+            TpShardKind::ColumnParallel,
+        )?;
         gpu.copy_d2d(
             weight.weight,
-            conv_ptr.offset(slot * conv_bytes),
-            conv_bytes,
+            conv_ptr.offset(slot * local_conv_bytes),
+            local_conv_bytes,
         )?;
+        gpu.free(weight.weight)?;
+    }
+    let a_log_full = dense_keep_f32(store, &format!("{p}.A_log"), gpu)?;
+    let (a_log, _) = shard_gdn_value_vector(a_log_full.weight, &dims, 1, 4, gpu)?;
+    if a_log != a_log_full.weight {
+        gpu.free(a_log_full.weight)?;
+    }
+    let dt_bias_full = dense_keep_f32(store, &format!("{p}.dt_bias"), gpu)?;
+    let (dt_bias, _) = shard_gdn_value_vector(dt_bias_full.weight, &dims, dims.kd, 4, gpu)?;
+    if dt_bias != dt_bias_full.weight {
+        gpu.free(dt_bias_full.weight)?;
     }
     Ok(Glm5KdaWeights {
-        q_proj: load("q_proj")?,
-        k_proj: load("k_proj")?,
-        v_proj: load("v_proj")?,
-        b_proj: load("b_proj")?,
+        q_proj: load_hot(
+            "q_proj",
+            dims.full_key_dim(),
+            dims.h,
+            TpShardKind::ColumnParallel,
+            true,
+        )?,
+        k_proj: load_hot(
+            "k_proj",
+            dims.full_key_dim(),
+            dims.h,
+            TpShardKind::ColumnParallel,
+            true,
+        )?,
+        v_proj: load_hot(
+            "v_proj",
+            dims.full_value_dim(),
+            dims.h,
+            TpShardKind::ColumnParallel,
+            true,
+        )?,
+        b_proj: load_tp_dense("b_proj", dims.full_nk, dims.h, TpShardKind::ColumnParallel)?,
         f_a_proj: load("f_a_proj")?,
-        f_b_proj: load("f_b_proj")?,
+        f_b_proj: load_tp_dense(
+            "f_b_proj",
+            dims.full_key_dim(),
+            dims.kd,
+            TpShardKind::ColumnParallel,
+        )?,
         g_a_proj: load("g_a_proj")?,
-        g_b_proj: load("g_b_proj")?,
+        g_b_proj: load_tp_dense(
+            "g_b_proj",
+            dims.full_key_dim(),
+            dims.kd,
+            TpShardKind::ColumnParallel,
+        )?,
         conv: DenseWeight { weight: conv_ptr },
-        a_log: dense_keep_f32(store, &format!("{p}.A_log"), gpu)?,
-        dt_bias: dense_keep_f32(store, &format!("{p}.dt_bias"), gpu)?,
+        a_log: DenseWeight { weight: a_log },
+        dt_bias: DenseWeight { weight: dt_bias },
         o_norm: load("o_norm")?,
-        o_proj: load("o_proj")?,
+        o_proj: load_hot(
+            "o_proj",
+            dims.h,
+            dims.full_value_dim(),
+            TpShardKind::RowParallel,
+            true,
+        )?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unified_moe_layout_enabled;
+
+    #[test]
+    fn unified_moe_layout_is_explicitly_opt_in() {
+        assert!(unified_moe_layout_enabled(Some("1")));
+        assert!(unified_moe_layout_enabled(Some("TRUE")));
+        assert!(!unified_moe_layout_enabled(None));
+        assert!(!unified_moe_layout_enabled(Some("0")));
+        assert!(!unified_moe_layout_enabled(Some("full")));
+    }
 }

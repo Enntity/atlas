@@ -292,6 +292,48 @@ pub fn moe_w4a16_grouped_gemm_ptrtable_k64_n128(
         .launch(stream)
 }
 
+/// Sparse-expert M=32 twin of the K64/N128 grouped GEMM.
+///
+/// The caller's `max_m_tiles` is expressed in the established M=64 units;
+/// doubling grid.y provides complete, conservative coverage for 32-row CTAs.
+/// Grid: (ceil(n_out/128), 2*max_m_tiles, num_experts) Block: (64, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_grouped_gemm_ptrtable_k64_m32_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    c: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    max_m_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([
+            div_ceil(n_out, 128),
+            max_m_tiles.saturating_mul(2),
+            num_experts,
+        ])
+        .block([64, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(c)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// K64 fused gate+up GEMM — zero pipeline stall for K=h (2048 for 35B), 32 K-steps vs 64.
 ///
 /// Grid: (ceil(2*n_out/128), max_m_tiles, num_experts)  Block: (128, 1, 1)

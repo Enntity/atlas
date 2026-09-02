@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! GLM-5 KDA recurrent block for the conservative GB10 bring-up path.
+mod hc;
+mod profile;
+mod projection;
+mod recurrent;
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -12,21 +16,7 @@ use crate::layers::ops;
 use crate::layers::qwen3_attention::HcWeights;
 use crate::weight_map::DenseWeight;
 
-pub struct Glm5KdaWeights {
-    pub q_proj: DenseWeight,
-    pub k_proj: DenseWeight,
-    pub v_proj: DenseWeight,
-    pub b_proj: DenseWeight,
-    pub f_a_proj: DenseWeight,
-    pub f_b_proj: DenseWeight,
-    pub g_a_proj: DenseWeight,
-    pub g_b_proj: DenseWeight,
-    pub conv: DenseWeight,
-    pub a_log: DenseWeight,
-    pub dt_bias: DenseWeight,
-    pub o_norm: DenseWeight,
-    pub o_proj: DenseWeight,
-}
+pub use projection::{Glm5KdaWeights, Glm5Projection};
 
 pub struct Glm5KdaLayer {
     input_norm: DenseWeight,
@@ -44,15 +34,23 @@ pub struct Glm5KdaLayer {
     conv_state_bytes: usize,
     rms_norm_k: KernelHandle,
     dense_gemv_k: KernelHandle,
+    w4a16_gemv_k: KernelHandle,
+    w4a16_gemv_sw_k: KernelHandle,
+    w4a16_gemm_k: KernelHandle,
+    w4a16_gemm_t_m128_k: KernelHandle,
     dense_gemm_k: KernelHandle,
     dense_gemm_pipelined_k: KernelHandle,
     conv_prefill_k: KernelHandle,
     conv_prefill_tp_k: KernelHandle,
     pack_k: KernelHandle,
     recurrent_k: KernelHandle,
+    preprocess_regresident_k: KernelHandle,
+    recurrent_regresident_k: KernelHandle,
+    register_resident_prefill: bool,
     gated_norm_k: KernelHandle,
     hc_expand_k: KernelHandle,
     hc_pre_k: KernelHandle,
+    hc_pre_from_raw_mix_k: KernelHandle,
     hc_post_k: KernelHandle,
     hc_contract_k: KernelHandle,
 }
@@ -79,6 +77,31 @@ impl Glm5KdaLayer {
         ensure!(config.hc_mult == 4, "GLM-5 KDA requires hc_mult=4");
         let heads = config.linear_num_key_heads;
         let dim = config.linear_key_head_dim;
+        let register_resident_prefill = recurrent::parse_register_resident_prefill(
+            std::env::var("ATLAS_KDA_REGRESIDENT_PREFILL")
+                .ok()
+                .as_deref(),
+        )?;
+        let recurrent_regresident_k = if register_resident_prefill {
+            gpu.kernel("kda", "kda_recurrent_bf16_regresident")?
+        } else {
+            KernelHandle(0)
+        };
+        let preprocess_regresident_k = if register_resident_prefill {
+            ensure!(
+                recurrent::scratch_is_sufficient(
+                    heads,
+                    dim,
+                    config.num_experts_per_tok,
+                    config.moe_intermediate_size,
+                    config.hidden_size,
+                ),
+                "GLM-5 KDA register-resident prefill scratch does not fit expert buffers"
+            );
+            gpu.kernel("kda", "kda_preprocess_regresident")?
+        } else {
+            KernelHandle(0)
+        };
         Ok(Self {
             input_norm,
             post_attn_norm,
@@ -95,6 +118,10 @@ impl Glm5KdaLayer {
             conv_state_bytes: 3 * heads * dim * config.linear_conv_kernel_dim * 4,
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
+            w4a16_gemv_sw_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
+            w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
+            w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
             dense_gemm_pipelined_k: super::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined"),
             conv_prefill_k: gpu.kernel("causal_conv1d", "causal_conv1d_update_prefill")?,
@@ -105,100 +132,16 @@ impl Glm5KdaLayer {
             ),
             pack_k: gpu.kernel("kda", "kda_pack_qkv")?,
             recurrent_k: gpu.kernel("kda", "kda_recurrent_bf16")?,
+            preprocess_regresident_k,
+            recurrent_regresident_k,
+            register_resident_prefill,
             gated_norm_k: gpu.kernel("kda", "kda_sigmoid_gated_rms_norm")?,
             hc_expand_k: gpu.kernel("hyper_connection", "hc_expand")?,
             hc_pre_k: gpu.kernel("hyper_connection", "hc_pre")?,
+            hc_pre_from_raw_mix_k: gpu.kernel("hyper_connection", "hc_pre_from_raw_mix")?,
             hc_post_k: gpu.kernel("hyper_connection", "hc_post")?,
             hc_contract_k: gpu.kernel("hyper_connection", "hc_contract")?,
         })
-    }
-
-    fn project(
-        &self,
-        input: DevicePtr,
-        weight: &DenseWeight,
-        output: DevicePtr,
-        m: u32,
-        n: u32,
-        k: u32,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        if m == 1 {
-            ops::dense_gemv(
-                ctx.gpu,
-                self.dense_gemv_k,
-                input,
-                weight,
-                output,
-                n,
-                k,
-                stream,
-            )
-        } else {
-            ops::dense_gemm_prefill(
-                ctx.gpu,
-                self.dense_gemm_k,
-                self.dense_gemm_pipelined_k,
-                input,
-                weight,
-                output,
-                m,
-                n,
-                k,
-                stream,
-            )
-        }
-    }
-
-    fn hc_pre(
-        &self,
-        site: &crate::layers::qwen3_attention::HcSiteWeights,
-        hidden: DevicePtr,
-        tokens: u32,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        ops::hc_pre(
-            ctx.gpu,
-            self.hc_pre_k,
-            ctx.buffers.hc_streams(),
-            site.hc_fn,
-            site.hc_scale,
-            site.hc_base,
-            hidden,
-            ctx.buffers.hc_post(),
-            ctx.buffers.hc_comb(),
-            tokens,
-            self.hidden_size as u32,
-            self.hc.hc_mult as u32,
-            self.hc.sinkhorn_iters as u32,
-            ctx.config.rms_norm_eps as f32,
-            self.hc.hc_eps,
-            stream,
-        )
-    }
-
-    fn hc_post(
-        &self,
-        block_out: DevicePtr,
-        tokens: u32,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        ops::hc_post(
-            ctx.gpu,
-            self.hc_post_k,
-            block_out,
-            ctx.buffers.hc_streams(),
-            ctx.buffers.hc_post(),
-            ctx.buffers.hc_comb(),
-            ctx.buffers.hc_streams(),
-            tokens,
-            self.hidden_size as u32,
-            self.hc.hc_mult as u32,
-            stream,
-        )
     }
 
     fn forward_inner(
@@ -219,6 +162,7 @@ impl Glm5KdaLayer {
         let h = self.hidden_size as u32;
         let p = self.heads * self.dim;
         let bf16 = 2usize;
+        let mut profile_timer = profile::start(ctx, stream)?;
 
         if self.layer_idx == 0 {
             ops::hc_expand(
@@ -245,41 +189,46 @@ impl Glm5KdaLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
+        profile::step(ctx, stream, &mut profile_timer, "hc_attn_norm")?;
 
         let projected = ctx.buffers.qkv_output();
         let plane_bytes = tokens * p * bf16;
-        self.project(
+        self.project_hot(
             normed,
             &self.weights.q_proj,
             projected,
             m,
             p as u32,
             h,
+            decode,
             ctx,
             stream,
         )?;
-        self.project(
+        profile::step(ctx, stream, &mut profile_timer, "q_proj")?;
+        self.project_hot(
             normed,
             &self.weights.k_proj,
             projected.offset(plane_bytes),
             m,
             p as u32,
             h,
+            decode,
             ctx,
             stream,
         )?;
-        self.project(
+        self.project_hot(
             normed,
             &self.weights.v_proj,
             projected.offset(2 * plane_bytes),
             m,
             p as u32,
             h,
+            decode,
             ctx,
             stream,
         )?;
         let beta = projected.offset(3 * plane_bytes);
-        self.project(
+        self.project_dense(
             normed,
             &self.weights.b_proj,
             beta,
@@ -289,8 +238,9 @@ impl Glm5KdaLayer {
             ctx,
             stream,
         )?;
+        profile::step(ctx, stream, &mut profile_timer, "kv_beta_proj")?;
         let fa = beta.offset(tokens * self.heads * bf16);
-        self.project(
+        self.project_dense(
             normed,
             &self.weights.f_a_proj,
             fa,
@@ -300,8 +250,9 @@ impl Glm5KdaLayer {
             ctx,
             stream,
         )?;
+        profile::step(ctx, stream, &mut profile_timer, "f_a_proj")?;
         let ga = fa.offset(tokens * self.dim * bf16);
-        self.project(
+        self.project_dense(
             normed,
             &self.weights.g_a_proj,
             ga,
@@ -313,7 +264,7 @@ impl Glm5KdaLayer {
         )?;
 
         let g1 = ctx.buffers.ssm_deinterleaved();
-        self.project(
+        self.project_dense(
             fa,
             &self.weights.f_b_proj,
             g1,
@@ -324,7 +275,7 @@ impl Glm5KdaLayer {
             stream,
         )?;
         let g2 = g1.offset(plane_bytes);
-        self.project(
+        self.project_dense(
             ga,
             &self.weights.g_b_proj,
             g2,
@@ -334,6 +285,7 @@ impl Glm5KdaLayer {
             ctx,
             stream,
         )?;
+        profile::step(ctx, stream, &mut profile_timer, "g_a_f_b_g_b")?;
 
         let packed = ctx.buffers.ssm_qkvz();
         ops::kda_pack_qkv(ctx.gpu, self.pack_k, projected, packed, m, p as u32, stream)?;
@@ -354,23 +306,20 @@ impl Glm5KdaLayer {
             (3 * p) as u32,
             stream,
         )?;
+        profile::step(ctx, stream, &mut profile_timer, "pack_conv")?;
         let core_out = ctx.buffers.attn_output();
-        ops::kda_recurrent(
-            ctx.gpu,
-            self.recurrent_k,
+        self.run_recurrent(
             convolved,
             g1,
             beta,
-            self.weights.a_log.weight,
-            self.weights.dt_bias.weight,
             state.h_state,
             core_out,
             m,
-            self.heads as u32,
-            self.dim as u32,
-            self.lower_bound,
+            decode,
+            ctx,
             stream,
         )?;
+        profile::step(ctx, stream, &mut profile_timer, "recurrent")?;
         let gated = projected;
         ops::kda_sigmoid_gated_norm(
             ctx.gpu,
@@ -385,17 +334,27 @@ impl Glm5KdaLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
-        self.project(
+        profile::step(ctx, stream, &mut profile_timer, "gated_norm")?;
+        self.project_hot(
             gated,
             &self.weights.o_proj,
             normed,
             m,
             h,
             p as u32,
+            decode,
             ctx,
             stream,
         )?;
+        profile::step(ctx, stream, &mut profile_timer, "o_proj")?;
+        if ctx.config.tp_world_size > 1
+            && let Some(comm) = ctx.comm
+        {
+            comm.all_reduce_async(normed.0, tokens * self.hidden_size * 2, stream)?;
+        }
+        profile::step(ctx, stream, &mut profile_timer, "tp_reduce")?;
         self.hc_post(normed, m, ctx, stream)?;
+        profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
 
         self.hc_pre(&self.hc.ffn, hidden, m, ctx, stream)?;
         ops::rms_norm(
@@ -409,13 +368,16 @@ impl Glm5KdaLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
+        profile::step(ctx, stream, &mut profile_timer, "hc_ffn_norm")?;
         let ffn_out = if decode {
             self.ffn.forward(normed, ctx, stream)?
         } else {
             self.ffn.forward_prefill(normed, tokens, ctx, stream)?;
             ctx.buffers.moe_output()
         };
+        profile::step(ctx, stream, &mut profile_timer, "ffn")?;
         self.hc_post(ffn_out, m, ctx, stream)?;
+        profile::step(ctx, stream, &mut profile_timer, "hc_ffn_post")?;
 
         if self.layer_idx + 1 == ctx.config.num_hidden_layers {
             ops::hc_contract(

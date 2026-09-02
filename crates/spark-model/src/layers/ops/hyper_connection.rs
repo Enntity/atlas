@@ -93,6 +93,44 @@ pub fn hc_pre(
         .launch(stream)
 }
 
+/// Finalize `hc_pre` from an FP32 `[tokens, (2 + hc) * hc]` pre-mix GEMM.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_pre_from_raw_mix(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    streams: DevicePtr,
+    raw_mix: DevicePtr,
+    hc_scale: DevicePtr,
+    hc_base: DevicePtr,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    norm_eps: f32,
+    hc_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(streams)
+        .arg_ptr(raw_mix)
+        .arg_ptr(hc_scale)
+        .arg_ptr(hc_base)
+        .arg_ptr(y_out)
+        .arg_ptr(post_out)
+        .arg_ptr(comb_out)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .arg_u32(sinkhorn_iters)
+        .arg_f32(norm_eps)
+        .arg_f32(hc_eps)
+        .launch(stream)
+}
+
 /// Expand the sublayer output back into `hc_mult` streams, mixing the saved
 /// residual streams through the doubly-stochastic `comb`. `out` may alias
 /// `residual`. One block per token.

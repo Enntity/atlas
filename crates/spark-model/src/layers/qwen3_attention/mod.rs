@@ -18,6 +18,7 @@ mod decode;
 // V4: `pub(crate)` so the DeepSeek-V4 weight loader (`weight_loader::deepseek_v4`)
 // and the V4 attention submodules can call `helpers::yarn_rope_mscale`. Non-V4
 // code paths are unaffected by the wider visibility.
+mod hc_prefill;
 pub(crate) mod helpers;
 mod init;
 mod init_arch_gates;

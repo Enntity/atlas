@@ -320,14 +320,9 @@ impl MoeLayer {
 
     /// Transpose one projection across ALL routed experts on the GPU, into a
     /// single slab allocation per buffer.
-    ///
     /// Replaces a per-expert `QuantizedWeight::transpose_for_gemm_gs`, which
-    /// round-trips every expert through the host (D2H, a strided host byte
-    /// loop, H2D) and takes two `gpu.alloc`s each. At 256 experts x 3
-    /// projections x ~47 MoE layers that was ~36k host round-trips and ~145k
-    /// allocations, measured at ~1.0 s per layer (~48 s of load). The batched
-    /// kernel is the same one the lazy down-scratch path already uses.
-    ///
+    /// round-trips each expert through the host and creates two allocations.
+    /// The batched kernel avoids those transfers and allocation pressure.
     /// `src` supplies the per-expert untransposed `[n, k/2]` packed bytes and
     /// `[n, k/group_size]` scales; the returned `QuantizedWeight`s point into
     /// the two slabs and carry the source's scale metadata unchanged.
@@ -341,6 +336,8 @@ impl MoeLayer {
         group_size: usize,
     ) -> Result<Vec<QuantizedWeight>> {
         let num_experts = src.len();
+        let (local_experts, compact_slots) =
+            super::compact_layout::compact_slot_map(src.iter().map(|w| !w.is_null()));
         let packed_each = n * (k / 2);
         let scale_each = n * (k / group_size);
         anyhow::ensure!(
@@ -348,24 +345,26 @@ impl MoeLayer {
             "transpose_experts_gpu: zero-sized projection (n={n} k={k} gs={group_size})"
         );
 
-        // One slab per buffer instead of two allocations per expert.
-        let packed_slab = gpu.alloc(num_experts * packed_each)?;
-        let scale_slab = gpu.alloc(num_experts * scale_each)?;
+        if local_experts == 0 {
+            return Ok(vec![QuantizedWeight::null(); num_experts]);
+        }
+        let packed_slab = gpu.alloc(local_experts * packed_each)?;
+        let scale_slab = gpu.alloc(local_experts * scale_each)?;
 
         // Destinations carve the slabs; a NULL source keeps a NULL slot so the
         // kernel's own NULL guard skips that expert (EP-remote convention).
         let mut out = Vec::with_capacity(num_experts);
-        for (e, w) in src.iter().enumerate() {
-            if w.is_null() {
-                out.push(QuantizedWeight::null());
-            } else {
+        for (w, compact_slot) in src.iter().zip(compact_slots) {
+            if let Some(slot) = compact_slot {
                 out.push(QuantizedWeight {
-                    weight: packed_slab.offset(e * packed_each),
-                    weight_scale: scale_slab.offset(e * scale_each),
+                    weight: packed_slab.offset(slot * packed_each),
+                    weight_scale: scale_slab.offset(slot * scale_each),
                     weight_scale_2: w.weight_scale_2,
                     input_scale: w.input_scale,
                     weight_scale_2_vec: w.weight_scale_2_vec,
                 });
+            } else {
+                out.push(QuantizedWeight::null());
             }
         }
 

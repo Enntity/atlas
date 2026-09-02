@@ -356,6 +356,7 @@ struct GroupedAPrep {
 static GroupedAPrep prep_grouped_a(
     const __nv_bfloat16* A_global,
     const int* sorted_token_ids,
+    const unsigned long long* local_packed_ptrs,
     const int* expert_offsets_host,
     int num_experts,
     int n,
@@ -373,6 +374,13 @@ static GroupedAPrep prep_grouped_a(
   size_t a_acc = 0;
   size_t sfa_acc = 0;
   for (int e = 0; e < num_experts; ++e) {
+    // Expert-parallel ranks retain global routing offsets, but only local
+    // experts have materialized weight pointers.  Do not create a CUTLASS
+    // problem for a remote expert: launch_projection would otherwise
+    // dereference its deliberately-null packed-weight pointer.
+    if (local_packed_ptrs[e] == 0) {
+      continue;
+    }
     int m_e = expert_offsets_host[e + 1] - expert_offsets_host[e];
     if (m_e <= 0) {
       continue;
@@ -395,6 +403,9 @@ static GroupedAPrep prep_grouped_a(
   int max_me = 0;
   int gi = 0;
   for (int e = 0; e < num_experts; ++e) {
+    if (local_packed_ptrs[e] == 0) {
+      continue;
+    }
     int ms = expert_offsets_host[e];
     int m_e = expert_offsets_host[e + 1] - ms;
     if (m_e <= 0) {
@@ -618,8 +629,9 @@ extern "C" int atlas_cutlass_nvfp4_grouped_gate_up_fused(
   unsigned char* ws = static_cast<unsigned char*>(workspace);
   // Pack A ONCE (gate + up share the same activation).
   GroupedAPrep a = prep_grouped_a(static_cast<const __nv_bfloat16*>(A_bf16),
-                                  sorted_token_ids, expert_offsets_host, num_experts,
-                                  n, k, ws, stream);
+                                  sorted_token_ids, gate_packed_ptrs,
+                                  expert_offsets_host, num_experts, n, k, ws,
+                                  stream);
   if (a.G == 0) {
     return 0;
   }
@@ -680,7 +692,8 @@ extern "C" int atlas_cutlass_nvfp4_grouped_down(
   }
   unsigned char* ws = static_cast<unsigned char*>(workspace);
   GroupedAPrep a = prep_grouped_a(static_cast<const __nv_bfloat16*>(A_bf16), nullptr,
-                                  expert_offsets_host, num_experts, n, k, ws, stream);
+                                  packed_ptrs, expert_offsets_host, num_experts, n,
+                                  k, ws, stream);
   if (a.G == 0) {
     return 0;
   }

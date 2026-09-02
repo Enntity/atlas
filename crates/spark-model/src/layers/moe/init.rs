@@ -136,6 +136,62 @@ impl MoeLayer {
             moe_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t")?,
             moe_grouped_gemm_t_k64: gpu
                 .kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t_k64")?,
+            moe_grouped_gemm_t_k64_m32: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a16_grouped_gemm_ptrtable_t_k64_m32",
+            ),
+            moe_w4a4_prequant_t_k64: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a4_grouped_gemm_prequant_t_k64",
+            ),
+            moe_nvfp4_mmq_gate_up_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_mmq64_gate_up",
+            ),
+            moe_nvfp4_mmq_down_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_mmq64_down",
+            ),
+            moe_nvfp4_mmq_quantize_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_quantize_bf16",
+            ),
+            moe_nvfp4_mmq_repack_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_repack_batched",
+            ),
+            moe_nvfp4_mmq_silu_scale2_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_silu_scale2",
+            ),
+            moe_nvfp4_mmq_scale2_rows_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_scale2_rows",
+            ),
+            moe_expert_gate_up_shared_mmq_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_mmq",
+                "moe_expert_gate_up_shared_mmq",
+            ),
+            moe_expert_silu_down_shared_mmq_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_mmq",
+                "moe_expert_silu_down_shared_mmq",
+            ),
+            quantize_nvfp4_k: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+            silu_mul_quant_nvfp4_k: super::super::try_kernel(
+                gpu,
+                "moe_silu_mul",
+                "silu_mul_quant_nvfp4",
+            ),
             moe_fused_gate_up_t: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t")?,
             moe_fused_gate_up_t_k64: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64")?,
             // ARM-2 Phase-K native-MXFP4 (E8M0) prefill variants — try_kernel:
@@ -270,6 +326,7 @@ impl MoeLayer {
             moe_act_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?, // default: SiLU
             gelu_activation: false,
             moe_unpermute_reduce: gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,
+            moe_unpermute_reduce_ep: gpu.kernel("moe", "moe_unpermute_reduce_indexed_ep")?,
             moe_batched_blend: gpu.kernel("moe", "moe_batched_blend")?,
             gate_ptrs,
             up_ptrs,
@@ -367,10 +424,21 @@ impl MoeLayer {
             unified_layout: std::env::var("ATLAS_UNIFIED_MOE_LAYOUT")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            nvfp4_mmq_layout: false,
+            _nvfp4_mmq_owned: Vec::new(),
             hybrid_layout: std::env::var("ATLAS_HYBRID_MOE_LAYOUT")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             nvfp4_gate_up_m128: std::env::var("ATLAS_NVFP4_GATE_UP_M128")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            nvfp4_down_m32: std::env::var("ATLAS_NVFP4_DOWN_M32")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            nvfp4_prequant_moe: std::env::var("ATLAS_NVFP4_PREQUANT_MOE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            nvfp4_fused_silu_quant: std::env::var("ATLAS_NVFP4_FUSED_SILU_QUANT")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             // FP4 prefill MoE over the shared FAST_MOE=full [K/2,N] tables.

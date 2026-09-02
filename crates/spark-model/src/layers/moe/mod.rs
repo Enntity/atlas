@@ -169,6 +169,7 @@ pub struct MoeLayer {
     /// When true, decode uses the sorted prefill path (avoids fused SiLU kernels).
     gelu_activation: bool,
     moe_unpermute_reduce: KernelHandle,
+    moe_unpermute_reduce_ep: KernelHandle,
     moe_batched_blend: KernelHandle,
     /// Pointer tables for batched expert dispatch.
     gate_ptrs: ExpertPtrTable,
@@ -242,6 +243,12 @@ pub struct MoeLayer {
     /// dispatch falls through to the original `[N, K/2]` kernels.
     /// Resolved once at construction.
     unified_layout: bool,
+    /// Equal-size block_nvfp4 routed-weight replacement used by the grouped
+    /// Blackwell MMQ prefill path and its decode-compatible GEMV kernels.
+    nvfp4_mmq_layout: bool,
+    /// Slab allocations backing `gate_ptrs` / `up_ptrs` / `down_ptrs` while
+    /// `nvfp4_mmq_layout` is active. Pointer tables do not own their targets.
+    _nvfp4_mmq_owned: Vec<DevicePtr>,
     /// `ATLAS_NVFP4_GATE_UP_M128=1` opts in to the M=128 fused gate+up
     /// kernel (Block D #3, Atlas tile-shape rewrite). Halves block count
     /// at large prefill — better SM amortization on GB10's 25-SM budget.
@@ -249,6 +256,16 @@ pub struct MoeLayer {
     /// `moe_fused_gate_up_t_k64_m128 == KernelHandle(0)` and dispatch
     /// falls through to the M=64 path even when the env var is set.
     nvfp4_gate_up_m128: bool,
+    /// `ATLAS_NVFP4_DOWN_M32=1` opts routed prefill down projection into a
+    /// two-warp M=32 specialization. This targets sparse expert batches and
+    /// is intentionally independent of gate/up while it is being measured.
+    nvfp4_down_m32: bool,
+    /// Quantize routed activations once, then use native block-scaled FP4 MMA
+    /// for gate/up/down without any persistent weight duplication.
+    nvfp4_prequant_moe: bool,
+    /// Fuse DeepSeek/GLM SiLU·mul with activation NVFP4 quantization. The
+    /// compact result is staged safely through down scratch before down GEMM.
+    nvfp4_fused_silu_quant: bool,
     /// `ATLAS_HOLO_MOE_GATEUP_FP4=1` opts the prefill fused gate_up onto the
     /// block-scaled FP4 kernel. Reads the SHARED FAST_MOE=full `gate_ptrs_t`/
     /// `up_ptrs_t` `[K/2,N]` tables (no extra MoE memory); dispatch also requires
@@ -272,6 +289,19 @@ pub struct MoeLayer {
     shared_down_t: Option<QuantizedWeight>,
     moe_grouped_gemm_t: KernelHandle,
     moe_grouped_gemm_t_k64: KernelHandle,
+    /// Optional M=32 NVFP4 twin of `moe_grouped_gemm_t_k64`.
+    moe_grouped_gemm_t_k64_m32: KernelHandle,
+    moe_w4a4_prequant_t_k64: KernelHandle,
+    moe_nvfp4_mmq_gate_up_k: KernelHandle,
+    moe_nvfp4_mmq_down_k: KernelHandle,
+    moe_nvfp4_mmq_quantize_k: KernelHandle,
+    moe_nvfp4_mmq_repack_k: KernelHandle,
+    moe_nvfp4_mmq_silu_scale2_k: KernelHandle,
+    moe_nvfp4_mmq_scale2_rows_k: KernelHandle,
+    moe_expert_gate_up_shared_mmq_k: KernelHandle,
+    moe_expert_silu_down_shared_mmq_k: KernelHandle,
+    quantize_nvfp4_k: KernelHandle,
+    silu_mul_quant_nvfp4_k: KernelHandle,
     moe_fused_gate_up_t: KernelHandle,
     moe_fused_gate_up_t_k64: KernelHandle,
     // ARM-2 Phase-K: native-MXFP4 (E8M0 per-32) prefill variants of the W4A16
@@ -451,7 +481,9 @@ impl MoeLayer {
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod compact_layout;
 mod dump;
+mod ep_prefill;
 mod forward;
 mod lora;
 mod lora_gateup;
@@ -474,8 +506,10 @@ mod helpers_a;
 mod helpers_b;
 mod helpers_c;
 mod init;
+mod mmq_layout;
 #[cfg(test)]
 mod mod_tests;
+mod prequant_fp4;
 mod ptr_table_build;
 mod union_stats;
 pub(crate) use ptr_table_build::*;

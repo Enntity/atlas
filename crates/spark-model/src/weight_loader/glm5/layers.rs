@@ -9,6 +9,7 @@ use spark_runtime::weights::WeightStore;
 use crate::layer::TransformerLayer;
 use crate::layers::qwen3_attention::{MlaWeights, Qwen3AttentionLayer};
 use crate::layers::{FfnComponent, Glm5KdaLayer};
+use crate::tp_shard::shard_dense_bf16;
 use crate::weight_map::{
     AttentionWeights, DenseWeight, QuantizeCtx, QuantizedWeight, dense_auto, detect_nvfp4_variant,
 };
@@ -40,7 +41,7 @@ pub(super) fn load_all(
         let hc = super::components::load_hc(store, &lp, config, gpu)?;
         match config.layer_type(layer_idx) {
             LayerType::LinearAttention => {
-                let weights = super::components::load_kda_weights(store, &lp, config, gpu)?;
+                let weights = super::components::load_kda_weights(store, &lp, config, gpu, qctx)?;
                 layers.push(Box::new(Glm5KdaLayer::new(
                     input_norm,
                     post_attn_norm,
@@ -101,13 +102,30 @@ fn load_mla_layer(
     kv_dtype: KvCacheDtype,
 ) -> Result<Box<dyn TransformerLayer>> {
     let p = format!("{lp}.self_attn");
+    let tp = super::tp::MlaTpPlan::from_config(config);
+    let load_tp = |name: &str, shape: (usize, usize, crate::tp_shard::TpShardKind)| {
+        let source = dense_auto(store, &format!("{p}.{name}.weight"), gpu)?;
+        let (local, _, _) = shard_dense_bf16(
+            source.weight,
+            shape.0,
+            shape.1,
+            shape.2,
+            tp.tp_rank,
+            tp.tp_size,
+            gpu,
+        )?;
+        if local != source.weight {
+            gpu.free(source.weight)?;
+        }
+        Ok::<DenseWeight, anyhow::Error>(DenseWeight { weight: local })
+    };
     let wq_a = dense_auto(store, &format!("{p}.q_a_proj.weight"), gpu)?;
-    let wq_b = dense_auto(store, &format!("{p}.q_b_proj.weight"), gpu)?;
+    let wq_b = load_tp("q_b_proj", tp.q_b())?;
     let wkv_a = dense_auto(store, &format!("{p}.kv_a_proj_with_mqa.weight"), gpu)?;
-    let wkv_b = dense_auto(store, &format!("{p}.kv_b_proj.weight"), gpu)?;
-    let wo = dense_auto(store, &format!("{p}.o_proj.weight"), gpu)?;
-    let wq_b_shape = store.get(&format!("{p}.q_b_proj.weight"))?.shape.clone();
-    let wkv_b_shape = store.get(&format!("{p}.kv_b_proj.weight"))?.shape.clone();
+    let wkv_b = load_tp("kv_b_proj", tp.kv_b())?;
+    let wo = load_tp("o_proj", tp.o())?;
+    let wq_b_shape = tp.local_q_b_shape();
+    let wkv_b_shape = tp.local_kv_b_shape();
     let (w_uk_t, w_uv, wq_b_rope, _) = super::super::deepseek_v4::compute::build_per_head_views(
         &wkv_b,
         &wkv_b_shape,

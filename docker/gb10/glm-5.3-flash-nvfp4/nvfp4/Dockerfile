@@ -10,6 +10,12 @@
 
 FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS builder
 
+# Keep native grouped NVFP4 builds reproducible. CUTLASS is header-only; its
+# pinned headers are consumed by spark-runtime/build.rs when CUTLASS_HOME is
+# present, while deployments that leave the grouped path disabled are
+# unaffected at runtime.
+ARG CUTLASS_SHA=cf064d2e6bad2886238ac565b3b49007764f4939
+
 RUN apt-get update -qq && \
     apt-get install -y -qq curl build-essential pkg-config git cmake libclang-dev \
       libibverbs-dev librdmacm-dev && \
@@ -18,6 +24,10 @@ RUN apt-get update -qq && \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 ENV CUDA_HOME=/usr/local/cuda
+ENV CUTLASS_HOME=/opt/cutlass
+
+RUN git clone --filter=blob:none https://github.com/NVIDIA/cutlass.git ${CUTLASS_HOME} && \
+    git -C ${CUTLASS_HOME} checkout ${CUTLASS_SHA}
 
 WORKDIR /build
 

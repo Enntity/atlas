@@ -4,6 +4,7 @@
 
 mod components;
 mod layers;
+mod tp;
 
 use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
@@ -19,7 +20,7 @@ pub struct Glm5WeightLoader;
 
 impl ModelWeightLoader for Glm5WeightLoader {
     fn supports_tp(&self) -> bool {
-        false
+        true
     }
 
     fn load_layers(

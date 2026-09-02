@@ -12,6 +12,11 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
+use crate::weight_map::DenseWeight;
+
+fn use_cublas_mla_prefill(cublas_enabled: bool, num_tokens: u32) -> bool {
+    cublas_enabled && num_tokens > 1
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) struct CacheSkipMlaArgs {
@@ -29,6 +34,48 @@ pub(super) struct CacheSkipMlaArgs {
 }
 
 impl Qwen3AttentionLayer {
+    #[allow(clippy::too_many_arguments)]
+    fn mla_prefill_dense(
+        &self,
+        input: DevicePtr,
+        weight: &DenseWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if use_cublas_mla_prefill(ctx.dispatch.cublas_gemm, m) {
+            return ops::cublas_bf16_proj_dense(input, weight.weight, output, m, n, k, stream);
+        }
+        if self.dense_gemm_tc_k.0 != 0 {
+            ops::dense_gemm_tc(
+                ctx.gpu,
+                self.dense_gemm_tc_k,
+                input,
+                weight,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            )
+        } else {
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm_k,
+                input,
+                weight,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            )
+        }
+    }
+
     /// Run the cache-skip MLA prefill chain. Always returns the output
     /// pointer — caller short-circuits with `return Ok(out)`.
     pub(super) fn prefill_attention_cache_skip_mla(
@@ -60,35 +107,24 @@ impl Qwen3AttentionLayer {
         let mla_nope = mla.nope as u32;
         let mla_v_dim = mla.v_dim as u32;
         let mla_rope = mla.rope as u32;
-        let use_tc = self.dense_gemm_tc_k.0 != 0;
+        macro_rules! mprof {
+            ($label:expr, $started:expr) => {
+                if let Some(started) = $started {
+                    ctx.gpu.synchronize(stream)?;
+                    tracing::info!(
+                        "  MLA prefill [{}] N={}: {}µs",
+                        $label,
+                        n,
+                        started.elapsed().as_micros()
+                    );
+                }
+            };
+        }
+        let mut started = ctx.profile.then(std::time::Instant::now);
 
         // Q: latent → norm → expand
         let q_latent = ctx.buffers.ssm_ba();
-        if use_tc {
-            ops::dense_gemm_tc(
-                ctx.gpu,
-                self.dense_gemm_tc_k,
-                normed,
-                &mla.wq_a,
-                q_latent,
-                n,
-                q_lora,
-                h,
-                stream,
-            )?;
-        } else {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
-                normed,
-                &mla.wq_a,
-                q_latent,
-                n,
-                q_lora,
-                h,
-                stream,
-            )?;
-        }
+        self.mla_prefill_dense(normed, &mla.wq_a, q_latent, n, q_lora, h, ctx, stream)?;
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_w_k,
@@ -101,59 +137,13 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
         let qg_out = ctx.buffers.qkv_output();
-        if use_tc {
-            ops::dense_gemm_tc(
-                ctx.gpu,
-                self.dense_gemm_tc_k,
-                q_latent,
-                &mla.wq_b,
-                qg_out,
-                n,
-                nq * hd,
-                q_lora,
-                stream,
-            )?;
-        } else {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
-                q_latent,
-                &mla.wq_b,
-                qg_out,
-                n,
-                nq * hd,
-                q_lora,
-                stream,
-            )?;
-        }
+        self.mla_prefill_dense(q_latent, &mla.wq_b, qg_out, n, nq * hd, q_lora, ctx, stream)?;
+        mprof!("q_latent_expand", started);
+        started = ctx.profile.then(std::time::Instant::now);
 
         // KV latent + K_rope
         let kv_latent = ctx.buffers.expert_gate_out();
-        if use_tc {
-            ops::dense_gemm_tc(
-                ctx.gpu,
-                self.dense_gemm_tc_k,
-                normed,
-                &mla.wkv_a,
-                kv_latent,
-                n,
-                kv_lora,
-                h,
-                stream,
-            )?;
-        } else {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
-                normed,
-                &mla.wkv_a,
-                kv_latent,
-                n,
-                kv_lora,
-                h,
-                stream,
-            )?;
-        }
+        self.mla_prefill_dense(normed, &mla.wkv_a, kv_latent, n, kv_lora, h, ctx, stream)?;
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_w_k,
@@ -166,31 +156,20 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
         let k_rope_buf = ctx.buffers.ssm_ba();
-        if mla_rope > 0 && use_tc {
-            ops::dense_gemm_tc(
-                ctx.gpu,
-                self.dense_gemm_tc_k,
+        if mla_rope > 0 {
+            self.mla_prefill_dense(
                 normed,
                 &mla.wkv_a_rope,
                 k_rope_buf,
                 n,
                 mla_rope,
                 h,
-                stream,
-            )?;
-        } else if mla_rope > 0 {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
-                normed,
-                &mla.wkv_a_rope,
-                k_rope_buf,
-                n,
-                mla_rope,
-                h,
+                ctx,
                 stream,
             )?;
         }
+        mprof!("kv_latent", started);
+        started = ctx.profile.then(std::time::Instant::now);
 
         // Q rope extract → RoPE. GLM-5 has a zero-width RoPE partition.
         let q_rope_tmp = ctx.buffers.ssm_conv_out_f32();
@@ -260,19 +239,20 @@ impl Qwen3AttentionLayer {
             stream,
             ctx.graph_capture,
         )?;
+        mprof!("cache_write", started);
+        started = ctx.profile.then(std::time::Instant::now);
 
         // Unabsorbed (MHA) prefill: expand K/V via wkv_b, use HDIM=128 FlashAttention
         let kv_expanded_dim = nkv * (mla_nope + mla_v_dim);
         let kv_expanded = ctx.buffers.ssm_deinterleaved();
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm_k,
+        self.mla_prefill_dense(
             kv_latent,
             &mla.wkv_b,
             kv_expanded,
             n,
             kv_expanded_dim,
             kv_lora,
+            ctx,
             stream,
         )?;
         let k_contiguous = ctx.buffers.ssm_qkvz();
@@ -308,6 +288,8 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
+        mprof!("kv_expand", started);
+        started = ctx.profile.then(std::time::Instant::now);
         let attn_out_fb = ctx.buffers.attn_output();
         ops::prefill_attention_64(
             ctx.gpu,
@@ -327,6 +309,8 @@ impl Qwen3AttentionLayer {
             stream,
         )
         .map_err(|e| anyhow::anyhow!("MLA flash_attn_64 fallback: {e}"))?;
+        mprof!("flash_attention", started);
+        started = ctx.profile.then(std::time::Instant::now);
         // wo projection — output to qkv_output (norm_output aliases downstream)
         let o_out = ctx.buffers.qkv_output();
         if let Some(ref wo_nvfp4) = mla.wo_nvfp4 {
@@ -342,18 +326,22 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
-                attn_out_fb,
-                &mla.wo,
-                o_out,
-                n,
-                h,
-                nq * hd,
-                stream,
-            )?;
+            self.mla_prefill_dense(attn_out_fb, &mla.wo, o_out, n, h, nq * hd, ctx, stream)?;
         }
+        mprof!("o_proj", started);
         Ok(o_out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_cublas_mla_prefill;
+
+    #[test]
+    fn cublas_mla_prefill_requires_batch_work_and_dispatch_support() {
+        assert!(use_cublas_mla_prefill(true, 2));
+        assert!(use_cublas_mla_prefill(true, 1000));
+        assert!(!use_cublas_mla_prefill(true, 1));
+        assert!(!use_cublas_mla_prefill(false, 1000));
     }
 }
