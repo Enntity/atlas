@@ -58,6 +58,7 @@ MTP_SPEC_THINK="${MTP_SPEC_THINK:-1}"
 MTP_GATE_FORCE="${MTP_GATE_FORCE:-0}"
 MTP_TIMING="${MTP_TIMING:-0}"
 VERIFY_PROFILE="${VERIFY_PROFILE:-0}"
+MOE_UNION_STATS="${MOE_UNION_STATS:-0}"
 
 if (( MAX_SEQ_LEN > 2048 )); then
   echo "ERROR: initial GLM-5.3 Atlas support is capped at 2048 tokens." >&2
@@ -124,6 +125,10 @@ if [[ "$MTP_TIMING" != "0" && "$MTP_TIMING" != "1" ]]; then
 fi
 if [[ "$VERIFY_PROFILE" != "0" && "$VERIFY_PROFILE" != "1" ]]; then
   echo "ERROR: VERIFY_PROFILE must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$MOE_UNION_STATS" != "0" && "$MOE_UNION_STATS" != "1" ]]; then
+  echo "ERROR: MOE_UNION_STATS must be 0 or 1." >&2
   exit 2
 fi
 
@@ -247,6 +252,7 @@ echo "  MTP speculative / draft tokens: $SPECULATIVE / $NUM_DRAFTS"
 echo "  MTP during thinking / force gate: $MTP_SPEC_THINK / $MTP_GATE_FORCE"
 echo "  MTP phase timing: $MTP_TIMING"
 echo "  GLM verifier layer profile: $VERIFY_PROFILE"
+echo "  sampled MoE expert-union stats: $MOE_UNION_STATS"
 
 # Never leave one stale rank in an old communicator.
 docker rm -f atlas-glm53-ep0 2>/dev/null || true
@@ -289,6 +295,7 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_MTP_GATE_FORCE=$MTP_GATE_FORCE \
   -e ATLAS_MTP_TIMING=$MTP_TIMING \
   -e ATLAS_GLM_VERIFY_PROFILE=$VERIFY_PROFILE \
+  -e ATLAS_MOE_UNION_STATS=$MOE_UNION_STATS \
   $REMOTE_MOUNT $IMAGE $REMOTE_SERVE --rank 1 --port 0"
 
 docker run -d \
@@ -323,6 +330,7 @@ docker run -d \
   -e ATLAS_MTP_GATE_FORCE="$MTP_GATE_FORCE" \
   -e ATLAS_MTP_TIMING="$MTP_TIMING" \
   -e ATLAS_GLM_VERIFY_PROFILE="$VERIFY_PROFILE" \
+  -e ATLAS_MOE_UNION_STATS="$MOE_UNION_STATS" \
   "${MOUNT_FLAGS[@]}" \
   "$IMAGE" "${COMMON_SERVE_ARGS[@]}" --rank 0 --port "$PORT"
 

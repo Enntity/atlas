@@ -380,6 +380,29 @@ impl FfnComponent {
         }
     }
 
+    /// Fixed four-row speculative-verifier FFN. Returns the actual output
+    /// buffer because GLM's MoE composition safely stages over its norm input,
+    /// while dense batchm writes the conventional `moe_output` scratch.
+    pub fn forward_k4(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        match self {
+            Self::Moe(m) => m.forward_k4(input, ctx, stream),
+            Self::Dense(d) if d.can_forward_km(4) => {
+                d.forward_km(input, 4, ctx, stream)?;
+                Ok(ctx.buffers.moe_output())
+            }
+            Self::Dense(d) => {
+                d.forward_prefill(input, 4, ctx, stream)?;
+                Ok(ctx.buffers.moe_output())
+            }
+            Self::None => Ok(input),
+        }
+    }
+
     /// Whether the K=m (m<=8) batched-GEMV verify FFN is available (dense
     /// only — MoE / missing batch4/batch8 kernel / non-NVFP4 weights →
     /// false). Lets callers gate branch entry BEFORE computing the pre-FFN

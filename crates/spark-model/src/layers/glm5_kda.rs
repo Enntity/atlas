@@ -563,23 +563,9 @@ impl Glm5KdaLayer {
             self.ffn.forward_k3(normed, ctx, stream)?;
             ctx.buffers.moe_output()
         } else if capture_verify_intermediates && tokens == 4 && verify_batched_ffn_enabled() {
-            // K=4 verification is still decode-sized. Process it as two
-            // native K=2 MoE passes so gate/up/down expert weights are shared
-            // by each pair. `moe_output` is shared scratch, therefore stage
-            // pair 0 into the now-dead norm input before pair 1 overwrites it.
-            // Rows 2/3 remain untouched until their own pass.
-            for pair in 0..2 {
-                let row_offset = pair * 2 * self.hidden_size * 2;
-                self.ffn
-                    .forward_k2(normed.offset(row_offset), ctx, stream)?;
-                ctx.gpu.copy_d2d_async(
-                    ctx.buffers.moe_output(),
-                    normed.offset(row_offset),
-                    2 * self.hidden_size * 2,
-                    stream,
-                )?;
-            }
-            normed
+            // Dense layers use one batch4 GEMV; GLM MoE layers preserve the
+            // parallel K2 routed path while evaluating the shared expert once.
+            self.ffn.forward_k4(normed, ctx, stream)?
         } else if capture_verify_intermediates {
             self.ffn.forward_batched(normed, tokens, ctx, stream)?;
             ctx.buffers.moe_output()

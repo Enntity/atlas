@@ -232,7 +232,10 @@ fn load_moe(
         // layout one layer at a time. The transpose helper frees each source
         // phase before advancing, and EP slabs contain only locally owned
         // experts, so peak memory stays bounded on dual GB10.
-        layer.transpose_for_prefill_unified(gpu, config)?;
+        // K=4 verification batches GLM's always-on shared expert through the
+        // exact-M=4 GEMV, which needs its decode-native layout. Routed experts
+        // remain transposed-only to avoid hybrid layout's memory cost.
+        layer.transpose_for_prefill_unified_keep_shared(gpu, config)?;
     }
     Ok(FfnComponent::Moe(layer))
 }

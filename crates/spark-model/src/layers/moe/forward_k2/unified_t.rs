@@ -28,6 +28,7 @@ impl MoeLayer {
         top_k: u32,
         is_ep: bool,
         mixed_bf16_shared: bool,
+        include_shared: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -48,7 +49,7 @@ impl MoeLayer {
         // → the kernel skips it) and compute it in BF16 below instead. The
         // NVFP4 shared_*_t tables are load-time placeholders whose values
         // would be numerically wrong for this checkpoint.
-        let (sh_gate_t, sh_up_t, sh_down_t) = if mixed_bf16_shared {
+        let (sh_gate_t, sh_up_t, sh_down_t) = if mixed_bf16_shared || !include_shared {
             (&null_qw, &null_qw, &null_qw)
         } else {
             (
@@ -79,6 +80,14 @@ impl MoeLayer {
             top_k,
             stream,
         )?;
+        // In routed-only mode keep the precomputed four-row shared output in
+        // attn_output intact. Rows 2/3 of moe_output are outside this K2
+        // result and provide a zero scratch for the disabled shared branch.
+        let kernel_shared_down_out = if include_shared {
+            shared_down_out
+        } else {
+            output.offset(2 * h as usize * 2)
+        };
         ops::moe_expert_silu_down_shared_batch2_t(
             ctx.gpu,
             self.moe_expert_silu_down_shared_batch2_t_k,
@@ -92,7 +101,7 @@ impl MoeLayer {
             shared_gate_scratch,
             shared_up_scratch,
             sh_down_t,
-            shared_down_out,
+            kernel_shared_down_out,
             h,
             inter,
             top_k,
@@ -118,7 +127,9 @@ impl MoeLayer {
         }
         // The _t branch previously returned without writing moe_output at
         // all — every sibling branch ends in this blend.
-        let shared_for_blend = if is_ep && !shared_down_out.is_null() {
+        let shared_for_blend = if !include_shared {
+            kernel_shared_down_out
+        } else if is_ep && !shared_down_out.is_null() {
             ctx.gpu
                 .memset_async(expert_gate_out, 0, 2 * h as usize * 2, stream)?;
             expert_gate_out

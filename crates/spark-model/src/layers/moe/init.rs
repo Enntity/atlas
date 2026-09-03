@@ -113,6 +113,7 @@ impl MoeLayer {
             moe_weighted_sum_blend_batch3: gpu
                 .kernel("moe_fused_batch3", "moe_weighted_sum_blend_batch3")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            w4a16_gemv_batch4: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch4")?,
             moe_expert_gate_up_shared_token_major: gpu
                 .kernel("moe_prefill", "moe_expert_gate_up_shared_prefill")?,
             moe_expert_silu_down_shared_token_major: gpu

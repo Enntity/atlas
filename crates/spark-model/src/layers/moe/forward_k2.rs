@@ -21,6 +21,41 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.forward_k2_impl(input, ctx, stream, true)
+    }
+
+    /// K=2 routed experts only. Used twice by GLM's K=4 verifier after its
+    /// shared expert has already been evaluated once over all four rows.
+    pub(super) fn forward_k2_routed_only(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.forward_k2_impl(input, ctx, stream, false)
+    }
+
+    fn forward_k2_impl(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+        include_shared: bool,
+    ) -> Result<()> {
+        if !include_shared {
+            anyhow::ensure!(
+                self.lora.is_none()
+                    && self.bf16_gate_weight_ptrs.is_none()
+                    && self.fp8_gate_weight_ptrs.is_none()
+                    && !self.has_mixed_bf16_shared_expert()
+                    && matches!(
+                        self.experts_scale_kind,
+                        crate::weight_map::WeightQuantFormat::Nvfp4
+                    )
+                    && self.use_t_layout_for_decode(),
+                "routed-only K2 requires unified-layout NVFP4 experts"
+            );
+        }
         // Feature-1: the fused batch2 fast path has no fold hook. When a MoE
         // adapter is RESIDENT (install-time-fixed → graph-safe; graphs drain on
         // rotate/swap), route to the per-row batched fallback which folds
@@ -347,6 +382,7 @@ impl MoeLayer {
                 top_k,
                 is_ep,
                 mixed_bf16_shared,
+                include_shared,
                 ctx,
                 stream,
             )?;
@@ -388,7 +424,7 @@ impl MoeLayer {
                 comm.all_reduce_async(output.0, 2 * h as usize * 2, stream)?;
             }
             // Add shared expert with sigmoid gate (BUG #41 fix)
-            if !shared_down_out.is_null() {
+            if include_shared && !shared_down_out.is_null() {
                 if self.weights.shared_expert_gate.weight.0 == 0 {
                     ops::residual_add(
                         ctx.gpu,

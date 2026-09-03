@@ -145,9 +145,9 @@ impl MoeLayer {
     ///   C. Transpose down                  (allocs +20 GB; free ≈ 27 GB)
     ///   D. Free down untransposed          (frees 20 GB; free ≈ 47 GB)
     ///
-    /// Net memory: same as starting point, but layout is now unified
-    /// (transposed-only) — the `[N, K/2]` decode kernels can no longer
-    /// run; dispatch must use the `_t` decode kernels (which do).
+    /// Net memory: all originals are freed and the layout is transposed-only.
+    /// Models that need a decode-native shared expert use the explicitly named
+    /// `transpose_for_prefill_unified_keep_shared` variant below.
     ///
     /// Caller responsibilities:
     ///   1. Set `ATLAS_UNIFIED_MOE_LAYOUT=1` so `MoeLayer::use_t_layout_for_decode()`
@@ -159,7 +159,19 @@ impl MoeLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
-        self.transpose_for_prefill_unified_inner(gpu, config, false)
+        self.transpose_for_prefill_unified_inner(gpu, config, false, false)
+    }
+
+    /// Unified routed-expert layout while retaining only the small shared
+    /// expert's decode-native weights. GLM K=4 verification uses this to run
+    /// an exact-M=4 shared projection without paying hybrid layout's cost for
+    /// every routed expert.
+    pub fn transpose_for_prefill_unified_keep_shared(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        self.transpose_for_prefill_unified_inner(gpu, config, false, true)
     }
 
     /// Hybrid-layout transpose pass — analogue of `transpose_for_prefill_unified`
@@ -174,19 +186,20 @@ impl MoeLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
-        self.transpose_for_prefill_unified_inner(gpu, config, true)
+        self.transpose_for_prefill_unified_inner(gpu, config, true, true)
     }
 
     /// Phased build of the transposed weight set. When `keep_originals` is true
     /// (hybrid-layout mode), Phase B and Phase D frees are skipped so decode
     /// paths still find the untransposed weights. When false (unified-layout
-    /// mode), the originals are freed between phases — current Phase 8a
-    /// behavior.
+    /// mode), routed originals are freed between phases. The independent
+    /// `keep_shared_originals` bit exempts only the shared expert.
     pub(super) fn transpose_for_prefill_unified_inner(
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
         keep_originals: bool,
+        keep_shared_originals: bool,
     ) -> Result<()> {
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
@@ -262,7 +275,10 @@ impl MoeLayer {
                     expert.up_proj.weight_scale = DevicePtr::NULL;
                 }
             }
-            if !self.weights.shared_expert.gate_proj.weight.is_null() && shared_inter > 0 {
+            if !keep_shared_originals
+                && !self.weights.shared_expert.gate_proj.weight.is_null()
+                && shared_inter > 0
+            {
                 gpu.free(self.weights.shared_expert.gate_proj.weight)?;
                 gpu.free(self.weights.shared_expert.gate_proj.weight_scale)?;
                 self.weights.shared_expert.gate_proj.weight = DevicePtr::NULL;
@@ -307,7 +323,10 @@ impl MoeLayer {
                     expert.down_proj.weight_scale = DevicePtr::NULL;
                 }
             }
-            if !self.weights.shared_expert.down_proj.weight.is_null() && shared_inter > 0 {
+            if !keep_shared_originals
+                && !self.weights.shared_expert.down_proj.weight.is_null()
+                && shared_inter > 0
+            {
                 gpu.free(self.weights.shared_expert.down_proj.weight)?;
                 gpu.free(self.weights.shared_expert.down_proj.weight_scale)?;
                 self.weights.shared_expert.down_proj.weight = DevicePtr::NULL;
