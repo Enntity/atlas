@@ -25,6 +25,7 @@ mod ctx;
 mod ffn;
 mod mla;
 mod mla_gemv;
+mod mla_glm;
 mod qkv;
 
 impl Qwen3AttentionLayer {

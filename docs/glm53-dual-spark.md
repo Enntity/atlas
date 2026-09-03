@@ -41,10 +41,10 @@ The launcher intentionally starts with:
 - the worker rank first and no automatic restart policy.
 
 The KDA register-resident prefill path, KDA multi-sequence decode, width-three
-batched FFN, unified MoE layout, and cuBLASLt projection dispatch are enabled by
-default. Their diagnostic fallbacks are `KDA_REGRESIDENT_PREFILL=0`,
-`KDA_MULTI_SEQ=0`, `KDA_BATCHED_FFN=0`, `UNIFIED_MOE_LAYOUT=0`, and
-`CUBLAS_GEMM=0`.
+batched FFN, guarded GLM MLA projection batching, unified MoE layout, and
+cuBLASLt projection dispatch are enabled by default. Their diagnostic fallbacks
+are `KDA_REGRESIDENT_PREFILL=0`, `KDA_MULTI_SEQ=0`, `KDA_BATCHED_FFN=0`,
+`MLA_MULTI_SEQ=0`, `UNIFIED_MOE_LAYOUT=0`, and `CUBLAS_GEMM=0`.
 KDA Q/K/V and row-parallel output projections keep independent decode-native
 NVFP4 weights plus transposed M=128 prefill twins. The output twins add about
 0.3 GiB per rank across all 34 KDA layers without changing decode numerics.
@@ -97,6 +97,13 @@ state updates remain per sequence. At width three, Atlas's existing grouped FFN
 path processes all rows together. Width two deliberately retains the sequential
 FFN path because the grouped version was neutral in isolated GB10 measurements.
 
+GLM's 11 full-attention layers use checkpoint-native BF16 MLA matrices. The
+guarded width-two/three path now reads each large Q-down, Q-up, KV-latent, and
+output matrix once for the active batch through Atlas's existing batched dense
+projection primitive. Absorption, cache writes, paged attention, and value
+extraction remain sequence-private. This confines the optimization to stateless
+work and preserves the established cache semantics.
+
 The concurrency receipt uses simultaneous streaming requests with identical
 1,000-token prompts and 96 requested output tokens. Each cell has one warm-up
 and three measured repetitions. `Aggregate window` divides all completion tokens
@@ -105,17 +112,24 @@ by the interval from the first emitted token to the last completed stream;
 
 | Concurrent sessions | Per-session decode (median tok/s) | Sum receipts (tok/s) | Aggregate window (tok/s) | Median TTFT |
 |---:|---:|---:|---:|---:|
-| 1 | 12.606 | 12.606 | 12.738 | 1.063 s |
-| 2 | 7.683 | 15.366 | 14.760 | 1.070 s |
-| 3 | 6.345 | 19.119 | 17.872 | 1.065 s |
+| 1 | 12.627 | 12.627 | 12.760 | 1.066 s |
+| 2 | 8.003 | 16.006 | 15.342 | 1.066 s |
+| 3 | 6.852 | 20.654 | 19.175 | 1.066 s |
 
-Aggregate window throughput is monotonic through C=3: C=2 is 15.9% above C=1
-and C=3 is 40.3% above C=1. Against the prior exact-width result, KDA batching
-raises C=2 from 12.820 to 14.760 tok/s and C=3 from 13.136 to 17.872 tok/s. A
-normal-mode C=3 A/B measured 16.003 tok/s with batched FFN disabled, so grouped
-width-three FFN contributes another 11.7%; the rest comes from KDA projection
-and hyper-connection batching. Before exact-width EP dispatch, C=3 was 10.571
-tok/s because it executed the padded fourth row.
+Aggregate window throughput is monotonic through C=3: C=2 is 20.2% above C=1
+and C=3 is 50.3% above C=1. Against the preceding KDA-batched result, MLA
+projection batching raises C=2 from 14.760 to 15.342 tok/s (+3.9%) and C=3 from
+17.872 to 19.175 tok/s (+7.3%). The server-reported summed C=3 rate reaches
+20.654 tok/s. Before MLA work, KDA batching had raised C=2 from 12.820 to
+14.760 tok/s and C=3 from 13.136 to 17.872 tok/s. A normal-mode C=3 A/B measured
+16.003 tok/s with batched FFN disabled, so grouped width-three FFN contributed
+another 11.7%. Before exact-width EP dispatch, C=3 was 10.571 tok/s because it
+executed the padded fourth row.
+
+The guarded MLA path also passed a three-stream long-prompt needle test: the
+independent `SAPPHIRE-7319`, `EMBER-4826`, and `QUARTZ-9051` codes were all
+recovered exactly. The receipt used raw completions to prevent hidden reasoning
+tokens from exhausting a short chat response budget.
 
 Reproduce the table on the head node with:
 

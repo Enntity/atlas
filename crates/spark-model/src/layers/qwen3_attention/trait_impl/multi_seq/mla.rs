@@ -91,6 +91,14 @@ impl Qwen3AttentionLayer {
         // consumes the same buffer for both paths.
         let o_out = c.fwd.buffers.moe_output();
 
+        // GLM-5's zero-RoPE MLA shape can keep the N=2/3 rows together for
+        // its large stateless projections. Cache mutation and attention stay
+        // on the proven sequence-private path; other MLA variants retain the
+        // fully conservative implementation below.
+        if self.glm_mla_multi_seq_eligible(c, mla) {
+            return self.ms_glm_mla_decode(c, kv_cache, meta, mla, o_out);
+        }
+
         for i in 0..c.n {
             let normed_i = c.normed.offset(i * c.h * bf16);
             // Per-sequence metadata views. The batched metadata packs
