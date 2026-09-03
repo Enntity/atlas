@@ -53,6 +53,7 @@ use spark_runtime::gpu::DevicePtr;
 
 use super::super::types::TransformerModel;
 use crate::layer::ForwardContext;
+use crate::layers::ops;
 use crate::traits::SequenceState;
 
 /// `ATLAS_NO_MTP_EAGER_DRAFTER` (PRESENCE): restore the propose-site-only
@@ -64,9 +65,12 @@ pub fn eager_drafter_disabled() -> bool {
 }
 
 impl TransformerModel {
-    /// ATLAS_MTP_DRAFTER_PREFILL: copy this prefill chunk's final-layer
+    /// ATLAS_MTP_DRAFTER_PREFILL: capture this prefill chunk's final-layer
     /// hiddens (`[proc_count, h]` BF16, contiguous at the head of the hidden
-    /// buffer) into the whole-prompt capture at row `chunk_start`.
+    /// buffer) at row `chunk_start`. GLM-5's MTP contract consumes the base
+    /// model's post-final-norm rows (the same representation decode supplies),
+    /// so GLM normalizes while capturing. Other proposers retain the legacy
+    /// pre-final-norm capture until their upstream contracts are audited.
     ///
     /// Contiguity-tracked: `chunk_start == 0` (re)starts the capture; a chunk
     /// extending the current range appends; anything else (prefix-cache
@@ -142,12 +146,28 @@ impl TransformerModel {
         }
         let h = self.config.hidden_size;
         let bf16 = 2usize;
-        self.gpu.copy_d2d_async(
-            src,
-            self.mtp_prefill_hidden.offset(chunk_start * h * bf16),
-            proc_count * h * bf16,
-            stream,
-        )?;
+        let dst = self.mtp_prefill_hidden.offset(chunk_start * h * bf16);
+        if self.config.model_type == "glm5_next" {
+            // vLLM's Glm5NextModel applies its final RMSNorm before returning
+            // the per-position target hiddens consumed by the MTP model. The
+            // normal Atlas prefill path only final-normalizes the last row for
+            // logits, so a plain copy here made prompt rows use a different
+            // representation from every subsequent decode row.
+            ops::rms_norm(
+                self.gpu.as_ref(),
+                self.rms_norm_kernel,
+                src,
+                &self.final_norm,
+                dst,
+                proc_count as u32,
+                h as u32,
+                self.config.rms_norm_eps as f32,
+                stream,
+            )?;
+        } else {
+            self.gpu
+                .copy_d2d_async(src, dst, proc_count * h * bf16, stream)?;
+        }
         if let Some(new_len) = contiguous_from_zero {
             self.mtp_prefill_capture_len
                 .store(new_len, Ordering::Relaxed);

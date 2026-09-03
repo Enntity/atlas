@@ -59,6 +59,25 @@ pub trait TransformerLayer: Send + Sync {
         None
     }
 
+    /// Populate only this layer's compressed MLA K/V cache for a batch of
+    /// already-combined MTP inputs. This deliberately skips Q projection,
+    /// attention, output projection, and FFN work: an autoregressive draft
+    /// layer's cached K/V depends only on its normalized input row.
+    ///
+    /// `slots` is a device array of `num_tokens` physical paged-cache slots.
+    /// The default declines the optimization; MLA attention layers override.
+    fn prefill_mla_kv_only(
+        &self,
+        _hidden: DevicePtr,
+        _num_tokens: usize,
+        _kv_cache: &mut PagedKvCache,
+        _slots: DevicePtr,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Decode one token through this layer, modifying `hidden` in-place.
     ///
     /// # Arguments

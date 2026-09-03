@@ -214,6 +214,40 @@ reduced that profiled KDA FFN total to about 89 ms. `VERIFY_PROFILE` and
 `MOE_UNION_STATS` are diagnostic only and must remain disabled for performance
 measurements.
 
+### MTP prompt-state correction and batched KV primer
+
+GLM's MTP module consumes the base model's post-final-norm hidden state for
+each shifted prompt pair. Atlas previously captured prompt rows before that
+normalization, although its decode path supplied the normalized state. This
+prefill/decode mismatch substantially reduced acceptance immediately after a
+prompt. Atlas now captures the same post-final-norm representation used by
+upstream GLM and initializes the appended MLA layer's prompt cache with a
+batched KV-only pass. The latter computes the shifted embeddings, both input
+normalizations, `eh_proj`, and compressed MLA K/V, while intentionally skipping
+historical attention output and MoE work that no future proposal consumes.
+
+`GLM_MTP_BATCHED_PREFILL` defaults to the value of `SPECULATIVE`. Set it to
+`0` and `GLM_MTP_SERIAL_PREFILL=1` only to compare against the slow full-layer
+correctness oracle; the two modes are mutually exclusive.
+
+On the same TP2+EP2, K=4 launch, the KV-only primer populated 999 prompt rows
+in 26.7--27.6 ms. After one warm-up, two exact 1,000-token requests that ended
+naturally after 113 generated tokens measured:
+
+| Run | TTFT | Prefill | Decode | Mean accepted drafts (of 3) |
+|---|---:|---:|---:|---:|
+| 1 | 1,296.959 ms | 771.034 tok/s | 18.734 tok/s | 2.645 |
+| 2 | 1,301.142 ms | 768.555 tok/s | 19.496 tok/s | 2.767 |
+
+Speculative results depend strongly on the generated sequence. A separate
+1,000-token chat benchmark forced to generate all 256 tokens measured `12.699`
+and `13.293` tok/s (12.996 median), with only 1.462 and 1.550 mean accepted
+drafts. These longer receipts are the appropriate sustained-output baseline;
+the 18.7--19.5 tok/s result demonstrates the corrected high-acceptance path,
+not a universal decode rate. The external repository's advertised 23--30
+tok/s single-session range does not include enough workload detail for a
+strict apples-to-apples comparison.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

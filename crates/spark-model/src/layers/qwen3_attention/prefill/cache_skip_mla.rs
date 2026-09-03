@@ -34,6 +34,93 @@ pub(super) struct CacheSkipMlaArgs {
 }
 
 impl Qwen3AttentionLayer {
+    /// MTP prompt-context fast path for compressed MLA. The predictor only
+    /// needs its cache populated before autoregressive proposal; none of the
+    /// layer output is consumed. For GLM-5 (NoPE, `mla.rope == 0`) K/V is a
+    /// pure function of the combined input row, so skip Q, attention, O, and
+    /// MoE entirely and write the compressed latent directly to paged cache.
+    pub(crate) fn prefill_mla_kv_only_impl(
+        &self,
+        hidden: DevicePtr,
+        num_tokens: usize,
+        kv_cache: &mut PagedKvCache,
+        slots: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let Some(mla) = self.mla.as_ref() else {
+            return Ok(false);
+        };
+        if mla.rope != 0 || num_tokens == 0 {
+            return Ok(false);
+        }
+
+        let n = num_tokens as u32;
+        let h = ctx.config.hidden_size as u32;
+        let kv_lora = mla.kv_lora_rank as u32;
+        let normed = ctx.buffers.norm_output();
+        ops::rms_norm(
+            ctx.gpu,
+            self.rms_norm_w_k,
+            hidden,
+            &self.input_norm,
+            normed,
+            n,
+            h,
+            ctx.config.rms_norm_eps as f32,
+            stream,
+        )?;
+
+        let kv_latent = ctx.buffers.expert_gate_out();
+        self.mla_prefill_dense(normed, &mla.wkv_a, kv_latent, n, kv_lora, h, ctx, stream)?;
+        ops::rms_norm(
+            ctx.gpu,
+            self.rms_norm_w_k,
+            kv_latent,
+            &mla.kv_a_norm,
+            kv_latent,
+            n,
+            kv_lora,
+            ctx.config.rms_norm_eps as f32,
+            stream,
+        )?;
+
+        // With a zero-width RoPE partition the compressed cache row is the KV
+        // latent itself for both K and V. Keep the ordinary assembly kernel so
+        // the cache layout remains identical to decode's established path.
+        let k_cache = ctx.buffers.expert_up_out();
+        let v_cache = ctx.buffers.expert_down_out();
+        ops::mla_cache_assemble_batched(
+            ctx.gpu,
+            self.mla_cache_assemble_batched_k,
+            kv_latent,
+            ctx.buffers.ssm_ba(),
+            k_cache,
+            v_cache,
+            n,
+            kv_lora,
+            0,
+            kv_lora,
+            stream,
+        )?;
+        self.write_kv_cache(
+            ctx.gpu,
+            k_cache,
+            v_cache,
+            kv_cache,
+            slots,
+            n,
+            1,
+            kv_lora,
+            kv_cache.block_size() as u32,
+            kv_lora,
+            kv_lora,
+            stream,
+            false,
+        )?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn mla_prefill_dense(
         &self,

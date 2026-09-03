@@ -46,6 +46,8 @@ pub struct Glm5MtpHead {
     kv_cache: Mutex<PagedKvCache>,
     rms_norm_k: KernelHandle,
     dense_gemv_k: KernelHandle,
+    dense_gemm_k: KernelHandle,
+    bf16_concat_k: KernelHandle,
     argmax_k: KernelHandle,
 }
 
@@ -78,6 +80,8 @@ impl Glm5MtpHead {
             kv_cache: Mutex::new(PagedKvCache::new(kv_config, num_blocks, gpu)?),
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
+            bf16_concat_k: gpu.kernel("residual_add", "bf16_concat")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
         })
     }
@@ -92,7 +96,7 @@ impl Glm5MtpHead {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward_one(
+    fn forward_body_one(
         &self,
         token: u32,
         target_hidden: DevicePtr,
@@ -100,8 +104,7 @@ impl Glm5MtpHead {
         state: &mut Glm5MtpProposerState,
         ctx: &ForwardContext,
         stream: u64,
-        grammar_bitmask: Option<&[i32]>,
-    ) -> Result<u32> {
+    ) -> Result<DevicePtr> {
         let h = ctx.config.hidden_size;
         let h_u32 = h as u32;
         let eps = ctx.config.rms_norm_eps as f32;
@@ -218,7 +221,25 @@ impl Glm5MtpHead {
         )?;
         drop(kv_cache);
 
-        let h_out = ctx.buffers.hidden_states();
+        state.seq_len += 1;
+        Ok(ctx.buffers.hidden_states())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_one(
+        &self,
+        token: u32,
+        target_hidden: DevicePtr,
+        position: usize,
+        state: &mut Glm5MtpProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+        grammar_bitmask: Option<&[i32]>,
+    ) -> Result<u32> {
+        let h_out = self.forward_body_one(token, target_hidden, position, state, ctx, stream)?;
+        let h_u32 = ctx.config.hidden_size as u32;
+        let eps = ctx.config.rms_norm_eps as f32;
+
         let final_hidden = ctx.buffers.norm_output();
         ops::rms_norm(
             ctx.gpu,
@@ -256,8 +277,172 @@ impl Glm5MtpHead {
             ctx.gpu.copy_d2h(out, &mut bytes)?;
             u32::from_le_bytes(bytes)
         };
-        state.seq_len += 1;
         Ok(draft)
+    }
+
+    /// Batch-build the shifted GLM MTP inputs and populate only the appended
+    /// MLA layer's compressed K/V cache. The body output is intentionally not
+    /// computed: future proposal rows need historical K/V, not historical
+    /// attention or MoE outputs.
+    fn prefill_kv_batched(
+        &self,
+        prompt_tokens: &[u32],
+        hiddens: DevicePtr,
+        state: &mut Glm5MtpProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
+        if state.seq_len != 0 || prompt_tokens.len() < 2 {
+            return Ok(0);
+        }
+        let started = std::time::Instant::now();
+        let h = ctx.config.hidden_size;
+        let bf16 = 2usize;
+        let rows_total = prompt_tokens.len() - 1;
+        let chunk_rows = ctx.buffers.max_batch_tokens().max(1);
+
+        let mut kv_cache = self.kv_cache.lock();
+        let bs = kv_cache.block_size();
+        let blocks_needed = rows_total.div_ceil(bs);
+        while state.block_table.len() < blocks_needed {
+            state.block_table.push(kv_cache.alloc_block()?);
+        }
+
+        let mut done = 0usize;
+        while done < rows_total {
+            let n = (rows_total - done).min(chunk_rows);
+            let embed = ctx.buffers.ssm_deinterleaved();
+            for row in 0..n {
+                let token = prompt_tokens[done + row + 1] as usize;
+                ctx.gpu.copy_d2d_async(
+                    self.embed_tokens.weight.offset(token * h * bf16),
+                    embed.offset(row * h * bf16),
+                    h * bf16,
+                    stream,
+                )?;
+            }
+
+            let normed_embed = ctx.buffers.attn_output();
+            let normed_hidden = ctx.buffers.residual();
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                embed,
+                &self.module.enorm,
+                normed_embed,
+                n as u32,
+                h as u32,
+                ctx.config.rms_norm_eps as f32,
+                stream,
+            )?;
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                hiddens.offset(done * h * bf16),
+                &self.module.hnorm,
+                normed_hidden,
+                n as u32,
+                h as u32,
+                ctx.config.rms_norm_eps as f32,
+                stream,
+            )?;
+
+            let eh_input = ctx.buffers.ssm_qkvz();
+            for row in 0..n {
+                ops::bf16_concat(
+                    ctx.gpu,
+                    self.bf16_concat_k,
+                    normed_embed.offset(row * h * bf16),
+                    normed_hidden.offset(row * h * bf16),
+                    eh_input.offset(row * 2 * h * bf16),
+                    h as u32,
+                    stream,
+                )?;
+            }
+            let h_in = ctx.buffers.hidden_states();
+            if ctx.dispatch.cublas_gemm && n > 1 {
+                ops::cublas_bf16_proj_dense(
+                    eh_input,
+                    self.module.eh_proj.weight,
+                    h_in,
+                    n as u32,
+                    h as u32,
+                    (2 * h) as u32,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm(
+                    ctx.gpu,
+                    self.dense_gemm_k,
+                    eh_input,
+                    &self.module.eh_proj,
+                    h_in,
+                    n as u32,
+                    h as u32,
+                    (2 * h) as u32,
+                    stream,
+                )?;
+            }
+
+            let slots: Vec<i64> = (0..n)
+                .map(|row| {
+                    let logical = done + row;
+                    state.block_table[logical / bs] as i64 * bs as i64 + (logical % bs) as i64
+                })
+                .collect();
+            let slot_bytes = n * std::mem::size_of::<i64>();
+            anyhow::ensure!(
+                MTP_META_OFFSET + slot_bytes <= ctx.buffers.scratch_bytes(),
+                "GLM MTP batched prefill slots exceed scratch: need {} B, have {} B",
+                MTP_META_OFFSET + slot_bytes,
+                ctx.buffers.scratch_bytes(),
+            );
+            let slots_dev = ctx.buffers.scratch().offset(MTP_META_OFFSET);
+            // SAFETY: `slots` contains exactly `n` initialized i64 elements.
+            let slots_raw =
+                unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, slot_bytes) };
+            ctx.gpu.copy_h2d_async(slots_raw, slots_dev, stream)?;
+
+            let mtp_ctx = ForwardContext {
+                buffers: ctx.buffers,
+                gpu: ctx.gpu,
+                config: ctx.config,
+                dispatch: ctx.dispatch,
+                derived: ctx.derived,
+                levers: ctx.levers,
+                stats: ctx.stats,
+                attn_metadata: None,
+                profile: ctx.profile,
+                comm: None,
+                graph_capture: false,
+                gdn_exact_replay: false,
+                token_ids: ctx.token_ids,
+                routed_lora_layers: None,
+                midchunk_capture: None,
+                moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+            };
+            anyhow::ensure!(
+                self.module.body.prefill_mla_kv_only(
+                    h_in,
+                    n,
+                    &mut kv_cache,
+                    slots_dev,
+                    &mtp_ctx,
+                    stream,
+                )?,
+                "GLM MTP appended layer does not support MLA KV-only prefill"
+            );
+            // `slots_raw` is pageable Vec-backed storage; keep it alive until
+            // its async upload and the dependent cache write have completed.
+            ctx.gpu.synchronize(stream)?;
+            done += n;
+        }
+        state.seq_len = rows_total;
+        tracing::info!(
+            "GLM MTP batched KV prefill: {rows_total} rows in {:.1} ms",
+            started.elapsed().as_secs_f64() * 1e3,
+        );
+        Ok(rows_total)
     }
 }
 
@@ -294,6 +479,61 @@ impl DraftProposer for Glm5MtpHead {
             .downcast_mut::<Glm5MtpProposerState>()
             .map(|s| s.seq_len)
             .unwrap_or(0)
+    }
+
+    fn prefill_drafter(
+        &self,
+        prompt_tokens: &[u32],
+        hiddens: DevicePtr,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
+        let batched = std::env::var("ATLAS_GLM_MTP_BATCHED_PREFILL")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let serial = std::env::var("ATLAS_GLM_MTP_SERIAL_PREFILL")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if !batched && !serial {
+            return Ok(0);
+        }
+        let state = match state.as_any_mut().downcast_mut::<Glm5MtpProposerState>() {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+        if batched {
+            return self.prefill_kv_batched(prompt_tokens, hiddens, state, ctx, stream);
+        }
+
+        // Correctness fallback: mirror the shifted-pair contract one row at a
+        // time through the full decode body. This remains an opt-in diagnostic
+        // oracle for the batched KV-only implementation.
+        if state.seq_len != 0 || prompt_tokens.len() < 2 {
+            return Ok(0);
+        }
+
+        let started = std::time::Instant::now();
+        let h = ctx.config.hidden_size;
+        let rows = prompt_tokens.len() - 1;
+        for i in 0..rows {
+            self.forward_body_one(
+                prompt_tokens[i + 1],
+                hiddens.offset(i * h * 2),
+                i + 1,
+                state,
+                ctx,
+                stream,
+            )?;
+        }
+        ctx.gpu.synchronize(stream)?;
+        tracing::info!(
+            "GLM MTP serial drafter prefill probe: {rows} rows in {:.1} ms",
+            started.elapsed().as_secs_f64() * 1e3,
+        );
+        Ok(rows)
     }
 
     fn propose(

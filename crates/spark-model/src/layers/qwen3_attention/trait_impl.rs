@@ -100,6 +100,18 @@ impl TransformerLayer for Qwen3AttentionLayer {
             .map(|cal| !cal.is_calibrating())
     }
 
+    fn prefill_mla_kv_only(
+        &self,
+        hidden: DevicePtr,
+        num_tokens: usize,
+        kv_cache: &mut PagedKvCache,
+        slots: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        self.prefill_mla_kv_only_impl(hidden, num_tokens, kv_cache, slots, ctx, stream)
+    }
+
     fn decode(
         &self,
         hidden: DevicePtr,

@@ -59,6 +59,11 @@ MTP_GATE_FORCE="${MTP_GATE_FORCE:-0}"
 MTP_TIMING="${MTP_TIMING:-0}"
 VERIFY_PROFILE="${VERIFY_PROFILE:-0}"
 MOE_UNION_STATS="${MOE_UNION_STATS:-0}"
+GLM_MTP_SERIAL_PREFILL="${GLM_MTP_SERIAL_PREFILL:-0}"
+# MTP proposals need the appended layer's prompt K/V history. Build it with
+# the batched KV-only path by default whenever speculative decode is enabled.
+# The serial path remains an explicit correctness/debugging oracle.
+GLM_MTP_BATCHED_PREFILL="${GLM_MTP_BATCHED_PREFILL:-$SPECULATIVE}"
 
 if (( MAX_SEQ_LEN > 2048 )); then
   echo "ERROR: initial GLM-5.3 Atlas support is capped at 2048 tokens." >&2
@@ -129,6 +134,18 @@ if [[ "$VERIFY_PROFILE" != "0" && "$VERIFY_PROFILE" != "1" ]]; then
 fi
 if [[ "$MOE_UNION_STATS" != "0" && "$MOE_UNION_STATS" != "1" ]]; then
   echo "ERROR: MOE_UNION_STATS must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_MTP_SERIAL_PREFILL" != "0" && "$GLM_MTP_SERIAL_PREFILL" != "1" ]]; then
+  echo "ERROR: GLM_MTP_SERIAL_PREFILL must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_MTP_BATCHED_PREFILL" != "0" && "$GLM_MTP_BATCHED_PREFILL" != "1" ]]; then
+  echo "ERROR: GLM_MTP_BATCHED_PREFILL must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_MTP_SERIAL_PREFILL" == "1" && "$GLM_MTP_BATCHED_PREFILL" == "1" ]]; then
+  echo "ERROR: GLM_MTP_SERIAL_PREFILL and GLM_MTP_BATCHED_PREFILL are mutually exclusive." >&2
   exit 2
 fi
 
@@ -253,6 +270,8 @@ echo "  MTP during thinking / force gate: $MTP_SPEC_THINK / $MTP_GATE_FORCE"
 echo "  MTP phase timing: $MTP_TIMING"
 echo "  GLM verifier layer profile: $VERIFY_PROFILE"
 echo "  sampled MoE expert-union stats: $MOE_UNION_STATS"
+echo "  GLM serial MTP prefill probe: $GLM_MTP_SERIAL_PREFILL"
+echo "  GLM batched MTP KV prefill: $GLM_MTP_BATCHED_PREFILL"
 
 # Never leave one stale rank in an old communicator.
 docker rm -f atlas-glm53-ep0 2>/dev/null || true
@@ -296,6 +315,8 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_MTP_TIMING=$MTP_TIMING \
   -e ATLAS_GLM_VERIFY_PROFILE=$VERIFY_PROFILE \
   -e ATLAS_MOE_UNION_STATS=$MOE_UNION_STATS \
+  -e ATLAS_GLM_MTP_SERIAL_PREFILL=$GLM_MTP_SERIAL_PREFILL \
+  -e ATLAS_GLM_MTP_BATCHED_PREFILL=$GLM_MTP_BATCHED_PREFILL \
   $REMOTE_MOUNT $IMAGE $REMOTE_SERVE --rank 1 --port 0"
 
 docker run -d \
@@ -331,6 +352,8 @@ docker run -d \
   -e ATLAS_MTP_TIMING="$MTP_TIMING" \
   -e ATLAS_GLM_VERIFY_PROFILE="$VERIFY_PROFILE" \
   -e ATLAS_MOE_UNION_STATS="$MOE_UNION_STATS" \
+  -e ATLAS_GLM_MTP_SERIAL_PREFILL="$GLM_MTP_SERIAL_PREFILL" \
+  -e ATLAS_GLM_MTP_BATCHED_PREFILL="$GLM_MTP_BATCHED_PREFILL" \
   "${MOUNT_FLAGS[@]}" \
   "$IMAGE" "${COMMON_SERVE_ARGS[@]}" --rank 0 --port "$PORT"
 
