@@ -492,11 +492,9 @@ pub fn step_mtp(
             }
         }
 
-        // DFlash γ-block drafters return ≥4 drafts per step (γ=16 typical).
-        // The K=2/3/4 graphed paths are MTP-shaped and don't generalize past
-        // K=4 cleanly, so γ-block verify routes through `step_verify_dflash`.
-        // MTP keeps using the existing graphed paths; this dispatch is purely
-        // additive.
+        // Four-or-more drafts use Atlas's width-generic K=γ verifier. This
+        // serves DFlash (γ=16 typical) and MTP with four drafts (K=5), while
+        // the narrower, heavily tuned K=2/3/4 paths remain unchanged.
         if drafts.len() >= 4 {
             step_verify_dflash(
                 model,

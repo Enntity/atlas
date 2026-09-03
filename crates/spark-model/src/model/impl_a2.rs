@@ -400,6 +400,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF0: prefill start → chunk_len, chunk_start, full_len, then full_len tokens
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
+    /// - 0xFFFFFFF5: generic verify → K, K tokens, then num accepted drafts
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let (seq_id, cmd) = self.ep_recv_seq_and_cmd(self.ep_protocol_v2)?;
@@ -567,6 +568,41 @@ impl TransformerModel {
                         self.start_rollback_and_checkpoint_async(seq, 1)?;
                     }
                 }
+            }
+            0xFFFFFFF5 => {
+                // Width-generic verify, used by four-draft MTP (K=5) and
+                // DFlash. Keep this protocol separate from the fixed-width
+                // commands so existing ranks remain byte-for-byte unchanged.
+                let k = self.ep_broadcast_u32(0)? as usize;
+                anyhow::ensure!(
+                    (2..=32).contains(&k),
+                    "EP generic verify width must be 2..=32, got {k}"
+                );
+                let tokens = self.ep_broadcast_tokens(&vec![0u32; k])?;
+                self.sync_secondary()?;
+                self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
+
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                anyhow::ensure!(
+                    num_accepted < k,
+                    "EP generic verify accepted {num_accepted} drafts for K={k}"
+                );
+                let committed = num_accepted + 1;
+                let to_drop = k - committed;
+                if to_drop > 0 {
+                    anyhow::ensure!(
+                        seq.seq_len >= to_drop && seq.tokens.len() >= to_drop,
+                        "EP generic verify rollback underflow: seq_len={}, tokens={}, drop={to_drop}",
+                        seq.seq_len,
+                        seq.tokens.len(),
+                    );
+                    seq.seq_len -= to_drop;
+                    for _ in 0..to_drop {
+                        seq.tokens.pop();
+                    }
+                }
+                self.trim_proposer_state(seq, num_accepted, 0)?;
+                self.commit_accepted_prefix(seq, committed, k)?;
             }
             token => {
                 // Regular decode

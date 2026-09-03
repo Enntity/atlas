@@ -248,6 +248,38 @@ not a universal decode rate. The external repository's advertised 23--30
 tok/s single-session range does not include enough workload detail for a
 strict apples-to-apples comparison.
 
+### K=5 MTP verification
+
+`NUM_DRAFTS=4` verifies five rows per target pass. The generic K-gamma path
+was initially correct but slow: its target forward took about 322 ms. Two
+GLM-specific dispatch gaps caused the cliff at five rows:
+
+- KDA q/k/v/o projections used the small-prefill GEMM even though Atlas
+  already shipped exact-M=5 NVFP4 GEMVs;
+- every KDA MoE evaluated five rows independently instead of composing the
+  fused K2 and K3 routed paths and reading the shared expert once.
+
+The KDA projection dispatcher now uses the common exact-M tier resolver for
+M=4..=8. The K=5 MoE path evaluates the shared expert once with the M5 tier,
+then combines routed-only K2 and K3 passes. A failed experiment that applied
+the same FFN composition to the 11 MLA layers was measured slightly slower and
+was removed rather than shipped.
+
+The target forward fell from ~322 ms to 223--224 ms. With a 1,536-token safety
+cap, TP2+EP2, one admitted sequence, BF16 KV, and a 4 GiB OOM guard, one warm-up
+followed by two exact 1,000-token requests produced:
+
+| Run | TTFT | Prefill | Decode | Mean accepted drafts (of 4) |
+|---|---:|---:|---:|---:|
+| 1 | 1,316.850 ms | 759.388 tok/s | 19.490 tok/s | 3.708 |
+| 2 | 1,315.246 ms | 760.314 tok/s | 19.551 tok/s | 3.708 |
+
+Both requests ended naturally after 113 generated tokens. This makes K=5
+competitive with the corrected K=4 high-acceptance path while verifying one
+additional draft. It does not supersede the forced-256 K=4 sustained-output
+baseline above; K=5 still needs an equivalent low-acceptance receipt before it
+can be selected as a general default.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

@@ -15,6 +15,41 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.forward_k3_impl(input, ctx, stream, true)
+    }
+
+    /// K=3 routed experts only. Used with K2 by GLM's K=5 verifier after its
+    /// shared expert has already been evaluated once over all five rows.
+    pub(super) fn forward_k3_routed_only(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.forward_k3_impl(input, ctx, stream, false)
+    }
+
+    fn forward_k3_impl(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+        include_shared: bool,
+    ) -> Result<()> {
+        if !include_shared {
+            anyhow::ensure!(
+                self.lora.is_none()
+                    && self.bf16_gate_weight_ptrs.is_none()
+                    && self.fp8_gate_weight_ptrs.is_none()
+                    && !self.has_mixed_bf16_shared_expert()
+                    && matches!(
+                        self.experts_scale_kind,
+                        crate::weight_map::WeightQuantFormat::Nvfp4
+                    )
+                    && self.use_t_layout_for_decode(),
+                "routed-only K3 requires unified-layout NVFP4 experts"
+            );
+        }
         // Feature-1: a resident MoE adapter forces the per-row batched fallback
         // (folds gate/up/down route-agnostically; base rows no-op; same
         // moe_output[3,H]), skipping any no-fold fast path. Install-time gate →
@@ -224,7 +259,7 @@ impl MoeLayer {
             // Mixed config: in-kernel shared expert off (NULL), computed in
             // BF16 below instead — the NVFP4 shared_*_t tables are load-time
             // placeholders and numerically wrong for this checkpoint.
-            let (sh_gate_t, sh_up_t, sh_down_t) = if mixed_bf16_shared {
+            let (sh_gate_t, sh_up_t, sh_down_t) = if mixed_bf16_shared || !include_shared {
                 (&null_qw, &null_qw, &null_qw)
             } else {
                 (
@@ -255,6 +290,14 @@ impl MoeLayer {
                 top_k,
                 stream,
             )?;
+            // In routed-only mode preserve the precomputed five-row shared
+            // output in attn_output. Rows 3/4 of moe_output are outside this
+            // K3 result and provide scratch for the disabled shared branch.
+            let kernel_shared_down_out = if include_shared {
+                shared_down_out
+            } else {
+                output.offset(3 * h as usize * 2)
+            };
             ops::moe_expert_silu_down_shared_batch3_t(
                 ctx.gpu,
                 self.moe_expert_silu_down_shared_batch3_t_k,
@@ -268,7 +311,7 @@ impl MoeLayer {
                 shared_gate_scratch,
                 shared_up_scratch,
                 sh_down_t,
-                shared_down_out,
+                kernel_shared_down_out,
                 h,
                 inter,
                 top_k,
@@ -290,7 +333,9 @@ impl MoeLayer {
             }
             // The _t branch previously returned without writing moe_output at
             // all — every sibling branch ends in this blend.
-            let shared_for_blend = if is_ep && !shared_down_out.is_null() {
+            let shared_for_blend = if !include_shared {
+                kernel_shared_down_out
+            } else if is_ep && !shared_down_out.is_null() {
                 ctx.gpu
                     .memset_async(expert_gate_out, 0, 3 * h as usize * 2, stream)?;
                 expert_gate_out
@@ -388,7 +433,7 @@ impl MoeLayer {
                 comm.all_reduce_async(output.0, 3 * h as usize * 2, stream)?;
             }
             // Add shared expert with sigmoid gate (BUG #41 fix)
-            if !shared_down_out.is_null() {
+            if include_shared && !shared_down_out.is_null() {
                 if self.weights.shared_expert_gate.weight.0 == 0 {
                     ops::residual_add(
                         ctx.gpu,

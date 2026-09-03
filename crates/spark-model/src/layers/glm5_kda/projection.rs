@@ -56,8 +56,9 @@ impl ProjectionPath {
 impl Glm5KdaLayer {
     /// Project a short speculative-verification batch with the decode kernels
     /// that amortize one weight read across the candidate rows.  Atlas only
-    /// ships tuned NVFP4 variants for M=2/3/4 today; larger draft batches
-    /// retain the correct small-GEMM fallback.
+    /// ships tuned NVFP4 variants for M=2..=8. Widths 4..=8 use the shared
+    /// exact-M tier resolver, so K=5 does not fall off the decode path into a
+    /// small prefill GEMM.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn project_hot_verify(
         &self,
@@ -70,7 +71,7 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if (2..=4).contains(&m) {
+        if (2..=8).contains(&m) {
             self.project_hot_multi_decode(input, weight, output, m, n, k, ctx, stream)
         } else {
             self.project_hot(input, weight, output, m, n, k, false, ctx, stream)
@@ -98,7 +99,7 @@ impl Glm5KdaLayer {
         }
     }
 
-    /// Read one NVFP4 projection once for two or three concurrent decode rows.
+    /// Read one NVFP4 projection once for a short decode/verify batch.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn project_hot_multi_decode(
         &self,
@@ -132,11 +133,11 @@ impl Glm5KdaLayer {
                 k,
                 stream,
             ),
-            4 => {
+            4..=8 => {
                 let kernel = self.w4a16_gemv_batchm.kernel(m);
                 anyhow::ensure!(
                     kernel.0 != 0,
-                    "GLM KDA M=4 decode requires w4a16_gemv_batch4"
+                    "GLM KDA M={m} decode requires a matching w4a16 batch-M tier"
                 );
                 ops::w4a16_gemv_batchm(
                     ctx.gpu,
@@ -150,7 +151,7 @@ impl Glm5KdaLayer {
                     stream,
                 )
             }
-            _ => anyhow::bail!("GLM KDA multi-decode projection requires M=2..=4, got {m}"),
+            _ => anyhow::bail!("GLM KDA multi-decode projection requires M=2..=8, got {m}"),
         }
     }
 

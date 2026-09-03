@@ -11,6 +11,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layer::ForwardContext;
 use crate::layers::ops;
+use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeight};
 
 /// Device-side pointer table for one projection across all experts.
@@ -151,9 +152,9 @@ pub struct MoeLayer {
     moe_expert_silu_down_shared_batch3: KernelHandle,
     moe_weighted_sum_blend_batch3: KernelHandle,
     w4a16_gemv_batch3: KernelHandle,
-    /// Exact-M=4 GEMV used to read GLM's retained shared expert once during
-    /// K=4 verification (the routed half remains on parallel K2 kernels).
-    w4a16_gemv_batch4: KernelHandle,
+    /// Exact-M GEMVs used to read GLM's retained shared expert once during
+    /// K=4/K=5 verification (routed experts remain on fused K2/K3 kernels).
+    w4a16_batchm: W4a16BatchmTiers,
     // Generic token-major NVFP4 MoE kernels. Used as an opt-in decode
     // concurrency experiment for N>=4 without grouped-GEMM sorting.
     moe_expert_gate_up_shared_token_major: KernelHandle,
@@ -499,6 +500,7 @@ mod forward_ep;
 mod forward_k2;
 mod forward_k3;
 mod forward_k4;
+mod forward_k5;
 mod forward_phase;
 mod forward_prefill;
 mod forward_prefill_bf16;

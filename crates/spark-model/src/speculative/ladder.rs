@@ -76,6 +76,11 @@
 //!   NOT off): disables the ladder entirely (fixed `num_drafts` at every n)
 //!   AND drops the [`super::mtp_max_seqs`] default back to 4, restoring the
 //!   pre-ladder adaptive policy (batched K=4 MTP at C<=4, MTP-off above).
+//!
+//! The default rungs were measured with a three-draft ceiling. At one active
+//! sequence there is no cross-sequence row-pressure tradeoff, so an explicit
+//! higher ceiling is honored in full. This is what makes four-draft MTP
+//! (five-row verify) possible without widening any multi-sequence rung.
 
 /// PRESENCE check for `ATLAS_NO_MTP_K_LADDER`. Read once per process.
 pub fn mtp_ladder_disabled() -> bool {
@@ -217,6 +222,9 @@ pub fn mtp_ladder_drafts(n_active: usize, num_drafts: usize) -> usize {
     if mtp_ladder_disabled() {
         return num_drafts;
     }
+    if n_active <= 1 {
+        return num_drafts;
+    }
     let steps = mtp_ladder_steps();
     steps
         .iter()
@@ -284,6 +292,11 @@ mod tests {
     #[test]
     fn default_ladder_holds_depth_to_the_cap() {
         assert_eq!(mtp_ladder_drafts(1, 3), 3);
+        // The static ladder was calibrated at a three-draft ceiling. A lone
+        // sequence honors an explicitly wider ceiling, while multi-sequence
+        // rungs retain their measured depths.
+        assert_eq!(mtp_ladder_drafts(1, 4), 4);
+        assert_eq!(mtp_ladder_drafts(2, 4), 3);
         assert_eq!(mtp_ladder_drafts(4, 3), 3);
         assert_eq!(mtp_ladder_drafts(5, 3), 3);
         assert_eq!(mtp_ladder_drafts(8, 3), 3);

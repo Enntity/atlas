@@ -566,6 +566,8 @@ impl Glm5KdaLayer {
             // Dense layers use one batch4 GEMV; GLM MoE layers preserve the
             // parallel K2 routed path while evaluating the shared expert once.
             self.ffn.forward_k4(normed, ctx, stream)?
+        } else if capture_verify_intermediates && tokens == 5 && verify_batched_ffn_enabled() {
+            self.ffn.forward_k5(normed, ctx, stream)?
         } else if capture_verify_intermediates {
             self.ffn.forward_batched(normed, tokens, ctx, stream)?;
             ctx.buffers.moe_output()

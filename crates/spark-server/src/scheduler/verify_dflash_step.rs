@@ -1,29 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! DFlash-based verify step (drafted token verification).
+//! Width-generic drafted-token verification (DFlash and MTP K>=5).
 
 use super::*;
 
-/// DFlash γ-token verify with accept-prefix.
+/// Width-generic γ-token verify with accept-prefix.
 ///
-/// Phase 3 minimal-viable implementation: routes `[last_token, drafts...]`
-/// through the eager `decode_verify_dflash` path (which today defaults to
-/// `decode_verify`) and finds the first index where draft ≠ verified
-/// argmax. Tokens 0..first_mismatch are accepted; the verified token at
-/// the mismatch position becomes the bonus token; subsequent drafts are
-/// dropped.
+/// Routes `[last_token, drafts...]` through Atlas's width-generic target
+/// verifier and finds the first index where draft ≠ verified argmax. Tokens
+/// before the first mismatch are accepted; the target token at the mismatch
+/// becomes the bonus token and subsequent drafts are dropped.
 ///
-/// Deferred to Phase 6 (full integration):
-///   * EP=2 broadcast of verify-cmd + drafts (drafter currently runs only
-///     on rank 0; verify on a single-rank target is correct, but EP=2 needs
-///     the broadcast pattern from `step_verify_k2`).
+/// Remaining DFlash-specific work:
 ///   * Per-position logprobs extraction.
-///   * SSM `commit_verify_state_async(num_accepted, k)` loop. Without it,
-///     hybrid models (Qwen3.6-A3B has GDN layers) will see SSM state drift
-///     after γ-verify. Single-token decode unaffected; γ-verify only
-///     correct on pure-attention targets until this is wired.
-///   * `save_hidden_for_mtp` / `save_hidden_for_dflash` hook on the
-///     accepted bonus token (the next propose() needs the latest hidden).
 ///   * Sliding-window state rollback for sliding-attention layers
 ///     (Gemma-4-style; not used by Qwen3.6 targets).
 pub fn step_verify_dflash(
@@ -35,6 +24,8 @@ pub fn step_verify_dflash(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
+    let _step_timer = crate::scheduler::mtp_timing::StepTimer::new(&sched.timing, a.seq.seq_len);
+
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
         a.finished = true;
@@ -45,6 +36,26 @@ pub fn step_verify_dflash(
     let mut tokens = Vec::with_capacity(drafts.len() + 1);
     tokens.push(a.last_token);
     tokens.extend_from_slice(drafts);
+
+    // EP rank 1 must execute the same K-row target forward in NCCL lockstep.
+    // F5 is width-generic: K, then K tokens, followed after verification by
+    // the accepted-draft count. Fixed K=2/3/4 retain their established wire
+    // commands and never pass through here.
+    if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF5) {
+        tracing::error!("EP broadcast generic verify cmd: {e:#}");
+        a.finished = true;
+        return;
+    }
+    if let Err(e) = model.ep_broadcast_cmd(tokens.len() as u32) {
+        tracing::error!("EP broadcast generic verify width: {e:#}");
+        a.finished = true;
+        return;
+    }
+    if let Err(e) = model.ep_broadcast_tokens(&tokens) {
+        tracing::error!("EP broadcast generic verify tokens: {e:#}");
+        a.finished = true;
+        return;
+    }
 
     // STEP-TIMING (ATLAS_DFLASH_STEP_TIMING=1): split the ~0.88s/step into
     // verify (target M=1+γ forward) vs propose (drafter forward, tail below).
@@ -60,6 +71,9 @@ pub fn step_verify_dflash(
             return;
         }
     };
+    sched
+        .timing
+        .record(crate::scheduler::mtp_timing::Phase::VerifyForward, t_verify);
     let verify_ms = if step_timing {
         t_verify.elapsed().as_secs_f64() * 1000.0
     } else {
@@ -105,6 +119,18 @@ pub fn step_verify_dflash(
             break;
         }
     }
+
+    if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
+        tracing::error!("EP broadcast generic verify result: {e:#}");
+        a.finished = true;
+        return;
+    }
+    crate::scheduler::mtp_accept_debug::record(
+        1,
+        drafts.len(),
+        drafts.first() == verified.first(),
+        num_accepted,
+    );
 
     // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling
     // accept window; may suspend this seq's speculation (see adaptive_spec).
@@ -173,7 +199,11 @@ pub fn step_verify_dflash(
 
     crate::metrics::SPEC_DECODE_VERIFY
         .with_label_values(&[
-            "dflash",
+            if dflash_verify_raw_argmax {
+                "dflash"
+            } else {
+                "mtp"
+            },
             if num_accepted == drafts.len() {
                 "accept_all"
             } else {
@@ -182,8 +212,8 @@ pub fn step_verify_dflash(
         ])
         .inc();
 
-    tracing::info!(
-        "DFLASH K=γ verify: γ={} accepted={}/{} ({:.0}%) seq_len={}",
+    tracing::debug!(
+        "K=γ verify: γ={} accepted={}/{} ({:.0}%) seq_len={}",
         drafts.len(),
         num_accepted,
         drafts.len(),
@@ -237,6 +267,9 @@ pub fn step_verify_dflash(
             Err(e) => tracing::error!("run_mtp_propose_multi (dflash): {e:#}"),
         }
     }
+    sched
+        .timing
+        .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
     if step_timing {
         let propose_ms = t_propose.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(
