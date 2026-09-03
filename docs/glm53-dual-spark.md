@@ -280,6 +280,22 @@ additional draft. It does not supersede the forced-256 K=4 sustained-output
 baseline above; K=5 still needs an equivalent low-acceptance receipt before it
 can be selected as a general default.
 
+The first K=5 MLA follow-up removes another width cliff. GLM's guarded
+zero-RoPE MLA projection path originally admitted only two through four rows,
+so a five-row verify reread the four large BF16 projection matrices once per
+row in all 11 MLA layers. The path now admits five rows and selects an exact-M5
+BF16 GEMV instantiation instead of the generic M<=8 accumulator tier.
+
+With the same deployment and one warm-up, two high-acceptance 1,000-token
+requests measured `21.374` and `21.575` tok/s (113 generated tokens), up from
+`19.490` and `19.551` tok/s. Target-forward time fell from 221--223 ms to
+197--201 ms. A separate chat request with an exact 1,000-token rendered prompt
+and `min_tokens=max_tokens=256` measured `11.781` and `11.915` tok/s after
+warm-up, versus `10.447` and `11.731` tok/s before the change. That is a 6.8%
+median sustained-output gain despite normal acceptance-path variance. Prefill
+remained effectively unchanged at 766--768 tok/s, and both output workloads
+remained coherent.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

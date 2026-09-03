@@ -176,6 +176,9 @@ pub struct Qwen3AttentionLayer {
     /// models whose attention weights are plain BF16 -- the quantized paths have
     /// w4a16/w8a16 batch tiers, BF16 had none.
     pub(super) dense_gemv_batchm_k: KernelHandle,
+    /// Exact five-row BF16 GEMV tier for GLM K=5 verification. Optional so
+    /// kernel sets built before this optimization retain the generic fallback.
+    pub(super) dense_gemv_batch5_k: KernelHandle,
     pub(super) w4a16_gemv_k: KernelHandle,
     /// Single-warp `w4a16_gemv_sw`. `KernelHandle(0)` on miss → base GEMV.
     pub(super) w4a16_gemv_sw_k: KernelHandle,

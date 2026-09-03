@@ -40,16 +40,18 @@
 #define N_PER_BLOCK 4
 #define WARP_SIZE 32
 #define VEC_SIZE 8   // BF16 values per vectorized load (uint4 = 16 bytes)
-#define MAX_M 8      // compile-time cap on batched rows; callers must pass M <= MAX_M
+#define MAX_M 8      // compile-time cap on the generic entry point
 
-extern "C" __global__ void dense_gemv_bf16_batchm(
+template <int ROWS>
+__device__ __forceinline__ void dense_gemv_bf16_batchm_impl(
     const __nv_bfloat16* __restrict__ A,  // [M, K]
     const __nv_bfloat16* __restrict__ B,  // [N, K]
     __nv_bfloat16* __restrict__ C,        // rows at C + t*out_stride
     unsigned int M,
     unsigned int N,
     unsigned int K,
-    unsigned int out_stride                // BF16 elements between output rows
+    unsigned int out_stride,               // BF16 elements between output rows
+    float* __restrict__ smem
 ) {
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
@@ -58,11 +60,11 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
     if (n >= N) return;
 
-    const unsigned int m = (M > MAX_M) ? MAX_M : M;
+    const unsigned int m = (M > ROWS) ? ROWS : M;
 
-    float acc[MAX_M];
+    float acc[ROWS];
     #pragma unroll
-    for (int t = 0; t < MAX_M; t++) acc[t] = 0.0f;
+    for (int t = 0; t < ROWS; t++) acc[t] = 0.0f;
 
     const unsigned int K_VEC = K / VEC_SIZE;
     const uint4* B_vec = (const uint4*)(B + (unsigned long long)n * K);
@@ -124,18 +126,48 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
     }
 
     // 2 warps per output: cross-warp reduce via shared memory, per row.
-    __shared__ float smem[MAX_M][N_PER_BLOCK * 2];
-
     if (warp_lane == 0) {
         const unsigned int smem_idx = local_out * 2 + (lane / WARP_SIZE);
-        for (unsigned int t = 0; t < m; t++) smem[t][smem_idx] = acc[t];
+        for (unsigned int t = 0; t < m; t++) {
+            smem[t * (N_PER_BLOCK * 2) + smem_idx] = acc[t];
+        }
     }
     __syncthreads();
 
     if (lane == 0) {
         for (unsigned int t = 0; t < m; t++) {
-            const float r = smem[t][local_out * 2] + smem[t][local_out * 2 + 1];
+            const unsigned int base = t * (N_PER_BLOCK * 2) + local_out * 2;
+            const float r = smem[base] + smem[base + 1];
             C[(unsigned long long)t * out_stride + n] = __float2bfloat16(r);
         }
     }
+}
+
+extern "C" __global__ void dense_gemv_bf16_batchm(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride
+) {
+    __shared__ float smem[MAX_M * N_PER_BLOCK * 2];
+    dense_gemv_bf16_batchm_impl<MAX_M>(A, B, C, M, N, K, out_stride, smem);
+}
+
+// Exact five-row verifier tier. Keeping ROWS compile-time constant avoids the
+// generic M<=8 kernel's three unused accumulator lanes and lets ptxas keep the
+// hot accumulator array register-resident for GLM's K=5 verification batch.
+extern "C" __global__ void dense_gemv_bf16_batch5(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride
+) {
+    __shared__ float smem[5 * N_PER_BLOCK * 2];
+    dense_gemv_bf16_batchm_impl<5>(A, B, C, 5, N, K, out_stride, smem);
 }

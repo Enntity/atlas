@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! GLM-5 zero-RoPE MLA decode for two to four independent rows.
+//! GLM-5 zero-RoPE MLA decode for two to five independent rows.
 //!
 //! The generic absorbed-MLA implementation is deliberately per-sequence to
 //! accommodate several architectures. GLM-5 has a simpler fixed shape: no
@@ -27,7 +27,7 @@ fn enabled() -> bool {
 
 impl Qwen3AttentionLayer {
     pub(super) fn glm_mla_multi_seq_eligible(&self, c: &MultiSeqCtx<'_>, mla: &MlaWeights) -> bool {
-        enabled() && (2..=4).contains(&c.n) && mla.rope == 0 && mla.o_lora_rank == 0
+        enabled() && (2..=5).contains(&c.n) && mla.rope == 0 && mla.o_lora_rank == 0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -73,20 +73,26 @@ impl Qwen3AttentionLayer {
                         c.fwd.gpu, kernel, input, weight, output, 4, n_out, k, c.stream,
                     )
                 }
-                n => anyhow::bail!("GLM MLA multi-sequence projection requires N=2..=4, got {n}"),
+                5 => {
+                    let kernel = self.w4a16_batchm.kernel(5);
+                    ensure!(
+                        kernel.0 != 0,
+                        "GLM MLA batch5 projection kernel is unavailable"
+                    );
+                    ops::w4a16_gemv_batchm(
+                        c.fwd.gpu, kernel, input, weight, output, 5, n_out, k, c.stream,
+                    )
+                }
+                n => anyhow::bail!("GLM MLA multi-sequence projection requires N=2..=5, got {n}"),
             }
         } else {
+            let kernel = if c.n == 5 && self.dense_gemv_batch5_k.0 != 0 {
+                self.dense_gemv_batch5_k
+            } else {
+                self.dense_gemv_batchm_k
+            };
             ops::dense_gemv_batchm(
-                c.fwd.gpu,
-                self.dense_gemv_batchm_k,
-                input,
-                dense,
-                output,
-                c.n as u32,
-                n_out,
-                k,
-                n_out,
-                c.stream,
+                c.fwd.gpu, kernel, input, dense, output, c.n as u32, n_out, k, n_out, c.stream,
             )
         }
     }
