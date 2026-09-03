@@ -89,13 +89,26 @@ impl MoeLayer {
 
         // Run routed experts through their fused small-M kernels. Consume each
         // temporary moe_output before the next group overwrites it.
-        self.forward_k2_routed_only(input, ctx, stream)?;
+        self.forward_k2_routed_local(input, ctx, stream)?;
         ctx.gpu
             .copy_d2d_async(ctx.buffers.moe_output(), input, 2 * h as usize * 2, stream)?;
         let row3 = input.offset(2 * h as usize * 2);
-        self.forward_k3_routed_only(row3, ctx, stream)?;
+        self.forward_k3_routed_local(row3, ctx, stream)?;
         ctx.gpu
             .copy_d2d_async(ctx.buffers.moe_output(), row3, 3 * h as usize * 2, stream)?;
+
+        // K2 and K3 produced rank-local routed contributions. Reducing their
+        // contiguous five-row result once avoids a second EP collective per
+        // MoE layer while retaining the faster small-M expert kernels.
+        if let Some(comm) = ctx.comm
+            && ctx.config.ep_world_size > 1
+        {
+            if ctx.graph_capture {
+                comm.all_reduce(input.0, 5 * h as usize * 2)?;
+            } else {
+                comm.all_reduce_async(input.0, 5 * h as usize * 2, stream)?;
+            }
+        }
         ops::residual_add(
             ctx.gpu,
             self.residual_add,

@@ -315,6 +315,25 @@ reduced launch count while expanding the active expert wave from K2/K3 to 40
 slots, lowering acceptance-normalized target throughput by about 10%. The
 proven K2+K3 routed schedule therefore remains in place.
 
+The next K=5 change preserves those small expert waves but defers their
+expert-parallel reductions. K2 and K3 write rank-local routed contributions
+into one contiguous five-row buffer, which is reduced once before the shared
+expert result is added. Existing K2 and K3 callers retain their independent
+reductions; the change is isolated to GLM's K=5 verifier.
+
+An exact A/B used a 1,280-token sequence cap, one admitted sequence, BF16 KV,
+and the same 1,000-token rendered chat prompt with
+`min_tokens=max_tokens=256`. The v84 control's two measured requests decoded
+at `19.324` and `18.672` tok/s (18.998 median). Across two v86 measurement
+sets, five requests decoded at `20.305`, `18.048`, `18.897`, `19.288`, and
+`19.217` tok/s (19.217 median, +1.15%). Median accepted-draft counts were 195
+and 194 respectively, so the comparison is not explained by a favorable MTP
+acceptance shift. Twelve timed v86 target-forward samples had a 195.48 ms
+median, versus 199.02 ms for five v84 control samples (-1.78%). Median v86
+prefill was 855.55 tok/s versus 849.03 tok/s for the control. All responses
+generated the requested 256 tokens and preserved the control's deterministic
+output prefix.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

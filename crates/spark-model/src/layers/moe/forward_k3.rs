@@ -15,18 +15,18 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.forward_k3_impl(input, ctx, stream, true)
+        self.forward_k3_impl(input, ctx, stream, true, true)
     }
 
-    /// K=3 routed experts only. Used with K2 by GLM's K=5 verifier after its
-    /// shared expert has already been evaluated once over all five rows.
-    pub(super) fn forward_k3_routed_only(
+    /// K=3 routed experts without the EP reduction. GLM's K=5 verifier
+    /// combines this partial result with K=2 before reducing all five rows.
+    pub(super) fn forward_k3_routed_local(
         &self,
         input: DevicePtr,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.forward_k3_impl(input, ctx, stream, false)
+        self.forward_k3_impl(input, ctx, stream, false, false)
     }
 
     fn forward_k3_impl(
@@ -35,6 +35,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
         include_shared: bool,
+        reduce_ep: bool,
     ) -> Result<()> {
         if !include_shared {
             anyhow::ensure!(
@@ -424,7 +425,8 @@ impl MoeLayer {
         }
 
         // EP all-reduce: sum partial outputs for 3 tokens
-        if let Some(comm) = ctx.comm
+        if reduce_ep
+            && let Some(comm) = ctx.comm
             && ctx.config.ep_world_size > 1
         {
             if ctx.graph_capture {
