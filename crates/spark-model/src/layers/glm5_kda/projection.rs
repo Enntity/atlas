@@ -54,6 +54,71 @@ impl ProjectionPath {
 }
 
 impl Glm5KdaLayer {
+    /// Read one NVFP4 projection once for two or three concurrent decode rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_hot_multi_decode(
+        &self,
+        input: DevicePtr,
+        weight: &Glm5Projection,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        match m {
+            2 => ops::w4a16_gemv_batch2(
+                ctx.gpu,
+                self.w4a16_gemv_batch2_k,
+                input,
+                &weight.nvfp4,
+                output,
+                n,
+                k,
+                stream,
+            ),
+            3 => ops::w4a16_gemv_batch3(
+                ctx.gpu,
+                self.w4a16_gemv_batch3_k,
+                input,
+                &weight.nvfp4,
+                output,
+                n,
+                k,
+                stream,
+            ),
+            _ => anyhow::bail!("GLM KDA multi-decode projection requires M=2 or M=3, got {m}"),
+        }
+    }
+
+    /// Read one BF16 projection once for all concurrent decode rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_dense_multi_decode(
+        &self,
+        input: DevicePtr,
+        weight: &DenseWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        ops::dense_gemv_batchm(
+            ctx.gpu,
+            self.dense_gemv_batchm_k,
+            input,
+            weight,
+            output,
+            m,
+            n,
+            k,
+            n,
+            stream,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn project_hot(
         &self,

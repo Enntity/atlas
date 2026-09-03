@@ -2,6 +2,7 @@
 
 //! GLM-5 KDA recurrent block for the conservative GB10 bring-up path.
 mod hc;
+mod multi_seq;
 mod profile;
 mod projection;
 mod recurrent;
@@ -34,8 +35,11 @@ pub struct Glm5KdaLayer {
     conv_state_bytes: usize,
     rms_norm_k: KernelHandle,
     dense_gemv_k: KernelHandle,
+    dense_gemv_batchm_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
     w4a16_gemv_sw_k: KernelHandle,
+    w4a16_gemv_batch2_k: KernelHandle,
+    w4a16_gemv_batch3_k: KernelHandle,
     w4a16_gemm_k: KernelHandle,
     w4a16_gemm_t_m128_k: KernelHandle,
     dense_gemm_k: KernelHandle,
@@ -118,8 +122,11 @@ impl Glm5KdaLayer {
             conv_state_bytes: 3 * heads * dim * config.linear_conv_kernel_dim * 4,
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemv_batchm_k: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
+            w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
+            w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
@@ -432,6 +439,43 @@ impl TransformerLayer for Glm5KdaLayer {
         stream: u64,
     ) -> Result<()> {
         self.forward_inner(hidden, state, num_tokens, false, ctx, stream)
+    }
+
+    fn decode_multi_seq<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if multi_seq::enabled() && (2..=3).contains(&num_seqs) {
+            self.decode_multi_seq_inner(hidden, num_seqs, states, ctx, stream)
+        } else {
+            let h = ctx.config.hidden_size;
+            for i in 0..num_seqs {
+                let mut bt = block_tables[i].clone();
+                let mut disk = Vec::new();
+                let mut last_offloaded = Vec::new();
+                self.decode(
+                    hidden.offset(i * h * 2),
+                    residual.offset(i * h * 2),
+                    states[i],
+                    kv_cache,
+                    seq_lens[i],
+                    &mut bt,
+                    &mut disk,
+                    &mut last_offloaded,
+                    ctx,
+                    stream,
+                )?;
+            }
+            Ok(())
+        }
     }
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {

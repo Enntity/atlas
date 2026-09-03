@@ -40,9 +40,11 @@ The launcher intentionally starts with:
 - cuBLASLt BF16 projection dispatch for checkpoint-native MLA matrices;
 - the worker rank first and no automatic restart policy.
 
-The KDA register-resident prefill path, unified MoE layout, and cuBLASLt
-projection dispatch are enabled by default. Their diagnostic fallbacks are
-`KDA_REGRESIDENT_PREFILL=0`, `UNIFIED_MOE_LAYOUT=0`, and `CUBLAS_GEMM=0`.
+The KDA register-resident prefill path, KDA multi-sequence decode, width-three
+batched FFN, unified MoE layout, and cuBLASLt projection dispatch are enabled by
+default. Their diagnostic fallbacks are `KDA_REGRESIDENT_PREFILL=0`,
+`KDA_MULTI_SEQ=0`, `KDA_BATCHED_FFN=0`, `UNIFIED_MOE_LAYOUT=0`, and
+`CUBLAS_GEMM=0`.
 KDA Q/K/V and row-parallel output projections keep independent decode-native
 NVFP4 weights plus transposed M=128 prefill twins. The output twins add about
 0.3 GiB per rank across all 34 KDA layers without changing decode numerics.
@@ -88,31 +90,39 @@ a CUDA kernel with a zero-width grid. Distributed decode also keeps the EP
 protocol's exact batch width: rounding three live requests to Atlas's generic
 four-row CUDA-graph bucket wastes a full KDA/MLA pass on a dummy row.
 
+GLM KDA decode now reads each checkpoint-native NVFP4 Q/K/V/O matrix once for
+the active two- or three-row batch. Its small BF16 projections, normalization,
+and hyper-connections are also batch-aware; only convolution and recurrent
+state updates remain per sequence. At width three, Atlas's existing grouped FFN
+path processes all rows together. Width two deliberately retains the sequential
+FFN path because the grouped version was neutral in isolated GB10 measurements.
+
 The concurrency receipt uses simultaneous streaming requests with identical
 1,000-token prompts and 96 requested output tokens. Each cell has one warm-up
-and two measured repetitions. `Aggregate window` divides all completion tokens
+and three measured repetitions. `Aggregate window` divides all completion tokens
 by the interval from the first emitted token to the last completed stream;
 `sum receipts` sums the server-reported per-session decode rates.
 
 | Concurrent sessions | Per-session decode (median tok/s) | Sum receipts (tok/s) | Aggregate window (tok/s) | Median TTFT |
 |---:|---:|---:|---:|---:|
-| 1 | 12.573 | 12.573 | 12.706 | 1.066 s |
-| 2 | 6.625 | 13.251 | 12.820 | 1.068 s |
-| 3 | 4.575 | 13.761 | 13.136 | 1.066 s |
+| 1 | 12.606 | 12.606 | 12.738 | 1.063 s |
+| 2 | 7.683 | 15.366 | 14.760 | 1.070 s |
+| 3 | 6.345 | 19.119 | 17.872 | 1.065 s |
 
-Aggregate window throughput is monotonic through C=3, although the gain is
-still small: C=3 is 3.4% above C=1. Before exact-width EP dispatch, C=3 was
-10.571 tok/s because it executed the padded fourth row; the fix raises that
-long-run point to 13.1--13.5 tok/s depending on the decode length. The next
-decode optimization should batch GLM KDA and MLA weight reads instead of
-running most mixer projections once per sequence.
+Aggregate window throughput is monotonic through C=3: C=2 is 15.9% above C=1
+and C=3 is 40.3% above C=1. Against the prior exact-width result, KDA batching
+raises C=2 from 12.820 to 14.760 tok/s and C=3 from 13.136 to 17.872 tok/s. A
+normal-mode C=3 A/B measured 16.003 tok/s with batched FFN disabled, so grouped
+width-three FFN contributes another 11.7%; the rest comes from KDA projection
+and hyper-connection batching. Before exact-width EP dispatch, C=3 was 10.571
+tok/s because it executed the padded fourth row.
 
 Reproduce the table on the head node with:
 
 ```bash
 python3 scripts/benchmark_glm53_concurrency.py \
   --prompt-tokens 1000 --output-tokens 96 \
-  --max-concurrency 3 --repetitions 2
+  --max-concurrency 3 --repetitions 3
 ```
 
 ## 1K prompt benchmark

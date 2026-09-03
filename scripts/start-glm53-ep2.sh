@@ -28,8 +28,12 @@ CONTAINER_MEMORY="${CONTAINER_MEMORY:-114g}"
 NCCL_IFNAME="${NCCL_IFNAME:-enp1s0f1np1}"
 NCCL_HCA="${NCCL_HCA:-rocep1s0f1}"
 PROFILE="${PROFILE:-0}"
+MS_PROFILE="${MS_PROFILE:-0}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-}"
 KDA_REGRESIDENT_PREFILL="${KDA_REGRESIDENT_PREFILL:-1}"
+KDA_MULTI_SEQ="${KDA_MULTI_SEQ:-1}"
+KDA_BATCHED_FFN="${KDA_BATCHED_FFN:-1}"
+KDA_MS_PROFILE="${KDA_MS_PROFILE:-0}"
 UNIFIED_MOE_LAYOUT="${UNIFIED_MOE_LAYOUT:-1}"
 CUBLAS_GEMM="${CUBLAS_GEMM:-1}"
 HC_CUBLAS_PREFILL="${HC_CUBLAS_PREFILL:-1}"
@@ -57,6 +61,24 @@ fi
 
 if [[ "$FP4_PREFILL" != "0" && "$FP4_PREFILL" != "1" ]]; then
   echo "ERROR: FP4_PREFILL must be 0 or 1." >&2
+  exit 2
+fi
+
+if [[ "$MS_PROFILE" != "0" && "$MS_PROFILE" != "1" ]]; then
+  echo "ERROR: MS_PROFILE must be 0 or 1." >&2
+  exit 2
+fi
+
+if [[ "$KDA_MULTI_SEQ" != "0" && "$KDA_MULTI_SEQ" != "1" ]]; then
+  echo "ERROR: KDA_MULTI_SEQ must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$KDA_BATCHED_FFN" != "0" && "$KDA_BATCHED_FFN" != "1" ]]; then
+  echo "ERROR: KDA_BATCHED_FFN must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$KDA_MS_PROFILE" != "0" && "$KDA_MS_PROFILE" != "1" ]]; then
+  echo "ERROR: KDA_MS_PROFILE must be 0 or 1." >&2
   exit 2
 fi
 
@@ -119,6 +141,9 @@ NCCL_ENV=(
 if (( MAX_BATCH_SIZE > 1 )); then
   NCCL_ENV+=(-e ATLAS_EP_PROTOCOL=v2)
 fi
+if [[ "$MS_PROFILE" == "1" ]]; then
+  NCCL_ENV+=(-e ATLAS_MS_PROFILE=1)
+fi
 
 OPTIONAL_ENV=()
 if [[ "$FP4_PREFILL" == "1" ]]; then
@@ -156,7 +181,10 @@ echo "  GPU budget: $GPU_MEM_UTIL; OOM guard: ${OOM_GUARD_MB} MiB"
 echo "  container memory ceiling: $CONTAINER_MEMORY"
 echo "  NCCL: $NCCL_IFNAME / $NCCL_HCA"
 echo "  profiler: $PROFILE"
+echo "  multi-sequence phase profiler: $MS_PROFILE"
 echo "  KDA register-resident prefill: $KDA_REGRESIDENT_PREFILL"
+echo "  KDA multi-sequence decode: $KDA_MULTI_SEQ"
+echo "  KDA batched FFN: $KDA_BATCHED_FFN"
 echo "  unified MoE layout: $UNIFIED_MOE_LAYOUT"
 echo "  cuBLASLt BF16 projections: $CUBLAS_GEMM"
 echo "  cuBLASLt TF32 mHC prefill: $HC_CUBLAS_PREFILL"
@@ -191,6 +219,9 @@ ssh "$SSH_TARGET" "docker run -d \
   --memory $CONTAINER_MEMORY --memory-swap $CONTAINER_MEMORY \
   $REMOTE_RDMA $REMOTE_NCCL $REMOTE_OPTIONAL_ENV -e RUST_LOG=info \
   -e ATLAS_KDA_REGRESIDENT_PREFILL=$KDA_REGRESIDENT_PREFILL \
+  -e ATLAS_GLM_KDA_MULTI_SEQ=$KDA_MULTI_SEQ \
+  -e ATLAS_GLM_KDA_BATCHED_FFN=$KDA_BATCHED_FFN \
+  -e ATLAS_GLM_KDA_MS_PROFILE=$KDA_MS_PROFILE \
   -e ATLAS_UNIFIED_MOE_LAYOUT=$UNIFIED_MOE_LAYOUT \
   -e ATLAS_CUBLAS_GEMM=$CUBLAS_GEMM \
   -e ATLAS_HC_CUBLAS_PREFILL=$HC_CUBLAS_PREFILL \
@@ -217,6 +248,9 @@ docker run -d \
   "${OPTIONAL_ENV[@]}" \
   -e RUST_LOG=info \
   -e ATLAS_KDA_REGRESIDENT_PREFILL="$KDA_REGRESIDENT_PREFILL" \
+  -e ATLAS_GLM_KDA_MULTI_SEQ="$KDA_MULTI_SEQ" \
+  -e ATLAS_GLM_KDA_BATCHED_FFN="$KDA_BATCHED_FFN" \
+  -e ATLAS_GLM_KDA_MS_PROFILE="$KDA_MS_PROFILE" \
   -e ATLAS_UNIFIED_MOE_LAYOUT="$UNIFIED_MOE_LAYOUT" \
   -e ATLAS_CUBLAS_GEMM="$CUBLAS_GEMM" \
   -e ATLAS_HC_CUBLAS_PREFILL="$HC_CUBLAS_PREFILL" \
