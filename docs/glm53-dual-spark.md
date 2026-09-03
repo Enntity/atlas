@@ -184,6 +184,27 @@ returned the exact middle-of-prompt recovery code `SAPPHIRE-7319`; a separate
 deterministic arithmetic check returned 703 with the correct derivation. With
 profiling enabled, the 1K model pass fell from 1,198.6 ms to 1,082.8 ms.
 
+### K=4 MTP verification optimization
+
+With `SPECULATIVE=1`, `NUM_DRAFTS=3`, TP2+EP2, a 2,048-token context cap,
+one admitted sequence, and the standard 4 GiB OOM guard, the fixed-width K=4
+path now uses the narrow batch-4 NVFP4 projections in both KDA and GLM MLA.
+The KDA MoE consumes the four verify rows as two fused K=2 passes; setting
+`KDA_BATCHED_FFN=0` restores the generic per-row expert path.
+
+| Warmed receipt | Before | After |
+|---|---:|---:|
+| K=4 target forward, short context | ~194 ms | ~181 ms |
+| 256-token decode, short prompt | 9.1 tok/s | 10.6 tok/s |
+| 1,000-token prompt + 96-token decode | — | 767.94 prefill / 9.50 decode tok/s |
+
+The 1K receipt reported 1,302.2 ms TTFT and 1.920 emitted tokens per verify
+step. A layer-boundary diagnostic (`VERIFY_PROFILE=1`) attributed about 133 ms
+of the pre-pairwise K=4 target pass to 34 KDA layers and 46 ms to 11 MLA
+layers; KDA FFN alone accounted for roughly 102 ms. The pairwise change reduced
+that profiled KDA FFN total to about 89 ms. `VERIFY_PROFILE` is diagnostic only
+and must remain disabled for performance measurements.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

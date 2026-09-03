@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! GLM-5 zero-RoPE MLA decode for two or three independent sequences.
+//! GLM-5 zero-RoPE MLA decode for two to four independent rows.
 //!
 //! The generic absorbed-MLA implementation is deliberately per-sequence to
 //! accommodate several architectures. GLM-5 has a simpler fixed shape: no
@@ -27,7 +27,7 @@ fn enabled() -> bool {
 
 impl Qwen3AttentionLayer {
     pub(super) fn glm_mla_multi_seq_eligible(&self, c: &MultiSeqCtx<'_>, mla: &MlaWeights) -> bool {
-        enabled() && (2..=3).contains(&c.n) && mla.rope == 0 && mla.o_lora_rank == 0
+        enabled() && (2..=4).contains(&c.n) && mla.rope == 0 && mla.o_lora_rank == 0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -63,7 +63,17 @@ impl Qwen3AttentionLayer {
                     k,
                     c.stream,
                 ),
-                n => anyhow::bail!("GLM MLA multi-sequence projection requires N=2/3, got {n}"),
+                4 => {
+                    let kernel = self.w4a16_batchm.kernel(4);
+                    ensure!(
+                        kernel.0 != 0,
+                        "GLM MLA batch4 projection kernel is unavailable"
+                    );
+                    ops::w4a16_gemv_batchm(
+                        c.fwd.gpu, kernel, input, weight, output, 4, n_out, k, c.stream,
+                    )
+                }
+                n => anyhow::bail!("GLM MLA multi-sequence projection requires N=2..=4, got {n}"),
             }
         } else {
             ops::dense_gemv_batchm(

@@ -56,6 +56,8 @@ NUM_DRAFTS="${NUM_DRAFTS:-1}"
 # which would leave MTP idle for most benchmark and agent workloads.
 MTP_SPEC_THINK="${MTP_SPEC_THINK:-1}"
 MTP_GATE_FORCE="${MTP_GATE_FORCE:-0}"
+MTP_TIMING="${MTP_TIMING:-0}"
+VERIFY_PROFILE="${VERIFY_PROFILE:-0}"
 
 if (( MAX_SEQ_LEN > 2048 )); then
   echo "ERROR: initial GLM-5.3 Atlas support is capped at 2048 tokens." >&2
@@ -114,6 +116,14 @@ if [[ "$MTP_SPEC_THINK" != "0" && "$MTP_SPEC_THINK" != "1" ]]; then
 fi
 if [[ "$MTP_GATE_FORCE" != "0" && "$MTP_GATE_FORCE" != "1" ]]; then
   echo "ERROR: MTP_GATE_FORCE must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$MTP_TIMING" != "0" && "$MTP_TIMING" != "1" ]]; then
+  echo "ERROR: MTP_TIMING must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$VERIFY_PROFILE" != "0" && "$VERIFY_PROFILE" != "1" ]]; then
+  echo "ERROR: VERIFY_PROFILE must be 0 or 1." >&2
   exit 2
 fi
 
@@ -235,6 +245,8 @@ echo "  MoE exact grid / fallback load factor: $MOE_PREFILL_EXACT_TILES / $MOE_P
 echo "  tool-call parser override: ${TOOL_CALL_PARSER:-model default}"
 echo "  MTP speculative / draft tokens: $SPECULATIVE / $NUM_DRAFTS"
 echo "  MTP during thinking / force gate: $MTP_SPEC_THINK / $MTP_GATE_FORCE"
+echo "  MTP phase timing: $MTP_TIMING"
+echo "  GLM verifier layer profile: $VERIFY_PROFILE"
 
 # Never leave one stale rank in an old communicator.
 docker rm -f atlas-glm53-ep0 2>/dev/null || true
@@ -275,6 +287,8 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_DUMP_EXPERT_IDS=$DUMP_EXPERT_IDS \
   -e ATLAS_MTP_SPEC_THINK=$MTP_SPEC_THINK \
   -e ATLAS_MTP_GATE_FORCE=$MTP_GATE_FORCE \
+  -e ATLAS_MTP_TIMING=$MTP_TIMING \
+  -e ATLAS_GLM_VERIFY_PROFILE=$VERIFY_PROFILE \
   $REMOTE_MOUNT $IMAGE $REMOTE_SERVE --rank 1 --port 0"
 
 docker run -d \
@@ -307,6 +321,8 @@ docker run -d \
   -e ATLAS_DUMP_EXPERT_IDS="$DUMP_EXPERT_IDS" \
   -e ATLAS_MTP_SPEC_THINK="$MTP_SPEC_THINK" \
   -e ATLAS_MTP_GATE_FORCE="$MTP_GATE_FORCE" \
+  -e ATLAS_MTP_TIMING="$MTP_TIMING" \
+  -e ATLAS_GLM_VERIFY_PROFILE="$VERIFY_PROFILE" \
   "${MOUNT_FLAGS[@]}" \
   "$IMAGE" "${COMMON_SERVE_ARGS[@]}" --rank 0 --port "$PORT"
 

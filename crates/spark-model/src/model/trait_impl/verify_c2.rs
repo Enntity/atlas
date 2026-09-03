@@ -182,6 +182,9 @@ impl TransformerModel {
         // byte-for-byte unchanged when the env is unset.
         let k4_diag = std::env::var("ATLAS_K4_DIAG").ok().as_deref() == Some("1");
         let use_graphs = self.comm.is_none() && !hss_engaged && !lora_eager && !k4_diag;
+        let verify_profile = std::env::var("ATLAS_GLM_VERIFY_PROFILE").ok().as_deref() == Some("1")
+            && self.config.model_type == "glm5_next"
+            && !use_graphs;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -192,7 +195,7 @@ impl TransformerModel {
             levers: &self.levers,
             stats: &self.stats,
             attn_metadata: Some(metadata),
-            profile: false,
+            profile: verify_profile,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
@@ -228,8 +231,19 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            let mut attn_us = 0u128;
+            let mut kda_us = 0u128;
+            let mut attn_layers = 0usize;
+            let mut kda_layers = 0usize;
+
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
+                let layer_started = if verify_profile {
+                    self.gpu.synchronize(stream)?;
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
 
                 if layer_type == LayerType::FullAttention {
                     if hss_engaged {
@@ -301,6 +315,27 @@ impl TransformerModel {
                         "K4_DIAG: CUDA error after layer {layer_idx} ({layer_type:?}): {e:#}"
                     );
                 }
+                if let Some(started) = layer_started {
+                    self.gpu.synchronize(stream)?;
+                    let elapsed = started.elapsed().as_micros();
+                    if layer_type == LayerType::FullAttention {
+                        attn_us += elapsed;
+                        attn_layers += 1;
+                    } else {
+                        kda_us += elapsed;
+                        kda_layers += 1;
+                    }
+                }
+            }
+
+            if verify_profile {
+                tracing::info!(
+                    "GLM K4 layer profile: kda={:.2}ms({}L) mla={:.2}ms({}L)",
+                    kda_us as f64 / 1000.0,
+                    kda_layers,
+                    attn_us as f64 / 1000.0,
+                    attn_layers,
+                );
             }
 
             // Final norm [4, H]

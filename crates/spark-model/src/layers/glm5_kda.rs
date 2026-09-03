@@ -15,9 +15,14 @@ use crate::layer::{ForwardContext, LayerState, SsmLayerState, TransformerLayer};
 use crate::layers::FfnComponent;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::HcWeights;
+use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use crate::weight_map::DenseWeight;
 
 pub use projection::{Glm5KdaWeights, Glm5Projection};
+
+fn verify_batched_ffn_enabled() -> bool {
+    std::env::var("ATLAS_GLM_KDA_BATCHED_FFN").ok().as_deref() == Some("1")
+}
 
 pub struct Glm5KdaLayer {
     input_norm: DenseWeight,
@@ -40,6 +45,7 @@ pub struct Glm5KdaLayer {
     w4a16_gemv_sw_k: KernelHandle,
     w4a16_gemv_batch2_k: KernelHandle,
     w4a16_gemv_batch3_k: KernelHandle,
+    w4a16_gemv_batchm: W4a16BatchmTiers,
     w4a16_gemm_k: KernelHandle,
     w4a16_gemm_t_m128_k: KernelHandle,
     dense_gemm_k: KernelHandle,
@@ -127,6 +133,7 @@ impl Glm5KdaLayer {
             w4a16_gemv_sw_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            w4a16_gemv_batchm: W4a16BatchmTiers::resolve(gpu),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
@@ -554,6 +561,27 @@ impl Glm5KdaLayer {
             ctx.buffers.moe_output()
         } else if capture_verify_intermediates && tokens == 3 {
             self.ffn.forward_k3(normed, ctx, stream)?;
+            ctx.buffers.moe_output()
+        } else if capture_verify_intermediates && tokens == 4 && verify_batched_ffn_enabled() {
+            // K=4 verification is still decode-sized. Process it as two
+            // native K=2 MoE passes so gate/up/down expert weights are shared
+            // by each pair. `moe_output` is shared scratch, therefore stage
+            // pair 0 into the now-dead norm input before pair 1 overwrites it.
+            // Rows 2/3 remain untouched until their own pass.
+            for pair in 0..2 {
+                let row_offset = pair * 2 * self.hidden_size * 2;
+                self.ffn
+                    .forward_k2(normed.offset(row_offset), ctx, stream)?;
+                ctx.gpu.copy_d2d_async(
+                    ctx.buffers.moe_output(),
+                    normed.offset(row_offset),
+                    2 * self.hidden_size * 2,
+                    stream,
+                )?;
+            }
+            normed
+        } else if capture_verify_intermediates {
+            self.ffn.forward_batched(normed, tokens, ctx, stream)?;
             ctx.buffers.moe_output()
         } else if decode {
             self.ffn.forward(normed, ctx, stream)?

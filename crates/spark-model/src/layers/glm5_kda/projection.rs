@@ -56,8 +56,8 @@ impl ProjectionPath {
 impl Glm5KdaLayer {
     /// Project a short speculative-verification batch with the decode kernels
     /// that amortize one weight read across the candidate rows.  Atlas only
-    /// ships the tuned NVFP4 variants for M=2/3 today; larger draft batches
-    /// retain the correct small-GEMM fallback until a batch4 kernel exists.
+    /// ships tuned NVFP4 variants for M=2/3/4 today; larger draft batches
+    /// retain the correct small-GEMM fallback.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn project_hot_verify(
         &self,
@@ -70,7 +70,7 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if (2..=3).contains(&m) {
+        if (2..=4).contains(&m) {
             self.project_hot_multi_decode(input, weight, output, m, n, k, ctx, stream)
         } else {
             self.project_hot(input, weight, output, m, n, k, false, ctx, stream)
@@ -132,7 +132,25 @@ impl Glm5KdaLayer {
                 k,
                 stream,
             ),
-            _ => anyhow::bail!("GLM KDA multi-decode projection requires M=2 or M=3, got {m}"),
+            4 => {
+                let kernel = self.w4a16_gemv_batchm.kernel(m);
+                anyhow::ensure!(
+                    kernel.0 != 0,
+                    "GLM KDA M=4 decode requires w4a16_gemv_batch4"
+                );
+                ops::w4a16_gemv_batchm(
+                    ctx.gpu,
+                    kernel,
+                    input,
+                    &weight.nvfp4,
+                    output,
+                    m,
+                    n,
+                    k,
+                    stream,
+                )
+            }
+            _ => anyhow::bail!("GLM KDA multi-decode projection requires M=2..=4, got {m}"),
         }
     }
 
