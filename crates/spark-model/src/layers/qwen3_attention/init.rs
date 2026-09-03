@@ -365,6 +365,12 @@ impl Qwen3AttentionLayer {
                 "mla_paged_decode_fp8",
             ),
             mla_batched_gemv_k: gate(probes.mla, gpu, "mla_absorbed", "mla_batched_gemv"),
+            mla_batched_gemv_batch5_k: gate(
+                probes.mla,
+                gpu,
+                "mla_absorbed",
+                "mla_batched_gemv_batch5",
+            ),
             mla_q_rope_scatter_k: gate(probes.mla, gpu, "mla_absorbed", "mla_q_rope_scatter"),
             mla_q_rope_writeback_k: gate(probes.mla, gpu, "mla_absorbed", "mla_q_rope_writeback"),
             mla_cache_assemble_k: gate(probes.mla, gpu, "mla_absorbed", "mla_cache_assemble"),

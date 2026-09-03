@@ -296,6 +296,25 @@ median sustained-output gain despite normal acceptance-path variance. Prefill
 remained effectively unchanged at 766--768 tok/s, and both output workloads
 remained coherent.
 
+The next guarded step batches the rest of GLM's exact five-row MLA chain. A
+dedicated BF16 GEMV shares each absorbed-Q and extracted-V weight load across
+the five verification rows; cache assembly/write and paged attention are also
+submitted once for all five rows while preserving each row's sequence length
+and block table. Across twelve timed target-forward samples, median target
+time fell from about 196.5 ms to 194.6 ms (roughly 1%). End-to-end forced-256
+decode remained acceptance-bound and noisy: the two measured requests were
+12.623 tok/s with 166 accepted drafts and 10.374 tok/s with 143. Prefill stayed
+at 771--774 tok/s and coherent-output checks passed. This is a modest kernel
+scheduling win, not the remaining route to vLLM-class sustained decode.
+
+An eager per-layer verifier profile locates that remaining work. Median K=5
+time was 137.53 ms across the 34 KDA layers and 75.15 ms across the 11 MLA
+layers. The KDA FFN accounted for 91.48 ms by itself, about two thirds of KDA
+time. A true five-row routed-expert dispatch was tested but discarded: it
+reduced launch count while expanding the active expert wave from K2/K3 to 40
+slots, lowering acceptance-normalized target throughput by about 10%. The
+proven K2+K3 routed schedule therefore remains in place.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

@@ -605,6 +605,38 @@ pub fn mla_batched_gemv(
         .launch(stream)
 }
 
+/// Exact five-row MLA GEMV. The per-head weight matrix is shared across rows.
+#[allow(clippy::too_many_arguments)]
+pub fn mla_batched_gemv_batch5(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    output: DevicePtr,
+    n_out: u32,
+    k: u32,
+    num_heads: u32,
+    input_head_stride: u32,
+    output_head_stride: u32,
+    input_row_stride: u32,
+    output_row_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_out, 8), num_heads, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(output)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .arg_u32(input_head_stride)
+        .arg_u32(output_head_stride)
+        .arg_u32(input_row_stride)
+        .arg_u32(output_row_stride)
+        .launch(stream)
+}
+
 /// MLA Q_rope scatter: copy rope portion from q_full to strided q_absorbed_buf. 1 kernel replaces 32 D2D copies.
 #[allow(clippy::too_many_arguments)]
 pub fn mla_q_rope_scatter(

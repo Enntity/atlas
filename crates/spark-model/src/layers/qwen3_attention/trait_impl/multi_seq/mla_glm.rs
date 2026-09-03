@@ -5,9 +5,9 @@
 //! The generic absorbed-MLA implementation is deliberately per-sequence to
 //! accommodate several architectures. GLM-5 has a simpler fixed shape: no
 //! RoPE arm, no output LoRA, and BF16 Q/KV/O projections. This first guarded
-//! step batches only the four stateless projections.
-//! Absorption, cache mutation, paged attention, and value extraction remain on
-//! the byte-for-byte proven per-sequence path.
+//! step batches the four stateless projections and, for exact K=5 verification,
+//! Q absorption, cache mutation, causal paged attention, and value extraction.
+//! Every row retains its own sequence length and block table.
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
@@ -197,50 +197,49 @@ impl Qwen3AttentionLayer {
             o_lora_rank: 0,
         };
 
-        // Preserve the established sequence-private absorbed-attention chain.
-        // Its transient buffers are consumed before the next row reuses them;
-        // only v_extracted keeps one dedicated output row for the final batched
-        // O projection.
+        // K=5 shares Q-absorption and V-extraction weights across all rows,
+        // assembles and writes their cache entries with the existing batched
+        // prefill kernels, and submits five independently masked attention rows
+        // in one multi-sequence launch. Every other width retains the proven
+        // per-row chain.
         let q_absorbed = buffers.expert_up_out();
         let k_entries = buffers.qkv_output();
         let cache_row = cache_dim as usize * bf16;
-        let v_entries = k_entries.offset(cache_row);
         let attn_out = buffers.attn_output();
         let v_extracted = buffers.ssm_qkvz();
         let q_full_row = q_dim as usize * bf16;
+        let q_absorbed_row = (nq * cache_dim) as usize * bf16;
+        let attn_out_row = q_absorbed_row;
         let kv_row = kv_lora as usize * bf16;
         let v_row = (nq * v_dim) as usize * bf16;
-        for i in 0..c.n {
-            let meta_i = AttnMetadataDev {
-                positions: meta.positions.offset(i * 4),
-                positions_h: meta.positions_h.offset(i * 4),
-                positions_w: meta.positions_w.offset(i * 4),
-                slot: meta.slot.offset(i * 8),
-                seq_len: meta.seq_len.offset(i * 4),
-                block_table: meta
-                    .block_table
-                    .offset(i * meta.max_blocks_per_seq as usize * 4),
-                max_blocks_per_seq: meta.max_blocks_per_seq,
-                num_seqs: 1,
-                seq_slot: DevicePtr::NULL,
-                moe_row_adapter: DevicePtr::NULL,
-            };
-
-            self.ms_mla_q_absorb(
-                c,
-                mla,
-                &dims,
-                q_full.offset(i * q_full_row),
+        let batched_mla_gemv = c.n == 5 && self.mla_batched_gemv_batch5_k.0 != 0;
+        if batched_mla_gemv {
+            ops::mla_batched_gemv_batch5(
+                gpu,
+                self.mla_batched_gemv_batch5_k,
+                q_full,
+                mla.w_uk_t.weight,
                 q_absorbed,
+                kv_lora,
+                nope,
+                nq,
+                c.hd,
+                cache_dim,
+                q_dim,
+                nq * cache_dim,
                 stream,
             )?;
-            ops::mla_cache_assemble(
+        }
+        if batched_mla_gemv {
+            let v_entries = k_entries.offset(c.n * cache_row);
+            ops::mla_cache_assemble_batched(
                 gpu,
-                self.mla_cache_assemble_k,
-                kv_latent.offset(i * kv_row),
+                self.mla_cache_assemble_batched_k,
+                kv_latent,
                 DevicePtr::NULL,
                 k_entries,
                 v_entries,
+                rows,
                 kv_lora,
                 0,
                 cache_dim,
@@ -251,8 +250,8 @@ impl Qwen3AttentionLayer {
                 k_entries,
                 v_entries,
                 kv_cache,
-                meta_i.slot,
-                1,
+                meta.slot,
+                rows,
                 1,
                 cache_dim,
                 c.bs,
@@ -268,10 +267,10 @@ impl Qwen3AttentionLayer {
                 kv_cache.k_pool_ptr(self.attn_layer_idx),
                 kv_cache.v_pool_ptr(self.attn_layer_idx),
                 attn_out,
-                meta_i.block_table,
-                meta_i.seq_len,
-                meta_i.max_blocks_per_seq,
-                1,
+                meta.block_table,
+                meta.seq_len,
+                meta.max_blocks_per_seq,
+                rows,
                 nq,
                 1,
                 cache_dim,
@@ -281,14 +280,105 @@ impl Qwen3AttentionLayer {
                 0,
                 stream,
             )?;
-            self.ms_mla_v_extract(
-                c,
-                mla,
-                &dims,
+            ops::mla_batched_gemv_batch5(
+                gpu,
+                self.mla_batched_gemv_batch5_k,
                 attn_out,
-                v_extracted.offset(i * v_row),
+                mla.w_uv.weight,
+                v_extracted,
+                v_dim,
+                kv_lora,
+                nq,
+                cache_dim,
+                v_dim,
+                nq * cache_dim,
+                nq * v_dim,
                 stream,
             )?;
+        } else {
+            let v_entries = k_entries.offset(cache_row);
+            for i in 0..c.n {
+                let meta_i = AttnMetadataDev {
+                    positions: meta.positions.offset(i * 4),
+                    positions_h: meta.positions_h.offset(i * 4),
+                    positions_w: meta.positions_w.offset(i * 4),
+                    slot: meta.slot.offset(i * 8),
+                    seq_len: meta.seq_len.offset(i * 4),
+                    block_table: meta
+                        .block_table
+                        .offset(i * meta.max_blocks_per_seq as usize * 4),
+                    max_blocks_per_seq: meta.max_blocks_per_seq,
+                    num_seqs: 1,
+                    seq_slot: DevicePtr::NULL,
+                    moe_row_adapter: DevicePtr::NULL,
+                };
+
+                let q_absorbed_i = q_absorbed.offset(i * q_absorbed_row);
+                self.ms_mla_q_absorb(
+                    c,
+                    mla,
+                    &dims,
+                    q_full.offset(i * q_full_row),
+                    q_absorbed_i,
+                    stream,
+                )?;
+                let attn_out_i = attn_out.offset(i * attn_out_row);
+                ops::mla_cache_assemble(
+                    gpu,
+                    self.mla_cache_assemble_k,
+                    kv_latent.offset(i * kv_row),
+                    DevicePtr::NULL,
+                    k_entries,
+                    v_entries,
+                    kv_lora,
+                    0,
+                    cache_dim,
+                    stream,
+                )?;
+                self.write_kv_cache(
+                    gpu,
+                    k_entries,
+                    v_entries,
+                    kv_cache,
+                    meta_i.slot,
+                    1,
+                    1,
+                    cache_dim,
+                    c.bs,
+                    cache_dim,
+                    cache_dim,
+                    stream,
+                    c.fwd.graph_capture,
+                )?;
+                ops::paged_decode_attn_bf16(
+                    gpu,
+                    self.paged_decode_mla_k,
+                    q_absorbed_i,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    attn_out_i,
+                    meta_i.block_table,
+                    meta_i.seq_len,
+                    meta_i.max_blocks_per_seq,
+                    1,
+                    nq,
+                    1,
+                    cache_dim,
+                    c.bs,
+                    dims.inv_sqrt_d,
+                    nq * cache_dim,
+                    0,
+                    stream,
+                )?;
+                self.ms_mla_v_extract(
+                    c,
+                    mla,
+                    &dims,
+                    attn_out_i,
+                    v_extracted.offset(i * v_row),
+                    stream,
+                )?;
+            }
         }
 
         // Read the large O matrix once after all rows have been extracted.

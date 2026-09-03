@@ -239,6 +239,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) mla_paged_decode_fp8_k: KernelHandle,
     /// MLA batched GEMV for Q absorption and V extraction.
     pub(super) mla_batched_gemv_k: KernelHandle,
+    /// Exact five-row MLA GEMV for GLM-5 K=5 speculative verification.
+    pub(super) mla_batched_gemv_batch5_k: KernelHandle,
     /// MLA fused kernels — decode.
     pub(super) mla_q_rope_scatter_k: KernelHandle,
     pub(super) mla_q_rope_writeback_k: KernelHandle,
