@@ -249,6 +249,9 @@ pub struct SafetensorsLoader {
     pub ep_world_size: usize,
     /// Total number of MoE experts in the model (for EP partitioning).
     pub num_experts: usize,
+    /// Optional layer-name fragment whose expert tensors are loaded only on
+    /// EP rank 0, with all experts replicated there.
+    pub rank0_only_expert_prefix: Option<String>,
     /// Override for the peak memory multiplier in the pre-flight OOM check.
     /// Set from QuantFormat::peak_memory_multiplier() in the caller.
     /// When None, the pre-flight uses its own heuristic (1.3x NVFP4 / 1.5x FP8).
@@ -268,6 +271,7 @@ impl SafetensorsLoader {
             ep_rank: 0,
             ep_world_size: 1,
             num_experts: 0,
+            rank0_only_expert_prefix: None,
             peak_memory_multiplier: None,
         }
     }
@@ -278,6 +282,7 @@ impl SafetensorsLoader {
             ep_rank,
             ep_world_size,
             num_experts,
+            rank0_only_expert_prefix: None,
             peak_memory_multiplier: None,
         }
     }
@@ -295,6 +300,13 @@ impl SafetensorsLoader {
         }
         // Parse expert index from patterns like "*.experts.42.gate_proj*"
         if let Some(idx) = parse_expert_index(name) {
+            if self
+                .rank0_only_expert_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.contains(prefix))
+            {
+                return self.ep_rank != 0;
+            }
             let per_rank = self.num_experts / self.ep_world_size;
             let local_start = self.ep_rank * per_rank;
             let local_end = if self.ep_rank == self.ep_world_size - 1 {

@@ -65,6 +65,10 @@ impl TransformerModel {
         max_batch_size: usize,
         mtp_quant: crate::layers::MtpQuantization,
         use_speculative: bool,
+        // Model-specific proposers (DeepSeek-V4 / GLM-5) are installed after
+        // construction, but hybrid targets still need their verify rollback
+        // pools allocated here before the proposer exists.
+        external_mtp_proposer: bool,
         prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache>,
         mtp_vocab_size: u32,
         comm: Option<std::sync::Arc<dyn spark_comm::CommBackend>>,
@@ -189,6 +193,7 @@ impl TransformerModel {
         let draft_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
         let has_mtp = self_speculative
             || (use_speculative && !mtp_weights.is_empty() && draft_lm_head_nvfp4.is_some())
+            || external_mtp_proposer
             || dflash_kgamma > 0;
         let num_intermediates = if has_mtp {
             (num_drafts + 1).max(dflash_kgamma)

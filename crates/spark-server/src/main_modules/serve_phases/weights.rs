@@ -75,6 +75,13 @@ pub(crate) fn load_weight_store(
             } else {
                 spark_runtime::fast_weights::FastSafetensorsLoader::new()
             };
+            if config.model_type == "glm5_next" && args.speculative {
+                loader.rank0_only_expert_prefix =
+                    Some(format!(".layers.{}.", config.num_hidden_layers));
+                tracing::info!(
+                    "GLM-5 MTP: appended-layer experts are rank-0-only and fully replicated"
+                );
+            }
             loader.peak_memory_multiplier = mult;
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
@@ -97,6 +104,10 @@ pub(crate) fn load_weight_store(
         } else {
             spark_runtime::weights::SafetensorsLoader::new()
         };
+        if config.model_type == "glm5_next" && args.speculative {
+            loader.rank0_only_expert_prefix =
+                Some(format!(".layers.{}.", config.num_hidden_layers));
+        }
         loader.peak_memory_multiplier = mult;
         loader
             .load(model_dir, gpu, oom_reserve_bytes)

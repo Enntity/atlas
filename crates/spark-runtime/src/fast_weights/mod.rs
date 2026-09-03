@@ -38,6 +38,10 @@ pub struct FastSafetensorsLoader {
     pub ep_rank: usize,
     pub ep_world_size: usize,
     pub num_experts: usize,
+    /// Optional layer-name fragment whose expert tensors are loaded only on
+    /// EP rank 0, with all experts replicated there. Used by model-specific
+    /// draft modules that execute entirely on the coordinator rank.
+    pub rank0_only_expert_prefix: Option<String>,
     pub peak_memory_multiplier: Option<f64>,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
@@ -75,6 +79,7 @@ impl FastSafetensorsLoader {
             ep_rank: 0,
             ep_world_size: 1,
             num_experts: 0,
+            rank0_only_expert_prefix: None,
             peak_memory_multiplier: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
@@ -87,6 +92,7 @@ impl FastSafetensorsLoader {
             ep_rank,
             ep_world_size,
             num_experts,
+            rank0_only_expert_prefix: None,
             peak_memory_multiplier: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
@@ -102,6 +108,13 @@ impl FastSafetensorsLoader {
             return false;
         }
         if let Some(idx) = parse_expert_index(name) {
+            if self
+                .rank0_only_expert_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.contains(prefix))
+            {
+                return self.ep_rank != 0;
+            }
             let per_rank = self.num_experts / self.ep_world_size;
             let local_start = self.ep_rank * per_rank;
             let local_end = if self.ep_rank == self.ep_world_size - 1 {

@@ -196,10 +196,35 @@ pub fn build_model(
             None
         };
 
+    // GLM-5.3 likewise ships a model-specific full decoder MTP layer under
+    // `model.language_model.layers.<num_hidden_layers>`. It is replicated on
+    // rank 0 and proposes without collectives; all ranks still participate in
+    // the normal target-model verification pass.
+    let glm5_mtp_module =
+        if config.model_type == "glm5_next" && use_speculative && config.ep_rank == 0 {
+            match crate::weight_loader::glm5::load_glm5_mtp_module(&store, &config, gpu.as_ref()) {
+                Ok(Some(module)) => Some(module),
+                Ok(None) => {
+                    tracing::info!("GLM-5: no appended MTP module in checkpoint (MTP off)");
+                    None
+                }
+                Err(error) => {
+                    tracing::error!("GLM-5 MTP module load FAILED: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
     // this loudly so the user knows the flag was inert.
-    if use_speculative && mtp_weights.is_empty() {
+    if use_speculative
+        && mtp_weights.is_empty()
+        && v4_mtp_module.is_none()
+        && glm5_mtp_module.is_none()
+    {
         tracing::warn!(
             "`--speculative` was requested but no MTP weights were loaded for this \
              model — speculative decoding will be disabled. Either drop `--speculative` \
@@ -256,6 +281,8 @@ pub fn build_model(
     // same BF16 head via dense_gemv (drafts are re-verified by the target, so the
     // draft head only affects acceptance). DenseWeight is Copy.
     let v4_mtp_lm_head = lm_head;
+    let glm5_mtp_embed = embed;
+    let glm5_mtp_lm_head = lm_head;
 
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
@@ -540,6 +567,16 @@ pub fn build_model(
     let target_lm_head_nvfp4_for_dflash = lm_head_nvfp4;
     let target_hidden_for_dflash = config.hidden_size;
 
+    // These proposers are installed after construction, but the target's SSM
+    // verify/checkpoint pools must be allocated inside `new`.
+    // Resolve this from checkpoint capability rather than the rank-local
+    // module Option: only rank 0 owns/proposes with the replicated draft
+    // layer, while every rank must checkpoint recurrent target state during
+    // verification.
+    let external_mtp_proposer = use_speculative
+        && config.num_mtp_modules > 0
+        && matches!(config.model_type.as_str(), "deepseek_v4" | "glm5_next");
+
     let mut model = TransformerModel::new(
         config,
         embed,
@@ -557,6 +594,7 @@ pub fn build_model(
         max_batch_size,
         effective_mtp_quant,
         use_speculative,
+        external_mtp_proposer,
         prefix_cache,
         mtp_vocab_size,
         comm,
@@ -590,6 +628,27 @@ pub fn build_model(
             }
             Err(e) => tracing::warn!(
                 "Failed to build DeepSeek-V4 MTP proposer: {e:#}. Speculative decoding disabled."
+            ),
+        }
+    }
+
+    // ── Step 6c: GLM-5 appended-layer MTP proposer (optional) ──
+    if let Some(glm5_module) = glm5_mtp_module {
+        match crate::layers::Glm5MtpHead::new(
+            glm5_module,
+            glm5_mtp_embed,
+            glm5_mtp_lm_head,
+            model.config_ref(),
+            model.gpu_backend(),
+            mtp_vocab_size,
+            max_seq_len,
+        ) {
+            Ok(head) => {
+                model.set_dflash_proposer(std::sync::Arc::new(head));
+                tracing::info!("GLM-5 MTP speculative decoding: ENABLED (single module)");
+            }
+            Err(error) => tracing::warn!(
+                "Failed to build GLM-5 MTP proposer: {error:#}. Speculative decoding disabled."
             ),
         }
     }

@@ -82,6 +82,7 @@ fn glm5_next_maps_nested_hybrid_mla_kda_and_ep_shape() {
             "model_type": "glm5_next_text",
             "hidden_size": 4096,
             "num_hidden_layers": 45,
+            "num_nextn_predict_layers": 1,
             "intermediate_size": 12288,
             "vocab_size": 154880,
             "max_position_embeddings": 1048576,
@@ -142,6 +143,8 @@ fn glm5_next_maps_nested_hybrid_mla_kda_and_ep_shape() {
     assert_eq!(cfg.routed_scaling_factor, 2.5);
     assert_eq!(cfg.hc_mult, 4);
     assert_eq!(cfg.index_topk, 2048);
+    assert_eq!(cfg.num_mtp_modules, 1);
+    assert_eq!(cfg.mtp_num_hidden_layers, 1);
     assert!(cfg.nested_config);
     assert!(!cfg.attn_gated);
     let quant = cfg.quantization_config.unwrap();

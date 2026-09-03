@@ -157,6 +157,7 @@ impl Glm5KdaLayer {
         state: &mut dyn LayerState,
         tokens: usize,
         decode: bool,
+        capture_verify_intermediates: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -200,132 +201,291 @@ impl Glm5KdaLayer {
 
         let projected = ctx.buffers.qkv_output();
         let plane_bytes = tokens * p * bf16;
-        self.project_hot(
-            normed,
-            &self.weights.q_proj,
-            projected,
-            m,
-            p as u32,
-            h,
-            decode,
-            ctx,
-            stream,
-        )?;
+        if capture_verify_intermediates {
+            self.project_hot_verify(
+                normed,
+                &self.weights.q_proj,
+                projected,
+                m,
+                p as u32,
+                h,
+                ctx,
+                stream,
+            )?;
+        } else {
+            self.project_hot(
+                normed,
+                &self.weights.q_proj,
+                projected,
+                m,
+                p as u32,
+                h,
+                decode,
+                ctx,
+                stream,
+            )?;
+        }
         profile::step(ctx, stream, &mut profile_timer, "q_proj")?;
-        self.project_hot(
-            normed,
-            &self.weights.k_proj,
-            projected.offset(plane_bytes),
-            m,
-            p as u32,
-            h,
-            decode,
-            ctx,
-            stream,
-        )?;
-        self.project_hot(
-            normed,
-            &self.weights.v_proj,
-            projected.offset(2 * plane_bytes),
-            m,
-            p as u32,
-            h,
-            decode,
-            ctx,
-            stream,
-        )?;
+        if capture_verify_intermediates {
+            self.project_hot_verify(
+                normed,
+                &self.weights.k_proj,
+                projected.offset(plane_bytes),
+                m,
+                p as u32,
+                h,
+                ctx,
+                stream,
+            )?;
+            self.project_hot_verify(
+                normed,
+                &self.weights.v_proj,
+                projected.offset(2 * plane_bytes),
+                m,
+                p as u32,
+                h,
+                ctx,
+                stream,
+            )?;
+        } else {
+            self.project_hot(
+                normed,
+                &self.weights.k_proj,
+                projected.offset(plane_bytes),
+                m,
+                p as u32,
+                h,
+                decode,
+                ctx,
+                stream,
+            )?;
+            self.project_hot(
+                normed,
+                &self.weights.v_proj,
+                projected.offset(2 * plane_bytes),
+                m,
+                p as u32,
+                h,
+                decode,
+                ctx,
+                stream,
+            )?;
+        }
         let beta = projected.offset(3 * plane_bytes);
-        self.project_dense(
-            normed,
-            &self.weights.b_proj,
-            beta,
-            m,
-            self.heads as u32,
-            h,
-            ctx,
-            stream,
-        )?;
+        if capture_verify_intermediates {
+            self.project_dense_verify(
+                normed,
+                &self.weights.b_proj,
+                beta,
+                m,
+                self.heads as u32,
+                h,
+                ctx,
+                stream,
+            )?;
+        } else {
+            self.project_dense(
+                normed,
+                &self.weights.b_proj,
+                beta,
+                m,
+                self.heads as u32,
+                h,
+                ctx,
+                stream,
+            )?;
+        }
         profile::step(ctx, stream, &mut profile_timer, "kv_beta_proj")?;
         let fa = beta.offset(tokens * self.heads * bf16);
-        self.project_dense(
-            normed,
-            &self.weights.f_a_proj,
-            fa,
-            m,
-            self.dim as u32,
-            h,
-            ctx,
-            stream,
-        )?;
+        if capture_verify_intermediates {
+            self.project_dense_verify(
+                normed,
+                &self.weights.f_a_proj,
+                fa,
+                m,
+                self.dim as u32,
+                h,
+                ctx,
+                stream,
+            )?;
+        } else {
+            self.project_dense(
+                normed,
+                &self.weights.f_a_proj,
+                fa,
+                m,
+                self.dim as u32,
+                h,
+                ctx,
+                stream,
+            )?;
+        }
         profile::step(ctx, stream, &mut profile_timer, "f_a_proj")?;
         let ga = fa.offset(tokens * self.dim * bf16);
-        self.project_dense(
-            normed,
-            &self.weights.g_a_proj,
-            ga,
-            m,
-            self.dim as u32,
-            h,
-            ctx,
-            stream,
-        )?;
+        if capture_verify_intermediates {
+            self.project_dense_verify(
+                normed,
+                &self.weights.g_a_proj,
+                ga,
+                m,
+                self.dim as u32,
+                h,
+                ctx,
+                stream,
+            )?;
+        } else {
+            self.project_dense(
+                normed,
+                &self.weights.g_a_proj,
+                ga,
+                m,
+                self.dim as u32,
+                h,
+                ctx,
+                stream,
+            )?;
+        }
 
         let g1 = ctx.buffers.ssm_deinterleaved();
-        self.project_dense(
-            fa,
-            &self.weights.f_b_proj,
-            g1,
-            m,
-            p as u32,
-            self.dim as u32,
-            ctx,
-            stream,
-        )?;
+        if capture_verify_intermediates {
+            self.project_dense_verify(
+                fa,
+                &self.weights.f_b_proj,
+                g1,
+                m,
+                p as u32,
+                self.dim as u32,
+                ctx,
+                stream,
+            )?;
+        } else {
+            self.project_dense(
+                fa,
+                &self.weights.f_b_proj,
+                g1,
+                m,
+                p as u32,
+                self.dim as u32,
+                ctx,
+                stream,
+            )?;
+        }
         let g2 = g1.offset(plane_bytes);
-        self.project_dense(
-            ga,
-            &self.weights.g_b_proj,
-            g2,
-            m,
-            p as u32,
-            self.dim as u32,
-            ctx,
-            stream,
-        )?;
+        if capture_verify_intermediates {
+            self.project_dense_verify(
+                ga,
+                &self.weights.g_b_proj,
+                g2,
+                m,
+                p as u32,
+                self.dim as u32,
+                ctx,
+                stream,
+            )?;
+        } else {
+            self.project_dense(
+                ga,
+                &self.weights.g_b_proj,
+                g2,
+                m,
+                p as u32,
+                self.dim as u32,
+                ctx,
+                stream,
+            )?;
+        }
         profile::step(ctx, stream, &mut profile_timer, "g_a_f_b_g_b")?;
 
         let packed = ctx.buffers.ssm_qkvz();
         ops::kda_pack_qkv(ctx.gpu, self.pack_k, projected, packed, m, p as u32, stream)?;
         let convolved = ctx.buffers.ssm_conv_out_f32();
-        ops::conv1d_update_prefill(
-            ctx.gpu,
-            self.conv_prefill_k,
-            self.conv_prefill_tp_k,
-            state.conv_state,
-            packed,
-            &self.weights.conv,
-            DevicePtr::NULL,
-            convolved,
-            (3 * p) as u32,
-            self.conv_width as u32,
-            m,
-            (3 * p) as u32,
-            (3 * p) as u32,
-            stream,
-        )?;
-        profile::step(ctx, stream, &mut profile_timer, "pack_conv")?;
         let core_out = ctx.buffers.attn_output();
-        self.run_recurrent(
-            convolved,
-            g1,
-            beta,
-            state.h_state,
-            core_out,
-            m,
-            decode,
-            ctx,
-            stream,
-        )?;
+        if capture_verify_intermediates {
+            ensure!(
+                state.h_state_intermediates.len() + 1 >= tokens
+                    && state.conv_state_intermediates.len() >= tokens,
+                "GLM-5 KDA verify needs K-1 h and K conv intermediates (h={}, conv={}, K={tokens})",
+                state.h_state_intermediates.len(),
+                state.conv_state_intermediates.len(),
+            );
+            let packed_row_bytes = 3 * p * bf16;
+            let gate_row_bytes = p * bf16;
+            let beta_row_bytes = self.heads * bf16;
+            for t in 0..tokens {
+                ops::conv1d_update_prefill(
+                    ctx.gpu,
+                    self.conv_prefill_k,
+                    self.conv_prefill_tp_k,
+                    state.conv_state,
+                    packed.offset(t * packed_row_bytes),
+                    &self.weights.conv,
+                    DevicePtr::NULL,
+                    convolved.offset(t * packed_row_bytes),
+                    (3 * p) as u32,
+                    self.conv_width as u32,
+                    1,
+                    (3 * p) as u32,
+                    (3 * p) as u32,
+                    stream,
+                )?;
+                self.run_recurrent(
+                    convolved.offset(t * packed_row_bytes),
+                    g1.offset(t * gate_row_bytes),
+                    beta.offset(t * beta_row_bytes),
+                    state.h_state,
+                    core_out.offset(t * gate_row_bytes),
+                    1,
+                    true,
+                    ctx,
+                    stream,
+                )?;
+                // A partial accept can select states after rows 0..K-2;
+                // the post-row K-1 state is already canonical on full accept.
+                if t + 1 < tokens {
+                    ctx.gpu.copy_d2d_async(
+                        state.h_state,
+                        state.h_state_intermediates[t],
+                        self.h_state_bytes,
+                        stream,
+                    )?;
+                    ctx.gpu.copy_d2d_async(
+                        state.conv_state,
+                        state.conv_state_intermediates[t],
+                        self.conv_state_bytes,
+                        stream,
+                    )?;
+                }
+            }
+        } else {
+            ops::conv1d_update_prefill(
+                ctx.gpu,
+                self.conv_prefill_k,
+                self.conv_prefill_tp_k,
+                state.conv_state,
+                packed,
+                &self.weights.conv,
+                DevicePtr::NULL,
+                convolved,
+                (3 * p) as u32,
+                self.conv_width as u32,
+                m,
+                (3 * p) as u32,
+                (3 * p) as u32,
+                stream,
+            )?;
+            self.run_recurrent(
+                convolved,
+                g1,
+                beta,
+                state.h_state,
+                core_out,
+                m,
+                decode,
+                ctx,
+                stream,
+            )?;
+        }
+        profile::step(ctx, stream, &mut profile_timer, "pack_conv")?;
         profile::step(ctx, stream, &mut profile_timer, "recurrent")?;
         let gated = projected;
         ops::kda_sigmoid_gated_norm(
@@ -342,17 +502,30 @@ impl Glm5KdaLayer {
             stream,
         )?;
         profile::step(ctx, stream, &mut profile_timer, "gated_norm")?;
-        self.project_hot(
-            gated,
-            &self.weights.o_proj,
-            normed,
-            m,
-            h,
-            p as u32,
-            decode,
-            ctx,
-            stream,
-        )?;
+        if capture_verify_intermediates {
+            self.project_hot_verify(
+                gated,
+                &self.weights.o_proj,
+                normed,
+                m,
+                h,
+                p as u32,
+                ctx,
+                stream,
+            )?;
+        } else {
+            self.project_hot(
+                gated,
+                &self.weights.o_proj,
+                normed,
+                m,
+                h,
+                p as u32,
+                decode,
+                ctx,
+                stream,
+            )?;
+        }
         profile::step(ctx, stream, &mut profile_timer, "o_proj")?;
         if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
@@ -376,7 +549,13 @@ impl Glm5KdaLayer {
             stream,
         )?;
         profile::step(ctx, stream, &mut profile_timer, "hc_ffn_norm")?;
-        let ffn_out = if decode {
+        let ffn_out = if capture_verify_intermediates && tokens == 2 {
+            self.ffn.forward_k2(normed, ctx, stream)?;
+            ctx.buffers.moe_output()
+        } else if capture_verify_intermediates && tokens == 3 {
+            self.ffn.forward_k3(normed, ctx, stream)?;
+            ctx.buffers.moe_output()
+        } else if decode {
             self.ffn.forward(normed, ctx, stream)?
         } else {
             self.ffn.forward_prefill(normed, tokens, ctx, stream)?;
@@ -420,7 +599,7 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.forward_inner(hidden, state, 1, true, ctx, stream)
+        self.forward_inner(hidden, state, 1, true, false, ctx, stream)
     }
 
     fn prefill(
@@ -438,7 +617,27 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.forward_inner(hidden, state, num_tokens, false, ctx, stream)
+        self.forward_inner(hidden, state, num_tokens, false, false, ctx, stream)
+    }
+
+    fn decode_batched(
+        &self,
+        hidden: DevicePtr,
+        _residual: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        _kv_cache: &mut PagedKvCache,
+        _seq_len: usize,
+        _block_table: &mut Vec<u32>,
+        _disk_block_ids: &mut Vec<u32>,
+        _disk_last_offloaded_per_layer: &mut Vec<u32>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        // Speculative verify rows are one temporal sequence, not independent
+        // requests. Batch the stateless projections/mHC work, but advance the
+        // KDA recurrent state row-by-row and capture rollback intermediates.
+        self.forward_inner(hidden, state, num_tokens, false, true, ctx, stream)
     }
 
     fn decode_multi_seq<'a, 'b: 'a>(

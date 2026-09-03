@@ -37,7 +37,8 @@ pub(super) fn load_all(
         let input_norm = dense_auto(store, &format!("{lp}.input_layernorm.weight"), gpu)?;
         let post_attn_norm =
             dense_auto(store, &format!("{lp}.post_attention_layernorm.weight"), gpu)?;
-        let ffn = super::components::load_ffn(store, &lp, layer_idx, config, gpu, variant, qctx)?;
+        let ffn =
+            super::components::load_ffn(store, &lp, layer_idx, config, gpu, variant, qctx, true)?;
         let hc = super::components::load_hc(store, &lp, config, gpu)?;
         match config.layer_type(layer_idx) {
             LayerType::LinearAttention => {
@@ -66,10 +67,11 @@ pub(super) fn load_all(
                     input_norm,
                     post_attn_norm,
                     ffn,
-                    hc,
+                    Some(hc),
                     config,
                     gpu,
                     kv_dtype,
+                    false,
                 )?;
                 layers.push(layer);
                 attn_idx += 1;
@@ -88,7 +90,7 @@ pub(super) fn load_all(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_mla_layer(
+pub(super) fn load_mla_layer(
     store: &WeightStore,
     lp: &str,
     layer_idx: usize,
@@ -96,10 +98,11 @@ fn load_mla_layer(
     input_norm: DenseWeight,
     post_attn_norm: DenseWeight,
     ffn: FfnComponent,
-    hc: crate::layers::qwen3_attention::HcWeights,
+    hc: Option<crate::layers::qwen3_attention::HcWeights>,
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     kv_dtype: KvCacheDtype,
+    force_dimension_overrides: bool,
 ) -> Result<Box<dyn TransformerLayer>> {
     let p = format!("{lp}.self_attn");
     let tp = super::tp::MlaTpPlan::from_config(config);
@@ -208,6 +211,19 @@ fn load_mla_layer(
     )?;
     layer.set_block_idx(layer_idx);
     layer.set_mla_weights(mla);
-    layer.set_hc_weights(hc);
+    if let Some(hc) = hc {
+        layer.set_hc_weights(hc);
+    }
+    if force_dimension_overrides {
+        // A model-specific MTP proposer is replicated on rank 0 and therefore
+        // uses the checkpoint's full attention dimensions even when the target
+        // model is TP-sharded.  Runtime ForwardContext still carries the
+        // target's local head counts, so pin the full dimensions on the layer.
+        layer.set_dimension_overrides(
+            config.head_dim,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+        );
+    }
     Ok(Box::new(layer))
 }

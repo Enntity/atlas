@@ -46,9 +46,15 @@ pub(crate) fn preflight_reserve(
              --max-num-seqs max_batch..=5; batches above one require ATLAS_EP_PROTOCOL=v2"
         );
         anyhow::ensure!(
-            !(args.speculative || args.self_speculative || args.ngram_speculative),
-            "GLM-5 initial Atlas support does not support speculative decoding"
+            !(args.self_speculative || args.ngram_speculative),
+            "GLM-5 supports its checkpoint MTP layer via --speculative; self/ngram speculative modes are unsupported"
         );
+        if args.speculative {
+            anyhow::ensure!(
+                args.max_batch_size == 1,
+                "GLM-5 MTP bring-up is intentionally limited to --max-batch-size 1 until batched proposer state is validated"
+            );
+        }
         anyhow::ensure!(
             glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size),
             "GLM-5 dual-Spark support requires --world-size 2 --ep-size 2 and either --tp-size 1 (EP fallback) or --tp-size 2 (overlapping TP+EP)"

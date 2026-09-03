@@ -122,10 +122,15 @@ pub fn parse_glm5_next(raw: &Value) -> Result<ModelConfig> {
     config.attn_gated = false;
     config.nested_config = true;
     config.weight_prefix = "model.language_model".to_string();
-    // Initial support deliberately excludes the MTP draft layer: it doubles
-    // checkpoint load pressure and is unnecessary for correctness.
-    config.mtp_num_hidden_layers = 0;
-    config.num_mtp_modules = 0;
+    // GLM-5 stores each next-token predictor as a full decoder layer appended
+    // after the target layers (rather than under Atlas' generic `mtp.*`
+    // namespace).  The model-specific loader consumes those layers when
+    // `--speculative` is requested; ordinary decode continues to ignore them.
+    config.num_mtp_modules = text
+        .get("num_nextn_predict_layers")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    config.mtp_num_hidden_layers = config.num_mtp_modules;
     config.vision = None;
     finalize_config(&mut config, raw)?;
     Ok(config)

@@ -17,7 +17,7 @@
 pub(crate) mod deepseek_v4;
 pub mod dflash_loader;
 mod gemma4;
-mod glm5;
+pub(crate) mod glm5;
 mod laguna;
 mod minimax;
 mod nemotron;

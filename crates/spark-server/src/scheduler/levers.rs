@@ -145,7 +145,9 @@ impl SchedLevers {
             dflash_adaptive: opt_in("ATLAS_DFLASH_ADAPTIVE"),
             dflash_serial_append: opt_in("ATLAS_DFLASH_SERIAL_APPEND"),
             dflash_unified_ctx: opt_in("ATLAS_DFLASH_UNIFIED_CTX"),
-            dflash_spec_think: opt_in("ATLAS_DFLASH_SPEC_THINK"),
+            // The policy applies to every MTP proposer. Keep the old DFlash
+            // spelling as a compatibility alias for existing deployments.
+            dflash_spec_think: opt_in("ATLAS_MTP_SPEC_THINK") || opt_in("ATLAS_DFLASH_SPEC_THINK"),
             dflash_adaptive_min: num("ATLAS_DFLASH_ADAPTIVE_MIN", 2.0),
             dflash_adaptive_reprobe: num("ATLAS_DFLASH_ADAPTIVE_REPROBE", 256),
             dflash_resume_guard: num("ATLAS_DFLASH_RESUME_GUARD", 0),

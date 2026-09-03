@@ -17,6 +17,7 @@ WORKER_IP="${WORKER_IP:-127.0.0.1}"
 SSH_TARGET="${SSH_TARGET:-$WORKER_IP}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 PORT="${PORT:-8888}"
+BIND_ADDRESS="${BIND_ADDRESS:-0.0.0.0}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-1}"
@@ -48,6 +49,13 @@ FP4_PREFILL="${FP4_PREFILL:-0}"
 MOE_PREFILL_EXACT_TILES="${MOE_PREFILL_EXACT_TILES:-1}"
 MOE_PREFILL_MAX_LOAD_FACTOR="${MOE_PREFILL_MAX_LOAD_FACTOR:-8}"
 DUMP_EXPERT_IDS="${DUMP_EXPERT_IDS:-0}"
+SPECULATIVE="${SPECULATIVE:-0}"
+NUM_DRAFTS="${NUM_DRAFTS:-1}"
+# GLM's shipped template enters <think> for ordinary chat requests. Atlas's
+# generic safety gate otherwise keeps speculative decode out of that phase,
+# which would leave MTP idle for most benchmark and agent workloads.
+MTP_SPEC_THINK="${MTP_SPEC_THINK:-1}"
+MTP_GATE_FORCE="${MTP_GATE_FORCE:-0}"
 
 if (( MAX_SEQ_LEN > 2048 )); then
   echo "ERROR: initial GLM-5.3 Atlas support is capped at 2048 tokens." >&2
@@ -89,6 +97,23 @@ fi
 
 if (( MAX_BATCH_SIZE < 1 || MAX_BATCH_SIZE > 3 )); then
   echo "ERROR: validated GLM-5 dual-Spark MAX_BATCH_SIZE range is 1..3." >&2
+  exit 2
+fi
+
+if [[ "$SPECULATIVE" != "0" && "$SPECULATIVE" != "1" ]]; then
+  echo "ERROR: SPECULATIVE must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$SPECULATIVE" == "1" && "$MAX_BATCH_SIZE" != "1" ]]; then
+  echo "ERROR: initial GLM-5 MTP validation requires MAX_BATCH_SIZE=1." >&2
+  exit 2
+fi
+if [[ "$MTP_SPEC_THINK" != "0" && "$MTP_SPEC_THINK" != "1" ]]; then
+  echo "ERROR: MTP_SPEC_THINK must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$MTP_GATE_FORCE" != "0" && "$MTP_GATE_FORCE" != "1" ]]; then
+  echo "ERROR: MTP_GATE_FORCE must be 0 or 1." >&2
   exit 2
 fi
 
@@ -162,6 +187,7 @@ COMMON_SERVE_ARGS=(
   --ep-size 2
   --master-addr "$HEAD_IP"
   --master-port "$MASTER_PORT"
+  --bind "$BIND_ADDRESS"
   --max-seq-len "$MAX_SEQ_LEN"
   --max-prefill-tokens "$MAX_SEQ_LEN"
   --max-batch-size "$MAX_BATCH_SIZE"
@@ -176,10 +202,14 @@ fi
 if [[ -n "$TOOL_CALL_PARSER" ]]; then
   COMMON_SERVE_ARGS+=(--tool-call-parser "$TOOL_CALL_PARSER")
 fi
+if [[ "$SPECULATIVE" == "1" ]]; then
+  COMMON_SERVE_ARGS+=(--speculative --num-drafts "$NUM_DRAFTS")
+fi
 
 echo "Atlas GLM-5.3 dual-Spark safe bring-up"
 echo "  model: $MODEL"
 echo "  image: $IMAGE"
+echo "  API bind: $BIND_ADDRESS:$PORT"
 echo "  per-sequence context / active / admitted: $MAX_SEQ_LEN / $MAX_BATCH_SIZE / $MAX_NUM_SEQS"
 echo "  parallelism: TP=$TP_SIZE / EP=2 on two physical ranks"
 echo "  GPU budget: $GPU_MEM_UTIL; OOM guard: ${OOM_GUARD_MB} MiB"
@@ -203,6 +233,8 @@ echo "  NVFP4 grouped CUTLASS MoE: $NVFP4_CUTLASS_MOE"
 echo "  dense FFN native FP4 prefill: $FP4_PREFILL"
 echo "  MoE exact grid / fallback load factor: $MOE_PREFILL_EXACT_TILES / $MOE_PREFILL_MAX_LOAD_FACTOR"
 echo "  tool-call parser override: ${TOOL_CALL_PARSER:-model default}"
+echo "  MTP speculative / draft tokens: $SPECULATIVE / $NUM_DRAFTS"
+echo "  MTP during thinking / force gate: $MTP_SPEC_THINK / $MTP_GATE_FORCE"
 
 # Never leave one stale rank in an old communicator.
 docker rm -f atlas-glm53-ep0 2>/dev/null || true
@@ -241,6 +273,8 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_MOE_PREFILL_EXACT_TILES=$MOE_PREFILL_EXACT_TILES \
   -e ATLAS_MOE_PREFILL_MAX_LOAD_FACTOR=$MOE_PREFILL_MAX_LOAD_FACTOR \
   -e ATLAS_DUMP_EXPERT_IDS=$DUMP_EXPERT_IDS \
+  -e ATLAS_MTP_SPEC_THINK=$MTP_SPEC_THINK \
+  -e ATLAS_MTP_GATE_FORCE=$MTP_GATE_FORCE \
   $REMOTE_MOUNT $IMAGE $REMOTE_SERVE --rank 1 --port 0"
 
 docker run -d \
@@ -271,9 +305,11 @@ docker run -d \
   -e ATLAS_MOE_PREFILL_EXACT_TILES="$MOE_PREFILL_EXACT_TILES" \
   -e ATLAS_MOE_PREFILL_MAX_LOAD_FACTOR="$MOE_PREFILL_MAX_LOAD_FACTOR" \
   -e ATLAS_DUMP_EXPERT_IDS="$DUMP_EXPERT_IDS" \
+  -e ATLAS_MTP_SPEC_THINK="$MTP_SPEC_THINK" \
+  -e ATLAS_MTP_GATE_FORCE="$MTP_GATE_FORCE" \
   "${MOUNT_FLAGS[@]}" \
   "$IMAGE" "${COMMON_SERVE_ARGS[@]}" --rank 0 --port "$PORT"
 
 echo "Rank 0 logs: docker logs -f atlas-glm53-ep0"
 echo "Rank 1 logs: ssh $SSH_TARGET 'docker logs -f atlas-glm53-ep1'"
-echo "API (head node): http://127.0.0.1:$PORT/v1"
+echo "API (head node): http://$BIND_ADDRESS:$PORT/v1"

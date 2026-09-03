@@ -4,7 +4,10 @@
 
 mod components;
 mod layers;
+mod mtp;
 mod tp;
+
+pub(crate) use mtp::{Glm5MtpModule, load_glm5_mtp_module};
 
 use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;

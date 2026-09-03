@@ -54,6 +54,50 @@ impl ProjectionPath {
 }
 
 impl Glm5KdaLayer {
+    /// Project a short speculative-verification batch with the decode kernels
+    /// that amortize one weight read across the candidate rows.  Atlas only
+    /// ships the tuned NVFP4 variants for M=2/3 today; larger draft batches
+    /// retain the correct small-GEMM fallback until a batch4 kernel exists.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_hot_verify(
+        &self,
+        input: DevicePtr,
+        weight: &Glm5Projection,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if (2..=3).contains(&m) {
+            self.project_hot_multi_decode(input, weight, output, m, n, k, ctx, stream)
+        } else {
+            self.project_hot(input, weight, output, m, n, k, false, ctx, stream)
+        }
+    }
+
+    /// BF16 side projections already have a general batch-M GEMV kernel, so
+    /// speculative verification need not fall through to a prefill GEMM.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_dense_verify(
+        &self,
+        input: DevicePtr,
+        weight: &DenseWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if m == 1 {
+            self.project_dense(input, weight, output, m, n, k, ctx, stream)
+        } else {
+            self.project_dense_multi_decode(input, weight, output, m, n, k, ctx, stream)
+        }
+    }
+
     /// Read one NVFP4 projection once for two or three concurrent decode rows.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn project_hot_multi_decode(

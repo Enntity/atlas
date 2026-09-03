@@ -56,11 +56,12 @@ pub(super) fn load_ffn(
     gpu: &dyn GpuBackend,
     variant: Nvfp4Variant,
     qctx: QuantizeCtx,
+    allow_prefill_layout: bool,
 ) -> Result<FfnComponent> {
     if config.mlp_only_layers.contains(&layer_idx) {
         return load_dense_ffn(store, lp, config, gpu, qctx);
     }
-    load_moe(store, lp, config, gpu, variant, qctx)
+    load_moe(store, lp, config, gpu, variant, qctx, allow_prefill_layout)
 }
 
 fn load_dense_ffn(
@@ -119,6 +120,7 @@ fn load_moe(
     gpu: &dyn GpuBackend,
     variant: Nvfp4Variant,
     qctx: QuantizeCtx,
+    allow_prefill_layout: bool,
 ) -> Result<FfnComponent> {
     let p = format!("{lp}.mlp");
     let h = config.hidden_size;
@@ -223,7 +225,8 @@ fn load_moe(
         // its block-scale swizzle. Avoid materializing the much larger Atlas
         // transposed expert twins in this mode.
         layer.build_cutlass_grouped_sfb(gpu, config, gpu.default_stream())?;
-    } else if unified_moe_layout_enabled(std::env::var("ATLAS_UNIFIED_MOE_LAYOUT").ok().as_deref())
+    } else if allow_prefill_layout
+        && unified_moe_layout_enabled(std::env::var("ATLAS_UNIFIED_MOE_LAYOUT").ok().as_deref())
     {
         // Replace the decode-native expert storage with Atlas' transposed
         // layout one layer at a time. The transpose helper frees each source

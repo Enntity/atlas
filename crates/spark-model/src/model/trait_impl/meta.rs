@@ -246,7 +246,10 @@ impl TransformerModel {
         self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream)?;
         // Ensure zero completes before any prefill kernels touch this slot.
         self.gpu.synchronize(stream)?;
-        let has_mtp = self.proposer.is_some() || self.self_speculative;
+        // Worker ranks do not own a model-specific proposer, but they still
+        // run the distributed target verify and must attach the rollback
+        // buffers allocated in the shared SSM pool.
+        let has_mtp = self.ssm_pool.has_mtp;
 
         // ATLAS_MTP_DRAFTER_PREFILL: a fresh sequence invalidates the
         // whole-prompt hidden capture — without this, a warm-restored prefill
