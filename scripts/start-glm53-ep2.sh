@@ -60,6 +60,7 @@ MTP_TIMING="${MTP_TIMING:-0}"
 VERIFY_PROFILE="${VERIFY_PROFILE:-0}"
 MOE_UNION_STATS="${MOE_UNION_STATS:-0}"
 GLM_K5_GROUPED_MOE="${GLM_K5_GROUPED_MOE:-1}"
+MOE_SHARED_REDUCE_OVERLAP="${MOE_SHARED_REDUCE_OVERLAP:-1}"
 GLM_MTP_SERIAL_PREFILL="${GLM_MTP_SERIAL_PREFILL:-0}"
 # MTP proposals need the appended layer's prompt K/V history. Build it with
 # the batched KV-only path by default whenever speculative decode is enabled.
@@ -139,6 +140,10 @@ if [[ "$MOE_UNION_STATS" != "0" && "$MOE_UNION_STATS" != "1" ]]; then
 fi
 if [[ "$GLM_K5_GROUPED_MOE" != "0" && "$GLM_K5_GROUPED_MOE" != "1" ]]; then
   echo "ERROR: GLM_K5_GROUPED_MOE must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$MOE_SHARED_REDUCE_OVERLAP" != "0" && "$MOE_SHARED_REDUCE_OVERLAP" != "1" ]]; then
+  echo "ERROR: MOE_SHARED_REDUCE_OVERLAP must be 0 or 1." >&2
   exit 2
 fi
 if [[ "$GLM_MTP_SERIAL_PREFILL" != "0" && "$GLM_MTP_SERIAL_PREFILL" != "1" ]]; then
@@ -276,6 +281,7 @@ echo "  MTP phase timing: $MTP_TIMING"
 echo "  GLM verifier layer profile: $VERIFY_PROFILE"
 echo "  sampled MoE expert-union stats: $MOE_UNION_STATS"
 echo "  GLM K5 grouped W4A16 MoE: $GLM_K5_GROUPED_MOE"
+echo "  shared-expert / EP-reduce overlap: $MOE_SHARED_REDUCE_OVERLAP"
 echo "  GLM serial MTP prefill probe: $GLM_MTP_SERIAL_PREFILL"
 echo "  GLM batched MTP KV prefill: $GLM_MTP_BATCHED_PREFILL"
 
@@ -322,6 +328,7 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_GLM_VERIFY_PROFILE=$VERIFY_PROFILE \
   -e ATLAS_MOE_UNION_STATS=$MOE_UNION_STATS \
   -e ATLAS_GLM_K5_GROUPED_MOE=$GLM_K5_GROUPED_MOE \
+  -e ATLAS_MOE_SHARED_REDUCE_OVERLAP=$MOE_SHARED_REDUCE_OVERLAP \
   -e ATLAS_GLM_MTP_SERIAL_PREFILL=$GLM_MTP_SERIAL_PREFILL \
   -e ATLAS_GLM_MTP_BATCHED_PREFILL=$GLM_MTP_BATCHED_PREFILL \
   $REMOTE_MOUNT $IMAGE $REMOTE_SERVE --rank 1 --port 0"
@@ -360,6 +367,7 @@ docker run -d \
   -e ATLAS_GLM_VERIFY_PROFILE="$VERIFY_PROFILE" \
   -e ATLAS_MOE_UNION_STATS="$MOE_UNION_STATS" \
   -e ATLAS_GLM_K5_GROUPED_MOE="$GLM_K5_GROUPED_MOE" \
+  -e ATLAS_MOE_SHARED_REDUCE_OVERLAP="$MOE_SHARED_REDUCE_OVERLAP" \
   -e ATLAS_GLM_MTP_SERIAL_PREFILL="$GLM_MTP_SERIAL_PREFILL" \
   -e ATLAS_GLM_MTP_BATCHED_PREFILL="$GLM_MTP_BATCHED_PREFILL" \
   "${MOUNT_FLAGS[@]}" \

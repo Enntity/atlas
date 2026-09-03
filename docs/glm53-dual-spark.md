@@ -354,8 +354,8 @@ pipeline for the complete five-row verifier. It sorts the 40 top-k routes by
 expert, keeps the source activations in BF16, then converts activation and
 dequantized weight tiles on chip to E4M3 for FP8 MMA. Unlike Atlas's W4A4 MMQ
 path, it does not quantize and stage verifier activations in FP4. The grouped
-path also skips the expert-offset host copy
-when the worst case is already one 64-row tile; at K=5 and top-k=8, all 40
+path also skips the expert-offset host copy when the worst case is already one
+64-row tile; at K=5 and top-k=8, all 40
 routes fit in that tile by construction. `GLM_K5_GROUPED_MOE=0` restores the
 K2+K3 verifier path.
 
@@ -373,6 +373,23 @@ to FP4 reduced accepted drafts to 154 and sustained decode to 13.68 tok/s on
 the forced workload. MMQ therefore remains experimental and disabled. Its
 small-batch fallback now routes through the layout-aware grouped dispatcher,
 preventing repacked weights from being consumed by checkpoint-layout kernels.
+
+The next prefill-only optimization defers the shared expert until routed MoE is
+complete, then runs the shared GEMMs on Atlas's auxiliary CUDA stream while the
+main stream performs the EP all-reduce. This pairs compute with communication
+instead of overlapping two LPDDR5X-heavy expert paths. It is deliberately
+restricted to more than 64 rows: applying it to the five-row MTP verifier
+reduced decode from 15.04 to 12.23 tok/s in the rejection test.
+
+On the exact 1,000-token benchmark, one warm-up plus five measured requests
+gave 875.35 tok/s median versus 862.82 with the overlap disabled (+1.45%). A
+second prompt followed by a deterministic 97-token continuation measured
+880.98 versus 861.77 prefill tok/s (+2.23%); decode was 15.97 versus 15.04
+tok/s, confirming that the >64-row guard preserved the verifier path. All
+measured continuation outputs were byte-identical across the A/B comparison.
+Arithmetic still returned `5/16`, and a 964-token rendered needle prompt
+recovered `SAPPHIRE-7319`. `MOE_SHARED_REDUCE_OVERLAP=0` restores the fully
+sequential schedule.
 
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model

@@ -141,7 +141,7 @@ impl MoeLayer {
             };
         }
 
-        // ── Shared expert on secondary stream (overlaps with routed path) ──
+        // ── Shared expert ──
         // Shared expert only reads `input` and writes to separate buffers
         // (ssm_deinterleaved, ssm_qkvz, attn_output) — no data conflict
         // with the routed expert path.  In profile mode, run sequentially
@@ -151,24 +151,22 @@ impl MoeLayer {
         // e.g. Qwen3-VL-30B which has no shared_expert_intermediate_size).
         // Launching kernels with N=0 produces CUDA_ERROR_INVALID_VALUE (grid.x=0).
         let has_shared = shared_inter > 0;
-        let use_overlap = false; // disabled: dual-stream contention worsens LPDDR5X bandwidth
-        let aux = if use_overlap {
-            self.prefill_stream
-        } else {
-            stream
-        };
+        let is_ep_prefill = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+        // Overlapping shared and routed GEMMs regresses on unified-memory GB10
+        // because both streams compete for LPDDR5X bandwidth. In EP mode there
+        // is a better pairing: defer the shared GEMMs until routed work is done,
+        // then overlap them with the routed-output NCCL all-reduce. Keep graph
+        // capture and profiling sequential; both require deterministic stream
+        // ownership/timing.
+        let overlap_shared_reduce = has_shared
+            && is_ep_prefill
+            && num_tokens > 64
+            && !ctx.graph_capture
+            && !ctx.profile
+            && std::env::var("ATLAS_MOE_SHARED_REDUCE_OVERLAP").as_deref() == Ok("1");
 
-        if has_shared {
-            self.run_shared_expert_prefill(
-                input,
-                n,
-                h,
-                shared_inter,
-                aux,
-                stream,
-                use_overlap,
-                ctx,
-            )?;
+        if has_shared && !overlap_shared_reduce {
+            self.run_shared_expert_prefill(input, n, h, shared_inter, stream, stream, false, ctx)?;
         }
         prof_step!("shared_expert");
 
@@ -399,12 +397,8 @@ impl MoeLayer {
         // 8. Blend shared expert: output += sigmoid(dot(input, gate)) * shared
         // Skip when has_shared == false (no shared expert in this model config).
         // EP fix: defer shared expert blend until AFTER all-reduce to avoid doubling.
-        let is_ep_prefill = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
         if has_shared && !is_ep_prefill {
             let shared_down_out = ctx.buffers.attn_output();
-            if use_overlap {
-                ctx.gpu.stream_wait_event(stream, self.event_b)?;
-            }
             super::dump::dump_routed_only(ctx.gpu, stream, output, n, h)?;
             super::dump::dump_shared_out(ctx.gpu, stream, shared_down_out, n, h)?;
             super::dump::dump_shared_gate(
@@ -429,6 +423,23 @@ impl MoeLayer {
         }
         super::dump::dump_moe_out(ctx.gpu, stream, output, n, h)?;
         prof_step!("unpermute_blend");
+
+        // The routed result is now complete. Starting the shared expert here
+        // lets its GEMMs run beside the EP collective instead of beside the
+        // bandwidth-heavy routed GEMMs. event_a makes the auxiliary stream wait
+        // for this point; event_b is joined immediately before the shared blend.
+        if overlap_shared_reduce {
+            self.run_shared_expert_prefill(
+                input,
+                n,
+                h,
+                shared_inter,
+                self.prefill_stream,
+                stream,
+                true,
+                ctx,
+            )?;
+        }
 
         // EP all-reduce
         if let Some(comm) = ctx.comm
@@ -456,7 +467,7 @@ impl MoeLayer {
             // Add shared expert ONCE after all-reduce (prevents EP doubling)
             if has_shared {
                 let shared_down_out = ctx.buffers.attn_output();
-                if use_overlap {
+                if overlap_shared_reduce {
                     ctx.gpu.stream_wait_event(stream, self.event_b)?;
                 }
                 ops::moe_batched_blend(
