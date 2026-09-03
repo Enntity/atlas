@@ -349,6 +349,31 @@ was effectively flat at 852.61 tok/s. The deterministic output prefix remained
 identical, and a separate arithmetic chat completed with the correct simplified
 fraction `5/16` in both separated reasoning and visible content.
 
+The routed-expert follow-up reuses Atlas's existing grouped W4A16 tensor-core
+pipeline for the complete five-row verifier. It sorts the 40 top-k routes by
+expert, keeps the source activations in BF16, then converts activation and
+dequantized weight tiles on chip to E4M3 for FP8 MMA. Unlike Atlas's W4A4 MMQ
+path, it does not quantize and stage verifier activations in FP4. The grouped
+path also skips the expert-offset host copy
+when the worst case is already one 64-row tile; at K=5 and top-k=8, all 40
+routes fit in that tile by construction. `GLM_K5_GROUPED_MOE=0` restores the
+K2+K3 verifier path.
+
+With one warm-up and five measured copies of the same exact 1,000-token,
+forced-256 request, grouped W4A16 decoded at `19.046`, `19.414`, `21.029`,
+`20.243`, and `20.646` tok/s (20.243 median, +3.1% over v87). Median accepted
+drafts were 194 versus v87's 195, and median prefill remained flat at 852.42
+tok/s. Target-forward samples from the benchmark had a 177.0 ms median, 7.6%
+below v87's 191.55 ms. A direct arithmetic check returned `5/16`, and a
+1,002-token needle prompt recovered `SAPPHIRE-7319` exactly.
+
+An equal-memory MMQ comparison was also made before selecting W4A16. It lowered
+target-forward time further to 158--161 ms, but quantizing verifier activations
+to FP4 reduced accepted drafts to 154 and sustained decode to 13.68 tok/s on
+the forced workload. MMQ therefore remains experimental and disabled. Its
+small-batch fallback now routes through the layout-aware grouped dispatcher,
+preventing repacked weights from being consumed by checkpoint-layout kernels.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

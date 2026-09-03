@@ -84,7 +84,8 @@ impl MoeLayer {
             Some("0") => false,
             Some("1") => true,
             _ => self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4,
-        } && !ctx.graph_capture;
+        } && worst_case_m_tiles > 1
+            && !ctx.graph_capture;
         // Keep the host copy when exact sizing already paid for it. The
         // CUTLASS grouped path also needs these offsets to build its problem
         // list; copying them again would introduce a second stream-draining

@@ -14,6 +14,19 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        // Experimental Marlin-shaped verifier path: keep the source activations
+        // in BF16, then sort all five rows by expert and run Atlas's weight-only
+        // W4A16 grouped GEMM. The GB10 kernel converts each activation/weight tile
+        // to E4M3 on chip for FP8 MMA; unlike NVFP4 MMQ, it does not quantize and
+        // stage the verifier activations in FP4. This preserves acceptance while
+        // amortizing routed weights across the verifier batch.
+        if self.use_t_layout_for_prefill()
+            && std::env::var("ATLAS_GLM_K5_GROUPED_MOE").as_deref() == Ok("1")
+        {
+            self.forward_prefill(input, 5, ctx, stream)?;
+            return Ok(ctx.buffers.moe_output());
+        }
+
         let optimized = self.lora.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
