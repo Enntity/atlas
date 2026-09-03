@@ -334,6 +334,21 @@ prefill was 855.55 tok/s versus 849.03 tok/s for the control. All responses
 generated the requested 256 tokens and preserved the control's deterministic
 output prefix.
 
+K=5 routing is also shared across the two expert waves. GLM's five BF16 router
+rows and sigmoid top-k are evaluated once, then the device-resident indices and
+weights are sliced between K2 and K3. The optimized arm explicitly excludes
+hash routing and sqrt-softplus scoring, so those models retain their established
+paths. Expert execution remains K2+K3 and the single EP reduction above is
+unchanged.
+
+Against v86 with the same launch and request, v87's three measured forced-256
+runs decoded at `19.630`, `19.999`, and `18.677` tok/s (19.630 median, +2.15%).
+Median accepted drafts were 195 versus v86's 194. Seven timed target-forward
+samples had a 191.55 ms median, down 2.01% from v86's 195.48 ms. Median prefill
+was effectively flat at 852.61 tok/s. The deterministic output prefix remained
+identical, and a separate arithmetic chat completed with the correct simplified
+fraction `5/16` in both separated reasoning and visible content.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

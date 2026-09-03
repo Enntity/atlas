@@ -28,6 +28,14 @@ pub(crate) struct ExpertPtrTable {
     pub(crate) scale2_vals: DevicePtr,
 }
 
+/// Device-resident top-k routing results that can be sliced across fused
+/// small-M expert waves without recomputing the router projection.
+#[derive(Clone, Copy)]
+pub(super) struct PrecomputedRoutes {
+    indices: DevicePtr,
+    weights: DevicePtr,
+}
+
 /// Device-side pointer table for FP8 expert dispatch (one projection).
 ///
 /// FP8 experts use 2 pointer arrays (weight + block_scale) instead of

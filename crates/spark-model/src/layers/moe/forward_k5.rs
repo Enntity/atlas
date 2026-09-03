@@ -27,6 +27,8 @@ impl MoeLayer {
             && !self.weights.shared_expert.gate_proj.is_null()
             && !self.weights.shared_expert.up_proj.is_null()
             && !self.weights.shared_expert.down_proj.is_null()
+            && self.tid2eid_dev.is_none()
+            && ctx.config.scoring_func != "sqrtsoftplus"
             && self.w4a16_batchm.kernel(5).0 != 0;
 
         if !optimized {
@@ -87,13 +89,91 @@ impl MoeLayer {
             stream,
         )?;
 
+        // Route all five rows once, then hand contiguous slices to the proven
+        // K2/K3 expert waves below. This preserves their expert working sets
+        // while avoiding a second read of the router matrix and top-k launch.
+        let router_in = self.router_input(input, 5, h, ctx, stream)?;
+        let num_experts = ctx.config.num_experts as u32;
+        let top_k = ctx.config.num_experts_per_tok as u32;
+        let gate_logits = ctx.buffers.gate_logits();
+        if let Some(ref nvfp4) = self.gate_nvfp4 {
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                batch5,
+                router_in,
+                nvfp4,
+                gate_logits,
+                5,
+                num_experts,
+                h,
+                stream,
+            )?;
+        } else {
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                5,
+                num_experts,
+                h,
+                stream,
+            )?;
+        }
+        let scratch = ctx.buffers.scratch();
+        let routes = PrecomputedRoutes {
+            indices: scratch,
+            weights: scratch.offset(5 * top_k as usize * 4),
+        };
+        if let Some(bias) = self.correction_bias_dev {
+            ops::moe_topk_sigmoid_batched(
+                ctx.gpu,
+                self.moe_topk_sigmoid_batched_k,
+                gate_logits,
+                bias,
+                routes.indices,
+                routes.weights,
+                num_experts,
+                top_k,
+                ctx.config.norm_topk_prob,
+                ctx.config.routed_scaling_factor as f32,
+                5,
+                stream,
+            )?;
+        } else {
+            ops::moe_topk_softmax_batched(
+                ctx.gpu,
+                self.moe_topk_batched,
+                gate_logits,
+                routes.indices,
+                routes.weights,
+                num_experts,
+                top_k,
+                ctx.config.norm_topk_prob,
+                5,
+                stream,
+            )?;
+        }
+        super::union_stats::maybe_sample_expert_union(
+            ctx,
+            routes.indices,
+            5,
+            top_k as usize,
+            stream,
+        );
+
         // Run routed experts through their fused small-M kernels. Consume each
         // temporary moe_output before the next group overwrites it.
-        self.forward_k2_routed_local(input, ctx, stream)?;
+        self.forward_k2_routed_local(input, routes, ctx, stream)?;
         ctx.gpu
             .copy_d2d_async(ctx.buffers.moe_output(), input, 2 * h as usize * 2, stream)?;
         let row3 = input.offset(2 * h as usize * 2);
-        self.forward_k3_routed_local(row3, ctx, stream)?;
+        let routes3 = PrecomputedRoutes {
+            indices: routes.indices.offset(2 * top_k as usize * 4),
+            weights: routes.weights.offset(2 * top_k as usize * 4),
+        };
+        self.forward_k3_routed_local(row3, routes3, ctx, stream)?;
         ctx.gpu
             .copy_d2d_async(ctx.buffers.moe_output(), row3, 3 * h as usize * 2, stream)?;
 
