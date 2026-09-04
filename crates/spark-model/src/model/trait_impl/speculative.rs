@@ -419,8 +419,39 @@ impl TransformerModel {
         _stream: u64,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
-        // MTP loads ALL experts on every rank — no EP all_reduce needed.
-        // Rank 1 does not participate in MTP propose.
+        if crate::layers::glm5_mtp::distributed_enabled() {
+            anyhow::ensure!(
+                self.config.model_type == "glm5_next"
+                    && self.config.tp_world_size == 2
+                    && self.config.ep_world_size == 2
+                    && self.levers.max_decode_seqs == 1,
+                "distributed GLM MTP requires GLM TP2/EP2 with max_batch_size=1"
+            );
+            anyhow::ensure!(
+                grammar_bitmask.is_none() || num_drafts == 1,
+                "distributed GLM MTP supports grammar masking only at one draft"
+            );
+            anyhow::ensure!(
+                (1..=4).contains(&num_drafts),
+                "distributed GLM MTP draft count must be 1..=4, got {num_drafts}"
+            );
+            anyhow::ensure!(position <= u32::MAX as usize, "MTP position exceeds u32");
+            let hidden_row = self
+                .last_mtp_hidden_idx
+                .load(std::sync::atomic::Ordering::Relaxed);
+            anyhow::ensure!(hidden_row < 32, "MTP hidden row exceeds verify limit");
+            self.ep_broadcast_seq_and_cmd(
+                seq.slot_idx as u32,
+                super::super::impl_a2::EP_CMD_GLM_MTP_PROPOSE,
+                self.ep_protocol_v2,
+            )?;
+            self.ep_broadcast_tokens(&[
+                token,
+                position as u32,
+                num_drafts as u32,
+                hidden_row as u32,
+            ])?;
+        }
         self.run_mtp_propose_inner(token, position, num_drafts, seq, grammar_bitmask)
     }
 

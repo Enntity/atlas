@@ -4,8 +4,10 @@
 //!
 //! GLM's predictor is a complete appended decoder layer, not the compact
 //! Qwen-shaped head represented by [`crate::layers::MtpHead`]. Every draft is
-//! still verified by the distributed target model, so this proposer executes
-//! independently on rank 0 with a private one-layer MLA cache.
+//! still verified by the distributed target model. The default proposer runs
+//! independently on rank 0 with a private one-layer MLA cache; the opt-in
+//! dual-Spark path mirrors that exact body and splits only its vocabulary
+//! projection.
 
 use parking_lot::Mutex;
 use std::any::Any;
@@ -20,6 +22,11 @@ use crate::layers::ops;
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_loader::glm5::Glm5MtpModule;
 use crate::weight_map::{DenseWeight, QuantizedWeight};
+
+pub(crate) fn distributed_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ATLAS_GLM_MTP_DISTRIBUTED").ok().as_deref() == Some("1"))
+}
 
 pub struct Glm5MtpProposerState {
     pub block_table: Vec<u32>,
@@ -217,6 +224,8 @@ impl Glm5MtpHead {
             stats: ctx.stats,
             attn_metadata: Some(mtp_meta),
             profile: ctx.profile,
+            // Both ranks execute the checkpoint-native full proposer body.
+            // Only the vocabulary projection below is distributed.
             comm: None,
             graph_capture: false,
             gdn_exact_replay: false,
@@ -284,33 +293,79 @@ impl Glm5MtpHead {
             ctx.config.vocab_size as u32
         };
         let logits = ctx.buffers.logits();
+        let (vocab_start, projected_vocab) = if distributed_enabled() {
+            let comm = ctx
+                .comm
+                .ok_or_else(|| anyhow::anyhow!("distributed GLM MTP requires a communicator"))?;
+            anyhow::ensure!(
+                comm.world_size() == 2 && vocab as usize % comm.world_size() == 0,
+                "distributed GLM MTP requires an even TP2 vocabulary (got {vocab})"
+            );
+            let local = vocab as usize / comm.world_size();
+            (comm.rank() * local, local as u32)
+        } else {
+            (0, vocab)
+        };
+        let local_logits = logits.offset(vocab_start * 2);
         // Preserve the two highest-leverage draft decisions with the target's
         // BF16 tied head. Later drafts are always verified before emission and
         // can use the cheaper NVFP4 projection without destabilizing p1/p2.
         if draft_index > 1
             && let Some(ref head) = self.lm_head_nvfp4
         {
+            let local_head = QuantizedWeight {
+                weight: head.weight.offset(vocab_start * ctx.config.hidden_size / 2),
+                weight_scale: head
+                    .weight_scale
+                    .offset(vocab_start * ctx.config.hidden_size / 16),
+                weight_scale_2: head.weight_scale_2,
+                input_scale: head.input_scale,
+                weight_scale_2_vec: if head.weight_scale_2_vec.is_null() {
+                    head.weight_scale_2_vec
+                } else {
+                    head.weight_scale_2_vec.offset(vocab_start * 4)
+                },
+            };
             ops::w4a16_gemv(
                 ctx.gpu,
                 self.w4a16_gemv_k,
                 final_hidden,
-                head,
-                logits,
-                vocab,
+                &local_head,
+                local_logits,
+                projected_vocab,
                 h_u32,
                 stream,
             )?;
         } else {
+            let local_head = DenseWeight {
+                weight: self
+                    .lm_head
+                    .weight
+                    .offset(vocab_start * ctx.config.hidden_size * 2),
+            };
             ops::dense_gemv(
                 ctx.gpu,
                 self.dense_gemv_k,
                 final_hidden,
-                &self.lm_head,
-                logits,
-                vocab,
+                &local_head,
+                local_logits,
+                projected_vocab,
                 h_u32,
                 stream,
             )?;
+        }
+        if distributed_enabled() {
+            let comm = ctx.comm.expect("distributed communicator checked above");
+            // Projection runs on Atlas's compute stream while the communicator's
+            // broadcasts use its legacy stream. Complete the local half first,
+            // then exchange the two contiguous BF16 halves in rank order. Both
+            // ranks finish with the exact original full-vocabulary logits, so
+            // global argmax and grammar tie-breaking stay byte-identical.
+            ctx.gpu.synchronize(stream)?;
+            let local = projected_vocab as usize;
+            for root in 0..comm.world_size() {
+                comm.broadcast(logits.offset(root * local * 2).0, local * 2, root)?;
+            }
         }
         let out = ctx.buffers.scratch();
         let draft = if let Some(mask) = grammar_bitmask {

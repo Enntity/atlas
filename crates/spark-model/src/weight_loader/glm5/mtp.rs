@@ -32,7 +32,8 @@ pub struct Glm5MtpModule {
     pub norm: DenseWeight,
 }
 
-/// Load the appended GLM MTP layer as a rank-0 replicated proposer.
+/// Load the appended GLM MTP layer as a rank-0 proposer, or replicate that
+/// exact body on both ranks when split-vocabulary MTP is explicitly enabled.
 pub fn load_glm5_mtp_module(
     store: &WeightStore,
     config: &ModelConfig,
@@ -52,11 +53,22 @@ pub fn load_glm5_mtp_module(
         return Ok(None);
     }
 
-    // The proposer executes only on rank 0. Give it full TP dimensions and all
-    // experts so it performs no collectives while worker ranks execute the
-    // target verification path. The checkpoint-native NVFP4 expert tensors are
-    // referenced directly; this does not create a second full expert copy.
+    let distributed = std::env::var("ATLAS_GLM_MTP_DISTRIBUTED").ok().as_deref() == Some("1");
+
+    // Keep the appended body identical to the proven rank-0 proposer on both
+    // ranks: full TP dimensions and all experts, with no body collectives.
+    // Distributed mode uses rank 1 only to split the dominant vocabulary
+    // projection, preserving draft arithmetic and therefore acceptance.
     let mut draft_config = config.clone();
+    if distributed {
+        anyhow::ensure!(
+            draft_config.tp_world_size == 2 && draft_config.ep_world_size == 2,
+            "ATLAS_GLM_MTP_DISTRIBUTED=1 requires GLM overlapping TP=EP=world=2 \
+             (got TP={}, EP={})",
+            draft_config.tp_world_size,
+            draft_config.ep_world_size,
+        );
+    }
     let target_tp = draft_config.tp_world_size.max(1);
     draft_config.num_attention_heads *= target_tp;
     draft_config.num_key_value_heads *= target_tp;

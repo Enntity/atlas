@@ -252,6 +252,9 @@ pub struct SafetensorsLoader {
     /// Optional layer-name fragment whose expert tensors are loaded only on
     /// EP rank 0, with all experts replicated there.
     pub rank0_only_expert_prefix: Option<String>,
+    /// Optional layer-name fragment whose expert tensors bypass EP filtering
+    /// and are replicated on every rank.
+    pub replicated_expert_prefix: Option<String>,
     /// Override for the peak memory multiplier in the pre-flight OOM check.
     /// Set from QuantFormat::peak_memory_multiplier() in the caller.
     /// When None, the pre-flight uses its own heuristic (1.3x NVFP4 / 1.5x FP8).
@@ -272,6 +275,7 @@ impl SafetensorsLoader {
             ep_world_size: 1,
             num_experts: 0,
             rank0_only_expert_prefix: None,
+            replicated_expert_prefix: None,
             peak_memory_multiplier: None,
         }
     }
@@ -283,6 +287,7 @@ impl SafetensorsLoader {
             ep_world_size,
             num_experts,
             rank0_only_expert_prefix: None,
+            replicated_expert_prefix: None,
             peak_memory_multiplier: None,
         }
     }
@@ -300,6 +305,13 @@ impl SafetensorsLoader {
         }
         // Parse expert index from patterns like "*.experts.42.gate_proj*"
         if let Some(idx) = parse_expert_index(name) {
+            if self
+                .replicated_expert_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.contains(prefix))
+            {
+                return false;
+            }
             if self
                 .rank0_only_expert_prefix
                 .as_ref()
@@ -345,6 +357,22 @@ pub(crate) use loader::check_oom_guard;
 // Consumed by the unix-only fast-weights (O_DIRECT) loader path.
 #[cfg(unix)]
 pub(crate) use loader::estimate_has_fp8;
+
+#[cfg(test)]
+mod expert_filter_tests {
+    use super::SafetensorsLoader;
+
+    #[test]
+    fn replicated_prefix_overrides_ep_expert_filter() {
+        let mut loader = SafetensorsLoader::with_ep(1, 2, 288);
+        let appended = "model.language_model.layers.45.mlp.experts.1.gate_proj.weight";
+        let target = "model.language_model.layers.44.mlp.experts.1.gate_proj.weight";
+        assert!(loader.should_skip_tensor(appended));
+        loader.replicated_expert_prefix = Some(".layers.45.".into());
+        assert!(!loader.should_skip_tensor(appended));
+        assert!(loader.should_skip_tensor(target));
+    }
+}
 
 #[cfg(test)]
 mod from_str_tests {

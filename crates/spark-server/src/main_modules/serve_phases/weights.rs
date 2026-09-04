@@ -42,6 +42,27 @@ pub(crate) fn load_weight_store(
 ) -> Result<spark_runtime::weights::WeightStore> {
     use spark_runtime::weights::WeightLoader;
     let mult = quant_multiplier(config);
+    let glm_mtp_distributed =
+        std::env::var("ATLAS_GLM_MTP_DISTRIBUTED").ok().as_deref() == Some("1");
+    if glm_mtp_distributed {
+        anyhow::ensure!(
+            config.model_type == "glm5_next"
+                && args.speculative
+                && args.world_size == 2
+                && args.tp_size == 2
+                && args.ep_size == 2,
+            "ATLAS_GLM_MTP_DISTRIBUTED=1 requires speculative GLM with overlapping \
+             TP=EP=world=2 (model={}, speculative={}, TP={}, EP={}, world={})",
+            config.model_type,
+            args.speculative,
+            args.tp_size,
+            args.ep_size,
+            args.world_size,
+        );
+        tracing::info!(
+            "GLM-5 split-vocabulary MTP enabled: appended body is mirrored on both ranks"
+        );
+    }
 
     // GGUF checkpoints are dequantized to BF16 by a dedicated loader; take that
     // path whenever a .gguf file is present (fast/safetensors loaders can't read it).
@@ -76,11 +97,18 @@ pub(crate) fn load_weight_store(
                 spark_runtime::fast_weights::FastSafetensorsLoader::new()
             };
             if config.model_type == "glm5_next" && args.speculative {
-                loader.rank0_only_expert_prefix =
-                    Some(format!(".layers.{}.", config.num_hidden_layers));
-                tracing::info!(
-                    "GLM-5 MTP: appended-layer experts are rank-0-only and fully replicated"
-                );
+                let prefix = format!(".layers.{}.", config.num_hidden_layers);
+                if glm_mtp_distributed {
+                    loader.replicated_expert_prefix = Some(prefix);
+                    tracing::info!(
+                        "GLM-5 distributed MTP: appended-layer experts are replicated on both ranks"
+                    );
+                } else {
+                    loader.rank0_only_expert_prefix = Some(prefix);
+                    tracing::info!(
+                        "GLM-5 MTP: appended-layer experts are rank-0-only and fully replicated"
+                    );
+                }
             }
             loader.peak_memory_multiplier = mult;
             loader.prefetch_shards = args.fast_load_prefetch_shards
@@ -105,8 +133,12 @@ pub(crate) fn load_weight_store(
             spark_runtime::weights::SafetensorsLoader::new()
         };
         if config.model_type == "glm5_next" && args.speculative {
-            loader.rank0_only_expert_prefix =
-                Some(format!(".layers.{}.", config.num_hidden_layers));
+            let prefix = format!(".layers.{}.", config.num_hidden_layers);
+            if glm_mtp_distributed {
+                loader.replicated_expert_prefix = Some(prefix);
+            } else {
+                loader.rank0_only_expert_prefix = Some(prefix);
+            }
         }
         loader.peak_memory_multiplier = mult;
         loader

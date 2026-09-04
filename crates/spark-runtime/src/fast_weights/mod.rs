@@ -42,6 +42,10 @@ pub struct FastSafetensorsLoader {
     /// EP rank 0, with all experts replicated there. Used by model-specific
     /// draft modules that execute entirely on the coordinator rank.
     pub rank0_only_expert_prefix: Option<String>,
+    /// Optional layer-name fragment whose expert tensors bypass EP filtering
+    /// and are replicated on every rank. Used when a small draft module keeps
+    /// identical local arithmetic while distributing only its output head.
+    pub replicated_expert_prefix: Option<String>,
     pub peak_memory_multiplier: Option<f64>,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
@@ -80,6 +84,7 @@ impl FastSafetensorsLoader {
             ep_world_size: 1,
             num_experts: 0,
             rank0_only_expert_prefix: None,
+            replicated_expert_prefix: None,
             peak_memory_multiplier: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
@@ -93,6 +98,7 @@ impl FastSafetensorsLoader {
             ep_world_size,
             num_experts,
             rank0_only_expert_prefix: None,
+            replicated_expert_prefix: None,
             peak_memory_multiplier: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
@@ -108,6 +114,13 @@ impl FastSafetensorsLoader {
             return false;
         }
         if let Some(idx) = parse_expert_index(name) {
+            if self
+                .replicated_expert_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.contains(prefix))
+            {
+                return false;
+            }
             if self
                 .rank0_only_expert_prefix
                 .as_ref()
@@ -263,6 +276,22 @@ impl WeightLoader for FastSafetensorsLoader {
 
         tracing::info!("Fast-loaded {} weight tensors", weights.len());
         Ok(WeightStore::from_map(weights))
+    }
+}
+
+#[cfg(test)]
+mod expert_filter_tests {
+    use super::FastSafetensorsLoader;
+
+    #[test]
+    fn replicated_prefix_overrides_ep_expert_filter() {
+        let mut loader = FastSafetensorsLoader::with_ep(1, 2, 288);
+        let appended = "model.language_model.layers.45.mlp.experts.1.gate_proj.weight";
+        let target = "model.language_model.layers.44.mlp.experts.1.gate_proj.weight";
+        assert!(loader.should_skip_tensor(appended));
+        loader.replicated_expert_prefix = Some(".layers.45.".into());
+        assert!(!loader.should_skip_tensor(appended));
+        assert!(loader.should_skip_tensor(target));
     }
 }
 

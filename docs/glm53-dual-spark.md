@@ -684,6 +684,35 @@ exact 995-rendered-token, forced-256 chat workload, the NVFP4 arm measured
 away acceptance. A separate arithmetic request completed naturally with the
 correct exact result `10/1` and decimal `10.0`.
 
+### Mirrored MTP body with split vocabulary projection
+
+The target verifier already uses both Sparks, but the appended GLM MTP
+proposer historically ran only on rank 0. `GLM_MTP_DISTRIBUTED=1` now mirrors
+the checkpoint-native full TP1/EP1 proposer body on both ranks and assigns each
+rank one contiguous half of the exact vocabulary projection. The two BF16
+logit halves are exchanged before the unchanged full-vocabulary argmax. BF16
+and GS16 NVFP4 row offsets are aligned for this model, so the projection does
+not change any per-row reduction arithmetic.
+
+An earlier TP2/EP2 body prototype reduced proposer time further, but its BF16
+MLA and routed-MoE reductions changed draft acceptance enough to erase the
+endpoint gain; that form was rejected. Mirroring the proven body recovered
+acceptance while still reducing steady proposer windows from about 17.6 ms to
+14.7 ms (-16.5%). On a warmed 1,005-token prompt with 256 forced decode tokens,
+five measured requests reported `20.224`, `18.800`, `19.160`, `19.913`, and
+`18.218` tok/s: 19.160 median and 19.263 mean. The matched rank-0 proposer
+control from the same binary reported `19.288`, `18.219`, `19.434`, `18.898`,
+and `18.879` tok/s: 18.898 median and 18.944 mean. The split projection gained
+1.4% by median and 1.7% by mean. Median accepted predictions were 154 versus
+156, confirming that the decode gain was not purchased by the earlier material
+acceptance regression.
+
+This path is deliberately opt-in and currently requires two ranks with
+TP=EP=2, `MAX_BATCH_SIZE=MAX_NUM_SEQS=1`, one to four draft tokens, batched MTP
+prompt KV prefill, and serial MTP prefill disabled. Both ranks must use the same
+image and flag value. The default rank-0 proposer remains unchanged when the
+flag is off.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

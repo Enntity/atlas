@@ -197,25 +197,56 @@ pub fn build_model(
         };
 
     // GLM-5.3 likewise ships a model-specific full decoder MTP layer under
-    // `model.language_model.layers.<num_hidden_layers>`. It is replicated on
-    // rank 0 and proposes without collectives; all ranks still participate in
-    // the normal target-model verification pass.
-    let glm5_mtp_module =
-        if config.model_type == "glm5_next" && use_speculative && config.ep_rank == 0 {
-            match crate::weight_loader::glm5::load_glm5_mtp_module(&store, &config, gpu.as_ref()) {
-                Ok(Some(module)) => Some(module),
-                Ok(None) => {
-                    tracing::info!("GLM-5: no appended MTP module in checkpoint (MTP off)");
-                    None
-                }
-                Err(error) => {
-                    tracing::error!("GLM-5 MTP module load FAILED: {error:#}");
-                    None
-                }
+    // `model.language_model.layers.<num_hidden_layers>`. The default path is
+    // replicated on rank 0 and proposes without collectives. The opt-in
+    // distributed path loads an identical full body on both ranks; its exact
+    // vocabulary projection is split and exchanged by the proposer path.
+    let glm5_mtp_distributed =
+        std::env::var("ATLAS_GLM_MTP_DISTRIBUTED").ok().as_deref() == Some("1");
+    if glm5_mtp_distributed {
+        anyhow::ensure!(
+            config.model_type == "glm5_next"
+                && use_speculative
+                && config.tp_world_size == 2
+                && config.ep_world_size == 2,
+            "ATLAS_GLM_MTP_DISTRIBUTED=1 requires speculative GLM with overlapping \
+             TP=EP=world=2 (model={}, speculative={}, TP={}, EP={})",
+            config.model_type,
+            use_speculative,
+            config.tp_world_size,
+            config.ep_world_size,
+        );
+    }
+    let glm5_mtp_module = if config.model_type == "glm5_next"
+        && use_speculative
+        && (config.ep_rank == 0 || glm5_mtp_distributed)
+    {
+        match crate::weight_loader::glm5::load_glm5_mtp_module(&store, &config, gpu.as_ref()) {
+            Ok(Some(module)) => Some(module),
+            Ok(None) if glm5_mtp_distributed => {
+                anyhow::bail!(
+                    "distributed GLM MTP requested, but rank {} found no appended predictor layer",
+                    config.ep_rank
+                )
             }
-        } else {
-            None
-        };
+            Ok(None) => {
+                tracing::info!("GLM-5: no appended MTP module in checkpoint (MTP off)");
+                None
+            }
+            Err(error) if glm5_mtp_distributed => {
+                return Err(error.context(format!(
+                    "distributed GLM MTP module load failed on rank {}",
+                    config.ep_rank
+                )));
+            }
+            Err(error) => {
+                tracing::error!("GLM-5 MTP module load FAILED: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
@@ -666,6 +697,12 @@ pub fn build_model(
             Ok(head) => {
                 model.set_dflash_proposer(std::sync::Arc::new(head));
                 tracing::info!("GLM-5 MTP speculative decoding: ENABLED (single module)");
+            }
+            Err(error) if glm5_mtp_distributed => {
+                return Err(error.context(format!(
+                    "distributed GLM MTP proposer construction failed on rank {}",
+                    model.config_ref().ep_rank
+                )));
             }
             Err(error) => tracing::warn!(
                 "Failed to build GLM-5 MTP proposer: {error:#}. Speculative decoding disabled."

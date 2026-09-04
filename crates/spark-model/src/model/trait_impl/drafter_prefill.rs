@@ -222,6 +222,8 @@ impl TransformerModel {
             stats: &self.stats,
             attn_metadata: None,
             profile: false,
+            // GLM's opt-in split-vocabulary path mirrors the proven full MTP
+            // body locally; prompt KV construction therefore stays no-comm.
             comm: None,
             graph_capture: false,
             gdn_exact_replay: false,

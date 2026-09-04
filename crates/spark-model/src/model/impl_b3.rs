@@ -74,9 +74,15 @@ impl TransformerModel {
         }
         let stream = self.gpu.default_stream();
         let draft_embed_target = None;
-        // MTP loads ALL experts on every rank (no EP filtering), so its MoE
-        // output is already complete — no all_reduce needed. Passing comm: None
-        // prevents MoeLayer::forward() from doubling the output via SUM.
+        // The legacy proposer loads every expert on rank 0 and therefore uses
+        // no communicator. The opt-in GLM path keeps that body arithmetic on
+        // both ranks and supplies the communicator only for matched split-vocab
+        // projection collectives.
+        let mtp_comm = if crate::layers::glm5_mtp::distributed_enabled() {
+            self.comm_ref()
+        } else {
+            None
+        };
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
@@ -87,7 +93,7 @@ impl TransformerModel {
             stats: &self.stats,
             attn_metadata: None,
             profile: false,
-            comm: None,
+            comm: mtp_comm,
             graph_capture: false,
             gdn_exact_replay: false,
             token_ids: None,

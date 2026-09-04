@@ -27,6 +27,8 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+pub(super) const EP_CMD_GLM_MTP_PROPOSE: u32 = 0xFFFFFFE1;
+
 impl TransformerModel {
     pub(super) fn comm_ref(&self) -> Option<&dyn spark_comm::CommBackend> {
         self.comm.as_deref()
@@ -401,6 +403,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
     /// - 0xFFFFFFF5: generic verify → K, K tokens, then num accepted drafts
+    /// - 0xFFFFFFE1: distributed GLM MTP propose → token, position, drafts, hidden row
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let (seq_id, cmd) = self.ep_recv_seq_and_cmd(self.ep_protocol_v2)?;
@@ -472,6 +475,39 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
 
         match cmd {
+            EP_CMD_GLM_MTP_PROPOSE => {
+                anyhow::ensure!(
+                    crate::layers::glm5_mtp::distributed_enabled()
+                        && self.config.model_type == "glm5_next",
+                    "received distributed GLM MTP command while the feature is disabled"
+                );
+                anyhow::ensure!(
+                    self.levers.max_decode_seqs == 1,
+                    "distributed GLM MTP currently requires max_batch_size=1"
+                );
+                let payload = self.ep_broadcast_tokens(&[0u32; 4])?;
+                let [token, position, num_drafts, hidden_row] = payload.as_slice() else {
+                    unreachable!("fixed-size GLM MTP payload")
+                };
+                let num_drafts = *num_drafts as usize;
+                anyhow::ensure!(
+                    (1..=4).contains(&num_drafts),
+                    "distributed GLM MTP draft count must be 1..=4, got {num_drafts}"
+                );
+                anyhow::ensure!(
+                    *hidden_row < 32,
+                    "distributed GLM MTP hidden row {} exceeds verify limit",
+                    hidden_row
+                );
+                self.save_hidden_for_mtp(*hidden_row as usize, stream)?;
+                let drafts =
+                    self.run_mtp_propose_inner(*token, *position as usize, num_drafts, seq, None)?;
+                anyhow::ensure!(
+                    drafts.len() == num_drafts,
+                    "worker GLM MTP proposer returned {} drafts, expected {num_drafts}",
+                    drafts.len()
+                );
+            }
             0xFFFFFFF0 => {
                 // Prefill chunk: receive chunk_len, chunk_start, full prompt length,
                 // then ALL prompt tokens via bulk broadcast (single NCCL op).
