@@ -192,3 +192,27 @@ extern "C" __global__ void dense_gemv_bf16_batch5_dual(
     __nv_bfloat16* C = second ? C1 : C0;
     dense_gemv_bf16_batchm_impl<5>(A, B, C, 5, N, K, N, smem);
 }
+
+// Three exact-five-row BF16 projections sharing one input and K dimension.
+// Plane zero may use a smaller output width (GLM beta); planes one and two
+// cover the equal-width f_a/g_a pair. CTAs beyond a plane's N return inside
+// the unchanged projection body.
+extern "C" __global__ void dense_gemv_bf16_batch5_triple_n(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B0,
+    const __nv_bfloat16* __restrict__ B1,
+    const __nv_bfloat16* __restrict__ B2,
+    __nv_bfloat16* __restrict__ C0,
+    __nv_bfloat16* __restrict__ C1,
+    __nv_bfloat16* __restrict__ C2,
+    unsigned int N0,
+    unsigned int N12,
+    unsigned int K
+) {
+    __shared__ float smem[5 * N_PER_BLOCK * 2];
+    const unsigned int plane = blockIdx.z;
+    const __nv_bfloat16* B = plane == 0u ? B0 : (plane == 1u ? B1 : B2);
+    __nv_bfloat16* C = plane == 0u ? C0 : (plane == 1u ? C1 : C2);
+    const unsigned int N = plane == 0u ? N0 : N12;
+    dense_gemv_bf16_batchm_impl<5>(A, B, C, 5, N, K, N, smem);
+}

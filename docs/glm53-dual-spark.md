@@ -489,6 +489,16 @@ draft count; the less acceptance-sensitive target-forward timings are the
 performance claim. An arithmetic chat returned `1517` correctly and kept its
 reasoning separate from the visible answer.
 
+`GLM_K5_FUSED_DENSE_TRIPLE=1` extends the same submission pattern to the
+same-input `beta/f_a/g_a` projections, including beta's narrower output plane.
+The kernel keeps each plane's original output width and exact-five reduction;
+`=0` restores the separate beta launch plus the fused `f_a/g_a` pair.
+On the same v24 image, 15 target-forward timing windows improved from 116.230
+to 115.680 ms median (-0.47%) and from 116.177 to 115.777 ms mean (-0.34%).
+Three forced-256 endpoint runs were acceptance-limited (19.855 versus 19.320
+tok/s median), while their means were effectively flat at 19.569 versus 19.513
+tok/s. A separate arithmetic request still produced the correct result `1517`.
+
 With one warm-up and five measured copies of the same exact 1,000-token,
 forced-256 request, grouped W4A16 decoded at `19.046`, `19.414`, `21.029`,
 `20.243`, and `20.646` tok/s (20.243 median, +3.1% over v87). Median accepted
