@@ -82,6 +82,13 @@ impl Qwen3AttentionLayer {
             if mla.o_lora_rank > 0 {
                 return self.prefill_attention_paged_v4(kv_cache, ctx, &args, seq_len_start);
             }
+            // GLM-5 uses zero-RoPE MLA. Its cache already stores the
+            // compressed 512-wide latent, so chunk 1+ must absorb Q and read
+            // the complete paged history. The generic MLA prefill below only
+            // attends within the current contiguous chunk.
+            if mla.glm_indexer.is_some() {
+                return self.prefill_attention_paged_glm_dense(kv_cache, ctx, &args, seq_len_start);
+            }
             return self.prefill_attention_paged_mla(kv_cache, ctx, &args);
         }
 
