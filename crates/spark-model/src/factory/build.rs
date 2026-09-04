@@ -267,7 +267,7 @@ pub fn build_model(
         &config,
         gpu.as_ref(),
         use_speculative,
-        !mtp_weights.is_empty(),
+        !mtp_weights.is_empty() || (glm5_mtp_module.is_some() && num_drafts > 2),
     )?;
 
     // Capture the shared embed + resolved draft NVFP4 head for the DeepSeek-V4
@@ -283,6 +283,10 @@ pub fn build_model(
     let v4_mtp_lm_head = lm_head;
     let glm5_mtp_embed = embed;
     let glm5_mtp_lm_head = lm_head;
+    // GLM's tied BF16 target head is deliberately retained for final
+    // verification, but drafting can use the existing approximate NVFP4 copy.
+    // Every proposal is still checked by the target head before emission.
+    let glm5_mtp_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
 
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
@@ -653,6 +657,7 @@ pub fn build_model(
             glm5_module,
             glm5_mtp_embed,
             glm5_mtp_lm_head,
+            glm5_mtp_lm_head_nvfp4,
             model.config_ref(),
             model.gpu_backend(),
             mtp_vocab_size,

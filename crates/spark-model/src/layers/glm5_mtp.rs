@@ -19,7 +19,7 @@ use crate::layers::mtp_meta::{MTP_META_OFFSET, pack_mtp_attn_meta};
 use crate::layers::ops;
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_loader::glm5::Glm5MtpModule;
-use crate::weight_map::DenseWeight;
+use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 pub struct Glm5MtpProposerState {
     pub block_table: Vec<u32>,
@@ -42,11 +42,13 @@ pub struct Glm5MtpHead {
     module: Glm5MtpModule,
     embed_tokens: DenseWeight,
     lm_head: DenseWeight,
+    lm_head_nvfp4: Option<QuantizedWeight>,
     mtp_vocab_size: u32,
     kv_cache: Mutex<PagedKvCache>,
     rms_norm_k: KernelHandle,
     dense_gemv_k: KernelHandle,
     dense_gemm_k: KernelHandle,
+    w4a16_gemv_k: KernelHandle,
     bf16_concat_k: KernelHandle,
     argmax_k: KernelHandle,
 }
@@ -56,6 +58,7 @@ impl Glm5MtpHead {
         module: Glm5MtpModule,
         embed_tokens: DenseWeight,
         lm_head: DenseWeight,
+        lm_head_nvfp4: Option<QuantizedWeight>,
         config: &atlas_core::config::ModelConfig,
         gpu: &dyn GpuBackend,
         mtp_vocab_size: u32,
@@ -83,11 +86,13 @@ impl Glm5MtpHead {
             module,
             embed_tokens,
             lm_head,
+            lm_head_nvfp4,
             mtp_vocab_size,
             kv_cache: Mutex::new(kv_cache),
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
+            w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             bf16_concat_k: gpu.kernel("residual_add", "bf16_concat")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
         })
@@ -238,6 +243,7 @@ impl Glm5MtpHead {
         token: u32,
         target_hidden: DevicePtr,
         position: usize,
+        draft_index: usize,
         state: &mut Glm5MtpProposerState,
         ctx: &ForwardContext,
         stream: u64,
@@ -265,16 +271,34 @@ impl Glm5MtpHead {
             ctx.config.vocab_size as u32
         };
         let logits = ctx.buffers.logits();
-        ops::dense_gemv(
-            ctx.gpu,
-            self.dense_gemv_k,
-            final_hidden,
-            &self.lm_head,
-            logits,
-            vocab,
-            h_u32,
-            stream,
-        )?;
+        // Preserve the two highest-leverage draft decisions with the target's
+        // BF16 tied head. Later drafts are always verified before emission and
+        // can use the cheaper NVFP4 projection without destabilizing p1/p2.
+        if draft_index > 1
+            && let Some(ref head) = self.lm_head_nvfp4
+        {
+            ops::w4a16_gemv(
+                ctx.gpu,
+                self.w4a16_gemv_k,
+                final_hidden,
+                head,
+                logits,
+                vocab,
+                h_u32,
+                stream,
+            )?;
+        } else {
+            ops::dense_gemv(
+                ctx.gpu,
+                self.dense_gemv_k,
+                final_hidden,
+                &self.lm_head,
+                logits,
+                vocab,
+                h_u32,
+                stream,
+            )?;
+        }
         let out = ctx.buffers.scratch();
         let draft = if let Some(mask) = grammar_bitmask {
             grammar_argmax(ctx.gpu, logits, vocab as usize, mask)?
@@ -568,6 +592,7 @@ impl DraftProposer for Glm5MtpHead {
                 token,
                 hidden,
                 position + i,
+                i,
                 state,
                 ctx,
                 stream,
