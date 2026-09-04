@@ -206,6 +206,98 @@ extern "C" __global__ void glm_index_logits_bf16(
     }
 }
 
+// Eight warps score an 8-row x 8-pool tile. A pooled key is loaded once into
+// shared memory and reused by all query rows, while each warp loads its query
+// values once and accumulates all eight pool scores. This preserves the
+// per-score reduction order of glm_index_logits_bf16 while removing the
+// redundant query and key traffic that dominates long-context prefill.
+extern "C" __global__ void glm_index_logits_bf16_row8(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ weights,
+    const __nv_bfloat16* __restrict__ index_cache,
+    float* __restrict__ logits,
+    const unsigned int* __restrict__ block_table,
+    unsigned int rows,
+    unsigned int seq_len_start,
+    unsigned int logits_stride,
+    unsigned int index_heads,
+    unsigned int head_dim,
+    unsigned int pool_size,
+    unsigned int cache_block_size,
+    unsigned long long index_block_stride_bytes) {
+    extern __shared__ __nv_bfloat16 pooled_keys[];
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int pool_base = blockIdx.x * 8;
+    const unsigned int row_base = blockIdx.y * 8;
+
+    // All warps cooperatively stage eight pooled keys before out-of-range row
+    // warps exit, so partial row tiles cannot strand a block-wide barrier.
+    const unsigned int max_pool_count = (seq_len_start + rows) / pool_size;
+    for (unsigned int item = threadIdx.x; item < 8 * head_dim; item += blockDim.x) {
+        const unsigned int pool_offset_in_tile = item / head_dim;
+        const unsigned int d = item % head_dim;
+        const unsigned int pool_id = pool_base + pool_offset_in_tile;
+        __nv_bfloat16 value = __float2bfloat16(0.0f);
+        if (pool_id < logits_stride && pool_id < max_pool_count) {
+            const unsigned int raw_pos = pool_id * pool_size;
+            const unsigned int logical_block = raw_pos / cache_block_size;
+            const unsigned int raw_offset = raw_pos % cache_block_size;
+            const unsigned int physical_block = block_table[logical_block];
+            const unsigned int cache_pool_offset = raw_offset / pool_size;
+            const __nv_bfloat16* key =
+                (const __nv_bfloat16*)((const char*)index_cache
+                    + (unsigned long long)physical_block * index_block_stride_bytes)
+                + (unsigned long long)cache_pool_offset * head_dim;
+            value = key[d];
+        }
+        pooled_keys[item] = value;
+    }
+    __syncthreads();
+
+    const unsigned int row = row_base + warp;
+    if (row >= rows) return;
+    const __nv_bfloat16* q = query
+        + (unsigned long long)row * index_heads * head_dim;
+    const __nv_bfloat16* w = weights + (unsigned long long)row * index_heads;
+    float scores[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (unsigned int head = 0; head < index_heads; ++head) {
+        float dots[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        for (unsigned int d = lane; d < head_dim; d += 32) {
+            const float qv = __bfloat162float(q[(unsigned long long)head * head_dim + d]);
+#pragma unroll
+            for (unsigned int pool = 0; pool < 8; ++pool) {
+                dots[pool] += qv * __bfloat162float(pooled_keys[pool * head_dim + d]);
+            }
+        }
+        for (unsigned int offset = 16; offset; offset >>= 1) {
+#pragma unroll
+            for (unsigned int pool = 0; pool < 8; ++pool) {
+                dots[pool] += __shfl_down_sync(0xffffffff, dots[pool], offset);
+            }
+        }
+        if (lane == 0) {
+            const float weight = __bfloat162float(w[head]);
+#pragma unroll
+            for (unsigned int pool = 0; pool < 8; ++pool) {
+                scores[pool] += weight * fmaxf(dots[pool], 0.0f);
+            }
+        }
+    }
+    if (lane == 0) {
+        const unsigned int pool_count = (seq_len_start + row + 1) / pool_size;
+        const float scale = rsqrtf((float)(head_dim * index_heads));
+#pragma unroll
+        for (unsigned int pool = 0; pool < 8; ++pool) {
+            const unsigned int pool_id = pool_base + pool;
+            if (pool_id < logits_stride) {
+                logits[(unsigned long long)row * logits_stride + pool_id] =
+                    pool_id < pool_count ? scores[pool] * scale : -INFINITY;
+            }
+        }
+    }
+}
+
 __device__ __forceinline__ unsigned int glm_ordered_float(float value) {
     if (isnan(value)) value = -INFINITY;
     const unsigned int bits = __float_as_uint(value);

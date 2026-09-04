@@ -150,7 +150,7 @@ impl Qwen3AttentionLayer {
         let logits = ctx.buffers.expert_down_out();
         ops::glm_index_logits(
             ctx.gpu,
-            self.glm_index_logits_k,
+            self.glm_index_logits_decode_k,
             query,
             weights,
             kv_cache.sparse_index_pool_ptr(self.attn_layer_idx),
@@ -164,6 +164,7 @@ impl Qwen3AttentionLayer {
             pool_size,
             kv_cache.block_size() as u32,
             kv_cache.sparse_index_block_stride_bytes(self.attn_layer_idx) as u64,
+            1,
             stream,
         )?;
         // Cache writeback has completed in stream order, so the QKV arena can

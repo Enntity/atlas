@@ -115,6 +115,20 @@ impl Qwen3AttentionLayer {
         } else {
             "glm_sparse_mla_prefill_bf16_head8"
         };
+        // Tile semantic-index scoring over eight query rows during prefill so
+        // both queries and pooled keys are reused. Decode retains the original
+        // eight-pool kernel because it has only one live row.
+        let glm_index_logits_rows_per_cta =
+            if std::env::var("ATLAS_GLM_INDEX_ROW_GROUP").ok().as_deref() == Some("1") {
+                1
+            } else {
+                8
+            };
+        let glm_index_logits_fn = if glm_index_logits_rows_per_cta == 1 {
+            "glm_index_logits_bf16"
+        } else {
+            "glm_index_logits_bf16_row8"
+        };
         Ok(Self {
             input_norm,
             attn,
@@ -443,6 +457,13 @@ impl Qwen3AttentionLayer {
                 "glm_index_fill_causal",
             ),
             glm_index_logits_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "glm_indexer",
+                glm_index_logits_fn,
+            ),
+            glm_index_logits_rows_per_cta,
+            glm_index_logits_decode_k: gate(
                 probes.glm_kpool_indexer,
                 gpu,
                 "glm_indexer",

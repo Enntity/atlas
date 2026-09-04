@@ -261,6 +261,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) glm_index_kpool_finalize_k: KernelHandle,
     pub(super) glm_index_fill_causal_k: KernelHandle,
     pub(super) glm_index_logits_k: KernelHandle,
+    pub(super) glm_index_logits_rows_per_cta: u32,
+    pub(super) glm_index_logits_decode_k: KernelHandle,
     pub(super) glm_index_topk_expand_k: KernelHandle,
     pub(super) glm_sparse_attn_k: KernelHandle,
     pub(super) glm_sparse_attn_heads_per_cta: u32,

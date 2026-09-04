@@ -129,11 +129,17 @@ pub fn glm_index_logits(
     pool_size: u32,
     cache_block_size: u32,
     index_block_stride_bytes: u64,
+    rows_per_cta: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(logits_stride, 8), rows, 1])
+        .grid([div_ceil(logits_stride, 8), div_ceil(rows, rows_per_cta), 1])
         .block([256, 1, 1])
+        .shared_mem(if rows_per_cta == 8 {
+            8 * head_dim * std::mem::size_of::<u16>() as u32
+        } else {
+            0
+        })
         .arg_ptr(query)
         .arg_ptr(weights)
         .arg_ptr(index_cache)

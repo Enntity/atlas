@@ -118,6 +118,17 @@ best to 963.3 tok/s, and raised 10K from 379.2 to 392.7 tok/s. Decode remained
 launcher; `NVFP4_PREQUANT_MOE=0 NVFP4_FUSED_SILU_QUANT=0` restores the BF16
 activation path. An exact-10K early-needle run still recovered `NEBULA-2847`.
 
+The long-context semantic scorer now tiles eight query rows by eight pooled
+keys per CTA. The GB10 kernel stages each pooled BF16 key once in shared memory
+and reuses each query value across all eight scores; decode retains the original
+one-row/eight-pool kernel. In a same-image, profiler-enabled A/B, semantic-logit
+time fell from 1.093 to 0.793 seconds at 10K (27%) and from 11.293 to 7.766
+seconds at 32K (31%). Exact-32K end-to-end prefill rose from 341.9 to 358.5
+tok/s (+4.9%), while 10K rose from 394.0 to 401.4 tok/s (+1.9%). Set
+`GLM_INDEX_ROW_GROUP=1` to restore the original scorer. With profiling disabled,
+the exact-10K needle receipt again recovered `NEBULA-2847`, at 399.0 prefill
+tok/s and 10.16 decode tok/s.
+
 BF16 is deliberate for the first 100K correctness gate. FP8 halves the main KV
 value width and should improve capacity and bandwidth, but it needs its own
 needle/coherence A/B because quantization can change attention rankings. The
