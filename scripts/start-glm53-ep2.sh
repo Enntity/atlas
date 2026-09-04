@@ -28,6 +28,10 @@ MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 TP_SIZE="${TP_SIZE:-1}"
 OOM_GUARD_MB="${OOM_GUARD_MB:-4096}"
+# The server deadline includes chunked prefill. A 100K request currently takes
+# longer than Atlas's 300-second default on two Sparks, so expose the existing
+# serve flag without weakening the default for short-context deployments.
+REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-300}"
 MODEL_MOUNT="${MODEL_MOUNT:-}"
 CONTAINER_MEMORY="${CONTAINER_MEMORY:-114g}"
 NCCL_IFNAME="${NCCL_IFNAME:-enp1s0f1np1}"
@@ -79,6 +83,11 @@ fi
 
 if (( MAX_PREFILL_TOKENS < 1 || MAX_PREFILL_TOKENS > MAX_SEQ_LEN )); then
   echo "ERROR: MAX_PREFILL_TOKENS must be in 1..MAX_SEQ_LEN." >&2
+  exit 2
+fi
+
+if [[ ! "$REQUEST_TIMEOUT" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: REQUEST_TIMEOUT must be a non-negative integer number of seconds." >&2
   exit 2
 fi
 
@@ -246,6 +255,7 @@ COMMON_SERVE_ARGS=(
   --gpu-memory-utilization "$GPU_MEM_UTIL"
   --kv-cache-dtype bf16
   --oom-guard-mb "$OOM_GUARD_MB"
+  --request-timeout "$REQUEST_TIMEOUT"
 )
 if [[ "$PROFILE" == "1" ]]; then
   COMMON_SERVE_ARGS+=(--profile)
