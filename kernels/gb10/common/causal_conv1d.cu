@@ -643,3 +643,85 @@ causal_conv1d_update_prefill_tp(
                 st[k] = xin((long long)seq_len - (long long)d_conv + (long long)k);
     }
 }
+
+// GLM K=5 verifier twin of the token-parallel prefill kernel. Besides the
+// normal output and final state, it writes the post-token sliding window for
+// rows 0..seq_len-2 into a contiguous rollback slab. This replaces five
+// one-token launches plus four full-state D2D snapshots while preserving the
+// exact per-output arithmetic above.
+extern "C" __global__ void __launch_bounds__(256, 4)
+causal_conv1d_update_prefill_tp_snap(
+    float* __restrict__ conv_state,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    const float* __restrict__ bias,
+    __nv_bfloat16* __restrict__ output,
+    float* __restrict__ state_inter,
+    unsigned long long inter_stride,
+    unsigned int dim,
+    unsigned int d_conv,
+    unsigned int seq_len,
+    unsigned int input_stride,
+    unsigned int output_stride
+) {
+    const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= dim) return;
+    const unsigned int t0 = (blockIdx.y * blockDim.y + threadIdx.y) * 8u;
+    if (t0 >= seq_len) return;
+
+    const float* state = conv_state + (unsigned long long)ch * d_conv;
+    const __nv_bfloat16* w = weight + (unsigned long long)ch * d_conv;
+    const float b_val = (bias != nullptr) ? bias[ch] : 0.0f;
+
+    float w_reg[4] = {0.f, 0.f, 0.f, 0.f};
+    #pragma unroll
+    for (unsigned int k = 0; k < 4; k++)
+        if (k < d_conv) w_reg[k] = __bfloat162float(w[k]);
+
+    auto xin = [&] (long long t) -> float {
+        if (t >= 0) {
+            return (t < (long long)seq_len)
+                ? __bfloat162float(input[(unsigned long long)t * input_stride + ch])
+                : 0.0f;
+        }
+        const long long idx = (long long)d_conv + t;
+        return (idx >= 0) ? state[idx] : 0.0f;
+    };
+
+    float s0 = xin((long long)t0 - 3);
+    float s1 = xin((long long)t0 - 2);
+    float s2 = xin((long long)t0 - 1);
+    #pragma unroll
+    for (unsigned int i = 0; i < 8; i++) {
+        const unsigned int t = t0 + i;
+        if (t >= seq_len) break;
+        const float s3 = xin((long long)t);
+        const float acc = b_val + s0 * w_reg[0] + s1 * w_reg[1] + s2 * w_reg[2] + s3 * w_reg[3];
+        const float sig = 1.0f / (1.0f + __expf(-acc));
+        output[(unsigned long long)t * output_stride + ch] = __float2bfloat16(acc * sig);
+        s0 = s1; s1 = s2; s2 = s3;
+    }
+
+    // K=5 is contained in the first token tile, so its owning thread can emit
+    // every rollback window before the canonical state is updated.
+    if (t0 == 0u) {
+        for (unsigned int t = 0; t + 1u < seq_len; ++t) {
+            float* snapshot = state_inter + (unsigned long long)t * inter_stride
+                            + (unsigned long long)ch * d_conv;
+            #pragma unroll
+            for (unsigned int k = 0; k < 4; ++k) {
+                if (k < d_conv) {
+                    snapshot[k] = xin((long long)t + 1ll - (long long)d_conv + (long long)k);
+                }
+            }
+        }
+    }
+
+    if (t0 + 8u >= seq_len) {
+        float* st = conv_state + (unsigned long long)ch * d_conv;
+        #pragma unroll
+        for (unsigned int k = 0; k < 4; k++)
+            if (k < d_conv)
+                st[k] = xin((long long)seq_len - (long long)d_conv + (long long)k);
+    }
+}

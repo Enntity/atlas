@@ -568,6 +568,30 @@ launches retain the prior adaptive default, and an explicitly supplied
 `MTP_SINGLE_DEPTH_ADAPT` always wins. This changes no model math or request
 semantics; it keeps the optimized launcher on the measured faster verifier.
 
+The KDA verifier now batches its stateful K=5 section without weakening
+rollback correctness. Previously, each of the 34 KDA layers submitted five
+one-token convolutions, five one-token recurrences, four FP32 convolution-state
+copies, and four FP32 H-state copies. The batched variants perform one
+five-token convolution and one five-token recurrence, writing the four
+post-token rollback states inline. Dispatch requires the exact five-row GLM
+shape and contiguous snapshot pools; otherwise it falls back to the original
+interleaved path. `GLM_K5_BATCHED_CONV_SNAPSHOT=0` and
+`GLM_K5_BATCHED_RECURRENT_SNAPSHOT=0` independently restore the old paths.
+
+The dedicated GB10 hardware check compared outputs, final states, and all four
+rollback states byte-for-byte against the legacy sequence: every comparison
+had zero differing bytes. With verifier profiling enabled, the combined
+pack/conv/recurrent/snapshot phase fell from 180 us to 104 us per KDA layer,
+and the 34-layer KDA section fell from a 92.77 ms median to 89.55 ms. A separate
+five-window MTP ledger measured median target-forward time at 123.62 ms versus
+126.85 ms for the same-image control (-2.55%), and median complete MTP-step
+time at 143.26 ms versus 145.87 ms (-1.79%). On the warmed 1,000-token,
+forced-256 endpoint test, five optimized requests measured 17.566 tok/s median
+versus 16.286 tok/s for the control (+7.9%); accepted-prediction variation
+(153.0 versus 147.4 mean) exaggerates that endpoint delta, so the direct
+target-forward ledger is the conservative speed claim. Both snapshot levers
+default on in the GLM launcher after the exactness and end-to-end checks.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

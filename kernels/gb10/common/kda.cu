@@ -127,6 +127,123 @@ extern "C" __global__ void kda_recurrent_bf16(
     }
 }
 
+// GLM K=5 verifier twin of kda_recurrent_bf16. The recurrence and FP32 FMA
+// order are unchanged; after rows 0..tokens-2 it also writes the updated H to
+// a contiguous rollback slab. This replaces five recurrent launches and four
+// full-state D2D snapshots with one launch.
+extern "C" __global__ void kda_recurrent_bf16_verify_snap(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ raw_gate,
+    const __nv_bfloat16* __restrict__ raw_beta,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ state,
+    __nv_bfloat16* __restrict__ output,
+    float* __restrict__ state_inter,
+    unsigned long long inter_stride,
+    unsigned int tokens,
+    unsigned int heads,
+    unsigned int dim,
+    float lower_bound
+) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int vrow = threadIdx.x;
+    if (head >= heads || dim > 128 || blockDim.x < dim) return;
+
+    __shared__ float qv[128];
+    __shared__ float kv[128];
+    __shared__ float gate_exp[128];
+    __shared__ float red_q[128];
+    __shared__ float red_k[128];
+    __shared__ float inv_q;
+    __shared__ float inv_k;
+    __shared__ float beta;
+
+    float* H = state + (unsigned long long)head * dim * dim;
+    const float a = expf(a_log[head]);
+    const float scale = rsqrtf((float)dim);
+
+    for (unsigned int t = 0; t < tokens; ++t) {
+        const unsigned long long qbase = (unsigned long long)t * 3 * heads * dim;
+        if (vrow < dim) {
+            float q = (float)qkv[qbase + (unsigned long long)head * dim + vrow];
+            float k = (float)qkv[qbase + (unsigned long long)heads * dim
+                              + (unsigned long long)head * dim + vrow];
+            qv[vrow] = q;
+            kv[vrow] = k;
+            red_q[vrow] = q * q;
+            red_k[vrow] = k * k;
+            float g = (float)raw_gate[((unsigned long long)t * heads + head) * dim + vrow];
+            float log_decay = lower_bound /
+                (1.0f + expf(-a * (g + dt_bias[(unsigned long long)head * dim + vrow])));
+            gate_exp[vrow] = expf(log_decay);
+        }
+        __syncthreads();
+
+        for (unsigned int stride = 64; stride > 0; stride >>= 1) {
+            if (vrow < stride) {
+                red_q[vrow] += red_q[vrow + stride];
+                red_k[vrow] += red_k[vrow + stride];
+            }
+            __syncthreads();
+        }
+        if (vrow == 0) {
+            inv_q = rsqrtf(red_q[0] + 1.0e-6f) * scale;
+            inv_k = rsqrtf(red_k[0] + 1.0e-6f);
+            float b = (float)raw_beta[(unsigned long long)t * heads + head];
+            beta = 1.0f / (1.0f + expf(-b));
+        }
+        __syncthreads();
+
+        if (vrow < dim) {
+            float dot_k = 0.0f;
+            #pragma unroll 4
+            for (unsigned int k = 0; k < dim; k += 4) {
+                float h0 = H[(unsigned long long)(k + 0) * dim + vrow] * gate_exp[k + 0];
+                float h1 = H[(unsigned long long)(k + 1) * dim + vrow] * gate_exp[k + 1];
+                float h2 = H[(unsigned long long)(k + 2) * dim + vrow] * gate_exp[k + 2];
+                float h3 = H[(unsigned long long)(k + 3) * dim + vrow] * gate_exp[k + 3];
+                dot_k += h0 * (kv[k + 0] * inv_k) + h1 * (kv[k + 1] * inv_k)
+                       + h2 * (kv[k + 2] * inv_k) + h3 * (kv[k + 3] * inv_k);
+            }
+            const unsigned long long vbase = qbase + (unsigned long long)2 * heads * dim;
+            float delta = ((float)qkv[vbase + (unsigned long long)head * dim + vrow]
+                           - dot_k) * beta;
+            float out = 0.0f;
+            float* snapshot = (t + 1u < tokens)
+                ? state_inter + (unsigned long long)t * inter_stride
+                    + (unsigned long long)head * dim * dim
+                : nullptr;
+            #pragma unroll 4
+            for (unsigned int k = 0; k < dim; k += 4) {
+                float h0 = H[(unsigned long long)(k + 0) * dim + vrow] * gate_exp[k + 0]
+                         + delta * (kv[k + 0] * inv_k);
+                float h1 = H[(unsigned long long)(k + 1) * dim + vrow] * gate_exp[k + 1]
+                         + delta * (kv[k + 1] * inv_k);
+                float h2 = H[(unsigned long long)(k + 2) * dim + vrow] * gate_exp[k + 2]
+                         + delta * (kv[k + 2] * inv_k);
+                float h3 = H[(unsigned long long)(k + 3) * dim + vrow] * gate_exp[k + 3]
+                         + delta * (kv[k + 3] * inv_k);
+                H[(unsigned long long)(k + 0) * dim + vrow] = h0;
+                H[(unsigned long long)(k + 1) * dim + vrow] = h1;
+                H[(unsigned long long)(k + 2) * dim + vrow] = h2;
+                H[(unsigned long long)(k + 3) * dim + vrow] = h3;
+                if (snapshot != nullptr) {
+                    snapshot[(unsigned long long)(k + 0) * dim + vrow] = h0;
+                    snapshot[(unsigned long long)(k + 1) * dim + vrow] = h1;
+                    snapshot[(unsigned long long)(k + 2) * dim + vrow] = h2;
+                    snapshot[(unsigned long long)(k + 3) * dim + vrow] = h3;
+                }
+                out += h0 * (qv[k + 0] * inv_q) + h1 * (qv[k + 1] * inv_q)
+                     + h2 * (qv[k + 2] * inv_q) + h3 * (qv[k + 3] * inv_q);
+            }
+            output[((unsigned long long)t * heads + head) * dim + vrow] =
+                __float2bfloat16(out);
+        }
+        __syncthreads();
+    }
+}
+
 // Precompute normalized Q/K and row decay once per token/head. The recurrence
 // fans each token out across 32 column groups, so doing the reductions and
 // transcendental operations there would repeat the expensive work 32 times.

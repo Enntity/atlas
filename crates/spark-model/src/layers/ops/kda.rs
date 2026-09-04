@@ -58,6 +58,44 @@ pub fn kda_recurrent(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn kda_recurrent_verify_snap(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    qkv: DevicePtr,
+    raw_gate: DevicePtr,
+    raw_beta: DevicePtr,
+    a_log: DevicePtr,
+    dt_bias: DevicePtr,
+    state: DevicePtr,
+    output: DevicePtr,
+    state_inter: DevicePtr,
+    inter_stride: usize,
+    tokens: u32,
+    heads: u32,
+    dim: u32,
+    lower_bound: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([heads, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(qkv)
+        .arg_ptr(raw_gate)
+        .arg_ptr(raw_beta)
+        .arg_ptr(a_log)
+        .arg_ptr(dt_bias)
+        .arg_ptr(state)
+        .arg_ptr(output)
+        .arg_ptr(state_inter)
+        .arg_u64(inter_stride as u64)
+        .arg_u32(tokens)
+        .arg_u32(heads)
+        .arg_u32(dim)
+        .arg_f32(lower_bound)
+        .launch(stream)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn kda_recurrent_regresident(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
