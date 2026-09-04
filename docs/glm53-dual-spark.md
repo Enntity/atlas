@@ -592,6 +592,18 @@ versus 16.286 tok/s for the control (+7.9%); accepted-prediction variation
 target-forward ledger is the conservative speed claim. Both snapshot levers
 default on in the GLM launcher after the exactness and end-to-end checks.
 
+The next native-NVFP4 change multiplexes the KDA Q, K, and V projections in
+one three-plane launch. Grid Z selects the independent projection weight and
+output plane, while each plane calls the unchanged exact-M=5 FP4 GEMV body;
+no dot product is combined or reassociated. The GB10 hardware oracle reported
+zero differing bytes across all three output planes versus three separate
+launches. Per-layer Q/K/V-plus-beta projection time fell from about 194 us to
+169 us. Five-window MTP timing on the same image measured target-forward at a
+121.57 ms median versus 122.97 ms with `GLM_K5_FUSED_QKV=0` (-1.14%); complete
+MTP-step medians were 141.58 and 142.35 ms respectively. The GLM launcher now
+defaults the fused path on, with the environment flag retained as an exact
+fallback switch.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

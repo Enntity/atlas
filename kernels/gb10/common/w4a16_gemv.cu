@@ -712,6 +712,34 @@ extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch5(
     w4a16_gemv_batchm_impl<5>(A, B_packed, B_scale, scale2, C, M, N, K);
 }
 
+// GLM KDA Q/K/V verifier projection. Grid Z chooses one of three independent
+// native-NVFP4 weights while each plane executes the proven exact-M=5 body
+// unchanged. This removes two graph nodes per KDA layer; it does not combine
+// or reassociate any dot product.
+extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch5_qkv(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ Bq_packed,
+    const unsigned char* __restrict__ Bq_scale,
+    const float q_scale2,
+    const unsigned char* __restrict__ Bk_packed,
+    const unsigned char* __restrict__ Bk_scale,
+    const float k_scale2,
+    const unsigned char* __restrict__ Bv_packed,
+    const unsigned char* __restrict__ Bv_scale,
+    const float v_scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int plane = blockIdx.z;
+    const unsigned char* B_packed = plane == 0u ? Bq_packed : (plane == 1u ? Bk_packed : Bv_packed);
+    const unsigned char* B_scale = plane == 0u ? Bq_scale : (plane == 1u ? Bk_scale : Bv_scale);
+    const float scale2 = plane == 0u ? q_scale2 : (plane == 1u ? k_scale2 : v_scale2);
+    __nv_bfloat16* out = C + (unsigned long long)plane * M * N;
+    w4a16_gemv_batchm_impl<5>(A, B_packed, B_scale, scale2, out, M, N, K);
+}
+
 extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch6(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ B_packed,

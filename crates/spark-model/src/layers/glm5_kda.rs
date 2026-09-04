@@ -40,6 +40,10 @@ fn verify_batched_recurrent_snapshot_enabled() -> bool {
         == Some("1")
 }
 
+fn verify_fused_qkv_enabled() -> bool {
+    std::env::var("ATLAS_GLM_K5_FUSED_QKV").ok().as_deref() == Some("1")
+}
+
 pub struct Glm5KdaLayer {
     input_norm: DenseWeight,
     post_attn_norm: DenseWeight,
@@ -61,6 +65,7 @@ pub struct Glm5KdaLayer {
     w4a16_gemv_sw_k: KernelHandle,
     w4a16_gemv_batch2_k: KernelHandle,
     w4a16_gemv_batch3_k: KernelHandle,
+    w4a16_gemv_batch5_qkv_k: KernelHandle,
     w4a16_gemv_batchm: W4a16BatchmTiers,
     w4a16_gemm_k: KernelHandle,
     w4a16_gemm_t_m128_k: KernelHandle,
@@ -151,6 +156,7 @@ impl Glm5KdaLayer {
             w4a16_gemv_sw_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            w4a16_gemv_batch5_qkv_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch5_qkv"),
             w4a16_gemv_batchm: W4a16BatchmTiers::resolve(gpu),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
@@ -236,7 +242,25 @@ impl Glm5KdaLayer {
 
         let projected = ctx.buffers.qkv_output();
         let plane_bytes = tokens * p * bf16;
-        if capture_verify_intermediates {
+        let fused_qkv = capture_verify_intermediates
+            && m == 5
+            && self.w4a16_gemv_batch5_qkv_k.0 != 0
+            && verify_fused_qkv_enabled();
+        if fused_qkv {
+            ops::w4a16_gemv_batch5_qkv(
+                ctx.gpu,
+                self.w4a16_gemv_batch5_qkv_k,
+                normed,
+                &self.weights.q_proj.nvfp4,
+                &self.weights.k_proj.nvfp4,
+                &self.weights.v_proj.nvfp4,
+                projected,
+                m,
+                p as u32,
+                h,
+                stream,
+            )?;
+        } else if capture_verify_intermediates {
             self.project_hot_verify(
                 normed,
                 &self.weights.q_proj,
@@ -261,50 +285,52 @@ impl Glm5KdaLayer {
             )?;
         }
         profile::step(ctx, stream, &mut profile_timer, "q_proj")?;
-        if capture_verify_intermediates {
-            self.project_hot_verify(
-                normed,
-                &self.weights.k_proj,
-                projected.offset(plane_bytes),
-                m,
-                p as u32,
-                h,
-                ctx,
-                stream,
-            )?;
-            self.project_hot_verify(
-                normed,
-                &self.weights.v_proj,
-                projected.offset(2 * plane_bytes),
-                m,
-                p as u32,
-                h,
-                ctx,
-                stream,
-            )?;
-        } else {
-            self.project_hot(
-                normed,
-                &self.weights.k_proj,
-                projected.offset(plane_bytes),
-                m,
-                p as u32,
-                h,
-                decode,
-                ctx,
-                stream,
-            )?;
-            self.project_hot(
-                normed,
-                &self.weights.v_proj,
-                projected.offset(2 * plane_bytes),
-                m,
-                p as u32,
-                h,
-                decode,
-                ctx,
-                stream,
-            )?;
+        if !fused_qkv {
+            if capture_verify_intermediates {
+                self.project_hot_verify(
+                    normed,
+                    &self.weights.k_proj,
+                    projected.offset(plane_bytes),
+                    m,
+                    p as u32,
+                    h,
+                    ctx,
+                    stream,
+                )?;
+                self.project_hot_verify(
+                    normed,
+                    &self.weights.v_proj,
+                    projected.offset(2 * plane_bytes),
+                    m,
+                    p as u32,
+                    h,
+                    ctx,
+                    stream,
+                )?;
+            } else {
+                self.project_hot(
+                    normed,
+                    &self.weights.k_proj,
+                    projected.offset(plane_bytes),
+                    m,
+                    p as u32,
+                    h,
+                    decode,
+                    ctx,
+                    stream,
+                )?;
+                self.project_hot(
+                    normed,
+                    &self.weights.v_proj,
+                    projected.offset(2 * plane_bytes),
+                    m,
+                    p as u32,
+                    h,
+                    decode,
+                    ctx,
+                    stream,
+                )?;
+            }
         }
         let beta = projected.offset(3 * plane_bytes);
         if capture_verify_intermediates {

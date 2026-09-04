@@ -219,6 +219,69 @@ fn check_recurrent(gpu: &dyn GpuBackend, stream: u64, rng: &mut Rng) -> Result<(
     )
 }
 
+fn check_qkv(gpu: &dyn GpuBackend, stream: u64, rng: &mut Rng) -> Result<()> {
+    let m = K;
+    let n = 128usize;
+    let k = 256usize;
+    let input: Vec<u16> = (0..m * k).map(|_| bf16(rng.uni(-1.0, 1.0))).collect();
+    let input_p = upload(gpu, &bytes_u16(&input))?;
+    let mut weights = Vec::new();
+    let mut scales = Vec::new();
+    for plane in 0..3usize {
+        let packed: Vec<u8> = (0..n * k / 2)
+            .map(|i| ((i * (17 + plane * 2) + plane * 13) & 0xff) as u8)
+            .collect();
+        let scale: Vec<u8> = (0..n * k / 16)
+            .map(|i| [0x30, 0x38, 0x40][(i + plane) % 3])
+            .collect();
+        weights.push(upload(gpu, &packed)?);
+        scales.push(upload(gpu, &scale)?);
+    }
+    let scale2 = [1.0f32, 0.5, 1.25];
+    let separate = gpu.alloc(3 * m * n * 2)?;
+    let fused_out = gpu.alloc(3 * m * n * 2)?;
+    let base = gpu.kernel("w4a16_gemv", "w4a16_gemv_batch5")?;
+    let fused = gpu.kernel("w4a16_gemv", "w4a16_gemv_batch5_qkv")?;
+    for plane in 0..3usize {
+        KernelLaunch::new(gpu, base)
+            .grid([div_ceil(n as u32, 4), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(input_p)
+            .arg_ptr(weights[plane])
+            .arg_ptr(scales[plane])
+            .arg_f32(scale2[plane])
+            .arg_ptr(separate.offset(plane * m * n * 2))
+            .arg_u32(m as u32)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .launch(stream)?;
+    }
+    KernelLaunch::new(gpu, fused)
+        .grid([div_ceil(n as u32, 4), 1, 3])
+        .block([256, 1, 1])
+        .arg_ptr(input_p)
+        .arg_ptr(weights[0])
+        .arg_ptr(scales[0])
+        .arg_f32(scale2[0])
+        .arg_ptr(weights[1])
+        .arg_ptr(scales[1])
+        .arg_f32(scale2[1])
+        .arg_ptr(weights[2])
+        .arg_ptr(scales[2])
+        .arg_f32(scale2[2])
+        .arg_ptr(fused_out)
+        .arg_u32(m as u32)
+        .arg_u32(n as u32)
+        .arg_u32(k as u32)
+        .launch(stream)?;
+    gpu.synchronize(stream)?;
+    require_equal(
+        "native-FP4 QKV output",
+        &download(gpu, separate, 3 * m * n * 2)?,
+        &download(gpu, fused_out, 3 * m * n * 2)?,
+    )
+}
+
 fn main() -> Result<()> {
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let gpu: &dyn GpuBackend = &backend;
@@ -227,6 +290,7 @@ fn main() -> Result<()> {
     println!("=== GLM K=5 inline snapshot exactness ===");
     check_conv(gpu, stream, &mut rng)?;
     check_recurrent(gpu, stream, &mut rng)?;
-    println!("PASS: outputs, final states, and rollback states are bit-identical");
+    check_qkv(gpu, stream, &mut rng)?;
+    println!("PASS: state kernels and native-FP4 QKV are bit-identical");
     Ok(())
 }
