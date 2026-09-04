@@ -66,7 +66,8 @@ physical block IDs, so chunk boundaries, recycled blocks, and a later
 multi-sequence implementation have one ownership model. The launcher rejects
 only values above the checkpoint limit.
 
-`MAX_PREFILL_TOKENS` is independent of `MAX_SEQ_LEN` and defaults to 1,024.
+`MAX_PREFILL_TOKENS` is independent of `MAX_SEQ_LEN` and defaults to the smaller
+of 2,048 and `MAX_SEQ_LEN`.
 Long prompts stream through that reusable activation arena while paged
 persistent state grows across the request. Atlas accepts arbitrary scheduler
 chunk boundaries: raw index inputs are staged by physical token offset, and a
@@ -128,6 +129,16 @@ tok/s (+4.9%), while 10K rose from 394.0 to 401.4 tok/s (+1.9%). Set
 `GLM_INDEX_ROW_GROUP=1` to restore the original scorer. With profiling disabled,
 the exact-10K needle receipt again recovered `NEBULA-2847`, at 399.0 prefill
 tok/s and 10.16 decode tok/s.
+
+A subsequent isolated chunk-size A/B kept the 32K sequence cap, one admitted
+sequence, the 90% memory budget, and the 4 GiB guard fixed. Raising only the
+prefill chunk from 1,024 to 2,048 increased warmed exact-10K prefill from
+398--400 to 445--447 tok/s (about 11.8%). At exact 32K it increased prefill
+from 354.5 to 375.8 tok/s (6.0%). The 2,048-token run left 8.2/10 GiB host
+memory available, and its exact-10K early-needle receipt recovered
+`NEBULA-2847`. The launcher therefore defaults to 2,048 when the configured
+sequence limit permits it, while the 1,024-token safe-first-launch remains
+unchanged because the default chunk is capped to `MAX_SEQ_LEN`.
 
 BF16 is deliberate for the first 100K correctness gate. FP8 halves the main KV
 value width and should improve capacity and bandwidth, but it needs its own
