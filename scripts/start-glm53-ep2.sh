@@ -67,6 +67,9 @@ NUM_DRAFTS="${NUM_DRAFTS:-1}"
 # which would leave MTP idle for most benchmark and agent workloads.
 MTP_SPEC_THINK="${MTP_SPEC_THINK:-1}"
 MTP_GATE_FORCE="${MTP_GATE_FORCE:-0}"
+# Per-request K=3/K=5 selection.  Starts at K=5, steps down only when the
+# observed extra-draft yield cannot repay K=5's measured GB10 step cost.
+MTP_SINGLE_DEPTH_ADAPT="${MTP_SINGLE_DEPTH_ADAPT:-1}"
 MTP_TIMING="${MTP_TIMING:-0}"
 VERIFY_PROFILE="${VERIFY_PROFILE:-0}"
 GLM_INDEX_PROFILE="${GLM_INDEX_PROFILE:-0}"
@@ -148,6 +151,10 @@ if [[ "$MTP_SPEC_THINK" != "0" && "$MTP_SPEC_THINK" != "1" ]]; then
 fi
 if [[ "$MTP_GATE_FORCE" != "0" && "$MTP_GATE_FORCE" != "1" ]]; then
   echo "ERROR: MTP_GATE_FORCE must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$MTP_SINGLE_DEPTH_ADAPT" != "0" && "$MTP_SINGLE_DEPTH_ADAPT" != "1" ]]; then
+  echo "ERROR: MTP_SINGLE_DEPTH_ADAPT must be 0 or 1." >&2
   exit 2
 fi
 if [[ "$MTP_TIMING" != "0" && "$MTP_TIMING" != "1" ]]; then
@@ -316,6 +323,7 @@ echo "  MoE exact grid / fallback load factor: $MOE_PREFILL_EXACT_TILES / $MOE_P
 echo "  tool-call parser override: ${TOOL_CALL_PARSER:-model default}"
 echo "  MTP speculative / draft tokens: $SPECULATIVE / $NUM_DRAFTS"
 echo "  MTP during thinking / force gate: $MTP_SPEC_THINK / $MTP_GATE_FORCE"
+echo "  MTP per-request K3/K5 adaptation: $MTP_SINGLE_DEPTH_ADAPT"
 echo "  MTP phase timing: $MTP_TIMING"
 echo "  GLM verifier layer profile: $VERIFY_PROFILE"
 echo "  GLM semantic-index profile: $GLM_INDEX_PROFILE"
@@ -367,6 +375,7 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_DUMP_EXPERT_IDS=$DUMP_EXPERT_IDS \
   -e ATLAS_MTP_SPEC_THINK=$MTP_SPEC_THINK \
   -e ATLAS_MTP_GATE_FORCE=$MTP_GATE_FORCE \
+  -e ATLAS_MTP_SINGLE_DEPTH_ADAPT=$MTP_SINGLE_DEPTH_ADAPT \
   -e ATLAS_MTP_TIMING=$MTP_TIMING \
   -e ATLAS_GLM_VERIFY_PROFILE=$VERIFY_PROFILE \
   -e ATLAS_GLM_INDEX_PROFILE=$GLM_INDEX_PROFILE \
@@ -410,6 +419,7 @@ docker run -d \
   -e ATLAS_DUMP_EXPERT_IDS="$DUMP_EXPERT_IDS" \
   -e ATLAS_MTP_SPEC_THINK="$MTP_SPEC_THINK" \
   -e ATLAS_MTP_GATE_FORCE="$MTP_GATE_FORCE" \
+  -e ATLAS_MTP_SINGLE_DEPTH_ADAPT="$MTP_SINGLE_DEPTH_ADAPT" \
   -e ATLAS_MTP_TIMING="$MTP_TIMING" \
   -e ATLAS_GLM_VERIFY_PROFILE="$VERIFY_PROFILE" \
   -e ATLAS_GLM_INDEX_PROFILE="$GLM_INDEX_PROFILE" \

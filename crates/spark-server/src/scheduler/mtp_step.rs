@@ -54,6 +54,18 @@ pub fn step_mtp(
     } else {
         crate::scheduler::adaptive_rung::drafts_for(active.len(), num_drafts)
     };
+    // At n=1, GLM can choose between the measured K=3 and K=5 kernels from
+    // this request's own acceptance history.  This composes after the global
+    // concurrency ladder and is a carried per-run lever rather than global
+    // process state (`ATLAS_MTP_SINGLE_DEPTH_ADAPT=1`).
+    let ladder_nd =
+        if active.len() == 1 && !dflash_verify_raw_argmax && sched.levers.mtp_single_depth_adapt {
+            active[0]
+                .mtp_acct
+                .depth_drafts(ladder_nd, sched.levers.mtp_single_depth_adapt)
+        } else {
+            ladder_nd
+        };
     // Tiered verify-pool capacity clamp (2026-08-16): the step's draft
     // count must respect the MINIMUM slot capacity across the active
     // sequences — a sequence in a K=2-sized slot must never receive K=4
@@ -490,6 +502,13 @@ pub fn step_mtp(
             if drafts.is_empty() {
                 continue;
             }
+        }
+
+        // The n=1 path does not pass through the batched partition's depth
+        // truncation above.  Honor the same ladder decision here so a K5
+        // proposal can immediately step down to the cheaper K3 verifier.
+        if a.grammar_state.is_none() && drafts.len() > ladder_nd {
+            drafts.truncate(ladder_nd);
         }
 
         // Four-or-more drafts use Atlas's width-generic K=γ verifier. This

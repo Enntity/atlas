@@ -67,6 +67,8 @@ pub struct SchedLevers {
     pub decode_timing: bool,
     pub mtp_timing: bool,
     pub mtp_gate_force: bool,
+    /// Per-request K=3/K=5 selection for low-concurrency MTP.
+    pub mtp_single_depth_adapt: bool,
     pub adadec_diagnostic: bool,
 
     /// Loop watchdog. **Runtime-mutable** — the TUI ops REPL toggles it while
@@ -170,6 +172,7 @@ impl SchedLevers {
             // `--mtp-gate force` is the configured spelling; the env var is
             // the fallback for scripts that predate the flag.
             mtp_gate_force: mtp_gate_force(),
+            mtp_single_depth_adapt: opt_in("ATLAS_MTP_SINGLE_DEPTH_ADAPT"),
             adadec_diagnostic: present("ATLAS_ADADEC_DIAGNOSTIC"),
 
             loop_watchdog: AtomicBool::new(false),
@@ -202,6 +205,7 @@ impl SchedLevers {
             decode_timing: false,
             mtp_timing: false,
             mtp_gate_force: false,
+            mtp_single_depth_adapt: false,
             adadec_diagnostic: false,
             loop_watchdog: AtomicBool::new(false),
         }
@@ -262,7 +266,9 @@ mod tests {
         assert!(!d.force_temp_zero);
         assert!(!d.dflash_masked_verify && !d.dflash_adaptive && !d.dflash_spec_think);
         assert!(!d.disable_watchdogs);
-        assert!(!d.decode_timing && !d.mtp_timing && !d.adadec_diagnostic);
+        assert!(
+            !d.decode_timing && !d.mtp_timing && !d.mtp_single_depth_adapt && !d.adadec_diagnostic
+        );
     }
 
     #[test]

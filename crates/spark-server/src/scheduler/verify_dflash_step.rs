@@ -131,6 +131,13 @@ pub fn step_verify_dflash(
         drafts.first() == verified.first(),
         num_accepted,
     );
+    if !dflash_verify_raw_argmax {
+        a.mtp_acct.record_depth_verify(
+            drafts.len(),
+            num_accepted,
+            sched.levers.mtp_single_depth_adapt,
+        );
+    }
 
     // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling
     // accept window; may suspend this seq's speculation (see adaptive_spec).
@@ -254,10 +261,16 @@ pub fn step_verify_dflash(
     let _mtp_grammar_mask = mtp_grammar_mask_for(a);
     let t_propose = std::time::Instant::now();
     if crate::scheduler::adaptive_spec::spec_allowed(a, sched) {
+        let next_num_drafts = if dflash_verify_raw_argmax {
+            num_drafts
+        } else {
+            a.mtp_acct
+                .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt)
+        };
         match model.run_mtp_propose_multi(
             a.last_token,
             a.seq.seq_len,
-            num_drafts,
+            next_num_drafts,
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),

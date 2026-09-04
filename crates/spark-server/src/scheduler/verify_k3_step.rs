@@ -222,6 +222,10 @@ pub fn step_verify_k3(
     } else {
         2
     };
+    if !dflash_verify_raw_argmax {
+        a.mtp_acct
+            .record_depth_verify(2, num_accepted, sched.levers.mtp_single_depth_adapt);
+    }
 
     // Shadow top-k target line (ATLAS_MTP_SHADOW_TOPK): joins offline with
     // the drafter's SHADOW_TOPK lines — draft i (drafter pos base+i) vs v_i.
@@ -350,7 +354,11 @@ pub fn step_verify_k3(
         match model.run_mtp_propose_multi(
             v2,
             a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, num_drafts),
+            crate::scheduler::spec_step::effective_drafts_under_grammar(
+                a,
+                a.mtp_acct
+                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+            ),
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),
@@ -397,7 +405,11 @@ pub fn step_verify_k3(
         match model.run_mtp_propose_multi(
             v1,
             a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, num_drafts),
+            crate::scheduler::spec_step::effective_drafts_under_grammar(
+                a,
+                a.mtp_acct
+                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+            ),
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),
@@ -442,7 +454,11 @@ pub fn step_verify_k3(
         match model.run_mtp_propose_multi(
             v0,
             a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, num_drafts),
+            crate::scheduler::spec_step::effective_drafts_under_grammar(
+                a,
+                a.mtp_acct
+                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+            ),
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),
