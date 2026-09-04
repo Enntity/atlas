@@ -85,6 +85,36 @@ fn test_compute_num_blocks() {
 }
 
 #[test]
+fn test_sparse_index_cache_geometry_and_budgeting() {
+    let cfg = test_config();
+    let index = SparseIndexCacheConfig::bf16(4, 128);
+
+    // One pooled 128-wide BF16 key per four source tokens. A 16-token
+    // physical KV block therefore carries four 256-byte index keys.
+    assert_eq!(index.block_bytes(cfg.block_size).unwrap(), 1024);
+    assert_eq!(
+        PagedKvCache::compute_num_blocks_with_sparse_index(&cfg, index, 1_000_000).unwrap(),
+        1_000_000 / (196_608 + 12 * 1024)
+    );
+}
+
+#[test]
+fn test_sparse_index_cache_attaches_to_each_layer() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = PagedKvCache::new(test_config(), 10, &gpu).unwrap();
+    let index = SparseIndexCacheConfig::bf16(4, 128);
+
+    cache.attach_sparse_index(index, &gpu).unwrap();
+    assert!(!cache.sparse_index_pool_ptr(0).is_null());
+    assert_ne!(
+        cache.sparse_index_pool_ptr(0),
+        cache.sparse_index_pool_ptr(1)
+    );
+    assert_eq!(cache.sparse_index_block_stride_bytes(0), 1024);
+    assert_eq!(cache.sparse_index_config(), Some(index));
+}
+
+#[test]
 fn test_compute_num_blocks_nvfp4() {
     let cfg = KvCacheConfig {
         dtype: KvCacheDtype::Nvfp4,

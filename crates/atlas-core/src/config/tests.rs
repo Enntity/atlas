@@ -115,7 +115,11 @@ fn glm5_next_maps_nested_hybrid_mla_kda_and_ep_shape() {
             "hc_eps": 1e-6,
             "index_n_heads": 32,
             "index_head_dim": 128,
-            "index_topk": 2048
+            "index_topk": 2048,
+            "index_kpool": 4,
+            "index_kpool_compress": true,
+            "index_kpool_always_select_tail": true,
+            "indexer_types": vec!["full"; 45]
         },
         "quantization_config": {
             "quant_method": "modelopt",
@@ -143,6 +147,8 @@ fn glm5_next_maps_nested_hybrid_mla_kda_and_ep_shape() {
     assert_eq!(cfg.routed_scaling_factor, 2.5);
     assert_eq!(cfg.hc_mult, 4);
     assert_eq!(cfg.index_topk, 2048);
+    assert_eq!(cfg.index_kpool, 4);
+    assert!(cfg.index_kpool_always_select_tail);
     assert_eq!(cfg.num_mtp_modules, 1);
     assert_eq!(cfg.mtp_num_hidden_layers, 1);
     assert!(cfg.nested_config);

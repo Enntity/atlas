@@ -411,6 +411,10 @@ struct LayerPool {
     v_block_stride: usize,
     /// Effective dtype for this layer.
     dtype: KvCacheDtype,
+    sparse_index_values: DevicePtr,
+    sparse_index_scales: DevicePtr,
+    sparse_index_values_block_stride: usize,
+    sparse_index_scales_block_stride: usize,
 }
 
 /// Paged KV cache across all attention layers.
@@ -422,6 +426,7 @@ pub struct PagedKvCache {
     /// Default: 1 on alloc, freed when decremented to 0.
     block_ref_counts: Vec<u32>,
     config: KvCacheConfig,
+    sparse_index_config: Option<SparseIndexCacheConfig>,
     /// Per-block refcount event history (`ATLAS_KV_TRACE=1`; inert otherwise).
     trace: block_trace::BlockTrace,
 }
@@ -429,7 +434,10 @@ pub struct PagedKvCache {
 mod block_trace;
 mod catalog;
 mod paged_impl;
-/// Release both pools of every layer.
+mod sparse_index;
+mod sparse_index_impl;
+pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
+/// Release K/V and any attached sparse-index pools for every layer.
 ///
 /// Each layer allocates its K and V pools separately, so freeing per layer is
 /// correct. The block bookkeeping (`free_blocks`, `block_ref_counts`) is host
@@ -443,7 +451,15 @@ impl atlas_core::scope::ModelResource<dyn crate::gpu::GpuBackend> for PagedKvCac
     fn release(&mut self, gpu: &dyn crate::gpu::GpuBackend) -> anyhow::Result<()> {
         let mut first_error = None;
         for layer in self.layers.drain(..) {
-            for ptr in [layer.k_pool, layer.v_pool] {
+            for ptr in [
+                layer.k_pool,
+                layer.v_pool,
+                layer.sparse_index_values,
+                layer.sparse_index_scales,
+            ] {
+                if ptr.is_null() {
+                    continue;
+                }
                 if let Err(e) = gpu.free(ptr)
                     && first_error.is_none()
                 {

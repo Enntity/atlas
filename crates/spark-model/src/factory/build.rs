@@ -7,7 +7,7 @@ use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::GpuBackend;
-use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache, SparseIndexCacheConfig};
 use spark_runtime::prefix_cache::PrefixCache;
 use spark_runtime::weights::WeightStore;
 
@@ -330,6 +330,13 @@ pub fn build_model(
         layer_dims: config.kv_layer_dims.clone(),
         cache_blocks_per_seq: hss_cache_blocks_per_seq,
     };
+    // GLM-5.3 selects one semantic-index key for each four-token pool. Keep
+    // those keys under the same physical block lifecycle as MLA K/V so prefix
+    // sharing and recycling cannot leave the two histories out of sync.
+    // BF16 is the correctness baseline; the cache API also models scaled FP8
+    // for the production-memory follow-up.
+    let sparse_index = (config.model_type == "glm5_next")
+        .then(|| SparseIndexCacheConfig::bf16(config.index_kpool, config.index_head_dim));
 
     if hss_cache_blocks_per_seq.is_some() {
         kv_summary::log_hss_kv_summary(&kv_config);
@@ -476,7 +483,12 @@ pub fn build_model(
                     (used_so_far + inference_reserve) as f64 / (1024.0 * 1024.0 * 1024.0),
                 );
             }
-            let n = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+            let n = match sparse_index {
+                Some(index) => PagedKvCache::compute_num_blocks_with_sparse_index(
+                    &kv_config, index, kv_budget,
+                )?,
+                None => PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?,
+            };
             let max_kv_tokens = n * kv_block_size;
             tracing::info!(
                 "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
@@ -554,7 +566,10 @@ pub fn build_model(
             );
         }
     }
-    let kv_cache = PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?;
+    let mut kv_cache = PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?;
+    if let Some(index) = sparse_index {
+        kv_cache.attach_sparse_index(index, gpu.as_ref())?;
+    }
 
     // ── Step 6: Assemble model ──
     // Capture pointers for any post-construction sharing (DFlash drafter

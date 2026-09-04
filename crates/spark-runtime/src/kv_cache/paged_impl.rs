@@ -33,6 +33,10 @@ impl PagedKvCache {
                 k_block_stride: k_block_bytes,
                 v_block_stride: v_block_bytes,
                 dtype: config.dtype_for_layer(i),
+                sparse_index_values: DevicePtr::NULL,
+                sparse_index_scales: DevicePtr::NULL,
+                sparse_index_values_block_stride: 0,
+                sparse_index_scales_block_stride: 0,
             });
         }
 
@@ -71,6 +75,7 @@ impl PagedKvCache {
             free_blocks,
             block_ref_counts,
             config,
+            sparse_index_config: None,
             trace: BlockTrace::new(num_blocks),
         })
     }
@@ -114,6 +119,26 @@ impl PagedKvCache {
                 layer.v_block_stride,
                 stream,
             )?;
+            if !layer.sparse_index_values.is_null() {
+                gpu.memset_async(
+                    layer
+                        .sparse_index_values
+                        .offset(block_idx as usize * layer.sparse_index_values_block_stride),
+                    0,
+                    layer.sparse_index_values_block_stride,
+                    stream,
+                )?;
+            }
+            if !layer.sparse_index_scales.is_null() {
+                gpu.memset_async(
+                    layer
+                        .sparse_index_scales
+                        .offset(block_idx as usize * layer.sparse_index_scales_block_stride),
+                    0,
+                    layer.sparse_index_scales_block_stride,
+                    stream,
+                )?;
+            }
         }
         Ok(())
     }

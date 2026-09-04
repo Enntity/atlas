@@ -20,6 +20,7 @@ PORT="${PORT:-8888}"
 BIND_ADDRESS="${BIND_ADDRESS:-0.0.0.0}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
+MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-$MAX_SEQ_LEN}"
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 TP_SIZE="${TP_SIZE:-1}"
@@ -70,6 +71,11 @@ GLM_MTP_BATCHED_PREFILL="${GLM_MTP_BATCHED_PREFILL:-$SPECULATIVE}"
 if (( MAX_SEQ_LEN > 2048 )); then
   echo "ERROR: initial GLM-5.3 Atlas support is capped at 2048 tokens." >&2
   echo "Its sparse-attention layers use exact dense attention only while seq_len <= index_topk (2048)." >&2
+  exit 2
+fi
+
+if (( MAX_PREFILL_TOKENS < 1 || MAX_PREFILL_TOKENS > MAX_SEQ_LEN )); then
+  echo "ERROR: MAX_PREFILL_TOKENS must be in 1..MAX_SEQ_LEN." >&2
   exit 2
 fi
 
@@ -231,7 +237,7 @@ COMMON_SERVE_ARGS=(
   --master-port "$MASTER_PORT"
   --bind "$BIND_ADDRESS"
   --max-seq-len "$MAX_SEQ_LEN"
-  --max-prefill-tokens "$MAX_SEQ_LEN"
+  --max-prefill-tokens "$MAX_PREFILL_TOKENS"
   --max-batch-size "$MAX_BATCH_SIZE"
   --max-num-seqs "$MAX_NUM_SEQS"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
@@ -253,6 +259,7 @@ echo "  model: $MODEL"
 echo "  image: $IMAGE"
 echo "  API bind: $BIND_ADDRESS:$PORT"
 echo "  per-sequence context / active / admitted: $MAX_SEQ_LEN / $MAX_BATCH_SIZE / $MAX_NUM_SEQS"
+echo "  prefill chunk budget: $MAX_PREFILL_TOKENS"
 echo "  parallelism: TP=$TP_SIZE / EP=2 on two physical ranks"
 echo "  GPU budget: $GPU_MEM_UTIL; OOM guard: ${OOM_GUARD_MB} MiB"
 echo "  container memory ceiling: $CONTAINER_MEMORY"

@@ -274,15 +274,23 @@ pub struct ModelConfig {
     /// Length equals num_hidden_layers. Empty = all layers full attention.
     #[serde(default)]
     pub compress_ratios: Vec<usize>,
-    /// Number of semantic-indexer heads used by DeepSeek-V4 CSA layers.
+    /// Number of semantic-indexer heads used by sparse-attention layers.
     #[serde(default)]
     pub index_n_heads: usize,
-    /// Per-head dimension of the DeepSeek-V4 semantic indexer.
+    /// Per-head dimension of the semantic indexer.
     #[serde(default)]
     pub index_head_dim: usize,
     /// Maximum compressed-history rows selected per query by the semantic indexer.
     #[serde(default)]
     pub index_topk: usize,
+    /// Number of adjacent raw tokens represented by one GLM-5 indexer pool.
+    /// Zero means the architecture does not use k-pool compression.
+    #[serde(default)]
+    pub index_kpool: usize,
+    /// Whether GLM-5 appends the visible, incomplete k-pool tail to the
+    /// expanded top-k token indices.
+    #[serde(default)]
+    pub index_kpool_always_select_tail: bool,
     /// Number of hash-based attention layers (DeepSeek-V4 HCA). 0 = none.
     #[serde(default)]
     pub num_hash_layers: usize,

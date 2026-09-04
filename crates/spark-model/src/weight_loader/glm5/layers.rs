@@ -7,7 +7,7 @@ use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
-use crate::layers::qwen3_attention::{MlaWeights, Qwen3AttentionLayer};
+use crate::layers::qwen3_attention::{GlmIndexerWeights, MlaWeights, Qwen3AttentionLayer};
 use crate::layers::{FfnComponent, Glm5KdaLayer};
 use crate::tp_shard::shard_dense_bf16;
 use crate::weight_map::{
@@ -140,6 +140,24 @@ pub(super) fn load_mla_layer(
     let null = DenseWeight {
         weight: DevicePtr::NULL,
     };
+    let indexer_prefix = format!("{p}.indexer");
+    let glm_indexer = GlmIndexerWeights {
+        wq_b: dense_auto(store, &format!("{indexer_prefix}.wq_b.weight"), gpu)?,
+        wk: dense_auto(store, &format!("{indexer_prefix}.wk.weight"), gpu)?,
+        weights_proj: dense_auto(store, &format!("{indexer_prefix}.weights_proj.weight"), gpu)?,
+        kpool_gate: dense_auto(
+            store,
+            &format!("{indexer_prefix}.index_kpool_compress_gate"),
+            gpu,
+        )?,
+        kpool_ape: dense_auto(
+            store,
+            &format!("{indexer_prefix}.index_kpool_compress_ape"),
+            gpu,
+        )?,
+        k_norm_weight: dense_auto(store, &format!("{indexer_prefix}.k_norm.weight"), gpu)?,
+        k_norm_bias: dense_auto(store, &format!("{indexer_prefix}.k_norm.bias"), gpu)?,
+    };
     let mla = MlaWeights {
         wq_a,
         wq_a_nvfp4: None,
@@ -180,6 +198,7 @@ pub(super) fn load_mla_layer(
         nope: config.qk_nope_head_dim,
         rope: 0,
         v_dim: config.v_head_dim,
+        glm_indexer: Some(glm_indexer),
         compressor: None,
         attn_sink: DevicePtr::NULL,
     };

@@ -32,6 +32,7 @@ FP4_PREFILL=1 \
 The launcher intentionally starts with:
 
 - 1,024 maximum sequence tokens;
+- a separately configurable 1,024-token prefill chunk budget;
 - one batch item and one concurrent sequence;
 - BF16 KV cache;
 - a 92% total GPU-memory budget and 4 GiB OOM guard;
@@ -64,6 +65,12 @@ equivalent while the entire sequence is no longer than `index_topk=2048`.
 Startup therefore rejects values above 2,048 rather than silently changing the
 model. KDA recurrent state is FP32 and allocated for one sequence; increasing
 concurrency multiplies that state and should follow a measured memory audit.
+
+`MAX_PREFILL_TOKENS` is independent of `MAX_SEQ_LEN`. It still defaults to the
+context limit during the guarded 2,048-token phase, but the separation is
+required for long context: a future 100K launch will keep the reusable
+activation arena at a 1K--2K chunk while paged persistent state grows across
+the full request. It does not bypass the semantic-indexer cap above.
 
 ## Guarded concurrency launch
 

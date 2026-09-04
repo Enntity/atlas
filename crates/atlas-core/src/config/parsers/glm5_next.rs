@@ -118,6 +118,33 @@ pub fn parse_glm5_next(raw: &Value) -> Result<ModelConfig> {
     config.index_n_heads = usize_field(text, "index_n_heads")?;
     config.index_head_dim = usize_field(text, "index_head_dim")?;
     config.index_topk = usize_field(text, "index_topk")?;
+    config.index_kpool = usize_field(text, "index_kpool")?;
+    ensure!(
+        config.index_topk.is_multiple_of(config.index_kpool),
+        "glm5_next index_topk must be divisible by index_kpool"
+    );
+    ensure!(
+        text.get("index_kpool_compress").and_then(Value::as_bool) == Some(true),
+        "glm5_next Atlas support requires index_kpool_compress=true"
+    );
+    config.index_kpool_always_select_tail = text
+        .get("index_kpool_always_select_tail")
+        .and_then(Value::as_bool)
+        .context("glm5_next text_config missing boolean `index_kpool_always_select_tail`")?;
+    let indexer_types = text
+        .get("indexer_types")
+        .and_then(Value::as_array)
+        .context("glm5_next text_config missing indexer_types")?;
+    ensure!(
+        indexer_types.len() == config.num_hidden_layers,
+        "glm5_next indexer_types length must equal num_hidden_layers"
+    );
+    ensure!(
+        indexer_types
+            .iter()
+            .all(|kind| kind.as_str() == Some("full")),
+        "glm5_next Atlas support currently requires a full indexer on every layer"
+    );
 
     config.attn_gated = false;
     config.nested_config = true;
