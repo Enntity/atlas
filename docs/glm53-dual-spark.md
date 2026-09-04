@@ -140,6 +140,16 @@ memory available, and its exact-10K early-needle receipt recovered
 sequence limit permits it, while the 1,024-token safe-first-launch remains
 unchanged because the default chunk is capped to `MAX_SEQ_LEN`.
 
+Re-testing chunk geometry after the native NVFP4 prequant path was established
+showed that 2,048 was no longer the throughput optimum. On the same image and
+exact-10K prompt, raising only the chunk budget from 2,048 to 4,096 increased
+warmed prefill from 447.3 to 534.4 tok/s (+19.5%). Exact-32K prefill was 397.9
+tok/s versus 375.8 tok/s at 2,048 (+5.9%). The 4,096-token run retained more
+than the 4 GiB memory guard, produced coherent output, and recovered the exact
+10K `NEBULA-2847` needle at 535.4 prefill tok/s. The adaptive launcher default
+therefore caps at 4,096; safe-first launches with `MAX_SEQ_LEN=1024` remain at
+1,024 automatically.
+
 BF16 is deliberate for the first 100K correctness gate. FP8 halves the main KV
 value width and should improve capacity and bandwidth, but it needs its own
 needle/coherence A/B because quantization can change attention rankings. The

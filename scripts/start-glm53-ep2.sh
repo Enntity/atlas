@@ -21,9 +21,9 @@ BIND_ADDRESS="${BIND_ADDRESS:-0.0.0.0}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
 # Keep scratch and the live chunk bounded when only the context window is
-# raised. The measured dual-Spark sweet spot is 2048 tokens, capped to the
+# raised. The measured dual-Spark sweet spot is 4096 tokens, capped to the
 # configured sequence limit so the 1024-token safe-first-launch still works.
-MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-$(( MAX_SEQ_LEN < 2048 ? MAX_SEQ_LEN : 2048 ))}"
+MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-$(( MAX_SEQ_LEN < 4096 ? MAX_SEQ_LEN : 4096 ))}"
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 TP_SIZE="${TP_SIZE:-1}"
