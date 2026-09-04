@@ -478,6 +478,17 @@ to 116.560 ms mean (-0.31%). Three endpoint samples were acceptance-limited
 the performance claim. A separate arithmetic chat returned `899` correctly
 with reasoning and visible content separated.
 
+`GLM_K5_FUSED_DENSE_PAIRS=1` then submits KDA's same-shape `f_a/g_a` and
+`f_b/g_b` BF16 projections as two planes per pair. Each plane uses the same
+exact-five dot-product body and its original input, weight, and output; `=0`
+restores four individual launches. On the same v23 image, 12 target-forward
+windows improved from 116.965 to 115.870 ms median (-0.94%) and from 116.834
+to 115.891 ms mean (-0.81%). Three forced-256 endpoint runs were essentially
+flat at the median (-0.37%) and +0.76% at the mean with the same median accepted
+draft count; the less acceptance-sensitive target-forward timings are the
+performance claim. An arithmetic chat returned `1517` correctly and kept its
+reasoning separate from the visible answer.
+
 With one warm-up and five measured copies of the same exact 1,000-token,
 forced-256 request, grouped W4A16 decoded at `19.046`, `19.414`, `21.029`,
 `20.243`, and `20.646` tok/s (20.243 median, +3.1% over v87). Median accepted

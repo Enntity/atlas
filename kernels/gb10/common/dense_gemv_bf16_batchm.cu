@@ -171,3 +171,24 @@ extern "C" __global__ void dense_gemv_bf16_batch5(
     __shared__ float smem[5 * N_PER_BLOCK * 2];
     dense_gemv_bf16_batchm_impl<5>(A, B, C, 5, N, K, out_stride, smem);
 }
+
+// Two independent exact-five-row BF16 projections with the same [N,K]
+// shape. Grid Z selects the input, weight, and output plane; the underlying
+// dot-product body and reduction order are unchanged.
+extern "C" __global__ void dense_gemv_bf16_batch5_dual(
+    const __nv_bfloat16* __restrict__ A0,
+    const __nv_bfloat16* __restrict__ A1,
+    const __nv_bfloat16* __restrict__ B0,
+    const __nv_bfloat16* __restrict__ B1,
+    __nv_bfloat16* __restrict__ C0,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int N,
+    unsigned int K
+) {
+    __shared__ float smem[5 * N_PER_BLOCK * 2];
+    const bool second = blockIdx.z != 0u;
+    const __nv_bfloat16* A = second ? A1 : A0;
+    const __nv_bfloat16* B = second ? B1 : B0;
+    __nv_bfloat16* C = second ? C1 : C0;
+    dense_gemv_bf16_batchm_impl<5>(A, B, C, 5, N, K, N, smem);
+}

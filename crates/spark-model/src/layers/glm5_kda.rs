@@ -44,6 +44,13 @@ fn verify_fused_qkv_enabled() -> bool {
     std::env::var("ATLAS_GLM_K5_FUSED_QKV").ok().as_deref() == Some("1")
 }
 
+fn verify_fused_dense_pairs_enabled() -> bool {
+    std::env::var("ATLAS_GLM_K5_FUSED_DENSE_PAIRS")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 pub struct Glm5KdaLayer {
     input_norm: DenseWeight,
     post_attn_norm: DenseWeight,
@@ -62,6 +69,7 @@ pub struct Glm5KdaLayer {
     dense_gemv_k: KernelHandle,
     dense_gemv_batchm_k: KernelHandle,
     dense_gemv_batch5_k: KernelHandle,
+    dense_gemv_batch5_dual_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
     w4a16_gemv_sw_k: KernelHandle,
     w4a16_gemv_batch2_k: KernelHandle,
@@ -157,6 +165,11 @@ impl Glm5KdaLayer {
                 gpu,
                 "dense_gemv_bf16_batchm",
                 "dense_gemv_bf16_batch5",
+            ),
+            dense_gemv_batch5_dual_k: super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batch5_dual",
             ),
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
@@ -364,102 +377,138 @@ impl Glm5KdaLayer {
         }
         profile::step(ctx, stream, &mut profile_timer, "kv_beta_proj")?;
         let fa = beta.offset(tokens * self.heads * bf16);
-        if capture_verify_intermediates {
-            self.project_dense_verify(
-                normed,
-                &self.weights.f_a_proj,
-                fa,
-                m,
-                self.dim as u32,
-                h,
-                ctx,
-                stream,
-            )?;
-        } else {
-            self.project_dense(
-                normed,
-                &self.weights.f_a_proj,
-                fa,
-                m,
-                self.dim as u32,
-                h,
-                ctx,
-                stream,
-            )?;
-        }
-        profile::step(ctx, stream, &mut profile_timer, "f_a_proj")?;
         let ga = fa.offset(tokens * self.dim * bf16);
-        if capture_verify_intermediates {
-            self.project_dense_verify(
+        let fused_dense_pairs = capture_verify_intermediates
+            && m == 5
+            && self.dense_gemv_batch5_dual_k.0 != 0
+            && verify_fused_dense_pairs_enabled();
+        if fused_dense_pairs {
+            ops::dense_gemv_batch5_dual(
+                ctx.gpu,
+                self.dense_gemv_batch5_dual_k,
                 normed,
+                normed,
+                &self.weights.f_a_proj,
                 &self.weights.g_a_proj,
+                fa,
                 ga,
-                m,
                 self.dim as u32,
                 h,
-                ctx,
                 stream,
             )?;
         } else {
-            self.project_dense(
-                normed,
-                &self.weights.g_a_proj,
-                ga,
-                m,
-                self.dim as u32,
-                h,
-                ctx,
-                stream,
-            )?;
+            if capture_verify_intermediates {
+                self.project_dense_verify(
+                    normed,
+                    &self.weights.f_a_proj,
+                    fa,
+                    m,
+                    self.dim as u32,
+                    h,
+                    ctx,
+                    stream,
+                )?;
+            } else {
+                self.project_dense(
+                    normed,
+                    &self.weights.f_a_proj,
+                    fa,
+                    m,
+                    self.dim as u32,
+                    h,
+                    ctx,
+                    stream,
+                )?;
+            }
+            profile::step(ctx, stream, &mut profile_timer, "f_a_proj")?;
+            if capture_verify_intermediates {
+                self.project_dense_verify(
+                    normed,
+                    &self.weights.g_a_proj,
+                    ga,
+                    m,
+                    self.dim as u32,
+                    h,
+                    ctx,
+                    stream,
+                )?;
+            } else {
+                self.project_dense(
+                    normed,
+                    &self.weights.g_a_proj,
+                    ga,
+                    m,
+                    self.dim as u32,
+                    h,
+                    ctx,
+                    stream,
+                )?;
+            }
+        }
+        if fused_dense_pairs {
+            profile::step(ctx, stream, &mut profile_timer, "f_a_g_a")?;
         }
 
         let g1 = ctx.buffers.ssm_deinterleaved();
-        if capture_verify_intermediates {
-            self.project_dense_verify(
-                fa,
-                &self.weights.f_b_proj,
-                g1,
-                m,
-                p as u32,
-                self.dim as u32,
-                ctx,
-                stream,
-            )?;
-        } else {
-            self.project_dense(
-                fa,
-                &self.weights.f_b_proj,
-                g1,
-                m,
-                p as u32,
-                self.dim as u32,
-                ctx,
-                stream,
-            )?;
-        }
         let g2 = g1.offset(plane_bytes);
-        if capture_verify_intermediates {
-            self.project_dense_verify(
+        if fused_dense_pairs {
+            ops::dense_gemv_batch5_dual(
+                ctx.gpu,
+                self.dense_gemv_batch5_dual_k,
+                fa,
                 ga,
+                &self.weights.f_b_proj,
                 &self.weights.g_b_proj,
+                g1,
                 g2,
-                m,
                 p as u32,
                 self.dim as u32,
-                ctx,
                 stream,
             )?;
         } else {
-            self.project_dense(
-                ga,
-                &self.weights.g_b_proj,
-                g2,
-                m,
-                p as u32,
-                self.dim as u32,
-                ctx,
-                stream,
-            )?;
+            if capture_verify_intermediates {
+                self.project_dense_verify(
+                    fa,
+                    &self.weights.f_b_proj,
+                    g1,
+                    m,
+                    p as u32,
+                    self.dim as u32,
+                    ctx,
+                    stream,
+                )?;
+                self.project_dense_verify(
+                    ga,
+                    &self.weights.g_b_proj,
+                    g2,
+                    m,
+                    p as u32,
+                    self.dim as u32,
+                    ctx,
+                    stream,
+                )?;
+            } else {
+                self.project_dense(
+                    fa,
+                    &self.weights.f_b_proj,
+                    g1,
+                    m,
+                    p as u32,
+                    self.dim as u32,
+                    ctx,
+                    stream,
+                )?;
+                self.project_dense(
+                    ga,
+                    &self.weights.g_b_proj,
+                    g2,
+                    m,
+                    p as u32,
+                    self.dim as u32,
+                    ctx,
+                    stream,
+                )?;
+            }
         }
         profile::step(ctx, stream, &mut profile_timer, "g_a_f_b_g_b")?;
 

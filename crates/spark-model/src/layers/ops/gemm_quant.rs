@@ -222,6 +222,35 @@ pub fn dense_gemv_batchm(
         .launch(stream)
 }
 
+/// Two same-shape exact-M=5 BF16 projections in one two-plane launch.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_batch5_dual(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    first_input: DevicePtr,
+    second_input: DevicePtr,
+    first_weight: &DenseWeight,
+    second_weight: &DenseWeight,
+    first_output: DevicePtr,
+    second_output: DevicePtr,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 2])
+        .block([256, 1, 1])
+        .arg_ptr(first_input)
+        .arg_ptr(second_input)
+        .arg_ptr(first_weight.weight)
+        .arg_ptr(second_weight.weight)
+        .arg_ptr(first_output)
+        .arg_ptr(second_output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Dense FP8-weight GEMV (M=1): C = A @ (dequant(B_fp8) * row_scale).
 ///
 /// A: `[1, K]` BF16, B: `[N, K]` FP8 E4M3, row_scale: `[N]` f32, C: `[1, N]` BF16.
