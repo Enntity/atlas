@@ -258,6 +258,40 @@ pub fn w4a16_gemv_batch5_qkv(
         .launch(stream)
 }
 
+/// Exact-M=5 pair of same-shape native-NVFP4 projections in one launch.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_batch5_dual(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    first: &QuantizedWeight,
+    second: &QuantizedWeight,
+    first_output: DevicePtr,
+    second_output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert_eq!(m, 5);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 2])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(first.weight)
+        .arg_ptr(first.weight_scale)
+        .arg_f32(first.weight_scale_2)
+        .arg_ptr(second.weight)
+        .arg_ptr(second.weight_scale)
+        .arg_f32(second.weight_scale_2)
+        .arg_ptr(first_output)
+        .arg_ptr(second_output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// W4A16 GEMV with inline Q/Gate deinterleave on output write.
 ///
 /// Same as `w4a16_gemv` but writes Q and Gate to deinterleaved positions,

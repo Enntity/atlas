@@ -740,6 +740,32 @@ extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch5_qk
     w4a16_gemv_batchm_impl<5>(A, B_packed, B_scale, scale2, out, M, N, K);
 }
 
+// GLM shared-expert gate/up verifier projections. Grid Z chooses one of two
+// independent native-NVFP4 weights and output planes. Each plane executes the
+// exact-M=5 implementation unchanged, so this removes one launch without
+// changing a dot product, scale application, or BF16 rounding point.
+extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch5_dual(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B0_packed,
+    const unsigned char* __restrict__ B0_scale,
+    const float b0_scale2,
+    const unsigned char* __restrict__ B1_packed,
+    const unsigned char* __restrict__ B1_scale,
+    const float b1_scale2,
+    __nv_bfloat16* __restrict__ C0,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    const bool second = blockIdx.z != 0u;
+    const unsigned char* B_packed = second ? B1_packed : B0_packed;
+    const unsigned char* B_scale = second ? B1_scale : B0_scale;
+    const float scale2 = second ? b1_scale2 : b0_scale2;
+    __nv_bfloat16* out = second ? C1 : C0;
+    w4a16_gemv_batchm_impl<5>(A, B_packed, B_scale, scale2, out, M, N, K);
+}
+
 extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch6(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ B_packed,

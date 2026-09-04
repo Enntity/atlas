@@ -163,6 +163,8 @@ pub struct MoeLayer {
     /// Exact-M GEMVs used to read GLM's retained shared expert once during
     /// K=4/K=5 verification (routed experts remain on fused K2/K3 kernels).
     w4a16_batchm: W4a16BatchmTiers,
+    /// Two-plane exact-M=5 shared-expert gate/up projection for GLM verify.
+    w4a16_batch5_dual_k: KernelHandle,
     // Generic token-major NVFP4 MoE kernels. Used as an opt-in decode
     // concurrency experiment for N>=4 without grouped-GEMM sorting.
     moe_expert_gate_up_shared_token_major: KernelHandle,

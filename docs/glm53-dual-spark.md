@@ -455,6 +455,19 @@ path also skips the expert-offset host copy when the worst case is already one
 routes fit in that tile by construction. `GLM_K5_GROUPED_MOE=0` restores the
 K2+K3 verifier path.
 
+When the exact-M shared path is selected, `GLM_K5_FUSED_SHARED_GATE_UP=1`
+submits its independent gate and up projections as two planes of one native
+NVFP4 launch. Each plane executes the unchanged batch-five dot-product body;
+`=0` restores the two-launch path for direct A/B and compatibility testing.
+On the same v21 image, 20 target-forward timing windows measured 117.635 ms
+median / 117.578 ms mean with fusion versus 117.975 ms / 118.017 ms without it
+(-0.29% / -0.37%). One warm-up plus five forced-256 endpoint runs improved
+from 19.010 to 19.187 tok/s median (+0.93%) and from 18.958 to 19.599 tok/s
+mean (+3.38%); the larger endpoint-mean movement includes normal accepted-draft
+variation, so the target-forward delta is the conservative kernel claim. A
+separate arithmetic chat returned `323` with reasoning and visible content
+still separated.
+
 With one warm-up and five measured copies of the same exact 1,000-token,
 forced-256 request, grouped W4A16 decoded at `19.046`, `19.414`, `21.029`,
 `20.243`, and `20.646` tok/s (20.243 median, +3.1% over v87). Median accepted
