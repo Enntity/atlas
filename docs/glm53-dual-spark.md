@@ -604,6 +604,24 @@ MTP-step medians were 141.58 and 142.35 ms respectively. The GLM launcher now
 defaults the fused path on, with the environment flag retained as an exact
 fallback switch.
 
+The K=5 verifier now also sends each five-row mHC pre-mix through Atlas's
+existing batched TF32 cuBLASLt path instead of evaluating 24 independent
+matrix-vector reductions per token inside `hc_pre`. The final RMS scaling,
+sigmoid gates, Sinkhorn iterations, residual collapse, and FP32 highway remain
+in the existing Atlas kernel. `GLM_K5_HC_CUBLAS=0` restores the serial-FP32
+pre-mix; the launcher defaults the measured batched path on.
+
+With verifier profiling enabled, both KDA mHC-plus-RMS boundaries fell from
+about 182 us to 94--98 us per layer. Across all 34 KDA layers, two measured
+K=5 forwards fell from about 90.1 ms to 84.0--84.2 ms. With profiling disabled,
+one warm-up plus five exact 1,000-token, forced-256 requests decoded at
+`18.695`, `19.712`, `19.162`, `20.732`, and `18.762` tok/s: 19.162 tok/s
+median and 19.412 mean. The same-image control measured `18.830`, `17.578`,
+`18.249`, `18.414`, and `19.372` tok/s: 18.414 median and 18.489 mean. That is
++4.1% by median and +5.0% by mean, while median accepted predictions remained
+effectively unchanged (159 versus 160), so the gain is not an MTP-acceptance
+artifact.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.
