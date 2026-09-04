@@ -67,9 +67,10 @@ NUM_DRAFTS="${NUM_DRAFTS:-1}"
 # which would leave MTP idle for most benchmark and agent workloads.
 MTP_SPEC_THINK="${MTP_SPEC_THINK:-1}"
 MTP_GATE_FORCE="${MTP_GATE_FORCE:-0}"
-# Per-request K=3/K=5 selection.  Starts at K=5, steps down only when the
-# observed extra-draft yield cannot repay K=5's measured GB10 step cost.
-MTP_SINGLE_DEPTH_ADAPT="${MTP_SINGLE_DEPTH_ADAPT:-1}"
+# Per-request K=3/K=5 selection. Resolve its default after the compact-K5
+# lever below: the compact native-FP4 verifier made K=5 cheaper than K=3 on
+# dual GB10, so stepping down is no longer economical in that configuration.
+MTP_SINGLE_DEPTH_ADAPT="${MTP_SINGLE_DEPTH_ADAPT:-}"
 MTP_TIMING="${MTP_TIMING:-0}"
 VERIFY_PROFILE="${VERIFY_PROFILE:-0}"
 GLM_INDEX_PROFILE="${GLM_INDEX_PROFILE:-0}"
@@ -80,6 +81,13 @@ GLM_K5_GROUPED_MOE="${GLM_K5_GROUPED_MOE:-1}"
 GLM_K5_BATCHED_SHARED="${GLM_K5_BATCHED_SHARED:-0}"
 GLM_K5_COMPACT_MOE="${GLM_K5_COMPACT_MOE:-0}"
 GLM_K5_FUSED_COMPACT_GATE_UP="${GLM_K5_FUSED_COMPACT_GATE_UP:-0}"
+if [[ -z "$MTP_SINGLE_DEPTH_ADAPT" ]]; then
+  if [[ "$GLM_K5_COMPACT_MOE" == "1" ]]; then
+    MTP_SINGLE_DEPTH_ADAPT=0
+  else
+    MTP_SINGLE_DEPTH_ADAPT=1
+  fi
+fi
 MOE_SHARED_REDUCE_OVERLAP="${MOE_SHARED_REDUCE_OVERLAP:-1}"
 GLM_MTP_SERIAL_PREFILL="${GLM_MTP_SERIAL_PREFILL:-0}"
 # MTP proposals need the appended layer's prompt K/V history. Build it with

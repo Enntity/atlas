@@ -553,6 +553,21 @@ drafts—but the direct target-forward ledger consistently resolves the launch
 reduction. Short 8/32-token smoke tests completed normally, and an arithmetic
 check kept reasoning/content separated and computed `5/16` correctly.
 
+Compact K=5 also changes the depth-controller economics. The controller was
+calibrated when a K=5 target step cost about 1.20x K=3, but the optimized
+native-FP4 K=5 path now completes at roughly the same step cost while emitting
+every token K=3 can emit plus up to two more accepted drafts. On the exact
+1,000-token, forced-256 workload, fixed K=3 decoded at `15.130`, `14.061`, and
+`14.856` tok/s (14.856 median), versus 17.626 tok/s for fixed K=5 (+18.6%).
+The old adaptive default measured 16.396 tok/s because it moved into the
+now-dominated K=3 path after its initial 12-step probe.
+
+Accordingly, `start-glm53-ep2.sh` now defaults
+`MTP_SINGLE_DEPTH_ADAPT=0` whenever `GLM_K5_COMPACT_MOE=1`. Non-compact
+launches retain the prior adaptive default, and an explicitly supplied
+`MTP_SINGLE_DEPTH_ADAPT` always wins. This changes no model math or request
+semantics; it keeps the optimized launcher on the measured faster verifier.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.
