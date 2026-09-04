@@ -2045,5 +2045,74 @@ extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact
         worklist, total_tiles, max_tiles);
 }
 
+// Projection-multiplexed compact gate/up dispatch.  The y grid selects the
+// pointer table and destination while x retains the proven compact work item.
+// This removes one host submission per MoE layer without changing the native
+// FP4 MMA body, its K accumulation order, or either output tensor's layout.
+template<bool PQ_VEC_SCALES>
+__device__ __forceinline__ void moe_w4a4_grouped_gemm_prequant_compact_gate_up_impl(
+    const unsigned char* __restrict__ A_packed,
+    const unsigned char* __restrict__ A_scale,
+    const unsigned long long* __restrict__ gate_packed_ptrs,
+    const unsigned long long* __restrict__ gate_scale_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    __nv_bfloat16* __restrict__ C_gate,
+    const unsigned long long* __restrict__ up_packed_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ C_up,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K,
+    const unsigned int* __restrict__ worklist,
+    const int* __restrict__ total_tiles,
+    unsigned int max_tiles
+) {
+    if (blockIdx.y > 1) return;
+    const bool is_up = blockIdx.y != 0;
+    moe_w4a4_grouped_gemm_prequant_compact_impl<PQ_VEC_SCALES>(
+        A_packed, A_scale,
+        is_up ? up_packed_ptrs : gate_packed_ptrs,
+        is_up ? up_scale_ptrs : gate_scale_ptrs,
+        is_up ? up_scale2_vals : gate_scale2_vals,
+        is_up ? C_up : C_gate,
+        expert_offsets, sorted_token_ids, num_experts, N, K,
+        worklist, total_tiles, max_tiles);
+}
+
+#define PQ4_COMPACT_GATE_UP_ARGS \
+    const unsigned char* A_packed, const unsigned char* A_scale, \
+    const unsigned long long* gate_packed_ptrs, \
+    const unsigned long long* gate_scale_ptrs, const float* gate_scale2_vals, \
+    __nv_bfloat16* C_gate, const unsigned long long* up_packed_ptrs, \
+    const unsigned long long* up_scale_ptrs, const float* up_scale2_vals, \
+    __nv_bfloat16* C_up, const int* expert_offsets, const int* sorted_token_ids, \
+    unsigned int num_experts, unsigned int N, unsigned int K, \
+    const unsigned int* worklist, const int* total_tiles, unsigned int max_tiles
+
+#define PQ4_COMPACT_GATE_UP_CALL(VEC) \
+    moe_w4a4_grouped_gemm_prequant_compact_gate_up_impl<VEC>( \
+        A_packed, A_scale, gate_packed_ptrs, gate_scale_ptrs, gate_scale2_vals, \
+        C_gate, up_packed_ptrs, up_scale_ptrs, up_scale2_vals, C_up, \
+        expert_offsets, sorted_token_ids, num_experts, N, K, \
+        worklist, total_tiles, max_tiles)
+
+extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_compact_gate_up(
+    PQ4_COMPACT_GATE_UP_ARGS
+) {
+    PQ4_COMPACT_GATE_UP_CALL(false);
+}
+
+extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact_gate_up(
+    PQ4_COMPACT_GATE_UP_ARGS
+) {
+    PQ4_COMPACT_GATE_UP_CALL(true);
+}
+
+#undef PQ4_COMPACT_GATE_UP_CALL
+#undef PQ4_COMPACT_GATE_UP_ARGS
+
 #undef PQ4_PREQUANT_CALL
 #undef PQ4_PREQUANT_ARGS

@@ -128,3 +128,53 @@ pub fn moe_w4a4_grouped_gemm_prequant_compact_n128(
         .arg_u32(max_tiles)
         .launch(stream)
 }
+
+/// Compact native-FP4 gate and up projections in one projection-multiplexed
+/// launch. Grid y selects gate/up; grid x indexes the common device worklist.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a4_grouped_gemm_prequant_compact_gate_up_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_packed: DevicePtr,
+    a_scale: DevicePtr,
+    gate_packed_ptrs: DevicePtr,
+    gate_scale_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    gate_output: DevicePtr,
+    up_packed_ptrs: DevicePtr,
+    up_scale_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    up_output: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    worklist: DevicePtr,
+    total_tiles: DevicePtr,
+    max_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([max_tiles.max(1), 2, 1])
+        .block([128, 1, 1])
+        .arg_ptr(a_packed)
+        .arg_ptr(a_scale)
+        .arg_ptr(gate_packed_ptrs)
+        .arg_ptr(gate_scale_ptrs)
+        .arg_ptr(gate_scale2_vals)
+        .arg_ptr(gate_output)
+        .arg_ptr(up_packed_ptrs)
+        .arg_ptr(up_scale_ptrs)
+        .arg_ptr(up_scale2_vals)
+        .arg_ptr(up_output)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .arg_ptr(worklist)
+        .arg_ptr(total_tiles)
+        .arg_u32(max_tiles)
+        .launch(stream)
+}

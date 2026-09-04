@@ -311,6 +311,8 @@ pub struct MoeLayer {
     /// Optional and used only for guarded K=5 gate/up verification.
     moe_w4a4_prequant_t_k64_compact: KernelHandle,
     moe_w4a4_prequant_t_k64_vecscale_compact: KernelHandle,
+    moe_w4a4_prequant_t_k64_compact_gate_up: KernelHandle,
+    moe_w4a4_prequant_t_k64_vecscale_compact_gate_up: KernelHandle,
     moe_nvfp4_mmq_gate_up_k: KernelHandle,
     moe_nvfp4_mmq_down_k: KernelHandle,
     moe_nvfp4_mmq_quantize_k: KernelHandle,

@@ -170,6 +170,24 @@ impl MoeLayer {
             } else {
                 KernelHandle(0)
             },
+            moe_w4a4_prequant_t_k64_compact_gate_up: if config.model_type == "glm5_next" {
+                super::super::try_kernel(
+                    gpu,
+                    "moe_w4a16",
+                    "moe_w4a4_grouped_gemm_prequant_t_k64_compact_gate_up",
+                )
+            } else {
+                KernelHandle(0)
+            },
+            moe_w4a4_prequant_t_k64_vecscale_compact_gate_up: if config.model_type == "glm5_next" {
+                super::super::try_kernel(
+                    gpu,
+                    "moe_w4a16",
+                    "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact_gate_up",
+                )
+            } else {
+                KernelHandle(0)
+            },
             moe_nvfp4_mmq_gate_up_k: super::super::try_kernel(
                 gpu,
                 "moe_nvfp4_mmq",

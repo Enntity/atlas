@@ -528,6 +528,31 @@ variant produced one stalled long request and later measured only 14.967 tok/s
 median on the same forced workload. It is therefore absent from the shipping
 dispatch; down retains the established dense native-FP4 kernel.
 
+A smaller M=32 compact gate/up CTA was also tested to reduce inactive-row MMA
+at K=5. It retained the native FP4 instructions but cut the block from 128 to
+64 threads. On the exact 1,000-token, forced-256 workload, the M32 image
+decoded at `15.747` tok/s median versus `17.523` tok/s for the M64 control from
+the same binary (-10.1%). The reduced loader participation and duplicated
+B-tile staging outweighed the saved inactive-row math, so the M32 variant was
+removed rather than retained as another runtime branch.
+
+The next guarded change keeps the proven M64/block-128 kernel and multiplexes
+the compact gate and up projections in one two-dimensional launch.
+`GLM_K5_FUSED_COMPACT_GATE_UP=1` selects gate/up with grid Y while grid X
+indexes the unchanged device worklist. The native Blackwell FP4 helper, K
+accumulation order, scale handling, outputs, and EP ownership are unchanged;
+the optimization removes one submission per routed layer.
+
+With the phase ledger enabled, 16 steady fused K=5 windows had a 127.015 ms
+median target-forward time versus 128.085 ms across 12 unfused windows from
+the same image (-0.84%). Three exact 1,000-token, forced-256 measurements
+decoded at `19.091`, `17.416`, and `16.735` tok/s (17.416 median); the matched
+unfused runs were `18.050`, `14.355`, and `17.599` tok/s (17.599 median). The
+end-to-end medians are acceptance-noisy—the low unfused run accepted only 136
+drafts—but the direct target-forward ledger consistently resolves the launch
+reduction. Short 8/32-token smoke tests completed normally, and an arithmetic
+check kept reasoning/content separated and computed `5/16` correctly.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

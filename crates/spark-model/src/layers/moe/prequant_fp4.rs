@@ -51,6 +51,42 @@ impl MoeLayer {
         } else {
             self.moe_w4a4_prequant_t_k64
         };
+        if let Some(work) = compact
+            && std::env::var("ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP").as_deref() == Ok("1")
+        {
+            let fused_kernel = if self.nvfp4_vecscale
+                && self.moe_w4a4_prequant_t_k64_vecscale_compact_gate_up.0 != 0
+            {
+                self.moe_w4a4_prequant_t_k64_vecscale_compact_gate_up
+            } else {
+                self.moe_w4a4_prequant_t_k64_compact_gate_up
+            };
+            if fused_kernel.0 != 0 {
+                return ops::moe_w4a4_grouped_gemm_prequant_compact_gate_up_n128(
+                    ctx.gpu,
+                    fused_kernel,
+                    a_packed,
+                    a_scale,
+                    gate.packed_ptrs,
+                    gate.scale_ptrs,
+                    gate.scale2_vals,
+                    expert_gate_out,
+                    up.packed_ptrs,
+                    up.scale_ptrs,
+                    up.scale2_vals,
+                    expert_up_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
+                    inter,
+                    h,
+                    work.worklist,
+                    work.total_tiles,
+                    work.max_tiles,
+                    stream,
+                );
+            }
+        }
         for (weight, output) in [(gate, expert_gate_out), (up, expert_up_out)] {
             if let Some(work) = compact {
                 let compact_kernel = if self.nvfp4_vecscale
