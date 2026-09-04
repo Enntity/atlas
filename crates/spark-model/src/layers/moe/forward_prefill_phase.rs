@@ -59,6 +59,68 @@ impl MoeLayer {
             return Ok(());
         }
 
+        // GLM's K=5 verifier enters the grouped routed-expert pipeline to
+        // amortize its expert weights, but the generic shared-expert prefill
+        // kernels pad this five-row problem to a much wider GEMM tile. Reuse
+        // the exact-M decode kernels already proven by forward_k5: they read
+        // each native NVFP4 projection once while computing only five rows.
+        let batch5 = self.w4a16_batchm.kernel(5);
+        let exact_k5 = n == 5
+            && std::env::var("ATLAS_GLM_K5_BATCHED_SHARED").as_deref() == Ok("1")
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && batch5.0 != 0
+            && !self.weights.shared_expert.gate_proj.is_null()
+            && !self.weights.shared_expert.up_proj.is_null()
+            && !self.weights.shared_expert.down_proj.is_null();
+        if exact_k5 {
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                batch5,
+                input,
+                &self.weights.shared_expert.gate_proj,
+                shared_gate_out,
+                5,
+                shared_inter,
+                h,
+                aux,
+            )?;
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                batch5,
+                input,
+                &self.weights.shared_expert.up_proj,
+                shared_up_out,
+                5,
+                shared_inter,
+                h,
+                aux,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.moe_act_mul,
+                shared_gate_out,
+                shared_up_out,
+                shared_gate_out,
+                5 * shared_inter,
+                aux,
+            )?;
+            ops::w4a16_gemv_batchm(
+                ctx.gpu,
+                batch5,
+                shared_gate_out,
+                &self.weights.shared_expert.down_proj,
+                shared_down_out,
+                5,
+                h,
+                shared_inter,
+                aux,
+            )?;
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
+
         // Shared gate + up GEMM on aux stream
         if let (Some(sg_fp8), Some(su_fp8)) = (self.shared_gate_fp8, self.shared_up_fp8) {
             ops::fp8_gemm_n128(

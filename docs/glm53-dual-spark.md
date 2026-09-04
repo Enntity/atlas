@@ -487,6 +487,25 @@ Arithmetic still returned `5/16`, and a 964-token rendered needle prompt
 recovered `SAPPHIRE-7319`. `MOE_SHARED_REDUCE_OVERLAP=0` restores the fully
 sequential schedule.
 
+The sustained verifier path subsequently gained two more guarded changes.
+First, the eleven MLA-layer FFNs run their native NVFP4 projections as one
+three- or five-row operation instead of repeating the single-row decode path.
+On the exact 1,000-token, forced-256 benchmark, fixed K=3 improved from a
+13.34 tok/s median to 15.99 tok/s (+19.9%), while fixed K=5 improved from
+13.38 tok/s to 15.94 tok/s (+19.2%). The K=5 gain remained 12.9% after
+normalizing target-step throughput by accepted drafts.
+
+Second, the grouped K=5 routed-expert path now has an opt-in exact-M shared
+expert dispatch. `GLM_K5_BATCHED_SHARED=1` reuses the existing batch-five
+NVFP4 W4A16 kernels for the shared gate, up, and down projections, avoiding
+the generic prefill GEMM's padded tile at only five rows. An eager profile
+reduced the 34 KDA layers from roughly 105 ms to 96 ms per target step. With
+profiling disabled, one warm-up plus five exact 1,000-token, forced-256 runs
+decoded at `16.716`, `14.927`, `16.932`, `17.144`, and `16.076` tok/s: a
+16.716 median, +4.9% over the 15.941 tok/s control. The low run coincided with
+137 accepted predictions versus 147--153 in the other runs. All completions
+retained separated reasoning and coherent technical output.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.
