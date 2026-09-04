@@ -21,6 +21,22 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.forward_prefill_impl(input, num_tokens, ctx, stream, false)
+    }
+
+    /// Internal entry used by the exact GLM K=5 verifier to leave the shared
+    /// expert blend for the immediately following hyperconnection post-step.
+    /// Normal prefill and every other model always pass `false` through the
+    /// public wrapper above.
+    #[allow(unused_assignments)]
+    pub(super) fn forward_prefill_impl(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+        defer_shared_hc: bool,
+    ) -> Result<()> {
         // Native-HIP (gfx1151) has NO ported grouped-GEMM MoE path:
         // moe_fp8_grouped_gemm is a compile stub (kernels/strix-hip/.../
         // moe_fp8_grouped_gemm.cu writes nothing) and the grouped prefill
@@ -152,6 +168,11 @@ impl MoeLayer {
         // Launching kernels with N=0 produces CUDA_ERROR_INVALID_VALUE (grid.x=0).
         let has_shared = shared_inter > 0;
         let is_ep_prefill = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+        let defer_shared_hc = defer_shared_hc
+            && has_shared
+            && is_ep_prefill
+            && num_tokens == 5
+            && ctx.config.model_type == "glm5_next";
         // Overlapping shared and routed GEMMs regresses on unified-memory GB10
         // because both streams compete for LPDDR5X bandwidth. In EP mode there
         // is a better pairing: defer the shared GEMMs until routed work is done,
@@ -465,7 +486,7 @@ impl MoeLayer {
                 );
             }
             // Add shared expert ONCE after all-reduce (prevents EP doubling)
-            if has_shared {
+            if has_shared && !defer_shared_hc {
                 let shared_down_out = ctx.buffers.attn_output();
                 if overlap_shared_reduce {
                     ctx.gpu.stream_wait_event(stream, self.event_b)?;

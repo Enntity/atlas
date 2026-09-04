@@ -192,6 +192,12 @@ impl Qwen3AttentionLayer {
                 "hc_pre_from_raw_mix",
             ),
             hc_post_k: gate(probes.hyper_connection, gpu, "hyper_connection", "hc_post"),
+            hc_post_moe_blend_k: gate(
+                probes.hyper_connection,
+                gpu,
+                "hyper_connection",
+                "hc_post_moe_blend",
+            ),
             hc_expand_k: gate(
                 probes.hyper_connection,
                 gpu,

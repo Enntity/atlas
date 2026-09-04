@@ -112,6 +112,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) hc_pre_from_raw_mix_k: KernelHandle,
     /// HC `hc_post` kernel handle (NULL when HC disabled).
     pub(super) hc_post_k: KernelHandle,
+    /// GLM K=5 shared-expert blend fused into `hc_post`.
+    pub(super) hc_post_moe_blend_k: KernelHandle,
     /// HC `hc_expand` kernel handle (NULL when HC disabled).
     pub(super) hc_expand_k: KernelHandle,
     /// HC `hc_head` kernel handle (NULL when HC disabled).

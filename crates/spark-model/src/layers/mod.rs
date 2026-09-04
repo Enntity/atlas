@@ -425,6 +425,43 @@ impl FfnComponent {
         }
     }
 
+    /// Fixed K=5 FFN for an mHC caller capable of fusing GLM's EP shared
+    /// expert blend into its post-step. `Some(gate)` means the returned MoE
+    /// output is routed-only and already globally reduced; the shared output
+    /// remains in `buffers.attn_output()`.
+    pub fn forward_k5_for_hc(
+        &self,
+        input: DevicePtr,
+        allow_deferred_shared_hc: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<(DevicePtr, Option<DevicePtr>)> {
+        match self {
+            Self::Moe(m) => m.forward_k5_for_hc(input, allow_deferred_shared_hc, ctx, stream),
+            _ => Ok((self.forward_k5(input, ctx, stream)?, None)),
+        }
+    }
+
+    /// Execute the unfused shared-expert blend for the GLM K=5 exactness
+    /// oracle after [`Self::forward_k5_for_hc`] returned `Some(gate)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_k5_deferred_shared_blend(
+        &self,
+        routed: DevicePtr,
+        shared: DevicePtr,
+        input: DevicePtr,
+        gate_weight: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Moe(m) => {
+                m.finish_k5_deferred_shared_blend(routed, shared, input, gate_weight, ctx, stream)
+            }
+            _ => anyhow::bail!("deferred K=5 shared blend requires a MoE FFN"),
+        }
+    }
+
     /// Whether the K=m (m<=8) batched-GEMV verify FFN is available (dense
     /// only — MoE / missing batch4/batch8 kernel / non-NVFP4 weights →
     /// false). Lets callers gate branch entry BEFORE computing the pre-FFN

@@ -356,25 +356,49 @@ impl Qwen3AttentionLayer {
         // Other MLA architectures retain their established sequential path.
         let glm_batched_ffn = ctx.config.model_type == "glm5_next" && matches!(n, 3 | 5);
         if glm_batched_ffn {
-            let moe_out = if n == 3 {
+            let (moe_out, deferred_shared_gate) = if n == 3 {
                 self.ffn.forward_k3(c.normed, ctx, stream)?;
-                ctx.buffers.moe_output()
+                (ctx.buffers.moe_output(), None)
             } else {
-                self.ffn.forward_k5(c.normed, ctx, stream)?
+                self.ffn.forward_k5_for_hc(
+                    c.normed,
+                    self.hc_post_moe_blend_k.0 != 0,
+                    ctx,
+                    stream,
+                )?
             };
-            ops::hc_post(
-                ctx.gpu,
-                self.hc_post_k,
-                moe_out,
-                hc_streams,
-                post,
-                comb,
-                hc_streams,
-                n as u32,
-                h as u32,
-                hc_mult,
-                stream,
-            )?;
+            if let Some(gate_weight) = deferred_shared_gate {
+                ops::hc_post_moe_blend(
+                    ctx.gpu,
+                    self.hc_post_moe_blend_k,
+                    moe_out,
+                    ctx.buffers.attn_output(),
+                    c.normed,
+                    gate_weight,
+                    hc_streams,
+                    post,
+                    comb,
+                    hc_streams,
+                    n as u32,
+                    h as u32,
+                    hc_mult,
+                    stream,
+                )?;
+            } else {
+                ops::hc_post(
+                    ctx.gpu,
+                    self.hc_post_k,
+                    moe_out,
+                    hc_streams,
+                    post,
+                    comb,
+                    hc_streams,
+                    n as u32,
+                    h as u32,
+                    hc_mult,
+                    stream,
+                )?;
+            }
         } else {
             for i in 0..n {
                 let normed2_i = c.normed.offset(i * c.h * c.bf16);

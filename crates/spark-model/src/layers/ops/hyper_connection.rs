@@ -194,6 +194,42 @@ pub fn hc_post_bf16_add(
         .launch(stream)
 }
 
+/// Fuse GLM's exact BF16 shared-expert blend into the immediately following
+/// mHC post-step. The kernel retains the blend's explicit BF16 rounding before
+/// feeding the value into the FP32 hyperconnection highway.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_post_moe_blend(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    routed: DevicePtr,
+    shared: DevicePtr,
+    normed: DevicePtr,
+    gate_weight: DevicePtr,
+    residual: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(routed)
+        .arg_ptr(shared)
+        .arg_ptr(normed)
+        .arg_ptr(gate_weight)
+        .arg_ptr(residual)
+        .arg_ptr(post)
+        .arg_ptr(comb)
+        .arg_ptr(out)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .launch(stream)
+}
+
 /// Final collapse before the LM head: a single learned sigmoid-weighted sum
 /// over the `hc_mult` streams. One block per token.
 #[allow(clippy::too_many_arguments)]

@@ -6,6 +6,65 @@
 use super::*;
 
 impl MoeLayer {
+    /// Materialize the established shared-expert blend after
+    /// [`forward_k5_for_hc`] deferred it. Used only by the one-shot exactness
+    /// oracle; the optimized path consumes the same operands in mHC directly.
+    pub fn finish_k5_deferred_shared_blend(
+        &self,
+        routed: DevicePtr,
+        shared: DevicePtr,
+        input: DevicePtr,
+        gate_weight: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            gate_weight.0 == self.weights.shared_expert_gate.weight.0,
+            "GLM K=5 deferred shared gate does not belong to this MoE layer"
+        );
+        ops::moe_batched_blend(
+            ctx.gpu,
+            self.moe_batched_blend,
+            routed,
+            shared,
+            input,
+            gate_weight,
+            ctx.config.hidden_size as u32,
+            5,
+            stream,
+        )
+    }
+
+    /// K=5 variant for a caller that can consume the shared-expert blend
+    /// directly inside its hyperconnection post kernel. The returned optional
+    /// pointer is the shared gate weight; `Some` means `moe_output` contains
+    /// the globally reduced routed contribution while `attn_output` contains
+    /// the unblended shared contribution.
+    pub fn forward_k5_for_hc(
+        &self,
+        input: DevicePtr,
+        allow_deferred_shared_hc: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<(DevicePtr, Option<DevicePtr>)> {
+        let defer = allow_deferred_shared_hc
+            && std::env::var("ATLAS_GLM_K5_FUSED_MOE_HC").as_deref() == Ok("1")
+            && self.use_t_layout_for_prefill()
+            && std::env::var("ATLAS_GLM_K5_GROUPED_MOE").as_deref() == Ok("1")
+            && ctx.config.model_type == "glm5_next"
+            && ctx.config.ep_world_size == 2
+            && ctx.comm.is_some()
+            && ctx.config.shared_expert_intermediate_size > 0;
+        if defer {
+            self.forward_prefill_impl(input, 5, ctx, stream, true)?;
+            return Ok((
+                ctx.buffers.moe_output(),
+                Some(self.weights.shared_expert_gate.weight),
+            ));
+        }
+        Ok((self.forward_k5(input, ctx, stream)?, None))
+    }
+
     /// Returns the buffer containing five output rows. The optimized arm is
     /// intentionally restricted to GLM's unified NVFP4, ungated-shared layout.
     pub fn forward_k5(

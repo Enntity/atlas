@@ -384,6 +384,79 @@ extern "C" __global__ void hc_post_bf16_add(
     }
 }
 
+// Exact GLM K=5 MoE seam. The established path first rounds
+//   routed + sigmoid(dot(normed, gate)) * shared
+// to BF16 in moe_batched_blend, then hc_post converts that BF16 value back to
+// FP32. Preserve that explicit round trip while avoiding the intermediate
+// [T,H] store and a separate kernel launch.
+extern "C" __global__ void hc_post_moe_blend(
+    const __nv_bfloat16* __restrict__ routed,       // [T, H], EP-reduced
+    const __nv_bfloat16* __restrict__ shared,       // [T, H]
+    const __nv_bfloat16* __restrict__ normed,       // [T, H]
+    const __nv_bfloat16* __restrict__ gate_weight,  // [H], nullable
+    const float* __restrict__ residual,             // [T, hc, H]
+    const float* __restrict__ post,                 // [T, hc]
+    const float* __restrict__ comb,                 // [T, hc, hc]
+    float* __restrict__ out,                        // [T, hc, H]
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    __shared__ float dot_partial[8];
+
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid / 32;
+    const unsigned int lane = tid % 32;
+    const unsigned int H = hidden_size;
+    const unsigned int hc = hc_mult;
+
+    const __nv_bfloat16* r = routed + (size_t)t * H;
+    const __nv_bfloat16* s = shared + (size_t)t * H;
+    const __nv_bfloat16* n = normed + (size_t)t * H;
+    const float* res = residual + (size_t)t * hc * H;
+    const float* p = post + (size_t)t * hc;
+    const float* c = comb + (size_t)t * hc * hc;
+    float* o = out + (size_t)t * hc * H;
+
+    float local_dot = 0.0f;
+    if (gate_weight != 0) {
+        for (unsigned int d = tid; d < H; d += HC_BLOCK) {
+            local_dot += __bfloat162float(n[d]) * __bfloat162float(gate_weight[d]);
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_dot += __shfl_down_sync(0xFFFFFFFF, local_dot, offset);
+    }
+    if (lane == 0) dot_partial[warp_id] = local_dot;
+    __syncthreads();
+    if (tid == 0) {
+        if (gate_weight == 0) {
+            dot_partial[0] = 1.0f;
+        } else {
+            float total = 0.0f;
+            for (unsigned int w = 0; w < HC_BLOCK / 32; ++w) total += dot_partial[w];
+            dot_partial[0] = 1.0f / (1.0f + __expf(-total));
+        }
+    }
+    __syncthreads();
+    const float gate = dot_partial[0];
+
+    for (unsigned int d = tid; d < H; d += HC_BLOCK) {
+        const float routed_f = __bfloat162float(r[d]);
+        const float shared_f = __bfloat162float(s[d]);
+        const __nv_bfloat16 blended = __float2bfloat16(routed_f + gate * shared_f);
+        const float xd = __bfloat162float(blended);
+        float rv[HC_MAX_MULT];
+        for (unsigned int i = 0; i < hc; ++i) rv[i] = res[i * H + d];
+        for (unsigned int j = 0; j < hc; ++j) {
+            float acc = p[j] * xd;
+            for (unsigned int i = 0; i < hc; ++i) acc += c[i * hc + j] * rv[i];
+            o[j * H + d] = acc;
+        }
+    }
+}
+
 // ── hc_head ──
 // Final collapse: streams [T, hc, H] -> y_out [T, H] via a single learned
 // sigmoid-weighted sum.  Grid: (T,1,1)  Block: (256,1,1).

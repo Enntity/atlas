@@ -65,6 +65,17 @@ fn verify_fused_tp_hc_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_K5_FUSED_TP_HC").ok().as_deref() == Some("1"))
 }
 
+fn verify_fused_moe_hc_check_once() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    *ENABLED.get_or_init(|| {
+        std::env::var("ATLAS_GLM_K5_FUSED_MOE_HC_CHECK")
+            .ok()
+            .as_deref()
+            == Some("1")
+    }) && !CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Glm5KdaLayer {
     input_norm: DenseWeight,
     post_attn_norm: DenseWeight,
@@ -110,6 +121,7 @@ pub struct Glm5KdaLayer {
     hc_pre_from_raw_mix_k: KernelHandle,
     hc_post_k: KernelHandle,
     hc_post_bf16_add_k: KernelHandle,
+    hc_post_moe_blend_k: KernelHandle,
     hc_contract_k: KernelHandle,
 }
 
@@ -229,6 +241,7 @@ impl Glm5KdaLayer {
             hc_pre_from_raw_mix_k: gpu.kernel("hyper_connection", "hc_pre_from_raw_mix")?,
             hc_post_k: gpu.kernel("hyper_connection", "hc_post")?,
             hc_post_bf16_add_k: super::try_kernel(gpu, "hyper_connection", "hc_post_bf16_add"),
+            hc_post_moe_blend_k: super::try_kernel(gpu, "hyper_connection", "hc_post_moe_blend"),
             hc_contract_k: gpu.kernel("hyper_connection", "hc_contract")?,
         })
     }
@@ -860,6 +873,7 @@ impl Glm5KdaLayer {
             stream,
         )?;
         profile::step(ctx, stream, &mut profile_timer, "hc_ffn_norm")?;
+        let mut deferred_shared_gate = None;
         let ffn_out = if capture_verify_intermediates && tokens == 2 {
             self.ffn.forward_k2(normed, ctx, stream)?;
             ctx.buffers.moe_output()
@@ -871,7 +885,11 @@ impl Glm5KdaLayer {
             // parallel K2 routed path while evaluating the shared expert once.
             self.ffn.forward_k4(normed, ctx, stream)?
         } else if capture_verify_intermediates && tokens == 5 && verify_batched_ffn_enabled() {
-            self.ffn.forward_k5(normed, ctx, stream)?
+            let (out, gate) =
+                self.ffn
+                    .forward_k5_for_hc(normed, self.hc_post_moe_blend_k.0 != 0, ctx, stream)?;
+            deferred_shared_gate = gate;
+            out
         } else if capture_verify_intermediates {
             self.ffn.forward_batched(normed, tokens, ctx, stream)?;
             ctx.buffers.moe_output()
@@ -882,7 +900,81 @@ impl Glm5KdaLayer {
             ctx.buffers.moe_output()
         };
         profile::step(ctx, stream, &mut profile_timer, "ffn")?;
-        self.hc_post(ffn_out, m, ctx, stream)?;
+        if let Some(gate_weight) = deferred_shared_gate {
+            let run_fused = || {
+                ops::hc_post_moe_blend(
+                    ctx.gpu,
+                    self.hc_post_moe_blend_k,
+                    ffn_out,
+                    ctx.buffers.attn_output(),
+                    normed,
+                    gate_weight,
+                    ctx.buffers.hc_streams(),
+                    ctx.buffers.hc_post(),
+                    ctx.buffers.hc_comb(),
+                    ctx.buffers.hc_streams(),
+                    m,
+                    h,
+                    self.hc.hc_mult as u32,
+                    stream,
+                )
+            };
+            if verify_fused_moe_hc_check_once() {
+                let routed_bytes = tokens * self.hidden_size * size_of::<u16>();
+                let highway_bytes = tokens * self.hc.hc_mult * self.hidden_size * size_of::<f32>();
+                let residual_save = ctx.buffers.expert_gate_out();
+                let routed_save = ctx.buffers.expert_up_out();
+                let fused_save = ctx.buffers.expert_down_out();
+                ctx.gpu.copy_d2d_async(
+                    ctx.buffers.hc_streams(),
+                    residual_save,
+                    highway_bytes,
+                    stream,
+                )?;
+                ctx.gpu
+                    .copy_d2d_async(ffn_out, routed_save, routed_bytes, stream)?;
+                run_fused()?;
+                ctx.gpu.copy_d2d_async(
+                    ctx.buffers.hc_streams(),
+                    fused_save,
+                    highway_bytes,
+                    stream,
+                )?;
+                ctx.gpu.copy_d2d_async(
+                    residual_save,
+                    ctx.buffers.hc_streams(),
+                    highway_bytes,
+                    stream,
+                )?;
+                ctx.gpu
+                    .copy_d2d_async(routed_save, ffn_out, routed_bytes, stream)?;
+                self.ffn.finish_k5_deferred_shared_blend(
+                    ffn_out,
+                    ctx.buffers.attn_output(),
+                    normed,
+                    gate_weight,
+                    ctx,
+                    stream,
+                )?;
+                self.hc_post(ffn_out, m, ctx, stream)?;
+                let mut got = vec![0u8; highway_bytes];
+                let mut want = vec![0u8; highway_bytes];
+                ctx.gpu.copy_d2h(fused_save, &mut got)?;
+                ctx.gpu.copy_d2h(ctx.buffers.hc_streams(), &mut want)?;
+                let mismatches = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+                anyhow::ensure!(
+                    mismatches == 0,
+                    "GLM K=5 fused MoE blend/mHC differs from oracle in {mismatches}/{highway_bytes} bytes"
+                );
+                tracing::info!(
+                    "GLM K=5 fused MoE blend/mHC: exact oracle match ({highway_bytes} bytes)"
+                );
+            } else {
+                run_fused()?;
+            }
+        } else {
+            self.hc_post(ffn_out, m, ctx, stream)?;
+        }
         profile::step(ctx, stream, &mut profile_timer, "hc_ffn_post")?;
 
         if self.layer_idx + 1 == ctx.config.num_hidden_layers {

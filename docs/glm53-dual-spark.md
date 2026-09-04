@@ -815,3 +815,26 @@ prompt, steady proposer windows improved from 13.791 ms mean / 13.780 ms
 median to 13.654 ms mean / 13.640 ms median (-1.0% for both). Raw endpoint
 throughput was inconclusive because accepted-draft counts varied, so the
 direct proposer timing is the performance claim.
+
+### Fused K=5 shared-expert blend and mHC post
+
+GLM's K=5 MoE path previously materialized the BF16 sum of the globally
+reduced routed experts and sigmoid-gated shared expert, then immediately read
+that temporary into the hyperconnection post kernel. With
+`GLM_K5_FUSED_MOE_HC=1`, the mHC kernel consumes the routed contribution,
+shared contribution, input row, and shared gate directly. It preserves the
+original FP32 reduction and sigmoid, including the explicit BF16 rounding at
+the former kernel boundary, while removing one launch and one complete
+five-row output store/read per MoE layer. The optimization is restricted to
+GLM's exact K=5, EP=2 grouped path; the launcher defaults it on and `=0`
+retains the established implementation.
+
+The one-shot `GLM_K5_FUSED_MOE_HC_CHECK=1` oracle reruns the old blend and mHC
+post and compares the complete hyperconnection state. Both ranks matched all
+327,680 bytes exactly. Across steady draft-forward samples, the fused path
+improved from 110.736 ms mean / 110.900 ms median to 110.397 ms mean /
+110.450 ms median (-0.31% / -0.41%). One-warm-up, five-request endpoint A/B
+testing normalized by target steps improved from 136.43 ms to 135.17 ms mean
+(-0.92%); medians were 135.75 ms and 135.52 ms. Raw token rates remain
+acceptance-dependent, so the normalized and direct phase measurements are the
+reliable claims.
