@@ -22,7 +22,8 @@ impl SparseIndexCacheConfig {
         }
     }
 
-    /// Total values + scales bytes carried by one physical KV block.
+    /// Total pooled values, optional scales, and the four-token staging tail
+    /// carried by one physical KV block.
     pub fn block_bytes(self, kv_block_size: usize) -> Result<usize> {
         if self.tokens_per_pool == 0 || self.head_dim == 0 {
             bail!("sparse index cache dimensions must be non-zero");
@@ -33,7 +34,9 @@ impl SparseIndexCacheConfig {
                 self.tokens_per_pool
             );
         }
-        Ok(self.values_block_bytes(kv_block_size) + self.scales_block_bytes(kv_block_size))
+        Ok(self.values_block_bytes(kv_block_size)
+            + self.scales_block_bytes(kv_block_size)
+            + self.tail_block_bytes(kv_block_size))
     }
 
     pub(super) fn entries_per_block(self, kv_block_size: usize) -> usize {
@@ -55,6 +58,13 @@ impl SparseIndexCacheConfig {
                 self.entries_per_block(kv_block_size) * std::mem::size_of::<f32>()
             }
         }
+    }
+
+    /// Uncompressed keys and gates for the pool currently being assembled.
+    /// Keeping this paged (rather than in per-layer scalar state) makes a
+    /// prefill/decode seam and interleaved sequences obey identical ownership.
+    pub(super) fn tail_block_bytes(self, kv_block_size: usize) -> usize {
+        kv_block_size * self.head_dim * 2 * std::mem::size_of::<u16>()
     }
 }
 

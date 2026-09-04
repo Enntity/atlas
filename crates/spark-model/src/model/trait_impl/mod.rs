@@ -827,6 +827,11 @@ impl Model for TransformerModel {
     fn is_mla(&self) -> bool {
         self.is_mla_dispatch()
     }
+    fn supports_chunked_mla(&self) -> bool {
+        self.config.model_type == "glm5_next"
+            && self.config.index_kpool > 0
+            && self.config.index_topk > 0
+    }
 
     fn kv_block_size(&self) -> Option<usize> {
         Some(self.kv_cache.lock().block_size())

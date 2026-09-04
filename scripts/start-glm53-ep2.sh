@@ -20,7 +20,10 @@ PORT="${PORT:-8888}"
 BIND_ADDRESS="${BIND_ADDRESS:-0.0.0.0}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
-MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-$MAX_SEQ_LEN}"
+# Keep scratch and the live chunk bounded when only the context window is
+# raised. Long prompts stream through the paged cache in these 1024-token
+# chunks; callers can still opt into a measured larger chunk explicitly.
+MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-1024}"
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 TP_SIZE="${TP_SIZE:-1}"
@@ -68,9 +71,9 @@ GLM_MTP_SERIAL_PREFILL="${GLM_MTP_SERIAL_PREFILL:-0}"
 # The serial path remains an explicit correctness/debugging oracle.
 GLM_MTP_BATCHED_PREFILL="${GLM_MTP_BATCHED_PREFILL:-$SPECULATIVE}"
 
-if (( MAX_SEQ_LEN > 2048 )); then
-  echo "ERROR: initial GLM-5.3 Atlas support is capped at 2048 tokens." >&2
-  echo "Its sparse-attention layers use exact dense attention only while seq_len <= index_topk (2048)." >&2
+MODEL_MAX_SEQ_LEN=1048576
+if (( MAX_SEQ_LEN > MODEL_MAX_SEQ_LEN )); then
+  echo "ERROR: MAX_SEQ_LEN exceeds GLM-5.3's ${MODEL_MAX_SEQ_LEN}-token model limit." >&2
   exit 2
 fi
 

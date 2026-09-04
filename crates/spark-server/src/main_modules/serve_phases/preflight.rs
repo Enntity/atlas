@@ -29,6 +29,19 @@ fn glm5_concurrency_supported(max_batch: usize, max_num_seqs: usize, ep_v2: bool
         && (max_batch == 1 || ep_v2)
 }
 
+fn glm5_context_supported(max_seq_len: usize, max_prefill_tokens: usize, model_max: usize) -> bool {
+    max_seq_len <= model_max && max_prefill_tokens > 0
+}
+
+fn glm5_long_context_concurrency_supported(
+    max_seq_len: usize,
+    index_topk: usize,
+    max_batch: usize,
+    max_num_seqs: usize,
+) -> bool {
+    max_seq_len <= index_topk || (max_batch == 1 && max_num_seqs == 1)
+}
+
 pub(crate) fn preflight_reserve(
     args: &cli::ServeArgs,
     config: &ModelConfig,
@@ -36,14 +49,29 @@ pub(crate) fn preflight_reserve(
 ) -> Result<ReservePreflight> {
     if config.model_type == "glm5_next" {
         anyhow::ensure!(
-            args.max_seq_len <= 2048,
-            "GLM-5 initial Atlas support is intentionally capped at --max-seq-len 2048: index_topk=2048 makes dense MLA exact only within this window"
+            glm5_context_supported(
+                args.max_seq_len,
+                args.max_prefill_tokens,
+                config.max_position_embeddings,
+            ),
+            "GLM-5 requires --max-seq-len <= {} and a non-zero --max-prefill-tokens for bounded chunked prefill",
+            config.max_position_embeddings,
         );
         let ep_v2 = matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"));
         anyhow::ensure!(
             glm5_concurrency_supported(args.max_batch_size, args.max_num_seqs, ep_v2),
             "GLM-5 dual-Spark concurrency supports --max-batch-size 1..=3 and \
              --max-num-seqs max_batch..=5; batches above one require ATLAS_EP_PROTOCOL=v2"
+        );
+        anyhow::ensure!(
+            glm5_long_context_concurrency_supported(
+                args.max_seq_len,
+                config.index_topk,
+                args.max_batch_size,
+                args.max_num_seqs,
+            ),
+            "GLM-5 context above index_topk={} is currently limited to one active/admitted sequence until batched sparse MLA decode is wired",
+            config.index_topk,
         );
         anyhow::ensure!(
             !(args.self_speculative || args.ngram_speculative),
@@ -322,7 +350,10 @@ pub(crate) fn preflight_reserve(
 
 #[cfg(test)]
 mod tests {
-    use super::{glm5_concurrency_supported, glm5_dual_spark_parallelism};
+    use super::{
+        glm5_concurrency_supported, glm5_context_supported, glm5_dual_spark_parallelism,
+        glm5_long_context_concurrency_supported,
+    };
 
     #[test]
     fn glm5_accepts_ep_fallback_and_overlapping_tp2_only() {
@@ -341,6 +372,22 @@ mod tests {
         assert!(!glm5_concurrency_supported(4, 5, true));
         assert!(!glm5_concurrency_supported(3, 2, true));
         assert!(!glm5_concurrency_supported(3, 6, true));
+    }
+
+    #[test]
+    fn glm5_long_context_stays_within_model_limit_and_uses_chunking() {
+        assert!(glm5_context_supported(100_000, 1024, 1_048_576));
+        assert!(!glm5_context_supported(1_048_577, 1024, 1_048_576));
+        assert!(!glm5_context_supported(100_000, 0, 1_048_576));
+    }
+
+    #[test]
+    fn glm5_long_context_is_single_sequence_until_batched_sparse_decode_lands() {
+        assert!(glm5_long_context_concurrency_supported(100_000, 2048, 1, 1));
+        assert!(!glm5_long_context_concurrency_supported(
+            100_000, 2048, 2, 2
+        ));
+        assert!(glm5_long_context_concurrency_supported(2048, 2048, 3, 5));
     }
 }
 

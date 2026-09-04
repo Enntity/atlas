@@ -405,6 +405,48 @@ impl Qwen3AttentionLayer {
                 "mla_prefill_attn_320",
             ),
             grouped_gemm_mla_k: gate(probes.mla, gpu, "grouped_gemm_mla", "grouped_gemm_mla"),
+            glm_index_layernorm_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "glm_indexer",
+                "glm_index_layernorm_bf16",
+            ),
+            glm_index_tail_write_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "glm_indexer",
+                "glm_index_tail_write_bf16",
+            ),
+            glm_index_kpool_finalize_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "glm_indexer",
+                "glm_index_kpool_finalize_bf16",
+            ),
+            glm_index_fill_causal_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "glm_indexer",
+                "glm_index_fill_causal",
+            ),
+            glm_index_logits_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "glm_indexer",
+                "glm_index_logits_bf16",
+            ),
+            glm_index_topk_expand_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "glm_indexer",
+                "glm_index_topk_expand",
+            ),
+            glm_sparse_attn_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "glm_indexer",
+                "glm_sparse_mla_prefill_bf16",
+            ),
             mla_q_final_assemble_k: gate(
                 probes.mla,
                 gpu,

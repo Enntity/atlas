@@ -56,7 +56,7 @@ impl Qwen3AttentionLayer {
             eps,
             bs,
             stream,
-            pos: _,
+            pos,
         } = *args;
         let mla = self
             .mla
@@ -383,27 +383,58 @@ impl Qwen3AttentionLayer {
         // Step 8: Paged decode attention
         let attn_out = ctx.buffers.attn_output();
         let inv_sqrt_d = self.effective_attn_scale(hd);
+        let sparse_indices = if mla.glm_indexer.is_some() {
+            pos.map(|token_pos| {
+                self.glm_index_decode_update_and_select(
+                    normed, q_latent, token_pos, kv_cache, ctx, stream,
+                )
+            })
+            .transpose()?
+            .flatten()
+        } else {
+            None
+        };
         prof!("paged_attn", {
-            ops::paged_decode_attn_bf16(
-                ctx.gpu,
-                self.paged_decode_mla_k,
-                q_absorbed_buf,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
-                attn_out,
-                meta.block_table,
-                meta.seq_len,
-                meta.max_blocks_per_seq,
-                1,
-                nq,
-                1,
-                mla_cache_dim,
-                bs as u32,
-                inv_sqrt_d,
-                nq * mla_cache_dim,
-                0,
-                stream,
-            )
+            if let Some((indices, index_width)) = sparse_indices {
+                ops::glm_sparse_mla_prefill(
+                    ctx.gpu,
+                    self.glm_sparse_attn_k,
+                    q_absorbed_buf,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    indices,
+                    attn_out,
+                    meta.block_table,
+                    1,
+                    nq,
+                    mla_cache_dim,
+                    index_width,
+                    kv_cache.block_size() as u32,
+                    inv_sqrt_d,
+                    stream,
+                )
+            } else {
+                ops::paged_decode_attn_bf16(
+                    ctx.gpu,
+                    self.paged_decode_mla_k,
+                    q_absorbed_buf,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    attn_out,
+                    meta.block_table,
+                    meta.seq_len,
+                    meta.max_blocks_per_seq,
+                    1,
+                    nq,
+                    1,
+                    mla_cache_dim,
+                    bs as u32,
+                    inv_sqrt_d,
+                    nq * mla_cache_dim,
+                    0,
+                    stream,
+                )
+            }
         })?;
 
         // Step 9: V extraction (batched GEMV)

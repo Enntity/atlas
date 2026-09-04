@@ -89,12 +89,11 @@ fn test_sparse_index_cache_geometry_and_budgeting() {
     let cfg = test_config();
     let index = SparseIndexCacheConfig::bf16(4, 128);
 
-    // One pooled 128-wide BF16 key per four source tokens. A 16-token
-    // physical KV block therefore carries four 256-byte index keys.
-    assert_eq!(index.block_bytes(cfg.block_size).unwrap(), 1024);
+    // Four pooled keys plus raw key+gate staging for all 16 token offsets.
+    assert_eq!(index.block_bytes(cfg.block_size).unwrap(), 9216);
     assert_eq!(
         PagedKvCache::compute_num_blocks_with_sparse_index(&cfg, index, 1_000_000).unwrap(),
-        1_000_000 / (196_608 + 12 * 1024)
+        1_000_000 / (196_608 + 12 * 9216)
     );
 }
 
@@ -111,6 +110,8 @@ fn test_sparse_index_cache_attaches_to_each_layer() {
         cache.sparse_index_pool_ptr(1)
     );
     assert_eq!(cache.sparse_index_block_stride_bytes(0), 1024);
+    assert!(!cache.sparse_index_tail_pool_ptr(0).is_null());
+    assert_eq!(cache.sparse_index_tail_block_stride_bytes(0), 8192);
     assert_eq!(cache.sparse_index_config(), Some(index));
 }
 

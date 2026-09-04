@@ -58,19 +58,43 @@ quantization is lossy. Hybrid dense/MoE models allocate about 78 MiB of shared
 scratch per rank at the guarded 1,280-token test size; pure MoE models still
 allocate none.
 
-This checkpoint declares 1M model context, but initial Atlas support does not.
-GLM's full-attention layers select 2,048 tokens using an indexer. Atlas currently
-uses causally masked dense attention for those layers, which is mathematically
-equivalent while the entire sequence is no longer than `index_topk=2048`.
-Startup therefore rejects values above 2,048 rather than silently changing the
-model. KDA recurrent state is FP32 and allocated for one sequence; increasing
-concurrency multiplies that state and should follow a measured memory audit.
+This checkpoint declares a 1,048,576-token model context. Atlas uses causally
+masked dense MLA through `index_topk=2048`, then the checkpoint's 32-head,
+128-wide semantic index to select 2,048 raw history tokens from four-token
+pools. Pooled keys and unfinished raw key/gate groups share the main KV cache's
+physical block IDs, so chunk boundaries, recycled blocks, and a later
+multi-sequence implementation have one ownership model. The launcher rejects
+only values above the checkpoint limit.
 
-`MAX_PREFILL_TOKENS` is independent of `MAX_SEQ_LEN`. It still defaults to the
-context limit during the guarded 2,048-token phase, but the separation is
-required for long context: a future 100K launch will keep the reusable
-activation arena at a 1K--2K chunk while paged persistent state grows across
-the full request. It does not bypass the semantic-indexer cap above.
+`MAX_PREFILL_TOKENS` is independent of `MAX_SEQ_LEN` and defaults to 1,024.
+Long prompts stream through that reusable activation arena while paged
+persistent state grows across the request. Atlas accepts arbitrary scheduler
+chunk boundaries: raw index inputs are staged by physical token offset, and a
+separate stream-ordered kernel finalizes every completed four-token pool.
+
+## Guarded 100K launch
+
+The first long-context milestone keeps BF16 KV and admits one sequence:
+
+```bash
+MAX_SEQ_LEN=100000 \
+MAX_PREFILL_TOKENS=1024 \
+MAX_BATCH_SIZE=1 \
+MAX_NUM_SEQS=1 \
+./scripts/start-glm53-ep2.sh
+```
+
+On the measured TP2+EP2 pair at a 90% GPU budget and 4 GiB OOM guard, startup
+left 9.1/9.8 GiB available on the two hosts and allocated capacity for 275,696
+KV tokens per rank. A warmed 10,000-token prompt completed coherently at 251.6
+prefill tok/s and 9.47 decode tok/s. An independent 10,000-token prompt with an
+early `QUARTZ-9051` needle recovered that exact value. These are correctness
+receipts for the scalar sparse baseline, not the final performance target.
+
+BF16 is deliberate for the first 100K correctness gate. FP8 halves the main KV
+value width and should improve capacity and bandwidth, but it needs its own
+needle/coherence A/B because quantization can change attention rankings. The
+semantic index is also BF16 in this milestone.
 
 ## Guarded concurrency launch
 

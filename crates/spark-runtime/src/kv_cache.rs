@@ -413,8 +413,10 @@ struct LayerPool {
     dtype: KvCacheDtype,
     sparse_index_values: DevicePtr,
     sparse_index_scales: DevicePtr,
+    sparse_index_tail: DevicePtr,
     sparse_index_values_block_stride: usize,
     sparse_index_scales_block_stride: usize,
+    sparse_index_tail_block_stride: usize,
 }
 
 /// Paged KV cache across all attention layers.
@@ -456,6 +458,7 @@ impl atlas_core::scope::ModelResource<dyn crate::gpu::GpuBackend> for PagedKvCac
                 layer.v_pool,
                 layer.sparse_index_values,
                 layer.sparse_index_scales,
+                layer.sparse_index_tail,
             ] {
                 if ptr.is_null() {
                     continue;

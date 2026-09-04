@@ -1,0 +1,375 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// GLM-5.3 four-token semantic-index primitives. The correctness baseline
+// stores pooled keys as BF16; the later FP8 path adds a Hadamard bookend and a
+// per-vector scale without changing the pool addressing established here.
+
+#include <cuda_bf16.h>
+#include <math.h>
+
+extern "C" __global__ void glm_index_layernorm_bf16(
+    __nv_bfloat16* __restrict__ values,
+    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ bias,
+    unsigned int rows,
+    unsigned int dim,
+    float eps) {
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float reduce[];
+    __nv_bfloat16* x = values + (unsigned long long)row * dim;
+    float sum = 0.0f;
+    for (unsigned int d = threadIdx.x; d < dim; d += blockDim.x) {
+        sum += __bfloat162float(x[d]);
+    }
+    reduce[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float mean = reduce[0] / (float)dim;
+    float sq = 0.0f;
+    for (unsigned int d = threadIdx.x; d < dim; d += blockDim.x) {
+        const float centered = __bfloat162float(x[d]) - mean;
+        sq += centered * centered;
+    }
+    reduce[threadIdx.x] = sq;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inv_std = rsqrtf(reduce[0] / (float)dim + eps);
+    for (unsigned int d = threadIdx.x; d < dim; d += blockDim.x) {
+        const float y = (__bfloat162float(x[d]) - mean) * inv_std
+                      * __bfloat162float(weight[d]) + __bfloat162float(bias[d]);
+        x[d] = __float2bfloat16(y);
+    }
+}
+
+// Persist the raw key and gate for every token in the physical block that owns
+// it. This is deliberately a separate launch from finalization: CUDA provides
+// stream ordering between launches, while different CTAs in one launch cannot
+// safely publish and consume the four members of a pool.
+extern "C" __global__ void glm_index_tail_write_bf16(
+    const __nv_bfloat16* __restrict__ keys,
+    const __nv_bfloat16* __restrict__ gates,
+    __nv_bfloat16* __restrict__ tail,
+    const long long* __restrict__ slots,
+    unsigned int num_tokens,
+    unsigned int block_size,
+    unsigned int pool_size,
+    unsigned int head_dim,
+    unsigned long long tail_block_stride_bytes) {
+    const unsigned int token = blockIdx.x;
+    if (token >= num_tokens) return;
+    const long long slot = slots[token];
+    if (slot < 0) return;
+    const unsigned int physical_block = (unsigned int)(slot / block_size);
+    const unsigned int raw_offset = (unsigned int)(slot % block_size);
+    __nv_bfloat16* block_tail = (__nv_bfloat16*)((char*)tail
+        + (unsigned long long)physical_block * tail_block_stride_bytes);
+    __nv_bfloat16* key_dst = block_tail + (unsigned long long)raw_offset * head_dim;
+    __nv_bfloat16* gate_dst = block_tail
+        + (unsigned long long)block_size * head_dim
+        + (unsigned long long)raw_offset * head_dim;
+    const __nv_bfloat16* key_src = keys + (unsigned long long)token * head_dim;
+    const __nv_bfloat16* gate_src = gates + (unsigned long long)token * head_dim;
+    for (unsigned int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        key_dst[d] = key_src[d];
+        gate_dst[d] = gate_src[d];
+    }
+}
+
+// Finalize every pool-ending token after all raw keys/gates in this chunk have
+// been published by the preceding stream-ordered launch. Addressing by raw
+// physical-block offset makes arbitrary scheduler chunk boundaries exact.
+extern "C" __global__ void glm_index_kpool_finalize_bf16(
+    const __nv_bfloat16* __restrict__ tail,
+    const __nv_bfloat16* __restrict__ ape,
+    __nv_bfloat16* __restrict__ cache,
+    const long long* __restrict__ slots,
+    unsigned int num_tokens,
+    unsigned int block_size,
+    unsigned int pool_size,
+    unsigned int head_dim,
+    unsigned long long tail_block_stride_bytes,
+    unsigned long long values_block_stride_bytes) {
+    const unsigned int token = blockIdx.x;
+    if (token >= num_tokens || pool_size != 4) return;
+    const long long slot = slots[token];
+    if (slot < 0) return;
+    const unsigned int physical_block = (unsigned int)(slot / block_size);
+    const unsigned int raw_offset = (unsigned int)(slot % block_size);
+    if (raw_offset % pool_size != pool_size - 1) return;
+    const __nv_bfloat16* block_tail = (const __nv_bfloat16*)((const char*)tail
+        + (unsigned long long)physical_block * tail_block_stride_bytes);
+    const unsigned int first = raw_offset - (pool_size - 1);
+    const __nv_bfloat16* tail_keys = block_tail
+        + (unsigned long long)first * head_dim;
+    const __nv_bfloat16* tail_gates = block_tail
+        + (unsigned long long)block_size * head_dim
+        + (unsigned long long)first * head_dim;
+    __nv_bfloat16* dst = (__nv_bfloat16*)((char*)cache
+        + (unsigned long long)physical_block * values_block_stride_bytes)
+        + (unsigned long long)(raw_offset / pool_size) * head_dim;
+    for (unsigned int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float score[4];
+        float max_score = -INFINITY;
+#pragma unroll
+        for (unsigned int i = 0; i < 4; ++i) {
+            score[i] = __bfloat162float(tail_gates[(unsigned long long)i * head_dim + d])
+                     + __bfloat162float(ape[(unsigned long long)i * head_dim + d]);
+            max_score = fmaxf(max_score, score[i]);
+        }
+        float denom = 0.0f;
+        float weighted = 0.0f;
+#pragma unroll
+        for (unsigned int i = 0; i < 4; ++i) {
+            const float p = expf(score[i] - max_score);
+            denom += p;
+            weighted += p * __bfloat162float(
+                tail_keys[(unsigned long long)i * head_dim + d]);
+        }
+        dst[d] = __float2bfloat16(weighted / denom);
+    }
+}
+
+extern "C" __global__ void glm_index_fill_causal(
+    int* __restrict__ output,
+    unsigned int rows,
+    unsigned int seq_len_start,
+    unsigned int width) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int col = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row >= rows || col >= width) return;
+    const unsigned int query_pos = seq_len_start + row;
+    output[(unsigned long long)row * width + col] = col <= query_pos ? (int)col : -1;
+}
+
+// Eight warps score eight pooled keys per CTA. Each warp holds one pool and
+// accumulates its 32 index-head dot products without materializing headwise
+// logits. The cache remains paged with the main KV block table.
+extern "C" __global__ void glm_index_logits_bf16(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ weights,
+    const __nv_bfloat16* __restrict__ index_cache,
+    float* __restrict__ logits,
+    const unsigned int* __restrict__ block_table,
+    unsigned int rows,
+    unsigned int seq_len_start,
+    unsigned int logits_stride,
+    unsigned int index_heads,
+    unsigned int head_dim,
+    unsigned int pool_size,
+    unsigned int cache_block_size,
+    unsigned long long index_block_stride_bytes) {
+    const unsigned int row = blockIdx.y;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int pool_id = blockIdx.x * 8 + warp;
+    if (row >= rows || pool_id >= logits_stride) return;
+    const unsigned int seq_len = seq_len_start + row + 1;
+    const unsigned int pool_count = seq_len / pool_size;
+    if (pool_id >= pool_count) {
+        if (lane == 0) logits[(unsigned long long)row * logits_stride + pool_id] = -INFINITY;
+        return;
+    }
+
+    const unsigned int raw_pos = pool_id * pool_size;
+    const unsigned int logical_block = raw_pos / cache_block_size;
+    const unsigned int raw_offset = raw_pos % cache_block_size;
+    const unsigned int physical_block = block_table[logical_block];
+    const unsigned int pool_offset = raw_offset / pool_size;
+    const __nv_bfloat16* key = (const __nv_bfloat16*)((const char*)index_cache
+        + (unsigned long long)physical_block * index_block_stride_bytes)
+        + (unsigned long long)pool_offset * head_dim;
+    const __nv_bfloat16* q = query
+        + (unsigned long long)row * index_heads * head_dim;
+    const __nv_bfloat16* w = weights + (unsigned long long)row * index_heads;
+    float score = 0.0f;
+    for (unsigned int head = 0; head < index_heads; ++head) {
+        float dot = 0.0f;
+        for (unsigned int d = lane; d < head_dim; d += 32) {
+            dot += __bfloat162float(q[(unsigned long long)head * head_dim + d])
+                 * __bfloat162float(key[d]);
+        }
+        for (unsigned int offset = 16; offset; offset >>= 1) {
+            dot += __shfl_down_sync(0xffffffff, dot, offset);
+        }
+        if (lane == 0) score += __bfloat162float(w[head]) * fmaxf(dot, 0.0f);
+    }
+    if (lane == 0) {
+        logits[(unsigned long long)row * logits_stride + pool_id] =
+            score * rsqrtf((float)(head_dim * index_heads));
+    }
+}
+
+__device__ __forceinline__ unsigned int glm_ordered_float(float value) {
+    if (isnan(value)) value = -INFINITY;
+    const unsigned int bits = __float_as_uint(value);
+    const unsigned int flip = ((int)bits < 0) ? 0xffffffffu : 0x80000000u;
+    return bits ^ flip;
+}
+
+// Exact per-row top-K for signed FP32 logits using a radix threshold.
+// Once the Kth score's bit pattern is known, all larger pools and enough equal
+// pools are expanded to their four raw token IDs. Ordering is immaterial to
+// attention; ties at the threshold may choose any equivalent pool.
+extern "C" __global__ void glm_index_topk_expand(
+    const float* __restrict__ logits,
+    int* __restrict__ output,
+    unsigned int rows,
+    unsigned int seq_len_start,
+    unsigned int logits_stride,
+    unsigned int topk_tokens,
+    unsigned int pool_size,
+    unsigned int output_width) {
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ unsigned int shared[];
+    unsigned int& prefix = shared[0];
+    unsigned int& rank = shared[1];
+    unsigned int& count = shared[2];
+    unsigned int& written = shared[3];
+    const unsigned int seq_len = seq_len_start + row + 1;
+    const unsigned int pool_count = seq_len / pool_size;
+    const unsigned int pool_budget = topk_tokens / pool_size;
+    const unsigned int select_pools = pool_budget < pool_count ? pool_budget : pool_count;
+    int* out = output + (unsigned long long)row * output_width;
+    for (unsigned int i = threadIdx.x; i < output_width; i += blockDim.x) out[i] = -1;
+    if (threadIdx.x == 0) {
+        prefix = 0;
+        rank = select_pools;
+    }
+    __syncthreads();
+
+    const float* row_logits = logits + (unsigned long long)row * logits_stride;
+    unsigned int mask = 0;
+    for (int bit_idx = 31; bit_idx >= 0; --bit_idx) {
+        if (threadIdx.x == 0) count = 0;
+        __syncthreads();
+        const unsigned int bit = 1u << bit_idx;
+        const unsigned int candidate = prefix | bit;
+        const unsigned int candidate_mask = mask | bit;
+        unsigned int local = 0;
+        for (unsigned int p = threadIdx.x; p < pool_count; p += blockDim.x) {
+            const unsigned int bits = glm_ordered_float(row_logits[p]);
+            local += (bits & candidate_mask) == candidate;
+        }
+        if (local) atomicAdd(&count, local);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            if (count >= rank) prefix = candidate;
+            else rank -= count;
+        }
+        mask = candidate_mask;
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) written = 0;
+    __syncthreads();
+    for (unsigned int p = threadIdx.x; p < pool_count; p += blockDim.x) {
+        const unsigned int bits = glm_ordered_float(row_logits[p]);
+        if (bits > prefix) {
+            const unsigned int dst_pool = atomicAdd(&written, 1u);
+            if (dst_pool < select_pools) {
+                for (unsigned int i = 0; i < pool_size; ++i)
+                    out[dst_pool * pool_size + i] = (int)(p * pool_size + i);
+            }
+        }
+    }
+    __syncthreads();
+    for (unsigned int p = threadIdx.x; p < pool_count; p += blockDim.x) {
+        const unsigned int bits = glm_ordered_float(row_logits[p]);
+        if (bits == prefix) {
+            const unsigned int dst_pool = atomicAdd(&written, 1u);
+            if (dst_pool < select_pools) {
+                for (unsigned int i = 0; i < pool_size; ++i)
+                    out[dst_pool * pool_size + i] = (int)(p * pool_size + i);
+            }
+        }
+    }
+    __syncthreads();
+    const unsigned int tail_start = pool_count * pool_size;
+    const unsigned int tail_count = seq_len - tail_start;
+    for (unsigned int i = threadIdx.x; i < tail_count; i += blockDim.x) {
+        out[topk_tokens + i] = (int)(tail_start + i);
+    }
+}
+
+// Scalar correctness kernel for sparse absorbed MLA. One CTA owns one
+// (query, head), scans the selected raw token IDs, and maintains online
+// softmax while each lane owns two of the 512 output dimensions.
+extern "C" __global__ void glm_sparse_mla_prefill_bf16(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ token_indices,
+    __nv_bfloat16* __restrict__ output,
+    const unsigned int* __restrict__ block_table,
+    unsigned int rows,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int index_width,
+    unsigned int cache_block_size,
+    float inv_sqrt_d) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int row = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    if (row >= rows || head >= num_heads || head_dim != 512) return;
+    extern __shared__ float shared_score[];
+    float* warp_sums = shared_score;
+    float& score_slot = shared_score[8];
+    const __nv_bfloat16* q = query
+        + ((unsigned long long)row * num_heads + head) * head_dim;
+    const int* indices = token_indices + (unsigned long long)row * index_width;
+    const unsigned long long cache_block_stride =
+        (unsigned long long)cache_block_size * head_dim;
+    const float q0 = __bfloat162float(q[tid]);
+    const float q1 = __bfloat162float(q[tid + 256]);
+    float out0 = 0.0f, out1 = 0.0f;
+    float max_logit = -INFINITY, denom = 0.0f;
+
+    for (unsigned int selected = 0; selected < index_width; ++selected) {
+        const int token = indices[selected];
+        if (token < 0) continue;
+        const unsigned int logical_block = (unsigned int)token / cache_block_size;
+        const unsigned int block_offset = (unsigned int)token % cache_block_size;
+        const unsigned int physical_block = block_table[logical_block];
+        const __nv_bfloat16* k = k_cache
+            + (unsigned long long)physical_block * cache_block_stride
+            + (unsigned long long)block_offset * head_dim;
+        const __nv_bfloat16* v = v_cache
+            + (unsigned long long)physical_block * cache_block_stride
+            + (unsigned long long)block_offset * head_dim;
+        float partial = q0 * __bfloat162float(k[tid])
+                      + q1 * __bfloat162float(k[tid + 256]);
+        for (unsigned int offset = 16; offset; offset >>= 1)
+            partial += __shfl_down_sync(0xffffffff, partial, offset);
+        if ((tid & 31) == 0) warp_sums[tid >> 5] = partial;
+        __syncthreads();
+        if (tid < 8) {
+            partial = warp_sums[tid];
+            for (unsigned int offset = 4; offset; offset >>= 1)
+                partial += __shfl_down_sync(0x000000ff, partial, offset);
+            if (tid == 0) score_slot = partial * inv_sqrt_d;
+        }
+        __syncthreads();
+        const float score = score_slot;
+        const float new_max = fmaxf(max_logit, score);
+        const float alpha = expf(max_logit - new_max);
+        const float beta = expf(score - new_max);
+        denom = denom * alpha + beta;
+        out0 = out0 * alpha + beta * __bfloat162float(v[tid]);
+        out1 = out1 * alpha + beta * __bfloat162float(v[tid + 256]);
+        max_logit = new_max;
+        __syncthreads();
+    }
+    __nv_bfloat16* dst = output
+        + ((unsigned long long)row * num_heads + head) * head_dim;
+    const float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
+    dst[tid] = __float2bfloat16(out0 * inv_denom);
+    dst[tid + 256] = __float2bfloat16(out1 * inv_denom);
+}

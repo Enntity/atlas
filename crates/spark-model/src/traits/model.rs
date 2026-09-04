@@ -958,11 +958,18 @@ pub trait Model: Send + Sync {
         )
     }
 
-    /// Multi-head Latent Attention guard. When true, chunked prefill MUST run
-    /// as a single chunk — Atlas has no paged-MLA prefill kernel and
-    /// multi-chunk MLA silently corrupts attention output (see Mistral-Small-4
-    /// 2026-05-01 sweep: 8K collapses to "The\nThe…").
+    /// Multi-head Latent Attention guard. Unless
+    /// [`Self::supports_chunked_mla`] also returns true, the scheduler keeps
+    /// the remaining prefill in one chunk because legacy MLA kernels do not
+    /// read prior paged history.
     fn is_mla(&self) -> bool {
+        false
+    }
+
+    /// Whether this MLA implementation reads prior paged history during
+    /// chunked prefill. Most MLA architectures still require one chunk; GLM-5
+    /// overrides this after maintaining its checkpoint semantic index.
+    fn supports_chunked_mla(&self) -> bool {
         false
     }
 

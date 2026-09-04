@@ -21,7 +21,9 @@ impl PagedKvCache {
         spec.block_bytes(self.config.block_size)?;
         let values_stride = spec.values_block_bytes(self.config.block_size);
         let scales_stride = spec.scales_block_bytes(self.config.block_size);
-        let mut allocations: Vec<(DevicePtr, DevicePtr)> = Vec::with_capacity(self.layers.len());
+        let tail_stride = spec.tail_block_bytes(self.config.block_size);
+        let mut allocations: Vec<(DevicePtr, DevicePtr, DevicePtr)> =
+            Vec::with_capacity(self.layers.len());
         for _ in 0..self.layers.len() {
             let values = match gpu.alloc(self.num_blocks * values_stride) {
                 Ok(ptr) => ptr,
@@ -42,13 +44,26 @@ impl PagedKvCache {
                     }
                 }
             };
-            allocations.push((values, scales));
+            let tail = match gpu.alloc(self.num_blocks * tail_stride) {
+                Ok(ptr) => ptr,
+                Err(error) => {
+                    let _ = gpu.free(values);
+                    if !scales.is_null() {
+                        let _ = gpu.free(scales);
+                    }
+                    free_allocations(gpu, allocations);
+                    return Err(error);
+                }
+            };
+            allocations.push((values, scales, tail));
         }
-        for (layer, (values, scales)) in self.layers.iter_mut().zip(allocations) {
+        for (layer, (values, scales, tail)) in self.layers.iter_mut().zip(allocations) {
             layer.sparse_index_values = values;
             layer.sparse_index_scales = scales;
+            layer.sparse_index_tail = tail;
             layer.sparse_index_values_block_stride = values_stride;
             layer.sparse_index_scales_block_stride = scales_stride;
+            layer.sparse_index_tail_block_stride = tail_stride;
         }
         self.sparse_index_config = Some(spec);
         let total =
@@ -71,8 +86,16 @@ impl PagedKvCache {
         self.layers[layer_idx].sparse_index_scales
     }
 
+    pub fn sparse_index_tail_pool_ptr(&self, layer_idx: usize) -> DevicePtr {
+        self.layers[layer_idx].sparse_index_tail
+    }
+
     pub fn sparse_index_block_stride_bytes(&self, layer_idx: usize) -> usize {
         self.layers[layer_idx].sparse_index_values_block_stride
+    }
+
+    pub fn sparse_index_tail_block_stride_bytes(&self, layer_idx: usize) -> usize {
+        self.layers[layer_idx].sparse_index_tail_block_stride
     }
 
     pub fn sparse_index_config(&self) -> Option<SparseIndexCacheConfig> {
@@ -97,11 +120,12 @@ impl PagedKvCache {
     }
 }
 
-fn free_allocations(gpu: &dyn GpuBackend, allocations: Vec<(DevicePtr, DevicePtr)>) {
-    for (values, scales) in allocations {
+fn free_allocations(gpu: &dyn GpuBackend, allocations: Vec<(DevicePtr, DevicePtr, DevicePtr)>) {
+    for (values, scales, tail) in allocations {
         let _ = gpu.free(values);
         if !scales.is_null() {
             let _ = gpu.free(scales);
         }
+        let _ = gpu.free(tail);
     }
 }

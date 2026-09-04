@@ -60,14 +60,7 @@ impl Qwen3AttentionLayer {
         let sequence_end = seq_len_start
             .checked_add(num_tokens)
             .ok_or_else(|| anyhow::anyhow!("GLM prefill sequence length overflow"))?;
-        ensure!(
-            dense_selection_is_exact(sequence_end, ctx.config.index_topk),
-            "GLM dense paged prefill is exact only through index_topk={} tokens; \
-             requested sequence end {}. Enable the k-pool sparse path before \
-             raising this limit.",
-            ctx.config.index_topk,
-            sequence_end
-        );
+        let use_dense = dense_selection_is_exact(sequence_end, ctx.config.index_topk);
 
         let q_lora = mla.q_lora_rank as u32;
         let kv_lora = mla.kv_lora_rank as u32;
@@ -102,6 +95,20 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
+        self.glm_index_prefill_cache_update(normed, n, kv_cache, ctx, stream)?;
+        let sparse_indices = if use_dense {
+            None
+        } else {
+            Some(self.glm_index_prefill_select(
+                q_latent,
+                normed,
+                n,
+                seq_len_start,
+                kv_cache,
+                ctx,
+                stream,
+            )?)
+        };
         let q_full = ctx.buffers.qkv_output();
         ops::dense_gemm(
             ctx.gpu,
@@ -194,30 +201,50 @@ impl Qwen3AttentionLayer {
             ctx.graph_capture,
         )?;
 
-        ensure!(
-            self.prefill_attn_paged_512_k.0 != 0,
-            "GLM paged prefill kernel inferspark_prefill_paged_512 is unavailable"
-        );
         let attn_latent = ctx.buffers.attn_output();
-        ops::prefill_attention_paged_512(
-            ctx.gpu,
-            self.prefill_attn_paged_512_k,
-            q_absorbed,
-            kv_cache.k_pool_ptr(self.attn_layer_idx),
-            kv_cache.v_pool_ptr(self.attn_layer_idx),
-            attn_latent,
-            meta.block_table,
-            n,
-            sequence_end as u32,
-            seq_len_start as u32,
-            nq,
-            1,
-            kv_lora,
-            bs,
-            0,
-            self.effective_attn_scale(hd),
-            stream,
-        )?;
+        if let Some((indices, index_width)) = sparse_indices {
+            ops::glm_sparse_mla_prefill(
+                ctx.gpu,
+                self.glm_sparse_attn_k,
+                q_absorbed,
+                kv_cache.k_pool_ptr(self.attn_layer_idx),
+                kv_cache.v_pool_ptr(self.attn_layer_idx),
+                indices,
+                attn_latent,
+                meta.block_table,
+                n,
+                nq,
+                kv_lora,
+                index_width,
+                bs,
+                self.effective_attn_scale(hd),
+                stream,
+            )?;
+        } else {
+            ensure!(
+                self.prefill_attn_paged_512_k.0 != 0,
+                "GLM paged prefill kernel inferspark_prefill_paged_512 is unavailable"
+            );
+            ops::prefill_attention_paged_512(
+                ctx.gpu,
+                self.prefill_attn_paged_512_k,
+                q_absorbed,
+                kv_cache.k_pool_ptr(self.attn_layer_idx),
+                kv_cache.v_pool_ptr(self.attn_layer_idx),
+                attn_latent,
+                meta.block_table,
+                n,
+                sequence_end as u32,
+                seq_len_start as u32,
+                nq,
+                1,
+                kv_lora,
+                bs,
+                0,
+                self.effective_attn_scale(hd),
+                stream,
+            )?;
+        }
 
         // Convert the latent attention result back to each head's value
         // width, then apply the row-parallel output projection.

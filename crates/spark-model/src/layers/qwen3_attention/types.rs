@@ -254,6 +254,15 @@ pub struct Qwen3AttentionLayer {
     pub(super) prefill_attn_mla320_k: KernelHandle,
     /// Grouped GEMM for MLA Q absorption + V extraction.
     pub(super) grouped_gemm_mla_k: KernelHandle,
+    /// GLM-5 semantic index primitives: affine LayerNorm, four-token pool
+    /// compression/write, and the exact short-context causal index fill.
+    pub(super) glm_index_layernorm_k: KernelHandle,
+    pub(super) glm_index_tail_write_k: KernelHandle,
+    pub(super) glm_index_kpool_finalize_k: KernelHandle,
+    pub(super) glm_index_fill_causal_k: KernelHandle,
+    pub(super) glm_index_logits_k: KernelHandle,
+    pub(super) glm_index_topk_expand_k: KernelHandle,
+    pub(super) glm_sparse_attn_k: KernelHandle,
     /// Q_final assembly: [absorbed|rope] per head.
     pub(super) mla_q_final_assemble_k: KernelHandle,
     /// Fused MLA prefill: Q_absorb + attention + V_extract in one kernel.

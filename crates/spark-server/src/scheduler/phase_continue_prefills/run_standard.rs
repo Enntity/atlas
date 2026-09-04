@@ -55,7 +55,8 @@ pub(super) fn run_standard_chunk_loop(
     // silently corrupts attention output. Force single-chunk until a
     // paged-MLA prefill kernel lands. Hurts cold TTFT on long MLA
     // prompts but preserves correctness.
-    let effective_max = if model.is_mla() {
+    let force_single_chunk = model.is_mla() && !model.supports_chunked_mla();
+    let effective_max = if force_single_chunk {
         remaining
     } else {
         max_prefill_tokens
@@ -66,7 +67,7 @@ pub(super) fn run_standard_chunk_loop(
     // is a no-op and the chunk cap is unchanged (byte-identical resting path).
     // MLA keeps its forced full-remaining chunk (correctness gate above) — the
     // slice budget never applies there.
-    let cap = if model.is_mla() {
+    let cap = if force_single_chunk {
         effective_max
     } else {
         effective_max.min(slice_budget)
