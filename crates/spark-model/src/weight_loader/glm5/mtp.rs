@@ -14,7 +14,9 @@ use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
-use crate::weight_map::{DenseWeight, QuantizeCtx, dense_auto, detect_nvfp4_variant};
+use crate::weight_map::{
+    DenseWeight, QuantizeCtx, QuantizedWeight, dense_auto, detect_nvfp4_variant, quantize_to_nvfp4,
+};
 
 /// Loaded GLM MTP module. Embedding and LM head are shared with the target.
 pub struct Glm5MtpModule {
@@ -23,6 +25,10 @@ pub struct Glm5MtpModule {
     pub hnorm: DenseWeight,
     /// Fused `[embed || target_hidden] -> hidden` projection.
     pub eh_proj: DenseWeight,
+    /// Optional decode-native copy of `eh_proj`.  Prompt KV prefill retains
+    /// the BF16 matrix above; the autoregressive proposer can stream this
+    /// compact copy once per draft on GB10.
+    pub eh_proj_nvfp4: Option<QuantizedWeight>,
     pub norm: DenseWeight,
 }
 
@@ -92,11 +98,31 @@ pub fn load_glm5_mtp_module(
         true,
     )?;
 
+    let eh_proj = dense_auto(store, &format!("{lp}.eh_proj.weight"), gpu)?;
+    let eh_proj_nvfp4 = if std::env::var("ATLAS_GLM_MTP_NVFP4_EH").ok().as_deref() == Some("1") {
+        let q = quantize_to_nvfp4(
+            &eh_proj,
+            draft_config.hidden_size,
+            2 * draft_config.hidden_size,
+            gpu,
+            qctx.absmax_k,
+            qctx.quantize_k,
+            qctx.stream,
+        )?;
+        tracing::info!(
+            "GLM-5 MTP eh_proj: built decode-native NVFP4 copy (BF16 retained for prefill)"
+        );
+        Some(q)
+    } else {
+        None
+    };
+
     let module = Glm5MtpModule {
         body,
         enorm: dense_auto(store, &format!("{lp}.enorm.weight"), gpu)?,
         hnorm: dense_auto(store, &format!("{lp}.hnorm.weight"), gpu)?,
-        eh_proj: dense_auto(store, &format!("{lp}.eh_proj.weight"), gpu)?,
+        eh_proj,
+        eh_proj_nvfp4,
         norm: dense_auto(store, &format!("{lp}.shared_head.norm.weight"), gpu)?,
     };
     tracing::info!("GLM-5 MTP module loaded: appended layer {layer_idx} (full MLA + MoE)");

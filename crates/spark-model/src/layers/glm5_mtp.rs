@@ -154,16 +154,29 @@ impl Glm5MtpHead {
             stream,
         )?;
         let h_in = ctx.buffers.hidden_states();
-        ops::dense_gemv(
-            ctx.gpu,
-            self.dense_gemv_k,
-            eh_input,
-            &self.module.eh_proj,
-            h_in,
-            h_u32,
-            (2 * h) as u32,
-            stream,
-        )?;
+        if let Some(ref eh_proj) = self.module.eh_proj_nvfp4 {
+            ops::w4a16_gemv(
+                ctx.gpu,
+                self.w4a16_gemv_k,
+                eh_input,
+                eh_proj,
+                h_in,
+                h_u32,
+                (2 * h) as u32,
+                stream,
+            )?;
+        } else {
+            ops::dense_gemv(
+                ctx.gpu,
+                self.dense_gemv_k,
+                eh_input,
+                &self.module.eh_proj,
+                h_in,
+                h_u32,
+                (2 * h) as u32,
+                stream,
+            )?;
+        }
 
         let mut kv_cache = self.kv_cache.lock();
         let bs = kv_cache.block_size();

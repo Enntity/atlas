@@ -622,6 +622,24 @@ median and 19.412 mean. The same-image control measured `18.830`, `17.578`,
 effectively unchanged (159 versus 160), so the gain is not an MTP-acceptance
 artifact.
 
+The appended MTP layer's input combiner is a BF16 `[4096, 8192]` matrix. It
+was streamed once for each of the four serial drafts even though prompt KV
+prefill is the only phase that benefits from its BF16 batched-GEMM layout.
+`GLM_MTP_NVFP4_EH=1` now keeps an additional compact NVFP4 copy for the
+one-row draft path while retaining BF16 for prompt prefill; setting it to `0`
+restores the original projection exactly. The extra rank-0 allocation is about
+18 MiB including block scales.
+
+On a same-image A/B, four 25-step timing windows reduced the proposer from a
+17.345 ms median to 16.56 ms (-4.6%). On the established one-warm-up plus five
+exact 995-rendered-token, forced-256 chat workload, the NVFP4 arm measured
+`20.278`, `20.067`, `19.631`, `19.211`, and `17.873` tok/s (19.631 median,
+19.412 mean) versus BF16's `18.304`, `17.468`, `19.815`, `19.500`, and
+`19.784` tok/s (19.500 median, 18.974 mean). Median accepted predictions were
+160 and 159 respectively, so the measured raw proposer saving did not trade
+away acceptance. A separate arithmetic request completed naturally with the
+correct exact result `10/1` and decimal `10.0`.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.
