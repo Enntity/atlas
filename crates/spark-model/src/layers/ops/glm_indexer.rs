@@ -194,13 +194,17 @@ pub fn glm_sparse_mla_prefill(
     head_dim: u32,
     index_width: u32,
     cache_block_size: u32,
+    heads_per_cta: u32,
     inv_sqrt_d: f32,
     stream: u64,
 ) -> Result<()> {
+    let heads_per_cta = if heads_per_cta == 8 { 8 } else { 1 };
+    // head8 uses scores[8][8], betas[8][8], and three per-head state arrays.
+    let shared_floats = if heads_per_cta == 8 { 152 } else { 19 };
     KernelLaunch::new(gpu, kernel)
-        .grid([num_heads, rows, 1])
+        .grid([div_ceil(num_heads, heads_per_cta), rows, 1])
         .block([256, 1, 1])
-        .shared_mem(19 * std::mem::size_of::<f32>() as u32)
+        .shared_mem(shared_floats * std::mem::size_of::<f32>() as u32)
         .arg_ptr(query)
         .arg_ptr(k_cache)
         .arg_ptr(v_cache)

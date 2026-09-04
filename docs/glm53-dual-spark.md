@@ -97,6 +97,18 @@ requests it raised 3K prefill from 303.9 to 362.0 tok/s and 10K prefill from
 251.6 to 285.7 tok/s; 10K decode rose from 9.47 to 10.04 tok/s. The 10K early
 needle still returned `QUARTZ-9051` exactly.
 
+GPU-synchronized stage profiling at 10K then attributed 13.355 seconds to the
+one-head sparse-MLA kernel, versus 1.077 seconds for semantic-index logits and
+0.011 seconds for exact top-k. At 32K the same stages took 48.937, 11.322, and
+0.118 seconds respectively. The follow-up kernel groups eight query heads per
+CTA, reusing each head-shared compressed K/V row while retaining the original
+one-head kernel as `GLM_SPARSE_HEAD_GROUP=1`. Sparse-attention time at 10K fell
+to 4.801 seconds (2.78x faster). With profiling disabled, warmed exact-10K
+requests measured 379.2--383.4 prefill tok/s and 10.14--10.16 decode tok/s,
+up 32.7% in prefill from the 285.7 tok/s tiled baseline. Decode continues to
+use the latency-favorable one-head kernel. The exact-10K early needle receipt
+from `scripts/benchmark_glm53_niah.py` recovered `NEBULA-2847` verbatim.
+
 BF16 is deliberate for the first 100K correctness gate. FP8 halves the main KV
 value width and should improve capacity and bandwidth, but it needs its own
 needle/coherence A/B because quantization can change attention rankings. The

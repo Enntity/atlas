@@ -102,6 +102,19 @@ impl Qwen3AttentionLayer {
         // failed row in the boot audit. See `init_arch_gates`.
         let probes = ArchProbes::from_config(config);
         let mrope_interleaved = config.mrope_interleaved;
+        // Multi-head sparse MLA reuses GLM's shared compressed K/V rows. Keep
+        // the original one-head kernel available as an operational fallback.
+        let glm_sparse_attn_heads_per_cta =
+            if std::env::var("ATLAS_GLM_SPARSE_HEAD_GROUP").ok().as_deref() == Some("1") {
+                1
+            } else {
+                8
+            };
+        let glm_sparse_attn_fn = if glm_sparse_attn_heads_per_cta == 1 {
+            "glm_sparse_mla_prefill_bf16"
+        } else {
+            "glm_sparse_mla_prefill_bf16_head8"
+        };
         Ok(Self {
             input_norm,
             attn,
@@ -442,6 +455,13 @@ impl Qwen3AttentionLayer {
                 "glm_index_topk_expand",
             ),
             glm_sparse_attn_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "glm_indexer",
+                glm_sparse_attn_fn,
+            ),
+            glm_sparse_attn_heads_per_cta,
+            glm_sparse_attn_decode_k: gate(
                 probes.glm_kpool_indexer,
                 gpu,
                 "glm_indexer",

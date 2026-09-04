@@ -398,7 +398,7 @@ impl Qwen3AttentionLayer {
             if let Some((indices, index_width)) = sparse_indices {
                 ops::glm_sparse_mla_prefill(
                     ctx.gpu,
-                    self.glm_sparse_attn_k,
+                    self.glm_sparse_attn_decode_k,
                     q_absorbed_buf,
                     kv_cache.k_pool_ptr(self.attn_layer_idx),
                     kv_cache.v_pool_ptr(self.attn_layer_idx),
@@ -410,6 +410,7 @@ impl Qwen3AttentionLayer {
                     mla_cache_dim,
                     index_width,
                     kv_cache.block_size() as u32,
+                    1,
                     inv_sqrt_d,
                     stream,
                 )

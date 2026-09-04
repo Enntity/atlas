@@ -203,6 +203,7 @@ impl Qwen3AttentionLayer {
 
         let attn_latent = ctx.buffers.attn_output();
         if let Some((indices, index_width)) = sparse_indices {
+            let mut profile = super::glm_index::profile_start(ctx, stream)?;
             ops::glm_sparse_mla_prefill(
                 ctx.gpu,
                 self.glm_sparse_attn_k,
@@ -217,9 +218,21 @@ impl Qwen3AttentionLayer {
                 kv_lora,
                 index_width,
                 bs,
+                self.glm_sparse_attn_heads_per_cta,
                 self.effective_attn_scale(hd),
                 stream,
             )?;
+            let sparse_attention_us = super::glm_index::profile_lap(ctx, stream, &mut profile)?;
+            if profile.is_some() {
+                tracing::info!(
+                    "ATLAS_GLM_INDEX_PROFILE phase=attention layer={} rows={} seq_end={} selected={} sparse_attention_us={}",
+                    self.attn_layer_idx,
+                    n,
+                    sequence_end,
+                    index_width,
+                    sparse_attention_us,
+                );
+            }
         } else {
             ensure!(
                 self.prefill_attn_paged_512_k.0 != 0,

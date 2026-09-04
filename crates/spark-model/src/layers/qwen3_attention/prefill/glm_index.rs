@@ -10,6 +10,36 @@ use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+fn profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ATLAS_GLM_INDEX_PROFILE").ok().as_deref() == Some("1"))
+}
+
+pub(super) fn profile_start(
+    ctx: &ForwardContext,
+    stream: u64,
+) -> Result<Option<std::time::Instant>> {
+    if !profile_enabled() {
+        return Ok(None);
+    }
+    ctx.gpu.synchronize(stream)?;
+    Ok(Some(std::time::Instant::now()))
+}
+
+pub(super) fn profile_lap(
+    ctx: &ForwardContext,
+    stream: u64,
+    timer: &mut Option<std::time::Instant>,
+) -> Result<u128> {
+    let Some(started) = timer.take() else {
+        return Ok(0);
+    };
+    ctx.gpu.synchronize(stream)?;
+    let elapsed = started.elapsed().as_micros();
+    *timer = Some(std::time::Instant::now());
+    Ok(elapsed)
+}
+
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_index_prefill_cache_update(
@@ -44,6 +74,8 @@ impl Qwen3AttentionLayer {
             "GLM semantic-index kernels are unavailable"
         );
 
+        let mut profile = profile_start(ctx, stream)?;
+
         let rows = n;
         let h = ctx.config.hidden_size as u32;
         let dim = spec.head_dim as u32;
@@ -61,6 +93,7 @@ impl Qwen3AttentionLayer {
             1e-6,
             stream,
         )?;
+        let key_projection_us = profile_lap(ctx, stream, &mut profile)?;
         self.mla_prefill_dense(
             normed,
             &indexer.kpool_gate,
@@ -71,6 +104,7 @@ impl Qwen3AttentionLayer {
             ctx,
             stream,
         )?;
+        let gate_projection_us = profile_lap(ctx, stream, &mut profile)?;
         let meta = ctx
             .attn_metadata
             .expect("GLM index cache update requires slot metadata");
@@ -102,7 +136,19 @@ impl Qwen3AttentionLayer {
             kv_cache.sparse_index_tail_block_stride_bytes(self.attn_layer_idx) as u64,
             kv_cache.sparse_index_block_stride_bytes(self.attn_layer_idx) as u64,
             stream,
-        )
+        )?;
+        let cache_write_us = profile_lap(ctx, stream, &mut profile)?;
+        if profile.is_some() {
+            tracing::info!(
+                "ATLAS_GLM_INDEX_PROFILE phase=cache layer={} rows={} key_projection_us={} gate_projection_us={} cache_write_us={}",
+                self.attn_layer_idx,
+                rows,
+                key_projection_us,
+                gate_projection_us,
+                cache_write_us,
+            );
+        }
+        Ok(())
     }
 
     /// Project semantic queries and select token-granular sparse history for
@@ -138,6 +184,7 @@ impl Qwen3AttentionLayer {
         let sequence_end = seq_len_start + n as usize;
         let logits_stride = sequence_end.div_ceil(pool_size as usize) as u32;
 
+        let mut profile = profile_start(ctx, stream)?;
         let index_query = ctx.buffers.ssm_deinterleaved();
         self.mla_prefill_dense(
             q_latent,
@@ -179,6 +226,13 @@ impl Qwen3AttentionLayer {
         let query_row_bytes = index_heads as usize * index_dim as usize * 2;
         let weights_row_bytes = index_heads as usize * 2;
         let output_row_bytes = output_width as usize * std::mem::size_of::<i32>();
+        // Projection launches above are intentionally included in this first
+        // lap. They produce the semantic query and per-head weights consumed
+        // by every history tile.
+        let projection_us = profile_lap(ctx, stream, &mut profile)?;
+        let mut logits_us = 0u128;
+        let mut topk_us = 0u128;
+        let mut tiles = 0usize;
         let mut row_start = 0usize;
         while row_start < n as usize {
             let rows = tile_rows.min(n as usize - row_start) as u32;
@@ -202,6 +256,7 @@ impl Qwen3AttentionLayer {
                 kv_cache.sparse_index_block_stride_bytes(self.attn_layer_idx) as u64,
                 stream,
             )?;
+            logits_us += profile_lap(ctx, stream, &mut profile)?;
             ops::glm_index_topk_expand(
                 ctx.gpu,
                 self.glm_index_topk_expand_k,
@@ -215,7 +270,23 @@ impl Qwen3AttentionLayer {
                 output_width,
                 stream,
             )?;
+            topk_us += profile_lap(ctx, stream, &mut profile)?;
+            tiles += 1;
             row_start += rows as usize;
+        }
+        if profile.is_some() {
+            tracing::info!(
+                "ATLAS_GLM_INDEX_PROFILE phase=select layer={} rows={} seq_end={} pools={} tile_rows={} tiles={} projection_us={} logits_us={} topk_us={}",
+                self.attn_layer_idx,
+                n,
+                sequence_end,
+                logits_stride,
+                tile_rows,
+                tiles,
+                projection_us,
+                logits_us,
+                topk_us,
+            );
         }
         Ok((selected, output_width))
     }

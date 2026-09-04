@@ -402,3 +402,164 @@ extern "C" __global__ void glm_sparse_mla_prefill_bf16(
     dst[tid] = __float2bfloat16(out0 * inv_denom);
     dst[tid + 256] = __float2bfloat16(out1 * inv_denom);
 }
+
+// Eight-head sparse absorbed MLA. GLM's compressed K/V row is shared by all
+// query heads, so assigning a CTA to eight heads lets every warp load a
+// selected K row once for eight dot products and lets every lane load each V
+// element once for eight accumulators. The one-head kernel above remains the
+// low-register-pressure fallback selected with ATLAS_GLM_SPARSE_HEAD_GROUP=1.
+extern "C" __global__ void glm_sparse_mla_prefill_bf16_head8(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ token_indices,
+    __nv_bfloat16* __restrict__ output,
+    const unsigned int* __restrict__ block_table,
+    unsigned int rows,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int index_width,
+    unsigned int cache_block_size,
+    float inv_sqrt_d) {
+    constexpr unsigned int HEADS = 8;
+    constexpr unsigned int ITEMS = 8;
+    const unsigned int head_base = blockIdx.x * HEADS;
+    const unsigned int row = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    if (row >= rows || head_base >= num_heads || head_dim != 512) return;
+
+    extern __shared__ float shared_f[];
+    float* scores = shared_f;
+    float* betas = scores + HEADS * ITEMS;
+    float* alphas = betas + HEADS * ITEMS;
+    float* running_max = alphas + HEADS;
+    float* running_denom = running_max + HEADS;
+    const int* indices = token_indices + (unsigned long long)row * index_width;
+    const unsigned long long cache_block_stride =
+        (unsigned long long)cache_block_size * head_dim;
+    float out0[HEADS];
+    float out1[HEADS];
+#pragma unroll
+    for (unsigned int h = 0; h < HEADS; ++h) {
+        out0[h] = 0.0f;
+        out1[h] = 0.0f;
+    }
+    if (tid < HEADS) {
+        running_max[tid] = -INFINITY;
+        running_denom[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    const unsigned int warp = tid >> 5;
+    const unsigned int lane = tid & 31;
+    for (unsigned int tile = 0; tile < index_width; tile += ITEMS) {
+        const unsigned int selected = tile + warp;
+        const int token = selected < index_width ? indices[selected] : -1;
+        float partial[HEADS];
+#pragma unroll
+        for (unsigned int h = 0; h < HEADS; ++h) partial[h] = 0.0f;
+        if (token >= 0) {
+            const unsigned int logical_block = (unsigned int)token / cache_block_size;
+            const unsigned int block_offset = (unsigned int)token % cache_block_size;
+            const unsigned int physical_block = block_table[logical_block];
+            const __nv_bfloat16* k = k_cache
+                + (unsigned long long)physical_block * cache_block_stride
+                + (unsigned long long)block_offset * head_dim;
+            for (unsigned int d = lane; d < head_dim; d += 32) {
+                const float kval = __bfloat162float(k[d]);
+#pragma unroll
+                for (unsigned int h = 0; h < HEADS; ++h) {
+                    const unsigned int head = head_base + h;
+                    if (head < num_heads) {
+                        const __nv_bfloat16* q = query
+                            + ((unsigned long long)row * num_heads + head) * head_dim;
+                        partial[h] += __bfloat162float(q[d]) * kval;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned int h = 0; h < HEADS; ++h) {
+            for (unsigned int offset = 16; offset; offset >>= 1)
+                partial[h] += __shfl_down_sync(0xffffffff, partial[h], offset);
+            if (lane == 0) {
+                scores[h * ITEMS + warp] =
+                    token >= 0 && head_base + h < num_heads
+                        ? partial[h] * inv_sqrt_d
+                        : -INFINITY;
+            }
+        }
+        __syncthreads();
+
+        if (tid < HEADS) {
+            const unsigned int h = tid;
+            float tile_max = -INFINITY;
+#pragma unroll
+            for (unsigned int i = 0; i < ITEMS; ++i)
+                tile_max = fmaxf(tile_max, scores[h * ITEMS + i]);
+            const float next_max = fmaxf(running_max[h], tile_max);
+            alphas[h] = running_max[h] == -INFINITY
+                ? 0.0f
+                : expf(running_max[h] - next_max);
+            float tile_sum = 0.0f;
+#pragma unroll
+            for (unsigned int i = 0; i < ITEMS; ++i) {
+                const float score = scores[h * ITEMS + i];
+                const float beta = score == -INFINITY ? 0.0f : expf(score - next_max);
+                betas[h * ITEMS + i] = beta;
+                tile_sum += beta;
+            }
+            running_denom[h] = running_denom[h] * alphas[h] + tile_sum;
+            running_max[h] = next_max;
+        }
+        __syncthreads();
+
+        float values0[ITEMS];
+        float values1[ITEMS];
+#pragma unroll
+        for (unsigned int i = 0; i < ITEMS; ++i) {
+            const unsigned int item = tile + i;
+            const int value_token = item < index_width ? indices[item] : -1;
+            if (value_token < 0) {
+                values0[i] = 0.0f;
+                values1[i] = 0.0f;
+                continue;
+            }
+            const unsigned int logical_block = (unsigned int)value_token / cache_block_size;
+            const unsigned int block_offset = (unsigned int)value_token % cache_block_size;
+            const unsigned int physical_block = block_table[logical_block];
+            const __nv_bfloat16* v = v_cache
+                + (unsigned long long)physical_block * cache_block_stride
+                + (unsigned long long)block_offset * head_dim;
+            values0[i] = __bfloat162float(v[tid]);
+            values1[i] = __bfloat162float(v[tid + 256]);
+        }
+#pragma unroll
+        for (unsigned int h = 0; h < HEADS; ++h) {
+            float next0 = out0[h] * alphas[h];
+            float next1 = out1[h] * alphas[h];
+#pragma unroll
+            for (unsigned int i = 0; i < ITEMS; ++i) {
+                const float beta = betas[h * ITEMS + i];
+                next0 += beta * values0[i];
+                next1 += beta * values1[i];
+            }
+            out0[h] = next0;
+            out1[h] = next1;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (unsigned int h = 0; h < HEADS; ++h) {
+        const unsigned int head = head_base + h;
+        if (head >= num_heads) continue;
+        __nv_bfloat16* dst = output
+            + ((unsigned long long)row * num_heads + head) * head_dim;
+        const float inv_denom = running_denom[h] > 0.0f
+            ? 1.0f / running_denom[h]
+            : 0.0f;
+        dst[tid] = __float2bfloat16(out0[h] * inv_denom);
+        dst[tid + 256] = __float2bfloat16(out1[h] * inv_denom);
+    }
+}
