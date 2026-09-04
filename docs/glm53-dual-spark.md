@@ -146,9 +146,15 @@ exact-10K prompt, raising only the chunk budget from 2,048 to 4,096 increased
 warmed prefill from 447.3 to 534.4 tok/s (+19.5%). Exact-32K prefill was 397.9
 tok/s versus 375.8 tok/s at 2,048 (+5.9%). The 4,096-token run retained more
 than the 4 GiB memory guard, produced coherent output, and recovered the exact
-10K `NEBULA-2847` needle at 535.4 prefill tok/s. The adaptive launcher default
-therefore caps at 4,096; safe-first launches with `MAX_SEQ_LEN=1024` remain at
-1,024 automatically.
+10K `NEBULA-2847` needle at 535.4 prefill tok/s.
+
+A guarded follow-up at 6,144 tokens reduced exact-10K to two prefill passes and
+reached 663.1 tok/s on the M=64 NVFP4 expert kernel, another 24.1% over 4,096.
+The exact-32K receipt reached 415.0 tok/s (+4.3% over 4,096), and the exact-10K
+needle recovered `NEBULA-2847` at 662.5 tok/s. Both ranks retained 9--10 GiB
+available after the run. The adaptive launcher default therefore caps at
+6,144; safe-first launches with `MAX_SEQ_LEN=1024` remain at 1,024
+automatically.
 
 BF16 is deliberate for the first 100K correctness gate. FP8 halves the main KV
 value width and should improve capacity and bandwidth, but it needs its own
