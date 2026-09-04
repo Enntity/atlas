@@ -1744,9 +1744,12 @@ __device__ __forceinline__ void moe_w4a4_grouped_gemm_prequant_t_k64_impl(
     const int* __restrict__ sorted_token_ids,
     unsigned int num_experts,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int work_expert_id,
+    unsigned int work_m_tile,
+    unsigned int work_n_tile
 ) {
-    const unsigned int expert_id = blockIdx.z;
+    const unsigned int expert_id = work_expert_id;
     if (expert_id >= num_experts) return;
 
     const int m_start = expert_offsets[expert_id];
@@ -1754,11 +1757,11 @@ __device__ __forceinline__ void moe_w4a4_grouped_gemm_prequant_t_k64_impl(
     const int M_expert = m_end - m_start;
     if (M_expert <= 0) return;
 
-    const int cta_m_local = blockIdx.y * M_TILE;
+    const int cta_m_local = work_m_tile * M_TILE;
     if (cta_m_local >= M_expert) return;
 
     const unsigned int cta_m = m_start + cta_m_local;
-    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
+    const unsigned int cta_n = work_n_tile * N_TILE_LG;
     const unsigned char* B_expert =
         (const unsigned char*)B_packed_ptrs[expert_id];
     const unsigned char* S_expert =
@@ -1975,7 +1978,8 @@ __device__ __forceinline__ void moe_w4a4_grouped_gemm_prequant_t_k64_impl(
 #define PQ4_PREQUANT_CALL(VEC) \
     moe_w4a4_grouped_gemm_prequant_t_k64_impl<VEC>( \
         A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C, \
-        expert_offsets, sorted_token_ids, num_experts, N, K)
+        expert_offsets, sorted_token_ids, num_experts, N, K, \
+        blockIdx.z, blockIdx.y, blockIdx.x)
 
 extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64(
     PQ4_PREQUANT_ARGS
@@ -1987,6 +1991,58 @@ extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_vecscale(
     PQ4_PREQUANT_ARGS
 ) {
     PQ4_PREQUANT_CALL(true);
+}
+
+// Compact-worklist variants of the exact same native-FP4 MMA.
+// Each work item is (expert, m_tile, n_tile), packed by
+// moe_build_tile_worklist. This removes thousands of empty expert CTAs for
+// decode-sized verifier batches without changing tile arithmetic or stores.
+template<bool PQ_VEC_SCALES>
+__device__ __forceinline__ void moe_w4a4_grouped_gemm_prequant_compact_impl(
+    PQ4_PREQUANT_ARGS,
+    const unsigned int* __restrict__ worklist,
+    const int* __restrict__ total_tiles,
+    unsigned int max_tiles
+) {
+    const int raw_total = *total_tiles;
+    const unsigned int total = raw_total > 0
+        ? min((unsigned int)raw_total, max_tiles) : 0u;
+    const unsigned int wid = blockIdx.x;
+    if (wid >= total) return;
+    const unsigned int expert_id = worklist[wid * 2];
+    const unsigned int packed = worklist[wid * 2 + 1];
+    const unsigned int m_tile = packed >> 6;
+    const unsigned int n_tile = packed & 0x3fu;
+    if (expert_id >= num_experts || n_tile >= (N + N_TILE_LG - 1) / N_TILE_LG)
+        return;
+    moe_w4a4_grouped_gemm_prequant_t_k64_impl<PQ_VEC_SCALES>(
+        A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
+        expert_offsets, sorted_token_ids, num_experts, N, K,
+        expert_id, m_tile, n_tile);
+}
+
+extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_compact(
+    PQ4_PREQUANT_ARGS,
+    const unsigned int* __restrict__ worklist,
+    const int* __restrict__ total_tiles,
+    unsigned int max_tiles
+) {
+    moe_w4a4_grouped_gemm_prequant_compact_impl<false>(
+        A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
+        expert_offsets, sorted_token_ids, num_experts, N, K,
+        worklist, total_tiles, max_tiles);
+}
+
+extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact(
+    PQ4_PREQUANT_ARGS,
+    const unsigned int* __restrict__ worklist,
+    const int* __restrict__ total_tiles,
+    unsigned int max_tiles
+) {
+    moe_w4a4_grouped_gemm_prequant_compact_impl<true>(
+        A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
+        expert_offsets, sorted_token_ids, num_experts, N, K,
+        worklist, total_tiles, max_tiles);
 }
 
 #undef PQ4_PREQUANT_CALL

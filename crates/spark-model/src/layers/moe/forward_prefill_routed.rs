@@ -131,6 +131,25 @@ impl MoeLayer {
         prof_step!("grid_setup");
 
         let total_expanded = n * top_k;
+        // GLM K=5 has only 40 routes across 288 experts. Its prequantized
+        // native-FP4 kernels otherwise launch a dense expert grid where most
+        // CTAs immediately exit. Keep this exact-shape gate explicit while the
+        // compact scheduler is evaluated. GLM's correction-bias router excludes
+        // the FP32-routing path, leaving its workspace dead here. It provides
+        // 16 KiB even for a one-row arena: enough for the K=5 gate/up worklist
+        // (640 items + counter) without allocations.
+        let compact_k5 = std::env::var("ATLAS_GLM_K5_COMPACT_MOE").as_deref() == Ok("1")
+            && ctx.config.model_type == "glm5_next"
+            && n == 5
+            && total_expanded == 40
+            && num_experts == 288
+            && h == 4096
+            && inter == 2048
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && self.nvfp4_prequant_moe
+            && self.moe_w4a4_prequant_t_k64.0 != 0
+            && self.moe_w4a4_prequant_t_k64_compact.0 != 0
+            && self.moe_build_tile_worklist_k.0 != 0;
 
         // 5. Grouped gate+up GEMM — cp.async pipelined FP8-MMA K64 (transposed).
         let expert_gate_out = ctx.buffers.expert_gate_out();
@@ -221,6 +240,30 @@ impl MoeLayer {
                         stream,
                     )?;
                 } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
+                    let compact = if compact_k5 {
+                        let total_tiles = ctx.buffers.moe_router_in_f32();
+                        let worklist = total_tiles.offset(16);
+                        let n_tiles = inter.div_ceil(128);
+                        ops::moe_build_tile_worklist(
+                            ctx.gpu,
+                            self.moe_build_tile_worklist_k,
+                            expert_offsets,
+                            gp.packed_ptrs,
+                            worklist,
+                            total_tiles,
+                            num_experts,
+                            n_tiles,
+                            64,
+                            stream,
+                        )?;
+                        Some(super::prequant_fp4::CompactMoeWorklist {
+                            worklist,
+                            total_tiles,
+                            max_tiles: total_expanded * n_tiles,
+                        })
+                    } else {
+                        None
+                    };
                     self.prequant_fp4_gate_up(
                         expert_input,
                         gp,
@@ -234,6 +277,7 @@ impl MoeLayer {
                         inter,
                         num_experts,
                         max_m_tiles,
+                        compact,
                         ctx,
                         stream,
                     )?;

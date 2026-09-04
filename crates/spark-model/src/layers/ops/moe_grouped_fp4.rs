@@ -85,3 +85,46 @@ pub fn moe_w4a4_grouped_gemm_prequant_n128(
         .arg_u32(k)
         .launch(stream)
 }
+
+/// Native-FP4 prequant GEMM over a compact `(expert, m_tile, n_tile)`
+/// worklist. A conservative work-item bound replaces the dense expert grid;
+/// excess CTAs exit before entering the unchanged per-tile MMA implementation.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a4_grouped_gemm_prequant_compact_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_packed: DevicePtr,
+    a_scale: DevicePtr,
+    b_packed_ptrs: DevicePtr,
+    b_scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_offsets: DevicePtr,
+    sorted_token_ids: DevicePtr,
+    num_experts: u32,
+    n_out: u32,
+    k: u32,
+    worklist: DevicePtr,
+    total_tiles: DevicePtr,
+    max_tiles: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([max_tiles.max(1), 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(a_packed)
+        .arg_ptr(a_scale)
+        .arg_ptr(b_packed_ptrs)
+        .arg_ptr(b_scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_offsets)
+        .arg_ptr(sorted_token_ids)
+        .arg_u32(num_experts)
+        .arg_u32(n_out)
+        .arg_u32(k)
+        .arg_ptr(worklist)
+        .arg_ptr(total_tiles)
+        .arg_u32(max_tiles)
+        .launch(stream)
+}

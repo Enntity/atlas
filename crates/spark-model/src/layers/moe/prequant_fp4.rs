@@ -4,6 +4,13 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct CompactMoeWorklist {
+    pub worklist: DevicePtr,
+    pub total_tiles: DevicePtr,
+    pub max_tiles: u32,
+}
+
 impl MoeLayer {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prequant_fp4_gate_up(
@@ -20,6 +27,7 @@ impl MoeLayer {
         inter: u32,
         num_experts: u32,
         max_m_tiles: u32,
+        compact: Option<CompactMoeWorklist>,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -44,23 +52,52 @@ impl MoeLayer {
             self.moe_w4a4_prequant_t_k64
         };
         for (weight, output) in [(gate, expert_gate_out), (up, expert_up_out)] {
-            ops::moe_w4a4_grouped_gemm_prequant_n128(
-                ctx.gpu,
-                grouped_kernel,
-                a_packed,
-                a_scale,
-                weight.packed_ptrs,
-                weight.scale_ptrs,
-                weight.scale2_vals,
-                output,
-                expert_offsets,
-                sorted_token_ids,
-                num_experts,
-                inter,
-                h,
-                max_m_tiles,
-                stream,
-            )?;
+            if let Some(work) = compact {
+                let compact_kernel = if self.nvfp4_vecscale
+                    && self.moe_w4a4_prequant_t_k64_vecscale_compact.0 != 0
+                {
+                    self.moe_w4a4_prequant_t_k64_vecscale_compact
+                } else {
+                    self.moe_w4a4_prequant_t_k64_compact
+                };
+                ops::moe_w4a4_grouped_gemm_prequant_compact_n128(
+                    ctx.gpu,
+                    compact_kernel,
+                    a_packed,
+                    a_scale,
+                    weight.packed_ptrs,
+                    weight.scale_ptrs,
+                    weight.scale2_vals,
+                    output,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
+                    inter,
+                    h,
+                    work.worklist,
+                    work.total_tiles,
+                    work.max_tiles,
+                    stream,
+                )?;
+            } else {
+                ops::moe_w4a4_grouped_gemm_prequant_n128(
+                    ctx.gpu,
+                    grouped_kernel,
+                    a_packed,
+                    a_scale,
+                    weight.packed_ptrs,
+                    weight.scale_ptrs,
+                    weight.scale2_vals,
+                    output,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
+                    inter,
+                    h,
+                    max_m_tiles,
+                    stream,
+                )?;
+            }
         }
         Ok(())
     }

@@ -506,6 +506,28 @@ decoded at `16.716`, `14.927`, `16.932`, `17.144`, and `16.076` tok/s: a
 137 accepted predictions versus 147--153 in the other runs. All completions
 retained separated reasoning and coherent technical output.
 
+The routed gate/up follow-up keeps the same native Blackwell FP4 MMA tile but
+replaces its dense `[16, 1, 288]` expert grid with a device-built compact
+worklist. At K=5, each gate and up projection now launches at most 640 CTAs
+instead of 4,608; empty and rank-remote experts never enter the MMA kernel.
+The dispatch is restricted to GLM's exact five-row, 40-route shape and is
+opt-in with `GLM_K5_COMPACT_MOE=1`. Its device tile count is clamped to the
+host-provided capacity and every work item validates its expert and N tile.
+
+With one warm-up and five measured exact 1,000-token, forced-256 requests, the
+gate/up-only image decoded at `16.656`, `17.028`, `17.238`, `17.135`, and
+`15.921` tok/s (17.028 median), +1.9% over the 16.716 tok/s control above.
+A rebuilt, hardened image repeated at `17.547`, `15.607`, and `17.304` tok/s
+(17.304 median); the low sample again tracked fewer accepted predictions.
+A separate arithmetic request completed naturally at 19.16 tok/s with cleanly
+separated reasoning and the correct visible answer `5/16`.
+
+Compacting the down projection was tested independently and as part of the
+full routed path. Although it completed short isolated requests, the combined
+variant produced one stalled long request and later measured only 14.967 tok/s
+median on the same forced workload. It is therefore absent from the shipping
+dispatch; down retains the established dense native-FP4 kernel.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.
