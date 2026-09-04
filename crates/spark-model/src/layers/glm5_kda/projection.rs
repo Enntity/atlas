@@ -168,18 +168,15 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        ops::dense_gemv_batchm(
-            ctx.gpu,
-            self.dense_gemv_batchm_k,
-            input,
-            weight,
-            output,
-            m,
-            n,
-            k,
-            n,
-            stream,
-        )
+        let kernel = if m == 5
+            && self.dense_gemv_batch5_k.0 != 0
+            && std::env::var("ATLAS_GLM_K5_DENSE_EXACT").as_deref() == Ok("1")
+        {
+            self.dense_gemv_batch5_k
+        } else {
+            self.dense_gemv_batchm_k
+        };
+        ops::dense_gemv_batchm(ctx.gpu, kernel, input, weight, output, m, n, k, n, stream)
     }
 
     #[allow(clippy::too_many_arguments)]

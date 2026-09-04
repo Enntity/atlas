@@ -468,6 +468,16 @@ variation, so the target-forward delta is the conservative kernel claim. A
 separate arithmetic chat returned `323` with reasoning and visible content
 still separated.
 
+`GLM_K5_DENSE_EXACT=1` selects Atlas's existing exact-five-row BF16 GEMV for
+the KDA side projections instead of executing the general eight-row kernel
+with three inactive accumulator lanes. `=0` restores the general batch-M
+kernel for same-image comparison. On the same v22 image, 12 target-forward
+windows improved from 117.075 to 116.580 ms median (-0.42%) and from 116.923
+to 116.560 ms mean (-0.31%). Three endpoint samples were acceptance-limited
+(160 versus 157 median accepted predictions), so the target-forward delta is
+the performance claim. A separate arithmetic chat returned `899` correctly
+with reasoning and visible content separated.
+
 With one warm-up and five measured copies of the same exact 1,000-token,
 forced-256 request, grouped W4A16 decoded at `19.046`, `19.414`, `21.029`,
 `20.243`, and `20.646` tok/s (20.243 median, +3.1% over v87). Median accepted
