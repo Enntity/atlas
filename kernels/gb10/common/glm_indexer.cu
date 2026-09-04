@@ -299,9 +299,10 @@ extern "C" __global__ void glm_index_topk_expand(
     }
 }
 
-// Scalar correctness kernel for sparse absorbed MLA. One CTA owns one
-// (query, head), scans the selected raw token IDs, and maintains online
-// softmax while each lane owns two of the 512 output dimensions.
+// Tiled sparse absorbed MLA. One CTA owns one (query, head); its eight warps
+// score eight selected tokens concurrently, then all 256 lanes update two of
+// the 512 output dimensions. This preserves the online-softmax recurrence of
+// the scalar oracle while reducing synchronization by roughly eightfold.
 extern "C" __global__ void glm_sparse_mla_prefill_bf16(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ k_cache,
@@ -319,57 +320,85 @@ extern "C" __global__ void glm_sparse_mla_prefill_bf16(
     const unsigned int row = blockIdx.y;
     const unsigned int tid = threadIdx.x;
     if (row >= rows || head >= num_heads || head_dim != 512) return;
-    extern __shared__ float shared_score[];
-    float* warp_sums = shared_score;
-    float& score_slot = shared_score[8];
+    extern __shared__ float shared_f[];
+    float* scores = shared_f;
+    float* betas = shared_f + 8;
+    float& alpha = shared_f[16];
+    float& running_max = shared_f[17];
+    float& running_denom = shared_f[18];
     const __nv_bfloat16* q = query
         + ((unsigned long long)row * num_heads + head) * head_dim;
     const int* indices = token_indices + (unsigned long long)row * index_width;
     const unsigned long long cache_block_stride =
         (unsigned long long)cache_block_size * head_dim;
-    const float q0 = __bfloat162float(q[tid]);
-    const float q1 = __bfloat162float(q[tid + 256]);
     float out0 = 0.0f, out1 = 0.0f;
-    float max_logit = -INFINITY, denom = 0.0f;
+    if (tid == 0) {
+        running_max = -INFINITY;
+        running_denom = 0.0f;
+    }
+    __syncthreads();
 
-    for (unsigned int selected = 0; selected < index_width; ++selected) {
-        const int token = indices[selected];
-        if (token < 0) continue;
-        const unsigned int logical_block = (unsigned int)token / cache_block_size;
-        const unsigned int block_offset = (unsigned int)token % cache_block_size;
-        const unsigned int physical_block = block_table[logical_block];
-        const __nv_bfloat16* k = k_cache
-            + (unsigned long long)physical_block * cache_block_stride
-            + (unsigned long long)block_offset * head_dim;
-        const __nv_bfloat16* v = v_cache
-            + (unsigned long long)physical_block * cache_block_stride
-            + (unsigned long long)block_offset * head_dim;
-        float partial = q0 * __bfloat162float(k[tid])
-                      + q1 * __bfloat162float(k[tid + 256]);
+    const unsigned int warp = tid >> 5;
+    const unsigned int lane = tid & 31;
+    for (unsigned int tile = 0; tile < index_width; tile += 8) {
+        const unsigned int selected = tile + warp;
+        const int token = selected < index_width ? indices[selected] : -1;
+        float partial = 0.0f;
+        if (token >= 0) {
+            const unsigned int logical_block = (unsigned int)token / cache_block_size;
+            const unsigned int block_offset = (unsigned int)token % cache_block_size;
+            const unsigned int physical_block = block_table[logical_block];
+            const __nv_bfloat16* k = k_cache
+                + (unsigned long long)physical_block * cache_block_stride
+                + (unsigned long long)block_offset * head_dim;
+            for (unsigned int d = lane; d < head_dim; d += 32)
+                partial += __bfloat162float(q[d]) * __bfloat162float(k[d]);
+        }
         for (unsigned int offset = 16; offset; offset >>= 1)
             partial += __shfl_down_sync(0xffffffff, partial, offset);
-        if ((tid & 31) == 0) warp_sums[tid >> 5] = partial;
+        if (lane == 0) scores[warp] = token >= 0 ? partial * inv_sqrt_d : -INFINITY;
         __syncthreads();
-        if (tid < 8) {
-            partial = warp_sums[tid];
-            for (unsigned int offset = 4; offset; offset >>= 1)
-                partial += __shfl_down_sync(0x000000ff, partial, offset);
-            if (tid == 0) score_slot = partial * inv_sqrt_d;
+
+        if (tid == 0) {
+            float tile_max = -INFINITY;
+#pragma unroll
+            for (unsigned int i = 0; i < 8; ++i) tile_max = fmaxf(tile_max, scores[i]);
+            const float next_max = fmaxf(running_max, tile_max);
+            alpha = running_max == -INFINITY ? 0.0f : expf(running_max - next_max);
+            float tile_sum = 0.0f;
+#pragma unroll
+            for (unsigned int i = 0; i < 8; ++i) {
+                betas[i] = scores[i] == -INFINITY ? 0.0f : expf(scores[i] - next_max);
+                tile_sum += betas[i];
+            }
+            running_denom = running_denom * alpha + tile_sum;
+            running_max = next_max;
         }
         __syncthreads();
-        const float score = score_slot;
-        const float new_max = fmaxf(max_logit, score);
-        const float alpha = expf(max_logit - new_max);
-        const float beta = expf(score - new_max);
-        denom = denom * alpha + beta;
-        out0 = out0 * alpha + beta * __bfloat162float(v[tid]);
-        out1 = out1 * alpha + beta * __bfloat162float(v[tid + 256]);
-        max_logit = new_max;
+
+        float next0 = out0 * alpha;
+        float next1 = out1 * alpha;
+#pragma unroll
+        for (unsigned int i = 0; i < 8; ++i) {
+            const unsigned int item = tile + i;
+            const int value_token = item < index_width ? indices[item] : -1;
+            if (value_token < 0 || betas[i] == 0.0f) continue;
+            const unsigned int logical_block = (unsigned int)value_token / cache_block_size;
+            const unsigned int block_offset = (unsigned int)value_token % cache_block_size;
+            const unsigned int physical_block = block_table[logical_block];
+            const __nv_bfloat16* v = v_cache
+                + (unsigned long long)physical_block * cache_block_stride
+                + (unsigned long long)block_offset * head_dim;
+            next0 += betas[i] * __bfloat162float(v[tid]);
+            next1 += betas[i] * __bfloat162float(v[tid + 256]);
+        }
+        out0 = next0;
+        out1 = next1;
         __syncthreads();
     }
     __nv_bfloat16* dst = output
         + ((unsigned long long)row * num_heads + head) * head_dim;
-    const float inv_denom = denom > 0.0f ? 1.0f / denom : 0.0f;
+    const float inv_denom = running_denom > 0.0f ? 1.0f / running_denom : 0.0f;
     dst[tid] = __float2bfloat16(out0 * inv_denom);
     dst[tid + 256] = __float2bfloat16(out1 * inv_denom);
 }

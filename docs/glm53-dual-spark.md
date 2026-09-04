@@ -91,6 +91,12 @@ prefill tok/s and 9.47 decode tok/s. An independent 10,000-token prompt with an
 early `QUARTZ-9051` needle recovered that exact value. These are correctness
 receipts for the scalar sparse baseline, not the final performance target.
 
+The first sparse-attention optimization scores eight selected tokens per CTA
+tile while retaining the same online-softmax recurrence. With the same warmed
+requests it raised 3K prefill from 303.9 to 362.0 tok/s and 10K prefill from
+251.6 to 285.7 tok/s; 10K decode rose from 9.47 to 10.04 tok/s. The 10K early
+needle still returned `QUARTZ-9051` exactly.
+
 BF16 is deliberate for the first 100K correctness gate. FP8 halves the main KV
 value width and should improve capacity and bandwidth, but it needs its own
 needle/coherence A/B because quantization can change attention rankings. The

@@ -200,7 +200,7 @@ pub fn glm_sparse_mla_prefill(
     KernelLaunch::new(gpu, kernel)
         .grid([num_heads, rows, 1])
         .block([256, 1, 1])
-        .shared_mem(10 * std::mem::size_of::<f32>() as u32)
+        .shared_mem(19 * std::mem::size_of::<f32>() as u32)
         .arg_ptr(query)
         .arg_ptr(k_cache)
         .arg_ptr(v_cache)
