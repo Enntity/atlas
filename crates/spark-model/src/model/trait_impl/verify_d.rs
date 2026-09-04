@@ -177,7 +177,19 @@ impl TransformerModel {
         let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1");
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        let use_graphs = self.comm.is_none()
+        // Exact GLM K=5 on two ranks is pointer- and shape-static. Both ranks
+        // enter the same layer collectives in lockstep, so recent CUDA/NCCL
+        // stacks can capture this forward. Keep distributed capture opt-in;
+        // all other models and topologies retain the eager default.
+        static GLM_TP_VERIFY_GRAPH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let glm_tp_graphs = self.config.model_type == "glm5_next"
+            && k == 5
+            && self.config.tp_world_size == 2
+            && *GLM_TP_VERIFY_GRAPH.get_or_init(|| {
+                std::env::var("ATLAS_GLM_TP_VERIFY_GRAPH")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            });
+        let use_graphs = (self.comm.is_none() || glm_tp_graphs)
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)

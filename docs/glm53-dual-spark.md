@@ -774,3 +774,24 @@ separate natural arithmetic request completed coherently with the exact result
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.
+
+### Distributed K=5 CUDA graph
+
+The generic five-row target verifier used by four-draft MTP was permanently
+eager whenever a communication backend was present, even though this exact
+GLM path has fixed shapes, fixed arena/state pointers, and identical collective
+order on both ranks. `GLM_TP_VERIFY_GRAPH=1` now permits CUDA/NCCL capture only
+for `glm5_next`, K=5, and TP=2. Other models, verifier widths, and distributed
+topologies retain the established eager behavior. Setting the flag to `0` is
+the immediate fallback; the dual-Spark launcher defaults it on after validation.
+
+Both ranks captured and replayed the graph successfully without CUDA, NCCL, or
+OOM errors. A natural arithmetic request remained coherent and returned the
+exact result `73 * 19 = 1387` with two independent checks. On the same v35
+binary, one warm-up plus five 1,005-token-prompt, forced-256 requests measured
+18.693 tok/s mean and 18.889 median with capture, versus 17.517 mean and 17.660
+median eager (+6.7% mean, +7.0% median). Because draft acceptance varied,
+target-forward work was also normalized by `completion_tokens -
+accepted_prediction_tokens`: capture measured 135.58 ms per target step mean
+and median, versus 139.24 mean and 138.41 median eager (-2.6% mean, -2.1%
+median). The normalized result is the conservative decode claim.
