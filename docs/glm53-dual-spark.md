@@ -713,6 +713,21 @@ prompt KV prefill, and serial MTP prefill disabled. Both ranks must use the same
 image and flag value. The default rank-0 proposer remains unchanged when the
 flag is off.
 
+The split projection initially exchanged its two contiguous logit halves with
+two synchronous broadcasts per draft. `GLM_MTP_ALL_GATHER=1` replaces them with
+one NCCL in-place all-gather. Rank `r` already writes at
+`logits + r * local_vocab`, which is NCCL's defined in-place layout, and the
+collective uses the same default CUDA stream as projection and global argmax.
+The fallback broadcasts remain available with `=0`; the launcher defaults the
+one-collective path on only when `GLM_MTP_DISTRIBUTED=1`.
+
+On the same v29 binary, steady 25-step proposer windows fell from a 14.37 ms
+median with the broadcast oracle to 13.91 ms with all-gather (-3.2%). Five
+warmed 1,005-token, forced-256 endpoint requests were effectively neutral:
+19.317 versus 19.295 tok/s median, and 19.148 versus 19.264 tok/s mean. The
+direct phase result is the conservative claim; it removes one collective and
+one host synchronization without changing projection or argmax arithmetic.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

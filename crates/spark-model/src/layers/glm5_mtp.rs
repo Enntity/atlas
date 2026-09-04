@@ -28,6 +28,11 @@ pub(crate) fn distributed_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ATLAS_GLM_MTP_DISTRIBUTED").ok().as_deref() == Some("1"))
 }
 
+fn all_gather_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ATLAS_GLM_MTP_ALL_GATHER").ok().as_deref() == Some("1"))
+}
+
 pub struct Glm5MtpProposerState {
     pub block_table: Vec<u32>,
     pub seq_len: usize,
@@ -356,15 +361,21 @@ impl Glm5MtpHead {
         }
         if distributed_enabled() {
             let comm = ctx.comm.expect("distributed communicator checked above");
-            // Projection runs on Atlas's compute stream while the communicator's
-            // broadcasts use its legacy stream. Complete the local half first,
-            // then exchange the two contiguous BF16 halves in rank order. Both
-            // ranks finish with the exact original full-vocabulary logits, so
-            // global argmax and grammar tie-breaking stay byte-identical.
-            ctx.gpu.synchronize(stream)?;
             let local = projected_vocab as usize;
-            for root in 0..comm.world_size() {
-                comm.broadcast(logits.offset(root * local * 2).0, local * 2, root)?;
+            if all_gather_enabled() {
+                // Each rank projected directly into its rank-ordered slice of
+                // the full logits buffer. NCCL's in-place form gathers both
+                // slices with one launch. The communicator's legacy stream is
+                // this same default compute stream, so GEMV -> gather -> global
+                // argmax remain FIFO without events or a host synchronization.
+                comm.all_gather(local_logits.0, logits.0, local * 2)?;
+            } else {
+                // Synchronous two-broadcast oracle retained for same-image A/B
+                // and rollback. Both paths produce the same BF16 logits layout.
+                ctx.gpu.synchronize(stream)?;
+                for root in 0..comm.world_size() {
+                    comm.broadcast(logits.offset(root * local * 2).0, local * 2, root)?;
+                }
             }
         }
         let out = ctx.buffers.scratch();
