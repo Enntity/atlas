@@ -91,6 +91,70 @@ impl CommBackend for NcclBackend {
         Ok(())
     }
 
+    fn peer_exchange_async(
+        &self,
+        send_ptr: u64,
+        recv_ptr: u64,
+        bytes: usize,
+        compute_stream: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.world_size == 2,
+            "peer_exchange_async requires exactly two ranks (got {})",
+            self.world_size
+        );
+        anyhow::ensure!(
+            bytes.is_multiple_of(ALL_REDUCE_DTYPE_BYTES),
+            "peer_exchange_async BF16 payload must be a whole number of elements ({bytes} bytes)"
+        );
+
+        // Preserve the all_reduce_async ordering contract: the send observes
+        // all producer kernels on `compute_stream`, and subsequent compute on
+        // that stream observes the peer payload. The caller owns and registers
+        // `recv_ptr`; no shared backend scratch can be aliased by a fused user.
+        nccl::record_event(self.compute_done_event, compute_stream)?;
+        nccl::stream_wait_event(self.comm_stream, self.compute_done_event)?;
+
+        let count = bytes / ALL_REDUCE_DTYPE_BYTES;
+        let partner = (1 - self.rank) as i32;
+        let comm = *self.comm.lock();
+        let result = unsafe { nccl::ncclGroupStart() };
+        nccl::check_nccl(result, "peer exchange ncclGroupStart")?;
+        let result = unsafe {
+            nccl::ncclSend(
+                send_ptr as *const c_void,
+                count,
+                NcclDataType::Bfloat16,
+                partner,
+                comm,
+                self.comm_stream,
+            )
+        };
+        nccl::check_nccl(result, "peer exchange ncclSend")?;
+        let result = unsafe {
+            nccl::ncclRecv(
+                recv_ptr as *mut c_void,
+                count,
+                NcclDataType::Bfloat16,
+                partner,
+                comm,
+                self.comm_stream,
+            )
+        };
+        nccl::check_nccl(result, "peer exchange ncclRecv")?;
+        let result = unsafe { nccl::ncclGroupEnd() };
+        nccl::check_nccl(result, "peer exchange ncclGroupEnd")?;
+
+        nccl::record_event(self.comm_done_event, self.comm_stream)?;
+        nccl::stream_wait_event(compute_stream, self.comm_done_event)?;
+        self.check_async_error(comm);
+        Ok(())
+    }
+
+    fn supports_peer_exchange_async(&self) -> bool {
+        self.world_size == 2
+    }
+
     fn register_buffer(&self, ptr: u64, bytes: usize) -> Result<u64> {
         let mut handle: *mut c_void = ptr::null_mut();
         let comm = *self.comm.lock();

@@ -58,6 +58,13 @@ fn verify_fused_dense_triple_enabled() -> bool {
         == Some("1")
 }
 
+/// Exact K=5-only seam: exchange the remote row-parallel KDA O projection and
+/// combine it inside mHC post-mixing. The launcher retains a fallback switch.
+fn verify_fused_tp_hc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_K5_FUSED_TP_HC").ok().as_deref() == Some("1"))
+}
+
 pub struct Glm5KdaLayer {
     input_norm: DenseWeight,
     post_attn_norm: DenseWeight,
@@ -102,6 +109,7 @@ pub struct Glm5KdaLayer {
     hc_pre_k: KernelHandle,
     hc_pre_from_raw_mix_k: KernelHandle,
     hc_post_k: KernelHandle,
+    hc_post_bf16_add_k: KernelHandle,
     hc_contract_k: KernelHandle,
 }
 
@@ -220,6 +228,7 @@ impl Glm5KdaLayer {
             hc_pre_k: gpu.kernel("hyper_connection", "hc_pre")?,
             hc_pre_from_raw_mix_k: gpu.kernel("hyper_connection", "hc_pre_from_raw_mix")?,
             hc_post_k: gpu.kernel("hyper_connection", "hc_post")?,
+            hc_post_bf16_add_k: super::try_kernel(gpu, "hyper_connection", "hc_post_bf16_add"),
             hc_contract_k: gpu.kernel("hyper_connection", "hc_contract")?,
         })
     }
@@ -793,13 +802,49 @@ impl Glm5KdaLayer {
             )?;
         }
         profile::step(ctx, stream, &mut profile_timer, "o_proj")?;
-        if ctx.config.tp_world_size > 1
+        let fused_tp_hc = capture_verify_intermediates
+            && tokens == 5
+            && !ctx.graph_capture
+            && verify_fused_tp_hc_enabled()
+            && self.hc_post_bf16_add_k.0 != 0
+            && ctx.config.tp_world_size == 2
+            && ctx
+                .comm
+                .is_some_and(|comm| comm.world_size() == 2 && comm.supports_peer_exchange_async());
+        if fused_tp_hc {
+            // `moe_output` is a registered, caller-owned [M,H] BF16 arena.
+            // The preceding KDA work is done with it, and FFN overwrites it
+            // only after this immediate mHC post consumes the peer payload.
+            ctx.comm.unwrap().peer_exchange_async(
+                normed.0,
+                ctx.buffers.moe_output().0,
+                tokens * self.hidden_size * 2,
+                stream,
+            )?;
+        } else if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {
             comm.all_reduce_async(normed.0, tokens * self.hidden_size * 2, stream)?;
         }
         profile::step(ctx, stream, &mut profile_timer, "tp_reduce")?;
-        self.hc_post(normed, m, ctx, stream)?;
+        if fused_tp_hc {
+            ops::hc_post_bf16_add(
+                ctx.gpu,
+                self.hc_post_bf16_add_k,
+                normed,
+                ctx.buffers.moe_output(),
+                ctx.buffers.hc_streams(),
+                ctx.buffers.hc_post(),
+                ctx.buffers.hc_comb(),
+                ctx.buffers.hc_streams(),
+                m,
+                h,
+                self.hc.hc_mult as u32,
+                stream,
+            )?;
+        } else {
+            self.hc_post(normed, m, ctx, stream)?;
+        }
         profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
 
         self.hc_pre(&self.hc.ffn, hidden, m, ctx, stream)?;

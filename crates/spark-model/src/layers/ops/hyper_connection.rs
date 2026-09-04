@@ -161,6 +161,39 @@ pub fn hc_post(
         .launch(stream)
 }
 
+/// K=5 two-rank KDA seam: add the local and peer BF16 projections, then feed
+/// the exact rounded result into mHC post-mixing without materialising the
+/// reduced BF16 buffer. The kernel uses the same `__hadd` operation as Atlas's
+/// existing two-rank all-reduce fast path.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_post_bf16_add(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    local_block_out: DevicePtr,
+    peer_block_out: DevicePtr,
+    residual: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(local_block_out)
+        .arg_ptr(peer_block_out)
+        .arg_ptr(residual)
+        .arg_ptr(post)
+        .arg_ptr(comb)
+        .arg_ptr(out)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .launch(stream)
+}
+
 /// Final collapse before the LM head: a single learned sigmoid-weighted sum
 /// over the `hc_mult` streams. One block per token.
 #[allow(clippy::too_many_arguments)]

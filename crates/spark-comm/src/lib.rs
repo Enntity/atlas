@@ -56,6 +56,28 @@ pub trait CommBackend: Send + Sync {
         self.all_reduce(ptr, bytes)
     }
 
+    /// Asynchronously exchange one BF16 payload with the other rank.
+    ///
+    /// Unlike an all-reduce, `recv_ptr` receives the peer's unmodified payload.
+    /// This lets a consumer fuse Atlas's established local reduction arithmetic
+    /// with its immediately-dependent kernel without materialising an
+    /// intermediate reduced buffer. Only available on backends that explicitly
+    /// support the two-rank event-ordered path.
+    fn peer_exchange_async(
+        &self,
+        _send_ptr: u64,
+        _recv_ptr: u64,
+        _bytes: usize,
+        _compute_stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("peer_exchange_async is not supported by this CommBackend")
+    }
+
+    /// Whether [`Self::peer_exchange_async`] is available for this communicator.
+    fn supports_peer_exchange_async(&self) -> bool {
+        false
+    }
+
     /// Pre-register a GPU buffer with the communication backend.
     ///
     /// For NCCL over IB/RoCE, this caches the IB memory registration

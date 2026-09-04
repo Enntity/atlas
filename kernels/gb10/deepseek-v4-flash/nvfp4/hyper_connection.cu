@@ -346,6 +346,44 @@ extern "C" __global__ void hc_post(
     }
 }
 
+// Two-rank KDA K=5 fast seam. This intentionally evaluates the exact same
+// BF16 `__hadd(local, peer)` that the existing send/recv all-reduce path stores
+// before `hc_post` reads it. The reduced BF16 value is only consumed here, so
+// fusing removes the transient store/load without changing its arithmetic.
+extern "C" __global__ void hc_post_bf16_add(
+    const __nv_bfloat16* __restrict__ local_block_out, // [T, H]
+    const __nv_bfloat16* __restrict__ peer_block_out,  // [T, H]
+    const float* __restrict__ residual,                // [T, hc, H]
+    const float* __restrict__ post,                    // [T, hc]
+    const float* __restrict__ comb,                    // [T, hc, hc]
+    float* __restrict__ out,                           // [T, hc, H]
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const unsigned int hc = hc_mult;
+
+    const __nv_bfloat16* local = local_block_out + (size_t)t * H;
+    const __nv_bfloat16* peer = peer_block_out + (size_t)t * H;
+    const float* res = residual + (size_t)t * hc * H;
+    const float* p = post + (size_t)t * hc;
+    const float* c = comb + (size_t)t * hc * hc;
+    float* o = out + (size_t)t * hc * H;
+
+    for (unsigned int d = tid; d < H; d += HC_BLOCK) {
+        const float xd = (float)__hadd(local[d], peer[d]);
+        float rv[HC_MAX_MULT];
+        for (unsigned int i = 0; i < hc; ++i) rv[i] = res[i * H + d];
+        for (unsigned int j = 0; j < hc; ++j) {
+            float acc = p[j] * xd;
+            for (unsigned int i = 0; i < hc; ++i) acc += c[i * hc + j] * rv[i];
+            o[j * H + d] = acc;
+        }
+    }
+}
+
 // ── hc_head ──
 // Final collapse: streams [T, hc, H] -> y_out [T, H] via a single learned
 // sigmoid-weighted sum.  Grid: (T,1,1)  Block: (256,1,1).

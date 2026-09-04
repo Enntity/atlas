@@ -748,6 +748,29 @@ mean and 17.680 median for the fallback. Accepted drafts varied between the
 samples, so the bit-exact microtest and per-target profile are the conservative
 speed claims rather than the larger endpoint delta.
 
+### Fused two-rank KDA reduction and mHC post
+
+The five-row KDA output projection previously exchanged the peer BF16 tensor,
+launched `bf16_add_inplace`, stored the reduced tensor, and immediately loaded
+it again in `hc_post`. `GLM_K5_FUSED_TP_HC=1` instead exchanges the unmodified
+peer contribution into Atlas's already-registered MoE scratch and evaluates
+the same `__hadd(local, peer)` inside an `hc_post` twin. The rounded BF16 sum,
+FP32 conversion, mHC accumulation order, and output stores are unchanged. The
+path is restricted to eager K=5 verification with exactly two ranks; graph
+capture, every other shape, and other communication backends retain the
+existing all-reduce path. The dual-Spark launcher defaults it on after the
+exactness and endpoint checks.
+
+Across 137 profiled target forwards, the fused communication phase measured
+8.05 ms per KDA stack versus 10.14 ms across 127 same-image control forwards
+(-20.6%). On the profiler-off 1,005-token-prompt, forced-256 A/B, acceptance
+variation made raw endpoint rates misleading: 18.011 tok/s candidate mean
+versus 18.511 control. Normalizing each request by its actual number of target
+verification steps showed the model work falling from 139.89 to 138.67 ms per
+step by mean (-0.87%), and from 140.67 to 138.57 ms by median (-1.49%). A
+separate natural arithmetic request completed coherently with the exact result
+`73 * 19 = 1387`.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.
