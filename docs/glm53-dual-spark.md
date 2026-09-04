@@ -728,6 +728,26 @@ warmed 1,005-token, forced-256 endpoint requests were effectively neutral:
 direct phase result is the conservative claim; it removes one collective and
 one host synchronization without changing projection or argmax arithmetic.
 
+### Exact five-row router
+
+The K=5 verifier previously sent its `[5, 4096] x [4096, 288]` BF16 router
+through the generic exact router kernel's 16-row tile. Eleven row lanes did
+the complete scalar K loop on padding. `GLM_K5_ROUTER_M5=1` selects a
+shape-guarded five-row kernel with 16 columns per CTA. Every real output keeps
+the same increasing-K FP32 accumulation chain and final BF16 conversion; the
+existing exact router remains the fallback for every other shape. The GLM
+launcher defaults the specialization on after validation.
+
+The GB10 microtest produced zero bit differences across all 1,440 logits and
+reduced kernel-only time from 0.1579 ms to 0.0901 ms (-42.9%). In the complete
+42-layer verifier profile, router time fell from 8.67 ms to 7.20 ms per target
+forward (-17.0% after launch and pipeline effects). A same-image endpoint A/B
+with one warm-up and five 1,005-token-prompt, forced-256 requests measured
+18.456 tok/s mean and 18.779 median with the specialization, versus 17.731
+mean and 17.680 median for the fallback. Accepted drafts varied between the
+samples, so the bit-exact microtest and per-target profile are the conservative
+speed claims rather than the larger endpoint delta.
+
 If either rank exits during model load, remove both Atlas containers before a
 retry. Do not configure a Docker restart policy: repeatedly reloading a model
 under unified-memory pressure can make both Sparks unreachable.

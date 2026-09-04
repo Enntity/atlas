@@ -136,6 +136,8 @@ pub struct MoeLayer {
     /// `--fmad=false` build) at ~2x speed. `KernelHandle(0)` on miss → the
     /// pinned scalar kernel. Used ONLY by `router_gate_gemm_dense`.
     dense_gemm_router: KernelHandle,
+    /// Exact-M=5, scalar-order router specialization for GLM verification.
+    dense_gemm_router_m5: KernelHandle,
     dense_gemm_pipelined: KernelHandle,
     /// FP32-output router GEMM + FP32-input top-K for the ATLAS_FP32_GATE path.
     /// Zero (unresolved) when the kernels are absent; dispatch falls back to BF16.

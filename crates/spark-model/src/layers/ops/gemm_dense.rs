@@ -145,6 +145,33 @@ pub fn dense_gemm_router(
         .launch(stream)
 }
 
+/// Exact-M=5 order-preserving router GEMM. The kernel retains one sequential
+/// FP32 accumulator per output while eliminating the generic tile's eleven
+/// padded row lanes. Callers must guard `m == 5`.
+pub fn dense_gemm_router_m5(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert_eq!(m, 5);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 16), 1, 1])
+        .block([16, 5, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Pipelined tensor-core BF16 GEMM — drop-in faster `dense_gemm` (kernel
 /// `dense_gemm_bf16_pipelined`): mma.sync.m16n8k16 + cp.async 2-stage, 128x128
 /// tile. ~40x the scalar `dense_gemm` on large-M shapes (cosine=1.0, same math).

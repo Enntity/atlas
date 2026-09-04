@@ -282,6 +282,91 @@ extern "C" __global__ void dense_gemm_bf16_router(
     }
 }
 
+// Exact-M=5 router GEMM for GLM speculative verification.
+//
+// The generic order-preserving router tile has 16 row lanes, so eleven lanes
+// execute the complete K loop on zero-padded A rows at M=5. This specialization
+// keeps one thread per real (row, column) output, raises the grid from five to
+// eighteen CTAs for GLM's N=288 router, and retains the identical scalar
+// k=0..K-1 FP32 accumulation chain. This translation unit is compiled with
+// --fmad=false, so no FMA reassociation is introduced.
+//
+// Grid: (ceil(N/16), 1, 1)  Block: (16, 5, 1). Dispatch is shape-guarded.
+#define R5_M 5
+#define R5_BN 16
+#define R5_BK 64
+
+extern "C" __global__ void dense_gemm_bf16_router_m5(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    if (M != R5_M || blockDim.x != R5_BN || blockDim.y != R5_M) return;
+
+    __shared__ float sA[R5_M][R5_BK + 1];
+    __shared__ float sB[R5_BN][R5_BK + 1];
+
+    const unsigned int tid = threadIdx.y * R5_BN + threadIdx.x; // 0..79
+    const unsigned int row = threadIdx.y;
+    const unsigned int local_col = threadIdx.x;
+    const unsigned int col = blockIdx.x * R5_BN + local_col;
+    float acc = 0.0f;
+
+    for (unsigned int kb = 0; kb < K; kb += R5_BK) {
+        // A is exactly 5x64 BF16 values per full tile: 80 vector loads.
+        const unsigned int a_chunk = tid;
+        const unsigned int ar = a_chunk / (R5_BK / 4);
+        const unsigned int ak = (a_chunk % (R5_BK / 4)) * 4;
+        if (kb + ak + 3 < K) {
+            ushort4 v = *(const ushort4*)(A + (size_t)ar * K + kb + ak);
+            sA[ar][ak + 0] = __bfloat162float(__ushort_as_bfloat16(v.x));
+            sA[ar][ak + 1] = __bfloat162float(__ushort_as_bfloat16(v.y));
+            sA[ar][ak + 2] = __bfloat162float(__ushort_as_bfloat16(v.z));
+            sA[ar][ak + 3] = __bfloat162float(__ushort_as_bfloat16(v.w));
+        } else {
+            #pragma unroll
+            for (unsigned int j = 0; j < 4; j++)
+                sA[ar][ak + j] = kb + ak + j < K
+                    ? __bfloat162float(A[(size_t)ar * K + kb + ak + j]) : 0.0f;
+        }
+
+        // B is 16x64 BF16 values. Flattened vector chunks keep each load
+        // contiguous within one checkpoint row while all 80 threads assist.
+        for (unsigned int b_chunk = tid; b_chunk < R5_BN * (R5_BK / 4); b_chunk += R5_M * R5_BN) {
+            const unsigned int bn = b_chunk / (R5_BK / 4);
+            const unsigned int bk = (b_chunk % (R5_BK / 4)) * 4;
+            const unsigned int global_n = blockIdx.x * R5_BN + bn;
+            if (global_n < N && kb + bk + 3 < K) {
+                ushort4 v = *(const ushort4*)(B + (size_t)global_n * K + kb + bk);
+                sB[bn][bk + 0] = __bfloat162float(__ushort_as_bfloat16(v.x));
+                sB[bn][bk + 1] = __bfloat162float(__ushort_as_bfloat16(v.y));
+                sB[bn][bk + 2] = __bfloat162float(__ushort_as_bfloat16(v.z));
+                sB[bn][bk + 3] = __bfloat162float(__ushort_as_bfloat16(v.w));
+            } else {
+                #pragma unroll
+                for (unsigned int j = 0; j < 4; j++)
+                    sB[bn][bk + j] = global_n < N && kb + bk + j < K
+                        ? __bfloat162float(B[(size_t)global_n * K + kb + bk + j]) : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll 8
+        for (unsigned int kk = 0; kk < R5_BK; kk++)
+            acc += sA[row][kk] * sB[local_col][kk];
+        __syncthreads();
+    }
+
+    if (col < N) C[(size_t)row * N + col] = __float2bfloat16(acc);
+}
+
+#undef R5_BK
+#undef R5_BN
+#undef R5_M
+
 // ─────────────────────────────────────────────────────────────────────────
 // Fix-E: tensor-core pipelined BF16 dense GEMM (dense_gemm_bf16_pipelined).
 //

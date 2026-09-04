@@ -4,6 +4,12 @@
 
 use super::*;
 
+#[inline]
+fn glm_k5_router_m5_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_K5_ROUTER_M5").as_deref() == Ok("1"))
+}
+
 impl MoeLayer {
     /// Pre-dequant dense (non-expert) NVFP4 weights to FP8 for zero-overhead prefill.
     ///
@@ -273,6 +279,25 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if ctx.config.model_type == "glm5_next"
+            && num_tokens == 5
+            && num_experts == 288
+            && hidden_size == 4096
+            && self.dense_gemm_router_m5.0 != 0
+            && glm_k5_router_m5_enabled()
+        {
+            return ops::dense_gemm_router_m5(
+                ctx.gpu,
+                self.dense_gemm_router_m5,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                num_tokens,
+                num_experts,
+                hidden_size,
+                stream,
+            );
+        }
         if self.dense_gemm_router.0 != 0 {
             return ops::dense_gemm_router(
                 ctx.gpu,

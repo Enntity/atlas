@@ -81,6 +81,11 @@ impl MoeLayer {
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             dense_gemm_router: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_router"),
+            dense_gemm_router_m5: super::super::try_kernel(
+                gpu,
+                "gemm",
+                "dense_gemm_bf16_router_m5",
+            ),
             dense_gemm_pipelined: super::super::try_kernel(
                 gpu,
                 "gemm",
