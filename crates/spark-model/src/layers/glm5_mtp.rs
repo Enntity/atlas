@@ -33,6 +33,23 @@ fn all_gather_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ATLAS_GLM_MTP_ALL_GATHER").ok().as_deref() == Some("1"))
 }
 
+fn fused_eh_norm_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("ATLAS_GLM_MTP_FUSED_EH_NORM").ok().as_deref() == Some("1"))
+}
+
+fn fused_eh_norm_check_once() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    *ENABLED.get_or_init(|| {
+        std::env::var("ATLAS_GLM_MTP_FUSED_EH_CHECK")
+            .ok()
+            .as_deref()
+            == Some("1")
+    }) && !CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Glm5MtpProposerState {
     pub block_table: Vec<u32>,
     pub seq_len: usize,
@@ -58,6 +75,7 @@ pub struct Glm5MtpHead {
     mtp_vocab_size: u32,
     kv_cache: Mutex<PagedKvCache>,
     rms_norm_k: KernelHandle,
+    fused_eh_norm_k: KernelHandle,
     dense_gemv_k: KernelHandle,
     dense_gemm_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
@@ -102,6 +120,9 @@ impl Glm5MtpHead {
             mtp_vocab_size,
             kv_cache: Mutex::new(kv_cache),
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
+            fused_eh_norm_k: gpu
+                .kernel("glm_mtp_eh_norm", "glm_mtp_eh_norm")
+                .unwrap_or(KernelHandle(0)),
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
@@ -135,36 +156,101 @@ impl Glm5MtpHead {
         let row_bytes = h * 2;
 
         // Upstream GLM: eh_proj(cat(enorm(embed(token)), hnorm(target_hidden))).
-        let embed = ctx.buffers.ssm_deinterleaved();
-        ctx.gpu.copy_d2d_async(
-            self.embed_tokens.weight.offset(token as usize * row_bytes),
-            embed,
-            row_bytes,
-            stream,
-        )?;
         let eh_input = ctx.buffers.ssm_qkvz();
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            embed,
-            &self.module.enorm,
-            eh_input,
-            1,
-            h_u32,
-            eps,
-            stream,
-        )?;
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            target_hidden,
-            &self.module.hnorm,
-            eh_input.offset(row_bytes),
-            1,
-            h_u32,
-            eps,
-            stream,
-        )?;
+        if fused_eh_norm_enabled() && self.fused_eh_norm_k.0 != 0 {
+            ops::glm_mtp_eh_norm(
+                ctx.gpu,
+                self.fused_eh_norm_k,
+                self.embed_tokens.weight,
+                token,
+                target_hidden,
+                &self.module.enorm,
+                &self.module.hnorm,
+                eh_input,
+                h_u32,
+                eps,
+                stream,
+            )?;
+            // One-shot on-device A/B for bring-up. Preserve the fused result
+            // in disposable attention scratch, run the established copy + two
+            // RMSNorm oracle, then require every BF16 output bit to match.
+            if fused_eh_norm_check_once() {
+                let bytes = 2 * row_bytes;
+                let fused = ctx.buffers.attn_output();
+                ctx.gpu.copy_d2d_async(eh_input, fused, bytes, stream)?;
+                let embed = ctx.buffers.ssm_deinterleaved();
+                ctx.gpu.copy_d2d_async(
+                    self.embed_tokens.weight.offset(token as usize * row_bytes),
+                    embed,
+                    row_bytes,
+                    stream,
+                )?;
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    embed,
+                    &self.module.enorm,
+                    eh_input,
+                    1,
+                    h_u32,
+                    eps,
+                    stream,
+                )?;
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    target_hidden,
+                    &self.module.hnorm,
+                    eh_input.offset(row_bytes),
+                    1,
+                    h_u32,
+                    eps,
+                    stream,
+                )?;
+                let mut got = vec![0u8; bytes];
+                let mut want = vec![0u8; bytes];
+                ctx.gpu.copy_d2h(fused, &mut got)?;
+                ctx.gpu.copy_d2h(eh_input, &mut want)?;
+                let mismatches = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+                anyhow::ensure!(
+                    mismatches == 0,
+                    "GLM MTP fused eh norms differ from oracle in {mismatches}/{bytes} bytes"
+                );
+                tracing::info!(
+                    "GLM MTP fused embedding/hidden norms: exact oracle match ({bytes} bytes)"
+                );
+            }
+        } else {
+            let embed = ctx.buffers.ssm_deinterleaved();
+            ctx.gpu.copy_d2d_async(
+                self.embed_tokens.weight.offset(token as usize * row_bytes),
+                embed,
+                row_bytes,
+                stream,
+            )?;
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                embed,
+                &self.module.enorm,
+                eh_input,
+                1,
+                h_u32,
+                eps,
+                stream,
+            )?;
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                target_hidden,
+                &self.module.hnorm,
+                eh_input.offset(row_bytes),
+                1,
+                h_u32,
+                eps,
+                stream,
+            )?;
+        }
         let h_in = ctx.buffers.hidden_states();
         if let Some(ref eh_proj) = self.module.eh_proj_nvfp4 {
             ops::w4a16_gemv(

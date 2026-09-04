@@ -795,3 +795,23 @@ target-forward work was also normalized by `completion_tokens -
 accepted_prediction_tokens`: capture measured 135.58 ms per target step mean
 and median, versus 139.24 mean and 138.41 median eager (-2.6% mean, -2.1%
 median). The normalized result is the conservative decode claim.
+
+### Fused MTP embedding and hidden-state normalization
+
+Each speculative draft previously copied one embedding row to scratch and
+then launched two independent RMSNorm kernels to construct
+`[enorm(embed(token)), hnorm(target_hidden)]`. `GLM_MTP_FUSED_EH_NORM=1`
+replaces those three operations with one two-CTA kernel: one CTA reads the
+embedding table directly and the other reads the target hidden state. The
+kernel deliberately preserves the established thread mapping, FP32 reduction
+tree, multiplication order, and BF16 conversion. The exact GLM launcher now
+defaults it on; `=0` retains the original path.
+
+For bring-up, `GLM_MTP_FUSED_EH_CHECK=1` saves the fused result, reruns the
+original copy plus two-normalization oracle, and requires every output byte to
+match. Both ranks independently reported zero differences across 16,384 bytes.
+With one warm-up followed by five forced-256 requests using a 1,005-token
+prompt, steady proposer windows improved from 13.791 ms mean / 13.780 ms
+median to 13.654 ms mean / 13.640 ms median (-1.0% for both). Raw endpoint
+throughput was inconclusive because accepted-draft counts varied, so the
+direct proposer timing is the performance claim.
