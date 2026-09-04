@@ -12,7 +12,7 @@ use std::any::Any;
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache, SparseIndexCacheConfig};
 
 use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};
 use crate::layers::mtp_meta::{MTP_META_OFFSET, pack_mtp_attn_meta};
@@ -72,12 +72,19 @@ impl Glm5MtpHead {
             cache_blocks_per_seq: None,
         };
         let num_blocks = max_seq_len / kv_config.block_size + 1;
+        let mut kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
+        if config.index_kpool > 0 && config.index_head_dim > 0 {
+            kv_cache.attach_sparse_index(
+                SparseIndexCacheConfig::bf16(config.index_kpool, config.index_head_dim),
+                gpu,
+            )?;
+        }
         Ok(Self {
             module,
             embed_tokens,
             lm_head,
             mtp_vocab_size,
-            kv_cache: Mutex::new(PagedKvCache::new(kv_config, num_blocks, gpu)?),
+            kv_cache: Mutex::new(kv_cache),
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
