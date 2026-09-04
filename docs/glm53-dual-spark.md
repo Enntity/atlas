@@ -109,6 +109,15 @@ up 32.7% in prefill from the 285.7 tok/s tiled baseline. Decode continues to
 use the latency-favorable one-head kernel. The exact-10K early needle receipt
 from `scripts/benchmark_glm53_niah.py` recovered `NEBULA-2847` verbatim.
 
+With sparse attention no longer dominating 10K, whole-model profiling showed
+the routed/shared MoE FFNs consuming about 0.64 seconds of a 1.19-second 1K
+model pass. Enabling Atlas's existing prequantized NVFP4 activation path and
+fused SiLU-quant kernel raised warmed 1K prefill from the previous 942.9 tok/s
+best to 963.3 tok/s, and raised 10K from 379.2 to 392.7 tok/s. Decode remained
+10.18 tok/s on the 10K workload. These two levers are now default-on in the GLM
+launcher; `NVFP4_PREQUANT_MOE=0 NVFP4_FUSED_SILU_QUANT=0` restores the BF16
+activation path. An exact-10K early-needle run still recovered `NEBULA-2847`.
+
 BF16 is deliberate for the first 100K correctness gate. FP8 halves the main KV
 value width and should improve capacity and bandwidth, but it needs its own
 needle/coherence A/B because quantization can change attention rankings. The
