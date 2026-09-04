@@ -239,6 +239,13 @@ __device__ __forceinline__ void moe_cp_async_pred_16(void* dst_smem, const void*
                  :: "r"(dst), "l"(src_gmem), "r"(src_bytes));
 }
 
+__device__ __forceinline__ void moe_cp_async_pred_4(void* dst_smem, const void* src_gmem, bool pred) {
+    unsigned int dst = __cvta_generic_to_shared(dst_smem);
+    unsigned int src_bytes = pred ? 4 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;"
+                 :: "r"(dst), "l"(src_gmem), "r"(src_bytes));
+}
+
 __device__ __forceinline__ void moe_cp_async_commit() {
     asm volatile("cp.async.commit_group;");
 }
@@ -1725,7 +1732,8 @@ extern "C" __global__ void moe_fp8_grouped_gemm_ptrtable_t(
 // quantization.  B remains in Atlas's shared transposed pointer-table layout,
 // so this adds no persistent weight copy.  Gate and up use two launches with
 // the same pre-quantized A; down reuses the entry after quantizing SiLU output.
-extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64(
+template<bool PQ_VEC_SCALES>
+__device__ __forceinline__ void moe_w4a4_grouped_gemm_prequant_t_k64_impl(
     const unsigned char* __restrict__ A_packed,
     const unsigned char* __restrict__ A_scale,
     const unsigned long long* __restrict__ B_packed_ptrs,
@@ -1773,7 +1781,7 @@ extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64(
     // 32-byte K run required by the native block-scaled MMA.
     __shared__ unsigned char smem_BpT_pq[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
     __shared__ unsigned char smem_Bp_pq[N_TILE_LG][K_STEP_T64 / 2 + 16];
-    __shared__ unsigned char smem_Bs_pq[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG + BP_PAD];
+    __shared__ unsigned char smem_Bs_pq[2][K_STEP_T64 / GROUP_SIZE][N_TILE_LG];
     __shared__ int smem_tok_pq[M_TILE];
 
     if (threadIdx.x < M_TILE) {
@@ -1806,8 +1814,18 @@ extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64(
                 &A_packed[(unsigned long long)a_row * (K / 2) + (kb) / 2 + col], \
                 valid); \
         } \
-        { \
-            /* 256 scale bytes: two jobs/thread. */ \
+        if constexpr (PQ_VEC_SCALES) { \
+            /* One aligned 4-byte transaction loads all four A scales/row. */ \
+            if (threadIdx.x < M_TILE) { \
+                unsigned int row = threadIdx.x; \
+                bool valid = (cta_m_local + row) < M_eff; \
+                unsigned int a_row = (unsigned int)smem_tok_pq[row]; \
+                moe_cp_async_pred_4(&smem_As_pq[(buf)][row][0], \
+                    &A_scale[(unsigned long long)a_row * (K / GROUP_SIZE) \
+                        + (kb) / GROUP_SIZE], valid); \
+            } \
+        } else { \
+            /* Conservative scalar scale loader. */ \
             _Pragma("unroll") \
             for (int job = 0; job < 2; job++) { \
                 unsigned int jid = threadIdx.x + job * 128; \
@@ -1834,7 +1852,18 @@ extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64(
                     (gke + 1 < K) && (gns + 15 < N)); \
             } \
         } \
-        { \
+        if constexpr (PQ_VEC_SCALES) { \
+            /* 32 aligned 16-byte transactions replace 512 scalar copies. */ \
+            if (threadIdx.x < 32) { \
+                unsigned int g = threadIdx.x >> 3; \
+                unsigned int ns = (threadIdx.x & 7) << 4; \
+                unsigned int sg = (kb) / GROUP_SIZE + g; \
+                unsigned int gns = cta_n + ns; \
+                moe_cp_async_pred_16(&smem_Bs_pq[(buf)][g][ns], \
+                    &S_expert[(unsigned long long)sg * N + gns], \
+                    (gns + 15 < N) && (sg < num_groups)); \
+            } \
+        } else { \
             unsigned int g = threadIdx.x >> 5; \
             unsigned int nn = threadIdx.x & 31; \
             unsigned int sg = (kb) / GROUP_SIZE + g; \
@@ -1935,3 +1964,30 @@ extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64(
         if (r1v && c1 < N) C[r1 * N + c1] = __float2bfloat16(acc[nt][3] * scale2);
     }
 }
+
+#define PQ4_PREQUANT_ARGS \
+    const unsigned char* A_packed, const unsigned char* A_scale, \
+    const unsigned long long* B_packed_ptrs, \
+    const unsigned long long* B_scale_ptrs, const float* scale2_vals, \
+    __nv_bfloat16* C, const int* expert_offsets, const int* sorted_token_ids, \
+    unsigned int num_experts, unsigned int N, unsigned int K
+
+#define PQ4_PREQUANT_CALL(VEC) \
+    moe_w4a4_grouped_gemm_prequant_t_k64_impl<VEC>( \
+        A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C, \
+        expert_offsets, sorted_token_ids, num_experts, N, K)
+
+extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64(
+    PQ4_PREQUANT_ARGS
+) {
+    PQ4_PREQUANT_CALL(false);
+}
+
+extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_vecscale(
+    PQ4_PREQUANT_ARGS
+) {
+    PQ4_PREQUANT_CALL(true);
+}
+
+#undef PQ4_PREQUANT_CALL
+#undef PQ4_PREQUANT_ARGS

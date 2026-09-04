@@ -37,10 +37,16 @@ impl MoeLayer {
             h,
             stream,
         )?;
+        let grouped_kernel = if self.nvfp4_vecscale && self.moe_w4a4_prequant_t_k64_vecscale.0 != 0
+        {
+            self.moe_w4a4_prequant_t_k64_vecscale
+        } else {
+            self.moe_w4a4_prequant_t_k64
+        };
         for (weight, output) in [(gate, expert_gate_out), (up, expert_up_out)] {
             ops::moe_w4a4_grouped_gemm_prequant_n128(
                 ctx.gpu,
-                self.moe_w4a4_prequant_t_k64,
+                grouped_kernel,
                 a_packed,
                 a_scale,
                 weight.packed_ptrs,
@@ -78,9 +84,15 @@ impl MoeLayer {
         // scales. No allocation or persistent memory is introduced.
         let a_packed = expert_up_out;
         let a_scale = a_packed.offset(total_expanded as usize * inter as usize / 2);
+        let grouped_kernel = if self.nvfp4_vecscale && self.moe_w4a4_prequant_t_k64_vecscale.0 != 0
+        {
+            self.moe_w4a4_prequant_t_k64_vecscale
+        } else {
+            self.moe_w4a4_prequant_t_k64
+        };
         ops::moe_w4a4_grouped_gemm_prequant_n128(
             ctx.gpu,
-            self.moe_w4a4_prequant_t_k64,
+            grouped_kernel,
             a_packed,
             a_scale,
             down.packed_ptrs,

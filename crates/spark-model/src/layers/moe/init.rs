@@ -147,6 +147,11 @@ impl MoeLayer {
                 "moe_w4a16",
                 "moe_w4a4_grouped_gemm_prequant_t_k64",
             ),
+            moe_w4a4_prequant_t_k64_vecscale: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale",
+            ),
             moe_nvfp4_mmq_gate_up_k: super::super::try_kernel(
                 gpu,
                 "moe_nvfp4_mmq",
@@ -437,6 +442,9 @@ impl MoeLayer {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             nvfp4_prequant_moe: std::env::var("ATLAS_NVFP4_PREQUANT_MOE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            nvfp4_vecscale: std::env::var("ATLAS_NVFP4_VECSCALE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             nvfp4_fused_silu_quant: std::env::var("ATLAS_NVFP4_FUSED_SILU_QUANT")

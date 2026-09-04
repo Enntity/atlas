@@ -275,6 +275,8 @@ pub struct MoeLayer {
     /// Quantize routed activations once, then use native block-scaled FP4 MMA
     /// for gate/up/down without any persistent weight duplication.
     nvfp4_prequant_moe: bool,
+    /// Vectorize NVFP4 activation/weight scale staging with cp.async.
+    nvfp4_vecscale: bool,
     /// Fuse DeepSeek/GLM SiLU·mul with activation NVFP4 quantization. The
     /// compact result is staged safely through down scratch before down GEMM.
     nvfp4_fused_silu_quant: bool,
@@ -304,6 +306,7 @@ pub struct MoeLayer {
     /// Optional M=32 NVFP4 twin of `moe_grouped_gemm_t_k64`.
     moe_grouped_gemm_t_k64_m32: KernelHandle,
     moe_w4a4_prequant_t_k64: KernelHandle,
+    moe_w4a4_prequant_t_k64_vecscale: KernelHandle,
     moe_nvfp4_mmq_gate_up_k: KernelHandle,
     moe_nvfp4_mmq_down_k: KernelHandle,
     moe_nvfp4_mmq_quantize_k: KernelHandle,
