@@ -878,3 +878,24 @@ BF16 control (-5.0% / -7.0%). Mean endpoint completion rate increased from
 12.45--12.77 ms to 10.68--11.03 ms (about 14%). Sampled acceptance did not
 regress; the mean of the five reported accepted-draft windows was 1.455 for
 NVFP4 and 1.397 for BF16.
+
+### Distributed MTP top-1 reduction
+
+The split-vocabulary proposer previously all-gathered both BF16 logit halves
+before running the ordinary full-vocabulary argmax. For unconstrained decode,
+`GLM_MTP_DISTRIBUTED_ARGMAX=1` now runs the identical first-strict-max
+reduction over each contiguous local half and exchanges only an 8-byte
+`(value, local_index)` pair per rank. Rank zero wins equal values, exactly
+matching the lower-token-ID tie break of the concatenated argmax. Requests
+with a grammar bitmask retain the established full-logit gather because their
+mask must inspect the complete vocabulary. The dual-Spark launcher enables
+the reduction whenever distributed MTP is enabled; `=0` is the direct
+full-gather fallback.
+
+On the same v51 image and 1,004-token-prompt, forced-256 workload, one warm-up
+plus six measured requests took 13.907 s mean / 13.714 s median with the
+distributed top-1 path versus 14.477 s / 14.259 s for the full-logit control
+(-3.9% / -3.8%). Mean endpoint decode increased from 17.719 to 18.432 tok/s
+(+4.0%). Direct steady proposer windows show the conservative gain is smaller,
+roughly 1--2% (about 10.70--10.85 ms versus 10.80--11.00 ms); endpoint spread
+still reflects generated-sequence variance.

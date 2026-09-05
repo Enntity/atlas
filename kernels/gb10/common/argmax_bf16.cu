@@ -55,6 +55,48 @@ extern "C" __global__ void argmax_bf16(
     }
 }
 
+// Local shard argmax for distributed vocabulary projection. The reduction is
+// byte-for-byte the same as `argmax_bf16`; thread zero additionally preserves
+// the winning BF16 value as FP32 beside its shard-local index. Two ranks can
+// exchange this 8-byte pair instead of all BF16 logits, then select rank one
+// only when its value is strictly greater. That reproduces the full-row
+// lower-index tie break because rank zero owns the leading vocabulary range.
+extern "C" __global__ void argmax_bf16_value(
+    const __nv_bfloat16* __restrict__ logits,
+    unsigned int* __restrict__ out_value_index,
+    unsigned int n
+) {
+    __shared__ float s_val[1024];
+    __shared__ unsigned int s_idx[1024];
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int stride = blockDim.x;
+    float local_max = -1e30f;
+    unsigned int local_idx = 0;
+    for (unsigned int i = tid; i < n; i += stride) {
+        const float v = __bfloat162float(logits[i]);
+        if (v > local_max) {
+            local_max = v;
+            local_idx = i;
+        }
+    }
+    s_val[tid] = local_max;
+    s_idx[tid] = local_idx;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && s_val[tid + s] > s_val[tid]) {
+            s_val[tid] = s_val[tid + s];
+            s_idx[tid] = s_idx[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out_value_index[0] = __float_as_uint(s_val[0]);
+        out_value_index[1] = s_idx[0];
+    }
+}
+
 // BATCHED argmax over BF16 logits — ONE BLOCK PER ROW.
 //
 // `argmax_batch` used to launch this kernel n times on the same stream, and the

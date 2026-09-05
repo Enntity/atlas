@@ -33,6 +33,16 @@ fn all_gather_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ATLAS_GLM_MTP_ALL_GATHER").ok().as_deref() == Some("1"))
 }
 
+fn distributed_argmax_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ATLAS_GLM_MTP_DISTRIBUTED_ARGMAX")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 fn fused_eh_norm_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
@@ -97,6 +107,7 @@ pub struct Glm5MtpHead {
     w4a16_gemv_k: KernelHandle,
     bf16_concat_k: KernelHandle,
     argmax_k: KernelHandle,
+    argmax_value_k: KernelHandle,
 }
 
 impl Glm5MtpHead {
@@ -144,6 +155,7 @@ impl Glm5MtpHead {
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             bf16_concat_k: gpu.kernel("residual_add", "bf16_concat")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
+            argmax_value_k: gpu.kernel("argmax", "argmax_bf16_value")?,
         })
     }
 
@@ -524,7 +536,9 @@ impl Glm5MtpHead {
             );
             started = Some(std::time::Instant::now());
         }
-        if distributed_enabled() {
+        let local_argmax =
+            distributed_enabled() && distributed_argmax_enabled() && grammar_bitmask.is_none();
+        if distributed_enabled() && !local_argmax {
             let comm = ctx.comm.expect("distributed communicator checked above");
             let local = projected_vocab as usize;
             if all_gather_enabled() {
@@ -558,6 +572,29 @@ impl Glm5MtpHead {
         let out = ctx.buffers.scratch();
         let draft = if let Some(mask) = grammar_bitmask {
             grammar_argmax(ctx.gpu, logits, vocab as usize, mask)?
+        } else if local_argmax {
+            // Preserve full-vocabulary argmax semantics without materializing
+            // peer logits. Each rank reduces its contiguous half with the same
+            // first-strict-max tree, then exchanges one `(f32,u32)` pair. Rank
+            // zero wins an equal-value tie because it owns lower token IDs.
+            let local_pair = out.offset(32);
+            ops::argmax_bf16_value(
+                ctx.gpu,
+                self.argmax_value_k,
+                local_logits,
+                local_pair,
+                projected_vocab,
+                stream,
+            )?;
+            let comm = ctx.comm.expect("distributed communicator checked above");
+            comm.all_gather(local_pair.0, out.0, 8)?;
+            let mut pairs = [0u8; 16];
+            ctx.gpu.copy_d2h(out, &mut pairs)?;
+            let v0 = f32::from_le_bytes(pairs[0..4].try_into().expect("rank-0 max bytes"));
+            let i0 = u32::from_le_bytes(pairs[4..8].try_into().expect("rank-0 index bytes"));
+            let v1 = f32::from_le_bytes(pairs[8..12].try_into().expect("rank-1 max bytes"));
+            let i1 = u32::from_le_bytes(pairs[12..16].try_into().expect("rank-1 index bytes"));
+            if v1 > v0 { i1 + projected_vocab } else { i0 }
         } else {
             ops::argmax_bf16(ctx.gpu, self.argmax_k, logits, out, vocab, stream)?;
             let mut bytes = [0u8; 4];
