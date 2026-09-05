@@ -859,3 +859,22 @@ sample (148.0 control versus 150.8 candidate). A natural arithmetic request
 continued to return the correct result. `GLM_MTP_PROFILE=1` enables the
 synchronized MTP-only phase profiler used for this analysis; it remains off by
 default and should never be used for throughput measurements.
+
+### Decode-native MTP MLA output projection
+
+The appended predictor's full-rank MLA output projection remained a BF16
+`[4096, 16384]` matrix and was streamed once for every serial draft. The
+predictor-only `GLM_MTP_NVFP4_WO` path now constructs a compact NVFP4 copy at
+load time and sends the one-row output projection through Atlas's established
+decode GEMV. Target-model MLA layers are unchanged, the BF16 predictor weight
+is retained as the `=0` fallback, and the launcher defaults the measured path
+on.
+
+On the same v49 image, 1,004-token prompt, forced-256 output, and fixed seed
+set, one warm-up plus six measured requests took 13.778 s mean / 13.440 s
+median with the native-NVFP4 projection versus 14.508 s / 14.448 s with the
+BF16 control (-5.0% / -7.0%). Mean endpoint completion rate increased from
+17.654 to 18.621 tok/s (+5.5%). Steady proposer windows fell from roughly
+12.45--12.77 ms to 10.68--11.03 ms (about 14%). Sampled acceptance did not
+regress; the mean of the five reported accepted-draft windows was 1.455 for
+NVFP4 and 1.397 for BF16.

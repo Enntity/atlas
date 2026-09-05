@@ -12,6 +12,7 @@ use crate::layers::{FfnComponent, Glm5KdaLayer};
 use crate::tp_shard::shard_dense_bf16;
 use crate::weight_map::{
     AttentionWeights, DenseWeight, QuantizeCtx, QuantizedWeight, dense_auto, detect_nvfp4_variant,
+    quantize_to_nvfp4,
 };
 
 pub(super) fn load_all(
@@ -127,6 +128,29 @@ pub(super) fn load_mla_layer(
     let wkv_a = dense_auto(store, &format!("{p}.kv_a_proj_with_mqa.weight"), gpu)?;
     let wkv_b = load_tp("kv_b_proj", tp.kv_b())?;
     let wo = load_tp("o_proj", tp.o())?;
+    // The appended predictor repeats this large projection once per serial
+    // draft. Keep BF16 as the exact fallback, but optionally add the compact
+    // decode-native representation used by Atlas's NVFP4 attention paths.
+    // Target layers remain untouched: `force_dimension_overrides` uniquely
+    // identifies the replicated TP1 MTP body.
+    let wo_nvfp4 = if force_dimension_overrides
+        && std::env::var("ATLAS_GLM_MTP_NVFP4_WO").ok().as_deref() == Some("1")
+    {
+        let (wo_n, wo_k, _) = tp.o();
+        let q = quantize_to_nvfp4(
+            &wo,
+            wo_n,
+            wo_k,
+            gpu,
+            gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
+            gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+            gpu.default_stream(),
+        )?;
+        tracing::info!("GLM-5 MTP MLA o_proj: built decode-native NVFP4 copy");
+        Some(q)
+    } else {
+        None
+    };
     let wq_b_shape = tp.local_q_b_shape();
     let wkv_b_shape = tp.local_kv_b_shape();
     let (w_uk_t, w_uv, wq_b_rope, _) = super::super::deepseek_v4::compute::build_per_head_views(
@@ -175,7 +199,7 @@ pub(super) fn load_mla_layer(
         wkv_a_rope: null,
         wkv_a_merged: wkv_a,
         wo,
-        wo_nvfp4: None,
+        wo_nvfp4,
         wo_a: null,
         wo_a_nvfp4: None,
         wo_a_fp8: None,

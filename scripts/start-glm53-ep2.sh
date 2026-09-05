@@ -91,6 +91,7 @@ GLM_K5_HC_CUBLAS="${GLM_K5_HC_CUBLAS:-1}"
 # The appended predictor rereads its 4096x8192 input combiner once per draft.
 # Keep a compact NVFP4 decode copy; BF16 remains resident for batched KV prefill.
 GLM_MTP_NVFP4_EH="${GLM_MTP_NVFP4_EH:-1}"
+GLM_MTP_NVFP4_WO="${GLM_MTP_NVFP4_WO:-1}"
 # Experimental distributed proposer: keep disabled unless both ranks should
 # load and execute the appended layer with the target's overlapping TP2/EP2.
 GLM_MTP_DISTRIBUTED="${GLM_MTP_DISTRIBUTED:-0}"
@@ -201,6 +202,10 @@ if [[ "$MTP_TIMING" != "0" && "$MTP_TIMING" != "1" ]]; then
 fi
 if [[ "$MTP_ACCEPT_DEBUG" != "0" && "$MTP_ACCEPT_DEBUG" != "1" ]]; then
   echo "ERROR: MTP_ACCEPT_DEBUG must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_MTP_NVFP4_WO" != "0" && "$GLM_MTP_NVFP4_WO" != "1" ]]; then
+  echo "ERROR: GLM_MTP_NVFP4_WO must be 0 or 1." >&2
   exit 2
 fi
 if [[ "$GLM_MTP_DISTRIBUTED" != "0" && "$GLM_MTP_DISTRIBUTED" != "1" ]]; then
@@ -476,6 +481,7 @@ echo "  GLM K5 compact native-FP4 MoE: $GLM_K5_COMPACT_MOE"
 echo "  GLM K5 fused compact gate/up: $GLM_K5_FUSED_COMPACT_GATE_UP"
 echo "  GLM K5 batched TF32 mHC: $GLM_K5_HC_CUBLAS"
 echo "  GLM MTP decode-native NVFP4 eh_proj: $GLM_MTP_NVFP4_EH"
+echo "  GLM MTP decode-native NVFP4 MLA o_proj: $GLM_MTP_NVFP4_WO"
 echo "  GLM mirrored-body split-vocabulary MTP: $GLM_MTP_DISTRIBUTED"
 echo "  GLM MTP one-collective vocabulary gather: $GLM_MTP_ALL_GATHER"
 echo "  GLM K5 exact-M5 BF16 router: $GLM_K5_ROUTER_M5"
@@ -550,6 +556,7 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP=$GLM_K5_FUSED_COMPACT_GATE_UP \
   -e ATLAS_GLM_K5_HC_CUBLAS=$GLM_K5_HC_CUBLAS \
   -e ATLAS_GLM_MTP_NVFP4_EH=$GLM_MTP_NVFP4_EH \
+  -e ATLAS_GLM_MTP_NVFP4_WO=$GLM_MTP_NVFP4_WO \
   -e ATLAS_GLM_MTP_DISTRIBUTED=$GLM_MTP_DISTRIBUTED \
   -e ATLAS_GLM_MTP_ALL_GATHER=$GLM_MTP_ALL_GATHER \
   -e ATLAS_GLM_K5_ROUTER_M5=$GLM_K5_ROUTER_M5 \
@@ -618,6 +625,7 @@ docker run -d \
   -e ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP="$GLM_K5_FUSED_COMPACT_GATE_UP" \
   -e ATLAS_GLM_K5_HC_CUBLAS="$GLM_K5_HC_CUBLAS" \
   -e ATLAS_GLM_MTP_NVFP4_EH="$GLM_MTP_NVFP4_EH" \
+  -e ATLAS_GLM_MTP_NVFP4_WO="$GLM_MTP_NVFP4_WO" \
   -e ATLAS_GLM_MTP_DISTRIBUTED="$GLM_MTP_DISTRIBUTED" \
   -e ATLAS_GLM_MTP_ALL_GATHER="$GLM_MTP_ALL_GATHER" \
   -e ATLAS_GLM_K5_ROUTER_M5="$GLM_K5_ROUTER_M5" \
