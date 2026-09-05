@@ -39,7 +39,11 @@ NCCL_HCA="${NCCL_HCA:-rocep1s0f1}"
 PROFILE="${PROFILE:-0}"
 MS_PROFILE="${MS_PROFILE:-0}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-}"
-LM_HEAD_DTYPE="${LM_HEAD_DTYPE:-default}"
+# The checkpoint leaves its tied vocabulary projection in BF16. On dual GB10,
+# converting that projection once at load time lets K=5 verification use the
+# native block-scaled FP4 path and improves sustained decode. Keep `bf16` as an
+# explicit exact-head fallback for quality comparisons.
+LM_HEAD_DTYPE="${LM_HEAD_DTYPE:-nvfp4}"
 KDA_REGRESIDENT_PREFILL="${KDA_REGRESIDENT_PREFILL:-1}"
 KDA_MULTI_SEQ="${KDA_MULTI_SEQ:-1}"
 KDA_BATCHED_FFN="${KDA_BATCHED_FFN:-1}"

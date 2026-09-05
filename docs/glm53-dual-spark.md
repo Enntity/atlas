@@ -921,3 +921,21 @@ disabled control (+13.7% mean). Mean accepted predictions were 59.5 versus
 59.125. Steady verifier forwards fell from roughly 108.2 ms to 97--99 ms. A
 separate natural decode returned the correct `73 * 19 = 1387` result with its
 reasoning kept separate from visible content.
+
+### Native-NVFP4 target vocabulary head
+
+The model checkpoint stores its tied target vocabulary projection in BF16.
+For this model-specific dual-GB10 launcher, `LM_HEAD_DTYPE` now defaults to
+`nvfp4`, quantizing that projection once while loading and using Atlas's native
+block-scaled FP4 path during verification. `LM_HEAD_DTYPE=bf16` retains the
+one-pass exact BF16 implementation above as the explicit precision fallback.
+
+With an identical v65 binary, conservative 512-token sequence cap, one warm-up,
+and four measured forced-256 requests, native NVFP4 reached 22.794 tok/s mean
+and 22.882 tok/s median. The BF16 control reached 21.840 tok/s mean and 21.595
+tok/s median, a 6.0% median sustained-decode improvement. Mean accepted draft
+counts were 150.25 and 149.5 respectively. Direct verifier-forward timing fell
+from roughly 99--101 ms to about 94--96 ms. A natural exact-arithmetic check
+completed with the correct `1384` response and reasoning separated from visible
+content. These results apply to the target vocabulary projection only; model
+body weights remain the checkpoint's original NVFP4 tensors.
