@@ -50,6 +50,22 @@ fn fused_eh_norm_check_once() -> bool {
     }) && !CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn mtp_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ATLAS_GLM_MTP_PROFILE").ok().as_deref() == Some("1"))
+}
+
+fn mtp_bf16_drafts() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("ATLAS_GLM_MTP_BF16_DRAFTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+            .min(4)
+    })
+}
+
 pub struct Glm5MtpProposerState {
     pub block_table: Vec<u32>,
     pub seq_len: usize,
@@ -154,6 +170,8 @@ impl Glm5MtpHead {
         let h_u32 = h as u32;
         let eps = ctx.config.rms_norm_eps as f32;
         let row_bytes = h * 2;
+        let profile = mtp_profile_enabled();
+        let mut started = profile.then(std::time::Instant::now);
 
         // Upstream GLM: eh_proj(cat(enorm(embed(token)), hnorm(target_hidden))).
         let eh_input = ctx.buffers.ssm_qkvz();
@@ -251,6 +269,18 @@ impl Glm5MtpHead {
                 stream,
             )?;
         }
+        if profile {
+            ctx.gpu.synchronize(stream)?;
+            tracing::info!(
+                "GLM MTP PROFILE input_norm={}us",
+                started
+                    .take()
+                    .expect("MTP profile timer")
+                    .elapsed()
+                    .as_micros()
+            );
+            started = Some(std::time::Instant::now());
+        }
         let h_in = ctx.buffers.hidden_states();
         if let Some(ref eh_proj) = self.module.eh_proj_nvfp4 {
             ops::w4a16_gemv(
@@ -274,6 +304,18 @@ impl Glm5MtpHead {
                 (2 * h) as u32,
                 stream,
             )?;
+        }
+        if profile {
+            ctx.gpu.synchronize(stream)?;
+            tracing::info!(
+                "GLM MTP PROFILE eh_proj={}us",
+                started
+                    .take()
+                    .expect("MTP profile timer")
+                    .elapsed()
+                    .as_micros()
+            );
+            started = Some(std::time::Instant::now());
         }
 
         let mut kv_cache = self.kv_cache.lock();
@@ -314,7 +356,7 @@ impl Glm5MtpHead {
             levers: ctx.levers,
             stats: ctx.stats,
             attn_metadata: Some(mtp_meta),
-            profile: ctx.profile,
+            profile: ctx.profile || profile,
             // Both ranks execute the checkpoint-native full proposer body.
             // Only the vocabulary projection below is distributed.
             comm: None,
@@ -344,6 +386,17 @@ impl Glm5MtpHead {
             &mtp_ctx,
             stream,
         )?;
+        if profile {
+            ctx.gpu.synchronize(stream)?;
+            tracing::info!(
+                "GLM MTP PROFILE body_total={}us",
+                started
+                    .take()
+                    .expect("MTP profile timer")
+                    .elapsed()
+                    .as_micros()
+            );
+        }
         drop(kv_cache);
 
         state.seq_len += 1;
@@ -363,6 +416,8 @@ impl Glm5MtpHead {
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<u32> {
         let h_out = self.forward_body_one(token, target_hidden, position, state, ctx, stream)?;
+        let profile = mtp_profile_enabled();
+        let mut started = profile.then(std::time::Instant::now);
         let h_u32 = ctx.config.hidden_size as u32;
         let eps = ctx.config.rms_norm_eps as f32;
 
@@ -378,6 +433,18 @@ impl Glm5MtpHead {
             eps,
             stream,
         )?;
+        if profile {
+            ctx.gpu.synchronize(stream)?;
+            tracing::info!(
+                "GLM MTP PROFILE final_norm={}us",
+                started
+                    .take()
+                    .expect("MTP profile timer")
+                    .elapsed()
+                    .as_micros()
+            );
+            started = Some(std::time::Instant::now());
+        }
         let vocab = if self.mtp_vocab_size > 0 {
             self.mtp_vocab_size.min(ctx.config.vocab_size as u32)
         } else {
@@ -398,10 +465,10 @@ impl Glm5MtpHead {
             (0, vocab)
         };
         let local_logits = logits.offset(vocab_start * 2);
-        // Preserve the two highest-leverage draft decisions with the target's
+        // Preserve the configured leading draft decisions with the target's
         // BF16 tied head. Later drafts are always verified before emission and
-        // can use the cheaper NVFP4 projection without destabilizing p1/p2.
-        if draft_index > 1
+        // can use the cheaper NVFP4 projection; the launcher keeps p1 in BF16.
+        if draft_index >= mtp_bf16_drafts()
             && let Some(ref head) = self.lm_head_nvfp4
         {
             let local_head = QuantizedWeight {
@@ -445,6 +512,18 @@ impl Glm5MtpHead {
                 stream,
             )?;
         }
+        if profile {
+            ctx.gpu.synchronize(stream)?;
+            tracing::info!(
+                "GLM MTP PROFILE lm_head={}us draft={draft_index}",
+                started
+                    .take()
+                    .expect("MTP profile timer")
+                    .elapsed()
+                    .as_micros()
+            );
+            started = Some(std::time::Instant::now());
+        }
         if distributed_enabled() {
             let comm = ctx.comm.expect("distributed communicator checked above");
             let local = projected_vocab as usize;
@@ -464,6 +543,18 @@ impl Glm5MtpHead {
                 }
             }
         }
+        if profile {
+            ctx.gpu.synchronize(stream)?;
+            tracing::info!(
+                "GLM MTP PROFILE vocab_collective={}us",
+                started
+                    .take()
+                    .expect("MTP profile timer")
+                    .elapsed()
+                    .as_micros()
+            );
+            started = Some(std::time::Instant::now());
+        }
         let out = ctx.buffers.scratch();
         let draft = if let Some(mask) = grammar_bitmask {
             grammar_argmax(ctx.gpu, logits, vocab as usize, mask)?
@@ -473,6 +564,16 @@ impl Glm5MtpHead {
             ctx.gpu.copy_d2h(out, &mut bytes)?;
             u32::from_le_bytes(bytes)
         };
+        if profile {
+            tracing::info!(
+                "GLM MTP PROFILE argmax_readback={}us",
+                started
+                    .take()
+                    .expect("MTP profile timer")
+                    .elapsed()
+                    .as_micros()
+            );
+        }
         Ok(draft)
     }
 

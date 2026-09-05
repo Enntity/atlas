@@ -838,3 +838,24 @@ testing normalized by target steps improved from 136.43 ms to 135.17 ms mean
 (-0.92%); medians were 135.75 ms and 135.52 ms. Raw token rates remain
 acceptance-dependent, so the normalized and direct phase measurements are the
 reliable claims.
+
+### Mixed-precision MTP vocabulary policy
+
+The appended predictor's per-draft profile showed that its full MLA+MoE body
+cost about 1.8 ms, while each BF16 half-vocabulary projection cost another
+1.7 ms. The already-established NVFP4 projection used by drafts three and four
+needed only 0.45--0.50 ms. `GLM_MTP_BF16_DRAFTS` now controls how many leading
+drafts retain the exact tied BF16 head. The dual-Spark launcher defaults to one:
+draft one remains BF16, while drafts two through four use the compact head.
+`=2` restores the previous policy exactly, and values zero through four remain
+available for controlled acceptance studies.
+
+On the same image and 1,004-token-prompt, forced-256 workload, changing the
+leading BF16 count from two to one reduced steady proposer windows from about
+13.6 ms to 12.4--12.6 ms (roughly 8%). One warm-up plus six measured requests
+reduced endpoint wall time from 14.727 s mean / 14.752 s median to 14.250 s /
+14.117 s (-3.2% / -4.3%). Mean accepted predictions did not regress in that
+sample (148.0 control versus 150.8 candidate). A natural arithmetic request
+continued to return the correct result. `GLM_MTP_PROFILE=1` enables the
+synchronized MTP-only phase profiler used for this analysis; it remains off by
+default and should never be used for throughput measurements.
