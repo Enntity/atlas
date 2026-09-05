@@ -899,3 +899,25 @@ distributed top-1 path versus 14.477 s / 14.259 s for the full-logit control
 (+4.0%). Direct steady proposer windows show the conservative gain is smaller,
 roughly 1--2% (about 10.70--10.85 ms versus 10.80--11.00 ms); endpoint spread
 still reflects generated-sequence variance.
+
+### One-pass exact BF16 target vocabulary head
+
+GLM's K=5 verifier retains the model's exact BF16 target vocabulary head, but
+the five normalized hidden rows previously fell through to the generic tiny-M
+GEMM. With `GLM_K5_BF16_LMHEAD_BATCHM=1`, Atlas dispatches those exact five
+rows through its existing batched BF16 GEMV instead. That kernel streams each
+vocabulary weight row once and reuses it across all five hidden rows. No model
+weights or output logits are quantized; `=0` restores the generic GEMM path.
+`LM_HEAD_DTYPE=default|bf16|nvfp4|fp8` is also exposed by the launcher so head
+precision experiments are explicit, while the production default remains the
+model's configured dtype.
+
+The one-shot `GLM_K5_BF16_LMHEAD_BATCHM_CHECK=1` oracle reruns the former GEMM
+and requires all five target argmax IDs to match. It passed independently on
+both physical ranks. On an identical image with one warm-up followed by eight
+forced 96-token requests, the optimized path reached 24.411 tok/s mean and
+24.423 tok/s median versus 21.471 tok/s mean and 21.691 tok/s median for the
+disabled control (+13.7% mean). Mean accepted predictions were 59.5 versus
+59.125. Steady verifier forwards fell from roughly 108.2 ms to 97--99 ms. A
+separate natural decode returned the correct `73 * 19 = 1387` result with its
+reasoning kept separate from visible content.

@@ -39,6 +39,7 @@ NCCL_HCA="${NCCL_HCA:-rocep1s0f1}"
 PROFILE="${PROFILE:-0}"
 MS_PROFILE="${MS_PROFILE:-0}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-}"
+LM_HEAD_DTYPE="${LM_HEAD_DTYPE:-default}"
 KDA_REGRESIDENT_PREFILL="${KDA_REGRESIDENT_PREFILL:-1}"
 KDA_MULTI_SEQ="${KDA_MULTI_SEQ:-1}"
 KDA_BATCHED_FFN="${KDA_BATCHED_FFN:-1}"
@@ -110,6 +111,8 @@ GLM_K5_FUSED_MOE_HC_CHECK="${GLM_K5_FUSED_MOE_HC_CHECK:-0}"
 GLM_K5_BATCHED_CONV_SNAPSHOT="${GLM_K5_BATCHED_CONV_SNAPSHOT:-1}"
 GLM_K5_BATCHED_RECURRENT_SNAPSHOT="${GLM_K5_BATCHED_RECURRENT_SNAPSHOT:-1}"
 GLM_K5_FUSED_QKV="${GLM_K5_FUSED_QKV:-1}"
+GLM_K5_BF16_LMHEAD_BATCHM="${GLM_K5_BF16_LMHEAD_BATCHM:-1}"
+GLM_K5_BF16_LMHEAD_BATCHM_CHECK="${GLM_K5_BF16_LMHEAD_BATCHM_CHECK:-0}"
 if [[ -z "$MTP_SINGLE_DEPTH_ADAPT" ]]; then
   if [[ "$GLM_K5_COMPACT_MOE" == "1" ]]; then
     MTP_SINGLE_DEPTH_ADAPT=0
@@ -139,6 +142,14 @@ if [[ ! "$REQUEST_TIMEOUT" =~ ^[0-9]+$ ]]; then
   echo "ERROR: REQUEST_TIMEOUT must be a non-negative integer number of seconds." >&2
   exit 2
 fi
+
+case "$LM_HEAD_DTYPE" in
+  default|bf16|nvfp4|fp8) ;;
+  *)
+    echo "ERROR: LM_HEAD_DTYPE must be default, bf16, nvfp4, or fp8." >&2
+    exit 2
+    ;;
+esac
 
 if [[ "$TP_SIZE" != "1" && "$TP_SIZE" != "2" ]]; then
   echo "ERROR: dual-Spark GLM-5.3 supports TP_SIZE=1 or overlapping TP_SIZE=2." >&2
@@ -243,6 +254,14 @@ if [[ "$GLM_MTP_FUSED_EH_NORM" != "0" && "$GLM_MTP_FUSED_EH_NORM" != "1" ]]; the
 fi
 if [[ "$GLM_MTP_FUSED_EH_CHECK" != "0" && "$GLM_MTP_FUSED_EH_CHECK" != "1" ]]; then
   echo "ERROR: GLM_MTP_FUSED_EH_CHECK must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_K5_BF16_LMHEAD_BATCHM" != "0" && "$GLM_K5_BF16_LMHEAD_BATCHM" != "1" ]]; then
+  echo "ERROR: GLM_K5_BF16_LMHEAD_BATCHM must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_K5_BF16_LMHEAD_BATCHM_CHECK" != "0" && "$GLM_K5_BF16_LMHEAD_BATCHM_CHECK" != "1" ]]; then
+  echo "ERROR: GLM_K5_BF16_LMHEAD_BATCHM_CHECK must be 0 or 1." >&2
   exit 2
 fi
 if [[ "$GLM_MTP_PROFILE" != "0" && "$GLM_MTP_PROFILE" != "1" ]]; then
@@ -429,6 +448,7 @@ COMMON_SERVE_ARGS=(
   --kv-cache-dtype bf16
   --oom-guard-mb "$OOM_GUARD_MB"
   --request-timeout "$REQUEST_TIMEOUT"
+  --lm-head-dtype "$LM_HEAD_DTYPE"
 )
 if [[ "$PROFILE" == "1" ]]; then
   COMMON_SERVE_ARGS+=(--profile)
@@ -469,6 +489,7 @@ echo "  NVFP4 grouped CUTLASS MoE: $NVFP4_CUTLASS_MOE"
 echo "  dense FFN native FP4 prefill: $FP4_PREFILL"
 echo "  MoE exact grid / fallback load factor: $MOE_PREFILL_EXACT_TILES / $MOE_PREFILL_MAX_LOAD_FACTOR"
 echo "  tool-call parser override: ${TOOL_CALL_PARSER:-model default}"
+echo "  LM head dtype: $LM_HEAD_DTYPE"
 echo "  MTP speculative / draft tokens: $SPECULATIVE / $NUM_DRAFTS"
 echo "  MTP during thinking / force gate: $MTP_SPEC_THINK / $MTP_GATE_FORCE"
 echo "  MTP per-request K3/K5 adaptation: $MTP_SINGLE_DEPTH_ADAPT"
@@ -503,6 +524,8 @@ echo "  GLM K5 fused MoE blend + mHC post: $GLM_K5_FUSED_MOE_HC"
 echo "  GLM K5 batched conv snapshots: $GLM_K5_BATCHED_CONV_SNAPSHOT"
 echo "  GLM K5 batched recurrent snapshots: $GLM_K5_BATCHED_RECURRENT_SNAPSHOT"
 echo "  GLM K5 fused native-FP4 QKV: $GLM_K5_FUSED_QKV"
+echo "  GLM K5 one-pass BF16 vocabulary head: $GLM_K5_BF16_LMHEAD_BATCHM"
+echo "  GLM K5 BF16 vocabulary-head oracle: $GLM_K5_BF16_LMHEAD_BATCHM_CHECK"
 echo "  shared-expert / EP-reduce overlap: $MOE_SHARED_REDUCE_OVERLAP"
 echo "  GLM serial MTP prefill probe: $GLM_MTP_SERIAL_PREFILL"
 echo "  GLM batched MTP KV prefill: $GLM_MTP_BATCHED_PREFILL"
@@ -581,6 +604,8 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_GLM_K5_BATCHED_CONV_SNAPSHOT=$GLM_K5_BATCHED_CONV_SNAPSHOT \
   -e ATLAS_GLM_K5_BATCHED_RECURRENT_SNAPSHOT=$GLM_K5_BATCHED_RECURRENT_SNAPSHOT \
   -e ATLAS_GLM_K5_FUSED_QKV=$GLM_K5_FUSED_QKV \
+  -e ATLAS_GLM_K5_BF16_LMHEAD_BATCHM=$GLM_K5_BF16_LMHEAD_BATCHM \
+  -e ATLAS_GLM_K5_BF16_LMHEAD_BATCHM_CHECK=$GLM_K5_BF16_LMHEAD_BATCHM_CHECK \
   -e ATLAS_MOE_SHARED_REDUCE_OVERLAP=$MOE_SHARED_REDUCE_OVERLAP \
   -e ATLAS_GLM_MTP_SERIAL_PREFILL=$GLM_MTP_SERIAL_PREFILL \
   -e ATLAS_GLM_MTP_BATCHED_PREFILL=$GLM_MTP_BATCHED_PREFILL \
@@ -651,6 +676,8 @@ docker run -d \
   -e ATLAS_GLM_K5_BATCHED_CONV_SNAPSHOT="$GLM_K5_BATCHED_CONV_SNAPSHOT" \
   -e ATLAS_GLM_K5_BATCHED_RECURRENT_SNAPSHOT="$GLM_K5_BATCHED_RECURRENT_SNAPSHOT" \
   -e ATLAS_GLM_K5_FUSED_QKV="$GLM_K5_FUSED_QKV" \
+  -e ATLAS_GLM_K5_BF16_LMHEAD_BATCHM="$GLM_K5_BF16_LMHEAD_BATCHM" \
+  -e ATLAS_GLM_K5_BF16_LMHEAD_BATCHM_CHECK="$GLM_K5_BF16_LMHEAD_BATCHM_CHECK" \
   -e ATLAS_MOE_SHARED_REDUCE_OVERLAP="$MOE_SHARED_REDUCE_OVERLAP" \
   -e ATLAS_GLM_MTP_SERIAL_PREFILL="$GLM_MTP_SERIAL_PREFILL" \
   -e ATLAS_GLM_MTP_BATCHED_PREFILL="$GLM_MTP_BATCHED_PREFILL" \
