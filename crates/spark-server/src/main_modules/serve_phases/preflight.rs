@@ -23,10 +23,16 @@ fn glm5_dual_spark_parallelism(world: usize, tp: usize, ep: usize) -> bool {
     world == 2 && ep == 2 && matches!(tp, 1 | 2)
 }
 
-fn glm5_concurrency_supported(max_batch: usize, max_num_seqs: usize, ep_v2: bool) -> bool {
-    (1..=3).contains(&max_batch)
-        && (max_batch..=5).contains(&max_num_seqs)
-        && (max_batch == 1 || ep_v2)
+fn glm5_concurrency_supported(
+    max_batch: usize,
+    max_num_seqs: usize,
+    ep_v2: bool,
+    c4: bool,
+) -> bool {
+    (c4 && max_batch == 4 && max_num_seqs == 4 && ep_v2)
+        || ((1..=3).contains(&max_batch)
+            && (max_batch..=5).contains(&max_num_seqs)
+            && (max_batch == 1 || ep_v2))
 }
 
 fn glm5_context_supported(max_seq_len: usize, max_prefill_tokens: usize, model_max: usize) -> bool {
@@ -75,10 +81,36 @@ pub(crate) fn preflight_reserve(
             config.max_position_embeddings,
         );
         let ep_v2 = matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"));
+        let c4 = spark_model::model::glm_c4::enabled(&config.model_type);
         anyhow::ensure!(
-            glm5_concurrency_supported(args.max_batch_size, args.max_num_seqs, ep_v2),
+            std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() != Ok("1") || c4,
+            "ATLAS_GLM_C4_GROUPED_MOE=1 requires ATLAS_GLM_C4_DECODE=1"
+        );
+        if c4 || args.max_batch_size == 4 {
+            spark_model::model::glm_c4::policy_from_env(
+                &config.model_type,
+                args.world_size,
+                args.tp_size,
+                args.ep_size,
+                ep_v2,
+                !(args.speculative
+                    || args.self_speculative
+                    || args.ngram_speculative
+                    || args.dflash),
+            )
+            .validate()?;
+            spark_model::model::glm_c4::validate_launch_limits(
+                args.max_batch_size,
+                args.max_num_seqs,
+                args.max_seq_len,
+                args.kv_cache_dtype.as_deref() == Some("bf16"),
+            )?;
+        }
+        anyhow::ensure!(
+            glm5_concurrency_supported(args.max_batch_size, args.max_num_seqs, ep_v2, c4),
             "GLM-5 dual-Spark concurrency supports --max-batch-size 1..=3 and \
-             --max-num-seqs max_batch..=5; batches above one require ATLAS_EP_PROTOCOL=v2"
+             --max-num-seqs max_batch..=5, or explicitly opted-in short C4 with active/admitted4; \
+             batches above one require ATLAS_EP_PROTOCOL=v2"
         );
         anyhow::ensure!(
             glm5_long_context_concurrency_supported(
@@ -393,12 +425,16 @@ mod tests {
 
     #[test]
     fn glm5_concurrency_is_bounded_and_requires_ep_v2() {
-        assert!(glm5_concurrency_supported(1, 1, false));
-        assert!(glm5_concurrency_supported(3, 5, true));
-        assert!(!glm5_concurrency_supported(2, 5, false));
-        assert!(!glm5_concurrency_supported(4, 5, true));
-        assert!(!glm5_concurrency_supported(3, 2, true));
-        assert!(!glm5_concurrency_supported(3, 6, true));
+        assert!(glm5_concurrency_supported(1, 1, false, false));
+        assert!(glm5_concurrency_supported(3, 5, true, false));
+        assert!(!glm5_concurrency_supported(2, 5, false, false));
+        assert!(!glm5_concurrency_supported(4, 5, true, false));
+        assert!(!glm5_concurrency_supported(3, 2, true, false));
+        assert!(!glm5_concurrency_supported(3, 6, true, false));
+        assert!(!glm5_concurrency_supported(4, 4, true, false));
+        assert!(glm5_concurrency_supported(4, 4, true, true));
+        assert!(!glm5_concurrency_supported(4, 5, true, true));
+        assert!(!glm5_concurrency_supported(4, 4, false, true));
     }
 
     #[test]

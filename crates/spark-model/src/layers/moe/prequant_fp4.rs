@@ -12,9 +12,19 @@ pub(super) struct CompactMoeWorklist {
 }
 
 fn c3_grouped_shape(config: &atlas_core::config::ModelConfig, rows: u32, decode_rows: u32) -> bool {
-    rows == 3
-        && decode_rows >= 3
-        && config.model_type == "glm5_next"
+    rows == 3 && decode_rows >= 3 && glm_grouped_shape(config)
+}
+
+pub(super) fn c4_grouped_shape(
+    config: &atlas_core::config::ModelConfig,
+    rows: u32,
+    decode_rows: u32,
+) -> bool {
+    rows == 4 && decode_rows >= 4 && glm_grouped_shape(config)
+}
+
+fn glm_grouped_shape(config: &atlas_core::config::ModelConfig) -> bool {
+    config.model_type == "glm5_next"
         && config.hidden_size == 4096
         && config.moe_intermediate_size == 2048
         && config.shared_expert_intermediate_size == 2048
@@ -36,14 +46,22 @@ impl MoeLayer {
     pub(super) fn glm_c3_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
         std::env::var("ATLAS_GLM_C3_GROUPED_MOE").as_deref() == Ok("1")
             && c3_grouped_shape(ctx.config, rows, ctx.levers.max_decode_seqs)
-            && ctx.comm.is_some()
-            && self.lora.is_none()
-            && self.bf16_gate_weight_ptrs.is_none()
-            && self.fp8_gate_weight_ptrs.is_none()
-            && !self.has_mixed_bf16_shared_expert()
-            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
-            && !self.nvfp4_mmq_layout
-            && self.use_t_layout_for_prefill()
+            && self.glm_grouped_resources(ctx)
+            && self.w4a16_gemv_batch3.0 != 0
+    }
+
+    pub(super) fn glm_c4_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
+        crate::model::glm_c4::enabled(&ctx.config.model_type)
+            && std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() == Ok("1")
+            && c4_grouped_shape(ctx.config, rows, ctx.levers.max_decode_seqs)
+            && ctx.attn_metadata.is_some_and(|m| m.num_seqs == 4)
+            && self.glm_grouped_resources(ctx)
+            && self.w4a16_batchm.kernel(4).0 != 0
+            && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+    }
+
+    pub(super) fn glm_grouped_resources(&self, ctx: &ForwardContext) -> bool {
+        self.glm_native_moe_resources(ctx)
             && self.nvfp4_prequant_moe
             && self.nvfp4_fused_silu_quant
             && self.moe_w4a4_prequant_t_k64.0 != 0
@@ -54,7 +72,17 @@ impl MoeLayer {
             && self.moe_unpermute_reduce_ep.0 != 0
             && self.quantize_nvfp4_k.0 != 0
             && self.silu_mul_quant_nvfp4_k.0 != 0
-            && self.w4a16_gemv_batch3.0 != 0
+    }
+
+    pub(super) fn glm_native_moe_resources(&self, ctx: &ForwardContext) -> bool {
+        ctx.comm.is_some()
+            && self.lora.is_none()
+            && self.bf16_gate_weight_ptrs.is_none()
+            && self.fp8_gate_weight_ptrs.is_none()
+            && !self.has_mixed_bf16_shared_expert()
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && !self.nvfp4_mmq_layout
+            && self.use_t_layout_for_prefill()
             && self.gate_fp8.is_none()
             && self.gate_nvfp4.is_none()
             && self.correction_bias_dev.is_some()
@@ -159,7 +187,8 @@ impl MoeLayer {
         };
         if let Some(work) = compact
             && (std::env::var("ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP").as_deref() == Ok("1")
-                || self.glm_c3_grouped(ctx, n))
+                || self.glm_c3_grouped(ctx, n)
+                || self.glm_c4_grouped(ctx, n))
         {
             let fused_kernel = if self.nvfp4_vecscale
                 && self.moe_w4a4_prequant_t_k64_vecscale_compact_gate_up.0 != 0

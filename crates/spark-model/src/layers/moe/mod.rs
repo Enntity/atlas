@@ -517,6 +517,7 @@ pub(crate) use lora::MoeLoraWeights;
 mod forward_atomic_c4;
 mod forward_batched;
 mod forward_batched_gate;
+mod forward_c4;
 mod forward_ep;
 mod forward_k2;
 mod forward_k3;

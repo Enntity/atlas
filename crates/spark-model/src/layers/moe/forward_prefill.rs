@@ -236,6 +236,8 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
+        } else if self.glm_c4_grouped(ctx, n) {
+            self.c4_router_logits(router_in, gate_logits, ctx, stream)?;
         } else {
             // Selection numerics — see router_gate_gemm_dense for why this
             // must stay on the scalar kernel and why ATLAS_CUBLAS_GEMM must

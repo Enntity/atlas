@@ -178,6 +178,22 @@ impl TransformerModel {
         _stream: u64,
     ) -> Result<DevicePtr> {
         let n = tokens.len();
+        let c4_lane = self.config.model_type == "glm5_next"
+            && (n == 4 || crate::model::glm_c4::enabled(&self.config.model_type));
+        if c4_lane {
+            crate::model::glm_c4::validate_runtime(
+                &self.config,
+                self.comm.as_ref().map_or(0, |comm| comm.world_size()),
+                self.ep_protocol_v2,
+                self.proposer.is_none() && !self.self_speculative,
+            )?;
+            crate::model::glm_c4::validate_positions(seqs.iter().map(|s| s.seq_len), n)?;
+            anyhow::ensure!(
+                self.levers.max_decode_seqs == 4,
+                "initial GLM C4 lane requires active cap4"
+            );
+            crate::model::glm_c4::validate_scratch(self.buffers.sizes(), self.config.hc_mult)?;
+        }
         // SOLID Incr-4 pre-lookup guard (the bail `forward_batched.rs` and
         // `build_moe_row_adapter_decode` document): a batch with a row routed
         // to a NON-active adapter cannot be served by the single-active fold —
@@ -271,6 +287,26 @@ impl TransformerModel {
 
         // Lock order: kv_cache BEFORE the graph cache, matching verify_e.
         let mut kv_cache = self.kv_cache.lock();
+        if c4_lane {
+            use spark_runtime::kv_cache::{KvCacheDtype, SparseIndexCacheDtype};
+            anyhow::ensure!(
+                kv_cache.dtype() == KvCacheDtype::Bf16
+                    && (0..kv_cache.num_layers())
+                        .all(|i| kv_cache.dtype_for_layer(i) == KvCacheDtype::Bf16)
+                    && kv_cache
+                        .sparse_index_config()
+                        .is_some_and(|s| s.dtype == SparseIndexCacheDtype::Bf16),
+                "GLM C4 requires BF16 KV and semantic index"
+            );
+            let bs = kv_cache.block_size();
+            let capacity = (self.max_blocks_per_seq as usize)
+                .checked_mul(bs)
+                .ok_or_else(|| anyhow::anyhow!("GLM C4 table capacity overflow"))?;
+            anyhow::ensure!(
+                bs > 0 && seqs.iter().all(|s| s.seq_len < capacity),
+                "GLM C4 position exceeds fixed table capacity"
+            );
+        }
         if glm_dynamic {
             // These checks must run on every step, BEFORE graph lookup/replay.
             // Layer validation alone only executes on the capture/cache miss.

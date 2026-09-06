@@ -26,6 +26,7 @@
 pub(crate) mod block_mgmt;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
+pub mod glm_c4;
 pub(crate) mod impl_a1;
 pub(crate) mod impl_a1_init;
 pub(crate) mod impl_a2;

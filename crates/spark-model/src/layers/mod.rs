@@ -315,6 +315,8 @@ pub enum FfnComponent {
     None,
 }
 
+mod ffn_c4;
+
 impl FfnComponent {
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)

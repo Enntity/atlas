@@ -11,12 +11,13 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import math
 import threading
 
-from benchmark_glm53_niah import run
+NEEDLE_NAMES = ("AURORA", "NEBULA", "ORBIT", "QUASAR")
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8888")
     parser.add_argument("--model", default="/var/tmp/models/glm53-flash-nvfp4")
@@ -25,18 +26,47 @@ def main() -> None:
     parser.add_argument("--position", type=float, default=0.05)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--repetitions", type=int, default=1)
-    args = parser.parse_args()
+    parser.add_argument("--context-limit", type=int, help=(
+        "server's per-request context cap; required for four requests; reject "
+        "prompt+output beyond this limit before making any HTTP requests"
+    ))
+    args = parser.parse_args(argv)
     count = len(args.prompt_tokens)
-    if not 1 <= count <= 3 or len(args.output_tokens) != count:
-        parser.error("supply one to three prompt lengths and matching output caps")
+    if not 1 <= count <= len(NEEDLE_NAMES) or len(args.output_tokens) != count:
+        parser.error("supply one to four prompt lengths and matching output caps")
     if min(args.output_tokens + args.prompt_tokens) < 1 or args.repetitions < 1:
         parser.error("token counts and repetitions must be positive")
     if not 0 <= args.position <= 1:
         parser.error("position must be between zero and one")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("timeout must be finite and positive")
+    if count == 4 and args.context_limit is None:
+        parser.error("four requests require --context-limit matching the server cap")
+    if args.context_limit is not None:
+        if args.context_limit < 1:
+            parser.error("context-limit must be positive")
+        if any(prompt + output > args.context_limit for prompt, output in
+               zip(args.prompt_tokens, args.output_tokens)):
+            parser.error("each prompt length plus output cap must fit context-limit")
+    return args
+
+
+def needles_for(count: int, repetition: int) -> list[str]:
+    if not 1 <= count <= len(NEEDLE_NAMES) or repetition < 0:
+        raise ValueError("needles require one to four rows and a nonnegative repetition")
+    return [f"{name}-{6193 + repetition * 17}" for name in NEEDLE_NAMES[:count]]
+
+
+def main() -> None:
+    args = parse_args()
+    # Keep argument validation CPU-only and usable without HTTP dependencies.
+    from benchmark_glm53_niah import run
+
+    count = len(args.prompt_tokens)
 
     all_passed = True
     for repetition in range(args.repetitions):
-        needles = [f"{name}-{6193 + repetition * 17}" for name in ("AURORA", "NEBULA", "ORBIT")][:count]
+        needles = needles_for(count, repetition)
         barrier = threading.Barrier(count)
 
         def request(index: int) -> dict:
@@ -59,7 +89,8 @@ def main() -> None:
             rows = list(pool.map(request, range(count)))
         passed = all(row["passed"] for row in rows)
         all_passed = all_passed and passed
-        print(json.dumps({"repetition": repetition, "passed": passed, "requests": rows}), flush=True)
+        print(json.dumps({"repetition": repetition, "passed": passed,
+                          "context_limit": args.context_limit, "requests": rows}), flush=True)
     raise SystemExit(0 if all_passed else 1)
 
 

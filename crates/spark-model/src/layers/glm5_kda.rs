@@ -1064,7 +1064,14 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if multi_seq::enabled() && (2..=3).contains(&num_seqs) {
+        if crate::model::glm_c4::batched_kda_rows(
+            num_seqs,
+            multi_seq::enabled(),
+            crate::model::glm_c4::enabled(&ctx.config.model_type),
+        )? {
+            if num_seqs == 4 {
+                crate::model::glm_c4::validate_positions(seq_lens.iter().copied(), 4)?;
+            }
             self.decode_multi_seq_inner(hidden, num_seqs, states, ctx, stream)
         } else {
             let h = ctx.config.hidden_size;

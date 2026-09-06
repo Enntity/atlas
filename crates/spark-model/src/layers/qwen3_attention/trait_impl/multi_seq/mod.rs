@@ -21,6 +21,7 @@ use crate::layer::{ForwardContext, LayerState};
 use crate::layers::ops;
 
 mod attn;
+mod c4;
 mod ctx;
 mod ffn;
 mod mla;
@@ -130,6 +131,7 @@ impl Qwen3AttentionLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let n = c.n;
         let hc = self.hc.as_ref().unwrap();
+        self.validate_glm_c4(&c)?;
         let hc_mult = hc.hc_mult as u32;
         let is_first_layer = self.block_idx == 0;
         let is_last_layer = self.block_idx + 1 == ctx.config.num_hidden_layers;
@@ -356,11 +358,13 @@ impl Qwen3AttentionLayer {
         // verifier rows together through the full-attention layers too;
         // otherwise these layers reread every expert weight once per row.
         // Other MLA architectures retain their established sequential path.
-        let glm_batched_ffn = ctx.config.model_type == "glm5_next" && matches!(n, 3 | 5);
+        let glm_batched_ffn = ctx.config.model_type == "glm5_next" && matches!(n, 3 | 4 | 5);
         if glm_batched_ffn {
             let (moe_out, deferred_shared_gate) = if n == 3 {
                 self.ffn.forward_k3(c.normed, ctx, stream)?;
                 (ctx.buffers.moe_output(), None)
+            } else if n == 4 {
+                (self.ffn.forward_c4(c.normed, ctx, stream)?, None)
             } else {
                 self.ffn.forward_k5_for_hc(
                     c.normed,

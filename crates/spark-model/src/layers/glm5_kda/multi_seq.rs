@@ -33,10 +33,38 @@ impl Glm5KdaLayer {
         stream: u64,
     ) -> Result<()> {
         ensure!(
-            (2..=3).contains(&num_seqs),
-            "GLM KDA batched decode currently supports 2 or 3 rows"
+            crate::model::glm_c4::batched_kda_rows(
+                num_seqs,
+                enabled(),
+                crate::model::glm_c4::enabled(&ctx.config.model_type),
+            )?,
+            "GLM KDA batched decode supports C2/C3 and opted-in C4"
         );
         ensure!(states.len() >= num_seqs, "GLM KDA state batch is truncated");
+        if num_seqs == 4 {
+            crate::model::glm_c4::validate_runtime(
+                ctx.config,
+                ctx.comm.map_or(0, |comm| comm.world_size()),
+                std::env::var("ATLAS_EP_PROTOCOL").as_deref() == Ok("v2"),
+                true,
+            )?;
+            ensure!(
+                self.hidden_size == 4096 && self.heads == 32 && self.dim == 128,
+                "GLM C4 requires local KDA P4096/dim128"
+            );
+            crate::model::glm_c4::validate_projection_handles(
+                self.w4a16_gemv_batchm.kernel(4).0,
+                self.dense_gemv_batchm_k.0,
+            )?;
+            crate::model::glm_c4::validate_scratch(ctx.buffers.sizes(), self.hc.hc_mult)?;
+            for state in states.iter().take(4) {
+                let state = state
+                    .as_any()
+                    .downcast_ref::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("GLM C4 requires independent SSM states"))?;
+                ensure!(!state.h_is_f16, "GLM C4 requires FP32 KDA state");
+            }
+        }
 
         let n = num_seqs;
         let m = n as u32;
@@ -280,7 +308,10 @@ impl Glm5KdaLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
-        if batched_ffn_enabled() && n == 3 {
+        if n == 4 {
+            let output = self.ffn.forward_c4(normed, ctx, stream)?;
+            self.hc_post(output, m, ctx, stream)?;
+        } else if batched_ffn_enabled() && n == 3 {
             self.ffn.forward_k3(normed, ctx, stream)?;
             self.hc_post(ctx.buffers.moe_output(), m, ctx, stream)?;
         } else {
