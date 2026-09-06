@@ -75,7 +75,9 @@ accounts for this, and this change does not alter its alignment rules.
 Keep `OOM_GUARD_MB=4096`, existing GPU utilization and container ceiling. This
 flag protects weight loading; the nonspeculative inference reserve's CUDA
 headroom is 512 MiB, not a 4 GiB post-load guarantee. Root must measure at least 4 GiB
-free on **both** nodes after load/warmup and at campaign checkpoints. Do not
+of host `MemAvailable` on **both** unified-memory nodes after load/warmup and at
+campaign checkpoints. Record this as available host memory, not CUDA allocator
+free bytes or the kernel's smaller `MemFree` field. Do not
 raise utilization, remove guards, enable swap, or admit extra requests to fit.
 
 ## Hardware gates and rollback
