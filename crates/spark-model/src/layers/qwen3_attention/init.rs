@@ -130,6 +130,8 @@ impl Qwen3AttentionLayer {
             && config.index_kpool == 4
             && glm_index_logits_rows_per_cta == 8
             && std::env::var("ATLAS_GLM_INDEX_WMMA").ok().as_deref() == Some("1");
+        let glm_sparse_graphs = probes.glm_kpool_indexer
+            && super::glm_multi_seq_sparse_graphs_enabled(&config.model_type)?;
         let glm_index_logits_fn = if glm_index_wmma {
             "glm_index_logits_bf16_wmma_row8_pool32"
         } else if glm_index_logits_rows_per_cta == 1 {
@@ -518,6 +520,24 @@ impl Qwen3AttentionLayer {
                 gpu,
                 "glm_indexer",
                 "glm_sparse_mla_prefill_bf16",
+            ),
+            glm_index_logits_dynamic_k: gate(
+                glm_sparse_graphs,
+                gpu,
+                "glm_indexer",
+                "glm_index_logits_bf16_dynamic",
+            ),
+            glm_index_topk_dynamic_k: gate(
+                glm_sparse_graphs,
+                gpu,
+                "glm_indexer",
+                "glm_index_topk_expand_dynamic",
+            ),
+            glm_sparse_attn_dynamic_k: gate(
+                glm_sparse_graphs,
+                gpu,
+                "glm_indexer",
+                "glm_sparse_mla_prefill_bf16_dynamic",
             ),
             mla_q_final_assemble_k: gate(
                 probes.mla,

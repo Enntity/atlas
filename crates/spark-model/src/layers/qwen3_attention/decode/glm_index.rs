@@ -11,18 +11,15 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 
 impl Qwen3AttentionLayer {
-    /// Append this token to the paged four-token index staging tail, finalize a
-    /// pool on phase three, and return sparse token IDs once history exceeds
-    /// the checkpoint's exact-attention threshold.
-    pub(in crate::layers::qwen3_attention) fn glm_index_decode_update_and_select(
+    /// Shared eager/graph maintenance. Position and pool phase come from the
+    /// uploaded slot, so every call in this chain is safe to capture.
+    pub(in crate::layers::qwen3_attention) fn glm_index_decode_update(
         &self,
         normed: DevicePtr,
-        q_latent: DevicePtr,
-        pos: u32,
         kv_cache: &PagedKvCache,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<Option<(DevicePtr, u32)>> {
+    ) -> Result<()> {
         let mla = self.mla.as_ref().expect("GLM decode index without MLA");
         let indexer = mla
             .glm_indexer
@@ -110,7 +107,33 @@ impl Qwen3AttentionLayer {
             kv_cache.sparse_index_block_stride_bytes(self.attn_layer_idx) as u64,
             stream,
         )?;
+        Ok(())
+    }
 
+    /// Maintain semantic history, then select IDs above the exact threshold.
+    /// This eager variant embeds the host position and must not be captured.
+    pub(in crate::layers::qwen3_attention) fn glm_index_decode_update_and_select(
+        &self,
+        normed: DevicePtr,
+        q_latent: DevicePtr,
+        pos: u32,
+        kv_cache: &PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Option<(DevicePtr, u32)>> {
+        self.glm_index_decode_update(normed, kv_cache, ctx, stream)?;
+        let mla = self.mla.as_ref().expect("GLM decode index without MLA");
+        let indexer = mla
+            .glm_indexer
+            .as_ref()
+            .expect("GLM decode index without weights");
+        let spec = kv_cache
+            .sparse_index_config()
+            .expect("validated semantic cache");
+        let meta = ctx
+            .attn_metadata
+            .expect("GLM decode index requires metadata");
+        let h = ctx.config.hidden_size as u32;
         let seq_len = pos + 1;
         let topk = ctx.config.index_topk as u32;
         if seq_len <= topk {

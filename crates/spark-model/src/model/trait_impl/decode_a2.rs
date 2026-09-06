@@ -241,16 +241,28 @@ impl TransformerModel {
         // ATLAS_MS_PROFILE forces eager (graphs off) so per-phase syncs are legal.
         // ATLAS_LORA_EAGER: same LoRA graph-vs-eager debugging hatch as decode_a.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        // The sparse selector embeds each row's host position, scorer width,
-        // and dense/sparse branch. Slot-keyed graphs cannot replay these as
-        // lengths advance, even while the current rows are still <=2048.
+        // The eager selector embeds host lengths. Only the explicit dynamic
+        // variant has fixed topology/addresses and device-driven predicates.
         let glm_sparse =
             crate::layers::qwen3_attention::glm_multi_seq_sparse_enabled(&self.config.model_type);
+        let glm_dynamic = crate::layers::qwen3_attention::glm_multi_seq_sparse_graphs_enabled(
+            &self.config.model_type,
+        )?;
         anyhow::ensure!(
             !glm_sparse || (self.proposer.is_none() && !self.self_speculative),
             "GLM multi-sequence sparse decode does not support speculative decoding"
         );
-        let graph_key = if !glm_sparse && !ms_profile && !lora_eager && multiseq_graphs_enabled() {
+        let dynamic_capture_ok = !glm_dynamic
+            || (!self.profile
+                && !self
+                    .suppress_graphs
+                    .load(std::sync::atomic::Ordering::Relaxed));
+        let graph_key = if (!glm_sparse || glm_dynamic)
+            && dynamic_capture_ok
+            && !ms_profile
+            && !lora_eager
+            && multiseq_graphs_enabled()
+        {
             self.batch_decode_graph_key(&*seqs, padded_n)
         } else {
             None
@@ -259,6 +271,25 @@ impl TransformerModel {
 
         // Lock order: kv_cache BEFORE the graph cache, matching verify_e.
         let mut kv_cache = self.kv_cache.lock();
+        if glm_dynamic {
+            // These checks must run on every step, BEFORE graph lookup/replay.
+            // Layer validation alone only executes on the capture/cache miss.
+            anyhow::ensure!(
+                padded_n == n,
+                "GLM sparse graphs require exact unpadded C2/C3 width"
+            );
+            let shape = ops::GlmDynamicShape::new(
+                self.max_blocks_per_seq,
+                u32::try_from(kv_cache.block_size())?,
+            )?;
+            shape.validate_positions(
+                seqs.iter().map(|s| s.seq_len),
+                n,
+                self.config.max_position_embeddings,
+            )?;
+            let sizes = self.buffers.sizes();
+            shape.validate_arenas(sizes.expert_down_out, sizes.qkv_output)?;
+        }
 
         // ── Phase 2 (decision): exact CUDA-graph hit, or drain-tail borrow ──
         let mut graphs = if use_graphs {
@@ -283,6 +314,7 @@ impl TransformerModel {
                 e.1 = tick;
                 replay = Some(e.0);
             } else if super::graph_borrow::graph_borrow_enabled()
+                && !glm_dynamic
                 && self.comm.is_none()
                 && self.config.num_ssm_layers() > 0
             {

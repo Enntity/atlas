@@ -151,14 +151,14 @@ extern "C" __global__ void glm_index_fill_causal(
 // Eight warps score eight pooled keys per CTA. Each warp holds one pool and
 // accumulates its 32 index-head dot products without materializing headwise
 // logits. The cache remains paged with the main KV block table.
-extern "C" __global__ void glm_index_logits_bf16(
+__device__ __forceinline__ void glm_index_logits_bf16_impl(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ weights,
     const __nv_bfloat16* __restrict__ index_cache,
     float* __restrict__ logits,
     const unsigned int* __restrict__ block_table,
     unsigned int rows,
-    unsigned int seq_len_start,
+    unsigned int seq_len,
     unsigned int logits_stride,
     unsigned int index_heads,
     unsigned int head_dim,
@@ -170,7 +170,6 @@ extern "C" __global__ void glm_index_logits_bf16(
     const unsigned int lane = threadIdx.x & 31;
     const unsigned int pool_id = blockIdx.x * 8 + warp;
     if (row >= rows || pool_id >= logits_stride) return;
-    const unsigned int seq_len = seq_len_start + row + 1;
     const unsigned int pool_count = seq_len / pool_size;
     if (pool_id >= pool_count) {
         if (lane == 0) logits[(unsigned long long)row * logits_stride + pool_id] = -INFINITY;
@@ -204,6 +203,59 @@ extern "C" __global__ void glm_index_logits_bf16(
         logits[(unsigned long long)row * logits_stride + pool_id] =
             score * rsqrtf((float)(head_dim * index_heads));
     }
+}
+
+extern "C" __global__ void glm_index_logits_bf16(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ weights,
+    const __nv_bfloat16* __restrict__ index_cache,
+    float* __restrict__ logits,
+    const unsigned int* __restrict__ block_table,
+    unsigned int rows,
+    unsigned int seq_len_start,
+    unsigned int logits_stride,
+    unsigned int index_heads,
+    unsigned int head_dim,
+    unsigned int pool_size,
+    unsigned int cache_block_size,
+    unsigned long long index_block_stride_bytes) {
+    glm_index_logits_bf16_impl(query, weights, index_cache, logits, block_table,
+        rows, seq_len_start + blockIdx.y + 1, logits_stride, index_heads, head_dim,
+        pool_size, cache_block_size, index_block_stride_bytes);
+}
+
+// Single-row graph scorer: launch the fixed capacity (ceil(stride/8),1,1)
+// with 256 threads and no dynamic shared memory. Device length includes the
+// token just appended. Short, empty, over-capacity and future pools produce
+// -infinity before any query/key/page-table read.
+extern "C" __global__ void glm_index_logits_bf16_dynamic(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ weights,
+    const __nv_bfloat16* __restrict__ index_cache,
+    float* __restrict__ logits,
+    const unsigned int* __restrict__ block_table,
+    unsigned int rows,
+    const unsigned int* __restrict__ seq_len,
+    unsigned int logits_stride,
+    unsigned int index_heads,
+    unsigned int head_dim,
+    unsigned int pool_size,
+    unsigned int cache_block_size,
+    unsigned long long index_block_stride_bytes,
+    unsigned int dense_threshold) {
+    if (rows != 1 || blockIdx.y != 0 || blockDim.x != 256) return;
+    const unsigned int length = seq_len[0];
+    const bool valid = pool_size > 0 && cache_block_size > 0
+        && length > dense_threshold
+        && (unsigned long long)length <= (unsigned long long)logits_stride * pool_size;
+    if (!valid) {
+        const unsigned int pool = blockIdx.x * 8 + (threadIdx.x >> 5);
+        if ((threadIdx.x & 31) == 0 && pool < logits_stride) logits[pool] = -INFINITY;
+        return;
+    }
+    glm_index_logits_bf16_impl(query, weights, index_cache, logits, block_table,
+        1, length, logits_stride, index_heads, head_dim, pool_size,
+        cache_block_size, index_block_stride_bytes);
 }
 
 // Eight warps score an 8-row x 8-pool tile. A pooled key is loaded once into
@@ -309,11 +361,11 @@ __device__ __forceinline__ unsigned int glm_ordered_float(float value) {
 // Once the Kth score's bit pattern is known, all larger pools and enough equal
 // pools are expanded to their four raw token IDs. Ordering is immaterial to
 // attention; ties at the threshold may choose any equivalent pool.
-extern "C" __global__ void glm_index_topk_expand(
+__device__ __forceinline__ void glm_index_topk_expand_impl(
     const float* __restrict__ logits,
     int* __restrict__ output,
     unsigned int rows,
-    unsigned int seq_len_start,
+    unsigned int seq_len,
     unsigned int logits_stride,
     unsigned int topk_tokens,
     unsigned int pool_size,
@@ -325,7 +377,6 @@ extern "C" __global__ void glm_index_topk_expand(
     unsigned int& rank = shared[1];
     unsigned int& count = shared[2];
     unsigned int& written = shared[3];
-    const unsigned int seq_len = seq_len_start + row + 1;
     const unsigned int pool_count = seq_len / pool_size;
     const unsigned int pool_budget = topk_tokens / pool_size;
     const unsigned int select_pools = pool_budget < pool_count ? pool_budget : pool_count;
@@ -391,11 +442,53 @@ extern "C" __global__ void glm_index_topk_expand(
     }
 }
 
+extern "C" __global__ void glm_index_topk_expand(
+    const float* __restrict__ logits,
+    int* __restrict__ output,
+    unsigned int rows,
+    unsigned int seq_len_start,
+    unsigned int logits_stride,
+    unsigned int topk_tokens,
+    unsigned int pool_size,
+    unsigned int output_width) {
+    glm_index_topk_expand_impl(logits, output, rows, seq_len_start + blockIdx.x + 1,
+        logits_stride, topk_tokens, pool_size, output_width);
+}
+
+// Single-row graph selector: grid=(1,1,1), block=256, shared=16 bytes.
+// Always reset both outputs, including transitions long->short and slot reuse.
+// dense_seq_len belongs to this row until both attention launches finish.
+extern "C" __global__ void glm_index_topk_expand_dynamic(
+    const float* __restrict__ logits,
+    int* __restrict__ output,
+    unsigned int rows,
+    const unsigned int* __restrict__ seq_len,
+    unsigned int logits_stride,
+    unsigned int topk_tokens,
+    unsigned int pool_size,
+    unsigned int output_width,
+    unsigned int* __restrict__ dense_seq_len) {
+    if (rows != 1 || blockIdx.x != 0 || blockDim.x != 256) return;
+    const unsigned int length = seq_len[0];
+    const bool valid = length > 0 && pool_size > 0 && topk_tokens > 0
+        && topk_tokens % pool_size == 0
+        && (unsigned long long)output_width >= (unsigned long long)topk_tokens + pool_size - 1
+        && (unsigned long long)length <= (unsigned long long)logits_stride * pool_size;
+    if (threadIdx.x == 0)
+        dense_seq_len[0] = valid && length <= topk_tokens ? length : 0;
+    if (!valid || length <= topk_tokens) {
+        for (unsigned int i = threadIdx.x; i < output_width; i += blockDim.x) output[i] = -1;
+        return;
+    }
+    glm_index_topk_expand_impl(logits, output, 1, length, logits_stride,
+        topk_tokens, pool_size, output_width);
+}
+
 // Tiled sparse absorbed MLA. One CTA owns one (query, head); its eight warps
 // score eight selected tokens concurrently, then all 256 lanes update two of
 // the 512 output dimensions. This preserves the online-softmax recurrence of
 // the scalar oracle while reducing synchronization by roughly eightfold.
-extern "C" __global__ void glm_sparse_mla_prefill_bf16(
+__device__ __forceinline__ void glm_sparse_mla_prefill_bf16_impl(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ k_cache,
     const __nv_bfloat16* __restrict__ v_cache,
@@ -412,12 +505,12 @@ extern "C" __global__ void glm_sparse_mla_prefill_bf16(
     const unsigned int row = blockIdx.y;
     const unsigned int tid = threadIdx.x;
     if (row >= rows || head >= num_heads || head_dim != 512) return;
-    extern __shared__ float shared_f[];
-    float* scores = shared_f;
-    float* betas = shared_f + 8;
-    float& alpha = shared_f[16];
-    float& running_max = shared_f[17];
-    float& running_denom = shared_f[18];
+    extern __shared__ float glm_sparse_head1_shared[];
+    float* scores = glm_sparse_head1_shared;
+    float* betas = glm_sparse_head1_shared + 8;
+    float& alpha = glm_sparse_head1_shared[16];
+    float& running_max = glm_sparse_head1_shared[17];
+    float& running_denom = glm_sparse_head1_shared[18];
     const __nv_bfloat16* q = query
         + ((unsigned long long)row * num_heads + head) * head_dim;
     const int* indices = token_indices + (unsigned long long)row * index_width;
@@ -493,6 +586,48 @@ extern "C" __global__ void glm_sparse_mla_prefill_bf16(
     const float inv_denom = running_denom > 0.0f ? 1.0f / running_denom : 0.0f;
     dst[tid] = __float2bfloat16(out0 * inv_denom);
     dst[tid + 256] = __float2bfloat16(out1 * inv_denom);
+}
+
+extern "C" __global__ void glm_sparse_mla_prefill_bf16(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ token_indices,
+    __nv_bfloat16* __restrict__ output,
+    const unsigned int* __restrict__ block_table,
+    unsigned int rows,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int index_width,
+    unsigned int cache_block_size,
+    float inv_sqrt_d) {
+    glm_sparse_mla_prefill_bf16_impl(query, k_cache, v_cache, token_indices, output,
+        block_table, rows, num_heads, head_dim, index_width, cache_block_size, inv_sqrt_d);
+}
+
+// Single-row graph sparse attention: grid=(num_heads,1,1), block=256,
+// shared=19*sizeof(float). This uniform guard is before every CTA barrier.
+// For invalid over-capacity lengths the preceding dynamic selector supplies
+// only -1 IDs, so this body performs no paged reads and writes zeros.
+extern "C" __global__ void glm_sparse_mla_prefill_bf16_dynamic(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ token_indices,
+    __nv_bfloat16* __restrict__ output,
+    const unsigned int* __restrict__ block_table,
+    unsigned int rows,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int index_width,
+    unsigned int cache_block_size,
+    float inv_sqrt_d,
+    const unsigned int* __restrict__ seq_len,
+    unsigned int dense_threshold) {
+    if (rows != 1 || blockIdx.y != 0 || blockDim.x != 256
+        || cache_block_size == 0 || seq_len[0] <= dense_threshold) return;
+    glm_sparse_mla_prefill_bf16_impl(query, k_cache, v_cache, token_indices, output,
+        block_table, 1, num_heads, head_dim, index_width, cache_block_size, inv_sqrt_d);
 }
 
 // Eight-head sparse absorbed MLA. GLM's compressed K/V row is shared by all

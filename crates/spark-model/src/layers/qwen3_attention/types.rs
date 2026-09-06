@@ -273,6 +273,9 @@ pub struct Qwen3AttentionLayer {
     pub(super) glm_sparse_attn_k: KernelHandle,
     pub(super) glm_sparse_attn_heads_per_cta: u32,
     pub(super) glm_sparse_attn_decode_k: KernelHandle,
+    pub(super) glm_index_logits_dynamic_k: KernelHandle,
+    pub(super) glm_index_topk_dynamic_k: KernelHandle,
+    pub(super) glm_sparse_attn_dynamic_k: KernelHandle,
     /// Q_final assembly: [absorbed|rope] per head.
     pub(super) mla_q_final_assemble_k: KernelHandle,
     /// Fused MLA prefill: Q_absorb + attention + V_extract in one kernel.

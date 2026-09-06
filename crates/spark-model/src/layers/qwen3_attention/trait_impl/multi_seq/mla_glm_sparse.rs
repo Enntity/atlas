@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Eager semantic indexing for independent GLM decode rows. Q absorption and
+//! Semantic indexing for independent GLM decode rows. Q absorption and
 //! KV writes finish before selectors borrow their scratch; V extraction waits
 //! until every selector has released ssm_qkvz. No persistent memory is added.
 
@@ -60,9 +60,12 @@ impl Qwen3AttentionLayer {
     ) -> Result<()> {
         let config = c.fwd.config;
         let max_position = validate_positions(c.seq_lens, c.n, config.max_position_embeddings)?;
+        let dynamic = crate::layers::qwen3_attention::glm_multi_seq_sparse_graphs_enabled(
+            &config.model_type,
+        )?;
         ensure!(
-            !c.fwd.graph_capture,
-            "GLM multi-sequence sparse decode requires eager execution"
+            !c.fwd.graph_capture || dynamic,
+            "GLM multi-sequence sparse capture requires the device-length graph opt-in"
         );
         ensure!(
             config.model_type == "glm5_next"
@@ -116,9 +119,28 @@ impl Qwen3AttentionLayer {
             "GLM multi-sequence sparse kernels are unavailable"
         );
         let sizes = c.fwd.buffers.sizes();
+        let shape = ops::GlmDynamicShape::new(meta.max_blocks_per_seq, c.bs)?;
+        if dynamic {
+            shape.validate_positions(
+                c.seq_lens.iter().copied(),
+                c.n,
+                config.max_position_embeddings,
+            )?;
+            shape.validate_arenas(sizes.expert_down_out, sizes.qkv_output)?;
+            ensure!(
+                self.glm_index_logits_dynamic_k.0 != 0
+                    && self.glm_index_topk_dynamic_k.0 != 0
+                    && self.glm_sparse_attn_dynamic_k.0 != 0,
+                "GLM device-length sparse kernels are unavailable"
+            );
+        }
         let absorbed = c.n * c.nq as usize * 512 * 2;
         let expanded = c.n * c.nq as usize * 256 * 2;
-        let logits = ((max_position as usize + 1).div_ceil(4)) * 4;
+        let logits = if dynamic {
+            shape.score_bytes()
+        } else {
+            ((max_position as usize + 1).div_ceil(4)) * 4
+        };
         for (name, available, required) in [
             ("Q latent", sizes.ssm_ba, c.n * 1536 * 2),
             (
@@ -205,6 +227,10 @@ impl Qwen3AttentionLayer {
         )?;
 
         let attn_out = buffers.attn_output();
+        let dynamic = crate::layers::qwen3_attention::glm_multi_seq_sparse_graphs_enabled(
+            &c.fwd.config.model_type,
+        )?;
+        let shape = ops::GlmDynamicShape::new(meta.max_blocks_per_seq, c.bs)?;
         for row in 0..c.n {
             let meta_i = row_metadata(meta, row);
             let row_ctx = ForwardContext {
@@ -212,6 +238,21 @@ impl Qwen3AttentionLayer {
                 midchunk_capture: None,
                 ..*c.fwd
             };
+            if dynamic {
+                self.glm_index_dynamic_attention(
+                    c.normed.offset(row * c.h * 2),
+                    buffers.ssm_ba().offset(row * 1536 * 2),
+                    q_absorbed.offset(row * absorbed_row),
+                    attn_out.offset(row * absorbed_row),
+                    kv_cache,
+                    &row_ctx,
+                    shape,
+                    c.nq,
+                    dims.inv_sqrt_d,
+                    stream,
+                )?;
+                continue;
+            }
             // Always maintain the index, including dense rows below 2048.
             // This preserves pool history across threshold and C3/C2/C1 drains.
             let selected = self.glm_index_decode_update_and_select(

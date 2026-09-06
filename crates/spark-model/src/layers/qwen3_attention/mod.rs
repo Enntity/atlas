@@ -18,6 +18,7 @@ mod decode;
 // V4: `pub(crate)` so the DeepSeek-V4 weight loader (`weight_loader::deepseek_v4`)
 // and the V4 attention submodules can call `helpers::yarn_rope_mscale`. Non-V4
 // code paths are unaffected by the wider visibility.
+mod glm_sparse_graphs_policy;
 mod hc_prefill;
 pub(crate) mod helpers;
 mod init;
@@ -41,6 +42,7 @@ mod types_weights;
 pub use innerq_driver::InnerQDriver;
 // V4: re-export the new hyper-connection / compressor weight types alongside the
 // existing ones. These are only constructed under DeepSeek-V4 detection.
+pub use glm_sparse_graphs_policy::glm_multi_seq_sparse_graphs_enabled;
 pub(crate) use types::HeadGateActivation;
 pub use types::Qwen3AttentionLayer;
 pub use types_weights::{

@@ -66,6 +66,8 @@ mod gemv_q2_vec;
 mod gemv_sw;
 #[path = "ops/glm_indexer.rs"]
 mod glm_indexer;
+#[path = "ops/glm_indexer_dynamic.rs"]
+mod glm_indexer_dynamic;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
 #[path = "ops/kda.rs"]
@@ -167,6 +169,7 @@ pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
 pub use glm_indexer::*;
+pub use glm_indexer_dynamic::*;
 pub use hyper_connection::*;
 pub use kda::*;
 pub use kv_cache::*;
