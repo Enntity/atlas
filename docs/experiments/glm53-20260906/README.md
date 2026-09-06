@@ -9,6 +9,12 @@ changes; its graph opt-in stays default-off. See the normalized
 [peer comparisons](phase2-comparisons.md) and next
 [C4 implementation plan](c4-implementation-plan.md).
 
+The [C4 follow-up results](phase3-results.md) include a corrected dense MLA
+kernel binding; historical dense-path needle passes did not establish numerical
+correctness. The next work follows the pinned
+[vLLM infrastructure roadmap](vllm-infrastructure-roadmap.md), beginning with
+state-indexed KDA execution and explicit cache ownership.
+
 Measured wins are distinct experiments, not one combined benchmark:
 
 | Experiment | Control | Candidate |

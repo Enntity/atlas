@@ -1,0 +1,15 @@
+Complete the following Python module. Implement an LRU cache without importing
+OrderedDict or using a third-party package. Use a dictionary and a doubly linked
+list with sentinel nodes. Include get, put, delete, clear, __len__, and an items
+method returning items from most recently used to least recently used. Reject
+nonpositive capacities. Updating an existing key must move it to the front.
+Deleting a missing key returns False. Include a small unittest.TestCase with
+distinct tests for eviction order, updating existing keys, deletion, clearing,
+and invalid capacity. Output only the complete Python source, with short
+docstrings explaining the invariants. Do not abbreviate methods or tests.
+
+Python source:
+import unittest
+
+
+class _Node:
