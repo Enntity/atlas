@@ -605,9 +605,9 @@ pub fn mla_batched_gemv(
         .launch(stream)
 }
 
-/// Exact five-row MLA GEMV. The per-head weight matrix is shared across rows.
+/// Exact-row MLA GEMV. The selected M=2/3/5 kernel shares weights across rows.
 #[allow(clippy::too_many_arguments)]
-pub fn mla_batched_gemv_batch5(
+pub fn mla_batched_gemv_batchm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     input: DevicePtr,

@@ -38,6 +38,7 @@ NCCL_IFNAME="${NCCL_IFNAME:-enp1s0f1np1}"
 NCCL_HCA="${NCCL_HCA:-rocep1s0f1}"
 PROFILE="${PROFILE:-0}"
 MS_PROFILE="${MS_PROFILE:-0}"
+DECODE_BATCH_LOG="${DECODE_BATCH_LOG:-0}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-}"
 # The checkpoint leaves its tied vocabulary projection in BF16. On dual GB10,
 # converting that projection once at load time lets K=5 verification use the
@@ -49,6 +50,9 @@ KDA_MULTI_SEQ="${KDA_MULTI_SEQ:-1}"
 KDA_BATCHED_FFN="${KDA_BATCHED_FFN:-1}"
 KDA_MS_PROFILE="${KDA_MS_PROFILE:-0}"
 MLA_MULTI_SEQ="${MLA_MULTI_SEQ:-1}"
+GLM_MLA_BATCH23="${GLM_MLA_BATCH23:-0}"
+GLM_C3_GROUPED_MOE="${GLM_C3_GROUPED_MOE:-0}"
+GLM_MULTI_SEQ_SPARSE="${GLM_MULTI_SEQ_SPARSE:-0}"
 UNIFIED_MOE_LAYOUT="${UNIFIED_MOE_LAYOUT:-1}"
 CUBLAS_GEMM="${CUBLAS_GEMM:-1}"
 HC_CUBLAS_PREFILL="${HC_CUBLAS_PREFILL:-1}"
@@ -81,6 +85,7 @@ MTP_ACCEPT_DEBUG="${MTP_ACCEPT_DEBUG:-0}"
 VERIFY_PROFILE="${VERIFY_PROFILE:-0}"
 GLM_INDEX_PROFILE="${GLM_INDEX_PROFILE:-0}"
 GLM_INDEX_ROW_GROUP="${GLM_INDEX_ROW_GROUP:-8}"
+GLM_INDEX_WMMA="${GLM_INDEX_WMMA:-0}"
 GLM_SPARSE_HEAD_GROUP="${GLM_SPARSE_HEAD_GROUP:-8}"
 MOE_UNION_STATS="${MOE_UNION_STATS:-0}"
 GLM_K5_GROUPED_MOE="${GLM_K5_GROUPED_MOE:-1}"
@@ -169,6 +174,10 @@ if [[ "$MS_PROFILE" != "0" && "$MS_PROFILE" != "1" ]]; then
   echo "ERROR: MS_PROFILE must be 0 or 1." >&2
   exit 2
 fi
+if [[ "$DECODE_BATCH_LOG" != "0" && "$DECODE_BATCH_LOG" != "1" ]]; then
+  echo "ERROR: DECODE_BATCH_LOG must be 0 or 1." >&2
+  exit 2
+fi
 
 if [[ "$KDA_MULTI_SEQ" != "0" && "$KDA_MULTI_SEQ" != "1" ]]; then
   echo "ERROR: KDA_MULTI_SEQ must be 0 or 1." >&2
@@ -186,6 +195,22 @@ if [[ "$MLA_MULTI_SEQ" != "0" && "$MLA_MULTI_SEQ" != "1" ]]; then
   echo "ERROR: MLA_MULTI_SEQ must be 0 or 1." >&2
   exit 2
 fi
+if [[ "$GLM_MLA_BATCH23" != "0" && "$GLM_MLA_BATCH23" != "1" ]]; then
+  echo "ERROR: GLM_MLA_BATCH23 must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_C3_GROUPED_MOE" != "0" && "$GLM_C3_GROUPED_MOE" != "1" ]]; then
+  echo "ERROR: GLM_C3_GROUPED_MOE must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_MULTI_SEQ_SPARSE" != "0" && "$GLM_MULTI_SEQ_SPARSE" != "1" ]]; then
+  echo "ERROR: GLM_MULTI_SEQ_SPARSE must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_MULTI_SEQ_SPARSE" == "1" && "$SPECULATIVE" != "0" ]]; then
+  echo "ERROR: GLM_MULTI_SEQ_SPARSE does not support speculative decoding." >&2
+  exit 2
+fi
 
 if (( MAX_BATCH_SIZE < 1 || MAX_BATCH_SIZE > 3 )); then
   echo "ERROR: validated GLM-5 dual-Spark MAX_BATCH_SIZE range is 1..3." >&2
@@ -198,6 +223,17 @@ if [[ "$SPECULATIVE" != "0" && "$SPECULATIVE" != "1" ]]; then
 fi
 if [[ "$SPECULATIVE" == "1" && "$MAX_BATCH_SIZE" != "1" ]]; then
   echo "ERROR: initial GLM-5 MTP validation requires MAX_BATCH_SIZE=1." >&2
+  exit 2
+fi
+# Ordinary multi-row MLA executes dense causal attention. Long independent
+# sequences require the explicitly enabled, eager semantic-index path.
+# Include MTP lookahead, which may temporarily evaluate beyond the final token.
+if (( MAX_BATCH_SIZE > 1 && MAX_SEQ_LEN > 2048 )) && [[ "$GLM_MULTI_SEQ_SPARSE" != "1" ]]; then
+  echo "ERROR: GLM concurrent decode beyond 2048 tokens requires experimental GLM_MULTI_SEQ_SPARSE=1." >&2
+  exit 2
+fi
+if [[ "$SPECULATIVE" == "1" ]] && (( MAX_SEQ_LEN + NUM_DRAFTS > 2048 )); then
+  echo "ERROR: GLM MTP requires MAX_SEQ_LEN+NUM_DRAFTS<=2048 until verifier semantic indexing is implemented." >&2
   exit 2
 fi
 if [[ "$MTP_SPEC_THINK" != "0" && "$MTP_SPEC_THINK" != "1" ]]; then
@@ -298,6 +334,14 @@ if [[ "$GLM_INDEX_PROFILE" != "0" && "$GLM_INDEX_PROFILE" != "1" ]]; then
 fi
 if [[ "$GLM_INDEX_ROW_GROUP" != "1" && "$GLM_INDEX_ROW_GROUP" != "8" ]]; then
   echo "ERROR: GLM_INDEX_ROW_GROUP must be 1 or 8." >&2
+  exit 2
+fi
+if [[ "$GLM_INDEX_WMMA" != "0" && "$GLM_INDEX_WMMA" != "1" ]]; then
+  echo "ERROR: GLM_INDEX_WMMA must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_INDEX_WMMA" == "1" && "$GLM_INDEX_ROW_GROUP" != "8" ]]; then
+  echo "ERROR: GLM_INDEX_WMMA=1 requires GLM_INDEX_ROW_GROUP=8." >&2
   exit 2
 fi
 if [[ "$GLM_SPARSE_HEAD_GROUP" != "1" && "$GLM_SPARSE_HEAD_GROUP" != "8" ]]; then
@@ -480,6 +524,9 @@ echo "  KDA register-resident prefill: $KDA_REGRESIDENT_PREFILL"
 echo "  KDA multi-sequence decode: $KDA_MULTI_SEQ"
 echo "  KDA batched FFN: $KDA_BATCHED_FFN"
 echo "  GLM MLA multi-sequence decode: $MLA_MULTI_SEQ"
+echo "  GLM MLA batched two/three-row chain: $GLM_MLA_BATCH23"
+echo "  experimental GLM C3 native-FP4 grouped MoE: $GLM_C3_GROUPED_MOE"
+echo "  experimental eager GLM concurrent semantic indexing: $GLM_MULTI_SEQ_SPARSE"
 echo "  unified MoE layout: $UNIFIED_MOE_LAYOUT"
 echo "  cuBLASLt BF16 projections: $CUBLAS_GEMM"
 echo "  cuBLASLt TF32 mHC prefill: $HC_CUBLAS_PREFILL"
@@ -502,6 +549,7 @@ echo "  MTP acceptance telemetry: $MTP_ACCEPT_DEBUG"
 echo "  GLM verifier layer profile: $VERIFY_PROFILE"
 echo "  GLM semantic-index profile: $GLM_INDEX_PROFILE"
 echo "  semantic-index rows per CTA: $GLM_INDEX_ROW_GROUP"
+echo "  BF16 tensor-core semantic scorer: $GLM_INDEX_WMMA"
 echo "  sparse MLA heads per CTA: $GLM_SPARSE_HEAD_GROUP"
 echo "  sampled MoE expert-union stats: $MOE_UNION_STATS"
 echo "  GLM K5 grouped W4A16 MoE: $GLM_K5_GROUPED_MOE"
@@ -580,6 +628,11 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_GLM_VERIFY_PROFILE=$VERIFY_PROFILE \
   -e ATLAS_GLM_INDEX_PROFILE=$GLM_INDEX_PROFILE \
   -e ATLAS_GLM_INDEX_ROW_GROUP=$GLM_INDEX_ROW_GROUP \
+  -e ATLAS_GLM_INDEX_WMMA=$GLM_INDEX_WMMA \
+  -e ATLAS_GLM_MLA_BATCH23=$GLM_MLA_BATCH23 \
+  -e ATLAS_GLM_C3_GROUPED_MOE=$GLM_C3_GROUPED_MOE \
+  -e ATLAS_GLM_MULTI_SEQ_SPARSE=$GLM_MULTI_SEQ_SPARSE \
+  -e ATLAS_DECODE_BATCH_LOG=$DECODE_BATCH_LOG \
   -e ATLAS_GLM_SPARSE_HEAD_GROUP=$GLM_SPARSE_HEAD_GROUP \
   -e ATLAS_MOE_UNION_STATS=$MOE_UNION_STATS \
   -e ATLAS_GLM_K5_GROUPED_MOE=$GLM_K5_GROUPED_MOE \
@@ -652,6 +705,11 @@ docker run -d \
   -e ATLAS_GLM_VERIFY_PROFILE="$VERIFY_PROFILE" \
   -e ATLAS_GLM_INDEX_PROFILE="$GLM_INDEX_PROFILE" \
   -e ATLAS_GLM_INDEX_ROW_GROUP="$GLM_INDEX_ROW_GROUP" \
+  -e ATLAS_GLM_INDEX_WMMA="$GLM_INDEX_WMMA" \
+  -e ATLAS_GLM_MLA_BATCH23="$GLM_MLA_BATCH23" \
+  -e ATLAS_GLM_C3_GROUPED_MOE="$GLM_C3_GROUPED_MOE" \
+  -e ATLAS_GLM_MULTI_SEQ_SPARSE="$GLM_MULTI_SEQ_SPARSE" \
+  -e ATLAS_DECODE_BATCH_LOG="$DECODE_BATCH_LOG" \
   -e ATLAS_GLM_SPARSE_HEAD_GROUP="$GLM_SPARSE_HEAD_GROUP" \
   -e ATLAS_MOE_UNION_STATS="$MOE_UNION_STATS" \
   -e ATLAS_GLM_K5_GROUPED_MOE="$GLM_K5_GROUPED_MOE" \

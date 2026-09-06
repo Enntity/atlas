@@ -33,13 +33,23 @@ fn glm5_context_supported(max_seq_len: usize, max_prefill_tokens: usize, model_m
     max_seq_len <= model_max && max_prefill_tokens > 0
 }
 
+fn glm5_mtp_context_supported(max_seq_len: usize, num_drafts: usize, index_topk: usize) -> bool {
+    // Scheduler clamps zero drafts to one; the verifier has no semantic index.
+    max_seq_len
+        .checked_add(num_drafts.max(1))
+        .is_some_and(|verify_end| verify_end <= index_topk)
+}
+
 fn glm5_long_context_concurrency_supported(
     max_seq_len: usize,
     index_topk: usize,
     max_batch: usize,
     max_num_seqs: usize,
+    sparse_decode: bool,
 ) -> bool {
-    max_seq_len <= index_topk || (max_batch == 1 && max_num_seqs == 1)
+    max_seq_len <= index_topk
+        || (max_batch == 1 && max_num_seqs == 1)
+        || (sparse_decode && matches!(max_batch, 2 | 3) && (max_batch..=5).contains(&max_num_seqs))
 }
 
 pub(crate) fn preflight_reserve(
@@ -48,6 +58,13 @@ pub(crate) fn preflight_reserve(
     free_mem: usize,
 ) -> Result<ReservePreflight> {
     if config.model_type == "glm5_next" {
+        let sparse_decode =
+            spark_model::layers::qwen3_attention::glm_multi_seq_sparse_enabled(&config.model_type);
+        anyhow::ensure!(
+            !sparse_decode
+                || !(args.speculative || args.self_speculative || args.ngram_speculative),
+            "ATLAS_GLM_MULTI_SEQ_SPARSE=1 supports independent non-speculative decode only"
+        );
         anyhow::ensure!(
             glm5_context_supported(
                 args.max_seq_len,
@@ -69,8 +86,9 @@ pub(crate) fn preflight_reserve(
                 config.index_topk,
                 args.max_batch_size,
                 args.max_num_seqs,
+                sparse_decode,
             ),
-            "GLM-5 context above index_topk={} is currently limited to one active/admitted sequence until batched sparse MLA decode is wired",
+            "GLM-5 context above index_topk={} requires one active/admitted sequence or opt-in ATLAS_GLM_MULTI_SEQ_SPARSE=1 for independent C2/C3",
             config.index_topk,
         );
         anyhow::ensure!(
@@ -78,6 +96,15 @@ pub(crate) fn preflight_reserve(
             "GLM-5 supports its checkpoint MTP layer via --speculative; self/ngram speculative modes are unsupported"
         );
         if args.speculative {
+            anyhow::ensure!(
+                glm5_mtp_context_supported(
+                    args.max_seq_len,
+                    args.resolved_num_drafts(),
+                    config.index_topk,
+                ),
+                "GLM-5 MTP requires --max-seq-len + max(--num-drafts, 1) <= {}; verifier semantic indexing is not implemented",
+                config.index_topk,
+            );
             anyhow::ensure!(
                 args.max_batch_size == 1,
                 "GLM-5 MTP bring-up is intentionally limited to --max-batch-size 1 until batched proposer state is validated"
@@ -352,7 +379,7 @@ pub(crate) fn preflight_reserve(
 mod tests {
     use super::{
         glm5_concurrency_supported, glm5_context_supported, glm5_dual_spark_parallelism,
-        glm5_long_context_concurrency_supported,
+        glm5_long_context_concurrency_supported, glm5_mtp_context_supported,
     };
 
     #[test]
@@ -382,12 +409,42 @@ mod tests {
     }
 
     #[test]
-    fn glm5_long_context_is_single_sequence_until_batched_sparse_decode_lands() {
-        assert!(glm5_long_context_concurrency_supported(100_000, 2048, 1, 1));
-        assert!(!glm5_long_context_concurrency_supported(
-            100_000, 2048, 2, 2
+    fn glm5_mtp_context_includes_all_drafts_and_rejects_overflow() {
+        assert!(glm5_mtp_context_supported(2044, 4, 2048));
+        assert!(!glm5_mtp_context_supported(2045, 4, 2048));
+        assert!(glm5_mtp_context_supported(2047, 1, 2048));
+        assert!(!glm5_mtp_context_supported(2048, 1, 2048));
+        assert!(glm5_mtp_context_supported(2047, 0, 2048));
+        assert!(!glm5_mtp_context_supported(2048, 0, 2048));
+        assert!(!glm5_mtp_context_supported(16384, 4, 2048));
+        assert!(!glm5_mtp_context_supported(usize::MAX, 1, usize::MAX));
+        assert!(!glm5_mtp_context_supported(1, usize::MAX, usize::MAX));
+        assert!(!glm5_mtp_context_supported(0, 1, 0));
+    }
+
+    #[test]
+    fn glm5_long_context_concurrency_requires_explicit_sparse_decode() {
+        assert!(glm5_long_context_concurrency_supported(
+            100_000, 2048, 1, 1, false
         ));
-        assert!(glm5_long_context_concurrency_supported(2048, 2048, 3, 5));
+        assert!(!glm5_long_context_concurrency_supported(
+            100_000, 2048, 2, 2, false
+        ));
+        assert!(glm5_long_context_concurrency_supported(
+            2048, 2048, 3, 5, false
+        ));
+        assert!(glm5_long_context_concurrency_supported(
+            16384, 2048, 3, 3, true
+        ));
+        assert!(glm5_long_context_concurrency_supported(
+            16384, 2048, 2, 5, true
+        ));
+        assert!(!glm5_long_context_concurrency_supported(
+            16384, 2048, 4, 4, true
+        ));
+        assert!(!glm5_long_context_concurrency_supported(
+            16384, 2048, 1, 5, true
+        ));
     }
 }
 

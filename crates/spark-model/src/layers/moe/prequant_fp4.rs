@@ -11,7 +11,113 @@ pub(super) struct CompactMoeWorklist {
     pub max_tiles: u32,
 }
 
+fn c3_grouped_shape(config: &atlas_core::config::ModelConfig, rows: u32, decode_rows: u32) -> bool {
+    rows == 3
+        && decode_rows >= 3
+        && config.model_type == "glm5_next"
+        && config.hidden_size == 4096
+        && config.moe_intermediate_size == 2048
+        && config.shared_expert_intermediate_size == 2048
+        && config.num_experts == 288
+        && config.num_experts_per_tok == 8
+        && config.tp_world_size == 2
+        && config.ep_world_size == 2
+        && config.scoring_func == "sigmoid"
+}
+
+pub(super) fn compact_gate_up_worklist_bytes(rows: u32, top_k: u32, inter: u32) -> usize {
+    16 + rows as usize * top_k as usize * inter.div_ceil(128) as usize * 8
+}
+
 impl MoeLayer {
+    /// C3-only prototype: stateless MoE work is independent of sequence
+    /// ownership. Keep the control's router and shared expert, changing only
+    /// routed GEMV to the established prequantized native-FP4 grouped path.
+    pub(super) fn glm_c3_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
+        std::env::var("ATLAS_GLM_C3_GROUPED_MOE").as_deref() == Ok("1")
+            && c3_grouped_shape(ctx.config, rows, ctx.levers.max_decode_seqs)
+            && ctx.comm.is_some()
+            && self.lora.is_none()
+            && self.bf16_gate_weight_ptrs.is_none()
+            && self.fp8_gate_weight_ptrs.is_none()
+            && !self.has_mixed_bf16_shared_expert()
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && !self.nvfp4_mmq_layout
+            && self.use_t_layout_for_prefill()
+            && self.nvfp4_prequant_moe
+            && self.nvfp4_fused_silu_quant
+            && self.moe_w4a4_prequant_t_k64.0 != 0
+            && self.moe_w4a4_prequant_t_k64_compact.0 != 0
+            && self.moe_build_tile_worklist_k.0 != 0
+            // Prequantization reuses expert_down_out before routed down.
+            // Remote expert rows remain scratch, so reduction must skip them.
+            && self.moe_unpermute_reduce_ep.0 != 0
+            && self.quantize_nvfp4_k.0 != 0
+            && self.silu_mul_quant_nvfp4_k.0 != 0
+            && self.w4a16_gemv_batch3.0 != 0
+            && self.gate_fp8.is_none()
+            && self.gate_nvfp4.is_none()
+            && self.correction_bias_dev.is_some()
+            && self.tid2eid_dev.is_none()
+            && self.pre_expert_norm.is_none()
+            && self.weights.shared_expert_gate.weight.is_null()
+            && !self.weights.shared_expert.gate_proj.is_null()
+            && !self.weights.shared_expert.up_proj.is_null()
+            && !self.weights.shared_expert.down_proj.is_null()
+            && !super::forward_prefill_routed::grouped_cutlass_gate_up_enabled()
+            && !super::forward_prefill_routed::grouped_cutlass_down_enabled()
+    }
+
+    /// Same batch-three shared projections as forward_k3, with destinations
+    /// owned by the grouped pipeline until its final post-EP shared blend.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn c3_shared_expert(
+        &self,
+        input: DevicePtr,
+        gate_out: DevicePtr,
+        up_out: DevicePtr,
+        down_out: DevicePtr,
+        h: u32,
+        inter: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        for (weight, output) in [
+            (&self.weights.shared_expert.gate_proj, gate_out),
+            (&self.weights.shared_expert.up_proj, up_out),
+        ] {
+            ops::w4a16_gemv_batch3(
+                ctx.gpu,
+                self.w4a16_gemv_batch3,
+                input,
+                weight,
+                output,
+                inter,
+                h,
+                stream,
+            )?;
+        }
+        ops::silu_mul(
+            ctx.gpu,
+            self.moe_silu_mul,
+            gate_out,
+            up_out,
+            gate_out,
+            3 * inter,
+            stream,
+        )?;
+        ops::w4a16_gemv_batch3(
+            ctx.gpu,
+            self.w4a16_gemv_batch3,
+            gate_out,
+            &self.weights.shared_expert.down_proj,
+            down_out,
+            h,
+            inter,
+            stream,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prequant_fp4_gate_up(
         &self,
@@ -52,7 +158,8 @@ impl MoeLayer {
             self.moe_w4a4_prequant_t_k64
         };
         if let Some(work) = compact
-            && std::env::var("ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP").as_deref() == Ok("1")
+            && (std::env::var("ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP").as_deref() == Ok("1")
+                || self.glm_c3_grouped(ctx, n))
         {
             let fused_kernel = if self.nvfp4_vecscale
                 && self.moe_w4a4_prequant_t_k64_vecscale_compact_gate_up.0 != 0
@@ -224,3 +331,7 @@ impl MoeLayer {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "prequant_fp4_tests.rs"]
+mod c3_tests;

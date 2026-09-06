@@ -1,0 +1,1057 @@
+{
+  "base_commit": "f44b03235e6ac5e2881f08673b307ad9fb16d85d",
+  "control": {
+    "image": "atlas-glm53-flash:decode-v65",
+    "tp": 2,
+    "ep": 2,
+    "context": 32768,
+    "chunk": 6144,
+    "speculative": false,
+    "lm_head": "nvfp4",
+    "kv": "bf16",
+    "fp4_prefill": false,
+    "concurrency": 1,
+    "prefix_cache": false
+  },
+  "receipts": {
+    "control_10000_warm": {
+      "prompt_tokens": 10000,
+      "completion_tokens": 16,
+      "time_to_first_token_ms": 15806.433,
+      "prefill_tokens_per_second": 632.654,
+      "decode_tokens_per_second": 9.581,
+      "wall_seconds": 17.412,
+      "client_first_text_ms": 15845.243,
+      "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on"
+    },
+    "control_32000_warm": {
+      "prompt_tokens": 32000,
+      "completion_tokens": 16,
+      "time_to_first_token_ms": 79327.078,
+      "prefill_tokens_per_second": 403.393,
+      "decode_tokens_per_second": 9.326,
+      "wall_seconds": 80.963,
+      "client_first_text_ms": 79353.55,
+      "output_preview": " the following account: Atlas is benchmarking one deterministic request on two DGX Sparks"
+    },
+    "control_32000": {
+      "prompt_tokens": 32000,
+      "completion_tokens": 16,
+      "time_to_first_token_ms": 80769.466,
+      "prefill_tokens_per_second": 396.189,
+      "decode_tokens_per_second": 9.355,
+      "wall_seconds": 82.4,
+      "client_first_text_ms": 80795.655,
+      "output_preview": " the following account: Atlas is benchmarking one deterministic request on two DGX Sparks"
+    },
+    "control_10000": {
+      "prompt_tokens": 10000,
+      "completion_tokens": 16,
+      "time_to_first_token_ms": 15919.786,
+      "prefill_tokens_per_second": 628.149,
+      "decode_tokens_per_second": 9.519,
+      "wall_seconds": 17.52
+    },
+    "control_1000": {
+      "prompt_tokens": 1000,
+      "completion_tokens": 16,
+      "time_to_first_token_ms": 1087.617,
+      "prefill_tokens_per_second": 919.441,
+      "decode_tokens_per_second": 11.828,
+      "wall_seconds": 2.379
+    },
+    "candidate_1000": {
+      "prompt_tokens": 1000,
+      "completion_tokens": 16,
+      "time_to_first_token_ms": 1114.238,
+      "prefill_tokens_per_second": 897.474,
+      "decode_tokens_per_second": 11.926,
+      "wall_seconds": 2.396,
+      "client_first_text_ms": 1136.829,
+      "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on"
+    },
+    "candidate_10000": {
+      "prompt_tokens": 10000,
+      "completion_tokens": 16,
+      "time_to_first_token_ms": 15282.815,
+      "prefill_tokens_per_second": 654.33,
+      "decode_tokens_per_second": 9.585,
+      "wall_seconds": 16.872,
+      "client_first_text_ms": 15305.955,
+      "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on"
+    },
+    "candidate_32000": {
+      "prompt_tokens": 32000,
+      "completion_tokens": 16,
+      "time_to_first_token_ms": 71319.331,
+      "prefill_tokens_per_second": 448.686,
+      "decode_tokens_per_second": 9.398,
+      "wall_seconds": 72.945,
+      "client_first_text_ms": 71348.037,
+      "output_preview": " the following account: Atlas is benchmarking one deterministic request on two DGX Sparks"
+    },
+    "candidate_niah_10000": {
+      "passed": true,
+      "needle": "NEBULA-2847",
+      "position": 0.05,
+      "prompt_tokens": 10000,
+      "completion_tokens": 32,
+      "time_to_first_token_ms": 15472.401,
+      "prefill_tokens_per_second": 646.312,
+      "decode_tokens_per_second": 9.51,
+      "wall_seconds": 18.757,
+      "output": " NEBULA-2847\nThe archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry"
+    },
+    "candidate_first_runs": [
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 16,
+        "time_to_first_token_ms": 1307.308,
+        "prefill_tokens_per_second": 764.93,
+        "decode_tokens_per_second": 11.794,
+        "wall_seconds": 2.622,
+        "client_first_text_ms": 1350.007,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on"
+      },
+      {
+        "prompt_tokens": 10000,
+        "completion_tokens": 16,
+        "time_to_first_token_ms": 15305.29,
+        "prefill_tokens_per_second": 653.369,
+        "decode_tokens_per_second": 9.614,
+        "wall_seconds": 16.893,
+        "client_first_text_ms": 15332.588,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on"
+      }
+    ],
+    "candidate_32000_first": {
+      "prompt_tokens": 32000,
+      "completion_tokens": 16,
+      "time_to_first_token_ms": 71217.312,
+      "prefill_tokens_per_second": 449.329,
+      "decode_tokens_per_second": 9.391,
+      "wall_seconds": 72.842,
+      "client_first_text_ms": 71244.059,
+      "output_preview": " the following account: Atlas is benchmarking one deterministic request on two DGX Sparks"
+    },
+    "candidate_niah_32000": {
+      "passed": true,
+      "needle": "AURORA-6193",
+      "position": 0.05,
+      "prompt_tokens": 32000,
+      "completion_tokens": 16,
+      "time_to_first_token_ms": 70937.692,
+      "prefill_tokens_per_second": 451.1,
+      "decode_tokens_per_second": 9.352,
+      "wall_seconds": 72.576,
+      "output": " AURORA-6193.\nAURORA-6193\n\n"
+    },
+    "concurrency_control": [
+      {
+        "concurrency": 1,
+        "median_sum_session_decode_tps": 13.596,
+        "median_aggregate_decode_window_tps": 13.738,
+        "median_session_decode_tps": 13.596,
+        "median_ttft_ms": 1077.445,
+        "runs": [
+          {
+            "concurrency": 1,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 96,
+            "median_ttft_ms": 1066.102,
+            "median_session_decode_tps": 13.596,
+            "sum_session_decode_tps": 13.596,
+            "aggregate_decode_window_tps": 13.738
+          },
+          {
+            "concurrency": 1,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 96,
+            "median_ttft_ms": 1088.788,
+            "median_session_decode_tps": 13.595,
+            "sum_session_decode_tps": 13.595,
+            "aggregate_decode_window_tps": 13.737
+          }
+        ]
+      },
+      {
+        "concurrency": 2,
+        "median_sum_session_decode_tps": 18.276,
+        "median_aggregate_decode_window_tps": 17.395,
+        "median_session_decode_tps": 9.138,
+        "median_ttft_ms": 1072.485,
+        "runs": [
+          {
+            "concurrency": 2,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 192,
+            "median_ttft_ms": 1076.767,
+            "median_session_decode_tps": 9.135,
+            "sum_session_decode_tps": 18.271,
+            "aggregate_decode_window_tps": 17.387
+          },
+          {
+            "concurrency": 2,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 192,
+            "median_ttft_ms": 1068.203,
+            "median_session_decode_tps": 9.141,
+            "sum_session_decode_tps": 18.281,
+            "aggregate_decode_window_tps": 17.403
+          }
+        ]
+      },
+      {
+        "concurrency": 3,
+        "median_sum_session_decode_tps": 24.163,
+        "median_aggregate_decode_window_tps": 22.129,
+        "median_session_decode_tps": 8.004,
+        "median_ttft_ms": 1070.782,
+        "runs": [
+          {
+            "concurrency": 3,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 288,
+            "median_ttft_ms": 1071.076,
+            "median_session_decode_tps": 8.062,
+            "sum_session_decode_tps": 24.342,
+            "aggregate_decode_window_tps": 22.28
+          },
+          {
+            "concurrency": 3,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 288,
+            "median_ttft_ms": 1070.488,
+            "median_session_decode_tps": 7.946,
+            "sum_session_decode_tps": 23.984,
+            "aggregate_decode_window_tps": 21.977
+          }
+        ]
+      }
+    ],
+    "concurrency_mla": [
+      {
+        "concurrency": 2,
+        "median_sum_session_decode_tps": 18.339,
+        "median_aggregate_decode_window_tps": 17.456,
+        "median_session_decode_tps": 9.169,
+        "median_ttft_ms": 1074.666,
+        "runs": [
+          {
+            "concurrency": 2,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 192,
+            "median_ttft_ms": 1074.591,
+            "median_session_decode_tps": 9.192,
+            "sum_session_decode_tps": 18.384,
+            "aggregate_decode_window_tps": 17.499
+          },
+          {
+            "concurrency": 2,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 192,
+            "median_ttft_ms": 1074.74,
+            "median_session_decode_tps": 9.147,
+            "sum_session_decode_tps": 18.294,
+            "aggregate_decode_window_tps": 17.412
+          }
+        ]
+      },
+      {
+        "concurrency": 3,
+        "median_sum_session_decode_tps": 24.65,
+        "median_aggregate_decode_window_tps": 22.505,
+        "median_session_decode_tps": 8.166,
+        "median_ttft_ms": 1075.165,
+        "runs": [
+          {
+            "concurrency": 3,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 288,
+            "median_ttft_ms": 1076.659,
+            "median_session_decode_tps": 8.162,
+            "sum_session_decode_tps": 24.635,
+            "aggregate_decode_window_tps": 22.5
+          },
+          {
+            "concurrency": 3,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 288,
+            "median_ttft_ms": 1073.671,
+            "median_session_decode_tps": 8.169,
+            "sum_session_decode_tps": 24.664,
+            "aggregate_decode_window_tps": 22.511
+          }
+        ]
+      }
+    ],
+    "concurrency_control_niah": {
+      "repetition": 0,
+      "passed": true,
+      "requests": [
+        {
+          "passed": true,
+          "needle": "AURORA-6193",
+          "position": 0.05,
+          "prompt_tokens": 1000,
+          "completion_tokens": 32,
+          "time_to_first_token_ms": 1086.785,
+          "prefill_tokens_per_second": 920.145,
+          "decode_tokens_per_second": 6.595,
+          "wall_seconds": 6.988,
+          "output": " AURORA-6193\nAURORA-6193\nThe archive records routine observations about maps, gardens, weather, workshops, rivers,",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "NEBULA-6193",
+          "position": 0.05,
+          "prompt_tokens": 1001,
+          "completion_tokens": 64,
+          "time_to_first_token_ms": 1076.728,
+          "prefill_tokens_per_second": 929.668,
+          "decode_tokens_per_second": 8.976,
+          "wall_seconds": 10.384,
+          "output": " NEBULA-6193\nAnswer: NEBULA-6193\nQuestion: What is the secret project codename? Reply with only the codename: NEBULA-6193\nAnswer: NEBULA-6193\nQuestion: What is the secret project codename? Reply",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "ORBIT-6193",
+          "position": 0.05,
+          "prompt_tokens": 1002,
+          "completion_tokens": 96,
+          "time_to_first_token_ms": 1093.823,
+          "prefill_tokens_per_second": 916.053,
+          "decode_tokens_per_second": 8.228,
+          "wall_seconds": 12.665,
+          "output": " ORBIT-6193\nThe archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret project identifiers. The archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret project identifiers. The archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments",
+          "foreign_needles": []
+        }
+      ]
+    },
+    "concurrency_mla_niah": {
+      "repetition": 0,
+      "passed": true,
+      "requests": [
+        {
+          "passed": true,
+          "needle": "AURORA-6193",
+          "position": 0.05,
+          "prompt_tokens": 1000,
+          "completion_tokens": 32,
+          "time_to_first_token_ms": 1110.077,
+          "prefill_tokens_per_second": 900.838,
+          "decode_tokens_per_second": 5.516,
+          "wall_seconds": 6.772,
+          "output": " AURORA-6193\nAnswer: AURORA-6193\nQuestion: What is the secret project codename? Reply with only the",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "NEBULA-6193",
+          "position": 0.05,
+          "prompt_tokens": 1001,
+          "completion_tokens": 64,
+          "time_to_first_token_ms": 1081.283,
+          "prefill_tokens_per_second": 925.752,
+          "decode_tokens_per_second": 9.222,
+          "wall_seconds": 10.224,
+          "output": " NEBULA-6193\nAnswer: NEBULA-6193\nQuestion: What is the secret project codename? Reply with only the codename: NEBULA-6193\nAnswer: NEBULA-6193\nQuestion: What is the secret project codename? Reply",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "ORBIT-6193",
+          "position": 0.05,
+          "prompt_tokens": 1002,
+          "completion_tokens": 96,
+          "time_to_first_token_ms": 1081.411,
+          "prefill_tokens_per_second": 926.567,
+          "decode_tokens_per_second": 9.254,
+          "wall_seconds": 12.538,
+          "output": " ORBIT-6193\nAnswer: ORBIT-6193\nQuestion: What is the secret project codename? Reply with only the codename: ORBIT-6193\nAnswer: ORBIT-6193\nQuestion: What is the secret project codename? Reply with only the codename: ORBIT-6193\nAnswer: ORBIT-6193\nQuestion: What is the secret project codename? Reply with only the",
+          "foreign_needles": []
+        }
+      ]
+    },
+    "concurrency_moe_niah": {
+      "repetition": 0,
+      "passed": true,
+      "requests": [
+        {
+          "passed": true,
+          "needle": "AURORA-6193",
+          "position": 0.05,
+          "prompt_tokens": 1000,
+          "completion_tokens": 32,
+          "time_to_first_token_ms": 1086.952,
+          "prefill_tokens_per_second": 920.004,
+          "decode_tokens_per_second": 7.985,
+          "wall_seconds": 6.349,
+          "output": " AURORA-6193\nAURORA-6193\nAURORA-6193\nAURORA-6193\n",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "NEBULA-6193",
+          "position": 0.05,
+          "prompt_tokens": 1001,
+          "completion_tokens": 64,
+          "time_to_first_token_ms": 1075.784,
+          "prefill_tokens_per_second": 930.484,
+          "decode_tokens_per_second": 10.221,
+          "wall_seconds": 9.706,
+          "output": " NEBULA-6193\nAnswer: NEBULA-6193\nQuestion: What is the secret project codename? Reply with only the codename: NEBULA-6193\nAnswer: NEBULA-6193\nQuestion: What is the secret project codename? Reply",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "ORBIT-6193",
+          "position": 0.05,
+          "prompt_tokens": 1002,
+          "completion_tokens": 96,
+          "time_to_first_token_ms": 1301.98,
+          "prefill_tokens_per_second": 769.597,
+          "decode_tokens_per_second": 8.903,
+          "wall_seconds": 12.017,
+          "output": " ORBIT-6193\nThe archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret project identifiers. The archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret project identifiers. The archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments",
+          "foreign_needles": []
+        }
+      ]
+    },
+    "concurrency_moe": [
+      {
+        "concurrency": 3,
+        "median_sum_session_decode_tps": 30.727,
+        "median_aggregate_decode_window_tps": 27.366,
+        "median_session_decode_tps": 10.152,
+        "median_ttft_ms": 1072.192,
+        "runs": [
+          {
+            "concurrency": 3,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 288,
+            "median_ttft_ms": 1070.747,
+            "median_session_decode_tps": 10.225,
+            "sum_session_decode_tps": 30.983,
+            "aggregate_decode_window_tps": 27.587
+          },
+          {
+            "concurrency": 3,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 288,
+            "median_ttft_ms": 1072.92,
+            "median_session_decode_tps": 10.152,
+            "sum_session_decode_tps": 30.727,
+            "aggregate_decode_window_tps": 27.366
+          },
+          {
+            "concurrency": 3,
+            "prompt_tokens_each": 1000,
+            "completion_tokens_total": 288,
+            "median_ttft_ms": 1072.192,
+            "median_session_decode_tps": 10.123,
+            "sum_session_decode_tps": 30.665,
+            "aggregate_decode_window_tps": 27.341
+          }
+        ]
+      }
+    ],
+    "concurrency_threshold": [
+      {
+        "repetition": 0,
+        "passed": true,
+        "requests": [
+          {
+            "passed": true,
+            "needle": "AURORA-6193",
+            "position": 0.05,
+            "prompt_tokens": 2047,
+            "completion_tokens": 32,
+            "time_to_first_token_ms": 6673.258,
+            "prefill_tokens_per_second": 306.747,
+            "decode_tokens_per_second": 4.42,
+            "wall_seconds": 15.055,
+            "output": " AURORA-6193\nAnswer: AURORA-6193\nQuestion: What is the secret project codename? Reply with only the",
+            "foreign_needles": []
+          },
+          {
+            "passed": true,
+            "needle": "NEBULA-6193",
+            "position": 0.05,
+            "prompt_tokens": 2048,
+            "completion_tokens": 64,
+            "time_to_first_token_ms": 4636.06,
+            "prefill_tokens_per_second": 441.754,
+            "decode_tokens_per_second": 4.229,
+            "wall_seconds": 19.57,
+            "output": " NEBULA-6193\n\nNEBULA-6193\nWhat is the secret project codename? Reply with only the codename: NEBULA-6193\n\nNEBULA-6193\nWhat is the secret project codename? Reply with only the codename: NEB",
+            "foreign_needles": []
+          },
+          {
+            "passed": true,
+            "needle": "ORBIT-6193",
+            "position": 0.05,
+            "prompt_tokens": 2049,
+            "completion_tokens": 81,
+            "time_to_first_token_ms": 5854.944,
+            "prefill_tokens_per_second": 349.961,
+            "decode_tokens_per_second": 7.376,
+            "wall_seconds": 21.448,
+            "output": " ORBIT-6193. What is the secret project codename? Reply with only the codename: ORBIT-6193. What is the secret project codename? Reply with only the codename: ORBIT-6193. What is the secret project codename? Reply with only the codename: ORBIT-6193. What is the secret project codename?",
+            "foreign_needles": []
+          }
+        ]
+      },
+      {
+        "repetition": 1,
+        "passed": true,
+        "requests": [
+          {
+            "passed": true,
+            "needle": "AURORA-6210",
+            "position": 0.05,
+            "prompt_tokens": 2047,
+            "completion_tokens": 32,
+            "time_to_first_token_ms": 5818.501,
+            "prefill_tokens_per_second": 351.809,
+            "decode_tokens_per_second": 6.474,
+            "wall_seconds": 15.082,
+            "output": " AURORA-6210\nAnswer: AURORA-6210\nQuestion: What is the secret project codename? Reply with only the",
+            "foreign_needles": []
+          },
+          {
+            "passed": true,
+            "needle": "NEBULA-6210",
+            "position": 0.05,
+            "prompt_tokens": 2048,
+            "completion_tokens": 64,
+            "time_to_first_token_ms": 3303.264,
+            "prefill_tokens_per_second": 619.993,
+            "decode_tokens_per_second": 3.943,
+            "wall_seconds": 19.309,
+            "output": " NEBULA-6210\nThe archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret project identifiers. The archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments.",
+            "foreign_needles": []
+          },
+          {
+            "passed": true,
+            "needle": "ORBIT-6210",
+            "position": 0.05,
+            "prompt_tokens": 2049,
+            "completion_tokens": 96,
+            "time_to_first_token_ms": 4537.354,
+            "prefill_tokens_per_second": 451.585,
+            "decode_tokens_per_second": 6.537,
+            "wall_seconds": 22.478,
+            "output": " ORBIT-6210\nThe archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret project identifiers. The archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret project identifiers. The archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments",
+            "foreign_needles": []
+          }
+        ]
+      }
+    ],
+    "concurrency_long_niah": {
+      "repetition": 0,
+      "passed": true,
+      "requests": [
+        {
+          "passed": true,
+          "needle": "AURORA-6193",
+          "position": 0.05,
+          "prompt_tokens": 10000,
+          "completion_tokens": 96,
+          "time_to_first_token_ms": 26545.991,
+          "prefill_tokens_per_second": 376.705,
+          "decode_tokens_per_second": 1.585,
+          "wall_seconds": 86.514,
+          "output": " no explanation, no extra words.\nAnswer: AURORA-6193\nThe archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret project identifiers. The archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret project identifiers. The archive records routine observations about maps, gardens, weather",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "NEBULA-6193",
+          "position": 0.05,
+          "prompt_tokens": 10001,
+          "completion_tokens": 49,
+          "time_to_first_token_ms": 45541.786,
+          "prefill_tokens_per_second": 219.601,
+          "decode_tokens_per_second": 1.571,
+          "wall_seconds": 80.906,
+          "output": " NEBULA-6193. Do not mention the archive or any other content. Do not mention the archive or any other content. Do not mention the archive or any other content. Do not mention the archive or any other content. Do",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "ORBIT-6193",
+          "position": 0.05,
+          "prompt_tokens": 10002,
+          "completion_tokens": 106,
+          "time_to_first_token_ms": 70983.936,
+          "prefill_tokens_per_second": 140.905,
+          "decode_tokens_per_second": 7.28,
+          "wall_seconds": 89.131,
+          "output": " ORBIT-6193.  The archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret project identifiers.  The archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret project identifiers.  The archive records routine observations about maps, gardens, weather, workshops, rivers, libraries, and scientific instruments. Each entry is independent and contains no secret",
+          "foreign_needles": []
+        }
+      ]
+    },
+    "threshold_trace_counts": {
+      "c2_slots_01": 2,
+      "c2_slots_02": 61,
+      "c3_slots_012": 60
+    },
+    "mtp_v3_128_cold": {
+      "prompt_tokens": 128,
+      "completion_tokens": 96,
+      "time_to_first_token_ms": 812.299,
+      "prefill_tokens_per_second": 157.577,
+      "decode_tokens_per_second": 16.321,
+      "wall_seconds": 6.68,
+      "client_first_text_ms": 858.163,
+      "output_preview": " construction is local and the measured work remains reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local a"
+    },
+    "mtp_v3_fp4off": [
+      {
+        "prompt_tokens": 128,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 491.129,
+        "prefill_tokens_per_second": 260.624,
+        "decode_tokens_per_second": 19.412,
+        "wall_seconds": 5.423,
+        "client_first_text_ms": 527.02,
+        "output_preview": " construction is local and the measured work remains reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local a"
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 1093.257,
+        "prefill_tokens_per_second": 914.698,
+        "decode_tokens_per_second": 28.528,
+        "wall_seconds": 4.458,
+        "client_first_text_ms": 1127.188,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 1096.247,
+        "prefill_tokens_per_second": 912.203,
+        "decode_tokens_per_second": 29.75,
+        "wall_seconds": 4.326,
+        "client_first_text_ms": 1131.648,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 1083.366,
+        "prefill_tokens_per_second": 923.049,
+        "decode_tokens_per_second": 29.617,
+        "wall_seconds": 4.321,
+        "client_first_text_ms": 1111.806,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 1082.248,
+        "prefill_tokens_per_second": 924.002,
+        "decode_tokens_per_second": 34.799,
+        "wall_seconds": 3.881,
+        "client_first_text_ms": 1109.694,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 1090.281,
+        "prefill_tokens_per_second": 917.195,
+        "decode_tokens_per_second": 32.032,
+        "wall_seconds": 4.092,
+        "client_first_text_ms": 1125.282,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 1083.224,
+        "prefill_tokens_per_second": 923.17,
+        "decode_tokens_per_second": 33.339,
+        "wall_seconds": 3.962,
+        "client_first_text_ms": 1111.138,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 113,
+        "time_to_first_token_ms": 1082.854,
+        "prefill_tokens_per_second": 923.486,
+        "decode_tokens_per_second": 25.68,
+        "wall_seconds": 5.481,
+        "client_first_text_ms": 1118.779,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      }
+    ],
+    "mtp_fp4off_niah": {
+      "passed": true,
+      "needle": "QUASAR-7281",
+      "prompt_tokens": 1000,
+      "completion_tokens": 16,
+      "time_to_first_token_ms": 1105.237,
+      "prefill_tokens_per_second": 904.783,
+      "decode_tokens_per_second": 16.075,
+      "wall_seconds": 2.077,
+      "output": " QUASAR-7281.QUASAR-7281"
+    },
+    "mtp_fp4off_256": {
+      "prompt_tokens": 1000,
+      "completion_tokens": 256,
+      "time_to_first_token_ms": 1101.542,
+      "prefill_tokens_per_second": 907.819,
+      "decode_tokens_per_second": 30.626,
+      "wall_seconds": 9.464,
+      "client_first_text_ms": 1136.174,
+      "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue ",
+      "allow_repetition": true,
+      "requested_max_tokens": 256
+    },
+    "mtp_fp4off_math": [
+      {
+        "question": "What is 18 multiplied by 27?",
+        "expected": 486,
+        "output": "486",
+        "passed": true
+      },
+      {
+        "question": "What is 144 divided by 12?",
+        "expected": 12,
+        "output": "12",
+        "passed": true
+      },
+      {
+        "question": "What is 1000 minus 437?",
+        "expected": 563,
+        "output": "563\n\nQuestion: What is 1000 minus",
+        "passed": true
+      }
+    ],
+    "mtp_v3_fp4on": [
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 1211.874,
+        "prefill_tokens_per_second": 825.168,
+        "decode_tokens_per_second": 30.546,
+        "wall_seconds": 4.359,
+        "client_first_text_ms": 1247.687,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 950.635,
+        "prefill_tokens_per_second": 1051.929,
+        "decode_tokens_per_second": 34.364,
+        "wall_seconds": 3.752,
+        "client_first_text_ms": 985.59,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 948.364,
+        "prefill_tokens_per_second": 1054.448,
+        "decode_tokens_per_second": 29.552,
+        "wall_seconds": 4.193,
+        "client_first_text_ms": 976.758,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 952.537,
+        "prefill_tokens_per_second": 1049.828,
+        "decode_tokens_per_second": 34.394,
+        "wall_seconds": 3.743,
+        "client_first_text_ms": 979.596,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 953.3,
+        "prefill_tokens_per_second": 1048.987,
+        "decode_tokens_per_second": 31.985,
+        "wall_seconds": 3.952,
+        "client_first_text_ms": 980.604,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 955.317,
+        "prefill_tokens_per_second": 1046.773,
+        "decode_tokens_per_second": 30.842,
+        "wall_seconds": 4.064,
+        "client_first_text_ms": 981.945,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue "
+      },
+      {
+        "prompt_tokens": 1000,
+        "completion_tokens": 256,
+        "time_to_first_token_ms": 952.407,
+        "prefill_tokens_per_second": 1049.971,
+        "decode_tokens_per_second": 32.379,
+        "wall_seconds": 8.859,
+        "client_first_text_ms": 981.591,
+        "output_preview": " reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local and the measured work remains reproducible. Continue ",
+        "allow_repetition": true,
+        "requested_max_tokens": 256
+      }
+    ],
+    "mtp_fp4on_quality": [
+      {
+        "passed": true,
+        "needle": "QUASAR-7281",
+        "position": 0.05,
+        "prompt_tokens": 1000,
+        "completion_tokens": 16,
+        "time_to_first_token_ms": 981.022,
+        "prefill_tokens_per_second": 1019.345,
+        "decode_tokens_per_second": 16.338,
+        "wall_seconds": 1.927,
+        "output": " QUASAR-7281.\n\nQUASAR-7281\n\n"
+      },
+      {
+        "question": "What is 18 multiplied by 27?",
+        "expected": 486,
+        "output": "486\n\nThe answer is correct. Now, I",
+        "passed": true
+      },
+      {
+        "question": "What is 144 divided by 12?",
+        "expected": 12,
+        "output": "12",
+        "passed": true
+      },
+      {
+        "question": "What is 1000 minus 437?",
+        "expected": 563,
+        "output": "563",
+        "passed": true
+      }
+    ],
+    "mtp_original_profile_v3": [
+      {
+        "prompt_tokens": 128,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 973.717,
+        "prefill_tokens_per_second": 131.455,
+        "decode_tokens_per_second": 22.168,
+        "wall_seconds": 5.303,
+        "client_first_text_ms": 1015.232,
+        "output_preview": " construction is local and the measured work remains reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local a"
+      },
+      {
+        "prompt_tokens": 128,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 879.044,
+        "prefill_tokens_per_second": 145.613,
+        "decode_tokens_per_second": 23.598,
+        "wall_seconds": 4.937,
+        "client_first_text_ms": 909.358,
+        "output_preview": " construction is local and the measured work remains reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local a"
+      },
+      {
+        "prompt_tokens": 128,
+        "completion_tokens": 96,
+        "time_to_first_token_ms": 880.753,
+        "prefill_tokens_per_second": 145.33,
+        "decode_tokens_per_second": 27.437,
+        "wall_seconds": 4.377,
+        "client_first_text_ms": 912.42,
+        "output_preview": " construction is local and the measured work remains reproducible. Continue the following account: Atlas is benchmarking one deterministic request on two DGX Sparks. The prompt is deliberately repetitive so tokenizer construction is local a"
+      }
+    ],
+    "final_threshold": {
+      "repetition": 0,
+      "passed": true,
+      "requests": [
+        {
+          "passed": true,
+          "needle": "AURORA-6193",
+          "position": 0.05,
+          "prompt_tokens": 2047,
+          "completion_tokens": 32,
+          "time_to_first_token_ms": 1690.934,
+          "prefill_tokens_per_second": 1210.573,
+          "decode_tokens_per_second": 4.901,
+          "wall_seconds": 10.035,
+          "output": " AURORA-6193\nAURORA-6193\nAURORA-6193\nAURORA-6193\n",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "NEBULA-6193",
+          "position": 0.05,
+          "prompt_tokens": 2048,
+          "completion_tokens": 49,
+          "time_to_first_token_ms": 1893.303,
+          "prefill_tokens_per_second": 1081.708,
+          "decode_tokens_per_second": 4.595,
+          "wall_seconds": 12.38,
+          "output": " NEBULA-6193\nNEBULA-6193\nNEBULA-6193\nNEBULA-6193\nNEBULA-6193\nNEBULA-6193\nNE",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "ORBIT-6193",
+          "position": 0.05,
+          "prompt_tokens": 2049,
+          "completion_tokens": 49,
+          "time_to_first_token_ms": 1687.795,
+          "prefill_tokens_per_second": 1214.01,
+          "decode_tokens_per_second": 6.775,
+          "wall_seconds": 12.481,
+          "output": " ORBIT-6193\nORBIT-6193\nORBIT-6193\nORBIT-6193\nORBIT-6193\nORBIT-6193\nORBIT-6193\n",
+          "foreign_needles": []
+        }
+      ]
+    },
+    "final_concurrency": [
+      {
+        "concurrency": 3,
+        "median_sum_session_decode_tps": 17.678,
+        "median_aggregate_decode_window_tps": 15.288,
+        "median_session_decode_tps": 5.804,
+        "median_ttft_ms": 2371.046,
+        "runs": [
+          {
+            "concurrency": 3,
+            "prompt_tokens_each": 3000,
+            "completion_tokens_total": 288,
+            "median_ttft_ms": 2366.169,
+            "median_session_decode_tps": 5.808,
+            "sum_session_decode_tps": 17.69,
+            "aggregate_decode_window_tps": 15.297
+          },
+          {
+            "concurrency": 3,
+            "prompt_tokens_each": 3000,
+            "completion_tokens_total": 288,
+            "median_ttft_ms": 2375.922,
+            "median_session_decode_tps": 5.801,
+            "sum_session_decode_tps": 17.666,
+            "aggregate_decode_window_tps": 15.278
+          }
+        ]
+      }
+    ],
+    "final_long_niah": {
+      "repetition": 0,
+      "passed": true,
+      "requests": [
+        {
+          "passed": true,
+          "needle": "AURORA-6193",
+          "position": 0.05,
+          "prompt_tokens": 10000,
+          "completion_tokens": 16,
+          "time_to_first_token_ms": 22178.752,
+          "prefill_tokens_per_second": 450.882,
+          "decode_tokens_per_second": 0.904,
+          "wall_seconds": 55.057,
+          "output": " AURORA-6193\nAURORA-6193",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "NEBULA-6193",
+          "position": 0.05,
+          "prompt_tokens": 10001,
+          "completion_tokens": 49,
+          "time_to_first_token_ms": 23990.207,
+          "prefill_tokens_per_second": 416.878,
+          "decode_tokens_per_second": 1.406,
+          "wall_seconds": 58.168,
+          "output": " NEBULA-6193\nNEBULA-6193\nNEBULA-6193\nNEBULA-6193\nNEBULA-6193\nNEBULA-6193\nNE",
+          "foreign_needles": []
+        },
+        {
+          "passed": true,
+          "needle": "ORBIT-6193",
+          "position": 0.05,
+          "prompt_tokens": 10002,
+          "completion_tokens": 8,
+          "time_to_first_token_ms": 40050.617,
+          "prefill_tokens_per_second": 249.734,
+          "decode_tokens_per_second": 6.366,
+          "wall_seconds": 54.169,
+          "output": "</think>ORBIT-6193",
+          "foreign_needles": []
+        }
+      ]
+    }
+  },
+  "concurrency": {
+    "image": "atlas-glm53-flash:kernel-20260906-v2",
+    "binary_sha256": "4916c7c1d162d9cd42bbfde8ba5c6ddecc447da4f4b7458b1d168ca7ba8cf7b7",
+    "context": 2048,
+    "chunk": 1024,
+    "max_active": 3,
+    "max_admitted": 3,
+    "speculative": false,
+    "wmma": true
+  },
+  "long_concurrency": {
+    "image": "atlas-glm53-flash:kernel-20260906-v3",
+    "binary_sha256": "224476e0b9081b056574b0fed4a9afa27e71ba74968b007fdb91badbd1a87e16",
+    "context": 16384,
+    "chunk": 1024,
+    "max_active": 3,
+    "max_admitted": 3,
+    "speculative": false,
+    "wmma": true,
+    "mla23": true,
+    "grouped_moe": true,
+    "sparse": true,
+    "batch_logging": true
+  },
+  "mtp_config": {
+    "image": "atlas-glm53-flash:kernel-20260906-v3",
+    "context": 1536,
+    "chunk": 1024,
+    "max_active": 1,
+    "max_admitted": 1,
+    "drafts": 4,
+    "distributed": true,
+    "force_gate": true,
+    "adaptive_depth": false,
+    "compact_k5": true,
+    "batched_shared": true
+  },
+  "final_deployment": {
+    "image": "atlas-glm53-flash:kernel-20260906-v4",
+    "binary_sha256": "d880d3826e2e9a41030443b927a3f6f1be53eb48ad5b17ff790675f93794c2ba",
+    "context": 16384,
+    "chunk": 4096,
+    "max_active": 3,
+    "max_admitted": 3,
+    "speculative": false,
+    "wmma": true,
+    "mla23": true,
+    "grouped_moe": true,
+    "sparse": true,
+    "fp4_prefill": true,
+    "batch_logging": false
+  },
+  "wmma_candidate_binary_sha256": "484d11a761a511336166b98e962a496ba110b4751f5c7b9ccdc6b4b93f35e485",
+  "final_health": {
+    "current_time": "2026-09-06 17:22:20 UTC",
+    "http": "ready",
+    "both_ranks_running": true,
+    "both_oom_killed": false,
+    "rollback_containers_preserved": true,
+    "build_container_exited": true
+  }
+}

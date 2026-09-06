@@ -8,11 +8,11 @@ use super::*;
 /// Whether the single-launch CUTLASS grouped NVFP4 path is enabled. The
 /// model-neutral name is used by new integrations; retain the Holo variable
 /// as a compatibility alias for existing recipes.
-fn grouped_cutlass_gate_up_enabled() -> bool {
+pub(super) fn grouped_cutlass_gate_up_enabled() -> bool {
     env_flag("ATLAS_MOE_GROUPED_CUTLASS") || env_flag("ATLAS_HOLO_MOE_GROUPED_CUTLASS")
 }
 
-fn grouped_cutlass_down_enabled() -> bool {
+pub(super) fn grouped_cutlass_down_enabled() -> bool {
     env_flag("ATLAS_MOE_GROUPED_CUTLASS") || env_flag("ATLAS_HOLO_MOE_GROUPED_DOWN")
 }
 
@@ -240,10 +240,17 @@ impl MoeLayer {
                         stream,
                     )?;
                 } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
-                    let compact = if compact_k5 {
+                    let compact = if compact_k5 || self.glm_c3_grouped(ctx, n) {
                         let total_tiles = ctx.buffers.moe_router_in_f32();
                         let worklist = total_tiles.offset(16);
                         let n_tiles = inter.div_ceil(128);
+                        anyhow::ensure!(
+                            ctx.buffers.sizes().moe_router_in_f32
+                                >= super::prequant_fp4::compact_gate_up_worklist_bytes(
+                                    n, top_k, inter
+                                ),
+                            "compact native-FP4 gate/up worklist exceeds router scratch"
+                        );
                         ops::moe_build_tile_worklist(
                             ctx.gpu,
                             self.moe_build_tile_worklist_k,

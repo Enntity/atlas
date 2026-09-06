@@ -112,6 +112,71 @@ pub fn glm_index_fill_causal(
         .launch(stream)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IndexLogitsLaunch {
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared_mem: u32,
+}
+
+/// Validate the kernel contract before constructing or submitting a launch.
+#[allow(clippy::too_many_arguments)]
+fn index_logits_launch(
+    query_address: u64,
+    rows: u32,
+    seq_len_start: u32,
+    logits_stride: u32,
+    index_heads: u32,
+    head_dim: u32,
+    pool_size: u32,
+    cache_block_size: u32,
+    rows_per_cta: u32,
+    pools_per_cta: u32,
+) -> Result<IndexLogitsLaunch> {
+    anyhow::ensure!(
+        rows > 0 && logits_stride > 0 && index_heads > 0 && head_dim > 0,
+        "GLM semantic scorer dimensions must be nonzero"
+    );
+    anyhow::ensure!(
+        pool_size > 0 && cache_block_size > 0 && cache_block_size.is_multiple_of(pool_size),
+        "GLM semantic scorer cache blocks must contain whole nonempty pools"
+    );
+    anyhow::ensure!(
+        seq_len_start.checked_add(rows).is_some() && head_dim.checked_mul(index_heads).is_some(),
+        "GLM semantic scorer sequence or head dimensions overflow u32"
+    );
+    anyhow::ensure!(
+        (pools_per_cta == 8 && matches!(rows_per_cta, 1 | 8))
+            || (pools_per_cta == 32
+                && rows_per_cta == 8
+                && index_heads == 32
+                && head_dim == 128
+                && pool_size == 4
+                && query_address.is_multiple_of(32)),
+        "unsupported GLM semantic scorer launch geometry or query alignment"
+    );
+    let shared_mem = if rows_per_cta == 8 && pools_per_cta == 8 {
+        head_dim
+            .checked_mul(8 * std::mem::size_of::<u16>() as u32)
+            .ok_or_else(|| anyhow::anyhow!("GLM semantic scorer shared memory overflows u32"))?
+    } else {
+        0
+    };
+    anyhow::ensure!(
+        shared_mem <= 48 * 1024,
+        "GLM semantic scorer exceeds default shared memory limit"
+    );
+    Ok(IndexLogitsLaunch {
+        grid: [
+            logits_stride.div_ceil(pools_per_cta),
+            rows.div_ceil(rows_per_cta),
+            1,
+        ],
+        block: [256, 1, 1],
+        shared_mem,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn glm_index_logits(
     gpu: &dyn GpuBackend,
@@ -130,16 +195,25 @@ pub fn glm_index_logits(
     cache_block_size: u32,
     index_block_stride_bytes: u64,
     rows_per_cta: u32,
+    pools_per_cta: u32,
     stream: u64,
 ) -> Result<()> {
+    let launch = index_logits_launch(
+        query.0,
+        rows,
+        seq_len_start,
+        logits_stride,
+        index_heads,
+        head_dim,
+        pool_size,
+        cache_block_size,
+        rows_per_cta,
+        pools_per_cta,
+    )?;
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(logits_stride, 8), div_ceil(rows, rows_per_cta), 1])
-        .block([256, 1, 1])
-        .shared_mem(if rows_per_cta == 8 {
-            8 * head_dim * std::mem::size_of::<u16>() as u32
-        } else {
-            0
-        })
+        .grid(launch.grid)
+        .block(launch.block)
+        .shared_mem(launch.shared_mem)
         .arg_ptr(query)
         .arg_ptr(weights)
         .arg_ptr(index_cache)
@@ -224,4 +298,121 @@ pub fn glm_sparse_mla_prefill(
         .arg_u32(cache_block_size)
         .arg_f32(inv_sqrt_d)
         .launch(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn geometry(rows_per_cta: u32, pools_per_cta: u32) -> Result<IndexLogitsLaunch> {
+        index_logits_launch(
+            256,
+            9,
+            4096,
+            33,
+            32,
+            128,
+            4,
+            32,
+            rows_per_cta,
+            pools_per_cta,
+        )
+    }
+
+    #[test]
+    fn scorer_tiles_cover_partial_rows_and_pools() {
+        let scalar = geometry(1, 8).unwrap();
+        let row8 = geometry(8, 8).unwrap();
+        let wmma = geometry(8, 32).unwrap();
+        assert_eq!(scalar.grid, [5, 9, 1]);
+        assert_eq!(row8.grid, [5, 2, 1]);
+        assert_eq!(wmma.grid, [2, 2, 1]);
+        for launch in [scalar, row8, wmma] {
+            assert_eq!(launch.block, [256, 1, 1]);
+        }
+    }
+
+    #[test]
+    fn only_scalar_row8_requests_dynamic_shared_memory() {
+        assert_eq!(geometry(1, 8).unwrap().shared_mem, 0);
+        assert_eq!(geometry(8, 8).unwrap().shared_mem, 2048);
+        // WMMA owns 25,600 static bytes; adding those again as dynamic memory
+        // would exceed its intended per-CTA footprint and hurt occupancy.
+        assert_eq!(geometry(8, 32).unwrap().shared_mem, 0);
+    }
+
+    #[test]
+    fn single_row_wmma_and_exact_tiles_use_nonzero_grids() {
+        let single = index_logits_launch(256, 1, 4096, 1, 32, 128, 4, 32, 8, 32).unwrap();
+        let exact = index_logits_launch(256, 16, 4096, 64, 32, 128, 4, 32, 8, 32).unwrap();
+        assert_eq!(single.grid, [1, 1, 1]);
+        assert_eq!(exact.grid, [2, 2, 1]);
+    }
+
+    #[test]
+    fn unsupported_tiles_are_rejected() {
+        for (rows, pools) in [(0, 8), (4, 8), (1, 32), (8, 0), (8, 16), (8, 64)] {
+            assert!(
+                geometry(rows, pools).is_err(),
+                "accepted tile {rows}x{pools}"
+            );
+        }
+    }
+
+    #[test]
+    fn wmma_requires_exact_shape_and_query_alignment() {
+        for (query, heads, dim, pool) in [
+            (258, 32, 128, 4),
+            (256, 16, 128, 4),
+            (256, 32, 64, 4),
+            (256, 32, 128, 2),
+        ] {
+            assert!(index_logits_launch(query, 9, 4096, 33, heads, dim, pool, 32, 8, 32).is_err());
+        }
+        // WMMA's stricter alignment and specialization must not accidentally
+        // remove shapes supported by the two scalar implementations.
+        for rows_per_cta in [1, 8] {
+            assert!(index_logits_launch(258, 9, 4096, 33, 16, 64, 2, 32, rows_per_cta, 8).is_ok());
+        }
+    }
+
+    #[test]
+    fn empty_dimensions_and_incomplete_cache_pools_are_rejected() {
+        for (rows_per_cta, pools_per_cta) in [(1, 8), (8, 8), (8, 32)] {
+            for (rows, stride, heads, dim, pool, block) in [
+                (0, 33, 32, 128, 4, 32),
+                (9, 0, 32, 128, 4, 32),
+                (9, 33, 0, 128, 4, 32),
+                (9, 33, 32, 0, 4, 32),
+                (9, 33, 32, 128, 0, 32),
+                (9, 33, 32, 128, 4, 0),
+                (9, 33, 32, 128, 4, 2),
+                (9, 33, 32, 128, 4, 34),
+            ] {
+                assert!(
+                    index_logits_launch(
+                        256,
+                        rows,
+                        4096,
+                        stride,
+                        heads,
+                        dim,
+                        pool,
+                        block,
+                        rows_per_cta,
+                        pools_per_cta
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arithmetic_and_shared_memory_limits_are_checked() {
+        assert!(index_logits_launch(256, 9, u32::MAX, 33, 32, 128, 4, 32, 8, 32).is_err());
+        assert!(index_logits_launch(256, 9, 4096, 33, u32::MAX, 128, 4, 32, 1, 8).is_err());
+        assert!(index_logits_launch(256, 9, 4096, 33, 1, 4096, 4, 32, 8, 8).is_err());
+        assert!(index_logits_launch(256, 9, 4096, 33, 1, u32::MAX, 4, 32, 8, 8).is_err());
+    }
 }

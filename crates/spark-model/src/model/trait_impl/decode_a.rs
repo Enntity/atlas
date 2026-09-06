@@ -230,6 +230,11 @@ impl TransformerModel {
         // load-time-fixed). Folded in as one more suppressor.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
+            // C3/C2 can drain to C1. Its selector also embeds host positions;
+            // keep the final row eager throughout the opt-in sparse session.
+            && !crate::layers::qwen3_attention::glm_multi_seq_sparse_enabled(
+                &self.config.model_type,
+            )
             && !self.profile
             && !self
                 .suppress_graphs

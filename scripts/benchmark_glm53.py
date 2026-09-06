@@ -45,6 +45,15 @@ def run(args: argparse.Namespace) -> dict:
         "stream_options": {"include_usage": True},
         "seed": 1,
     }
+    allow_repetition = getattr(args, "allow_repetition", False)
+    if allow_repetition:
+        # Scope the watchdog override to this bounded benchmark request.
+        # EOS and the requested output-token cap still apply.
+        body["repetition_detection"] = {
+            "min_pattern_size": 2,
+            "max_pattern_size": 64,
+            "min_count": args.max_tokens + 1,
+        }
 
     started = time.perf_counter()
     first_chunk_at = None
@@ -98,6 +107,9 @@ def run(args: argparse.Namespace) -> dict:
         raise RuntimeError(
             f"server reported {prompt_count} prompt tokens, expected {args.prompt_tokens}"
         )
+    if allow_repetition:
+        receipt["allow_repetition"] = True
+        receipt["requested_max_tokens"] = args.max_tokens
     return receipt
 
 
@@ -108,7 +120,13 @@ def main() -> None:
     parser.add_argument("--prompt-tokens", type=int, default=1000)
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument(
+        "--allow-repetition", action="store_true",
+        help="raise repetition-watchdog threshold for this bounded request only",
+    )
     args = parser.parse_args()
+    if not 1 <= args.max_tokens <= 1_000_000:
+        parser.error("--max-tokens must be in 1..1000000")
     print(json.dumps(run(args), indent=2))
 
 

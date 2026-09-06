@@ -241,7 +241,16 @@ impl TransformerModel {
         // ATLAS_MS_PROFILE forces eager (graphs off) so per-phase syncs are legal.
         // ATLAS_LORA_EAGER: same LoRA graph-vs-eager debugging hatch as decode_a.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
-        let graph_key = if !ms_profile && !lora_eager && multiseq_graphs_enabled() {
+        // The sparse selector embeds each row's host position, scorer width,
+        // and dense/sparse branch. Slot-keyed graphs cannot replay these as
+        // lengths advance, even while the current rows are still <=2048.
+        let glm_sparse =
+            crate::layers::qwen3_attention::glm_multi_seq_sparse_enabled(&self.config.model_type);
+        anyhow::ensure!(
+            !glm_sparse || (self.proposer.is_none() && !self.self_speculative),
+            "GLM multi-sequence sparse decode does not support speculative decoding"
+        );
+        let graph_key = if !glm_sparse && !ms_profile && !lora_eager && multiseq_graphs_enabled() {
             self.batch_decode_graph_key(&*seqs, padded_n)
         } else {
             None

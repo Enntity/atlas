@@ -14,7 +14,7 @@ impl Qwen3AttentionLayer {
     /// Append this token to the paged four-token index staging tail, finalize a
     /// pool on phase three, and return sparse token IDs once history exceeds
     /// the checkpoint's exact-attention threshold.
-    pub(super) fn glm_index_decode_update_and_select(
+    pub(in crate::layers::qwen3_attention) fn glm_index_decode_update_and_select(
         &self,
         normed: DevicePtr,
         q_latent: DevicePtr,
@@ -165,6 +165,7 @@ impl Qwen3AttentionLayer {
             kv_cache.block_size() as u32,
             kv_cache.sparse_index_block_stride_bytes(self.attn_layer_idx) as u64,
             1,
+            8,
             stream,
         )?;
         // Cache writeback has completed in stream order, so the QKV arena can

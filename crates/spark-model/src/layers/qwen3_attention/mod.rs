@@ -47,6 +47,12 @@ pub use types_weights::{
     CompressorWeights, GlmIndexerWeights, HcHeadWeights, HcSiteWeights, HcWeights, MlaWeights,
 };
 
+/// Opt-in eager semantic indexing for independent GLM C2/C3 decode rows.
+/// The model and server share this gate so admission and graph policy agree.
+pub fn glm_multi_seq_sparse_enabled(model_type: &str) -> bool {
+    model_type == "glm5_next" && std::env::var("ATLAS_GLM_MULTI_SEQ_SPARSE").as_deref() == Ok("1")
+}
+
 /// Startup fail-fast for `--kv-cache-dtype`: resolve every kernel handle the
 /// dtype's dispatch arms require (chunked-prefill kernel, WHT bookends) and
 /// error with the full missing list — BEFORE the multi-minute weight load,

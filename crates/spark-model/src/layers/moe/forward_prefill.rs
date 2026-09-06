@@ -222,6 +222,20 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
+        } else if self.glm_c3_grouped(ctx, n) {
+            // Preserve forward_k3's router logits and expert weights exactly;
+            // the experiment changes routed activation precision, not routing.
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                n,
+                num_experts,
+                h,
+                stream,
+            )?;
         } else {
             // Selection numerics — see router_gate_gemm_dense for why this
             // must stay on the scalar kernel and why ATLAS_CUBLAS_GEMM must

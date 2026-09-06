@@ -124,14 +124,14 @@ extern "C" __global__ void mla_batched_gemv(
     }
 }
 
-// Exact five-row twin used by GLM-5's K=5 MTP verify path.  All five
-// activations share the same per-head weight matrix, so keeping the rows in a
-// single block lets each weight value feed five accumulators instead of being
-// fetched by five independent launches.
+// Exact-row twins used by GLM-5's C2/C3 decode and K=5 MTP verify paths.
+// Activations share the same per-head weight matrix, so each loaded weight
+// feeds all row accumulators instead of being fetched by independent launches.
 //
-// input:  [5, num_heads, input_head_stride], with input_row_stride between rows
-// output: [5, num_heads, output_head_stride], with output_row_stride between rows
-extern "C" __global__ void mla_batched_gemv_batch5(
+// input:  [ROWS, num_heads, input_head_stride], with input_row_stride between rows
+// output: [ROWS, num_heads, output_head_stride], with output_row_stride between rows
+template <unsigned int ROWS>
+__device__ __forceinline__ void mla_batched_gemv_batch_impl(
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ output,
@@ -142,7 +142,6 @@ extern "C" __global__ void mla_batched_gemv_batch5(
     unsigned int input_row_stride,
     unsigned int output_row_stride
 ) {
-    constexpr unsigned int ROWS = 5;
     const unsigned int head = blockIdx.y;
     const unsigned int tid = threadIdx.x;
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
@@ -235,6 +234,33 @@ extern "C" __global__ void mla_batched_gemv_batch5(
         }
     }
 }
+
+#define MLA_BATCH_ARGS \
+    const __nv_bfloat16* __restrict__ input, \
+    const __nv_bfloat16* __restrict__ weight, \
+    __nv_bfloat16* __restrict__ output, \
+    unsigned int N_out, unsigned int K, \
+    unsigned int input_head_stride, unsigned int output_head_stride, \
+    unsigned int input_row_stride, unsigned int output_row_stride
+
+#define MLA_BATCH_CALL(ROWS) \
+    mla_batched_gemv_batch_impl<ROWS>(input, weight, output, N_out, K, \
+        input_head_stride, output_head_stride, input_row_stride, output_row_stride)
+
+extern "C" __global__ void mla_batched_gemv_batch2(MLA_BATCH_ARGS) {
+    MLA_BATCH_CALL(2);
+}
+
+extern "C" __global__ void mla_batched_gemv_batch3(MLA_BATCH_ARGS) {
+    MLA_BATCH_CALL(3);
+}
+
+extern "C" __global__ void mla_batched_gemv_batch5(MLA_BATCH_ARGS) {
+    MLA_BATCH_CALL(5);
+}
+
+#undef MLA_BATCH_ARGS
+#undef MLA_BATCH_CALL
 
 // Assemble Q for absorbed MLA: copies Q_absorbed + Q_rope into contiguous [Lkv+R] per head.
 // Also handles RoPE application to Q_rope and K_rope.

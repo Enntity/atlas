@@ -10,15 +10,15 @@
 //! Every row retains its own sequence length and block table.
 
 use anyhow::{Result, ensure};
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::ctx::MultiSeqCtx;
 use super::mla_gemv::MlaDims;
 use crate::layer::AttnMetadataDev;
 use crate::layers::ops;
-use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 use crate::layers::qwen3_attention::types::MlaWeights;
+use crate::layers::qwen3_attention::{Qwen3AttentionLayer, glm_multi_seq_sparse_enabled};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 fn enabled() -> bool {
@@ -27,7 +27,10 @@ fn enabled() -> bool {
 
 impl Qwen3AttentionLayer {
     pub(super) fn glm_mla_multi_seq_eligible(&self, c: &MultiSeqCtx<'_>, mla: &MlaWeights) -> bool {
-        enabled() && (2..=5).contains(&c.n) && mla.rope == 0 && mla.o_lora_rank == 0
+        (enabled() || glm_multi_seq_sparse_enabled(&c.fwd.config.model_type))
+            && (2..=5).contains(&c.n)
+            && mla.rope == 0
+            && mla.o_lora_rank == 0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -109,6 +112,10 @@ impl Qwen3AttentionLayer {
             self.glm_mla_multi_seq_eligible(c, mla),
             "GLM MLA batched path called for an unsupported MLA shape"
         );
+        let sparse = glm_multi_seq_sparse_enabled(&c.fwd.config.model_type);
+        if sparse {
+            self.validate_glm_multi_seq_sparse(c, kv_cache, meta, mla)?;
+        }
 
         let gpu = c.fwd.gpu;
         let buffers = c.fwd.buffers;
@@ -197,11 +204,10 @@ impl Qwen3AttentionLayer {
             o_lora_rank: 0,
         };
 
-        // K=5 shares Q-absorption and V-extraction weights across all rows,
-        // assembles and writes their cache entries with the existing batched
-        // prefill kernels, and submits five independently masked attention rows
-        // in one multi-sequence launch. Every other width retains the proven
-        // per-row chain.
+        // Exact-row kernels share Q-absorption and V-extraction weights,
+        // assemble and write all cache entries, and submit independently masked
+        // attention rows together. C2/C3 remains opt-in for controlled A/B;
+        // K=5 retains its established default path.
         let q_absorbed = buffers.expert_up_out();
         let k_entries = buffers.qkv_output();
         let cache_row = cache_dim as usize * bf16;
@@ -212,11 +218,19 @@ impl Qwen3AttentionLayer {
         let attn_out_row = q_absorbed_row;
         let kv_row = kv_lora as usize * bf16;
         let v_row = (nq * v_dim) as usize * bf16;
-        let batched_mla_gemv = c.n == 5 && self.mla_batched_gemv_batch5_k.0 != 0;
+        let batch23 = c.fwd.config.model_type == "glm5_next"
+            && std::env::var("ATLAS_GLM_MLA_BATCH23").as_deref() == Ok("1");
+        let batched_kernel = match c.n {
+            2 if batch23 => self.mla_batched_gemv_batch2_k,
+            3 if batch23 => self.mla_batched_gemv_batch3_k,
+            5 => self.mla_batched_gemv_batch5_k,
+            _ => KernelHandle(0),
+        };
+        let batched_mla_gemv = batched_kernel.0 != 0;
         if batched_mla_gemv {
-            ops::mla_batched_gemv_batch5(
+            ops::mla_batched_gemv_batchm(
                 gpu,
-                self.mla_batched_gemv_batch5_k,
+                batched_kernel,
                 q_full,
                 mla.w_uk_t.weight,
                 q_absorbed,
@@ -230,7 +244,9 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
-        if batched_mla_gemv {
+        if sparse {
+            self.ms_glm_mla_sparse_attention(c, kv_cache, meta, mla, &dims, batched_kernel)?;
+        } else if batched_mla_gemv {
             let v_entries = k_entries.offset(c.n * cache_row);
             ops::mla_cache_assemble_batched(
                 gpu,
@@ -280,9 +296,9 @@ impl Qwen3AttentionLayer {
                 0,
                 stream,
             )?;
-            ops::mla_batched_gemv_batch5(
+            ops::mla_batched_gemv_batchm(
                 gpu,
-                self.mla_batched_gemv_batch5_k,
+                batched_kernel,
                 attn_out,
                 mla.w_uv.weight,
                 v_extracted,

@@ -124,7 +124,15 @@ impl Qwen3AttentionLayer {
             } else {
                 8
             };
-        let glm_index_logits_fn = if glm_index_logits_rows_per_cta == 1 {
+        let glm_index_wmma = probes.glm_kpool_indexer
+            && config.index_n_heads == 32
+            && config.index_head_dim == 128
+            && config.index_kpool == 4
+            && glm_index_logits_rows_per_cta == 8
+            && std::env::var("ATLAS_GLM_INDEX_WMMA").ok().as_deref() == Some("1");
+        let glm_index_logits_fn = if glm_index_wmma {
+            "glm_index_logits_bf16_wmma_row8_pool32"
+        } else if glm_index_logits_rows_per_cta == 1 {
             "glm_index_logits_bf16"
         } else {
             "glm_index_logits_bf16_row8"
@@ -398,6 +406,18 @@ impl Qwen3AttentionLayer {
                 "mla_paged_decode_fp8",
             ),
             mla_batched_gemv_k: gate(probes.mla, gpu, "mla_absorbed", "mla_batched_gemv"),
+            mla_batched_gemv_batch2_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "mla_absorbed",
+                "mla_batched_gemv_batch2",
+            ),
+            mla_batched_gemv_batch3_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "mla_absorbed",
+                "mla_batched_gemv_batch3",
+            ),
             mla_batched_gemv_batch5_k: gate(
                 probes.mla,
                 gpu,
@@ -465,10 +485,15 @@ impl Qwen3AttentionLayer {
             glm_index_logits_k: gate(
                 probes.glm_kpool_indexer,
                 gpu,
-                "glm_indexer",
+                if glm_index_wmma {
+                    "glm_indexer_wmma"
+                } else {
+                    "glm_indexer"
+                },
                 glm_index_logits_fn,
             ),
             glm_index_logits_rows_per_cta,
+            glm_index_logits_pools_per_cta: if glm_index_wmma { 32 } else { 8 },
             glm_index_logits_decode_k: gate(
                 probes.glm_kpool_indexer,
                 gpu,

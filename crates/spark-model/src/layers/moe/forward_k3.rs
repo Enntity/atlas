@@ -15,6 +15,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.glm_c3_grouped(ctx, 3) {
+            return self.forward_prefill(input, 3, ctx, stream);
+        }
         let optimized = self.lora.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()

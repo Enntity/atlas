@@ -26,6 +26,7 @@ mod ffn;
 mod mla;
 mod mla_gemv;
 mod mla_glm;
+mod mla_glm_sparse;
 mod qkv;
 
 impl Qwen3AttentionLayer {
@@ -37,14 +38,15 @@ impl Qwen3AttentionLayer {
         num_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
-        _seq_lens: &[usize],
+        seq_lens: &[usize],
         _block_tables: &[Vec<u32>],
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
         let _ = states; // Attention layers use EmptyLayerState — no per-seq state.
         let bs = kv_cache.block_size() as u32;
-        let mut c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
+        let mut c =
+            ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, seq_lens, bs, stream);
         // Per-request LoRA routing slot buffer for this step (from metadata).
         if let Some(m) = ctx.attn_metadata.as_ref() {
             c.seq_slot = m.seq_slot;

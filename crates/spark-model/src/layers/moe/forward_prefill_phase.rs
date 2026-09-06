@@ -42,6 +42,22 @@ impl MoeLayer {
         let shared_gate_out = ctx.buffers.ssm_deinterleaved();
         let shared_up_out = ctx.buffers.ssm_qkvz();
         let shared_down_out = ctx.buffers.attn_output();
+        if self.glm_c3_grouped(ctx, n) {
+            self.c3_shared_expert(
+                input,
+                shared_gate_out,
+                shared_up_out,
+                shared_down_out,
+                h,
+                shared_inter,
+                ctx,
+                aux,
+            )?;
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
         if self.run_bf16_shared_expert(
             input,
             n,
