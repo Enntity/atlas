@@ -364,6 +364,7 @@ impl Glm5MtpHead {
             moe_row_adapter: DevicePtr::NULL,
         };
         let mtp_ctx = ForwardContext {
+            ssm_batch: None,
             buffers: ctx.buffers,
             gpu: ctx.gpu,
             config: ctx.config,
@@ -742,6 +743,7 @@ impl Glm5MtpHead {
             ctx.gpu.copy_h2d_async(slots_raw, slots_dev, stream)?;
 
             let mtp_ctx = ForwardContext {
+                ssm_batch: None,
                 buffers: ctx.buffers,
                 gpu: ctx.gpu,
                 config: ctx.config,

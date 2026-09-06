@@ -138,6 +138,7 @@ fn run_batched_verify(
     let levers = crate::layers::ops::ModelLevers::defaults();
     let stats = crate::layers::ops::ModelStats::new();
     let ctx = ForwardContext {
+        ssm_batch: None,
         dispatch: &dispatch,
         derived: &derived,
         levers: &levers,

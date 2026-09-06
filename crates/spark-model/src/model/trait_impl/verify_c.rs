@@ -187,6 +187,7 @@ impl TransformerModel {
         let use_graphs = self.comm.is_none() && !hss_engaged && !lora_eager;
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,

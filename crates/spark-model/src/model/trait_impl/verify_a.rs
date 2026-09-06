@@ -143,6 +143,7 @@ impl TransformerModel {
                     };
 
                     let ctx = ForwardContext {
+                        ssm_batch: None,
                         buffers: &self.buffers,
                         gpu: self.gpu.as_ref(),
                         config: &self.config,
@@ -179,6 +180,7 @@ impl TransformerModel {
             } else {
                 // SSM layers: GEMM-batched via decode_batched override
                 let ctx = ForwardContext {
+                    ssm_batch: None,
                     buffers: &self.buffers,
                     gpu: self.gpu.as_ref(),
                     config: &self.config,

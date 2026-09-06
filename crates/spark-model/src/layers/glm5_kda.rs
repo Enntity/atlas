@@ -2,6 +2,7 @@
 
 //! GLM-5 KDA recurrent block for the conservative GB10 bring-up path.
 mod hc;
+mod indexed_core;
 mod multi_seq;
 mod profile;
 mod projection;
@@ -83,6 +84,8 @@ pub struct Glm5KdaLayer {
     ffn: FfnComponent,
     hc: HcWeights,
     layer_idx: usize,
+    ssm_ordinal: usize,
+    indexed_trace_logged: std::sync::atomic::AtomicBool,
     hidden_size: usize,
     heads: usize,
     dim: usize,
@@ -109,8 +112,10 @@ pub struct Glm5KdaLayer {
     conv_prefill_k: KernelHandle,
     conv_prefill_tp_k: KernelHandle,
     conv_prefill_tp_snap_k: KernelHandle,
+    conv_indexed_k: KernelHandle,
     pack_k: KernelHandle,
     recurrent_k: KernelHandle,
+    recurrent_indexed_k: KernelHandle,
     recurrent_verify_snap_k: KernelHandle,
     preprocess_regresident_k: KernelHandle,
     recurrent_regresident_k: KernelHandle,
@@ -179,6 +184,8 @@ impl Glm5KdaLayer {
             ffn,
             hc,
             layer_idx,
+            ssm_ordinal: indexed_core::ordinal(config, layer_idx)?,
+            indexed_trace_logged: std::sync::atomic::AtomicBool::new(false),
             hidden_size: config.hidden_size,
             heads,
             dim,
@@ -226,7 +233,9 @@ impl Glm5KdaLayer {
                 "causal_conv1d_update_prefill_tp_snap",
             ),
             pack_k: gpu.kernel("kda", "kda_pack_qkv")?,
+            conv_indexed_k: super::try_kernel(gpu, "causal_conv1d", "glm_kda_conv_indexed"),
             recurrent_k: gpu.kernel("kda", "kda_recurrent_bf16")?,
+            recurrent_indexed_k: super::try_kernel(gpu, "kda", "glm_kda_recurrent_indexed"),
             recurrent_verify_snap_k: super::try_kernel(
                 gpu,
                 "kda",

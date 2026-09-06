@@ -290,6 +290,9 @@ pub struct ForwardContext<'a> {
     pub stats: &'a crate::layers::ops::ModelStats,
     /// Pre-uploaded attention metadata (None if no attention layers).
     pub attn_metadata: Option<AttnMetadataDev>,
+    /// Independent live FP32 SSM rows, validated and refreshed before replay.
+    /// None for prefill, temporal verification, and unsupported decode scopes.
+    pub ssm_batch: Option<ssm_batch::SsmBatchView<'a>>,
     /// Profile mode: sync+time per-operation within layers.
     pub profile: bool,
     /// Communication backend for expert parallelism (EP) all-reduce.

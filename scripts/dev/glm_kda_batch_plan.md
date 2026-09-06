@@ -179,3 +179,21 @@ Production GPU acceptance remains root-only: bounded exact/memcheck first,
 then eager and graph full-model C2/C3/C4 quality, nonprefix/permuted slots and
 C4→3→2→1 drains, followed by matched performance. Retain an image built from
 the preceding source for rollback; do not add a feature flag for the new core.
+
+### CUDA extraction checkpoint
+
+Root validated all91 indexed cases plus memcheck, and all60 frozen-reference
+temporal cases plus memcheck under both production no-FMA and default FMA.
+The measured eager-submission medians were N2 45.452→20.702us, N3
+68.174→26.559us, N4 113.724→39.288us; these are microkernel measurements,
+not full-model throughput predictions.
+
+After authorization, the common scalar bodies were extracted into
+`causal_conv1d_update_body.cuh` and `kda_recurrent_body.cuh`. Old scalar and
+new indexed exports now share these helpers. Recurrent shared variables have
+distinct helper-local names to avoid nvcc shared-symbol linkage collisions;
+undoing those renames reproduces the original arithmetic text exactly.
+The indexed harness now compiles production exports and compares with the
+unchanged frozen scalar reference plus unchanged TP convolution, not another
+wrapper of the helper. The old standalone candidate header is no longer included.
+The entire GPU gate must be repeated after this extraction before runtime use.

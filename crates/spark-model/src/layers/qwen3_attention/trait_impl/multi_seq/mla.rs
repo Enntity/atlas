@@ -138,6 +138,7 @@ impl Qwen3AttentionLayer {
                 // attention metadata (positions / slot / seq_len /
                 // block_table). All other ctx fields are copied verbatim.
                 let ctx_i = crate::layer::ForwardContext {
+                    ssm_batch: None,
                     attn_metadata: Some(meta_i),
                     midchunk_capture: None,
                     ..*c.fwd

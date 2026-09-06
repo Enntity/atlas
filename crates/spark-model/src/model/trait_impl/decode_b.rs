@@ -383,6 +383,7 @@ impl TransformerModel {
         // cache for the second sub-call. This halves memory bandwidth vs
         // the sequential decode_batch + prefill_chunk approach.
         let decode_ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -403,6 +404,7 @@ impl TransformerModel {
         };
 
         let prefill_ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,

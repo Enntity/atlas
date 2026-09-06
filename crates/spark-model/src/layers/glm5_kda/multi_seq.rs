@@ -3,8 +3,8 @@
 //! GLM-5 KDA multi-sequence decode.
 //!
 //! The large stateless projections are evaluated once for the whole decode
-//! batch. Only convolution and the recurrent KDA state update remain in a
-//! per-sequence loop. At width three, the FFN can also use Atlas's existing
+//! batch. Convolution and recurrence use validated device-indexed pools when
+//! available, retaining the per-sequence fallback. At width three, the FFN can also use Atlas's existing
 //! grouped path; width two remains sequential because measurements on GB10
 //! show no benefit there.
 
@@ -57,14 +57,15 @@ impl Glm5KdaLayer {
                 self.dense_gemv_batchm_k.0,
             )?;
             crate::model::glm_c4::validate_scratch(ctx.buffers.sizes(), self.hc.hc_mult)?;
-            for state in states.iter().take(4) {
-                let state = state
-                    .as_any()
-                    .downcast_ref::<SsmLayerState>()
-                    .ok_or_else(|| anyhow::anyhow!("GLM C4 requires independent SSM states"))?;
-                ensure!(!state.h_is_f16, "GLM C4 requires FP32 KDA state");
-            }
         }
+        for state in states.iter().take(num_seqs) {
+            let state = state
+                .as_any()
+                .downcast_ref::<SsmLayerState>()
+                .ok_or_else(|| anyhow::anyhow!("GLM KDA requires independent SSM states"))?;
+            ensure!(!state.h_is_f16, "GLM KDA requires FP32 recurrent state");
+        }
+        let indexed_core = self.prepare_indexed_core(num_seqs, ctx)?;
 
         let n = num_seqs;
         let m = n as u32;
@@ -207,47 +208,52 @@ impl Glm5KdaLayer {
         let packed = ctx.buffers.ssm_qkvz();
         ops::kda_pack_qkv(ctx.gpu, self.pack_k, projected, packed, m, p_u32, stream)?;
 
-        // Recurrent state is sequence-private. The surrounding projections,
-        // normalization and mHC work stay batched; only this small stateful
-        // core is submitted once per row.
+        // Recurrent state is sequence-private. Only submission of this core
+        // changes; all projections and subsequent normalization stay identical.
         let convolved = ctx.buffers.ssm_conv_out_f32();
         let core_out = ctx.buffers.attn_output();
         let packed_row_bytes = 3 * p * bf16;
         let gate_row_bytes = p * bf16;
         let beta_row_bytes = self.heads * bf16;
-        for i in 0..n {
-            let state = states[i]
-                .as_any_mut()
-                .downcast_mut::<SsmLayerState>()
-                .ok_or_else(|| anyhow::anyhow!("GLM-5 KDA expected SsmLayerState for row {i}"))?;
-            ensure!(!state.h_is_f16, "GLM-5 KDA requires FP32 recurrent state");
-            ops::conv1d_update_prefill(
-                ctx.gpu,
-                self.conv_prefill_k,
-                self.conv_prefill_tp_k,
-                state.conv_state,
-                packed.offset(i * packed_row_bytes),
-                &self.weights.conv,
-                DevicePtr::NULL,
-                convolved.offset(i * packed_row_bytes),
-                (3 * p) as u32,
-                self.conv_width as u32,
-                1,
-                (3 * p) as u32,
-                (3 * p) as u32,
-                stream,
-            )?;
-            self.run_recurrent(
-                convolved.offset(i * packed_row_bytes),
-                g1.offset(i * gate_row_bytes),
-                beta.offset(i * beta_row_bytes),
-                state.h_state,
-                core_out.offset(i * gate_row_bytes),
-                1,
-                true,
-                ctx,
-                stream,
-            )?;
+        if let Some(core) = indexed_core {
+            self.run_indexed_core(core, ctx, stream)?;
+        } else {
+            for i in 0..n {
+                let state = states[i]
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("GLM-5 KDA expected SsmLayerState for row {i}")
+                    })?;
+                ensure!(!state.h_is_f16, "GLM-5 KDA requires FP32 recurrent state");
+                ops::conv1d_update_prefill(
+                    ctx.gpu,
+                    self.conv_prefill_k,
+                    self.conv_prefill_tp_k,
+                    state.conv_state,
+                    packed.offset(i * packed_row_bytes),
+                    &self.weights.conv,
+                    DevicePtr::NULL,
+                    convolved.offset(i * packed_row_bytes),
+                    (3 * p) as u32,
+                    self.conv_width as u32,
+                    1,
+                    (3 * p) as u32,
+                    (3 * p) as u32,
+                    stream,
+                )?;
+                self.run_recurrent(
+                    convolved.offset(i * packed_row_bytes),
+                    g1.offset(i * gate_row_bytes),
+                    beta.offset(i * beta_row_bytes),
+                    state.h_state,
+                    core_out.offset(i * gate_row_bytes),
+                    1,
+                    true,
+                    ctx,
+                    stream,
+                )?;
+            }
         }
 
         let gated = projected;

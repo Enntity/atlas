@@ -1,7 +1,8 @@
 # Phase 4: cache contracts and state-indexed KDA
 
-Status: cache contract committed and built; indexed KDA standalone gates passed,
-production integration underway. No indexed-KDA serving speedup is claimed yet.
+Status: cache contract committed and built; indexed KDA integrated and building,
+with post-extraction numerical gates passed. No indexed-KDA serving speedup is
+claimed yet.
 The architectural basis is the [pinned vLLM roadmap](vllm-infrastructure-roadmap.md).
 
 ## Existing-layout cache contract
@@ -108,3 +109,26 @@ exact13/14-argument kernel ABIs; paired prevalidation before state mutation.
 dispatch wiring. Subsequent integration preserves exact-slot graph keys and
 refreshes each rank's real slot IDs before every lookup/replay; no new tuning
 flag or new GPU allocation is the objective.
+
+## Post-extraction and integration gates
+
+Production scalar and indexed exports now share private arithmetic helpers;
+the original scalar ABIs remain unchanged. The indexed harness compares the
+frozen scalar oracle and unchanged TP convolution, rather than comparing only
+two users of the same extracted helper. All91 indexed cases and all60 temporal
+cases (both compiler FMA modes) pass natively and under memcheck again.
+The repeated eager timing measures N2:45.444→18.654us, N3:68.370→28.803us,
+N4:93.580→38.100us. Compare paired arms within each invocation; the change from
+the earlier microbenchmark's baseline is not a separate serving improvement.
+Receipt: `kda-shared-gpu.log`.
+
+Runtime integration passes all712 model CPU tests. Root separately reran that
+suite; kernel-shadow, license, formatting and whitespace checks passed.
+The native image build and full-model indexed serving gates remain pending.
+
+The preceding v10 short2048/chunk1024 graph profile passed budgeted chat and
+four near-limit needles, then established the baseline for this integration:
+1024/64 C4 full-wall28.162/post-first31.310 tokens/s; coding148/256 C3
+34.071/34.628 and C4 45.669/46.425. Same workload hashes, one warmup plus two
+measured batches, every output reaches its cap. Containers are preserved,
+stopped, as `atlas-glm53-v10-short-control-ep0/1`.

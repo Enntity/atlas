@@ -3,6 +3,8 @@
 // nvcc -O3 --fmad=false -arch=sm_121a scripts/dev/bench_glm_kda_batch.cu -o /tmp/bench-glm-kda-batch
 // Standalone state-indexed decode gate. No model/collectives; GPU budget64MiB.
 // See glm_kda_batch_plan.md. All state/output comparisons are bitwise.
+// Indexed exports compile from production; reference recurrence/serial conv
+// remain frozen independently, and token-parallel conv remains unchanged.
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>

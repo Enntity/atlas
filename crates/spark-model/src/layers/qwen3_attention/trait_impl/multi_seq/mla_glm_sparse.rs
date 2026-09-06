@@ -251,6 +251,7 @@ impl Qwen3AttentionLayer {
         for row in 0..c.n {
             let meta_i = row_metadata(meta, row);
             let row_ctx = ForwardContext {
+                ssm_batch: None,
                 attn_metadata: Some(meta_i),
                 midchunk_capture: None,
                 ..*c.fwd

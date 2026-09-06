@@ -241,6 +241,11 @@ impl TransformerModel {
         let glm5_distributed = self.comm.is_some() && self.config.model_type == "glm5_next";
         let padded_n = decode_dispatch_width(n, glm5_distributed);
 
+        // Both ranks validate their own actual slot guards/state pointers and
+        // refresh the fixed ID stream before any graph lookup or replay.
+        let ssm_batch =
+            crate::model::ssm_indexed_decode::prepare_runtime(self, seqs, n, padded_n, stream)?;
+
         // CUDA graphs for multi-sequence decode (ATLAS_DECODE_GRAPHS_MULTISEQ=1).
         //
         // SSM h_state/conv_state pointers ARE baked into per-seq kernel args at
@@ -410,6 +415,7 @@ impl TransformerModel {
         let metadata = self.upload_batch_metadata_fixed(seqs, dispatch_n, &mut kv_cache, stream)?;
 
         let ctx = ForwardContext {
+            ssm_batch,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,

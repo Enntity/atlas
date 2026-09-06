@@ -5,6 +5,7 @@
 // first GB10 port and can later be replaced by a chunked implementation.
 
 #include <cuda_bf16.h>
+#include "kda_recurrent_body.cuh"
 
 extern "C" __global__ void kda_pack_qkv(
     const __nv_bfloat16* __restrict__ planes,
@@ -35,96 +36,42 @@ extern "C" __global__ void kda_recurrent_bf16(
     unsigned int dim,
     float lower_bound
 ) {
-    const unsigned int head = blockIdx.x;
-    const unsigned int vrow = threadIdx.x;
-    if (head >= heads || dim > 128 || blockDim.x < dim) return;
+    atlas_kda_recurrent_body(qkv, raw_gate, raw_beta, a_log, dt_bias, state, output, tokens, heads, dim,
+        lower_bound);
+}
 
-    __shared__ float qv[128];
-    __shared__ float kv[128];
-    __shared__ float gate_exp[128];
-    __shared__ float red_q[128];
-    __shared__ float red_k[128];
-    __shared__ float inv_q;
-    __shared__ float inv_k;
-    __shared__ float beta;
-
-    // H is [key_dim, value_dim], with value_dim contiguous. Each thread owns
-    // one value column, so every warp reads and writes adjacent FP32 elements.
-    // The original [value_dim, key_dim] traversal issued one 32-byte memory
-    // transaction per lane for every state access on decode.
-    float* H = state + (unsigned long long)head * dim * dim;
-    const float a = expf(a_log[head]);
-    const float scale = rsqrtf((float)dim);
-
-    for (unsigned int t = 0; t < tokens; ++t) {
-        const unsigned long long qbase = (unsigned long long)t * 3 * heads * dim;
-        if (vrow < dim) {
-            float q = (float)qkv[qbase + (unsigned long long)head * dim + vrow];
-            float k = (float)qkv[qbase + (unsigned long long)heads * dim
-                              + (unsigned long long)head * dim + vrow];
-            qv[vrow] = q;
-            kv[vrow] = k;
-            red_q[vrow] = q * q;
-            red_k[vrow] = k * k;
-            float g = (float)raw_gate[((unsigned long long)t * heads + head) * dim + vrow];
-            float log_decay = lower_bound /
-                (1.0f + expf(-a * (g + dt_bias[(unsigned long long)head * dim + vrow])));
-            gate_exp[vrow] = expf(log_decay);
-        }
-        __syncthreads();
-
-        for (unsigned int stride = 64; stride > 0; stride >>= 1) {
-            if (vrow < stride) {
-                red_q[vrow] += red_q[vrow + stride];
-                red_k[vrow] += red_k[vrow + stride];
-            }
-            __syncthreads();
-        }
-        if (vrow == 0) {
-            inv_q = rsqrtf(red_q[0] + 1.0e-6f) * scale;
-            inv_k = rsqrtf(red_k[0] + 1.0e-6f);
-            float b = (float)raw_beta[(unsigned long long)t * heads + head];
-            beta = 1.0f / (1.0f + expf(-b));
-        }
-        __syncthreads();
-
-        if (vrow < dim) {
-            float dot_k = 0.0f;
-            #pragma unroll 4
-            for (unsigned int k = 0; k < dim; k += 4) {
-                float h0 = H[(unsigned long long)(k + 0) * dim + vrow] * gate_exp[k + 0];
-                float h1 = H[(unsigned long long)(k + 1) * dim + vrow] * gate_exp[k + 1];
-                float h2 = H[(unsigned long long)(k + 2) * dim + vrow] * gate_exp[k + 2];
-                float h3 = H[(unsigned long long)(k + 3) * dim + vrow] * gate_exp[k + 3];
-                dot_k += h0 * (kv[k + 0] * inv_k) + h1 * (kv[k + 1] * inv_k)
-                       + h2 * (kv[k + 2] * inv_k) + h3 * (kv[k + 3] * inv_k);
-            }
-            const unsigned long long vbase = qbase + (unsigned long long)2 * heads * dim;
-            float delta = ((float)qkv[vbase + (unsigned long long)head * dim + vrow]
-                           - dot_k) * beta;
-            float out = 0.0f;
-            #pragma unroll 4
-            for (unsigned int k = 0; k < dim; k += 4) {
-                float h0 = H[(unsigned long long)(k + 0) * dim + vrow] * gate_exp[k + 0]
-                         + delta * (kv[k + 0] * inv_k);
-                float h1 = H[(unsigned long long)(k + 1) * dim + vrow] * gate_exp[k + 1]
-                         + delta * (kv[k + 1] * inv_k);
-                float h2 = H[(unsigned long long)(k + 2) * dim + vrow] * gate_exp[k + 2]
-                         + delta * (kv[k + 2] * inv_k);
-                float h3 = H[(unsigned long long)(k + 3) * dim + vrow] * gate_exp[k + 3]
-                         + delta * (kv[k + 3] * inv_k);
-                H[(unsigned long long)(k + 0) * dim + vrow] = h0;
-                H[(unsigned long long)(k + 1) * dim + vrow] = h1;
-                H[(unsigned long long)(k + 2) * dim + vrow] = h2;
-                H[(unsigned long long)(k + 3) * dim + vrow] = h3;
-                out += h0 * (qv[k + 0] * inv_q) + h1 * (qv[k + 1] * inv_q)
-                     + h2 * (qv[k + 2] * inv_q) + h3 * (qv[k + 3] * inv_q);
-            }
-            output[((unsigned long long)t * heads + head) * dim + vrow] =
-                __float2bfloat16(out);
-        }
-        __syncthreads();
-    }
+// Independent one-token rows select FP32 pools by explicit device slot IDs.
+// Host validates geometry, row strides, capacities and unique live slot IDs.
+// Invalid slots leave all state and output untouched. Strides are FP32 elements.
+extern "C" __global__ void glm_kda_recurrent_indexed(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ raw_gate,
+    const __nv_bfloat16* __restrict__ raw_beta,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ state_pool,
+    __nv_bfloat16* __restrict__ output,
+    unsigned int rows,
+    unsigned int heads,
+    unsigned int dim,
+    float lower_bound,
+    const int* __restrict__ state_slots,
+    unsigned int slot_count,
+    unsigned long long state_stride
+) {
+    const unsigned int row = blockIdx.y;
+    // Host validates the supported 32x128 geometry. Do not prove dim==128
+    // here: nvcc can fold rsqrtf(dim) differently from the scalar runtime ABI.
+    if (row >= rows) return;
+    const int slot = state_slots[row];
+    if (slot < 0 || (unsigned int)slot >= slot_count || state_stride < (unsigned long long)heads * dim * dim) return;
+    float* state = state_pool + (unsigned long long)slot * state_stride;
+    qkv += (unsigned long long)row * 3 * heads * dim;
+    raw_gate += (unsigned long long)row * heads * dim;
+    raw_beta += (unsigned long long)row * heads;
+    output += (unsigned long long)row * heads * dim;
+    atlas_kda_recurrent_body(qkv, raw_gate, raw_beta, a_log, dt_bias, state, output, 1, heads, dim,
+        lower_bound);
 }
 
 // GLM K=5 verifier twin of kda_recurrent_bf16. The recurrence and FP32 FMA
