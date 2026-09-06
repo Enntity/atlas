@@ -1,8 +1,9 @@
 # Phase 4: cache contracts and state-indexed KDA
 
-Status: cache contract committed and built; indexed KDA integrated and building,
-with post-extraction numerical gates passed. No indexed-KDA serving speedup is
-claimed yet.
+Status: cache contract and indexed KDA committed, built, and validated on both
+Sparks. v11 short-C4 graphs are deployed; the matched coding workload improves
+3.6% full-wall aggregate throughput over v10. This is a small-sample result,
+not a general model-quality or full serve-matrix claim.
 The architectural basis is the [pinned vLLM roadmap](vllm-infrastructure-roadmap.md).
 
 ## Existing-layout cache contract
@@ -124,7 +125,8 @@ Receipt: `kda-shared-gpu.log`.
 
 Runtime integration passes all712 model CPU tests. Root separately reran that
 suite; kernel-shadow, license, formatting and whitespace checks passed.
-The native image build and full-model indexed serving gates remain pending.
+Native build and the bounded full-model serving gates subsequently passed;
+see the v11 results below.
 
 The preceding v10 short2048/chunk1024 graph profile passed budgeted chat and
 four near-limit needles, then established the baseline for this integration:
@@ -132,3 +134,101 @@ four near-limit needles, then established the baseline for this integration:
 34.071/34.628 and C4 45.669/46.425. Same workload hashes, one warmup plus two
 measured batches, every output reaches its cap. Containers are preserved,
 stopped, as `atlas-glm53-v10-short-control-ep0/1`.
+
+## v11 indexed KDA: bounded serving validation and matched throughput
+
+Source `e8771f30`, image `atlas-glm53-flash:kernel-20260906-v11`, identical binary
+SHA256 on both ranks:
+`949ec12d3aac6024927cbd070c16b0a1658c1129343bedb222fb48539a5e3f29`.
+The subsequent `d3b0ac9f` is equivalent range/alignment style cleanup, not the
+source revision of this deployed binary.
+
+The production path now submits one indexed convolution and one indexed
+recurrence for eligible independent N2–N4 GLM decode. It uses validated actual
+SSM pool slots, refreshes their device metadata before graph lookup/replay,
+and preserves exact ordered-slot graph keys. No new GPU allocation or new
+tuning flag was introduced. C1, prefill, verification and unsupported profiles
+retain their existing paths; a malformed present state view fails before mutation.
+The typed cache contract retains existing ownership/allocation sizes; it is
+not the proposed single-latent or bounded-tail storage redesign.
+
+Eager full-model gates passed: fresh C1/C3 needles, two four-request near-limit
+batches, and four budgeted chat answers. Both ranks logged indexed-path
+selection. Preserved stopped containers: `atlas-glm53-v11-eager-ep0/1`.
+
+Graph-enabled gates also passed:
+
+- Four budgeted chat answers, four short independent needles, and eight
+  near-limit needles over two batches (1900/1920/1950/1984 prompt tokens,
+  caps96/64/48/64, needle position0.9).
+- Both ranks actually captured N4 `[0,1,2,3]`, nonprefix N3 `[0,1,3]`, and
+  N2 `[0,3]` graphs. Subsequent matching decode traces support replay through
+  the inspected graph-cache path; logs do not emit a separate replay event.
+- Fresh C1, C3 and four chat answers passed again after all throughput runs.
+
+No foreign needles were found. Needle checks are narrow behavioral gates;
+some responses repeat or finish before their caps through the existing content
+watchdog. This is not hidden as exact-output or general generation-quality
+parity. Fixed-output throughput below separately verifies every requested cap.
+
+Same settings for v10 and v11: context2048/chunk1024, C4 admission, TP2/EP2,
+non-speculative, BF16 KV/index, FP32 KDA state, exact M4 MLA, grouped C3/C4 MoE,
+FP4 prefill, short decode graphs, sparse switches off, KV overcommit off.
+One warmup plus two measured batches per width; medians, temperature0/seed1.
+No concurrent CPU build or other GPU workload during timing.
+
+| Workload | v10 full-wall / post-first tokens/s | v11 full-wall / post-first tokens/s | Full-wall change |
+| --- | ---: | ---: | ---: |
+| C4, 1024 prompt / 64 output | 28.162 / 31.310 | 28.886 / 31.989 | +2.6% |
+| C3, coding148 prompt / 256 output | 34.071 / 34.628 | 34.890 / 35.472 | +2.4% |
+| C4, coding148 prompt / 256 output | 45.669 / 46.425 | 47.309 / 48.123 | +3.6% |
+
+Full-wall includes prefill and drain. Post-first excludes the first token of
+each stream in its numerator and spans first text to last completion; neither
+is the sum of per-session rates. The C4 coding median session decode rate is
+12.445 tokens/s (v10:11.991). Both measured v11 C4 coding batches deliver
+47.308–47.311 full-wall tokens/s. There is no statistical confidence claim or
+direct comparison to speculative-decoding public results.
+
+All outputs reached64/256 respectively. The generated1024-token workload alone
+uses per-request repetition allowance; the literal coding workload does not.
+Its generated code is not executed or graded. Exact prompt-token hashes:
+
+- 1024 synthetic: `e74375dce562b280752663f16202b17f37f388a64155a15e2db604c43fda23ec`.
+- Coding148: `8b104308b377752ad9803d298be34e01cedf9f8ac577cacfea653c3359e7aebf`.
+- Coding literal UTF-8: `940f3a003a1ac66b5195b27a78e31b92f5622bd29d221a35949056bdd87477d1`.
+
+Receipts: `v11-eager-*`, `v11-graphs-*`, `v11-image-build.log`; matched baseline
+`v10-short-1k-64.json` and `v10-short-coding-256.json`. Local root:
+`/tmp/atlas-glm53-phase3-20260906/`; persistent head copy:
+`/home/mangokid/atlas-glm53-deploy-20260906/phase3/`.
+
+### Safety, known warning, and remaining work
+
+After graph-profile loading, sampled host `MemAvailable` was10410/9655 MiB;
+after the final gates it was10540/10607 MiB (head/worker). Final GPU temperatures
+were52/57°C. Both containers remained running with `OOMKilled=false`; no GPU
+fault, node reset, host-policy change, or sudo action was observed/performed.
+Memory limits and guards remained unchanged. These samples are not continuous
+minimum-memory telemetry or a guarantee against every hardware failure.
+
+The worker logged a preexisting false slow-broadcast classification after
+83.6 seconds idle in eager mode and46.0 seconds idle in graph mode. Both calls
+returned successfully, and subsequent quality checks passed. The timer includes
+normal waiting for the next command; the latched health bit currently has no
+production consumer. No independent CUDA/NCCL fault was found in the saved logs.
+Do not clear it through unilateral reconnect. The exact evidence and a typed
+intent fix are in [the health follow-up plan](ep-command-idle-health-plan.md).
+This issue remains unfixed in v11; output-loop warnings remain separate.
+
+The bounded full-model gates pass, along with all712 model CPU tests and
+eight GLM server preflight tests. Formatting, kernel shadows and license gates
+passed. Full clippy still has three preexisting model warnings; the full
+multi-model serve matrix and full-model MTP regression suite were not run.
+
+[Current deployment and v10 rollback](deployment-current.md) supersede the old
+phase-1 recipes. Next infrastructure work is the
+[typed EP execution-plan slice](ep-mixed-execution-plan.md): first validated
+intent, legacy wire compatibility and two-rank CPU agreement; then bounded
+mixed scheduling. Do not lift the current EP/MLA exclusions or confuse the new
+independent-row KDA kernel with temporal/ragged prefill support.

@@ -10,11 +10,17 @@ June revision and predates this GLM support. Reference architecture is not a
 claim that every upstream backend works on SM121 with TP2/EP2. No vLLM source
 has been copied into Atlas by this campaign.
 
+Progress: the first milestone's independent-row KDA execution and the second
+milestone's existing-layout typed cache contract are implemented and validated
+in [phase 4](phase4-infrastructure-results.md). Single-latent ownership and
+bounded tails remain unimplemented. The next bounded slice is the
+[EP execution-plan contract](ep-mixed-execution-plan.md), not a flag sweep.
+
 ## First milestone: state-indexed KDA execution
 
 vLLM submits decode convolution and recurrence with device-side state indices
-for the whole batch. Atlas batches projections, but currently launches those
-stateful updates separately for each independent row.
+for the whole batch. At the start of this milestone Atlas batched projections
+but launched those stateful updates separately for each independent row.
 [Upstream KDA orchestration](https://github.com/vllm-project/vllm/blob/6865e67f0be02d53694517f6f71d7fb96492792d/vllm/models/glm5next/nvidia/kda.py),
 [upstream recurrence](https://github.com/vllm-project/vllm/blob/6865e67f0be02d53694517f6f71d7fb96492792d/vllm/models/glm5next/nvidia/ops/third_party/kda/kernels.py).
 

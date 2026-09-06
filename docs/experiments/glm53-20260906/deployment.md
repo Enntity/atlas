@@ -1,5 +1,11 @@
 # Deployment profiles and rollback
 
+**Historical phase-1 recipes, not current deployment instructions.** The later
+dense MLA512 binding fix supersedes these images. Use
+[the current bounded deployment](deployment-current.md), including its v10
+rollback; do not restore v4/v65 merely because their original needle checks
+passed. The recipes below are retained to interpret historical receipts.
+
 Run these commands **on the head Spark**, not the EPYC development host.
 Both Sparks already have image `atlas-glm53-flash:kernel-20260906-v4`.
 Its binary SHA256 is

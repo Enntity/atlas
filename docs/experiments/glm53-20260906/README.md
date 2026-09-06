@@ -3,6 +3,12 @@
 Base: `f44b03235e6ac5e2881f08673b307ad9fb16d85d`.
 Raw full-model observations are in [receipts.json](receipts.json).
 
+For the active profile and safe rollback, use
+[current deployment](deployment-current.md). This page's v4 recipes and
+measurements are historical, not the current serving recommendation.
+The [phase-4 report](phase4-infrastructure-results.md) records typed cache
+contracts, state-indexed KDA, and the separate long-context limitations.
+
 This page records the first campaign. The follow-up
 [graph comparison](phase2-results.md) found only small/mixed throughput
 changes; its graph opt-in stays default-off. See the normalized
