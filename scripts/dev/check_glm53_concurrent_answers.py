@@ -4,6 +4,11 @@
 
 Short answers may never reach actual C4 decode: correlate server batch traces.
 No generated code is executed. Run --self-test for CPU-only validator tests.
+Initial v8-off run with thinking disabled passed arithmetic/JSON but failed
+sort/code: empty visible answers, finish_reason=length at 128 tokens, with correct
+answers in reasoning_content. GLM's template forced thinking despite the flag.
+This revision explicitly enables thinking with a 32-token budget; answer checks
+remain strict and never accept hidden reasoning in place of visible answers.
 """
 
 import argparse
@@ -33,6 +38,16 @@ ANSWERS = ("432", "ash,dogwood,birch,cedar", "def square(n):\n    return n*n",
 
 
 class ValidatorTests(unittest.TestCase):
+    def test_payload_reserves_visible_answer_budget(self):
+        for index in range(4):
+            payload = request_payload(index, "test-model")
+            self.assertEqual(payload["model"], "test-model")
+            self.assertEqual(payload["messages"][0]["content"], PROMPTS[index])
+            self.assertEqual(payload["max_tokens"], 128)
+            self.assertEqual(payload["thinking_token_budget"], 32)
+            self.assertIs(payload["chat_template_kwargs"]["enable_thinking"], True)
+            self.assertEqual(payload["max_tokens"] - payload["thinking_token_budget"], 96)
+
     def test_correct_answers(self):
         for index, answer in enumerate(ANSWERS):
             self.assertTrue(validate(index, answer))
@@ -89,12 +104,16 @@ def validate(index, answer):
     return False
 
 
+def request_payload(index, model):
+    return {"model": model, "messages": [{"role": "user", "content": PROMPTS[index]}],
+            "temperature": 0, "max_tokens": 128, "stream": False,
+            "thinking_token_budget": 32, "chat_template_kwargs": {"enable_thinking": True}}
+
+
 def request(index, args, barrier):
-    payload = {"model": args.model, "messages": [{"role": "user", "content": PROMPTS[index]}],
-               "temperature": 0, "max_tokens": 128, "stream": False,
-               "chat_template_kwargs": {"enable_thinking": False}}
+    payload = request_payload(index, args.model)
     receipt = {"index": index, "prompt": PROMPTS[index], "passed": False,
-               "output": None, "usage": None, "error": None}
+               "payload": payload, "output": None, "usage": None, "error": None}
     started = time.time()
     try:
         barrier.wait(timeout=10)
@@ -145,7 +164,11 @@ def main():
         receipts = list(pool.map(lambda index: request(index, args, barrier), range(4)))
     passed = all(receipt["passed"] for receipt in receipts)
     print(json.dumps({"passed": passed, "context_limit": args.context_limit,
-                      "max_tokens": 128, "timeout_seconds": 90,
+                      "max_tokens": 128, "thinking_token_budget": 32, "timeout_seconds": 90,
+                      "prior_failure": "Initial v8-off thinking-disabled run passed arithmetic/JSON "
+                                       "but failed sort/code with empty visible answers and length at 128; "
+                                       "correct answers appeared only in template-forced reasoning. "
+                                       "Now uses an explicit 32-token thinking budget; validators unchanged.",
                       "scope": "Four answer checks only, not a benchmark or full quality evaluation. "
                                "Short outputs may not exercise C4: server batch traces are required.",
                       "requests": receipts}), flush=True)
