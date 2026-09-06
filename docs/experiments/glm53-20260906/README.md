@@ -3,6 +3,12 @@
 Base: `f44b03235e6ac5e2881f08673b307ad9fb16d85d`.
 Raw full-model observations are in [receipts.json](receipts.json).
 
+This page records the first campaign. The follow-up
+[graph comparison](phase2-results.md) found only small/mixed throughput
+changes; its graph opt-in stays default-off. See the normalized
+[peer comparisons](phase2-comparisons.md) and next
+[C4 implementation plan](c4-implementation-plan.md).
+
 Measured wins are distinct experiments, not one combined benchmark:
 
 | Experiment | Control | Candidate |

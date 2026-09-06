@@ -8,7 +8,9 @@ Paths below start at the repository root; Rust layer paths are under
 ## Scope and first launch contract
 
 Add one explicit experimental `ATLAS_GLM_C4_DECODE=1` opt-in, propagated
-identically to both ranks. Keep its default off. First scope:
+identically to both ranks. Keep its default off. A separate default-off
+`ATLAS_GLM_C4_GROUPED_MOE=1` isolates grouped activation precision from the
+independent-row implementation. First scope:
 
 - Exact `glm5_next`, TP2+EP2, EP protocol v2, independent non-speculative rows.
 - BF16 MLA KV and semantic index, FP32 KDA state, unchanged NVFP4 checkpoint.
@@ -89,9 +91,11 @@ Required details:
    a fixed upper grid with device work counts.
 4. Preserve router numerics explicitly. The current C3 branch in
    `forward_prefill.rs` uses `dense_gemm` to match `forward_k3`. Do not blindly
-   extend that condition to C4. N4 should retain the existing scalar router
-   helper (`router_gate_gemm_dense`) until its IDs/weights are compared with
-   the FFN-only scalar control. C3's router behavior must stay unchanged.
+   extend that condition to C4. Implementation review found that the generic
+   `router_gate_gemm_dense` helper also has a different reduction from the
+   proven scalar decode GEMV. N4 therefore needs four row-offset launches of
+   the same scalar router GEMV for its first grouped/control comparison.
+   C3's router behavior must stay unchanged.
 5. KDA and MLA call the same guarded N4 FFN entry and consume its contiguous
    `[4,H]` output through ordinary mHC post-mix. Do not add the K5 deferred
    shared blend or communication overlap to this first step. Both ranks must
@@ -101,6 +105,15 @@ This reuse changes routed activation precision relative to scalar W4A16,
 as the measured C3 path already does. Require numerical/quality validation;
 do not describe the whole grouped path as bit-identical merely because its
 router and independent-row ownership are preserved.
+
+Implementation review also rejected generic `forward_batched` as the C4 EP
+control: it blends the shared expert before its per-row EP reduction. The
+proven scalar `forward` defers that blend until after reduction. Use the
+proven scalar path in reverse row order3,2,1,0, copying each row0 result to
+its final `[4,H]` output row before the next call. Audit that all input rows
+and already-copied output rows remain live. This preserves four scalar
+collectives in the control versus one grouped collective in the candidate;
+do not quietly repair an unrelated generic path as part of this experiment.
 
 ## Explicit scratch and memory bounds
 
