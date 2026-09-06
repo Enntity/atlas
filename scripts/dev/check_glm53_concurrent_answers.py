@@ -14,6 +14,8 @@ remain strict and never accept hidden reasoning in place of visible answers.
 import argparse
 import ast
 import concurrent.futures
+import contextlib
+import io
 import json
 import threading
 import time
@@ -38,6 +40,13 @@ ANSWERS = ("432", "ash,dogwood,birch,cedar", "def square(n):\n    return n*n",
 
 
 class ValidatorTests(unittest.TestCase):
+    def test_context_receipt_accepts_only_tested_profiles(self):
+        self.assertEqual(parse_args([]).context_limit, 2048)
+        self.assertEqual(parse_args(["--context-limit", "16384"]).context_limit, 16384)
+        for invalid in ["0", "4096", "32768"]:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse_args(["--context-limit", invalid])
+
     def test_payload_reserves_visible_answer_budget(self):
         for index in range(4):
             payload = request_payload(index, "test-model")
@@ -148,14 +157,18 @@ def request(index, args, barrier):
     return receipt
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8888")
     parser.add_argument("--model", default="/var/tmp/models/glm53-flash-nvfp4")
-    parser.add_argument("--context-limit", type=int, choices=[2048], default=2048,
+    parser.add_argument("--context-limit", type=int, choices=[2048, 16384], default=2048,
                         help="must match the restarted server's bounded context cap")
     parser.add_argument("--self-test", action="store_true", help="CPU only; no HTTP requests")
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
     if args.self_test:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(ValidatorTests)
         raise SystemExit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())
