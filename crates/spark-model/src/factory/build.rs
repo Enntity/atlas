@@ -7,7 +7,7 @@ use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::GpuBackend;
-use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache, SparseIndexCacheConfig};
+use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use spark_runtime::prefix_cache::PrefixCache;
 use spark_runtime::weights::WeightStore;
 
@@ -16,6 +16,7 @@ use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
 use super::{DflashBuildArgs, LoraBuildArgs};
 use crate::layers::MtpQuantization;
 use crate::model::TransformerModel;
+use crate::model::glm_cache_plan::{GlmCachePlan, GlmMlaShape};
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
@@ -341,7 +342,14 @@ pub fn build_model(
     // ── Step 5: Size KV cache from actual free memory ──
     // MLA absorbed: cache compressed latent [kv_lora + rope] instead of expanded [nkv * hd]
     // This gives 12.8x smaller KV cache AND better precision (no expand→cache→read roundtrip)
-    let (kv_num_heads, kv_head_dim) = if config.kv_lora_rank > 0 {
+    let glm_cache_shape = GlmMlaShape::for_model(
+        &config.model_type,
+        config.kv_lora_rank,
+        config.qk_rope_head_dim,
+    )?;
+    let (kv_num_heads, kv_head_dim) = if let Some(shape) = glm_cache_shape {
+        (shape.num_kv_heads(), shape.head_dim())
+    } else if config.kv_lora_rank > 0 {
         let mla_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim;
         tracing::info!(
             "MLA absorbed KV cache: 1 head × {} dims ({}+{}) per token (vs {} heads × {})",
@@ -370,8 +378,12 @@ pub fn build_model(
     // sharing and recycling cannot leave the two histories out of sync.
     // BF16 is the correctness baseline; the cache API also models scaled FP8
     // for the production-memory follow-up.
-    let sparse_index = (config.model_type == "glm5_next")
-        .then(|| SparseIndexCacheConfig::bf16(config.index_kpool, config.index_head_dim));
+    let sparse_index = glm_cache_shape
+        .map(|shape| shape.bf16_index(config.index_kpool, config.index_head_dim))
+        .transpose()?;
+    let glm_cache_plan = glm_cache_shape
+        .map(|shape| GlmCachePlan::new(shape, &kv_config, sparse_index))
+        .transpose()?;
 
     if hss_cache_blocks_per_seq.is_some() {
         kv_summary::log_hss_kv_summary(&kv_config);
@@ -518,10 +530,8 @@ pub fn build_model(
                     (used_so_far + inference_reserve) as f64 / (1024.0 * 1024.0 * 1024.0),
                 );
             }
-            let n = match sparse_index {
-                Some(index) => PagedKvCache::compute_num_blocks_with_sparse_index(
-                    &kv_config, index, kv_budget,
-                )?,
+            let n = match glm_cache_plan {
+                Some(plan) => plan.num_blocks_for_budget(kv_budget),
                 None => PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?,
             };
             let max_kv_tokens = n * kv_block_size;
@@ -542,6 +552,9 @@ pub fn build_model(
             n
         }
     };
+    if let Some(plan) = glm_cache_plan {
+        plan.bytes_for_blocks(num_kv_blocks)?;
+    }
     let _max_kv_tokens = num_kv_blocks * kv_block_size;
     // Phase 6.1.f / 6.2.c — when --high-speed-swap is on with HBM-shrink, the
     // production KV cache only has to fit the per-seq HBM window, not the full

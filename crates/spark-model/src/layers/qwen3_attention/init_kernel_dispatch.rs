@@ -28,14 +28,10 @@ pub(super) fn mla_bf16_module(
     kv_lora_rank: usize,
     rope_dim: usize,
 ) -> anyhow::Result<&'static str> {
-    if model_type == "glm5_next" {
-        anyhow::ensure!(
-            kv_lora_rank == 512 && rope_dim == 0,
-            "GLM BF16 MLA decode requires latent rank512 and zero RoPE"
-        );
-        // The inherited DeepSeek `paged_decode_mla` is compiled for 576,
-        // regardless of the runtime head_dim argument. It overlaps GLM heads.
-        return Ok("paged_decode_attn_512");
+    if let Some(shape) =
+        crate::model::glm_cache_plan::GlmMlaShape::for_model(model_type, kv_lora_rank, rope_dim)?
+    {
+        return Ok(shape.bf16_decode_module());
     }
     Ok("paged_decode_mla")
 }

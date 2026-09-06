@@ -14,11 +14,12 @@ use std::any::Any;
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache, SparseIndexCacheConfig};
+use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};
 use crate::layers::mtp_meta::{MTP_META_OFFSET, pack_mtp_attn_meta};
 use crate::layers::ops;
+use crate::model::glm_cache_plan::{GlmCachePlan, GlmMlaShape};
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_loader::glm5::Glm5MtpModule;
 use crate::weight_map::{DenseWeight, QuantizedWeight};
@@ -121,23 +122,26 @@ impl Glm5MtpHead {
         mtp_vocab_size: u32,
         max_seq_len: usize,
     ) -> Result<Self> {
+        let cache_shape = GlmMlaShape::new(config.kv_lora_rank, config.qk_rope_head_dim)?;
         let kv_config = KvCacheConfig {
             block_size: 16,
-            num_kv_heads: 1,
-            head_dim: config.kv_lora_rank + config.qk_rope_head_dim,
+            num_kv_heads: cache_shape.num_kv_heads(),
+            head_dim: cache_shape.head_dim(),
             num_layers: 1,
             dtype: KvCacheDtype::Bf16,
             layer_dtypes: vec![],
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         };
+        let sparse_index = (config.index_kpool > 0 && config.index_head_dim > 0)
+            .then(|| cache_shape.bf16_index(config.index_kpool, config.index_head_dim))
+            .transpose()?;
+        let cache_plan = GlmCachePlan::new(cache_shape, &kv_config, sparse_index)?;
         let num_blocks = max_seq_len / kv_config.block_size + 1;
+        cache_plan.bytes_for_blocks(num_blocks)?;
         let mut kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
-        if config.index_kpool > 0 && config.index_head_dim > 0 {
-            kv_cache.attach_sparse_index(
-                SparseIndexCacheConfig::bf16(config.index_kpool, config.index_head_dim),
-                gpu,
-            )?;
+        if let Some(index) = sparse_index {
+            kv_cache.attach_sparse_index(index, gpu)?;
         }
         Ok(Self {
             module,
