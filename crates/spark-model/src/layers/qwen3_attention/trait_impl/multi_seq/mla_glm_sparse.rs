@@ -14,8 +14,19 @@ use crate::layer::{AttnMetadataDev, ForwardContext};
 use crate::layers::ops;
 use crate::layers::qwen3_attention::{MlaWeights, Qwen3AttentionLayer};
 
-fn validate_positions(positions: &[usize], rows: usize, model_limit: usize) -> Result<u32> {
-    ensure!(matches!(rows, 2 | 3), "GLM sparse decode requires C2/C3");
+fn validate_positions(
+    positions: &[usize],
+    rows: usize,
+    model_limit: usize,
+    c4_sparse: bool,
+) -> Result<u32> {
+    ensure!(
+        matches!(rows, 2 | 3) || (rows == 4 && c4_sparse),
+        "GLM sparse decode requires C2/C3 or opted-in eager C4"
+    );
+    if c4_sparse {
+        crate::model::glm_c4::validate_positions_for_mode(positions.iter().copied(), rows, true)?;
+    }
     ensure!(
         positions.len() == rows,
         "GLM sparse host-position count mismatch"
@@ -59,10 +70,16 @@ impl Qwen3AttentionLayer {
         mla: &MlaWeights,
     ) -> Result<()> {
         let config = c.fwd.config;
-        let max_position = validate_positions(c.seq_lens, c.n, config.max_position_embeddings)?;
+        let c4_sparse = crate::model::glm_c4::sparse_enabled(&config.model_type);
+        let max_position =
+            validate_positions(c.seq_lens, c.n, config.max_position_embeddings, c4_sparse)?;
         let dynamic = crate::layers::qwen3_attention::glm_multi_seq_sparse_graphs_enabled(
             &config.model_type,
         )?;
+        ensure!(
+            !c4_sparse || (!dynamic && !c.fwd.graph_capture),
+            "GLM C4 sparse decode is eager-only"
+        );
         ensure!(
             !c.fwd.graph_capture || dynamic,
             "GLM multi-sequence sparse capture requires the device-length graph opt-in"
@@ -350,14 +367,33 @@ mod tests {
     #[test]
     fn independent_positions_preserve_threshold_and_tail_phases() {
         assert_eq!(
-            validate_positions(&[2047, 2048, 2051], 3, 16384).unwrap(),
+            validate_positions(&[2047, 2048, 2051], 3, 16384, false).unwrap(),
             2051
         );
-        assert_eq!(validate_positions(&[16383, 7], 2, 16384).unwrap(), 16383);
-        assert!(validate_positions(&[2047], 2, 16384).is_err());
-        assert!(validate_positions(&[0, 1, 2, 3, 4], 5, 16384).is_err());
-        assert!(validate_positions(&[16384, 7], 2, 16384).is_err());
-        assert!(validate_positions(&[u32::MAX as usize, 0], 2, usize::MAX).is_err());
+        assert_eq!(
+            validate_positions(&[16383, 7], 2, 16384, false).unwrap(),
+            16383
+        );
+        assert!(validate_positions(&[2047], 2, 16384, false).is_err());
+        assert!(validate_positions(&[0, 1, 2, 3, 4], 5, 16384, false).is_err());
+        assert!(validate_positions(&[16384, 7], 2, 16384, false).is_err());
+        assert!(validate_positions(&[u32::MAX as usize, 0], 2, usize::MAX, false).is_err());
+    }
+
+    #[test]
+    fn eager_c4_positions_are_opt_in_bounded_and_preserve_drain_rows() {
+        let positions = [2047, 2048, 2051, 16383];
+        assert_eq!(
+            validate_positions(&positions, 4, 16384, true).unwrap(),
+            16383
+        );
+        assert!(validate_positions(&positions, 4, 16384, false).is_err());
+        assert!(validate_positions(&positions, 4, 8192, true).is_err());
+        for rows in 2..=4 {
+            assert!(validate_positions(&positions[..rows], rows, 16384, true).is_ok());
+            assert!(validate_positions(&[16384, 0, 1, 2][..rows], rows, 1_048_576, true).is_err());
+        }
+        assert!(validate_positions(&positions[..3], 4, 16384, true).is_err());
     }
 
     #[test]

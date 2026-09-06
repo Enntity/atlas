@@ -28,6 +28,7 @@ MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 TP_SIZE="${TP_SIZE:-1}"
 OOM_GUARD_MB="${OOM_GUARD_MB:-4096}"
+KV_OVERCOMMIT="${KV_OVERCOMMIT:-1}"
 # The server deadline includes chunked prefill. A 100K request currently takes
 # longer than Atlas's 300-second default on two Sparks, so expose the existing
 # serve flag without weakening the default for short-context deployments.
@@ -55,6 +56,7 @@ GLM_MLA_BATCH23="${GLM_MLA_BATCH23:-0}"
 GLM_MLA_BATCH4="${GLM_MLA_BATCH4:-0}"
 GLM_C3_GROUPED_MOE="${GLM_C3_GROUPED_MOE:-0}"
 GLM_C4_DECODE="${GLM_C4_DECODE:-0}"
+GLM_C4_SPARSE="${GLM_C4_SPARSE:-0}"
 GLM_C4_GROUPED_MOE="${GLM_C4_GROUPED_MOE:-0}"
 GLM_MULTI_SEQ_SPARSE="${GLM_MULTI_SEQ_SPARSE:-0}"
 GLM_MULTI_SEQ_SPARSE_GRAPHS="${GLM_MULTI_SEQ_SPARSE_GRAPHS:-0}"
@@ -233,9 +235,9 @@ if [[ "$GLM_MULTI_SEQ_SPARSE_GRAPHS" == "1" && "$GLM_MULTI_SEQ_SPARSE" != "1" ]]
   exit 2
 fi
 
-for c4_switch in "$GLM_C4_DECODE" "$GLM_C4_GROUPED_MOE" "$NO_DECODE_GRAPHS_MULTISEQ"; do
+for c4_switch in "$GLM_C4_DECODE" "$GLM_C4_SPARSE" "$GLM_C4_GROUPED_MOE" "$NO_DECODE_GRAPHS_MULTISEQ" "$KV_OVERCOMMIT"; do
   if [[ "$c4_switch" != "0" && "$c4_switch" != "1" ]]; then
-    echo "ERROR: GLM_C4_DECODE, GLM_C4_GROUPED_MOE and NO_DECODE_GRAPHS_MULTISEQ must be 0 or 1." >&2
+    echo "ERROR: C4 switches, NO_DECODE_GRAPHS_MULTISEQ and KV_OVERCOMMIT must be 0 or 1." >&2
     exit 1
   fi
 done
@@ -243,15 +245,27 @@ if [[ "$GLM_C4_GROUPED_MOE" == "1" && "$GLM_C4_DECODE" != "1" ]]; then
   echo "ERROR: GLM_C4_GROUPED_MOE=1 requires GLM_C4_DECODE=1." >&2
   exit 1
 fi
-if [[ "$GLM_C4_DECODE" == "1" ]] && \
-   [[ "$TP_SIZE" != "2" || "$MAX_BATCH_SIZE" != "4" || "$MAX_NUM_SEQS" != "4" || \
-      "$SPECULATIVE" != "0" || "$KDA_MULTI_SEQ" != "1" || "$MLA_MULTI_SEQ" != "1" || "$GLM_MULTI_SEQ_SPARSE" != "0" || \
-      "$GLM_MULTI_SEQ_SPARSE_GRAPHS" != "0" ]] ; then
-  echo "ERROR: initial C4 requires TP2, active4/admitted4, SPECULATIVE=0, KDA/MLA_MULTI_SEQ=1 and sparse flags off." >&2
+if [[ "$GLM_C4_SPARSE" == "1" ]] && \
+   [[ "$GLM_C4_DECODE" != "1" || "$GLM_MULTI_SEQ_SPARSE" != "1" || \
+      "$NO_DECODE_GRAPHS_MULTISEQ" != "1" || "$KV_OVERCOMMIT" != "0" ]]; then
+  echo "ERROR: GLM_C4_SPARSE requires C4_DECODE=1, MULTI_SEQ_SPARSE=1, NO_DECODE_GRAPHS_MULTISEQ=1 and KV_OVERCOMMIT=0." >&2
   exit 1
 fi
-if [[ "$GLM_C4_DECODE" == "1" ]] && (( MAX_SEQ_LEN < 1 || MAX_SEQ_LEN > 2048 )); then
-  echo "ERROR: initial C4 requires MAX_SEQ_LEN in 1..2048 (including completion)." >&2
+if [[ "$GLM_C4_DECODE" == "1" ]] && \
+   [[ "$TP_SIZE" != "2" || "$MAX_BATCH_SIZE" != "4" || "$MAX_NUM_SEQS" != "4" || \
+      "$SPECULATIVE" != "0" || "$KDA_MULTI_SEQ" != "1" || "$MLA_MULTI_SEQ" != "1" || "$GLM_MULTI_SEQ_SPARSE" != "$GLM_C4_SPARSE" || \
+      "$GLM_MULTI_SEQ_SPARSE_GRAPHS" != "0" ]] ; then
+  echo "ERROR: C4 requires TP2, active4/admitted4, SPECULATIVE=0, KDA/MLA_MULTI_SEQ=1, base sparse matching C4_SPARSE and sparse graphs off." >&2
+  exit 1
+fi
+C4_CONTEXT_LIMIT=2048
+if [[ "$GLM_C4_SPARSE" == "1" ]]; then C4_CONTEXT_LIMIT=16384; fi
+if [[ "$GLM_C4_SPARSE" == "1" ]] && (( MAX_PREFILL_TOKENS < 1 || MAX_PREFILL_TOKENS > 1024 )); then
+  echo "ERROR: GLM_C4_SPARSE requires MAX_PREFILL_TOKENS in 1..1024." >&2
+  exit 1
+fi
+if [[ "$GLM_C4_DECODE" == "1" ]] && (( MAX_SEQ_LEN < 1 || MAX_SEQ_LEN > C4_CONTEXT_LIMIT )); then
+  echo "ERROR: C4 requires MAX_SEQ_LEN in 1..$C4_CONTEXT_LIMIT (including completion)." >&2
   exit 1
 fi
 if (( MAX_BATCH_SIZE < 1 || MAX_BATCH_SIZE > 4 )) || \
@@ -559,6 +573,7 @@ echo "  per-sequence context / active / admitted: $MAX_SEQ_LEN / $MAX_BATCH_SIZE
 echo "  prefill chunk budget: $MAX_PREFILL_TOKENS"
 echo "  parallelism: TP=$TP_SIZE / EP=2 on two physical ranks"
 echo "  GPU budget: $GPU_MEM_UTIL; OOM guard: ${OOM_GUARD_MB} MiB"
+echo "  KV overcommit: $KV_OVERCOMMIT"
 echo "  container memory ceiling: $CONTAINER_MEMORY"
 echo "  NCCL: $NCCL_IFNAME / $NCCL_HCA"
 echo "  profiler: $PROFILE"
@@ -572,7 +587,7 @@ echo "  GLM MLA batched four-row chain: $GLM_MLA_BATCH4"
 echo "  experimental GLM C3 native-FP4 grouped MoE: $GLM_C3_GROUPED_MOE"
 echo "  experimental GLM concurrent semantic indexing: $GLM_MULTI_SEQ_SPARSE"
 echo "  experimental device-length C2/C3 graphs: $GLM_MULTI_SEQ_SPARSE_GRAPHS"
-echo "  experimental short C4 / grouped MoE: $GLM_C4_DECODE / $GLM_C4_GROUPED_MOE"
+echo "  experimental C4 / eager sparse / grouped MoE: $GLM_C4_DECODE / $GLM_C4_SPARSE / $GLM_C4_GROUPED_MOE"
 echo "  disable multi-sequence decode graphs: $NO_DECODE_GRAPHS_MULTISEQ"
 echo "  unified MoE layout: $UNIFIED_MOE_LAYOUT"
 echo "  cuBLASLt BF16 projections: $CUBLAS_GEMM"
@@ -682,6 +697,8 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE=$GLM_MULTI_SEQ_SPARSE \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS=$GLM_MULTI_SEQ_SPARSE_GRAPHS \
   -e ATLAS_GLM_C4_DECODE=$GLM_C4_DECODE \
+  -e ATLAS_GLM_C4_SPARSE=$GLM_C4_SPARSE \
+  -e ATLAS_KV_OVERCOMMIT=$KV_OVERCOMMIT \
   -e ATLAS_GLM_C4_GROUPED_MOE=$GLM_C4_GROUPED_MOE \
   -e ATLAS_NO_DECODE_GRAPHS_MULTISEQ=$NO_DECODE_GRAPHS_MULTISEQ \
   -e ATLAS_DECODE_BATCH_LOG=$DECODE_BATCH_LOG \
@@ -764,6 +781,8 @@ docker run -d \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE="$GLM_MULTI_SEQ_SPARSE" \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS="$GLM_MULTI_SEQ_SPARSE_GRAPHS" \
   -e ATLAS_GLM_C4_DECODE="$GLM_C4_DECODE" \
+  -e ATLAS_GLM_C4_SPARSE="$GLM_C4_SPARSE" \
+  -e ATLAS_KV_OVERCOMMIT="$KV_OVERCOMMIT" \
   -e ATLAS_GLM_C4_GROUPED_MOE="$GLM_C4_GROUPED_MOE" \
   -e ATLAS_NO_DECODE_GRAPHS_MULTISEQ="$NO_DECODE_GRAPHS_MULTISEQ" \
   -e ATLAS_DECODE_BATCH_LOG="$DECODE_BATCH_LOG" \

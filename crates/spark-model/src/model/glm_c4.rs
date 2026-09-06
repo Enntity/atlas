@@ -18,6 +18,9 @@ pub struct C4Policy<'a> {
     pub mla_multi: bool,
     pub sparse: bool,
     pub sparse_graphs: bool,
+    pub c4_sparse: bool,
+    pub no_multiseq_graphs: bool,
+    pub kv_overcommit_disabled: bool,
     pub fp32_state: bool,
 }
 
@@ -35,10 +38,14 @@ impl C4Policy<'_> {
             self.independent
                 && self.kda_multi
                 && self.mla_multi
-                && !self.sparse
+                && self.sparse == self.c4_sparse
                 && !self.sparse_graphs
                 && self.fp32_state,
-            "GLM C4 requires non-speculative decode, KDA/MLA_MULTI_SEQ=1, FP32 KDA state and sparse flags off"
+            "GLM C4 requires non-speculative decode, KDA/MLA_MULTI_SEQ=1, FP32 KDA state, sparse graphs off and base sparse matching C4_SPARSE"
+        );
+        ensure!(
+            !self.c4_sparse || (self.no_multiseq_graphs && self.kv_overcommit_disabled),
+            "GLM C4_SPARSE requires ATLAS_NO_DECODE_GRAPHS_MULTISEQ=1 and ATLAS_KV_OVERCOMMIT=0"
         );
         Ok(())
     }
@@ -46,6 +53,41 @@ impl C4Policy<'_> {
 
 pub fn enabled(model_type: &str) -> bool {
     model_type == "glm5_next" && std::env::var("ATLAS_GLM_C4_DECODE").as_deref() == Ok("1")
+}
+
+pub const SPARSE_CONTEXT_LIMIT: usize = 16384;
+
+pub fn validate_prefill_budget(tokens: usize, c4_sparse: bool) -> Result<()> {
+    ensure!(
+        !c4_sparse || (1..=1024).contains(&tokens),
+        "GLM C4_SPARSE requires a configured prefill budget in 1..1024"
+    );
+    Ok(())
+}
+
+fn context_limit(c4_sparse: bool) -> usize {
+    if c4_sparse {
+        SPARSE_CONTEXT_LIMIT
+    } else {
+        2048
+    }
+}
+
+pub fn sparse_enabled(model_type: &str) -> bool {
+    model_type == "glm5_next" && std::env::var("ATLAS_GLM_C4_SPARSE").as_deref() == Ok("1")
+}
+
+/// Direct-server boundary rejects misspelled flags and other architectures.
+pub fn validate_sparse_flag(model_type: &str, value: Option<&str>) -> Result<bool> {
+    ensure!(
+        matches!(value, None | Some("0" | "1")),
+        "ATLAS_GLM_C4_SPARSE must be 0 or 1"
+    );
+    ensure!(
+        value != Some("1") || model_type == "glm5_next",
+        "ATLAS_GLM_C4_SPARSE requires glm5_next"
+    );
+    Ok(value == Some("1"))
 }
 
 pub fn policy_from_env(
@@ -68,6 +110,12 @@ pub fn policy_from_env(
         mla_multi: std::env::var("ATLAS_GLM_MLA_MULTI_SEQ").as_deref() == Ok("1"),
         sparse: std::env::var("ATLAS_GLM_MULTI_SEQ_SPARSE").as_deref() == Ok("1"),
         sparse_graphs: std::env::var("ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS").as_deref() == Ok("1"),
+        c4_sparse: sparse_enabled(model_type),
+        no_multiseq_graphs: std::env::var("ATLAS_NO_DECODE_GRAPHS_MULTISEQ").as_deref() == Ok("1"),
+        kv_overcommit_disabled: matches!(
+            std::env::var("ATLAS_KV_OVERCOMMIT").as_deref(),
+            Ok("0" | "false")
+        ),
         fp32_state: !crate::layers::qwen3_ssm::ssm_h_fp16_enabled(),
     }
 }
@@ -78,9 +126,20 @@ pub fn validate_launch_limits(
     context: usize,
     bf16: bool,
 ) -> Result<()> {
+    validate_launch_limits_for_mode(active, admitted, context, bf16, sparse_enabled("glm5_next"))
+}
+
+pub fn validate_launch_limits_for_mode(
+    active: usize,
+    admitted: usize,
+    context: usize,
+    bf16: bool,
+    c4_sparse: bool,
+) -> Result<()> {
+    let limit = context_limit(c4_sparse);
     ensure!(
-        active == 4 && admitted == 4 && (1..=2048).contains(&context) && bf16,
-        "initial GLM C4 lane requires active4/admitted4, context1..2048 and BF16 KV"
+        active == 4 && admitted == 4 && (1..=limit).contains(&context) && bf16,
+        "GLM C4 requires active4/admitted4, context1..{limit} and BF16 KV"
     );
     Ok(())
 }
@@ -127,16 +186,22 @@ pub fn batched_kda_rows(rows: usize, kda: bool, c4: bool) -> Result<bool> {
 }
 
 pub fn validate_positions(positions: impl IntoIterator<Item = usize>, rows: usize) -> Result<()> {
+    validate_positions_for_mode(positions, rows, sparse_enabled("glm5_next"))
+}
+
+pub fn validate_positions_for_mode(
+    positions: impl IntoIterator<Item = usize>,
+    rows: usize,
+    c4_sparse: bool,
+) -> Result<()> {
     ensure!(
         matches!(rows, 2..=4),
         "GLM C4 lane accepts only independent C2/C3/C4 batch widths"
     );
     let mut count = 0;
+    let limit = context_limit(c4_sparse);
     for position in positions {
-        ensure!(
-            position < 2048,
-            "GLM C4 lane cannot decode at position2048 or beyond"
-        );
+        ensure!(position < limit, "GLM C4 position must be below {limit}");
         count += 1;
     }
     ensure!(count == rows, "GLM C4 host position count mismatch");
@@ -211,8 +276,98 @@ mod tests {
             mla_multi: true,
             sparse: false,
             sparse_graphs: false,
+            c4_sparse: false,
+            no_multiseq_graphs: false,
+            kv_overcommit_disabled: false,
             fp32_state: true,
         }
+    }
+
+    #[test]
+    fn c4_sparse_requires_explicit_eager_bounded_policy() {
+        let long = || C4Policy {
+            c4_sparse: true,
+            sparse: true,
+            no_multiseq_graphs: true,
+            kv_overcommit_disabled: true,
+            ..policy()
+        };
+        assert!(long().validate().is_ok());
+        for bad in [
+            C4Policy {
+                enabled: false,
+                ..long()
+            },
+            C4Policy {
+                sparse: false,
+                ..long()
+            },
+            C4Policy {
+                sparse_graphs: true,
+                ..long()
+            },
+            C4Policy {
+                no_multiseq_graphs: false,
+                ..long()
+            },
+            C4Policy {
+                kv_overcommit_disabled: false,
+                ..long()
+            },
+            C4Policy {
+                independent: false,
+                ..long()
+            },
+            C4Policy {
+                fp32_state: false,
+                ..long()
+            },
+            C4Policy {
+                mla_multi: false,
+                ..long()
+            },
+        ] {
+            assert!(bad.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn c4_sparse_flag_and_context_boundaries_fail_closed() {
+        assert!(validate_prefill_budget(1, true).is_ok());
+        assert!(validate_prefill_budget(1024, true).is_ok());
+        for invalid in [0, 1025, 6144, usize::MAX] {
+            assert!(validate_prefill_budget(invalid, true).is_err());
+            assert!(validate_prefill_budget(invalid, false).is_ok());
+        }
+        assert!(!validate_sparse_flag("glm5_next", None).unwrap());
+        assert!(!validate_sparse_flag("other", Some("0")).unwrap());
+        assert!(validate_sparse_flag("glm5_next", Some("1")).unwrap());
+        assert!(validate_sparse_flag("other", Some("1")).is_err());
+        assert!(validate_sparse_flag("glm5_next", Some("true")).is_err());
+        for limit in [2048, SPARSE_CONTEXT_LIMIT] {
+            let sparse = limit > 2048;
+            assert!(validate_launch_limits_for_mode(4, 4, limit, true, sparse).is_ok());
+            for (active, admitted, context, bf16) in [
+                (4, 4, 0, true),
+                (4, 4, limit + 1, true),
+                (3, 4, limit, true),
+                (4, 5, limit, true),
+                (4, 4, limit, false),
+            ] {
+                assert!(
+                    validate_launch_limits_for_mode(active, admitted, context, bf16, sparse)
+                        .is_err()
+                );
+            }
+            for rows in 2..=4 {
+                assert!(validate_positions_for_mode(vec![limit - 1; rows], rows, sparse).is_ok());
+                assert!(validate_positions_for_mode(vec![limit; rows], rows, sparse).is_err());
+                assert!(validate_positions_for_mode(vec![usize::MAX; rows], rows, sparse).is_err());
+                assert!(validate_positions_for_mode(vec![0; rows - 1], rows, sparse).is_err());
+            }
+        }
+        assert!(validate_positions_for_mode([0], 1, true).is_err());
+        assert!(validate_positions_for_mode([0; 5], 5, true).is_err());
     }
 
     #[test]

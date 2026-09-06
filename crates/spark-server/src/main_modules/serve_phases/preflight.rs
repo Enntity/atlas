@@ -52,10 +52,21 @@ fn glm5_long_context_concurrency_supported(
     max_batch: usize,
     max_num_seqs: usize,
     sparse_decode: bool,
+    c4_sparse: bool,
 ) -> bool {
     max_seq_len <= index_topk
         || (max_batch == 1 && max_num_seqs == 1)
         || (sparse_decode && matches!(max_batch, 2 | 3) && (max_batch..=5).contains(&max_num_seqs))
+        || (sparse_decode
+            && c4_sparse
+            && spark_model::model::glm_c4::validate_launch_limits_for_mode(
+                max_batch,
+                max_num_seqs,
+                max_seq_len,
+                true,
+                true,
+            )
+            .is_ok())
 }
 
 pub(crate) fn preflight_reserve(
@@ -63,6 +74,10 @@ pub(crate) fn preflight_reserve(
     config: &ModelConfig,
     free_mem: usize,
 ) -> Result<ReservePreflight> {
+    let c4_sparse = spark_model::model::glm_c4::validate_sparse_flag(
+        &config.model_type,
+        std::env::var("ATLAS_GLM_C4_SPARSE").ok().as_deref(),
+    )?;
     if config.model_type == "glm5_next" {
         let sparse_decode =
             spark_model::layers::qwen3_attention::glm_multi_seq_sparse_enabled(&config.model_type);
@@ -86,7 +101,11 @@ pub(crate) fn preflight_reserve(
             std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() != Ok("1") || c4,
             "ATLAS_GLM_C4_GROUPED_MOE=1 requires ATLAS_GLM_C4_DECODE=1"
         );
-        if c4 || args.max_batch_size == 4 {
+        if c4 || c4_sparse || args.max_batch_size == 4 {
+            spark_model::model::glm_c4::validate_prefill_budget(
+                args.max_prefill_tokens,
+                c4_sparse,
+            )?;
             spark_model::model::glm_c4::policy_from_env(
                 &config.model_type,
                 args.world_size,
@@ -109,7 +128,7 @@ pub(crate) fn preflight_reserve(
         anyhow::ensure!(
             glm5_concurrency_supported(args.max_batch_size, args.max_num_seqs, ep_v2, c4),
             "GLM-5 dual-Spark concurrency supports --max-batch-size 1..=3 and \
-             --max-num-seqs max_batch..=5, or explicitly opted-in short C4 with active/admitted4; \
+             --max-num-seqs max_batch..=5, or explicitly opted-in C4 with active/admitted4; \
              batches above one require ATLAS_EP_PROTOCOL=v2"
         );
         anyhow::ensure!(
@@ -119,8 +138,9 @@ pub(crate) fn preflight_reserve(
                 args.max_batch_size,
                 args.max_num_seqs,
                 sparse_decode,
+                c4_sparse,
             ),
-            "GLM-5 context above index_topk={} requires one active/admitted sequence or opt-in ATLAS_GLM_MULTI_SEQ_SPARSE=1 for independent C2/C3",
+            "GLM-5 context above index_topk={} requires one active/admitted sequence, opt-in sparse C2/C3, or guarded eager ATLAS_GLM_C4_SPARSE=1",
             config.index_topk,
         );
         anyhow::ensure!(
@@ -461,26 +481,43 @@ mod tests {
     #[test]
     fn glm5_long_context_concurrency_requires_explicit_sparse_decode() {
         assert!(glm5_long_context_concurrency_supported(
-            100_000, 2048, 1, 1, false
+            100_000, 2048, 1, 1, false, false
         ));
         assert!(!glm5_long_context_concurrency_supported(
-            100_000, 2048, 2, 2, false
+            100_000, 2048, 2, 2, false, false
         ));
         assert!(glm5_long_context_concurrency_supported(
-            2048, 2048, 3, 5, false
+            2048, 2048, 3, 5, false, false
         ));
         assert!(glm5_long_context_concurrency_supported(
-            16384, 2048, 3, 3, true
+            16384, 2048, 3, 3, true, false
         ));
         assert!(glm5_long_context_concurrency_supported(
-            16384, 2048, 2, 5, true
+            16384, 2048, 2, 5, true, false
         ));
         assert!(!glm5_long_context_concurrency_supported(
-            16384, 2048, 4, 4, true
+            16384, 2048, 4, 4, true, false
         ));
         assert!(!glm5_long_context_concurrency_supported(
-            16384, 2048, 1, 5, true
+            16384, 2048, 1, 5, true, false
         ));
+    }
+
+    #[test]
+    fn glm5_long_c4_requires_its_own_bounded_opt_in() {
+        assert!(glm5_long_context_concurrency_supported(
+            16384, 2048, 4, 4, true, true
+        ));
+        for (context, active, admitted, sparse) in [
+            (16385, 4, 4, true),
+            (16384, 4, 5, true),
+            (16384, 5, 5, true),
+            (16384, 4, 4, false),
+        ] {
+            assert!(!glm5_long_context_concurrency_supported(
+                context, 2048, active, admitted, sparse, true
+            ));
+        }
     }
 }
 
