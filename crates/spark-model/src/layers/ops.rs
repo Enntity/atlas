@@ -72,6 +72,8 @@ mod glm_indexer_dynamic;
 mod hyper_connection;
 #[path = "ops/kda.rs"]
 mod kda;
+#[path = "ops/kda_indexed.rs"]
+mod kda_indexed;
 #[path = "ops/kv_cache.rs"]
 mod kv_cache;
 #[path = "ops/kv_cache_fp8k.rs"]
@@ -172,6 +174,7 @@ pub use glm_indexer::*;
 pub use glm_indexer_dynamic::*;
 pub use hyper_connection::*;
 pub use kda::*;
+pub use kda_indexed::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
 pub use kv_cache_turbok::*;
