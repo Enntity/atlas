@@ -97,6 +97,11 @@ impl Qwen3AttentionLayer {
     ) -> Result<Self> {
         let (reshape_mod, reshape_fn, decode_mod, decode_fn) =
             super::init_kernel_dispatch::kernel_modules_for_dtype(kv_dtype, config.head_dim);
+        let mla_decode_mod = super::init_kernel_dispatch::mla_bf16_module(
+            &config.model_type,
+            config.kv_lora_rank,
+            config.qk_rope_head_dim,
+        )?;
         // Which cross-architecture kernel families this config says exist. A
         // family the model does not have is never LOOKED UP, so it leaves no
         // failed row in the boot audit. See `init_arch_gates`.
@@ -393,7 +398,13 @@ impl Qwen3AttentionLayer {
                     "paged_decode_attn_fp8",
                 ),
             },
-            paged_decode_mla_k: gate(probes.mla, gpu, "paged_decode_mla", "paged_decode_attn"),
+            // GLM's latent width is 512, not the inherited DeepSeek 576.
+            // Require its exact kernel; a missing module must not fall back.
+            paged_decode_mla_k: if config.model_type == "glm5_next" {
+                gpu.kernel(mla_decode_mod, "paged_decode_attn")?
+            } else {
+                gate(probes.mla, gpu, mla_decode_mod, "paged_decode_attn")
+            },
             // DeepSeek-V4-Flash MLA paged decode (compressed 576-dim KV cache).
             mla_paged_decode_k: gate(
                 probes.mla,

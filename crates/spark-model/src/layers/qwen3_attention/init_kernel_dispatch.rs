@@ -22,6 +22,24 @@
 
 use spark_runtime::kv_cache::KvCacheDtype;
 
+/// BF16 absorbed-MLA module, selected separately from the unabsorbed Q head.
+pub(super) fn mla_bf16_module(
+    model_type: &str,
+    kv_lora_rank: usize,
+    rope_dim: usize,
+) -> anyhow::Result<&'static str> {
+    if model_type == "glm5_next" {
+        anyhow::ensure!(
+            kv_lora_rank == 512 && rope_dim == 0,
+            "GLM BF16 MLA decode requires latent rank512 and zero RoPE"
+        );
+        // The inherited DeepSeek `paged_decode_mla` is compiled for 576,
+        // regardless of the runtime head_dim argument. It overlaps GLM heads.
+        return Ok("paged_decode_attn_512");
+    }
+    Ok("paged_decode_mla")
+}
+
 /// Module + function name 4-tuple consumed by `Qwen3AttentionLayer::new_with_gating`:
 /// `(reshape_mod, reshape_fn, decode_mod, decode_fn)`. The reshape pair feeds
 /// `self.reshape_cache_k`; the decode pair feeds `self.paged_decode_k`.
@@ -177,6 +195,52 @@ pub(super) fn kernel_modules_for_dtype(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glm_mla_512_uses_exact_latent_width() {
+        assert_eq!(
+            mla_bf16_module("glm5_next", 512, 0).unwrap(),
+            "paged_decode_attn_512"
+        );
+    }
+
+    #[test]
+    fn glm_mla_rejects_unsupported_latent_geometry() {
+        for (rank, rope) in [(0, 0), (256, 0), (512, 64), (576, 0), (usize::MAX, 1)] {
+            assert!(mla_bf16_module("glm5_next", rank, rope).is_err());
+        }
+    }
+
+    #[test]
+    fn glm_mla_fix_preserves_other_model_bindings() {
+        for (model, rank, rope) in [
+            ("deepseek_v4", 512, 64),
+            ("mistral3", 256, 64),
+            ("qwen3", 0, 0),
+            ("other", 512, 0),
+        ] {
+            assert_eq!(
+                mla_bf16_module(model, rank, rope).unwrap(),
+                "paged_decode_mla"
+            );
+        }
+    }
+
+    #[test]
+    fn glm_mla_512_source_and_alias_match_the_binding() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernels/gb10/deepseek-v4-flash/nvfp4/paged_decode_attn_512.cu"
+        ));
+        let manifest = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernels/gb10/deepseek-v4-flash/nvfp4/KERNEL.toml"
+        ));
+        assert!(source.contains("#define HDIM 512"));
+        assert!(source.contains("void paged_decode_attn("));
+        assert!(source.contains("const unsigned int sliding_window"));
+        assert!(manifest.contains("paged_decode_attn_512 = \"paged_decode_attn_512\""));
+    }
 
     /// Every variant the enum advertises must be in the dispatch table.
     /// The match in `kernel_modules_for_dtype` is exhaustive (no `_` arm),
