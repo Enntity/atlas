@@ -1,8 +1,9 @@
 # Phase 3: bounded C4 correctness investigation
 
-Status: **experimental; not promoted**. The initial full-model C4 scalar
-control fails independent-needle correctness. Kernel-only speedups are not
-serving throughput results.
+Status: corrected short-context C4 has passed the scoped serving gates below;
+long-context C4 remains under validation. The initial failure and its resolution
+are retained chronologically. Kernel-only speedups are not serving throughput
+results.
 
 ## Initial image and configuration
 
@@ -161,3 +162,25 @@ tokens. C4 improves full-wall aggregate by34.2% on this workload. Do not compare
 coding completion is a throughput workload; generated implementations were
 not executed or graded. Raw receipts: `v8-on-coding-c3-256.json` and
 `v8-on-coding-256.json`.
+
+## Short-context C4 graphs, matched v8 comparison
+
+Same v8 binary and M4-on/grouped configuration; only
+`NO_DECODE_GRAPHS_MULTISEQ=1` changes to `0`. Sparse indexing remains disabled,
+context2048/chunk1024. No CPU build runs during either benchmark.
+
+| C4 workload | Eager full-wall tokens/s | Graph full-wall tokens/s | Graph post-first tokens/s |
+| --- | ---: | ---: | ---: |
+| 1024 prompt / 64 output, repetition allowed | 27.691 | 28.321 | 31.270 |
+| 148 coding prompt / 256 output, normal watchdog | 44.246 | 45.948 | 46.713 |
+
+One warmup and two measured batches, matching the hashes above; all measured
+streams reach their requested caps. Graph gains are2.3% and3.8% respectively,
+not evidence that graphs resolve the remaining execution bottlenecks.
+Four budgeted chat answers, four short needles, and eight repeated near-limit
+needles pass. Server logs show captured C4 plus C3/C2 nonprefix slot subsets.
+This result does not extend to long sparse C4, whose graph path is not enabled.
+Receipts: `v8-graphs-{1k-64,coding-256}.json`,
+`v8-graphs-{chat-budget32,c4-smoke,c4-boundary}` and both-rank logs in the
+phase3 receipt directory. The tested containers are preserved, stopped, as
+`atlas-glm53-v8-graphs-control-ep0/1`.
