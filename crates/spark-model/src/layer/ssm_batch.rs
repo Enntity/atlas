@@ -17,7 +17,7 @@ pub struct SsmPoolView<'a> {
 
 pub(crate) fn checked_span(ptr: DevicePtr, bytes: usize) -> Result<()> {
     ensure!(
-        ptr.0 != 0 && ptr.0 % 4 == 0,
+        ptr.0 != 0 && ptr.0.is_multiple_of(4),
         "SSM pointer must be nonnull and FP32 aligned"
     );
     ensure!(bytes > 0, "SSM span must be nonempty");
@@ -41,11 +41,11 @@ impl<'a> SsmPoolView<'a> {
             "SSM layer pool counts disagree"
         );
         ensure!(
-            h_bytes > 0 && h_bytes % 4 == 0 && h_stored_bytes == h_bytes,
+            h_bytes > 0 && h_bytes.is_multiple_of(4) && h_stored_bytes == h_bytes,
             "indexed SSM requires live FP32 H storage"
         );
         ensure!(
-            conv_bytes > 0 && conv_bytes % 4 == 0,
+            conv_bytes > 0 && conv_bytes.is_multiple_of(4),
             "invalid FP32 convolution stride"
         );
         ensure!(
