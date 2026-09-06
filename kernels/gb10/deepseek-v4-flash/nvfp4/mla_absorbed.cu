@@ -124,7 +124,7 @@ extern "C" __global__ void mla_batched_gemv(
     }
 }
 
-// Exact-row twins used by GLM-5's C2/C3 decode and K=5 MTP verify paths.
+// Exact-row twins used by GLM-5's C2/C3/C4 decode and K=5 MTP verify paths.
 // Activations share the same per-head weight matrix, so each loaded weight
 // feeds all row accumulators instead of being fetched by independent launches.
 //
@@ -253,6 +253,10 @@ extern "C" __global__ void mla_batched_gemv_batch2(MLA_BATCH_ARGS) {
 
 extern "C" __global__ void mla_batched_gemv_batch3(MLA_BATCH_ARGS) {
     MLA_BATCH_CALL(3);
+}
+
+extern "C" __global__ void mla_batched_gemv_batch4(MLA_BATCH_ARGS) {
+    MLA_BATCH_CALL(4);
 }
 
 extern "C" __global__ void mla_batched_gemv_batch5(MLA_BATCH_ARGS) {

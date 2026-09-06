@@ -25,6 +25,54 @@ fn enabled() -> bool {
     std::env::var("ATLAS_GLM_MLA_MULTI_SEQ").ok().as_deref() == Some("1")
 }
 
+fn batch4_kernel(
+    rows: usize,
+    requested: bool,
+    c4: bool,
+    kernel: KernelHandle,
+) -> Result<KernelHandle> {
+    if !requested {
+        return Ok(KernelHandle(0));
+    }
+    ensure!(
+        c4,
+        "ATLAS_GLM_MLA_BATCH4=1 requires validated GLM C4 decode"
+    );
+    if rows != 4 {
+        return Ok(KernelHandle(0));
+    }
+    ensure!(kernel.0 != 0, "GLM MLA batch4 kernel is unavailable");
+    Ok(kernel)
+}
+
+#[cfg(test)]
+mod batch4_tests {
+    use super::*;
+
+    #[test]
+    fn batch4_is_opt_in_and_never_changes_other_widths() {
+        for rows in 1..=5 {
+            assert_eq!(
+                batch4_kernel(rows, false, false, KernelHandle(0))
+                    .unwrap()
+                    .0,
+                0
+            );
+            assert_eq!(
+                batch4_kernel(rows, true, true, KernelHandle(42)).unwrap().0,
+                if rows == 4 { 42 } else { 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn batch4_requires_c4_and_a_live_exact_row_kernel() {
+        assert!(batch4_kernel(4, true, false, KernelHandle(42)).is_err());
+        assert!(batch4_kernel(3, true, false, KernelHandle(42)).is_err());
+        assert!(batch4_kernel(4, true, true, KernelHandle(0)).is_err());
+    }
+}
+
 impl Qwen3AttentionLayer {
     pub(super) fn glm_mla_multi_seq_eligible(&self, c: &MultiSeqCtx<'_>, mla: &MlaWeights) -> bool {
         (enabled() || glm_multi_seq_sparse_enabled(&c.fwd.config.model_type))
@@ -112,6 +160,12 @@ impl Qwen3AttentionLayer {
             self.glm_mla_multi_seq_eligible(c, mla),
             "GLM MLA batched path called for an unsupported MLA shape"
         );
+        let batch4 = batch4_kernel(
+            c.n,
+            std::env::var("ATLAS_GLM_MLA_BATCH4").as_deref() == Ok("1"),
+            crate::model::glm_c4::enabled(&c.fwd.config.model_type),
+            self.mla_batched_gemv_batch4_k,
+        )?;
         let sparse = glm_multi_seq_sparse_enabled(&c.fwd.config.model_type);
         if sparse {
             self.validate_glm_multi_seq_sparse(c, kv_cache, meta, mla)?;
@@ -223,6 +277,7 @@ impl Qwen3AttentionLayer {
         let batched_kernel = match c.n {
             2 if batch23 => self.mla_batched_gemv_batch2_k,
             3 if batch23 => self.mla_batched_gemv_batch3_k,
+            4 => batch4,
             5 => self.mla_batched_gemv_batch5_k,
             _ => KernelHandle(0),
         };

@@ -244,6 +244,8 @@ pub struct Qwen3AttentionLayer {
     /// Exact two/three-row MLA GEMV for independent GLM-5 decode sessions.
     pub(super) mla_batched_gemv_batch2_k: KernelHandle,
     pub(super) mla_batched_gemv_batch3_k: KernelHandle,
+    /// Opt-in exact four-row MLA GEMV for independent short GLM decode.
+    pub(super) mla_batched_gemv_batch4_k: KernelHandle,
     /// Exact five-row MLA GEMV for GLM-5 K=5 speculative verification.
     pub(super) mla_batched_gemv_batch5_k: KernelHandle,
     /// MLA fused kernels — decode.

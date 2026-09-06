@@ -52,6 +52,7 @@ KDA_BATCHED_FFN="${KDA_BATCHED_FFN:-1}"
 KDA_MS_PROFILE="${KDA_MS_PROFILE:-0}"
 MLA_MULTI_SEQ="${MLA_MULTI_SEQ:-1}"
 GLM_MLA_BATCH23="${GLM_MLA_BATCH23:-0}"
+GLM_MLA_BATCH4="${GLM_MLA_BATCH4:-0}"
 GLM_C3_GROUPED_MOE="${GLM_C3_GROUPED_MOE:-0}"
 GLM_C4_DECODE="${GLM_C4_DECODE:-0}"
 GLM_C4_GROUPED_MOE="${GLM_C4_GROUPED_MOE:-0}"
@@ -201,6 +202,14 @@ if [[ "$MLA_MULTI_SEQ" != "0" && "$MLA_MULTI_SEQ" != "1" ]]; then
 fi
 if [[ "$GLM_MLA_BATCH23" != "0" && "$GLM_MLA_BATCH23" != "1" ]]; then
   echo "ERROR: GLM_MLA_BATCH23 must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_MLA_BATCH4" != "0" && "$GLM_MLA_BATCH4" != "1" ]]; then
+  echo "ERROR: GLM_MLA_BATCH4 must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_MLA_BATCH4" == "1" && "$GLM_C4_DECODE" != "1" ]]; then
+  echo "ERROR: GLM_MLA_BATCH4=1 requires GLM_C4_DECODE=1." >&2
   exit 2
 fi
 if [[ "$GLM_C3_GROUPED_MOE" != "0" && "$GLM_C3_GROUPED_MOE" != "1" ]]; then
@@ -559,6 +568,7 @@ echo "  KDA multi-sequence decode: $KDA_MULTI_SEQ"
 echo "  KDA batched FFN: $KDA_BATCHED_FFN"
 echo "  GLM MLA multi-sequence decode: $MLA_MULTI_SEQ"
 echo "  GLM MLA batched two/three-row chain: $GLM_MLA_BATCH23"
+echo "  GLM MLA batched four-row chain: $GLM_MLA_BATCH4"
 echo "  experimental GLM C3 native-FP4 grouped MoE: $GLM_C3_GROUPED_MOE"
 echo "  experimental GLM concurrent semantic indexing: $GLM_MULTI_SEQ_SPARSE"
 echo "  experimental device-length C2/C3 graphs: $GLM_MULTI_SEQ_SPARSE_GRAPHS"
@@ -667,6 +677,7 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_GLM_INDEX_ROW_GROUP=$GLM_INDEX_ROW_GROUP \
   -e ATLAS_GLM_INDEX_WMMA=$GLM_INDEX_WMMA \
   -e ATLAS_GLM_MLA_BATCH23=$GLM_MLA_BATCH23 \
+  -e ATLAS_GLM_MLA_BATCH4=$GLM_MLA_BATCH4 \
   -e ATLAS_GLM_C3_GROUPED_MOE=$GLM_C3_GROUPED_MOE \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE=$GLM_MULTI_SEQ_SPARSE \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS=$GLM_MULTI_SEQ_SPARSE_GRAPHS \
@@ -748,6 +759,7 @@ docker run -d \
   -e ATLAS_GLM_INDEX_ROW_GROUP="$GLM_INDEX_ROW_GROUP" \
   -e ATLAS_GLM_INDEX_WMMA="$GLM_INDEX_WMMA" \
   -e ATLAS_GLM_MLA_BATCH23="$GLM_MLA_BATCH23" \
+  -e ATLAS_GLM_MLA_BATCH4="$GLM_MLA_BATCH4" \
   -e ATLAS_GLM_C3_GROUPED_MOE="$GLM_C3_GROUPED_MOE" \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE="$GLM_MULTI_SEQ_SPARSE" \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS="$GLM_MULTI_SEQ_SPARSE_GRAPHS" \

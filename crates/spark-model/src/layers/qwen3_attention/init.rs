@@ -431,6 +431,12 @@ impl Qwen3AttentionLayer {
                 "mla_absorbed",
                 "mla_batched_gemv_batch3",
             ),
+            mla_batched_gemv_batch4_k: gate(
+                probes.glm_kpool_indexer,
+                gpu,
+                "mla_absorbed",
+                "mla_batched_gemv_batch4",
+            ),
             mla_batched_gemv_batch5_k: gate(
                 probes.mla,
                 gpu,

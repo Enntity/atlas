@@ -22,13 +22,32 @@
 } while (0)
 
 template <typename T> struct Buffer {
+    static constexpr size_t guard = 128 / sizeof(T);
+    T* allocation;
     T* ptr;
-    explicit Buffer(size_t count) { CUDA_CHECK(cudaMalloc(&ptr, count * sizeof(T))); }
-    ~Buffer() { cudaFree(ptr); }
+    size_t count;
+    explicit Buffer(size_t count_) : count(count_) {
+        CUDA_CHECK(cudaMalloc(&allocation, (count + 2 * guard) * sizeof(T)));
+        CUDA_CHECK(cudaMemset(allocation, 0xa5, (count + 2 * guard) * sizeof(T)));
+        ptr = allocation + guard;
+    }
+    ~Buffer() { cudaFree(allocation); }
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     void copy(const std::vector<T>& src) {
+        if (src.size() != count) std::exit(3);
         CUDA_CHECK(cudaMemcpy(ptr, src.data(), src.size() * sizeof(T), cudaMemcpyHostToDevice));
+    }
+    void guards() const {
+        unsigned char before[128], after[128];
+        CUDA_CHECK(cudaMemcpy(before, allocation, 128, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(after, ptr + count, 128, cudaMemcpyDeviceToHost));
+        for (unsigned i = 0; i < 128; ++i) {
+            if (before[i] != 0xa5 || after[i] != 0xa5) {
+                std::fprintf(stderr, "FAIL: allocation guard overwritten\n");
+                std::exit(3);
+            }
+        }
     }
 };
 
@@ -43,7 +62,13 @@ static void run(unsigned rows, unsigned heads, unsigned n, unsigned k,
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::vector<__nv_bfloat16> input(size_t(rows) * input_row_stride);
     std::vector<__nv_bfloat16> weight(size_t(heads) * n * k);
-    for (auto& value : input) value = __float2bfloat16(dist(rng));
+    const unsigned short poison = 0x7fc1;
+    for (auto& value : input) std::memcpy(&value, &poison, 2);
+    for (unsigned row = 0; row < rows; ++row)
+        for (unsigned head = 0; head < heads; ++head)
+            for (unsigned d = 0; d < k; ++d)
+                input[size_t(row) * input_row_stride + head * input_head_stride + d] =
+                    __float2bfloat16(dist(rng));
     for (auto& value : weight) value = __float2bfloat16(dist(rng));
     Buffer<__nv_bfloat16> di(input.size()), dw(weight.size());
     Buffer<__nv_bfloat16> baseline(output_elements), candidate(output_elements);
@@ -65,6 +90,9 @@ static void run(unsigned rows, unsigned heads, unsigned n, unsigned k,
         } else if (rows == 3) {
             mla_batched_gemv_batch3<<<grid, 256>>>(di.ptr, dw.ptr, candidate.ptr,
                 n, k, input_head_stride, output_head_stride, input_row_stride, output_row_stride);
+        } else if (rows == 4) {
+            mla_batched_gemv_batch4<<<grid, 256>>>(di.ptr, dw.ptr, candidate.ptr,
+                n, k, input_head_stride, output_head_stride, input_row_stride, output_row_stride);
         } else {
             mla_batched_gemv_batch5<<<grid, 256>>>(di.ptr, dw.ptr, candidate.ptr,
                 n, k, input_head_stride, output_head_stride, input_row_stride, output_row_stride);
@@ -83,9 +111,10 @@ static void run(unsigned rows, unsigned heads, unsigned n, unsigned k,
         const unsigned in_row = i % output_row_stride;
         const bool live = in_row < heads * output_head_stride && in_row % output_head_stride < n;
         if (!live) {
-            unsigned short bits;
-            std::memcpy(&bits, &b[i], sizeof(bits));
-            if (bits != 0xffff) ++guard_errors;
+            unsigned short bits_a, bits_b;
+            std::memcpy(&bits_a, &a[i], sizeof(bits_a));
+            std::memcpy(&bits_b, &b[i], sizeof(bits_b));
+            if (bits_a != 0xffff || bits_b != 0xffff) ++guard_errors;
             continue;
         }
         if (std::memcmp(&a[i], &b[i], sizeof(a[i]))) ++mismatches;
@@ -98,7 +127,10 @@ static void run(unsigned rows, unsigned heads, unsigned n, unsigned k,
     float max_reference_error = 0.0f;
     for (unsigned row = 0; row < rows; ++row) {
         for (unsigned head = 0; head < heads; ++head) {
-            for (unsigned col : {0u, n / 2, n - 1}) {
+            // Exhaustive CPU dots for the new M4 path; retain sampled columns
+            // for existing M2/M3/M5 regression coverage.
+            for (unsigned col = 0; col < n; ++col) {
+                if (rows != 4 && col != 0 && col != n / 2 && col != n - 1) continue;
                 double expected = 0.0;
                 for (unsigned d = 0; d < k; ++d)
                     expected += double(__bfloat162float(input[size_t(row) * input_row_stride
@@ -118,6 +150,38 @@ static void run(unsigned rows, unsigned heads, unsigned n, unsigned k,
     if (mismatches || guard_errors) {
         std::printf(" FAIL\n");
         std::exit(2);
+    }
+    if (rows == 4) {
+        // Same allocations and weights, two nontrivial row permutations.
+        // Compare full rows (including padding) with the canonical result;
+        // this also verifies that pointer/row identity is not cached in CUDA.
+        for (const auto& order : {std::vector<unsigned>{3, 1, 0, 2},
+                                  std::vector<unsigned>{2, 0, 3, 1}}) {
+            auto permuted = input;
+            for (unsigned row = 0; row < rows; ++row)
+                std::copy_n(input.begin() + size_t(order[row]) * input_row_stride,
+                            input_row_stride, permuted.begin() + size_t(row) * input_row_stride);
+            di.copy(permuted);
+            CUDA_CHECK(cudaMemset(baseline.ptr, 0xff, output_elements * sizeof(__nv_bfloat16)));
+            CUDA_CHECK(cudaMemset(candidate.ptr, 0xff, output_elements * sizeof(__nv_bfloat16)));
+            launch(false); launch(true);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::vector<__nv_bfloat16> pa(output_elements), pb(output_elements);
+            CUDA_CHECK(cudaMemcpy(pa.data(), baseline.ptr, pa.size() * 2, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(pb.data(), candidate.ptr, pb.size() * 2, cudaMemcpyDeviceToHost));
+            for (unsigned row = 0; row < rows; ++row) {
+                const auto* expected = b.data() + size_t(order[row]) * output_row_stride;
+                const size_t offset = size_t(row) * output_row_stride;
+                if (std::memcmp(expected, pa.data() + offset, output_row_stride * 2) ||
+                    std::memcmp(expected, pb.data() + offset, output_row_stride * 2)) {
+                    std::fprintf(stderr, " FAIL: M4 row permutation mismatch at row%u\n", row);
+                    std::exit(2);
+                }
+            }
+            di.guards(); dw.guards(); baseline.guards(); candidate.guards();
+        }
+        di.copy(input);
+        std::printf(" permutations=2_BITEXACT");
     }
     if (repetitions) {
         for (unsigned i = 0; i < 10; ++i) { launch(false); launch(true); }
@@ -153,6 +217,7 @@ static void run(unsigned rows, unsigned heads, unsigned n, unsigned k,
         CUDA_CHECK(cudaEventDestroy(start));
         CUDA_CHECK(cudaEventDestroy(end));
     }
+    di.guards(); dw.guards(); baseline.guards(); candidate.guards();
     std::printf(" PASS\n");
 }
 
@@ -162,7 +227,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "repetitions must be <=1000\n");
         return 1;
     }
-    for (unsigned rows : {2u, 3u, 5u}) {
+    for (unsigned rows : {2u, 3u, 4u, 5u}) {
         run(rows, 3, 8, 8, true, 0);
         run(rows, 32, 512, 256, true, 0);
         run(rows, 32, 256, 512, true, 0);
