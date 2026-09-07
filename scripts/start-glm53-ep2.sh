@@ -119,6 +119,13 @@ GLM_MTP_KV_REPAIR_VERIFY="${GLM_MTP_KV_REPAIR_VERIFY:-0}"
 MTP_PREFILL_ONLY="${MTP_PREFILL_ONLY:-0}"
 GLM_MOE_GATE_UP_M16="${GLM_MOE_GATE_UP_M16:-0}"
 GLM_MOE_GATE_UP_M16_VERIFY="${GLM_MOE_GATE_UP_M16_VERIFY:-0}"
+# Independent, arithmetic-preserving M5 projection experiments; default-off.
+GLM_M5_ROUTER_BN4="${GLM_M5_ROUTER_BN4:-0}"
+GLM_M5_ROUTER_BN4_VERIFY="${GLM_M5_ROUTER_BN4_VERIFY:-0}"
+GLM_M5_SHARED_M16="${GLM_M5_SHARED_M16:-0}"
+GLM_M5_SHARED_M16_VERIFY="${GLM_M5_SHARED_M16_VERIFY:-0}"
+# Host-only first-eight-proposal diagnostic, never a throughput setting.
+GLM_MTP_K5_LEDGER="${GLM_MTP_K5_LEDGER:-0}"
 # One in-place all-gather replaces the two synchronous half-vocabulary
 # broadcasts whenever the split-vocabulary proposer is selected.
 GLM_MTP_ALL_GATHER="${GLM_MTP_ALL_GATHER:-$GLM_MTP_DISTRIBUTED}"
@@ -150,7 +157,7 @@ GLM_MTP_SERIAL_PREFILL="${GLM_MTP_SERIAL_PREFILL:-0}"
 # The serial path remains an explicit correctness/debugging oracle.
 GLM_MTP_BATCHED_PREFILL="${GLM_MTP_BATCHED_PREFILL:-$SPECULATIVE}"
 
-for glm_checked_flag in GLM_MTP_REPAIR GLM_MTP_KV_REPAIR_VERIFY MTP_PREFILL_ONLY GLM_MOE_GATE_UP_M16 GLM_MOE_GATE_UP_M16_VERIFY; do
+for glm_checked_flag in GLM_MTP_REPAIR GLM_MTP_KV_REPAIR_VERIFY MTP_PREFILL_ONLY GLM_MOE_GATE_UP_M16 GLM_MOE_GATE_UP_M16_VERIFY GLM_M5_ROUTER_BN4 GLM_M5_ROUTER_BN4_VERIFY GLM_M5_SHARED_M16 GLM_M5_SHARED_M16_VERIFY GLM_MTP_K5_LEDGER; do
   if [[ "${!glm_checked_flag}" != "0" && "${!glm_checked_flag}" != "1" ]]; then
     echo "ERROR: $glm_checked_flag must be 0 or 1." >&2
     exit 2
@@ -172,6 +179,19 @@ if [[ "$GLM_MOE_GATE_UP_M16_VERIFY" == "1" && "$GLM_MOE_GATE_UP_M16" != "1" ]]; 
   echo "ERROR: GLM_MOE_GATE_UP_M16_VERIFY requires GLM_MOE_GATE_UP_M16=1." >&2
   exit 2
 fi
+for glm_m5_feature in GLM_M5_ROUTER_BN4 GLM_M5_SHARED_M16; do
+  glm_m5_oracle="${glm_m5_feature}_VERIFY"
+  if [[ "${!glm_m5_oracle}" == "1" ]]; then
+    if [[ "${!glm_m5_feature}" != "1" ]]; then
+      echo "ERROR: $glm_m5_oracle requires $glm_m5_feature=1." >&2
+      exit 2
+    fi
+    if [[ "$GLM_TP_VERIFY_GRAPH" != "0" ]]; then
+      echo "ERROR: $glm_m5_oracle requires GLM_TP_VERIFY_GRAPH=0 for the eager diagnostic." >&2
+      exit 2
+    fi
+  fi
+done
 
 MODEL_MAX_SEQ_LEN=1048576
 if (( MAX_SEQ_LEN > MODEL_MAX_SEQ_LEN )); then
@@ -660,6 +680,9 @@ echo "  GLM MTP decode-native NVFP4 MLA o_proj: $GLM_MTP_NVFP4_WO"
 echo "  GLM mirrored-body split-vocabulary MTP: $GLM_MTP_DISTRIBUTED"
 echo "  GLM accepted-pair repair / oracle / cold prefill-only: $GLM_MTP_REPAIR / $GLM_MTP_KV_REPAIR_VERIFY / $MTP_PREFILL_ONLY"
 echo "  GLM M16 gate/up / oracle: $GLM_MOE_GATE_UP_M16 / $GLM_MOE_GATE_UP_M16_VERIFY"
+echo "  GLM M5 router BN4 / oracle: $GLM_M5_ROUTER_BN4 / $GLM_M5_ROUTER_BN4_VERIFY"
+echo "  GLM M5 shared M16 / oracle: $GLM_M5_SHARED_M16 / $GLM_M5_SHARED_M16_VERIFY"
+echo "  GLM MTP first-eight K5 ledger: $GLM_MTP_K5_LEDGER"
 echo "  GLM MTP one-collective vocabulary gather: $GLM_MTP_ALL_GATHER"
 echo "  GLM MTP distributed top-1 reduction: $GLM_MTP_DISTRIBUTED_ARGMAX"
 echo "  GLM K5 exact-M5 BF16 router: $GLM_K5_ROUTER_M5"
@@ -755,6 +778,11 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_MTP_DRAFTER_CONTEXT_PREFILL_ONLY_UNSAFE=$MTP_PREFILL_ONLY \
   -e ATLAS_GLM_MOE_GATE_UP_M16=$GLM_MOE_GATE_UP_M16 \
   -e ATLAS_GLM_MOE_GATE_UP_M16_VERIFY=$GLM_MOE_GATE_UP_M16_VERIFY \
+  -e ATLAS_GLM_M5_ROUTER_BN4=$GLM_M5_ROUTER_BN4 \
+  -e ATLAS_GLM_M5_ROUTER_BN4_VERIFY=$GLM_M5_ROUTER_BN4_VERIFY \
+  -e ATLAS_GLM_M5_SHARED_M16=$GLM_M5_SHARED_M16 \
+  -e ATLAS_GLM_M5_SHARED_M16_VERIFY=$GLM_M5_SHARED_M16_VERIFY \
+  -e ATLAS_GLM_MTP_K5_LEDGER=$GLM_MTP_K5_LEDGER \
   -e ATLAS_GLM_MTP_ALL_GATHER=$GLM_MTP_ALL_GATHER \
   -e ATLAS_GLM_MTP_DISTRIBUTED_ARGMAX=$GLM_MTP_DISTRIBUTED_ARGMAX \
   -e ATLAS_GLM_K5_ROUTER_M5=$GLM_K5_ROUTER_M5 \
@@ -844,6 +872,11 @@ docker run -d \
   -e ATLAS_MTP_DRAFTER_CONTEXT_PREFILL_ONLY_UNSAFE="$MTP_PREFILL_ONLY" \
   -e ATLAS_GLM_MOE_GATE_UP_M16="$GLM_MOE_GATE_UP_M16" \
   -e ATLAS_GLM_MOE_GATE_UP_M16_VERIFY="$GLM_MOE_GATE_UP_M16_VERIFY" \
+  -e ATLAS_GLM_M5_ROUTER_BN4="$GLM_M5_ROUTER_BN4" \
+  -e ATLAS_GLM_M5_ROUTER_BN4_VERIFY="$GLM_M5_ROUTER_BN4_VERIFY" \
+  -e ATLAS_GLM_M5_SHARED_M16="$GLM_M5_SHARED_M16" \
+  -e ATLAS_GLM_M5_SHARED_M16_VERIFY="$GLM_M5_SHARED_M16_VERIFY" \
+  -e ATLAS_GLM_MTP_K5_LEDGER="$GLM_MTP_K5_LEDGER" \
   -e ATLAS_GLM_MTP_ALL_GATHER="$GLM_MTP_ALL_GATHER" \
   -e ATLAS_GLM_MTP_DISTRIBUTED_ARGMAX="$GLM_MTP_DISTRIBUTED_ARGMAX" \
   -e ATLAS_GLM_K5_ROUTER_M5="$GLM_K5_ROUTER_M5" \
