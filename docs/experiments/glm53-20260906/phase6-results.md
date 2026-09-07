@@ -119,6 +119,12 @@ This is text equality, not a token-ID or broad semantic quality claim.
 The same target output despite varying acceptance motivates a bounded
 proposal-path determinism audit. Goal still open; confirming repeat pending.
 
+Separately restoring BF16 WO while keeping BF16 EH gives full-wall runs
+28.816,27.024,24.160: median27.024, post-first28.266, all256 caps and identical
+text fingerprints. All four strict answers pass. This does not improve the
+27.258 EH-only median, and its spread is wider; retain it as a negative result,
+not a new promoted setting. Both earlier control containers remain recoverable.
+
 ## Accepted-history foundation and safety receipts
 
 `9c54d24c` adds checked GLM pair planning; `8bd85db1` extracts the existing
@@ -256,6 +262,51 @@ each shape/width. These are warm standalone weights, not endpoint gains.
 The shared kernel preserves the original BF16-A/E4M3-B conversion and K32
 MMA order; it is not a routed W4A4 replacement. Production integration and
 resident-model oracles remain pending, with explicit default-off selection.
+
+## Predecoded shared FP8, standalone only
+
+`67a7da3d` compares the actual existing converter and FP8 M64 kernel, plus a
+test-only FP8 M16, against original W4A16 M64 using the same logical weights.
+Every predecoded byte matches an independent E4M3 conversion oracle, including
+scale2, both nibbles, signed zero, subnormal scales and saturation. Full BF16
+outputs match bit-for-bit at M0/1/4/5/16 for separate gate/up/down fixtures;
+CPU columns, refreshed graphs, immutable inputs/weights and canaries pass.
+Both FMA-policy memchecks report0 errors. Explicit device peak18,286,848 bytes.
+
+Three clean repeats show M5 gate/up roughly148us ->49us with existing FP8 M64,
+or41us with FP8 M16; down roughly76us ->27us or23us. Predecode is outside the
+GEMM timing. This hot-weight fixture does not forecast full-model throughput.
+Target-only caching retains the existing originals/transposes and adds exactly
+1008MiB per rank across42 replicated shared experts. Logical weight traffic
+increases16/9 times, while conversion work and a K32-stage barrier disappear.
+Prioritize a validated once-at-load M64-cache integration and cold-model A/B,
+with actual allocation-peak/headroom checks; no model cache has been allocated
+by this standalone work. M16 FP8 is a separate follow-up, not yet production.
+
+The separate large-prefill profile `227828de` compares only existing W4A16
+M64 and FP8 M64 at63/64/65/148/1024 rows, with no M16 allocation or launch.
+Both FMA-policy native gates pass all full-output/byte/CPU-column/graph-refresh/
+immutable/canary checks, and both memchecks report0 errors. Exact peak explicit
+device allocation38,799,360 bytes is below64MiB; fixtures run sequentially with
+model services and native compilers stopped. This qualifies the standalone
+prefill range for a cache experiment, not the model integration or its TPS.
+
+## Bounded proposal trace
+
+Server source `0787e7e8` adds a default-off host-only first-eight K5 ledger per
+native-GLM request. It records position, seed, four drafts, five raw verifier
+IDs, five selected IDs and accepted count before terminal emission changes
+the request. Fixed arrays only; no new GPU operation or sampling changes.
+Actual scheduler ON/OFF tests cover accepted0..4, terminal truncation and
+diagnostic errors. The full serial CPU server suite passes2349 tests with
+12 ignored; this is not a full serve-matrix claim.
+
+Trace-only image v17 compiles committed Rust in1m22s with the4GiB CPU builder,
+`exited0/OOMKilled=false`. Both nodes' packaged binary SHA256 is
+`f598482bc9d2502c2ad3fabb791b64eadbdb0aff5f22fe49d218d014d06ad210`.
+An initial packaging attempt referenced nonexistent `Dockerfile` and stopped;
+the corrected `Dockerfile.runtime` build succeeded before launch. No stale
+binary was served. Numerical kernel/cache work remains separate and default-off.
 
 The initial v15 CPU build hit its own4GiB container limit while an archive
 timestamp change unnecessarily triggered CUTLASS recompilation. Builder
