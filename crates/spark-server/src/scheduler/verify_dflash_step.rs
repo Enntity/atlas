@@ -4,6 +4,9 @@
 
 use super::*;
 
+#[path = "verify_dflash_ledger.rs"]
+pub(super) mod ledger;
+
 #[cfg(test)]
 #[path = "verify_dflash_repair_tests.rs"]
 mod repair_tests;
@@ -28,7 +31,34 @@ pub fn step_verify_dflash(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
+    let ledger_enabled = ledger::enabled_for(&a.seq);
+    step_verify_dflash_inner(
+        model,
+        a,
+        sched,
+        drafts,
+        num_drafts,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+        ledger_enabled,
+    );
+}
+
+// Keep diagnostic eligibility outside the inference body: tests can exercise
+// the actual host-only K5 path without changing process-wide environment.
+#[allow(clippy::too_many_arguments)]
+fn step_verify_dflash_inner(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    drafts: &[u32],
+    num_drafts: usize,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    dflash_verify_raw_argmax: bool,
+    ledger_enabled: bool,
+) {
     let _step_timer = crate::scheduler::mtp_timing::StepTimer::new(&sched.timing, a.seq.seq_len);
+    let ledger_position = a.seq.seq_len;
 
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
@@ -85,6 +115,21 @@ pub fn step_verify_dflash(
     };
     a.last_token_time = Instant::now();
 
+    // Preserve only the diagnostic's fixed five IDs before the existing
+    // selection branch may move the Vec. Disabled/exhausted paths copy none.
+    let ledger_capture = if ledger_enabled {
+        a.mtp_acct.glm_k5_ledger.prepare(
+            true,
+            ledger_position,
+            a.last_token,
+            drafts,
+            &verified_argmax,
+            model.vocab_size(),
+        )
+    } else {
+        None
+    };
+
     // DFlash drafter proposes on raw argmax; when dflash_verify_raw_argmax is set
     // (process-wide DFlash mode), skip the rep_pen/DRY pipeline so verifier and
     // drafter judge on the SAME (GOLD) basis. For non-DFlash callers (unreachable
@@ -122,6 +167,14 @@ pub fn step_verify_dflash(
         } else {
             break;
         }
+    }
+
+    if let Some(record) = a
+        .mtp_acct
+        .glm_k5_ledger
+        .finish(ledger_capture, &verified, num_accepted)
+    {
+        ledger::emit(a.seq.slot_idx, &record);
     }
 
     if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {

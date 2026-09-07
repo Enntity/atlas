@@ -195,6 +195,15 @@ impl Model for Target {
 }
 
 fn run(accepted: usize, remaining: usize, record_error: bool) -> (ActiveSeq, Vec<&'static str>) {
+    run_with_ledger(accepted, remaining, record_error, false)
+}
+
+fn run_with_ledger(
+    accepted: usize,
+    remaining: usize,
+    record_error: bool,
+    ledger_enabled: bool,
+) -> (ActiveSeq, Vec<&'static str>) {
     let target = Target {
         accepted,
         record_error,
@@ -220,17 +229,100 @@ fn run(accepted: usize, remaining: usize, record_error: bool) -> (ActiveSeq, Vec
         tool_call_start_token: None,
         tool_call_end_token: None,
     };
-    step_verify_dflash(
-        &target,
-        &mut a,
-        &sched,
-        &[10, 11, 12, 13],
-        4,
-        &verify_ctx,
-        true,
-    );
+    if ledger_enabled {
+        step_verify_dflash_inner(
+            &target,
+            &mut a,
+            &sched,
+            &[10, 11, 12, 13],
+            4,
+            &verify_ctx,
+            true,
+            true,
+        );
+    } else {
+        step_verify_dflash(
+            &target,
+            &mut a,
+            &sched,
+            &[10, 11, 12, 13],
+            4,
+            &verify_ctx,
+            true,
+        );
+    }
     let calls = target.calls.into_inner().unwrap();
     (a, calls)
+}
+
+#[test]
+fn k5_ledger_actual_runtime_records_before_terminal_and_preserves_calls() {
+    for accepted in 0..=4 {
+        for (remaining, record_error) in [(20, false), (1, false), (20, true)] {
+            let (control, control_calls) =
+                run_with_ledger(accepted, remaining, record_error, false);
+            let (mut traced, traced_calls) =
+                run_with_ledger(accepted, remaining, record_error, true);
+            assert_eq!(control.mtp_acct.glm_k5_ledger.emitted(), 0);
+            assert_eq!(traced.mtp_acct.glm_k5_ledger.emitted(), 1);
+            assert_eq!(traced_calls, control_calls);
+            assert_eq!(traced.finished, control.finished);
+            assert_eq!(traced.remaining, control.remaining);
+            assert_eq!(traced.output_tokens, control.output_tokens);
+            assert_eq!(traced.seq.tokens, control.seq.tokens);
+            assert_eq!(traced.seq.seq_len, control.seq.seq_len);
+            assert_eq!(traced.pending_drafts, control.pending_drafts);
+            let snapshot = traced.mtp_acct;
+            traced.mtp_acct = Default::default();
+            assert_eq!(snapshot.glm_k5_ledger.emitted(), 1);
+            assert_eq!(traced.mtp_acct.glm_k5_ledger.emitted(), 0);
+        }
+    }
+}
+
+#[test]
+fn k5_ledger_terminal_runtime_log_contains_host_verdict_not_text() {
+    use std::io::Write;
+    use std::sync::Arc;
+    #[derive(Clone)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer = Writer(bytes.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let (a, calls) = run_with_ledger(4, 1, false, true);
+        assert!(a.finished);
+        assert_eq!(calls, ["verify", "record"]);
+    });
+    let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let records: Vec<_> = output
+        .lines()
+        .filter(|line| line.contains("K5_LEDGER"))
+        .collect();
+    assert_eq!(records.len(), 1, "{output}");
+    let record = records[0];
+    assert!(record.contains("ordinal=1 position=3 seed=7"), "{record}");
+    assert!(record.contains("drafts=[10, 11, 12, 13]"), "{record}");
+    assert!(record.contains("raw=[10, 11, 12, 13, 99]"), "{record}");
+    assert!(
+        record.contains("selected=[10, 11, 12, 13, 99] accepted=4"),
+        "{record}"
+    );
+    assert!(!record.contains("prompt=") && !record.contains("text="));
 }
 
 #[test]
