@@ -4,6 +4,12 @@ The user target remains >=30 C1 or >=60 aggregate C4 tokens/s, measured by
 the existing coding148/256 full-wall median, not summed per-session rates.
 This plan specifies the next candidate's checks; it is not a passed receipt.
 
+The existing four-answer validator will expose explicit concurrency1 or4 and
+the already tested context2044 envelope. Add parser regression tests first;
+keep the default C4 behavior and all answer validators/payloads unchanged.
+C1 runs the same four requests sequentially with a one-party start barrier,
+so a constrained deployment is never accidentally sent four active requests.
+
 ## Frozen artifacts and recovery
 
 Root controls all native operations. Keep both v15 C1 control containers

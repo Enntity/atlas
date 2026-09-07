@@ -72,6 +72,17 @@ not default promotion. The fixture contains only four distinct local pairs
 larger real expert working sets, downstream operations and graph-on model
 throughput remain unmeasured. Keep down and all quantization policies fixed.
 
+Production-source extraction/guarded selection committed as `502cda12`.
+Recompiled standalone fixtures against that actual production translation
+unit: C4/K5 gate/up and unchanged test-only down passed again, including four
+zero-error memchecks. The new three-pair gate/up timing receipt has23/24
+useful builder-inclusive wins (C4 median1.031298, K5 median1.043205); the
+smallest C4 ratio is0.999296. Kernel-only comparisons24/24 win, medians
+1.040765/1.045365. Preserve this newer variability rather than treating the
+earlier24/24 result as universal. All services and CPU builders were stopped
+for these timings. Resident-model selection/oracle and end-to-end A/B remain
+pending; the production switch is default-off.
+
 ## Accepted-history foundation and safety receipts
 
 `9c54d24c` adds checked GLM pair planning; `8bd85db1` extracts the existing
@@ -79,6 +90,13 @@ BF16 KV-only primer into a checked arbitrary-row writer. They are not in
 v15 and do not yet repair accepted history. Combined model CPU suite751/751
 passes (nine pair-plan and six KV-writer tests added). Both received
 independent source review. Runtime integration is a separate candidate.
+
+Runtime repair plus resident BF16 KV diagnostic committed as `14a47186`,
+after independent review. Final CPU receipts: model771/771, server2342 passed
+with12 ignored, launcher9/9. The server suite requires the known serial/color
+test environment; an initial parallel run retained four unrelated TUI color
+failures before the corrected complete run. No UI code was changed. Native
+repair quality, accepted-count and throughput attribution remain pending.
 
 The initial v15 CPU build hit its own4GiB container limit while an archive
 timestamp change unnecessarily triggered CUTLASS recompilation. Builder

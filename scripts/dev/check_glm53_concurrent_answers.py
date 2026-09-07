@@ -42,10 +42,18 @@ ANSWERS = ("432", "ash,dogwood,birch,cedar", "def square(n):\n    return n*n",
 class ValidatorTests(unittest.TestCase):
     def test_context_receipt_accepts_only_tested_profiles(self):
         self.assertEqual(parse_args([]).context_limit, 2048)
+        self.assertEqual(parse_args(["--context-limit", "2044"]).context_limit, 2044)
         self.assertEqual(parse_args(["--context-limit", "16384"]).context_limit, 16384)
         for invalid in ["0", "4096", "32768"]:
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parse_args(["--context-limit", invalid])
+
+    def test_concurrency_is_explicit_and_keeps_existing_default(self):
+        self.assertEqual(parse_args([]).concurrency, 4)
+        self.assertEqual(parse_args(["--concurrency", "1"]).concurrency, 1)
+        for invalid in ["0", "2", "3", "8"]:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse_args(["--concurrency", invalid])
 
     def test_payload_reserves_visible_answer_budget(self):
         for index in range(4):
@@ -161,8 +169,10 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8888")
     parser.add_argument("--model", default="/var/tmp/models/glm53-flash-nvfp4")
-    parser.add_argument("--context-limit", type=int, choices=[2048, 16384], default=2048,
+    parser.add_argument("--context-limit", type=int, choices=[2044, 2048, 16384], default=2048,
                         help="must match the restarted server's bounded context cap")
+    parser.add_argument("--concurrency", type=int, choices=[1, 4], default=4,
+                        help="run the same four checks sequentially at C1 or together at C4")
     parser.add_argument("--self-test", action="store_true", help="CPU only; no HTTP requests")
     return parser.parse_args(argv)
 
@@ -172,11 +182,12 @@ def main():
     if args.self_test:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(ValidatorTests)
         raise SystemExit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())
-    barrier = threading.Barrier(4)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    barrier = threading.Barrier(args.concurrency)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         receipts = list(pool.map(lambda index: request(index, args, barrier), range(4)))
     passed = all(receipt["passed"] for receipt in receipts)
     print(json.dumps({"passed": passed, "context_limit": args.context_limit,
+                      "concurrency": args.concurrency,
                       "max_tokens": 128, "thinking_token_budget": 32, "timeout_seconds": 90,
                       "prior_failure": "Initial v8-off thinking-disabled run passed arithmetic/JSON "
                                        "but failed sort/code with empty visible answers and length at 128; "
