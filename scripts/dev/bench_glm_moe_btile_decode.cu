@@ -36,6 +36,14 @@ static size_t original_offset(size_t dst){size_t t=dst/4096,i=dst%4096;return ((
 static unsigned char code(size_t i,unsigned seed){unsigned x=unsigned(i)^seed*0x9e3779b9u;x^=x>>16;x*=0x7feb352du;x^=x>>15;return static_cast<unsigned char>(x^(x>>8));}
 static unsigned char scode(size_t i,unsigned seed){return static_cast<unsigned char>(0x20+8*((i+seed)%3));}
 static bool fits(size_t n,size_t elem,size_t live){return elem&&n<=(CAP-256)/elem&&live<=CAP-(n*elem+256);}
+static size_t fixture_budget(){
+    const size_t sizes[]={6*WB,4*WB,6*SB,MAXR*DK*2,
+        MAXR*TK*DN*2,MAXR*TK*DN*2,MAXR*DN*2,MAXR*DN*2,
+        MAXR*TK*DN*2,MAXR*TK*DN*2,MAXR*DN*2,MAXR*DN*2,
+        MAXR*TK*DN*2,MAXR*TK*DN*2,MAXR*DN*2,MAXR*DN*2,
+        NE*8,NE*8,NE*8,NE*8,NE*8,NE*8,NE*4,NE*4,MAXR*TK*4};
+    size_t used=0;for(size_t bytes:sizes){require(fits(bytes,1,used),"fixture allocation budget");used+=bytes+256;}return used;
+}
 static bool valid_routes(const std::vector<unsigned>& ids,unsigned rows){
     if(rows<1||rows>MAXR||ids.size()!=rows*TK)return false;
     for(unsigned r=0;r<rows;++r){std::array<bool,NE> seen{};for(unsigned j=0;j<TK;++j){unsigned e=ids[r*TK+j];if(e>=NE||seen[e])return false;seen[e]=true;}}
@@ -60,6 +68,7 @@ static void host_tests(){
     }
     for(unsigned r=1;r<=3;++r){std::vector<unsigned> ids(r*TK);for(unsigned i=0;i<ids.size();++i)ids[i]=i%TK;require(valid_routes(ids,r),"valid routes");ids[0]=NE;require(!valid_routes(ids,r),"reject expert bound");ids[0]=ids[1];require(!valid_routes(ids,r),"reject duplicate within token");}
     require(!valid_routes({},0)&&!valid_routes({},4)&&fits(1,4,0)&&!fits(std::numeric_limits<size_t>::max(),4,0),"shape and budget rejection");
+    require(fixture_budget()==45799520,"exact guarded device footprint");
     std::puts("PASS host Btile decode exhaustive_pack staged_slice routes budget");
 }
 
@@ -90,8 +99,9 @@ static void gpu_tests(bool timing){
     auto guards=[&](){orig.guards();tile.guards();scales.guards();input.guards();for(auto& b:out)b.guards();gp.guards();up.guards();gs.guards();us.guards();tp.guards();tu.guards();gf.guards();uf.guards();ids.guards();};
     for(unsigned w=0;w<6;++w){std::vector<unsigned char> b(WB);for(size_t i=0;i<WB;++i)b[i]=code(i,w+31);orig.upload(b,w*WB);if(w<4)tile.upload(pack(b),w*WB);b.resize(SB);for(size_t i=0;i<SB;++i)b[i]=scode(i,w);scales.upload(b,w*SB);}
     cudaStream_t stream;CK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+    require(live==fixture_budget(),"actual allocation matches CPU accounting");
     std::printf("device_bytes=%zu cap=%zu original_tiled_routed_pairs=2 shared_original_pair=1\n",peak,CAP);
-    for(unsigned rows=1;rows<=MAXR;++rows)for(unsigned ci=0;ci<6;++ci){
+    for(unsigned rows=1;rows<=MAXR;++rows)for(unsigned ci=0;ci<8;++ci){
         // Shared stays original; exercise all four present/absent masks.
         unsigned mask=ci%4;
         auto launch=[&](unsigned v){

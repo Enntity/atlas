@@ -54,8 +54,9 @@ Two distinct local expert gate/up pairs have original and tiled packed B:
 32 MiB packed plus2 MiB shared immutable scales. A third, distinct shared
 expert gate/up pair remains original-only:8 MiB packed plus1 MiB scales.
 Total weight storage43 MiB. Fixed max3 BF16 inputs and all twelve output
-buffers, metadata and128-byte leading/trailing canaries keep total below
-45 MiB; each allocation is charged before cudaMalloc against a hard64 MiB
+buffers, metadata and128-byte leading/trailing canaries total45,799,520 bytes
+across25 allocations, checked against the CPU accounting function. Each
+allocation is charged before cudaMalloc against a hard64 MiB
 cap. No model weights or additional kernels run concurrently during GPU gates.
 
 The two local pairs are a small hot working set, not a representative rank's
@@ -79,3 +80,14 @@ Repeat native correctness/memcheck with `--fmad=false` omitted. Preserve all
 paired timing runs, including regressions; no production promotion from a
 microbenchmark alone. Validate combined scalar bootstrap/drains/general M64
 prefill and full-model C1/K5/C4 before any equal-memory layout replacement.
+
+## CPU source checkpoint
+
+Genuine TDD RED: identity-layout address stub compiled then failed with
+`FAIL: B tile corners` (exit2). Corrected helper passed exhaustive byte
+packing/inverse, cooperative slice simulation, route bounds/uniqueness and
+the exact allocation budget. Receipts are `btile-decode-host-{red,green}.log`
+under the phase6 directory. Eight cases per width and eager/graph replay give
+48 cases, including both shared projections present with nonzero input.
+Independent read-only arithmetic/barrier/harness review approved the source;
+native numerical, default-FMA and memcheck gates remain root-owned/pending.
