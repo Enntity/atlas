@@ -7,7 +7,8 @@ from pathlib import Path
 SOURCE = (Path(__file__).resolve().parents[1] / "start-glm53-ep2.sh").read_text()
 PREFIX = SOURCE.split("MODEL_MAX_SEQ_LEN=", 1)[0]
 FLAGS = ["GLM_M5_ROUTER_BN4", "GLM_M5_ROUTER_BN4_VERIFY",
-         "GLM_M5_SHARED_M16", "GLM_M5_SHARED_M16_VERIFY", "GLM_MTP_K5_LEDGER"]
+         "GLM_M5_SHARED_M16", "GLM_M5_SHARED_M16_VERIFY", "GLM_MTP_K5_LEDGER",
+         "GLM_TARGET_SHARED_FP8", "GLM_TARGET_SHARED_FP8_VERIFY"]
 
 
 class M5LauncherTests(unittest.TestCase):
@@ -44,6 +45,24 @@ class M5LauncherTests(unittest.TestCase):
         for flag in FLAGS:
             self.assertEqual(SOURCE.count(f"-e ATLAS_{flag}="), 2)
             self.assertIn(f'{flag}="${{{flag}:-0}}"', PREFIX)
+
+    def test_shared_cache_requires_bounded_prefill_and_consuming_path(self):
+        self.assertEqual(self.prefix(GLM_TARGET_SHARED_FP8="1").returncode, 0)
+        for changes in ({"MAX_PREFILL_TOKENS": "1025"},
+                        {"MAX_PREFILL_TOKENS": "0"},
+                        {"MAX_PREFILL_TOKENS": "1+1"},
+                        {"MAX_PREFILL_TOKENS": "18446744073709551617"},
+                        {"MAX_PREFILL_TOKENS": "010"},
+                        {"GLM_K5_BATCHED_SHARED": "1"}):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.prefix(GLM_TARGET_SHARED_FP8="1", **changes).returncode, 2)
+        self.assertEqual(self.prefix(GLM_TARGET_SHARED_FP8_VERIFY="1",
+                                     GLM_TP_VERIFY_GRAPH="0").returncode, 2)
+        self.assertEqual(self.prefix(GLM_TARGET_SHARED_FP8="1",
+                                     GLM_TARGET_SHARED_FP8_VERIFY="1").returncode, 2)
+        self.assertEqual(self.prefix(GLM_TARGET_SHARED_FP8="1",
+                                     GLM_TARGET_SHARED_FP8_VERIFY="1",
+                                     GLM_TP_VERIFY_GRAPH="0").returncode, 0)
 
 
 if __name__ == "__main__":

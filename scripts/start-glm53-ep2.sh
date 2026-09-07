@@ -126,6 +126,9 @@ GLM_M5_SHARED_M16="${GLM_M5_SHARED_M16:-0}"
 GLM_M5_SHARED_M16_VERIFY="${GLM_M5_SHARED_M16_VERIFY:-0}"
 # Host-only first-eight-proposal diagnostic, never a throughput setting.
 GLM_MTP_K5_LEDGER="${GLM_MTP_K5_LEDGER:-0}"
+# Target-only shared FP8 cache; validated prefill range is bounded explicitly.
+GLM_TARGET_SHARED_FP8="${GLM_TARGET_SHARED_FP8:-0}"
+GLM_TARGET_SHARED_FP8_VERIFY="${GLM_TARGET_SHARED_FP8_VERIFY:-0}"
 # One in-place all-gather replaces the two synchronous half-vocabulary
 # broadcasts whenever the split-vocabulary proposer is selected.
 GLM_MTP_ALL_GATHER="${GLM_MTP_ALL_GATHER:-$GLM_MTP_DISTRIBUTED}"
@@ -157,7 +160,7 @@ GLM_MTP_SERIAL_PREFILL="${GLM_MTP_SERIAL_PREFILL:-0}"
 # The serial path remains an explicit correctness/debugging oracle.
 GLM_MTP_BATCHED_PREFILL="${GLM_MTP_BATCHED_PREFILL:-$SPECULATIVE}"
 
-for glm_checked_flag in GLM_MTP_REPAIR GLM_MTP_KV_REPAIR_VERIFY MTP_PREFILL_ONLY GLM_MOE_GATE_UP_M16 GLM_MOE_GATE_UP_M16_VERIFY GLM_M5_ROUTER_BN4 GLM_M5_ROUTER_BN4_VERIFY GLM_M5_SHARED_M16 GLM_M5_SHARED_M16_VERIFY GLM_MTP_K5_LEDGER; do
+for glm_checked_flag in GLM_MTP_REPAIR GLM_MTP_KV_REPAIR_VERIFY MTP_PREFILL_ONLY GLM_MOE_GATE_UP_M16 GLM_MOE_GATE_UP_M16_VERIFY GLM_M5_ROUTER_BN4 GLM_M5_ROUTER_BN4_VERIFY GLM_M5_SHARED_M16 GLM_M5_SHARED_M16_VERIFY GLM_MTP_K5_LEDGER GLM_TARGET_SHARED_FP8 GLM_TARGET_SHARED_FP8_VERIFY; do
   if [[ "${!glm_checked_flag}" != "0" && "${!glm_checked_flag}" != "1" ]]; then
     echo "ERROR: $glm_checked_flag must be 0 or 1." >&2
     exit 2
@@ -179,7 +182,7 @@ if [[ "$GLM_MOE_GATE_UP_M16_VERIFY" == "1" && "$GLM_MOE_GATE_UP_M16" != "1" ]]; 
   echo "ERROR: GLM_MOE_GATE_UP_M16_VERIFY requires GLM_MOE_GATE_UP_M16=1." >&2
   exit 2
 fi
-for glm_m5_feature in GLM_M5_ROUTER_BN4 GLM_M5_SHARED_M16; do
+for glm_m5_feature in GLM_M5_ROUTER_BN4 GLM_M5_SHARED_M16 GLM_TARGET_SHARED_FP8; do
   glm_m5_oracle="${glm_m5_feature}_VERIFY"
   if [[ "${!glm_m5_oracle}" == "1" ]]; then
     if [[ "${!glm_m5_feature}" != "1" ]]; then
@@ -192,6 +195,17 @@ for glm_m5_feature in GLM_M5_ROUTER_BN4 GLM_M5_SHARED_M16; do
     fi
   fi
 done
+
+if [[ "$GLM_TARGET_SHARED_FP8" == "1" ]]; then
+  if [[ ! "$MAX_PREFILL_TOKENS" =~ ^[1-9][0-9]{0,3}$ ]] || (( MAX_PREFILL_TOKENS > 1024 )); then
+    echo "ERROR: GLM_TARGET_SHARED_FP8 requires MAX_PREFILL_TOKENS in 1..1024." >&2
+    exit 2
+  fi
+  if [[ "$GLM_K5_BATCHED_SHARED" != "0" ]]; then
+    echo "ERROR: GLM_TARGET_SHARED_FP8 requires GLM_K5_BATCHED_SHARED=0." >&2
+    exit 2
+  fi
+fi
 
 MODEL_MAX_SEQ_LEN=1048576
 if (( MAX_SEQ_LEN > MODEL_MAX_SEQ_LEN )); then
@@ -683,6 +697,7 @@ echo "  GLM M16 gate/up / oracle: $GLM_MOE_GATE_UP_M16 / $GLM_MOE_GATE_UP_M16_VE
 echo "  GLM M5 router BN4 / oracle: $GLM_M5_ROUTER_BN4 / $GLM_M5_ROUTER_BN4_VERIFY"
 echo "  GLM M5 shared M16 / oracle: $GLM_M5_SHARED_M16 / $GLM_M5_SHARED_M16_VERIFY"
 echo "  GLM MTP first-eight K5 ledger: $GLM_MTP_K5_LEDGER"
+echo "  GLM target shared FP8 cache / oracle: $GLM_TARGET_SHARED_FP8 / $GLM_TARGET_SHARED_FP8_VERIFY"
 echo "  GLM MTP one-collective vocabulary gather: $GLM_MTP_ALL_GATHER"
 echo "  GLM MTP distributed top-1 reduction: $GLM_MTP_DISTRIBUTED_ARGMAX"
 echo "  GLM K5 exact-M5 BF16 router: $GLM_K5_ROUTER_M5"
@@ -783,6 +798,8 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_GLM_M5_SHARED_M16=$GLM_M5_SHARED_M16 \
   -e ATLAS_GLM_M5_SHARED_M16_VERIFY=$GLM_M5_SHARED_M16_VERIFY \
   -e ATLAS_GLM_MTP_K5_LEDGER=$GLM_MTP_K5_LEDGER \
+  -e ATLAS_GLM_TARGET_SHARED_FP8=$GLM_TARGET_SHARED_FP8 \
+  -e ATLAS_GLM_TARGET_SHARED_FP8_VERIFY=$GLM_TARGET_SHARED_FP8_VERIFY \
   -e ATLAS_GLM_MTP_ALL_GATHER=$GLM_MTP_ALL_GATHER \
   -e ATLAS_GLM_MTP_DISTRIBUTED_ARGMAX=$GLM_MTP_DISTRIBUTED_ARGMAX \
   -e ATLAS_GLM_K5_ROUTER_M5=$GLM_K5_ROUTER_M5 \
@@ -877,6 +894,8 @@ docker run -d \
   -e ATLAS_GLM_M5_SHARED_M16="$GLM_M5_SHARED_M16" \
   -e ATLAS_GLM_M5_SHARED_M16_VERIFY="$GLM_M5_SHARED_M16_VERIFY" \
   -e ATLAS_GLM_MTP_K5_LEDGER="$GLM_MTP_K5_LEDGER" \
+  -e ATLAS_GLM_TARGET_SHARED_FP8="$GLM_TARGET_SHARED_FP8" \
+  -e ATLAS_GLM_TARGET_SHARED_FP8_VERIFY="$GLM_TARGET_SHARED_FP8_VERIFY" \
   -e ATLAS_GLM_MTP_ALL_GATHER="$GLM_MTP_ALL_GATHER" \
   -e ATLAS_GLM_MTP_DISTRIBUTED_ARGMAX="$GLM_MTP_DISTRIBUTED_ARGMAX" \
   -e ATLAS_GLM_K5_ROUTER_M5="$GLM_K5_ROUTER_M5" \
