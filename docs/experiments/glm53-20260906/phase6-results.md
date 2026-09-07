@@ -338,6 +338,16 @@ passes four strict answers. Coding148/256 warmup+three gives full-wall
 27.973/27.947/24.622, median27.947; post-first median29.328. All caps complete.
 The slower third sample is retained; this does not meet the30 C1 target.
 
+Restarting those same preserved clean containers for a control repeat gives
+25.501/24.529/25.161 full-wall, median25.161, post-first26.251. Four answers
+and all256-token caps pass again. The strict offline correlator matches four
+complete coding windows (warmup+three), retaining four unrelated quality
+windows. Measured mean accepted drafts2.266/2.146/2.225 is lower than the first
+run's2.583/2.583/2.146; clean timing-window medians109.72ms verifier and12.09ms
+proposal. The original27.947 median is not a reliably reproduced rate. This
+repeat is preserved rather than discarded as unfavorable. No native build,
+packaging, or standalone GPU test overlaps either clean measurement.
+
 Additional scoped Clippy runs are **not clean**: runtime tests stop at the
 existing `fast_weights/mod.rs` items-after-test-module lint; model lib/tests
 report existing collapsible branches, manual divisibility, unnecessary unwrap,
