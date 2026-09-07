@@ -15,6 +15,7 @@
 #include "../../kernels/gb10/common/causal_conv1d.cu"
 #include "../../kernels/gb10/common/kda.cu"
 #include "glm_kda_legacy_reference.cuh"
+#include "glm_kda_value_tiled.cuh"
 
 #define CHECK(call) do { const auto error = (call); if (error != cudaSuccess) { \
     std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(error)); \
@@ -121,8 +122,12 @@ static void output_isolation(const std::vector<__nv_bfloat16>& out,
 }
 
 int main(int argc, char** argv) {
-    const bool timing = argc == 2 && std::strcmp(argv[1], "--timing") == 0;
-    require(argc == 1 || timing, "usage: bench-glm-kda-batch [--timing]");
+    bool timing = false, value_tile = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--timing") == 0 && !timing) timing = true;
+        else if (std::strcmp(argv[i], "--value-tile") == 0 && !value_tile) value_tile = true;
+        else require(false, "usage: bench-glm-kda-batch [--timing] [--value-tile]");
+    }
     constexpr unsigned heads = 32, dim = 128, p = heads * dim, channels = 3 * p;
     constexpr unsigned slots = 8, conv_width = 4;
     constexpr size_t h_live = heads * dim * dim, h_stride = h_live + 64;
@@ -153,16 +158,25 @@ int main(int argc, char** argv) {
     const auto original_weight = weight.read();
     const auto original_a = a_log.read(), original_bias = dt_bias.read();
     std::printf("device_bytes=%zu slots=%u heads=%u D=%u state_FP32\n", device_bytes, slots, heads, dim);
-    const auto candidate = [&](unsigned rows) {
+    std::printf("candidate=%s oracle=frozen_scalar full_state_BITEXACT\n",
+                value_tile ? "value32_tiled" : "production_indexed");
+    const auto indexed = [&](unsigned rows, bool tiled) {
         glm_kda_conv_indexed<<<dim3((channels + 255) / 256, rows), 256, 0, stream>>>(
             new_c.ptr, input.ptr, weight.ptr, nullptr, new_conv.ptr, channels, conv_width,
             rows, channels, channels, indices.ptr, slots, c_stride);
         CHECK(cudaGetLastError());
-        glm_kda_recurrent_indexed<<<dim3(heads, rows), 128, 0, stream>>>(
-            new_conv.ptr, gate.ptr, beta.ptr, a_log.ptr, dt_bias.ptr, new_h.ptr, new_out.ptr,
-            rows, heads, dim, lower_bound, indices.ptr, slots, h_stride);
+        if (tiled) {
+            glm_kda_recurrent_value32<<<dim3(heads, rows, dim / 32), 32, 0, stream>>>(
+                new_conv.ptr, gate.ptr, beta.ptr, a_log.ptr, dt_bias.ptr, new_h.ptr, new_out.ptr,
+                rows, heads, dim, lower_bound, indices.ptr, slots, h_stride);
+        } else {
+            glm_kda_recurrent_indexed<<<dim3(heads, rows), 128, 0, stream>>>(
+                new_conv.ptr, gate.ptr, beta.ptr, a_log.ptr, dt_bias.ptr, new_h.ptr, new_out.ptr,
+                rows, heads, dim, lower_bound, indices.ptr, slots, h_stride);
+        }
         CHECK(cudaGetLastError());
     };
+    const auto candidate = [&](unsigned rows) { indexed(rows, value_tile); };
     if (timing) {
         // Separate submission timing, not a correctness substitute. Reset all
         // state outside each interval; no extra GPU allocation beyond events.
@@ -186,30 +200,38 @@ int main(int argc, char** argv) {
                 }
                 CHECK(cudaGetLastError());
             };
-            for (unsigned i = 0; i < 10; ++i) { reference(); candidate(rows); }
-            float medians[2];
-            std::vector<float> samples[2];
+            for (unsigned i = 0; i < 10; ++i) {
+                reference(); indexed(rows, false);
+                if (value_tile) indexed(rows, true);
+            }
+            const unsigned variants = value_tile ? 3 : 2;
+            float medians[3];
+            std::vector<float> samples[3];
             for (unsigned trial = 0; trial < 5; ++trial) {
-                for (unsigned order = 0; order < 2; ++order) {
-                    const unsigned variant = (trial + order) % 2;
+                for (unsigned order = 0; order < variants; ++order) {
+                    const unsigned variant = (trial + order) % variants;
                     init_state(old_h, h_live, h_stride, 17); init_state(new_h, h_live, h_stride, 17);
                     init_state(old_c, c_live, c_stride, 37); init_state(new_c, c_live, c_stride, 37);
                     CHECK(cudaEventRecord(begin, stream));
                     for (unsigned i = 0; i < 100; ++i) {
-                        if (variant) candidate(rows); else reference();
+                        if (variant) indexed(rows, variant == 2); else reference();
                     }
                     CHECK(cudaEventRecord(end, stream)); CHECK(cudaEventSynchronize(end));
                     float ms; CHECK(cudaEventElapsedTime(&ms, begin, end));
                     samples[variant].push_back(ms * 10.0f); // 1000 us/ms / 100 iterations.
                 }
             }
-            for (unsigned variant = 0; variant < 2; ++variant) {
+            for (unsigned variant = 0; variant < variants; ++variant) {
                 std::sort(samples[variant].begin(), samples[variant].end());
                 medians[variant] = samples[variant][2];
             }
-            std::printf("TIMING rows=%u per_row_us=%.3f indexed_us=%.3f ratio=%.3f "
-                        "CUDA_events_eager_submission median5x100 interleaved reset_excluded\n",
+            std::printf("TIMING rows=%u per_row_us=%.3f indexed_us=%.3f ratio=%.3f ",
                         rows, medians[0], medians[1], medians[0] / medians[1]);
+            if (value_tile)
+                std::printf("value32_us=%.3f indexed_over_value32=%.3f ",
+                            medians[2], medians[1] / medians[2]);
+            std::printf("CUDA_events_eager_submission conv_plus_recurrent "
+                        "median5x100 interleaved reset_excluded\n");
         }
         CHECK(cudaEventDestroy(begin)); CHECK(cudaEventDestroy(end));
         CHECK(cudaStreamDestroy(stream));
