@@ -205,6 +205,8 @@ impl TransformerModel {
             && !hss_engaged
             && !force_eager
             && !lora_eager;
+        // The optional M16 oracle must never perform D2H inside capture.
+        crate::layers::moe::validate_m16_gate_up_graphs(&self.config.model_type, use_graphs)?;
         let verify_profile = std::env::var("ATLAS_GLM_VERIFY_PROFILE").ok().as_deref() == Some("1")
             && self.config.model_type == "glm5_next"
             && !use_graphs;

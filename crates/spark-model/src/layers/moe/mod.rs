@@ -317,6 +317,7 @@ pub struct MoeLayer {
     moe_w4a4_prequant_t_k64_vecscale_compact: KernelHandle,
     moe_w4a4_prequant_t_k64_compact_gate_up: KernelHandle,
     moe_w4a4_prequant_t_k64_vecscale_compact_gate_up: KernelHandle,
+    m16_gate_up: gate_up_m16::M16GateUp,
     moe_nvfp4_mmq_gate_up_k: KernelHandle,
     moe_nvfp4_mmq_down_k: KernelHandle,
     moe_nvfp4_mmq_quantize_k: KernelHandle,
@@ -530,9 +531,11 @@ mod forward_prefill_fp8;
 mod forward_prefill_phase;
 mod forward_prefill_routed;
 mod forward_token_major;
+mod gate_up_m16;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;
+pub(crate) use gate_up_m16::validate_m16_gate_up_graphs;
 mod init;
 mod mmq_layout;
 #[cfg(test)]

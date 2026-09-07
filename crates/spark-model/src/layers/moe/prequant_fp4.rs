@@ -23,7 +23,7 @@ pub(super) fn c4_grouped_shape(
     rows == 4 && decode_rows >= 4 && glm_grouped_shape(config)
 }
 
-fn glm_grouped_shape(config: &atlas_core::config::ModelConfig) -> bool {
+pub(super) fn glm_grouped_shape(config: &atlas_core::config::ModelConfig) -> bool {
     config.model_type == "glm5_next"
         && config.hidden_size == 4096
         && config.moe_intermediate_size == 2048
@@ -198,28 +198,49 @@ impl MoeLayer {
                 self.moe_w4a4_prequant_t_k64_compact_gate_up
             };
             if fused_kernel.0 != 0 {
-                return ops::moe_w4a4_grouped_gemm_prequant_compact_gate_up_n128(
-                    ctx.gpu,
-                    fused_kernel,
-                    a_packed,
-                    a_scale,
-                    gate.packed_ptrs,
-                    gate.scale_ptrs,
-                    gate.scale2_vals,
-                    expert_gate_out,
-                    up.packed_ptrs,
-                    up.scale_ptrs,
-                    up.scale2_vals,
-                    expert_up_out,
-                    expert_offsets,
-                    sorted_token_ids,
-                    num_experts,
-                    inter,
-                    h,
-                    work.worklist,
-                    work.total_tiles,
-                    work.max_tiles,
+                return self.m16_gate_up.run(
+                    super::gate_up_m16::GateUpCall {
+                        rows: n,
+                        n: inter,
+                        k: h,
+                        experts: num_experts,
+                        work,
+                        native_resources: self.m16_gate_up.enabled()
+                            && self.glm_grouped_resources(ctx),
+                        vector: self.nvfp4_vecscale
+                            && self.moe_w4a4_prequant_t_k64_vecscale_compact_gate_up.0 != 0,
+                        original: fused_kernel,
+                        outputs: [expert_gate_out, expert_up_out],
+                        sorted_tokens: sorted_token_ids,
+                        gate_table: gate.packed_ptrs,
+                    },
+                    ctx,
                     stream,
+                    |kernel| {
+                        ops::moe_w4a4_grouped_gemm_prequant_compact_gate_up_n128(
+                            ctx.gpu,
+                            kernel,
+                            a_packed,
+                            a_scale,
+                            gate.packed_ptrs,
+                            gate.scale_ptrs,
+                            gate.scale2_vals,
+                            expert_gate_out,
+                            up.packed_ptrs,
+                            up.scale_ptrs,
+                            up.scale2_vals,
+                            expert_up_out,
+                            expert_offsets,
+                            sorted_token_ids,
+                            num_experts,
+                            inter,
+                            h,
+                            work.worklist,
+                            work.total_tiles,
+                            work.max_tiles,
+                            stream,
+                        )
+                    },
                 );
             }
         }

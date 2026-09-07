@@ -289,6 +289,9 @@ impl TransformerModel {
             None
         };
         let use_graphs = graph_key.is_some();
+        // The optional M16 numerical oracle performs host readback. Reject
+        // actual graph use before lookup, warmup, or beginning capture.
+        crate::layers::moe::validate_m16_gate_up_graphs(&self.config.model_type, use_graphs)?;
 
         // Lock order: kv_cache BEFORE the graph cache, matching verify_e.
         let mut kv_cache = self.kv_cache.lock();

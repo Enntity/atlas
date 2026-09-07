@@ -52,6 +52,7 @@ impl MoeLayer {
             num_experts,
             crate::layers::ops::MOE_TOPK_SIGMOID_MAX_EXPERTS,
         );
+        let m16_gate_up = super::gate_up_m16::M16GateUp::new(gpu, config)?;
         let gate_ptrs = build_ptr_table(&weights.experts, |e| &e.gate_proj, gpu)?;
         let up_ptrs = build_ptr_table(&weights.experts, |e| &e.up_proj, gpu)?;
         let down_ptrs = build_ptr_table(&weights.experts, |e| &e.down_proj, gpu)?;
@@ -180,6 +181,7 @@ impl MoeLayer {
             } else {
                 KernelHandle(0)
             },
+            m16_gate_up,
             moe_w4a4_prequant_t_k64_compact_gate_up: if config.model_type == "glm5_next" {
                 super::super::try_kernel(
                     gpu,
