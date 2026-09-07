@@ -23,6 +23,10 @@ pub(super) fn retire_if_cancelled(a: &mut ActiveSeq) -> bool {
 #[path = "cancel_tests.rs"]
 mod cancellation_tests;
 
+#[cfg(test)]
+#[path = "emit_thinking_tests.rs"]
+mod thinking_tests;
+
 /// Emit a token for an active sequence (stream + bookkeeping).
 ///
 /// Per OpenAI spec, stop/EOS tokens are NOT streamed to the client —
@@ -423,19 +427,24 @@ pub fn emit_token(
     //
     // `inside_thinking` term: the matcher is PAUSED during `<think>` (tokens
     // are neither masked nor accepted), so stop-legality is undefined there.
-    // Preserve the historical emit-path behavior — a spurious EOS inside a
-    // thinking span on a grammar-armed turn is discarded, `</think>` is the
-    // only legal exit (the non-MTP path does this via its explicit
-    // `thinking_suppresses_eos` term, which emit_token never had).
+    // The separate thinking suppression below also covers grammarless turns,
+    // matching ordinary decode: `</think>` is the normal thinking exit.
     let grammar_suppresses_eos = a.eos_tokens.contains(&tok)
         && !eos_escape
         && ((a.inside_thinking && a.grammar_state.is_some())
             || crate::grammar::grammar_blocks_stop(a.grammar_state.as_mut(), &a.eos_tokens));
     let legacy_suppresses_eos = a.require_tool_call;
     let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-    let suppress_eos = grammar_suppresses_eos || legacy_suppresses_eos || min_tokens_suppresses;
+    let hard_ceiling = hard_ceiling_hit(a.remaining, a.seq.seq_len, sched.limits.max_seq_len);
+    let thinking_suppresses_eos = eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling);
+    let suppress_eos = grammar_suppresses_eos
+        || legacy_suppresses_eos
+        || min_tokens_suppresses
+        || thinking_suppresses_eos;
 
-    if a.eos_tokens.contains(&tok) && !suppress_eos {
+    // The suppressed-EOS return below precedes the bottom length check. Do
+    // not let any suppression policy bypass an exhausted output/KV ceiling.
+    if a.eos_tokens.contains(&tok) && (hard_ceiling || !suppress_eos) {
         a.finished = true;
         return;
     }
