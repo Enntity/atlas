@@ -346,6 +346,29 @@ paths. Those files have no diff between production14a47186 and6f8b7cb9.
 These receipts are retained (`v18-clippy.log`, `v18-model-server-clippy.log`);
 do not claim full CI or Clippy success from the passing build/test gates.
 
+The first shared-FP8-cache model attempt fails closed during startup on both
+ranks, before serving any request. Head rejects the layer3 shared gate's
+checkpoint layout; worker's pre-layer cache+arena+inference check requires
+9,547,603,708 bytes with8,832,421,888 available. Both containers exit1 with
+`OOMKilled=false`; subsequent host MemAvailable exceeds114GiB. Failed
+containers are retained as `atlas-glm53-v18-c1-cache-rejected-ep0/1`.
+
+Read-only safetensors-header inspection establishes the layout cause: all126
+target shared projections are BF16-only, not checkpoint-native NVFP4. Gate/up
+are84 tensors of shape[2048,4096], down42 of[4096,2048], each16,777,216 bytes;
+there are no packed or scale siblings. Existing `quantized_any` converts each
+to fresh NVFP4 allocations and frees the BF16 source. Therefore the cache must
+validate loader-derived live NVFP4 provenance, never dereference the stale
+BF16 pointer still present in WeightStore metadata. Cache conversion must
+continue from the existing NVFP4 weights, without changing their arithmetic.
+
+The memory rejection is separate: reserve cache capacity after target/MTP
+loading, vocabulary setup and existing memory-releasing layout transforms,
+before arena allocation. Do not merely remove the early check while leaving
+cache allocations inline. Preserve arena+inference reservations, the4GiB
+floor, and actual-free KV accounting. There is no real-weight FP8 oracle or
+throughput result yet. These failures motivate the next guarded loader fix.
+
 ## Bounded proposal trace
 
 Server source `0787e7e8` adds a default-off host-only first-eight K5 ledger per
