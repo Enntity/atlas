@@ -88,7 +88,15 @@ rank at actual K5, each with positive useful work and both full gate/up
 outputs bit-identical. Both numerical diagnostics are separate from timings.
 The four strict C1 answers and bounded coding32 check pass. This validates
 K5 selection on real resident weights, not C4 selection or a full-model gain;
-the graph-on M16 A/B is pending.
+the graph-on M16 A/B is recorded below.
+
+Graph-on M16/oracles-OFF passes all four strict answers. Matched coding256
+full-wall runs24.693,25.160,25.503 yield median25.160, post-first26.277,
+all cap-complete. The preceding M16-OFF repaired control was24.751; this small
+1.65% endpoint difference is not yet a demonstrated kernel gain. Accepted
+draft means2.160,2.266,2.308 differ from that control, while target-forward
+windows do not show a clear improvement. Keep the default OFF and separate
+numerical validation from performance attribution.
 
 ## Accepted-history foundation and safety receipts
 
