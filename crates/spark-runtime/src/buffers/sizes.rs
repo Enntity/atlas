@@ -7,6 +7,10 @@ use atlas_core::device::sm121::NUM_SMS;
 
 use super::sizes_q12::{Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
 
+#[cfg(test)]
+#[path = "sizes_total_tests.rs"]
+mod total_tests;
+
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
 pub struct BufferSizes {
@@ -507,6 +511,8 @@ impl BufferSizes {
             + self.expert_up_out
             + self.expert_down_out
             + self.splitk_workspace
+            + self.o_latent
+            + self.norm_unit_w
             + self.gdn_fla_scratch
             + self.ssd_scratch
             + self.hc_streams
