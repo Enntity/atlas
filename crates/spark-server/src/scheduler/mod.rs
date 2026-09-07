@@ -25,6 +25,7 @@ mod emit_step;
 mod fast_greedy;
 #[cfg(test)]
 mod finish_guard_tests;
+mod first_token_thinking;
 mod helpers;
 mod lifecycle;
 #[cfg(test)]

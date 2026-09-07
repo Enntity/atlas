@@ -9,6 +9,10 @@ use std::time::Instant;
 
 use super::*;
 
+#[cfg(test)]
+#[path = "first_token_thinking_promotion_tests.rs"]
+mod first_token_thinking_tests;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn promote_completed_prefills(
     model: &dyn Model,
@@ -129,6 +133,12 @@ fn build_active_seq_from_prefill(
     // F4: sticky tool-request flag — grammar attached OR legacy tool path.
     // Computed before `p.grammar_state` is moved into the struct below.
     let tool_request = p.grammar_state.is_some() || use_legacy_tool_call;
+    let thinking = first_token_thinking::FirstTokenThinking::resolve(
+        p.enable_thinking,
+        first,
+        think_start_token,
+        think_end_token,
+    );
     ActiveSeq {
         seq: p.seq,
         session_hash: p.session_hash,
@@ -167,11 +177,7 @@ fn build_active_seq_from_prefill(
         logit_bias: p.logit_bias,
         pending_drafts: Vec::new(),
         pending_draft_conf: Vec::new(),
-        inside_thinking: if immediate_finish {
-            p.enable_thinking && think_end_token.is_some()
-        } else {
-            spontaneous_think || (p.enable_thinking && think_end_token.is_some())
-        },
+        inside_thinking: thinking.inside_thinking,
         enable_thinking: p.enable_thinking,
         thinking_budget: if !immediate_finish && spontaneous_think {
             Some(p.spontaneous_think_budget)
@@ -190,15 +196,8 @@ fn build_active_seq_from_prefill(
         in_code_fence: false,
         think_end_token,
         think_start_token,
-        // When thinking is disabled but model supports thinking, the template
-        // pre-closes with `<think>\n\n</think>\n\n`. Set think_ended=true so
-        // the </think> logit suppression is active from the start.
-        think_ended: if !immediate_finish && spontaneous_think {
-            false
-        } else {
-            !p.enable_thinking && think_end_token.is_some()
-        },
-        think_just_ended: false,
+        think_ended: thinking.think_ended,
+        think_just_ended: thinking.think_just_ended,
         post_think_emitted: 0,
         spec_adapt: Default::default(),
         think_skip_count: 0,

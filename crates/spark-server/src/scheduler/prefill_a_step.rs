@@ -471,6 +471,12 @@ pub fn start_chunked_prefill(
         };
 
         let spontaneous_think = !req_enable_thinking && think_start_token == Some(first);
+        let thinking = first_token_thinking::FirstTokenThinking::resolve(
+            req_enable_thinking,
+            first,
+            think_start_token,
+            think_end_token,
+        );
         // Legacy echo+logprobs: hand prompt logprobs to a streaming client
         // BEFORE any token event (blocking carries them via finish_sequence).
         if req_prompt_logprobs.is_some()
@@ -553,7 +559,7 @@ pub fn start_chunked_prefill(
                 logit_bias: logit_bias.clone(),
                 pending_drafts: Vec::new(),
                 pending_draft_conf: Vec::new(),
-                inside_thinking: req_enable_thinking && think_end_token.is_some(),
+                inside_thinking: thinking.inside_thinking,
                 enable_thinking: req_enable_thinking,
                 thinking_budget: req_thinking_budget,
                 repetition_detection: req_repetition_detection,
@@ -568,8 +574,8 @@ pub fn start_chunked_prefill(
                 in_code_fence: false,
                 think_end_token,
                 think_start_token,
-                think_ended: !req_enable_thinking && think_end_token.is_some(),
-                think_just_ended: false,
+                think_ended: thinking.think_ended,
+                think_just_ended: thinking.think_just_ended,
                 post_think_emitted: 0,
                 spec_adapt: Default::default(),
                 think_skip_count: 0,
@@ -641,8 +647,7 @@ pub fn start_chunked_prefill(
                 logit_bias: logit_bias.clone(),
                 pending_drafts: Vec::new(),
                 pending_draft_conf: Vec::new(),
-                inside_thinking: spontaneous_think
-                    || (req_enable_thinking && think_end_token.is_some()),
+                inside_thinking: thinking.inside_thinking,
                 enable_thinking: req_enable_thinking,
                 thinking_budget: if spontaneous_think {
                     Some(spontaneous_think_budget)
@@ -661,12 +666,8 @@ pub fn start_chunked_prefill(
                 in_code_fence: false,
                 think_end_token,
                 think_start_token,
-                think_ended: if spontaneous_think {
-                    false
-                } else {
-                    !req_enable_thinking && think_end_token.is_some()
-                },
-                think_just_ended: false,
+                think_ended: thinking.think_ended,
+                think_just_ended: thinking.think_just_ended,
                 post_think_emitted: 0,
                 spec_adapt: Default::default(),
                 think_skip_count: 0,
