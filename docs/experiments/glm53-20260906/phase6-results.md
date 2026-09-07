@@ -121,7 +121,14 @@ TTFT2984.739ms). A tool request is rejected by the bounded-lane admission guard
 The cancelled client hit its intentional2-second deadline after receiving SSE;
 server logs confirm receiver-drop retirement after29 generated tokens.
 Diagnostic coding128/128 completes, but its rate is not the matched256-token
-acceptance benchmark. Repair-ON/oracle-OFF measurement is next.
+acceptance benchmark.
+
+Repair-ON with both numerical diagnostics OFF passes the same four strict
+answers. Matched coding148/256, warmup plus three measured waves, gives
+full-wall23.945,25.130,24.751: median24.751, post-first25.781. All outputs
+reach256 with the ordinary repetition policy. This is5.8% above the matched
+repair-OFF23.399 median, not a comparison against the differently gated v15.
+M16 and the proposed B layout remain OFF. The30 C1 /60 C4 goal remains open.
 
 ## Direct-staged expert B layout, standalone only
 
