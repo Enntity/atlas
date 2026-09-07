@@ -83,6 +83,13 @@ earlier24/24 result as universal. All services and CPU builders were stopped
 for these timings. Resident-model selection/oracle and end-to-end A/B remain
 pending; the production switch is default-off.
 
+Subsequent v16 eager resident-model oracle passes all42 MoE layers on each
+rank at actual K5, each with positive useful work and both full gate/up
+outputs bit-identical. Both numerical diagnostics are separate from timings.
+The four strict C1 answers and bounded coding32 check pass. This validates
+K5 selection on real resident weights, not C4 selection or a full-model gain;
+the graph-on M16 A/B is pending.
+
 ## Accepted-history foundation and safety receipts
 
 `9c54d24c` adds checked GLM pair planning; `8bd85db1` extracts the existing
@@ -129,6 +136,37 @@ full-wall23.945,25.130,24.751: median24.751, post-first25.781. All outputs
 reach256 with the ordinary repetition policy. This is5.8% above the matched
 repair-OFF23.399 median, not a comparison against the differently gated v15.
 M16 and the proposed B layout remain OFF. The30 C1 /60 C4 goal remains open.
+Measured request mean accepted drafts OFF1.988,1.920,2.160 versus
+ON2.071,2.225,2.185. Clean25-step timing windows (excluding the first after
+each request boundary) give median target forward111.360/110.765ms and
+proposal10.400/10.920ms, OFF/ON respectively. The seven/six retained windows
+support acceptance improvement with a small repair cost, not a faster target.
+
+## Actual K5 phase diagnostic
+
+Same v16 repaired policy, `VERIFY_PROFILE=1`, actual verify graphs OFF, both
+numerical oracles OFF. Coding32 warmup plus one measured request yields20
+complete K5 intervals per rank (11 warmup,9 measured), each42 MoE/EP sets,
+34 KDA sets and45 total layers. No partial intervals. Discarding each request's
+first interval leaves18 per rank. Median summed phase milliseconds:
+
+| Phase | Rank0 | Rank1 |
+|---|---:|---:|
+| Routed gate/up |27.635|28.804|
+| Routed SiLU/down |13.513|14.475|
+| Shared expert |18.254|18.505|
+| Router projection |6.984|7.073|
+| MoE EP communication |16.116|13.307|
+| KDA TP communication |7.271|6.900|
+| All45 layers |127.830|127.735|
+
+The layer total excludes final norm/vocabulary/argmax. Do not sum ranks or
+independently calculated medians. Communication includes peer waiting, not
+pure transport cost. Gate/up includes setup/activation quantization and is
+about22% of this eager timeline. Halving the entire phase would improve
+layer-only throughput about12–13%; actual B-layout benefit has a lower ceiling.
+Synchronization/logging and disabled graphs perturb these numbers: use them
+for prioritization, not as graph-on performance or the acceptance workload.
 
 ## Direct-staged expert B layout, standalone only
 
@@ -149,6 +187,19 @@ builder-inclusive median speed ratios1.299195/1.303584; K5 ratios
 small working set. This is not an end-to-end rate or production-layout
 approval. Scalar bootstrap, small-batch fallback and larger-prefill consumers
 would all need typed, equal-memory layout support before replacing weights.
+
+Compatibility prototypes `91bc1cda` plus final decode harness `5867d7de`
+pass native full-output equality, CPU columns, refreshed graphs, immutable
+inputs/weights and guards. M64 covers15/16/17,63/64/65,127/128/129 rows per
+expert; BF16-input decode covers widths1/2/3 and shared/remote cases. All three
+memchecks (M64, decode `--fmad=false`, decode default FMA) report0 errors.
+Explicit device budgets52,884,648 and45,799,520 bytes; models/builders stopped
+for GPU gates and timings. Three clean timing pairs show M64 useful-case
+median speed ratios1.253–1.339 across the nine geometries. The decode
+compatibility is a negative result: direct addressing regresses every case,
+and staged addressing regresses most. An all-remote/shared-only case also
+regresses despite no tiled reads, motivating compiler/loop-path isolation.
+Do not integrate the model-wide weight layout on these mixed results.
 
 The initial v15 CPU build hit its own4GiB container limit while an archive
 timestamp change unnecessarily triggered CUTLASS recompilation. Builder
