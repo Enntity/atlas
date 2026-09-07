@@ -230,6 +230,33 @@ and staged addressing regresses most. An all-remote/shared-only case also
 regresses despite no tiled reads, motivating compiler/loop-path isolation.
 Do not integrate the model-wide weight layout on these mixed results.
 
+The revised split-loop/register-byte decode prototype `cac9764e` resolves
+the large regression without changing BF16 inputs, scale arithmetic or
+accumulation order. Native full-output/CPU/graph/immutable/guard checks pass
+under both FMA policies; both memchecks report0 errors. Three clean timing
+pairs: word-load median speed ratios C1=1.04588, C2=1.30100, C3=1.17950;
+wide-vector medians1.04477/1.28859/1.20783. C2 and C3 win all24 comparisons
+per variant; C1 includes losses (word minimum0.95321, vector0.93010).
+Preserve those losses and measure model bootstrap/drains before selection.
+
+## Small exact router and shared tiles
+
+Router `574322d3` plus reference-output hardening `722a64f6`, and shared
+M16 `23856fb5`, pass full production-bit equality, independent CPU columns,
+refreshed fixed-pointer graphs, immutable inputs/weights and guards. Router
+uses2,407,040 explicit device bytes; shared shapes peak10,029,312 bytes.
+Router memcheck and both FMA-policy shared memchecks report0 errors. Together
+with register decode above, this native gate window has five clean memchecks.
+
+Three clean timing pairs, no model or CPU compiler running: router baseline
+90.263/90.235/90.224us versus BN4 77.111/77.613/76.877us, speed ratios
+1.1706/1.1626/1.1736. Shared M16 GU median ratios1.14763 at M4 and1.14306
+at M5; down1.15517/1.15464. All six projection/pair comparisons improve for
+each shape/width. These are warm standalone weights, not endpoint gains.
+The shared kernel preserves the original BF16-A/E4M3-B conversion and K32
+MMA order; it is not a routed W4A4 replacement. Production integration and
+resident-model oracles remain pending, with explicit default-off selection.
+
 The initial v15 CPU build hit its own4GiB container limit while an archive
 timestamp change unnecessarily triggered CUTLASS recompilation. Builder
 status was `exited101/OOMKilled=true`; model services were stopped and both
