@@ -322,7 +322,16 @@ full supported-model serve matrix. Native kernel cache-prime build3m55s used
 8GiB CPU container; final committed Rust build2m24s used4GiB. Both exit0,
 OOMKilled=false; model services stopped. Image v18 on both nodes has binary
 SHA256 `68ee92c69715cdbdb53e999f297759c8c9f6a5578b4858b6eaa9265fb30c5dff`.
-Real-model oracle/quality and clean endpoint measurements are pending.
+Real-model oracle/quality and clean endpoint measurements follow below.
+
+The first v18 model run enables both M5 substitutions with their diagnostics,
+cache OFF and actual K5 graphs OFF. Each rank reports exactly42 full-output
+router matches and126 full-output shared matches (42 each Gate/Up/Down), all
+bit-identical against the original implementations. All four strict answers
+pass; coding148/32 warmup+one completes both caps. Loaded host MemAvailable is
+about10.7/12.2GiB, above the4GiB floor. The model containers stop gracefully
+and are preserved as `atlas-glm53-v18-c1-m5-oracle-ep0/1`. No timing claim is
+made from the diagnostic run.
 
 ## Bounded proposal trace
 
