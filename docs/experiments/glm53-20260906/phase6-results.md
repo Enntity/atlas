@@ -110,6 +110,39 @@ all outputs reached256. Every timed request reports serial0, depthK5 and
 no regime re-probes. Mean accepted drafts1.988,1.920,2.160. M16 is OFF.
 This is the baseline for repair attribution, not a performance gain.
 
+Repair-ON with the separate resident KV diagnostic passed215 comparisons on
+each rank, with identical row/block-count histograms. All widths1..4 occurred;
+12 comparisons per rank touched three blocks (reference plus a destination
+crossing a block boundary). No cache mismatch or stale-state error was found.
+Four strict answers pass; arithmetic also passes immediately after a cancelled
+stream is retired. The1984/48 near-context retrieval passes (16 emitted tokens,
+TTFT2984.739ms). A tool request is rejected by the bounded-lane admission guard
+(HTTP500 with its explicit error), followed by a successful plain completion.
+The cancelled client hit its intentional2-second deadline after receiving SSE;
+server logs confirm receiver-drop retirement after29 generated tokens.
+Diagnostic coding128/128 completes, but its rate is not the matched256-token
+acceptance benchmark. Repair-ON/oracle-OFF measurement is next.
+
+## Direct-staged expert B layout, standalone only
+
+Prototype `3f1e916a` permutes packed bytes without changing FP4 arithmetic,
+scales or K64 accumulation order. It removes runtime B transposition using
+double-buffered MMA-ready tiles. CPU C4/K5 tests exhaustively check all4,194,304
+packed-byte indices and invertibility; independent source review passed.
+The reviewer found and fixed a timing-harness gap before native testing:
+all six outputs, immutable metadata/inputs and canaries are now checked after
+timed loops as well as before them. Production weights/dispatch are unchanged.
+
+Native C4/K5 eager/refreshed-graph full-output equality, independent CPU
+columns, immutable weights and guards pass; both memchecks report0 errors.
+Explicit device peaks36,474,632/36,674,600 bytes. Three clean paired timing
+runs win all15 useful cases per width against existing M16. C4 direct and
+builder-inclusive median speed ratios1.299195/1.303584; K5 ratios
+1.727232/1.414485. The fixture has only two local expert pairs and a warm,
+small working set. This is not an end-to-end rate or production-layout
+approval. Scalar bootstrap, small-batch fallback and larger-prefill consumers
+would all need typed, equal-memory layout support before replacing weights.
+
 The initial v15 CPU build hit its own4GiB container limit while an archive
 timestamp change unnecessarily triggered CUTLASS recompilation. Builder
 status was `exited101/OOMKilled=true`; model services were stopped and both
