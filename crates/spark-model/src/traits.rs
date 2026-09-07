@@ -5,6 +5,8 @@
 //! The Model trait defines the interface for running inference. Business
 //! logic (scheduler, engine) programs against this trait, not concrete types.
 
+pub mod execution_plan;
+
 use spark_runtime::gpu::DevicePtr;
 
 use crate::layer::LayerState;
