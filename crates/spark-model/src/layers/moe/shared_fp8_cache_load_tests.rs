@@ -63,6 +63,10 @@ fn fixture(gpu: &dyn GpuBackend) -> (MoeLayer, WeightStore, atlas_core::config::
         down_proj: weights(2),
     };
     let mut layer = MoeLayer::new(original, 288, None, gpu, &config).unwrap();
+    layer.shared_fp8_origins = Some(std::array::from_fn(|i| {
+        let (n, k) = if i == 2 { (4096, 2048) } else { (2048, 4096) };
+        super::super::shared_fp8_origin::SharedFp8Origin::native_fixture(weights(i as u64), n, k)
+    }));
     layer.shared_gate_t = Some(weights(3));
     layer.shared_up_t = Some(weights(4));
     layer.shared_down_t = Some(weights(5));
@@ -111,6 +115,7 @@ fn actual_target_install_is_atomic_once_and_preserves_original_views() {
             &gpu,
             0,
             (true, false),
+            SharedFp8Reserve::new(0, 0).unwrap(),
         )
         .unwrap();
     assert_eq!(
@@ -132,7 +137,8 @@ fn actual_target_install_is_atomic_once_and_preserves_original_views() {
                 Nvfp4Variant::Standard,
                 &gpu,
                 0,
-                (true, false)
+                (true, false),
+                SharedFp8Reserve::new(0, 0).unwrap()
             )
             .is_err()
     );
@@ -167,6 +173,7 @@ fn actual_install_disabled_mtp_and_malformed_views_do_no_gpu_work() {
             &gpu,
             0,
             (false, false),
+            SharedFp8Reserve::new(0, 0).unwrap(),
         )
         .unwrap();
     layer
@@ -179,6 +186,7 @@ fn actual_install_disabled_mtp_and_malformed_views_do_no_gpu_work() {
             Nvfp4Variant::Standard,
             &gpu,
             0,
+            SharedFp8Reserve::new(0, 0).unwrap(),
         )
         .unwrap();
     let valid = layer.shared_down_t;
@@ -198,7 +206,8 @@ fn actual_install_disabled_mtp_and_malformed_views_do_no_gpu_work() {
                     Nvfp4Variant::Standard,
                     &gpu,
                     0,
-                    (true, false)
+                    (true, false),
+                    SharedFp8Reserve::new(0, 0).unwrap()
                 )
                 .is_err()
         );
@@ -221,7 +230,8 @@ fn actual_install_disabled_mtp_and_malformed_views_do_no_gpu_work() {
                 Nvfp4Variant::Standard,
                 &gpu,
                 0,
-                (true, false)
+                (true, false),
+                SharedFp8Reserve::new(0, 0).unwrap()
             )
             .is_err()
     );
@@ -246,7 +256,8 @@ fn actual_install_byte_copy_failure_does_not_publish_or_leak_temporary() {
                 Nvfp4Variant::Standard,
                 &gpu,
                 0,
-                (true, true)
+                (true, true),
+                SharedFp8Reserve::new(0, 0).unwrap()
             )
             .is_err()
     );
@@ -258,4 +269,94 @@ fn actual_install_byte_copy_failure_does_not_publish_or_leak_temporary() {
             && layer.shared_down_fp8.is_none()
     );
     assert!(layer.shared_fp8_cache.layer.is_none());
+}
+
+#[test]
+fn actual_install_uses_derived_nvfp4_after_all_bf16_sources_are_freed() {
+    let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+    let (mut layer, _, config) = fixture(&gpu);
+    let mut weights = Vec::new();
+    let mut origins = Vec::new();
+    for i in 0..3 {
+        let (n, k) = if i == 2 { (4096, 2048) } else { (2048, 4096) };
+        let source = gpu.alloc(n * k * 2).unwrap();
+        let store = WeightStore::from_map(std::collections::HashMap::from([(
+            "shared.weight".into(),
+            WeightTensor {
+                ptr: source,
+                shape: vec![n, k],
+                dtype: WeightDtype::BF16,
+            },
+        )]));
+        let qctx = crate::weight_map::QuantizeCtx {
+            absmax_k: KernelHandle(11),
+            quantize_k: KernelHandle(12),
+            stream: 0,
+        };
+        let (weight, origin) = super::super::shared_fp8_origin::load_with_origin(
+            &store,
+            "shared",
+            n,
+            k,
+            &gpu,
+            Nvfp4Variant::Standard,
+            qctx,
+            true,
+        )
+        .unwrap();
+        assert!(gpu.copy_d2h(source, &mut [0]).is_err());
+        weights.push(weight);
+        origins.push(origin.unwrap());
+    }
+    layer.weights.shared_expert = crate::weight_map::ExpertWeight {
+        gate_proj: weights[0],
+        up_proj: weights[1],
+        down_proj: weights[2],
+    };
+    layer.shared_fp8_origins = Some([origins[0], origins[1], origins[2]]);
+    let before = (gpu.alloc_count(), gpu.launch_count());
+    // Empty store proves no dereference or metadata lookup of freed BF16:
+    // only the captured live NVFP4 origin and retained T views are consumed.
+    layer
+        .install_glm_target_shared_fp8(
+            &WeightStore::empty(),
+            "freed",
+            &config,
+            3,
+            Nvfp4Variant::Standard,
+            &gpu,
+            0,
+            (true, false),
+            SharedFp8Reserve::new(0, 0).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        (gpu.alloc_count(), gpu.launch_count()),
+        (before.0 + 3, before.1 + 3)
+    );
+    assert_eq!(layer.shared_fp8_cache.layer, Some(3));
+}
+
+#[test]
+fn missing_captured_origin_rejects_before_cache_allocation_or_conversion() {
+    let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+    let (mut layer, store, config) = fixture(&gpu);
+    layer.shared_fp8_origins = None;
+    let before = (gpu.alloc_count(), gpu.launch_count());
+    assert!(
+        layer
+            .install_glm_target_shared_fp8(
+                &store,
+                "shared",
+                &config,
+                3,
+                Nvfp4Variant::Standard,
+                &gpu,
+                0,
+                (true, false),
+                SharedFp8Reserve::new(0, 0).unwrap()
+            )
+            .is_err()
+    );
+    assert_eq!((gpu.alloc_count(), gpu.launch_count()), before);
 }

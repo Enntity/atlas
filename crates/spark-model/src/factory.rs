@@ -119,6 +119,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
 }
 
 mod build;
+mod glm_shared_cache;
 mod lm_head_setup;
 mod m2_setup;
 

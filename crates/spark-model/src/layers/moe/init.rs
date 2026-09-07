@@ -513,6 +513,7 @@ impl MoeLayer {
             gate_fp8: None,
             shared_gate_fp8: None,
             shared_fp8_cache: Default::default(),
+            shared_fp8_origins: None,
             shared_up_fp8: None,
             shared_down_fp8: None,
             prefill_stream: gpu.create_stream()?,

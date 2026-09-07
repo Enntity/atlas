@@ -36,6 +36,10 @@ pub(crate) fn yarn_rope_mscale(config: &atlas_core::config::ModelConfig) -> f32 
 }
 
 impl Qwen3AttentionLayer {
+    /// Factory-only access: use the global block ordinal, not the MLA index.
+    pub(crate) fn glm_shared_cache_ffn(&mut self) -> (usize, &mut FfnComponent) {
+        (self.block_idx, &mut self.ffn)
+    }
     /// Set MLA weights for 2-step latent decode. When set, decode uses
     /// latent→norm→expand instead of single-step GEMV.
     pub fn set_mla_weights(&mut self, mla: MlaWeights) {

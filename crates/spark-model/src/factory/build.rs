@@ -154,7 +154,7 @@ pub fn build_model(
     // "use global num_kv_heads/head_dim for all layers" (backward compatible).
     config.kv_layer_dims = loader.kv_layer_dims(&config);
 
-    crate::layers::moe::validate_shared_fp8_cache_factory_reserve(
+    let shared_cache_reserve = crate::layers::moe::validate_shared_fp8_cache_factory_reserve(
         &config,
         gpu.as_ref(),
         max_batch_tokens,
@@ -339,8 +339,15 @@ pub fn build_model(
     // gemma4) still call `transpose_for_prefill` inline during layer
     // construction; this default-no-op hook doesn't perturb them.
     maybe_run_minimax_m2_moe_transpose(&config, gpu.as_ref(), &mut layers)?;
+    super::glm_shared_cache::initialize(
+        &config,
+        &store,
+        gpu.as_ref(),
+        &mut layers,
+        shared_cache_reserve,
+    )?;
     // ── Step 4: Create buffer arena ──
-    crate::layers::moe::validate_shared_fp8_cache_factory_reserve(
+    let _ = crate::layers::moe::validate_shared_fp8_cache_factory_reserve(
         &config,
         gpu.as_ref(),
         max_batch_tokens,

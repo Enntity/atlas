@@ -7,6 +7,7 @@ mod multi_seq;
 mod profile;
 mod projection;
 mod recurrent;
+mod shared_cache;
 
 use std::mem::size_of;
 

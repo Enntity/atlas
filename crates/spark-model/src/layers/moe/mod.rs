@@ -359,6 +359,7 @@ pub struct MoeLayer {
     gate_fp8: Option<DevicePtr>,
     shared_gate_fp8: Option<DevicePtr>,
     shared_fp8_cache: shared_fp8_cache::SharedFp8CacheState,
+    shared_fp8_origins: Option<[shared_fp8_origin::SharedFp8Origin; 3]>,
     shared_up_fp8: Option<DevicePtr>,
     shared_down_fp8: Option<DevicePtr>,
     fp8_gemm_k: KernelHandle,
@@ -540,9 +541,12 @@ mod helpers_c;
 mod shared_fp8_cache;
 mod shared_fp8_cache_load;
 mod shared_fp8_cache_output;
+mod shared_fp8_origin;
 pub(crate) use gate_up_m16::validate_m16_gate_up_graphs;
+pub(crate) use shared_fp8_cache::SharedFp8Reserve;
 pub(crate) use shared_fp8_cache::validate_shared_fp8_cache_factory_reserve;
 pub use shared_fp8_cache::{validate_shared_fp8_cache_graphs, validate_shared_fp8_cache_profile};
+pub(crate) use shared_fp8_origin::load_glm_shared_fp8_weight;
 mod init;
 mod m5_projection_oracle;
 mod m5_projections;

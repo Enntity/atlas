@@ -1,7 +1,34 @@
 # Target-only GLM shared-expert FP8 cache: bounded integration plan
 
-Status: source frozen and independently approved; CPU gates passed, not yet built
-or served. Root reports standalone full-byte
+## v18 startup correction: validated BF16-derived provenance
+
+The first cache-oracle startup failed safely before serving. Root's complete
+checkpoint-header audit (`v18-shared-checkpoint-metadata.log`) shows all126 target
+shared matrices are BF16-only:84 GU `[2048,4096]` and42 down `[4096,2048]`, each
+16,777,216 bytes, with no quantization markers. The preexisting `quantized_any`
+path already quantizes these to NVFP4 and **frees the BF16 source**. Consequently,
+the native-checkpoint-pointer assumption below does not describe this checkpoint.
+
+The correction captures explicit typed provenance at that unchanged quantizer
+call: first validate BF16 dtype/exact shape/checked extent and absence of packed
+or scale markers, then record the returned live NVFP4 packed/scales/scalar and
+geometry. Deferred cache construction must match that token to the actual shared
+weight. It must never read the freed BF16 pointer or require its stale address to
+remain disjoint from later allocations. Original generated NVFP4/T weights and
+quantization arithmetic remain unchanged; FP8-source fallback is not added.
+
+TDD gates: a real Mock `quantized_any` call consumes/frees BF16, provenance matches
+the exact returned NVFP4 view, changed pointers/scalars/shape and missing origin
+reject, malformed BF16 source rejects before quantizer work, and a real cache
+install succeeds from that provenance even though checkpoint BF16 is no longer
+live. Existing native-checkpoint metadata and all non-cache paths remain strict.
+The separately owned deferred-load/reserve correction keeps memory floors; it
+does not turn the observed worker reserve rejection into permission to allocate.
+
+Historical v18 status (before the startup correction above): source frozen and
+independently approved with CPU gates passed; subsequent startup rejected the
+real BF16-derived source and worker memory reserve. Current correction is WIP,
+not yet approved or tested on GPU. Root reports standalone full-byte
 predecode, three-way full-output, CPU-column, graph and both-FMA memcheck gates
 passed. Three clean M5 micro repeats put gate/up around147.6→49.2us and down
 75.8→26.6us for existing FP8 M64; these are hot-weight micro timings, not TPS.

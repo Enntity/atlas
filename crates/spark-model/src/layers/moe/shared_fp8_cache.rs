@@ -11,6 +11,44 @@ use std::sync::atomic::AtomicU8;
 pub(super) const WEIGHT_BYTES: usize = 2048 * 4096;
 const LAYER_BYTES: usize = 3 * WEIGHT_BYTES;
 
+/// Factory-owned future arena/inference obligations throughout the cache pass.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SharedFp8Reserve {
+    protected: usize,
+}
+impl SharedFp8Reserve {
+    pub(crate) fn new(arena: usize, inference: usize) -> Result<Self> {
+        let future = arena
+            .checked_add(inference)
+            .ok_or_else(|| anyhow::anyhow!("shared FP8 future reserve overflow"))?;
+        Ok(Self {
+            protected: future.max(4 * 1024 * 1024 * 1024),
+        })
+    }
+    pub(crate) fn remaining_bytes(self, layers: usize) -> Result<usize> {
+        layers
+            .checked_mul(LAYER_BYTES)
+            .ok_or_else(|| anyhow::anyhow!("shared FP8 cache byte count overflow"))
+    }
+    pub(crate) fn check(self, free: usize, remaining: usize) -> Result<()> {
+        let required = remaining
+            .checked_add(self.protected)
+            .ok_or_else(|| anyhow::anyhow!("shared FP8 deferred reserve overflow"))?;
+        ensure!(
+            free >= required,
+            "shared FP8 deferred reserve needs {required} bytes, have {free}"
+        );
+        tracing::info!(
+            free,
+            remaining,
+            protected = self.protected,
+            required,
+            "GLM shared FP8 deferred reserve checked before allocation"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 pub(super) struct SharedFp8CacheState {
     pub layer: Option<usize>,
@@ -120,9 +158,9 @@ pub(crate) fn validate_shared_fp8_cache_factory_reserve(
     max_batch_size: usize,
     inference_reserve: usize,
     before_layers: bool,
-) -> Result<()> {
+) -> Result<Option<SharedFp8Reserve>> {
     if !flags()?.0 {
-        return Ok(());
+        return Ok(None);
     }
     validate_config(config)?;
     let arena = spark_runtime::buffers::BufferSizes::from_config(
@@ -133,7 +171,10 @@ pub(crate) fn validate_shared_fp8_cache_factory_reserve(
         max_batch_size,
     )
     .total_bytes();
-    let cache = if before_layers { 42 * LAYER_BYTES } else { 0 };
+    // Cache allocation is deferred until checkpoint replacement, MTP and
+    // LM-head setup finish. At either outer boundary only A+I is unallocated;
+    // the deferred pass separately protects its full remaining cache budget.
+    let cache = 0;
     let required = factory_required(arena, inference_reserve, cache)?;
     let free = gpu.free_memory()?;
     ensure!(
@@ -149,7 +190,7 @@ pub(crate) fn validate_shared_fp8_cache_factory_reserve(
         cache,
         "GLM shared FP8 factory reserve passed"
     );
-    Ok(())
+    Ok(Some(SharedFp8Reserve::new(arena, inference_reserve)?))
 }
 
 fn factory_required(arena: usize, inference: usize, cache: usize) -> Result<usize> {
@@ -183,17 +224,6 @@ pub(super) fn target_plan(
         total_bytes: 42 * LAYER_BYTES,
         remaining_bytes: (45 - layer) * LAYER_BYTES,
     }))
-}
-
-pub(super) fn reserve(free: usize, remaining: usize) -> Result<()> {
-    let required = remaining
-        .checked_add(4 * 1024 * 1024 * 1024usize)
-        .ok_or_else(|| anyhow::anyhow!("shared FP8 reserve overflow"))?;
-    ensure!(
-        free >= required,
-        "shared FP8 cache requires {required} free bytes (remaining cache plus 4 GiB floor), have {free}"
-    );
-    Ok(())
 }
 
 /// Publish only the returned complete triple. Every allocated temporary is

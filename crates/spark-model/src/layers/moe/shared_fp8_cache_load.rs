@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Target-only cache ownership transaction; original and transposed weights survive.
-use super::shared_fp8_cache::{WEIGHT_BYTES, flags, reserve, target_plan, transaction};
+use super::shared_fp8_cache::{SharedFp8Reserve, WEIGHT_BYTES, flags, target_plan, transaction};
 use super::*;
 use crate::weight_map::{Nvfp4Variant, WeightQuantFormat};
 use spark_runtime::weights::{WeightDtype, WeightStore};
@@ -46,6 +46,7 @@ impl MoeLayer {
         variant: Nvfp4Variant,
         gpu: &dyn GpuBackend,
         stream: u64,
+        reserve: SharedFp8Reserve,
     ) -> Result<()> {
         // MTP deliberately exits before interpreting flags or target geometry.
         if !target {
@@ -60,6 +61,7 @@ impl MoeLayer {
             gpu,
             stream,
             flags()?,
+            reserve,
         )
     }
 
@@ -74,6 +76,7 @@ impl MoeLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
         (enabled, verify): (bool, bool),
+        reserve: SharedFp8Reserve,
     ) -> Result<()> {
         anyhow::ensure!(
             !verify || enabled,
@@ -118,12 +121,17 @@ impl MoeLayer {
             self.weights.shared_expert.down_proj,
         ];
         let transposed = [self.shared_gate_t, self.shared_up_t, self.shared_down_t];
+        let origins = self
+            .shared_fp8_origins
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("shared FP8 cache requires captured load provenance"))?;
         let suffix = if variant == Nvfp4Variant::Standard {
             "weight"
         } else {
             "weight_packed"
         };
         let mut ranges = Vec::new();
+        let mut derived_bf16_weights = 0;
         for (i, projection) in ["gate_proj", "up_proj", "down_proj"]
             .into_iter()
             .enumerate()
@@ -139,22 +147,26 @@ impl MoeLayer {
                     && w.weight_scale_2.to_bits() == t.weight_scale_2.to_bits(),
                 "shared FP8 scalar scale2 contract"
             );
-            checkpoint_weight(
-                store,
-                &format!("{prefix}.{projection}.{suffix}"),
-                w.weight,
-                rows,
-                WEIGHT_BYTES / 2,
-                false,
-            )?;
-            checkpoint_weight(
-                store,
-                &format!("{prefix}.{projection}.weight_scale"),
-                w.weight_scale,
-                rows,
-                WEIGHT_BYTES / 16,
-                true,
-            )?;
+            let derived = origins[i].validate(&w, rows, WEIGHT_BYTES / rows)?;
+            derived_bf16_weights += usize::from(derived);
+            if !derived {
+                checkpoint_weight(
+                    store,
+                    &format!("{prefix}.{projection}.{suffix}"),
+                    w.weight,
+                    rows,
+                    WEIGHT_BYTES / 2,
+                    false,
+                )?;
+                checkpoint_weight(
+                    store,
+                    &format!("{prefix}.{projection}.weight_scale"),
+                    w.weight_scale,
+                    rows,
+                    WEIGHT_BYTES / 16,
+                    true,
+                )?;
+            }
             for weight in [w, t] {
                 for (ptr, bytes) in [
                     (weight.weight, WEIGHT_BYTES / 2),
@@ -173,7 +185,7 @@ impl MoeLayer {
             converter.0 != 0 && self.fp8_gemm_k.0 != 0 && self.w4a16_gemm_t.0 != 0,
             "shared FP8 cache requires conversion and both GEMM handles"
         );
-        reserve(gpu.free_memory()?, plan.remaining_bytes)?;
+        reserve.check(gpu.free_memory()?, plan.remaining_bytes)?;
         let outputs = transaction(
             || gpu.alloc(WEIGHT_BYTES),
             |p| gpu.free(p),
@@ -224,6 +236,7 @@ impl MoeLayer {
             layer,
             bytes = 3 * WEIGHT_BYTES,
             total_bytes = plan.total_bytes,
+            derived_bf16_weights,
             verify,
             "GLM target shared FP8 cache installed"
         );

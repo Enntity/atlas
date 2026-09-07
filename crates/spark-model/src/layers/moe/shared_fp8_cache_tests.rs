@@ -59,10 +59,15 @@ fn target_shared_plan_rejects_geometry_and_invalid_dense_map() {
 fn target_shared_reserve_preserves_four_gib_floor_without_overflow() {
     let reserve_bytes = 1_056_964_608;
     let floor = 4 * 1024 * 1024 * 1024usize;
-    assert!(reserve(floor + reserve_bytes, reserve_bytes).is_ok());
-    assert!(reserve(floor + reserve_bytes - 1, reserve_bytes).is_err());
-    assert!(reserve(0, reserve_bytes).is_err());
-    assert!(reserve(usize::MAX, usize::MAX).is_err());
+    let reserve = SharedFp8Reserve::new(0, 0).unwrap();
+    assert!(reserve.check(floor + reserve_bytes, reserve_bytes).is_ok());
+    assert!(
+        reserve
+            .check(floor + reserve_bytes - 1, reserve_bytes)
+            .is_err()
+    );
+    assert!(reserve.check(0, reserve_bytes).is_err());
+    assert!(reserve.check(usize::MAX, usize::MAX).is_err());
 }
 
 #[test]
@@ -158,6 +163,29 @@ fn factory_reserve_preserves_arena_and_inference_without_double_cache_debit() {
     for (a, i, c) in [(usize::MAX, 1, 0), (1, usize::MAX, 0), (0, 1, usize::MAX)] {
         assert!(factory_required(a, i, c).is_err());
     }
+}
+
+#[test]
+fn deferred_reserve_keeps_future_arena_inference_and_physical_floor() {
+    let arena = 3_121_929_980;
+    let inference = 5_368_709_120;
+    let cache = 1_056_964_608;
+    let early_free = 8_832_421_888;
+    assert!(early_free >= factory_required(arena, inference, 0).unwrap());
+    let budget = SharedFp8Reserve::new(arena, inference).unwrap();
+    assert!(
+        budget.check(early_free, cache).is_err(),
+        "cache cannot yet fit at early transient point"
+    );
+    assert!(budget.check(arena + inference + cache, cache).is_ok());
+    assert!(budget.check(arena + inference + cache - 1, cache).is_err());
+    assert!(budget.check(arena + inference, 0).is_ok());
+    let floor = 4 * 1024 * 1024 * 1024;
+    let small = SharedFp8Reserve::new(1, 1).unwrap();
+    assert!(small.check(floor + cache, cache).is_ok());
+    assert!(small.check(floor + cache - 1, cache).is_err());
+    assert!(SharedFp8Reserve::new(usize::MAX, 1).is_err());
+    assert!(small.check(usize::MAX, usize::MAX).is_err());
 }
 
 #[test]

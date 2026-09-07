@@ -125,7 +125,7 @@ fn load_dense_ffn(
 fn load_moe(
     store: &WeightStore,
     lp: &str,
-    layer_idx: usize,
+    _layer_idx: usize,
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     variant: Nvfp4Variant,
@@ -176,34 +176,40 @@ fn load_moe(
         }
     }
     let shared = format!("{p}.shared_experts");
+    let (shared_gate, gate_origin) = crate::layers::moe::load_glm_shared_fp8_weight(
+        store,
+        &format!("{shared}.gate_proj"),
+        inter,
+        h,
+        gpu,
+        variant,
+        qctx,
+        allow_prefill_layout,
+    )?;
+    let (shared_up, up_origin) = crate::layers::moe::load_glm_shared_fp8_weight(
+        store,
+        &format!("{shared}.up_proj"),
+        inter,
+        h,
+        gpu,
+        variant,
+        qctx,
+        allow_prefill_layout,
+    )?;
+    let (shared_down, down_origin) = crate::layers::moe::load_glm_shared_fp8_weight(
+        store,
+        &format!("{shared}.down_proj"),
+        h,
+        inter,
+        gpu,
+        variant,
+        qctx,
+        allow_prefill_layout,
+    )?;
     let shared_expert = ExpertWeight {
-        gate_proj: quantized_any(
-            store,
-            &format!("{shared}.gate_proj"),
-            inter,
-            h,
-            gpu,
-            variant,
-            qctx,
-        )?,
-        up_proj: quantized_any(
-            store,
-            &format!("{shared}.up_proj"),
-            inter,
-            h,
-            gpu,
-            variant,
-            qctx,
-        )?,
-        down_proj: quantized_any(
-            store,
-            &format!("{shared}.down_proj"),
-            h,
-            inter,
-            gpu,
-            variant,
-            qctx,
-        )?,
+        gate_proj: shared_gate,
+        up_proj: shared_up,
+        down_proj: shared_down,
     };
     let bias = store.get(&format!("{p}.gate.e_score_correction_bias"))?;
     anyhow::ensure!(
@@ -222,6 +228,7 @@ fn load_moe(
         correction_bias: Some(DenseWeight { weight: bias.ptr }),
     };
     let mut layer = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
+    layer.set_shared_fp8_origins([gate_origin, up_origin, down_origin])?;
     let mmq_moe = env_flag("ATLAS_NVFP4_MMQ_MOE");
     let cutlass_moe = env_flag("ATLAS_MOE_GROUPED_CUTLASS");
     anyhow::ensure!(
@@ -247,16 +254,8 @@ fn load_moe(
         // remain transposed-only to avoid hybrid layout's memory cost.
         layer.transpose_for_prefill_unified_keep_shared(gpu, config)?;
     }
-    layer.maybe_cache_glm_target_shared_fp8(
-        store,
-        &shared,
-        config,
-        layer_idx,
-        allow_prefill_layout,
-        variant,
-        gpu,
-        qctx.stream,
-    )?;
+    // The factory installs optional shared FP8 caches only after all target,
+    // MTP and head loading has released replaced checkpoint allocations.
     Ok(FfnComponent::Moe(layer))
 }
 
