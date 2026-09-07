@@ -98,6 +98,27 @@ draft means2.160,2.266,2.308 differ from that control, while target-forward
 windows do not show a clear improvement. Keep the default OFF and separate
 numerical validation from performance attribution.
 
+## Predictor EH precision contract
+
+The repaired cache writer and prompt primer use retained BF16 EH, while the
+proposal path still used an optional requantized NVFP4 EH copy. Repair keeps
+the true-conditioned seed, leaving mixed precision in private history. This
+is a numerical approximation, not a demonstrated new token-alignment defect.
+Pinned vLLM uses an unquantized EH linear; WO and vocabulary are distinct
+precision choices. Isolate EH only, keeping WO/head/M16/repair unchanged.
+
+`GLM_MTP_NVFP4_EH=0` saves the optional18MiB/rank copy (BF16 was already
+resident). It passes all four strict answers. Coding148/256 full-wall runs
+26.179,27.688,27.258 give median27.258, post-first28.517; all caps complete.
+This is8.34% above the preceding matched M16-ON/EH-NVFP4 control25.160.
+Mean accepted drafts2.395,2.583,2.534 versus2.160,2.266,2.308. Client hash
+instrumentation `c45bf998` now records text identity after the timed window:
+all three BF16-EH outputs have SHA256
+`12046a6857a2c4411efb58c919331ecc16c7243ae22a1d12d9281857c0903fc2`.
+This is text equality, not a token-ID or broad semantic quality claim.
+The same target output despite varying acceptance motivates a bounded
+proposal-path determinism audit. Goal still open; confirming repeat pending.
+
 ## Accepted-history foundation and safety receipts
 
 `9c54d24c` adds checked GLM pair planning; `8bd85db1` extracts the existing
