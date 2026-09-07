@@ -62,7 +62,11 @@ class M5LauncherTests(unittest.TestCase):
                                      GLM_TARGET_SHARED_FP8_VERIFY="1").returncode, 2)
         self.assertEqual(self.prefix(GLM_TARGET_SHARED_FP8="1",
                                      GLM_TARGET_SHARED_FP8_VERIFY="1",
-                                     GLM_TP_VERIFY_GRAPH="0").returncode, 0)
+                                     GLM_TP_VERIFY_GRAPH="0").returncode, 2)
+        self.assertEqual(self.prefix(GLM_TARGET_SHARED_FP8="1",
+                                     GLM_TARGET_SHARED_FP8_VERIFY="1",
+                                     GLM_TP_VERIFY_GRAPH="0",
+                                     MOE_SHARED_REDUCE_OVERLAP="0").returncode, 0)
 
 
 if __name__ == "__main__":

@@ -197,6 +197,10 @@ for glm_m5_feature in GLM_M5_ROUTER_BN4 GLM_M5_SHARED_M16 GLM_TARGET_SHARED_FP8;
 done
 
 if [[ "$GLM_TARGET_SHARED_FP8" == "1" ]]; then
+  if [[ "$GLM_TARGET_SHARED_FP8_VERIFY" == "1" && "$MOE_SHARED_REDUCE_OVERLAP" != "0" ]]; then
+    echo "ERROR: GLM_TARGET_SHARED_FP8_VERIFY requires MOE_SHARED_REDUCE_OVERLAP=0." >&2
+    exit 2
+  fi
   if [[ ! "$MAX_PREFILL_TOKENS" =~ ^[1-9][0-9]{0,3}$ ]] || (( MAX_PREFILL_TOKENS > 1024 )); then
     echo "ERROR: GLM_TARGET_SHARED_FP8 requires MAX_PREFILL_TOKENS in 1..1024." >&2
     exit 2
