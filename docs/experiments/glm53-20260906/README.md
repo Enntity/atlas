@@ -8,6 +8,9 @@ For the active profile and safe rollback, use
 measurements are historical, not the current serving recommendation.
 The [phase-4 report](phase4-infrastructure-results.md) records typed cache
 contracts, state-indexed KDA, and the separate long-context limitations.
+The [phase-5 report](phase5-vllm-gap.md) records the vLLM gap audit, v13 stream
+lifecycle fixes, bounded execution-plan/codec infrastructure, and rejected
+KDA/MoE kernel experiments with retained measurements.
 
 This page records the first campaign. The follow-up
 [graph comparison](phase2-results.md) found only small/mixed throughput
