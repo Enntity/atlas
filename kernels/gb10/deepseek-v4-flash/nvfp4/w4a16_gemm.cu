@@ -1104,7 +1104,6 @@ void w4a16_gemm_t_m128(
         if (r1 < M && c1 < N) C[r1 * N + c1] = __float2bfloat16(acc1[nt][3]);
     }
 }
-
 // ═══════════════════════════════════════════════════════════════════
 // M128 variant of fp8_gemm_t: BF16 A × FP8 B, 2 M-chunks per CTA.
 //
@@ -1408,3 +1407,6 @@ void fp8_fp8_gemm_t_m128(
         if (r1 < M && c1 < N) C[r1 * N + c1] = __float2bfloat16(acc1[nt][3]);
     }
 }
+
+// GLM-only small-M shared projection; shares the primitives above.
+#include "glm_shared_m16.cuh"

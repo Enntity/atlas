@@ -9,7 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <vector>
-#include "glm_router_bn4.cuh"
+#include "../../kernels/gb10/deepseek-v4-flash/nvfp4/glm_router_bn4.cu"
 namespace r = glm_router_bn4;
 static void require(bool ok,const char* message) {
     if(!ok){std::fprintf(stderr,"FAIL: %s\n",message);std::exit(2);}

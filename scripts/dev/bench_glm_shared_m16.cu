@@ -12,7 +12,9 @@
 #include <cuda_runtime.h>
 #include "../../kernels/gb10/deepseek-v4-flash/nvfp4/w4a16_gemm.cu"
 #endif
-#include "glm_shared_m16.cuh"
+#ifdef ATLAS_SHARED_M16_HOST_ONLY
+#include "../../kernels/gb10/deepseek-v4-flash/nvfp4/glm_shared_m16.cuh"
+#endif
 
 static void require(bool ok, const char* message) {
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(2); }
