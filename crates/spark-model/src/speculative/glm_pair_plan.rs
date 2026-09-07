@@ -4,11 +4,12 @@
 //! identity, or live-state validation occurs here. Callers must bind counts,
 //! generations and normalized hidden ownership to real request state, then
 //! publish the returned state only after all planned cache writes succeed.
-//! Fixed C1/four-draft continuous speculation only; no runtime callers yet.
+//! Fixed C1/four-draft continuous speculation only; the opt-in GLM repair
+//! adapter binds these plans to the live request and existing private cache.
 
 use anyhow::{Context, Result, ensure};
 
-/// Explicit profile assertion supplied by a future checked runtime boundary.
+/// Explicit profile assertion supplied by the checked runtime boundary.
 /// This is not a replacement for GLM/TP/EP/BF16/server capability validation.
 #[derive(Clone, Copy, Debug)]
 pub struct Profile {

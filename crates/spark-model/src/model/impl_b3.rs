@@ -105,7 +105,11 @@ impl TransformerModel {
         // Give the drafter its prompt context on the first propose of this
         // sequence: whole-prompt prefill on a COLD turn, carried rows + a
         // short append on a WARM one. See `ensure_drafter_context`.
-        self.ensure_drafter_context(proposer, seq, &ctx, stream);
+        if crate::speculative::glm_repair_policy::enabled() {
+            self.prepare_glm_mtp_repair(seq, token, position, num_drafts, stream)?;
+        } else {
+            self.ensure_drafter_context(proposer, seq, &ctx, stream);
+        }
         let prop_state = seq
             .proposer_state
             .as_mut()

@@ -74,6 +74,35 @@ pub(crate) fn preflight_reserve(
     config: &ModelConfig,
     free_mem: usize,
 ) -> Result<ReservePreflight> {
+    if spark_model::speculative::glm_repair_policy::parse(
+        std::env::var("ATLAS_GLM_MTP_REPAIR").ok().as_deref(),
+    )? {
+        anyhow::ensure!(
+            !args.high_speed_swap && args.swap_space_gb == 0,
+            "GLM repair first lane requires resident state with swap disabled"
+        );
+        spark_model::speculative::glm_repair_policy::RepairPolicy {
+            model_type: &config.model_type,
+            world: args.world_size,
+            tp: args.tp_size,
+            ep: args.ep_size,
+            active: args.max_batch_size,
+            admitted: args.max_num_seqs,
+            context: args.max_seq_len,
+            drafts: args.resolved_num_drafts(),
+            native_only: args.speculative
+                && !(args.dflash || args.self_speculative || args.ngram_speculative),
+            bf16: args.kv_cache_dtype.as_deref() == Some("bf16"),
+            prefix_reuse: args.enable_prefix_caching,
+            force: args
+                .mtp_gate
+                .as_deref()
+                .map(|v| v == "force")
+                .unwrap_or_else(|| std::env::var("ATLAS_MTP_GATE_FORCE").as_deref() == Ok("1")),
+        }
+        .validate()?;
+        spark_model::speculative::glm_repair_policy::validate_environment()?;
+    }
     let c4_sparse = spark_model::model::glm_c4::validate_sparse_flag(
         &config.model_type,
         std::env::var("ATLAS_GLM_C4_SPARSE").ok().as_deref(),

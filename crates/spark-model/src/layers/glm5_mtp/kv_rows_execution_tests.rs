@@ -8,8 +8,14 @@ use crate::layer::{EmptyLayerState, TransformerLayer};
 use spark_runtime::{buffers::BufferArena, gpu::mock::MockGpuBackend};
 use std::sync::Arc;
 
-struct SlotBody(Arc<Mutex<Vec<i64>>>);
+#[path = "repair_execution_tests.rs"]
+mod repair_tests;
+
+struct SlotBody(Arc<Mutex<Vec<i64>>>, bool);
 impl TransformerLayer for SlotBody {
+    fn supports_mla_kv_only(&self) -> bool {
+        self.1
+    }
     fn alloc_state(&self, _: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         Ok(Box::new(EmptyLayerState))
     }
@@ -62,6 +68,21 @@ impl TransformerLayer for SlotBody {
 fn fixture(
     run: impl FnOnce(&Glm5MtpHead, &ForwardContext, &MockGpuBackend, &Arc<Mutex<Vec<i64>>>),
 ) {
+    fixture_rows(2, run);
+}
+
+fn fixture_rows(
+    max_rows: usize,
+    run: impl FnOnce(&Glm5MtpHead, &ForwardContext, &MockGpuBackend, &Arc<Mutex<Vec<i64>>>),
+) {
+    fixture_capable(true, max_rows, run);
+}
+
+fn fixture_capable(
+    capable: bool,
+    max_rows: usize,
+    run: impl FnOnce(&Glm5MtpHead, &ForwardContext, &MockGpuBackend, &Arc<Mutex<Vec<i64>>>),
+) {
     let gpu = MockGpuBackend::new();
     let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
     config.model_type = "glm5_next".into();
@@ -86,7 +107,7 @@ fn fixture(
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     let module = Glm5MtpModule {
-        body: Box::new(SlotBody(seen.clone())),
+        body: Box::new(SlotBody(seen.clone(), capable)),
         enorm: dense(1024),
         hnorm: dense(1024),
         eh_proj: dense(512 * 1024 * 2),
@@ -102,7 +123,7 @@ fn fixture(
         )
         .unwrap();
     }
-    let buffers = BufferArena::new(&config, 2, 64, 16, 1, &gpu).unwrap();
+    let buffers = BufferArena::new(&config, max_rows, 64, 16, 1, &gpu).unwrap();
     let mut dispatch = ops::GemmDispatch::defaults();
     dispatch.cublas_gemm = false;
     let derived = ops::DerivedWeights::new();
@@ -249,5 +270,66 @@ fn malformed_requests_do_not_launch_copy_allocate_or_mutate_state() {
         assert_eq!(gpu.sync_count(), 0);
         assert_eq!(gpu.alloc_count(), allocations);
         assert!(seen.lock().is_empty());
+    });
+}
+
+#[test]
+fn unsupported_body_is_rejected_before_gpu_work_or_primer_allocation() {
+    fixture_capable(false, 2, |head, ctx, gpu, seen| {
+        let source = gpu.alloc(2048).unwrap();
+        let mut state = head.alloc_state_inner(gpu).unwrap();
+        let free = head.kv_cache.lock().num_free_blocks();
+        let allocations = gpu.alloc_count();
+        assert!(
+            head.prefill_kv_batched(&[0, 1, 2], source, &mut state, ctx, 0)
+                .is_err()
+        );
+        assert!(state.block_table.is_empty());
+        assert_eq!(state.seq_len, 0);
+        assert_eq!(head.kv_cache.lock().num_free_blocks(), free);
+        assert_eq!(gpu.alloc_count(), allocations);
+        assert_eq!(
+            (gpu.launch_count(), gpu.d2d_count(), gpu.sync_count()),
+            (0, 0, 0)
+        );
+        assert!(seen.lock().is_empty());
+    });
+}
+
+#[test]
+fn resident_oracle_executes_real_reference_and_writer_with_shuffled_blocks() {
+    fixture(|head, ctx, gpu, seen| {
+        let source = DeviceSpan {
+            ptr: gpu.alloc(4096).unwrap(),
+            bytes: 4096,
+        };
+        let mut cache = head.kv_cache.lock();
+        for _ in 0..3 {
+            cache.alloc_block().unwrap();
+        }
+        let blocks = [1, 2, 0];
+        let tokens = [1, 4, 2, 3];
+        let plan = KvRowsPlan::new(
+            &tokens,
+            source,
+            512,
+            8,
+            31,
+            16,
+            &blocks,
+            cache.num_blocks(),
+            2,
+            ctx.buffers.scratch_bytes(),
+            &[],
+        )
+        .unwrap();
+        let allocations = gpu.alloc_count();
+        head.verify_kv_rows(&tokens, &plan, source, &blocks, &mut cache, ctx, 0)
+            .unwrap();
+        assert_eq!(*seen.lock(), [16, 17, 18, 19, 47, 0, 1, 2]);
+        assert_eq!(gpu.launch_count(), 20);
+        assert_eq!(gpu.alloc_count(), allocations);
+        let (reference_k, reference_v) = cache.read_block(0, 1, gpu).unwrap();
+        assert!(reference_k.iter().chain(&reference_v).all(|&b| b == 0));
     });
 }

@@ -292,6 +292,9 @@ pub fn step_mtp(
 
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp: {e:#}");
+            if spark_model::speculative::glm_repair_policy::enabled() {
+                a.finished = true;
+            }
             continue;
         }
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
@@ -327,9 +330,17 @@ pub fn step_mtp(
                     tracing::debug!("MTP bootstrap: tok={tok} → drafts={drafts:?}");
                     a.pending_drafts = drafts;
                 }
-                Ok(_) => tracing::warn!("MTP propose returned empty"),
+                Ok(_) => {
+                    tracing::warn!("MTP propose returned empty");
+                    if spark_model::speculative::glm_repair_policy::enabled() {
+                        a.finished = true;
+                    }
+                }
                 Err(e) => {
                     tracing::error!("run_mtp_propose_multi: {e:#}");
+                    if spark_model::speculative::glm_repair_policy::enabled() {
+                        a.finished = true;
+                    }
                 }
             }
         }

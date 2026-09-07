@@ -10,6 +10,8 @@ use super::*;
 use crate::api::InferenceRequest;
 use crate::grammar::GrammarEngine;
 
+mod repair_admission;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_new_requests(
     model: &dyn Model,
@@ -31,6 +33,10 @@ pub(super) fn start_new_requests(
     active: &mut Vec<ActiveSeq>,
     prefilling: &mut Vec<PrefillInProgress>,
 ) {
+    let new_reqs = repair_admission::filter(
+        new_reqs,
+        spark_model::speculative::glm_repair_policy::enabled(),
+    );
     // Co-dispatch (ATLAS_PREFILL_CODISPATCH=1): when >=2 non-vision requests are
     // co-admitted this tick with no active decode to starve, DEFER their chunk-0
     // prefill so they batch into one forward via run_batched_prefill_step (which

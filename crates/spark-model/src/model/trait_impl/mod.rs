@@ -738,6 +738,16 @@ impl Model for TransformerModel {
     ) -> Result<Option<u32>> {
         self.run_mtp_propose_dispatch(token, position, seq, _stream)
     }
+    fn record_glm_mtp_verified(
+        &self,
+        seq: &mut SequenceState,
+        base: usize,
+        tokens: &[u32],
+        accepted: usize,
+    ) -> Result<()> {
+        self.record_glm_mtp_verified_impl(seq, base, tokens, accepted)
+    }
+
     fn run_mtp_propose_multi(
         &self,
         token: u32,

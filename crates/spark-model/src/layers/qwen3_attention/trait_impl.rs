@@ -100,6 +100,10 @@ impl TransformerLayer for Qwen3AttentionLayer {
             .map(|cal| !cal.is_calibrating())
     }
 
+    fn supports_mla_kv_only(&self) -> bool {
+        self.mla.as_ref().is_some_and(|mla| mla.rope == 0)
+    }
+
     fn prefill_mla_kv_only(
         &self,
         hidden: DevicePtr,

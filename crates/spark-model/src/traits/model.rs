@@ -844,6 +844,18 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// Record an actual K5 verified commit, distinct from unverified discard.
+    /// Default no-op; the GLM repair lane binds request-owned pending state.
+    fn record_glm_mtp_verified(
+        &self,
+        _seq: &mut SequenceState,
+        _base: usize,
+        _tokens: &[u32],
+        _accepted: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Run the MTP proposer for one draft token off the saved hidden state.
     /// `None` when no proposer is wired.
     fn run_mtp_propose(

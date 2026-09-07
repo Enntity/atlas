@@ -7,8 +7,9 @@ reviewed, committed and native-tested. Root's matched LRU coding receipt
 the cap. This is the hidden-handoff result, not accepted-cache repair.
 The earlier v13 diagnostic chat failure and v14 thinking-EOS delivery issue
 are separate lifecycle observations; the latter has its own reviewed fix.
-Slice B has a CPU-only pair-planning foundation; accepted cache repair is
-not integrated. Scope is the existing bounded
+Slice B now has a default-off runtime adapter using the committed CPU planner
+and extracted KV writer. Native validation and speed/quality attribution are
+still pending; the adapter has no deployment claim. Scope is the existing bounded
 C1 native-MTP lane, not concurrent speculation or long context.
 
 Slice A is committed as `a35ad139`. CPU receipt: behavior-preserving extracted
@@ -24,7 +25,8 @@ not a GPU RMSNorm or model acceptance oracle.
 
 Slice B pure planning foundation is now isolated in
 `crates/spark-model/src/speculative/glm_pair_plan.rs` with sibling tests and
-one module export. It has no serving caller, allocation, or wire change.
+one module export. The subsequent opt-in runtime adapter now consumes it;
+the planner itself still has no allocation or wire change.
 The initial tests failed to compile before implementation (missing module),
 then 9/9 focused tests passed. The final combined model suite passed 751/751,
 including all nine latest planner tests; receipt:
@@ -36,7 +38,7 @@ and verified/discarded proposal transitions return private immutable state
 and checked `PairWrite` source/destination spans. Caller-provided generation,
 position and capacity assertions are not live-state or wire authentication.
 
-Intended next callers, still not implemented:
+Implemented callers in the default-off runtime adapter:
 
 - GLM proposer bootstrap prepares the missing shifted prompt tail after the
   existing eager primer, consuming owned post-norm prompt rows. Its write
@@ -60,7 +62,54 @@ Future runtime admission must bind those capacities to actual allocations;
 an unexpected error after an issued forward is not permission to continue
 with stale cache state.
 
-## Proposed slice B runtime patch, not authorized by this document
+## Slice B runtime patch and validation status
+
+Root authorized implementation after reviewing this plan. Runtime state and
+writer live in `layers/glm5_mtp/{repair_state,repair}.rs`; the live metadata
+binding is `model/glm_mtp_repair.rs`. The model trait's explicit verdict hook
+is called by the actual K5 head and F5 worker paths. No new collective, wire
+field, persistent buffer, or CUDA kernel is introduced by this adapter.
+
+CPU TDD: missing state module produced RED, then all three phase tests were
+GREEN. Actual KV writer tests cover lazy bootstrap, every acceptance count,
+accepted-only staging, untouched bonus storage, stale/aliased inputs before
+mutation, terminal release, and injected copy failure retaining a Failed
+phase instead of publishing the planned cursor. Actual K5 scheduler tests
+cover all acceptance counts, record-before-terminal-emission and no output
+or proposal after invalid verdict. Admission tests exercise real blocking
+and streaming error sinks. These do not establish CUDA KV numerics; the
+separate opt-in resident-weight oracle is described in
+[the oracle plan](glm-mtp-kv-oracle-plan.md).
+
+Final frozen-source CPU receipts in
+`/tmp/atlas-glm53-phase6-20260907.J5PkkO/`:
+`accepted-pair-runtime-model-cpu.log` (771 passed),
+`accepted-pair-runtime-server-cpu-color-serial.log` (2342 passed, 12 ignored),
+and launcher repair/MLA/C4 suites (9 passed). The initial parallel server run
+retained in `accepted-pair-runtime-server-cpu.log` failed four unrelated TUI
+tests under inherited NO_COLOR/time-sensitive rendering; the known full-suite
+recipe removes NO_COLOR, sets COLORTERM=truecolor, runs serially from repo cwd.
+No TUI source was changed. Source and lifecycle ordering were independently
+reviewed; native repaired-cache correctness and matched A/B remain pending.
+
+First deployment lane additionally requires `--swap-space-gb 0` and no
+`--high-speed-swap`. The launcher exposes `SWAP_SPACE_GB`, preserving the
+server's existing default 3 for other profiles and requiring explicit 0 for
+repair. Ordinary watchdogs, cancellation, context/output ceilings and the
+post-load >=4 GiB free-memory check remain. An unexpected restored/gapped
+position fails before a new E1; it is never silently repaired from guessed
+history. Prefix/SSM storage need not be deallocated merely because reuse is
+forbidden in this cold-request lane.
+
+Launcher additions for the matched continuous A/B (alongside the existing
+TP2/C1/MTP4/BF16 profile): `GLM_MTP_REPAIR=1 MTP_GATE_FORCE=1
+MTP_SINGLE_DEPTH_ADAPT=0 MTP_SPEC_THINK=1 GLM_MTP_DISTRIBUTED=1
+MTP_PREFILL_ONLY=1 SWAP_SPACE_GB=0`. `MTP_PREFILL_ONLY=1` forwards the existing
+explicit `ATLAS_MTP_DRAFTER_CONTEXT_PREFILL_ONLY_UNSAFE=1` research policy;
+obsolete carry variables are not substitutes. The optional diagnostic is
+`GLM_MTP_KV_REPAIR_VERIFY=1`, never used in timed runs. Both ranks receive
+identical rollout/policy flags. The baseline must use the same forced,
+prefill-only, swap-disabled policy with repair off for attribution.
 
 Rollout name proposed: `GLM_MTP_REPAIR=0|1` in the dual-Spark launcher,
 forwarded as `ATLAS_GLM_MTP_REPAIR` to both ranks, default off. This is a

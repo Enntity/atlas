@@ -4,6 +4,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "verify_dflash_repair_tests.rs"]
+mod repair_tests;
+
 /// Width-generic γ-token verify with accept-prefix.
 ///
 /// Routes `[last_token, drafts...]` through Atlas's width-generic target
@@ -162,6 +166,13 @@ pub fn step_verify_dflash(
         }
     }
 
+    if let Err(e) = model.record_glm_mtp_verified(&mut a.seq, pre_verify_len, &tokens, num_accepted)
+    {
+        tracing::error!("GLM verified-pair record: {e:#}");
+        a.finished = true;
+        return;
+    }
+
     // EAGLE-fix (ATLAS_DFLASH_EAGLE_FIX=1): append one ctx slot per committed
     // position (rows 0..=num_accepted at N..=N+num_accepted), with the bonus
     // generator (row num_accepted) freshest. Fixes the ctx-undercount (was 1
@@ -250,10 +261,18 @@ pub fn step_verify_dflash(
     let bonus_token_idx = total_accepted.saturating_sub(1);
     if let Err(e) = model.save_hidden_for_mtp(bonus_token_idx, 0) {
         tracing::error!("save_hidden_for_mtp (dflash): {e:#}");
+        if spark_model::speculative::glm_repair_policy::enabled() {
+            a.finished = true;
+            return;
+        }
     }
 
     if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
         tracing::error!("trim_proposer_state: {e:#}");
+        if spark_model::speculative::glm_repair_policy::enabled() {
+            a.finished = true;
+            return;
+        }
     }
 
     // Re-propose for next step — unless adaptive speculation just suspended
@@ -276,8 +295,17 @@ pub fn step_verify_dflash(
             _mtp_grammar_mask.as_deref(),
         ) {
             Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => tracing::error!("run_mtp_propose_multi (dflash): {e:#}"),
+            Ok(_) => {
+                if spark_model::speculative::glm_repair_policy::enabled() {
+                    a.finished = true;
+                }
+            }
+            Err(e) => {
+                tracing::error!("run_mtp_propose_multi (dflash): {e:#}");
+                if spark_model::speculative::glm_repair_policy::enabled() {
+                    a.finished = true;
+                }
+            }
         }
     }
     sched

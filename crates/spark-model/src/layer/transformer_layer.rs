@@ -59,6 +59,12 @@ pub trait TransformerLayer: Send + Sync {
         None
     }
 
+    /// Read-only capability check before a KV-only caller mutates scratch or
+    /// temporarily overwrites a reference cache prefix. No GPU work is allowed.
+    fn supports_mla_kv_only(&self) -> bool {
+        false
+    }
+
     /// Populate only this layer's compressed MLA K/V cache for a batch of
     /// already-combined MTP inputs. This deliberately skips Q projection,
     /// attention, output projection, and FFN work: an autoregressive draft

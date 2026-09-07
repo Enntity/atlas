@@ -29,6 +29,7 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 TP_SIZE="${TP_SIZE:-1}"
 OOM_GUARD_MB="${OOM_GUARD_MB:-4096}"
 KV_OVERCOMMIT="${KV_OVERCOMMIT:-1}"
+SWAP_SPACE_GB="${SWAP_SPACE_GB:-3}"
 # The server deadline includes chunked prefill. A 100K request currently takes
 # longer than Atlas's 300-second default on two Sparks, so expose the existing
 # serve flag without weakening the default for short-context deployments.
@@ -112,6 +113,12 @@ GLM_MTP_NVFP4_WO="${GLM_MTP_NVFP4_WO:-1}"
 # Experimental distributed proposer: keep disabled unless both ranks should
 # load and execute the appended layer with the target's overlapping TP2/EP2.
 GLM_MTP_DISTRIBUTED="${GLM_MTP_DISTRIBUTED:-0}"
+GLM_MTP_REPAIR="${GLM_MTP_REPAIR:-0}"
+GLM_MTP_KV_REPAIR_VERIFY="${GLM_MTP_KV_REPAIR_VERIFY:-0}"
+# Existing explicit cold-request research policy: capture on, carry off.
+MTP_PREFILL_ONLY="${MTP_PREFILL_ONLY:-0}"
+GLM_MOE_GATE_UP_M16="${GLM_MOE_GATE_UP_M16:-0}"
+GLM_MOE_GATE_UP_M16_VERIFY="${GLM_MOE_GATE_UP_M16_VERIFY:-0}"
 # One in-place all-gather replaces the two synchronous half-vocabulary
 # broadcasts whenever the split-vocabulary proposer is selected.
 GLM_MTP_ALL_GATHER="${GLM_MTP_ALL_GATHER:-$GLM_MTP_DISTRIBUTED}"
@@ -142,6 +149,29 @@ GLM_MTP_SERIAL_PREFILL="${GLM_MTP_SERIAL_PREFILL:-0}"
 # the batched KV-only path by default whenever speculative decode is enabled.
 # The serial path remains an explicit correctness/debugging oracle.
 GLM_MTP_BATCHED_PREFILL="${GLM_MTP_BATCHED_PREFILL:-$SPECULATIVE}"
+
+for glm_checked_flag in GLM_MTP_REPAIR GLM_MTP_KV_REPAIR_VERIFY MTP_PREFILL_ONLY GLM_MOE_GATE_UP_M16 GLM_MOE_GATE_UP_M16_VERIFY; do
+  if [[ "${!glm_checked_flag}" != "0" && "${!glm_checked_flag}" != "1" ]]; then
+    echo "ERROR: $glm_checked_flag must be 0 or 1." >&2
+    exit 2
+  fi
+done
+if [[ "$GLM_MTP_REPAIR" == "1" && ( "$SPECULATIVE" != "1" || "$TP_SIZE" != "2" || "$MAX_BATCH_SIZE" != "1" || "$MAX_NUM_SEQS" != "1" || "$NUM_DRAFTS" != "4" || "$MTP_GATE_FORCE" != "1" || "$MTP_SPEC_THINK" != "1" || "$MTP_SINGLE_DEPTH_ADAPT" != "0" || "$GLM_MTP_DISTRIBUTED" != "1" || "$GLM_MTP_BATCHED_PREFILL" != "1" || "$GLM_MTP_SERIAL_PREFILL" != "0" || "$MTP_PREFILL_ONLY" != "1" ) ]]; then
+  echo "ERROR: GLM_MTP_REPAIR=1 requires cold C1 TP2/EP2 native MTP4, forced continuous speculation, no depth adaptation, distributed/batched primer, and MTP_PREFILL_ONLY=1." >&2
+  exit 2
+fi
+if [[ "$GLM_MTP_KV_REPAIR_VERIFY" == "1" && "$GLM_MTP_REPAIR" != "1" ]]; then
+  echo "ERROR: GLM_MTP_KV_REPAIR_VERIFY requires GLM_MTP_REPAIR=1." >&2
+  exit 2
+fi
+if [[ "$GLM_MTP_REPAIR" == "1" && "$SWAP_SPACE_GB" != "0" ]]; then
+  echo "ERROR: GLM_MTP_REPAIR=1 requires SWAP_SPACE_GB=0 for fully resident state." >&2
+  exit 2
+fi
+if [[ "$GLM_MOE_GATE_UP_M16_VERIFY" == "1" && "$GLM_MOE_GATE_UP_M16" != "1" ]]; then
+  echo "ERROR: GLM_MOE_GATE_UP_M16_VERIFY requires GLM_MOE_GATE_UP_M16=1." >&2
+  exit 2
+fi
 
 MODEL_MAX_SEQ_LEN=1048576
 if (( MAX_SEQ_LEN > MODEL_MAX_SEQ_LEN )); then
@@ -551,6 +581,7 @@ COMMON_SERVE_ARGS=(
   --max-num-seqs "$MAX_NUM_SEQS"
   --gpu-memory-utilization "$GPU_MEM_UTIL"
   --kv-cache-dtype bf16
+  --swap-space-gb "$SWAP_SPACE_GB"
   --oom-guard-mb "$OOM_GUARD_MB"
   --request-timeout "$REQUEST_TIMEOUT"
   --lm-head-dtype "$LM_HEAD_DTYPE"
@@ -627,6 +658,8 @@ echo "  GLM K5 batched TF32 mHC: $GLM_K5_HC_CUBLAS"
 echo "  GLM MTP decode-native NVFP4 eh_proj: $GLM_MTP_NVFP4_EH"
 echo "  GLM MTP decode-native NVFP4 MLA o_proj: $GLM_MTP_NVFP4_WO"
 echo "  GLM mirrored-body split-vocabulary MTP: $GLM_MTP_DISTRIBUTED"
+echo "  GLM accepted-pair repair / oracle / cold prefill-only: $GLM_MTP_REPAIR / $GLM_MTP_KV_REPAIR_VERIFY / $MTP_PREFILL_ONLY"
+echo "  GLM M16 gate/up / oracle: $GLM_MOE_GATE_UP_M16 / $GLM_MOE_GATE_UP_M16_VERIFY"
 echo "  GLM MTP one-collective vocabulary gather: $GLM_MTP_ALL_GATHER"
 echo "  GLM MTP distributed top-1 reduction: $GLM_MTP_DISTRIBUTED_ARGMAX"
 echo "  GLM K5 exact-M5 BF16 router: $GLM_K5_ROUTER_M5"
@@ -717,6 +750,11 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_GLM_MTP_NVFP4_EH=$GLM_MTP_NVFP4_EH \
   -e ATLAS_GLM_MTP_NVFP4_WO=$GLM_MTP_NVFP4_WO \
   -e ATLAS_GLM_MTP_DISTRIBUTED=$GLM_MTP_DISTRIBUTED \
+  -e ATLAS_GLM_MTP_REPAIR=$GLM_MTP_REPAIR \
+  -e ATLAS_GLM_MTP_KV_REPAIR_VERIFY=$GLM_MTP_KV_REPAIR_VERIFY \
+  -e ATLAS_MTP_DRAFTER_CONTEXT_PREFILL_ONLY_UNSAFE=$MTP_PREFILL_ONLY \
+  -e ATLAS_GLM_MOE_GATE_UP_M16=$GLM_MOE_GATE_UP_M16 \
+  -e ATLAS_GLM_MOE_GATE_UP_M16_VERIFY=$GLM_MOE_GATE_UP_M16_VERIFY \
   -e ATLAS_GLM_MTP_ALL_GATHER=$GLM_MTP_ALL_GATHER \
   -e ATLAS_GLM_MTP_DISTRIBUTED_ARGMAX=$GLM_MTP_DISTRIBUTED_ARGMAX \
   -e ATLAS_GLM_K5_ROUTER_M5=$GLM_K5_ROUTER_M5 \
@@ -801,6 +839,11 @@ docker run -d \
   -e ATLAS_GLM_MTP_NVFP4_EH="$GLM_MTP_NVFP4_EH" \
   -e ATLAS_GLM_MTP_NVFP4_WO="$GLM_MTP_NVFP4_WO" \
   -e ATLAS_GLM_MTP_DISTRIBUTED="$GLM_MTP_DISTRIBUTED" \
+  -e ATLAS_GLM_MTP_REPAIR="$GLM_MTP_REPAIR" \
+  -e ATLAS_GLM_MTP_KV_REPAIR_VERIFY="$GLM_MTP_KV_REPAIR_VERIFY" \
+  -e ATLAS_MTP_DRAFTER_CONTEXT_PREFILL_ONLY_UNSAFE="$MTP_PREFILL_ONLY" \
+  -e ATLAS_GLM_MOE_GATE_UP_M16="$GLM_MOE_GATE_UP_M16" \
+  -e ATLAS_GLM_MOE_GATE_UP_M16_VERIFY="$GLM_MOE_GATE_UP_M16_VERIFY" \
   -e ATLAS_GLM_MTP_ALL_GATHER="$GLM_MTP_ALL_GATHER" \
   -e ATLAS_GLM_MTP_DISTRIBUTED_ARGMAX="$GLM_MTP_DISTRIBUTED_ARGMAX" \
   -e ATLAS_GLM_K5_ROUTER_M5="$GLM_K5_ROUTER_M5" \

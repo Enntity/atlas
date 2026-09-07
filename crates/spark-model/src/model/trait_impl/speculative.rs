@@ -435,6 +435,15 @@ impl TransformerModel {
         _stream: u64,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
+        self.validate_glm_mtp_repair(
+            seq,
+            token,
+            position,
+            num_drafts,
+            self.last_mtp_hidden_idx
+                .load(std::sync::atomic::Ordering::Relaxed),
+            grammar_bitmask.is_some(),
+        )?;
         if crate::layers::glm5_mtp::distributed_enabled() {
             anyhow::ensure!(
                 self.config.model_type == "glm5_next"

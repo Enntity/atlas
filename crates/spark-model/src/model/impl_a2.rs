@@ -499,6 +499,14 @@ impl TransformerModel {
                     "distributed GLM MTP hidden row {} exceeds verify limit",
                     hidden_row
                 );
+                self.validate_glm_mtp_repair(
+                    seq,
+                    *token,
+                    *position as usize,
+                    num_drafts,
+                    *hidden_row as usize,
+                    false,
+                )?;
                 self.save_hidden_for_mtp(*hidden_row as usize, stream)?;
                 let drafts =
                     self.run_mtp_propose_inner(*token, *position as usize, num_drafts, seq, None)?;
@@ -624,6 +632,13 @@ impl TransformerModel {
                     "EP generic verify accepted {num_accepted} drafts for K={k}"
                 );
                 let committed = num_accepted + 1;
+                let verify_base = if crate::speculative::glm_repair_policy::enabled() {
+                    seq.seq_len
+                        .checked_sub(k)
+                        .ok_or_else(|| anyhow::anyhow!("EP verify base underflow"))?
+                } else {
+                    0
+                };
                 let to_drop = k - committed;
                 if to_drop > 0 {
                     anyhow::ensure!(
@@ -637,6 +652,7 @@ impl TransformerModel {
                         seq.tokens.pop();
                     }
                 }
+                self.record_glm_mtp_verified_impl(seq, verify_base, &tokens, num_accepted)?;
                 self.trim_proposer_state(seq, num_accepted, 0)?;
                 self.commit_accepted_prefix(seq, committed, k)?;
             }

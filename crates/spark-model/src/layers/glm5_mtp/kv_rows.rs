@@ -59,7 +59,7 @@ impl Glm5MtpHead {
         Ok(tokens.len())
     }
 
-    fn validate_kv_blocks(&self, cache: &PagedKvCache, blocks: &[u32]) -> Result<()> {
+    pub(super) fn validate_kv_blocks(&self, cache: &PagedKvCache, blocks: &[u32]) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         for &block in blocks {
             ensure!(
@@ -74,7 +74,7 @@ impl Glm5MtpHead {
         Ok(())
     }
 
-    fn validate_kv_inputs(
+    pub(super) fn validate_kv_inputs(
         &self,
         tokens: &[u32],
         source: DeviceSpan,
@@ -95,6 +95,10 @@ impl Glm5MtpHead {
             "GLM KV writer requires its BF16 NoPE512 cache"
         );
         ensure!(!ctx.graph_capture, "GLM KV writer is eager only");
+        ensure!(
+            self.module.body.supports_mla_kv_only(),
+            "GLM KV writer requires a KV-only MLA body"
+        );
         let h = ctx.config.hidden_size;
         let row_bytes = h.checked_mul(2).context("GLM KV row overflow")?;
         let n = tokens.len().min(ctx.buffers.max_batch_tokens());
@@ -243,10 +247,14 @@ impl Glm5MtpHead {
             ctx.buffers.scratch_bytes(),
             &forbidden,
         )?;
-        self.execute_kv_rows(&plan, source, &mut cache, ctx, stream)
+        if super::kv_rows_oracle::enabled(tokens.len()) {
+            self.verify_kv_rows(tokens, &plan, source, blocks, &mut cache, ctx, stream)
+        } else {
+            self.execute_kv_rows(&plan, source, &mut cache, ctx, stream)
+        }
     }
 
-    fn execute_kv_rows(
+    pub(super) fn execute_kv_rows(
         &self,
         plan: &KvRowsPlan,
         source: DeviceSpan,

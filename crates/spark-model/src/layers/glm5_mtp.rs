@@ -30,6 +30,15 @@ mod kv_rows_plan;
 #[path = "glm5_mtp/kv_rows.rs"]
 mod kv_rows;
 
+#[path = "glm5_mtp/kv_rows_oracle.rs"]
+mod kv_rows_oracle;
+
+#[path = "glm5_mtp/repair_state.rs"]
+mod repair_state;
+
+#[path = "glm5_mtp/repair.rs"]
+mod repair;
+
 pub(crate) fn distributed_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("ATLAS_GLM_MTP_DISTRIBUTED").ok().as_deref() == Some("1"))
@@ -84,6 +93,7 @@ fn mtp_bf16_drafts() -> usize {
 }
 
 pub struct Glm5MtpProposerState {
+    repair: repair_state::RepairPhase,
     pub block_table: Vec<u32>,
     pub seq_len: usize,
     pub last_num_drafted: usize,
@@ -97,6 +107,31 @@ impl ProposerState for Glm5MtpProposerState {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+impl Glm5MtpProposerState {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_verified(
+        &mut self,
+        generation: u64,
+        capture_generation: u64,
+        base: usize,
+        tokens: &[u32],
+        accepted: usize,
+        position: usize,
+        hidden_rows: usize,
+    ) -> Result<()> {
+        self.repair.record(
+            generation,
+            capture_generation,
+            base,
+            tokens,
+            accepted,
+            position,
+            self.seq_len,
+            hidden_rows,
+        )
     }
 }
 
@@ -171,6 +206,7 @@ impl Glm5MtpHead {
 
     fn alloc_state_inner(&self, gpu: &dyn GpuBackend) -> Result<Glm5MtpProposerState> {
         Ok(Glm5MtpProposerState {
+            repair: repair_state::RepairPhase::Capture,
             block_table: Vec::new(),
             seq_len: 0,
             last_num_drafted: 0,
@@ -649,6 +685,9 @@ fn grammar_argmax(
 }
 
 impl DraftProposer for Glm5MtpHead {
+    fn glm_pair_repair(&self) -> Option<&dyn crate::speculative::glm_repair::GlmPairRepair> {
+        Some(self)
+    }
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         Ok(Box::new(self.alloc_state_inner(gpu)?))
     }
@@ -733,6 +772,18 @@ impl DraftProposer for Glm5MtpHead {
             .as_any_mut()
             .downcast_mut::<Glm5MtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("invalid GLM-5 MTP proposer state"))?;
+        if crate::speculative::glm_repair_policy::enabled() {
+            let repair_state::RepairPhase::Proposed(plan) = state.repair else {
+                anyhow::bail!("GLM repair proposal was not prepared");
+            };
+            anyhow::ensure!(
+                num_drafts == 4
+                    && grammar_bitmask.is_none()
+                    && plan.position() == position
+                    && state.seq_len.checked_add(4) == Some(plan.speculative_cache_end()),
+                "GLM repair proposal metadata changed after prepare"
+            );
+        }
         let mut drafts = Vec::with_capacity(num_drafts);
         let mut token = last_token;
         let mut hidden = target_hidden;
@@ -766,6 +817,9 @@ impl DraftProposer for Glm5MtpHead {
             .as_any_mut()
             .downcast_mut::<Glm5MtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("invalid GLM-5 MTP proposer state"))?;
+        if crate::speculative::glm_repair_policy::enabled() {
+            return state.repair.acknowledge(num_accepted);
+        }
         state.seq_len = state
             .seq_len
             .saturating_sub(state.last_num_drafted.saturating_sub(num_accepted));
@@ -782,6 +836,8 @@ impl DraftProposer for Glm5MtpHead {
             state.block_table.clear();
         }
         state.seq_len = 0;
+        state.repair = repair_state::RepairPhase::Capture;
+        state.last_num_drafted = 0;
         Ok(())
     }
 }
