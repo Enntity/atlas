@@ -47,6 +47,7 @@ def one_request(
     first_text = None
     usage = None
     finish_reason = None
+    text_chunks = []
     with requests.post(
         f"{base_url}/v1/completions", json=body, stream=True, timeout=timeout
     ) as response:
@@ -63,6 +64,8 @@ def one_request(
             if first_text is None and any(c.get("text") for c in event.get("choices", [])):
                 first_text = time.perf_counter()
             for choice in event.get("choices", []):
+                if choice.get("text"):
+                    text_chunks.append(choice["text"])
                 if choice.get("finish_reason") is not None:
                     finish_reason = choice["finish_reason"]
             if event.get("usage"):
@@ -72,6 +75,9 @@ def one_request(
         raise RuntimeError("stream ended without text or usage")
     if int(usage["prompt_tokens"]) != len(prompt):
         raise RuntimeError("server prompt token count does not match supplied prompt")
+    # Text identity, not token-ID or semantic equivalence. Hash outside the
+    # timed window, preserving the request and all historical rate formulas.
+    completion_text = "".join(text_chunks).encode("utf-8")
     return {
         "started": started,
         "first_text": first_text,
@@ -81,6 +87,8 @@ def one_request(
         "ttft_ms": float(usage["time_to_first_token_ms"]),
         "decode_tps": float(usage["response_token/s"]),
         "finish_reason": finish_reason,
+        "completion_text_sha256": hashlib.sha256(completion_text).hexdigest(),
+        "completion_text_bytes": len(completion_text),
     }
 
 
@@ -133,6 +141,8 @@ def summarize_batch(rows: list[dict], requested_output_tokens: int) -> dict:
                 "end_offset_ms": round((row["ended"] - started) * 1000, 3),
                 "completion_tokens": row["completion_tokens"],
                 "finish_reason": row.get("finish_reason"),
+                "completion_text_sha256": row.get("completion_text_sha256"),
+                "completion_text_bytes": row.get("completion_text_bytes"),
             }
             for row in rows
         ],
