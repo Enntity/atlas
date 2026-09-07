@@ -11,6 +11,7 @@ an unqualified diagnostic as completion.
 |---|---|---|---:|---:|
 | v13 | `2465672f` |18.425,18.516,18.729|18.516|19.104|
 | v14 | `014dbe29` |24.813,24.280,21.741|24.280|25.304|
+| v15 | `4a5a45d5` |24.457,23.013,24.016|24.016|25.004|
 
 Both used one warmup plus three measured waves, exact coding148/256,
 temperature0/seed1 and normal repetition policy. All measured outputs hit256.
@@ -32,7 +33,16 @@ output/context ceilings authoritative even through suppressed-EOS returns.
 Regression tests: RED0/2 then GREEN2/2. A first test fixture mistakenly
 started already finished and was corrected before the meaningful RED run;
 all failed logs remain in the raw archive. Full server CPU suite2338 passed,
-12 ignored. Native visible-answer confirmation is still pending here.
+12 ignored. Native v15 visible-answer checks now pass all four cases:
+arithmetic, sorting, Python AST and strict JSON. Its matched coding run also
+completed all256-token caps. The persistent gate includes intervening quality
+requests, so its phase differs from v14; the small median difference is not
+an isolated EOS-fix performance measurement.
+
+A bounded v15 near-context retrieval check passed at1984 prompt tokens with
+48 output tokens permitted (16 actually emitted), needle at90% of the prompt.
+TTFT2973.690ms and full wall4.002s. It returned the needle twice; this is a
+retrieval pass, not a strict answer-format or throughput-target pass.
 
 v15 is the EOS-only snapshot `4a5a45d5`, excluding the subsequent pair/KV
 foundations. Correct binary SHA256 on both nodes:
