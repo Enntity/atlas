@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Standalone only; see glm_moe_down_cost_plan.md. Never loads a model.
-// nvcc -O3 --fmad=false -arch=sm_121a scripts/dev/bench_glm_moe_down_cost.cu -o /tmp/bench-glm-moe-down-cost
+// nvcc -O3 --fmad=false -gencode=arch=compute_121a,code=sm_121a scripts/dev/bench_glm_moe_down_cost.cu -o /tmp/bench-glm-moe-down-cost
 #include <algorithm>
 #include <array>
 #include <cmath>

@@ -1,7 +1,18 @@
 # EP mixed execution: typed intent before packed execution
 
-Status: design only, 2026-09-06. No runtime implementation, protocol change,
-GPU experiment, or performance claim accompanies this document. Follow-on to
+Status: stage A's pure execution-plan contract and bounded legacy codec are
+implemented, CPU-tested, and **unused by serving routes** (updated 2026-09-07).
+`2463786b` adds the validated sequential plan; `79c01f03` adds legacy transcript
+encoding and staged parsing. Rank-state binding, the two-rank acceptance
+simulator/rendezvous, scheduler/worker adapters and framed transport are **not
+implemented**. The [codec and remaining binding plan](ep-execution-codec-plan.md)
+records the narrower implemented scope and next gates.
+
+The codec's 11 focused tests and the full 732 model CPU tests pass. Full-suite
+receipt: `/tmp/atlas-glm53-phase5-20260907.gu145h/execution-codec-model-tests.log`.
+Neither commit changes transmitted bytes or adds generation protection to v1/v2.
+No GPU experiment or performance claim follows from these CPU-only foundations.
+Follow-on to
 [the infrastructure roadmap](vllm-infrastructure-roadmap.md), not permission to
 remove existing EP/MLA exclusions or enable generic mixed-scheduling flags.
 
@@ -65,21 +76,23 @@ cannot process a multi-token prefill as independent rows.
 
 ## Smallest useful implementation slice
 
-Implement a pure, immutable **scheduled intent → validated substep plan** first.
-It initially lowers to existing independent decode and single-request prefill
-operations in their existing order. This is mixed scheduling, not fused model
-execution, and does not promise weight-sharing or throughput improvement.
+The pure, immutable **scheduled intent → validated substep plan** and its legacy
+transcript lowering are implemented. They represent existing independent decode
+and single-request prefill operations in order, without executing them. This is
+a scheduling contract, not enabled mixed scheduling or fused model execution,
+and does not promise weight-sharing or throughput improvement.
 
 Suggested new modules, each bounded below the Rust file-size cap:
 
-- `spark-model/src/traits/execution_plan.rs`: shared semantic types, checked
-  construction, capability decision, output disposition. Expose through
-  `traits/mod.rs`; no GPU/communication dependency in planning logic.
+- `spark-model/src/traits/execution_plan.rs`: implemented shared semantic types,
+  checked construction and sequential result-consumption obligations. Exported
+  through `traits.rs`; no GPU/communication dependency in planning logic.
 - `spark-model/src/model/ep_execution_plan.rs`: rank-local binding and
   lowering into existing compute paths; reuse `ssm_indexed_decode` and
   `glm_cache_plan` instead of duplicating pointer/geometry rules.
-- `spark-model/src/model/ep_execution_codec.rs`: pure bounded codec and
-  legacy-command lowering; isolate transport calls from encoding logic.
+- `spark-model/src/traits/ep_execution_codec.rs` and `ep_execution_parser.rs`:
+  implemented bounded legacy-command lowering and parsing. No transport calls,
+  rank binding or framed-protocol codec is implemented.
 - `spark-server/src/scheduler/execution_plan.rs`: adapter over current active
   and prefilling requests plus existing token-budget policy, not a second
   request queue. Existing continuation/finalization helpers remain owners of
@@ -180,7 +193,10 @@ never replay a partially executed plan under the same step ID.
 
 ## Tests-first gates and staged rollout
 
-**A — CPU-only contract/codec.** No scheduler route changes. Test exact v1/v2
+**A — CPU-only contract/codec (partially complete).** Pure contract and legacy
+codec are implemented in the commits above; new-frame encoding, live-state
+binding and replay/generation authority below remain future work. No scheduler
+route changes. Test exact v1/v2
 golden bytes and pure lowering order; new-frame encode/decode round trips;
 unknown/truncated/oversized fields, checked overflow, invalid token IDs, duplicate
 requests, zero-length chunks, bad computed positions, stale generations and

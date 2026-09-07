@@ -77,7 +77,7 @@ not bypass correctness; memcheck remains a separate root-owned invocation.
 ```sh
 g++ -std=c++17 -O2 -x c++ -DATLAS_MOE_DOWN_HOST_ONLY scripts/dev/bench_glm_moe_down_cost.cu -o /tmp/bench-glm-moe-down-cost-host
 /tmp/bench-glm-moe-down-cost-host --host-test
-nvcc -O3 --fmad=false -arch=sm_121a scripts/dev/bench_glm_moe_down_cost.cu -o /tmp/bench-glm-moe-down-cost
+nvcc -O3 --fmad=false -gencode=arch=compute_121a,code=sm_121a scripts/dev/bench_glm_moe_down_cost.cu -o /tmp/bench-glm-moe-down-cost
 /tmp/bench-glm-moe-down-cost --host-test
 /tmp/bench-glm-moe-down-cost
 compute-sanitizer --tool memcheck --error-exitcode=99 /tmp/bench-glm-moe-down-cost
@@ -105,3 +105,71 @@ the vecscale comparisons and before scalar launches. Reusing correct prior
 output could otherwise conceal omitted scalar writes. Output guards are checked
 again immediately after scalar synchronization. Apply this independent-output
 initialization rule to every future multi-variant correctness harness.
+
+## GPU outcome — 2026-09-07, no promotion
+
+Root ran the reviewed fixture only after stopping both models and observing
+approximately118GB available on each node, using a constrained1GiB container
+on CPUs2,3. Explicit device allocations were38,590,472 bytes, below64MiB.
+No production down dispatch was changed or enabled by this experiment.
+
+The initial native compilation attempted an unsupported generic PTX target.
+Root corrected the invocation to explicit architecture-specific code generation:
+`-gencode=arch=compute_121a,code=sm_121a`, with `-O3 --fmad=false` unchanged.
+The command above and harness comment now record that successful invocation.
+The compiled binary's `--host-test` also passed. This was a compile-target
+correction, not a change to kernel arithmetic or the correctness thresholds.
+
+All five maps in both eager and captured-graph modes passed complete-output
+bit equality across dense/compact and scalar/vecscale loaders, independent CPU
+sampled-column arithmetic, independent worklist checks, remote-output poison,
+input/weight immutability and guards. The same correctness suite passed under
+compute-sanitizer memcheck with zero errors. Each timing invocation reran the
+complete eager/graph gate before measuring and revalidated each timed fixture.
+
+All three paired runs are retained below. Times are microseconds, eager
+CUDA-event medians of five100-step interleaved intervals, setup excluded.
+`Compact` excludes worklist construction; `Builder+compact` includes it.
+Dense8 and dense288 contain exactly the same useful work within each row.
+
+| Run | Map | Dense8 | Dense288 | Compact | Builder | Builder+compact |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Initial | first8 | 183.659 | 180.861 | 187.402 | 30.836 | 218.970 |
+| Initial | all-empty | 2.540 | 14.370 | 4.093 | 22.548 | 26.637 |
+| Initial | remote-only | 3.921 | 14.516 | 4.110 | 22.579 | 26.636 |
+| Repeat1 | first8 | 186.148 | 184.695 | 193.664 | 31.048 | 223.914 |
+| Repeat1 | all-empty | 2.452 | 14.368 | 4.104 | 22.497 | 26.645 |
+| Repeat1 | remote-only | 3.940 | 14.358 | 4.082 | 22.538 | 26.631 |
+| Repeat2 | first8 | 176.360 | 173.605 | 181.268 | 30.830 | 219.246 |
+| Repeat2 | all-empty | 2.433 | 14.366 | 4.091 | 22.547 | 26.646 |
+| Repeat2 | remote-only | 3.889 | 14.367 | 4.111 | 22.550 | 26.633 |
+
+Decision: **do not promote compact down**. Removing trailing empty experts
+did not produce a repeatable useful-work gain: dense8 was slightly slower than
+dense288 in all three first8 pairs. Compact-only was also slower there, and
+the independently measured builder added about31 microseconds. Builder+compact
+lost to dense288 in every timed map/run. Empty/remote fixtures demonstrate a
+real early-exit-grid cost, but their isolated cost cannot simply be subtracted
+from useful-work timings or treated as a full-model speedup estimate.
+
+Limitations: synthetic eight-expert locality and dyadic scales are diagnostic,
+not the full model's expert histogram, quantization distribution or cache
+working set. No routed SiLU/quantization staging copy, production scratch alias,
+TP/EP collective, shared-expert blend or end-to-end model path was exercised.
+Graph replay was a correctness gate; these timing values are eager submission,
+not graph-timed model measurements. CPU arithmetic checks sample columns,
+while cross-kernel equality checks every output element.
+
+The historical long-request stall remains unexplained and unreproduced here.
+The measurements provide a reason not to adopt this compact dispatch for the
+tested fixture; they do not establish the cause of that earlier integration
+failure. No production promotion or additional GPU run follows from this plan.
+
+Root-owned receipts inspected locally:
+
+- `/tmp/atlas-glm53-phase5-20260907.gu145h/moe-down-gpu-gates.log`
+- `/tmp/atlas-glm53-phase5-20260907.gu145h/moe-down-timing-repeat.log`
+
+Final status: measured negative result documented; source and results frozen
+for root review/commit. Root proceeds with v13 lifecycle validation independently
+of this unpromoted kernel experiment.
