@@ -333,6 +333,19 @@ about10.7/12.2GiB, above the4GiB floor. The model containers stop gracefully
 and are preserved as `atlas-glm53-v18-c1-m5-oracle-ep0/1`. No timing claim is
 made from the diagnostic run.
 
+Clean graph-enabled M5 router/shared ON (cache OFF, numerical diagnostics OFF)
+passes four strict answers. Coding148/256 warmup+three gives full-wall
+27.973/27.947/24.622, median27.947; post-first median29.328. All caps complete.
+The slower third sample is retained; this does not meet the30 C1 target.
+
+Additional scoped Clippy runs are **not clean**: runtime tests stop at the
+existing `fast_weights/mod.rs` items-after-test-module lint; model lib/tests
+report existing collapsible branches, manual divisibility, unnecessary unwrap,
+literal-bool assertion and useless-vector lints in seven older GLM/runtime
+paths. Those files have no diff between production14a47186 and6f8b7cb9.
+These receipts are retained (`v18-clippy.log`, `v18-model-server-clippy.log`);
+do not claim full CI or Clippy success from the passing build/test gates.
+
 ## Bounded proposal trace
 
 Server source `0787e7e8` adds a default-off host-only first-eight K5 ledger per
