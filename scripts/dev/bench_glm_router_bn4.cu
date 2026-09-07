@@ -120,6 +120,11 @@ static void exact(const std::vector<uint16_t>& a,const std::vector<uint16_t>& b,
         std::fprintf(stderr,"FAIL %s i=%zu got=%04x expected=%04x\n",label,i,a[i],b[i]);std::exit(2);
     }
 }
+static void valid_reference(const std::vector<uint16_t>& out) {
+    require(out.size()==r::rows*r::columns,"complete reference extent");
+    for(uint16_t bits:out)
+        require(bits!=0x7f7f && std::isfinite(value(bits)),"reference finite/nonpoison at every output");
+}
 static void cpu_columns(const std::vector<uint16_t>& a,const std::vector<uint16_t>& b,
                         const std::vector<uint16_t>& out) {
     for(unsigned row=0;row<r::rows;++row)for(unsigned col:{0u,1u,15u,16u,143u,144u,286u,287u}) {
@@ -168,7 +173,8 @@ int main(int argc,char** argv) {
         fixture(ah,bh,profile,epoch);a.upload(ah);b.upload(bh);
         poison(old,stream);poison(candidate,stream);
         launch(false,a,b,old,stream);launch(true,a,b,candidate,stream);CHECK(cudaStreamSynchronize(stream));
-        const auto reference=old.read();exact(candidate.read(),reference,"eager production M5");cpu_columns(ah,bh,reference);
+        const auto reference=old.read();valid_reference(reference);
+        exact(candidate.read(),reference,"eager production M5");cpu_columns(ah,bh,reference);
         poison(old,stream);poison(candidate,stream);CHECK(cudaGraphLaunch(exec,stream));CHECK(cudaStreamSynchronize(stream));
         exact(old.read(),reference,"refreshed graph original");exact(candidate.read(),reference,"refreshed graph BN4");
         exact(a.read(),ah,"immutable A");exact(b.read(),bh,"immutable B");
@@ -184,7 +190,8 @@ int main(int argc,char** argv) {
     // Time a nonzero random profile, never the preceding all-zero fixture.
     fixture(ah,bh,0,19);a.upload(ah);b.upload(bh);
     launch(false,a,b,old,stream);launch(true,a,b,candidate,stream);CHECK(cudaStreamSynchronize(stream));
-    const auto reference=old.read();cpu_columns(ah,bh,reference);exact(candidate.read(),reference,"timing fixture");
+    const auto reference=old.read();valid_reference(reference);
+    cpu_columns(ah,bh,reference);exact(candidate.read(),reference,"timing fixture");
     std::vector<float> old_us,new_us;
     for(unsigned round=0;round<7;++round) {
         float times[2];

@@ -28,6 +28,8 @@ layout. This targets grid occupancy, not quantization or routing policy.
    oracle; require all1440 BF16 logits bit-identical for signed, mixed-scale,
    cancellation/near-tie, and zero-weight profiles. Independently calculate
    selected columns using ordered FP32 operations and a double sanity oracle.
+   Check every reference logit is finite and differs from the initial poison,
+   including the separate timing fixture; matching unwritten cells cannot pass.
    Full identical logits preserve downstream routing inputs without changing
    the production top-k implementation. This is not a resident-weight test.
 3. Poison both outputs before each variant, inspect allocation canaries and
