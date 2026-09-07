@@ -24,10 +24,11 @@ __device__ __forceinline__ void glm_moe_m16n128_impl(
     unsigned int work_m_tile,
     unsigned int work_n_tile
 ) {
-    // Standalone down fixture only: host also validates row counts/capacities.
+    // Standalone exact shapes only: host also validates row/gather capacities.
     // Every early return is CTA-uniform and precedes barriers.
     if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1
-        || sorted_token_ids != nullptr || N != 4096 || K != 2048) return;
+        || !((N == 4096 && K == 2048 && sorted_token_ids == nullptr)
+             || (N == 2048 && K == 4096 && sorted_token_ids != nullptr))) return;
     const unsigned int expert_id = work_expert_id;
     if (expert_id >= num_experts) return;
 
@@ -262,11 +263,59 @@ __device__ __forceinline__ void glm_moe_m16n128_impl(
         blockIdx.z, blockIdx.y, blockIdx.x)
 
 extern "C" __global__ void glm_moe_down_m16n128(GLM_M16_ARGS) {
+    if (N != 4096 || K != 2048 || sorted_token_ids != nullptr) return;
     GLM_M16_CALL(false);
 }
 extern "C" __global__ void glm_moe_down_m16n128_vecscale(GLM_M16_ARGS) {
+    if (N != 4096 || K != 2048 || sorted_token_ids != nullptr) return;
     GLM_M16_CALL(true);
 }
 #undef GLM_M16_ARGS
 #undef GLM_M16_CALL
 
+// Projection-multiplexed gate/up: unchanged compact-map contract, now with
+// actual token-major A gather. No extra builder, weight copy or down dispatch.
+#define GLM_GU_M16_ARGS \
+    const unsigned char* A_packed, const unsigned char* A_scale, \
+    const unsigned long long* gate_packed_ptrs, const unsigned long long* gate_scale_ptrs, \
+    const float* gate_scale2_vals, __nv_bfloat16* C_gate, \
+    const unsigned long long* up_packed_ptrs, const unsigned long long* up_scale_ptrs, \
+    const float* up_scale2_vals, __nv_bfloat16* C_up, \
+    const int* expert_offsets, const int* sorted_token_ids, \
+    unsigned int num_experts, unsigned int N, unsigned int K, \
+    const unsigned int* worklist, const int* total_tiles, unsigned int max_tiles
+
+template<bool VEC>
+__device__ __forceinline__ void glm_moe_gate_up_m16_impl(GLM_GU_M16_ARGS) {
+    if (blockIdx.y > 1 || N != 2048 || K != 4096 || !sorted_token_ids) return;
+    const int raw_total = *total_tiles;
+    const unsigned int count = raw_total > 0 ? min((unsigned int)raw_total, max_tiles) : 0u;
+    const unsigned int wid = blockIdx.x;
+    if (wid >= count) return;
+    const unsigned int expert = worklist[wid * 2];
+    const unsigned int packed = worklist[wid * 2 + 1];
+    const unsigned int mt = packed >> 6, nt = packed & 0x3fu;
+    // Host permits at most5 rows/expert: only the first M tile is legal.
+    if (expert >= num_experts || mt != 0 || nt >= N / 128) return;
+    const bool is_up = blockIdx.y != 0;
+    glm_moe_m16n128_impl<VEC>(A_packed, A_scale,
+        is_up ? up_packed_ptrs : gate_packed_ptrs,
+        is_up ? up_scale_ptrs : gate_scale_ptrs,
+        is_up ? up_scale2_vals : gate_scale2_vals,
+        is_up ? C_up : C_gate, expert_offsets, sorted_token_ids, num_experts,
+        N, K, expert, mt, nt);
+}
+
+#define GLM_GU_M16_CALL(VEC) \
+    glm_moe_gate_up_m16_impl<VEC>(A_packed, A_scale, gate_packed_ptrs, gate_scale_ptrs, \
+        gate_scale2_vals, C_gate, up_packed_ptrs, up_scale_ptrs, up_scale2_vals, C_up, \
+        expert_offsets, sorted_token_ids, num_experts, N, K, worklist, total_tiles, max_tiles)
+
+extern "C" __global__ void glm_moe_gate_up_m16n128(GLM_GU_M16_ARGS) {
+    GLM_GU_M16_CALL(false);
+}
+extern "C" __global__ void glm_moe_gate_up_m16n128_vecscale(GLM_GU_M16_ARGS) {
+    GLM_GU_M16_CALL(true);
+}
+#undef GLM_GU_M16_ARGS
+#undef GLM_GU_M16_CALL
