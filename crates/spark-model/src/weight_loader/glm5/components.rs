@@ -61,7 +61,16 @@ pub(super) fn load_ffn(
     if config.mlp_only_layers.contains(&layer_idx) {
         return load_dense_ffn(store, lp, config, gpu, qctx);
     }
-    load_moe(store, lp, config, gpu, variant, qctx, allow_prefill_layout)
+    load_moe(
+        store,
+        lp,
+        layer_idx,
+        config,
+        gpu,
+        variant,
+        qctx,
+        allow_prefill_layout,
+    )
 }
 
 fn load_dense_ffn(
@@ -116,6 +125,7 @@ fn load_dense_ffn(
 fn load_moe(
     store: &WeightStore,
     lp: &str,
+    layer_idx: usize,
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     variant: Nvfp4Variant,
@@ -237,6 +247,16 @@ fn load_moe(
         // remain transposed-only to avoid hybrid layout's memory cost.
         layer.transpose_for_prefill_unified_keep_shared(gpu, config)?;
     }
+    layer.maybe_cache_glm_target_shared_fp8(
+        store,
+        &shared,
+        config,
+        layer_idx,
+        allow_prefill_layout,
+        variant,
+        gpu,
+        qctx.stream,
+    )?;
     Ok(FfnComponent::Moe(layer))
 }
 

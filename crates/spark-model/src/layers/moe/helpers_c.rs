@@ -286,17 +286,7 @@ impl MoeLayer {
             && self.dense_gemm_router_m5.0 != 0
             && glm_k5_router_m5_enabled()
         {
-            return ops::dense_gemm_router_m5(
-                ctx.gpu,
-                self.dense_gemm_router_m5,
-                router_in,
-                &self.weights.gate,
-                gate_logits,
-                num_tokens,
-                num_experts,
-                hidden_size,
-                stream,
-            );
+            return self.run_router_bn4(router_in, gate_logits, ctx, stream);
         }
         if self.dense_gemm_router.0 != 0 {
             return ops::dense_gemm_router(

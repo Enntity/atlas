@@ -223,6 +223,10 @@ impl TransformerModel {
             && !hss_engaged
             && !lora_eager;
 
+        crate::layers::moe::validate_shared_fp8_cache_graphs(&self.config.model_type, use_graphs)?;
+
+        crate::layers::moe::validate_m5_projection_graphs(&self.config.model_type, m, use_graphs)?;
+
         let ctx = ForwardContext {
             ssm_batch: None,
             buffers: &self.buffers,

@@ -68,6 +68,9 @@ mod gemv_sw;
 mod glm_indexer;
 #[path = "ops/glm_indexer_dynamic.rs"]
 mod glm_indexer_dynamic;
+#[path = "ops/glm_router_bn4.rs"]
+mod glm_router_bn4;
+pub use glm_router_bn4::glm_router_bn4;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
 #[path = "ops/kda.rs"]

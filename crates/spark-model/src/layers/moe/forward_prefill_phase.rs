@@ -33,6 +33,11 @@ impl MoeLayer {
         if shared_inter == 0 {
             return Ok(());
         }
+        anyhow::ensure!(
+            !self.shared_fp8_cache.verify
+                || (!use_overlap && !ctx.graph_capture && !ctx.gpu.stream_is_capturing(aux)),
+            "shared FP8 VERIFY requires eager, non-overlapped execution"
+        );
         if use_overlap {
             // Ensure secondary stream sees `input` (produced by prior default-stream work)
             ctx.gpu.record_event(self.event_a, stream)?;
@@ -173,52 +178,54 @@ impl MoeLayer {
 
         // Shared gate + up GEMM on aux stream
         if let (Some(sg_fp8), Some(su_fp8)) = (self.shared_gate_fp8, self.shared_up_fp8) {
-            ops::fp8_gemm_n128(
-                ctx.gpu,
-                self.fp8_gemm_k,
+            self.run_shared_fp8_cache(
+                0,
                 input,
                 sg_fp8,
                 shared_gate_out,
                 n,
                 shared_inter,
                 h,
+                ctx,
                 aux,
             )?;
-            ops::fp8_gemm_n128(
-                ctx.gpu,
-                self.fp8_gemm_k,
+            self.run_shared_fp8_cache(
+                1,
                 input,
                 su_fp8,
                 shared_up_out,
                 n,
                 shared_inter,
                 h,
+                ctx,
                 aux,
             )?;
         } else if let (Some(sg), Some(su), Some(_sd)) =
             (&self.shared_gate_t, &self.shared_up_t, &self.shared_down_t)
         {
-            ops::w4a16_gemm_n128(
-                ctx.gpu,
-                self.w4a16_gemm_t,
+            self.run_shared_m16(
+                shared_m16::SharedProjection::Gate,
                 input,
                 sg,
                 shared_gate_out,
                 n,
                 shared_inter,
                 h,
+                ctx,
                 aux,
+                use_overlap,
             )?;
-            ops::w4a16_gemm_n128(
-                ctx.gpu,
-                self.w4a16_gemm_t,
+            self.run_shared_m16(
+                shared_m16::SharedProjection::Up,
                 input,
                 su,
                 shared_up_out,
                 n,
                 shared_inter,
                 h,
+                ctx,
                 aux,
+                use_overlap,
             )?;
         } else {
             ops::w4a16_gemm(
@@ -256,28 +263,29 @@ impl MoeLayer {
             aux,
         )?;
         if let Some(sd_fp8) = self.shared_down_fp8 {
-            ops::fp8_gemm_n128(
-                ctx.gpu,
-                self.fp8_gemm_k,
+            self.run_shared_fp8_cache(
+                2,
                 shared_gate_out,
                 sd_fp8,
                 shared_down_out,
                 n,
                 h,
                 shared_inter,
+                ctx,
                 aux,
             )?;
         } else if let Some(sd) = &self.shared_down_t {
-            ops::w4a16_gemm_n128(
-                ctx.gpu,
-                self.w4a16_gemm_t,
+            self.run_shared_m16(
+                shared_m16::SharedProjection::Down,
                 shared_gate_out,
                 sd,
                 shared_down_out,
                 n,
                 h,
                 shared_inter,
+                ctx,
                 aux,
+                use_overlap,
             )?;
         } else {
             ops::w4a16_gemm(

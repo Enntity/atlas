@@ -318,6 +318,7 @@ pub struct MoeLayer {
     moe_w4a4_prequant_t_k64_compact_gate_up: KernelHandle,
     moe_w4a4_prequant_t_k64_vecscale_compact_gate_up: KernelHandle,
     m16_gate_up: gate_up_m16::M16GateUp,
+    m5_projections: m5_projections::M5Projections,
     moe_nvfp4_mmq_gate_up_k: KernelHandle,
     moe_nvfp4_mmq_down_k: KernelHandle,
     moe_nvfp4_mmq_quantize_k: KernelHandle,
@@ -357,6 +358,7 @@ pub struct MoeLayer {
     /// Pre-dequanted FP8 weights for zero-overhead prefill GEMMs.
     gate_fp8: Option<DevicePtr>,
     shared_gate_fp8: Option<DevicePtr>,
+    shared_fp8_cache: shared_fp8_cache::SharedFp8CacheState,
     shared_up_fp8: Option<DevicePtr>,
     shared_down_fp8: Option<DevicePtr>,
     fp8_gemm_k: KernelHandle,
@@ -535,9 +537,20 @@ mod gate_up_m16;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;
+mod shared_fp8_cache;
+mod shared_fp8_cache_load;
+mod shared_fp8_cache_output;
 pub(crate) use gate_up_m16::validate_m16_gate_up_graphs;
+pub(crate) use shared_fp8_cache::validate_shared_fp8_cache_factory_reserve;
+pub use shared_fp8_cache::{validate_shared_fp8_cache_graphs, validate_shared_fp8_cache_profile};
 mod init;
+mod m5_projection_oracle;
+mod m5_projections;
 mod mmq_layout;
+mod router_bn4;
+mod shared_fp8_cache_bytes;
+mod shared_m16;
+pub(crate) use m5_projections::validate_m5_projection_graphs;
 #[cfg(test)]
 mod mod_tests;
 mod prequant_fp4;

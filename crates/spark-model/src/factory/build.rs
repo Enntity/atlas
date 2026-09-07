@@ -154,6 +154,16 @@ pub fn build_model(
     // "use global num_kv_heads/head_dim for all layers" (backward compatible).
     config.kv_layer_dims = loader.kv_layer_dims(&config);
 
+    crate::layers::moe::validate_shared_fp8_cache_factory_reserve(
+        &config,
+        gpu.as_ref(),
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        inference_reserve,
+        true,
+    )?;
     let mut layers = loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
     let embed = loader.load_embedding(&store, &config, gpu.as_ref())?;
     let final_norm = loader.load_final_norm(&store, &config, gpu.as_ref())?;
@@ -330,6 +340,16 @@ pub fn build_model(
     // construction; this default-no-op hook doesn't perturb them.
     maybe_run_minimax_m2_moe_transpose(&config, gpu.as_ref(), &mut layers)?;
     // ── Step 4: Create buffer arena ──
+    crate::layers::moe::validate_shared_fp8_cache_factory_reserve(
+        &config,
+        gpu.as_ref(),
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        inference_reserve,
+        false,
+    )?;
     let buffers = BufferArena::new(
         &config,
         max_batch_tokens,

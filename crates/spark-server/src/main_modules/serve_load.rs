@@ -402,6 +402,16 @@ pub(crate) fn load_model(
         tp_rank: _tp_rank,
         ep_rank,
     } = serve_phases::resolve_topology(&args, &mut config)?;
+    // Resolve once before weight loading, so the bounded shared-cache lane
+    // rejects unsupported chunks/adapters before allocating model weights.
+    let resolved_prefill = serve_phases::resolve_prefill_budget(&args, ssm_prefill_chunk);
+    spark_model::layers::moe::validate_shared_fp8_cache_profile(
+        &config,
+        resolved_prefill.prefill_budget,
+        !args.lora_adapter.is_empty()
+            || !args.lora_stageable.is_empty()
+            || !args.lora_stageable_disk.is_empty(),
+    )?;
     // FP8 KV calibration precedence (highest wins): an explicit
     // --fp8-kv-calibration-tokens ALWAYS wins — including 0, which
     // force-disables calibration on a model whose MODEL.toml enables it
@@ -496,7 +506,7 @@ pub(crate) fn load_model(
         prefill_budget,
         max_batch_tokens,
         spec_tokens: _spec_tokens,
-    } = serve_phases::resolve_prefill_budget(&args, ssm_prefill_chunk);
+    } = resolved_prefill;
     if args.dflash && args.enable_prefix_caching {
         tracing::warn!(
             "dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."

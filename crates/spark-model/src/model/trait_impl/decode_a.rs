@@ -272,6 +272,7 @@ impl TransformerModel {
 
         // ── Phase 2: Try CUDA graph replay ──
 
+        crate::layers::moe::validate_shared_fp8_cache_graphs(&self.config.model_type, use_graphs)?;
         let mut graph_cache = if use_graphs {
             Some(self.decode_graph.lock())
         } else {
