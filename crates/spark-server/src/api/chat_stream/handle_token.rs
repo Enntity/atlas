@@ -25,6 +25,9 @@ use super::tool_handlers::{
 
 type DeltaVec = Vec<StreamDelta>;
 
+#[path = "terminal_token.rs"]
+mod terminal_token;
+
 /// Maximum consecutive tokens the stream may spend with
 /// `state.suppressing_param_leak == true` (sanitizer holding content
 /// because of an orphan `<parameter=` / `<tool_call>` opener without
@@ -77,6 +80,10 @@ pub(super) fn strip_bare_role_literal(delta: &mut String, inside_tool_call: bool
 /// through is taken, leaving the doom-loop case (long suppressed
 /// stream of orphan `<tool_call>` openers) uncaught.
 pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {
+    terminal_token::while_open(state, |state| handle_open_token(state, ctx, tok))
+}
+
+fn handle_open_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {
     let result = handle_token_inner(state, ctx, tok);
 
     // Orphan-suppression streak watchdog. The sanitizer flips
@@ -503,19 +510,10 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
     }
 
     if state.stop_string_triggered {
-        // The tool guards (F11 within-response dedup, hard-validation
-        // reject, loop cap) reuse `stop_string_triggered` as a generic
-        // "end this response" flag. But the scheduler keeps generating for
-        // a few tokens after the flag is set (cancel latency), and on a
-        // tool-call *runaway* those tokens are raw markup —
-        // `<tool_call><function=…><parameter=…>…</tool_call></_call>` —
-        // re-emitted here. A raw passthrough (the old behaviour) leaked
-        // that markup into `content` because this branch returns BEFORE the
-        // detector/sanitizer fork below. Route the delta through the
-        // buffered `sanitize_content_chunk` so multi-token markers that
-        // straddle deltas (`</_call>` = `</` `_` `call` `>`) are reassembled
-        // and scrubbed. For a genuine stop string, legitimate trailing
-        // content is untouched — the sanitizer only removes tool markup.
+        // Only the current token's genuine client stop match can reach this
+        // branch. Emit its pre-stop prefix once, preserving markup sanitization.
+        // Tokens queued AFTER a guard or stop match are rejected at handle_token
+        // entry, before detokenization, content accumulation or token-ID tracking.
         if !delta.is_empty() {
             let cleaned = sanitize_content_chunk(
                 &delta,

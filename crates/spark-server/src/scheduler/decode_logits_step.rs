@@ -266,6 +266,12 @@ pub fn process_decode_logits(
                 .par_iter_mut()
                 .enumerate()
                 .map(|(i, a)| {
+                    // Preserve batch row mapping but skip mutable host sampling
+                    // for an already-cancelled request. The retained last token
+                    // is only a placeholder: the commit gate below discards it.
+                    if retire_if_cancelled(a) {
+                        return (a.last_token, None);
+                    }
                     // The run's `DecodeScratch` is a `RefCell` — neither
                     // `Sync` nor shareable across the pool — so each worker
                     // borrows its own and builds the context around it. Same
@@ -312,6 +318,9 @@ pub fn process_decode_logits(
                 .iter_mut()
                 .enumerate()
                 .map(|(i, a)| {
+                    if retire_if_cancelled(a) {
+                        return (a.last_token, None);
+                    }
                     process_seq_logits(
                         model,
                         a,
@@ -346,6 +355,12 @@ pub fn process_decode_logits(
     let now = Instant::now();
     for (i, (tok, logprobs)) in new_tokens.into_iter().enumerate() {
         let a = &mut active[i];
+        // Recheck after sampling: stream cancellation can arrive during this
+        // step or while a preceding independent row is being delivered. Do not
+        // compact rows or undo the completed forward; lifecycle retires state.
+        if retire_if_cancelled(a) {
+            continue;
+        }
         a.last_token = tok;
         a.last_token_time = now;
 
