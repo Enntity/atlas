@@ -1,12 +1,18 @@
 # GLM native MTP: restore the target-conditioning contract
 
-Status: slice A (GLM normalized target-hidden save/stash) implemented locally,
-pending independent review and root-only native validation. Slice B (accepted
-cache repair) remains a design, not implemented. No GPU experiment or speedup
-is claimed here. Scope is the existing bounded C1 native-MTP lane, not
-concurrent speculation or long context.
+Status: slice A (GLM normalized target-hidden save/stash) independently
+reviewed, committed and native-tested. Root's matched LRU coding receipt
+(148 input / 256 output tokens) measured median full-wall throughput
+24.280 versus 18.516 tok/s, approximately +31%, with all outputs reaching
+the cap. This is the hidden-handoff result, not accepted-cache repair.
+The earlier v13 diagnostic chat failure and v14 thinking-EOS delivery issue
+are separate lifecycle observations; the latter has its own reviewed fix.
+Slice B has a CPU-only pair-planning foundation; accepted cache repair is
+not integrated. Scope is the existing bounded
+C1 native-MTP lane, not concurrent speculation or long context.
 
-Slice A CPU receipt: behavior-preserving extracted raw-copy helper produced
+Slice A is committed as `a35ad139`. CPU receipt: behavior-preserving extracted
+raw-copy helper produced
 RED with 2 failures (GLM save and stash bytes), while non-GLM preservation and
 overflow tests passed. Changing only the GLM source to the already-computed
 normalized buffer produced GREEN, 4/4 focused tests. The actual save and
@@ -15,6 +21,175 @@ tests check non-uniform weighted RMSNorm reference rows, row permutations,
 stash survival after source overwrite, both rank-local fixtures, and no new
 kernel, allocation, or synchronization. These are CPU transfer-contract tests,
 not a GPU RMSNorm or model acceptance oracle.
+
+Slice B pure planning foundation is now isolated in
+`crates/spark-model/src/speculative/glm_pair_plan.rs` with sibling tests and
+one module export. It has no serving caller, allocation, or wire change.
+The initial tests failed to compile before implementation (missing module),
+then 9/9 focused tests passed. The final combined model suite passed 751/751,
+including all nine latest planner tests; receipt:
+`slice-b-foundation-model-tests.log` in the root phase6 receipt directory.
+Limits require an explicitly fixed continuous,
+grammarless C1/four-draft profile without adaptation, catch-up, carry or
+prefix reuse, and preserve the context-plus-four <=2048 bound. Bootstrap
+and verified/discarded proposal transitions return private immutable state
+and checked `PairWrite` source/destination spans. Caller-provided generation,
+position and capacity assertions are not live-state or wire authentication.
+
+Intended next callers, still not implemented:
+
+- GLM proposer bootstrap prepares the missing shifted prompt tail after the
+  existing eager primer, consuming owned post-norm prompt rows. Its write
+  span can include the whole prefix if the primer is lazy.
+- GLM proposal entry records `ProposalPlan` before its four transient writes;
+  the actual K5 head and F5 worker verified-commit boundaries bind the same
+  acceptance metadata into a pending `FinishPlan`. Confidence discard is an
+  explicit separate event, never inferred from `after_verify(0)`.
+- The next existing E1 invokes `run_mtp_propose_inner`: after preserving the
+  bonus hidden but before any scratch-using primer/proposer work, snapshot
+  the plan's accepted normalized rows in checked owned staging and call
+  the extracted GLM KV-row writer with `tokens[token_start..]`, hidden offset,
+  `cache_start`, and `rows`. Publish planned state only after successful
+  writes. No new E1 fields or collective is needed; ended/cancelled requests
+  may free their cache without executing an unused next-proposal repair.
+
+Before returning a proposal plan, the pure planner checks the possible
+full-accept fifth cache row and all four accepted-hidden staging rows, not
+only the four transient proposal writes. Finish retains defensive checks.
+Future runtime admission must bind those capacities to actual allocations;
+an unexpected error after an issued forward is not permission to continue
+with stale cache state.
+
+## Proposed slice B runtime patch, not authorized by this document
+
+Rollout name proposed: `GLM_MTP_REPAIR=0|1` in the dual-Spark launcher,
+forwarded as `ATLAS_GLM_MTP_REPAIR` to both ranks, default off. This is a
+checked implementation A/B gate, not an independent tuning policy. The actual
+v15 native snapshot `4a5` contains the reviewed handoff/EOS fixes and excludes
+both uncommitted slice B foundations for attribution. Repair would be a
+separate v16 experiment after source and CPU review.
+
+### Exact ownership and hook proposal
+
+The KV extraction author owns `layers/glm5_mtp.rs` and its `glm5_mtp/`
+submodules until the helper freezes. A subsequent explicitly assigned layer
+patch adds request-local `RepairPhase` to `Glm5MtpProposerState`, with phases
+`PromptCapture`, `Canonical(PairState)`, `Proposed(ProposalPlan)` and
+`PendingVerified(FinishPlan)`. The layer exposes narrow checked bootstrap,
+record-verdict, discard and apply-repair methods; the KV-row executor itself
+continues to own neither state cursor updates nor scheduler policy.
+
+The model integration author would own a new small
+`model/glm_mtp_repair.rs` adapter plus the following minimal call sites:
+
+1. `model/impl_b3.rs::run_mtp_propose_inner`: prepare bootstrap or consume
+   pending repair **before** legacy `ensure_drafter_context`/catch-up and
+   proposer scratch work. Repair mode bypasses those legacy context paths;
+   off mode calls them unchanged. Before the first transient draft write,
+   create/store the checked `ProposalPlan` using actual private cache rows.
+2. `traits/model.rs` plus the thin `model/trait_impl/mod.rs` bridge: one
+   optional family-specific `record_glm_mtp_verified` operation, no wire
+   message. Its arguments include the actual verify base, width and accepted
+   count; the model adapter binds the request, generation and live row spans.
+   Default behavior for unrelated models is the existing no-op contract.
+3. `spark-server/src/scheduler/verify_dflash_step.rs`: call that operation
+   immediately after its K5 target token/length rollback and **before** any
+   emission can terminate the request. This is an actual verified event,
+   unlike the overloaded `after_verify(0)`. Errors finish this request.
+4. `model/impl_a2.rs` F5 worker branch: record the same event after receiving
+   accepted count and target rollback, before its legacy proposer trim.
+   Both ranks retain the original F5 and E1 payloads unchanged.
+5. The GLM layer's legacy `after_verify` in repair mode only acknowledges a
+   matching already-recorded verified event; it must not mutate the old
+   transient length or invent a verified event. Unverified cancellation can
+   release the state; an explicit discard method uses `DiscardUnverified`.
+   Unexpected trim without a recorded event fails closed in this restricted
+   lane. Non-repair behavior is byte-for-byte unchanged.
+
+This hook placement avoids a subtle terminal asymmetry: the worker receives
+acceptance before the head emits tokens, so an EOS on the head must not be
+the only thing deciding whether a verified descriptor exists. An ended
+request may simply free the private cache on each rank; no repair collective
+is needed and no E1 need be sent. The next live E1 already calls
+`save_hidden_for_mtp(hidden_row)` before common proposal entry; require that
+row to equal the pending plan's bonus index and its position to match the
+planned committed target position.
+
+### No new persistent staging allocation
+
+Do **not** use `verify_hidden_stash` without checking construction:
+`model/impl_a1.rs:394` allocates it only when the constructor already has a
+proposer. GLM's external proposer is installed later (`factory/build.rs`),
+so that stash is NULL in this lane. This corrects the earlier tentative
+stash suggestion; the pure planner never assumes a particular allocation.
+
+Use the already allocated `mtp_prefill_hidden` capture instead, only after
+bootstrap has consumed the complete prompt including its missing tail pair.
+The buffer is allocated through `has_mtp`, which includes external GLM.
+Validate nonnull pointer, checked `capacity * H * 2` bytes, at least four
+rows, and this request's capture generation before transition. Mark the
+phase `Canonical` and invalidate the legacy capture-length/range metadata
+when changing ownership from prompt capture to repair staging. A stale
+`ensure_drafter_context` must never reinterpret repaired rows as prompt
+hidden states; simply relying on the primer's nonempty-state fast return is
+not an ownership guarantee. Cold prefill of the next request installs a
+fresh generation and restarts prompt capture normally.
+
+At E1, the original K5 `norm_output` still has all five target rows. Validate
+that source span and snapshot only the a accepted repair rows (0..a), at
+most four, into the repurposed capture allocation. The bonus row a already
+has its independent `mtp_hidden_save` copy. Pass the writer a DeviceSpan of
+**exactly a staged rows**, not five; `VerifiedCommit.normalized_hidden_rows`
+describes the original live K5 source before staging, not its smaller copy.
+There is no write for a=0: retain the seed and advance canonical metadata.
+Only after all writer calls succeed may the layer publish new private KV
+length and clear pending state. Never overwrite target hidden sources before
+their copy, and never restart a failed repair as ordinary serial decoding.
+
+### Single-source eligibility before load and before proposal
+
+The rollout parser and pure profile resolver should be one helper shared by
+`main_modules/serve_phases/preflight.rs`, the model adapter, and launcher
+tests. Require GLM, native MTP, TP2/EP2, active/admitted C1, BF16 KV,
+four drafts, context-plus-four <=2048, batched primer on/serial primer off,
+distributed proposer on, `MTP_GATE_FORCE=1`, MTP during thinking enabled,
+depth adaptation off, DFlash adaptive suspension off, and draft-confidence
+discard disabled. Gate forcing only disables the measured-throughput gate;
+it does not disable watchdogs, cancellation, output/context limits, or EOS.
+
+Reject grammar/constrained requests for the initial lane before bootstrap
+GPU work, and reject a changed depth or uncovered serial position at model
+entry. Require no prefix caching (`ServeArgs.enable_prefix_caching=false`,
+its existing default), no SSM prefix snapshot reuse, no drafter carry and no
+generic catch-up/refeed. Runtime bootstrap additionally proves owned full
+prompt capture and exact P-1 (eager) or zero (lazy) private rows; do not
+silently accept missing prefix coverage. Both rank launch environments and
+startup-derived capacities must agree before requests are admitted.
+
+The model adapter must validate head-side descriptor/position/capacities
+before sending E1, then validate the worker's received fields before its
+local repair. These are homogeneous fixed-lane checks, not a new rank
+rendezvous protocol. Unexpected device failures remain fatal request/worker
+errors under the existing error machinery, not a license to continue or
+silently fall back. Root must review both-rank failure handling at the exact
+new hook sites before this design is enabled.
+
+### Integration tests after the isolated foundations
+
+Use real model adapter methods with MockGpu/checked writer seams: eager and
+lazy bootstrap; two rank-local allocations and identical accepted metadata;
+all a=0..4 across repeated cycles; seed retention; full-accept extra row;
+original K5 source -> a-row staging -> KV write with the bonus untouched;
+capture-generation change across requests; terminal EOS/cancel before E1;
+explicit unverified discard; stale E1 hidden row/position; unsupported
+profile/request rejection before any copy or broadcast; and injected writer
+failure never publishing a canonical cursor. Off-mode tests must prove the
+existing primer/proposal/trim sequence is unchanged.
+
+Only after these CPU gates and independent source review should root run a
+stopped-model bounded cache oracle and memcheck, then the matched continuous
+C1/K5 baseline versus repair. Keep identical gate-force settings in both
+arms so the persistent gate's periodic serial measurement is not a confound.
 
 ## Why this is the next C1 candidate
 

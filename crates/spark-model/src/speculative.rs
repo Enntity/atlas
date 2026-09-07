@@ -5,6 +5,7 @@
 //! Defines the [`DraftProposer`] trait for speculative decoding strategies.
 //! MTP implements this first; EAGLE-3 can implement later without engine changes.
 
+pub mod glm_pair_plan;
 pub mod ladder;
 pub mod tree_shape;
 pub mod verify_key;
