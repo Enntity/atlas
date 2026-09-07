@@ -291,6 +291,39 @@ device allocation38,799,360 bytes is below64MiB; fixtures run sequentially with
 model services and native compilers stopped. This qualifies the standalone
 prefill range for a cache experiment, not the model integration or its TPS.
 
+## Production projection/cache integration gates
+
+CUDA exports `189db87e` preserve the standalone router/shared arithmetic and
+adapt the harnesses to include the actual production source. All five final
+source native/memcheck gates pass: router, both shared-M16 FMA modes, both
+large-prefill FP8 FMA modes. All five memchecks report0 errors. No model or
+native CPU compiler overlaps those GPU gates.
+
+Model/server source `6f8b7cb9` adds independent default-off M5 router/shared
+selection and the target-only1008MiB shared FP8 cache. The cache publishes
+only a complete synchronized triple, retains original/T weights, checks exact
+checkpoint extents, and has bounded resident byte/output diagnostics. Review
+caught generic `fp8_gemm_n128`'s default-on LDMAB reroute; the installed cache
+now directly launches the validated M64 handle with no activation allocation.
+The old generic noncache behavior is unchanged. A real dispatch test fails
+before that correction and passes afterward for both projection shapes and
+all admitted tested row boundaries.
+
+Runtime `ef7f3681` corrects `BufferSizes::total_bytes` to include existing
+`o_latent` and `norm_unit_w` allocations. Real Mock arena totals demonstrated
+the4352/9216-byte omissions before the two-field fix. Allocation geometry is
+unchanged. Cache prechecks retain actual arena/inference reserves; final host
+headroom is still a separate mandatory native gate.
+
+CPU gates: model806 without default features, model811 with default features,
+server2349 pass/12 ignored, runtime272 pass/2 ignored. Formatting, license
+headers and kernel-shadow structure pass. These are scoped checks, not the
+full supported-model serve matrix. Native kernel cache-prime build3m55s used
+8GiB CPU container; final committed Rust build2m24s used4GiB. Both exit0,
+OOMKilled=false; model services stopped. Image v18 on both nodes has binary
+SHA256 `68ee92c69715cdbdb53e999f297759c8c9f6a5578b4858b6eaa9265fb30c5dff`.
+Real-model oracle/quality and clean endpoint measurements are pending.
+
 ## Bounded proposal trace
 
 Server source `0787e7e8` adds a default-off host-only first-eight K5 ledger per
