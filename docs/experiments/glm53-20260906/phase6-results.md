@@ -98,6 +98,18 @@ test environment; an initial parallel run retained four unrelated TUI color
 failures before the corrected complete run. No UI code was changed. Native
 repair quality, accepted-count and throughput attribution remain pending.
 
+The v16 binary (`14a47186`) built successfully in2m11s after a separate
+3m56s committed-kernel cache-prime build. Both completed without container
+OOM; the final Rust build used4GiB. Both nodes' binary SHA256 is
+`412a05f3f479fb0629d895268bb4d39014d96d618820dafeee34072f0f8abac0`.
+The matched repair-OFF control uses continuous forced MTP, cold prefill-only
+context and Atlas swap-space0; it is not the same policy as v15 above.
+Its four visible-answer checks all pass, identical to v15. Coding148/256
+full-wall runs23.399,22.867,24.797 give median23.399, post-first24.332;
+all outputs reached256. Every timed request reports serial0, depthK5 and
+no regime re-probes. Mean accepted drafts1.988,1.920,2.160. M16 is OFF.
+This is the baseline for repair attribution, not a performance gain.
+
 The initial v15 CPU build hit its own4GiB container limit while an archive
 timestamp change unnecessarily triggered CUTLASS recompilation. Builder
 status was `exited101/OOMKilled=true`; model services were stopped and both
