@@ -74,6 +74,23 @@ compute-sanitizer --tool memcheck --error-exitcode=9 /tmp/bench-glm-shared-fp8
 Root should run both default FMA and `--fmad=false` native gates. CPU checks do
 not establish device correctness. Source must receive independent review first.
 
+## Large-prefill follow-up (new receipts required)
+
+Compile the harness with `-DATLAS_SHARED_FP8_LARGE_ROWS` to compare only the
+unchanged W4A16 M64 and FP8 M64 at M63/64/65/148/1024. No M16 output allocation
+or launch occurs in this profile. GEMM grid Y is ceil(M/64); host tests prove
+multiple-tile/tail ownership and max-row guards. All existing predecode-byte,
+full-output, CPU-column, refreshed graph, immutable/canary and posttiming gates
+apply. The explicit max_rows1024, eight-allocation budget is34,605,056 bytes
+for GU and38,799,360 for down, below the separately enforced64MiB cap. Shapes
+run sequentially. Add the macro to both g++ and nvcc commands above.
+
+The original small-profile native receipt remains tied to source67a7da3d.
+This extension is not covered by it. Local CPU receipts are
+`shared-fp8-large-host-green.log` and `shared-fp8-small-regression-host-green.log`.
+Root must obtain new native/both-FMA/memcheck receipts before any shared cache
+serving, because cached fields also affect general prefill, not just K5.
+
 ## Local CPU receipts
 
 The initial transpose helper retained original row-major addressing: the harness

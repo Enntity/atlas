@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <vector>
 #ifndef ATLAS_SHARED_FP8_HOST_ONLY
 #include <cuda_runtime.h>
@@ -17,8 +18,18 @@
 static void require(bool ok,const char* message) {
     if(!ok){std::fprintf(stderr,"FAIL: %s\n",message);std::exit(2);}
 }
+#ifdef ATLAS_SHARED_FP8_LARGE_ROWS
+constexpr size_t memory_limit=64ULL*1024*1024;
+constexpr unsigned max_rows=1024, variants=2;
+static const std::array<unsigned,5> row_cases={63,64,65,148,1024};
+#else
 constexpr size_t memory_limit=32ULL*1024*1024;
-constexpr unsigned max_rows=16;
+constexpr unsigned max_rows=16, variants=3;
+static const std::array<unsigned,5> row_cases={0,1,4,5,16};
+#endif
+static bool profile_geometry(unsigned m,unsigned n,unsigned k){
+    return m<=max_rows&&glm_shared_fp8::geometry(std::min(m,16u),n,k);
+}
 static size_t device_live=0,device_peak=0;
 static bool allocation_fits(size_t n,size_t width,size_t live) {
     return width&&n<=(memory_limit-256)/width&&live<=memory_limit-(n*width+256);
@@ -27,10 +38,11 @@ struct Shape{const char* name;unsigned n,k,seed;float scale2;};
 static const std::array<Shape,3> shapes={{{"gate",2048,4096,31,.75f},
     {"up",2048,4096,73,.375f},{"down",4096,2048,117,.625f}}};
 static size_t fixture_budget(const Shape& s){
-    const size_t sizes[]={size_t(max_rows)*s.k*2,
+    std::vector<size_t> sizes={size_t(max_rows)*s.k*2,
         size_t(s.n)*s.k/2,size_t(s.n)*s.k/2,size_t(s.n)*s.k/16,size_t(s.n)*s.k/16,
-        size_t(s.n)*s.k,size_t(max_rows)*s.n*2,size_t(max_rows)*s.n*2,size_t(max_rows)*s.n*2};
-    size_t live=0;for(size_t bytes:sizes){require(allocation_fits(bytes,1,live),"explicit32MiB fixture budget");live+=bytes+256;}return live;
+        size_t(s.n)*s.k};
+    for(unsigned v=0;v<variants;++v)sizes.push_back(size_t(max_rows)*s.n*2);
+    size_t live=0;for(size_t bytes:sizes){require(allocation_fits(bytes,1,live),"explicit fixture budget");live+=bytes+256;}return live;
 }
 static float from_bf16(unsigned short bits) {
     unsigned wide=unsigned(bits)<<16; float value; std::memcpy(&value,&wide,4); return value;
@@ -145,8 +157,17 @@ static void host_tests(){
     require(within_one_bf16_ulp(0x3f80,0x3f81)&&!within_one_bf16_ulp(0x3f80,0x3f82),"CPU comparison exact1ULP");
     require(!allocation_fits(SIZE_MAX,2,0)&&!allocation_fits(1,2,SIZE_MAX)
         &&!allocation_fits(1,2,memory_limit),"allocation overflow");
-    std::printf("PASS CPU packed/scales transpose full_bijection_roundtrip M0to16_ownership copies E4M3_RNE cap32MiB budgets=%zu/%zu/%zu\n",
-        fixture_budget(shapes[0]),fixture_budget(shapes[1]),fixture_budget(shapes[2]));
+    for(unsigned m:row_cases){require(profile_geometry(m,2048,4096),"profile rows supported");
+        unsigned grid=(m+63)/64;std::vector<unsigned> writes(m);
+        for(unsigned tile=0;tile<grid;++tile)for(unsigned warp=0;warp<4;++warp)
+            for(unsigned lane_row=0;lane_row<16;++lane_row){unsigned row=tile*64+warp*16+lane_row;if(row<m)++writes[row];}
+        for(unsigned n:writes)require(n==1,"M64 multiple tile/tail ownership");}
+    require(!profile_geometry(max_rows+1,2048,4096),"profile max row guard");
+#ifdef ATLAS_SHARED_FP8_LARGE_ROWS
+    require(variants==2&&fixture_budget(shapes[0])==34605056&&fixture_budget(shapes[2])==38799360,"large profile exact budget");
+#endif
+    std::printf("PASS CPU packed/scales transpose full_bijection_roundtrip M64_tail_ownership copies E4M3_RNE max_rows=%u variants=%u cap=%zu budgets=%zu/%zu/%zu\n",
+        max_rows,variants,memory_limit,fixture_budget(shapes[0]),fixture_budget(shapes[1]),fixture_budget(shapes[2]));
 }
 
 #ifndef ATLAS_SHARED_FP8_HOST_ONLY
@@ -155,7 +176,7 @@ static void host_tests(){
 template<class T> struct Buffer {
     T* allocation; T* ptr; size_t count,bytes;
     explicit Buffer(size_t n):count(n){
-        require(allocation_fits(n,sizeof(T),device_live),"32MiB explicit allocation/overflow cap");
+        require(allocation_fits(n,sizeof(T),device_live),"explicit allocation/overflow cap");
         bytes=n*sizeof(T)+256;CHECK(cudaMalloc(&allocation,bytes));
         device_live+=bytes;device_peak=std::max(device_peak,device_live);
         CHECK(cudaMemset(allocation,0xa5,bytes));ptr=allocation+128/sizeof(T);
@@ -185,29 +206,32 @@ static void cpu_columns(const Shape& s,unsigned m,const std::vector<unsigned sho
     }
 }
 static void run_shape(const Shape& s,bool timing) {
-    require(glm_shared_fp8::geometry(max_rows,s.n,s.k),"bounded projection geometry");
+    require(profile_geometry(max_rows,s.n,s.k),"bounded projection geometry");
     Buffer<unsigned short> a(size_t(max_rows)*s.k);
     Buffer<unsigned char> bp(size_t(s.n)*s.k/2),bt(bp.count),bs(size_t(s.n)*s.k/16),bst(bs.count),bf8(size_t(s.n)*s.k);
-    Buffer<unsigned short> original(size_t(max_rows)*s.n),predecoded(original.count),m16(original.count);
+    Buffer<unsigned short> original(size_t(max_rows)*s.n),predecoded(original.count);
+    std::unique_ptr<Buffer<unsigned short>> m16;
+    if(variants==3)m16=std::make_unique<Buffer<unsigned short>>(original.count);
     require(device_live==fixture_budget(s),"actual explicit device accounting");
     auto guards=[&](){a.guards();bp.guards();bt.guards();bs.guards();bst.guards();bf8.guards();
-        original.guards();predecoded.guards();m16.guards();};
+        original.guards();predecoded.guards();if(m16)m16->guards();};
     cudaStream_t stream;CHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
-    for(unsigned m:{0u,1u,4u,5u,16u}){
+    for(unsigned m:row_cases){
         auto launch=[&](unsigned variant){
-            require(variant<3,"projection selection");
-            auto* ap=reinterpret_cast<__nv_bfloat16*>(a.ptr);const dim3 grid(s.n/128,1);
+            require(variant<variants,"projection selection");
+            auto* ap=reinterpret_cast<__nv_bfloat16*>(a.ptr);const dim3 grid(s.n/128,std::max(1u,(m+63)/64));
             if(variant==0)w4a16_gemm_t<<<grid,128,0,stream>>>(ap,bt.ptr,bst.ptr,s.scale2,
                 reinterpret_cast<__nv_bfloat16*>(original.ptr),m,s.n,s.k,s.n);
             else if(variant==1)fp8_gemm_t<<<grid,128,0,stream>>>(ap,bf8.ptr,
                 reinterpret_cast<__nv_bfloat16*>(predecoded.ptr),m,s.n,s.k);
-            else glm_shared_fp8_m16<<<grid,128,0,stream>>>(ap,bf8.ptr,
-                reinterpret_cast<__nv_bfloat16*>(m16.ptr),m,s.n,s.k);
+            else {require(m16&&m<=16,"M16 never selected above16");
+                glm_shared_fp8_m16<<<dim3(s.n/128,1),128,0,stream>>>(ap,bf8.ptr,
+                    reinterpret_cast<__nv_bfloat16*>(m16->ptr),m,s.n,s.k);}
             CHECK(cudaGetLastError());
         };
         cudaGraph_t graph;cudaGraphExec_t exec;
         CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
-        for(unsigned v=0;v<3;++v)launch(v);
+        for(unsigned v=0;v<variants;++v)launch(v);
         CHECK(cudaStreamEndCapture(stream,&graph));CHECK(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
         std::vector<unsigned short> previous;
         for(unsigned epoch=0;epoch<2;++epoch){
@@ -235,13 +259,14 @@ static void run_shape(const Shape& s,bool timing) {
             float setup_ms;CHECK(cudaEventElapsedTime(&setup_ms,begin,end));
             CHECK(cudaEventDestroy(begin));CHECK(cudaEventDestroy(end));
             exact(expected,bf8.read(),"every predecoded E4M3 byte vs independent CPU");
-            auto poison=[&](){for(auto* out:{&original,&predecoded,&m16})CHECK(cudaMemsetAsync(out->ptr,0x5a,out->count*2,stream));};
-            poison();for(unsigned v=0;v<3;++v)launch(v);CHECK(cudaStreamSynchronize(stream));
+            auto poison=[&](){for(auto* out:{&original,&predecoded})CHECK(cudaMemsetAsync(out->ptr,0x5a,out->count*2,stream));
+                if(m16)CHECK(cudaMemsetAsync(m16->ptr,0x5a,m16->count*2,stream));};
+            poison();for(unsigned v=0;v<variants;++v)launch(v);CHECK(cudaStreamSynchronize(stream));
             const auto reference=original.read();
             auto check_outputs=[&](){
                 exact(reference,original.read(),"original projection unchanged");
                 exact(reference,predecoded.read(),"existing FP8 full bit equality");
-                exact(reference,m16.read(),"M16 FP8 full bit equality");
+                if(m16)exact(reference,m16->read(),"M16 FP8 full bit equality");
                 for(unsigned row=0;row<max_rows;++row)for(unsigned col=0;col<s.n;++col){
                     unsigned short bits=reference[size_t(row)*s.n+col];
                     if(row>=m)require(bits==0x5a5a,"inactive output tail");
@@ -255,18 +280,18 @@ static void run_shape(const Shape& s,bool timing) {
             check_outputs();immutable();cpu_columns(s,m,ha,expected,reference);
             poison();CHECK(cudaGraphLaunch(exec,stream));CHECK(cudaStreamSynchronize(stream));check_outputs();immutable();
             if(epoch&&m)require(reference!=previous,"refreshed graph fixture differs");previous=reference;
-            std::printf("PASS FP8cache shape=%s M=%u epoch=%u all_predecode_bytes full3way_BITEXACT CPUcolumns graphrefresh immutable tails setup_us=%.3f\n",
-                s.name,m,epoch,setup_ms*1000);
-            if(timing&&epoch==1&&(m==4||m==5)){
-                for(unsigned i=0;i<5;++i)for(unsigned v=0;v<3;++v)launch(v);
-                cudaEvent_t start,stop;CHECK(cudaEventCreate(&start));CHECK(cudaEventCreate(&stop));std::vector<float> samples[3];
-                for(unsigned trial=0;trial<5;++trial)for(unsigned order=0;order<3;++order){
-                    unsigned v=(trial+order)%3;CHECK(cudaEventRecord(start,stream));
+            std::printf("PASS FP8cache shape=%s M=%u epoch=%u variants=%u all_predecode_bytes full_BITEXACT CPUcolumns graphrefresh immutable tails setup_us=%.3f\n",
+                s.name,m,epoch,variants,setup_ms*1000);
+            if(timing&&epoch==1&&(max_rows>16||m==4||m==5)){
+                for(unsigned i=0;i<5;++i)for(unsigned v=0;v<variants;++v)launch(v);
+                cudaEvent_t start,stop;CHECK(cudaEventCreate(&start));CHECK(cudaEventCreate(&stop));std::vector<float> samples[variants];
+                for(unsigned trial=0;trial<5;++trial)for(unsigned order=0;order<variants;++order){
+                    unsigned v=(trial+order)%variants;CHECK(cudaEventRecord(start,stream));
                     for(unsigned i=0;i<100;++i)launch(v);CHECK(cudaEventRecord(stop,stream));CHECK(cudaEventSynchronize(stop));
                     float ms;CHECK(cudaEventElapsedTime(&ms,start,stop));samples[v].push_back(ms*10);
                 }
                 const char* names[]={"original_W4A16_M64","predecoded_FP8_M64","predecoded_FP8_M16"};
-                for(unsigned v=0;v<3;++v){auto& values=samples[v];std::sort(values.begin(),values.end());
+                for(unsigned v=0;v<variants;++v){auto& values=samples[v];std::sort(values.begin(),values.end());
                     std::printf("TIMING shape=%s M=%u path=%s us=%.3f eager_events median5x100 interleaved excludes_predecode hot_weights_not_fullmodel\n",
                         s.name,m,names[v],values[2]);}
                 CHECK(cudaEventDestroy(start));CHECK(cudaEventDestroy(stop));CHECK(cudaStreamSynchronize(stream));
