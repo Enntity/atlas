@@ -308,6 +308,23 @@ An initial packaging attempt referenced nonexistent `Dockerfile` and stopped;
 the corrected `Dockerfile.runtime` build succeeded before launch. No stale
 binary was served. Numerical kernel/cache work remains separate and default-off.
 
+The native148/64 trace completes six windows (warmup plus five measured),
+each with eight records. All48 raw/selected target arrays match. Five measured
+first proposals agree; later proposals diverge at the same position/seed.
+Comparing target decisions with identical causal input prefixes finds no
+target-argmax disagreement in these windows. This narrows the observation to
+draft-side sensitivity, but does not prove identical target/proposer hidden
+states, a reset defect, or a faulty quantization kernel. All five measured
+output-text hashes match, and four strict answers pass.
+
+An isolated existing vocabulary-policy arm sets `GLM_MTP_BF16_DRAFTS=4`,
+retaining BF16 EH/NVFP4 WO, repair and all other settings. It is negative:
+148/64 median22.785 versus mixed-head24.372; matched148/256 warmup+three gives
+23.839/25.540/25.609, median25.540 full-wall and26.663 post-first. All caps
+and four strict answers pass. The bounded host trace remains ON in this arm,
+so it is diagnostic rather than a clean new performance qualification. Do
+not promote it over the earlier mixed-vocabulary/BF16-EH27.258 candidate.
+
 The initial v15 CPU build hit its own4GiB container limit while an archive
 timestamp change unnecessarily triggered CUTLASS recompilation. Builder
 status was `exited101/OOMKilled=true`; model services were stopped and both
