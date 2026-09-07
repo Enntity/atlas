@@ -270,3 +270,94 @@ review M64/large-prefill compatibility; upstream review independent audit;
 root server preflight/launcher, native builds and all hardware operations.
 Do not edit a frozen source slice after announcing freeze: request or notify
 before any change so the commit, build snapshot and GPU receipt stay aligned.
+
+## Follow-up source audit: compatibility work required before replacement
+
+Status: planning only. This section records remaining production-reader gaps,
+not permission to repack resident weights or a fixed TPS forecast. Cache-v19
+review/freeze takes priority over this next implementation stage.
+
+### Current prototypes are not a complete reader family
+
+- `scripts/dev/glm_moe_btile.cuh` is a **prequantized-FP4** M16 reader. Its
+  body rejects more than5 rows per expert; its fused compact wrapper requires
+  gathered token IDs and a worklist with `mt==0`. It is suitable for the existing
+  small grouped path, not arbitrary prefill or a BF16-input fallback.
+- `glm_moe_btile_m64.cuh` preserves prequantized-FP4 K64 arithmetic, but currently
+  rejects `M_expert>129`; its compact wrapper also rejects `work_m_tile>=3`.
+  A1024-token prefill can send all1024 distinct rows to one local expert.
+  Reusing this prototype unchanged would silently leave later outputs unwritten.
+- The M64 prototype exports only fused compact/gathered gate+up. Production
+  `prequant_fp4_gate_up` also executes separate gate/up compact calls and an
+  ordinary dense-grid path. Both scalar and vector scale policies must have
+  compatible readers; a missing optional M16 handle must select matching M64,
+  never an old transposed handle against tiled bytes.
+- `glm_moe_btile_decode{,_register}.cuh` contains compatible **BF16-input**
+  rows1/2/3 readers, with shared weights still transposed. Their remote-expert
+  outputs are explicitly zero; grouped kernels instead leave remote outputs
+  untouched. Preserve those different contracts and their existing reductions.
+- When `nvfp4_prequant_moe` is false, general prefill reaches BF16-input grouped
+  W4A16 kernels with FP8 activation conversion/K32 arithmetic. No existing
+  B-tile M64 prototype implements that precision contract. Complete support
+  requires a separately validated reader for that branch. An initial narrower
+  prequant profile may reject it before repack, but this is a declared capability
+  limit, not a substitute for scalar/bootstrap/verify/drain support and not
+  permission to silently change BF16 activations to FP4.
+
+### Smallest safe implementation partitions
+
+1. **Storage and loader:** new `layers/moe/gate_up_layout.rs` + tests and
+   `gate_up_repack.rs` + tests; focused declarations/handles in MoE `mod.rs` and
+   `init.rs`; extraction of routed gate/up versus shared/down phases from
+   `helpers_a.rs`; `weight_loader/glm5/components.rs` and `glm5/layers.rs` own
+   target-only conversion. The existing helper cannot transpose/free a pair
+   after its bytes have been repacked. Preserve exact resident addresses and
+   original allocation ownership; native-source permutation needs its own
+   byte oracle because existing fixtures start from transposed source bytes.
+2. **Small-row readers:** new checked ops and CUDA family for BF16 rows1/2/3;
+   storage-aware dispatch in `forward.rs`, `forward_phase.rs`,
+   `forward_k2.rs`, `forward_k2/unified_t.rs`, `forward_k3.rs`, and
+   `forward_batched.rs`. Keep scalar arithmetic/shared output/down/EP unchanged.
+   `forward_k4.rs` and `forward_k5.rs` must preserve optimized shared projections
+   and their routed-only K2/K3 decompositions; `forward_c4.rs` reverse scalar
+   control must reach the compatible N1 reader for every row. Grouped C3/C4
+   selection must use the typed capability as well.
+3. **Grouped/prefill readers:** `prequant_fp4.rs` and
+   `forward_prefill_routed.rs` bind M16/M64, fused/separate, compact/dense plans
+   to the storage type. Keep quantizer inputs/output ownership and scale policy
+   unchanged. `forward_prefill.rs`/`forward_prefill_phase.rs` retain sort/router,
+   shared-expert and blending behavior. Extend the M64 CUDA body/wrappers and
+   standalone fixture before production use; implement BF16-grouped compatibility
+   separately if that existing precision profile is admitted.
+4. **Incompatible routes and gates:** explicit pre-repack rejection for MMQ,
+   CUTLASS, hybrid conversion, token-major/atomic and incompatible expert-format
+   modes; defensive typed guards in `helpers_b/c.rs`, `mmq_layout.rs`,
+   `forward_token_major.rs`, `forward_atomic_c4.rs` and affected original-reader
+   helpers. Root owns server/factory policy, launcher and hardware gates.
+
+Do not broaden `use_t_layout_for_decode/prefill` to mean “some usable layout.”
+They currently require gate/up/down `_t` tables; leaving gate/up absent without
+new dispatch makes `forward.rs` fall into native readers of now-tiled bytes.
+A typed capability must choose the correct routed reader AND retain the actual
+transposed down view. Legacy raw tables are unavailable in the B-tile variant.
+Tests must cover disabled grouped/M16 flags and fallback decompositions, not
+only the preferred K5 path. No normal scalar decode or C4 drain may be excluded
+as a convenience workaround.
+
+### Mandatory additional gates
+
+- Large prefill: full-output old-kernel comparison for concentrated local
+  expert populations130/148/255/256/257/1023/1024 in addition to existing M64
+  boundaries; no-local, mixed local/remote, shuffled gather and nonzero offsets.
+  Cover the highest configured production row bound, not just total expanded
+  scratch size. Bound memory by streaming output/oracle chunks where necessary.
+- Every actual work encoding: separate and fused compact, ordinary dense grid,
+  scalar/vector scales, and any admitted no-gather mode. Test deliberately
+  poisoned outputs so an early-returning/tail-skipping kernel cannot pass.
+- Native exactness/memcheck for both build FMA policies, fixed-pointer graph
+  metadata refresh, immutable inputs/scales after timing, and native-to-tile
+  plus scale-transpose byte checks. No numerical relaxation for fallback paths.
+- Full-model cold prefill, C1 bootstrap/serial fallback, K2/K3/K4/K5, C4 scalar
+  and grouped controls, and C4→C3→C2→C1 drain/permuted slots. Retain the original
+  transposed default and restart rollback. Measure actual cycle/acceptance and
+  capped output separately; the microkernel speedup is not a TPS promise.
