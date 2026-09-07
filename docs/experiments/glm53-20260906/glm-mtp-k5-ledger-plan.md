@@ -78,3 +78,14 @@ One terminal fixture captures the real log event and checks every token array.
 Native concrete-state admission is source-inspected; CPU fixtures inject the
 resolved eligibility into the same runtime body, not GPU-owned GLM state.
 All six touched Rust files are under500 lines; formatting/diff checks pass.
+# Follow-up precision isolation
+
+After the v17 native first-eight trace, compare an explicit existing
+`GLM_MTP_BF16_DRAFTS=4` vocabulary arm against the prior value1, retaining
+BF16 EH, NVFP4 WO, accepted-pair repair, routed M16 and every other launch
+setting. This changes draft-head precision only, not the target, sampler or
+output cap. First run the same148/64 diagnostic with five repetitions to
+compare proposals; then strict answers and matching148/256 warmup+three waves.
+Trace rates are diagnostic only. Any throughput candidate needs trace-OFF
+matching runs and confirmation. Different draft IDs under mixed precision
+do not prove a cache bug or a particular kernel race.
