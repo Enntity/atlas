@@ -7,15 +7,16 @@
 //! comm/buffers/sizes/streams come from valid prior allocations on this
 //! rank's device, and the `extern "C"` ABI matches NCCL 2.28+.
 
+#[cfg(test)]
+use super::COLLECTIVE_TIMEOUT_SECS;
+use super::{ALL_REDUCE_DTYPE_BYTES, NcclBackend};
+use crate::CommBackend;
+use crate::broadcast::{Classification, validate_idle_receiver};
+use crate::nccl::{self, NcclDataType, NcclRedOp};
 use anyhow::Result;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
-
-use super::{ALL_REDUCE_DTYPE_BYTES, COLLECTIVE_TIMEOUT_SECS, NcclBackend};
-use crate::CommBackend;
-use crate::nccl::{self, NcclDataType, NcclRedOp};
 
 impl CommBackend for NcclBackend {
     fn all_reduce(&self, ptr: u64, bytes: usize) -> Result<()> {
@@ -227,41 +228,12 @@ impl CommBackend for NcclBackend {
     }
 
     fn broadcast(&self, ptr: u64, bytes: usize, root: usize) -> Result<()> {
-        let start = Instant::now();
-        let comm = *self.comm.lock();
+        self.broadcast_classified(ptr, bytes, root, Classification::TimedPayload)
+    }
 
-        // Broadcast raw bytes as Uint8
-        let result = unsafe {
-            nccl::ncclBroadcast(
-                ptr as *const _,
-                ptr as *mut _,
-                bytes,
-                NcclDataType::Uint8,
-                root as i32,
-                comm,
-                self.legacy_stream,
-            )
-        };
-        nccl::check_nccl(result, "ncclBroadcast")?;
-
-        // Synchronize to measure wall-clock time for timeout detection.
-        nccl::sync_stream(self.legacy_stream)?;
-
-        let elapsed = start.elapsed();
-        if elapsed.as_secs() >= COLLECTIVE_TIMEOUT_SECS {
-            tracing::error!(
-                "NCCL broadcast took {:.1}s (threshold: {}s) \
-                 — marking communicator unhealthy",
-                elapsed.as_secs_f64(),
-                COLLECTIVE_TIMEOUT_SECS,
-            );
-            self.unhealthy.store(true, Ordering::Release);
-        }
-
-        // Also check for async errors.
-        self.check_async_error(comm);
-
-        Ok(())
+    fn receive_idle_command_word(&self, ptr: u64) -> Result<()> {
+        validate_idle_receiver(self.rank, self.world_size, ptr)?;
+        self.broadcast_classified(ptr, 4, 0, Classification::IdleCommand)
     }
 
     fn barrier(&self) -> Result<()> {

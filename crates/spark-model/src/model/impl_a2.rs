@@ -29,6 +29,10 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 pub(super) const EP_CMD_GLM_MTP_PROPOSE: u32 = 0xFFFFFFE1;
 
+#[cfg(test)]
+#[path = "impl_a2/idle_command_tests.rs"]
+mod idle_command_tests;
+
 impl TransformerModel {
     pub(super) fn comm_ref(&self) -> Option<&dyn spark_comm::CommBackend> {
         self.comm.as_deref()
@@ -358,9 +362,27 @@ impl TransformerModel {
     /// the worker to dispatch the command into; with `v2` disabled the
     /// returned `seq_id` is always 0 (the legacy singleton slot).
     pub(super) fn ep_recv_seq_and_cmd(&self, v2: bool) -> Result<(u32, u32)> {
-        let seq_id = if v2 { self.ep_broadcast_u32(0)? } else { 0 };
-        let cmd = self.ep_broadcast_u32(0)?;
-        Ok((seq_id, cmd))
+        // Only this outer first word can be waiting for a future command.
+        // In v2 the following command word is already part of active traffic.
+        let first = self.ep_receive_idle_word()?;
+        if v2 {
+            Ok((first, self.ep_broadcast_u32(0)?))
+        } else {
+            Ok((0, first))
+        }
+    }
+
+    fn ep_receive_idle_word(&self) -> Result<u32> {
+        let comm = self
+            .comm
+            .as_ref()
+            .expect("ep_receive_idle_word without comm");
+        let stream = self.gpu.default_stream();
+        comm.receive_idle_command_word(self.ep_cmd_buf.0)?;
+        self.gpu.synchronize(stream)?;
+        let mut buf = [0u8; 4];
+        self.gpu.copy_d2h(self.ep_cmd_buf, &mut buf)?;
+        Ok(u32::from_le_bytes(buf))
     }
 
     /// Broadcast a u32 command from rank 0 to all ranks.

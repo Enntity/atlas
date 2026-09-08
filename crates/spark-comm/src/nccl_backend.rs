@@ -12,7 +12,8 @@
 //!
 //! Health monitoring and recovery:
 //! - Checks `ncclCommGetAsyncError` after each collective
-//! - Detects broadcast timeouts (>30s) via stream sync + wall-clock check
+//! - Flags timed broadcasts after a stream sync taking at least 30s; this is
+//!   a post-completion duration check, not an interrupting watchdog
 //! - Aborts dead communicators via `ncclCommAbort` and reconnects
 //!
 //! ## Safety contract for the `unsafe { ... }` calls below
@@ -69,9 +70,7 @@ mod recv_buffer;
 use recv_buffer::ensure_payload_fits;
 pub use recv_buffer::{ALL_REDUCE_DTYPE_BYTES, required_recv_bytes};
 
-/// Timeout threshold for a single synchronous collective operation.
-/// If a broadcast + stream sync takes longer than this, mark the communicator unhealthy.
-pub(super) const COLLECTIVE_TIMEOUT_SECS: u64 = 30;
+pub(super) use crate::broadcast::COLLECTIVE_TIMEOUT_SECS;
 
 /// NCCL communication backend for multi-GPU / multi-node EP.
 pub struct NcclBackend {
@@ -561,4 +560,5 @@ impl Drop for NcclBackend {
     }
 }
 
+mod broadcast;
 mod comm_impl;

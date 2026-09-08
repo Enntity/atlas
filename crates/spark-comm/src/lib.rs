@@ -13,6 +13,10 @@
 
 use anyhow::Result;
 
+mod broadcast;
+#[cfg(test)]
+mod idle_command_tests;
+
 // NCCL FFI + the multi-GPU `NcclBackend` are gated on the `nccl`
 // feature because they `#[link(name = "nccl")]`. `nccl` is separate
 // from `cuda` so SCALE/AMD (gfx1151) builds can use the CUDA compute
@@ -42,6 +46,18 @@ pub trait CommBackend: Send + Sync {
 
     /// Broadcast from root rank to all ranks.
     fn broadcast(&self, ptr: u64, bytes: usize, root: usize) -> Result<()>;
+
+    /// Receive exactly the first four-byte word of an outer worker command
+    /// from rank zero. Only non-root ranks of a multi-rank communicator may
+    /// call this, with an aligned, live device word. This explicit boundary
+    /// may wait for a future command: NCCL excludes that idle duration from
+    /// its post-completion slow-broadcast latch, but keeps all error checks.
+    /// Subsequent words and payloads must use ordinary [Self::broadcast].
+    /// Other backends retain their ordinary broadcast behavior by default.
+    fn receive_idle_command_word(&self, ptr: u64) -> Result<()> {
+        broadcast::validate_idle_receiver(self.rank(), self.world_size(), ptr)?;
+        self.broadcast(ptr, 4, 0)
+    }
 
     /// Barrier: block until all ranks reach this point.
     fn barrier(&self) -> Result<()>;
