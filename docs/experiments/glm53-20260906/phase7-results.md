@@ -35,6 +35,15 @@ Existing28.53 C1 rates are retained historical measurements, not
 evidence that the old handoff is safe or a speedup prediction.
 The checked B-tile family is now independently approved and committedad367a70;
 its897-test CPU gate does not activate the resident layout.
+The next ownership prerequisite is committed `6a486364`: exact GLM checkpoint
+retirement at the actual MLA/KDA/down free sites, with935 passing CPU tests and
+independent frozen-source review. It remains unselected by the whole-model
+legacy loader. Its source/CPU archive `btile-retirement-6a486364-receipts.tar`
+is verified on controller/head with SHA256
+`e7b3647adbbb0bbe4a44a7db071092463190b2ee072a1d9e7b6711fb06db235c`.
+Actual resident readers and loader activation remain separate gates. The
+[next idle-receive native plan](../../../scripts/dev/glm_ep_idle_native_plan.md)
+does not enable them or presume a throughput gain.
 
 ## Recovery and artifact identity
 
