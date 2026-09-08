@@ -17,7 +17,8 @@ The C1 figures below remain historical benchmark evidence, not approval to
 restart that known unordered path. The additional idle-command duration/health-
 latch defect is now repaired in `e40a9066`: two fresh
 [v26 C1/v1 native35-second idle gates](glm-ep-idle-v26-results.md) pass.
-Native v2 coverage remains separate; no general transport recovery is claimed.
+The separate [v26 warm C1–C4 matrix](glm-concurrency-v26-results.md) now also
+passes two native35-second EP-v2 idle gates; no general transport recovery is claimed.
 The separate
 nonspeculative C4 measurement does not exercise the eager-drafter handoff.
 
@@ -28,7 +29,7 @@ CUDA `189db87e`, executable SHA256 on both nodes:
 `a29c261991b94309a2eb4193f3354a429cb60f77d851604b62fe1f3ea5538cbd`.
 Matched148/256 full-wall medians are28.699 initially and28.618 after a fresh
 restart. All caps, short answers,1984-token needle, cancellation/recovery and
-clean shutdown pass. These are below30 C1; C4 is unchanged. The approximately
+clean shutdown pass. These are below30 C1. The approximately
 30.1 decode-only rates must not replace full-wall results.
 
 The frozen head recipe is `phase7/run-v26-c1.sh`, requiring explicit
@@ -41,6 +42,18 @@ measured v26 services are stopped and preserved; root continues source work.
 The preceding [v25 result](glm-mtp-stream-fix-v25-results.md) records28.632/28.726
 medians and retained failed idle-health attempts as well as clean gates. v26
 does not establish a speedup over those measurements.
+
+## Latest nonspeculative C1–C4 matrix — v26, September8
+
+Same v26 executable, separate active4/admitted4 profile, context2048,
+prefill1024, utilization.90,114GiB and4096MiB guard; EP v2, speculation OFF.
+Warm148/256 initial/fresh full-wall aggregate medians: C1 13.478/13.468,
+C2 19.067/18.976, C3 35.037/34.828, C4 47.440/47.222. The C1 here is a
+nonspeculative scaling control, not the optimized C1 profile above.
+All measured caps, quality, paired batch/slot logs, cancellation/recovery,
+35-second idle and clean stops pass. See [exact results](glm-concurrency-v26-results.md).
+Use frozen `phase7/run-v26-c4.sh` only under root's stopped/preserved-container
+preflight; do not combine it with C1 flags. No C2 speculation is enabled.
 
 ## Historical C1 comparison — v20, September8
 
@@ -78,8 +91,9 @@ with strict parser correctionaa88a9b0 pass20 standalone executions and ten
 zero-error memchecks. This is compiled-ABI/bounded-correctness evidence, not
 serving activation or a throughput gain. The checked Rust kernel family is
 independently approved and committed asad367a70, with897 CPU tests passing.
-It has no serving caller; resident ownership and actual reader integration
-remain in progress, and no B-tile serving profile is approved.
+Resident ownership and actual reader integration are now committed4416ede2,
+with957 passing CPU tests, exact retained-GU bind hardening and independent
+review. The loader still does not select B-tile; no serving profile is approved.
 
 The [v24 first-private-KV diagnostic](glm-mtp-first-kv-v24-results.md), source
 2da770dc with unchanged CUDA189db87e, passed its bounded native/health gates.
@@ -88,7 +102,7 @@ appended rows; the upstream cause remains under investigation. Both services
 were stopped cleanly afterward. This is not a throughput-qualified replacement
 for v20 or the separate C4 profile below; tracing remains OFF for timing.
 
-## Last qualified C4 profile — September7
+## Historical qualified C4 profile — September7
 
 The short C4 profile is v13: native NVFP4 GLM-5.3-Flash,
 TP2/EP2, BF16 KV/index, FP32 recurrent state, **2048 context per request**,

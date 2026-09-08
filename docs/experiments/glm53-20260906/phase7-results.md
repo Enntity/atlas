@@ -3,8 +3,10 @@
 The acceptance target remains a reproducible full-wall median of at least30
 tok/s at C1 or60 aggregate tok/s at C4 on the unchanged LRU148/256 fixture,
 one warmup plus three measured waves and a confirming repeat. Latest bounded
-C1 medians are28.699 initially and28.618 on a fresh v26 restart; qualified C4
-remains47.319 on its separate profile. Neither establishes the target. The
+C1 medians are28.699 initially and28.618 on a fresh v26 restart; the separate
+[warm v26 concurrency matrix](glm-concurrency-v26-results.md) records
+C4 47.440/47.222 initially/fresh, C2 19.067/18.976 and C3 35.037/34.828.
+Neither establishes the target. Historical v13 C4 was47.319. The
 preceding v25 medians28.632/28.726 and v20 medians28.545/28.529 are historical
 comparisons, not evidence of a v26 speedup. The
 earlier27.947/25.161 C1 receipts below are historical, not current best results.
@@ -32,7 +34,8 @@ gate passes. Two earlier attempts retain idle-command health errors explicitly;
 the separate idle-receive fix `e40a9066` now passes two native35-second C1/v1
 idle gates. Its [v26 results](glm-ep-idle-v26-results.md) record trace-OFF
 initial/fresh full-wall medians28.699/28.618 and clean quality/shutdown.
-Native v2 coverage remains separate. The small historical differences are
+The separate nonspeculative matrix also passes two native-v2 idle gates.
+The small historical differences are
 not causal significance or30 C1.
 Existing28.53 C1 rates are retained historical measurements, not
 evidence that the old handoff is safe or a speedup prediction.
@@ -44,7 +47,12 @@ independent frozen-source review. It remains unselected by the whole-model
 legacy loader. Its source/CPU archive `btile-retirement-6a486364-receipts.tar`
 is verified on controller/head with SHA256
 `e7b3647adbbb0bbe4a44a7db071092463190b2ee072a1d9e7b6711fb06db235c`.
-Actual resident readers and loader activation remain separate gates. The
+Actual resident readers are now committed4416ede2 after957 passing CPU tests
+and independent54-file review, including exact retained-source arena binding.
+Loader activation remains OFF and separate from the new C2 speculation plan.
+The source/CPU archive `btile-resident-4416ede2-receipts.tar` is verified on controller/head
+with SHA256`ae0934a8f0861d9ae5f36b895f02ba603fe8e5502a4d58c6273103fca85b1e45`.
+The
 [next idle-receive native plan](../../../scripts/dev/glm_ep_idle_native_plan.md)
 does not enable them or presume a throughput gain.
 
