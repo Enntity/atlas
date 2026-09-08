@@ -35,6 +35,8 @@ mod prefill_a;
 mod prefill_b;
 mod prefill_c;
 mod prefill_d;
+#[cfg(test)]
+mod prefill_stream_tests;
 mod sequence;
 mod speculative;
 pub(in crate::model) mod ssm_fault_in;
@@ -86,7 +88,9 @@ impl Model for TransformerModel {
     fn tokens_contain_vision_pad(&self, tokens: &[u32]) -> bool {
         self.tokens_have_vision_pad(tokens)
     }
-    fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
+    fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
+        // Full prefill computes on default; its eager consumer must follow it.
+        let stream = self.gpu.default_stream();
         self.stamp_overlay_route(seq.adapter_slot);
         let logits = self.prefill_dispatch(tokens, seq, stream)?;
         self.try_eager_drafter_prefill(seq, true, stream)?;
@@ -101,6 +105,13 @@ impl Model for TransformerModel {
         is_last_chunk: bool,
         stream: u64,
     ) -> Result<DevicePtr> {
+        // Distributed dispatch uses default for command/collective ordering.
+        // Keep capture consumption and scratch reuse on that same stream.
+        let stream = if self.multi_rank_protocol_active() {
+            self.gpu.default_stream()
+        } else {
+            stream
+        };
         self.stamp_overlay_route(seq.adapter_slot);
         let logits = self.prefill_chunk_dispatch(
             tokens,
@@ -120,6 +131,11 @@ impl Model for TransformerModel {
         chunk_size: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
+        let stream = if self.multi_rank_protocol_active() {
+            self.gpu.default_stream()
+        } else {
+            stream
+        };
         self.stamp_overlay_route(seq.adapter_slot);
         let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
         self.try_eager_drafter_prefill(seq, true, stream)?;

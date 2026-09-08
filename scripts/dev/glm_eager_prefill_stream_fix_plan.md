@@ -87,3 +87,33 @@ C1 with one warmup/three measured requests and fresh-repeat confirmation.
 Only full-wall cap-complete results can satisfy30 C1; no diagnostic timing or
 assumed acceptance improvement qualifies. Preserve both nodes' memory guards,
 exclusive GPU use, graceful stop and rollback images throughout.
+
+## Implemented CPU evidence
+
+The source diagnostic is separately committed asaa2b7e16. The stream fix changes
+only the three real wrappers in trait_impl/mod.rs; the two new private test
+files are164 and380 lines. The existing903-line trait module remains on the
+repository's explicit file-size allow-list; no new exemption was added.
+
+Receipts are under atlas-campaigns/20260908/eager-prefill-stream-fix:
+
+- `behavior-red.log`: actual runtime failures in three tests, including
+  chunked target/capture on7 and primer on37. Two negative-path tests passed.
+  The separate initial missing-fixture-method compile failure is not RED proof.
+- `focused-green.log`: all five tests pass after the wrapper fix,0.05s. The
+  matrix covers12 multi-rank entry combinations, single-rank policy, two-chunk
+  consumption, target/capture errors and disabled capture. A separate compiler
+  check caught the intentionally shadowed full-prefill parameter; it is now
+  named `_stream`, with no lint suppression.
+- `full-green.log`:917/917 PASS34.07s, including the committed diagnostic's
+  actual public-caller selected-error/ordinary-fallback tests. No unreferenced
+  resident-reader drafts are compiled by this gate.
+- `lib-check.log`: non-test library check PASS4.05s.
+- `format-check.log` and `diff-check.log`: workspace format and whitespace
+  checks pass; all three touched Rust files have the required SPDX header.
+- `clippy.log`: FAIL at four existing spark-runtime Metal stub argument-count
+  errors before the model check; no Clippy or full-workspace CI pass claimed.
+
+These tests prove the dispatch/stream contract, not GPU numerical equality or
+throughput. Root native gates and independent exact-source approval remain
+required before this becomes a serving recommendation.
