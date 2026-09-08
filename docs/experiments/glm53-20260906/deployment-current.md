@@ -1,6 +1,35 @@
-# Current bounded dual-Spark GLM deployment
+# Qualified bounded dual-Spark GLM profiles
 
-As of 2026-09-07, the active short profile is v13: native NVFP4 GLM-5.3-Flash,
+During the September8 campaign, root stops and replaces experimental services.
+Inspect both nodes before using any recipe; this document identifies qualified
+profiles, not a promise that a particular container is currently running.
+Do not combine the C1 speculative and C4 independent-decode settings.
+
+## Last qualified C1 profile — September8
+
+Image `atlas-glm53-flash:kernel-20260908-v20`, source `7bfa3bae`, production
+CUDA `189db87e`, executable SHA256 on both nodes:
+`6d774b5a4bd69d121a0822af227a504bc818a3b194ca308cf8731c9421a9e447`.
+Native MTP4 accepted-pair repair, one active/admitted request,2044 context plus
+four verifier lookahead positions,1024 configured prefill chunk, target shared
+FP8 cache ON, utilization.91,114GiB container and4096MiB host guard. Keep all
+diagnostic oracles/hidden tracing OFF for throughput; verifier graphs/shared
+overlap ON. The shared-cache path retains original-T fallback above1024 rows.
+
+Matched148/256 full-wall medians are28.545 initially and28.529 after a fresh
+restart, versus28.049 cache-OFF. All caps, both-rank resident cache oracles,
+short answers,1984-token retrieval boundary and cancellation/recovery passed.
+This does not meet30 C1, establish a C4 gain, or validate longer context.
+See [phase7 results](phase7-results.md) for exact flags, limitations and receipts.
+The exact preserved head recipe is
+`/home/mangokid/atlas-glm53-deploy-20260906/phase7/run-v20-c1.sh`, requiring
+explicit `CACHE=1 VERIFY=0` after both standard-name containers are stopped
+and preserved. Persistent archived receipts include that recipe. The newer
+v21/v22 hidden-trace images are diagnostic builds, not performance promotions.
+
+## Last qualified C4 profile — September7
+
+The short C4 profile is v13: native NVFP4 GLM-5.3-Flash,
 TP2/EP2, BF16 KV/index, FP32 recurrent state, **2048 context per request**,
 four active/admitted requests, 1024-token prefill chunks, no speculation.
 Graph-enabled answer/needle and stream-lifecycle gates passed. This retains
