@@ -3,6 +3,34 @@
 Scope: script-only kernel/harness extension; root owns commits, native builds,
 GPU gates and all node operations. No production dispatch or precision changes.
 
+## Arena envelope follow-up: 1088 expert rows
+
+Root observed valid solo-prefill row1025 and identified C4 padding through1028;
+the configured chunk value is not the actual consuming row limit. Before any
+physical B-tile replacement, extend this standalone compatible-reader envelope
+through1088 (17 M64 tiles), including explicit1025/1028/1087/1088 cases.
+An old transposed reader is not a fallback once resident bytes are tiled.
+
+TDD: extend the shared host/device predicate's CPU test first, observe its
+existing1024 ceiling reject required rows, then update the single row bound to
+1088. Dense-grid M extent, compact capacity and fixture source/route bounds must
+derive from it. Keep every prior case and all12 graph/ABI/scales/gather variants.
+Retain two local gate/up pairs and full poison/oracle/immutability/guard checks.
+No kernel arithmetic, activation precision, production or loader change.
+
+New planned explicit device budget: **57,211,784 bytes** across21 individually
+guarded allocations, below64MiB. Four output buffers use1152 route rows; gathered
+A has1088 real token rows, while explicit route-major A has1152 rows. Compact
+capacity is544 work items (two pairs x17 M tiles x16 N tiles). The largest case
+uses1088 concentrated local rows,16 rows in the other local pair and48 remote
+rows, exactly1152 routes with nonzero offsets. Preserve the historical1024-row
+receipts below; this changed fixture requires new native/root gate receipts.
+
+CPU receipts for this extension are persistent under
+`/home/abc/storage/models/atlas-campaigns/20260908/btile-m64-arena/`.
+
+## Historical 1024-row fixture plan and receipts
+
 1. Add a shared host/device M64 geometry predicate; require actual CPU tests
    to fail with a rejecting stub before implementing 1..1024 expert rows and
    M tiles 0..15. Keep N2048/K4096 and prequantized FP4/K64 accumulation.

@@ -24,8 +24,8 @@ static void require(bool ok, const char* message) {
 }
 constexpr unsigned max_rows = glm_btile_m64_max_rows;
 constexpr unsigned dn = 2048, dk = 4096, experts = 288, routes = max_rows + 64, weights = 2;
-// Gathered A has 1024 true token rows. No-gather A is an explicitly expanded
-// route-major tensor and therefore needs all 1088 rows, including remote rows.
+// Gathered A has max_rows true token rows. No-gather A is an explicitly
+// expanded route-major tensor and needs all routes rows, including remote rows.
 constexpr unsigned source_capacity = routes;
 constexpr unsigned max_tiles = weights * ((max_rows + 63) / 64) * (dn / 128);
 constexpr size_t packed_weight = size_t(dn) * dk / 2, scale_weight = size_t(dn) * dk / 16;
@@ -130,13 +130,16 @@ static void fill_ids(Case& c,unsigned salt){
         c.ids.push_back(int((max_rows-1-unsigned(j)+e+salt)%max_rows));
 }
 static std::vector<Case> cases(){
-    const unsigned counts[]={15,16,17,63,64,65,127,128,129,130,148,255,256,257,1023,1024,1,2,3,4,5};
-    const char* names[]={"M15","M16","M17","M63","M64","M65","M127","M128","M129", "M130","M148","M255","M256","M257","M1023","M1024","M1","M2","M3","M4","M5"};
+    const unsigned counts[]={15,16,17,63,64,65,127,128,129,130,148,255,256,257,1023,1024,1,2,3,4,5,1025,1028,1087,1088};
+    const char* names[]={"M15","M16","M17","M63","M64","M65","M127","M128","M129", "M130","M148","M255","M256","M257","M1023","M1024","M1","M2","M3","M4","M5","M1025","M1028","M1087","M1088"};
+    constexpr size_t count_cases=sizeof(counts)/sizeof(counts[0]);
+    static_assert(count_cases==sizeof(names)/sizeof(names[0]),"case name/count agreement");
     std::vector<Case> all;
-    for(unsigned c=0;c<21;++c){
+    for(unsigned c=0;c<count_cases;++c){
         Case value(names[c]); unsigned ids[]={0,17,142,143,144,145,286,287};
-        for(unsigned i=0;i<8;++i)value.count[ids[i]]=int(c<9||c>=16?counts[c]:8);
-        if(c>=9&&c<16){value.count[17]=int(counts[c]);value.count[287]=16;}
+        const bool concentrated=counts[c]>129;
+        for(unsigned i=0;i<8;++i)value.count[ids[i]]=int(concentrated?8:counts[c]);
+        if(concentrated){value.count[17]=int(counts[c]);value.count[287]=16;}
         // Nonzero starts and pointer swaps exercise both packed M and N fields.
         value.local[17]=int(c%2); value.local[287]=int(1-c%2);
         all.push_back(value);
@@ -202,14 +205,23 @@ static void host_tests(){
     packing_tests();
     auto all=cases();for(const auto& c:all)require(valid(c),"valid gathered fixture");
     require(expected_work(all[0]).size()==weights*16*2,"gate/up16 Ntiles");
-    require(expected_work(all[21]).empty()&&expected_work(all[22]).empty(),"remote/empty skips");
+    require(expected_work(all[all.size()-2]).empty()&&expected_work(all.back()).empty(),"remote/empty skips");
     auto c=all[0];c.ids[0]=int(max_rows);require(!valid(c),"reject out-of-range gather");
     c=all[0];c.ids[1]=c.ids[0];require(!valid(c),"reject duplicate within expert");
     c=all[0];c.local[287]=c.local[17];require(!valid(c),"reject live pair alias");
     c=all[0];c.count[0]=int(max_rows)+1;require(!valid(c),"reject M overflow");
     c=all[0];c.ids.pop_back();require(!valid(c),"reject truncated gather");
-    for(unsigned i=0;i<21;++i){
+    bool largest_case=false;
+    for(unsigned i=0;i<all.size()-2;++i){
         unsigned m=unsigned(all[i].count[17]);auto work=expected_work(all[i]);
+        if(m==max_rows){
+            largest_case=true;
+            require(offsets(all[i]).back()==int(routes),"largest concentrated route extent");
+            unsigned largest_m_tile=0;
+            for(size_t j=0;j<work.size();j+=2)if(work[j]==17)
+                largest_m_tile=std::max(largest_m_tile,work[j+1]>>6);
+            require(largest_m_tile==(max_rows-1)/64,"highest M tile in full envelope");
+        }
         unsigned other=unsigned(all[i].count[287]);
         require(work.size()==((m+63)/64+(other+63)/64)*16*2,"multiple M tile count");
         for(size_t j=0;j<work.size();j+=2)
@@ -236,9 +248,9 @@ static void host_tests(){
     require(expected_work(all[5])[32+1]==64,"M65 second tile encoding");
     require(allocation_fits(1,4,0)&&!allocation_fits(std::numeric_limits<size_t>::max(),4,0),"allocation overflow");
     require(!allocation_fits(1,1,memory_limit)&&!allocation_fits(1,1,std::numeric_limits<size_t>::max()),"live allocation cap");
-    require(fixture_budget()==56015240,"explicit guarded fixture footprint");
-    require(offsets(all[15]).back()==int(routes),"largest concentrated route extent");
-    std::printf("PASS host source_rows=%u route_capacity=%u M1_2_3_4_5_15_16_17_63_64_65_127_128_129_130_148_255_256_257_1023_1024 gathered_and_route_major_rowownership exhaustive_B_bijection_roundtrip bounds aliasing device_bytes=%zu\n",max_rows,routes,fixture_budget());
+    require(fixture_budget()==57211784,"explicit guarded fixture footprint");
+    require(largest_case,"fixture reaches configured expert-row bound");
+    std::printf("PASS host source_rows=%u route_capacity=%u max_tiles=%u M1_2_3_4_5_15_16_17_63_64_65_127_128_129_130_148_255_256_257_1023_1024_1025_1028_1087_1088 gathered_and_route_major_rowownership exhaustive_B_bijection_roundtrip bounds aliasing device_bytes=%zu\n",max_rows,routes,max_tiles,fixture_budget());
 }
 
 int main(int argc,char** argv){
