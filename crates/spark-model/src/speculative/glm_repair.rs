@@ -30,6 +30,9 @@ pub struct RepairInput<'a> {
 }
 
 pub trait GlmPairRepair: Send + Sync {
+    fn paired_handoff(&self) -> Option<&dyn GlmPairedHandoff> {
+        None
+    }
     /// No mutation, allocation or GPU operation. Head invokes before E1.
     fn validate_prepare(
         &self,
@@ -42,6 +45,58 @@ pub trait GlmPairRepair: Send + Sync {
     fn prepare(
         &self,
         input: &RepairInput<'_>,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()>;
+}
+
+/// Optional GLM-only request-owned path; legacy and other proposers lack it.
+pub trait GlmPairedHandoff: Send + Sync {
+    fn validate_cold(
+        &self,
+        state: &dyn ProposerState,
+        slot: usize,
+        prompt: usize,
+        ctx: &ForwardContext,
+    ) -> Result<()>;
+    fn retire(
+        &self,
+        state: &mut dyn ProposerState,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+    ) -> Result<()>;
+    fn close(&self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()>;
+    fn propose_owned(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        token: u32,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Vec<u32>>;
+    fn begin_decode(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        token: u32,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()>;
+    fn publish_decode(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        token: u32,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()>;
+    fn quarantine(
+        &self,
+        state: &mut dyn ProposerState,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+    ) -> Result<()>;
+    fn prime(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
         state: &mut dyn ProposerState,
         ctx: &ForwardContext,
         stream: u64,

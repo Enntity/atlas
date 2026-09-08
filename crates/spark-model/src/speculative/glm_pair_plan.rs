@@ -119,6 +119,43 @@ impl Limits {
         })
     }
 
+    /// One owned terminal row after an exactly completed eager P-1 primer.
+    /// Its hidden index is local zero, never a fictitious whole-prompt span.
+    pub fn bootstrap_eager_tail(self, input: EagerTailInput) -> Result<FinishPlan> {
+        ensure!(
+            input.generation != 0 && input.prompt_tokens > 0,
+            "GLM eager tail requires a live generation and nonempty prompt"
+        );
+        let position = input
+            .prompt_tokens
+            .checked_add(1)
+            .context("GLM eager position overflow")?;
+        ensure!(
+            input.target_position == position
+                && position <= self.context_tokens
+                && input.token_rows >= position
+                && input.cached_rows == input.prompt_tokens - 1
+                && input.tail_position == input.prompt_tokens - 1
+                && input.prompt_tokens <= self.cache_rows,
+            "GLM eager tail ownership/cursor/position/capacity mismatch"
+        );
+        Ok(FinishPlan {
+            state: PairState {
+                generation: input.generation,
+                cache_rows: input.prompt_tokens,
+                target_position: position,
+            },
+            write: Some(PairWrite {
+                cache_start: input.cached_rows,
+                token_start: input.prompt_tokens,
+                hidden_start: 0,
+                rows: 1,
+            }),
+            bonus_hidden_row: None,
+            keep_seed: false,
+        })
+    }
+
     /// Prepare a proposal with a canonical committed prefix. The resulting
     /// transient cache extent is explicit so a later stale/partial write
     /// cannot be mistaken for the full proposal. This does not execute it.
@@ -192,6 +229,16 @@ pub struct BootstrapInput {
     pub token_rows: usize,
     pub normalized_hidden_rows: usize,
     pub cached_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EagerTailInput {
+    pub generation: u64,
+    pub prompt_tokens: usize,
+    pub target_position: usize,
+    pub token_rows: usize,
+    pub cached_rows: usize,
+    pub tail_position: usize,
 }
 
 /// Canonical private cache covers every shifted pair before the next seed.

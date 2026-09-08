@@ -11,6 +11,46 @@ use anyhow::{Context, ensure};
 #[path = "kv_rows_execution_tests.rs"]
 mod tests;
 
+/// Actual dense and semantic-index owners share one checked extent source.
+pub(super) fn cache_spans(cache: &PagedKvCache) -> Result<Vec<DeviceSpan>> {
+    let mut spans = Vec::with_capacity(5);
+    let mut push = |ptr, stride: usize| -> Result<()> {
+        if stride == 0 {
+            return Ok(());
+        }
+        let bytes = cache
+            .num_blocks()
+            .checked_mul(stride)
+            .context("GLM cache span overflow")?;
+        let span = DeviceSpan { ptr, bytes };
+        ensure!(!ptr.is_null(), "GLM cache owner missing");
+        span.end()?;
+        spans.push(span);
+        Ok(())
+    };
+    push(
+        cache.k_cache_ptr(0, 0),
+        cache.k_block_stride_bytes_for_layer(0),
+    )?;
+    push(
+        cache.v_cache_ptr(0, 0),
+        cache.v_block_stride_bytes_for_layer(0),
+    )?;
+    if let Some(index) = cache.sparse_index_config() {
+        let values = cache.sparse_index_block_stride_bytes(0);
+        let tail = cache.sparse_index_tail_block_stride_bytes(0);
+        let scales = index
+            .block_bytes(cache.block_size())?
+            .checked_sub(values)
+            .and_then(|bytes| bytes.checked_sub(tail))
+            .context("GLM index span mismatch")?;
+        push(cache.sparse_index_pool_ptr(0), values)?;
+        push(cache.sparse_index_scale_pool_ptr(0), scales)?;
+        push(cache.sparse_index_tail_pool_ptr(0), tail)?;
+    }
+    Ok(spans)
+}
+
 impl Glm5MtpHead {
     pub(super) fn prefill_kv_batched(
         &self,
@@ -185,24 +225,7 @@ impl Glm5MtpHead {
             span.end()?;
             forbidden.push(span);
         }
-        for (ptr, stride) in [
-            (
-                cache.k_cache_ptr(0, 0),
-                cache.k_block_stride_bytes_for_layer(0),
-            ),
-            (
-                cache.v_cache_ptr(0, 0),
-                cache.v_block_stride_bytes_for_layer(0),
-            ),
-        ] {
-            let bytes = cache
-                .num_blocks()
-                .checked_mul(stride)
-                .context("GLM KV pool overflow")?;
-            let span = DeviceSpan { ptr, bytes };
-            span.end()?;
-            forbidden.push(span);
-        }
+        forbidden.extend(cache_spans(cache)?);
         KvRowsPlan::inputs(
             tokens,
             source,

@@ -2,23 +2,14 @@
 
 #![allow(unused_imports, dead_code)]
 
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use anyhow::{Context, Result, bail};
-use atlas_core::config::{LayerType, ModelConfig};
-use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
-use spark_runtime::kv_cache::PagedKvCache;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
-use super::ssm_pool::SsmStatePool;
-use super::ssm_snapshot::SsmSnapshotPool;
-use super::types::{PinnedMetaStaging, TransformerModel};
+use super::types::TransformerModel;
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
@@ -105,6 +96,17 @@ impl TransformerModel {
         // Give the drafter its prompt context on the first propose of this
         // sequence: whole-prompt prefill on a COLD turn, carried rows + a
         // short append on a WARM one. See `ensure_drafter_context`.
+        if let Some(drafts) = self.try_glm_paired_propose(
+            seq,
+            token,
+            position,
+            num_drafts,
+            grammar_bitmask.is_some(),
+            &ctx,
+            stream,
+        )? {
+            return Ok(drafts);
+        }
         if crate::speculative::glm_repair_policy::enabled() {
             self.prepare_glm_mtp_repair(seq, token, position, num_drafts, stream)?;
         } else {

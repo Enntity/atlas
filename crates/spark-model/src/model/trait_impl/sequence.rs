@@ -106,6 +106,12 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        let paired = self.paired_handoff();
+        if let Some(capability) = paired
+            && let Some(state) = seq.proposer_state.as_mut()
+        {
+            capability.retire(state.as_mut(), self.gpu.as_ref())?;
+        }
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
         // CRITICAL: release SSM slot FIRST to prevent slot leak if later
@@ -128,11 +134,26 @@ impl TransformerModel {
         let slot_to_release = if slot_reused_by_compact { None } else { taken };
         if let Some(slot) = slot_to_release {
             let stream = self.gpu.default_stream();
+            let mut paired_error = None;
             if let Err(e) = self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream) {
                 tracing::error!("free_sequence: ssm_pool.zero_slot({slot}): {e:#}");
+                if paired.is_some() {
+                    paired_error = Some(e);
+                }
             }
             if let Err(e) = self.gpu.synchronize(stream) {
                 tracing::error!("free_sequence: gpu.synchronize after zero_slot({slot}): {e:#}");
+                if paired.is_some() && paired_error.is_none() {
+                    paired_error = Some(e);
+                }
+            }
+            if let Some(error) = paired_error {
+                if let Some(state) = seq.proposer_state.as_mut() {
+                    paired
+                        .expect("selected cleanup")
+                        .quarantine(state.as_mut(), self.gpu.as_ref())?;
+                }
+                return Err(error.context("paired sequence cleanup failed; lease quarantined"));
             }
             self.ssm_pool.release_slot(slot);
         }

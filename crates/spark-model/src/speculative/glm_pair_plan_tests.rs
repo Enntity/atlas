@@ -32,6 +32,58 @@ fn bootstrap(prompt: usize, eager: bool) -> BootstrapInput {
 }
 
 #[test]
+fn eager_owned_tail_has_exact_local_row_and_absolute_position_bounds() {
+    for prompt in [1, 2, 15, 16, 127] {
+        let input = EagerTailInput {
+            generation: 9,
+            prompt_tokens: prompt,
+            target_position: prompt + 1,
+            token_rows: prompt + 1,
+            cached_rows: prompt - 1,
+            tail_position: prompt - 1,
+        };
+        let plan = limits().bootstrap_eager_tail(input).unwrap();
+        assert_eq!(
+            plan.write().unwrap(),
+            PairWrite {
+                cache_start: prompt - 1,
+                token_start: prompt,
+                hidden_start: 0,
+                rows: 1
+            }
+        );
+        assert_eq!(plan.state().cache_rows(), prompt);
+        assert_eq!(plan.state().generation(), 9);
+        for case in 0..6 {
+            let mut bad = input;
+            match case {
+                0 => bad.generation = 0,
+                1 => bad.prompt_tokens = 0,
+                2 => bad.target_position += 1,
+                3 => bad.token_rows = prompt,
+                4 => bad.cached_rows += 1,
+                _ => bad.tail_position += 1,
+            }
+            assert!(limits().bootstrap_eager_tail(bad).is_err());
+        }
+    }
+    for prompt in [128, usize::MAX] {
+        assert!(
+            limits()
+                .bootstrap_eager_tail(EagerTailInput {
+                    generation: 1,
+                    prompt_tokens: prompt,
+                    target_position: prompt,
+                    token_rows: prompt,
+                    cached_rows: prompt - 1,
+                    tail_position: prompt - 1
+                })
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn bootstrap_covers_shifted_prompt_and_first_generated_token_exactly_once() {
     for prompt in [1, 2, 15, 16] {
         for eager in [false, true] {

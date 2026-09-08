@@ -91,10 +91,14 @@ impl Model for TransformerModel {
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
         // Full prefill computes on default; its eager consumer must follow it.
         let stream = self.gpu.default_stream();
+        self.paired_prefill_preflight(tokens, seq, 0, tokens.len(), true, stream)?;
         self.stamp_overlay_route(seq.adapter_slot);
-        let logits = self.prefill_dispatch(tokens, seq, stream)?;
-        self.try_eager_drafter_prefill(seq, true, stream)?;
-        Ok(logits)
+        let result = (|| {
+            let logits = self.prefill_dispatch(tokens, seq, stream)?;
+            self.try_eager_drafter_prefill(seq, true, stream)?;
+            Ok(logits)
+        })();
+        self.paired_prefill_result(seq, result)
     }
     fn prefill_chunk(
         &self,
@@ -112,17 +116,21 @@ impl Model for TransformerModel {
         } else {
             stream
         };
+        self.paired_prefill_preflight(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream)?;
         self.stamp_overlay_route(seq.adapter_slot);
-        let logits = self.prefill_chunk_dispatch(
-            tokens,
-            seq,
-            chunk_start,
-            chunk_len,
-            is_last_chunk,
-            stream,
-        )?;
-        self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
-        Ok(logits)
+        let result = (|| {
+            let logits = self.prefill_chunk_dispatch(
+                tokens,
+                seq,
+                chunk_start,
+                chunk_len,
+                is_last_chunk,
+                stream,
+            )?;
+            self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
+            Ok(logits)
+        })();
+        self.paired_prefill_result(seq, result)
     }
     fn prefill_twophase(
         &self,
@@ -136,15 +144,32 @@ impl Model for TransformerModel {
         } else {
             stream
         };
+        self.paired_prefill_preflight(
+            tokens,
+            seq,
+            0,
+            tokens.len(),
+            chunk_size >= tokens.len(),
+            stream,
+        )?;
         self.stamp_overlay_route(seq.adapter_slot);
-        let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
-        self.try_eager_drafter_prefill(seq, true, stream)?;
-        Ok(logits)
+        let result = (|| {
+            let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
+            self.try_eager_drafter_prefill(seq, true, stream)?;
+            Ok(logits)
+        })();
+        self.paired_prefill_result(seq, result)
     }
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
+        let paired = self.paired_before_decode(seq, token)?;
         self.stamp_overlay_route(seq.adapter_slot);
         self.stamp_decode_moe_single(seq.adapter_slot);
-        self.decode_dispatch(token, seq, _stream)
+        let result = self.decode_dispatch(token, seq, _stream);
+        if paired {
+            self.paired_after_decode(seq, token, result)
+        } else {
+            result
+        }
     }
     fn decode_batch(
         &self,
@@ -152,6 +177,7 @@ impl Model for TransformerModel {
         seqs: &mut [&mut SequenceState],
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.reject_paired_batch_producer()?;
         self.stamp_overlay_route_batch(seqs);
         self.stamp_decode_moe_batch(seqs);
         let r = self.decode_batch_dispatch(tokens, seqs, stream);
@@ -177,6 +203,7 @@ impl Model for TransformerModel {
         prefill_is_last: bool,
         stream: u64,
     ) -> Result<crate::traits::MixedForwardResult> {
+        self.reject_paired_batch_producer()?;
         // Mixed decode+prefill batch spans multiple adapters ⇒ mark mixed so the
         // overlay hooks skip (per-token seq_slot routing is SOLID Incr-4).
         self.overlay_route_slot
@@ -222,6 +249,7 @@ impl Model for TransformerModel {
         stream: u64,
         row_base: usize,
     ) -> Result<Vec<DevicePtr>> {
+        self.reject_paired_batch_producer()?;
         self.prefill_batch_chunk_dispatch(streams, stream, row_base)
     }
     fn vocab_size(&self) -> usize {

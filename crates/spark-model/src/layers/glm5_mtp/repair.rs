@@ -39,6 +39,10 @@ impl Glm5MtpHead {
         ctx: &ForwardContext,
     ) -> Result<Prepared> {
         ensure!(
+            self.paired.is_none() && state.paired.is_none(),
+            "paired owners require the owned repair entry"
+        );
+        ensure!(
             input.generation != 0 && input.generation == input.capture_generation,
             "GLM repair does not own capture generation"
         );
@@ -209,6 +213,11 @@ impl Glm5MtpHead {
 }
 
 impl GlmPairRepair for Glm5MtpHead {
+    fn paired_handoff(&self) -> Option<&dyn crate::speculative::glm_repair::GlmPairedHandoff> {
+        self.paired
+            .as_ref()
+            .map(|_| self as &dyn crate::speculative::glm_repair::GlmPairedHandoff)
+    }
     fn validate_prepare(
         &self,
         input: &RepairInput<'_>,
@@ -233,6 +242,10 @@ impl GlmPairRepair for Glm5MtpHead {
             .as_any_mut()
             .downcast_mut::<Glm5MtpProposerState>()
             .context("GLM repair requires GLM-owned state")?;
+        ensure!(
+            self.paired.is_none() && state.paired.is_none(),
+            "paired owners require the owned repair entry"
+        );
         let result = (|| {
             let plan = self.plan_repair(input, state, ctx)?;
             let bootstrap = matches!(state.repair, RepairPhase::Capture);

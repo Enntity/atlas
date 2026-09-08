@@ -216,6 +216,52 @@ fn primer_keeps_shift_chunking_block_zero_and_noop_contract() {
 }
 
 #[test]
+fn actual_index_owner_source_aliases_are_rejected_before_writer_work() {
+    fixture(|head, ctx, gpu, _| {
+        let mut cache = head.kv_cache.lock();
+        cache
+            .attach_sparse_index(
+                spark_runtime::kv_cache::SparseIndexCacheConfig::bf16(4, 128),
+                gpu,
+            )
+            .unwrap();
+        let pointers = [
+            (
+                cache.sparse_index_pool_ptr(0),
+                cache.sparse_index_block_stride_bytes(0),
+            ),
+            (
+                cache.sparse_index_tail_pool_ptr(0),
+                cache.sparse_index_tail_block_stride_bytes(0),
+            ),
+        ];
+        let count = (gpu.launch_count(), gpu.sync_count(), gpu.d2d_count());
+        for (base, stride) in pointers {
+            let bytes = cache.num_blocks() * stride;
+            for offset in [0, 2, bytes - 2] {
+                assert!(
+                    head.validate_kv_inputs(
+                        &[1],
+                        DeviceSpan {
+                            ptr: base.offset(offset),
+                            bytes: 1024
+                        },
+                        ctx,
+                        &cache
+                    )
+                    .is_err(),
+                    "actual writer must reject source overlapping live sparse cache"
+                );
+            }
+        }
+        assert_eq!(
+            (gpu.launch_count(), gpu.sync_count(), gpu.d2d_count()),
+            count
+        );
+    });
+}
+
+#[test]
 fn arbitrary_rows_use_owned_shuffled_blocks_and_preserve_other_rows() {
     fixture(|head, ctx, gpu, seen| {
         let blocks: Vec<_> = (0..3)

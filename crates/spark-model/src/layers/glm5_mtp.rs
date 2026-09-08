@@ -39,6 +39,12 @@ mod repair_state;
 #[path = "glm5_mtp/repair.rs"]
 mod repair;
 
+#[path = "glm5_mtp/paired.rs"]
+mod paired;
+
+#[path = "glm5_mtp/new.rs"]
+mod new;
+
 #[path = "glm5_mtp/hidden_trace.rs"]
 pub(crate) mod hidden_trace;
 
@@ -96,6 +102,7 @@ fn mtp_bf16_drafts() -> usize {
 }
 
 pub struct Glm5MtpProposerState {
+    paired: Option<paired::Lease>,
     hidden_trace: hidden_trace::HiddenTrace,
     repair: repair_state::RepairPhase,
     pub block_table: Vec<u32>,
@@ -140,6 +147,7 @@ impl Glm5MtpProposerState {
 }
 
 pub struct Glm5MtpHead {
+    paired: Option<Mutex<paired::Pool>>,
     hidden_trace_enabled: bool,
     module: Glm5MtpModule,
     embed_tokens: DenseWeight,
@@ -158,61 +166,12 @@ pub struct Glm5MtpHead {
 }
 
 impl Glm5MtpHead {
-    pub fn new(
-        module: Glm5MtpModule,
-        embed_tokens: DenseWeight,
-        lm_head: DenseWeight,
-        lm_head_nvfp4: Option<QuantizedWeight>,
-        config: &atlas_core::config::ModelConfig,
-        gpu: &dyn GpuBackend,
-        mtp_vocab_size: u32,
-        max_seq_len: usize,
-    ) -> Result<Self> {
-        let hidden_trace_enabled = hidden_trace::configured()?;
-        let cache_shape = GlmMlaShape::new(config.kv_lora_rank, config.qk_rope_head_dim)?;
-        let kv_config = KvCacheConfig {
-            block_size: 16,
-            num_kv_heads: cache_shape.num_kv_heads(),
-            head_dim: cache_shape.head_dim(),
-            num_layers: 1,
-            dtype: KvCacheDtype::Bf16,
-            layer_dtypes: vec![],
-            layer_dims: vec![],
-            cache_blocks_per_seq: None,
-        };
-        let sparse_index = (config.index_kpool > 0 && config.index_head_dim > 0)
-            .then(|| cache_shape.bf16_index(config.index_kpool, config.index_head_dim))
-            .transpose()?;
-        let cache_plan = GlmCachePlan::new(cache_shape, &kv_config, sparse_index)?;
-        let num_blocks = max_seq_len / kv_config.block_size + 1;
-        cache_plan.bytes_for_blocks(num_blocks)?;
-        let mut kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
-        if let Some(index) = sparse_index {
-            kv_cache.attach_sparse_index(index, gpu)?;
-        }
-        Ok(Self {
-            hidden_trace_enabled,
-            module,
-            embed_tokens,
-            lm_head,
-            lm_head_nvfp4,
-            mtp_vocab_size,
-            kv_cache: Mutex::new(kv_cache),
-            rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
-            fused_eh_norm_k: gpu
-                .kernel("glm_mtp_eh_norm", "glm_mtp_eh_norm")
-                .unwrap_or(KernelHandle(0)),
-            dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
-            dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
-            w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
-            bf16_concat_k: gpu.kernel("residual_add", "bf16_concat")?,
-            argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
-            argmax_value_k: gpu.kernel("argmax", "argmax_bf16_value")?,
-        })
-    }
-
     fn alloc_state_inner(&self, gpu: &dyn GpuBackend) -> Result<Glm5MtpProposerState> {
+        if self.paired.is_some() {
+            return self.alloc_paired_state(gpu);
+        }
         Ok(Glm5MtpProposerState {
+            paired: None,
             hidden_trace: hidden_trace::HiddenTrace::new(self.hidden_trace_enabled),
             repair: repair_state::RepairPhase::Capture,
             block_table: Vec::new(),
@@ -233,6 +192,7 @@ impl Glm5MtpHead {
         stream: u64,
         mut trace: Option<&mut hidden_trace::StepTrace>,
     ) -> Result<DevicePtr> {
+        self.validate_paired_live(state, ctx.gpu)?;
         let h = ctx.config.hidden_size;
         let h_u32 = h as u32;
         let eps = ctx.config.rms_norm_eps as f32;
@@ -758,6 +718,14 @@ impl DraftProposer for Glm5MtpHead {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<usize> {
+        anyhow::ensure!(
+            self.paired.is_none()
+                && !state
+                    .as_any()
+                    .downcast_ref::<Glm5MtpProposerState>()
+                    .is_some_and(|state| state.paired.is_some()),
+            "paired owners require the owned primer entry"
+        );
         let batched = std::env::var("ATLAS_GLM_MTP_BATCHED_PREFILL")
             .ok()
             .as_deref()
@@ -830,7 +798,8 @@ impl DraftProposer for Glm5MtpHead {
             .as_any_mut()
             .downcast_mut::<Glm5MtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("invalid GLM-5 MTP proposer state"))?;
-        if crate::speculative::glm_repair_policy::enabled() {
+        self.authorize_paired_propose(state, target_hidden, ctx)?;
+        if self.paired.is_some() || crate::speculative::glm_repair_policy::enabled() {
             let repair_state::RepairPhase::Proposed(plan) = state.repair else {
                 anyhow::bail!("GLM repair proposal was not prepared");
             };
@@ -875,6 +844,10 @@ impl DraftProposer for Glm5MtpHead {
             .as_any_mut()
             .downcast_mut::<Glm5MtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("invalid GLM-5 MTP proposer state"))?;
+        anyhow::ensure!(
+            self.paired.is_none() && state.paired.is_none(),
+            "paired verdict consumption is not available in Gate1"
+        );
         if crate::speculative::glm_repair_policy::enabled() {
             return state.repair.acknowledge(num_accepted);
         }
@@ -889,6 +862,13 @@ impl DraftProposer for Glm5MtpHead {
             .as_any_mut()
             .downcast_mut::<Glm5MtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("invalid GLM-5 MTP proposer state"))?;
+        if self.paired.is_some() {
+            return self.free_paired_state(_gpu, state);
+        }
+        anyhow::ensure!(
+            state.paired.is_none(),
+            "legacy head cannot free a paired lease"
+        );
         if !state.block_table.is_empty() {
             self.kv_cache.lock().free_blocks(&state.block_table);
             state.block_table.clear();

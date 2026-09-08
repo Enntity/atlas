@@ -26,10 +26,14 @@
 pub(crate) mod block_mgmt;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
+mod glm_c2_handoff;
 pub mod glm_c4;
 pub(crate) mod glm_cache_plan;
 pub(crate) mod glm_mtp_prompt_trace;
 mod glm_mtp_repair;
+pub use glm_c2_handoff::GlmPairedInput;
+#[cfg(test)]
+mod glm_c2_handoff_tests;
 pub(crate) mod impl_a1;
 pub(crate) mod impl_a1_init;
 pub(crate) mod impl_a2;

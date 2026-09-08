@@ -203,6 +203,9 @@ impl TransformerModel {
         is_last: bool,
         stream: u64,
     ) -> Result<()> {
+        if self.try_glm_paired_eager(seq, is_last, stream)? {
+            return Ok(());
+        }
         if is_last
             && crate::layers::glm5_mtp::hidden_trace::prompt_selected(seq)
             && (eager_drafter_disabled()

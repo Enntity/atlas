@@ -12,7 +12,7 @@ use anyhow::{Context, Result, ensure};
 use std::sync::atomic::Ordering;
 
 impl TransformerModel {
-    fn glm_repair_context(&self) -> ForwardContext<'_> {
+    pub(super) fn glm_repair_context(&self) -> ForwardContext<'_> {
         ForwardContext {
             ssm_batch: None,
             buffers: &self.buffers,
@@ -193,6 +193,10 @@ impl TransformerModel {
         tokens: &[u32],
         accepted: usize,
     ) -> Result<()> {
+        ensure!(
+            self.paired_handoff().is_none(),
+            "paired verdict staging is not available in Gate1"
+        );
         if !policy::enabled() {
             return Ok(());
         }
