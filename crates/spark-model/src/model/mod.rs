@@ -28,6 +28,7 @@ pub(crate) mod drafter_context;
 pub(crate) mod drop;
 pub mod glm_c4;
 pub(crate) mod glm_cache_plan;
+pub(crate) mod glm_mtp_prompt_trace;
 mod glm_mtp_repair;
 pub(crate) mod impl_a1;
 pub(crate) mod impl_a1_init;

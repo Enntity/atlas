@@ -109,7 +109,8 @@ impl TransformerModel {
         seq: &mut SequenceState,
         ctx: &ForwardContext,
         stream: u64,
-    ) {
+    ) -> anyhow::Result<()> {
+        let diagnostic = self.arm_glm_prompt_trace(seq, ctx, stream)?;
         // Disjoint field borrows: the proposer state is mutated while the
         // token slice is read. Destructuring is what makes that legal, and it
         // avoids cloning a 12k-token vector on every propose.
@@ -121,7 +122,7 @@ impl TransformerModel {
             ..
         } = seq;
         let Some(prop_state) = proposer_state.as_mut() else {
-            return;
+            return Ok(());
         };
         let prompt_len = *prompt_len;
         // ATLAS_MTP_DRAFTER_PREFILL: on the FIRST propose of a sequence,
@@ -168,8 +169,15 @@ impl TransformerModel {
                     ctx,
                     stream,
                 ) {
+                    if diagnostic {
+                        return Err(e);
+                    }
                     tracing::warn!("MTP drafter prefill failed (continuing without): {e:#}");
                 }
+                anyhow::ensure!(
+                    !diagnostic || proposer.drafter_rows(prop_state.as_mut()) == p - 1,
+                    "GLM prompt diagnostic primer did not commit expected rows"
+                );
             } else if carry_on && first_propose && p >= 2 {
                 // WARM turn: adopt the previous turn's drafter KV and append
                 // only this turn's newly-computed span. See `try_carry_drafter`.
@@ -189,6 +197,7 @@ impl TransformerModel {
                 }
             }
         }
+        Ok(())
     }
 
     /// ATLAS_MTP_CARRY_DRAFTER: give the drafter this turn's prompt context on
@@ -533,7 +542,7 @@ impl TransformerModel {
         // First-propose drafter context (cold-turn prefill); fast no-op on
         // every later call — same as the per-seq path.
         for seq in seqs.iter_mut() {
-            self.ensure_drafter_context(proposer, seq, &ctx, stream);
+            self.ensure_drafter_context(proposer, seq, &ctx, stream)?;
         }
         let h = self.config.hidden_size;
         let hiddens: Vec<spark_runtime::gpu::DevicePtr> = stash_idx

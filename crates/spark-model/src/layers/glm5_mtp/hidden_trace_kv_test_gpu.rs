@@ -16,6 +16,7 @@ pub(super) struct Gpu {
     pub events: Mutex<Vec<Event>>,
     pub fail: AtomicUsize,
     pub capturing: AtomicBool,
+    pub capture_queries: AtomicUsize,
     pub bad_allocation: AtomicUsize,
 }
 impl Gpu {
@@ -25,6 +26,7 @@ impl Gpu {
             events: Mutex::new(vec![]),
             fail: AtomicUsize::new(usize::MAX),
             capturing: AtomicBool::new(false),
+            capture_queries: AtomicUsize::new(0),
             bad_allocation: AtomicUsize::new(0),
         }
     }
@@ -70,6 +72,7 @@ impl GpuBackend for Gpu {
         anyhow::bail!("copy API owns synchronization")
     }
     fn stream_is_capturing(&self, _: u64) -> bool {
+        self.capture_queries.fetch_add(1, Ordering::Relaxed);
         self.capturing.load(Ordering::Relaxed)
     }
     fn default_stream(&self) -> u64 {

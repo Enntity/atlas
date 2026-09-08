@@ -15,9 +15,9 @@ fn state(seq: &mut SequenceState) -> &mut Glm5MtpProposerState {
 fn actual_post_eh_hook_reads_projection_sentinel_before_body_overwrite() {
     for rank in 0..2 {
         fixture(rank, |head, ctx, gpu, saved| {
-            let mut seq = sequence(head, ctx, 1);
+            let mut seq = sequence(head, ctx, gpu, 1);
             for (attempt, last) in [0x5a, 0xda].into_iter().enumerate() {
-                prepared(state(&mut seq), 1, 3);
+                prepared_with_source(head, ctx, gpu, state(&mut seq), 1, 3);
                 arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
                 gpu.read_hashes.lock().clear();
                 gpu.eh_last_byte.store(last, Ordering::Relaxed);
@@ -42,10 +42,10 @@ fn actual_post_eh_hook_reads_projection_sentinel_before_body_overwrite() {
 fn actual_post_eh_failure_spends_all_attempts_before_body_then_exhausts() {
     for rank in 0..2 {
         fixture(rank, |head, ctx, gpu, saved| {
-            let mut seq = sequence(head, ctx, 1);
+            let mut seq = sequence(head, ctx, gpu, 1);
             gpu.fail_post_eh_read.store(true, Ordering::Relaxed);
             for attempt in 1..=9 {
-                prepared(state(&mut seq), 1, 3);
+                prepared_with_source(head, ctx, gpu, state(&mut seq), 1, 3);
                 arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
                 gpu.events.lock().clear();
                 let queries = gpu.capture_queries.load(Ordering::Relaxed);
@@ -74,7 +74,7 @@ fn actual_post_eh_failure_spends_all_attempts_before_body_then_exhausts() {
                 assert_eq!(state(&mut seq).hidden_trace.spent, attempt.min(8));
             }
             seq.mtp_capture_gen = 2;
-            prepared(state(&mut seq), 2, 3);
+            prepared_with_source(head, ctx, gpu, state(&mut seq), 2, 3);
             arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
             assert_eq!(state(&mut seq).hidden_trace.spent, 1);
         });
@@ -84,7 +84,7 @@ fn actual_post_eh_failure_spends_all_attempts_before_body_then_exhausts() {
 #[test]
 fn post_eh_metadata_missing_duplicate_capture_and_later_step_are_fail_closed() {
     fixture(0, |head, ctx, gpu, saved| {
-        let mut seq = sequence(head, ctx, 1);
+        let mut seq = sequence(head, ctx, gpu, 1);
         arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
         let state = state(&mut seq);
         let mut record = state

@@ -26,7 +26,7 @@ mod decode_b;
 mod decode_b2;
 mod decode_checkpoint;
 mod decode_graph_key;
-mod drafter_prefill;
+pub(super) mod drafter_prefill;
 mod ep_misc;
 mod graph_borrow;
 mod lm_head_batched;
@@ -89,7 +89,7 @@ impl Model for TransformerModel {
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
         self.stamp_overlay_route(seq.adapter_slot);
         let logits = self.prefill_dispatch(tokens, seq, stream)?;
-        self.try_eager_drafter_prefill(seq, true, stream);
+        self.try_eager_drafter_prefill(seq, true, stream)?;
         Ok(logits)
     }
     fn prefill_chunk(
@@ -110,7 +110,7 @@ impl Model for TransformerModel {
             is_last_chunk,
             stream,
         )?;
-        self.try_eager_drafter_prefill(seq, is_last_chunk, stream);
+        self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
         Ok(logits)
     }
     fn prefill_twophase(
@@ -122,7 +122,7 @@ impl Model for TransformerModel {
     ) -> Result<DevicePtr> {
         self.stamp_overlay_route(seq.adapter_slot);
         let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
-        self.try_eager_drafter_prefill(seq, true, stream);
+        self.try_eager_drafter_prefill(seq, true, stream)?;
         Ok(logits)
     }
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
@@ -183,7 +183,7 @@ impl Model for TransformerModel {
             self.gpu.abort_capture_if_active(self.gpu.default_stream());
         }
         let out = r?;
-        self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream);
+        self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream)?;
         Ok(out)
     }
 

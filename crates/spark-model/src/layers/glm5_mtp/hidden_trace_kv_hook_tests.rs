@@ -35,7 +35,7 @@ fn prefix(head: &Glm5MtpHead, state: &mut Glm5MtpProposerState, gpu: &support::T
 fn actual_first_hook_request_repair_and_missing_order_fail_without_kv_reads() {
     for fault in 0..8 {
         fixture(0, |head, ctx, gpu, saved| {
-            let mut seq = sequence(head, ctx, 1);
+            let mut seq = sequence(head, ctx, gpu, 1);
             prefix(head, state(&mut seq), gpu);
             arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
             let s = state(&mut seq);
@@ -52,7 +52,7 @@ fn actual_first_hook_request_repair_and_missing_order_fail_without_kv_reads() {
                 3 => trace.request.position = 4,
                 4 => s.seq_len = 3,
                 5 => s.repair = repair_state::RepairPhase::Capture,
-                6 => prepared(s, 1, 4),
+                6 => prepared_with_source(head, ctx, gpu, s, 1, 4),
                 7 => ctx.graph_capture = true,
                 _ => unreachable!(),
             }
@@ -66,7 +66,7 @@ fn actual_first_hook_request_repair_and_missing_order_fail_without_kv_reads() {
         });
     }
     fixture(0, |head, ctx, gpu, saved| {
-        let mut seq = sequence(head, ctx, 1);
+        let mut seq = sequence(head, ctx, gpu, 1);
         prefix(head, state(&mut seq), gpu);
         arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
         let s = state(&mut seq);
@@ -92,7 +92,7 @@ fn actual_first_hook_request_repair_and_missing_order_fail_without_kv_reads() {
 fn actual_first_hook_reads_prefix_before_body_and_distinct_written_row_after() {
     for rank in 0..2 {
         fixture(rank, |head, ctx, gpu, saved| {
-            let mut seq = sequence(head, ctx, 1);
+            let mut seq = sequence(head, ctx, gpu, 1);
             prefix(head, state(&mut seq), gpu);
             arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
             let s = state(&mut seq);
@@ -132,7 +132,7 @@ fn actual_each_kv_copy_failure_spends_first_attempt_without_replacement() {
     for fail in 1..=4 {
         for rank in 0..2 {
             fixture(rank, |head, ctx, gpu, saved| {
-                let mut seq = sequence(head, ctx, 1);
+                let mut seq = sequence(head, ctx, gpu, 1);
                 prefix(head, state(&mut seq), gpu);
                 arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
                 gpu.fail_kv_read_at.store(fail, Ordering::Relaxed);
@@ -145,7 +145,7 @@ fn actual_each_kv_copy_failure_spends_first_attempt_without_replacement() {
                 assert_eq!(state(&mut seq).hidden_trace.spent, 1);
                 gpu.fail_kv_read_at.store(usize::MAX, Ordering::Relaxed);
                 gpu.kv_reads.store(0, Ordering::Relaxed);
-                prepared(state(&mut seq), 1, 3);
+                prepared_with_source(head, ctx, gpu, state(&mut seq), 1, 3);
                 arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
                 head.forward_one(3, saved, 3, 0, state(&mut seq), ctx, 7, None)
                     .unwrap();
@@ -159,10 +159,10 @@ fn actual_each_kv_copy_failure_spends_first_attempt_without_replacement() {
 #[test]
 fn actual_unselected_later_steps_attempts_and_disabled_trace_do_not_read_kv() {
     fixture(0, |head, ctx, gpu, saved| {
-        let mut seq = sequence(head, ctx, 1);
+        let mut seq = sequence(head, ctx, gpu, 1);
         prefix(head, state(&mut seq), gpu);
         for attempt in 1..=9 {
-            prepared(state(&mut seq), 1, 3);
+            prepared_with_source(head, ctx, gpu, state(&mut seq), 1, 3);
             arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
             gpu.kv_reads.store(0, Ordering::Relaxed);
             head.propose(3, saved, 3, 4, state(&mut seq), ctx, 7, None, None, None)
@@ -173,7 +173,7 @@ fn actual_unselected_later_steps_attempts_and_disabled_trace_do_not_read_kv() {
             );
         }
         seq.mtp_capture_gen = 2;
-        prepared(state(&mut seq), 2, 3);
+        prepared_with_source(head, ctx, gpu, state(&mut seq), 2, 3);
         arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
         gpu.kv_reads.store(0, Ordering::Relaxed);
         head.forward_one(3, saved, 3, 0, state(&mut seq), ctx, 7, None)
@@ -181,7 +181,7 @@ fn actual_unselected_later_steps_attempts_and_disabled_trace_do_not_read_kv() {
         assert_eq!(gpu.kv_reads.load(Ordering::Relaxed), 4);
         state(&mut seq).hidden_trace.enabled = false;
         state(&mut seq).hidden_trace.reset();
-        prepared(state(&mut seq), 2, 3);
+        prepared_with_source(head, ctx, gpu, state(&mut seq), 2, 3);
         gpu.kv_reads.store(0, Ordering::Relaxed);
         head.forward_one(3, saved, 3, 0, state(&mut seq), ctx, 7, None)
             .unwrap();

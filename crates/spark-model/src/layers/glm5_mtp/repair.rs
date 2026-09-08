@@ -233,32 +233,61 @@ impl GlmPairRepair for Glm5MtpHead {
             .as_any_mut()
             .downcast_mut::<Glm5MtpProposerState>()
             .context("GLM repair requires GLM-owned state")?;
-        let plan = self.plan_repair(input, state, ctx)?;
-        // From the first mutable operation onward failure cannot fall back.
-        state.repair = RepairPhase::Failed;
-        {
-            let mut cache = self.kv_cache.lock();
-            while state.block_table.len() < plan.needed_blocks {
-                state.block_table.push(cache.alloc_block()?);
+        let result = (|| {
+            let plan = self.plan_repair(input, state, ctx)?;
+            let bootstrap = matches!(state.repair, RepairPhase::Capture);
+            // From the first mutable operation onward failure cannot fall back.
+            state.repair = RepairPhase::Failed;
+            {
+                let mut cache = self.kv_cache.lock();
+                while state.block_table.len() < plan.needed_blocks {
+                    state.block_table.push(cache.alloc_block()?);
+                }
             }
+            if let Some(source) = plan.stage_from {
+                ctx.gpu
+                    .copy_d2d_async(source, plan.source.ptr, plan.source.bytes, stream)?;
+            }
+            if let Some(write) = plan.finish.write() {
+                if bootstrap && state.hidden_trace.prompt.active() {
+                    state.hidden_trace.prompt.bootstrap_before(
+                        input,
+                        &plan.tokens,
+                        plan.source,
+                        write.cache_start(),
+                        ctx,
+                        stream,
+                    )?;
+                }
+                if let Err(error) = self.write_kv_rows(
+                    &plan.tokens,
+                    plan.source,
+                    write.cache_start(),
+                    &state.block_table,
+                    ctx,
+                    stream,
+                ) {
+                    state.hidden_trace.prompt.fail();
+                    return Err(error);
+                }
+                if bootstrap && state.hidden_trace.prompt.active() {
+                    let cache = self.kv_cache.lock();
+                    state.hidden_trace.prompt.bootstrap_after(
+                        &cache,
+                        &state.block_table,
+                        ctx,
+                        stream,
+                    )?;
+                }
+            }
+            state.seq_len = plan.finish.state().cache_rows();
+            state.last_num_drafted = 0;
+            state.repair = RepairPhase::Proposed(plan.next);
+            Ok(())
+        })();
+        if result.is_err() {
+            state.hidden_trace.prompt.fail();
         }
-        if let Some(source) = plan.stage_from {
-            ctx.gpu
-                .copy_d2d_async(source, plan.source.ptr, plan.source.bytes, stream)?;
-        }
-        if let Some(write) = plan.finish.write() {
-            self.write_kv_rows(
-                &plan.tokens,
-                plan.source,
-                write.cache_start(),
-                &state.block_table,
-                ctx,
-                stream,
-            )?;
-        }
-        state.seq_len = plan.finish.state().cache_rows();
-        state.last_num_drafted = 0;
-        state.repair = RepairPhase::Proposed(plan.next);
-        Ok(())
+        result
     }
 }

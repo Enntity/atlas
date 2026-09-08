@@ -6,6 +6,96 @@ use super::*;
 const SIDE_ROW: usize = 1024;
 const SIDE_BLOCK: usize = 16 * SIDE_ROW;
 
+/// Read only a currently valid interval, without requiring a future row.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn read_interval(
+    cache: &PagedKvCache,
+    blocks: &[u32],
+    start: usize,
+    rows: usize,
+    ctx: &ForwardContext,
+    stream: u64,
+    scratch: &mut [u8],
+    mut consume: impl FnMut(&[u8]),
+) -> Result<Binding> {
+    let end = start.checked_add(rows).context("KV interval overflow")?;
+    ensure!(
+        rows > 0 && end <= 256 && scratch.len() == 2 * SIDE_BLOCK,
+        "KV interval outside prompt probe"
+    );
+    let (pools, capacity) = Owner::validate_required(cache, blocks, end, ctx, stream)?;
+    let owner = Owner {
+        pools,
+        capacity,
+        blocks: blocks.to_vec(),
+        rows: end,
+        stream,
+    };
+    let mut row = start;
+    while row < end {
+        let valid = (16 - row % 16).min(end - row);
+        for side in 0..2 {
+            ctx.gpu.copy_d2h_on_stream(
+                owner.pointer(side, row, valid * SIDE_ROW)?,
+                &mut scratch[side * SIDE_BLOCK..side * SIDE_BLOCK + valid * SIDE_ROW],
+                stream,
+            )?;
+        }
+        for i in 0..valid {
+            for side in 0..2 {
+                let offset = side * SIDE_BLOCK + i * SIDE_ROW;
+                consume(&scratch[offset..offset + SIDE_ROW]);
+            }
+        }
+        row += valid;
+    }
+    Ok(Binding::from(&owner))
+}
+
+/// Fixed-size ownership witness of the observed logical prefix, not spare blocks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Binding {
+    pools: [DevicePtr; 2],
+    capacity: usize,
+    map: [u8; 32],
+    rows: usize,
+}
+impl Binding {
+    fn from(owner: &Owner) -> Self {
+        Self {
+            pools: owner.pools,
+            capacity: owner.capacity,
+            map: Self::map(&owner.blocks, owner.rows),
+            rows: owner.rows,
+        }
+    }
+    fn map(blocks: &[u32], rows: usize) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"atlas/glm53/mtp-kv/prompt-owner/v1\0");
+        hash.update((rows as u64).to_le_bytes());
+        for block in &blocks[..rows.div_ceil(16)] {
+            hash.update(block.to_le_bytes());
+        }
+        hash.finalize().into()
+    }
+    pub fn validate(
+        self,
+        cache: &PagedKvCache,
+        blocks: &[u32],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let (pools, capacity) = Owner::validate_required(cache, blocks, self.rows, ctx, stream)?;
+        ensure!(
+            self.pools == pools
+                && self.capacity == capacity
+                && self.map == Self::map(blocks, self.rows),
+            "GLM prompt KV owner/map changed"
+        );
+        Ok(())
+    }
+}
+
 struct Owner {
     pools: [DevicePtr; 2],
     capacity: usize,
@@ -26,6 +116,20 @@ impl Owner {
             (1..=2043).contains(&rows),
             "first KV prefix outside admitted profile"
         );
+        Self::validate_required(cache, blocks, rows + 1, ctx, stream)
+    }
+
+    fn validate_required(
+        cache: &PagedKvCache,
+        blocks: &[u32],
+        required_rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<([DevicePtr; 2], usize)> {
+        ensure!(
+            (1..=2044).contains(&required_rows),
+            "KV required rows outside profile"
+        );
         let c = cache.config();
         ensure!(
             c.num_layers == 1
@@ -43,15 +147,15 @@ impl Owner {
                 && ctx.config.hidden_size == 4096
                 && ctx.config.kv_lora_rank == 512
                 && ctx.config.qk_rope_head_dim == 0
-                && rows + 1 <= ctx.config.index_topk,
+                && required_rows <= ctx.config.index_topk,
             "first KV requires admitted dense NoPE profile"
         );
         let capacity = cache.num_blocks();
         ensure!(
             (1..=128).contains(&capacity)
-                && rows + 1 <= capacity * 16
+                && required_rows <= capacity * 16
                 && blocks.len() <= 128
-                && blocks.len() >= (rows + 1).div_ceil(16),
+                && blocks.len() >= required_rows.div_ceil(16),
             "first KV capacity mismatch"
         );
         ensure!(
@@ -194,7 +298,7 @@ impl Probe {
         Ok(())
     }
 
-    fn hash(domain: &[u8], rows: usize) -> Sha256 {
+    pub(super) fn hash(domain: &[u8], rows: usize) -> Sha256 {
         let mut hash = Sha256::new();
         hash.update(domain);
         hash.update((rows as u64).to_le_bytes());

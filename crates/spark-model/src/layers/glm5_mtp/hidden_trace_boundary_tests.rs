@@ -15,11 +15,11 @@ fn state(seq: &mut SequenceState) -> &mut Glm5MtpProposerState {
 fn actual_body_and_final_copy_failures_after_input_spend_attempt() {
     for body_failure in [true, false] {
         fixture(0, |head, ctx, gpu, saved| {
-            let mut seq = sequence(head, ctx, 1);
+            let mut seq = sequence(head, ctx, gpu, 1);
             gpu.fail_body.store(body_failure, Ordering::Relaxed);
             gpu.fail_final_read.store(!body_failure, Ordering::Relaxed);
             for attempt in 1..=8 {
-                prepared(state(&mut seq), 1, 3);
+                prepared_with_source(head, ctx, gpu, state(&mut seq), 1, 3);
                 arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
                 gpu.events.lock().clear();
                 assert!(
@@ -45,7 +45,7 @@ fn actual_body_and_final_copy_failures_after_input_spend_attempt() {
                 assert_eq!(state(&mut seq).hidden_trace.spent, attempt);
             }
             gpu.fail_body.store(false, Ordering::Relaxed);
-            prepared(state(&mut seq), 1, 3);
+            prepared_with_source(head, ctx, gpu, state(&mut seq), 1, 3);
             let queries = gpu.capture_queries.load(Ordering::Relaxed);
             arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
             gpu.events.lock().clear();
@@ -95,9 +95,9 @@ fn exact_raw_bf16_digest_includes_last_byte_and_distinguishes_zero_from_failure(
 #[test]
 fn actual_hook_rechecks_capture_and_step_ownership_before_io() {
     fixture(0, |head, ctx, gpu, saved| {
-        let mut seq = sequence(head, ctx, 1);
+        let mut seq = sequence(head, ctx, gpu, 1);
         for fault in 0..6 {
-            prepared(state(&mut seq), 1, 3);
+            prepared_with_source(head, ctx, gpu, state(&mut seq), 1, 3);
             arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
             gpu.events.lock().clear();
             gpu.capturing.store(fault == 0, Ordering::Relaxed);
@@ -124,7 +124,7 @@ fn actual_hook_rechecks_capture_and_step_ownership_before_io() {
 #[test]
 fn final_owner_and_cursor_reject_before_copy() {
     fixture(0, |head, ctx, gpu, saved| {
-        let mut seq = sequence(head, ctx, 1);
+        let mut seq = sequence(head, ctx, gpu, 1);
         arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
         let state = state(&mut seq);
         let mut record = state
@@ -175,7 +175,7 @@ fn explicit_non_unicode_flag_is_not_treated_as_absent() {
 fn actual_no_pool_route_from_production_resolver_is_trace_eligible() {
     for rank in 0..2 {
         fixture(rank, |head, ctx, gpu, saved| {
-            let mut seq = sequence(head, ctx, 1);
+            let mut seq = sequence(head, ctx, gpu, 1);
             ctx.moe_lora_route = crate::lora::resolve_moe_lora_route(-1, -1, false);
             assert_eq!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Fold);
             arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7)

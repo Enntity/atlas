@@ -29,6 +29,44 @@ fn reference(rows: usize, appended: bool) -> [u8; 32] {
 }
 
 #[test]
+fn actual_valid_interval_needs_no_future_block_and_composes_existing_prefix() {
+    let gpu = Gpu::new();
+    context(&gpu, |ctx| {
+        for p in [2, 17, 33, 129, 148, 256] {
+            let (cache, blocks) = cache(&gpu, p, true);
+            let primer_blocks = &blocks[..(p - 1).div_ceil(16)];
+            let mut scratch = vec![0; 32768];
+            let mut composed = Probe::hash(b"atlas/glm53/mtp-kv/prefix/v1\0", p);
+            read_interval(
+                &cache,
+                primer_blocks,
+                0,
+                p - 1,
+                ctx,
+                7,
+                &mut scratch,
+                |bytes| composed.update(bytes),
+            )
+            .unwrap();
+            read_interval(&cache, &blocks, p - 1, 1, ctx, 7, &mut scratch, |bytes| {
+                composed.update(bytes)
+            })
+            .unwrap();
+            assert_eq!(<[u8; 32]>::from(composed.finalize()), reference(p, false));
+            let events = gpu.events.lock();
+            assert!(events.iter().all(|e| matches!(e, Event::Read(_, _, 7))));
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|e| if let Event::Read(_, n, _) = e { *n } else { 0 })
+                    .sum::<usize>(),
+                p * 2048
+            );
+        }
+    });
+}
+
+#[test]
 fn actual_reader_full_valid_rows_maps_and_exact_transfer_budgets() {
     for rows in [1, 15, 16, 17, 148, 1984, 2043] {
         let mut hashes = Vec::new();

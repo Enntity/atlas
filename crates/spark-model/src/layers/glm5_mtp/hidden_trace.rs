@@ -9,6 +9,39 @@ pub(super) const ROW_BYTES: usize = 8192;
 
 #[path = "hidden_trace_kv.rs"]
 mod kv;
+#[path = "hidden_trace_profile.rs"]
+mod profile;
+#[path = "hidden_trace_prompt.rs"]
+mod prompt;
+use profile::ColdProfile;
+pub(crate) use prompt::{arm_prompt, prompt_selected, spend_prompt};
+
+#[cfg(test)]
+pub(crate) fn fixture_set_enabled(state: &mut dyn ProposerState, enabled: bool) {
+    state
+        .as_any_mut()
+        .downcast_mut::<Glm5MtpProposerState>()
+        .unwrap()
+        .hidden_trace
+        .enabled = enabled;
+}
+#[cfg(test)]
+pub(crate) fn fixture_prompt_hashes(
+    state: &Glm5MtpProposerState,
+    generation: u64,
+    p: usize,
+) -> Result<[[u8; 32]; 7]> {
+    let e = state.hidden_trace.prompt.evidence(0, generation, p)?;
+    Ok([
+        e.primer_source,
+        e.bootstrap_source,
+        e.primer_tokens,
+        e.bootstrap_token,
+        e.primer_kv,
+        e.bootstrap_kv,
+        e.written_prefix,
+    ])
+}
 
 /// Live model owners plus sticky installation history, never config inference.
 #[derive(Clone, Copy)]
@@ -87,6 +120,7 @@ pub(super) struct HiddenTrace {
     identity: Option<Identity>,
     spent: u8,
     active: Option<Attempt>,
+    pub(super) prompt: prompt::Prompt,
 }
 impl HiddenTrace {
     pub fn new(enabled: bool) -> Self {
@@ -176,6 +210,15 @@ impl HiddenTrace {
             final_hidden: [0; 32],
             kv: None,
             kv_before_spent: false,
+            prompt: if active.ordinal == 1 && step == 0 && (2..=256).contains(&cache_rows) {
+                Some(self.prompt.evidence(
+                    active.request.identity.slot,
+                    active.request.identity.generation,
+                    cache_rows,
+                )?)
+            } else {
+                None
+            },
         };
         record.input = snapshot(ctx.gpu, ptr, ctx.graph_capture, stream)?;
         Ok(Some(record))
@@ -194,6 +237,7 @@ pub(super) struct StepTrace {
     final_hidden: [u8; 32],
     kv: Option<kv::Probe>,
     kv_before_spent: bool,
+    prompt: Option<prompt::Evidence>,
 }
 impl StepTrace {
     pub fn kv_before(
@@ -225,6 +269,12 @@ impl StepTrace {
                 && state.seq_len.checked_add(4) == Some(plan.speculative_cache_end()),
             "GLM first KV request/repair/cursor/post-EH mismatch"
         );
+        if self.prompt.is_some() {
+            state
+                .hidden_trace
+                .prompt
+                .validate_body(cache, &state.block_table, ctx, stream)?;
+        }
         self.kv = Some(kv::Probe::before(
             cache,
             &state.block_table,
@@ -294,10 +344,17 @@ impl StepTrace {
             attempt=self.ordinal, position=self.request.position, seed=self.request.seed, hidden_row=self.request.hidden_row,
             step=self.step, input_token=self.token, self.cache_before, self.cache_after, draft, eh_nvfp4, head_nvfp4,
             input_sha256=%Hex(&self.input), final_sha256=%Hex(&self.final_hidden), argmax_pair_bytes=?pairs,
-            trace_version=3u8, post_eh_sha256=%OptionalHex(self.post_eh.as_ref()),
+            trace_version=4u8, post_eh_sha256=%OptionalHex(self.post_eh.as_ref()),
             kv_prefix_sha256=%OptionalHex(self.kv.as_ref().map(|p| &p.prefix)),
             kv_appended_sha256=%OptionalHex(self.kv.as_ref().and_then(|p| p.appended.as_ref())),
             kv_block_map_sha256=%OptionalHex(self.kv.as_ref().map(|p| &p.block_map)),
+            prompt_primer_source_sha256=%OptionalHex(self.prompt.as_ref().map(|p|&p.primer_source)),
+            prompt_bootstrap_source_sha256=%OptionalHex(self.prompt.as_ref().map(|p|&p.bootstrap_source)),
+            prompt_primer_tokens_sha256=%OptionalHex(self.prompt.as_ref().map(|p|&p.primer_tokens)),
+            prompt_bootstrap_token_sha256=%OptionalHex(self.prompt.as_ref().map(|p|&p.bootstrap_token)),
+            prompt_primer_kv_sha256=%OptionalHex(self.prompt.as_ref().map(|p|&p.primer_kv)),
+            prompt_bootstrap_kv_sha256=%OptionalHex(self.prompt.as_ref().map(|p|&p.bootstrap_kv)),
+            prompt_written_prefix_sha256=%OptionalHex(self.prompt.as_ref().map(|p|&p.written_prefix)),
             "GLM MTP HIDDEN_TRACE");
     }
 }
@@ -350,6 +407,7 @@ pub(crate) fn arm_prepared(
     stream: u64,
     adapter_ownership: impl FnOnce() -> AdapterOwnership,
 ) -> Result<()> {
+    let profile = ColdProfile::from(seq);
     let Some(state) = seq
         .proposer_state
         .as_mut()
@@ -375,31 +433,13 @@ pub(crate) fn arm_prepared(
         return Ok(());
     }
     let result = (|| {
-        adapter_ownership().ensure_absent()?;
-        ensure!(
-            ctx.config.model_type == "glm5_next"
-                && ctx.config.hidden_size == 4096
-                && ctx.config.tp_world_size == 2
-                && ctx.config.ep_world_size == 2
-                && ctx.levers.max_decode_seqs == 1
-                && ctx.levers.drafter.prefill
-                && !ctx.levers.drafter.carry
-                && ctx
-                    .comm
-                    .is_some_and(|c| c.world_size() == 2 && c.rank() < 2)
-                && drafts == 4
-                && !grammar
-                && seq.adapter_id == 0
-                && seq.adapter_slot < 0
-                && seq.cached_prefix_tokens == 0
-                && seq.cached_prefix_blocks == 0
-                && seq.marconi_skip_to == 0
-                && seq.disk_block_ids.is_empty()
-                && ctx.config.adapter_max_rank == 0
-                && ctx.routed_lora_layers.is_none()
-                && !matches!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Refuse),
-            "GLM hidden trace requires exact cold C1 TP2/EP2 MTP4 repair profile without adapters"
-        );
+        profile.validate(ctx, drafts, grammar, adapter_ownership)?;
+        if state.hidden_trace.spent == 1 && (2..=256).contains(&state.seq_len) {
+            state
+                .hidden_trace
+                .prompt
+                .evidence(seq.slot_idx, seq.mtp_capture_gen, state.seq_len)?;
+        }
         let repair_state::RepairPhase::Proposed(plan) = state.repair else {
             anyhow::bail!("GLM hidden trace must be armed after repair");
         };

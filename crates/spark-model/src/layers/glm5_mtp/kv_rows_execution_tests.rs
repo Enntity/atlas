@@ -8,6 +8,8 @@ use crate::layer::{EmptyLayerState, TransformerLayer};
 use spark_runtime::{buffers::BufferArena, gpu::mock::MockGpuBackend};
 use std::sync::Arc;
 
+#[path = "prompt_writer_tests.rs"]
+mod prompt_tests;
 #[path = "repair_execution_tests.rs"]
 mod repair_tests;
 
@@ -43,6 +45,10 @@ impl TransformerLayer for SlotBody {
         ctx: &ForwardContext,
         _: u64,
     ) -> Result<bool> {
+        anyhow::ensure!(
+            !self.0.lock().contains(&-1),
+            "injected actual KV body failure"
+        );
         assert!(ctx.comm.is_none() && !ctx.graph_capture);
         let mut raw = vec![0; rows * 8];
         ctx.gpu.copy_d2h(slots, &mut raw)?;
@@ -83,10 +89,19 @@ fn fixture_capable(
     max_rows: usize,
     run: impl FnOnce(&Glm5MtpHead, &ForwardContext, &MockGpuBackend, &Arc<Mutex<Vec<i64>>>),
 ) {
+    fixture_geometry(capable, max_rows, 512, 64, run);
+}
+fn fixture_geometry(
+    capable: bool,
+    max_rows: usize,
+    hidden: usize,
+    context: usize,
+    run: impl FnOnce(&Glm5MtpHead, &ForwardContext, &MockGpuBackend, &Arc<Mutex<Vec<i64>>>),
+) {
     let gpu = MockGpuBackend::new();
     let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
     config.model_type = "glm5_next".into();
-    config.hidden_size = 512;
+    config.hidden_size = hidden;
     config.vocab_size = 8;
     config.num_hidden_layers = 1;
     config.num_attention_heads = 1;
@@ -100,30 +115,46 @@ fn fixture_capable(
     config.linear_num_value_heads = 64;
     config.linear_key_head_dim = 4;
     config.linear_value_head_dim = 4;
+    if hidden > 512 {
+        config.num_attention_heads = 32;
+        config.head_dim = 128;
+        config.linear_key_head_dim = hidden / 64;
+        config.linear_value_head_dim = hidden / 64;
+    }
     config.index_kpool = 0;
     config.index_head_dim = 0;
+    config.index_topk = 2048;
     let dense = |n| DenseWeight {
         weight: gpu.alloc(n).unwrap(),
     };
     let seen = Arc::new(Mutex::new(Vec::new()));
     let module = Glm5MtpModule {
         body: Box::new(SlotBody(seen.clone(), capable)),
-        enorm: dense(1024),
-        hnorm: dense(1024),
-        eh_proj: dense(512 * 1024 * 2),
+        enorm: dense(hidden * 2),
+        hnorm: dense(hidden * 2),
+        eh_proj: dense(hidden * hidden * 4),
         eh_proj_nvfp4: None,
-        norm: dense(1024),
+        norm: dense(hidden * 2),
     };
-    let head =
-        Glm5MtpHead::new(module, dense(8192), dense(8192), None, &config, &gpu, 8, 64).unwrap();
+    let head = Glm5MtpHead::new(
+        module,
+        dense(8 * hidden * 2),
+        dense(8 * hidden * 2),
+        None,
+        &config,
+        &gpu,
+        8,
+        context,
+    )
+    .unwrap();
     for token in 0..8 {
         gpu.copy_h2d(
-            &[token as u8; 1024],
-            head.embed_tokens.weight.offset(token * 1024),
+            &vec![token as u8; hidden * 2],
+            head.embed_tokens.weight.offset(token * hidden * 2),
         )
         .unwrap();
     }
-    let buffers = BufferArena::new(&config, max_rows, 64, 16, 1, &gpu).unwrap();
+    let buffers = BufferArena::new(&config, max_rows, context, 16, 1, &gpu).unwrap();
     let mut dispatch = ops::GemmDispatch::defaults();
     dispatch.cublas_gemm = false;
     let derived = ops::DerivedWeights::new();

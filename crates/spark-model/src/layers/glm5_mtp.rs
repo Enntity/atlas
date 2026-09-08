@@ -766,6 +766,13 @@ impl DraftProposer for Glm5MtpHead {
             .ok()
             .as_deref()
             == Some("1");
+        if !batched
+            && let Some(s) = state.as_any_mut().downcast_mut::<Glm5MtpProposerState>()
+            && s.hidden_trace.prompt.active()
+        {
+            s.hidden_trace.prompt.fail();
+            anyhow::bail!("GLM prompt diagnostic requires actual batched KV primer");
+        }
         if !batched && !serial {
             return Ok(0);
         }

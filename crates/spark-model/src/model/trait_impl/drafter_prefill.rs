@@ -56,6 +56,10 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::traits::SequenceState;
 
+#[cfg(test)]
+#[path = "drafter_prompt_tests.rs"]
+mod prompt_tests;
+
 /// `ATLAS_NO_MTP_EAGER_DRAFTER` (PRESENCE): restore the propose-site-only
 /// consume, i.e. the pre-fix behaviour where only the last-prefilled sequence
 /// of a concurrent group can prefill its drafter.
@@ -191,22 +195,31 @@ impl TransformerModel {
     /// the pre-existing contract (the propose-site consume already read this
     /// buffer from `default_stream`).
     ///
-    /// Never fails a prefill: a drafter with fewer rows costs acceptance, not
-    /// correctness, because the target verifies every draft.
+    /// Legacy primer errors remain best-effort. A selected prompt diagnostic
+    /// propagates failure so eager fallback cannot disguise missing evidence.
     pub(super) fn try_eager_drafter_prefill(
         &self,
         seq: &mut SequenceState,
         is_last: bool,
         stream: u64,
-    ) {
+    ) -> Result<()> {
+        if is_last
+            && crate::layers::glm5_mtp::hidden_trace::prompt_selected(seq)
+            && (eager_drafter_disabled()
+                || self.mtp_prefill_hidden.is_null()
+                || self.proposer.is_none())
+        {
+            crate::layers::glm5_mtp::hidden_trace::spend_prompt(seq)?;
+            anyhow::bail!("GLM prompt diagnostic requires eager capture/proposer owner");
+        }
         if !is_last || eager_drafter_disabled() || self.mtp_prefill_hidden.is_null() {
-            return;
+            return Ok(());
         }
         let Some(proposer) = self.proposer.clone() else {
-            return;
+            return Ok(());
         };
         if seq.proposer_state.is_none() {
-            return;
+            return Ok(());
         }
         let ctx = ForwardContext {
             ssm_batch: None,
@@ -232,7 +245,7 @@ impl TransformerModel {
             routed_lora_layers: None,
             midchunk_capture: None,
         };
-        self.ensure_drafter_context(proposer.as_ref(), seq, &ctx, stream);
+        self.ensure_drafter_context(proposer.as_ref(), seq, &ctx, stream)?;
         if crate::speculative::mtp_accept_debug() {
             let rows =
                 proposer.drafter_rows(seq.proposer_state.as_mut().expect("checked above").as_mut());
@@ -252,5 +265,6 @@ impl TransformerModel {
                  can build drafter KV over its own prompt"
             );
         }
+        Ok(())
     }
 }

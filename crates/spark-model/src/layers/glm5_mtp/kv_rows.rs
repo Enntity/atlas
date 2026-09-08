@@ -20,6 +20,20 @@ impl Glm5MtpHead {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<usize> {
+        let result = self.prefill_kv_batched_inner(prompt_tokens, hiddens, state, ctx, stream);
+        if result.is_err() {
+            state.hidden_trace.prompt.fail();
+        }
+        result
+    }
+    fn prefill_kv_batched_inner(
+        &self,
+        prompt_tokens: &[u32],
+        hiddens: DevicePtr,
+        state: &mut Glm5MtpProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
         if state.seq_len != 0 || prompt_tokens.len() < 2 {
             return Ok(0);
         }
@@ -49,7 +63,21 @@ impl Glm5MtpHead {
                 state.block_table.push(cache.alloc_block()?);
             }
         }
-        self.write_kv_rows(tokens, source, 0, &state.block_table, ctx, stream)?;
+        state
+            .hidden_trace
+            .prompt
+            .primer_before(tokens, source, ctx, stream)?;
+        if let Err(error) = self.write_kv_rows(tokens, source, 0, &state.block_table, ctx, stream) {
+            state.hidden_trace.prompt.fail();
+            return Err(error);
+        }
+        if state.hidden_trace.prompt.active() {
+            let cache = self.kv_cache.lock();
+            state
+                .hidden_trace
+                .prompt
+                .primer_after(&cache, &state.block_table, ctx, stream)?;
+        }
         state.seq_len = tokens.len();
         tracing::info!(
             "GLM MTP batched KV prefill: {} rows in {:.1} ms",

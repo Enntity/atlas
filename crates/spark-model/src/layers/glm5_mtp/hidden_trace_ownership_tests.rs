@@ -15,7 +15,7 @@ fn state(seq: &mut SequenceState) -> &mut Glm5MtpProposerState {
 fn actual_arm_requires_absent_live_and_historical_owners_for_fold_or_skip() {
     for rank in 0..2 {
         fixture(rank, |head, ctx, gpu, saved| {
-            let mut seq = sequence(head, ctx, 1);
+            let mut seq = sequence(head, ctx, gpu, 1);
             for route in [
                 crate::lora::resolve_moe_lora_route(-1, -1, false),
                 crate::lora::resolve_moe_lora_route(-1, 0, true),
@@ -27,7 +27,7 @@ fn actual_arm_requires_absent_live_and_historical_owners_for_fold_or_skip() {
                     // suppressing any of these independent negative probes.
                     seq.mtp_capture_gen += 1;
                     let generation = seq.mtp_capture_gen;
-                    prepared(state(&mut seq), generation, 3);
+                    prepared_with_source(head, ctx, gpu, state(&mut seq), generation, 3);
                     let mut owners = no_adapter_owners();
                     match owner {
                         0 => owners.pool = true,
@@ -60,7 +60,7 @@ fn actual_arm_requires_absent_live_and_historical_owners_for_fold_or_skip() {
 #[test]
 fn actual_arm_still_rejects_refuse_config_capacity_and_active_sequences() {
     fixture(0, |head, ctx, gpu, saved| {
-        let mut seq = sequence(head, ctx, 1);
+        let mut seq = sequence(head, ctx, gpu, 1);
         ctx.moe_lora_route = crate::lora::resolve_moe_lora_route(1, 0, true);
         assert_eq!(ctx.moe_lora_route, MoeLoraRoute::Refuse);
         assert!(arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).is_err());
@@ -85,8 +85,8 @@ fn actual_arm_still_rejects_refuse_config_capacity_and_active_sequences() {
 
 #[test]
 fn disabled_or_exhausted_trace_does_not_read_model_ownership() {
-    fixture(0, |head, ctx, _, saved| {
-        let mut seq = sequence(head, ctx, 1);
+    fixture(0, |head, ctx, gpu, saved| {
+        let mut seq = sequence(head, ctx, gpu, 1);
         state(&mut seq).hidden_trace.enabled = false;
         super::super::arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7, || {
             panic!("disabled ownership read")

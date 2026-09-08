@@ -44,6 +44,109 @@ def rows(rank, generation=1, attempts=8):
 
 
 class TraceAnalysisTests(unittest.TestCase):
+    def v4_records(self, prompt=148):
+        records = self.v3_records()
+        for items in records:
+            for item in items:
+                delta = prompt - 147
+                item["position"] += delta
+                item["self.cache_before"] += delta
+                item["self.cache_after"] += delta
+                sampled = item["attempt"] == 1 and item["step"] == 0 and 2 <= prompt <= 256
+                item["trace_version"] = 4
+                for i, key in enumerate(("prompt_primer_source_sha256", "prompt_bootstrap_source_sha256",
+                                         "prompt_primer_tokens_sha256", "prompt_bootstrap_token_sha256",
+                                         "prompt_primer_kv_sha256", "prompt_bootstrap_kv_sha256",
+                                         "prompt_written_prefix_sha256")):
+                    item[key] = str(i + 1) * 64 if sampled else None
+                if sampled:
+                    item["prompt_written_prefix_sha256"] = item["kv_prefix_sha256"]
+        return records
+
+    def test_v4_short_source_and_long_quality_availability_preserves_kv(self):
+        for prompt in (1, 2, 148, 256, 257, 1984):
+            with self.subTest(prompt=prompt):
+                report = self.run_records(self.v4_records(prompt))
+                steps = report["requests"]["A"]["cross_rank"]
+                available = 2 <= prompt <= 256
+                self.assertEqual(steps[0]["prompt_source_availability"], [available, available])
+                self.assertEqual(steps[0]["prompt_primer_source_equal"], True if available else None)
+                self.assertEqual(steps[0]["kv_availability"], [True, True])
+                self.assertEqual(steps[0]["prompt_source_relation"], "equal_sources" if available else "unavailable")
+                for step in steps[1:]:
+                    self.assertEqual(step["prompt_source_availability"], [False, False])
+                    self.assertIsNone(step["prompt_bootstrap_source_equal"])
+
+    def test_v4_strict_source_schema_eligibility_and_version(self):
+        good = self.v4_records()[0][0]
+        keys = ("prompt_primer_source_sha256", "prompt_bootstrap_source_sha256",
+                "prompt_primer_tokens_sha256", "prompt_bootstrap_token_sha256",
+                "prompt_primer_kv_sha256", "prompt_bootstrap_kv_sha256", "prompt_written_prefix_sha256")
+        for key in keys:
+            for bad in (None, "x", "A" * 64):
+                with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                    parse_line(wire({**good, key: bad}))
+            missing = dict(good)
+            del missing[key]
+            with self.assertRaises(ValueError):
+                parse_line(wire(missing))
+            with self.assertRaises(ValueError):
+                parse_line(wire(good).strip() + f" {key}=" + "1" * 64)
+        for changes in ({"trace_version": 3}, {"trace_version": 5}, {"attempt": 2}, {"step": 1},
+                        {"self.cache_before": 257, "self.cache_after": 258, "position": 258}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                parse_line(wire({**good, **changes}))
+        for fault in ("within", "across"):
+            records = self.v4_records()
+            for record in records[1][:1 if fault == "within" else 32]:
+                record["trace_version"] = 3
+                for key in keys:
+                    del record[key]
+            with self.assertRaisesRegex(ValueError, "schema"):
+                self.run_records(records)
+
+    def test_v4_token_source_and_writer_evidence_are_distinct(self):
+        left = parse_line(wire(self.v4_records()[0][0]))
+        for changes, classification, relation in (
+            ({"prompt_primer_tokens_sha256": "f" * 64}, "prompt_token_difference", "token_difference"),
+            ({"prompt_bootstrap_token_sha256": "f" * 64}, "prompt_token_difference", "token_difference"),
+            ({"prompt_primer_source_sha256": "f" * 64}, "prompt_primer_source_difference", "source_difference"),
+            ({"prompt_bootstrap_source_sha256": "f" * 64}, "prompt_bootstrap_source_difference", "source_difference"),
+            ({"kv_prefix_sha256": "f" * 64}, "kv_prefix_difference", "post_writer_change"),
+            ({"prompt_primer_kv_sha256": "f" * 64}, "prompt_writer_difference", "writer_difference"),
+            ({"prompt_bootstrap_kv_sha256": "f" * 64}, "prompt_writer_difference", "writer_difference"),
+            ({"prompt_written_prefix_sha256": "f" * 64}, "prompt_writer_difference", "writer_difference"),
+            ({"kv_block_map_sha256": "f" * 64}, "observed_agreement", "equal_sources")):
+            result = compare("A", left, "B", {**left, **changes})
+            self.assertEqual(result["classification"], classification)
+            self.assertEqual(result["prompt_source_relation"], relation)
+        both = compare("A", left, "B", {**left, "prompt_primer_tokens_sha256": "f" * 64,
+                                          "prompt_primer_source_sha256": "f" * 64})
+        self.assertEqual(both["prompt_source_relation"], "token_difference")
+        mutated = compare("A", {**left,"kv_prefix_sha256":"f"*64}, "B", {**left,"kv_prefix_sha256":"f"*64})
+        self.assertEqual(mutated["prompt_source_relation"],"post_writer_change")
+        self.assertEqual(mutated["prompt_prefix_unchanged"],[False,False])
+
+    def test_v4_does_not_upgrade_legacy_or_later_attempt_source_evidence(self):
+        left = parse_line(wire(self.v4_records()[0][0]))
+        legacy = self.v3_records()[0][0]
+        legacy.update(position=149, **{"self.cache_before": 148, "self.cache_after": 149})
+        result = compare("A", left, "old", parse_line(wire(legacy)))
+        self.assertEqual(result["classification"], "prompt_source_availability_difference")
+        self.assertEqual(result["prompt_source_availability"], [True, False])
+        self.assertEqual(result["prompt_source_relation"], "unavailable")
+        self.assertIsNone(result["prompt_primer_tokens_equal"])
+        rows_a = self.v4_records()[0]
+        rows_b = copy.deepcopy(rows_a)
+        for record in rows_b:
+            record["position"] += 4
+            record["self.cache_before"] += 4
+            record["self.cache_after"] += 4
+        result = analyzer.compare_requests("A", {0: rows_a, 1: rows_a}, "B", {0: rows_b, 1: rows_b})
+        first = result["ranks"]["0"]["steps"][0]
+        self.assertEqual(first["prompt_source_availability"], [False, True])
+        self.assertIsNone(first["prompt_primer_source_equal"])
+
     def v3_records(self):
         records = [rows(0, 1), rows(1, 2)]
         for items in records:

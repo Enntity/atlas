@@ -51,9 +51,14 @@ fn arm_prepared(
     )
 }
 
-fn sequence(head: &Glm5MtpHead, ctx: &ForwardContext, generation: u64) -> SequenceState {
+fn sequence(
+    head: &Glm5MtpHead,
+    ctx: &ForwardContext,
+    gpu: &support::TraceGpu,
+    generation: u64,
+) -> SequenceState {
     let mut state = head.alloc_state_inner(ctx.gpu).unwrap();
-    prepared(&mut state, generation, 3);
+    prepared_with_source(head, ctx, gpu, &mut state, generation, 3);
     let mut seq = SequenceState::host_only(0);
     seq.tokens = vec![1, 2, 3];
     seq.seq_len = 3;
@@ -61,6 +66,24 @@ fn sequence(head: &Glm5MtpHead, ctx: &ForwardContext, generation: u64) -> Sequen
     seq.mtp_capture_gen = generation;
     seq.proposer_state = Some(Box::new(state));
     seq
+}
+fn prepared_with_source(
+    head: &Glm5MtpHead,
+    ctx: &ForwardContext,
+    gpu: &support::TraceGpu,
+    state: &mut Glm5MtpProposerState,
+    generation: u64,
+    position: usize,
+) {
+    prepared(state, generation, position);
+    if state.hidden_trace.enabled && (2..=256).contains(&(position - 1)) {
+        let setup_ctx = ForwardContext {
+            gpu: &gpu.inner,
+            midchunk_capture: None,
+            ..*ctx
+        };
+        super::prompt::fixture_observe(head, state, generation, position - 1, &setup_ctx).unwrap();
+    }
 }
 fn prepared(state: &mut Glm5MtpProposerState, generation: u64, position: usize) {
     let limits = Limits::new(
@@ -102,7 +125,7 @@ fn prepared(state: &mut Glm5MtpProposerState, generation: u64, position: usize) 
 fn actual_forward_one_traces_input_then_post_norm_before_vocabulary_on_both_ranks() {
     for rank in 0..2 {
         fixture(rank, |head, ctx, gpu, saved| {
-            let mut seq = sequence(head, ctx, 1);
+            let mut seq = sequence(head, ctx, gpu, 1);
             arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
             gpu.events.lock().clear();
             let state = seq

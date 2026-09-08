@@ -108,7 +108,7 @@ impl TransformerModel {
         if crate::speculative::glm_repair_policy::enabled() {
             self.prepare_glm_mtp_repair(seq, token, position, num_drafts, stream)?;
         } else {
-            self.ensure_drafter_context(proposer, seq, &ctx, stream);
+            self.ensure_drafter_context(proposer, seq, &ctx, stream)?;
         }
         crate::layers::glm5_mtp::hidden_trace::arm_prepared(
             seq,
