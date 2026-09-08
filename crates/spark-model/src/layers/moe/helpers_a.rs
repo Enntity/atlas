@@ -4,6 +4,12 @@
 
 use super::*;
 
+#[path = "helpers_unified_phases.rs"]
+mod unified_phases;
+#[cfg(test)]
+#[path = "helpers_unified_tests.rs"]
+mod unified_tests;
+
 impl MoeLayer {
     /// Transpose MoE weights for coalesced prefill GEMM reads.
     ///
@@ -203,8 +209,6 @@ impl MoeLayer {
     ) -> Result<()> {
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
-        let shared_inter = config.shared_expert_intermediate_size;
-        let _num_experts = self.weights.experts.len();
 
         // ── Phase A: transpose gate+up routed experts ──
         // ARM-2 Phase-K Family C: native-MXFP4 routed experts are per-32 E8M0.
@@ -242,19 +246,7 @@ impl MoeLayer {
         let up_t = self.transpose_experts_gpu(gpu, &up_src, inter, h, routed_gs)?;
         self.gate_ptrs_t = Some(build_ptr_table_from_qw(&gate_t, gpu)?);
         self.up_ptrs_t = Some(build_ptr_table_from_qw(&up_t, gpu)?);
-        // Shared expert (tiny, do unconditionally — fits regardless).
-        if !self.weights.shared_expert.gate_proj.is_null() && shared_inter > 0 {
-            self.shared_gate_t = Some(self.weights.shared_expert.gate_proj.transpose_for_gemm(
-                gpu,
-                shared_inter,
-                h,
-            )?);
-            self.shared_up_t = Some(self.weights.shared_expert.up_proj.transpose_for_gemm(
-                gpu,
-                shared_inter,
-                h,
-            )?);
-        }
+        self.transpose_unified_shared_gate_up(gpu, config)?;
 
         if !keep_originals {
             // ── Phase B: free gate+up untransposed ──
@@ -275,66 +267,17 @@ impl MoeLayer {
                     expert.up_proj.weight_scale = DevicePtr::NULL;
                 }
             }
-            if !keep_shared_originals
-                && !self.weights.shared_expert.gate_proj.weight.is_null()
-                && shared_inter > 0
-            {
-                gpu.free(self.weights.shared_expert.gate_proj.weight)?;
-                gpu.free(self.weights.shared_expert.gate_proj.weight_scale)?;
-                self.weights.shared_expert.gate_proj.weight = DevicePtr::NULL;
-                self.weights.shared_expert.gate_proj.weight_scale = DevicePtr::NULL;
-                gpu.free(self.weights.shared_expert.up_proj.weight)?;
-                gpu.free(self.weights.shared_expert.up_proj.weight_scale)?;
-                self.weights.shared_expert.up_proj.weight = DevicePtr::NULL;
-                self.weights.shared_expert.up_proj.weight_scale = DevicePtr::NULL;
+            if !keep_shared_originals {
+                self.release_unified_shared_gate_up(gpu, config)?;
             }
         }
-
-        // ── Phase C: transpose down routed experts ──
-        let down_src: Vec<QuantizedWeight> = self
-            .weights
-            .experts
-            .iter()
-            .map(|e| {
-                if e.down_proj.is_null() {
-                    QuantizedWeight::null()
-                } else {
-                    e.down_proj
-                }
-            })
-            .collect();
-        let down_t = self.transpose_experts_gpu(gpu, &down_src, h, inter, routed_gs)?;
-        self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
-        if !self.weights.shared_expert.down_proj.is_null() && shared_inter > 0 {
-            self.shared_down_t = Some(self.weights.shared_expert.down_proj.transpose_for_gemm(
-                gpu,
-                h,
-                shared_inter,
-            )?);
-        }
-
-        if !keep_originals {
-            // ── Phase D: free down untransposed ──
-            for expert in &mut self.weights.experts {
-                if !expert.down_proj.weight.is_null() {
-                    gpu.free(expert.down_proj.weight)?;
-                    gpu.free(expert.down_proj.weight_scale)?;
-                    expert.down_proj.weight = DevicePtr::NULL;
-                    expert.down_proj.weight_scale = DevicePtr::NULL;
-                }
-            }
-            if !keep_shared_originals
-                && !self.weights.shared_expert.down_proj.weight.is_null()
-                && shared_inter > 0
-            {
-                gpu.free(self.weights.shared_expert.down_proj.weight)?;
-                gpu.free(self.weights.shared_expert.down_proj.weight_scale)?;
-                self.weights.shared_expert.down_proj.weight = DevicePtr::NULL;
-                self.weights.shared_expert.down_proj.weight_scale = DevicePtr::NULL;
-            }
-        }
-
-        Ok(())
+        self.transpose_unified_down_phase(
+            gpu,
+            config,
+            routed_gs,
+            keep_originals,
+            keep_shared_originals,
+        )
     }
 
     /// Transpose one projection across ALL routed experts on the GPU, into a
