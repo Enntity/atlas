@@ -3,9 +3,10 @@
 The acceptance target remains a reproducible full-wall median of at least30
 tok/s at C1 or60 aggregate tok/s at C4 on the unchanged LRU148/256 fixture,
 one warmup plus three measured waves and a confirming repeat. Latest bounded
-C1 medians are28.632 initially and28.726 on a fresh v25 restart; qualified C4
+C1 medians are28.699 initially and28.618 on a fresh v26 restart; qualified C4
 remains47.319 on its separate profile. Neither establishes the target. The
-preceding v20 medians28.545/28.529 are historical comparisons. The
+preceding v25 medians28.632/28.726 and v20 medians28.545/28.529 are historical
+comparisons, not evidence of a v26 speedup. The
 earlier27.947/25.161 C1 receipts below are historical, not current best results.
 Do not substitute post-first-token rates or discard low-acceptance
 samples. The four strict answer checks are a smoke gate, not comprehensive
@@ -28,9 +29,11 @@ The reviewed fix is now committed `d3f989c7` with917 passing model CPU tests.
 The [v25 native result](glm-mtp-stream-fix-v25-results.md) has complete sampled
 cross-rank and repeated-request agreement; its automated full quality/health
 gate passes. Two earlier attempts retain idle-command health errors explicitly;
-that separate infrastructure defect remains under repair. Trace-OFF initial
-and fresh-repeat medians28.632/28.726 pass bounded quality/shutdown gates;
-the small historical difference is not causal significance or30 C1.
+the separate idle-receive fix `e40a9066` now passes two native35-second C1/v1
+idle gates. Its [v26 results](glm-ep-idle-v26-results.md) record trace-OFF
+initial/fresh full-wall medians28.699/28.618 and clean quality/shutdown.
+Native v2 coverage remains separate. The small historical differences are
+not causal significance or30 C1.
 Existing28.53 C1 rates are retained historical measurements, not
 evidence that the old handoff is safe or a speedup prediction.
 The checked B-tile family is now independently approved and committedad367a70;

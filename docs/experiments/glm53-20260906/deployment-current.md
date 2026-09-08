@@ -14,29 +14,33 @@ The separately tested fix `d3f989c7` now passes the bounded
 complete cross-rank/repeated-request equality. The native image also contains
 the new source/immediate-KV probe, so this is not isolated causal A/B proof.
 The C1 figures below remain historical benchmark evidence, not approval to
-restart that known unordered path. v25 trace-OFF timing is now confirmed below.
-An additional idle-command duration/health-latch defect is under repair;
-the clean automated gate does not validate idle serving. The separate
+restart that known unordered path. The additional idle-command duration/health-
+latch defect is now repaired in `e40a9066`: two fresh
+[v26 C1/v1 native35-second idle gates](glm-ep-idle-v26-results.md) pass.
+Native v2 coverage remains separate; no general transport recovery is claimed.
+The separate
 nonspeculative C4 measurement does not exercise the eager-drafter handoff.
 
-## Latest bounded C1 measurement — v25, September8
+## Latest bounded C1 measurement — v26, September8
 
-Image `atlas-glm53-flash:kernel-20260908-v25`, Rust `d3f989c7`, unchanged enabled
+Image `atlas-glm53-flash:kernel-20260908-v26`, Rust `e40a9066`, unchanged enabled
 CUDA `189db87e`, executable SHA256 on both nodes:
-`6166a51d36256860bc176e02debdbba4f689ba9181333ba050daafac5364f51e`.
-Matched148/256 full-wall medians are28.632 initially and28.726 after a fresh
+`a29c261991b94309a2eb4193f3354a429cb60f77d851604b62fe1f3ea5538cbd`.
+Matched148/256 full-wall medians are28.699 initially and28.618 after a fresh
 restart. All caps, short answers,1984-token needle, cancellation/recovery and
 clean shutdown pass. These are below30 C1; C4 is unchanged. The approximately
 30.1 decode-only rates must not replace full-wall results.
 
-The frozen head recipe is `phase7/run-v25-c1.sh`, requiring explicit
+The frozen head recipe is `phase7/run-v26-c1.sh`, requiring explicit
 `CACHE=1 VERIFY=0 TRACE=0`. It retains the v20 C1 safeguards/settings below,
 including one active request, context2044, prefill1024,114GiB and4096MiB guard.
-It is a cold bounded measurement arm, not general multi-turn, long-context or
-idle-service deployment approval. Do not restart historical C1 images that
-predate the stream repair. Both measured v25 services are stopped and preserved;
-root continues source work. The full [v25 result](glm-mtp-stream-fix-v25-results.md)
-records the retained failed idle-health attempts as well as clean gates.
+It is a cold bounded measurement arm with two validated35-second idle intervals,
+not general multi-turn, long-context or transport-recovery deployment approval.
+Do not restart historical C1 images that predate the stream repair. Both
+measured v26 services are stopped and preserved; root continues source work.
+The preceding [v25 result](glm-mtp-stream-fix-v25-results.md) records28.632/28.726
+medians and retained failed idle-health attempts as well as clean gates. v26
+does not establish a speedup over those measurements.
 
 ## Historical C1 comparison — v20, September8
 
