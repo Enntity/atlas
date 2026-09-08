@@ -4,6 +4,10 @@ Plan first: CPU-only scripts, no engine edits, nodes, Docker, GPU or Cargo.
 The native producer is `layers/glm5_mtp/hidden_trace.rs::StepTrace::emit`.
 This harness checks evidence; it does not explain a cache bug or measure speed.
 
+The version3 first-attempt private-KV extension is specified separately in
+`glm_mtp_first_kv_probe_plan.md`; legacy v1/v2 evidence stays explicitly
+unavailable for its new KV fields rather than being filled with equality.
+
 ## Inputs and strict bounds
 
 Add `analyze_glm_mtp_hidden_trace.py` plus unittest fixtures in a separate file.

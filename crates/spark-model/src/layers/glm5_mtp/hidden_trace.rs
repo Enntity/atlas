@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 
 pub(super) const ROW_BYTES: usize = 8192;
 
+#[path = "hidden_trace_kv.rs"]
+mod kv;
+
 /// Live model owners plus sticky installation history, never config inference.
 #[derive(Clone, Copy)]
 pub(crate) struct AdapterOwnership {
@@ -171,6 +174,8 @@ impl HiddenTrace {
             input: [0; 32],
             post_eh: None,
             final_hidden: [0; 32],
+            kv: None,
+            kv_before_spent: false,
         };
         record.input = snapshot(ctx.gpu, ptr, ctx.graph_capture, stream)?;
         Ok(Some(record))
@@ -187,8 +192,67 @@ pub(super) struct StepTrace {
     input: [u8; 32],
     post_eh: Option<[u8; 32]>,
     final_hidden: [u8; 32],
+    kv: Option<kv::Probe>,
+    kv_before_spent: bool,
 }
 impl StepTrace {
+    pub fn kv_before(
+        &mut self,
+        cache: &PagedKvCache,
+        state: &Glm5MtpProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if self.ordinal != 1 || self.step != 0 {
+            return Ok(());
+        }
+        ensure!(
+            !self.kv_before_spent,
+            "GLM first KV prefix already attempted"
+        );
+        self.kv_before_spent = true;
+        let repair_state::RepairPhase::Proposed(plan) = state.repair else {
+            anyhow::bail!("GLM first KV requires prepared repair");
+        };
+        ensure!(
+            self.post_eh.is_some()
+                && self.kv.is_none()
+                && self.request.hidden_row == 0
+                && plan.generation() == self.request.identity.generation
+                && plan.position() == self.request.position
+                && state.seq_len == self.cache_before
+                && state.seq_len.checked_add(1) == Some(self.request.position)
+                && state.seq_len.checked_add(4) == Some(plan.speculative_cache_end()),
+            "GLM first KV request/repair/cursor/post-EH mismatch"
+        );
+        self.kv = Some(kv::Probe::before(
+            cache,
+            &state.block_table,
+            state.seq_len,
+            ctx,
+            stream,
+        )?);
+        Ok(())
+    }
+    pub fn kv_after(
+        &mut self,
+        cache: &PagedKvCache,
+        state: &Glm5MtpProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if self.ordinal != 1 || self.step != 0 {
+            return Ok(());
+        }
+        ensure!(
+            state.seq_len == self.cache_before,
+            "GLM first KV body changed cursor"
+        );
+        self.kv
+            .as_mut()
+            .context("GLM first KV missing prefix")?
+            .after(cache, &state.block_table, state.seq_len, ctx, stream)
+    }
     pub fn post_eh(&mut self, ptr: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         if self.step != 0 {
             return Ok(());
@@ -215,6 +279,9 @@ impl StepTrace {
                 && ctx.buffers.sizes().norm_output >= ROW_BYTES
                 && ctx.config.hidden_size == 4096
                 && (self.step != 0 || self.post_eh.is_some())
+                && (self.ordinal != 1
+                    || self.step != 0
+                    || self.kv.as_ref().is_some_and(|p| p.appended.is_some()))
                 && self.cache_before.checked_add(1) == Some(cache_rows),
             "GLM hidden trace final owner/capacity/cursor/post-EH"
         );
@@ -227,7 +294,10 @@ impl StepTrace {
             attempt=self.ordinal, position=self.request.position, seed=self.request.seed, hidden_row=self.request.hidden_row,
             step=self.step, input_token=self.token, self.cache_before, self.cache_after, draft, eh_nvfp4, head_nvfp4,
             input_sha256=%Hex(&self.input), final_sha256=%Hex(&self.final_hidden), argmax_pair_bytes=?pairs,
-            trace_version=2u8, post_eh_sha256=%OptionalHex(self.post_eh.as_ref()),
+            trace_version=3u8, post_eh_sha256=%OptionalHex(self.post_eh.as_ref()),
+            kv_prefix_sha256=%OptionalHex(self.kv.as_ref().map(|p| &p.prefix)),
+            kv_appended_sha256=%OptionalHex(self.kv.as_ref().and_then(|p| p.appended.as_ref())),
+            kv_block_map_sha256=%OptionalHex(self.kv.as_ref().map(|p| &p.block_map)),
             "GLM MTP HIDDEN_TRACE");
     }
 }

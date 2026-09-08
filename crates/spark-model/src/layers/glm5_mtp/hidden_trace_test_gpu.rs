@@ -24,6 +24,8 @@ pub(super) struct TraceGpu {
     pub eh_last_byte: AtomicU8,
     pub read_hashes: Mutex<Vec<[u8; 32]>>,
     pub fail_body: Arc<AtomicBool>,
+    pub kv_reads: AtomicUsize,
+    pub fail_kv_read_at: AtomicUsize,
 }
 impl TraceGpu {
     pub fn new() -> Self {
@@ -38,6 +40,8 @@ impl TraceGpu {
             eh_last_byte: AtomicU8::new(0x5a),
             read_hashes: Mutex::new(Vec::new()),
             fail_body: Arc::new(AtomicBool::new(false)),
+            kv_reads: AtomicUsize::new(0),
+            fail_kv_read_at: AtomicUsize::new(usize::MAX),
         }
     }
 }
@@ -59,6 +63,13 @@ impl GpuBackend for TraceGpu {
     }
     fn copy_d2h_on_stream(&self, p: DevicePtr, b: &mut [u8], s: u64) -> Result<()> {
         self.events.lock().push(Event::Read(p, b.len(), s));
+        if matches!(b.len(), 1024 | 2048) {
+            let ordinal = self.kv_reads.fetch_add(1, Ordering::Relaxed) + 1;
+            anyhow::ensure!(
+                ordinal != self.fail_kv_read_at.load(Ordering::Relaxed),
+                "injected KV copy failure"
+            );
+        }
         if self.fail_read.load(Ordering::Relaxed)
             || (self.fail_post_eh_read.load(Ordering::Relaxed)
                 && !self.events.lock().contains(&Event::Body)
@@ -70,7 +81,8 @@ impl GpuBackend for TraceGpu {
                     .count()
                     == 2)
             || (self.fail_final_read.load(Ordering::Relaxed)
-                && self.events.lock().contains(&Event::Body))
+                && self.events.lock().contains(&Event::Body)
+                && b.len() == ROW_BYTES)
         {
             anyhow::bail!("injected hidden read failure");
         }
@@ -201,9 +213,9 @@ impl crate::layer::TransformerLayer for Body {
         _: DevicePtr,
         _: DevicePtr,
         _: &mut dyn crate::layer::LayerState,
-        _: &mut PagedKvCache,
+        cache: &mut PagedKvCache,
         row: usize,
-        _: &mut Vec<u32>,
+        blocks: &mut Vec<u32>,
         _: &mut Vec<u32>,
         _: &mut Vec<u32>,
         ctx: &ForwardContext,
@@ -211,6 +223,14 @@ impl crate::layer::TransformerLayer for Body {
     ) -> Result<()> {
         self.0.lock().push(Event::Body);
         anyhow::ensure!(!self.1.load(Ordering::Relaxed), "injected body failure");
+        for (side, pool) in [cache.k_pool_ptr(0), cache.v_pool_ptr(0)]
+            .into_iter()
+            .enumerate()
+        {
+            let ptr = pool.offset(blocks[row / 16] as usize * 16384 + row % 16 * 1024);
+            ctx.gpu
+                .copy_h2d(&[0x60 + (side as u8) * 16 + row as u8; 1024], ptr)?;
+        }
         let bytes: Vec<_> = (0..4096)
             .flat_map(|_| [0, 0x3f + (row % 8) as u8])
             .collect();
@@ -243,6 +263,7 @@ pub(super) fn fixture(
     config.linear_value_head_dim = 128;
     config.index_kpool = 0;
     config.index_head_dim = 0;
+    config.index_topk = 2048;
     config.tp_world_size = 2;
     config.ep_world_size = 2;
     config.adapter_max_rank = 0;

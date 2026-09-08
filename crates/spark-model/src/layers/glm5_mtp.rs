@@ -231,7 +231,7 @@ impl Glm5MtpHead {
         state: &mut Glm5MtpProposerState,
         ctx: &ForwardContext,
         stream: u64,
-        trace: Option<&mut hidden_trace::StepTrace>,
+        mut trace: Option<&mut hidden_trace::StepTrace>,
     ) -> Result<DevicePtr> {
         let h = ctx.config.hidden_size;
         let h_u32 = h as u32;
@@ -372,7 +372,7 @@ impl Glm5MtpHead {
                 stream,
             )?;
         }
-        if let Some(trace) = trace {
+        if let Some(trace) = trace.as_mut() {
             trace.post_eh(h_in, ctx, stream)?;
         }
         if profile {
@@ -444,6 +444,9 @@ impl Glm5MtpHead {
         // Atlas represents that as a zeroed residual row before its fused
         // add+norm path initializes the residual stream from `h_in`.
         let residual = ctx.buffers.residual();
+        if let Some(trace) = trace.as_mut() {
+            trace.kv_before(&kv_cache, state, ctx, stream)?;
+        }
         ctx.gpu.memset_async(residual, 0, row_bytes, stream)?;
         self.module.body.decode(
             h_in,
@@ -457,6 +460,9 @@ impl Glm5MtpHead {
             &mtp_ctx,
             stream,
         )?;
+        if let Some(trace) = trace.as_mut() {
+            trace.kv_after(&kv_cache, state, ctx, stream)?;
+        }
         if profile {
             ctx.gpu.synchronize(stream)?;
             tracing::info!(

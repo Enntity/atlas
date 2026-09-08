@@ -43,8 +43,8 @@ fn real_sequence_arm_bounds_all_attempts_and_resets_reused_state_only_for_new_re
                     .lock()
                     .iter()
                     .filter_map(|e| {
-                        if let Event::Read(p, n, s) = e {
-                            Some((*p, *n, *s))
+                        if let Event::Read(p, ROW_BYTES, s) = e {
+                            Some((*p, ROW_BYTES, *s))
                         } else {
                             None
                         }

@@ -7,6 +7,8 @@ use support::{Event, fixture};
 
 #[path = "hidden_trace_boundary_tests.rs"]
 mod boundary_tests;
+#[path = "hidden_trace_kv_hook_tests.rs"]
+mod kv_hook_tests;
 #[path = "hidden_trace_ownership_tests.rs"]
 mod ownership_tests;
 #[path = "hidden_trace_post_eh_tests.rs"]
@@ -142,7 +144,7 @@ fn actual_forward_one_traces_input_then_post_norm_before_vocabulary_on_both_rank
             assert_eq!(
                 events
                     .iter()
-                    .filter(|e| matches!(e, Event::Read(..)))
+                    .filter(|e| matches!(e, Event::Read(_, ROW_BYTES, _)))
                     .count(),
                 3
             );

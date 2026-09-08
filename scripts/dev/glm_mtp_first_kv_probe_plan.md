@@ -1,8 +1,12 @@
 # GLM MTP first-attempt private-KV probe
 
-Status: plan only, awaiting root's complete read and approval. No Rust, Python,
-Cargo, nodes, native builds or GPU actions in this partition yet. The kernel
-family agent owns integrated Rust/Cargo. Root alone owns activation and hardware.
+Status: implemented and controller CPU-gated; native validation pending. The
+strict v3 Python analyzer passed20/20 and is separately reviewed/committed at
+`3862c8d6`. Actual Rust
+reader/hooks passed30 focused tests and the shared-tree model suite passed887/887;
+non-test library check passed; independent source review is completing. No nodes, native builds
+or GPU actions by this agent.
+Root alone owns activation and hardware; this remains a diagnostic, not a fix.
 
 ## Question and exact boundary
 
@@ -234,3 +238,28 @@ requests, the1984-token quality case and cancel/recovery with existing memory
 guards. Acceptance, answers and model health remain gates, not predicted
 outcomes. This trace is not eligible for throughput promotion or performance
 comparison. No model activation is authorized by this plan alone.
+
+## Controller implementation receipts
+
+Persistent directory: `atlas-campaigns/20260908/hidden-trace-first-kv/`.
+`rust-initial-red.log` and `rust-behavioral-red.log` are compile failures, not
+behavioral evidence. `rust-runtime-red.log` executes the real hooks/readers:
+15 passed,13 failed against the explicit missing-reader implementation.
+`rust-focused-green.log` passes28/28; expanded `rust-focused-final.log` passes
+30/30, including all258 KV-copy fault positions and actual request-hook failures.
+`rust-full-suite.log` passes887/887 in33.83s, including the other agent's compiling
+but unapproved B-tile WIP. It is not a frozen standalone native build receipt.
+`rust-lib-check.log` passes the non-test model library check in7.47s on that
+same shared tree; neither receipt is an exact KV-only commit full-suite claim.
+
+`fmt-owned.log` checks all11 owned Rust files. The initial workspace `fmt.log`
+included one own module-order difference (corrected) and unrelated B-tile WIP
+formatting; the latter is deliberately not modified by this partition. The
+reader uses exactly one32,768-byte host payload allocation and one block-map
+snapshot of at most512 bytes. Post-body validation compares borrowed map data,
+without making a second snapshot. No normal or error path allocates on GPU.
+
+The standalone reader fixture supplies real host-backed bytes, not numerical
+MLA simulation. The proposer hook fixture only substitutes the body callback
+to write distinct appended storage and verify actual hook order. Neither CPU
+suite proves native CUDA correctness, model quality, or a numerical fix.

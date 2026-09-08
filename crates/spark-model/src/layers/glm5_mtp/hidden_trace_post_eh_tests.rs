@@ -16,7 +16,7 @@ fn actual_post_eh_hook_reads_projection_sentinel_before_body_overwrite() {
     for rank in 0..2 {
         fixture(rank, |head, ctx, gpu, saved| {
             let mut seq = sequence(head, ctx, 1);
-            for last in [0x5a, 0xda] {
+            for (attempt, last) in [0x5a, 0xda].into_iter().enumerate() {
                 prepared(state(&mut seq), 1, 3);
                 arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
                 gpu.read_hashes.lock().clear();
@@ -29,10 +29,10 @@ fn actual_post_eh_hook_reads_projection_sentinel_before_body_overwrite() {
                 let hashes = gpu.read_hashes.lock();
                 let mut expected = [0xa5; ROW_BYTES];
                 expected[ROW_BYTES - 1] = last;
-                assert_eq!(hashes.len(), 3);
+                assert_eq!(hashes.len(), if attempt == 0 { 7 } else { 3 });
                 assert_eq!(hashes[1], <[u8; 32]>::from(Sha256::digest(expected)));
                 assert_ne!(hashes[1], hashes[0]);
-                assert_ne!(hashes[1], hashes[2]);
+                assert_ne!(hashes[1], *hashes.last().unwrap());
             }
         });
     }
@@ -147,9 +147,12 @@ fn post_eh_metadata_missing_duplicate_capture_and_later_step_are_fail_closed() {
             format!("{}", Hex(&hash))
         );
         assert_eq!(format!("{}", OptionalHex(None)), "None");
-        record
-            .final_hidden(ctx.buffers.norm_output(), state.seq_len + 1, ctx, 7)
-            .unwrap();
+        // Post-EH alone no longer admits a complete first-attempt record.
+        assert!(
+            record
+                .final_hidden(ctx.buffers.norm_output(), state.seq_len + 1, ctx, 7)
+                .is_err()
+        );
         record.step = 1;
         let queries = gpu.capture_queries.load(Ordering::Relaxed);
         gpu.events.lock().clear();

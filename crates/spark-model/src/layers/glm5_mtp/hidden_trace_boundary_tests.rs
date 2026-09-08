@@ -32,7 +32,7 @@ fn actual_body_and_final_copy_failures_after_input_spend_attempt() {
                 assert_eq!(
                     events
                         .iter()
-                        .filter(|e| matches!(e, Event::Read(..)))
+                        .filter(|e| matches!(e, Event::Read(_, ROW_BYTES, _)))
                         .count(),
                     if body_failure { 2 } else { 3 }
                 );
