@@ -31,6 +31,7 @@ mod cli;
 mod conversation_store;
 mod disk_guard;
 mod error_hints;
+mod glm_terminal_session;
 pub mod grammar;
 mod halluc_probe;
 mod hint_injector;
@@ -79,6 +80,7 @@ pub type ModelBehavior = atlas_kernels::ModelBehavior;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    glm_terminal_session::install_panic_ingress();
     // Parse BEFORE subscriber install so the TUI gate can see `--no-tui`.
     // clap emits no tracing events, so plain-mode output is unchanged.
     let cli = Cli::parse();
