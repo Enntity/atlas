@@ -66,13 +66,23 @@ def check_ptx(texts):
             require(name in entries, f"{module}: missing entry {name}")
             actual, parameter_names = [], set()
             for declaration in entries[name].split(","):
-                parameter = re.fullmatch(r"\s*\.param\s+\.(u64|u32|f32)\s+([A-Za-z_$][\w$]*)\s*",
-                                         declaration)
+                # NVCC emits explicit generic pointer alignment in real PTX.
+                # Do not erase arbitrary attributes: validate this narrow form.
+                parameter = re.fullmatch(
+                    r"\s*\.param\s+\.(u64|u32|f32)\s+"
+                    r"(?:\.ptr\s+\.align\s+([1-9][0-9]{0,9})\s+)?"
+                    r"([A-Za-z_$][\w$]*)\s*", declaration)
                 require(parameter is not None, f"{module}: unsupported parameter in {name}")
-                require(parameter.group(2) not in parameter_names,
+                kind, alignment, parameter_name = parameter.groups()
+                if alignment is not None:
+                    alignment = int(alignment)
+                    require(kind == "u64" and alignment <= 2**31
+                            and alignment & (alignment - 1) == 0,
+                            f"{module}: invalid pointer type/alignment in {name}")
+                require(parameter_name not in parameter_names,
                         f"{module}: duplicate parameter in {name}")
-                parameter_names.add(parameter.group(2))
-                actual.append(parameter.group(1))
+                parameter_names.add(parameter_name)
+                actual.append(kind)
             require(actual == wanted, f"{module}: ABI mismatch {name}: {actual}, expected {wanted}")
             result[module][name] = actual
     return result

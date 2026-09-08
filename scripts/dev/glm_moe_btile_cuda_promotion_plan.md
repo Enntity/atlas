@@ -126,3 +126,47 @@ cannot establish that the compiler produced an artifact.
 Prior register-decode timing evidence exists in phase6-results.md:239; it does
 not select a serving variant here. Promotion reruns are exact-source correctness
 gates, not another exploratory timing sweep.
+
+## Native pointer-attribute parser correction (root-approved scope)
+
+The first actual native signature gate stopped before any GPU fixture run:
+`native-ptx.stderr` reports an unsupported grouped parameter. The three frozen
+artifacts in `atlas-campaigns/20260908/btile-cuda-promotion/ptx/` use NVCC's
+literal `.param .u64 .ptr .align 1 name` for pointers; scalar u32/f32 parameters
+remain unqualified. The old synthetic fixture used only unqualified u64.
+
+Narrow Python-only correction: retain the current unqualified forms and admit
+the observed optional `.ptr .align N` suffix only on u64 parameters. Require
+an explicit positive power-of-two alignment fitting a positive32-bit count;
+reject absent/zero/negative/non-power-of-two/oversized alignment, repeated or
+unknown attributes, qualifiers on scalar types, and malformed identifiers.
+Normalize only this validated pointer annotation to the same u64 ABI type;
+keep ordered arity/type/width, visibility/definition, duplicate, target and
+file-bound checks unchanged. This intentionally recognizes this producer's
+grammar, not every legal PTX extension or state-space annotation.
+
+Before implementation, reproduce the failure against the actual three files
+and add a positive literal NVCC pointer fixture plus strict negative tests.
+After correction require both the complete CPU suite and the actual3-artifact
+CLI gate to pass, recording hashes and8/6/1 exact exports. Root reviews/commits
+before GPU gates resume. No CUDA, Rust, Cargo, native compilation or device
+operation belongs to this parser-only change.
+
+Correction receipts in the same campaign directory:
+
+- `pointer-attributes-red.log`: the new literal NVCC positive test fails on
+  the old parser; `native-pointer-red.stderr` independently reproduces the
+  refusal against all three supplied real artifacts (exit2).
+- `pointer-attributes-green.log`:12/12 complete tests pass, including explicit
+  valid alignments and malformed/unknown/repeated/scalar pointer annotations,
+  plus all existing arity/type/width/duplicate/visibility/target negatives.
+- `native-pointer-green.json`: actual3-artifact CLI gate passes (exit0, empty
+  `.stderr`), finding8 grouped,6 decode and1 repack signatures. This is real
+  compiled-artifact ABI evidence, not numerical GPU correctness.
+  Grouped1942130 bytes SHA256
+  `deb8f2ff2ced3c549b14795f71588163309a5e720f593a6b60d505a6cab60d40`;
+  decode248387 bytes SHA256
+  `ee283c1dcbae8693cd6a5e29b8d88d32404cb7c8a55800ddcad45d34b43900c9`;
+  repack1995 bytes SHA256
+  `ac1007e6964214943994705a9412b4d26996f8b429e7556684774fb3dc3b9fe4`.
+  No artifact or CUDA body was changed to obtain this pass.

@@ -93,6 +93,36 @@ class SourceClosureTests(unittest.TestCase):
 
 
 class PtxCheckerTests(unittest.TestCase):
+    def test_actual_nvcc_pointer_attribute_spelling_preserves_exact_abi(self):
+        texts = {key: re.sub(r"\.param \.u64 ", ".param .u64 .ptr .align 1 ", source)
+                 for key, source in fixture_ptx().items()}
+        self.assertEqual(check_ptx(texts), check_ptx(fixture_ptx()))
+        for alignment in (1, 2, 4, 8, 16, 32, 256, 2147483648):
+            aligned = {key: source.replace(".align 1 ", f".align {alignment} ")
+                       for key, source in texts.items()}
+            self.assertEqual(check_ptx(aligned), check_ptx(fixture_ptx()))
+
+    def test_pointer_attributes_remain_strict_and_cannot_hide_abi_changes(self):
+        valid = {key: source.replace(".param .u64 ", ".param .u64 .ptr .align 1 ")
+                 for key, source in fixture_ptx().items()}
+        for replacement in (".u64 .ptr", ".u64 .align 1", ".u64 .ptr .align 0",
+                            ".u64 .ptr .align -1", ".u64 .ptr .align 3",
+                            ".u64 .ptr .align 4294967296", ".u64 .ptr .align 1.0",
+                            ".u64 .ptr .align 01", ".u64 .ptr .ptr .align 1",
+                            ".u64 .ptr .align 1 .align 1", ".u64 .ptr .global .align 1",
+                            ".u32 .ptr .align 1", ".f32 .ptr .align 1"):
+            texts = dict(valid)
+            texts["repack"] = texts["repack"].replace(".u64 .ptr .align 1", replacement, 1)
+            with self.subTest(replacement=replacement), self.assertRaises(ValueError):
+                check_ptx(texts)
+        for old, new in ((".u32 p3", ".f32 p3"), (",\n.param .u32 p3", ""),
+                         (".u32 p3", ".u64 .ptr .align 1 p3"),
+                         (".u64 .ptr .align 1 p1", ".u64 .ptr .align 1 p0")):
+            texts = dict(valid)
+            texts["repack"] = texts["repack"].replace(old, new)
+            with self.subTest(new=new), self.assertRaises(ValueError):
+                check_ptx(texts)
+
     def test_complete_three_module_signature_evidence(self):
         result = check_ptx(fixture_ptx())
         self.assertEqual(set(result), {"grouped", "decode", "repack"})
