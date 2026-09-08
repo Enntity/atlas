@@ -4,6 +4,8 @@
 mod cleanup_tests;
 #[path = "glm_c2_handoff_decode_fault_tests.rs"]
 mod decode_fault_tests;
+#[path = "glm_c2_eager_bootstrap_error_tests.rs"]
+mod eager_bootstrap_error_tests;
 #[path = "glm_c2_handoff_test_fixture.rs"]
 mod fixture;
 #[path = "glm_c2_legacy_boundary_tests.rs"]

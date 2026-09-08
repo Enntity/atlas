@@ -33,6 +33,10 @@ pub(super) enum Event {
     Sync(u64),
     RecordEvent(u64, u64),
     WaitEvent(u64, u64),
+    BeginCapture(u64),
+    EndCapture(u64),
+    AbortCapture(u64),
+    LaunchGraph(u64, u64),
     Memset(DevicePtr, usize, u64),
     Kernel(String, Vec<DevicePtr>, u64),
     Target(usize, usize, u64),
@@ -51,6 +55,7 @@ pub(super) struct Recorder {
     pub fail: AtomicUsize,
     pub reuse_freed: AtomicBool,
     pub capturing: AtomicBool,
+    pub capture_handles: AtomicBool,
     pub sweeps: AtomicUsize,
     pub deterministic_logits: AtomicBool,
 }
@@ -177,6 +182,24 @@ impl GpuBackend for Gpu {
     }
     fn stream_is_capturing(&self, _: u64) -> bool {
         self.0.capturing.load(Ordering::Relaxed)
+    }
+    fn begin_capture(&self, stream: u64) -> Result<()> {
+        self.0.event(Event::BeginCapture(stream))
+    }
+    fn end_capture(&self, stream: u64) -> Result<spark_runtime::gpu::GraphHandle> {
+        self.0.event(Event::EndCapture(stream))?;
+        let handle = if self.0.capture_handles.load(Ordering::Relaxed) {
+            self.0.next_handle.fetch_add(1, Ordering::Relaxed) as u64 + 1024
+        } else {
+            0
+        };
+        Ok(spark_runtime::gpu::GraphHandle(handle))
+    }
+    fn abort_capture_if_active(&self, stream: u64) {
+        let _ = self.0.event(Event::AbortCapture(stream));
+    }
+    fn launch_graph(&self, graph: spark_runtime::gpu::GraphHandle, stream: u64) -> Result<()> {
+        self.0.event(Event::LaunchGraph(graph.0, stream))
     }
     fn sweep_unreleased(&self) -> usize {
         self.0.sweeps.fetch_add(1, Ordering::Relaxed);

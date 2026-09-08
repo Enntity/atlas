@@ -50,6 +50,7 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         // Use backend's own stream (non-default, required for CUDA graph capture).
         let stream = self.gpu.default_stream();
+        let selected_paired = self.paired_handoff().is_some();
         // ATLAS_SSM_H_FP16: narrow this sequence's SSM h-state to FP16 exactly
         // once, HERE — outside the CUDA-graph region. No-op without the flag.
         self.ssm_h_to_f16_dispatch(seq)?;
@@ -230,6 +231,9 @@ impl TransformerModel {
         // load-time-fixed). Folded in as one more suppressor.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
+            // The selected paired scalar bootstrap is an eager-only producer.
+            // Its terminal error path must not destroy/fallback a partial graph.
+            && !selected_paired
             // C3/C2 can drain to C1. Its selector also embeds host positions;
             // keep the final row eager throughout the opt-in sparse session.
             && !crate::layers::qwen3_attention::glm_multi_seq_sparse_enabled(
@@ -339,9 +343,13 @@ impl TransformerModel {
             // `synchronize`) fails with STREAM_CAPTURE_UNSUPPORTED and every
             // subsequent op on this stream is poisoned — a single refused request
             // bricks the whole server. Release the stream (discarding the partial
-            // graph) before propagating; no-op when not capturing. Graphs stay
-            // enabled: the next decode step begins a fresh capture.
-            self.gpu.abort_capture_if_active(stream);
+            // graph) before propagating on the ordinary legacy path. The helper
+            // can still call cuStreamEndCapture when not capturing; selected
+            // eager bootstrap must return without that cleanup. Legacy graphs
+            // stay enabled: the next decode step begins a fresh capture.
+            if !selected_paired {
+                self.gpu.abort_capture_if_active(stream);
+            }
             return Err(e);
         }
 
