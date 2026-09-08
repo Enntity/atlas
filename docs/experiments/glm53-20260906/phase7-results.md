@@ -64,3 +64,20 @@ total budget against a1,056,964,608-byte cache. Keep the same full inference
 reserve,114GiB container cap and4096MiB watchdog, and require measured4GiB
 host MemAvailable after load/warmup. Both subsequent cache-OFF and cache-ON
 controls use.91; do not attribute an unmatched budget change to a kernel gain.
+
+The.91 diagnostic loads successfully with about11.5GiB host MemAvailable on
+each rank. Both ranks pass all126 byte comparisons and all126 K5 projection
+output comparisons against retained originals. All four strict answers pass.
+
+The1984/48 near-context request then rejects cleanly: the solo first-chunk
+policy uses the full1025-row arena, not the configured1024-row scheduling
+budget. The cache's validated1024-row limit catches this at layer3. Both model
+containers subsequently stop gracefully with exit0/OOMKilled=false and are
+preserved as `atlas-glm53-v19-cache91-oracle-ep0/1`. No clean TPS run occurred.
+
+Next fix: keep the scheduler's existing chunk policy and use retained original
+T-layout kernels for installed-cache inputs beyond the tested1024-row FP8
+range. Preserve the cached K5 fast path and explicit buffer/geometry/lifetime
+checks. Do not raise the FP8 admission limit without native evidence, shrink
+the context, or call the failed near-context gate a pass. The final image must
+repeat this gate before performance qualification.
