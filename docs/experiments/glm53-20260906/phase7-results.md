@@ -81,3 +81,42 @@ range. Preserve the cached K5 fast path and explicit buffer/geometry/lifetime
 checks. Do not raise the FP8 admission limit without native evidence, shrink
 the context, or call the failed near-context gate a pass. The final image must
 repeat this gate before performance qualification.
+
+The independently reviewed correction is committed as `7bfa3bae`. Its actual
+dispatch test first failed at1025 rows, then passed the exact old-T ABI for
+all three projections. The final824-test model CPU suite passes, including
+arena-bound2048-row fallback, invalid spans/owners/capture refusal and a missing
+FP8-handle check before any eager oracle mutation. These are CPU dispatch tests,
+not native numerical evidence. The frozen three-file Rust slice was copied to
+the retained native builder; no CUDA production source changed. Both hosts are
+idle before starting the build, which is bounded to8GiB/two CPU cores because
+restored source timestamps may cause CUDA recompilation. Native rollout remains
+pending until its new executable is built and verified on both nodes.
+
+## Routed B-tile M64 standalone extension
+
+Committed prototype `40c4bf5c` completes four native fixture passes: ordinary
+and Compute Sanitizer execution for each of default FMA and `--fmad=false`.
+Both sanitizer summaries report zero errors; the bounded GPU container exits
+0/OOMKilled=false. Model services and native builders were stopped throughout.
+The fixture explicitly allocates 56,015,240 device bytes, below its64MiB cap.
+Across eager and fixed-pointer graph execution it checks dense, separate
+compact, and fused compact readers, scalar/vector scales, gathered/route-major
+activation ownership, both output arrays, CPU reference columns, immutable
+inputs and allocation guards, including empty and remote-only routes.
+
+This is correctness evidence through1024 rows, not an engine integration or
+TPS result. The newly observed solo1025-row arena remains outside this
+prototype's envelope. Before replacing physical routed-weight storage, extend
+the readers' native coverage through actual admitted arena rows (including
+concurrency padding); unlike the shared-cache experiment, overwritten original
+T storage cannot provide a fallback. Typed layout ownership, all other readers,
+and the BF16-versus-prequantized activation contract remain promotion gates.
+
+Native executable SHA256 values:
+
+- default: `080468e50c0facdb3b15bc76e9af62e859f809ec9422510921ad31e8567680c3`
+- no-FMA: `08dc5f760ca0445caf48d10c40e4246d4db261ddab0356ea901bbfe00c48043e`
+
+Raw receipts: persistent campaign `btile-m64-full/native-gates.log` plus
+the corresponding CPU bounds/fixture logs. No timing claim is made here.
