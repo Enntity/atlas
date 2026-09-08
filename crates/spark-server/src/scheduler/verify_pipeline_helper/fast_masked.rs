@@ -44,6 +44,7 @@
 //! to the unmodified slow path for the whole call.
 //! Kill-switch: `ATLAS_DISABLE_FAST_MASKED=1`.
 
+use super::selection_io::CopyFailurePolicy;
 use crate::scheduler::ActiveSeq;
 use crate::scheduler::logit_processors::LogitsContext;
 use crate::scheduler::mtp_timing::Phase;
@@ -62,7 +63,8 @@ pub(super) fn try_chat_fast_path(
     a: &ActiveSeq,
     ctx: &LogitsContext,
     row_base: usize,
-) -> Option<Vec<u32>> {
+    policy: CopyFailurePolicy,
+) -> anyhow::Result<Option<Vec<u32>>> {
     // DFlash masked-verify mode ONLY. The fast path exists to make
     // ATLAS_DFLASH_MASKED_VERIFY affordable; it must never run for MTP:
     // returning the GPU argmax where the slow path computes a host-side
@@ -72,12 +74,12 @@ pub(super) fn try_chat_fast_path(
     // low-margin tokens). MTP keeps the slow path unconditionally so
     // its behavior is byte-invariant by construction.
     if !ctx.sampling.dflash_masked_verify {
-        return None;
+        return Ok(None);
     }
     let fast_masked_enabled = ctx.sampling.fast_masked;
     let adadec_recording = ctx.sampling.adadec_diagnostic;
     if !fast_masked_enabled || a.grammar_state.is_some() || adadec_recording {
-        return None;
+        return Ok(None);
     }
     use crate::scheduler::confidence::{
         MAX_SENTENCE_DEFER_TOKENS, THINK_DEFER_ABS_CEILING, THINK_DEFER_BUDGET_FACTOR,
@@ -112,7 +114,7 @@ pub(super) fn try_chat_fast_path(
         || pin_tool_armed
         || penalty_gate == crate::scheduler::fast_greedy::PenaltyGate::Blocked
     {
-        return None;
+        return Ok(None);
     }
     let t_fast = std::time::Instant::now();
     let scoped_history: Vec<u32> =
@@ -138,15 +140,15 @@ pub(super) fn try_chat_fast_path(
             break;
         }
         if penalty_gate == crate::scheduler::fast_greedy::PenaltyGate::ReduceOnly
-            && !crate::scheduler::fast_greedy::argmax_immune(tok, &scoped_history, || {
-                crate::scheduler::fast_greedy::logit_is_positive(
+            && !policy.immune(tok, &scoped_history, || {
+                crate::scheduler::fast_greedy::logit_is_positive_checked(
                     model,
                     logits_base,
                     row_base + i,
                     vocab,
                     tok,
                 )
-            })
+            })?
         {
             all_clear = false;
             break;
@@ -160,9 +162,9 @@ pub(super) fn try_chat_fast_path(
                  (kill-switch: ATLAS_DISABLE_FAST_MASKED=1)"
             );
         }
-        return Some(argmax_ids.to_vec());
+        return Ok(Some(argmax_ids.to_vec()));
     }
     // Fall through — grammar fast path can't fire (grammar_state is
     // None), so the slow path handles the call.
-    None
+    Ok(None)
 }

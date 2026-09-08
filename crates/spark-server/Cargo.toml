@@ -101,6 +101,7 @@ base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
+spark-runtime = { path = "../spark-runtime", default-features = false, features = ["test-utils"] }
 
 [lints]
 workspace = true
