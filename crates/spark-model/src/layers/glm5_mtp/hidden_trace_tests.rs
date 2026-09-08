@@ -7,8 +7,45 @@ use support::{Event, fixture};
 
 #[path = "hidden_trace_boundary_tests.rs"]
 mod boundary_tests;
+#[path = "hidden_trace_ownership_tests.rs"]
+mod ownership_tests;
 #[path = "hidden_trace_request_tests.rs"]
 mod request_tests;
+
+fn no_adapter_owners() -> AdapterOwnership {
+    AdapterOwnership {
+        pool: false,
+        overlays: false,
+        rotatable: false,
+        install_attempted: false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arm_prepared(
+    seq: &mut SequenceState,
+    token: u32,
+    position: usize,
+    drafts: usize,
+    saved: DevicePtr,
+    hidden_row: usize,
+    grammar: bool,
+    ctx: &ForwardContext,
+    stream: u64,
+) -> Result<()> {
+    super::arm_prepared(
+        seq,
+        token,
+        position,
+        drafts,
+        saved,
+        hidden_row,
+        grammar,
+        ctx,
+        stream,
+        no_adapter_owners,
+    )
+}
 
 fn sequence(head: &Glm5MtpHead, ctx: &ForwardContext, generation: u64) -> SequenceState {
     let mut state = head.alloc_state_inner(ctx.gpu).unwrap();

@@ -169,3 +169,17 @@ fn explicit_non_unicode_flag_is_not_treated_as_absent() {
     // Test the environment API's error value directly: no process-global mutation.
     assert!(parse_environment(Err(VarError::NotUnicode(std::ffi::OsString::new()))).is_err());
 }
+
+#[test]
+fn actual_no_pool_route_from_production_resolver_is_trace_eligible() {
+    for rank in 0..2 {
+        fixture(rank, |head, ctx, gpu, saved| {
+            let mut seq = sequence(head, ctx, 1);
+            ctx.moe_lora_route = crate::lora::resolve_moe_lora_route(-1, -1, false);
+            assert_eq!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Fold);
+            arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7)
+                .expect("actual native no-pool Fold is inert and must be eligible");
+            assert!(gpu.events.lock().is_empty());
+        });
+    }
+}

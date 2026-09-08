@@ -701,6 +701,7 @@ impl TransformerModel {
             layers,
             buffers,
             lora: None,
+            lora_install_attempted: false,
             lora_rotatable: false,
             kv_cache: Mutex::new(kv_cache),
             gpu,

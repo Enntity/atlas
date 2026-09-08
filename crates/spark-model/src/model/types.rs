@@ -86,6 +86,9 @@ pub struct TransformerModel {
     /// layer structs; kept here as the owner of the pool/tables and for
     /// status introspection.
     pub(super) lora: Option<crate::lora::LoraWeights>,
+    /// Sticky diagnostic ownership proof: a failed install or later detach
+    /// may leave layer fields installed even when the pool owner is absent.
+    pub(super) lora_install_attempted: bool,
     /// True when runtime adapter rotation is ARMED: `ATLAS_LORA_ROTATE=1`, or
     /// `$ATLAS_LORA_PEER` set. Armed ⇒ decode runs eager (no CUDA-graph
     /// capture) so a `set_active_lora` re-point is immediately live

@@ -121,6 +121,7 @@ impl TransformerModel {
             grammar_bitmask.is_some(),
             &ctx,
             stream,
+            || self.hidden_trace_adapter_ownership(),
         )?;
         let prop_state = seq
             .proposer_state

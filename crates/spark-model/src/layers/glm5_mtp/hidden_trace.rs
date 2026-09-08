@@ -7,6 +7,24 @@ use sha2::{Digest, Sha256};
 
 pub(super) const ROW_BYTES: usize = 8192;
 
+/// Live model owners plus sticky installation history, never config inference.
+#[derive(Clone, Copy)]
+pub(crate) struct AdapterOwnership {
+    pub pool: bool,
+    pub overlays: bool,
+    pub rotatable: bool,
+    pub install_attempted: bool,
+}
+impl AdapterOwnership {
+    pub(crate) fn ensure_absent(self) -> Result<()> {
+        ensure!(
+            !self.pool && !self.overlays && !self.rotatable && !self.install_attempted,
+            "GLM hidden trace requires no live or previously installed adapters"
+        );
+        Ok(())
+    }
+}
+
 pub(super) fn parse(value: Option<&str>) -> Result<bool> {
     ensure!(
         matches!(value, None | Some("0") | Some("1")),
@@ -233,6 +251,7 @@ pub(crate) fn arm_prepared(
     grammar: bool,
     ctx: &ForwardContext,
     stream: u64,
+    adapter_ownership: impl FnOnce() -> AdapterOwnership,
 ) -> Result<()> {
     let Some(state) = seq
         .proposer_state
@@ -259,6 +278,7 @@ pub(crate) fn arm_prepared(
         return Ok(());
     }
     let result = (|| {
+        adapter_ownership().ensure_absent()?;
         ensure!(
             ctx.config.model_type == "glm5_next"
                 && ctx.config.hidden_size == 4096
@@ -280,7 +300,7 @@ pub(crate) fn arm_prepared(
                 && seq.disk_block_ids.is_empty()
                 && ctx.config.adapter_max_rank == 0
                 && ctx.routed_lora_layers.is_none()
-                && matches!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Skip),
+                && !matches!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Refuse),
             "GLM hidden trace requires exact cold C1 TP2/EP2 MTP4 repair profile without adapters"
         );
         let repair_state::RepairPhase::Proposed(plan) = state.repair else {

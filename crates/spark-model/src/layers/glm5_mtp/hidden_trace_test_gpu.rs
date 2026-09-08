@@ -267,7 +267,7 @@ pub(super) fn fixture(
         token_ids: None,
         routed_lora_layers: None,
         midchunk_capture: None,
-        moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+        moe_lora_route: crate::lora::resolve_moe_lora_route(-1, -1, false),
     };
     let saved = gpu.alloc(ROW_BYTES).unwrap();
     gpu.copy_h2d(&[0x3c; ROW_BYTES], saved).unwrap();

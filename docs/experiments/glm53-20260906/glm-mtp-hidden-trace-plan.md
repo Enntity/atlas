@@ -159,3 +159,64 @@ kernel/body behavior. It proves production hook placement, bounds, ownership,
 failure propagation and output non-interference, **not CUDA numerical parity**.
 No native build, GPU allocation, node run, performance result or explanation of
 the observed acceptance variation is claimed for this diagnostic yet.
+
+## Native v21 rejection and bounded ownership correction
+
+The first native v21 diagnostic request rejected on both ranks at the trace's
+no-adapter profile guard, before any hidden snapshots. This is a failed
+diagnostic gate, not a model throughput result. The exact base-model route was
+incorrectly assumed to be `Skip`: production
+`lora::resolve_moe_lora_route(-1,-1,false)` returns inert `Fold`, and
+`model/impl_lora.rs::moe_lora_route` derives that `false` from `self.lora=None`.
+The constructor also initializes the decode route to `Fold`. The CPU fixture
+hardcoded `Skip`, so its prior pass did not cover this live representation.
+
+Root approved the following bounded correction before implementation: supply
+live model LoRA pool, token-overlay and rotation ownership from `impl_b3` to the
+trace arming helper. Evaluate the ownership reader only after the existing
+disabled/exhausted returns. Require all three absent, retain adapter_max_rank0,
+base sequence adapter id/slot and absent routed-layer guards, and reject
+`Refuse` unconditionally. Only that proven no-owner profile may use inert
+`Fold` or `Skip`; do not permit arbitrary Fold based on config alone and do not
+change the underlying model's LoRA routing semantics.
+
+First record a behavioral RED using the real route resolver's no-pool Fold in
+the actual trace arming test. Then cover no-owner Fold/Skip success on both
+ranks, pool/overlay/rotation/config/active-sequence refusal before I/O, and
+disabled/exhausted ownership-reader non-evaluation. Update the shared fixture to
+derive its route through the production resolver. Run focused/full controller
+CPU tests and independent review before root commits or builds again. This
+fix changes only diagnostic eligibility; the native diagnostic still needs a
+successful clean rerun before any hidden-divergence conclusion.
+
+Root additionally authorized one sticky model lifecycle bit to close the
+detachment/error history gap: `set_lora_weights(None)` does not clear every
+installed layer field, and a failed Some install may mutate layers before the
+pool owner is stored. Initialize `lora_install_attempted=false` in the actual
+constructor, set it before any fallible Some installation work, and never clear
+it on None. Include it in the lazy ownership proof. Actual setter tests cover
+both successful and failed Some attempts followed by detach. This adds one
+inert host boolean to all models; it changes no LoRA arithmetic, routing,
+allocation, or ordinary serving admission. No layer-trait expansion is needed.
+
+Final correction receipts under `atlas-campaigns/20260908/`:
+
+- `hidden-trace-route-red.log`: actual resolver no-pool Fold rejected by the
+  old trace guard (behavior RED).
+- `hidden-trace-history-red.log`: actual model constructor/setter did not retain
+  the attempted-install history (behavior RED, not a compiler failure).
+- `hidden-trace-route-green.log`:13/13 focused tests pass after live ownership
+  binding. `hidden-trace-ownership-full-final.log`:841/841 model CPU tests pass,
+  including actual setter success and failed install followed by None detach,
+  all owner/history/config/sequence/Refuse negatives and inert lazy reader when
+  disabled/exhausted. An intermediate test-only non-Copy context construction
+  compiler error is retained in `hidden-trace-ownership-full-green.log`; it is
+  not labeled a behavioral RED or passing receipt.
+- `hidden-trace-ownership-fmt.log` and final diff check pass. New Rust files are
+  below500 lines; existing `impl_lora.rs`495 and `impl_b3.rs`497 remain below cap.
+- Independent review approved the frozen correction. Production trace SHA256:
+  `65b2a7df1858e865dc70b6a5421662ee9a1adb8c9fe46459043e105764af443e`.
+
+The native v21 failure remains preserved in `v21-hidden-rejected-rank0.log` and
+`v21-hidden-rejected-rank1.log`. This CPU-corrected source has not yet passed a
+new native diagnostic request; root must rebuild and verify that separately.

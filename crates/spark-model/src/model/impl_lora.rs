@@ -13,6 +13,9 @@ use spark_runtime::gpu::DevicePtr;
 use super::types::TransformerModel;
 use crate::layers::ops;
 
+#[path = "impl_lora_history.rs"]
+mod history;
+
 impl TransformerModel {
     /// Install a startup-static LoRA adapter (post-construction, mirroring
     /// [`Self::set_dflash_proposer`]). Walks the model layers by GLOBAL
@@ -133,6 +136,9 @@ impl TransformerModel {
 
     pub fn set_lora_weights(&mut self, mut lora: Option<crate::lora::LoraWeights>) -> Result<()> {
         if let Some(ref lw) = lora {
+            // A failed install or later None detach may leave layer pointers.
+            // Only the bounded hidden diagnostic reads this sticky history bit.
+            self.lora_install_attempted = true;
             // eager-on-rotate: ONLY the global rotate/swap re-point path forces
             // eager decode. A multi-adapter pool no longer implies eager —
             // per-request routing (M2) is graph-safe by construction (the
