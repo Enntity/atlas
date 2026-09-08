@@ -4,6 +4,7 @@
 // only B staging uses [N/128,K/64,128,32] packed bytes. No production exports.
 // Include after production grouped kernel primitives. See accompanying plan.
 #pragma once
+#include "glm_moe_btile_m64_bounds.h"
 
 template<bool PQ_VEC_SCALES>
 __device__ __forceinline__ void glm_moe_btile_m64_impl(
@@ -23,14 +24,14 @@ __device__ __forceinline__ void glm_moe_btile_m64_impl(
     unsigned int work_n_tile
 ) {
     if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1
-        || N != 2048 || K != 4096 || sorted_token_ids == nullptr) return;
+        || N != 2048 || K != 4096) return;
     const unsigned int expert_id = work_expert_id;
     if (expert_id >= num_experts) return;
 
     const int m_start = expert_offsets[expert_id];
     const int m_end = expert_offsets[expert_id + 1];
     const int M_expert = m_end - m_start;
-    if (M_expert <= 0 || M_expert > 129) return;
+    if (!glm_btile_m64_work_valid(M_expert, work_m_tile, work_n_tile)) return;
 
     const int cta_m_local = work_m_tile * M_TILE;
     if (cta_m_local >= M_expert) return;
@@ -224,7 +225,8 @@ __device__ __forceinline__ void glm_moe_btile_m64_impl(
 }
 
 // Projection-multiplexed gate/up: unchanged compact-map contract, now with
-// actual token-major A gather. No extra builder, weight copy or down dispatch.
+// token-major A gather or explicit route-major A when the gather is null.
+// No extra builder, weight copy or down dispatch.
 #define GLM_GU_BTILE_M64_ARGS \
     const unsigned char* A_packed, const unsigned char* A_scale, \
     const unsigned long long* gate_packed_ptrs, const unsigned long long* gate_scale_ptrs, \
@@ -237,7 +239,7 @@ __device__ __forceinline__ void glm_moe_btile_m64_impl(
 
 template<bool VEC>
 __device__ __forceinline__ void glm_moe_gate_up_btile_m64_impl(GLM_GU_BTILE_M64_ARGS) {
-    if (blockIdx.y > 1 || N != 2048 || K != 4096 || !sorted_token_ids) return;
+    if (blockIdx.y > 1 || N != 2048 || K != 4096) return;
     const int raw_total = *total_tiles;
     const unsigned int count = raw_total > 0 ? min((unsigned int)raw_total, max_tiles) : 0u;
     const unsigned int wid = blockIdx.x;
@@ -245,8 +247,7 @@ __device__ __forceinline__ void glm_moe_gate_up_btile_m64_impl(GLM_GU_BTILE_M64_
     const unsigned int expert = worklist[wid * 2];
     const unsigned int packed = worklist[wid * 2 + 1];
     const unsigned int mt = packed >> 6, nt = packed & 0x3fu;
-    // Host fixture supports up to129 gathered rows per expert: M tiles0..2.
-    if (expert >= num_experts || mt >= 3 || nt >= N / 128) return;
+    if (expert >= num_experts || nt >= N / 128) return;
     const bool is_up = blockIdx.y != 0;
     glm_moe_btile_m64_impl<VEC>(A_packed, A_scale,
         is_up ? up_packed_ptrs : gate_packed_ptrs,
@@ -269,3 +270,40 @@ extern "C" __global__ void glm_moe_gate_up_btile_m64_vecscale(GLM_GU_BTILE_M64_A
 }
 #undef GLM_GU_BTILE_M64_ARGS
 #undef GLM_GU_BTILE_M64_CALL
+
+// Separate projections retain the exact production dense and compact ABIs.
+// A null sorted_token_ids explicitly means route-major (already gathered) A.
+#define GLM_BT64_ARGS \
+    const unsigned char* A_packed, const unsigned char* A_scale, \
+    const unsigned long long* B_packed_ptrs, const unsigned long long* B_scale_ptrs, \
+    const float* scale2_vals, __nv_bfloat16* C, const int* expert_offsets, \
+    const int* sorted_token_ids, unsigned int num_experts, unsigned int N, unsigned int K
+#define GLM_BT64_VALUES \
+    A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C, \
+    expert_offsets, sorted_token_ids, num_experts, N, K
+extern "C" __global__ void glm_moe_btile_m64_dense(GLM_BT64_ARGS) {
+    glm_moe_btile_m64_impl<false>(GLM_BT64_VALUES, blockIdx.z, blockIdx.y, blockIdx.x);
+}
+extern "C" __global__ void glm_moe_btile_m64_vecscale_dense(GLM_BT64_ARGS) {
+    glm_moe_btile_m64_impl<true>(GLM_BT64_VALUES, blockIdx.z, blockIdx.y, blockIdx.x);
+}
+template<bool VEC>
+__device__ __forceinline__ void glm_moe_btile_m64_compact_impl(
+    GLM_BT64_ARGS, const unsigned int* worklist, const int* total_tiles, unsigned max_tiles) {
+    const int raw_total = *total_tiles;
+    const unsigned count = raw_total > 0 ? min(unsigned(raw_total), max_tiles) : 0u;
+    if (blockIdx.x >= count) return;
+    const unsigned expert = worklist[blockIdx.x * 2];
+    const unsigned packed = worklist[blockIdx.x * 2 + 1];
+    glm_moe_btile_m64_impl<VEC>(GLM_BT64_VALUES, expert, packed >> 6, packed & 63u);
+}
+extern "C" __global__ void glm_moe_btile_m64_compact(
+    GLM_BT64_ARGS, const unsigned int* worklist, const int* total_tiles, unsigned max_tiles) {
+    glm_moe_btile_m64_compact_impl<false>(GLM_BT64_VALUES, worklist, total_tiles, max_tiles);
+}
+extern "C" __global__ void glm_moe_btile_m64_vecscale_compact(
+    GLM_BT64_ARGS, const unsigned int* worklist, const int* total_tiles, unsigned max_tiles) {
+    glm_moe_btile_m64_compact_impl<true>(GLM_BT64_VALUES, worklist, total_tiles, max_tiles);
+}
+#undef GLM_BT64_ARGS
+#undef GLM_BT64_VALUES
