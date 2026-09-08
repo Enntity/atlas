@@ -126,6 +126,8 @@ GLM_M5_SHARED_M16="${GLM_M5_SHARED_M16:-0}"
 GLM_M5_SHARED_M16_VERIFY="${GLM_M5_SHARED_M16_VERIFY:-0}"
 # Host-only first-eight-proposal diagnostic, never a throughput setting.
 GLM_MTP_K5_LEDGER="${GLM_MTP_K5_LEDGER:-0}"
+# Bounded device readbacks; diagnostic only, never a throughput mode.
+GLM_MTP_HIDDEN_TRACE="${GLM_MTP_HIDDEN_TRACE-0}"
 # Target-only shared FP8 cache; validated prefill range is bounded explicitly.
 GLM_TARGET_SHARED_FP8="${GLM_TARGET_SHARED_FP8:-0}"
 GLM_TARGET_SHARED_FP8_VERIFY="${GLM_TARGET_SHARED_FP8_VERIFY:-0}"
@@ -160,12 +162,16 @@ GLM_MTP_SERIAL_PREFILL="${GLM_MTP_SERIAL_PREFILL:-0}"
 # The serial path remains an explicit correctness/debugging oracle.
 GLM_MTP_BATCHED_PREFILL="${GLM_MTP_BATCHED_PREFILL:-$SPECULATIVE}"
 
-for glm_checked_flag in GLM_MTP_REPAIR GLM_MTP_KV_REPAIR_VERIFY MTP_PREFILL_ONLY GLM_MOE_GATE_UP_M16 GLM_MOE_GATE_UP_M16_VERIFY GLM_M5_ROUTER_BN4 GLM_M5_ROUTER_BN4_VERIFY GLM_M5_SHARED_M16 GLM_M5_SHARED_M16_VERIFY GLM_MTP_K5_LEDGER GLM_TARGET_SHARED_FP8 GLM_TARGET_SHARED_FP8_VERIFY; do
+for glm_checked_flag in GLM_MTP_REPAIR GLM_MTP_KV_REPAIR_VERIFY MTP_PREFILL_ONLY GLM_MOE_GATE_UP_M16 GLM_MOE_GATE_UP_M16_VERIFY GLM_M5_ROUTER_BN4 GLM_M5_ROUTER_BN4_VERIFY GLM_M5_SHARED_M16 GLM_M5_SHARED_M16_VERIFY GLM_MTP_K5_LEDGER GLM_MTP_HIDDEN_TRACE GLM_TARGET_SHARED_FP8 GLM_TARGET_SHARED_FP8_VERIFY; do
   if [[ "${!glm_checked_flag}" != "0" && "${!glm_checked_flag}" != "1" ]]; then
     echo "ERROR: $glm_checked_flag must be 0 or 1." >&2
     exit 2
   fi
 done
+if [[ "$GLM_MTP_HIDDEN_TRACE" == "1" && "$GLM_MTP_REPAIR" != "1" ]]; then
+  echo "ERROR: GLM_MTP_HIDDEN_TRACE requires GLM_MTP_REPAIR=1." >&2
+  exit 2
+fi
 if [[ "$GLM_MTP_REPAIR" == "1" && ( "$SPECULATIVE" != "1" || "$TP_SIZE" != "2" || "$MAX_BATCH_SIZE" != "1" || "$MAX_NUM_SEQS" != "1" || "$NUM_DRAFTS" != "4" || "$MTP_GATE_FORCE" != "1" || "$MTP_SPEC_THINK" != "1" || "$MTP_SINGLE_DEPTH_ADAPT" != "0" || "$GLM_MTP_DISTRIBUTED" != "1" || "$GLM_MTP_BATCHED_PREFILL" != "1" || "$GLM_MTP_SERIAL_PREFILL" != "0" || "$MTP_PREFILL_ONLY" != "1" ) ]]; then
   echo "ERROR: GLM_MTP_REPAIR=1 requires cold C1 TP2/EP2 native MTP4, forced continuous speculation, no depth adaptation, distributed/batched primer, and MTP_PREFILL_ONLY=1." >&2
   exit 2
@@ -701,6 +707,7 @@ echo "  GLM M16 gate/up / oracle: $GLM_MOE_GATE_UP_M16 / $GLM_MOE_GATE_UP_M16_VE
 echo "  GLM M5 router BN4 / oracle: $GLM_M5_ROUTER_BN4 / $GLM_M5_ROUTER_BN4_VERIFY"
 echo "  GLM M5 shared M16 / oracle: $GLM_M5_SHARED_M16 / $GLM_M5_SHARED_M16_VERIFY"
 echo "  GLM MTP first-eight K5 ledger: $GLM_MTP_K5_LEDGER"
+echo "  GLM MTP first-eight hidden trace (diagnostic only): $GLM_MTP_HIDDEN_TRACE"
 echo "  GLM target shared FP8 cache / oracle: $GLM_TARGET_SHARED_FP8 / $GLM_TARGET_SHARED_FP8_VERIFY"
 echo "  GLM MTP one-collective vocabulary gather: $GLM_MTP_ALL_GATHER"
 echo "  GLM MTP distributed top-1 reduction: $GLM_MTP_DISTRIBUTED_ARGMAX"
@@ -802,6 +809,7 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_GLM_M5_SHARED_M16=$GLM_M5_SHARED_M16 \
   -e ATLAS_GLM_M5_SHARED_M16_VERIFY=$GLM_M5_SHARED_M16_VERIFY \
   -e ATLAS_GLM_MTP_K5_LEDGER=$GLM_MTP_K5_LEDGER \
+  -e ATLAS_GLM_MTP_HIDDEN_TRACE=$GLM_MTP_HIDDEN_TRACE \
   -e ATLAS_GLM_TARGET_SHARED_FP8=$GLM_TARGET_SHARED_FP8 \
   -e ATLAS_GLM_TARGET_SHARED_FP8_VERIFY=$GLM_TARGET_SHARED_FP8_VERIFY \
   -e ATLAS_GLM_MTP_ALL_GATHER=$GLM_MTP_ALL_GATHER \
@@ -898,6 +906,7 @@ docker run -d \
   -e ATLAS_GLM_M5_SHARED_M16="$GLM_M5_SHARED_M16" \
   -e ATLAS_GLM_M5_SHARED_M16_VERIFY="$GLM_M5_SHARED_M16_VERIFY" \
   -e ATLAS_GLM_MTP_K5_LEDGER="$GLM_MTP_K5_LEDGER" \
+  -e ATLAS_GLM_MTP_HIDDEN_TRACE="$GLM_MTP_HIDDEN_TRACE" \
   -e ATLAS_GLM_TARGET_SHARED_FP8="$GLM_TARGET_SHARED_FP8" \
   -e ATLAS_GLM_TARGET_SHARED_FP8_VERIFY="$GLM_TARGET_SHARED_FP8_VERIFY" \
   -e ATLAS_GLM_MTP_ALL_GATHER="$GLM_MTP_ALL_GATHER" \

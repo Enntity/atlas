@@ -7,6 +7,13 @@ Root alone owns native builds, deployment, node/GPU operations and commits.
 
 ## Observation and scope
 
+Root launcher follow-up: add a strict default-off `GLM_MTP_HIDDEN_TRACE` switch,
+forward it to both ranks, and reject enabling it without the existing accepted-
+pair repair profile before any external command. CPU tests evaluate only the
+launcher's pure validation prefix and separately inspect both forwarding sites;
+native container environments still require root verification. The target's
+verifier graphs may remain enabled; the actual proposer stream must be eager.
+
 The phase6 first-eight K5 ledger found later draft disagreements at matching
 position/seed while target decisions agreed for matching causal token prefixes.
 It did not establish identical target hidden inputs or identical proposer KV.
