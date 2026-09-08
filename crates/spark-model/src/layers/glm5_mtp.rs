@@ -39,6 +39,9 @@ mod repair_state;
 #[path = "glm5_mtp/repair.rs"]
 mod repair;
 
+#[path = "glm5_mtp/hidden_trace.rs"]
+pub(crate) mod hidden_trace;
+
 pub(crate) fn distributed_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("ATLAS_GLM_MTP_DISTRIBUTED").ok().as_deref() == Some("1"))
@@ -93,6 +96,7 @@ fn mtp_bf16_drafts() -> usize {
 }
 
 pub struct Glm5MtpProposerState {
+    hidden_trace: hidden_trace::HiddenTrace,
     repair: repair_state::RepairPhase,
     pub block_table: Vec<u32>,
     pub seq_len: usize,
@@ -136,6 +140,7 @@ impl Glm5MtpProposerState {
 }
 
 pub struct Glm5MtpHead {
+    hidden_trace_enabled: bool,
     module: Glm5MtpModule,
     embed_tokens: DenseWeight,
     lm_head: DenseWeight,
@@ -163,6 +168,7 @@ impl Glm5MtpHead {
         mtp_vocab_size: u32,
         max_seq_len: usize,
     ) -> Result<Self> {
+        let hidden_trace_enabled = hidden_trace::configured()?;
         let cache_shape = GlmMlaShape::new(config.kv_lora_rank, config.qk_rope_head_dim)?;
         let kv_config = KvCacheConfig {
             block_size: 16,
@@ -185,6 +191,7 @@ impl Glm5MtpHead {
             kv_cache.attach_sparse_index(index, gpu)?;
         }
         Ok(Self {
+            hidden_trace_enabled,
             module,
             embed_tokens,
             lm_head,
@@ -206,6 +213,7 @@ impl Glm5MtpHead {
 
     fn alloc_state_inner(&self, gpu: &dyn GpuBackend) -> Result<Glm5MtpProposerState> {
         Ok(Glm5MtpProposerState {
+            hidden_trace: hidden_trace::HiddenTrace::new(self.hidden_trace_enabled),
             repair: repair_state::RepairPhase::Capture,
             block_table: Vec::new(),
             seq_len: 0,
@@ -474,6 +482,15 @@ impl Glm5MtpHead {
         stream: u64,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<u32> {
+        let mut trace = state.hidden_trace.input(
+            token,
+            position,
+            draft_index,
+            target_hidden,
+            state.seq_len,
+            ctx,
+            stream,
+        )?;
         let h_out = self.forward_body_one(token, target_hidden, position, state, ctx, stream)?;
         let profile = mtp_profile_enabled();
         let mut started = profile.then(std::time::Instant::now);
@@ -492,6 +509,9 @@ impl Glm5MtpHead {
             eps,
             stream,
         )?;
+        if let Some(trace) = &mut trace {
+            trace.final_hidden(final_hidden, state.seq_len, ctx, stream)?;
+        }
         if profile {
             ctx.gpu.synchronize(stream)?;
             tracing::info!(
@@ -617,6 +637,7 @@ impl Glm5MtpHead {
             started = Some(std::time::Instant::now());
         }
         let out = ctx.buffers.scratch();
+        let mut trace_pairs = None;
         let draft = if let Some(mask) = grammar_bitmask {
             grammar_argmax(ctx.gpu, logits, vocab as usize, mask)?
         } else if local_argmax {
@@ -637,6 +658,9 @@ impl Glm5MtpHead {
             comm.all_gather(local_pair.0, out.0, 8)?;
             let mut pairs = [0u8; 16];
             ctx.gpu.copy_d2h(out, &mut pairs)?;
+            if trace.is_some() {
+                trace_pairs = Some(pairs);
+            }
             let v0 = f32::from_le_bytes(pairs[0..4].try_into().expect("rank-0 max bytes"));
             let i0 = u32::from_le_bytes(pairs[4..8].try_into().expect("rank-0 index bytes"));
             let v1 = f32::from_le_bytes(pairs[8..12].try_into().expect("rank-1 max bytes"));
@@ -656,6 +680,14 @@ impl Glm5MtpHead {
                     .expect("MTP profile timer")
                     .elapsed()
                     .as_micros()
+            );
+        }
+        if let Some(trace) = trace {
+            trace.emit(
+                draft,
+                trace_pairs,
+                self.module.eh_proj_nvfp4.is_some(),
+                draft_index >= mtp_bf16_drafts() && self.lm_head_nvfp4.is_some(),
             );
         }
         Ok(draft)
@@ -838,6 +870,7 @@ impl DraftProposer for Glm5MtpHead {
         state.seq_len = 0;
         state.repair = repair_state::RepairPhase::Capture;
         state.last_num_drafted = 0;
+        state.hidden_trace.reset();
         Ok(())
     }
 }

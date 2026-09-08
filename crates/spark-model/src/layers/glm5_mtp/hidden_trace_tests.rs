@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+use super::*;
+use crate::speculative::glm_pair_plan::{BootstrapInput, Limits, Profile};
+#[path = "hidden_trace_test_gpu.rs"]
+mod support;
+use support::{Event, fixture};
+
+#[path = "hidden_trace_boundary_tests.rs"]
+mod boundary_tests;
+#[path = "hidden_trace_request_tests.rs"]
+mod request_tests;
+
+fn sequence(head: &Glm5MtpHead, ctx: &ForwardContext, generation: u64) -> SequenceState {
+    let mut state = head.alloc_state_inner(ctx.gpu).unwrap();
+    prepared(&mut state, generation, 3);
+    let mut seq = SequenceState::host_only(0);
+    seq.tokens = vec![1, 2, 3];
+    seq.seq_len = 3;
+    seq.prompt_len = 2;
+    seq.mtp_capture_gen = generation;
+    seq.proposer_state = Some(Box::new(state));
+    seq
+}
+fn prepared(state: &mut Glm5MtpProposerState, generation: u64, position: usize) {
+    let limits = Limits::new(
+        Profile {
+            sequences: 1,
+            drafts: 4,
+            continuous: true,
+            grammar: false,
+            adaptive_depth: false,
+            catchup: false,
+            carry: false,
+            prefix_reuse: false,
+        },
+        2044,
+        2048,
+        2044,
+    )
+    .unwrap();
+    let finish = limits
+        .bootstrap(BootstrapInput {
+            generation,
+            capture_generation: generation,
+            prompt_tokens: position - 1,
+            target_position: position,
+            token_rows: position,
+            normalized_hidden_rows: position - 1,
+            cached_rows: 0,
+        })
+        .unwrap();
+    state.seq_len = finish.state().cache_rows();
+    state.repair = repair_state::RepairPhase::Proposed(
+        limits
+            .propose(finish.state(), generation, position, state.seq_len, 4)
+            .unwrap(),
+    );
+}
+
+#[test]
+fn actual_forward_one_traces_input_then_post_norm_before_vocabulary_on_both_ranks() {
+    for rank in 0..2 {
+        fixture(rank, |head, ctx, gpu, saved| {
+            let mut seq = sequence(head, ctx, 1);
+            arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
+            gpu.events.lock().clear();
+            let state = seq
+                .proposer_state
+                .as_mut()
+                .unwrap()
+                .as_any_mut()
+                .downcast_mut::<Glm5MtpProposerState>()
+                .unwrap();
+            let draft = head
+                .forward_one(3, saved, 3, 0, state, ctx, 7, None)
+                .unwrap();
+            assert_eq!(draft, 7);
+            let events = gpu.events.lock();
+            assert_eq!(
+                events.first(),
+                Some(&Event::Read(saved, ROW_BYTES, 7)),
+                "actual input hook must precede body"
+            );
+            let body = events.iter().position(|e| *e == Event::Body).unwrap();
+            let final_read = events
+                .iter()
+                .position(|e| *e == Event::Read(ctx.buffers.norm_output(), ROW_BYTES, 7))
+                .expect("actual final hook");
+            assert!(body < final_read);
+            assert!(
+                matches!(&events[final_read-1],Event::Kernel(101,p) if p[2]==ctx.buffers.norm_output())
+            );
+            assert!(
+                matches!(&events[final_read+1],Event::Kernel(102,p) if p[0]==ctx.buffers.norm_output())
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Read(..)))
+                    .count(),
+                2
+            );
+        });
+    }
+}

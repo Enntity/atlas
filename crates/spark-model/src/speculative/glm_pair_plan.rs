@@ -273,6 +273,10 @@ pub struct ProposalPlan {
 }
 
 impl ProposalPlan {
+    pub fn generation(self) -> u64 {
+        self.before.generation()
+    }
+
     pub fn position(self) -> usize {
         self.before.target_position
     }

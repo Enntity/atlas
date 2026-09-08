@@ -110,6 +110,18 @@ impl TransformerModel {
         } else {
             self.ensure_drafter_context(proposer, seq, &ctx, stream);
         }
+        crate::layers::glm5_mtp::hidden_trace::arm_prepared(
+            seq,
+            token,
+            position,
+            num_drafts,
+            self.mtp_hidden_save,
+            self.last_mtp_hidden_idx
+                .load(std::sync::atomic::Ordering::Relaxed),
+            grammar_bitmask.is_some(),
+            &ctx,
+            stream,
+        )?;
         let prop_state = seq
             .proposer_state
             .as_mut()

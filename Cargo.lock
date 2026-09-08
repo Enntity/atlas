@@ -2387,6 +2387,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha2",
  "spark-comm",
  "spark-runtime",
  "spark-storage",
