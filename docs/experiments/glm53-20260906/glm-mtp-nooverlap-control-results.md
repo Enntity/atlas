@@ -122,6 +122,34 @@ none of this run's timing qualifies the 30 C1 / 60 C4 goal.
 
 ## Frozen receipts
 
+### Separate trace-off timing probe: no promotion
+
+A subsequent fresh v23 start used the same no-overlap recipe with `TRACE=0`,
+the unchanged literal148/256 workload and one warmup plus three measured C1
+requests. Both executable hashes matched the diagnostic image; both live
+environments confirmed hidden tracing disabled. There was no build or other
+GPU workload during timing, and post-load host available memory was12,240/
+11,858MiB with zero swap use.
+
+Full-wall rates were27.446,28.182,28.181tok/s: median **28.181tok/s**, below
+the qualified v20 result of approximately28.53 and below30. No fresh confirming
+repeat or performance promotion follows this negative probe. The29.528tok/s
+session decode rate is not the full-wall acceptance metric.
+
+All measured outputs reached256 tokens with text SHA256
+`12046a6857a2c4411efb58c919331ecc16c7243ae22a1d12d9281857c0903fc2`.
+Both timing containers stopped cleanly with exit0/OOMfalse and were preserved
+as `atlas-glm53-v23-nooverlap-timing-ep0/1`. Quality/recovery results above belong
+to the preceding diagnostic run, not this separate timing process.
+
+The persistent timing prefix is `v23-nooverlap-timing-`. Result JSON SHA256:
+`86af5145a5f3f529b373cdc26befb2026fce4c4aecbdec85564640fe336123ca`;
+complete rank0/rank1 log SHA256:
+`0d77eee39c8e9bf0e06d1854f1f8763e7031d7c72171856c95e1306db8b1ca60` /
+`511bad66e1bc61831e73f8c8c48a7cd327bf6f26da61307674f8c81c96f83445`.
+
+### Diagnostic receipts
+
 All files are under `/home/abc/storage/models/atlas-campaigns/20260908/`, with
 prefix `v23-nooverlap-hidden-`. Baseline evidence and limits are in
 [the v23 post-EH report](glm-mtp-hidden-trace-v23-results.md).
