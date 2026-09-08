@@ -9,13 +9,36 @@ September8 source-audit safety update: the historical C1 images contain an
 [unordered target-prefill to eager-drafter handoff](../../../scripts/dev/glm_eager_prefill_stream_fix_plan.md)
 on the head. The producer switches to default stream while its eager consumer
 receives the caller's non-blocking stream, with no intervening dependency.
-Both nodes are stopped pending the separately tested fix and v25 validation.
+The separately tested fix `d3f989c7` now passes the bounded
+[v25 diagnostic and quality gates](glm-mtp-stream-fix-v25-results.md), with
+complete cross-rank/repeated-request equality. The native image also contains
+the new source/immediate-KV probe, so this is not isolated causal A/B proof.
 The C1 figures below remain historical benchmark evidence, not approval to
-restart that known unordered path. Its role in the KV divergence is not yet
-proven by a corrected native run. The separate nonspeculative C4 measurement
-does not exercise this eager-drafter handoff.
+restart that known unordered path. v25 trace-OFF timing is now confirmed below.
+An additional idle-command duration/health-latch defect is under repair;
+the clean automated gate does not validate idle serving. The separate
+nonspeculative C4 measurement does not exercise the eager-drafter handoff.
 
-## Last qualified C1 profile — September8
+## Latest bounded C1 measurement — v25, September8
+
+Image `atlas-glm53-flash:kernel-20260908-v25`, Rust `d3f989c7`, unchanged enabled
+CUDA `189db87e`, executable SHA256 on both nodes:
+`6166a51d36256860bc176e02debdbba4f689ba9181333ba050daafac5364f51e`.
+Matched148/256 full-wall medians are28.632 initially and28.726 after a fresh
+restart. All caps, short answers,1984-token needle, cancellation/recovery and
+clean shutdown pass. These are below30 C1; C4 is unchanged. The approximately
+30.1 decode-only rates must not replace full-wall results.
+
+The frozen head recipe is `phase7/run-v25-c1.sh`, requiring explicit
+`CACHE=1 VERIFY=0 TRACE=0`. It retains the v20 C1 safeguards/settings below,
+including one active request, context2044, prefill1024,114GiB and4096MiB guard.
+It is a cold bounded measurement arm, not general multi-turn, long-context or
+idle-service deployment approval. Do not restart historical C1 images that
+predate the stream repair. Both measured v25 services are stopped and preserved;
+root continues source work. The full [v25 result](glm-mtp-stream-fix-v25-results.md)
+records the retained failed idle-health attempts as well as clean gates.
+
+## Historical C1 comparison — v20, September8
 
 Image `atlas-glm53-flash:kernel-20260908-v20`, source `7bfa3bae`, production
 CUDA `189db87e`, executable SHA256 on both nodes:
@@ -34,8 +57,8 @@ See [phase7 results](phase7-results.md) for exact flags, limitations and receipt
 The exact preserved head recipe is
 `/home/mangokid/atlas-glm53-deploy-20260906/phase7/run-v20-c1.sh`, requiring
 explicit `CACHE=1 VERIFY=0` after both standard-name containers are stopped
-and preserved. Persistent archived receipts include that recipe. Newer hidden-
-trace images are diagnostic builds, not performance promotions.
+and preserved. Persistent archived receipts include that historical recipe;
+do not use it to bypass the stream-fix safety boundary above.
 
 ### Latest experimental status — not a replacement profile
 

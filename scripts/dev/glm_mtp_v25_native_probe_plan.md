@@ -21,7 +21,8 @@ serving caller and must not cause new runtime kernel lookups.
 Verify both nodes idle before any build/package operation. Package the resulting
 executable over v24 in bounded, executable-only image contexts; record complete
 Rust commit, CUDA revision, binary SHA256 and both inside-image hashes. Retain
-v20 as qualified rollback and v24 as the directly preceding diagnostic.
+v20 as a historical timing artifact, not a safe C1 restart recommendation after
+the stream audit, and v24 as the directly preceding diagnostic.
 
 Use the v24 overlap-on recipe with only image changed to v25. The binary also
 contains the separately committed stream fix; this is not a probe-only A/B.
@@ -78,3 +79,25 @@ receipts on controller and head. Select any subsequent fix or discriminator
 from the actual observations, with its own TDD and bounded execution plan.
 Continue resident B-tile reader integration independently on the controller;
 do not mix its activation or arithmetic with this diagnostic.
+
+## Execution addendum: idle receive health latch
+
+The initial v25 diagnostic has complete equality but its first idle command
+receive lasted376.9s and set the worker's communicator-health latch. A fresh
+six-request window also agrees completely, with no warning in that window,
+but manual gaps before later quality requests caused50.5s/32.9s idle warnings.
+Both full receipts remain preserved and are not clean whole-run health passes.
+No timeout is relaxed. Source audit identifies ordinary worker command waiting
+inside the elapsed broadcast timer; a separate explicit idle-receive fix is
+being planned, without exempting timed data/payload collectives.
+
+Root's fixed campaign runner `run-v25-gated-native.sh` automates readiness,
+unchanged requests, complete-window log freeze, quality, cancellation, recovery,
+and graceful stop. Run a third diagnostic under tag `v25-gated-hidden`; require
+the same strict384-record/equality analysis and no health errors in complete
+post-stop logs. Only then run separate trace-OFF `v25-timing-initial` and fresh
+`v25-timing-repeat`, each148/256, one warmup plus three measured runs with all
+outputs capped, plus the same health/quality sequence. Automated short idle
+gaps are a validation control, not a repair or endorsement of idle serving.
+All use the exact same frozen v25 executable and safety limits; no build or
+standalone GPU workload overlaps. Preserve every attempt, not just clean ones.

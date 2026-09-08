@@ -2,9 +2,10 @@
 
 The acceptance target remains a reproducible full-wall median of at least30
 tok/s at C1 or60 aggregate tok/s at C4 on the unchanged LRU148/256 fixture,
-one warmup plus three measured waves and a confirming repeat. Latest qualified
-C1 medians are28.545 initially and28.529 on a fresh v20 restart; qualified C4
+one warmup plus three measured waves and a confirming repeat. Latest bounded
+C1 medians are28.632 initially and28.726 on a fresh v25 restart; qualified C4
 remains47.319 on its separate profile. Neither establishes the target. The
+preceding v20 medians28.545/28.529 are historical comparisons. The
 earlier27.947/25.161 C1 receipts below are historical, not current best results.
 Do not substitute post-first-token rates or discard low-acceptance
 samples. The four strict answer checks are a smoke gate, not comprehensive
@@ -23,9 +24,15 @@ A subsequent source audit found a reachable unordered target-prefill/eager-
 drafter handoff on the head, already present in v24. The
 [bounded stream fix plan](../../../scripts/dev/glm_eager_prefill_stream_fix_plan.md)
 records the exact producer/consumer mismatch and real-entry regression tests.
-Both nodes remain stopped until that fix passes CPU review and the revised
-v25 diagnostic/health gates. Existing28.53 C1 rates are retained historical
-measurements, not evidence that this handoff is safe or a speedup prediction.
+The reviewed fix is now committed `d3f989c7` with917 passing model CPU tests.
+The [v25 native result](glm-mtp-stream-fix-v25-results.md) has complete sampled
+cross-rank and repeated-request agreement; its automated full quality/health
+gate passes. Two earlier attempts retain idle-command health errors explicitly;
+that separate infrastructure defect remains under repair. Trace-OFF initial
+and fresh-repeat medians28.632/28.726 pass bounded quality/shutdown gates;
+the small historical difference is not causal significance or30 C1.
+Existing28.53 C1 rates are retained historical measurements, not
+evidence that the old handoff is safe or a speedup prediction.
 The checked B-tile family is now independently approved and committedad367a70;
 its897-test CPU gate does not activate the resident layout.
 
