@@ -4,7 +4,11 @@ Root-owned execution plan, 2026-09-08. Implementation must first complete the
 approved prompt-source plan, behavioral RED/GREEN, full CPU suite, non-test
 check, strict v4 analyzer and exact v22/v23/v24 legacy replay, independent
 review, source freeze and commit. Never overlay the active reader-integration
-worktree. This plan does not authorize a numerical fix or performance promotion.
+worktree. Before native execution, also complete the separately reviewed
+[eager prefill stream fix](glm_eager_prefill_stream_fix_plan.md). Source audit
+found the real head target/primer stream handoff unordered; do not deploy that
+known unsafe handoff merely to collect another reproduction. Record both
+independent commits. No performance promotion is authorized by this probe.
 
 ## Frozen build and unchanged serving profile
 
@@ -19,7 +23,9 @@ executable over v24 in bounded, executable-only image contexts; record complete
 Rust commit, CUDA revision, binary SHA256 and both inside-image hashes. Retain
 v20 as qualified rollback and v24 as the directly preceding diagnostic.
 
-Use the v24 overlap-on recipe with only image changed to v25. Explicit cache1,
+Use the v24 overlap-on recipe with only image changed to v25. The binary also
+contains the separately committed stream fix; this is not a probe-only A/B.
+Explicit cache1,
 verify0, trace1; C1, TP2/EP2, four drafts, accepted-pair repair, BF16 KV, existing
 target verification graphs and numerical policy. Keep context2044, prefill1024,
 114GiB memory limits, 4096MiB guard, KV overcommit0 and swapspace0. Refuse existing
