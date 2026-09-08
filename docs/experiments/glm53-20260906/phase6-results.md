@@ -13,8 +13,10 @@ and [phase7 results](phase7-results.md): qualified C1 full-wall medians are
 promotions; the separate no-overlap trace-OFF C1 median28.181 also misses the
 target. [Promoted B-tile CUDA](glm-btile-cuda-promotion-results.md) passes20
 standalone executions/ten zero-error memchecks, but is not serving-enabled.
-The committed2da770dc first-KV diagnostic is awaiting root's v24 native build
-and qualification; checked kernel-family review remains open.
+The [2da770dc v24 first-KV diagnostic](glm-mtp-first-kv-v24-results.md) passed
+bounded native/health gates and found differing existing prefixes with equal
+newly appended rows. It is not a performance promotion; checked kernel-family
+review remains open.
 
 ## Normalized MTP handoff
 

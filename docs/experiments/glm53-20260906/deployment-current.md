@@ -42,10 +42,12 @@ zero-error memchecks. This is compiled-ABI/bounded-correctness evidence, not
 serving activation or a throughput gain. The checked Rust kernel family is
 still under review and is not approved for serving.
 
-The first-private-KV diagnostic source2da770dc is committed; root's v24 native
-build is in progress at this status update, using unchanged CUDA189db87e.
-It is not yet a qualified live image. Keep its trace OFF in throughput profiles;
-do not replace v20 or the separate C4 profile below based on diagnostic builds.
+The [v24 first-private-KV diagnostic](glm-mtp-first-kv-v24-results.md), source
+2da770dc with unchanged CUDA189db87e, passed its bounded native/health gates.
+All six requests had differing existing prefixes across ranks but equal newly
+appended rows; the upstream cause remains under investigation. Both services
+were stopped cleanly afterward. This is not a throughput-qualified replacement
+for v20 or the separate C4 profile below; tracing remains OFF for timing.
 
 ## Last qualified C4 profile — September7
 

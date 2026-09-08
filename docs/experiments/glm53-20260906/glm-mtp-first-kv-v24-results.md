@@ -5,12 +5,20 @@ hashes across ranks **before the first proposer body executes**. The input and
 post-EH rows agree, and the newly appended K/V row agrees afterward. This
 localizes an observed difference upstream of the current body; it does not
 identify which prefix producer differs or prove a KV corruption/reset bug.
+Status: CPU-reviewed and bounded native diagnostic/health gates passed;
+**not a serving performance promotion**.
 
 ## Executable, profile and complete-log validation
 
 Diagnostic source `2da770dc`, unchanged CUDA `189db87e`, image
 `atlas-glm53-flash:kernel-20260908-v24`; root verified both executables as SHA256
 `818d1ad78b2f0cfcffff354dd045c2437572bed4f2860d5bb5fdf99b2d515efb`.
+The root-owned offline Rust build used the bounded8GiB/two-CPU builder,
+finished in2m11s and exited0/OOMfalse; no model or standalone GPU work overlapped
+build/packaging, and no other GPU workload overlapped diagnostic serving.
+The retained build log contains existing closure warnings; success is not a
+warning-free-build claim. This executable does not include the separately
+promoted B-tile CUDA or the unapproved checked-family worktree.
 The actual profile is C1 TP2/EP2, four drafts with accepted-pair repair,
 context2044, configured prefill1024, BF16 KV, target shared cache ON/VERIFY OFF,
 target verification graphs ON and shared overlap ON. This is not the earlier
@@ -123,7 +131,8 @@ All five measured client outputs reached64 tokens with completion text SHA256
 Four answer checks and the1,984-token needle case passed in the subsequent
 quality receipts. A deliberate two-second cancellation returned curl28 after
 8,642 response bytes; four subsequent recovery answer checks passed. Both
-containers then stopped with exit0/OOMfalse. Those separate root-owned health
+containers then stopped with exit0/OOMfalse and were preserved as
+`atlas-glm53-v24-hidden-clean-ep0/1`. Those separate root-owned health
 receipts do not alter the frozen six-request trace window or establish broad
 model-quality certification.
 All trace timings are diagnostic and cannot qualify30 C1/60 C4. No numerical
@@ -132,6 +141,7 @@ fix or performance promotion is claimed by these observations.
 ## Persistent evidence
 
 Directory: `/home/abc/storage/models/atlas-campaigns/20260908/`.
+Build receipts are `v24-native-build.log` and `v24-native-build-identity.log`.
 The following suffixes use prefix `v24-hidden-`:
 
 | Suffix | Bytes | SHA256 |

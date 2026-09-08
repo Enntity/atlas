@@ -14,8 +14,10 @@ See [deployment-current.md](deployment-current.md) for profile safeguards and
 rollback boundaries. The latest [v23 no-overlap control](glm-mtp-nooverlap-control-results.md)
 changes the diagnostic divergence distribution without curing it; its separate
 trace-OFF full-wall median28.181 is a negative timing result, not a promotion.
-The committed first-KV probe2da770dc is awaiting root's v24 native build and
-qualification; no new serving image or checked B-tile family is approved here.
+The [first-KV probe2da770dc](glm-mtp-first-kv-v24-results.md) passed root's v24
+native/health gates and found a difference in the existing private prefix,
+before the current body. No throughput promotion or checked B-tile serving
+activation is approved here.
 
 ## Recovery and artifact identity
 
