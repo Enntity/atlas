@@ -191,3 +191,63 @@ Native executable SHA256 values:
 
 Raw receipts: persistent campaign `btile-m64-full/native-gates.log` plus
 the corresponding CPU bounds/fixture logs. No timing claim is made here.
+
+### Padded-arena and native-source follow-up gates
+
+The1088-row extension `ba37e742` and native-source byte repack `6246882b` now
+pass all eight native fixture executions: ordinary plus Compute Sanitizer for
+both compiler FMA policies, for each fixture. Four sanitizer summaries report
+zero errors; the2GiB/two-core standalone container exits0/OOMKilled=false.
+Both model services and all builders/packaging are stopped during GPU work.
+
+The reader checks27 cases with all12 graph/ABI/scale/gather variants and
+57,211,784 explicit guarded device bytes, including1025/1028/1087/1088 rows.
+The native-source fixture checks six complementary-poison transactions per
+execution: every packed/scale byte against independent native-to-T-to-tile and
+direct references, inverse/bijection, scratch reuse, immutable references,
+owner/scalar stability and guards. Explicit device13,632,768 bytes; host tensor
+payload18,415,616 bytes. This does not repack any model weights.
+
+Raw `btile-arena-repack-native-{build,gates}.log` records source-slice identity,
+executable checksums and completion. The v20 serving receipts and restart
+recipes are archived under the head's persistent `phase7/receipts-20260908`;
+`phase7/v20-receipt-manifest.sha256` verifies the v20 subset.
+
+## Original-T direct-register M16: correctness passes, no promotion
+
+Standalone source `1f07c65e` removes the intermediate shared B transpose while
+retaining original transposed resident weights. Native C4/K5 fixtures pass
+ordinary and Compute Sanitizer execution under both compiler FMA policies:
+eight complete passes, four zero-error summaries, exit0/OOMKilled=false.
+Current and candidate kernels both use56 registers with zero spills; static
+shared memory drops18,112 to11,968 bytes. Device fixture peaks are38,566,408
+and38,766,376 bytes. These are standalone gates, not resident-model oracles.
+
+Three clean paired C4/K5 timing invocations complete all360 timing rows and
+post-timing numerical/input/guard checks. Across eight active cases, geometric
+mean candidate/current-M16 latency ratios are0.99468 launch-only /0.99347
+builder-inclusive at C4, and0.99715 /0.98984 at K5. The small gains are mixed:
+C4 population1 launch median regresses4.09%; K5 boundaries regress on all
+three launch-only repeats. Empty and remote-only cases are retained in the
+raw record, not counted as active-weight speedups. No production promotion.
+
+Raw receipts: `m16-direct-register/native-{build,gates,timing}.log`. Both model
+services and all native builders/packaging were stopped during these runs.
+
+## Bounded hidden trace: first native gate rejected
+
+Diagnostic source `5bc9a6ef`, launcher `a85b1a7b`, and v21 executable
+`48f0afc568d89b197a478846390817e2a8e2ee2d19bb787a243af07e6823f6fb`
+were packaged and verified on both nodes. Actual container environments
+confirm hidden trace and K5 ledger enabled on both ranks. The cache-ON/.91
+profile loaded with over11GiB host MemAvailable per node.
+
+The first148/64 request fails the diagnostic's exact-profile guard on both
+ranks before any hidden trace record. The worker exits its command loop;
+root stops both services gracefully, exit0/OOMKilled=false, preserving
+`atlas-glm53-v21-hidden-rejected-ep0/1`. The benchmark exits1 and supplies no
+valid capped comparison. Raw `v21-hidden-rejected-rank0/1.log`, container
+environment, memory and stop receipts are retained. The no-pool LoRA route
+uses inert `Fold` in production while the diagnostic fixture assumes `Skip`;
+this mismatch is under investigation, not permission to relax adapter safety.
+The proven v20 image and measured28.53 full-wall profile remain unchanged.
