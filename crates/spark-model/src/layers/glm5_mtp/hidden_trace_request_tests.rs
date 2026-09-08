@@ -50,11 +50,12 @@ fn real_sequence_arm_bounds_all_attempts_and_resets_reused_state_only_for_new_re
                         }
                     })
                     .collect();
-                assert_eq!(reads.len(), if attempt <= 8 { 8 } else { 0 });
+                assert_eq!(reads.len(), if attempt <= 8 { 9 } else { 0 });
                 if attempt <= 8 {
                     assert_eq!(reads[0], (saved, ROW_BYTES, 7));
+                    assert_eq!(reads[1], (ctx.buffers.hidden_states(), ROW_BYTES, 7));
                     assert!(
-                        reads[1..]
+                        reads[2..]
                             .iter()
                             .all(|v| *v == (ctx.buffers.norm_output(), ROW_BYTES, 7))
                     );

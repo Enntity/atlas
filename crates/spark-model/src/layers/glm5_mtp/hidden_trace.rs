@@ -169,6 +169,7 @@ impl HiddenTrace {
             cache_before: cache_rows,
             cache_after: 0,
             input: [0; 32],
+            post_eh: None,
             final_hidden: [0; 32],
         };
         record.input = snapshot(ctx.gpu, ptr, ctx.graph_capture, stream)?;
@@ -184,9 +185,24 @@ pub(super) struct StepTrace {
     cache_before: usize,
     cache_after: usize,
     input: [u8; 32],
+    post_eh: Option<[u8; 32]>,
     final_hidden: [u8; 32],
 }
 impl StepTrace {
+    pub fn post_eh(&mut self, ptr: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        if self.step != 0 {
+            return Ok(());
+        }
+        ensure!(
+            self.post_eh.is_none()
+                && ptr == ctx.buffers.hidden_states()
+                && ctx.buffers.sizes().hidden_states >= ROW_BYTES
+                && ctx.config.hidden_size == 4096,
+            "GLM hidden trace post-EH owner/capacity/duplicate"
+        );
+        self.post_eh = Some(snapshot(ctx.gpu, ptr, ctx.graph_capture, stream)?);
+        Ok(())
+    }
     pub fn final_hidden(
         &mut self,
         ptr: DevicePtr,
@@ -198,8 +214,9 @@ impl StepTrace {
             ptr == ctx.buffers.norm_output()
                 && ctx.buffers.sizes().norm_output >= ROW_BYTES
                 && ctx.config.hidden_size == 4096
+                && (self.step != 0 || self.post_eh.is_some())
                 && self.cache_before.checked_add(1) == Some(cache_rows),
-            "GLM hidden trace final owner/capacity/cursor"
+            "GLM hidden trace final owner/capacity/cursor/post-EH"
         );
         self.final_hidden = snapshot(ctx.gpu, ptr, ctx.graph_capture, stream)?;
         self.cache_after = cache_rows;
@@ -210,7 +227,17 @@ impl StepTrace {
             attempt=self.ordinal, position=self.request.position, seed=self.request.seed, hidden_row=self.request.hidden_row,
             step=self.step, input_token=self.token, self.cache_before, self.cache_after, draft, eh_nvfp4, head_nvfp4,
             input_sha256=%Hex(&self.input), final_sha256=%Hex(&self.final_hidden), argmax_pair_bytes=?pairs,
+            trace_version=2u8, post_eh_sha256=%OptionalHex(self.post_eh.as_ref()),
             "GLM MTP HIDDEN_TRACE");
+    }
+}
+struct OptionalHex<'a>(Option<&'a [u8; 32]>);
+impl std::fmt::Display for OptionalHex<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(hash) => Hex(hash).fmt(f),
+            None => f.write_str("None"),
+        }
     }
 }
 struct Hex<'a>(&'a [u8; 32]);

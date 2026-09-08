@@ -34,7 +34,7 @@ fn actual_body_and_final_copy_failures_after_input_spend_attempt() {
                         .iter()
                         .filter(|e| matches!(e, Event::Read(..)))
                         .count(),
-                    if body_failure { 1 } else { 2 }
+                    if body_failure { 2 } else { 3 }
                 );
                 if !body_failure {
                     assert_eq!(
@@ -132,6 +132,7 @@ fn final_owner_and_cursor_reject_before_copy() {
             .input(3, 3, 0, saved, state.seq_len, ctx, 7)
             .unwrap()
             .unwrap();
+        record.post_eh(ctx.buffers.hidden_states(), ctx, 7).unwrap();
         gpu.events.lock().clear();
         assert!(
             record

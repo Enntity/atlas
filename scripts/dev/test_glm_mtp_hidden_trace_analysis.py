@@ -44,6 +44,69 @@ def rows(rank, generation=1, attempts=8):
 
 
 class TraceAnalysisTests(unittest.TestCase):
+    def test_version2_post_eh_boundary_and_legacy_availability(self):
+        records = [rows(0, 1), rows(1, 2)]
+        for items in records:
+            for item in items:
+                item.update(trace_version=2, post_eh_sha256="a" * 64 if item["step"] == 0 else None)
+        report = self.run_records(records)
+        steps = report["requests"]["A"]["cross_rank"]
+        self.assertTrue(steps[0]["post_eh_equal"])
+        self.assertIsNone(steps[1]["post_eh_equal"])
+        left = parse_line(wire(records[0][0]))
+        right = {**left, "post_eh_sha256": "b" * 64}
+        self.assertEqual(compare("A", left, "B", right)["classification"], "post_eh_difference")
+        legacy = parse_line(wire(row()))
+        result = compare("A", left, "B", legacy)
+        self.assertIsNone(result["post_eh_equal"])
+        self.assertEqual(result["post_eh_availability"], [True, False])
+        self.assertEqual(result["classification"], "post_eh_availability_difference")
+
+    def test_version2_strict_schema_step_and_request_consistency(self):
+        valid = row(trace_version=2, post_eh_sha256="a" * 64)
+        for changes in ({"trace_version": 3}, {"trace_version": 1},
+                        {"post_eh_sha256": None}, {"post_eh_sha256": "A" * 64},
+                        {"step": 1}, {"post_eh_sha256": "0"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                parse_line(wire({**valid, **changes}))
+        for missing in ("trace_version", "post_eh_sha256"):
+            broken = {**valid}
+            del broken[missing]
+            with self.assertRaises(ValueError):
+                parse_line(wire(broken))
+        for fault in ("within_rank", "across_ranks"):
+            records = [rows(0, 1), rows(1, 2)]
+            for item in records[0][:1 if fault == "within_rank" else 32]:
+                item.update(trace_version=2, post_eh_sha256="a" * 64 if item["step"] == 0 else None)
+            with self.subTest(fault=fault), self.assertRaisesRegex(ValueError, "schema"):
+                self.run_records(records)
+
+    def test_explicit_legacy_and_extended_requests_keep_missing_boundary_evidence(self):
+        records = [[], []]
+        requests = []
+        for generation, label in ((1, "legacy"), (2, "extended")):
+            requests.append(dict(id=label, expected_attempts=8, ranks=[
+                dict(rank=rank, path=f"rank{rank}.log", slot=0, generation=generation)
+                for rank in range(2)]))
+            for rank in range(2):
+                items = rows(rank, generation)
+                if generation == 2:
+                    for item in items:
+                        item.update(trace_version=2, post_eh_sha256="a" * 64 if item["step"] == 0 else None)
+                records[rank].extend(items)
+        report = self.run_records(records, requests, [["legacy", "extended"]])
+        steps = report["comparisons"][0]["ranks"]["0"]["steps"]
+        self.assertEqual(steps[0]["classification"], "post_eh_availability_difference")
+        self.assertEqual(steps[0]["trace_versions"], [1, 2])
+        self.assertEqual(steps[1]["classification"], "observed_agreement")
+        self.assertIsNone(steps[1]["post_eh_equal"])
+        left = parse_line(wire(row()))
+        right = parse_line(wire(row(trace_version=2, post_eh_sha256="a" * 64, final_sha256="b" * 64)))
+        result = compare("legacy", left, "extended", right)
+        self.assertEqual(result["classification"], "final_hidden_difference")
+        self.assertEqual(result["post_eh_availability"], [False, True])
+        self.assertIsNone(result["post_eh_equal"])
+
     def run_records(self, records, requests=None, comparisons=None):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

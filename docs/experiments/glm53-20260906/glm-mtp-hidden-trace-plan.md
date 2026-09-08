@@ -220,3 +220,163 @@ Final correction receipts under `atlas-campaigns/20260908/`:
 The native v21 failure remains preserved in `v21-hidden-rejected-rank0.log` and
 `v21-hidden-rejected-rank1.log`. This CPU-corrected source has not yet passed a
 new native diagnostic request; root must rebuild and verify that separately.
+
+## Post-EH boundary extension (root-approved; CPU implementation complete)
+
+The subsequent v22 native diagnostic succeeded: six requests, 192 complete
+records per rank. Exact counts and earliest keys are preserved separately in
+`glm-mtp-hidden-trace-v22-results.md`. At every observed step0, identical input
+token/position and raw input hash can lead to different final hidden hashes.
+Rank0 varies across repeated requests; rank1 is substantially stable, with the
+documented generation3 downstream exception. This establishes a boundary to
+investigate, not an explanation or a speed result.
+
+### Read-only audit negatives and remaining uncertainty
+
+- `weight_loader/glm5/mtp.rs` constructs a full TP1/EP1 body. Although
+  `forward_body_one` passes the target config in its runtime context,
+  `load_mla_layer(..., force_dimension_overrides=true)` installs full head
+  overrides. `attention_forward` passes those dimensions through Q expansion,
+  Q absorption, paged attention, V extraction and O projection. The simple
+  partly-unwritten-full-head hypothesis is not supported by this path.
+- Body attention TP reduction and MoE EP reduction require `comm=Some`; the
+  draft body supplies None. Ordinary single-row MoE uses the supplied stream,
+  not the prefill shared-expert auxiliary-stream path. No concurrent scratch
+  ownership violation was identified; this is not a native race proof.
+- The body explicitly zeros its 8192-byte residual row. Module final RMSNorm
+  uses hidden4096 and distinct arena allocations. The deployed 1088-row arena
+  exceeds these single-row full-head scratch demands; this does not establish
+  eligibility of a differently sized future arena.
+- Head and worker use common repair/proposer code. Prompt capture normalizes
+  every target row into generation-owned storage. Bootstrap/accepted repair
+  write private KV through batched projections, whereas a draft uses GEMV.
+  The v22 current-input hash does not cover those prompt rows or private KV;
+  numerical parity against a candidate KV writer does not establish equal
+  canonical prefixes across requests or ranks.
+- Semantic-index maintenance executes, but sparse selection returns None at
+  these positions below2048. That semantic history is not selected by the
+  observed dense-attention path. No reset or broad config change is justified.
+
+### Exact production hook and ownership
+
+Extend only the already enabled hidden trace, without a new flag or ordinary
+serving behavior change. Pass the existing optional `StepTrace` from
+`forward_one` into `forward_body_one`; the legacy prompt-body caller passes
+None. Invoke the new hook immediately after the EH projection finishes being
+queued into `ctx.buffers.hidden_states()` and before private-cache allocation,
+metadata upload, residual initialization or body decode. This is the complete
+post-EH BF16[4096] row, not a sample or the later normalized row.
+
+The hook returns immediately unless the existing record represents step0.
+Thus only step0 of each already admitted first-eight proposal attempts per
+actual request gets one additional 8192-byte `copy_d2h_on_stream`, on the same
+proposal stream, followed by raw SHA256. No new request counters, ownership
+readers, allocations on device, GPU kernels, collectives or scheduler hooks.
+Off/exhausted records remain None; later steps perform no added capture query,
+readback or digest. An existing admitted attempt is already spent before the
+input copy; post-EH copy failure propagates and cannot restore its budget.
+
+Validate exact hidden width, pointer equality to the live hidden_states owner,
+capacity at least8192, nonnull/aligned/address-safe span, eager context and
+actual stream before the new copy. Reject duplicate post-EH capture. Require a
+successful step0 post-EH capture before final capture/emission, so a missing
+hook cannot produce an apparently complete extended record. Existing profile,
+generation, step ordering and no-adapter/history checks remain unchanged.
+
+Readback totals become24576 bytes for step0,16384 for each later step,
+73728 bytes/attempt and589824 bytes/request/rank. Each individual step stays
+strictly below64KiB, using the existing bounded snapshot workspace. A full
+148-row private K+V prefix would instead require303104 bytes; sampling fewer
+rows would not prove equal KV. This is why the complete post-EH row is the
+smallest next discriminating boundary. Equal post-EH hashes still do not prove
+equal weights, private KV, intermediate arithmetic or freedom from races.
+
+### Wire schema and backward-compatible analyzer
+
+Keep one existing trace record per completed step and its original identity,
+cursor, hashes, token and pair fields. New producers append `trace_version=2`
+and `post_eh_sha256`: exactly64 lowercase hex characters on step0 and literal
+`None` on steps1..3. Both fields are mandatory on every version2 record.
+Old records with neither field remain explicitly recognized as legacy version1;
+one missing field, unknown version, invalid digest or an unexpected later-step
+digest rejects. No separate event stream or record-count expansion.
+
+Update the strict Python analyzer and tests together. Require a consistent
+schema within each selected request/rank and across its two rank selectors;
+allow explicitly declared legacy and extended requests in the same manifest.
+Keep complete-file ownership/count validation unchanged. Comparisons retain
+version, digest availability and both digest values; `post_eh_equal` is null
+unless both digests exist, never fabricated true for absent evidence.
+At matching conditioning tuples, differing available post-EH digests identify
+`post_eh_difference` before the existing final-hidden classification. Equal
+post-EH and different final hashes localize only to the remaining body/private-
+state/final-norm region. Legacy/extended comparisons explicitly report missing
+post-EH evidence; they may report an observed downstream difference but must
+not claim post-EH agreement. Existing v22 logs must still parse and retain all
+384 rows and prior raw comparison counts.
+
+### TDD, review and controlled handoff
+
+1. After root reads/approves this addendum, coordinate exclusive controller
+   Cargo with the other author. No node/build/native/GPU work by this agent.
+2. Add an actual forward_one/propose regression first: both ranks must read
+   input, then exact post-EH hidden_states, then final norm_output, with EH
+   kernel preceding the new copy and the body following it. Record a behavior
+   RED against the old hooks, not a compile failure. The recording fixture
+   gives EH a distinct sentinel to prove the hashed bytes belong to this
+   boundary, including a last-byte mutation.
+3. Preserve off/on identical tokens and non-diagnostic backend event order.
+   Check four-step proposals add exactly one8192-byte read; first8 attempts,
+   failure-spent budget, reused generation reset, off/exhausted no extra
+   backend operations, later-step inertness, duplicate/missing hook refusal,
+   owner/capacity/capture refusal and post-EH copy failure before body execution.
+   Existing input/body/final failure tests retain their meaning with updated
+   expected read counts, not weakened assertions.
+4. Python TDD covers legacy success, extended success, malformed/missing/version
+   mismatch, step0-only availability, missing-evidence reporting and earliest
+   post-EH classification. Reanalyze the frozen complete v22 files and compare
+   all prior integrity and raw-difference counts; do not overwrite old receipts.
+5. Focused/full controller CPU tests, formatting, file-size/SPDX and Python
+   suite; preserve behavioral RED/GREEN receipts under the persistent20260908
+   campaign. Independent source review and frozen hashes before root commit.
+   CPU fixtures establish hook/ownership behavior, not CUDA numerical parity.
+6. Root alone decides and runs a clean native diagnostic after approval, checks
+   schema and32 rows/request/rank plus8 post-EH hashes, then disables tracing
+   for performance work. No broad reset fix or additional KV/body probe is
+   included in this slice.
+
+Implementation receipts in `atlas-campaigns/20260908/`:
+
+- `hidden-trace-post-eh-hook-red.log`: actual forward_one test fails because
+  the full8192-byte post-EH read is absent, before production changes.
+  `hidden-trace-post-eh-focused-green.log`:16/16 focused tests pass afterward.
+- `hidden-trace-post-eh-analysis-red.log`: old strict parser rejects version2
+  valid records; `hidden-trace-post-eh-analysis-green.log`:15/15 pass with the
+  extension. Final `hidden-trace-post-eh-analysis-final.log`:16/16, including
+  explicitly declared legacy/extended requests and missing-boundary evidence.
+- `hidden-trace-post-eh-full-green.log`:859/859 complete model CPU tests pass,
+  including three new tests for actual projection sentinel/last byte on both
+  ranks, post-EH copy failure consuming all8 attempts then remaining inert,
+  new request reset, missing/duplicate/owner/capacity/capture negatives and
+  later-step zero added backend operations. The intermediate expanded-test
+  receipt contains a test-only borrowed-buffer lifetime compile error; it is
+  preserved as such, not called a behavioral RED or passing receipt.
+  `hidden-trace-post-eh-full-final.log` repeats859/859 after ensuring the
+  existing final-owner/cursor negatives first establish valid post-EH proof;
+  those tests therefore still independently exercise their original guards.
+- `v22-hidden-post-eh-analyzer-regression.json` is a fresh analysis of the
+  same lossless logs using the original all6-selector manifest. The companion
+  `.log` verifies complete JSON equality with the old evidence after removing
+  only the four new version/availability/digest comparison fields:384 rows,
+  every original count, key, classification, hash and metadata value preserved.
+  The original v22 evidence and native logs were not overwritten.
+- `hidden-trace-post-eh-fmt.log`: scoped rustfmt check passes; only owned files
+  were formatted. `hidden-trace-post-eh-license.log` records the full header
+  scan:2413 valid,0 invalid,14 ignored. New trace Rust test file is162 lines;
+  trace module372, support301.
+  Final scoped `hidden-trace-post-eh-fmt-final.log` and owned-file diff check pass.
+
+Root independently reviewed the production/analyzer diff and hook/failure
+tests without a source blocker. Final hash handoff precedes commit and any
+native build. No new native measurement or explanation of the divergence is
+claimed by these CPU tests.

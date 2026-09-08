@@ -231,6 +231,7 @@ impl Glm5MtpHead {
         state: &mut Glm5MtpProposerState,
         ctx: &ForwardContext,
         stream: u64,
+        trace: Option<&mut hidden_trace::StepTrace>,
     ) -> Result<DevicePtr> {
         let h = ctx.config.hidden_size;
         let h_u32 = h as u32;
@@ -371,6 +372,9 @@ impl Glm5MtpHead {
                 stream,
             )?;
         }
+        if let Some(trace) = trace {
+            trace.post_eh(h_in, ctx, stream)?;
+        }
         if profile {
             ctx.gpu.synchronize(stream)?;
             tracing::info!(
@@ -491,7 +495,15 @@ impl Glm5MtpHead {
             ctx,
             stream,
         )?;
-        let h_out = self.forward_body_one(token, target_hidden, position, state, ctx, stream)?;
+        let h_out = self.forward_body_one(
+            token,
+            target_hidden,
+            position,
+            state,
+            ctx,
+            stream,
+            trace.as_mut(),
+        )?;
         let profile = mtp_profile_enabled();
         let mut started = profile.then(std::time::Instant::now);
         let h_u32 = ctx.config.hidden_size as u32;
@@ -777,6 +789,7 @@ impl DraftProposer for Glm5MtpHead {
                 state,
                 ctx,
                 stream,
+                None,
             )?;
         }
         ctx.gpu.synchronize(stream)?;

@@ -4,7 +4,7 @@ use super::*;
 use spark_runtime::gpu::{KernelArg, mock::MockGpuBackend};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -20,6 +20,9 @@ pub(super) struct TraceGpu {
     pub capturing: AtomicBool,
     pub fail_read: AtomicBool,
     pub fail_final_read: AtomicBool,
+    pub fail_post_eh_read: AtomicBool,
+    pub eh_last_byte: AtomicU8,
+    pub read_hashes: Mutex<Vec<[u8; 32]>>,
     pub fail_body: Arc<AtomicBool>,
 }
 impl TraceGpu {
@@ -31,6 +34,9 @@ impl TraceGpu {
             capturing: AtomicBool::new(false),
             fail_read: AtomicBool::new(false),
             fail_final_read: AtomicBool::new(false),
+            fail_post_eh_read: AtomicBool::new(false),
+            eh_last_byte: AtomicU8::new(0x5a),
+            read_hashes: Mutex::new(Vec::new()),
             fail_body: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -54,12 +60,23 @@ impl GpuBackend for TraceGpu {
     fn copy_d2h_on_stream(&self, p: DevicePtr, b: &mut [u8], s: u64) -> Result<()> {
         self.events.lock().push(Event::Read(p, b.len(), s));
         if self.fail_read.load(Ordering::Relaxed)
+            || (self.fail_post_eh_read.load(Ordering::Relaxed)
+                && !self.events.lock().contains(&Event::Body)
+                && self
+                    .events
+                    .lock()
+                    .iter()
+                    .filter(|e| matches!(e, Event::Read(..)))
+                    .count()
+                    == 2)
             || (self.fail_final_read.load(Ordering::Relaxed)
                 && self.events.lock().contains(&Event::Body))
         {
             anyhow::bail!("injected hidden read failure");
         }
-        self.inner.copy_d2h_on_stream(p, b, s)
+        self.inner.copy_d2h_on_stream(p, b, s)?;
+        self.read_hashes.lock().push(Sha256::digest(b).into());
+        Ok(())
     }
     fn copy_d2d(&self, a: DevicePtr, b: DevicePtr, n: usize) -> Result<()> {
         self.inner.copy_d2d(a, b, n)
@@ -118,6 +135,14 @@ impl GpuBackend for TraceGpu {
             .push(Event::Kernel(kernel.0, ptrs.clone()));
         if kernel.0 == 101 {
             self.inner.copy_d2d(ptrs[0], ptrs[2], ROW_BYTES)?;
+        }
+        if kernel.0 == 102
+            && matches!(args.last(), Some(KernelArg::Bytes(k))
+            if *k == 8192u32.to_ne_bytes())
+        {
+            let mut row = [0xa5; ROW_BYTES];
+            row[ROW_BYTES - 1] = self.eh_last_byte.load(Ordering::Relaxed);
+            self.inner.copy_h2d(&row, ptrs[2])?;
         }
         if kernel.0 == 104 {
             self.inner.copy_h2d(&7u32.to_le_bytes(), ptrs[1])?;

@@ -9,6 +9,8 @@ use support::{Event, fixture};
 mod boundary_tests;
 #[path = "hidden_trace_ownership_tests.rs"]
 mod ownership_tests;
+#[path = "hidden_trace_post_eh_tests.rs"]
+mod post_eh_tests;
 #[path = "hidden_trace_request_tests.rs"]
 mod request_tests;
 
@@ -119,6 +121,13 @@ fn actual_forward_one_traces_input_then_post_norm_before_vocabulary_on_both_rank
                 "actual input hook must precede body"
             );
             let body = events.iter().position(|e| *e == Event::Body).unwrap();
+            let post_eh = events
+                .iter()
+                .position(|e| *e == Event::Read(ctx.buffers.hidden_states(), ROW_BYTES, 7))
+                .expect("actual post-EH hook must read full row before body");
+            assert!(post_eh < body);
+            assert!(matches!(&events[post_eh-1], Event::Kernel(102,p)
+                if p[2] == ctx.buffers.hidden_states()));
             let final_read = events
                 .iter()
                 .position(|e| *e == Event::Read(ctx.buffers.norm_output(), ROW_BYTES, 7))
@@ -135,7 +144,7 @@ fn actual_forward_one_traces_input_then_post_norm_before_vocabulary_on_both_rank
                     .iter()
                     .filter(|e| matches!(e, Event::Read(..)))
                     .count(),
-                2
+                3
             );
         });
     }
