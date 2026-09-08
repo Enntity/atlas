@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // nvcc -std=c++17 -O3 --fmad=false -arch=sm_121a scripts/dev/bench_glm_w4a16_m10.cu -o bench-w4a16-m10
-// Existing exports only. No model weights, collectives, or serving selection.
+// Fixture-local specialization only. No model weights, collectives, or serving selection.
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <array>
@@ -12,6 +12,16 @@
 #include <limits>
 #include <vector>
 #include "../../kernels/gb10/common/w4a16_gemv.cu"
+
+// Unactivated specialization of the unchanged production arithmetic template.
+// Deliberately no launch_bounds or alternative reduction policy.
+extern "C" __global__ void fixture_w4a16_gemv_exact10(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, float scale2, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    w4a16_gemv_batchm_impl<10>(A, B_packed, B_scale, scale2, C, M, N, K);
+}
 
 #define CHECK(call) do { const auto status = (call); if (status != cudaSuccess) { \
     std::fprintf(stderr, "%s:%d CUDA: %s\n", __FILE__, __LINE__, cudaGetErrorString(status)); \
@@ -134,15 +144,18 @@ static void run(unsigned n, unsigned k, unsigned profile, const Options& opt) {
     for (auto& s : scales) s = impulse ? 0x38 :
         (profile == 7 ? 1 + rng.next() % 7 : 0x30 + rng.next() % 24);
     Buffer<unsigned char> w(weight.size()), ws(scales.size());
-    Buffer<__nv_bfloat16> a(input.size()), candidate(mul(16, n)),
+    Buffer<__nv_bfloat16> a(input.size()), candidate(mul(16, n)), wide(mul(16, n)),
         pair(mul(16, n)), scalar(mul(16, n));
     a.upload(input); w.upload(weight); ws.upload(scales);
     const dim3 grid((n + 3) / 4);
     const auto launch = [&](unsigned arm) {
         if (arm == 0) {
-            w4a16_gemv_batch16<<<grid, 256>>>(a.ptr, w.ptr, ws.ptr, scale2, candidate.ptr, 10, n, k);
+            fixture_w4a16_gemv_exact10<<<grid, 256>>>(a.ptr, w.ptr, ws.ptr, scale2, candidate.ptr, 10, n, k);
             CHECK(cudaGetLastError());
         } else if (arm == 1) {
+            w4a16_gemv_batch16<<<grid, 256>>>(a.ptr, w.ptr, ws.ptr, scale2, wide.ptr, 10, n, k);
+            CHECK(cudaGetLastError());
+        } else if (arm == 2) {
             for (unsigned segment = 0; segment < 2; ++segment) {
                 w4a16_gemv_batch5<<<grid, 256>>>(a.ptr + size_t(segment * 5) * k,
                     w.ptr, ws.ptr, scale2, pair.ptr + size_t(segment * 5) * n, 5, n, k);
@@ -157,11 +170,12 @@ static void run(unsigned n, unsigned k, unsigned profile, const Options& opt) {
         }
     };
     const auto reset = [&] {
-        for (auto* buf : {&candidate, &pair, &scalar})
+        for (auto* buf : {&candidate, &wide, &pair, &scalar})
             CHECK(cudaMemset(buf->ptr, 0xff, mul(buf->count, 2)));
     };
     const auto validate = [&] {
-        const auto c = candidate.read(), p = pair.read(), s = scalar.read();
+        const auto c = candidate.read(), b = wide.read(), p = pair.read(), s = scalar.read();
+        require(!std::memcmp(c.data(), b.data(), mul(c.size(), 2)), "candidate versus batch16 bytes");
         require(!std::memcmp(c.data(), p.data(), mul(c.size(), 2)), "candidate versus two M5 bytes");
         require(!std::memcmp(c.data(), s.data(), mul(c.size(), 2)), "candidate versus scalar bytes");
         for (size_t i = 0; i < c.size(); ++i) {
@@ -169,10 +183,10 @@ static void run(unsigned n, unsigned k, unsigned profile, const Options& opt) {
                 require(std::isfinite(__bfloat162float(c[i])), "nonfinite live output");
             else require(bits(c[i]) == 0xffff, "unused output row modified");
         }
-        a.guards(); w.guards(); ws.guards(); candidate.guards(); pair.guards(); scalar.guards();
+        a.guards(); w.guards(); ws.guards(); candidate.guards(); wide.guards(); pair.guards(); scalar.guards();
         return c;
     };
-    reset(); launch(0); launch(1); launch(2); CHECK(cudaDeviceSynchronize());
+    reset(); launch(0); launch(1); launch(2); launch(3); CHECK(cudaDeviceSynchronize());
     if (opt.fault == Fault::Output) flip_byte(candidate.ptr);
     if (opt.fault == Fault::Unused) flip_byte(candidate.ptr + size_t(10) * n);
     if (opt.fault == Fault::Guard) flip_byte(candidate.allocation);
@@ -197,17 +211,24 @@ static void run(unsigned n, unsigned k, unsigned profile, const Options& opt) {
         for (unsigned row = 0; row < 10; ++row)
             std::copy_n(input.begin() + size_t(order[row]) * k, k,
                         permuted.begin() + size_t(row) * k);
-        a.upload(permuted); reset(); launch(0); launch(1); launch(2);
+        a.upload(permuted); reset(); launch(0); launch(1); launch(2); launch(3);
         CHECK(cudaDeviceSynchronize()); const auto actual = validate();
         for (unsigned row = 0; row < 10; ++row)
             require(!std::memcmp(actual.data() + size_t(row) * n,
                     canonical.data() + size_t(order[row]) * n, mul(n, 2)), "row permutation bytes");
     }
     a.upload(input);
-    std::printf("M=10 N=%u K=%u profile=%u scale2=%.9g exact_two_M5=1 exact_scalar=1 "
+    std::printf("M=10 N=%u K=%u profile=%u scale2=%.9g exact_batch16=1 exact_two_M5=1 exact_scalar=1 "
                 "finite=1 unused_rows=6 permutations=2 live_bytes=%zu", n, k, profile, scale2, live_bytes);
-    if (opt.repetitions && profile == 0 && n != 7) {
-        for (unsigned i = 0; i < 10; ++i) { launch(0); launch(1); }
+    const bool timed = opt.repetitions && profile == 0 && n != 7;
+    // First three cyclic orders balance all positions; the remaining two
+    // distinct permutations leave each arm in each position once or twice.
+    const std::array<std::array<unsigned, 3>, 5> timing_orders{{
+        {{0, 1, 2}}, {{1, 2, 0}}, {{2, 0, 1}}, {{2, 1, 0}}, {{1, 0, 2}}
+    }};
+    std::array<std::array<float, 3>, 5> round_us{};
+    if (timed) {
+        for (unsigned i = 0; i < 10; ++i) { launch(0); launch(1); launch(2); }
         CHECK(cudaDeviceSynchronize());
         cudaEvent_t start, end; CHECK(cudaEventCreate(&start)); CHECK(cudaEventCreate(&end));
         const auto measure = [&](unsigned arm) {
@@ -215,21 +236,37 @@ static void run(unsigned n, unsigned k, unsigned profile, const Options& opt) {
             for (unsigned i = 0; i < opt.repetitions; ++i) launch(arm);
             CHECK(cudaEventRecord(end)); CHECK(cudaEventSynchronize(end));
             float ms; CHECK(cudaEventElapsedTime(&ms, start, end));
+            require(std::isfinite(ms) && ms > 0, "invalid CUDA event duration");
             return ms * 1000 / opt.repetitions;
         };
-        std::vector<float> c, p;
+        std::array<std::vector<float>, 3> samples;
         for (unsigned round = 0; round < 5; ++round) {
-            if (round % 2) { c.push_back(measure(0)); p.push_back(measure(1)); }
-            else { p.push_back(measure(1)); c.push_back(measure(0)); }
+            for (unsigned arm : timing_orders[round]) {
+                round_us[round][arm] = measure(arm);
+                samples[arm].push_back(round_us[round][arm]);
+            }
         }
-        std::sort(c.begin(), c.end()); std::sort(p.begin(), p.end());
-        std::printf(" two_M5_us=%.3f batch16_M10_us=%.3f speedup=%.3f", p[2], c[2], p[2] / c[2]);
+        for (auto& values : samples) std::sort(values.begin(), values.end());
+        const float exact = samples[0][2], batch16 = samples[1][2], two_m5 = samples[2][2];
+        std::printf(" exact10_us=%.3f batch16_M10_us=%.3f two_M5_us=%.3f "
+                    "speedup_vs_batch16=%.3f speedup_vs_two_M5=%.3f",
+                    exact, batch16, two_m5, batch16 / exact, two_m5 / exact);
         CHECK(cudaEventDestroy(start)); CHECK(cudaEventDestroy(end));
         // Recheck the live output and inactive-row payload after repeated launches.
-        launch(2); CHECK(cudaDeviceSynchronize()); validate();
+        launch(3); CHECK(cudaDeviceSynchronize()); validate();
     }
-    a.guards(); w.guards(); ws.guards(); candidate.guards(); pair.guards(); scalar.guards();
+    a.guards(); w.guards(); ws.guards(); candidate.guards(); wide.guards(); pair.guards(); scalar.guards();
     std::printf(" PASS\n");
+    if (timed) {
+        std::printf("timing_policy N=%u K=%u rounds=5 repetitions=%u warmup_per_arm=10 "
+                    "arms=0:exact10,1:batch16,2:two_M5 residual_order_imbalance=1_or_2_per_position\n",
+                    n, k, opt.repetitions);
+        for (unsigned round = 0; round < 5; ++round)
+            std::printf("timing_round N=%u K=%u round=%u order=%u,%u,%u "
+                        "exact10_us=%.6f batch16_M10_us=%.6f two_M5_us=%.6f\n",
+                        n, k, round, timing_orders[round][0], timing_orders[round][1],
+                        timing_orders[round][2], round_us[round][0], round_us[round][1], round_us[round][2]);
+    }
 }
 
 int main(int argc, char** argv) {
