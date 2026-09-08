@@ -10,6 +10,24 @@ mod fixture;
 mod legacy_boundary_tests;
 #[path = "glm_c2_handoff_preflight_tests.rs"]
 mod preflight_tests;
+#[path = "glm_c2_verdict_continuation_tests.rs"]
+mod verdict_continuation_tests;
+#[path = "glm_c2_verdict_escape_tests.rs"]
+mod verdict_escape_tests;
+#[path = "glm_c2_verdict_fault_tests.rs"]
+mod verdict_fault_tests;
+#[path = "glm_c2_verdict_lifecycle_tests.rs"]
+mod verdict_lifecycle_tests;
+#[path = "glm_c2_verdict_preflight_tests.rs"]
+mod verdict_preflight_tests;
+#[path = "glm_c2_verdict_producer_tests.rs"]
+mod verdict_producer_tests;
+#[path = "glm_c2_verdict_repair_fault_tests.rs"]
+mod verdict_repair_fault_tests;
+#[path = "glm_c2_verdict_ssm_tests.rs"]
+mod verdict_ssm_tests;
+#[path = "glm_c2_verdict_worker_tests.rs"]
+mod verdict_worker_tests;
 #[path = "glm_c2_handoff_worker_tests.rs"]
 mod worker_tests;
 #[path = "glm_c2_handoff_writer_fault_tests.rs"]

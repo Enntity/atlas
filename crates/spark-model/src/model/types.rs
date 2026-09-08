@@ -584,7 +584,7 @@ impl TransformerModel {
 
     pub(super) fn release_pools(&mut self) -> anyhow::Result<()> {
         if let Some(capability) = self.paired_handoff() {
-            capability.close(self.gpu.as_ref())?;
+            capability.close(self.gpu.as_ref(), self.secondary_stream)?;
         }
         crate::layers::moe::invalidate_resident_btile_readers(&self.config, &mut self.layers);
         use atlas_core::scope::ModelResource;

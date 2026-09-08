@@ -582,6 +582,7 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<DevicePtr> {
+        self.reject_paired_batch_producer()?;
         let stream = self.gpu.default_stream();
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();

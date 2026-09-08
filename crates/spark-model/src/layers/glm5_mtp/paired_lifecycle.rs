@@ -25,6 +25,10 @@ impl Pool {
         );
         let index = lease.slot;
         self.slots[index].retiring = true;
+        if self.verification.as_ref().is_some_and(|v| v.slot == index) {
+            self.producer_failed = true;
+            self.slots[index].failed = true;
+        }
         if let Err(error) = self.validate(state, gpu) {
             self.slots[index].failed = true;
             return Err(error);
@@ -55,6 +59,7 @@ impl Pool {
         *slot = Slot {
             generation,
             active: true,
+            issued_prefix: Vec::with_capacity(self.context),
             ..Slot::default()
         };
         Ok(index)

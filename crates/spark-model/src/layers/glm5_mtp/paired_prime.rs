@@ -40,6 +40,47 @@ impl Pool {
 }
 
 impl GlmPairedHandoff for Glm5MtpHead {
+    fn commit_target(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        committed: usize,
+        width: usize,
+        completed: bool,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_commit_target(input, committed, width, completed, state, ctx)
+    }
+    fn begin_verify(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        tokens: &[u32],
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_begin_verify(input, tokens, state, ctx)
+    }
+    fn publish_verify(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        tokens: &[u32],
+        predictions: &[u32],
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_publish_verify(input, tokens, predictions, state, ctx)
+    }
+    fn record_verify(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        base: usize,
+        tokens: &[u32],
+        accepted: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_record_verify(input, base, tokens, accepted, state, ctx)
+    }
     fn validate_cold(
         &self,
         state: &dyn ProposerState,
@@ -53,6 +94,7 @@ impl GlmPairedHandoff for Glm5MtpHead {
             .context("paired preflight requires actual GLM state")?;
         self.validate_paired_live(state, ctx.gpu)?;
         let pool = self.paired.as_ref().context("paired pool missing")?.lock();
+        pool.scratch_idle()?;
         let slot = &pool.slots[state.paired.as_ref().expect("validated lease").slot];
         ensure!(
             pool.rank == ctx.config.ep_rank
@@ -73,8 +115,8 @@ impl GlmPairedHandoff for Glm5MtpHead {
     fn retire(&self, state: &mut dyn ProposerState, gpu: &dyn GpuBackend) -> Result<()> {
         self.paired_retire(state, gpu)
     }
-    fn close(&self, gpu: &dyn GpuBackend) -> Result<()> {
-        self.paired_close(gpu)
+    fn close(&self, gpu: &dyn GpuBackend, secondary_stream: u64) -> Result<()> {
+        self.paired_close(gpu, secondary_stream)
     }
     fn propose_owned(
         &self,
@@ -172,6 +214,7 @@ impl GlmPairedHandoff for Glm5MtpHead {
         let destination;
         {
             let mut pool = owner.lock();
+            pool.scratch_idle()?;
             pool.validate(state, ctx.gpu)?;
             ensure!(
                 data.prompt < pool.context

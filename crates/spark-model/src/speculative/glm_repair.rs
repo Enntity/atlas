@@ -53,6 +53,39 @@ pub trait GlmPairRepair: Send + Sync {
 
 /// Optional GLM-only request-owned path; legacy and other proposers lack it.
 pub trait GlmPairedHandoff: Send + Sync {
+    fn commit_target(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        committed: usize,
+        width: usize,
+        completed: bool,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()>;
+    fn begin_verify(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        tokens: &[u32],
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()>;
+    fn publish_verify(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        tokens: &[u32],
+        predictions: &[u32],
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()>;
+    fn record_verify(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        base: usize,
+        tokens: &[u32],
+        accepted: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()>;
     fn validate_cold(
         &self,
         state: &dyn ProposerState,
@@ -65,7 +98,7 @@ pub trait GlmPairedHandoff: Send + Sync {
         state: &mut dyn ProposerState,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
     ) -> Result<()>;
-    fn close(&self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()>;
+    fn close(&self, gpu: &dyn spark_runtime::gpu::GpuBackend, secondary_stream: u64) -> Result<()>;
     fn propose_owned(
         &self,
         input: &crate::model::GlmPairedInput<'_>,

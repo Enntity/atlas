@@ -15,8 +15,28 @@ mod close;
 mod lifecycle;
 #[path = "paired_prime.rs"]
 mod prime;
+#[path = "paired_repair.rs"]
+mod repair;
 #[path = "paired_target.rs"]
 mod target;
+#[path = "paired_verdict.rs"]
+mod verdict;
+#[path = "paired_verify.rs"]
+mod verify;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct IssuedProposal {
+    attempt: u64,
+    base: usize,
+    tokens: [u32; 5],
+}
+struct Verification {
+    slot: usize,
+    generation: u64,
+    issued: IssuedProposal,
+    normalized: DevicePtr,
+    produced: bool,
+}
 
 struct Binding {
     sequence_slot: usize,
@@ -52,6 +72,10 @@ struct Slot {
     bonus: Option<HiddenView>,
     pending_target: Option<u32>,
     proposing: bool,
+    attempt: u64,
+    issued: Option<IssuedProposal>,
+    issued_prefix: Vec<u32>,
+    commit_queued: bool,
     blocks: Vec<u32>,
 }
 
@@ -75,6 +99,8 @@ pub(super) struct Pool {
     slots: [Slot; 2],
     closed: bool,
     close_failed: bool,
+    verification: Option<Verification>,
+    producer_failed: bool,
 }
 impl Pool {
     pub(super) fn new(
@@ -130,6 +156,8 @@ impl Pool {
             slots: std::array::from_fn(|_| Slot::default()),
             closed: false,
             close_failed: false,
+            verification: None,
+            producer_failed: false,
         })
     }
 }

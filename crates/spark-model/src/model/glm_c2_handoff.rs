@@ -7,6 +7,10 @@ use anyhow::{Context, Result, ensure};
 use std::sync::atomic::Ordering;
 #[path = "glm_c2_handoff_decode.rs"]
 mod decode;
+#[path = "glm_c2_ssm.rs"]
+mod ssm;
+#[path = "glm_c2_verification.rs"]
+mod verification;
 
 /// Not constructible from an arbitrary pointer/row bundle outside this module.
 pub struct GlmPairedInput<'a> {
@@ -20,6 +24,7 @@ pub(crate) struct RequestData<'a> {
     pub capture_generation: u64,
     pub capture: RepairSpan,
     pub normalized: RepairSpan,
+    pub secondary_event: u64,
 }
 impl GlmPairedInput<'_> {
     pub(crate) fn data(&self) -> &RequestData<'_> {
@@ -31,7 +36,7 @@ impl TransformerModel {
     pub(super) fn reject_paired_batch_producer(&self) -> Result<()> {
         ensure!(
             self.paired_handoff().is_none(),
-            "paired Gate1 supports single-owner complete producers only"
+            "paired handoff does not support this legacy producer/state mutation"
         );
         Ok(())
     }
@@ -101,6 +106,7 @@ impl TransformerModel {
                 && self.config.ep_world_size == 2
                 && self.levers.drafter.prefill
                 && !self.levers.drafter.carry
+                && !self.prefix_cache.is_active()
                 && seq.slot_idx < 2
                 && seq.adapter_id == 0
                 && seq.adapter_slot < 0,
@@ -207,6 +213,7 @@ impl TransformerModel {
                     ptr: self.buffers.norm_output(),
                     bytes: self.buffers.sizes().norm_output,
                 },
+                secondary_event: self.secondary_event,
             },
         })
     }

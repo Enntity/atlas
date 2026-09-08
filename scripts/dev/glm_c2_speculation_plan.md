@@ -286,6 +286,22 @@ Cancellation cannot skip the rest of an issued transaction. Retire only its
 owner; EP v2 must not compact surviving slots. Validate K5 intermediate capacity
 for both actual SSM slots, not merely configured max batch size.
 
+Before sending a slot-addressed F5/E1 command, the head must run the applicable
+host-only transaction preflight. Gate 2's Model wrapper checks alone occur
+after the current scheduler broadcasts F5; a head-only refusal at that point
+could leave the worker entering unmatched collectives. Construction/admission
+checks do not replace per-step issued-token, position and remaining-capacity
+checks. A failure after command issuance needs an explicit paired-rank abort or
+completed transaction policy, never local request removal followed by serving
+the peer. This protocol integration is not proved by CPU Model-only tests.
+
+Preserve the existing post-logit-processor token selection (including repetition
+penalties). Raw verifier argmax is not bonus-token authority. Bind the actual
+selected next seed to the owner and target position at the scheduler/E1
+boundary, and have the worker consume that same selected token with its owned
+bonus hidden row. Gate 2 seals the resulting next `[seed, four drafts]` inputs;
+it neither authenticates the external sampler decision nor forces raw sampling.
+
 This serial control proves concurrent request correctness; it is NOT a fused
 target batch or a promised throughput improvement. Verify real scheduler and
 worker paths with cancellation/EOS/output-cap at every transaction boundary.

@@ -16,6 +16,9 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+#[path = "glm_c2_verdict_test_numerics.rs"]
+mod numerics;
+use numerics::Body;
 pub(super) const DEFAULT: u64 = 7;
 pub(super) const CALLER: u64 = 37;
 pub(super) const ROW_BYTES: usize = 8192;
@@ -28,6 +31,8 @@ pub(super) enum Event {
     Upload(DevicePtr, usize, u64),
     Read(DevicePtr, usize, u64),
     Sync(u64),
+    RecordEvent(u64, u64),
+    WaitEvent(u64, u64),
     Memset(DevicePtr, usize, u64),
     Kernel(String, Vec<DevicePtr>, u64),
     Target(usize, usize, u64),
@@ -41,10 +46,13 @@ pub(super) struct Recorder {
     live: Mutex<HashMap<u64, usize>>,
     retired: Mutex<Vec<(DevicePtr, usize)>>,
     names: Mutex<Vec<String>>,
+    eh_pairs: Mutex<Vec<(u8, u8)>>,
+    next_handle: AtomicUsize,
     pub fail: AtomicUsize,
     pub reuse_freed: AtomicBool,
     pub capturing: AtomicBool,
     pub sweeps: AtomicUsize,
+    pub deterministic_logits: AtomicBool,
 }
 impl Recorder {
     fn event(&self, event: Event) -> Result<()> {
@@ -56,10 +64,14 @@ impl Recorder {
     }
     pub fn clear(&self) {
         self.events.lock().clear();
+        self.eh_pairs.lock().clear();
         self.fail.store(usize::MAX, Ordering::Relaxed);
     }
     pub fn trace(&self) -> Vec<Event> {
         self.events.lock().clone()
+    }
+    pub fn eh_pairs(&self) -> Vec<(u8, u8)> {
+        self.eh_pairs.lock().clone()
     }
     pub fn read_span(&self, ptr: DevicePtr, bytes: usize) -> Vec<u8> {
         let mut result = vec![0; bytes];
@@ -68,6 +80,18 @@ impl Recorder {
     }
     pub fn write_span(&self, ptr: DevicePtr, bytes: &[u8]) {
         self.inner.copy_h2d(bytes, ptr).unwrap();
+    }
+    pub fn gather_sentinel(&self, src: u64, dst: u64, bytes: usize) -> Result<()> {
+        if self.deterministic_logits.load(Ordering::Relaxed) {
+            ensure!(
+                bytes == 8,
+                "sentinel gather supports only local vocab4 BF16"
+            );
+            let local = self.read_span(DevicePtr(src), bytes);
+            self.inner.copy_h2d(&local, DevicePtr(dst))?;
+            self.inner.copy_h2d(&local, DevicePtr(dst).offset(bytes))?;
+        }
+        Ok(())
     }
     pub fn slab(&self) -> DevicePtr {
         let live = self.live.lock();
@@ -136,8 +160,20 @@ impl GpuBackend for Gpu {
         self.0.event(Event::Sync(s))?;
         self.0.inner.synchronize(s)
     }
+    fn record_event(&self, event: u64, stream: u64) -> Result<()> {
+        self.0.event(Event::RecordEvent(event, stream))
+    }
+    fn stream_wait_event(&self, stream: u64, event: u64) -> Result<()> {
+        self.0.event(Event::WaitEvent(stream, event))
+    }
     fn default_stream(&self) -> u64 {
         DEFAULT
+    }
+    fn create_stream(&self) -> Result<u64> {
+        Ok(self.0.next_handle.fetch_add(1, Ordering::Relaxed) as u64 + 1024)
+    }
+    fn create_event(&self) -> Result<u64> {
+        Ok(self.0.next_handle.fetch_add(1, Ordering::Relaxed) as u64 + 1024)
     }
     fn stream_is_capturing(&self, _: u64) -> bool {
         self.0.capturing.load(Ordering::Relaxed)
@@ -230,10 +266,45 @@ impl GpuBackend for Gpu {
             for row in 0..rows {
                 let src = ptrs[0].offset((row * 2 + 1) * ROW_BYTES);
                 let dst = ptrs[2].offset(row * ROW_BYTES);
+                if self.0.deterministic_logits.load(Ordering::Relaxed) {
+                    let token = self
+                        .0
+                        .read_span(ptrs[0].offset(row * 2 * ROW_BYTES), ROW_BYTES);
+                    let hidden = self.0.read_span(src, ROW_BYTES);
+                    ensure!(
+                        token.iter().all(|b| *b == token[0])
+                            && hidden.iter().all(|b| *b == hidden[0]),
+                        "nonuniform EH sentinel input"
+                    );
+                    self.0.eh_pairs.lock().push((token[0], hidden[0]));
+                }
                 self.0.inner.copy_d2d(src, dst, ROW_BYTES)?;
             }
+        } else if self.0.deterministic_logits.load(Ordering::Relaxed)
+            && matches!(name.as_str(), "dense_gemm_bf16" | "dense_gemv_bf16")
+        {
+            let (rows, n, k) = if name == "dense_gemm_bf16" {
+                (scalar(3)?, scalar(4)?, scalar(5)?)
+            } else {
+                (1, scalar(3)?, scalar(4)?)
+            };
+            ensure!(
+                matches!(n, 4 | 8) && k == 4096,
+                "unsupported sentinel head ABI"
+            );
+            for row in 0..rows {
+                let value = self.0.read_span(ptrs[0].offset(row * ROW_BYTES), 1)[0];
+                self.0
+                    .inner
+                    .copy_h2d(&vec![value; n * 2], ptrs[2].offset(row * n * 2))?;
+            }
         } else if matches!(name.as_str(), "argmax_bf16" | "argmax_bf16_value") {
-            self.0.inner.copy_h2d(&1u32.to_ne_bytes(), ptrs[1])?;
+            let token = if self.0.deterministic_logits.load(Ordering::Relaxed) {
+                u32::from(self.0.read_span(ptrs[0], 1)[0] % 8)
+            } else {
+                1
+            };
+            self.0.inner.copy_h2d(&token.to_ne_bytes(), ptrs[1])?;
         }
         Ok(())
     }
@@ -247,108 +318,20 @@ impl GpuBackend for Gpu {
         Ok(48)
     }
 }
-struct Body {
-    record: Arc<Recorder>,
-    target: bool,
-}
-impl Body {
-    fn target_rows(&self, h: DevicePtr, n: usize, pos: usize, s: u64) -> Result<()> {
-        self.record.event(Event::Target(n, pos, s))?;
-        for row in 0..n {
-            let dst = h.offset(row * ROW_BYTES);
-            let source = self.record.read_span(dst, 1)[0];
-            let sentinel = source.wrapping_add(0x20).wrapping_add((pos + row) as u8);
-            self.record
-                .inner
-                .copy_h2d(&vec![sentinel; ROW_BYTES], dst)?;
-        }
-        Ok(())
-    }
-}
-impl TransformerLayer for Body {
-    fn alloc_state(&self, _: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
-        Ok(Box::new(EmptyLayerState))
-    }
-    fn supports_mla_kv_only(&self) -> bool {
-        !self.target
-    }
-    fn prefill(
-        &self,
-        h: DevicePtr,
-        _: DevicePtr,
-        rows: usize,
-        _: &mut dyn LayerState,
-        _: &mut PagedKvCache,
-        position: usize,
-        _: &mut Vec<u32>,
-        _: &mut Vec<u32>,
-        _: &mut Vec<u32>,
-        _: usize,
-        _: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        ensure!(self.target, "private body must use real KV-only entry");
-        self.target_rows(h, rows, position, stream)
-    }
-    fn decode(
-        &self,
-        h: DevicePtr,
-        _: DevicePtr,
-        _: &mut dyn LayerState,
-        _: &mut PagedKvCache,
-        position: usize,
-        _: &mut Vec<u32>,
-        _: &mut Vec<u32>,
-        _: &mut Vec<u32>,
-        _: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        if self.target {
-            self.target_rows(h, 1, position, stream)
-        } else {
-            self.record.event(Event::Body(position, stream))
-        }
-    }
-    fn prefill_mla_kv_only(
-        &self,
-        h: DevicePtr,
-        rows: usize,
-        cache: &mut PagedKvCache,
-        slots: DevicePtr,
-        _: &ForwardContext,
-        stream: u64,
-    ) -> Result<bool> {
-        ensure!(!self.target, "target cannot act as private KV body");
-        let raw = self.record.read_span(slots, rows * 8);
-        let slots: Vec<_> = raw
-            .chunks_exact(8)
-            .map(|b| i64::from_ne_bytes(b.try_into().unwrap()))
-            .collect();
-        self.record.event(Event::Kv(slots.clone(), stream))?;
-        for (row, slot) in slots.into_iter().enumerate() {
-            ensure!(slot >= 0, "negative actual KV slot");
-            let block = slot as usize / cache.block_size();
-            let offset = slot as usize % cache.block_size() * 1024;
-            let bytes = self.record.read_span(h.offset(row * ROW_BYTES), 1024);
-            let k = cache.k_cache_ptr(0, block as u32).offset(offset);
-            let v = cache.v_cache_ptr(0, block as u32).offset(offset);
-            self.record.inner.copy_h2d(&bytes, k)?;
-            self.record.inner.copy_h2d(&bytes, v)?;
-        }
-        Ok(true)
-    }
-}
-struct Rank(usize);
+struct Rank(usize, Arc<Recorder>);
 macro_rules! rank_comm {
     ($($name:ident($($arg:ty),*));*) => {
         impl spark_comm::CommBackend for Rank {
             $(fn $name(&self, $(_: $arg),*) -> Result<()> { Ok(()) })*
             fn rank(&self) -> usize { self.0 }
             fn world_size(&self) -> usize { 2 }
+            fn all_gather(&self, src: u64, dst: u64, n: usize) -> Result<()> {
+                self.1.gather_sentinel(src, dst, n)
+            }
         }
     };
 }
-rank_comm! { all_reduce(u64, usize); all_gather(u64, u64, usize);
+rank_comm! { all_reduce(u64, usize);
 reduce_scatter(u64, u64, usize); broadcast(u64, usize, usize); barrier();
 send_to(u64, usize, usize, u64); recv_from(u64, usize, usize, u64) }
 pub(super) struct Fixture {
@@ -464,7 +447,7 @@ impl Fixture {
             false,
             Box::new(spark_runtime::prefix_cache::NoPrefixCaching),
             8,
-            Some(Arc::new(Rank(rank))),
+            Some(Arc::new(Rank(rank, record.clone()))),
             false,
             4,
             None,

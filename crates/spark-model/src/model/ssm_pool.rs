@@ -764,6 +764,11 @@ pub(crate) struct SlotGuard {
 }
 
 impl SlotGuard {
+    /// Read-only owner identity for selected checked request-state consumers.
+    pub(crate) fn belongs_to(&self, pool: &Arc<SsmStatePool>) -> bool {
+        Arc::ptr_eq(&self.pool, pool)
+    }
+
     /// A guard that owns no slot (released/migrated, or a placeholder for the
     /// reserved-dummy / sentinel paths). Holds an `Arc` to the pool but its
     /// `Drop` is a no-op while `idx` is `None`.

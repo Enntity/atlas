@@ -17,7 +17,7 @@ impl Glm5MtpHead {
         Ok(())
     }
 
-    pub(super) fn paired_close(&self, gpu: &dyn GpuBackend) -> Result<()> {
+    pub(super) fn paired_close(&self, gpu: &dyn GpuBackend, secondary_stream: u64) -> Result<()> {
         let owner = self.paired.as_ref().context("paired pool missing")?;
         let slab = {
             let mut pool = owner.lock();
@@ -44,6 +44,12 @@ impl Glm5MtpHead {
         // freeing any model owner or invoking its bulk sweep in release_pools.
         gpu.synchronize(gpu.default_stream())
             .context("paired close completion failed; model release prohibited")?;
+        // A failed record_event may leave secondary writes absent from the
+        // event's history. Join the actual model stream, not only that event.
+        if secondary_stream != gpu.default_stream() {
+            gpu.synchronize(secondary_stream)
+                .context("paired secondary close completion failed; model release prohibited")?;
+        }
         gpu.free(slab)
             .context("paired slab free failed; no retry")?;
         owner.lock().close_failed = false;

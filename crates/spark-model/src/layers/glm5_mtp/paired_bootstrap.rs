@@ -21,13 +21,18 @@ impl Glm5MtpHead {
         ensure!(
             stream == ctx.gpu.default_stream()
                 && !ctx.graph_capture
+                && !ctx.gpu.stream_is_capturing(stream)
                 && (token as usize) < ctx.config.vocab_size,
             "paired proposal requires eager default stream and valid token"
         );
+        if matches!(state.repair, repair_state::RepairPhase::Pending(_)) {
+            return self.paired_repair_owned(input, token, state, ctx, stream);
+        }
         let owner = self.paired.as_ref().context("paired pool missing")?;
         let data = input.data();
         let (index, tail, bonus, finish, next) = {
             let pool = owner.lock();
+            pool.scratch_idle()?;
             let index = pool.matches_request(state, input, ctx)?;
             let slot = &pool.slots[index];
             ensure!(
@@ -137,7 +142,9 @@ impl Glm5MtpHead {
                 None,
                 None,
             )?;
-            owner.lock().slots[index].proposing = false;
+            let mut pool = owner.lock();
+            pool.slots[index].proposing = false;
+            pool.issue(index, data.position, token, &drafts, data.tokens)?;
             Ok(drafts)
         })();
         if result.is_err() {
@@ -158,6 +165,7 @@ impl Glm5MtpHead {
             return Ok(());
         };
         let pool = owner.lock();
+        pool.scratch_idle()?;
         let lease = state
             .paired
             .as_ref()

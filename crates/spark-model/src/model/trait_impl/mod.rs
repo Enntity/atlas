@@ -321,6 +321,7 @@ impl Model for TransformerModel {
         self.high_speed_swap_dims_dispatch()
     }
     fn normalize_ssm_states(&self, seq: &SequenceState, stream: u64) -> Result<()> {
+        self.reject_paired_batch_producer()?;
         self.normalize_ssm_states_dispatch(seq, stream)
     }
     fn bind_gpu_to_thread(&self) -> Result<()> {
@@ -353,6 +354,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         stream: u64,
     ) -> Result<Vec<u32>> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         let r = self.decode_verify_dispatch(tokens, seq, stream);
         if r.is_err() {
@@ -367,6 +369,7 @@ impl Model for TransformerModel {
         self.checkpoint_ssm_states_dispatch(seq)
     }
     fn rollback_ssm_states(&self, seq: &mut SequenceState, num_accepted: usize) -> Result<()> {
+        self.reject_paired_batch_producer()?;
         self.rollback_ssm_states_dispatch(seq, num_accepted)
     }
     fn has_ssm_layers(&self) -> bool {
@@ -386,6 +389,7 @@ impl Model for TransformerModel {
         self.save_decode_ssm_snapshot_dispatch(seq, ring_slot)
     }
     fn restore_decode_ssm_snapshot(&self, seq: &SequenceState, ring_slot: usize) -> Result<()> {
+        self.reject_paired_batch_producer()?;
         self.restore_decode_ssm_snapshot_dispatch(seq, ring_slot)
     }
     fn generate_speculative(
@@ -403,6 +407,7 @@ impl Model for TransformerModel {
         self.has_self_speculative_dispatch()
     }
     fn decode_draft(&self, token: u32, seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
+        self.reject_paired_batch_producer()?;
         self.decode_draft_dispatch(token, seq, stream)
     }
     fn cache_sequence(&self, seq: &SequenceState) {
@@ -420,6 +425,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 2]> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_verify_graphed_dispatch(tokens, seq, _stream)
     }
@@ -429,6 +435,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 3]> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_verify_graphed_k3_dispatch(tokens, seq, _stream)
     }
@@ -438,6 +445,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 4]> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream)
     }
@@ -451,6 +459,7 @@ impl Model for TransformerModel {
         seqs: &mut [&mut SequenceState],
         _stream: u64,
     ) -> Result<Vec<u32>> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_verify_batched_dispatch(tokens, ks, seqs, _stream)
     }
@@ -487,7 +496,13 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
-        self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream)
+        let paired = self.paired_before_verify(tokens, seq)?;
+        let result = self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream);
+        if paired {
+            self.paired_after_verify(tokens, seq, result)
+        } else {
+            result
+        }
     }
     fn decode_and_verify_fused(
         &self,
@@ -495,6 +510,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<Vec<u32>> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_and_verify_fused_dispatch(tokens, seq, _stream)
     }
@@ -822,6 +838,7 @@ impl Model for TransformerModel {
         self.trim_proposer_state_dispatch(seq, num_accepted, _stream)
     }
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
+        self.reject_paired_batch_producer()?;
         self.compact_sequence_dispatch(seq, new_slot)
     }
     fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {
@@ -840,6 +857,7 @@ impl Model for TransformerModel {
         num_blocks: usize,
         reader: &mut dyn std::io::Read,
     ) -> Result<()> {
+        self.reject_paired_batch_producer()?;
         self.restore_sequence_state_dispatch(seq, num_blocks, reader)
     }
     fn num_free_blocks(&self) -> usize {
@@ -859,6 +877,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         num_accepted: usize,
     ) -> Result<()> {
+        self.reject_paired_batch_producer()?;
         self.start_rollback_and_checkpoint_async_dispatch(seq, num_accepted)
     }
     fn sync_secondary(&self) -> Result<()> {
@@ -870,7 +889,14 @@ impl Model for TransformerModel {
         num_accepted: usize,
         k: usize,
     ) -> Result<()> {
-        self.commit_accepted_prefix_dispatch(seq, num_accepted, k)
+        if self.paired_handoff().is_none() {
+            return self.commit_accepted_prefix_dispatch(seq, num_accepted, k);
+        }
+        self.paired_commit_check(seq, num_accepted, k, false)?;
+        let result = self
+            .commit_accepted_prefix_dispatch(seq, num_accepted, k)
+            .and_then(|()| self.paired_commit_check(seq, num_accepted, k, true));
+        result.map_err(|error| self.paired_failed_transaction(seq, error))
     }
     fn ep_worker_step(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         self.ep_worker_step_dispatch(slots)

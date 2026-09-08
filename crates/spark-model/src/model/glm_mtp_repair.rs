@@ -193,10 +193,9 @@ impl TransformerModel {
         tokens: &[u32],
         accepted: usize,
     ) -> Result<()> {
-        ensure!(
-            self.paired_handoff().is_none(),
-            "paired verdict staging is not available in Gate1"
-        );
+        if self.paired_handoff().is_some() {
+            return self.paired_record_verified(seq, base, tokens, accepted);
+        }
         if !policy::enabled() {
             return Ok(());
         }

@@ -645,16 +645,26 @@ impl TransformerModel {
                     "EP generic verify width must be 2..=32, got {k}"
                 );
                 let tokens = self.ep_broadcast_tokens(&vec![0u32; k])?;
+                let paired_base = self.paired_handoff().map(|_| seq.seq_len);
                 self.sync_secondary()?;
                 self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
 
-                let num_accepted = self.ep_broadcast_u32(0)? as usize;
-                anyhow::ensure!(
-                    num_accepted < k,
-                    "EP generic verify accepted {num_accepted} drafts for K={k}"
-                );
+                let num_accepted = self
+                    .ep_broadcast_u32(0)
+                    .map_err(|error| self.paired_failed_transaction(seq, error))?
+                    as usize;
+                if num_accepted >= k {
+                    return Err(self.paired_failed_transaction(
+                        seq,
+                        anyhow::anyhow!(
+                            "EP generic verify accepted {num_accepted} drafts for K={k}"
+                        ),
+                    ));
+                }
                 let committed = num_accepted + 1;
-                let verify_base = if crate::speculative::glm_repair_policy::enabled() {
+                let verify_base = if let Some(base) = paired_base {
+                    base
+                } else if crate::speculative::glm_repair_policy::enabled() {
                     seq.seq_len
                         .checked_sub(k)
                         .ok_or_else(|| anyhow::anyhow!("EP verify base underflow"))?

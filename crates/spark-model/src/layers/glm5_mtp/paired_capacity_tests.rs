@@ -186,7 +186,7 @@ fn recycled_slab_address_cannot_rebind_a_lease_from_a_closed_head() {
     let old = head(&gpu);
     let state = old.alloc_state_inner(&gpu).unwrap();
     let address = old.paired.as_ref().unwrap().lock().slab;
-    old.close(&gpu).unwrap();
+    old.close(&gpu, gpu.default_stream()).unwrap();
     let new = head(&gpu);
     assert_eq!(new.paired.as_ref().unwrap().lock().slab, address);
     let current = new.alloc_state_inner(&gpu).unwrap();

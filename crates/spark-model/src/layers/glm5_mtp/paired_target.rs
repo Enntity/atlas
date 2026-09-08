@@ -50,6 +50,7 @@ impl Glm5MtpHead {
             .context("paired target requires actual GLM state")?;
         self.validate_paired_live(state, ctx.gpu)?;
         let mut pool = self.paired.as_ref().context("paired pool absent")?.lock();
+        pool.scratch_idle()?;
         let index = pool.matches_request(state, input, ctx)?;
         pool.tail_span(state, ctx.gpu)?;
         let data = input.data();
@@ -144,6 +145,13 @@ impl Glm5MtpHead {
             "foreign paired quarantine lease"
         );
         pool.slots[lease.slot].failed = true;
+        if pool
+            .verification
+            .as_ref()
+            .is_some_and(|v| v.slot == lease.slot)
+        {
+            pool.producer_failed = true;
+        }
         state.repair = repair_state::RepairPhase::Failed;
         Ok(())
     }

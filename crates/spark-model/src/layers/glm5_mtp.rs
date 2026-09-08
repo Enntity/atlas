@@ -844,9 +844,12 @@ impl DraftProposer for Glm5MtpHead {
             .as_any_mut()
             .downcast_mut::<Glm5MtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("invalid GLM-5 MTP proposer state"))?;
+        if self.paired.is_some() {
+            return self.paired_acknowledge(num_accepted, state);
+        }
         anyhow::ensure!(
-            self.paired.is_none() && state.paired.is_none(),
-            "paired verdict consumption is not available in Gate1"
+            state.paired.is_none(),
+            "paired state passed to legacy acknowledgement"
         );
         if crate::speculative::glm_repair_policy::enabled() {
             return state.repair.acknowledge(num_accepted);
