@@ -244,9 +244,13 @@ def main() -> None:
 
     results = []
     for concurrency in range(args.min_concurrency, args.max_concurrency + 1):
-        batch(args, concurrency, prompt)  # warm-up
+        warmup = batch(args, concurrency, prompt)
         measured = [batch(args, concurrency, prompt) for _ in range(args.repetitions)]
         result = summarize_runs(concurrency, args.allow_repetition, measured)
+        # Keep warmup evidence separate; all historical medians/cap flags above
+        # still describe only the measured waves, including normal early stops.
+        result["warmup_runs"] = [warmup]
+        result["warmup_all_outputs_reached_cap"] = warmup["all_outputs_reached_cap"]
         result["workload"] = workload
         results.append(result)
         print(json.dumps(result), file=sys.stderr, flush=True)
