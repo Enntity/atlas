@@ -108,6 +108,7 @@ pub fn load_glm5_mtp_module(
         gpu,
         KvCacheDtype::Bf16,
         true,
+        None, // Replicated TP1 body retains its checkpoint projections.
     )?;
 
     let eh_proj = dense_auto(store, &format!("{lp}.eh_proj.weight"), gpu)?;

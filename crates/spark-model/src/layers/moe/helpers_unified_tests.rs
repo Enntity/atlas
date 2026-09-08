@@ -6,6 +6,8 @@ use crate::weight_map::{ExpertWeight, MoeWeights, WeightQuantFormat};
 #[path = "helpers_unified_test_gpu.rs"]
 mod recording;
 use recording::{Arg, Event, RecordingGpu};
+#[path = "helpers_checkpoint_down_tests.rs"]
+mod checkpoint_down;
 #[path = "helpers_unified_fault_tests.rs"]
 mod faults;
 

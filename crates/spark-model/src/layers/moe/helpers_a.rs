@@ -4,6 +4,8 @@
 
 use super::*;
 
+#[path = "helpers_checkpoint_down.rs"]
+mod checkpoint_down;
 #[path = "helpers_unified_phases.rs"]
 mod unified_phases;
 pub(super) use unified_phases::SharedGateUpReceipt;

@@ -6,6 +6,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
 
+use super::retirement::{LoadedDense, RetirementLog};
 use crate::layer::TransformerLayer;
 use crate::layers::qwen3_attention::{GlmIndexerWeights, MlaWeights, Qwen3AttentionLayer};
 use crate::layers::{FfnComponent, Glm5KdaLayer};
@@ -43,7 +44,8 @@ pub(super) fn load_all(
         let hc = super::components::load_hc(store, &lp, config, gpu)?;
         match config.layer_type(layer_idx) {
             LayerType::LinearAttention => {
-                let weights = super::components::load_kda_weights(store, &lp, config, gpu, qctx)?;
+                let weights =
+                    super::components::load_kda_weights(store, &lp, config, gpu, qctx, None)?;
                 layers.push(Box::new(Glm5KdaLayer::new(
                     input_norm,
                     post_attn_norm,
@@ -73,6 +75,7 @@ pub(super) fn load_all(
                     gpu,
                     kv_dtype,
                     false,
+                    None,
                 )?;
                 layers.push(layer);
                 attn_idx += 1;
@@ -104,13 +107,15 @@ pub(super) fn load_mla_layer(
     gpu: &dyn GpuBackend,
     kv_dtype: KvCacheDtype,
     force_dimension_overrides: bool,
+    retirement: Option<&RetirementLog>,
 ) -> Result<Box<dyn TransformerLayer>> {
     let p = format!("{lp}.self_attn");
     let tp = super::tp::MlaTpPlan::from_config(config);
     let load_tp = |name: &str, shape: (usize, usize, crate::tp_shard::TpShardKind)| {
-        let source = dense_auto(store, &format!("{p}.{name}.weight"), gpu)?;
-        let (local, _, _) = shard_dense_bf16(
-            source.weight,
+        let source =
+            LoadedDense::load(store, &format!("{p}.{name}.weight"), gpu, retirement, false)?;
+        let (local, local_n, local_k) = shard_dense_bf16(
+            source.dense.weight,
             shape.0,
             shape.1,
             shape.2,
@@ -118,10 +123,11 @@ pub(super) fn load_mla_layer(
             tp.tp_size,
             gpu,
         )?;
-        if local != source.weight {
-            gpu.free(source.weight)?;
-        }
-        Ok::<DenseWeight, anyhow::Error>(DenseWeight { weight: local })
+        Ok::<DenseWeight, anyhow::Error>(
+            source
+                .replaced(local, local_n * local_k * 2, gpu)?
+                .into_dense(),
+        )
     };
     let wq_a = dense_auto(store, &format!("{p}.q_a_proj.weight"), gpu)?;
     let wq_b = load_tp("q_b_proj", tp.q_b())?;

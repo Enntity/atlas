@@ -76,6 +76,11 @@ impl RecordingGpu {
             .map(|(&p, b)| (p, b.len()))
             .collect()
     }
+    pub fn reuse_next(&self, ptr: DevicePtr) {
+        let mut s = self.state.lock().unwrap();
+        assert!(!s.bytes.contains_key(&ptr.0));
+        s.next = ptr.0;
+    }
     pub fn read(&self, p: DevicePtr, n: usize) -> Vec<u8> {
         let s = self.state.lock().unwrap();
         let (&base, bytes) = s.bytes.range(..=p.0).next_back().expect("known allocation");

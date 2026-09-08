@@ -10,7 +10,7 @@ use crate::layers::qwen3_attention::{HcSiteWeights, HcWeights};
 use crate::layers::{DenseFfnLayer, FfnComponent, Glm5KdaWeights, Glm5Projection, MoeLayer};
 use crate::tp_shard::{TpGdnDims, TpShardKind, shard_dense_bf16, shard_gdn_value_vector};
 use crate::weight_map::{
-    DenseWeight, ExpertWeight, MoeWeights, Nvfp4Variant, QuantizeCtx, dense_auto, dense_keep_f32,
+    DenseWeight, ExpertWeight, MoeWeights, Nvfp4Variant, QuantizeCtx, dense_auto,
     quantize_to_nvfp4, quantized_any,
 };
 
@@ -275,20 +275,27 @@ pub(super) fn load_kda_weights(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     qctx: QuantizeCtx,
+    retirement: Option<&super::retirement::RetirementLog>,
 ) -> Result<Glm5KdaWeights> {
+    use super::retirement::LoadedDense;
     let p = format!("{lp}.self_attn");
     let load = |name: &str| dense_auto(store, &format!("{p}.{name}.weight"), gpu);
     let dims = TpGdnDims::from_config(config);
     let p_dim = dims.local_key_dim();
     let load_tp_dense =
-        |name: &str, n: usize, k: usize, kind: TpShardKind| -> Result<DenseWeight> {
-            let source = load(name)?;
-            let (local, _, _) =
-                shard_dense_bf16(source.weight, n, k, kind, dims.tp_rank, dims.tp_size, gpu)?;
-            if local != source.weight {
-                gpu.free(source.weight)?;
-            }
-            Ok(DenseWeight { weight: local })
+        |name: &str, n: usize, k: usize, kind: TpShardKind| -> Result<LoadedDense<'_>> {
+            let source =
+                LoadedDense::load(store, &format!("{p}.{name}.weight"), gpu, retirement, false)?;
+            let (local, local_n, local_k) = shard_dense_bf16(
+                source.dense.weight,
+                n,
+                k,
+                kind,
+                dims.tp_rank,
+                dims.tp_size,
+                gpu,
+            )?;
+            source.replaced(local, local_n * local_k * 2, gpu)
         };
     let load_hot = |name: &str,
                     n: usize,
@@ -308,7 +315,7 @@ pub(super) fn load_kda_weights(
             k
         };
         let decode_nvfp4 = quantize_to_nvfp4(
-            &dense,
+            &dense.dense,
             local_n,
             local_k,
             gpu,
@@ -319,7 +326,7 @@ pub(super) fn load_kda_weights(
         // Quantization synchronizes internally, so the checkpoint-native BF16
         // source is no longer needed. Releasing it keeps the safe 92% memory
         // budget viable on GB10 instead of retaining two projection copies.
-        gpu.free(dense.weight)?;
+        dense.release(gpu)?;
         let prefill_nvfp4_t = transpose_prefill
             .then(|| decode_nvfp4.transpose_for_gemm(gpu, local_n, local_k))
             .transpose()?;
@@ -339,22 +346,21 @@ pub(super) fn load_kda_weights(
             TpShardKind::ColumnParallel,
         )?;
         gpu.copy_d2d(
-            weight.weight,
+            weight.dense.weight,
             conv_ptr.offset(slot * local_conv_bytes),
             local_conv_bytes,
         )?;
-        gpu.free(weight.weight)?;
+        weight.release(gpu)?;
     }
-    let a_log_full = dense_keep_f32(store, &format!("{p}.A_log"), gpu)?;
-    let (a_log, _) = shard_gdn_value_vector(a_log_full.weight, &dims, 1, 4, gpu)?;
-    if a_log != a_log_full.weight {
-        gpu.free(a_log_full.weight)?;
-    }
-    let dt_bias_full = dense_keep_f32(store, &format!("{p}.dt_bias"), gpu)?;
-    let (dt_bias, _) = shard_gdn_value_vector(dt_bias_full.weight, &dims, dims.kd, 4, gpu)?;
-    if dt_bias != dt_bias_full.weight {
-        gpu.free(dt_bias_full.weight)?;
-    }
+    let a_log_full = LoadedDense::load(store, &format!("{p}.A_log"), gpu, retirement, true)?;
+    let (a_log, a_len) = shard_gdn_value_vector(a_log_full.dense.weight, &dims, 1, 4, gpu)?;
+    let a_log = a_log_full.replaced(a_log, a_len * 4, gpu)?.into_dense();
+    let dt_bias_full = LoadedDense::load(store, &format!("{p}.dt_bias"), gpu, retirement, true)?;
+    let (dt_bias, dt_len) =
+        shard_gdn_value_vector(dt_bias_full.dense.weight, &dims, dims.kd, 4, gpu)?;
+    let dt_bias = dt_bias_full
+        .replaced(dt_bias, dt_len * 4, gpu)?
+        .into_dense();
     Ok(Glm5KdaWeights {
         q_proj: load_hot(
             "q_proj",
@@ -377,24 +383,27 @@ pub(super) fn load_kda_weights(
             TpShardKind::ColumnParallel,
             true,
         )?,
-        b_proj: load_tp_dense("b_proj", dims.full_nk, dims.h, TpShardKind::ColumnParallel)?,
+        b_proj: load_tp_dense("b_proj", dims.full_nk, dims.h, TpShardKind::ColumnParallel)?
+            .into_dense(),
         f_a_proj: load("f_a_proj")?,
         f_b_proj: load_tp_dense(
             "f_b_proj",
             dims.full_key_dim(),
             dims.kd,
             TpShardKind::ColumnParallel,
-        )?,
+        )?
+        .into_dense(),
         g_a_proj: load("g_a_proj")?,
         g_b_proj: load_tp_dense(
             "g_b_proj",
             dims.full_key_dim(),
             dims.kd,
             TpShardKind::ColumnParallel,
-        )?,
+        )?
+        .into_dense(),
         conv: DenseWeight { weight: conv_ptr },
-        a_log: DenseWeight { weight: a_log },
-        dt_bias: DenseWeight { weight: dt_bias },
+        a_log,
+        dt_bias,
         o_norm: load("o_norm")?,
         o_proj: load_hot(
             "o_proj",

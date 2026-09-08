@@ -5,6 +5,7 @@
 mod components;
 mod layers;
 mod mtp;
+pub(crate) mod retirement;
 mod tp;
 
 pub(crate) use mtp::{Glm5MtpModule, load_glm5_mtp_module};

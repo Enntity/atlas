@@ -23,6 +23,40 @@ fn remap(store: &WeightStore) -> HashMap<String, WeightTensor> {
 }
 
 #[test]
+fn actual_live_source_allows_retired_owner_reuse_but_rejects_live_checkpoint_alias() {
+    let gpu = RecordingGpu::new();
+    let (store, config, local) = fixture(0, &gpu);
+    let retired = gpu.alloc(PACKED_BYTES).unwrap();
+    let mut map = remap(&store);
+    map.insert(
+        "retired_down".into(),
+        WeightTensor {
+            ptr: retired,
+            shape: vec![PACKED_BYTES],
+            dtype: D::UInt8,
+        },
+    );
+    let store = WeightStore::from_map(map);
+    let log = RetirementLog::new(&store, &gpu).unwrap();
+    log.release_checkpoint(&store, "retired_down", retired, &gpu)
+        .unwrap();
+    gpu.allocation.store(retired.0, Ordering::Relaxed);
+    let reused = gpu.alloc(PACKED_BYTES).unwrap();
+    assert_eq!(reused, retired);
+    let source = NativeGateUpLayer::from_live(&log, &config, 0, &local, &gpu, 77).unwrap();
+    assert!(source.scratch_is_disjoint(Span::new(reused, PACKED_BYTES, 16).unwrap()));
+    assert!(!source.scratch_is_disjoint(source.projections()[0].packed));
+    assert!(
+        !NativeGateUpLayer::from_store(&store, &config, 0, &local, &gpu, 77)
+            .unwrap()
+            .scratch_is_disjoint(Span::new(reused, PACKED_BYTES, 16).unwrap())
+    );
+    drop(source);
+    let _receipt = log.finish();
+    gpu.free(reused).unwrap();
+}
+
+#[test]
 fn actual_native_store_provenance_full_both_ranks_and_scalar_bits() {
     for rank in 0..2 {
         let gpu = RecordingGpu::new();

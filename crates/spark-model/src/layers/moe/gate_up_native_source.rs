@@ -2,6 +2,7 @@
 //! Construction-only standard-NVFP4 provenance; deliberately no serving caller.
 //! Dead-code allowance is temporary staging, not an enabled loader capability.
 #![allow(dead_code)]
+use crate::weight_loader::glm5::retirement::RetirementLog;
 use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -47,6 +48,7 @@ pub(super) struct NativeGateUpLayer<'s, 'g> {
     stream: u64,
     owner: &'s WeightStore,
     gpu: &'g dyn GpuBackend,
+    retirement: Option<&'s RetirementLog<'s>>,
 }
 impl<'s, 'g> NativeGateUpLayer<'s, 'g> {
     pub(super) fn from_store(
@@ -56,6 +58,36 @@ impl<'s, 'g> NativeGateUpLayer<'s, 'g> {
         local: &[bool],
         gpu: &'g dyn GpuBackend,
         stream: u64,
+    ) -> Result<Self> {
+        Self::from_owner(store, config, layer, local, gpu, stream, None)
+    }
+    pub(super) fn from_live(
+        retirement: &'s RetirementLog<'s>,
+        config: &ModelConfig,
+        layer: usize,
+        local: &[bool],
+        gpu: &'g dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Self> {
+        Self::from_owner(
+            retirement.store(),
+            config,
+            layer,
+            local,
+            gpu,
+            stream,
+            Some(retirement),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn from_owner(
+        store: &'s WeightStore,
+        config: &ModelConfig,
+        layer: usize,
+        local: &[bool],
+        gpu: &'g dyn GpuBackend,
+        stream: u64,
+        retirement: Option<&'s RetirementLog<'s>>,
     ) -> Result<Self> {
         ensure!(
             !gpu.stream_is_capturing(stream),
@@ -115,6 +147,12 @@ impl<'s, 'g> NativeGateUpLayer<'s, 'g> {
                 }
                 let mut tensor = |suffix: &str, dtype, shape: Option<&[usize]>| -> Result<Span> {
                     let name = format!("{prefix}.{suffix}");
+                    if let Some(log) = retirement {
+                        ensure!(
+                            log.is_live(&name, gpu)?,
+                            "native checkpoint already retired: {name}"
+                        );
+                    }
                     let w = store.get(&name)?;
                     ensure!(w.dtype == dtype, "native dtype mismatch: {name}");
                     let elements = w
@@ -163,6 +201,11 @@ impl<'s, 'g> NativeGateUpLayer<'s, 'g> {
         // A foreign/shared/down/MTP store entry must not alias a destination.
         // Scan without retaining the model's tensors or copying their bytes.
         for name in store.names().filter(|name| !names.contains(*name)) {
+            if let Some(log) = retirement {
+                if !log.is_live(name, gpu)? {
+                    continue;
+                }
+            }
             let w = store.get(name)?;
             let bytes = w
                 .shape
@@ -193,12 +236,18 @@ impl<'s, 'g> NativeGateUpLayer<'s, 'g> {
             stream,
             owner: store,
             gpu,
+            retirement,
         })
     }
     pub(super) fn projections(&self) -> &[NativeProjection] {
         &self.projections
     }
     pub(super) fn scratch_is_disjoint(&self, scratch: Span) -> bool {
+        if let Some(log) = self.retirement {
+            return log
+                .disjoint_live(scratch.ptr, scratch.bytes, self.gpu)
+                .is_ok();
+        }
         // Recheck every borrowed store owner, not only selected projections.
         // No model-wide metadata retention, device access or allocation.
         self.owner.names().all(|name| {

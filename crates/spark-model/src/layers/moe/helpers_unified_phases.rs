@@ -77,6 +77,26 @@ impl MoeLayer {
         keep_originals: bool,
         keep_shared_originals: bool,
     ) -> Result<()> {
+        self.transpose_unified_down_owned(
+            gpu,
+            config,
+            routed_group,
+            keep_originals,
+            keep_shared_originals,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn transpose_unified_down_owned(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+        routed_group: usize,
+        keep_originals: bool,
+        keep_shared_originals: bool,
+        mut release: Option<&mut dyn FnMut(usize, bool, DevicePtr) -> Result<()>>,
+    ) -> Result<()> {
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
         let shared_inter = config.shared_expert_intermediate_size;
@@ -105,10 +125,15 @@ impl MoeLayer {
 
         if !keep_originals {
             // ── Phase D: free down untransposed ──
-            for expert in &mut self.weights.experts {
+            for (index, expert) in self.weights.experts.iter_mut().enumerate() {
                 if !expert.down_proj.weight.is_null() {
-                    gpu.free(expert.down_proj.weight)?;
-                    gpu.free(expert.down_proj.weight_scale)?;
+                    if let Some(release) = release.as_mut() {
+                        release(index, false, expert.down_proj.weight)?;
+                        release(index, true, expert.down_proj.weight_scale)?;
+                    } else {
+                        gpu.free(expert.down_proj.weight)?;
+                        gpu.free(expert.down_proj.weight_scale)?;
+                    }
                     expert.down_proj.weight = DevicePtr::NULL;
                     expert.down_proj.weight_scale = DevicePtr::NULL;
                 }
