@@ -282,3 +282,38 @@ clean v20 only by these diagnostics and graph/overlap settings. Both services
 stop gracefully, exit0/OOMKilled=false, preserved as
 `atlas-glm53-v20-cache-profile-ep0/1`. No native builder or standalone GPU
 workload overlapped the model run.
+
+## v22 hidden trace: native and recovery gates pass; divergence localized
+
+Source `b4092742` corrects the diagnostic guard to inspect actual adapter
+ownership, including sticky failed-install history, while accepting the inert
+no-pool Fold route. It does not change proposer math. Both nodes verify v22
+executable SHA256
+`dfaf9ebfa5262b8f3f5f8fc7b54564c3a37b52b97d36dd4d336b77c6ef97a5b1`.
+Six sequential148/64 requests cap successfully. Complete-file analysis accounts
+for all384 records, with no missing/foreign/duplicate/order/chain errors.
+
+Across repeats, rank0 step0 has identical conditioning inputs but differing
+post-body/norm hashes; rank1 is mostly stable. Both ranks agree on all gathered
+argmax pairs and draft tokens. This narrows the unmeasured region to EH/body/
+normalization/private state, not a proven reset or kernel bug. See
+[the complete trace evidence](glm-mtp-hidden-trace-v22-results.md).
+
+Four answer checks, the1984-token needle, cancellation, and four fresh recovery
+answers pass. Root stops both services gracefully, exit0/OOMKilled=false,
+preserving `atlas-glm53-v22-hidden-clean-ep0/1`. These instrumented64-output
+requests are not throughput qualification; v20's28.529 confirmed C1 full-wall
+median and the separate older47.319 C4 profile remain the measured baselines.
+
+The subsequent read-only audit rules out the simple full-head configuration
+hypothesis: explicit MLA dimension overrides reach Q, attention, V and O, and
+comm=None suppresses TP/EP reductions. No scratch/stream ownership violation
+is established. Captured prompt-prefix rows/private KV remain unmeasured.
+The proposed next probe hashes only the post-EH step0 row within the existing
+request-owned trace budget; no reset, precision or serving-layout change.
+
+Separately, `d5f9cde9` seals native B-tile provenance and a4MiB repack workspace.
+Its856 CPU tests cover real production validation, typed dispatch and ownership,
+including exhaustive scalar/copy/launch/sync fault injection. There is no loader
+caller, Ready publication or enabled serving reader, and therefore no claimed
+model speedup from this infrastructure commit.
