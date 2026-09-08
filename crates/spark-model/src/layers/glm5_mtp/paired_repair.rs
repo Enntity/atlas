@@ -58,64 +58,7 @@ impl Glm5MtpHead {
         stream: u64,
     ) -> Result<Vec<u32>> {
         let owner = self.paired.as_ref().context("paired repair pool missing")?;
-        let (index, pending, source, bonus, next) = {
-            let pool = owner.lock();
-            pool.scratch_idle()?;
-            let index = pool.matches_request(state, input, ctx)?;
-            let slot = &pool.slots[index];
-            let repair_state::RepairPhase::Pending(record) = state.repair else {
-                anyhow::bail!("paired repair has no owned verdict");
-            };
-            let accepted = record
-                .plan
-                .bonus_hidden_row()
-                .context("paired bonus row missing")?;
-            let pending = state
-                .repair
-                .pending(slot.generation, input.data().position, accepted)?;
-            pool.pending_input(index, input, pending)?;
-            ensure!(
-                slot.commit_queued && state.seq_len == pending.cached_rows && !slot.proposing,
-                "paired repair precedes target commit or private cursor changed"
-            );
-            let view = slot.bonus.as_ref().context("paired repair bonus absent")?;
-            ensure!(
-                view.generation == slot.generation
-                    && view.row == 5
-                    && view.rows == 1
-                    && view.position.checked_add(1) == Some(input.data().position),
-                "paired repair bonus position/identity changed"
-            );
-            let next = pool.limits()?.propose(
-                pending.plan.state(),
-                slot.generation,
-                input.data().position,
-                pending.plan.state().cache_rows(),
-                4,
-            )?;
-            (
-                index,
-                pending,
-                DeviceSpan {
-                    ptr: pool.slab.offset(index * SLOT_BYTES + ROW_BYTES),
-                    bytes: accepted * ROW_BYTES,
-                },
-                pool.slab.offset(index * SLOT_BYTES + 5 * ROW_BYTES),
-                next,
-            )
-        };
-        {
-            let cache = self.kv_cache.lock();
-            self.validate_kv_blocks(&cache, &state.block_table)?;
-            if let Some(write) = pending.plan.write() {
-                self.validate_kv_inputs(
-                    &pending.tokens[write.token_start()..write.token_start() + write.rows()],
-                    source,
-                    ctx,
-                    &cache,
-                )?;
-            }
-        }
+        let (index, pending, source, bonus, next) = self.repair_plan(input, state, ctx)?;
         owner.lock().slots[index].writing = true;
         state.repair = repair_state::RepairPhase::Failed;
         let result = (|| {
@@ -171,5 +114,82 @@ impl Glm5MtpHead {
             state.repair = repair_state::RepairPhase::Failed;
         }
         result
+    }
+    pub(super) fn repair_plan(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        state: &Glm5MtpProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<(
+        usize,
+        repair_state::PendingRepair,
+        DeviceSpan,
+        DevicePtr,
+        crate::speculative::glm_pair_plan::ProposalPlan,
+    )> {
+        let owner = self.paired.as_ref().context("paired repair pool missing")?;
+        let (index, pending, source, bonus, next) = {
+            let pool = owner.lock();
+            pool.scratch_idle()?;
+            let index = pool.matches_request(state, input, ctx)?;
+            pool.next_attempt(index)?;
+            let slot = &pool.slots[index];
+            let repair_state::RepairPhase::Pending(record) = state.repair else {
+                anyhow::bail!("paired repair has no owned verdict");
+            };
+            let accepted = record
+                .plan
+                .bonus_hidden_row()
+                .context("paired bonus row missing")?;
+            let pending = state
+                .repair
+                .pending(slot.generation, input.data().position, accepted)?;
+            pool.pending_input(index, input, pending)?;
+            ensure!(
+                slot.commit_queued && state.seq_len == pending.cached_rows && !slot.proposing,
+                "paired repair precedes target commit or private cursor changed"
+            );
+            let view = slot.bonus.as_ref().context("paired repair bonus absent")?;
+            ensure!(
+                view.generation == slot.generation
+                    && view.row == 5
+                    && view.rows == 1
+                    && view.position.checked_add(1) == Some(input.data().position),
+                "paired repair bonus position/identity changed"
+            );
+            let next = pool.limits()?.propose(
+                pending.plan.state(),
+                slot.generation,
+                input.data().position,
+                pending.plan.state().cache_rows(),
+                4,
+            )?;
+            (
+                index,
+                pending,
+                DeviceSpan {
+                    ptr: pool.slab.offset(index * SLOT_BYTES + ROW_BYTES),
+                    bytes: accepted * ROW_BYTES,
+                },
+                pool.slab.offset(index * SLOT_BYTES + 5 * ROW_BYTES),
+                next,
+            )
+        };
+        {
+            let cache = self.kv_cache.lock();
+            self.validate_kv_blocks(&cache, &state.block_table)?;
+            if let Some(write) = pending.plan.write() {
+                self.plan_kv_rows(
+                    &pending.tokens[write.token_start()..write.token_start() + write.rows()],
+                    source,
+                    write.cache_start(),
+                    &state.block_table,
+                    ctx,
+                    &cache,
+                )?;
+            }
+        }
+        self.proposal_metadata(state, next, ctx)?;
+        Ok((index, pending, source, bonus, next))
     }
 }

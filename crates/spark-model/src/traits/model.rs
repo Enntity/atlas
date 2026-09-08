@@ -96,6 +96,12 @@ pub fn padded_batch_n(n: usize) -> usize {
 }
 
 pub trait Model: Send + Sync {
+    /// Optional checked GLM paired execution; absent on legacy/other models.
+    fn glm_paired_execution(
+        &self,
+    ) -> Option<&dyn crate::speculative::glm_paired_execution::GlmPairedExecution> {
+        None
+    }
     /// Release the device memory this model owns, in reverse construction
     /// order.
     ///

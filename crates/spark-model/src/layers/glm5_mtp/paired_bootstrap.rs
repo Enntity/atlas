@@ -17,23 +17,79 @@ impl Glm5MtpHead {
             .as_any_mut()
             .downcast_mut::<Glm5MtpProposerState>()
             .context("paired proposal requires actual GLM state")?;
-        self.validate_paired_live(state, ctx.gpu)?;
-        ensure!(
-            stream == ctx.gpu.default_stream()
-                && !ctx.graph_capture
-                && !ctx.gpu.stream_is_capturing(stream)
-                && (token as usize) < ctx.config.vocab_size,
-            "paired proposal requires eager default stream and valid token"
-        );
+        self.check_owned_proposal(token, state, ctx, stream)?;
         if matches!(state.repair, repair_state::RepairPhase::Pending(_)) {
             return self.paired_repair_owned(input, token, state, ctx, stream);
         }
+        let owner = self.paired.as_ref().context("paired pool missing")?;
+        let data = input.data();
+        let (index, tail, bonus, finish, next) = self.bootstrap_plan(input, state, ctx)?;
+        owner.lock().slots[index].writing = true;
+        state.repair = repair_state::RepairPhase::Failed;
+        let result = (|| {
+            let write = finish
+                .write()
+                .context("paired bootstrap missing write plan")?;
+            self.write_kv_rows(
+                &data.tokens[write.token_start()..write.token_start() + 1],
+                tail,
+                write.cache_start(),
+                &state.block_table,
+                ctx,
+                stream,
+            )?;
+            state.seq_len = finish.state().cache_rows();
+            state.last_num_drafted = 0;
+            state.repair = repair_state::RepairPhase::Proposed(next);
+            {
+                let mut pool = owner.lock();
+                pool.matches_request(state, input, ctx)?;
+                pool.slots[index].writing = false;
+                pool.slots[index].proposing = true;
+            }
+            let drafts = self.propose(
+                token,
+                bonus.ptr,
+                data.position,
+                4,
+                state,
+                ctx,
+                stream,
+                None,
+                None,
+                None,
+            )?;
+            let mut pool = owner.lock();
+            pool.slots[index].proposing = false;
+            pool.issue(index, data.position, token, &drafts, data.tokens)?;
+            Ok(drafts)
+        })();
+        if result.is_err() {
+            owner.lock().slots[index].failed = true;
+            state.repair = repair_state::RepairPhase::Failed;
+        }
+        result
+    }
+
+    pub(super) fn bootstrap_plan(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        state: &Glm5MtpProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<(
+        usize,
+        DeviceSpan,
+        DeviceSpan,
+        crate::speculative::glm_pair_plan::FinishPlan,
+        crate::speculative::glm_pair_plan::ProposalPlan,
+    )> {
         let owner = self.paired.as_ref().context("paired pool missing")?;
         let data = input.data();
         let (index, tail, bonus, finish, next) = {
             let pool = owner.lock();
             pool.scratch_idle()?;
             let index = pool.matches_request(state, input, ctx)?;
+            pool.next_attempt(index)?;
             let slot = &pool.slots[index];
             ensure!(
                 matches!(state.repair, repair_state::RepairPhase::Capture)
@@ -99,59 +155,19 @@ impl Glm5MtpHead {
         };
         {
             let cache = self.kv_cache.lock();
-            self.validate_kv_inputs(
-                &data.tokens[data.prompt..data.prompt + 1],
+            let write = finish.write().context("paired bootstrap missing write")?;
+            self.plan_kv_rows(
+                &data.tokens[write.token_start()..write.token_start() + write.rows()],
                 tail,
+                write.cache_start(),
+                &state.block_table,
                 ctx,
                 &cache,
             )?;
             self.validate_kv_blocks(&cache, &state.block_table)?;
         }
-        owner.lock().slots[index].writing = true;
-        state.repair = repair_state::RepairPhase::Failed;
-        let result = (|| {
-            let write = finish
-                .write()
-                .context("paired bootstrap missing write plan")?;
-            self.write_kv_rows(
-                &data.tokens[write.token_start()..write.token_start() + 1],
-                tail,
-                write.cache_start(),
-                &state.block_table,
-                ctx,
-                stream,
-            )?;
-            state.seq_len = finish.state().cache_rows();
-            state.last_num_drafted = 0;
-            state.repair = repair_state::RepairPhase::Proposed(next);
-            {
-                let mut pool = owner.lock();
-                pool.matches_request(state, input, ctx)?;
-                pool.slots[index].writing = false;
-                pool.slots[index].proposing = true;
-            }
-            let drafts = self.propose(
-                token,
-                bonus.ptr,
-                data.position,
-                4,
-                state,
-                ctx,
-                stream,
-                None,
-                None,
-                None,
-            )?;
-            let mut pool = owner.lock();
-            pool.slots[index].proposing = false;
-            pool.issue(index, data.position, token, &drafts, data.tokens)?;
-            Ok(drafts)
-        })();
-        if result.is_err() {
-            owner.lock().slots[index].failed = true;
-            state.repair = repair_state::RepairPhase::Failed;
-        }
-        result
+        self.proposal_metadata(state, next, ctx)?;
+        Ok((index, tail, bonus, finish, next))
     }
 
     pub(in crate::layers::glm5_mtp) fn authorize_paired_propose(

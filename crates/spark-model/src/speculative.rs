@@ -6,6 +6,7 @@
 //! MTP implements this first; EAGLE-3 can implement later without engine changes.
 
 pub mod glm_pair_plan;
+pub mod glm_paired_execution;
 pub mod glm_repair;
 pub mod glm_repair_policy;
 pub mod ladder;

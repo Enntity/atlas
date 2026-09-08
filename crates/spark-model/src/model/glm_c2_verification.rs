@@ -15,11 +15,8 @@ impl TransformerModel {
         if self.paired_handoff().is_none() {
             return Ok(false);
         }
-        let end = seq
-            .seq_len
-            .checked_add(width)
-            .context("paired verify end overflow")?;
-        let needed = end.div_ceil(cache.block_size());
+        ensure!(width == 5, "paired target allocation requires K5");
+        let (end, needed) = self.paired_target_budget(seq, cache)?;
         crate::model::block_mgmt::ensure_blocks_through_decode(
             seq,
             needed - 1,
@@ -104,59 +101,7 @@ impl TransformerModel {
         let Some(capability) = self.paired_handoff() else {
             return Ok(false);
         };
-        self.paired_profile(seq)?;
-        self.paired_ssm_bindings(seq)?;
-        let end = seq
-            .seq_len
-            .checked_add(5)
-            .context("paired target K5 end overflow")?;
-        let sizes = self.buffers.sizes();
-        let metadata_end = (self.max_blocks_per_seq as usize)
-            .checked_mul(20)
-            .and_then(|n| n.checked_add(32768 + 768))
-            .context("paired K5 metadata overflow")?;
-        ensure!(
-            tokens.len() == 5
-                && end <= 2048
-                && tokens
-                    .iter()
-                    .all(|&t| (t as usize) < self.config.vocab_size)
-                && self.mtp_slot_draft_capacity(seq.slot_idx) >= 4
-                && self.buffers.max_batch_tokens() >= 5
-                && sizes.hidden_states >= 5 * 8192
-                && sizes.norm_output >= 5 * 8192
-                && sizes.logits >= 5 * self.config.vocab_size * 2
-                && sizes.scratch >= metadata_end
-                && seq.disk_block_ids.is_empty()
-                && seq.hss_window_start() == 0,
-            "paired K5 requires actual dense target rows/arena/slot capacity"
-        );
-        {
-            let cache = self.kv_cache.lock();
-            ensure!(
-                cache.config().cache_blocks_per_seq.is_none(),
-                "paired K5 does not support HSS target cache"
-            );
-            self.paired_target_map(seq, &cache, seq.seq_len)?;
-        }
-        let scratch = self.buffers.scratch().0;
-        let scratch_end = scratch
-            .checked_add(sizes.scratch as u64)
-            .context("paired scratch end overflow")?;
-        ensure!(scratch != 0, "paired scratch owner is null");
-        for (pointer, bytes) in [
-            (self.buffers.hidden_states(), sizes.hidden_states),
-            (self.buffers.norm_output(), sizes.norm_output),
-        ] {
-            let end = pointer
-                .0
-                .checked_add(bytes as u64)
-                .context("paired target span overflow")?;
-            ensure!(
-                !pointer.is_null() && (end <= scratch || scratch_end <= pointer.0),
-                "paired target scratch aliases actual hidden owner"
-            );
-        }
+        self.paired_validate_verify(seq, tokens)?;
         let mut state = seq
             .proposer_state
             .take()

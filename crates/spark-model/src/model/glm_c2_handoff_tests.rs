@@ -8,6 +8,8 @@ mod decode_fault_tests;
 mod fixture;
 #[path = "glm_c2_legacy_boundary_tests.rs"]
 mod legacy_boundary_tests;
+#[path = "glm_c2_predispatch_tests.rs"]
+mod predispatch_tests;
 #[path = "glm_c2_handoff_preflight_tests.rs"]
 mod preflight_tests;
 #[path = "glm_c2_verdict_continuation_tests.rs"]

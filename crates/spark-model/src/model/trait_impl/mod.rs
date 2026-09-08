@@ -50,6 +50,12 @@ pub(in crate::model) mod verify_e2;
 mod verify_fused;
 
 impl Model for TransformerModel {
+    fn glm_paired_execution(
+        &self,
+    ) -> Option<&dyn crate::speculative::glm_paired_execution::GlmPairedExecution> {
+        self.paired_handoff()
+            .map(|_| self as &dyn crate::speculative::glm_paired_execution::GlmPairedExecution)
+    }
     fn teardown(&mut self) -> Result<()> {
         self.release_pools()
     }

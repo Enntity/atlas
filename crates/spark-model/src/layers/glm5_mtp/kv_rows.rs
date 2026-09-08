@@ -269,6 +269,33 @@ impl Glm5MtpHead {
         Ok(forbidden)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_kv_rows(
+        &self,
+        tokens: &[u32],
+        source: DeviceSpan,
+        row_base: usize,
+        blocks: &[u32],
+        ctx: &ForwardContext,
+        cache: &PagedKvCache,
+    ) -> Result<KvRowsPlan> {
+        let forbidden = self.validate_kv_inputs(tokens, source, ctx, cache)?;
+        self.validate_kv_blocks(cache, blocks)?;
+        KvRowsPlan::new(
+            tokens,
+            source,
+            ctx.config.hidden_size,
+            ctx.config.vocab_size,
+            row_base,
+            cache.block_size(),
+            blocks,
+            cache.num_blocks(),
+            ctx.buffers.max_batch_tokens(),
+            ctx.buffers.scratch_bytes(),
+            &forbidden,
+        )
+    }
+
     /// Sources are already shifted and owned outside mutable scratch. Blocks
     /// are already allocated exclusively. This writes rows but never changes
     /// seq_len/last_num_drafted or allocates blocks; callers own commit policy.
@@ -283,21 +310,7 @@ impl Glm5MtpHead {
         stream: u64,
     ) -> Result<()> {
         let mut cache = self.kv_cache.lock();
-        let forbidden = self.validate_kv_inputs(tokens, source, ctx, &cache)?;
-        self.validate_kv_blocks(&cache, blocks)?;
-        let plan = KvRowsPlan::new(
-            tokens,
-            source,
-            ctx.config.hidden_size,
-            ctx.config.vocab_size,
-            row_base,
-            cache.block_size(),
-            blocks,
-            cache.num_blocks(),
-            ctx.buffers.max_batch_tokens(),
-            ctx.buffers.scratch_bytes(),
-            &forbidden,
-        )?;
+        let plan = self.plan_kv_rows(tokens, source, row_base, blocks, ctx, &cache)?;
         if super::kv_rows_oracle::enabled(tokens.len()) {
             self.verify_kv_rows(tokens, &plan, source, blocks, &mut cache, ctx, stream)
         } else {

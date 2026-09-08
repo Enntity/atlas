@@ -7,6 +7,8 @@ use anyhow::{Context, Result, ensure};
 use std::sync::atomic::Ordering;
 #[path = "glm_c2_handoff_decode.rs"]
 mod decode;
+#[path = "glm_c2_predispatch.rs"]
+mod predispatch;
 #[path = "glm_c2_ssm.rs"]
 mod ssm;
 #[path = "glm_c2_verification.rs"]
@@ -73,15 +75,7 @@ impl TransformerModel {
         let Some(capability) = self.paired_handoff() else {
             return Ok(None);
         };
-        ensure!(
-            !grammar && drafts == 4 && position == seq.seq_len,
-            "paired proposal requires fixed four drafts at actual request position"
-        );
-        use crate::traits::Model;
-        ensure!(
-            self.mtp_slot_draft_capacity(seq.slot_idx) >= 4,
-            "paired target slot lacks actual K5 capacity"
-        );
+        self.paired_validate_propose(seq, token, position, drafts, grammar)?;
         let mut state = seq
             .proposer_state
             .take()

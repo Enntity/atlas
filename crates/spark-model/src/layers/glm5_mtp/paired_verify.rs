@@ -3,6 +3,13 @@
 use super::*;
 
 impl Pool {
+    pub(super) fn next_attempt(&self, index: usize) -> Result<u64> {
+        let slot = &self.slots[index];
+        ensure!(slot.issued.is_none(), "paired proposal already issued");
+        slot.attempt
+            .checked_add(1)
+            .context("paired attempt exhausted")
+    }
     pub(super) fn scratch_idle(&self) -> Result<()> {
         ensure!(
             !self.producer_failed && self.verification.is_none(),
@@ -28,12 +35,8 @@ impl Pool {
             prefix.len() == base && base <= self.context,
             "paired issued prefix exceeds actual context"
         );
+        let attempt = self.next_attempt(index)?;
         let slot = &mut self.slots[index];
-        ensure!(slot.issued.is_none(), "paired proposal already issued");
-        let attempt = slot
-            .attempt
-            .checked_add(1)
-            .context("paired attempt exhausted")?;
         let mut tokens = [seed; 5];
         tokens[1..].copy_from_slice(drafts);
         slot.attempt = attempt;
@@ -67,24 +70,18 @@ impl Pool {
     }
 }
 
-impl Glm5MtpHead {
-    pub(super) fn paired_begin_verify(
+impl Pool {
+    fn verify_candidate(
         &self,
         input: &crate::model::GlmPairedInput<'_>,
         tokens: &[u32],
-        state: &mut dyn ProposerState,
+        state: &Glm5MtpProposerState,
         ctx: &ForwardContext,
-    ) -> Result<()> {
-        let state = state
-            .as_any_mut()
-            .downcast_mut::<Glm5MtpProposerState>()
-            .context("paired K5 state missing")?;
-        self.validate_paired_live(state, ctx.gpu)?;
-        let mut pool = self.paired.as_ref().context("paired pool missing")?.lock();
-        pool.scratch_idle()?;
-        let index = pool.matches_request(state, input, ctx)?;
+    ) -> Result<Verification> {
+        self.scratch_idle()?;
+        let index = self.matches_request(state, input, ctx)?;
         let slab = kv_rows_plan::DeviceSpan {
-            ptr: pool.slab,
+            ptr: self.slab,
             bytes: SLAB_BYTES,
         };
         for span in [
@@ -102,7 +99,7 @@ impl Glm5MtpHead {
                 "paired K5 actual scratch aliases owned slab"
             );
         }
-        let slot = &pool.slots[index];
+        let slot = &self.slots[index];
         let issued = slot.issued.context("paired K5 has no issued proposal")?;
         let repair_state::RepairPhase::Proposed(plan) = state.repair else {
             anyhow::bail!("paired K5 requires outstanding proposal");
@@ -119,13 +116,52 @@ impl Glm5MtpHead {
                 && !slot.proposing,
             "paired K5 does not match actual issued proposal"
         );
-        pool.verification = Some(Verification {
+        Ok(Verification {
             slot: index,
             generation: slot.generation,
             issued,
             normalized: input.data().normalized.ptr,
             produced: false,
-        });
+        })
+    }
+}
+
+impl Glm5MtpHead {
+    pub(super) fn paired_validate_verify(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        tokens: &[u32],
+        state: &dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        let state = state
+            .as_any()
+            .downcast_ref::<Glm5MtpProposerState>()
+            .context("paired K5 state missing")?;
+        self.validate_paired_live(state, ctx.gpu)?;
+        self.paired
+            .as_ref()
+            .context("paired pool missing")?
+            .lock()
+            .verify_candidate(input, tokens, state, ctx)?;
+        Ok(())
+    }
+
+    pub(super) fn paired_begin_verify(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        tokens: &[u32],
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        let state = state
+            .as_any_mut()
+            .downcast_mut::<Glm5MtpProposerState>()
+            .context("paired K5 state missing")?;
+        self.validate_paired_live(state, ctx.gpu)?;
+        let mut pool = self.paired.as_ref().context("paired pool missing")?.lock();
+        let candidate = pool.verify_candidate(input, tokens, state, ctx)?;
+        pool.verification = Some(candidate);
         Ok(())
     }
 

@@ -13,6 +13,8 @@ mod bootstrap;
 mod close;
 #[path = "paired_lifecycle.rs"]
 mod lifecycle;
+#[path = "paired_predispatch.rs"]
+mod predispatch;
 #[path = "paired_prime.rs"]
 mod prime;
 #[path = "paired_repair.rs"]

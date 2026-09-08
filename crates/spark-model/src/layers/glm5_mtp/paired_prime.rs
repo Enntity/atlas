@@ -40,6 +40,25 @@ impl Pool {
 }
 
 impl GlmPairedHandoff for Glm5MtpHead {
+    fn validate_verify(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        tokens: &[u32],
+        state: &dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_validate_verify(input, tokens, state, ctx)
+    }
+    fn validate_propose(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        seed: u32,
+        state: &dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.paired_validate_propose(input, seed, state, ctx, stream)
+    }
     fn commit_target(
         &self,
         input: &crate::model::GlmPairedInput<'_>,

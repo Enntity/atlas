@@ -53,6 +53,21 @@ pub trait GlmPairRepair: Send + Sync {
 
 /// Optional GLM-only request-owned path; legacy and other proposers lack it.
 pub trait GlmPairedHandoff: Send + Sync {
+    fn validate_verify(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        tokens: &[u32],
+        state: &dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()>;
+    fn validate_propose(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        seed: u32,
+        state: &dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()>;
     fn commit_target(
         &self,
         input: &crate::model::GlmPairedInput<'_>,
