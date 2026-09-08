@@ -78,3 +78,58 @@ pairs then continuation, untouched inactive-owner sentinels, cancellation at
 transaction boundaries, retirement/reuse, stale/aliased/undersized spans and
 fixed-pointer graph replay. Start eager against serialized B before graphs.
 No engine throughput estimate follows from this audit or the MLA microtest.
+
+## Follow-up: actual C2 FFN topology and the M10 scheduling cliff
+
+Source audit at `b66f1d34`, independently reviewed on 2026-09-08. These are
+dispatch facts, not new GPU timing measurements.
+
+Both `glm5_kda/multi_seq.rs` and
+`qwen3_attention/trait_impl/multi_seq/mod.rs` retain per-row scalar MoE for
+independent C2. C3 and C4 can use their grouped FFN arms. Thus C2 repeats the
+router, routed gate/up/down, routed reduction, replicated shared-expert blend
+and per-row mHC consumption. A shared output arena must be consumed before the
+next scalar row overwrites it; changing the row loop alone is not batching.
+
+In `moe/forward.rs`, each scalar GLM EP2 row reduces 8192 bytes of routed BF16
+output and adds the replicated shared expert **after** reduction, exactly once.
+C2 therefore issues two such reductions per MoE layer, compared with one
+24576-byte grouped C3 or one 32768-byte grouped C4 reduction. C4's separate
+scalar control issues four. These counts exclude attention/projection
+collectives. `nccl_backend/comm_impl.rs::all_reduce_async` orders each reduction
+with two event records and two stream waits; its configured two-rank fast path
+uses send/receive plus a local BF16 add. These are GPU dependencies, not routine
+host synchronization. Captured execution uses a different reduction entry.
+
+The current hot path replicates routing and reduces rank-local expert outputs;
+it is not the unused `forward_ep_dispatch` token-all-to-all scaffold. Likewise,
+a TP2 vLLM recipe does not establish the same expert partition as Atlas EP2.
+An earlier C2 batched FFN experiment was neutral on GB10
+(`docs/glm53-dual-spark.md`, concurrent decode section). Do not simply re-enable
+that older batch-two kernel and predict a gain; any new candidate must identify
+which dispatch, weight reuse or collective cost actually changed.
+
+For future paired verification, calling generic grouped prefill with ten rows
+has another important condition in `moe/forward_prefill_routed.rs`:
+
+- With unpublished B-tile storage, default NVFP4 exact-tile sizing and eager
+  execution, its conservative bound is `ceil(rows * top_k / 64)`.
+- K5 has 40 routes and one tile, so exact sizing does not read offsets back.
+  M10 has 80 routes and two tiles, enabling a GPU-to-host read of all 289 expert
+  offsets: 1156 bytes **per MoE layer**, with the associated stream-draining
+  boundary. Setting a truncating load-factor cap is not a valid optimization.
+- Published resident B-tile storage already bypasses this readback and uses
+  `ceil(rows / 64)`: unique top-k routing visits each expert at most once per
+  token. That resident path is not activated in the serving baseline and must
+  not be silently assumed by the first paired verifier.
+- Existing compact-worklist selection names K5/C3/C4 and excludes M10. A proper
+  ten-row path needs explicit GPU-resident work planning and checked workspace
+  capacity, not just a wider GEMM. Two K5 FFN reductions move 40960 bytes each;
+  one paired reduction could move 81920 bytes, with the same per-owner results
+  and the shared expert added only after the routed sum.
+
+The smallest useful later profile covers one KDA and one MLA FFN from routing
+through mHC: collective call counts/bytes, dense versus compact tiles, expert
+offset readback counts/bytes, and actual eager/graph topology. Diagnostic
+synchronization must not be enabled in qualifying throughput measurements.
+This refines Partition C; it does not expand the current Gate 2 ownership work.
