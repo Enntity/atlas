@@ -2119,3 +2119,7 @@ extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact
 
 // GLM-only, default-off small-M gate/up A/B. Existing down is unchanged.
 #include "glm_moe_gate_up_m16.cuh"
+
+// Staged GLM B-tile exports. No loader/serving selection is enabled here.
+#include "glm_moe_btile.cuh"
+#include "glm_moe_btile_m64.cuh"
