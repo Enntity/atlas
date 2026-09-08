@@ -91,6 +91,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.btile_input_guard(input, 4, ctx, stream)?;
         anyhow::ensure!(
             crate::model::glm_c4::enabled(&ctx.config.model_type)
                 && super::prequant_fp4::c4_grouped_shape(ctx.config, 4, ctx.levers.max_decode_seqs)

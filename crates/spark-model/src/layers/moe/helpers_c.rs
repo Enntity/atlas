@@ -21,6 +21,7 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
         stream: u64,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
         let shared_inter = config.shared_expert_intermediate_size;
         let num_experts = config.num_experts;
@@ -75,6 +76,7 @@ impl MoeLayer {
         shared_expert: Fp8ExpertWeight,
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         self.fp8_gate_weight_ptrs = Some(build_fp8_ptr_table(experts, |e| &e.gate_proj, gpu)?);
         self.fp8_up_weight_ptrs = Some(build_fp8_ptr_table(experts, |e| &e.up_proj, gpu)?);
         self.fp8_down_weight_ptrs = Some(build_fp8_ptr_table(experts, |e| &e.down_proj, gpu)?);
@@ -101,6 +103,7 @@ impl MoeLayer {
         shared_down: DevicePtr,
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         use super::build_bf16_ptr_table;
         self.bf16_gate_weight_ptrs = Some(build_bf16_ptr_table(gate_experts, gpu)?);
         self.bf16_up_weight_ptrs = Some(build_bf16_ptr_table(up_experts, gpu)?);
@@ -129,6 +132,7 @@ impl MoeLayer {
         up_proj: DenseWeight,
         down_proj: DenseWeight,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         self.bf16_shared_expert = Some(Bf16SharedExpert::new(gate_proj, up_proj, down_proj)?);
         Ok(())
     }

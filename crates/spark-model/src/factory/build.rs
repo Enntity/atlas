@@ -365,6 +365,13 @@ pub fn build_model(
         max_batch_size,
         gpu.as_ref(),
     )?;
+    crate::layers::moe::bind_resident_btile_arenas(
+        &config,
+        &store,
+        gpu.as_ref(),
+        &mut layers,
+        &buffers,
+    )?;
 
     // ── Step 5: Size KV cache from actual free memory ──
     // MLA absorbed: cache compressed latent [kv_lora + rope] instead of expanded [nkv * hd]

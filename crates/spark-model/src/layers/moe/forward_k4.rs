@@ -16,6 +16,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.btile_input_guard(input, 4, ctx, stream)?;
         let optimized = self.lora.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
@@ -24,7 +25,7 @@ impl MoeLayer {
                 self.experts_scale_kind,
                 crate::weight_map::WeightQuantFormat::Nvfp4
             )
-            && self.use_t_layout_for_decode()
+            && self.use_btile_or_t_decode()
             && self.weights.shared_expert_gate.weight.is_null()
             && !self.weights.shared_expert.gate_proj.is_null()
             && !self.weights.shared_expert.up_proj.is_null()

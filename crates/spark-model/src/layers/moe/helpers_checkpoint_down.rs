@@ -12,7 +12,30 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
         ordinal: usize,
         log: &RetirementLog<'_>,
-    ) -> Result<()> {
+    ) -> Result<Vec<QuantizedWeight>> {
+        let mut origins = self.validate_checkpoint_down(gpu, config, ordinal, log)?;
+        let mut release = |expert, scale, ptr| {
+            let (expected, origin) = origins
+                .remove(&(expert, scale))
+                .ok_or_else(|| anyhow::anyhow!("missing/consumed down retirement receipt"))?;
+            anyhow::ensure!(ptr == expected, "changed down allocation before release");
+            log.release_origin(log.store(), origin, gpu)
+        };
+        self.transpose_unified_down_owned(gpu, config, 16, false, true, Some(&mut release))
+    }
+
+    pub(super) fn validate_checkpoint_down(
+        &self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+        ordinal: usize,
+        log: &RetirementLog<'_>,
+    ) -> Result<
+        std::collections::HashMap<
+            (usize, bool),
+            (DevicePtr, crate::weight_loader::glm5::retirement::Origin),
+        >,
+    > {
         use spark_runtime::weights::WeightDtype;
         anyhow::ensure!(
             self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4,
@@ -80,15 +103,6 @@ impl MoeLayer {
                 ),
             );
         }
-        // Every source is proven before the first transform/allocation. Each
-        // receipt is consumed at the existing free, including a failed attempt.
-        let mut release = |expert, scale, ptr| {
-            let (expected, origin) = origins
-                .remove(&(expert, scale))
-                .ok_or_else(|| anyhow::anyhow!("missing/consumed down retirement receipt"))?;
-            anyhow::ensure!(ptr == expected, "changed down allocation before release");
-            log.release_origin(log.store(), origin, gpu)
-        };
-        self.transpose_unified_down_owned(gpu, config, 16, false, true, Some(&mut release))
+        Ok(origins)
     }
 }

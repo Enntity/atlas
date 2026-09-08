@@ -43,8 +43,35 @@ pub(super) struct NativeProjection {
     pub input: Option<Span>,
     pub input_bits: Option<u32>,
 }
+/// Exact metadata captured only while validating the immutable native owner.
+#[derive(Clone)]
+pub(super) struct CheckpointIdentity {
+    name: String,
+    dtype: WeightDtype,
+    shape: Vec<usize>,
+    pub span: Span,
+}
+impl CheckpointIdentity {
+    pub(super) fn validate(&self, store: &WeightStore) -> Result<()> {
+        let tensor = store.get(&self.name)?;
+        ensure!(
+            tensor.ptr == self.span.ptr
+                && tensor.dtype == self.dtype
+                && tensor.shape == self.shape
+                && tensor
+                    .shape
+                    .iter()
+                    .try_fold(tensor.dtype.byte_size(), |n, &v| n.checked_mul(v))
+                    == Some(self.span.bytes),
+            "retained GU checkpoint identity changed: {}",
+            self.name
+        );
+        Ok(())
+    }
+}
 pub(super) struct NativeGateUpLayer<'s, 'g> {
     projections: Vec<NativeProjection>,
+    retained: Vec<CheckpointIdentity>,
     stream: u64,
     owner: &'s WeightStore,
     gpu: &'g dyn GpuBackend,
@@ -123,6 +150,7 @@ impl<'s, 'g> NativeGateUpLayer<'s, 'g> {
             "rank-local ownership map mismatch"
         );
         let mut projections = Vec::with_capacity(288);
+        let mut retained = Vec::with_capacity(288 * 4);
         let mut protected = Vec::with_capacity(1152);
         let mut names = HashSet::with_capacity(1152);
         for (expert, &owned) in local.iter().enumerate() {
@@ -168,6 +196,12 @@ impl<'s, 'g> NativeGateUpLayer<'s, 'g> {
                         .checked_mul(w.dtype.byte_size())
                         .ok_or_else(|| anyhow::anyhow!("native byte extent overflow: {name}"))?;
                     let span = Span::new(w.ptr, bytes, if shape.is_some() { 16 } else { 4 })?;
+                    retained.push(CheckpointIdentity {
+                        name: name.clone(),
+                        dtype: w.dtype,
+                        shape: w.shape.clone(),
+                        span,
+                    });
                     names.insert(name);
                     protected.push(span);
                     Ok(span)
@@ -233,6 +267,7 @@ impl<'s, 'g> NativeGateUpLayer<'s, 'g> {
         }
         Ok(Self {
             projections,
+            retained,
             stream,
             owner: store,
             gpu,
@@ -241,6 +276,9 @@ impl<'s, 'g> NativeGateUpLayer<'s, 'g> {
     }
     pub(super) fn projections(&self) -> &[NativeProjection] {
         &self.projections
+    }
+    pub(super) fn retained(&self) -> &[CheckpointIdentity] {
+        &self.retained
     }
     pub(super) fn scratch_is_disjoint(&self, scratch: Span) -> bool {
         if let Some(log) = self.retirement {

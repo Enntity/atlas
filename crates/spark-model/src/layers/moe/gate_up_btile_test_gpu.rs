@@ -4,7 +4,7 @@ use anyhow::{Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelArg, KernelHandle};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{
-    Mutex,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -27,7 +27,7 @@ pub(super) enum Event {
 }
 pub(super) struct Gpu {
     cache: spark_runtime::op_cache::OpCache,
-    pub events: Mutex<Vec<Event>>,
+    pub events: Arc<Mutex<Vec<Event>>>,
     memory: Mutex<BTreeMap<u64, (usize, Vec<u8>)>>,
     pub scalars: Mutex<HashMap<u64, u32>>,
     next: Mutex<u64>,
@@ -41,7 +41,7 @@ impl Gpu {
     pub fn new() -> Self {
         Self {
             cache: spark_runtime::op_cache::OpCache::new(),
-            events: Mutex::new(Vec::new()),
+            events: Arc::new(Mutex::new(Vec::new())),
             memory: Mutex::new(BTreeMap::new()),
             scalars: Mutex::new(HashMap::new()),
             next: Mutex::new(0x8000_0000_0000),
@@ -94,9 +94,12 @@ impl GpuBackend for Gpu {
         bail!("managed allocation")
     }
     fn free(&self, p: DevicePtr) -> Result<()> {
+        if p.is_null() {
+            return Ok(());
+        }
         ensure!(
             self.memory.lock().unwrap().remove(&p.0).is_some(),
-            "nonowned free"
+            "nonowned free {p:?}"
         );
         self.record(Event::Free(p))
     }

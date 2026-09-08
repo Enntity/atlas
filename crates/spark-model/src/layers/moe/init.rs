@@ -69,6 +69,7 @@ impl MoeLayer {
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
         Ok(Self {
             weights,
+            btile_storage: super::gate_up_repack::Storage::Legacy,
             // Default: standard NVFP4 (FP8-E4M3 per-16 + f32 global). The
             // DeepSeek-V4 native-MXFP4 loader overrides this to `Mxfp4E8m0`
             // after construction (see deepseek_v4/assemble.rs).

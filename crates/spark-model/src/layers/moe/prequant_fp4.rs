@@ -82,7 +82,7 @@ impl MoeLayer {
             && !self.has_mixed_bf16_shared_expert()
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
             && !self.nvfp4_mmq_layout
-            && self.use_t_layout_for_prefill()
+            && self.use_btile_or_t_prefill()
             && self.gate_fp8.is_none()
             && self.gate_nvfp4.is_none()
             && self.correction_bias_dev.is_some()

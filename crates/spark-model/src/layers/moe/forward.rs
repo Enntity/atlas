@@ -31,6 +31,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.btile_input_guard(input, 1, ctx, stream)?;
         // SOLID Incr-4: a genuine single-token decode (num_seqs == 1) folds the
         // routed expert down_proj LoRA delta below (before the wsum blend). The
         // multi-seq per-token reuse of this fn (num_seqs > 1 — decode_batch's
@@ -442,7 +443,7 @@ impl MoeLayer {
                     stream,
                 )
             })?;
-        } else if self.use_t_layout_for_decode() {
+        } else if self.btile_storage.is_published() || self.use_t_layout_for_decode() {
             prof!("exp_unified_t", {
                 self.dispatch_unified_t_decode(
                     ctx,

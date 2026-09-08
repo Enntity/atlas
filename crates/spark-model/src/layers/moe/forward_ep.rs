@@ -19,6 +19,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.btile_input_guard(input, 1, ctx, stream)?;
         use super::super::ep_dispatch::build_ep_routing_table;
 
         let h = ctx.config.hidden_size as u32;

@@ -86,6 +86,7 @@ impl MoeLayer {
         let Some(plan) = target_plan(config, layer, target, enabled)? else {
             return Ok(());
         };
+        self.btile_storage.require_legacy()?;
         anyhow::ensure!(
             !gpu.stream_is_capturing(stream),
             "shared FP8 cache load cannot capture"

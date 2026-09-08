@@ -18,6 +18,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.btile_input_guard(input, 5, ctx, stream)?;
         anyhow::ensure!(
             gate_weight.0 == self.weights.shared_expert_gate.weight.0,
             "GLM K=5 deferred shared gate does not belong to this MoE layer"
@@ -47,9 +48,10 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<(DevicePtr, Option<DevicePtr>)> {
+        self.btile_input_guard(input, 5, ctx, stream)?;
         let defer = allow_deferred_shared_hc
             && std::env::var("ATLAS_GLM_K5_FUSED_MOE_HC").as_deref() == Ok("1")
-            && self.use_t_layout_for_prefill()
+            && self.use_btile_or_t_prefill()
             && std::env::var("ATLAS_GLM_K5_GROUPED_MOE").as_deref() == Ok("1")
             && ctx.config.model_type == "glm5_next"
             && ctx.config.ep_world_size == 2
@@ -73,13 +75,14 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.btile_input_guard(input, 5, ctx, stream)?;
         // Experimental Marlin-shaped verifier path: keep the source activations
         // in BF16, then sort all five rows by expert and run Atlas's weight-only
         // W4A16 grouped GEMM. The GB10 kernel converts each activation/weight tile
         // to E4M3 on chip for FP8 MMA; unlike NVFP4 MMQ, it does not quantize and
         // stage the verifier activations in FP4. This preserves acceptance while
         // amortizing routed weights across the verifier batch.
-        if self.use_t_layout_for_prefill()
+        if self.use_btile_or_t_prefill()
             && std::env::var("ATLAS_GLM_K5_GROUPED_MOE").as_deref() == Ok("1")
         {
             self.forward_prefill(input, 5, ctx, stream)?;
@@ -94,7 +97,7 @@ impl MoeLayer {
                 self.experts_scale_kind,
                 crate::weight_map::WeightQuantFormat::Nvfp4
             )
-            && self.use_t_layout_for_decode()
+            && self.use_btile_or_t_decode()
             && self.weights.shared_expert_gate.weight.is_null()
             && !self.weights.shared_expert.gate_proj.is_null()
             && !self.weights.shared_expert.up_proj.is_null()

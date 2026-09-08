@@ -56,6 +56,7 @@ impl MoeLayer {
         reduce_ep: bool,
         routes: Option<PrecomputedRoutes>,
     ) -> Result<()> {
+        self.btile_input_guard(input, 2, ctx, stream)?;
         if !include_shared {
             anyhow::ensure!(
                 self.lora.is_none()
@@ -66,7 +67,7 @@ impl MoeLayer {
                         self.experts_scale_kind,
                         crate::weight_map::WeightQuantFormat::Nvfp4
                     )
-                    && self.use_t_layout_for_decode(),
+                    && self.use_btile_or_t_decode(),
                 "routed-only K2 requires unified-layout NVFP4 experts"
             );
         }
@@ -118,10 +119,10 @@ impl MoeLayer {
         // kernels are usable only since 37e818ad NULL-guarded their shared
         // expert (their `_t` siblings always had that guard); before it, this
         // faulted with CUDA 700 on the first 2-sequence batch.
-        let mixed_t_ok = self.use_t_layout_for_decode()
+        let mixed_t_ok = self.use_btile_or_t_decode()
             && self.moe_expert_gate_up_shared_batch2_t_k.0 != 0
             && self.moe_expert_silu_down_shared_batch2_t_k.0 != 0;
-        let mixed_orig_ok = !self.use_t_layout_for_decode()
+        let mixed_orig_ok = !self.use_btile_or_t_decode()
             && self.moe_expert_gate_up_shared_batch2.0 != 0
             && self.moe_expert_silu_down_shared_batch2.0 != 0
             && !self.gate_ptrs.packed_ptrs.is_null();
@@ -390,7 +391,7 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
-        } else if self.use_t_layout_for_decode() {
+        } else if self.use_btile_or_t_decode() {
             self.forward_k2_unified_t(
                 input,
                 indices_dev,

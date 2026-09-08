@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Construction-only lease. No raw table getter or serving publication.
-use super::{UnpublishedBTileLayer, kernels::KernelFamily, native_source::Span};
+use super::{
+    UnpublishedBTileLayer,
+    kernels::KernelFamily,
+    native_source::{NativeGateUpLayer, Span},
+};
 use crate::layers::moe::MoeLayer;
 use anyhow::{Result, ensure};
 
@@ -17,7 +21,28 @@ impl<'a, 's, 'g> Lease<'a, 's, 'g> {
         family: &'a KernelFamily<'g>,
         layer: &'a mut MoeLayer,
     ) -> Result<Self> {
-        let source = &unpublished.source;
+        let checked = ValidatedTables::read(&unpublished.source, family, layer)?;
+        Ok(Self {
+            unpublished,
+            family,
+            layer,
+            tables: checked.tables,
+            shared: checked.shared,
+        })
+    }
+}
+
+/// Sealed result of reading the actual table allocations, not caller spans.
+pub(super) struct ValidatedTables {
+    pub(super) tables: [Span; 6],
+    pub(super) shared: Option<([crate::weight_map::QuantizedWeight; 2], [Span; 4])>,
+}
+impl ValidatedTables {
+    pub(super) fn read(
+        source: &NativeGateUpLayer<'_, '_>,
+        family: &KernelFamily<'_>,
+        layer: &MoeLayer,
+    ) -> Result<Self> {
         ensure!(
             std::ptr::addr_eq(source.gpu(), family.gpu),
             "lease backend mismatch"
@@ -56,33 +81,7 @@ impl<'a, 's, 'g> Lease<'a, 's, 'g> {
             );
             tables[index] = span;
         }
-        let shared = match (
-            layer.shared_gate_t,
-            layer.shared_up_t,
-            &layer.shared_gate_up_receipt,
-        ) {
-            (None, None, None) => None,
-            (Some(gate), Some(up), Some(receipt)) => {
-                ensure!(
-                    layer.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4,
-                    "shared quant format changed"
-                );
-                let regions = receipt.validate(family.gpu, gate, up)?;
-                let mut spans = [tables[0]; 4];
-                for (i, (ptr, bytes)) in regions.into_iter().enumerate() {
-                    let span = Span::new(ptr, bytes, 16)?;
-                    ensure!(
-                        source.scratch_is_disjoint(span)
-                            && tables.iter().all(|s| s.disjoint(span))
-                            && spans[..i].iter().all(|s| s.disjoint(span)),
-                        "shared transform owner alias"
-                    );
-                    spans[i] = span;
-                }
-                Some(([gate, up], spans))
-            }
-            _ => anyhow::bail!("missing or incomplete shared transform authority"),
-        };
+        let shared = Self::shared(source, family, layer, &tables)?;
         // Every capacity and live-owner check precedes the first D2H.
         for (index, span) in tables.iter().enumerate() {
             let mut data = vec![0u8; span.bytes];
@@ -108,12 +107,53 @@ impl<'a, 's, 'g> Lease<'a, 's, 'g> {
                 );
             }
         }
-        Ok(Self {
-            unpublished,
-            family,
-            layer,
-            tables,
-            shared,
-        })
+        Ok(Self { tables, shared })
+    }
+    pub(super) fn with_shared(
+        mut self,
+        source: &NativeGateUpLayer<'_, '_>,
+        family: &KernelFamily<'_>,
+        layer: &MoeLayer,
+    ) -> Result<Self> {
+        self.shared = Self::shared(source, family, layer, &self.tables)?;
+        ensure!(self.shared.is_some(), "missing active shared transform");
+        Ok(self)
+    }
+    fn shared(
+        source: &NativeGateUpLayer<'_, '_>,
+        family: &KernelFamily<'_>,
+        layer: &MoeLayer,
+        tables: &[Span; 6],
+    ) -> Result<Option<([crate::weight_map::QuantizedWeight; 2], [Span; 4])>> {
+        Ok(
+            match (
+                layer.shared_gate_t,
+                layer.shared_up_t,
+                &layer.shared_gate_up_receipt,
+            ) {
+                (None, None, None) => None,
+                (Some(gate), Some(up), Some(receipt)) => {
+                    ensure!(
+                        layer.shared_experts_scale_kind
+                            == crate::weight_map::WeightQuantFormat::Nvfp4,
+                        "shared quant format changed"
+                    );
+                    let regions = receipt.validate(family.gpu, gate, up)?;
+                    let mut spans = [tables[0]; 4];
+                    for (i, (ptr, bytes)) in regions.into_iter().enumerate() {
+                        let span = Span::new(ptr, bytes, 16)?;
+                        ensure!(
+                            source.scratch_is_disjoint(span)
+                                && tables.iter().all(|s| s.disjoint(span))
+                                && spans[..i].iter().all(|s| s.disjoint(span)),
+                            "shared transform owner alias"
+                        );
+                        spans[i] = span;
+                    }
+                    Some(([gate, up], spans))
+                }
+                _ => anyhow::bail!("missing or incomplete shared transform authority"),
+            },
+        )
     }
 }

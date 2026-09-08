@@ -14,12 +14,45 @@ mod binding;
 #[cfg(test)]
 #[path = "gate_up_btile_binding_tests.rs"]
 mod binding_tests;
+#[path = "gate_up_btile_call.rs"]
+mod call;
 #[path = "gate_up_btile_decode.rs"]
 mod decode;
 #[path = "gate_up_btile_grouped.rs"]
 mod grouped;
 #[path = "gate_up_btile_kernels.rs"]
 mod kernels;
+#[path = "gate_up_btile_load.rs"]
+mod load;
+#[path = "gate_up_btile_preflight.rs"]
+mod preflight;
+pub(in crate::layers::moe) use load::ConstructionToken;
+#[path = "gate_up_btile_resident.rs"]
+mod resident;
+pub(in crate::layers::moe) use resident::Storage;
+#[cfg(test)]
+#[path = "gate_up_btile_compact_reader_tests.rs"]
+mod compact_reader_tests;
+#[cfg(test)]
+#[path = "gate_up_btile_model_fixture.rs"]
+mod model_fixture;
+#[cfg(test)]
+#[path = "gate_up_btile_prefill_tests.rs"]
+mod prefill_tests;
+#[cfg(test)]
+#[path = "gate_up_btile_reader_tests.rs"]
+mod reader_tests;
+#[cfg(test)]
+#[path = "gate_up_btile_resident_tests.rs"]
+mod resident_tests;
+#[cfg(test)]
+#[path = "gate_up_btile_unsupported_tests.rs"]
+mod unsupported_tests;
+#[cfg(test)]
+#[path = "gate_up_btile_validity_tests.rs"]
+mod validity_tests;
+#[cfg(test)]
+pub(crate) use model_fixture::model_fixture;
 #[cfg(test)]
 #[path = "gate_up_btile_launch_tests.rs"]
 mod launch_tests;

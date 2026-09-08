@@ -3,6 +3,8 @@
 //! Setters + transposes + transpose_for_prefill_unified_inner.
 
 use super::*;
+#[path = "helpers_btile_phase.rs"]
+mod btile_phase;
 
 #[path = "helpers_checkpoint_down.rs"]
 mod checkpoint_down;
@@ -33,6 +35,7 @@ impl MoeLayer {
     /// Replaces SiLU with GELU in the sorted/unfused path and forces decode
     /// to use the sorted path (avoiding fused SiLU kernels).
     pub fn set_gelu_activation(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         self.moe_act_mul = gpu.kernel("gelu", "gelu_mul")?;
         self.gelu_activation = true;
         Ok(())
@@ -67,6 +70,7 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
         include_down: bool,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
         let shared_inter = config.shared_expert_intermediate_size;
@@ -212,6 +216,7 @@ impl MoeLayer {
         keep_originals: bool,
         keep_shared_originals: bool,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
 
@@ -383,6 +388,7 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
         stream: u64,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
         let num = self.weights.experts.len();

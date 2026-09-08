@@ -14,6 +14,7 @@ pub(super) enum WordPolicy {
 #[derive(Clone, Copy)]
 pub(super) enum SharedMode {
     Active,
+    ActiveLogits,
     RoutedOnly,
 }
 #[derive(Clone, Copy)]
@@ -23,7 +24,7 @@ pub(super) struct DecodeRows {
     pub routes: usize,
     pub output: usize,
 }
-impl CheckedArena<'_, '_, '_, '_> {
+impl CheckedArena<'_, '_> {
     pub(super) fn decode(
         &self,
         arena: &BufferArena,
@@ -43,7 +44,7 @@ impl CheckedArena<'_, '_, '_, '_> {
             "decode row range"
         );
         let [sg, su] = match shared {
-            SharedMode::Active => {
+            SharedMode::Active | SharedMode::ActiveLogits => {
                 self.lease
                     .shared
                     .as_ref()
@@ -88,10 +89,18 @@ impl CheckedArena<'_, '_, '_, '_> {
         // The next down phase must overwrite these before reading; grouped A
         // staging uses this owner in a different, non-overlapping phase.
         let (shared_gate, shared_up) = match shared {
-            SharedMode::Active => (
+            SharedMode::Active | SharedMode::ActiveLogits => (
                 slice(
-                    arena.ssm_deinterleaved(),
-                    sizes.ssm_deinterleaved,
+                    if matches!(shared, SharedMode::ActiveLogits) {
+                        arena.logits()
+                    } else {
+                        arena.ssm_deinterleaved()
+                    },
+                    if matches!(shared, SharedMode::ActiveLogits) {
+                        sizes.logits
+                    } else {
+                        sizes.ssm_deinterleaved
+                    },
                     range.output * 4096,
                     rows * 4096,
                     16,
@@ -153,6 +162,6 @@ impl CheckedArena<'_, '_, '_, '_> {
         .arg_u32(2048)
         .arg_u32(4096)
         .arg_u32(8)
-        .launch(self.lease.unpublished.source.stream())
+        .launch(self.lease.stream)
     }
 }

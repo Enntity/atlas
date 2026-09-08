@@ -282,6 +282,7 @@ impl MoeLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         self.experts_scale_kind.expect(
             crate::weight_map::WeightQuantFormat::Nvfp4,
             "NVFP4 MMQ routed-weight repack",

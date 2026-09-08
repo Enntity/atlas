@@ -40,6 +40,7 @@ impl MoeLayer {
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.btile_forward_guard(ctx, stream)?;
         let Some(dpt) = self.down_ptrs_t.as_ref() else {
             return Ok(());
         };
@@ -97,6 +98,7 @@ impl MoeLayer {
         ctx: &crate::layer::ForwardContext,
         compute_stream: u64,
     ) -> Result<()> {
+        self.btile_forward_guard(ctx, compute_stream)?;
         let Some(dpt) = self.down_ptrs_t.as_ref() else {
             return Ok(());
         };

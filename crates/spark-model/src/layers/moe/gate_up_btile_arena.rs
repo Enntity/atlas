@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Extents come from actual arena owners; device routing contents are not read.
-use super::{binding::Lease, native_source::Span};
+use super::{binding::Lease, call::LaunchLease, kernels::KernelFamily, native_source::Span};
 use crate::layer::ForwardContext;
 use anyhow::{Result, ensure};
 use spark_runtime::{buffers::BufferArena, gpu::DevicePtr};
 
-pub(super) struct CheckedArena<'b, 'a, 's, 'g> {
-    pub(super) lease: &'b Lease<'a, 's, 'g>,
+pub(super) struct CheckedArena<'b, 'g> {
+    pub(super) lease: LaunchLease<'g>,
     pub(super) arena: &'b BufferArena,
-    owners: [Span; 9],
+    owners: [Span; 10],
 }
 impl<'a, 's, 'g> Lease<'a, 's, 'g> {
     pub(super) fn check_arena<'b>(
         &'b self,
         ctx: &ForwardContext<'b>,
-    ) -> Result<CheckedArena<'b, 'a, 's, 'g>> {
+    ) -> Result<CheckedArena<'b, 'g>> {
         let source = &self.unpublished.source;
         ensure!(
             std::ptr::addr_eq(ctx.gpu, self.family.gpu),
@@ -42,21 +42,8 @@ impl<'a, 's, 'g> Lease<'a, 's, 'g> {
             (1..=1088).contains(&arena.max_batch_tokens()),
             "arena owner row bound"
         );
-        let s = arena.sizes();
-        let raw = [
-            (arena.norm_output(), s.norm_output),
-            (arena.scratch(), s.scratch),
-            (arena.expert_gate_out(), s.expert_gate_out),
-            (arena.expert_up_out(), s.expert_up_out),
-            (arena.expert_down_out(), s.expert_down_out),
-            (arena.gate_logits(), s.gate_logits),
-            (arena.moe_router_in_f32(), s.moe_router_in_f32),
-            (arena.ssm_deinterleaved(), s.ssm_deinterleaved),
-            (arena.ssm_qkvz(), s.ssm_qkvz),
-        ];
-        let mut owners = [self.tables[0]; 9];
-        for (i, (ptr, bytes)) in raw.into_iter().enumerate() {
-            let span = Span::new(ptr, bytes, 16)?;
+        let owners = owner_spans(arena)?;
+        for (i, &span) in owners.iter().enumerate() {
             ensure!(
                 source.scratch_is_disjoint(span)
                     && self.tables.iter().all(|t| t.disjoint(span))
@@ -67,10 +54,17 @@ impl<'a, 's, 'g> Lease<'a, 's, 'g> {
                     && owners[..i].iter().all(|s| s.disjoint(span)),
                 "arena allocation owner alias"
             );
-            owners[i] = span;
         }
         Ok(CheckedArena {
-            lease: self,
+            lease: LaunchLease {
+                family: KernelFamily {
+                    gpu: self.family.gpu,
+                    handles: self.family.handles,
+                },
+                tables: self.tables,
+                shared: self.shared,
+                stream: source.stream(),
+            },
             arena,
             owners,
         })
@@ -98,7 +92,43 @@ pub(super) fn slice(
         alignment,
     )
 }
-impl CheckedArena<'_, '_, '_, '_> {
+pub(super) fn owner_spans(arena: &BufferArena) -> Result<[Span; 10]> {
+    let s = arena.sizes();
+    let raw = [
+        (arena.norm_output(), s.norm_output),
+        (arena.scratch(), s.scratch),
+        (arena.expert_gate_out(), s.expert_gate_out),
+        (arena.expert_up_out(), s.expert_up_out),
+        (arena.expert_down_out(), s.expert_down_out),
+        (arena.gate_logits(), s.gate_logits),
+        (arena.moe_router_in_f32(), s.moe_router_in_f32),
+        (arena.ssm_deinterleaved(), s.ssm_deinterleaved),
+        (arena.ssm_qkvz(), s.ssm_qkvz),
+        (arena.logits(), s.logits),
+    ];
+    let mut result = [Span {
+        ptr: DevicePtr::NULL,
+        bytes: 0,
+    }; 10];
+    for (i, (ptr, bytes)) in raw.into_iter().enumerate() {
+        result[i] = Span::new(ptr, bytes, 16)?;
+    }
+    Ok(result)
+}
+impl<'b, 'g> CheckedArena<'b, 'g> {
+    pub(super) fn resident(
+        lease: LaunchLease<'g>,
+        arena: &'b BufferArena,
+        owners: [Span; 10],
+    ) -> Self {
+        Self {
+            lease,
+            arena,
+            owners,
+        }
+    }
+}
+impl CheckedArena<'_, '_> {
     pub(super) fn rows(&self, arena: &BufferArena, rows: usize) -> Result<()> {
         ensure!(
             std::ptr::eq(arena, self.arena) && rows > 0 && rows <= arena.max_batch_tokens(),

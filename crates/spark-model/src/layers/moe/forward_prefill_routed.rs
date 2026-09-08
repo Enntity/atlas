@@ -84,14 +84,19 @@ impl MoeLayer {
             Some("0") => false,
             Some("1") => true,
             _ => self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4,
-        } && worst_case_m_tiles > 1
+        } && !self.btile_storage.is_published()
+            && worst_case_m_tiles > 1
             && !ctx.graph_capture;
         // Keep the host copy when exact sizing already paid for it. The
         // CUTLASS grouped path also needs these offsets to build its problem
         // list; copying them again would introduce a second stream-draining
         // D2H boundary in every MoE layer.
         let mut exact_eoff: Option<Vec<i32>> = None;
-        let max_m_tiles = if exact_tiles {
+        let max_m_tiles = if self.btile_storage.is_published() {
+            // Top-k selects each expert at most once per token, so a local
+            // expert has at most `num_tokens` sorted rows: 17 M64 tiles at1088.
+            num_tokens.div_ceil(64) as u32
+        } else if exact_tiles {
             let mut offsets = vec![0u8; (ne + 1) * 4];
             ctx.gpu
                 .copy_d2h_on_stream(expert_offsets, &mut offsets, stream)?;
@@ -169,7 +174,17 @@ impl MoeLayer {
             // transposed ones, so it must be reachable when gate_ptrs_t is
             // absent — that is exactly the originals-only layout a
             // checkpoint-native model runs in.
-            if self.nvfp4_mmq_layout {
+            if self.btile_storage.is_published() {
+                self.dispatch_btile_grouped(
+                    expert_input,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_tokens,
+                    compact_k5 || self.glm_c3_grouped(ctx, n) || self.glm_c4_grouped(ctx, n),
+                    ctx,
+                    stream,
+                )?;
+            } else if self.nvfp4_mmq_layout {
                 self.run_nvfp4_mmq_gate_up(
                     expert_input,
                     expert_gate_out,

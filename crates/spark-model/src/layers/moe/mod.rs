@@ -13,6 +13,12 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeight};
+mod btile_model_owners;
+pub(crate) use btile_model_owners::{
+    bind as bind_resident_btile_arenas, invalidate as invalidate_resident_btile_readers,
+};
+#[cfg(test)]
+pub(crate) use gate_up_repack::model_fixture as btile_model_fixture;
 
 /// Device-side pointer table for one projection across all experts.
 ///
@@ -103,6 +109,7 @@ pub(crate) enum ExpertPtrSet {
 #[allow(dead_code)]
 pub struct MoeLayer {
     pub weights: MoeWeights,
+    btile_storage: gate_up_repack::Storage,
     /// Quant format of the ROUTED experts as landed in GPU memory. `Nvfp4`
     /// (default) = packed E2M1 + FP8-E4M3 per-16 block scales + f32 per-tensor
     /// global. Set to `Mxfp4E8m0` by the DeepSeek-V4 native-MXFP4 loader

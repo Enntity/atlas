@@ -4,104 +4,10 @@
 
 use super::*;
 
+#[path = "forward_k3_shared.rs"]
+mod shared;
+
 impl MoeLayer {
-    /// Fused K=3 forward: process 3 tokens through MoE in 5 kernel launches.
-    ///
-    /// Gate GEMV batch3 → batched topK → fused expert gate+up → fused silu+down → fused wsum+blend.
-    /// Expert buffers sized for 3*top_k slots. Output at moe_output() [3, H].
-    pub fn forward_k3(
-        &self,
-        input: DevicePtr, // [3, H] BF16 — normed MoE input for 3 tokens
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        if self.glm_c3_grouped(ctx, 3) {
-            return self.forward_prefill(input, 3, ctx, stream);
-        }
-        let optimized = self.lora.is_none()
-            && self.bf16_gate_weight_ptrs.is_none()
-            && self.fp8_gate_weight_ptrs.is_none()
-            && !self.has_mixed_bf16_shared_expert()
-            && matches!(
-                self.experts_scale_kind,
-                crate::weight_map::WeightQuantFormat::Nvfp4
-            )
-            && self.use_t_layout_for_decode()
-            && self.weights.shared_expert_gate.weight.is_null()
-            && !self.weights.shared_expert.gate_proj.is_null()
-            && !self.weights.shared_expert.up_proj.is_null()
-            && !self.weights.shared_expert.down_proj.is_null()
-            && self.w4a16_gemv_batch3.0 != 0;
-
-        if !optimized {
-            return self.forward_k3_impl(input, ctx, stream, true, true, None);
-        }
-
-        let h = ctx.config.hidden_size as u32;
-        let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
-        let gate_out = ctx.buffers.logits();
-        let up_out = ctx.buffers.ssm_qkvz();
-        let shared_down = ctx.buffers.attn_output();
-        let sh_gate = &self.weights.shared_expert.gate_proj;
-        let sh_up = &self.weights.shared_expert.up_proj;
-        let sh_down = &self.weights.shared_expert.down_proj;
-
-        // GLM's shared expert is identical for all verifier rows. Batch the
-        // three rows so each NVFP4 projection is fetched once instead of once
-        // per row in the fused routed-expert kernel.
-        ops::w4a16_gemv_batch3(
-            ctx.gpu,
-            self.w4a16_gemv_batch3,
-            input,
-            sh_gate,
-            gate_out,
-            shared_inter,
-            h,
-            stream,
-        )?;
-        ops::w4a16_gemv_batch3(
-            ctx.gpu,
-            self.w4a16_gemv_batch3,
-            input,
-            sh_up,
-            up_out,
-            shared_inter,
-            h,
-            stream,
-        )?;
-        ops::silu_mul(
-            ctx.gpu,
-            self.moe_silu_mul,
-            gate_out,
-            up_out,
-            gate_out,
-            3 * shared_inter,
-            stream,
-        )?;
-        ops::w4a16_gemv_batch3(
-            ctx.gpu,
-            self.w4a16_gemv_batch3,
-            gate_out,
-            sh_down,
-            shared_down,
-            h,
-            shared_inter,
-            stream,
-        )?;
-
-        // Keep the routed K3 path and EP all-reduce unchanged, then add the
-        // precomputed always-on shared expert once on each rank.
-        self.forward_k3_impl(input, ctx, stream, false, true, None)?;
-        ops::residual_add(
-            ctx.gpu,
-            self.residual_add,
-            ctx.buffers.moe_output(),
-            shared_down,
-            3 * h,
-            stream,
-        )
-    }
-
     /// K=3 routed experts without the EP reduction. GLM's K=5 verifier
     /// combines this partial result with K=2 before reducing all five rows.
     pub(super) fn forward_k3_routed_local(
@@ -123,6 +29,7 @@ impl MoeLayer {
         reduce_ep: bool,
         routes: Option<PrecomputedRoutes>,
     ) -> Result<()> {
+        self.btile_input_guard(input, 3, ctx, stream)?;
         if !include_shared {
             anyhow::ensure!(
                 self.lora.is_none()
@@ -133,7 +40,7 @@ impl MoeLayer {
                         self.experts_scale_kind,
                         crate::weight_map::WeightQuantFormat::Nvfp4
                     )
-                    && self.use_t_layout_for_decode(),
+                    && self.use_btile_or_t_decode(),
                 "routed-only K3 requires unified-layout NVFP4 experts"
             );
         }
@@ -158,7 +65,7 @@ impl MoeLayer {
         // pass afterwards. See forward_k2 for the rationale.
         let mixed_bf16_shared = self.has_mixed_bf16_shared_expert();
         if mixed_bf16_shared
-            && !(self.use_t_layout_for_decode()
+            && !(self.use_btile_or_t_decode()
                 && self.moe_expert_gate_up_shared_batch3_t_k.0 != 0
                 && self.moe_expert_silu_down_shared_batch3_t_k.0 != 0
                 && !(ctx.comm.is_some() && ctx.config.ep_world_size > 1))
@@ -340,15 +247,10 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
-        } else if self.use_t_layout_for_decode() {
+        } else if self.use_btile_or_t_decode() {
             // Phase 8a unified-layout NVFP4 batch=3 verify (MTP K=3). Hybrid
             // mode skips this branch — small-N MTP verify wins on warp-
             // reduction originals.
-            let gate_t = self
-                .gate_ptrs_t
-                .as_ref()
-                .expect("gate_ptrs_t under unified_t");
-            let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under unified_t");
             let down_t = self
                 .down_ptrs_t
                 .as_ref()
@@ -366,28 +268,46 @@ impl MoeLayer {
                     self.shared_down_t.as_ref().unwrap_or(&null_qw),
                 )
             };
-            ops::moe_expert_gate_up_shared_batch3_t(
-                ctx.gpu,
-                self.moe_expert_gate_up_shared_batch3_t_k,
-                input,
-                gate_t.packed_ptrs,
-                gate_t.scale_ptrs,
-                gate_t.scale2_vals,
-                expert_gate_out,
-                up_t.packed_ptrs,
-                up_t.scale_ptrs,
-                up_t.scale2_vals,
-                expert_up_out,
-                indices_dev,
-                sh_gate_t,
-                shared_gate_scratch,
-                sh_up_t,
-                shared_up_scratch,
-                inter,
-                h,
-                top_k,
-                stream,
-            )?;
+            if self.btile_storage.is_published() {
+                self.dispatch_btile_decode(
+                    ctx,
+                    input,
+                    expert_gate_out,
+                    expert_up_out,
+                    indices_dev,
+                    include_shared.then_some((shared_gate_scratch, shared_up_scratch)),
+                    3,
+                    stream,
+                )?;
+            } else {
+                let gate_t = self
+                    .gate_ptrs_t
+                    .as_ref()
+                    .expect("gate_ptrs_t under unified_t");
+                let up_t = self.up_ptrs_t.as_ref().expect("up_ptrs_t under unified_t");
+                ops::moe_expert_gate_up_shared_batch3_t(
+                    ctx.gpu,
+                    self.moe_expert_gate_up_shared_batch3_t_k,
+                    input,
+                    gate_t.packed_ptrs,
+                    gate_t.scale_ptrs,
+                    gate_t.scale2_vals,
+                    expert_gate_out,
+                    up_t.packed_ptrs,
+                    up_t.scale_ptrs,
+                    up_t.scale2_vals,
+                    expert_up_out,
+                    indices_dev,
+                    sh_gate_t,
+                    shared_gate_scratch,
+                    sh_up_t,
+                    shared_up_scratch,
+                    inter,
+                    h,
+                    top_k,
+                    stream,
+                )?;
+            }
             // In routed-only mode preserve the precomputed five-row shared
             // output in attn_output. Rows 3/4 of moe_output are outside this
             // K3 result and provide scratch for the disabled shared branch.

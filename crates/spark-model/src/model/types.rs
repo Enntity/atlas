@@ -13,6 +13,9 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::ssm_pool::SsmStatePool;
+#[cfg(test)]
+#[path = "btile_teardown_tests.rs"]
+mod btile_teardown_tests;
 use super::ssm_snapshot::SsmSnapshotPool;
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
@@ -570,9 +573,9 @@ unsafe impl Sync for TransformerModel {}
 /// because it attempts every resource even after one fails: a half-torn-down
 /// GPU is worse than a reported error.
 ///
-/// NOT released here: the weights. `build_model` takes `store: &WeightStore`
-/// and the layers only copy pointers out of it, so this model does not own
-/// them — the host that retained the store releases it after this returns.
+/// The builder transfers its owned WeightStore through `adopt_weight_store`.
+/// Its remaining checkpoint allocations are released here after the pools;
+/// published resident readers are invalidated before any owner is freed.
 impl TransformerModel {
     /// Hand the model the ledger of its own weights, for teardown.
     pub fn adopt_weight_store(&mut self, store: spark_runtime::weights::WeightStore) {
@@ -580,6 +583,7 @@ impl TransformerModel {
     }
 
     pub(super) fn release_pools(&mut self) -> anyhow::Result<()> {
+        crate::layers::moe::invalidate_resident_btile_readers(&self.config, &mut self.layers);
         use atlas_core::scope::ModelResource;
 
         let gpu: &dyn GpuBackend = self.gpu.as_ref();

@@ -85,6 +85,7 @@ impl MoeLayer {
             keep_shared_originals,
             None,
         )
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -96,7 +97,7 @@ impl MoeLayer {
         keep_originals: bool,
         keep_shared_originals: bool,
         mut release: Option<&mut dyn FnMut(usize, bool, DevicePtr) -> Result<()>>,
-    ) -> Result<()> {
+    ) -> Result<Vec<QuantizedWeight>> {
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
         let shared_inter = config.shared_expert_intermediate_size;
@@ -148,6 +149,6 @@ impl MoeLayer {
                 self.weights.shared_expert.down_proj.weight_scale = DevicePtr::NULL;
             }
         }
-        Ok(())
+        Ok(down_t)
     }
 }

@@ -1,8 +1,9 @@
 # GLM B-tile reader closure and resident activation outline
 
-Status: next-slice outline for root review, not implementation authorization.
-Current immediate work remains the checked family, shared-T receipt and
-construction-bound arena. No serving selector or Ready has been added.
+Status: partition1 implemented and undergoing final independent source review.
+Actual private publication, reader dispatch, arena binding and model teardown
+are exercised by CPU tests. Partition2 loader/environment activation is NOT
+approved or implemented; no serving selector or loader caller is enabled.
 
 ## Actual ownership seam
 
@@ -18,6 +19,14 @@ by existing production ownership, not a new device-memory owner:
 - `spark-runtime/src/weights.rs:446` drains every entry and attempts exactly one
   free per stored base pointer. Original in-place B-tile gate/up addresses stay
   in that store. No gate/up frees, re-registration or extra layout are needed.
+
+Follow-up source audit found that native down and several GLM TP-shard inputs
+are already freed while their checkpoint entries remain in that map. The
+model-owned-store seam is real, but it does NOT prove every current map entry
+remains live. See glm_btile_checkpoint_retirement_plan.md for the separately
+review-gated exact retirement/live-view/single-map replacement plan. Activation
+and whole-store teardown claims must wait for that proof; no blanket address
+pruning or extra retained down copies are permitted.
 
 The stale comment near `model/types.rs:573` says the builder borrows the store;
 the actual call above owns and adopts it. Correct that comment when this slice
@@ -172,7 +181,28 @@ binding must be a hard refusal, model release must prevent further forwarding,
 and the actual release sequence must show each original allocation freed once.
 Tests should construct and release the actual model/store fixture, not emulate
 teardown with unrelated local counters. No new serving selector is approved by
-this outline; root must read the finalized partition1 plan before code starts.
+this outline; partition2 remains separately review-gated.
+
+## Approved live-caller binding refinement
+
+The current construction fixture launches on its source/repack stream. Resident
+readers MUST NOT retain that stream as their execution choice. Every actual
+eager/graph reader supplies its live `stream` argument, and all validation,
+quantization, sort/worklist production, GU and downstream operations use that
+same actual caller stream. Ready binds the supplied live backend/context and
+arena allocation snapshot before exposing its private checked call. No launch
+lookups, D2H, synchronization or GPU allocation is added. Stream0 remains valid
+when it is the real caller stream; a numeric stream handle is not independent
+proof of CUDA ownership, which follows the existing model/backend contract.
+
+Tests construct on stream77 then call the real eager and graph paths on distinct
+streams91/92, verifying every submitted operation uses the caller's stream and
+never77. Foreign backend and changed arena spans fail before work. The actual
+caller scratch destinations are preserved: scalar/batched shared gate uses the
+logits owner, while K2/K3 use their existing destinations. Extend the fixed
+arena snapshot to include logits capacity and check those explicit per-call
+spans rather than globally changing scratch placement. Keep independent input,
+route and output origins, including shifted-input/base-output K4.
 
 ## Fail-before-conversion profile and final gates
 
@@ -185,7 +215,117 @@ not prove scalar/bootstrap/drain/padded-prefill alternatives unreachable.
 
 Final root gates: exact committed-source CUDA/PTX/output/memcheck checks, actual
 model default-off/on correctness and equal resident-memory/4MiB transient gate,
-then paired full-wall C4 performance. Keep numerical uncertainty and residual
-MTP diagnostic differences separate from CPU ABI/control-flow evidence. No
+then cap-complete full-wall C1+MTP4 qualification first, followed by offered
+concurrency C1/C2/C3/C4 on the same active4/admitted4 non-speculative profile and C4/drain
+quality and paired full-wall timing. This rollout order does not waive any
+scalar/bootstrap/K2/K3/C4/K5 or padded-prefill reader compatibility gate. The
+v25 baseline is28.632 initial /28.726 fresh-repeat C1 tok/s; hot-region ratios
+do not predict full-wall gains or establish the30 C1 target. Keep numerical
+uncertainty separate from CPU ABI/control-flow evidence. No
 additional standalone prototype is a prerequisite when existing promoted
 readers already cover the required mathematical families.
+
+Reuse `scripts/benchmark_glm53_concurrent_niah.py` for the bounded C4 drain
+quality gate: prompt lengths768/800/832/896 with output caps32/16/48/64 and
+explicit context-limit2048. Keep its foreign-needle checks. Actual server batch
+traces must demonstrate N4 followed by nonprefix drains; API success alone
+does not prove that the intended K4→K3/K2/K1 reader transitions ran. No new
+concurrency harness is needed.
+
+## Partition1 implementation and CPU receipts (2026-09-08)
+
+The private load-session now resolves the complete family, validates actual
+checkpoint/table/shared/down sources, and marks the layer Constructing before
+the first matrix mutation. It invokes the real shared transform, byte repack,
+tracked down transform and exact compact-down allocation completion. Only that
+successful transaction can publish the owned storage discriminant. Failures
+after construction starts leave Failed, never Legacy or a retryable capability.
+Native GU views and table aliases are invalidated without freeing their retained
+checkpoint allocations. Shared native weights remain for existing exact-M math.
+
+The down helper returns its already-built projection vector to its private
+construction caller; legacy callers discard that return without changing GPU
+events. This supplies exact slab/table/shared-down extents for alias checks and
+later arena binding. There is no extra model-sized device allocation or copy.
+Actual model-owned store handoff uses the separately committed exact checkpoint
+retirement map rebuild, not numerical-address pruning. The arena is bound after
+its actual factory construction and may move afterward. Model teardown changes
+non-Legacy target FFNs to Failed before releasing any allocation.
+
+All actual serving reader branches listed above now select the private checked
+GU reader from Published storage, using their live caller stream. Old shared,
+down, routing, collectives and deferred-HC math remain unchanged. Mandatory
+down/producer handles are admitted before conversion; existing optional down
+kernel preferences retain their established same-layout fallbacks. That is not
+a GU-layout fallback: all B-tile GU exports resolve atomically and never read T
+or invalidated native GU bytes. The K3 shared wrapper was moved literally to a
+private child to keep its routed parent at499 lines; no arithmetic was changed.
+
+Raw receipts live in
+`atlas-campaigns/20260908/btile-resident-readers/`:
+
+- Actual runtime RED→GREEN: `publication-behavior-red.log`, `scalar-red.log`,
+  `small-readers-red.log`, `converters-red.log`, `prefill-red.log`, followed by
+  their corresponding GREEN receipts. Earlier compile-only failures and two
+  fixture expectation corrections are retained but are not behavioral REDs.
+- `publication-fault-green.log`:6/6, including more than1700 actual mutation/
+  synchronization fault positions per rank, exact primary event prefixes,
+  no retry/Legacy fallback, and one scratch free attempt. This does not claim
+  complete cleanup of partial derived allocations left for backend teardown.
+- `compact-first.log`: the contributed seven-mode subprocess matrix passes
+  actual C1/C2/C3, C4 scalar/M64/M16 and K5 separate/M64/M16 with HC allowed and
+  refused, both ranks, word/vector policies and eager/capture-shaped contexts.
+  This is characterization/negative coverage, not a fabricated prior RED.
+- `prefill-green.log`: actual rows1/5/6/64/129/1025/1088, both policies and
+  eager/capture contexts, including17 dense row tiles at1088 and no reader D2H.
+- `model-teardown-final-green.log`: actual TransformerModel ownership, once-only
+  original frees, stale-reader refusal and idempotent repeat teardown. The
+  recorder follows real CUDA's free(NULL) no-op while rejecting unknown non-null
+  frees. A later deliberate hook-disabled mutation executes and fails in
+  `model-teardown-hook-disabled-red.log`; the restored hook passes the full suite.
+  The earlier hook-omission compile failure is not behavioral evidence.
+- `full-model-cpu-final.log`:956/956 pass in80.50s, including the actual Failed
+  publication reader refusals and Legacy arena-binding zero-event check.
+- `lib-check-final.log`: non-test no-default library check passes in5.77s.
+- `fmt-final.log`, scoped SPDX and `git diff --check` pass. Strict scoped
+  clippy fails at the four existing runtime Metal stub too-many-arguments
+  errors (`clippy-final.log`); no lint level was lowered and no lint PASS is
+  claimed. All new Rust files are at most500 lines. Existing oversized
+  unrelated bodies were not broadly rewritten or newly allow-listed.
+
+These tests execute production construction/dispatch APIs using typed recorded
+GPU operations. They do not emulate numerical kernels, establish CUDA graph
+replay correctness, prove allocator-context identity beyond the existing actual
+backend construction contract, or establish a native performance improvement.
+No loader/environment activation is part of this source slice.
+
+### Root-approved bind hardening
+
+At the once-only arena bind, validate every owner directly against sealed GU
+packed/scale spans, independently of the supplied store index. Also require
+the rebuilt store to retain every captured GU checkpoint key with its exact
+pointer, dtype, shape and byte extent, including scalar and optional input-scale
+metadata. These identities originate in the actual immutable native source
+validation and survive publication; a same-address but retyped/reshaped entry
+does not qualify. Empty, foreign, missing/replaced-key and overlapping-owner
+fixtures must exercise the real publication/bind API and fail before GPU work.
+The correct rebuilt store remains eligible and binding remains once-only.
+No general store/allocator authentication API, launch-time scan, D2H, GPU
+allocation or new loader activation is added. Legacy binding remains inert.
+
+Implementation receipts: `bind-retained-red.log` executes the actual publication
+and bind test and fails because the empty replacement store was admitted.
+`bind-retained-green.log` passes all11 cases on both ranks (22 total) in0.80s:
+empty/foreign store, replaced packed/scales addresses, same-byte retyping and
+reshaping, missing scalar/input keys, changed scalar shape, and overlapping GU
+arena allocations with both missing and complete store metadata. Only the first
+empty-store case executed in the original RED; the other cases are expanded
+negative GREEN coverage. Each refusal does no GPU work and permits a later bind
+to the correct rebuilt store/disjoint arena followed by the actual reader.
+
+Final hardened snapshot: `full-model-cpu-hardened.log`957/957 passes in81.89s;
+`lib-check-hardened.log` passes in8.77s; `fmt-hardened.log`, scoped SPDX and diff
+checks pass. `clippy-hardened.log` retains the same four existing runtime Metal
+stub errors; no suppression or lint PASS claim. Exact-source independent review
+and the manifest cover this hardened snapshot, superseding the earlier956-test
+snapshot above. No native or numerical evidence is claimed by these CPU gates.

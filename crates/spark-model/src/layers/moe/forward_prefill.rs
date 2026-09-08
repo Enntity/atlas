@@ -37,6 +37,11 @@ impl MoeLayer {
         stream: u64,
         defer_shared_hc: bool,
     ) -> Result<()> {
+        self.btile_input_guard(input, num_tokens, ctx, stream)?;
+        anyhow::ensure!(
+            !self.btile_storage.is_published() || self.nvfp4_prequant_moe,
+            "B-tile BF16 grouped reader unsupported"
+        );
         // Native-HIP (gfx1151) has NO ported grouped-GEMM MoE path:
         // moe_fp8_grouped_gemm is a compile stub (kernels/strix-hip/.../
         // moe_fp8_grouped_gemm.cu writes nothing) and the grouped prefill

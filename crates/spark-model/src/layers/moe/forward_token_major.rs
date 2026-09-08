@@ -23,6 +23,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         // SOLID Incr-4: the token-major fast path has no fold hooks. When a
         // MoE adapter is RESIDENT, delegate to the per-row batched fallback,
         // which folds router + gate/up/down route-agnostically (base rows
