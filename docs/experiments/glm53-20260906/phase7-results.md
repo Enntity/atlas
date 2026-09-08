@@ -118,6 +118,52 @@ Next: fresh cache-OFF and cache-ON graph-enabled runs at the same.91 budget,
 same image and LRU148/256 fixture, one warmup plus three measurements. The
 diagnostic gate above is not evidence of a throughput improvement.
 
+### Matched v20 cache-OFF control
+
+Fresh graph-enabled cache-OFF C1 at.91 completes one warmup and three148/256
+measurements:28.049 /28.011 /28.116 full-wall tok/s, median **28.049**.
+All outputs reach256. The strict offline correlator matches the four complete
+requests and retains the client metrics unchanged; measured mean accepted
+drafts is2.583 in all three requests. Excluding each request's first timing
+window gives diagnostic medians108.83ms verifier and11.455ms proposal.
+
+Post-run host MemAvailable is12,935,316kB head /12,182,092kB worker. Both
+containers stop gracefully and are preserved as
+`atlas-glm53-v20-control91-ep0/1`. This is a fresh control, not a cache gain or
+proof that older25.161 repeat variability is fixed. The next cache-ON run
+differs only in the cache selection, not the image or memory budget.
+
+### Cache-ON initial and clean repeat
+
+Same v20/.91 recipe, diagnostics OFF and graphs/overlap ON:
+
+| Run | Three full-wall C1 rates (tok/s) | Full-wall median |
+| --- | --- | --- |
+| Cache-OFF control | 28.049 / 28.011 / 28.116 | 28.049 |
+| Cache-ON initial | 28.546 / 28.545 / 28.526 | 28.545 |
+| Cache-ON fresh restart | 28.599 / 28.215 / 28.529 | 28.529 |
+
+All measured outputs reach256; each run has its own warmup. Initial improvement
+is1.77%; the confirming median is1.71% above the control. Acceptance is2.583
+for all initial measured requests and2.583 /2.534 /2.583 on the repeat. Initial
+diagnostic verifier/proposal medians are106.76 /11.59ms; repeat106.35 /11.52ms.
+These exclude each request's first timing window and are not client metrics.
+
+The initial cache-ON decode-window median is30.074 tok/s, but **full-wall is
+28.545**, so neither run meets the30 C1 target. The small gain is reproducible
+in this matched short profile; it does not prove broader acceptance variability
+fixed, a C4 benefit, or a general900-prefill improvement. C4 remains47.319 on
+the previous measured profile. No concurrent native compilation/packaging or
+standalone GPU workload runs during these measurements.
+
+After recording the repeat's clean logs, the same graph-enabled process passes
+the four answer checks, the1984-token needle request (3.592s,16 tokens), and
+another intentional2s cancellation followed by four fresh passing answers.
+The cancelled client receives5,642 bytes and exits28. Both model containers
+then stop gracefully, exit0/OOMKilled=false, preserved as
+`atlas-glm53-v20-cache91-repeat-ep0/1`. The executable and restart recipe are
+retained while root runs standalone tests with both models stopped.
+
 ## Routed B-tile M64 standalone extension
 
 Committed prototype `40c4bf5c` completes four native fixture passes: ordinary
