@@ -19,6 +19,16 @@ native/health gates and found a difference in the existing private prefix,
 before the current body. No throughput promotion or checked B-tile serving
 activation is approved here.
 
+A subsequent source audit found a reachable unordered target-prefill/eager-
+drafter handoff on the head, already present in v24. The
+[bounded stream fix plan](../../../scripts/dev/glm_eager_prefill_stream_fix_plan.md)
+records the exact producer/consumer mismatch and real-entry regression tests.
+Both nodes remain stopped until that fix passes CPU review and the revised
+v25 diagnostic/health gates. Existing28.53 C1 rates are retained historical
+measurements, not evidence that this handoff is safe or a speedup prediction.
+The checked B-tile family is now independently approved and committedad367a70;
+its897-test CPU gate does not activate the resident layout.
+
 ## Recovery and artifact identity
 
 This recovery checkpoint used `1c186acf`, the independently reviewed deferred

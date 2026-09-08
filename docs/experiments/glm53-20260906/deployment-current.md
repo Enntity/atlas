@@ -5,6 +5,16 @@ Inspect both nodes before using any recipe; this document identifies qualified
 profiles, not a promise that a particular container is currently running.
 Do not combine the C1 speculative and C4 independent-decode settings.
 
+September8 source-audit safety update: the historical C1 images contain an
+[unordered target-prefill to eager-drafter handoff](../../../scripts/dev/glm_eager_prefill_stream_fix_plan.md)
+on the head. The producer switches to default stream while its eager consumer
+receives the caller's non-blocking stream, with no intervening dependency.
+Both nodes are stopped pending the separately tested fix and v25 validation.
+The C1 figures below remain historical benchmark evidence, not approval to
+restart that known unordered path. Its role in the KV divergence is not yet
+proven by a corrected native run. The separate nonspeculative C4 measurement
+does not exercise this eager-drafter handoff.
+
 ## Last qualified C1 profile — September8
 
 Image `atlas-glm53-flash:kernel-20260908-v20`, source `7bfa3bae`, production
@@ -40,7 +50,9 @@ tok/s, below the qualified v20 approximately28.53; it was not promoted.
 with strict parser correctionaa88a9b0 pass20 standalone executions and ten
 zero-error memchecks. This is compiled-ABI/bounded-correctness evidence, not
 serving activation or a throughput gain. The checked Rust kernel family is
-still under review and is not approved for serving.
+independently approved and committed asad367a70, with897 CPU tests passing.
+It has no serving caller; resident ownership and actual reader integration
+remain in progress, and no B-tile serving profile is approved.
 
 The [v24 first-private-KV diagnostic](glm-mtp-first-kv-v24-results.md), source
 2da770dc with unchanged CUDA189db87e, passed its bounded native/health gates.
