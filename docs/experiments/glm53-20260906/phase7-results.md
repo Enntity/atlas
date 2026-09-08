@@ -317,3 +317,26 @@ Its856 CPU tests cover real production validation, typed dispatch and ownership,
 including exhaustive scalar/copy/launch/sync fault injection. There is no loader
 caller, Ready publication or enabled serving reader, and therefore no claimed
 model speedup from this infrastructure commit.
+
+## v23 post-EH probe and production-reader integration
+
+The default-off post-EH extension1f675c8b passes859 CPU tests,16 analyzer tests,
+and exact reanalysis of every prior v22 evidence field. Native v23 completes
+six148/64 diagnostic requests with all384 records accounted for. All48 sampled
+cross-rank post-EH hashes agree, while every corresponding final hash differs.
+The unexplained interval is therefore after the measured EH boundary; equal
+private KV or a particular body bug is not established. Generation3 changes
+draft/acceptance trajectories, so three cross-request comparisons match24
+steps rather than32. See [complete v23 evidence](glm-mtp-hidden-trace-v23-results.md).
+
+Answer,1984-token needle, cancellation and fresh recovery checks pass. Both
+containers stop cleanly and are preserved; the v20 qualified baseline remains
+unchanged. No diagnostic decode-window timing qualifies the30/60 target.
+
+Kernel source3332c36e promotes the six unchanged B-tile helper bodies into
+production, with standalone fixtures including that same source. All15 new
+CUDA exports compile, but compiled-signature/native numerical gates remain
+separate from source review. No serving selection is enabled. The literal
+shared/down loader extractiond6f4e554 passes866 model CPU tests, including80
+configuration combinations and888 injected I/O failures. It preserves the
+legacy allocation/stream/free order and does not activate B-tile storage.
