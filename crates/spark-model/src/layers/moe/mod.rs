@@ -535,6 +535,9 @@ mod forward_prefill_phase;
 mod forward_prefill_routed;
 mod forward_token_major;
 mod gate_up_m16;
+mod gate_up_repack;
+#[cfg(test)]
+mod gate_up_repack_test_gpu;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;
