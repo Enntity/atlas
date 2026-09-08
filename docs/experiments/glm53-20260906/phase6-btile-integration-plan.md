@@ -7,6 +7,34 @@ decode/M64 compatibility prototypes are not yet production capabilities.
 
 ## Evidence and decision boundary
 
+### September8 loader audit (not an enabled implementation)
+
+The existing unified helper allocates routed transposed gate/up and then frees
+their native allocations before proceeding to down. Therefore conversion cannot
+be appended after that helper, nor can `keep_originals` substitute for a bounded
+transaction: a duplicate gate/up layout costs about53.16GiB per rank across42
+layers. Extract shared/down phases explicitly and bypass both routed transpose
+and routed-native frees when the new storage is eventually selected.
+
+Publication must invalidate not only native/transposed pointer tables but also
+the routed `weights.experts[*].gate_proj/up_proj` native views. Those remaining
+views otherwise invite incompatible converters or frees. Preserve their real
+allocation owner while transferring the checked spans into the private pair.
+Validate native checkpoint dtype/shape/scale markers before `quantized_any`;
+do not infer checkpoint-native ownership from a returned quantized weight.
+
+The scripts now cover all required prequantized M64 ABIs through1024 with four
+native ordinary/sanitizer passes (`40c4bf5c`). The further1088-row envelope is
+committed as `ba37e742`, CPU-tested/reviewed but awaiting its own native gates.
+Use actual arena rows for production eligibility, not just configured chunks.
+Neither prototype validates production's native-source permutation: that
+requires a separate full-byte oracle before resident conversion is enabled.
+
+The next implementation partition is the private storage/handle contract and
+bounded repack transaction, plus an unchanged-legacy extraction of shared/down
+phases. Complete all reader selectors before exposing an enabled loader path.
+This partition alone does not provide a speedup and cannot authorize repacking.
+
 The original M16 B-tile standalone fixture passed C4/K5 full-output numerical
 and memcheck gates. Root's three paired runs reported all15 useful comparisons
 per width winning versus the current M16 baseline: C4 direct median1.299195x
