@@ -90,8 +90,16 @@ The frozen 38-file manifest (36 Rust files and both implementation plans) has
 SHA256 `eac4236c538bc527cdc18d29186ad4fab90b2a5131c7246858d216edec0f81e5`.
 This result document is outside that manifest. After the full test run, only
 one safety-comment line was combined to retain the existing verifier's
-500-line limit; there was no executable delta. Post-commit tests still remain
-required for the committed source.
+500-line limit; there was no executable delta. Source was committed as
+`f8a0bdb9faa38797021a720a4ecf6cea79db59d3`; the clean post-commit full CPU
+suite also passed 1,045/1,045 in 81.56 seconds.
+
+`glm-c2-verdict-f8a0bdb9-receipts.tar` contains the frozen source, committed
+result document and complete development receipts, including the post-commit
+run. Controller and head phase7 copies have SHA256
+`ed3136b7a79afcb7b03f2ff353e518ba511e7543afa1d7754744b6acf095ef51`.
+The archive predates this provenance paragraph and contains no serving binary
+or controller CPU shim.
 
 Non-test library checking passed in 9.01 seconds. Workspace formatting,
 scoped SPDX first-line checks and `git diff --check` passed. All 16 new Rust
