@@ -6,6 +6,9 @@ use super::*;
 
 #[path = "helpers_unified_phases.rs"]
 mod unified_phases;
+pub(super) use unified_phases::SharedGateUpReceipt;
+#[cfg(test)]
+pub(super) use unified_phases::btile_shared_fixture;
 #[cfg(test)]
 #[path = "helpers_unified_tests.rs"]
 mod unified_tests;

@@ -23,6 +23,7 @@ impl MoeLayer {
         self.down_t_scratch_packed = Some(scratch_packed);
         self.down_t_scratch_scale = Some(scratch_scale);
         self.down_ptrs_t = Some(ExpertPtrTable {
+            allocation: None, // Borrowed scratch is not an owning table allocation.
             packed_ptrs: packed_ptrs_t,
             scale_ptrs: scale_ptrs_t,
             scale2_vals: self.down_ptrs.scale2_vals,

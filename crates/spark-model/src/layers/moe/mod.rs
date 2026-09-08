@@ -20,6 +20,7 @@ use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeigh
 /// expert_id from device memory, then indexes these tables to find
 /// the correct weight pointers — no CPU involvement needed.
 pub(crate) struct ExpertPtrTable {
+    allocation: Option<ptr_table_build::receipt::TableAllocation>,
     /// `[num_experts]` u64 device pointers to each expert's B_packed.
     pub(crate) packed_ptrs: DevicePtr,
     /// `[num_experts]` u64 device pointers to each expert's B_scale.
@@ -303,6 +304,7 @@ pub struct MoeLayer {
     hybrid_layout: bool,
     /// Transposed shared expert weights for prefill.
     shared_gate_t: Option<QuantizedWeight>,
+    shared_gate_up_receipt: Option<helpers_a::SharedGateUpReceipt>,
     shared_up_t: Option<QuantizedWeight>,
     shared_down_t: Option<QuantizedWeight>,
     moe_grouped_gemm_t: KernelHandle,

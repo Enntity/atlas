@@ -2,8 +2,23 @@
 use super::super::gate_up_repack_test_gpu::{Arg, Event, RecordingGpu, fixture, fixture_layer};
 use super::native_source::SCALE_BYTES;
 use super::*;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use std::sync::atomic::Ordering;
+
+fn family(
+    gpu: &dyn GpuBackend,
+    packed: KernelHandle,
+    transpose: KernelHandle,
+) -> kernels::KernelFamily<'_> {
+    let donor = RecordingGpu::new();
+    let (_, mut config, _) = fixture(0, &donor);
+    config.shared_expert_intermediate_size = 2048;
+    let mut family = kernels::KernelFamily::resolve(gpu, &config, 77).unwrap();
+    // Explicitly corrupt handles only in the existing negative-handle test.
+    family.handles[0] = packed;
+    family.handles[1] = transpose;
+    family
+}
 
 #[test]
 fn actual_production_byte_dispatch_full_layer_exact_abi_and_single_workspace() {
@@ -20,7 +35,7 @@ fn actual_production_byte_dispatch_full_layer_exact_abi_and_single_workspace() {
         let mut workspace = RepackWorkspace::new(&gpu, 77).unwrap();
         let scratch = workspace.scratch.unwrap().ptr;
         let result = workspace
-            .repack(input, KernelHandle(101), KernelHandle(102))
+            .repack(input, &family(&gpu, KernelHandle(101), KernelHandle(102)))
             .unwrap();
         assert_eq!(result.source.projections().len(), 288);
         let events = gpu.trace();
@@ -81,7 +96,7 @@ fn actual_transaction_every_copy_launch_sync_fault_poisoned_and_cleaned() {
         gpu.clear();
         gpu.fail_at.store(fault, Ordering::Relaxed);
         let error = workspace
-            .repack(input, KernelHandle(101), KernelHandle(102))
+            .repack(input, &family(&gpu, KernelHandle(101), KernelHandle(102)))
             .err()
             .expect("injected failure");
         assert!(error.to_string().contains("abandon"), "{error:#}");
@@ -98,7 +113,7 @@ fn actual_transaction_every_copy_launch_sync_fault_poisoned_and_cleaned() {
         gpu.clear();
         assert!(
             workspace
-                .repack(next, KernelHandle(101), KernelHandle(102))
+                .repack(next, &family(&gpu, KernelHandle(101), KernelHandle(102)))
                 .is_err()
         );
         assert!(gpu.trace().is_empty());
@@ -113,18 +128,15 @@ fn actual_transaction_refuses_handles_stream_and_capture_before_copy() {
         let input = NativeGateUpLayer::from_store(&store, &config, 0, &local, &gpu, 77).unwrap();
         let mut workspace = RepackWorkspace::new(&gpu, if fault == 2 { 78 } else { 77 }).unwrap();
         gpu.clear();
+        let handles = family(
+            &gpu,
+            KernelHandle(if fault == 0 { 0 } else { 101 }),
+            KernelHandle(if fault == 1 { 0 } else { 102 }),
+        );
         if fault == 3 {
             gpu.capturing.store(true, Ordering::Relaxed);
         }
-        assert!(
-            workspace
-                .repack(
-                    input,
-                    KernelHandle(if fault == 0 { 0 } else { 101 }),
-                    KernelHandle(if fault == 1 { 0 } else { 102 })
-                )
-                .is_err()
-        );
+        assert!(workspace.repack(input, &handles).is_err());
         assert!(gpu.trace().is_empty());
         gpu.capturing.store(false, Ordering::Relaxed);
         workspace.close().unwrap();
@@ -194,7 +206,7 @@ fn actual_workspace_backend_alias_fault_never_frees_original_owner() {
         gpu.clear();
         assert!(
             workspace
-                .repack(input, KernelHandle(101), KernelHandle(102))
+                .repack(input, &family(&gpu, KernelHandle(101), KernelHandle(102)))
                 .is_err()
         );
         assert!(workspace.poisoned);
@@ -218,7 +230,7 @@ fn actual_transaction_refuses_foreign_backend_without_launch() {
     gpu.clear();
     assert!(
         workspace
-            .repack(input, KernelHandle(101), KernelHandle(102))
+            .repack(input, &family(&gpu, KernelHandle(101), KernelHandle(102)))
             .is_err()
     );
     assert!(other.trace().is_empty());
@@ -237,10 +249,10 @@ fn actual_workspace_reused_across_distinct_layers_without_device_allocations() {
     let mut workspace = RepackWorkspace::new(&gpu, 77).unwrap();
     let scratch = workspace.scratch.unwrap().ptr;
     let a = workspace
-        .repack(first, KernelHandle(101), KernelHandle(102))
+        .repack(first, &family(&gpu, KernelHandle(101), KernelHandle(102)))
         .unwrap();
     let b = workspace
-        .repack(next, KernelHandle(101), KernelHandle(102))
+        .repack(next, &family(&gpu, KernelHandle(101), KernelHandle(102)))
         .unwrap();
     assert_ne!(
         a.source.projections()[0].packed.ptr,
@@ -276,7 +288,7 @@ fn actual_async_failure_preserves_primary_and_cleanup_error_context() {
         gpu.fail_at.store(1, Ordering::Relaxed);
         gpu.fail_also.store(cleanup, Ordering::Relaxed);
         let error = workspace
-            .repack(input, KernelHandle(101), KernelHandle(102))
+            .repack(input, &family(&gpu, KernelHandle(101), KernelHandle(102)))
             .err()
             .unwrap();
         let message = format!("{error:#}");
@@ -336,7 +348,7 @@ fn actual_workspace_foreign_shared_down_mtp_alias_never_mutates_or_frees_owner()
         gpu.clear();
         assert!(
             workspace
-                .repack(input, KernelHandle(101), KernelHandle(102))
+                .repack(input, &family(&gpu, KernelHandle(101), KernelHandle(102)))
                 .is_err(),
             "{name}"
         );
@@ -362,7 +374,7 @@ fn actual_weight_store_release_owns_all_originals_exactly_once_after_unpublished
     let input = NativeGateUpLayer::from_store(&store, &config, 0, &local, &gpu, 77).unwrap();
     let mut workspace = RepackWorkspace::new(&gpu, 77).unwrap();
     let unpublished = workspace
-        .repack(input, KernelHandle(101), KernelHandle(102))
+        .repack(input, &family(&gpu, KernelHandle(101), KernelHandle(102)))
         .unwrap();
     workspace.close().unwrap();
     assert_eq!(*gpu.live.lock().unwrap(), originals);

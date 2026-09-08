@@ -2,6 +2,18 @@
 //! Private construction phases; no partial-layout serving entry point.
 
 use super::*;
+#[path = "shared_gate_up_receipt.rs"]
+mod receipt;
+pub(in crate::layers::moe) use receipt::SharedGateUpReceipt;
+
+#[cfg(test)]
+pub(in crate::layers::moe) fn btile_shared_fixture(
+    layer: &mut MoeLayer,
+    gpu: &dyn GpuBackend,
+    config: &atlas_core::config::ModelConfig,
+) -> Result<()> {
+    layer.transpose_unified_shared_gate_up(gpu, config)
+}
 
 impl MoeLayer {
     pub(super) fn transpose_unified_shared_gate_up(
@@ -9,6 +21,9 @@ impl MoeLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
+        // Invalidate before any fallible repeat; stamp only after both actual
+        // transforms succeed. No new GPU operations or legacy failure paths.
+        self.shared_gate_up_receipt = None;
         let h = config.hidden_size;
         let shared_inter = config.shared_expert_intermediate_size;
         // Shared expert (tiny, do unconditionally — fits regardless).
@@ -23,6 +38,14 @@ impl MoeLayer {
                 shared_inter,
                 h,
             )?);
+            self.shared_gate_up_receipt = receipt::SharedGateUpReceipt::completed(
+                gpu,
+                shared_inter,
+                h,
+                self.shared_experts_scale_kind,
+                self.shared_gate_t.expect("successful transform"),
+                self.shared_up_t.expect("successful transform"),
+            );
         }
         Ok(())
     }

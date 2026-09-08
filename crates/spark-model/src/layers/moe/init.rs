@@ -508,6 +508,7 @@ impl MoeLayer {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             shared_gate_t: None,
+            shared_gate_up_receipt: None,
             shared_up_t: None,
             shared_down_t: None,
             gate_fp8: None,

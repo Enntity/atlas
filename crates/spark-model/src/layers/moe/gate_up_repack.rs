@@ -3,9 +3,34 @@
 //! Staged until the complete reader family exists; never enable via a flag here.
 #![allow(dead_code)]
 use anyhow::{Result, ensure};
-use spark_runtime::gpu::{GpuBackend, KernelHandle};
+use spark_runtime::gpu::GpuBackend;
+#[path = "gate_up_btile_arena.rs"]
+mod arena;
+#[cfg(test)]
+#[path = "gate_up_btile_arena_tests.rs"]
+mod arena_tests;
+#[path = "gate_up_btile_binding.rs"]
+mod binding;
+#[cfg(test)]
+#[path = "gate_up_btile_binding_tests.rs"]
+mod binding_tests;
+#[path = "gate_up_btile_decode.rs"]
+mod decode;
+#[path = "gate_up_btile_grouped.rs"]
+mod grouped;
+#[path = "gate_up_btile_kernels.rs"]
+mod kernels;
+#[cfg(test)]
+#[path = "gate_up_btile_launch_tests.rs"]
+mod launch_tests;
 #[path = "gate_up_native_source.rs"]
 mod native_source;
+#[cfg(test)]
+#[path = "gate_up_btile_test_gpu.rs"]
+mod recording;
+#[cfg(test)]
+#[path = "gate_up_btile_shared_tests.rs"]
+mod shared_tests;
 use native_source::{NativeGateUpLayer, PACKED_BYTES, Span};
 
 pub(super) struct RepackWorkspace<'a> {
@@ -42,17 +67,19 @@ impl<'a> RepackWorkspace<'a> {
     fn repack<'s>(
         &mut self,
         source: NativeGateUpLayer<'s, 'a>,
-        packed: KernelHandle,
-        transpose: KernelHandle,
+        family: &kernels::KernelFamily<'a>,
     ) -> Result<UnpublishedBTileLayer<'s, 'a>> {
         ensure!(
             !self.poisoned,
             "poisoned repack workspace; abandon construction"
         );
         ensure!(
-            std::ptr::addr_eq(self.gpu, source.gpu()) && self.stream == source.stream(),
+            std::ptr::addr_eq(self.gpu, source.gpu())
+                && std::ptr::addr_eq(self.gpu, family.gpu)
+                && self.stream == source.stream(),
             "repack backend/stream mismatch"
         );
+        let [packed, transpose] = [family.handles[0], family.handles[1]];
         ensure!(
             !self.gpu.stream_is_capturing(self.stream),
             "repack during capture"

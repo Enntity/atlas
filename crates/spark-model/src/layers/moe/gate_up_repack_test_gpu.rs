@@ -157,8 +157,12 @@ impl GpuBackend for RecordingGpu {
     fn default_stream(&self) -> u64 {
         0
     }
-    fn kernel(&self, _: &str, _: &str) -> Result<KernelHandle> {
-        bail!("unexpected kernel lookup")
+    fn kernel(&self, _: &str, name: &str) -> Result<KernelHandle> {
+        Ok(KernelHandle(match name {
+            "glm_native_to_btile_u8" => 101,
+            "transpose_u8" => 102,
+            _ => 103,
+        }))
     }
     fn op_cache(&self) -> &spark_runtime::op_cache::OpCache {
         &self.cache
