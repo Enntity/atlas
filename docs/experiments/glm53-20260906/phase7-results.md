@@ -93,6 +93,31 @@ idle before starting the build, which is bounded to8GiB/two CPU cores because
 restored source timestamps may cause CUDA recompilation. Native rollout remains
 pending until its new executable is built and verified on both nodes.
 
+### v20 native correctness gate
+
+The rebuilt executable completes in6m03s (189 CUDA compilations plus Rust),
+exit0/OOMKilled=false. Both `kernel-20260908-v20` images contain SHA256
+`6d774b5a4bd69d121a0822af227a504bc818a3b194ca308cf8731c9421a9e447`.
+The committed source's824-test CPU suite is repeated successfully. No native
+builder, packaging or standalone GPU job overlaps this model execution.
+
+At.91 utilization the eager/no-overlap cache diagnostic passes all126 resident
+byte and126 K5 output comparisons on each rank. Four strict answers pass. The
+1984-token needle request now passes through its1025-row first chunk and
+retrieves `NEBULA-2847` (16 output tokens,3.609s full wall). This is a boundary
+retrieval check, not a capped throughput benchmark or a new prefill claim.
+
+A128-token streaming request receives5,642 bytes before its intentional2s
+client cancellation (curl exit28); all four fresh answer checks then pass.
+Available host memory remains above4GiB, including about11.5GiB after load and
+12.3GiB on the head after the long-context request. Both oracle containers stop
+gracefully, exit0/OOMKilled=false, and are preserved as
+`atlas-glm53-v20-cache91-oracle-ep0/1`.
+
+Next: fresh cache-OFF and cache-ON graph-enabled runs at the same.91 budget,
+same image and LRU148/256 fixture, one warmup plus three measurements. The
+diagnostic gate above is not evidence of a throughput improvement.
+
 ## Routed B-tile M64 standalone extension
 
 Committed prototype `40c4bf5c` completes four native fixture passes: ordinary
