@@ -18,6 +18,20 @@ impl GlmPairedExecution for TransformerModel {
         grammar: Option<&[i32]>,
     ) -> Result<()> {
         self.paired_validate_propose(seq, seed, position, drafts, grammar.is_some())
+            .map(|_| ())
+    }
+    fn verify(&self, seq: &mut SequenceState, tokens: &[u32]) -> Result<Vec<u32>> {
+        self.paired_send_verify(seq, tokens)
+    }
+    fn propose(
+        &self,
+        seq: &mut SequenceState,
+        seed: u32,
+        position: usize,
+        drafts: usize,
+        grammar: Option<&[i32]>,
+    ) -> Result<Vec<u32>> {
+        self.paired_send_propose(seq, seed, position, drafts, grammar)
     }
 }
 
@@ -126,7 +140,7 @@ impl TransformerModel {
         position: usize,
         drafts: usize,
         grammar: bool,
-    ) -> Result<()> {
+    ) -> Result<(u64, u64)> {
         let capability = self
             .paired_handoff()
             .context("paired proposal capability missing")?;

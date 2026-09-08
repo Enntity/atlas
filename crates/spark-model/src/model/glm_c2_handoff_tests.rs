@@ -12,6 +12,20 @@ mod legacy_boundary_tests;
 mod predispatch_tests;
 #[path = "glm_c2_handoff_preflight_tests.rs"]
 mod preflight_tests;
+#[path = "glm_c2_transport_boundary_tests.rs"]
+mod transport_boundary_tests;
+#[path = "glm_c2_transport_continuation_tests.rs"]
+mod transport_continuation_tests;
+#[path = "glm_c2_transport_fault_tests.rs"]
+mod transport_fault_tests;
+#[path = "glm_c2_transport_legacy_tests.rs"]
+mod transport_legacy_tests;
+#[path = "glm_c2_transport_reuse_tests.rs"]
+mod transport_reuse_tests;
+#[path = "glm_c2_transport_test_fixture.rs"]
+mod transport_test_fixture;
+#[path = "glm_c2_transport_tests.rs"]
+mod transport_tests;
 #[path = "glm_c2_verdict_continuation_tests.rs"]
 mod verdict_continuation_tests;
 #[path = "glm_c2_verdict_escape_tests.rs"]

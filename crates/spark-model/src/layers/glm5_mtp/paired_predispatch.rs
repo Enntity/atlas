@@ -43,18 +43,24 @@ impl Glm5MtpHead {
         state: &dyn ProposerState,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<(u64, u64)> {
         let state = state
             .as_any()
             .downcast_ref::<Glm5MtpProposerState>()
             .context("paired proposal requires actual GLM state")?;
         self.check_owned_proposal(token, state, ctx, stream)?;
-        if matches!(state.repair, repair_state::RepairPhase::Pending(_)) {
-            self.repair_plan(input, state, ctx)?;
+        let index = if matches!(state.repair, repair_state::RepairPhase::Pending(_)) {
+            self.repair_plan(input, state, ctx)?.0
         } else {
-            self.bootstrap_plan(input, state, ctx)?;
-        }
-        Ok(())
+            self.bootstrap_plan(input, state, ctx)?.0
+        };
+        let pool = self.paired.as_ref().context("paired pool missing")?.lock();
+        pool.scratch_idle()?;
+        ensure!(
+            pool.matches_request(state, input, ctx)? == index,
+            "paired proposal owner changed"
+        );
+        Ok((pool.slots[index].generation, pool.next_attempt(index)?))
     }
 
     pub(super) fn proposal_metadata(

@@ -251,8 +251,9 @@ fn worker_f0_and_bootstrap_publish_two_real_owners_before_peer_overwrite() {
 }
 
 #[test]
-fn worker_c2_e1_guard_stays_closed_before_payload_or_proposer_work() {
-    if isolated("worker_tests::worker_c2_e1_guard_stays_closed_before_payload_or_proposer_work") {
+fn worker_selected_e1_requires_versioned_payload_before_proposer_work() {
+    if isolated("worker_tests::worker_selected_e1_requires_versioned_payload_before_proposer_work")
+    {
         return;
     }
     let mut f = Fixture::new(1);
@@ -260,20 +261,17 @@ fn worker_c2_e1_guard_stays_closed_before_payload_or_proposer_work() {
     let mut slots = take_slots(&mut f);
     let before = f.gpu.read_span(f.gpu.slab(), SLAB_BYTES);
     let mut messages = command(1, 0xffffffe1);
-    messages.push(Message::Payload(0, vec![5, 4, 4, 0]));
+    messages.push(Message::Payload(0, vec![0, 1, 0, 1, 0, 5, 4, 7]));
     comm.queue(messages.clone());
     f.gpu.clear();
-    let error = f.model.ep_worker_step(&mut slots).unwrap_err().to_string();
-    assert!(error.contains("requires max_batch_size=1"), "{error}");
-    assert_eq!(*comm.received.lock(), messages[..2]);
-    assert_eq!(comm.pending.lock().len(), 1, "E1 payload remains unread");
+    let error = format!("{:#}", f.model.ep_worker_step(&mut slots).unwrap_err());
+    assert!(error.contains("paired E1 version"), "{error}");
+    comm.done(&messages);
     assert_eq!(comm.collectives.load(Ordering::Relaxed), 0);
-    assert!(
-        f.gpu
-            .trace()
-            .iter()
-            .all(|event| matches!(event, Event::Sync(DEFAULT) | Event::Read(_, 4, DEFAULT)))
-    );
+    assert!(f.gpu.trace().iter().all(|event| matches!(
+        event,
+        Event::Sync(DEFAULT) | Event::Read(_, 4 | 32, DEFAULT)
+    )));
     assert_eq!(f.gpu.read_span(f.gpu.slab(), SLAB_BYTES), before);
     assert!(slots.iter().all(|seq| seq.as_ref().unwrap().seq_len == 0));
 }

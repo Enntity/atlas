@@ -498,6 +498,9 @@ impl TransformerModel {
 
         match cmd {
             EP_CMD_GLM_MTP_PROPOSE => {
+                if self.paired_handoff().is_some() {
+                    return self.paired_receive_propose(seq);
+                }
                 anyhow::ensure!(
                     crate::layers::glm5_mtp::distributed_enabled()
                         && self.config.model_type == "glm5_next",
@@ -636,57 +639,77 @@ impl TransformerModel {
                 }
             }
             0xFFFFFFF5 => {
-                // Width-generic verify, used by four-draft MTP (K=5) and
-                // DFlash. Keep this protocol separate from the fixed-width
-                // commands so existing ranks remain byte-for-byte unchanged.
-                let k = self.ep_broadcast_u32(0)? as usize;
-                anyhow::ensure!(
-                    (2..=32).contains(&k),
-                    "EP generic verify width must be 2..=32, got {k}"
-                );
-                let tokens = self.ep_broadcast_tokens(&vec![0u32; k])?;
-                let paired_base = self.paired_handoff().map(|_| seq.seq_len);
-                self.sync_secondary()?;
-                self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
-
-                let num_accepted = self
-                    .ep_broadcast_u32(0)
-                    .map_err(|error| self.paired_failed_transaction(seq, error))?
-                    as usize;
-                if num_accepted >= k {
-                    return Err(self.paired_failed_transaction(
-                        seq,
-                        anyhow::anyhow!(
-                            "EP generic verify accepted {num_accepted} drafts for K={k}"
-                        ),
-                    ));
-                }
-                let committed = num_accepted + 1;
-                let verify_base = if let Some(base) = paired_base {
-                    base
-                } else if crate::speculative::glm_repair_policy::enabled() {
-                    seq.seq_len
-                        .checked_sub(k)
-                        .ok_or_else(|| anyhow::anyhow!("EP verify base underflow"))?
-                } else {
-                    0
-                };
-                let to_drop = k - committed;
-                if to_drop > 0 {
-                    anyhow::ensure!(
-                        seq.seq_len >= to_drop && seq.tokens.len() >= to_drop,
-                        "EP generic verify rollback underflow: seq_len={}, tokens={}, drop={to_drop}",
-                        seq.seq_len,
-                        seq.tokens.len(),
-                    );
-                    seq.seq_len -= to_drop;
-                    for _ in 0..to_drop {
-                        seq.tokens.pop();
+                let selected = self.paired_handoff().is_some();
+                let result = (|| {
+                    if selected {
+                        self.paired_wire_profile(1)?;
                     }
-                }
-                self.record_glm_mtp_verified_impl(seq, verify_base, &tokens, num_accepted)?;
-                self.trim_proposer_state(seq, num_accepted, 0)?;
-                self.commit_accepted_prefix(seq, committed, k)?;
+                    // Width-generic verify, used by four-draft MTP (K=5) and
+                    // DFlash. Keep this protocol separate from the fixed-width
+                    // commands so existing ranks remain byte-for-byte unchanged.
+                    let k = self.ep_broadcast_u32(0)? as usize;
+                    if selected {
+                        anyhow::ensure!(k == 5, "paired F5 requires fixed K5");
+                    }
+                    anyhow::ensure!(
+                        (2..=32).contains(&k),
+                        "EP generic verify width must be 2..=32, got {k}"
+                    );
+                    let tokens = self.ep_broadcast_tokens(&vec![0u32; k])?;
+                    let paired_base = self.paired_handoff().map(|_| seq.seq_len);
+                    if selected {
+                        self.paired_validate_verify(seq, &tokens)?;
+                    }
+                    self.sync_secondary()?;
+                    self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
+
+                    let num_accepted = self
+                        .ep_broadcast_u32(0)
+                        .map_err(|error| self.paired_failed_transaction(seq, error))?
+                        as usize;
+                    if num_accepted >= k {
+                        return Err(self.paired_failed_transaction(
+                            seq,
+                            anyhow::anyhow!(
+                                "EP generic verify accepted {num_accepted} drafts for K={k}"
+                            ),
+                        ));
+                    }
+                    let committed = num_accepted + 1;
+                    let verify_base = if let Some(base) = paired_base {
+                        base
+                    } else if crate::speculative::glm_repair_policy::enabled() {
+                        seq.seq_len
+                            .checked_sub(k)
+                            .ok_or_else(|| anyhow::anyhow!("EP verify base underflow"))?
+                    } else {
+                        0
+                    };
+                    let to_drop = k - committed;
+                    if to_drop > 0 {
+                        anyhow::ensure!(
+                            seq.seq_len >= to_drop && seq.tokens.len() >= to_drop,
+                            "EP generic verify rollback underflow: seq_len={}, tokens={}, drop={to_drop}",
+                            seq.seq_len,
+                            seq.tokens.len(),
+                        );
+                        seq.seq_len -= to_drop;
+                        for _ in 0..to_drop {
+                            seq.tokens.pop();
+                        }
+                    }
+                    self.record_glm_mtp_verified_impl(seq, verify_base, &tokens, num_accepted)?;
+                    self.trim_proposer_state(seq, num_accepted, 0)?;
+                    self.commit_accepted_prefix(seq, committed, k)?;
+                    Ok(())
+                })();
+                result.map_err(|error| {
+                    if selected {
+                        self.paired_transport_error(error)
+                    } else {
+                        error
+                    }
+                })?;
             }
             token => {
                 // Regular decode

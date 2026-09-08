@@ -56,8 +56,21 @@ impl GlmPairedHandoff for Glm5MtpHead {
         state: &dyn ProposerState,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<(u64, u64)> {
         self.paired_validate_propose(input, seed, state, ctx, stream)
+    }
+    fn fail_transport(&self, gpu: &dyn GpuBackend) -> Result<()> {
+        let mut pool = self
+            .paired
+            .as_ref()
+            .context("paired transport pool missing")?
+            .lock();
+        pool.backend(gpu)?;
+        pool.producer_failed = true;
+        for slot in &mut pool.slots {
+            slot.failed = true;
+        }
+        Ok(())
     }
     fn commit_target(
         &self,

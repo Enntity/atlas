@@ -1,8 +1,9 @@
 # GLM paired B1: shared prewire validation and owned command transport
 
-2026-09-08. Root read the full plan and approved checkpoint 1 implementation.
-Checkpoint 2 is approved only after checkpoint 1 behavioral RED/GREEN and root
-source review. Coordinate model edits with the selection author's Cargo window.
+2026-09-08. Root read and approved both checkpoints; checkpoint 1 is committed
+as `335c9956` after behavioral RED/GREEN and independent source review. Root
+explicitly released checkpoint 2 after exact-tip model/server CPU gates at
+`67640368`. Compiled-source freezes and Cargo handoffs remain coordinated.
 Partition A Gate 2 is committed as `f8a0bdb9`; its post-commit CPU suite passed
 1045/1045. Root closed its archive before this plan. Root approved the design
 direction, API and eight-word selected wire format below under that sequencing.
@@ -257,3 +258,44 @@ contract. They validate extent, geometry and history but are not an independent
 allocation-provenance seal against arbitrary substitution of another live
 sequence's numerically valid map. Prefix reuse, HSS, restore and compaction are
 refused; no new target-map ownership abstraction is introduced at this checkpoint.
+
+## Checkpoint 2 staged implementation receipt
+
+The actual sealed Model capability now owns selected head E1/F5 preflight,
+first-header attempt, payload and local execution. E1's identity comes back
+from the same immutable private proposal plans as `(generation, next_attempt)`;
+the public validation API still returns only `()`. It is neither a reservation
+nor authority that bypasses execution-time revalidation. Worker selected E1
+receives the eight-word versioned payload and never saves a global hidden row.
+Worker F5 retains one existing verify/record/trim/commit body, with selected
+validation before its first local wait and a terminal-error wrapper.
+
+`fail_transport` validates the actual backend and latches both private slots
+plus the producer state, including errors before any Verification exists.
+Head capability scope ends when proposals/verified IDs return; the subsequent
+head sampler/verdict/accepted-count send remains B2's transaction driver and
+mandatory pre-armed fatal policy. Worker accepted-count receive/read/invalid
+value errors are inside the selected F5 wrapper and latch the whole session.
+No remote readiness, sampler truth, process containment or recovery is implied.
+
+`checkpoint2-red.log` has three genuine runtime failures: disabled head E1/F5
+and the old paired-worker C1 guard. `checkpoint2-green-attempt.log` passed the
+first 12 new tests. The first wider run was **89 PASS / 1 FAIL**, not GREEN:
+the old accepted-count fault fixture tried a live peer getter after the newly
+global latch. It now compares the real K/V pointers captured before failure,
+retaining the byte-preservation assertions without reviving a failed owner.
+The final focused run `checkpoint2-focused-final.log` passed **93/93 in 3.65s**.
+Full-suite/non-test/hygiene receipts are separate; this paragraph is not a
+native or whole-workspace CI claim.
+
+Coverage includes actual head bytes replayed through rank1 worker, all25
+acceptance pairs in both owner orders, six-round unequal histories, valid
+non-raw seed, old generation1 packet against a real generation2 replacement,
+each E1 identity field, actual base15 target-block exhaustion before either
+E1 or F5 header, first-header uploads/broadcasts, and worker postheader
+receive/read/completion/local-writer faults. Controls use real owners, target
+K5 normalization, actual private KV writes and the existing direct-call byte
+oracle. The independent actual legacy constructor tests preserve E1's four
+words/global-row copy and F5 message/event order under both v1 and v2, plus
+the unpaired max-batch refusal. Two obsolete staged tests now assert selected
+version/unready-owner refusal; the real legacy guard remains unchanged.

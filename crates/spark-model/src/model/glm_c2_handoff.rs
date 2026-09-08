@@ -11,6 +11,8 @@ mod decode;
 mod predispatch;
 #[path = "glm_c2_ssm.rs"]
 mod ssm;
+#[path = "glm_c2_transport.rs"]
+mod transport;
 #[path = "glm_c2_verification.rs"]
 mod verification;
 

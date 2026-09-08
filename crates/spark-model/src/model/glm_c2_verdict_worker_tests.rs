@@ -188,9 +188,9 @@ fn all25_rank1_worker_f5_repair_off_both_owner_orders() {
 }
 
 #[test]
-fn repeated_worker_transactions_detach_before_peer_and_keep_e1_closed() {
+fn repeated_worker_transactions_detach_before_peer_and_refuse_unready_e1() {
     if flow::isolated(
-        "verdict_worker_tests::repeated_worker_transactions_detach_before_peer_and_keep_e1_closed",
+        "verdict_worker_tests::repeated_worker_transactions_detach_before_peer_and_refuse_unready_e1",
     ) {
         return;
     }
@@ -216,15 +216,19 @@ fn repeated_worker_transactions_detach_before_peer_and_keep_e1_closed() {
         }
         let before = f.gpu.read_span(f.gpu.slab(), SLAB_BYTES);
         let cursors = f.seqs.each_ref().map(|seq| flow::private(seq).seq_len);
-        let messages = command(0, 0xffffffe1);
+        let mut messages = command(0, 0xffffffe1);
+        messages.push(Receive {
+            idle: false,
+            words: vec![1, 1, 0, 8, 0, f.seqs[0].seq_len as u32, 4, 7],
+        });
         comm.queue(&messages);
         let mut slots =
             std::mem::replace(&mut f.seqs, std::array::from_fn(SequenceState::host_only)).map(Some);
         f.gpu.clear();
         let error = f.model.ep_worker_step(&mut slots).unwrap_err();
         f.seqs = slots.map(Option::unwrap);
-        assert!(format!("{error:#}").contains("requires max_batch_size=1"));
-        comm.done(&messages); // No draft count/token/position payload admitted.
+        assert!(format!("{error:#}").contains("paired"));
+        comm.done(&messages); // Valid format cannot replace a missing owned bonus phase.
         assert!(!f.gpu.trace().iter().any(|e| matches!(
             e,
             Event::Body(_, _) | Event::Target(_, _, _) | Event::Kernel(_, _, _)
@@ -276,6 +280,14 @@ fn accepted_count_receive_read_and_invalid_value_fail_after_actual_k5() {
                 let peer = 1 - owner;
                 let peer_len = flow::private(&f.seqs[peer]).seq_len;
                 let peer_kv = flow::bytes(&f, peer, peer_len);
+                let peer_pointers = f
+                    .head
+                    .paired_test_kv_rows(
+                        f.seqs[peer].proposer_state.as_ref().unwrap().as_ref(),
+                        f.model.gpu.as_ref(),
+                        peer_len,
+                    )
+                    .unwrap();
                 let peer_blocks = flow::private(&f.seqs[peer]).block_table.clone();
                 let peer_tokens = f.seqs[peer].tokens.clone();
                 let peer_slab = f
@@ -372,7 +384,12 @@ fn accepted_count_receive_read_and_invalid_value_fail_after_actual_k5() {
                     f.gpu.trace().is_empty(),
                     "later completion cannot reopen issued F5 transaction"
                 );
-                assert_eq!(flow::bytes(&f, peer, peer_len), peer_kv);
+                // B1's issued-command latch invalidates both owners, so inspect
+                // the actual pointers sealed before failure, not a live-view API.
+                for ((k, v), expected) in peer_pointers.into_iter().zip(peer_kv) {
+                    assert_eq!(f.gpu.read_span(k, 1024), expected);
+                    assert_eq!(f.gpu.read_span(v, 1024), expected);
+                }
                 assert_eq!(flow::private(&f.seqs[peer]).block_table, peer_blocks);
                 assert_eq!(f.seqs[peer].tokens, peer_tokens);
                 assert_eq!(

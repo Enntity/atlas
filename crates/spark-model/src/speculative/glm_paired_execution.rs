@@ -19,18 +19,14 @@ pub trait GlmPairedExecution: sealed::Sealed + Send + Sync {
         drafts: usize,
         grammar: Option<&[i32]>,
     ) -> Result<()>;
-    /// Transport checkpoint is deliberately not implemented by validation alone.
-    fn verify(&self, _seq: &mut SequenceState, _tokens: &[u32]) -> Result<Vec<u32>> {
-        anyhow::bail!("paired command transport is not enabled")
-    }
+    /// Revalidate before issuing selected F5; caller owns the later verdict.
+    fn verify(&self, seq: &mut SequenceState, tokens: &[u32]) -> Result<Vec<u32>>;
     fn propose(
         &self,
-        _seq: &mut SequenceState,
-        _seed: u32,
-        _position: usize,
-        _drafts: usize,
-        _grammar: Option<&[i32]>,
-    ) -> Result<Vec<u32>> {
-        anyhow::bail!("paired command transport is not enabled")
-    }
+        seq: &mut SequenceState,
+        seed: u32,
+        position: usize,
+        drafts: usize,
+        grammar: Option<&[i32]>,
+    ) -> Result<Vec<u32>>;
 }
