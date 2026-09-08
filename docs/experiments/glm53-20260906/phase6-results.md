@@ -5,6 +5,17 @@ at C1, with cap-complete outputs, quality gates and a confirming repeat.
 Do not substitute a post-first-token metric, change the workload, or count
 an unqualified diagnostic as completion.
 
+Latest status is maintained in [deployment-current.md](deployment-current.md)
+and [phase7 results](phase7-results.md): qualified C1 full-wall medians are
+28.545/28.529 on v20; the separate qualified C4 profile remains47.319.
+[v23 post-EH](glm-mtp-hidden-trace-v23-results.md) and
+[no-overlap diagnostics](glm-mtp-nooverlap-control-results.md) are not performance
+promotions; the separate no-overlap trace-OFF C1 median28.181 also misses the
+target. [Promoted B-tile CUDA](glm-btile-cuda-promotion-results.md) passes20
+standalone executions/ten zero-error memchecks, but is not serving-enabled.
+The committed2da770dc first-KV diagnostic is awaiting root's v24 native build
+and qualification; checked kernel-family review remains open.
+
 ## Normalized MTP handoff
 
 | C1 image | Source | Full-wall runs | Median | Post-first median |

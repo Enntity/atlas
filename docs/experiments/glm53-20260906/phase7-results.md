@@ -2,15 +2,24 @@
 
 The acceptance target remains a reproducible full-wall median of at least30
 tok/s at C1 or60 aggregate tok/s at C4 on the unchanged LRU148/256 fixture,
-one warmup plus three measured waves and a confirming repeat. Current C1
-receipts are27.947 initially and25.161 on a clean repeat; neither establishes
-the target. Do not substitute post-first-token rates or discard low-acceptance
+one warmup plus three measured waves and a confirming repeat. Latest qualified
+C1 medians are28.545 initially and28.529 on a fresh v20 restart; qualified C4
+remains47.319 on its separate profile. Neither establishes the target. The
+earlier27.947/25.161 C1 receipts below are historical, not current best results.
+Do not substitute post-first-token rates or discard low-acceptance
 samples. The four strict answer checks are a smoke gate, not comprehensive
 model quality qualification.
 
+See [deployment-current.md](deployment-current.md) for profile safeguards and
+rollback boundaries. The latest [v23 no-overlap control](glm-mtp-nooverlap-control-results.md)
+changes the diagnostic divergence distribution without curing it; its separate
+trace-OFF full-wall median28.181 is a negative timing result, not a promotion.
+The committed first-KV probe2da770dc is awaiting root's v24 native build and
+qualification; no new serving image or checked B-tile family is approved here.
+
 ## Recovery and artifact identity
 
-Production source remains `1c186acf`, the independently reviewed deferred
+This recovery checkpoint used `1c186acf`, the independently reviewed deferred
 shared-cache/provenance fix. The prior native builder finished successfully
 on2026-09-07 at05:09:34UTC in2m13s, exit0/OOMKilled=false. On resumption both
 model services were stopped and both hosts had about116GiB MemAvailable.
@@ -335,8 +344,12 @@ unchanged. No diagnostic decode-window timing qualifies the30/60 target.
 
 Kernel source3332c36e promotes the six unchanged B-tile helper bodies into
 production, with standalone fixtures including that same source. All15 new
-CUDA exports compile, but compiled-signature/native numerical gates remain
-separate from source review. No serving selection is enabled. The literal
+CUDA exports pass the actual strict compiled-PTX ABI gate after Python-only
+parser correctionaa88a9b0. The [native promotion results](glm-btile-cuda-promotion-results.md)
+record20 completed standalone executions across both FMA policies and ten
+zero-error memchecks, with exact artifact hashes and bounded device budgets.
+No serving selection or speed gain is established. Checked Rust family review
+and owning publication remain incomplete. The literal
 shared/down loader extractiond6f4e554 passes866 model CPU tests, including80
 configuration combinations and888 injected I/O failures. It preserves the
 legacy allocation/stream/free order and does not activate B-tile storage.

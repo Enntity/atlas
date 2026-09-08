@@ -24,8 +24,28 @@ See [phase7 results](phase7-results.md) for exact flags, limitations and receipt
 The exact preserved head recipe is
 `/home/mangokid/atlas-glm53-deploy-20260906/phase7/run-v20-c1.sh`, requiring
 explicit `CACHE=1 VERIFY=0` after both standard-name containers are stopped
-and preserved. Persistent archived receipts include that recipe. The newer
-v21/v22 hidden-trace images are diagnostic builds, not performance promotions.
+and preserved. Persistent archived receipts include that recipe. Newer hidden-
+trace images are diagnostic builds, not performance promotions.
+
+### Latest experimental status — not a replacement profile
+
+The [v23 post-EH probe](glm-mtp-hidden-trace-v23-results.md) and
+[initial-prefill no-overlap control](glm-mtp-nooverlap-control-results.md)
+localize observed hidden-state differences without establishing a cause.
+No-overlap changes ordering as well as concurrency and does not remove every
+divergence. Its separate trace-OFF148/256 C1 timing median is28.181 full-wall
+tok/s, below the qualified v20 approximately28.53; it was not promoted.
+
+[Promoted B-tile CUDA gates](glm-btile-cuda-promotion-results.md) for3332c36e
+with strict parser correctionaa88a9b0 pass20 standalone executions and ten
+zero-error memchecks. This is compiled-ABI/bounded-correctness evidence, not
+serving activation or a throughput gain. The checked Rust kernel family is
+still under review and is not approved for serving.
+
+The first-private-KV diagnostic source2da770dc is committed; root's v24 native
+build is in progress at this status update, using unchanged CUDA189db87e.
+It is not yet a qualified live image. Keep its trace OFF in throughput profiles;
+do not replace v20 or the separate C4 profile below based on diagnostic builds.
 
 ## Last qualified C4 profile — September7
 
