@@ -251,3 +251,34 @@ environment, memory and stop receipts are retained. The no-pool LoRA route
 uses inert `Fold` in production while the diagnostic fixture assumes `Skip`;
 this mismatch is under investigation, not permission to relax adapter safety.
 The proven v20 image and measured28.53 full-wall profile remain unchanged.
+
+## Cache-enabled v20 K5 phase diagnostic
+
+Using the unchanged v20 image/cache-ON/.91 profile, enable verifier profiling
+and disable target graphs/shared-overlap. One148/32 warmup plus one148/32
+measurement both complete. This is not the148/256 throughput qualification.
+Both ranks have16 complete K5 intervals, eight per request, with exactly42
+instances of every MoE phase and34 KDA/11 MLA layers per interval. Excluding
+the first interval of each request leaves14 per rank, with these median summed
+phase times in milliseconds:
+
+| Phase | Rank0 | Rank1 |
+| --- | ---: | ---: |
+| Routed gate/up, including setup/activation work in that phase |26.6945|27.9190|
+| Routed SiLU/down |13.3425|14.4605|
+| Shared expert |15.9980|16.5640|
+| Router projection |4.9045|4.9310|
+| All45 layers, excluding final norm/vocabulary/argmax |123.4900|123.3650|
+
+Do not sum ranks or independently computed medians. Synchronized eager
+profiling perturbs timing and removes production overlap; these are priorities,
+not graph-on cost shares or causal deltas against the older v16 diagnostic.
+Shared work remains material, but the stronger routed-layout experiment also
+still addresses a substantial phase. No new kernel is promoted from this data.
+
+Raw `v20-cache-profile-*` receipts include both complete logs, client result,
+memory samples and condensed interval/count records. The recipe differs from
+clean v20 only by these diagnostics and graph/overlap settings. Both services
+stop gracefully, exit0/OOMKilled=false, preserved as
+`atlas-glm53-v20-cache-profile-ep0/1`. No native builder or standalone GPU
+workload overlapped the model run.
