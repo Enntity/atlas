@@ -21,6 +21,7 @@ BOOLS = {"eh_nvfp4", "head_nvfp4"}
 HASHES = {"input_sha256", "final_sha256"}
 FIELDS = INTEGERS | BOOLS | HASHES | {"argmax_pair_bytes"}
 EXTENDED = {"trace_version", "post_eh_sha256"}
+KV = {"kv_prefix_sha256", "kv_appended_sha256", "kv_block_map_sha256"}
 LIMITATIONS = (
     "Equal hidden hashes do not prove equal private KV, equal target causal prefixes, "
     "or a root cause. Matching position/seed only identifies comparison candidates. "
@@ -63,7 +64,7 @@ def parse_line(line):
         match = FIELD.match(tail)
         require(match is not None, "malformed trace field syntax")
         key, raw = match.groups()
-        require(key in FIELDS | EXTENDED and key not in result, f"unknown/duplicate trace field {key}")
+        require(key in FIELDS | EXTENDED | KV and key not in result, f"unknown/duplicate trace field {key}")
         if key in INTEGERS or key == "trace_version":
             require(re.fullmatch(r"0|[1-9][0-9]{0,19}", raw) is not None,
                     f"malformed integer {key}")
@@ -71,9 +72,9 @@ def parse_line(line):
         elif key in BOOLS:
             require(raw in ("true", "false"), f"invalid boolean {key}")
             result[key] = raw == "true"
-        elif key == "post_eh_sha256" and raw == "None":
+        elif key in KV | {"post_eh_sha256"} and raw == "None":
             result[key] = None
-        elif key in HASHES or key == "post_eh_sha256":
+        elif key in HASHES | KV | {"post_eh_sha256"}:
             require(re.fullmatch("[0-9a-f]{64}", raw) is not None, f"invalid digest {key}")
             result[key] = raw
         elif raw == "None":
@@ -90,13 +91,26 @@ def parse_line(line):
         rest = tail[match.end():]
         require(not rest or rest[0].isspace(), "missing field separator")
         tail = rest.lstrip()
-    require(set(result) in (FIELDS, FIELDS | EXTENDED), "missing fields or incomplete trace schema")
+    require(set(result) in (FIELDS, FIELDS | EXTENDED, FIELDS | EXTENDED | KV),
+            "missing fields or incomplete trace schema")
     if "trace_version" in result:
-        require(result["trace_version"] == 2, "unsupported trace schema version")
+        require(result["trace_version"] in (2, 3), "unsupported trace schema version")
+        require((set(result) == FIELDS | EXTENDED | KV) == (result["trace_version"] == 3),
+                "trace version/field schema mismatch")
         require((result["post_eh_sha256"] is not None) == (result["step"] == 0),
                 "post-EH digest required only at step0")
     else:
         result.update(trace_version=1, post_eh_sha256=None)
+    if result["trace_version"] == 3:
+        sampled = result["attempt"] == 1 and result["step"] == 0
+        require(all((result[key] is not None) == sampled for key in KV),
+                "KV digests required only at attempt1/step0")
+        if sampled:
+            integer(result["self.cache_before"], "first KV prefix rows", 1, 2043)
+            require(result["self.cache_before"] + 1 == result["self.cache_after"] == result["position"]
+                    and result["hidden_row"] == 0, "first KV cursor/source mismatch")
+    else:
+        result.update({key: None for key in KV})
     for key, lower, upper in (("rank", 0, 1), ("generation", 1, 2**64 - 1),
                               ("attempt", 1, 8), ("step", 0, 3), ("hidden_row", 0, 4),
                               ("position", 1, 2048), ("self.cache_before", 0, 2047),
@@ -143,6 +157,8 @@ def decoded_pairs(row):
 def compare(left_label, left, right_label, right):
     post_eh = [left.get("post_eh_sha256"), right.get("post_eh_sha256")]
     available = [value is not None for value in post_eh]
+    kv = {key: [left.get(key), right.get(key)] for key in sorted(KV)}
+    kv_available = [value is not None for value in kv["kv_prefix_sha256"]]
     metadata = {field: [left[field], right[field]] for field in ("position", "seed", "hidden_row", "step",
                 "self.cache_before", "self.cache_after", "eh_nvfp4", "head_nvfp4")
                 if left[field] != right[field]}
@@ -150,6 +166,10 @@ def compare(left_label, left, right_label, right):
         classification = "input_difference"
     elif all(available) and post_eh[0] != post_eh[1]:
         classification = "post_eh_difference"
+    elif all(kv_available) and kv["kv_prefix_sha256"][0] != kv["kv_prefix_sha256"][1]:
+        classification = "kv_prefix_difference"
+    elif all(kv_available) and kv["kv_appended_sha256"][0] != kv["kv_appended_sha256"][1]:
+        classification = "kv_appended_difference"
     elif left["final_sha256"] != right["final_sha256"]:
         classification = "final_hidden_difference"
     elif (left["argmax_pair_bytes"] is not None and right["argmax_pair_bytes"] is not None
@@ -161,6 +181,8 @@ def compare(left_label, left, right_label, right):
         classification = "argmax_pair_availability_difference"
     elif available[0] != available[1]:
         classification = "post_eh_availability_difference"
+    elif kv_available[0] != kv_available[1]:
+        classification = "kv_availability_difference"
     else:
         classification = "observed_agreement"
     return {"left": record_key(left_label, left), "right": record_key(right_label, right),
@@ -172,6 +194,9 @@ def compare(left_label, left, right_label, right):
             "trace_versions": [left.get("trace_version", 1), right.get("trace_version", 1)],
             "post_eh_sha256": post_eh, "post_eh_availability": available,
             "post_eh_equal": post_eh[0] == post_eh[1] if all(available) else None,
+            **kv, "kv_availability": kv_available,
+            **{key.replace("_sha256", "_equal"): value[0] == value[1] if all(kv_available) else None
+               for key, value in kv.items()},
             "drafts": [left["draft"], right["draft"]],
             "argmax_pair_evidence": [decoded_pairs(left), decoded_pairs(right)]}
 

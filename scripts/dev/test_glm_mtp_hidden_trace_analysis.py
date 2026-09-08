@@ -44,6 +44,92 @@ def rows(rank, generation=1, attempts=8):
 
 
 class TraceAnalysisTests(unittest.TestCase):
+    def v3_records(self):
+        records = [rows(0, 1), rows(1, 2)]
+        for items in records:
+            for item in items:
+                sampled = item["attempt"] == 1 and item["step"] == 0
+                item.update(trace_version=3, post_eh_sha256="a" * 64 if item["step"] == 0 else None,
+                            kv_prefix_sha256="b" * 64 if sampled else None,
+                            kv_appended_sha256="c" * 64 if sampled else None,
+                            kv_block_map_sha256="d" * 64 if sampled else None)
+        return records
+
+    def test_v3_first_attempt_only_canonical_kv_and_map_is_not_semantic(self):
+        records = self.v3_records()
+        records[1][0]["kv_block_map_sha256"] = "e" * 64
+        report = self.run_records(records)
+        steps = report["requests"]["A"]["cross_rank"]
+        self.assertTrue(steps[0]["kv_prefix_equal"])
+        self.assertTrue(steps[0]["kv_appended_equal"])
+        self.assertFalse(steps[0]["kv_block_map_equal"])
+        self.assertEqual(steps[0]["classification"], "observed_agreement")
+        for step in steps[1:]:
+            self.assertEqual(step["kv_availability"], [False, False])
+            self.assertIsNone(step["kv_prefix_equal"])
+            self.assertIsNone(step["kv_appended_equal"])
+
+    def test_v3_strict_field_set_first_attempt_and_cursor_cap(self):
+        record = self.v3_records()[0][0]
+        for missing in ("kv_prefix_sha256", "kv_appended_sha256", "kv_block_map_sha256"):
+            broken = dict(record)
+            del broken[missing]
+            with self.assertRaises(ValueError):
+                parse_line(wire(broken))
+        for changes in ({"kv_prefix_sha256": None}, {"kv_appended_sha256": "A" * 64},
+                        {"kv_block_map_sha256": "x"}, {"attempt": 2}, {"step": 1},
+                        {"trace_version": 2}, {"trace_version": 4}, {"hidden_row": 1},
+                        {"self.cache_before": 0}, {"self.cache_before": 2044},
+                        {"position": 149}, {"self.cache_after": 149}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                parse_line(wire({**record, **changes}))
+        for key in ("kv_prefix_sha256", "kv_appended_sha256", "kv_block_map_sha256"):
+            with self.assertRaises(ValueError):
+                parse_line(wire(record).strip() + f" {key}=" + "f" * 64)
+        for p in (1, 148, 1984, 2043):
+            self.assertEqual(parse_line(wire({**record, "self.cache_before": p,
+                "self.cache_after": p+1, "position": p+1}))["self.cache_before"], p)
+        for fault in ("within", "across"):
+            records = self.v3_records()
+            for item in records[1][:1 if fault == "within" else 32]:
+                item["trace_version"] = 2
+                for key in ("kv_prefix_sha256", "kv_appended_sha256", "kv_block_map_sha256"):
+                    del item[key]
+            with self.assertRaisesRegex(ValueError, "schema"):
+                self.run_records(records)
+
+    def test_v3_observed_boundaries_and_legacy_kv_unavailability(self):
+        left = parse_line(wire(self.v3_records()[0][0]))
+        for changes, expected in (({"kv_prefix_sha256": "e" * 64}, "kv_prefix_difference"),
+                                  ({"kv_appended_sha256": "e" * 64}, "kv_appended_difference"),
+                                  ({"final_sha256": "e" * 64}, "final_hidden_difference"),
+                                  ({"post_eh_sha256": "e" * 64}, "post_eh_difference")):
+            result = compare("A", left, "B", {**left, **changes})
+            self.assertEqual(result["classification"], expected)
+            self.assertEqual(result["kv_availability"], [True, True])
+        for legacy in (row(), row(trace_version=2, post_eh_sha256="a" * 64)):
+            result = compare("A", left, "legacy", parse_line(wire(legacy)))
+            self.assertEqual(result["kv_availability"], [True, False])
+            self.assertIsNone(result["kv_prefix_equal"])
+            self.assertIsNone(result["kv_appended_equal"])
+        result = compare("A", left, "legacy", parse_line(wire(row(trace_version=2, post_eh_sha256="a" * 64))))
+        self.assertEqual(result["classification"], "kv_availability_difference")
+
+    def test_v3_repeat_match_does_not_upgrade_attempt2_to_first_probe(self):
+        left = self.v3_records()[0]
+        right = copy.deepcopy(left)
+        for record in right:
+            record["generation"] = 2
+            record["position"] += 4
+            record["self.cache_before"] += 4
+            record["self.cache_after"] += 4
+        result = analyzer.compare_requests("A", {0: left, 1: left}, "B", {0: right, 1: right})
+        step = result["ranks"]["0"]["steps"][0]
+        self.assertEqual(step["left"]["attempt"], 2)
+        self.assertEqual(step["right"]["attempt"], 1)
+        self.assertEqual(step["kv_availability"], [False, True])
+        self.assertIsNone(step["kv_prefix_equal"])
+
     def test_version2_post_eh_boundary_and_legacy_availability(self):
         records = [rows(0, 1), rows(1, 2)]
         for items in records:
