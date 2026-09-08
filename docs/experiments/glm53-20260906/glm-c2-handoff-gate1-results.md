@@ -104,6 +104,14 @@ Controller receipts are under `atlas-campaigns/20260908/glm-c2-handoff/`.
 They are source-hashed development receipts, not dirty-tree serving gate
 records. The result document is outside that source manifest.
 
+Source committed as `bd14c2899f8370703f5bb07f3770ec8055f27395`; the post-commit
+full CPU suite also passed 1,003/1,003 in 81.81 seconds. The closed archive
+`glm-c2-handoff-bd14c289-receipts.tar` contains the frozen source, committed
+result document and development receipts. Controller and head phase7 copies
+have SHA256 `331e920b0fda9b1eb376c87452b94c5ef4e09e17e149413be18689299ab92087`.
+The archive predates this provenance paragraph; it contains no serving binary
+or controller CPU shim.
+
 ## Performance status and next gate
 
 No speculative C2 model benchmark has run. The qualified warm serving baseline
