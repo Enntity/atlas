@@ -1,5 +1,49 @@
 # Target-only GLM shared-expert FP8 cache: bounded integration plan
 
+## v20: retain valid oversized-prefill dispatch
+
+Root observed a legitimate 1025-row solo prefill with an arena sized for 1025,
+despite the configured chunk setting of 1024. Installed cache currently rejects
+this existing path. Do not change scheduler/context bounds or claim FP8 M64 was
+validated beyond 1024. Keep cache M64 for rows 1..1024 and dispatch larger valid
+arena-bounded rows through the retained original transposed NVFP4 projection.
+
+Before either installed-cache route, validate the projection ordinal (before
+bit shifts), exact GU/down geometry, installed cache pointer, arena row limit,
+output owner/capacity, and retained T handle/finite scalar/no per-row scales.
+Check aligned non-null non-overflowing spans and disjoint output/input/weights.
+VERIFY must refuse context or actual stream capture before the fallback, even
+after diagnostic bits were checked; the existing outer overlap guard remains.
+The large-row fallback calls existing `ops::w4a16_gemm_n128` with its retained
+handle, unchanged scalar and stream. No GPU allocation, copy, synchronization,
+oracle-pass log or diagnostic-bit update. Non-cache generic dispatch is unchanged.
+
+TDD first: actual `MoeLayer::run_shared_fp8_cache` with a recording GPU backend
+must fail on the current 1025-row rejection, then select cache at 1024 and old T
+at 1025 for all three projections. Verify complete typed launch arguments,
+grid/block/stream, zero extra backend operations, invalid projection/cache/T/
+geometry/capacity/alias refusal, and both capture guards even with checked bits.
+Independent source review and CPU suites precede root-only native rebuild,
+near-cap/cold-prefill quality, both-rank diagnostics and matched clean timing.
+
+The final positive dispatch matrix checks rows 1/4/5/16/63/64/65/148/1024 at the
+cached handle and 1025 at the retained T handle, for every projection (30 exact
+typed launches). A separate arena-2048 test accepts rows2048 through old T.
+Missing candidate handles at eager K5 VERIFY also reject before the reference
+launch: the added test first observed that reference launch, then passed after
+moving the candidate-handle check before oracle work. The large-row fallback
+does not require or launch the unused FP8 handle.
+
+Raw CPU receipts are persistent under
+`/home/abc/storage/models/atlas-campaigns/20260908/shared-fp8-fallback/`:
+`dispatch-behavior-red.log` (actual1025 rejection), `oracle-handle-red.log`
+(reference incorrectly launched before missing-candidate rejection), focused
+`dispatch-green.log` and final `full-model-cpu-frozen.log` (824 model tests).
+These are metadata/CPU tests, not CUDA numerical or serving-performance claims.
+The link-only controller libcuda shim exports no CUDA API and therefore cannot
+turn real CUDA calls into successful no-ops; it only satisfies the unused
+link-library name for the no-default-feature CPU binary.
+
 ## v18 startup correction: validated BF16-derived provenance
 
 The first cache-oracle startup failed safely before serving. Root's complete

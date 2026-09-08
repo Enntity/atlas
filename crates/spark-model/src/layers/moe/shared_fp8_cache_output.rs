@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Existing M64 FP8 dispatch, with an eager resident-weight K5 diagnostic.
+//! Validated FP8 M64 dispatch, retained-T large prefill, and eager K5 diagnostic.
 use super::*;
 use std::sync::atomic::Ordering;
 
@@ -31,6 +31,105 @@ impl MoeLayer {
                 stream,
             );
         }
+        anyhow::ensure!(
+            !state.verify || (!ctx.graph_capture && !ctx.gpu.stream_is_capturing(stream)),
+            "shared FP8 output VERIFY requires eager stream, including previously checked projections"
+        );
+        // Validate the ordinal before its diagnostic bit shift, including
+        // ordinary and large-row calls that never enter the K5 oracle.
+        let (pn, pk, owner, capacity, cached, original) = match projection {
+            0 => (
+                2048,
+                4096,
+                ctx.buffers.ssm_deinterleaved(),
+                ctx.buffers.sizes().ssm_deinterleaved,
+                self.shared_gate_fp8,
+                self.shared_gate_t,
+            ),
+            1 => (
+                2048,
+                4096,
+                ctx.buffers.ssm_qkvz(),
+                ctx.buffers.sizes().ssm_qkvz,
+                self.shared_up_fp8,
+                self.shared_up_t,
+            ),
+            2 => (
+                4096,
+                2048,
+                ctx.buffers.attn_output(),
+                ctx.buffers.sizes().attn_output,
+                self.shared_down_fp8,
+                self.shared_down_t,
+            ),
+            _ => anyhow::bail!("shared FP8 projection ordinal"),
+        };
+        anyhow::ensure!(
+            rows > 0 && rows as usize <= ctx.buffers.max_batch_tokens(),
+            "shared FP8 output row capacity exceeded"
+        );
+        anyhow::ensure!(
+            (n, k) == (pn, pk) && output == owner && cached == Some(weight),
+            "shared FP8 output geometry/owner/cached-weight binding"
+        );
+        let bf16_bytes = |width: u32| {
+            (rows as usize)
+                .checked_mul(width as usize)
+                .and_then(|bytes| bytes.checked_mul(2))
+                .ok_or_else(|| anyhow::anyhow!("shared FP8 output byte capacity overflow"))
+        };
+        let bytes = bf16_bytes(n)?;
+        anyhow::ensure!(
+            capacity >= bytes,
+            "shared FP8 output geometry/owner/capacity"
+        );
+        let original = original
+            .ok_or_else(|| anyhow::anyhow!("shared FP8 output missing retained T weight"))?;
+        anyhow::ensure!(
+            self.w4a16_gemm_t.0 != 0
+                && original.weight_scale_2.is_finite()
+                && !original.has_per_row_scale2(),
+            "shared FP8 retained T handle/scalar contract"
+        );
+        let out = super::m5_projections::span(output, bytes, 2)?;
+        let sources = [
+            (input, bf16_bytes(k)?),
+            (weight, n as usize * k as usize),
+            (original.weight, n as usize * k as usize / 2),
+            (original.weight_scale, n as usize * k as usize / 16),
+        ];
+        let mut spans = [0..0, 0..0, 0..0, 0..0];
+        for (index, (ptr, len)) in sources.into_iter().enumerate() {
+            spans[index] = super::m5_projections::span(ptr, len, 16)?;
+            super::m5_projections::disjoint(&out, &spans[index])?;
+            for previous in &spans[..index] {
+                super::m5_projections::disjoint(previous, &spans[index])?;
+            }
+        }
+        let reference = || {
+            ops::w4a16_gemm_n128(
+                ctx.gpu,
+                self.w4a16_gemm_t,
+                input,
+                &original,
+                output,
+                rows,
+                n,
+                k,
+                stream,
+            )
+        };
+        // A configured 1024-token chunk can legitimately arrive as a solo
+        // 1025-row pass in a 1025-row arena. The original T projection already
+        // supports it; keep that existing precision/ABI without extending the
+        // separately validated FP8 kernel envelope or fabricating oracle passes.
+        if rows > 1024 {
+            return reference();
+        }
+        anyhow::ensure!(
+            self.fp8_gemm_k.0 != 0,
+            "shared FP8 cache M64 handle missing before output/oracle work"
+        );
         let launch = || {
             launch_cached_m64(
                 ctx.gpu,
@@ -44,78 +143,11 @@ impl MoeLayer {
                 stream,
             )
         };
-        anyhow::ensure!(
-            (1..=1024).contains(&rows),
-            "shared FP8 cache row capacity exceeded"
-        );
-        anyhow::ensure!(
-            !state.verify || (!ctx.graph_capture && !ctx.gpu.stream_is_capturing(stream)),
-            "shared FP8 output VERIFY requires eager stream, including previously checked projections"
-        );
         let bit = 1u8 << projection;
         if !state.verify || rows != 5 || state.checked.load(Ordering::Relaxed) & bit != 0 {
             return launch();
         }
-        let (pn, pk, owner, capacity, original) = match projection {
-            0 => (
-                2048,
-                4096,
-                ctx.buffers.ssm_deinterleaved(),
-                ctx.buffers.sizes().ssm_deinterleaved,
-                self.shared_gate_t,
-            ),
-            1 => (
-                2048,
-                4096,
-                ctx.buffers.ssm_qkvz(),
-                ctx.buffers.sizes().ssm_qkvz,
-                self.shared_up_t,
-            ),
-            2 => (
-                4096,
-                2048,
-                ctx.buffers.attn_output(),
-                ctx.buffers.sizes().attn_output,
-                self.shared_down_t,
-            ),
-            _ => anyhow::bail!("shared FP8 projection ordinal"),
-        };
-        let bytes = rows as usize * n as usize * 2;
-        anyhow::ensure!(
-            (n, k) == (pn, pk) && output == owner && capacity >= bytes,
-            "shared FP8 output geometry/owner/capacity"
-        );
-        let original =
-            original.ok_or_else(|| anyhow::anyhow!("shared FP8 output oracle missing T weight"))?;
-        let out = super::m5_projections::span(output, bytes, 2)?;
-        for (ptr, len) in [
-            (input, rows as usize * k as usize * 2),
-            (weight, n as usize * k as usize),
-            (original.weight, n as usize * k as usize / 2),
-            (original.weight_scale, n as usize * k as usize / 16),
-        ] {
-            super::m5_projections::disjoint(&out, &super::m5_projections::span(ptr, len, 16)?)?;
-        }
-        verify_output(
-            ctx.gpu,
-            output,
-            bytes,
-            stream,
-            || {
-                ops::w4a16_gemm_n128(
-                    ctx.gpu,
-                    self.w4a16_gemm_t,
-                    input,
-                    &original,
-                    output,
-                    rows,
-                    n,
-                    k,
-                    stream,
-                )
-            },
-            launch,
-        )?;
+        verify_output(ctx.gpu, output, bytes, stream, reference, launch)?;
         state.checked.fetch_or(bit, Ordering::Relaxed);
         tracing::info!(
             layer = state.layer,
@@ -209,3 +241,7 @@ fn compare_outputs(reference: &[u8], actual: &[u8]) -> Result<()> {
 #[cfg(test)]
 #[path = "shared_fp8_cache_output_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "shared_fp8_cache_dispatch_tests.rs"]
+mod dispatch_tests;
