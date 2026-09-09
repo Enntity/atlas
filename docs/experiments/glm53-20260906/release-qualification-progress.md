@@ -1,7 +1,9 @@
 # Release qualification: September 9–10
 
-Deadline: September 10, 02:42 UTC. Native engine source is `a6cfeec0`, merged
-with upstream `6c5f17dab9c27ee2396aef1ac2501a17b201c715`. Portable C8 harness
+Deadline: September 10, 02:42 UTC. The first merged C8 native engine source is
+`a6cfeec0`, merged with upstream `6c5f17dab9c27ee2396aef1ac2501a17b201c715`.
+Latest release source freeze is `c853bafa`; its native qualification is pending.
+Portable C8 harness
 and its followup-envelope correction are `708db27c` and `440526f2`.
 
 ## Immutable native build
@@ -56,7 +58,7 @@ Evidence below is retained outside Git in
 The4K raw run's first1028-token chunk took1.064s (warm0.949s), while later1024
 chunks took2.46–2.57s. Overall3968-token TTFT was8.34s, not a comparable1K
 benchmark. Later paged GLM attention still uses the scalar BF16 GEMM for four
-projections; an opt-in existing-cuBLAS experiment is being prepared separately.
+projections; the same-image opt-in existing-cuBLAS results are recorded below.
 
 Pre-merge C1 coding used65 verification rounds per256 output tokens; initial
 merged traces use80. The merged full argmax changes equal-BF16-logit tie order.
@@ -135,8 +137,8 @@ requests use1024. Ending2048 chooses dense attention for that whole chunk,
 whereas ending2052 chooses sparse. This changes reduction arithmetic even
 where all causal keys are retained. It is not evidence of a missing-key or
 owner-slot alias, and no such concrete alias was found in the source audit.
-A narrow issued-budget correction is being prepared separately; it restores
-the declared bound, not an asserted quality fix.
+The narrow issued-budget correction is committed as `20c73e42`; it restores
+the declared bound, not an asserted quality fix. Native validation is pending.
 
 The audit also found pre-existing head/worker normalization-call asymmetry
 at the initial chunk and implicit head normalization-to-next-chunk ordering.
@@ -148,3 +150,59 @@ Evidence: `longctx-22b56144-4096-off-chat-run`, its raw quality receipts
 `longctx-22b56144-4096-off-chat-summary.json`. The new ordinary cache pools
 were12606/13112 blocks, minimum sampled MemAvailable10,350,688/10,531,008 KiB.
 These4K allocation facts do not by themselves qualify a larger context.
+
+## New-image 4K accelerated run: faster prefill, quality still failed
+
+The same `22b56144` engine and real-chat workload ran with
+`ATLAS_GLM_PAGED_PREFILL_BF16_GEMM=1`. For the four C1 retrieval/linked-facts
+requests (3953/3953/3953/3956 prompt tokens), mean reported TTFT fell from
+8.341s OFF to5.945s ON: **28.7% lower**. Individual OFF/ON times in seconds
+were8.231/5.860,8.344/5.947,8.322/5.908 and8.469/6.063. These are one
+fresh-process run per setting, not a repeated performance qualification or
+proof of numerical equivalence; output trajectories differ.
+
+C1 and C2 again passed all six quality waves. C3 passed early/middle/late
+needle retrieval and linked facts, but auto-tool failed differently:
+NEBULA produced the correct structured call after53 tokens, while AURORA
+identified its correct case ID in plain content and continued planning until
+the192-token cap, without a tool call. ORBIT's call passed. The failed AURORA
+response reported0 reasoning tokens despite the request's explicit thinking
+enable and budget16. This is not a successful tool invocation or a quality
+PASS. C3 tool-result, C4 and boundary/cancellation qualification were not
+issued after the failure;8K/16K remain pending.
+
+Both containers exited0, OOM=false, with swap0. Minimum sampled MemAvailable
+was10,168,100/10,610,808 KiB. This ordinary operational-watchdog shutdown is
+not a paired-T3 quiescence receipt, and does not erase the failed workload.
+Evidence: `longctx-22b56144-4096-on-chat-summary.json` and
+`longctx-22b56144-4096-on-chat-run/quality-receipts/quality/`; actual requests
+`http-0007.json`, `http-0013.json`, `http-0019.json`, `http-0025.json` provide
+the C1 timings, `http-0167.json` the AURORA failure and `http-0168.json` the
+successful NEBULA call. OFF timing receipts use the same names in the OFF run.
+
+## Latest source corrections awaiting native validation
+
+- `20c73e42` caps the issued initial chunk at the configured1024 tokens for
+  the opt-in ordinary GLM sparse profile, including idle admission. The
+  arena remains1028 rows; other profiles retain their prior policy. Actual
+  CPU test RED was1 pass/1 failure; GREEN was2 passes
+  (`chunk-budget-red.log`, `chunk-budget-green.log`).
+- `c853bafa` makes the GLM OpenAI template honor resolved enabled thinking
+  during tool turns. The old override always closed thinking when tools were
+  present; API reconciliation then disabled the requested budget. Enabled
+  tool turns now retain the stock open-thinking suffix and explicit budget16;
+  disabled/default tool turns remain closed and no-tools behavior is unchanged.
+  Real rendering/tokenization/reconciliation tests recorded37 passes/2 expected
+  failures before the change and39 passes afterward
+  (`tool-thinking-red.log`, `tool-thinking-green.log`). The tool output cap
+  remains192; this fixes the request contract rather than increasing its budget.
+
+The actual stopped-container runtime template matched the old Git/a069 asset,
+SHA256 `7398a9b6153b868b0ff1213a8a84fa459a53ea088d84b131eb4313d2bf8c98ea`.
+Templates load from the process working directory, not from the server ELF;
+ELF-only image overlays therefore do not update these assets. The corrected
+GLM template is SHA256
+`d921f36103aa17db5fbf5891e4f7fe55a9080db450d7b8fb5c9833237c31bd16`.
+The next image must carry and verify the current runtime templates separately.
+Neither CPU fix has yet established a native quality PASS or a maximum safe
+context. The failed OFF and ON receipts remain retained.

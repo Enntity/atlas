@@ -28,8 +28,15 @@ it preserves all live SSM/MTP state, snapshot rollback, the4GiB CUDA reserve,
 utilization0.90, memory=swap114GiB, and all numerical/health/lease/watchdog
 settings. The initial merged native attempt safely refused at818 worker KV
 blocks versus the required8×128; the controller stopped both ranks with
-exit137, OOM=false and zero swap. **Native retry with these explicit flags is
-pending; this recipe change is not a successful serving or fit receipt.**
+exit137, OOM=false and zero swap. The subsequent `a6cfeec0` retry with these
+flags and128-token tool-result followups passed all32 bounded quality checks,
+the C1..C8 timing matrix, and both actual quiescent releases/final exit0
+checks, with OOM=false and swap0. Its receipts are
+`native-prepared-a6cfeec0-c8-owner-owners-joint-followup128` and
+`native-summary-a6cfeec0-c8-owner-joint-followup128.json`, summarized in
+[qualification progress](../../../docs/experiments/glm53-20260906/release-qualification-progress.md).
+This qualifies only those exact `a6cfeec0` artifacts and bounded checks, not
+the latest `c853bafa` build, whose native qualification remains pending.
 
 ## Contents and provenance
 
@@ -80,6 +87,15 @@ Install immutable root-owned, non-writable node helpers and construct/pin both
 runtime images containing the actual guard/server at their recipe paths. The
 guard remains exec-form PID1, with the server inheriting its private channel.
 No image pull/build/provisioning is performed by this handoff.
+
+Package the exact source revision's complete `jinja-templates/` runtime tree
+at `/jinja-templates` in both images and preserve the reviewed working
+directory `/`: the server resolves templates relative to its working
+directory, not its ELF. Record and verify the runtime asset hashes as well
+as the image/ELF hashes. At `c853bafa`,
+`/jinja-templates/openai/glm5_next.jinja` must have SHA256
+`d921f36103aa17db5fbf5891e4f7fe55a9080db450d7b8fb5c9833237c31bd16`.
+An ELF-only overlay on an older image does not ship the current template.
 
 ## Supply explicit local inputs
 
