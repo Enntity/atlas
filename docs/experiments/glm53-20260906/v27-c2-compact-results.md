@@ -31,10 +31,15 @@ Primary evidence: `before-tools.json` retains full payloads and HTTP responses;
 `final-rank*.log`, `stop-rank*.log` and `gate-exit.log` retain the other gates.
 The overall gate exit is1, despite clean process shutdown.
 
-Initial source diagnosis: the GLM template ends tool prompts with
+Source and log diagnosis: the GLM template ends tool prompts with
 `<think></think>`, even when the request explicitly enables thinking. The chat
 template boundary detects an unclosed opener to enable scheduler thinking, but
 does not reconcile an explicitly closed suffix in the opposite direction.
 This leaves the scheduler/response decoder expecting reasoning when generation
-has already entered visible output. Confirm with a focused regression and a
-fresh native run; do not reinterpret the failed receipt or weaken the checker.
+has already entered visible output. The head log resolves `<tool_call>` to
+token154843 and records that exact first token for both requests. First-token
+sampling advances the grammar past the opener; the incorrect thinking state
+classifies it as reasoning. When thinking ends, grammar resumes after the
+opener, explaining the bare function name in visible output. Confirm the fix
+with a focused regression and a fresh native run; do not reinterpret the failed
+receipt, promote hidden tool calls, or weaken the checker.
