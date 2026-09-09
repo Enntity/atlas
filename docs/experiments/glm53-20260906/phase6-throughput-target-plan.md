@@ -1,5 +1,8 @@
 # Phase 6: throughput target and measured implementation selection
 
+Superseded goal (2026-09-09): see [current-goal.md](current-goal.md) for the
+user's MiaAI TP=2 reference-parity target. The thresholds below are historical.
+
 User target (2026-09-07): keep working until at least 60 aggregate tok/s at C4
 or 30 tok/s at C1. Start from deployed v13, source `2465672f`, and the committed
 workspace `e1dc1046`. Do not trade away numerical correctness or host safety.
