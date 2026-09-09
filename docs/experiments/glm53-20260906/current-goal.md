@@ -62,6 +62,7 @@ followed by real-model eager quality and same-binary warmed off/on C1..4.
 Next work must close measured gaps toward concurrent speculation and C6/C8,
 not accumulate inactive infrastructure or test counts as a substitute for results.
 
-This file records the revised working objective. The product's existing paused
-goal record still contains the historical threshold: available goal tools cannot
-edit that record's objective, and it must not be marked complete to replace it.
+The user has now updated and resumed the actual product goal; `get_goal`
+confirmed this reference-parity objective on 2026-09-09. Every candidate must
+include coherence, real tool-calling and needle-in-haystack checks. Never
+substitute a repository document change for changing the product goal itself.
