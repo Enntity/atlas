@@ -69,8 +69,18 @@ impl TransformerModel {
             num_beams: 1,
             length_penalty: 1.0,
             early_stopping: false,
-            tokens: Vec::new(),
-            block_table: Vec::new(),
+            // Selected paired requests retain bounded host append/map storage
+            // before any verification command. Wider issued paths cannot grow it.
+            tokens: if paired.is_some() {
+                Vec::with_capacity(2048)
+            } else {
+                Vec::new()
+            },
+            block_table: if paired.is_some() {
+                Vec::with_capacity(self.max_blocks_per_seq as usize)
+            } else {
+                Vec::new()
+            },
             seq_len: 0,
             layer_states,
             proposer_state,

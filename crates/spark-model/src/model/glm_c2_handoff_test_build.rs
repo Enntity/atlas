@@ -17,6 +17,10 @@ impl Fixture {
         Self::build(rank, true, 20, owners)
     }
 
+    pub fn new_owner_compute(rank: usize) -> Self {
+        Self::build(rank, true, 40, 4)
+    }
+
     pub fn new_legacy(rank: usize) -> Self {
         Self::build(rank, false, 8, 1)
     }
@@ -28,7 +32,7 @@ impl Fixture {
         let mut cfg = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
         cfg.model_type = "glm5_next".into();
         cfg.hidden_size = 4096;
-        if target_rows == 20 {
+        if target_rows >= 20 {
             cfg.hc_mult = 4;
         }
         cfg.vocab_size = 8;
@@ -152,7 +156,7 @@ impl Fixture {
         )
         .unwrap();
         model.levers.max_decode_seqs = u32::try_from(owners).unwrap();
-        if target_rows == 20 {
+        if target_rows >= 20 {
             model.ep_protocol_v2 = true;
         }
         model.levers.drafter.prefill = true;

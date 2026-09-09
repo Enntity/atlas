@@ -50,6 +50,9 @@ mod bootstrap;
 mod close;
 #[path = "paired_joint.rs"]
 mod joint;
+#[path = "paired_owners.rs"]
+mod owners;
+use owners::OwnerVerification;
 #[path = "paired_lifecycle.rs"]
 mod lifecycle;
 #[path = "paired_predispatch.rs"]
@@ -83,12 +86,14 @@ struct Verification {
 enum Producer {
     Single(Verification),
     Pair(PairVerification),
+    Owners(OwnerVerification),
 }
 impl Producer {
     fn owns(&self, index: usize) -> bool {
         match self {
             Self::Single(record) => record.slot == index,
             Self::Pair(pair) => pair.records.iter().any(|record| record.slot == index),
+            Self::Owners(group) => group.records().iter().any(|record| record.slot == index),
         }
     }
 }

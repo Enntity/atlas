@@ -7,6 +7,12 @@ use crate::traits::{Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
 use std::sync::atomic::Ordering;
 
+#[path = "glm_owner_producer_tests.rs"]
+mod owner_producer;
+
+#[path = "glm_owner_compute_tests.rs"]
+mod owner_compute;
+
 struct Four {
     f: Fixture,
     states: [SequenceState; 4],
@@ -14,7 +20,10 @@ struct Four {
 
 impl Four {
     fn prepared(rank: usize) -> (Self, [flow::History; 4]) {
-        let mut f = Fixture::new_pair_compute_with_owner_capacity(rank, 4);
+        Self::prepare_fixture(Fixture::new_pair_compute_with_owner_capacity(rank, 4))
+    }
+
+    fn prepare_fixture(mut f: Fixture) -> (Self, [flow::History; 4]) {
         let extra2 = f
             .model
             .alloc_sequence()

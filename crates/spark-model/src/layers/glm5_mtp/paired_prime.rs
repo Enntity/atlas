@@ -40,6 +40,49 @@ impl Pool {
 }
 
 impl GlmPairedHandoff for Glm5MtpHead {
+    fn validate_verify_owners(
+        &self,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        inputs: &[crate::model::GlmPairedInput<'_>],
+        tokens: &[[u32; 5]],
+        states: &[&dyn ProposerState],
+        ctx: &ForwardContext,
+    ) -> Result<[(u64, u64); 4]> {
+        self.paired_validate_verify_owners(shape, inputs, tokens, states, ctx)
+    }
+    fn begin_verify_owners(
+        &self,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        inputs: &[crate::model::GlmPairedInput<'_>],
+        tokens: &[[u32; 5]],
+        states: &mut [&mut dyn ProposerState],
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_begin_verify_owners(shape, inputs, tokens, states, ctx)
+    }
+    fn publish_verify_owners(
+        &self,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        inputs: &[crate::model::GlmPairedInput<'_>],
+        tokens: &[[u32; 5]],
+        predictions: &[[u32; 5]],
+        states: &mut [&mut dyn ProposerState],
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_publish_verify_owners(shape, inputs, tokens, predictions, states, ctx)
+    }
+    fn record_verify_owners(
+        &self,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        inputs: &[crate::model::GlmPairedInput<'_>],
+        bases: &[usize],
+        tokens: &[[u32; 5]],
+        accepted: &[usize],
+        states: &mut [&mut dyn ProposerState],
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_record_verify_owners(shape, inputs, bases, tokens, accepted, states, ctx)
+    }
     fn owner_capacity(&self, gpu: &dyn GpuBackend) -> Result<usize> {
         let pool = self
             .paired

@@ -38,6 +38,33 @@ impl Body {
 }
 
 impl TransformerLayer for Body {
+    fn validate_glm_owner_verify(
+        &self,
+        ctx: &ForwardContext,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(self.target, "private fixture body is not an owner target");
+        crate::layer::glm_owner_verify::GlmOwnerBatchWorkspace::new(ctx, shape)?
+            .scratch
+            .validate_context(ctx, stream)
+    }
+    fn decode_glm_owner_verify(
+        &self,
+        owners: &mut [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>],
+        _: &mut PagedKvCache,
+        workspace: &mut crate::layer::glm_owner_verify::GlmOwnerBatchWorkspace<'_>,
+        contexts: &[&ForwardContext],
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(self.target, "private fixture body is not an owner target");
+        workspace.scratch.begin_layer(0, owners, contexts, stream)?;
+        for owner in owners {
+            self.target_rows(owner.hidden, 5, owner.positions[0], stream)?;
+        }
+        workspace.scratch.finish_layer();
+        Ok(())
+    }
     fn supports_glm_pair_verify(&self) -> bool {
         self.target
     }

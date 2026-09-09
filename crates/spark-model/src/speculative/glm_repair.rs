@@ -55,6 +55,52 @@ pub trait GlmPairRepair: Send + Sync {
 pub trait GlmPairedHandoff: Send + Sync {
     /// Actual retained owner capacity, not free space or admission authority.
     fn owner_capacity(&self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<usize>;
+    /// Immutable facts for exactly three/four canonical physical owners.
+    /// Only the shape-count prefix is populated; inactive facts are zero.
+    fn validate_verify_owners(
+        &self,
+        _shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        _inputs: &[crate::model::GlmPairedInput<'_>],
+        _tokens: &[[u32; 5]],
+        _states: &[&dyn ProposerState],
+        _ctx: &ForwardContext,
+    ) -> Result<[(u64, u64); 4]> {
+        anyhow::bail!("GLM owner-batch producer is unsupported")
+    }
+    fn begin_verify_owners(
+        &self,
+        _shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        _inputs: &[crate::model::GlmPairedInput<'_>],
+        _tokens: &[[u32; 5]],
+        _states: &mut [&mut dyn ProposerState],
+        _ctx: &ForwardContext,
+    ) -> Result<()> {
+        anyhow::bail!("GLM owner-batch producer is unsupported")
+    }
+    fn publish_verify_owners(
+        &self,
+        _shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        _inputs: &[crate::model::GlmPairedInput<'_>],
+        _tokens: &[[u32; 5]],
+        _predictions: &[[u32; 5]],
+        _states: &mut [&mut dyn ProposerState],
+        _ctx: &ForwardContext,
+    ) -> Result<()> {
+        anyhow::bail!("GLM owner-batch producer is unsupported")
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn record_verify_owners(
+        &self,
+        _shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        _inputs: &[crate::model::GlmPairedInput<'_>],
+        _bases: &[usize],
+        _tokens: &[[u32; 5]],
+        _accepted: &[usize],
+        _states: &mut [&mut dyn ProposerState],
+        _ctx: &ForwardContext,
+    ) -> Result<()> {
+        anyhow::bail!("GLM owner-batch producer is unsupported")
+    }
     /// Fixed canonical slot order. Facts identify existing issued proposals;
     /// this immutable check neither reserves scratch nor creates authority.
     fn validate_verify_pair(

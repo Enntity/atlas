@@ -43,6 +43,8 @@ pub(crate) mod glm_cache_plan;
 pub mod glm_independent;
 pub(crate) mod glm_mtp_prompt_trace;
 mod glm_mtp_repair;
+mod glm_owner_compute;
+pub(crate) mod glm_owner_wire;
 pub use glm_c2_handoff::GlmPairedInput;
 #[cfg(test)]
 mod glm_c2_handoff_tests;
