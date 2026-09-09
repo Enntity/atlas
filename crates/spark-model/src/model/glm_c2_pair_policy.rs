@@ -90,12 +90,14 @@ impl TransformerModel {
                 && self.buffers.sizes().scratch >= 49152,
             "paired temporal metadata exceeds reserved scratch window"
         );
-        for layer in &self.layers {
+        for (index, layer) in self.layers.iter().enumerate() {
             ensure!(
                 layer.supports_glm_pair_verify(),
                 "unsupported paired target layer"
             );
-            layer.validate_glm_pair_verify(&ctx, mode, self.gpu.default_stream())?;
+            layer
+                .validate_glm_pair_verify(&ctx, mode, self.gpu.default_stream())
+                .with_context(|| format!("paired target layer {index} mode {mode:?}"))?;
         }
         Ok(())
     }

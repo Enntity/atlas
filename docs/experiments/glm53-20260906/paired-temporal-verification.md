@@ -59,3 +59,13 @@ The Docker Running-to-clean-Exited observation race is fixed separately in
 `7d0d220b`; its corrected observer has CPU qualification, not yet a native
 campaign qualification. Neither that fix nor this infrastructure meets the
 reference-parity goal by itself.
+
+The first native `two-k5` startup reached actual model construction, then exited
+before readiness. Both containers were stopped by the supervisor (137,
+OOMKilled=false); minimum observed host available memory was9,970,536KiB and
+10,233,252KiB, with zero swap. A CPU reproduction found that the new FFN guard
+required `Skip` while the real base-model adapter resolver returns inert `Fold`
+when no adapter is loaded. The correction admits that base state only with no
+resident adapter and zero configured adapter rank; `Refuse` remains rejected.
+Factory diagnostics now print the indexed layer error before fail-safe exit.
+Native qualification of the corrected candidate remains pending.

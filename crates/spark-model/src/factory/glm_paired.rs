@@ -153,7 +153,16 @@ pub(super) fn install_head(
         }
     }
     if mode == GlmMtpBuildMode::Paired {
-        model.configure_glm_pair_verification()?;
+        model
+            .configure_glm_pair_verification()
+            .inspect_err(|error| {
+                // ColdOwner must retain fatal cleanup semantics, but it exits before
+                // the caller can print a propagated error. Diagnose before its drop.
+                tracing::error!(
+                    rank = model.config_ref().ep_rank,
+                    "paired target verification admission failed: {error:#}"
+                );
+            })?;
     }
     Ok(model.into_inner())
 }

@@ -14,7 +14,8 @@ pub(super) fn validate_common(input: DevicePtr, ctx: &ForwardContext, stream: u6
             && !ctx.profile
             && !ctx.gpu.stream_is_capturing(stream)
             && ctx.routed_lora_layers.is_none()
-            && matches!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Skip)
+            && ctx.config.adapter_max_rank == 0
+            && !matches!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Refuse)
             && input == ctx.buffers.norm_output(),
         "paired FFN requires eager native GLM TP2/EP2 ten normalized rows without adapters"
     );
@@ -152,6 +153,9 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<()> {
         validate_common(input, ctx, stream)?;
+        // With no resident adapter the production resolver returns Fold, which
+        // is inert. Never accept that route with actual adapter weights present.
+        anyhow::ensure!(self.lora.is_none(), "paired FFN refuses resident adapters");
         self.validate_pair_shared()?;
         super::forward_independent::validate_independent_environment()?;
         anyhow::ensure!(

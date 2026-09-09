@@ -70,6 +70,8 @@ fn actual_pair_verify_ffn_dispatch() {
             };
             let mut ctx = resources.view(&arena, &config, &gpu);
             ctx.comm = Some(&comm);
+            // Real base-model routing is Fold with no resident adapter, not Skip.
+            ctx.moe_lora_route = crate::lora::resolve_moe_lora_route(-1, -1, false);
             assert!(ctx.ssm_batch.is_none()); // Not independent indexed decode.
             assert!(arena.sizes().norm_output >= 81920);
             let shared = layer.w4a16_gemm_t.0;
@@ -128,6 +130,15 @@ fn actual_pair_verify_ffn_dispatch() {
             );
             assert!(gpu.trace().is_empty());
             layer.shared_down_t = good;
+            let route = ctx.moe_lora_route;
+            ctx.moe_lora_route = crate::layer::MoeLoraRoute::Refuse;
+            assert!(
+                layer
+                    .forward_pair_verify(arena.norm_output(), &ctx, 91)
+                    .is_err()
+            );
+            assert!(gpu.trace().is_empty());
+            ctx.moe_lora_route = route;
             ctx.graph_capture = true;
             assert!(
                 layer
