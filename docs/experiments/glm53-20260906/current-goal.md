@@ -67,13 +67,18 @@ Independent-row KDA/MLA/grouped-MoE host support through every draining width1..
 is now committed in `c0f7b0ef`, with selected server admission, TP-local reserve
 accounting and preserved slot identity. MLA exports6/7/8 are committed and
 standalone GPU-qualified (exact scalar equality, zero memcheck errors and repeated
-projection speedups); see `mla-c6-c8-kernel-results.md`. The host integration has
-source/CPU qualification only; see `scripts/dev/glm_independent_c2_c8_plan.md`.
-The native candidate build has started; no selected C6/C8 serving result exists
-yet. Launcher and distinct answer/tool/needle clients now support C1..8.
-Next qualify eager native quality, actual memory headroom and drain behavior,
-then warmed graphs and reproducible throughput. Preserve rollback/watchdog
-behavior throughout. Concurrent MTP also remains required: checked cold F0 transport is
+projection speedups); see `mla-c6-c8-kernel-results.md`. The integrated v29 binary
+now passed eager and graph native C1..8 quality, retrieval, cancellation recovery,
+actual width/slot tracing and clean shutdown with zero observed swap/OOMs.
+One fresh graph process, warmup plus three measured148-input/256-output batches,
+gives full-wall medians C1=13.410,C2=25.589,C3=36.732,C4=46.839,C5=56.227,
+C6=63.585,C7=70.549,C8=76.923tok/s. C8 exceeds72 on this internal workload;
+C6 remains0.415 below64 and C1/C2 remain below30/37. All are nonspeculative.
+See `independent-c2-c8-results.md` for raw evidence, TTFT, quality limitations
+and full tables. A second fresh-process graph repeat remains required; there
+is no exact reference-workload or full-goal-completion claim. Preserve the
+rollback/watchdog behavior and bounded memory throughout subsequent work.
+Concurrent MTP also remains required: checked cold F0 transport is
 committed, but scheduler admission and actual supervised head/worker integration
 are not live. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.

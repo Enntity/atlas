@@ -1,7 +1,10 @@
 # Independent GLM C2–C8 host dispatch
 
 2026-09-09. A/B model integration and root-owned server admission C are
-implemented, source-reviewed and CPU-qualified, not native-qualified.
+implemented, source-reviewed and CPU-qualified. The integrated v29 binary now
+passes eager and graph native qualification; see
+`docs/experiments/glm53-20260906/independent-c2-c8-results.md`. A second fresh
+graph-process performance repetition and the full reference goal remain open.
 This is nonspeculative concurrent decode, not temporal K5 or paired MTP.
 Root owns native, deployment, watchdog, health checks and commits.
 
@@ -105,7 +108,11 @@ inference reserve is4494.282MiB C4 and7171.939MiB C8, plus the actual arena.
 Receipts are in the controller campaign `20260909/glm-independent-c2-c8`.
 Launcher support is committed separately as `cbe646d4`; it requires explicit
 `GLM_INDEPENDENT_DECODE=1` and `GLM_K5_HC_CUBLAS=0`, and sends the selected flag
-to both ranks. No selected native model has been launched or timed yet.
+to both ranks. The exact integrated binary has now run on both ranks: eager
+and graph C1..8 answer/tool/retrieval/cancellation gates and clean stops pass.
+Graph full-wall C8 median76.923tok/s (three measured batches) exceeds72 on the
+internal148/256 workload; C6 median63.585 remains below64. See the native result
+document for per-width counts, output caveats, memory observations and repeats.
 
 A/B closure: actual FFN/KDA dispatch covers all2..8 widths and both ranks;
 the actual model/worker E0 transport drains8→7→6→5→4→3→2→1 with physical slot7
