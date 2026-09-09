@@ -18,7 +18,7 @@ void silu_quant(const Bf*,const Bf*,unsigned char*,unsigned char*,unsigned,cudaS
 void down(const unsigned char*,const unsigned char*,Table,Bf*,const int*,bool,cudaStream_t);
 void down_reused_gu(const unsigned char*,const unsigned char*,Table,Bf*,const int*,
                     const unsigned*,const int*,unsigned,bool,cudaStream_t);
-void shared_t(const Bf*,Weight,Bf*,unsigned,unsigned,cudaStream_t);
+void shared_t(const Bf*,Weight,Bf*,unsigned,unsigned,unsigned,cudaStream_t);
 void activation(Bf*,const Bf*,unsigned,cudaStream_t);
 void unpermute(const Bf*,Bf*,const int*,const unsigned*,const float*,unsigned,unsigned,cudaStream_t);
 void finish(Bf*,const Bf*,const Bf*,const Bf*,const float*,const float*,const float*,float*,

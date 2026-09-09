@@ -16,8 +16,13 @@ struct RankSnapshot {
     std::vector<unsigned> ids;std::vector<float> coeff;
     std::vector<unsigned char> ap,as,dp,ds;
 };
+struct SharedSnapshot {
+    std::vector<unsigned> rows;
+    std::vector<Bf> input,gate,up,activated,down;
+};
 struct Result {
     std::array<RankSnapshot,2> rank;
+    std::array<SharedSnapshot,2> shared_rank;
     std::vector<Bf> shared; std::vector<float> highway;
 };
 // Canonicalize actual atomic scatter by token_to_perm; never assume expert-sort order.
@@ -131,20 +136,46 @@ inline void down_boundaries(Fixture& f,Table d,bool vector) {
     PCHECK(cudaStreamSynchronize(nullptr));
     f.guards();
 }
-inline Result run(Fixture& f,bool joint,bool vector,bool diagnostic,bool reused_down=false) {
+inline Result run(Fixture& f,bool joint,bool vector,bool diagnostic,bool reused_down=false,
+                  bool shared10=false,bool shared_diagnostics=false) {
     require(!reused_down||joint,"reused GU down requires actual Joint worklist");
+    require(!shared10||(joint&&!reused_down),"shared-M10 comparison requires Joint dense down");
+    require(!shared_diagnostics||diagnostic,"shared diagnostics cannot enter timing");
     Result result;auto& b=f.b;const unsigned width=joint?R:5;
     for(unsigned base=0;base<R;base+=width) {
         for(unsigned rank=0;rank<2;++rank) {
             // Each simulated rank executes its own replicated shared work, as serving does.
-            for(unsigned first=0;first<width;first+=5) {
+            const unsigned shared_rows=shared10?R:5;
+            for(unsigned first=0;first<width;first+=shared_rows) {
                 const Bf* a=f.input.ptr+(base+first)*H;
                 Bf* g=b.sg.ptr+first*I;Bf* u=b.su.ptr+first*I;Bf* out=f.shared.ptr+(base+first)*H;
+                if(shared_diagnostics) {
+                    // Refuse stale-row false greens; these writes never enter timing.
+                    PCHECK(cudaMemsetAsync(g,0xff,shared_rows*I*sizeof(Bf),f.stream));
+                    PCHECK(cudaMemsetAsync(u,0xff,shared_rows*I*sizeof(Bf),f.stream));
+                    PCHECK(cudaMemsetAsync(out,0xff,shared_rows*H*sizeof(Bf),f.stream));
+                }
                 // Preserve the exact qualified shared-T arithmetic in both modes.
-                shared_t(a,f.w.shared(0,true),g,I,H,f.stream);
-                shared_t(a,f.w.shared(1,true),u,I,H,f.stream);
-                activation(g,u,5,f.stream);
-                shared_t(g,f.w.shared(2,true),out,H,I,f.stream);
+                shared_t(a,f.w.shared(0,true),g,shared_rows,I,H,f.stream);
+                shared_t(a,f.w.shared(1,true),u,shared_rows,I,H,f.stream);
+                auto& snap=result.shared_rank[rank];
+                if(shared_diagnostics) {
+                    PCHECK(cudaStreamSynchronize(f.stream));
+                    for(unsigned row=0;row<shared_rows;++row)snap.rows.push_back(base+first+row);
+                    append(snap.input,f.input.read(shared_rows*H,(base+first)*H));
+                    append(snap.gate,b.sg.read(shared_rows*I,first*I));
+                    append(snap.up,b.su.read(shared_rows*I,first*I));
+                }
+                activation(g,u,shared_rows,f.stream);
+                if(shared_diagnostics) {
+                    PCHECK(cudaStreamSynchronize(f.stream));
+                    append(snap.activated,b.sg.read(shared_rows*I,first*I));
+                }
+                shared_t(g,f.w.shared(2,true),out,shared_rows,H,I,f.stream);
+                if(shared_diagnostics) {
+                    PCHECK(cudaStreamSynchronize(f.stream));
+                    append(snap.down,f.shared.read(shared_rows*H,(base+first)*H));
+                }
             }
             if(diagnostic)b.poison(f.stream); // outside timing; no numerical work on local rows depends on poison.
             route(f.input.ptr+base*H,f.w.router.ptr,f.w.bias.ptr,b.logits.ptr,b.ids.ptr,b.coeff.ptr,width,f.stream);
