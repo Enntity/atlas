@@ -26,6 +26,7 @@ mod fast_greedy;
 #[cfg(test)]
 mod finish_guard_tests;
 mod first_token_thinking;
+mod glm_c2_serial;
 mod helpers;
 mod lifecycle;
 #[cfg(test)]
