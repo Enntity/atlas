@@ -14,6 +14,9 @@ mod binding;
 #[cfg(test)]
 #[path = "gate_up_btile_binding_tests.rs"]
 mod binding_tests;
+#[cfg(test)]
+#[path = "forward_c2_tests.rs"]
+mod c2_tests;
 #[path = "gate_up_btile_call.rs"]
 mod call;
 #[path = "gate_up_btile_decode.rs"]

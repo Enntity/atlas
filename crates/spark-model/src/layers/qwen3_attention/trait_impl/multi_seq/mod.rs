@@ -359,8 +359,15 @@ impl Qwen3AttentionLayer {
         // otherwise these layers reread every expert weight once per row.
         // Other MLA architectures retain their established sequential path.
         let glm_batched_ffn = ctx.config.model_type == "glm5_next" && matches!(n, 3..=5);
-        if glm_batched_ffn {
-            let (moe_out, deferred_shared_gate) = if n == 3 {
+        let compact_c2 = if n == 2 {
+            self.ffn.try_forward_c2_compact(c.normed, ctx, stream)?
+        } else {
+            None
+        };
+        if compact_c2.is_some() || glm_batched_ffn {
+            let (moe_out, deferred_shared_gate) = if let Some(output) = compact_c2 {
+                (output, None)
+            } else if n == 3 {
                 self.ffn.forward_k3(c.normed, ctx, stream)?;
                 (ctx.buffers.moe_output(), None)
             } else if n == 4 {

@@ -314,7 +314,14 @@ impl Glm5KdaLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
-        if n == 4 {
+        let compact_c2 = if n == 2 {
+            self.ffn.try_forward_c2_compact(normed, ctx, stream)?
+        } else {
+            None
+        };
+        if let Some(output) = compact_c2 {
+            self.hc_post(output, m, ctx, stream)?;
+        } else if n == 4 {
             let output = self.ffn.forward_c4(normed, ctx, stream)?;
             self.hc_post(output, m, ctx, stream)?;
         } else if batched_ffn_enabled() && n == 3 {

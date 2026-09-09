@@ -287,6 +287,8 @@ pub struct MoeLayer {
     /// Quantize routed activations once, then use native block-scaled FP4 MMA
     /// for gate/up/down without any persistent weight duplication.
     nvfp4_prequant_moe: bool,
+    /// Immutable, default-off independent C2 compact FFN experiment.
+    c2_compact_moe: bool,
     /// Vectorize NVFP4 activation/weight scale staging with cp.async.
     nvfp4_vecscale: bool,
     /// Fuse DeepSeek/GLM SiLU·mul with activation NVFP4 quantization. The
@@ -530,6 +532,7 @@ pub(crate) use lora::MoeLoraWeights;
 mod forward_atomic_c4;
 mod forward_batched;
 mod forward_batched_gate;
+mod forward_c2;
 mod forward_c4;
 mod forward_ep;
 mod forward_k2;

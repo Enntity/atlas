@@ -188,6 +188,7 @@ impl MoeLayer {
         if let Some(work) = compact
             && (std::env::var("ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP").as_deref() == Ok("1")
                 || self.glm_c3_grouped(ctx, n)
+                || self.glm_c2_grouped(ctx, n)
                 || self.glm_c4_grouped(ctx, n))
         {
             let fused_kernel = if self.nvfp4_vecscale

@@ -47,6 +47,13 @@ impl MoeLayer {
         let shared_gate_out = ctx.buffers.ssm_deinterleaved();
         let shared_up_out = ctx.buffers.ssm_qkvz();
         let shared_down_out = ctx.buffers.attn_output();
+        if self.glm_c2_grouped(ctx, n) {
+            anyhow::ensure!(
+                !use_overlap,
+                "C2 compact shared work must remain sequential"
+            );
+            return self.c2_shared_expert(input, ctx, aux);
+        }
         if self.glm_c4_grouped(ctx, n) {
             self.c4_shared_expert(
                 input,

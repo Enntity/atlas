@@ -9,10 +9,20 @@ fn c4_scalar_rows() -> impl Iterator<Item = usize> {
     (0..4).rev()
 }
 
+#[cfg(test)]
 fn c4_moe_arenas(
     config: &atlas_core::config::ModelConfig,
     sizes: &BufferSizes,
 ) -> Result<[(&'static str, usize, usize); 12]> {
+    independent_moe_arenas(config, sizes, 4)
+}
+
+fn independent_moe_arenas(
+    config: &atlas_core::config::ModelConfig,
+    sizes: &BufferSizes,
+    rows: usize,
+) -> Result<[(&'static str, usize, usize); 12]> {
+    anyhow::ensure!(matches!(rows, 2 | 4), "independent MoE rows must be 2 or 4");
     let bytes = |factors: &[usize]| -> Result<usize> {
         factors.iter().try_fold(1usize, |n, &factor| {
             n.checked_mul(factor)
@@ -26,11 +36,11 @@ fn c4_moe_arenas(
     let h = config.hidden_size;
     let inter = config.moe_intermediate_size;
     let shared = config.shared_expert_intermediate_size;
-    let routes = bytes(&[4, config.num_experts_per_tok])?;
-    let output = bytes(&[4, h, 2])?;
+    let routes = bytes(&[rows, config.num_experts_per_tok])?;
+    let output = bytes(&[rows, h, 2])?;
     let gate_up = bytes(&[routes, inter, 2])?;
     let routed_down = bytes(&[routes, h, 2])?;
-    let input_elements = bytes(&[4, h])?;
+    let input_elements = bytes(&[rows, h])?;
     let down_elements = bytes(&[routes, inter])?;
     let input_pack = add(input_elements / 2, input_elements / 16)?;
     let down_pack = add(down_elements / 2, down_elements / 16)?;
@@ -45,7 +55,7 @@ fn c4_moe_arenas(
         (
             "router / sort metadata",
             sizes.gate_logits,
-            sort.max(bytes(&[4, config.num_experts, 2])?),
+            sort.max(bytes(&[rows, config.num_experts, 2])?),
         ),
         ("compact worklist", sizes.moe_router_in_f32, worklist),
         ("routed gate", sizes.expert_gate_out, gate_up),
@@ -58,9 +68,9 @@ fn c4_moe_arenas(
         (
             "shared gate",
             sizes.ssm_deinterleaved,
-            bytes(&[4, shared, 2])?,
+            bytes(&[rows, shared, 2])?,
         ),
-        ("shared up", sizes.ssm_qkvz, bytes(&[4, shared, 2])?),
+        ("shared up", sizes.ssm_qkvz, bytes(&[rows, shared, 2])?),
         ("shared down", sizes.attn_output, output),
         ("scalar shared gate", sizes.logits, bytes(&[shared, 2])?),
         ("routing scratch", sizes.scratch, bytes(&[routes, 8])?),
@@ -71,7 +81,15 @@ fn validate_c4_moe_arenas(
     config: &atlas_core::config::ModelConfig,
     sizes: &BufferSizes,
 ) -> Result<()> {
-    for (name, available, required) in c4_moe_arenas(config, sizes)? {
+    validate_independent_moe_arenas(config, sizes, 4)
+}
+
+pub(super) fn validate_independent_moe_arenas(
+    config: &atlas_core::config::ModelConfig,
+    sizes: &BufferSizes,
+    rows: usize,
+) -> Result<()> {
+    for (name, available, required) in independent_moe_arenas(config, sizes, rows)? {
         anyhow::ensure!(
             available >= required,
             "C4 MoE {name} requires {required} bytes, arena has {available}"
@@ -145,9 +163,20 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.independent_router_logits(input, output, 4, ctx, stream)
+    }
+
+    pub(super) fn independent_router_logits(
+        &self,
+        input: DevicePtr,
+        output: DevicePtr,
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
         let h = ctx.config.hidden_size;
         let experts = ctx.config.num_experts;
-        for row in 0..4 {
+        for row in 0..rows {
             ops::dense_gemv(
                 ctx.gpu,
                 self.dense_gemv,

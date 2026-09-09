@@ -241,6 +241,8 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
+        } else if self.glm_c2_grouped(ctx, n) {
+            self.independent_router_logits(router_in, gate_logits, 2, ctx, stream)?;
         } else if self.glm_c4_grouped(ctx, n) {
             self.c4_router_logits(router_in, gate_logits, ctx, stream)?;
         } else {

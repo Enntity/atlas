@@ -6,6 +6,21 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
 
 impl FfnComponent {
+    /// None leaves the caller's exact scalar path intact, including dense layers.
+    pub(crate) fn try_forward_c2_compact(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Option<DevicePtr>> {
+        if let Self::Moe(m) = self
+            && ctx.config.model_type == "glm5_next"
+            && m.c2_compact_enabled()
+        {
+            return m.forward_c2_compact(input, ctx, stream).map(Some);
+        }
+        Ok(None)
+    }
     /// Independent C4 FFN. Never aliases the temporal verifier dispatch.
     pub fn forward_c4(
         &self,
