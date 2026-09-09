@@ -51,6 +51,7 @@ struct Runner<'a> {
     output: Outputs,
     child_output: Option<Output>,
     child_eof: bool,
+    drain_requested: bool,
 }
 
 /// Caller supplies the original State/HELLO and clock constructed from this
@@ -88,6 +89,7 @@ pub fn drive(
         output: Outputs::new(),
         child_output: None,
         child_eof: false,
+        drain_requested: false,
     };
     let result = runner.run();
     if result.is_err() {

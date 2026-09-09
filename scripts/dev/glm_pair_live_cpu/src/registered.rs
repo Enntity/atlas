@@ -29,6 +29,12 @@ use spark_model::traits::Model;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static DRAIN_SIGNAL: AtomicBool = AtomicBool::new(false);
+extern "C" fn drain_signal(_: i32) {
+    DRAIN_SIGNAL.store(true, Ordering::Release);
+}
 
 struct Witness(File);
 impl Witness {
@@ -55,6 +61,15 @@ pub(crate) fn consumer() -> Result<()> {
         super::namespace::registered_mode(&mode),
         "registered fixture mode"
     );
+    if mode.starts_with("registered-drain") && rank == 0 {
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        action.sa_sigaction = drain_signal as *const () as usize;
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        ensure!(
+            unsafe { libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) } == 0,
+            "install actual CPU drain signal"
+        );
+    }
     let mut witness = Witness(
         OpenOptions::new()
             .write(true)
@@ -75,7 +90,7 @@ pub(crate) fn consumer() -> Result<()> {
     };
     let wire = fixture.install_wire();
     let (model, mut sequences, observer) = fixture.into_parts();
-    if mode == "registered-valid" && rank == 1 {
+    if (mode == "registered-valid" || mode.starts_with("registered-drain")) && rank == 1 {
         // The fixture starts with two real owners. Retire those before actual
         // run_worker allocates its own two slots; never fabricate SlotGuards.
         for sequence in &mut sequences {
@@ -94,6 +109,15 @@ pub(crate) fn consumer() -> Result<()> {
         "registration actual health only"
     );
     witness.mark(b"registered\n")?;
+    if mode.starts_with("registered-drain") && rank == 0 {
+        let deadline = atlas_glm_pair_io::identity::boot_time_ms()? + 10_000;
+        while !DRAIN_SIGNAL.load(Ordering::Acquire) {
+            owner.check_health();
+            atlas_glm_pair_io::identity::check_deadline(deadline)?;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        witness.mark(b"drain-signal\n")?;
+    }
     // Both functions are the actual nonreturning production paths. Rank0 sends
     // the shutdown words; rank1 consumes that exact protocol via local replay.
     // Guard control remains a genuine two-process connected exchange.

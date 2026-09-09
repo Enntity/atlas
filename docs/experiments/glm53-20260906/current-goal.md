@@ -98,6 +98,10 @@ retirement; see `selected-paired-serving-results.md`. The real registered-Model/
 two-guard CPU fixture passes valid release and three registration refusals,
 using local scripted model transport, not NCCL. The native recipe/controller
 adapter remains unqualified.
+Recipe v2, the actual held-child healthy drain path and the native controller's
+Docker/state/subprocess adapters are now implemented; see
+`native-controller-adapter-results.md`. The SSH launch/renewal run loop is still
+unconnected and no native throughput gain is claimed for this slice.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.

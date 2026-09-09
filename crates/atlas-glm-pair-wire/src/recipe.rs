@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Canonical recipe v1 data only. No resource admission, environment defaults,
+//! Canonical recipe v2 data only. No resource admission, environment defaults,
 //! Docker observations or process/Model authority are supplied by this codec.
 //!
-//! Wire order is declaration order below, preceded by Recipe version u16=1.
+//! Wire order is declaration order below, preceded by Recipe version u16=2.
 //! Vectors use u16 counts, strings u32 UTF-8 byte lengths, booleans one 0/1 byte.
 //! Integers are big-endian; Docker count/ulimit -1 is explicit signed i64.
 //! Environment/options sort by key, mounts by destination, devices by driver,
-//! ulimits by name, and set-like string lists lexicographically. Argv preserves
+//! mappings by container path, ulimits by name, and set-like lists lexicographically. Argv preserves
 //! order, including meaningful duplicates. No field is omitted/defaulted.
 
 use crate::{Digest, Result, recipe_digest};
@@ -75,6 +75,15 @@ pub struct Resources {
     pub init: bool,
     pub no_new_privileges: bool,
     pub ipc_mode: String,
+    pub devices: Vec<DeviceMapping>,
+    pub security_options: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceMapping {
+    pub path_on_host: String,
+    pub path_in_container: String,
+    pub cgroup_permissions: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

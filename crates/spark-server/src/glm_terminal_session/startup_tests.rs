@@ -79,6 +79,8 @@ fn recipe() -> Recipe {
             cold_max: 1024,
         },
         resources: Resources {
+            devices: vec![],
+            security_options: vec![],
             memory: 114 << 30,
             swap: 114 << 30,
             cpuset: "0-19".into(),

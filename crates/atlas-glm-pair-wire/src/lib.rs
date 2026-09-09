@@ -15,7 +15,9 @@ pub use digest::{
     manifest_digest, policy_digest, quiescent_digest, recipe_digest, release_digest, ticket_digest,
 };
 pub use frame::{Body, Direction, Encoded, Frame, control_frame_len};
-pub use recipe::{DeviceRequest, MAX_RECIPE_BYTES, Mount, Profile, Recipe, Resources, Ulimit};
+pub use recipe::{
+    DeviceMapping, DeviceRequest, MAX_RECIPE_BYTES, Mount, Profile, Recipe, Resources, Ulimit,
+};
 pub use records::*;
 
 pub const MAX_FRAME: usize = 4096;

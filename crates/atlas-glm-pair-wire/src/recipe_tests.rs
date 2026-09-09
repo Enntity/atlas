@@ -60,11 +60,16 @@ fn sample() -> Recipe {
             init: false,
             no_new_privileges: true,
             ipc_mode: "private".into(),
+            devices: vec![],
+            security_options: vec![],
         },
     }
 }
 
-// Independently assembled schema v1 bytes, not the production encoder.
+#[path = "recipe_v2_tests.rs"]
+mod v2;
+
+// Independently assembled schema v2 bytes, not the production encoder.
 fn expected() -> Vec<u8> {
     fn s(b: &mut Vec<u8>, value: &str) {
         b.extend_from_slice(&(value.len() as u32).to_be_bytes());
@@ -74,7 +79,7 @@ fn expected() -> Vec<u8> {
         b.extend_from_slice(&value.to_be_bytes());
     }
     let mut b = vec![];
-    n(&mut b, 1);
+    n(&mut b, 2);
     n(&mut b, 2);
     s(&mut b, "/spark");
     s(&mut b, "serve");
@@ -127,6 +132,8 @@ fn expected() -> Vec<u8> {
     s(&mut b, "no");
     b.extend([0, 1]);
     s(&mut b, "private");
+    n(&mut b, 0); // No device mappings in this explicit fixture.
+    n(&mut b, 0); // No extra security options.
     b
 }
 
@@ -149,7 +156,7 @@ fn truncated_noncanonical_and_oversized_bytes_refuse() {
     bad.push(0);
     assert!(Recipe::decode(&bad).is_err());
     bad = bytes.clone();
-    bad[1] = 2;
+    bad[1] = 3;
     assert!(Recipe::decode(&bad).is_err());
     bad = bytes.clone();
     bad[2..4].copy_from_slice(&65u16.to_be_bytes());

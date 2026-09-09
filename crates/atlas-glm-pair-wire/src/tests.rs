@@ -2,6 +2,9 @@
 
 use crate::*;
 
+#[path = "drain_tests.rs"]
+mod drain;
+
 #[test]
 fn actual_child_hello_codec_matches_fixed_independent_bytes() {
     let hello = ChildHello {

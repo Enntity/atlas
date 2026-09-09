@@ -2,6 +2,11 @@
 //! Transitions over the actual retained Child, never supplied PID authority.
 use super::*;
 
+fn quiescent_end(previous: Option<u64>, now: u64, wait: u64) -> io::Result<u64> {
+    let received = end(now, wait)?;
+    Ok(previous.map_or(received, |drain| drain.min(received)))
+}
+
 impl Runner<'_> {
     pub(super) fn initialize(&mut self) -> io::Result<()> {
         self.startup.validate().map_err(wire_error)?;
@@ -97,6 +102,36 @@ impl Runner<'_> {
                     return Err(error("LIVE control recipient rank"));
                 }
                 match frame.body {
+                    wire::Body::DrainRequest(request) => {
+                        if self.drain_requested {
+                            return Err(error("LIVE repeated drain request"));
+                        }
+                        if self.rank != 0
+                            || self.phase != Phase::Running
+                            || self.pending.is_some()
+                            || self.child_output.is_some()
+                            || self.output.live_pending()
+                        {
+                            return Err(error(
+                                "LIVE drain requires running rank0 without pending release",
+                            ));
+                        }
+                        request
+                            .validate(
+                                self.manifest
+                                    .as_ref()
+                                    .ok_or_else(|| error("missing manifest"))?,
+                            )
+                            .map_err(wire_error)?;
+                        self.observe_child()?;
+                        let accepted = self.acceptance(began)?;
+                        // Consume before signaling: even an uncertain signal
+                        // result cannot admit a retry or earn another window.
+                        self.drain_requested = true;
+                        self.phase_end = Some(end(accepted, self.startup.policy.quiescent_wait)?);
+                        self.child.request_drain()?;
+                        self.tick()?;
+                    }
                     wire::Body::PairedStart(manifest) => {
                         if self.phase != Phase::Gated || self.output.pending() {
                             return Err(error("LIVE unexpected or premature PAIRED_START"));
@@ -198,7 +233,13 @@ impl Runner<'_> {
                 let now = self.acceptance(began)?;
                 self.output.live(Output::new(encoded.as_slice(), now)?)?;
                 self.pending = Some(receipt);
-                self.phase_end = Some(end(now, self.startup.policy.quiescent_wait)?);
+                // Spontaneous Q starts its usual wait. Requested drain retains
+                // its earlier bound: receiving Q cannot restart that clock.
+                self.phase_end = Some(quiescent_end(
+                    self.phase_end,
+                    now,
+                    self.startup.policy.quiescent_wait,
+                )?);
                 self.phase = Phase::Quiescent;
             }
             _ => return Err(error("LIVE phase-inappropriate child frame")),
@@ -226,5 +267,25 @@ impl Runner<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod drain_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn actual_quiescent_deadline_helper_never_extends_requested_drain() {
+        assert_eq!(quiescent_end(None, 100, 100).unwrap(), 200);
+        assert_eq!(quiescent_end(Some(200), 150, 100).unwrap(), 200);
+        assert_eq!(quiescent_end(Some(200), 199, 100).unwrap(), 200);
+        // The runner's phase check rejects equality; preserve that exact
+        // absolute boundary even when Q arrives near the old deadline.
+        let until = quiescent_end(Some(200), 199, 100).unwrap();
+        assert!(199 < until);
+        assert!(200 >= until);
+        assert_eq!(quiescent_end(Some(500), 100, 100).unwrap(), 200);
+        assert!(quiescent_end(None, u64::MAX, 1).is_err());
+        assert!(quiescent_end(Some(1), u64::MAX, 1).is_err());
     }
 }

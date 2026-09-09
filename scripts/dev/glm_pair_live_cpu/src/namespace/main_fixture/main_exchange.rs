@@ -34,7 +34,12 @@ fn alive(nodes: &mut [Namespace; 2]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn run(nodes: &mut [Namespace; 2], manifest: &wire::Manifest, mode: &str) -> Result<()> {
+pub(super) fn run(
+    nodes: &mut [Namespace; 2],
+    manifest: &wire::Manifest,
+    mode: &str,
+    sources: &[PathBuf],
+) -> Result<()> {
     for (rank, node) in nodes.iter_mut().enumerate() {
         write_frame(
             &mut node.socket,
@@ -43,6 +48,81 @@ pub(super) fn run(nodes: &mut [Namespace; 2], manifest: &wire::Manifest, mode: &
                 body: wire::Body::PairedStart(*manifest),
             },
         )?;
+    }
+    if mode.starts_with("registered-drain") {
+        // Real registration marker follows receipt of the actual child ticket;
+        // the controller does not infer Running from a fixed sleep interval.
+        // Inherited startup hashes the actual model-feature ELF before its
+        // ticket/registration. Preserve the existing fixture's 15s envelope;
+        // this is not the guard's packet deadline or a native policy change.
+        let deadline = identity::boot_time_ms()? + 15000;
+        loop {
+            identity::check_deadline(deadline)
+                .context("waiting for both actual registration markers before drain")?;
+            alive(nodes)?;
+            let mut ready = true;
+            for source in sources {
+                match std::fs::read(source.join("registered-witness")) {
+                    Ok(bytes) if bytes == b"before-register\nregistered\n" => {}
+                    Ok(_) => ready = false,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => ready = false,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if ready {
+                break;
+            }
+            linux::Io::poll(&mut [], 5)?;
+        }
+        let mut request = wire::DrainRequest {
+            pair_digest: wire::manifest_digest(manifest)?,
+            epoch: wire::DRAIN_EPOCH,
+        };
+        if mode == "registered-drain-foreign" {
+            request.pair_digest[0] ^= 128;
+        }
+        let request = wire::Frame {
+            rank: 0,
+            body: wire::Body::DrainRequest(request),
+        };
+        write_frame(&mut nodes[0].socket, request)?;
+        if mode == "registered-drain-replay" {
+            let deadline = identity::boot_time_ms()? + 3000;
+            loop {
+                identity::check_deadline(deadline)
+                    .context("waiting for actual rank0 SIGINT witness before replay")?;
+                alive(nodes)?;
+                if std::fs::read(sources[0].join("registered-witness"))?
+                    == b"before-register\nregistered\ndrain-signal\n"
+                {
+                    break;
+                }
+                linux::Io::poll(&mut [], 5)?;
+            }
+            write_frame(&mut nodes[0].socket, request)?;
+        }
+        if matches!(mode, "registered-drain-foreign" | "registered-drain-replay") {
+            // A later ten-second Q/lease timeout is not rejection evidence.
+            // Require rank0's actual terminal exit inside this short window.
+            let deadline = identity::boot_time_ms()? + 2000;
+            loop {
+                identity::check_deadline(deadline)
+                    .context("waiting for prompt rank0 invalid-drain refusal")?;
+                if let Some(status) = nodes[0].process.try_wait()? {
+                    nodes[0].finished = true;
+                    ensure!(
+                        status.code() == Some(74),
+                        "invalid drain must fail terminally"
+                    );
+                    break;
+                }
+                linux::Io::poll(&mut [], 5)?;
+            }
+            // Never send either release after the peer failed.
+            nodes[1].socket.shutdown(std::net::Shutdown::Both)?;
+            nodes[1].finish_expected(74)?;
+            return Ok(());
+        }
     }
     if matches!(
         mode,
@@ -162,7 +242,7 @@ pub(super) fn run(nodes: &mut [Namespace; 2], manifest: &wire::Manifest, mode: &
         node.finish_expected(
             if matches!(
                 mode,
-                "valid" | "delayed" | "reused-session" | "registered-valid"
+                "valid" | "delayed" | "reused-session" | "registered-valid" | "registered-drain"
             ) {
                 0
             } else {

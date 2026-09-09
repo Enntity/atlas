@@ -246,3 +246,22 @@ impl PairRelease {
         Ok(())
     }
 }
+
+impl DrainRequest {
+    pub fn validate_fields(&self) -> Result<()> {
+        nonzero(&self.pair_digest)?;
+        if self.epoch != DRAIN_EPOCH {
+            return Err(Error("drain request epoch"));
+        }
+        Ok(())
+    }
+    /// Only checks supplied data. Guard owns one-shot phase, deadline and
+    /// actual held-child checks before signaling its pidfd.
+    pub fn validate(&self, manifest: &Manifest) -> Result<()> {
+        self.validate_fields()?;
+        if self.pair_digest != manifest_digest(manifest)? {
+            return Err(Error("drain request manifest mismatch"));
+        }
+        Ok(())
+    }
+}

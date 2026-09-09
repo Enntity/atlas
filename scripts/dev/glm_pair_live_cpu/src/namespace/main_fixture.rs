@@ -12,6 +12,9 @@ pub(crate) fn registered_mode(mode: &str) -> bool {
     matches!(
         mode,
         "registered-valid"
+            | "registered-drain"
+            | "registered-drain-foreign"
+            | "registered-drain-replay"
             | "registered-wrong-rank"
             | "registered-missing-capability"
             | "registered-unhealthy"
@@ -156,6 +159,8 @@ fn fixture_recipe(
             cold_max: 1024,
         },
         resources: wire::Resources {
+            devices: vec![],
+            security_options: vec![],
             memory: 114 << 30,
             swap: 114 << 30,
             cpuset: "0-19".to_owned(),
@@ -341,14 +346,17 @@ pub(crate) fn run(executable: &str, mode: &str) -> Result<()> {
         policy_digest: wire::policy_digest(&policy())?,
         ranks: [reports[0], reports[1]],
     };
-    main_exchange::run(&mut nodes, &manifest, mode)?;
+    main_exchange::run(&mut nodes, &manifest, mode, &sources)?;
     if registered_mode(mode) {
-        let expected = if mode == "registered-valid" {
-            b"before-register\nregistered\n".as_slice()
-        } else {
-            b"before-register\n".as_slice()
-        };
-        for source in &sources {
+        for (rank, source) in sources.iter().enumerate() {
+            let expected =
+                if matches!(mode, "registered-drain" | "registered-drain-replay") && rank == 0 {
+                    b"before-register\nregistered\ndrain-signal\n".as_slice()
+                } else if mode == "registered-valid" || mode.starts_with("registered-drain") {
+                    b"before-register\nregistered\n".as_slice()
+                } else {
+                    b"before-register\n".as_slice()
+                };
             ensure!(
                 std::fs::read(source.join("registered-witness"))? == expected,
                 "actual Model registration/terminal witness mismatch"

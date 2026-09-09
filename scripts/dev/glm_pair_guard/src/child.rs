@@ -249,6 +249,28 @@ impl Child {
         }
         Ok(())
     }
+    /// One-shot authorization belongs to the LIVE runner; this primitive may
+    /// signal only its released, still-live held child, never a numeric PID.
+    pub fn request_drain(&mut self) -> io::Result<()> {
+        if self.gate.is_some() || self.exit_status()?.is_some() {
+            return Err(error("drain requires released live held child"));
+        }
+        // Unlike best-effort terminal SIGKILL, ESRCH is a failed drain: it
+        // cannot establish that this live owner received the shutdown request.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.fd(),
+                libc::SIGINT,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
     pub fn reap(&self) -> io::Result<bool> {
         let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
         if unsafe {

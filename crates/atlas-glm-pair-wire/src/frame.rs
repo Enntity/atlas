@@ -21,6 +21,7 @@ pub enum Body {
     ChildTicket(ChildTicket),
     Quiescent(Quiescent),
     PairRelease(PairRelease),
+    DrainRequest(DrainRequest),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +72,7 @@ impl Frame {
             Body::ChildTicket(_) => (0x13, ChildTicket::LEN),
             Body::Quiescent(_) => (0x14, Quiescent::LEN),
             Body::PairRelease(_) => (0x15, PairRelease::LEN),
+            Body::DrainRequest(_) => (0x16, DrainRequest::LEN),
         };
         let mut out = Encoded {
             bytes: [0; MAX_ENCODED],
@@ -86,6 +88,7 @@ impl Frame {
             Body::ChildTicket(v) => w.field(v),
             Body::Quiescent(v) => w.field(v),
             Body::PairRelease(v) => w.field(v),
+            Body::DrainRequest(v) => w.field(v),
         }?;
         if !w.0.is_empty() {
             return Err(Error("internal encoded length mismatch"));
@@ -111,6 +114,7 @@ impl Frame {
             0x13 => Body::ChildTicket(r.field()?),
             0x14 => Body::Quiescent(r.field()?),
             0x15 => Body::PairRelease(r.field()?),
+            0x16 => Body::DrainRequest(r.field()?),
             _ => return Err(Error("unknown frame kind")),
         };
         if !r.0.is_empty() {
@@ -135,6 +139,12 @@ impl Frame {
             Body::ChildTicket(v) => v.validate(),
             Body::Quiescent(v) => v.validate_fields(),
             Body::PairRelease(v) => v.validate_fields(),
+            Body::DrainRequest(v) => {
+                if self.rank != 0 {
+                    return Err(Error("drain request must address rank0"));
+                }
+                v.validate_fields()
+            }
         }
     }
 }
@@ -153,7 +163,7 @@ pub fn control_frame_len(prefix: [u8; 4], direction: Direction) -> Result<usize>
     if len == 112 {
         return Ok(112);
     }
-    for kind in [0x10, 0x11, 0x14, 0x15] {
+    for kind in [0x10, 0x11, 0x14, 0x15, 0x16] {
         if direction.allows(kind) && kind_len(kind)? == len as usize {
             return Ok(len as usize);
         }
@@ -170,6 +180,7 @@ fn kind_len(kind: u8) -> Result<usize> {
         0x13 => ChildTicket::LEN,
         0x14 => Quiescent::LEN,
         0x15 => PairRelease::LEN,
+        0x16 => DrainRequest::LEN,
         _ => return Err(Error("unknown frame kind")),
     };
     Ok(HEADER_LEN + body)
@@ -178,7 +189,7 @@ impl Direction {
     fn allows(self, kind: u8) -> bool {
         match self {
             Self::StartupFile => kind == 0x01,
-            Self::ControllerToGuard => matches!(kind, 0x11 | 0x15),
+            Self::ControllerToGuard => matches!(kind, 0x11 | 0x15 | 0x16),
             Self::GuardToController => matches!(kind, 0x10 | 0x14),
             Self::ChildToGuard => matches!(kind, 0x12 | 0x14),
             Self::GuardToChild => matches!(kind, 0x13 | 0x15),

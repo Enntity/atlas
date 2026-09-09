@@ -135,3 +135,8 @@ record!(PairRelease {
     receipts: [QuiescentFrame; 2],
     receipt_digests: [Digest; 2],
 });
+
+record!(DrainRequest {
+    pair_digest: Digest,
+    epoch: u64,
+});

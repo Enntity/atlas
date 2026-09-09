@@ -22,7 +22,7 @@ pub fn recipe_digest(bytes: &[u8]) -> Result<Digest> {
     if bytes.is_empty() || bytes.len() > 65536 {
         return Err(Error("recipe size"));
     }
-    Ok(domain("atlas.glm.pair.recipe.v1", bytes))
+    Ok(domain("atlas.glm.pair.recipe.v2", bytes))
 }
 pub fn policy_digest(value: &Policy) -> Result<Digest> {
     value.validate()?;

@@ -3,6 +3,12 @@
 use super::*;
 use std::process::Command;
 
+extern "C" fn drain_exit(signal: i32) {
+    // The exec'd Rust test binary has a harness thread too. A process-wide
+    // handler, unlike a test-thread-only mask, witnesses process-directed SIGINT.
+    unsafe { libc::_exit(if signal == libc::SIGINT { 42 } else { 88 }) }
+}
+
 fn argv() -> Vec<String> {
     vec![
         std::env::current_exe().unwrap().to_str().unwrap().into(),
@@ -89,6 +95,17 @@ fn exec_probe() {
         .status()
         .unwrap();
     assert!(status.success());
+    if mode == "drain" {
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        action.sa_sigaction = drain_exit as *const () as usize;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+        }
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) },
+            0
+        );
+    }
     let report = format!(
         "{}:{}:{}:{}",
         std::process::id(),
@@ -98,6 +115,11 @@ fn exec_probe() {
     );
     assert!(channel.send(report.as_bytes()).unwrap());
     match mode.as_str() {
+        "drain" => loop {
+            unsafe {
+                libc::pause();
+            }
+        },
         "exit0" => unsafe { libc::_exit(0) },
         "exit9" => unsafe { libc::_exit(9) },
         "signal" => unsafe {
@@ -106,6 +128,70 @@ fn exec_probe() {
         },
         _ => panic!("explicit probe mode"),
     }
+}
+
+#[test]
+fn held_child_drain_signal_is_gated_and_exact() {
+    if std::env::var_os("ATLAS_CHILD_DRAIN_PARENT").is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "child::tests::held_child_drain_signal_is_gated_and_exact",
+                "--nocapture",
+            ])
+            .env("ATLAS_CHILD_DRAIN_PARENT", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let spec = Spec::with_environment(&argv(), &environment("drain")).unwrap();
+    let (parent, endpoint) = Channel::pair().unwrap();
+    let (child, parent) =
+        Child::prepare_live(spec, &mask(), Io::now().unwrap() + 3000, parent, endpoint).unwrap();
+    let mut held = Held(child);
+    assert!(
+        held.0.request_drain().is_err(),
+        "gated child cannot receive drain"
+    );
+    assert!(held.0.exit_status().unwrap().is_none());
+    held.0.release().unwrap();
+    let until = Io::now().unwrap() + 3000;
+    loop {
+        if parent.receive(held.0.credentials()).unwrap().is_some() {
+            break;
+        }
+        assert!(Io::now().unwrap() < until, "SIGINT-ready child report");
+        Io::poll(
+            &mut [libc::pollfd {
+                fd: parent.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }],
+            10,
+        )
+        .unwrap();
+    }
+    held.0
+        .request_drain()
+        .expect("signal exact live held child");
+    assert_eq!(
+        wait_status(&held.0),
+        ExitStatus {
+            code: libc::CLD_EXITED,
+            status: 42
+        }
+    );
+    assert!(
+        held.0.request_drain().is_err(),
+        "exited child cannot receive drain"
+    );
+    assert!(held.0.reap().unwrap());
 }
 
 #[test]

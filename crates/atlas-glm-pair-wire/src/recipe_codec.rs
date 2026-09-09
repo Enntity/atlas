@@ -129,7 +129,7 @@ number!(i64, i64, 8);
 
 pub(super) fn encode(v: &Recipe) -> Result<Vec<u8>> {
     let mut w = Writer(Vec::new());
-    w.u16(1)?;
+    w.u16(2)?;
     w.strings(&v.argv)?;
     w.pairs(&v.environment)?;
     w.vector(&v.mounts, |w, m| {
@@ -153,7 +153,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Recipe> {
         return Err(Error("recipe exceeds 64 KiB"));
     }
     let mut r = Reader(bytes);
-    if r.u16()? != 1 {
+    if r.u16()? != 2 {
         return Err(Error("unsupported recipe version"));
     }
     let value = Recipe {
@@ -235,7 +235,13 @@ fn put_resources(w: &mut Writer, v: &Resources) -> Result<()> {
     w.string(&v.restart_policy)?;
     w.boolean(v.init)?;
     w.boolean(v.no_new_privileges)?;
-    w.string(&v.ipc_mode)
+    w.string(&v.ipc_mode)?;
+    w.vector(&v.devices, |w, d| {
+        w.string(&d.path_on_host)?;
+        w.string(&d.path_in_container)?;
+        w.string(&d.cgroup_permissions)
+    })?;
+    w.strings(&v.security_options)
 }
 fn get_resources(r: &mut Reader<'_>) -> Result<Resources> {
     Ok(Resources {
@@ -269,5 +275,13 @@ fn get_resources(r: &mut Reader<'_>) -> Result<Resources> {
         init: r.boolean()?,
         no_new_privileges: r.boolean()?,
         ipc_mode: r.string()?,
+        devices: r.vector(32, |r| {
+            Ok(DeviceMapping {
+                path_on_host: r.string()?,
+                path_in_container: r.string()?,
+                cgroup_permissions: r.string()?,
+            })
+        })?,
+        security_options: r.strings(32)?,
     })
 }

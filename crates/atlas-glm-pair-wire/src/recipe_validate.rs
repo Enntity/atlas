@@ -139,6 +139,25 @@ fn resources(v: &Resources) -> Result<()> {
     }
     strings(&v.cap_add, 64)?;
     strings(&v.cap_drop, 64)?;
+    count(v.devices.len(), 32)?;
+    ordered(v.devices.iter().map(|d| d.path_in_container.as_str()))?;
+    for d in &v.devices {
+        text(&d.path_on_host, true)?;
+        text(&d.path_in_container, true)?;
+        if !matches!(
+            d.cgroup_permissions.as_str(),
+            "r" | "w" | "m" | "rw" | "rm" | "wm" | "rwm"
+        ) {
+            return Err(Error("noncanonical device permissions"));
+        }
+    }
+    strings(&v.security_options, 32)?;
+    for option in &v.security_options {
+        let key = option.split(['=', ':']).next().unwrap_or("").trim();
+        if key.eq_ignore_ascii_case("no-new-privileges") {
+            return Err(Error("no-new-privileges has a separate boolean authority"));
+        }
+    }
     // Explicit resource values are data, not admission. Root separately checks
     // memory/swap, device policy, modes, capabilities and literal environment.
     Ok(())
