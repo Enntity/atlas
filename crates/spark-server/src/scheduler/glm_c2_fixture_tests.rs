@@ -9,9 +9,13 @@ use spark_model::traits::Model;
 #[path = "glm_c2_fixture_test_process.rs"]
 mod process;
 
+fn isolated(name: &str) -> bool {
+    process::isolated(&format!("scheduler::glm_c2_fixture_tests::{name}"))
+}
+
 #[test]
 fn actual_paired_dependency_fixture_is_available() {
-    if process::isolated("actual_paired_dependency_fixture_is_available") {
+    if isolated("actual_paired_dependency_fixture_is_available") {
         return;
     }
     for order in [[0, 1], [1, 0]] {
@@ -21,7 +25,7 @@ fn actual_paired_dependency_fixture_is_available() {
 
 #[test]
 fn observer_snapshots_keep_revocation_and_foreign_boundaries() {
-    if process::isolated("observer_snapshots_keep_revocation_and_foreign_boundaries") {
+    if isolated("observer_snapshots_keep_revocation_and_foreign_boundaries") {
         return;
     }
     let (mut model, mut seqs, observer) = setup(0, [0, 1]).into_parts();
@@ -60,7 +64,7 @@ fn observer_snapshots_keep_revocation_and_foreign_boundaries() {
 
 #[test]
 fn explicit_legacy_fixture_has_no_selected_capability() {
-    if process::isolated("explicit_legacy_fixture_has_no_selected_capability") {
+    if isolated("explicit_legacy_fixture_has_no_selected_capability") {
         return;
     }
     for rank in 0..2 {

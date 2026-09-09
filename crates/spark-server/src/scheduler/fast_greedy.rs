@@ -39,6 +39,10 @@
 
 use spark_runtime::sampler::SamplingParams;
 
+#[path = "fast_greedy_copy_policy.rs"]
+mod copy_policy;
+pub(in crate::scheduler) use copy_policy::CopyFailurePolicy;
+
 /// How the configured penalties interact with the greedy fast path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PenaltyGate {
