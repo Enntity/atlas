@@ -4,7 +4,8 @@
 implemented, source-reviewed and CPU-qualified. The integrated v29 binary now
 passes eager and graph native qualification; see
 `docs/experiments/glm53-20260906/independent-c2-c8-results.md`. A second fresh
-graph-process performance repetition and the full reference goal remain open.
+graph-process repetition also passed, with C8 median77.014 versus76.923 and
+all width medians within1%. The full reference goal and concurrent MTP remain open.
 This is nonspeculative concurrent decode, not temporal K5 or paired MTP.
 Root owns native, deployment, watchdog, health checks and commits.
 

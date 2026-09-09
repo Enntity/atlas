@@ -73,8 +73,8 @@ that those warnings or ownership accounting have been resolved.
 
 Same binary/configuration with multi-sequence graphs enabled,
 148-input/256-output workload, one warmup plus three measured batches at every
-C1..8. Medians exclude warmups. These are repeats within one fresh process;
-a second fresh-process graph repetition is still required for reproducibility.
+C1..8. Medians exclude warmups. The first process is tabulated below; the
+second fresh-process reproduction is recorded in the following section.
 
 | C | Full-wall tok/s, median | Three measured batches, tok/s | Per-stream decode, median | Client TTFT ms |
 |---|---:|---|---:|---:|
@@ -124,8 +124,49 @@ available and zero swap use. Native error scans and overall graph gate exit0.
 As with eager, sampling does not prove the exact minimum free memory. No node
 reset, reboot, driver/clock/swap changes or native fault injection was used.
 
-Next: repeat the warmed graph matrix in another fresh process, retaining output
-mix; then integrate actual supervised paired MTP4 serving. The nearest missing
+## Second fresh-process graph reproduction — passed
+
+Same immutable binary, image tags, exact configuration and clients. New containers
+and independent startup/warmups; no intervening native build. Only controller
+receipt prefixes changed, preserving all first-run evidence. Each width again
+uses one warmup plus three measured148-input/256-output batches.
+
+| C | First median tok/s | Fresh repeat median tok/s | Repeat measured batches | Repeat client TTFT ms |
+|---|---:|---:|---|---:|
+| 1 | 13.410 | 13.434 | 13.425 / 13.434 / 13.460 | 457.101 |
+| 2 | 25.589 | 25.810 | 25.791 / 25.810 / 25.819 | 695.684 |
+| 3 | 36.732 | 36.998 | 36.986 / 36.998 / 37.025 | 949.137 |
+| 4 | 46.839 | 47.303 | 47.270 / 47.303 / 47.927 | 1153.760 |
+| 5 | 56.227 | 56.469 | 56.425 / 56.469 / 56.557 | 1364.957 |
+| 6 | 63.585 | 63.761 | 63.823 / 63.761 / 63.747 | 1582.535 |
+| 7 | 70.549 | 70.805 | 70.846 / 70.786 / 70.805 | 1786.260 |
+| 8 | 76.923 | 77.014 | 77.014 / 77.014 / 77.301 | 2002.694 |
+
+All eight process medians differ by less than1%; C8 differs0.12%. C6 misses64
+in both processes; neither C1 nor C2 reaches its target. Do not pool different
+timing denominators or the separate speculative C1 result into this table.
+All144 repeat outputs reached256 tokens, rehashed byte-for-byte; the same five
+unique truncated LRU variants occur. Root inspected each unique text. The C1
+variant's docstring mentions an unimplemented `_dll`, reinforcing that coherent
+partial code is not full-program correctness. Output mix can vary within widths.
+
+Repeat C1..8 before/after distinct-answer/forced-tool checks, both eight-needle
+retrieval waves per phase and cancellation/C8 recovery all passed. Retrieval
+remains own-substring/no-foreign, not strict formatting. Both ranks have matching
+8559 ordered batch-entry records and graph captures at every width2..8. Counts:
+1350/1340/1216/1196/1141/1125/1191; capture counts19/19/19/16/12/6/1.
+Ready MemAvailable7985/7845MiB; late sampled6821/6272MiB; all observed swap use0.
+Both ranks stopped exit0/OOMfalse, no remaining GPU processes, and recovered
+118818/118773MiB available. Native scans and overall repeat gate exit0.
+These samples do not prove continuous minimum headroom.
+
+All performance above belongs to the c0f7b0ef runtime, not later controller-only
+MTP development. `bdaa2558` adds reviewed actual Model health/quiescence checks
+with focused CPU evidence; it was not built or deployed into these measurements.
+
+## Next integration
+
+Integrate actual supervised paired MTP4 serving. The nearest missing
 pieces are the guard/child channel and two-rank quiescent release, actual Model
 registration/paired construction, and selected head/whole-worker admission and
 shutdown—not another implementation of the already committed cold F0 or serial
@@ -137,14 +178,18 @@ alone satisfies the full C1/C2/C4/C6/C8 reference objective.
 
 Controller campaign:
 `/home/abc/storage/models/atlas-campaigns/20260909/glm-independent-c2-c8`.
-Receipt prefixes `v29-c8-eager-` and `v29-c8-graphs-`: matrix JSON includes all text/counts,
+Receipt prefixes `v29-c8-eager-`, `v29-c8-graphs-`, and
+`v29-c8-graphs-repeat-`: matrix JSON includes all text/counts,
 per-request timing and warmup records; before/after quality JSON and NIAH JSONL,
 live configuration, binary hashes, ready memory, both final rank logs, shutdown
 and gate-exit receipts are retained. Stopped containers are preserved as
-`atlas-glm53-v29-c8-{eager,graphs}-ep{0,1}` (each on its respective rank node).
+`atlas-glm53-v29-c8-{eager,graphs,graphs-repeat}-ep{0,1}`
+(each on its respective rank node).
 
 Root gate SHA256 `125522ccf43cf356d6bf324ac773a2cfc496c639dc0622098ff9ed2ec54ae7fb`;
 measurement runner `65939c9e72948262afe9a5f0d4a65c284849f877aab4cc8f042e998f63c7b064`.
+Repeat gate `380745f1e8abf77f2d9ed1b2041855c7bdb0816b824ef06f1d145540cb7f2cec`;
+repeat measurement `5fb05a604c16f0ec3faedb4e9517aa6a01a1f03f6ab606e2bcee564be9608e5f`.
 The global native lock, exact binary/config checks, memory guard and
 evidence-preserving shutdown apply to both arms. No full-suite or release-matrix
 claim follows from this GLM-specific experiment.

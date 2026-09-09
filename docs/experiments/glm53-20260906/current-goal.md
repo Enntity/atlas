@@ -75,12 +75,18 @@ gives full-wall medians C1=13.410,C2=25.589,C3=36.732,C4=46.839,C5=56.227,
 C6=63.585,C7=70.549,C8=76.923tok/s. C8 exceeds72 on this internal workload;
 C6 remains0.415 below64 and C1/C2 remain below30/37. All are nonspeculative.
 See `independent-c2-c8-results.md` for raw evidence, TTFT, quality limitations
-and full tables. A second fresh-process graph repeat remains required; there
+and full tables. A second fresh-process graph repeat also passed: medians
+C1=13.434,C2=25.810,C3=36.998,C4=47.303,C5=56.469,C6=63.761,C7=70.805,
+C8=77.014tok/s, all within1% of the first process. Quality/retrieval/recovery
+and both-rank clean shutdown passed with zero observed swap/OOMs. There
 is no exact reference-workload or full-goal-completion claim. Preserve the
 rollback/watchdog behavior and bounded memory throughout subsequent work.
 Concurrent MTP also remains required: checked cold F0 transport is
-committed, but scheduler admission and actual supervised head/worker integration
-are not live. Neither standalone kernels nor inactive infrastructure complete
+committed, and `bdaa2558` adds actual Model health/strict stream-quiescence checks
+with independent source and focused CPU qualification. Live guard ticket/channel,
+two-rank quiescent release, scheduler admission and actual supervised head/worker
+integration are not live. See `scripts/dev/glm_c2_live_integration_plan.md` and
+the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.
 
 The user has now updated and resumed the actual product goal; `get_goal`
