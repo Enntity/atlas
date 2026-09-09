@@ -182,7 +182,7 @@ inline Result run(Fixture& f,bool joint,bool vector,bool diagnostic,bool reused_
             }
             if(diagnostic)b.poison(f.stream); // outside timing; no numerical work on local rows depends on poison.
             if(diagnostic&&f.rows!=R) {
-                // Especially rows16..19: every candidate writer must replace poison.
+                // Including rows32..39: every candidate writer must replace poison.
                 PCHECK(cudaMemsetAsync(b.logits.ptr,0xff,width*E*sizeof(Bf),f.stream));
                 PCHECK(cudaMemsetAsync((rank?f.rank1:f.rank0).ptr+base*H,0xff,width*H*sizeof(Bf),f.stream));
                 for(auto* a:{&b.ap,&b.as,&b.dp,&b.ds})

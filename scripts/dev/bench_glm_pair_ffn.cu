@@ -9,11 +9,11 @@
 // This compares Joint dense down against Joint reused-list down, not TwoK5.
 // Shared-width ONLY: append --compare joint-shared (zero/zero mandatory).
 // BOTH arms use Joint dense down: two generic-T M5 shared chains vs one M10.
-// Wider traversal: append --compare owner-batch --owners 3|4 (strict zero/zero).
-// Control is qualified JointShared M10 chunks plus K5 tail; candidate M15/M20.
+// Wider traversal: append --compare owner-batch --owners 3..8 (strict zero/zero).
+// Control is qualified JointShared M10 chunks plus K5 tail; candidate M15..M40.
 // Example: BENCH --atol 0 --rtol 0 --repeat 0 --compare owner-batch --owners 4
-// No kernel source changes. M20 has two router M16 tiles; all other inherited
-// GEMMs keep M64 row tiling. Max guarded device payload is 150296520 bytes;
+// No kernel source changes. M35/M40 have three router M16 tiles; other inherited
+// GEMMs keep M64 row tiling. Max guarded device payload is 156625800 bytes;
 // actual counted allocations must still satisfy the unchanged 192MiB cap.
 // Timing allowed only AFTER all six restored-input cases pass the explicit gate.
 #include "glm_pair_ffn_run.cuh"
@@ -28,7 +28,7 @@ static double number(const char* s) {
     require(!errno&&end!=s&&!*end&&std::isfinite(n)&&n>=0,"finite number/end/overflow");return n;
 }
 static Options options(int argc,char** argv) {
-    require(argc==7||argc==9||argc==11,"usage: bench_glm_pair_ffn --atol VALUE --rtol VALUE --repeat 0..100 [--compare joint-down|joint-shared|owner-batch] [--owners 3|4]");
+    require(argc==7||argc==9||argc==11,"usage: bench_glm_pair_ffn --atol VALUE --rtol VALUE --repeat 0..100 [--compare joint-down|joint-shared|owner-batch] [--owners 3..8]");
     Options out{};bool a=false,r=false,n=false,c=false,owners=false;
     for(int i=1;i<argc;i+=2) {
         const std::string key=argv[i];
@@ -40,8 +40,8 @@ static Options options(int argc,char** argv) {
         }
         if(key=="--owners"&&!owners) {
             const std::string count=argv[i+1];
-            require(count=="3"||count=="4","owners must be exactly 3 or 4");
-            owners=true;out.owners=count=="3"?3:4;continue;
+            require(count.size()==1&&count[0]>='3'&&count[0]<='8',"owners must be a single digit 3..8");
+            owners=true;out.owners=unsigned(count[0]-'0');continue;
         }
         const double value=number(argv[i+1]);
         if(key=="--atol"&&!a) {a=true;out.atol=value;}
@@ -121,7 +121,7 @@ static void shared_oracle(Fixture& f,const SharedSnapshot& s,unsigned rank) {
     for(unsigned row=0;row<f.rows;++row)require(s.rows[row]==row,"canonical five-row owner mapping");
     for(const auto* a:{&s.input,&s.gate,&s.up,&s.activated,&s.down})
         for(auto v:*a)require(std::isfinite(f32(v)),"finite full shared intermediate");
-    // Sample every owner's EVERY row, including rows16..19 in the M20 case.
+    // Sample every owner's EVERY row, including rows32..39 for M35/M40.
     // Gate/up/down use actual input (down uses captured post-SiLU). The oracle
     // covers full K at N boundaries; it is not an exhaustive full-weight proof.
     for(unsigned p=0;p<3;++p) {
@@ -213,8 +213,8 @@ int main(int argc,char** argv) {
             auto joint=run(f,true,vector,true,o.reused_down,shared_checks,shared_checks);
             for(unsigned rank=0;rank<2;++rank)rank_equal(old.rank[rank],joint.rank[rank]);
             independent_post(f,old);independent_post(f,joint);
-            if(o.wide)std::printf("PASS every-row router/post oracle owners=%u rows=0..%u including_M20_router_tail=%u\n",
-                o.owners,f.rows-1,unsigned(f.rows==20));
+            if(o.wide)std::printf("PASS every-row router/post oracle owners=%u rows=0..%u router_tiles=%u including_rows32plus=%u\n",
+                o.owners,f.rows-1,(f.rows+15)/16,unsigned(f.rows>32));
             if(shared_checks) {
                 for(unsigned rank=0;rank<2;++rank) {
                     shared_oracle(f,old.shared_rank[rank],rank);shared_oracle(f,joint.shared_rank[rank],rank);

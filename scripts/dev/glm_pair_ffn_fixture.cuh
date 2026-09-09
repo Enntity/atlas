@@ -160,10 +160,13 @@ struct Fixture {
     Buffer<Bf> input,rank0,rank1,shared;
     Buffer<float> residual,post,comb,highway;
     std::vector<Bf> host_input;std::vector<float> host_residual,host_post,host_comb;
-    explicit Fixture(unsigned count=R):rows(count),b(count),input(count*H),rank0(count*H),
+    static unsigned checked_rows(unsigned count) {
+        require(count>=10&&count<=40&&count%5==0,"fixed owner-count envelope");
+        return count;
+    }
+    explicit Fixture(unsigned count=R):rows(checked_rows(count)),b(count),input(count*H),rank0(count*H),
         rank1(count*H),shared(count*H),residual(count*HC*H),post(count*HC),
         comb(count*HC*HC),highway(count*HC*H) {
-        require(count==10||count==15||count==20,"fixed owner-count envelope");
         PCHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
     }
     ~Fixture() { cudaStreamDestroy(stream); }
@@ -172,7 +175,14 @@ struct Fixture {
         host_post.resize(rows*HC);host_comb.resize(rows*HC*HC);
         for(unsigned t=0;t<rows;++t) {
             const unsigned source=reversed?(rows/5-1-t/5)*5+t%5:t;
-            for(unsigned k=0;k<H;++k)host_input[t*H+k]=bf(float(int((source*13+k*7)%31)-15)/32);
+            for(unsigned k=0;k<H;++k) {
+                float value=float(int((source*13+k*7)%31)-15)/32;
+                // The old periodic fixture repeats input rows after31. Encode
+                // all six row-identity bits for wider cases, preserving old
+                // 2/3/4-owner literals and distinguishing every M40 row.
+                if(rows>20&&k<6)value=((source>>k)&1)?.25f:-.25f;
+                host_input[t*H+k]=bf(value);
+            }
             for(unsigned j=0;j<HC;++j) {
                 host_post[t*HC+j]=float(j+1)/8;
                 for(unsigned i=0;i<HC;++i)host_comb[t*HC*HC+i*HC+j]=i==j?.625f:.125f;

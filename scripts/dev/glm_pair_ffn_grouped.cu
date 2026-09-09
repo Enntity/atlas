@@ -47,7 +47,7 @@ void gate_up(const unsigned char* a,const unsigned char* as,Table g,Table u,Bf* 
 void down(const unsigned char* a,const unsigned char* as,Table d,Bf* out,const int* off,
           bool vector,cudaStream_t s) {
     // Literal production native prequant DOWN: dense M64 grid, not compact-down.
-    // Unique top8 gives <=10 rows/expert, so one M64 tile; no offset D2H in compute.
+    // Unique top8 gives <=40 rows/expert, so one M64 tile; no offset D2H in compute.
     if(vector) moe_w4a4_grouped_gemm_prequant_t_k64_vecscale<<<dim3(H/128,1,E),128,0,s>>>(
         a,as,d.packed,d.scale,d.scale2,out,off,nullptr,E,H,I);
     else moe_w4a4_grouped_gemm_prequant_t_k64<<<dim3(H/128,1,E),128,0,s>>>(
