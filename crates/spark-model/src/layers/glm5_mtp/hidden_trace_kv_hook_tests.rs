@@ -165,8 +165,20 @@ fn actual_unselected_later_steps_attempts_and_disabled_trace_do_not_read_kv() {
             prepared_with_source(head, ctx, gpu, state(&mut seq), 1, 3);
             arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
             gpu.kv_reads.store(0, Ordering::Relaxed);
-            head.propose(3, saved, 3, 4, state(&mut seq), ctx, 7, None, None, None)
-                .unwrap();
+            head.propose(
+                3,
+                saved,
+                3,
+                4,
+                state(&mut seq),
+                None,
+                ctx,
+                7,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
             assert_eq!(
                 gpu.kv_reads.load(Ordering::Relaxed),
                 if attempt == 1 { 4 } else { 0 }

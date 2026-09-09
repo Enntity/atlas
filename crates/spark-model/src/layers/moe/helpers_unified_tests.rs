@@ -327,6 +327,8 @@ fn assert_abi_and_tables(
 
 #[test]
 fn actual_legacy_wrappers_exact_order_abi_ownership_and_peak() {
+    // Upstream MoeLayer::new now owns a permanent zero-accumulator slab.
+    const ZERO_ACCUM_BYTES: usize = 65536;
     for gs in [16, 32] {
         for (local, shared, inter) in [
             (true, true, 32),
@@ -342,7 +344,7 @@ fn actual_legacy_wrappers_exact_order_abi_ownership_and_peak() {
                     let initial = gpu.live();
                     let initial_bytes = gpu.profile().0;
                     if gs == 16 && local && shared {
-                        assert_eq!(initial_bytes, 34560 + 240);
+                        assert_eq!(initial_bytes, 34560 + 240 + ZERO_ACCUM_BYTES);
                     }
                     run(&mut layer, &gpu, &config, mode).unwrap();
                     let trace = gpu.trace();
@@ -423,9 +425,9 @@ fn actual_legacy_wrappers_exact_order_abi_ownership_and_peak() {
                         assert_eq!(
                             gpu.profile(),
                             match mode {
-                                0 => (35040, 58000),
-                                1 => (41952, 58000),
-                                _ => (69600, 69600),
+                                0 => (35040 + ZERO_ACCUM_BYTES, 58000 + ZERO_ACCUM_BYTES),
+                                1 => (41952 + ZERO_ACCUM_BYTES, 58000 + ZERO_ACCUM_BYTES),
+                                _ => (69600 + ZERO_ACCUM_BYTES, 69600 + ZERO_ACCUM_BYTES),
                             }
                         );
                     }

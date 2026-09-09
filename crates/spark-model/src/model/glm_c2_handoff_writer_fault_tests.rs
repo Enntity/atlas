@@ -201,7 +201,7 @@ fn boundary_is_terminal(boundary: Boundary) {
             assert!(blocks.is_disjoint(&failed_blocks));
             assert!(f.head.alloc_state(f.model.gpu.as_ref()).is_err());
             f.head
-                .free_state(f.model.gpu.as_ref(), replacement.as_mut())
+                .free_state(f.model.gpu.as_ref(), None, replacement.as_mut())
                 .unwrap();
             // Healthy-owner control above precedes the separately terminal
             // Model cleanup error; that error now closes the whole session.

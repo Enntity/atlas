@@ -143,7 +143,7 @@ fn healthy_cleanup_control() {
         "no duplicate block return or other live-slot reuse"
     );
     f.head
-        .free_state(f.model.gpu.as_ref(), replacement.as_mut())
+        .free_state(f.model.gpu.as_ref(), None, replacement.as_mut())
         .unwrap();
     assert_eq!(
         free_count(&f.gpu.trace(), slab),
@@ -377,6 +377,7 @@ fn teardown_failure_is_terminal(free: bool) {
             external
                 .free_state(
                     f.model.gpu.as_ref(),
+                    None,
                     seq.proposer_state.as_mut().unwrap().as_mut()
                 )
                 .is_err()

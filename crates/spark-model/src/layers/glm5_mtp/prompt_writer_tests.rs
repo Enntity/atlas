@@ -85,7 +85,7 @@ fn actual_primer_repair_observe_after_writes_and_reset_makes_long_request_inert(
                 kv_reference(b"atlas/glm53/mtp-kv/prefix/v1\0", p, p)
             );
             assert!(head.prepare(&input, &mut state, ctx, 37).is_err());
-            head.free_state(gpu, &mut state).unwrap();
+            head.free_state(gpu, None, &mut state).unwrap();
             assert!(!state.hidden_trace.prompt.active());
             assert!(hidden_trace::fixture_prompt_hashes(&state, 1, p).is_err());
             let long = vec![1; 257];
@@ -95,7 +95,7 @@ fn actual_primer_repair_observe_after_writes_and_reset_makes_long_request_inert(
                 256
             );
             assert!(!state.hidden_trace.prompt.active());
-            head.free_state(gpu, &mut state).unwrap();
+            head.free_state(gpu, None, &mut state).unwrap();
         });
     }
 }
@@ -153,7 +153,7 @@ fn actual_writer_failures_poison_without_publishing_expected_rows() {
             assert_eq!(state.seq_len, if bootstrap { 16 } else { 0 });
             assert!(hidden_trace::fixture_prompt_hashes(&state, 1, 17).is_err());
             assert!(state.hidden_trace.prompt.arm(owner).is_err());
-            head.free_state(gpu, &mut state).unwrap();
+            head.free_state(gpu, None, &mut state).unwrap();
             assert!(!state.hidden_trace.prompt.active());
         });
     }

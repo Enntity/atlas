@@ -24,6 +24,9 @@ use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_loader::glm5::Glm5MtpModule;
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
+#[path = "glm5_mtp/argmax_merge.rs"]
+mod argmax_merge;
+
 #[path = "glm5_mtp/kv_rows_plan.rs"]
 mod kv_rows_plan;
 
@@ -379,6 +382,7 @@ impl Glm5MtpHead {
         };
         let mtp_ctx = ForwardContext {
             ssm_batch: None,
+            host_token_ids: None,
             buffers: ctx.buffers,
             gpu: ctx.gpu,
             config: ctx.config,
@@ -621,8 +625,9 @@ impl Glm5MtpHead {
         } else if local_argmax {
             // Preserve full-vocabulary argmax semantics without materializing
             // peer logits. Each rank reduces its contiguous half with the same
-            // first-strict-max tree, then exchanges one `(f32,u32)` pair. Rank
-            // zero wins an equal-value tie because it owns lower token IDs.
+            // value-descending/index-descending tree, then exchanges one
+            // `(f32,u32)` pair. Valid ties choose the higher global token ID;
+            // two all-invalid shards retain the full-kernel fallback0.
             let local_pair = out.offset(32);
             ops::argmax_bf16_value(
                 ctx.gpu,
@@ -643,7 +648,7 @@ impl Glm5MtpHead {
             let i0 = u32::from_le_bytes(pairs[4..8].try_into().expect("rank-0 index bytes"));
             let v1 = f32::from_le_bytes(pairs[8..12].try_into().expect("rank-1 max bytes"));
             let i1 = u32::from_le_bytes(pairs[12..16].try_into().expect("rank-1 index bytes"));
-            if v1 > v0 { i1 + projected_vocab } else { i0 }
+            argmax_merge::merge(v0, i0, v1, i1, projected_vocab)
         } else {
             ops::argmax_bf16(ctx.gpu, self.argmax_k, logits, out, vocab, stream)?;
             let mut bytes = [0u8; 4];
@@ -788,6 +793,7 @@ impl DraftProposer for Glm5MtpHead {
         position: usize,
         num_drafts: usize,
         state: &mut dyn ProposerState,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         ctx: &ForwardContext,
         stream: u64,
         _draft_embed_target: Option<DevicePtr>,
@@ -837,6 +843,7 @@ impl DraftProposer for Glm5MtpHead {
     fn after_verify(
         &self,
         num_accepted: usize,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
         state: &mut dyn ProposerState,
         _stream: u64,
     ) -> Result<()> {
@@ -860,7 +867,12 @@ impl DraftProposer for Glm5MtpHead {
         Ok(())
     }
 
-    fn free_state(&self, _gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
+    fn free_state(
+        &self,
+        _gpu: &dyn GpuBackend,
+        _expected_owner: Option<crate::layers::dflash_head::SequenceGeneration>,
+        state: &mut dyn ProposerState,
+    ) -> Result<()> {
         let state = state
             .as_any_mut()
             .downcast_mut::<Glm5MtpProposerState>()

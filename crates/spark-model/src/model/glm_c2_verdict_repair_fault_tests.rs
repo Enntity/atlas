@@ -175,7 +175,7 @@ fn fault(rank: usize, owner: usize, a: usize, boundary: Boundary) {
         "failed reserve was not recycled"
     );
     f.head
-        .free_state(f.model.gpu.as_ref(), replacement.as_mut())
+        .free_state(f.model.gpu.as_ref(), None, replacement.as_mut())
         .unwrap();
     // Keep detached-peer continuation/reuse before the distinct terminal
     // selected Model cleanup error, rather than trying to recover after it.

@@ -12,7 +12,13 @@ use spark_runtime::kv_cache::KvCacheDtype;
 
 impl Qwen3AttentionLayer {
     pub(in crate::layers::qwen3_attention) fn pair_mla_supported(&self) -> bool {
-        self.hc.as_ref().is_some_and(|hc| hc.hc_mult == 4)
+        self.qsa.is_none()
+            && self.hc.as_ref().is_some_and(|hc| {
+                hc.hc_mult == 4
+                    && hc.attn.lowrank.is_none()
+                    && hc.ffn.lowrank.is_none()
+                    && hc.head.as_ref().is_none_or(|head| head.lowrank.is_none())
+            })
             && self
                 .mla
                 .as_ref()
@@ -156,8 +162,17 @@ impl Qwen3AttentionLayer {
             "GLM pair MLA requires BF16 dense16 cache"
         );
         for (owner, input) in owners.iter().enumerate() {
+            // Upstream attention allocates this wrapper even when QSA is absent.
+            // Accept only its truly stateless form (or the legacy empty state),
+            // never QSA carry, recurrent/PLE state, or another layer's state.
+            let stateless = input.state.as_any().is::<crate::layer::EmptyLayerState>()
+                || input
+                    .state
+                    .as_any()
+                    .downcast_ref::<crate::layer::AttnLayerState>()
+                    .is_some_and(|state| state.qsa.is_none());
             ensure!(
-                input.state.as_any().is::<crate::layer::EmptyLayerState>()
+                stateless
                     && input.block_table.len() > input.positions[4] / 16
                     && input
                         .block_table

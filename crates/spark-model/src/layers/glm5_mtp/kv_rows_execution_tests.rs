@@ -169,6 +169,7 @@ fn fixture_geometry(
         levers: &levers,
         stats: &stats,
         ssm_batch: None,
+        host_token_ids: None,
         attn_metadata: None,
         profile: false,
         comm: None,

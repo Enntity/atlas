@@ -427,6 +427,7 @@ fn gate_one_refuses_verdicts_without_owned_accepted_row_consumption() {
             f.head
                 .after_verify(
                     0,
+                    None,
                     f.seqs[0].proposer_state.as_mut().unwrap().as_mut(),
                     DEFAULT
                 )

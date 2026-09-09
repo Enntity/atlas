@@ -141,6 +141,7 @@ pub(super) fn context(gpu: &Gpu, run: impl FnOnce(&ForwardContext)) {
         graph_capture: false,
         gdn_exact_replay: false,
         ssm_batch: None,
+        host_token_ids: None,
         token_ids: None,
         routed_lora_layers: None,
         midchunk_capture: None,

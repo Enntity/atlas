@@ -43,6 +43,7 @@ impl Qwen3AttentionLayer {
             bf16,
             bs,
             stream,
+            seq_len_start: _,
         } = *args;
         let mla = self
             .mla

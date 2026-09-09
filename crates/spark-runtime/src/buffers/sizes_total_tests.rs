@@ -28,6 +28,8 @@ fn assert_actual_arena_total(config: &ModelConfig, rows: usize) {
         arena.scratch,
         arena.expert_gate_out,
         arena.expert_up_out,
+        arena.hc_lowrank_scratch,
+        arena.qsa_select_scratch,
         arena.expert_down_out,
         arena.splitk_workspace,
         arena.o_latent,

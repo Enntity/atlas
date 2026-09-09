@@ -70,10 +70,10 @@ fn actual_factory_head_allocates_exact_explicit_owner_capacity() {
             // A full actual pool remains healthy; capacity is not free-slot count.
             handoff.validate_session(&gpu).unwrap();
             for state in &mut states {
-                head.free_state(&gpu, state.as_mut()).unwrap();
+                head.free_state(&gpu, None, state.as_mut()).unwrap();
             }
             let mut replacement = head.alloc_state(&gpu).unwrap();
-            head.free_state(&gpu, replacement.as_mut()).unwrap();
+            head.free_state(&gpu, None, replacement.as_mut()).unwrap();
         }
     }
 }

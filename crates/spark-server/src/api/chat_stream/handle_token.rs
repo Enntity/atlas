@@ -80,6 +80,8 @@ pub(super) fn strip_bare_role_literal(delta: &mut String, inside_tool_call: bool
 /// through is taken, leaving the doom-loop case (long suppressed
 /// stream of orphan `<tool_call>` openers) uncaught.
 pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {
+    // Count generated tokens without reopening a terminal parser/stream.
+    crate::metrics::DECODED_TOKENS_TOTAL.inc();
     terminal_token::while_open(state, |state| handle_open_token(state, ctx, tok))
 }
 

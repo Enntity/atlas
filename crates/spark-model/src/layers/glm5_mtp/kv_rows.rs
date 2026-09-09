@@ -403,6 +403,7 @@ impl Glm5MtpHead {
 
             let mtp_ctx = ForwardContext {
                 ssm_batch: None,
+                host_token_ids: None,
                 buffers: ctx.buffers,
                 gpu: ctx.gpu,
                 config: ctx.config,

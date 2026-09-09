@@ -2,6 +2,7 @@
 //! Keep the actual target guard outside fallible initialization until publication.
 use super::types::TransformerModel;
 use crate::layer::{LayerState, SsmLayerState};
+use crate::layers::dflash_head::{CaptureDescriptor, DflashProposerState, SequenceGeneration};
 use crate::speculative::ProposerState;
 use crate::traits::SequenceState;
 use anyhow::{Result, ensure};
@@ -10,6 +11,7 @@ use atlas_core::config::LayerType;
 struct AllocationParts {
     layer_states: Vec<Box<dyn LayerState>>,
     proposer_state: Option<Box<dyn ProposerState>>,
+    dspark_owner: SequenceGeneration,
 }
 
 impl TransformerModel {
@@ -41,6 +43,7 @@ impl TransformerModel {
         let AllocationParts {
             layer_states,
             proposer_state,
+            dspark_owner,
         } = match result {
             Ok(parts) => parts,
             Err(error) => {
@@ -90,6 +93,7 @@ impl TransformerModel {
             marconi_exact_snap: None,
             session_hash: 0,
             mtp_capture_gen: 0,
+            dspark_owner: Some(dspark_owner),
             chunked_prefill_meta: None,
             cached_prefix_tokens: 0,
             cached_prefix_blocks: 0,
@@ -163,6 +167,7 @@ impl TransformerModel {
                     // until the mixer converts.
                     h_is_f16: stage.is_some(),
                     h_prefill_stage: stage,
+                    ple: None,
                 };
 
                 if has_mtp {
@@ -202,15 +207,31 @@ impl TransformerModel {
         // Double-check: explicit sync to guarantee zero is complete
         self.gpu.synchronize(self.gpu.default_stream())?;
 
-        // Allocate MTP proposer state (owns its own KV cache block table)
-        let proposer_state = match &self.proposer {
+        let generation =
+            super::dspark_generation::next_dspark_generation(&self.dspark_sequence_generation)?;
+        let dspark_owner = SequenceGeneration::new(slot, generation)?;
+        // Keep all fallible initialization inside the retained-slot error boundary.
+        let mut proposer_state = match &self.proposer {
             Some(p) => Some(p.alloc_state(self.gpu.as_ref())?),
             None => None,
         };
+        if let Some(dstate) = proposer_state
+            .as_mut()
+            .and_then(|state| state.as_any_mut().downcast_mut::<DflashProposerState>())
+        {
+            dstate.lifecycle = Some(CaptureDescriptor::bind(
+                dspark_owner,
+                0,
+                0,
+                self.dflash_hidden_save_rows,
+                dstate.ctx_slot_bytes,
+            )?);
+        }
 
         Ok(AllocationParts {
             layer_states,
             proposer_state,
+            dspark_owner,
         })
     }
 }

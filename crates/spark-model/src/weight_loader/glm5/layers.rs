@@ -41,7 +41,7 @@ pub(super) fn load_all(
             dense_auto(store, &format!("{lp}.post_attention_layernorm.weight"), gpu)?;
         let ffn =
             super::components::load_ffn(store, &lp, layer_idx, config, gpu, variant, qctx, true)?;
-        let hc = super::components::load_hc(store, &lp, config, gpu)?;
+        let hc = super::components::load_hc(store, &lp, layer_idx, config, gpu)?;
         match config.layer_type(layer_idx) {
             LayerType::LinearAttention => {
                 let weights =

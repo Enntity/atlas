@@ -34,6 +34,7 @@ fn rendered_glm_generation_tail_reconciles_requested_thinking() {
         0,
         true,
         "glm5_next",
+        "",
         Some(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")

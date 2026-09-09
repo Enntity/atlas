@@ -134,6 +134,7 @@ impl DraftProposer for Failing {
         _: usize,
         _: usize,
         _: &mut dyn ProposerState,
+        _: Option<crate::layers::dflash_head::SequenceGeneration>,
         _: &ForwardContext,
         _: u64,
         _: Option<DevicePtr>,
@@ -142,7 +143,13 @@ impl DraftProposer for Failing {
     ) -> Result<Vec<u32>> {
         anyhow::bail!("never proposes")
     }
-    fn after_verify(&self, _: usize, _: &mut dyn ProposerState, _: u64) -> Result<()> {
+    fn after_verify(
+        &self,
+        _: usize,
+        _: Option<crate::layers::dflash_head::SequenceGeneration>,
+        _: &mut dyn ProposerState,
+        _: u64,
+    ) -> Result<()> {
         Ok(())
     }
 }

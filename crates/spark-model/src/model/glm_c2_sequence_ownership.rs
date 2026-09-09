@@ -103,6 +103,7 @@ impl TransformerModel {
             .context("paired proposer missing")?
             .free_state(
                 self.gpu.as_ref(),
+                seq.dspark_owner,
                 seq.proposer_state
                     .as_mut()
                     .expect("validated state")

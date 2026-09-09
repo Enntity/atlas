@@ -35,7 +35,19 @@ fn real_sequence_arm_bounds_all_attempts_and_resets_reused_state_only_for_new_re
                 let queries = gpu.capture_queries.load(Ordering::Relaxed);
                 arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
                 let drafts = head
-                    .propose(3, saved, 3, 4, state(&mut seq), ctx, 7, None, None, None)
+                    .propose(
+                        3,
+                        saved,
+                        3,
+                        4,
+                        state(&mut seq),
+                        None,
+                        ctx,
+                        7,
+                        None,
+                        None,
+                        None,
+                    )
                     .unwrap();
                 assert_eq!(drafts, [7, 7, 7, 7]);
                 let reads: Vec<_> = gpu
@@ -78,8 +90,8 @@ fn real_sequence_arm_bounds_all_attempts_and_resets_reused_state_only_for_new_re
             prepared_with_source(head, ctx, gpu, state(&mut seq), 11, 3);
             assert!(arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).is_err());
             assert_eq!(state(&mut seq).hidden_trace.spent, 1);
-            head.free_state(gpu, state(&mut seq)).unwrap();
-            head.free_state(gpu, state(&mut seq)).unwrap();
+            head.free_state(gpu, None, state(&mut seq)).unwrap();
+            head.free_state(gpu, None, state(&mut seq)).unwrap();
             assert_eq!(state(&mut seq).hidden_trace.spent, 0);
             assert!(state(&mut seq).hidden_trace.enabled);
             assert!(state(&mut seq).hidden_trace.identity.is_none());
@@ -95,7 +107,19 @@ fn actual_disabled_hook_has_no_reads_queries_or_changed_drafts_and_hidden() {
         let allocations = gpu.inner.alloc_count();
         arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
         let off = head
-            .propose(3, saved, 3, 4, state(&mut seq), ctx, 7, None, None, None)
+            .propose(
+                3,
+                saved,
+                3,
+                4,
+                state(&mut seq),
+                None,
+                ctx,
+                7,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         let off_events = gpu.events.lock().clone();
         let off_hidden = gpu.inner.read_alloc(ctx.buffers.norm_output()).unwrap();
@@ -109,7 +133,19 @@ fn actual_disabled_hook_has_no_reads_queries_or_changed_drafts_and_hidden() {
         gpu.events.lock().clear();
         arm_prepared(&mut seq, 3, 3, 4, saved, 0, false, ctx, 7).unwrap();
         let on = head
-            .propose(3, saved, 3, 4, state(&mut seq), ctx, 7, None, None, None)
+            .propose(
+                3,
+                saved,
+                3,
+                4,
+                state(&mut seq),
+                None,
+                ctx,
+                7,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(on, off);
         assert_eq!(

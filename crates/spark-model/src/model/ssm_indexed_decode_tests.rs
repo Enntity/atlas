@@ -93,6 +93,7 @@ fn state(h: u64, conv: u64) -> Box<dyn LayerState> {
         conv_state_intermediates: vec![],
         h_is_f16: false,
         h_prefill_stage: None,
+        ple: None,
     })
 }
 

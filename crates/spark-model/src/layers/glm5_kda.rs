@@ -431,6 +431,7 @@ impl TransformerLayer for Glm5KdaLayer {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
+        _active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
@@ -493,6 +494,7 @@ impl TransformerLayer for Glm5KdaLayer {
             conv_state_intermediates: Vec::new(),
             h_is_f16: false,
             h_prefill_stage: None,
+            ple: None,
         }))
     }
 }

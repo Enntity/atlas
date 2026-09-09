@@ -17,6 +17,7 @@ use crate::weight_map::{
 pub(super) fn load_hc(
     store: &WeightStore,
     lp: &str,
+    layer_idx: usize,
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
 ) -> Result<HcWeights> {
@@ -36,6 +37,7 @@ pub(super) fn load_hc(
             hc_fn: load("fn", mix * hc_dim)?,
             hc_base: load("base", mix)?,
             hc_scale: load("scale", 3)?,
+            lowrank: None,
         })
     };
     Ok(HcWeights {
@@ -45,6 +47,8 @@ pub(super) fn load_hc(
         hc_mult: config.hc_mult,
         sinkhorn_iters: config.hc_sinkhorn_iters,
         hc_eps: config.hc_eps,
+        is_first_model_layer: layer_idx == 0,
+        is_last_model_layer: layer_idx + 1 == config.num_hidden_layers,
     })
 }
 

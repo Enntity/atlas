@@ -46,7 +46,8 @@ pub use glm_sparse_graphs_policy::glm_multi_seq_sparse_graphs_enabled;
 pub(crate) use types::HeadGateActivation;
 pub use types::Qwen3AttentionLayer;
 pub use types_weights::{
-    CompressorWeights, GlmIndexerWeights, HcHeadWeights, HcSiteWeights, HcWeights, MlaWeights,
+    CompressorWeights, GlmIndexerWeights, HcHeadWeights, HcLowRank, HcSiteWeights, HcWeights,
+    MlaWeights,
 };
 
 /// Opt-in eager semantic indexing for independent GLM C2/C3 decode rows.

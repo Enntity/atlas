@@ -165,6 +165,7 @@ impl Qwen3AttentionLayer {
             sliding_window: None,
             rope_theta_override: None,
             rotary_dim_override: None,
+            rope_disabled: false,
             rope_proportional: false,
             attn_scale_override: None,
             k_eq_v: false,
@@ -187,6 +188,8 @@ impl Qwen3AttentionLayer {
             post_ffn_out_norm: None,
             layer_scalar: None,
             moe_ffn: None,
+            shortcut_carry_out: None,
+            shortcut_carry_in: None,
             pre_moe_norm: None,
             post_moe_out_norm: None,
             post_dense_ffn_norm: None,
@@ -203,6 +206,7 @@ impl Qwen3AttentionLayer {
             // when the hyper_connection module is absent), so non-V4 models
             // still start cleanly.
             hc: None,
+            qsa: None,
             hc_pre_k: gate(probes.hyper_connection, gpu, "hyper_connection", "hc_pre"),
             hc_pre_from_raw_mix_k: gate(
                 probes.hyper_connection,

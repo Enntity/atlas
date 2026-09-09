@@ -1,48 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! K=γ (DFlash) verify path.
-//!
-//! ## Safety
-//!
-//! `unsafe { from_raw_parts(...) }` reinterprets POD integer stack arrays / Vecs as byte
-//! slices for H2D upload. See `verify_c.rs` module docs for the full
-//! safety contract — same pattern, same invariants here.
+//! H2D POD byte slices follow the safety contract documented in `verify_c.rs`.
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::sync::Arc;
+use anyhow::Result;
+use atlas_core::config::LayerType;
+use std::time::Instant;
 
-use anyhow::{Result, bail};
-use atlas_core::config::{LayerType, ModelConfig};
-use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
-use spark_runtime::kv_cache::PagedKvCache;
-
-use super::super::block_mgmt::{
-    apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
-    extract_layer_refs, reuse_prefix_match_disk_ids,
-};
-use super::super::ssm_pool::SsmStatePool;
-use super::super::ssm_snapshot::SsmSnapshotPool;
-use super::super::types::{PinnedMetaStaging, TransformerModel};
-use crate::layer::{
-    AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
-};
+use super::super::block_mgmt::ensure_blocks_through_decode;
+use super::super::types::TransformerModel;
+use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};
 use crate::layers::ops;
-use crate::speculative::DraftProposer;
-use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
-use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
+use crate::traits::{Model, SequenceState};
 
-fn glm_k5_bf16_lmhead_batchm_check_once() -> bool {
-    static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    std::env::var("ATLAS_GLM_K5_BF16_LMHEAD_BATCHM_CHECK")
-        .ok()
-        .as_deref()
-        == Some("1")
-        && !CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed)
-}
+#[path = "verify_d_oracle.rs"]
+mod oracle;
 
 impl TransformerModel {
     pub(super) fn decode_verify_graphed_kgamma_dispatch(
@@ -54,6 +28,11 @@ impl TransformerModel {
         let k = tokens.len();
         if k == 0 {
             return Ok(Vec::new());
+        }
+        if self.lightning_dspark_identity.policy().is_some()
+            && std::env::var("ATLAS_LIGHTNING_VERIFY_SERIAL_M1").as_deref() == Ok("1")
+        {
+            return self.decode_verify_serial_m1_dispatch(tokens, seq, _stream);
         }
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
@@ -183,9 +162,19 @@ impl TransformerModel {
         // ATLAS_DFLASH_DEBUG_NO_GRAPH=1 forces eager (no graph capture) so
         // CUDA_LAUNCH_BLOCKING=1 reports the exact failing kernel — used
         // to localize K=γ illegal-address crashes downstream of SSM.
-        let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1");
+        // Product Lightning serves froze this switch at admission: the
+        // admitted policy rejects any presence of the variable, so the
+        // product path never consults the environment here. Generic and
+        // diagnostic serves keep the legacy read.
+        let force_eager = if self.lightning_dspark_identity.policy().is_some() {
+            false
+        } else {
+            std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1")
+        };
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
+        // Host-maintained per-layer state must not freeze during graph replay.
+        let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
         // Exact GLM K=5 on two ranks is pointer- and shape-static. Both ranks
         // enter the same layer collectives in lockstep, so recent CUDA/NCCL
         // stacks can capture this forward. Keep distributed capture opt-in;
@@ -204,7 +193,9 @@ impl TransformerModel {
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
             && !force_eager
-            && !lora_eager;
+            && !super::verify_layer_trace::enabled()
+            && !lora_eager
+            && !layer_veto;
         // The optional M16 oracle must never perform D2H inside capture.
         crate::layers::moe::validate_m16_gate_up_graphs(&self.config.model_type, use_graphs)?;
         crate::layers::moe::validate_shared_fp8_cache_graphs(&self.config.model_type, use_graphs)?;
@@ -212,6 +203,21 @@ impl TransformerModel {
         let verify_profile = std::env::var("ATLAS_GLM_VERIFY_PROFILE").ok().as_deref() == Some("1")
             && self.config.model_type == "glm5_next"
             && !use_graphs;
+
+        // PLE's host half (n-gram hash + NVMe fault-in + slot upload) for the
+        // WHOLE draft window, hoisted before capture/replay exactly as
+        // `decode_a` hoists the single decode token. Without it the verify
+        // forward has no staging to consume and falls back to a D2H readback,
+        // which invalidates a recording graph (901) — the "PLE: no
+        // host_token_ids ... capture-unsupported" refusal. #753 item B.
+        for (li, l) in self.layers.iter().enumerate() {
+            l.verify_prestage(
+                tokens,
+                seq.layer_states[li].as_mut(),
+                self.gpu.as_ref(),
+                stream,
+            )?;
+        }
 
         let ctx = ForwardContext {
             ssm_batch: None,
@@ -228,6 +234,7 @@ impl TransformerModel {
             graph_capture: use_graphs,
             gdn_exact_replay: false,
             token_ids: None,
+            host_token_ids: Some(tokens),
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
@@ -263,6 +270,14 @@ impl TransformerModel {
             let mut kda_us = 0u128;
             let mut attn_layers = 0usize;
             let mut kda_layers = 0usize;
+            // Product Lightning serves carry force_eager=false from the
+            // frozen admission, so this timing hatch only arms on
+            // diagnostic/generic serves (it requires eager anyway).
+            let time_layers = force_eager
+                && std::env::var("ATLAS_DFLASH_LAYER_TIMING").ok().as_deref() == Some("1");
+            let mut t_attn = 0u128;
+            let mut t_moe = 0u128;
+            let mut t_lin = 0u128;
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
@@ -272,6 +287,10 @@ impl TransformerModel {
                 } else {
                     None
                 };
+                if time_layers {
+                    self.gpu.synchronize(stream)?;
+                }
+                let t0 = Instant::now();
 
                 if layer_type == LayerType::FullAttention {
                     if hss_engaged {
@@ -294,16 +313,19 @@ impl TransformerModel {
                             stream,
                         )?;
                     } else {
-                        let mut dummy_states: Vec<Box<dyn LayerState>> = (0..k)
-                            .map(|_| layer.alloc_state(self.gpu.as_ref()))
-                            .collect::<Result<_>>()?;
-                        let mut refs: Vec<&mut (dyn LayerState + 'static)> =
-                            dummy_states.iter_mut().map(|s| s.as_mut()).collect();
-                        layer.decode_multi_seq(
+                        // k ROWS of ONE sequence, not k sequences: per-sequence
+                        // aux state (the QSA indexer) must advance once per row
+                        // against this sequence's own state. See
+                        // `decode_multi_seq_rows`.
+                        let mut seq_state_arr: [&mut (dyn LayerState + 'static); 1] =
+                            [seq.layer_states[layer_idx].as_mut()];
+                        let row_owner = vec![0usize; k];
+                        layer.decode_multi_seq_rows(
                             hidden,
                             residual,
                             k,
-                            &mut refs,
+                            &mut seq_state_arr,
+                            &row_owner,
                             &mut kv_cache,
                             &seq_lens_vec,
                             &block_tables_vec,
@@ -326,6 +348,7 @@ impl TransformerModel {
                         stream,
                     )?;
                 }
+                self.trace_lightning_hidden_rows("k4", seq.seq_len, layer_idx, hidden, k, stream)?;
                 // DFlash intermediate hidden capture: snapshot each capture
                 // layer's output at position k-1 (last verify token) into
                 // dflash_hidden_save[slot] while hidden_states still holds
@@ -341,13 +364,21 @@ impl TransformerModel {
                 // the WRONG token's hidden and rows 1.. are stale garbage
                 // (2026-07-09 accept-collapse root cause: EAGLE_FIX=0 under
                 // UNIFIED=1 starved this capture and poisoned drafter ctx).
-                let capture_all = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref()
-                    == Some("1")
-                    || std::env::var("ATLAS_DFLASH_UNIFIED_CTX").ok().as_deref() == Some("1");
-                if capture_all {
-                    self.try_dflash_capture_all(layer_idx, k, stream)?;
-                } else {
+                // Always capture every verify row. commit_ctx copies
+                // 0..=num_accepted; capturing only k-1 poisons the next
+                // propose (2026-07-09 accept-collapse). Opt out with
+                // ATLAS_DFLASH_CAPTURE_LAST_ONLY=1 for ablation.
+                // Ablation only: product Lightning serves never arm this
+                // (the admitted policy freezes the diagnostic surface).
+                let capture_last_only = self.lightning_dspark_identity.policy().is_none()
+                    && std::env::var("ATLAS_DFLASH_CAPTURE_LAST_ONLY")
+                        .ok()
+                        .as_deref()
+                        == Some("1");
+                if capture_last_only {
                     self.try_dflash_capture(layer_idx, k - 1, stream)?;
+                } else {
+                    self.try_dflash_capture_all(layer_idx, k, stream)?;
                 }
                 if let Some(started) = layer_started {
                     self.gpu.synchronize(stream)?;
@@ -360,6 +391,15 @@ impl TransformerModel {
                         kda_layers += 1;
                     }
                 }
+                if time_layers {
+                    self.gpu.synchronize(stream)?;
+                    let dt = t0.elapsed().as_micros();
+                    match layer_type {
+                        LayerType::FullAttention | LayerType::SlidingAttention => t_attn += dt,
+                        LayerType::Moe => t_moe += dt,
+                        LayerType::LinearAttention => t_lin += dt,
+                    }
+                }
             }
 
             if verify_profile {
@@ -369,6 +409,14 @@ impl TransformerModel {
                     kda_layers,
                     attn_us as f64 / 1000.0,
                     attn_layers,
+                );
+            }
+            if time_layers {
+                tracing::info!(
+                    "DFLASH LAYER_TIMING K={k}: attn={:.1}ms moe={:.1}ms mamba={:.1}ms",
+                    t_attn as f64 / 1000.0,
+                    t_moe as f64 / 1000.0,
+                    t_lin as f64 / 1000.0
                 );
             }
 
@@ -437,57 +485,7 @@ impl TransformerModel {
             ]));
         }
 
-        // One-shot behavioral oracle for the GLM K=5 BF16 vocabulary-head
-        // dispatch. The optimized graph has already produced `out`; rerun the
-        // former dense GEMM outside capture, reduce its logits identically,
-        // and require every target token ID to agree. The baseline logits may
-        // differ below BF16 rounding because the kernels have different
-        // accumulation trees; target argmax equality is the inference seam.
-        if k == 5
-            && self.config.model_type == "glm5_next"
-            && self.lm_head_nvfp4.is_none()
-            && self.lm_head_fp8.is_none()
-            && glm_k5_bf16_lmhead_batchm_check_once()
-        {
-            let normed = self.buffers.norm_output();
-            let logits = self.buffers.logits();
-            let vocab = self.config.vocab_size;
-            ops::dense_gemm(
-                self.gpu.as_ref(),
-                self.dense_gemm_kernel,
-                normed,
-                &self.lm_head_weight,
-                logits,
-                k as u32,
-                vocab as u32,
-                h as u32,
-                stream,
-            )?;
-            for t in 0..k {
-                ops::argmax_bf16(
-                    self.gpu.as_ref(),
-                    self.argmax_kernel,
-                    logits.offset(t * vocab * bf16),
-                    out_ptr.offset(t * 4),
-                    vocab as u32,
-                    stream,
-                )?;
-            }
-            let mut baseline_raw = vec![0u8; k * 4];
-            self.gpu.copy_d2h(out_ptr, &mut baseline_raw)?;
-            let baseline: Vec<u32> = baseline_raw
-                .chunks_exact(4)
-                .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
-                .collect();
-            anyhow::ensure!(
-                out == baseline,
-                "GLM K5 BF16 LM-head batchm oracle mismatch: batchm={out:?}, dense={baseline:?}"
-            );
-            tracing::info!(
-                "GLM K5 BF16 LM-head batchm oracle passed: all {} target argmax IDs match",
-                k
-            );
-        }
+        self.check_glm_k5_bf16_head(k, &out, stream)?;
 
         // See decode_verify_graphed for rationale on `seq_len += k` fix.
         for &t in tokens {

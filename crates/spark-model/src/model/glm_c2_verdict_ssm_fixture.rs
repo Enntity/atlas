@@ -151,6 +151,7 @@ pub(super) fn prepared(rank: usize) -> (Fixture, [flow::History; 2]) {
                 .collect(),
             h_is_f16: false,
             h_prefill_stage: None,
+            ple: None,
         }));
         f.gpu
             .write_span(pool.conv_intermediate(0, owner, 4), &[0xd7; 48]);

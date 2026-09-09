@@ -18,19 +18,18 @@
 
 use crate::gpu::GpuBackend;
 use crate::weights::{
-    WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8,
-    estimate_load_bytes, evict_page_cache, f16_to_bf16_bytes, parse_expert_index,
+    WeightLoader, WeightStore, WeightTensor, check_oom_guard, estimate_has_fp8, estimate_load_bytes,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::sync_channel;
 
 mod direct_io;
 mod header;
+mod shard;
 
-use header::{parse_header, resolve_shards};
+use header::resolve_shards;
+use shard::load_shard_fast;
 
 /// Pure-Rust InstantTensor-style loader. Same public shape as
 /// [`crate::weights::SafetensorsLoader`].
@@ -47,6 +46,27 @@ pub struct FastSafetensorsLoader {
     /// identical local arithmetic while distributing only its output head.
     pub replicated_expert_prefix: Option<String>,
     pub peak_memory_multiplier: Option<f64>,
+    /// Skip the W4A4 `*.input_scale` activation scales at load.
+    ///
+    /// ModelOpt NVFP4 checkpoints ship one 0-dim F32 scalar per quantized
+    /// projection. On a 512-expert model that is ~74k four-byte allocations,
+    /// each taking a full allocation granule — GBs of padding for values
+    /// Atlas never reads, because it serves w4a16 (BF16 activations) and the
+    /// NVFP4 loader already treats the key as optional.
+    ///
+    /// OPT-IN: `step3p7` reads this key on its own path, so it must stay off
+    /// unless the model's loader is known not to need it.
+    pub skip_activation_scales: bool,
+    /// Skip `mtp.*` tensors at load.
+    ///
+    /// For models whose loader deliberately does not build an MTP head,
+    /// uploading its weights is pure waste — on Qwen3.8-Flash-Next that is a
+    /// 1.49 GB expert shard plus the MTP backbone, held resident while the KV
+    /// cache goes without.
+    ///
+    /// OPT-IN: a model that DOES build an MTP head must keep them, so this is
+    /// set only where `load_mtp_weights` is known to return `None`.
+    pub skip_mtp: bool,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
     pub try_direct_io: bool,
@@ -64,6 +84,22 @@ pub struct FastSafetensorsLoader {
     /// sequentially before the per-tensor copy loop starts. This helps NFS
     /// mounts where many small tensor reads defeat normal readahead.
     pub prefetch_shards: bool,
+    /// Name substrings marking tensors that are **read from disk at use time
+    /// and never made resident**. They are excluded from the load AND from the
+    /// pre-flight estimate, since counting bytes we will not allocate refuses
+    /// models that would in fact fit.
+    ///
+    /// This exists for embedding tables that are gathered by row rather than
+    /// multiplied. Qwen3.8-Flash-Next's n-gram table is 51.2 B parameters —
+    /// 41% of that checkpoint — and one token touches ~2.5 KB of it. Loading
+    /// it puts the pre-flight at 163 GB on a 119 GB box; skipping it puts the
+    /// same model at ~96 GB.
+    ///
+    /// A tensor named here MUST have a reader that goes to disk
+    /// (`atlas_core::ngram_table` is the one that does). Nothing checks that
+    /// from here — a name listed without a reader is simply absent from the
+    /// store, and the model loader will fail on it by name.
+    pub demand_paged_patterns: Vec<String>,
 }
 
 /// Default tensor-count cap for per-shard `O_DIRECT`. Above this, the fast
@@ -77,6 +113,9 @@ impl Default for FastSafetensorsLoader {
     }
 }
 
+#[path = "skip.rs"]
+mod skip;
+
 impl FastSafetensorsLoader {
     pub fn new() -> Self {
         Self {
@@ -86,9 +125,12 @@ impl FastSafetensorsLoader {
             rank0_only_expert_prefix: None,
             replicated_expert_prefix: None,
             peak_memory_multiplier: None,
+            skip_activation_scales: false,
+            skip_mtp: false,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
+            demand_paged_patterns: Vec::new(),
         }
     }
 
@@ -100,44 +142,12 @@ impl FastSafetensorsLoader {
             rank0_only_expert_prefix: None,
             replicated_expert_prefix: None,
             peak_memory_multiplier: None,
+            skip_activation_scales: false,
+            skip_mtp: false,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
-        }
-    }
-
-    fn should_skip_tensor(&self, name: &str) -> bool {
-        if self.ep_world_size <= 1 {
-            return false;
-        }
-        if name.starts_with("mtp.") {
-            return false;
-        }
-        if let Some(idx) = parse_expert_index(name) {
-            if self
-                .replicated_expert_prefix
-                .as_ref()
-                .is_some_and(|prefix| name.contains(prefix))
-            {
-                return false;
-            }
-            if self
-                .rank0_only_expert_prefix
-                .as_ref()
-                .is_some_and(|prefix| name.contains(prefix))
-            {
-                return self.ep_rank != 0;
-            }
-            let per_rank = self.num_experts / self.ep_world_size;
-            let local_start = self.ep_rank * per_rank;
-            let local_end = if self.ep_rank == self.ep_world_size - 1 {
-                self.num_experts
-            } else {
-                local_start + per_rank
-            };
-            idx < local_start || idx >= local_end
-        } else {
-            false
+            demand_paged_patterns: Vec::new(),
         }
     }
 }
@@ -156,9 +166,15 @@ impl WeightLoader for FastSafetensorsLoader {
             resolve_shards(model_dir)?;
 
         // Pre-flight OOM estimate (identical to SafetensorsLoader).
+        //
+        // The n-gram tables are DEFERRED further down — they are never
+        // uploaded, so counting them here refuses a model that fits. On
+        // LongCat-Flash-Lite they are 62.8 of the checkpoint's 138 GB, which
+        // is the difference between a 167 GB "peak" and a 98 GB one.
+        let preflight_skip = |name: &str| skip_fn(name) || crate::weights::is_ngram_table(name);
         {
-            let estimated = estimate_load_bytes(&shard_files, &skip_fn)?;
-            let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn)?;
+            let estimated = estimate_load_bytes(&shard_files, &preflight_skip)?;
+            let has_fp8 = estimate_has_fp8(&shard_files, &preflight_skip)?;
             let mult = self
                 .peak_memory_multiplier
                 .unwrap_or(if has_fp8 { 1.5 } else { 1.3 });
@@ -189,6 +205,8 @@ impl WeightLoader for FastSafetensorsLoader {
 
         // Load each shard. Loaded tensors filtered by EP rules upstream.
         let mut weights: HashMap<String, WeightTensor> = HashMap::new();
+        // Locations of tensors deliberately NOT uploaded (the n-gram tables).
+        let mut deferred: HashMap<String, crate::weights::DeferredTensor> = HashMap::new();
         let total_shards = shard_files.len();
         let initial_free = gpu.free_memory()?;
         let mut offload_logged = false;
@@ -228,6 +246,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
                 &mut weights,
+                &mut deferred,
                 &mut offload_logged,
             )?;
 
@@ -270,12 +289,17 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
                 &mut weights,
+                &mut deferred,
                 &mut extra_offload,
             )?;
         }
 
         tracing::info!("Fast-loaded {} weight tensors", weights.len());
-        Ok(WeightStore::from_map(weights))
+        let mut store = WeightStore::from_map(weights);
+        for (name, d) in deferred {
+            store.defer(name, d);
+        }
+        Ok(store)
     }
 }
 
@@ -294,179 +318,3 @@ mod expert_filter_tests {
         assert!(loader.should_skip_tensor(target));
     }
 }
-
-/// Load a single shard with O_DIRECT + pipelined read/copy.
-///
-/// Pipeline:
-///   reader thread: pread tensor N into aligned buffer → sync_channel ──▶
-///   main thread:   recv → copy_h2d → store tensor
-///
-/// The channel has capacity 1, so at any time the reader is ≤1 tensor
-/// ahead of the copier. Memory overhead per shard: 2 × max_tensor_bytes
-/// (rounded up to O_DIRECT alignment).
-#[allow(clippy::too_many_arguments)]
-fn load_shard_fast(
-    shard_path: &Path,
-    tensor_filter: Option<&[String]>,
-    gpu: &dyn GpuBackend,
-    skip_fn: &dyn Fn(&str) -> bool,
-    try_direct_io: bool,
-    direct_io_tensor_cap: usize,
-    prefetch_shards: bool,
-    out: &mut HashMap<String, WeightTensor>,
-    offload_logged: &mut bool,
-) -> Result<()> {
-    // Header parsing uses a buffered fd — header is a few KB, cache pollution
-    // is negligible and buffered I/O handles short reads cleanly.
-    let mut meta_file = File::open(shard_path)
-        .with_context(|| format!("Failed to open {}", shard_path.display()))?;
-    let mut tensors = parse_header(&mut meta_file)?;
-    let file_size = meta_file.metadata()?.len();
-
-    // Filter down to tensors we actually want (index filter + EP filter).
-    if let Some(allow) = tensor_filter {
-        let allow_set: std::collections::HashSet<&str> = allow.iter().map(|s| s.as_str()).collect();
-        tensors.retain(|t| allow_set.contains(t.name.as_str()));
-    }
-    tensors.retain(|t| !skip_fn(&t.name));
-
-    // Per-shard heuristic: above `direct_io_tensor_cap` tensors, O_DIRECT's
-    // per-tensor syscall + 4 KiB alignment overhead costs more than kernel
-    // readahead on the buffered path saves. Skip the direct-open attempt
-    // entirely in that case — keeps the log clean and avoids a wasted fd.
-    let wants_direct = try_direct_io && tensors.len() <= direct_io_tensor_cap;
-    if try_direct_io && !wants_direct {
-        tracing::info!(
-            "  Shard has {} tensors (> {} cap) — using buffered+pipelined path",
-            tensors.len(),
-            direct_io_tensor_cap
-        );
-    }
-
-    // File for data reads. Try O_DIRECT; if it fails, fall through to buffered.
-    let (direct_file, using_direct) = match wants_direct
-        .then(|| direct_io::open_direct(shard_path))
-        .transpose()
-    {
-        Ok(Some(f)) => (Some(f), true),
-        Ok(None) => (None, false),
-        Err(e) => {
-            tracing::warn!(
-                "O_DIRECT open failed for {} ({e}); falling back to buffered reads",
-                shard_path.display()
-            );
-            (None, false)
-        }
-    };
-    let buffered_file = File::open(shard_path)?;
-    let data_fd = direct_file.as_ref().unwrap_or(&buffered_file);
-    if prefetch_shards && !using_direct {
-        advise_prefetch_shard(&buffered_file, shard_path, file_size);
-    }
-
-    // Pipelined reader: sends (tensor_index, aligned_buffer, slice_start) to main.
-    type ReadMsg = (usize, direct_io::AlignedBuffer, usize);
-    let (tx, rx) = sync_channel::<Result<ReadMsg>>(1);
-    let tensors_for_reader: Vec<(u64, usize)> =
-        tensors.iter().map(|t| (t.abs_offset, t.len)).collect();
-    let raw_fd = {
-        use std::os::unix::io::AsRawFd;
-        data_fd.as_raw_fd()
-    };
-
-    let _ = file_size; // retained for future use (tail-fragment buffered read)
-    let reader_handle = std::thread::spawn(move || {
-        for (idx, (abs_offset, len)) in tensors_for_reader.iter().enumerate() {
-            let msg = direct_io::read_tensor_aligned(raw_fd, *abs_offset, *len, using_direct)
-                .map(|(buf, slice_start)| (idx, buf, slice_start));
-            if tx.send(msg).is_err() {
-                break; // receiver dropped
-            }
-        }
-    });
-
-    // Copier: drains the channel, does gpu alloc + copy_h2d, inserts into the map.
-    for result in rx {
-        let (idx, buf, slice_start) = result?;
-        let meta = &tensors[idx];
-        let raw = &buf.as_slice()[slice_start..slice_start + meta.len];
-        // F16 shards: convert bytes to BF16 before upload (same length,
-        // different bit layout — meta.dtype is already staged as BF16).
-        let converted: Vec<u8>;
-        let src: &[u8] = if meta.from_f16 {
-            converted = f16_to_bf16_bytes(raw);
-            &converted
-        } else {
-            raw
-        };
-
-        let ptr = match gpu.alloc(meta.len) {
-            Ok(p) => {
-                gpu.copy_h2d(src, p)?;
-                p
-            }
-            Err(_) => {
-                if !*offload_logged {
-                    tracing::warn!(
-                        "GPU alloc failed for {} ({} bytes) — switching to managed (UVM) memory",
-                        meta.name,
-                        meta.len
-                    );
-                    *offload_logged = true;
-                }
-                let p = gpu.alloc_managed(meta.len)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), p.0 as *mut u8, meta.len);
-                }
-                p
-            }
-        };
-
-        out.insert(
-            meta.name.clone(),
-            WeightTensor {
-                ptr,
-                shape: meta.shape.clone(),
-                dtype: meta.dtype,
-            },
-        );
-    }
-
-    reader_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
-
-    // Release file handles, then advise the kernel to drop any pages we did
-    // end up caching on the buffered fallback path. O_DIRECT reads never hit
-    // the page cache, so the posix_fadvise is a no-op there but cheap.
-    drop(direct_file);
-    evict_page_cache(&buffered_file);
-    drop(buffered_file);
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn advise_prefetch_shard(file: &File, shard_path: &Path, file_size: u64) {
-    use std::os::unix::io::AsRawFd;
-
-    let fd = file.as_raw_fd();
-    let seq_rc = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
-    let willneed_rc = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_WILLNEED) };
-    if seq_rc == 0 && willneed_rc == 0 {
-        tracing::info!(
-            "  NFS/shard prefetch requested for {} ({:.2} GB)",
-            shard_path.display(),
-            file_size as f64 / (1024.0 * 1024.0 * 1024.0)
-        );
-    } else {
-        tracing::warn!(
-            "  NFS/shard prefetch hint failed for {}: sequential_rc={}, willneed_rc={}",
-            shard_path.display(),
-            seq_rc,
-            willneed_rc
-        );
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn advise_prefetch_shard(_file: &File, _shard_path: &Path, _file_size: u64) {}

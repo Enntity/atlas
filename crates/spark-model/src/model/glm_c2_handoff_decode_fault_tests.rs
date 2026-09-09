@@ -272,7 +272,7 @@ fn fails_closed(boundary: Boundary) {
             assert!(blocks.is_disjoint(&failed_blocks));
             assert!(f.head.alloc_state(f.model.gpu.as_ref()).is_err());
             f.head
-                .free_state(f.model.gpu.as_ref(), replacement.as_mut())
+                .free_state(f.model.gpu.as_ref(), None, replacement.as_mut())
                 .unwrap();
             // Producer failure is owner-local; the later selected cleanup
             // error is session-terminal, after the healthy peer control.

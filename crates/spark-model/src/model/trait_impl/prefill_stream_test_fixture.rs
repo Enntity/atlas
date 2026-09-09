@@ -213,6 +213,7 @@ impl DraftProposer for Proposer {
         _: usize,
         _: usize,
         _: &mut dyn ProposerState,
+        _: Option<crate::layers::dflash_head::SequenceGeneration>,
         _: &ForwardContext,
         _: u64,
         _: Option<DevicePtr>,
@@ -221,7 +222,13 @@ impl DraftProposer for Proposer {
     ) -> Result<Vec<u32>> {
         anyhow::bail!("stream fixture never proposes")
     }
-    fn after_verify(&self, _: usize, _: &mut dyn ProposerState, _: u64) -> Result<()> {
+    fn after_verify(
+        &self,
+        _: usize,
+        _: Option<crate::layers::dflash_head::SequenceGeneration>,
+        _: &mut dyn ProposerState,
+        _: u64,
+    ) -> Result<()> {
         Ok(())
     }
 }

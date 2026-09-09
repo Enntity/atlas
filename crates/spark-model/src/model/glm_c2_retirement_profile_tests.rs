@@ -60,6 +60,7 @@ fn no_private_lease_with_remaining_target_owner_refuses_before_cleanup() {
             f.head
                 .free_state(
                     f.model.gpu.as_ref(),
+                    None,
                     f.seqs[owner].proposer_state.as_mut().unwrap().as_mut(),
                 )
                 .unwrap();

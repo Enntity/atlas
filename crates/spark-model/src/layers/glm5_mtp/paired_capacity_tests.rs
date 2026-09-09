@@ -247,7 +247,7 @@ fn legacy_free_refuses_paired_state_before_touching_either_block_ledger() {
     let paired_before = state.block_table.clone();
     gpu.clear();
     assert!(
-        legacy.free_state(&gpu, &mut state).is_err(),
+        legacy.free_state(&gpu, None, &mut state).is_err(),
         "legacy head must reject paired authority"
     );
     assert_eq!(legacy.kv_cache.lock().num_free_blocks(), 0);
@@ -291,12 +291,12 @@ fn actual_free_completion_failure_cannot_be_erased_by_later_success() {
     let mut b = head.alloc_state_inner(&gpu).unwrap();
     gpu.clear();
     gpu.fail_sync_at.store(1, Ordering::Relaxed);
-    assert!(head.free_state(&gpu, &mut a).is_err());
+    assert!(head.free_state(&gpu, None, &mut a).is_err());
     gpu.clear();
-    assert!(head.free_state(&gpu, &mut a).is_err());
+    assert!(head.free_state(&gpu, None, &mut a).is_err());
     assert_eq!(gpu.sync_count(), 0);
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 0);
-    head.free_state(&gpu, &mut b).unwrap();
+    head.free_state(&gpu, None, &mut b).unwrap();
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 128);
     assert!(head.alloc_state_inner(&gpu).is_ok());
     assert!(head.alloc_state_inner(&gpu).is_err());
@@ -347,9 +347,9 @@ fn actual_free_retires_once_and_reuses_only_completed_owner() {
     let b = head.alloc_state_inner(&gpu).unwrap();
     let old_generation = a.paired.as_ref().unwrap().generation;
     let b_blocks = b.block_table.clone();
-    head.free_state(&gpu, &mut a).unwrap();
+    head.free_state(&gpu, None, &mut a).unwrap();
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 128);
-    head.free_state(&gpu, &mut a).unwrap();
+    head.free_state(&gpu, None, &mut a).unwrap();
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 128);
     let next = head
         .alloc_state_inner(&gpu)
@@ -366,7 +366,7 @@ fn actual_free_refuses_foreign_block_view_without_returning_peer_blocks() {
     let mut a = head.alloc_state_inner(&gpu).unwrap();
     let b = head.alloc_state_inner(&gpu).unwrap();
     a.block_table = b.block_table.clone();
-    assert!(head.free_state(&gpu, &mut a).is_err());
+    assert!(head.free_state(&gpu, None, &mut a).is_err());
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 0);
     assert!(head.alloc_state_inner(&gpu).is_err());
 }

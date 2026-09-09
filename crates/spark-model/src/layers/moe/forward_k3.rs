@@ -44,17 +44,17 @@ impl MoeLayer {
                 "routed-only K3 requires unified-layout NVFP4 experts"
             );
         }
-        // Feature-1: a resident MoE adapter forces the per-row batched fallback
-        // (folds gate/up/down route-agnostically; base rows no-op; same
-        // moe_output[3,H]), skipping any no-fold fast path. Install-time gate →
-        // graph-safe (graphs drain on rotate/swap). Router adapter refused inside.
+        // This variant does not support LongCat zero-expert routing.
+        anyhow::ensure!(
+            self.router_logits_n as usize == ctx.config.num_experts,
+            "zero-expert MoE routing is not wired on this dispatch variant yet (forward_k3)"
+        );
+        // Resident adapters require the route-aware batched fallback.
         if self.lora.is_some() {
             return self.forward_batched(input, 3, ctx, stream);
         }
-        // BF16 (FP8-dequant-on-load) experts have no fused batch3 kernel.
-        // The FP8 batch3 branch below would read expert weights that were
-        // FREED at dequant-load → garbage MTP-verify logits → degenerate
-        // repetition. Route the 3-token verify through the per-token BF16
+        // BF16-dequant experts have no batch3 kernel; FP8 originals are freed.
+        // Route the 3-token verify through the per-token BF16
         // batched path, which produces the same moe_output()[3,H]. (SSOT:
         // reuses the decode BF16 kernels via forward_batched.)
         if self.bf16_gate_weight_ptrs.is_some() {

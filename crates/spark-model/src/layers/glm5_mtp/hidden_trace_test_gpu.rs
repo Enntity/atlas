@@ -305,6 +305,7 @@ pub(super) fn fixture(
         levers: &levers,
         stats: &stats,
         ssm_batch: None,
+        host_token_ids: None,
         attn_metadata: None,
         profile: false,
         comm: Some(&comm),

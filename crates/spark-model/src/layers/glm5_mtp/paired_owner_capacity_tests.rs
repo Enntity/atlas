@@ -62,7 +62,7 @@ fn actual_four_owner_constructor_and_slot3_reuse_preserve_peers() {
     let peers = gpu.read_span(slab, 3 * SLOT_BYTES).unwrap();
     let generation = states[3].paired.as_ref().unwrap().generation;
     let retired_blocks = states[3].block_table.clone();
-    head.free_state(&gpu, &mut states[3]).unwrap();
+    head.free_state(&gpu, None, &mut states[3]).unwrap();
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 128);
     assert!(head.validate_paired_live(&states[3], &gpu).is_err());
     let replacement = head.alloc_state_inner(&gpu).unwrap();
@@ -84,7 +84,7 @@ fn actual_four_owner_constructor_and_slot3_reuse_preserve_peers() {
     // Retired object has no authority after actual same-slot generation reuse.
     let before_old_free = gpu.read_span(slab, 4 * SLOT_BYTES).unwrap();
     gpu.clear();
-    head.free_state(&gpu, &mut states[3]).unwrap();
+    head.free_state(&gpu, None, &mut states[3]).unwrap();
     assert!(gpu.trace().is_empty());
     assert_eq!(
         gpu.read_span(slab, 4 * SLOT_BYTES).unwrap(),
@@ -104,12 +104,12 @@ fn actual_four_owner_failed_slot3_retirement_stays_quarantined() {
     let views: Vec<_> = states.iter().map(|s| s.block_table.clone()).collect();
     gpu.clear();
     gpu.fail_sync_at.store(1, Ordering::Relaxed);
-    assert!(head.free_state(&gpu, &mut states[3]).is_err());
+    assert!(head.free_state(&gpu, None, &mut states[3]).is_err());
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 0);
     gpu.clear();
     gpu.synchronize(gpu.default_stream()).unwrap();
     gpu.clear();
-    assert!(head.free_state(&gpu, &mut states[3]).is_err());
+    assert!(head.free_state(&gpu, None, &mut states[3]).is_err());
     assert!(head.alloc_state_inner(&gpu).is_err());
     assert!(gpu.trace().is_empty());
     for (index, state) in states.iter().enumerate() {
@@ -232,7 +232,7 @@ fn actual_five_through_eight_private_capacity_and_last_slot_reuse() {
             .map(|state| state.block_table.clone())
             .collect();
         let generation = states[last].paired.as_ref().unwrap().generation;
-        head.free_state(&gpu, &mut states[last]).unwrap();
+        head.free_state(&gpu, None, &mut states[last]).unwrap();
         assert!(head.validate_paired_live(&states[last], &gpu).is_err());
         assert_eq!(head.kv_cache.lock().num_free_blocks(), 128);
         let replacement = head.alloc_state_inner(&gpu).unwrap();
@@ -252,7 +252,7 @@ fn actual_five_through_eight_private_capacity_and_last_slot_reuse() {
         }
         let all_bytes = gpu.read_span(slab, count * SLOT_BYTES).unwrap();
         gpu.clear();
-        head.free_state(&gpu, &mut states[last]).unwrap();
+        head.free_state(&gpu, None, &mut states[last]).unwrap();
         assert!(
             gpu.trace().is_empty(),
             "old free has no replacement authority"
@@ -277,10 +277,10 @@ fn actual_eighth_owner_failed_retirement_retains_every_reserve() {
         .collect();
     gpu.clear();
     gpu.fail_sync_at.store(1, Ordering::Relaxed);
-    assert!(head.free_state(&gpu, &mut states[7]).is_err());
+    assert!(head.free_state(&gpu, None, &mut states[7]).is_err());
     assert_eq!(head.kv_cache.lock().num_free_blocks(), 0);
     gpu.clear();
-    assert!(head.free_state(&gpu, &mut states[7]).is_err());
+    assert!(head.free_state(&gpu, None, &mut states[7]).is_err());
     assert!(head.alloc_state_inner(&gpu).is_err());
     assert!(gpu.trace().is_empty());
     for (slot, state) in states.iter().enumerate() {

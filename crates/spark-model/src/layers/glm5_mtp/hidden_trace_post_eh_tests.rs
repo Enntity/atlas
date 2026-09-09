@@ -118,6 +118,7 @@ fn post_eh_metadata_missing_duplicate_capture_and_later_step_are_fail_closed() {
                     stats: ctx.stats,
                     comm: ctx.comm,
                     ssm_batch: None,
+                    host_token_ids: None,
                     attn_metadata: None,
                     profile: false,
                     graph_capture: false,

@@ -146,7 +146,7 @@ impl SchedLevers {
             dflash_seam_serial: opt_in("ATLAS_DFLASH_SEAM_SERIAL"),
             dflash_adaptive: opt_in("ATLAS_DFLASH_ADAPTIVE"),
             dflash_serial_append: opt_in("ATLAS_DFLASH_SERIAL_APPEND"),
-            dflash_unified_ctx: opt_in("ATLAS_DFLASH_UNIFIED_CTX"),
+            dflash_unified_ctx: on_unless("ATLAS_NO_DFLASH_UNIFIED_CTX"),
             // The policy applies to every MTP proposer. Keep the old DFlash
             // spelling as a compatibility alias for existing deployments.
             dflash_spec_think: opt_in("ATLAS_MTP_SPEC_THINK") || opt_in("ATLAS_DFLASH_SPEC_THINK"),

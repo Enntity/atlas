@@ -179,6 +179,10 @@ impl Fixture {
                 return seq;
             }
             let mut seq = SequenceState::host_only(slot);
+            // This legacy host fixture has no pool allocation, but the upstream
+            // proposer boundary now requires an explicit allocation identity.
+            seq.dspark_owner =
+                Some(crate::layers::dflash_head::SequenceGeneration::new(slot, 1).unwrap());
             seq.prompt_len = 4;
             seq.layer_states = vec![Box::new(EmptyLayerState)];
             seq.disk_last_offloaded_per_layer = vec![0];

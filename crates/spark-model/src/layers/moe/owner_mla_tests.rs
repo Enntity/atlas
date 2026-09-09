@@ -6,6 +6,16 @@ use crate::layer::glm_pair_verify::{GlmPairFfn, GlmPairLayerInput, GlmPairWorksp
 use crate::layers::qwen3_attention::{HcHeadWeights, MlaWeights, Qwen3AttentionLayer};
 use crate::weight_map::AttentionWeights;
 
+struct ForeignState;
+impl LayerState for ForeignState {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 fn with_mla(
     rank: usize,
     run: impl FnOnce(&Gpu, &atlas_core::config::ModelConfig, &Qwen3AttentionLayer),
@@ -104,6 +114,7 @@ fn with_mla(
         hc_fn: gpu.alloc(24 * 4 * 4096 * 4).unwrap(),
         hc_base: gpu.alloc(24 * 4).unwrap(),
         hc_scale: gpu.alloc(12).unwrap(),
+        lowrank: None,
     };
     layer.set_hc_weights(HcWeights {
         attn: site(),
@@ -112,10 +123,13 @@ fn with_mla(
             hc_fn: gpu.alloc(4 * 4 * 4096 * 4).unwrap(),
             hc_base: gpu.alloc(16).unwrap(),
             hc_scale: gpu.alloc(4).unwrap(),
+            lowrank: None,
         }),
         hc_mult: 4,
         sinkhorn_iters: 1,
         hc_eps: 1e-6,
+        is_first_model_layer: true,
+        is_last_model_layer: true,
     });
     run(&gpu, &config, &layer);
 }
@@ -257,6 +271,32 @@ fn actual_mla_owner_batch_layer_entry() {
                 let mut states: Vec<_> = (0..count)
                     .map(|_| layer.alloc_state(gpu).unwrap())
                     .collect();
+                if count == 3 {
+                    let actual = std::mem::replace(&mut states[2], Box::new(ForeignState));
+                    let mut bad = inputs(&mut states, &blocks, &positions, &arena);
+                    let mut workspace = GlmOwnerBatchWorkspace::new(
+                        refs[0],
+                        GlmOwnerBatchShape::new(count).unwrap(),
+                    )
+                    .unwrap();
+                    gpu.clear();
+                    let error = layer
+                        .decode_glm_owner_verify(
+                            &mut bad,
+                            &mut cache,
+                            &mut workspace,
+                            &refs,
+                            gpu.default_stream(),
+                        )
+                        .unwrap_err();
+                    assert!(error.to_string().contains("actual state/block map invalid"));
+                    assert!(
+                        gpu.trace().is_empty(),
+                        "foreign final owner must precede writers"
+                    );
+                    drop(bad);
+                    states[2] = actual;
+                }
                 let mut owners = inputs(&mut states, &blocks, &positions, &arena);
                 gpu.clear();
                 if count == 2 {

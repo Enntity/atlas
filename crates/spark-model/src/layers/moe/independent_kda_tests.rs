@@ -67,6 +67,7 @@ fn with_kda_ffn(
         hc_fn: gpu.alloc(24 * 4 * 4096 * 4).unwrap(),
         hc_base: gpu.alloc(24 * 4).unwrap(),
         hc_scale: gpu.alloc(12).unwrap(),
+        lowrank: None,
     };
     let weights = Glm5KdaWeights {
         q_proj: projection(),
@@ -95,6 +96,8 @@ fn with_kda_ffn(
             hc_mult: 4,
             sinkhorn_iters: 1,
             hc_eps: 1e-6,
+            is_first_model_layer: true,
+            is_last_model_layer: true,
         },
         0,
         &config,
@@ -156,6 +159,7 @@ pub(super) fn actual_kda_rows() {
                             h_state_intermediates: vec![],
                             conv_state_intermediates: vec![],
                             h_prefill_stage: None,
+                            ple: None,
                         }) as Box<dyn LayerState>
                     })
                     .collect();
@@ -193,6 +197,7 @@ pub(super) fn actual_kda_rows() {
                     .decode_multi_seq(
                         arena.hidden_states(),
                         arena.hidden_states(),
+                        rows,
                         rows,
                         &mut refs,
                         &mut cache,

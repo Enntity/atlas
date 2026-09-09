@@ -79,7 +79,7 @@ fn real_writer_bootstrap_then_every_verdict_stages_only_accepted_rows() {
             assert_eq!(gpu.read_alloc(bonus).unwrap(), vec![0x3c; 1024]);
             // Terminal retirement after a prepared proposal releases blocks
             // without inventing a verified zero-acceptance event.
-            head.free_state(gpu, &mut state).unwrap();
+            head.free_state(gpu, None, &mut state).unwrap();
             assert!(state.block_table.is_empty());
             assert_eq!(state.seq_len, 0);
             assert!(matches!(state.repair, RepairPhase::Capture));
@@ -150,7 +150,7 @@ fn real_prepare_rejects_alias_and_stale_capture_before_copy_or_allocation() {
         assert_eq!(state.seq_len, 6);
         assert!(matches!(state.repair, RepairPhase::Failed));
         assert!(head.validate_prepare(&input, &state, ctx).is_err());
-        head.free_state(gpu, &mut state).unwrap();
+        head.free_state(gpu, None, &mut state).unwrap();
         assert!(state.block_table.is_empty());
     });
 }

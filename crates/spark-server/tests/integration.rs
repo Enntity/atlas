@@ -75,6 +75,8 @@ fn setup_model(
         rank0_only_expert_prefix: None,
         replicated_expert_prefix: None,
         peak_memory_multiplier: None,
+        skip_activation_scales: false,
+        skip_mtp: false,
     };
     use spark_runtime::weights::WeightLoader;
     let store = loader.load(model_dir, gpu.as_ref(), 1024 * 1024 * 1024)?;
@@ -315,6 +317,7 @@ fn coherence_test_capital_of_france() -> Result<()> {
         config.eos_token_id,
         false,
         &config.model_type,
+        "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
     )?;
@@ -395,6 +398,7 @@ fn streaming_coherence_test() -> Result<()> {
         config.eos_token_id,
         false,
         &config.model_type,
+        "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
     )?;
@@ -485,6 +489,7 @@ fn speculative_decode_coherence() -> Result<()> {
         config.eos_token_id,
         false,
         &config.model_type,
+        "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
     )?;
@@ -564,6 +569,7 @@ fn prompt_logprobs_collection_during_prefill() -> Result<()> {
         config.eos_token_id,
         false,
         &config.model_type,
+        "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
     )?;
