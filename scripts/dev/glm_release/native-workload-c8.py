@@ -216,7 +216,10 @@ class Client:
                               "content": json.dumps(result, separators=(",", ":"))},
                              {"role": "user", "content": "Reply with exactly the result_code from the tool response, with no other text."}],
                 "tools": [], "tool_choice": "none",
-                "temperature": 0, "max_tokens": 64, "stream": False,
+                # The 32-token thinking budget is soft: sentence-safe closure
+                # can defer until about96 tokens. Allow room for the exact
+                # visible result; retain the strict stop/own-result validator.
+                "temperature": 0, "max_tokens": 128, "stream": False,
                 "thinking_token_budget": 32,
                 "chat_template_kwargs": {"enable_thinking": True}}
         followup = self.request("/v1/chat/completions", body)
@@ -285,7 +288,7 @@ def validate_chat(row, index, tool=False):
 def validate_tool_followup(row, index):
     require("error" not in row, row.get("error", ""))
     response = row["response"]
-    check_usage(response["usage"], 64)
+    check_usage(response["usage"], 128)
     require(len(response["choices"]) == 1, "expected one followup choice")
     choice = response["choices"][0]
     require(choice["finish_reason"] == "stop", "tool followup did not stop normally")

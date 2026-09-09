@@ -43,6 +43,11 @@ pending; this recipe change is not a successful serving or fit receipt.**
 - `native-workload-c8.py`: byte-identical retained C8 stdlib stdin workload.
   The coding literal/token hashes, temperature0, seed1, 148-input/256-output
   requests, one warmup and three measured waves at each C1..C8 are unchanged.
+  The new tool-result followups allow128 total output tokens: their32-token
+  thinking budget is soft and can defer closure until about96 tokens. The
+  initial64-token envelope truncated four valid own-result reasoning paths;
+  those failed receipts are retained. Exact visible result and normal-stop
+  checks remain mandatory. This does not change the coding benchmark.
 - `test_materialize.py`: CPU-only transformation controls; no fake serving or
   authority fixture. These do not replace codec, controller or native tests.
 
