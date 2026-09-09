@@ -54,10 +54,10 @@ impl TransformerModel {
         let mode = self
             .glm_pair_verify_mode
             .context("pair compute mode was not admitted")?;
-        ensure!(
-            seqs[0].slot_idx == 0 && seqs[1].slot_idx == 1,
-            "pair compute requires canonical physical owners"
-        );
+        crate::layers::glm5_mtp::Glm5MtpHead::validate_fixed_pair_slots(
+            [seqs[0].slot_idx, seqs[1].slot_idx],
+            self.paired_owner_capacity()?,
+        )?;
         for owner in 0..2 {
             self.paired_validate_verify(seqs[owner], &tokens[owner])?;
         }

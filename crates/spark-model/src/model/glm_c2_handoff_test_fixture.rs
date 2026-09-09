@@ -126,8 +126,13 @@ impl Recorder {
         Ok(())
     }
     pub fn slab(&self) -> DevicePtr {
+        self.slab_for_owners(2)
+    }
+    pub fn slab_for_owners(&self, owners: usize) -> DevicePtr {
+        assert!((2..=4).contains(&owners));
         let live = self.live.lock();
-        let found: Vec<_> = live.iter().filter(|(_, n)| **n == SLAB_BYTES).collect();
+        let bytes = owners * 6 * ROW_BYTES;
+        let found: Vec<_> = live.iter().filter(|(_, n)| **n == bytes).collect();
         assert_eq!(found.len(), 1, "exactly one actual paired slab");
         DevicePtr(*found[0].0)
     }

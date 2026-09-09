@@ -13,9 +13,23 @@ and both original/shared-M10 all25 Model/worker continuation controls pass.
 The constructor test first failed at the actual capacity-four refusal before
 implementation. Logs: campaign `c4-owner-capacity-{red,green,controls}.log` and
 `c4-owner-pair-controls.log`. No native serving gain is attributed to this slice.
-Factory remains literal capacity2; paired compute explicitly rejects larger
-pools until physical-group mapping is implemented. Scheduler, wire admission,
-target memory accounting and large-context limits are not opened by this change.
+Factory remains literal capacity2. Scheduler, recipe admission, target memory
+accounting and large-context limits are not opened by the storage change.
+
+Physical-group mapping is now implemented and CPU-qualified. Model capacity
+checks require agreement between the actual private pool, target SSM slot pool
+and decode levers. E6 binds its existing preamble and owner records to complete
+physical groups[0,1] or[2,3]; packed rows and verdict arrays remain pair-local.
+Only the addressed group writes private state, and one exclusive producer is
+retained through both commits. The actual four-owner Model/worker test first
+failed at the old two-slot wire restriction, then passed alternating groups,
+independent0/4 acceptance, exact committed tokens, E1 repair/continuation, full
+unselected private/target-byte preservation, and wrong-preamble refusal before
+worker writers with globally terminal retention. Existing handoff controls,
+including both original/shared-M10 all25 continuation checks, also pass.
+Evidence: campaign `c4-model-group-{red,green,controls}.log`; these are host-side
+ownership checks with recorded numerical kernels, not native C4 qualification.
+The last native-qualified serving source remains290cf248 with two owners.
 
 ## Architectural reference
 

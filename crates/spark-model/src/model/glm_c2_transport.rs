@@ -42,6 +42,7 @@ impl TransformerModel {
     }
 
     pub(in crate::model) fn paired_wire_profile(&self, rank: usize) -> Result<()> {
+        self.paired_owner_capacity()?;
         let comm = self
             .comm
             .as_ref()
@@ -49,12 +50,11 @@ impl TransformerModel {
         ensure!(
             self.paired_handoff().is_some()
                 && self.ep_protocol_v2
-                && self.levers.max_decode_seqs == 2
                 && crate::layers::glm5_mtp::distributed_enabled()
                 && comm.world_size() == 2
                 && comm.rank() == rank
                 && !self.ep_cmd_buf.is_null(),
-            "paired transport requires actual selected EP-v2 two-slot rank"
+            "paired transport requires actual selected EP-v2 bounded-owner rank"
         );
         Ok(())
     }

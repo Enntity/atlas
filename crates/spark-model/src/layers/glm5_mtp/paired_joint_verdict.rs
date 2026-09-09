@@ -35,11 +35,11 @@ impl Glm5MtpHead {
             );
             let mut pending = [states[0].repair, states[1].repair];
             for index in 0..2 {
+                let record = pair.records[index];
                 ensure!(
-                    pool.matches_request(states[index], &inputs[index], ctx)? == index,
+                    pool.matches_request(states[index], &inputs[index], ctx)? == record.slot,
                     "pair verdict slot order changed"
                 );
-                let record = pair.records[index];
                 let base = bases[index];
                 let count = accepted[index];
                 ensure!(count <= 4, "pair accepted count exceeds four");
@@ -54,7 +54,7 @@ impl Glm5MtpHead {
                         && data.position == end
                         && data.tokens.get(base..end) == Some(&tokens[index][..count + 1])
                         && data.tokens.get(..base)
-                            == Some(pool.slots[index].issued_prefix.as_slice()),
+                            == Some(pool.slots[record.slot].issued_prefix.as_slice()),
                     "Pair verdict differs from actual verified committed prefix"
                 );
                 pending[index].record(
@@ -69,26 +69,27 @@ impl Glm5MtpHead {
                 )?;
             }
             // No copy or phase change above: a bad second verdict cannot detach the first.
-            for slot in &mut pool.slots {
-                slot.writing = true;
+            for record in &pair.records {
+                pool.slots[record.slot].writing = true;
             }
             (pair, pending, pool.slab)
         };
         let result = (|| {
             for index in 0..2 {
                 // The sealed input still names original row zero. Only this actual
-                // producer derives the canonical owner's source row within that arena.
+                // producer derives the packed ordinal's source row within that arena.
+                // Private storage is addressed by the record's physical owner slot.
                 let source = pair.records[index].normalized.offset(index * 5 * ROW_BYTES);
                 Self::paired_detach_rows(
                     ctx,
                     source,
-                    slab.offset(index * SLOT_BYTES),
+                    slab.offset(pair.records[index].slot * SLOT_BYTES),
                     accepted[index],
                 )?;
                 let mut pool = owner.lock();
                 pool.matches_request(states[index], &inputs[index], ctx)?;
                 pool.pair_owner(ctx)?;
-                let slot = &mut pool.slots[index];
+                let slot = &mut pool.slots[pair.records[index].slot];
                 slot.bonus = Some(HiddenView {
                     generation: slot.generation,
                     position: bases[index] + accepted[index],
@@ -109,7 +110,7 @@ impl Glm5MtpHead {
             let mut pool = owner.lock();
             pool.producer_failed = true;
             for index in 0..2 {
-                pool.slots[index].failed = true;
+                pool.slots[pair.records[index].slot].failed = true;
                 states[index].repair = repair_state::RepairPhase::Failed;
             }
         }

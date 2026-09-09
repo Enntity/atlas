@@ -5,18 +5,23 @@ use crate::traits::Model;
 
 impl Fixture {
     pub fn new(rank: usize) -> Self {
-        Self::build(rank, true, 8)
+        Self::build(rank, true, 8, 2)
     }
 
     pub fn new_pair_compute(rank: usize) -> Self {
-        Self::build(rank, true, 20)
+        Self::build(rank, true, 20, 2)
+    }
+
+    pub fn new_pair_compute_with_owner_capacity(rank: usize, owners: usize) -> Self {
+        assert!((2..=4).contains(&owners));
+        Self::build(rank, true, 20, owners)
     }
 
     pub fn new_legacy(rank: usize) -> Self {
-        Self::build(rank, false, 8)
+        Self::build(rank, false, 8, 1)
     }
 
-    fn build(rank: usize, paired: bool, target_rows: usize) -> Self {
+    fn build(rank: usize, paired: bool, target_rows: usize, owners: usize) -> Self {
         assert!(rank < 2);
         let record = Arc::new(Recorder::default());
         let gpu = Box::new(Gpu(record.clone()));
@@ -67,27 +72,34 @@ impl Fixture {
         } else {
             Glm5MtpHead::new
         };
+        let module = Glm5MtpModule {
+            body: Box::new(Body {
+                record: record.clone(),
+                target: false,
+            }),
+            enorm: dense(ROW_BYTES),
+            hnorm: dense(ROW_BYTES),
+            norm: dense(ROW_BYTES),
+            eh_proj: dense(4096 * 4096 * 4),
+            eh_proj_nvfp4: None,
+        };
         let head = Arc::new(
-            construct(
-                Glm5MtpModule {
-                    body: Box::new(Body {
-                        record: record.clone(),
-                        target: false,
-                    }),
-                    enorm: dense(ROW_BYTES),
-                    hnorm: dense(ROW_BYTES),
-                    norm: dense(ROW_BYTES),
-                    eh_proj: dense(4096 * 4096 * 4),
-                    eh_proj_nvfp4: None,
-                },
-                embed,
-                lm_head,
-                None,
-                &cfg,
-                gpu.as_ref(),
-                8,
-                2044,
-            )
+            if owners > 2 {
+                assert!(paired);
+                Glm5MtpHead::new_paired_with_owner_capacity(
+                    module,
+                    embed,
+                    lm_head,
+                    None,
+                    &cfg,
+                    gpu.as_ref(),
+                    8,
+                    2044,
+                    owners,
+                )
+            } else {
+                construct(module, embed, lm_head, None, &cfg, gpu.as_ref(), 8, 2044)
+            }
             .unwrap(),
         );
         let buffers =
@@ -104,7 +116,7 @@ impl Fixture {
                 layer_dims: vec![],
                 cache_blocks_per_seq: None,
             },
-            256,
+            if paired { 128 * owners } else { 256 },
             gpu.as_ref(),
         )
         .unwrap();
@@ -125,7 +137,7 @@ impl Fixture {
             vec![],
             gpu,
             2044,
-            if paired { 2 } else { 1 },
+            owners,
             crate::layers::MtpQuantization::Bf16,
             false,
             false,
@@ -139,7 +151,7 @@ impl Fixture {
             16,
         )
         .unwrap();
-        model.levers.max_decode_seqs = if paired { 2 } else { 1 };
+        model.levers.max_decode_seqs = u32::try_from(owners).unwrap();
         if target_rows == 20 {
             model.ep_protocol_v2 = true;
         }

@@ -102,22 +102,27 @@ impl Glm5MtpHead {
                 && !pool.slots[index].commit_queued,
             "paired target commit count/position changed or duplicate"
         );
-        if pool.verification.is_some() {
+        let pair_ordinal = if pool.verification.is_some() {
             let pair = pool.pair_owner(ctx)?;
-            let record = &pair.records[index];
+            let ordinal = pair.ordinal(index)?;
+            let record = &pair.records[ordinal];
             ensure!(
                 pair.detached == [true; 2]
-                    && !pair.committed[index]
+                    && !pair.committed[ordinal]
                     && record.produced
                     && pending.tokens == record.issued.tokens
                     && record.issued.base.checked_add(committed) == Some(input.data().position),
                 "Pair target commit precedes both detaches or differs from issued verdict"
             );
-        }
+            Some(ordinal)
+        } else {
+            None
+        };
         if completed {
             pool.slots[index].commit_queued = true;
             if let Some(Producer::Pair(pair)) = pool.verification.as_mut() {
-                pair.committed[index] = true;
+                let ordinal = pair_ordinal.context("Pair commit ordinal missing")?;
+                pair.committed[ordinal] = true;
                 if pair.committed == [true; 2] {
                     pool.verification = None;
                 }

@@ -94,7 +94,20 @@ impl TransformerModel {
         self.proposer.as_ref()?.glm_pair_repair()?.paired_handoff()
     }
 
+    pub(in crate::model) fn paired_owner_capacity(&self) -> Result<usize> {
+        let capacity = self
+            .paired_handoff()
+            .context("paired capacity capability missing")?
+            .owner_capacity(self.gpu.as_ref())?;
+        ensure!(
+            capacity == self.levers.max_decode_seqs as usize && capacity == self.ssm_pool.max_slots,
+            "paired private/target/admitted owner capacities differ"
+        );
+        Ok(capacity)
+    }
+
     fn paired_profile(&self, seq: &SequenceState) -> Result<()> {
+        let capacity = self.paired_owner_capacity()?;
         ensure!(
             self.config.model_type == "glm5_next"
                 && self.config.hidden_size == 4096
@@ -103,10 +116,10 @@ impl TransformerModel {
                 && self.levers.drafter.prefill
                 && !self.levers.drafter.carry
                 && !self.prefix_cache.is_active()
-                && seq.slot_idx < 2
+                && seq.slot_idx < capacity
                 && seq.adapter_id == 0
                 && seq.adapter_slot < 0,
-            "paired producer requires the base GLM two-slot prefill-only profile"
+            "paired producer requires the base GLM bounded-owner prefill-only profile"
         );
         let comm = self
             .comm

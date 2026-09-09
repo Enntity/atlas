@@ -40,6 +40,15 @@ impl Pool {
 }
 
 impl GlmPairedHandoff for Glm5MtpHead {
+    fn owner_capacity(&self, gpu: &dyn GpuBackend) -> Result<usize> {
+        let pool = self
+            .paired
+            .as_ref()
+            .context("paired capacity pool missing")?
+            .lock();
+        pool.backend(gpu)?;
+        Ok(pool.capacity.owners())
+    }
     fn validate_verify_pair(
         &self,
         inputs: &[crate::model::GlmPairedInput<'_>; 2],

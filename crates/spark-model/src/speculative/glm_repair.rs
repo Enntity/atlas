@@ -53,6 +53,8 @@ pub trait GlmPairRepair: Send + Sync {
 
 /// Optional GLM-only request-owned path; legacy and other proposers lack it.
 pub trait GlmPairedHandoff: Send + Sync {
+    /// Actual retained owner capacity, not free space or admission authority.
+    fn owner_capacity(&self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<usize>;
     /// Fixed canonical slot order. Facts identify existing issued proposals;
     /// this immutable check neither reserves scratch nor creates authority.
     fn validate_verify_pair(

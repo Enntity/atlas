@@ -100,6 +100,15 @@ struct PairVerification {
     committed: [bool; 2],
 }
 
+impl PairVerification {
+    fn ordinal(&self, physical_slot: usize) -> Result<usize> {
+        self.records
+            .iter()
+            .position(|record| record.slot == physical_slot)
+            .context("physical owner does not belong to active Pair producer")
+    }
+}
+
 struct Binding {
     sequence_slot: usize,
     capture_generation: u64,
@@ -231,6 +240,17 @@ impl Pool {
 }
 
 impl Glm5MtpHead {
+    /// Membership only: callers must also validate actual live leases and capacity.
+    pub(crate) fn validate_fixed_pair_slots(slots: [usize; 2], capacity: usize) -> Result<()> {
+        let capacity = OwnerCapacity::new(capacity)?;
+        ensure!(
+            matches!(slots, [0, 1] | [2, 3])
+                && slots.into_iter().all(|slot| capacity.contains(slot)),
+            "fixed pair requires a complete canonical physical owner group"
+        );
+        Ok(())
+    }
+
     /// Explicit cold owner capacity; serving still calls the fixed-two wrapper.
     /// Capacity expansion is staged separately from any pair mapping or E6 admission.
     #[allow(dead_code, clippy::too_many_arguments)]

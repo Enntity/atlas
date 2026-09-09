@@ -18,10 +18,10 @@ impl TransformerModel {
         let mode = self
             .glm_pair_verify_mode
             .context("joint verification disabled")?;
-        ensure!(
-            seqs[0].slot_idx == 0 && seqs[1].slot_idx == 1,
-            "paired physical owner order"
-        );
+        crate::layers::glm5_mtp::Glm5MtpHead::validate_fixed_pair_slots(
+            [seqs[0].slot_idx, seqs[1].slot_idx],
+            self.paired_owner_capacity()?,
+        )?;
         GlmPairWorkspace::new(&self.glm_repair_context(), mode)?;
         for seq in seqs {
             self.paired_target_preflight(seq, 5)?;
@@ -77,7 +77,7 @@ impl TransformerModel {
             let start = 4 + owner * 11;
             let (generation, attempt) = facts[owner];
             packet[start..start + 6].copy_from_slice(&[
-                owner as u32,
+                u32::try_from(seqs[owner].slot_idx)?,
                 generation as u32,
                 (generation >> 32) as u32,
                 attempt as u32,
@@ -96,8 +96,9 @@ impl TransformerModel {
     ) -> Result<[[u32; 5]; 2]> {
         self.paired_wire_profile(0)?;
         let packet = self.paired_pair_packet([&*seqs[0], &*seqs[1]], tokens)?;
+        let group_base = u32::try_from(seqs[0].slot_idx)?;
         (|| {
-            self.ep_broadcast_seq_and_cmd(0, EP_GLM_PAIR_VERIFY, true)?;
+            self.ep_broadcast_seq_and_cmd(group_base, EP_GLM_PAIR_VERIFY, true)?;
             self.ep_broadcast_tokens(&packet)?;
             self.sync_secondary()?;
             self.paired_compute_verify(seqs, tokens)
@@ -112,13 +113,26 @@ impl TransformerModel {
     ) -> Result<bool> {
         (|| {
             self.paired_wire_profile(1)?;
+            let capacity = self.paired_owner_capacity()?;
             ensure!(
-                preamble_slot == 0 && slots.len() == 2,
-                "paired worker preamble/slot capacity"
+                slots.len() == capacity,
+                "paired worker registry/capacity mismatch"
             );
-            let (left, right) = slots.split_at_mut(1);
+            let base = usize::try_from(preamble_slot)?;
+            let second = base
+                .checked_add(1)
+                .context("paired worker group overflow")?;
+            crate::layers::glm5_mtp::Glm5MtpHead::validate_fixed_pair_slots(
+                [base, second],
+                capacity,
+            )?;
+            let (left, right) = slots[base..=second].split_at_mut(1);
             let s0 = left[0].as_mut().context("paired worker owner0 missing")?;
             let s1 = right[0].as_mut().context("paired worker owner1 missing")?;
+            ensure!(
+                s0.slot_idx == base && s1.slot_idx == second,
+                "paired worker physical registry differs from preamble"
+            );
             let payload = self.ep_broadcast_tokens(&[0; WORDS])?;
             ensure!(payload.len() == WORDS, "paired worker payload extent");
             let tokens: [[u32; 5]; 2] = std::array::from_fn(|owner| {
@@ -174,6 +188,10 @@ impl TransformerModel {
         tokens: &[[u32; 5]; 2],
         accepted: [usize; 2],
     ) -> Result<[usize; 2]> {
+        crate::layers::glm5_mtp::Glm5MtpHead::validate_fixed_pair_slots(
+            [seqs[0].slot_idx, seqs[1].slot_idx],
+            self.paired_owner_capacity()?,
+        )?;
         ensure!(
             accepted.iter().all(|&a| a <= 4),
             "paired accepted count exceeds four"
@@ -186,8 +204,7 @@ impl TransformerModel {
                 .checked_sub(5)
                 .context("paired verdict lacks five rows")?;
             ensure!(
-                seq.slot_idx == owner
-                    && seq.tokens.len() == seq.seq_len
+                seq.tokens.len() == seq.seq_len
                     && seq.tokens.get(bases[owner]..) == Some(tokens[owner].as_slice()),
                 "paired verdict canonical issued append changed"
             );

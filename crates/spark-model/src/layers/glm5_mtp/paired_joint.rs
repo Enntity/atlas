@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! One exclusive producer for canonical slots 0/1 and original normalized rows 0/5.
+//! One exclusive producer for a physical owner group and normalized rows 0/5.
 use super::*;
 
 #[path = "paired_joint_verdict.rs"]
@@ -13,16 +13,16 @@ impl Pool {
         states: [&Glm5MtpProposerState; 2],
         ctx: &ForwardContext,
     ) -> Result<PairVerification> {
-        ensure!(
-            self.capacity.owners() == 2,
-            "fixed paired compute requires capacity2 until physical group mapping is admitted"
-        );
         let records = [
             self.verify_candidate(&inputs[0], &tokens[0], states[0], ctx)?,
             self.verify_candidate(&inputs[1], &tokens[1], states[1], ctx)?,
         ];
+        Glm5MtpHead::validate_fixed_pair_slots(
+            records.map(|record| record.slot),
+            self.capacity.owners(),
+        )?;
         ensure!(
-            records[0].slot == 0 && records[1].slot == 1 && !ctx.graph_capture,
+            !ctx.graph_capture,
             "fixed pair requires canonical live slots and eager execution"
         );
         let normalized_bytes = ctx.buffers.sizes().norm_output;
@@ -51,16 +51,19 @@ impl Pool {
         let Some(Producer::Pair(pair)) = &self.verification else {
             anyhow::bail!("actual Pair verification receipt missing");
         };
+        Glm5MtpHead::validate_fixed_pair_slots(
+            pair.records.map(|record| record.slot),
+            self.capacity.owners(),
+        )?;
         ensure!(
             !ctx.graph_capture && pair.normalized_bytes == ctx.buffers.sizes().norm_output,
             "pair normalized arena/capture changed"
         );
         for index in 0..2 {
             let record = &pair.records[index];
-            let slot = &self.slots[index];
+            let slot = &self.slots[record.slot];
             ensure!(
-                record.slot == index
-                    && record.generation == slot.generation
+                record.generation == slot.generation
                     && slot.active
                     && !slot.failed
                     && !slot.retiring
@@ -154,11 +157,11 @@ impl Glm5MtpHead {
         let mut pool = self.paired.as_ref().context("paired pool missing")?.lock();
         let pair = pool.pair_owner(ctx)?;
         for index in 0..2 {
+            let record = &pair.records[index];
             ensure!(
-                pool.matches_request(states[index], &inputs[index], ctx)? == index,
+                pool.matches_request(states[index], &inputs[index], ctx)? == record.slot,
                 "pair publish slot order changed"
             );
-            let record = &pair.records[index];
             let end = record
                 .issued
                 .base
@@ -172,7 +175,7 @@ impl Glm5MtpHead {
                     && data.position == end
                     && data.tokens.get(record.issued.base..end) == Some(tokens[index].as_slice())
                     && data.tokens.get(..record.issued.base)
-                        == Some(pool.slots[index].issued_prefix.as_slice())
+                        == Some(pool.slots[record.slot].issued_prefix.as_slice())
                     && predictions[index]
                         .iter()
                         .all(|&p| (p as usize) < ctx.config.vocab_size),

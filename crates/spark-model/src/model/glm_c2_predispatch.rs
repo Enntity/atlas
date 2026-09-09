@@ -9,6 +9,9 @@ mod quiescence;
 
 impl sealed::Sealed for TransformerModel {}
 impl GlmPairedExecution for TransformerModel {
+    fn owner_capacity(&self) -> Result<usize> {
+        self.paired_owner_capacity()
+    }
     fn pair_verification_enabled(&self) -> bool {
         self.glm_pair_verify_mode.is_some()
     }
