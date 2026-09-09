@@ -104,3 +104,43 @@ guard authority. No router-return/join workaround was added.
 Root observed threaded GREEN (`/tmp/atlas-live-main-aBD8eU`), ordinary drain
 GREEN and unchanged replay/foreign refusals, plus focused IO/server checks.
 These are CPU fixture results, not a substitute for repeating the native run.
+
+## Native execution-thread fix repeat
+
+Source `fcbe8da6fccd77f81c91fcd579ef38a7db7e5763`, same workload and settings.
+All four answer checks, two automatic tool calls and both own/no-peer NIAH
+checks passed again. Warm full-wall medians were C1=27.280 and C2=27.245tok/s;
+decode-window medians28.716/27.925. Full-wall repeats were
+C1=27.280/27.282/27.276 and C2=27.276/27.245/27.217. No performance gain is
+attributed to the thread fix; C2 remains effectively serial aggregate throughput.
+
+Both real quiescent receipts and both local release writes now completed.
+Independent final Docker inspections show both containers exited0, OOMfalse,
+restart0 at13:35:12UTC. Across922 node observations, minimum MemAvailable was
+9,236,268KiB head and10,382,952KiB worker, with zero observed swap on either.
+Both recovered about116GiB available. No reset/reboot was needed.
+
+The controller nevertheless exited74 and did not issue a success receipt.
+Its node observer classified the first Docker snapshot as Running, then required
+that same stage on the second snapshot across the proc/memory read window.
+The native completion exposed a Running-to-Exited race. This is distinct from
+the previous server release failure: the current containers really exited0.
+Do not relabel the failed controller campaign as qualified. A focused regression
+through the actual Docker validator reproduced the exact phase-mismatch error
+in `observation-window-red.log`; a narrow transition fix is in development.
+
+Prepared bundle `cd5c4590c027fc8dc13e2d0e989a128da3bb32588bdfb0fdd722a95b8aa75e9b`;
+session `e0379292e25a3b4eaa3d8fe99e18291383473f47ce44cfbf4d2749f8dda18782`.
+Head image `2b6320a5031469b0b684c004810678e174367ec8381822a60f0b11f996c39522`;
+worker image `eaa4db9d7095c235fe3a472efa3ae85add514c9386d0df978439568f3223049b`.
+Spark SHA256 `1d38bdd196ddf9f0b37b3f786212b57526d62f78e4c7922de60cd6aee4b99ebe`.
+Native helpers are sourcefcbe8da6; the compatible unchanged x86 controller was
+the retained source656667ce binary, SHA256
+`f0494975e4d719ec5b9424279a4257b6f80eb37be15e3fa6ced0b27a4e620649`.
+
+External evidence: `native-prepared-fcbe8da6/`,
+`native-controller-fcbe8da6-evidence.tgz`, `native-summary-fcbe8da6.json`,
+`native-{head,worker}-fcbe8da6.log`, corresponding `*-final.json`, and
+`native-run-fcbe8da6.log`. Temporary version-pinned sudo helper permissions were
+withdrawn on both nodes after final inspection; rule backups, binaries, stopped
+containers and rollback images remain recoverable.

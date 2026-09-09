@@ -109,8 +109,13 @@ The first actual native selected C2 MTP campaign now completed quality and warme
 148/256 timing: C1=27.359 and C2=27.312 aggregate full-wall tok/s. However, paired
 shutdown failed before Q/release, and exact-ID cleanup ended both containers137
 with OOMKilled=false and zero observed swap. This is not a qualified deployment;
-see `paired-native-first-results.md`. Reproduce/fix the execution-thread release
-handoff before promotion, then tackle the serial target-verification bottleneck.
+see `paired-native-first-results.md`. The execution-thread fix in `fcbe8da6`
+then passed the same native quality workload at C1=27.280/C2=27.245 full-wall
+tok/s. Both real Q/release exchanges and independently observed container exit0
+completed without OOM/swap. The controller still failed on a two-snapshot Docker
+Running-to-Exited race, so full campaign qualification remains pending. Fix that
+narrow observer transition while building joint layer-major verification: the
+two-owner routed FFN is the next performance target, not an achieved gain.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.
