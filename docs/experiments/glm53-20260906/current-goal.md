@@ -105,6 +105,12 @@ connected and has passed an actual two-container Docker/SSH CPU Model rehearsal,
 including active lease renewals and independently observed paired exit0; see
 `connected-controller-results.md`. ARM64/native MTP qualification remains next;
 no native throughput gain is claimed for this slice.
+The first actual native selected C2 MTP campaign now completed quality and warmed
+148/256 timing: C1=27.359 and C2=27.312 aggregate full-wall tok/s. However, paired
+shutdown failed before Q/release, and exact-ID cleanup ended both containers137
+with OOMKilled=false and zero observed swap. This is not a qualified deployment;
+see `paired-native-first-results.md`. Reproduce/fix the execution-thread release
+handoff before promotion, then tackle the serial target-verification bottleneck.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.
