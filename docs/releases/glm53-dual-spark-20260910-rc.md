@@ -81,6 +81,44 @@ quality check despite finding the needle. Correct real-chat framing is being
 qualified without weakening the answer validators or watchdogs. Do not quote
 the historical16K run as a PASS for this release candidate.
 
+### Retained 4K full-response audit and quality limitations
+
+A local, read-only audit examined the `22b56144` real-chat OFF/ON receipts under
+`longctx-22b56144-4096-{off,on}-chat-run/quality-receipts/quality/` in the
+20260909 `glm-native-controller` campaign. Each run contains33 final quality
+responses and87 one-token sizing responses. A request-owner-aware scan of the
+full returned choices, including content, reasoning and tool fields, found no
+other-owner case names, result codes, function names, project names, leaders or
+cities. This is a bounded known-marker check, not proof of arbitrary data
+isolation; calibration responses are sizing evidence, not quality passes.
+
+The raw fields expose weaknesses that exact-answer checks alone do not reject:
+
+- ON `http-0085.json` (C2, NEBULA) makes the correct tool call, but its visible
+  preamble repeats archive filler and breaks a sentence before announcing the
+  correct case. ON `http-0090.json` returns the exact tool result, while its
+  reasoning repeats that result and incorrectly describes three user sends and
+  a garbled message.
+- OFF `http-0154.json` returns the correct linked-fact JSON, but its reasoning
+  introduces unrelated `question, answer` keys. Other successful responses have
+  filler fragments or repeated own answers in reasoning. These observations do
+  not by themselves identify a model, template or engine cause.
+- Both complete runs remain **FAIL**, not qualified4K results: OFF
+  `http-0167.json` (C3, NEBULA) produces a49-token filler loop without a tool call;
+  ON `http-0167.json` (C3, AURORA) spends192 tokens describing the intended call
+  without emitting one. Both finish with `length`; the strict tool gate rejects
+  them. C3 tool-result followups and C4 quality were consequently not reached.
+
+The harness checks exact retrieval at approximate early/middle/late positions,
+linked facts/arithmetic, and actual assistant-call-ID/tool-result roundtrips;
+it does **not** establish broad long-form coherence. Tool-call preambles and
+reasoning are retained but not generally coherence-validated. Same-owner values
+repeat across waves, so stale same-owner answers are not independently ruled
+out. Native validation of the later `c853bafa` source, including its chunk-budget
+and explicit tool-thinking changes, is **PENDING**; no normalization change has
+been made. The earlier failures and this audit
+must not be relabeled as passes for that source.
+
 ## Rollback and acceptance checklist
 
 Retain the qualified **capacity4** `a069efc3` rollback and its original recipe;
