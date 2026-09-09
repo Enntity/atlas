@@ -18,7 +18,12 @@ impl Fixture {
     }
 
     pub fn new_owner_compute(rank: usize) -> Self {
-        Self::build(rank, true, 40, 4)
+        Self::new_owner_compute_with_owner_capacity(rank, 4)
+    }
+
+    pub fn new_owner_compute_with_owner_capacity(rank: usize, owners: usize) -> Self {
+        assert!((3..=8).contains(&owners));
+        Self::build(rank, true, owners * 10, owners)
     }
 
     pub fn new_legacy(rank: usize) -> Self {

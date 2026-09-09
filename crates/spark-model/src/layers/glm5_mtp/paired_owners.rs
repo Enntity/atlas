@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Distinct bounded producer for three/four actual owners; no allocation.
+//! Distinct bounded producer for three through eight actual owners; no allocation.
 use super::*;
 use crate::layer::glm_owner_verify::GlmOwnerBatchShape;
 
@@ -10,14 +10,18 @@ mod verdict;
 enum Records {
     Three([Verification; 3]),
     Four([Verification; 4]),
+    Five([Verification; 5]),
+    Six([Verification; 6]),
+    Seven([Verification; 7]),
+    Eight([Verification; 8]),
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct OwnerVerification {
     records: Records,
     normalized_bytes: usize,
-    pub(super) detached: [bool; 4],
-    pub(super) committed: [bool; 4],
+    pub(super) detached: [bool; 8],
+    pub(super) committed: [bool; 8],
 }
 
 impl OwnerVerification {
@@ -25,12 +29,20 @@ impl OwnerVerification {
         match &self.records {
             Records::Three(v) => v,
             Records::Four(v) => v,
+            Records::Five(v) => v,
+            Records::Six(v) => v,
+            Records::Seven(v) => v,
+            Records::Eight(v) => v,
         }
     }
     fn records_mut(&mut self) -> &mut [Verification] {
         match &mut self.records {
             Records::Three(v) => v,
             Records::Four(v) => v,
+            Records::Five(v) => v,
+            Records::Six(v) => v,
+            Records::Seven(v) => v,
+            Records::Eight(v) => v,
         }
     }
     pub(super) fn ordinal(&self, slot: usize) -> Result<usize> {
@@ -75,6 +87,34 @@ impl Pool {
         let records = match n {
             3 => Records::Three([record(0)?, record(1)?, record(2)?]),
             4 => Records::Four([record(0)?, record(1)?, record(2)?, record(3)?]),
+            5 => Records::Five([record(0)?, record(1)?, record(2)?, record(3)?, record(4)?]),
+            6 => Records::Six([
+                record(0)?,
+                record(1)?,
+                record(2)?,
+                record(3)?,
+                record(4)?,
+                record(5)?,
+            ]),
+            7 => Records::Seven([
+                record(0)?,
+                record(1)?,
+                record(2)?,
+                record(3)?,
+                record(4)?,
+                record(5)?,
+                record(6)?,
+            ]),
+            8 => Records::Eight([
+                record(0)?,
+                record(1)?,
+                record(2)?,
+                record(3)?,
+                record(4)?,
+                record(5)?,
+                record(6)?,
+                record(7)?,
+            ]),
             _ => anyhow::bail!("owner candidate shape changed"),
         };
         let normalized_bytes = ctx.buffers.sizes().norm_output;
@@ -90,8 +130,8 @@ impl Pool {
         let result = OwnerVerification {
             records,
             normalized_bytes,
-            detached: [false; 4],
-            committed: [false; 4],
+            detached: [false; 8],
+            committed: [false; 8],
         };
         ensure!(
             result.records().windows(2).all(|v| v[0].slot < v[1].slot),
@@ -160,7 +200,7 @@ impl Glm5MtpHead {
         tokens: &[[u32; 5]],
         states: &[&dyn ProposerState],
         ctx: &ForwardContext,
-    ) -> Result<[(u64, u64); 4]> {
+    ) -> Result<[(u64, u64); 8]> {
         ensure!(states.len() == shape.owners(), "owner state count changed");
         for state in states {
             self.owner_state(*state, ctx)?;
@@ -171,7 +211,7 @@ impl Glm5MtpHead {
             .context("owner producer pool missing")?
             .lock();
         let candidate = pool.owner_candidate(shape, inputs, tokens, states, ctx)?;
-        let mut facts = [(0, 0); 4];
+        let mut facts = [(0, 0); 8];
         for (i, record) in candidate.records().iter().enumerate() {
             facts[i] = (record.generation, record.issued.attempt);
         }
@@ -189,7 +229,7 @@ impl Glm5MtpHead {
         ensure!(states.len() == shape.owners(), "owner state count changed");
         // Only the active prefix is passed. These are borrowed references, not
         // new owners or allocations; every actual state is independently checked.
-        let mut refs: [&dyn ProposerState; 4] = [&*states[0]; 4];
+        let mut refs: [&dyn ProposerState; 8] = [&*states[0]; 8];
         for (i, state) in states.iter().enumerate() {
             self.owner_state(&**state, ctx)?;
             refs[i] = &**state;

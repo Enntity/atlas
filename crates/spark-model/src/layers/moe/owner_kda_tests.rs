@@ -43,10 +43,10 @@ fn actual_kda_owner_batch_layer_entry() {
         return;
     }
     for rank in 0..2 {
-        for count in [3, 4] {
+        for count in 3..=8 {
             with_kda_ffn(rank, true, |gpu, config, layer| {
                 let shape = GlmOwnerBatchShape::new(count).unwrap();
-                let arena = BufferArena::new(config, 40, 2048, 16, count, gpu).unwrap();
+                let arena = BufferArena::new(config, count * 10, 2048, 16, count, gpu).unwrap();
                 let resources = ContextResources::new();
                 let mut levers = ops::ModelLevers::defaults();
                 levers.max_decode_seqs = count as u32;
@@ -62,7 +62,7 @@ fn actual_kda_owner_batch_layer_entry() {
                 gpu.clear();
                 layer
                     .validate_glm_owner_verify(&ctx, shape, gpu.default_stream())
-                    .expect("actual KDA wider preflight must support three/four owners");
+                    .expect("actual KDA wider preflight must support three through eight owners");
                 assert!(gpu.trace().is_empty());
                 let mut workspace = GlmOwnerBatchWorkspace::new(&ctx, shape).unwrap();
                 let mut states: Vec<_> = (0..count)
@@ -92,7 +92,7 @@ fn actual_kda_owner_batch_layer_entry() {
                 .unwrap();
                 let blocks: Vec<_> = (0..count).map(|_| [cache.alloc_block().unwrap()]).collect();
                 let positions = [3, 4, 5, 6, 7];
-                let contexts = [&ctx; 4];
+                let contexts = [&ctx; 8];
                 let mut inputs: Vec<_> = states
                     .iter_mut()
                     .enumerate()

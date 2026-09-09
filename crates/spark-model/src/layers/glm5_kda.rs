@@ -325,7 +325,7 @@ impl TransformerLayer for Glm5KdaLayer {
         let workspace = crate::layer::glm_owner_verify::GlmOwnerBatchWorkspace::new(ctx, shape)?;
         self.validate_temporal(
             &workspace.scratch,
-            &[ctx; 4][..shape.owners()],
+            &[ctx; 8][..shape.owners()],
             crate::layer::glm_verify_ffn::GlmVerifyFfn::Owners(shape),
             stream,
         )

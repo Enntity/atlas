@@ -30,7 +30,11 @@ impl Fixture {
     }
     /// Real cold-selected wider compute plus the existing pair fallback.
     pub fn owner_compute(rank: usize) -> Self {
-        let mut fixture = inner::Fixture::new_owner_compute(rank);
+        Self::owner_compute_with_owner_capacity(rank, 4)
+    }
+    /// Actual explicit-capacity construction; no serving admission is granted.
+    pub fn owner_compute_with_owner_capacity(rank: usize, owners: usize) -> Self {
+        let mut fixture = inner::Fixture::new_owner_compute_with_owner_capacity(rank, owners);
         fixture
             .model
             .initialize_glm_pair_verification(crate::layer::glm_pair_verify::GlmPairFfn::TwoK5)

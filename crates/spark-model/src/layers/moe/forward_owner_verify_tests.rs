@@ -51,7 +51,7 @@ fn actual_owner_verify_ffn_dispatch() {
         );
         return;
     }
-    for owners in [3, 4] {
+    for owners in 3..=8 {
         for rank in 0..2 {
             for vector in [false, true] {
                 let shape = GlmOwnerBatchShape::new(owners).unwrap();
@@ -85,7 +85,7 @@ fn actual_owner_verify_ffn_dispatch() {
                 let shared = layer.w4a16_gemm_t.0;
                 let activation = layer.moe_act_mul.0;
                 let ffn = FfnComponent::Moe(layer);
-                let arena = BufferArena::new(&config, rows * 2, 2048, 16, 4, &gpu).unwrap();
+                let arena = BufferArena::new(&config, rows * 2, 2048, 16, owners, &gpu).unwrap();
                 let resources = ContextResources::new();
                 let comm = Comm {
                     gpu: &gpu,
@@ -222,7 +222,7 @@ fn actual_owner_verify_ffn_dispatch() {
                 );
                 assert!(gpu.trace().is_empty());
                 ctx.graph_capture = false;
-                let short = BufferArena::new(&config, rows - 1, 2048, 16, 4, &gpu).unwrap();
+                let short = BufferArena::new(&config, rows - 1, 2048, 16, owners, &gpu).unwrap();
                 let mut short_ctx = resources.view(&short, &config, &gpu);
                 short_ctx.comm = Some(&comm);
                 gpu.clear();
@@ -264,7 +264,7 @@ fn dense_owners(
     )
     .unwrap();
     let ffn = FfnComponent::Dense(layer);
-    let arena = BufferArena::new(&config, shape.rows() * 2, 2048, 16, 4, gpu).unwrap();
+    let arena = BufferArena::new(&config, shape.rows() * 2, 2048, 16, shape.owners(), gpu).unwrap();
     let resources = ContextResources::new();
     let mut ctx = resources.view(&arena, &config, gpu);
     ctx.comm = Some(comm);

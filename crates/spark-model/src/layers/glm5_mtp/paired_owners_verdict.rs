@@ -32,11 +32,11 @@ impl Glm5MtpHead {
             let group = *pool.owners_owner(ctx)?;
             ensure!(
                 group.records().len() == n
-                    && group.detached == [false; 4]
-                    && group.committed == [false; 4],
+                    && group.detached == [false; 8]
+                    && group.committed == [false; 8],
                 "owner verdict shape changed or already detached/committed"
             );
-            let mut pending = [repair_state::RepairPhase::Failed; 4];
+            let mut pending = [repair_state::RepairPhase::Failed; 8];
             for (i, record) in group.records().iter().enumerate() {
                 let state = states[i]
                     .as_any()

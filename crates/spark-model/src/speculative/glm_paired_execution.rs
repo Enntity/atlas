@@ -26,7 +26,7 @@ pub trait GlmPairedExecution: sealed::Sealed + Send + Sync {
         shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
         seqs: &mut [&mut SequenceState],
         tokens: &[[u32; 5]],
-    ) -> Result<[[u32; 5]; 4]>;
+    ) -> Result<[[u32; 5]; 8]>;
     fn finish_verify_owners(
         &self,
         shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
@@ -64,7 +64,7 @@ pub trait GlmPairedExecution: sealed::Sealed + Send + Sync {
     ) -> Result<()>;
     /// Revalidate before issuing selected F5; caller owns the later verdict.
     fn verify(&self, seq: &mut SequenceState, tokens: &[u32]) -> Result<Vec<u32>>;
-    /// Fixed temporal [5,5] transaction in physical group order [0,1] or [2,3].
+    /// Fixed temporal [5,5] transaction in an admitted even/odd physical group.
     /// Both result slices remain live until the joint verdict has detached them.
     fn verify_pair(
         &self,

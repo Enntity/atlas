@@ -15,13 +15,13 @@ pub(crate) enum Mode {
 }
 
 impl Mode {
-    fn word(self) -> u32 {
+    pub(super) fn word(self) -> u32 {
         match self {
             Self::OwnersJoint => 1,
         }
     }
 
-    fn decode(word: u32) -> Result<Self> {
+    pub(super) fn decode(word: u32) -> Result<Self> {
         match word {
             1 => Ok(Self::OwnersJoint),
             _ => bail!("E7 unknown owner compute mode"),
@@ -36,6 +36,20 @@ pub(crate) struct Bounds {
     pub context_tokens: usize,
 }
 
+impl Bounds {
+    pub(super) fn validate(self, count: usize) -> Result<()> {
+        ensure!(
+            (2..=8).contains(&self.capacity)
+                && count <= self.capacity
+                && self.vocab_size > 0
+                && self.vocab_size <= u32::MAX as usize
+                && (5..=2048).contains(&self.context_tokens),
+            "invalid explicit owner/vocabulary/context bounds"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OwnerRecord {
     pub slot: u32,
@@ -43,6 +57,28 @@ pub(crate) struct OwnerRecord {
     pub attempt: u64,
     pub base: u32,
     pub tokens: [u32; 5],
+}
+
+impl OwnerRecord {
+    pub(super) fn validate(self, bounds: Bounds, previous: Option<u32>) -> Result<()> {
+        ensure!(
+            (self.slot as usize) < bounds.capacity
+                && previous.is_none_or(|slot| slot < self.slot)
+                && self.generation != 0
+                && self.attempt != 0,
+            "invalid owner ordering/identity"
+        );
+        let end = self.base.checked_add(5).context("owner end overflow")?;
+        ensure!(
+            (end as usize) <= bounds.context_tokens
+                && self
+                    .tokens
+                    .iter()
+                    .all(|&token| (token as usize) < bounds.vocab_size),
+            "owner position/token outside explicit bounds"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,14 +92,8 @@ pub(crate) struct Packet {
 impl Packet {
     pub(crate) fn encode(&self, bounds: Bounds) -> Result<[u32; PAYLOAD_WORDS]> {
         let count = self.shape.owners();
-        ensure!(
-            (2..=4).contains(&bounds.capacity)
-                && count <= bounds.capacity
-                && bounds.vocab_size > 0
-                && bounds.vocab_size <= u32::MAX as usize
-                && (5..=2048).contains(&bounds.context_tokens),
-            "E7 invalid explicit owner/vocabulary/context bounds"
-        );
+        ensure!(matches!(count, 3 | 4), "E7 requires exactly3/4 owners");
+        bounds.validate(count).context("E7 bounds")?;
         ensure!(
             self.owners[count..].iter().all(Option::is_none),
             "E7 unused owner record is present"
@@ -78,22 +108,7 @@ impl Packet {
         let mut previous = None;
         for (ordinal, owner) in self.owners[..count].iter().enumerate() {
             let owner = owner.context("E7 live owner record missing")?;
-            ensure!(
-                (owner.slot as usize) < bounds.capacity
-                    && previous.is_none_or(|slot| slot < owner.slot)
-                    && owner.generation != 0
-                    && owner.attempt != 0,
-                "E7 invalid owner ordering/identity"
-            );
-            let end = owner.base.checked_add(5).context("E7 owner end overflow")?;
-            ensure!(
-                (end as usize) <= bounds.context_tokens
-                    && owner
-                        .tokens
-                        .iter()
-                        .all(|&token| (token as usize) < bounds.vocab_size),
-                "E7 owner position/token outside explicit bounds"
-            );
+            owner.validate(bounds, previous).context("E7 owner")?;
             previous = Some(owner.slot);
             let start = 4 + ordinal * RECORD_WORDS;
             words[start..start + 6].copy_from_slice(&[
@@ -111,6 +126,7 @@ impl Packet {
 
     pub(crate) fn decode(words: &[u32; PAYLOAD_WORDS], bounds: Bounds) -> Result<Self> {
         ensure!(words[0] == VERSION, "E7 payload version mismatch");
+        ensure!(matches!(words[1], 3 | 4), "E7 requires exactly3/4 owners");
         let shape = GlmOwnerBatchShape::new(words[1] as usize)?;
         ensure!(
             words[2] == shape.rows() as u32,
@@ -150,6 +166,7 @@ pub(crate) fn encode_verdict(
     accepted: [usize; 4],
 ) -> Result<[u32; VERDICT_WORDS]> {
     let count = shape.owners();
+    ensure!(matches!(count, 3 | 4), "E7 requires exactly3/4 owners");
     ensure!(
         accepted[..count].iter().all(|&value| value <= 4)
             && accepted[count..].iter().all(|&value| value == 0),
@@ -186,6 +203,25 @@ mod tests {
         vocab_size: 32,
         context_tokens: 2048,
     };
+
+    #[test]
+    fn legacy_payload_refuses_wider_shapes_before_record_slices() {
+        for owners in 5..=8 {
+            let mut words = [0; PAYLOAD_WORDS];
+            words[..4].copy_from_slice(&[VERSION, owners, owners * 5, 1]);
+            assert!(Packet::decode(&words, BOUNDS).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_verdict_refuses_wider_shapes_before_count_slices() {
+        for owners in 5..=8 {
+            let shape = GlmOwnerBatchShape::new(owners).unwrap();
+            assert!(encode_verdict(shape, [0; 4]).is_err());
+            let words = [VERSION, owners as u32, 0, 0, 0, 0];
+            assert!(decode_verdict(&words, shape).is_err());
+        }
+    }
 
     fn fixture(count: usize) -> (Packet, [u32; PAYLOAD_WORDS]) {
         let shape = GlmOwnerBatchShape::new(count).unwrap();
@@ -302,7 +338,7 @@ mod tests {
                 ..BOUNDS
             },
             Bounds {
-                capacity: 5,
+                capacity: 9,
                 ..BOUNDS
             },
             Bounds {

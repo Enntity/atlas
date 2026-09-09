@@ -13,7 +13,7 @@ pub(super) fn validate_rows(
     stream: u64,
 ) -> Result<()> {
     anyhow::ensure!(
-        matches!(rows, 10 | 15 | 20),
+        matches!(rows, 10 | 15 | 20 | 25 | 30 | 35 | 40),
         "bounded temporal FFN row count"
     );
     anyhow::ensure!(

@@ -445,8 +445,10 @@ impl TransformerModel {
         if cmd == super::glm_c2_pair_transport::EP_GLM_PAIR_VERIFY {
             return self.paired_receive_verify_pair(seq_id, slots);
         }
-        if cmd == super::glm_owner_wire::EP_GLM_OWNER_VERIFY {
-            return self.owner_receive_verify(seq_id, slots);
+        if cmd == super::glm_owner_wire::EP_GLM_OWNER_VERIFY
+            || cmd == super::glm_owner8_wire::EP_GLM_OWNER8_VERIFY
+        {
+            return self.owner_receive_verify(seq_id, cmd, slots);
         }
 
         let slot_idx = seq_id as usize;

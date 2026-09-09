@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Shared immutable checks for cold selection and every E7 pre-dispatch.
 use super::TransformerModel;
+use super::glm_owner_metadata::GlmOwnerMetadata;
 use crate::layer::glm_owner_verify::{GlmOwnerBatchShape, GlmOwnerBatchWorkspace};
 use crate::traits::SequenceState;
 use anyhow::{Context, Result, ensure};
@@ -12,7 +13,7 @@ impl TransformerModel {
         seqs: &[&SequenceState],
         tokens: &[[u32; 5]],
         accepted: &[usize],
-    ) -> Result<[usize; 4]> {
+    ) -> Result<[usize; 8]> {
         ensure!(
             seqs.len() == shape.owners()
                 && tokens.len() == shape.owners()
@@ -20,7 +21,7 @@ impl TransformerModel {
                 && accepted.iter().all(|&a| a <= 4),
             "owner verdict count mismatch"
         );
-        let mut bases = [0usize; 4];
+        let mut bases = [0usize; 8];
         let capacity = self.paired_owner_capacity()?;
         for (index, seq) in seqs.iter().enumerate() {
             ensure!(
@@ -44,7 +45,7 @@ impl TransformerModel {
     pub(in crate::model) fn validate_glm_owner_compute(
         &self,
         shape: GlmOwnerBatchShape,
-    ) -> Result<usize> {
+    ) -> Result<GlmOwnerMetadata> {
         let context = self.glm_repair_context();
         let stream = self.gpu.default_stream();
         let workspace = GlmOwnerBatchWorkspace::new(&context, shape)?;
@@ -60,15 +61,14 @@ impl TransformerModel {
             "wider compute requires complete admitted base paired model"
         );
         let max_blocks = self.max_blocks_per_seq as usize;
+        let metadata = GlmOwnerMetadata::new(
+            shape,
+            max_blocks,
+            self.buffers.max_batch_tokens(),
+            self.buffers.sizes().scratch,
+        )?;
         ensure!(
-            (1..=128).contains(&max_blocks),
-            "owner metadata block capacity"
-        );
-        let stride = (768 + 5 * max_blocks * 4).next_multiple_of(256);
-        ensure!(
-            stride <= 3328
-                && 32768 + shape.owners() * stride <= 49152
-                && self.buffers.sizes().scratch >= 49152
+            self.buffers.sizes().scratch >= crate::layers::mtp_meta::MTP_META_OFFSET
                 && self.buffers.sizes().logits
                     >= self
                         .config
@@ -81,7 +81,7 @@ impl TransformerModel {
         for layer in &self.layers {
             layer.validate_glm_owner_verify(&context, shape, stream)?;
         }
-        Ok(stride)
+        Ok(metadata)
     }
 
     pub(in crate::model) fn owner_compute_preflight(
@@ -89,12 +89,12 @@ impl TransformerModel {
         shape: GlmOwnerBatchShape,
         seqs: &[&SequenceState],
         tokens: &[[u32; 5]],
-    ) -> Result<usize> {
+    ) -> Result<GlmOwnerMetadata> {
         ensure!(
             seqs.len() == shape.owners() && tokens.len() == shape.owners(),
             "owner model count mismatch"
         );
-        let stride = self.validate_glm_owner_compute(shape)?;
+        let metadata = self.validate_glm_owner_compute(shape)?;
         let capacity = self.paired_owner_capacity()?;
         let max_blocks = self.max_blocks_per_seq as usize;
         for (index, seq) in seqs.iter().enumerate() {
@@ -134,6 +134,6 @@ impl TransformerModel {
             additional <= cache.num_free_blocks(),
             "owner aggregate target budget exhausted"
         );
-        Ok(stride)
+        Ok(metadata)
     }
 }

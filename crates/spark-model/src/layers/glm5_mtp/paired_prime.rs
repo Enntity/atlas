@@ -47,7 +47,7 @@ impl GlmPairedHandoff for Glm5MtpHead {
         tokens: &[[u32; 5]],
         states: &[&dyn ProposerState],
         ctx: &ForwardContext,
-    ) -> Result<[(u64, u64); 4]> {
+    ) -> Result<[(u64, u64); 8]> {
         self.paired_validate_verify_owners(shape, inputs, tokens, states, ctx)
     }
     fn begin_verify_owners(

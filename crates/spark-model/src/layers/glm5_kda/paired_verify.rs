@@ -119,7 +119,7 @@ impl Glm5KdaLayer {
         self.validate_temporal(workspace, contexts, mode, stream)?;
         workspace.begin_layer(self.layer_idx, owners, contexts, stream)?;
         // Validate every snapshot set before advancing any canonical state.
-        let mut storage = [(DevicePtr::NULL, 0usize); 44];
+        let mut storage = [(DevicePtr::NULL, 0usize); 88];
         let spans = &mut storage[..owners.len() * 11];
         for (owner, input) in owners.iter().enumerate() {
             let s = input
@@ -164,7 +164,7 @@ impl Glm5KdaLayer {
                 );
             }
         }
-        let mut phases = [None, None, None, None];
+        let mut phases = [None, None, None, None, None, None, None, None];
         for (owner, input) in owners.iter_mut().enumerate() {
             workspace.restore_highway(owner, stream)?;
             phases[owner] = Some(self.forward_attention(

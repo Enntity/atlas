@@ -210,9 +210,9 @@ impl Qwen3AttentionLayer {
             c.seq_slot = contexts[owner].attn_metadata.unwrap().seq_slot;
             c
         };
-        let cs: [Option<ctx::MultiSeqCtx<'_>>; 4] =
+        let cs: [Option<ctx::MultiSeqCtx<'_>>; 8] =
             std::array::from_fn(|owner| (owner < count).then(|| make_ctx(owner)));
-        let mut phases = [None, None, None, None];
+        let mut phases = [None, None, None, None, None, None, None, None];
         for owner in 0..count {
             workspace.restore_highway(owner, stream)?;
             phases[owner] = self.ms_hc_attention_norm(

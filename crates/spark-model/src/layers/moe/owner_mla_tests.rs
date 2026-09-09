@@ -181,8 +181,9 @@ fn actual_mla_owner_batch_layer_entry() {
     for rank in 0..2 {
         with_mla(rank, |gpu, config, layer| {
             // Existing pair is the constructor/context control before wider RED.
-            for count in [2usize, 3, 4] {
-                let arena = BufferArena::new(config, 40, 2048, 16, count, gpu).unwrap();
+            for count in 2usize..=8 {
+                let arena =
+                    BufferArena::new(config, (count * 10).max(40), 2048, 16, count, gpu).unwrap();
                 let resources = ContextResources::new();
                 let mut levers = ops::ModelLevers::defaults();
                 levers.max_decode_seqs = count as u32;
@@ -269,7 +270,9 @@ fn actual_mla_owner_batch_layer_entry() {
                             GlmOwnerBatchShape::new(count).unwrap(),
                             gpu.default_stream(),
                         )
-                        .expect("actual MLA wider preflight must support three/four owners");
+                        .expect(
+                            "actual MLA wider preflight must support three through eight owners",
+                        );
                 }
                 assert!(
                     gpu.trace().is_empty(),

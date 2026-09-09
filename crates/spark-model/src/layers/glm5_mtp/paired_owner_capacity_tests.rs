@@ -135,12 +135,12 @@ fn actual_three_owner_constructor_and_invalid_capacity_bounds() {
     gpu.clear();
     assert!(head.alloc_state_inner(&gpu).is_err());
     assert!(gpu.trace().is_empty());
-    for invalid in [0, 1, 5, usize::MAX] {
+    for invalid in [0, 1, 9, usize::MAX] {
         let gpu = TestGpu::new();
         let error = configured_owner_head(&gpu, true, false, Some(invalid))
             .err()
             .expect("invalid explicit capacity must fail");
-        assert!(format!("{error:#}").contains("capacity must be2..4"));
+        assert!(format!("{error:#}").contains("capacity must be2..8"));
         // Only the six fixture-supplied weights exist, no cache/slab allocation.
         assert_eq!(gpu.live_allocations().len(), 6);
         assert_eq!(gpu.trace().len(), 6);
@@ -168,4 +168,123 @@ fn actual_four_owner_slab_checks_its_full_extent_before_claiming_alias() {
     assert!(Pool::new(&gpu, 2044, &cache, 0, OwnerCapacity::new(4).unwrap()).is_err());
     assert_eq!(gpu.free_count(), 0);
     assert_eq!(gpu.live_allocations(), before);
+}
+
+#[test]
+fn actual_five_through_eight_private_capacity_and_last_slot_reuse() {
+    for count in 5..=8 {
+        let gpu = TestGpu::new();
+        let head = configured_owner_head(&gpu, true, true, Some(count))
+            .expect("actual private owner capacity must support five through eight");
+        let slab = head.paired.as_ref().unwrap().lock().slab;
+        assert_eq!(head.paired.as_ref().unwrap().lock().slots.len(), count);
+        assert_eq!(gpu.live_allocations()[&slab.0], count * SLOT_BYTES);
+        {
+            let cache = head.kv_cache.lock();
+            assert_eq!(cache.num_blocks(), count * 128);
+            assert_eq!(cache.num_free_blocks(), count * 128);
+            for (ptr, stride) in [
+                (
+                    cache.sparse_index_pool_ptr(0),
+                    cache.sparse_index_block_stride_bytes(0),
+                ),
+                (
+                    cache.sparse_index_tail_pool_ptr(0),
+                    cache.sparse_index_tail_block_stride_bytes(0),
+                ),
+            ] {
+                assert!(!ptr.is_null());
+                assert_eq!(gpu.live_allocations()[&ptr.0], count * 128 * stride);
+            }
+        }
+        let mut states: Vec<_> = (0..count)
+            .map(|_| head.alloc_state_inner(&gpu).unwrap())
+            .collect();
+        for (slot, state) in states.iter().enumerate() {
+            let lease = state.paired.as_ref().unwrap();
+            assert_eq!(lease.slot, slot);
+            assert_eq!(lease.slab, slab);
+            assert_eq!(state.block_table.len(), 128);
+            head.validate_paired_live(state, &gpu).unwrap();
+            for other in &states[..slot] {
+                assert!(
+                    state
+                        .block_table
+                        .iter()
+                        .all(|block| !other.block_table.contains(block))
+                );
+            }
+            gpu.memset(
+                slab.offset(slot * SLOT_BYTES),
+                0x40 + slot as u8,
+                SLOT_BYTES,
+            )
+            .unwrap();
+        }
+        assert_eq!(head.kv_cache.lock().num_free_blocks(), 0);
+        gpu.clear();
+        assert!(head.alloc_state_inner(&gpu).is_err());
+        assert!(gpu.trace().is_empty());
+        let last = count - 1;
+        let peers = gpu.read_span(slab, last * SLOT_BYTES).unwrap();
+        let blocks: Vec<_> = states
+            .iter()
+            .map(|state| state.block_table.clone())
+            .collect();
+        let generation = states[last].paired.as_ref().unwrap().generation;
+        head.free_state(&gpu, &mut states[last]).unwrap();
+        assert!(head.validate_paired_live(&states[last], &gpu).is_err());
+        assert_eq!(head.kv_cache.lock().num_free_blocks(), 128);
+        let replacement = head.alloc_state_inner(&gpu).unwrap();
+        let lease = replacement.paired.as_ref().unwrap();
+        assert_eq!(lease.slot, last);
+        assert!(lease.generation > generation);
+        assert!(
+            replacement
+                .block_table
+                .iter()
+                .all(|block| blocks[last].contains(block))
+        );
+        assert_eq!(gpu.read_span(slab, last * SLOT_BYTES).unwrap(), peers);
+        for (slot, state) in states[..last].iter().enumerate() {
+            assert_eq!(state.block_table, blocks[slot]);
+            head.validate_paired_live(state, &gpu).unwrap();
+        }
+        let all_bytes = gpu.read_span(slab, count * SLOT_BYTES).unwrap();
+        gpu.clear();
+        head.free_state(&gpu, &mut states[last]).unwrap();
+        assert!(
+            gpu.trace().is_empty(),
+            "old free has no replacement authority"
+        );
+        assert_eq!(gpu.read_span(slab, count * SLOT_BYTES).unwrap(), all_bytes);
+        head.validate_paired_live(&replacement, &gpu).unwrap();
+        assert_eq!(head.kv_cache.lock().num_free_blocks(), 0);
+    }
+}
+
+#[test]
+fn actual_eighth_owner_failed_retirement_retains_every_reserve() {
+    let gpu = TestGpu::new();
+    let head = configured_owner_head(&gpu, true, false, Some(8))
+        .expect("actual eight-owner head must construct before retirement fault");
+    let mut states: Vec<_> = (0..8)
+        .map(|_| head.alloc_state_inner(&gpu).unwrap())
+        .collect();
+    let views: Vec<_> = states
+        .iter()
+        .map(|state| state.block_table.clone())
+        .collect();
+    gpu.clear();
+    gpu.fail_sync_at.store(1, Ordering::Relaxed);
+    assert!(head.free_state(&gpu, &mut states[7]).is_err());
+    assert_eq!(head.kv_cache.lock().num_free_blocks(), 0);
+    gpu.clear();
+    assert!(head.free_state(&gpu, &mut states[7]).is_err());
+    assert!(head.alloc_state_inner(&gpu).is_err());
+    assert!(gpu.trace().is_empty());
+    for (slot, state) in states.iter().enumerate() {
+        assert_eq!(state.block_table, views[slot]);
+        assert_eq!(head.validate_paired_live(state, &gpu).is_ok(), slot != 7);
+    }
 }

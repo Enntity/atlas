@@ -28,7 +28,8 @@ impl MoeLayer {
         rows: usize,
     ) -> Result<()> {
         anyhow::ensure!(
-            matches!((total_rows, rows), (10, 5 | 10) | (15, 15) | (20, 20)),
+            matches!((total_rows, rows), (10, 5 | 10))
+                || (total_rows == rows && matches!(rows, 15 | 20 | 25 | 30 | 35 | 40)),
             "bounded temporal shared width"
         );
         let h = ctx.config.hidden_size;

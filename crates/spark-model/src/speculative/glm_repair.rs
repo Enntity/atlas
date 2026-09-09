@@ -55,7 +55,7 @@ pub trait GlmPairRepair: Send + Sync {
 pub trait GlmPairedHandoff: Send + Sync {
     /// Actual retained owner capacity, not free space or admission authority.
     fn owner_capacity(&self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<usize>;
-    /// Immutable facts for exactly three/four canonical physical owners.
+    /// Immutable facts for three through eight canonical physical owners.
     /// Only the shape-count prefix is populated; inactive facts are zero.
     fn validate_verify_owners(
         &self,
@@ -64,7 +64,7 @@ pub trait GlmPairedHandoff: Send + Sync {
         _tokens: &[[u32; 5]],
         _states: &[&dyn ProposerState],
         _ctx: &ForwardContext,
-    ) -> Result<[(u64, u64); 4]> {
+    ) -> Result<[(u64, u64); 8]> {
         anyhow::bail!("GLM owner-batch producer is unsupported")
     }
     fn begin_verify_owners(

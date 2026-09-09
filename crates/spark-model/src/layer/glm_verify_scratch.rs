@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Checked original-arena dead tails shared by pair and three/four-owner traversal.
+//! Checked original-arena dead tails shared by pair and three-through-eight-owner traversal.
 //! No allocation, FFN mode selection, or sequence/transaction authority.
 use super::{
     ForwardContext,
@@ -25,8 +25,8 @@ pub(crate) struct GlmVerifyScratch<'a> {
 impl<'a> GlmVerifyScratch<'a> {
     pub(crate) fn new(ctx: &ForwardContext<'a>, owners: usize) -> Result<Self> {
         ensure!(
-            (2..=4).contains(&owners),
-            "GLM scratch owner count must be2..4"
+            (2..=8).contains(&owners),
+            "GLM scratch owner count must be2..8"
         );
         // The bounded count makes every fixed-row byte product below fit usize;
         // real device span ends are separately checked for address overflow.

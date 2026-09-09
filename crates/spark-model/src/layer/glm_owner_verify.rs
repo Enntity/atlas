@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Explicit three/four-owner geometry; scratch is not transaction authority.
+//! Explicit three-through-eight-owner geometry; scratch is not transaction authority.
 use super::{ForwardContext, glm_verify_scratch::GlmVerifyScratch};
 use anyhow::{Result, ensure};
 
@@ -9,8 +9,8 @@ pub struct GlmOwnerBatchShape(usize);
 impl GlmOwnerBatchShape {
     pub fn new(owners: usize) -> Result<Self> {
         ensure!(
-            (3..=4).contains(&owners),
-            "GLM owner batch requires exactly3/4 owners"
+            (3..=8).contains(&owners),
+            "GLM owner batch requires three through eight owners"
         );
         Ok(Self(owners))
     }

@@ -18,8 +18,8 @@ pub(super) struct OwnerCapacity(usize);
 impl OwnerCapacity {
     pub(super) fn new(owners: usize) -> Result<Self> {
         ensure!(
-            (2..=4).contains(&owners),
-            "paired owner capacity must be2..4"
+            (2..=8).contains(&owners),
+            "paired owner capacity must be2..8"
         );
         Ok(Self(owners))
     }
@@ -33,7 +33,7 @@ impl OwnerCapacity {
     }
 
     pub(super) fn slab_bytes(self) -> usize {
-        // The private constructor bounds owners at four; SLOT_BYTES is fixed.
+        // The private constructor bounds owners at eight; SLOT_BYTES is fixed.
         self.0 * SLOT_BYTES
     }
 
@@ -249,7 +249,8 @@ impl Glm5MtpHead {
     pub(crate) fn validate_fixed_pair_slots(slots: [usize; 2], capacity: usize) -> Result<()> {
         let capacity = OwnerCapacity::new(capacity)?;
         ensure!(
-            matches!(slots, [0, 1] | [2, 3])
+            slots[0].is_multiple_of(2)
+                && slots[0].checked_add(1) == Some(slots[1])
                 && slots.into_iter().all(|slot| capacity.contains(slot)),
             "fixed pair requires a complete canonical physical owner group"
         );

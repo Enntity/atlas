@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn private_reserve_matches_actual_cache_and_slab_allocations() {
     for indexed in [false, true] {
-        for owners in 2..=4 {
+        for owners in 2..=8 {
             let gpu = TestGpu::new();
             let head = configured_owner_head(&gpu, true, indexed, Some(owners)).unwrap();
             let shared = [
@@ -34,7 +34,7 @@ fn private_reserve_matches_actual_cache_and_slab_allocations() {
 #[test]
 fn private_reserve_rejects_unqualified_capacity_context_and_shape() {
     let config = capacity_config(true);
-    for owners in [0, 1, 5, usize::MAX] {
+    for owners in [0, 1, 9, usize::MAX] {
         assert!(Glm5MtpHead::paired_private_reserve_bytes(&config, 2044, owners).is_err());
     }
     for context in [1, 2045, usize::MAX] {

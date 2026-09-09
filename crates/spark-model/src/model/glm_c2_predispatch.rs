@@ -31,7 +31,7 @@ impl GlmPairedExecution for TransformerModel {
         shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
         seqs: &mut [&mut SequenceState],
         tokens: &[[u32; 5]],
-    ) -> Result<[[u32; 5]; 4]> {
+    ) -> Result<[[u32; 5]; 8]> {
         self.owner_send_verify(shape, seqs, tokens)
     }
     fn finish_verify_owners(

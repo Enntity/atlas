@@ -129,7 +129,7 @@ impl Recorder {
         self.slab_for_owners(2)
     }
     pub fn slab_for_owners(&self, owners: usize) -> DevicePtr {
-        assert!((2..=4).contains(&owners));
+        assert!((2..=8).contains(&owners));
         let live = self.live.lock();
         let bytes = owners * 6 * ROW_BYTES;
         let found: Vec<_> = live.iter().filter(|(_, n)| **n == bytes).collect();

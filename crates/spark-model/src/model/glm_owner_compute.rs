@@ -35,6 +35,10 @@ impl TransformerModel {
             match shape.owners() {
                 3 => self.owner_finish_fixed::<3>(shape, seqs.try_into()?, tokens, accepted),
                 4 => self.owner_finish_fixed::<4>(shape, seqs.try_into()?, tokens, accepted),
+                5 => self.owner_finish_fixed::<5>(shape, seqs.try_into()?, tokens, accepted),
+                6 => self.owner_finish_fixed::<6>(shape, seqs.try_into()?, tokens, accepted),
+                7 => self.owner_finish_fixed::<7>(shape, seqs.try_into()?, tokens, accepted),
+                8 => self.owner_finish_fixed::<8>(shape, seqs.try_into()?, tokens, accepted),
                 _ => anyhow::bail!("invalid checked owner verdict shape"),
             }
         })()
@@ -83,7 +87,7 @@ impl TransformerModel {
         shape: GlmOwnerBatchShape,
         seqs: &mut [&mut SequenceState],
         tokens: &[[u32; 5]],
-    ) -> Result<[[u32; 5]; 4]> {
+    ) -> Result<[[u32; 5]; 8]> {
         ensure!(
             seqs.len() == shape.owners() && tokens.len() == shape.owners(),
             "owner model count mismatch"
@@ -91,6 +95,10 @@ impl TransformerModel {
         match shape.owners() {
             3 => self.owner_compute_fixed::<3>(shape, seqs.try_into()?, tokens),
             4 => self.owner_compute_fixed::<4>(shape, seqs.try_into()?, tokens),
+            5 => self.owner_compute_fixed::<5>(shape, seqs.try_into()?, tokens),
+            6 => self.owner_compute_fixed::<6>(shape, seqs.try_into()?, tokens),
+            7 => self.owner_compute_fixed::<7>(shape, seqs.try_into()?, tokens),
+            8 => self.owner_compute_fixed::<8>(shape, seqs.try_into()?, tokens),
             _ => anyhow::bail!("invalid checked owner shape"),
         }
     }
@@ -106,7 +114,7 @@ impl TransformerModel {
         ) -> Result<T>,
     ) -> Result<T> {
         ensure!(
-            matches!(N, 3 | 4) && seqs.iter().all(|s| s.proposer_state.is_some()),
+            (3..=8).contains(&N) && seqs.iter().all(|s| s.proposer_state.is_some()),
             "owner proposer state missing"
         );
         let mut states: [Box<dyn ProposerState>; N] = std::array::from_fn(|i| {
@@ -137,12 +145,13 @@ impl TransformerModel {
         shape: GlmOwnerBatchShape,
         seqs: &mut [&mut SequenceState; N],
         tokens: &[[u32; 5]],
-    ) -> Result<[[u32; 5]; 4]> {
+    ) -> Result<[[u32; 5]; 8]> {
         let context = self.glm_repair_context();
         let stream = self.gpu.default_stream();
         let mut workspace = GlmOwnerBatchWorkspace::new(&context, shape)?;
         let borrowed = seqs.each_ref().map(|seq| &**seq);
-        let stride = self.owner_compute_preflight(shape, &borrowed, tokens)?;
+        let metadata = self.owner_compute_preflight(shape, &borrowed, tokens)?;
+        let stride = metadata.stride;
         let max_blocks = self.max_blocks_per_seq as usize;
         let bases: [usize; N] = std::array::from_fn(|i| seqs[i].seq_len);
         let positions: [[usize; 5]; N] =
@@ -169,7 +178,7 @@ impl TransformerModel {
                 "owner allocated target cache maps alias"
             );
         }
-        let mut token_bytes = [0u8; 80];
+        let mut token_bytes = [0u8; 8 * 5 * 4];
         for owner in 0..N {
             for row in 0..5 {
                 self.embed(
@@ -205,7 +214,7 @@ impl TransformerModel {
                     bytes[offset..offset + 4].copy_from_slice(&(block as i32).to_le_bytes());
                 }
             }
-            let base = self.buffers.scratch().offset(32768 + owner * stride);
+            let base = self.buffers.scratch().offset(metadata.offset(owner)?);
             self.gpu.copy_h2d_async(&bytes[..stride], base, stream)?;
             contexts[owner].attn_metadata = Some(AttnMetadataDev {
                 positions: base,
@@ -277,10 +286,10 @@ impl TransformerModel {
                 stream,
             )?;
         }
-        let mut bytes = [0u8; 80];
+        let mut bytes = [0u8; 8 * 5 * 4];
         self.gpu
             .copy_d2h(self.buffers.scratch(), &mut bytes[..N * 20])?;
-        let mut predictions = [[0u32; 5]; 4];
+        let mut predictions = [[0u32; 5]; 8];
         for (owner, prediction) in predictions[..N].iter_mut().enumerate() {
             for (row, token) in prediction.iter_mut().enumerate() {
                 let offset = (owner * 5 + row) * 4;

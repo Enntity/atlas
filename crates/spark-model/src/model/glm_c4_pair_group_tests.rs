@@ -10,51 +10,74 @@ use std::sync::atomic::Ordering;
 #[path = "glm_owner_producer_tests.rs"]
 mod owner_producer;
 
+#[path = "glm_owner8_pair_tests.rs"]
+mod owner8_pair;
+
 #[path = "glm_owner_compute_tests.rs"]
 mod owner_compute;
+
+#[path = "glm_owner8_compute_tests.rs"]
+mod owner8_compute;
 
 #[path = "glm_owner_transport_tests.rs"]
 mod owner_transport;
 
+#[path = "glm_owner8_transport_tests.rs"]
+mod owner8_transport;
+
 #[path = "glm_owner_policy_tests.rs"]
 mod owner_policy;
 
-struct Four {
+struct Many<const N: usize> {
     f: Fixture,
-    states: [SequenceState; 4],
+    states: [SequenceState; N],
 }
+type Four = Many<4>;
+type Eight = Many<8>;
 
-impl Four {
-    fn prepared(rank: usize) -> (Self, [flow::History; 4]) {
-        Self::prepare_fixture(Fixture::new_pair_compute_with_owner_capacity(rank, 4))
+impl<const N: usize> Many<N> {
+    fn prepared(rank: usize) -> (Self, [flow::History; N]) {
+        let fixture = if N <= 4 {
+            Fixture::new_pair_compute_with_owner_capacity(rank, N)
+        } else {
+            Fixture::new_owner_compute_with_owner_capacity(rank, N)
+        };
+        Self::prepare_fixture(fixture)
     }
 
-    fn prepare_fixture(mut f: Fixture) -> (Self, [flow::History; 4]) {
-        let extra2 = f
-            .model
-            .alloc_sequence()
-            .expect("actual target/private owner2");
-        let extra3 = f
-            .model
-            .alloc_sequence()
-            .expect("actual target/private owner3");
-        assert_eq!((extra2.slot_idx, extra3.slot_idx), (2, 3));
+    fn prepare_fixture(mut f: Fixture) -> (Self, [flow::History; N]) {
+        assert!((3..=8).contains(&N));
+        assert_eq!(f.model.paired_owner_capacity().unwrap(), N);
         // Move the genuine first two states, leaving inert placeholders only
         // in the old two-slot fixture container. They never enter a Model call.
-        let [s0, s1] =
-            std::mem::replace(&mut f.seqs, std::array::from_fn(SequenceState::host_only));
-        let mut states = [s0, s1, extra2, extra3];
+        let first = std::mem::replace(&mut f.seqs, std::array::from_fn(SequenceState::host_only));
+        let mut first = first.into_iter();
+        let mut states: [SequenceState; N] = std::array::from_fn(|slot| {
+            let state = if slot < 2 {
+                first.next().unwrap()
+            } else {
+                f.model
+                    .alloc_sequence()
+                    .expect("actual extra target/private owner")
+            };
+            assert_eq!(state.slot_idx, slot);
+            state
+        });
         f.model
             .initialize_glm_pair_verification(GlmPairFfn::TwoK5)
             .unwrap();
         f.gpu.deterministic_logits.store(true, Ordering::Relaxed);
         f.gpu
-            .write_span(f.gpu.slab_for_owners(4), &vec![0xa5; 4 * 6 * ROW_BYTES]);
+            .write_span(f.gpu.slab_for_owners(N), &vec![0xa5; N * 6 * ROW_BYTES]);
         let prompts = [
             vec![1, 2, 3, 4],
             vec![6, 5, 4, 3, 2, 1],
             vec![2, 4, 6, 1, 3],
             vec![7, 6, 5, 4, 3, 2, 1],
+            vec![4, 0, 4, 0],
+            vec![5, 1, 5, 1, 5],
+            vec![6, 2, 6, 2, 6, 2],
+            vec![7, 3, 7, 3, 7, 3, 7],
         ];
         let histories = std::array::from_fn(|owner| {
             let seq = &mut states[owner];
@@ -128,7 +151,7 @@ impl Four {
         self.f.gpu.read_span(
             self.f
                 .gpu
-                .slab_for_owners(4)
+                .slab_for_owners(N)
                 .offset((owner * 6 + row) * ROW_BYTES),
             ROW_BYTES,
         )
@@ -173,7 +196,7 @@ struct PeerSnapshot {
     spans: Vec<(DevicePtr, Vec<u8>)>,
 }
 
-fn peer_snapshot(f: &Four, owner: usize) -> PeerSnapshot {
+fn peer_snapshot<const N: usize>(f: &Many<N>, owner: usize) -> PeerSnapshot {
     let seq = &f.states[owner];
     let private = flow::private(seq);
     let pointers =
@@ -191,7 +214,7 @@ fn peer_snapshot(f: &Four, owner: usize) -> PeerSnapshot {
             spans.push((ptr, f.f.gpu.read_live_span(ptr, 16 * 1024).unwrap()));
         }
     }
-    let slab = f.f.gpu.slab_for_owners(4).offset(owner * 6 * ROW_BYTES);
+    let slab = f.f.gpu.slab_for_owners(N).offset(owner * 6 * ROW_BYTES);
     spans.push((slab, f.f.gpu.read_live_span(slab, 6 * ROW_BYTES).unwrap()));
     let cache = f.f.model.kv_cache.lock();
     for block in &seq.block_table {
