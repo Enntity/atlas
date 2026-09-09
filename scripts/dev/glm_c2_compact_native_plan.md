@@ -112,6 +112,13 @@ not an automatic proof of GPU isolation or a replacement shutdown trap.
 Each graph arm runs existing C2 concurrent-answer checks (checker2155b752 executes
 four checks in pairs) and uneven C4 NIAH BEFORE and AFTER the matrix. The
 explicit C2 answer check must pass before timing, not merely a C4 tail check.
+Every quality phase also requires two concurrent actual tool-call requests with
+distinct natural-language tasks, function schemas and exact string arguments.
+The checker requires one parsed function call, exact name/duplicate-free JSON
+arguments and finish_reason=tool_calls; it never executes a tool or accepts
+reasoning/prose as a substitute. Initial gate uses supported specific tool_choice:
+forced named-tool correctness only, not automatic tool selection. A separate
+auto-choice gate remains necessary for a broader tool-selection claim.
 The existing benchmark uses literal148-token LRU workload,
 temperature0/seed1, ordinary EOS,256 requested tokens, C1..4, one retained warmup
 per width and three measured waves. Validate every warmup/measured request
