@@ -80,3 +80,14 @@ waves also pass. Overall gate exit0; both ranks exit0/OOMKilled=false, no used
 swap or remaining GPU applications. Ready head11311MiB/worker11752MiB available.
 Receipts use prefix `v28-compact-off-eager-`; this remains quality-only, with
 no throughput claim. Compact C2 ON requires its own quality qualification next.
+
+### v28 ON eager: compact C2 quality passed
+
+Same binary and recipe, compact bit1 on both ranks. All four answer checks,
+both C4 retrieval waves and both exact structured tool calls pass. The uneven
+retrieval requests exercise shrinking batches; the run is not speculative.
+Ready head11808MiB/worker11802MiB available. Overall gate exit0, both ranks
+exit0/OOMKilled=false, zero used swap and no remaining GPU applications.
+Receipts use prefix `v28-compact-on-eager-`. Both eager prerequisites are now
+qualified; same-binary warmed OFF/ON graph matrices are the next performance
+evidence. No native throughput improvement has yet been established.
