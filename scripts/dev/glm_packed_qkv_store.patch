@@ -1,0 +1,8 @@
+--- a/kernels/gb10/common/w4a16_gemv.cu
++++ b/kernels/gb10/common/w4a16_gemv.cu
+@@ -461,1 +461,1 @@
+-template <int MAX_M>
++template <int MAX_M, int OUTPUT_ROW_MULTIPLIER = 1>
+@@ -600,1 +600,1 @@
+-            C[(unsigned long long)t * N + n] = __float2bfloat16(r);
++            C[(unsigned long long)t * OUTPUT_ROW_MULTIPLIER * N + n] = __float2bfloat16(r);

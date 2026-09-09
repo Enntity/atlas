@@ -164,3 +164,16 @@ No reset, clock changes, wider memory policy or concurrent node work.
 Freeze source/plan/unchanged-dependency hashes before root review and execution.
 Archive all controls, expected failures and negative timings honestly. Neither
 this plan nor a standalone PASS activates M5/M10 in Atlas.
+
+## Root execution amendment: isolated source only
+
+Root reviewed the complete M5 fixture and approves a bounded standalone run.
+Apply `glm_packed_qkv_store.patch` only to a copied source tree, leaving the
+repository production kernel and all engine dispatch unchanged. The patch is
+exactly the template's default multiplier and final store-index change above.
+The fixture plus the patch is the reproducible candidate; retain copied source
+hashes and compare its two-line delta before compilation. Do not install this
+modified common source into a serving image from a standalone result.
+Use numerical and memory-sanitizer checks, then initial/fresh timing; no broad
+CPU suite is needed for this isolated source experiment. This time-boxed kernel
+measurement complements, rather than replaces, the concurrency driver work.
