@@ -138,3 +138,50 @@ zero used swap and no remaining GPU applications. Prefix
 required before calling the improvement reproducible. C2 remains below37tok/s;
 C6/C8 and concurrent MTP are not qualified, and the short workload is not proof
 of exact MiaAI benchmark parity.
+
+### v28 fresh-process repeats: gain reproduced, output-mix sensitivity exposed
+
+Both repeat arms completed with gate exit0 on 2026-09-09. Native binary and
+recipe are unchanged; the updated benchmark from123840bb retains text after
+timing on both arms. Same literal148/256 workload, one warm-up plus three
+measured waves per width. Prefixes `v28-compact-off-repeat-graphs-` and
+`v28-compact-on-repeat-graphs-` retain raw evidence in the campaign directory.
+
+| Concurrency | OFF repeat full-wall tok/s | ON repeat full-wall tok/s | OFF/ON client TTFT ms |
+| --- | ---: | ---: | ---: |
+| C1 | 13.428 | 13.477 | 462.318 /450.151 |
+| C2 | 19.025 | 29.746 | 704.896 /657.965 |
+| C3 | 34.764 | 35.008 | 954.203 /862.923 |
+| C4 | 47.116 | 47.273 | 1160.248 /1153.450 |
+
+C2's repeat median is56.35% above its OFF control, but do not interpret the
+larger gain as a new stable baseline. The unchanged workload metadata and
+retained output hashes expose two clusters:
+
+- Mixed output pairs (`72891e8f…` plus `f79f067e…`) measured25.446–25.566tok/s
+  across the first ON run and repeat; the repeat's mixed wave is25.455tok/s.
+- Identical output pairs (`72891e8f…` twice) measured29.746 and29.862tok/s in
+  the repeat. The first ON warm-up also had this pair and reached29.971tok/s;
+  the repeat warm-up instead had mixed outputs and reached25.547tok/s.
+
+This is an observed output-mix/throughput correlation, not a proven account of
+the scheduling or expert-routing cause. There is a reproducible conservative
+C2 improvement around34% (about19.0→25.5tok/s); do not advertise29.7 as general
+heterogeneous-request throughput. Longer, distinct-prompt workloads and a matched
+reference run remain necessary. C1/C3/C4 full-wall medians stay within0.7% of
+their repeat controls. These C1 results are nonspeculative, not the separate
+single-request MTP4 baseline.
+
+All80 repeat completions reached256 tokens; every retained UTF-8 byte count
+and SHA256 was recomputed successfully. Root inspected all seven distinct texts:
+coherent partial LRU implementations, not repetition collapse. Some docstrings
+refer to an `_dll`/`_list` attribute absent from the visible implementation, and
+the cap interrupts functions. This is limited coherence evidence, not complete
+program correctness, semantic equivalence, or bit-identical numerical output.
+
+Before/after answer and exact forced-tool checks, both uneven retrieval waves,
+cancellation and answer recovery pass for both repeats. Ready memory was
+head11732/worker11807MiB OFF and11746/11759MiB ON. Both ranks exited0 with
+OOMKilled=false after each arm; zero used swap and no remaining GPU applications.
+All four timed arms are now retained, with no node reset/crash. C2>=37, C6/C8,
+concurrent MTP and exact reference parity remain unmet/unproven.

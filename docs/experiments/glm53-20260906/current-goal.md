@@ -57,10 +57,19 @@ correctness for headline throughput. Do not copy the reference's memory fraction
 blindly: vLLM and Atlas have different allocations. No reboot/reset/clock/driver
 changes are part of this goal.
 
-Immediate work remains the committed default-off compact C2 FFN candidate,
-followed by real-model eager quality and same-binary warmed off/on C1..4.
-Next work must close measured gaps toward concurrent speculation and C6/C8,
-not accumulate inactive infrastructure or test counts as a substitute for results.
+The default-off compact C2 FFN candidate now has native eager quality and two
+fresh-process warmed OFF/ON C1..4 pairs. Conservative mixed-output C2 throughput
+improves about19.0→25.5tok/s; identical-output pairs can be faster, so the repeat's
+29.746 median is not a general heterogeneous-request baseline. See
+`v27-c2-compact-results.md` for full-wall rates, TTFT, quality and limitations.
+
+Next native-facing work extends actual independent-row KDA/MLA/grouped-MoE
+support through every draining width1..8, including missing MLA exports6/7/8.
+Preserve rollback/watchdog behavior and qualify bounded memory before C6/C8
+admission. Concurrent MTP also remains required: checked cold F0 transport is
+committed, but scheduler admission and actual supervised head/worker integration
+are not live. Neither standalone kernels nor inactive infrastructure complete
+the goal; require measured native serving gains and all quality checks.
 
 The user has now updated and resumed the actual product goal; `get_goal`
 confirmed this reference-parity objective on 2026-09-09. Every candidate must
