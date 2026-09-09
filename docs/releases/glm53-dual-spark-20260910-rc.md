@@ -1,10 +1,12 @@
 # GLM-5.3-Flash dual-Spark fork: release-candidate handoff
 
 **Draft test handoff, not a final qualification or model card.** Engine source
-`22b56144` includes the upstream merge at
-`6c5f17dab9c27ee2396aef1ac2501a17b201c715` and an OFF-by-default later-chunk
-BF16 projection experiment. The new build's native qualification is **PENDING**;
-its4K probe is in progress. Older-image results below do not qualify this build.
+`c853bafa` includes the upstream merge at
+`6c5f17dab9c27ee2396aef1ac2501a17b201c715`, an OFF-by-default later-chunk
+BF16 projection experiment, bounded sparse chunk admission, and explicit
+tool-thinking support. Both immutable images include the committed runtime
+template tree. The new build's native qualification is **PENDING**;
+its4K ON probe is in progress. Older-image results below do not qualify this build.
 
 ## Reproduce the bounded profiles
 
@@ -34,9 +36,18 @@ from an unresponsive GPU, driver, kernel or Docker daemon.
 
 | Artifact | Full SHA256 |
 | --- | --- |
-| Head image | `7029712412b5547a3c4eacf9162f1520cb6ca034ed78074f60223de721fe30bc` |
-| Worker image | `70ffa1aee2ab7c912c3e73985eb10cabc4e1aad6bf0397543bc8fcdfdae89996` |
-| Server ELF | `35afceb060ef2bca140f91891414ba3d525b7908797702ca5fc9766967cc19a8` |
+| Head image | `9fe4707fd90837cc82ecb5168802281d1abf2acb038248875caa4f34201e85a7` |
+| Worker image | `8a0bdf093cbb01f4e145e07c16e4c684aec60a5576cabfec5b2d1bbeb65e5aa6` |
+| Server ELF | `6211d3d70f9e5b22e9f4a7f276efffa1017ba042999aa91aeeaf2a5d7d6a4e15` |
+| GLM OpenAI runtime template | `d921f36103aa17db5fbf5891e4f7fe55a9080db450d7b8fb5c9833237c31bd16` |
+
+The server and all212 target kernels built without the stub gate; the bounded
+CPU-only native builder exited0, OOM=false. Both images were inspected by full
+ID; actual in-image server, guard and runtime GLM template hashes matched,
+and the working directory was `/`. Source archive SHA256 is
+`e14520752e9956083526006caa741efb57be6d7a34dfe293d939cf03157a22f3`.
+The source archive includes the complete runtime template tree separately from
+the ELF. These packaging checks do not establish model-quality success.
 
 The new `ATLAS_GLM_PAGED_PREFILL_BF16_GEMM=0|1` experiment affects only four
 later-chunk GLM BF16 projections; absent/OFF preserves scalar control. Its CPU
