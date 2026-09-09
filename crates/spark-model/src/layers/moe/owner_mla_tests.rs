@@ -6,6 +6,9 @@ use crate::layer::glm_pair_verify::{GlmPairFfn, GlmPairLayerInput, GlmPairWorksp
 use crate::layers::qwen3_attention::{HcHeadWeights, MlaWeights, Qwen3AttentionLayer};
 use crate::weight_map::AttentionWeights;
 
+#[path = "paged_glm_projection_tests.rs"]
+mod paged_projection;
+
 struct ForeignState;
 impl LayerState for ForeignState {
     fn as_any(&self) -> &dyn std::any::Any {

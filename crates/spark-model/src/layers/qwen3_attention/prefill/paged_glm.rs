@@ -17,6 +17,9 @@ use super::paged_mla::MlaPrefillArgs;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+#[path = "paged_glm_projection.rs"]
+mod projection;
+
 fn dense_selection_is_exact(sequence_end: usize, index_topk: usize) -> bool {
     index_topk > 0 && sequence_end <= index_topk
 }
@@ -62,6 +65,7 @@ impl Qwen3AttentionLayer {
             .checked_add(num_tokens)
             .ok_or_else(|| anyhow::anyhow!("GLM prefill sequence length overflow"))?;
         let use_dense = dense_selection_is_exact(sequence_end, ctx.config.index_topk);
+        let accelerated = projection::enabled(&ctx.config.model_type)?;
 
         let q_lora = mla.q_lora_rank as u32;
         let kv_lora = mla.kv_lora_rank as u32;
@@ -74,16 +78,16 @@ impl Qwen3AttentionLayer {
 
         // Q down/up projections. q_full is [N, nq, nope].
         let q_latent = ctx.buffers.ssm_ba();
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm_k,
+        self.paged_glm_projection(
             normed,
             &mla.wq_a,
             q_latent,
             n,
             q_lora,
             h,
+            ctx,
             stream,
+            accelerated,
         )?;
         ops::rms_norm(
             ctx.gpu,
@@ -111,16 +115,16 @@ impl Qwen3AttentionLayer {
             )?)
         };
         let q_full = ctx.buffers.qkv_output();
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm_k,
+        self.paged_glm_projection(
             q_latent,
             &mla.wq_b,
             q_full,
             n,
             nq * hd,
             q_lora,
+            ctx,
             stream,
+            accelerated,
         )?;
 
         // Absorb W_UK into Q. This is the same representation used by Atlas's
@@ -146,16 +150,16 @@ impl Qwen3AttentionLayer {
         // pools keeps this correctness milestone compatible with the existing
         // paged-attention kernels.
         let kv_latent = ctx.buffers.expert_gate_out();
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm_k,
+        self.paged_glm_projection(
             normed,
             &mla.wkv_a,
             kv_latent,
             n,
             kv_lora,
             h,
+            ctx,
             stream,
+            accelerated,
         )?;
         ops::rms_norm(
             ctx.gpu,
@@ -278,16 +282,16 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
         let o_out = ctx.buffers.norm_output();
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm_k,
+        self.paged_glm_projection(
             v_extracted,
             &mla.wo,
             o_out,
             n,
             h,
             nq * v_dim,
+            ctx,
             stream,
+            accelerated,
         )?;
         Ok(o_out)
     }
