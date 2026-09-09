@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Actual model producers and actual paired head; numerical kernels are recorded.
+#[path = "glm_c2_allocation_ownership_tests.rs"]
+mod allocation_ownership_tests;
 #[path = "glm_c2_handoff_cleanup_tests.rs"]
 mod cleanup_tests;
 #[path = "glm_c2_handoff_decode_fault_tests.rs"]
 mod decode_fault_tests;
 #[path = "glm_c2_eager_bootstrap_error_tests.rs"]
 mod eager_bootstrap_error_tests;
+#[path = "glm_c2_f1_ownership_tests.rs"]
+mod f1_ownership_tests;
 #[path = "glm_c2_handoff_test_fixture.rs"]
 mod fixture;
 #[path = "glm_c2_legacy_boundary_tests.rs"]
@@ -14,6 +18,12 @@ mod legacy_boundary_tests;
 mod predispatch_tests;
 #[path = "glm_c2_handoff_preflight_tests.rs"]
 mod preflight_tests;
+#[path = "glm_c2_retirement_fault_tests.rs"]
+mod retirement_fault_tests;
+#[path = "glm_c2_retirement_guard_tests.rs"]
+mod retirement_guard_tests;
+#[path = "glm_c2_retirement_profile_tests.rs"]
+mod retirement_profile_tests;
 #[path = "glm_c2_transport_boundary_tests.rs"]
 mod transport_boundary_tests;
 #[path = "glm_c2_transport_continuation_tests.rs"]
@@ -302,16 +312,17 @@ fn retired_slots_can_prime_in_reverse_target_slot_order() {
                 .prefill(&[1, 2, 3, 4], &mut f.seqs[owner], CALLER)
                 .unwrap();
         }
-        for seq in &mut f.seqs {
-            f.model.free_sequence(seq).unwrap();
+        for owner in [1, 0] {
+            f.model.free_sequence(&mut f.seqs[owner]).unwrap();
+        }
+        for owner in 0..2 {
+            f.seqs[owner] = f.model.alloc_sequence().unwrap();
+            assert_eq!(f.seqs[owner].slot_idx, owner);
         }
         for owner in [1, 0] {
-            let mut seq = crate::traits::SequenceState::host_only(owner);
-            seq.layer_states = vec![Box::new(crate::layer::EmptyLayerState)];
-            seq.disk_last_offloaded_per_layer = vec![0];
-            seq.proposer_state = Some(f.head.alloc_state(f.model.gpu.as_ref()).unwrap());
-            f.model.prefill(&[4, 3, 2, 1], &mut seq, CALLER).unwrap();
-            f.seqs[owner] = seq;
+            f.model
+                .prefill(&[4, 3, 2, 1], &mut f.seqs[owner], CALLER)
+                .unwrap();
         }
     }
 }
@@ -347,6 +358,7 @@ fn failed_retirement_cannot_restore_a_corrupted_mutable_block_view() {
             .unwrap()
             .block_table
             .clone();
+        f.model.decode(6, &mut f.seqs[1], CALLER).unwrap();
         let bytes = f.gpu.read_span(f.gpu.slab(), SLAB_BYTES);
         f.seqs[0]
             .proposer_state
@@ -375,7 +387,8 @@ fn failed_retirement_cannot_restore_a_corrupted_mutable_block_view() {
         assert!(f.head.alloc_state(f.model.gpu.as_ref()).is_err());
         assert!(f.gpu.trace().is_empty());
         assert_eq!(f.gpu.read_span(f.gpu.slab(), SLAB_BYTES), bytes);
-        f.model.decode(6, &mut f.seqs[1], CALLER).unwrap();
+        assert!(f.model.decode(6, &mut f.seqs[1], CALLER).is_err());
+        assert!(f.gpu.trace().is_empty());
     }
 }
 

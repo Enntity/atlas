@@ -134,15 +134,12 @@ fn pending_retirement_actual_model_reallocation_and_peer_continuation() {
             for retired_acceptance in [0, 4] {
                 let peer = 1 - victim;
                 let (mut f, mut histories) = flow::prepare(rank, [victim, peer]);
-                // Initial Fixture has real proposer leases but host-only target slots.
-                // Claim both actual free-list guards before exercising Model allocation;
-                // no fabricated guard or SSM numerical state is introduced.
+                // Fixture owners now originate from actual Model allocation.
                 assert_eq!(f.model.ssm_pool.max_slots, 2);
                 for owner in 0..2 {
-                    assert!(f.seqs[owner].ssm_slot.is_none());
-                    let guard = f.model.ssm_pool.claim_guarded().unwrap();
+                    let guard = f.seqs[owner].ssm_slot.as_ref().unwrap();
                     assert_eq!(guard.idx(), Some(owner));
-                    f.seqs[owner].ssm_slot = Some(guard);
+                    assert!(guard.belongs_to(&f.model.ssm_pool));
                 }
                 assert!(f.model.ssm_pool.claim_guarded().is_err());
                 let original = [blocks(&f.seqs[0]), blocks(&f.seqs[1])];
@@ -227,7 +224,9 @@ fn pending_retirement_actual_model_reallocation_and_peer_continuation() {
                         assert_eq!(blocks(&f.seqs[owner]), original[owner]);
                     }
                 }
-                for owner in [victim, peer] {
+                // Current selected allocation requires aligned private-lowest
+                // and target-LIFO indices; arbitrary two-idle churn is B2 work.
+                for owner in [1, 0] {
                     f.model.free_sequence(&mut f.seqs[owner]).unwrap();
                 }
                 let mut next = [

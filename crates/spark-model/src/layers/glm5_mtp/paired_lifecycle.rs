@@ -43,19 +43,26 @@ impl Pool {
         Ok(())
     }
 
-    fn begin_claim(&mut self, gpu: &dyn GpuBackend) -> Result<usize> {
+    pub(super) fn claim_candidate(&self, gpu: &dyn GpuBackend) -> Result<(usize, u64)> {
         self.backend(gpu)?;
+        ensure!(!self.producer_failed, "paired session is terminal");
         let index = self
             .slots
             .iter()
             .position(|s| !s.active && !s.failed)
             .context("paired pool has no reusable request slot")?;
-        let slot = &mut self.slots[index];
+        let slot = &self.slots[index];
         ensure!(slot.blocks.is_empty(), "unreleased paired block reserve");
         let generation = slot
             .generation
             .checked_add(1)
             .context("paired generation exhausted")?;
+        Ok((index, generation))
+    }
+
+    fn begin_claim(&mut self, gpu: &dyn GpuBackend) -> Result<usize> {
+        let (index, generation) = self.claim_candidate(gpu)?;
+        let slot = &mut self.slots[index];
         *slot = Slot {
             generation,
             active: true,

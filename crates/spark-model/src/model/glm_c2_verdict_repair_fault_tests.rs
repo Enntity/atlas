@@ -155,7 +155,6 @@ fn fault(rank: usize, owner: usize, a: usize, boundary: Boundary) {
             .read_span(f.gpu.slab().offset(owner * 6 * ROW_BYTES), 6 * ROW_BYTES),
         failed_slab
     );
-    assert!(f.model.free_sequence(&mut f.seqs[owner]).is_err());
     assert!(f.head.alloc_state(f.model.gpu.as_ref()).is_err());
     f.model.free_sequence(&mut f.seqs[peer]).unwrap();
     let mut replacement = f.head.alloc_state(f.model.gpu.as_ref()).unwrap();
@@ -178,6 +177,15 @@ fn fault(rank: usize, owner: usize, a: usize, boundary: Boundary) {
     f.head
         .free_state(f.model.gpu.as_ref(), replacement.as_mut())
         .unwrap();
+    // Keep detached-peer continuation/reuse before the distinct terminal
+    // selected Model cleanup error, rather than trying to recover after it.
+    let free = f.head.paired_test_free_blocks();
+    f.gpu.clear();
+    assert!(f.model.free_sequence(&mut f.seqs[owner]).is_err());
+    assert!(f.model.alloc_sequence().is_err());
+    assert!(f.gpu.trace().is_empty());
+    assert_eq!(f.head.paired_test_free_blocks(), free);
+    assert!(!f.model.ssm_pool.slot_is_free(owner));
 }
 
 #[test]

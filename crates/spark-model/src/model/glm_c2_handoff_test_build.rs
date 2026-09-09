@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Shared actual-head fixture construction; default paired ordering is retained.
 use super::*;
+use crate::traits::Model;
 
 impl Fixture {
     pub fn new(rank: usize) -> Self {
@@ -139,11 +140,17 @@ impl Fixture {
         model.mtp_hidden_save = model.gpu.alloc(ROW_BYTES).unwrap();
         model.proposer = Some(head.clone());
         let seqs = std::array::from_fn(|slot| {
+            if paired {
+                let mut seq = model.alloc_sequence().unwrap();
+                assert_eq!(seq.slot_idx, slot);
+                seq.prompt_len = 4;
+                return seq;
+            }
             let mut seq = SequenceState::host_only(slot);
             seq.prompt_len = 4;
             seq.layer_states = vec![Box::new(EmptyLayerState)];
             seq.disk_last_offloaded_per_layer = vec![0];
-            if paired || slot == 0 {
+            if slot == 0 {
                 seq.proposer_state = Some(head.alloc_state(model.gpu.as_ref()).unwrap());
             }
             seq

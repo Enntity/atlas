@@ -30,7 +30,7 @@ impl TransformerModel {
         let latched = self
             .paired_handoff()
             .context("paired transport capability missing")
-            .and_then(|capability| capability.fail_transport(self.gpu.as_ref()));
+            .and_then(|capability| capability.fail_session(self.gpu.as_ref()));
         error.context(format!(
             "paired issued command is terminal; latch={latched:?}"
         ))

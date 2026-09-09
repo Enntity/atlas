@@ -8,9 +8,9 @@ use crate::traits::{Model, SequenceState};
 
 fn retire_and_bootstrap(f: &mut Fixture, owner: usize) -> SequenceState {
     for i in 0..2 {
-        let guard = f.model.ssm_pool.claim_guarded().unwrap();
+        let guard = f.seqs[i].ssm_slot.as_ref().unwrap();
         assert_eq!(guard.idx(), Some(i));
-        f.seqs[i].ssm_slot = Some(guard);
+        assert!(guard.belongs_to(&f.model.ssm_pool));
     }
     let original: std::collections::BTreeSet<_> = flow::private(&f.seqs[owner])
         .block_table

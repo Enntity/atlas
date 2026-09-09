@@ -183,12 +183,6 @@ fn boundary_is_terminal(boundary: Boundary) {
                 )),
                 "failed request retry must reject before target/capture/primer/publication work"
             );
-            // Retirement must not erase a target/capture error which escaped
-            // before the private primer's own failure handling was entered.
-            assert!(
-                f.model.free_sequence(&mut f.seqs[0]).is_err(),
-                "producer error must quarantine the actual lease, not only invalidate target length"
-            );
             assert!(f.head.alloc_state(f.model.gpu.as_ref()).is_err());
             assert_peer_unchanged(&f, &peer_bytes, &peer_blocks);
             // Retiring only the healthy peer yields precisely one reusable
@@ -209,6 +203,15 @@ fn boundary_is_terminal(boundary: Boundary) {
             f.head
                 .free_state(f.model.gpu.as_ref(), replacement.as_mut())
                 .unwrap();
+            // Healthy-owner control above precedes the separately terminal
+            // Model cleanup error; that error now closes the whole session.
+            let free = f.head.paired_test_free_blocks();
+            f.gpu.clear();
+            assert!(f.model.free_sequence(&mut f.seqs[0]).is_err());
+            assert!(f.model.alloc_sequence().is_err());
+            assert!(f.gpu.trace().is_empty());
+            assert_eq!(f.head.paired_test_free_blocks(), free);
+            assert!(!f.model.ssm_pool.slot_is_free(0));
             assert!(
                 !f.gpu
                     .trace()

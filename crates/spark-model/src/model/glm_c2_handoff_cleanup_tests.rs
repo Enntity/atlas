@@ -93,7 +93,74 @@ fn free_count(events: &[Event], ptr: DevicePtr) -> usize {
         .count()
 }
 
+fn healthy_cleanup_control() {
+    let mut f = primed_with_cleanup_pool();
+    let slab = f.gpu.slab();
+    let peer_blocks: BTreeSet<_> = private(&f.seqs[1]).block_table.iter().copied().collect();
+    let other_blocks: BTreeSet<_> = private(&f.seqs[0]).block_table.iter().copied().collect();
+    // A successful independent control can publish, retire and reuse its reserve.
+    f.model.decode(6, &mut f.seqs[1], CALLER).unwrap();
+    f.model.free_sequence(&mut f.seqs[1]).unwrap();
+    f.model.free_sequence(&mut f.seqs[1]).unwrap();
+    let target = f.model.ssm_pool.claim_guarded().unwrap();
+    assert_eq!(
+        target.idx(),
+        Some(1),
+        "only the healthy target slot returns"
+    );
+    assert!(f.model.ssm_pool.claim_guarded().is_err());
+    assert!(!f.model.ssm_pool.claim_specific(0));
+    drop(target);
+    let target = f.model.ssm_pool.claim_guarded().unwrap();
+    assert_eq!(
+        target.idx(),
+        Some(1),
+        "guard Drop/reclaim cannot reopen slot0"
+    );
+    assert!(f.model.ssm_pool.claim_guarded().is_err());
+    assert!(!f.model.ssm_pool.slot_is_free(0));
+    drop(target);
+    let mut replacement = f.head.alloc_state(f.model.gpu.as_ref()).unwrap();
+    let blocks: BTreeSet<_> = replacement
+        .as_any()
+        .downcast_ref::<Glm5MtpProposerState>()
+        .unwrap()
+        .block_table
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(
+        blocks, peer_blocks,
+        "only the healthy peer reserve may be returned"
+    );
+    assert!(blocks.is_disjoint(&other_blocks));
+    assert!(
+        f.head.alloc_state(f.model.gpu.as_ref()).is_err(),
+        "no duplicate block return or other live-slot reuse"
+    );
+    f.head
+        .free_state(f.model.gpu.as_ref(), replacement.as_mut())
+        .unwrap();
+    assert_eq!(
+        free_count(&f.gpu.trace(), slab),
+        0,
+        "per-sequence cleanup never owns the slab"
+    );
+    let free = f.model.ssm_pool.free_slots.lock();
+    assert_eq!(
+        free.iter().filter(|&&slot| slot == 1).count(),
+        1,
+        "healthy SSM slot returns once"
+    );
+    assert_eq!(
+        free.iter().filter(|&&slot| slot == 0).count(),
+        0,
+        "other live target SSM slot remains held"
+    );
+}
+
 fn cleanup_failure_quarantines(zero: bool) {
+    healthy_cleanup_control();
     let ordinal = cleanup_failure_ordinal(zero);
     let mut f = primed_with_cleanup_pool();
     let slab = f.gpu.slab();
@@ -158,65 +225,17 @@ fn cleanup_failure_quarantines(zero: bool) {
         !f.model.ssm_pool.slot_is_free(1),
         "peer SlotGuard is still exclusive"
     );
-    // The healthy peer can still publish, retire, and return exactly its reserve.
-    f.model.decode(6, &mut f.seqs[1], CALLER).unwrap();
-    f.model.free_sequence(&mut f.seqs[1]).unwrap();
-    f.model.free_sequence(&mut f.seqs[1]).unwrap();
-    let target = f.model.ssm_pool.claim_guarded().unwrap();
-    assert_eq!(
-        target.idx(),
-        Some(1),
-        "only the healthy target slot returns"
-    );
+    // An actual Model cleanup error makes the entire selected session terminal.
+    f.gpu.clear();
+    assert!(f.model.decode(6, &mut f.seqs[1], CALLER).is_err());
+    assert!(f.model.free_sequence(&mut f.seqs[1]).is_err());
+    assert!(f.model.alloc_sequence().is_err());
+    assert!(f.gpu.trace().is_empty());
+    assert_eq!(f.head.paired_test_free_blocks(), 0);
     assert!(f.model.ssm_pool.claim_guarded().is_err());
-    assert!(!f.model.ssm_pool.claim_specific(0));
-    drop(target);
-    let target = f.model.ssm_pool.claim_guarded().unwrap();
-    assert_eq!(
-        target.idx(),
-        Some(1),
-        "guard Drop/reclaim cannot reopen slot0"
-    );
-    assert!(f.model.ssm_pool.claim_guarded().is_err());
-    assert!(!f.model.ssm_pool.slot_is_free(0));
-    drop(target);
-    let mut replacement = f.head.alloc_state(f.model.gpu.as_ref()).unwrap();
-    let blocks: BTreeSet<_> = replacement
-        .as_any()
-        .downcast_ref::<Glm5MtpProposerState>()
-        .unwrap()
-        .block_table
-        .iter()
-        .copied()
-        .collect();
-    assert_eq!(
-        blocks, peer_blocks,
-        "only the healthy peer reserve may be returned"
-    );
-    assert!(blocks.is_disjoint(&failed_blocks));
-    assert!(
-        f.head.alloc_state(f.model.gpu.as_ref()).is_err(),
-        "no duplicate block return or failed-slot reuse"
-    );
-    f.head
-        .free_state(f.model.gpu.as_ref(), replacement.as_mut())
-        .unwrap();
-    assert_eq!(
-        free_count(&f.gpu.trace(), slab),
-        0,
-        "per-sequence cleanup never owns the slab"
-    );
-    let free = f.model.ssm_pool.free_slots.lock();
-    assert_eq!(
-        free.iter().filter(|&&slot| slot == 1).count(),
-        1,
-        "healthy SSM slot returns once"
-    );
-    assert_eq!(
-        free.iter().filter(|&&slot| slot == 0).count(),
-        0,
-        "failed target SSM slot stays quarantined until whole-pool teardown"
-    );
+    for seq in &mut f.seqs {
+        assert!(seq.ssm_slot_idx().is_none());
+    }
 }
 
 #[test]
@@ -249,6 +268,7 @@ fn actual_model_teardown_closes_retained_head_and_frees_slab_once() {
     // refusal proves closure rather than merely an exhausted two-slot pool.
     for seq in &mut f.seqs {
         f.model.free_sequence(seq).unwrap();
+        seq.ssm_slot = None; // Drop the neutralized guard's external pool Arc.
     }
     f.gpu.clear();
     f.model.teardown().unwrap();
@@ -299,6 +319,7 @@ fn actual_model_teardown_closes_retained_head_and_frees_slab_once() {
 
 fn teardown_event_ordinal(free: bool) -> usize {
     let mut f = Fixture::new(1);
+    detach_target_guards_for_teardown(&mut f);
     let slab = f.gpu.slab();
     f.gpu.clear();
     f.model.teardown().unwrap();
@@ -321,6 +342,7 @@ fn teardown_event_ordinal(free: bool) -> usize {
 fn teardown_failure_is_terminal(free: bool) {
     let ordinal = teardown_event_ordinal(free);
     let mut f = Fixture::new(1);
+    detach_target_guards_for_teardown(&mut f);
     let external = f.head.clone();
     let slab = f.gpu.slab();
     let before = f.gpu.read_span(slab, SLAB_BYTES);
@@ -387,6 +409,15 @@ fn teardown_failure_is_terminal(free: bool) {
             0,
             "dropping the retained head/model must not sweep uncertain owners"
         );
+    }
+}
+
+// These tests retain private head leases across close, but whole-pool teardown
+// requires no external SlotGuard Arc. Neutralize without recycling target slots.
+fn detach_target_guards_for_teardown(f: &mut Fixture) {
+    for seq in &mut f.seqs {
+        let mut guard = seq.ssm_slot.take().unwrap();
+        assert_eq!(guard.take(), Some(seq.slot_idx));
     }
 }
 

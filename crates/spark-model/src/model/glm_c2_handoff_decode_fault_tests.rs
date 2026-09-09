@@ -242,7 +242,6 @@ fn fails_closed(boundary: Boundary) {
                 f.gpu.trace().is_empty(),
                 "failed bonus bytes are not a publishable view"
             );
-            assert!(f.model.free_sequence(&mut f.seqs[victim]).is_err());
             assert!(f.head.alloc_state(f.model.gpu.as_ref()).is_err());
             saved.unchanged(&f, peer);
             // Healthy peer progresses through the actual owned-tail repair and
@@ -275,6 +274,15 @@ fn fails_closed(boundary: Boundary) {
             f.head
                 .free_state(f.model.gpu.as_ref(), replacement.as_mut())
                 .unwrap();
+            // Producer failure is owner-local; the later selected cleanup
+            // error is session-terminal, after the healthy peer control.
+            let free = f.head.paired_test_free_blocks();
+            f.gpu.clear();
+            assert!(f.model.free_sequence(&mut f.seqs[victim]).is_err());
+            assert!(f.model.alloc_sequence().is_err());
+            assert!(f.gpu.trace().is_empty());
+            assert_eq!(f.head.paired_test_free_blocks(), free);
+            assert!(!f.model.ssm_pool.slot_is_free(victim));
         }
     }
 }

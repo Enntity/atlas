@@ -9,6 +9,9 @@ use gpu::TestGpu;
 use std::sync::atomic::Ordering;
 
 impl Glm5MtpHead {
+    pub(crate) fn paired_test_free_blocks(&self) -> usize {
+        self.kv_cache.lock().num_free_blocks()
+    }
     pub(crate) fn paired_test_kv_rows(
         &self,
         state: &dyn ProposerState,

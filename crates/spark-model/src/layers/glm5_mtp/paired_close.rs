@@ -7,14 +7,13 @@ impl Glm5MtpHead {
         &self,
         state: &mut dyn ProposerState,
         gpu: &dyn GpuBackend,
-    ) -> Result<()> {
+    ) -> Result<Option<usize>> {
         let state = state
             .as_any_mut()
             .downcast_mut::<Glm5MtpProposerState>()
             .context("paired retirement requires actual GLM state")?;
         let mut pool = self.paired.as_ref().context("paired pool missing")?.lock();
-        pool.begin_retire(state, gpu)?;
-        Ok(())
+        pool.begin_retire(state, gpu)
     }
 
     pub(super) fn paired_close(&self, gpu: &dyn GpuBackend, secondary_stream: u64) -> Result<()> {

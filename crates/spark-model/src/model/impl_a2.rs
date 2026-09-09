@@ -460,6 +460,9 @@ impl TransformerModel {
         // `claim_slot()` from a free-list pop in matched order. Defensive
         // bail if they ever diverge so we fail fast rather than corrupt KV.
         if cmd == 0xFFFFFFF1 {
+            if self.paired_handoff().is_some() {
+                return self.paired_replace_worker_slot(slots, slot_idx);
+            }
             if let Some(mut old) = slots[slot_idx].take() {
                 self.free_sequence(&mut old)?;
             }

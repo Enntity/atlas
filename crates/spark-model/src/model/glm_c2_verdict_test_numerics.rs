@@ -39,6 +39,9 @@ impl Body {
 
 impl TransformerLayer for Body {
     fn alloc_state(&self, _: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
+        if self.record.record_state_allocations.load(Ordering::Relaxed) {
+            self.record.event(Event::AllocState(self.target))?;
+        }
         Ok(Box::new(EmptyLayerState))
     }
     fn supports_mla_kv_only(&self) -> bool {

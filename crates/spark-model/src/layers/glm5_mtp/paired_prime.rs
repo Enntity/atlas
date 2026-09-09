@@ -59,7 +59,15 @@ impl GlmPairedHandoff for Glm5MtpHead {
     ) -> Result<(u64, u64)> {
         self.paired_validate_propose(input, seed, state, ctx, stream)
     }
-    fn fail_transport(&self, gpu: &dyn GpuBackend) -> Result<()> {
+    fn validate_allocation(&self, gpu: &dyn GpuBackend) -> Result<usize> {
+        let pool = self
+            .paired
+            .as_ref()
+            .context("paired allocation pool missing")?
+            .lock();
+        pool.claim_candidate(gpu).map(|(index, _)| index)
+    }
+    fn fail_session(&self, gpu: &dyn GpuBackend) -> Result<()> {
         let mut pool = self
             .paired
             .as_ref()
@@ -144,7 +152,7 @@ impl GlmPairedHandoff for Glm5MtpHead {
         );
         Ok(())
     }
-    fn retire(&self, state: &mut dyn ProposerState, gpu: &dyn GpuBackend) -> Result<()> {
+    fn retire(&self, state: &mut dyn ProposerState, gpu: &dyn GpuBackend) -> Result<Option<usize>> {
         self.paired_retire(state, gpu)
     }
     fn close(&self, gpu: &dyn GpuBackend, secondary_stream: u64) -> Result<()> {

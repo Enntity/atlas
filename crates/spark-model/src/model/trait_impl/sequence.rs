@@ -106,18 +106,8 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
-        let paired = self.paired_handoff();
-        if let Some(capability) = paired
-            && let Some(state) = seq.proposer_state.as_mut()
-        {
-            if let Err(error) = capability.retire(state.as_mut(), self.gpu.as_ref()) {
-                // A failed selected owner must not return its target slot later
-                // through SlotGuard::drop, even when retirement failed early.
-                if let Some(guard) = seq.ssm_slot.as_mut() {
-                    guard.take();
-                }
-                return Err(error);
-            }
+        if self.paired_handoff().is_some() {
+            return self.free_paired_sequence(seq);
         }
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
@@ -141,31 +131,11 @@ impl TransformerModel {
         let slot_to_release = if slot_reused_by_compact { None } else { taken };
         if let Some(slot) = slot_to_release {
             let stream = self.gpu.default_stream();
-            if paired.is_some()
-                && let Err(error) = self.gpu.stream_wait_event(stream, self.secondary_event)
-            {
-                return Err(self.paired_failed_transaction(seq, error));
-            }
-            let mut paired_error = None;
             if let Err(e) = self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream) {
                 tracing::error!("free_sequence: ssm_pool.zero_slot({slot}): {e:#}");
-                if paired.is_some() {
-                    paired_error = Some(e);
-                }
             }
             if let Err(e) = self.gpu.synchronize(stream) {
                 tracing::error!("free_sequence: gpu.synchronize after zero_slot({slot}): {e:#}");
-                if paired.is_some() && paired_error.is_none() {
-                    paired_error = Some(e);
-                }
-            }
-            if let Some(error) = paired_error {
-                if let Some(state) = seq.proposer_state.as_mut() {
-                    paired
-                        .expect("selected cleanup")
-                        .quarantine(state.as_mut(), self.gpu.as_ref())?;
-                }
-                return Err(error.context("paired sequence cleanup failed; lease quarantined"));
             }
             self.ssm_pool.release_slot(slot);
         }

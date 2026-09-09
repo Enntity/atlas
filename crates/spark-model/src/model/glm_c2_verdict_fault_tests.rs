@@ -5,6 +5,7 @@ use super::{fixture::*, verdict_continuation_tests as flow};
 use crate::speculative::DraftProposer;
 use crate::traits::Model;
 use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
@@ -181,6 +182,7 @@ struct Peer {
     private: usize,
     blocks: BTreeSet<u32>,
     kv: Vec<Vec<u8>>,
+    pointers: Vec<(DevicePtr, DevicePtr)>,
     slab: Vec<u8>,
 }
 impl Peer {
@@ -192,6 +194,14 @@ impl Peer {
             private: state.seq_len,
             blocks: state.block_table.iter().copied().collect(),
             kv: flow::bytes(f, owner, state.seq_len),
+            pointers: f
+                .head
+                .paired_test_kv_rows(
+                    f.seqs[owner].proposer_state.as_ref().unwrap().as_ref(),
+                    f.model.gpu.as_ref(),
+                    state.seq_len,
+                )
+                .unwrap(),
             slab: f
                 .gpu
                 .read_span(f.gpu.slab().offset(owner * 6 * ROW_BYTES), 6 * ROW_BYTES),
@@ -206,7 +216,12 @@ impl Peer {
             state.block_table.iter().copied().collect::<BTreeSet<_>>(),
             self.blocks
         );
-        assert_eq!(flow::bytes(f, owner, self.private), self.kv);
+        // Saved actual canonical addresses remain a byte oracle after Model
+        // cleanup terminally revokes both leases; do not request new authority.
+        for ((k, v), expected) in self.pointers.iter().zip(&self.kv) {
+            assert_eq!(f.gpu.read_span(*k, 1024), *expected);
+            assert_eq!(f.gpu.read_span(*v, 1024), *expected);
+        }
         assert_eq!(
             f.gpu
                 .read_span(f.gpu.slab().offset(owner * 6 * ROW_BYTES), 6 * ROW_BYTES),

@@ -53,6 +53,8 @@ pub trait GlmPairRepair: Send + Sync {
 
 /// Optional GLM-only request-owned path; legacy and other proposers lack it.
 pub trait GlmPairedHandoff: Send + Sync {
+    /// Read-only candidate identity, not a reservation or published lease.
+    fn validate_allocation(&self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<usize>;
     fn validate_verify(
         &self,
         input: &crate::model::GlmPairedInput<'_>,
@@ -68,8 +70,8 @@ pub trait GlmPairedHandoff: Send + Sync {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<(u64, u64)>;
-    /// Latch an issued command failure even before a local producer exists.
-    fn fail_transport(&self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()>;
+    /// Latch a selected ownership/issued-command failure before any producer exists.
+    fn fail_session(&self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()>;
     fn commit_target(
         &self,
         input: &crate::model::GlmPairedInput<'_>,
@@ -114,7 +116,7 @@ pub trait GlmPairedHandoff: Send + Sync {
         &self,
         state: &mut dyn ProposerState,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
-    ) -> Result<()>;
+    ) -> Result<Option<usize>>;
     fn close(&self, gpu: &dyn spark_runtime::gpu::GpuBackend, secondary_stream: u64) -> Result<()>;
     fn propose_owned(
         &self,

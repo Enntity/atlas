@@ -11,7 +11,7 @@ use anyhow::{Result, ensure};
 use parking_lot::Mutex;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelArg, KernelHandle, mock::MockGpuBackend};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -37,6 +37,8 @@ pub(super) enum Event {
     EndCapture(u64),
     AbortCapture(u64),
     LaunchGraph(u64, u64),
+    DestroyGraph(u64),
+    AllocState(bool),
     Memset(DevicePtr, usize, u64),
     Kernel(String, Vec<DevicePtr>, u64),
     Target(usize, usize, u64),
@@ -52,10 +54,12 @@ pub(super) struct Recorder {
     names: Mutex<Vec<String>>,
     eh_pairs: Mutex<Vec<(u8, u8)>>,
     next_handle: AtomicUsize,
+    graphs: Mutex<HashSet<u64>>,
     pub fail: AtomicUsize,
     pub reuse_freed: AtomicBool,
     pub capturing: AtomicBool,
     pub capture_handles: AtomicBool,
+    pub record_state_allocations: AtomicBool,
     pub sweeps: AtomicUsize,
     pub deterministic_logits: AtomicBool,
 }
@@ -193,13 +197,24 @@ impl GpuBackend for Gpu {
         } else {
             0
         };
+        if handle != 0 {
+            assert!(self.0.graphs.lock().insert(handle));
+        }
         Ok(spark_runtime::gpu::GraphHandle(handle))
     }
     fn abort_capture_if_active(&self, stream: u64) {
         let _ = self.0.event(Event::AbortCapture(stream));
     }
     fn launch_graph(&self, graph: spark_runtime::gpu::GraphHandle, stream: u64) -> Result<()> {
+        ensure!(
+            self.0.graphs.lock().contains(&graph.0),
+            "foreign/dead graph"
+        );
         self.0.event(Event::LaunchGraph(graph.0, stream))
+    }
+    fn destroy_graph(&self, graph: spark_runtime::gpu::GraphHandle) -> Result<()> {
+        ensure!(self.0.graphs.lock().remove(&graph.0), "foreign/dead graph");
+        self.0.event(Event::DestroyGraph(graph.0))
     }
     fn sweep_unreleased(&self) -> usize {
         self.0.sweeps.fetch_add(1, Ordering::Relaxed);
