@@ -36,6 +36,10 @@ and memcheck180s/4GiB no-swap container bounds. CUDA13, `-O3 --fmad=false`,
 Evidence: `joint-shared-native-{build,timing,memcheck}.log`,
 `joint-shared-source.tgz`. This warrants explicit opt-in serving integration;
 no full-model or tok/s improvement is established by this experiment.
+Subsequent explicit serving integration `290cf248` is separately qualified in
+`shared-m10-serving-results.md`: repeated C2 full-wall36.76–36.96 versus
+same-binary Joint34.243. Do not substitute the standalone1.36–1.39x FFN ratio
+for that measured serving improvement.
 
 ## First-draft BF16 vocabulary projection
 

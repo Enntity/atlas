@@ -131,6 +131,15 @@ and coding acceptance histograms. Both ranks confirm actual Joint E6 commits
 and normal release/exit. C2 remains below37 and selected MTP capacity remains
 two, not reference parity. Same-kernel shared-expert batching is the next
 exact-arithmetic candidate; no gain from it is claimed yet.
+That candidate is now implemented in `290cf248` and qualified: same-binary
+Joint C2=34.243 versus shared-M10 fresh-process medians36.957/36.763 aggregate
+full-wall tok/s (7.4–7.9% gain). C1 remains27.2–27.3. Quality, retained outputs,
+coding acceptance histograms, actual paired release and both-rank exit0 match;
+zero observed swap/OOMs. See `shared-m10-serving-results.md`. The conservative
+full-wall C2 target37 remains unmet despite decode-window rates38.0–38.2.
+The next source slice is capacity-aware MTP owner storage, still with selected
+serving capped at2; `mtp-c3-c4-next-plan.md` distinguishes correct additional
+residency from the later cross-request FFN batching needed for throughput.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.
