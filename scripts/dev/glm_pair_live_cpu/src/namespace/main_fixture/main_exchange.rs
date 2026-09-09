@@ -86,6 +86,13 @@ pub(super) fn run(
             body: wire::Body::DrainRequest(request),
         };
         write_frame(&mut nodes[0].socket, request)?;
+        if mode == "registered-drain-threaded" {
+            // Test-only scheduling barrier, after both real registrations and
+            // the actual drain command. No synthetic ticket or release frame.
+            for source in sources {
+                std::fs::write(source.join("thread-handoff"), b"handoff\n")?;
+            }
+        }
         if mode == "registered-drain-replay" {
             let deadline = identity::boot_time_ms()? + 3000;
             loop {
@@ -242,7 +249,12 @@ pub(super) fn run(
         node.finish_expected(
             if matches!(
                 mode,
-                "valid" | "delayed" | "reused-session" | "registered-valid" | "registered-drain"
+                "valid"
+                    | "delayed"
+                    | "reused-session"
+                    | "registered-valid"
+                    | "registered-drain"
+                    | "registered-drain-threaded"
             ) {
                 0
             } else {

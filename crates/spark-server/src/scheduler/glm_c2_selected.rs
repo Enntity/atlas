@@ -28,6 +28,7 @@ pub(crate) fn run_selected(
     spontaneous_think_budget: u32,
     sched: SchedCtx,
 ) -> ! {
+    owner.bind_execution_thread();
     let tokens = Tokens {
         eos: eos_tokens,
         think_end: think_end_token,

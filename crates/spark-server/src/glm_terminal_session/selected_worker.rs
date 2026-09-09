@@ -9,6 +9,7 @@ impl SelectedModel {
         if self.rank != 1 {
             crate::glm_terminal_session::terminate();
         }
+        self.bind_execution_thread();
         let operation = self.begin();
         operation.require(self.model().bind_gpu_to_thread());
         operation.complete();

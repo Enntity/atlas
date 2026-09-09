@@ -78,6 +78,28 @@ impl InheritedSession {
         &self.ticket
     }
 
+    /// Called once on the actual selected execution thread, before Model work.
+    /// Keep both opened ELF identities and the original process observation;
+    /// thread-local signal installation cannot mint a new inherited session.
+    pub(crate) fn bind_execution_thread(&self) -> Result<()> {
+        let validate_executables = || -> Result<()> {
+            self._server
+                .revalidate_process(self.local.child.pid as u32)?;
+            self._guard
+                .revalidate_process(self.local.parent.pid as u32)?;
+            Ok(())
+        };
+        validate_executables()?;
+        self.local.bind_execution_thread()?;
+        validate_executables()?;
+        ensure!(
+            LocalIdentity::observe()? == self.local,
+            "local identity changed across execution-thread ELF validation"
+        );
+        self.local.require_guard_parent()?;
+        Ok(())
+    }
+
     /// Nonreturning transport completion, not proof that GPU work was drained.
     ///
     /// The selected caller must already have stopped admission, completed the

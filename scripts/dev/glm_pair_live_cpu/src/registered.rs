@@ -127,6 +127,53 @@ pub(crate) fn consumer() -> Result<()> {
         }
         witness.mark(b"drain-signal\n")?;
     }
+    if mode == "registered-drain-threaded" {
+        // Fixture scheduling only: let the controller observe both genuine
+        // registrations and issue the actual rank0 drain before either new
+        // thread can fail. This file confers no Model or release authority.
+        let deadline = atlas_glm_pair_io::identity::boot_time_ms()? + 15000;
+        loop {
+            owner.check_health();
+            atlas_glm_pair_io::identity::check_deadline(deadline)?;
+            match std::fs::read("/run/atlas-pair/thread-handoff") {
+                Ok(bytes) => {
+                    ensure!(bytes == b"handoff\n", "thread fixture handoff marker");
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::spawn(move || {
+            // Retain actual sequence ownership alongside the moved actual
+            // SelectedModel/InheritedSession, just as native serving does.
+            let _sequences = sequences;
+            (|| -> Result<()> {
+                let mut signal = -1;
+                ensure!(
+                    unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal) } == 0,
+                    "read actual thread parent-death signal"
+                );
+                ensure!(signal == 0, "new OS thread must start without PDEATHSIG");
+                witness.mark(b"thread-pdeathsig=0\n")
+            })()
+            .unwrap_or_else(|_| terminate());
+            if rank == 0 {
+                // The real head scheduler calls this before its Model bind;
+                // actual run_worker below performs its own same handoff.
+                owner.bind_execution_thread();
+                owner.shutdown_head()
+            } else {
+                owner.run_worker()
+            }
+        })
+        .join()
+        .unwrap_or_else(|_| terminate());
+        // Both real production entry points are nonreturning. A join is never
+        // interpreted as a quiescence certificate or permission to Drop.
+        terminate();
+    }
     // Both functions are the actual nonreturning production paths. Rank0 sends
     // the shutdown words; rank1 consumes that exact protocol via local replay.
     // Guard control remains a genuine two-process connected exchange.

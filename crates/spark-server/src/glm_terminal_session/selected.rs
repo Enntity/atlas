@@ -72,6 +72,17 @@ impl SelectedModel {
         self.model.as_ref()
     }
 
+    /// Establish the new thread's protection before bind/alloc/receive. No GPU
+    /// query or per-token prctl: the registered core already makes errors fatal.
+    pub(crate) fn bind_execution_thread(&self) {
+        require(
+            self.session
+                .as_ref()
+                .context("selected execution thread requires retained session")
+                .and_then(InheritedSession::bind_execution_thread),
+        );
+    }
+
     pub(crate) fn begin(&self) -> SelectedOperation<'_> {
         SelectedOperation::begin(self.model(), &self.key)
     }

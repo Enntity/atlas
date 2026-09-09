@@ -199,6 +199,39 @@ impl LocalIdentity {
         Ok(value)
     }
 
+    /// Bind a newly created execution thread to the same observed guard.
+    /// Linux clears PDEATHSIG on clone, including CLONE_THREAD. This is a
+    /// one-time thread handoff, not permission to change the retained parent.
+    pub fn bind_execution_thread(&self) -> io::Result<()> {
+        if self.parent.pid != 1
+            || self.parent.uid != 0
+            || self.parent.gid != 0
+            || Self::observe()? != *self
+        {
+            return Err(invalid(
+                "execution thread differs from retained root PID1 identity",
+            ));
+        }
+        let mut signal: libc::c_int = 0;
+        if unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if signal != 0 && signal != libc::SIGKILL {
+            return Err(invalid("unexpected execution-thread parent-death signal"));
+        }
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Close the parent-death/reparenting race across prctl. Failure remains
+        // fatal to the selected caller; never clear the installed protection.
+        if Self::observe()? != *self {
+            return Err(invalid(
+                "guard identity changed during execution-thread binding",
+            ));
+        }
+        self.require_guard_parent()
+    }
+
     pub fn require_guard_parent(&self) -> io::Result<()> {
         let mut signal: libc::c_int = 0;
         if unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal) } != 0 {

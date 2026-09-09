@@ -16,6 +16,7 @@ pub(crate) fn registered_mode(mode: &str) -> bool {
             | "registered-drain-foreign"
             | "registered-drain-replay"
             | "registered-drain-controller"
+            | "registered-drain-threaded"
             | "registered-wrong-rank"
             | "registered-missing-capability"
             | "registered-unhealthy"
@@ -338,14 +339,17 @@ pub(crate) fn run(executable: &str, mode: &str) -> Result<()> {
     main_exchange::run(&mut nodes, &manifest, mode, &sources)?;
     if registered_mode(mode) {
         for (rank, source) in sources.iter().enumerate() {
-            let expected =
-                if matches!(mode, "registered-drain" | "registered-drain-replay") && rank == 0 {
-                    b"before-register\nregistered\ndrain-signal\n".as_slice()
-                } else if mode == "registered-valid" || mode.starts_with("registered-drain") {
-                    b"before-register\nregistered\n".as_slice()
-                } else {
-                    b"before-register\n".as_slice()
-                };
+            let expected = if mode == "registered-drain-threaded" && rank == 0 {
+                b"before-register\nregistered\ndrain-signal\nthread-pdeathsig=0\n".as_slice()
+            } else if mode == "registered-drain-threaded" {
+                b"before-register\nregistered\nthread-pdeathsig=0\n".as_slice()
+            } else if matches!(mode, "registered-drain" | "registered-drain-replay") && rank == 0 {
+                b"before-register\nregistered\ndrain-signal\n".as_slice()
+            } else if mode == "registered-valid" || mode.starts_with("registered-drain") {
+                b"before-register\nregistered\n".as_slice()
+            } else {
+                b"before-register\n".as_slice()
+            };
             ensure!(
                 std::fs::read(source.join("registered-witness"))? == expected,
                 "actual Model registration/terminal witness mismatch"
