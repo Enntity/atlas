@@ -73,9 +73,16 @@ checks, not GPU numerics, host drain, live admission or two-rank release proof.
 Committed as `bdaa2558`; root's post-commit focused run again passed4/4 in0.22s
 (`postcommit-focused.log` in the same campaign). The unchanged v29 native binary
 was independently reproduced while this controller-only development occurred.
-The proposed shared guard/server record and wire contract is detailed in
-`glm_c2_live_wire_plan.md`; it still needs the literal selected recipe and
-connected consumer implementation before native admission.
+The shared guard/server record and wire contract is detailed in
+`glm_c2_live_wire_plan.md`. The shared codecs, authenticated socket transport,
+existing guard child extension and actual inherited server consumer are now
+implemented. A controller-only fixture connects two actual gated children under
+separate PID1/proc namespaces to the production consumer, with valid and rejected
+ticket cases. See `docs/experiments/glm53-20260906/live-pair-handshake-results.md`.
+This does not implement the LIVE guard main loop, canonical recipe/materialized
+launch, quiescent release or actual Model registration. Those remain the next
+connected integration step before any native admission; do not rerun the older
+PID1-death qualification as if that prerequisite were absent.
 
 First model slice: model author owns the sealed capability, its actual impl,
 small quiescence child and existing Model-fixture extensions. No factory flag,

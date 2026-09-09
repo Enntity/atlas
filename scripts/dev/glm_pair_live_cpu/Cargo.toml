@@ -1,5 +1,5 @@
 [package]
-name = "glm-pair-guard"
+name = "glm-pair-live-cpu"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
@@ -8,8 +8,7 @@ publish = false
 [workspace]
 
 [dependencies]
+anyhow = "1"
 libc = "=0.2.189"
 atlas-glm-pair-io = { path = "../../../crates/atlas-glm-pair-io" }
-
-[profile.release]
-panic = "abort"
+atlas-glm-pair-wire = { path = "../../../crates/atlas-glm-pair-wire" }

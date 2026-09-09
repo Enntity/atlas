@@ -1,7 +1,8 @@
 # LIVE paired guard wire and quiescent release
 
-2026-09-09. Exact bounded proposal; direction approved, implementation not yet
-authorized. This document changes no serving admission, process, or native gate.
+2026-09-09. Root has authorized the bounded wire, inherited-channel transport,
+actual child primitive and server consumer implementation below. Native admission
+remains disabled until the connected path and literal recipe are qualified.
 Read with [live integration](glm_c2_live_integration_plan.md) and
 [terminal session](glm_c2_terminal_session_plan.md). Root owns live integration.
 
@@ -16,10 +17,14 @@ Private PID1 death killed its unprotected descendant while an outside decoy
 survived. Do not reopen that completed prerequisite. It does not prove live
 Docker pairing, server registration, GPU recovery, or this release protocol.
 
-Actual gaps: `child::Spec` forwards only PATH; `Child` retains no live channel or
-reported child identity; `reap()` reports only whether an exit occurred; the
-guard always exits failure. The server must consume actual inherited authority
-before selected GPU initialization, then bind its actual Model capability.
+This slice now implements the explicit LIVE child environment/channel, retained
+child identity/status, shared wire/I/O and actual server consumer; connected
+controller-only evidence is in
+`docs/experiments/glm53-20260906/live-pair-handshake-results.md`.
+The production guard main still always exits failure and has no LIVE loop.
+The server must still call its consumer before selected GPU initialization,
+then bind the actual Model capability. Startup files/recipe and pair release
+also remain unconnected; handshake evidence is not native admission.
 
 Proposed source split, all Rust children <=500 lines:
 
@@ -34,6 +39,17 @@ Proposed source split, all Rust children <=500 lines:
 - Root owns server inherited-channel consumer, pre-GPU profile validation,
   actual Model registration, nonreturning release, and the two-node controller
   adapter. Model author owns only actual health checks/stream joins.
+
+Implementation ownership for the connected boundary: protocol author owns the
+wire crate; root owns a shared Linux-only, GPU-free `atlas-glm-pair-io` transport;
+the Model author implements its local identity I/O and the real server consumer;
+the guard author extends the existing child primitive. The I/O crate centralizes
+the unsafe ancillary parser for both endpoints, not a second supervisor or an
+execution abstraction. Its credentials are actual per-message kernel facts;
+neither a valid packet nor an identity object grants Model capability. Serialize
+controller Cargo and retain runtime RED before each behavioral implementation.
+Use real socketpair/fork/exec checks and a connected private-PID1 consumer gate,
+then independently review before wiring native admission. OFF remains untouched.
 
 OFF retains the existing CLI, 112-byte parser and failure behavior. No per-command
 ACK, new E1/F5 counter, K5/F0 redesign, or generic resource-cleanup framework.
@@ -96,6 +112,9 @@ SSH is the trust boundary; peer UID is checked, but an outside-namespace peer PI
 may appear as zero and is not claimed as the controller's process identity.
 SSH/relay EOF is terminal; an orphan relay cannot renew without fresh controller
 responses. A blocked link expires the guard's own lease without Docker/SSH help.
+Because the host directory is root-owned0700, that node-local relay must run
+through the existing authorized sudo path; do not broaden directory permissions
+to make an unprivileged SSH account connect.
 
 Root correlates each full container's inspected host init PID/start ticks,
 host boot ID and `/proc/<host-init>/ns/pid` identity with the guard's local PID1
@@ -143,6 +162,8 @@ settings. This plan does not invent the not-yet-registered selected admission
 flag or claim an executable native recipe exists already. Missing materialized
 settings block launch. First profile remains TP2/EP2v2, two owners, MTP4, eager,
 BF16 KV, cold text2..1024, greedy grammarless and excluded routes as in integration.
+The first paired served context is2044, not2048: the actual paired-head reserve
+requires context+4<=2048. This is an interim bounded gate, not long-context parity.
 
 ## Exact byte records and frames
 

@@ -83,9 +83,13 @@ is no exact reference-workload or full-goal-completion claim. Preserve the
 rollback/watchdog behavior and bounded memory throughout subsequent work.
 Concurrent MTP also remains required: checked cold F0 transport is
 committed, and `bdaa2558` adds actual Model health/strict stream-quiescence checks
-with independent source and focused CPU qualification. Live guard ticket/channel,
-two-rank quiescent release, scheduler admission and actual supervised head/worker
-integration are not live. See `scripts/dev/glm_c2_live_integration_plan.md` and
+with independent source and focused CPU qualification. Shared wire/credentialed
+transport, the existing guard's inherited child channel and actual server ticket
+consumer now pass a connected controller-only two-PID1/proc handshake gate.
+See `live-pair-handshake-results.md`; this is not native serving activation.
+The LIVE guard loop, literal recipe, two-rank quiescent release, scheduler
+admission and actual supervised head/worker integration are not live.
+See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.
 

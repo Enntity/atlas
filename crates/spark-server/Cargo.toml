@@ -99,6 +99,10 @@ lazy_static = "1"
 tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
 base64 = "0.22"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+atlas-glm-pair-wire = { path = "../atlas-glm-pair-wire" }
+atlas-glm-pair-io = { path = "../atlas-glm-pair-io" }
+
 [dev-dependencies]
 spark-model = { path = "../spark-model", default-features = false, features = ["glm-c2-test-utils"] }
 tempfile = "3"

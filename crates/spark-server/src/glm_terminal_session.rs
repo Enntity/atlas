@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Inert, server-local terminal core for future selected paired registration.
-//! No live Model, supervisor ticket, serving flag, or activation caller exists.
+//! Server-local terminal core and inherited-channel consumer.
+//! No live Model registration, serving flag, or activation caller exists yet.
 mod core;
 mod panic;
+#[cfg(target_os = "linux")]
+pub(crate) mod inherited;
 
 #[cfg(test)]
 mod tests;

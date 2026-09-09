@@ -1,74 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use crate::linux::{error, owned, Io};
-use std::ffi::CString;
+use atlas_glm_pair_io::{Channel, Credentials};
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 
-pub struct Spec {
-    executable: OwnedFd,
-    argv: Vec<CString>,
-    env: Vec<CString>,
-}
-
-impl Spec {
-    pub fn new(args: &[String]) -> io::Result<Self> {
-        if args.is_empty() || args.len() > 64 || args.iter().any(|x| x.len() > 4096) {
-            return Err(error("bounded executable and argv required"));
-        }
-        let argv: Vec<_> = args
-            .iter()
-            .map(|s| CString::new(s.as_bytes()))
-            .collect::<Result<_, _>>()
-            .map_err(|_| error("NUL in argument"))?;
-        let executable = owned(unsafe {
-            libc::open(
-                argv[0].as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
-        })?;
-        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-        if unsafe { libc::fstat(executable.as_raw_fd(), &mut stat) } != 0
-            || stat.st_mode & libc::S_IFMT != libc::S_IFREG
-            || stat.st_mode & 0o6000 != 0
-            || stat.st_mode & 0o111 == 0
-        {
-            return Err(error(
-                "executable must be regular, executable and not set-ID",
-            ));
-        }
-        let mut magic = [0u8; 4];
-        if unsafe { libc::pread(executable.as_raw_fd(), magic.as_mut_ptr().cast(), 4, 0) } != 4
-            || magic != *b"\x7fELF"
-        {
-            return Err(error("ELF executable required; no scripts"));
-        }
-        let cap = unsafe {
-            libc::fgetxattr(
-                executable.as_raw_fd(),
-                c"security.capability".as_ptr(),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if cap >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA) {
-            return Err(error(
-                "executable capability check failed or capability present",
-            ));
-        }
-        // No inherited loader/preload variables or credential-changing wrapper.
-        let env = vec![CString::new("PATH=/usr/bin:/bin").unwrap()];
-        Ok(Self {
-            executable,
-            argv,
-            env,
-        })
-    }
-}
+#[path = "child_spec.rs"]
+mod spec;
+pub use spec::Spec;
 
 pub struct Child {
     pidfd: OwnedFd,
     gate: Option<OwnedFd>,
+    credentials: Credentials,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExitStatus {
+    pub code: i32,
+    pub status: i32,
 }
 
 fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
@@ -90,6 +40,52 @@ pub unsafe fn protect_parent(expected_parent: libc::pid_t) {
 
 impl Child {
     pub fn prepare(spec: Spec, old_mask: &libc::sigset_t, deadline: u64) -> io::Result<Self> {
+        if spec.explicit_env {
+            return Err(error("explicit LIVE environment requires private channel"));
+        }
+        Self::prepare_inner(spec, old_mask, deadline, None).map(|(child, _)| child)
+    }
+
+    /// The caller owns recipe equality/authorization; this only launches the
+    /// validated explicit environment with its private pre-created channel.
+    pub fn prepare_live(
+        spec: Spec,
+        old_mask: &libc::sigset_t,
+        deadline: u64,
+        parent: Channel,
+        child: Channel,
+    ) -> io::Result<(Self, Channel)> {
+        if !spec.explicit_env {
+            return Err(error(
+                "LIVE requires explicit environment, no PATH fallback",
+            ));
+        }
+        let (child, parent) = Self::prepare_inner(spec, old_mask, deadline, Some((parent, child)))?;
+        Ok((child, parent.expect("LIVE owns parent channel")))
+    }
+
+    fn prepare_inner(
+        spec: Spec,
+        old_mask: &libc::sigset_t,
+        deadline: u64,
+        live: Option<(Channel, Channel)>,
+    ) -> io::Result<(Self, Option<Channel>)> {
+        // Both descriptors are fixed before fork. FD3 may currently hold the
+        // pinned ELF or either socket: dup3 must never overwrite our exec FD.
+        let relocated = live
+            .as_ref()
+            .map(|(_, child)| -> io::Result<_> {
+                Ok((
+                    owned(unsafe {
+                        libc::fcntl(spec.executable.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4)
+                    })?,
+                    owned(unsafe { libc::fcntl(child.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4) })?,
+                ))
+            })
+            .transpose()?;
+        let executable = relocated
+            .as_ref()
+            .map_or(spec.executable.as_raw_fd(), |(elf, _)| elf.as_raw_fd());
         let (gate_read, gate_write) = pipe()?;
         let (ready_read, ready_write) = pipe()?;
         let argv: Vec<_> = spec
@@ -105,6 +101,8 @@ impl Child {
             .chain([std::ptr::null()])
             .collect();
         let expected_parent = unsafe { libc::getpid() };
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(io::Error::last_os_error());
@@ -114,6 +112,9 @@ impl Child {
             unsafe {
                 libc::close(gate_write.as_raw_fd());
                 libc::close(ready_read.as_raw_fd());
+                if let Some((parent, _)) = live.as_ref() {
+                    libc::close(parent.as_raw_fd());
+                }
                 protect_parent(expected_parent);
                 if libc::write(ready_write.as_raw_fd(), b"R".as_ptr().cast(), 1) != 1 {
                     libc::_exit(75);
@@ -145,7 +146,14 @@ impl Child {
                 {
                     libc::_exit(75);
                 }
-                libc::fexecve(spec.executable.as_raw_fd(), argv.as_ptr(), env.as_ptr());
+                // Only FD3 survives the first exec. The actual server ingress
+                // immediately consumes it into a CLOEXEC owner, closing FD3.
+                if let Some((_, channel)) = relocated.as_ref() {
+                    if libc::dup3(channel.as_raw_fd(), 3, 0) != 3 {
+                        libc::_exit(75);
+                    }
+                }
+                libc::fexecve(executable, argv.as_ptr(), env.as_ptr());
                 libc::_exit(76);
             }
         }
@@ -156,6 +164,7 @@ impl Child {
         let child = Self {
             pidfd,
             gate: Some(gate_write),
+            credentials: Credentials { pid, uid, gid },
         };
         Io::nonblocking(ready_read.as_raw_fd())?;
         loop {
@@ -164,7 +173,7 @@ impl Child {
             }
             let mut byte = [0];
             match Io::read(ready_read.as_raw_fd(), &mut byte)? {
-                Some(1) if byte == [b'R'] => return Ok(child),
+                Some(1) if byte == [b'R'] => return Ok((child, live.map(|(parent, _)| parent))),
                 Some(_) => return Err(error("child setup failed")),
                 None => Io::poll(
                     &mut [libc::pollfd {
@@ -179,6 +188,39 @@ impl Child {
     }
     pub fn fd(&self) -> i32 {
         self.pidfd.as_raw_fd()
+    }
+    pub fn pid(&self) -> libc::pid_t {
+        self.credentials.pid
+    }
+    pub fn credentials(&self) -> Credentials {
+        self.credentials
+    }
+    /// Observe the exact held child without consuming its status; `reap`
+    /// remains the sole consuming operation used by the legacy runner.
+    pub fn exit_status(&self) -> io::Result<Option<ExitStatus>> {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        if unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                self.fd() as _,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let pid = unsafe { info.si_pid() };
+        if pid == 0 {
+            return Ok(None);
+        }
+        if pid != self.pid() {
+            return Err(error("pidfd exit identity mismatch"));
+        }
+        Ok(Some(ExitStatus {
+            code: info.si_code,
+            status: unsafe { info.si_status() },
+        }))
     }
     pub fn release(&mut self) -> io::Result<()> {
         let gate = self
@@ -223,3 +265,7 @@ impl Child {
         Ok(unsafe { info.si_pid() } != 0)
     }
 }
+
+#[cfg(test)]
+#[path = "child_tests.rs"]
+mod tests;

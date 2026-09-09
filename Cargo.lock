@@ -128,6 +128,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-glm-pair-io"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+]
+
+[[package]]
+name = "atlas-glm-pair-wire"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "atlas-governance"
 version = "1.0.0-beta-preview"
 dependencies = [
@@ -2440,6 +2455,8 @@ dependencies = [
  "anyhow",
  "atlas-closure",
  "atlas-core",
+ "atlas-glm-pair-io",
+ "atlas-glm-pair-wire",
  "atlas-kernels",
  "atlas-plugin",
  "axum",
