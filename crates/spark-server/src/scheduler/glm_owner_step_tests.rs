@@ -17,6 +17,9 @@ use spark_model::{
 #[path = "glm_c2_fixture_test_process.rs"]
 mod process;
 
+#[path = "glm_owner8_step_tests.rs"]
+mod owner8;
+
 fn context(s: &SchedCtx) -> LogitsContext<'_> {
     LogitsContext {
         scratch: &s.scratch,
@@ -50,19 +53,23 @@ struct Run {
 
 impl Run {
     fn new(physical: &[usize], reverse: bool) -> Self {
+        Self::with_capacity(4, physical, reverse)
+    }
+    fn with_capacity(capacity: usize, physical: &[usize], reverse: bool) -> Self {
         let prepare = |rank| {
-            let mut fixture = Fixture::owner_compute(rank);
+            let mut fixture = Fixture::owner_compute_with_owner_capacity(rank, capacity);
             fixture.deterministic_logits(true);
             let wire = fixture.install_wire();
             let (model, initial, observer) = fixture.into_parts();
             let mut seqs = Vec::from(initial);
-            for slot in 2..4 {
+            for slot in 2..capacity {
                 let seq = model.alloc_sequence().unwrap();
                 assert_eq!(seq.slot_idx, slot);
                 seqs.push(seq);
             }
             for seq in &mut seqs {
-                let prompt = vec![1 + seq.slot_idx as u32; 4 + seq.slot_idx];
+                let token = (1 + seq.slot_idx as u32) % model.vocab_size() as u32;
+                let prompt = vec![token; 4 + seq.slot_idx];
                 seq.prompt_len = prompt.len();
                 model.prefill(&prompt, seq, 37).unwrap();
             }

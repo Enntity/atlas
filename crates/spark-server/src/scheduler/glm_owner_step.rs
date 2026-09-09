@@ -15,7 +15,12 @@ pub(super) fn try_step_owners(
     sched: &SchedCtx,
     verify_ctx: &LogitsContext,
 ) -> Result<bool> {
-    let mut physical: [Option<&mut ActiveSeq>; 4] = [None, None, None, None];
+    let capacity = capability.owner_capacity()?;
+    ensure!(
+        (2..=8).contains(&capacity),
+        "owner scheduler capacity changed"
+    );
+    let mut physical: [Option<&mut ActiveSeq>; 8] = std::array::from_fn(|_| None);
     for a in active {
         if glm_c2_serial::stopped(a, sched, true) {
             continue;
@@ -27,22 +32,41 @@ pub(super) fn try_step_owners(
         }
         let slot = a.seq.slot_idx;
         ensure!(
-            slot < 4 && physical[slot].is_none(),
+            slot < capacity && physical[slot].is_none(),
             "owner scheduler physical mapping changed"
         );
         physical[slot] = Some(a);
     }
-    let mut cohort = [None, None, None, None];
+    let mut cohort = std::array::from_fn::<_, 8, _>(|_| None);
+    let mut count = 0;
     for (ordinal, owner) in physical.into_iter().flatten().enumerate() {
         cohort[ordinal] = Some(owner);
+        count += 1;
     }
-    match cohort {
-        [Some(a), Some(b), Some(c), None] => step([a, b, c], model, capability, sched, verify_ctx),
-        [Some(a), Some(b), Some(c), Some(d)] => {
-            step([a, b, c, d], model, capability, sched, verify_ctx)
-        }
+    match count {
+        3 => step_cohort::<3>(cohort, model, capability, sched, verify_ctx),
+        4 => step_cohort::<4>(cohort, model, capability, sched, verify_ctx),
+        5 => step_cohort::<5>(cohort, model, capability, sched, verify_ctx),
+        6 => step_cohort::<6>(cohort, model, capability, sched, verify_ctx),
+        7 => step_cohort::<7>(cohort, model, capability, sched, verify_ctx),
+        8 => step_cohort::<8>(cohort, model, capability, sched, verify_ctx),
         _ => Ok(false),
     }
+}
+
+fn step_cohort<const N: usize>(
+    mut cohort: [Option<&mut ActiveSeq>; 8],
+    model: &dyn Model,
+    capability: &dyn GlmPairedExecution,
+    sched: &SchedCtx,
+    verify_ctx: &LogitsContext,
+) -> Result<bool> {
+    ensure!(
+        cohort[..N].iter().all(Option::is_some) && cohort[N..].iter().all(Option::is_none),
+        "owner scheduler cohort coverage changed"
+    );
+    let owners = std::array::from_fn(|i| cohort[i].take().expect("complete distinct cohort"));
+    step::<N>(owners, model, capability, sched, verify_ctx)
 }
 
 fn step<const N: usize>(

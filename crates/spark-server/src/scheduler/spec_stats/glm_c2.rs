@@ -10,10 +10,10 @@ pub struct GlmC2Stats {
     serial_commits: AtomicU64,
     serial_accept: [AtomicU64; 5],
     bootstrap_commits: AtomicU64,
-    // Cohort-size order: index0=C3, index1=C4. Acceptance bins count owners,
+    // Cohort-size order: index0=C3 through index5=C8. Bins count owners,
     // not transactions; neither field is a Pair/Serial or emitted-token count.
-    owner_commits: [AtomicU64; 2],
-    owner_accept: [[AtomicU64; 5]; 2],
+    owner_commits: [AtomicU64; 6],
+    owner_accept: [[AtomicU64; 5]; 6],
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -23,13 +23,13 @@ pub struct Snapshot {
     pub serial_commits: u64,
     pub serial_accept: [u64; 5],
     pub bootstrap_commits: u64,
-    pub owner_commits: [u64; 2],
-    pub owner_accept: [[u64; 5]; 2],
+    pub owner_commits: [u64; 6],
+    pub owner_accept: [[u64; 5]; 6],
 }
 
 impl GlmC2Stats {
     pub fn owners_committed(&self, accepted: &[usize]) {
-        // Called only after the typed3/4 cohort and every count passed commit.
+        // Called only after the typed3..8 cohort and every count passed commit.
         let group = accepted.len() - 3;
         for &count in accepted {
             self.owner_accept[group][count].fetch_add(1, Ordering::Relaxed);
@@ -74,8 +74,8 @@ impl GlmC2Stats {
             serial_commits = s.serial_commits,
             serial_accept = ?s.serial_accept,
             bootstrap_commits = s.bootstrap_commits,
-            owner_commits_c3_c4 = ?s.owner_commits,
-            owner_accept_c3_c4 = ?s.owner_accept,
+            owner_commits_c3_c8 = ?s.owner_commits,
+            owner_accept_c3_c8 = ?s.owner_accept,
             "GLM C2 committed summary (cumulative; acceptance counts exclude seed)"
         );
     }
