@@ -253,5 +253,5 @@ For each function call, output the function name and arguments within the follow
 {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
-    <|assistant|>{%- if tools -%}{{- '<think></think>' -}}{%- else -%}{{- '<think>' -}}{%- endif -%}
+    <|assistant|>{%- if tools and not enable_thinking -%}{{- '<think></think>' -}}{%- else -%}{{- '<think>' -}}{%- endif -%}
 {%- endif -%}

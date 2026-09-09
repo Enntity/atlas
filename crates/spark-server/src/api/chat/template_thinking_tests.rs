@@ -49,15 +49,24 @@ fn rendered_glm_generation_tail_reconciles_requested_thinking() {
         "name":"get_weather","parameters":{"type":"object","properties":{
             "city":{"type":"string"}},"required":["city"]}
     }})];
-    for requested in [true, false] {
-        let closed = tokenizer
+    for requested in [false, true] {
+        let rendered = tokenizer
             .apply_chat_template_openai(&messages, Some(&tools), requested, false)
             .unwrap();
-        assert!(closed.ends_with(&[3, START, END]));
+        let suffix: &[u32] = if requested {
+            &[3, START]
+        } else {
+            &[3, START, END]
+        };
+        assert!(rendered.ends_with(suffix), "resolved thinking={requested}");
         assert_eq!(
-            reconcile_prompt_thinking(&closed, Some(START), Some(END), requested, Some(32), 128),
-            (false, None),
-            "closed GLM tools tail must start generation outside reasoning"
+            reconcile_prompt_thinking(&rendered, Some(START), Some(END), requested, Some(16), 128),
+            if requested {
+                (true, Some(16))
+            } else {
+                (false, None)
+            },
+            "GLM tools must retain enabled reasoning and its explicit budget"
         );
         let open = tokenizer
             .apply_chat_template_openai(&messages, None, requested, false)

@@ -4,7 +4,11 @@
 
 use serde_json::json;
 
-fn render(messages: &[serde_json::Value], tools: Option<&[serde_json::Value]>) -> String {
+fn render(
+    messages: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    enable_thinking: bool,
+) -> String {
     let raw = include_str!("../../../../../jinja-templates/openai/glm5_next.jinja");
     let converted = crate::tokenizer::jinja_helpers::convert_python_jinja_to_minijinja(raw);
     let env = crate::tokenizer::jinja_helpers::build_jinja_env(&converted)
@@ -13,13 +17,16 @@ fn render(messages: &[serde_json::Value], tools: Option<&[serde_json::Value]>) -
         &env,
         messages,
         tools,
-        crate::tokenizer::chat_render::RenderFlags::default(),
+        crate::tokenizer::chat_render::RenderFlags {
+            enable_thinking,
+            ..Default::default()
+        },
     )
     .expect("GLM-5.3 OpenAI template renders")
 }
 
 #[test]
-fn glm5_tools_close_reasoning_before_generation() {
+fn glm5_tools_respect_resolved_thinking_before_generation() {
     let tools = [json!({
         "type": "function",
         "function": {
@@ -33,15 +40,26 @@ fn glm5_tools_close_reasoning_before_generation() {
         }
     })];
     let messages = [json!({"role": "user", "content": "What is the weather in Paris?"})];
-    let rendered = render(&messages, Some(&tools));
-    assert!(rendered.ends_with("<|assistant|><think></think>"));
-    assert!(rendered.contains("<tools>"));
-    assert!(rendered.contains("get_weather"));
+    // The API resolver supplies false for silent clients under the GLM tool
+    // default, but explicit enable wins that default (thinking.rs tests).
+    for enabled in [false, true] {
+        let rendered = render(&messages, Some(&tools), enabled);
+        let suffix = if enabled {
+            "<|assistant|><think>"
+        } else {
+            "<|assistant|><think></think>"
+        };
+        assert!(rendered.ends_with(suffix), "resolved thinking={enabled}");
+        assert!(rendered.contains("<tools>"));
+        assert!(rendered.contains("get_weather"));
+    }
 }
 
 #[test]
 fn glm5_without_tools_preserves_stock_reasoning_prompt() {
     let messages = [json!({"role": "user", "content": "What is the weather in Paris?"})];
-    let rendered = render(&messages, None);
-    assert!(rendered.ends_with("<|assistant|><think>"));
+    for enabled in [false, true] {
+        let rendered = render(&messages, None, enabled);
+        assert!(rendered.ends_with("<|assistant|><think>"));
+    }
 }
