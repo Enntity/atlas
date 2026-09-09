@@ -46,7 +46,7 @@ impl Profile {
         if self.tp != 2
             || self.ep != 2
             || self.ep_protocol != 2
-            || self.max_sequences != 2
+            || !(2..=4).contains(&self.max_sequences)
             || self.context != 2044
             || self.prefill != 1024
             || self.drafts != 4

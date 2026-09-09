@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Shared constructor; legacy allocation/kernel ordering is unchanged.
 use super::*;
+#[path = "storage.rs"]
+mod storage;
 
 impl Glm5MtpHead {
     #[allow(clippy::too_many_arguments)]
@@ -44,29 +46,9 @@ impl Glm5MtpHead {
             paired_context.is_none() || !hidden_trace_enabled,
             "paired handoff does not support the C1 hidden diagnostic"
         );
-        let cache_shape = GlmMlaShape::new(config.kv_lora_rank, config.qk_rope_head_dim)?;
-        let kv_config = KvCacheConfig {
-            block_size: 16,
-            num_kv_heads: cache_shape.num_kv_heads(),
-            head_dim: cache_shape.head_dim(),
-            num_layers: 1,
-            dtype: KvCacheDtype::Bf16,
-            layer_dtypes: vec![],
-            layer_dims: vec![],
-            cache_blocks_per_seq: None,
-        };
-        let sparse_index = (config.index_kpool > 0 && config.index_head_dim > 0)
-            .then(|| cache_shape.bf16_index(config.index_kpool, config.index_head_dim))
-            .transpose()?;
-        let cache_plan = GlmCachePlan::new(cache_shape, &kv_config, sparse_index)?;
-        let num_blocks = if let Some((context, capacity)) = paired_context {
-            capacity.cache_blocks(context)?
-        } else {
-            max_seq_len / kv_config.block_size + 1
-        };
-        cache_plan.bytes_for_blocks(num_blocks)?;
-        let mut kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
-        if let Some(index) = sparse_index {
+        let plan = storage::PrivateStoragePlan::new(config, max_seq_len, paired_context)?;
+        let mut kv_cache = PagedKvCache::new(plan.config, plan.blocks, gpu)?;
+        if let Some(index) = plan.index {
             kv_cache.attach_sparse_index(index, gpu)?;
         }
         let mut result = Self {

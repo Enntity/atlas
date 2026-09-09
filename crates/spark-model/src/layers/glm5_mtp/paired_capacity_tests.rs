@@ -10,6 +10,8 @@ use std::sync::atomic::Ordering;
 
 #[path = "paired_owner_capacity_tests.rs"]
 mod owner_capacity_tests;
+#[path = "paired_storage_quote_tests.rs"]
+mod storage_quote_tests;
 
 struct Body(bool);
 impl TransformerLayer for Body {
@@ -46,12 +48,7 @@ fn configured_head(gpu: &dyn GpuBackend, paired: bool, indexed: bool) -> Result<
     configured_owner_head(gpu, paired, indexed, None)
 }
 
-fn configured_owner_head(
-    gpu: &dyn GpuBackend,
-    paired: bool,
-    indexed: bool,
-    owners: Option<usize>,
-) -> Result<Glm5MtpHead> {
+fn capacity_config(indexed: bool) -> atlas_core::config::ModelConfig {
     let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
     config.model_type = "glm5_next".into();
     config.hidden_size = 4096;
@@ -64,6 +61,16 @@ fn configured_owner_head(
     config.tp_rank = 0;
     config.ep_rank = 0;
     config.adapter_max_rank = 0;
+    config
+}
+
+fn configured_owner_head(
+    gpu: &dyn GpuBackend,
+    paired: bool,
+    indexed: bool,
+    owners: Option<usize>,
+) -> Result<Glm5MtpHead> {
+    let config = capacity_config(indexed);
     let dense = |n| DenseWeight {
         weight: gpu.alloc(n).unwrap(),
     };

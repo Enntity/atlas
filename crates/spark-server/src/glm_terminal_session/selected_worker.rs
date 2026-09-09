@@ -14,9 +14,10 @@ impl SelectedModel {
         operation.require(self.model().bind_gpu_to_thread());
         operation.complete();
 
-        // Publish each successful allocation into the retained array before the
+        // Publish each successful allocation into the retained vector before the
         // completion check. Never return a local SequenceState through Err.
-        let mut slots: [Option<SequenceState>; 2] = [None, None];
+        let mut slots: Vec<Option<SequenceState>> =
+            (0..self.owner_capacity()).map(|_| None).collect();
         for (index, slot) in slots.iter_mut().enumerate() {
             let operation = self.begin();
             self.check_health();
@@ -26,7 +27,10 @@ impl SelectedModel {
             }
             operation.complete();
         }
-        tracing::info!("Selected EP worker ready (rank 1, 2 retained slots)");
+        tracing::info!(
+            "Selected EP worker ready (rank 1, {} retained slots)",
+            slots.len()
+        );
         loop {
             let operation = self.begin();
             self.check_health();

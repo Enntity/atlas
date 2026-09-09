@@ -362,16 +362,24 @@ pub(super) fn retire_selected_finished_sequences(
         model.glm_paired_execution().is_some() && model.ep_protocol_v2(),
         "selected retirement requires actual paired EP-v2 Model"
     );
-    let mut seen = [false; 2];
+    let capacity = model
+        .glm_paired_execution()
+        .expect("validated selected retirement capability")
+        .owner_capacity()?;
+    anyhow::ensure!(
+        (2..=4).contains(&capacity),
+        "selected retirement requires actual owner capacity 2..=4"
+    );
+    let mut seen = [false; 4];
     for a in active.iter() {
         let slot = a.seq.slot_idx;
         anyhow::ensure!(
-            slot < 2 && !seen[slot],
-            "selected retirement owner slots must be distinct 0/1"
+            slot < capacity && !seen[slot],
+            "selected retirement owner slots must be distinct and below actual capacity"
         );
         seen[slot] = true;
     }
-    for slot in 0..2 {
+    for slot in 0..capacity {
         if crate::tui::shutdown::requested() {
             return Ok(());
         }

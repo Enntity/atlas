@@ -18,6 +18,9 @@ use std::sync::{
 mod recording;
 use recording::Gpu;
 
+#[path = "glm_paired_capacity_tests.rs"]
+mod capacity_tests;
+
 fn isolated(name: &str) -> bool {
     if std::env::var("ATLAS_PAIRED_FACTORY_CHILD").as_deref() == Ok("1") {
         return false;
@@ -181,6 +184,7 @@ fn actual_factory_head_selects_paired_without_changing_legacy() {
                 &gpu,
                 8,
                 2044,
+                2,
             )
             .unwrap();
             assert_eq!(
@@ -363,7 +367,7 @@ fn actual_assembled_target_is_retained_on_appended_head_error() {
         )
         .unwrap();
         probe.fail_kernel.store(true, Ordering::Relaxed);
-        let result = install_head(model, mode, Some(module), w, w, None, 8, 32, true);
+        let result = install_head(model, mode, Some(module), w, w, None, 8, 32, 2, true);
         assert!(
             format!("{:#}", result.err().expect("actual head kernel fails"))
                 .contains("injected actual constructor kernel")
@@ -448,7 +452,7 @@ fn missing_actual_module_refuses_paired_without_legacy_fallback() {
         )
         .unwrap();
         let before = probe.kernels.load(Ordering::Relaxed);
-        let result = install_head(model, mode, None, w, w, None, 8, 32, true);
+        let result = install_head(model, mode, None, w, w, None, 8, 32, 2, true);
         if mode == GlmMtpBuildMode::Paired {
             assert!(
                 format!("{:#}", result.err().expect("actual module required"))

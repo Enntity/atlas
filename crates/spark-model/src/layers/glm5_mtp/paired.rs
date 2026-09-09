@@ -267,6 +267,21 @@ impl Glm5MtpHead {
     ) -> Result<Self> {
         let capacity = OwnerCapacity::new(owners)?;
         blocks_per_slot(context_tokens)?;
+        Self::validate_paired_shape(config)?;
+        Self::new_with_capacity(
+            module,
+            embed_tokens,
+            lm_head,
+            lm_head_nvfp4,
+            config,
+            gpu,
+            mtp_vocab_size,
+            context_tokens,
+            Some((context_tokens, capacity)),
+        )
+    }
+
+    pub(super) fn validate_paired_shape(config: &atlas_core::config::ModelConfig) -> Result<()> {
         ensure!(
             config.model_type == "glm5_next"
                 && config.hidden_size == 4096
@@ -279,17 +294,7 @@ impl Glm5MtpHead {
                 && config.adapter_max_rank == 0,
             "paired head requires base GLM4096 NoPE512 TP2/EP2"
         );
-        Self::new_with_capacity(
-            module,
-            embed_tokens,
-            lm_head,
-            lm_head_nvfp4,
-            config,
-            gpu,
-            mtp_vocab_size,
-            context_tokens,
-            Some((context_tokens, capacity)),
-        )
+        Ok(())
     }
 
     #[allow(dead_code, clippy::too_many_arguments)]

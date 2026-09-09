@@ -309,6 +309,38 @@ fn off_keeps_legacy_global_reserve_and_late_topology() {
 }
 
 #[test]
+fn paired_invalid_capacity_or_context_refuses_before_backend() {
+    if isolated(
+        "paired_invalid_capacity_or_context_refuses_before_backend",
+        &[
+            ("ATLAS_GLM_INDEPENDENT_DECODE", "0"),
+            ("ATLAS_GLM_MTP_DISTRIBUTED", "1"),
+        ],
+    ) {
+        return;
+    }
+    for (capacity, admitted, context) in [(1, 1, 2044), (5, 5, 2044), (4, 3, 2044), (4, 4, 2045)] {
+        let mut a = args(capacity, 0);
+        a.max_num_seqs = admitted;
+        a.max_seq_len = context;
+        a.glm_paired_mtp = true;
+        a.speculative = true;
+        let mut initialized = false;
+        assert!(
+            super::prepare_reserve(&a, &mut config(), || {
+                initialized = true;
+                Ok(((), 128usize << 30))
+            })
+            .is_err()
+        );
+        assert!(
+            !initialized,
+            "invalid paired profile initialized the backend"
+        );
+    }
+}
+
+#[test]
 fn paired_mtp_preparation_reserves_real_local_slots_and_rows() {
     if isolated(
         "paired_mtp_preparation_reserves_real_local_slots_and_rows",
@@ -319,8 +351,8 @@ fn paired_mtp_preparation_reserves_real_local_slots_and_rows() {
     ) {
         return;
     }
-    for rank in 0..2 {
-        let mut a = args(2, rank);
+    for (capacity, rank) in (2..=4).flat_map(|capacity| (0..2).map(move |rank| (capacity, rank))) {
+        let mut a = args(capacity, rank);
         a.glm_paired_mtp = true;
         a.speculative = true;
         a.max_seq_len = 2044;
@@ -335,14 +367,20 @@ fn paired_mtp_preparation_reserves_real_local_slots_and_rows() {
             reserve.resolved_prefill.as_ref().unwrap().max_batch_tokens,
             budget.max_batch_tokens
         );
-        // Match the actual pool: three live blobs (two owners plus dummy),
-        // two K5 checkpoint/intermediate sets, no plain-decode rollback ring.
+        // Actual owner capacity plus one dummy, per-owner K5 checkpoint and
+        // intermediate sets; no plain-decode rollback ring.
         let h = cfg.num_ssm_layers() * cfg.ssm_h_state_bytes();
         let conv = cfg.num_ssm_layers() * cfg.ssm_conv_state_bytes();
-        let pool = 3 * (h + conv) + 2 * (4 * h + 5 * conv + h + conv);
+        let pool = (capacity + 1) * (h + conv) + capacity * (4 * h + 5 * conv + h + conv);
+        // Independent current-layout oracle: 128 indexed BF16 private blocks
+        // of41984 bytes plus six8192-byte hidden rows, per owner.
+        let private = capacity * (128 * 41984 + 6 * 8192);
         assert_eq!(
             reserve.inference_reserve,
-            pool + a.ssm_cache_slots * (h + conv) + reserve.gdn_two_phase_bytes + (4usize << 30)
+            pool + a.ssm_cache_slots * (h + conv)
+                + reserve.gdn_two_phase_bytes
+                + (4usize << 30)
+                + private
         );
         assert_eq!(
             reserve.buffer_arena_bytes,

@@ -61,10 +61,10 @@ pub(super) fn validate(
             && num_drafts == 4
             && matches!(mtp_quant, MtpQuantization::Bf16)
             && config.num_mtp_modules > 0
-            && max_batch_size == 2
+            && (2..=4).contains(&max_batch_size)
             && max_batch_tokens >= 5
             && (2..=2044).contains(&max_seq_len),
-        "paired factory requires two owners, BF16 MTP4 and bounded target capacity"
+        "paired factory requires two to four owners, BF16 MTP4 and bounded target capacity"
     );
     ensure!(
         kv_dtype == KvCacheDtype::Bf16
@@ -96,13 +96,22 @@ pub(super) fn build_head(
     gpu: &dyn GpuBackend,
     vocabulary: u32,
     context: usize,
+    max_batch_size: usize,
 ) -> Result<Glm5MtpHead> {
     match mode {
         GlmMtpBuildMode::Legacy => Glm5MtpHead::new(
             module, embed, lm_head, nvfp4, config, gpu, vocabulary, context,
         ),
-        GlmMtpBuildMode::Paired => Glm5MtpHead::new_paired(
-            module, embed, lm_head, nvfp4, config, gpu, vocabulary, context,
+        GlmMtpBuildMode::Paired => Glm5MtpHead::new_paired_with_owner_capacity(
+            module,
+            embed,
+            lm_head,
+            nvfp4,
+            config,
+            gpu,
+            vocabulary,
+            context,
+            max_batch_size,
         ),
     }
 }
@@ -118,6 +127,7 @@ pub(super) fn install_head(
     nvfp4: Option<QuantizedWeight>,
     vocabulary: u32,
     context: usize,
+    max_batch_size: usize,
     distributed: bool,
 ) -> Result<crate::model::TransformerModel> {
     let mut model = super::ColdOwner::new(model, mode == GlmMtpBuildMode::Paired);
@@ -136,6 +146,7 @@ pub(super) fn install_head(
             model.gpu_backend(),
             vocabulary,
             context,
+            max_batch_size,
         ) {
             Ok(head) => {
                 model.set_dflash_proposer(std::sync::Arc::new(head));

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Actual local retirement + worker F1 replay; not distributed completion proof.
+#[path = "glm_c2_retirement_capacity_tests.rs"]
+mod capacity;
 use super::retire_selected_finished_sequences;
 use crate::scheduler::{
     ActiveSeq,

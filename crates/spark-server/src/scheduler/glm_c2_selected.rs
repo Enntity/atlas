@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Supervised fixed-two-owner serving; never enters the ordinary cleanup ladder.
+//! Supervised fixed-capacity serving; never enters the ordinary cleanup ladder.
 use super::{ActiveSeq, InferenceRequest, LoraRotation, Model, sched_ctx::SchedCtx};
 use crate::glm_terminal_session::SelectedModel;
 
@@ -40,7 +40,10 @@ pub(crate) fn run_selected(
     let operation = owner.begin();
     operation.require(owner.model().bind_gpu_to_thread());
     operation.complete();
-    let mut active: Vec<ActiveSeq> = Vec::with_capacity(2);
+    // Registration checked this immutable value against both the actual Model
+    // and the authenticated recipe; admission never falls back to CLI capacity.
+    let capacity = owner.owner_capacity();
+    let mut active: Vec<ActiveSeq> = Vec::with_capacity(capacity);
     loop {
         owner.check_health();
         if crate::tui::shutdown::requested() || request_rx.is_closed() {
@@ -59,7 +62,7 @@ pub(crate) fn run_selected(
             };
             let _ = response.send(Err("selected paired serving forbids adapter changes".into()));
         }
-        for _ in 0..(2 - active.len()) {
+        for _ in 0..(capacity - active.len()) {
             if crate::tui::shutdown::requested() || request_rx.is_closed() {
                 break;
             }

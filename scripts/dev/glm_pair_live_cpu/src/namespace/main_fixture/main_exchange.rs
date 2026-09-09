@@ -137,6 +137,7 @@ pub(super) fn run(
             | "bad-environment"
             | "registered-wrong-rank"
             | "registered-missing-capability"
+            | "registered-capacity-mismatch"
             | "registered-unhealthy"
     ) {
         for node in nodes {
@@ -253,6 +254,8 @@ pub(super) fn run(
                     | "delayed"
                     | "reused-session"
                     | "registered-valid"
+                    | "registered-valid3"
+                    | "registered-valid4"
                     | "registered-drain"
                     | "registered-drain-threaded"
             ) {

@@ -1,6 +1,9 @@
 # Next concurrency increment: four retained MTP owners
 
-2026-09-09 source audit. Proposed implementation, not activated or measured.
+2026-09-09 source audit and staged implementation. Not native activated or measured.
+The coordinated admission/registration/worker/retirement/reserve integration
+below is now implemented and host-qualified; see `c4-admission-integration.md`.
+Descriptions of those gates as pending below record the original staged plan.
 The qualified selected path still has two request slots. Nonspeculative C1..C8
 support does not provide speculative accepted-prefix or rollback semantics.
 

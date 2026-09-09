@@ -14,6 +14,7 @@ pub(crate) struct SelectedModel {
     key: SessionKey<'static>,
     rank: u8,
     poll_ms: u64,
+    owner_capacity: usize,
 }
 
 /// An accidental owner drop terminates before Rust drops any owned fields.
@@ -55,9 +56,15 @@ impl SelectedModel {
             );
             let paired = capability(model.as_ref())?;
             paired.validate_session_rank(rank)?;
-            paired.check_communication_health()
+            let owner_capacity = paired.owner_capacity()?;
+            ensure!(
+                owner_capacity == usize::from(startup.recipe.profile.max_sequences),
+                "selected Model/recipe owner capacity mismatch"
+            );
+            paired.check_communication_health()?;
+            Ok(owner_capacity)
         })();
-        require(validation);
+        let owner_capacity = require(validation);
         let poll_ms = startup.session.poll_ms();
         Self {
             model,
@@ -65,11 +72,16 @@ impl SelectedModel {
             key,
             rank,
             poll_ms,
+            owner_capacity,
         }
     }
 
     pub(crate) fn model(&self) -> &(dyn Model + 'static) {
         self.model.as_ref()
+    }
+
+    pub(crate) fn owner_capacity(&self) -> usize {
+        self.owner_capacity
     }
 
     /// Establish the new thread's protection before bind/alloc/receive. No GPU

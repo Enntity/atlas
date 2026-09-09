@@ -85,16 +85,38 @@ pub(crate) fn consumer() -> Result<()> {
     } else {
         rank
     };
+    let owners = usize::from(received.recipe.profile.max_sequences);
+    let valid = matches!(
+        mode.as_str(),
+        "registered-valid" | "registered-valid3" | "registered-valid4"
+    ) || mode.starts_with("registered-drain");
     let mut fixture = if mode == "registered-missing-capability" {
         Fixture::legacy(usize::from(model_rank))
+    } else if mode == "registered-capacity-mismatch" {
+        // Actual four-owner pool/target construction versus the received,
+        // unchanged two-owner recipe; no fabricated capability or ticket.
+        Fixture::paired_compute_with_owner_capacity(usize::from(model_rank), 4)
+    } else if matches!(mode.as_str(), "registered-valid3" | "registered-valid4") {
+        Fixture::paired_compute_with_owner_capacity(usize::from(model_rank), owners)
     } else {
         Fixture::paired(usize::from(model_rank))
     };
     let wire = fixture.install_wire();
-    let (model, mut sequences, observer) = fixture.into_parts();
-    if (mode == "registered-valid" || mode.starts_with("registered-drain")) && rank == 1 {
+    let (model, sequences, observer) = fixture.into_parts();
+    let mut sequences = Vec::from(sequences);
+    if valid && rank == 0 {
+        while sequences.len() < owners {
+            let sequence = model.alloc_sequence()?;
+            ensure!(
+                sequence.slot_idx == sequences.len(),
+                "actual head fixture owner index"
+            );
+            sequences.push(sequence);
+        }
+    }
+    if valid && rank == 1 {
         // The fixture starts with two real owners. Retire those before actual
-        // run_worker allocates its own two slots; never fabricate SlotGuards.
+        // run_worker allocates its own exact capacity; never fabricate SlotGuards.
         for sequence in &mut sequences {
             model.free_sequence(sequence)?;
         }
@@ -106,11 +128,22 @@ pub(crate) fn consumer() -> Result<()> {
     }
     witness.mark(b"before-register\n")?;
     let owner = selected::SelectedModel::register(Box::new(model), received, rank);
+    if valid {
+        ensure!(
+            owner.owner_capacity() == owners,
+            "actual registered capacity"
+        );
+    }
     ensure!(
         observer.events() == [Event::Health(true)],
         "registration actual health only"
     );
     witness.mark(b"registered\n")?;
+    if mode == "registered-capacity-mismatch" {
+        // A false acceptance must fail the parent's exact witness oracle,
+        // without proceeding into worker allocations or head shutdown.
+        terminate();
+    }
     if mode == "registered-drain-controller" {
         let operation = owner.begin();
         operation.require(registered_controller::wait(&owner, rank));

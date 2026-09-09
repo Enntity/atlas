@@ -137,7 +137,7 @@ pub(crate) fn preflight_reserve(
             independent || std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() != Ok("1") || c4,
             "ATLAS_GLM_C4_GROUPED_MOE=1 requires ATLAS_GLM_C4_DECODE=1"
         );
-        if !independent && (c4 || c4_sparse || args.max_batch_size == 4) {
+        if !independent && !args.glm_paired_mtp && (c4 || c4_sparse || args.max_batch_size == 4) {
             spark_model::model::glm_c4::validate_prefill_budget(
                 args.max_prefill_tokens,
                 c4_sparse,
@@ -163,6 +163,7 @@ pub(crate) fn preflight_reserve(
         }
         anyhow::ensure!(
             independent
+                || args.glm_paired_mtp
                 || glm5_concurrency_supported(args.max_batch_size, args.max_num_seqs, ep_v2, c4),
             "GLM-5 dual-Spark concurrency supports --max-batch-size 1..=3 and \
              --max-num-seqs max_batch..=5, or explicitly opted-in C4 with active/admitted4; \
@@ -195,8 +196,9 @@ pub(crate) fn preflight_reserve(
                 config.index_topk,
             );
             anyhow::ensure!(
-                args.max_batch_size == 1 || (args.glm_paired_mtp && args.max_batch_size == 2),
-                "GLM-5 MTP requires C1 or the supervised paired C2 dispatcher"
+                args.max_batch_size == 1
+                    || (args.glm_paired_mtp && (2..=4).contains(&args.max_batch_size)),
+                "GLM-5 MTP requires C1 or the supervised bounded-owner dispatcher"
             );
         }
         anyhow::ensure!(
@@ -393,6 +395,15 @@ pub(crate) fn preflight_reserve(
             0
         }
     };
+    let paired_private_bytes = if args.glm_paired_mtp {
+        spark_model::layers::Glm5MtpHead::paired_private_reserve_bytes(
+            config,
+            args.max_seq_len,
+            args.max_batch_size,
+        )?
+    } else {
+        0
+    };
     let inference_reserve: usize = if bounded {
         [
             ssm_pool_bytes,
@@ -401,6 +412,7 @@ pub(crate) fn preflight_reserve(
             ssm_snapshot_bytes,
             gdn_two_phase_bytes,
             cuda_headroom,
+            paired_private_bytes,
         ]
         .into_iter()
         .try_fold(0usize, |sum, bytes| sum.checked_add(bytes))

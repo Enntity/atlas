@@ -767,6 +767,7 @@ pub fn build_model(
             glm5_mtp_lm_head_nvfp4,
             mtp_vocab_size,
             max_seq_len,
+            max_batch_size,
             glm5_mtp_distributed,
         )?,
         retain,

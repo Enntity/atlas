@@ -184,6 +184,30 @@ fn truncated_noncanonical_and_oversized_bytes_refuse() {
 }
 
 #[test]
+fn bounded_owner_capacity_round_trips_without_changing_rank_count() {
+    let mut digests = Vec::new();
+    for owners in [2, 3, 4] {
+        let mut recipe = sample();
+        recipe.profile.max_sequences = owners;
+        let bytes = recipe.encode().unwrap();
+        assert_eq!(Recipe::decode(&bytes).unwrap(), recipe);
+        assert_eq!((recipe.rank, recipe.world), (1, 2));
+        digests.push(recipe.digest().unwrap());
+    }
+    assert!(digests.windows(2).all(|pair| pair[0] != pair[1]));
+}
+
+#[test]
+fn owner_capacity_outside_two_through_four_refuses() {
+    for owners in [0, 1, 5, u16::MAX] {
+        let mut recipe = sample();
+        recipe.profile.max_sequences = owners;
+        assert!(recipe.profile.validate().is_err());
+        assert!(recipe.encode().is_err());
+    }
+}
+
+#[test]
 fn every_profile_field_is_fixed_but_no_environment_values_are_invented() {
     let original = sample();
     for which in 0..13 {

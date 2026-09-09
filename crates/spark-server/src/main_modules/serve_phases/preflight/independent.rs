@@ -25,6 +25,10 @@ fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<O
         );
     }
     if args.glm_paired_mtp {
+        anyhow::ensure!(
+            (2..=4).contains(&args.max_batch_size) && args.max_num_seqs == args.max_batch_size,
+            "selected paired active/admitted capacities must agree within2..4"
+        );
         let topology = resolve_topology(args, config)?;
         anyhow::ensure!(
             topology.world_size == 2
@@ -34,6 +38,11 @@ fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<O
                 && config.ep_rank == args.rank,
             "resolved paired topology mismatch before GPU initialization"
         );
+        spark_model::layers::Glm5MtpHead::paired_private_reserve_bytes(
+            config,
+            args.max_seq_len,
+            args.max_batch_size,
+        )?;
         return Ok(Some(topology));
     }
     if !spark_model::model::glm_independent::enabled(&config.model_type)? {

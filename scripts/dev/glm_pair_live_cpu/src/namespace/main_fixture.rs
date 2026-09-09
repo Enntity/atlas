@@ -12,6 +12,8 @@ pub(crate) fn registered_mode(mode: &str) -> bool {
     matches!(
         mode,
         "registered-valid"
+            | "registered-valid3"
+            | "registered-valid4"
             | "registered-drain"
             | "registered-drain-foreign"
             | "registered-drain-replay"
@@ -19,6 +21,7 @@ pub(crate) fn registered_mode(mode: &str) -> bool {
             | "registered-drain-threaded"
             | "registered-wrong-rank"
             | "registered-missing-capability"
+            | "registered-capacity-mismatch"
             | "registered-unhealthy"
     )
 }
@@ -139,7 +142,11 @@ fn fixture_recipe(
             tp: 2,
             ep: 2,
             ep_protocol: 2,
-            max_sequences: 2,
+            max_sequences: match mode {
+                "registered-valid3" => 3,
+                "registered-valid4" => 4,
+                _ => 2,
+            },
             context: 2044,
             prefill: 1024,
             drafts: 4,
@@ -345,7 +352,11 @@ pub(crate) fn run(executable: &str, mode: &str) -> Result<()> {
                 b"before-register\nregistered\nthread-pdeathsig=0\n".as_slice()
             } else if matches!(mode, "registered-drain" | "registered-drain-replay") && rank == 0 {
                 b"before-register\nregistered\ndrain-signal\n".as_slice()
-            } else if mode == "registered-valid" || mode.starts_with("registered-drain") {
+            } else if matches!(
+                mode,
+                "registered-valid" | "registered-valid3" | "registered-valid4"
+            ) || mode.starts_with("registered-drain")
+            {
                 b"before-register\nregistered\n".as_slice()
             } else {
                 b"before-register\n".as_slice()
