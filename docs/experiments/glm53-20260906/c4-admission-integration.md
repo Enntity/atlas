@@ -1,6 +1,8 @@
 # Bounded concurrent-MTP serving admission
 
 2026-09-09. Host-side integration, not native throughput qualification.
+Subsequent first-process native evidence for committed source6e1e37f4 is in
+`c4-mtp-first-native-results.md`; the host evidence below retains its narrower scope.
 
 The authenticated recipe now admits two through four owners while retaining
 exactly two ranks. Factory construction takes the explicit capacity; armed

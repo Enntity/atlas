@@ -150,7 +150,16 @@ preflight accounting shares the constructor's storage plan and matches actual
 host allocation receipts. The connected CPU supervisor fixture passes actual
 C2/C3/C4 registration and paired shutdown, and rejects a four-owner Model under
 a two-owner recipe. This is not native C3/C4 serving qualification; latest
-qualified serving source remains290cf248. See `c4-admission-integration.md`.
+repeat-qualified C2 serving source remains290cf248. See `c4-admission-integration.md`.
+The first native source6e1e37f4 C4-MTP process now passes four simultaneous
+coherence, tool-call and needle checks, identical retained coding outputs,
+actual paired release and independently inspected both-rank exit0 with zero
+observed swap/OOMs. Warm full-wall medians are C1=27.309,C2=36.891,C3=33.054,
+C4=36.894. This is correct residency, not a C3/C4 throughput win: serialized
+pairs/singletons still reread target weights. Fresh-process repetition remains
+pending. See `c4-mtp-first-native-results.md` and the substantive next traversal
+plan `mtp-owner-batch-implementation-plan.md`; C6/C8 MTP and strict targets
+remain unmet.
 Separately, native M15/M20 FFN arithmetic is bit-exact on the bounded harness,
 memcheck-clean and approximately2x faster than M10 chunks in fresh repetitions;
 see `owner-batch-ffn-native-results.md`. This is not a serving-rate improvement.
