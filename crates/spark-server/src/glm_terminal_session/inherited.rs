@@ -66,6 +66,14 @@ pub(crate) struct InheritedSession {
 }
 
 impl InheritedSession {
+    pub(crate) fn rank(&self) -> u8 {
+        self.rank
+    }
+
+    pub(crate) fn poll_ms(&self) -> u64 {
+        self.policy.poll
+    }
+
     pub(crate) fn ticket(&self) -> &ChildTicket {
         &self.ticket
     }

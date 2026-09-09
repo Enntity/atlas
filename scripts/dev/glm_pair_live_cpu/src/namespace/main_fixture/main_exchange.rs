@@ -44,7 +44,14 @@ pub(super) fn run(nodes: &mut [Namespace; 2], manifest: &wire::Manifest, mode: &
             },
         )?;
     }
-    if matches!(mode, "unreleased-zero" | "bad-environment") {
+    if matches!(
+        mode,
+        "unreleased-zero"
+            | "bad-environment"
+            | "registered-wrong-rank"
+            | "registered-missing-capability"
+            | "registered-unhealthy"
+    ) {
         for node in nodes {
             node.finish_expected(74)?;
         }
@@ -152,11 +159,16 @@ pub(super) fn run(nodes: &mut [Namespace; 2], manifest: &wire::Manifest, mode: &
         node.socket.write_all(&bytes)?;
     }
     for node in nodes {
-        node.finish_expected(if matches!(mode, "valid" | "delayed" | "reused-session") {
-            0
-        } else {
-            74
-        })?;
+        node.finish_expected(
+            if matches!(
+                mode,
+                "valid" | "delayed" | "reused-session" | "registered-valid"
+            ) {
+                0
+            } else {
+                74
+            },
+        )?;
     }
     println!("observed renewal pairs={renewal_pairs}");
     Ok(())

@@ -87,6 +87,11 @@ pub(crate) fn build_model(
         lora_args,
         nllb_lang,
         nllb_lora_dir,
+        if args.glm_paired_mtp {
+            spark_model::factory::GlmMtpBuildMode::Paired
+        } else {
+            spark_model::factory::GlmMtpBuildMode::Legacy
+        },
     )
     .context("Failed to build model")
 }

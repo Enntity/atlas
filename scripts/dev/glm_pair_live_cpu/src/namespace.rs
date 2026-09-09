@@ -6,6 +6,8 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child as Process, Command};
 
 mod main_fixture;
+#[cfg(feature = "model-test-support")]
+pub(crate) use main_fixture::registered_mode;
 pub(super) use main_fixture::{mount_guard, run as main_controller};
 
 struct Namespace {

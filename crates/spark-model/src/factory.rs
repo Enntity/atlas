@@ -124,6 +124,10 @@ mod lm_head_setup;
 mod m2_setup;
 
 pub use build::build_model;
+mod glm_paired;
+#[doc(hidden)]
+pub use crate::model::construction_owner::ColdOwner;
+pub use glm_paired::GlmMtpBuildMode;
 
 #[cfg(test)]
 mod tests {
@@ -168,6 +172,7 @@ mod tests {
             None, // lora_args
             None, // nllb_lang
             None, // nllb_lora_dir
+            GlmMtpBuildMode::Legacy,
         );
         match result {
             Err(e) => assert!(e.to_string().contains("Unsupported model type: 'llama'")),

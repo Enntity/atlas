@@ -307,3 +307,56 @@ fn off_keeps_legacy_global_reserve_and_late_topology() {
     }
     assert!(prepare_reserve(&args(8, 0), &mut config(), 128usize << 30).is_err());
 }
+
+#[test]
+fn paired_mtp_preparation_reserves_real_local_slots_and_rows() {
+    if isolated(
+        "paired_mtp_preparation_reserves_real_local_slots_and_rows",
+        &[
+            ("ATLAS_GLM_INDEPENDENT_DECODE", "0"),
+            ("ATLAS_GLM_MTP_DISTRIBUTED", "1"),
+        ],
+    ) {
+        return;
+    }
+    for rank in 0..2 {
+        let mut a = args(2, rank);
+        a.glm_paired_mtp = true;
+        a.speculative = true;
+        a.max_seq_len = 2044;
+        let mut cfg = config();
+        let (topology, reserve) = prepare_reserve(&a, &mut cfg, 128usize << 30)
+            .unwrap_or_else(|e| panic!("actual paired preparation refused: {e:#}"));
+        assert_eq!(topology.unwrap().ep_rank, rank);
+        assert_eq!(cfg.linear_num_value_heads, 32);
+        let budget = super::super::super::resolve_prefill_budget(&a, reserve.ssm_prefill_chunk);
+        assert_eq!(reserve.max_batch_tokens_pre, budget.max_batch_tokens);
+        assert_eq!(
+            reserve.resolved_prefill.as_ref().unwrap().max_batch_tokens,
+            budget.max_batch_tokens
+        );
+        // Match the actual pool: three live blobs (two owners plus dummy),
+        // two K5 checkpoint/intermediate sets, no plain-decode rollback ring.
+        let h = cfg.num_ssm_layers() * cfg.ssm_h_state_bytes();
+        let conv = cfg.num_ssm_layers() * cfg.ssm_conv_state_bytes();
+        let pool = 3 * (h + conv) + 2 * (4 * h + 5 * conv + h + conv);
+        assert_eq!(
+            reserve.inference_reserve,
+            pool + a.ssm_cache_slots * (h + conv) + reserve.gdn_two_phase_bytes + (4usize << 30)
+        );
+        assert_eq!(
+            reserve.buffer_arena_bytes,
+            spark_runtime::buffers::BufferSizes::from_config(
+                &cfg,
+                budget.max_batch_tokens,
+                a.max_seq_len,
+                a.block_size,
+                a.max_batch_size
+            )
+            .total_bytes()
+        );
+        let total = reserve.inference_reserve + reserve.buffer_arena_bytes;
+        assert!(prepare_reserve(&a, &mut config(), total).is_ok());
+        assert!(prepare_reserve(&a, &mut config(), total - 1).is_err());
+    }
+}

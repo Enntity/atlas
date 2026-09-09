@@ -7,8 +7,13 @@ publish = false
 
 [workspace]
 
+[features]
+model-test-support = ["dep:spark-model", "dep:tracing"]
+
 [dependencies]
 anyhow = "1"
 libc = "=0.2.189"
 atlas-glm-pair-io = { path = "../../../crates/atlas-glm-pair-io" }
 atlas-glm-pair-wire = { path = "../../../crates/atlas-glm-pair-wire" }
+spark-model = { path = "../../../crates/spark-model", default-features = false, features = ["glm-c2-test-utils"], optional = true }
+tracing = { version = "0.1", optional = true }

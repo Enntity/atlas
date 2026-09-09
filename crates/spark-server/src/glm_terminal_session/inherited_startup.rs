@@ -8,6 +8,12 @@ use anyhow::{Context, Result, anyhow, ensure};
 use atlas_glm_pair_io::{PrivateDirectory, identity::boot_time_ms};
 use atlas_glm_pair_wire::{Body, Direction, Frame, MAX_RECIPE_BYTES, Recipe, recipe_digest};
 
+/// Keep the validated launch settings with their actual inherited session.
+pub(crate) struct ReceivedStartup {
+    pub(crate) session: InheritedSession,
+    pub(crate) recipe: Recipe,
+}
+
 fn remaining(deadline: u64, last: &mut u64) -> Result<u64> {
     let now = boot_time_ms()?;
     ensure!(
@@ -58,7 +64,7 @@ fn environment() -> Result<Vec<(String, String)>> {
 pub(crate) unsafe fn receive(
     handshake_ms: u64,
     max_executable_bytes: u64,
-) -> Result<InheritedSession> {
+) -> Result<ReceivedStartup> {
     // Before opening ANY record/directory: otherwise a missing inherited socket
     // could be replaced by a newly opened record at FD3 and mistaken for ownership.
     if unsafe { libc::fcntl(3, libc::F_GETFD) } < 0 {
@@ -127,5 +133,5 @@ pub(crate) unsafe fn receive(
     let session = unsafe { InheritedSession::receive(expected, left) }?;
     directory.revalidate()?;
     remaining(deadline, &mut last)?;
-    Ok(session)
+    Ok(ReceivedStartup { session, recipe })
 }

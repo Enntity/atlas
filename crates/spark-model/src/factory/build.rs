@@ -11,11 +11,13 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use spark_runtime::prefix_cache::PrefixCache;
 use spark_runtime::weights::WeightStore;
 
+use super::GlmMtpBuildMode;
 use super::loader_for_config;
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
 use super::{DflashBuildArgs, LoraBuildArgs};
 use crate::layers::MtpQuantization;
 use crate::model::TransformerModel;
+use crate::model::construction_owner::ColdOwner;
 use crate::model::glm_cache_plan::{GlmCachePlan, GlmMlaShape};
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
@@ -64,7 +66,28 @@ pub fn build_model(
     // NLLB / M2M-100 PEFT LoRA adapter directory (`--lora-adapter` for an
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
+    glm_mtp_mode: GlmMtpBuildMode,
 ) -> Result<Box<dyn Model>> {
+    let retain = glm_mtp_mode == GlmMtpBuildMode::Paired;
+    let gpu = ColdOwner::new(gpu, retain);
+    let comm = ColdOwner::new(comm, retain);
+    super::glm_paired::validate(
+        glm_mtp_mode,
+        &config,
+        max_batch_tokens,
+        max_seq_len,
+        max_batch_size,
+        mtp_quant,
+        use_speculative,
+        self_speculative,
+        num_drafts,
+        kv_dtype,
+        &layer_dtypes,
+        comm.as_deref(),
+        hss_cache_blocks_per_seq,
+        dflash_args.is_some(),
+        lora_args.is_some(),
+    )?;
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
     // `NllbGpuModel`, which reads its weights from the standard `store` — this
@@ -87,7 +110,7 @@ pub fn build_model(
         let model = crate::model::nllb::NllbGpuModel::new(
             &config,
             &store,
-            gpu,
+            gpu.into_inner(),
             lang,
             max_seq_len,
             max_batch_size,
@@ -674,33 +697,37 @@ pub fn build_model(
         && config.num_mtp_modules > 0
         && matches!(config.model_type.as_str(), "deepseek_v4" | "glm5_next");
 
-    let mut model = TransformerModel::new(
-        config,
-        embed,
-        final_norm,
-        lm_head,
-        lm_head_nvfp4,
-        lm_head_fp8,
-        mtp_lm_head_nvfp4,
-        layers,
-        buffers,
-        kv_cache,
-        mtp_weights,
-        gpu,
-        max_seq_len,
-        max_batch_size,
-        effective_mtp_quant,
-        use_speculative,
-        external_mtp_proposer,
-        prefix_cache,
-        mtp_vocab_size,
-        comm,
-        self_speculative,
-        num_drafts,
-        vision_encoder,
-        ssm_cache_slots,
-        ssm_checkpoint_interval,
-    )?;
+    let mut model = ColdOwner::new(
+        TransformerModel::new_with_cold_retention(
+            config,
+            embed,
+            final_norm,
+            lm_head,
+            lm_head_nvfp4,
+            lm_head_fp8,
+            mtp_lm_head_nvfp4,
+            layers,
+            buffers,
+            kv_cache,
+            mtp_weights,
+            gpu.into_inner(),
+            max_seq_len,
+            max_batch_size,
+            effective_mtp_quant,
+            use_speculative,
+            external_mtp_proposer,
+            prefix_cache,
+            mtp_vocab_size,
+            comm.into_inner(),
+            self_speculative,
+            num_drafts,
+            vision_encoder,
+            ssm_cache_slots,
+            ssm_checkpoint_interval,
+            retain,
+        )?,
+        retain,
+    );
 
     // ── Step 6b: DeepSeek-V4 MTP proposer (optional, post-construction) ──
     //
@@ -730,32 +757,20 @@ pub fn build_model(
     }
 
     // ── Step 6c: GLM-5 appended-layer MTP proposer (optional) ──
-    if let Some(glm5_module) = glm5_mtp_module {
-        match crate::layers::Glm5MtpHead::new(
-            glm5_module,
+    model = ColdOwner::new(
+        super::glm_paired::install_head(
+            model.into_inner(),
+            glm_mtp_mode,
+            glm5_mtp_module,
             glm5_mtp_embed,
             glm5_mtp_lm_head,
             glm5_mtp_lm_head_nvfp4,
-            model.config_ref(),
-            model.gpu_backend(),
             mtp_vocab_size,
             max_seq_len,
-        ) {
-            Ok(head) => {
-                model.set_dflash_proposer(std::sync::Arc::new(head));
-                tracing::info!("GLM-5 MTP speculative decoding: ENABLED (single module)");
-            }
-            Err(error) if glm5_mtp_distributed => {
-                return Err(error.context(format!(
-                    "distributed GLM MTP proposer construction failed on rank {}",
-                    model.config_ref().ep_rank
-                )));
-            }
-            Err(error) => tracing::warn!(
-                "Failed to build GLM-5 MTP proposer: {error:#}. Speculative decoding disabled."
-            ),
-        }
-    }
+            glm5_mtp_distributed,
+        )?,
+        retain,
+    );
 
     // ── Step 7: DFlash drafter (optional, post-construction) ──
     //
@@ -802,5 +817,5 @@ pub fn build_model(
     // to happen — orphaned the memory: live, referenced by the layers, with
     // nothing owning the ability to release it.
     model.adopt_weight_store(store);
-    Ok(Box::new(model))
+    Ok(Box::new(model.into_inner()))
 }

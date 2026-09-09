@@ -37,6 +37,9 @@ use crate::{
     session_manager,
 };
 
+mod selected_handoff;
+use selected_handoff::ServingModel;
+
 /// Load a model and build everything derived from it.
 ///
 /// State that OUTLIVES any model and must be carried across a swap.
@@ -83,10 +86,27 @@ impl Carried {
 /// `Ok(None)` means this rank is an EP worker: it ran its command loop and has
 /// nothing for the async tail to serve.
 pub(crate) fn load_model(
-    mut args: cli::ServeArgs,
+    args: cli::ServeArgs,
     tui_handles_tx: Option<std::sync::mpsc::Sender<crate::tui::RunHandles>>,
     carried: Carried,
 ) -> Result<Option<Prepared>> {
+    anyhow::ensure!(
+        !args.glm_paired_mtp,
+        "paired session cannot hot-swap or load without inherited authority"
+    );
+    load_model_selected(args, tui_handles_tx, carried, None)
+}
+
+pub(crate) fn load_model_selected(
+    mut args: cli::ServeArgs,
+    tui_handles_tx: Option<std::sync::mpsc::Sender<crate::tui::RunHandles>>,
+    carried: Carried,
+    selected: Option<crate::glm_terminal_session::startup::SelectedStartup>,
+) -> Result<Option<Prepared>> {
+    anyhow::ensure!(
+        args.glm_paired_mtp == selected.is_some(),
+        "selected launch authority mismatch"
+    );
     // 0. Resolve model directory from HF ID or path
     spark_runtime::progress::phase(1, "model resolve");
     let model_dir = serve_phases::resolve_model_dir(&args)?;
@@ -366,11 +386,28 @@ pub(crate) fn load_model(
     // `args.num_drafts` is Some and `args.resolved_num_drafts()` is valid.
     serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);
 
+    #[cfg(target_os = "linux")]
+    if let Some(startup) = &selected {
+        crate::glm_terminal_session::startup::validate_args(&args, &startup.received.recipe)?;
+        anyhow::ensure!(
+            config.model_type == "glm5_next"
+                && model_quant == "nvfp4"
+                && config.hidden_size == 4096
+                && config.kv_lora_rank == 512
+                && config.qk_rope_head_dim == 0
+                && config.vision.is_none(),
+            "paired serving requires the resolved text GLM5.3 NVFP4 target"
+        );
+    }
+
     // ── Pre-load reserve preflight ──
     let (gpu, free_mem, prepared_topology, reserve) =
         serve_phases::prepare_reserve(&args, &mut config, || {
             serve_phases::init_gpu_backend(&args, &ptx_set)
         })?;
+    // Preserve the native owner on any selected startup Err before the actual
+    // factory takes ownership. Its selected constructor applies the same rule.
+    let gpu = spark_model::factory::ColdOwner::new(gpu, selected.is_some());
     let serve_phases::ReservePreflight {
         inference_reserve,
         buffer_arena_bytes,
@@ -389,10 +426,15 @@ pub(crate) fn load_model(
     // and the OS handles memory pressure via Metal's working-set policy,
     // so the dedicated watchdog isn't needed.
     #[cfg(feature = "cuda")]
-    let _oom_watchdog = spark_runtime::cuda_backend::spawn_oom_watchdog(
-        2048, // 2 GB threshold
-        std::time::Duration::from_secs(2),
-    );
+    let _oom_watchdog = if selected.is_some() {
+        spark_runtime::cuda_backend::spawn_oom_watchdog_with_exit(
+            2048,
+            std::time::Duration::from_secs(2),
+            crate::glm_terminal_session::terminate,
+        )
+    } else {
+        spark_runtime::cuda_backend::spawn_oom_watchdog(2048, std::time::Duration::from_secs(2))
+    };
     #[cfg(feature = "cuda")]
     tracing::info!("OOM watchdog started (threshold: 2 GB, interval: 2s)");
 
@@ -540,6 +582,7 @@ pub(crate) fn load_model(
         max_batch_tokens,
         config.hidden_size,
     )?;
+    let comm = spark_model::factory::ColdOwner::new(comm, selected.is_some());
     // Carried on the config rather than written into the environment: the old
     // `unsafe set_var` claimed "called before any threads are spawned", which
     // was false by this point (tokio pool, this blocking thread, the signal
@@ -678,19 +721,35 @@ pub(crate) fn load_model(
         // Moved, not borrowed: the model keeps the ledger so it can free the
         // weights at teardown. Nothing after this point reads the store.
         store,
-        gpu,
+        gpu.into_inner(),
         max_batch_tokens,
         kv_dtype,
         inference_reserve,
         layer_dtypes,
         hss_cache_blocks_per_seq,
         prefix_cache,
-        comm,
+        comm.into_inner(),
         dflash_args,
         lora_args,
         nllb_lang,
         nllb_lora_dir,
     )?;
+
+    // Register the actual capability before any fallible post-build work or
+    // worker/scheduler handoff can drop this selected Model.
+    #[cfg(target_os = "linux")]
+    let model = match selected {
+        Some(startup) => {
+            ServingModel::Selected(crate::glm_terminal_session::SelectedModel::register(
+                model,
+                startup.received,
+                args.rank as u8,
+            ))
+        }
+        None => ServingModel::Ordinary(model),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let model = ServingModel::Ordinary(model);
 
     // Kernel load audit + the fail-closed boot gate. Every lookup is eager, so
     // by here the audit holds this model's COMPLETE lookup set — see
@@ -705,13 +764,23 @@ pub(crate) fn load_model(
     let early_high_speed_swap_cfg = serve_phases::build_high_speed_swap_config(&args)?;
 
     // EP worker: rank > 0 enters command loop, returns when head exits.
-    let mut model_opt = Some(model);
-    if serve_phases::maybe_run_ep_worker(&args, &mut model_opt, &early_high_speed_swap_cfg)? {
-        // An EP worker (rank > 0) never serves HTTP: it ran its command loop and
-        // the head has exited. `None` = nothing for the async tail to do.
-        return Ok(None);
-    }
-    let model = model_opt.expect("head retains model on rank 0");
+    let model = match model {
+        #[cfg(target_os = "linux")]
+        ServingModel::Selected(owner) => {
+            if args.rank > 0 {
+                owner.run_worker();
+            }
+            ServingModel::Selected(owner)
+        }
+        ServingModel::Ordinary(model) => {
+            let mut model_opt = Some(model);
+            if serve_phases::maybe_run_ep_worker(&args, &mut model_opt, &early_high_speed_swap_cfg)?
+            {
+                return Ok(None);
+            }
+            ServingModel::Ordinary(model_opt.expect("head retains model on rank 0"))
+        }
+    };
 
     // Build EOS token list from generation_config.json (authoritative) or config.json fallback
     let mut eos_tokens = serve_phases::load_eos_tokens(&model_dir, &config);
@@ -947,6 +1016,28 @@ pub(crate) fn load_model(
     // down. Without the handle there is no way to wait for that, and the
     // teardown would race a scheduler still touching the weights.
     let scheduler_handle = std::thread::spawn(move || {
+        let scheduler_model = match scheduler_model {
+            #[cfg(target_os = "linux")]
+            ServingModel::Selected(owner) => scheduler::run_selected(
+                owner,
+                request_rx,
+                rotation_rx,
+                scheduler_eos,
+                think_end_token,
+                think_start_token,
+                tool_call_start_token,
+                tool_call_end_token,
+                scheduler_spontaneous_think_budget,
+                scheduler::sched_ctx::SchedCtx::new(
+                    vocab_masks,
+                    run_levers,
+                    run_snapshot,
+                    sched_limits,
+                    watchdog_params,
+                ),
+            ),
+            ServingModel::Ordinary(model) => model,
+        };
         scheduler::run(
             scheduler_model,
             request_rx,

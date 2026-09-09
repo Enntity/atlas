@@ -78,6 +78,9 @@ pub(crate) fn preflight_reserve(
     free_mem: usize,
 ) -> Result<ReservePreflight> {
     let independent = spark_model::model::glm_independent::enabled(&config.model_type)?;
+    // Both selected dispatchers retain TP-local topology and the exact row
+    // budget. Paired MTP still reserves its speculative intermediates/headroom.
+    let bounded = independent || args.glm_paired_mtp;
     if spark_model::speculative::glm_repair_policy::parse(
         std::env::var("ATLAS_GLM_MTP_REPAIR").ok().as_deref(),
     )? {
@@ -192,8 +195,8 @@ pub(crate) fn preflight_reserve(
                 config.index_topk,
             );
             anyhow::ensure!(
-                args.max_batch_size == 1,
-                "GLM-5 MTP bring-up is intentionally limited to --max-batch-size 1 until batched proposer state is validated"
+                args.max_batch_size == 1 || (args.glm_paired_mtp && args.max_batch_size == 2),
+                "GLM-5 MTP requires C1 or the supervised paired C2 dispatcher"
             );
         }
         anyhow::ensure!(
@@ -231,9 +234,9 @@ pub(crate) fn preflight_reserve(
         h_state_bytes,
         spark_model::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
     );
-    // Selected FP32/nonspec pools allocate one additional live dummy slot.
+    // Selected FP32 pools allocate one additional live dummy slot.
     // It has no prefix/rollback snapshots; do not inflate those counts.
-    let live_slots = args.max_batch_size + usize::from(independent);
+    let live_slots = args.max_batch_size + usize::from(bounded);
     let ssm_pool_bytes = spark_model::ssm_reserve::ssm_pool_reserve_bytes(
         live_slots,
         config.num_ssm_layers() * h_state_bytes,
@@ -306,8 +309,7 @@ pub(crate) fn preflight_reserve(
     // Issue #15 auto-clamp removed (2026-07-02): snapshot reachability is
     // handled by the tail-checkpoint split in `prefill_chunk_dispatch`, so
     // the budget (and this arena-sizing mirror) stays at full chunk size.
-    let resolved_prefill =
-        independent.then(|| super::resolve_prefill_budget(args, ssm_prefill_chunk));
+    let resolved_prefill = bounded.then(|| super::resolve_prefill_budget(args, ssm_prefill_chunk));
     let max_batch_tokens_pre = resolved_prefill.as_ref().map_or_else(
         || {
             prefill_budget_pre
@@ -318,8 +320,8 @@ pub(crate) fn preflight_reserve(
     );
     // The selected envelope is bounded before BufferSizes' unchecked products.
     anyhow::ensure!(
-        !independent || max_batch_tokens_pre <= 65535,
-        "independent arena rows exceed the CUDA grid limit"
+        !bounded || max_batch_tokens_pre <= 65535,
+        "selected arena rows exceed the CUDA grid limit"
     );
     let buffer_arena_bytes = spark_runtime::buffers::BufferSizes::from_config(
         config,
@@ -358,12 +360,12 @@ pub(crate) fn preflight_reserve(
         )
         .slots
     };
-    let ssm_snapshot_bytes = if independent {
+    let ssm_snapshot_bytes = if bounded {
         args.ssm_cache_slots
             .checked_add(decode_ring_slots * args.max_batch_size)
             .and_then(|n| n.checked_mul(config.num_ssm_layers()))
             .and_then(|n| n.checked_mul(h_state_bytes + conv_state_bytes))
-            .context("independent snapshot reserve overflow")?
+            .context("selected snapshot reserve overflow")?
     } else {
         (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
             * config.num_ssm_layers()
@@ -381,7 +383,7 @@ pub(crate) fn preflight_reserve(
         let nv = config.linear_num_value_heads;
         let conv_dim = key_dim * 2 + value_dim;
         if conv_dim > 0 && config.num_ssm_layers() > 0 {
-            let sl = if independent {
+            let sl = if bounded {
                 max_batch_tokens_pre.min(args.max_seq_len)
             } else {
                 max_batch_tokens_pre
@@ -391,7 +393,7 @@ pub(crate) fn preflight_reserve(
             0
         }
     };
-    let inference_reserve: usize = if independent {
+    let inference_reserve: usize = if bounded {
         [
             ssm_pool_bytes,
             ssm_h_stage_bytes,
@@ -402,7 +404,7 @@ pub(crate) fn preflight_reserve(
         ]
         .into_iter()
         .try_fold(0usize, |sum, bytes| sum.checked_add(bytes))
-        .context("independent inference reserve overflow")?
+        .context("selected inference reserve overflow")?
     } else {
         ssm_pool_bytes
             + ssm_h_stage_bytes
@@ -411,10 +413,10 @@ pub(crate) fn preflight_reserve(
             + gdn_two_phase_bytes
             + cuda_headroom
     };
-    let total_reserve = if independent {
+    let total_reserve = if bounded {
         inference_reserve
             .checked_add(buffer_arena_bytes)
-            .context("independent total reserve overflow")?
+            .context("selected total reserve overflow")?
     } else {
         inference_reserve + buffer_arena_bytes
     };

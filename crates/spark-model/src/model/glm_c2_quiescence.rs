@@ -3,6 +3,14 @@
 use super::*;
 
 impl TransformerModel {
+    pub(super) fn paired_validate_session_rank(&self, expected_rank: u8) -> Result<()> {
+        self.paired_completion_preflight()?;
+        ensure!(
+            self.config.ep_rank == usize::from(expected_rank),
+            "paired Model rank differs from inherited session rank"
+        );
+        Ok(())
+    }
     fn paired_completion_preflight(&self) -> Result<()> {
         ensure!(
             self.config.model_type == "glm5_next"

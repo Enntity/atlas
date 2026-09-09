@@ -41,7 +41,7 @@ fn lmhead_tgemm_enabled() -> bool {
 }
 
 impl TransformerModel {
-    pub fn new(
+    pub(crate) fn new_with_cold_retention(
         config: ModelConfig,
         embed_tokens: DenseWeight,
         final_norm: DenseWeight,
@@ -77,7 +77,10 @@ impl TransformerModel {
         vision_encoder: Option<crate::layers::VisionEncoder>,
         ssm_cache_slots: usize,
         ssm_checkpoint_interval: usize,
+        retain_backend_on_error: bool,
     ) -> Result<Self> {
+        let gpu = super::construction_owner::ColdOwner::new(gpu, retain_backend_on_error);
+        let comm = super::construction_owner::ColdOwner::new(comm, retain_backend_on_error);
         // `rms_norm_kernel` normalizes exactly one weight: `final_norm` (a
         // checkpoint tensor). Models that ship HF-vanilla norm weights load it
         // exactly and must use the vanilla kernel.
@@ -508,19 +511,25 @@ impl TransformerModel {
         //   - norm_output: attention o_proj decode output
         //     (`attention_forward_oproj` writes o_out = `buffers.norm_output()`),
         //     reduced per attention layer under TP.
-        if let Some(ref comm) = comm
+        if let Some(ref comm) = *comm
             && comm.world_size() == 2
         {
             let moe_ptr = buffers.moe_output().0;
             let moe_bytes = buffers.sizes().moe_output;
             match comm.register_buffer(moe_ptr, moe_bytes) {
                 Ok(_) => tracing::info!("Registered moe_output ({moe_bytes} B) with NCCL"),
+                Err(e) if retain_backend_on_error => {
+                    return Err(e.context("paired moe_output registration failed"));
+                }
                 Err(e) => tracing::warn!("ncclCommRegister moe_output failed (non-fatal): {e}"),
             }
             let norm_ptr = buffers.norm_output().0;
             let norm_bytes = buffers.sizes().norm_output;
             match comm.register_buffer(norm_ptr, norm_bytes) {
                 Ok(_) => tracing::info!("Registered norm_output ({norm_bytes} B) with NCCL"),
+                Err(e) if retain_backend_on_error => {
+                    return Err(e.context("paired norm_output registration failed"));
+                }
                 Err(e) => tracing::warn!("ncclCommRegister norm_output failed (non-fatal): {e}"),
             }
             match gpu.kernel("bf16_add", "bf16_add_inplace") {
@@ -704,7 +713,7 @@ impl TransformerModel {
             lora_install_attempted: false,
             lora_rotatable: false,
             kv_cache: Mutex::new(kv_cache),
-            gpu,
+            gpu: gpu.into_inner(),
             rms_norm_kernel,
             dense_gemv_kernel,
             dense_gemv_fp32out_kernel,
@@ -780,7 +789,7 @@ impl TransformerModel {
             secondary_stream,
             secondary_event,
             snapshot_event,
-            comm,
+            comm: comm.into_inner(),
             ep_cmd_buf,
             ep_protocol_v2: matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2")),
             self_speculative,

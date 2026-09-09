@@ -52,6 +52,12 @@ impl Fixture {
 /// Local packet recorder/replay, not concurrent collective agreement.
 pub struct Wire(Arc<wire::Wire>);
 impl Wire {
+    pub fn enable_cold_prefix(&self) {
+        self.0.enable_cold_prefix();
+    }
+    pub fn roots(&self) -> Vec<usize> {
+        self.0.roots()
+    }
     pub fn packets(&self) -> Vec<Vec<u32>> {
         self.0.packets()
     }

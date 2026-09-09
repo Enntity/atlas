@@ -12,11 +12,24 @@ pub(crate) fn prepare_reserve<B>(
     // OFF retains the original backend -> reserve -> late topology order.
     let topology = prepare_topology(args, config)?;
     let (backend, free_mem) = init_backend()?;
+    let backend = spark_model::factory::ColdOwner::new(backend, args.glm_paired_mtp);
     let reserve = preflight_reserve(args, config, free_mem)?;
-    Ok((backend, free_mem, topology, reserve))
+    Ok((backend.into_inner(), free_mem, topology, reserve))
 }
 
 fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<Option<Topology>> {
+    if args.glm_paired_mtp {
+        let topology = resolve_topology(args, config)?;
+        anyhow::ensure!(
+            topology.world_size == 2
+                && topology.tp_size == 2
+                && topology.ep_size == 2
+                && config.tp_rank == config.ep_rank
+                && config.ep_rank == args.rank,
+            "resolved paired topology mismatch before GPU initialization"
+        );
+        return Ok(Some(topology));
+    }
     if !spark_model::model::glm_independent::enabled(&config.model_type)? {
         return Ok(None);
     }

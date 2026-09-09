@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Unactivated paired serial control; serving still requires admission and T2/T3.
+//! Request-owned paired serial transactions for the supervised selected caller.
 use super::{ActiveSeq, logit_processors::LogitsContext, sched_ctx::SchedCtx};
 use super::{emit_step, helpers, mod_helpers, sample_step, verify_pipeline_helper};
 use anyhow::Result;
 use spark_model::speculative::glm_paired_execution::GlmPairedExecution;
 use spark_model::traits::Model;
 
-/// A complete owner transaction before moving to its peer. No serving caller;
-/// any error must enter the future armed T2 boundary, not ordinary retirement.
-#[allow(dead_code)]
+/// A complete owner transaction before moving to its peer. The serving caller
+/// must handle errors while armed, without entering ordinary retirement.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn step_selected_serial(
     model: &dyn Model,
     active: &mut [ActiveSeq],
@@ -74,6 +74,11 @@ pub(super) fn step_selected_serial(
 }
 
 fn stopped(a: &mut ActiveSeq, sched: &SchedCtx, ceiling: bool) -> bool {
+    // Shutdown is not per-request retirement. Finish any issued transaction,
+    // then retain its owners for the selected caller's matched shutdown.
+    if crate::tui::shutdown::requested() {
+        return true;
+    }
     mod_helpers::enforce_request_deadlines(std::slice::from_mut(a));
     if a.finished || emit_step::retire_if_cancelled(a) {
         return true;
@@ -111,6 +116,7 @@ fn propose(
     }
     let position = a.seq.seq_len;
     capability.validate_propose(&a.seq, a.last_token, position, 4, None)?;
+    capability.check_communication_health()?;
     let drafts = capability.propose(&mut a.seq, a.last_token, position, 4, None)?;
     anyhow::ensure!(
         drafts.len() == 4 && drafts.iter().all(|t| (*t as usize) < model.vocab_size()),
@@ -154,6 +160,7 @@ fn bootstrap(
     if stopped(a, sched, false) {
         return Ok(());
     }
+    capability.check_communication_health()?;
     emit_step::emit_token_at_position(a, token, None, sched, a.seq.seq_len);
     a.last_token = token;
     propose(capability, model, a, sched)
@@ -205,6 +212,7 @@ fn verdict(
         } else {
             selected[accepted]
         };
+        capability.check_communication_health()?;
         emit_step::emit_token_at_position(a, token, None, sched, base + i + 1);
         a.last_token = token;
     }

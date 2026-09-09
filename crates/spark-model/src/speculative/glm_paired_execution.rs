@@ -8,9 +8,11 @@ pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
-/// Only the actual TransformerModel implements this capability. No factory
-/// selects its paired constructor yet; other models return None.
+/// Only the actual TransformerModel implements this capability. Explicit paired
+/// construction is separate from supervised serving admission; other models return None.
 pub trait GlmPairedExecution: sealed::Sealed + Send + Sync {
+    /// Bind a supervised local rank to the actual open paired Model; no health probe.
+    fn validate_session_rank(&self, expected_rank: u8) -> Result<()>;
     /// Local health only; no synchronization, host drain or pair-release authority.
     fn check_communication_health(&self) -> Result<()>;
     /// Strict local joins; caller retains owners and owns the supervised pair release.

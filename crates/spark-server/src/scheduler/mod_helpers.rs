@@ -350,9 +350,9 @@ pub(super) fn retire_finished_sequences(
     *active = survivors;
 }
 
-/// Staged paired-only path; future T2 must handle Err while armed, before cleanup.
-/// No serving caller exists until supervised selected admission is integrated.
-#[allow(dead_code)]
+/// Paired-only retirement: the selected caller handles Err while still armed,
+/// before any ordinary cleanup can drop the retained host owners.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn retire_selected_finished_sequences(
     model: &dyn Model,
     active: &mut Vec<ActiveSeq>,
@@ -372,6 +372,9 @@ pub(super) fn retire_selected_finished_sequences(
         seen[slot] = true;
     }
     for slot in 0..2 {
+        if crate::tui::shutdown::requested() {
+            return Ok(());
+        }
         let Some(index) = active
             .iter()
             .position(|a| a.finished && a.seq.slot_idx == slot)
@@ -383,6 +386,13 @@ pub(super) fn retire_selected_finished_sequences(
         // already be retired when F1 fails: this is terminal, never rollback/retry.
         model.free_sequence(&mut a.seq)?;
         model.ep_broadcast_cmd_for_seq(slot as u32, 0xFFFFFFF1)?;
+        model
+            .glm_paired_execution()
+            .expect("validated selected retirement capability")
+            .check_communication_health()?;
+        if crate::tui::shutdown::requested() {
+            return Ok(());
+        }
         super::lifecycle::finish_response(a, max_seq_len);
         active.remove(index);
     }

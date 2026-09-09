@@ -8,6 +8,16 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 mod main_exchange;
 
+pub(crate) fn registered_mode(mode: &str) -> bool {
+    matches!(
+        mode,
+        "registered-valid"
+            | "registered-wrong-rank"
+            | "registered-missing-capability"
+            | "registered-unhealthy"
+    )
+}
+
 pub(crate) fn mount_guard(source: &str, executable: &str) -> Result<()> {
     ensure!(
         unsafe { libc::getpid() } == 1,
@@ -80,22 +90,47 @@ fn fixture_recipe(
                 .to_str()
                 .context("UTF8 ELF")?
                 .to_owned(),
-            "--consumer-files".to_owned(),
+            if registered_mode(mode) {
+                "--consumer-registered"
+            } else {
+                "--consumer-files"
+            }
+            .to_owned(),
         ],
-        environment: vec![
-            ("ATLAS_GLM_PAIR_FD".to_owned(), "3".to_owned()),
-            (
-                "ATLAS_PAIR_CPU_DELAY_MS".to_owned(),
-                if mode == "delayed" && rank == 1 {
-                    "6000"
-                } else {
-                    "0"
-                }
-                .to_owned(),
-            ),
-            ("ATLAS_PAIR_CPU_MODE".to_owned(), mode.to_owned()),
-            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-        ],
+        environment: {
+            let mut environment = vec![
+                ("ATLAS_GLM_PAIR_FD".to_owned(), "3".to_owned()),
+                (
+                    "ATLAS_PAIR_CPU_DELAY_MS".to_owned(),
+                    if mode == "delayed" && rank == 1 {
+                        "6000"
+                    } else {
+                        "0"
+                    }
+                    .to_owned(),
+                ),
+                ("ATLAS_PAIR_CPU_MODE".to_owned(), mode.to_owned()),
+                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ];
+            if registered_mode(mode) {
+                // Literal CPU fixture policy, never ambient Atlas/NCCL/loader forwarding.
+                environment.extend(
+                    [
+                        ("ATLAS_EP_PROTOCOL", "v2"),
+                        ("ATLAS_GLM_MTP_HIDDEN_TRACE", "0"),
+                        ("ATLAS_GLM_MTP_REPAIR", "0"),
+                        ("ATLAS_GLM_MTP_BATCHED_PREFILL", "1"),
+                        ("ATLAS_GLM_MTP_DISTRIBUTED", "1"),
+                        ("ATLAS_GLM_MTP_ALL_GATHER", "1"),
+                        ("ATLAS_GLM_MTP_DISTRIBUTED_ARGMAX", "0"),
+                        ("ATLAS_MTP_DRAFTER_CONTEXT_PREFILL_ONLY_UNSAFE", "1"),
+                    ]
+                    .map(|(key, value)| (key.to_owned(), value.to_owned())),
+                );
+                environment.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            }
+            environment
+        },
         mounts: vec![wire::Mount {
             source: source.to_str().context("UTF8 source")?.to_owned(),
             destination: "/run/atlas-pair".to_owned(),
@@ -213,8 +248,13 @@ pub(crate) fn run(executable: &str, mode: &str) -> Result<()> {
             "reused-session",
             "hardlinked-record"
         ]
-        .contains(&mode),
+        .contains(&mode)
+            || registered_mode(mode),
         "explicit main fixture mode"
+    );
+    ensure!(
+        !registered_mode(mode) || cfg!(feature = "model-test-support"),
+        "registered modes require the explicit model-test-support build"
     );
     let deadline = identity::boot_time_ms()? + 10000;
     let server = identity::PinnedExecutable::open_process(
@@ -302,6 +342,21 @@ pub(crate) fn run(executable: &str, mode: &str) -> Result<()> {
         ranks: [reports[0], reports[1]],
     };
     main_exchange::run(&mut nodes, &manifest, mode)?;
+    if registered_mode(mode) {
+        let expected = if mode == "registered-valid" {
+            b"before-register\nregistered\n".as_slice()
+        } else {
+            b"before-register\n".as_slice()
+        };
+        for source in &sources {
+            ensure!(
+                std::fs::read(source.join("registered-witness"))? == expected,
+                "actual Model registration/terminal witness mismatch"
+            );
+        }
+        println!("PASS ({mode}): actual inherited startup, Model registration and terminal owner; valid mode uses actual head/worker shutdown and local Model quiescence, with scripted model command replay, NOT NCCL/GPU/Docker qualification");
+        return Ok(());
+    }
     if mode == "reused-session" {
         for source in &sources {
             ensure!(

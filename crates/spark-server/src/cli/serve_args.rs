@@ -509,6 +509,12 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub speculative: bool,
 
+    /// Supervised, fixed-profile GLM TP2/EP2 paired MTP4 serving.
+    /// Requires the one-shot inherited guard channel and matching launch recipe;
+    /// this flag alone never authorizes model construction or serving.
+    #[arg(long)]
+    pub glm_paired_mtp: bool,
+
     /// Enable self-speculative decoding: draft via layer-skipping (no MTP weights needed).
     /// Skips SSM layers during drafting for cheap predictions, then verifies with full model.
     #[arg(long, default_value_t = false)]

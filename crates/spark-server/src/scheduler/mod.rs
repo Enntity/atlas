@@ -26,7 +26,13 @@ mod fast_greedy;
 #[cfg(test)]
 mod finish_guard_tests;
 mod first_token_thinking;
+#[cfg(target_os = "linux")]
+mod glm_c2_selected;
+#[cfg(target_os = "linux")]
+mod glm_c2_selected_prefill;
 mod glm_c2_serial;
+#[cfg(target_os = "linux")]
+pub(crate) use glm_c2_selected::run_selected;
 mod helpers;
 mod lifecycle;
 #[cfg(test)]

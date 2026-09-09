@@ -139,6 +139,46 @@ impl Run {
 }
 
 #[test]
+fn actual_health_failure_stops_before_emission_or_e1() {
+    if isolated("actual_health_failure_stops_before_emission_or_e1") {
+        return;
+    }
+    let mut control = Run::new([0, 1]);
+    control.step().unwrap();
+    let accepted = control.tx.packets()[4][0] as usize;
+    let health: Vec<_> = control
+        .observer
+        .events()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| (*e == Event::Health(true)).then_some(i + 1))
+        .collect();
+    assert!(
+        health.len() >= accepted + 2,
+        "missing actual health before every emit and E1"
+    );
+    let ordinals = [health[0], health[accepted + 1]];
+    control.close();
+    for (site, ordinal) in ordinals.into_iter().enumerate() {
+        let mut run = Run::new([0, 1]);
+        let outputs: Vec<_> = run.active.iter().map(|a| a.output_tokens.len()).collect();
+        let peer_tokens = run.active[1].seq.tokens.clone();
+        run.observer.fail_at(ordinal);
+        assert!(format!("{:#}", run.step().unwrap_err()).contains("unhealthy"));
+        assert_eq!(run.observer.events().len(), ordinal);
+        assert_eq!(run.observer.events().last(), Some(&Event::Health(true)));
+        assert_eq!(run.tx.packets().len(), 5); // F5 + accepted; no E1 or peer.
+        assert_eq!(
+            run.active[0].output_tokens.len(),
+            outputs[0] + if site == 0 { 0 } else { accepted + 1 }
+        );
+        assert_eq!(run.active[1].output_tokens.len(), outputs[1]);
+        assert_eq!(run.active[1].seq.tokens, peer_tokens);
+        run.abandon_failed_mock();
+    }
+}
+
+#[test]
 fn actual_multiple_rounds_replay_in_both_vector_orders() {
     if isolated("actual_multiple_rounds_replay_in_both_vector_orders") {
         return;

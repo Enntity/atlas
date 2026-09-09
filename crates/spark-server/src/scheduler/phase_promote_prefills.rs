@@ -114,7 +114,7 @@ pub(super) fn promote_completed_prefills(
 /// near-identical field initialisation; this helper reuses the same record
 /// and the caller decides whether to push onto active or finish_sequence.
 #[allow(clippy::too_many_arguments)]
-fn build_active_seq_from_prefill(
+pub(super) fn build_active_seq_from_prefill(
     p: PrefillInProgress,
     first: u32,
     spontaneous_think: bool,

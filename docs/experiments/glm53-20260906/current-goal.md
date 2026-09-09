@@ -91,8 +91,13 @@ The production LIVE guard entry/loop, canonical recipe codec, pinned startup
 ingress and two-rank release now pass the actual two-guard CPU fixture, including
 delayed-peer renewal and rejected unreleased/replayed exits. See
 `live-pair-release-results.md`. No throughput gain is attributed to this slice.
-The literal native recipe/controller adapter, actual Model registration,
-scheduler admission and supervised head/worker activation remain unconnected.
+Actual Model registration, selected factory/admission and supervised head/worker
+dispatch are now connected in the development source. Focused controller checks
+cover cold selection, owner health, memory accounting, serial transactions and
+retirement; see `selected-paired-serving-results.md`. The real registered-Model/
+two-guard CPU fixture passes valid release and three registration refusals,
+using local scripted model transport, not NCCL. The native recipe/controller
+adapter remains unqualified.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.

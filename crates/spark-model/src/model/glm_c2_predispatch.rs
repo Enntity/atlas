@@ -9,6 +9,9 @@ mod quiescence;
 
 impl sealed::Sealed for TransformerModel {}
 impl GlmPairedExecution for TransformerModel {
+    fn validate_session_rank(&self, expected_rank: u8) -> Result<()> {
+        self.paired_validate_session_rank(expected_rank)
+    }
     fn check_communication_health(&self) -> Result<()> {
         self.paired_check_communication_health()
     }

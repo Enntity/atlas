@@ -12,14 +12,19 @@ pub(super) struct Reader {
     used: usize,
     target: usize,
     started: Option<u64>,
+    direction: wire::Direction,
 }
 impl Reader {
     pub(super) fn new() -> Self {
+        Self::directional(wire::Direction::ControllerToGuard)
+    }
+    pub(super) fn directional(direction: wire::Direction) -> Self {
         Self {
             bytes: [0; wire::MAX_ENCODED],
             used: 0,
             target: 4,
             started: None,
+            direction,
         }
     }
     pub(super) fn idle(&self) -> bool {
@@ -41,11 +46,9 @@ impl Reader {
             }
         }
         if self.used == 4 && self.target == 4 {
-            self.target = wire::control_frame_len(
-                self.bytes[..4].try_into().unwrap(),
-                wire::Direction::ControllerToGuard,
-            )
-            .map_err(wire_error)?;
+            self.target =
+                wire::control_frame_len(self.bytes[..4].try_into().unwrap(), self.direction)
+                    .map_err(wire_error)?;
         }
         if self.used != self.target {
             return Ok(None);
@@ -57,11 +60,8 @@ impl Reader {
             )
         } else {
             Incoming::Live(
-                wire::Frame::decode(
-                    &self.bytes[..self.target],
-                    wire::Direction::ControllerToGuard,
-                )
-                .map_err(wire_error)?,
+                wire::Frame::decode(&self.bytes[..self.target], self.direction)
+                    .map_err(wire_error)?,
             )
         };
         let started = self

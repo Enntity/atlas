@@ -150,6 +150,34 @@ impl Run {
 }
 
 #[test]
+fn actual_retirement_health_failure_keeps_response_and_host_owner() {
+    if isolated("actual_retirement_health_failure_keeps_response_and_host_owner") {
+        return;
+    }
+    let mut control = Run::new(false);
+    control.finish(0);
+    control.retire().unwrap();
+    let events = control.observer.events();
+    assert_eq!(
+        events.last(),
+        Some(&Event::Health(true)),
+        "missing pre-response health"
+    );
+    let ordinal = events.len();
+    control.close(false);
+    let mut run = Run::new(false);
+    run.finish(0);
+    run.finish(1);
+    run.observer.fail_at(ordinal);
+    assert!(format!("{:#}", run.retire().unwrap_err()).contains("unhealthy"));
+    assert_eq!(run.active.len(), 2);
+    assert!(run.responses.iter_mut().all(|rx| rx.try_recv().is_err()));
+    assert_eq!(run.observer.events().len(), ordinal);
+    assert_eq!(run.tx.packets(), [vec![0], vec![0xfffffff1]]);
+    run.close(true);
+}
+
+#[test]
 fn actual_retirement_keeps_slot_survivor_and_replays_worker_f1() {
     if isolated("actual_retirement_keeps_slot_survivor_and_replays_worker_f1") {
         return;

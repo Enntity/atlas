@@ -126,3 +126,18 @@ No fault injection, forced-kill experiment, reset or driver changes on Sparks.
 Only after native quality/memory/clean-exit control should batching and higher
 MTP concurrency be optimized. Serialized C2 alone does not satisfy C1>=30,
 C2>=37,C4>=43,C6>=64,C8>=72 or the remaining serving/quality/parity requirements.
+
+## Selected serving implementation status
+
+The development source now connects steps3..5 through the actual factory,
+owned Model registration, selected head admission/serial driver and whole-worker
+loop. Pre-runtime ingress, exact selected reserve, completion health and the
+watchdog terminal callback have focused controller evidence; see
+`docs/experiments/glm53-20260906/selected-paired-serving-results.md`.
+The actual registered-Model/two-guard fixture now passes valid release and actual
+rank/capability/health refusal, using local scripted model command replay rather
+than NCCL. This is new evidence, not supplied by the older consumer-only fixture.
+The node-local relay now has local pipe/socket/path evidence; actual SSH use and
+the Docker/controller adapter remain native prerequisites.
+Keep native data-path fault injection excluded. Preserve v29 results as the
+baseline until the new serving path has real warmed quality/performance evidence.
