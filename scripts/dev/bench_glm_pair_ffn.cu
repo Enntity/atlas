@@ -9,27 +9,39 @@
 // This compares Joint dense down against Joint reused-list down, not TwoK5.
 // Shared-width ONLY: append --compare joint-shared (zero/zero mandatory).
 // BOTH arms use Joint dense down: two generic-T M5 shared chains vs one M10.
+// Wider traversal: append --compare owner-batch --owners 3|4 (strict zero/zero).
+// Control is qualified JointShared M10 chunks plus K5 tail; candidate M15/M20.
+// Example: BENCH --atol 0 --rtol 0 --repeat 0 --compare owner-batch --owners 4
+// No kernel source changes. M20 has two router M16 tiles; all other inherited
+// GEMMs keep M64 row tiling. Max guarded device payload is 150296520 bytes;
+// actual counted allocations must still satisfy the unchanged 192MiB cap.
 // Timing allowed only AFTER all six restored-input cases pass the explicit gate.
 #include "glm_pair_ffn_run.cuh"
 #include "glm_pair_ffn_down_map.cuh"
 #include <cerrno>
 #include <string>
 using namespace pair_ffn;
-struct Options { double atol,rtol; unsigned repeat; bool reused_down,shared10; };
+struct Options { double atol,rtol; unsigned repeat; bool reused_down,shared10,wide; unsigned owners=2; };
 static double number(const char* s) {
     require(s&&*s&&*s!='-'&&*s!='+'&&*s!=' ',"unsigned finite decimal required");
     char* end=nullptr;errno=0;double n=std::strtod(s,&end);
     require(!errno&&end!=s&&!*end&&std::isfinite(n)&&n>=0,"finite number/end/overflow");return n;
 }
 static Options options(int argc,char** argv) {
-    require(argc==7||argc==9,"usage: bench_glm_pair_ffn --atol VALUE --rtol VALUE --repeat 0..100 [--compare joint-down|joint-shared]");
-    Options out{};bool a=false,r=false,n=false,c=false;
+    require(argc==7||argc==9||argc==11,"usage: bench_glm_pair_ffn --atol VALUE --rtol VALUE --repeat 0..100 [--compare joint-down|joint-shared|owner-batch] [--owners 3|4]");
+    Options out{};bool a=false,r=false,n=false,c=false,owners=false;
     for(int i=1;i<argc;i+=2) {
         const std::string key=argv[i];
         if(key=="--compare"&&!c) {
             const std::string mode=argv[i+1];
-            require(mode=="joint-down"||mode=="joint-shared","unknown explicit comparison");
-            c=true;out.reused_down=mode=="joint-down";out.shared10=mode=="joint-shared";continue;
+            require(mode=="joint-down"||mode=="joint-shared"||mode=="owner-batch","unknown explicit comparison");
+            c=true;out.reused_down=mode=="joint-down";out.shared10=mode=="joint-shared";
+            out.wide=mode=="owner-batch";continue;
+        }
+        if(key=="--owners"&&!owners) {
+            const std::string count=argv[i+1];
+            require(count=="3"||count=="4","owners must be exactly 3 or 4");
+            owners=true;out.owners=count=="3"?3:4;continue;
         }
         const double value=number(argv[i+1]);
         if(key=="--atol"&&!a) {a=true;out.atol=value;}
@@ -39,7 +51,8 @@ static Options options(int argc,char** argv) {
         } else require(false,"unknown/duplicate option");
     }
     require(a&&r&&n,"every bound must be explicit");
-    require(!(out.reused_down||out.shared10)||(out.atol==0&&out.rtol==0),"isolated comparison requires strict zero/zero plus bit equality");
+    require(owners==out.wide,"owner-batch requires explicit owners; other modes retain two owners");
+    require(!(out.reused_down||out.shared10||out.wide)||(out.atol==0&&out.rtol==0),"isolated comparison requires strict zero/zero plus bit equality");
     return out;
 }
 static void down_map_checks() {
@@ -102,20 +115,20 @@ static double fp8(double x) {
     return std::copysign(e4m3(nearest),x);
 }
 static void shared_oracle(Fixture& f,const SharedSnapshot& s,unsigned rank) {
-    require(s.rows.size()==R&&s.input.size()==R*H&&s.gate.size()==R*I
-        &&s.up.size()==R*I&&s.activated.size()==R*I&&s.down.size()==R*H,"full shared snapshot extents");
+    require(s.rows.size()==f.rows&&s.input.size()==f.rows*H&&s.gate.size()==f.rows*I
+        &&s.up.size()==f.rows*I&&s.activated.size()==f.rows*I&&s.down.size()==f.rows*H,"full shared snapshot extents");
     equal(s.input,f.host_input,"actual shared input canonical owner rows");
-    for(unsigned row=0;row<R;++row)require(s.rows[row]==row,"owner0 row0..4 / owner1 row5..9 mapping");
+    for(unsigned row=0;row<f.rows;++row)require(s.rows[row]==row,"canonical five-row owner mapping");
     for(const auto* a:{&s.input,&s.gate,&s.up,&s.activated,&s.down})
         for(auto v:*a)require(std::isfinite(f32(v)),"finite full shared intermediate");
-    // Sample every owner's EVERY row, including moved MMA-register rows8/9.
+    // Sample every owner's EVERY row, including rows16..19 in the M20 case.
     // Gate/up/down use actual input (down uses captured post-SiLU). The oracle
     // covers full K at N boundaries; it is not an exhaustive full-weight proof.
     for(unsigned p=0;p<3;++p) {
         const unsigned k=p==2?I:H,n=p==2?H:I,salt=100+p;
         const auto& input=p==2?s.activated:s.input;
         const auto& output=p==0?s.gate:(p==1?s.up:s.down);
-        for(unsigned row=0;row<R;++row)for(unsigned col:{0u,127u,128u,n-1}) {
+        for(unsigned row=0;row<f.rows;++row)for(unsigned col:{0u,127u,128u,n-1}) {
             double sum=0;
             for(unsigned j=0;j<k;++j) {
                 const unsigned packed_value=code(size_t(col)*(k/2)+j/2,salt);
@@ -138,18 +151,19 @@ static void shared_equal(const SharedSnapshot& a,const SharedSnapshot& b,unsigne
     const char* names[]={"gate-preactivation","up-preactivation","post-SiLU","down"};
     for(unsigned p=0;p<4;++p) {
         const unsigned cols=p==3?H:I;
-        require(left[p]->size()==R*cols&&right[p]->size()==R*cols,"shared exact tensor extents");
+        require(left[p]->size()==a.rows.size()*cols&&right[p]->size()==a.rows.size()*cols,"shared exact tensor extents");
         for(size_t i=0;i<left[p]->size();++i)if(std::memcmp(&(*left[p])[i],&(*right[p])[i],sizeof(Bf))) {
             std::fprintf(stderr,"FAIL shared exact stage=%s rank=%u owner=%zu row=%zu col=%zu old=%g new=%g\n",
                 names[p],rank,i/cols/5,i/cols%5,i%cols,f32((*left[p])[i]),f32((*right[p])[i]));std::exit(2);
         }
-        std::printf("PASS shared exact stage=%s rank=%u owners=0,1 elements=%zu unequal=0\n",names[p],rank,left[p]->size());
+        if(a.rows.size()==R)std::printf("PASS shared exact stage=%s rank=%u owners=0,1 elements=%zu unequal=0\n",names[p],rank,left[p]->size());
+        else std::printf("PASS shared exact stage=%s rank=%u owners=%zu elements=%zu unequal=0\n",names[p],rank,a.rows.size()/5,left[p]->size());
     }
 }
 static void independent_post(Fixture& f,const Result& result) {
     // Host oracle for actual BF16 rank sum, replicated shared-once and FP32 mHC.
     // This verifies the control fused and Joint unfused tails independently.
-    for(unsigned t=0;t<R;++t)for(unsigned h=0;h<H;++h) {
+    for(unsigned t=0;t<f.rows;++t)for(unsigned h=0;h<H;++h) {
         const size_t x=t*H+h;
         const Bf reduced=bf(f32(result.rank[0].routed[x])+f32(result.rank[1].routed[x]));
         const Bf blended=bf(f32(reduced)+f32(result.shared[x]));
@@ -159,31 +173,33 @@ static void independent_post(Fixture& f,const Result& result) {
             require(result.highway[(t*HC+j)*H+h]==expected,"independent BF16 rank-add/shared/mHC oracle");
         }
     }
-    for(unsigned rank=0;rank<2;++rank)for(unsigned t=0;t<R;++t)for(unsigned e=0;e<E;++e) {
+    for(unsigned rank=0;rank<2;++rank)for(unsigned t=0;t<f.rows;++t)for(unsigned e=0;e<E;++e) {
         float acc=0;
         for(unsigned k=0;k<64;++k)acc+=f32(f.host_input[t*H+k])*float(int((e*7+k*3)%17)-8)/128;
         require(f32(result.rank[rank].logits[t*E+e])==f32(bf(acc)),"independent sparse-weight full router oracle");
     }
 }
-static float timed(Fixture& f,bool joint,bool vector,unsigned repeats,bool reused_down=false,bool shared10=false) {
+static float timed(Fixture& f,bool joint,bool vector,unsigned repeats,bool reused_down=false,bool shared10=false,unsigned chunk_rows=0) {
     cudaEvent_t begin,end;PCHECK(cudaEventCreate(&begin));PCHECK(cudaEventCreate(&end));
     // This is a serialized two-rank arithmetic surrogate on ONE device, no NCCL.
     PCHECK(cudaEventRecord(begin,f.stream));
-    for(unsigned i=0;i<repeats;++i)(void)run(f,joint,vector,false,reused_down,shared10);
+    for(unsigned i=0;i<repeats;++i)(void)run(f,joint,vector,false,reused_down,shared10,false,chunk_rows);
     PCHECK(cudaEventRecord(end,f.stream));PCHECK(cudaEventSynchronize(end));float ms=0;
     PCHECK(cudaEventElapsedTime(&ms,begin,end));PCHECK(cudaEventDestroy(begin));PCHECK(cudaEventDestroy(end));
     return ms/repeats;
 }
 int main(int argc,char** argv) {
     const Options o=options(argc,argv);
-    const bool old_joint=o.reused_down||o.shared10;
-    if(o.shared10)require(fp8(1.0625)==1&&fp8(1.1875)==1.25&&fp8(1.0/1024)==0
+    const bool old_joint=o.reused_down||o.shared10||o.wide;
+    const bool shared_checks=o.shared10||o.wide;
+    if(shared_checks)require(fp8(1.0625)==1&&fp8(1.1875)==1.25&&fp8(1.0/1024)==0
         &&fp8(3.0/1024)==1.0/256&&fp8(-900)==-448,"host FP8 tie/subnormal/saturation controls");
     if(o.reused_down)down_map_checks();
     require(fits(1,4,0)&&!fits(std::numeric_limits<size_t>::max(),8,0)&&!fits(1,4,limit),"allocation accounting negatives");
-    Fixture f;std::printf("device_live=%zu device_peak=%zu cap=%zu H=%u I=%u experts=%u topk=%u rows=%u\n",live,peak,limit,H,I,E,K,R);
+    Fixture f(o.owners*5);std::printf("device_live=%zu device_peak=%zu cap=%zu H=%u I=%u experts=%u topk=%u rows=%u\n",live,peak,limit,H,I,E,K,f.rows);
     std::printf("scope=router-to-mHC arithmetic; actual NCCL/attention/token-quality excluded; no timed D2H\n");
-    if(o.reused_down)std::puts("comparison=Joint-dense-down-vs-Joint-reused-GU-down; identical M10 route/GU/shared/post; down CTAs9216->2560; no extra builder/allocation; fixed M64 arithmetic");
+    if(o.wide)std::printf("comparison=JointShared-M10-chunks-plus-K5-tail-vs-M%u; owners=%u; BOTH genericT-shared+dense-M64-down; strict every-row intermediate/post equality; no serving/NCCL claim\n",f.rows,o.owners);
+    else if(o.reused_down)std::puts("comparison=Joint-dense-down-vs-Joint-reused-GU-down; identical M10 route/GU/shared/post; down CTAs9216->2560; no extra builder/allocation; fixed M64 arithmetic");
     else if(o.shared10)std::puts("comparison=Joint-shared-two-genericT-M5-vs-one-genericT-M10; BOTH Joint dense-down; same route/GU/down/post; full shared intermediate bits+sampled host dots+owner-row maps; no extra device allocation");
     else std::printf("control=twoM5 grouped denseGU scalar-or-vector prequantdown shared-generic-T FUSED_MOE_HC1; joint=M10 compact-fusedGU+two-genericT-K5-shared; norm_topk=1 route_scale=1\n");
     bool numerical=true;
@@ -193,11 +209,13 @@ int main(int argc,char** argv) {
         f.w.select(test);f.inputs(reverse!=0);
         for(bool vector:{false,true}) {
             std::printf("case=%u reverse=%u vector=%u\n",test,reverse,unsigned(vector));
-            auto old=run(f,old_joint,vector,true,false,false,o.shared10);
-            auto joint=run(f,true,vector,true,o.reused_down,o.shared10,o.shared10);
+            auto old=run(f,old_joint,vector,true,false,o.wide,shared_checks,o.wide?10:0);
+            auto joint=run(f,true,vector,true,o.reused_down,shared_checks,shared_checks);
             for(unsigned rank=0;rank<2;++rank)rank_equal(old.rank[rank],joint.rank[rank]);
             independent_post(f,old);independent_post(f,joint);
-            if(o.shared10) {
+            if(o.wide)std::printf("PASS every-row router/post oracle owners=%u rows=0..%u including_M20_router_tail=%u\n",
+                o.owners,f.rows-1,unsigned(f.rows==20));
+            if(shared_checks) {
                 for(unsigned rank=0;rank<2;++rank) {
                     shared_oracle(f,old.shared_rank[rank],rank);shared_oracle(f,joint.shared_rank[rank],rank);
                     shared_equal(old.shared_rank[rank],joint.shared_rank[rank],rank);
@@ -211,12 +229,12 @@ int main(int argc,char** argv) {
                 equal(old.highway,joint.highway,"isolated Joint exact final mHC");
             }
             numerical=metrics(old.shared,joint.shared,
-                o.shared10?"shared-Joint-genericT-M5-vs-M10":(o.reused_down?"shared-Joint-dense-vs-reused":"shared-genericT-control-vs-joint"),o)&&numerical;
+                o.wide?"shared-M10-chunks-vs-wide":(o.shared10?"shared-Joint-genericT-M5-vs-M10":(o.reused_down?"shared-Joint-dense-vs-reused":"shared-genericT-control-vs-joint")),o)&&numerical;
             numerical=metrics(old.highway,joint.highway,"complete-mHC",o)&&numerical;
             // A repeated restored-input run must not depend on dead scratch contents.
-            auto again=run(f,true,vector,true,o.reused_down,o.shared10,o.shared10);
+            auto again=run(f,true,vector,true,o.reused_down,shared_checks,shared_checks);
             if(old_joint)for(unsigned rank=0;rank<2;++rank)rank_equal(joint.rank[rank],again.rank[rank]);
-            if(o.shared10)for(unsigned rank=0;rank<2;++rank)shared_equal(joint.shared_rank[rank],again.shared_rank[rank],rank);
+            if(shared_checks)for(unsigned rank=0;rank<2;++rank)shared_equal(joint.shared_rank[rank],again.shared_rank[rank],rank);
             equal(joint.shared,again.shared,"restored-input shared repeat");equal(joint.highway,again.highway,"restored-input mHC repeat");
         }
     }
@@ -224,12 +242,14 @@ int main(int argc,char** argv) {
     if(o.repeat) {
         f.w.select(0);f.inputs(false);
         for(bool vector:{false,true}) {
-            for(unsigned i=0;i<3;++i){(void)run(f,old_joint,vector,false);(void)run(f,true,vector,false,o.reused_down,o.shared10);}
+            for(unsigned i=0;i<3;++i){(void)run(f,old_joint,vector,false,false,o.wide,false,o.wide?10:0);(void)run(f,true,vector,false,o.reused_down,shared_checks);}
             for(unsigned order=0;order<2;++order) {
                 float old=0,joint=0;
-                if(!order){old=timed(f,old_joint,vector,o.repeat);joint=timed(f,true,vector,o.repeat,o.reused_down,o.shared10);}
-                else {joint=timed(f,true,vector,o.repeat,o.reused_down,o.shared10);old=timed(f,old_joint,vector,o.repeat);}
-                if(o.reused_down)std::printf("single_gpu_serialized_two_rank_arithmetic comparison=Joint-dense-vs-reused-down vector=%u order=%u repeats=%u dense_ms=%.6f reused_ms=%.6f ratio=%.6f timed_D2H=0\n",
+                if(!order){old=timed(f,old_joint,vector,o.repeat,false,o.wide,o.wide?10:0);joint=timed(f,true,vector,o.repeat,o.reused_down,shared_checks);}
+                else {joint=timed(f,true,vector,o.repeat,o.reused_down,shared_checks);old=timed(f,old_joint,vector,o.repeat,false,o.wide,o.wide?10:0);}
+                if(o.wide)std::printf("single_gpu_serialized_two_rank_arithmetic comparison=M10-chunks-vs-M%u owners=%u vector=%u order=%u repeats=%u chunks_ms=%.6f wide_ms=%.6f ratio=%.6f BOTH_dense_down=1 timed_D2H=0\n",
+                    f.rows,o.owners,unsigned(vector),order,o.repeat,old,joint,old/joint);
+                else if(o.reused_down)std::printf("single_gpu_serialized_two_rank_arithmetic comparison=Joint-dense-vs-reused-down vector=%u order=%u repeats=%u dense_ms=%.6f reused_ms=%.6f ratio=%.6f timed_D2H=0\n",
                     unsigned(vector),order,o.repeat,old,joint,old/joint);
                 else if(o.shared10)std::printf("single_gpu_serialized_two_rank_arithmetic comparison=Joint-shared-M5-vs-M10 vector=%u order=%u repeats=%u sharedM5_ms=%.6f sharedM10_ms=%.6f ratio=%.6f BOTH_Joint_dense_down=1 timed_D2H=0\n",
                     unsigned(vector),order,o.repeat,old,joint,old/joint);

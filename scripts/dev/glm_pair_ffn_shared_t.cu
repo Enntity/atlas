@@ -7,7 +7,7 @@
 #undef E2M1_LUT
 namespace pair_ffn {
 void shared_t(const Bf* a,Weight w,Bf* out,unsigned rows,unsigned n,unsigned k,cudaStream_t s) {
-    if((rows!=5&&rows!=10)||!((n==I&&k==H)||(n==H&&k==I)))std::abort();
+    if((rows!=5&&rows!=10&&rows!=15&&rows!=20)||!((n==I&&k==H)||(n==H&&k==I)))std::abort();
     w4a16_gemm_t<<<dim3(n/128,1),128,0,s>>>(a,w.packed,w.scale,w.scale2,out,rows,n,k,n);
 }
 }

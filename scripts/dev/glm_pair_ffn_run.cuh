@@ -53,8 +53,8 @@ inline void capture(Fixture& f,RankSnapshot& out,unsigned rows,unsigned base,uns
         if(counts[e]&&e/144==rank)++local;
     }
     require(sum==rows*K&&off[E]==int(sum),"full expanded extent");
-    const auto total=rows==R?b.total.read()[0]:0;
-    if(rows==R)require(total==int(local*I/128),"actual compact work count");
+    const auto total=rows!=5?b.total.read()[0]:0;
+    if(rows!=5)require(total==int(local*I/128),"actual compact work count");
     if(total) {
         auto list=b.list.read(size_t(total)*2);std::vector<unsigned> expected;
         for(unsigned e=0;e<E;++e)if(counts[e]&&e/144==rank)for(unsigned n=0;n<I/128;++n){expected.push_back(e);expected.push_back(n);}
@@ -137,15 +137,18 @@ inline void down_boundaries(Fixture& f,Table d,bool vector) {
     f.guards();
 }
 inline Result run(Fixture& f,bool joint,bool vector,bool diagnostic,bool reused_down=false,
-                  bool shared10=false,bool shared_diagnostics=false) {
+                  bool shared10=false,bool shared_diagnostics=false,unsigned chunk_rows=0) {
     require(!reused_down||joint,"reused GU down requires actual Joint worklist");
     require(!shared10||(joint&&!reused_down),"shared-M10 comparison requires Joint dense down");
     require(!shared_diagnostics||diagnostic,"shared diagnostics cannot enter timing");
-    Result result;auto& b=f.b;const unsigned width=joint?R:5;
-    for(unsigned base=0;base<R;base+=width) {
+    require(f.rows==R||(joint&&shared10&&!reused_down&&(chunk_rows==0||chunk_rows==10)),
+        "wide comparison requires shared generic-T and dense down");
+    Result result;auto& b=f.b;const unsigned batch=chunk_rows?chunk_rows:(joint?f.rows:5);
+    for(unsigned base=0;base<f.rows;base+=batch) {
+        const unsigned width=std::min(batch,f.rows-base);
         for(unsigned rank=0;rank<2;++rank) {
             // Each simulated rank executes its own replicated shared work, as serving does.
-            const unsigned shared_rows=shared10?R:5;
+            const unsigned shared_rows=shared10?width:5;
             for(unsigned first=0;first<width;first+=shared_rows) {
                 const Bf* a=f.input.ptr+(base+first)*H;
                 Bf* g=b.sg.ptr+first*I;Bf* u=b.su.ptr+first*I;Bf* out=f.shared.ptr+(base+first)*H;
@@ -178,6 +181,18 @@ inline Result run(Fixture& f,bool joint,bool vector,bool diagnostic,bool reused_
                 }
             }
             if(diagnostic)b.poison(f.stream); // outside timing; no numerical work on local rows depends on poison.
+            if(diagnostic&&f.rows!=R) {
+                // Especially rows16..19: every candidate writer must replace poison.
+                PCHECK(cudaMemsetAsync(b.logits.ptr,0xff,width*E*sizeof(Bf),f.stream));
+                PCHECK(cudaMemsetAsync((rank?f.rank1:f.rank0).ptr+base*H,0xff,width*H*sizeof(Bf),f.stream));
+                for(auto* a:{&b.ap,&b.as,&b.dp,&b.ds})
+                    PCHECK(cudaMemsetAsync(a->ptr,0xff,a->count,f.stream));
+                for(auto* a:{&b.ids,&b.list})
+                    PCHECK(cudaMemsetAsync(a->ptr,0xff,a->count*sizeof(unsigned),f.stream));
+                for(auto* a:{&b.tok,&b.exp,&b.off,&b.inv,&b.total})
+                    PCHECK(cudaMemsetAsync(a->ptr,0xff,a->count*sizeof(int),f.stream));
+                PCHECK(cudaMemsetAsync(b.coeff.ptr,0xff,b.coeff.count*sizeof(float),f.stream));
+            }
             route(f.input.ptr+base*H,f.w.router.ptr,f.w.bias.ptr,b.logits.ptr,b.ids.ptr,b.coeff.ptr,width,f.stream);
             sort(b.ids.ptr,b.tok.ptr,b.exp.ptr,b.off.ptr,b.inv.ptr,width,f.stream);
             auto g=f.w.tables[rank][0]->view(),u=f.w.tables[rank][1]->view(),d=f.w.tables[rank][2]->view();
@@ -185,7 +200,7 @@ inline Result run(Fixture& f,bool joint,bool vector,bool diagnostic,bool reused_
                 const auto gp=f.w.tables[rank][0]->p.read(),up=f.w.tables[rank][1]->p.read(),dp=f.w.tables[rank][2]->p.read();
                 for(unsigned e=0;e<E;++e)require((gp[e]==0)==(up[e]==0)&&(gp[e]==0)==(dp[e]==0),"GU/down actual EP ownership masks must match");
             }
-            if(joint)work(b.off.ptr,g,b.list.ptr,b.total.ptr,f.stream);
+            if(joint&&width!=5)work(b.off.ptr,g,b.list.ptr,b.total.ptr,f.stream);
             quant(f.input.ptr+base*H,b.ap.ptr,b.as.ptr,width,H,f.stream);
             gate_up(b.ap.ptr,b.as.ptr,g,u,b.gate.ptr,b.up.ptr,b.off.ptr,b.tok.ptr,b.list.ptr,b.total.ptr,width,vector,f.stream);
             silu_quant(b.gate.ptr,b.up.ptr,b.dp.ptr,b.ds.ptr,width,f.stream);
@@ -197,8 +212,9 @@ inline Result run(Fixture& f,bool joint,bool vector,bool diagnostic,bool reused_
             PCHECK(cudaGetLastError());
             if(diagnostic)capture(f,result.rank[rank],width,base,rank);
         }
+        if(diagnostic&&f.rows!=R)PCHECK(cudaMemsetAsync(f.highway.ptr+base*HC*H,0xff,width*HC*H*sizeof(float),f.stream));
         finish(f.rank0.ptr+base*H,f.rank1.ptr+base*H,f.shared.ptr+base*H,f.input.ptr+base*H,
-            f.residual.ptr+base*HC*H,f.post.ptr+base*HC,f.comb.ptr+base*HC*HC,f.highway.ptr+base*HC*H,width,joint,f.stream);
+            f.residual.ptr+base*HC*H,f.post.ptr+base*HC,f.comb.ptr+base*HC*HC,f.highway.ptr+base*HC*H,width,joint&&width!=5,f.stream);
         PCHECK(cudaGetLastError());
     }
     if(diagnostic) {

@@ -8,7 +8,7 @@ void route(const Bf* a,const Bf* w,const float* bias,Bf* logits,unsigned* ids,fl
            unsigned rows,cudaStream_t s) {
     // Literal qualified K5 router and the Joint generic order-preserving router.
     if(rows==5) dense_gemm_bf16_router_m5<<<E/16,dim3(16,5),0,s>>>(a,w,logits,5,E,H);
-    else dense_gemm_bf16_router<<<dim3((E+63)/64,1),dim3(16,16),0,s>>>(a,w,logits,R,E,H);
+    else dense_gemm_bf16_router<<<dim3((E+63)/64,(rows+15)/16),dim3(16,16),0,s>>>(a,w,logits,rows,E,H);
     moe_topk_sigmoid_batched<<<rows,256,0,s>>>(logits,bias,ids,weights,E,K,1,1.0f);
 }
 void sort(const unsigned* ids,int* tok,int* exp,int* off,int* inv,unsigned rows,cudaStream_t s) {

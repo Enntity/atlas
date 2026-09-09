@@ -136,10 +136,14 @@ struct Weights {
     }
 };
 struct Scratch {
-    Buffer<Bf> logits{R*E},gate{X*I},up{X*I},down{X*H},sg{R*I},su{R*I};
-    Buffer<unsigned char> ap{R*H/2},as{R*H/16},dp{X*I/2},ds{X*I/16};
-    Buffer<unsigned> ids{X},list{X*(I/128)*2};Buffer<float> coeff{X};
-    Buffer<int> tok{X},exp{X},off{E+1},inv{X},total{1};
+    Buffer<Bf> logits,gate,up,down,sg,su;
+    Buffer<unsigned char> ap,as,dp,ds;
+    Buffer<unsigned> ids,list;Buffer<float> coeff;
+    Buffer<int> tok,exp,off{E+1},inv,total{1};
+    explicit Scratch(unsigned rows):logits(rows*E),gate(rows*K*I),up(rows*K*I),
+        down(rows*K*H),sg(rows*I),su(rows*I),ap(rows*H/2),as(rows*H/16),
+        dp(rows*K*I/2),ds(rows*K*I/16),ids(rows*K),list(rows*K*(I/128)*2),
+        coeff(rows*K),tok(rows*K),exp(rows*K),inv(rows*K) {}
     void poison(cudaStream_t s) {
         // BF16 0xffff is NaN. Remote rows must never enter unpermute/reduction.
         for(auto* b:{&gate,&up,&down})PCHECK(cudaMemsetAsync(b->ptr,0xff,b->count*sizeof(Bf),s));
@@ -151,17 +155,23 @@ struct Scratch {
     }
 };
 struct Fixture {
+    const unsigned rows;
     Weights w; Scratch b; cudaStream_t stream;
-    Buffer<Bf> input{R*H},rank0{R*H},rank1{R*H},shared{R*H};
-    Buffer<float> residual{R*HC*H},post{R*HC},comb{R*HC*HC},highway{R*HC*H};
+    Buffer<Bf> input,rank0,rank1,shared;
+    Buffer<float> residual,post,comb,highway;
     std::vector<Bf> host_input;std::vector<float> host_residual,host_post,host_comb;
-    Fixture() { PCHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking)); }
+    explicit Fixture(unsigned count=R):rows(count),b(count),input(count*H),rank0(count*H),
+        rank1(count*H),shared(count*H),residual(count*HC*H),post(count*HC),
+        comb(count*HC*HC),highway(count*HC*H) {
+        require(count==10||count==15||count==20,"fixed owner-count envelope");
+        PCHECK(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
+    }
     ~Fixture() { cudaStreamDestroy(stream); }
     void inputs(bool reversed) {
-        host_input.assign(R*H,bf(0));host_residual.resize(R*HC*H);
-        host_post.resize(R*HC);host_comb.resize(R*HC*HC);
-        for(unsigned t=0;t<R;++t) {
-            const unsigned source=reversed?(t+5)%10:t;
+        host_input.assign(rows*H,bf(0));host_residual.resize(rows*HC*H);
+        host_post.resize(rows*HC);host_comb.resize(rows*HC*HC);
+        for(unsigned t=0;t<rows;++t) {
+            const unsigned source=reversed?(rows/5-1-t/5)*5+t%5:t;
             for(unsigned k=0;k<H;++k)host_input[t*H+k]=bf(float(int((source*13+k*7)%31)-15)/32);
             for(unsigned j=0;j<HC;++j) {
                 host_post[t*HC+j]=float(j+1)/8;
