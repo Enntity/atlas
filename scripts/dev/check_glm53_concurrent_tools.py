@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Two concurrent forced-tool tasks; no external tools are executed.
+"""Distinct forced-tool tasks at C1..8; no external tools are executed.
 
 This checks structured output and argument ownership, not automatic tool choice.
-Short replies need server batch traces to establish actual C2 decode occupancy.
---self-test runs only the three CPU validator tests, without HTTP.
+Short replies need server batch traces to establish actual decode occupancy.
+--self-test runs CPU client/validator tests with stubbed HTTP only.
 """
 import argparse
 import concurrent.futures
+import contextlib
+import io
 import json
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -24,6 +27,24 @@ CASES = (
      "Check the inventory for SKU BLUE-17 in the north warehouse. You must call "
      "lookup_inventory exactly once with sku BLUE-17 and warehouse north. "
      "Do not invent the stock count or provide an answer before the tool result."),
+    ("lookup_library", {"title": "River Atlas", "branch": "west"},
+     "Find River Atlas at the west library branch. You must call lookup_library "
+     "exactly once with title River Atlas and branch west; wait for the result."),
+    ("lookup_train", {"route": "T42", "station": "Central"},
+     "Check train T42 at Central. You must call lookup_train exactly once "
+     "with route T42 and station Central; wait for the result."),
+    ("lookup_parcel", {"tracking": "PKG-503", "carrier": "Acorn"},
+     "Track PKG-503 with Acorn. You must call lookup_parcel exactly once "
+     "with tracking PKG-503 and carrier Acorn; wait for the result."),
+    ("lookup_booking", {"reference": "BK-611", "surname": "Mora"},
+     "Find booking BK-611 for Mora. You must call lookup_booking exactly once "
+     "with reference BK-611 and surname Mora; wait for the result."),
+    ("lookup_museum", {"museum": "Harbor", "day": "Tuesday"},
+     "Check Harbor museum on Tuesday. You must call lookup_museum exactly once "
+     "with museum Harbor and day Tuesday; wait for the result."),
+    ("lookup_repair", {"ticket": "REP-829", "device": "printer"},
+     "Check repair REP-829 for the printer. You must call lookup_repair exactly "
+     "once with ticket REP-829 and device printer; wait for the result."),
 )
 
 
@@ -76,12 +97,12 @@ class ValidatorTests(unittest.TestCase):
                 "name": name, "arguments": json.dumps(arguments)}}]}}]}
 
     def test_correct(self):
-        for index in range(2):
+        for index in range(len(CASES)):
             self.assertTrue(validate(index, self.response(index)))
             self.assertIn("must call", payload(index, "test-model")["messages"][0]["content"])
 
     def test_wrong(self):
-        for index in range(2):
+        for index in range(len(CASES)):
             for bad in ("{}", "not json", '{"city":"Oslo","city":"Oslo","unit":"celsius"}'):
                 body = self.response(index)
                 body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = bad
@@ -94,11 +115,56 @@ class ValidatorTests(unittest.TestCase):
             self.assertFalse(validate(index, body))
 
     def test_crossed_args(self):
-        for index in range(2):
-            self.assertFalse(validate(index, self.response(1 - index)))
-            body = self.response(index)
-            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = json.dumps(CASES[1-index][1])
-            self.assertFalse(validate(index, body))
+        for index in range(len(CASES)):
+            for peer in range(len(CASES)):
+                if peer == index:
+                    continue
+                self.assertFalse(validate(index, self.response(peer)))
+                body = self.response(index)
+                body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = json.dumps(CASES[peer][1])
+                self.assertFalse(validate(index, body))
+
+    def test_actual_client_full_wave(self):
+        for width in range(1, 9):
+            seen = []
+            lock = threading.Lock()
+            http_wave = threading.Barrier(width)
+
+            def urlopen(req, timeout):
+                task = json.loads(req.data)
+                index = next(i for i, case in enumerate(CASES)
+                             if case[2] == task["messages"][0]["content"])
+                with lock:
+                    seen.append(index)
+                http_wave.wait(timeout=5)
+                body = self.response(index)
+                body["usage"] = {"prompt_tokens": 100}
+                response = mock.MagicMock(status=200)
+                response.read.return_value = json.dumps(body).encode()
+                response.__enter__.return_value = response
+                return response
+
+            output = io.StringIO()
+            with mock.patch("sys.argv", ["tools", "--concurrency", str(width)]), \
+                    mock.patch.object(urllib.request, "urlopen", side_effect=urlopen), \
+                    contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as done:
+                main()
+            self.assertEqual(done.exception.code, 0, output.getvalue())
+            receipt = json.loads(output.getvalue())
+            self.assertEqual(receipt["concurrency"], width)
+            self.assertEqual(sorted(seen), list(range(max(2, width))))
+
+    def test_actual_client_refuses_crossed_tool(self):
+        body = self.response(1)
+        body["usage"] = {"prompt_tokens": 100}
+        response = mock.MagicMock(status=200)
+        response.read.return_value = json.dumps(body).encode()
+        response.__enter__.return_value = response
+        args = argparse.Namespace(model="test-model", base_url="http://unused", context_limit=2048)
+        with mock.patch.object(urllib.request, "urlopen", return_value=response):
+            receipt = request(0, args, threading.Barrier(1))
+        self.assertFalse(receipt["passed"])
+        self.assertEqual(receipt["response"], body)
 
 
 def request(index, args, barrier):
@@ -140,18 +206,18 @@ def main():
     parser.add_argument("--base-url", default="http://127.0.0.1:8888")
     parser.add_argument("--model", default="/var/tmp/models/glm53-flash-nvfp4")
     parser.add_argument("--context-limit", type=int, choices=[2044, 2048, 16384], default=2048)
-    parser.add_argument("--concurrency", type=int, choices=[2], default=2)
+    parser.add_argument("--concurrency", type=int, choices=range(1, 9), default=2)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(ValidatorTests)
         raise SystemExit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())
-    barrier = threading.Barrier(2)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(request, index, args, barrier) for index in range(2)]
+    barrier = threading.Barrier(args.concurrency)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        futures = [pool.submit(request, index, args, barrier) for index in range(max(2, args.concurrency))]
         receipts = [future.result() for future in futures]
     passed = all(row["passed"] for row in receipts)
-    print(json.dumps({"passed": passed, "concurrency": 2,
+    print(json.dumps({"passed": passed, "concurrency": args.concurrency,
                       "scope": "Forced named-tool calls, not automatic tool selection; no tools executed.",
                       "requests": receipts}), flush=True)
     raise SystemExit(0 if passed else 1)

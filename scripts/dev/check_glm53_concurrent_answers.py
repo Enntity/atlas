@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Four small answer checks, not a benchmark or full quality evaluation.
+"""Small distinct answer checks, not a benchmark or full quality evaluation.
 
 Short answers may never reach actual C4 decode: correlate server batch traces.
-No generated code is executed. Run --self-test for CPU-only validator tests.
+No generated code is executed. Run --self-test for CPU-only client/validator tests.
 Initial v8-off run with thinking disabled passed arithmetic/JSON but failed
 sort/code: empty visible answers, finish_reason=length at 128 tokens, with correct
 answers in reasoning_content. GLM's template forced thinking despite the flag.
@@ -20,6 +20,7 @@ import json
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -34,9 +35,13 @@ PROMPTS = (
     "Return exactly one JSON object with these three keys and no others: "
     "city is the string Oslo, count is the integer 7, active is boolean true. "
     "Do not use Markdown or add explanations.",
+    "Calculate 91 - 38. Reply with only the integer answer.",
+    "Calculate 12 * 13. Reply with only the integer answer.",
+    "Calculate 144 / 12. Reply with only the integer answer.",
+    "Calculate 8 * 9 + 5. Reply with only the integer answer.",
 )
 ANSWERS = ("432", "ash,dogwood,birch,cedar", "def square(n):\n    return n*n",
-           '{"city":"Oslo","count":7,"active":true}')
+           '{"city":"Oslo","count":7,"active":true}', "53", "156", "12", "77")
 
 
 class ValidatorTests(unittest.TestCase):
@@ -51,8 +56,9 @@ class ValidatorTests(unittest.TestCase):
     def test_concurrency_is_explicit_and_keeps_existing_default(self):
         self.assertEqual(parse_args([]).concurrency, 4)
         self.assertEqual(parse_args(["--concurrency", "1"]).concurrency, 1)
-        self.assertEqual(parse_args(["--concurrency", "2"]).concurrency, 2)
-        for invalid in ["0", "3", "8"]:
+        for width in range(2, 9):
+            self.assertEqual(parse_args(["--concurrency", str(width)]).concurrency, width)
+        for invalid in ["0", "9"]:
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parse_args(["--concurrency", invalid])
 
@@ -73,8 +79,11 @@ class ValidatorTests(unittest.TestCase):
     def test_junk_empty_repetition_and_cross_answers(self):
         for index, answer in enumerate(ANSWERS):
             for invalid in ("", "!" * 128, "I cannot answer", answer + "\n" + answer,
-                            ANSWERS[(index + 1) % 4]):
+                            ANSWERS[(index + 1) % len(ANSWERS)]):
                 self.assertFalse(validate(index, invalid), (index, invalid))
+            for peer, other in enumerate(ANSWERS):
+                if peer != index:
+                    self.assertFalse(validate(index, other), (index, peer))
 
     def test_wrong_answers(self):
         wrong = ("433", "ash,dogwood,cedar,birch", "def square(n):\n    return n+n",
@@ -94,12 +103,53 @@ class ValidatorTests(unittest.TestCase):
                        ANSWERS[2] + "\nsquare(3)"):
             self.assertFalse(validate(2, answer))
 
+    def test_actual_client_full_waves(self):
+        for width in range(1, 9):
+            seen = []
+            lock = threading.Lock()
+            http_wave = threading.Barrier(width)
+
+            def urlopen(req, timeout):
+                task = json.loads(req.data)
+                index = PROMPTS.index(task["messages"][0]["content"])
+                with lock:
+                    seen.append(index)
+                http_wave.wait(timeout=5)
+                body = {"choices": [{"finish_reason": "stop", "message": {
+                    "content": ANSWERS[index]}}], "usage": {"prompt_tokens": 100}}
+                response = mock.MagicMock(status=200)
+                response.read.return_value = json.dumps(body).encode()
+                response.__enter__.return_value = response
+                return response
+
+            output = io.StringIO()
+            with mock.patch("sys.argv", ["answers", "--concurrency", str(width)]), \
+                    mock.patch.object(urllib.request, "urlopen", side_effect=urlopen), \
+                    contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as done:
+                main()
+            self.assertEqual(done.exception.code, 0, output.getvalue())
+            receipt = json.loads(output.getvalue())
+            count = 4 if width in (1, 2, 4) else (6 if width == 3 else width)
+            self.assertEqual(sorted(seen), list(range(count)))
+            self.assertEqual(len(receipt["requests"]), count)
+
+    def test_actual_client_refuses_crossed_answer(self):
+        body = {"choices": [{"finish_reason": "stop", "message": {"content": ANSWERS[1]}}],
+                "usage": {"prompt_tokens": 100}}
+        response = mock.MagicMock(status=200)
+        response.read.return_value = json.dumps(body).encode()
+        response.__enter__.return_value = response
+        with mock.patch.object(urllib.request, "urlopen", return_value=response):
+            receipt = request(0, parse_args([]), threading.Barrier(1))
+        self.assertFalse(receipt["passed"])
+        self.assertEqual(receipt["output"], ANSWERS[1])
+
 
 def validate(index, answer):
     if not isinstance(answer, str) or not answer.strip() or len(answer) > 16384:
         return False
     answer = answer.strip()
-    if index in (0, 1):
+    if index in (0, 1, 4, 5, 6, 7):
         return answer == ANSWERS[index]
     try:
         if index == 2:
@@ -172,8 +222,8 @@ def parse_args(argv=None):
     parser.add_argument("--model", default="/var/tmp/models/glm53-flash-nvfp4")
     parser.add_argument("--context-limit", type=int, choices=[2044, 2048, 16384], default=2048,
                         help="must match the restarted server's bounded context cap")
-    parser.add_argument("--concurrency", type=int, choices=[1, 2, 4], default=4,
-                        help="run four checks sequentially, in pairs, or together")
+    parser.add_argument("--concurrency", type=int, choices=range(1, 9), default=4,
+                        help="C1/C2/C4 retain four checks; C3 runs six, C5..8 run one full wave")
     parser.add_argument("--self-test", action="store_true", help="CPU only; no HTTP requests")
     return parser.parse_args(argv)
 
@@ -184,8 +234,9 @@ def main():
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(ValidatorTests)
         raise SystemExit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())
     barrier = threading.Barrier(args.concurrency)
+    count = 4 if args.concurrency in (1, 2, 4) else (6 if args.concurrency == 3 else args.concurrency)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        receipts = list(pool.map(lambda index: request(index, args, barrier), range(4)))
+        receipts = list(pool.map(lambda index: request(index, args, barrier), range(count)))
     passed = all(receipt["passed"] for receipt in receipts)
     print(json.dumps({"passed": passed, "context_limit": args.context_limit,
                       "concurrency": args.concurrency,
@@ -194,8 +245,8 @@ def main():
                                        "but failed sort/code with empty visible answers and length at 128; "
                                        "correct answers appeared only in template-forced reasoning. "
                                        "Now uses an explicit 32-token thinking budget; validators unchanged.",
-                      "scope": "Four answer checks only, not a benchmark or full quality evaluation. "
-                               "Short outputs may not exercise C4: server batch traces are required.",
+                      "scope": "Distinct answer checks only, not a benchmark or full quality evaluation. "
+                               "Short outputs may not reach requested occupancy: server traces are required.",
                       "requests": receipts}), flush=True)
     raise SystemExit(0 if passed else 1)
 

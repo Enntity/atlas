@@ -4,6 +4,7 @@
 
 This is a behavioral check, not proof that every decode step was co-batched.
 Correlate with server multi-sequence traces when validating scheduler coverage.
+The client barrier precedes tokenization, not the completion POST or GPU launch.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import json
 import math
 import threading
 
-NEEDLE_NAMES = ("AURORA", "NEBULA", "ORBIT", "QUASAR")
+NEEDLE_NAMES = ("AURORA", "NEBULA", "ORBIT", "QUASAR", "PULSAR", "COMET", "ZENITH", "LYRA")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -27,21 +28,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--context-limit", type=int, help=(
-        "server's per-request context cap; required for four requests; reject "
+        "server's per-request context cap; required for four or more requests; reject "
         "prompt+output beyond this limit before making any HTTP requests"
     ))
     args = parser.parse_args(argv)
     count = len(args.prompt_tokens)
     if not 1 <= count <= len(NEEDLE_NAMES) or len(args.output_tokens) != count:
-        parser.error("supply one to four prompt lengths and matching output caps")
+        parser.error("supply one to eight prompt lengths and matching output caps")
     if min(args.output_tokens + args.prompt_tokens) < 1 or args.repetitions < 1:
         parser.error("token counts and repetitions must be positive")
     if not 0 <= args.position <= 1:
         parser.error("position must be between zero and one")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("timeout must be finite and positive")
-    if count == 4 and args.context_limit is None:
-        parser.error("four requests require --context-limit matching the server cap")
+    if count >= 4 and args.context_limit is None:
+        parser.error("four or more requests require --context-limit matching the server cap")
     if args.context_limit is not None:
         if args.context_limit < 1:
             parser.error("context-limit must be positive")
@@ -53,7 +54,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def needles_for(count: int, repetition: int) -> list[str]:
     if not 1 <= count <= len(NEEDLE_NAMES) or repetition < 0:
-        raise ValueError("needles require one to four rows and a nonnegative repetition")
+        raise ValueError("needles require one to eight rows and a nonnegative repetition")
     return [f"{name}-{6193 + repetition * 17}" for name in NEEDLE_NAMES[:count]]
 
 
@@ -90,7 +91,9 @@ def main() -> None:
         passed = all(row["passed"] for row in rows)
         all_passed = all_passed and passed
         print(json.dumps({"repetition": repetition, "passed": passed,
-                          "context_limit": args.context_limit, "requests": rows}), flush=True)
+                          "context_limit": args.context_limit,
+                          "scope": "Barrier precedes tokenization; server traces establish decode occupancy.",
+                          "requests": rows}), flush=True)
     raise SystemExit(0 if all_passed else 1)
 
 
