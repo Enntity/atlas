@@ -8,7 +8,41 @@ mod inspection;
 
 pub(super) const ROW_BYTES: usize = 8192;
 pub(super) const SLOT_BYTES: usize = 6 * ROW_BYTES;
+#[cfg(test)]
 pub(super) const SLAB_BYTES: usize = 2 * SLOT_BYTES;
+
+/// Checked once before private cache/slab allocation; not serving admission.
+#[derive(Clone, Copy)]
+pub(super) struct OwnerCapacity(usize);
+
+impl OwnerCapacity {
+    pub(super) fn new(owners: usize) -> Result<Self> {
+        ensure!(
+            (2..=4).contains(&owners),
+            "paired owner capacity must be2..4"
+        );
+        Ok(Self(owners))
+    }
+
+    pub(super) fn owners(self) -> usize {
+        self.0
+    }
+
+    pub(super) fn contains(self, slot: usize) -> bool {
+        slot < self.0
+    }
+
+    pub(super) fn slab_bytes(self) -> usize {
+        // The private constructor bounds owners at four; SLOT_BYTES is fixed.
+        self.0 * SLOT_BYTES
+    }
+
+    pub(super) fn cache_blocks(self, context: usize) -> Result<usize> {
+        blocks_per_slot(context)?
+            .checked_mul(self.0)
+            .context("paired KV block count overflow")
+    }
+}
 
 #[path = "paired_bootstrap.rs"]
 mod bootstrap;
@@ -124,7 +158,8 @@ pub(super) struct Pool {
     rank: usize,
     context: usize,
     blocks_per_slot: usize,
-    slots: [Slot; 2],
+    capacity: OwnerCapacity,
+    slots: Box<[Slot]>,
     closed: bool,
     close_failed: bool,
     verification: Option<Producer>,
@@ -136,17 +171,18 @@ impl Pool {
         context: usize,
         cache: &PagedKvCache,
         rank: usize,
+        capacity: OwnerCapacity,
     ) -> Result<Self> {
         let blocks = blocks_per_slot(context)?;
         ensure!(
-            cache.num_blocks() == blocks * 2 && cache.block_size() == 16,
-            "paired cache must own two complete reserves"
+            cache.num_blocks() == capacity.cache_blocks(context)? && cache.block_size() == 16,
+            "paired cache must own one complete reserve per admitted owner"
         );
         let cache_spans = kv_rows::cache_spans(cache)?;
-        let slab = gpu.alloc(SLAB_BYTES)?;
+        let slab = gpu.alloc(capacity.slab_bytes())?;
         let span = kv_rows_plan::DeviceSpan {
             ptr: slab,
-            bytes: SLAB_BYTES,
+            bytes: capacity.slab_bytes(),
         };
         // A backend alias is not a newly owned allocation, even when the
         // returned interior pointer is malformed. Never free that old owner.
@@ -181,7 +217,11 @@ impl Pool {
             rank,
             context,
             blocks_per_slot: blocks,
-            slots: std::array::from_fn(|_| Slot::default()),
+            capacity,
+            slots: (0..capacity.owners())
+                .map(|_| Slot::default())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             closed: false,
             close_failed: false,
             verification: None,
@@ -191,8 +231,10 @@ impl Pool {
 }
 
 impl Glm5MtpHead {
+    /// Explicit cold owner capacity; serving still calls the fixed-two wrapper.
+    /// Capacity expansion is staged separately from any pair mapping or E6 admission.
     #[allow(dead_code, clippy::too_many_arguments)]
-    pub(crate) fn new_paired(
+    pub(crate) fn new_paired_with_owner_capacity(
         module: Glm5MtpModule,
         embed_tokens: DenseWeight,
         lm_head: DenseWeight,
@@ -201,7 +243,9 @@ impl Glm5MtpHead {
         gpu: &dyn GpuBackend,
         mtp_vocab_size: u32,
         context_tokens: usize,
+        owners: usize,
     ) -> Result<Self> {
+        let capacity = OwnerCapacity::new(owners)?;
         blocks_per_slot(context_tokens)?;
         ensure!(
             config.model_type == "glm5_next"
@@ -224,7 +268,31 @@ impl Glm5MtpHead {
             gpu,
             mtp_vocab_size,
             context_tokens,
-            Some(context_tokens),
+            Some((context_tokens, capacity)),
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn new_paired(
+        module: Glm5MtpModule,
+        embed_tokens: DenseWeight,
+        lm_head: DenseWeight,
+        lm_head_nvfp4: Option<QuantizedWeight>,
+        config: &atlas_core::config::ModelConfig,
+        gpu: &dyn GpuBackend,
+        mtp_vocab_size: u32,
+        context_tokens: usize,
+    ) -> Result<Self> {
+        Self::new_paired_with_owner_capacity(
+            module,
+            embed_tokens,
+            lm_head,
+            lm_head_nvfp4,
+            config,
+            gpu,
+            mtp_vocab_size,
+            context_tokens,
+            2,
         )
     }
 }

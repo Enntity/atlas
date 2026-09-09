@@ -44,7 +44,7 @@ impl Glm5MtpHead {
         ensure!(
             !pool.closed
                 && std::sync::Arc::ptr_eq(&pool.identity, &lease.owner)
-                && lease.slot < 2
+                && pool.capacity.contains(lease.slot)
                 && lease.slab == pool.slab,
             "foreign paired acknowledgement lease"
         );

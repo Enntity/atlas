@@ -37,7 +37,7 @@ impl Glm5MtpHead {
         gpu: &dyn GpuBackend,
         mtp_vocab_size: u32,
         max_seq_len: usize,
-        paired_context: Option<usize>,
+        paired_context: Option<(usize, paired::OwnerCapacity)>,
     ) -> Result<Self> {
         let hidden_trace_enabled = hidden_trace::configured()?;
         anyhow::ensure!(
@@ -59,10 +59,8 @@ impl Glm5MtpHead {
             .then(|| cache_shape.bf16_index(config.index_kpool, config.index_head_dim))
             .transpose()?;
         let cache_plan = GlmCachePlan::new(cache_shape, &kv_config, sparse_index)?;
-        let num_blocks = if let Some(context) = paired_context {
-            paired::blocks_per_slot(context)?
-                .checked_mul(2)
-                .ok_or_else(|| anyhow::anyhow!("paired KV block count overflow"))?
+        let num_blocks = if let Some((context, capacity)) = paired_context {
+            capacity.cache_blocks(context)?
         } else {
             max_seq_len / kv_config.block_size + 1
         };
@@ -91,8 +89,14 @@ impl Glm5MtpHead {
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
             argmax_value_k: gpu.kernel("argmax", "argmax_bf16_value")?,
         };
-        if let Some(context) = paired_context {
-            let pool = paired::Pool::new(gpu, context, &result.kv_cache.lock(), config.ep_rank)?;
+        if let Some((context, capacity)) = paired_context {
+            let pool = paired::Pool::new(
+                gpu,
+                context,
+                &result.kv_cache.lock(),
+                config.ep_rank,
+                capacity,
+            )?;
             result.paired = Some(Mutex::new(pool));
         }
         Ok(result)

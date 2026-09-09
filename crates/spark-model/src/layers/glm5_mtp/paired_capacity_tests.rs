@@ -8,6 +8,9 @@ mod gpu;
 use gpu::TestGpu;
 use std::sync::atomic::Ordering;
 
+#[path = "paired_owner_capacity_tests.rs"]
+mod owner_capacity_tests;
+
 struct Body(bool);
 impl TransformerLayer for Body {
     fn alloc_state(&self, _: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
@@ -40,6 +43,15 @@ fn build_head(gpu: &dyn GpuBackend) -> Result<Glm5MtpHead> {
 }
 
 fn configured_head(gpu: &dyn GpuBackend, paired: bool, indexed: bool) -> Result<Glm5MtpHead> {
+    configured_owner_head(gpu, paired, indexed, None)
+}
+
+fn configured_owner_head(
+    gpu: &dyn GpuBackend,
+    paired: bool,
+    indexed: bool,
+    owners: Option<usize>,
+) -> Result<Glm5MtpHead> {
     let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
     config.model_type = "glm5_next".into();
     config.hidden_size = 4096;
@@ -63,6 +75,23 @@ fn configured_head(gpu: &dyn GpuBackend, paired: bool, indexed: bool) -> Result<
         eh_proj: dense(4096 * 4096 * 4),
         eh_proj_nvfp4: None,
     };
+    if let Some(owners) = owners {
+        ensure!(
+            paired,
+            "explicit owner capacity requires actual paired constructor"
+        );
+        return Glm5MtpHead::new_paired_with_owner_capacity(
+            module,
+            dense(8 * 8192),
+            dense(8 * 8192),
+            None,
+            &config,
+            gpu,
+            8,
+            2044,
+            owners,
+        );
+    }
     let constructor = if paired {
         Glm5MtpHead::new_paired
     } else {
@@ -189,7 +218,7 @@ fn actual_indexed_constructor_sizes_all_256_blocks_and_rejects_slab_aliases() {
         gpu.clear();
         gpu.next_alloc_alias.store(ptr.0, Ordering::Relaxed);
         assert!(
-            Pool::new(&gpu, 2044, &cache, 0).is_err(),
+            Pool::new(&gpu, 2044, &cache, 0, OwnerCapacity::new(2).unwrap()).is_err(),
             "index owner is not slab authority"
         );
         assert_eq!(gpu.free_count(), 0);
@@ -235,7 +264,7 @@ fn actual_pool_alias_refusal_does_not_free_original_kv_owner() {
         let before = gpu.live_allocations();
         gpu.clear();
         gpu.next_alloc_alias.store(original.0, Ordering::Relaxed);
-        assert!(Pool::new(&gpu, 2044, &cache, 0).is_err());
+        assert!(Pool::new(&gpu, 2044, &cache, 0, OwnerCapacity::new(2).unwrap()).is_err());
         assert_eq!(
             gpu.free_count(),
             0,

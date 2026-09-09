@@ -173,7 +173,7 @@ impl Glm5MtpHead {
         ensure!(
             pool.backend == gpu as *const dyn GpuBackend as *const () as usize
                 && std::sync::Arc::ptr_eq(&pool.identity, &lease.owner)
-                && lease.slot < 2
+                && pool.capacity.contains(lease.slot)
                 && pool.slots[lease.slot].generation == lease.generation,
             "foreign paired quarantine lease"
         );

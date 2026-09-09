@@ -4,6 +4,19 @@
 The qualified selected path still has two request slots. Nonspeculative C1..C8
 support does not provide speculative accepted-prefix or rollback semantics.
 
+Owner-storage prerequisite is now implemented and CPU-qualified: one checked
+capacity2..4 derives the private cache/index reserves, fixed-length owner table
+and whole hidden-slab bounds. Actual constructor/lease checks cover three/four
+owners, fifth-owner refusal, slot3 retirement/reuse, failed-retirement quarantine
+and an overlap visible only in the larger slab. Existing capacity/cleanup checks
+and both original/shared-M10 all25 Model/worker continuation controls pass.
+The constructor test first failed at the actual capacity-four refusal before
+implementation. Logs: campaign `c4-owner-capacity-{red,green,controls}.log` and
+`c4-owner-pair-controls.log`. No native serving gain is attributed to this slice.
+Factory remains literal capacity2; paired compute explicitly rejects larger
+pools until physical-group mapping is implemented. Scheduler, wire admission,
+target memory accounting and large-context limits are not opened by this change.
+
 ## Architectural reference
 
 Current upstream vLLM batches request-indexed target queries and independently

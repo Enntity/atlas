@@ -20,7 +20,7 @@ impl Pool {
         let binding = slot.binding.as_ref().context("paired request not bound")?;
         let view = slot.tail.as_ref().context("paired tail not published")?;
         ensure!(
-            binding.sequence_slot < 2
+            self.capacity.contains(binding.sequence_slot)
                 && binding.capture_generation != 0
                 && !binding.capture.is_null()
                 && !binding.normalized.is_null()
@@ -190,7 +190,7 @@ impl GlmPairedHandoff for Glm5MtpHead {
         let slot = &pool.slots[state.paired.as_ref().expect("validated lease").slot];
         ensure!(
             pool.rank == ctx.config.ep_rank
-                && sequence_slot < 2
+                && pool.capacity.contains(sequence_slot)
                 && prompt > 0
                 && prompt < pool.context
                 && state.seq_len == 0
@@ -329,7 +329,7 @@ impl GlmPairedHandoff for Glm5MtpHead {
             ensure!(
                 !source.overlaps(DeviceSpan {
                     ptr: pool.slab,
-                    bytes: SLAB_BYTES
+                    bytes: pool.capacity.slab_bytes()
                 })?,
                 "paired prompt source aliases handoff slab"
             );
@@ -337,7 +337,7 @@ impl GlmPairedHandoff for Glm5MtpHead {
                 ensure!(
                     !span.overlaps(DeviceSpan {
                         ptr: pool.slab,
-                        bytes: SLAB_BYTES
+                        bytes: pool.capacity.slab_bytes()
                     })?,
                     "paired handoff slab aliases actual writer scratch/cache"
                 );

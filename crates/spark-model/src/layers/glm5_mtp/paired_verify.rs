@@ -85,7 +85,7 @@ impl Pool {
         let index = self.matches_request(state, input, ctx)?;
         let slab = kv_rows_plan::DeviceSpan {
             ptr: self.slab,
-            bytes: SLAB_BYTES,
+            bytes: self.capacity.slab_bytes(),
         };
         for span in [
             kv_rows_plan::DeviceSpan {

@@ -13,6 +13,10 @@ impl Pool {
         states: [&Glm5MtpProposerState; 2],
         ctx: &ForwardContext,
     ) -> Result<PairVerification> {
+        ensure!(
+            self.capacity.owners() == 2,
+            "fixed paired compute requires capacity2 until physical group mapping is admitted"
+        );
         let records = [
             self.verify_candidate(&inputs[0], &tokens[0], states[0], ctx)?,
             self.verify_candidate(&inputs[1], &tokens[1], states[1], ctx)?,

@@ -19,7 +19,7 @@ impl Pool {
         ensure!(
             std::sync::Arc::ptr_eq(&lease.owner, &self.identity)
                 && lease.slab == self.slab
-                && lease.slot < 2
+                && self.capacity.contains(lease.slot)
                 && lease.generation == self.slots[lease.slot].generation,
             "foreign paired cleanup lease"
         );
