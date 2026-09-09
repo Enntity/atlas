@@ -57,6 +57,8 @@ GLM_MLA_BATCH23="${GLM_MLA_BATCH23:-0}"
 GLM_MLA_BATCH4="${GLM_MLA_BATCH4:-0}"
 GLM_C3_GROUPED_MOE="${GLM_C3_GROUPED_MOE:-0}"
 GLM_C4_DECODE="${GLM_C4_DECODE:-0}"
+# Independent nonspeculative C2..8; requires explicit temporal mHC disable below.
+GLM_INDEPENDENT_DECODE="${GLM_INDEPENDENT_DECODE-0}"
 GLM_C4_SPARSE="${GLM_C4_SPARSE:-0}"
 GLM_C4_GROUPED_MOE="${GLM_C4_GROUPED_MOE:-0}"
 GLM_MULTI_SEQ_SPARSE="${GLM_MULTI_SEQ_SPARSE:-0}"
@@ -161,6 +163,29 @@ GLM_MTP_SERIAL_PREFILL="${GLM_MTP_SERIAL_PREFILL:-0}"
 # the batched KV-only path by default whenever speculative decode is enabled.
 # The serial path remains an explicit correctness/debugging oracle.
 GLM_MTP_BATCHED_PREFILL="${GLM_MTP_BATCHED_PREFILL:-$SPECULATIVE}"
+
+if [[ "$GLM_INDEPENDENT_DECODE" != "0" && "$GLM_INDEPENDENT_DECODE" != "1" ]]; then
+  echo "ERROR: GLM_INDEPENDENT_DECODE must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$GLM_INDEPENDENT_DECODE" == "1" ]]; then
+  if [[ ! "$MAX_BATCH_SIZE" =~ ^[2-8]$ || "$MAX_NUM_SEQS" != "$MAX_BATCH_SIZE" || \
+        "$TP_SIZE" != "2" || "$SPECULATIVE" != "0" || "$SWAP_SPACE_GB" != "0" || \
+        "$GLM_MULTI_SEQ_SPARSE" != "0" || "$GLM_MULTI_SEQ_SPARSE_GRAPHS" != "0" || "$GLM_C4_SPARSE" != "0" ]]; then
+    echo "ERROR: GLM_INDEPENDENT_DECODE requires TP2, equal active/admitted caps 2..8, SPECULATIVE=0, SWAP_SPACE_GB=0 and sparse modes off." >&2
+    exit 2
+  fi
+  if [[ ! "$MAX_SEQ_LEN" =~ ^[1-9][0-9]{0,3}$ ]] || (( MAX_SEQ_LEN > 2048 )); then
+    echo "ERROR: GLM_INDEPENDENT_DECODE requires MAX_SEQ_LEN in 1..2048." >&2
+    exit 2
+  fi
+  # Preserve the ordinary launcher's default1; do not silently override an
+  # explicit temporal setting or borrow temporal K5 math for an independent row.
+  if [[ "$GLM_K5_HC_CUBLAS" != "0" ]]; then
+    echo "ERROR: GLM_INDEPENDENT_DECODE requires explicit GLM_K5_HC_CUBLAS=0 (ordinary default is 1)." >&2
+    exit 2
+  fi
+fi
 
 for glm_checked_flag in GLM_MTP_REPAIR GLM_MTP_KV_REPAIR_VERIFY MTP_PREFILL_ONLY GLM_MOE_GATE_UP_M16 GLM_MOE_GATE_UP_M16_VERIFY GLM_M5_ROUTER_BN4 GLM_M5_ROUTER_BN4_VERIFY GLM_M5_SHARED_M16 GLM_M5_SHARED_M16_VERIFY GLM_MTP_K5_LEDGER GLM_MTP_HIDDEN_TRACE GLM_TARGET_SHARED_FP8 GLM_TARGET_SHARED_FP8_VERIFY; do
   if [[ "${!glm_checked_flag}" != "0" && "${!glm_checked_flag}" != "1" ]]; then
@@ -284,7 +309,7 @@ if [[ "$GLM_MLA_BATCH4" != "0" && "$GLM_MLA_BATCH4" != "1" ]]; then
   echo "ERROR: GLM_MLA_BATCH4 must be 0 or 1." >&2
   exit 2
 fi
-if [[ "$GLM_MLA_BATCH4" == "1" && "$GLM_C4_DECODE" != "1" ]]; then
+if [[ "$GLM_INDEPENDENT_DECODE" == "0" && "$GLM_MLA_BATCH4" == "1" && "$GLM_C4_DECODE" != "1" ]]; then
   echo "ERROR: GLM_MLA_BATCH4=1 requires GLM_C4_DECODE=1." >&2
   exit 2
 fi
@@ -315,7 +340,7 @@ for c4_switch in "$GLM_C4_DECODE" "$GLM_C4_SPARSE" "$GLM_C4_GROUPED_MOE" "$NO_DE
     exit 1
   fi
 done
-if [[ "$GLM_C4_GROUPED_MOE" == "1" && "$GLM_C4_DECODE" != "1" ]]; then
+if [[ "$GLM_INDEPENDENT_DECODE" == "0" && "$GLM_C4_GROUPED_MOE" == "1" && "$GLM_C4_DECODE" != "1" ]]; then
   echo "ERROR: GLM_C4_GROUPED_MOE=1 requires GLM_C4_DECODE=1." >&2
   exit 1
 fi
@@ -325,7 +350,7 @@ if [[ "$GLM_C4_SPARSE" == "1" ]] && \
   echo "ERROR: GLM_C4_SPARSE requires C4_DECODE=1, MULTI_SEQ_SPARSE=1, NO_DECODE_GRAPHS_MULTISEQ=1 and KV_OVERCOMMIT=0." >&2
   exit 1
 fi
-if [[ "$GLM_C4_DECODE" == "1" ]] && \
+if [[ "$GLM_INDEPENDENT_DECODE" == "0" && "$GLM_C4_DECODE" == "1" ]] && \
    [[ "$TP_SIZE" != "2" || "$MAX_BATCH_SIZE" != "4" || "$MAX_NUM_SEQS" != "4" || \
       "$SPECULATIVE" != "0" || "$KDA_MULTI_SEQ" != "1" || "$MLA_MULTI_SEQ" != "1" || "$GLM_MULTI_SEQ_SPARSE" != "$GLM_C4_SPARSE" || \
       "$GLM_MULTI_SEQ_SPARSE_GRAPHS" != "0" ]] ; then
@@ -342,8 +367,9 @@ if [[ "$GLM_C4_DECODE" == "1" ]] && (( MAX_SEQ_LEN < 1 || MAX_SEQ_LEN > C4_CONTE
   echo "ERROR: C4 requires MAX_SEQ_LEN in 1..$C4_CONTEXT_LIMIT (including completion)." >&2
   exit 1
 fi
-if (( MAX_BATCH_SIZE < 1 || MAX_BATCH_SIZE > 4 )) || \
-   { (( MAX_BATCH_SIZE == 4 )) && [[ "$GLM_C4_DECODE" != "1" ]]; }; then
+if [[ "$GLM_INDEPENDENT_DECODE" == "0" ]] && \
+   { (( MAX_BATCH_SIZE < 1 || MAX_BATCH_SIZE > 4 )) || \
+     { (( MAX_BATCH_SIZE == 4 )) && [[ "$GLM_C4_DECODE" != "1" ]]; }; }; then
   echo "ERROR: GLM-5 MAX_BATCH_SIZE range is 1..3; C4 requires GLM_C4_DECODE=1." >&2
   exit 2
 fi
@@ -548,7 +574,7 @@ if [[ "$GLM_MTP_SERIAL_PREFILL" == "1" && "$GLM_MTP_BATCHED_PREFILL" == "1" ]]; 
   exit 2
 fi
 
-if (( MAX_NUM_SEQS < MAX_BATCH_SIZE || MAX_NUM_SEQS > 5 )); then
+if [[ "$GLM_INDEPENDENT_DECODE" == "0" ]] && (( MAX_NUM_SEQS < MAX_BATCH_SIZE || MAX_NUM_SEQS > 5 )); then
   echo "ERROR: validated GLM-5 MAX_NUM_SEQS range is MAX_BATCH_SIZE..5." >&2
   exit 2
 fi
@@ -726,6 +752,8 @@ echo "  shared-expert / EP-reduce overlap: $MOE_SHARED_REDUCE_OVERLAP"
 echo "  GLM serial MTP prefill probe: $GLM_MTP_SERIAL_PREFILL"
 echo "  GLM batched MTP KV prefill: $GLM_MTP_BATCHED_PREFILL"
 
+echo "  GLM independent nonspeculative C2..8: $GLM_INDEPENDENT_DECODE"
+
 # Never leave one stale rank in an old communicator.
 docker rm -f atlas-glm53-ep0 2>/dev/null || true
 ssh "$SSH_TARGET" "docker rm -f atlas-glm53-ep1 2>/dev/null || true"
@@ -779,6 +807,7 @@ ssh "$SSH_TARGET" "docker run -d \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE=$GLM_MULTI_SEQ_SPARSE \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS=$GLM_MULTI_SEQ_SPARSE_GRAPHS \
   -e ATLAS_GLM_C4_DECODE=$GLM_C4_DECODE \
+  -e ATLAS_GLM_INDEPENDENT_DECODE=$GLM_INDEPENDENT_DECODE \
   -e ATLAS_GLM_C4_SPARSE=$GLM_C4_SPARSE \
   -e ATLAS_KV_OVERCOMMIT=$KV_OVERCOMMIT \
   -e ATLAS_GLM_C4_GROUPED_MOE=$GLM_C4_GROUPED_MOE \
@@ -876,6 +905,7 @@ docker run -d \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE="$GLM_MULTI_SEQ_SPARSE" \
   -e ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS="$GLM_MULTI_SEQ_SPARSE_GRAPHS" \
   -e ATLAS_GLM_C4_DECODE="$GLM_C4_DECODE" \
+  -e ATLAS_GLM_INDEPENDENT_DECODE="$GLM_INDEPENDENT_DECODE" \
   -e ATLAS_GLM_C4_SPARSE="$GLM_C4_SPARSE" \
   -e ATLAS_KV_OVERCOMMIT="$KV_OVERCOMMIT" \
   -e ATLAS_GLM_C4_GROUPED_MOE="$GLM_C4_GROUPED_MOE" \
