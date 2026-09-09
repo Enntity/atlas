@@ -27,6 +27,10 @@ mod cancellation_tests;
 #[path = "emit_thinking_tests.rs"]
 mod thinking_tests;
 
+#[cfg(test)]
+#[path = "glm_c2_emit_position_tests.rs"]
+mod position_tests;
+
 /// Emit a token for an active sequence (stream + bookkeeping).
 ///
 /// Per OpenAI spec, stop/EOS tokens are NOT streamed to the client —
@@ -40,6 +44,19 @@ pub fn emit_token(
     tok: u32,
     logprobs: Option<crate::api::TokenLogprobs>,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
+) {
+    emit_token_at_position(a, tok, logprobs, sched, a.seq.seq_len);
+}
+
+/// Emit one already-verified row after its whole target prefix was committed.
+/// The caller supplies the validated logical position for ceiling checks only;
+/// canonical model state and all other emission/accounting semantics stay intact.
+pub(super) fn emit_token_at_position(
+    a: &mut ActiveSeq,
+    tok: u32,
+    logprobs: Option<crate::api::TokenLogprobs>,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    position: usize,
 ) {
     // Cooperative cancellation from the streaming pipeline. The
     // stream-side guards (Bug-2 name-run cap, F11 within-dedup, F44
@@ -435,7 +452,7 @@ pub fn emit_token(
             || crate::grammar::grammar_blocks_stop(a.grammar_state.as_mut(), &a.eos_tokens));
     let legacy_suppresses_eos = a.require_tool_call;
     let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-    let hard_ceiling = hard_ceiling_hit(a.remaining, a.seq.seq_len, sched.limits.max_seq_len);
+    let hard_ceiling = hard_ceiling_hit(a.remaining, position, sched.limits.max_seq_len);
     let thinking_suppresses_eos = eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling);
     let suppress_eos = grammar_suppresses_eos
         || legacy_suppresses_eos
@@ -472,7 +489,7 @@ pub fn emit_token(
     // (twin of the non-MTP guard in `decode_logits_step`), so the MTP/emit path
     // also cannot run KV past the context ceiling. No-op when `max_seq_len` is
     // unset (0) or not yet reached.
-    if a.remaining == 0 || seqlen_force_stop(a.seq.seq_len, sched.limits.max_seq_len) {
+    if a.remaining == 0 || seqlen_force_stop(position, sched.limits.max_seq_len) {
         // #144: before the hard length-stop, if a grammar is active and the
         // stop token is not legal at the current position (e.g. mid JSON
         // string), emit the shortest grammar-legal close so the truncated
