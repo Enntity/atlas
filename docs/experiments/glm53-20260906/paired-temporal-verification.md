@@ -68,5 +68,5 @@ required `Skip` while the real base-model adapter resolver returns inert `Fold`
 when no adapter is loaded. The correction admits that base state only with no
 resident adapter and zero configured adapter rank; `Refuse` remains rejected.
 Factory diagnostics now print the indexed layer error before fail-safe exit.
-The corrected candidate subsequently passes both native modes as detailed in
-`paired-ffn-serving-results.md`; fresh-process repetition remains next.
+The corrected candidate subsequently passes both native modes and reversed-order
+fresh-process repetition as detailed in `paired-ffn-serving-results.md`.

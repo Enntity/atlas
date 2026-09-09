@@ -125,8 +125,12 @@ Native source `5b4662a9` subsequently passes the first fully supervised paired
 FFN A/B, including quality and both-rank normal shutdown: warmed C1 remains
 approximately27.3, while C2 improves27.314→34.333 aggregate full-wall tok/s
 (25.7%) with identical retained outputs. See `paired-ffn-serving-results.md`.
-Fresh-process repetition and explicit committed-pair telemetry are next; C2
-remains below37 and selected MTP capacity remains two, not reference parity.
+Fresh-process reversed-order repetition with committed-pair telemetry also
+passes: C2 control27.320→Joint34.418, C1 unchanged near27.35, identical outputs
+and coding acceptance histograms. Both ranks confirm actual Joint E6 commits
+and normal release/exit. C2 remains below37 and selected MTP capacity remains
+two, not reference parity. Same-kernel shared-expert batching is the next
+exact-arithmetic candidate; no gain from it is claimed yet.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.
