@@ -1,9 +1,13 @@
 # T3.1: local Linux guard core, before deployment authority
 
-Status: T3.1 implemented and standalone CPU-gated after actual behavioral RED.
-Frozen source passed10 lifecycle tests plus state/codec tests, check, strict
-clippy and fmt. Final independent source review and root-owned private-PID1
-gate remain pending; no T2 authority or deployment qualification is implied.
+Status: T3.1 is committed (`caf585ed`) and standalone CPU-gated after actual
+behavioral RED. Root's actual private-PID1 gate is also committed (`06561c10`)
+and passed, including a post-commit run with unprotected descendant death and
+outside-decoy survival. Do not repeat that work as a missing prerequisite.
+Authoritative closure: controller campaign `20260908/glm-pair-guard-core/`
+`postcommit-closure.md`, including exact source/executable hashes and raw receipts.
+The live child ticket/channel, pair-disarm/controller adapter and actual T2
+registration remain absent; no selected serving/deployment qualification follows.
 This narrows [T3](glm_c2_supervision_plan.md), not an alternative supervisor.
 No Spark/model/server edits, Cargo workspace registration, Docker/SSH, privilege,
 node access, image packaging, GPU imports or native fault injection in this slice.

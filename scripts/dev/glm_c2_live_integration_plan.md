@@ -70,6 +70,12 @@ Ten-file manifest SHA256
 `bd50fc3506dbfed8e77e7132f8567f09c6acd9ad5be6a6984c9bbdf698c9681c` and raw logs:
 controller `20260909/glm-c2-quiescence/closure.md`. These are local Model-fixture
 checks, not GPU numerics, host drain, live admission or two-rank release proof.
+Committed as `bdaa2558`; root's post-commit focused run again passed4/4 in0.22s
+(`postcommit-focused.log` in the same campaign). The unchanged v29 native binary
+was independently reproduced while this controller-only development occurred.
+The proposed shared guard/server record and wire contract is detailed in
+`glm_c2_live_wire_plan.md`; it still needs the literal selected recipe and
+connected consumer implementation before native admission.
 
 First model slice: model author owns the sealed capability, its actual impl,
 small quiescence child and existing Model-fixture extensions. No factory flag,
