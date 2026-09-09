@@ -57,6 +57,11 @@ impl Fixture {
     pub fn legacy(rank: usize) -> Self {
         Self(inner::Fixture::new_legacy(rank))
     }
+    /// Real one-layer FP32 SSM pool and two allocated owners, without MTP.
+    /// Target compute remains a byte sentinel, not a KDA numerical oracle.
+    pub fn legacy_ssm(rank: usize) -> Self {
+        Self(inner::Fixture::new_legacy_ssm(rank))
+    }
     pub fn deterministic_logits(&self, enabled: bool) {
         self.0
             .gpu
@@ -140,6 +145,49 @@ impl Observer {
     }
     pub fn events(&self) -> Vec<Event> {
         self.gpu.trace().into_iter().map(Event::from).collect()
+    }
+    /// Check the real normalization pointer table against this owner's actual
+    /// pooled SSM state. Call before another owner can overwrite that table.
+    pub fn normalization_streams(
+        &self,
+        model: &TransformerModel,
+        seq: &SequenceState,
+    ) -> Result<Vec<u64>> {
+        ensure!(
+            backend_id(model.gpu.as_ref()) == self.backend,
+            "foreign backend"
+        );
+        let states: Vec<_> = seq
+            .layer_states
+            .iter()
+            .filter_map(|state| state.as_any().downcast_ref::<crate::layer::SsmLayerState>())
+            .collect();
+        ensure!(
+            !states.is_empty(),
+            "normalization fixture needs real SSM state"
+        );
+        let mut streams = Vec::new();
+        for event in self.gpu.trace() {
+            if let inner::Event::Kernel(name, pointers, stream) = event
+                && name == "ssm_state_clamp_norm_fused"
+            {
+                ensure!(pointers.len() == 1, "normalization pointer ABI");
+                let bytes = self.gpu.read_live_span(pointers[0], states.len() * 8)?;
+                for (ordinal, (entry, state)) in bytes.chunks_exact(8).zip(&states).enumerate() {
+                    let actual = u64::from_ne_bytes(entry.try_into().unwrap());
+                    ensure!(
+                        actual == state.h_state.0,
+                        "normalization addressed another owner"
+                    );
+                    ensure!(
+                        actual == model.ssm_pool.h_state(ordinal, seq.slot_idx).0,
+                        "normalization disagrees with physical pool slot"
+                    );
+                }
+                streams.push(stream);
+            }
+        }
+        Ok(streams)
     }
     /// Recorded device-to-host reads only; no memory access or ownership authority.
     pub fn read_spans(&self) -> Vec<(DevicePtr, usize, u64)> {

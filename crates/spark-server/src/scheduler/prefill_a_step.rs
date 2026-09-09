@@ -397,7 +397,9 @@ pub fn start_chunked_prefill(
         if vision_slice.is_some() {
             model.set_vision_slice_base(0, 0, 0);
         }
-        chunk_res
+        let logits = chunk_res?;
+        super::prefill_normalization::initial(model, &seq)?;
+        Ok(logits)
     })();
 
     let logits = match prefill_result {

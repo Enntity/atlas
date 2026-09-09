@@ -322,7 +322,9 @@ pub(super) fn run_standard_chunk_loop(
                 p.prompt_tokens.len(),
             );
             // Normalize SSM states after EVERY chunk to prevent state drift.
-            if let Err(e) = model.normalize_ssm_states(&p.seq, prefill_stream) {
+            if let Err(e) =
+                super::super::prefill_normalization::continuation(model, &p.seq, prefill_stream)
+            {
                 tracing::warn!("SSM state normalization failed: {e:#}");
             }
             if is_last {

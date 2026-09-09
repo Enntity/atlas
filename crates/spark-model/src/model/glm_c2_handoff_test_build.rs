@@ -30,7 +30,21 @@ impl Fixture {
         Self::build(rank, false, 8, 1)
     }
 
+    pub fn new_legacy_ssm(rank: usize) -> Self {
+        Self::build_inner(rank, false, 8, 2, true)
+    }
+
     fn build(rank: usize, paired: bool, target_rows: usize, owners: usize) -> Self {
+        Self::build_inner(rank, paired, target_rows, owners, false)
+    }
+
+    fn build_inner(
+        rank: usize,
+        paired: bool,
+        target_rows: usize,
+        owners: usize,
+        legacy_ssm: bool,
+    ) -> Self {
         assert!(rank < 2);
         let record = Arc::new(Recorder::default());
         let gpu = Box::new(Gpu(record.clone()));
@@ -58,6 +72,15 @@ impl Fixture {
         cfg.num_experts_per_tok = 2;
         cfg.linear_num_key_heads = 64;
         cfg.linear_num_value_heads = 64;
+        if legacy_ssm {
+            cfg.layer_types = vec![atlas_core::config::LayerType::LinearAttention];
+            cfg.index_kpool = 4;
+            cfg.linear_num_key_heads = 32;
+            cfg.linear_num_value_heads = 32;
+            cfg.linear_key_head_dim = 128;
+            cfg.linear_value_head_dim = 128;
+            cfg.linear_conv_kernel_dim = 4;
+        }
         cfg.num_mtp_modules = 0;
         cfg.tp_world_size = 2;
         cfg.ep_world_size = 2;
@@ -171,8 +194,13 @@ impl Fixture {
         model.mtp_prefill_capacity = 2044;
         model.mtp_hidden_save = model.gpu.alloc(ROW_BYTES).unwrap();
         model.proposer = Some(head.clone());
+        if legacy_ssm {
+            model.proposer = None;
+            model.levers.drafter.prefill = false;
+            model.ep_protocol_v2 = true;
+        }
         let seqs = std::array::from_fn(|slot| {
-            if paired {
+            if paired || legacy_ssm {
                 let mut seq = model.alloc_sequence().unwrap();
                 assert_eq!(seq.slot_idx, slot);
                 seq.prompt_len = 4;

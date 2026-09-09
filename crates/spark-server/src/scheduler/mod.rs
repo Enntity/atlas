@@ -66,6 +66,7 @@ mod preempt_tests;
 mod prefill_a_step;
 mod prefill_a_step_params;
 mod prefill_b_step;
+mod prefill_normalization;
 mod repetition;
 mod rollback;
 mod sample_step;

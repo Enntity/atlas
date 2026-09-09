@@ -30,6 +30,10 @@ mod run_batched_prefill;
 #[path = "phase_continue_prefills/run_standard.rs"]
 mod run_standard;
 
+#[cfg(test)]
+#[path = "glm_prefill_normalization_tests.rs"]
+mod normalization_tests;
+
 use std::time::Instant;
 
 use spark_model::traits::Model;
