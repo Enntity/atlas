@@ -123,6 +123,15 @@ static void run(unsigned rows, unsigned heads, unsigned n, unsigned k,
         } else if (rows == 5) {
             mla_batched_gemv_batch5<<<grid, 256>>>(di.ptr, dw.ptr, candidate.ptr,
                 n, k, input_head_stride, output_head_stride, input_row_stride, output_row_stride);
+        } else if (rows == 6) {
+            mla_batched_gemv_batch6<<<grid, 256>>>(di.ptr, dw.ptr, candidate.ptr,
+                n, k, input_head_stride, output_head_stride, input_row_stride, output_row_stride);
+        } else if (rows == 7) {
+            mla_batched_gemv_batch7<<<grid, 256>>>(di.ptr, dw.ptr, candidate.ptr,
+                n, k, input_head_stride, output_head_stride, input_row_stride, output_row_stride);
+        } else if (rows == 8) {
+            mla_batched_gemv_batch8<<<grid, 256>>>(di.ptr, dw.ptr, candidate.ptr,
+                n, k, input_head_stride, output_head_stride, input_row_stride, output_row_stride);
         } else if (rows == 10) {
             mla_batched_gemv_batch10<<<grid, 256>>>(di.ptr, dw.ptr, candidate.ptr,
                 n, k, input_head_stride, output_head_stride, input_row_stride, output_row_stride);
@@ -178,9 +187,10 @@ static void run(unsigned rows, unsigned heads, unsigned n, unsigned k,
     float max_reference_error = 0.0f;
     for (unsigned row = 0; row < rows; ++row) {
         for (unsigned head = 0; head < heads; ++head) {
-            // Exhaustive CPU dots for M4/M10; sampled columns for M2/M3/M5.
+            // Exhaustive CPU dots for M4/M6/M7/M8/M10; sampled M2/M3/M5.
             for (unsigned col = 0; col < n; ++col) {
-                if (rows != 4 && rows != 10 && col != 0 && col != n / 2 && col != n - 1) continue;
+                const bool exhaustive = rows == 4 || (rows >= 6 && rows <= 8) || rows == 10;
+                if (!exhaustive && col != 0 && col != n / 2 && col != n - 1) continue;
                 double expected = 0.0;
                 for (unsigned d = 0; d < k; ++d)
                     expected += double(__bfloat162float(input[size_t(row) * input_row_stride
@@ -201,14 +211,22 @@ static void run(unsigned rows, unsigned heads, unsigned n, unsigned k,
         std::printf(" FAIL\n");
         std::exit(2);
     }
-    if (rows == 4 || rows == 10) {
+    if (rows == 4 || (rows >= 6 && rows <= 8) || rows == 10) {
         // Same allocations and weights, two nontrivial row permutations.
         // Compare full rows (including padding) with the canonical result;
         // this also verifies that pointer/row identity is not cached in CUDA.
-        const std::vector<std::vector<unsigned>> orders = rows == 4
-            ? std::vector<std::vector<unsigned>>{{3, 1, 0, 2}, {2, 0, 3, 1}}
-            : std::vector<std::vector<unsigned>>{{5, 6, 7, 8, 9, 0, 1, 2, 3, 4},
-                                                 {4, 1, 3, 0, 2, 7, 9, 5, 8, 6}};
+        std::vector<std::vector<unsigned>> orders;
+        if (rows == 4) {
+            orders = {{3, 1, 0, 2}, {2, 0, 3, 1}};
+        } else if (rows == 10) {
+            orders = {{5, 6, 7, 8, 9, 0, 1, 2, 3, 4}, {4, 1, 3, 0, 2, 7, 9, 5, 8, 6}};
+        } else {
+            orders.resize(2, std::vector<unsigned>(rows));
+            for (unsigned row = 0; row < rows; ++row) {
+                orders[0][row] = rows - 1 - row;
+                orders[1][row] = (row + 1) % rows;
+            }
+        }
         for (const auto& order : orders) {
             auto permuted = input;
             for (unsigned row = 0; row < rows; ++row)
@@ -281,9 +299,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "repetitions must be <=100\n");
         return 1;
     }
-    for (unsigned rows : {2u, 3u, 4u, 5u, 10u}) {
+    for (unsigned rows : {2u, 3u, 4u, 5u, 6u, 7u, 8u, 10u}) {
         run(rows, 3, 8, 8, true, 0);
         if (rows == 10) run(rows, 3, 9, 12, true, 0);
+        if (rows >= 6 && rows <= 8) {
+            run(rows, 3, 9, 12, true, 0);
+            run(rows, 3, 9, 12, false, 0);
+        }
         run(rows, 32, 512, 256, true, 0);
         run(rows, 32, 256, 512, true, 0);
         run(rows, 32, 512, 256, false, repetitions);

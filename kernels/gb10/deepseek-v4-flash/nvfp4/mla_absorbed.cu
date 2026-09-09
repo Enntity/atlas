@@ -263,6 +263,18 @@ extern "C" __global__ void mla_batched_gemv_batch5(MLA_BATCH_ARGS) {
     MLA_BATCH_CALL(5);
 }
 
+extern "C" __global__ void mla_batched_gemv_batch6(MLA_BATCH_ARGS) {
+    MLA_BATCH_CALL(6);
+}
+
+extern "C" __global__ void mla_batched_gemv_batch7(MLA_BATCH_ARGS) {
+    MLA_BATCH_CALL(7);
+}
+
+extern "C" __global__ void mla_batched_gemv_batch8(MLA_BATCH_ARGS) {
+    MLA_BATCH_CALL(8);
+}
+
 // Staged two-session K5 projection. No serving dispatcher selects this export.
 extern "C" __global__ void mla_batched_gemv_batch10(MLA_BATCH_ARGS) {
     MLA_BATCH_CALL(10);
