@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Actual four-owner allocation/retirement and addressed F1; no native proof.
+//! Actual bounded-owner allocation/retirement and addressed F1; no native proof.
 use super::*;
 use spark_model::model::glm_c2_test_support::Snapshot;
 
-struct Four {
+struct Owners<const N: usize> {
     model: TransformerModel,
     worker: TransformerModel,
     active: Vec<ActiveSeq>,
@@ -15,15 +15,22 @@ struct Four {
     responses: Vec<RespRx>,
 }
 
-impl Four {
+type Four = Owners<4>;
+type Eight = Owners<8>;
+
+impl<const N: usize> Owners<N> {
     fn new(reverse: bool) -> Self {
         let prepare = |rank| {
-            let mut f = Fixture::paired_compute_with_owner_capacity(rank, 4);
+            let mut f = if N <= 4 {
+                Fixture::paired_compute_with_owner_capacity(rank, N)
+            } else {
+                Fixture::owner_compute_with_owner_capacity(rank, N)
+            };
             f.deterministic_logits(true);
             let wire = f.install_wire();
             let (model, seqs, observer) = f.into_parts();
             let mut seqs = Vec::from(seqs);
-            for slot in 2..4 {
+            for slot in 2..N {
                 let seq = model.alloc_sequence().unwrap();
                 assert_eq!(seq.slot_idx, slot);
                 seqs.push(seq);
@@ -34,10 +41,10 @@ impl Four {
                     .unwrap()
                     .owner_capacity()
                     .unwrap(),
-                4
+                N
             );
             for seq in &mut seqs {
-                let prompt = [1, 2, 3, 4 + seq.slot_idx as u32];
+                let prompt = [1, 2, 3, (4 + seq.slot_idx as u32) % 8];
                 seq.prompt_len = prompt.len();
                 model.prefill(&prompt, seq, 37).unwrap();
             }
@@ -146,23 +153,40 @@ fn actual_four_owner_retirement_reuses_slots2_and3_without_compaction() {
     if isolated("capacity::actual_four_owner_retirement_reuses_slots2_and3_without_compaction") {
         return;
     }
+    reuse_last_pair::<4>();
+}
+
+#[test]
+fn actual_eight_owner_retirement_reuses_slots6_and7_without_compaction() {
+    if isolated("capacity::actual_eight_owner_retirement_reuses_slots6_and7_without_compaction") {
+        return;
+    }
+    reuse_last_pair::<8>();
+}
+
+fn reuse_last_pair<const N: usize>() {
     for reverse in [false, true] {
-        let mut r = Four::new(reverse);
-        let saved0 = r.saved(0);
-        let saved1 = r.saved(1);
-        r.finish(3);
-        r.finish(2);
+        let mut r = Owners::<N>::new(reverse);
+        let saved: Vec<_> = (0..N - 2).map(|slot| r.saved(slot)).collect();
+        r.finish(N - 1);
+        r.finish(N - 2);
         r.retire()
-            .expect("actual capacity4 retirement must accept physical slots2/3");
+            .expect("actual retirement must accept the last physical pair");
         assert_eq!(
             r.tx.packets(),
-            [vec![2], vec![0xfffffff1], vec![3], vec![0xfffffff1]]
+            [
+                vec![(N - 2) as u32],
+                vec![0xfffffff1],
+                vec![(N - 1) as u32],
+                vec![0xfffffff1]
+            ]
         );
-        assert_eq!(r.active.len(), 2);
-        r.unchanged(0, &saved0, true);
-        r.unchanged(1, &saved1, true);
-        for slot in 0..4 {
-            if slot < 2 {
+        assert_eq!(r.active.len(), N - 2);
+        for (slot, before) in saved.iter().enumerate() {
+            r.unchanged(slot, before, true);
+        }
+        for slot in 0..N {
+            if slot < N - 2 {
                 assert!(r.responses[slot].try_recv().is_err());
             } else {
                 assert_eq!(
@@ -172,7 +196,7 @@ fn actual_four_owner_retirement_reuses_slots2_and3_without_compaction() {
             }
         }
         r.replay(2);
-        for slot in 2..4 {
+        for slot in N - 2..N {
             assert_eq!(r.slots[slot].as_ref().unwrap().slot_idx, slot);
             assert_eq!(
                 r.peer_observer
@@ -200,8 +224,60 @@ fn actual_four_owner_retirement_reuses_slots2_and3_without_compaction() {
             let (a, response) = test_owned_seq(replacement, vec![5], 128, None);
             r.active.push(a);
             r.responses.push(response);
-            r.unchanged(0, &saved0, true);
-            r.unchanged(1, &saved1, true);
+            for (slot, before) in saved.iter().enumerate() {
+                r.unchanged(slot, before, true);
+            }
+        }
+        r.close();
+    }
+}
+
+#[test]
+fn failed_last_slot_retirement_keeps_owner_and_response_at_capacity_eight() {
+    if isolated("capacity::failed_last_slot_retirement_keeps_owner_and_response_at_capacity_eight")
+    {
+        return;
+    }
+    let mut control = Eight::new(false);
+    control.finish(7);
+    control.retire().unwrap();
+    let sync = control
+        .observer
+        .events()
+        .iter()
+        .position(|event| matches!(event, Event::Sync(7)))
+        .unwrap()
+        + 1;
+    control.close();
+    for fault in 0..3 {
+        let mut r = Eight::new(true);
+        let saved: Vec<_> = (0..7).map(|slot| r.saved(slot)).collect();
+        r.finish(7);
+        if fault == 0 {
+            r.observer.fail_at(sync);
+        } else {
+            r.tx.fail_at(fault);
+        }
+        let error = r.retire().unwrap_err();
+        assert!(format!("{error:#}").contains("injected"), "{error:#}");
+        assert_eq!(r.active.len(), 8);
+        assert!(r.active.iter().any(|a| a.seq.slot_idx == 7 && a.finished));
+        for response in &mut r.responses {
+            assert!(response.try_recv().is_err());
+        }
+        if fault == 0 {
+            assert!(r.tx.packets().is_empty());
+            assert_eq!(r.observer.events().len(), sync);
+        } else {
+            assert_eq!(r.tx.packets().len(), fault);
+            assert_eq!(r.tx.packets()[0], vec![7]);
+            if fault == 2 {
+                assert_eq!(r.tx.packets()[1], vec![0xfffffff1]);
+            }
+        }
+        for (slot, before) in saved.iter().enumerate() {
+            // Inspect saved actual backing after failure, not revoked leases.
+            r.unchanged(slot, before, false);
         }
         r.close();
     }

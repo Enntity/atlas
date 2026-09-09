@@ -319,8 +319,18 @@ fn paired_invalid_capacity_or_context_refuses_before_backend() {
     ) {
         return;
     }
-    for (capacity, admitted, context) in [(1, 1, 2044), (5, 5, 2044), (4, 3, 2044), (4, 4, 2045)] {
-        let mut a = args(capacity, 0);
+    for (rank, (capacity, admitted, context)) in (0..2).flat_map(|rank| {
+        [
+            (1, 1, 2044),
+            (9, 9, 2044),
+            (4, 3, 2044),
+            (8, 7, 2044),
+            (8, 8, 2045),
+        ]
+        .into_iter()
+        .map(move |case| (rank, case))
+    }) {
+        let mut a = args(capacity, rank);
         a.max_num_seqs = admitted;
         a.max_seq_len = context;
         a.glm_paired_mtp = true;
@@ -351,7 +361,8 @@ fn paired_mtp_preparation_reserves_real_local_slots_and_rows() {
     ) {
         return;
     }
-    for (capacity, rank) in (2..=4).flat_map(|capacity| (0..2).map(move |rank| (capacity, rank))) {
+    let mut four_owner_reserve = [None; 2];
+    for (capacity, rank) in (2..=8).flat_map(|capacity| (0..2).map(move |rank| (capacity, rank))) {
         let mut a = args(capacity, rank);
         a.glm_paired_mtp = true;
         a.speculative = true;
@@ -362,6 +373,7 @@ fn paired_mtp_preparation_reserves_real_local_slots_and_rows() {
         assert_eq!(topology.unwrap().ep_rank, rank);
         assert_eq!(cfg.linear_num_value_heads, 32);
         let budget = super::super::super::resolve_prefill_budget(&a, reserve.ssm_prefill_chunk);
+        assert_eq!(budget.max_batch_tokens, 1024 + capacity);
         assert_eq!(reserve.max_batch_tokens_pre, budget.max_batch_tokens);
         assert_eq!(
             reserve.resolved_prefill.as_ref().unwrap().max_batch_tokens,
@@ -393,6 +405,16 @@ fn paired_mtp_preparation_reserves_real_local_slots_and_rows() {
             )
             .total_bytes()
         );
+        if capacity == 4 {
+            four_owner_reserve[rank] = Some(reserve.inference_reserve);
+        } else if capacity == 8 {
+            // Actual TP-local reserve delta, excluding the separately quoted
+            // arena: four owners' full K5 state/private storage plus four GDN rows.
+            assert_eq!(
+                reserve.inference_reserve - four_owner_reserve[rank].unwrap(),
+                1_920_304_128
+            );
+        }
         let total = reserve.inference_reserve + reserve.buffer_arena_bytes;
         assert!(prepare_reserve(&a, &mut config(), total).is_ok());
         assert!(prepare_reserve(&a, &mut config(), total - 1).is_err());

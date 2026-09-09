@@ -61,10 +61,10 @@ pub(super) fn validate(
             && num_drafts == 4
             && matches!(mtp_quant, MtpQuantization::Bf16)
             && config.num_mtp_modules > 0
-            && (2..=4).contains(&max_batch_size)
+            && (2..=8).contains(&max_batch_size)
             && max_batch_tokens >= 5
             && (2..=2044).contains(&max_seq_len),
-        "paired factory requires two to four owners, BF16 MTP4 and bounded target capacity"
+        "paired factory requires two to eight owners, BF16 MTP4 and bounded target capacity"
     );
     ensure!(
         kv_dtype == KvCacheDtype::Bf16

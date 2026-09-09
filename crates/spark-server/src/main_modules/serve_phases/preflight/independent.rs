@@ -26,8 +26,8 @@ fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<O
     }
     if args.glm_paired_mtp {
         anyhow::ensure!(
-            (2..=4).contains(&args.max_batch_size) && args.max_num_seqs == args.max_batch_size,
-            "selected paired active/admitted capacities must agree within2..4"
+            (2..=8).contains(&args.max_batch_size) && args.max_num_seqs == args.max_batch_size,
+            "selected paired active/admitted capacities must agree within2..8"
         );
         let topology = resolve_topology(args, config)?;
         anyhow::ensure!(

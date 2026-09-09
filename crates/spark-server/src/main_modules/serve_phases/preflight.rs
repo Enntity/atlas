@@ -197,7 +197,7 @@ pub(crate) fn preflight_reserve(
             );
             anyhow::ensure!(
                 args.max_batch_size == 1
-                    || (args.glm_paired_mtp && (2..=4).contains(&args.max_batch_size)),
+                    || (args.glm_paired_mtp && (2..=8).contains(&args.max_batch_size)),
                 "GLM-5 MTP requires C1 or the supervised bounded-owner dispatcher"
             );
         }

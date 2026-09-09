@@ -367,10 +367,10 @@ pub(super) fn retire_selected_finished_sequences(
         .expect("validated selected retirement capability")
         .owner_capacity()?;
     anyhow::ensure!(
-        (2..=4).contains(&capacity),
-        "selected retirement requires actual owner capacity 2..=4"
+        (2..=8).contains(&capacity),
+        "selected retirement requires actual owner capacity 2..=8"
     );
-    let mut seen = [false; 4];
+    let mut seen = [false; 8];
     for a in active.iter() {
         let slot = a.seq.slot_idx;
         anyhow::ensure!(

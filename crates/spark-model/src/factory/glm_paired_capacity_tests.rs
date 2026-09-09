@@ -3,14 +3,14 @@
 use super::*;
 
 #[test]
-fn actual_factory_validator_requires_explicit_two_to_four_owners() {
-    if isolated("capacity_tests::actual_factory_validator_requires_explicit_two_to_four_owners") {
+fn actual_factory_validator_requires_explicit_two_to_eight_owners() {
+    if isolated("capacity_tests::actual_factory_validator_requires_explicit_two_to_eight_owners") {
         return;
     }
     for rank in 0..2 {
         let c = config(rank);
         let comm = Comm(rank, Arc::new(AtomicUsize::new(0)), None);
-        for owners in [2, 3, 4, 1, 5] {
+        for owners in [2, 3, 4, 5, 6, 7, 8, 1, 9] {
             let result = validate(
                 GlmMtpBuildMode::Paired,
                 &c,
@@ -30,7 +30,7 @@ fn actual_factory_validator_requires_explicit_two_to_four_owners() {
             );
             assert_eq!(
                 result.is_ok(),
-                (2..=4).contains(&owners),
+                (2..=8).contains(&owners),
                 "actual factory rank={rank} owners={owners}: {result:?}"
             );
         }
@@ -43,7 +43,7 @@ fn actual_factory_head_allocates_exact_explicit_owner_capacity() {
         return;
     }
     for rank in 0..2 {
-        for owners in 2..=4 {
+        for owners in 2..=8 {
             let gpu = Gpu::new();
             let embed = DenseWeight {
                 weight: gpu.alloc(8 * 8192).unwrap(),
@@ -85,7 +85,7 @@ fn actual_factory_head_rejects_invalid_selected_capacity_before_kernel_lookup() 
     ) {
         return;
     }
-    for owners in [1, 5] {
+    for owners in [1, 9] {
         for mode in [GlmMtpBuildMode::Legacy, GlmMtpBuildMode::Paired] {
             let gpu = Gpu::new();
             let embed = DenseWeight {
