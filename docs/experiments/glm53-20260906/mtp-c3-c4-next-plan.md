@@ -77,6 +77,40 @@ Existing EP-v2 gives full-width snapshot sizing, but its reserve accounting
 still must be applied at the new capacity. No C4 MTP memory receipt exists yet.
 Retain context2044/prefill1024 and current no-swap/headroom guards initially.
 
+Concrete next integration boundaries (source audit, not enabled):
+
+- Recipe `max_sequences` already participates in identity: admit2..4 without
+  changing the two-rank transport/release arrays. Selected registration must
+  compare recipe capacity with the actual Model capacity getter while armed.
+- Factory must pass its validated capacity into the actual private-head
+  constructor; the compatibility constructor remains two-owner.
+- Selected worker retains exactly that many actual physical slots. Scheduler
+  validates the whole active slice, then visits both physical groups without
+  returning after the first successful pair. Cold/missing/stopped partners use
+  the existing singleton path. Active-vector order never defines identity.
+- Selected retirement visits actual physical slots in order, preserving
+  free/F1/health/Done ordering and terminal retention. Shutdown retains all
+  owners through the existing single rank-pair quiescence/release.
+- Preflight must keep selected C4 out of the ordinary nonspeculative C4 branch;
+  validate capacity before backend initialization, preserving all context,
+  sampling, rank, cache and no-swap restrictions.
+
+The private-head payload is currently not an explicit preflight line item.
+At context2044 with the current pool4/index128 configuration, the existing
+`GlmCachePlan` gives41,984 bytes per private block. Each owner has128 blocks
+plus49,152 hidden bytes:5,423,104 bytes per owner, or21,692,416 bytes at C4.
+This excludes allocator overhead and shared/loaded weights. Refactor one
+private storage plan for constructor and public reserve quote, then add it
+exactly once to selected `inference_reserve`. Existing post-load audit and
+factory fresh-free-memory clamps carry that reserve into target-KV budgeting;
+do not subtract the arena or private allowance twice, or consume the4GiB
+headroom. Verify against actual allocation accounting before native admission.
+The existing snapshot reserve functions remain authoritative for target state;
+for MTP4 snapshot mode their live/verify term is `(6C+1)H+(7C+1)V`, where H/V
+are aggregate TP-local H-state/conv bytes. Keep the separate prefix snapshot
+and arena terms. A failed post-load memory query currently permits an estimate;
+that estimate is not a measured headroom receipt.
+
 Use existing real owner/worker fixtures: group2/3 preserving0/1 bytes, alternating
 groups, singleton3, C3 occupancy, survivors1/2, retirement/reuse generations,
 wrong group/preamble before target writes, independent0/4 acceptance and global
