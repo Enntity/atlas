@@ -11,6 +11,8 @@ pub(crate) mod sealed {
 /// Only the actual TransformerModel implements this capability. No factory
 /// selects its paired constructor yet; other models return None.
 pub trait GlmPairedExecution: sealed::Sealed + Send + Sync {
+    fn validate_cold_prefill(&self, seq: &SequenceState, tokens: &[u32]) -> Result<()>;
+    fn cold_prefill(&self, seq: &mut SequenceState, tokens: &[u32]) -> Result<DevicePtr>;
     fn validate_bootstrap(&self, seq: &SequenceState, token: u32) -> Result<()>;
     fn bootstrap(&self, seq: &mut SequenceState, token: u32) -> Result<DevicePtr>;
     fn validate_verify(&self, seq: &SequenceState, tokens: &[u32]) -> Result<()>;

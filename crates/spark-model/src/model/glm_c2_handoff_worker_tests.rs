@@ -291,7 +291,7 @@ fn worker_f0_receive_failures_do_not_enter_target_or_publish_hidden() {
         comm.queue(prefill(1, &[4, 3, 2, 1]));
         comm.fail_at.store(fail_at, Ordering::Relaxed);
         f.gpu.clear();
-        let error = f.model.ep_worker_step(&mut slots).unwrap_err().to_string();
+        let error = format!("{:#}", f.model.ep_worker_step(&mut slots).unwrap_err());
         assert!(error.contains("injected worker receive failure"), "{error}");
         assert_eq!(comm.received.lock().len(), fail_at);
         assert_eq!(comm.collectives.load(Ordering::Relaxed), 0);

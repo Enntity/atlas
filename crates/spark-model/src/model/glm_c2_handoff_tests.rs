@@ -10,6 +10,8 @@ mod bootstrap_transport_fault_tests;
 mod bootstrap_transport_tests;
 #[path = "glm_c2_handoff_cleanup_tests.rs"]
 mod cleanup_tests;
+#[path = "glm_c2_cold_prefill_transport_tests.rs"]
+mod cold_prefill_transport_tests;
 #[path = "glm_c2_handoff_decode_fault_tests.rs"]
 mod decode_fault_tests;
 #[path = "glm_c2_eager_bootstrap_error_tests.rs"]

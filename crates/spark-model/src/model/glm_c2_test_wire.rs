@@ -7,7 +7,7 @@ use spark_comm::CommBackend;
 use spark_runtime::gpu::DevicePtr;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub(crate) struct Wire {
     rank: usize,
@@ -15,6 +15,8 @@ pub(crate) struct Wire {
     pending: Mutex<VecDeque<Vec<u32>>>,
     pub seen: Mutex<Vec<Vec<u32>>>,
     pub fail: AtomicUsize,
+    cold_prefix: AtomicBool,
+    roots: Mutex<Vec<usize>>,
 }
 impl Wire {
     pub fn install(f: &mut Fixture, rank: usize) -> Arc<Self> {
@@ -24,6 +26,8 @@ impl Wire {
             pending: Mutex::new(VecDeque::new()),
             seen: Mutex::new(Vec::new()),
             fail: AtomicUsize::new(0),
+            cold_prefix: AtomicBool::new(false),
+            roots: Mutex::new(Vec::new()),
         });
         f.model.comm = Some(wire.clone());
         f.model.ep_protocol_v2 = true;
@@ -32,6 +36,7 @@ impl Wire {
     pub fn clear(&self) {
         assert!(self.pending.lock().is_empty());
         self.seen.lock().clear();
+        self.roots.lock().clear();
         self.fail.store(0, Ordering::Relaxed);
     }
     pub fn queue(&self, packets: &[Vec<u32>]) {
@@ -41,12 +46,30 @@ impl Wire {
     pub fn packets(&self) -> Vec<Vec<u32>> {
         self.seen.lock().clone()
     }
+    pub fn enable_cold_prefix(&self) {
+        self.cold_prefix.store(true, Ordering::Relaxed);
+    }
+    pub fn roots(&self) -> Vec<usize> {
+        self.roots.lock().clone()
+    }
     pub fn done(&self) {
         assert!(self.pending.lock().is_empty());
     }
     fn transfer(&self, pointer: u64, bytes: usize, root: usize) -> Result<()> {
-        ensure!(root == 0 && bytes % 4 == 0, "unexpected command boundary");
-        let words = if self.rank == 0 {
+        let cold_root = root == 1 && bytes == 4 && self.cold_prefix.load(Ordering::Relaxed);
+        ensure!(
+            (root == 0 || cold_root) && bytes % 4 == 0,
+            "unexpected command boundary"
+        );
+        if cold_root && self.rank == 1 {
+            ensure!(
+                self.gpu.read_span(DevicePtr(pointer), 4) == [0; 4],
+                "worker cold prefix source must be zero"
+            );
+        }
+        let words = if cold_root && self.rank == 0 {
+            vec![0] // Explicit cold peer response, not general collective agreement.
+        } else if self.rank == 0 {
             self.gpu
                 .read_span(DevicePtr(pointer), bytes)
                 .chunks_exact(4)
@@ -57,12 +80,17 @@ impl Wire {
             ensure!(words.len() * 4 == bytes, "wrong received payload extent");
             words
         };
+        ensure!(
+            !cold_root || words == [0],
+            "cold prefix response must be zero"
+        );
+        self.roots.lock().push(root);
         self.seen.lock().push(words.clone());
         ensure!(
             self.seen.lock().len() != self.fail.load(Ordering::Relaxed),
             "injected command transfer failure"
         );
-        if self.rank == 1 {
+        if self.rank == 1 || cold_root {
             let data: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             self.gpu.write_span(DevicePtr(pointer), &data);
         }

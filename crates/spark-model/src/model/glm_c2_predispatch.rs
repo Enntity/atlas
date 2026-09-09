@@ -7,6 +7,12 @@ use spark_runtime::gpu::DevicePtr;
 
 impl sealed::Sealed for TransformerModel {}
 impl GlmPairedExecution for TransformerModel {
+    fn validate_cold_prefill(&self, seq: &SequenceState, tokens: &[u32]) -> Result<()> {
+        self.paired_validate_cold_prefill(seq, tokens)
+    }
+    fn cold_prefill(&self, seq: &mut SequenceState, tokens: &[u32]) -> Result<DevicePtr> {
+        self.paired_send_cold_prefill(seq, tokens)
+    }
     fn validate_bootstrap(&self, seq: &SequenceState, token: u32) -> Result<()> {
         self.paired_wire_profile(0)?;
         self.paired_validate_bootstrap(seq, token)

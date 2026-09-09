@@ -5,6 +5,9 @@ use crate::traits::Model;
 
 const SELECTED_E1_VERSION: u32 = 1;
 
+#[path = "glm_c2_cold_prefill_transport.rs"]
+mod cold_prefill;
+
 impl TransformerModel {
     pub(in crate::model) fn paired_send_bootstrap(
         &self,

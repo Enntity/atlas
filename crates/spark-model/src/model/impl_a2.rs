@@ -545,6 +545,10 @@ impl TransformerModel {
                 );
             }
             0xFFFFFFF0 => {
+                if self.paired_handoff().is_some() {
+                    self.paired_receive_cold_prefill(seq)?;
+                    return Ok(true);
+                }
                 // Prefill chunk: receive chunk_len, chunk_start, full prompt length,
                 // then ALL prompt tokens via bulk broadcast (single NCCL op).
                 let chunk_len = self.ep_broadcast_u32(0)? as usize;
