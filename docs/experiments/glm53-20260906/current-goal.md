@@ -100,8 +100,11 @@ using local scripted model transport, not NCCL. The native recipe/controller
 adapter remains unqualified.
 Recipe v2, the actual held-child healthy drain path and the native controller's
 Docker/state/subprocess adapters are now implemented; see
-`native-controller-adapter-results.md`. The SSH launch/renewal run loop is still
-unconnected and no native throughput gain is claimed for this slice.
+`native-controller-adapter-results.md`. The SSH launch/renewal run loop is now
+connected and has passed an actual two-container Docker/SSH CPU Model rehearsal,
+including active lease renewals and independently observed paired exit0; see
+`connected-controller-results.md`. ARM64/native MTP qualification remains next;
+no native throughput gain is claimed for this slice.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.

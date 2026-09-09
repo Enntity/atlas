@@ -60,7 +60,7 @@ fn nonblocking(fd: i32) -> io::Result<()> {
     }
     Ok(())
 }
-fn validate(spec: &Spec, limits: Limits) -> io::Result<()> {
+pub(super) fn validate(spec: &Spec, limits: Limits) -> io::Result<()> {
     if !spec.program.is_absolute()
         || limits.timeout_ms == 0
         || limits.timeout_ms > 86_400_000

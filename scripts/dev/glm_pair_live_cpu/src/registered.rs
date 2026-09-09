@@ -22,6 +22,8 @@ mod inherited_startup;
 #[rustfmt::skip]
 #[path = "../../../../crates/spark-server/src/glm_terminal_session/selected.rs"]
 mod selected;
+#[path = "registered_controller.rs"]
+mod registered_controller;
 
 use anyhow::{ensure, Result};
 use spark_model::model::glm_c2_test_support::{Event, Fixture};
@@ -109,7 +111,14 @@ pub(crate) fn consumer() -> Result<()> {
         "registration actual health only"
     );
     witness.mark(b"registered\n")?;
-    if mode.starts_with("registered-drain") && rank == 0 {
+    if mode == "registered-drain-controller" {
+        let operation = owner.begin();
+        operation.require(registered_controller::wait(&owner, rank));
+        if rank == 0 {
+            operation.require(witness.mark(b"drain-signal\n"));
+        }
+        operation.complete();
+    } else if mode.starts_with("registered-drain") && rank == 0 {
         let deadline = atlas_glm_pair_io::identity::boot_time_ms()? + 10_000;
         while !DRAIN_SIGNAL.load(Ordering::Acquire) {
             owner.check_health();

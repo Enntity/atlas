@@ -3,7 +3,7 @@
 use super::*;
 
 #[allow(clippy::large_enum_variant)] // Fixed <=832-byte storage avoids a watchdog heap allocation.
-pub(super) enum Incoming {
+pub(crate) enum Incoming {
     Legacy(frame::Frame),
     Live(wire::Frame),
 }
@@ -38,7 +38,12 @@ impl Reader {
     }
     pub(super) fn read(&mut self, fd: i32, now: u64) -> io::Result<Option<(Incoming, u64)>> {
         match Io::read(fd, &mut self.bytes[self.used..self.target])? {
-            Some(0) => return Err(error("LIVE control EOF")),
+            Some(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "LIVE control EOF",
+                ))
+            }
             None => return Ok(None),
             Some(n) => {
                 self.started.get_or_insert(now);

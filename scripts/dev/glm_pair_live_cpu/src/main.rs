@@ -20,6 +20,7 @@ mod inherited;
 #[rustfmt::skip]
 #[path = "../../../../crates/spark-server/src/glm_terminal_session/inherited_startup.rs"]
 mod inherited_startup;
+mod controller_fixture;
 #[cfg(feature = "model-test-support")]
 #[path = "registered.rs"]
 mod glm_terminal_session;
@@ -122,6 +123,7 @@ fn policy() -> wire::Policy {
 fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("--controller-recipes") if args.len() == 8 => controller_fixture::recipes(&args[2..]),
         Some("--guard") if args.len() == 4 => namespace::guard(args[2].parse()?, &args[3]),
         Some("--consumer") if args.len() == 3 => namespace::consumer(&unhex(&args[2])?),
         #[cfg(feature = "model-test-support")]

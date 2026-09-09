@@ -15,6 +15,7 @@ pub(crate) fn registered_mode(mode: &str) -> bool {
             | "registered-drain"
             | "registered-drain-foreign"
             | "registered-drain-replay"
+            | "registered-drain-controller"
             | "registered-wrong-rank"
             | "registered-missing-capability"
             | "registered-unhealthy"
@@ -116,21 +117,9 @@ fn fixture_recipe(
                 ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
             ];
             if registered_mode(mode) {
-                // Literal CPU fixture policy, never ambient Atlas/NCCL/loader forwarding.
-                environment.extend(
-                    [
-                        ("ATLAS_EP_PROTOCOL", "v2"),
-                        ("ATLAS_GLM_MTP_HIDDEN_TRACE", "0"),
-                        ("ATLAS_GLM_MTP_REPAIR", "0"),
-                        ("ATLAS_GLM_MTP_BATCHED_PREFILL", "1"),
-                        ("ATLAS_GLM_MTP_DISTRIBUTED", "1"),
-                        ("ATLAS_GLM_MTP_ALL_GATHER", "1"),
-                        ("ATLAS_GLM_MTP_DISTRIBUTED_ARGMAX", "0"),
-                        ("ATLAS_MTP_DRAFTER_CONTEXT_PREFILL_ONLY_UNSAFE", "1"),
-                    ]
-                    .map(|(key, value)| (key.to_owned(), value.to_owned())),
-                );
-                environment.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                // Same literal policy table as real-controller CPU recipes;
+                // ordinary namespace fixtures keep their unchanged values.
+                environment = crate::controller_fixture::environment(mode, "0");
             }
             environment
         },

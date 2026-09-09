@@ -115,3 +115,22 @@ fn every_queued_output_and_overflow_bound_is_checked() {
     assert!(Output::new(&[0; wire::MAX_ENCODED + 1], 0).is_err());
     assert!(end(u64::MAX, 1).is_err());
 }
+
+#[test]
+fn actual_stream_eof_is_typed_without_erasing_partial_frame_state() {
+    for partial in [false, true] {
+        let (mut sender, receiver) = pair();
+        let mut reader = Reader::new();
+        if partial {
+            sender.write_all(&[0, 0]).unwrap();
+            assert!(reader.read(receiver.as_raw_fd(), 1).unwrap().is_none());
+        }
+        drop(sender);
+        let failure = match reader.read(receiver.as_raw_fd(), 2) {
+            Err(e) => e,
+            Ok(_) => panic!("actual stream EOF must be an error"),
+        };
+        assert_eq!(failure.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(reader.idle(), !partial);
+    }
+}

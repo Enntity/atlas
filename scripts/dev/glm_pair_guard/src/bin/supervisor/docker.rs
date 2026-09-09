@@ -205,9 +205,14 @@ pub(super) fn inspect(
         .and_then(Value::as_object)
         .ok_or_else(|| error("missing Docker HostConfig"))?;
     for (key, want) in expected["HostConfig"].as_object().unwrap() {
-        let actual = host
-            .get(key)
-            .ok_or_else(|| error("missing Docker host resource field"))?;
+        // Moby declares Tmpfs with omitempty; an absent map means no tmpfs
+        // entries. Keep every other expected field mandatory.
+        if key == "Tmpfs" && !host.contains_key(key) && want == &json!({}) {
+            continue;
+        }
+        let actual = host.get(key).ok_or_else(|| {
+            io::Error::other(format!("missing Docker host resource field: {key}"))
+        })?;
         if normalize(key, actual)? != normalize(key, want)? {
             return Err(io::Error::other(format!(
                 "Docker HostConfig mismatch: {key}"
@@ -334,6 +339,11 @@ fn normalize(key: &str, value: &Value) -> io::Result<Value> {
     }
     if key == "PidsLimit" && v.is_null() {
         v = json!(0);
+    }
+    // Moby clears this pointer when disabling the OOM killer is unsupported
+    // (notably cgroup v2). Null grants no disable authority; true still refuses.
+    if key == "OomKillDisable" && v.is_null() {
+        v = json!(false);
     }
     if matches!(key, "CapAdd" | "CapDrop" | "SecurityOpt") {
         let a = v

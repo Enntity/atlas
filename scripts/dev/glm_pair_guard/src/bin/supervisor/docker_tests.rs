@@ -158,6 +158,37 @@ fn observed(r: &wire::Recipe) -> Value {
 }
 
 #[test]
+fn engine_omits_empty_tmpfs_but_cannot_hide_additional_mounts() {
+    let r = recipe();
+    let mut value = observed(&r);
+    value["HostConfig"].as_object_mut().unwrap().remove("Tmpfs");
+    assert_eq!(
+        inspect(&r, "/guard", "runc", &[4; 32], Stage::Created, &value).unwrap(),
+        0
+    );
+    value["HostConfig"]["Tmpfs"] = json!({"/extra":""});
+    assert!(inspect(&r, "/guard", "runc", &[4; 32], Stage::Created, &value).is_err());
+}
+
+#[test]
+fn engine_null_oom_disable_is_not_permission_to_disable_killer() {
+    let r = recipe();
+    let mut value = observed(&r);
+    value["HostConfig"]["OomKillDisable"] = Value::Null;
+    assert_eq!(
+        inspect(&r, "/guard", "runc", &[4; 32], Stage::Created, &value).unwrap(),
+        0
+    );
+    value["HostConfig"]["OomKillDisable"] = json!(true);
+    assert!(inspect(&r, "/guard", "runc", &[4; 32], Stage::Created, &value).is_err());
+    value["HostConfig"]
+        .as_object_mut()
+        .unwrap()
+        .remove("OomKillDisable");
+    assert!(inspect(&r, "/guard", "runc", &[4; 32], Stage::Created, &value).is_err());
+}
+
+#[test]
 fn exact_inspection_requires_original_full_identity_and_matching_phase() {
     let r = recipe();
     let mut v = observed(&r);
