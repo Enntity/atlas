@@ -159,6 +159,7 @@ impl Run {
         }
     }
     fn round(&mut self) {
+        let stats_before = self.sched.stats.glm_c2.snapshot();
         let before: Vec<_> = self
             .active
             .iter()
@@ -189,6 +190,20 @@ impl Run {
         assert_eq!(&packets[2][..4], &[1, 2, 10, 1]);
         assert_eq!(packets[3].len(), 4);
         assert_eq!(&packets[3][..2], &[1, 2]);
+        // Actual completed E6/verdict, canonical physical owner histogram,
+        // including reversed scheduler vectors. Not an attempted-header count.
+        let stats = self.sched.stats.glm_c2.snapshot();
+        let bin = packets[3][2] as usize * 5 + packets[3][3] as usize;
+        assert_eq!(stats.pair_commits, stats_before.pair_commits + 1);
+        for index in 0..25 {
+            assert_eq!(
+                stats.pair_accept[index],
+                stats_before.pair_accept[index] + u64::from(index == bin)
+            );
+        }
+        assert_eq!(stats.serial_commits, 0);
+        assert_eq!(stats.serial_accept, [0; 5]);
+        assert_eq!(stats.bootstrap_commits, 2);
         for owner in 0..2 {
             let index = self
                 .active

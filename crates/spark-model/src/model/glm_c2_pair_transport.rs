@@ -220,6 +220,16 @@ impl TransformerModel {
         self.sync_secondary()?;
         crate::speculative::glm_paired_execution::GlmPairedExecution::check_communication_health(
             self,
-        )
+        )?;
+        if self.stats.once("log:glm_e6_committed") {
+            tracing::info!(
+                rank = self.config.ep_rank,
+                mode = ?self.glm_pair_verify_mode,
+                owners = 2,
+                rows = 10,
+                "GLM E6 local paired verification committed"
+            );
+        }
+        Ok(())
     }
 }

@@ -164,6 +164,7 @@ fn bootstrap(
         (token as usize) < model.vocab_size(),
         "paired serial invalid selected seed"
     );
+    sched.stats.glm_c2.bootstrap_committed();
     if stopped(a, sched, false) {
         return Ok(());
     }
@@ -208,6 +209,7 @@ fn verdict(
     model.record_glm_mtp_verified(&mut a.seq, base, &tokens, accepted)?;
     model.trim_proposer_state(&mut a.seq, accepted, 0)?;
     model.commit_accepted_prefix(&mut a.seq, accepted + 1, 5)?;
+    sched.stats.glm_c2.serial_committed(accepted);
     a.pending_drafts.clear();
     // Every model acknowledgement above precedes even a cancelled/finished emit.
     for i in 0..=accepted {

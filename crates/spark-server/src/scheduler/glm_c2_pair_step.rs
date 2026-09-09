@@ -81,6 +81,7 @@ pub(super) fn try_step_pair(
             .count()
     });
     capability.finish_verify_pair([&mut a0.seq, &mut a1.seq], &tokens, accepted)?;
+    sched.stats.glm_c2.pair_committed(accepted);
     a0.pending_drafts.clear();
     a1.pending_drafts.clear();
     // Both selected vectors and both commits are complete. E1 for owner0 may

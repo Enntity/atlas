@@ -50,6 +50,7 @@ pub(crate) fn run_selected(
             }
             // `active` remains alive across this diverging call. No F1, drain,
             // Model teardown, or backend Drop follows matched shutdown/release.
+            sched.stats.glm_c2.summary("shutdown");
             owner.shutdown_head();
         }
         for _ in 0..2 {
@@ -97,6 +98,9 @@ pub(crate) fn run_selected(
                 sched.limits.max_seq_len,
             ));
             operation.complete();
+            if active.is_empty() {
+                sched.stats.glm_c2.summary("idle-wave");
+            }
         } else {
             // The explicit ticket policy bounds idle communicator observations;
             // no detached watchdog or GPU thread is introduced.
