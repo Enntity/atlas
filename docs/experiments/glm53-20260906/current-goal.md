@@ -163,6 +163,11 @@ remain unmet.
 Separately, native M15/M20 FFN arithmetic is bit-exact on the bounded harness,
 memcheck-clean and approximately2x faster than M10 chunks in fresh repetitions;
 see `owner-batch-ffn-native-results.md`. This is not a serving-rate improvement.
+Source `bc3637fd` now connects bounded M15/M20 FFN compute to shared actual
+KDA/MLA layer traversal, preserving independent state and old pair semantics.
+Focused host byte/dispatch and ownership controls pass; producer/model/E7 and
+scheduler activation remain unfinished, with no new native rate claimed.
+See `owner-batch-layer-integration.md` for the evidence and next integration.
 `mtp-c3-c4-next-plan.md` separates residency, admission and wider weight reuse.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
