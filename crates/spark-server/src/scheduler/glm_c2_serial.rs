@@ -18,16 +18,17 @@ pub(super) fn step_selected_serial(
     let capability = model
         .glm_paired_execution()
         .ok_or_else(|| anyhow::anyhow!("paired serial capability unavailable"))?;
+    let capacity = capability.owner_capacity()?;
     anyhow::ensure!(
-        (1..=2).contains(&active.len()),
-        "paired serial occupancy must be 1..2"
+        (1..=capacity).contains(&active.len()),
+        "paired serial occupancy exceeds actual owner capacity"
     );
-    let mut owners = [None; 2];
+    let mut owners = vec![None; capacity];
     for (index, a) in active.iter_mut().enumerate() {
         let slot = a.seq.slot_idx;
         anyhow::ensure!(
-            slot < 2 && owners[slot].is_none(),
-            "paired serial owner slots must be distinct 0/1"
+            slot < capacity && owners[slot].is_none(),
+            "paired serial owner slots must be distinct and within actual capacity"
         );
         owners[slot] = Some(index);
         if !a.finished {
@@ -59,22 +60,27 @@ pub(super) fn step_selected_serial(
             capability.validate_verify(&a.seq, &issued)?;
         }
     }
-    if capability.pair_verification_enabled()
-        && super::glm_c2_pair_step::try_step_pair(
-            model, capability, active, owners, sched, verify_ctx,
-        )?
-    {
-        return Ok(());
-    }
-    for index in owners.into_iter().flatten() {
-        let a = &mut active[index];
-        if stopped(a, sched, true) {
+    // Physical groups, not adjacent active-vector entries. Complete each
+    // producer before the next group; a missing/cold partner stays singleton.
+    for group in owners.chunks(2) {
+        let pair = [group[0], group.get(1).copied().flatten()];
+        if capability.pair_verification_enabled()
+            && super::glm_c2_pair_step::try_step_pair(
+                model, capability, active, pair, sched, verify_ctx,
+            )?
+        {
             continue;
         }
-        if a.pending_drafts.is_empty() {
-            bootstrap(model, capability, a, sched)?;
-        } else {
-            verdict(model, capability, a, sched, verify_ctx)?;
+        for index in pair.into_iter().flatten() {
+            let a = &mut active[index];
+            if stopped(a, sched, true) {
+                continue;
+            }
+            if a.pending_drafts.is_empty() {
+                bootstrap(model, capability, a, sched)?;
+            } else {
+                verdict(model, capability, a, sched, verify_ctx)?;
+            }
         }
     }
     Ok(())
@@ -235,3 +241,7 @@ mod tests;
 #[cfg(test)]
 #[path = "glm_c2_serial_round_tests.rs"]
 mod round_tests;
+
+#[cfg(test)]
+#[path = "glm_c4_selected_group_tests.rs"]
+mod group_tests;

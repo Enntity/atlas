@@ -141,9 +141,15 @@ full-wall tok/s (7.4–7.9% gain). C1 remains27.2–27.3. Quality, retained outp
 coding acceptance histograms, actual paired release and both-rank exit0 match;
 zero observed swap/OOMs. See `shared-m10-serving-results.md`. The conservative
 full-wall C2 target37 remains unmet despite decode-window rates38.0–38.2.
-The next source slice is capacity-aware MTP owner storage, still with selected
-serving capped at2; `mtp-c3-c4-next-plan.md` distinguishes correct additional
-residency from the later cross-request FFN batching needed for throughput.
+Capacity-aware MTP storage and physical-group Model/E6 mapping are now
+implemented, followed by inner scheduler execution of both physical pairs.
+Actual host-side Model/worker checks cover C4, C3 and drain to physical slot3.
+Outer selected serving is still capped at2 pending coordinated recipe,
+registration, worker, retirement and explicit private-memory reserve changes.
+Separately, native M15/M20 FFN arithmetic is bit-exact on the bounded harness,
+memcheck-clean and approximately2x faster than M10 chunks in fresh repetitions;
+see `owner-batch-ffn-native-results.md`. This is not a serving-rate improvement.
+`mtp-c3-c4-next-plan.md` separates residency, admission and wider weight reuse.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.

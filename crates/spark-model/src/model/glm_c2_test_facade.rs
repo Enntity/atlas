@@ -28,6 +28,15 @@ impl Fixture {
             .expect("actual fixture pair-compute configuration");
         Self(fixture)
     }
+    /// Explicit test-only owner residency; no serving admission is granted.
+    pub fn paired_compute_with_owner_capacity(rank: usize, owners: usize) -> Self {
+        let mut fixture = inner::Fixture::new_pair_compute_with_owner_capacity(rank, owners);
+        fixture
+            .model
+            .initialize_glm_pair_verification(crate::layer::glm_pair_verify::GlmPairFfn::TwoK5)
+            .expect("actual fixture bounded-owner pair configuration");
+        Self(fixture)
+    }
     pub fn legacy(rank: usize) -> Self {
         Self(inner::Fixture::new_legacy(rank))
     }
@@ -164,7 +173,14 @@ impl Observer {
             .into_iter()
             .flat_map(|(k, v)| [(k, 1024), (v, 1024)])
             .collect();
-        spans.push((self.gpu.slab(), inner::SLAB_BYTES));
+        let owners = crate::speculative::glm_repair::GlmPairedHandoff::owner_capacity(
+            self.head.as_ref(),
+            model.gpu.as_ref(),
+        )?;
+        spans.push((
+            self.gpu.slab_for_owners(owners),
+            owners * 6 * inner::ROW_BYTES,
+        ));
         let initial = spans
             .iter()
             .map(|(p, n)| self.gpu.read_live_span(*p, *n))

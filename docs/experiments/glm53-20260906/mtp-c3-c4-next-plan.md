@@ -31,6 +31,18 @@ Evidence: campaign `c4-model-group-{red,green,controls}.log`; these are host-sid
 ownership checks with recorded numerical kernels, not native C4 qualification.
 The last native-qualified serving source remains290cf248 with two owners.
 
+The inner selected scheduler now derives its owner map from that actual Model
+capacity and visits every physical pair, rather than returning after group0/1.
+Actual scheduler/Model/worker checks first failed at the old occupancy1..2
+restriction, then passed C4 in reversed vector order, both groups' checked
+selections/commits/E1, C3 with singleton2, and drain to physical survivor3
+including final completion without another E1. Existing selected two-owner
+scheduler controls pass. Evidence: `c4-scheduler-group-{red,green,controls}.log`.
+These fixtures use local prefill and explicit Model cleanup; they do not prove
+serving F0/F1, registration, retirement or native arithmetic. Outer serving
+admission, registered worker startup and retirement remain capacity2 pending
+the coordinated next integration below.
+
 ## Architectural reference
 
 Current upstream vLLM batches request-indexed target queries and independently
@@ -126,6 +138,12 @@ retain independent K5 attention/state, then combine15/20 rows for shared/routed
 FFN and reduction. Explicitly enlarge and validate row/worklist staging, saved
 tails and producer lifetime; do not silently widen fixed-M10 validators.
 Qualify exact arithmetic and bounded allocations before full-model activation.
+
+The standalone arithmetic comparison is now native-qualified at15/20 rows:
+exact checked outputs, zero memcheck errors/leaks and about2x faster than
+M10 chunks (plus a literal K5 tail for C3), repeated in fresh processes.
+See `owner-batch-ffn-native-results.md`. This supports the wider traversal but
+does not implement it or establish any additional serving tok/s gain.
 
 Batched draft generation is a separate subsequent optimization. The standalone
 first-draft BF16 batch2 projection is exact and faster, but that alone does not

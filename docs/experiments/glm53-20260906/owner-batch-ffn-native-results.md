@@ -55,6 +55,8 @@ bytes/allocations. Timing processes have120-second deadlines and2GiB no-swap
 container limits; memcheck uses180 seconds and4GiB. Two host CPUs, isolated
 network, no other model/build/GPU workload, and zero observed host swap.
 Completed runs exited0 with OOMKilled=false. No node reset or driver change.
+The same rebuilt harness also passes its original two-owner `joint-shared`
+numerical control with the original147,131,880-byte allocation count.
 
 Source archive SHA256:
 `bf4877b12e9f3b2cd1c4f95282dff53c12671c19c530be72e5a2efca92e413f1`.
