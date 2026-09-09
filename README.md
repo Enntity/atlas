@@ -36,6 +36,14 @@
 
 ## ⚡ What is Atlas?
 
+This fork also develops **GLM-5.3-Flash NVFP4 on two DGX Sparks**. Start with
+the [fork release-candidate handoff](docs/releases/glm53-dual-spark-20260910-rc.md)
+for exact tested image/source pins, bounded profiles, current failures and
+rollback. The [qualification bundles](scripts/dev/glm_release/README.md) keep
+short-context concurrent MTP separate from ordinary long-context serving.
+The upstream quick starts and performance claims below do not qualify this
+GLM fork or its experimental context limits.
+
 Atlas is a high-performance, pure Rust & CUDA LLM inference engine purpose-built for prosumer workstations (NVIDIA DGX Spark / GB10 SM121 and AMD Strix Halo). No Python, no PyTorch, no bloated dependency trees—just one compact binary with hand-tuned micro-kernels.
 
 - **Sub-90s First Token**: Boots in seconds with cached weights; zero JIT compile or Python startup lag.
