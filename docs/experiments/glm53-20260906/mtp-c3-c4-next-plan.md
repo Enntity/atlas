@@ -72,3 +72,27 @@ implement request-batched E1 proposal or establish a serving gain.
 
 Detailed audit retained in the campaign's `c3-c4-mtp-next-plan.md`, SHA256
 `e79fe34e0e983d02b4e1b476a5a0596e8a83970787879e5447ceb2db96e86246`.
+
+## Required follow-up: fresh large-context qualification
+
+User reminder, 2026-09-09: explicitly revisit large context after the bounded
+C3/C4 MTP integration. Historical 10K/32K retrieval runs on older images are
+not qualification of the current numerical paths or the new MTP serving path.
+
+Before raising the current 2044-token MTP cap, implement and validate semantic
+indexing beyond the 2048-token boundary for target verification and draft
+continuation, plus context-dependent cache, metadata and rollback reserves.
+Do not bypass existing context guards just to launch a benchmark.
+
+Once those prerequisites hold, test increasing contexts (4K, 8K, 16K, then
+32K where safe), starting at C1 and then C2/C3/C4 within an explicitly computed
+per-rank budget. Each larger step requires measured headroom at the smaller
+step, zero swap, bounded supervision and recoverable shutdown. Keep the user-
+permitted reduced total context if larger allocations are unsafe.
+
+For each qualified profile retain fresh-process, warmed uncached prefill rates,
+TTFT, decode rates and output counts; coherence/coding spot checks, real tool
+calls, and distinct per-request needles at early/middle/late positions with
+foreign-needle detection. Include semantic-index threshold crossings and
+unequal request lengths/drains. Report speculative and nonspeculative profiles
+separately. No 128K/256K capability claim without direct safe qualification.

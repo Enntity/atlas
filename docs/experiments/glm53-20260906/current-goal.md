@@ -50,6 +50,10 @@ and KV budget from measured per-rank memory headroom, state it alongside results
 and grow only after lower-cap qualification. The existing 2048-token C2 experiment
 is an interim short-context gate, not a claim of comparable long-context capacity.
 An exact new long-context cap is not selected or qualified yet.
+User reminder, 2026-09-09: fresh large-context qualification is required follow-up,
+not satisfied by historical retrieval passes. The staged safety, semantic-index
+prerequisites and quality/performance checks are recorded in the final section
+of `mtp-c3-c4-next-plan.md`; preserve this work after short-context C3/C4 integration.
 
 Retain TP=2, no competing resident models/builds/microbenchmarks, no swap use,
 strict memory guards and recoverable images. Never trade node stability or
