@@ -2,9 +2,11 @@
 
 // nvcc -O3 -arch=sm_121a scripts/dev/bench_glm_nvfp4_m4.cu -o /tmp/bench-glm-nvfp4-m4
 // Run only while the model is stopped, under an external bounded timeout.
-// Synthetic exact-M4 vs four scalar projections; no model, network or NCCL.
+// Synthetic exact-M4 (default) or M2 vs scalar projections; no model/network/NCCL.
 // Argument: timing iterations per round, 0..200 (default20, 0 correctness only).
+#ifndef ATLAS_NVFP4_HOST_ONLY
 #include <cuda_runtime.h>
+#endif
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -14,7 +16,9 @@
 #include <random>
 #include <vector>
 
+#ifndef ATLAS_NVFP4_HOST_ONLY
 #include "../../kernels/gb10/common/w4a16_gemv.cu"
+#endif
 
 #define CUDA_CHECK(call) do { const cudaError_t err = (call); if (err != cudaSuccess) { \
     std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
@@ -22,6 +26,35 @@
 static void require(bool value, const char* message) {
     if (!value) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(2); }
 }
+#ifndef ATLAS_NVFP4_TEST_ROWS
+#define ATLAS_NVFP4_TEST_ROWS 4
+#endif
+static_assert(ATLAS_NVFP4_TEST_ROWS == 2 || ATLAS_NVFP4_TEST_ROWS == 4,
+              "fixture supports M2 or M4 only");
+static constexpr unsigned rows = ATLAS_NVFP4_TEST_ROWS;
+static constexpr float row_scales[4] = {0.03125f, 0.25f, 1.0f, 4.0f};
+static unsigned permuted_row(unsigned row) {
+    const unsigned order[4] = {3, 1, 0, 2};
+    return rows == 2 ? 1 - row : order[row];
+}
+static bool valid_shape(unsigned n, unsigned k) {
+    return n > 0 && n % 4 == 0 && k > 0 && k % 16 == 0;
+}
+static void host_tests() {
+    bool seen[rows] = {};
+    for (unsigned row = 0; row < rows; ++row) {
+        const unsigned source = permuted_row(row);
+        require(source < rows && !seen[source], "row permutation bounds/uniqueness");
+        seen[source] = true;
+        require(std::isfinite(row_scales[row]) && row_scales[row] > 0, "row scale");
+    }
+    require(valid_shape(12, 48) && valid_shape(2048, 4096)
+            && valid_shape(4096, 2048), "supported shapes");
+    require(!valid_shape(0, 48) && !valid_shape(13, 48)
+            && !valid_shape(12, 0) && !valid_shape(12, 47), "unsupported shapes");
+    std::printf("PASS host M%u row permutation/scales/shape checks\n", rows);
+}
+#ifndef ATLAS_NVFP4_HOST_ONLY
 static constexpr size_t memory_limit = 128ULL * 1024 * 1024;
 static size_t device_live = 0, device_peak = 0;
 
@@ -71,11 +104,10 @@ static double scale_value(unsigned char value) {
 
 static void run_case(const char* name, unsigned n, unsigned k, bool zero_row,
                      unsigned iterations) {
-    constexpr unsigned rows = 4;
     // The existing batch template has CTA barriers after its output-tail
     // return. Production GLM outputs satisfy N%4==0; do not adversarially
     // launch N%4 tails in this safety-focused harness. K packing requires16.
-    require(n > 0 && n % 4 == 0 && k > 0 && k % 16 == 0,
+    require(valid_shape(n, k),
             "fixture requires positive N%4==0 and K%16==0");
     const size_t packed_count = size_t(n) * k / 2;
     const size_t scale_count = size_t(n) * k / 16;
@@ -86,7 +118,6 @@ static void run_case(const char* name, unsigned n, unsigned k, bool zero_row,
             "estimated combined host/device fixture storage must stay below128MiB");
     std::mt19937 random(6193 + n + k + unsigned(zero_row));
     std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
-    const float row_scales[rows] = {0.03125f, 0.25f, 1.0f, 4.0f};
     const unsigned char scale_codes[] = {0x00, 0x01, 0x08, 0x18, 0x28, 0x34, 0x38, 0x42};
     constexpr float tensor_scale = 0.375f;
     std::vector<__nv_bfloat16> input(size_t(rows) * k);
@@ -102,8 +133,13 @@ static void run_case(const char* name, unsigned n, unsigned k, bool zero_row,
     a.upload(input); w.upload(packed); s.upload(scales);
     const auto launch = [&](bool candidate) {
         if (candidate) {
+#if ATLAS_NVFP4_TEST_ROWS == 2
+            w4a16_gemv_batch2<<<n / 4, 256>>>(a.ptr, w.ptr, s.ptr, tensor_scale,
+                batch.ptr, n, k);
+#else
             w4a16_gemv_batch4<<<n / 4, 256>>>(a.ptr, w.ptr, s.ptr, tensor_scale,
                 batch.ptr, rows, n, k);
+#endif
         } else {
             for (unsigned row = 0; row < rows; ++row)
                 w4a16_gemv<<<n / 4, 256>>>(a.ptr + size_t(row) * k, w.ptr, s.ptr,
@@ -114,10 +150,9 @@ static void run_case(const char* name, unsigned n, unsigned k, bool zero_row,
     const double fp4[16] = {0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6};
     double maximum_oracle_error = 0;
     for (unsigned permutation = 0; permutation < 2; ++permutation) {
-        const unsigned order[rows] = {3, 1, 0, 2};
         std::vector<__nv_bfloat16> ordered(input.size());
         for (unsigned row = 0; row < rows; ++row) {
-            const unsigned source = permutation ? order[row] : row;
+            const unsigned source = permutation ? permuted_row(row) : row;
             std::copy_n(input.data() + size_t(source) * k, k, ordered.data() + size_t(row) * k);
         }
         a.upload(ordered);
@@ -134,7 +169,7 @@ static void run_case(const char* name, unsigned n, unsigned k, bool zero_row,
         }
         if (mismatches) std::fprintf(stderr, "%s permutation%u: %zu bit mismatches\n",
                                     name, permutation, mismatches);
-        require(mismatches == 0, "M4 differs from four scalar projections");
+        require(mismatches == 0, "batched projection differs from scalar rows");
         // All columns on tiny fixtures, otherwise five distinct output columns.
         std::vector<unsigned> columns = {0, 1, n / 3, n / 2, n - 1};
         if (n <= 16) { columns.clear(); for (unsigned col = 0; col < n; ++col) columns.push_back(col); }
@@ -158,8 +193,8 @@ static void run_case(const char* name, unsigned n, unsigned k, bool zero_row,
         a.check_guards(); w.check_guards(); s.check_guards();
         scalar.check_guards(); batch.check_guards();
     }
-    std::printf("PASS %s M4 N=%u K=%u zero_row=%u cpu_maxabs=%g fixture_device_bytes=%zu",
-                name, n, k, unsigned(zero_row), maximum_oracle_error, device_live);
+    std::printf("PASS %s M%u N=%u K=%u zero_row=%u cpu_maxabs=%g fixture_device_bytes=%zu",
+                name, rows, n, k, unsigned(zero_row), maximum_oracle_error, device_live);
     if (iterations) {
         for (unsigned i = 0; i < 2; ++i) { launch(false); launch(true); }
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -183,14 +218,24 @@ static void run_case(const char* name, unsigned n, unsigned k, bool zero_row,
         }
         std::sort(control_times.begin(), control_times.end());
         std::sort(batch_times.begin(), batch_times.end());
+#if ATLAS_NVFP4_TEST_ROWS == 2
+        std::printf(" two_scalar_us=%.3f batch2_us=%.3f speedup=%.3f",
+#else
         std::printf(" four_scalar_us=%.3f batch4_us=%.3f speedup=%.3f",
+#endif
                     control_times[2], batch_times[2], control_times[2] / batch_times[2]);
         CUDA_CHECK(cudaEventDestroy(start)); CUDA_CHECK(cudaEventDestroy(end));
     }
     std::printf("\n");
 }
+#endif
 
 int main(int argc, char** argv) {
+#ifdef ATLAS_NVFP4_HOST_ONLY
+    require(argc == 2 && !std::strcmp(argv[1], "--host-test"),
+            "CPU-only build supports --host-test only");
+    host_tests();
+#else
     unsigned iterations = 20;
     if (argc > 2) { std::fprintf(stderr, "usage: %s [iterations0..200]\n", argv[0]); return 1; }
     if (argc == 2) {
@@ -202,6 +247,7 @@ int main(int argc, char** argv) {
         }
         iterations = static_cast<unsigned>(value);
     }
+    host_tests();
     run_case("tiny_k_tail", 12, 48, false, 0);
     run_case("tiny_zero_row", 12, 48, true, 0);
     run_case("k_tail", 128, 2064, false, 0);
@@ -210,5 +256,6 @@ int main(int argc, char** argv) {
     run_case("shared_down", 4096, 2048, false, iterations);
     require(device_live == 0, "fixture allocations leaked");
     std::printf("PASS all shapes and row permutations; peak_device_bytes=%zu (<128MiB)\n", device_peak);
+#endif
     return 0;
 }

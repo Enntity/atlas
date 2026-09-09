@@ -24,7 +24,7 @@ static void require(bool ok, const char* message) {
 #ifndef ATLAS_MOE_TEST_ROWS
 #define ATLAS_MOE_TEST_ROWS 4
 #endif
-static_assert(ATLAS_MOE_TEST_ROWS == 4 || ATLAS_MOE_TEST_ROWS == 5, "fixture supports C4 or K5 only");
+static_assert(ATLAS_MOE_TEST_ROWS == 2 || ATLAS_MOE_TEST_ROWS == 4 || ATLAS_MOE_TEST_ROWS == 5, "fixture supports C2, C4 or K5 only");
 constexpr unsigned max_rows = ATLAS_MOE_TEST_ROWS;
 constexpr unsigned dn = 2048, dk = 4096, experts = 288, routes = 8 * max_rows, weights = 4;
 constexpr size_t packed_weight = size_t(dn) * dk / 2, scale_weight = size_t(dn) * dk / 16;
