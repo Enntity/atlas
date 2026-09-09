@@ -5,29 +5,58 @@
 //   scripts/dev/glm_pair_ffn_{route,grouped,activation,shared_t,post}.cu -o BENCH
 // Explicit comparison thresholds required; zero/zero is the initial strict probe.
 // Run: BENCH --atol 0 --rtol 0 --repeat 0
+// Reused-GU down ONLY: append --compare joint-down (zero/zero mandatory).
+// This compares Joint dense down against Joint reused-list down, not TwoK5.
 // Timing allowed only AFTER all six restored-input cases pass the explicit gate.
 #include "glm_pair_ffn_run.cuh"
+#include "glm_pair_ffn_down_map.cuh"
 #include <cerrno>
 #include <string>
 using namespace pair_ffn;
-struct Options { double atol,rtol; unsigned repeat; };
+struct Options { double atol,rtol; unsigned repeat; bool reused_down; };
 static double number(const char* s) {
     require(s&&*s&&*s!='-'&&*s!='+'&&*s!=' ',"unsigned finite decimal required");
     char* end=nullptr;errno=0;double n=std::strtod(s,&end);
     require(!errno&&end!=s&&!*end&&std::isfinite(n)&&n>=0,"finite number/end/overflow");return n;
 }
 static Options options(int argc,char** argv) {
-    require(argc==7,"usage: bench_glm_pair_ffn --atol VALUE --rtol VALUE --repeat 0..100");
-    Options out{};bool a=false,r=false,n=false;
+    require(argc==7||argc==9,"usage: bench_glm_pair_ffn --atol VALUE --rtol VALUE --repeat 0..100 [--compare joint-down]");
+    Options out{};bool a=false,r=false,n=false,c=false;
     for(int i=1;i<argc;i+=2) {
-        const std::string key=argv[i];const double value=number(argv[i+1]);
+        const std::string key=argv[i];
+        if(key=="--compare"&&!c) {
+            require(std::string(argv[i+1])=="joint-down","only explicit joint-down comparison is supported");
+            c=true;out.reused_down=true;continue;
+        }
+        const double value=number(argv[i+1]);
         if(key=="--atol"&&!a) {a=true;out.atol=value;}
         else if(key=="--rtol"&&!r) {r=true;out.rtol=value;}
         else if(key=="--repeat"&&!n) {
             require(value<=100&&std::floor(value)==value,"repeat bound/integer");n=true;out.repeat=unsigned(value);
         } else require(false,"unknown/duplicate option");
     }
-    require(a&&r&&n,"every bound must be explicit");return out;
+    require(a&&r&&n,"every bound must be explicit");
+    require(!out.reused_down||(out.atol==0&&out.rtol==0),"reused down requires strict zero/zero plus bit equality");
+    return out;
+}
+static void down_map_checks() {
+    unsigned index=0,m=0,n=0;
+    require(!reused_gu_index(0,0,gu_down_capacity,index),"zero list count");
+    require(!reused_gu_index(0,1,0,index),"zero capacity");
+    require(!reused_gu_index(0,-1,gu_down_capacity,index),"negative count");
+    require(!reused_gu_index(0,2,1,index),"count exceeds capacity");
+    require(!reused_gu_index(0,1,gu_down_capacity+1,index),"capacity exceeds fixed allocation");
+    std::array<bool,gu_down_capacity*2> visited{};
+    for(unsigned wid=0;wid<gu_down_capacity*2;++wid) {
+        require(reused_gu_index(wid,gu_down_capacity,gu_down_capacity,index),"full list capacity");
+        require(index==wid/2&&reused_gu_tile(index%16,wid&1,m,n),"16-to-32 N mapping");
+        const unsigned tile=(index/16)*32+n;
+        require(m==0&&n<32&&tile==wid&&!visited[tile],"unique exact down tile");visited[tile]=true;
+    }
+    require(!reused_gu_index(gu_down_capacity*2,gu_down_capacity,gu_down_capacity,index),"tail CTA refuses before list read");
+    require(!reused_gu_tile(16,0,m,n)&&!reused_gu_tile(64,0,m,n)
+        &&!reused_gu_tile(0,2,m,n),"reject non-M10/malformed tile");
+    std::puts("PASS host shared CTA mapping zero/full/capacity/16-to-32 bounds");
 }
 template<class T> static double value(T v) { return double(v); }
 template<> double value(Bf v) { return f32(v); }
@@ -74,21 +103,23 @@ static void independent_post(Fixture& f,const Result& result) {
         require(f32(result.rank[rank].logits[t*E+e])==f32(bf(acc)),"independent sparse-weight full router oracle");
     }
 }
-static float timed(Fixture& f,bool joint,bool vector,unsigned repeats) {
+static float timed(Fixture& f,bool joint,bool vector,unsigned repeats,bool reused_down=false) {
     cudaEvent_t begin,end;PCHECK(cudaEventCreate(&begin));PCHECK(cudaEventCreate(&end));
     // This is a serialized two-rank arithmetic surrogate on ONE device, no NCCL.
     PCHECK(cudaEventRecord(begin,f.stream));
-    for(unsigned i=0;i<repeats;++i)(void)run(f,joint,vector,false);
+    for(unsigned i=0;i<repeats;++i)(void)run(f,joint,vector,false,reused_down);
     PCHECK(cudaEventRecord(end,f.stream));PCHECK(cudaEventSynchronize(end));float ms=0;
     PCHECK(cudaEventElapsedTime(&ms,begin,end));PCHECK(cudaEventDestroy(begin));PCHECK(cudaEventDestroy(end));
     return ms/repeats;
 }
 int main(int argc,char** argv) {
     const Options o=options(argc,argv);
+    if(o.reused_down)down_map_checks();
     require(fits(1,4,0)&&!fits(std::numeric_limits<size_t>::max(),8,0)&&!fits(1,4,limit),"allocation accounting negatives");
     Fixture f;std::printf("device_live=%zu device_peak=%zu cap=%zu H=%u I=%u experts=%u topk=%u rows=%u\n",live,peak,limit,H,I,E,K,R);
-    std::printf("scope=router-to-mHC arithmetic; actual NCCL/attention/token-quality excluded; no timed D2H; down=dense-native-M64\n");
-    std::printf("control=twoM5 grouped denseGU scalar-or-vector prequantdown shared-generic-T FUSED_MOE_HC1; joint=M10 compact-fusedGU+two-genericT-K5-shared; norm_topk=1 route_scale=1\n");
+    std::printf("scope=router-to-mHC arithmetic; actual NCCL/attention/token-quality excluded; no timed D2H\n");
+    if(o.reused_down)std::puts("comparison=Joint-dense-down-vs-Joint-reused-GU-down; identical M10 route/GU/shared/post; down CTAs9216->2560; no extra builder/allocation; fixed M64 arithmetic");
+    else std::printf("control=twoM5 grouped denseGU scalar-or-vector prequantdown shared-generic-T FUSED_MOE_HC1; joint=M10 compact-fusedGU+two-genericT-K5-shared; norm_topk=1 route_scale=1\n");
     bool numerical=true;
     // Every case uses eight distinct full-size tensors, ten unique-per-token routes;
     // mixed boundary IDs and all-local/all-remote masks, normal/reversed owners.
@@ -96,13 +127,19 @@ int main(int argc,char** argv) {
         f.w.select(test);f.inputs(reverse!=0);
         for(bool vector:{false,true}) {
             std::printf("case=%u reverse=%u vector=%u\n",test,reverse,unsigned(vector));
-            auto old=run(f,false,vector,true),joint=run(f,true,vector,true);
+            auto old=run(f,o.reused_down,vector,true),joint=run(f,true,vector,true,o.reused_down);
             for(unsigned rank=0;rank<2;++rank)rank_equal(old.rank[rank],joint.rank[rank]);
             independent_post(f,old);independent_post(f,joint);
-            numerical=metrics(old.shared,joint.shared,"shared-genericT-control-vs-joint",o)&&numerical;
+            if(o.reused_down) {
+                equal(old.shared,joint.shared,"Joint dense/reused exact shared");
+                equal(old.highway,joint.highway,"Joint dense/reused exact final mHC");
+            }
+            numerical=metrics(old.shared,joint.shared,
+                o.reused_down?"shared-Joint-dense-vs-reused":"shared-genericT-control-vs-joint",o)&&numerical;
             numerical=metrics(old.highway,joint.highway,"complete-mHC",o)&&numerical;
             // A repeated restored-input run must not depend on dead scratch contents.
-            auto again=run(f,true,vector,true);
+            auto again=run(f,true,vector,true,o.reused_down);
+            if(o.reused_down)for(unsigned rank=0;rank<2;++rank)rank_equal(joint.rank[rank],again.rank[rank]);
             equal(joint.shared,again.shared,"restored-input shared repeat");equal(joint.highway,again.highway,"restored-input mHC repeat");
         }
     }
@@ -110,12 +147,14 @@ int main(int argc,char** argv) {
     if(o.repeat) {
         f.w.select(0);f.inputs(false);
         for(bool vector:{false,true}) {
-            for(unsigned i=0;i<3;++i){(void)run(f,false,vector,false);(void)run(f,true,vector,false);}
+            for(unsigned i=0;i<3;++i){(void)run(f,o.reused_down,vector,false);(void)run(f,true,vector,false,o.reused_down);}
             for(unsigned order=0;order<2;++order) {
                 float old=0,joint=0;
-                if(!order){old=timed(f,false,vector,o.repeat);joint=timed(f,true,vector,o.repeat);}
-                else {joint=timed(f,true,vector,o.repeat);old=timed(f,false,vector,o.repeat);}
-                std::printf("single_gpu_serialized_two_rank_arithmetic vector=%u order=%u repeats=%u twoM5_ms=%.6f M10_ms=%.6f ratio=%.6f collective_model_only=2x40960_vs_1x81920 timed_D2H=0\n",
+                if(!order){old=timed(f,o.reused_down,vector,o.repeat);joint=timed(f,true,vector,o.repeat,o.reused_down);}
+                else {joint=timed(f,true,vector,o.repeat,o.reused_down);old=timed(f,o.reused_down,vector,o.repeat);}
+                if(o.reused_down)std::printf("single_gpu_serialized_two_rank_arithmetic comparison=Joint-dense-vs-reused-down vector=%u order=%u repeats=%u dense_ms=%.6f reused_ms=%.6f ratio=%.6f timed_D2H=0\n",
+                    unsigned(vector),order,o.repeat,old,joint,old/joint);
+                else std::printf("single_gpu_serialized_two_rank_arithmetic vector=%u order=%u repeats=%u twoM5_ms=%.6f M10_ms=%.6f ratio=%.6f collective_model_only=2x40960_vs_1x81920 timed_D2H=0\n",
                     unsigned(vector),order,o.repeat,old,joint,old/joint);
             }
         }

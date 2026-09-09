@@ -96,7 +96,43 @@ inline void capture(Fixture& f,RankSnapshot& out,unsigned rows,unsigned base,uns
     append(out.dp,canonical(dp,inv,ids,I/2,rank));append(out.ds,canonical(ds,inv,ids,I/16,rank));
     append(out.routed,(rank?f.rank1:f.rank0).read(rows*H,base*H));
 }
-inline Result run(Fixture& f,bool joint,bool vector,bool diagnostic) {
+// Exercise the production candidate kernel with zero count, zero capacity and
+// exact full count/capacity. Reuses every existing allocation; diagnostic only.
+inline void down_boundaries(Fixture& f,Table d,bool vector) {
+    auto& b=f.b;
+    PCHECK(cudaStreamSynchronize(f.stream));
+    const auto expected=b.down.read();const int count=b.total.read()[0];
+    require(count>=0&&count<=int(X*(I/128)),"GU count within original allocation");
+    const auto list=b.list.read();
+    auto poison=[&]() { PCHECK(cudaMemsetAsync(b.down.ptr,0xff,b.down.count*sizeof(Bf),f.stream)); };
+    auto upload_count=[&](int value) {
+        b.total.upload(std::vector<int>{value});
+        PCHECK(cudaStreamSynchronize(nullptr)); // default-copy completion before nonblocking test stream.
+    };
+    auto untouched=[&]() {
+        PCHECK(cudaGetLastError());PCHECK(cudaStreamSynchronize(f.stream));
+        const auto out=b.down.read();
+        for(const auto x:out) {unsigned short bits;std::memcpy(&bits,&x,2);require(bits==0xffff,"bounded down must not write");}
+        b.down.guards();b.list.guards();b.total.guards();
+    };
+    poison();upload_count(0);
+    down_reused_gu(b.dp.ptr,b.ds.ptr,d,b.down.ptr,b.off.ptr,b.list.ptr,b.total.ptr,X*(I/128),vector,f.stream);
+    untouched();
+    upload_count(count);
+    down_reused_gu(b.dp.ptr,b.ds.ptr,d,b.down.ptr,b.off.ptr,b.list.ptr,b.total.ptr,0,vector,f.stream);
+    untouched();
+    if(count>0) {
+        down_reused_gu(b.dp.ptr,b.ds.ptr,d,b.down.ptr,b.off.ptr,b.list.ptr,b.total.ptr,unsigned(count),vector,f.stream);
+        PCHECK(cudaGetLastError());PCHECK(cudaStreamSynchronize(f.stream));
+        equal(expected,b.down.read(),"full count/capacity reused-list down incl remote poison");
+    }
+    equal(list,b.list.read(),"down preserves original GU worklist");
+    b.down.upload(expected); // restore exactly before unpermute; never timed.
+    PCHECK(cudaStreamSynchronize(nullptr));
+    f.guards();
+}
+inline Result run(Fixture& f,bool joint,bool vector,bool diagnostic,bool reused_down=false) {
+    require(!reused_down||joint,"reused GU down requires actual Joint worklist");
     Result result;auto& b=f.b;const unsigned width=joint?R:5;
     for(unsigned base=0;base<R;base+=width) {
         for(unsigned rank=0;rank<2;++rank) {
@@ -114,11 +150,18 @@ inline Result run(Fixture& f,bool joint,bool vector,bool diagnostic) {
             route(f.input.ptr+base*H,f.w.router.ptr,f.w.bias.ptr,b.logits.ptr,b.ids.ptr,b.coeff.ptr,width,f.stream);
             sort(b.ids.ptr,b.tok.ptr,b.exp.ptr,b.off.ptr,b.inv.ptr,width,f.stream);
             auto g=f.w.tables[rank][0]->view(),u=f.w.tables[rank][1]->view(),d=f.w.tables[rank][2]->view();
+            if(diagnostic&&reused_down) {
+                const auto gp=f.w.tables[rank][0]->p.read(),up=f.w.tables[rank][1]->p.read(),dp=f.w.tables[rank][2]->p.read();
+                for(unsigned e=0;e<E;++e)require((gp[e]==0)==(up[e]==0)&&(gp[e]==0)==(dp[e]==0),"GU/down actual EP ownership masks must match");
+            }
             if(joint)work(b.off.ptr,g,b.list.ptr,b.total.ptr,f.stream);
             quant(f.input.ptr+base*H,b.ap.ptr,b.as.ptr,width,H,f.stream);
             gate_up(b.ap.ptr,b.as.ptr,g,u,b.gate.ptr,b.up.ptr,b.off.ptr,b.tok.ptr,b.list.ptr,b.total.ptr,width,vector,f.stream);
             silu_quant(b.gate.ptr,b.up.ptr,b.dp.ptr,b.ds.ptr,width,f.stream);
-            down(b.dp.ptr,b.ds.ptr,d,b.down.ptr,b.off.ptr,vector,f.stream);
+            if(reused_down) {
+                down_reused_gu(b.dp.ptr,b.ds.ptr,d,b.down.ptr,b.off.ptr,b.list.ptr,b.total.ptr,X*(I/128),vector,f.stream);
+                if(diagnostic)down_boundaries(f,d,vector);
+            } else down(b.dp.ptr,b.ds.ptr,d,b.down.ptr,b.off.ptr,vector,f.stream);
             unpermute(b.down.ptr,(rank?f.rank1:f.rank0).ptr+base*H,b.inv.ptr,b.ids.ptr,b.coeff.ptr,width,rank,f.stream);
             PCHECK(cudaGetLastError());
             if(diagnostic)capture(f,result.rank[rank],width,base,rank);
