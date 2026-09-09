@@ -716,7 +716,11 @@ impl TransformerModel {
             }
             token => {
                 // Regular decode
-                self.decode(token, seq, stream)?;
+                if self.paired_handoff().is_some() {
+                    self.paired_receive_bootstrap(seq, token)?;
+                } else {
+                    self.decode(token, seq, stream)?;
+                }
             }
         }
 

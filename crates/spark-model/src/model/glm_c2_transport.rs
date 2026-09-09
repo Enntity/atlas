@@ -6,6 +6,38 @@ use crate::traits::Model;
 const SELECTED_E1_VERSION: u32 = 1;
 
 impl TransformerModel {
+    pub(in crate::model) fn paired_send_bootstrap(
+        &self,
+        seq: &mut SequenceState,
+        token: u32,
+    ) -> Result<spark_runtime::gpu::DevicePtr> {
+        self.paired_wire_profile(0)?;
+        self.paired_validate_bootstrap(seq, token)?;
+        let slot = u32::try_from(seq.slot_idx)?;
+        // Future T2 owns fatal containment before the first header attempt.
+        (|| {
+            self.ep_broadcast_seq_and_cmd(slot, token, true)?;
+            self.decode(token, seq, self.gpu.default_stream())
+        })()
+        .map_err(|error| self.paired_transport_error(error))
+    }
+
+    pub(in crate::model) fn paired_receive_bootstrap(
+        &self,
+        seq: &mut SequenceState,
+        token: u32,
+    ) -> Result<()> {
+        // The scalar word is already received. Earlier preamble/slot errors
+        // remain outside this helper and require T2's entire worker-step scope.
+        (|| {
+            self.paired_wire_profile(1)?;
+            self.paired_validate_bootstrap(seq, token)?;
+            self.decode(token, seq, self.gpu.default_stream())?;
+            Ok(())
+        })()
+        .map_err(|error| self.paired_transport_error(error))
+    }
+
     pub(in crate::model) fn paired_wire_profile(&self, rank: usize) -> Result<()> {
         let comm = self
             .comm

@@ -3,9 +3,17 @@
 use super::*;
 use crate::speculative::glm_paired_execution::{GlmPairedExecution, sealed};
 use crate::traits::Model;
+use spark_runtime::gpu::DevicePtr;
 
 impl sealed::Sealed for TransformerModel {}
 impl GlmPairedExecution for TransformerModel {
+    fn validate_bootstrap(&self, seq: &SequenceState, token: u32) -> Result<()> {
+        self.paired_wire_profile(0)?;
+        self.paired_validate_bootstrap(seq, token)
+    }
+    fn bootstrap(&self, seq: &mut SequenceState, token: u32) -> Result<DevicePtr> {
+        self.paired_send_bootstrap(seq, token)
+    }
     fn validate_verify(&self, seq: &SequenceState, tokens: &[u32]) -> Result<()> {
         self.paired_validate_verify(seq, tokens)
     }
@@ -41,6 +49,19 @@ impl TransformerModel {
         seq: &SequenceState,
         cache: &spark_runtime::kv_cache::PagedKvCache,
     ) -> Result<(usize, usize)> {
+        self.paired_target_row_budget(seq, cache, 5)
+    }
+
+    fn paired_target_row_budget(
+        &self,
+        seq: &SequenceState,
+        cache: &spark_runtime::kv_cache::PagedKvCache,
+        rows: usize,
+    ) -> Result<(usize, usize)> {
+        ensure!(
+            rows == 1 || rows == 5,
+            "paired target budget requires scalar or K5"
+        );
         ensure!(
             !self.prefix_cache.is_active() && cache.config().cache_blocks_per_seq.is_none(),
             "paired target budget requires inactive prefix cache and no HSS"
@@ -48,20 +69,24 @@ impl TransformerModel {
         self.paired_target_map(seq, cache, seq.seq_len)?;
         let end = seq
             .seq_len
-            .checked_add(5)
-            .context("paired target K5 end overflow")?;
+            .checked_add(rows)
+            .context("paired target end overflow")?;
         let needed = end.div_ceil(cache.block_size());
         let additional = needed.saturating_sub(seq.block_table.len());
         ensure!(
             end <= 2048
                 && needed <= self.max_blocks_per_seq as usize
                 && additional <= cache.num_free_blocks(),
-            "paired next K5 exceeds actual target table or free-block budget"
+            "paired next target exceeds actual table or free-block budget"
         );
         Ok((end, needed))
     }
 
-    fn paired_target_preflight(&self, seq: &SequenceState) -> Result<()> {
+    pub(in crate::model) fn paired_target_preflight(
+        &self,
+        seq: &SequenceState,
+        rows: usize,
+    ) -> Result<()> {
         self.paired_profile(seq)?;
         self.paired_ssm_bindings(seq)?;
         let sizes = self.buffers.sizes();
@@ -86,7 +111,7 @@ impl TransformerModel {
                 cache.config().cache_blocks_per_seq.is_none(),
                 "paired K5 does not support HSS target cache"
             );
-            self.paired_target_budget(seq, &cache)?;
+            self.paired_target_row_budget(seq, &cache, rows)?;
         }
         let scratch = self.buffers.scratch().0;
         let scratch_end = scratch
@@ -117,7 +142,7 @@ impl TransformerModel {
         let capability = self
             .paired_handoff()
             .context("paired verification capability missing")?;
-        self.paired_target_preflight(seq)?;
+        self.paired_target_preflight(seq, 5)?;
         ensure!(
             tokens.len() == 5
                 && tokens
@@ -144,7 +169,7 @@ impl TransformerModel {
         let capability = self
             .paired_handoff()
             .context("paired proposal capability missing")?;
-        self.paired_target_preflight(seq)?;
+        self.paired_target_preflight(seq, 5)?;
         ensure!(
             !grammar && drafts == 4 && position == seq.seq_len,
             "paired proposal requires fixed four drafts at actual request position"

@@ -4,6 +4,10 @@
 mod aligned_churn_tests;
 #[path = "glm_c2_allocation_ownership_tests.rs"]
 mod allocation_ownership_tests;
+#[path = "glm_c2_bootstrap_transport_fault_tests.rs"]
+mod bootstrap_transport_fault_tests;
+#[path = "glm_c2_bootstrap_transport_tests.rs"]
+mod bootstrap_transport_tests;
 #[path = "glm_c2_handoff_cleanup_tests.rs"]
 mod cleanup_tests;
 #[path = "glm_c2_handoff_decode_fault_tests.rs"]

@@ -4,6 +4,27 @@ use super::*;
 use spark_runtime::gpu::DevicePtr;
 
 impl TransformerModel {
+    pub(in crate::model) fn paired_validate_bootstrap(
+        &self,
+        seq: &SequenceState,
+        token: u32,
+    ) -> Result<()> {
+        let capability = self
+            .paired_handoff()
+            .context("paired bootstrap capability missing")?;
+        self.paired_target_preflight(seq, 1)?;
+        let state = seq
+            .proposer_state
+            .as_ref()
+            .context("paired decode state missing")?;
+        capability.validate_decode(
+            &self.paired_input(seq)?,
+            token,
+            state.as_ref(),
+            &self.glm_repair_context(),
+        )
+    }
+
     pub(in crate::model) fn paired_before_decode(
         &self,
         seq: &mut SequenceState,
@@ -12,6 +33,7 @@ impl TransformerModel {
         let Some(capability) = self.paired_handoff() else {
             return Ok(false);
         };
+        self.paired_validate_bootstrap(seq, token)?;
         let mut state = seq
             .proposer_state
             .take()

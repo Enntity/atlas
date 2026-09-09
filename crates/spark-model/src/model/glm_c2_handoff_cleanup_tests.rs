@@ -19,12 +19,17 @@ fn private(seq: &SequenceState) -> &Glm5MtpProposerState {
         .unwrap()
 }
 
-fn primed_with_cleanup_pool() -> Fixture {
+fn primed_with_cleanup_pool(bootstrap_peer: bool) -> Fixture {
     let mut f = Fixture::new(1);
     for owner in 0..2 {
         f.model
             .prefill(&[1 + owner as u32, 2, 3, 4], &mut f.seqs[owner], CALLER)
             .unwrap();
+    }
+    // The cleanup-only pool below deliberately does not match target geometry.
+    // Complete the healthy producer first; post-install decode is not valid.
+    if bootstrap_peer {
+        f.model.decode(6, &mut f.seqs[1], CALLER).unwrap();
     }
     // Install a real minimal pool after producer work: no production geometry
     // check is relaxed, and no SSM numerical computation is represented here.
@@ -69,7 +74,7 @@ fn primed_with_cleanup_pool() -> Fixture {
 }
 
 fn cleanup_failure_ordinal(zero: bool) -> usize {
-    let mut f = primed_with_cleanup_pool();
+    let mut f = primed_with_cleanup_pool(false);
     let h = f.model.ssm_pool.h_state(0, 0);
     f.model.free_sequence(&mut f.seqs[0]).unwrap();
     f.gpu
@@ -94,12 +99,11 @@ fn free_count(events: &[Event], ptr: DevicePtr) -> usize {
 }
 
 fn healthy_cleanup_control() {
-    let mut f = primed_with_cleanup_pool();
+    let mut f = primed_with_cleanup_pool(true);
     let slab = f.gpu.slab();
     let peer_blocks: BTreeSet<_> = private(&f.seqs[1]).block_table.iter().copied().collect();
     let other_blocks: BTreeSet<_> = private(&f.seqs[0]).block_table.iter().copied().collect();
-    // A successful independent control can publish, retire and reuse its reserve.
-    f.model.decode(6, &mut f.seqs[1], CALLER).unwrap();
+    // The independent control already published, and can retire/reuse its reserve.
     f.model.free_sequence(&mut f.seqs[1]).unwrap();
     f.model.free_sequence(&mut f.seqs[1]).unwrap();
     let target = f.model.ssm_pool.claim_guarded().unwrap();
@@ -162,7 +166,7 @@ fn healthy_cleanup_control() {
 fn cleanup_failure_quarantines(zero: bool) {
     healthy_cleanup_control();
     let ordinal = cleanup_failure_ordinal(zero);
-    let mut f = primed_with_cleanup_pool();
+    let mut f = primed_with_cleanup_pool(false);
     let slab = f.gpu.slab();
     let peer_bytes = f.gpu.read_span(slab.offset(6 * ROW_BYTES), 6 * ROW_BYTES);
     let peer_blocks: BTreeSet<_> = private(&f.seqs[1]).block_table.iter().copied().collect();
@@ -225,7 +229,9 @@ fn cleanup_failure_quarantines(zero: bool) {
         !f.model.ssm_pool.slot_is_free(1),
         "peer SlotGuard is still exclusive"
     );
-    // An actual Model cleanup error makes the entire selected session terminal.
+    // This cleanup-only pool can also cause geometry refusal at decode; this
+    // assertion alone does not isolate the terminal latch. Valid-pool transport
+    // tests prove that cause independently, without incompatible target geometry.
     f.gpu.clear();
     assert!(f.model.decode(6, &mut f.seqs[1], CALLER).is_err());
     assert!(f.model.free_sequence(&mut f.seqs[1]).is_err());

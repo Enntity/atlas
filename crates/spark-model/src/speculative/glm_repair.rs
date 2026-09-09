@@ -126,6 +126,13 @@ pub trait GlmPairedHandoff: Send + Sync {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Vec<u32>>;
+    fn validate_decode(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        token: u32,
+        state: &dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()>;
     fn begin_decode(
         &self,
         input: &crate::model::GlmPairedInput<'_>,

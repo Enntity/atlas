@@ -2,6 +2,7 @@
 //! Optional actual GLM model execution; validation is not a reservation.
 use crate::traits::SequenceState;
 use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
 
 pub(crate) mod sealed {
     pub trait Sealed {}
@@ -10,6 +11,8 @@ pub(crate) mod sealed {
 /// Only the actual TransformerModel implements this capability. No factory
 /// selects its paired constructor yet; other models return None.
 pub trait GlmPairedExecution: sealed::Sealed + Send + Sync {
+    fn validate_bootstrap(&self, seq: &SequenceState, token: u32) -> Result<()>;
+    fn bootstrap(&self, seq: &mut SequenceState, token: u32) -> Result<DevicePtr>;
     fn validate_verify(&self, seq: &SequenceState, tokens: &[u32]) -> Result<()>;
     fn validate_propose(
         &self,

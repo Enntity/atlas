@@ -168,6 +168,15 @@ impl GlmPairedHandoff for Glm5MtpHead {
     ) -> Result<Vec<u32>> {
         self.paired_propose_owned(input, token, state, ctx, stream)
     }
+    fn validate_decode(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        token: u32,
+        state: &dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_validate_target(input, token, state, ctx)
+    }
     fn begin_decode(
         &self,
         input: &crate::model::GlmPairedInput<'_>,

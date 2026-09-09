@@ -3,6 +3,31 @@
 use super::*;
 
 impl Pool {
+    fn bootstrap_target_plan(
+        &self,
+        state: &Glm5MtpProposerState,
+        input: &crate::model::GlmPairedInput<'_>,
+        token: u32,
+        ctx: &ForwardContext,
+    ) -> Result<usize> {
+        self.scratch_idle()?;
+        let index = self.matches_request(state, input, ctx)?;
+        self.tail_span(state, ctx.gpu)?;
+        let data = input.data();
+        let primer = data
+            .prompt
+            .checked_sub(1)
+            .context("paired bootstrap prompt is empty")?;
+        ensure!(
+            data.position == data.prompt
+                && state.seq_len == primer
+                && (token as usize) < ctx.config.vocab_size
+                && self.slots[index].bonus.is_none()
+                && self.slots[index].pending_target.is_none(),
+            "paired target requires exactly one bootstrap decode after eager P-1"
+        );
+        Ok(index)
+    }
     pub(super) fn matches_request(
         &self,
         state: &Glm5MtpProposerState,
@@ -37,6 +62,25 @@ impl Pool {
 }
 
 impl Glm5MtpHead {
+    pub(super) fn paired_validate_target(
+        &self,
+        input: &crate::model::GlmPairedInput<'_>,
+        token: u32,
+        state: &dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        let state = state
+            .as_any()
+            .downcast_ref::<Glm5MtpProposerState>()
+            .context("paired target requires actual GLM state")?;
+        self.validate_paired_live(state, ctx.gpu)?;
+        self.paired
+            .as_ref()
+            .context("paired pool absent")?
+            .lock()
+            .bootstrap_target_plan(state, input, token, ctx)?;
+        Ok(())
+    }
     pub(super) fn paired_begin_target(
         &self,
         input: &crate::model::GlmPairedInput<'_>,
@@ -50,18 +94,7 @@ impl Glm5MtpHead {
             .context("paired target requires actual GLM state")?;
         self.validate_paired_live(state, ctx.gpu)?;
         let mut pool = self.paired.as_ref().context("paired pool absent")?.lock();
-        pool.scratch_idle()?;
-        let index = pool.matches_request(state, input, ctx)?;
-        pool.tail_span(state, ctx.gpu)?;
-        let data = input.data();
-        ensure!(
-            data.position == data.prompt
-                && state.seq_len == data.prompt - 1
-                && (token as usize) < ctx.config.vocab_size
-                && pool.slots[index].bonus.is_none()
-                && pool.slots[index].pending_target.is_none(),
-            "paired target requires exactly one bootstrap decode after eager P-1"
-        );
+        let index = pool.bootstrap_target_plan(state, input, token, ctx)?;
         pool.slots[index].pending_target = Some(token);
         pool.slots[index].writing = true;
         Ok(())
