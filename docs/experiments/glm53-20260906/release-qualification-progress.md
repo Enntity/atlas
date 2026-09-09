@@ -115,3 +115,36 @@ The revised long-context probe must use the real chat API, not assume
 differ. Real one-token sizing probes, explicit thinking budget16 and cap128
 replace that unqualified assumption. Strict visible-answer/normal-stop checks
 remain. Full-context quality and maximum safe context are still pending.
+
+## New-image 4K scalar control failure
+
+Engine `22b56144`, OFF profile and portable real-chat driver `63eb6075...`:
+C1 and C2 pass all six quality waves; C3 passes all three needle positions
+and linked facts. C3 auto-tool fails: NEBULA repeats archive filler and is
+stopped by the content-loop watchdog after49 tokens, with no tool call. The
+other two calls are correct. C4 and boundary/cancellation checks were not
+issued after this failure. Both containers exited0, OOM=false, swap0; the
+campaign remains **failed**, not qualified by its clean shutdown.
+
+Exact failed request body matches the earlier successful C2 request. The
+successful prefill used chunk ends1028/2052/3076/3485 and first token785;
+the failed one used1024/2048/3072/3485 and first token198, before its first
+C3 decode batch. Source inspection shows idle initial requests borrow the
+1028-row arena despite the declared1024-token sparse-prefill budget; busy
+requests use1024. Ending2048 chooses dense attention for that whole chunk,
+whereas ending2052 chooses sparse. This changes reduction arithmetic even
+where all causal keys are retained. It is not evidence of a missing-key or
+owner-slot alias, and no such concrete alias was found in the source audit.
+A narrow issued-budget correction is being prepared separately; it restores
+the declared bound, not an asserted quality fix.
+
+The audit also found pre-existing head/worker normalization-call asymmetry
+at the initial chunk and implicit head normalization-to-next-chunk ordering.
+Whether the norm200 clamp activates in this failure is not measured; do not
+present these observations as its proven cause. Exact replay is prepared.
+
+Evidence: `longctx-22b56144-4096-off-chat-run`, its raw quality receipts
+`http-0085.json` (successful NEBULA C2) and `http-0167.json` (failed C3), and
+`longctx-22b56144-4096-off-chat-summary.json`. The new ordinary cache pools
+were12606/13112 blocks, minimum sampled MemAvailable10,350,688/10,531,008 KiB.
+These4K allocation facts do not by themselves qualify a larger context.
