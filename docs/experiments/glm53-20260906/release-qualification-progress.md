@@ -66,6 +66,52 @@ requires actual shared-prefix tied logits, not timing alone. Distributed shard
 argmax is OFF in both compared recipes, so its host merge is not the active
 cause here. Do not present old C1–C4 rates as current merged-image results.
 
-Final C1–C8 timing, repeated portable launch, chat-templated full-context quality,
-and any prefill candidate are still pending. No reference-performance goal or
-maximum-context qualification is claimed by this progress record.
+## First merged C8 qualification, 22:22 UTC
+
+Immutable engine `a6cfeec0`, explicit unused prefix slots/checkpoint0, selected
+capacity8, context2044, MTP4: all32 checks passed (8 distinct answers,8 auto
+tool calls,8 actual-call-ID result followups,8 own/no-foreign needle checks).
+One warmup and three measured148-input/256-output batches at each width:
+
+| C | Aggregate full-wall tok/s | Aggregate decode-window tok/s | Client TTFT ms |
+|---|---:|---:|---:|
+| 1 |22.588|23.538|457.388|
+| 2 |30.675|31.539|668.480|
+| 3 |35.093|35.839|884.276|
+| 4 |37.891|38.541|1091.515|
+| 5 |39.719|40.292|1320.664|
+| 6 |41.071|41.583|1525.539|
+| 7 |42.253|42.711|1733.500|
+| 8 |43.087|43.506|1946.026|
+
+All144 coding completions reached256 tokens and were byte-identical within
+this merged run: SHA256 `9fea649abf50e69cd3a3860967b93849b0a08a3b42a29acc9b0e65df792350cd`.
+They differ from the40 pre-merge completions, SHA256
+`d08c6d60eafcb87b86176d8cfd7402e294097f168a9e6cf0356a9b184f24d4c1`,
+starting after the first four spaces (`__slots__` versus a docstring). Coding
+output is retained, not executed or claimed functionally complete. This is
+a performance regression versus the earlier C4-capacity image, not an
+equal-output A/B or a reference-performance PASS.
+
+Both ranks completed real paired quiescence/release and independently observed
+exit0. Minimum sampled MemAvailable was10,178,056/9,610,940 KiB; swap0 on both.
+Evidence: `native-prepared-a6cfeec0-c8-owner-owners-joint-followup128` and
+`native-summary-a6cfeec0-c8-owner-joint-followup128.json`. Fresh-process repeat
+remains pending.
+
+## Bounded prefill candidate
+
+Source `22b56144` adds explicit `ATLAS_GLM_PAGED_PREFILL_BF16_GEMM=0|1`,
+absentOFF, GLM-only. Q_A/Q_B/KV_A/O in later paged prefill can use the existing
+BF16 cuBLAS helper (existing TC/scalar fallback); literal scalar control,
+precision, attention selection and cache lifecycle remain unchanged. Actual
+constructor/dispatch test failed before the selected branch, then passes on
+both ranks including non-GLM control; parser check passes. These are host
+dispatch checks, not numerical equivalence. Native same-image OFF/ON quality
+and timing are required before enabling the candidate in a tested profile.
+
+The revised long-context probe must use the real chat API, not assume
+`/tokenize(messages)` uses the same template: base and OpenAI Jinja environments
+differ. Real one-token sizing probes, explicit thinking budget16 and cap128
+replace that unqualified assumption. Strict visible-answer/normal-stop checks
+remain. Full-context quality and maximum safe context are still pending.
