@@ -64,7 +64,11 @@ improves about19.0→25.5tok/s; identical-output pairs can be faster, so the rep
 `v27-c2-compact-results.md` for full-wall rates, TTFT, quality and limitations.
 
 Next native-facing work extends actual independent-row KDA/MLA/grouped-MoE
-support through every draining width1..8, including missing MLA exports6/7/8.
+support through every draining width1..8. MLA exports6/7/8 are now committed and
+standalone GPU-qualified (exact scalar equality, zero memcheck errors and repeated
+projection speedups); see `mla-c6-c8-kernel-results.md`. Host integration remains
+in progress. Pre-load reserve accounting must also use actual TP-local shapes
+and allocation envelopes before admitting the larger batch.
 Preserve rollback/watchdog behavior and qualify bounded memory before C6/C8
 admission. Concurrent MTP also remains required: checked cold F0 transport is
 committed, but scheduler admission and actual supervised head/worker integration
