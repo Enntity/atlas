@@ -51,7 +51,8 @@ class ValidatorTests(unittest.TestCase):
     def test_concurrency_is_explicit_and_keeps_existing_default(self):
         self.assertEqual(parse_args([]).concurrency, 4)
         self.assertEqual(parse_args(["--concurrency", "1"]).concurrency, 1)
-        for invalid in ["0", "2", "3", "8"]:
+        self.assertEqual(parse_args(["--concurrency", "2"]).concurrency, 2)
+        for invalid in ["0", "3", "8"]:
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parse_args(["--concurrency", invalid])
 
@@ -171,8 +172,8 @@ def parse_args(argv=None):
     parser.add_argument("--model", default="/var/tmp/models/glm53-flash-nvfp4")
     parser.add_argument("--context-limit", type=int, choices=[2044, 2048, 16384], default=2048,
                         help="must match the restarted server's bounded context cap")
-    parser.add_argument("--concurrency", type=int, choices=[1, 4], default=4,
-                        help="run the same four checks sequentially at C1 or together at C4")
+    parser.add_argument("--concurrency", type=int, choices=[1, 2, 4], default=4,
+                        help="run four checks sequentially, in pairs, or together")
     parser.add_argument("--self-test", action="store_true", help="CPU only; no HTTP requests")
     return parser.parse_args(argv)
 
