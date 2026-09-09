@@ -11,6 +11,10 @@ pub(crate) mod sealed {
 /// Only the actual TransformerModel implements this capability. No factory
 /// selects its paired constructor yet; other models return None.
 pub trait GlmPairedExecution: sealed::Sealed + Send + Sync {
+    /// Local health only; no synchronization, host drain or pair-release authority.
+    fn check_communication_health(&self) -> Result<()>;
+    /// Strict local joins; caller retains owners and owns the supervised pair release.
+    fn quiesce(&self) -> Result<()>;
     fn validate_cold_prefill(&self, seq: &SequenceState, tokens: &[u32]) -> Result<()>;
     fn cold_prefill(&self, seq: &mut SequenceState, tokens: &[u32]) -> Result<DevicePtr>;
     fn validate_bootstrap(&self, seq: &SequenceState, token: u32) -> Result<()>;

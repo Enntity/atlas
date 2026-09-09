@@ -59,6 +59,19 @@ impl GlmPairedHandoff for Glm5MtpHead {
     ) -> Result<(u64, u64)> {
         self.paired_validate_propose(input, seed, state, ctx, stream)
     }
+    fn validate_session(&self, gpu: &dyn GpuBackend) -> Result<()> {
+        let pool = self
+            .paired
+            .as_ref()
+            .context("paired session pool missing")?
+            .lock();
+        pool.backend(gpu)?;
+        ensure!(
+            !pool.producer_failed && !pool.slots.iter().any(|slot| slot.failed),
+            "paired session is terminal"
+        );
+        Ok(())
+    }
     fn validate_allocation(&self, gpu: &dyn GpuBackend) -> Result<usize> {
         let pool = self
             .paired

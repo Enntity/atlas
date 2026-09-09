@@ -59,6 +59,18 @@ already exist. Reuse them; do not implement another parallel transaction model.
 
 ## Ownership and promotion
 
+First Model slice is implemented and independently reviewed: sealed health and
+quiescence methods, with real open/unfailed pool validation and the existing
+irreversible failure latch. The actual capability-entry scaffold failed two
+runtime checks before implementation; final focused4/4 and legacy3/3 pass,
+including health becoming false after a successful join. Non-test and existing
+test-support-feature checks pass. Scoped formatting/SPDX/caps pass; clippy is
+blocked by four unchanged runtime stub argument-count errors, not claimed green.
+Ten-file manifest SHA256
+`bd50fc3506dbfed8e77e7132f8567f09c6acd9ad5be6a6984c9bbdf698c9681c` and raw logs:
+controller `20260909/glm-c2-quiescence/closure.md`. These are local Model-fixture
+checks, not GPU numerics, host drain, live admission or two-rank release proof.
+
 First model slice: model author owns the sealed capability, its actual impl,
 small quiescence child and existing Model-fixture extensions. No factory flag,
 server/scheduler selection or native deployment is authorized by that slice.

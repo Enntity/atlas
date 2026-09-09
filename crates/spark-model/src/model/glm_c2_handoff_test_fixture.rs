@@ -31,6 +31,7 @@ pub(crate) enum Event {
     Upload(DevicePtr, usize, u64),
     Read(DevicePtr, usize, u64),
     Sync(u64),
+    Health(bool),
     RecordEvent(u64, u64),
     WaitEvent(u64, u64),
     BeginCapture(u64),
@@ -62,8 +63,14 @@ pub(crate) struct Recorder {
     pub record_state_allocations: AtomicBool,
     pub sweeps: AtomicUsize,
     pub deterministic_logits: AtomicBool,
+    pub unhealthy: AtomicBool,
+    pub unhealthy_on_sync: AtomicUsize,
 }
 impl Recorder {
+    pub fn health(&self) -> bool {
+        let healthy = !self.unhealthy.load(Ordering::Relaxed);
+        self.event(Event::Health(healthy)).is_ok() && healthy
+    }
     fn event(&self, event: Event) -> Result<()> {
         let mut events = self.events.lock();
         events.push(event);
@@ -183,7 +190,11 @@ impl GpuBackend for Gpu {
     }
     fn synchronize(&self, s: u64) -> Result<()> {
         self.0.event(Event::Sync(s))?;
-        self.0.inner.synchronize(s)
+        self.0.inner.synchronize(s)?;
+        if self.0.unhealthy_on_sync.load(Ordering::Relaxed) == s as usize && s != 0 {
+            self.0.unhealthy.store(true, Ordering::Relaxed);
+        }
+        Ok(())
     }
     fn record_event(&self, event: u64, stream: u64) -> Result<()> {
         self.0.event(Event::RecordEvent(event, stream))

@@ -25,6 +25,8 @@ mod legacy_boundary_tests;
 mod predispatch_tests;
 #[path = "glm_c2_handoff_preflight_tests.rs"]
 mod preflight_tests;
+#[path = "glm_c2_quiescence_tests.rs"]
+mod quiescence_tests;
 #[path = "glm_c2_retirement_fault_tests.rs"]
 mod retirement_fault_tests;
 #[path = "glm_c2_retirement_guard_tests.rs"]

@@ -4,9 +4,17 @@ use super::*;
 use crate::speculative::glm_paired_execution::{GlmPairedExecution, sealed};
 use crate::traits::Model;
 use spark_runtime::gpu::DevicePtr;
+#[path = "glm_c2_quiescence.rs"]
+mod quiescence;
 
 impl sealed::Sealed for TransformerModel {}
 impl GlmPairedExecution for TransformerModel {
+    fn check_communication_health(&self) -> Result<()> {
+        self.paired_check_communication_health()
+    }
+    fn quiesce(&self) -> Result<()> {
+        self.paired_quiesce()
+    }
     fn validate_cold_prefill(&self, seq: &SequenceState, tokens: &[u32]) -> Result<()> {
         self.paired_validate_cold_prefill(seq, tokens)
     }

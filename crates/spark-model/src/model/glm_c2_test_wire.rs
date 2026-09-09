@@ -103,6 +103,7 @@ macro_rules! inert {
             $(fn $name(&self, $(_: $arg),*) -> Result<()> { Ok(()) })*
             fn rank(&self) -> usize { self.rank }
             fn world_size(&self) -> usize { 2 }
+            fn is_healthy(&self) -> bool { self.gpu.health() }
             fn receive_idle_command_word(&self, ptr: u64) -> Result<()> {
                 self.transfer(ptr, 4, 0)
             }

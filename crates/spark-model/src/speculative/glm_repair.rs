@@ -53,6 +53,8 @@ pub trait GlmPairRepair: Send + Sync {
 
 /// Optional GLM-only request-owned path; legacy and other proposers lack it.
 pub trait GlmPairedHandoff: Send + Sync {
+    /// Read-only open/unfailed actual pool check, independent of free slot count.
+    fn validate_session(&self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()>;
     /// Read-only candidate identity, not a reservation or published lease.
     fn validate_allocation(&self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<usize>;
     fn validate_verify(
