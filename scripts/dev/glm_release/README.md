@@ -6,6 +6,13 @@ source/image qualification in
 and [merge evidence](../../../docs/experiments/glm53-20260906/upstream-release-integration.md).
 Never label a newly built image qualified using an older image's results.
 
+For the first `a6cfeec0` images, the exact source archive and server ELF are
+pinned, but inherited image source/revision labels still describe an older
+base. Do not use those labels as source identity or mistake them for evidence
+of an older ELF. The next image packaging must explicitly replace the labels
+with the actual source revision; retain the archive/ELF/image digests either
+way. Correcting labels alone does not constitute new runtime qualification.
+
 The supplied profile is TP2/EP2-v2, eager selected MTP, capacity eight,
 context2044, prefill1024, four drafts, BF16 KV, snapshot rollback and zero swap.
 It is not long-context MTP. The paired M10 control uses owner mode `0`; the
@@ -184,8 +191,9 @@ declare success. This is a qualification budget, not a worst-case completion
 guarantee. The watchdogs are unchanged from the retained C8 campaign.
 
 Long-context4K/8K/16K qualification is a **separate** independent eager sparse
-C1..C4 profile and needs its own fresh image/quality receipts. This C8 bundle
-does not generate or qualify that lane, nor imply long-context C8/MTP support.
+C1..C4 profile and needs its own fresh image/quality receipts. Its portable
+[runner and clients](long_context/README.md) are packaged separately; they do
+not use paired T3 release or imply long-context C8/MTP support.
 
 Local checks (no nodes or model execution):
 

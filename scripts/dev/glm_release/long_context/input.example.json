@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "context": 4096,
+  "paged_prefill_bf16_gemm": false,
+  "nodes": [
+    {
+      "rank": 0,
+      "destination": "REQUIRED_USER@REQUIRED_HEAD_IPV4",
+      "image_sha256": "REQUIRED_RANK0_IMAGE_SHA256",
+      "weights_host_path": "/REQUIRED_RANK0_WEIGHTS_PATH",
+      "fabric": {
+        "interface": "REQUIRED_RANK0_RDMA_INTERFACE",
+        "hca": "REQUIRED_RANK0_RDMA_HCA",
+        "gid_index": "REQUIRED_RANK0_GID_INDEX"
+      }
+    },
+    {
+      "rank": 1,
+      "destination": "REQUIRED_USER@REQUIRED_WORKER_IPV4",
+      "image_sha256": "REQUIRED_RANK1_IMAGE_SHA256",
+      "weights_host_path": "/REQUIRED_RANK1_WEIGHTS_PATH",
+      "fabric": {
+        "interface": "REQUIRED_RANK1_RDMA_INTERFACE",
+        "hca": "REQUIRED_RANK1_RDMA_HCA",
+        "gid_index": "REQUIRED_RANK1_GID_INDEX"
+      }
+    }
+  ],
+  "server_sha256": "REQUIRED_SERVER_ELF_SHA256",
+  "fabric_head": "REQUIRED_RDMA_HEAD_IPV4",
+  "api_url": "http://REQUIRED_HEAD_IPV4:8890",
+  "port": 8890,
+  "ssh_executable": "/REQUIRED_PINNED_SSH_EXECUTABLE",
+  "node_python": "/REQUIRED_NODE_PYTHON_EXECUTABLE",
+  "ssh_key": "/REQUIRED_OPERATOR_SSH_KEY",
+  "known_hosts": "/REQUIRED_OPERATOR_KNOWN_HOSTS",
+  "output_directory": "/REQUIRED_NEW_PRIVATE_RECEIPT_DIRECTORY",
+  "workload": "GENERATED_LOCAL_WORKLOAD"
+}

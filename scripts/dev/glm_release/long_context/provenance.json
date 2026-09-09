@@ -1,0 +1,26 @@
+{
+  "source": "2026-09-09 retained glm-native-controller release-context campaign; sources read fully before packaging",
+  "native_qualification_claim": false,
+  "source_sha256": {
+    "long-context-runner.py": "3c78dacab1c2e42121755ee080ac6e76a837fecedaaa997d7633e3b29f07689b",
+    "long_context_profile.py": "3123de5b821318ada847f64bdcc2e76df5baa5866f4f0de8f299611721c0d633",
+    "long_context_node.py": "c5add8c96e6b3449cefef3864012ab77bb81f9eb9ef0c05b2195ebab7c149a41",
+    "release-context-quality.py": "63eb60757bff31e57822550f009e8e36a4f46aa74344c886e13d54c3df0c6807",
+    "release-context-boundaries.py": "35d187ae291a71d52b6e15a0318295fb80305d8be36bb97490ce6d11496d6079",
+    "release-context-suite.py": "383f98e1717a247da0d9f7229a32a4d56d4214ff61f76fc71686838ff9c4bc3b",
+    "long_context_dry_tests.py": "0f9d05003fe7399e12724566c15030f17763b99da1482abdc0d8de26e128c00d"
+  },
+  "byte_identical": [
+    "long_context_node.py",
+    "release-context-quality.py",
+    "release-context-boundaries.py",
+    "release-context-suite.py"
+  ],
+  "adaptations": {
+    "long-context-runner.py": "Explicit per-node RDMA fabric, SSH executable/node Python paths, mandatory strict boolean numerical switch propagated to create/inspection/dry-run; synthetic fixture addresses only. Safety/lifecycle bodies unchanged.",
+    "long_context_profile.py": "Per-node RDMA values required; explicit paged-prefill BF16 GEMM0/1; reject zero artifact digests. Existing fixed numerical/resource policy otherwise unchanged.",
+    "long_context_dry_tests.py": "Retained controls plus explicit fabric/strict-boolean0/1 assertions and documentation-range fixture addresses.",
+    "configure.py": "New local-only generator deriving pinned workload argv/files from explicit operator input; no runner or node execution."
+  },
+  "baseline_note": "Runner/profile provenance precedes the separately authorized external boolean-plumbing update; portable code already requires that explicit switch. Quality includes the final real-chat sizing correction."
+}
