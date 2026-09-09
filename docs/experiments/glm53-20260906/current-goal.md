@@ -165,15 +165,26 @@ memcheck-clean and approximately2x faster than M10 chunks in fresh repetitions;
 see `owner-batch-ffn-native-results.md`. This is not a serving-rate improvement.
 Source `bc3637fd` now connects bounded M15/M20 FFN compute to shared actual
 KDA/MLA layer traversal, preserving independent state and old pair semantics.
-Focused host byte/dispatch and ownership controls pass; producer/model/E7 and
-scheduler activation remain unfinished, with no new native rate claimed.
+Focused host byte/dispatch and ownership controls passed at that stage;
+producer/model/E7 and scheduler activation were then unfinished.
 See `owner-batch-layer-integration.md` for the evidence and next integration.
 Source `77a58abb` additionally connects distinct3/4-owner producer retention to
 actual model traversal, mixed verdict detachment/commit and next proposals in
-the byte-backed fixture. The fixed E7 codec is implemented, but live transport,
-cold wider selection and scheduler activation are not yet connected. Existing
-E6 remains unchanged. See `owner-batch-model-integration.md`; no new native
-throughput or generated-quality result is claimed.
+the byte-backed fixture. See `owner-batch-model-integration.md` for that
+host-side stage. Source `a069efc3` now connects explicit cold selection, live
+E7 head/worker exchange and the scheduler's all-owner transaction. Existing
+E6 and scalar cold/drain paths remain unchanged. The first native same-image
+OFF/ON comparison passes coherence, actual tool calls, needle retrieval,
+identical retained coding outputs and normal both-rank exit0/noOOM/noSwap.
+Warmed full-wall C3 improves33.070→42.248 and C4 improves36.883→45.526tok/s;
+C1/C2 remain roughly unchanged27.2/36.9. Fresh-process wider repetition also
+passes all quality/output/clean-exit checks: C1=27.258,C2=36.874,C3=42.347,
+C4=45.745, all within0.5% of the first wider process. Minimum observed available
+memory remains above9.2GiB on both nodes, with zero swap. Both machines are
+idle and temporary helper sudo authority is withdrawn. This is not reference-
+workload parity or full-goal completion; strict C1/C2, concurrent C6/C8 MTP,
+comparable capabilities and fresh larger-context qualification remain open.
+See `owner-batch-live-integration.md` and `mtp-c6-c8-extension-plan.md`.
 `mtp-c3-c4-next-plan.md` separates residency, admission and wider weight reuse.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
