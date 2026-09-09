@@ -85,6 +85,7 @@ pub struct TransformerModel {
     pub(super) buffers: BufferArena,
     /// Constructor-selected eager temporal pair compute; None preserves serial MTP.
     pub(super) glm_pair_verify_mode: Option<crate::layer::glm_pair_verify::GlmPairFfn>,
+    pub(super) glm_owner_verify_mode: Option<super::glm_owner_wire::Mode>,
     /// Startup-static LoRA adapter (pool + per-layer pairs + M2 pointer
     /// tables). `None` = no adapter. Installed post-construction via
     /// `set_lora_weights`, which also copies the per-layer pairs into the

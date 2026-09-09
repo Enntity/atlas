@@ -13,6 +13,12 @@ mod owner_producer;
 #[path = "glm_owner_compute_tests.rs"]
 mod owner_compute;
 
+#[path = "glm_owner_transport_tests.rs"]
+mod owner_transport;
+
+#[path = "glm_owner_policy_tests.rs"]
+mod owner_policy;
+
 struct Four {
     f: Fixture,
     states: [SequenceState; 4],

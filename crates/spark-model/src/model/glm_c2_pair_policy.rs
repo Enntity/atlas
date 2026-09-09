@@ -29,6 +29,9 @@ impl TransformerModel {
         if let Some(mode) = requested()? {
             self.initialize_glm_pair_verification(mode)?;
         }
+        if let Some(mode) = super::glm_owner_policy::requested()? {
+            self.initialize_glm_owner_verification(mode)?;
+        }
         Ok(())
     }
 

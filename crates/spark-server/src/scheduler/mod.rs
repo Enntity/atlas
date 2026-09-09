@@ -32,6 +32,7 @@ mod glm_c2_selected;
 #[cfg(target_os = "linux")]
 mod glm_c2_selected_prefill;
 mod glm_c2_serial;
+mod glm_owner_step;
 #[cfg(target_os = "linux")]
 pub(crate) use glm_c2_selected::run_selected;
 mod helpers;

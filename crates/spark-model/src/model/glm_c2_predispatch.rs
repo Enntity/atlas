@@ -15,6 +15,34 @@ impl GlmPairedExecution for TransformerModel {
     fn pair_verification_enabled(&self) -> bool {
         self.glm_pair_verify_mode.is_some()
     }
+    fn owner_verification_enabled(&self) -> bool {
+        self.glm_owner_verify_mode.is_some()
+    }
+    fn validate_verify_owners(
+        &self,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        seqs: &[&SequenceState],
+        tokens: &[[u32; 5]],
+    ) -> Result<()> {
+        self.owner_packet(shape, seqs, tokens).map(|_| ())
+    }
+    fn verify_owners(
+        &self,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        seqs: &mut [&mut SequenceState],
+        tokens: &[[u32; 5]],
+    ) -> Result<[[u32; 5]; 4]> {
+        self.owner_send_verify(shape, seqs, tokens)
+    }
+    fn finish_verify_owners(
+        &self,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        seqs: &mut [&mut SequenceState],
+        tokens: &[[u32; 5]],
+        accepted: &[usize],
+    ) -> Result<()> {
+        self.owner_send_verdict(shape, seqs, tokens, accepted)
+    }
     fn validate_verify_pair(
         &self,
         seqs: [&SequenceState; 2],

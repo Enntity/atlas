@@ -14,6 +14,26 @@ pub trait GlmPairedExecution: sealed::Sealed + Send + Sync {
     /// Checked agreement of actual private, target and admitted capacities.
     fn owner_capacity(&self) -> Result<usize>;
     fn pair_verification_enabled(&self) -> bool;
+    fn owner_verification_enabled(&self) -> bool;
+    fn validate_verify_owners(
+        &self,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        seqs: &[&SequenceState],
+        tokens: &[[u32; 5]],
+    ) -> Result<()>;
+    fn verify_owners(
+        &self,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        seqs: &mut [&mut SequenceState],
+        tokens: &[[u32; 5]],
+    ) -> Result<[[u32; 5]; 4]>;
+    fn finish_verify_owners(
+        &self,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        seqs: &mut [&mut SequenceState],
+        tokens: &[[u32; 5]],
+        accepted: &[usize],
+    ) -> Result<()>;
     fn validate_verify_pair(&self, seqs: [&SequenceState; 2], tokens: &[[u32; 5]; 2])
     -> Result<()>;
     /// Both checked selections must finish before either owner can emit/propose.

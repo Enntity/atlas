@@ -28,6 +28,19 @@ impl Fixture {
             .expect("actual fixture pair-compute configuration");
         Self(fixture)
     }
+    /// Real cold-selected wider compute plus the existing pair fallback.
+    pub fn owner_compute(rank: usize) -> Self {
+        let mut fixture = inner::Fixture::new_owner_compute(rank);
+        fixture
+            .model
+            .initialize_glm_pair_verification(crate::layer::glm_pair_verify::GlmPairFfn::TwoK5)
+            .expect("actual fixture pair fallback configuration");
+        fixture
+            .model
+            .initialize_glm_owner_verification(super::super::glm_owner_wire::Mode::OwnersJoint)
+            .expect("actual fixture owner-compute configuration");
+        Self(fixture)
+    }
     /// Explicit test-only owner residency; no serving admission is granted.
     pub fn paired_compute_with_owner_capacity(rank: usize, owners: usize) -> Self {
         let mut fixture = inner::Fixture::new_pair_compute_with_owner_capacity(rank, owners);
@@ -123,6 +136,17 @@ impl Observer {
     }
     pub fn events(&self) -> Vec<Event> {
         self.gpu.trace().into_iter().map(Event::from).collect()
+    }
+    /// Recorded device-to-host reads only; no memory access or ownership authority.
+    pub fn read_spans(&self) -> Vec<(DevicePtr, usize, u64)> {
+        self.gpu
+            .trace()
+            .into_iter()
+            .filter_map(|event| match event {
+                inner::Event::Read(ptr, bytes, stream) => Some((ptr, bytes, stream)),
+                _ => None,
+            })
+            .collect()
     }
     pub fn fail_at(&self, ordinal: usize) {
         assert!(ordinal > 0);

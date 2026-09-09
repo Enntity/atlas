@@ -48,24 +48,8 @@ impl TransformerModel {
         tokens: &[[u32; 5]],
         accepted: &[usize],
     ) -> Result<()> {
-        let mut bases = [0usize; N];
-        let capacity = self.paired_owner_capacity()?;
-        for (index, seq) in seqs.iter().enumerate() {
-            ensure!(
-                seq.slot_idx < capacity && (index == 0 || seqs[index - 1].slot_idx < seq.slot_idx),
-                "owner verdict physical slots changed"
-            );
-            bases[index] = seq
-                .seq_len
-                .checked_sub(5)
-                .context("owner verdict lacks five rows")?;
-            ensure!(
-                seq.tokens.len() == seq.seq_len
-                    && seq.tokens.get(bases[index]..) == Some(tokens[index].as_slice()),
-                "owner verdict canonical issued append changed"
-            );
-            self.paired_ssm_bindings(seq)?;
-        }
+        let borrowed = seqs.each_ref().map(|seq| &**seq);
+        let bases = self.owner_verdict_preflight(shape, &borrowed, tokens, accepted)?;
         for owner in 0..N {
             seqs[owner].seq_len = bases[owner] + accepted[owner] + 1;
             seqs[owner].tokens.truncate(seqs[owner].seq_len);
@@ -74,7 +58,15 @@ impl TransformerModel {
             .paired_handoff()
             .context("owner verdict capability missing")?;
         self.owner_with_states(seqs, |inputs, states, ctx| {
-            capability.record_verify_owners(shape, inputs, &bases, tokens, accepted, states, ctx)
+            capability.record_verify_owners(
+                shape,
+                inputs,
+                &bases[..N],
+                tokens,
+                accepted,
+                states,
+                ctx,
+            )
         })?;
         for owner in 0..N {
             self.trim_proposer_state(seqs[owner], accepted[owner], 0)?;
@@ -149,69 +141,9 @@ impl TransformerModel {
         let context = self.glm_repair_context();
         let stream = self.gpu.default_stream();
         let mut workspace = GlmOwnerBatchWorkspace::new(&context, shape)?;
-        workspace.scratch.validate_context(&context, stream)?;
-        ensure!(
-            shape.owners() == N && self.glm_pair_verify_mode.is_some() && self.lora.is_none(),
-            "wider compute requires admitted base paired model"
-        );
-        let capacity = self.paired_owner_capacity()?;
+        let borrowed = seqs.each_ref().map(|seq| &**seq);
+        let stride = self.owner_compute_preflight(shape, &borrowed, tokens)?;
         let max_blocks = self.max_blocks_per_seq as usize;
-        ensure!(
-            (1..=128).contains(&max_blocks),
-            "owner metadata block capacity"
-        );
-        let stride = (768 + 5 * max_blocks * 4).next_multiple_of(256);
-        ensure!(
-            stride <= 3328
-                && 32768 + N * stride <= 49152
-                && self.buffers.sizes().scratch >= 49152
-                && self.buffers.sizes().logits
-                    >= self
-                        .config
-                        .vocab_size
-                        .checked_mul(N * 10)
-                        .context("owner logits overflow")?
-                && self.buffers.sizes().token_ids >= N * 20,
-            "owner metadata/logits/token arena capacity"
-        );
-        for (index, seq) in seqs.iter().enumerate() {
-            ensure!(
-                seq.slot_idx < capacity && (index == 0 || seqs[index - 1].slot_idx < seq.slot_idx),
-                "owner slots must be canonical distinct physical slots"
-            );
-            self.paired_validate_verify(seq, &tokens[index])?;
-            let end = seq
-                .seq_len
-                .checked_add(5)
-                .context("owner target end overflow")?;
-            ensure!(
-                seq.tokens.capacity() >= end && seq.block_table.capacity() >= max_blocks,
-                "owner host storage must be reserved before issue"
-            );
-        }
-        for layer in &self.layers {
-            layer.validate_glm_owner_verify(&context, shape, stream)?;
-        }
-        let mut cache = self.kv_cache.lock();
-        let mut additional = 0usize;
-        for (index, seq) in seqs.iter().enumerate() {
-            additional += self
-                .paired_target_budget(seq, &cache)?
-                .1
-                .saturating_sub(seq.block_table.len());
-            ensure!(
-                seqs[..index].iter().all(|other| seq
-                    .block_table
-                    .iter()
-                    .all(|block| !other.block_table.contains(block))),
-                "owner historical target cache maps alias"
-            );
-        }
-        ensure!(
-            additional <= cache.num_free_blocks(),
-            "owner aggregate target budget exhausted"
-        );
-        drop(cache);
         let bases: [usize; N] = std::array::from_fn(|i| seqs[i].seq_len);
         let positions: [[usize; 5]; N] =
             std::array::from_fn(|i| std::array::from_fn(|row| bases[i] + row));
@@ -221,7 +153,7 @@ impl TransformerModel {
         self.owner_with_states(seqs, |inputs, states, ctx| {
             capability.begin_verify_owners(shape, inputs, tokens, states, ctx)
         })?;
-        cache = self.kv_cache.lock();
+        let mut cache = self.kv_cache.lock();
         for seq in seqs.iter_mut() {
             ensure!(
                 self.paired_allocate_target(seq, &mut cache, 5, stream)?,

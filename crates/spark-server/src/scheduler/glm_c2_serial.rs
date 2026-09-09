@@ -60,6 +60,11 @@ pub(super) fn step_selected_serial(
             capability.validate_verify(&a.seq, &issued)?;
         }
     }
+    if capability.owner_verification_enabled()
+        && super::glm_owner_step::try_step_owners(model, capability, active, sched, verify_ctx)?
+    {
+        return Ok(());
+    }
     // Physical groups, not adjacent active-vector entries. Complete each
     // producer before the next group; a missing/cold partner stays singleton.
     for group in owners.chunks(2) {
