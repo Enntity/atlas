@@ -63,14 +63,17 @@ improves about19.0→25.5tok/s; identical-output pairs can be faster, so the rep
 29.746 median is not a general heterogeneous-request baseline. See
 `v27-c2-compact-results.md` for full-wall rates, TTFT, quality and limitations.
 
-Next native-facing work extends actual independent-row KDA/MLA/grouped-MoE
-support through every draining width1..8. MLA exports6/7/8 are now committed and
+Independent-row KDA/MLA/grouped-MoE host support through every draining width1..8
+is now committed in `c0f7b0ef`, with selected server admission, TP-local reserve
+accounting and preserved slot identity. MLA exports6/7/8 are committed and
 standalone GPU-qualified (exact scalar equality, zero memcheck errors and repeated
-projection speedups); see `mla-c6-c8-kernel-results.md`. Host integration remains
-in progress. Pre-load reserve accounting must also use actual TP-local shapes
-and allocation envelopes before admitting the larger batch.
-Preserve rollback/watchdog behavior and qualify bounded memory before C6/C8
-admission. Concurrent MTP also remains required: checked cold F0 transport is
+projection speedups); see `mla-c6-c8-kernel-results.md`. The host integration has
+source/CPU qualification only; see `scripts/dev/glm_independent_c2_c8_plan.md`.
+The native candidate build has started; no selected C6/C8 serving result exists
+yet. Launcher and distinct answer/tool/needle clients now support C1..8.
+Next qualify eager native quality, actual memory headroom and drain behavior,
+then warmed graphs and reproducible throughput. Preserve rollback/watchdog
+behavior throughout. Concurrent MTP also remains required: checked cold F0 transport is
 committed, but scheduler admission and actual supervised head/worker integration
 are not live. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.
