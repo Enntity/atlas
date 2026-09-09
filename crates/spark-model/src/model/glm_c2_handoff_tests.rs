@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Actual model producers and actual paired head; numerical kernels are recorded.
+#[path = "glm_c2_aligned_churn_tests.rs"]
+mod aligned_churn_tests;
 #[path = "glm_c2_allocation_ownership_tests.rs"]
 mod allocation_ownership_tests;
 #[path = "glm_c2_handoff_cleanup_tests.rs"]

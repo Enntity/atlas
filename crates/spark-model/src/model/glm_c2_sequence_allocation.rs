@@ -21,7 +21,13 @@ impl TransformerModel {
         let candidate = paired
             .map(|capability| capability.validate_allocation(self.gpu.as_ref()))
             .transpose()?;
-        let mut slot_guard = self.ssm_pool.claim_guarded()?;
+        let mut slot_guard = match candidate {
+            Some(index) => self
+                .ssm_pool
+                .claim_specific_guarded(index)
+                .map_err(|error| self.paired_ownership_error(error))?,
+            None => self.ssm_pool.claim_guarded()?,
+        };
         let slot = slot_guard.idx().expect("claim_guarded owns a slot");
         let result = (|| {
             if let Some(candidate) = candidate {

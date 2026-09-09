@@ -171,7 +171,8 @@ fn initial_selected_allocation_matches_real_private_candidate_to_target_before_g
             f.model.free_sequence(&mut f.seqs[owner]).unwrap();
         }
         // Hold real target0 outside a SequenceState. Both actual private slots
-        // are free, so their first candidate is0 while target allocation sees1.
+        // are free, so their first candidate is0. Unrelated target1 remains
+        // free: selected refusal must not claim/quarantine it instead.
         let first = f.model.ssm_pool.claim_guarded().unwrap();
         let second = f.model.ssm_pool.claim_guarded().unwrap();
         let (target0, target1) = if first.idx() == Some(0) {
@@ -192,7 +193,10 @@ fn initial_selected_allocation_matches_real_private_candidate_to_target_before_g
             f.gpu.trace().is_empty(),
             "identity refusal precedes target zero/reset"
         );
-        assert!(!f.model.ssm_pool.slot_is_free(1));
+        assert!(f.model.ssm_pool.slot_is_free(1));
+        let unrelated = f.model.ssm_pool.claim_guarded().unwrap();
+        assert_eq!(unrelated.idx(), Some(1));
+        drop(unrelated);
         drop(target0); // Never written or failed; this independent guard remains valid.
         f.gpu.clear();
         assert!(

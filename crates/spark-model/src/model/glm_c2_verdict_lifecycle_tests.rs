@@ -224,9 +224,9 @@ fn pending_retirement_actual_model_reallocation_and_peer_continuation() {
                         assert_eq!(blocks(&f.seqs[owner]), original[owner]);
                     }
                 }
-                // Current selected allocation requires aligned private-lowest
-                // and target-LIFO indices; arbitrary two-idle churn is B2 work.
-                for owner in [1, 0] {
+                // Original unrestricted retirement order: the actual private
+                // candidate now claims its matching target, regardless of LIFO.
+                for owner in [victim, peer] {
                     f.model.free_sequence(&mut f.seqs[owner]).unwrap();
                 }
                 let mut next = [
