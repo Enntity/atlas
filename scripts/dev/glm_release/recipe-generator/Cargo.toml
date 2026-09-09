@@ -1,0 +1,12 @@
+[package]
+name = "glm-release-recipe-generator"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace]
+
+[dependencies]
+atlas-glm-pair-wire = { path = "../../../../crates/atlas-glm-pair-wire" }
+serde_json = "=1.0.151"

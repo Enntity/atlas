@@ -58,3 +58,18 @@ Status at plan creation: model/E8 commit `e4eac89e` and scheduler commit
 FFN arithmetic/memcheck/repeat evidence is in `owner-eight-ffn-native-results.md`.
 C6/C8 native serving, the upstream merge and fresh large-context qualification
 are not yet complete.
+
+## Portable operator handoff
+
+The [portable C8 bundle](../../../scripts/dev/glm_release/README.md) packages
+the retained standalone workload and canonical recipe generator with explicit
+operator templates, pinned local inputs and the existing production supervisor.
+It removes campaign-directory/historical-template dependencies; it does not
+replace guard/lease/identity checks or publish a new native PASS. Generated
+sessions, credentials and raw receipts stay outside Git. The bundle documents
+the separate long-context lane and the selected profile's known API limits.
+
+The upstream merge is committed as `a6cfeec0`; qualification status and exact
+evidence are tracked in [upstream integration](upstream-release-integration.md).
+The status paragraph above remains the plan-creation snapshot, not a claim
+that this handoff qualifies the merged native image.

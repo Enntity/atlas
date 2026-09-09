@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "policy": {
+    "startup": 90000,
+    "lease": 120000,
+    "challenge": 10000,
+    "frame": 5000,
+    "campaign": 1800000,
+    "poll": 10,
+    "reap": 5000,
+    "child_handshake": 30000,
+    "quiescent_wait": 30000,
+    "exit": 10000
+  },
+  "controller": {
+    "readiness_ms": 300000,
+    "workload_ms": 1200000,
+    "drain_ms": 40000,
+    "status_max_age_ms": 6000,
+    "command_ms": 4000,
+    "status_interval_ms": 500,
+    "cleanup_ms": 6000
+  },
+  "ssh": {
+    "executable": "/usr/bin/ssh",
+    "key": "/REQUIRED_OPERATOR_SSH_PRIVATE_KEY",
+    "known_hosts": "/REQUIRED_OPERATOR_KNOWN_HOSTS",
+    "environment": []
+  },
+  "nodes": [
+    {
+      "rank": 0,
+      "destination": "REQUIRED_RANK0_SSH_DESTINATION",
+      "supervisor_path": "/REQUIRED_PINNED_HELPER_DIRECTORY/glm-pair-supervisor",
+      "supervisor_sha256": "REQUIRED_SUPERVISOR_ELF_SHA256",
+      "relay_path": "/REQUIRED_PINNED_HELPER_DIRECTORY/glm-pair-relay",
+      "relay_sha256": "REQUIRED_RELAY_ELF_SHA256",
+      "guard_container_path": "/usr/local/bin/glm-pair-guard",
+      "recipe_file": "/REQUIRED_GENERATED_RECIPE",
+      "recipe_sha256": "REQUIRED_GENERATED_RECIPE_SHA256"
+    },
+    {
+      "rank": 1,
+      "destination": "REQUIRED_RANK1_SSH_DESTINATION",
+      "supervisor_path": "/REQUIRED_PINNED_HELPER_DIRECTORY/glm-pair-supervisor",
+      "supervisor_sha256": "REQUIRED_SUPERVISOR_ELF_SHA256",
+      "relay_path": "/REQUIRED_PINNED_HELPER_DIRECTORY/glm-pair-relay",
+      "relay_sha256": "REQUIRED_RELAY_ELF_SHA256",
+      "guard_container_path": "/usr/local/bin/glm-pair-guard",
+      "recipe_file": "/REQUIRED_GENERATED_RECIPE",
+      "recipe_sha256": "REQUIRED_GENERATED_RECIPE_SHA256"
+    }
+  ],
+  "readiness": {
+    "curl": "/usr/bin/curl",
+    "url": "http://REQUIRED_HEAD_HTTP_HOST:8890/health",
+    "expected_model": "/var/tmp/models/glm53-flash-nvfp4",
+    "per_attempt_ms": 1000
+  },
+  "workload": {
+    "program": "/REQUIRED_PINNED_PYTHON_EXECUTABLE",
+    "program_sha256": "REQUIRED_PYTHON_ELF_SHA256",
+    "argv": [
+      "-I",
+      "-",
+      "http://REQUIRED_HEAD_HTTP_HOST:8890",
+      "/var/tmp/models/glm53-flash-nvfp4"
+    ],
+    "environment": [],
+    "input_file": "/REQUIRED_WORKLOAD_FROM_MATERIALIZER",
+    "input_sha256": "REQUIRED_GENERATED_WORKLOAD_SHA256",
+    "limits": {
+      "timeout_ms": 1190000,
+      "stdout_bytes": 1048576,
+      "stderr_bytes": 65536,
+      "stdin_bytes": 65536,
+      "bytes_per_turn": 16384
+    }
+  }
+}
