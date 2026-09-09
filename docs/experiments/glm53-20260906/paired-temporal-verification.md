@@ -1,8 +1,8 @@
 # Fixed two-owner temporal verification candidate
 
-2026-09-09. Implementation checkpoint, not a serving performance result.
-The latest measured selected-MTP control remains C1=27.280 and C2=27.245
-aggregate full-wall tok/s on the warmed 148-input/256-output workload.
+2026-09-09. Native source `5b4662a9` now passes the first full serving A/B:
+C2=27.314→34.333 aggregate full-wall tok/s, C1 unchanged at approximately27.3.
+See `paired-ffn-serving-results.md` for quality, safety, provenance and limits.
 
 ## Change and explicit controls
 
@@ -56,9 +56,9 @@ or serving throughput. Native comparison, full-model quality/rollback checks,
 warmed C1/C2 evidence and a fully qualified paired exit remain required.
 
 The Docker Running-to-clean-Exited observation race is fixed separately in
-`7d0d220b`; its corrected observer has CPU qualification, not yet a native
-campaign qualification. Neither that fix nor this infrastructure meets the
-reference-parity goal by itself.
+`7d0d220b`; its corrected observer now completes both native serving campaigns
+with actual paired release and independently observed exit0. Neither that fix
+nor this C2 improvement meets the full reference-parity goal by itself.
 
 The first native `two-k5` startup reached actual model construction, then exited
 before readiness. Both containers were stopped by the supervisor (137,
@@ -68,4 +68,5 @@ required `Skip` while the real base-model adapter resolver returns inert `Fold`
 when no adapter is loaded. The correction admits that base state only with no
 resident adapter and zero configured adapter rank; `Refuse` remains rejected.
 Factory diagnostics now print the indexed layer error before fail-safe exit.
-Native qualification of the corrected candidate remains pending.
+The corrected candidate subsequently passes both native modes as detailed in
+`paired-ffn-serving-results.md`; fresh-process repetition remains next.

@@ -121,6 +121,12 @@ and joint routed-FFN candidate are implemented default-off, with actual CPU
 ownership/continuation checks; native numerical and throughput qualification
 remain outstanding. See `paired-temporal-verification.md` for the implementation,
 explicit controls and evidence boundaries.
+Native source `5b4662a9` subsequently passes the first fully supervised paired
+FFN A/B, including quality and both-rank normal shutdown: warmed C1 remains
+approximately27.3, while C2 improves27.314→34.333 aggregate full-wall tok/s
+(25.7%) with identical retained outputs. See `paired-ffn-serving-results.md`.
+Fresh-process repetition and explicit committed-pair telemetry are next; C2
+remains below37 and selected MTP capacity remains two, not reference parity.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.
