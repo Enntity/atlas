@@ -227,3 +227,36 @@ fn explicit_environment_refuses_noncanonical_or_injection() {
     )
     .is_err());
 }
+
+#[test]
+fn executable_fifo_is_rejected_without_waiting_for_a_writer() {
+    if let Some(path) = std::env::var_os("ATLAS_FIFO_PROBE") {
+        assert!(Spec::new(&[path.to_str().unwrap().to_owned()]).is_err());
+        return;
+    }
+    let mut template = b"/tmp/atlas-guard-fifo-XXXXXX\0".to_vec();
+    let pointer = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+    assert!(!pointer.is_null());
+    let directory = unsafe { std::ffi::CStr::from_ptr(pointer) }
+        .to_str()
+        .unwrap();
+    let path = format!("{directory}/not-an-elf");
+    let c_path = std::ffi::CString::new(path.as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let output = Command::new("/usr/bin/timeout")
+        .arg("1s")
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child::tests::executable_fifo_is_rejected_without_waiting_for_a_writer",
+            "--nocapture",
+        ])
+        .env("ATLAS_FIFO_PROBE", &path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "FIFO must reject without a writer: {}",
+        output.status
+    );
+}

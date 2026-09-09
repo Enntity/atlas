@@ -79,10 +79,17 @@ existing guard child extension and actual inherited server consumer are now
 implemented. A controller-only fixture connects two actual gated children under
 separate PID1/proc namespaces to the production consumer, with valid and rejected
 ticket cases. See `docs/experiments/glm53-20260906/live-pair-handshake-results.md`.
-This does not implement the LIVE guard main loop, canonical recipe/materialized
-launch, quiescent release or actual Model registration. Those remain the next
-connected integration step before any native admission; do not rerun the older
-PID1-death qualification as if that prerequisite were absent.
+The next slice now implements the production `--live` guard main, canonical
+recipe codec, pinned startup-file ingress and two-rank quiescent release. The
+actual guard ELF runs as private PID1 and execs the exact server ingress/release
+source in the GPU-free fixture. Valid and delayed-peer release, bad/replayed
+release, unreleased exit0, environment mismatch, consumed-session reuse and
+hardlinked-input refusal pass. See `live-pair-release-results.md` in the same
+experiment directory. This is not an actual Model quiescence, Docker resource,
+native recipe or serving proof. Actual Model registration, selected factory/
+scheduler/worker activation and the two-node Docker/controller adapter remain
+the next connected integration step. Do not rerun the older PID1-death
+qualification as if that prerequisite were absent.
 
 First model slice: model author owns the sealed capability, its actual impl,
 small quiescence child and existing Model-fixture extensions. No factory flag,
@@ -97,6 +104,24 @@ independent source review. Avoid broad redundant suites; evidence must cover the
 connected behavior, not a fake capability or mocked completion certificate.
 Subsequent qualification must exercise the real factory/admission/worker/driver
 path plus actual local guarded children before a healthy bounded native C2 run.
+
+Next connected implementation boundary (source rechecked after LIVE release):
+move selected ingress ahead of runtime construction (`main` currently uses
+`#[tokio::main]`, which violates ingress's single-threaded precondition if called
+inside the async body). Carry the validated session through the actual resolved
+startup into a private owner containing the boxed Model and terminal key before
+`serve_load` hands ownership to either worker or scheduler. Do not activate from
+an environment flag alone, or add another record-only admission validator.
+Explicitly select the paired factory constructor without an ordinary fallback.
+The selected worker branch must precede its current bind/alloc/log-break-free
+loop; the selected head branch must precede generic scheduler setup/admission.
+Use existing cold F0/serial/retirement paths, with actual communicator-health
+checks before token emission/next E1 and before retirement response/removal:
+an outer check after either helper returns is too late. Reuse the actual Model
+fixture and subprocess terminal boundary for this dispatcher, not a mock sealed
+capability. Cold-construction inner error cleanup still requires its own explicit
+ownership treatment; later Model registration cannot retroactively contain it.
+
 No fault injection, forced-kill experiment, reset or driver changes on Sparks.
 Only after native quality/memory/clean-exit control should batching and higher
 MTP concurrency be optimized. Serialized C2 alone does not satisfy C1>=30,

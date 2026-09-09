@@ -7,4 +7,6 @@
 
 mod channel;
 pub mod identity;
+mod startup_files;
 pub use channel::{Channel, Credentials};
+pub use startup_files::PrivateDirectory;

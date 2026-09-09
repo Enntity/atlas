@@ -126,24 +126,28 @@ fn wrong_local_identity_challenge_or_launch_refuses() {
                 "rank{rank} mismatch{which}"
             );
         }
-        assert!(check_ticket(
-            &expected,
-            &hello,
-            Frame {
-                rank: 1 - rank,
-                body: Body::ChildTicket(ticket)
-            }
-        )
-        .is_err());
-        assert!(check_ticket(
-            &expected,
-            &hello,
-            Frame {
-                rank,
-                body: Body::ChildHello(hello)
-            }
-        )
-        .is_err());
+        assert!(
+            check_ticket(
+                &expected,
+                &hello,
+                Frame {
+                    rank: 1 - rank,
+                    body: Body::ChildTicket(ticket)
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            check_ticket(
+                &expected,
+                &hello,
+                Frame {
+                    rank,
+                    body: Body::ChildHello(hello)
+                }
+            )
+            .is_err()
+        );
     }
 }
 

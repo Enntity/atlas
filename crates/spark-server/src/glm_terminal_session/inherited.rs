@@ -6,10 +6,10 @@
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{bail, ensure, Context, Result};
-use atlas_glm_pair_io::identity::{boot_time_ms, fresh_nonce, LocalIdentity, PinnedExecutable};
+use anyhow::{Context, Result, bail, ensure};
 use atlas_glm_pair_io::Channel;
-use atlas_glm_pair_wire::{policy_digest, Body, ChildHello, ChildTicket, Direction, Frame, Policy};
+use atlas_glm_pair_io::identity::{LocalIdentity, PinnedExecutable, boot_time_ms, fresh_nonce};
+use atlas_glm_pair_wire::{Body, ChildHello, ChildTicket, Direction, Frame, Policy, policy_digest};
 
 static INHERITED_SPENT: AtomicBool = AtomicBool::new(false);
 
@@ -58,6 +58,8 @@ pub(crate) struct InheritedSession {
     channel: Channel,
     ticket: ChildTicket,
     local: LocalIdentity,
+    rank: u8,
+    policy: Policy,
     // Retain the opened identities; a pathname/digest alone does not own the ELF.
     _server: PinnedExecutable,
     _guard: PinnedExecutable,
@@ -66,6 +68,23 @@ pub(crate) struct InheritedSession {
 impl InheritedSession {
     pub(crate) fn ticket(&self) -> &ChildTicket {
         &self.ticket
+    }
+
+    /// Nonreturning transport completion, not proof that GPU work was drained.
+    ///
+    /// The selected caller must already have stopped admission, completed the
+    /// matched shutdown and actual Model quiescence, and retained all Model and
+    /// sequence owners with T1 armed. No further GPU work is permitted. The CPU
+    /// protocol harness exercises this transport only, not that caller contract.
+    pub(crate) fn exit_after_quiescence(self) -> ! {
+        // Borrow throughout: neither failure nor success drops this session (or
+        // a caller's live owners) before the direct no-unwind process exit.
+        let status = if release::exchange(&self).is_ok() {
+            0
+        } else {
+            74
+        };
+        unsafe { libc::_exit(status) }
     }
 
     /// Consume only inherited FD3, irreversibly, before selected GPU startup.
@@ -145,16 +164,21 @@ impl InheritedSession {
         local.require_guard_parent()?;
         server.revalidate_process(local.child.pid as u32)?;
         guard.revalidate_process(local.parent.pid as u32)?;
-        deadline.check()?;
+        deadline.finish_frame(&mut frame_deadline)?;
         Ok(Self {
             channel,
             ticket,
             local,
+            rank: expected.rank,
+            policy: expected.policy,
             _server: server,
             _guard: guard,
         })
     }
 }
+
+#[path = "inherited_release.rs"]
+mod release;
 
 fn hello(local: &LocalIdentity, challenge: [u8; 32]) -> ChildHello {
     ChildHello {
@@ -225,6 +249,18 @@ impl Deadline {
             last: self.last,
         })
     }
+    fn finish_frame(&mut self, frame: &mut Self) -> Result<()> {
+        // One observed clock checks both original windows after all identity
+        // validation, without a fresh frame window or two-clock acceptance gap.
+        let now = boot_time_ms()?;
+        ensure!(
+            now >= self.last && now >= frame.last && now < self.at && now < frame.at,
+            "handshake/frame deadline or clock failure"
+        );
+        self.last = now;
+        frame.last = now;
+        Ok(())
+    }
     fn check(&mut self) -> Result<u64> {
         let now = boot_time_ms()?;
         ensure!(
@@ -260,3 +296,19 @@ impl Deadline {
 #[cfg(test)]
 #[path = "inherited_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod frame_timing_tests {
+    use super::*;
+
+    #[test]
+    fn final_acceptance_keeps_frame_bound_inside_live_overall_window() {
+        let mut overall = Deadline::new(10_000).unwrap();
+        let mut healthy = overall.stage(1_000).unwrap();
+        overall.finish_frame(&mut healthy).unwrap();
+        let mut expired = overall.stage(1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        assert!(overall.check().is_ok(), "overall window remains live");
+        assert!(overall.finish_frame(&mut expired).is_err());
+    }
+}

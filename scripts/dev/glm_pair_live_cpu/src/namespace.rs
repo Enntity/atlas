@@ -5,6 +5,9 @@ use std::os::fd::{OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child as Process, Command};
 
+mod main_fixture;
+pub(super) use main_fixture::{mount_guard, run as main_controller};
+
 struct Namespace {
     process: Process,
     pidfd: OwnedFd,
@@ -51,11 +54,17 @@ impl Namespace {
         })
     }
     fn finish(&mut self) -> Result<()> {
+        self.finish_expected(0)
+    }
+    fn finish_expected(&mut self, expected: i32) -> Result<()> {
         let end = identity::boot_time_ms()? + 10000;
         loop {
             if let Some(status) = self.process.try_wait()? {
                 self.finished = true;
-                ensure!(status.success(), "namespace fixture status {status}");
+                ensure!(
+                    status.code() == Some(expected),
+                    "namespace fixture status {status}, expected{expected}"
+                );
                 return Ok(());
             }
             identity::check_deadline(end)?;
@@ -89,7 +98,14 @@ impl Drop for Namespace {
 
 pub(super) fn controller(mode: &str) -> Result<()> {
     ensure!(
-        ["valid", "bad-echo", "bad-recipe", "stalled-ticket"].contains(&mode),
+        [
+            "valid",
+            "bad-echo",
+            "bad-recipe",
+            "stalled-ticket",
+            "release"
+        ]
+        .contains(&mode),
         "explicit CPU fixture mode"
     );
     ensure!(
@@ -122,6 +138,14 @@ pub(super) fn controller(mode: &str) -> Result<()> {
     }
     let mut reports = Vec::new();
     for (rank, node) in nodes.iter_mut().enumerate() {
+        if mode == "release" {
+            let mut bytes = [0; frame::LEN];
+            node.socket.read_exact(&mut bytes)?;
+            ensure!(
+                frame::Frame::decode(&bytes).map_err(linux::error)?.kind == frame::HELLO,
+                "actual legacy HELLO"
+            );
+        }
         let received = read_frame(&mut node.socket, wire::Direction::GuardToController)?;
         ensure!(received.rank == rank as u8, "report rank");
         let wire::Body::GatedReport(report) = received.body else {
@@ -147,6 +171,44 @@ pub(super) fn controller(mode: &str) -> Result<()> {
                 body: wire::Body::PairedStart(manifest),
             },
         )?;
+    }
+    if mode == "release" {
+        let mut receipts = Vec::new();
+        for (rank, node) in nodes.iter_mut().enumerate() {
+            let frame = read_frame(&mut node.socket, wire::Direction::GuardToController)?;
+            ensure!(frame.rank == rank as u8, "receipt rank");
+            let wire::Body::Quiescent(receipt) = frame.body else {
+                bail!("expected actual quiescence receipt")
+            };
+            receipt.validate(&manifest, rank as u8)?;
+            receipts.push(wire::QuiescentFrame {
+                rank: rank as u8,
+                receipt,
+            });
+        }
+        let release = wire::PairRelease {
+            pair_digest: wire::manifest_digest(&manifest)?,
+            epoch: wire::DRAIN_EPOCH,
+            receipts: [receipts[0], receipts[1]],
+            receipt_digests: [
+                wire::quiescent_digest(&receipts[0])?,
+                wire::quiescent_digest(&receipts[1])?,
+            ],
+        };
+        for (rank, node) in nodes.iter_mut().enumerate() {
+            write_frame(
+                &mut node.socket,
+                wire::Frame {
+                    rank: rank as u8,
+                    body: wire::Body::PairRelease(release),
+                },
+            )?;
+        }
+        for node in &mut nodes {
+            node.finish()?;
+        }
+        println!("PASS: production LIVE loop and actual server quiescent-release transport under two PID1/proc namespaces; CPU only, NO Model/Docker/native proof");
+        return Ok(());
     }
     for (rank, node) in nodes.iter_mut().enumerate() {
         let mut marker = [0u8; 1];
@@ -198,10 +260,11 @@ pub(super) fn guard(rank: u8, mode: &str) -> Result<()> {
     ];
     let env = vec![
         ("ATLAS_GLM_PAIR_FD".to_owned(), "3".to_owned()),
+        ("ATLAS_PAIR_CPU_MODE".to_owned(), mode.to_owned()),
         ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
     ];
     let spec = child::Spec::with_environment(&args, &env)?;
-    let (_signals, mask) = linux::Io::signals()?;
+    let (signals, mask) = linux::Io::signals()?;
     let old_policy = core::Policy {
         startup: startup.policy.startup,
         lease: startup.policy.lease,
@@ -240,6 +303,19 @@ pub(super) fn guard(rank: u8, mode: &str) -> Result<()> {
         original_startup_challenge: hello.challenge,
         process: process_record(observed)?,
     };
+    if mode == "release" {
+        let control: OwnedFd = socket.into();
+        linux::Io::nonblocking(control.as_raw_fd())?;
+        let result = live::drive(
+            &control, &signals, &mut child, &channel, &mut state, hello, &startup, record, rank,
+            now,
+        );
+        if result.is_err() {
+            child.terminate()?;
+        }
+        result?;
+        unsafe { libc::_exit(0) }
+    }
     write_frame(
         &mut socket,
         wire::Frame {
@@ -366,7 +442,7 @@ pub(super) fn consumer(bytes: &[u8]) -> Result<()> {
         guard_elf_digest: startup.guard_elf_digest,
         max_executable_bytes: 512 * 1024 * 1024,
     };
-    let _session = unsafe { inherited::InheritedSession::receive(expected, 20000) }?;
+    let session = unsafe { inherited::InheritedSession::receive(expected, 20000) }?;
     // Closing FD3 permits later proc/ELF opens to reuse that numeric slot.
     // It must not remain an inheritable socket; retained pinned ELFs are valid.
     let flags = unsafe { libc::fcntl(3, libc::F_GETFD) };
@@ -383,6 +459,10 @@ pub(super) fn consumer(bytes: &[u8]) -> Result<()> {
             std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF),
             "FD3 status"
         );
+    }
+    if std::env::var("ATLAS_PAIR_CPU_MODE").as_deref() == Ok("release") {
+        // CPU protocol fixture: no issued GPU work or Model capability is claimed.
+        session.exit_after_quiescence();
     }
     // Handshake-only child witness. Not a successful paired quiescent release.
     unsafe { libc::_exit(0) }

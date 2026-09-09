@@ -10,6 +10,17 @@ pub struct Spec {
     pub(super) explicit_env: bool,
 }
 impl Spec {
+    pub fn pin_executable(
+        &self,
+        max_bytes: u64,
+        deadline: u64,
+    ) -> io::Result<atlas_glm_pair_io::identity::PinnedExecutable> {
+        atlas_glm_pair_io::identity::PinnedExecutable::from_file(
+            std::fs::File::from(self.executable.try_clone()?),
+            max_bytes,
+            deadline,
+        )
+    }
     pub fn new(args: &[String]) -> io::Result<Self> {
         if args.is_empty() || args.len() > 64 || args.iter().any(|x| x.len() > 4096) {
             return Err(error("bounded executable and argv required"));
@@ -22,7 +33,7 @@ impl Spec {
         let executable = owned(unsafe {
             libc::open(
                 argv[0].as_ptr(),
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
             )
         })?;
         let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };

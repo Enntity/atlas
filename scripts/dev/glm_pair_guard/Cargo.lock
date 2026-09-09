@@ -11,6 +11,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-glm-pair-wire"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -69,6 +76,7 @@ name = "glm-pair-guard"
 version = "0.1.0"
 dependencies = [
  "atlas-glm-pair-io",
+ "atlas-glm-pair-wire",
  "libc",
 ]
 

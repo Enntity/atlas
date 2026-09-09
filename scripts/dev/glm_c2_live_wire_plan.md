@@ -21,10 +21,15 @@ This slice now implements the explicit LIVE child environment/channel, retained
 child identity/status, shared wire/I/O and actual server consumer; connected
 controller-only evidence is in
 `docs/experiments/glm53-20260906/live-pair-handshake-results.md`.
-The production guard main still always exits failure and has no LIVE loop.
-The server must still call its consumer before selected GPU initialization,
-then bind the actual Model capability. Startup files/recipe and pair release
-also remain unconnected; handshake evidence is not native admission.
+The production guard now has a separate one-shot `--live` entry, canonical
+recipe/startup-file validation, a bounded LIVE loop and actual paired release.
+The exact server file-ingress and nonreturning release source is exercised by
+two actual guard ELFs in a controller-only private-PID1 fixture; see
+`docs/experiments/glm53-20260906/live-pair-release-results.md`.
+The actual server main must still call ingress before selected GPU initialization,
+validate its resolved profile and bind the actual Model capability. The native
+literal recipe and two-node Docker/controller adapter remain absent; CPU fixture
+resource/image assertions are not actual Docker inspection or native admission.
 
 Proposed source split, all Rust children <=500 lines:
 
@@ -248,7 +253,12 @@ positive <=lease, and every duration <=campaign. No fallback values. Existing
 non-LIVE Policy is unchanged. Child handshake starts at gate release; quiescent
 wait starts at accepted local receipt; exit starts when guard accepts release,
 not when delivery finally completes. Each wait is capped by lease/campaign
-deadlines and frame I/O remains capped at3000ms. BOOTTIME origins are node-local,
+deadlines and frame I/O remains capped at3000ms. For atomic child-channel
+SEQPACKET release reception, waiting for an absent packet uses the original quiescent_wait;
+the frame deadline is captured before the successful recvmsg and checked through
+decoding and identity validation. It does not shorten absent-packet QWAIT to3s.
+The original handshake and partial control-stream frame bounds are unchanged.
+BOOTTIME origins are node-local,
 never compared across hosts. Equality/overflow/clock regression fails.
 
 ## Inherited authority and successful release

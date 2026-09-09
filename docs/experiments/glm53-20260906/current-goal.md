@@ -87,8 +87,12 @@ with independent source and focused CPU qualification. Shared wire/credentialed
 transport, the existing guard's inherited child channel and actual server ticket
 consumer now pass a connected controller-only two-PID1/proc handshake gate.
 See `live-pair-handshake-results.md`; this is not native serving activation.
-The LIVE guard loop, literal recipe, two-rank quiescent release, scheduler
-admission and actual supervised head/worker integration are not live.
+The production LIVE guard entry/loop, canonical recipe codec, pinned startup
+ingress and two-rank release now pass the actual two-guard CPU fixture, including
+delayed-peer renewal and rejected unreleased/replayed exits. See
+`live-pair-release-results.md`. No throughput gain is attributed to this slice.
+The literal native recipe/controller adapter, actual Model registration,
+scheduler admission and supervised head/worker activation remain unconnected.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.

@@ -174,7 +174,20 @@ impl Channel {
             };
         }
         // Never reject payload/EOF/truncation before disposing delivered FDs.
-        unsafe { ancillary::validate_and_dispose(&message, expected) }?;
+        let ancillary = unsafe { ancillary::validate_and_dispose(&message, expected) };
+        // A closed peer returns no packet and no ancillary data. A zero-length
+        // packet still carries credentials and must not masquerade as EOF.
+        // Ancillary disposal always precedes this distinction.
+        if n == 0
+            && message.msg_controllen == 0
+            && message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "paired peer closed",
+            ));
+        }
+        ancillary?;
         if n == 0 || n as usize > bytes.len() {
             return Err(io::Error::other("paired channel EOF or invalid packet"));
         }

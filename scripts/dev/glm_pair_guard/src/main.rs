@@ -6,6 +6,9 @@ mod child;
 mod core;
 mod frame;
 mod linux;
+mod live;
+mod live_entry;
+mod startup;
 
 use child::{Child, Spec};
 use core::{Policy, State};
@@ -204,7 +207,11 @@ fn entry() -> io::Result<()> {
 
 fn main() {
     std::panic::set_hook(Box::new(|_| unsafe { libc::_exit(74) }));
-    // No successful completion is defined until the later pair-drain slice.
-    let _ = entry();
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--live")) {
+        let _ = live_entry::run();
+    } else {
+        // Legacy CLI always terminates as before; it has no clean release.
+        let _ = entry();
+    }
     unsafe { libc::_exit(74) };
 }

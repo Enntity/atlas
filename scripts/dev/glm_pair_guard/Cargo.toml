@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 libc = "=0.2.189"
 atlas-glm-pair-io = { path = "../../../crates/atlas-glm-pair-io" }
+atlas-glm-pair-wire = { path = "../../../crates/atlas-glm-pair-wire" }
 
 [profile.release]
 panic = "abort"

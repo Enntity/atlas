@@ -2,6 +2,11 @@
 
 use super::*;
 
+// A concurrently spawned probe can transiently inherit another test's pipe
+// writer before exec closes CLOEXEC descriptors. Keep the immediate EOF witness
+// separate from this test module's process spawn; no production lock is added.
+static FORK_AND_EOF: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn current() -> Credentials {
     unsafe {
         Credentials {
@@ -26,6 +31,7 @@ fn actual_packet_credentials_and_no_data_are_distinct() {
 
 #[test]
 fn missing_inherited_descriptor_is_a_clean_error() {
+    let _exclusive = FORK_AND_EOF.lock().unwrap();
     if std::env::var_os("ATLAS_PAIR_MISSING_FD_PROBE").is_some() {
         // Isolated CPU child owns this descriptor slot, with no Channel owner.
         unsafe {
@@ -58,7 +64,10 @@ fn wrong_sender_and_eof_are_terminal() {
     wrong.pid += 1;
     assert!(right.receive(wrong).is_err());
     drop(left);
-    assert!(right.receive(current()).is_err());
+    assert_eq!(
+        right.receive(current()).unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
 }
 
 fn send_rights(channel: &Channel, writer: RawFd, count: usize, payload: &[u8]) {
@@ -92,6 +101,7 @@ fn send_rights(channel: &Channel, writer: RawFd, count: usize, payload: &[u8]) {
 
 #[test]
 fn all_delivered_rights_are_closed_even_on_truncation_or_wrong_sender() {
+    let _exclusive = FORK_AND_EOF.lock().unwrap();
     for (count, size, wrong_sender) in [
         (1, 1, false),
         (16, 1, false),

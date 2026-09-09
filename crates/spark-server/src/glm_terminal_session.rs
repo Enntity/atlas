@@ -3,9 +3,11 @@
 //! Server-local terminal core and inherited-channel consumer.
 //! No live Model registration, serving flag, or activation caller exists yet.
 mod core;
-mod panic;
 #[cfg(target_os = "linux")]
 pub(crate) mod inherited;
+#[cfg(target_os = "linux")]
+pub(crate) mod inherited_startup;
+mod panic;
 
 #[cfg(test)]
 mod tests;

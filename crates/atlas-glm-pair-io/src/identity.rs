@@ -3,7 +3,7 @@
 //! Local Linux observations. These are not a launch ticket or Model authority.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
@@ -250,7 +250,17 @@ pub struct PinnedExecutable {
 impl PinnedExecutable {
     pub fn open_process(pid: u32, max_bytes: u64, deadline_ms: u64) -> io::Result<Self> {
         check_deadline(deadline_ms)?;
-        let mut file = File::open(format!("/proc/{pid}/exe"))?;
+        Self::from_file(
+            File::open(format!("/proc/{pid}/exe"))?,
+            max_bytes,
+            deadline_ms,
+        )
+    }
+
+    /// Hash the already-open executable selected for fexecve, not its pathname.
+    pub fn from_file(mut file: File, max_bytes: u64, deadline_ms: u64) -> io::Result<Self> {
+        check_deadline(deadline_ms)?;
+        file.seek(SeekFrom::Start(0))?;
         let identity = FileIdentity::read(&file)?;
         if max_bytes == 0 || identity.len < 4 || identity.len > max_bytes {
             return Err(invalid("executable size outside explicit bound"));
@@ -301,6 +311,13 @@ impl PinnedExecutable {
 
     pub fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        if FileIdentity::read(&self.file)? != self.identity {
+            return Err(invalid("pinned executable changed"));
+        }
+        Ok(())
     }
 
     pub fn revalidate_process(&self, pid: u32) -> io::Result<()> {
