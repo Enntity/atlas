@@ -168,6 +168,12 @@ KDA/MLA layer traversal, preserving independent state and old pair semantics.
 Focused host byte/dispatch and ownership controls pass; producer/model/E7 and
 scheduler activation remain unfinished, with no new native rate claimed.
 See `owner-batch-layer-integration.md` for the evidence and next integration.
+Source `77a58abb` additionally connects distinct3/4-owner producer retention to
+actual model traversal, mixed verdict detachment/commit and next proposals in
+the byte-backed fixture. The fixed E7 codec is implemented, but live transport,
+cold wider selection and scheduler activation are not yet connected. Existing
+E6 remains unchanged. See `owner-batch-model-integration.md`; no new native
+throughput or generated-quality result is claimed.
 `mtp-c3-c4-next-plan.md` separates residency, admission and wider weight reuse.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete

@@ -44,6 +44,13 @@ dense M64 down projection, shared T-row path and scalar mHC at15/20 rows.
 Reuse those implementations through checked production interfaces; do not
 claim the approximately2x arithmetic result as an end-to-end speedup.
 
+Implementation update: `bc3637fd` provides the shared layer/FFN workspace and
+`77a58abb` adds the distinct producer, actual model traversal/local verdict and
+fixed E7 codec. Host composed checks pass; see `owner-batch-model-integration.md`.
+Next work is explicit cold selection plus live E7 exchange/worker dispatch and
+scheduler selection, not another standalone arithmetic harness. The internal
+model path is not yet reachable through serving.
+
 Fresh native qualification must include current-build C1/C2 regressions,
 C3/C4 warmed full-wall rates and TTFT, distinct coherence/tool/needle requests,
 measured no-swap headroom and actual paired release. C6/C8 concurrent MTP and
