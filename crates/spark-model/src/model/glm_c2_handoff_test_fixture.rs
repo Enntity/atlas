@@ -7,7 +7,7 @@ use crate::speculative::DraftProposer;
 use crate::traits::SequenceState;
 use crate::weight_loader::glm5::Glm5MtpModule;
 use crate::weight_map::DenseWeight;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use parking_lot::Mutex;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelArg, KernelHandle, mock::MockGpuBackend};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
@@ -19,12 +19,12 @@ use std::sync::{
 #[path = "glm_c2_verdict_test_numerics.rs"]
 mod numerics;
 use numerics::Body;
-pub(super) const DEFAULT: u64 = 7;
-pub(super) const CALLER: u64 = 37;
-pub(super) const ROW_BYTES: usize = 8192;
-pub(super) const SLAB_BYTES: usize = 98_304;
+pub(crate) const DEFAULT: u64 = 7;
+pub(crate) const CALLER: u64 = 37;
+pub(crate) const ROW_BYTES: usize = 8192;
+pub(crate) const SLAB_BYTES: usize = 98_304;
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Event {
+pub(crate) enum Event {
     Alloc(DevicePtr, usize),
     Free(DevicePtr),
     Copy(DevicePtr, DevicePtr, usize, u64),
@@ -46,7 +46,7 @@ pub(super) enum Event {
     Kv(Vec<i64>, u64),
 }
 #[derive(Default)]
-pub(super) struct Recorder {
+pub(crate) struct Recorder {
     inner: MockGpuBackend,
     events: Mutex<Vec<Event>>,
     live: Mutex<HashMap<u64, usize>>,
@@ -86,6 +86,22 @@ impl Recorder {
         let mut result = vec![0; bytes];
         self.inner.copy_d2h(ptr, &mut result).unwrap();
         result
+    }
+    pub fn read_live_span(&self, ptr: DevicePtr, bytes: usize) -> Result<Vec<u8>> {
+        let end = ptr
+            .0
+            .checked_add(bytes as u64)
+            .context("snapshot span overflow")?;
+        ensure!(
+            self.live.lock().iter().any(|(base, size)| {
+                *base <= ptr.0
+                    && base
+                        .checked_add(*size as u64)
+                        .is_some_and(|limit| end <= limit)
+            }),
+            "snapshot backing was released or is out of bounds"
+        );
+        Ok(self.read_span(ptr, bytes))
     }
     pub fn write_span(&self, ptr: DevicePtr, bytes: &[u8]) {
         self.inner.copy_h2d(bytes, ptr).unwrap();
@@ -372,7 +388,7 @@ macro_rules! rank_comm {
 rank_comm! { all_reduce(u64, usize);
 reduce_scatter(u64, u64, usize); broadcast(u64, usize, usize); barrier();
 send_to(u64, usize, usize, u64); recv_from(u64, usize, usize, u64) }
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     pub model: TransformerModel,
     pub seqs: [SequenceState; 2],
     pub head: Arc<Glm5MtpHead>,

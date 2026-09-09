@@ -12,8 +12,7 @@ mod decode_fault_tests;
 mod eager_bootstrap_error_tests;
 #[path = "glm_c2_f1_ownership_tests.rs"]
 mod f1_ownership_tests;
-#[path = "glm_c2_handoff_test_fixture.rs"]
-mod fixture;
+use super::glm_c2_test_support::fixture;
 #[path = "glm_c2_legacy_boundary_tests.rs"]
 mod legacy_boundary_tests;
 #[path = "glm_c2_predispatch_tests.rs"]

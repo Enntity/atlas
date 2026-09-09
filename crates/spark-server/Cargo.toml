@@ -100,6 +100,7 @@ tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
 base64 = "0.22"
 
 [dev-dependencies]
+spark-model = { path = "../spark-model", default-features = false, features = ["glm-c2-test-utils"] }
 tempfile = "3"
 spark-runtime = { path = "../spark-runtime", default-features = false, features = ["test-utils"] }
 

@@ -32,6 +32,8 @@ metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 # driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
 # CI runner). Build on a real GPU host with `--features gpu-examples`.
 gpu-examples = []
+# Explicit dependency-test seam; no native/default recipe enables it.
+glm-c2-test-utils = ["spark-runtime/test-utils"]
 
 [dependencies]
 atlas-core = { workspace = true }

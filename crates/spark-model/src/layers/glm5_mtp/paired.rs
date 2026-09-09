@@ -2,6 +2,9 @@
 //! Explicit staged paired-head construction; no factory/admission caller.
 use super::*;
 use anyhow::{Context, ensure};
+#[cfg(any(test, feature = "glm-c2-test-utils"))]
+#[path = "paired_test_inspection.rs"]
+mod inspection;
 
 pub(super) const ROW_BYTES: usize = 8192;
 pub(super) const SLOT_BYTES: usize = 6 * ROW_BYTES;

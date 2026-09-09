@@ -29,6 +29,10 @@ pub(crate) mod drop;
 mod glm_c2_handoff;
 mod glm_c2_sequence_allocation;
 mod glm_c2_sequence_ownership;
+#[cfg(feature = "glm-c2-test-utils")]
+pub mod glm_c2_test_support;
+#[cfg(all(test, not(feature = "glm-c2-test-utils")))]
+mod glm_c2_test_support;
 pub mod glm_c4;
 pub(crate) mod glm_cache_plan;
 pub(crate) mod glm_mtp_prompt_trace;

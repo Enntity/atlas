@@ -36,6 +36,8 @@ mod logprobs;
 mod mod_helpers;
 pub use mod_helpers::capture_runtime_handle;
 pub mod dumps;
+#[cfg(test)]
+mod glm_c2_fixture_tests;
 pub mod levers;
 pub mod limits;
 mod mtp_accept_debug;
