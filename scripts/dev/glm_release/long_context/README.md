@@ -12,8 +12,13 @@ These are portable counterparts of the retained release-context campaign's
 `long-context-runner.py`, `long_context_profile.py`, `long_context_node.py`,
 `release-context-quality.py`, `release-context-boundaries.py`,
 `release-context-suite.py`, and `long_context_dry_tests.py`. The node helper,
-quality validators, boundary client and suite are copied literally; their
-recorded source hashes are in `provenance.json`. Runner/profile changes only
+quality validators and suite are copied literally; their recorded source hashes
+are in `provenance.json`. The boundary client has one documented adaptation:
+`answers()` now uses the same real-chat helper, empty tools, thinking budget16,
+cap128 and one-token calibration instead of a bare completion capped at32.
+The original8K repetition/length failure is retained in provenance. Exact
+answer/stop validation, raw context400 and cancellation SSE checks are unchanged;
+the corrected client still requires fresh native qualification. Runner/profile changes only
 replace workstation configuration with explicit input and carry the numerical
 switch below. The source and configuration must be frozen together.
 

@@ -2,7 +2,8 @@
 
 Deadline: September 10, 02:42 UTC. The first merged C8 native engine source is
 `a6cfeec0`, merged with upstream `6c5f17dab9c27ee2396aef1ac2501a17b201c715`.
-Latest release source freeze is `c853bafa`; its native qualification is pending.
+Latest tested release source is `c853bafa`; bounded native results below include
+quality passes and retained failures, not a complete release qualification.
 Portable C8 harness
 and its followup-envelope correction are `708db27c` and `440526f2`.
 
@@ -180,7 +181,7 @@ Evidence: `longctx-22b56144-4096-on-chat-summary.json` and
 the C1 timings, `http-0167.json` the AURORA failure and `http-0168.json` the
 successful NEBULA call. OFF timing receipts use the same names in the OFF run.
 
-## Latest source corrections awaiting native validation
+## Latest engine source corrections
 
 - `20c73e42` caps the issued initial chunk at the configured1024 tokens for
   the opt-in ordinary GLM sparse profile, including idle admission. The
@@ -203,6 +204,50 @@ Templates load from the process working directory, not from the server ELF;
 ELF-only image overlays therefore do not update these assets. The corrected
 GLM template is SHA256
 `d921f36103aa17db5fbf5891e4f7fe55a9080db450d7b8fb5c9833237c31bd16`.
-The next image must carry and verify the current runtime templates separately.
-Neither CPU fix has yet established a native quality PASS or a maximum safe
-context. The failed OFF and ON receipts remain retained.
+Images must carry and verify the current runtime templates separately. The
+bounded new-image results below do not establish a maximum safe context or a
+complete release PASS. The earlier failed OFF and ON receipts remain retained.
+
+## c853bafa 4K: C1 passes, C2 exact-format failure
+
+The fresh `c853bafa` ordinary4K run used paged-prefill BF16 GEMM **ON**.
+All six C1 quality waves passed, followed by the C2 early-needle wave. The
+subsequent C2 needle response contained the correct AURORA value but added
+brackets, failing the unchanged exact-answer validator. Correct retrieval
+content with extra formatting is not a PASS. No later quality waves or
+boundary/cancellation supplement were issued after this failure.
+
+Both containers exited0, OOM=false, with swap0. Minimum sampled MemAvailable
+was10,173,260/10,723,440 KiB (head/worker). Clean shutdown does not erase the
+failed campaign. Evidence: `longctx-c853bafa-4096-on-chat-summary.json` and
+`longctx-c853bafa-4096-on-chat-run/quality-receipts/quality/`.
+
+## c853bafa 8K: C1 quality passes, reuse-answer supplement fails
+
+The fresh ordinary8K ON run tested **C1 only**. All six main quality waves
+passed: early/middle/late needles, linked facts, structured tool call, and
+actual-call-ID tool-result followup. That quality child completed in228.86s;
+this is total phase elapsed time including preparation/calibration, not a
+throughput or per-request latency result. It does not qualify8K C2–C4.
+
+The boundary supplement then passed exact HTTP400 checks at8192/8193 input
+tokens and observed actual streamed text plus response ID before client close.
+The next reuse-answer probe failed: its bare `/v1/completions` prompt produced
+`153`, then repeated prompt/answer text until its32-token cap with
+`finish_reason=length`. The strict integer/normal-stop validator correctly
+rejected it. Subsequent reuse-tool checks were not issued. This is a retained
+boundary-suite failure, not proof of a server cancellation bug or completed
+GPU reclamation.
+
+Both containers exited0, OOM=false, swap0; minimum sampled MemAvailable was
+10,149,920/10,721,620 KiB. Evidence: `longctx-c853bafa-8192-on-chat-summary.json`
+and its run's `quality-receipts/boundaries/http-0009.json` (receipt SHA256
+`c8678b80fe9f065b30fe8c7cc5629e024567d9f28623ba89e3e897c41f468c6c`).
+
+Harness correction `0b80ab90` changes only reuse-answer framing to the main
+quality helper's real chat request: empty tools, explicit thinking budget16,
+cap128, and one-token chat calibration for exact input counting. The integer,
+normal-stop and peer-leakage validators are unchanged; raw context400 and
+cancellation SSE probes remain unchanged. This is an input-contract correction,
+not a server cancellation fix. Fresh native qualification of the corrected
+boundary client is pending; neither prior failure is relabeled as a pass.
