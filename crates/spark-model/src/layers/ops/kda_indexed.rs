@@ -19,7 +19,7 @@ pub struct KdaIndexedShape {
 
 impl KdaIndexedShape {
     pub fn select(rows: usize, heads: usize, dim: usize, conv_width: usize) -> Option<Self> {
-        (matches!(rows, 2..=4) && heads == 32 && dim == 128 && conv_width == 4)
+        (matches!(rows, 2..=8) && heads == 32 && dim == 128 && conv_width == 4)
             .then_some(Self { rows: rows as u32 })
     }
     fn grid(self, recurrent: bool) -> [u32; 3] {

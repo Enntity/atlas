@@ -95,7 +95,7 @@ impl Qwen3AttentionLayer {
         // its large stateless projections. Cache mutation and attention stay
         // on the proven sequence-private path; other MLA variants retain the
         // fully conservative implementation below.
-        if self.glm_mla_multi_seq_eligible(c, mla) {
+        if self.glm_mla_multi_seq_eligible(c, mla)? {
             return self.ms_glm_mla_decode(c, kv_cache, meta, mla, o_out);
         }
 

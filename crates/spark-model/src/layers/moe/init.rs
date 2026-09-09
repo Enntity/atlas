@@ -73,7 +73,7 @@ impl MoeLayer {
 
         let _ = num_experts;
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
-        Ok(Self {
+        let mut layer = Self {
             weights,
             btile_storage: super::gate_up_repack::Storage::Legacy,
             // Default: standard NVFP4 (FP8-E4M3 per-16 + f32 global). The
@@ -594,6 +594,12 @@ impl MoeLayer {
                 "moe_topk_sig",
                 "moe_topk_sigmoid_batched",
             ),
-        })
+        };
+        if crate::model::glm_independent::enabled(&config.model_type)? {
+            layer.nvfp4_prequant_moe = true;
+            layer.nvfp4_fused_silu_quant = true;
+            layer.validate_independent_handles()?;
+        }
+        Ok(layer)
     }
 }

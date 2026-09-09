@@ -59,6 +59,13 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let n = tokens.len();
+        self.validate_independent_decode(tokens, seqs)?;
+        if crate::model::glm_independent::enabled(&self.config.model_type)? {
+            anyhow::ensure!(
+                self.comm.as_ref().is_some_and(|c| c.rank() == 0),
+                "independent decode sender requires head rank0"
+            );
+        }
         assert_eq!(n, seqs.len(), "tokens.len() must equal seqs.len()");
         // ATLAS_SSM_H_FP16: narrow this sequence's SSM h-state to FP16 exactly
         // once, HERE — outside the CUDA-graph region. No-op without the flag.
@@ -178,7 +185,10 @@ impl TransformerModel {
         _stream: u64,
     ) -> Result<DevicePtr> {
         let n = tokens.len();
+        self.validate_independent_decode(tokens, seqs)?;
+        let independent_lane = crate::model::glm_independent::enabled(&self.config.model_type)?;
         let c4_lane = self.config.model_type == "glm5_next"
+            && !independent_lane
             && (n == 4 || crate::model::glm_c4::enabled(&self.config.model_type));
         if c4_lane {
             crate::model::glm_c4::validate_runtime(
@@ -301,7 +311,7 @@ impl TransformerModel {
 
         // Lock order: kv_cache BEFORE the graph cache, matching verify_e.
         let mut kv_cache = self.kv_cache.lock();
-        if c4_lane {
+        if c4_lane || independent_lane {
             use spark_runtime::kv_cache::{KvCacheDtype, SparseIndexCacheDtype};
             anyhow::ensure!(
                 kv_cache.dtype() == KvCacheDtype::Bf16

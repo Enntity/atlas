@@ -1,7 +1,7 @@
 # Independent GLM C2–C8 host dispatch
 
-2026-09-09. Root approved implementation of A and B; both are in progress.
-Server admission C remains root-owned and is not implemented or native-qualified.
+2026-09-09. A/B model integration and root-owned server admission C are
+implemented, source-reviewed and CPU-qualified, not native-qualified.
 This is nonspeculative concurrent decode, not temporal K5 or paired MTP.
 Root owns native, deployment, watchdog, health checks and commits.
 
@@ -80,6 +80,46 @@ eager, followed by explicit warmed graph qualification, not silent graph bypass.
   No sparse MLA changes. Author A owns policy/FFN APIs; B alone edits these callers.
 
 ### C — server admission (root-assigned last integration slice)
+
+Root implementation gate: introduce a preparation seam used by serve, capture
+an actual C8 admission RED there, then resolve selected topology once before
+reserve. Carry the selected `PrefillBudget` in the reserve result to construction;
+size its actual rows with `BufferSizes`, clamp GDN rows exactly as construction
+does, and count active+1 live FP32 state blobs (snapshots still active only).
+Focused subprocess tests cover both ranks, caps2..8, override rows, OFF parity,
+invalid profiles and insufficient free memory. No GPU allocation in these tests.
+
+Executed C gate: actual C8 startup preparation first refused at the legacy
+concurrency guard (`server-preflight-red-2.log`; the earlier attempt only caught
+a fixture CLI typo and is not behavioral RED). The implemented preparation
+and existing preflight regressions pass11/11 in0.18s at final source
+(`server-preflight-final-green.log`). Selected admission/profile validation also
+precedes the actual backend initializer; allocation/free-memory checks follow
+initialization. The exact production seam tests this ordering. Both ranks/caps2..8 use
+local32-head shapes, actual1024+cap rows and active+1 live state blobs. A valid
+4096-row override is reserved/carried, with GDN rows clamped to2048; huge row
+and snapshot counts refuse safely. Malformed/too-small overrides retain the
+existing resolver's fallback, not a new strict-parsing claim. OFF C4 remains
+8327.5MiB inference reserve before its original late sharding. Selected corrected
+inference reserve is4494.282MiB C4 and7171.939MiB C8, plus the actual arena.
+Receipts are in the controller campaign `20260909/glm-independent-c2-c8`.
+Launcher support is committed separately as `cbe646d4`; it requires explicit
+`GLM_INDEPENDENT_DECODE=1` and `GLM_K5_HC_CUBLAS=0`, and sends the selected flag
+to both ranks. No selected native model has been launched or timed yet.
+
+A/B closure: actual FFN/KDA dispatch covers all2..8 widths and both ranks;
+the actual model/worker E0 transport drains8→7→6→5→4→3→2→1 with physical slot7
+preserved. This exposed and corrected two remaining four-row metadata ceilings.
+The transport fixture uses a sentinel target body, so it proves packet/slot
+ownership rather than native attention numerics. Missing semantic index fails
+before wire/upload while preserving outer AbortCapture cleanup. Independent
+review closed real FP8/MMQ/CUTLASS flag exclusions, early semantic-index checks
+and a missing mandatory compact kernel handle. A25/B9 source manifests and
+focused raw receipts are retained in the same campaign. No full-suite claim.
+Quality clients now support allC1..8 with distinct visible answers, named tools
+and eight independent needles (`5a4cc116`), keeping original defaults and strict
+validators. CPU HTTP stubs verify request/wave dispatch, not native quality.
+Use `/usr/bin/python3` for NIAH: this controller's other Python lacks requests.
 
 - Preflight ordering audit found raw, unsharded head counts are used for reserve
   before `resolve_topology` halves them for TP2. At the same1024-row envelope,

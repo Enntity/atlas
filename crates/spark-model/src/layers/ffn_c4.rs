@@ -6,6 +6,30 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
 
 impl FfnComponent {
+    pub fn forward_independent(
+        &self,
+        input: DevicePtr,
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        ensure!(
+            crate::model::glm_independent::selected(ctx, rows)?,
+            "independent FFN requires actual indexed independent rows"
+        );
+        match self {
+            Self::Moe(m) => m.forward_independent(input, rows, ctx, stream),
+            Self::Dense(d) if d.can_forward_km(rows as u32) => {
+                d.forward_km(input, rows as u32, ctx, stream)?;
+                Ok(ctx.buffers.moe_output())
+            }
+            Self::Dense(d) => {
+                d.forward_prefill(input, rows, ctx, stream)?;
+                Ok(ctx.buffers.moe_output())
+            }
+            Self::None => Ok(input),
+        }
+    }
     /// None leaves the caller's exact scalar path intact, including dense layers.
     pub(crate) fn try_forward_c2_compact(
         &self,

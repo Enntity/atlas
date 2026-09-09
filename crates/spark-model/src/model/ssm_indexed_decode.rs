@@ -22,13 +22,25 @@ pub(crate) fn runtime_eligible(
     rows: usize,
     padded_rows: usize,
 ) -> bool {
+    runtime_eligible_up_to(config, world, independent, enabled, rows, padded_rows, 4)
+}
+
+fn runtime_eligible_up_to(
+    config: &ModelConfig,
+    world: usize,
+    independent: bool,
+    enabled: bool,
+    rows: usize,
+    padded_rows: usize,
+    max_rows: usize,
+) -> bool {
     enabled
         && independent
         && config.model_type == "glm5_next"
         && world == 2
         && config.tp_world_size == 2
         && config.ep_world_size == 2
-        && (2..=4).contains(&rows)
+        && (2..=max_rows).contains(&rows)
         && padded_rows == rows
         && config.linear_num_key_heads == 32
         && config.linear_num_value_heads == 32
@@ -47,14 +59,27 @@ pub(crate) fn prepare_runtime<'a>(
     padded_rows: usize,
     stream: u64,
 ) -> Result<Option<SsmBatchView<'a>>> {
-    if !runtime_eligible(
-        &model.config,
-        model.comm.as_ref().map_or(0, |c| c.world_size()),
-        model.proposer.is_none() && !model.self_speculative,
-        std::env::var("ATLAS_GLM_KDA_MULTI_SEQ").as_deref() == Ok("1"),
-        rows,
-        padded_rows,
-    ) {
+    let independent_mode = super::glm_independent::enabled(&model.config.model_type)?;
+    let selected_scope = independent_mode
+        && runtime_eligible_up_to(
+            &model.config,
+            model.comm.as_ref().map_or(0, |c| c.world_size()),
+            model.proposer.is_none() && !model.self_speculative,
+            true,
+            rows,
+            padded_rows,
+            8,
+        );
+    if !selected_scope
+        && !runtime_eligible(
+            &model.config,
+            model.comm.as_ref().map_or(0, |c| c.world_size()),
+            model.proposer.is_none() && !model.self_speculative,
+            std::env::var("ATLAS_GLM_KDA_MULTI_SEQ").as_deref() == Ok("1"),
+            rows,
+            padded_rows,
+        )
+    {
         return Ok(None);
     }
     ensure!(
@@ -166,8 +191,8 @@ fn prepare_rows<'a>(
     layout: DecodeMetaLayout,
 ) -> Result<PreparedSsmBatch<'a>> {
     ensure!(
-        (1..=4).contains(&rows.len()),
-        "indexed SSM supports one to four rows"
+        (1..=8).contains(&rows.len()),
+        "indexed SSM supports one to eight rows"
     );
     ensure!(
         layer_types
@@ -225,7 +250,7 @@ fn slot_upload(
         "unsupported SSM metadata row capacity"
     );
     ensure!(
-        (1..=4).contains(&ids.len()) && ids.len() <= layout.rows(),
+        (1..=8).contains(&ids.len()) && ids.len() <= layout.rows(),
         "invalid active SSM row count"
     );
     checked_span(metadata_base, metadata_bytes)?;

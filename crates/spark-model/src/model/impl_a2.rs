@@ -746,6 +746,14 @@ impl TransformerModel {
     /// payload from a buggy head fails before touching slot state.
     fn ep_worker_decode_batch(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let n = self.ep_broadcast_u32(0)? as usize;
+        if super::glm_independent::enabled(&self.config.model_type)? {
+            anyhow::ensure!(
+                (2..=8).contains(&n)
+                    && n <= slots.len()
+                    && n <= self.levers.max_decode_seqs as usize,
+                "independent E0 width exceeds actual worker slots"
+            );
+        }
         let seq_ids = self.ep_broadcast_tokens(&vec![0u32; n])?;
         let tokens = self.ep_broadcast_tokens(&vec![0u32; n])?;
 

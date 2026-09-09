@@ -8,7 +8,9 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+mod independent;
 mod ssm_h_fp16;
+pub(crate) use independent::prepare_reserve;
 use ssm_h_fp16::ssm_h_fp16_preconditions;
 
 pub(crate) struct ReservePreflight {
@@ -17,6 +19,7 @@ pub(crate) struct ReservePreflight {
     pub(crate) gdn_two_phase_bytes: usize,
     pub(crate) ssm_prefill_chunk: usize,
     pub(crate) max_batch_tokens_pre: usize,
+    pub(crate) resolved_prefill: Option<super::PrefillBudget>,
 }
 
 fn glm5_dual_spark_parallelism(world: usize, tp: usize, ep: usize) -> bool {
@@ -74,6 +77,7 @@ pub(crate) fn preflight_reserve(
     config: &ModelConfig,
     free_mem: usize,
 ) -> Result<ReservePreflight> {
+    let independent = spark_model::model::glm_independent::enabled(&config.model_type)?;
     if spark_model::speculative::glm_repair_policy::parse(
         std::env::var("ATLAS_GLM_MTP_REPAIR").ok().as_deref(),
     )? {
@@ -127,10 +131,10 @@ pub(crate) fn preflight_reserve(
         let ep_v2 = matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"));
         let c4 = spark_model::model::glm_c4::enabled(&config.model_type);
         anyhow::ensure!(
-            std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() != Ok("1") || c4,
+            independent || std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() != Ok("1") || c4,
             "ATLAS_GLM_C4_GROUPED_MOE=1 requires ATLAS_GLM_C4_DECODE=1"
         );
-        if c4 || c4_sparse || args.max_batch_size == 4 {
+        if !independent && (c4 || c4_sparse || args.max_batch_size == 4) {
             spark_model::model::glm_c4::validate_prefill_budget(
                 args.max_prefill_tokens,
                 c4_sparse,
@@ -155,7 +159,8 @@ pub(crate) fn preflight_reserve(
             )?;
         }
         anyhow::ensure!(
-            glm5_concurrency_supported(args.max_batch_size, args.max_num_seqs, ep_v2, c4),
+            independent
+                || glm5_concurrency_supported(args.max_batch_size, args.max_num_seqs, ep_v2, c4),
             "GLM-5 dual-Spark concurrency supports --max-batch-size 1..=3 and \
              --max-num-seqs max_batch..=5, or explicitly opted-in C4 with active/admitted4; \
              batches above one require ATLAS_EP_PROTOCOL=v2"
@@ -192,7 +197,7 @@ pub(crate) fn preflight_reserve(
             );
         }
         anyhow::ensure!(
-            glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size),
+            independent || glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size),
             "GLM-5 dual-Spark support requires --world-size 2 --ep-size 2 and either --tp-size 1 (EP fallback) or --tp-size 2 (overlapping TP+EP)"
         );
     }
@@ -226,8 +231,11 @@ pub(crate) fn preflight_reserve(
         h_state_bytes,
         spark_model::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
     );
+    // Selected FP32/nonspec pools allocate one additional live dummy slot.
+    // It has no prefix/rollback snapshots; do not inflate those counts.
+    let live_slots = args.max_batch_size + usize::from(independent);
     let ssm_pool_bytes = spark_model::ssm_reserve::ssm_pool_reserve_bytes(
-        args.max_batch_size,
+        live_slots,
         config.num_ssm_layers() * h_state_bytes,
         config.num_ssm_layers() * conv_state_bytes,
         spec_on_pool,
@@ -298,9 +306,21 @@ pub(crate) fn preflight_reserve(
     // Issue #15 auto-clamp removed (2026-07-02): snapshot reachability is
     // handled by the tail-checkpoint split in `prefill_chunk_dispatch`, so
     // the budget (and this arena-sizing mirror) stays at full chunk size.
-    let max_batch_tokens_pre = prefill_budget_pre
-        .max(spec_tokens_pre)
-        .max(args.max_batch_size);
+    let resolved_prefill =
+        independent.then(|| super::resolve_prefill_budget(args, ssm_prefill_chunk));
+    let max_batch_tokens_pre = resolved_prefill.as_ref().map_or_else(
+        || {
+            prefill_budget_pre
+                .max(spec_tokens_pre)
+                .max(args.max_batch_size)
+        },
+        |budget| budget.max_batch_tokens,
+    );
+    // The selected envelope is bounded before BufferSizes' unchecked products.
+    anyhow::ensure!(
+        !independent || max_batch_tokens_pre <= 65535,
+        "independent arena rows exceed the CUDA grid limit"
+    );
     let buffer_arena_bytes = spark_runtime::buffers::BufferSizes::from_config(
         config,
         max_batch_tokens_pre,
@@ -338,9 +358,17 @@ pub(crate) fn preflight_reserve(
         )
         .slots
     };
-    let ssm_snapshot_bytes = (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
-        * config.num_ssm_layers()
-        * (h_state_bytes + conv_state_bytes);
+    let ssm_snapshot_bytes = if independent {
+        args.ssm_cache_slots
+            .checked_add(decode_ring_slots * args.max_batch_size)
+            .and_then(|n| n.checked_mul(config.num_ssm_layers()))
+            .and_then(|n| n.checked_mul(h_state_bytes + conv_state_bytes))
+            .context("independent snapshot reserve overflow")?
+    } else {
+        (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
+            * config.num_ssm_layers()
+            * (h_state_bytes + conv_state_bytes)
+    };
     let cuda_headroom: usize =
         if args.speculative || args.self_speculative || args.ngram_speculative {
             4 * 1024 * 1024 * 1024
@@ -353,19 +381,43 @@ pub(crate) fn preflight_reserve(
         let nv = config.linear_num_value_heads;
         let conv_dim = key_dim * 2 + value_dim;
         if conv_dim > 0 && config.num_ssm_layers() > 0 {
-            let sl = max_batch_tokens_pre;
+            let sl = if independent {
+                max_batch_tokens_pre.min(args.max_seq_len)
+            } else {
+                max_batch_tokens_pre
+            };
             sl * conv_dim * 2 + sl * nv * 2 * 4 + sl * value_dim * 2 + sl * value_dim * 2
         } else {
             0
         }
     };
-    let inference_reserve: usize = ssm_pool_bytes
-        + ssm_h_stage_bytes
-        + ssm_replay_ring
-        + ssm_snapshot_bytes
-        + gdn_two_phase_bytes
-        + cuda_headroom;
-    let total_reserve = inference_reserve + buffer_arena_bytes;
+    let inference_reserve: usize = if independent {
+        [
+            ssm_pool_bytes,
+            ssm_h_stage_bytes,
+            ssm_replay_ring,
+            ssm_snapshot_bytes,
+            gdn_two_phase_bytes,
+            cuda_headroom,
+        ]
+        .into_iter()
+        .try_fold(0usize, |sum, bytes| sum.checked_add(bytes))
+        .context("independent inference reserve overflow")?
+    } else {
+        ssm_pool_bytes
+            + ssm_h_stage_bytes
+            + ssm_replay_ring
+            + ssm_snapshot_bytes
+            + gdn_two_phase_bytes
+            + cuda_headroom
+    };
+    let total_reserve = if independent {
+        inference_reserve
+            .checked_add(buffer_arena_bytes)
+            .context("independent total reserve overflow")?
+    } else {
+        inference_reserve + buffer_arena_bytes
+    };
     if total_reserve > free_mem {
         let need_gb = total_reserve as f64 / (1024.0 * 1024.0 * 1024.0);
         let free_gb = free_mem as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -426,7 +478,7 @@ pub(crate) fn preflight_reserve(
          cuda_headroom={} MB ({}), \
          spec_on={}, num_drafts={}",
         ssm_pool_bytes / (1024 * 1024),
-        args.max_batch_size,
+        live_slots,
         if spec_on_pool { mtp_state_slots } else { 0 },
         if spec_on_pool {
             args.resolved_num_drafts() + 2
@@ -453,6 +505,7 @@ pub(crate) fn preflight_reserve(
         gdn_two_phase_bytes,
         ssm_prefill_chunk,
         max_batch_tokens_pre,
+        resolved_prefill,
     })
 }
 

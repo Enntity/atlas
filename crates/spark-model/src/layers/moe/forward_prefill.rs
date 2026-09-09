@@ -227,6 +227,8 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
+        } else if self.independent_grouped(ctx, n) {
+            self.independent_router_logits(router_in, gate_logits, n as usize, ctx, stream)?;
         } else if self.glm_c3_grouped(ctx, n) {
             // Preserve forward_k3's router logits and expert weights exactly;
             // the experiment changes routed activation precision, not routing.

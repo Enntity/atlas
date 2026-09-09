@@ -22,7 +22,7 @@ fn independent_moe_arenas(
     sizes: &BufferSizes,
     rows: usize,
 ) -> Result<[(&'static str, usize, usize); 12]> {
-    anyhow::ensure!(matches!(rows, 2 | 4), "independent MoE rows must be 2 or 4");
+    anyhow::ensure!((2..=8).contains(&rows), "independent MoE rows must be 2..8");
     let bytes = |factors: &[usize]| -> Result<usize> {
         factors.iter().try_fold(1usize, |n, &factor| {
             n.checked_mul(factor)
@@ -203,7 +203,23 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let kernel = self.w4a16_batchm.kernel(4);
+        self.independent_shared_batchm(input, gate_out, up_out, down_out, 4, h, inter, ctx, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn independent_shared_batchm(
+        &self,
+        input: DevicePtr,
+        gate_out: DevicePtr,
+        up_out: DevicePtr,
+        down_out: DevicePtr,
+        rows: u32,
+        h: u32,
+        inter: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let kernel = self.w4a16_batchm.kernel(rows);
         anyhow::ensure!(
             kernel.0 != 0,
             "C4 shared expert exact-M4 GEMV is unavailable"
@@ -212,7 +228,9 @@ impl MoeLayer {
             (&self.weights.shared_expert.gate_proj, gate_out),
             (&self.weights.shared_expert.up_proj, up_out),
         ] {
-            ops::w4a16_gemv_batchm(ctx.gpu, kernel, input, weight, output, 4, inter, h, stream)?;
+            ops::w4a16_gemv_batchm(
+                ctx.gpu, kernel, input, weight, output, rows, inter, h, stream,
+            )?;
         }
         ops::silu_mul(
             ctx.gpu,
@@ -220,7 +238,7 @@ impl MoeLayer {
             gate_out,
             up_out,
             gate_out,
-            4 * inter,
+            rows * inter,
             stream,
         )?;
         ops::w4a16_gemv_batchm(
@@ -229,7 +247,7 @@ impl MoeLayer {
             gate_out,
             &self.weights.shared_expert.down_proj,
             down_out,
-            4,
+            rows,
             h,
             inter,
             stream,

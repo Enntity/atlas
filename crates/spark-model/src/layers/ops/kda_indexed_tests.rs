@@ -211,10 +211,10 @@ fn both_core_operations_are_validated_before_any_state_update() {
 
 #[test]
 fn exact_geometry_selects_only_independent_supported_widths() {
-    for rows in 0..=5 {
+    for rows in 0..=9 {
         assert_eq!(
             KdaIndexedShape::select(rows, 32, 128, 4).is_some(),
-            (2..=4).contains(&rows)
+            (2..=8).contains(&rows)
         );
     }
     for (heads, dim, width) in [

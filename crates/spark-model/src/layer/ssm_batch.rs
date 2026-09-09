@@ -132,8 +132,8 @@ pub struct SsmBatchView<'a> {
 impl<'a> SsmBatchView<'a> {
     pub(crate) fn new(pool: SsmPoolView<'a>, slots: DevicePtr, host_slots: &[i32]) -> Result<Self> {
         ensure!(
-            (1..=4).contains(&host_slots.len()),
-            "indexed SSM supports one to four independent rows"
+            (1..=8).contains(&host_slots.len()),
+            "indexed SSM supports one to eight independent rows"
         );
         pool.validate_disjoint(slots, host_slots.len() * 4)?;
         for (row, &slot) in host_slots.iter().enumerate() {
@@ -262,7 +262,16 @@ mod tests {
     fn malformed_present_pools_and_live_ids_are_errors() {
         let h = [DevicePtr(0x1000)];
         let c = [DevicePtr(0x3000)];
-        for ids in [vec![], vec![-1], vec![8], vec![0, 0], vec![0, 1, 2, 3, 4]] {
+        assert!(
+            SsmBatchView::new(pool(&h, &c), DevicePtr(0x9000), &[7, 0, 6, 1, 5, 2, 4, 3]).is_ok()
+        );
+        for ids in [
+            vec![],
+            vec![-1],
+            vec![8],
+            vec![0, 0],
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 0],
+        ] {
             assert!(SsmBatchView::new(pool(&h, &c), DevicePtr(0x9000), &ids).is_err());
         }
         for ptr in [DevicePtr::NULL, DevicePtr(3), DevicePtr(u64::MAX - 3)] {

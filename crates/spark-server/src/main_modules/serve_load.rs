@@ -366,16 +366,19 @@ pub(crate) fn load_model(
     // `args.num_drafts` is Some and `args.resolved_num_drafts()` is valid.
     serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);
 
-    let (gpu, free_mem) = serve_phases::init_gpu_backend(&args, &ptx_set)?;
-
     // ── Pre-load reserve preflight ──
+    let (gpu, free_mem, prepared_topology, reserve) =
+        serve_phases::prepare_reserve(&args, &mut config, || {
+            serve_phases::init_gpu_backend(&args, &ptx_set)
+        })?;
     let serve_phases::ReservePreflight {
         inference_reserve,
         buffer_arena_bytes,
         gdn_two_phase_bytes,
         ssm_prefill_chunk,
         max_batch_tokens_pre,
-    } = serve_phases::preflight_reserve(&args, &config, free_mem)?;
+        resolved_prefill,
+    } = reserve;
     let total_reserve = inference_reserve + buffer_arena_bytes;
 
     // 2a-2. OOM watchdog: background async task that polls GPU memory every 2s.
@@ -401,10 +404,14 @@ pub(crate) fn load_model(
         ep_size,
         tp_rank: _tp_rank,
         ep_rank,
-    } = serve_phases::resolve_topology(&args, &mut config)?;
+    } = match prepared_topology {
+        Some(topology) => topology,
+        None => serve_phases::resolve_topology(&args, &mut config)?,
+    };
     // Resolve once before weight loading, so the bounded shared-cache lane
     // rejects unsupported chunks/adapters before allocating model weights.
-    let resolved_prefill = serve_phases::resolve_prefill_budget(&args, ssm_prefill_chunk);
+    let resolved_prefill = resolved_prefill
+        .unwrap_or_else(|| serve_phases::resolve_prefill_budget(&args, ssm_prefill_chunk));
     spark_model::layers::moe::validate_shared_fp8_cache_profile(
         &config,
         resolved_prefill.prefill_budget,

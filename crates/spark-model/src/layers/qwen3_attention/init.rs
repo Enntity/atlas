@@ -16,6 +16,9 @@ use crate::layers::FfnComponent;
 use crate::layers::fp8_calibration::Fp8KvCalibration;
 use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
 
+#[path = "init_independent.rs"]
+mod independent;
+
 impl Qwen3AttentionLayer {
     pub fn new(
         input_norm: DenseWeight,
@@ -95,6 +98,7 @@ impl Qwen3AttentionLayer {
         fp8_calibration_tokens: usize,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<Self> {
+        let independent = crate::model::glm_independent::enabled(&config.model_type)?;
         let (reshape_mod, reshape_fn, decode_mod, decode_fn) =
             super::init_kernel_dispatch::kernel_modules_for_dtype(kv_dtype, config.head_dim);
         let mla_decode_mod = super::init_kernel_dispatch::mla_bf16_module(
@@ -144,7 +148,7 @@ impl Qwen3AttentionLayer {
         } else {
             "glm_index_logits_bf16_row8"
         };
-        Ok(Self {
+        let layer = Self {
             input_norm,
             attn,
             post_attn_norm,
@@ -442,6 +446,24 @@ impl Qwen3AttentionLayer {
                 gpu,
                 "mla_absorbed",
                 "mla_batched_gemv_batch5",
+            ),
+            mla_batched_gemv_batch6_k: gate(
+                independent,
+                gpu,
+                "mla_absorbed",
+                "mla_batched_gemv_batch6",
+            ),
+            mla_batched_gemv_batch7_k: gate(
+                independent,
+                gpu,
+                "mla_absorbed",
+                "mla_batched_gemv_batch7",
+            ),
+            mla_batched_gemv_batch8_k: gate(
+                independent,
+                gpu,
+                "mla_absorbed",
+                "mla_batched_gemv_batch8",
             ),
             mla_q_rope_scatter_k: gate(probes.mla, gpu, "mla_absorbed", "mla_q_rope_scatter"),
             mla_q_rope_writeback_k: gate(probes.mla, gpu, "mla_absorbed", "mla_q_rope_writeback"),
@@ -842,6 +864,10 @@ impl Qwen3AttentionLayer {
             } else {
                 None
             },
-        })
+        };
+        if independent {
+            layer.validate_independent_kernels()?;
+        }
+        Ok(layer)
     }
 }

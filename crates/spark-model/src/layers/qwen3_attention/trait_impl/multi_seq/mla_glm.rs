@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! GLM-5 zero-RoPE MLA decode for two to five independent rows.
+//! GLM-5 zero-RoPE MLA decode, including selected independent rows 2..8.
 //!
 //! The generic absorbed-MLA implementation is deliberately per-sequence to
 //! accommodate several architectures. GLM-5 has a simpler fixed shape: no
@@ -74,11 +74,18 @@ mod batch4_tests {
 }
 
 impl Qwen3AttentionLayer {
-    pub(super) fn glm_mla_multi_seq_eligible(&self, c: &MultiSeqCtx<'_>, mla: &MlaWeights) -> bool {
-        (enabled() || glm_multi_seq_sparse_enabled(&c.fwd.config.model_type))
-            && (2..=5).contains(&c.n)
-            && mla.rope == 0
-            && mla.o_lora_rank == 0
+    pub(super) fn glm_mla_multi_seq_eligible(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        mla: &MlaWeights,
+    ) -> Result<bool> {
+        let independent = crate::model::glm_independent::selected(c.fwd, c.n)?;
+        Ok(
+            (independent || enabled() || glm_multi_seq_sparse_enabled(&c.fwd.config.model_type))
+                && (2..=if independent { 8 } else { 5 }).contains(&c.n)
+                && mla.rope == 0
+                && mla.o_lora_rank == 0,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -134,6 +141,16 @@ impl Qwen3AttentionLayer {
                         c.fwd.gpu, kernel, input, weight, output, 5, n_out, k, c.stream,
                     )
                 }
+                n @ 6..=8 if crate::model::glm_independent::selected(c.fwd, n)? => {
+                    let kernel = self.w4a16_batchm.kernel(n as u32);
+                    ensure!(
+                        kernel.0 != 0,
+                        "independent MLA projection kernel unavailable"
+                    );
+                    ops::w4a16_gemv_batchm(
+                        c.fwd.gpu, kernel, input, weight, output, n as u32, n_out, k, c.stream,
+                    )
+                }
                 n => anyhow::bail!("GLM MLA multi-sequence projection requires N=2..=5, got {n}"),
             }
         } else {
@@ -157,12 +174,15 @@ impl Qwen3AttentionLayer {
         o_out: DevicePtr,
     ) -> Result<DevicePtr> {
         ensure!(
-            self.glm_mla_multi_seq_eligible(c, mla),
+            self.glm_mla_multi_seq_eligible(c, mla)?,
             "GLM MLA batched path called for an unsupported MLA shape"
         );
+        let independent = crate::model::glm_independent::selected(c.fwd, c.n)?;
+        let independent_kernel =
+            super::mla_independent::select(c.n, independent, self.independent_mla_handles())?;
         let batch4 = batch4_kernel(
             c.n,
-            std::env::var("ATLAS_GLM_MLA_BATCH4").as_deref() == Ok("1"),
+            !independent && std::env::var("ATLAS_GLM_MLA_BATCH4").as_deref() == Ok("1"),
             crate::model::glm_c4::enabled(&c.fwd.config.model_type),
             self.mla_batched_gemv_batch4_k,
         )?;
@@ -274,13 +294,13 @@ impl Qwen3AttentionLayer {
         let v_row = (nq * v_dim) as usize * bf16;
         let batch23 = c.fwd.config.model_type == "glm5_next"
             && std::env::var("ATLAS_GLM_MLA_BATCH23").as_deref() == Ok("1");
-        let batched_kernel = match c.n {
+        let batched_kernel = independent_kernel.unwrap_or_else(|| match c.n {
             2 if batch23 => self.mla_batched_gemv_batch2_k,
             3 if batch23 => self.mla_batched_gemv_batch3_k,
             4 => batch4,
             5 => self.mla_batched_gemv_batch5_k,
             _ => KernelHandle(0),
-        };
+        });
         let batched_mla_gemv = batched_kernel.0 != 0;
         if batched_mla_gemv {
             ops::mla_batched_gemv_batchm(

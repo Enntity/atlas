@@ -28,6 +28,7 @@ mod mla;
 mod mla_gemv;
 mod mla_glm;
 mod mla_glm_sparse;
+mod mla_independent;
 mod qkv;
 
 impl Qwen3AttentionLayer {
@@ -354,18 +355,20 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
 
-        // GLM's verifier already has native fixed-row FFN paths.  Keep all
-        // verifier rows together through the full-attention layers too;
-        // otherwise these layers reread every expert weight once per row.
-        // Other MLA architectures retain their established sequential path.
+        let independent = crate::model::glm_independent::selected(ctx, n)?;
         let glm_batched_ffn = ctx.config.model_type == "glm5_next" && matches!(n, 3..=5);
-        let compact_c2 = if n == 2 {
+        let compact_c2 = if !independent && n == 2 {
             self.ffn.try_forward_c2_compact(c.normed, ctx, stream)?
         } else {
             None
         };
-        if compact_c2.is_some() || glm_batched_ffn {
-            let (moe_out, deferred_shared_gate) = if let Some(output) = compact_c2 {
+        if independent || compact_c2.is_some() || glm_batched_ffn {
+            let (moe_out, deferred_shared_gate) = if independent {
+                (
+                    self.ffn.forward_independent(c.normed, n, ctx, stream)?,
+                    None,
+                )
+            } else if let Some(output) = compact_c2 {
                 (output, None)
             } else if n == 3 {
                 self.ffn.forward_k3(c.normed, ctx, stream)?;

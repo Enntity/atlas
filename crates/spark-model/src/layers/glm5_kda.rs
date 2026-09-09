@@ -178,7 +178,7 @@ impl Glm5KdaLayer {
         } else {
             KernelHandle(0)
         };
-        Ok(Self {
+        let layer = Self {
             input_norm,
             post_attn_norm,
             weights,
@@ -253,7 +253,23 @@ impl Glm5KdaLayer {
             hc_post_bf16_add_k: super::try_kernel(gpu, "hyper_connection", "hc_post_bf16_add"),
             hc_post_moe_blend_k: super::try_kernel(gpu, "hyper_connection", "hc_post_moe_blend"),
             hc_contract_k: gpu.kernel("hyper_connection", "hc_contract")?,
-        })
+        };
+        if crate::model::glm_independent::enabled(&config.model_type)? {
+            let handles = std::array::from_fn(|i| match i + 2 {
+                2 => layer.w4a16_gemv_batch2_k.0,
+                3 => layer.w4a16_gemv_batch3_k.0,
+                n => layer.w4a16_gemv_batchm.kernel(n as u32).0,
+            });
+            crate::model::glm_independent::validate_projection_handles(
+                handles,
+                layer.dense_gemv_batchm_k.0,
+            )?;
+            ensure!(
+                layer.conv_indexed_k.0 != 0 && layer.recurrent_indexed_k.0 != 0,
+                "independent KDA requires both indexed kernels"
+            );
+        }
+        Ok(layer)
     }
 
     fn forward_inner(
@@ -1074,12 +1090,21 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if crate::model::glm_c4::batched_kda_rows(
-            num_seqs,
-            multi_seq::enabled(),
-            crate::model::glm_c4::enabled(&ctx.config.model_type),
-        )? {
-            if num_seqs == 4 {
+        let independent = crate::model::glm_independent::selected(ctx, num_seqs)?;
+        if independent
+            || crate::model::glm_c4::batched_kda_rows(
+                num_seqs,
+                multi_seq::enabled(),
+                crate::model::glm_c4::enabled(&ctx.config.model_type),
+            )?
+        {
+            if independent {
+                crate::model::glm_independent::validate_positions(
+                    seq_lens.iter().copied(),
+                    num_seqs,
+                    ctx.levers.max_decode_seqs as usize,
+                )?;
+            } else if num_seqs == 4 {
                 crate::model::glm_c4::validate_positions(seq_lens.iter().copied(), 4)?;
             }
             self.decode_multi_seq_inner(hidden, num_seqs, states, ctx, stream)

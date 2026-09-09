@@ -32,16 +32,30 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let independent = crate::model::glm_independent::selected(ctx, num_seqs)?;
         ensure!(
-            crate::model::glm_c4::batched_kda_rows(
-                num_seqs,
-                enabled(),
-                crate::model::glm_c4::enabled(&ctx.config.model_type),
-            )?,
+            independent
+                || crate::model::glm_c4::batched_kda_rows(
+                    num_seqs,
+                    enabled(),
+                    crate::model::glm_c4::enabled(&ctx.config.model_type),
+                )?,
             "GLM KDA batched decode supports C2/C3 and opted-in C4"
         );
         ensure!(states.len() >= num_seqs, "GLM KDA state batch is truncated");
-        if num_seqs == 4 {
+        if independent {
+            crate::model::glm_independent::validate_runtime(
+                ctx.config,
+                ctx.comm.map_or(0, |c| c.world_size()),
+                std::env::var("ATLAS_EP_PROTOCOL").as_deref() == Ok("v2"),
+                true,
+            )?;
+            crate::model::glm_independent::validate_scratch(
+                ctx.buffers.sizes(),
+                self.hc.hc_mult,
+                num_seqs,
+            )?;
+        } else if num_seqs == 4 {
             crate::model::glm_c4::validate_runtime(
                 ctx.config,
                 ctx.comm.map_or(0, |comm| comm.world_size()),
@@ -66,6 +80,10 @@ impl Glm5KdaLayer {
             ensure!(!state.h_is_f16, "GLM KDA requires FP32 recurrent state");
         }
         let indexed_core = self.prepare_indexed_core(num_seqs, ctx)?;
+        ensure!(
+            !independent || indexed_core.is_some(),
+            "independent KDA must use actual indexed state pair"
+        );
 
         let n = num_seqs;
         let m = n as u32;
@@ -314,7 +332,9 @@ impl Glm5KdaLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
-        let compact_c2 = if n == 2 {
+        let compact_c2 = if independent {
+            Some(self.ffn.forward_independent(normed, n, ctx, stream)?)
+        } else if n == 2 {
             self.ffn.try_forward_c2_compact(normed, ctx, stream)?
         } else {
             None

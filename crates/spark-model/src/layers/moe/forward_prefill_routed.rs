@@ -16,7 +16,7 @@ pub(super) fn grouped_cutlass_down_enabled() -> bool {
     env_flag("ATLAS_MOE_GROUPED_CUTLASS") || env_flag("ATLAS_HOLO_MOE_GROUPED_DOWN")
 }
 
-fn env_flag(name: &str) -> bool {
+pub(super) fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .ok()
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -183,7 +183,8 @@ impl MoeLayer {
                     compact_k5
                         || self.glm_c2_grouped(ctx, n)
                         || self.glm_c3_grouped(ctx, n)
-                        || self.glm_c4_grouped(ctx, n),
+                        || self.glm_c4_grouped(ctx, n)
+                        || self.independent_grouped(ctx, n),
                     ctx,
                     stream,
                 )?;
@@ -262,6 +263,7 @@ impl MoeLayer {
                         || self.glm_c2_grouped(ctx, n)
                         || self.glm_c3_grouped(ctx, n)
                         || self.glm_c4_grouped(ctx, n)
+                        || self.independent_grouped(ctx, n)
                     {
                         let total_tiles = ctx.buffers.moe_router_in_f32();
                         let worklist = total_tiles.offset(16);

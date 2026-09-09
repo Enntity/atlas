@@ -17,6 +17,9 @@ use spark_runtime::{
 };
 use std::sync::{Mutex, atomic::Ordering};
 
+#[path = "forward_independent_tests.rs"]
+mod independent;
+
 struct Comm<'a> {
     gpu: &'a Gpu,
     rank: usize,

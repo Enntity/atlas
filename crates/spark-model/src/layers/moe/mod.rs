@@ -534,6 +534,8 @@ mod forward_batched;
 mod forward_batched_gate;
 mod forward_c2;
 mod forward_c4;
+mod forward_independent;
+pub(crate) use forward_independent::validate_independent_environment;
 mod forward_ep;
 mod forward_k2;
 mod forward_k3;
