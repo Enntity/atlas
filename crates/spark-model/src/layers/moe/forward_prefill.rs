@@ -38,6 +38,9 @@ impl MoeLayer {
         defer_shared_hc: bool,
         mode: super::forward_pair_verify::PrefillMode,
     ) -> Result<()> {
+        if let super::forward_pair_verify::PrefillMode::OwnerVerify(shape) = mode {
+            anyhow::ensure!(num_tokens == shape.rows(), "owner FFN row shape changed");
+        }
         self.btile_input_guard(input, num_tokens, ctx, stream)?;
         anyhow::ensure!(
             !self.btile_storage.is_published() || self.nvfp4_prequant_moe,
@@ -193,10 +196,14 @@ impl MoeLayer {
             && std::env::var("ATLAS_MOE_SHARED_REDUCE_OVERLAP").as_deref() == Ok("1");
 
         if has_shared && !overlap_shared_reduce {
-            if let super::forward_pair_verify::PrefillMode::PairVerify(shared) = mode {
-                self.run_pair_shared(input, ctx, stream, shared)?;
-            } else {
-                self.run_shared_expert_prefill(
+            match mode {
+                super::forward_pair_verify::PrefillMode::PairVerify(shared) => {
+                    self.run_pair_shared(input, ctx, stream, shared)?
+                }
+                super::forward_pair_verify::PrefillMode::OwnerVerify(shape) => {
+                    self.run_verify_shared_rows(input, ctx, stream, shape.rows(), shape.rows())?
+                }
+                super::forward_pair_verify::PrefillMode::Legacy => self.run_shared_expert_prefill(
                     input,
                     n,
                     h,
@@ -205,7 +212,7 @@ impl MoeLayer {
                     stream,
                     false,
                     ctx,
-                )?;
+                )?,
             }
         }
         prof_step!("shared_expert");

@@ -535,6 +535,7 @@ mod forward_batched_gate;
 mod forward_c2;
 mod forward_c4;
 mod forward_independent;
+mod forward_owner_verify;
 mod forward_pair_shared;
 mod forward_pair_validate;
 mod forward_pair_verify;

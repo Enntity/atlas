@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Two temporal owners; original arena scratch is reused only after saving mHC.
+//! Bounded temporal owners; original scratch is reused only after saving mHC.
 
 use super::*;
-use crate::layer::glm_pair_verify::{
-    GlmPairFfn, GlmPairLayerInput, GlmPairWorkspace, OWNER_NORM_BYTES,
-};
+use crate::layer::glm_pair_verify::{GlmPairLayerInput, GlmPairWorkspace, OWNER_NORM_BYTES};
+use crate::layer::{glm_verify_ffn::GlmVerifyFfn, glm_verify_scratch::GlmVerifyScratch};
 
 impl Glm5KdaLayer {
     pub(super) fn pair_supported(&self) -> bool {
@@ -23,12 +22,31 @@ impl Glm5KdaLayer {
         contexts: [&ForwardContext; 2],
         stream: u64,
     ) -> Result<()> {
+        self.validate_temporal(
+            &workspace.scratch,
+            &contexts,
+            GlmVerifyFfn::Pair(workspace.mode),
+            stream,
+        )
+    }
+
+    pub(super) fn validate_temporal(
+        &self,
+        workspace: &GlmVerifyScratch,
+        contexts: &[&ForwardContext],
+        mode: GlmVerifyFfn,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            contexts.len() == mode.owners() && workspace.owner_count() == mode.owners(),
+            "GLM temporal KDA owner/workspace/context count mismatch"
+        );
         ensure!(
             self.pair_supported(),
             "GLM pair KDA geometry/FFN unsupported"
         );
         ensure!(
-            workspace.mode != GlmPairFfn::TwoK5 || verify_batched_ffn_enabled(),
+            !mode.is_two_k5() || verify_batched_ffn_enabled(),
             "GLM pair TwoK5 requires the existing batched K5 FFN dispatch"
         );
         for ctx in contexts {
@@ -41,16 +59,7 @@ impl Glm5KdaLayer {
                     && s.ssm_conv_out_f32 >= 3 * 5 * 4096 * 2,
                 "GLM pair KDA working scratch capacity"
             );
-            match workspace.mode {
-                GlmPairFfn::TwoK5 => {
-                    self.ffn
-                        .validate_pair_k5(ctx.buffers.norm_output(), ctx, stream)?
-                }
-                GlmPairFfn::Joint | GlmPairFfn::JointSharedM10 => {
-                    self.ffn
-                        .validate_pair_verify(ctx.buffers.norm_output(), ctx, stream)?
-                }
-            }
+            mode.validate(&self.ffn, ctx.buffers.norm_output(), ctx, stream)?;
         }
         for k in [
             self.rms_norm_k,
@@ -89,10 +98,29 @@ impl Glm5KdaLayer {
         contexts: [&ForwardContext; 2],
         stream: u64,
     ) -> Result<()> {
-        self.validate_pair(workspace, contexts, stream)?;
-        workspace.begin_layer(self.layer_idx, &owners, contexts, stream)?;
-        // Validate both actual snapshot sets before advancing either canonical state.
-        let mut spans = [(DevicePtr::NULL, 0usize); 22];
+        let mode = GlmVerifyFfn::Pair(workspace.mode);
+        self.decode_temporal(
+            &mut { owners },
+            &mut workspace.scratch,
+            &contexts,
+            mode,
+            stream,
+        )
+    }
+
+    pub(super) fn decode_temporal(
+        &self,
+        owners: &mut [GlmPairLayerInput<'_>],
+        workspace: &mut GlmVerifyScratch,
+        contexts: &[&ForwardContext],
+        mode: GlmVerifyFfn,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate_temporal(workspace, contexts, mode, stream)?;
+        workspace.begin_layer(self.layer_idx, owners, contexts, stream)?;
+        // Validate every snapshot set before advancing any canonical state.
+        let mut storage = [(DevicePtr::NULL, 0usize); 44];
+        let spans = &mut storage[..owners.len() * 11];
         for (owner, input) in owners.iter().enumerate() {
             let s = input
                 .state
@@ -136,8 +164,8 @@ impl Glm5KdaLayer {
                 );
             }
         }
-        let mut phases = [None, None];
-        for (owner, input) in owners.into_iter().enumerate() {
+        let mut phases = [None, None, None, None];
+        for (owner, input) in owners.iter_mut().enumerate() {
             workspace.restore_highway(owner, stream)?;
             phases[owner] = Some(self.forward_attention(
                 input.hidden,
@@ -151,19 +179,15 @@ impl Glm5KdaLayer {
             workspace.save_attention(owner, stream)?;
         }
         workspace.pack_norms(stream)?;
-        let joint = if let Some(shared) = workspace.mode.joint_shared() {
-            Some(self.ffn.forward_pair_verify(
-                contexts[0].buffers.norm_output(),
-                contexts[0],
-                stream,
-                shared,
-            )?)
-        } else {
-            None
-        };
-        for (owner, phase) in phases.into_iter().enumerate() {
+        let joint = mode.forward(
+            &self.ffn,
+            contexts[0].buffers.norm_output(),
+            contexts[0],
+            stream,
+        )?;
+        for (owner, phase) in phases.into_iter().take(owners.len()).enumerate() {
             workspace.restore_ffn(owner, joint.is_none(), stream)?;
-            let mut phase = phase.expect("both KDA attention phases completed");
+            let mut phase = phase.expect("all KDA attention phases completed");
             if let Some(output) = joint {
                 phase.normed = contexts[owner]
                     .buffers

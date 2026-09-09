@@ -57,14 +57,14 @@ impl MoeLayer {
             };
         }
 
-        let paired = mode.is_pair();
+        let paired = mode.is_verify_group();
         let avg_per_expert = (num_tokens * top_k as usize).div_ceil(ne);
         // Default to the absolute worst case (one expert receives every routed
         // token) to prevent silent truncation. An opt-in load-factor cap lets
         // Holo experiments trade that safety margin for fewer empty expert
         // tiles after validating the router histogram.
-        // Fixed pair uses unique top8 routing: each expert receives at most10
-        // rows, not80. One M64 tile needs no offsets D2H or load-factor guess.
+        // Checked temporal groups use unique top8 routing: each expert receives
+        // at most20 rows, not160. One M64 tile needs no offsets D2H or load-factor guess.
         let worst_case_m_tiles = if paired {
             1
         } else {

@@ -7,6 +7,10 @@ use crate::layers::qwen3_attention::{HcSiteWeights, HcWeights};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
+#[path = "owner_kda_tests.rs"]
+mod owner_batch;
+#[path = "owner_mla_tests.rs"]
+mod owner_mla;
 #[path = "pair_kda_tests.rs"]
 mod pair;
 

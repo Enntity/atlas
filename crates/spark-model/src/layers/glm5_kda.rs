@@ -316,6 +316,33 @@ impl Glm5KdaLayer {
 }
 
 impl TransformerLayer for Glm5KdaLayer {
+    fn validate_glm_owner_verify(
+        &self,
+        ctx: &ForwardContext,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        stream: u64,
+    ) -> Result<()> {
+        let workspace = crate::layer::glm_owner_verify::GlmOwnerBatchWorkspace::new(ctx, shape)?;
+        self.validate_temporal(
+            &workspace.scratch,
+            &[ctx; 4][..shape.owners()],
+            crate::layer::glm_verify_ffn::GlmVerifyFfn::Owners(shape),
+            stream,
+        )
+    }
+
+    fn decode_glm_owner_verify(
+        &self,
+        owners: &mut [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>],
+        _cache: &mut PagedKvCache,
+        workspace: &mut crate::layer::glm_owner_verify::GlmOwnerBatchWorkspace,
+        ctx: &[&ForwardContext],
+        stream: u64,
+    ) -> Result<()> {
+        let mode = crate::layer::glm_verify_ffn::GlmVerifyFfn::Owners(workspace.shape());
+        self.decode_temporal(owners, &mut workspace.scratch, ctx, mode, stream)
+    }
+
     fn supports_glm_pair_verify(&self) -> bool {
         self.pair_supported()
     }

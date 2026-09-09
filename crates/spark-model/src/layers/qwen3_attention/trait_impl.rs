@@ -90,6 +90,31 @@ pub fn diag_norm_f32(
 // and carried on `ForwardContext`.
 
 impl TransformerLayer for Qwen3AttentionLayer {
+    fn validate_glm_owner_verify(
+        &self,
+        ctx: &ForwardContext,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate_verify_mla(
+            ctx,
+            crate::layer::glm_verify_ffn::GlmVerifyFfn::Owners(shape),
+            stream,
+        )
+    }
+
+    fn decode_glm_owner_verify(
+        &self,
+        owners: &mut [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>],
+        cache: &mut PagedKvCache,
+        workspace: &mut crate::layer::glm_owner_verify::GlmOwnerBatchWorkspace,
+        ctx: &[&ForwardContext],
+        stream: u64,
+    ) -> Result<()> {
+        let mode = crate::layer::glm_verify_ffn::GlmVerifyFfn::Owners(workspace.shape());
+        self.decode_verify_mla(owners, cache, &mut workspace.scratch, ctx, mode, stream)
+    }
+
     fn supports_glm_pair_verify(&self) -> bool {
         self.pair_mla_supported()
     }

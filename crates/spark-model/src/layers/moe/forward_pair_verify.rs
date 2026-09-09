@@ -9,11 +9,12 @@ use crate::layers::FfnComponent;
 pub(super) enum PrefillMode {
     Legacy,
     PairVerify(GlmPairShared),
+    OwnerVerify(crate::layer::glm_owner_verify::GlmOwnerBatchShape),
 }
 
 impl PrefillMode {
-    pub(super) fn is_pair(self) -> bool {
-        matches!(self, Self::PairVerify(_))
+    pub(super) fn is_verify_group(self) -> bool {
+        matches!(self, Self::PairVerify(_) | Self::OwnerVerify(_))
     }
 }
 

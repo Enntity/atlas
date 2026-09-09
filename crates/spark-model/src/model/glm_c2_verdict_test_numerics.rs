@@ -62,11 +62,13 @@ impl TransformerLayer for Body {
         // Same byte-sentinel target as the existing scalar/K5 tests, now using
         // two actual owner descriptors. This is NOT a KDA/MLA numerical oracle.
         ensure!(self.target, "private fixture body is not a paired target");
-        workspace.begin_layer(0, &owners, contexts, stream)?;
+        workspace
+            .scratch
+            .begin_layer(0, &owners, &contexts, stream)?;
         for owner in owners {
             self.target_rows(owner.hidden, 5, owner.positions[0], stream)?;
         }
-        workspace.finish_layer();
+        workspace.scratch.finish_layer();
         Ok(())
     }
     fn alloc_state(&self, _: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {

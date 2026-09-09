@@ -3,6 +3,19 @@
 use super::*;
 
 pub(super) fn validate_common(input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
+    validate_rows(input, 10, ctx, stream)
+}
+
+pub(super) fn validate_rows(
+    input: DevicePtr,
+    rows: usize,
+    ctx: &ForwardContext,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        matches!(rows, 10 | 15 | 20),
+        "bounded temporal FFN row count"
+    );
     anyhow::ensure!(
         super::prequant_fp4::glm_grouped_shape(ctx.config)
             && ctx.config.tp_rank == ctx.config.ep_rank
@@ -17,7 +30,7 @@ pub(super) fn validate_common(input: DevicePtr, ctx: &ForwardContext, stream: u6
             && ctx.config.adapter_max_rank == 0
             && !matches!(ctx.moe_lora_route, crate::layer::MoeLoraRoute::Refuse)
             && input == ctx.buffers.norm_output(),
-        "paired FFN requires eager native GLM TP2/EP2 ten normalized rows without adapters"
+        "paired FFN requires eager native GLM TP2/EP2 normalized rows without adapters"
     );
     anyhow::ensure!(
         !super::dump::enabled(),
@@ -28,21 +41,25 @@ pub(super) fn validate_common(input: DevicePtr, ctx: &ForwardContext, stream: u6
     // Requirements include the exact packed-A+scale and post-SiLU staging
     // lifetimes, not merely the final BF16 row extents. No allocation here.
     let spans = [
-        (a.norm_output(), s.norm_output, 81920),
-        (a.moe_output(), s.moe_output, 81920),
+        (a.norm_output(), s.norm_output, rows * 8192),
+        (a.moe_output(), s.moe_output, rows * 8192),
         (
             a.gate_logits(),
             s.gate_logits,
-            5760, // Router logits exceed the 2116-byte routing metadata extent.
+            rows * 288 * 2, // Exceeds 12*expanded + 4*(experts+1) sort metadata.
         ),
-        (a.moe_router_in_f32(), s.moe_router_in_f32, 10256),
-        (a.expert_gate_out(), s.expert_gate_out, 80 * 2048 * 2),
-        (a.expert_up_out(), s.expert_up_out, 80 * 2048 * 2),
-        (a.expert_down_out(), s.expert_down_out, 80 * 4096 * 2),
-        (a.ssm_deinterleaved(), s.ssm_deinterleaved, 10 * 2048 * 2),
-        (a.ssm_qkvz(), s.ssm_qkvz, 10 * 2048 * 2),
-        (a.attn_output(), s.attn_output, 81920),
-        (a.scratch(), s.scratch, 80 * 8),
+        (
+            a.moe_router_in_f32(),
+            s.moe_router_in_f32,
+            super::prequant_fp4::compact_gate_up_worklist_bytes(rows as u32, 8, 2048),
+        ),
+        (a.expert_gate_out(), s.expert_gate_out, rows * 8 * 2048 * 2),
+        (a.expert_up_out(), s.expert_up_out, rows * 8 * 2048 * 2),
+        (a.expert_down_out(), s.expert_down_out, rows * 8 * 4096 * 2),
+        (a.ssm_deinterleaved(), s.ssm_deinterleaved, rows * 2048 * 2),
+        (a.ssm_qkvz(), s.ssm_qkvz, rows * 2048 * 2),
+        (a.attn_output(), s.attn_output, rows * 8192),
+        (a.scratch(), s.scratch, rows * 8 * 8),
     ];
     for (index, &(ptr, capacity, required)) in spans.iter().enumerate() {
         anyhow::ensure!(
@@ -153,6 +170,10 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<()> {
         validate_common(input, ctx, stream)?;
+        self.validate_verify_resources(ctx)
+    }
+
+    pub(super) fn validate_verify_resources(&self, ctx: &ForwardContext) -> Result<()> {
         // With no resident adapter the production resolver returns Fold, which
         // is inert. Never accept that route with actual adapter weights present.
         anyhow::ensure!(self.lora.is_none(), "paired FFN refuses resident adapters");

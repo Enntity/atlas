@@ -42,6 +42,27 @@ pub const VERIFY_WY_LAYER_STRIDE_BYTES: usize =
     VERIFY_WY_TABLES_PER_LAYER * VERIFY_WY_TABLE_STRIDE_BYTES;
 
 pub trait TransformerLayer: Send + Sync {
+    /// Bounded wider temporal compute only, not request or transaction authority.
+    fn validate_glm_owner_verify(
+        &self,
+        _ctx: &ForwardContext<'_>,
+        _shape: super::glm_owner_verify::GlmOwnerBatchShape,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM owner-batch layer verification is unsupported")
+    }
+
+    fn decode_glm_owner_verify(
+        &self,
+        _owners: &mut [super::glm_pair_verify::GlmPairLayerInput<'_>],
+        _cache: &mut PagedKvCache,
+        _workspace: &mut super::glm_owner_verify::GlmOwnerBatchWorkspace<'_>,
+        _ctx: &[&ForwardContext<'_>],
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM owner-batch layer verification is unsupported")
+    }
+
     /// Fixed eager GLM [5,5] compute support, not request/transaction authority.
     fn supports_glm_pair_verify(&self) -> bool {
         false

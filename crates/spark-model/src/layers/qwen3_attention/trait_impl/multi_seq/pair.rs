@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Two unchanged temporal K5 attention passes with owner-preserved mHC tails.
+//! Unchanged temporal K5 attention passes with owner-preserved mHC tails.
 
 use super::*;
 use crate::layer::glm_pair_verify::{
     GlmPairFfn, GlmPairLayerInput, GlmPairWorkspace, OWNER_NORM_BYTES,
 };
+use crate::layer::{glm_verify_ffn::GlmVerifyFfn, glm_verify_scratch::GlmVerifyScratch};
 use anyhow::ensure;
 use spark_runtime::kv_cache::KvCacheDtype;
 
@@ -25,6 +26,15 @@ impl Qwen3AttentionLayer {
         mode: GlmPairFfn,
         stream: u64,
     ) -> Result<()> {
+        self.validate_verify_mla(context, GlmVerifyFfn::Pair(mode), stream)
+    }
+
+    pub(in crate::layers::qwen3_attention) fn validate_verify_mla(
+        &self,
+        context: &ForwardContext,
+        mode: GlmVerifyFfn,
+        stream: u64,
+    ) -> Result<()> {
         ensure!(
             self.pair_mla_supported(),
             "GLM pair requires mHC/NoPE MLA with FFN"
@@ -33,7 +43,7 @@ impl Qwen3AttentionLayer {
             self.kv_dtype == KvCacheDtype::Bf16,
             "GLM pair MLA layer cache dtype"
         );
-        let workspace = GlmPairWorkspace::new(context, mode)?;
+        let workspace = GlmVerifyScratch::new(context, mode.owners())?;
         workspace.validate_context(context, stream)?;
         let positions = [0, 1, 2, 3, 4];
         let c = ctx::MultiSeqCtx::new(
@@ -53,16 +63,7 @@ impl Qwen3AttentionLayer {
             "GLM pair requires existing dense temporal K5 MLA path"
         );
         self.validate_glm_c4(&c)?;
-        match mode {
-            GlmPairFfn::TwoK5 => {
-                self.ffn
-                    .validate_pair_k5(context.buffers.norm_output(), context, stream)?
-            }
-            GlmPairFfn::Joint | GlmPairFfn::JointSharedM10 => {
-                self.ffn
-                    .validate_pair_verify(context.buffers.norm_output(), context, stream)?
-            }
-        }
+        mode.validate(&self.ffn, context.buffers.norm_output(), context, stream)?;
         for kernel in [
             self.rms_norm_w_k,
             self.dense_gemv_batchm_k,
@@ -114,16 +115,40 @@ impl Qwen3AttentionLayer {
 
     pub(in crate::layers::qwen3_attention) fn decode_pair_mla(
         &self,
-        owners: [GlmPairLayerInput<'_>; 2],
+        mut owners: [GlmPairLayerInput<'_>; 2],
         cache: &mut PagedKvCache,
         workspace: &mut GlmPairWorkspace,
         contexts: [&ForwardContext; 2],
         stream: u64,
     ) -> Result<()> {
+        self.decode_verify_mla(
+            &mut owners,
+            cache,
+            &mut workspace.scratch,
+            &contexts,
+            GlmVerifyFfn::Pair(workspace.mode),
+            stream,
+        )
+    }
+
+    pub(in crate::layers::qwen3_attention) fn decode_verify_mla(
+        &self,
+        owners: &mut [GlmPairLayerInput<'_>],
+        cache: &mut PagedKvCache,
+        workspace: &mut GlmVerifyScratch,
+        contexts: &[&ForwardContext],
+        mode: GlmVerifyFfn,
+        stream: u64,
+    ) -> Result<()> {
+        let count = mode.owners();
+        ensure!(
+            owners.len() == count && contexts.len() == count && workspace.owner_count() == count,
+            "GLM MLA owner/context/scratch/policy count mismatch"
+        );
         for context in contexts {
-            self.validate_pair_mla(context, workspace.mode, stream)?;
+            self.validate_verify_mla(context, mode, stream)?;
         }
-        workspace.begin_layer(self.block_idx, &owners, contexts, stream)?;
+        workspace.begin_layer(self.block_idx, owners, contexts, stream)?;
         ensure!(
             cache.block_size() == 16
                 && cache.config().dtype == KvCacheDtype::Bf16
@@ -153,13 +178,19 @@ impl Qwen3AttentionLayer {
                 "GLM pair MLA K5 metadata invalid"
             );
         }
-        for &p0 in owners[0].positions {
-            for &p1 in owners[1].positions {
-                ensure!(
-                    owners[0].block_table[p0 / 16] != owners[1].block_table[p1 / 16]
-                        || p0 % 16 != p1 % 16,
-                    "GLM pair MLA writable cache slots alias"
-                );
+        // Complete every cross-owner writable K5 slot check before the first
+        // attention writer, including nonadjacent owners in a wider batch.
+        for (index, input) in owners.iter().enumerate() {
+            for other in &owners[..index] {
+                for &p0 in input.positions {
+                    for &p1 in other.positions {
+                        ensure!(
+                            input.block_table[p0 / 16] != other.block_table[p1 / 16]
+                                || p0 % 16 != p1 % 16,
+                            "GLM pair MLA writable cache slots alias"
+                        );
+                    }
+                }
             }
         }
         let make_ctx = |owner: usize| {
@@ -179,39 +210,41 @@ impl Qwen3AttentionLayer {
             c.seq_slot = contexts[owner].attn_metadata.unwrap().seq_slot;
             c
         };
-        let cs = [make_ctx(0), make_ctx(1)];
-        let mut phases = [None, None];
-        for owner in 0..2 {
+        let cs: [Option<ctx::MultiSeqCtx<'_>>; 4] =
+            std::array::from_fn(|owner| (owner < count).then(|| make_ctx(owner)));
+        let mut phases = [None, None, None, None];
+        for owner in 0..count {
             workspace.restore_highway(owner, stream)?;
-            phases[owner] =
-                self.ms_hc_attention_norm(&cs[owner], cache, contexts[owner], stream)?;
+            phases[owner] = self.ms_hc_attention_norm(
+                cs[owner].as_ref().expect("bounded owner context"),
+                cache,
+                contexts[owner],
+                stream,
+            )?;
             ensure!(phases[owner].is_some(), "GLM pair MLA FFN phase missing");
             workspace.save_attention(owner, stream)?;
         }
         workspace.pack_norms(stream)?;
-        let joint = if let Some(shared) = workspace.mode.joint_shared() {
-            Some(self.ffn.forward_pair_verify(
-                contexts[0].buffers.norm_output(),
-                contexts[0],
-                stream,
-                shared,
-            )?)
-        } else {
-            None
-        };
-        for (owner, phase) in phases.into_iter().enumerate() {
+        let joint = mode.forward(
+            &self.ffn,
+            contexts[0].buffers.norm_output(),
+            contexts[0],
+            stream,
+        )?;
+        for (owner, phase) in phases.into_iter().enumerate().take(count) {
             workspace.restore_ffn(owner, joint.is_none(), stream)?;
-            let phase = phase.expect("both MLA attention phases completed");
+            let phase = phase.expect("all MLA attention phases completed");
+            let context = cs[owner].as_ref().expect("bounded owner context");
             if let Some(output) = joint {
                 self.ms_hc_supplied_post(
-                    &cs[owner],
+                    context,
                     phase,
                     output.offset(owner * OWNER_NORM_BYTES),
                     contexts[owner],
                     stream,
                 )?;
             } else {
-                self.ms_hc_ffn_post(&cs[owner], phase, contexts[owner], stream)?;
+                self.ms_hc_ffn_post(context, phase, contexts[owner], stream)?;
             }
             workspace.save_highway(owner, stream)?;
         }

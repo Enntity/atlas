@@ -11,9 +11,29 @@ impl MoeLayer {
         stream: u64,
         shared: GlmPairShared,
     ) -> Result<()> {
+        let rows = match shared {
+            GlmPairShared::TwoM5 => 5,
+            GlmPairShared::M10 => 10,
+        };
+        self.run_verify_shared_rows(input, ctx, stream, 10, rows)
+    }
+
+    /// Same native-T arithmetic for explicitly checked temporal row groups.
+    pub(super) fn run_verify_shared_rows(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+        total_rows: usize,
+        rows: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!((total_rows, rows), (10, 5 | 10) | (15, 15) | (20, 20)),
+            "bounded temporal shared width"
+        );
         let h = ctx.config.hidden_size;
         let inter = ctx.config.shared_expert_intermediate_size;
-        // Checked before any attention writer by validate_pair_verify. Resolve
+        // Checked before any attention writer by the row/resource validator. Resolve
         // all three references before launching, preserving stop-first-error.
         let gate = self
             .shared_gate_t
@@ -27,13 +47,9 @@ impl MoeLayer {
             .shared_down_t
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("paired shared down-T missing"))?;
-        // Both widths use the same generic-T kernel and elementwise activation;
-        // the explicit M10 candidate only shares their existing weight scans.
-        let rows = match shared {
-            GlmPairShared::TwoM5 => 5,
-            GlmPairShared::M10 => 10,
-        };
-        for owner in 0..(10 / rows) {
+        // All widths use the same generic-T kernel and elementwise activation;
+        // wider row groups only share their existing weight scans.
+        for owner in 0..(total_rows / rows) {
             let row_input = input.offset(owner * rows * h * 2);
             let gate_out = ctx
                 .buffers

@@ -3,6 +3,9 @@
 use super::*;
 use crate::layer::glm_pair_verify::GlmPairShared;
 
+#[path = "forward_owner_verify_tests.rs"]
+mod owner_verify;
+
 #[test]
 fn actual_pair_verify_ffn_dispatch() {
     const SENTINEL: &str = "ATLAS_TEST_PAIR_VERIFY_FFN";
