@@ -350,6 +350,49 @@ pub(super) fn retire_finished_sequences(
     *active = survivors;
 }
 
+/// Staged paired-only path; future T2 must handle Err while armed, before cleanup.
+/// No serving caller exists until supervised selected admission is integrated.
+#[allow(dead_code)]
+pub(super) fn retire_selected_finished_sequences(
+    model: &dyn Model,
+    active: &mut Vec<ActiveSeq>,
+    max_seq_len: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        model.glm_paired_execution().is_some() && model.ep_protocol_v2(),
+        "selected retirement requires actual paired EP-v2 Model"
+    );
+    let mut seen = [false; 2];
+    for a in active.iter() {
+        let slot = a.seq.slot_idx;
+        anyhow::ensure!(
+            slot < 2 && !seen[slot],
+            "selected retirement owner slots must be distinct 0/1"
+        );
+        seen[slot] = true;
+    }
+    for slot in 0..2 {
+        let Some(index) = active
+            .iter()
+            .position(|a| a.finished && a.seq.slot_idx == slot)
+        else {
+            continue;
+        };
+        let a = &mut active[index];
+        // Keep the actual host owner live on either failure. Local resources may
+        // already be retired when F1 fails: this is terminal, never rollback/retry.
+        model.free_sequence(&mut a.seq)?;
+        model.ep_broadcast_cmd_for_seq(slot as u32, 0xFFFFFFF1)?;
+        super::lifecycle::finish_response(a, max_seq_len);
+        active.remove(index);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "glm_c2_retirement_tests.rs"]
+mod selected_retirement_tests;
+
 /// Compact live sequences into contiguous SSM slots `[0..n)` (n = the slice
 /// length), claiming each migration target exclusively from the free list so
 /// no two live sequences can ever share a slot.

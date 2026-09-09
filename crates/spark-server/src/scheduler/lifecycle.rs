@@ -134,6 +134,22 @@ pub(super) fn derive_finish_reason(
 /// 0 = unlimited) — needed so the `"length"` decision reuses the exact
 /// stop predicate from `emit_step`/`decode_logits_step`.
 pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize) {
+    finish_response(a, max_seq_len);
+    // Cache the full sequence (prompt + generated) in the prefix cache.
+    // Must happen BEFORE free_sequence() so block indices are still valid.
+    // Enables multi-turn sessions to reuse KV cache for prior assistant responses.
+    model.cache_sequence(&a.seq);
+    if let Err(e) = model.free_sequence(&mut a.seq) {
+        tracing::error!("free_sequence: {e:#}");
+    }
+    // EP: signal worker to free+realloc its mirrored sequence.
+    if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF1) {
+        tracing::error!("EP broadcast free+realloc: {e:#}");
+    }
+}
+
+/// Host-only response/log accounting, shared without changing legacy cleanup order.
+pub(super) fn finish_response(a: &mut ActiveSeq, max_seq_len: usize) {
     let reason = derive_finish_reason(
         a.guard_stop,
         a.output_tokens.last().copied(),
@@ -207,17 +223,6 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
     };
     let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
     super::mtp_accept_debug::RequestAccept::log_done(n, reason, tps, ttft_ms, &a.mtp_acct);
-    // Cache the full sequence (prompt + generated) in the prefix cache.
-    // Must happen BEFORE free_sequence() so block indices are still valid.
-    // Enables multi-turn sessions to reuse KV cache for prior assistant responses.
-    model.cache_sequence(&a.seq);
-    if let Err(e) = model.free_sequence(&mut a.seq) {
-        tracing::error!("free_sequence: {e:#}");
-    }
-    // EP: signal worker to free+realloc its mirrored sequence.
-    if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF1) {
-        tracing::error!("EP broadcast free+realloc: {e:#}");
-    }
 }
 
 /// Send error to client and free GPU resources.
