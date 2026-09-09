@@ -31,11 +31,9 @@ impl Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<()> {
         let h = ctx.config.hidden_size;
-        let eps = ctx.config.rms_norm_eps as f32;
         let n = c.n;
         let hc = self.hc.as_ref().unwrap();
         let hc_mult = hc.hc_mult as u32;
-        let is_last_layer = self.block_idx + 1 == ctx.config.num_hidden_layers;
         let HcFfnPhase {
             hc_streams,
             post,
@@ -125,6 +123,53 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         }
+        self.ms_hc_finish(c, hc_streams, diag_this, ctx, stream)
+    }
+
+    pub(super) fn ms_hc_supplied_post(
+        &self,
+        c: &ctx::MultiSeqCtx<'_>,
+        phase: HcFfnPhase,
+        output: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let HcFfnPhase {
+            hc_streams,
+            post,
+            comb,
+            diag_this,
+        } = phase;
+        ops::hc_post(
+            ctx.gpu,
+            self.hc_post_k,
+            output,
+            hc_streams,
+            post,
+            comb,
+            hc_streams,
+            c.n as u32,
+            c.h as u32,
+            self.hc.as_ref().unwrap().hc_mult as u32,
+            stream,
+        )?;
+        self.ms_hc_finish(c, hc_streams, diag_this, ctx, stream)
+    }
+
+    fn ms_hc_finish(
+        &self,
+        c: &ctx::MultiSeqCtx<'_>,
+        hc_streams: DevicePtr,
+        diag_this: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let n = c.n;
+        let hc = self.hc.as_ref().unwrap();
+        let hc_mult = hc.hc_mult as u32;
+        let is_last_layer = self.block_idx + 1 == ctx.config.num_hidden_layers;
         if diag_this {
             super::super::diag_norm(
                 ctx.gpu,

@@ -90,6 +90,30 @@ pub fn diag_norm_f32(
 // and carried on `ForwardContext`.
 
 impl TransformerLayer for Qwen3AttentionLayer {
+    fn supports_glm_pair_verify(&self) -> bool {
+        self.pair_mla_supported()
+    }
+
+    fn validate_glm_pair_verify(
+        &self,
+        ctx: &ForwardContext,
+        mode: crate::layer::glm_pair_verify::GlmPairFfn,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate_pair_mla(ctx, mode, stream)
+    }
+
+    fn decode_glm_pair_verify(
+        &self,
+        owners: [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>; 2],
+        cache: &mut PagedKvCache,
+        workspace: &mut crate::layer::glm_pair_verify::GlmPairWorkspace,
+        ctx: [&ForwardContext; 2],
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_pair_mla(owners, cache, workspace, ctx, stream)
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }

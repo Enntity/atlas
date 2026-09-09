@@ -181,7 +181,7 @@ impl Glm5MtpHead {
         if pool
             .verification
             .as_ref()
-            .is_some_and(|v| v.slot == lease.slot)
+            .is_some_and(|v| v.owns(lease.slot))
         {
             pool.producer_failed = true;
         }

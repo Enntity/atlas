@@ -29,6 +29,9 @@ pub(crate) mod construction_owner;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
 mod glm_c2_handoff;
+pub mod glm_c2_pair_policy;
+mod glm_c2_pair_transport;
+mod glm_c2_pair_verify;
 mod glm_c2_sequence_allocation;
 mod glm_c2_sequence_ownership;
 #[cfg(feature = "glm-c2-test-utils")]

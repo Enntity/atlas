@@ -11,16 +11,12 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let FfnPhase {
-            hidden,
-            normed,
-            tokens,
-            decode,
-            capture_verify_intermediates,
-            mut profile_timer,
-        } = phase;
-        let m = tokens as u32;
-        let h = self.hidden_size as u32;
+        let (normed, tokens, decode, capture_verify_intermediates) = (
+            phase.normed,
+            phase.tokens,
+            phase.decode,
+            phase.capture_verify_intermediates,
+        );
         let mut deferred_shared_gate = None;
         let ffn_out = if capture_verify_intermediates && tokens == 2 {
             self.ffn.forward_k2(normed, ctx, stream)?;
@@ -47,6 +43,26 @@ impl Glm5KdaLayer {
             self.ffn.forward_prefill(normed, tokens, ctx, stream)?;
             ctx.buffers.moe_output()
         };
+        self.forward_ffn_post(phase, ffn_out, deferred_shared_gate, ctx, stream)
+    }
+
+    pub(super) fn forward_ffn_post(
+        &self,
+        phase: FfnPhase,
+        ffn_out: DevicePtr,
+        deferred_shared_gate: Option<DevicePtr>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let FfnPhase {
+            hidden,
+            normed,
+            tokens,
+            mut profile_timer,
+            ..
+        } = phase;
+        let m = tokens as u32;
+        let h = self.hidden_size as u32;
         profile::step(ctx, stream, &mut profile_timer, "ffn")?;
         if let Some(gate_weight) = deferred_shared_gate {
             let run_fused = || {

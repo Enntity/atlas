@@ -25,7 +25,7 @@ impl Pool {
         );
         let index = lease.slot;
         self.slots[index].retiring = true;
-        if self.verification.as_ref().is_some_and(|v| v.slot == index) {
+        if self.verification.as_ref().is_some_and(|v| v.owns(index)) {
             self.producer_failed = true;
             self.slots[index].failed = true;
         }

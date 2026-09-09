@@ -18,6 +18,16 @@ impl Fixture {
     pub fn paired(rank: usize) -> Self {
         Self(inner::Fixture::new(rank))
     }
+    /// Actual fixed-pair target configuration over the bounded byte backend.
+    /// This selects the real constructor validation, not a fabricated capability.
+    pub fn paired_compute(rank: usize) -> Self {
+        let mut fixture = inner::Fixture::new_pair_compute(rank);
+        fixture
+            .model
+            .initialize_glm_pair_verification(crate::layer::glm_pair_verify::GlmPairFfn::TwoK5)
+            .expect("actual fixture pair-compute configuration");
+        Self(fixture)
+    }
     pub fn legacy(rank: usize) -> Self {
         Self(inner::Fixture::new_legacy(rank))
     }

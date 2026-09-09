@@ -9,6 +9,24 @@ mod quiescence;
 
 impl sealed::Sealed for TransformerModel {}
 impl GlmPairedExecution for TransformerModel {
+    fn pair_verification_enabled(&self) -> bool {
+        self.glm_pair_verify_mode.is_some()
+    }
+    fn validate_verify_pair(
+        &self,
+        seqs: [&SequenceState; 2],
+        tokens: &[[u32; 5]; 2],
+    ) -> Result<()> {
+        self.paired_pair_packet(seqs, tokens).map(|_| ())
+    }
+    fn finish_verify_pair(
+        &self,
+        seqs: [&mut SequenceState; 2],
+        tokens: &[[u32; 5]; 2],
+        accepted: [usize; 2],
+    ) -> Result<()> {
+        self.paired_send_pair_verdict(seqs, tokens, accepted)
+    }
     fn validate_session_rank(&self, expected_rank: u8) -> Result<()> {
         self.paired_validate_session_rank(expected_rank)
     }
@@ -47,6 +65,13 @@ impl GlmPairedExecution for TransformerModel {
     }
     fn verify(&self, seq: &mut SequenceState, tokens: &[u32]) -> Result<Vec<u32>> {
         self.paired_send_verify(seq, tokens)
+    }
+    fn verify_pair(
+        &self,
+        seqs: [&mut SequenceState; 2],
+        tokens: &[[u32; 5]; 2],
+    ) -> Result<[[u32; 5]; 2]> {
+        self.paired_send_verify_pair(seqs, tokens)
     }
     fn propose(
         &self,

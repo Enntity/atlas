@@ -7,6 +7,7 @@ mod forward_recurrent;
 mod hc;
 mod indexed_core;
 mod multi_seq;
+mod paired_verify;
 mod profile;
 mod projection;
 mod recurrent;
@@ -315,6 +316,31 @@ impl Glm5KdaLayer {
 }
 
 impl TransformerLayer for Glm5KdaLayer {
+    fn supports_glm_pair_verify(&self) -> bool {
+        self.pair_supported()
+    }
+
+    fn validate_glm_pair_verify(
+        &self,
+        ctx: &ForwardContext,
+        mode: crate::layer::glm_pair_verify::GlmPairFfn,
+        stream: u64,
+    ) -> Result<()> {
+        let workspace = crate::layer::glm_pair_verify::GlmPairWorkspace::new(ctx, mode)?;
+        self.validate_pair(&workspace, [ctx, ctx], stream)
+    }
+
+    fn decode_glm_pair_verify(
+        &self,
+        owners: [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>; 2],
+        _cache: &mut PagedKvCache,
+        workspace: &mut crate::layer::glm_pair_verify::GlmPairWorkspace,
+        ctx: [&ForwardContext; 2],
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_pair(owners, workspace, ctx, stream)
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }

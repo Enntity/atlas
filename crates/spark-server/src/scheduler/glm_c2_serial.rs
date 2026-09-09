@@ -59,6 +59,13 @@ pub(super) fn step_selected_serial(
             capability.validate_verify(&a.seq, &issued)?;
         }
     }
+    if capability.pair_verification_enabled()
+        && super::glm_c2_pair_step::try_step_pair(
+            model, capability, active, owners, sched, verify_ctx,
+        )?
+    {
+        return Ok(());
+    }
     for index in owners.into_iter().flatten() {
         let a = &mut active[index];
         if stopped(a, sched, true) {
@@ -73,7 +80,7 @@ pub(super) fn step_selected_serial(
     Ok(())
 }
 
-fn stopped(a: &mut ActiveSeq, sched: &SchedCtx, ceiling: bool) -> bool {
+pub(super) fn stopped(a: &mut ActiveSeq, sched: &SchedCtx, ceiling: bool) -> bool {
     // Shutdown is not per-request retirement. Finish any issued transaction,
     // then retain its owners for the selected caller's matched shutdown.
     if crate::tui::shutdown::requested() {
@@ -91,7 +98,7 @@ fn stopped(a: &mut ActiveSeq, sched: &SchedCtx, ceiling: bool) -> bool {
     a.finished
 }
 
-fn issued(a: &ActiveSeq, vocab: usize) -> Result<[u32; 5]> {
+pub(super) fn issued(a: &ActiveSeq, vocab: usize) -> Result<[u32; 5]> {
     anyhow::ensure!(
         a.pending_drafts.len() == 4 && a.pending_drafts.iter().all(|t| (*t as usize) < vocab),
         "paired serial needs exactly four valid drafts"
@@ -105,7 +112,7 @@ fn issued(a: &ActiveSeq, vocab: usize) -> Result<[u32; 5]> {
     ])
 }
 
-fn propose(
+pub(super) fn propose(
     capability: &dyn GlmPairedExecution,
     model: &dyn Model,
     a: &mut ActiveSeq,

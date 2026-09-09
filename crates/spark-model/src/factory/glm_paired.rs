@@ -32,6 +32,10 @@ pub(super) fn validate(
     dflash: bool,
     lora: bool,
 ) -> Result<()> {
+    ensure!(
+        mode == GlmMtpBuildMode::Paired || crate::model::glm_c2_pair_policy::requested()?.is_none(),
+        "joint verification requires explicitly selected paired factory"
+    );
     if mode == GlmMtpBuildMode::Legacy {
         return Ok(());
     }
@@ -147,6 +151,9 @@ pub(super) fn install_head(
                 "Failed to build GLM-5 MTP proposer: {error:#}. Speculative decoding disabled."
             ),
         }
+    }
+    if mode == GlmMtpBuildMode::Paired {
+        model.configure_glm_pair_verification()?;
     }
     Ok(model.into_inner())
 }

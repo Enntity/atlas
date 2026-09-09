@@ -14,6 +14,8 @@ pub(super) const SLAB_BYTES: usize = 2 * SLOT_BYTES;
 mod bootstrap;
 #[path = "paired_close.rs"]
 mod close;
+#[path = "paired_joint.rs"]
+mod joint;
 #[path = "paired_lifecycle.rs"]
 mod lifecycle;
 #[path = "paired_predispatch.rs"]
@@ -35,12 +37,33 @@ struct IssuedProposal {
     base: usize,
     tokens: [u32; 5],
 }
+#[derive(Clone, Copy)]
 struct Verification {
     slot: usize,
     generation: u64,
     issued: IssuedProposal,
     normalized: DevicePtr,
     produced: bool,
+}
+
+enum Producer {
+    Single(Verification),
+    Pair(PairVerification),
+}
+impl Producer {
+    fn owns(&self, index: usize) -> bool {
+        match self {
+            Self::Single(record) => record.slot == index,
+            Self::Pair(pair) => pair.records.iter().any(|record| record.slot == index),
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct PairVerification {
+    records: [Verification; 2],
+    normalized_bytes: usize,
+    detached: [bool; 2],
+    committed: [bool; 2],
 }
 
 struct Binding {
@@ -104,7 +127,7 @@ pub(super) struct Pool {
     slots: [Slot; 2],
     closed: bool,
     close_failed: bool,
-    verification: Option<Verification>,
+    verification: Option<Producer>,
     producer_failed: bool,
 }
 impl Pool {

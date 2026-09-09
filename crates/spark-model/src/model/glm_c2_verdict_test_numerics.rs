@@ -38,6 +38,37 @@ impl Body {
 }
 
 impl TransformerLayer for Body {
+    fn supports_glm_pair_verify(&self) -> bool {
+        self.target
+    }
+    fn validate_glm_pair_verify(
+        &self,
+        ctx: &ForwardContext,
+        mode: crate::layer::glm_pair_verify::GlmPairFfn,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(self.target, "private fixture body is not a paired target");
+        let workspace = crate::layer::glm_pair_verify::GlmPairWorkspace::new(ctx, mode)?;
+        workspace.validate_context(ctx, stream)
+    }
+    fn decode_glm_pair_verify(
+        &self,
+        owners: [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>; 2],
+        _: &mut PagedKvCache,
+        workspace: &mut crate::layer::glm_pair_verify::GlmPairWorkspace<'_>,
+        contexts: [&ForwardContext; 2],
+        stream: u64,
+    ) -> Result<()> {
+        // Same byte-sentinel target as the existing scalar/K5 tests, now using
+        // two actual owner descriptors. This is NOT a KDA/MLA numerical oracle.
+        ensure!(self.target, "private fixture body is not a paired target");
+        workspace.begin_layer(0, &owners, contexts, stream)?;
+        for owner in owners {
+            self.target_rows(owner.hidden, 5, owner.positions[0], stream)?;
+        }
+        workspace.finish_layer();
+        Ok(())
+    }
     fn alloc_state(&self, _: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         if self.record.record_state_allocations.load(Ordering::Relaxed) {
             self.record.event(Event::AllocState(self.target))?;

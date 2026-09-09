@@ -26,6 +26,7 @@ mod fast_greedy;
 #[cfg(test)]
 mod finish_guard_tests;
 mod first_token_thinking;
+mod glm_c2_pair_step;
 #[cfg(target_os = "linux")]
 mod glm_c2_selected;
 #[cfg(target_os = "linux")]

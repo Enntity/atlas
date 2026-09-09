@@ -53,6 +53,39 @@ pub trait GlmPairRepair: Send + Sync {
 
 /// Optional GLM-only request-owned path; legacy and other proposers lack it.
 pub trait GlmPairedHandoff: Send + Sync {
+    /// Fixed canonical slot order. Facts identify existing issued proposals;
+    /// this immutable check neither reserves scratch nor creates authority.
+    fn validate_verify_pair(
+        &self,
+        inputs: &[crate::model::GlmPairedInput<'_>; 2],
+        tokens: &[[u32; 5]; 2],
+        states: [&dyn ProposerState; 2],
+        ctx: &ForwardContext,
+    ) -> Result<[(u64, u64); 2]>;
+    fn begin_verify_pair(
+        &self,
+        inputs: &[crate::model::GlmPairedInput<'_>; 2],
+        tokens: &[[u32; 5]; 2],
+        states: [&mut dyn ProposerState; 2],
+        ctx: &ForwardContext,
+    ) -> Result<()>;
+    fn publish_verify_pair(
+        &self,
+        inputs: &[crate::model::GlmPairedInput<'_>; 2],
+        tokens: &[[u32; 5]; 2],
+        predictions: &[[u32; 5]; 2],
+        states: [&mut dyn ProposerState; 2],
+        ctx: &ForwardContext,
+    ) -> Result<()>;
+    fn record_verify_pair(
+        &self,
+        inputs: &[crate::model::GlmPairedInput<'_>; 2],
+        bases: [usize; 2],
+        tokens: &[[u32; 5]; 2],
+        accepted: [usize; 2],
+        states: [&mut dyn ProposerState; 2],
+        ctx: &ForwardContext,
+    ) -> Result<()>;
     /// Read-only open/unfailed actual pool check, independent of free slot count.
     fn validate_session(&self, gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()>;
     /// Read-only candidate identity, not a reservation or published lease.

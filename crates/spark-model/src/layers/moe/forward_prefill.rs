@@ -29,13 +29,14 @@ impl MoeLayer {
     /// Normal prefill and every other model always pass `false` through the
     /// public wrapper above.
     #[allow(unused_assignments)]
-    pub(super) fn forward_prefill_impl(
+    pub(super) fn forward_prefill_mode(
         &self,
         input: DevicePtr,
         num_tokens: usize,
         ctx: &ForwardContext,
         stream: u64,
         defer_shared_hc: bool,
+        mode: super::forward_pair_verify::PrefillMode,
     ) -> Result<()> {
         self.btile_input_guard(input, num_tokens, ctx, stream)?;
         anyhow::ensure!(
@@ -192,7 +193,20 @@ impl MoeLayer {
             && std::env::var("ATLAS_MOE_SHARED_REDUCE_OVERLAP").as_deref() == Ok("1");
 
         if has_shared && !overlap_shared_reduce {
-            self.run_shared_expert_prefill(input, n, h, shared_inter, stream, stream, false, ctx)?;
+            if mode == super::forward_pair_verify::PrefillMode::PairVerify {
+                self.run_pair_shared(input, ctx, stream)?;
+            } else {
+                self.run_shared_expert_prefill(
+                    input,
+                    n,
+                    h,
+                    shared_inter,
+                    stream,
+                    stream,
+                    false,
+                    ctx,
+                )?;
+            }
         }
         prof_step!("shared_expert");
 
@@ -406,6 +420,7 @@ impl MoeLayer {
             num_tokens,
             ne,
             &mut t0,
+            mode,
             ctx,
             stream,
         )?;

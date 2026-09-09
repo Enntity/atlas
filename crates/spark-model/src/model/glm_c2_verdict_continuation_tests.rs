@@ -87,7 +87,14 @@ pub(super) struct History {
 }
 
 pub(super) fn prepare(rank: usize, order: [usize; 2]) -> (Fixture, [History; 2]) {
-    let mut f = Fixture::new(rank);
+    prepare_fixture(Fixture::new(rank), order)
+}
+
+pub(super) fn prepare_pair(rank: usize, order: [usize; 2]) -> (Fixture, [History; 2]) {
+    prepare_fixture(Fixture::new_pair_compute(rank), order)
+}
+
+fn prepare_fixture(mut f: Fixture, order: [usize; 2]) -> (Fixture, [History; 2]) {
     f.gpu.deterministic_logits.store(true, Ordering::Relaxed);
     f.gpu.write_span(f.gpu.slab(), &vec![0xa5; SLAB_BYTES]);
     let prompts = [vec![1, 2, 3, 4], vec![6, 5, 4, 3, 2, 1]];

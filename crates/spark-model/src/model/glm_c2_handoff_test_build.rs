@@ -5,20 +5,27 @@ use crate::traits::Model;
 
 impl Fixture {
     pub fn new(rank: usize) -> Self {
-        Self::build(rank, true)
+        Self::build(rank, true, 8)
+    }
+
+    pub fn new_pair_compute(rank: usize) -> Self {
+        Self::build(rank, true, 20)
     }
 
     pub fn new_legacy(rank: usize) -> Self {
-        Self::build(rank, false)
+        Self::build(rank, false, 8)
     }
 
-    fn build(rank: usize, paired: bool) -> Self {
+    fn build(rank: usize, paired: bool, target_rows: usize) -> Self {
         assert!(rank < 2);
         let record = Arc::new(Recorder::default());
         let gpu = Box::new(Gpu(record.clone()));
         let mut cfg = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
         cfg.model_type = "glm5_next".into();
         cfg.hidden_size = 4096;
+        if target_rows == 20 {
+            cfg.hc_mult = 4;
+        }
         cfg.vocab_size = 8;
         cfg.num_hidden_layers = 1;
         cfg.layer_types = vec![atlas_core::config::LayerType::FullAttention];
@@ -84,7 +91,8 @@ impl Fixture {
             .unwrap(),
         );
         let buffers =
-            spark_runtime::buffers::BufferArena::new(&cfg, 8, 2044, 16, 1, gpu.as_ref()).unwrap();
+            spark_runtime::buffers::BufferArena::new(&cfg, target_rows, 2044, 16, 1, gpu.as_ref())
+                .unwrap();
         let cache = PagedKvCache::new(
             KvCacheConfig {
                 block_size: 16,
@@ -132,6 +140,9 @@ impl Fixture {
         )
         .unwrap();
         model.levers.max_decode_seqs = if paired { 2 } else { 1 };
+        if target_rows == 20 {
+            model.ep_protocol_v2 = true;
+        }
         model.levers.drafter.prefill = true;
         model.levers.drafter.carry = false;
         model.dispatch.cublas_gemm = false;

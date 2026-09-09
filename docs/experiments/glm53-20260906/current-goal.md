@@ -116,6 +116,11 @@ completed without OOM/swap. The controller still failed on a two-snapshot Docker
 Running-to-Exited race, so full campaign qualification remains pending. Fix that
 narrow observer transition while building joint layer-major verification: the
 two-owner routed FFN is the next performance target, not an achieved gain.
+The observer fix is now committed in `7d0d220b`. The fixed-pair model/scheduler
+and joint routed-FFN candidate are implemented default-off, with actual CPU
+ownership/continuation checks; native numerical and throughput qualification
+remain outstanding. See `paired-temporal-verification.md` for the implementation,
+explicit controls and evidence boundaries.
 See `scripts/dev/glm_c2_live_integration_plan.md` and
 the exact proposed `glm_c2_live_wire_plan.md`. Neither standalone kernels nor inactive infrastructure complete
 the goal; require measured native serving gains and all quality checks.

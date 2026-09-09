@@ -18,6 +18,12 @@ pub(crate) fn prepare_reserve<B>(
 }
 
 fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<Option<Topology>> {
+    if spark_model::model::glm_c2_pair_policy::requested()?.is_some() {
+        anyhow::ensure!(
+            args.glm_paired_mtp && args.max_prefill_tokens >= 20,
+            "joint verification requires selected paired serving and at least20 prefill rows"
+        );
+    }
     if args.glm_paired_mtp {
         let topology = resolve_topology(args, config)?;
         anyhow::ensure!(

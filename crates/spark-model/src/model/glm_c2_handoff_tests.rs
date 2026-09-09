@@ -21,6 +21,10 @@ mod f1_ownership_tests;
 use super::glm_c2_test_support::fixture;
 #[path = "glm_c2_legacy_boundary_tests.rs"]
 mod legacy_boundary_tests;
+#[path = "glm_c2_pair_producer_tests.rs"]
+mod pair_producer_tests;
+#[path = "glm_c2_pair_verify_tests.rs"]
+mod pair_verify_tests;
 #[path = "glm_c2_predispatch_tests.rs"]
 mod predispatch_tests;
 #[path = "glm_c2_handoff_preflight_tests.rs"]

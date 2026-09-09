@@ -40,6 +40,45 @@ impl Pool {
 }
 
 impl GlmPairedHandoff for Glm5MtpHead {
+    fn validate_verify_pair(
+        &self,
+        inputs: &[crate::model::GlmPairedInput<'_>; 2],
+        tokens: &[[u32; 5]; 2],
+        states: [&dyn ProposerState; 2],
+        ctx: &ForwardContext,
+    ) -> Result<[(u64, u64); 2]> {
+        self.paired_validate_verify_pair(inputs, tokens, states, ctx)
+    }
+    fn begin_verify_pair(
+        &self,
+        inputs: &[crate::model::GlmPairedInput<'_>; 2],
+        tokens: &[[u32; 5]; 2],
+        states: [&mut dyn ProposerState; 2],
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_begin_verify_pair(inputs, tokens, states, ctx)
+    }
+    fn publish_verify_pair(
+        &self,
+        inputs: &[crate::model::GlmPairedInput<'_>; 2],
+        tokens: &[[u32; 5]; 2],
+        predictions: &[[u32; 5]; 2],
+        states: [&mut dyn ProposerState; 2],
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_publish_verify_pair(inputs, tokens, predictions, states, ctx)
+    }
+    fn record_verify_pair(
+        &self,
+        inputs: &[crate::model::GlmPairedInput<'_>; 2],
+        bases: [usize; 2],
+        tokens: &[[u32; 5]; 2],
+        accepted: [usize; 2],
+        states: [&mut dyn ProposerState; 2],
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        self.paired_record_verify_pair(inputs, bases, tokens, accepted, states, ctx)
+    }
     fn validate_verify(
         &self,
         input: &crate::model::GlmPairedInput<'_>,

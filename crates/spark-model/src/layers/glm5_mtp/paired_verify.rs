@@ -55,10 +55,13 @@ impl Pool {
             !self.producer_failed,
             "paired verification terminally failed"
         );
-        let record = self
+        let Producer::Single(record) = self
             .verification
             .as_ref()
-            .context("paired actual verification receipt missing")?;
+            .context("paired actual verification receipt missing")?
+        else {
+            anyhow::bail!("Single verification cannot consume Pair producer");
+        };
         ensure!(
             record.slot == index
                 && record.generation == self.slots[index].generation
@@ -71,7 +74,7 @@ impl Pool {
 }
 
 impl Pool {
-    fn verify_candidate(
+    pub(super) fn verify_candidate(
         &self,
         input: &crate::model::GlmPairedInput<'_>,
         tokens: &[u32],
@@ -161,7 +164,7 @@ impl Glm5MtpHead {
         self.validate_paired_live(state, ctx.gpu)?;
         let mut pool = self.paired.as_ref().context("paired pool missing")?.lock();
         let candidate = pool.verify_candidate(input, tokens, state, ctx)?;
-        pool.verification = Some(candidate);
+        pool.verification = Some(Producer::Single(candidate));
         Ok(())
     }
 
@@ -199,10 +202,9 @@ impl Glm5MtpHead {
                     .all(|&p| (p as usize) < ctx.config.vocab_size),
             "paired K5 actual producer return mismatch"
         );
-        pool.verification
-            .as_mut()
-            .expect("checked actual producer")
-            .produced = true;
+        if let Some(Producer::Single(record)) = pool.verification.as_mut() {
+            record.produced = true;
+        }
         Ok(())
     }
 }

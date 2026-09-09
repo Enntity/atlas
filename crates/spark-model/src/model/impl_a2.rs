@@ -442,6 +442,9 @@ impl TransformerModel {
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
         }
+        if cmd == super::glm_c2_pair_transport::EP_GLM_PAIR_VERIFY {
+            return self.paired_receive_verify_pair(seq_id, slots);
+        }
 
         let slot_idx = seq_id as usize;
         if slot_idx >= slots.len() {

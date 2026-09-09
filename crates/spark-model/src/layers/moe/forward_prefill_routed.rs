@@ -42,6 +42,7 @@ impl MoeLayer {
         num_tokens: usize,
         ne: usize,
         t0: &mut Option<std::time::Instant>,
+        mode: super::forward_pair_verify::PrefillMode,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -56,12 +57,19 @@ impl MoeLayer {
             };
         }
 
+        let paired = mode == super::forward_pair_verify::PrefillMode::PairVerify;
         let avg_per_expert = (num_tokens * top_k as usize).div_ceil(ne);
         // Default to the absolute worst case (one expert receives every routed
         // token) to prevent silent truncation. An opt-in load-factor cap lets
         // Holo experiments trade that safety margin for fewer empty expert
         // tiles after validating the router histogram.
-        let worst_case_m_tiles = (num_tokens * top_k as usize).div_ceil(64).max(1) as u32;
+        // Fixed pair uses unique top8 routing: each expert receives at most10
+        // rows, not80. One M64 tile needs no offsets D2H or load-factor guess.
+        let worst_case_m_tiles = if paired {
+            1
+        } else {
+            (num_tokens * top_k as usize).div_ceil(64).max(1) as u32
+        };
         // Default-on for NVFP4 experts ONLY; opt-in ("=1") everywhere else.
         //
         // Reads the REAL expert offsets instead of the worst-case bound above, so it
@@ -92,7 +100,9 @@ impl MoeLayer {
         // list; copying them again would introduce a second stream-draining
         // D2H boundary in every MoE layer.
         let mut exact_eoff: Option<Vec<i32>> = None;
-        let max_m_tiles = if self.btile_storage.is_published() {
+        let max_m_tiles = if paired {
+            1
+        } else if self.btile_storage.is_published() {
             // Top-k selects each expert at most once per token, so a local
             // expert has at most `num_tokens` sorted rows: 17 M64 tiles at1088.
             num_tokens.div_ceil(64) as u32
@@ -259,7 +269,8 @@ impl MoeLayer {
                         stream,
                     )?;
                 } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
-                    let compact = if compact_k5
+                    let compact = if paired
+                        || compact_k5
                         || self.glm_c2_grouped(ctx, n)
                         || self.glm_c3_grouped(ctx, n)
                         || self.glm_c4_grouped(ctx, n)
@@ -309,6 +320,7 @@ impl MoeLayer {
                         num_experts,
                         max_m_tiles,
                         compact,
+                        mode,
                         ctx,
                         stream,
                     )?;

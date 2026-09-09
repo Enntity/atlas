@@ -30,6 +30,7 @@ mod mla_gemv;
 mod mla_glm;
 mod mla_glm_sparse;
 mod mla_independent;
+mod pair;
 mod qkv;
 
 impl Qwen3AttentionLayer {

@@ -13,6 +13,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
+pub mod glm_pair_verify;
 pub mod ssm_batch;
 mod transformer_layer;
 pub use transformer_layer::{

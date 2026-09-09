@@ -124,64 +124,14 @@ impl MoeLayer {
             && !self.weights.shared_expert.up_proj.is_null()
             && !self.weights.shared_expert.down_proj.is_null();
         if exact_k5 {
-            let fused_gate_up = self.w4a16_batch5_dual_k.0 != 0
-                && std::env::var("ATLAS_GLM_K5_FUSED_SHARED_GATE_UP").as_deref() == Ok("1");
-            if fused_gate_up {
-                ops::w4a16_gemv_batch5_dual(
-                    ctx.gpu,
-                    self.w4a16_batch5_dual_k,
-                    input,
-                    &self.weights.shared_expert.gate_proj,
-                    &self.weights.shared_expert.up_proj,
-                    shared_gate_out,
-                    shared_up_out,
-                    5,
-                    shared_inter,
-                    h,
-                    aux,
-                )?;
-            } else {
-                ops::w4a16_gemv_batchm(
-                    ctx.gpu,
-                    batch5,
-                    input,
-                    &self.weights.shared_expert.gate_proj,
-                    shared_gate_out,
-                    5,
-                    shared_inter,
-                    h,
-                    aux,
-                )?;
-                ops::w4a16_gemv_batchm(
-                    ctx.gpu,
-                    batch5,
-                    input,
-                    &self.weights.shared_expert.up_proj,
-                    shared_up_out,
-                    5,
-                    shared_inter,
-                    h,
-                    aux,
-                )?;
-            }
-            ops::silu_mul(
-                ctx.gpu,
-                self.moe_act_mul,
+            self.run_exact_k5_shared(
+                input,
                 shared_gate_out,
                 shared_up_out,
-                shared_gate_out,
-                5 * shared_inter,
-                aux,
-            )?;
-            ops::w4a16_gemv_batchm(
-                ctx.gpu,
-                batch5,
-                shared_gate_out,
-                &self.weights.shared_expert.down_proj,
                 shared_down_out,
-                5,
                 h,
                 shared_inter,
+                ctx,
                 aux,
             )?;
             if use_overlap {

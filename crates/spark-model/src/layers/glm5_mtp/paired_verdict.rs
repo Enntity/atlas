@@ -3,6 +3,30 @@
 use super::*;
 
 impl Glm5MtpHead {
+    pub(super) fn paired_detach_rows(
+        ctx: &ForwardContext,
+        source: DevicePtr,
+        destination: DevicePtr,
+        accepted: usize,
+    ) -> Result<()> {
+        let stream = ctx.gpu.default_stream();
+        if accepted > 0 {
+            ctx.gpu.copy_d2d_async(
+                source,
+                destination.offset(ROW_BYTES),
+                accepted * ROW_BYTES,
+                stream,
+            )?;
+        }
+        ctx.gpu.copy_d2d_async(
+            source.offset(accepted * ROW_BYTES),
+            destination.offset(5 * ROW_BYTES),
+            ROW_BYTES,
+            stream,
+        )?;
+        ctx.gpu.synchronize(stream)
+    }
+
     pub(in crate::layers::glm5_mtp) fn paired_acknowledge(
         &self,
         accepted: usize,
@@ -78,8 +102,26 @@ impl Glm5MtpHead {
                 && !pool.slots[index].commit_queued,
             "paired target commit count/position changed or duplicate"
         );
+        if pool.verification.is_some() {
+            let pair = pool.pair_owner(ctx)?;
+            let record = &pair.records[index];
+            ensure!(
+                pair.detached == [true; 2]
+                    && !pair.committed[index]
+                    && record.produced
+                    && pending.tokens == record.issued.tokens
+                    && record.issued.base.checked_add(committed) == Some(input.data().position),
+                "Pair target commit precedes both detaches or differs from issued verdict"
+            );
+        }
         if completed {
             pool.slots[index].commit_queued = true;
+            if let Some(Producer::Pair(pair)) = pool.verification.as_mut() {
+                pair.committed[index] = true;
+                if pair.committed == [true; 2] {
+                    pool.verification = None;
+                }
+            }
         }
         Ok(())
     }
@@ -133,24 +175,9 @@ impl Glm5MtpHead {
             )?;
             (index, pool.slab.offset(index * SLOT_BYTES), pending)
         };
-        let stream = ctx.gpu.default_stream();
         owner.lock().slots[index].writing = true;
         let result = (|| {
-            if accepted > 0 {
-                ctx.gpu.copy_d2d_async(
-                    input.data().normalized.ptr,
-                    destination.offset(ROW_BYTES),
-                    accepted * ROW_BYTES,
-                    stream,
-                )?;
-            }
-            ctx.gpu.copy_d2d_async(
-                input.data().normalized.ptr.offset(accepted * ROW_BYTES),
-                destination.offset(5 * ROW_BYTES),
-                ROW_BYTES,
-                stream,
-            )?;
-            ctx.gpu.synchronize(stream)?;
+            Self::paired_detach_rows(ctx, input.data().normalized.ptr, destination, accepted)?;
             let mut pool = owner.lock();
             pool.matches_request(state, input, ctx)?;
             pool.verification_owner(index, tokens)?;

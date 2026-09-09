@@ -42,6 +42,33 @@ pub const VERIFY_WY_LAYER_STRIDE_BYTES: usize =
     VERIFY_WY_TABLES_PER_LAYER * VERIFY_WY_TABLE_STRIDE_BYTES;
 
 pub trait TransformerLayer: Send + Sync {
+    /// Fixed eager GLM [5,5] compute support, not request/transaction authority.
+    fn supports_glm_pair_verify(&self) -> bool {
+        false
+    }
+
+    /// Read-only support/handle/profile check before any layer in a pair runs.
+    fn validate_glm_pair_verify(
+        &self,
+        _ctx: &ForwardContext<'_>,
+        _mode: super::glm_pair_verify::GlmPairFfn,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM pair layer verification is unsupported")
+    }
+
+    /// One layer for two temporal owners. Unsupported layers refuse before work.
+    fn decode_glm_pair_verify(
+        &self,
+        _owners: [super::glm_pair_verify::GlmPairLayerInput<'_>; 2],
+        _cache: &mut PagedKvCache,
+        _workspace: &mut super::glm_pair_verify::GlmPairWorkspace<'_>,
+        _ctx: [&ForwardContext<'_>; 2],
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM pair layer verification is unsupported")
+    }
+
     /// `&mut dyn Any` downcast hook for post-construction weight overlays (e.g.
     /// the LoRA install walk). Default `None`; overlay-capable layers override.
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

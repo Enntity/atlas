@@ -162,6 +162,7 @@ impl MoeLayer {
         num_experts: u32,
         max_m_tiles: u32,
         compact: Option<CompactMoeWorklist>,
+        mode: super::forward_pair_verify::PrefillMode,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -186,7 +187,8 @@ impl MoeLayer {
             self.moe_w4a4_prequant_t_k64
         };
         if let Some(work) = compact
-            && (std::env::var("ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP").as_deref() == Ok("1")
+            && (mode == super::forward_pair_verify::PrefillMode::PairVerify
+                || std::env::var("ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP").as_deref() == Ok("1")
                 || self.glm_c3_grouped(ctx, n)
                 || self.glm_c2_grouped(ctx, n)
                 || self.independent_grouped(ctx, n)

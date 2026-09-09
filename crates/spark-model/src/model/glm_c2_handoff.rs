@@ -182,7 +182,10 @@ impl TransformerModel {
         )
     }
 
-    fn paired_input<'a>(&self, seq: &'a SequenceState) -> Result<GlmPairedInput<'a>> {
+    pub(in crate::model) fn paired_input<'a>(
+        &self,
+        seq: &'a SequenceState,
+    ) -> Result<GlmPairedInput<'a>> {
         self.paired_profile(seq)?;
         ensure!(
             seq.tokens.len() == seq.seq_len
