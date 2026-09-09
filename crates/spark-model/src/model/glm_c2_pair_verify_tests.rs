@@ -64,6 +64,7 @@ fn pair_round(
     rx: &wire::Wire,
     accepted: [usize; 2],
     order: [usize; 2],
+    mode_word: u32,
 ) {
     let tokens: [[u32; 5]; 2] =
         std::array::from_fn(|owner| history[owner].issued.as_slice().try_into().unwrap());
@@ -112,7 +113,7 @@ fn pair_round(
     assert_eq!(packets[0], [0]);
     assert_eq!(packets[1], [0xffff_ffe6]);
     assert_eq!(packets[2].len(), 26);
-    assert_eq!(&packets[2][..4], &[1, 2, 10, 1]);
+    assert_eq!(&packets[2][..4], &[1, 2, 10, mode_word]);
     assert_eq!(packets[3], [1, 2, accepted[0] as u32, accepted[1] as u32]);
     for owner in 0..2 {
         assert_eq!(packets[2][4 + owner * 11], owner as u32);
@@ -200,6 +201,22 @@ fn all25_pair_verdicts_actual_worker_e1_and_next_pair() {
     if flow::isolated("pair_verify_tests::all25_pair_verdicts_actual_worker_e1_and_next_pair") {
         return;
     }
+    all25(GlmPairFfn::TwoK5, 1);
+}
+
+#[test]
+fn all25_shared_m10_pair_verdicts_actual_worker_e1_and_next_pair() {
+    if flow::isolated(
+        "pair_verify_tests::all25_shared_m10_pair_verdicts_actual_worker_e1_and_next_pair",
+    ) {
+        return;
+    }
+    // Real Model/producer/packet/worker paths, with the existing byte-sentinel
+    // layer body. Shared FFN numerical/launch correctness belongs to its tests.
+    all25(GlmPairFfn::JointSharedM10, 3);
+}
+
+fn all25(mode: GlmPairFfn, mode_word: u32) {
     for order in [[0, 1], [1, 0]] {
         for a in 0..5 {
             for b in 0..5 {
@@ -207,9 +224,7 @@ fn all25_pair_verdicts_actual_worker_e1_and_next_pair() {
                 let (mut worker, _) = flow::prepare_pair(1, order);
                 let (mut control, mut history) = flow::prepare_pair(0, order);
                 for f in [&mut head, &mut worker] {
-                    f.model
-                        .initialize_glm_pair_verification(GlmPairFfn::TwoK5)
-                        .unwrap();
+                    f.model.initialize_glm_pair_verification(mode).unwrap();
                 }
                 let tx = wire::Wire::install(&mut head, 0);
                 let rx = wire::Wire::install(&mut worker, 1);
@@ -228,6 +243,7 @@ fn all25_pair_verdicts_actual_worker_e1_and_next_pair() {
                         &rx,
                         accepted,
                         turn,
+                        mode_word,
                     );
                     repropose(
                         &mut head,
@@ -241,6 +257,147 @@ fn all25_pair_verdicts_actual_worker_e1_and_next_pair() {
                     );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn shared_m10_head_worker_mode_mismatch_refuses_before_target_compute() {
+    const TEST: &str =
+        "pair_verify_tests::shared_m10_head_worker_mode_mismatch_refuses_before_target_compute";
+    const CASE: &str = "ATLAS_C2_PAIR_MODE_MISMATCH_CASE";
+    if flow::isolated(TEST) {
+        return;
+    }
+    // The real failure poisons process-wide paired session state. Each case
+    // inherits the existing isolated() environment but needs its own process.
+    let selected = match std::env::var(CASE) {
+        Ok(value) => value.parse::<usize>().unwrap(),
+        Err(std::env::VarError::NotPresent) => {
+            for case in 0..8 {
+                assert!(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            &format!("model::glm_c2_handoff_tests::{TEST}"),
+                            "--nocapture",
+                        ])
+                        .env(CASE, case.to_string())
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "actual mismatch child failed: {case}"
+                );
+            }
+            return;
+        }
+        Err(error) => panic!("invalid mismatch child selector: {error}"),
+    };
+    assert!(selected < 8);
+    for (order_index, order) in [[0, 1], [1, 0]].into_iter().enumerate() {
+        for (mode_index, (head_mode, worker_mode, head_word)) in [
+            (GlmPairFfn::TwoK5, GlmPairFfn::JointSharedM10, 1),
+            (GlmPairFfn::Joint, GlmPairFfn::JointSharedM10, 2),
+            (GlmPairFfn::JointSharedM10, GlmPairFfn::TwoK5, 3),
+            (GlmPairFfn::JointSharedM10, GlmPairFfn::Joint, 3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if selected != order_index * 4 + mode_index {
+                continue;
+            }
+            let (mut head, history) = flow::prepare_pair(0, order);
+            let (mut worker, _) = flow::prepare_pair(1, order);
+            head.model
+                .initialize_glm_pair_verification(head_mode)
+                .unwrap();
+            worker
+                .model
+                .initialize_glm_pair_verification(worker_mode)
+                .unwrap();
+            let tx = wire::Wire::install(&mut head, 0);
+            let rx = wire::Wire::install(&mut worker, 1);
+            let tokens: [[u32; 5]; 2] =
+                std::array::from_fn(|owner| history[owner].issued.as_slice().try_into().unwrap());
+            let [s0, s1] = &mut head.seqs;
+            head.model
+                .glm_paired_execution()
+                .unwrap()
+                .verify_pair([s0, s1], &tokens)
+                .unwrap();
+            let packets = tx.packets();
+            assert_eq!(packets.len(), 3);
+            assert_eq!(&packets[2][..4], &[1, 2, 10, head_word]);
+            let before = worker
+                .seqs
+                .each_ref()
+                .map(|seq| (seq.seq_len, seq.tokens.clone(), seq.block_table.clone()));
+            let private_before = std::array::from_fn::<_, 2, _>(|owner| {
+                // Resolve real backing while the lease is healthy. A rejected
+                // E6 deliberately makes subsequent lease-based inspection fail.
+                worker
+                    .head
+                    .paired_test_kv_rows(
+                        worker.seqs[owner].proposer_state.as_deref().unwrap(),
+                        worker.model.gpu.as_ref(),
+                        flow::private(&worker.seqs[owner]).seq_len,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let bytes = worker.gpu.read_span(k, 1024);
+                        assert_eq!(worker.gpu.read_span(v, 1024), bytes);
+                        (k, v, bytes)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let slab = worker.gpu.read_span(worker.gpu.slab(), SLAB_BYTES);
+            let free = worker.model.kv_cache.lock().num_free_blocks();
+            worker.gpu.clear();
+            rx.queue(&packets);
+            let error = wire::worker(&mut worker).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("mode/owner/generation/attempt/token mismatch"),
+                "{error:#}"
+            );
+            rx.done();
+            assert_eq!(
+                rx.packets(),
+                packets,
+                "consumes E6 header/payload, no verdict read"
+            );
+            assert!(
+                !worker.gpu.trace().iter().any(|event| matches!(
+                    event,
+                    Event::Kernel(_, _, _)
+                        | Event::Target(_, _, _)
+                        | Event::Body(_, _)
+                        | Event::Kv(_, _)
+                        | Event::Copy(_, _, _, _)
+                        | Event::Memset(_, _, _)
+                        | Event::Alloc(_, _)
+                        | Event::Free(_)
+                )),
+                "mismatched cold modes must refuse before target allocation/compute"
+            );
+            assert_eq!(worker.model.kv_cache.lock().num_free_blocks(), free);
+            assert_eq!(worker.gpu.read_span(worker.gpu.slab(), SLAB_BYTES), slab);
+            for owner in 0..2 {
+                assert_eq!(
+                    (
+                        worker.seqs[owner].seq_len,
+                        worker.seqs[owner].tokens.clone(),
+                        worker.seqs[owner].block_table.clone()
+                    ),
+                    before[owner]
+                );
+                for (k, v, bytes) in &private_before[owner] {
+                    assert_eq!(&worker.gpu.read_span(*k, 1024), bytes);
+                    assert_eq!(&worker.gpu.read_span(*v, 1024), bytes);
+                }
+            }
+            super::transport_boundary_tests::terminal(&mut worker);
         }
     }
 }

@@ -46,7 +46,7 @@ impl Glm5KdaLayer {
                     self.ffn
                         .validate_pair_k5(ctx.buffers.norm_output(), ctx, stream)?
                 }
-                GlmPairFfn::Joint => {
+                GlmPairFfn::Joint | GlmPairFfn::JointSharedM10 => {
                     self.ffn
                         .validate_pair_verify(ctx.buffers.norm_output(), ctx, stream)?
                 }
@@ -151,11 +151,12 @@ impl Glm5KdaLayer {
             workspace.save_attention(owner, stream)?;
         }
         workspace.pack_norms(stream)?;
-        let joint = if workspace.mode == GlmPairFfn::Joint {
+        let joint = if let Some(shared) = workspace.mode.joint_shared() {
             Some(self.ffn.forward_pair_verify(
                 contexts[0].buffers.norm_output(),
                 contexts[0],
                 stream,
+                shared,
             )?)
         } else {
             None

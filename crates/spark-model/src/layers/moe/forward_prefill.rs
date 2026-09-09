@@ -193,8 +193,8 @@ impl MoeLayer {
             && std::env::var("ATLAS_MOE_SHARED_REDUCE_OVERLAP").as_deref() == Ok("1");
 
         if has_shared && !overlap_shared_reduce {
-            if mode == super::forward_pair_verify::PrefillMode::PairVerify {
-                self.run_pair_shared(input, ctx, stream)?;
+            if let super::forward_pair_verify::PrefillMode::PairVerify(shared) = mode {
+                self.run_pair_shared(input, ctx, stream, shared)?;
             } else {
                 self.run_shared_expert_prefill(
                     input,

@@ -57,7 +57,7 @@ impl MoeLayer {
             };
         }
 
-        let paired = mode == super::forward_pair_verify::PrefillMode::PairVerify;
+        let paired = mode.is_pair();
         let avg_per_expert = (num_tokens * top_k as usize).div_ceil(ne);
         // Default to the absolute worst case (one expert receives every routed
         // token) to prevent silent truncation. An opt-in load-factor cap lets

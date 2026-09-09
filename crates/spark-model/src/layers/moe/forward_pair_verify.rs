@@ -2,12 +2,19 @@
 //! Fixed two-K5 stateless FFN entry; no sequence or paired Model authority.
 
 use super::*;
+use crate::layer::glm_pair_verify::GlmPairShared;
 use crate::layers::FfnComponent;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PrefillMode {
     Legacy,
-    PairVerify,
+    PairVerify(GlmPairShared),
+}
+
+impl PrefillMode {
+    pub(super) fn is_pair(self) -> bool {
+        matches!(self, Self::PairVerify(_))
+    }
 }
 
 impl FfnComponent {
@@ -67,10 +74,11 @@ impl FfnComponent {
         input: DevicePtr,
         ctx: &ForwardContext,
         stream: u64,
+        shared: GlmPairShared,
     ) -> Result<DevicePtr> {
         self.validate_pair_verify(input, ctx, stream)?;
         match self {
-            Self::Moe(layer) => layer.forward_pair_verify(input, ctx, stream),
+            Self::Moe(layer) => layer.forward_pair_verify(input, ctx, stream, shared),
             Self::Dense(_) => {
                 let output = ctx.buffers.moe_output();
                 // Existing K5 writes row0. Complete owner1 and save it before
@@ -96,9 +104,17 @@ impl MoeLayer {
         input: DevicePtr,
         ctx: &ForwardContext,
         stream: u64,
+        shared: GlmPairShared,
     ) -> Result<DevicePtr> {
         self.validate_pair_verify(input, ctx, stream)?;
-        self.forward_prefill_mode(input, 10, ctx, stream, false, PrefillMode::PairVerify)?;
+        self.forward_prefill_mode(
+            input,
+            10,
+            ctx,
+            stream,
+            false,
+            PrefillMode::PairVerify(shared),
+        )?;
         Ok(ctx.buffers.moe_output())
     }
 

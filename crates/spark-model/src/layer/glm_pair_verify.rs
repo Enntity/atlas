@@ -18,6 +18,24 @@ pub(crate) const OWNER_HIGHWAY_BYTES: usize = 5 * 4 * 4096 * 4;
 pub enum GlmPairFfn {
     TwoK5,
     Joint,
+    JointSharedM10,
+}
+
+/// Shared arithmetic width inside the already-joint routed FFN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GlmPairShared {
+    TwoM5,
+    M10,
+}
+
+impl GlmPairFfn {
+    pub(crate) fn joint_shared(self) -> Option<GlmPairShared> {
+        match self {
+            Self::TwoK5 => None,
+            Self::Joint => Some(GlmPairShared::TwoM5),
+            Self::JointSharedM10 => Some(GlmPairShared::M10),
+        }
+    }
 }
 /// Borrowed real owner inputs, ordered by physical slot 0 then 1 by the model.
 /// The model must validate actual slot/generation, state and KV ownership first.

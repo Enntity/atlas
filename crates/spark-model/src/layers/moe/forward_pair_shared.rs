@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Two literal generic-T K5 shared experts; Joint changes routed work only.
+//! Explicit shared width within the joint routed FFN; legacy K5 is separate.
 use super::*;
+use crate::layer::glm_pair_verify::GlmPairShared;
 
 impl MoeLayer {
     pub(super) fn run_pair_shared(
@@ -8,6 +9,7 @@ impl MoeLayer {
         input: DevicePtr,
         ctx: &ForwardContext,
         stream: u64,
+        shared: GlmPairShared,
     ) -> Result<()> {
         let h = ctx.config.hidden_size;
         let inter = ctx.config.shared_expert_intermediate_size;
@@ -25,14 +27,20 @@ impl MoeLayer {
             .shared_down_t
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("paired shared down-T missing"))?;
-        for owner in 0..2 {
-            let row_input = input.offset(owner * 5 * h * 2);
+        // Both widths use the same generic-T kernel and elementwise activation;
+        // the explicit M10 candidate only shares their existing weight scans.
+        let rows = match shared {
+            GlmPairShared::TwoM5 => 5,
+            GlmPairShared::M10 => 10,
+        };
+        for owner in 0..(10 / rows) {
+            let row_input = input.offset(owner * rows * h * 2);
             let gate_out = ctx
                 .buffers
                 .ssm_deinterleaved()
-                .offset(owner * 5 * inter * 2);
-            let up_out = ctx.buffers.ssm_qkvz().offset(owner * 5 * inter * 2);
-            let down_out = ctx.buffers.attn_output().offset(owner * 5 * h * 2);
+                .offset(owner * rows * inter * 2);
+            let up_out = ctx.buffers.ssm_qkvz().offset(owner * rows * inter * 2);
+            let down_out = ctx.buffers.attn_output().offset(owner * rows * h * 2);
             // The existing policy is preflight-validated OFF. Thus these are
             // precisely the control's nine-argument native-T GEMM launches,
             // with explicit per-owner destinations, not exact-K5 GEMVs.
@@ -45,7 +53,7 @@ impl MoeLayer {
                     row_input,
                     weight,
                     out,
-                    5,
+                    rows as u32,
                     inter as u32,
                     h as u32,
                     ctx,
@@ -59,7 +67,7 @@ impl MoeLayer {
                 gate_out,
                 up_out,
                 gate_out,
-                5 * inter as u32,
+                (rows * inter) as u32,
                 stream,
             )?;
             self.run_shared_m16(
@@ -67,7 +75,7 @@ impl MoeLayer {
                 gate_out,
                 down,
                 down_out,
-                5,
+                rows as u32,
                 h as u32,
                 inter as u32,
                 ctx,

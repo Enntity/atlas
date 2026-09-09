@@ -15,7 +15,10 @@ pub fn requested() -> Result<Option<GlmPairFfn>> {
         Err(std::env::VarError::NotPresent) if !enabled => return Ok(None),
         Ok(value) if value == "two-k5" => GlmPairFfn::TwoK5,
         Ok(value) if value == "joint" => GlmPairFfn::Joint,
-        _ => bail!("paired verification requires explicit ATLAS_GLM_C2_PAIR_FFN=two-k5|joint"),
+        Ok(value) if value == "joint-shared-m10" => GlmPairFfn::JointSharedM10,
+        _ => bail!(
+            "paired verification requires explicit ATLAS_GLM_C2_PAIR_FFN=two-k5|joint|joint-shared-m10"
+        ),
     };
     Ok(enabled.then_some(mode))
 }

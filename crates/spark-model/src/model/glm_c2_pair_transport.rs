@@ -70,6 +70,7 @@ impl TransformerModel {
             match mode {
                 GlmPairFfn::TwoK5 => 1,
                 GlmPairFfn::Joint => 2,
+                GlmPairFfn::JointSharedM10 => 3,
             },
         ]);
         for owner in 0..2 {

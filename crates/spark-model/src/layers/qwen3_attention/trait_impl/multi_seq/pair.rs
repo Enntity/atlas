@@ -58,7 +58,7 @@ impl Qwen3AttentionLayer {
                 self.ffn
                     .validate_pair_k5(context.buffers.norm_output(), context, stream)?
             }
-            GlmPairFfn::Joint => {
+            GlmPairFfn::Joint | GlmPairFfn::JointSharedM10 => {
                 self.ffn
                     .validate_pair_verify(context.buffers.norm_output(), context, stream)?
             }
@@ -189,11 +189,12 @@ impl Qwen3AttentionLayer {
             workspace.save_attention(owner, stream)?;
         }
         workspace.pack_norms(stream)?;
-        let joint = if workspace.mode == GlmPairFfn::Joint {
+        let joint = if let Some(shared) = workspace.mode.joint_shared() {
             Some(self.ffn.forward_pair_verify(
                 contexts[0].buffers.norm_output(),
                 contexts[0],
                 stream,
+                shared,
             )?)
         } else {
             None
