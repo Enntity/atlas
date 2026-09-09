@@ -136,11 +136,15 @@ def cancellation_wave(client, count):
 def answers(client, count):
     prepared = []
     for index in range(count):
-        prompt = client.tokens(f"Calculate 17 * 9 + {index}. Reply only with the integer.\nAnswer:")
+        body = q.chat_body(client, [{"role": "user", "content":
+                            f"Calculate 17 * 9 + {index}. Reply only with the integer."}], [], q.CAP)
+        probe, reference = client.request("reuse-answer-calibration", "/v1/chat/completions",
+                                          {**body, "max_tokens": 1})
+        counted = q.usage(probe, None, 1, client.args.context_limit)["prompt_tokens"]
+        q.require(counted + q.CAP <= client.args.context_limit, "reuse answer context budget")
         prepared.append({"kind": "reuse-answer", "index": index,
-                         "expected": str(153 + index), "input_tokens": len(prompt),
-                         "body": {"model": client.args.model, "prompt": prompt,
-                                  "max_tokens": 32, "temperature": 0, "seed": 1, "stream": False}})
+                         "expected": str(153 + index), "input_tokens": counted, "body": body,
+                         "calibrations": [{"receipt": reference, "prompt_tokens": counted}]})
     return q.wave(client, prepared)
 
 

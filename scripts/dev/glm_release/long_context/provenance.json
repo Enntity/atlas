@@ -13,7 +13,6 @@
   "byte_identical": [
     "long_context_node.py",
     "release-context-quality.py",
-    "release-context-boundaries.py",
     "release-context-suite.py"
   ],
   "adaptations": {
@@ -21,6 +20,14 @@
     "long_context_profile.py": "Per-node RDMA values required; explicit paged-prefill BF16 GEMM0/1; reject zero artifact digests. Existing fixed numerical/resource policy otherwise unchanged.",
     "long_context_dry_tests.py": "Retained controls plus explicit fabric/strict-boolean0/1 assertions and documentation-range fixture addresses.",
     "configure.py": "New local-only generator deriving pinned workload argv/files from explicit operator input; no runner or node execution."
+  },
+  "boundary_answer_framing_correction": {
+    "current_sha256": "4a07c8f95ed589810bded37d8b01c233232078ddcba6b3c0bbf4f25e59c3f53c",
+    "original_failure_receipt": "atlas-campaigns/20260909/glm-native-controller/longctx-c853bafa-8192-on-chat-run/quality-receipts/boundaries/http-0009.json",
+    "original_failure_sha256": "c8678b80fe9f065b30fe8c7cc5629e024567d9f28623ba89e3e897c41f468c6c",
+    "observed_failure": "C1 post-cancel reuse-answer raw completion had18 input tokens and cap32; visible153 continued into repeated prompt text and finish_reason=length. This failed the unchanged exact-answer/stop validator. The failure is retained, not relabeled as a pass or attributed to server cancellation.",
+    "change": "Only answers() now uses the pinned quality chat_body helper: empty tools, thinking budget16, output CAP128, and one real one-token chat calibration per request to measure the exact rendered input. The same strict integer/stop/peer-leakage validator remains. Raw-completion exact-context400 and cancellation SSE, tools and other budgets are unchanged.",
+    "qualification": "Local no-HTTP construction RED/GREEN only; corrected native reuse qualification is pending. Old prepared inputs and source hashes remain historical evidence; fresh inputs must pin this new boundary file."
   },
   "baseline_note": "Runner/profile provenance precedes the separately authorized external boolean-plumbing update; portable code already requires that explicit switch. Quality includes the final real-chat sizing correction."
 }
