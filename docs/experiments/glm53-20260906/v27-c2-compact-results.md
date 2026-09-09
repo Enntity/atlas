@@ -43,3 +43,40 @@ classifies it as reasoning. When thinking ends, grammar resumes after the
 opener, explaining the bare function name in visible output. Confirm the fix
 with a focused regression and a fresh native run; do not reinterpret the failed
 receipt, promote hidden tool calls, or weaken the checker.
+
+## v28 boundary fix and rebuild
+
+Commit `4091d8da80415a59b727189eb3ea06c36d12b3df` adds an exact terminal
+`[think_start, think_end]` check at the rendered prompt boundary, returning
+initial thinking=false/budget=None. Existing unclosed-tail and no-marker
+behavior remains unchanged; tool parsing and the native checker are unchanged.
+Actual GLM template rendering/encoding reproduced the failure before the fix
+and passed afterward. The existing hidden-Poolside-call rejection still passes.
+Independent source review approved both files. Controller server checkpoint:
+2380 passed,12 ignored (26.74s; NO_COLOR unset as in the v27 checkpoint).
+
+Only those two server files differ from v27's compiled runtime source. The
+committed delta archive SHA256 is
+`f3cecc516f11d3514e9b1987ea402d11a8074c691b73c334b9a6c396c706c10b`.
+The retained CPU-only builder completed in1m21s, exit0/noOOM. Native binary
+SHA256 `d32875231dab0d1deae0546428a90a9b960c34d7f931582c9247e5b61dcf8faf`
+matches on both nodes in `atlas-glm53-flash:kernel-20260909-v28`:
+
+- Head image `598afb9c3559a961d29c8bb3dcb91abc34209fcfc32c3d2d9abe139c85f5831c`.
+- Worker image `b32d3bac8b405ffdaaa0ced728ef5e25378e5a4544771818ca8a056764d462a4`.
+
+The campaign's four v28 launch/measurement scripts are mechanical v27→v28
+renames with identical settings, checks and payloads. Retain v27 failure
+receipts; v28 uses a fresh prefix and fresh processes for each arm. Build,
+packaging and source checks do not themselves prove native tool correctness
+or a throughput improvement; the v28 quality and timing gates remain required.
+
+### v28 OFF eager: native tool fix confirmed
+
+The unchanged two tool requests now return exactly one structured function call
+each, with exact arguments and `finish_reason=tool_calls`; no reasoning markup
+is promoted into calls. Four paired answer checks and both uneven C4 retrieval
+waves also pass. Overall gate exit0; both ranks exit0/OOMKilled=false, no used
+swap or remaining GPU applications. Ready head11311MiB/worker11752MiB available.
+Receipts use prefix `v28-compact-off-eager-`; this remains quality-only, with
+no throughput claim. Compact C2 ON requires its own quality qualification next.
