@@ -24,6 +24,7 @@ mod attn;
 mod c4;
 mod ctx;
 mod ffn;
+mod hc_ffn;
 mod mla;
 mod mla_gemv;
 mod mla_glm;
@@ -120,7 +121,7 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    /// HC-enabled batched multi-sequence decode.
+    /// Run the unchanged serial phases without letting shared scratch escape.
     fn decode_multi_seq_inner_hc(
         &self,
         c: ctx::MultiSeqCtx<'_>,
@@ -128,11 +129,26 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if let Some(phase) = self.ms_hc_attention_norm(&c, kv_cache, ctx, stream)? {
+            self.ms_hc_ffn_post(&c, phase, ctx, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Attention plus the original FFN collapse/norm. None means the original
+    /// standalone-attention path already performed its final head operation.
+    fn ms_hc_attention_norm(
+        &self,
+        c: &ctx::MultiSeqCtx<'_>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Option<hc_ffn::HcFfnPhase>> {
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
         let n = c.n;
         let hc = self.hc.as_ref().unwrap();
-        self.validate_glm_c4(&c)?;
+        self.validate_glm_c4(c)?;
         let hc_mult = hc.hc_mult as u32;
         let is_first_layer = self.block_idx == 0;
         let is_last_layer = self.block_idx + 1 == ctx.config.num_hidden_layers;
@@ -215,13 +231,13 @@ impl Qwen3AttentionLayer {
 
         // ── Phases 2-6: attention ──
         let o_out = if let Some(ref _mla) = self.mla {
-            self.ms_mla_decode(&c, kv_cache, meta)?
+            self.ms_mla_decode(c, kv_cache, meta)?
         } else {
-            self.ms_phase_qkv(&c)?;
-            self.ms_phase_rope(&c, meta)?;
-            self.ms_phase_cache_write(&c, kv_cache, meta)?;
-            let attn_out = self.ms_phase_paged_decode(&c, kv_cache, meta)?;
-            self.ms_phase_o_proj(&c, attn_out)?
+            self.ms_phase_qkv(c)?;
+            self.ms_phase_rope(c, meta)?;
+            self.ms_phase_cache_write(c, kv_cache, meta)?;
+            let attn_out = self.ms_phase_paged_decode(c, kv_cache, meta)?;
+            self.ms_phase_o_proj(c, attn_out)?
         };
 
         if c.fwd.config.tp_world_size > 1
@@ -298,7 +314,7 @@ impl Qwen3AttentionLayer {
                     self.attn_layer_idx
                 );
             }
-            return Ok(());
+            return Ok(None);
         }
 
         // ── Phase 7: FFN + hc_post ──
@@ -355,141 +371,11 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
 
-        let independent = crate::model::glm_independent::selected(ctx, n)?;
-        let glm_batched_ffn = ctx.config.model_type == "glm5_next" && matches!(n, 3..=5);
-        let compact_c2 = if !independent && n == 2 {
-            self.ffn.try_forward_c2_compact(c.normed, ctx, stream)?
-        } else {
-            None
-        };
-        if independent || compact_c2.is_some() || glm_batched_ffn {
-            let (moe_out, deferred_shared_gate) = if independent {
-                (
-                    self.ffn.forward_independent(c.normed, n, ctx, stream)?,
-                    None,
-                )
-            } else if let Some(output) = compact_c2 {
-                (output, None)
-            } else if n == 3 {
-                self.ffn.forward_k3(c.normed, ctx, stream)?;
-                (ctx.buffers.moe_output(), None)
-            } else if n == 4 {
-                (self.ffn.forward_c4(c.normed, ctx, stream)?, None)
-            } else {
-                self.ffn.forward_k5_for_hc(
-                    c.normed,
-                    self.hc_post_moe_blend_k.0 != 0,
-                    ctx,
-                    stream,
-                )?
-            };
-            if let Some(gate_weight) = deferred_shared_gate {
-                ops::hc_post_moe_blend(
-                    ctx.gpu,
-                    self.hc_post_moe_blend_k,
-                    moe_out,
-                    ctx.buffers.attn_output(),
-                    c.normed,
-                    gate_weight,
-                    hc_streams,
-                    post,
-                    comb,
-                    hc_streams,
-                    n as u32,
-                    h as u32,
-                    hc_mult,
-                    stream,
-                )?;
-            } else {
-                ops::hc_post(
-                    ctx.gpu,
-                    self.hc_post_k,
-                    moe_out,
-                    hc_streams,
-                    post,
-                    comb,
-                    hc_streams,
-                    n as u32,
-                    h as u32,
-                    hc_mult,
-                    stream,
-                )?;
-            }
-        } else {
-            for i in 0..n {
-                let normed2_i = c.normed.offset(i * c.h * c.bf16);
-                let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
-                // hc_streams is the FP32 mHC highway (4 bytes/elem), not BF16.
-                let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
-                let post_i = post.offset(i * hc.hc_mult * 4);
-                let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
-                ops::hc_post(
-                    ctx.gpu,
-                    self.hc_post_k,
-                    moe_out,
-                    hc_streams_i,
-                    post_i,
-                    comb_i,
-                    hc_streams_i,
-                    1,
-                    h as u32,
-                    hc_mult,
-                    stream,
-                )?;
-            }
-        }
-        if diag_this {
-            super::diag_norm(
-                ctx.gpu,
-                hc_streams,
-                h,
-                stream,
-                &format!("V4-msdecode L{} hc_post-ffn", self.attn_layer_idx),
-            );
-            super::diag_norm(
-                ctx.gpu,
-                hc_streams,
-                n * (hc_mult as usize) * h,
-                stream,
-                &format!(
-                    "V4-msdecode L{} hc_post-ffn ALL_STREAMS",
-                    self.attn_layer_idx
-                ),
-            );
-        }
-
-        if is_last_layer && let Some(ref head) = hc.head {
-            ops::hc_head(
-                ctx.gpu,
-                self.hc_head_k,
-                hc_streams,
-                head.hc_fn,
-                head.hc_scale,
-                head.hc_base,
-                c.hidden,
-                n as u32,
-                h as u32,
-                hc_mult,
-                eps,
-                hc.hc_eps,
-                stream,
-            )?;
-            if diag_this {
-                super::diag_norm(
-                    ctx.gpu,
-                    c.hidden,
-                    n * h,
-                    stream,
-                    &format!("V4-msdecode L{} hc_head", self.attn_layer_idx),
-                );
-            }
-        } else if is_last_layer {
-            tracing::warn!(
-                "V4-msdecode L{}: hc_head SKIPPED (no head weights)",
-                self.attn_layer_idx
-            );
-        }
-
-        Ok(())
+        Ok(Some(hc_ffn::HcFfnPhase {
+            hc_streams,
+            post,
+            comb,
+            diag_this,
+        }))
     }
 }
