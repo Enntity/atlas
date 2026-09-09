@@ -52,3 +52,37 @@ fn actual_proc_memory_and_unrelated_process_refusal() {
     // namespace. Never reinterpret it using caller-parent identity helpers.
     assert!(proc::pair(std::process::id(), false).is_err());
 }
+
+#[test]
+fn proc_disappearance_requires_latest_validated_exit_not_running() {
+    for code in [libc::ENOENT, libc::ESRCH] {
+        assert!(commands::process_at_snapshot(
+            docker::Stage::Running,
+            Err(io::Error::from_raw_os_error(code)),
+        )
+        .is_err());
+        assert_eq!(
+            commands::process_at_snapshot(
+                docker::Stage::Exited,
+                Err(io::Error::from_raw_os_error(code)),
+            )
+            .unwrap(),
+            None
+        );
+    }
+    for stage in [docker::Stage::Running, docker::Stage::Exited] {
+        for error in [
+            io::Error::from_raw_os_error(libc::EACCES),
+            io::Error::from_raw_os_error(libc::EIO),
+            io::Error::other("process identity changed during observation"),
+        ] {
+            let message = error.to_string();
+            assert_eq!(
+                commands::process_at_snapshot(stage, Err(error))
+                    .unwrap_err()
+                    .to_string(),
+                message
+            );
+        }
+    }
+}

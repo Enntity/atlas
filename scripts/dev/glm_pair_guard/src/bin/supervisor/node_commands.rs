@@ -2,6 +2,24 @@
 use super::*;
 use serde_json::{json, Value};
 
+/// Called only after the latest full Docker snapshot passed exact validation.
+/// A disappearing /proc entry is not health or exit evidence by itself.
+pub(super) fn process_at_snapshot(
+    stage: docker::Stage,
+    process: io::Result<Option<NodeProcess>>,
+) -> io::Result<Option<NodeProcess>> {
+    match (stage, process) {
+        (docker::Stage::Exited, Ok(_)) => Ok(None),
+        (docker::Stage::Exited, Err(error))
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(None)
+        }
+        (_, result) => result,
+    }
+}
+
 pub(super) fn prepare(command: &Command, bytes: &[u8]) -> io::Result<Value> {
     let input: PrepareInput = serde_json::from_slice(bytes)?;
     input.metadata.validate()?;
@@ -74,7 +92,7 @@ impl Loaded {
         }
         Ok(id)
     }
-    fn inspect(&self, id: &wire::Digest, stage: docker::Stage) -> io::Result<(Value, u32)> {
+    fn read_inspect(&self, id: &wire::Digest) -> io::Result<Value> {
         let bytes = engine::request(
             &self.metadata,
             "GET",
@@ -82,7 +100,10 @@ impl Loaded {
             vec![],
             200,
         )?;
-        let value: Value = serde_json::from_slice(&bytes)?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+    fn inspect(&self, id: &wire::Digest, stage: docker::Stage) -> io::Result<(Value, u32)> {
+        let value = self.read_inspect(id)?;
         let pid = docker::inspect(
             &self.recipe,
             &self.metadata.guard_container_path,
@@ -164,19 +185,8 @@ impl Loaded {
     }
     pub fn observation(&self, command: &Command, socket_only: bool) -> io::Result<NodeObservation> {
         let id = self.recorded(command)?;
-        let bytes = engine::request(
-            &self.metadata,
-            "GET",
-            &format!("/containers/{}/json", docker::hex(&id)),
-            vec![],
-            200,
-        )?;
-        let inspect: Value = serde_json::from_slice(&bytes)?;
-        let stage = match inspect.pointer("/State/Status").and_then(Value::as_str) {
-            Some("running") => docker::Stage::Running,
-            Some("exited") if !socket_only => docker::Stage::Exited,
-            _ => return Err(error("unexpected node observation stage")),
-        };
+        let inspect = self.read_inspect(&id)?;
+        let stage = docker::observation_stage(&inspect, socket_only)?;
         let pid = docker::inspect(
             &self.recipe,
             &self.metadata.guard_container_path,
@@ -189,21 +199,26 @@ impl Loaded {
         // The controller permits None only pre-report or after local release;
         // it must never renew from this absence.
         let process = if pid == 0 {
-            None
+            Ok(None)
         } else {
-            proc::pair(pid, true)?
+            proc::pair(pid, true)
         };
         let socket_ready = pid != 0 && self.directory.socket_ready()?;
         let (mem_available_kib, swap_used_kib) = proc::memory()?;
         // A second exact inspect closes the Docker PID/config read window.
-        let (_, after_pid) = self.inspect(&id, stage)?;
-        if after_pid != pid {
-            return Err(error("Docker init changed during observation"));
-        }
+        let after = self.read_inspect(&id)?;
+        let (after_stage, _) = docker::observation_pair(
+            &self.recipe,
+            &self.metadata.guard_container_path,
+            &id,
+            socket_only,
+            &inspect,
+            &after,
+        )?;
         Ok(NodeObservation {
-            inspect,
-            process,
-            socket_ready,
+            inspect: after,
+            process: process_at_snapshot(after_stage, process)?,
+            socket_ready: after_stage == docker::Stage::Running && socket_ready,
             mem_available_kib,
             swap_used_kib,
         })

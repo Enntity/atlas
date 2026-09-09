@@ -283,3 +283,64 @@ fn docker_omits_false_bind_readonly_but_never_true() {
     v["HostConfig"]["Mounts"][0]["ReadOnly"] = json!(true);
     assert!(inspect(&r, "/guard", "runc", &[4; 32], Stage::Created, &v).is_err());
 }
+
+fn running_and_exited(r: &wire::Recipe) -> (Value, Value) {
+    let mut running = observed(r);
+    running["State"]["Status"] = json!("running");
+    running["State"]["Running"] = json!(true);
+    running["State"]["Pid"] = json!(1234);
+    let mut exited = observed(r);
+    exited["State"]["Status"] = json!("exited");
+    (running, exited)
+}
+
+#[test]
+fn observation_window_accepts_only_clean_forward_exit() {
+    let r = recipe();
+    let (running, exited) = running_and_exited(&r);
+    for (before, after, expected) in [
+        (&running, &running, (Stage::Running, 1234)),
+        (&exited, &exited, (Stage::Exited, 0)),
+        (&running, &exited, (Stage::Exited, 0)),
+    ] {
+        assert_eq!(
+            observation_pair(&r, "/guard", &[4; 32], false, before, after).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn observation_window_never_hides_identity_health_or_reverse_transition() {
+    let r = recipe();
+    let (running, exited) = running_and_exited(&r);
+    assert!(observation_pair(&r, "/guard", &[4; 32], false, &exited, &running).is_err());
+    assert!(observation_pair(&r, "/guard", &[4; 32], true, &running, &exited).is_err());
+    let mut replaced = running.clone();
+    replaced["State"]["Pid"] = json!(5678);
+    assert!(observation_pair(&r, "/guard", &[4; 32], false, &running, &replaced).is_err());
+    for (path, value) in [
+        ("/Id", json!("05".repeat(32))),
+        ("/Image", json!(format!("sha256:{}", "06".repeat(32)))),
+        ("/State/OOMKilled", json!(true)),
+        ("/State/ExitCode", json!(74)),
+        ("/State/Dead", json!(true)),
+        ("/State/Restarting", json!(true)),
+        ("/State/Paused", json!(true)),
+        ("/RestartCount", json!(1)),
+        ("/Config/Env", json!(["UNEXPECTED=1"])),
+    ] {
+        let mut bad_after = exited.clone();
+        *bad_after.pointer_mut(path).unwrap() = value.clone();
+        assert!(
+            observation_pair(&r, "/guard", &[4; 32], false, &running, &bad_after).is_err(),
+            "after {path}"
+        );
+        let mut bad_before = running.clone();
+        *bad_before.pointer_mut(path).unwrap() = value;
+        assert!(
+            observation_pair(&r, "/guard", &[4; 32], false, &bad_before, &exited).is_err(),
+            "before {path}"
+        );
+    }
+}

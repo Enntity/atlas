@@ -10,6 +10,40 @@ pub(super) enum Stage {
     Exited,
 }
 
+pub(super) fn observation_stage(value: &Value, socket_only: bool) -> io::Result<Stage> {
+    match value.pointer("/State/Status").and_then(Value::as_str) {
+        Some("running") => Ok(Stage::Running),
+        Some("exited") if !socket_only => Ok(Stage::Exited),
+        _ => Err(error("unexpected node observation stage")),
+    }
+}
+
+/// Validate both sides of the node's proc/memory observation window. The
+/// caller returns the second snapshot and must not attach stale process facts.
+pub(super) fn observation_pair(
+    recipe: &wire::Recipe,
+    guard: &str,
+    id: &wire::Digest,
+    socket_only: bool,
+    before: &Value,
+    after: &Value,
+) -> io::Result<(Stage, u32)> {
+    let stage = observation_stage(before, socket_only)?;
+    let pid = inspect(recipe, guard, "runc", id, stage, before)?;
+    let after_stage = observation_stage(after, socket_only)?;
+    let after_pid = inspect(recipe, guard, "runc", id, after_stage, after)?;
+    if stage == Stage::Running && after_stage == Stage::Exited {
+        // Normal forward progress, not a final-release certificate. Both full
+        // snapshots passed exact ID/config/health checks; the controller still
+        // requires delivered release and its original bounded exit deadline.
+        return Ok((after_stage, after_pid));
+    }
+    if after_stage != stage || after_pid != pid {
+        return Err(error("Docker init changed during observation"));
+    }
+    Ok((after_stage, after_pid))
+}
+
 pub(super) fn hex(value: &wire::Digest) -> String {
     value.iter().map(|b| format!("{b:02x}")).collect()
 }
