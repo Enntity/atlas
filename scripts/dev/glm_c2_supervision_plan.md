@@ -92,20 +92,28 @@ and neither parent-death protection nor namespace lifetime enforces that timer.
 
 ## Healthy shutdown is a different protocol
 
-T2 stops admission and completes every issued command, then performs the actual
-selected strict retirement/drain/teardown. Each still-live Spark sends its guard
-a `DRAINED(session, drain_epoch, last_command, rank, child_instance)` receipt only
-AFTER that succeeds, and waits without more GPU work while T1 remains armed.
+Root-approved amendment, 2026-09-09: the first fixed-profile implementation uses
+quiescent process exit rather than explicit allocator teardown; see the exact
+stream/communicator and failure contract in `glm_c2_terminal_session_plan.md`.
+T2 stops admission, completes every issued command, sends the matched shutdown
+command, retains Model/sequence owners, and performs strict actual-stream joins
+and the actual communicator health probe. Each still-live Spark sends its guard
+a `QUIESCENT(session, drain_epoch, last_command, rank, child_instance)` receipt
+only AFTER that succeeds, and waits without more GPU work while T1 remains armed.
 Controller validates BOTH matching receipts and sends a pair-disarm certificate
 containing both receipt digests. Each guard validates it before allowing its
-child's T2 key close/normal exit; a one-rank receipt or arbitrary exit0 is insufficient.
+child's non-returning `_exit(0)`; a one-rank receipt or arbitrary exit0 is insufficient.
+No Model teardown, backend Drop/sweep or normal main cleanup runs on this path.
 Keep leases running through this handshake; lost certificate/peer/controller is
 terminal, not inferred clean. Partial delivery after both drained is safe to
 classify as FAILED, never a both-rank clean pass. Final success needs both actual
-exit0, OOMfalse, no pending owner/error evidence and preserved full logs.
-Disarm permits bounded normal exit, not immediate release of the guard's pidfd;
+exit0, OOMfalse, no outstanding issued operation or unresolved error evidence,
+and preserved full logs. Retained Model/sequence allocations are expected.
+Disarm permits bounded process exit, not immediate release of the guard's pidfd;
 retain child supervision until actual exit0 or a finite exit deadline fails.
 This adds a shutdown-only receipt, NOT a per-E1/F5 acknowledgment framework.
+Process exit alone does not prove successful driver reclamation or hardware
+recovery; native post-exit health and memory checks remain required.
 
 ## Files and CPU gates after approval
 

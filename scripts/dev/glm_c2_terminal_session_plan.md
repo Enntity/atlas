@@ -1,9 +1,47 @@
 # GLM paired session: terminal containment plan
 
-Status: T1 approved and implemented, focused controller CPU gates passed;
-independent review, broad regression/non-test gates and commit qualification
-remain pending. T2/T3 remain design-only; there is no serving activation caller.
+Status: T1 implemented and committed; T2/T3 live integration remains absent.
+The 2026-09-09 quiescent-exit amendment below is root-reviewed and approved
+for implementation, not qualified for native activation.
 This is local process containment, not a GPU recovery mechanism or peer watchdog.
+
+## 2026-09-09 healthy-exit amendment
+
+For the first supervised, fixed-profile serial C2 implementation, replace the
+healthy-shutdown requirement for explicit allocator teardown with both-rank
+quiescence followed by non-returning `_exit(0)`. Other operation boundaries and
+the Result-owner audit below are unchanged. This is an intermediate deployment
+profile, not a reduction of the reference-parity goal or its serving requirements.
+
+Stop admission, finish every issued transaction, and send the existing matched
+shutdown command. Retain the actual Model and sequence owners. Both adapters
+then require the actual communicator's `is_healthy()` probe before and after
+directly synchronizing the actual default and distinct secondary streams,
+stopping on the first error. The live selected-operation completion boundary
+also checks communicator health before success can lead to retirement. No free,
+F1, teardown, backend Drop or sweep follows an error. Keep T1
+armed while waiting for the current session's two-rank QUIESCENT release; only
+that release permits `_exit(0)`. No ordinary main cleanup follows success either.
+
+Source audit: `sync_secondary_dispatch` only enqueues an event wait and is not
+a host join. NCCL also owns a communication stream even with overlap disabled;
+successful `all_reduce_async` and `peer_exchange_async` enqueue their completion
+event back onto the caller's compute stream. The fixed profile uses the Model's
+default stream, which topology passes as NCCL's legacy stream. Successful final
+shutdown/default-stream synchronization therefore joins those successful
+communication operations transitively. This argument does not cover failed
+event recording/waits: those must already enter the armed terminal boundary.
+The active health probe is necessary because collective APIs can latch an async
+NCCL error yet return Ok. No reconnect is permitted.
+
+Implement this as one usable fixed-profile vertical path: live guard channel and
+actual Model registration, selected head admission/prefill/serial driver/retirement,
+selected whole-worker loop, explicit paired factory construction, and two-node
+supervisor startup/lease/quiescent release. Do not add another generic ticket or
+per-command acknowledgment framework. Native admission still requires review
+of all actual error-owning callees, focused adapter/no-Drop and real guard-pair
+CPU evidence, and a pinned bounded-memory recipe. Quiescent process exit does
+not by itself prove driver resource reclamation or hardware recovery.
 
 ## Why the existing paths cannot own selected failure
 
