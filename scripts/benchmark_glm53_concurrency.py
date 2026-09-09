@@ -77,6 +77,7 @@ def one_request(
         raise RuntimeError("server prompt token count does not match supplied prompt")
     # Text identity, not token-ID or semantic equivalence. Hash outside the
     # timed window, preserving the request and all historical rate formulas.
+    # Retain the text too: a digest alone cannot support a coherence review.
     completion_text = "".join(text_chunks).encode("utf-8")
     return {
         "started": started,
@@ -89,6 +90,7 @@ def one_request(
         "finish_reason": finish_reason,
         "completion_text_sha256": hashlib.sha256(completion_text).hexdigest(),
         "completion_text_bytes": len(completion_text),
+        "completion_text": completion_text.decode("utf-8"),
     }
 
 
@@ -143,6 +145,7 @@ def summarize_batch(rows: list[dict], requested_output_tokens: int) -> dict:
                 "finish_reason": row.get("finish_reason"),
                 "completion_text_sha256": row.get("completion_text_sha256"),
                 "completion_text_bytes": row.get("completion_text_bytes"),
+                "completion_text": row.get("completion_text"),
             }
             for row in rows
         ],

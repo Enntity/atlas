@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Mocked SSE checks for completion identity without retaining full output."""
+"""Mocked SSE checks for retained completion text, identity and timing."""
 
 import hashlib
 import json
@@ -40,7 +40,7 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(first["completion_text_sha256"], hashlib.sha256(expected).hexdigest())
         self.assertEqual(first["completion_text_bytes"], len(expected))
         self.assertEqual(first, second)
-        self.assertNotIn("text", first)
+        self.assertEqual(first["completion_text"], expected.decode("utf-8"))
 
     def test_changed_output_has_distinct_digest_and_same_timing_metrics(self):
         first, second = self.request(["same"]), self.request(["else"])
@@ -50,6 +50,7 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(summary["requests"][0]["completion_text_sha256"],
                          first["completion_text_sha256"])
         self.assertEqual(summary["requests"][0]["completion_text_bytes"], 4)
+        self.assertEqual(summary["requests"][0]["completion_text"], "same")
 
 
 if __name__ == "__main__":
