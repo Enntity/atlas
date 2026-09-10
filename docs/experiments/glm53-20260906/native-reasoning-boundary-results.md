@@ -2,7 +2,7 @@
 
 ## Source and qualification status
 
-Committed source: `14b4e485a8719d763b1b043e1c7a8844994ae4c2`.
+Initial boundary-correction source: `14b4e485a8719d763b1b043e1c7a8844994ae4c2`.
 Native source archive SHA-256:
 `2506dce744e767569683079c837e6a02a88240992db648073e99c94c472e4fa8`.
 The native build and both images are hash-verified; exact pins are in the
@@ -125,3 +125,49 @@ repeat/post-cancel/requested-false arithmetic responses still failing identicall
 with45 output and16 reasoning tokens. Both ranks exited0, OOM=false, swap0;
 minimum available memory was10,630,212/10,290,624 KiB. The bounded native tool
 improvement does not resolve that arithmetic failure or qualify the release.
+
+## Native EOS observation and subsequent `da4ec65d` correction
+
+The log-only14b diagnostic localizes the unwanted continuation. Root verified
+`BASE/reuse-14b4e485-16384-eos-first-run/00197-rank0-collect.json`: at
+01:10:50.181145 the first token is122876 (`153`); at01:10:50.255972 the next
+sample is154827, the checkpoint's `<|user|>` token listed as EOS in its actual
+generation configuration. At01:10:50.255986, `atlas::eos` reports thinking as
+the sole suppressor. The subsequent token3838 (`What`) begins the unrelated
+question. All five requests show that suppression. Only diagnostic logging
+changed. The suppressed token remained the next decode input; this is native
+turn-boundary evidence, not proof of a correct replacement answer. The run
+also retained a cleanup-observation race and remains failed, as detailed in
+[qualification progress](release-qualification-progress.md).
+
+Subsequent committed source:
+`da4ec65d316bf3c57796e975633a6e8e78bfc099`; source archive SHA-256:
+`42e983c3588d938d37c72c152bcfe8f9e1cd8f5a75ed71f9d942dce5186c51da`.
+Its native build/qualification is **PENDING** at this update; the14b image pins
+and results do not identify or qualify this correction.
+
+The shared GLM helper identifies an actual configured EOS while thinking.
+Ordinary decode and MTP emission now remove only the thinking-based stop
+suppression and exclude that EOS from the reasoning-token count. Generation
+budget accounting remains; grammar, minimum-token and required-tool guards
+are unchanged. In particular, the MTP paused-grammar guard can still block
+EOS. No synthetic `</think>`, reasoning-to-content promotion or tool hoisting
+is introduced. First-token builders already honor EOS; existing first-token
+sampling masks are not changed by this patch.
+
+Selected verification also ends its accepted prefix before native EOS, making
+that token the bonus before verdict publication/trim/detachment. It does not
+commit subsequent rows even if another emission guard would suppress the EOS.
+
+- `glm-native-eos-red.log`: two actual ordinary/MTP emission failures and one
+  guard control pass; `glm-native-eos-green.log`: all three pass.
+- `glm-selected-eos-red.log`: actual E7 accepted4 versus expected0;
+  `glm-selected-eos-green.log`: the unchanged actual F5/E6/E7 worker-replay
+  test passes (child1.05s; enclosing isolated test1.16s). This remains
+  byte-backed transaction evidence, not GPU arithmetic evidence.
+- `glm-native-eos-da4ec65d.log`: committed-source47 tests pass in3.51s.
+
+The next native response could correctly stop with `153` only in reasoning
+and empty visible content. That would demonstrate respecting native EOS but
+would **still fail** the existing exact visible-answer validator. Arithmetic
+PASS, broader coherence and final release qualification remain unproven.
