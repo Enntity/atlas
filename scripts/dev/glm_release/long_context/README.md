@@ -119,3 +119,36 @@ python3 -B configure.py --help
 
 The selftest uses the existing explicitly mocked memory/identity controls and
 pure profile checks. It is not a connected lifecycle or numerical test.
+
+## Bounded prose probe and manual review
+
+`release-context-prose.py` is a byte-identical retained standalone driver,
+SHA256 `ed604fffc277827608de1ea8e58b0554410b8ff04b42b4bdc807dff142fd4402`.
+It issues one C1 prose request using an explicitly pinned quality helper:
+at most three real-chat sizing probes, nine total HTTP calls and300s. Input
+must fit `[context-608, context-512]`; output is capped at384 tokens. It does
+not launch or supervise a server. Run it only inside the existing exclusive,
+guarded profile window, with enough time remaining for its full deadline and
+cleanup. Do not overlap it with another workload or infer a native PASS from
+its presence in this bundle.
+
+```bash
+/absolute/pinned/python3 -B /absolute/checkout/scripts/dev/glm_release/long_context/release-context-prose.py \
+  --base-url http://HEAD_IPV4:8890 --model /var/tmp/models/glm53-flash-nvfp4 \
+  --context-limit 4096 --deadline 300 \
+  --quality-path /absolute/checkout/scripts/dev/glm_release/long_context/release-context-quality.py \
+  --quality-sha256 FULL_ACTUAL_QUALITY_SHA256 \
+  --output-dir /private/operator/new-prose-receipts
+```
+
+The context must equal the actual launched4096/8192/16384 profile. Pin Python,
+this driver and the exact helper in the enclosing runner's workload record;
+use a new private receipt directory. The helper controls the real chat request
+policy: an explicitly different Low-effort helper is a different prompt
+profile and must be recorded as such, not substituted under an old hash.
+
+Exit0 means only the automatic fact, count, normal-stop and sentence checks
+passed. `qualification_passed` remains null and manual review is required:
+read the full retained content and reasoning for connected sentences, accurate
+relationships, invented facts, repetition and unrelated material. One sample
+does not establish general coherence, concurrency, occupancy or performance.
