@@ -8,7 +8,8 @@ Native source archive SHA-256:
 The native build and both images are hash-verified; exact pins are in the
 [RC handoff](../../releases/glm53-dual-spark-20260910-rc.md). The earlier
 `1cb0267e` artifact pins do not identify this new code. Its fresh arithmetic
-diagnostic still fails unchanged; no GPU quality or performance PASS is claimed here.
+diagnostic still fails unchanged. Bounded C1 native results are recorded below;
+no complete-campaign qualification or performance PASS is claimed here.
 
 Retained logs below are relative to the operator evidence directory
 `/home/abc/storage/models/atlas-campaigns/20260909/glm-native-controller`
@@ -73,6 +74,54 @@ phase's masks are not committed.
 These are source-backed boundary corrections, not a demonstrated explanation
 or resolution of the fresh arithmetic failure. The earlier fresh, repeated
 and post-cancellation requests already failed identically, so cancellation
-was not necessary to trigger it. Fresh math, tool, near-full-context and
-performance qualification must be rerun on the new pinned image; historical
+was not necessary to trigger it. The new image's partial rerun below does not
+complete tool, near-full-context or performance qualification; historical
 failures remain recorded in [qualification progress](release-qualification-progress.md).
+
+## Native rerun: bounded C1 passes, full 4K ON campaign fails
+
+Local read-only inspection of all six final C1 responses under
+`BASE/longctx-14b4e485-4096-on-chat-run/quality-receipts/quality/` confirms the
+bounded validators pass: early/middle/late retrieval (`http-0007`, `0013`,
+`0019`) each returns exactly `AURORA-6819` with 3953 input tokens; linked facts
+(`0025`, 3956 input) returns Iris, Oslo and25 crates. All four finish normally.
+Calibration responses are not counted as quality passes.
+
+The previously failing auto-tool request now succeeds in `http-0030.json`:
+3483 input,35 output,16 reported reasoning tokens, exactly one declared
+`lookup_release_0` call with JSON arguments `{"case_id":"CASE-AURORA"}` and
+`finish_reason: tool_calls`. The complete canonical request body matches the
+prior1cb failure: SHA-256
+`ea2516e8ff661ce3a4085cbd8ee9f146f1c285e7ed1c32615f4c716928c7490b`
+(sorted-key, compact UTF-8 JSON). The new raw receipt SHA-256 is
+`024a5eb22ef69ff3534869e4347a2acf50cbb39b7419292552d6cad87c56b6c9`.
+
+`http-0033.json` reuses the actual returned call ID
+`call_0000000000000000` in both the retained assistant message and subsequent
+tool response. It returns exactly `RESULT-A6819`, normal stop,3399 input and29
+output tokens. Receipt SHA-256:
+`8e27e82faba90e0385a0a9600170b38ce610e983f7c7b148378a753a6c1d4e12`.
+This is a real structured-call/result roundtrip, not external tool execution.
+
+The raw reasoning still limits the claim: late retrieval contains archive
+filler, and the tool-result reasoning concatenates the result with a repeated
+case explanation. Several responses report more than16 reasoning tokens
+despite the requested budget16. Exact visible answers do not establish broad
+coherence or a strict16-token bound.
+
+The campaign finished **FAIL at01:08:37 UTC**. All three C2 needle waves also
+passed, but C2 linked facts failed strict JSON parsing: `http-0076.json`
+returned correct Noor/Kyoto/28 facts inside a Markdown `json` fence. Its peer
+`http-0077.json` returned the correct Iris/Oslo/25 raw JSON. The fence was not
+stripped or accepted; no C2 tools, C3/C4 or boundary checks were issued.
+`BASE/longctx-14b4e485-4096-on-chat-summary.json` records both ranks exited0,
+OOM=false, restart0 and sampled swap0, with minimum available memory
+10,620,256/10,249,140 KiB. Clean shutdown does not convert the workload failure
+into a qualification PASS.
+
+Separately, root's
+completed `reuse-14b4e485-16384-on-first-summary.json` reports all five fresh/
+repeat/post-cancel/requested-false arithmetic responses still failing identically
+with45 output and16 reasoning tokens. Both ranks exited0, OOM=false, swap0;
+minimum available memory was10,630,212/10,290,624 KiB. The bounded native tool
+improvement does not resolve that arithmetic failure or qualify the release.

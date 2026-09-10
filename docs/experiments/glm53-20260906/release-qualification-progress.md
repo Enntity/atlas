@@ -382,3 +382,50 @@ MemAvailable was10,630,212/10,290,624 KiB. Evidence:
 `reuse-14b4e485-16384-on-first-summary.json`, its run, and raw receipts.
 An existing-debug-log-only diagnostic is prepared to observe actual sampled
 EOS suppression; its hypothesis is not yet a demonstrated cause.
+
+## 14b4e485 4K ON final result: bounded tool improvement, suite FAIL
+
+The campaign finished at01:08:37 UTC. All six C1 quality waves passed,
+including the previously failing3483-input automatic-tool request:35 output
+tokens, a valid declared call and exact arguments. The3399-input followup
+reused the actual call ID and returned the exact result in29 output tokens.
+All three C2 needle waves then passed. These are bounded checks, not broad
+prose coherence or complete context qualification.
+
+C2 linked facts **FAILED** the unchanged strict JSON validator:
+`quality-receipts/quality/http-0076.json` returned correct Noor/Kyoto/28 facts
+wrapped in a Markdown `json` fence. Its peer `http-0077.json` returned correct
+Iris/Oslo/25 raw JSON. No fence repair was applied; no C2 tools, C3/C4 quality
+or boundary/cancellation/reuse phase was issued.
+
+Both ranks exited0, OOM=false, restart0 and sampled swap0. Minimum
+MemAvailable was10,620,256/10,249,140 KiB. Evidence:
+`longctx-14b4e485-4096-on-chat-summary.json` and its retained run/receipts.
+The overall result remains **FAIL**, despite clean shutdown and the bounded
+native tool improvement. Exact request/response pins and reasoning limitations
+are in the [native reasoning-boundary report](native-reasoning-boundary-results.md).
+
+## 14b4e485 sampled end-of-turn diagnostic
+
+The log-only16K rerun reproduces all five failures and localizes the unwanted
+continuation. In `reuse-14b4e485-16384-eos-first-run/00197-rank0-collect.json`,
+at01:10:50.181145 the first token is122876 (`153`); at01:10:50.255972 the
+next sampled token is154827, which the actual checkpoint tokenizer identifies
+as `<|user|>` and generation_config lists as EOS. At01:10:50.255986 the
+`atlas::eos` diagnostic says thinking is the **sole** suppressor. The next
+sample is3838 (`What`), followed by the unrelated prime-factor question.
+The same EOS suppression appears in all five math requests. Source inspection
+confirms the suppressed token remains `last_token` and conditions the next
+decode. This is concrete native turn-boundary evidence, not proof that a
+particular replacement policy produces a correct visible final answer.
+
+Only RUST_LOG changed (`info,spark::scheduler::decode_logits_step=debug,atlas::eos=debug`),
+with profile SHA256
+`897a2ced262335f5cc69f0eb03ddfaeae8ccea4ff23902c863f9d7f1570ad1ec`.
+All model, memory, lease and generation controls were retained. Final image
+observations show both ranks exited0/OOM=false/restart0 and sampled swap0;
+minimum MemAvailable10,591,004/10,238,988 KiB. The controller additionally
+records a cleanup-observation race: worker `/proc/2661118/cgroup` disappeared
+between process observation and file read. Therefore the campaign is **FAIL**
+for both workload and cleanup-observation error, despite final clean exits.
+Evidence: `reuse-14b4e485-16384-eos-first-summary.json` and raw receipts.
