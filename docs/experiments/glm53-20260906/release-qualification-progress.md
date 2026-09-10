@@ -517,5 +517,49 @@ postcheck confirmed both stopped137 at01:41:19 UTC, OOM=false, restart0:
 and `f219b08a07c961e186cff68a5957e0e0799b86b161fe988466d9b39efd12b5aa`.
 No running Docker containers or GPU compute PIDs remained; host swap was0
 and available memory121,498,036/121,196,832 KiB. This forced-cleanup result
-is not clean paired quiescence/release. A separate low-effort16K C1 run is
-active at this update; no result from that run is claimed here.
+is not clean paired quiescence/release. The separate low-effort16K C1 result
+follows.
+
+## da4ec65d explicit-low16K C1: middle needle reasoning-only, FAIL
+
+`longctx-da4ec65d-16384-low-first-run` completed at01:51:06 UTC. The early
+needle passed with16,229 input/24 output tokens and exact visible
+`AURORA-6819`. The middle needle (`quality-receipts/quality/http-0013.json`)
+used the same16,229 input-token count, but returned8 output tokens with
+`AURORA-6819` only in reasoning and empty visible content, normal stop.
+Its reported reasoning count was6 and TTFT26,189.222349ms. The unchanged
+exact visible-answer validator correctly rejected it; reasoning-only retrieval
+is not a quality pass.
+
+No remaining quality waves or boundary checks were issued. The controller
+records **FAIL**, despite both ranks exiting0, OOM=false, restart0 and sampled
+swap0. Minimum MemAvailable was10,646,604/10,036,728 KiB. Evidence:
+`longctx-da4ec65d-16384-low-first-summary.json` and its retained raw receipts.
+Explicit low effort therefore does not establish a qualified16K profile.
+The separate default-effort da4ec65d16K prose result follows.
+
+## da4ec65d near-full16K C1 prose: bounded visible-prose PASS
+
+`prose-da4ec65d-16384-on-first-run` completed at01:54:41 UTC. The final chat
+used15,869 input/105 output tokens, normal stop, with output cap384 and
+TTFT26,022.750181ms. Three calibration responses remain sizing evidence only.
+The visible answer is four complete connected sentences: VIOLET-7429 is led
+by Elena Marin in Ghent;31 initial sealed sample kits minus8 removed, no
+other changes,23 remaining. Root's separate manual review confirms correct
+relationships and arithmetic, no invented facts and no visible repetition.
+
+Automatic checks pass; the original summary still deliberately reports
+`qualification_passed: null`. The reasoning is relevant but ends mid-phrase
+at `no other`, and reports48 reasoning tokens against the requested soft16
+budget. This is **not** a reasoning-prose coherence PASS, strict16-token cap
+proof or exact reasoning-accounting claim.
+
+Evidence: `prose-da4ec65d-16384-on-first-receipts/summary.json`, separate
+`prose-da4ec65d-16384-manual-review.json`, and raw `http-0007.json` SHA256
+`2bb61f96752b4636fc1e60a6247656971a396299c0b6d60164d1baf4f873a0e6`.
+Both ranks exited0, OOM=false, restart0, sampled swap0; minimum MemAvailable
+10,614,264/10,182,376 KiB. This is one C1 visible-prose sample on ordinary
+eager MTP-OFF, paged BF16 prefill ON, not a complete16K/release qualification;
+the failed arithmetic, retrieval and C8 campaigns remain failed. A separate
+default-effort da4ec65d16K C1 quality run is active at this update, without a
+final result here.
