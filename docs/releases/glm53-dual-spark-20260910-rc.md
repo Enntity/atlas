@@ -59,9 +59,10 @@ below is **not** a measurement of this current build.
   prefill at most1024, BF16 KV and snapshot rollback. This is not long-context MTP.
 - [Portable long-context bundle](../../scripts/dev/glm_release/long_context/README.md):
   separate ordinary **MTP-OFF**, eager sparse C1–C4 profile, sequential4K/8K/16K
-  exploration with1024-token prefill chunks. Full-context quality and boundary/
-  cancellation/reuse qualification are **PENDING**. Actual qualified maximum
-  context: **PENDING**;16384 is the current C4 policy ceiling, not a fresh PASS.
+  exploration with1024-token prefill chunks. Current full-context quality
+  **FAILED**; those suites did not reach boundary/cancellation/reuse checks.
+  Actual qualified maximum context: **none established for this build**;
+  16384 is the current C4 policy ceiling, not a fresh full-profile PASS.
 
 Use the bundles' explicit operator inputs, immutable images/ELFs and local
 dry-run checks. They do not provision credentials, build images or grant access.
@@ -129,8 +130,8 @@ and the working directory was `/`. Source archive SHA256 is
 That source archive includes the complete runtime template tree separately from
 the ELF. These packaging checks do not establish model-quality success.
 Actual prior serving logs report NCCL2.31.2 with CUDA13.3; the build compiler
-was nvcc13.0. These are distinct observations, not a claim that the pending
-new image has already served or that its runtime is NCCL2.27.7/CUDA13.0.
+was nvcc13.0. These are distinct historical observations, not a substitute
+for inspecting the current runtime or evidence of NCCL2.27.7/CUDA13.0.
 
 The [normalization correction report](../experiments/glm53-20260906/ssm-normalization-native-results.md)
 records actual CUDA racecheck32→0 and corrected memcheck0, with numerical
@@ -302,8 +303,11 @@ records `*-ready.json`; existing node leases, memory monitoring and bounded
 shutdown stay active. Stop issuing requests well before the window ends, keep
 requests sequential, and leave the controller running until it collects both
 stopped containers. A sleep-workload exit0 is only an operational result, not
-a quality certification. This manual-window configuration has passed local
-dry-run validation, not a native manual-window campaign.
+a quality certification. The4K numerical-OFF manual window was exercised
+natively: it accepted two sequential requests, then timed out normally and
+both ranks exited0 at02:21:30 UTC, OOM=false and sampled swap0. The Low
+arithmetic response passed; default JSON remained reasoning-only and failed.
+This is a passed operational window, **not** a model-quality PASS.
 
 For example, from a second terminal after readiness, with the actual head
 address substituted:
@@ -340,7 +344,7 @@ records its limits, controls, results and provenance:
 Before declaring this new build qualified, retain exact source/image/helper/
 workload pins, pass the chosen profile's quality and boundary checks, obtain
 fresh measured rates and final both-node clean-exit/no-OOM/no-swap receipts,
-and update each PENDING item with evidence for that exact artifact. Preserve
+and resolve every failed or unissued gate with evidence for that exact artifact. Preserve
 failed attempts and stopped containers; no broad cleanup or mutable-tag rollback.
 See [merge evidence](../experiments/glm53-20260906/upstream-release-integration.md)
 and the [release checklist](../experiments/glm53-20260906/release-candidate-20260910.md).

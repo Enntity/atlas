@@ -664,3 +664,37 @@ Both ranks exited0, OOM=false, restart0, sampled swap0; minimum MemAvailable
 unchanged SHA-pinned quality helper; it is not advancement of a passing
 full-context suite. The overall result remains **FAIL**, with no performance
 or complete16K qualification claim.
+
+## da4ec65d manual test window: operational PASS, mixed answer results
+
+`human-da4ec65d-4096-off-first-run` exercised the portable ordinary runner
+with a pinned180-second sleep workload after readiness. The profile was4K,
+MTP OFF, later-chunk BF16 GEMM OFF, capacity4; two short C1 HTTP requests
+were issued sequentially while its existing watchdogs remained active.
+
+Explicit-Low arithmetic returned visible153,28 input/5 output tokens, normal
+stop. The exact default JSON request retained from the C8 gate returned the
+correct object only in reasoning, empty content,51 input/19 output tokens and
+normal stop. Thus that visible-answer failure also occurs on this C1 ordinary
+profile; it does not require C8 speculation. This is not an isolated numerical
+A/B between the two otherwise different serving profiles.
+
+Raw response artifacts and SHA256s:
+
+- `human-da4ec65d-low-math-response.json`:
+  `e5bed287dbfd036a46776eb8f50ee35c6fc88341333d58732f8c7f476f1a3e4b`.
+- `human-da4ec65d-default-json-response.json`:
+  `2f4c5b3e1b8a11c3470c9a885f6a093de4808da91dba18c362fb93e9d04d8d1e`.
+
+The timer completed and the controller reported operational PASS, with both
+containers exited0 at02:21:30 UTC, OOM=false, restart0 and sampled swap0.
+Minimum MemAvailable was10,626,920/10,379,180 KiB. Final independent SSH
+observations at02:21:50 found no running containers or GPU compute processes,
+zero swap and121,461,560/121,166,740 KiB available. No API remains running.
+Sleep success does not certify either request or the model's quality.
+
+A fresh unconsumed, dry-run-validated local input is
+`human-da4ec65d-4096-off-next-launch.json`, SHA256
+`58f3b2dad7ff543a96e4581d1f78cdde434e6f6c9cf9e5084a420963d0b6ef80`.
+Local operator instructions are `HUMAN-SMOKE-DA4EC65D.md` in the campaign
+directory. Machine-specific inputs and raw responses remain outside Git.
