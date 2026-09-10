@@ -429,3 +429,30 @@ records a cleanup-observation race: worker `/proc/2661118/cgroup` disappeared
 between process observation and file read. Therefore the campaign is **FAIL**
 for both workload and cleanup-observation error, despite final clean exits.
 Evidence: `reuse-14b4e485-16384-eos-first-summary.json` and raw receipts.
+
+## 14b4e485 near-full16K C1 prose: bounded automatic/manual PASS
+
+`prose-14b4e485-16384-on-first-run` finished01:15:44 UTC. The actual final
+chat used15,869 input tokens and86 output tokens under configured16,384
+context (output cap384; input+cap16,253). Three real-chat sizing probes are
+retained separately and are not quality responses. Final TTFT26,058.646ms.
+
+The visible answer is three connected complete sentences: VIOLET-7429 is
+led by Elena Marin in Ghent; originally31 sealed sample kits, exactly8
+removed, no other inventory changes,23 remaining. Root directly reviewed
+the prose and separate reasoning: accurate relationships/arithmetic, no
+invented people/purpose/dates, no repetition or foreign markers. The reasoning
+is one relevant sentence, but its reported31 tokens exceed the requested
+soft16 budget. No strict16-token bound is claimed.
+
+The driver's automatic checks pass while its `qualification_passed` remains
+null by design. Root's separate bounded manual review is retained as
+`prose-14b4e485-16384-manual-review.json`; receipt
+`prose-14b4e485-16384-on-first-receipts/http-0007.json` SHA256:
+`5756b0b6cdd8d711d6dd8c0f58a983be3e2e880a66734de3a118e78c5febc33d`.
+The ordinary controller passes, both ranks exit0/OOM=false/restart0,
+sampled swap0, minimum MemAvailable10,593,068/10,160,020 KiB.
+
+This is one C1 near-full prose sample on ordinary eager MTP-OFF with paged
+BF16 prefill ON. It does not qualify C2-C4, long-context MTP, broad coherence,
+or the release as a whole; the separate arithmetic/strict-format failures remain.

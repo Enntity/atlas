@@ -92,7 +92,7 @@ the earlier long-context output failures; the new combined image must pass.
 
 | Engine and profile | Retained outcome |
 | --- | --- |
-| `14b4e485` | Native build and image verification **PASS**. Fresh/repeat/post-cancel arithmetic **FAIL**, all five outputs unchanged from1cb. Both ranks exited0, OOM=false, restart0 and sampled swap0. Tool/context and selected-MTP qualification pending. |
+| `14b4e485` | Native build/image verification **PASS**. 4K C1 six quality checks and C2 three needles pass, then C2 linked facts fail strict JSON due to a Markdown fence. Separate15,869-input C1 prose passes automatic and bounded manual review. Fresh/repeat/post-cancel arithmetic **FAIL**; debug identifies a suppressed native EOS before the invented question. Selected-MTP qualification pending. |
 | `1cb0267e`,4K ON | **FAIL**: C1 early/middle/late needles and linked facts passed; auto-tool markup appeared inside reasoning, not a valid structured tool call. No tool-result, C2–C4 or boundary checks followed. |
 | `1cb0267e`,16K ON,C1 | Six main quality waves **PASS**; full suite **FAIL**. Exact16384/16385 HTTP400 and actual-text cancellation probes passed, then corrected chat reuse answered unrelated prime-factor mathematics instead of153. No reuse-tool check followed. |
 | `c853bafa`,4K ON | **FAIL**: all six C1 waves and C2 early needle passed; subsequent C2 AURORA needle added brackets and failed strict format. No later quality/boundaries. |
