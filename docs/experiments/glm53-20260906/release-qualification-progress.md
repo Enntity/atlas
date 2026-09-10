@@ -624,5 +624,43 @@ swap0; minimum MemAvailable10,626,176/10,348,016 KiB.
 Both campaigns are **FAIL**. Their correspondingly named `-summary.json`
 files and `quality-receipts/quality/` raw responses are retained. The separate
 C4 diagnostic is not advancement of a passing C3 profile or an acceptance
-gate relaxation. A low-effort4K C2 diagnostic is active at this update;
-the tools-only16K probe is queued, not executed. Neither has a result here.
+gate relaxation. The separate low-effort4K C2 result follows.
+
+## da4ec65d explicit-low4K C2: early passes, middle wave fails
+
+`longctx-da4ec65d-4096-low-c2-first-run` finished02:11:08 UTC. Both early
+needle answers passed at3953 input tokens, with40/18 output tokens. The
+middle wave then **FAILED**: `quality-receipts/quality/http-0022.json`
+(NEBULA) and `http-0023.json` (AURORA) each returned the correct codename
+only in reasoning, with empty visible content and normal stop. Each reported
+3953 input/8 output tokens and6 reasoning tokens; respective TTFTs were
+6527.082465/9195.765413ms. Neither is a passing visible answer.
+
+No late-needle, linked-fact, tool or boundary checks were issued. Both ranks
+exited0, OOM=false, restart0, sampled swap0; minimum MemAvailable
+10,498,036/10,220,104 KiB. The overall **FAIL** is retained in
+`longctx-da4ec65d-4096-low-c2-first-summary.json` and its raw receipts.
+The separate tools-only16K result follows.
+
+## da4ec65d isolated16K tool call passes, actual-ID result fails
+
+`tools-da4ec65d-16384-on-first-run` finished02:16:08 UTC. The isolated C1
+automatic-tool probe passed: `http-0007.json` used15,858 input/21 output
+tokens and returned exactly `lookup_release_0` with
+`{"case_id":"CASE-AURORA"}`, `finish_reason: tool_calls`, and actual ID
+`call_0000000000000000`. The original response is preserved separately as
+`original-auto-tool-row.json`; no external tool was executed.
+
+The calibrated followup reused that actual ID at15,761 input tokens.
+`http-0010.json` returned `RESULT-A6819` only in reasoning, empty visible
+content and normal stop:6 output tokens,4 reported reasoning tokens,
+TTFT25,208.463925ms. The unchanged exact visible-result validator **FAILED**.
+A successful structured call is not a successful call/result roundtrip.
+
+Both ranks exited0, OOM=false, restart0, sampled swap0; minimum MemAvailable
+10,603,856/10,171,676 KiB. Evidence:
+`tools-da4ec65d-16384-on-first-summary.json` and
+`tools-da4ec65d-16384-on-first-receipts/`. This isolated probe reused the
+unchanged SHA-pinned quality helper; it is not advancement of a passing
+full-context suite. The overall result remains **FAIL**, with no performance
+or complete16K qualification claim.

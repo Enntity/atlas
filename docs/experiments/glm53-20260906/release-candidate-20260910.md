@@ -4,6 +4,26 @@ User request received2026-09-09 20:42UTC. Target handoff:
 **2026-09-10 02:42UTC**. This is a testable fork release candidate deadline,
 not a revision of the full reference-performance/serving goal.
 
+## Release-window assessment
+
+Engine is frozen at `da4ec65d316bf3c57796e975633a6e8e78bfc099`; both native
+images are built and verified. Upstream main was rechecked02:02:54 UTC and
+still matches the merged `6c5f17dab9c27ee2396aef1ac2501a17b201c715`.
+Current qualification is **FAILED**, not merely awaiting tests: default/Low
+C8 answer gates fail, ordinary16K retrieval fails, and separate4K Low C2–C4
+probes fail. A near-full15,869-input visible-prose sample passes bounded
+review; a15,858-input tool call passes but its15,761-input result followup
+is reasoning-only and fails. These partial passes do not qualify16K.
+
+The deliverable is an **experimental source/local-image test checkpoint**,
+not a stable release or a performance-goal completion. Portable guarded
+profiles, exact artifact pins, focused prose/tool probes, known failures and
+the retained C4 rollback are in the
+[handoff](../../releases/glm53-dual-spark-20260910-rc.md).
+Historical throughput is labeled by its actual engine; current C8 timing was
+not issued after quality failure. No registry publication or Git push is
+part of this local handoff. The execution order below is the original plan.
+
 ## Execution order
 
 1. Finish the in-flight eight-owner MTP implementation, including admission,

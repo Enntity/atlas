@@ -30,6 +30,27 @@ The prior `1cb0267e`
 passed all six main-quality waves but failed corrected chat reuse. Neither
 complete campaign passed, and neither qualifies the new build.
 
+### Current-build acceptance snapshot
+
+These are separate probes, not one passing combined profile. All use the
+same frozenDa engine; the ordinary runs use MTP OFF.
+
+| Current probe | Result |
+| --- | --- |
+| C8 selected MTP, default and Low effort | **FAIL**:7/8 answers each; JSON reasoning-only. No timing issued. |
+| 16K C1 default / Low retrieval | **FAIL** at early / middle needle respectively. |
+| 16K C1 default prose | Bounded visible-prose **PASS**,15,869 input tokens; not broad coherence. |
+| 16K C1 isolated default tool roundtrip | Auto-call **PASS**,15,858 input tokens; result followup **FAIL**,15,761 input tokens, reasoning-only. |
+| 4K C2 Low retrieval | Early2/2 pass; middle0/2 pass. Complete probe **FAIL**. |
+| 4K C3 Low retrieval | First wave1/3 pass. Complete probe **FAIL**. |
+| 4K C4 Low retrieval, separate diagnostic | First wave2/4 pass. Complete probe **FAIL**. |
+
+The missing final answers remain failures even where reasoning contains the
+correct value. No current concurrency profile or full-context maximum is
+qualified. The isolated tool probe preserves its partial pass and complete
+roundtrip failure; it does not replace the failed full suites. The historical performance table
+below is **not** a measurement of this current build.
+
 ## Reproduce the bounded profiles
 
 - [Portable C8 MTP bundle](../../scripts/dev/glm_release/README.md): actual
@@ -323,3 +344,15 @@ and update each PENDING item with evidence for that exact artifact. Preserve
 failed attempts and stopped containers; no broad cleanup or mutable-tag rollback.
 See [merge evidence](../experiments/glm53-20260906/upstream-release-integration.md)
 and the [release checklist](../experiments/glm53-20260906/release-candidate-20260910.md).
+
+## Next work after this test handoff
+
+The immediate blocker is premature end-of-turn inside reasoning, including
+short arithmetic/JSON and near-full retrieval/tool-result answers. Keep the
+native EOS correction and strict visible-answer checks; do not hide failures
+by moving reasoning to content. The executed BF16-head control did not change
+the arithmetic failure. The
+[reference and numerical-oracle note](../experiments/glm53-20260906/end-of-turn-reference-and-head-control.md)
+defines the next exact-prefix, pre-mask-logit investigation, including the
+first-token EOS-mask trap. Restore demonstrated visible-answer quality before
+claiming new throughput or raising the context limit.
