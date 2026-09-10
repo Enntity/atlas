@@ -4,6 +4,9 @@ Deadline: 2026-09-10 02:42 UTC. Upstream `origin/main` was fetched at
 `6c5f17dab9c27ee2396aef1ac2501a17b201c715`. The pre-merge fork checkpoint
 is `3ff217b1`, also retained as `release/checkpoint-20260909-c8`.
 The already qualified serving images from `a069efc3` remain the rollback.
+At2026-09-10 02:02:54 UTC, a read-only `git ls-remote origin refs/heads/main`
+still returned the same full `6c5f17da…` commit. No newer upstream change was
+waiting to merge at that release-window check.
 
 ## Integration boundaries
 

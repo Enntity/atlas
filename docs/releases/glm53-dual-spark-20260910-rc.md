@@ -19,7 +19,10 @@ explicit Low and High each pass one separate arithmetic probe. Neither effort
 setting is a general fix. Ordinary16K Low validation also failed: the middle
 needle appeared only in reasoning after the early needle passed. A separate
 default-effort15,869-input prose response passes automatic checks and bounded
-manual visible-coherence review. The default-effort16K full suite is running.
+manual visible-coherence review. The default-effort16K full suite failed its
+first needle with reasoning-only output. An identical arithmetic comparison
+using the checkpoint's BF16 output head also failed the same five default
+cases; the head-precision mismatch alone did not fix this behavior.
 Prior14b arithmetic
 failed with an invented next question after Atlas suppressed native EOS.
 The prior `1cb0267e`
@@ -119,7 +122,7 @@ the earlier long-context output failures; the new combined image must pass.
 
 | Engine and profile | Retained outcome |
 | --- | --- |
-| `da4ec65d` | Build/image verification **PASS**. Default arithmetic5/5 **FAIL** (reasoning-only, no longer an invented next question); explicit Low/High each pass one arithmetic probe. Default and Low C8 MTP both **FAIL**, seven of eight answers, before tools/needles/timing. Ordinary16K Low **FAIL** at middle needle, reasoning-only. Separate15,869-input default-effort prose passes automatic and bounded manual visible-coherence checks; complete default16K suite running. |
+| `da4ec65d` | Build/image verification **PASS**. Default arithmetic5/5 **FAIL** (reasoning-only, no longer an invented next question); explicit Low/High each pass one arithmetic probe. Default and Low C8 MTP both **FAIL**, seven of eight answers, before tools/needles/timing. Ordinary16K default/Low **FAIL** at early/middle needle respectively, reasoning-only. Separate15,869-input default-effort prose passes automatic and bounded manual visible-coherence checks. BF16-head arithmetic control has identical requests/choices/token counts to NVFP4 across all seven cases and does not fix default quality. |
 | `14b4e485` | Native build/image verification **PASS**. 4K C1 six quality checks and C2 three needles pass, then C2 linked facts fail strict JSON due to a Markdown fence. Separate15,869-input C1 prose passes automatic and bounded manual review. Fresh/repeat/post-cancel arithmetic **FAIL**; debug identifies a suppressed native EOS before the invented question. Selected-MTP qualification pending. |
 | `1cb0267e`,4K ON | **FAIL**: C1 early/middle/late needles and linked facts passed; auto-tool markup appeared inside reasoning, not a valid structured tool call. No tool-result, C2–C4 or boundary checks followed. |
 | `1cb0267e`,16K ON,C1 | Six main quality waves **PASS**; full suite **FAIL**. Exact16384/16385 HTTP400 and actual-text cancellation probes passed, then corrected chat reuse answered unrelated prime-factor mathematics instead of153. No reuse-tool check followed. |

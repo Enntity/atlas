@@ -560,6 +560,43 @@ Evidence: `prose-da4ec65d-16384-on-first-receipts/summary.json`, separate
 Both ranks exited0, OOM=false, restart0, sampled swap0; minimum MemAvailable
 10,614,264/10,182,376 KiB. This is one C1 visible-prose sample on ordinary
 eager MTP-OFF, paged BF16 prefill ON, not a complete16K/release qualification;
-the failed arithmetic, retrieval and C8 campaigns remain failed. A separate
-default-effort da4ec65d16K C1 quality run is active at this update, without a
-final result here.
+the failed arithmetic, retrieval and C8 campaigns remain failed. The separate
+default-effort da4ec65d16K C1 quality result follows.
+
+## da4ec65d default16K C1: first needle reasoning-only, FAIL
+
+`longctx-da4ec65d-16384-on-chat-run` completed at01:58:11 UTC. Its very first
+early needle (`quality-receipts/quality/http-0007.json`) returned
+`AURORA-6819` only in reasoning, empty visible content and normal stop:
+16,229 input/8 output tokens,6 reported reasoning tokens, TTFT26,054.102361ms.
+The strict visible-answer gate **FAILED**. No quality wave completed
+successfully and no later quality or boundary phase was issued.
+
+Both ranks exited0, OOM=false, restart0, sampled swap0; minimum MemAvailable
+10,478,064/10,110,596 KiB. Evidence:
+`longctx-da4ec65d-16384-on-chat-summary.json` and its raw receipts. The separate
+successful prose sample does not qualify this default16K profile.
+
+## da4ec65d BF16 LM-head effort diagnostic: default failure unchanged
+
+The seven-case effort diagnostic completed at02:00:29 UTC under profile
+SHA256 `ee0958bdb847837a4841d874263fa5878702b4510d1db00faae6faa3fe98982d`.
+Only LM-head selection changed from NVFP4 to BF16; images, prompts and pinned
+driver were retained. Both actual final collection logs explicitly confirm
+`LM head kept as BF16`, so this is an executed head-format comparison, not
+merely a requested option.
+
+All five default fresh/repeat/post-cancel/requested-false cases still **FAIL**:
+28 input/2 output tokens, reasoning153 and empty visible content, normal stop.
+Explicit low returns visible153 in5 output tokens and high in4; both controls
+pass. Raw reported reasoning counts remain0 for default/high and1 for low,
+not an independently validated exact count. The complete diagnostic remains
+**FAIL**; the real head-format difference has not been demonstrated to cause
+the failure, and selecting BF16 did not fix it.
+
+Both ranks exited0, OOM=false, restart0, sampled swap0; minimum MemAvailable
+10,947,152/10,682,980 KiB. Evidence:
+`reuse-da4ec65d-16384-bf16head-effort-first-summary.json`, its run and receipts.
+The separately prepared BF16-head MTP profile remains **unconsumed and
+unqualified**. A low-effort4K C3/C4 run is active at this update; no final
+result from it is claimed here.
