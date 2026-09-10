@@ -13,3 +13,14 @@ pub(crate) fn native_opener(
         None
     }
 }
+
+/// Native GLM end-of-turn while reasoning, not an implicit `</think>`.
+/// This identifies the token only; callers retain all other stop guards.
+pub(crate) fn native_eos_while_thinking(
+    native_boundary: Option<u32>,
+    inside_thinking: bool,
+    token: u32,
+    eos_tokens: &[u32],
+) -> bool {
+    native_boundary.is_some() && inside_thinking && eos_tokens.contains(&token)
+}

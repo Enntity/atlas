@@ -35,6 +35,10 @@ mod position_tests;
 #[path = "glm_tool_boundary_tests.rs"]
 mod glm_tool_boundary_tests;
 
+#[cfg(test)]
+#[path = "glm_native_eos_tests.rs"]
+mod glm_native_eos_tests;
+
 /// Emit a token for an active sequence (stream + bookkeeping).
 ///
 /// Per OpenAI spec, stop/EOS tokens are NOT streamed to the client —
@@ -263,6 +267,12 @@ pub(super) fn emit_token_at_position(
     // force-stop at function end then finishes the sequence even while inside
     // thinking. No-op for direct-mode (thinking-OFF) turns.
     // Detect </think> transition. Track thinking token count for budget enforcement.
+    let native_glm_eos = crate::glm_tool_boundary::native_eos_while_thinking(
+        sched.limits.glm_tool_boundary,
+        a.inside_thinking,
+        tok,
+        &a.eos_tokens,
+    );
     if a.inside_thinking {
         a.consume_generation_budget();
         if a.think_end_token == Some(tok) {
@@ -281,7 +291,7 @@ pub(super) fn emit_token_at_position(
                 a.thinking_tokens,
                 a.thinking_budget,
             );
-        } else {
+        } else if !native_glm_eos {
             a.thinking_tokens += 1;
             if let Some(budget) = a.thinking_budget
                 && a.thinking_tokens >= budget
@@ -459,7 +469,10 @@ pub(super) fn emit_token_at_position(
     let legacy_suppresses_eos = a.require_tool_call;
     let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
     let hard_ceiling = hard_ceiling_hit(a.remaining, position, sched.limits.max_seq_len);
-    let thinking_suppresses_eos = eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling);
+    // Native GLM EOS ends the turn, not the reasoning block. The independent
+    // grammar-inside-thinking guard above is intentionally unchanged.
+    let thinking_suppresses_eos =
+        eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling) && !native_glm_eos;
     let suppress_eos = grammar_suppresses_eos
         || legacy_suppresses_eos
         || min_tokens_suppresses

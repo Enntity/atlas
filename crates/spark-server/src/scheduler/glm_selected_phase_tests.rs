@@ -10,8 +10,8 @@ fn glm_selected_phase_boundary_commits_only_pre_boundary_inputs() {
         return;
     }
     for physical in [&[0usize, 2, 3][..], &[0, 1][..], &[0][..]] {
-        // Unchanged selection control first, then native opener and natural end.
-        for boundary_kind in 0..3 {
+        // Control, native opener, natural reasoning end, then terminal EOS.
+        for boundary_kind in 0..4 {
             let mut r = Run::new(physical, true);
             r.cold();
             let index = r.active.iter().position(|a| a.seq.slot_idx == 0).unwrap();
@@ -26,7 +26,7 @@ fn glm_selected_phase_boundary_commits_only_pre_boundary_inputs() {
             let base = a.seq.seq_len;
             let previous_output = a.output_tokens.len();
             let remaining = a.remaining;
-            a.eos_tokens = vec![100];
+            a.eos_tokens = vec![if boundary_kind == 3 { boundary } else { 100 }];
             a.enable_thinking = true;
             a.inside_thinking = true;
             a.think_ended = false;
@@ -77,24 +77,50 @@ fn glm_selected_phase_boundary_commits_only_pre_boundary_inputs() {
                 );
                 assert_eq!(&a.output_tokens[previous_output..], &[boundary]);
                 assert_eq!(a.remaining, remaining - 1);
-                assert!(!a.inside_thinking && a.think_ended);
+                if boundary_kind == 3 {
+                    assert!(a.finished, "actual EOS must terminate the selected owner");
+                    assert!(
+                        a.inside_thinking,
+                        "do not fabricate a reasoning close/content"
+                    );
+                } else {
+                    assert!(!a.inside_thinking && a.think_ended);
+                }
                 assert_eq!(a.thinking_tokens, 20);
                 assert_eq!(a.seq.seq_len, base + 1);
                 assert_eq!(&a.seq.tokens[base..], &tokens[..1]);
                 assert_eq!(a.last_token, boundary);
-                assert_eq!(a.pending_drafts.len(), 4);
+                assert_eq!(
+                    a.pending_drafts.len(),
+                    if boundary_kind == 3 { 0 } else { 4 }
+                );
             }
             assert_eq!(a.seq.seq_len, base + accepted + 1);
             assert_eq!(&a.seq.tokens[base..], &tokens[..accepted + 1]);
-            let e1 = if physical.len() == 1 { 5 } else { 4 };
-            assert_eq!(packets[e1], [0]);
-            assert_eq!(packets[e1 + 1], [0xffff_ffe1]);
-            assert_eq!(packets[e1 + 2].last(), Some(&a.last_token));
-            r.replay(if physical.len() == 1 {
+            if boundary_kind == 3 {
+                assert!(
+                    !packets
+                        .windows(2)
+                        .any(|p| p[0] == [0] && p[1] == [0xffff_ffe1]),
+                    "never feed the terminal EOS into another proposal"
+                );
+                r.model
+                    .glm_paired_execution()
+                    .unwrap()
+                    .validate_propose(&a.seq, a.last_token, a.seq.seq_len, 4, None)
+                    .unwrap();
+            } else {
+                let e1 = if physical.len() == 1 { 5 } else { 4 };
+                assert_eq!(packets[e1], [0]);
+                assert_eq!(packets[e1 + 1], [0xffff_ffe1]);
+                assert_eq!(packets[e1 + 2].last(), Some(&a.last_token));
+            }
+            let commands = if physical.len() == 1 {
                 2
             } else {
                 1 + physical.len()
-            });
+            };
+            r.replay(commands - usize::from(boundary_kind == 3));
             r.close();
         }
     }

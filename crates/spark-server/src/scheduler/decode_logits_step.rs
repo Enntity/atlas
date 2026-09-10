@@ -472,6 +472,12 @@ pub fn process_decode_logits(
         // commit path (below) finishes the sequence even while inside thinking
         // (§C-2 budget half). Every generated token (content OR thinking,
         // including `</think>`) now decrements exactly once.
+        let native_glm_eos = crate::glm_tool_boundary::native_eos_while_thinking(
+            sched.limits.glm_tool_boundary,
+            a.inside_thinking,
+            tok,
+            &a.eos_tokens,
+        );
         if a.inside_thinking {
             a.consume_generation_budget();
             if think_end_token == Some(tok) {
@@ -486,7 +492,7 @@ pub fn process_decode_logits(
                 // tool call (Change 3b). Cleared in the `else`
                 // branch below on the next emit.
                 a.think_just_ended = true;
-            } else {
+            } else if !native_glm_eos {
                 a.thinking_tokens += 1;
                 // Track ``` code-fence parity within the thinking block:
                 // each fence token flips in/out of a fenced code span.
@@ -733,7 +739,10 @@ pub fn process_decode_logits(
         // decrement (thinking or content branch above); `a.seq.seq_len` is the
         // current KV position. No-op until a ceiling is actually hit.
         let hard_ceiling = hard_ceiling_hit(a.remaining, a.seq.seq_len, sched.limits.max_seq_len);
-        let thinking_suppresses_eos = eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling);
+        // GLM can end its turn without closing reasoning. Do not fabricate a
+        // close or keep decoding after that native EOS; other guards remain.
+        let thinking_suppresses_eos =
+            eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling) && !native_glm_eos;
         // Post-thinking EOS guard. Empirically (dump fix22b 2026-04-25
         // ses_23b4781f7ffebc7UgkKWedTmjd seq=43): when the thinking-loop
         // watchdog force-closes `</think>` mid-narration, the model can
