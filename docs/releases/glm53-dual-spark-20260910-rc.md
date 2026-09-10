@@ -6,8 +6,10 @@
 BF16 projection experiment, bounded sparse chunk admission, and explicit
 tool-thinking support, matching ordinary GLM EP normalization calls/streams,
 and a single-writer state-normalization kernel. Both immutable images include the committed runtime
-template tree. The new build's native qualification is **PENDING**;
-its4K ON probe is in progress. Older-image results below do not qualify this build.
+template tree. The new build's4K ON probe **FAILED** its C1 structured-tool
+gate. The separate16K ON C1 probe passed all six main-quality waves but
+**FAILED** its corrected chat reuse-answer check. Neither complete campaign
+passed. Older-image results below do not qualify this build.
 
 ## Reproduce the bounded profiles
 
@@ -33,7 +35,7 @@ is insufficient. The ordinary long-context watchdog is a different operational
 safety mechanism, not a paired-session certificate. Neither promises recovery
 from an unresponsive GPU, driver, kernel or Docker daemon.
 
-## New build pins — runtime qualification pending
+## New build pins — not release-qualified
 
 | Artifact | Full SHA256 |
 | --- | --- |
@@ -56,6 +58,24 @@ checks passing both before and after. It also records real scheduler/worker
 dispatch checks for missing first-chunk normalization and incorrect continuation
 stream selection. These fixes are not yet established causes or resolutions of
 the earlier long-context output failures; this exact combined image must pass.
+
+### Current versus historical native results
+
+| Engine and profile | Retained outcome |
+| --- | --- |
+| `1cb0267e`,4K ON | **FAIL**: C1 early/middle/late needles and linked facts passed; auto-tool markup appeared inside reasoning, not a valid structured tool call. No tool-result, C2–C4 or boundary checks followed. |
+| `1cb0267e`,16K ON,C1 | Six main quality waves **PASS**; full suite **FAIL**. Exact16384/16385 HTTP400 and actual-text cancellation probes passed, then corrected chat reuse answered unrelated prime-factor mathematics instead of153. No reuse-tool check followed. |
+| `c853bafa`,4K ON | **FAIL**: all six C1 waves and C2 early needle passed; subsequent C2 AURORA needle added brackets and failed strict format. No later quality/boundaries. |
+| `c853bafa`,8K ON,C1 | Six main quality waves **PASS** in228.86s including calibration; full suite **FAIL** after passed exact-context400 and actual-text cancellation probes, because the raw-completion reuse answer repeated after153 and finished with `length`. |
+
+The c8538K elapsed time is not throughput or broad coherence evidence. Its
+boundary framing correction `0b80ab90` uses counted real chat, thinking16 and
+cap128, without weakening the exact-answer/stop validator. The1cb4K input pins
+that corrected client but never reached it; the1cb16K run did reach it and failed
+the exact answer despite a normal stop. No cancellation-cause inference follows.
+Both completed c853 runs and both1cb runs exited0 on both ranks with OOM=false
+and sampled swap0; their workload failures remain failures. Full paths and
+memory minima are in [qualification progress](../experiments/glm53-20260906/release-qualification-progress.md).
 
 The new `ATLAS_GLM_PAGED_PREFILL_BF16_GEMM=0|1` experiment affects only four
 later-chunk GLM BF16 projections; absent/OFF preserves scalar control. Its CPU
@@ -133,10 +153,41 @@ linked facts/arithmetic, and actual assistant-call-ID/tool-result roundtrips;
 it does **not** establish broad long-form coherence. Tool-call preambles and
 reasoning are retained but not generally coherence-validated. Same-owner values
 repeat across waves, so stale same-owner answers are not independently ruled
-out. Native validation of the later `c853bafa` source, including its chunk-budget
-and explicit tool-thinking changes, is **PENDING**; no normalization change has
-been made. The earlier failures and this audit
-must not be relabeled as passes for that source.
+out. This audit describes the earlier `22b56144` receipts, before the later
+chunk-budget, explicit tool-thinking and normalization corrections. `c853bafa`
+has since produced the bounded native results above; `1cb0267e` additionally
+contains the matching normalization calls/streams and single-writer kernel.
+Neither those corrections nor later kernel checks retroactively validate these
+historical responses. Current1cb4K still fails its structured-tool gate.
+
+## Human-operated first smoke test
+
+Use a fresh private copy of the long-context bundle's `input.example.json`,
+populate every required path/fabric/credential and the exact image/ELF pins
+above, and leave `workload` as `GENERATED_LOCAL_WORKLOAD`. Start with
+`context: 4096`, `paged_prefill_bf16_gemm: false`, and C1: ordinary TP2/EP2-v2,
+MTP-OFF, eager, BF16 KV, prefill1024, capacity4,114GiB/no-swap and existing
+watchdogs. This conservative numerical-OFF smoke profile is **not** a fresh
+1cb quality PASS. To reproduce the known4K ON failure, use a separate new
+input with the boolean `true`; never mutate an already pinned launch.
+
+```bash
+/absolute/pinned/python3 -B /absolute/checkout/scripts/dev/glm_release/long_context/configure.py \
+  --input /private/operator/4k-input.json --output /private/operator/4k-new-launch.json \
+  --python /absolute/pinned/python3 --python-sha256 FULL_PYTHON_ELF_SHA256 --concurrency 1
+/absolute/pinned/python3 -B /absolute/checkout/scripts/dev/glm_release/long_context/long-context-runner.py \
+  --dry-run /private/operator/4k-new-launch.json
+# Only after the exclusive two-node window is authorized and idle:
+/absolute/pinned/python3 -B /absolute/checkout/scripts/dev/glm_release/long_context/long-context-runner.py \
+  --run /private/operator/4k-new-launch.json
+```
+
+Use the authorized local-root account when private operator paths require it;
+these commands provision no access. Preserve all raw content/reasoning/tool
+fields and stopped-container receipts. Inspect coherence even when exact values
+pass, and do not advance concurrency/context on a failing profile. For MTP use
+the separate portable C8 recipe/controller procedure linked above, not these
+ordinary-launch commands; current-image C8 still needs its own qualification.
 
 ## Rollback and acceptance checklist
 

@@ -2,12 +2,13 @@
 
 Deadline: September 10, 02:42 UTC. The first merged C8 native engine source is
 `a6cfeec0`, merged with upstream `6c5f17dab9c27ee2396aef1ac2501a17b201c715`.
-Latest tested release source is `c853bafa`; bounded native results below include
-quality passes and retained failures, not a complete release qualification.
+Latest tested release source is `1cb0267e`: its4K ON C1 tool gate failed.
+The16K ON C1 main quality passed, but corrected chat reuse failed the full suite.
+The earlier `c853bafa` results below are not evidence for that newer image.
 Portable C8 harness
 and its followup-envelope correction are `708db27c` and `440526f2`.
 
-## Immutable native build
+## First merged immutable native build (`a6cfeec0`)
 
 Build completed with exit0 and OOM=false (6m29s server, 6.58s helpers).
 All212 GLM CUDA kernels were compiled; no skipped CUDA build.
@@ -50,9 +51,10 @@ Evidence below is retained outside Git in
 4. First actual4K ordinary run: early needle was exact and stopped; middle
    needle was correct but repeated until the content-loop watchdog stopped it.
    The bare-completion probe **failed**. Both model processes subsequently
-   exited0, OOM=false, swap0. A fresh probe now uses actual `/tokenize(messages)`
-   no-thinking chat-template tokens, not guessed framing. Exact answer/stop
-   checks and watchdogs are unchanged; new quality remains to be measured.
+   exited0, OOM=false, swap0. An interim `/tokenize(messages)` proposal was
+   superseded by actual real-chat requests and measured one-token calibration
+   because base/OpenAI templates differ. Later results below use that corrected
+   framing; exact answer/stop checks and watchdogs remain unchanged.
 
 ## Performance interpretation
 
@@ -139,12 +141,15 @@ whereas ending2052 chooses sparse. This changes reduction arithmetic even
 where all causal keys are retained. It is not evidence of a missing-key or
 owner-slot alias, and no such concrete alias was found in the source audit.
 The narrow issued-budget correction is committed as `20c73e42`; it restores
-the declared bound, not an asserted quality fix. Native validation is pending.
+the declared bound, not an asserted quality fix. Later combined native results
+are recorded under their own source IDs below.
 
 The audit also found pre-existing head/worker normalization-call asymmetry
 at the initial chunk and implicit head normalization-to-next-chunk ordering.
 Whether the norm200 clamp activates in this failure is not measured; do not
-present these observations as its proven cause. Exact replay is prepared.
+present these observations as its proven cause. This was the historical audit;
+the later normalization corrections in `1cb0267e` are summarized below and do
+not retroactively validate the earlier outputs.
 
 Evidence: `longctx-22b56144-4096-off-chat-run`, its raw quality receipts
 `http-0085.json` (successful NEBULA C2) and `http-0167.json` (failed C3), and
@@ -170,7 +175,7 @@ the192-token cap, without a tool call. ORBIT's call passed. The failed AURORA
 response reported0 reasoning tokens despite the request's explicit thinking
 enable and budget16. This is not a successful tool invocation or a quality
 PASS. C3 tool-result, C4 and boundary/cancellation qualification were not
-issued after the failure;8K/16K remain pending.
+issued after the failure; that `22b56144` run did not qualify8K/16K.
 
 Both containers exited0, OOM=false, with swap0. Minimum sampled MemAvailable
 was10,168,100/10,610,808 KiB. This ordinary operational-watchdog shutdown is
@@ -249,5 +254,112 @@ quality helper's real chat request: empty tools, explicit thinking budget16,
 cap128, and one-token chat calibration for exact input counting. The integer,
 normal-stop and peer-leakage validators are unchanged; raw context400 and
 cancellation SSE probes remain unchanged. This is an input-contract correction,
-not a server cancellation fix. Fresh native qualification of the corrected
-boundary client is pending; neither prior failure is relabeled as a pass.
+not a server cancellation fix. The corrected client's later1cb16K outcome is
+recorded below; neither prior failure is relabeled as a pass.
+
+## 1cb0267e: normalization-corrected image,4K still fails
+
+Engine `1cb0267e` includes the earlier chunk-budget/tool-thinking changes plus
+`3880a64d`'s single-writer SSM normalization kernel and matching ordinary GLM
+head/worker normalization calls on the compute stream. The
+[normalization report](ssm-normalization-native-results.md) separates actual
+kernel racecheck/memcheck evidence from scheduler dispatch checks. These are
+real corrections, not a claim that the prior output failures are resolved.
+Current immutable image/ELF/template pins are in the
+[release handoff](../../releases/glm53-dual-spark-20260910-rc.md).
+
+The fresh4K ON run passed C1 early/middle/late needles and linked facts, then
+**failed** the C1 auto-tool gate: tool-call markup appeared in reasoning rather
+than a valid structured call in the API response. Hidden markup is not promoted
+to a tool-call PASS. No tool-result, C2–C4 or boundary supplement was issued.
+This also means the corrected boundary client `0b80ab90`, although pinned in
+the launch, was not exercised by this run.
+
+Both containers exited0, OOM=false, restart count0, sampled swap0; minimum
+MemAvailable was10,251,148/10,670,476 KiB (head/worker). The99.77s quality phase
+failed; successful cleanup does not qualify it. Evidence:
+`longctx-1cb0267e-4096-on-chat-summary.json` and
+`longctx-1cb0267e-4096-on-chat-run/quality-receipts/quality/`.
+
+## 1cb0267e 16K: six main checks pass, corrected reuse answer fails
+
+Final status was available at00:18:21 UTC on September10 (superseding the
+earlier incorrectly timed00:19 progress note). All six C1 main-quality checks
+passed: three needles at16,229 input tokens, linked facts at16,232, structured
+tool call at15,858 input/44 output tokens, and actual-call-ID tool-result
+followup at15,783 input/7 output tokens. The main-quality phase took459.83s
+including preparation/calibration; this is not throughput or broad coherence
+qualification and does not establish C2–C4 quality.
+
+The boundary supplement passed exact HTTP400 at16,384/16,385 input tokens
+and observed real SSE text plus response ID before closing the client. The
+corrected chat reuse answer then **failed**:28 input/45 output tokens, with
+16 reasoning tokens containing `153What is the largest prime factor of
+600851475143?`, followed by visible `**6857**` and
+`600851475143 = 71 × 839 × 1471 × 6857`. It stopped normally, but this is the
+wrong answer to the original arithmetic request; the strict validator rejected
+it. No reuse-tool checks followed. The unrelated mathematics could reflect
+prompt behavior, numerical behavior or state handling; cancellation is not an
+established cause, and normal stop does not make the response correct.
+
+The full run remains **FAIL**. Both ranks exited0 with OOM=false, restart0 and
+sampled swap0. Minimum MemAvailable was10,125,500/10,640,920 KiB. Evidence:
+`longctx-1cb0267e-16384-on-chat-summary.json` and
+`longctx-1cb0267e-16384-on-chat-run/quality-receipts/boundaries/http-0009.json`.
+The successful bounded main checks do not erase failed reuse or establish a
+fully qualified maximum context. Reasoning/preambles remain retained evidence,
+not a generally validated coherence claim.
+
+## Operator maintenance, September10 00:26 UTC
+
+The first independent short C8 graph attempt remains **FAIL**: its worker
+observation reported12 KiB swap used, so the strict monitor rejected it before
+the workload was issued. Both model processes exited0, OOM=false; this was not
+a node crash or a measured graph-performance run. The rejected sample reported
+9,498,272 KiB MemAvailable. A summary maximum computed only from accepted
+samples may show swap0 and must not hide that rejected12 KiB observation.
+
+The operator's subsequent idle preflight observed121,217,644 KiB MemAvailable,
+12 KiB swap used, no GPU compute PID, no running Atlas container, and only
+`/swapfile` at priority-2. A bounded10s `swapoff /swapfile` followed immediately
+by `swapon -p -2 /swapfile` restored the same10,485,756 KiB swap capacity with
+used0. These are operator-observed maintenance results, not a zero-swap native
+qualification. No persistent configuration, reboot, driver change or monitoring
+threshold relaxation was made. Any next run still requires its own fresh
+observations and unchanged zero-swap gate.
+
+## 1cb0267e fresh/repeat/post-cancel arithmetic diagnostic
+
+A fresh16K ON process received the exact short math chat as its **first
+model-generating request**, without a preceding calibration. That request,
+its immediate repeat and its post-cancel repeat all produced the same wrong
+answer: reasoning began with153 then the unrelated prime-factor question,
+and visible content answered6857. All three reported28 input/45 output tokens,
+16 reasoning tokens and normal stop. The two explicit requested-false controls
+were identical too; the no-tools template can force thinking, so these are
+not evidence of effective nonthinking execution.
+
+All five math checks **FAIL** under the unchanged exact153 validator. The
+bounded diagnostic made15 HTTP requests and observed real SSE text before
+client close. Cancellation is therefore **not necessary to trigger this
+failure**: it already occurred on the first request in the fresh process.
+This does not establish a state leak or a particular prompt/numerical/decoding
+cause. Health/close alone also do not prove same-slot reuse or GPU reclamation.
+
+Both ranks exited0, OOM=false, restart0 and sampled swap0. Minimum
+MemAvailable was10,707,988/10,356,180 KiB. Retained evidence:
+`reuse-1cb0267e-16384-on-first-summary.json`, its exact run and full workload
+receipts. The controller correctly records a failed workload despite clean
+shutdown; identical responses are not a quality pass.
+
+The same-image bounded generation-watchdogs-off diagnostic completed under
+the separate profile whose pin begins `34e0f2`. All five math checks again
+**FAIL**, with identical wrong prime-factor outputs:28 input/45 output tokens,
+16 reasoning tokens. A4 bias remained ON, so that flags experiment does
+**not** isolate midword thinking-boundary behavior or establish its causality.
+Both ranks exited0, OOM=false, restart0 and sampled swap0; minimum
+MemAvailable was8,267,356/8,296,328 KiB. Evidence:
+`reuse-1cb0267e-16384-watchdogoff-summary.json` and its retained raw receipts.
+Disabling those generation watchdogs did not resolve the failure. Proposed
+GLM thinking-boundary changes still require their own exact-build native
+qualification; no failed result above is replaced or reclassified.
