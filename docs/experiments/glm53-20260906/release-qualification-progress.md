@@ -598,5 +598,31 @@ Both ranks exited0, OOM=false, restart0, sampled swap0; minimum MemAvailable
 10,947,152/10,682,980 KiB. Evidence:
 `reuse-da4ec65d-16384-bf16head-effort-first-summary.json`, its run and receipts.
 The separately prepared BF16-head MTP profile remains **unconsumed and
-unqualified**. A low-effort4K C3/C4 run is active at this update; no final
-result from it is claimed here.
+unqualified**. Separate low-effort4K C3/C4 diagnostic results follow.
+
+## da4ec65d explicit-low4K C3 and C4: first-wave failures
+
+The C3 diagnostic `longctx-da4ec65d-4096-low-first-run` finished02:04:13 UTC.
+Its first early-needle wave passed only1 of3 exact visible answers:
+`http-0015.json` returned ORBIT-6893 correctly (3952 input/12 output);
+`0016` returned only reasoning `nameAURORA-6819` (3953/9), and `0017` only
+reasoning `: NEBULA-6856` (3953/9), both with empty visible content.
+All stopped normally; the latter two still fail. No later wave or C4 request
+was issued by this suite. Both ranks exited0, OOM=false, restart0, sampled
+swap0; minimum MemAvailable10,511,004/10,318,064 KiB.
+
+The **separate diagnostic**, `longctx-da4ec65d-4096-low-c4-first-run`, finished
+02:07:47 UTC. It passed2 of4 first early-needle answers: `http-0019.json`
+returned QUASAR-6930 (3953/9), and `0020` returned AURORA-6819 (3953/40).
+The latter nevertheless contains archive filler in reasoning, with30 reported
+reasoning tokens; its correct visible answer is not a reasoning-coherence pass.
+`0021` returned ORBIT-6893 only in reasoning (3952/7), and `0022` returned
+NEBULA-6856 only in reasoning (3953/8), empty visible content, normal stop.
+No later waves were issued. Both ranks exited0, OOM=false, restart0, sampled
+swap0; minimum MemAvailable10,626,176/10,348,016 KiB.
+
+Both campaigns are **FAIL**. Their correspondingly named `-summary.json`
+files and `quality-receipts/quality/` raw responses are retained. The separate
+C4 diagnostic is not advancement of a passing C3 profile or an acceptance
+gate relaxation. A low-effort4K C2 diagnostic is active at this update;
+the tools-only16K probe is queued, not executed. Neither has a result here.

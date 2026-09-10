@@ -96,3 +96,34 @@ MTP BF16-head test was executed for this finding.
 
 Do not substitute more unmeasured flags, invented closing tokens, or reasoning
 hoisting for a demonstrated explanation and a visible-answer quality gate.
+
+## Feasible prefill-versus-incremental numerical oracle — not executed
+
+The existing [`/tokenize` messages handler](../../../crates/spark-server/src/api/misc_handlers.rs#L252)
+returns actual checkpoint-template token IDs, but passes tools=None,
+thinking=false and effort=None. It does **not** use the
+[OpenAI chat-template path](../../../crates/spark-server/src/api/chat/template.rs#L93)
+or expose equivalent request-policy controls. Its output is therefore not a
+general exact-chat-prefix oracle; any narrowly equivalent no-tools case must
+first be established against the actual pinned templates and preprocessing.
+
+[`/v1/completions` accepts integer token IDs unchanged](../../../crates/spark-server/src/api/completions.rs#L68),
+so an independently verified native prefix followed by the actual `153` token
+can be replayed through prefill. However, the
+[first-token sampler masks EOS](../../../crates/spark-server/src/scheduler/sample_step.rs#L369).
+A different returned first token is consequently **not numerical proof** of
+prefill-versus-incremental divergence.
+
+Existing `ATLAS_DUMP_LOGITS_PATH` hooks offer a possible no-rebuild diagnostic:
+[`sample_token`](../../../crates/spark-server/src/scheduler/sample_step.rs#L351)
+appends pre-EOS-mask FP32 rows to `logits_stok.bin`, while
+[`decode_logits_seq`](../../../crates/spark-server/src/scheduler/decode_logits_seq.rs#L54)
+appends pre-pipeline/pre-penalty rows to `logits_seq.bin`. Before use, review
+actual path coverage: the sampler's greedy empty-suppression fast path bypasses
+its dump, and other decode/verification paths are not automatically covered.
+These append-only files carry no per-request identity, and write failures are
+ignored. A controlled future capture therefore needs explicit pinned diagnostic
+environment/output access, bounded C1 requests, fresh files, exact row counts,
+prefix/step correlation and retained artifact hashes. Compare the raw logits
+at the same prefix, not merely post-mask samples or later continuations. This
+precise-prefix/logit comparison has **not been executed** in this release.
