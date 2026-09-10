@@ -1,10 +1,11 @@
 # GLM-5.3-Flash dual-Spark fork: release-candidate handoff
 
 **Draft test handoff, not a final qualification or model card.** Engine source
-`c853bafa` includes the upstream merge at
+`1cb0267e` includes the upstream merge at
 `6c5f17dab9c27ee2396aef1ac2501a17b201c715`, an OFF-by-default later-chunk
 BF16 projection experiment, bounded sparse chunk admission, and explicit
-tool-thinking support. Both immutable images include the committed runtime
+tool-thinking support, matching ordinary GLM EP normalization calls/streams,
+and a single-writer state-normalization kernel. Both immutable images include the committed runtime
 template tree. The new build's native qualification is **PENDING**;
 its4K ON probe is in progress. Older-image results below do not qualify this build.
 
@@ -36,18 +37,25 @@ from an unresponsive GPU, driver, kernel or Docker daemon.
 
 | Artifact | Full SHA256 |
 | --- | --- |
-| Head image | `9fe4707fd90837cc82ecb5168802281d1abf2acb038248875caa4f34201e85a7` |
-| Worker image | `8a0bdf093cbb01f4e145e07c16e4c684aec60a5576cabfec5b2d1bbeb65e5aa6` |
-| Server ELF | `6211d3d70f9e5b22e9f4a7f276efffa1017ba042999aa91aeeaf2a5d7d6a4e15` |
+| Head image | `f65d53b311f6ca2c0af1b64538b342d15807fe616f550be714b7a2c2532e867d` |
+| Worker image | `0b7e4677f9d31ccc2241e4af3eecab9593469729de703d4db0f666f8e44e0f47` |
+| Server ELF | `bdda966a70a22821d257feb8d39814833d4d2abfb48cebb7ecd2049dcb64fef0` |
 | GLM OpenAI runtime template | `d921f36103aa17db5fbf5891e4f7fe55a9080db450d7b8fb5c9833237c31bd16` |
 
 The server and all212 target kernels built without the stub gate; the bounded
 CPU-only native builder exited0, OOM=false. Both images were inspected by full
 ID; actual in-image server, guard and runtime GLM template hashes matched,
 and the working directory was `/`. Source archive SHA256 is
-`e14520752e9956083526006caa741efb57be6d7a34dfe293d939cf03157a22f3`.
+`961436bbd49dc938deaa7f372c5df8d3262c546be5a99af147c572137b63a7e5`.
 The source archive includes the complete runtime template tree separately from
 the ELF. These packaging checks do not establish model-quality success.
+
+The [normalization correction report](../experiments/glm53-20260906/ssm-normalization-native-results.md)
+records actual CUDA racecheck32→0 and corrected memcheck0, with numerical
+checks passing both before and after. It also records real scheduler/worker
+dispatch checks for missing first-chunk normalization and incorrect continuation
+stream selection. These fixes are not yet established causes or resolutions of
+the earlier long-context output failures; this exact combined image must pass.
 
 The new `ATLAS_GLM_PAGED_PREFILL_BF16_GEMM=0|1` experiment affects only four
 later-chunk GLM BF16 projections; absent/OFF preserves scalar control. Its CPU

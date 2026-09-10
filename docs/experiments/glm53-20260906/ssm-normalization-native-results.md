@@ -51,6 +51,27 @@ numerical mismatch or source-text test.
 | RED executable | `925b233da01b5a79f241f4e26ef9f2171b6937878f6d4b3267f3f2992985a7d0` |
 | GREEN executable | `cfa4f8db3b89b42faef06ad986ee5869dec8c9d36fe12b9ce966df5cf99d3f83` |
 
+### Production-target/compiler-flag followup
+
+The initial standalone builds above used `sm_121a` with default FMA behavior.
+A completed followup used CUDA13.0.48, the actual target `sm_121f`, and
+`--fmad=false -DTQ_PLUS_SIGNS --expt-relaxed-constexpr`, with the same source and
+reproducer hashes. `ssm-norm-matched-build.log` retains the compiler version and
+artifact hashes. Results in `ssm-norm-red-matched-racecheck.log` again show both
+FP32/FP16 numerical PASS but32 racecheck errors (exit99). The corrected source
+passes both numerical checks with0 racecheck hazards (exit0) in
+`ssm-norm-green-matched-racecheck.log`, and both numerical checks with0 memcheck
+errors (exit0) in `ssm-norm-green-matched-memcheck.log`.
+
+| Matched standalone executable | SHA256 |
+| --- | --- |
+| RED | `768e797977eaa32f4b0ca26db2fa2b74cb4944c262a234d5ae0055733acc5ac8` |
+| GREEN | `78cd66f1e11b7493f22e35fa0cefbd90aca64acadab9c500ee3e09db545b5ac0` |
+
+This strengthens qualification for the production target and arithmetic flags.
+It is still an independently compiled standalone executable, **not proof of
+identity with the server's embedded PTX** or full-model execution.
+
 The external `bench-ssm-norm-release.cu` is byte-identical to the portable
 `scripts/dev/bench_glm_ssm_state_norm.cu`. It includes the actual source selected
 by `ATLAS_SSM_NORM_SOURCE`; data and tolerances are unchanged between builds.
@@ -62,11 +83,12 @@ must remain bitwise unchanged. Clamped FP32 has strict numerical tolerances,
 FP16 allows at most one half ULP, and both have independent norm checks.
 Layer/table canaries are checked; peak explicit device allocation is under7MiB.
 
-Reproduction command form, inside an independently authorized idle GPU window
-with the exact source paths and executable identity pinned by the operator:
+Matched reproduction command form, inside an independently authorized idle GPU
+window with exact source paths and executable identity pinned by the operator:
 
 ```sh
-nvcc -std=c++17 -O3 -arch=sm_121a -lineinfo \
+nvcc -std=c++17 -O3 -arch=sm_121f -lineinfo \
+  --fmad=false -DTQ_PLUS_SIGNS --expt-relaxed-constexpr \
   -DATLAS_SSM_NORM_SOURCE='"/ABS/PINNED/ssm_state_norm.cu"' \
   scripts/dev/bench_glm_ssm_state_norm.cu -o /ABS/NEW/ssm-norm-test
 compute-sanitizer --tool racecheck --error-exitcode 99 /ABS/NEW/ssm-norm-test
@@ -89,6 +111,6 @@ isolated child running its actual entry test. This proves the checked CPU
 dispatch behavior, not native SSM arithmetic or long-context quality.
 
 Native full-model quality must be rerun on the final combined source. These
-standalone source-hash-pinned checks were performed before the combined commit;
-they are not a complete repository benchmark gate. Neither this kernel result
-nor the earlier `c853bafa` run qualifies that subsequent serving artifact.
+standalone source-hash-pinned checks are not a complete repository benchmark
+gate. Neither this kernel result nor the earlier `c853bafa` run qualifies that
+subsequent serving artifact.
