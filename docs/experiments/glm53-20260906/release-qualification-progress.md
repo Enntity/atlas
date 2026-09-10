@@ -363,3 +363,22 @@ MemAvailable was8,267,356/8,296,328 KiB. Evidence:
 Disabling those generation watchdogs did not resolve the failure. Proposed
 GLM thinking-boundary changes still require their own exact-build native
 qualification; no failed result above is replaced or reclassified.
+
+## 14b4e485 native build and first arithmetic diagnostic
+
+Frozen engine14b4e485 built natively in6m34s plus6.93s for helpers, builder
+exit0/OOM=false. Both packaged images' actual server, guard and runtime GLM
+template hashes agree with the [RC artifact table](../../releases/glm53-dual-spark-20260910-rc.md).
+
+The fresh16K ON diagnostic completed at01:01:48 UTC. All five fresh, repeat,
+post-cancel and requested-false math responses still **FAIL** unchanged:
+28 input/45 output,16 reasoning tokens, reasoning153 then the unrelated
+prime question, visible6857. This disproves resolution by the combined14b
+boundary-policy changes; it does not disprove their separate tool-boundary fix.
+Requested-false remains not proof of effective nonthinking execution.
+
+Both ranks exited0, OOM=false, restart0, sampled swap0. Minimum
+MemAvailable was10,630,212/10,290,624 KiB. Evidence:
+`reuse-14b4e485-16384-on-first-summary.json`, its run, and raw receipts.
+An existing-debug-log-only diagnostic is prepared to observe actual sampled
+EOS suppression; its hypothesis is not yet a demonstrated cause.
