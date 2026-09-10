@@ -152,3 +152,31 @@ passed. `qualification_passed` remains null and manual review is required:
 read the full retained content and reasoning for connected sentences, accurate
 relationships, invented facts, repetition and unrelated material. One sample
 does not establish general coherence, concurrency, occupancy or performance.
+
+## Separate bounded tools-only diagnostic
+
+`release-context-tools-only.py` is a byte-identical retained driver, SHA256
+`624a3142f899af802088c957b413d290ab09eef904203333cb591c58d53f8392`.
+It reuses the exact pinned quality helper's C1 near-full auto-tool request,
+actual assistant-call-ID followup and unchanged validators. The original call
+is saved before followup preparation; literal tool results do not execute any
+external function. This permits a separately labeled tool diagnostic even when
+an earlier needle gate failed; it does not turn that failed suite into a PASS.
+
+```bash
+/absolute/pinned/python3 -B /absolute/checkout/scripts/dev/glm_release/long_context/release-context-tools-only.py \
+  --base-url http://HEAD_IPV4:8890 --model /var/tmp/models/glm53-flash-nvfp4 \
+  --context-limit 4096 \
+  --quality-path /absolute/checkout/scripts/dev/glm_release/long_context/release-context-quality.py \
+  --quality-sha256 FULL_ACTUAL_QUALITY_SHA256 \
+  --output-dir /private/operator/new-tools-only-receipts
+```
+
+The driver fixes its deadline and request timeout at300s, with at most16 HTTP
+calls; there is no timeout override flag. Use it as the pinned workload of the
+existing ordinary watchdog with an explicit320s outer workload timeout, not
+alongside another workload. Pin Python, driver and helper; match the configured
+4096/8192/16384 context and preserve all raw receipts and final node records.
+Its `passed` covers only this C1 tool/result diagnostic;
+`full_context_qualification_passed` stays null. Packaging establishes no native
+PASS, and this probe does not test needles, prose, concurrency or performance.
