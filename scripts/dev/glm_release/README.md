@@ -35,8 +35,13 @@ checks, with OOM=false and swap0. Its receipts are
 `native-prepared-a6cfeec0-c8-owner-owners-joint-followup128` and
 `native-summary-a6cfeec0-c8-owner-joint-followup128.json`, summarized in
 [qualification progress](../../../docs/experiments/glm53-20260906/release-qualification-progress.md).
-This qualifies only those exact `a6cfeec0` artifacts and bounded checks, not
-the latest `c853bafa` build, whose native qualification remains pending.
+This qualifies only those exact `a6cfeec0` artifacts and bounded checks; its
+rates are historical, not current-candidate performance. The current
+`da4ec65d` candidate failed both default-effort and explicitly Low-effort C8
+attempts: seven of eight answer checks passed; the JSON check returned only
+reasoning, with empty final content.
+Both attempts stopped before timing. Neither is a C8 quality or performance
+PASS, and Low effort is a distinct prompt profile, not a default-mode result.
 
 ## Contents and provenance
 
@@ -92,8 +97,8 @@ Package the exact source revision's complete `jinja-templates/` runtime tree
 at `/jinja-templates` in both images and preserve the reviewed working
 directory `/`: the server resolves templates relative to its working
 directory, not its ELF. Record and verify the runtime asset hashes as well
-as the image/ELF hashes. At `c853bafa`,
-`/jinja-templates/openai/glm5_next.jinja` must have SHA256
+as the image/ELF hashes. The actual `da4ec65d` images retain the verified
+`/jinja-templates/openai/glm5_next.jinja` SHA256
 `d921f36103aa17db5fbf5891e4f7fe55a9080db450d7b8fb5c9833237c31bd16`.
 An ELF-only overlay on an older image does not ship the current template.
 

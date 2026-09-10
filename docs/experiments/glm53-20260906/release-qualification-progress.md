@@ -456,3 +456,66 @@ sampled swap0, minimum MemAvailable10,593,068/10,160,020 KiB.
 This is one C1 near-full prose sample on ordinary eager MTP-OFF with paged
 BF16 prefill ON. It does not qualify C2-C4, long-context MTP, broad coherence,
 or the release as a whole; the separate arithmetic/strict-format failures remain.
+
+## da4ec65d native EOS correction: shorter default failure, effort controls pass
+
+Engine `da4ec65d316bf3c57796e975633a6e8e78bfc099` built successfully in6m37s
+plus6.86s for helpers. Both images' actual server hashes match
+`5c77b881074a2cc8fdbf9dc21950d5366574092fd5faf95261cfd6c944407406`;
+complete artifact pins are in the [RC handoff](../../releases/glm53-dual-spark-20260910-rc.md).
+
+The16K effort diagnostic completed at01:34:03 UTC with19 HTTP requests and
+unchanged output caps. Direct raw-receipt inspection confirms all five default
+fresh/repeat/post-cancel/requested-false cases now stop after2 output tokens:
+reasoning is `153`, visible content is empty. The unrelated prime-question
+continuation is gone, but all five still **FAIL** exact visible-answer153.
+Requested-false remains not proof of effective nonthinking execution.
+
+Separate explicit reasoning-effort controls, both retaining budget16, **PASS**:
+low returns visible153 in5 output tokens (`http-0015.json`), high in4
+(`http-0017.json`). These are changed request controls, not default-profile
+passes. Reported reasoning-token usage is0 in default/high and1 in low despite
+the retained reasoning text; these reported counters are not asserted to be
+an exact accounting of the rendered reasoning.
+
+The overall diagnostic remains **FAIL**. Both ranks exited0, OOM=false,
+restart0, sampled swap0; minimum MemAvailable10,676,320/10,279,364 KiB.
+Evidence: `reuse-da4ec65d-16384-effort-first-summary.json` and
+`reuse-da4ec65d-16384-effort-first-receipts/`.
+
+## da4ec65d default C8 MTP: answer gate fails, forced cleanup
+
+The default selected-MTP campaign passed7 of8 answer checks. Index3 produced
+the correct JSON only in reasoning with empty visible content, so the strict
+answer gate **FAILED**. No tools, tool-result followups, needles or timing
+were issued. Evidence: `portable-da4ec65d-c8-first-summary.json`.
+
+Failure cleanup did **not** establish clean paired quiescence/release:
+the controller recorded `healthy drain not authorized` and did not confirm
+remote exit in its cleanup result. Subsequent exact-container observations
+`portable-da4ec65d-c8-first-final-r0.json` and `-final-r1.json` confirm both
+exited137, OOM=false, restart0 after forced cleanup. Sampled campaign swap was0;
+minimum MemAvailable9,878,000/9,236,208 KiB. Root's postcheck found no GPU work
+or running Atlas containers, host swap0, and available memory
+121,502,060/121,192,552 KiB. Those postconditions do not turn this into a
+clean paired-release PASS. The separate low-effort MTP result follows.
+
+## da4ec65d explicit-low C8 MTP also fails the answer gate
+
+The new requests explicitly set `reasoning_effort: low`, retaining budget32
+and output cap128. Again7 of8 answer checks passed. Index3 returned the correct
+`{"city":"Oslo","count":7,"active":true}` only in reasoning, with empty
+visible content and normal stop:19 output tokens and17 **reported** reasoning
+tokens. The strict visible-answer validator rejected it; no tools, followups,
+needles or timing were issued. Actual request/response evidence is retained in
+`portable-da4ec65d-c8-low-first-prepared/evidence-000625.json`.
+
+The overall result is **FAIL**, not a low-effort C8 qualification. Minimum
+MemAvailable was10,361,352/9,390,272 KiB; sampled swap0. Root's exact-container
+postcheck confirmed both stopped137 at01:41:19 UTC, OOM=false, restart0:
+`df69de64dbabb26b84f0b5e9512ec35add29f8538c3922c38293799412605c3c`
+and `f219b08a07c961e186cff68a5957e0e0799b86b161fe988466d9b39efd12b5aa`.
+No running Docker containers or GPU compute PIDs remained; host swap was0
+and available memory121,498,036/121,196,832 KiB. This forced-cleanup result
+is not clean paired quiescence/release. A separate low-effort16K C1 run is
+active at this update; no result from that run is claimed here.

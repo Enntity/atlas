@@ -1,16 +1,25 @@
 # GLM-5.3-Flash dual-Spark fork: release-candidate handoff
 
 **Draft test handoff, not a final qualification or model card.** Engine source
-`14b4e485a8719d763b1b043e1c7a8844994ae4c2` includes the upstream merge at
+`da4ec65d316bf3c57796e975633a6e8e78bfc099` includes the upstream merge at
 `6c5f17dab9c27ee2396aef1ac2501a17b201c715`, an OFF-by-default later-chunk
 BF16 projection experiment, bounded sparse chunk admission, and explicit
 tool-thinking support, matching ordinary GLM EP normalization calls/streams,
 and a single-writer state-normalization kernel. It additionally preserves
 native GLM reasoning/tool boundaries and stops selected-MTP acceptance at a
-reasoning phase change. The native binary and both images are built and
-hash-verified. Its fresh/repeated/post-cancel arithmetic diagnostic still
-**FAILS** with the same unrelated prime-factor answer; final tool/context and
-selected-MTP validation are **PENDING**. The prior `1cb0267e`
+reasoning phase change. It now also honors GLM EOS during reasoning when
+thinking was the only stop suppressor, without inventing a reasoning close
+or promoting reasoning to final content. Both native images are built and
+hash-verified; current default- and explicit-Low-effort C8 MTP quality both
+**FAIL** before timing (seven of eight answers pass; JSON is returned only in
+reasoning with empty final content). This is an **experimental test candidate,
+not a qualified release**. The unwanted arithmetic continuation is removed,
+but five default-effort arithmetic probes now stop with reasoning-only `153`;
+explicit Low and High each pass one separate arithmetic probe. Neither effort
+setting is a general fix. Fresh ordinary16K Low validation is in progress.
+Prior14b arithmetic
+failed with an invented next question after Atlas suppressed native EOS.
+The prior `1cb0267e`
 4K ON probe failed its C1 structured-tool gate; its separate16K ON C1 probe
 passed all six main-quality waves but failed corrected chat reuse. Neither
 complete campaign passed, and neither qualifies the new build.
@@ -40,6 +49,21 @@ safety mechanism, not a paired-session certificate. Neither promises recovery
 from an unresponsive GPU, driver, kernel or Docker daemon.
 
 ## New build pins — not release-qualified
+
+| Artifact | Full SHA256 |
+| --- | --- |
+| Source archive (`da4ec65d`) | `42e983c3588d938d37c72c152bcfe8f9e1cd8f5a75ed71f9d942dce5186c51da` |
+| Server ELF | `5c77b881074a2cc8fdbf9dc21950d5366574092fd5faf95261cfd6c944407406` |
+| Head image | `2588ad9afd3889fa94a2a56cb813b95979cbff440d3b060621537ef8842a177d` |
+| Worker image | `596e8f74d6088b0b802bccb954e716414c77bd4b38ee3a17dd1be45aaf6a98db` |
+| GLM OpenAI runtime template | `d921f36103aa17db5fbf5891e4f7fe55a9080db450d7b8fb5c9833237c31bd16` |
+
+Native build stages6m37s and6.86s completed, builder exit0/OOM=false. Both
+actual images were inspected: matching server/guard/template hashes, working
+directory `/`. Helper binaries remain the retained `a6` set. Committed-source
+47 focused GLM tests pass; this does not qualify native answers or performance.
+
+### Retained prior `14b4e485` pins — bounded passes, failed full qualification
 
 | Artifact | Full SHA256 |
 | --- | --- |
@@ -92,6 +116,7 @@ the earlier long-context output failures; the new combined image must pass.
 
 | Engine and profile | Retained outcome |
 | --- | --- |
+| `da4ec65d` | Build/image verification **PASS**. Default arithmetic5/5 **FAIL** (reasoning-only, no longer an invented next question); explicit Low/High each pass one arithmetic probe. Default and Low C8 MTP both **FAIL**, seven of eight answers, before tools/needles/timing. Ordinary16K Low qualification in progress. |
 | `14b4e485` | Native build/image verification **PASS**. 4K C1 six quality checks and C2 three needles pass, then C2 linked facts fail strict JSON due to a Markdown fence. Separate15,869-input C1 prose passes automatic and bounded manual review. Fresh/repeat/post-cancel arithmetic **FAIL**; debug identifies a suppressed native EOS before the invented question. Selected-MTP qualification pending. |
 | `1cb0267e`,4K ON | **FAIL**: C1 early/middle/late needles and linked facts passed; auto-tool markup appeared inside reasoning, not a valid structured tool call. No tool-result, C2–C4 or boundary checks followed. |
 | `1cb0267e`,16K ON,C1 | Six main quality waves **PASS**; full suite **FAIL**. Exact16384/16385 HTTP400 and actual-text cancellation probes passed, then corrected chat reuse answered unrelated prime-factor mathematics instead of153. No reuse-tool check followed. |
@@ -143,7 +168,9 @@ The merged outputs differ from the pre-merge control, and rates regressed versus
 the earlier C4 image. This is not an equal-output A/B. The requested performance
 goal remains **unmet**; acceptance counts/timing alone do not establish the
 cause. See the [bounded argmax diagnostic plan](../experiments/glm53-20260906/merged-argmax-diagnostic.md).
-Fresh-process repeat and new-build C8 qualification remain **PENDING**.
+Fresh-process performance repeat remains **PENDING**. New-build default and
+Low C8 qualification have both **FAILED** before timing; the historical rates
+above must not be advertised as current-build measurements.
 
 The first earlier-image bare-completion4K probe failed its repetition/normal-stop
 quality check despite finding the needle. Correct real-chat framing is being
@@ -189,19 +216,21 @@ has since produced the bounded native results above; `1cb0267e` additionally
 contains the matching normalization calls/streams and single-writer kernel.
 Neither those corrections nor later kernel checks retroactively validate these
 historical responses. The retained1cb4K structured-tool gate remains a failure;
-the new14b4e485 boundary changes have not yet passed native qualification.
+the14b4e485 boundary change later passed the identical4K C1 tool request, but
+its complete campaign still failed C2 strict JSON. CurrentDa results are
+separately recorded above; no historical response is retroactively validated.
 
-## Human-operated first smoke test
+## Automated first smoke test
 
 Use a fresh private copy of the long-context bundle's `input.example.json`,
 populate every required path/fabric/credential and a matching verified set of
 image/ELF pins, and leave `workload` as `GENERATED_LOCAL_WORKLOAD`. The verified
-14b4e485 pins above are test candidates, not a quality-qualified release; the retained1cb images are only
+da4ec65d pins above are test candidates, not a quality-qualified release; the retained1cb images are only
 for explicitly labeled historical reproduction. Start with
 `context: 4096`, `paged_prefill_bf16_gemm: false`, and C1: ordinary TP2/EP2-v2,
 MTP-OFF, eager, BF16 KV, prefill1024, capacity4,114GiB/no-swap and existing
 watchdogs. This conservative numerical-OFF smoke profile is **not** a fresh
-14b4e485 quality PASS. To reproduce the known1cb4K ON failure, use its exact
+da4ec65d quality PASS. To reproduce the known1cb4K ON failure, use its exact
 retained artifact pins and a separate new input with the boolean `true`;
 never mutate an already pinned launch.
 
@@ -221,7 +250,54 @@ these commands provision no access. Preserve all raw content/reasoning/tool
 fields and stopped-container receipts. Inspect coherence even when exact values
 pass, and do not advance concurrency/context on a failing profile. For MTP use
 the separate portable C8 recipe/controller procedure linked above, not these
-ordinary-launch commands; current-image C8 still needs its own qualification.
+ordinary-launch commands; current-image C8 has failed its answer gate with
+both tested effort profiles and is not recommended as a qualified deployment.
+
+## Short supervised window for your own prompts
+
+The existing ordinary runner also accepts a finite local workload that keeps
+its monitoring active while you issue a few short C1 requests. In a **new**
+explicit4K ordinary configuration, use a fresh `output_directory` and replace
+the entire workload with the following, using the actual local executable hash:
+
+```json
+"workload": {
+  "argv": ["/usr/bin/sleep", "180"],
+  "files_sha256": {"/usr/bin/sleep": "ACTUAL_LOCAL_SHA256"},
+  "timeout_seconds": 190
+}
+```
+
+Run the ordinary runner's `--dry-run`, then `--run`, directly against that new
+file. **Do not run `configure.py` on this input:** it replaces the workload
+with the automated suite. The180-second window starts only after the runner
+records `*-ready.json`; existing node leases, memory monitoring and bounded
+shutdown stay active. Stop issuing requests well before the window ends, keep
+requests sequential, and leave the controller running until it collects both
+stopped containers. A sleep-workload exit0 is only an operational result, not
+a quality certification. This manual-window configuration has passed local
+dry-run validation, not a native manual-window campaign.
+
+For example, from a second terminal after readiness, with the actual head
+address substituted:
+
+```bash
+curl --connect-timeout 5 --max-time 60 --max-filesize 65536 \
+  -H 'Content-Type: application/json' \
+  --data '{"model":"/var/tmp/models/glm53-flash-nvfp4","messages":[{"role":"user","content":"Calculate 17*9+0. Reply only with the integer."}],"temperature":0,"max_tokens":128,"stream":false,"thinking_token_budget":16,"reasoning_effort":"low","chat_template_kwargs":{"enable_thinking":true}}' \
+  http://HEAD_IPV4:8890/v1/chat/completions
+```
+
+Inspect the full response, including empty `content`, `reasoning_content`,
+tool calls and finish reason. Explicit Low is a distinct request mode, not a
+general workaround: it passed one arithmetic probe but failed the C8 JSON
+answer gate. `enable_thinking:false` is not a proven no-reasoning mode for
+this model, the thinking budget is not a strict cap, and reported reasoning
+token counts are not yet verified exact accounting.
+
+This is a source/local-image handoff. No registry image, remote installation,
+Git push or published release has been produced. The bundles require existing
+matching images, weights, helpers and operator access on both nodes.
 
 ## Rollback and acceptance checklist
 
