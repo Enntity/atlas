@@ -20,6 +20,7 @@ mod process;
 
 fn context(sched: &SchedCtx) -> LogitsContext<'_> {
     LogitsContext {
+        glm_tool_boundary: None,
         scratch: &sched.scratch,
         dumps: &sched.dumps,
         stats: sched.stats.clone(),

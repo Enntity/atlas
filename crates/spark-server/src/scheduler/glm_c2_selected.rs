@@ -114,6 +114,7 @@ pub(crate) fn run_selected(
 
 fn context<'a>(sched: &'a SchedCtx, tokens: &Tokens) -> super::logit_processors::LogitsContext<'a> {
     super::logit_processors::LogitsContext {
+        glm_tool_boundary: sched.limits.glm_tool_boundary,
         scratch: &sched.scratch,
         dumps: &sched.dumps,
         stats: sched.stats.clone(),

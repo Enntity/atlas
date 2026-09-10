@@ -141,11 +141,20 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
         state.pending_token_ids.push(tok);
     }
 
-    // ── Thinking-phase: token-ID based </think> detection ────────────
+    // GLM's native opener ends reasoning and must also reach the existing
+    // content/tool parser. The startup carrier is model-scoped, not inferred
+    // from the display name or from tool-shaped reasoning text.
+    let implicit_tool = !state.thinking_done
+        && state.detector.is_some()
+        && ctx.state.glm_tool_boundary == Some(tok);
+    // ── Thinking-phase: token-ID based boundary detection ──────────
     if !state.thinking_done {
-        if let Some(end_id) = ctx.state.think_end_token_id
-            && tok == end_id
-        {
+        if ctx.state.think_end_token_id == Some(tok) || implicit_tool {
+            // Keep the opener out of a residual reasoning delta's token IDs;
+            // it will be restored once, with the retained content token below.
+            if implicit_tool && ctx.req_return_token_ids {
+                state.pending_token_ids.pop();
+            }
             state.thinking_done = true;
             // Emit only the residual reasoning delta not yet sent
             // by incremental streaming (e.g. trailing bytes held
@@ -198,8 +207,16 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
             state.content_decoded.clear();
             state.detok_prefix_offset = 0;
             state.detok_read_offset = 0;
-            return deltas;
+            if !implicit_tool {
+                return deltas;
+            }
+            state.all_toks.push(tok);
+            if ctx.req_return_token_ids {
+                state.pending_token_ids.push(tok);
+            }
         }
+    }
+    if !state.thinking_done {
         // Still in thinking — accumulate but don't emit as content
         if ctx.enable_thinking {
             // Layer-A one-shot guard: after the in-think tool-call leak

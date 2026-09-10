@@ -841,6 +841,13 @@ pub(crate) fn load_model_selected(
         supports_thinking,
     );
 
+    anyhow::ensure!(
+        config.model_type != "glm5_next"
+            || (tokenizer_limits.glm_tool_boundary.is_some()
+                && tokenizer_limits.glm_tool_boundary == tool_call_start_token),
+        "GLM tokenizer/tool format is missing or mismatches its native <tool_call> token"
+    );
+
     // 7. Create scheduler channel + spawn scheduler
     spark_runtime::progress::phase(9, "scheduler");
     let (request_tx, request_rx) = mpsc::channel::<InferenceRequest>(args.max_num_seqs);
@@ -1278,6 +1285,7 @@ pub(crate) fn load_model_selected(
         tool_call_parser,
         reasoning_parser: reasoning_parser_box,
         think_end_token_id: think_end_token,
+        glm_tool_boundary: tokenizer_limits.glm_tool_boundary,
         think_start_token_id: think_start_token,
         tool_max_tokens: args.tool_max_tokens,
         sampling_presets,

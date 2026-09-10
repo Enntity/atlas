@@ -120,9 +120,15 @@ fn step<const N: usize>(
         selected[ordinal].copy_from_slice(&rows);
     }
     let accepted: [usize; N] = std::array::from_fn(|ordinal| {
-        (0..4)
+        let matched = (0..4)
             .take_while(|&row| tokens[ordinal][row + 1] == selected[ordinal][row])
-            .count()
+            .count();
+        glm_c2_serial::accepted_before_boundary(
+            owners[ordinal],
+            &selected[ordinal],
+            matched,
+            verify_ctx.glm_tool_boundary,
+        )
     });
     capability.finish_verify_owners(
         shape,

@@ -231,6 +231,7 @@ pub(super) fn continue_in_progress_prefills(
             tool_call_start_token,
             tool_call_end_token,
             sched.limits.max_seq_len,
+            sched.limits.glm_tool_boundary,
         );
         return did_mixed_step;
     }
@@ -265,6 +266,7 @@ pub(super) fn continue_in_progress_prefills(
             tool_call_start_token,
             tool_call_end_token,
             sched.limits.max_seq_len,
+            sched.limits.glm_tool_boundary,
         );
         return did_mixed_step;
     }
@@ -379,6 +381,7 @@ pub(super) fn continue_in_progress_prefills(
         tool_call_start_token,
         tool_call_end_token,
         sched.limits.max_seq_len,
+        sched.limits.glm_tool_boundary,
     );
 
     did_mixed_step

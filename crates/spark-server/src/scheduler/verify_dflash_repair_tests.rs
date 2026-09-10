@@ -216,6 +216,7 @@ fn run_with_ledger(
     let mut sched = crate::scheduler::sched_ctx::SchedCtx::for_test();
     sched.limits.max_seq_len = 100;
     let verify_ctx = crate::scheduler::logit_processors::LogitsContext {
+        glm_tool_boundary: None,
         scratch: &sched.scratch,
         dumps: &sched.dumps,
         stats: sched.stats.clone(),

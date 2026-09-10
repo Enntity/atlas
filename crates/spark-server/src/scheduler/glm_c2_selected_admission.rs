@@ -80,6 +80,7 @@ pub(super) fn admit(
         first,
         tokens,
         model.decode_rollback_ring_slots(),
+        sched.limits.glm_tool_boundary,
     );
     crate::scheduler::mod_helpers::enforce_request_deadlines(std::slice::from_mut(&mut a));
     let cancelled = crate::scheduler::emit_step::retire_if_cancelled(&mut a);

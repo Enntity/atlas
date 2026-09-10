@@ -694,6 +694,7 @@ pub fn run(
             // this context the MTP/spec verify path emits unmasked
             // GPU-argmax tokens (Phase C-2 root cause, 2026-05-24).
             let verify_ctx = crate::scheduler::logit_processors::LogitsContext {
+                glm_tool_boundary: sched.limits.glm_tool_boundary,
                 watchdog: sched.watchdog,
                 scratch: &sched.scratch,
                 dumps: &sched.dumps,

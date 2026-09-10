@@ -20,8 +20,12 @@ mod process;
 #[path = "glm_owner8_step_tests.rs"]
 mod owner8;
 
+#[path = "glm_selected_phase_tests.rs"]
+mod phase_boundary;
+
 fn context(s: &SchedCtx) -> LogitsContext<'_> {
     LogitsContext {
+        glm_tool_boundary: None,
         scratch: &s.scratch,
         dumps: &s.dumps,
         stats: s.stats.clone(),

@@ -26,6 +26,7 @@ pub(super) fn promote_completed_prefills(
     // Served context ceiling (`sched.limits.max_seq_len`) — finish_sequence
     // needs it for the budget-derived `finish_reason` decision.
     max_seq_len: usize,
+    glm_tool_boundary: Option<u32>,
 ) {
     // Process in reverse order so swap_remove indices stay valid.
     completed_indices.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
@@ -100,6 +101,7 @@ pub(super) fn promote_completed_prefills(
             tool_call_start_token,
             tool_call_end_token,
             model.decode_rollback_ring_slots(),
+            glm_tool_boundary,
         );
         if immediate_finish {
             finish_sequence(model, &mut a, max_seq_len);
@@ -128,16 +130,19 @@ pub(super) fn build_active_seq_from_prefill(
     tool_call_end_token: Option<u32>,
     // Phase-C decode-rollback ring capacity (`model.decode_rollback_ring_slots()`).
     ssm_ring_capacity: usize,
+    glm_tool_boundary: Option<u32>,
 ) -> ActiveSeq {
     let temperature = p.temperature;
     // F4: sticky tool-request flag — grammar attached OR legacy tool path.
     // Computed before `p.grammar_state` is moved into the struct below.
     let tool_request = p.grammar_state.is_some() || use_legacy_tool_call;
-    let thinking = first_token_thinking::FirstTokenThinking::resolve(
+    let native_tool_open = p.max_tokens > 0 && p.tools_present && glm_tool_boundary == Some(first);
+    let thinking = first_token_thinking::FirstTokenThinking::resolve_with_tool_boundary(
         p.enable_thinking,
         first,
         think_start_token,
         think_end_token,
+        glm_tool_boundary.filter(|_| p.tools_present),
     );
     ActiveSeq {
         seq: p.seq,
@@ -201,12 +206,12 @@ pub(super) fn build_active_seq_from_prefill(
         post_think_emitted: 0,
         spec_adapt: Default::default(),
         think_skip_count: 0,
-        require_tool_call: use_legacy_tool_call,
+        require_tool_call: use_legacy_tool_call && !native_tool_open,
         tool_request,
         tools_present: p.tools_present,
         tool_call_start_token,
-        tool_call_opened: false,
-        inside_tool_body: false,
+        tool_call_opened: native_tool_open,
+        inside_tool_body: native_tool_open,
         tool_call_completed: false,
         post_completion_tool_opens: 0,
         tool_body_streak_tokens: 0,

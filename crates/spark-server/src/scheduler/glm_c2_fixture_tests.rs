@@ -194,6 +194,7 @@ fn exercise(order: [usize; 2]) {
         let output_before = a.output_tokens.clone();
         let sched = SchedCtx::for_test();
         let ctx = LogitsContext {
+            glm_tool_boundary: None,
             scratch: &sched.scratch,
             dumps: &sched.dumps,
             stats: sched.stats.clone(),

@@ -90,6 +90,7 @@ impl Run {
     fn step(&mut self) {
         let s = &self.sched;
         let ctx = LogitsContext {
+            glm_tool_boundary: None,
             scratch: &s.scratch,
             dumps: &s.dumps,
             stats: s.stats.clone(),

@@ -76,9 +76,15 @@ pub(super) fn try_step_pair(
         "paired scheduler checked selection malformed"
     );
     let accepted: [usize; 2] = std::array::from_fn(|owner| {
-        (0..4)
+        let matched = (0..4)
             .take_while(|&row| tokens[owner][row + 1] == selected[owner][row])
-            .count()
+            .count();
+        glm_c2_serial::accepted_before_boundary(
+            [&*a0, &*a1][owner],
+            &selected[owner],
+            matched,
+            verify_ctx.glm_tool_boundary,
+        )
     });
     capability.finish_verify_pair([&mut a0.seq, &mut a1.seq], &tokens, accepted)?;
     sched.stats.glm_c2.pair_committed(accepted);

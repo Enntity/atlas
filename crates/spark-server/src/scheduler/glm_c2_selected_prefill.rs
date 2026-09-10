@@ -39,6 +39,7 @@ pub(super) fn promote(
     first: u32,
     tokens: &super::glm_c2_selected::Tokens,
     ring_slots: usize,
+    glm_tool_boundary: Option<u32>,
 ) -> super::ActiveSeq {
     let spontaneous = !p.enable_thinking && tokens.think_start == Some(first);
     let legacy_tool = p.require_tool_call && tokens.tool_start.is_some();
@@ -57,6 +58,7 @@ pub(super) fn promote(
         tokens.tool_start,
         tokens.tool_end,
         ring_slots,
+        glm_tool_boundary,
     );
     // This first token was selected before ActiveSeq existed and is published
     // directly by admission. Mirror only its tool bookkeeping; do not emit or

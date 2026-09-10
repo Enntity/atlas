@@ -6,6 +6,10 @@ use anyhow::Result;
 use spark_model::speculative::glm_paired_execution::GlmPairedExecution;
 use spark_model::traits::Model;
 
+#[path = "glm_selected_phase.rs"]
+mod phase;
+pub(super) use phase::accepted_before_boundary;
+
 /// A complete owner transaction before moving to its peer. The serving caller
 /// must handle errors while armed, without entering ordinary retirement.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -214,6 +218,7 @@ fn verdict(
         "paired serial invalid selected verdict"
     );
     let accepted = (0..4).take_while(|i| tokens[i + 1] == selected[*i]).count();
+    let accepted = accepted_before_boundary(a, &selected, accepted, verify_ctx.glm_tool_boundary);
     model.ep_broadcast_cmd(accepted as u32)?;
     a.seq.seq_len = base + accepted + 1;
     a.seq.tokens.truncate(a.seq.seq_len);

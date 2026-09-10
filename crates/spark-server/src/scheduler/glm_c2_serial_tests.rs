@@ -28,6 +28,7 @@ pub(super) fn prefilled(rank: usize, order: [usize; 2]) -> Fixture {
 
 pub(super) fn context(sched: &SchedCtx) -> LogitsContext<'_> {
     LogitsContext {
+        glm_tool_boundary: None,
         scratch: &sched.scratch,
         dumps: &sched.dumps,
         stats: sched.stats.clone(),

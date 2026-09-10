@@ -141,7 +141,7 @@ fn actual_cold_first_tool_opener_tracks_selected_promotion() {
                     tool_end: Some(102),
                     spontaneous_budget: 0,
                 };
-                let mut a = promote(p, first, &tokens, model.decode_rollback_ring_slots());
+                let mut a = promote(p, first, &tokens, model.decode_rollback_ring_slots(), None);
                 let visible_opener = max > 0 && !thinking;
                 assert_eq!(a.inside_thinking, thinking);
                 assert_eq!(a.output_tokens, if max == 0 { vec![] } else { vec![first] });

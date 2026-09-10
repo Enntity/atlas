@@ -14,6 +14,7 @@ pub(super) fn context(s: &SchedCtx) -> LogitsContext<'_> {
         ..Default::default()
     };
     LogitsContext {
+        glm_tool_boundary: None,
         scratch: &s.scratch,
         dumps: &s.dumps,
         stats: s.stats.clone(),

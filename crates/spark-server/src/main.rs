@@ -32,6 +32,7 @@ mod conversation_store;
 mod disk_guard;
 mod error_hints;
 mod glm_terminal_session;
+mod glm_tool_boundary;
 pub mod grammar;
 mod halluc_probe;
 mod hint_injector;

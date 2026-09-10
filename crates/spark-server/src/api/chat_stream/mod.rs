@@ -21,7 +21,10 @@
 
 #[cfg(test)]
 mod cancel_guard_tests;
+
 mod ctx;
+#[cfg(test)]
+mod glm_tool_boundary_tests;
 mod handle_done;
 mod handle_error;
 mod handle_token;

@@ -66,6 +66,7 @@ fn first_token_thinking_promotion_preserves_accounting_and_handles_close() {
             None,
             None,
             0,
+            None,
         );
         assert_eq!(
             (a.inside_thinking, a.think_ended, a.think_just_ended),

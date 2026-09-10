@@ -36,6 +36,8 @@ hidden_size = 4096
 [behavior]
 thinking_default = false
 thinking_in_tools = false
+# Preserve native brief reasoning instead of imposing the generic A4 bias.
+min_reasoning_floor_tokens = 0
 tool_call_parser = "poolside_v1"
 enable_loop_watchdog = true
 default_num_drafts = 0

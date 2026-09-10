@@ -305,12 +305,15 @@ pub fn prefill_request(
     // Spontaneous <think>: if the first token is <think> and thinking was not
     // requested, suppress it and enter thinking mode on the ActiveSeq.
     let spontaneous_think = !req_enable_thinking && think_start_token == Some(first);
-    let thinking = first_token_thinking::FirstTokenThinking::resolve(
+    let thinking = first_token_thinking::FirstTokenThinking::resolve_with_tool_boundary(
         req_enable_thinking,
         first,
         think_start_token,
         think_end_token,
+        sched.limits.glm_tool_boundary.filter(|_| req_tools_present),
     );
+    let native_tool_open =
+        max_tokens > 0 && req_tools_present && sched.limits.glm_tool_boundary == Some(first);
     // Legacy echo+logprobs: prompt logprobs precede any token event.
     if seq.collect_prompt_logprobs.is_some()
         && let ResponseSink::Streaming(ref tx) = sink
@@ -411,7 +414,7 @@ pub fn prefill_request(
             post_think_emitted: 0,
             spec_adapt: Default::default(),
             think_skip_count: 0,
-            require_tool_call: use_legacy_tool_call,
+            require_tool_call: use_legacy_tool_call && !native_tool_open,
             tool_request,
             tools_present: req_tools_present,
             suppress_tool_call: req_suppress_tool_call,
@@ -424,8 +427,8 @@ pub fn prefill_request(
             rollback_count: 0,
             ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
             tool_call_start_token,
-            tool_call_opened: false,
-            inside_tool_body: false,
+            tool_call_opened: native_tool_open,
+            inside_tool_body: native_tool_open,
             tool_call_completed: false,
             post_completion_tool_opens: 0,
             tool_body_streak_tokens: 0,
@@ -500,7 +503,7 @@ pub fn prefill_request(
         post_think_emitted: 0,
         spec_adapt: Default::default(),
         think_skip_count: 0,
-        require_tool_call: use_legacy_tool_call,
+        require_tool_call: use_legacy_tool_call && !native_tool_open,
         tool_request,
         tools_present: req_tools_present,
         suppress_tool_call: req_suppress_tool_call,
@@ -513,8 +516,8 @@ pub fn prefill_request(
         rollback_count: 0,
         ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
         tool_call_start_token,
-        tool_call_opened: false,
-        inside_tool_body: false,
+        tool_call_opened: native_tool_open,
+        inside_tool_body: native_tool_open,
         tool_call_completed: false,
         post_completion_tool_opens: 0,
         tool_body_streak_tokens: 0,

@@ -35,6 +35,7 @@ fn logits_ctx<'a>(
     tool_call_end_token: Option<u32>,
 ) -> crate::scheduler::logit_processors::LogitsContext<'a> {
     crate::scheduler::logit_processors::LogitsContext {
+        glm_tool_boundary: sched.limits.glm_tool_boundary,
         think_end_token,
         think_start_token,
         tool_call_start_token,
@@ -257,6 +258,7 @@ pub fn process_decode_logits(
             // `&`-to-`Sync` — and leave the scratch to each worker.
             let dumps = &sched.dumps;
             let watchdog = sched.watchdog;
+            let glm_tool_boundary = sched.limits.glm_tool_boundary;
             let stats = sched.stats.clone();
             let boundary_mask = sched.masks.boundary.clone();
             let mid_word_mask = sched.masks.mid_word.clone();
@@ -278,6 +280,7 @@ pub fn process_decode_logits(
                     // reuse, one buffer per worker instead of one per run.
                     PAR_SAMPLE_SCRATCH.with(|scratch| {
                         let ctx = crate::scheduler::logit_processors::LogitsContext {
+                            glm_tool_boundary,
                             think_end_token,
                             think_start_token,
                             tool_call_start_token,
@@ -385,6 +388,8 @@ pub fn process_decode_logits(
             tracing::debug!("<tool_response> hard-stop fired (id={trs}); ending turn");
             continue;
         }
+
+        first_token_thinking::apply_native_tool_boundary(a, tok, sched.limits.glm_tool_boundary);
 
         // Spontaneous <think>: model generates <think> even when thinking
         // was not requested. Enter thinking mode so EOS is suppressed and

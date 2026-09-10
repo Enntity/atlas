@@ -31,6 +31,10 @@ mod thinking_tests;
 #[path = "glm_c2_emit_position_tests.rs"]
 mod position_tests;
 
+#[cfg(test)]
+#[path = "glm_tool_boundary_tests.rs"]
+mod glm_tool_boundary_tests;
+
 /// Emit a token for an active sequence (stream + bookkeeping).
 ///
 /// Per OpenAI spec, stop/EOS tokens are NOT streamed to the client —
@@ -116,6 +120,8 @@ pub(super) fn emit_token_at_position(
         tracing::debug!("<tool_response> hard-stop fired (id={trs}); ending turn");
         return;
     }
+
+    first_token_thinking::apply_native_tool_boundary(a, tok, sched.limits.glm_tool_boundary);
 
     // Spontaneous <think>: model generates <think> even when thinking was not
     // requested. Enter thinking mode so EOS is suppressed and thinking content
