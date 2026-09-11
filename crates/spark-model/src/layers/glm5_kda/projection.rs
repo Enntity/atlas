@@ -7,6 +7,8 @@ use super::Glm5KdaLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::weight_map::{DenseWeight, QuantizedWeight};
+#[path = "projection_fp8.rs"]
+mod fp8;
 
 /// Memory-tight GLM KDA projection.
 ///
@@ -192,6 +194,27 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if !decode
+            && m >= 2048
+            && fp8::try_project(
+                ctx.gpu,
+                input,
+                weight,
+                output,
+                m,
+                n,
+                k,
+                decode,
+                ctx.graph_capture,
+                ctx.buffers.expert_gate_out(),
+                ctx.buffers.sizes().expert_gate_out,
+                ctx.buffers.max_batch_tokens(),
+                std::env::var("ATLAS_GLM_KDA_PREFILL_LT_FP8").as_deref() == Ok("1"),
+                stream,
+            )?
+        {
+            return Ok(());
+        }
         match ProjectionPath::for_forward(decode, weight.prefill_nvfp4_t.is_some(), m) {
             ProjectionPath::DecodeGemv => ops::w4a16_decode_gemv(
                 ctx.gpu,

@@ -9,6 +9,18 @@ pub fn enabled() -> bool {
     std::env::var("ATLAS_GLM_MTP_REPAIR").as_deref() == Ok("1")
 }
 
+pub fn long_context_enabled() -> bool {
+    std::env::var("ATLAS_GLM_MTP_LONG_CONTEXT").as_deref() == Ok("1")
+}
+
+pub const MAX_LONG_CONTEXT: usize = 32_768;
+
+/// The legacy prompt capture has one writer. Retained owner tails and repair
+/// staging allow other requests to decode while that one prompt is chunked.
+pub fn new_prompt_capacity(active: usize, prefilling: usize, capacity: usize) -> usize {
+    usize::from(prefilling == 0 && active < capacity)
+}
+
 pub fn parse(raw: Option<&str>) -> Result<bool> {
     ensure!(
         matches!(raw, None | Some("0") | Some("1")),
@@ -31,6 +43,7 @@ pub struct RepairPolicy<'a> {
     pub bf16: bool,
     pub prefix_reuse: bool,
     pub force: bool,
+    pub long_context: bool,
 }
 
 impl RepairPolicy<'_> {
@@ -40,17 +53,24 @@ impl RepairPolicy<'_> {
                 && self.world == 2
                 && self.tp == 2
                 && self.ep == 2
-                && self.active == 1
-                && self.admitted == 1
-                && self.drafts == 4
+                && ((self.active == 1 && self.admitted == 1)
+                    || (self.long_context && self.active == 4 && self.admitted == self.active))
+                && matches!(self.drafts, 1 | 2 | 4)
+                && (!self.long_context || self.drafts == 2)
                 && self.native_only
                 && self.bf16
                 && !self.prefix_reuse,
-            "GLM repair requires native MTP4, GLM TP2/EP2, active/admitted C1, BF16, and no prefix reuse"
+            "GLM repair requires native MTP1/MTP2/MTP4, GLM TP2/EP2, C1 or opt-in MTP2 C4, BF16, and no prefix reuse"
         );
         ensure!(
-            self.context >= 4 && self.context.checked_add(4).is_some_and(|n| n <= 2048),
-            "GLM repair context + four drafts must be <=2048 with four staging rows"
+            self.context >= 4
+                && self.context
+                    <= if self.long_context {
+                        MAX_LONG_CONTEXT
+                    } else {
+                        2044
+                    },
+            "GLM repair requires context4..=2044 or opt-in MTP2 context4..=32768"
         );
         ensure!(self.force, "GLM repair requires resolved MTP gate force");
         Ok(())
@@ -59,6 +79,29 @@ impl RepairPolicy<'_> {
 
 /// Explicit resolved drafter policy matters: old CARRY=0 variables are ignored.
 pub fn validate_environment() -> Result<()> {
+    ensure!(
+        matches!(
+            std::env::var("ATLAS_GLM_MTP_LONG_CONTEXT").ok().as_deref(),
+            None | Some("0") | Some("1")
+        ),
+        "ATLAS_GLM_MTP_LONG_CONTEXT must be 0 or 1"
+    );
+    if long_context_enabled() {
+        for name in [
+            "ATLAS_GLM_MTP1_VERIFY_GRAPH",
+            "ATLAS_GLM_TP_VERIFY_GRAPH",
+            "ATLAS_GLM_C4_DECODE",
+            "ATLAS_GLM_C4_SPARSE",
+            "ATLAS_GLM_INDEPENDENT_DECODE",
+            "ATLAS_GLM_MULTI_SEQ_SPARSE",
+            "ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS",
+        ] {
+            ensure!(
+                matches!(std::env::var(name).ok().as_deref(), None | Some("0")),
+                "GLM long-context MTP2 requires {name} disabled"
+            );
+        }
+    }
     for name in [
         "ATLAS_GLM_MTP_DISTRIBUTED",
         "ATLAS_GLM_MTP_BATCHED_PREFILL",
@@ -108,11 +151,31 @@ mod tests {
             bf16: true,
             prefix_reuse: false,
             force: true,
+            long_context: false,
         }
     }
     #[test]
     fn exact_lane_and_overflow_checked() {
         assert!(policy().validate().is_ok());
+        assert!(
+            RepairPolicy {
+                drafts: 1,
+                ..policy()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            RepairPolicy {
+                drafts: 2,
+                ..policy()
+            }
+            .validate()
+            .is_ok()
+        );
+        for drafts in [0, 3, 5] {
+            assert!(RepairPolicy { drafts, ..policy() }.validate().is_err());
+        }
         for context in [0, 3, 2045, usize::MAX] {
             assert!(
                 RepairPolicy {
@@ -157,5 +220,55 @@ mod tests {
         );
         assert!(parse(Some("true")).is_err());
         assert!(!parse(None).unwrap());
+    }
+
+    #[test]
+    fn long_context_requires_explicit_fixed_mtp2_and_bounded_owners() {
+        let p = RepairPolicy {
+            drafts: 2,
+            context: MAX_LONG_CONTEXT,
+            long_context: true,
+            ..policy()
+        };
+        for active in [1, 4] {
+            assert!(
+                RepairPolicy {
+                    active,
+                    admitted: active,
+                    ..p
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        for invalid in [
+            RepairPolicy { drafts: 1, ..p },
+            RepairPolicy { drafts: 4, ..p },
+            RepairPolicy {
+                context: MAX_LONG_CONTEXT + 1,
+                ..p
+            },
+            RepairPolicy {
+                long_context: false,
+                ..p
+            },
+            RepairPolicy {
+                active: 4,
+                admitted: 5,
+                ..p
+            },
+            RepairPolicy {
+                active: 5,
+                admitted: 5,
+                ..p
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+        assert_eq!(new_prompt_capacity(0, 0, 4), 1);
+        assert_eq!(new_prompt_capacity(3, 0, 4), 1);
+        assert_eq!(new_prompt_capacity(0, 1, 4), 0);
+        assert_eq!(new_prompt_capacity(2, 1, 4), 0);
+        assert_eq!(new_prompt_capacity(4, 0, 4), 0);
     }
 }

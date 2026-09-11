@@ -712,3 +712,5 @@ extern "C" __global__ void fused_silu_mul(
     unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(r1));
     out32[col_pair] = lo | (hi << 16);
 }
+
+#include "router_prefill_bn32.cuh"

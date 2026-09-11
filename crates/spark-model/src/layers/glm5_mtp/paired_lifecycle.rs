@@ -196,6 +196,7 @@ impl Glm5MtpHead {
             paired: Some(lease),
             hidden_trace: hidden_trace::HiddenTrace::new(self.hidden_trace_enabled),
             repair: repair_state::RepairPhase::Capture,
+            repair_owned: None,
             block_table: pool.slots[index].blocks.clone(),
             seq_len: 0,
             last_num_drafted: 0,

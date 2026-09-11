@@ -15,6 +15,9 @@ use crate::weight_map::{
     DenseWeight, Fp8Weight, Fp8WeightTransposed, PackedQ2Weight, QuantizedWeight,
 };
 
+#[path = "dense_ffn_prefill_bf16.rs"]
+mod prefill_bf16;
+
 pub struct DenseFfnWeights {
     pub gate_proj: QuantizedWeight,
     pub up_proj: QuantizedWeight,
@@ -225,6 +228,7 @@ pub struct DenseFfnLayer {
     /// NVFP4 attention drift on greedy code generation (the fib test's
     /// broken-indentation pattern).
     bf16_weights: Option<DenseFfnWeightsBf16>,
+    prefill_bf16_weights: Option<DenseFfnWeightsBf16>,
     dense_gemv_bf16_k: KernelHandle,
     dense_gemm_bf16_k: KernelHandle,
     // Tensor-core BF16 GEMM (m16n8k16 MMA) for the dense-FFN PREFILL path.
@@ -393,6 +397,7 @@ impl DenseFfnLayer {
             w4a16_gemm_t_k64_k: super::k64_kernel(gpu).unwrap_or(KernelHandle(0)),
             act_mul,
             bf16_weights: None,
+            prefill_bf16_weights: None,
             dense_gemv_bf16_k,
             dense_gemm_bf16_k,
             dense_gemm_tc_k,
@@ -1620,6 +1625,9 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_glm_prefill_bf16(input, num_tokens, ctx, stream)? {
+            return Ok(());
+        }
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
         let m = num_tokens as u32;

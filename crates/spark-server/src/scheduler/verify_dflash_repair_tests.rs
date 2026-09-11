@@ -7,6 +7,7 @@ use spark_runtime::gpu::DevicePtr;
 use std::sync::Mutex;
 
 struct Target {
+    drafts: usize,
     accepted: usize,
     record_error: bool,
     calls: Mutex<Vec<&'static str>>,
@@ -73,10 +74,10 @@ impl Model for Target {
         seq: &mut SequenceState,
         _: u64,
     ) -> Result<Vec<u32>> {
-        assert_eq!(tokens, &[7, 10, 11, 12, 13]);
+        assert_eq!(tokens, &[7, 10, 11, 12, 13][..self.drafts + 1]);
         seq.tokens.extend_from_slice(tokens);
         seq.seq_len += tokens.len();
-        let mut result = vec![99; 5];
+        let mut result = vec![99; self.drafts + 1];
         result[..self.accepted].copy_from_slice(&tokens[1..1 + self.accepted]);
         self.calls.lock().unwrap().push("verify");
         Ok(result)
@@ -120,10 +121,10 @@ impl Model for Target {
         grammar: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
         assert_eq!(position, seq.seq_len);
-        assert_eq!(n, 4);
+        assert_eq!(n, self.drafts);
         assert!(grammar.is_none());
         self.calls.lock().unwrap().push("propose");
-        Ok(vec![20, 21, 22, 23])
+        Ok(vec![20, 21, 22, 23][..self.drafts].to_vec())
     }
     fn trim_proposer_state(&self, _: &mut SequenceState, a: usize, _: u64) -> Result<()> {
         assert_eq!(a, self.accepted);
@@ -141,7 +142,7 @@ impl Model for Target {
         accepted: usize,
         k: usize,
     ) -> Result<()> {
-        assert_eq!((accepted, k), (self.accepted + 1, 5));
+        assert_eq!((accepted, k), (self.accepted + 1, self.drafts + 1));
         self.calls.lock().unwrap().push("commit");
         Ok(())
     }
@@ -204,7 +205,18 @@ fn run_with_ledger(
     record_error: bool,
     ledger_enabled: bool,
 ) -> (ActiveSeq, Vec<&'static str>) {
+    run_at_depth(4, accepted, remaining, record_error, ledger_enabled)
+}
+
+fn run_at_depth(
+    drafts: usize,
+    accepted: usize,
+    remaining: usize,
+    record_error: bool,
+    ledger_enabled: bool,
+) -> (ActiveSeq, Vec<&'static str>) {
     let target = Target {
+        drafts,
         accepted,
         record_error,
         calls: Mutex::new(Vec::new()),
@@ -235,8 +247,8 @@ fn run_with_ledger(
             &target,
             &mut a,
             &sched,
-            &[10, 11, 12, 13],
-            4,
+            &[10, 11, 12, 13][..drafts],
+            drafts,
             &verify_ctx,
             true,
             true,
@@ -246,8 +258,8 @@ fn run_with_ledger(
             &target,
             &mut a,
             &sched,
-            &[10, 11, 12, 13],
-            4,
+            &[10, 11, 12, 13][..drafts],
+            drafts,
             &verify_ctx,
             true,
         );
@@ -356,4 +368,27 @@ fn terminal_or_invalid_verdict_never_reaches_next_proposal() {
         "invalid verdict cannot emit accepted tokens"
     );
     assert_eq!(calls, ["verify", "record"]);
+}
+
+#[test]
+fn actual_k2_k3_records_all_verdicts_before_trim_and_reproposal() {
+    for (drafts, accepted) in [1, 2]
+        .into_iter()
+        .flat_map(|d| (0..=d).map(move |a| (d, a)))
+    {
+        let (a, calls) = run_at_depth(drafts, accepted, 20, false, false);
+        assert!(!a.finished);
+        assert_eq!(
+            calls,
+            ["verify", "record", "commit", "save", "trim", "propose"]
+        );
+        assert_eq!(a.pending_drafts, [20, 21][..drafts]);
+        assert_eq!(a.seq.seq_len, 4 + accepted);
+        assert!(a.mtp_acct.tok_step() <= (drafts + 1) as f64);
+        for (remaining, error) in [(1, false), (20, true)] {
+            let (a, calls) = run_at_depth(drafts, accepted, remaining, error, false);
+            assert!(a.finished);
+            assert_eq!(calls, ["verify", "record"]);
+        }
+    }
 }

@@ -49,7 +49,14 @@ impl Qwen3AttentionLayer {
             )?;
             return ops::hc_pre_from_raw_mix(
                 ctx.gpu,
-                self.hc_pre_from_raw_mix_k,
+                ops::glm_hc_prefill_finalize_kernel(
+                    ctx.gpu,
+                    &ctx.config.model_type,
+                    self.hc_pre_from_raw_mix_k,
+                    tokens,
+                    h,
+                    hc_mult,
+                )?,
                 streams,
                 raw_mix,
                 site.hc_scale,

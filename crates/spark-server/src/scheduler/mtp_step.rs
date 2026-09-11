@@ -43,6 +43,9 @@ pub fn step_mtp(
         Some(max_nd) => num_drafts.min(max_nd),
         None => num_drafts,
     };
+    // Repair owns an explicit verdict on both ranks; legacy K2/K3 have no record hook.
+    let glm_repaired_narrow =
+        matches!(num_drafts, 1 | 2) && spark_model::speculative::glm_repair_policy::enabled();
     let mut bootstrap_idxs: Vec<usize> = Vec::new();
     let mut verify_idxs: Vec<usize> = Vec::new();
     for (i, a) in active.iter().enumerate() {
@@ -112,7 +115,9 @@ pub fn step_mtp(
     // target and n of the drafter. Falls back to the per-sequence loop below
     // whenever the envelope does not hold (`mtp_bootstrap_step`); kill switch
     // ATLAS_NO_MTP_BATCH_BOOTSTRAP.
-    if can_batch_bootstrap(model, sched, bootstrap_idxs.len(), dflash_verify_raw_argmax) {
+    if !spark_model::speculative::glm_repair_policy::enabled()
+        && can_batch_bootstrap(model, sched, bootstrap_idxs.len(), dflash_verify_raw_argmax)
+    {
         step_mtp_bootstrap_batched(model, active, sched, &bootstrap_idxs, ladder_nd, verify_ctx);
         bootstrap_idxs.clear();
     }
@@ -159,7 +164,7 @@ pub fn step_mtp(
                         late_dflash.push(idx);
                         continue;
                     }
-                    if dflash_verify_raw_argmax {
+                    if dflash_verify_raw_argmax || glm_repaired_narrow {
                         step_verify_dflash(
                             model,
                             a,
@@ -435,7 +440,8 @@ pub fn step_mtp(
             ladder_nd
         );
     }
-    if verify_idxs.len() >= 2
+    if !spark_model::speculative::glm_repair_policy::enabled()
+        && verify_idxs.len() >= 2
         && spark_model::speculative::mtp_multi_seq_mode()
         && dspark_batch_ok
         && !batch_verify_disabled()
@@ -615,7 +621,7 @@ pub fn step_mtp(
         // DFlash/DSpark verify: route by proposer, not draft count.
         // `--dflash` sets dflash_verify_raw_argmax. The old `drafts.len()>=4`
         // ladder sent K=3 (`--dflash-gamma 4`) into MTP K=3 verify.
-        if dflash_verify_raw_argmax || drafts.len() >= 4 {
+        if dflash_verify_raw_argmax || glm_repaired_narrow || drafts.len() >= 4 {
             step_verify_dflash(
                 model,
                 a,

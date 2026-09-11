@@ -130,9 +130,10 @@ impl Qwen3AttentionLayer {
         // Absorb W_UK into Q. This is the same representation used by Atlas's
         // established GLM decode path: [N, nq, kv_lora].
         let q_absorbed = ctx.buffers.ssm_deinterleaved();
-        ops::grouped_gemm_mla(
+        ops::glm_paged_grouped_gemm_mla(
             ctx.gpu,
             self.grouped_gemm_mla_k,
+            &ctx.config.model_type,
             q_full,
             mla.w_uk_t.weight,
             q_absorbed,
@@ -209,24 +210,49 @@ impl Qwen3AttentionLayer {
         let attn_latent = ctx.buffers.attn_output();
         if let Some((indices, index_width)) = sparse_indices {
             let mut profile = super::glm_index::profile_start(ctx, stream)?;
-            ops::glm_sparse_mla_prefill(
+            let accelerated = ops::try_glm_sparse_prefill_tc(
                 ctx.gpu,
-                self.glm_sparse_attn_k,
-                q_absorbed,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
-                indices,
-                attn_latent,
-                meta.block_table,
-                n,
-                nq,
-                kv_lora,
-                index_width,
-                bs,
-                self.glm_sparse_attn_heads_per_cta,
-                self.effective_attn_scale(hd),
+                &ops::GlmSparsePrefillTc {
+                    config: ctx.config,
+                    dtype: self.kv_dtype,
+                    // mla_cache_assemble_batched above writes the same normalized
+                    // NoPE latent to both conventional paged cache sides.
+                    identical_kv_latent: true,
+                    query: q_absorbed,
+                    k_cache: kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    v_cache: kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    indices,
+                    output: attn_latent,
+                    block_table: meta.block_table,
+                    rows: n,
+                    heads: nq,
+                    head_dim: kv_lora,
+                    index_width,
+                    block_size: bs,
+                    scale: self.effective_attn_scale(hd),
+                },
                 stream,
             )?;
+            if !accelerated {
+                ops::glm_sparse_mla_prefill(
+                    ctx.gpu,
+                    self.glm_sparse_attn_k,
+                    q_absorbed,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    indices,
+                    attn_latent,
+                    meta.block_table,
+                    n,
+                    nq,
+                    kv_lora,
+                    index_width,
+                    bs,
+                    self.glm_sparse_attn_heads_per_cta,
+                    self.effective_attn_scale(hd),
+                    stream,
+                )?;
+            }
             let sparse_attention_us = super::glm_index::profile_lap(ctx, stream, &mut profile)?;
             if profile.is_some() {
                 tracing::info!(
@@ -267,9 +293,10 @@ impl Qwen3AttentionLayer {
         // Convert the latent attention result back to each head's value
         // width, then apply the row-parallel output projection.
         let v_extracted = ctx.buffers.qkv_output();
-        ops::grouped_gemm_mla(
+        ops::glm_paged_grouped_gemm_mla(
             ctx.gpu,
             self.grouped_gemm_mla_k,
+            &ctx.config.model_type,
             attn_latent,
             mla.w_uv.weight,
             v_extracted,

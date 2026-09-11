@@ -200,6 +200,17 @@ pub(super) fn drain_pending_requests(
 
     // Account for both active and in-progress prefilling sequences.
     let cap = max_batch_size.saturating_sub(active.len() + prefilling.len());
+    let cap = if spark_model::speculative::glm_repair_policy::long_context_enabled() {
+        cap.min(
+            spark_model::speculative::glm_repair_policy::new_prompt_capacity(
+                active.len(),
+                prefilling.len(),
+                max_batch_size,
+            ),
+        )
+    } else {
+        cap
+    };
 
     let infos: Vec<PendingRequestInfo> = g
         .requests

@@ -13,6 +13,9 @@ mod prompt_tests;
 #[path = "repair_execution_tests.rs"]
 mod repair_tests;
 
+#[path = "repair_owned_execution_tests.rs"]
+mod repair_owned_tests;
+
 struct SlotBody(Arc<Mutex<Vec<i64>>>, bool);
 impl TransformerLayer for SlotBody {
     fn supports_mla_kv_only(&self) -> bool {

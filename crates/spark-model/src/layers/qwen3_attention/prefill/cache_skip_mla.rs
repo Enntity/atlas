@@ -55,6 +55,17 @@ impl Qwen3AttentionLayer {
             return Ok(false);
         }
 
+        if super::super::glm_long_context::enabled(&ctx.config.model_type) {
+            anyhow::ensure!(
+                crate::speculative::glm_repair_policy::enabled()
+                    && !ctx.graph_capture
+                    && !ctx.gpu.stream_is_capturing(stream)
+                    && mla.glm_indexer.is_some()
+                    && kv_cache.sparse_index_config().is_some()
+                    && self.kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Bf16,
+                "GLM long MTP KV writer requires eager repaired BF16 indexed MLA"
+            );
+        }
         let n = num_tokens as u32;
         let h = ctx.config.hidden_size as u32;
         let kv_lora = mla.kv_lora_rank as u32;
@@ -118,6 +129,27 @@ impl Qwen3AttentionLayer {
             stream,
             false,
         )?;
+        if super::super::glm_long_context::enabled(&ctx.config.model_type) {
+            // The KV-only caller owns explicit slots but intentionally has no
+            // attention metadata. Index population consumes only slot + rows.
+            let index_ctx = ForwardContext {
+                attn_metadata: Some(crate::layer::AttnMetadataDev {
+                    positions: DevicePtr::NULL,
+                    positions_h: DevicePtr::NULL,
+                    positions_w: DevicePtr::NULL,
+                    slot: slots,
+                    seq_len: DevicePtr::NULL,
+                    block_table: DevicePtr::NULL,
+                    max_blocks_per_seq: 0,
+                    num_seqs: n,
+                    seq_slot: DevicePtr::NULL,
+                    moe_row_adapter: DevicePtr::NULL,
+                }),
+                midchunk_capture: None,
+                ..*ctx
+            };
+            self.glm_index_prefill_cache_update(normed, n, kv_cache, &index_ctx, stream)?;
+        }
         Ok(true)
     }
 

@@ -250,6 +250,34 @@ impl TransformerModel {
             midchunk_capture: None,
         };
         self.ensure_drafter_context(proposer.as_ref(), seq, &ctx, stream)?;
+        if crate::layers::glm5_mtp::repair_owned::enabled() {
+            use std::sync::atomic::Ordering;
+            anyhow::ensure!(
+                seq.mtp_capture_gen != 0
+                    && seq.mtp_capture_gen == self.mtp_prefill_capture_gen.load(Ordering::Relaxed)
+                    && self.mtp_prefill_capture_len.load(Ordering::Relaxed) == seq.prompt_len,
+                "GLM concurrent repair requires complete owned prompt capture"
+            );
+            let row_bytes = self.config.hidden_size * 2;
+            let source = self
+                .mtp_prefill_hidden
+                .offset((seq.prompt_len - 1) * row_bytes);
+            let state = seq
+                .proposer_state
+                .as_mut()
+                .expect("checked above")
+                .as_any_mut()
+                .downcast_mut::<crate::layers::Glm5MtpProposerState>()
+                .ok_or_else(|| anyhow::anyhow!("GLM retained tail has foreign proposer state"))?;
+            state.retain_repair_prompt_tail(
+                self.gpu.as_ref(),
+                source,
+                seq.mtp_capture_gen,
+                seq.prompt_len,
+                row_bytes,
+                stream,
+            )?;
+        }
         if crate::speculative::mtp_accept_debug() {
             let rows =
                 proposer.drafter_rows(seq.proposer_state.as_mut().expect("checked above").as_mut());

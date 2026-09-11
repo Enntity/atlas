@@ -518,7 +518,9 @@ impl TransformerModel {
                     "received distributed GLM MTP command while the feature is disabled"
                 );
                 anyhow::ensure!(
-                    self.levers.max_decode_seqs == 1,
+                    crate::layers::glm5_mtp::repair_owned::permits_capacity(
+                        self.levers.max_decode_seqs
+                    ),
                     "distributed GLM MTP currently requires max_batch_size=1"
                 );
                 let payload = self.ep_broadcast_tokens(&[0u32; 4])?;

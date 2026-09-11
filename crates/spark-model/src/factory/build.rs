@@ -24,6 +24,8 @@ use crate::model::glm_cache_plan::{GlmCachePlan, GlmMlaShape};
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
+#[path = "glm_mtp_capacity.rs"]
+mod glm_mtp_capacity;
 mod kv_summary;
 
 pub fn build_model(
@@ -441,6 +443,16 @@ pub fn build_model(
         &mut layers,
         shared_cache_reserve,
     )?;
+    super::glm_dense_cache::initialize(
+        &config,
+        gpu.as_ref(),
+        &mut layers,
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        inference_reserve,
+    )?;
     // ── Step 4: Create buffer arena ──
     let _ = crate::layers::moe::validate_shared_fp8_cache_factory_reserve(
         &config,
@@ -681,6 +693,20 @@ pub fn build_model(
             n
         }
     };
+    if config.model_type == "glm5_next"
+        && crate::speculative::glm_repair_policy::enabled()
+        && crate::speculative::glm_repair_policy::long_context_enabled()
+    {
+        // Selected retained owners must fit every transient K-row verifier,
+        // independently of the legacy paged-KV overcommit setting below.
+        glm_mtp_capacity::validate_target_pool(
+            max_seq_len,
+            num_drafts,
+            kv_block_size,
+            max_batch_size,
+            num_kv_blocks,
+        )?;
+    }
     if let Some(plan) = glm_cache_plan {
         plan.bytes_for_blocks(num_kv_blocks)?;
     }

@@ -18,6 +18,7 @@ pub(super) enum RepairPhase {
 pub(super) struct PendingRepair {
     pub plan: FinishPlan,
     pub tokens: [u32; 5],
+    pub drafts: usize,
     pub cached_rows: usize,
     trim_seen: bool,
 }
@@ -48,12 +49,13 @@ impl RepairPhase {
             observed_cache_rows: cached_rows,
             hidden_base_position: base,
         }))?;
-        let tokens = tokens
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("GLM verdict requires K5"))?;
+        // The checked proposal fixes the valid prefix; paired storage stays K5.
+        let mut owned_tokens = [0; 5];
+        owned_tokens[..tokens.len()].copy_from_slice(tokens);
         *self = Self::Pending(PendingRepair {
             plan,
-            tokens,
+            tokens: owned_tokens,
+            drafts: proposal.drafts(),
             cached_rows,
             trim_seen: false,
         });

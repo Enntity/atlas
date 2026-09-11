@@ -536,7 +536,9 @@ impl TransformerModel {
                 self.config.model_type == "glm5_next"
                     && self.config.tp_world_size == 2
                     && self.config.ep_world_size == 2
-                    && self.levers.max_decode_seqs == 1,
+                    && crate::layers::glm5_mtp::repair_owned::permits_capacity(
+                        self.levers.max_decode_seqs
+                    ),
                 "distributed GLM MTP requires GLM TP2/EP2 with max_batch_size=1"
             );
             anyhow::ensure!(

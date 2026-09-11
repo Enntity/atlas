@@ -47,6 +47,9 @@ mod transport_continuation_tests;
 mod transport_fault_tests;
 #[path = "glm_c2_transport_legacy_tests.rs"]
 mod transport_legacy_tests;
+
+#[path = "glm_repair_c4_transport_tests.rs"]
+mod repair_c4_transport_tests;
 #[path = "glm_c2_transport_reuse_tests.rs"]
 mod transport_reuse_tests;
 #[path = "glm_c2_transport_test_fixture.rs"]

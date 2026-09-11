@@ -42,6 +42,9 @@ mod repair_state;
 #[path = "glm5_mtp/repair.rs"]
 mod repair;
 
+#[path = "glm5_mtp/repair_owned.rs"]
+pub(crate) mod repair_owned;
+
 #[path = "glm5_mtp/paired.rs"]
 mod paired;
 
@@ -108,6 +111,7 @@ pub struct Glm5MtpProposerState {
     paired: Option<paired::Lease>,
     hidden_trace: hidden_trace::HiddenTrace,
     repair: repair_state::RepairPhase,
+    repair_owned: Option<repair_owned::OwnedRepairRows>,
     pub block_table: Vec<u32>,
     pub seq_len: usize,
     pub last_num_drafted: usize,
@@ -177,6 +181,7 @@ impl Glm5MtpHead {
             paired: None,
             hidden_trace: hidden_trace::HiddenTrace::new(self.hidden_trace_enabled),
             repair: repair_state::RepairPhase::Capture,
+            repair_owned: None,
             block_table: Vec::new(),
             seq_len: 0,
             last_num_drafted: 0,
@@ -810,10 +815,11 @@ impl DraftProposer for Glm5MtpHead {
                 anyhow::bail!("GLM repair proposal was not prepared");
             };
             anyhow::ensure!(
-                num_drafts == 4
+                num_drafts == plan.drafts()
+                    && (self.paired.is_none() || num_drafts == 4)
                     && grammar_bitmask.is_none()
                     && plan.position() == position
-                    && state.seq_len.checked_add(4) == Some(plan.speculative_cache_end()),
+                    && state.seq_len.checked_add(num_drafts) == Some(plan.speculative_cache_end()),
                 "GLM repair proposal metadata changed after prepare"
             );
         }
@@ -889,6 +895,7 @@ impl DraftProposer for Glm5MtpHead {
             state.block_table.clear();
         }
         state.seq_len = 0;
+        state.free_repair_owned(_gpu)?;
         state.repair = repair_state::RepairPhase::Capture;
         state.last_num_drafted = 0;
         state.hidden_trace.reset();

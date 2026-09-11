@@ -187,18 +187,24 @@ pub fn sanitize_content_chunk(
                 continue;
             }
             None => {
-                let buf_len = tag_scan_buf.len();
-                let hold = tag_max.saturating_sub(1);
-                if buf_len <= hold {
-                    break;
-                }
-                let commit_to = buf_len - hold;
-                let cut = tag_scan_buf
-                    .char_indices()
-                    .map(|(i, _)| i)
-                    .take_while(|&i| i <= commit_to)
-                    .last()
+                // Complete markers were handled above. Only a strict marker
+                // prefix can become a marker when the next chunk arrives;
+                // ordinary prose can be committed immediately. Keep the
+                // longest matching suffix, including overlapping prefixes.
+                // Prefixes end at character boundaries, so draining the
+                // preceding UTF-8 text cannot split a character either.
+                let hold = markers
+                    .orphan_open
+                    .iter()
+                    .chain(markers.close.iter())
+                    .chain(markers.envelope_open.iter())
+                    .chain(markers.envelope_close.iter())
+                    .flat_map(|marker| marker.char_indices().skip(1).map(|(i, _)| &marker[..i]))
+                    .filter(|prefix| tag_scan_buf.ends_with(prefix))
+                    .map(str::len)
+                    .max()
                     .unwrap_or(0);
+                let cut = tag_scan_buf.len() - hold;
                 let emit: String = tag_scan_buf.drain(..cut).collect();
                 out.push_str(&emit);
                 break;

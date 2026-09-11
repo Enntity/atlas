@@ -34,6 +34,15 @@ impl PrivateStoragePlan {
         let cache = GlmCachePlan::new(shape, &kv, index)?;
         let (blocks, slab) = if let Some((context, capacity)) = paired {
             (capacity.cache_blocks(context)?, capacity.slab_bytes())
+        } else if repair_owned::enabled() {
+            // Four independently owned full contexts plus speculative overflow.
+            let blocks = max_seq_len
+                .checked_add(4)
+                .context("GLM concurrent repair context overflow")?
+                .div_ceil(kv.block_size)
+                .checked_mul(4)
+                .context("GLM concurrent repair pool overflow")?;
+            (blocks, 4 * 3 * config.hidden_size * 2)
         } else {
             (max_seq_len / kv.block_size + 1, 0)
         };
@@ -51,6 +60,18 @@ impl PrivateStoragePlan {
 }
 
 impl Glm5MtpHead {
+    /// Same private payload quote used by the concurrent repaired constructor.
+    pub fn repair_private_reserve_bytes(
+        config: &atlas_core::config::ModelConfig,
+        context: usize,
+    ) -> Result<usize> {
+        anyhow::ensure!(
+            repair_owned::enabled(),
+            "GLM concurrent repair is not selected"
+        );
+        Ok(PrivateStoragePlan::new(config, context, None)?.bytes)
+    }
+
     /// Device payload only: private K/V, optional index/tails and owner slab.
     /// Shared weights, allocator overhead and target state remain separate.
     /// This immutable quote is not serving admission or an allocation receipt.

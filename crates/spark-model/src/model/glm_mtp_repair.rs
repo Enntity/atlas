@@ -12,6 +12,25 @@ use anyhow::{Context, Result, ensure};
 use std::sync::atomic::Ordering;
 
 impl TransformerModel {
+    fn glm_repair_generation(&self, seq: &SequenceState) -> Result<u64> {
+        let owned = seq
+            .proposer_state
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .as_any()
+                    .downcast_ref::<crate::layers::Glm5MtpProposerState>()
+            })
+            .map(|state| state.repair_capture_generation(seq.mtp_capture_gen, seq.prompt_len))
+            .transpose()?
+            .flatten();
+        ensure!(
+            !crate::layers::glm5_mtp::repair_owned::enabled() || owned.is_some(),
+            "GLM concurrent repair is missing its retained prompt owner"
+        );
+        Ok(owned.unwrap_or_else(|| self.mtp_prefill_capture_gen.load(Ordering::Relaxed)))
+    }
+
     pub(super) fn glm_repair_context(&self) -> ForwardContext<'_> {
         ForwardContext {
             ssm_batch: None,
@@ -42,12 +61,15 @@ impl TransformerModel {
         position: usize,
         drafts: usize,
         hidden_row: usize,
+        capture_generation: u64,
     ) -> Result<RepairInput<'a>> {
         ensure!(
             self.config.model_type == "glm5_next"
                 && self.config.tp_world_size == 2
                 && self.config.ep_world_size == 2
-                && self.levers.max_decode_seqs == 1
+                && crate::layers::glm5_mtp::repair_owned::permits_capacity(
+                    self.levers.max_decode_seqs
+                )
                 && self.levers.drafter.prefill
                 && !self.levers.drafter.carry,
             "GLM repair requires the resolved C1 TP2/EP2 prefill-only lane"
@@ -69,7 +91,9 @@ impl TransformerModel {
             );
         }
         ensure!(
-            seq.seq_len == position && self.mtp_slot_draft_capacity(seq.slot_idx) >= 4,
+            seq.seq_len == position
+                && matches!(drafts, 1 | 2 | 4)
+                && self.mtp_slot_draft_capacity(seq.slot_idx) >= drafts,
             "GLM repair live target position/verify capacity mismatch"
         );
         let row = self
@@ -88,7 +112,7 @@ impl TransformerModel {
             position,
             drafts,
             generation: seq.mtp_capture_gen,
-            capture_generation: self.mtp_prefill_capture_gen.load(Ordering::Relaxed),
+            capture_generation,
             captured_rows: self.mtp_prefill_capture_len.load(Ordering::Relaxed),
             context_tokens: self.mtp_prefill_capacity,
             capture: RepairSpan {
@@ -124,7 +148,14 @@ impl TransformerModel {
             "GLM repair does not support grammar-constrained requests"
         );
         policy::validate_environment()?;
-        let input = self.glm_repair_input(seq, token, position, drafts, hidden_row)?;
+        let input = self.glm_repair_input(
+            seq,
+            token,
+            position,
+            drafts,
+            hidden_row,
+            self.glm_repair_generation(seq)?,
+        )?;
         let state = seq
             .proposer_state
             .as_ref()
@@ -150,6 +181,7 @@ impl TransformerModel {
         }
         // Temporarily take the state to borrow complete token/capture metadata
         // independently. Always restore it, including a Failed phase on error.
+        let capture_generation = self.glm_repair_generation(seq)?;
         let mut state = seq
             .proposer_state
             .take()
@@ -161,6 +193,7 @@ impl TransformerModel {
                 position,
                 drafts,
                 self.last_mtp_hidden_idx.load(Ordering::Relaxed),
+                capture_generation,
             )?;
             let repair = self
                 .proposer
@@ -173,8 +206,10 @@ impl TransformerModel {
         if result.is_ok() {
             // The owned prompt has been consumed. It is now accepted-row
             // staging and must never be reinterpreted by the legacy primer.
-            self.mtp_prefill_capture_len.store(0, Ordering::Relaxed);
-            *self.mtp_store_range.lock() = (0, 0);
+            if !crate::layers::glm5_mtp::repair_owned::enabled() {
+                self.mtp_prefill_capture_len.store(0, Ordering::Relaxed);
+                *self.mtp_store_range.lock() = (0, 0);
+            }
             if self.stats.dumped.keyed("glm_mtp_pair_repair") {
                 tracing::info!(
                     "GLM accepted-pair repair engaged: request generation={}, position={}, drafts={}",
@@ -201,8 +236,8 @@ impl TransformerModel {
             return Ok(());
         }
         ensure!(
-            tokens.len() == 5 && accepted <= 4,
-            "GLM repair verdict requires K5"
+            matches!(tokens.len(), 2 | 3 | 5) && accepted < tokens.len(),
+            "GLM repair verdict requires K2, K3 or K5 with a bounded accepted prefix"
         );
         let end = base
             .checked_add(accepted + 1)
@@ -214,7 +249,7 @@ impl TransformerModel {
             "GLM verdict does not match committed target tokens"
         );
         let generation = seq.mtp_capture_gen;
-        let capture_generation = self.mtp_prefill_capture_gen.load(Ordering::Relaxed);
+        let capture_generation = self.glm_repair_generation(seq)?;
         let rows = self.buffers.sizes().norm_output
             / self
                 .config

@@ -120,3 +120,29 @@ fn saturated_k3_triggers_a_deep_probe() {
     assert_eq!(a.depth_mode, DEPTH_DEEP);
     assert_eq!(a.depth_switches, 1);
 }
+
+#[test]
+fn fixed_single_draft_reports_k2_without_adaptive_depth() {
+    let mut a = RequestAccept::default();
+    for accepted in [1, 0, 1] {
+        a.record_depth_verify(1, accepted, false);
+        a.record_verify_emitted(accepted + 1);
+        assert!(a.done_suffix().contains("depth=k2 "));
+        assert!(a.tok_step() <= 2.0);
+        assert_eq!(a.depth_drafts(1, false), 1);
+    }
+    a.record_depth_verify(4, 4, false);
+    assert!(a.done_suffix().contains("depth=k5 "));
+}
+
+#[test]
+fn fixed_two_drafts_report_k3_without_adaptation_or_depth_lift() {
+    let mut a = RequestAccept::default();
+    for accepted in [2, 1, 0, 2] {
+        a.record_depth_verify(2, accepted, false);
+        a.record_verify_emitted(accepted + 1);
+        assert!(a.done_suffix().contains("depth=k3 "));
+        assert!(a.tok_step() <= 3.0);
+        assert_eq!(a.depth_drafts(2, false), 2);
+    }
+}

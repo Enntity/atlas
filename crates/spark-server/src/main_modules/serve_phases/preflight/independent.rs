@@ -24,6 +24,28 @@ fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<O
             "joint verification requires selected paired serving and at least20 prefill rows"
         );
     }
+    if spark_model::speculative::glm_repair_policy::long_context_enabled() {
+        anyhow::ensure!(
+            spark_model::speculative::glm_repair_policy::enabled()
+                && config.model_type == "glm5_next"
+                && !args.glm_paired_mtp
+                && !spark_model::model::glm_independent::enabled(&config.model_type)?,
+            "long MTP preparation requires the repaired GLM dispatcher"
+        );
+        let topology = resolve_topology(args, config)?;
+        anyhow::ensure!(
+            topology.world_size == 2
+                && topology.tp_size == 2
+                && topology.ep_size == 2
+                && config.tp_rank == config.ep_rank
+                && config.ep_rank == args.rank
+                && args.rank < topology.world_size,
+            "resolved long MTP topology mismatch before GPU initialization"
+        );
+        // The serve handoff consumes Some(topology), so global heads are divided
+        // exactly once and every reserve uses the same local shapes as allocation.
+        return Ok(Some(topology));
+    }
     if args.glm_paired_mtp {
         anyhow::ensure!(
             (2..=8).contains(&args.max_batch_size) && args.max_num_seqs == args.max_batch_size,

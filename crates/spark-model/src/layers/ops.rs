@@ -66,12 +66,16 @@ mod gemv_q2;
 mod gemv_q2_vec;
 #[path = "ops/gemv_sw.rs"]
 mod gemv_sw;
+#[path = "ops/glm_hc_prefill.rs"]
+mod glm_hc_prefill;
 #[path = "ops/glm_indexer.rs"]
 mod glm_indexer;
 #[path = "ops/glm_indexer_dynamic.rs"]
 mod glm_indexer_dynamic;
 #[path = "ops/glm_router_bn4.rs"]
 mod glm_router_bn4;
+#[path = "ops/glm_sparse_prefill_tc.rs"]
+mod glm_sparse_prefill_tc;
 pub use glm_router_bn4::glm_router_bn4;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
@@ -210,8 +214,10 @@ pub use gemm_quant::*;
 pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
+pub use glm_hc_prefill::*;
 pub use glm_indexer::*;
 pub use glm_indexer_dynamic::*;
+pub use glm_sparse_prefill_tc::*;
 pub use hyper_connection::*;
 pub use hyper_connection_dispatch::*;
 pub use hyper_connection_lowrank::*;
