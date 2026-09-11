@@ -15,6 +15,9 @@ const END: u32 = 2;
 const TOOL: u32 = 3;
 const CALL: &[u32] = &[3, 4, 5, 6, 7, 8, 9, 10, 11];
 
+#[path = "reasoning_done_tests.rs"]
+mod reasoning_done_tests;
+
 fn app(glm: bool) -> Arc<AppState> {
     let dir = tempfile::tempdir().unwrap();
     let words = [
@@ -32,6 +35,7 @@ fn app(glm: bool) -> Arc<AppState> {
         "</tool_call>",
         "unknown_tool",
         "<think>",
+        "42",
     ];
     let vocab = words
         .iter()
@@ -208,6 +212,15 @@ fn stream(
 }
 
 fn stream_tokens(glm: bool, tools: bool, tokens: Vec<u32>) -> (StreamState, Vec<ir::StreamDelta>) {
+    let (_, stream, deltas) = stream_tokens_with_context(glm, tools, tokens);
+    (stream, deltas)
+}
+
+fn stream_tokens_with_context(
+    glm: bool,
+    tools: bool,
+    tokens: Vec<u32>,
+) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
     let state = app(glm);
     let defs = if tools { request().tools } else { vec![] };
     let ctx = StreamCtx {
@@ -243,7 +256,7 @@ fn stream_tokens(glm: bool, tools: bool, tokens: Vec<u32>) -> (StreamState, Vec<
     for token in tokens {
         deltas.extend(handle_token(&mut stream, &ctx, token));
     }
-    (stream, deltas)
+    (ctx, stream, deltas)
 }
 
 #[test]

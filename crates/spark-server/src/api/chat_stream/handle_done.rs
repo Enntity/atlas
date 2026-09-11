@@ -121,6 +121,24 @@ pub(super) fn handle_done(
 fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
     let mut deltas: DeltaVec = Vec::new();
 
+    // EOS or a token limit can arrive before </think>. The reasoning
+    // sanitizer still holds a short safe tail in that case; preserve its
+    // channel instead of losing it or treating it as final answer content.
+    // finalize_done skips this entire flush for rejected output.
+    if ctx.enable_thinking && !state.reasoning_xml_leak_detected {
+        let tail = flush_content_sanitizer(
+            &mut state.reasoning_tag_scan_buf,
+            &mut state.reasoning_suppressing_leak,
+            &ctx.leak_markers,
+        );
+        if !tail.is_empty() {
+            deltas.push(StreamDelta::Reasoning {
+                text: tail,
+                token_ids: state.take_ids_if(ctx.req_return_token_ids),
+            });
+        }
+    }
+
     // ── Stop-string hold-back flush ─────────────────────────────────
     // vLLM's `IncrementalDetokenizer` releases any bytes still in the
     // hold-back window when the stream finalises (see
