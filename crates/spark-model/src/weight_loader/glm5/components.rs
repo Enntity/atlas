@@ -63,7 +63,7 @@ pub(super) fn load_ffn(
     allow_prefill_layout: bool,
 ) -> Result<FfnComponent> {
     if config.mlp_only_layers.contains(&layer_idx) {
-        return load_dense_ffn(store, lp, config, gpu, qctx);
+        return load_dense_ffn(store, lp, config, gpu, variant, qctx);
     }
     load_moe(
         store,
@@ -82,41 +82,39 @@ fn load_dense_ffn(
     lp: &str,
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
+    variant: Nvfp4Variant,
     qctx: QuantizeCtx,
 ) -> Result<FfnComponent> {
     let p = format!("{lp}.mlp");
     let h = config.hidden_size;
     let inter = config.intermediate_size;
-    let gate = dense_auto(store, &format!("{p}.gate_proj.weight"), gpu)?;
-    let up = dense_auto(store, &format!("{p}.up_proj.weight"), gpu)?;
-    let down = dense_auto(store, &format!("{p}.down_proj.weight"), gpu)?;
     let weights = DenseFfnWeights {
-        gate_proj: quantize_to_nvfp4(
-            &gate,
+        gate_proj: super::dense::load_projection(
+            store,
+            &format!("{p}.gate_proj"),
             inter,
             h,
             gpu,
-            qctx.absmax_k,
-            qctx.quantize_k,
-            qctx.stream,
+            variant,
+            qctx,
         )?,
-        up_proj: quantize_to_nvfp4(
-            &up,
+        up_proj: super::dense::load_projection(
+            store,
+            &format!("{p}.up_proj"),
             inter,
             h,
             gpu,
-            qctx.absmax_k,
-            qctx.quantize_k,
-            qctx.stream,
+            variant,
+            qctx,
         )?,
-        down_proj: quantize_to_nvfp4(
-            &down,
+        down_proj: super::dense::load_projection(
+            store,
+            &format!("{p}.down_proj"),
             h,
             inter,
             gpu,
-            qctx.absmax_k,
-            qctx.quantize_k,
-            qctx.stream,
+            variant,
+            qctx,
         )?,
         // Keep the memory-tight fallback for the first safe deployment.
         gate_proj_t: None,
