@@ -67,6 +67,8 @@ pub struct FastSafetensorsLoader {
     /// OPT-IN: a model that DOES build an MTP head must keep them, so this is
     /// set only where `load_mtp_weights` is known to return `None`.
     pub skip_mtp: bool,
+    /// Exact tensor prefix of an unused appended predictor layer; default retains it.
+    pub skip_layer_prefix: Option<String>,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
     pub try_direct_io: bool,
@@ -127,6 +129,7 @@ impl FastSafetensorsLoader {
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layer_prefix: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
@@ -144,6 +147,7 @@ impl FastSafetensorsLoader {
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layer_prefix: None,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
@@ -275,7 +279,11 @@ impl WeightLoader for FastSafetensorsLoader {
         }
 
         // Extra weights (e.g. MTP grafted from another quantization).
-        let no_skip = |_: &str| false;
+        let skip_unused = |name: &str| {
+            self.skip_layer_prefix
+                .as_ref()
+                .is_some_and(|prefix| name.starts_with(prefix))
+        };
         let extra = model_dir.join("extra_weights.safetensors");
         if extra.exists() {
             tracing::info!("Fast-loading extra_weights.safetensors");
@@ -284,7 +292,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 &extra,
                 None,
                 gpu,
-                &no_skip,
+                &skip_unused,
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,

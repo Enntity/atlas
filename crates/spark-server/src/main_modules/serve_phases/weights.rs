@@ -44,6 +44,7 @@ pub(crate) fn load_weight_store(
     let mult = quant_multiplier(config);
     let glm_mtp_distributed =
         std::env::var("ATLAS_GLM_MTP_DISTRIBUTED").ok().as_deref() == Some("1");
+    let unused_mtp_prefix = unused_glm_mtp_prefix(config, args.speculative);
     if glm_mtp_distributed {
         anyhow::ensure!(
             config.model_type == "glm5_next"
@@ -136,6 +137,7 @@ pub(crate) fn load_weight_store(
             }
             loader.skip_activation_scales = skip_activation_scales(config);
             loader.skip_mtp = skip_mtp(config, args);
+            loader.skip_layer_prefix = unused_mtp_prefix.clone();
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
                     .ok()
@@ -168,6 +170,7 @@ pub(crate) fn load_weight_store(
         loader.peak_memory_multiplier = mult;
         loader.skip_activation_scales = skip_activation_scales(config);
         loader.skip_mtp = skip_mtp(config, args);
+        loader.skip_layer_prefix = unused_mtp_prefix;
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?
@@ -332,4 +335,40 @@ fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
     // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
     // comes straight out of the KV cache. With the flag it is the drafter.
     matches!(config.model_type.as_str(), "qwen4_exp") && !args.speculative
+}
+
+// GLM's predictor is a physical appended layer, not the generic `mtp.*` tree.
+// Without speculative decoding the factory never consumes any of its tensors.
+fn unused_glm_mtp_prefix(config: &ModelConfig, speculative: bool) -> Option<String> {
+    (config.model_type == "glm5_next" && !speculative).then(|| {
+        format!(
+            "{}.layers.{}.",
+            config.weight_prefix, config.num_hidden_layers
+        )
+    })
+}
+
+#[cfg(test)]
+mod unused_glm_mtp_tests {
+    use super::*;
+
+    #[test]
+    fn unused_glm_mtp_policy_uses_actual_prefix_and_target_layer_count() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        assert!(unused_glm_mtp_prefix(&config, false).is_none());
+        config.model_type = "glm5_next".into();
+        config.weight_prefix = "model.language_model".into();
+        config.num_hidden_layers = 45;
+        assert_eq!(
+            unused_glm_mtp_prefix(&config, false).as_deref(),
+            Some("model.language_model.layers.45.")
+        );
+        assert!(unused_glm_mtp_prefix(&config, true).is_none());
+        config.weight_prefix = "fixture".into();
+        config.num_hidden_layers = 3;
+        assert_eq!(
+            unused_glm_mtp_prefix(&config, false).as_deref(),
+            Some("fixture.layers.3.")
+        );
+    }
 }
