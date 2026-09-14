@@ -13,6 +13,8 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, SparseIndexCacheConfi
 #[path = "mla_long_context_test_gpu.rs"]
 mod gpu;
 use gpu::TestGpu;
+#[path = "mla_query_dispatch_tests.rs"]
+mod query_dispatch_tests;
 #[path = "mla_split_context_tests.rs"]
 mod split_tests;
 fn fixture(run: impl FnOnce(&TestGpu, &atlas_core::config::ModelConfig, &Qwen3AttentionLayer)) {
@@ -37,8 +39,16 @@ fn fixture(run: impl FnOnce(&TestGpu, &atlas_core::config::ModelConfig, &Qwen3At
     config.max_position_embeddings = 32768;
     config.tp_world_size = 2;
     config.ep_world_size = 2;
-    let dense = |_bytes| DenseWeight {
-        weight: gpu.alloc(2).unwrap(),
+    // The mock never dereferences weight data, but the query/O plans inspect
+    // the resident matrix spans for alias safety. Give each fake weight a
+    // credible, aligned logical range without allocating hundreds of MB of
+    // backing storage in the test GPU.
+    let mut next_weight = 0x1_0000_0000u64;
+    let mut dense = |bytes: usize| {
+        let bytes = bytes.max(2);
+        let ptr = DevicePtr(next_weight);
+        next_weight += ((bytes + 255) & !255) as u64;
+        DenseWeight { weight: ptr }
     };
     let absent = DenseWeight {
         weight: DevicePtr::NULL,
@@ -85,9 +95,7 @@ fn fixture(run: impl FnOnce(&TestGpu, &atlas_core::config::ModelConfig, &Qwen3At
         wkv_a_rope: absent,
         wkv_a_merged: dense(512 * 4096 * 2),
         // Comparison mode validates the real operand range, not a two-byte stub.
-        wo: DenseWeight {
-            weight: gpu.alloc(4096 * 32 * 256 * 2).unwrap(),
-        },
+        wo: dense(4096 * 32 * 256 * 2),
         wo_nvfp4: None,
         wo_a: absent,
         wo_a_nvfp4: None,
@@ -125,345 +133,15 @@ fn fixture(run: impl FnOnce(&TestGpu, &atlas_core::config::ModelConfig, &Qwen3At
     layer.dense_gemv_k = KernelHandle(806);
     layer.dense_gemv_batchm_k = KernelHandle(807);
     layer.mla_batched_gemv_k = KernelHandle(808);
+    layer.mla_cache_assemble_k = KernelHandle(820);
+    layer.glm_index_layernorm_k = KernelHandle(800);
     layer.glm_index_tail_write_k = KernelHandle(801);
     layer.glm_index_kpool_finalize_k = KernelHandle(802);
+    layer.glm_index_logits_decode_k = KernelHandle(812);
     layer.glm_index_topk_expand_k = KernelHandle(803);
     layer.glm_sparse_attn_decode_k = KernelHandle(804);
     run(&gpu, &config, &layer);
 }
-#[test]
-fn actual_prompt_index_and_causal_verify_dispatch() {
-    const CHILD: &str = "ATLAS_TEST_LONG_MTP_ATTENTION";
-    if std::env::var_os(CHILD).is_none() {
-        let name = concat!(
-            module_path!(),
-            "::actual_prompt_index_and_causal_verify_dispatch"
-        );
-        for (tc, o_batch, compare) in [
-            ("0", "0", "0"),
-            ("1", "0", "0"),
-            ("0", "1", "0"),
-            ("1", "1", "0"),
-            ("0", "1", "1"),
-            ("1", "1", "1"),
-        ] {
-            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-            cmd.args(["--exact", name.split_once("::").unwrap().1, "--nocapture"]);
-            for (k, _) in std::env::vars_os() {
-                if k.to_string_lossy().starts_with("ATLAS_") {
-                    cmd.env_remove(k);
-                }
-            }
-            let out = cmd
-                .env(CHILD, "1")
-                .env("ATLAS_GLM_MTP_LONG_CONTEXT", "1")
-                .env("ATLAS_GLM_MTP_REPAIR", "1")
-                .env("ATLAS_GLM_SPARSE_DECODE_TC", tc)
-                .env("ATLAS_GLM_K3_MLA_O_BATCHM", o_batch)
-                .env("ATLAS_GLM_K3_MLA_O_COMPARE", compare)
-                .output()
-                .unwrap();
-            assert!(String::from_utf8_lossy(&out.stdout).contains("running 1 test"));
-            assert!(
-                out.status.success(),
-                "TC={tc}, batchm={o_batch}, compare={compare}: {}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        return;
-    }
-    fixture(|gpu, config, layer| {
-        if std::env::var("ATLAS_GLM_K3_MLA_O_BATCHM").as_deref() == Ok("1") {
-            use crate::layers::qwen3_attention::glm_k3_mla_o::initialize;
-            let ptr = layer.mla.as_ref().unwrap().wo.weight;
-            initialize(gpu, config, KvCacheDtype::Bf16, ptr, 4096, 8192).unwrap();
-            let mut wrong = config.clone();
-            wrong.num_attention_heads = 64;
-            assert!(initialize(gpu, &wrong, KvCacheDtype::Bf16, ptr, 4096, 8192).is_err());
-            assert!(initialize(gpu, config, KvCacheDtype::Fp8, ptr, 4096, 8192).is_err());
-        }
-        let sparse_kernel = if ops::glm_sparse_decode_tc_enabled(&config.model_type).unwrap() {
-            gpu.kernel(
-                "glm_sparse_prefill_kv_reuse",
-                "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad",
-            )
-            .unwrap()
-            .0
-        } else {
-            804
-        };
-        let arena = BufferArena::new(config, 16, 32768, 16, 1, gpu).unwrap();
-        let mut dispatch = ops::GemmDispatch::defaults();
-        dispatch.cublas_gemm = false;
-        let derived = ops::DerivedWeights::new();
-        let levers = ops::ModelLevers::defaults();
-        let stats = ops::ModelStats::new();
-        let ptr = gpu.alloc(3 * 2049 * 4 + 1024).unwrap();
-        let meta = AttnMetadataDev {
-            positions: ptr,
-            positions_h: ptr,
-            positions_w: ptr,
-            slot: ptr.offset(256),
-            seq_len: ptr.offset(512),
-            block_table: ptr.offset(768),
-            max_blocks_per_seq: 2049,
-            num_seqs: 3,
-            seq_slot: DevicePtr::NULL,
-            moe_row_adapter: DevicePtr::NULL,
-        };
-        let ctx = ForwardContext {
-            buffers: &arena,
-            gpu,
-            config,
-            dispatch: &dispatch,
-            derived: &derived,
-            levers: &levers,
-            stats: &stats,
-            ssm_batch: None,
-            attn_metadata: Some(meta),
-            profile: false,
-            comm: None,
-            graph_capture: false,
-            gdn_exact_replay: false,
-            token_ids: None,
-            host_token_ids: None,
-            routed_lora_layers: None,
-            midchunk_capture: None,
-            moe_lora_route: crate::layer::MoeLoraRoute::Skip,
-        };
-        let mut cache = PagedKvCache::new(
-            KvCacheConfig {
-                block_size: 16,
-                num_kv_heads: 1,
-                head_dim: 512,
-                num_layers: 1,
-                dtype: KvCacheDtype::Bf16,
-                layer_dtypes: vec![],
-                layer_dims: vec![],
-                cache_blocks_per_seq: None,
-            },
-            2050,
-            gpu,
-        )
-        .unwrap();
-        cache
-            .attach_sparse_index(SparseIndexCacheConfig::bf16(4, 128), gpu)
-            .unwrap();
-        let before = gpu.launch_count();
-        layer
-            .prefill_mla_kv_only_impl(arena.hidden_states(), 3, &mut cache, meta.slot, &ctx, 0)
-            .unwrap();
-        let launches = gpu.launches_snapshot();
-        let index: Vec<_> = launches[before..]
-            .iter()
-            .filter(|x| (801..=804).contains(&x.func))
-            .map(|x| (x.func, x.grid[0]))
-            .collect();
-        assert_eq!(
-            index,
-            vec![(801, 3), (802, 3)],
-            "KV-only prompt/repair must populate raw and pooled index"
-        );
-        for positions in [[2046, 2048, 2049], [32767, 32768, 32769]] {
-            let c = MultiSeqCtx::new(
-                layer,
-                &ctx,
-                arena.hidden_states(),
-                arena.residual(),
-                3,
-                &positions,
-                16,
-                0,
-            );
-            let before = gpu.launch_count();
-            assert!(layer.ms_mla_decode(&c, &mut cache, meta).is_err());
-            assert_eq!(
-                gpu.launch_count(),
-                before,
-                "bad row extents must refuse before kernels"
-            );
-        }
-        let graph_ctx = ForwardContext {
-            graph_capture: true,
-            midchunk_capture: None,
-            ..ctx
-        };
-        let positions = [2046, 2047, 2048];
-        let c = MultiSeqCtx::new(
-            layer,
-            &graph_ctx,
-            arena.hidden_states(),
-            arena.residual(),
-            3,
-            &positions,
-            16,
-            0,
-        );
-        let before = gpu.launch_count();
-        assert!(layer.ms_mla_decode(&c, &mut cache, meta).is_err());
-        assert_eq!(gpu.launch_count(), before);
-        for positions in [[2046, 2047, 2048], [32764, 32765, 32766]] {
-            let c = MultiSeqCtx::new(
-                layer,
-                &ctx,
-                arena.hidden_states(),
-                arena.residual(),
-                3,
-                &positions,
-                16,
-                0,
-            );
-            if std::env::var("ATLAS_GLM_K3_MLA_O_BATCHM").as_deref() == Ok("1") {
-                let compare = std::env::var("ATLAS_GLM_K3_MLA_O_COMPARE").as_deref() == Ok("1");
-                for bad in 0..if compare { 3 } else { 2 } {
-                    let mut rejected = MultiSeqCtx::new(
-                        layer,
-                        &ctx,
-                        arena.hidden_states(),
-                        arena.residual(),
-                        3,
-                        &positions,
-                        16,
-                        0,
-                    );
-                    if bad == 0 {
-                        rejected.nq = 64;
-                    } else if bad == 1 {
-                        rejected.normed = arena.ssm_qkvz().offset(512);
-                    } else {
-                        rejected.normed = arena.attn_output();
-                    }
-                    let count = gpu.launch_count();
-                    assert!(layer.ms_mla_decode(&rejected, &mut cache, meta).is_err());
-                    assert_eq!(
-                        gpu.launch_count(),
-                        count,
-                        "bad O plan must reject before cache/index writes"
-                    );
-                }
-            }
-            let before = gpu.launch_count();
-            let args_before = gpu.1.lock().unwrap().len();
-            let alloc_before = gpu.alloc_count();
-            let copies_before = gpu.d2h_blocking_count();
-            layer.ms_mla_decode(&c, &mut cache, meta).unwrap();
-            assert_eq!(gpu.alloc_count(), alloc_before, "no forward allocation");
-            let args = gpu.1.lock().unwrap();
-            let calls = &args[args_before..];
-            let batched = std::env::var("ATLAS_GLM_K3_MLA_O_BATCHM").as_deref() == Ok("1");
-            let compare = std::env::var("ATLAS_GLM_K3_MLA_O_COMPARE").as_deref() == Ok("1");
-            assert_eq!(
-                gpu.d2h_blocking_count() - copies_before,
-                if compare { 2 } else { 0 },
-                "only diagnostic mode reads both full output buffers"
-            );
-            let o_weight = layer
-                .mla
-                .as_ref()
-                .unwrap()
-                .wo
-                .weight
-                .0
-                .to_ne_bytes()
-                .to_vec();
-            let o_calls: Vec<_> = calls
-                .iter()
-                .enumerate()
-                .filter(|(_, (k, a))| (*k == 806 || *k == 807) && a[1] == o_weight)
-                .collect();
-            assert_eq!(
-                o_calls.len(),
-                if compare {
-                    4
-                } else if batched {
-                    1
-                } else {
-                    3
-                }
-            );
-            let extracted: Vec<_> = calls
-                .iter()
-                .enumerate()
-                .filter(|(_, (k, a))| *k == 808 && a[3] == 256_u32.to_ne_bytes())
-                .collect();
-            assert_eq!(extracted.len(), 3);
-            let prefix_writes: Vec<_> = calls
-                .iter()
-                .filter(|(k, a)| {
-                    *k == 806
-                        && (a[2] == arena.ssm_qkvz().0.to_ne_bytes()
-                            || a[2] == arena.ssm_qkvz().offset(256).0.to_ne_bytes())
-                        && a[3] == 128_u32.to_ne_bytes()
-                })
-                .collect();
-            assert_eq!(
-                prefix_writes.len(),
-                6,
-                "three serial key/gate writes stay in512-byte prefix"
-            );
-            for (i, (_, (_, a))) in extracted.iter().enumerate() {
-                let offset = if batched { 512 + i * 8192 * 2 } else { 0 };
-                assert_eq!(a[2], arena.ssm_qkvz().offset(offset).0.to_ne_bytes());
-            }
-            if compare {
-                let scalar: Vec<_> = o_calls.iter().filter(|(_, (k, _))| *k == 806).collect();
-                assert_eq!(scalar.len(), 3);
-                for i in 0..3 {
-                    assert_eq!(
-                        scalar[i].0,
-                        extracted[i].0 + 1,
-                        "scalar baseline must immediately follow its V extract"
-                    );
-                    let a = &scalar[i].1.1;
-                    assert_eq!(
-                        a[0],
-                        arena.ssm_qkvz().offset(512 + i * 8192 * 2).0.to_ne_bytes()
-                    );
-                    assert_eq!(
-                        a[2],
-                        arena.moe_output().offset(i * 4096 * 2).0.to_ne_bytes()
-                    );
-                }
-            }
-            if batched {
-                let batched_o = o_calls.iter().find(|(_, (k, _))| *k == 807).unwrap();
-                assert!(
-                    batched_o.0 > extracted[2].0,
-                    "O must follow third V extraction"
-                );
-                assert_eq!(calls.last().unwrap().0, 807);
-                let a = &batched_o.1.1;
-                assert_eq!(a[0], arena.ssm_qkvz().offset(512).0.to_ne_bytes());
-                let expected_output = if compare {
-                    arena.attn_output()
-                } else {
-                    arena.moe_output()
-                };
-                assert_eq!(a[2], expected_output.0.to_ne_bytes());
-                assert_eq!(
-                    &a[3..],
-                    &[3_u32, 4096, 8192, 4096].map(|v| v.to_ne_bytes().to_vec())
-                );
-            }
-            drop(args);
-            let launches = gpu.launches_snapshot();
-            let index: Vec<_> = launches[before..]
-                .iter()
-                .filter(|x| (801..=804).contains(&x.func) || x.func == sparse_kernel)
-                .map(|x| x.func)
-                .collect();
-            let mut expected = vec![];
-            for pos in positions {
-                expected.extend([801, 802]);
-                if pos + 1 > 2048 {
-                    expected.extend([803, sparse_kernel]);
-                }
-            }
-            assert_eq!(
-                index, expected,
-                "causal rows must maintain index before selecting sparse attention"
-            );
-        }
-    });
-}
+
+#[path = "mla_causal_dispatch_tests.rs"]
+mod causal_dispatch_tests;

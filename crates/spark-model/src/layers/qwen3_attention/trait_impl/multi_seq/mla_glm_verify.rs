@@ -160,6 +160,7 @@ impl Qwen3AttentionLayer {
         position: usize,
         d: &MlaDims,
         stream: u64,
+        index_query: Option<DevicePtr>,
     ) -> Result<bool> {
         if !glm_long_context::enabled(&c.fwd.config.model_type) {
             return Ok(false);
@@ -171,13 +172,14 @@ impl Qwen3AttentionLayer {
         };
         // q_latent survives the zero-RoPE chain. Index scratch overwrites only
         // consumed Q expansion / K/V assembly; normed and absorbed Q stay live.
-        let selected = self.glm_index_decode_update_and_select(
+        let selected = self.glm_index_decode_update_and_select_with_query(
             normed,
             q_latent,
             position as u32,
             cache,
             &row_ctx,
             stream,
+            index_query,
         )?;
         let Some((ids, width)) = selected else {
             return Ok(false);

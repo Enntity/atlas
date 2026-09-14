@@ -19,70 +19,79 @@ impl Qwen3AttentionLayer {
         stream: u64,
         position: usize,
         staged_v: Option<DevicePtr>,
+        prepared_query: Option<super::k3_query::QueryRow>,
     ) -> Result<()> {
         let gpu = c.fwd.gpu;
         let buffers = c.fwd.buffers;
 
         // ── Step 1: Q latent → norm → expand ──
-        let q_latent = buffers.ssm_ba();
-        if let Some(ref wqa_nvfp4) = mla.wq_a_nvfp4 {
-            self.nvfp4_decode_gemv(
-                gpu,
-                c.fwd.levers.gemv_sw,
-                normed,
-                wqa_nvfp4,
-                q_latent,
-                d.q_lora,
-                d.h,
-                stream,
-            )?;
+        let (q_latent, q_full, index_query) = if let Some(query) = prepared_query {
+            // The opt-in K3 query stage has already completed Qa, the exact
+            // in-place RMS, Qb, and index-Q for every row.  Keep every causal
+            // operation below on this row's retained slices.
+            (query.q_latent, query.q_full, Some(query.index_query))
         } else {
-            ops::dense_gemv(
+            let q_latent = buffers.ssm_ba();
+            if let Some(ref wqa_nvfp4) = mla.wq_a_nvfp4 {
+                self.nvfp4_decode_gemv(
+                    gpu,
+                    c.fwd.levers.gemv_sw,
+                    normed,
+                    wqa_nvfp4,
+                    q_latent,
+                    d.q_lora,
+                    d.h,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemv(
+                    gpu,
+                    self.dense_gemv_k,
+                    normed,
+                    &mla.wq_a,
+                    q_latent,
+                    d.q_lora,
+                    d.h,
+                    stream,
+                )?;
+            }
+            ops::rms_norm(
                 gpu,
-                self.dense_gemv_k,
-                normed,
-                &mla.wq_a,
+                self.rms_norm_w_k,
                 q_latent,
+                &mla.q_a_norm,
+                q_latent,
+                1,
                 d.q_lora,
-                d.h,
+                d.eps,
                 stream,
             )?;
-        }
-        ops::rms_norm(
-            gpu,
-            self.rms_norm_w_k,
-            q_latent,
-            &mla.q_a_norm,
-            q_latent,
-            1,
-            d.q_lora,
-            d.eps,
-            stream,
-        )?;
-        let q_full = buffers.ssm_deinterleaved();
-        if let Some(ref wqb_nvfp4) = mla.wq_b_nvfp4 {
-            self.nvfp4_decode_gemv(
-                gpu,
-                c.fwd.levers.gemv_sw,
-                q_latent,
-                wqb_nvfp4,
-                q_full,
-                d.q_dim,
-                d.q_lora,
-                stream,
-            )?;
-        } else {
-            ops::dense_gemv(
-                gpu,
-                self.dense_gemv_k,
-                q_latent,
-                &mla.wq_b,
-                q_full,
-                d.q_dim,
-                d.q_lora,
-                stream,
-            )?;
-        }
+            let q_full = buffers.ssm_deinterleaved();
+            if let Some(ref wqb_nvfp4) = mla.wq_b_nvfp4 {
+                self.nvfp4_decode_gemv(
+                    gpu,
+                    c.fwd.levers.gemv_sw,
+                    q_latent,
+                    wqb_nvfp4,
+                    q_full,
+                    d.q_dim,
+                    d.q_lora,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemv(
+                    gpu,
+                    self.dense_gemv_k,
+                    q_latent,
+                    &mla.wq_b,
+                    q_full,
+                    d.q_dim,
+                    d.q_lora,
+                    stream,
+                )?;
+            }
+            (q_latent, q_full, None)
+        };
 
         // ── Step 2: Q_absorbed (Q_nope @ W_UK_T) ──
         let q_absorbed_buf = buffers.expert_up_out();
@@ -281,6 +290,7 @@ impl Qwen3AttentionLayer {
             position,
             &d,
             stream,
+            index_query,
         )? {
             ops::paged_decode_attn_bf16(
                 gpu,

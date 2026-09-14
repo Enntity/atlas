@@ -101,6 +101,10 @@ impl Qwen3AttentionLayer {
         }
 
         let o_stage = self.glm_k3_o_stage(c, mla, long_verify, o_out)?;
+        let query_stage = self.glm_k3_query_stage(c, mla, long_verify)?;
+        if let Some(plan) = query_stage {
+            plan.project(self, c, mla)?;
+        }
         for i in 0..c.n {
             let normed_i = c.normed.offset(i * c.h * bf16);
             // Per-sequence metadata views. The batched metadata packs
@@ -208,6 +212,7 @@ impl Qwen3AttentionLayer {
                 stream,
                 c.seq_lens[i],
                 o_stage.map(|p| p.row(i)).transpose()?,
+                query_stage.map(|p| p.row(i)).transpose()?,
             )?;
             if let Some(plan) = o_stage {
                 plan.capture_scalar(c.fwd.gpu, self.dense_gemv_k, &mla.wo, i, stream)?;
@@ -254,3 +259,5 @@ mod long_context_tests;
 
 #[path = "mla_k3_o.rs"]
 mod k3_o;
+#[path = "mla_k3_query.rs"]
+mod k3_query;

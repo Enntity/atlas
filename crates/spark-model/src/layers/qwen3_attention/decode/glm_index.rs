@@ -121,6 +121,30 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<(DevicePtr, u32)>> {
+        self.glm_index_decode_update_and_select_with_query(
+            normed, q_latent, pos, kv_cache, ctx, stream, None,
+        )
+    }
+
+    /// Variant used by the repaired K3 query stage.  Index maintenance and
+    /// selection stay exactly where the scalar consumer performs them; only
+    /// the stateless index-Q projection can be supplied from retained scratch.
+    pub(in crate::layers::qwen3_attention) fn glm_index_decode_update_and_select_with_query(
+        &self,
+        normed: DevicePtr,
+        q_latent: DevicePtr,
+        pos: u32,
+        kv_cache: &PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+        precomputed_query: Option<DevicePtr>,
+    ) -> Result<Option<(DevicePtr, u32)>> {
+        if let Some(query) = precomputed_query {
+            ensure!(
+                !query.is_null() && query.0 % 16 == 0,
+                "GLM sparse decode precomputed index query is invalid"
+            );
+        }
         self.glm_index_decode_update(normed, kv_cache, ctx, stream)?;
         let mla = self.mla.as_ref().expect("GLM decode index without MLA");
         let indexer = mla
@@ -148,17 +172,22 @@ impl Qwen3AttentionLayer {
         let pool_size = spec.tokens_per_pool as u32;
         let logits_stride = seq_len.div_ceil(pool_size);
         let output_width = topk + pool_size - 1;
-        let query = ctx.buffers.ssm_deinterleaved();
-        ops::dense_gemv(
-            ctx.gpu,
-            self.dense_gemv_k,
-            q_latent,
-            &indexer.wq_b,
-            query,
-            index_heads * index_dim,
-            mla.q_lora_rank as u32,
-            stream,
-        )?;
+        let query = if let Some(query) = precomputed_query {
+            query
+        } else {
+            let query = ctx.buffers.ssm_deinterleaved();
+            ops::dense_gemv(
+                ctx.gpu,
+                self.dense_gemv_k,
+                q_latent,
+                &indexer.wq_b,
+                query,
+                index_heads * index_dim,
+                mla.q_lora_rank as u32,
+                stream,
+            )?;
+            query
+        };
         let weights = ctx.buffers.ssm_gates();
         ops::dense_gemv(
             ctx.gpu,
