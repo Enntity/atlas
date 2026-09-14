@@ -144,6 +144,7 @@ pub struct MoeLayer {
     /// `--fmad=false` build) at ~2x speed. `KernelHandle(0)` on miss → the
     /// pinned scalar kernel. Used ONLY by `router_gate_gemm_dense`.
     dense_gemm_router: KernelHandle,
+    router_prefill_bn32: KernelHandle,
     /// Exact-M=5, scalar-order router specialization for GLM verification.
     dense_gemm_router_m5: KernelHandle,
     dense_gemm_pipelined: KernelHandle,
@@ -584,6 +585,7 @@ mod m5_projection_oracle;
 mod m5_projections;
 mod mmq_layout;
 mod router_bn4;
+mod router_prefill_bn32;
 mod shared_fp8_cache_bytes;
 mod shared_m16;
 pub(crate) use m5_projections::validate_m5_projection_graphs;

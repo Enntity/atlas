@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Exact-weight M3 O projection after three causal, serial MLA rows.
+use crate::{layers::ops, weight_map::DenseWeight};
+use anyhow::{Result, bail, ensure};
+use atlas_core::config::ModelConfig;
+use spark_runtime::{
+    gpu::{DevicePtr, GpuBackend, KernelHandle},
+    kv_cache::KvCacheDtype,
+};
+#[path = "glm_k3_mla_o_compare.rs"]
+pub(super) mod compare;
+const FLAG: &str = "ATLAS_GLM_K3_MLA_O_BATCHM";
+const PREFIX: usize = 2 * 128 * 2; // index keys and gates, both BF16
+const ROW: usize = 8192 * 2;
+const OUTPUT: usize = 3 * 4096 * 2;
+fn parse_flag(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => bail!("{FLAG} must be 0 or 1"),
+    }
+}
+pub(crate) fn enabled(model: &str) -> Result<bool> {
+    if model != "glm5_next" {
+        return Ok(false);
+    }
+    match std::env::var(FLAG) {
+        Ok(v) => parse_flag(Some(&v)),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(_) => bail!("{FLAG} must be 0 or 1"),
+    }
+}
+fn validate_weight(ptr: DevicePtr, n: usize, k: usize) -> Result<()> {
+    ensure!(
+        n == 4096 && k == 8192 && ptr.0 != 0 && ptr.0 % 16 == 0,
+        "{FLAG} requires aligned resident BF16 O[4096,8192]"
+    );
+    Ok(())
+}
+/// Target-only loader hook, after BF16 conversion/sharding, before KV sizing.
+/// The TP1 appended predictor is deliberately excluded by the caller.
+pub(crate) fn initialize(
+    gpu: &dyn GpuBackend,
+    config: &ModelConfig,
+    dtype: KvCacheDtype,
+    ptr: DevicePtr,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let compare = compare::enabled(&config.model_type)?;
+    if !enabled(&config.model_type)? {
+        return Ok(());
+    }
+    ensure!(
+        config.hidden_size == 4096
+            && config.num_attention_heads == 32
+            && config.v_head_dim == 256
+            && config.qk_rope_head_dim == 0
+            && config.tp_world_size == 2
+            && config.ep_world_size == 2
+            && dtype == KvCacheDtype::Bf16
+            && super::glm_long_context::enabled(&config.model_type)
+            && crate::speculative::glm_repair_policy::enabled(),
+        "{FLAG} requires repaired long-context GLM TP2/EP2 BF16 MLA"
+    );
+    validate_weight(ptr, n, k)?;
+    if compare {
+        ensure!(
+            gpu.kernel("gemv", "dense_gemv_bf16")?.0 != 0,
+            "ATLAS_GLM_K3_MLA_O_COMPARE: scalar kernel unavailable"
+        );
+        tracing::warn!(
+            "GLM K3 MLA O comparison enabled: diagnostic synchronization; not for performance"
+        );
+    }
+    ensure!(
+        gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?
+            .0
+            != 0,
+        "{FLAG}: batchm kernel unavailable"
+    );
+    tracing::info!(
+        "GLM K3 MLA O batchm initialized: local BF16 [4096,8192], causal serial attention"
+    );
+    Ok(())
+}
+fn span(ptr: DevicePtr, bytes: usize) -> Result<(u64, u64)> {
+    ensure!(ptr.0 != 0, "{FLAG}: null staging/liveness pointer");
+    Ok((
+        ptr.0,
+        ptr.0
+            .checked_add(bytes as u64)
+            .ok_or_else(|| anyhow::anyhow!("{FLAG}: address overflow"))?,
+    ))
+}
+fn disjoint(a: (u64, u64), b: (u64, u64)) -> bool {
+    a.1 <= b.0 || b.1 <= a.0
+}
+#[derive(Clone, Copy)]
+pub(in crate::layers::qwen3_attention) struct StagePlan {
+    input: DevicePtr,
+    output: DevicePtr,
+    comparison: Option<DevicePtr>,
+}
+impl StagePlan {
+    pub(in crate::layers::qwen3_attention) fn new(
+        scratch: DevicePtr,
+        capacity: usize,
+        output: DevicePtr,
+        output_capacity: usize,
+        live: &[(DevicePtr, usize)],
+    ) -> Result<Self> {
+        ensure!(
+            capacity >= PREFIX + 3 * ROW && output_capacity >= OUTPUT,
+            "{FLAG}: need49664 scratch bytes and24576 output bytes"
+        );
+        ensure!(
+            scratch.0 % 16 == 0 && output.0 % 2 == 0,
+            "{FLAG}: invalid operand alignment"
+        );
+        let whole = span(scratch, PREFIX + 3 * ROW)?;
+        let retained = (whole.0 + PREFIX as u64, whole.1);
+        let out = span(output, OUTPUT)?;
+        ensure!(disjoint(whole, out), "{FLAG}: staging/output alias");
+        for &(ptr, bytes) in live {
+            let other = span(ptr, bytes)?;
+            ensure!(
+                disjoint(retained, other),
+                "{FLAG}: retained MLA rows alias live scratch/input"
+            );
+        }
+        Ok(Self {
+            input: DevicePtr(retained.0),
+            output,
+            comparison: None,
+        })
+    }
+    pub(in crate::layers::qwen3_attention) fn row(self, i: usize) -> Result<DevicePtr> {
+        ensure!(i < 3, "{FLAG}: staging row outside K3");
+        Ok(self.input.offset(i * ROW))
+    }
+    pub(in crate::layers::qwen3_attention) fn project(
+        self,
+        gpu: &dyn GpuBackend,
+        kernel: KernelHandle,
+        weight: &DenseWeight,
+        stream: u64,
+    ) -> Result<()> {
+        validate_weight(weight.weight, 4096, 8192)?;
+        ensure!(kernel.0 != 0, "{FLAG}: batchm kernel unavailable");
+        ops::dense_gemv_batchm(
+            gpu,
+            kernel,
+            self.input,
+            weight,
+            self.comparison.unwrap_or(self.output),
+            3,
+            4096,
+            8192,
+            4096,
+            stream,
+        )
+    }
+}
+#[cfg(test)]
+#[path = "glm_k3_mla_o_tests.rs"]
+mod tests;

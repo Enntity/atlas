@@ -2,6 +2,9 @@
 use super::*;
 use clap::Parser;
 
+#[path = "long_mtp_tests.rs"]
+mod long_mtp;
+
 // Supply only the I/O boundary; all topology/admission/accounting is production.
 fn prepare_reserve(
     args: &cli::ServeArgs,

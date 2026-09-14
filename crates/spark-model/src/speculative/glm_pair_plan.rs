@@ -4,7 +4,7 @@
 //! identity, or live-state validation occurs here. Callers must bind counts,
 //! generations and normalized hidden ownership to real request state, then
 //! publish the returned state only after all planned cache writes succeed.
-//! Fixed C1/four-draft continuous speculation only; the opt-in GLM repair
+//! Fixed per-owner one-, two- or four-draft speculation only; the opt-in GLM repair
 //! adapter binds these plans to the live request and existing private cache.
 
 use anyhow::{Context, Result, ensure};
@@ -28,6 +28,7 @@ pub struct Limits {
     context_tokens: usize,
     cache_rows: usize,
     staging_rows: usize,
+    drafts: usize,
 }
 
 impl Limits {
@@ -41,27 +42,33 @@ impl Limits {
     ) -> Result<Self> {
         ensure!(
             profile.sequences == 1
-                && profile.drafts == 4
+                && matches!(profile.drafts, 1 | 2 | 4)
                 && profile.continuous
                 && !profile.grammar
                 && !profile.adaptive_depth
                 && !profile.catchup
                 && !profile.carry
                 && !profile.prefix_reuse,
-            "GLM pair repair requires fixed continuous C1 MTP4 without grammar/adaptation/carry/catchup/prefix reuse"
+            "GLM pair repair requires fixed continuous C1 MTP1/MTP2/MTP4 without grammar/adaptation/carry/catchup/prefix reuse"
         );
-        let dense_bound = context_tokens
-            .checked_add(4)
+        context_tokens
+            .checked_add(profile.drafts)
             .context("GLM context overflow")?;
+        let context_limit = if profile.drafts == 2 {
+            super::glm_repair_policy::MAX_LONG_CONTEXT
+        } else {
+            2044
+        };
         ensure!(
-            context_tokens > 0 && dense_bound <= 2048,
-            "GLM context + drafts must be <= 2048"
+            context_tokens > 0 && context_tokens <= context_limit,
+            "GLM context exceeds dense2048 or MTP2 indexed32768 envelope"
         );
         ensure!(cache_rows > 0, "GLM cache capacity must be nonzero");
         Ok(Self {
             context_tokens,
             cache_rows,
             staging_rows,
+            drafts: profile.drafts,
         })
     }
 
@@ -172,8 +179,8 @@ impl Limits {
             "GLM proposal generation mismatch"
         );
         ensure!(
-            drafts == 4,
-            "GLM proposal must retain fixed continuous four-draft depth"
+            drafts == self.drafts,
+            "GLM proposal must retain fixed continuous configured draft depth"
         );
         ensure!(
             position == state.target_position && position < self.context_tokens,
@@ -204,13 +211,13 @@ impl Limits {
             self.staging_rows >= drafts,
             "GLM possible full acceptance exceeds hidden staging capacity"
         );
-        // A K5 forward processes the pending token and four draft inputs.
+        // Verification processes the pending token and every draft input.
         let verify_end = position
             .checked_add(drafts + 1)
             .context("GLM verify position overflow")?;
         ensure!(
-            verify_end <= 2048,
-            "GLM verification exceeds dense 2048 bound"
+            verify_end <= self.context_tokens + self.drafts,
+            "GLM verification exceeds configured context plus draft capacity"
         );
         Ok(ProposalPlan {
             limits: self,
@@ -263,7 +270,7 @@ impl PairState {
 }
 
 /// Sources are indexed within the input's token and normalized-hidden spans.
-/// Bootstrap uses full prompt spans; verified commit uses K5 verify spans.
+/// Bootstrap uses full prompt spans; verified commit uses the issued verify span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PairWrite {
     cache_start: usize,
@@ -320,6 +327,10 @@ pub struct ProposalPlan {
 }
 
 impl ProposalPlan {
+    pub fn drafts(self) -> usize {
+        self.limits.drafts
+    }
+
     pub fn generation(self) -> u64 {
         self.before.generation()
     }
@@ -368,16 +379,16 @@ impl ProposalPlan {
             "GLM verification hidden generation mismatch"
         );
         ensure!(
-            input.accepted <= 4,
-            "GLM accepted count exceeds four drafts"
+            input.accepted <= self.drafts(),
+            "GLM accepted count exceeds issued drafts"
         );
         ensure!(
-            input.verify_token_rows == 5,
-            "GLM verified token span must contain exactly K5 inputs"
+            input.verify_token_rows == self.drafts() + 1,
+            "GLM verified token span must match issued depth plus seed"
         );
         ensure!(
-            input.normalized_hidden_rows >= 5,
-            "GLM normalized hidden span does not cover K5"
+            input.normalized_hidden_rows > self.drafts(),
+            "GLM normalized hidden span does not cover issued width"
         );
         ensure!(
             input.hidden_base_position == self.before.target_position,

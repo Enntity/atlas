@@ -295,34 +295,21 @@ impl TransformerModel {
                 h,
                 stream,
             )?;
-        } else if num_tokens == 5
-            && self.config.model_type == "glm5_next"
-            && self.dense_gemv_batchm_kernel.0 != 0
-            && glm_k5_bf16_lmhead_batchm_enabled()
-        {
-            ops::dense_gemv_batchm(
-                self.gpu.as_ref(),
-                self.dense_gemv_batchm_kernel,
-                hidden,
-                &self.lm_head_weight,
-                logits,
-                num_tokens,
-                v,
-                h,
-                v,
-                stream,
-            )?;
         } else {
-            ops::dense_gemm(
+            super::glm_k3_head::project(
                 self.gpu.as_ref(),
-                self.dense_gemm_kernel,
+                &self.config,
                 hidden,
                 &self.lm_head_weight,
                 logits,
                 num_tokens,
-                v,
-                h,
+                self.dense_gemv_batchm_kernel,
+                self.dense_gemm_kernel,
                 stream,
+                num_tokens == 5
+                    && self.config.model_type == "glm5_next"
+                    && self.dense_gemv_batchm_kernel.0 != 0
+                    && glm_k5_bf16_lmhead_batchm_enabled(),
             )?;
         }
         // Feature-2: overlay overridden logit columns AFTER the base projection,

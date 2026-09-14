@@ -48,7 +48,14 @@ impl Glm5KdaLayer {
             )?;
             return ops::hc_pre_from_raw_mix(
                 ctx.gpu,
-                self.hc_pre_from_raw_mix_k,
+                ops::glm_hc_prefill_finalize_kernel(
+                    ctx.gpu,
+                    &ctx.config.model_type,
+                    self.hc_pre_from_raw_mix_k,
+                    tokens,
+                    self.hidden_size as u32,
+                    hc,
+                )?,
                 ctx.buffers.hc_streams(),
                 raw_mix,
                 site.hc_scale,

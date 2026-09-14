@@ -327,6 +327,8 @@ pub struct SafetensorsLoader {
     /// OPT-IN: a model that DOES build an MTP head must keep them, so this is
     /// set only where `load_mtp_weights` is known to return `None`.
     pub skip_mtp: bool,
+    /// Exact tensor prefix of an unused appended predictor layer; default retains it.
+    pub skip_layer_prefix: Option<String>,
 }
 
 impl Default for SafetensorsLoader {
@@ -347,6 +349,7 @@ impl SafetensorsLoader {
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layer_prefix: None,
         }
     }
 
@@ -361,6 +364,7 @@ impl SafetensorsLoader {
             peak_memory_multiplier: None,
             skip_activation_scales: false,
             skip_mtp: false,
+            skip_layer_prefix: None,
         }
     }
 
@@ -368,6 +372,13 @@ impl SafetensorsLoader {
     /// Skips `*.experts.{E}.*` tensors where E is not in local range.
     /// MTP head experts are never skipped (small, fully replicated).
     fn should_skip_tensor(&self, name: &str) -> bool {
+        if self
+            .skip_layer_prefix
+            .as_ref()
+            .is_some_and(|prefix| name.starts_with(prefix))
+        {
+            return true;
+        }
         // MTP head weights for a model whose loader does not build one.
         if self.skip_mtp && name.starts_with("mtp.") {
             return true;
@@ -434,20 +445,11 @@ pub(crate) use loader::check_oom_guard;
 pub(crate) use loader::estimate_has_fp8;
 
 #[cfg(test)]
-mod expert_filter_tests {
-    use super::SafetensorsLoader;
+#[path = "weights/appended_skip_tests.rs"]
+mod appended_skip_tests;
 
-    #[test]
-    fn replicated_prefix_overrides_ep_expert_filter() {
-        let mut loader = SafetensorsLoader::with_ep(1, 2, 288);
-        let appended = "model.language_model.layers.45.mlp.experts.1.gate_proj.weight";
-        let target = "model.language_model.layers.44.mlp.experts.1.gate_proj.weight";
-        assert!(loader.should_skip_tensor(appended));
-        loader.replicated_expert_prefix = Some(".layers.45.".into());
-        assert!(!loader.should_skip_tensor(appended));
-        assert!(loader.should_skip_tensor(target));
-    }
-}
+#[cfg(test)]
+mod expert_filter_tests;
 
 #[cfg(test)]
 mod from_str_tests;

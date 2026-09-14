@@ -6,7 +6,10 @@ use crate::speculative::glm_repair::{GlmPairRepair, RepairInput, RepairSpan};
 
 #[test]
 fn real_writer_bootstrap_then_every_verdict_stages_only_accepted_rows() {
-    for accepted in 0..=4 {
+    for (drafts, accepted) in [1, 2, 4]
+        .into_iter()
+        .flat_map(|d| (0..=d).map(move |a| (d, a)))
+    {
         fixture_rows(8, |head, ctx, gpu, seen| {
             let capture = gpu.alloc(64 * 1024).unwrap();
             let bonus = gpu.alloc(1024).unwrap();
@@ -18,7 +21,7 @@ fn real_writer_bootstrap_then_every_verdict_stages_only_accepted_rows() {
                 tokens: &tokens,
                 prompt_len: 2,
                 position: 3,
-                drafts: 4,
+                drafts,
                 generation: 1,
                 capture_generation: 1,
                 captured_rows: 2,
@@ -38,6 +41,14 @@ fn real_writer_bootstrap_then_every_verdict_stages_only_accepted_rows() {
                 hidden_row: 0,
             };
             let copies = gpu.d2d_count();
+            let short_verify = RepairInput {
+                normalized: RepairSpan {
+                    bytes: drafts * 1024,
+                    ..input.normalized
+                },
+                ..input
+            };
+            assert!(head.validate_prepare(&short_verify, &state, ctx).is_err());
             head.validate_prepare(&input, &state, ctx).unwrap();
             assert_eq!(gpu.d2d_count(), copies);
             assert!(state.block_table.is_empty());
@@ -45,14 +56,22 @@ fn real_writer_bootstrap_then_every_verdict_stages_only_accepted_rows() {
             assert_eq!(state.seq_len, 2);
             assert_eq!(*seen.lock(), [0, 1]);
             assert!(matches!(state.repair, RepairPhase::Proposed(_)));
-            // Stand in for the four completed autoregressive proposal writes.
-            state.seq_len += 4;
-            state.last_num_drafted = 4;
-            let verified = [3, 4, 5, 6, 7];
+            // Stand in for the completed autoregressive proposal writes.
+            state.seq_len += drafts;
+            state.last_num_drafted = drafts;
+            let verified = &[3, 4, 5, 6, 7][..drafts + 1];
             let mut committed_tokens = tokens.clone();
             committed_tokens.extend_from_slice(&verified[..accepted + 1]);
             state
-                .record_verified(1, 1, 3, &verified, accepted, committed_tokens.len(), 5)
+                .record_verified(
+                    1,
+                    1,
+                    3,
+                    verified,
+                    accepted,
+                    committed_tokens.len(),
+                    drafts + 1,
+                )
                 .unwrap();
             state.repair.acknowledge(accepted).unwrap();
             let target: Vec<u8> = (0..5).flat_map(|i| vec![0x70 + i; 1024]).collect();
@@ -66,6 +85,12 @@ fn real_writer_bootstrap_then_every_verdict_stages_only_accepted_rows() {
                 ..input
             };
             let start = seen.lock().len();
+            let wrong_depth = RepairInput {
+                drafts: if drafts == 1 { 4 } else { 1 },
+                ..input
+            };
+            assert!(head.validate_prepare(&wrong_depth, &state, ctx).is_err());
+            assert_eq!(seen.lock().len(), start);
             head.prepare(&input, &mut state, ctx, 0).unwrap();
             assert_eq!(state.seq_len, 3 + accepted);
             assert_eq!(

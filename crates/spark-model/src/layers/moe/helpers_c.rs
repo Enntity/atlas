@@ -283,6 +283,17 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_router_prefill_bn32(
+            router_in,
+            gate_logits,
+            num_tokens,
+            num_experts,
+            hidden_size,
+            ctx,
+            stream,
+        )? {
+            return Ok(());
+        }
         if ctx.config.model_type == "glm5_next"
             && num_tokens == 5
             && num_experts == 288

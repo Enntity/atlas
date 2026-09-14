@@ -78,9 +78,18 @@ pub(crate) fn preflight_reserve(
     free_mem: usize,
 ) -> Result<ReservePreflight> {
     let independent = spark_model::model::glm_independent::enabled(&config.model_type)?;
-    // Both selected dispatchers retain TP-local topology and the exact row
-    // budget. Paired MTP still reserves its speculative intermediates/headroom.
-    let bounded = independent || args.glm_paired_mtp;
+    let long_mtp = spark_model::speculative::glm_repair_policy::long_context_enabled();
+    anyhow::ensure!(
+        !long_mtp || spark_model::speculative::glm_repair_policy::enabled(),
+        "GLM long-context MTP requires repaired ownership"
+    );
+    anyhow::ensure!(
+        !long_mtp || (!args.glm_paired_mtp && !independent),
+        "GLM long-context MTP2 uses its retained serial verifier, not another dispatcher"
+    );
+    // Selected dispatchers retain TP-local topology and the exact row budget.
+    // Speculative profiles keep their intermediates and full CUDA headroom.
+    let bounded = independent || args.glm_paired_mtp || long_mtp;
     if spark_model::speculative::glm_repair_policy::parse(
         std::env::var("ATLAS_GLM_MTP_REPAIR").ok().as_deref(),
     )? {
@@ -106,6 +115,7 @@ pub(crate) fn preflight_reserve(
                 .as_deref()
                 .map(|v| v == "force")
                 .unwrap_or_else(|| std::env::var("ATLAS_MTP_GATE_FORCE").as_deref() == Ok("1")),
+            long_context: long_mtp,
         }
         .validate()?;
         spark_model::speculative::glm_repair_policy::validate_environment()?;
@@ -132,12 +142,20 @@ pub(crate) fn preflight_reserve(
             config.max_position_embeddings,
         );
         let ep_v2 = matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"));
+        anyhow::ensure!(
+            !long_mtp || args.max_batch_size == 1 || ep_v2,
+            "GLM concurrent MTP2 requires ATLAS_EP_PROTOCOL=v2 for owner slot identity"
+        );
         let c4 = spark_model::model::glm_c4::enabled(&config.model_type);
         anyhow::ensure!(
             independent || std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() != Ok("1") || c4,
             "ATLAS_GLM_C4_GROUPED_MOE=1 requires ATLAS_GLM_C4_DECODE=1"
         );
-        if !independent && !args.glm_paired_mtp && (c4 || c4_sparse || args.max_batch_size == 4) {
+        if !independent
+            && !args.glm_paired_mtp
+            && !long_mtp
+            && (c4 || c4_sparse || args.max_batch_size == 4)
+        {
             spark_model::model::glm_c4::validate_prefill_budget(
                 args.max_prefill_tokens,
                 c4_sparse,
@@ -163,6 +181,7 @@ pub(crate) fn preflight_reserve(
         }
         anyhow::ensure!(
             independent
+                || long_mtp
                 || args.glm_paired_mtp
                 || glm5_concurrency_supported(args.max_batch_size, args.max_num_seqs, ep_v2, c4),
             "GLM-5 dual-Spark concurrency supports --max-batch-size 1..=3 and \
@@ -170,14 +189,15 @@ pub(crate) fn preflight_reserve(
              batches above one require ATLAS_EP_PROTOCOL=v2"
         );
         anyhow::ensure!(
-            glm5_long_context_concurrency_supported(
-                args.max_seq_len,
-                config.index_topk,
-                args.max_batch_size,
-                args.max_num_seqs,
-                sparse_decode,
-                c4_sparse,
-            ),
+            long_mtp
+                || glm5_long_context_concurrency_supported(
+                    args.max_seq_len,
+                    config.index_topk,
+                    args.max_batch_size,
+                    args.max_num_seqs,
+                    sparse_decode,
+                    c4_sparse,
+                ),
             "GLM-5 context above index_topk={} requires one active/admitted sequence, opt-in sparse C2/C3, or guarded eager ATLAS_GLM_C4_SPARSE=1",
             config.index_topk,
         );
@@ -187,16 +207,18 @@ pub(crate) fn preflight_reserve(
         );
         if args.speculative {
             anyhow::ensure!(
-                glm5_mtp_context_supported(
-                    args.max_seq_len,
-                    args.resolved_num_drafts(),
-                    config.index_topk,
-                ),
+                long_mtp
+                    || glm5_mtp_context_supported(
+                        args.max_seq_len,
+                        args.resolved_num_drafts(),
+                        config.index_topk,
+                    ),
                 "GLM-5 MTP requires --max-seq-len + max(--num-drafts, 1) <= {}; verifier semantic indexing is not implemented",
                 config.index_topk,
             );
             anyhow::ensure!(
                 args.max_batch_size == 1
+                    || long_mtp
                     || (args.glm_paired_mtp && (2..=8).contains(&args.max_batch_size)),
                 "GLM-5 MTP requires C1 or the supervised bounded-owner dispatcher"
             );
@@ -239,7 +261,7 @@ pub(crate) fn preflight_reserve(
     // Selected FP32 pools allocate one additional live dummy slot.
     // It has no prefix/rollback snapshots; do not inflate those counts.
     let live_slots = args.max_batch_size + usize::from(bounded);
-    let ssm_pool_bytes = spark_model::ssm_reserve::ssm_pool_reserve_bytes(
+    let mut ssm_pool_bytes = spark_model::ssm_reserve::ssm_pool_reserve_bytes(
         live_slots,
         config.num_ssm_layers() * h_state_bytes,
         config.num_ssm_layers() * conv_state_bytes,
@@ -257,6 +279,25 @@ pub(crate) fn preflight_reserve(
         // is the separate term below.
         spark_model::ssm_reserve::ssm_rollback_mode(),
     );
+    if long_mtp {
+        // SsmStatePool also allocates an MTP dummy, separate from the live
+        // dummy above. Its H snapshots always have full width, irrespective
+        // of the real slots' ladder. Keep all of its bytes outside headroom.
+        let dummy = spark_model::ssm_reserve::ssm_pool_reserve_bytes(
+            0,
+            config.num_ssm_layers() * h_state_bytes,
+            config.num_ssm_layers() * conv_state_bytes,
+            true,
+            args.resolved_num_drafts(),
+            1,
+            true,
+            spark_model::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
+            spark_model::ssm_reserve::ssm_rollback_mode(),
+        );
+        ssm_pool_bytes = ssm_pool_bytes
+            .checked_add(dummy)
+            .context("long MTP dummy reserve overflow")?;
+    }
     // Replay-mode verify-window input ring (EXPERIMENTAL scaffold): sized by
     // the SAME SSOT `SsmStatePool::new` allocates through. K ceiling is the
     // MTP `num_drafts + 1` — matching this preflight's existing convention
@@ -273,7 +314,7 @@ pub(crate) fn preflight_reserve(
                 config.linear_num_value_heads,
             ),
             args.resolved_num_drafts() + 1,
-            mtp_state_slots,
+            mtp_state_slots + usize::from(long_mtp),
         )
     } else {
         0
@@ -404,7 +445,28 @@ pub(crate) fn preflight_reserve(
     } else {
         0
     };
-    let inference_reserve: usize = if bounded {
+    let repair_private_bytes = if long_mtp {
+        let private = spark_model::layers::Glm5MtpHead::repair_private_reserve_bytes(
+            config,
+            args.max_seq_len,
+        )?;
+        let capture = args
+            .max_seq_len
+            .checked_mul(config.hidden_size)
+            .and_then(|n| n.checked_mul(2))
+            .context("GLM MTP prompt capture reserve overflow")?;
+        tracing::info!(
+            "GLM MTP2 owned reserve: private={} MiB, prompt_capture={} MiB",
+            private / (1024 * 1024),
+            capture / (1024 * 1024)
+        );
+        private
+            .checked_add(capture)
+            .context("GLM MTP private reserve overflow")?
+    } else {
+        0
+    };
+    let inference_reserve: usize = if bounded || long_mtp {
         [
             ssm_pool_bytes,
             ssm_h_stage_bytes,
@@ -413,6 +475,7 @@ pub(crate) fn preflight_reserve(
             gdn_two_phase_bytes,
             cuda_headroom,
             paired_private_bytes,
+            repair_private_bytes,
         ]
         .into_iter()
         .try_fold(0usize, |sum, bytes| sum.checked_add(bytes))

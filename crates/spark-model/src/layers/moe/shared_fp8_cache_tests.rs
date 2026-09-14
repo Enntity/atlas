@@ -196,3 +196,99 @@ fn verify_profile_requires_explicit_no_overlap_before_weight_loading() {
         assert!(validate_verify_overlap(false, value).is_ok());
     }
 }
+
+#[test]
+fn explicit_2048_profile_checks_flag_and_configured_budget_before_loading() {
+    const CHILD: &str = "ATLAS_TEST_SHARED_2048_PROFILE";
+    if let Ok(value) = std::env::var(CHILD) {
+        let enabled = matches!(value.as_str(), "1");
+        if matches!(value.as_str(), "bad") {
+            assert!(prefill_2048_enabled().is_err());
+            assert!(validate_shared_fp8_cache_profile(&config(), 1024, false).is_err());
+            return;
+        }
+        assert_eq!(prefill_2048_enabled().unwrap(), enabled);
+        for rows in [1, 1024, 1025, 2048, 2049, 2052, 0] {
+            assert_eq!(
+                validate_shared_fp8_cache_profile(&config(), rows, false).is_ok(),
+                (1..=if enabled { 2048 } else { 1024 }).contains(&rows)
+            );
+        }
+        return;
+    }
+    for value in ["0", "1", "bad"] {
+        let full = concat!(
+            module_path!(),
+            "::explicit_2048_profile_checks_flag_and_configured_budget_before_loading"
+        );
+        let test = full.split_once("::").expect("crate-qualified test").1;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test])
+            .env(CHILD, value)
+            .env("ATLAS_GLM_PREFILL_2048", value)
+            .env("ATLAS_GLM_PREFILL_4096", "0")
+            .env("ATLAS_GLM_TARGET_SHARED_FP8", "1")
+            .env("ATLAS_GLM_TARGET_SHARED_FP8_VERIFY", "0")
+            .env("ATLAS_GLM_K5_BATCHED_SHARED", "0")
+            .env("ATLAS_NVFP4_MMQ_MOE", "0")
+            .env("ATLAS_MOE_GROUPED_CUTLASS", "0")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("running 1 test"),
+            "profile={value}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn explicit_4096_profile_bounds_and_conflicting_flags_fail_before_loading() {
+    const CHILD: &str = "ATLAS_TEST_SHARED_4096_PROFILE";
+    if let Ok(case) = std::env::var(CHILD) {
+        for rows in [0, 1, 1024, 1025, 2048, 2049, 4096, 4097, 4100] {
+            assert_eq!(
+                validate_shared_fp8_cache_profile(&config(), rows, false).is_ok(),
+                match case.as_str() {
+                    "on" => (1..=4096).contains(&rows),
+                    "off" => (1..=1024).contains(&rows),
+                    "both" | "bad" => false,
+                    _ => unreachable!(),
+                },
+                "case={case} rows={rows}"
+            );
+        }
+        return;
+    }
+    let full = concat!(
+        module_path!(),
+        "::explicit_4096_profile_bounds_and_conflicting_flags_fail_before_loading"
+    );
+    let test = full.split_once("::").unwrap().1;
+    for (case, two, four) in [
+        ("on", "0", "1"),
+        ("off", "0", "0"),
+        ("both", "1", "1"),
+        ("bad", "0", "true"),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test])
+            .env(CHILD, case)
+            .env("ATLAS_GLM_PREFILL_2048", two)
+            .env("ATLAS_GLM_PREFILL_4096", four)
+            .env("ATLAS_GLM_TARGET_SHARED_FP8", "1")
+            .env("ATLAS_GLM_TARGET_SHARED_FP8_VERIFY", "0")
+            .env("ATLAS_GLM_K5_BATCHED_SHARED", "0")
+            .env("ATLAS_NVFP4_MMQ_MOE", "0")
+            .env("ATLAS_MOE_GROUPED_CUTLASS", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{case}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

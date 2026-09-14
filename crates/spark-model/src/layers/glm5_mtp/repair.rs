@@ -4,7 +4,7 @@ use super::kv_rows_plan::DeviceSpan;
 use super::repair_state::RepairPhase;
 use super::*;
 use crate::speculative::glm_pair_plan::{
-    BootstrapInput, FinishPlan, Limits, Profile, ProposalPlan,
+    BootstrapInput, EagerTailInput, FinishPlan, Limits, Profile, ProposalPlan,
 };
 use crate::speculative::glm_repair::{GlmPairRepair, RepairInput, RepairSpan};
 use anyhow::{Context, ensure};
@@ -47,8 +47,8 @@ impl Glm5MtpHead {
             "GLM repair does not own capture generation"
         );
         ensure!(
-            input.tokens.len() == input.position && input.drafts == 4,
-            "GLM repair requires complete live target tokens and four drafts"
+            input.tokens.len() == input.position && matches!(input.drafts, 1 | 2 | 4),
+            "GLM repair requires complete live target tokens and one, two or four drafts"
         );
         ensure!(
             (input.token as usize) < ctx.config.vocab_size,
@@ -64,12 +64,21 @@ impl Glm5MtpHead {
             .checked_mul(2)
             .context("GLM repair row overflow")?;
         ensure!(row_bytes > 0, "GLM repair empty hidden width");
-        let capture = span(input.capture)?;
+        let capture = if let Some(owned) = &state.repair_owned {
+            owned.validate(input.generation, input.prompt_len, row_bytes)?;
+            ensure!(
+                input.drafts == 2,
+                "GLM retained repair requires exactly two drafts"
+            );
+            span(owned.staging())?
+        } else {
+            span(input.capture)?
+        };
         let normalized = span(input.normalized)?;
         let bonus = span(input.bonus)?;
         ensure!(
-            capture.bytes / row_bytes >= 4
-                && normalized.bytes / row_bytes >= 5
+            capture.bytes / row_bytes >= input.drafts
+                && normalized.bytes / row_bytes > input.drafts
                 && bonus.bytes >= row_bytes,
             "GLM repair storage capacity is insufficient"
         );
@@ -87,7 +96,7 @@ impl Glm5MtpHead {
         let limits = Limits::new(
             Profile {
                 sequences: 1,
-                drafts: 4,
+                drafts: input.drafts,
                 continuous: true,
                 grammar: false,
                 adaptive_depth: false,
@@ -100,6 +109,30 @@ impl Glm5MtpHead {
             capture.bytes / row_bytes,
         )?;
         let (finish, tokens, source, stage_from) = match state.repair {
+            RepairPhase::Capture if state.repair_owned.is_some() => {
+                ensure!(
+                    input.hidden_row == 0,
+                    "GLM retained bootstrap needs decoded row zero"
+                );
+                let owned = state.repair_owned.as_ref().expect("guarded above");
+                let finish = limits.bootstrap_eager_tail(EagerTailInput {
+                    generation: input.generation,
+                    prompt_tokens: input.prompt_len,
+                    target_position: input.position,
+                    token_rows: input.tokens.len(),
+                    cached_rows: state.seq_len,
+                    tail_position: input.prompt_len - 1,
+                })?;
+                (
+                    finish,
+                    vec![input.tokens[input.prompt_len]],
+                    DeviceSpan {
+                        ptr: owned.ptr,
+                        bytes: row_bytes,
+                    },
+                    None,
+                )
+            }
             RepairPhase::Capture => {
                 ensure!(
                     input.hidden_row == 0,
@@ -149,7 +182,9 @@ impl Glm5MtpHead {
                         .repair
                         .pending(input.generation, input.position, input.hidden_row)?;
                 ensure!(
-                    state.seq_len == pending.cached_rows && state.last_num_drafted == 4,
+                    state.seq_len == pending.cached_rows
+                        && state.last_num_drafted == pending.drafts
+                        && input.drafts == pending.drafts,
                     "GLM pending private cache changed after verified record"
                 );
                 let finish = pending.plan;
@@ -158,7 +193,7 @@ impl Glm5MtpHead {
                     .checked_mul(row_bytes)
                     .context("GLM staged span overflow")?;
                 ensure!(
-                    rows <= 4 && bytes <= capture.bytes && bytes <= normalized.bytes,
+                    rows <= pending.drafts && bytes <= capture.bytes && bytes <= normalized.bytes,
                     "GLM accepted source exceeds live storage"
                 );
                 let base = input

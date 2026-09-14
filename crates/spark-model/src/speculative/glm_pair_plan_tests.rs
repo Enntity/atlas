@@ -363,3 +363,104 @@ fn finished_request_can_release_without_fabricated_next_proposal() {
     assert_eq!(fresh.state().generation(), 8);
     assert!(limits().propose(fresh.state(), 7, 2, 1, 4).is_err());
 }
+
+#[test]
+fn single_draft_history_keeps_seed_and_full_accept_extra_pair() {
+    let bounds = Limits::new(
+        Profile {
+            drafts: 1,
+            ..profile()
+        },
+        128,
+        144,
+        1,
+    )
+    .unwrap();
+    for eager in [false, true] {
+        let mut state = bounds.bootstrap(bootstrap(3, eager)).unwrap().state();
+        for accepted in [1, 0, 1, 1, 0] {
+            let p = bounds
+                .propose(state, 7, state.target_position(), state.cache_rows(), 1)
+                .unwrap();
+            assert!(
+                bounds
+                    .propose(state, 7, state.target_position(), state.cache_rows(), 4)
+                    .is_err()
+            );
+            let input = VerifiedCommit {
+                verify_token_rows: 2,
+                normalized_hidden_rows: 2,
+                ..verified(&p, accepted)
+            };
+            for bad in [
+                VerifiedCommit {
+                    accepted: 2,
+                    ..input
+                },
+                VerifiedCommit {
+                    verify_token_rows: 5,
+                    ..input
+                },
+                VerifiedCommit {
+                    normalized_hidden_rows: 1,
+                    ..input
+                },
+                VerifiedCommit {
+                    capture_generation: 8,
+                    ..input
+                },
+            ] {
+                assert!(p.finish(Finish::Verified(bad)).is_err());
+            }
+            let next = p.finish(Finish::Verified(input)).unwrap();
+            assert!(next.keep_seed());
+            assert_eq!(next.state().cache_rows(), state.cache_rows() + accepted + 1);
+            assert_eq!(next.bonus_hidden_row(), Some(accepted));
+            assert_eq!(
+                next.write().map(|w| (
+                    w.cache_start(),
+                    w.token_start(),
+                    w.hidden_start(),
+                    w.rows()
+                )),
+                (accepted > 0).then_some((state.cache_rows() + 1, 1, 0, accepted))
+            );
+            state = next.state();
+        }
+    }
+}
+
+#[test]
+fn single_draft_capacity_and_unqualified_depths_fail_before_proposal() {
+    for drafts in [0, 3, 5] {
+        assert!(
+            Limits::new(
+                Profile {
+                    drafts,
+                    ..profile()
+                },
+                128,
+                144,
+                4
+            )
+            .is_err()
+        );
+    }
+    for (cache, staging) in [(4, 1), (5, 0)] {
+        let bounds = Limits::new(
+            Profile {
+                drafts: 1,
+                ..profile()
+            },
+            128,
+            cache,
+            staging,
+        )
+        .unwrap();
+        let state = bounds.bootstrap(bootstrap(3, true)).unwrap().state();
+        assert!(bounds.propose(state, 7, 4, 3, 1).is_err());
+    }
+}
+
+#[path = "glm_pair_plan_long_tests.rs"]
+mod long_tests;

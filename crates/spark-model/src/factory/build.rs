@@ -24,6 +24,8 @@ use crate::model::glm_cache_plan::{GlmCachePlan, GlmMlaShape};
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
+#[path = "glm_mtp_capacity.rs"]
+mod glm_mtp_capacity;
 mod kv_summary;
 
 pub fn build_model(
@@ -89,6 +91,33 @@ pub fn build_model(
         hss_cache_blocks_per_seq,
         dflash_args.is_some(),
         lora_args.is_some(),
+    )?;
+    super::glm_sparse_decode::initialize(
+        gpu.as_ref(),
+        super::glm_sparse_decode::BuildPolicy {
+            config: &config,
+            mode: glm_mtp_mode,
+            speculative: use_speculative,
+            self_speculative,
+            drafts: num_drafts,
+            owners: max_batch_size,
+            context: max_seq_len,
+            block_size: kv_block_size,
+            kv_dtype,
+            layer_dtypes: &layer_dtypes,
+            alternate_owner: dflash_args.is_some() || lora_args.is_some(),
+        },
+    )?;
+    // Explicit native module initialization precedes layers, arena, and the KV
+    // free-memory snapshot; requested load/ABI/configuration failures abort.
+    crate::layers::ops::initialize_glm_sparse_native(
+        &config,
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        kv_dtype,
+        &layer_dtypes,
     )?;
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
@@ -441,6 +470,16 @@ pub fn build_model(
         &mut layers,
         shared_cache_reserve,
     )?;
+    super::glm_dense_cache::initialize(
+        &config,
+        gpu.as_ref(),
+        &mut layers,
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        inference_reserve,
+    )?;
     // ── Step 4: Create buffer arena ──
     let _ = crate::layers::moe::validate_shared_fp8_cache_factory_reserve(
         &config,
@@ -460,6 +499,15 @@ pub fn build_model(
         max_batch_size,
         gpu.as_ref(),
     )?;
+    crate::layers::ops::validate_glm_sparse_decode_split_scratch(
+        &config.model_type,
+        buffers.expert_gate_out(),
+        buffers.sizes().expert_gate_out,
+        &[],
+    )?;
+    // Both ranks initialize HC's TF32 library path before state construction
+    // and the actual-free KV snapshot; the optional helper reuses dead scratch.
+    super::glm_hc_prewarm::initialize(&config, gpu.as_ref(), &buffers, max_batch_tokens)?;
     crate::layers::moe::bind_resident_btile_arenas(
         &config,
         &store,
@@ -681,6 +729,20 @@ pub fn build_model(
             n
         }
     };
+    if config.model_type == "glm5_next"
+        && crate::speculative::glm_repair_policy::enabled()
+        && crate::speculative::glm_repair_policy::long_context_enabled()
+    {
+        // Selected retained owners must fit every transient K-row verifier,
+        // independently of the legacy paged-KV overcommit setting below.
+        glm_mtp_capacity::validate_target_pool(
+            max_seq_len,
+            num_drafts,
+            kv_block_size,
+            max_batch_size,
+            num_kv_blocks,
+        )?;
+    }
     if let Some(plan) = glm_cache_plan {
         plan.bytes_for_blocks(num_kv_blocks)?;
     }

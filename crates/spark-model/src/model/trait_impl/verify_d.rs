@@ -15,6 +15,8 @@ use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};
 use crate::layers::ops;
 use crate::traits::{Model, SequenceState};
 
+#[path = "verify_d_graph_policy.rs"]
+mod graph_policy;
 #[path = "verify_d_oracle.rs"]
 mod oracle;
 
@@ -39,11 +41,7 @@ impl TransformerModel {
         let bf16 = 2usize;
         let fp32 = 2usize;
 
-        // Item #2 (STree-style in-place K=γ verify): `h_state` IS canonical
-        // — the verify kernel reads/writes it directly and the commit
-        // (`commit_accepted_prefix`) rewinds it in place on reject. No
-        // scratch/canonical split — dual-buffer pre-verify copy eliminated.
-        // Modeled on verify_b.rs (K=2 in-place).
+        // Canonical h_state is rewound in place by commit_accepted_prefix.
 
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
@@ -136,10 +134,7 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(bt_bytes, meta_base.offset(768), stream)?;
 
-        // Request-scoped LoRA routing (graphed γ-verify) — see verify_b.rs. One
-        // sequence → one adapter; [K]-all-equal buffer at the +128 gap, uploaded
-        // pre-`begin_capture`. γ spec depth MUST stay ≤ 32 or +128+K*4 would
-        // overrun slot@+256. `DevicePtr(0)` (no pool) → installed-pair path.
+        // Upload uniform LoRA slots before capture; +128 gap holds K<=32.
         debug_assert!(k <= 32, "γ verify seq_slot +128 gap holds K ≤ 32");
         let seq_slot =
             self.upload_seq_slot_uniform(seq.adapter_slot, k, meta_base.offset(128), stream)?;
@@ -175,18 +170,25 @@ impl TransformerModel {
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
         // Host-maintained per-layer state must not freeze during graph replay.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
-        // Exact GLM K=5 on two ranks is pointer- and shape-static. Both ranks
-        // enter the same layer collectives in lockstep, so recent CUDA/NCCL
-        // stacks can capture this forward. Keep distributed capture opt-in;
-        // all other models and topologies retain the eager default.
+        // Preserve K5 opt-in; repaired C1 K2 has a separate default-off gate.
         static GLM_TP_VERIFY_GRAPH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let glm_tp_graphs = self.config.model_type == "glm5_next"
+        let glm_tp_graphs = (self.config.model_type == "glm5_next"
             && k == 5
             && self.config.tp_world_size == 2
             && *GLM_TP_VERIFY_GRAPH.get_or_init(|| {
                 std::env::var("ATLAS_GLM_TP_VERIFY_GRAPH")
                     .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            });
+            }))
+            || graph_policy::mtp1_graph_allowed(
+                std::env::var("ATLAS_GLM_MTP1_VERIFY_GRAPH").as_deref() == Ok("1"),
+                &self.config.model_type,
+                self.config.tp_world_size,
+                self.config.ep_world_size,
+                self.levers.max_decode_seqs,
+                k,
+                crate::speculative::glm_repair_policy::enabled(),
+                std::env::var("ATLAS_K2_DIAG").as_deref() == Ok("1"),
+            );
         let use_graphs = (self.comm.is_none() || glm_tp_graphs)
             && !self
                 .suppress_graphs

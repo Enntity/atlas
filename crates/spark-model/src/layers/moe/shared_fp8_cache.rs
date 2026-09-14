@@ -8,6 +8,37 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::gpu::GpuBackend;
 use std::sync::atomic::AtomicU8;
 
+#[path = "shared_fp8_prefill_rows.rs"]
+pub(super) mod prefill_rows;
+
+pub(super) fn prefill_2048_enabled() -> Result<bool> {
+    match std::env::var("ATLAS_GLM_PREFILL_2048").ok().as_deref() {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => anyhow::bail!("ATLAS_GLM_PREFILL_2048 must be 0 or 1"),
+    }
+}
+
+pub(super) fn prefill_slab_budget() -> Result<Option<usize>> {
+    let two = prefill_2048_enabled()?;
+    let four = match std::env::var("ATLAS_GLM_PREFILL_4096").ok().as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        _ => anyhow::bail!("ATLAS_GLM_PREFILL_4096 must be 0 or 1"),
+    };
+    ensure!(
+        !(two && four),
+        "ATLAS_GLM_PREFILL_2048 and ATLAS_GLM_PREFILL_4096 cannot both be enabled"
+    );
+    Ok(if four {
+        Some(4096)
+    } else if two {
+        Some(2048)
+    } else {
+        None
+    })
+}
+
 pub(super) const WEIGHT_BYTES: usize = 2048 * 4096;
 const LAYER_BYTES: usize = 3 * WEIGHT_BYTES;
 
@@ -88,15 +119,17 @@ pub fn validate_shared_fp8_cache_profile(
     has_adapters: bool,
 ) -> Result<()> {
     let (enabled, verify) = flags()?;
+    let extended = prefill_slab_budget()?;
+    ensure!(
+        extended.is_none() || enabled,
+        "ATLAS_GLM_PREFILL_2048/4096 requires shared FP8 cache"
+    );
     if !enabled {
         return Ok(());
     }
     validate_config(config)?;
     ensure!(!has_adapters, "shared FP8 cache excludes adapters");
-    ensure!(
-        (1..=1024).contains(&prefill_budget),
-        "shared FP8 cache prefill must be 1..1024"
-    );
+    prefill_rows::validate_budget(prefill_budget, extended.unwrap_or(1024))?;
     for key in [
         "ATLAS_GLM_K5_BATCHED_SHARED",
         "ATLAS_NVFP4_MMQ_MOE",

@@ -3,10 +3,14 @@
 //! GLM-5.3 Flash loader (hybrid KDA/MLA + mHC + NVFP4 MoE).
 
 mod components;
+mod dense;
 mod layers;
 mod mtp;
 pub(crate) mod retirement;
 mod tp;
+
+#[cfg(test)]
+mod nvidia_dense_tests;
 
 pub(crate) use mtp::{Glm5MtpModule, load_glm5_mtp_module};
 
@@ -62,9 +66,16 @@ impl ModelWeightLoader for Glm5WeightLoader {
     fn load_lm_head(
         &self,
         store: &WeightStore,
-        _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
+        crate::model::glm_k3_head::initialize_from_weight(
+            gpu,
+            config,
+            store
+                .get("lm_head.weight")
+                .context("GLM-5: missing lm_head.weight")?,
+        )?;
         dense(store, "lm_head.weight").context("GLM-5: missing lm_head.weight")
     }
 

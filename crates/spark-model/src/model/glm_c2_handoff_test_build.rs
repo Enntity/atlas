@@ -30,6 +30,10 @@ impl Fixture {
         Self::build(rank, false, 8, 1)
     }
 
+    pub fn new_repaired_c4(rank: usize) -> Self {
+        Self::build(rank, false, 8, 4)
+    }
+
     pub fn new_legacy_ssm(rank: usize) -> Self {
         Self::build_inner(rank, false, 8, 2, true)
     }
@@ -116,7 +120,7 @@ impl Fixture {
             eh_proj_nvfp4: None,
         };
         let head = Arc::new(
-            if owners > 2 {
+            if paired && owners > 2 {
                 assert!(paired);
                 Glm5MtpHead::new_paired_with_owner_capacity(
                     module,
@@ -200,7 +204,7 @@ impl Fixture {
             model.ep_protocol_v2 = true;
         }
         let seqs = std::array::from_fn(|slot| {
-            if paired || legacy_ssm {
+            if paired || legacy_ssm || owners > 1 {
                 let mut seq = model.alloc_sequence().unwrap();
                 assert_eq!(seq.slot_idx, slot);
                 seq.prompt_len = 4;

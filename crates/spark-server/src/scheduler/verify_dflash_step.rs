@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Width-generic drafted-token verification (DFlash and MTP K>=5).
+//! Width-generic drafted-token verification (DFlash, MTP K>=5, and repaired GLM K2/K3).
 
 use super::*;
 
@@ -74,7 +74,7 @@ fn step_verify_dflash_inner(
     // EP rank 1 must execute the same K-row target forward in NCCL lockstep.
     // F5 is width-generic: K, then K tokens, followed after verification by
     // the accepted-draft count. Fixed K=2/3/4 retain their established wire
-    // commands and never pass through here.
+    // commands, except repaired GLM K2/K3 which needs the explicit verdict hook.
     if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF5) {
         tracing::error!("EP broadcast generic verify cmd: {e:#}");
         a.finished = true;

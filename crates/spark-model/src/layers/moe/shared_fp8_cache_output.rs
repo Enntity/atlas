@@ -124,6 +124,33 @@ impl MoeLayer {
         // supports it; keep that existing precision/ABI without extending the
         // separately validated FP8 kernel envelope or fabricating oracle passes.
         if rows > 1024 {
+            if let Some(budget) = super::shared_fp8_cache::prefill_slab_budget()? {
+                // Keep the previously qualified M64 row envelope. Only the
+                // explicit larger-prefill profile replaces the legacy T fallback.
+                let slabs = super::shared_fp8_cache::prefill_rows::plan(
+                    rows,
+                    ctx.buffers.max_batch_tokens(),
+                    n,
+                    k,
+                    input.0,
+                    output.0,
+                    budget,
+                )?;
+                for slab in slabs {
+                    launch_cached_m64(
+                        ctx.gpu,
+                        self.fp8_gemm_k,
+                        DevicePtr(slab.input),
+                        weight,
+                        DevicePtr(slab.output),
+                        slab.rows,
+                        n,
+                        k,
+                        stream,
+                    )?;
+                }
+                return Ok(());
+            }
             return reference();
         }
         anyhow::ensure!(

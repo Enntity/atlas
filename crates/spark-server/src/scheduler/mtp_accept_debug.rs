@@ -194,6 +194,7 @@ pub struct RequestAccept {
     // Per-request K=3/K=5 controller.  Zero is deliberately the deep state so
     // `Default` starts every request with an informative K=5 probe.
     depth_mode: u8,
+    last_verify_drafts: usize,
     depth_steps: u16,
     depth_full_accepts: u32,
     depth_k3_accepts: u32,
@@ -241,6 +242,7 @@ impl RequestAccept {
     /// ~20% higher target-forward cost.  K=3 periodically probes K=5 again,
     /// and promotes early when its own acceptance becomes high.
     pub fn record_depth_verify(&mut self, drafts: usize, accepted: usize, enabled: bool) {
+        self.last_verify_drafts = drafts;
         if !enabled {
             return;
         }
@@ -370,10 +372,13 @@ impl RequestAccept {
             self.mean_na(),
             self.tok_step(),
             self.regime_reprobes,
-            if self.depth_mode == DEPTH_SHALLOW {
-                "k3"
-            } else {
-                "k5"
+            match self.last_verify_drafts {
+                1 => "k2",
+                2 => "k3",
+                3 => "k4",
+                4 => "k5",
+                _ if self.depth_mode == DEPTH_SHALLOW => "k3",
+                _ => "k5",
             },
             self.depth_switches,
         )

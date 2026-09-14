@@ -62,3 +62,33 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
 ) -> Result<()> {
     unreachable!("cublaslt::fp8_gemm_act_weight_t_blkscaled is cuda-only (not built for metal)")
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_grouped_gemm_act_weight_t(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _g: u32,
+    _n: u32,
+    _k: u32,
+    _a_stride: u32,
+    _c_stride: u32,
+    _stream: u64,
+) -> Result<()> {
+    anyhow::bail!("cublaslt::bf16_grouped_gemm_act_weight_t requires CUDA")
+}
+
+/// No CUDA FP8 library on Metal; the opt-in caller fails explicitly.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_act_weight_t_tensorwise(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> anyhow::Result<()> {
+    anyhow::bail!("cuBLASLt tensorwise FP8 requires CUDA")
+}

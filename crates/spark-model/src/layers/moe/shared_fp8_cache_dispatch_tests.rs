@@ -354,6 +354,12 @@ fn projection(
         _ => panic!("test projection"),
     }
 }
+
+#[path = "shared_fp8_cache_2048_dispatch_tests.rs"]
+mod prefill_2048;
+#[path = "shared_fp8_cache_4096_dispatch_tests.rs"]
+mod prefill_4096;
+
 fn u32_arg(value: u32) -> Arg {
     Arg::Bytes(value.to_le_bytes().to_vec())
 }

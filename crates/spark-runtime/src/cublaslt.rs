@@ -14,7 +14,11 @@ use std::sync::OnceLock;
 // Native FP8 (E4M3) GEMM paths live in the `fp8` sibling (≤500 LoC split);
 // re-exported so `spark_runtime::cublaslt::fp8_gemm_*` paths are unchanged.
 mod fp8;
+mod fp8_tensorwise;
+pub use fp8_tensorwise::fp8_gemm_act_weight_t_tensorwise;
+mod grouped;
 pub use fp8::{fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_rowwise};
+pub use grouped::bf16_grouped_gemm_act_weight_t;
 
 #[allow(non_camel_case_types)]
 type cublasLtHandle_t = *mut c_void;
@@ -63,6 +67,12 @@ unsafe extern "C" {
         rows: u64,
         cols: u64,
         ld: i64,
+    ) -> i32;
+    fn cublasLtMatrixLayoutSetAttribute(
+        layout: cublasLtMatrixLayout_t,
+        attr: u32,
+        buf: *const c_void,
+        size: usize,
     ) -> i32;
     fn cublasLtMatrixLayoutDestroy(layout: cublasLtMatrixLayout_t) -> i32;
     fn cublasLtMatmulPreferenceCreate(pref: *mut cublasLtMatmulPreference_t) -> i32;

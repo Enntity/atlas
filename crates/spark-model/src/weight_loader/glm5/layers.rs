@@ -123,6 +123,11 @@ pub(super) fn load_mla_layer(
             tp.tp_size,
             gpu,
         )?;
+        if name == "o_proj" && !force_dimension_overrides {
+            crate::layers::qwen3_attention::glm_k3_mla_o::initialize(
+                gpu, config, kv_dtype, local, local_n, local_k,
+            )?;
+        }
         Ok::<DenseWeight, anyhow::Error>(
             source
                 .replaced(local, local_n * local_k * 2, gpu)?
