@@ -60,7 +60,12 @@ fn glm5_without_tools_preserves_stock_reasoning_prompt() {
     let messages = [json!({"role": "user", "content": "What is the weather in Paris?"})];
     for enabled in [false, true] {
         let rendered = render(&messages, None, enabled);
-        assert!(rendered.ends_with("<|assistant|><think>"));
+        let suffix = if enabled {
+            "<|assistant|><think>"
+        } else {
+            "<|assistant|><think></think>"
+        };
+        assert!(rendered.ends_with(suffix), "resolved thinking={enabled}");
     }
 }
 

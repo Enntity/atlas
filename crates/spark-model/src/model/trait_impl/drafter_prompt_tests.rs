@@ -358,6 +358,16 @@ fn actual_midchunk_and_disabled_missing_owner_are_inert() {
 }
 
 #[test]
+fn request_local_mtp_disable_skips_eager_owner_checks() {
+    let (model, mut seq, calls) = fixture(148, true);
+    seq.disable_mtp = true;
+    // Keep a live proposer/capture owner in the fixture: the request-local
+    // fence must short-circuit before either path can inspect or mutate it.
+    assert!(model.try_eager_drafter_prefill(&mut seq, true, 37).is_ok());
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn actual_prefill_policy_failure_is_spent_before_proposer() {
     let name = "model::trait_impl::drafter_prefill::prompt_tests::actual_prefill_policy_failure_is_spent_before_proposer";
     if std::env::var("ATLAS_PROMPT_POLICY_TEST_CHILD").as_deref() != Ok("1") {

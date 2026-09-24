@@ -210,6 +210,13 @@ impl TransformerModel {
         is_last: bool,
         stream: u64,
     ) -> Result<()> {
+        // Native/plain requests are admitted with MTP disabled.  Return
+        // before touching the paired path, proposer state, or retained
+        // capture so a request-local fallback cannot accidentally run a
+        // drafter through an eager-prefill call.
+        if seq.disable_mtp {
+            return Ok(());
+        }
         if self.try_glm_paired_eager(seq, is_last, stream)? {
             return Ok(());
         }

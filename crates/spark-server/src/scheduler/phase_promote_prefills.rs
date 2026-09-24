@@ -33,7 +33,11 @@ pub(super) fn promote_completed_prefills(
     for (idx, maybe_token) in completed_indices {
         let mut p = prefilling.swap_remove(idx);
         let Some(first) = maybe_token else {
-            // Error path: free the sequence.
+            // Every producer uses None to mark a failed forward/sampling
+            // operation.  Complete the request before releasing its owner;
+            // otherwise the scheduler frees/reallocates the slot while the
+            // client waits forever behind SSE keepalives.
+            super::lifecycle::send_error_to_sink(&mut p.sink, "prefill failed");
             let mut seq = p.seq;
             if let Err(e) = model.free_sequence(&mut seq) {
                 tracing::error!("phase_promote_prefills: free_sequence (error path): {e:#}");
@@ -237,4 +241,73 @@ pub(super) fn build_active_seq_from_prefill(
         timeout_at: p.timeout_at,
         adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn failed_prefill_notifies_request_before_releasing_owner() {
+    let (a, mut response_rx) = super::test_support::test_seq(vec![], 8, None, 4);
+    let now = Instant::now();
+    let p = super::prefill_a_step_params::build_prefill_in_progress(
+        std::sync::Arc::new(vec![7; 4]),
+        0,
+        a.seq,
+        4,
+        8,
+        0,
+        super::test_support::EOS.to_vec(),
+        a.sink,
+        None,
+        now,
+        0.0,
+        0,
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0,
+        vec![],
+        false,
+        None,
+        None,
+        0,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut prefilling = vec![p];
+    let mut active = Vec::new();
+
+    promote_completed_prefills(
+        &super::lifecycle_tests::StubModel::default(),
+        &mut prefilling,
+        vec![(0, None)],
+        &mut active,
+        None,
+        None,
+        None,
+        None,
+        64,
+        None,
+    );
+
+    let delivered = response_rx
+        .try_recv()
+        .unwrap_or_else(|e| panic!("failed prefill did not terminate request: {e:?}"));
+    match delivered {
+        Ok(_) => panic!("failed prefill unexpectedly returned a successful response"),
+        Err(e) => assert!(e.to_string().contains("prefill failed"), "{e:#}"),
+    }
+    assert!(prefilling.is_empty());
+    assert!(active.is_empty());
 }

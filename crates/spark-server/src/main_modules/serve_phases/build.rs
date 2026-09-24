@@ -302,8 +302,15 @@ pub(crate) fn maybe_run_ep_worker(
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
-                    tracing::error!("EP worker error: {e:#}");
-                    break;
+                    // An EP worker error may follow a failed collective.  A
+                    // local break leaves the rank alive and lets the head
+                    // issue another collective against a dead peer, which
+                    // turns a reportable failure into an indefinite hang.
+                    // Use the existing fail-fast propagation path so every
+                    // rank/process exits together after communicator state is
+                    // uncertain.
+                    tracing::error!("EP worker fatal error: {e:#}; terminating rank");
+                    crate::glm_terminal_session::terminate();
                 }
             }
         }
