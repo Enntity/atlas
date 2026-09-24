@@ -48,7 +48,7 @@ fn validate_startup(
     ensure!(
         rows == 4100
             && c.max_batch_tokens == rows
-            && seq == 32768
+            && seq == plan::MAX_CONTEXT
             && block == 16
             && active == 4
             && dtype == KvCacheDtype::Bf16
@@ -77,6 +77,10 @@ fn validate_startup(
     Ok(())
 }
 
+fn qualified_context(seq: usize) -> usize {
+    seq.min(plan::MAX_CONTEXT)
+}
+
 /// Load/configure the optional module on the serving context before KV sizing.
 /// The module init allocates no device buffers and never launches attention.
 #[allow(clippy::too_many_arguments)]
@@ -92,7 +96,15 @@ pub fn initialize_glm_sparse_native(
     if !loader::enabled()? {
         return Ok(());
     }
-    validate_startup(c, rows, seq, block, active, dtype, layer_dtypes)?;
+    let qualified_seq = qualified_context(seq);
+    if qualified_seq != seq {
+        tracing::warn!(
+            max_seq_len = seq,
+            native_context_limit = plan::MAX_CONTEXT,
+            "GLM native sparse prefill is qualified through the native context limit; longer rows use the Atlas sparse/plain fallback"
+        );
+    }
+    validate_startup(c, rows, qualified_seq, block, active, dtype, layer_dtypes)?;
     ensure!(
         cfg!(feature = "cuda"),
         "native sparse requires the CUDA backend"

@@ -101,7 +101,7 @@ pub fn build_model(
             self_speculative,
             drafts: num_drafts,
             owners: max_batch_size,
-            context: max_seq_len,
+            context: super::glm_sparse_decode::repair_context(max_seq_len),
             block_size: kv_block_size,
             kv_dtype,
             layer_dtypes: &layer_dtypes,

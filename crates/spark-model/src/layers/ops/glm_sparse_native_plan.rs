@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Checked, allocation-free layout and ABI for the optional GLM sparse library.
 
+pub(crate) const MAX_CONTEXT: usize = crate::speculative::glm_repair_policy::MAX_LONG_CONTEXT;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Span {
     pub ptr: u64,
@@ -45,7 +47,9 @@ pub(crate) fn admit(
     {
         return None;
     }
-    seq_start.checked_add(rows).filter(|&end| end <= 32768)
+    seq_start
+        .checked_add(rows)
+        .filter(|&end| end <= MAX_CONTEXT)
 }
 
 fn mul(a: usize, b: usize) -> Result<usize, &'static str> {
@@ -125,7 +129,8 @@ impl Plan {
     ) -> Result<Self, &'static str> {
         let seq_end = admit(rows, seq_start, false, false, false)
             .ok_or("native sparse unqualified prefill shape")?;
-        if !(1..=32768).contains(&physical_blocks) || block_table_count < seq_end.div_ceil(16) {
+        if !(1..=MAX_CONTEXT).contains(&physical_blocks) || block_table_count < seq_end.div_ceil(16)
+        {
             return Err("native sparse missing physical cache or logical block table");
         }
         let (required, metadata) =

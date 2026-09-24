@@ -71,3 +71,22 @@ fn glm_sparse_decode_build_rejects_wrong_rank_geometry() {
         assert!(policy(&c).validate(true, true).is_err());
     }
 }
+
+#[test]
+fn larger_served_context_is_capped_only_for_repair_startup() {
+    assert_eq!(repair_context(2048), 2048);
+    assert_eq!(repair_context(32768), 32768);
+    assert_eq!(repair_context(36864), 32768);
+
+    let c = config();
+    let mut capped = policy(&c);
+    capped.context = repair_context(36864);
+    assert!(capped.validate(true, true).is_ok());
+
+    // Keep the verifier's upper bound strict. The cap belongs at the factory
+    // boundary; it must not turn an out-of-domain repair policy into a valid
+    // policy when callers construct one directly.
+    let mut uncapped = policy(&c);
+    uncapped.context = 36864;
+    assert!(uncapped.validate(true, true).is_err());
+}

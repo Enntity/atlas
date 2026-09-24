@@ -95,6 +95,15 @@ fn native_sparse_startup_uses_real_arena_formula_and_rejects_wrong_profile() {
 }
 
 #[test]
+fn native_sparse_context_limit_is_a_fallback_boundary() {
+    assert_eq!(plan::MAX_CONTEXT, 32768);
+    assert_eq!(qualified_context(32768), 32768);
+    assert_eq!(qualified_context(36864), 32768);
+    assert!(plan::admit(4096, 28672, false, false, false).is_some());
+    assert!(plan::admit(4096, 32768, false, false, false).is_none());
+}
+
+#[test]
 fn native_sparse_exact_abi_call_and_native_failure_propagation() {
     static SEEN: std::sync::Mutex<Option<plan::NativeArgs>> = std::sync::Mutex::new(None);
     unsafe extern "C" fn success(args: *const plan::NativeArgs) -> i32 {

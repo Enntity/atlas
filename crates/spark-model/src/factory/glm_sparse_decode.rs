@@ -19,6 +19,14 @@ pub(super) struct BuildPolicy<'a> {
     pub alternate_owner: bool,
 }
 
+/// The repaired sparse verifier has a fixed 32K indexed domain. The serving
+/// context may be larger because requests beyond that domain are admitted to
+/// the native/plain lane and keep MTP disabled; startup must still validate
+/// the verifier against its own bounded domain.
+pub(super) fn repair_context(context: usize) -> usize {
+    context.min(crate::speculative::glm_repair_policy::MAX_LONG_CONTEXT)
+}
+
 impl BuildPolicy<'_> {
     fn validate(&self, repaired: bool, long_context: bool) -> Result<()> {
         ensure!(
