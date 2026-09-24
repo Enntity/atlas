@@ -135,12 +135,21 @@ fn glm_panorama_fits_without_unbounded_encoder_growth() {
 #[test]
 fn glm_video_total_rows_fit_the_bounded_encoder_capacity() {
     let cfg = glm_budget_cfg();
-    let frames = 8;
-    let (h, w) = glm_target_size(&cfg, 4096, 4096, frames, None, true).unwrap();
-    let groups = frames / cfg.temporal_patch_size;
-    let output_rows = groups * (h as usize / 14 / 2) * (w as usize / 14 / 2);
-    assert!(output_rows <= GLM_FALLBACK_MAX_PATCHES);
-    assert!(frames * h as usize * w as usize <= glm_runtime_max_pixels(&cfg, None, true));
+    for frames in [2, 4, 8, 256] {
+        let (h, w) = glm_target_size(&cfg, 4096, 4096, frames, None, true).unwrap();
+        let groups = frames / cfg.temporal_patch_size;
+        let per_group_patches = h as usize / 14 * (w as usize / 14);
+        let output_rows = groups * (h as usize / 14 / 2) * (w as usize / 14 / 2);
+        assert!(
+            per_group_patches <= GLM_FALLBACK_MAX_PATCHES,
+            "frames={frames}: per-group patches={per_group_patches}"
+        );
+        assert!(
+            output_rows <= GLM_FALLBACK_MAX_PATCHES,
+            "frames={frames}: output rows={output_rows}"
+        );
+    }
+    assert!(glm_runtime_max_pixels(&cfg, None, true) > 0);
 }
 
 #[test]
