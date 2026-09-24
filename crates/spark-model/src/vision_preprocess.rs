@@ -6,9 +6,9 @@
 //! `patch_size × spatial_merge_size`, normalizes with ImageNet stats,
 //! and produces a flat `f32` tensor ready for the GPU vision encoder.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use atlas_core::config::VisionConfig;
-use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, Rgb, RgbImage};
 
 /// SigLIP normalization — matches HF's Qwen2VLImageProcessor
 /// (`image_mean = image_std = (0.5, 0.5, 0.5)` → pixels mapped to [-1, 1]).
@@ -17,6 +17,19 @@ use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 /// numbers is two places for them to drift apart.
 pub(crate) const MEAN: [f32; 3] = [0.5, 0.5, 0.5];
 pub(crate) const STD: [f32; 3] = [0.5, 0.5, 0.5];
+
+/// GLM-5.3 ships the OpenAI CLIP processor constants in its nested
+/// `processor_config.json`, rather than the Qwen/SigLIP defaults above.
+pub(crate) const GLM_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
+pub(crate) const GLM_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+
+/// The pinned GLM processor expresses its geometry as token budgets.  A
+/// vision token covers one temporal group and one 2×2 patch merge.
+const GLM_MIN_IMAGE_TOKENS: usize = 16;
+const GLM_MAX_IMAGE_TOKENS: usize = 8_000;
+/// The upstream serving processor caps its checkpoint-declared 240k video
+/// tokens at 30k to keep encoder profiling and KV-cache admission bounded.
+const GLM_MAX_VIDEO_TOKENS: usize = 30_000;
 
 /// Long-side cap used ONLY when nothing else bounds the image — i.e. the
 /// caller passed no `max_pixels` because the checkpoint shipped no
@@ -157,6 +170,151 @@ fn validate_geometry(vcfg: &VisionConfig) -> Result<()> {
     Ok(())
 }
 
+/// Return patch coordinates in the order consumed by the native GLM tower.
+/// GLM's `view(-1, merge, merge, hidden)` downsample assumes each spatial
+/// merge block is contiguous; Qwen keeps the historical row-major ordering.
+pub(crate) fn patch_coordinates(
+    vcfg: &VisionConfig,
+    grid_h: usize,
+    grid_w: usize,
+) -> Vec<(usize, usize)> {
+    if !vcfg.is_glm5_next {
+        return (0..grid_h)
+            .flat_map(|ph| (0..grid_w).map(move |pw| (ph, pw)))
+            .collect();
+    }
+    let merge = vcfg.spatial_merge_size;
+    (0..grid_h / merge)
+        .flat_map(|bh| {
+            (0..grid_w / merge).flat_map(move |bw| {
+                (0..merge).flat_map(move |ih| {
+                    (0..merge).map(move |iw| (bh * merge + ih, bw * merge + iw))
+                })
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn normalize_channel(vcfg: &VisionConfig, channel: usize, raw: u8) -> f32 {
+    let (mean, std) = if vcfg.is_glm5_next {
+        (GLM_MEAN[channel], GLM_STD[channel])
+    } else {
+        (MEAN[channel], STD[channel])
+    };
+    (raw as f32 / 255.0 - mean) / std
+}
+
+fn glm_pixel_budget(vcfg: &VisionConfig, max_pixels: Option<usize>, video: bool) -> (usize, usize) {
+    let factor = vcfg.temporal_patch_size
+        * (vcfg.patch_size * vcfg.spatial_merge_size)
+            .saturating_mul(vcfg.patch_size * vcfg.spatial_merge_size);
+    let min_pixels = GLM_MIN_IMAGE_TOKENS.saturating_mul(factor);
+    let default_max_tokens = if video {
+        GLM_MAX_VIDEO_TOKENS
+    } else {
+        GLM_MAX_IMAGE_TOKENS
+    };
+    let max_pixels = max_pixels.unwrap_or_else(|| default_max_tokens.saturating_mul(factor));
+    (min_pixels, max_pixels)
+}
+
+/// Port of GLM-5.3's token-budget `smart_resize`: aligned dimensions are
+/// rounded upward, then proportionally refit by binary search when the
+/// temporal pixel budget is exceeded. The generic Qwen path intentionally
+/// keeps its historical nearest-grid behavior.
+pub(crate) fn glm_target_size(
+    vcfg: &VisionConfig,
+    orig_h: u32,
+    orig_w: u32,
+    temporal_len: usize,
+    max_pixels: Option<usize>,
+    video: bool,
+) -> Result<(u32, u32)> {
+    let factor = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
+    let (min_pixels, max_pixels) = glm_pixel_budget(vcfg, max_pixels, video);
+    ensure!(
+        max_pixels >= min_pixels,
+        "GLM vision max_pixels is below one image token"
+    );
+    let t_factor = vcfg.temporal_patch_size.max(1);
+    let t_bar = t_factor
+        .max(((temporal_len as f64 / t_factor as f64).round() as usize).saturating_mul(t_factor));
+    let h = orig_h as usize;
+    let w = orig_w as usize;
+    let mut h_bar = h.div_ceil(factor as usize) * factor as usize;
+    let mut w_bar = w.div_ceil(factor as usize) * factor as usize;
+    let aligned_pixels = |hh: usize, ww: usize| t_bar.saturating_mul(hh).saturating_mul(ww);
+    if aligned_pixels(h_bar, w_bar) > max_pixels {
+        let mut low = 1usize;
+        let mut high = h.max(1);
+        h_bar = factor as usize;
+        w_bar = factor as usize;
+        while low <= high {
+            let content_h = (low + high) / 2;
+            let content_w = (w.saturating_mul(content_h) / h.max(1)).max(1);
+            let candidate_h = content_h.div_ceil(factor as usize) * factor as usize;
+            let candidate_w = content_w.div_ceil(factor as usize) * factor as usize;
+            if aligned_pixels(candidate_h, candidate_w) <= max_pixels {
+                h_bar = candidate_h;
+                w_bar = candidate_w;
+                low = content_h + 1;
+            } else {
+                high = content_h.saturating_sub(1);
+            }
+        }
+    } else if aligned_pixels(h_bar, w_bar) < min_pixels {
+        let scale = (min_pixels as f64 / (temporal_len.max(t_factor) * h * w) as f64).sqrt();
+        let content_h = ((h as f64 * scale).ceil() as usize).max(1);
+        let content_w = ((w as f64 * scale).ceil() as usize).max(1);
+        h_bar = content_h.div_ceil(factor as usize) * factor as usize;
+        w_bar = content_w.div_ceil(factor as usize) * factor as usize;
+        if aligned_pixels(h_bar, w_bar) > max_pixels {
+            let mut low = 1usize;
+            let mut high = h.max(1);
+            h_bar = factor as usize;
+            w_bar = factor as usize;
+            while low <= high {
+                let content_h = (low + high) / 2;
+                let content_w = (w.saturating_mul(content_h) / h.max(1)).max(1);
+                let candidate_h = content_h.div_ceil(factor as usize) * factor as usize;
+                let candidate_w = content_w.div_ceil(factor as usize) * factor as usize;
+                if aligned_pixels(candidate_h, candidate_w) <= max_pixels {
+                    h_bar = candidate_h;
+                    w_bar = candidate_w;
+                    low = content_h + 1;
+                } else {
+                    high = content_h.saturating_sub(1);
+                }
+            }
+        }
+    }
+    Ok((h_bar as u32, w_bar as u32))
+}
+
+/// Preserve GLM's default `resize_mode="pad"`: resize the image to fit the
+/// aligned canvas and fill the right/bottom remainder with black pixels.
+pub(crate) fn glm_resize_or_pad(
+    img: &RgbImage,
+    target_h: u32,
+    target_w: u32,
+    allow_upscale: bool,
+) -> RgbImage {
+    let scale = (target_h as f32 / img.height() as f32)
+        .min(target_w as f32 / img.width() as f32)
+        .min(if allow_upscale { f32::INFINITY } else { 1.0 });
+    let content_h = ((img.height() as f32 * scale).floor() as u32).clamp(1, target_h);
+    let content_w = ((img.width() as f32 * scale).floor() as u32).clamp(1, target_w);
+    let resized = image::imageops::resize(
+        img,
+        content_w,
+        content_h,
+        image::imageops::FilterType::CatmullRom,
+    );
+    let mut canvas = RgbImage::from_pixel(target_w, target_h, Rgb([0, 0, 0]));
+    image::imageops::replace(&mut canvas, &resized, 0, 0);
+    canvas
+}
+
 /// Compute the target (H, W) so that:
 /// - The area bound is respected: `max_pixels` when the caller supplies one,
 ///   otherwise the long side is clamped to [`FALLBACK_MAX_DIM`].
@@ -233,12 +391,29 @@ pub fn preprocess_image_with_max_pixels(
     let img = img.to_rgb8();
     let (orig_w, orig_h) = (img.width(), img.height());
 
-    let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
-    let (th, tw) = target_size_with_max_pixels(orig_h, orig_w, grid_unit, max_pixels);
-
-    // Resize with CatmullRom — closest BICUBIC match in the `image` crate,
-    // matching HF's `Qwen2VLImageProcessor` which uses PIL resample=3 (BICUBIC).
-    let img = image::imageops::resize(&img, tw, th, image::imageops::FilterType::CatmullRom);
+    let (th, tw, img) = if vcfg.is_glm5_next {
+        let (th, tw) = glm_target_size(
+            vcfg,
+            orig_h,
+            orig_w,
+            vcfg.temporal_patch_size,
+            max_pixels,
+            false,
+        )?;
+        let allow_upscale = vcfg.temporal_patch_size * orig_h as usize * (orig_w as usize)
+            < glm_pixel_budget(vcfg, max_pixels, false).0;
+        (th, tw, glm_resize_or_pad(&img, th, tw, allow_upscale))
+    } else {
+        let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
+        let (th, tw) = target_size_with_max_pixels(orig_h, orig_w, grid_unit, max_pixels);
+        // Resize with CatmullRom — closest BICUBIC match in the `image` crate,
+        // matching HF's `Qwen2VLImageProcessor` which uses PIL resample=3 (BICUBIC).
+        (
+            th,
+            tw,
+            image::imageops::resize(&img, tw, th, image::imageops::FilterType::CatmullRom),
+        )
+    };
 
     let ps = vcfg.patch_size;
     let tp = vcfg.temporal_patch_size;
@@ -251,22 +426,24 @@ pub fn preprocess_image_with_max_pixels(
 
     // Build patches. The temporal dimension is handled by duplicating the image `tp` times.
     // Layout: [P, C, T, Hp, Wp] → stored as [P, C*T*Hp*Wp] in row-major order.
-    for ph in 0..grid_h {
-        for pw in 0..grid_w {
-            let patch_idx = ph * grid_w + pw;
-            for c in 0..3usize {
-                for t in 0..tp {
-                    for py in 0..ps {
-                        for px in 0..ps {
-                            let pixel_y = ph * ps + py;
-                            let pixel_x = pw * ps + px;
-                            let raw =
-                                img.get_pixel(pixel_x as u32, pixel_y as u32)[c] as f32 / 255.0;
-                            let norm = (raw - MEAN[c]) / STD[c];
-                            // Offset into patch_dim: c*(T*Hp*Wp) + t*(Hp*Wp) + py*Wp + px
-                            let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
-                            pixels[patch_idx * patch_dim + off] = norm;
-                        }
+    for (patch_idx, (ph, pw)) in patch_coordinates(vcfg, grid_h, grid_w)
+        .into_iter()
+        .enumerate()
+    {
+        for c in 0..3usize {
+            for t in 0..tp {
+                for py in 0..ps {
+                    for px in 0..ps {
+                        let pixel_y = ph * ps + py;
+                        let pixel_x = pw * ps + px;
+                        let norm = normalize_channel(
+                            vcfg,
+                            c,
+                            img.get_pixel(pixel_x as u32, pixel_y as u32)[c],
+                        );
+                        // Offset into patch_dim: c*(T*Hp*Wp) + t*(Hp*Wp) + py*Wp + px
+                        let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
+                        pixels[patch_idx * patch_dim + off] = norm;
                     }
                 }
             }

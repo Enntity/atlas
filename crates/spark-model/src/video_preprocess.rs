@@ -4,23 +4,16 @@
 //!
 //! # What a video is, to this encoder
 //!
-//! Qwen3-VL's ViT has NO temporal attention. Frames fuse inside a patch: the
-//! flattened patch dimension is `C × temporal_patch_size × patch² `, so a
-//! patch already spans `tp` frames' worth of pixels. A still image fills that
-//! axis by REPLICATING itself `tp` times (see `preprocess_image`) — the axis
-//! was always there, and a still is the degenerate case of a video.
+//! GLM's visual tower has no temporal attention between groups. Frames fuse
+//! inside a patch: the flattened patch dimension is
+//! `C × temporal_patch_size × patch²`, so a patch spans `tp` consecutive
+//! frames. A still image fills that axis by replicating itself `tp` times.
 //!
-//! So a video of `n` frames becomes `grid_t = n / tp` TEMPORAL GROUPS, each
-//! group a full `grid_h × grid_w` patch plane built from `tp` consecutive
-//! frames. Each group is shaped exactly like a preprocessed still, which is
-//! why the encoder needs no change at all: the groups ride the existing
-//! per-image path and only the bookkeeping downstream knows they belong to one
-//! item.
-//!
-//! What DOES differ is position. An image holds MRoPE's T coordinate constant
-//! across its whole pad run; a video advances T once per group. That is the
-//! reason `grid_t` is carried rather than groups being flattened into
-//! independent images, and it is why videos get their own pad token.
+//! A video of `n` sampled frames becomes `grid_t = n / tp` temporal groups,
+//! each a full `grid_h × grid_w` patch plane. The native encoder runs each
+//! group as its own attention sequence, then packs the resulting merger rows
+//! into one contiguous video pad run. Keeping the grouping in the item is
+//! still necessary for token insertion and MRoPE: T advances once per group.
 //!
 //! # Container support
 //!
@@ -39,7 +32,10 @@ use anyhow::{Context, Result, ensure};
 use atlas_core::config::VisionConfig;
 use image::RgbImage;
 
-use crate::vision_preprocess::{MEAN, STD, decode_data_uri_bytes, target_size_for};
+use crate::vision_preprocess::{
+    MEAN, STD, decode_data_uri_bytes, glm_resize_or_pad, glm_target_size, normalize_channel,
+    patch_coordinates, target_size_for,
+};
 
 /// Frames per second to sample at, when the caller has no better idea.
 /// Matches the `fps: 2` every Qwen3-VL `video_processor` block declares.
@@ -152,6 +148,85 @@ pub fn sample_indices(
     out
 }
 
+/// GLM's processor uses an `fps_interval` timestamp walk followed by a
+/// linspace repair when the greedy walk misses its requested frame count.
+fn sample_glm_indices(
+    n_frames: usize,
+    native_fps: f32,
+    target_fps: f32,
+    max_frames: usize,
+    temporal_patch_size: usize,
+) -> Vec<usize> {
+    if n_frames == 0 {
+        return Vec::new();
+    }
+    let fps = if native_fps.is_finite() && native_fps > 0.0 {
+        native_fps
+    } else {
+        DEFAULT_FPS
+    };
+    let target = if target_fps.is_finite() && target_fps > 0.0 {
+        target_fps
+    } else {
+        DEFAULT_FPS
+    };
+    let duration = n_frames as f32 / fps;
+    let wanted = ((duration * target).floor() as usize).min(max_frames);
+    // This is the reference processor's behavior for a clip shorter than one
+    // requested sample interval: return no indices and let the caller reject
+    // the video rather than inventing a frame.
+    if wanted == 0 {
+        return Vec::new();
+    }
+    let mut picked = if n_frames < wanted {
+        (0..wanted)
+            .map(|i| i * n_frames / wanted)
+            .collect::<Vec<_>>()
+    } else {
+        let mut out = Vec::new();
+        let mut current = 0.0f32;
+        let step = 1.0 / (temporal_patch_size.max(1) as f32 * target);
+        let max_second = duration.floor();
+        for index in 0..n_frames {
+            if index as f32 / fps >= current {
+                current += step;
+                out.push(index);
+                if current >= max_second {
+                    break;
+                }
+            }
+        }
+        out
+    };
+    let linspace = |start: usize, end: usize, count: usize| -> Vec<usize> {
+        if count <= 1 {
+            return vec![start];
+        }
+        (0..count)
+            .map(|i| start + end.saturating_sub(start) * i / (count - 1))
+            .collect()
+    };
+    if picked.len() < wanted {
+        let start = picked.first().copied().unwrap_or(0);
+        let end = picked.last().copied().unwrap_or(n_frames - 1);
+        picked = linspace(start, end, wanted);
+    } else if picked.len() > wanted {
+        picked = linspace(0, n_frames - 1, wanted);
+    }
+    let mut unique = Vec::with_capacity(picked.len() + 1);
+    for index in picked {
+        if unique.last().copied() != Some(index) {
+            unique.push(index);
+        }
+    }
+    if unique.len() % 2 == 1 {
+        if let Some(last) = unique.last().copied() {
+            unique.push(last);
+        }
+    }
+    unique
+}
+
 /// Decode every frame of a container, choosing a backend by what the bytes
 /// actually are.
 ///
@@ -259,14 +334,18 @@ pub fn preprocess_video(
     let (frames, native_fps) = decode_frames(data_uri, target_fps, ffmpeg)?;
     let tp = vcfg.temporal_patch_size;
 
-    let keep = sample_indices(
-        frames.len(),
-        native_fps,
-        target_fps,
-        DEFAULT_MIN_FRAMES,
-        DEFAULT_MAX_FRAMES,
-        tp,
-    );
+    let keep = if vcfg.is_glm5_next {
+        sample_glm_indices(frames.len(), native_fps, target_fps, 2_048, tp)
+    } else {
+        sample_indices(
+            frames.len(),
+            native_fps,
+            target_fps,
+            DEFAULT_MIN_FRAMES,
+            DEFAULT_MAX_FRAMES,
+            tp,
+        )
+    };
     ensure!(!keep.is_empty(), "frame sampling selected no frames");
 
     // A clip shorter than one temporal group cannot be encoded as video.
@@ -285,7 +364,24 @@ pub fn preprocess_video(
     // count assumes a single grid.
     let first = &frames[keep[0]];
     let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
-    let (th, tw) = target_size_for(first.height(), first.width(), grid_unit, max_pixels);
+    let (th, tw) = if vcfg.is_glm5_next {
+        glm_target_size(
+            vcfg,
+            first.height(),
+            first.width(),
+            keep.len(),
+            max_pixels,
+            true,
+        )?
+    } else {
+        target_size_for(first.height(), first.width(), grid_unit, max_pixels)
+    };
+    let glm_min_pixels = 16usize
+        * tp
+        * (vcfg.patch_size * vcfg.spatial_merge_size)
+            .saturating_mul(vcfg.patch_size * vcfg.spatial_merge_size);
+    let glm_allow_upscale = vcfg.is_glm5_next
+        && keep.len() * first.height() as usize * (first.width() as usize) < glm_min_pixels;
 
     let ps = vcfg.patch_size;
     let grid_h = (th as usize) / ps;
@@ -302,25 +398,37 @@ pub fn preprocess_video(
         let resized: Vec<RgbImage> = (0..tp)
             .map(|k| {
                 let f = &frames[keep[g * tp + k]];
-                image::imageops::resize(f, tw, th, image::imageops::FilterType::CatmullRom)
+                if vcfg.is_glm5_next {
+                    glm_resize_or_pad(f, th, tw, glm_allow_upscale)
+                } else {
+                    image::imageops::resize(f, tw, th, image::imageops::FilterType::CatmullRom)
+                }
             })
             .collect();
 
         let mut pixels = vec![0.0f32; plane * patch_dim];
-        for ph in 0..grid_h {
-            for pw in 0..grid_w {
-                let patch_idx = ph * grid_w + pw;
-                for c in 0..3usize {
-                    for (t, frame) in resized.iter().enumerate() {
-                        for py in 0..ps {
-                            for px in 0..ps {
-                                let raw = frame
-                                    .get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)[c]
-                                    as f32
-                                    / 255.0;
-                                let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
-                                pixels[patch_idx * patch_dim + off] = (raw - MEAN[c]) / STD[c];
-                            }
+        for (patch_idx, (ph, pw)) in patch_coordinates(vcfg, grid_h, grid_w)
+            .into_iter()
+            .enumerate()
+        {
+            for c in 0..3usize {
+                for (t, frame) in resized.iter().enumerate() {
+                    for py in 0..ps {
+                        for px in 0..ps {
+                            let raw = frame.get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)
+                                [c] as f32
+                                / 255.0;
+                            let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
+                            pixels[patch_idx * patch_dim + off] = if vcfg.is_glm5_next {
+                                normalize_channel(
+                                    vcfg,
+                                    c,
+                                    frame.get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)
+                                        [c],
+                                )
+                            } else {
+                                (raw - MEAN[c]) / STD[c]
+                            };
                         }
                     }
                 }
