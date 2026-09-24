@@ -76,7 +76,7 @@ fn glm5_next_maps_nested_hybrid_mla_kda_and_ep_shape() {
             "linear_attention"
         });
     }
-    let raw = serde_json::json!({
+    let mut raw = serde_json::json!({
         "model_type": "glm5_next",
         "text_config": {
             "model_type": "glm5_next_text",
@@ -127,6 +127,26 @@ fn glm5_next_maps_nested_hybrid_mla_kda_and_ep_shape() {
             "ignore": ["lm_head", "*.self_attn.q_proj"]
         }
     });
+    let object = raw.as_object_mut().unwrap();
+    object.insert("image_token_id".into(), serde_json::json!(151655));
+    object.insert("video_token_id".into(), serde_json::json!(151656));
+    object.insert(
+        "vision_config".into(),
+        serde_json::json!({
+            "depth": 24,
+            "hidden_size": 1024,
+            "num_heads": 16,
+            "patch_size": 14,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "intermediate_size": 4096,
+            "out_hidden_size": 4096,
+            "projection_intermediate_size": 10240,
+            "in_channels": 3,
+            "rms_norm_eps": 1e-5,
+            "swiglu_limit": 10.0
+        }),
+    );
 
     let cfg = parse_config(&raw.to_string()).unwrap();
     assert_eq!(cfg.model_type, "glm5_next");
@@ -153,6 +173,12 @@ fn glm5_next_maps_nested_hybrid_mla_kda_and_ep_shape() {
     assert_eq!(cfg.mtp_num_hidden_layers, 1);
     assert!(cfg.nested_config);
     assert!(!cfg.attn_gated);
+    let vision = cfg.vision.as_ref().expect("GLM vision config");
+    assert!(vision.is_glm5_next);
+    assert_eq!(vision.patch_size, 14);
+    assert_eq!(vision.projection_intermediate_size, 10240);
+    assert_eq!(vision.out_hidden_size, 4096);
+    assert_eq!(vision.image_pad_token_id, 151655);
     let quant = cfg.quantization_config.unwrap();
     assert_eq!(quant.quant_method, "modelopt");
     assert_eq!(quant.quant_algo, "NVFP4");

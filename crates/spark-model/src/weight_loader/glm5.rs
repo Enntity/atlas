@@ -8,6 +8,7 @@ mod layers;
 mod mtp;
 pub(crate) mod retirement;
 mod tp;
+mod vision;
 
 #[cfg(test)]
 mod nvidia_dense_tests;
@@ -86,5 +87,14 @@ impl ModelWeightLoader for Glm5WeightLoader {
         _gpu: &dyn GpuBackend,
     ) -> Result<Option<MtpWeights>> {
         Ok(None)
+    }
+
+    fn load_vision_encoder(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::VisionEncoder>> {
+        vision::load(store, config, gpu)
     }
 }

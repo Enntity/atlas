@@ -17,6 +17,8 @@ fn no_ffmpeg() -> FfmpegPolicy {
 
 fn cfg() -> VisionConfig {
     VisionConfig {
+        is_glm5_next: false,
+        in_channels: 3,
         depth: 2,
         hidden_size: 32,
         num_heads: 2,
@@ -25,6 +27,9 @@ fn cfg() -> VisionConfig {
         spatial_merge_size: 2,
         intermediate_size: 64,
         out_hidden_size: 32,
+        projection_intermediate_size: 0,
+        rms_norm_eps: 1e-6,
+        swiglu_limit: 0.0,
         deepstack_visual_indexes: vec![],
         image_pad_token_id: 248_056,
         video_pad_token_id: 248_057,

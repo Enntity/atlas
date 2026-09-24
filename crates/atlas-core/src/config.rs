@@ -697,6 +697,11 @@ pub struct QuantizationConfig {
 /// Vision encoder configuration for Qwen3-VL models.
 #[derive(Debug, Clone)]
 pub struct VisionConfig {
+    /// True only for the native GLM-5.3 vision tower.  Its RMSNorm/SwiGLU/
+    /// convolutional merger is not interchangeable with the Qwen ViT path.
+    pub is_glm5_next: bool,
+    /// Input channel count for the visual patch embed (GLM uses 3).
+    pub in_channels: usize,
     /// Number of ViT transformer blocks (depth=27).
     pub depth: usize,
     /// ViT hidden dimension (1152).
@@ -713,6 +718,13 @@ pub struct VisionConfig {
     pub intermediate_size: usize,
     /// Projection output dimension = LLM hidden_size (2048).
     pub out_hidden_size: usize,
+    /// GLM merger gated projection width (10240); zero for Qwen towers.
+    pub projection_intermediate_size: usize,
+    /// GLM visual RMSNorm epsilon. Qwen uses the model-specific LayerNorm
+    /// kernels and leaves this at the default.
+    pub rms_norm_eps: f64,
+    /// GLM clamped SwiGLU limit. Zero means the Qwen path has no such limit.
+    pub swiglu_limit: f32,
     /// Layer indices after which deepstack mergers are applied ([8, 16, 24]).
     pub deepstack_visual_indexes: Vec<usize>,
     /// Placeholder token ID that marks where vision embeddings get spliced
@@ -793,8 +805,9 @@ pub use parsers::{
     parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{
-    parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_laguna, parse_longcat_ngram,
-    parse_minimax_m2, parse_qwen4_exp, parse_step3p7, parse_vision_config,
+    parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_glm5_vision_config,
+    parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_step3p7,
+    parse_vision_config,
 };
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
