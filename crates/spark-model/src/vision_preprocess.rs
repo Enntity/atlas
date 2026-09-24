@@ -293,11 +293,11 @@ pub(crate) fn glm_target_size(
     orig_h: u32,
     orig_w: u32,
     temporal_len: usize,
-    max_pixels: Option<usize>,
+    requested_max_pixels: Option<usize>,
     video: bool,
 ) -> Result<(u32, u32)> {
     let factor = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
-    let (min_pixels, max_pixels) = glm_pixel_budget(vcfg, max_pixels, video);
+    let (min_pixels, mut max_pixels) = glm_pixel_budget(vcfg, requested_max_pixels, video);
     ensure!(
         max_pixels >= min_pixels,
         "GLM vision max_pixels is below one image token"
@@ -305,6 +305,21 @@ pub(crate) fn glm_target_size(
     let t_factor = vcfg.temporal_patch_size.max(1);
     let t_bar = t_factor
         .max(((temporal_len as f64 / t_factor as f64).round() as usize).saturating_mul(t_factor));
+    if video {
+        // The aggregate output-row bound is not sufficient for a short video:
+        // one temporal group still runs the full spatial grid through the
+        // per-sequence input buffers. Bound that grid independently, using the
+        // actual sampled temporal length now that `t_bar` is known.
+        let (p_max, _) = derive_glm_max_patches(
+            requested_max_pixels,
+            vcfg.patch_size,
+            vcfg.temporal_patch_size,
+        );
+        let per_group_volume = t_bar
+            .saturating_mul(p_max)
+            .saturating_mul(vcfg.patch_size.saturating_mul(vcfg.patch_size));
+        max_pixels = max_pixels.min(per_group_volume);
+    }
     let h = orig_h as usize;
     let w = orig_w as usize;
     let mut h_bar = h.div_ceil(factor as usize) * factor as usize;
