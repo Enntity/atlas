@@ -80,6 +80,20 @@ struct MediaInput {
     uri: String,
 }
 
+fn checked_glm5_video_timestamps(
+    timestamps: Vec<f32>,
+    frame_count: usize,
+) -> Result<Vec<f32>, String> {
+    if timestamps.len() != frame_count {
+        return Err(format!(
+            "GLM-5 video metadata has {} timestamps for {} temporal groups",
+            timestamps.len(),
+            frame_count
+        ));
+    }
+    Ok(timestamps)
+}
+
 /// Append every media part on `m` to `media` **in content order**, growing
 /// `image_pad_counts` in lockstep (each pad count is filled in later by the
 /// preprocessor). Shared by the tool-message branch and the normal branch so
@@ -462,13 +476,11 @@ pub(super) fn build_msg_entries(
                 let frame_count = item.t_len();
                 let frame_pad_count = image_pad_counts[idx] / frame_count.max(1);
                 let timestamps = if input.kind == MediaKind::Video {
-                    if video_timestamps.len() == frame_count {
-                        video_timestamps
-                    } else {
-                        // Keep the expansion fail-closed when a future video
-                        // decoder forgets metadata: one timestamp per encoder
-                        // group is still required to preserve token/row order.
-                        (0..frame_count).map(|g| g as f32).collect()
+                    match checked_glm5_video_timestamps(video_timestamps, frame_count) {
+                        Ok(timestamps) => timestamps,
+                        Err(message) => {
+                            return Err(openai_error_response(StatusCode::BAD_REQUEST, message));
+                        }
                     }
                 } else {
                     Vec::new()
