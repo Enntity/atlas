@@ -739,6 +739,16 @@ pub struct VisionConfig {
     /// advances T once per temporal group. When 0 the runtime falls back to
     /// the family default.
     pub video_pad_token_id: u32,
+    /// GLM image sequence boundary token IDs. GLM's chat template emits one
+    /// image marker triple and the serving processor expands it to one token
+    /// per merged patch. Zero for model families whose template owns a
+    /// different vision layout.
+    pub image_start_token_id: u32,
+    pub image_end_token_id: u32,
+    /// GLM video sequence boundary token IDs. A video expands to one image
+    /// marker per temporal group, with timestamp tokens between groups.
+    pub video_start_token_id: u32,
+    pub video_end_token_id: u32,
     /// Resolved vision pixel budget: the operator's `--vision-max-pixels`, else
     /// the checkpoint's processor configuration, else `None`. Qwen paths treat
     /// this as spatial `H×W`; GLM-5.3 treats it as the processor's temporal

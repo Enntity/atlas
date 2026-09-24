@@ -56,6 +56,10 @@ pub(crate) fn parse_vision_config(raw: &serde_json::Value) -> Option<VisionConfi
         deepstack_visual_indexes,
         image_pad_token_id,
         video_pad_token_id,
+        image_start_token_id: 0,
+        image_end_token_id: 0,
+        video_start_token_id: 0,
+        video_end_token_id: 0,
         // Not in config.json — it comes from preprocessor_config.json (or the
         // operator's flag), which this parser does not see. Resolved and
         // installed by the server right after config load, before the encoder
@@ -183,6 +187,21 @@ pub(crate) fn parse_glm5_vision_config(
                 .and_then(serde_json::Value::as_u64)
         })
         .unwrap_or(0) as u32;
+    // GLM-5 stores these at the top level alongside image_token_id and
+    // video_token_id. Keep the canonical IDs as a compatibility default for
+    // older exported configs that omitted the redundant fields; the pad IDs
+    // remain required above because they identify the encoder rows.
+    let token_id = |key: &str, default: u32| {
+        raw.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| vc.get(key).and_then(serde_json::Value::as_u64))
+            .or_else(|| text_config.get(key).and_then(serde_json::Value::as_u64))
+            .unwrap_or(default as u64) as u32
+    };
+    let image_start_token_id = token_id("image_start_token_id", 154_830);
+    let image_end_token_id = token_id("image_end_token_id", 154_831);
+    let video_start_token_id = token_id("video_start_token_id", 154_832);
+    let video_end_token_id = token_id("video_end_token_id", 154_833);
     let deepstack_visual_indexes = vc
         .get("deepstack_visual_indexes")
         .and_then(serde_json::Value::as_array)
@@ -210,6 +229,10 @@ pub(crate) fn parse_glm5_vision_config(
         deepstack_visual_indexes,
         image_pad_token_id,
         video_pad_token_id,
+        image_start_token_id,
+        image_end_token_id,
+        video_start_token_id,
+        video_end_token_id,
         max_pixels: None,
     }))
 }
