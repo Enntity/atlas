@@ -739,9 +739,10 @@ pub struct VisionConfig {
     /// advances T once per temporal group. When 0 the runtime falls back to
     /// the family default.
     pub video_pad_token_id: u32,
-    /// Resolved vision AREA bound in pixels: the operator's
-    /// `--vision-max-pixels`, else the checkpoint's `preprocessor_config.json`,
-    /// else `None`.
+    /// Resolved vision pixel budget: the operator's `--vision-max-pixels`, else
+    /// the checkpoint's processor configuration, else `None`. Qwen paths treat
+    /// this as spatial `H×W`; GLM-5.3 treats it as the processor's temporal
+    /// volume `T×H×W` and clamps it to the native encoder capacity.
     ///
     /// ★ THE SINGLE SOURCE OF TRUTH, and it exists because there used to be
     /// two. The CPU preprocessor clamped every image to 1280px on the long

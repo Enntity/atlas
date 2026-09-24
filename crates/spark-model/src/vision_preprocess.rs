@@ -31,6 +31,13 @@ const GLM_MAX_IMAGE_TOKENS: usize = 8_000;
 /// tokens at 30k to keep encoder profiling and KV-cache admission bounded.
 const GLM_MAX_VIDEO_TOKENS: usize = 30_000;
 
+/// Native GLM encoder capacity, in pre-merge spatial patches or merged output
+/// rows. The quadratic attention scratch is allocated once at construction, so
+/// preprocessing must use the same bounded capacity instead of the processor's
+/// larger checkpoint token budget.
+pub(crate) const GLM_FALLBACK_MAX_PATCHES: usize = 6_400;
+pub(crate) const GLM_CEILING_MAX_PATCHES: usize = 16_384;
+
 /// Long-side cap used ONLY when nothing else bounds the image — i.e. the
 /// caller passed no `max_pixels` because the checkpoint shipped no
 /// `preprocessor_config.json` and the operator set no `--vision-max-pixels`.
@@ -204,6 +211,60 @@ pub(crate) fn normalize_channel(vcfg: &VisionConfig, channel: usize, raw: u8) ->
     (raw as f32 / 255.0 - mean) / std
 }
 
+/// Convert the resolved GLM `max_pixels` setting into the capacity used by the
+/// native tower. For GLM this setting follows the processor's `t*h*w` pixel
+/// volume: still images use `t = temporal_patch_size`, while videos use the
+/// sampled frame count. The native buffers remain bounded even when the
+/// checkpoint advertises a larger processor budget.
+pub(crate) fn derive_glm_max_patches(
+    max_pixels: Option<usize>,
+    patch_size: usize,
+    temporal_patch_size: usize,
+) -> (usize, Option<usize>) {
+    let Some(volume) = max_pixels.filter(|&value| value > 0) else {
+        return (GLM_FALLBACK_MAX_PATCHES, None);
+    };
+    let patch_volume = temporal_patch_size
+        .max(1)
+        .saturating_mul(patch_size.max(1).saturating_mul(patch_size.max(1)));
+    let wanted = (volume / patch_volume).max(1);
+    if wanted > GLM_CEILING_MAX_PATCHES {
+        (GLM_CEILING_MAX_PATCHES, Some(wanted))
+    } else {
+        (wanted, None)
+    }
+}
+
+/// Effective GLM pixel-volume budget after applying the fixed native capacity.
+/// A video has one merged output row per 2×2 spatial patch for every temporal
+/// group, so it gets the extra `merge²` factor; each individual sequence still
+/// fits the same `p_max` input-patch allocation.
+pub(crate) fn glm_runtime_max_pixels(
+    vcfg: &VisionConfig,
+    max_pixels: Option<usize>,
+    video: bool,
+) -> usize {
+    let (p_max, _) = derive_glm_max_patches(max_pixels, vcfg.patch_size, vcfg.temporal_patch_size);
+    let patch_volume = vcfg.temporal_patch_size.max(1).saturating_mul(
+        vcfg.patch_size
+            .max(1)
+            .saturating_mul(vcfg.patch_size.max(1)),
+    );
+    let merge_factor = if video {
+        vcfg.spatial_merge_size
+            .max(1)
+            .saturating_mul(vcfg.spatial_merge_size.max(1))
+    } else {
+        1
+    };
+    let capacity = p_max
+        .saturating_mul(patch_volume)
+        .saturating_mul(merge_factor);
+    max_pixels
+        .filter(|&value| value > 0)
+        .map_or(capacity, |value| value.min(capacity))
+}
+
 fn glm_pixel_budget(vcfg: &VisionConfig, max_pixels: Option<usize>, video: bool) -> (usize, usize) {
     let factor = vcfg.temporal_patch_size
         * (vcfg.patch_size * vcfg.spatial_merge_size)
@@ -214,7 +275,12 @@ fn glm_pixel_budget(vcfg: &VisionConfig, max_pixels: Option<usize>, video: bool)
     } else {
         GLM_MAX_IMAGE_TOKENS
     };
-    let max_pixels = max_pixels.unwrap_or_else(|| default_max_tokens.saturating_mul(factor));
+    // Keep the canonical token budget as the requested upper bound, but cap
+    // it to the actual native encoder capacity. The default is also bounded;
+    // `None` means no operator/checkpoint override, not an unbounded GLM run.
+    let processor_max = max_pixels.unwrap_or_else(|| default_max_tokens.saturating_mul(factor));
+    let capacity_max = glm_runtime_max_pixels(vcfg, max_pixels, video);
+    let max_pixels = processor_max.min(capacity_max);
     (min_pixels, max_pixels)
 }
 

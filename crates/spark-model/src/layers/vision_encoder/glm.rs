@@ -10,7 +10,7 @@ use anyhow::{Result, ensure};
 use atlas_core::config::VisionConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
-use super::enc_impl::init::derive_max_patches;
+use crate::vision_preprocess::derive_glm_max_patches;
 
 mod forward;
 mod ops;
@@ -110,7 +110,11 @@ impl GlmVisionEncoder {
             weights.blocks.len() == config.depth,
             "GLM vision block count mismatch"
         );
-        let (p_max, asked_for) = derive_max_patches(config.max_pixels, config.patch_size);
+        let (p_max, asked_for) = derive_glm_max_patches(
+            config.max_pixels,
+            config.patch_size,
+            config.temporal_patch_size,
+        );
         if let Some(wanted) = asked_for {
             tracing::warn!(
                 "GLM vision capacity clamped to {p_max} patches from requested {wanted}"

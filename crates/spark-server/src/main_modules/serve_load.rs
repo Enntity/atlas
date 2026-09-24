@@ -160,7 +160,7 @@ pub(crate) fn load_model_selected(
     // whose TOP LEVEL is already the quantization block.
     serve_phases::merge_sidecar_quant_config(&model_dir, &mut config);
 
-    // Vision area bound, resolved ONCE and installed on the config before
+    // Vision pixel budget, resolved ONCE and installed on the config before
     // anything derived from it exists.
     //
     // Ordering is load-bearing: the vision encoder sizes every device buffer
@@ -175,7 +175,7 @@ pub(crate) fn load_model_selected(
     }
     match vision_max_pixels {
         Some(px) => tracing::info!(
-            "Vision area bound: {} px ({})",
+            "Vision pixel budget: {} px ({})",
             px,
             if args.vision_max_pixels > 0 {
                 "--vision-max-pixels"
@@ -190,7 +190,7 @@ pub(crate) fn load_model_selected(
             }
         ),
         None => tracing::info!(
-            "Vision area bound: none declared — falling back to the 1280px long-side clamp"
+            "Vision pixel budget: none declared — falling back to the 1280px long-side clamp"
         ),
     }
 
