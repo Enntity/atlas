@@ -33,18 +33,6 @@ extern "C" __global__ void glm_vision_gemm_bias(
     c[row * n + col] = glm_bf16_from_f32(acc + glm_bf16(bias[col]));
 }
 
-extern "C" __global__ void glm_vision_add_bias(
-    __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ bias,
-    unsigned int rows, unsigned int cols) {
-    unsigned int i = blockIdx.x * 256 + threadIdx.x;
-    unsigned int n = rows * cols;
-    if (i < n) {
-        unsigned int col = i % cols;
-        x[i] = glm_bf16_from_f32(glm_bf16(x[i]) + glm_bf16(bias[col]));
-    }
-}
-
 extern "C" __global__ void glm_vision_rms_norm(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ w,
@@ -112,7 +100,9 @@ extern "C" __global__ void glm_vision_swiglu_clamp(
     if (i >= n) return;
     unsigned int row = i / hidden;
     unsigned int col = i % hidden;
-    float gate = fminf(fmaxf(glm_bf16(x[row * (2 * hidden) + col]), -limit), limit);
+    // vLLM's SiluAndMulWithClamp clamps the gate only on the upper side;
+    // the up branch is clamped symmetrically below.
+    float gate = fminf(glm_bf16(x[row * (2 * hidden) + col]), limit);
     float up = fminf(fmaxf(glm_bf16(x[row * (2 * hidden) + hidden + col]), -limit), limit);
     y[i] = glm_bf16_from_f32((gate / (1.0f + expf(-gate))) * up);
 }
@@ -120,16 +110,23 @@ extern "C" __global__ void glm_vision_swiglu_clamp(
 __device__ inline float glm_rotated(
     const __nv_bfloat16* qkv, unsigned int base, unsigned int dim,
     const __nv_bfloat16* cos_row, const __nv_bfloat16* sin_row,
-    const __nv_bfloat16* norm, float inv, unsigned int axis_dim) {
-    unsigned int half = axis_dim / 2;
-    unsigned int axis = dim / axis_dim;
-    unsigned int local = dim % axis_dim;
-    unsigned int partner = local < half ? local + half : local - half;
-    float x = glm_bf16(qkv[base + dim]) * inv * glm_bf16(norm[dim]);
-    float p = glm_bf16(qkv[base + axis * axis_dim + partner]) * inv * glm_bf16(norm[partner]);
-    float c = glm_bf16(cos_row[axis * axis_dim + local]);
-    float s = glm_bf16(sin_row[axis * axis_dim + local]);
-    return local < half ? x * c - p * s : x * c + p * s;
+    const __nv_bfloat16* norm, float inv, unsigned int rotary_dim) {
+    // ApplyRotaryEmb is Neox-style over the full head.  GLM's partial rotary
+    // factor makes the cache row `head_dim / 2` wide; its first half carries
+    // H frequencies and its second half W frequencies, while the two halves
+    // of the head are paired by the rotary transform.
+    unsigned int partner = dim < rotary_dim ? dim + rotary_dim : dim - rotary_dim;
+    // fused_q_kv_rmsnorm returns BF16.  Preserve that write boundary before
+    // loading the values for the subsequent BF16 rotary operation.
+    float x = glm_bf16(glm_bf16_from_f32(
+        glm_bf16(qkv[base + dim]) * inv * glm_bf16(norm[dim])));
+    float p = glm_bf16(glm_bf16_from_f32(
+        glm_bf16(qkv[base + partner]) * inv * glm_bf16(norm[partner])));
+    float c = glm_bf16(cos_row[dim % rotary_dim]);
+    float s = glm_bf16(sin_row[dim % rotary_dim]);
+    float rotated = dim < rotary_dim ? x * c - p * s : x * c + p * s;
+    // The CUDA rotary op writes back to the BF16 q/k tensor before attention.
+    return glm_bf16(glm_bf16_from_f32(rotated));
 }
 
 // One thread computes one (query, head) row.  It is intentionally a scalar
@@ -149,7 +146,7 @@ extern "C" __global__ void glm_vision_attention(
     unsigned int hidden = heads * head_dim;
     unsigned int row_stride = 3 * hidden;
     unsigned int q_base = query * row_stride + head * head_dim;
-    unsigned int qk_axis = head_dim / 2;
+    unsigned int rotary_dim = head_dim / 2;
     float q[128];
     float q_sq = 0.0f;
     for (unsigned int d = 0; d < head_dim; ++d) {
@@ -158,10 +155,10 @@ extern "C" __global__ void glm_vision_attention(
         q_sq += raw * raw;
     }
     float q_inv = rsqrtf(q_sq / head_dim + 1.0e-5f);
-    const __nv_bfloat16* cos_q = cos_table + query * head_dim;
-    const __nv_bfloat16* sin_q = sin_table + query * head_dim;
+    const __nv_bfloat16* cos_q = cos_table + query * rotary_dim;
+    const __nv_bfloat16* sin_q = sin_table + query * rotary_dim;
     for (unsigned int d = 0; d < head_dim; ++d)
-        q[d] = glm_rotated(qkv, q_base, d, cos_q, sin_q, q_norm, q_inv, qk_axis);
+        q[d] = glm_rotated(qkv, q_base, d, cos_q, sin_q, q_norm, q_inv, rotary_dim);
 
     float max_score = -3.402823466e+38f;
     for (unsigned int key = 0; key < seq; ++key) {
@@ -172,11 +169,11 @@ extern "C" __global__ void glm_vision_attention(
             k_sq += raw * raw;
         }
         float k_inv = rsqrtf(k_sq / head_dim + 1.0e-5f);
-        const __nv_bfloat16* cos_k = cos_table + key * head_dim;
-        const __nv_bfloat16* sin_k = sin_table + key * head_dim;
+        const __nv_bfloat16* cos_k = cos_table + key * rotary_dim;
+        const __nv_bfloat16* sin_k = sin_table + key * rotary_dim;
         float score = 0.0f;
         for (unsigned int d = 0; d < head_dim; ++d)
-            score += q[d] * glm_rotated(qkv, k_base, d, cos_k, sin_k, k_norm, k_inv, qk_axis);
+            score += q[d] * glm_rotated(qkv, k_base, d, cos_k, sin_k, k_norm, k_inv, rotary_dim);
         score *= rsqrtf((float)head_dim);
         max_score = fmaxf(max_score, score);
     }
@@ -189,11 +186,11 @@ extern "C" __global__ void glm_vision_attention(
             k_sq += raw * raw;
         }
         float k_inv = rsqrtf(k_sq / head_dim + 1.0e-5f);
-        const __nv_bfloat16* cos_k = cos_table + key * head_dim;
-        const __nv_bfloat16* sin_k = sin_table + key * head_dim;
+        const __nv_bfloat16* cos_k = cos_table + key * rotary_dim;
+        const __nv_bfloat16* sin_k = sin_table + key * rotary_dim;
         float score = 0.0f;
         for (unsigned int d = 0; d < head_dim; ++d)
-            score += q[d] * glm_rotated(qkv, k_base, d, cos_k, sin_k, k_norm, k_inv, qk_axis);
+            score += q[d] * glm_rotated(qkv, k_base, d, cos_k, sin_k, k_norm, k_inv, rotary_dim);
         denom += expf(score * rsqrtf((float)head_dim) - max_score);
     }
     for (unsigned int d = 0; d < head_dim; ++d) {
@@ -206,11 +203,11 @@ extern "C" __global__ void glm_vision_attention(
                 k_sq += raw * raw;
             }
             float k_inv = rsqrtf(k_sq / head_dim + 1.0e-5f);
-            const __nv_bfloat16* cos_k = cos_table + key * head_dim;
-            const __nv_bfloat16* sin_k = sin_table + key * head_dim;
+            const __nv_bfloat16* cos_k = cos_table + key * rotary_dim;
+            const __nv_bfloat16* sin_k = sin_table + key * rotary_dim;
             float score = 0.0f;
             for (unsigned int j = 0; j < head_dim; ++j)
-                score += q[j] * glm_rotated(qkv, k_base, j, cos_k, sin_k, k_norm, k_inv, qk_axis);
+                score += q[j] * glm_rotated(qkv, k_base, j, cos_k, sin_k, k_norm, k_inv, rotary_dim);
             float p = expf(score * rsqrtf((float)head_dim) - max_score) / denom;
             acc += p * glm_bf16(qkv[key * row_stride + 2 * hidden + head * head_dim + d]);
         }

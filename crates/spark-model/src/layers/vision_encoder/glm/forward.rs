@@ -27,8 +27,13 @@ fn rope_table(
     let inv: Vec<f32> = (0..half)
         .map(|i| 1.0 / theta.powf(2.0 * i as f32 / rotary_dim as f32))
         .collect();
-    let mut cos = Vec::with_capacity(grid_h * grid_w * head_dim * 2);
-    let mut sin = Vec::with_capacity(grid_h * grid_w * head_dim * 2);
+    // `get_cos_sin` returns `rotary_dim / 2` values per axis.  GLM's
+    // `rotary_dim` is half the head size, so flattening the two position ids
+    // yields one `head_dim / 2`-wide row per patch: H frequencies followed by
+    // W frequencies.  The ApplyRotaryEmb Neox path then pairs that row with
+    // the two halves of the full head.
+    let mut cos = Vec::with_capacity(grid_h * grid_w * rotary_dim * 2);
+    let mut sin = Vec::with_capacity(grid_h * grid_w * rotary_dim * 2);
     // vLLM's 2-D position ids visit each spatial-merge block, then its 2x2
     // members.  This is also the order expected by the post-ViT conv2d.
     for _ in 0..temporal_groups {
@@ -38,9 +43,8 @@ fn rope_table(
                     for inner_w in 0..2 {
                         let positions = [block_h * 2 + inner_h, block_w * 2 + inner_w];
                         for &position in &positions {
-                            for dim in 0..rotary_dim {
-                                let freq = if dim < half { dim } else { dim - half };
-                                let angle = position as f32 * inv[freq];
+                            for dim in 0..half {
+                                let angle = position as f32 * inv[dim];
                                 cos.extend_from_slice(&bf16_bits(angle.cos()).to_le_bytes());
                                 sin.extend_from_slice(&bf16_bits(angle.sin()).to_le_bytes());
                             }
@@ -219,22 +223,15 @@ impl GlmVisionEncoder {
                 self.hidden_size,
                 stream,
             )?;
-            self.gemm(
+            self.gemm_bias(
                 gpu,
                 self.buf_norm,
                 block.qkv_w,
+                block.qkv_b,
                 self.buf_wide,
                 patches,
                 3 * self.hidden_size,
                 self.hidden_size,
-                stream,
-            )?;
-            self.gemm_bias_in_place(
-                gpu,
-                self.buf_wide,
-                block.qkv_b,
-                patches,
-                3 * self.hidden_size,
                 stream,
             )?;
             self.attention(
@@ -248,21 +245,14 @@ impl GlmVisionEncoder {
                 patches,
                 stream,
             )?;
-            self.gemm(
+            self.gemm_bias(
                 gpu,
                 self.buf_attn,
                 block.proj_w,
-                self.buf_norm,
-                patches,
-                self.hidden_size,
-                self.hidden_size,
-                stream,
-            )?;
-            self.gemm_bias_in_place(
-                gpu,
-                self.buf_norm,
                 block.proj_b,
+                self.buf_norm,
                 patches,
+                self.hidden_size,
                 self.hidden_size,
                 stream,
             )?;
@@ -282,22 +272,15 @@ impl GlmVisionEncoder {
                 self.hidden_size,
                 stream,
             )?;
-            self.gemm(
+            self.gemm_bias(
                 gpu,
                 self.buf_norm,
                 block.gate_up_w,
+                block.gate_up_b,
                 self.buf_wide,
                 patches,
                 2 * self.intermediate_size,
                 self.hidden_size,
-                stream,
-            )?;
-            self.gemm_bias_in_place(
-                gpu,
-                self.buf_wide,
-                block.gate_up_b,
-                patches,
-                2 * self.intermediate_size,
                 stream,
             )?;
             self.swiglu(
@@ -308,22 +291,15 @@ impl GlmVisionEncoder {
                 self.intermediate_size,
                 stream,
             )?;
-            self.gemm(
+            self.gemm_bias(
                 gpu,
                 self.buf_act,
                 block.down_w,
+                block.down_b,
                 self.buf_norm,
                 patches,
                 self.hidden_size,
                 self.intermediate_size,
-                stream,
-            )?;
-            self.gemm_bias_in_place(
-                gpu,
-                self.buf_norm,
-                block.down_b,
-                patches,
-                self.hidden_size,
                 stream,
             )?;
             self.add(
@@ -421,17 +397,17 @@ mod tests {
     #[test]
     fn rope_table_tracks_h_and_w_in_merge_block_order() {
         let (cos, sin) = rope_table(2, 2, 1, 64);
-        assert_eq!(cos.len(), 2 * 2 * 64 * 2);
+        assert_eq!(cos.len(), 2 * 2 * (64 / 2) * 2);
         assert_eq!(sin.len(), cos.len());
         let row = |bytes: &[u8], index: usize| bf16_to_f32(&bytes[index * 2..index * 2 + 2]);
         // The first patch is at (h=0,w=0), so every rotary cosine is one.
         assert!((row(&cos, 0) - 1.0).abs() < 0.01);
         // The second patch remains on h=0 and advances w; the first axis is
         // unchanged while the second axis has a non-trivial sine.
-        assert!((row(&cos, 64) - 1.0).abs() < 0.01);
-        assert!(row(&sin, 96).abs() > 0.1);
+        assert!((row(&cos, 32) - 1.0).abs() < 0.01);
+        assert!(row(&sin, 48).abs() > 0.1);
         // The third patch advances h and returns to w=0.
-        assert!(row(&sin, 128).abs() > 0.1);
-        assert!(row(&sin, 160).abs() < 0.01);
+        assert!(row(&sin, 64).abs() > 0.1);
+        assert!(row(&sin, 80).abs() < 0.01);
     }
 }
