@@ -5,7 +5,7 @@
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 
 use super::super::super::types::TransformerModel;
 use crate::layers::ops;
@@ -153,10 +153,38 @@ impl TransformerModel {
                 // embedding, and the model described a featureless gray field
                 // while every token count looked correct.
                 let (image_pad, video_pad) = self.vision_pad_ids();
+                let prior_pad_rows = crate::model::vision_transport::pad_rows_before_chunk(
+                    tokens,
+                    chunk_start,
+                    image_pad,
+                    video_pad,
+                );
                 // Co-dispatch: this request's slice starts at vision_row_base
                 // in the shared packed buf_out (0 for the legacy single encode).
                 let row_base = *self.vision_row_base.lock();
-                let mut img_idx = 0usize; // pad-token count within the chunk
+                let owned_images = *self.vision_owned_images.lock();
+                let slice_rows = *self.vision_slice_rows.lock();
+                let chunk_pad_rows = chunk_tokens
+                    .iter()
+                    .filter(|&&tok| tok == image_pad || tok == video_pad)
+                    .count();
+                ensure!(
+                    row_base
+                        .checked_add(prior_pad_rows)
+                        .and_then(|v| v.checked_add(chunk_pad_rows))
+                        .is_some_and(|end| end <= pending),
+                    "vision pad rows exceed encoded rows: base={row_base}, prior={prior_pad_rows}, chunk={chunk_pad_rows}, encoded={pending}"
+                );
+                if owned_images > 0 {
+                    ensure!(
+                        slice_rows > 0
+                            && prior_pad_rows
+                                .checked_add(chunk_pad_rows)
+                                .is_some_and(|end| end <= slice_rows),
+                        "vision pad rows exceed co-dispatched slice: prior={prior_pad_rows}, chunk={chunk_pad_rows}, slice={slice_rows}"
+                    );
+                }
+                let mut img_idx = prior_pad_rows; // global pad-row index, not chunk-local
                 for (i, &tok) in chunk_tokens.iter().enumerate() {
                     if tok == image_pad || tok == video_pad {
                         let src = ve

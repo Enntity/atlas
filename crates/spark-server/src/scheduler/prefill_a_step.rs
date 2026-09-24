@@ -284,6 +284,7 @@ pub fn start_chunked_prefill(
             // EP: broadcast chunk 0 to worker (no-op on single-GPU; the batched
             // step does NOT re-broadcast, so this stays the only broadcast site).
             model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
+            model.ep_broadcast_vision_state_for_seq(seq.slot_idx as u32, false, 0, 0, 0, 0)?;
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
             model.ep_broadcast_cmd(chunk_len as u32)?;
             model.ep_broadcast_cmd(0)?; // chunk_start
@@ -361,26 +362,50 @@ pub fn start_chunked_prefill(
             model.stream_wait_event(prefill_stream, prefill_event)?;
         }
 
+        // Co-dispatch: point this request's chunk-0 splice/MRoPE at its slice of
+        // the shared packed buf_out before the worker receives the same slice
+        // descriptor. Single-chunk-fit is guaranteed upstream for this path.
+        let vision_enabled = vision_slice.is_some() || !image_pixels.is_empty();
+        if let Some(s) = vision_slice {
+            model.set_vision_slice_base(
+                s.patch_row_offset,
+                s.grid_index_offset,
+                s.num_images,
+                s.patch_row_count,
+            );
+        } else {
+            model.set_vision_slice_base(0, 0, 0, 0);
+        }
+
         // EP: broadcast chunk 0 tokens to worker.
         // Send full prompt length + all tokens so worker can do
         // identical Marconi prefix-cache lookups (bug #33 fix).
         // Uses bulk broadcast (single NCCL op) instead of per-token broadcast
         // which caused NCCL timeouts on long prompts (6K+ tokens = 6K+ broadcasts).
         model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
+        let (vision_row_base, vision_grid_base, vision_owned_images, vision_slice_rows) =
+            vision_slice.map_or((0, 0, 0, 0), |s| {
+                (
+                    s.patch_row_offset,
+                    s.grid_index_offset,
+                    s.num_images,
+                    s.patch_row_count,
+                )
+            });
+        model.ep_broadcast_vision_state_for_seq(
+            seq.slot_idx as u32,
+            vision_enabled,
+            vision_row_base,
+            vision_grid_base,
+            vision_owned_images,
+            vision_slice_rows,
+        )?;
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(chunk_len as u32)?;
         model.ep_broadcast_cmd(0)?; // chunk_start
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
         model.ep_broadcast_tokens(&prompt_tokens)?;
 
-        // Co-dispatch: point this request's chunk-0 splice/MRoPE at its slice of
-        // the shared packed buf_out. Single-chunk-fit is guaranteed upstream, so
-        // the whole prompt (and its full pad run) is consumed in THIS chunk —
-        // set before, reset after (the scheduler admit loop is single-threaded,
-        // so no other request observes the non-zero base).
-        if let Some(s) = vision_slice {
-            model.set_vision_slice_base(s.patch_row_offset, s.grid_index_offset, s.num_images);
-        }
         let _pt0 = std::time::Instant::now();
         let chunk_res = model.prefill_chunk(
             &prompt_tokens,
@@ -400,7 +425,7 @@ pub fn start_chunked_prefill(
             );
         }
         if vision_slice.is_some() {
-            model.set_vision_slice_base(0, 0, 0);
+            model.set_vision_slice_base(0, 0, 0, 0);
         }
         let logits = chunk_res?;
         super::prefill_normalization::initial(model, &seq)?;

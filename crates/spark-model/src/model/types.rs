@@ -415,6 +415,9 @@ pub struct TransformerModel {
     pub(super) vision_row_base: Mutex<usize>,
     pub(super) vision_grid_base: Mutex<usize>,
     pub(super) vision_owned_images: Mutex<usize>,
+    /// Number of encoded rows owned by the current co-dispatched request.
+    /// Zero means the legacy single-request range (or no pending vision).
+    pub(super) vision_slice_rows: Mutex<usize>,
     /// Page-locked host staging for batched metadata H2D transfers.
     /// Allocated once at init via cuMemAllocHost, freed in Drop.
     ///

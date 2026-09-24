@@ -996,10 +996,37 @@ pub trait Model: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Set the co-dispatched batched-ViT slice base for the NEXT prefill_chunk
-    /// (row offset into buf_out, grid index offset, image count owned). Pass
-    /// (0,0,0) to reset to the legacy single-request behaviour. Default: no-op.
-    fn set_vision_slice_base(&self, _row_base: usize, _grid_base: usize, _owned_images: usize) {}
+    /// Set the co-dispatched batched-ViT slice for the NEXT prefill_chunk
+    /// (row offset into buf_out, grid index offset, image count and row count
+    /// owned). Pass all zeroes to reset to the legacy single-request
+    /// behaviour. Default: no-op.
+    fn set_vision_slice_base(
+        &self,
+        _row_base: usize,
+        _grid_base: usize,
+        _owned_images: usize,
+        _slice_rows: usize,
+    ) {
+    }
+
+    /// Synchronize the rank-local vision state before an EP/TP prefill.
+    ///
+    /// `enabled=false` explicitly clears the worker's pending image state for
+    /// a text request. When enabled, the implementation sends the encoded BF16
+    /// rows and grid metadata, plus the optional co-dispatch slice. The final
+    /// argument is zero for the legacy single-request range and non-zero for a
+    /// packed slice. Text-only models keep the default no-op implementation.
+    fn ep_broadcast_vision_state_for_seq(
+        &self,
+        _seq_id: u32,
+        _enabled: bool,
+        _row_base: usize,
+        _grid_base: usize,
+        _owned_images: usize,
+        _slice_rows: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// EP worker step: receive a (seq_id, cmd) preamble from rank 0 and
     /// execute the command in the addressed slot.

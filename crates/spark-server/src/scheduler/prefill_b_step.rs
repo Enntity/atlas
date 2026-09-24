@@ -258,6 +258,14 @@ pub fn prefill_request(
 
         // EP: broadcast prefill command + tokens to worker (bulk, single NCCL op).
         model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
+        model.ep_broadcast_vision_state_for_seq(
+            seq.slot_idx as u32,
+            !image_pixels.is_empty(),
+            0,
+            0,
+            0,
+            0,
+        )?;
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?;
         model.ep_broadcast_cmd(0)?; // chunk_start = 0 (non-chunked)

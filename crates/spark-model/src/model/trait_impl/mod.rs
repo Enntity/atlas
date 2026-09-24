@@ -89,10 +89,35 @@ impl Model for TransformerModel {
     ) -> Result<Vec<(usize, usize, usize, usize)>> {
         self.prepare_vision_embed_batched_dispatch(per_request)
     }
-    fn set_vision_slice_base(&self, row_base: usize, grid_base: usize, owned_images: usize) {
+    fn set_vision_slice_base(
+        &self,
+        row_base: usize,
+        grid_base: usize,
+        owned_images: usize,
+        slice_rows: usize,
+    ) {
         *self.vision_row_base.lock() = row_base;
         *self.vision_grid_base.lock() = grid_base;
         *self.vision_owned_images.lock() = owned_images;
+        *self.vision_slice_rows.lock() = slice_rows;
+    }
+    fn ep_broadcast_vision_state_for_seq(
+        &self,
+        seq_id: u32,
+        enabled: bool,
+        row_base: usize,
+        grid_base: usize,
+        owned_images: usize,
+        slice_rows: usize,
+    ) -> Result<()> {
+        self.ep_broadcast_vision_state_for_seq_dispatch(
+            seq_id,
+            enabled,
+            row_base,
+            grid_base,
+            owned_images,
+            slice_rows,
+        )
     }
     // The four prefill entry points each end with `try_eager_drafter_prefill`:
     // the whole-prompt drafter capture is a single shared slot, so it must be

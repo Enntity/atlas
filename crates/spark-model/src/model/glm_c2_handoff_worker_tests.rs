@@ -3,6 +3,7 @@
 //! Sequence leases are genuinely allocated by Fixture; F1 allocation, SSM,
 //! NCCL numerics, accepted-row verdicts and paired E1 consumption are NOT tested.
 use super::{fixture::*, isolated};
+use crate::model::vision_transport::EP_CMD_VISION_STATE;
 use crate::traits::{Model, SequenceState};
 use anyhow::{Result, ensure};
 use parking_lot::Mutex;
@@ -157,6 +158,12 @@ fn disable_mtp(slot: usize) -> Vec<Message> {
     ]
 }
 
+fn clear_vision(slot: usize) -> Vec<Message> {
+    let mut messages = command(slot, EP_CMD_VISION_STATE);
+    messages.push(Message::Payload(0, vec![0; 6]));
+    messages
+}
+
 fn take_slots(f: &mut Fixture) -> [Option<SequenceState>; 2] {
     std::mem::replace(&mut f.seqs, std::array::from_fn(SequenceState::host_only)).map(Some)
 }
@@ -193,6 +200,33 @@ fn worker_applies_native_only_fence_before_prefill() {
     assert!(slots[1].as_ref().unwrap().disable_mtp);
     // The fence is metadata only; no model collective or MTP producer ran.
     assert_eq!(comm.collectives.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn worker_clears_pending_vision_state_for_text_prefill() {
+    if isolated("worker_tests::worker_clears_pending_vision_state_for_text_prefill") {
+        return;
+    }
+    let mut f = Fixture::new(1);
+    let comm = Scripted::install(&mut f);
+    let mut slots = take_slots(&mut f);
+    *f.model.vision_embed_patches.lock() = 7;
+    *f.model.vision_image_grids.lock() = vec![(1, 2, 2)];
+    *f.model.vision_row_base.lock() = 3;
+    *f.model.vision_grid_base.lock() = 1;
+    *f.model.vision_owned_images.lock() = 1;
+    *f.model.vision_slice_rows.lock() = 4;
+    let messages = clear_vision(1);
+    comm.queue(messages.clone());
+
+    assert!(f.model.ep_worker_step(&mut slots).unwrap());
+    comm.done(&messages);
+    assert_eq!(*f.model.vision_embed_patches.lock(), 0);
+    assert!(f.model.vision_image_grids.lock().is_empty());
+    assert_eq!(*f.model.vision_row_base.lock(), 0);
+    assert_eq!(*f.model.vision_grid_base.lock(), 0);
+    assert_eq!(*f.model.vision_owned_images.lock(), 0);
+    assert_eq!(*f.model.vision_slice_rows.lock(), 0);
 }
 
 #[test]
