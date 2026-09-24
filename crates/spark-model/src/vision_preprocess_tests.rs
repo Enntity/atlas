@@ -105,6 +105,55 @@ fn glm_resize_or_pad_keeps_content_in_the_upper_left() {
     assert_eq!(padded.get_pixel(7, 3), &image::Rgb([0, 0, 0]));
 }
 
+fn glm_budget_cfg() -> VisionConfig {
+    let mut cfg = ok_cfg();
+    cfg.is_glm5_next = true;
+    cfg.patch_size = 14;
+    cfg.temporal_patch_size = 2;
+    cfg.spatial_merge_size = 2;
+    cfg
+}
+
+#[test]
+fn glm_large_photo_fits_the_bounded_encoder_capacity() {
+    let cfg = glm_budget_cfg();
+    let (h, w) = glm_target_size(&cfg, 1080, 1920, 2, None, false).unwrap();
+    assert_eq!(h % 28, 0);
+    assert_eq!(w % 28, 0);
+    assert!(h as usize / 14 * (w as usize / 14) <= GLM_FALLBACK_MAX_PATCHES);
+}
+
+#[test]
+fn glm_panorama_fits_without_unbounded_encoder_growth() {
+    let cfg = glm_budget_cfg();
+    let (h, w) = glm_target_size(&cfg, 512, 8192, 2, None, false).unwrap();
+    assert_eq!(h % 28, 0);
+    assert_eq!(w % 28, 0);
+    assert!(h as usize / 14 * (w as usize / 14) <= GLM_FALLBACK_MAX_PATCHES);
+}
+
+#[test]
+fn glm_video_total_rows_fit_the_bounded_encoder_capacity() {
+    let cfg = glm_budget_cfg();
+    let frames = 8;
+    let (h, w) = glm_target_size(&cfg, 4096, 4096, frames, None, true).unwrap();
+    let groups = frames / cfg.temporal_patch_size;
+    let output_rows = groups * (h as usize / 14 / 2) * (w as usize / 14 / 2);
+    assert!(output_rows <= GLM_FALLBACK_MAX_PATCHES);
+    assert!(frames * h as usize * w as usize <= glm_runtime_max_pixels(&cfg, None, true));
+}
+
+#[test]
+fn glm_explicit_budget_counts_temporal_volume_for_encoder_capacity() {
+    let cfg = glm_budget_cfg();
+    let volume =
+        GLM_FALLBACK_MAX_PATCHES * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+    let (patches, _) =
+        derive_glm_max_patches(Some(volume), cfg.patch_size, cfg.temporal_patch_size);
+    assert_eq!(patches, GLM_FALLBACK_MAX_PATCHES);
+    assert_eq!(glm_runtime_max_pixels(&cfg, Some(volume), false), volume);
+}
+
 /// A `vision_config` for the shipped Qwen3-VL geometry.
 fn ok_cfg() -> VisionConfig {
     VisionConfig {
