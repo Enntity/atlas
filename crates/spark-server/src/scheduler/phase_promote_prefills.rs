@@ -165,6 +165,7 @@ pub(super) fn build_active_seq_from_prefill(
         min_tokens: p.min_tokens,
         eos_tokens: p.eos_tokens,
         finished: immediate_finish,
+        terminal_error: None,
         guard_stop: None,
         param_close_pending: 0,
         sink: p.sink,

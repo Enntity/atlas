@@ -15,6 +15,13 @@ pub fn long_context_enabled() -> bool {
 
 pub const MAX_LONG_CONTEXT: usize = 32_768;
 
+/// Bound a serving arena's context before it is handed to the repaired
+/// verifier. The native serving lane may expose a larger context; requests
+/// beyond this indexed domain are admitted with MTP disabled.
+pub fn repair_context(context: usize) -> usize {
+    context.min(MAX_LONG_CONTEXT)
+}
+
 /// The legacy prompt capture has one writer. Retained owner tails and repair
 /// staging allow other requests to decode while that one prompt is chunked.
 pub fn new_prompt_capacity(active: usize, prefilling: usize, capacity: usize) -> usize {
@@ -270,5 +277,11 @@ mod tests {
         assert_eq!(new_prompt_capacity(0, 1, 4), 0);
         assert_eq!(new_prompt_capacity(2, 1, 4), 0);
         assert_eq!(new_prompt_capacity(4, 0, 4), 0);
+    }
+
+    #[test]
+    fn repair_context_bounds_larger_serving_profiles() {
+        assert_eq!(repair_context(MAX_LONG_CONTEXT), MAX_LONG_CONTEXT);
+        assert_eq!(repair_context(MAX_LONG_CONTEXT + 4096), MAX_LONG_CONTEXT);
     }
 }

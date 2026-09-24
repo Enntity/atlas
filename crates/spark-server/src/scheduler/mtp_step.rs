@@ -4,6 +4,16 @@
 
 use super::*;
 
+/// Mark an MTP failure for the normal retirement pass. Sending the error
+/// immediately would free the live owner while it is still present in the
+/// active set; leaving only `finished=true` would instead synthesize a
+/// successful `stop` response and cache the partial prefix. `finish_sequence`
+/// consumes this marker and uses the terminal error/free path exactly once.
+fn mark_terminal_error(a: &mut ActiveSeq, error: impl Into<String>) {
+    a.terminal_error = Some(error.into());
+    a.finished = true;
+}
+
 /// MTP-aware step: bootstrap sequences without drafts, then verify via CUDA graph.
 /// Supports K=2 (num_drafts=1) and K=3 (num_drafts=2).
 ///
@@ -248,14 +258,14 @@ pub fn step_mtp(
         // EP: broadcast token to worker before decode (worker runs decode in lockstep).
         if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
             tracing::error!("EP broadcast bootstrap token: {e:#}");
-            a.finished = true;
+            mark_terminal_error(a, format!("EP broadcast bootstrap token failed: {e:#}"));
             continue;
         }
         let logits = match model.decode(a.last_token, &mut a.seq, 0) {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!("bootstrap decode error: {e:#}");
-                a.finished = true;
+                mark_terminal_error(a, format!("bootstrap decode failed: {e:#}"));
                 continue;
             }
         };
@@ -303,7 +313,7 @@ pub fn step_mtp(
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("bootstrap sample error: {e:#}");
-                a.finished = true;
+                mark_terminal_error(a, format!("bootstrap sampling failed: {e:#}"));
                 continue;
             }
         };
@@ -359,7 +369,7 @@ pub fn step_mtp(
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp: {e:#}");
             if spark_model::speculative::glm_repair_policy::enabled() {
-                a.finished = true;
+                mark_terminal_error(a, format!("save_hidden_for_mtp failed: {e:#}"));
             }
             continue;
         }
@@ -399,16 +409,22 @@ pub fn step_mtp(
                 Ok(_) => {
                     tracing::warn!("MTP propose returned empty");
                     if spark_model::speculative::glm_repair_policy::enabled() {
-                        a.finished = true;
+                        mark_terminal_error(a, "MTP propose returned empty");
                     }
                 }
                 Err(e) => {
                     tracing::error!("run_mtp_propose_multi: {e:#}");
                     if spark_model::speculative::glm_repair_policy::enabled() {
-                        a.finished = true;
+                        mark_terminal_error(a, format!("MTP proposal failed: {e:#}"));
                     }
                 }
             }
+        }
+
+        // A terminal proposal failure must not start a checkpoint on the
+        // partially-mutated proposer state before retirement frees it.
+        if a.finished {
+            continue;
         }
 
         if let Err(e) = model.start_checkpoint_async(&mut a.seq) {

@@ -3,6 +3,37 @@
 use super::*;
 
 #[test]
+fn served_36k_profile_is_bounded_before_mtp2_limits() {
+    let served_context = 36_864;
+    let repair_context = crate::speculative::glm_repair_policy::repair_context(served_context);
+    assert_eq!(repair_context, 32_768);
+    assert!(
+        Limits::new(
+            Profile {
+                drafts: 2,
+                ..profile()
+            },
+            repair_context,
+            32_784,
+            2,
+        )
+        .is_ok()
+    );
+    assert!(
+        Limits::new(
+            Profile {
+                drafts: 2,
+                ..profile()
+            },
+            served_context,
+            32_784,
+            2,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn two_draft_limits_cover_all_verdicts_and_keep_fixed_width() {
     let limits = Limits::new(
         Profile {

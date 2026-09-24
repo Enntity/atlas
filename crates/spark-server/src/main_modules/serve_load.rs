@@ -37,6 +37,25 @@ use crate::{
     session_manager,
 };
 
+/// Return the PTX module that implements the checkpoint's vision tower.
+///
+/// Qwen-shaped towers use the historical `vision_encoder` module name. GLM-
+/// 5.3 has intentionally separate kernels and therefore ships
+/// `glm_vision_encoder`; accepting that name only for the corresponding
+/// parsed config keeps the startup guard fail-closed for every other model.
+fn required_vision_module(is_glm5_next: bool) -> &'static str {
+    if is_glm5_next {
+        "glm_vision_encoder"
+    } else {
+        "vision_encoder"
+    }
+}
+
+fn target_has_required_vision_module(is_glm5_next: bool, modules: &[(&str, &[u8])]) -> bool {
+    let required = required_vision_module(is_glm5_next);
+    modules.iter().any(|(name, _)| *name == required)
+}
+
 mod selected_handoff;
 use selected_handoff::ServingModel;
 
@@ -360,21 +379,22 @@ pub(crate) fn load_model_selected(
     );
 
     // Text-only kernel target + a checkpoint that ships a vision tower: honor the
-    // TARGET spec and serve text-only rather than failing the build at
-    // `vision_encoder module not loaded`. Some VL checkpoints (e.g.
-    // Kbenkhaled/Qwen3.5-27B-NVFP4) carry a `vision_config`, but their Atlas
-    // kernel target (qwen3.5-27b) ships no `vision_encoder` PTX module. Drop the
-    // vision tower to text-only; image inputs are unsupported until the target
-    // is rebuilt with vision.
-    if config.vision.is_some()
-        && !ptx_set
-            .modules
-            .iter()
-            .any(|(name, _)| *name == "vision_encoder")
-    {
+    // TARGET spec and serve text-only rather than failing the build at a missing
+    // vision module. Qwen-shaped VL targets use `vision_encoder`; native GLM-
+    // 5.3 uses the separate `glm_vision_encoder` module. Some VL checkpoints
+    // (e.g. Kbenkhaled/Qwen3.5-27B-NVFP4) carry a `vision_config`, but their
+    // Atlas kernel target ships no corresponding PTX module. Drop the vision
+    // tower to text-only; image inputs are unsupported until the target is
+    // rebuilt with vision.
+    let missing_vision_module = config.vision.as_ref().and_then(|vision| {
+        let required = required_vision_module(vision.is_glm5_next);
+        (!target_has_required_vision_module(vision.is_glm5_next, &ptx_set.modules))
+            .then_some(required)
+    });
+    if let Some(required_vision) = missing_vision_module {
         tracing::warn!(
             "Checkpoint declares a vision tower but kernel target {} ships no \
-             vision_encoder module — serving TEXT-ONLY (image inputs ignored). \
+             {required_vision} module — serving TEXT-ONLY (image inputs ignored). \
              Rebuild the target with vision to enable images.",
             ptx_set.target,
         );

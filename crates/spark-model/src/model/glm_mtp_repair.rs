@@ -114,7 +114,14 @@ impl TransformerModel {
             generation: seq.mtp_capture_gen,
             capture_generation,
             captured_rows: self.mtp_prefill_capture_len.load(Ordering::Relaxed),
-            context_tokens: self.mtp_prefill_capacity,
+            // The served arena may be larger than the repaired verifier's
+            // indexed domain. Requests whose prompt+output budget crosses
+            // this bound are admitted to the native lane with disable_mtp;
+            // keep the repair plan itself inside the domain for short
+            // requests on a larger (for example 36K) serving profile.
+            context_tokens: crate::speculative::glm_repair_policy::repair_context(
+                self.mtp_prefill_capacity,
+            ),
             capture: RepairSpan {
                 ptr: self.mtp_prefill_hidden,
                 bytes: capture_bytes,

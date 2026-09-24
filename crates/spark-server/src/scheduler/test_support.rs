@@ -57,6 +57,7 @@ pub(super) fn test_owned_seq(
         min_tokens: 7,
         eos_tokens: EOS.to_vec(),
         finished: true,
+        terminal_error: None,
         guard_stop,
         param_close_pending: 0,
         sink: ResponseSink::Blocking(Some(tx)),

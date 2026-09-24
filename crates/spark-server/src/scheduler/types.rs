@@ -168,6 +168,10 @@ pub(super) struct ActiveSeq {
     pub min_tokens: usize,
     pub eos_tokens: Vec<u32>,
     pub finished: bool,
+    /// Terminal scheduler/model failure. Retired through `send_error` so a
+    /// failed request cannot be reported as a natural stop or cached as a
+    /// usable prefix.
+    pub terminal_error: Option<String>,
     /// Which server-side guard force-finished this sequence (e.g.
     /// "fuzzy_repetition"), if any. Surfaced in the synthesized --dump body
     /// so a guard-cut turn is attributable without log archaeology (the

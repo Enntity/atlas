@@ -134,6 +134,10 @@ pub(super) fn derive_finish_reason(
 /// 0 = unlimited) — needed so the `"length"` decision reuses the exact
 /// stop predicate from `emit_step`/`decode_logits_step`.
 pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize) {
+    if let Some(error) = a.terminal_error.take() {
+        send_error(model, a, &error);
+        return;
+    }
     finish_response(a, max_seq_len);
     // Cache the full sequence (prompt + generated) in the prefix cache.
     // Must happen BEFORE free_sequence() so block indices are still valid.
@@ -355,6 +359,7 @@ pub fn resume_swapped_seq(
         min_tokens: s.min_tokens,
         eos_tokens: s.eos_tokens,
         finished: false,
+        terminal_error: None,
         guard_stop: None,
         param_close_pending: 0,
         sink: s.sink,
