@@ -74,7 +74,11 @@ fn rendered_glm_generation_tail_reconciles_requested_thinking() {
         assert!(open.ends_with(suffix), "plain request thinking={requested}");
         assert_eq!(
             reconcile_prompt_thinking(&open, Some(START), Some(END), requested, Some(32), 128),
-            if requested { (true, Some(32)) } else { (false, None) }
+            if requested {
+                (true, Some(32))
+            } else {
+                (false, None)
+            }
         );
     }
 }
