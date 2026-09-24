@@ -179,6 +179,10 @@ fn glm5_next_maps_nested_hybrid_mla_kda_and_ep_shape() {
     assert_eq!(vision.projection_intermediate_size, 10240);
     assert_eq!(vision.out_hidden_size, 4096);
     assert_eq!(vision.image_pad_token_id, 151655);
+    assert_eq!(vision.image_start_token_id, 154830);
+    assert_eq!(vision.image_end_token_id, 154831);
+    assert_eq!(vision.video_start_token_id, 154832);
+    assert_eq!(vision.video_end_token_id, 154833);
     let quant = cfg.quantization_config.unwrap();
     assert_eq!(quant.quant_method, "modelopt");
     assert_eq!(quant.quant_algo, "NVFP4");

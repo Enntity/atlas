@@ -182,6 +182,10 @@ fn ok_cfg() -> VisionConfig {
         deepstack_visual_indexes: vec![8, 16, 24],
         image_pad_token_id: 151_655,
         video_pad_token_id: 151_656,
+        image_start_token_id: 0,
+        image_end_token_id: 0,
+        video_start_token_id: 0,
+        video_end_token_id: 0,
         // These tests drive `preprocess_image_with_max_pixels` directly
         // with an explicit bound, so the config-carried one is not the
         // subject here.

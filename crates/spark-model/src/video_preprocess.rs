@@ -56,6 +56,10 @@ pub struct PreprocessedVideo {
     pub grid_t: usize,
     pub grid_h: usize,
     pub grid_w: usize,
+    /// One timestamp per temporal group, in source-video seconds. GLM's
+    /// prompt expansion places this text after each per-frame image marker;
+    /// retaining it here keeps the prompt and encoder group order coupled.
+    pub timestamps: Vec<f32>,
 }
 
 /// Summarised rather than derived: the payload is megabytes of f32 and a
@@ -65,12 +69,13 @@ impl std::fmt::Debug for PreprocessedVideo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "PreprocessedVideo {{ grid_t: {}, grid_h: {}, grid_w: {}, groups: {} x {} f32 }}",
+            "PreprocessedVideo {{ grid_t: {}, grid_h: {}, grid_w: {}, groups: {} x {} f32, timestamps: {} }}",
             self.grid_t,
             self.grid_h,
             self.grid_w,
             self.groups.len(),
-            self.groups.first().map_or(0, Vec::len)
+            self.groups.first().map_or(0, Vec::len),
+            self.timestamps.len()
         )
     }
 }
@@ -442,6 +447,13 @@ pub fn preprocess_video(
         grid_t,
         grid_h,
         grid_w,
+        // The pinned GLM processor's non-Glm4v path formats full-second
+        // timestamps (`"{:.1f} seconds"`) and takes one timestamp per
+        // temporal pair. Preserve that source-frame contract even when the
+        // decoder has already resampled an ffmpeg stream.
+        timestamps: (0..grid_t)
+            .map(|g| (keep[g * tp] as f32 / native_fps.max(f32::EPSILON)).floor())
+            .collect(),
     })
 }
 

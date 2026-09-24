@@ -11,6 +11,7 @@ use axum::response::Response;
 use std::sync::Arc;
 
 use crate::AppState;
+use crate::tokenizer::Glm5VisionPlaceholder;
 
 use super::super::compact::{compact_messages, openai_error_response};
 use super::msg_entry::MsgEntry;
@@ -31,6 +32,7 @@ pub(super) fn render_template(
     tools: &[crate::tool_parser::ToolDefinition],
     messages: &[MsgEntry],
     image_pad_counts: &[usize],
+    vision_placeholders: &[Glm5VisionPlaceholder],
     enable_thinking: bool,
     thinking_budget: Option<u32>,
     reasoning_effort: Option<crate::ir::ReasoningEffort>,
@@ -107,8 +109,25 @@ pub(super) fn render_template(
         }
     };
 
-    // Expand image pads when needed.
-    let prompt_tokens = if image_pad_counts.iter().any(|&c| c > 1) {
+    // GLM-5's shipped template intentionally emits canonical compact marker
+    // triples. Its checkpoint processor leaves the rendered text unchanged;
+    // expand those triples here so every image/video encoder row has a
+    // matching input token. Other model families keep the legacy pad-only
+    // expansion below.
+    let prompt_tokens = if !vision_placeholders.is_empty() {
+        match state
+            .tokenizer
+            .expand_glm5_vision_placeholders(prompt_tokens, vision_placeholders)
+        {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                return Err(openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("GLM-5 vision placeholder error: {e}"),
+                ));
+            }
+        }
+    } else if image_pad_counts.iter().any(|&c| c > 1) {
         state
             .tokenizer
             .expand_vision_pads(prompt_tokens, image_pad_counts)

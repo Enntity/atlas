@@ -63,3 +63,59 @@ fn glm5_without_tools_preserves_stock_reasoning_prompt() {
         assert!(rendered.ends_with("<|assistant|><think>"));
     }
 }
+
+#[test]
+fn glm5_rendered_prompt_keeps_two_image_markers_in_order() {
+    let messages = [json!({
+        "role": "user",
+        "content": [
+            {"type": "image"},
+            {"type": "text", "text": "compare"},
+            {"type": "image"}
+        ]
+    })];
+    let rendered = render(&messages, None, false);
+    let marker = "<|begin_of_image|><|image|><|end_of_image|>";
+    assert_eq!(rendered.matches(marker).count(), 2, "{rendered}");
+    assert!(!rendered.contains("<|vision_start|>"));
+    assert!(!rendered.contains("<|image_pad|>"));
+}
+
+#[test]
+fn glm5_multiturn_media_markers_are_not_grouped_or_dropped() {
+    let messages = [
+        json!({"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "first"}]}),
+        json!({"role": "assistant", "content": "noted"}),
+        json!({"role": "user", "content": [{"type": "text", "text": "second"}, {"type": "image"}]}),
+    ];
+    let rendered = render(&messages, None, false);
+    let marker = "<|begin_of_image|><|image|><|end_of_image|>";
+    assert_eq!(rendered.matches(marker).count(), 2, "{rendered}");
+    let first = rendered.find(marker).expect("first image marker");
+    let second = rendered[first + marker.len()..]
+        .find(marker)
+        .map(|offset| first + marker.len() + offset)
+        .expect("second image marker");
+    assert!(first < second);
+}
+
+#[test]
+fn glm5_video_template_emits_one_canonical_compact_marker() {
+    // Temporal grouping and odd-frame repair happen in the processor; the
+    // shipped chat template must contribute exactly one video triple for both
+    // a two-frame clip and a clip whose sampled frames are repaired to a pair.
+    for content in [
+        json!([{"type": "video"}, {"type": "text", "text": "two frames"}]),
+        json!([{"type": "video"}, {"type": "text", "text": "odd source"}]),
+    ] {
+        let rendered = render(&[json!({"role": "user", "content": content})], None, false);
+        assert_eq!(
+            rendered
+                .matches("<|begin_of_video|><|video|><|end_of_video|>")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert!(!rendered.contains("<|vision_start|>"));
+    }
+}

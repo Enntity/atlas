@@ -33,6 +33,10 @@ fn cfg() -> VisionConfig {
         deepstack_visual_indexes: vec![],
         image_pad_token_id: 248_056,
         video_pad_token_id: 248_057,
+        image_start_token_id: 0,
+        image_end_token_id: 0,
+        video_start_token_id: 0,
+        video_end_token_id: 0,
         max_pixels: None,
     }
 }
@@ -138,6 +142,16 @@ fn one_frame_cannot_make_a_group_at_tp2() {
     let got = sample_indices(1, 30.0, 2.0, 4, 768, 2);
     assert_eq!(got.len(), 1, "sampling reports the single frame it has");
     assert!(got.len() < 2, "and it is short of one tp=2 group");
+}
+
+#[test]
+fn glm5_sampling_repairs_an_odd_number_of_temporal_frames() {
+    let got = sample_glm_indices(25, 10.0, 2.0, 2_048, 2);
+    assert_eq!(got.len() % 2, 0, "GLM temporal groups need pairs: {got:?}");
+    assert!(got.len() >= 2);
+    if got.len() > 1 {
+        assert_eq!(got[got.len() - 1], got[got.len() - 2]);
+    }
 }
 
 // ── decode + grouping, against a real generated GIF ──────────────────────
