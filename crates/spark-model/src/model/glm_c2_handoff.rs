@@ -158,6 +158,9 @@ impl TransformerModel {
         last: bool,
         stream: u64,
     ) -> Result<()> {
+        if seq.disable_mtp {
+            return Ok(());
+        }
         let Some(capability) = self.paired_handoff() else {
             return Ok(());
         };
@@ -236,6 +239,12 @@ impl TransformerModel {
         is_last: bool,
         stream: u64,
     ) -> Result<bool> {
+        // Native-only sequences do not own paired/MTP prompt state. Returning
+        // before consulting the paired handoff avoids requiring a capture that
+        // was intentionally disabled at request allocation.
+        if seq.disable_mtp || seq.proposer_state.is_none() {
+            return Ok(false);
+        }
         let Some(capability) = self.paired_handoff() else {
             return Ok(false);
         };

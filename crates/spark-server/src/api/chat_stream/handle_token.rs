@@ -133,6 +133,7 @@ fn handle_open_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Delt
 
 fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {
     let mut deltas: DeltaVec = Vec::new();
+    state.generated_tokens = state.generated_tokens.saturating_add(1);
     state.all_toks.push(tok);
     // One push per call == one sampled token == one increment of
     // `usage.completion_tokens`. Drained onto the next client-visible
@@ -638,7 +639,9 @@ fn process_detector_content(
     let sanitized = sanitized_or_raw;
 
     // F4 SimHash guard.
-    let semantic_trip = if !state.loop_watchdog_triggered {
+    let watchdog_floor_reached =
+        crate::api::stream_guards::watchdog_floor_reached(state.generated_tokens, ctx.min_tokens);
+    let semantic_trip = if watchdog_floor_reached && !state.loop_watchdog_triggered {
         state.simhash_pending.push_str(sanitized);
         let mut dup = false;
         if crate::loop_simhash::ends_at_sentence_boundary(&state.simhash_pending).is_some()
@@ -656,11 +659,12 @@ fn process_detector_content(
         false
     };
 
-    let token_trip = check_loop_watchdog(
-        sanitized,
-        &mut state.loop_scan_buf,
-        state.loop_watchdog_triggered,
-    );
+    let token_trip = watchdog_floor_reached
+        && check_loop_watchdog(
+            sanitized,
+            &mut state.loop_scan_buf,
+            state.loop_watchdog_triggered,
+        );
 
     if semantic_trip || token_trip {
         if semantic_trip {

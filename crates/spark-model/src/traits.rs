@@ -85,6 +85,10 @@ pub struct SequenceState {
     pub layer_states: Vec<Box<dyn LayerState>>,
     /// Per-sequence state for speculative decoding proposer (None if no proposer).
     pub proposer_state: Option<Box<dyn ProposerState>>,
+    /// Request-local native-decode fence. When set, model prefill and propose
+    /// hooks must leave shared MTP capture/collective state untouched even
+    /// though the serving model was built with a proposer.
+    pub disable_mtp: bool,
     /// SSM state pool slot index. Used for CUDA graph stability — all sequences
     /// at the same slot_idx use the same fixed GPU addresses. Derived from
     /// `ssm_slot` at claim time (the guard is the authority on release
@@ -284,6 +288,7 @@ impl SequenceState {
             seq_len: 0,
             layer_states: Vec::new(),
             proposer_state: None,
+            disable_mtp: false,
             slot_idx,
             ssm_slot: None,
             marconi_skip_to: 0,

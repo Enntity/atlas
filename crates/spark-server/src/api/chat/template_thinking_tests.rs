@@ -71,10 +71,10 @@ fn rendered_glm_generation_tail_reconciles_requested_thinking() {
         let open = tokenizer
             .apply_chat_template_openai(&messages, None, requested, false)
             .unwrap();
-        assert!(open.ends_with(&[3, START]));
+        assert!(open.ends_with(suffix), "plain request thinking={requested}");
         assert_eq!(
             reconcile_prompt_thinking(&open, Some(START), Some(END), requested, Some(32), 128),
-            (true, Some(if requested { 32 } else { 128 }))
+            if requested { (true, Some(32)) } else { (false, None) }
         );
     }
 }

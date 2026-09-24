@@ -67,6 +67,7 @@ mod prefill_a_step;
 mod prefill_a_step_params;
 mod prefill_b_step;
 mod prefill_normalization;
+mod repair_admission_gate;
 mod repetition;
 mod rollback;
 mod sample_step;
@@ -434,6 +435,8 @@ pub fn run(
             &pending,
             &active,
             &prefilling,
+            &swapped,
+            &preempted,
             &*policy,
             max_batch_size,
             // Parked sequences (spilled or requeued) are waiting on blocks,

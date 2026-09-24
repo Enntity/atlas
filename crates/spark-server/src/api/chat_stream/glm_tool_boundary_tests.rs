@@ -243,6 +243,7 @@ fn stream_tokens_with_context(
         leak_markers: state.tool_call_parser.as_ref().unwrap().leak_markers(),
         wants_typed_arguments: true,
         max_tool_calls_per_response: 12,
+        min_tokens: 0,
         req_return_token_ids: true,
         req_ctx: None,
         dump_seq: None,

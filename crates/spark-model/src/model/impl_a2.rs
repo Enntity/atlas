@@ -425,6 +425,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
     /// - 0xFFFFFFF5: generic verify → K, K tokens, then num accepted drafts
+    /// - 0xFFFFFFF6: set request-local native-only fence → disabled (0/1)
     /// - 0xFFFFFFE1: distributed GLM MTP propose → token, position, drafts, hidden row
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
@@ -508,6 +509,14 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
 
         match cmd {
+            0xFFFFFFF6 => {
+                let disabled = self.ep_broadcast_u32(0)?;
+                anyhow::ensure!(
+                    disabled <= 1,
+                    "native-only sequence fence must be 0 or 1, got {disabled}"
+                );
+                seq.disable_mtp = disabled != 0;
+            }
             EP_CMD_GLM_MTP_PROPOSE => {
                 if self.paired_handoff().is_some() {
                     return self.paired_receive_propose(seq);

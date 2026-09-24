@@ -104,7 +104,13 @@ pub(crate) fn preflight_reserve(
             ep: args.ep_size,
             active: args.max_batch_size,
             admitted: args.max_num_seqs,
-            context: args.max_seq_len,
+            // The repair verifier's indexed domain ends at 32K. A larger
+            // served native context remains usable, but requests whose
+            // prompt+max_tokens budget crosses that domain are fenced into
+            // native decode by scheduler admission.
+            context: args
+                .max_seq_len
+                .min(spark_model::speculative::glm_repair_policy::MAX_LONG_CONTEXT),
             drafts: args.resolved_num_drafts(),
             native_only: args.speculative
                 && !(args.dflash || args.self_speculative || args.ngram_speculative),

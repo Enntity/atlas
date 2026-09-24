@@ -116,12 +116,12 @@ pub async fn completions(
     }
     for prompt_tokens in &prompts {
         let prompt_len = prompt_tokens.len();
-        if prompt_len >= state.max_seq_len {
+        if prompt_len.saturating_add(req.max_tokens) > state.max_seq_len {
             return openai_error_response(
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "Prompt too long: {prompt_len} tokens exceeds max_seq_len {}",
-                    state.max_seq_len
+                    "Prompt plus max_tokens exceeds max_seq_len {} (prompt={}, max_tokens={})",
+                    state.max_seq_len, prompt_len, req.max_tokens
                 ),
             );
         }

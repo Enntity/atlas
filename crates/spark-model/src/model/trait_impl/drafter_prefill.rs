@@ -110,7 +110,14 @@ impl TransformerModel {
         src: DevicePtr,
         stream: u64,
     ) -> Result<()> {
-        if self.mtp_prefill_hidden.is_null() || proc_count == 0 {
+        // Native-only sequences must not touch the single shared capture
+        // buffer; doing so would make a plain fallback mutate the next repair
+        // owner's input.
+        if self.mtp_prefill_hidden.is_null()
+            || proc_count == 0
+            || seq.disable_mtp
+            || seq.proposer_state.is_none()
+        {
             return Ok(());
         }
         use std::sync::atomic::Ordering;

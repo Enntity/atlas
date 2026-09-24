@@ -532,6 +532,7 @@ pub fn process_decode_logits(
                 if !sched.levers.disable_watchdogs
                     && sched.watchdog.enable_think_loop_watchdog
                     && !a.force_end_thinking
+                    && watchdog_floor_reached(a.output_tokens.len().saturating_add(1), a.min_tokens)
                     && a.thinking_tokens >= THINK_LOOP_MIN_TOKENS
                     && a.thinking_tokens.is_multiple_of(THINK_LOOP_CHECK_STRIDE)
                     && detect_thinking_token_loop_with(
@@ -983,6 +984,7 @@ pub fn process_decode_logits(
             if sched.levers.loop_watchdog()
                 && !a.finished
                 && !a.inside_thinking
+                && watchdog_floor_reached(a.output_tokens.len(), a.min_tokens)
                 && !inside_tool_call
                 && let Some((pattern_len, mis_a, mis_b)) = detect_fuzzy_repetition(
                     &a.output_tokens,

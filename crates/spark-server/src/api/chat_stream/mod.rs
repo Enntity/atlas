@@ -228,6 +228,7 @@ pub(crate) async fn run_chat_stream(
             .as_ref()
             .is_some_and(|p| p.wants_typed_arguments()),
         max_tool_calls_per_response,
+        min_tokens,
         req_return_token_ids,
         req_ctx,
         dump_seq,

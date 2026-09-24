@@ -310,6 +310,7 @@ pub(super) fn resume_preempted_seq(model: &dyn Model, p: PreemptedSeq) -> Result
         }
     };
     seq.session_hash = a.session_hash;
+    seq.disable_mtp = a.disable_mtp;
     seq.adapter_slot = a.seq.adapter_slot;
     // Task #24/#25 parity with the swap-in path: keep the STABLE adapter_id
     // stamped at the original prefill and re-acquire the slot ref released
@@ -321,6 +322,7 @@ pub(super) fn resume_preempted_seq(model: &dyn Model, p: PreemptedSeq) -> Result
     // EP: mirror the non-chunked prefill preamble so the worker mirrors the
     // re-prefill (no-ops on non-EP models).
     let prefill_result = (|| -> Result<()> {
+        model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, a.disable_mtp)?;
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(tokens.len() as u32)?;
         model.ep_broadcast_cmd(0)?;

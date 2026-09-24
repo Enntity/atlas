@@ -149,6 +149,14 @@ fn prefill(slot: usize, prompt: &[u32]) -> Vec<Message> {
     messages
 }
 
+fn disable_mtp(slot: usize) -> Vec<Message> {
+    vec![
+        Message::Idle(slot as u32),
+        Message::Payload(0, vec![0xfffffff6]),
+        Message::Payload(0, vec![1]),
+    ]
+}
+
 fn take_slots(f: &mut Fixture) -> [Option<SequenceState>; 2] {
     std::mem::replace(&mut f.seqs, std::array::from_fn(SequenceState::host_only)).map(Some)
 }
@@ -167,6 +175,24 @@ fn assert_publication(f: &Fixture, source: DevicePtr, row: usize) {
     let (index, event) = copies[0];
     assert_eq!(*event, Event::Copy(source, dst, ROW_BYTES, DEFAULT));
     assert_eq!(events.get(index + 1), Some(&Event::Sync(DEFAULT)));
+}
+
+#[test]
+fn worker_applies_native_only_fence_before_prefill() {
+    if isolated("worker_tests::worker_applies_native_only_fence_before_prefill") {
+        return;
+    }
+    let mut f = Fixture::new(1);
+    let comm = Scripted::install(&mut f);
+    let mut slots = take_slots(&mut f);
+    let messages = disable_mtp(1);
+    comm.queue(messages.clone());
+
+    assert!(f.model.ep_worker_step(&mut slots).unwrap());
+    comm.done(&messages);
+    assert!(slots[1].as_ref().unwrap().disable_mtp);
+    // The fence is metadata only; no model collective or MTP producer ran.
+    assert_eq!(comm.collectives.load(Ordering::Relaxed), 0);
 }
 
 #[test]

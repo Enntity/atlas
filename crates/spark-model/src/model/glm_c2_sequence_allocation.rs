@@ -87,6 +87,7 @@ impl TransformerModel {
             seq_len: 0,
             layer_states,
             proposer_state,
+            disable_mtp: false,
             slot_idx: slot,
             ssm_slot: Some(slot_guard),
             marconi_skip_to: 0,

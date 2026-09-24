@@ -120,6 +120,9 @@ pub fn prefill_request(
             return Err(e);
         }
     };
+    // Carry the request-local native-decode fence into model-owned state so
+    // prefill hooks cannot touch shared MTP capture/eager-drafter state.
+    seq.disable_mtp = req_disable_mtp;
     seq.session_hash = req_session_hash;
     seq.adapter_slot = req_adapter_slot;
     seq.src_lang_id = req_src_lang;
@@ -254,6 +257,7 @@ pub fn prefill_request(
         }
 
         // EP: broadcast prefill command + tokens to worker (bulk, single NCCL op).
+        model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?;
         model.ep_broadcast_cmd(0)?; // chunk_start = 0 (non-chunked)

@@ -44,6 +44,7 @@ impl TransformerModel {
         // From the first header attempt, uncertainty is terminal. T2 still owns
         // process containment and the worker's earlier preamble/slot resolution.
         (|| {
+            self.ep_broadcast_disable_mtp_for_seq(slot, seq.disable_mtp)?;
             self.ep_broadcast_seq_and_cmd(slot, 0xfffffff0, true)?;
             self.ep_broadcast_u32(rows)?;
             self.ep_broadcast_u32(0)?;

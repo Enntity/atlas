@@ -1107,6 +1107,19 @@ pub trait Model: Send + Sync {
         Ok(()) // no-op for non-EP models
     }
 
+    /// Set the request-local native-decode fence on the worker's matching
+    /// sequence before a prefill or resumed decode. The command is emitted
+    /// only for the native-only case so the established MTP wire transcript
+    /// remains unchanged. Workers consume the value before the next model
+    /// command, keeping TP2/EP2 prefill hooks in lockstep with the head.
+    fn ep_broadcast_disable_mtp_for_seq(&self, seq_id: u32, disabled: bool) -> Result<()> {
+        if disabled {
+            self.ep_broadcast_cmd_for_seq(seq_id, 0xFFFF_FFF6)?;
+            self.ep_broadcast_cmd(1)?;
+        }
+        Ok(())
+    }
+
     /// Returns true if this model's EP comm path is using the v2 protocol
     /// (slot-aware seq_id preamble). Default false — pre-PR behaviour.
     fn ep_protocol_v2(&self) -> bool {

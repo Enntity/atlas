@@ -141,6 +141,9 @@ pub fn start_chunked_prefill(
             return Err(e);
         }
     };
+    // Carry the request-local native-decode fence into model-owned state so
+    // prefill hooks cannot touch shared MTP capture/eager-drafter state.
+    seq.disable_mtp = req_disable_mtp;
     seq.session_hash = req_session_hash;
     seq.adapter_slot = req_adapter_slot;
     seq.src_lang_id = req_src_lang;
@@ -280,6 +283,7 @@ pub fn start_chunked_prefill(
         if let Err(e) = (|| -> Result<()> {
             // EP: broadcast chunk 0 to worker (no-op on single-GPU; the batched
             // step does NOT re-broadcast, so this stays the only broadcast site).
+            model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
             model.ep_broadcast_cmd(chunk_len as u32)?;
             model.ep_broadcast_cmd(0)?; // chunk_start
@@ -362,6 +366,7 @@ pub fn start_chunked_prefill(
         // identical Marconi prefix-cache lookups (bug #33 fix).
         // Uses bulk broadcast (single NCCL op) instead of per-token broadcast
         // which caused NCCL timeouts on long prompts (6K+ tokens = 6K+ broadcasts).
+        model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(chunk_len as u32)?;
         model.ep_broadcast_cmd(0)?; // chunk_start

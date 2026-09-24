@@ -99,6 +99,8 @@ pub(super) fn drain_pending_requests(
     pending: &Arc<(Mutex<PendingQueue>, Condvar)>,
     active: &[ActiveSeq],
     prefilling: &[PrefillInProgress],
+    swapped: &[SwappedSeq],
+    preempted: &[PreemptedSeq],
     policy: &dyn SchedulingPolicy,
     max_batch_size: usize,
     // True when spilled/requeued sequences are parked awaiting resume. They
@@ -212,16 +214,26 @@ pub(super) fn drain_pending_requests(
         cap
     };
 
+    let (eligible_prefix, effective_cap) = super::repair_admission_gate::limit_requests(
+        &g.requests,
+        active,
+        prefilling,
+        swapped,
+        preempted,
+        cap,
+        spark_model::speculative::glm_repair_policy::enabled(),
+    );
     let infos: Vec<PendingRequestInfo> = g
         .requests
         .iter()
+        .take(eligible_prefix)
         .enumerate()
         .map(|(i, req)| PendingRequestInfo {
             prompt_len: req.prompt_len(),
             index: i,
         })
         .collect();
-    let selected = policy.select_prefills(&infos, cap);
+    let selected = policy.select_prefills(&infos, effective_cap);
 
     // Remove selected indices from pending (reverse order to preserve indices).
     let mut remove_indices = selected.clone();

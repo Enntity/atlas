@@ -844,6 +844,10 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<Option<u32>> {
+        anyhow::ensure!(
+            !seq.disable_mtp,
+            "MTP propose invoked for native-only sequence"
+        );
         self.run_mtp_propose_dispatch(token, position, seq, _stream)
     }
     fn record_glm_mtp_verified(
@@ -865,6 +869,10 @@ impl Model for TransformerModel {
         _stream: u64,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
+        anyhow::ensure!(
+            !seq.disable_mtp,
+            "MTP propose invoked for native-only sequence"
+        );
         self.run_mtp_propose_multi_dispatch(
             token,
             position,
