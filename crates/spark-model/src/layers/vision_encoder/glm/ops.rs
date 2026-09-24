@@ -65,25 +65,6 @@ impl GlmVisionEncoder {
             .launch(stream)
     }
 
-    pub(super) fn gemm_bias_in_place(
-        &self,
-        gpu: &dyn GpuBackend,
-        data: DevicePtr,
-        bias: DevicePtr,
-        m: usize,
-        n: usize,
-        stream: u64,
-    ) -> Result<()> {
-        KernelLaunch::new(gpu, self.k_add_bias)
-            .grid([div_ceil((m * n) as u32, 256), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(data)
-            .arg_ptr(bias)
-            .arg_u32(m as u32)
-            .arg_u32(n as u32)
-            .launch(stream)
-    }
-
     pub(super) fn rms_norm(
         &self,
         gpu: &dyn GpuBackend,

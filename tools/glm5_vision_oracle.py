@@ -5,9 +5,10 @@
 The Rust test writes a small manifest, the exact post-processor F32 patch
 input, and the native BF16 output.  This driver reads only the visual tensors
 from the prepared safetensors index; it never instantiates or loads the text
-model.  The reference follows the native CUDA kernel write boundaries so a
-failure points at encoder math or checkpoint layout rather than a dtype
-conversion made only by the oracle.
+model.  The reference follows the pinned vLLM operation order and makes each
+BF16 tensor boundary explicit.  It does not call the native kernels, so a
+failure points at encoder math or checkpoint layout rather than at an oracle
+wrapper.
 
 Example (on a CUDA host after the ignored Rust test):
 
@@ -155,14 +156,14 @@ def rms_norm(x, weight, eps: float):
     return bf16(x * inv * weight.to(torch.float32))
 
 
-def qk_rms_float(x, weight, eps: float):
-    """Q/K norm before RoPE; the CUDA kernel keeps this result in F32."""
+def qk_rms(x, weight, eps: float):
+    """Q/K RMSNorm with the BF16 output boundary used by vLLM."""
 
     import torch
 
     x = x.to(torch.float32)
     inv = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
-    return x * inv * weight.to(torch.float32)
+    return bf16(x * inv * weight.to(torch.float32))
 
 
 def layer_norm(x, weight, bias, eps: float):
@@ -189,26 +190,35 @@ def rope_table(grid_h: int, grid_w: int, head_dim: int):
         for block_w in range(grid_w // 2):
             for inner_h in range(2):
                 for inner_w in range(2):
-                    for position in (block_h * 2 + inner_h, block_w * 2 + inner_w):
-                        cos_rows.append(
-                            [
-                                math.cos(position * inv[d if d < half else d - half])
-                                for d in range(rotary_dim)
-                            ]
-                        )
-                        sin_rows.append(
-                            [
-                                math.sin(position * inv[d if d < half else d - half])
-                                for d in range(rotary_dim)
-                            ]
-                        )
-    # Each patch gets H-axis rotary values followed by W-axis values.
+                    h_position = block_h * 2 + inner_h
+                    w_position = block_w * 2 + inner_w
+                    cos_rows.append(
+                        [
+                            math.cos(h_position * inv[d])
+                            for d in range(half)
+                        ]
+                        + [
+                            math.cos(w_position * inv[d])
+                            for d in range(half)
+                        ]
+                    )
+                    sin_rows.append(
+                        [
+                            math.sin(h_position * inv[d])
+                            for d in range(half)
+                        ]
+                        + [
+                            math.sin(w_position * inv[d])
+                            for d in range(half)
+                        ]
+                    )
+    # Each patch gets one flattened [H frequencies, W frequencies] row.
     cos = torch.tensor(
-        [cos_rows[2 * i] + cos_rows[2 * i + 1] for i in range(grid_h * grid_w)],
+        [cos_rows[i] for i in range(grid_h * grid_w)],
         dtype=torch.bfloat16,
     ).to(torch.float32)
     sin = torch.tensor(
-        [sin_rows[2 * i] + sin_rows[2 * i + 1] for i in range(grid_h * grid_w)],
+        [sin_rows[i] for i in range(grid_h * grid_w)],
         dtype=torch.bfloat16,
     ).to(torch.float32)
     return cos, sin
@@ -217,28 +227,19 @@ def rope_table(grid_h: int, grid_w: int, head_dim: int):
 def apply_rope(x, cos, sin):
     import torch
 
-    seq, heads, head_dim = x.shape
-    axis_dim = head_dim // 2
-    half = axis_dim // 2
-    local = torch.arange(axis_dim, device=x.device)
-    partner = torch.where(local < half, local + half, local - half)
-    rotated = x.clone()
-    # The native kernel applies the two independent axes over the first and
-    # second half of head_dim and rotates only half of each axis's channels.
-    for axis in range(2):
-        start = axis * axis_dim
-        stop = start + axis_dim
-        values = x[:, :, start:stop]
-        paired = values.index_select(-1, partner)
-        c = cos[:, start:stop].unsqueeze(1)
-        s = sin[:, start:stop].unsqueeze(1)
-        signs = torch.where(
-            local < half,
-            -torch.ones_like(local, dtype=x.dtype),
-            torch.ones_like(local, dtype=x.dtype),
-        )
-        rotated[:, :, start:stop] = values * c + signs * paired * s
-    return rotated
+    _, _, head_dim = x.shape
+    rotary_dim = head_dim // 2
+    # ApplyRotaryEmb is Neox-style over the whole head: cos/sin has
+    # head_dim/2 values, while x is split into two head_dim/2 halves.  Keep
+    # the BF16 input/cache and output boundaries explicit while doing the
+    # multiply/add in F32, as the CUDA rotary kernel does.
+    x = bf16(x)
+    c = bf16(cos).unsqueeze(1)
+    s = bf16(sin).unsqueeze(1)
+    x1, x2 = x[..., :rotary_dim], x[..., rotary_dim:]
+    o1 = bf16(x1 * c - x2 * s)
+    o2 = bf16(x2 * c + x1 * s)
+    return torch.cat((o1, o2), dim=-1)
 
 
 def attention(qkv, q_norm, k_norm, grid_h: int, grid_w: int, heads: int, head_dim: int):
@@ -250,8 +251,8 @@ def attention(qkv, q_norm, k_norm, grid_h: int, grid_w: int, heads: int, head_di
     k = qkv[:, hidden : 2 * hidden].view(seq, heads, head_dim)
     v = qkv[:, 2 * hidden :].view(seq, heads, head_dim)
     # The pinned implementation hard-codes q/k RMS epsilon to 1e-5.
-    q = qk_rms_float(q, q_norm, 1.0e-5)
-    k = qk_rms_float(k, k_norm, 1.0e-5)
+    q = qk_rms(q, q_norm, 1.0e-5)
+    k = qk_rms(k, k_norm, 1.0e-5)
     cos, sin = rope_table(grid_h, grid_w, head_dim)
     q = apply_rope(q, cos, sin)
     k = apply_rope(k, cos, sin)
@@ -264,7 +265,7 @@ def clamped_swiglu(x, limit: float):
     import torch
 
     hidden = x.shape[-1] // 2
-    gate = x[..., :hidden].clamp(-limit, limit)
+    gate = x[..., :hidden].clamp(max=limit)
     up = x[..., hidden:].clamp(-limit, limit)
     return bf16(torch.nn.functional.silu(gate) * up)
 
@@ -324,8 +325,8 @@ def run_encoder(weights: VisualWeights, pixels, grid_h: int, grid_w: int, vision
     x = x.view(merged, 4, hidden)
     conv_weight = weights.get(f"{prefix}.downsample.weight")
     conv_bias = weights.get(f"{prefix}.downsample.bias")
-    conv_weight = conv_weight.reshape(out_hidden, hidden, 4)
-    conv = torch.einsum("mic,oci->mo", x, conv_weight) + conv_bias
+    conv_weight = conv_weight.reshape(out_hidden, hidden, 4).to(torch.float32)
+    conv = torch.einsum("mic,oci->mo", x, conv_weight) + conv_bias.to(torch.float32)
     conv = bf16(conv)
 
     merger = f"{prefix}.merger"

@@ -20,11 +20,11 @@ use sha2::{Digest, Sha256};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::{SafetensorsLoader, WeightLoader};
 
-use super::VisionEncoder;
 use crate::VisionItem;
 use crate::weight_loader::{Glm5WeightLoader, ModelWeightLoader};
 
 const REFERENCE_REVISION: &str = "487ecf187d3dfe74d2cf6119a92881dba403c219";
+const MIN_FREE_BYTES_BEFORE_LOAD: usize = 5 * 1024 * 1024 * 1024;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -100,6 +100,42 @@ fn finite_bf16(bytes: &[u8]) -> bool {
     })
 }
 
+fn validate_visual_index(model_dir: &Path) -> Result<()> {
+    let index_path = [
+        "model.safetensors.index.json",
+        "consolidated.safetensors.index.json",
+    ]
+    .iter()
+    .map(|name| model_dir.join(name))
+    .find(|path| path.is_file())
+    .context("vision-only checkpoint has no safetensors index")?;
+    let index: serde_json::Value = serde_json::from_slice(
+        &fs::read(&index_path).with_context(|| format!("read {}", index_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", index_path.display()))?;
+    let weight_map = index
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .context("safetensors index has no object weight_map")?;
+    ensure!(
+        !weight_map.is_empty(),
+        "vision-only safetensors index is empty"
+    );
+    let non_visual: Vec<&str> = weight_map
+        .keys()
+        .map(String::as_str)
+        .filter(|name| {
+            !name.starts_with("model.visual.") && !name.starts_with("model.language_model.visual.")
+        })
+        .take(8)
+        .collect();
+    ensure!(
+        non_visual.is_empty(),
+        "prepared oracle index contains non-visual tensors before loading: {non_visual:?}"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires a prepared vision-only GLM checkpoint and a CUDA host"]
 fn glm5_vision_native_encoder_oracle_dump() -> Result<()> {
@@ -109,6 +145,16 @@ fn glm5_vision_native_encoder_oracle_dump() -> Result<()> {
         .context("set ATLAS_GLM_VISION_ORACLE_OUT to a private oracle output dir")?;
     let model_dir = std::path::PathBuf::from(model_dir);
     let out_dir = std::path::PathBuf::from(out_dir);
+    if out_dir.exists() {
+        ensure!(out_dir.is_dir(), "oracle output path is not a directory");
+        ensure!(
+            fs::read_dir(&out_dir)
+                .context("inspect oracle output directory")?
+                .next()
+                .is_none(),
+            "oracle output directory must be empty; refusing to overwrite prior output"
+        );
+    }
     fs::create_dir_all(&out_dir).context("create oracle output directory")?;
 
     let config_json =
@@ -126,15 +172,31 @@ fn glm5_vision_native_encoder_oracle_dump() -> Result<()> {
         vision.is_glm5_next,
         "parsed vision config is not native GLM"
     );
+    // Reject a full text-model index before constructing the GPU weight store.
+    // SafetensorsLoader otherwise has no model-semantic boundary and would
+    // happily map unrelated language tensors into this bounded oracle.
+    validate_visual_index(&model_dir)?;
 
     let target = atlas_kernels::ptx_for_exact_target("glm-5.3-flash-nvfp4", "nvfp4")
         .context("resolve exact GLM CUDA kernel target")?;
     let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &target.modules)
         .context("create CUDA backend")?;
     let gpu: &dyn GpuBackend = &gpu;
+    let free_bytes_before_load = gpu
+        .free_memory()
+        .context("query free CUDA memory before visual-only load")?;
+    ensure!(
+        free_bytes_before_load >= MIN_FREE_BYTES_BEFORE_LOAD,
+        "oracle requires at least {} GiB free before loading visual weights; got {:.2} GiB",
+        MIN_FREE_BYTES_BEFORE_LOAD / (1024 * 1024 * 1024),
+        free_bytes_before_load as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
     let store = SafetensorsLoader::new()
         .load(&model_dir, gpu, 0)
         .context("load vision-only safetensors index")?;
+    let free_bytes_after_load = gpu
+        .free_memory()
+        .context("query free CUDA memory after visual-only load")?;
     ensure!(!store.is_empty(), "vision-only weight store is empty");
     ensure!(
         store.names().all(|name| {
@@ -196,6 +258,8 @@ fn glm5_vision_native_encoder_oracle_dump() -> Result<()> {
         "format": "atlas-glm5-vision-oracle-v1",
         "reference_revision": REFERENCE_REVISION,
         "model_type": config.model_type,
+        "free_bytes_before_load": free_bytes_before_load,
+        "free_bytes_after_load": free_bytes_after_load,
         "vision": {
             "depth": vision.depth,
             "hidden_size": vision.hidden_size,
