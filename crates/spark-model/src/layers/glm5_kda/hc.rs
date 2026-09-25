@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! GLM-5 mHC dispatch, including the prefill-only batched pre-mix GEMM.
+//! GLM-5 mHC dispatch; batched prefill pre-mix is shared with the MLA sites.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
 use super::Glm5KdaLayer;
@@ -30,45 +30,15 @@ impl Glm5KdaLayer {
         stream: u64,
     ) -> Result<()> {
         if fast_prefill(tokens) {
-            let hc = self.hc.hc_mult as u32;
-            let mix = (2 + hc) * hc;
-            let raw_mix = ctx.buffers.gate_logits_f32();
-            ensure!(
-                ctx.buffers.sizes().gate_logits_f32 >= tokens as usize * mix as usize * 4,
-                "mHC TF32 pre-mix scratch is too small"
-            );
-            spark_runtime::cublaslt::tf32_gemm_act_weight_t(
-                ctx.buffers.hc_streams().0,
-                site.hc_fn.0,
-                raw_mix.0,
-                tokens,
-                mix,
-                hc * self.hidden_size as u32,
-                stream,
-            )?;
-            return ops::hc_pre_from_raw_mix(
-                ctx.gpu,
-                ops::glm_hc_prefill_finalize_kernel(
-                    ctx.gpu,
-                    &ctx.config.model_type,
-                    self.hc_pre_from_raw_mix_k,
-                    tokens,
-                    self.hidden_size as u32,
-                    hc,
-                )?,
-                ctx.buffers.hc_streams(),
-                raw_mix,
-                site.hc_scale,
-                site.hc_base,
+            return crate::layers::qwen3_attention::hc_pre_prefill_mix(
+                site,
                 hidden,
-                ctx.buffers.hc_post(),
-                ctx.buffers.hc_comb(),
                 tokens,
-                self.hidden_size as u32,
-                hc,
+                self.hc.hc_mult as u32,
                 self.hc.sinkhorn_iters as u32,
-                ctx.config.rms_norm_eps as f32,
                 self.hc.hc_eps,
+                self.hc_pre_from_raw_mix_k,
+                ctx,
                 stream,
             );
         }
