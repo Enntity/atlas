@@ -19,139 +19,14 @@ impl Glm5KdaLayer {
     ) -> Result<DevicePtr> {
         let m = tokens as u32;
         let p = self.heads * self.dim;
-        let bf16 = 2usize;
         let packed = ctx.buffers.ssm_qkvz();
         ops::kda_pack_qkv(ctx.gpu, self.pack_k, projected, packed, m, p as u32, stream)?;
         let convolved = ctx.buffers.ssm_conv_out_f32();
         let core_out = ctx.buffers.attn_output();
         if capture_verify_intermediates {
-            ensure!(
-                state.h_state_intermediates.len() + 1 >= tokens
-                    && state.conv_state_intermediates.len() >= tokens,
-                "GLM-5 KDA verify needs K-1 h and K conv intermediates (h={}, conv={}, K={tokens})",
-                state.h_state_intermediates.len(),
-                state.conv_state_intermediates.len(),
-            );
-            let packed_row_bytes = 3 * p * bf16;
-            let gate_row_bytes = p * bf16;
-            let beta_row_bytes = self.heads * bf16;
-            let conv_inter_base = state.conv_state_intermediates[0];
-            let h_inter_base = state.h_state_intermediates[0];
-            let fused_conv_snapshots = tokens == 5
-                && self.conv_prefill_tp_snap_k.0 != 0
-                && verify_batched_conv_snapshot_enabled()
-                && !conv_inter_base.is_null()
-                && state.conv_state_intermediates[..tokens - 1]
-                    .iter()
-                    .enumerate()
-                    .all(|(t, ptr)| {
-                        ptr.0 == conv_inter_base.0 + (t * self.conv_state_bytes) as u64
-                    });
-            let fused_recurrent_snapshots = tokens == 5
-                && self.recurrent_verify_snap_k.0 != 0
-                && verify_batched_recurrent_snapshot_enabled()
-                && !h_inter_base.is_null()
-                && state.h_state_intermediates[..tokens - 1]
-                    .iter()
-                    .enumerate()
-                    .all(|(t, ptr)| ptr.0 == h_inter_base.0 + (t * self.h_state_bytes) as u64);
-
-            if fused_conv_snapshots || fused_recurrent_snapshots {
-                if fused_conv_snapshots {
-                    ops::conv1d_update_prefill_tp_snap(
-                        ctx.gpu,
-                        self.conv_prefill_tp_snap_k,
-                        state.conv_state,
-                        packed,
-                        &self.weights.conv,
-                        DevicePtr::NULL,
-                        convolved,
-                        conv_inter_base,
-                        self.conv_state_bytes / size_of::<f32>(),
-                        (3 * p) as u32,
-                        self.conv_width as u32,
-                        m,
-                        (3 * p) as u32,
-                        (3 * p) as u32,
-                        stream,
-                    )?;
-                } else {
-                    for t in 0..tokens {
-                        ops::conv1d_update_prefill(
-                            ctx.gpu,
-                            self.conv_prefill_k,
-                            self.conv_prefill_tp_k,
-                            state.conv_state,
-                            packed.offset(t * packed_row_bytes),
-                            &self.weights.conv,
-                            DevicePtr::NULL,
-                            convolved.offset(t * packed_row_bytes),
-                            (3 * p) as u32,
-                            self.conv_width as u32,
-                            1,
-                            (3 * p) as u32,
-                            (3 * p) as u32,
-                            stream,
-                        )?;
-                        if t + 1 < tokens {
-                            ctx.gpu.copy_d2d_async(
-                                state.conv_state,
-                                state.conv_state_intermediates[t],
-                                self.conv_state_bytes,
-                                stream,
-                            )?;
-                        }
-                    }
-                }
-
-                if fused_recurrent_snapshots {
-                    ops::kda_recurrent_verify_snap(
-                        ctx.gpu,
-                        self.recurrent_verify_snap_k,
-                        convolved,
-                        g1,
-                        beta,
-                        self.weights.a_log.weight,
-                        self.weights.dt_bias.weight,
-                        state.h_state,
-                        core_out,
-                        h_inter_base,
-                        self.h_state_bytes / size_of::<f32>(),
-                        m,
-                        self.heads as u32,
-                        self.dim as u32,
-                        self.lower_bound,
-                        stream,
-                    )?;
-                } else {
-                    for t in 0..tokens {
-                        self.run_recurrent(
-                            convolved.offset(t * packed_row_bytes),
-                            g1.offset(t * gate_row_bytes),
-                            beta.offset(t * beta_row_bytes),
-                            state.h_state,
-                            core_out.offset(t * gate_row_bytes),
-                            1,
-                            true,
-                            ctx,
-                            stream,
-                        )?;
-                        if t + 1 < tokens {
-                            ctx.gpu.copy_d2d_async(
-                                state.h_state,
-                                state.h_state_intermediates[t],
-                                self.h_state_bytes,
-                                stream,
-                            )?;
-                        }
-                    }
-                }
-            } else {
-                // Preserve the original interleaved path as the exact fallback.
-                self.verify_recurrent_rows(
-                    packed, convolved, g1, beta, core_out, state, 0, tokens, ctx, stream,
-                )?;
-            }
+            self.verify_recurrent_rows(
+                packed, convolved, g1, beta, core_out, state, 0, tokens, ctx, stream,
+            )?;
         } else {
             ops::conv1d_update_prefill(
                 ctx.gpu,
@@ -205,9 +80,13 @@ impl Glm5KdaLayer {
         Ok(core_out)
     }
 
-    /// Exact interleaved verify recurrence for rows `[row0, row0 + tokens)` of
-    /// already-packed `packed`/`g1`/`beta`, advancing one owner's state row by
-    /// row and snapshotting after every row but the last.
+    /// Verify recurrence for rows `[row0, row0 + tokens)` of already-packed
+    /// `packed`/`g1`/`beta`, advancing one owner's state and snapshotting it
+    /// after every row but the last. Uses the single-launch snapshot kernels
+    /// (unchanged recurrence and FP32 FMA order) when the owner's snapshot
+    /// slabs are contiguous, else the original per-row launches. Convolution
+    /// and recurrence are independent per row, so running all convolution
+    /// rows before the recurrence rows is the same arithmetic.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn verify_recurrent_rows(
         &self,
@@ -223,7 +102,8 @@ impl Glm5KdaLayer {
         stream: u64,
     ) -> Result<()> {
         ensure!(
-            state.h_state_intermediates.len() + 1 >= tokens
+            tokens >= 1
+                && state.h_state_intermediates.len() + 1 >= tokens
                 && state.conv_state_intermediates.len() >= tokens,
             "GLM-5 KDA verify needs K-1 h and K conv intermediates (h={}, conv={}, K={tokens})",
             state.h_state_intermediates.len(),
@@ -234,50 +114,117 @@ impl Glm5KdaLayer {
         let packed_row_bytes = 3 * p * bf16;
         let gate_row_bytes = p * bf16;
         let beta_row_bytes = self.heads * bf16;
-        for t in 0..tokens {
-            let row = row0 + t;
-            ops::conv1d_update_prefill(
+        let (packed, convolved, g1, beta, core_out) = (
+            packed.offset(row0 * packed_row_bytes),
+            convolved.offset(row0 * packed_row_bytes),
+            g1.offset(row0 * gate_row_bytes),
+            beta.offset(row0 * beta_row_bytes),
+            core_out.offset(row0 * gate_row_bytes),
+        );
+        let contiguous = |ptrs: &[DevicePtr], stride: usize| {
+            ptrs.first().is_some_and(|base| {
+                !base.is_null()
+                    && ptrs[..tokens - 1]
+                        .iter()
+                        .enumerate()
+                        .all(|(t, ptr)| ptr.0 == base.0 + (t * stride) as u64)
+            })
+        };
+        let fused_conv = self.conv_prefill_tp_snap_k.0 != 0
+            && verify_batched_conv_snapshot_enabled()
+            && contiguous(&state.conv_state_intermediates, self.conv_state_bytes);
+        let fused_recurrent = self.recurrent_verify_snap_k.0 != 0
+            && verify_batched_recurrent_snapshot_enabled()
+            && contiguous(&state.h_state_intermediates, self.h_state_bytes);
+        let m = tokens as u32;
+        if fused_conv {
+            ops::conv1d_update_prefill_tp_snap(
                 ctx.gpu,
-                self.conv_prefill_k,
-                self.conv_prefill_tp_k,
+                self.conv_prefill_tp_snap_k,
                 state.conv_state,
-                packed.offset(row * packed_row_bytes),
+                packed,
                 &self.weights.conv,
                 DevicePtr::NULL,
-                convolved.offset(row * packed_row_bytes),
+                convolved,
+                state.conv_state_intermediates[0],
+                self.conv_state_bytes / size_of::<f32>(),
                 (3 * p) as u32,
                 self.conv_width as u32,
-                1,
+                m,
                 (3 * p) as u32,
                 (3 * p) as u32,
                 stream,
             )?;
-            self.run_recurrent(
-                convolved.offset(row * packed_row_bytes),
-                g1.offset(row * gate_row_bytes),
-                beta.offset(row * beta_row_bytes),
-                state.h_state,
-                core_out.offset(row * gate_row_bytes),
-                1,
-                true,
-                ctx,
-                stream,
-            )?;
-            // A partial accept can select states after rows 0..K-2;
-            // the post-row K-1 state is already canonical on full accept.
-            if t + 1 < tokens {
-                ctx.gpu.copy_d2d_async(
-                    state.h_state,
-                    state.h_state_intermediates[t],
-                    self.h_state_bytes,
-                    stream,
-                )?;
-                ctx.gpu.copy_d2d_async(
+        } else {
+            for t in 0..tokens {
+                ops::conv1d_update_prefill(
+                    ctx.gpu,
+                    self.conv_prefill_k,
+                    self.conv_prefill_tp_k,
                     state.conv_state,
-                    state.conv_state_intermediates[t],
-                    self.conv_state_bytes,
+                    packed.offset(t * packed_row_bytes),
+                    &self.weights.conv,
+                    DevicePtr::NULL,
+                    convolved.offset(t * packed_row_bytes),
+                    (3 * p) as u32,
+                    self.conv_width as u32,
+                    1,
+                    (3 * p) as u32,
+                    (3 * p) as u32,
                     stream,
                 )?;
+                if t + 1 < tokens {
+                    ctx.gpu.copy_d2d_async(
+                        state.conv_state,
+                        state.conv_state_intermediates[t],
+                        self.conv_state_bytes,
+                        stream,
+                    )?;
+                }
+            }
+        }
+        if fused_recurrent {
+            ops::kda_recurrent_verify_snap(
+                ctx.gpu,
+                self.recurrent_verify_snap_k,
+                convolved,
+                g1,
+                beta,
+                self.weights.a_log.weight,
+                self.weights.dt_bias.weight,
+                state.h_state,
+                core_out,
+                state.h_state_intermediates[0],
+                self.h_state_bytes / size_of::<f32>(),
+                m,
+                self.heads as u32,
+                self.dim as u32,
+                self.lower_bound,
+                stream,
+            )?;
+        } else {
+            for t in 0..tokens {
+                self.run_recurrent(
+                    convolved.offset(t * packed_row_bytes),
+                    g1.offset(t * gate_row_bytes),
+                    beta.offset(t * beta_row_bytes),
+                    state.h_state,
+                    core_out.offset(t * gate_row_bytes),
+                    1,
+                    true,
+                    ctx,
+                    stream,
+                )?;
+                // A partial accept can select states after rows 0..K-2;
+                // the post-row K-1 state is already canonical on full accept.
+                if t + 1 < tokens {
+                    ctx.gpu.copy_d2d_async(
+                        state.h_state,
+                        state.h_state_intermediates[t],
+                        self.h_state_bytes,
+                        stream,
+                    )?;
+                }
             }
         }
         Ok(())

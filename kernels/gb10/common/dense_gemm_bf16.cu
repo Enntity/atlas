@@ -714,3 +714,50 @@ extern "C" __global__ void fused_silu_mul(
 }
 
 #include "router_prefill_bn32.cuh"
+
+// ─────────────────────────────────────────────────────────────────────────
+// Order-preserving router GEMM for short decode/verify batches (M <= 32).
+//
+// dense_gemm_bf16's 16x16 tiles and dense_gemm_bf16_router's 16x64 tiles give
+// a [<=16, 288] router product only 18 or 5 blocks. Here one warp owns one
+// output column n and lane m owns C[m, n]: every lane accumulates in strict
+// k = 0..K-1 order with the same separate FMUL/FADD (--fmad=false) as the
+// scalar kernel, so each output is BIT-IDENTICAL to dense_gemm_bf16, while
+// all M*N accumulators run concurrently. The weight element is a warp
+// broadcast; each lane streams its own activation row.
+//
+// Grid: (ceil(N/8), 1, 1)   Block: (256, 1, 1)
+extern "C" __global__ void dense_gemm_bf16_router_rows(
+    const __nv_bfloat16* __restrict__ A,  // [M, K]
+    const __nv_bfloat16* __restrict__ B,  // [N, K]
+    __nv_bfloat16* __restrict__ C,        // [M, N]
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int warp = threadIdx.x / 32;
+    const unsigned int lane = threadIdx.x % 32;
+    const unsigned int n = blockIdx.x * 8 + warp;
+    if (n >= N || lane >= M) return;
+    const __nv_bfloat16* a = A + (unsigned long long)lane * K;
+    const __nv_bfloat16* b = B + (unsigned long long)n * K;
+    float acc = 0.0f;
+    unsigned int k = 0;
+    if ((K % 8) == 0 && ((unsigned long long)a % 16) == 0 && ((unsigned long long)b % 16) == 0) {
+        for (; k < K; k += 8) {
+            const uint4 av = *(const uint4*)(a + k);
+            const uint4 bv = *(const uint4*)(b + k);
+            const __nv_bfloat16* ae = (const __nv_bfloat16*)&av;
+            const __nv_bfloat16* be = (const __nv_bfloat16*)&bv;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                acc += __bfloat162float(ae[i]) * __bfloat162float(be[i]);
+            }
+        }
+    }
+    for (; k < K; ++k) {
+        acc += __bfloat162float(a[k]) * __bfloat162float(b[k]);
+    }
+    C[(unsigned long long)lane * N + n] = __float2bfloat16(acc);
+}
+

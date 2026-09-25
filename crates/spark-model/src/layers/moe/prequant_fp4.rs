@@ -177,6 +177,70 @@ impl MoeLayer {
         Ok(())
     }
 
+    /// C3 router logits in scalar `dense_gemm` numerics. Short batches use
+    /// the bit-identical row-parallel kernel (`ATLAS_GLM_ROUTER_ROWS=0`
+    /// reverts; `ATLAS_GLM_ROUTER_ROWS_CHECK=1` compares both byte for byte).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn c3_router_logits(
+        &self,
+        router_in: DevicePtr,
+        gate_logits: DevicePtr,
+        rows: u32,
+        num_experts: u32,
+        h: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        static MODE: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+        let (enabled, check) = *MODE.get_or_init(|| {
+            (
+                std::env::var("ATLAS_GLM_ROUTER_ROWS").as_deref() != Ok("0"),
+                std::env::var("ATLAS_GLM_ROUTER_ROWS_CHECK").as_deref() == Ok("1"),
+            )
+        });
+        let scalar = |out: DevicePtr| {
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm,
+                router_in,
+                &self.weights.gate,
+                out,
+                rows,
+                num_experts,
+                h,
+                stream,
+            )
+        };
+        if !enabled || rows > 32 || self.dense_gemm_router_rows.0 == 0 {
+            return scalar(gate_logits);
+        }
+        ops::dense_gemm_router_rows(
+            ctx.gpu,
+            self.dense_gemm_router_rows,
+            router_in,
+            &self.weights.gate,
+            gate_logits,
+            rows,
+            num_experts,
+            h,
+            stream,
+        )?;
+        if check {
+            let bytes = (rows * num_experts) as usize * 2;
+            let mut fast = vec![0u8; bytes];
+            ctx.gpu.copy_d2h(gate_logits, &mut fast)?;
+            scalar(gate_logits)?;
+            let mut reference = vec![0u8; bytes];
+            ctx.gpu.copy_d2h(gate_logits, &mut reference)?;
+            let diff = fast.iter().zip(&reference).filter(|(a, b)| a != b).count();
+            anyhow::ensure!(
+                diff == 0,
+                "router rows kernel differs from dense_gemm in {diff}/{bytes} bytes (rows={rows})"
+            );
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prequant_fp4_gate_up(
         &self,

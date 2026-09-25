@@ -254,17 +254,7 @@ impl MoeLayer {
         } else if self.glm_c3_grouped(ctx, n) {
             // Preserve forward_k3's router logits and expert weights exactly;
             // the experiment changes routed activation precision, not routing.
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm,
-                router_in,
-                &self.weights.gate,
-                gate_logits,
-                n,
-                num_experts,
-                h,
-                stream,
-            )?;
+            self.c3_router_logits(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
         } else if self.glm_c2_grouped(ctx, n) {
             self.independent_router_logits(router_in, gate_logits, 2, ctx, stream)?;
         } else if self.glm_c4_grouped(ctx, n) {
