@@ -87,7 +87,7 @@ impl MoeLayer {
         let up = ctx.buffers.ssm_qkvz();
         let down = ctx.buffers.attn_output();
         if rows == 3 {
-            return self.c3_shared_expert(input, gate, up, down, h, inter, ctx, stream);
+            return self.c3_shared_expert(input, gate, up, down, h, inter, 3, ctx, stream);
         }
         self.independent_shared_batchm(input, gate, up, down, rows, h, inter, ctx, stream)
     }

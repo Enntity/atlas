@@ -85,6 +85,7 @@ impl MoeLayer {
                 shared_down_out,
                 h,
                 shared_inter,
+                n,
                 ctx,
                 aux,
             )?;

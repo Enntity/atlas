@@ -592,6 +592,7 @@ pub(crate) use m5_projections::validate_m5_projection_graphs;
 #[cfg(test)]
 mod mod_tests;
 mod prequant_fp4;
+pub(crate) use prequant_fp4::with_owner_rows;
 mod ptr_table_build;
 mod union_stats;
 pub(crate) use ptr_table_build::*;

@@ -607,7 +607,12 @@ pub fn step_mtp(
             .copied()
             .filter(|&i| active[i].grammar_state.is_none() && active[i].pending_drafts.len() == 2)
             .collect();
-        if group.len() >= 2 && model.can_batch_glm_long_verify(group.len()) {
+        let min_group = std::env::var("ATLAS_GLM_LONG_BATCH_MIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2)
+            .max(1);
+        if group.len() >= min_group && model.can_batch_glm_long_verify(group.len()) {
             serial_idxs.retain(|i| !group.contains(i));
             let mut sorted = group.clone();
             sorted.sort_unstable();

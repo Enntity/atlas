@@ -60,7 +60,7 @@ impl RowBytes {
         }
     }
     fn total(&self) -> usize {
-        MAX_ROWS * (2 * self.hidden + self.highway + self.post + self.comb + self.logits)
+        MAX_ROWS * (3 * self.hidden + self.highway + self.post + self.comb + self.logits)
     }
 }
 
@@ -81,6 +81,8 @@ pub struct GlmLongStage {
     pub post: DevicePtr,
     pub comb: DevicePtr,
     pub logits: DevicePtr,
+    /// Joint FFN output, one owner's three rows at a time.
+    pub ffn: DevicePtr,
 }
 
 impl GlmLongStage {
@@ -100,6 +102,7 @@ impl GlmLongStage {
             post: take(rows.post),
             comb: take(rows.comb),
             logits: take(rows.logits),
+            ffn: take(rows.hidden),
         })
     }
 
@@ -129,4 +132,68 @@ impl GlmLongStage {
         }
         Ok(())
     }
+}
+
+/// The FFN of every owner with exactly the single-owner K=3 verifier's
+/// arithmetic. Routed MoE runs once over all rows through the served C3
+/// grouped path; other FFNs run per owner from arena rows [0, 3). Returns the
+/// `[owners * 3, H]` output.
+pub fn ffn_per_owner(
+    ffn: &crate::layers::FfnComponent,
+    owners: usize,
+    stage: &GlmLongStage,
+    ctx: &super::ForwardContext,
+    stream: u64,
+) -> Result<DevicePtr> {
+    let b = ctx.buffers;
+    let rows = owners * ROWS;
+    match (ffn_mode(), ffn) {
+        (FfnMode::Grouped, crate::layers::FfnComponent::Moe(_)) => {
+            // The served K3 MoE is the C3 grouped path; run it once over every
+            // owner's rows with the same row-for-row arithmetic.
+            crate::layers::moe::with_owner_rows(rows as u32, || {
+                ffn.forward_prefill(b.norm_output(), rows, ctx, stream)
+            })?;
+            return Ok(b.moe_output());
+        }
+        (FfnMode::Prefill, _) => {
+            ffn.forward_prefill(b.norm_output(), rows, ctx, stream)?;
+            return Ok(b.moe_output());
+        }
+        _ => {}
+    }
+    let bytes = stage.rows.hidden;
+    let input = [(b.norm_output(), stage.norm, bytes)];
+    let output = [(b.moe_output(), stage.ffn, bytes)];
+    stage.copy(ctx.gpu, &input, 0, 0, owners * ROWS, true, stream)?;
+    for owner in 0..owners {
+        stage.copy(ctx.gpu, &input, 0, owner * ROWS, ROWS, false, stream)?;
+        ffn.forward_k3(b.norm_output(), ctx, stream)?;
+        stage.copy(ctx.gpu, &output, 0, owner * ROWS, ROWS, true, stream)?;
+    }
+    Ok(stage.ffn)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FfnMode {
+    /// Default: routed MoE jointly through the exact C3 grouped arithmetic;
+    /// dense FFN layers per owner.
+    Grouped,
+    /// Every FFN per owner through `forward_k3` (diagnostic).
+    Owner,
+    /// Generic prefill FFN over all rows. Measurably NOT the verifier's
+    /// arithmetic (diagnostic only).
+    Prefill,
+}
+
+/// `ATLAS_GLM_LONG_BATCH_FFN=grouped|owner|prefill`.
+fn ffn_mode() -> FfnMode {
+    static MODE: std::sync::OnceLock<FfnMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("ATLAS_GLM_LONG_BATCH_FFN").as_deref() {
+            Ok("owner") => FfnMode::Owner,
+            Ok("prefill") => FfnMode::Prefill,
+            _ => FfnMode::Grouped,
+        },
+    )
 }

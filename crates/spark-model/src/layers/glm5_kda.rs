@@ -354,7 +354,7 @@ impl TransformerLayer for Glm5KdaLayer {
         &self,
         owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
         _cache: &mut PagedKvCache,
-        _stage: &crate::layer::glm_long_owner::GlmLongStage,
+        stage: &crate::layer::glm_long_owner::GlmLongStage,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -372,9 +372,10 @@ impl TransformerLayer for Glm5KdaLayer {
                 self.forward_recurrent_owners(projected, g1, beta, owners, ctx, stream)
             },
         )?;
-        // Grouped FFN: each routed expert is read once for all owners' rows.
-        self.ffn.forward_prefill(phase.normed, rows, ctx, stream)?;
-        self.forward_ffn_post(phase, ctx.buffers.moe_output(), None, ctx, stream)
+        let owners_n = rows / crate::layer::glm_long_owner::ROWS;
+        let ffn_out =
+            crate::layer::glm_long_owner::ffn_per_owner(&self.ffn, owners_n, stage, ctx, stream)?;
+        self.forward_ffn_post(phase, ffn_out, None, ctx, stream)
     }
 
     fn supports_glm_pair_verify(&self) -> bool {

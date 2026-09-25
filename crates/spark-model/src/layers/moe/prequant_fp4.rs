@@ -12,7 +12,24 @@ pub(super) struct CompactMoeWorklist {
 }
 
 fn c3_grouped_shape(config: &atlas_core::config::ModelConfig, rows: u32, decode_rows: u32) -> bool {
-    rows == 3 && decode_rows >= 3 && glm_grouped_shape(config)
+    (rows == 3 || (rows % 3 == 0 && rows <= 12 && OWNER_ROWS.with(|r| r.get()) == rows))
+        && decode_rows >= 3
+        && glm_grouped_shape(config)
+}
+
+thread_local! {
+    /// Rows of an owner-batched long-context K3 verify FFN in progress, else 0.
+    static OWNER_ROWS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f` as the joint FFN of an owner-batched K3 verify of `rows` rows: the
+/// C3 grouped arithmetic (router, routed and shared) is applied row-for-row as
+/// in a single-owner K3 verify, with each routed expert read once for all rows.
+pub(crate) fn with_owner_rows<R>(rows: u32, f: impl FnOnce() -> R) -> R {
+    OWNER_ROWS.with(|r| r.set(rows));
+    let out = f();
+    OWNER_ROWS.with(|r| r.set(0));
+    out
 }
 
 pub(super) fn c4_grouped_shape(
@@ -107,43 +124,57 @@ impl MoeLayer {
         down_out: DevicePtr,
         h: u32,
         inter: u32,
+        rows: u32,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        for (weight, output) in [
-            (&self.weights.shared_expert.gate_proj, gate_out),
-            (&self.weights.shared_expert.up_proj, up_out),
-        ] {
+        // Three rows per batch3 call, so each owner's shared expert is
+        // exactly the single-owner K3 arithmetic.
+        anyhow::ensure!(rows % 3 == 0 && rows > 0, "C3 shared expert rows {rows}");
+        let (h, inter) = (h as usize, inter as usize);
+        for chunk in 0..rows as usize / 3 {
+            let (x, g, u, d) = (
+                input.offset(chunk * 3 * h * 2),
+                gate_out.offset(chunk * 3 * inter * 2),
+                up_out.offset(chunk * 3 * inter * 2),
+                down_out.offset(chunk * 3 * h * 2),
+            );
+            for (weight, output) in [
+                (&self.weights.shared_expert.gate_proj, g),
+                (&self.weights.shared_expert.up_proj, u),
+            ] {
+                ops::w4a16_gemv_batch3(
+                    ctx.gpu,
+                    self.w4a16_gemv_batch3,
+                    x,
+                    weight,
+                    output,
+                    inter as u32,
+                    h as u32,
+                    stream,
+                )?;
+            }
+            ops::silu_mul(
+                ctx.gpu,
+                self.moe_silu_mul,
+                g,
+                u,
+                g,
+                (3 * inter) as u32,
+                stream,
+            )?;
             ops::w4a16_gemv_batch3(
                 ctx.gpu,
                 self.w4a16_gemv_batch3,
-                input,
-                weight,
-                output,
-                inter,
-                h,
+                g,
+                &self.weights.shared_expert.down_proj,
+                d,
+                h as u32,
+                inter as u32,
                 stream,
             )?;
         }
-        ops::silu_mul(
-            ctx.gpu,
-            self.moe_silu_mul,
-            gate_out,
-            up_out,
-            gate_out,
-            3 * inter,
-            stream,
-        )?;
-        ops::w4a16_gemv_batch3(
-            ctx.gpu,
-            self.w4a16_gemv_batch3,
-            gate_out,
-            &self.weights.shared_expert.down_proj,
-            down_out,
-            h,
-            inter,
-            stream,
-        )
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

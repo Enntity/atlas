@@ -5,7 +5,7 @@
 //! Attention runs per owner, unchanged: each owner's three rows are placed at
 //! arena rows [0, 3) and go through the same validated eager K3 path (causal
 //! semantic index, sparse attention, cache writes) with that owner's own
-//! metadata and state. Only the FFN is joint, over every owner's rows.
+//! metadata and state. The FFN also runs per owner; the mHC post is joint.
 
 use super::*;
 use crate::layer::glm_long_owner::{GlmLongOwner, GlmLongStage, ROWS};
@@ -75,8 +75,13 @@ impl Qwen3AttentionLayer {
         }
         // Every owner's post-attention highway, mHC coefficients and FFN input.
         stage.copy(ctx.gpu, &ffn_spans, 0, 0, rows, false, stream)?;
-        self.ffn
-            .forward_prefill(b.norm_output(), rows, ctx, stream)?;
+        let ffn_out = crate::layer::glm_long_owner::ffn_per_owner(
+            &self.ffn,
+            owners.len(),
+            stage,
+            ctx,
+            stream,
+        )?;
         let positions: Vec<usize> = owners.iter().flat_map(|o| o.positions).collect();
         let joint = ctx::MultiSeqCtx::new(
             self,
@@ -96,7 +101,7 @@ impl Qwen3AttentionLayer {
                 comb: b.hc_comb(),
                 diag_this: false,
             },
-            b.moe_output(),
+            ffn_out,
             ctx,
             stream,
         )
