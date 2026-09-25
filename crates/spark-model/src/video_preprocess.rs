@@ -155,91 +155,40 @@ pub fn sample_indices(
 
 /// GLM's processor uses an `fps_interval` timestamp walk followed by a
 /// linspace repair when the greedy walk misses its requested frame count.
-fn sample_glm_indices(
-    n_frames: usize,
-    native_fps: f32,
-    target_fps: f32,
-    max_frames: usize,
-    temporal_patch_size: usize,
-) -> Vec<usize> {
-    if n_frames == 0 {
-        return Vec::new();
+///
+/// Kept for the grouping contract's arithmetic above; the decode path now
+/// samples through [`crate::video_sample`] and only rounds to groups here.
+fn _legacy_sampling_reference() {}
+
+/// The only re-sampling left after the decoder has done the coverage work:
+/// drop any trailing partial temporal group.
+///
+/// The decoder ([`crate::video_sample`]) already chose which source frames to
+/// return, at the operator's rate and spanning the clip. A partial group
+/// cannot be encoded as video — the patch tensor's temporal axis is exactly
+/// `temporal_patch_size` frames — so a remainder is dropped here rather than
+/// padded. Frames are never duplicated to fill a group, which would charge
+/// the model for motion it never saw.
+pub fn group_indices(n_frames: usize, temporal_patch_size: usize) -> Vec<usize> {
+    let tp = temporal_patch_size.max(1);
+    let whole = n_frames / tp * tp;
+    // A clip with fewer frames than one group keeps them all: refusing it is
+    // the caller's job (the `temporal group` error in `preprocess_video`),
+    // and reporting nothing here would hide why it was refused.
+    if whole == 0 {
+        return (0..n_frames).collect();
     }
-    let fps = if native_fps.is_finite() && native_fps > 0.0 {
-        native_fps
-    } else {
-        DEFAULT_FPS
-    };
-    let target = if target_fps.is_finite() && target_fps > 0.0 {
-        target_fps
-    } else {
-        DEFAULT_FPS
-    };
-    let duration = n_frames as f32 / fps;
-    let wanted = ((duration * target).floor() as usize).min(max_frames);
-    // This is the reference processor's behavior for a clip shorter than one
-    // requested sample interval: return no indices and let the caller reject
-    // the video rather than inventing a frame.
-    if wanted == 0 {
-        return Vec::new();
-    }
-    let mut picked = if n_frames < wanted {
-        (0..wanted)
-            .map(|i| i * n_frames / wanted)
-            .collect::<Vec<_>>()
-    } else {
-        let mut out = Vec::new();
-        let mut current = 0.0f32;
-        let step = 1.0 / (temporal_patch_size.max(1) as f32 * target);
-        let max_second = duration.floor();
-        for index in 0..n_frames {
-            if index as f32 / fps >= current {
-                current += step;
-                out.push(index);
-                if current >= max_second {
-                    break;
-                }
-            }
-        }
-        out
-    };
-    let linspace = |start: usize, end: usize, count: usize| -> Vec<usize> {
-        if count <= 1 {
-            return vec![start];
-        }
-        (0..count)
-            .map(|i| start + end.saturating_sub(start) * i / (count - 1))
-            .collect()
-    };
-    if picked.len() < wanted {
-        let start = picked.first().copied().unwrap_or(0);
-        let end = picked.last().copied().unwrap_or(n_frames - 1);
-        picked = linspace(start, end, wanted);
-    } else if picked.len() > wanted {
-        picked = linspace(0, n_frames - 1, wanted);
-    }
-    let mut unique = Vec::with_capacity(picked.len() + 1);
-    for index in picked {
-        if unique.last().copied() != Some(index) {
-            unique.push(index);
-        }
-    }
-    if unique.len() % 2 == 1 {
-        if let Some(last) = unique.last().copied() {
-            unique.push(last);
-        }
-    }
-    unique
+    (0..whole).collect()
 }
 
 /// Decode every frame of a container, choosing a backend by what the bytes
 /// actually are.
 ///
-/// Returns the frames and the rate they represent. GIF is decoded in-process
-/// (pure Rust, no dependency) and reports the container's own average rate,
-/// so the caller still has to sample it. ffmpeg resamples during decode, so
-/// its frames are ALREADY at `target_fps` and it reports that — which makes
-/// the caller's sampling step a no-op rather than a second, lossy resample.
+/// Returns the frames, with one SOURCE time per frame. Both backends now go
+/// through the same coverage rule: the plan spans the whole clip at no more
+/// than `target_fps`, and the times it returns say where each returned frame
+/// actually sits. GIF decodes in-process (pure Rust, no dependency); every
+/// other container goes to ffmpeg.
 ///
 /// Dispatch is on MAGIC BYTES, not the declared MIME. A client that labels an
 /// mp4 `video/gif`, or sends `application/octet-stream`, still gets the right
@@ -248,21 +197,20 @@ pub fn decode_frames(
     data_uri: &str,
     target_fps: f32,
     ffmpeg: &crate::video_decode_ffmpeg::FfmpegPolicy,
-) -> Result<(Vec<RgbImage>, f32)> {
+) -> Result<(Vec<RgbImage>, Vec<f32>)> {
     let (mime, bytes) = decode_data_uri_bytes(data_uri)?;
     ensure!(!bytes.is_empty(), "the video payload is empty");
 
     if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return decode_gif(&bytes);
+        return decode_gif(&bytes, target_fps, ffmpeg);
     }
 
     // Everything else goes to the subprocess backend. If it is disabled the
     // error names the flag AND the container, so the operator is not left
     // guessing which of the two problems they have.
     let kind = sniff_container(&bytes, &mime);
-    crate::video_decode_ffmpeg::decode_frames(&bytes, target_fps, ffmpeg)
+    crate::video_decode_ffmpeg::decode_with_plan(&bytes, target_fps, ffmpeg)
         .with_context(|| format!("decoding {kind}"))
-        .map(|f| (f, target_fps))
 }
 
 /// Best-effort container name for error messages. Cosmetic only — nothing
@@ -285,42 +233,138 @@ fn sniff_container(bytes: &[u8], mime: &str) -> String {
     }
 }
 
-/// In-process GIF decode. The rate is derived from the per-frame delays the
-/// format stores; a GIF may declare 0 delay ("as fast as possible"), which is
-/// treated as the default rather than divided by.
-fn decode_gif(bytes: &[u8]) -> Result<(Vec<RgbImage>, f32)> {
+/// In-process GIF decode, bounded the same way the ffmpeg path is.
+///
+/// The GIF's own timeline is walked once to learn its duration, then the
+/// shared planner picks `wanted` positions spanning it — so a GIF and an MP4
+/// of the same clip sample the same way, and a GIF's timestamps are source
+/// times rather than an assumed constant rate.
+///
+/// The declared dimensions and frame count come from a cheap header pass
+/// BEFORE any pixels are allocated: a small file can declare an enormous GIF
+/// canvas, and the HTTP body cap does not bound what decoding it costs. The
+/// same pass refuses a clip whose decoded RGB would exceed the policy's
+/// `max_frames × max_decoded_pixels` budget, which is what `ffmpeg` is
+/// bounded by too.
+fn decode_gif(
+    bytes: &[u8],
+    target_fps: f32,
+    policy: &crate::video_decode_ffmpeg::FfmpegPolicy,
+) -> Result<(Vec<RgbImage>, Vec<f32>)> {
     use image::AnimationDecoder;
     use image::codecs::gif::GifDecoder;
-    let decoder =
-        GifDecoder::new(std::io::Cursor::new(bytes.to_vec())).context("not a decodable GIF")?;
-    let frames = decoder
-        .into_frames()
-        .collect_frames()
-        .context("failed to decode animation frames")?;
-    ensure!(!frames.is_empty(), "the container decoded to zero frames");
 
-    let total_ms: f64 = frames
-        .iter()
-        .map(|f| {
-            let (num, den) = f.delay().numer_denom_ms();
-            if den == 0 {
-                0.0
-            } else {
-                num as f64 / den as f64
-            }
-        })
-        .sum();
-    let fps = if total_ms > 0.0 {
-        (frames.len() as f64 * 1000.0 / total_ms) as f32
+    // Pass one: replay the decoder's frame ITERATOR without materialising the
+    // pixel buffers, to count frames and accumulate the declared duration. The
+    // decoder still decompresses each frame here, but the buffers are dropped
+    // as they arrive rather than collected, so peak memory is one frame.
+    let header = GifDecoder::new(std::io::Cursor::new(bytes.to_vec()))
+        .context("not a decodable GIF")?;
+    let mut count = 0usize;
+    let mut total_ms = 0f64;
+    // The largest declared frame area seen, for the memory bound below.
+    let mut max_area = 0usize;
+    for frame in header.into_frames() {
+        let frame = frame.context("failed to decode animation frames")?;
+        let buf = frame.buffer();
+        max_area = max_area.max(buf.width() as usize * buf.height() as usize);
+        let (num, den) = frame.delay().numer_denom_ms();
+        if den != 0 {
+            total_ms += num as f64 / den as f64;
+        }
+        count += 1;
+    }
+    ensure!(count > 0, "the container decoded to zero frames");
+
+    // The decoded-pixel budget, shared with the ffmpeg path's `scale` bound:
+    // `max_frames` frames at `max_decoded_pixels` each. `no_truncate` classes
+    // of omission are refused here rather than sampled around, because a GIF
+    // that cannot fit the budget must say so, not quietly decode a prefix.
+    let budget = policy
+        .max_frames
+        .max(1)
+        .saturating_mul(policy.max_decoded_pixels.max(1));
+    ensure!(
+        count.saturating_mul(max_area) <= budget,
+        "animated GIF would decode to {} frames of up to {max_area} pixels each, above the \
+         {budget}-pixel decoded-image budget; shorten or shrink the clip",
+        count
+    );
+
+    let native_fps = if total_ms > 0.0 {
+        (count as f64 * 1000.0 / total_ms) as f32
     } else {
         DEFAULT_FPS
     };
+    let fps = if target_fps.is_finite() && target_fps > 0.0 {
+        target_fps
+    } else {
+        DEFAULT_FPS
+    };
+    let want = crate::video_sample::wanted_frames(
+        (total_ms / 1000.0) as f32,
+        native_fps,
+        fps,
+        policy.max_frames,
+        fps,
+    );
+    let plan = crate::video_sample::sample_plan(want, (total_ms / 1000.0) as f32)?;
 
-    let rgb: Vec<RgbImage> = frames
-        .into_iter()
-        .map(|f| image::DynamicImage::ImageRgba8(f.into_buffer()).to_rgb8())
-        .collect();
-    Ok((rgb, fps))
+    // The plan's times are source seconds; a GIF has one frame per delay, so
+    // the frame for time `t` is the one whose cumulative delay covers `t`.
+    let mut cumulative = Vec::with_capacity(count);
+    {
+        let mut acc = 0f64;
+        for frame in GifDecoder::new(std::io::Cursor::new(bytes.to_vec()))
+            .context("not a decodable GIF")?
+            .into_frames()
+        {
+            let frame = frame.context("failed to decode animation frames")?;
+            cumulative.push(acc);
+            let (num, den) = frame.delay().numer_denom_ms();
+            if den != 0 {
+                acc += num as f64 / den as f64;
+            }
+        }
+    }
+    let index_for = |t: f32| -> usize {
+        let target = t as f64 * 1000.0;
+        // Last frame whose start time is at or before `t`; clamped so the
+        // first sample is frame 0 and nothing runs off the end.
+        cumulative
+            .partition_point(|&start| start <= target + 1e-6)
+            .saturating_sub(1)
+            .min(count - 1)
+    };
+
+    // Decode once, keeping only the frames the plan selected, in plan order.
+    let wanted_indices: Vec<usize> = plan.times.iter().map(|&t| index_for(t)).collect();
+    let keep: std::collections::BTreeSet<usize> = wanted_indices.iter().copied().collect();
+    let mut chosen: Vec<Option<RgbImage>> = vec![None; count];
+    for (i, frame) in GifDecoder::new(std::io::Cursor::new(bytes.to_vec()))
+        .context("not a decodable GIF")?
+        .into_frames()
+        .enumerate()
+    {
+        if !keep.contains(&i) {
+            continue;
+        }
+        let frame = frame.context("failed to decode animation frames")?;
+        chosen[i] = Some(
+            image::DynamicImage::ImageRgba8(frame.into_buffer()).to_rgb8(),
+        );
+    }
+
+    let mut frames = Vec::with_capacity(wanted_indices.len());
+    let mut times = Vec::with_capacity(wanted_indices.len());
+    for (t, &i) in plan.times.iter().zip(&wanted_indices) {
+        if let Some(img) = chosen[i].take() {
+            frames.push(img);
+            times.push(*t);
+        }
+    }
+    ensure!(!frames.is_empty(), "the GIF sampled to zero frames");
+    Ok((frames, times))
 }
 
 /// Full pipeline: a base64 `data:` URI holding an animated container becomes
@@ -336,21 +380,16 @@ pub fn preprocess_video(
         vcfg.patch_size > 0 && vcfg.spatial_merge_size > 0 && vcfg.temporal_patch_size > 0,
         "vision_config geometry is invalid (patch/merge/temporal size is 0)"
     );
-    let (frames, native_fps) = decode_frames(data_uri, target_fps, ffmpeg)?;
+    let (frames, frame_times) = decode_frames(data_uri, target_fps, ffmpeg)?;
     let tp = vcfg.temporal_patch_size;
 
-    let keep = if vcfg.is_glm5_next {
-        sample_glm_indices(frames.len(), native_fps, target_fps, 2_048, tp)
-    } else {
-        sample_indices(
-            frames.len(),
-            native_fps,
-            target_fps,
-            DEFAULT_MIN_FRAMES,
-            DEFAULT_MAX_FRAMES,
-            tp,
-        )
-    };
+    // The decoder has already sampled the clip: its frames ARE the plan, at
+    // the operator's rate and spanning the whole clip. Re-sampling here would
+    // be a second, lossy pass over positions the decoder chose deliberately
+    // (and, for a GIF, would need a rate the container may not declare).
+    // The one thing still owed is the group shape: a partial temporal group
+    // has no representation, so the count is rounded down to whole groups.
+    let keep = group_indices(frames.len(), tp);
     ensure!(!keep.is_empty(), "frame sampling selected no frames");
 
     // A clip shorter than one temporal group cannot be encoded as video.
@@ -449,10 +488,11 @@ pub fn preprocess_video(
         grid_w,
         // The pinned GLM processor's non-Glm4v path formats full-second
         // timestamps (`"{:.1f} seconds"`) and takes one timestamp per
-        // temporal pair. Preserve that source-frame contract even when the
-        // decoder has already resampled an ffmpeg stream.
+        // temporal pair. The decoder's per-frame source times are the SSOT
+        // for where each group sits — an assumed constant rate would drift
+        // from the positions actually sampled.
         timestamps: (0..grid_t)
-            .map(|g| (keep[g * tp] as f32 / native_fps.max(f32::EPSILON)).floor())
+            .map(|g| frame_times[keep[g * tp]].floor())
             .collect(),
     })
 }

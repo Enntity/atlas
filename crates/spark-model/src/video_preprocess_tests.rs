@@ -145,12 +145,29 @@ fn one_frame_cannot_make_a_group_at_tp2() {
 }
 
 #[test]
-fn glm5_sampling_repairs_an_odd_number_of_temporal_frames() {
-    let got = sample_glm_indices(25, 10.0, 2.0, 2_048, 2);
-    assert_eq!(got.len() % 2, 0, "GLM temporal groups need pairs: {got:?}");
-    assert!(got.len() >= 2);
-    if got.len() > 1 {
-        assert_eq!(got[got.len() - 1], got[got.len() - 2]);
+fn glm5_sampling_plans_whole_temporal_groups() {
+    // The old sampler asked ffmpeg for an odd count and then duplicated the
+    // last frame so `group_indices` had a full pair. Duplicating charged the
+    // model for a frame it could not learn from. The split now is: the planner
+    // chooses how many frames to take, and the group step keeps whole pairs of
+    // them. So the contract to hold is that grouping never drops a frame the
+    // planner asked the decoder for, and that a short clip still yields at
+    // least one group.
+    for (duration, native, target) in [(2.5, 10.0, 2.0), (1.0, 8.0, 2.0), (300.0, 8.0, 2.0)] {
+        let want = crate::video_sample::wanted_frames(duration, native, target, 2_048, DEFAULT_FPS);
+        assert!(want >= 1, "planner returned no frames for {duration}s");
+        let plan = crate::video_sample::sample_plan(want, duration).expect("plan");
+        assert_eq!(plan.times.len(), want);
+        let grouped = group_indices(plan.times.len(), 2);
+        assert!(!grouped.is_empty(), "one group at tp=2 needs two frames");
+        // At most the odd trailing frame is dropped, and the planner's count
+        // was available to the caller to round before it got here.
+        assert!(
+            plan.times.len() - grouped.len() <= 1,
+            "grouping dropped {} of {} planned frames",
+            plan.times.len() - grouped.len(),
+            plan.times.len()
+        );
     }
 }
 
@@ -189,10 +206,16 @@ fn make_gif(n: u16, size: u16) -> String {
 #[test]
 fn an_animated_gif_decodes_to_its_frames() {
     let uri = make_gif(6, 64);
-    let (frames, fps) = decode_frames(&uri, 10.0, &no_ffmpeg()).expect("decode");
+    let (frames, timestamps) = decode_frames(&uri, 10.0, &no_ffmpeg()).expect("decode");
     assert_eq!(frames.len(), 6);
+    // PER-FRAME timestamps, not one nominal fps for the whole clip: the decoder
+    // reports where each returned frame actually sits so the sample plan can
+    // span the full duration instead of the leading seconds.
+    assert_eq!(timestamps.len(), frames.len(), "one timestamp per frame");
     // 100 ms per frame → 10 fps.
-    assert!((fps - 10.0).abs() < 0.5, "fps was {fps}");
+    let steps: Vec<f32> = timestamps.windows(2).map(|w| w[1] - w[0]).collect();
+    let mean_step = steps.iter().sum::<f32>() / steps.len() as f32;
+    assert!((mean_step - 0.1).abs() < 0.02, "timestamps were {timestamps:?}");
 }
 
 /// The shape contract the encoder depends on: one buffer per temporal group,
