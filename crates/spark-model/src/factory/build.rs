@@ -656,7 +656,7 @@ pub fn build_model(
     // budget-driven sum. This is the *whole point* of the HBM-shrink
     // feature — the production cache becomes write staging only; older
     // blocks live on disk under the orchestrator's control.
-    let num_kv_blocks = match hss_cache_blocks_per_seq {
+    let mut num_kv_blocks = match hss_cache_blocks_per_seq {
         Some(cap) => {
             // Phase 6.3 (original): pool = max_batch × cap + 1 dummy + 1 spare per seq.
             // Issue #31 (2026-05-08): the cap×bs sizing assumed prefill would
@@ -729,6 +729,42 @@ pub fn build_model(
             n
         }
     };
+    // ATLAS_GLM_KV_CAP_TO_CONTEXTS=1: keep the target pool at exactly the
+    // geometry the retained owners verify (surplus blocks consume host
+    // reserve without increasing the declared context capacity). The helper re-checks the budget
+    // before narrowing, so a pool that cannot fit its own owners still
+    // fails here rather than looking capped. Resolution happens before any
+    // KV / sparse-index pool is allocated below.
+    let cap = glm_mtp_capacity::parse_cap(
+        std::env::var("ATLAS_GLM_KV_CAP_TO_CONTEXTS")
+            .ok()
+            .as_deref(),
+    )?;
+    if let Some(capped) = glm_mtp_capacity::capped_blocks(
+        cap,
+        config.model_type == "glm5_next",
+        crate::speculative::glm_repair_policy::enabled()
+            && crate::speculative::glm_repair_policy::long_context_enabled(),
+        hss_cache_blocks_per_seq.is_some(),
+        max_seq_len,
+        num_drafts,
+        kv_block_size,
+        max_batch_size,
+        num_kv_blocks,
+    )? {
+        tracing::info!(
+            "ATLAS_GLM_KV_CAP_TO_CONTEXTS=1: budget allows {} blocks, capping to \
+             {} blocks = {} owner(s) × ceil(({} context + {} speculative rows) / \
+             {} tok/block)",
+            num_kv_blocks,
+            capped,
+            max_batch_size,
+            max_seq_len,
+            num_drafts,
+            kv_block_size,
+        );
+        num_kv_blocks = capped;
+    }
     if config.model_type == "glm5_next"
         && crate::speculative::glm_repair_policy::enabled()
         && crate::speculative::glm_repair_policy::long_context_enabled()
