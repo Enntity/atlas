@@ -128,6 +128,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) hc_pre_k: KernelHandle,
     /// Finalizer for the prefill-only batched TF32 mHC pre-mix.
     pub(super) hc_pre_from_raw_mix_k: KernelHandle,
+    /// Exact per-(mix row, token) split of `hc_pre` for short batches.
+    pub(super) hc_pre_mix_k: KernelHandle,
     /// HC `hc_post` kernel handle (NULL when HC disabled).
     pub(super) hc_post_k: KernelHandle,
     /// GLM K=5 shared-expert blend fused into `hc_post`.

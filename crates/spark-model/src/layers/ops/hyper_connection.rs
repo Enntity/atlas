@@ -93,6 +93,184 @@ pub fn hc_pre(
         .launch(stream)
 }
 
+/// Largest batch routed through [`hc_pre_split`]; beyond it `hc_pre`'s one
+/// block per token already fills the GPU (prefill uses the TF32 GEMM path).
+pub const HC_PRE_SPLIT_MAX_TOKENS: u32 = 64;
+
+/// `hc_pre` as two launches with bit-identical results: `hc_pre_mix` spreads
+/// the 24 mix dot products of every token over the grid, `hc_pre_from_raw_mix`
+/// finalizes. `raw_mix` needs `tokens * (2 + hc) * hc` FP32 elements.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_pre_split(
+    gpu: &dyn GpuBackend,
+    mix_kernel: KernelHandle,
+    finalize_kernel: KernelHandle,
+    raw_mix: DevicePtr,
+    streams: DevicePtr,
+    hc_fn: DevicePtr,
+    hc_scale: DevicePtr,
+    hc_base: DevicePtr,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    norm_eps: f32,
+    hc_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, mix_kernel)
+        .grid([(2 + hc_mult) * hc_mult, num_tokens, 1])
+        .block([256, 1, 1])
+        .arg_ptr(streams)
+        .arg_ptr(hc_fn)
+        .arg_ptr(raw_mix)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .launch(stream)?;
+    hc_pre_from_raw_mix(
+        gpu,
+        finalize_kernel,
+        streams,
+        raw_mix,
+        hc_scale,
+        hc_base,
+        y_out,
+        post_out,
+        comb_out,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        sinkhorn_iters,
+        norm_eps,
+        hc_eps,
+        stream,
+    )
+}
+
+/// Decode/verify `hc_pre` through [`hc_pre_split`] when it applies
+/// (`ATLAS_GLM_HC_SPLIT`, default on; kernels present; `tokens` within
+/// [`HC_PRE_SPLIT_MAX_TOKENS`]; `scratch` large enough). Returns false when the
+/// caller must launch the one-kernel `hc_pre` itself.
+///
+/// `ATLAS_GLM_HC_SPLIT_CHECK=1` also runs `hc_pre` and requires byte-identical
+/// `y`/`post`/`comb` (synchronizing; diagnostic only).
+#[allow(clippy::too_many_arguments)]
+pub fn try_hc_pre_split(
+    gpu: &dyn GpuBackend,
+    pre_kernel: KernelHandle,
+    mix_kernel: KernelHandle,
+    finalize_kernel: KernelHandle,
+    scratch: DevicePtr,
+    scratch_bytes: usize,
+    streams: DevicePtr,
+    hc_fn: DevicePtr,
+    hc_scale: DevicePtr,
+    hc_base: DevicePtr,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    norm_eps: f32,
+    hc_eps: f32,
+    stream: u64,
+) -> Result<bool> {
+    static MODE: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let (enabled, check) = *MODE.get_or_init(|| {
+        (
+            std::env::var("ATLAS_GLM_HC_SPLIT").as_deref() != Ok("0"),
+            std::env::var("ATLAS_GLM_HC_SPLIT_CHECK").as_deref() == Ok("1"),
+        )
+    });
+    let t = num_tokens as usize;
+    let (h, hc) = (hidden_size as usize, hc_mult as usize);
+    let raw_bytes = t * (2 + hc) * hc * 4;
+    let (y_bytes, post_bytes, comb_bytes) = (t * h * 2, t * hc * 4, t * hc * hc * 4);
+    let needed = raw_bytes
+        + if check {
+            y_bytes + post_bytes + comb_bytes
+        } else {
+            0
+        };
+    if !enabled
+        || mix_kernel.0 == 0
+        || finalize_kernel.0 == 0
+        || num_tokens == 0
+        || num_tokens > HC_PRE_SPLIT_MAX_TOKENS
+        || scratch.is_null()
+        || scratch_bytes < needed
+    {
+        return Ok(false);
+    }
+    hc_pre_split(
+        gpu,
+        mix_kernel,
+        finalize_kernel,
+        scratch,
+        streams,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        y_out,
+        post_out,
+        comb_out,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        sinkhorn_iters,
+        norm_eps,
+        hc_eps,
+        stream,
+    )?;
+    if check {
+        let saved = scratch.offset(raw_bytes);
+        let spans = [
+            (y_out, saved, y_bytes),
+            (post_out, saved.offset(y_bytes), post_bytes),
+            (comb_out, saved.offset(y_bytes + post_bytes), comb_bytes),
+        ];
+        for &(src, dst, bytes) in &spans {
+            gpu.copy_d2d_async(src, dst, bytes, stream)?;
+        }
+        hc_pre(
+            gpu,
+            pre_kernel,
+            streams,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            y_out,
+            post_out,
+            comb_out,
+            num_tokens,
+            hidden_size,
+            hc_mult,
+            sinkhorn_iters,
+            norm_eps,
+            hc_eps,
+            stream,
+        )?;
+        gpu.synchronize(stream)?;
+        for (name, &(reference, split, bytes)) in ["y", "post", "comb"].iter().zip(&spans) {
+            let (mut a, mut b) = (vec![0u8; bytes], vec![0u8; bytes]);
+            gpu.copy_d2h(reference, &mut a)?;
+            gpu.copy_d2h(split, &mut b)?;
+            let diff = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+            anyhow::ensure!(
+                diff == 0,
+                "hc_pre split differs from hc_pre in {diff}/{bytes} {name} bytes (T={num_tokens})"
+            );
+        }
+        tracing::debug!("hc_pre split byte-identical (T={num_tokens})");
+    }
+    Ok(true)
+}
+
 /// Finalize `hc_pre` from an FP32 `[tokens, (2 + hc) * hc]` pre-mix GEMM.
 #[allow(clippy::too_many_arguments)]
 pub fn hc_pre_from_raw_mix(

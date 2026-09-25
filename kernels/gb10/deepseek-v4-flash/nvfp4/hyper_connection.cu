@@ -205,6 +205,38 @@ extern "C" __global__ void hc_pre(
     }
 }
 
+// Exact split of hc_pre's pass 2 for short decode/verify batches: one block
+// per (mix row m, token t) instead of one block per token looping all 24 rows,
+// so a 3..12-row verify uses 72..288 blocks rather than 3..12. The per-thread
+// accumulation order and the block tree reduction are hc_pre's, so
+// raw_mix[t, m] is bit-identical to hc_pre's pre-rsqrt `r`; hc_pre_from_raw_mix
+// then applies rsqrt/scale/Sinkhorn/collapse in hc_pre's operation order.
+// Grid: (mix_hc, T, 1)  Block: (256, 1, 1).
+extern "C" __global__ void hc_pre_mix(
+    const float* __restrict__ streams, // [T, hc, H]
+    const float* __restrict__ hc_fn,   // [mix_hc, hc*H]
+    float* __restrict__ raw_mix,       // [T, mix_hc]
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    const unsigned int m = blockIdx.x;
+    const unsigned int t = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int hc_dim = hc_mult * hidden_size;
+    const unsigned int mix_hc = (2 + hc_mult) * hc_mult;
+    const float* x = streams + (size_t)t * hc_dim;
+    const float* fn_row = hc_fn + (size_t)m * hc_dim;
+    __shared__ float red[HC_BLOCK];
+    float acc = 0.f;
+    for (unsigned int k = tid; k < hc_dim; k += HC_BLOCK) {
+        acc += fn_row[k] * (float)x[k];
+    }
+    red[tid] = acc;
+    __syncthreads();
+    float r = hc_block_reduce(red, tid);
+    if (tid == 0) raw_mix[(size_t)t * mix_hc + m] = r;
+}
+
 // Finalize an mHC pre block after a batched TF32 GEMM has produced
 // raw_mix[t,m] = dot(streams[t], hc_fn[m]).  Keeping the large MxNxK product
 // separate lets cuBLASLt reuse both operands across tokens/mix rows instead of

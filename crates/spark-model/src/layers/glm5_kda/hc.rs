@@ -72,6 +72,30 @@ impl Glm5KdaLayer {
                 stream,
             );
         }
+        if ops::try_hc_pre_split(
+            ctx.gpu,
+            self.hc_pre_k,
+            self.hc_pre_mix_k,
+            self.hc_pre_from_raw_mix_k,
+            ctx.buffers.gate_logits_f32(),
+            ctx.buffers.sizes().gate_logits_f32,
+            ctx.buffers.hc_streams(),
+            site.hc_fn,
+            site.hc_scale,
+            site.hc_base,
+            hidden,
+            ctx.buffers.hc_post(),
+            ctx.buffers.hc_comb(),
+            tokens,
+            self.hidden_size as u32,
+            self.hc.hc_mult as u32,
+            self.hc.sinkhorn_iters as u32,
+            ctx.config.rms_norm_eps as f32,
+            self.hc.hc_eps,
+            stream,
+        )? {
+            return Ok(());
+        }
         ops::hc_pre(
             ctx.gpu,
             self.hc_pre_k,

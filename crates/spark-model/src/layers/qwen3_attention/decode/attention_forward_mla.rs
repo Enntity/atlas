@@ -396,24 +396,40 @@ impl Qwen3AttentionLayer {
         };
         prof!("paged_attn", {
             if let Some((indices, index_width)) = sparse_indices {
-                ops::glm_sparse_mla_prefill(
-                    ctx.gpu,
-                    self.glm_sparse_attn_decode_k,
+                if self.try_glm_sparse_tc_decode_heads(
+                    ctx,
                     q_absorbed_buf,
-                    kv_cache.k_pool_ptr(self.attn_layer_idx),
-                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    kv_cache,
                     indices,
+                    index_width,
                     attn_out,
                     meta.block_table,
-                    1,
                     nq,
                     mla_cache_dim,
-                    index_width,
-                    kv_cache.block_size() as u32,
-                    1,
                     inv_sqrt_d,
                     stream,
-                )
+                )? {
+                    Ok(())
+                } else {
+                    ops::glm_sparse_mla_prefill(
+                        ctx.gpu,
+                        self.glm_sparse_attn_decode_k,
+                        q_absorbed_buf,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        indices,
+                        attn_out,
+                        meta.block_table,
+                        1,
+                        nq,
+                        mla_cache_dim,
+                        index_width,
+                        kv_cache.block_size() as u32,
+                        1,
+                        inv_sqrt_d,
+                        stream,
+                    )
+                }
             } else {
                 ops::paged_decode_attn_bf16(
                     ctx.gpu,
@@ -508,5 +524,71 @@ impl Qwen3AttentionLayer {
         })?;
 
         Ok(o_out)
+    }
+}
+
+impl Qwen3AttentionLayer {
+    /// Single-row GLM sparse attention through the tensor-core decode kernel,
+    /// 32 heads per launch (attention is independent per head, so a 64-head
+    /// MTP body runs two launches). Returns false, leaving the scalar kernel to
+    /// the caller, unless every precondition of that kernel holds.
+    #[allow(clippy::too_many_arguments)]
+    fn try_glm_sparse_tc_decode_heads(
+        &self,
+        ctx: &ForwardContext,
+        query: DevicePtr,
+        kv_cache: &PagedKvCache,
+        indices: DevicePtr,
+        index_width: u32,
+        output: DevicePtr,
+        block_table: DevicePtr,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+        stream: u64,
+    ) -> Result<bool> {
+        const GROUP: u32 = 32;
+        if !ops::glm_sparse_decode_tc_enabled(&ctx.config.model_type)?
+            || heads == 0
+            || heads % GROUP != 0
+            || head_dim != 512
+            || index_width != 2051
+            || kv_cache.block_size() != 16
+            || scale != 0.0625
+            || self.kv_dtype != spark_runtime::kv_cache::KvCacheDtype::Bf16
+            || ctx.config.qk_rope_head_dim != 0
+            || !query.0.is_multiple_of(16)
+            || !output.0.is_multiple_of(4)
+        {
+            return Ok(false);
+        }
+        let group_bytes = (GROUP * head_dim) as usize * 2;
+        for group in 0..(heads / GROUP) as usize {
+            let a = ops::GlmSparsePrefillTc {
+                config: ctx.config,
+                dtype: self.kv_dtype,
+                identical_kv_latent: true,
+                query: query.offset(group * group_bytes),
+                k_cache: kv_cache.k_pool_ptr(self.attn_layer_idx),
+                v_cache: kv_cache.v_pool_ptr(self.attn_layer_idx),
+                indices,
+                output: output.offset(group * group_bytes),
+                block_table,
+                rows: 1,
+                heads: GROUP,
+                head_dim,
+                index_width,
+                block_size: 16,
+                scale,
+            };
+            if !ops::try_glm_sparse_decode_tc(ctx.gpu, &a, stream)? {
+                anyhow::ensure!(
+                    group == 0,
+                    "GLM sparse TC decode stopped after a partial head group"
+                );
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
