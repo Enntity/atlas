@@ -723,11 +723,15 @@ extern "C" __global__ void fused_silu_mul(
 // output column n and lane m owns C[m, n]: every lane accumulates in strict
 // k = 0..K-1 order with the same separate FMUL/FADD (--fmad=false) as the
 // scalar kernel, so each output is BIT-IDENTICAL to dense_gemm_bf16, while
-// all M*N accumulators run concurrently. The weight element is a warp
-// broadcast; each lane streams its own activation row.
+// all M*N accumulators run concurrently. The warp first stages its weight row
+// in shared memory with coalesced loads, so the sequential chain reads the
+// weight as a shared-memory broadcast instead of one dependent global load
+// per 8 elements; each lane streams its own (cache-resident) activation row.
 //
-// Grid: (ceil(N/8), 1, 1)   Block: (256, 1, 1)
-extern "C" __global__ void dense_gemm_bf16_router_rows(
+// Grid: (ceil(N/4), 1, 1)   Block: (128, 1, 1)
+#define ROUTER_ROWS_WARPS 4
+#define ROUTER_ROWS_MAX_K 4096
+extern "C" __global__ void __launch_bounds__(128) dense_gemm_bf16_router_rows(
     const __nv_bfloat16* __restrict__ A,  // [M, K]
     const __nv_bfloat16* __restrict__ B,  // [N, K]
     __nv_bfloat16* __restrict__ C,        // [M, N]
@@ -735,15 +739,40 @@ extern "C" __global__ void dense_gemm_bf16_router_rows(
     unsigned int N,
     unsigned int K
 ) {
+    __shared__ __align__(16) __nv_bfloat16 s_b[ROUTER_ROWS_WARPS][ROUTER_ROWS_MAX_K];
     const unsigned int warp = threadIdx.x / 32;
     const unsigned int lane = threadIdx.x % 32;
-    const unsigned int n = blockIdx.x * 8 + warp;
-    if (n >= N || lane >= M) return;
+    const unsigned int n = blockIdx.x * ROUTER_ROWS_WARPS + warp;
+    if (n >= N) return;
     const __nv_bfloat16* a = A + (unsigned long long)lane * K;
     const __nv_bfloat16* b = B + (unsigned long long)n * K;
+    const bool vec = (K % 8) == 0 && ((unsigned long long)A % 16) == 0
+        && ((unsigned long long)b % 16) == 0;
+    const bool staged = vec && K <= ROUTER_ROWS_MAX_K;
+    if (staged) {
+        uint4* dst = (uint4*)s_b[warp];
+        for (unsigned int c = lane; c < K / 8; c += 32) dst[c] = ((const uint4*)b)[c];
+        __syncwarp();
+    }
+    if (lane >= M) return;
     float acc = 0.0f;
     unsigned int k = 0;
-    if ((K % 8) == 0 && ((unsigned long long)a % 16) == 0 && ((unsigned long long)b % 16) == 0) {
+    if (staged) {
+        const uint4* a4 = (const uint4*)a;
+        const uint4* b4 = (const uint4*)s_b[warp];
+        #pragma unroll 8
+        for (unsigned int c = 0; c < K / 8; ++c) {
+            const uint4 av = a4[c];
+            const uint4 bv = b4[c];
+            const __nv_bfloat16* ae = (const __nv_bfloat16*)&av;
+            const __nv_bfloat16* be = (const __nv_bfloat16*)&bv;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                acc += __bfloat162float(ae[i]) * __bfloat162float(be[i]);
+            }
+        }
+        k = K;
+    } else if (vec) {
         for (; k < K; k += 8) {
             const uint4 av = *(const uint4*)(a + k);
             const uint4 bv = *(const uint4*)(b + k);

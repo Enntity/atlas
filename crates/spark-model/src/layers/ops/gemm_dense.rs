@@ -150,7 +150,7 @@ pub fn dense_gemm_router(
 /// row, strict k order — bit-identical to [`dense_gemm`] at decode/verify
 /// widths where the tiled kernels launch only a handful of blocks.
 ///
-/// Grid: (ceil(N/8), 1, 1)  Block: (256, 1, 1)
+/// Grid: (ceil(N/4), 1, 1)  Block: (128, 1, 1)
 #[allow(clippy::too_many_arguments)]
 pub fn dense_gemm_router_rows(
     gpu: &dyn GpuBackend,
@@ -168,8 +168,8 @@ pub fn dense_gemm_router_rows(
         "dense_gemm_router_rows: m={m} outside 1..=32"
     );
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 8), 1, 1])
-        .block([256, 1, 1])
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([128, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)
         .arg_ptr(output)
