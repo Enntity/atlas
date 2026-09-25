@@ -436,23 +436,24 @@ impl TransformerModel {
                 stream,
             )?;
 
-            // LM head for K tokens
-            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
-
-            // Argmax inside graph (fixed scratch addresses — graph-safe)
-            let vocab = self.config.vocab_size;
+            // LM head + argmax for K tokens, inside the graph (fixed scratch
+            // addresses — graph-safe).
             let argmax_out = self.buffers.scratch();
-            for t in 0..k {
-                let logits_t = self.buffers.logits().offset(t * vocab * bf16);
-                let out_t = argmax_out.offset(t * 4);
-                ops::argmax_bf16(
-                    self.gpu.as_ref(),
-                    self.argmax_kernel,
-                    logits_t,
-                    out_t,
-                    vocab as u32,
-                    stream,
-                )?;
+            if !self.glm_split_head_argmax(normed, k, argmax_out, stream)? {
+                self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+                let vocab = self.config.vocab_size;
+                for t in 0..k {
+                    let logits_t = self.buffers.logits().offset(t * vocab * bf16);
+                    let out_t = argmax_out.offset(t * 4);
+                    ops::argmax_bf16(
+                        self.gpu.as_ref(),
+                        self.argmax_kernel,
+                        logits_t,
+                        out_t,
+                        vocab as u32,
+                        stream,
+                    )?;
+                }
             }
 
             if use_graphs {

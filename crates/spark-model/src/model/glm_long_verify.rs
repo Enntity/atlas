@@ -302,18 +302,20 @@ impl TransformerModel {
             self.config.rms_norm_eps as f32,
             stream,
         )?;
-        self.lm_head_batched(normed, rows as u32, self.buffers.logits(), stream)?;
-        let vocab = self.config.vocab_size;
         let argmax = self.buffers.scratch();
-        for r in 0..rows {
-            ops::argmax_bf16(
-                self.gpu.as_ref(),
-                self.argmax_kernel,
-                self.buffers.logits().offset(r * vocab * 2),
-                argmax.offset(r * 4),
-                vocab as u32,
-                stream,
-            )?;
+        if !self.glm_split_head_argmax(normed, rows, argmax, stream)? {
+            self.lm_head_batched(normed, rows as u32, self.buffers.logits(), stream)?;
+            let vocab = self.config.vocab_size;
+            for r in 0..rows {
+                ops::argmax_bf16(
+                    self.gpu.as_ref(),
+                    self.argmax_kernel,
+                    self.buffers.logits().offset(r * vocab * 2),
+                    argmax.offset(r * 4),
+                    vocab as u32,
+                    stream,
+                )?;
+            }
         }
         stage.copy(
             self.gpu.as_ref(),

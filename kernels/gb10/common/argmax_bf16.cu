@@ -280,3 +280,26 @@ extern "C" __global__ void argmax_fp32(
     }
     if (tid == 0) out[0] = s_idx[0];
 }
+
+// Merge per-row TP2 shard pairs from argmax_bf16_value into global token IDs,
+// on device so a graph-captured verify needs no host round trip. `local` and
+// `peer` hold [rows][value_bits, shard_index]; `rank` orders them. The rule is
+// the host glm5_mtp argmax_merge::merge: a valid tie picks the higher global
+// ID (rank one); two untouched sentinels keep index zero.
+// Grid: (1, 1, 1)  Block: (32, 1, 1)
+extern "C" __global__ void argmax_pair_merge(
+    const unsigned int* __restrict__ local,
+    const unsigned int* __restrict__ peer,
+    unsigned int* __restrict__ out,
+    unsigned int rows,
+    unsigned int shard,
+    unsigned int rank
+) {
+    for (unsigned int r = threadIdx.x; r < rows; r += blockDim.x) {
+        const unsigned int* p0 = rank == 0 ? local : peer;
+        const unsigned int* p1 = rank == 0 ? peer : local;
+        const float v0 = __uint_as_float(p0[2 * r]);
+        const float v1 = __uint_as_float(p1[2 * r]);
+        out[r] = (v1 > v0 || (v1 == v0 && v1 > -1e30f)) ? p1[2 * r + 1] + shard : p0[2 * r + 1];
+    }
+}
