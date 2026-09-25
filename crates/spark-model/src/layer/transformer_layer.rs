@@ -63,6 +63,19 @@ pub trait TransformerLayer: Send + Sync {
         anyhow::bail!("GLM owner-batch layer verification is unsupported")
     }
 
+    /// Repaired long-context K3 verify of several owners in one traversal
+    /// (`glm_long_owner`). Unsupported layers refuse before any work.
+    fn decode_glm_long_owners(
+        &self,
+        _owners: &mut [super::glm_long_owner::GlmLongOwner<'_>],
+        _cache: &mut PagedKvCache,
+        _stage: &super::glm_long_owner::GlmLongStage,
+        _ctx: &ForwardContext<'_>,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM long-context owner-batched verify is unsupported for this layer")
+    }
+
     /// Fixed eager GLM [5,5] compute support, not request/transaction authority.
     fn supports_glm_pair_verify(&self) -> bool {
         false

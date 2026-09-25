@@ -598,6 +598,35 @@ pub fn step_mtp(
             serial_idxs.extend_from_slice(chunk);
         }
     }
+    // Owner-batched repaired long-context K3 (`ATLAS_GLM_LONG_BATCH_VERIFY`):
+    // grammarless two-draft owners verify in ONE target traversal instead of
+    // one traversal per owner. Everything else keeps the per-sequence path.
+    if glm_repaired_narrow && !dflash_verify_raw_argmax && ladder_nd >= 2 {
+        let group: Vec<usize> = serial_idxs
+            .iter()
+            .copied()
+            .filter(|&i| active[i].grammar_state.is_none() && active[i].pending_drafts.len() == 2)
+            .collect();
+        if group.len() >= 2 && model.can_batch_glm_long_verify(group.len()) {
+            serial_idxs.retain(|i| !group.contains(i));
+            let mut sorted = group.clone();
+            sorted.sort_unstable();
+            let mut batch: Vec<&mut ActiveSeq> = active
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| sorted.binary_search(i).is_ok())
+                .map(|(_, a)| a)
+                .collect();
+            step_verify_glm_long_batched(
+                model,
+                &mut batch,
+                sched,
+                num_drafts,
+                verify_ctx,
+                dflash_verify_raw_argmax,
+            );
+        }
+    }
     for &idx in &serial_idxs {
         let a = &mut active[idx];
         let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);

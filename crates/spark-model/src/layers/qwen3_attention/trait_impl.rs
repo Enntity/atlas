@@ -114,6 +114,17 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.decode_verify_mla(owners, cache, &mut workspace.scratch, ctx, mode, stream)
     }
 
+    fn decode_glm_long_owners(
+        &self,
+        owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        cache: &mut PagedKvCache,
+        stage: &crate::layer::glm_long_owner::GlmLongStage,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_glm_long_owners_mla(owners, cache, stage, ctx, stream)
+    }
+
     fn supports_glm_pair_verify(&self) -> bool {
         self.pair_mla_supported()
     }

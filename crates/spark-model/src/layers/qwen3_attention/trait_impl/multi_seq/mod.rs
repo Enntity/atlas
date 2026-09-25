@@ -15,6 +15,7 @@ mod attn;
 mod c4;
 mod ctx;
 mod ffn;
+mod glm_long_owner;
 mod hc_ffn;
 mod hc_generic;
 mod mla;

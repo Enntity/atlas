@@ -13,6 +13,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
+pub mod glm_long_owner;
 pub mod glm_owner_verify;
 pub mod glm_pair_verify;
 pub(crate) mod glm_verify_ffn;

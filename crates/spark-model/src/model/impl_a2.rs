@@ -595,6 +595,9 @@ impl TransformerModel {
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
         }
+        if cmd == super::glm_long_verify::EP_CMD_GLM_LONG_VERIFY {
+            return self.glm_long_receive_verify(slots);
+        }
         if cmd == super::glm_c2_pair_transport::EP_GLM_PAIR_VERIFY {
             return self.paired_receive_verify_pair(seq_id, slots);
         }
@@ -696,6 +699,9 @@ impl TransformerModel {
                 *self.vision_grid_base.lock() = state.grid_base;
                 *self.vision_owned_images.lock() = state.owned_images;
                 *self.vision_slice_rows.lock() = state.slice_rows;
+            }
+            super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => {
+                self.glm_long_receive_tail(seq)?;
             }
             0xFFFFFFF6 => {
                 let disabled = self.ep_broadcast_u32(0)?;
@@ -889,7 +895,6 @@ impl TransformerModel {
                             ),
                         ));
                     }
-                    let committed = num_accepted + 1;
                     let verify_base = if let Some(base) = paired_base {
                         base
                     } else if crate::speculative::glm_repair_policy::enabled() {
@@ -899,23 +904,7 @@ impl TransformerModel {
                     } else {
                         0
                     };
-                    let to_drop = k - committed;
-                    if to_drop > 0 {
-                        anyhow::ensure!(
-                            seq.seq_len >= to_drop && seq.tokens.len() >= to_drop,
-                            "EP generic verify rollback underflow: seq_len={}, tokens={}, drop={to_drop}",
-                            seq.seq_len,
-                            seq.tokens.len(),
-                        );
-                        seq.seq_len -= to_drop;
-                        for _ in 0..to_drop {
-                            seq.tokens.pop();
-                        }
-                    }
-                    self.record_glm_mtp_verified_impl(seq, verify_base, &tokens, num_accepted)?;
-                    self.trim_proposer_state(seq, num_accepted, 0)?;
-                    self.commit_accepted_prefix(seq, committed, k)?;
-                    Ok(())
+                    self.ep_worker_apply_verdict(seq, verify_base, &tokens, num_accepted)
                 })();
                 result.map_err(|error| {
                     if selected {
@@ -936,6 +925,38 @@ impl TransformerModel {
         }
 
         Ok(true)
+    }
+
+    /// Worker side of a verified K-row step once the head's accepted-draft
+    /// count has arrived: roll back the rejected rows, record the repair
+    /// verdict, trim the proposer and commit the accepted SSM prefix.
+    pub(super) fn ep_worker_apply_verdict(
+        &self,
+        seq: &mut SequenceState,
+        verify_base: usize,
+        tokens: &[u32],
+        num_accepted: usize,
+    ) -> Result<()> {
+        let k = tokens.len();
+        let committed = num_accepted + 1;
+        anyhow::ensure!(committed <= k, "EP verdict {num_accepted} exceeds K={k}");
+        let to_drop = k - committed;
+        if to_drop > 0 {
+            anyhow::ensure!(
+                seq.seq_len >= to_drop && seq.tokens.len() >= to_drop,
+                "EP generic verify rollback underflow: seq_len={}, tokens={}, drop={to_drop}",
+                seq.seq_len,
+                seq.tokens.len(),
+            );
+            seq.seq_len -= to_drop;
+            for _ in 0..to_drop {
+                seq.tokens.pop();
+            }
+        }
+        self.record_glm_mtp_verified_impl(seq, verify_base, tokens, num_accepted)?;
+        self.trim_proposer_state(seq, num_accepted, 0)?;
+        self.commit_accepted_prefix(seq, committed, k)?;
+        Ok(())
     }
 
     /// Worker-side handler for the batched-decode protocol (`0xFFFFFFE0`).

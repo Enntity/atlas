@@ -417,6 +417,23 @@ impl TransformerModel {
         } else {
             DevicePtr::NULL
         };
+        // Owner-batched long-context K3 verify stage: ~5 MB, allocated before
+        // KV sizing so the pool accounts for it.
+        let glm_long_stage = if has_mtp
+            && config.model_type == "glm5_next"
+            && crate::layer::glm_long_owner::enabled()?
+        {
+            Some(crate::layer::glm_long_owner::GlmLongStage::alloc(
+                gpu.as_ref(),
+                crate::layer::glm_long_owner::RowBytes::new(
+                    config.hidden_size,
+                    config.hc_mult,
+                    config.vocab_size,
+                ),
+            )?)
+        } else {
+            None
+        };
         // Batched-verify WY pointer-table staging (fixed address for CUDA
         // graph stability; contents refreshed pre-graph every batched verify
         // step). One [h|Hi0|Hi1|Hi2] x 4-entry slice per GDN layer — ~6 KB.
@@ -826,6 +843,7 @@ impl TransformerModel {
             mtp_hidden_save,
             verify_hidden_stash,
             verify_stream_stash,
+            glm_long_stage,
             mtp_catchup_ring,
             mtp_catchup_meta: parking_lot::Mutex::new((0, 0)),
             mtp_prefill_hidden,

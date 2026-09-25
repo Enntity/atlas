@@ -148,51 +148,9 @@ impl Glm5KdaLayer {
                 }
             } else {
                 // Preserve the original interleaved path as the exact fallback.
-                for t in 0..tokens {
-                    ops::conv1d_update_prefill(
-                        ctx.gpu,
-                        self.conv_prefill_k,
-                        self.conv_prefill_tp_k,
-                        state.conv_state,
-                        packed.offset(t * packed_row_bytes),
-                        &self.weights.conv,
-                        DevicePtr::NULL,
-                        convolved.offset(t * packed_row_bytes),
-                        (3 * p) as u32,
-                        self.conv_width as u32,
-                        1,
-                        (3 * p) as u32,
-                        (3 * p) as u32,
-                        stream,
-                    )?;
-                    self.run_recurrent(
-                        convolved.offset(t * packed_row_bytes),
-                        g1.offset(t * gate_row_bytes),
-                        beta.offset(t * beta_row_bytes),
-                        state.h_state,
-                        core_out.offset(t * gate_row_bytes),
-                        1,
-                        true,
-                        ctx,
-                        stream,
-                    )?;
-                    // A partial accept can select states after rows 0..K-2;
-                    // the post-row K-1 state is already canonical on full accept.
-                    if t + 1 < tokens {
-                        ctx.gpu.copy_d2d_async(
-                            state.h_state,
-                            state.h_state_intermediates[t],
-                            self.h_state_bytes,
-                            stream,
-                        )?;
-                        ctx.gpu.copy_d2d_async(
-                            state.conv_state,
-                            state.conv_state_intermediates[t],
-                            self.conv_state_bytes,
-                            stream,
-                        )?;
-                    }
-                }
+                self.verify_recurrent_rows(
+                    packed, convolved, g1, beta, core_out, state, 0, tokens, ctx, stream,
+                )?;
             }
         } else {
             ops::conv1d_update_prefill(
@@ -243,6 +201,133 @@ impl Glm5KdaLayer {
                     stream,
                 )?;
             }
+        }
+        Ok(core_out)
+    }
+
+    /// Exact interleaved verify recurrence for rows `[row0, row0 + tokens)` of
+    /// already-packed `packed`/`g1`/`beta`, advancing one owner's state row by
+    /// row and snapshotting after every row but the last.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn verify_recurrent_rows(
+        &self,
+        packed: DevicePtr,
+        convolved: DevicePtr,
+        g1: DevicePtr,
+        beta: DevicePtr,
+        core_out: DevicePtr,
+        state: &mut SsmLayerState,
+        row0: usize,
+        tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            state.h_state_intermediates.len() + 1 >= tokens
+                && state.conv_state_intermediates.len() >= tokens,
+            "GLM-5 KDA verify needs K-1 h and K conv intermediates (h={}, conv={}, K={tokens})",
+            state.h_state_intermediates.len(),
+            state.conv_state_intermediates.len(),
+        );
+        let p = self.heads * self.dim;
+        let bf16 = 2usize;
+        let packed_row_bytes = 3 * p * bf16;
+        let gate_row_bytes = p * bf16;
+        let beta_row_bytes = self.heads * bf16;
+        for t in 0..tokens {
+            let row = row0 + t;
+            ops::conv1d_update_prefill(
+                ctx.gpu,
+                self.conv_prefill_k,
+                self.conv_prefill_tp_k,
+                state.conv_state,
+                packed.offset(row * packed_row_bytes),
+                &self.weights.conv,
+                DevicePtr::NULL,
+                convolved.offset(row * packed_row_bytes),
+                (3 * p) as u32,
+                self.conv_width as u32,
+                1,
+                (3 * p) as u32,
+                (3 * p) as u32,
+                stream,
+            )?;
+            self.run_recurrent(
+                convolved.offset(row * packed_row_bytes),
+                g1.offset(row * gate_row_bytes),
+                beta.offset(row * beta_row_bytes),
+                state.h_state,
+                core_out.offset(row * gate_row_bytes),
+                1,
+                true,
+                ctx,
+                stream,
+            )?;
+            // A partial accept can select states after rows 0..K-2;
+            // the post-row K-1 state is already canonical on full accept.
+            if t + 1 < tokens {
+                ctx.gpu.copy_d2d_async(
+                    state.h_state,
+                    state.h_state_intermediates[t],
+                    self.h_state_bytes,
+                    stream,
+                )?;
+                ctx.gpu.copy_d2d_async(
+                    state.conv_state,
+                    state.conv_state_intermediates[t],
+                    self.conv_state_bytes,
+                    stream,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Owner-batched verify recurrence: pack every owner's rows once, then
+    /// advance each owner's own state over its own three rows, in order.
+    pub(super) fn forward_recurrent_owners(
+        &self,
+        projected: DevicePtr,
+        g1: DevicePtr,
+        beta: DevicePtr,
+        owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        use crate::layer::glm_long_owner::ROWS;
+        let rows = owners.len() * ROWS;
+        let p = self.heads * self.dim;
+        let packed = ctx.buffers.ssm_qkvz();
+        ops::kda_pack_qkv(
+            ctx.gpu,
+            self.pack_k,
+            projected,
+            packed,
+            rows as u32,
+            p as u32,
+            stream,
+        )?;
+        let convolved = ctx.buffers.ssm_conv_out_f32();
+        let core_out = ctx.buffers.attn_output();
+        for (owner, input) in owners.iter_mut().enumerate() {
+            let state = input
+                .state
+                .as_any_mut()
+                .downcast_mut::<SsmLayerState>()
+                .ok_or_else(|| anyhow::anyhow!("GLM-5 KDA owner expected SsmLayerState"))?;
+            ensure!(!state.h_is_f16, "GLM-5 KDA requires FP32 recurrent state");
+            self.verify_recurrent_rows(
+                packed,
+                convolved,
+                g1,
+                beta,
+                core_out,
+                state,
+                owner * ROWS,
+                ROWS,
+                ctx,
+                stream,
+            )?;
         }
         Ok(core_out)
     }

@@ -233,6 +233,9 @@ pub struct TransformerModel {
     /// `verify_hidden_stash`, for drafters consuming the PRE-mixer
     /// highway. NULL without a proposer or without a highway.
     pub(super) verify_stream_stash: DevicePtr,
+    /// Owner-batched long-context K3 verify staging (`glm_long_owner`);
+    /// `None` unless that opt-in lane is configured.
+    pub(super) glm_long_stage: Option<crate::layer::glm_long_owner::GlmLongStage>,
     /// ATLAS_MTP_CATCHUP: circular per-position final-hidden ring captured
     /// during serial-decode stretches (BF16 rows, slot = position % ring
     /// len). Feeds the drafter catch-up on the next propose. NULL when the

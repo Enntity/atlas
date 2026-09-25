@@ -42,6 +42,7 @@ pub mod glm_c4;
 pub(crate) mod glm_cache_plan;
 pub mod glm_independent;
 pub(crate) mod glm_k3_head;
+mod glm_long_verify;
 pub(crate) mod glm_mtp_prompt_trace;
 mod glm_mtp_repair;
 pub(crate) mod glm_owner8_wire;

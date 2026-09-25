@@ -114,6 +114,42 @@ fn step_verify_dflash_inner(
         0.0
     };
     a.last_token_time = Instant::now();
+    verify_dflash_tail(
+        model,
+        a,
+        sched,
+        drafts,
+        num_drafts,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+        ledger_enabled,
+        ledger_position,
+        &tokens,
+        verified_argmax,
+        step_timing,
+        verify_ms,
+    );
+}
+
+/// Everything after the target forward: verdict, EP verdict word, rollback,
+/// repair record, emission, commit and re-propose for ONE sequence. Shared by
+/// the per-sequence verify and each owner of the owner-batched GLM verify.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_dflash_tail(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    drafts: &[u32],
+    num_drafts: usize,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    dflash_verify_raw_argmax: bool,
+    ledger_enabled: bool,
+    ledger_position: usize,
+    tokens: &[u32],
+    verified_argmax: Vec<u32>,
+    step_timing: bool,
+    verify_ms: f64,
+) {
     let raw_trace = if std::env::var("ATLAS_LIGHTNING_VERIFY_TOKEN_TRACE").as_deref() == Ok("1") {
         Some(verified_argmax.clone())
     } else {
@@ -459,6 +495,89 @@ fn step_verify_dflash_inner(
             propose_ms,
             tokens.len(),
             num_accepted,
+        );
+    }
+}
+
+/// Owner-batched repaired long-context K3 verify: one target traversal for
+/// every owner, then each owner's ordinary tail in order, each preceded by
+/// restoring that owner's verify rows on both ranks.
+pub fn step_verify_glm_long_batched(
+    model: &dyn Model,
+    group: &mut [&mut ActiveSeq],
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    num_drafts: usize,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    dflash_verify_raw_argmax: bool,
+) {
+    let fail_all = |group: &mut [&mut ActiveSeq]| group.iter_mut().for_each(|a| a.finished = true);
+    if let Err(e) = model.sync_secondary() {
+        tracing::error!("sync_secondary: {e:#}");
+        fail_all(group);
+        return;
+    }
+    let drafts: Vec<Vec<u32>> = group
+        .iter_mut()
+        .map(|a| {
+            a.pending_draft_conf.clear();
+            std::mem::take(&mut a.pending_drafts)
+        })
+        .collect();
+    let tokens: Vec<[u32; 3]> = group
+        .iter()
+        .zip(&drafts)
+        .map(|(a, d)| [a.last_token, d[0], d[1]])
+        .collect();
+    let positions: Vec<usize> = group.iter().map(|a| a.seq.seq_len).collect();
+    let step_timing = std::env::var("ATLAS_DFLASH_STEP_TIMING").ok().as_deref() == Some("1");
+    let t_verify = std::time::Instant::now();
+    let verified = {
+        let mut seqs: Vec<&mut SequenceState> = group.iter_mut().map(|a| &mut a.seq).collect();
+        model.decode_verify_glm_long_owners(&tokens, &mut seqs)
+    };
+    let verified = match verified {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("decode_verify_glm_long_owners (n={}): {e:#}", group.len());
+            fail_all(group);
+            return;
+        }
+    };
+    sched
+        .timing
+        .record(crate::scheduler::mtp_timing::Phase::VerifyForward, t_verify);
+    let verify_ms = if step_timing {
+        t_verify.elapsed().as_secs_f64() * 1000.0
+    } else {
+        0.0
+    };
+    for owner in 0..group.len() {
+        let a = &mut *group[owner];
+        let _step_timer =
+            crate::scheduler::mtp_timing::StepTimer::new(&sched.timing, positions[owner]);
+        if let Err(e) =
+            model.begin_glm_long_owner_tail(a.seq.slot_idx as u32, owner, &tokens[owner])
+        {
+            tracing::error!("begin_glm_long_owner_tail (owner={owner}): {e:#}");
+            fail_all(&mut group[owner..]);
+            return;
+        }
+        a.last_token_time = Instant::now();
+        let ledger_enabled = ledger::enabled_for(&a.seq);
+        verify_dflash_tail(
+            model,
+            a,
+            sched,
+            &drafts[owner],
+            num_drafts,
+            verify_ctx,
+            dflash_verify_raw_argmax,
+            ledger_enabled,
+            positions[owner],
+            &tokens[owner],
+            verified[owner].to_vec(),
+            step_timing,
+            verify_ms,
         );
     }
 }

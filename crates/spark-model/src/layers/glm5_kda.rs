@@ -350,6 +350,33 @@ impl TransformerLayer for Glm5KdaLayer {
         self.decode_temporal(owners, &mut workspace.scratch, ctx, mode, stream)
     }
 
+    fn decode_glm_long_owners(
+        &self,
+        owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        _cache: &mut PagedKvCache,
+        _stage: &crate::layer::glm_long_owner::GlmLongStage,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        // Every row-local stage (mHC, norms, projections, TP reduce) runs once
+        // over all owners' rows; only the recurrence is per owner.
+        let rows = owners.len() * crate::layer::glm_long_owner::ROWS;
+        let phase = self.forward_attention_rows(
+            ctx.buffers.hidden_states(),
+            rows,
+            false,
+            true,
+            ctx,
+            stream,
+            &mut |projected, g1, beta| {
+                self.forward_recurrent_owners(projected, g1, beta, owners, ctx, stream)
+            },
+        )?;
+        // Grouped FFN: each routed expert is read once for all owners' rows.
+        self.ffn.forward_prefill(phase.normed, rows, ctx, stream)?;
+        self.forward_ffn_post(phase, ctx.buffers.moe_output(), None, ctx, stream)
+    }
+
     fn supports_glm_pair_verify(&self) -> bool {
         self.pair_supported()
     }

@@ -691,6 +691,37 @@ pub trait Model: Send + Sync {
         bail!("decode_verify_batched: unsupported by this model")
     }
 
+    /// Whether [`Self::decode_verify_glm_long_owners`] can verify `owners`
+    /// repaired long-context K3 sequences in one target traversal.
+    fn can_batch_glm_long_verify(&self, _owners: usize) -> bool {
+        false
+    }
+
+    /// Owner-batched repaired long-context K3 verify: every owner's
+    /// `[last, d0, d1]` in one traversal (EP-coherent). On success each
+    /// sequence advanced by three rows, like the per-sequence verify, and the
+    /// per-owner argmax triples are returned in owner order. Before each
+    /// owner's verdict tail the caller must call
+    /// [`Self::begin_glm_long_owner_tail`] for that owner.
+    fn decode_verify_glm_long_owners(
+        &self,
+        _tokens: &[[u32; 3]],
+        _seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<[u32; 3]>> {
+        bail!("decode_verify_glm_long_owners: unsupported by this model")
+    }
+
+    /// Restore owner `owner`'s verify rows on every rank so its ordinary
+    /// single-owner verdict/commit/propose tail can run unchanged.
+    fn begin_glm_long_owner_tail(
+        &self,
+        _slot: u32,
+        _owner: usize,
+        _tokens: &[u32; 3],
+    ) -> Result<()> {
+        bail!("begin_glm_long_owner_tail: unsupported by this model")
+    }
+
     /// Copy raw-hidden rows `rows[i]` of the just-run batched verify forward
     /// into stash slot `i` (`verify_hidden_stash`), BEFORE any propose
     /// clobbers the shared `hidden_states` buffer. Companion of

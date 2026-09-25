@@ -20,6 +20,43 @@ impl Glm5KdaLayer {
             .downcast_mut::<SsmLayerState>()
             .ok_or_else(|| anyhow::anyhow!("GLM-5 KDA expected SsmLayerState"))?;
         ensure!(!state.h_is_f16, "GLM-5 KDA requires FP32 recurrent state");
+        self.forward_attention_rows(
+            hidden,
+            tokens,
+            decode,
+            capture_verify_intermediates,
+            ctx,
+            stream,
+            &mut |projected, g1, beta| {
+                self.forward_recurrent(
+                    projected,
+                    g1,
+                    beta,
+                    state,
+                    tokens,
+                    decode,
+                    capture_verify_intermediates,
+                    ctx,
+                    stream,
+                )
+            },
+        )
+    }
+
+    /// The attention body over `tokens` rows. Everything here is row-local
+    /// except `recurrent`, which advances whichever recurrent state(s) own the
+    /// rows and returns the core output `[tokens, heads*dim]`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_attention_rows(
+        &self,
+        hidden: DevicePtr,
+        tokens: usize,
+        decode: bool,
+        capture_verify_intermediates: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+        recurrent: &mut dyn FnMut(DevicePtr, DevicePtr, DevicePtr) -> Result<DevicePtr>,
+    ) -> Result<FfnPhase> {
         let m = tokens as u32;
         let h = self.hidden_size as u32;
         let p = self.heads * self.dim;
@@ -329,17 +366,7 @@ impl Glm5KdaLayer {
         }
         profile::step(ctx, stream, &mut profile_timer, "g_a_f_b_g_b")?;
 
-        let core_out = self.forward_recurrent(
-            projected,
-            g1,
-            beta,
-            state,
-            tokens,
-            decode,
-            capture_verify_intermediates,
-            ctx,
-            stream,
-        )?;
+        let core_out = recurrent(projected, g1, beta)?;
         profile::step(ctx, stream, &mut profile_timer, "pack_conv")?;
         profile::step(ctx, stream, &mut profile_timer, "recurrent")?;
         let gated = projected;

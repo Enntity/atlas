@@ -10,6 +10,17 @@ use crate::weight_map::{DenseWeight, QuantizedWeight};
 #[path = "projection_fp8.rs"]
 mod fp8;
 
+/// Balanced `(first_row, rows)` chunks of at most the batch-M GEMV cap, so an
+/// owner-batched verify of `m > 8` rows reuses the exact short-batch kernels.
+fn verify_row_chunks(m: u32) -> impl Iterator<Item = (u32, u32)> {
+    let cap = ops::DENSE_GEMV_BATCHM_MAX_M;
+    let chunks = m.div_ceil(cap);
+    (0..chunks).map(move |c| {
+        let start = c * m / chunks;
+        (start, (c + 1) * m / chunks - start)
+    })
+}
+
 /// Memory-tight GLM KDA projection.
 ///
 /// The checkpoint-native BF16 matrix is quantized once at load time and then
@@ -75,6 +86,23 @@ impl Glm5KdaLayer {
     ) -> Result<()> {
         if (2..=8).contains(&m) {
             self.project_hot_multi_decode(input, weight, output, m, n, k, ctx, stream)
+        } else if m > 8 {
+            // Owner-batched verify: the batch-M GEMV tiers stream the weight
+            // at near-peak bandwidth where the M64-tile prefill GEMM mostly
+            // pads. One weight read per balanced <=8-row chunk.
+            for (row, rows) in verify_row_chunks(m) {
+                self.project_hot_multi_decode(
+                    input.offset(row as usize * k as usize * 2),
+                    weight,
+                    output.offset(row as usize * n as usize * 2),
+                    rows,
+                    n,
+                    k,
+                    ctx,
+                    stream,
+                )?;
+            }
+            Ok(())
         } else {
             self.project_hot(input, weight, output, m, n, k, false, ctx, stream)
         }
@@ -96,8 +124,24 @@ impl Glm5KdaLayer {
     ) -> Result<()> {
         if m == 1 {
             self.project_dense(input, weight, output, m, n, k, ctx, stream)
-        } else {
+        } else if m <= ops::DENSE_GEMV_BATCHM_MAX_M {
             self.project_dense_multi_decode(input, weight, output, m, n, k, ctx, stream)
+        } else {
+            // Owner-batched verify rows exceed the batch-M kernel's cap. These
+            // side projections are small; read them once per <=8-row chunk.
+            for (row, rows) in verify_row_chunks(m) {
+                self.project_dense_multi_decode(
+                    input.offset(row as usize * k as usize * 2),
+                    weight,
+                    output.offset(row as usize * n as usize * 2),
+                    rows,
+                    n,
+                    k,
+                    ctx,
+                    stream,
+                )?;
+            }
+            Ok(())
         }
     }
 
@@ -315,5 +359,25 @@ mod tests {
             ProjectionPath::for_forward(false, false, 1000),
             ProjectionPath::PrefillBase
         );
+    }
+}
+
+#[cfg(test)]
+mod verify_row_chunk_tests {
+    use super::verify_row_chunks;
+
+    #[test]
+    fn verify_row_chunks_cover_rows_within_the_kernel_cap() {
+        for m in 9..=96u32 {
+            let chunks: Vec<_> = verify_row_chunks(m).collect();
+            let mut next = 0;
+            for &(start, rows) in &chunks {
+                assert_eq!(start, next, "m={m} chunks must be contiguous");
+                assert!((2..=8).contains(&rows), "m={m} chunk of {rows} rows");
+                next += rows;
+            }
+            assert_eq!(next, m, "m={m} chunks must cover every row");
+        }
+        assert_eq!(verify_row_chunks(12).collect::<Vec<_>>(), [(0, 6), (6, 6)]);
     }
 }
