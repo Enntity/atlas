@@ -55,13 +55,13 @@ impl Limits {
             .checked_add(profile.drafts)
             .context("GLM context overflow")?;
         let context_limit = if profile.drafts == 2 {
-            super::glm_repair_policy::MAX_LONG_CONTEXT
+            super::glm_repair_policy::max_long_context()
         } else {
             2044
         };
         ensure!(
             context_tokens > 0 && context_tokens <= context_limit,
-            "GLM context exceeds dense2048 or MTP2 indexed32768 envelope"
+            "GLM context exceeds dense2048 or MTP2 indexed repair envelope"
         );
         ensure!(cache_rows > 0, "GLM cache capacity must be nonzero");
         Ok(Self {

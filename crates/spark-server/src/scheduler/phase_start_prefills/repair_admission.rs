@@ -42,7 +42,7 @@ pub(super) fn filter(requests: Vec<InferenceRequest>, enabled: bool) -> Vec<Infe
                 disabled: req.disable_mtp(),
                 suppress: req.suppress_tool_call(),
                 long_context: req.prompt_len().saturating_add(req.max_tokens())
-                    > spark_model::speculative::glm_repair_policy::MAX_LONG_CONTEXT,
+                    > spark_model::speculative::glm_repair_policy::max_long_context(),
                 adapter: req.adapter_slot() >= 0,
                 vision: req.has_image_pixels(),
                 beam: req.num_beams() > 1,

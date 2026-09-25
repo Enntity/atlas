@@ -13,13 +13,32 @@ pub fn long_context_enabled() -> bool {
     std::env::var("ATLAS_GLM_MTP_LONG_CONTEXT").as_deref() == Ok("1")
 }
 
+/// Default repaired long-context domain; also the native sparse prefill
+/// plan's qualified context, which stays at this value.
 pub const MAX_LONG_CONTEXT: usize = 32_768;
+/// Largest configurable repaired domain (the served 262K profile).
+pub const MAX_REPAIR_CONTEXT: usize = 262_144;
+
+/// The repaired verifier's indexed domain: `ATLAS_GLM_MTP_REPAIR_CONTEXT`
+/// (a multiple of 16 in 32768..=262144), else [`MAX_LONG_CONTEXT`]. Requests
+/// whose prompt+output budget crosses it are fenced into native decode; the
+/// MTP prompt capture and the drafters' private caches are sized to it.
+pub fn max_long_context() -> usize {
+    static CONTEXT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CONTEXT.get_or_init(|| {
+        std::env::var("ATLAS_GLM_MTP_REPAIR_CONTEXT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| (MAX_LONG_CONTEXT..=MAX_REPAIR_CONTEXT).contains(&v) && v % 16 == 0)
+            .unwrap_or(MAX_LONG_CONTEXT)
+    })
+}
 
 /// Bound a serving arena's context before it is handed to the repaired
 /// verifier. The native serving lane may expose a larger context; requests
 /// beyond this indexed domain are admitted with MTP disabled.
 pub fn repair_context(context: usize) -> usize {
-    context.min(MAX_LONG_CONTEXT)
+    context.min(max_long_context())
 }
 
 /// The arena domain the repaired verifier actually indexes: the bounded repair
@@ -86,11 +105,11 @@ impl RepairPolicy<'_> {
             self.context >= 4
                 && self.context
                     <= if self.long_context {
-                        MAX_LONG_CONTEXT
+                        max_long_context()
                     } else {
                         2044
                     },
-            "GLM repair requires context4..=2044 or opt-in MTP2 context4..=32768"
+            "GLM repair requires context4..=2044 or opt-in MTP2 context within the repaired domain"
         );
         ensure!(self.force, "GLM repair requires resolved MTP gate force");
         Ok(())

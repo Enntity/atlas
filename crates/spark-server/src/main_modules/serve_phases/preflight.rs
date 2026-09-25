@@ -110,7 +110,7 @@ pub(crate) fn preflight_reserve(
             // native decode by scheduler admission.
             context: args
                 .max_seq_len
-                .min(spark_model::speculative::glm_repair_policy::MAX_LONG_CONTEXT),
+                .min(spark_model::speculative::glm_repair_policy::max_long_context()),
             drafts: args.resolved_num_drafts(),
             native_only: args.speculative
                 && !(args.dflash || args.self_speculative || args.ngram_speculative),

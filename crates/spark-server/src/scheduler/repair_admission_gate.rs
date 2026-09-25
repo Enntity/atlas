@@ -45,7 +45,7 @@ fn request_lane(req: &InferenceRequest) -> Lane {
 
 fn request_exceeds_repair_context(prompt_tokens: usize, max_tokens: usize) -> bool {
     prompt_tokens.saturating_add(max_tokens)
-        > spark_model::speculative::glm_repair_policy::MAX_LONG_CONTEXT
+        > spark_model::speculative::glm_repair_policy::max_long_context()
 }
 
 fn merge_lane(current: OccupiedLane, next: Lane) -> OccupiedLane {
