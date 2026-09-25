@@ -128,51 +128,55 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        // Three rows per batch3 call, so each owner's shared expert is
-        // exactly the single-owner K3 arithmetic.
+        // Every W4A16 batch tier runs the same per-row FMA chain (bit-identical
+        // to batch3 and to M x w4a16_gemv, per w4a16_batch_bitparity_microtest),
+        // so several owners' shared-expert rows share one weight read while each
+        // row keeps the single-owner K3 arithmetic.
         anyhow::ensure!(rows % 3 == 0 && rows > 0, "C3 shared expert rows {rows}");
         let (h, inter) = (h as usize, inter as usize);
-        for chunk in 0..rows as usize / 3 {
+        let mut row = 0usize;
+        while row < rows as usize {
+            let left = rows as usize - row;
+            let wide = if left <= 8 { left } else if left <= 12 { 6 } else { 8 };
+            let kernel = self.w4a16_batchm.kernel(wide as u32);
+            let take = if wide == 3 || kernel.0 == 0 { 3 } else { wide };
             let (x, g, u, d) = (
-                input.offset(chunk * 3 * h * 2),
-                gate_out.offset(chunk * 3 * inter * 2),
-                up_out.offset(chunk * 3 * inter * 2),
-                down_out.offset(chunk * 3 * h * 2),
+                input.offset(row * h * 2),
+                gate_out.offset(row * inter * 2),
+                up_out.offset(row * inter * 2),
+                down_out.offset(row * h * 2),
             );
-            for (weight, output) in [
-                (&self.weights.shared_expert.gate_proj, g),
-                (&self.weights.shared_expert.up_proj, u),
-            ] {
-                ops::w4a16_gemv_batch3(
-                    ctx.gpu,
-                    self.w4a16_gemv_batch3,
-                    x,
-                    weight,
-                    output,
-                    inter as u32,
-                    h as u32,
-                    stream,
-                )?;
-            }
-            ops::silu_mul(
-                ctx.gpu,
-                self.moe_silu_mul,
-                g,
-                u,
-                g,
-                (3 * inter) as u32,
-                stream,
-            )?;
-            ops::w4a16_gemv_batch3(
-                ctx.gpu,
-                self.w4a16_gemv_batch3,
-                g,
-                &self.weights.shared_expert.down_proj,
-                d,
-                h as u32,
-                inter as u32,
-                stream,
-            )?;
+            let gemv = |x: DevicePtr, weight: &QuantizedWeight, out: DevicePtr, n: usize, k: usize| {
+                if take == 3 {
+                    ops::w4a16_gemv_batch3(
+                        ctx.gpu,
+                        self.w4a16_gemv_batch3,
+                        x,
+                        weight,
+                        out,
+                        n as u32,
+                        k as u32,
+                        stream,
+                    )
+                } else {
+                    ops::w4a16_gemv_batchm(
+                        ctx.gpu,
+                        kernel,
+                        x,
+                        weight,
+                        out,
+                        take as u32,
+                        n as u32,
+                        k as u32,
+                        stream,
+                    )
+                }
+            };
+            gemv(x, &self.weights.shared_expert.gate_proj, g, inter, h)?;
+            gemv(x, &self.weights.shared_expert.up_proj, u, inter, h)?;
+            ops::silu_mul(ctx.gpu, self.moe_silu_mul, g, u, g, (take * inter) as u32, stream)?;
+            gemv(g, &self.weights.shared_expert.down_proj, d, h, inter)?;
+            row += take;
         }
         Ok(())
     }
