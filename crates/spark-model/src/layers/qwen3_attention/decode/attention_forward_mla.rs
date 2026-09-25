@@ -548,6 +548,8 @@ impl Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<bool> {
         const GROUP: u32 = 32;
+        // ops::glm_sparse_decode_split's partial O + LSE + merge scratch.
+        const SPLIT_SCRATCH_BYTES: usize = 8 * 32 * 512 * 4 + 8 * 32 * 4 + 32 * 4;
         if !ops::glm_sparse_decode_tc_enabled(&ctx.config.model_type)?
             || heads == 0
             || heads % GROUP != 0
@@ -581,6 +583,31 @@ impl Qwen3AttentionLayer {
                 block_size: 16,
                 scale,
             };
+            // The split kernel (8-way K split + merge) beats the single-pass TC
+            // kernel at one row; it needs a scratch region disjoint from its
+            // inputs, which expert_gate_out is here (query/output live in
+            // expert_up_out/attn_output and MoE has not started).
+            let scratch = ctx.buffers.expert_gate_out();
+            let disjoint = |p: DevicePtr, n: usize| {
+                let (s0, s1) = (scratch.0, scratch.0 + SPLIT_SCRATCH_BYTES as u64);
+                p.0 + n as u64 <= s0 || s1 <= p.0
+            };
+            if ops::glm_sparse_decode_split_enabled(&ctx.config.model_type)?
+                && ctx.buffers.sizes().expert_gate_out >= SPLIT_SCRATCH_BYTES
+                && disjoint(a.query, group_bytes)
+                && disjoint(a.output, group_bytes)
+                && disjoint(indices, 2051 * 4)
+                && disjoint(block_table, 4)
+                && ops::try_glm_sparse_decode_split(
+                    ctx.gpu,
+                    &a,
+                    scratch,
+                    ctx.buffers.sizes().expert_gate_out,
+                    stream,
+                )?
+            {
+                continue;
+            }
             if !ops::try_glm_sparse_decode_tc(ctx.gpu, &a, stream)? {
                 anyhow::ensure!(
                     group == 0,
