@@ -9,6 +9,7 @@ pub mod glm_pair_plan;
 pub mod glm_paired_execution;
 pub mod glm_repair;
 pub mod glm_repair_policy;
+pub mod glm_shared_kv;
 pub mod ladder;
 pub mod tree_shape;
 pub mod verify_key;

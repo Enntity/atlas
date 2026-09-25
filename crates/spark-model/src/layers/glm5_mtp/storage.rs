@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! One checked private-cache layout for construction and preflight accounting.
 use super::*;
+use crate::speculative::glm_repair_policy::repair_context;
 use anyhow::Context;
 use spark_runtime::kv_cache::SparseIndexCacheConfig;
 
@@ -35,8 +36,10 @@ impl PrivateStoragePlan {
         let (blocks, slab) = if let Some((context, capacity)) = paired {
             (capacity.cache_blocks(context)?, capacity.slab_bytes())
         } else if repair_owned::enabled() {
-            // Four independently owned full contexts plus speculative overflow.
-            let blocks = max_seq_len
+            // Four independently owned full contexts plus speculative
+            // overflow. The bounded repair window is the arena actually
+            // indexed, even when the native lane serves a larger context.
+            let blocks = repair_context(max_seq_len)
                 .checked_add(4)
                 .context("GLM concurrent repair context overflow")?
                 .div_ceil(kv.block_size)

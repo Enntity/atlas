@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
@@ -438,7 +438,7 @@ impl TransformerModel {
             DevicePtr::NULL
         };
 
-        // Whole-prompt hidden capture buffer, [max_seq_len, hidden_size] BF16 —
+        // Prompt hidden capture buffer, [mtp_arena_context, hidden_size] BF16 —
         // 335 MB at 32k/h=5120. Backs BOTH halves of the drafter-context
         // feature (see `crate::model::drafter_context`); NULL here disables
         // prefill AND carry, since the carry path reads this buffer.
@@ -447,16 +447,30 @@ impl TransformerModel {
         // not be killed, and the head must be a precision the batched prefill
         // can actually run at — an NVFP4/FP8 MTP head would allocate this and
         // never write it.
+        // The repaired GLM long-context lane indexes a bounded 32K arena even
+        // when the native lane serves a larger context; the capture below and
+        // every stored capacity must quote that same arena. `arena_context`
+        // is the SSOT for the bound, so the private-cache quote
+        // (`PrivateStoragePlan`) cannot disagree with this allocation.
+        let mtp_arena_context = crate::speculative::glm_repair_policy::arena_context(
+            &config.model_type,
+            crate::speculative::glm_repair_policy::enabled()
+                && crate::speculative::glm_repair_policy::long_context_enabled(),
+            max_seq_len,
+        );
         let mtp_prefill_hidden = if has_mtp
             && mtp_quant.supports_drafter_prefill()
             && crate::layers::mtp_drafter_prefill_enabled(&levers)
         {
-            let bytes = max_seq_len * config.hidden_size * 2;
+            let bytes = mtp_arena_context
+                .checked_mul(config.hidden_size)
+                .and_then(|n| n.checked_mul(2))
+                .context("MTP drafter context capture reserve overflow")?;
             tracing::info!(
                 "MTP drafter context: allocating {:.0} MB prompt-hidden capture \
                  ({} x {} BF16)",
                 bytes as f64 / 1e6,
-                max_seq_len,
+                mtp_arena_context,
                 config.hidden_size,
             );
             gpu.alloc(bytes)?
@@ -818,7 +832,7 @@ impl TransformerModel {
             mtp_prefill_capacity: if mtp_prefill_hidden.is_null() {
                 0
             } else {
-                max_seq_len
+                mtp_arena_context
             },
             mtp_prefill_capture_len: std::sync::atomic::AtomicUsize::new(0),
             mtp_prefill_capture_gen: std::sync::atomic::AtomicU64::new(0),

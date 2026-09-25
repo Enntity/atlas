@@ -212,16 +212,11 @@ impl Qwen3AttentionLayer {
         )?;
 
         let logits = ctx.buffers.expert_up_out();
-        let routed_width = ctx.config.num_experts_per_tok * ctx.config.moe_intermediate_size;
-        let logits_capacity_bytes = n as usize * routed_width * 2;
-        let bytes_per_row = logits_stride as usize * std::mem::size_of::<f32>();
-        let tile_rows = (logits_capacity_bytes / bytes_per_row)
-            .max(1)
-            .min(n as usize);
-        ensure!(
-            tile_rows * bytes_per_row <= logits_capacity_bytes,
-            "GLM index logits require {bytes_per_row} bytes for one row, but the bounded arena has {logits_capacity_bytes} bytes"
-        );
+        let tile_rows = super::super::glm_index_capacity::tile_rows(
+            n as usize,
+            logits_stride as usize,
+            ctx.buffers.sizes().expert_up_out,
+        )?;
         let selected = ctx.buffers.expert_down_out();
         let query_row_bytes = index_heads as usize * index_dim as usize * 2;
         let weights_row_bytes = index_heads as usize * 2;

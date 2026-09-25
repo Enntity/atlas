@@ -456,11 +456,16 @@ pub(crate) fn preflight_reserve(
             config,
             args.max_seq_len,
         )?;
-        let capture = args
-            .max_seq_len
-            .checked_mul(config.hidden_size)
-            .and_then(|n| n.checked_mul(2))
-            .context("GLM MTP prompt capture reserve overflow")?;
+        // Same bounded arena the runtime capture allocates: `arena_context`
+        // is the SSOT, so the quote tracks the private block plan above.
+        let capture = spark_model::speculative::glm_repair_policy::arena_context(
+            &config.model_type,
+            long_mtp,
+            args.max_seq_len,
+        )
+        .checked_mul(config.hidden_size)
+        .and_then(|n| n.checked_mul(2))
+        .context("GLM MTP prompt capture reserve overflow")?;
         tracing::info!(
             "GLM MTP2 owned reserve: private={} MiB, prompt_capture={} MiB",
             private / (1024 * 1024),

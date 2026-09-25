@@ -352,6 +352,15 @@ pub fn run(
     // context ceiling, i.e. reserve each request's own max_tokens; see
     // `admission` module docs and ATLAS_KV_ADMIT_WATERMARK).
     let admit_watermark = admission::resolve_admit_watermark(sched.limits.max_seq_len);
+    // The factory validates this opt-in and forbids a reduced watermark.
+    // Charge transient draft blocks per owner in addition to ordinary decode.
+    let shared_kv_spill = spark_model::speculative::glm_shared_kv::parse(
+        std::env::var(spark_model::speculative::glm_shared_kv::ENV)
+            .ok()
+            .as_deref(),
+    )
+    .expect("shared KV policy must pass factory validation before scheduler startup")
+    .map(|_| num_drafts.div_ceil(block_size.max(1)));
 
     let pending = Arc::new((
         Mutex::new(PendingQueue {
@@ -457,6 +466,7 @@ pub fn run(
             admit_watermark,
             sched.limits.max_seq_len,
             block_size,
+            shared_kv_spill,
         );
         sched.timing.record(mtp_timing::Phase::LoopDrain, t_loop);
 

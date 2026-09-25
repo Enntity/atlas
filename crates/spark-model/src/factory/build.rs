@@ -740,6 +740,46 @@ pub fn build_model(
             .ok()
             .as_deref(),
     )?;
+    let shared_kv = crate::speculative::glm_shared_kv::parse(
+        std::env::var(crate::speculative::glm_shared_kv::ENV)
+            .ok()
+            .as_deref(),
+    )?;
+    if let Some(tokens) = shared_kv {
+        anyhow::ensure!(
+            !cap && config.model_type == "glm5_next"
+                && crate::speculative::glm_repair_policy::enabled()
+                && crate::speculative::glm_repair_policy::long_context_enabled()
+                && hss_cache_blocks_per_seq.is_none()
+                && max_batch_size == 4
+                && num_drafts == 2,
+            "shared GLM KV requires repaired MTP2/C4, no HSS, and ATLAS_GLM_KV_CAP_TO_CONTEXTS disabled"
+        );
+        crate::speculative::glm_shared_kv::validate_watermark(
+            std::env::var("ATLAS_KV_ADMIT_WATERMARK").ok().as_deref(),
+            max_seq_len,
+        )?;
+        let physical = crate::speculative::glm_shared_kv::physical_blocks(
+            tokens,
+            max_seq_len,
+            max_batch_size,
+            num_drafts,
+            kv_block_size,
+        )?;
+        anyhow::ensure!(
+            num_kv_blocks >= physical,
+            "shared GLM KV needs {physical} physical blocks including its dummy, but only {num_kv_blocks} fit the memory budget"
+        );
+        tracing::info!(
+            "GLM shared KV: budget={} blocks, allocating={} physical/{} usable blocks, served context={}, repaired context={}",
+            num_kv_blocks,
+            physical,
+            physical - 1,
+            max_seq_len,
+            crate::speculative::glm_repair_policy::repair_context(max_seq_len)
+        );
+        num_kv_blocks = physical;
+    }
     if let Some(capped) = glm_mtp_capacity::capped_blocks(
         cap,
         config.model_type == "glm5_next",
@@ -768,6 +808,7 @@ pub fn build_model(
     if config.model_type == "glm5_next"
         && crate::speculative::glm_repair_policy::enabled()
         && crate::speculative::glm_repair_policy::long_context_enabled()
+        && shared_kv.is_none()
     {
         // Selected retained owners must fit every transient K-row verifier,
         // independently of the legacy paged-KV overcommit setting below.
@@ -793,7 +834,7 @@ pub fn build_model(
         None => max_seq_len.div_ceil(kv_block_size),
     };
     let max_concurrent = num_kv_blocks / blocks_per_seq.max(1);
-    if max_concurrent < max_batch_size {
+    if max_concurrent < max_batch_size && shared_kv.is_none() {
         // Suggest a max_seq_len that lets the requested batch size fit.
         let suggested_max_seq_len = (num_kv_blocks / max_batch_size.max(1)) * kv_block_size;
         // The check is WORST-CASE: it assumes every concurrent sequence reaches

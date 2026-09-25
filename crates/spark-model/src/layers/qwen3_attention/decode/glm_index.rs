@@ -199,6 +199,11 @@ impl Qwen3AttentionLayer {
             h,
             stream,
         )?;
+        super::super::glm_index_capacity::tile_rows(
+            1,
+            logits_stride as usize,
+            ctx.buffers.sizes().expert_down_out,
+        )?;
         let logits = ctx.buffers.expert_down_out();
         ops::glm_index_logits(
             ctx.gpu,

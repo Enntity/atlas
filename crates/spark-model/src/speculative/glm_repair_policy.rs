@@ -22,6 +22,19 @@ pub fn repair_context(context: usize) -> usize {
     context.min(MAX_LONG_CONTEXT)
 }
 
+/// The arena domain the repaired verifier actually indexes: the bounded repair
+/// window only on the opt-in long-context GLM lane, and the plain served
+/// context everywhere else (other models, repair off, long context off). Both
+/// the prompt-capture allocation and the private-cache quote derive from this
+/// one function so the two cannot disagree.
+pub fn arena_context(model_type: &str, repair_long_enabled: bool, served_context: usize) -> usize {
+    if model_type == "glm5_next" && repair_long_enabled {
+        repair_context(served_context)
+    } else {
+        served_context
+    }
+}
+
 /// The legacy prompt capture has one writer. Retained owner tails and repair
 /// staging allow other requests to decode while that one prompt is chunked.
 pub fn new_prompt_capacity(active: usize, prefilling: usize, capacity: usize) -> usize {
@@ -283,5 +296,16 @@ mod tests {
     fn repair_context_bounds_larger_serving_profiles() {
         assert_eq!(repair_context(MAX_LONG_CONTEXT), MAX_LONG_CONTEXT);
         assert_eq!(repair_context(MAX_LONG_CONTEXT + 4096), MAX_LONG_CONTEXT);
+    }
+    #[test]
+    fn arena_context_only_bounds_selected_glm_repair() {
+        for context in [2048, 32768, 36864, 262144, 524288] {
+            assert_eq!(
+                arena_context("glm5_next", true, context),
+                context.min(32768)
+            );
+            assert_eq!(arena_context("glm5_next", false, context), context);
+            assert_eq!(arena_context("qwen3", true, context), context);
+        }
     }
 }
