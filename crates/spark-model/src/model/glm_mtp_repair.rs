@@ -42,7 +42,17 @@ impl TransformerModel {
             levers: &self.levers,
             stats: &self.stats,
             attn_metadata: None,
-            profile: false,
+            // Honour `--profile` here too. This context used to hardcode
+            // `false`, which made the SERVED verify path invisible to every
+            // in-tree profiler: the highway verify profiler
+            // (`ATLAS_QWEN4EXP_VERIFY_PROF`, in `decode_batched_hc_out`) never
+            // fires because with `ATLAS_GLM_MTP_REPAIR=1` the verify runs
+            // through here instead, and the per-layer profiler is this field.
+            // Net effect was that the ~106 ms verify forward had no
+            // attribution available at all, so every explanation for it was
+            // unfalsified. Profiling syncs per layer and skips graphs, so this
+            // stays off unless the operator sets `--profile`/`ATLAS_PROFILE`.
+            profile: self.config.profile,
             comm: self.comm_ref(),
             graph_capture: false,
             gdn_exact_replay: false,
