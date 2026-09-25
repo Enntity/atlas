@@ -281,58 +281,72 @@ extern "C" __global__ void hc_pre_from_raw_mix(
     if (tid < mix_hc) s_mix[tid] = raw_mix[(size_t)t * mix_hc + tid];
     __syncthreads();
 
-    if (tid == 0) {
-        float comb[HC_MAX_MULT * HC_MAX_MULT];
-        for (unsigned int i = 0; i < hc; ++i) {
-            float pr = s_mix[i] * s_rsqrt * hc_scale[0] + hc_base[i];
-            s_pre[i] = 1.f / (1.f + expf(-pr)) + hc_eps;
-            float po = s_mix[hc + i] * s_rsqrt * hc_scale[1] + hc_base[hc + i];
-            post_out[(size_t)t * hc + i] = 2.f * (1.f / (1.f + expf(-po)));
-        }
-        for (unsigned int i = 0; i < hc; ++i)
-            for (unsigned int j = 0; j < hc; ++j)
-                comb[i * hc + j] = s_mix[2 * hc + i * hc + j] * s_rsqrt
-                    * hc_scale[2] + hc_base[2 * hc + i * hc + j];
-        for (unsigned int i = 0; i < hc; ++i) {
-            float mx = -1e30f;
-            for (unsigned int j = 0; j < hc; ++j) mx = fmaxf(mx, comb[i * hc + j]);
-            float sum = 0.f;
-            for (unsigned int j = 0; j < hc; ++j) {
-                float e = expf(comb[i * hc + j] - mx);
-                comb[i * hc + j] = e;
-                sum += e;
-            }
-            for (unsigned int j = 0; j < hc; ++j)
-                comb[i * hc + j] = comb[i * hc + j] / sum + hc_eps;
-        }
-        for (unsigned int j = 0; j < hc; ++j) {
-            float c = hc_eps;
-            for (unsigned int i = 0; i < hc; ++i) c += comb[i * hc + j];
-            for (unsigned int i = 0; i < hc; ++i) comb[i * hc + j] /= c;
-        }
-        for (unsigned int it = 0; it + 1 < sinkhorn_iters; ++it) {
-            for (unsigned int i = 0; i < hc; ++i) {
-                float r = hc_eps;
-                for (unsigned int j = 0; j < hc; ++j) r += comb[i * hc + j];
-                for (unsigned int j = 0; j < hc; ++j) comb[i * hc + j] /= r;
-            }
-            for (unsigned int j = 0; j < hc; ++j) {
-                float c = hc_eps;
-                for (unsigned int i = 0; i < hc; ++i) c += comb[i * hc + j];
-                for (unsigned int i = 0; i < hc; ++i) comb[i * hc + j] /= c;
-            }
-        }
-        // Atlas's FP32 highway relies on an exact final column projection.
-        for (unsigned int j = 0; j < hc; ++j) {
-            float c = 0.f;
-            for (unsigned int i = 0; i < hc; ++i) c += comb[i * hc + j];
-            float inv = (c > 0.f) ? (1.f / c) : 0.f;
-            for (unsigned int i = 0; i < hc; ++i) comb[i * hc + j] *= inv;
-        }
-        for (unsigned int i = 0; i < hc; ++i)
-            for (unsigned int j = 0; j < hc; ++j)
-                comb_out[(size_t)t * hc * hc + i * hc + j] = comb[i * hc + j];
+    // Split/Sinkhorn with one thread per matrix element or per row/column
+    // instead of all on thread 0. Every value sees exactly the operations and
+    // operand order of the serial version (each row/column sum is still one
+    // thread's sequential loop), so outputs are bit-identical to hc_pre; only
+    // the independent rows/columns/elements now run concurrently.
+    __shared__ float s_comb[HC_MAX_MULT * HC_MAX_MULT];
+    const unsigned int hc2 = hc * hc;
+    if (tid < hc) {
+        const unsigned int i = tid;
+        float pr = s_mix[i] * s_rsqrt * hc_scale[0] + hc_base[i];
+        s_pre[i] = 1.f / (1.f + expf(-pr)) + hc_eps;
+        float po = s_mix[hc + i] * s_rsqrt * hc_scale[1] + hc_base[hc + i];
+        post_out[(size_t)t * hc + i] = 2.f * (1.f / (1.f + expf(-po)));
     }
+    if (tid < hc2) {
+        s_comb[tid] = s_mix[2 * hc + tid] * s_rsqrt
+            * hc_scale[2] + hc_base[2 * hc + tid];
+    }
+    __syncthreads();
+    if (tid < hc) {  // softmax over j for row i = tid
+        const unsigned int i = tid;
+        float mx = -1e30f;
+        for (unsigned int j = 0; j < hc; ++j) mx = fmaxf(mx, s_comb[i * hc + j]);
+        float sum = 0.f;
+        for (unsigned int j = 0; j < hc; ++j) {
+            float e = expf(s_comb[i * hc + j] - mx);
+            s_comb[i * hc + j] = e;
+            sum += e;
+        }
+        for (unsigned int j = 0; j < hc; ++j)
+            s_comb[i * hc + j] = s_comb[i * hc + j] / sum + hc_eps;
+    }
+    __syncthreads();
+    if (tid < hc) {  // column j = tid
+        const unsigned int j = tid;
+        float c = hc_eps;
+        for (unsigned int i = 0; i < hc; ++i) c += s_comb[i * hc + j];
+        for (unsigned int i = 0; i < hc; ++i) s_comb[i * hc + j] /= c;
+    }
+    __syncthreads();
+    for (unsigned int it = 0; it + 1 < sinkhorn_iters; ++it) {
+        if (tid < hc) {
+            const unsigned int i = tid;
+            float r = hc_eps;
+            for (unsigned int j = 0; j < hc; ++j) r += s_comb[i * hc + j];
+            for (unsigned int j = 0; j < hc; ++j) s_comb[i * hc + j] /= r;
+        }
+        __syncthreads();
+        if (tid < hc) {
+            const unsigned int j = tid;
+            float c = hc_eps;
+            for (unsigned int i = 0; i < hc; ++i) c += s_comb[i * hc + j];
+            for (unsigned int i = 0; i < hc; ++i) s_comb[i * hc + j] /= c;
+        }
+        __syncthreads();
+    }
+    // Atlas's FP32 highway relies on an exact final column projection.
+    if (tid < hc) {
+        const unsigned int j = tid;
+        float c = 0.f;
+        for (unsigned int i = 0; i < hc; ++i) c += s_comb[i * hc + j];
+        float inv = (c > 0.f) ? (1.f / c) : 0.f;
+        for (unsigned int i = 0; i < hc; ++i) s_comb[i * hc + j] *= inv;
+    }
+    __syncthreads();
+    if (tid < hc2) comb_out[(size_t)t * hc2 + tid] = s_comb[tid];
     __syncthreads();
 
     for (unsigned int d = tid; d < H; d += HC_BLOCK) {
