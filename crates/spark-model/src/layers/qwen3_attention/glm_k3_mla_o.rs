@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Exact-weight M3 O projection after three causal, serial MLA rows.
+//! Exact-weight batched O projection after 2..=MAX_ROWS causal, serial MLA
+//! rows (the repaired K3 verify or a DFlash block); M equals the row count.
 use crate::{layers::ops, weight_map::DenseWeight};
 use anyhow::{Result, bail, ensure};
 use atlas_core::config::ModelConfig;
@@ -12,7 +13,22 @@ pub(super) mod compare;
 const FLAG: &str = "ATLAS_GLM_K3_MLA_O_BATCHM";
 const PREFIX: usize = 2 * 128 * 2; // index keys and gates, both BF16
 const ROW: usize = 8192 * 2;
-const OUTPUT: usize = 3 * 4096 * 2;
+const OUTPUT_ROW: usize = 4096 * 2;
+/// Widest verify block the staged MLA projections admit. One batched GEMV
+/// covers every row, so the block must fit the kernel's row limit.
+pub(in crate::layers::qwen3_attention) const MAX_ROWS: usize =
+    crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS;
+const _: () = assert!(MAX_ROWS <= ops::DENSE_GEMV_BATCHM_MAX_M as usize);
+pub(in crate::layers::qwen3_attention) fn rows_supported(rows: usize) -> bool {
+    (2..=MAX_ROWS).contains(&rows)
+}
+/// Index key/gate prefix plus every retained V row.
+pub(in crate::layers::qwen3_attention) const fn scratch_bytes(rows: usize) -> usize {
+    PREFIX + rows * ROW
+}
+const fn output_bytes(rows: usize) -> usize {
+    rows * OUTPUT_ROW
+}
 fn parse_flag(value: Option<&str>) -> Result<bool> {
     match value {
         None | Some("0") => Ok(false),
@@ -98,12 +114,14 @@ fn disjoint(a: (u64, u64), b: (u64, u64)) -> bool {
 }
 #[derive(Clone, Copy)]
 pub(in crate::layers::qwen3_attention) struct StagePlan {
+    rows: usize,
     input: DevicePtr,
     output: DevicePtr,
     comparison: Option<DevicePtr>,
 }
 impl StagePlan {
     pub(in crate::layers::qwen3_attention) fn new(
+        rows: usize,
         scratch: DevicePtr,
         capacity: usize,
         output: DevicePtr,
@@ -111,16 +129,21 @@ impl StagePlan {
         live: &[(DevicePtr, usize)],
     ) -> Result<Self> {
         ensure!(
-            capacity >= PREFIX + 3 * ROW && output_capacity >= OUTPUT,
-            "{FLAG}: need49664 scratch bytes and24576 output bytes"
+            rows_supported(rows),
+            "{FLAG}: {rows} staged rows outside 2..={MAX_ROWS}"
+        );
+        let (scratch_bytes, output_bytes) = (scratch_bytes(rows), output_bytes(rows));
+        ensure!(
+            capacity >= scratch_bytes && output_capacity >= output_bytes,
+            "{FLAG}: {rows} rows need {scratch_bytes} scratch bytes and {output_bytes} output bytes"
         );
         ensure!(
             scratch.0 % 16 == 0 && output.0 % 2 == 0,
             "{FLAG}: invalid operand alignment"
         );
-        let whole = span(scratch, PREFIX + 3 * ROW)?;
+        let whole = span(scratch, scratch_bytes)?;
         let retained = (whole.0 + PREFIX as u64, whole.1);
-        let out = span(output, OUTPUT)?;
+        let out = span(output, output_bytes)?;
         ensure!(disjoint(whole, out), "{FLAG}: staging/output alias");
         for &(ptr, bytes) in live {
             let other = span(ptr, bytes)?;
@@ -130,13 +153,18 @@ impl StagePlan {
             );
         }
         Ok(Self {
+            rows,
             input: DevicePtr(retained.0),
             output,
             comparison: None,
         })
     }
     pub(in crate::layers::qwen3_attention) fn row(self, i: usize) -> Result<DevicePtr> {
-        ensure!(i < 3, "{FLAG}: staging row outside K3");
+        ensure!(
+            i < self.rows,
+            "{FLAG}: staging row {i} outside {}",
+            self.rows
+        );
         Ok(self.input.offset(i * ROW))
     }
     pub(in crate::layers::qwen3_attention) fn project(
@@ -154,7 +182,7 @@ impl StagePlan {
             self.input,
             weight,
             self.comparison.unwrap_or(self.output),
-            3,
+            self.rows as u32,
             4096,
             8192,
             4096,

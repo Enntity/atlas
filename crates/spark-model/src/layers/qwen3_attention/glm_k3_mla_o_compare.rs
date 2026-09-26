@@ -22,10 +22,11 @@ pub(in crate::layers::qwen3_attention) fn enabled(model: &str) -> Result<bool> {
     };
     parse_compare(value.as_deref(), super::enabled(model)?)
 }
-fn compare_bytes(reference: &[u8], candidate: &[u8]) -> Result<()> {
+fn compare_bytes(reference: &[u8], candidate: &[u8], rows: usize) -> Result<()> {
+    let bytes = output_bytes(rows);
     ensure!(
-        reference.len() == OUTPUT && candidate.len() == OUTPUT,
-        "{COMPARE_FLAG}: expected full3x4096 BF16 outputs"
+        reference.len() == bytes && candidate.len() == bytes,
+        "{COMPARE_FLAG}: expected full {rows}x4096 BF16 outputs"
     );
     let mut mismatches = 0;
     let mut first = None;
@@ -72,13 +73,15 @@ impl StagePlan {
         capacity: usize,
         live: &[(DevicePtr, usize)],
     ) -> Result<Self> {
+        let bytes = output_bytes(self.rows);
         ensure!(
-            capacity >= OUTPUT && candidate.0 % 2 == 0,
-            "{COMPARE_FLAG}: need aligned24576-byte comparison output"
+            capacity >= bytes && candidate.0 % 2 == 0,
+            "{COMPARE_FLAG}: need aligned {bytes}-byte comparison output"
         );
-        let out = span(candidate, OUTPUT)?;
+        let out = span(candidate, bytes)?;
         ensure!(
-            disjoint(out, span(self.input, 3 * ROW)?) && disjoint(out, span(self.output, OUTPUT)?),
+            disjoint(out, span(self.input, self.rows * ROW)?)
+                && disjoint(out, span(self.output, bytes)?),
             "{COMPARE_FLAG}: comparison output aliases staged/reference rows"
         );
         for &(ptr, bytes) in live {
@@ -108,7 +111,7 @@ impl StagePlan {
             kernel,
             self.row(row)?,
             weight,
-            self.output.offset(row * 4096 * 2),
+            self.output.offset(row * OUTPUT_ROW),
             4096,
             8192,
             stream,
@@ -127,18 +130,20 @@ impl StagePlan {
         };
         gpu.synchronize(stream)?;
         // Explicitly diagnostic host allocations; no GPU allocation or state replay.
-        let mut reference = vec![0_u8; OUTPUT];
-        let mut actual = vec![0_u8; OUTPUT];
+        let bytes = output_bytes(self.rows);
+        let mut reference = vec![0_u8; bytes];
+        let mut actual = vec![0_u8; bytes];
         gpu.copy_d2h(self.output, &mut reference)?;
         gpu.copy_d2h(candidate, &mut actual)?;
-        compare_bytes(&reference, &actual).map_err(|error| {
+        compare_bytes(&reference, &actual, self.rows).map_err(|error| {
             anyhow::anyhow!("{COMPARE_FLAG}: rank={rank} attention_layer={layer}: {error}")
         })?;
         tracing::info!(
             rank,
             attention_layer = layer,
-            elements = OUTPUT / 2,
-            "GLM K3 MLA O compare passed: immediate scalar vs deferred M3, bit-identical"
+            rows = self.rows,
+            elements = bytes / 2,
+            "GLM K3 MLA O compare passed: immediate scalar vs deferred batchm, bit-identical"
         );
         Ok(())
     }

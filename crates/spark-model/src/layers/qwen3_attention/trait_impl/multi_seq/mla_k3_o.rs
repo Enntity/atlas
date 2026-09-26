@@ -11,14 +11,14 @@ impl Qwen3AttentionLayer {
         output: DevicePtr,
     ) -> Result<Option<glm_k3_mla_o::StagePlan>> {
         let compare = glm_k3_mla_o::compare::enabled(&c.fwd.config.model_type)?;
-        // Wider (DFlash) verifies keep the scalar per-row O projection.
-        if !glm_k3_mla_o::enabled(&c.fwd.config.model_type)? || !long_verify || c.n != 3 {
+        if !glm_k3_mla_o::enabled(&c.fwd.config.model_type)? || !long_verify {
             return Ok(None);
         }
         // validate_glm_long_verify already establishes causal consecutive rows,
-        // repaired eager K3, TP2/EP2, BF16 caches and index head_dim128.
+        // repaired eager K3 or a DFlash block, TP2/EP2, BF16 caches and index
+        // head_dim128.
         ensure!(
-            c.n == 3
+            glm_k3_mla_o::rows_supported(c.n)
                 && c.h == 4096
                 && c.bf16 == 2
                 && c.nq == 32
@@ -33,12 +33,24 @@ impl Qwen3AttentionLayer {
         );
         let b = c.fwd.buffers;
         let s = b.sizes();
+        // Retained rows share ssm_qkvz with the indexer prefix. An arena sized
+        // for fewer rows keeps the scalar per-row O projection.
+        let scratch_bytes = glm_k3_mla_o::scratch_bytes(c.n);
+        if s.ssm_qkvz < scratch_bytes {
+            tracing::debug!(
+                rows = c.n,
+                capacity = s.ssm_qkvz,
+                scratch_bytes,
+                "GLM K3 MLA O batchm: retained-row arena too small; scalar O projection"
+            );
+            return Ok(None);
+        }
         // BufferArena allocates these separately. Check their actual spans too:
         // no staged row may overlap a later row's Q/K/index/attention scratch.
         // glm_index_decode_update's ONLY ssm_qkvz writes are BF16 key[128]
         // and gate[128] in bytes0..512. Selection uses other arenas below.
         let live = [
-            (c.normed, 3 * 4096 * 2),
+            (c.normed, c.n * 4096 * 2),
             (b.ssm_ba(), s.ssm_ba),
             (b.ssm_deinterleaved(), s.ssm_deinterleaved),
             (b.ssm_conv_out_f32(), s.ssm_conv_out_f32),
@@ -50,8 +62,14 @@ impl Qwen3AttentionLayer {
             // Last entry becomes candidate output only after every causal row ends.
             (b.attn_output(), s.attn_output),
         ];
-        let mut plan =
-            glm_k3_mla_o::StagePlan::new(b.ssm_qkvz(), s.ssm_qkvz, output, s.moe_output, &live)?;
+        let mut plan = glm_k3_mla_o::StagePlan::new(
+            c.n,
+            b.ssm_qkvz(),
+            s.ssm_qkvz,
+            output,
+            s.moe_output,
+            &live,
+        )?;
         if compare {
             ensure!(
                 self.dense_gemv_k.0 != 0,

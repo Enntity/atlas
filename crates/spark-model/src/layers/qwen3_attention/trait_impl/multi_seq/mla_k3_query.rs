@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Opt-in query projection staging for the repaired GLM-5 K3 MLA path.
+//! Opt-in query projection staging for the GLM-5 long-verify MLA path: the
+//! repaired K3 verify or a DFlash block of up to `MAX_ROWS` rows.
 //!
-//! The three rows are independent only through the Qa/RMS/Qb/index-Q
+//! The rows are independent only through the Qa/RMS/Qb/index-Q
 //! projections.  Cache mutation, semantic-index maintenance, selection,
 //! attention, and value extraction remain in the caller's causal row loop.
 //! This module owns the checked scratch partition and the diagnostic scalar
@@ -13,12 +14,12 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::super::ctx::MultiSeqCtx;
 use crate::layers::ops;
+use crate::layers::qwen3_attention::glm_k3_mla_o::{MAX_ROWS, rows_supported};
 use crate::layers::qwen3_attention::{MlaWeights, Qwen3AttentionLayer};
 
 const FLAG: &str = "ATLAS_GLM_K3_MLA_QUERY_BATCHM";
 const COMPARE_FLAG: &str = "ATLAS_GLM_K3_MLA_QUERY_COMPARE";
 
-const ROWS: usize = 3;
 const HIDDEN: usize = 4096;
 const Q_LORA: usize = 1536;
 const Q_DIM: usize = 8192;
@@ -28,17 +29,30 @@ const BF16: usize = 2;
 const LATENT_ROW: usize = Q_LORA * BF16;
 const Q_ROW: usize = Q_DIM * BF16;
 const INDEX_ROW: usize = INDEX_DIM * BF16;
-const LATENT_BYTES: usize = ROWS * LATENT_ROW;
-const Q_BYTES: usize = ROWS * Q_ROW;
-const INDEX_OFFSET: usize = Q_BYTES;
-const INDEX_BYTES: usize = ROWS * INDEX_ROW;
-const QUERY_BYTES: usize = Q_BYTES + INDEX_BYTES;
+const INPUT_ROW: usize = HIDDEN * BF16;
+
+// Partition sizes for `rows` staged rows (2..=MAX_ROWS, so no overflow). Q
+// rows are contiguous and the index-Q rows follow the last Q row.
+const fn input_bytes(rows: usize) -> usize {
+    rows * INPUT_ROW
+}
+const fn latent_bytes(rows: usize) -> usize {
+    rows * LATENT_ROW
+}
+const fn index_offset(rows: usize) -> usize {
+    rows * Q_ROW
+}
+const fn query_bytes(rows: usize) -> usize {
+    index_offset(rows) + rows * INDEX_ROW
+}
 
 // ssm_qkvz is dead before the causal row loop. Diagnostic references borrow
 // the whole arena for the scalar snapshots, then the row loop reuses its first
 // 512 bytes for the indexer's key and gate scratch and its remaining bytes for
 // retained O rows.
-const DIAGNOSTIC_BYTES: usize = QUERY_BYTES;
+const fn diagnostic_bytes(rows: usize) -> usize {
+    query_bytes(rows)
+}
 
 fn parse_flag(value: Option<&str>) -> Result<bool> {
     match value {
@@ -140,6 +154,7 @@ pub(super) struct QueryRow {
 
 #[derive(Clone, Copy)]
 pub(super) struct QueryPlan {
+    rows: usize,
     latent: DevicePtr,
     q_full: DevicePtr,
     index_query: DevicePtr,
@@ -149,6 +164,7 @@ pub(super) struct QueryPlan {
 impl QueryPlan {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
+        rows: usize,
         input: DevicePtr,
         input_capacity: usize,
         latent: DevicePtr,
@@ -159,24 +175,30 @@ impl QueryPlan {
         live: &[(DevicePtr, usize)],
     ) -> Result<Self> {
         ensure!(
-            input_capacity >= ROWS * HIDDEN * BF16,
+            rows_supported(rows),
+            "{FLAG}: {rows} query rows outside 2..={MAX_ROWS}"
+        );
+        let (input_bytes, latent_bytes, query_bytes) =
+            (input_bytes(rows), latent_bytes(rows), query_bytes(rows));
+        ensure!(
+            input_capacity >= input_bytes,
             "{FLAG}: normalized input capacity is too small"
         );
         ensure!(
-            latent_capacity >= LATENT_BYTES,
-            "{FLAG}: Q latent capacity requires {LATENT_BYTES} bytes"
+            latent_capacity >= latent_bytes,
+            "{FLAG}: Q latent capacity requires {latent_bytes} bytes"
         );
         ensure!(
-            q_capacity >= QUERY_BYTES,
-            "{FLAG}: Q/index staging capacity requires {QUERY_BYTES} bytes"
+            q_capacity >= query_bytes,
+            "{FLAG}: Q/index staging capacity requires {query_bytes} bytes"
         );
         aligned_nonnull(input, 16, "normalized input")?;
         aligned_nonnull(latent, 16, "Q latent")?;
         aligned_nonnull(q_scratch, 16, "Q/index staging")?;
 
-        let input_span = span(input, ROWS * HIDDEN * BF16)?;
-        let latent_span = span(latent, LATENT_BYTES)?;
-        let query_span = span(q_scratch, QUERY_BYTES)?;
+        let input_span = span(input, input_bytes)?;
+        let latent_span = span(latent, latent_bytes)?;
+        let query_span = span(q_scratch, query_bytes)?;
         ensure!(
             disjoint(input_span, latent_span) && disjoint(input_span, query_span),
             "{FLAG}: query outputs alias normalized input"
@@ -201,12 +223,13 @@ impl QueryPlan {
                 .find_map(|(index, entry)| (*entry == target).then_some(index))
         });
         let diagnostic_ptr = if let Some((ptr, capacity)) = diagnostic {
+            let diagnostic_bytes = diagnostic_bytes(rows);
             ensure!(
-                capacity >= DIAGNOSTIC_BYTES,
-                "{COMPARE_FLAG}: diagnostic scratch requires {DIAGNOSTIC_BYTES} bytes"
+                capacity >= diagnostic_bytes,
+                "{COMPARE_FLAG}: diagnostic scratch requires {diagnostic_bytes} bytes"
             );
             aligned_nonnull(ptr, 16, "diagnostic scratch")?;
-            let scratch = span(ptr, DIAGNOSTIC_BYTES)?;
+            let scratch = span(ptr, diagnostic_bytes)?;
             ensure!(
                 disjoint(scratch, input_span)
                     && disjoint(scratch, latent_span)
@@ -230,15 +253,20 @@ impl QueryPlan {
         };
 
         Ok(Self {
+            rows,
             latent,
             q_full: q_scratch,
-            index_query: q_scratch.offset(INDEX_OFFSET),
+            index_query: q_scratch.offset(index_offset(rows)),
             diagnostic: diagnostic_ptr,
         })
     }
 
     pub(super) fn row(self, row: usize) -> Result<QueryRow> {
-        ensure!(row < ROWS, "{FLAG}: query row outside K3");
+        ensure!(
+            row < self.rows,
+            "{FLAG}: query row {row} outside {}",
+            self.rows
+        );
         Ok(QueryRow {
             q_latent: self.latent.offset(row * LATENT_ROW),
             q_full: self.q_full.offset(row * Q_ROW),
@@ -264,7 +292,7 @@ impl QueryPlan {
             c.normed,
             &mla.wq_a,
             self.latent,
-            ROWS as u32,
+            self.rows as u32,
             Q_LORA as u32,
             HIDDEN as u32,
             Q_LORA as u32,
@@ -274,11 +302,11 @@ impl QueryPlan {
         if let Some(reference) = self.diagnostic {
             // Compare the raw Qa result before the in-place RMS pass can
             // overwrite it.  This runs before any KV/index state write.
-            for row in 0..ROWS {
+            for row in 0..self.rows {
                 ops::dense_gemv(
                     gpu,
                     layer.dense_gemv_k,
-                    c.normed.offset(row * HIDDEN * BF16),
+                    c.normed.offset(row * INPUT_ROW),
                     &mla.wq_a,
                     reference.offset(row * LATENT_ROW),
                     Q_LORA as u32,
@@ -301,7 +329,7 @@ impl QueryPlan {
         // Keep the production RMS arithmetic and alias exactly as the scalar
         // lane.  A single packed launch would be mathematically equivalent,
         // but this first integration does not widen the normalization change.
-        for row in 0..ROWS {
+        for row in 0..self.rows {
             let candidate = self.latent.offset(row * LATENT_ROW);
             ops::rms_norm(
                 gpu,
@@ -317,7 +345,7 @@ impl QueryPlan {
         }
 
         if let Some(reference) = self.diagnostic {
-            for row in 0..ROWS {
+            for row in 0..self.rows {
                 let row_ref = reference.offset(row * LATENT_ROW);
                 ops::rms_norm(
                     gpu,
@@ -349,7 +377,7 @@ impl QueryPlan {
             self.latent,
             &mla.wq_b,
             self.q_full,
-            ROWS as u32,
+            self.rows as u32,
             Q_DIM as u32,
             Q_LORA as u32,
             Q_DIM as u32,
@@ -366,7 +394,7 @@ impl QueryPlan {
             self.latent,
             &indexer.wq_b,
             self.index_query,
-            ROWS as u32,
+            self.rows as u32,
             INDEX_DIM as u32,
             Q_LORA as u32,
             INDEX_DIM as u32,
@@ -375,8 +403,8 @@ impl QueryPlan {
 
         if let Some(reference) = self.diagnostic {
             let reference_q = reference;
-            let reference_index = reference.offset(INDEX_OFFSET);
-            for row in 0..ROWS {
+            let reference_index = reference.offset(index_offset(self.rows));
+            for row in 0..self.rows {
                 ops::dense_gemv(
                     gpu,
                     layer.dense_gemv_k,
@@ -434,7 +462,7 @@ impl QueryPlan {
         rank: usize,
     ) -> Result<()> {
         let candidate_bytes = row_bytes
-            .checked_mul(ROWS)
+            .checked_mul(self.rows)
             .ok_or_else(|| anyhow::anyhow!("{COMPARE_FLAG}: {stage} byte count overflow"))?;
         ensure!(
             candidate_bytes % 2 == 0,
@@ -469,7 +497,7 @@ impl QueryPlan {
         }
         tracing::info!(
             stage,
-            rows = ROWS,
+            rows = self.rows,
             bytes = candidate_bytes,
             attention_layer,
             rank,
