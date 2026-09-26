@@ -49,7 +49,10 @@ fn select(
         hidden_size == 4096 && hc_mult == 4,
         "GLM vector HC prefill requires hidden4096 and HC4"
     );
-    let kernel = gpu.kernel("glm_hc_prefill_vec", "glm_hc_pre_from_raw_mix_vec")?;
+    let kernel = gpu.kernel(
+        "glm_hc_prefill_vec",
+        &super::hc_kernel_name(model, "glm_hc_pre_from_raw_mix_vec"),
+    )?;
     ensure!(kernel.0 != 0, "GLM vector HC prefill kernel is unavailable");
     Ok(kernel)
 }

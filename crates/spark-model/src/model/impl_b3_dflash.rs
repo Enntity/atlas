@@ -57,7 +57,13 @@ impl TransformerModel {
                 Some(k) => *k,
                 None => *KERNEL.get_or_init(|| {
                     self.gpu
-                        .kernel("hyper_connection", "hc_contract_strided")
+                        .kernel(
+                            "hyper_connection",
+                            &crate::layers::ops::hc_kernel_name(
+                                &self.config.model_type,
+                                "hc_contract_strided",
+                            ),
+                        )
                         .unwrap_or(spark_runtime::gpu::KernelHandle(0))
                 }),
             };
@@ -66,7 +72,9 @@ impl TransformerModel {
             return spark_runtime::kernel_args::KernelLaunch::new(self.gpu.as_ref(), kernel)
                 .grid([rows as u32, 1, 1])
                 .block([256, 1, 1])
-                .arg_ptr(self.buffers.hc_streams().offset(row0 * hc * h * 4))
+                .arg_ptr(self.buffers.hc_streams().offset(
+                    row0 * hc * h * crate::layers::ops::hc_elem_bytes(&self.config.model_type),
+                ))
                 .arg_ptr(dst)
                 .arg_u32(h as u32)
                 .arg_u32(hc as u32)

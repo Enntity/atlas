@@ -355,7 +355,7 @@ impl Glm5KdaLayer {
                 let hc_streams_i = ctx
                     .buffers
                     .hc_streams()
-                    .offset(i * self.hc.hc_mult * h * size_of::<f32>());
+                    .offset(i * self.hc.hc_mult * h * super::super::ops::hc_elem_bytes("glm5_next"));
                 let post_i = ctx
                     .buffers
                     .hc_post()

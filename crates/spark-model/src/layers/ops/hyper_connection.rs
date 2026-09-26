@@ -7,6 +7,30 @@
 //! (stream-major per token). HC parameters are float32 device buffers.
 
 use anyhow::Result;
+
+/// GLM keeps its mHC highway BF16 (`ATLAS_GLM_HC_BF16=1`, the storage vLLM
+/// serves) on the DFlash lane; every other model and lane stays FP32.
+pub fn hc_bf16_for(model_type: &str) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    model_type == "glm5_next"
+        && *ON.get_or_init(|| std::env::var("ATLAS_GLM_HC_BF16").as_deref() == Ok("1"))
+        && crate::speculative::glm_repair_policy::dflash_enabled()
+}
+
+/// Bytes per highway element for `model_type`.
+pub fn hc_elem_bytes(model_type: &str) -> usize {
+    if hc_bf16_for(model_type) { 2 } else { 4 }
+}
+
+/// The `hyper_connection` / `glm_hc_prefill_vec` kernel serving this model's
+/// highway storage (BF16 twins carry a `_bf16` suffix).
+pub fn hc_kernel_name(model_type: &str, base: &str) -> String {
+    if hc_bf16_for(model_type) {
+        format!("{base}_bf16")
+    } else {
+        base.to_string()
+    }
+}
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 

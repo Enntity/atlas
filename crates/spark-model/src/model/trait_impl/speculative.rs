@@ -419,7 +419,7 @@ impl TransformerModel {
         if hc == 0 || std::env::var("ATLAS_MTP_STREAM_ROW_FIX").ok().as_deref() == Some("0") {
             return None;
         }
-        Some(hc * self.config.hidden_size * 4)
+        Some(hc * self.config.hidden_size * crate::layers::ops::hc_elem_bytes(&self.config.model_type))
     }
 
     /// Batched-verify Phase 3: stash slot `idx` → `mtp_hidden_save` (the MTP

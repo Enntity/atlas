@@ -75,7 +75,7 @@ impl RowBytes {
     pub fn new(hidden_size: usize, hc_mult: usize, vocab: usize) -> Self {
         Self {
             hidden: hidden_size * 2,
-            highway: hc_mult * hidden_size * 4,
+            highway: hc_mult * hidden_size * crate::layers::ops::hc_elem_bytes("glm5_next"),
             post: hc_mult * 4,
             comb: hc_mult * hc_mult * 4,
             logits: vocab * 2,

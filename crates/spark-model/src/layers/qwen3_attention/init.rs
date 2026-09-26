@@ -98,6 +98,7 @@ impl Qwen3AttentionLayer {
         fp8_calibration_tokens: usize,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<Self> {
+        let hc_name = |base: &str| crate::layers::ops::hc_kernel_name(&config.model_type, base);
         let independent = crate::model::glm_independent::enabled(&config.model_type)?;
         let (reshape_mod, reshape_fn, decode_mod, decode_fn) =
             super::init_kernel_dispatch::kernel_modules_for_dtype(kv_dtype, config.head_dim);
@@ -207,38 +208,38 @@ impl Qwen3AttentionLayer {
             // still start cleanly.
             hc: None,
             qsa: None,
-            hc_pre_k: gate(probes.hyper_connection, gpu, "hyper_connection", "hc_pre"),
+            hc_pre_k: gate(probes.hyper_connection, gpu, "hyper_connection", &hc_name("hc_pre")),
             hc_pre_from_raw_mix_k: gate(
                 probes.hyper_connection,
                 gpu,
                 "hyper_connection",
-                "hc_pre_from_raw_mix",
+                &hc_name("hc_pre_from_raw_mix"),
             ),
             hc_pre_mix_k: gate(
                 probes.hyper_connection,
                 gpu,
                 "hyper_connection",
-                "hc_pre_mix",
+                &hc_name("hc_pre_mix"),
             ),
-            hc_post_k: gate(probes.hyper_connection, gpu, "hyper_connection", "hc_post"),
+            hc_post_k: gate(probes.hyper_connection, gpu, "hyper_connection", &hc_name("hc_post")),
             hc_post_moe_blend_k: gate(
                 probes.hyper_connection,
                 gpu,
                 "hyper_connection",
-                "hc_post_moe_blend",
+                &hc_name("hc_post_moe_blend"),
             ),
             hc_expand_k: gate(
                 probes.hyper_connection,
                 gpu,
                 "hyper_connection",
-                "hc_expand",
+                &hc_name("hc_expand"),
             ),
-            hc_head_k: gate(probes.hyper_connection, gpu, "hyper_connection", "hc_head"),
+            hc_head_k: gate(probes.hyper_connection, gpu, "hyper_connection", &hc_name("hc_head")),
             hc_contract_k: gate(
                 probes.hyper_connection,
                 gpu,
                 "hyper_connection",
-                "hc_contract",
+                &hc_name("hc_contract"),
             ),
             qkv_nvfp4_t: None,
             q_nvfp4_t: None,

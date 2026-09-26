@@ -201,6 +201,7 @@ impl Glm5KdaLayer {
         } else {
             KernelHandle(0)
         };
+        let hc_name = |base: &str| super::ops::hc_kernel_name(&config.model_type, base);
         let layer = Self {
             input_norm,
             post_attn_norm,
@@ -274,14 +275,15 @@ impl Glm5KdaLayer {
                 config.kda_gate_lower_bound,
             )?,
             gated_norm_k: gpu.kernel("kda", "kda_sigmoid_gated_rms_norm")?,
-            hc_expand_k: gpu.kernel("hyper_connection", "hc_expand")?,
-            hc_pre_k: gpu.kernel("hyper_connection", "hc_pre")?,
-            hc_pre_from_raw_mix_k: gpu.kernel("hyper_connection", "hc_pre_from_raw_mix")?,
-            hc_pre_mix_k: super::try_kernel(gpu, "hyper_connection", "hc_pre_mix"),
-            hc_post_k: gpu.kernel("hyper_connection", "hc_post")?,
-            hc_post_bf16_add_k: super::try_kernel(gpu, "hyper_connection", "hc_post_bf16_add"),
-            hc_post_moe_blend_k: super::try_kernel(gpu, "hyper_connection", "hc_post_moe_blend"),
-            hc_contract_k: gpu.kernel("hyper_connection", "hc_contract")?,
+            // Highway-storage-specific mHC kernels (FP32, or BF16 twins).
+            hc_expand_k: gpu.kernel("hyper_connection", &hc_name("hc_expand"))?,
+            hc_pre_k: gpu.kernel("hyper_connection", &hc_name("hc_pre"))?,
+            hc_pre_from_raw_mix_k: gpu.kernel("hyper_connection", &hc_name("hc_pre_from_raw_mix"))?,
+            hc_pre_mix_k: super::try_kernel(gpu, "hyper_connection", &hc_name("hc_pre_mix")),
+            hc_post_k: gpu.kernel("hyper_connection", &hc_name("hc_post"))?,
+            hc_post_bf16_add_k: super::try_kernel(gpu, "hyper_connection", &hc_name("hc_post_bf16_add")),
+            hc_post_moe_blend_k: super::try_kernel(gpu, "hyper_connection", &hc_name("hc_post_moe_blend")),
+            hc_contract_k: gpu.kernel("hyper_connection", &hc_name("hc_contract"))?,
         };
         if crate::model::glm_independent::enabled(&config.model_type)? {
             let handles = std::array::from_fn(|i| match i + 2 {

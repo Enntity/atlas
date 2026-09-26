@@ -9,6 +9,14 @@
 #define HC_MAX_MULT 4
 #define HC_MAX_MIX 24
 #endif
+// Four consecutive highway values as FP32 (FP32 or BF16 highway storage).
+__device__ __forceinline__ float4 hc_ld4(const float* p) { return *(const float4*)p; }
+__device__ __forceinline__ float4 hc_ld4(const __nv_bfloat16* p) {
+    const uint2 u = *(const uint2*)p;
+    return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xffff0000u),
+                       __uint_as_float(u.y << 16), __uint_as_float(u.y & 0xffff0000u));
+}
+
 __device__ __forceinline__ float glm_hc_vec_block_reduce(float* red, unsigned tid) {
     for (unsigned s = HC_BLOCK / 2; s > 0; s >>= 1) {
         if (tid < s) red[tid] += red[tid + s];
@@ -19,8 +27,9 @@ __device__ __forceinline__ float glm_hc_vec_block_reduce(float* red, unsigned ti
 
 // Everything after the RMS scale: split, Sinkhorn and the vector collapse.
 // `s_rsqrt` and `s_mix` must be populated and visible (after a barrier).
+template <typename HT>
 __device__ __forceinline__ void glm_hc_vec_finalize(
-    const float* __restrict__ x,
+    const HT* __restrict__ x,
     const float s_rsqrt,
     const float* __restrict__ s_mix,
     float* __restrict__ s_pre,
@@ -93,7 +102,7 @@ __device__ __forceinline__ void glm_hc_vec_finalize(
         float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
         #pragma unroll
         for (unsigned int i = 0; i < 4; ++i) {
-            const float4 v = *(const float4*)&x[i * H + d];
+            const float4 v = hc_ld4(&x[i * H + d]);
             acc.x += s_pre[i] * v.x; acc.y += s_pre[i] * v.y;
             acc.z += s_pre[i] * v.z; acc.w += s_pre[i] * v.w;
         }
@@ -105,8 +114,9 @@ __device__ __forceinline__ void glm_hc_vec_finalize(
     }
 }
 
-extern "C" __global__ void glm_hc_pre_from_raw_mix_vec(
-    const float* __restrict__ streams,
+template <typename HT>
+__device__ __forceinline__ void glm_hc_pre_from_raw_mix_vec_t(
+    const HT* __restrict__ streams,
     const float* __restrict__ raw_mix,
     const float* __restrict__ hc_scale,
     const float* __restrict__ hc_base,
@@ -124,7 +134,7 @@ extern "C" __global__ void glm_hc_pre_from_raw_mix_vec(
     const unsigned int tid = threadIdx.x;
     constexpr unsigned int hc_dim = 4 * 4096;
     constexpr unsigned int mix_hc = 24;
-    const float* x = streams + (size_t)t * hc_dim;
+    const HT* x = streams + (size_t)t * hc_dim;
 
     __shared__ float red[HC_BLOCK];
     __shared__ float s_rsqrt;
@@ -134,7 +144,7 @@ extern "C" __global__ void glm_hc_pre_from_raw_mix_vec(
     float ss = 0.f;
     #pragma unroll 1
     for (unsigned int k = tid; k < hc_dim; k += HC_BLOCK) {
-        const float v = x[k];
+        const float v = (float)x[k];
         ss += v * v;
     }
 
@@ -156,8 +166,9 @@ extern "C" __global__ void glm_hc_pre_from_raw_mix_vec(
 #define GLM_HC_MIX_TPW 4
 #define GLM_HC_MIX_TOKENS (8 * GLM_HC_MIX_TPW)
 #define GLM_HC_MIX_KC 256
-extern "C" __global__ void __launch_bounds__(256) glm_hc_mix_ss(
-    const float* __restrict__ streams, // [T, 4, 4096]
+template <typename HT>
+__device__ __forceinline__ void glm_hc_mix_ss_t(
+    const HT* __restrict__ streams, // [T, 4, 4096]
     const float* __restrict__ hc_fn,   // [24, 16384]
     float* __restrict__ raw_mix,       // [T, 24]
     float* __restrict__ ss_out,        // [T]
@@ -176,11 +187,11 @@ extern "C" __global__ void __launch_bounds__(256) glm_hc_mix_ss(
         #pragma unroll
         for (unsigned int m = 0; m < M; ++m) acc[j][m] = 0.f;
     }
-    const float4* x4[GLM_HC_MIX_TPW];
+    const HT* xs[GLM_HC_MIX_TPW];
     #pragma unroll
     for (unsigned int j = 0; j < GLM_HC_MIX_TPW; ++j) {
         const unsigned int t = min(t0 + j, tokens - 1);
-        x4[j] = (const float4*)(streams + (size_t)t * K);
+        xs[j] = streams + (size_t)t * K;
     }
     #pragma unroll 1
     for (unsigned int k0 = 0; k0 < K; k0 += GLM_HC_MIX_KC) {
@@ -196,7 +207,7 @@ extern "C" __global__ void __launch_bounds__(256) glm_hc_mix_ss(
             const unsigned int c = half * 32 + lane;
             float4 v[GLM_HC_MIX_TPW];
             #pragma unroll
-            for (unsigned int j = 0; j < GLM_HC_MIX_TPW; ++j) v[j] = x4[j][k0 / 4 + c];
+            for (unsigned int j = 0; j < GLM_HC_MIX_TPW; ++j) v[j] = hc_ld4(xs[j] + k0 + 4 * c);
             #pragma unroll
             for (unsigned int j = 0; j < GLM_HC_MIX_TPW; ++j)
                 ss[j] += v[j].x * v[j].x + v[j].y * v[j].y + v[j].z * v[j].z + v[j].w * v[j].w;
@@ -230,8 +241,9 @@ extern "C" __global__ void __launch_bounds__(256) glm_hc_mix_ss(
 
 // Finalizer for glm_hc_mix_ss: identical split/Sinkhorn/collapse, RMS scale
 // taken from the fused pass instead of a second highway read.
-extern "C" __global__ void glm_hc_pre_finalize_ss_vec(
-    const float* __restrict__ streams,
+template <typename HT>
+__device__ __forceinline__ void glm_hc_pre_finalize_ss_vec_t(
+    const HT* __restrict__ streams,
     const float* __restrict__ raw_mix,
     const float* __restrict__ ss_in,
     const float* __restrict__ hc_scale,
@@ -256,3 +268,90 @@ extern "C" __global__ void glm_hc_pre_finalize_ss_vec(
                         y_out, post_out, comb_out, t, tid, sinkhorn_iters, hc_eps);
 }
 
+// ── FP32 (existing) and BF16-highway entry points ──
+
+extern "C" __global__ void glm_hc_pre_from_raw_mix_vec(
+    const float* __restrict__ streams,
+    const float* __restrict__ raw_mix,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    glm_hc_pre_from_raw_mix_vec_t<float>(streams, raw_mix, hc_scale, hc_base, y_out, post_out, comb_out, hidden_size, hc_mult, sinkhorn_iters, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void glm_hc_pre_from_raw_mix_vec_bf16(
+    const __nv_bfloat16* __restrict__ streams,
+    const float* __restrict__ raw_mix,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    glm_hc_pre_from_raw_mix_vec_t<__nv_bfloat16>(streams, raw_mix, hc_scale, hc_base, y_out, post_out, comb_out, hidden_size, hc_mult, sinkhorn_iters, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void __launch_bounds__(256) glm_hc_mix_ss(
+    const float* __restrict__ streams, // [T, 4, 4096]
+    const float* __restrict__ hc_fn,   // [24, 16384]
+    float* __restrict__ raw_mix,       // [T, 24]
+    float* __restrict__ ss_out,        // [T]
+    const unsigned int tokens
+) {
+    glm_hc_mix_ss_t<float>(streams, hc_fn, raw_mix, ss_out, tokens);
+}
+
+extern "C" __global__ void __launch_bounds__(256) glm_hc_mix_ss_bf16(
+    const __nv_bfloat16* __restrict__ streams, // [T, 4, 4096]
+    const float* __restrict__ hc_fn,   // [24, 16384]
+    float* __restrict__ raw_mix,       // [T, 24]
+    float* __restrict__ ss_out,        // [T]
+    const unsigned int tokens
+) {
+    glm_hc_mix_ss_t<__nv_bfloat16>(streams, hc_fn, raw_mix, ss_out, tokens);
+}
+
+extern "C" __global__ void glm_hc_pre_finalize_ss_vec(
+    const float* __restrict__ streams,
+    const float* __restrict__ raw_mix,
+    const float* __restrict__ ss_in,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    glm_hc_pre_finalize_ss_vec_t<float>(streams, raw_mix, ss_in, hc_scale, hc_base, y_out, post_out, comb_out, sinkhorn_iters, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void glm_hc_pre_finalize_ss_vec_bf16(
+    const __nv_bfloat16* __restrict__ streams,
+    const float* __restrict__ raw_mix,
+    const float* __restrict__ ss_in,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    glm_hc_pre_finalize_ss_vec_t<__nv_bfloat16>(streams, raw_mix, ss_in, hc_scale, hc_base, y_out, post_out, comb_out, sinkhorn_iters, norm_eps, hc_eps);
+}

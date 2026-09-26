@@ -50,13 +50,16 @@ pub(crate) fn hc_pre_prefill_mix(
     let mix = (2 + hc_mult) * hc_mult;
     let raw_mix = ctx.buffers.gate_logits_f32();
     let norm_eps = ctx.config.rms_norm_eps as f32;
-    if fused_prefill(&ctx.config.model_type, h, hc_mult, tokens) {
+    let bf16 = ops::hc_bf16_for(&ctx.config.model_type);
+    // A BF16 highway always takes the fused mixer (the TF32 GEMM reads FP32).
+    if bf16 || fused_prefill(&ctx.config.model_type, h, hc_mult, tokens) {
         ensure!(
             ctx.buffers.sizes().gate_logits_f32 >= tokens as usize * (mix as usize + 1) * 4,
             "mHC fused pre-mix scratch is too small"
         );
         let ss = raw_mix.offset(tokens as usize * mix as usize * 4);
-        KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", "glm_hc_mix_ss")?)
+        let name = |base| ops::hc_kernel_name(&ctx.config.model_type, base);
+        KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name("glm_hc_mix_ss"))?)
             .grid([tokens.div_ceil(32), 1, 1])
             .block([256, 1, 1])
             .arg_ptr(streams)
@@ -67,7 +70,7 @@ pub(crate) fn hc_pre_prefill_mix(
             .launch(stream)?;
         return KernelLaunch::new(
             ctx.gpu,
-            ctx.gpu.kernel("glm_hc_prefill_vec", "glm_hc_pre_finalize_ss_vec")?,
+            ctx.gpu.kernel("glm_hc_prefill_vec", &name("glm_hc_pre_finalize_ss_vec"))?,
         )
         .grid([tokens, 1, 1])
         .block([256, 1, 1])

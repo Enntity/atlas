@@ -35,9 +35,10 @@ __device__ __forceinline__ float hc_block_reduce(float* red, unsigned int tid) {
 // ── hc_expand ──
 // Broadcast a single hidden state into `hc_mult` identical streams:
 // streams[t, i, d] = hidden[t, d].  Grid: (T,1,1)  Block: (256,1,1).
-extern "C" __global__ void hc_expand(
+template <typename HT>
+__device__ __forceinline__ void hc_expand_t(
     const __nv_bfloat16* __restrict__ hidden, // [T, H]
-    float* __restrict__ streams,              // [T, hc, H] FP32 highway (mHC)
+    HT* __restrict__ streams,              // [T, hc, H] FP32 highway (mHC)
     const unsigned int hidden_size,
     const unsigned int hc_mult
 ) {
@@ -45,30 +46,32 @@ extern "C" __global__ void hc_expand(
     const unsigned int tid = threadIdx.x;
     const unsigned int H = hidden_size;
     const __nv_bfloat16* x = hidden + (size_t)t * H;
-    float* s = streams + (size_t)t * hc_mult * H;
+    HT* s = streams + (size_t)t * hc_mult * H;
     for (unsigned int d = tid; d < H; d += HC_BLOCK) {
         float v = (float)x[d];
-        for (unsigned int i = 0; i < hc_mult; ++i) s[i * H + d] = v;
+        for (unsigned int i = 0; i < hc_mult; ++i) s[i * H + d] = (HT)v;
     }
 }
 
 // GLM-5 has no learned HC head: contract the final residual highway by mean.
+template <typename HT>
 __device__ __forceinline__ void hc_contract_row(
-    const float* __restrict__ streams,
+    const HT* __restrict__ streams,
     __nv_bfloat16* __restrict__ out,
     const unsigned int hidden_size,
     const unsigned int hc_mult
 ) {
     for (unsigned int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
         float sum = 0.0f;
-        const float* x = streams + d;
-        for (unsigned int i = 0; i < hc_mult; ++i) sum += x[(size_t)i * hidden_size];
+        const HT* x = streams + d;
+        for (unsigned int i = 0; i < hc_mult; ++i) sum += (float)x[(size_t)i * hidden_size];
         out[d] = __float2bfloat16(sum / (float)hc_mult);
     }
 }
 
-extern "C" __global__ void hc_contract(
-    const float* __restrict__ streams,
+template <typename HT>
+__device__ __forceinline__ void hc_contract_t(
+    const HT* __restrict__ streams,
     __nv_bfloat16* __restrict__ hidden,
     const unsigned int hidden_size,
     const unsigned int hc_mult
@@ -80,8 +83,9 @@ extern "C" __global__ void hc_contract(
 
 // Same contraction into rows `out_stride` BF16 elements apart, e.g. one
 // layer's slot of a [T, layers, H] DFlash target-hidden capture.
-extern "C" __global__ void hc_contract_strided(
-    const float* __restrict__ streams,
+template <typename HT>
+__device__ __forceinline__ void hc_contract_strided_t(
+    const HT* __restrict__ streams,
     __nv_bfloat16* __restrict__ out,
     const unsigned int hidden_size,
     const unsigned int hc_mult,
@@ -95,8 +99,9 @@ extern "C" __global__ void hc_contract_strided(
 // ── hc_pre ──
 // streams [T, hc, H] -> y_out [T, H] (collapsed), post_out [T, hc],
 // comb_out [T, hc, hc].  Grid: (T,1,1)  Block: (256,1,1).
-extern "C" __global__ void hc_pre(
-    const float* __restrict__ streams,  // [T, hc, H] FP32 highway (mHC)
+template <typename HT>
+__device__ __forceinline__ void hc_pre_t(
+    const HT* __restrict__ streams,  // [T, hc, H] FP32 highway (mHC)
     const float* __restrict__ hc_fn,    // [mix_hc, hc*H]
     const float* __restrict__ hc_scale, // [3]
     const float* __restrict__ hc_base,  // [mix_hc]
@@ -116,7 +121,7 @@ extern "C" __global__ void hc_pre(
     const unsigned int hc_dim = hc * H;
     const unsigned int mix_hc = (2 + hc) * hc;
 
-    const float* x = streams + (size_t)t * hc_dim;
+    const HT* x = streams + (size_t)t * hc_dim;
 
     __shared__ float red[HC_BLOCK];
     __shared__ float s_rsqrt;
@@ -236,8 +241,9 @@ extern "C" __global__ void hc_pre(
 // raw_mix[t, m] is bit-identical to hc_pre's pre-rsqrt `r`; hc_pre_from_raw_mix
 // then applies rsqrt/scale/Sinkhorn/collapse in hc_pre's operation order.
 // Grid: (mix_hc, T, 1)  Block: (256, 1, 1).
-extern "C" __global__ void hc_pre_mix(
-    const float* __restrict__ streams, // [T, hc, H]
+template <typename HT>
+__device__ __forceinline__ void hc_pre_mix_t(
+    const HT* __restrict__ streams, // [T, hc, H]
     const float* __restrict__ hc_fn,   // [mix_hc, hc*H]
     float* __restrict__ raw_mix,       // [T, mix_hc]
     const unsigned int hidden_size,
@@ -248,7 +254,7 @@ extern "C" __global__ void hc_pre_mix(
     const unsigned int tid = threadIdx.x;
     const unsigned int hc_dim = hc_mult * hidden_size;
     const unsigned int mix_hc = (2 + hc_mult) * hc_mult;
-    const float* x = streams + (size_t)t * hc_dim;
+    const HT* x = streams + (size_t)t * hc_dim;
     const float* fn_row = hc_fn + (size_t)m * hc_dim;
     __shared__ float red[HC_BLOCK];
     float acc = 0.f;
@@ -266,8 +272,9 @@ extern "C" __global__ void hc_pre_mix(
 // separate lets cuBLASLt reuse both operands across tokens/mix rows instead of
 // hc_pre rereading the same 16K-float highway 24 times per token.
 // Grid: (T,1,1)  Block: (256,1,1).
-extern "C" __global__ void hc_pre_from_raw_mix(
-    const float* __restrict__ streams,
+template <typename HT>
+__device__ __forceinline__ void hc_pre_from_raw_mix_t(
+    const HT* __restrict__ streams,
     const float* __restrict__ raw_mix,
     const float* __restrict__ hc_scale,
     const float* __restrict__ hc_base,
@@ -286,7 +293,7 @@ extern "C" __global__ void hc_pre_from_raw_mix(
     const unsigned int hc = hc_mult;
     const unsigned int hc_dim = hc * H;
     const unsigned int mix_hc = (2 + hc) * hc;
-    const float* x = streams + (size_t)t * hc_dim;
+    const HT* x = streams + (size_t)t * hc_dim;
 
     __shared__ float red[HC_BLOCK];
     __shared__ float s_rsqrt;
@@ -295,7 +302,7 @@ extern "C" __global__ void hc_pre_from_raw_mix(
 
     float ss = 0.f;
     for (unsigned int k = tid; k < hc_dim; k += HC_BLOCK) {
-        float v = x[k];
+        float v = (float)x[k];
         ss += v * v;
     }
     red[tid] = ss;
@@ -375,7 +382,7 @@ extern "C" __global__ void hc_pre_from_raw_mix(
 
     for (unsigned int d = tid; d < H; d += HC_BLOCK) {
         float acc = 0.f;
-        for (unsigned int i = 0; i < hc; ++i) acc += s_pre[i] * x[i * H + d];
+        for (unsigned int i = 0; i < hc; ++i) acc += s_pre[i] * (float)x[i * H + d];
         y_out[(size_t)t * H + d] = __float2bfloat16(acc);
     }
 }
@@ -384,12 +391,13 @@ extern "C" __global__ void hc_pre_from_raw_mix(
 // out[t,j,d] = post[t,j]*block_out[t,d] + sum_i comb[t,i,j]*residual[t,i,d].
 // `out` may alias `residual` (all hc residual values are read before write).
 // Grid: (T,1,1)  Block: (256,1,1).
-extern "C" __global__ void hc_post(
+template <typename HT>
+__device__ __forceinline__ void hc_post_t(
     const __nv_bfloat16* __restrict__ block_out, // [T, H]
-    const float* __restrict__ residual,          // [T, hc, H] FP32 highway (mHC)
+    const HT* __restrict__ residual,          // [T, hc, H] FP32 highway (mHC)
     const float* __restrict__ post,              // [T, hc]
     const float* __restrict__ comb,              // [T, hc, hc]
-    float* __restrict__ out,                     // [T, hc, H] FP32 highway (mHC)
+    HT* __restrict__ out,                     // [T, hc, H] FP32 highway (mHC)
     const unsigned int hidden_size,
     const unsigned int hc_mult
 ) {
@@ -399,19 +407,19 @@ extern "C" __global__ void hc_post(
     const unsigned int hc = hc_mult;
 
     const __nv_bfloat16* x = block_out + (size_t)t * H;
-    const float* res = residual + (size_t)t * hc * H;
+    const HT* res = residual + (size_t)t * hc * H;
     const float* p = post + (size_t)t * hc;
     const float* c = comb + (size_t)t * hc * hc;
-    float* o = out + (size_t)t * hc * H;
+    HT* o = out + (size_t)t * hc * H;
 
     for (unsigned int d = tid; d < H; d += HC_BLOCK) {
         float xd = (float)x[d];
         float rv[HC_MAX_MULT];
-        for (unsigned int i = 0; i < hc; ++i) rv[i] = res[i * H + d];
+        for (unsigned int i = 0; i < hc; ++i) rv[i] = (float)res[i * H + d];
         for (unsigned int j = 0; j < hc; ++j) {
             float acc = p[j] * xd;
             for (unsigned int i = 0; i < hc; ++i) acc += c[i * hc + j] * rv[i];
-            o[j * H + d] = acc;
+            o[j * H + d] = (HT)acc;
         }
     }
 }
@@ -420,13 +428,14 @@ extern "C" __global__ void hc_post(
 // BF16 `__hadd(local, peer)` that the existing send/recv all-reduce path stores
 // before `hc_post` reads it. The reduced BF16 value is only consumed here, so
 // fusing removes the transient store/load without changing its arithmetic.
-extern "C" __global__ void hc_post_bf16_add(
+template <typename HT>
+__device__ __forceinline__ void hc_post_bf16_add_t(
     const __nv_bfloat16* __restrict__ local_block_out, // [T, H]
     const __nv_bfloat16* __restrict__ peer_block_out,  // [T, H]
-    const float* __restrict__ residual,                // [T, hc, H]
+    const HT* __restrict__ residual,                // [T, hc, H]
     const float* __restrict__ post,                    // [T, hc]
     const float* __restrict__ comb,                    // [T, hc, hc]
-    float* __restrict__ out,                           // [T, hc, H]
+    HT* __restrict__ out,                           // [T, hc, H]
     const unsigned int hidden_size,
     const unsigned int hc_mult
 ) {
@@ -437,19 +446,19 @@ extern "C" __global__ void hc_post_bf16_add(
 
     const __nv_bfloat16* local = local_block_out + (size_t)t * H;
     const __nv_bfloat16* peer = peer_block_out + (size_t)t * H;
-    const float* res = residual + (size_t)t * hc * H;
+    const HT* res = residual + (size_t)t * hc * H;
     const float* p = post + (size_t)t * hc;
     const float* c = comb + (size_t)t * hc * hc;
-    float* o = out + (size_t)t * hc * H;
+    HT* o = out + (size_t)t * hc * H;
 
     for (unsigned int d = tid; d < H; d += HC_BLOCK) {
         const float xd = (float)__hadd(local[d], peer[d]);
         float rv[HC_MAX_MULT];
-        for (unsigned int i = 0; i < hc; ++i) rv[i] = res[i * H + d];
+        for (unsigned int i = 0; i < hc; ++i) rv[i] = (float)res[i * H + d];
         for (unsigned int j = 0; j < hc; ++j) {
             float acc = p[j] * xd;
             for (unsigned int i = 0; i < hc; ++i) acc += c[i * hc + j] * rv[i];
-            o[j * H + d] = acc;
+            o[j * H + d] = (HT)acc;
         }
     }
 }
@@ -459,15 +468,16 @@ extern "C" __global__ void hc_post_bf16_add(
 // to BF16 in moe_batched_blend, then hc_post converts that BF16 value back to
 // FP32. Preserve that explicit round trip while avoiding the intermediate
 // [T,H] store and a separate kernel launch.
-extern "C" __global__ void hc_post_moe_blend(
+template <typename HT>
+__device__ __forceinline__ void hc_post_moe_blend_t(
     const __nv_bfloat16* __restrict__ routed,       // [T, H], EP-reduced
     const __nv_bfloat16* __restrict__ shared,       // [T, H]
     const __nv_bfloat16* __restrict__ normed,       // [T, H]
     const __nv_bfloat16* __restrict__ gate_weight,  // [H], nullable
-    const float* __restrict__ residual,             // [T, hc, H]
+    const HT* __restrict__ residual,             // [T, hc, H]
     const float* __restrict__ post,                 // [T, hc]
     const float* __restrict__ comb,                 // [T, hc, hc]
-    float* __restrict__ out,                        // [T, hc, H]
+    HT* __restrict__ out,                        // [T, hc, H]
     const unsigned int hidden_size,
     const unsigned int hc_mult
 ) {
@@ -483,10 +493,10 @@ extern "C" __global__ void hc_post_moe_blend(
     const __nv_bfloat16* r = routed + (size_t)t * H;
     const __nv_bfloat16* s = shared + (size_t)t * H;
     const __nv_bfloat16* n = normed + (size_t)t * H;
-    const float* res = residual + (size_t)t * hc * H;
+    const HT* res = residual + (size_t)t * hc * H;
     const float* p = post + (size_t)t * hc;
     const float* c = comb + (size_t)t * hc * hc;
-    float* o = out + (size_t)t * hc * H;
+    HT* o = out + (size_t)t * hc * H;
 
     float local_dot = 0.0f;
     if (gate_weight != 0) {
@@ -518,11 +528,11 @@ extern "C" __global__ void hc_post_moe_blend(
         const __nv_bfloat16 blended = __float2bfloat16(routed_f + gate * shared_f);
         const float xd = __bfloat162float(blended);
         float rv[HC_MAX_MULT];
-        for (unsigned int i = 0; i < hc; ++i) rv[i] = res[i * H + d];
+        for (unsigned int i = 0; i < hc; ++i) rv[i] = (float)res[i * H + d];
         for (unsigned int j = 0; j < hc; ++j) {
             float acc = p[j] * xd;
             for (unsigned int i = 0; i < hc; ++i) acc += c[i * hc + j] * rv[i];
-            o[j * H + d] = acc;
+            o[j * H + d] = (HT)acc;
         }
     }
 }
@@ -530,8 +540,9 @@ extern "C" __global__ void hc_post_moe_blend(
 // ── hc_head ──
 // Final collapse: streams [T, hc, H] -> y_out [T, H] via a single learned
 // sigmoid-weighted sum.  Grid: (T,1,1)  Block: (256,1,1).
-extern "C" __global__ void hc_head(
-    const float* __restrict__ streams,    // [T, hc, H] FP32 highway (mHC)
+template <typename HT>
+__device__ __forceinline__ void hc_head_t(
+    const HT* __restrict__ streams,    // [T, hc, H] FP32 highway (mHC)
     const float* __restrict__ head_fn,    // [hc, hc*H]
     const float* __restrict__ head_scale, // [1]
     const float* __restrict__ head_base,  // [hc]
@@ -547,7 +558,7 @@ extern "C" __global__ void hc_head(
     const unsigned int hc = hc_mult;
     const unsigned int hc_dim = hc * H;
 
-    const float* x = streams + (size_t)t * hc_dim;
+    const HT* x = streams + (size_t)t * hc_dim;
 
     __shared__ float red[HC_BLOCK];
     __shared__ float s_rsqrt;
@@ -587,4 +598,258 @@ extern "C" __global__ void hc_head(
         for (unsigned int i = 0; i < hc; ++i) acc += s_pre[i] * (float)x[i * H + d];
         y_out[(size_t)t * H + d] = __float2bfloat16(acc);
     }
+}
+
+// ── FP32 (existing) and BF16-highway entry points ──
+
+extern "C" __global__ void hc_expand(
+    const __nv_bfloat16* __restrict__ hidden, // [T, H]
+    float* __restrict__ streams,              // [T, hc, H] FP32 highway (mHC)
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_expand_t<float>(hidden, streams, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_expand_bf16(
+    const __nv_bfloat16* __restrict__ hidden, // [T, H]
+    __nv_bfloat16* __restrict__ streams,              // [T, hc, H] FP32 highway (mHC)
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_expand_t<__nv_bfloat16>(hidden, streams, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_contract(
+    const float* __restrict__ streams,
+    __nv_bfloat16* __restrict__ hidden,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_contract_t<float>(streams, hidden, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_contract_bf16(
+    const __nv_bfloat16* __restrict__ streams,
+    __nv_bfloat16* __restrict__ hidden,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_contract_t<__nv_bfloat16>(streams, hidden, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_contract_strided(
+    const float* __restrict__ streams,
+    __nv_bfloat16* __restrict__ out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int out_stride
+) {
+    hc_contract_strided_t<float>(streams, out, hidden_size, hc_mult, out_stride);
+}
+
+extern "C" __global__ void hc_contract_strided_bf16(
+    const __nv_bfloat16* __restrict__ streams,
+    __nv_bfloat16* __restrict__ out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int out_stride
+) {
+    hc_contract_strided_t<__nv_bfloat16>(streams, out, hidden_size, hc_mult, out_stride);
+}
+
+extern "C" __global__ void hc_pre(
+    const float* __restrict__ streams,  // [T, hc, H] FP32 highway (mHC)
+    const float* __restrict__ hc_fn,    // [mix_hc, hc*H]
+    const float* __restrict__ hc_scale, // [3]
+    const float* __restrict__ hc_base,  // [mix_hc]
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    hc_pre_t<float>(streams, hc_fn, hc_scale, hc_base, y_out, post_out, comb_out, hidden_size, hc_mult, sinkhorn_iters, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void hc_pre_bf16(
+    const __nv_bfloat16* __restrict__ streams,  // [T, hc, H] FP32 highway (mHC)
+    const float* __restrict__ hc_fn,    // [mix_hc, hc*H]
+    const float* __restrict__ hc_scale, // [3]
+    const float* __restrict__ hc_base,  // [mix_hc]
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    hc_pre_t<__nv_bfloat16>(streams, hc_fn, hc_scale, hc_base, y_out, post_out, comb_out, hidden_size, hc_mult, sinkhorn_iters, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void hc_pre_mix(
+    const float* __restrict__ streams, // [T, hc, H]
+    const float* __restrict__ hc_fn,   // [mix_hc, hc*H]
+    float* __restrict__ raw_mix,       // [T, mix_hc]
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_pre_mix_t<float>(streams, hc_fn, raw_mix, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_pre_mix_bf16(
+    const __nv_bfloat16* __restrict__ streams, // [T, hc, H]
+    const float* __restrict__ hc_fn,   // [mix_hc, hc*H]
+    float* __restrict__ raw_mix,       // [T, mix_hc]
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_pre_mix_t<__nv_bfloat16>(streams, hc_fn, raw_mix, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_pre_from_raw_mix(
+    const float* __restrict__ streams,
+    const float* __restrict__ raw_mix,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    hc_pre_from_raw_mix_t<float>(streams, raw_mix, hc_scale, hc_base, y_out, post_out, comb_out, hidden_size, hc_mult, sinkhorn_iters, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void hc_pre_from_raw_mix_bf16(
+    const __nv_bfloat16* __restrict__ streams,
+    const float* __restrict__ raw_mix,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    hc_pre_from_raw_mix_t<__nv_bfloat16>(streams, raw_mix, hc_scale, hc_base, y_out, post_out, comb_out, hidden_size, hc_mult, sinkhorn_iters, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void hc_post(
+    const __nv_bfloat16* __restrict__ block_out, // [T, H]
+    const float* __restrict__ residual,          // [T, hc, H] FP32 highway (mHC)
+    const float* __restrict__ post,              // [T, hc]
+    const float* __restrict__ comb,              // [T, hc, hc]
+    float* __restrict__ out,                     // [T, hc, H] FP32 highway (mHC)
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_post_t<float>(block_out, residual, post, comb, out, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_post_bf16(
+    const __nv_bfloat16* __restrict__ block_out, // [T, H]
+    const __nv_bfloat16* __restrict__ residual,          // [T, hc, H] FP32 highway (mHC)
+    const float* __restrict__ post,              // [T, hc]
+    const float* __restrict__ comb,              // [T, hc, hc]
+    __nv_bfloat16* __restrict__ out,                     // [T, hc, H] FP32 highway (mHC)
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_post_t<__nv_bfloat16>(block_out, residual, post, comb, out, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_post_bf16_add(
+    const __nv_bfloat16* __restrict__ local_block_out, // [T, H]
+    const __nv_bfloat16* __restrict__ peer_block_out,  // [T, H]
+    const float* __restrict__ residual,                // [T, hc, H]
+    const float* __restrict__ post,                    // [T, hc]
+    const float* __restrict__ comb,                    // [T, hc, hc]
+    float* __restrict__ out,                           // [T, hc, H]
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_post_bf16_add_t<float>(local_block_out, peer_block_out, residual, post, comb, out, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_post_bf16_add_bf16(
+    const __nv_bfloat16* __restrict__ local_block_out, // [T, H]
+    const __nv_bfloat16* __restrict__ peer_block_out,  // [T, H]
+    const __nv_bfloat16* __restrict__ residual,                // [T, hc, H]
+    const float* __restrict__ post,                    // [T, hc]
+    const float* __restrict__ comb,                    // [T, hc, hc]
+    __nv_bfloat16* __restrict__ out,                           // [T, hc, H]
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_post_bf16_add_t<__nv_bfloat16>(local_block_out, peer_block_out, residual, post, comb, out, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_post_moe_blend(
+    const __nv_bfloat16* __restrict__ routed,       // [T, H], EP-reduced
+    const __nv_bfloat16* __restrict__ shared,       // [T, H]
+    const __nv_bfloat16* __restrict__ normed,       // [T, H]
+    const __nv_bfloat16* __restrict__ gate_weight,  // [H], nullable
+    const float* __restrict__ residual,             // [T, hc, H]
+    const float* __restrict__ post,                 // [T, hc]
+    const float* __restrict__ comb,                 // [T, hc, hc]
+    float* __restrict__ out,                        // [T, hc, H]
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_post_moe_blend_t<float>(routed, shared, normed, gate_weight, residual, post, comb, out, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_post_moe_blend_bf16(
+    const __nv_bfloat16* __restrict__ routed,       // [T, H], EP-reduced
+    const __nv_bfloat16* __restrict__ shared,       // [T, H]
+    const __nv_bfloat16* __restrict__ normed,       // [T, H]
+    const __nv_bfloat16* __restrict__ gate_weight,  // [H], nullable
+    const __nv_bfloat16* __restrict__ residual,             // [T, hc, H]
+    const float* __restrict__ post,                 // [T, hc]
+    const float* __restrict__ comb,                 // [T, hc, hc]
+    __nv_bfloat16* __restrict__ out,                        // [T, hc, H]
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    hc_post_moe_blend_t<__nv_bfloat16>(routed, shared, normed, gate_weight, residual, post, comb, out, hidden_size, hc_mult);
+}
+
+extern "C" __global__ void hc_head(
+    const float* __restrict__ streams,    // [T, hc, H] FP32 highway (mHC)
+    const float* __restrict__ head_fn,    // [hc, hc*H]
+    const float* __restrict__ head_scale, // [1]
+    const float* __restrict__ head_base,  // [hc]
+    __nv_bfloat16* __restrict__ y_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const float norm_eps,
+    const float hc_eps
+) {
+    hc_head_t<float>(streams, head_fn, head_scale, head_base, y_out, hidden_size, hc_mult, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void hc_head_bf16(
+    const __nv_bfloat16* __restrict__ streams,    // [T, hc, H] FP32 highway (mHC)
+    const float* __restrict__ head_fn,    // [hc, hc*H]
+    const float* __restrict__ head_scale, // [1]
+    const float* __restrict__ head_base,  // [hc]
+    __nv_bfloat16* __restrict__ y_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const float norm_eps,
+    const float hc_eps
+) {
+    hc_head_t<__nv_bfloat16>(streams, head_fn, head_scale, head_base, y_out, hidden_size, hc_mult, norm_eps, hc_eps);
 }
