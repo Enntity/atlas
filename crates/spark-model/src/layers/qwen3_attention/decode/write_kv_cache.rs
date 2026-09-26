@@ -460,23 +460,37 @@ impl Qwen3AttentionLayer {
                     _ => unreachable!(),
                 }
             }
-            KvCacheDtype::Bf16 => ops::reshape_and_cache(
-                gpu,
-                self.reshape_cache_k,
-                k,
-                v,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
-                slot,
-                num_tokens,
-                num_kv_heads,
-                head_dim,
-                block_size,
-                key_stride,
-                value_stride,
-                kv_cache.cache_stride() as u64,
-                stream,
-            ),
+            KvCacheDtype::Bf16 => {
+                ops::reshape_and_cache(
+                    gpu,
+                    self.reshape_cache_k,
+                    k,
+                    v,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    slot,
+                    num_tokens,
+                    num_kv_heads,
+                    head_dim,
+                    block_size,
+                    key_stride,
+                    value_stride,
+                    kv_cache.cache_stride() as u64,
+                    stream,
+                )?;
+                // GLM's V aliases K, so rounding the K side covers both.
+                if self.glm_latent_qdq_k.0 != 0 && num_kv_heads == 1 && head_dim == 512 {
+                    ops::glm_latent_qdq_fp8g128(
+                        gpu,
+                        self.glm_latent_qdq_k,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        slot,
+                        num_tokens,
+                        stream,
+                    )?;
+                }
+                Ok(())
+            }
             _ => {
                 // FP8 KV cache
                 if !graph_capture && let Some(ref cal) = self.fp8_calibration {

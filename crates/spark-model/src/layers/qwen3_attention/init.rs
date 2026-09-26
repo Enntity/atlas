@@ -348,6 +348,11 @@ impl Qwen3AttentionLayer {
             ),
             rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
             reshape_cache_k: gpu.kernel(reshape_mod, reshape_fn)?,
+            glm_latent_qdq_k: if std::env::var("ATLAS_GLM_LATENT_QDQ").as_deref() == Ok("1") {
+                gpu.kernel("reshape_and_cache", "glm_latent_qdq_fp8g128")?
+            } else {
+                KernelHandle(0)
+            },
             fused_k_norm_rope_cache_write_bf16_k: super::super::try_kernel(
                 gpu,
                 "fused_k_norm_rope_cache",

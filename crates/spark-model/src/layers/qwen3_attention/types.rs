@@ -228,6 +228,9 @@ pub struct Qwen3AttentionLayer {
     /// Proportional RoPE kernel (Gemma-4 full-attention layers).
     pub(super) rope_proportional_k: KernelHandle,
     pub(super) reshape_cache_k: KernelHandle,
+    /// `ATLAS_GLM_LATENT_QDQ=1`: FP8 fake-quant of cached GLM latents
+    /// (quality probe for an FP8 latent cache). Null when off.
+    pub(super) glm_latent_qdq_k: KernelHandle,
     /// Fused k_norm + RoPE + paged BF16 cache write — eliminates two
     /// intermediate BF16 rounding steps that cause the documented L35-L39
     /// cliff in chunked-prefill BF16 KV mode (memory:

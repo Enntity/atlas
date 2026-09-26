@@ -835,3 +835,20 @@ pub fn mla_paged_decode_fp8(
 }
 
 // ── Batched prefill variants (N tokens) ──
+
+/// FP8 fake-quant of cached GLM NoPE-512 latents, one CTA per token.
+pub fn glm_latent_qdq_fp8g128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    cache: DevicePtr,
+    slot_mapping: DevicePtr,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(cache)
+        .arg_ptr(slot_mapping)
+        .launch(stream)
+}

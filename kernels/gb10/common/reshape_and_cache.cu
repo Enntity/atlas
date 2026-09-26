@@ -492,3 +492,34 @@ extern "C" __global__ void bf16_absmax(
         }
     }
 }
+
+// GLM NoPE-512 latent fake-quant (ATLAS_GLM_LATENT_QDQ=1): round each cached
+// token through FP8-E4M3 with one scale per 128 dims, exactly as the native
+// sparse prefill's `prep_kv` packs it (amax/448, amax floored at 1e-4).
+// Measures an FP8 latent cache's quality on every reader without porting them.
+// One CTA of 128 threads per token; `cache` rows are [slot, 512] BF16.
+extern "C" __global__ void glm_latent_qdq_fp8g128(
+    __nv_bfloat16* __restrict__ cache,
+    const long long* __restrict__ slots) {
+    __shared__ float amax[128];
+    const long long slot = slots[blockIdx.x];
+    if (slot < 0) return;
+    __nv_bfloat16* row = cache + (size_t)slot * 512u;
+    const int tid = threadIdx.x;
+    for (int g = 0; g < 4; ++g) {
+        const float v = __bfloat162float(row[g * 128 + tid]);
+        amax[tid] = fabsf(v);
+        __syncthreads();
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) amax[tid] = fmaxf(amax[tid], amax[tid + s]);
+            __syncthreads();
+        }
+        float m = amax[0];
+        if (!(m > 1.0e-4f)) m = 1.0e-4f;
+        const float sc = __fmul_rn(m, static_cast<float>(1.0 / 448.0));
+        const __nv_fp8_storage_t q = __nv_cvt_float_to_fp8(v / sc, __NV_SATFINITE, __NV_E4M3);
+        const __half_raw h = __nv_cvt_fp8_to_halfraw(q, __NV_E4M3);
+        row[g * 128 + tid] = __float2bfloat16(__half2float(__half(h)) * sc);
+        __syncthreads();
+    }
+}
