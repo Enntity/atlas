@@ -106,50 +106,45 @@ impl PagedKvCache {
         gpu: &dyn crate::gpu::GpuBackend,
         stream: u64,
     ) -> anyhow::Result<()> {
+        self.zero_block_run(block_idx, 1, gpu, stream)
+    }
+
+    /// [`Self::zero_block`] for many blocks: one memset per per-layer array
+    /// per run of contiguous block ids (a prefill chunk's fresh blocks come
+    /// off the free list as a few runs, not one memset storm per block).
+    pub fn zero_blocks(
+        &self,
+        blocks: &[u32],
+        gpu: &dyn crate::gpu::GpuBackend,
+        stream: u64,
+    ) -> anyhow::Result<()> {
+        let mut sorted = blocks.to_vec();
+        sorted.sort_unstable();
+        for run in sorted.chunk_by(|a, b| *b == *a + 1) {
+            self.zero_block_run(run[0], run.len(), gpu, stream)?;
+        }
+        Ok(())
+    }
+
+    fn zero_block_run(
+        &self,
+        first: u32,
+        count: usize,
+        gpu: &dyn crate::gpu::GpuBackend,
+        stream: u64,
+    ) -> anyhow::Result<()> {
         for layer in &self.layers {
-            let k_offset = block_idx as usize * layer.k_block_stride;
-            let v_offset = block_idx as usize * layer.v_block_stride;
-            gpu.memset_async(
-                layer.k_pool.offset(k_offset),
-                0,
-                layer.k_block_stride,
-                stream,
-            )?;
-            gpu.memset_async(
-                layer.v_pool.offset(v_offset),
-                0,
-                layer.v_block_stride,
-                stream,
-            )?;
-            if !layer.sparse_index_values.is_null() {
-                gpu.memset_async(
-                    layer
-                        .sparse_index_values
-                        .offset(block_idx as usize * layer.sparse_index_values_block_stride),
-                    0,
-                    layer.sparse_index_values_block_stride,
-                    stream,
-                )?;
-            }
-            if !layer.sparse_index_scales.is_null() {
-                gpu.memset_async(
-                    layer
-                        .sparse_index_scales
-                        .offset(block_idx as usize * layer.sparse_index_scales_block_stride),
-                    0,
-                    layer.sparse_index_scales_block_stride,
-                    stream,
-                )?;
-            }
-            if !layer.sparse_index_tail.is_null() {
-                gpu.memset_async(
-                    layer
-                        .sparse_index_tail
-                        .offset(block_idx as usize * layer.sparse_index_tail_block_stride),
-                    0,
-                    layer.sparse_index_tail_block_stride,
-                    stream,
-                )?;
+            for (base, stride) in [
+                (layer.k_pool, layer.k_block_stride),
+                (layer.v_pool, layer.v_block_stride),
+                (layer.sparse_index_values, layer.sparse_index_values_block_stride),
+                (layer.sparse_index_scales, layer.sparse_index_scales_block_stride),
+                (layer.sparse_index_tail, layer.sparse_index_tail_block_stride),
+            ] {
+                if base.is_null() || stride == 0 {
+                    continue;
+                }
+                gpu.memset_async(base.offset(first as usize * stride), 0, count * stride, stream)?;
             }
         }
         Ok(())

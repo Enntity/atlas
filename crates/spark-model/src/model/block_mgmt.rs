@@ -26,9 +26,9 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 /// Fill a freshly-allocated block: NaN-poison under the diagnostic flag,
 /// otherwise the production zero-fill (stale-KV leak guard).
 #[inline]
-fn fill_fresh_block(
+fn fill_fresh_blocks(
     kv_cache: &PagedKvCache,
-    blk: u32,
+    blocks: &[u32],
     gpu: &dyn GpuBackend,
     stream: u64,
     // `ModelLevers::kv_poison`. Carried, not read from a static: it changes
@@ -37,9 +37,11 @@ fn fill_fresh_block(
     poison: bool,
 ) -> Result<()> {
     if poison {
-        kv_cache.poison_block(blk, gpu, stream)
+        blocks
+            .iter()
+            .try_for_each(|&blk| kv_cache.poison_block(blk, gpu, stream))
     } else {
-        kv_cache.zero_block(blk, gpu, stream)
+        kv_cache.zero_blocks(blocks, gpu, stream)
     }
 }
 
@@ -292,7 +294,7 @@ pub(crate) fn ensure_blocks_through_decode(
     prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
     gpu: &dyn GpuBackend,
     stream: u64,
-    // `ModelLevers::kv_poison` — see `fill_fresh_block`.
+    // `ModelLevers::kv_poison` — see `fill_fresh_blocks`.
     kv_poison: bool,
 ) -> Result<()> {
     let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
@@ -378,7 +380,7 @@ pub(crate) fn ensure_blocks_through_decode(
                 ));
             }
         };
-        fill_fresh_block(kv_cache, blk, gpu, stream, kv_poison)?;
+        fill_fresh_blocks(kv_cache, &[blk], gpu, stream, kv_poison)?;
         seq.block_table.push(blk);
         alloc_count += 1;
         if cap.is_some() {
@@ -431,16 +433,18 @@ pub(crate) fn ensure_blocks_through_prefill(
     prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
     gpu: &dyn GpuBackend,
     stream: u64,
-    // `ModelLevers::kv_poison` — see `fill_fresh_block`.
+    // `ModelLevers::kv_poison` — see `fill_fresh_blocks`.
     kv_poison: bool,
 ) -> Result<()> {
     let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
+    // A chunk's fresh blocks are filled together after allocation.
+    let mut fresh = Vec::new();
     loop {
         let ws = seq.hss_window_start();
         let bt_len = seq.block_table.len();
         let in_window = bt_len > 0 && abs_block_idx < ws + bt_len;
         if in_window {
-            return Ok(());
+            return fill_fresh_blocks(kv_cache, &fresh, gpu, stream, kv_poison);
         }
         // Issue #31: NEVER slide during prefill. block_table grows
         // monotonically until the chunk's full token range is in-window.
@@ -456,7 +460,7 @@ pub(crate) fn ensure_blocks_through_prefill(
         // `alloc_block_evicting`).
         let blk = alloc_block_evicting(kv_cache, prefix_cache)
             .ok_or_else(|| anyhow::anyhow!("KV cache exhausted: no free blocks"))?;
-        fill_fresh_block(kv_cache, blk, gpu, stream, kv_poison)?;
+        fresh.push(blk);
         seq.block_table.push(blk);
         if cap.is_some() {
             let id = spark_storage::with_local(|hss| {

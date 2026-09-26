@@ -247,6 +247,30 @@ fn test_read_write_block_multiple_layers() {
 }
 
 #[test]
+fn zero_blocks_zeroes_exactly_the_given_blocks_one_memset_per_run() {
+    let gpu = MockGpuBackend::new();
+    let cache = PagedKvCache::new(test_config(), 10, &gpu).unwrap();
+    let stride = cache.block_stride_bytes();
+    let fill = vec![0xABu8; stride];
+    for layer in 0..12 {
+        for blk in 0..10 {
+            cache.write_block(layer, blk, &fill, &fill, &gpu).unwrap();
+        }
+    }
+    let before = gpu.memset_count();
+    // Unsorted ids forming two contiguous runs: 3..=5 and 7.
+    cache.zero_blocks(&[5, 4, 3, 7], &gpu, 0).unwrap();
+    assert_eq!(gpu.memset_count() - before, 12 * 2 * 2);
+    for layer in 0..12 {
+        for blk in 0..10 {
+            let (k, v) = cache.read_block(layer, blk, &gpu).unwrap();
+            let want = if [3, 4, 5, 7].contains(&blk) { 0 } else { 0xAB };
+            assert!(k.iter().chain(&v).all(|&b| b == want), "layer {layer} block {blk}");
+        }
+    }
+}
+
+#[test]
 fn test_num_layers() {
     let cfg = test_config();
     let gpu = MockGpuBackend::new();

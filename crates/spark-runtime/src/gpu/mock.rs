@@ -34,6 +34,8 @@ pub struct MockGpuBackend {
     /// backend regardless of `height`. Counted apart from `d2d` so a test can
     /// assert the SHAPE of the transfer, not just the bytes.
     d2d_2d: AtomicUsize,
+    /// `memset_async` calls — one eager launch each on the real backend.
+    memsets: AtomicUsize,
     host_pinned_allocs: AtomicUsize,
     /// Pending `free` failure injections (see [`Self::fail_next_free`]).
     pending_free_failures: AtomicUsize,
@@ -66,6 +68,7 @@ impl MockGpuBackend {
             d2h_async: AtomicUsize::new(0),
             d2d: AtomicUsize::new(0),
             d2d_2d: AtomicUsize::new(0),
+            memsets: AtomicUsize::new(0),
             host_pinned_allocs: AtomicUsize::new(0),
             pending_free_failures: AtomicUsize::new(0),
             destroyed_graphs: AtomicUsize::new(0),
@@ -122,6 +125,11 @@ impl MockGpuBackend {
     /// whatever the row count.
     pub fn d2d_2d_count(&self) -> usize {
         self.d2d_2d.load(Ordering::Relaxed)
+    }
+
+    /// `memset_async` calls so far.
+    pub fn memset_count(&self) -> usize {
+        self.memsets.load(Ordering::Relaxed)
     }
 
     /// `alloc_host_pinned` calls — the tripwire for a staging buffer that is
@@ -354,6 +362,7 @@ impl GpuBackend for MockGpuBackend {
     }
 
     fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, _stream: u64) -> Result<()> {
+        self.memsets.fetch_add(1, Ordering::Relaxed);
         self.memset(ptr, value, bytes)
     }
 
