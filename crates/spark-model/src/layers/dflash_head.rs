@@ -38,7 +38,44 @@ pub use startup_diagnostics::DsparkDiagnostics;
 #[cfg(test)]
 mod product_policy_tests;
 
+/// MXFP8 twin of a drafter projection: E4M3 `[n, k]` + E8M0 `[n, k/32]`.
+#[derive(Debug, Clone, Copy)]
+pub struct Mxfp8Weight {
+    pub data: DevicePtr,
+    pub scales: DevicePtr,
+}
+
 impl DflashKernels {
+    /// A drafter projection through its MXFP8 twin when present (up to 32
+    /// rows), else the BF16 weight via [`Self::linear`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn project(
+        &self,
+        gpu: &dyn GpuBackend,
+        input: DevicePtr,
+        weight: &DenseWeight,
+        mx: Option<&Mxfp8Weight>,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if let Some(mx) = mx {
+            let kernel = self.mxfp8_gemv[match m {
+                0..=8 => 0,
+                9..=16 => 1,
+                _ => 2,
+            }];
+            if m <= 32 && kernel.0 != 0 {
+                return crate::layers::ops::mxfp8_gemv(
+                    gpu, kernel, input, mx.data, mx.scales, output, m, n, k, n, stream,
+                );
+            }
+        }
+        self.linear(gpu, input, weight, output, m, n, k, stream)
+    }
+
     /// BF16 `C[m, n] = A[m, k] · W[n, k]ᵀ`. Drafter blocks (and batched
     /// proposals up to 32 rows) read each weight once at bandwidth through the
     /// batch-M / tensor-core GEMVs; the 128-row tiled GEMM would be almost all
@@ -79,6 +116,10 @@ pub struct DflashKernels {
     /// Tensor-core BF16 GEMV for 9..=16 / 17..=32 rows (batched proposals).
     pub dense_gemv_tc16: KernelHandle,
     pub dense_gemv_tc32: KernelHandle,
+    /// MXFP8 drafter projections (`ATLAS_DFLASH_MXFP8=1`): load-time
+    /// quantizer and the 8/16/32-row tensor-core GEMVs.
+    pub mxfp8_quantize: KernelHandle,
+    pub mxfp8_gemv: [KernelHandle; 3],
     pub dense_gemm: KernelHandle,
     /// NVFP4 GEMM for the final logits when the shared lm_head is NVFP4
     /// (e.g. Holo): a BF16 `dense_gemm` on NVFP4-packed bytes reads garbage
@@ -300,6 +341,13 @@ pub struct DflashLayer {
     pub gate_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
     pub up_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
     pub down_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+    // MXFP8 twins of the five large projections (`ATLAS_DFLASH_MXFP8=1`);
+    // k/v stay BF16 for the prefill context precompute.
+    pub q_proj_mx: Option<Mxfp8Weight>,
+    pub o_proj_mx: Option<Mxfp8Weight>,
+    pub gate_proj_mx: Option<Mxfp8Weight>,
+    pub up_proj_mx: Option<Mxfp8Weight>,
+    pub down_proj_mx: Option<Mxfp8Weight>,
 }
 
 /// Per-sequence DFlash drafter state. One paged KV cache per drafter layer

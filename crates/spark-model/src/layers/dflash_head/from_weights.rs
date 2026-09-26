@@ -156,6 +156,9 @@ impl BlockDiffusionDraftHead {
             dense_gemv_batchm: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
             dense_gemv_tc16: super::super::try_kernel(gpu, "dense_gemv_bf16_batchm", "dense_gemv_bf16_tc16"),
             dense_gemv_tc32: super::super::try_kernel(gpu, "dense_gemv_bf16_batchm", "dense_gemv_bf16_tc32"),
+            mxfp8_quantize: super::super::try_kernel(gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
+            mxfp8_gemv: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
+                .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             w4a16_gemm: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm"),
             dense_gemm_pipelined: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
@@ -713,6 +716,11 @@ impl BlockDiffusionDraftHead {
                     gate_proj_nvfp4: None,
                     up_proj_nvfp4: None,
                     down_proj_nvfp4: None,
+                    q_proj_mx: None,
+                    o_proj_mx: None,
+                    gate_proj_mx: None,
+                    up_proj_mx: None,
+                    down_proj_mx: None,
                 })
                 .collect(),
             // Phase 2 stage 2: fused KV weight built above by copy_d2d
@@ -896,7 +904,11 @@ impl BlockDiffusionDraftHead {
             );
         }
 
-        head.try_install_nvfp4(gpu)?;
+        if std::env::var("ATLAS_DFLASH_MXFP8").as_deref() == Ok("1") {
+            head.install_mxfp8(gpu)?;
+        } else {
+            head.try_install_nvfp4(gpu)?;
+        }
         Ok(head)
     }
 

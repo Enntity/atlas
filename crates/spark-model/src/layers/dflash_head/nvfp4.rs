@@ -111,12 +111,44 @@ impl BlockDiffusionDraftHead {
         Ok(())
     }
 
+    /// Quantize the five large drafter projections to MXFP8 twins
+    /// (`ATLAS_DFLASH_MXFP8=1`). BF16 originals stay: they serve rows the
+    /// tensor-core GEMVs do not (wider than 32).
+    pub(super) fn install_mxfp8(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+        let quant = self.kernels.mxfp8_quantize;
+        anyhow::ensure!(
+            quant.0 != 0 && self.kernels.mxfp8_gemv.iter().all(|k| k.0 != 0),
+            "ATLAS_DFLASH_MXFP8=1 but the mxfp8_gemv kernels are missing"
+        );
+        let h = self.hidden_size;
+        let q_dim = self.num_q_heads * self.head_dim;
+        let inter = self.intermediate_size;
+        let stream = gpu.default_stream();
+        let quantize = |w: &DenseWeight, n: usize, k: usize| -> Result<super::Mxfp8Weight> {
+            let data = gpu.alloc(n * k)?;
+            let scales = gpu.alloc(n * k / ops::MXFP8_BLOCK)?;
+            ops::mxfp8_quantize(gpu, quant, w.weight, data, scales, n, k, stream)?;
+            Ok(super::Mxfp8Weight { data, scales })
+        };
+        for layer in &mut self.layers {
+            layer.q_proj_mx = Some(quantize(&layer.q_proj, q_dim, h)?);
+            layer.o_proj_mx = Some(quantize(&layer.o_proj, h, q_dim)?);
+            layer.gate_proj_mx = Some(quantize(&layer.gate_proj, inter, h)?);
+            layer.up_proj_mx = Some(quantize(&layer.up_proj, inter, h)?);
+            layer.down_proj_mx = Some(quantize(&layer.down_proj, h, inter)?);
+        }
+        gpu.synchronize(stream)?;
+        tracing::info!("DFlash MXFP8: {} layers x 5 projections", self.layers.len());
+        Ok(())
+    }
+
     pub(super) fn drafter_gemm(
         &self,
         gpu: &dyn GpuBackend,
         w_bf16: &DenseWeight,
         w_fp8: &Option<Fp8DenseWeight>,
         w_nvfp4: &Option<QuantizedWeight>,
+        w_mx: Option<&super::Mxfp8Weight>,
         src: DevicePtr,
         dst: DevicePtr,
         n_out: u32,
@@ -156,15 +188,7 @@ impl BlockDiffusionDraftHead {
                 stream,
             );
         }
-        self.kernels.linear(
-            gpu,
-            src,
-            w_bf16,
-            dst,
-            g,
-            n_out,
-            k_in,
-            stream,
-        )
+        self.kernels
+            .project(gpu, src, w_bf16, w_mx, dst, g, n_out, k_in, stream)
     }
 }

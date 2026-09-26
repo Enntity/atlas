@@ -450,10 +450,11 @@ impl BlockDiffusionDraftHead {
                 gpu, head, layer_idx, ConvSite::Attention, 0, self.batch_norm, attn_deltas, rows,
                 stream,
             )?;
-            let lin = |x, w: &DenseWeight, y, n_out, k_in| {
-                self.kernels.linear(gpu, x, w, y, rows, n_out, k_in, stream)
+            let lin = |x, w: &DenseWeight, mx: Option<&super::Mxfp8Weight>, y, n_out, k_in| {
+                self.kernels
+                    .project(gpu, x, w, mx, y, rows, n_out, k_in, stream)
             };
-            lin(self.batch_norm, &layer.q_proj, self.batch_q, q_dim, h)?;
+            lin(self.batch_norm, &layer.q_proj, layer.q_proj_mx.as_ref(), self.batch_q, q_dim, h)?;
             ops::rms_norm(
                 gpu,
                 self.kernels.rms_norm,
@@ -465,7 +466,7 @@ impl BlockDiffusionDraftHead {
                 self.rms_norm_eps,
                 stream,
             )?;
-            lin(self.batch_norm, &layer.k_proj, self.batch_k, kv_dim, h)?;
+            lin(self.batch_norm, &layer.k_proj, None, self.batch_k, kv_dim, h)?;
             ops::rms_norm(
                 gpu,
                 self.kernels.rms_norm,
@@ -477,7 +478,7 @@ impl BlockDiffusionDraftHead {
                 self.rms_norm_eps,
                 stream,
             )?;
-            lin(self.batch_norm, &layer.v_proj, self.batch_v, kv_dim, h)?;
+            lin(self.batch_norm, &layer.v_proj, None, self.batch_v, kv_dim, h)?;
             ops::rope_yarn(
                 gpu,
                 self.kernels.rope_qwen3,
@@ -540,7 +541,7 @@ impl BlockDiffusionDraftHead {
                     stream,
                 )?;
             }
-            lin(self.batch_attn_out, &layer.o_proj, self.batch_attn_proj, h, q_dim)?;
+            lin(self.batch_attn_out, &layer.o_proj, layer.o_proj_mx.as_ref(), self.batch_attn_proj, h, q_dim)?;
             self.dflash2_batch_conv(
                 gpu, head, layer_idx, ConvSite::Attention, 1, self.batch_attn_proj, attn_deltas,
                 rows, stream,
@@ -567,8 +568,8 @@ impl BlockDiffusionDraftHead {
             self.dflash2_batch_conv(
                 gpu, head, layer_idx, ConvSite::Mlp, 0, self.batch_norm, mlp_deltas, rows, stream,
             )?;
-            lin(self.batch_norm, &layer.gate_proj, self.batch_mlp_gate, inter, h)?;
-            lin(self.batch_norm, &layer.up_proj, self.batch_mlp_up, inter, h)?;
+            lin(self.batch_norm, &layer.gate_proj, layer.gate_proj_mx.as_ref(), self.batch_mlp_gate, inter, h)?;
+            lin(self.batch_norm, &layer.up_proj, layer.up_proj_mx.as_ref(), self.batch_mlp_up, inter, h)?;
             ops::silu_mul(
                 gpu,
                 self.kernels.silu_mul,
@@ -578,7 +579,7 @@ impl BlockDiffusionDraftHead {
                 rows * inter,
                 stream,
             )?;
-            lin(self.batch_mlp_gate, &layer.down_proj, self.batch_mlp_down, h, inter)?;
+            lin(self.batch_mlp_gate, &layer.down_proj, layer.down_proj_mx.as_ref(), self.batch_mlp_down, h, inter)?;
             self.dflash2_batch_conv(
                 gpu, head, layer_idx, ConvSite::Mlp, 1, self.batch_mlp_down, mlp_deltas, rows,
                 stream,

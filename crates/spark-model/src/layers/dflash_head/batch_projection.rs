@@ -65,6 +65,7 @@ impl BlockDiffusionDraftHead {
                 weight,
                 weight_fp8,
                 weight_nvfp4,
+                None,
                 src.offset(sequence * src_row_bytes),
                 dst.offset(sequence * dst_row_bytes),
                 n_out,

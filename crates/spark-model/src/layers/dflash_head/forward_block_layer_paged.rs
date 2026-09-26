@@ -219,12 +219,13 @@ impl BlockDiffusionDraftHead {
         let gemm_swap = |w_bf16: &crate::weight_map::DenseWeight,
                          w_fp8: &Option<crate::weight_map::Fp8DenseWeight>,
                          w_nvfp4: &Option<crate::weight_map::QuantizedWeight>,
+                         w_mx: Option<&super::Mxfp8Weight>,
                          src: spark_runtime::gpu::DevicePtr,
                          dst: spark_runtime::gpu::DevicePtr,
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
-            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, src, dst, n_out, k_in, stream)
+            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, w_mx, src, dst, n_out, k_in, stream)
         };
 
         // 3b-q / 3c-q. Q branch: q_proj then q_norm — faithful to dflash.py:68-70.
@@ -235,6 +236,7 @@ impl BlockDiffusionDraftHead {
             &layer.q_proj,
             &layer.q_proj_fp8,
             &layer.q_proj_nvfp4,
+            layer.q_proj_mx.as_ref(),
             scratch.norm_buf,
             scratch.q_buf,
             q_dim,
@@ -285,6 +287,7 @@ impl BlockDiffusionDraftHead {
             &layer.k_proj,
             &layer.k_proj_fp8,
             &layer.k_proj_nvfp4,
+            None,
             scratch.norm_buf,
             scratch.k_buf,
             kv_dim,
@@ -331,6 +334,7 @@ impl BlockDiffusionDraftHead {
             &layer.v_proj,
             &layer.v_proj_fp8,
             &layer.v_proj_nvfp4,
+            None,
             scratch.norm_buf,
             scratch.v_buf,
             kv_dim,
@@ -827,12 +831,13 @@ impl BlockDiffusionDraftHead {
         let gemm_swap = |w_bf16: &crate::weight_map::DenseWeight,
                          w_fp8: &Option<crate::weight_map::Fp8DenseWeight>,
                          w_nvfp4: &Option<crate::weight_map::QuantizedWeight>,
+                         w_mx: Option<&super::Mxfp8Weight>,
                          src: spark_runtime::gpu::DevicePtr,
                          dst: spark_runtime::gpu::DevicePtr,
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
-            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, src, dst, n_out, k_in, stream)
+            self.drafter_gemm(gpu, w_bf16, w_fp8, w_nvfp4, w_mx, src, dst, n_out, k_in, stream)
         };
 
         // 3g. o_proj — γ rows, [q_dim → h].
@@ -845,6 +850,7 @@ impl BlockDiffusionDraftHead {
             &layer.o_proj,
             &layer.o_proj_fp8,
             &layer.o_proj_nvfp4,
+            layer.o_proj_mx.as_ref(),
             scratch.attn_out,
             scratch.stream_acc,
             h,
@@ -911,6 +917,7 @@ impl BlockDiffusionDraftHead {
             &layer.gate_proj,
             &layer.gate_proj_fp8,
             &layer.gate_proj_nvfp4,
+            layer.gate_proj_mx.as_ref(),
             scratch.norm_buf,
             scratch.mlp_intermediate,
             inter,
@@ -920,6 +927,7 @@ impl BlockDiffusionDraftHead {
             &layer.up_proj,
             &layer.up_proj_fp8,
             &layer.up_proj_nvfp4,
+            layer.up_proj_mx.as_ref(),
             scratch.norm_buf,
             scratch.mlp_up,
             inter,
@@ -938,6 +946,7 @@ impl BlockDiffusionDraftHead {
             &layer.down_proj,
             &layer.down_proj_fp8,
             &layer.down_proj_nvfp4,
+            layer.down_proj_mx.as_ref(),
             scratch.mlp_intermediate,
             scratch.stream_acc,
             h,
