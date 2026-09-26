@@ -2273,6 +2273,161 @@ extern "C" __global__ void __launch_bounds__(256) moe_w4a4_grouped_gemm_prequant
     }
 }
 
+// K-major-weight variant (checkpoint-native [N, K/2] + [N, K/16] scales):
+// the same MMA sequence with no on-chip transpose. Benchmark-only probe of
+// what the N-major prefill layout costs.
+extern "C" __global__ void __launch_bounds__(256) moe_w4a4_grouped_gemm_prequant_nk_k128(
+    const unsigned char* __restrict__ A_packed,
+    const unsigned char* __restrict__ A_scale,
+    const unsigned long long* __restrict__ B_packed_ptrs,
+    const unsigned long long* __restrict__ B_scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int expert_id = blockIdx.z;
+    if (expert_id >= num_experts) return;
+    const int m_start = expert_offsets[expert_id];
+    const int M_expert = expert_offsets[expert_id + 1] - m_start;
+    if (M_expert <= 0) return;
+    const int cta_m_local = blockIdx.y * M_TILE;
+    if (cta_m_local >= M_expert) return;
+    const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[expert_id];
+    const unsigned char* S_expert = (const unsigned char*)B_scale_ptrs[expert_id];
+    if (B_expert == 0) return;
+    const float scale2 = scale2_vals[expert_id];
+    const unsigned int cta_m = m_start + cta_m_local;
+    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
+
+    const unsigned int t = threadIdx.x;
+    const unsigned int warp_id = t / 32, lane_id = t % 32;
+    const unsigned int warp_m_offset = (warp_id & 3) * 16;
+    const unsigned int warp_n_offset = (warp_id >> 2) * 64;
+    const unsigned int group_id = lane_id >> 2, tid = lane_id & 3;
+
+    __shared__ __align__(16) unsigned char sA[2][M_TILE][PQ2_AP];
+    __shared__ __align__(16) unsigned char sAs[2][M_TILE][PQ2_KS / GROUP_SIZE];
+    __shared__ __align__(16) unsigned char sBt[2][N_TILE_LG][PQ2_BP];
+    __shared__ __align__(16) unsigned char sSt[2][N_TILE_LG][PQ2_KS / GROUP_SIZE];
+    __shared__ int sTok[M_TILE];
+
+    if (t < M_TILE) {
+        const bool live = (cta_m_local + (int)t) < M_expert;
+        sTok[t] = (sorted_token_ids && live) ? sorted_token_ids[cta_m + t] : (int)(cta_m + t);
+    }
+    __syncthreads();
+
+    const unsigned int M_eff = (unsigned int)M_expert;
+    auto issue = [&](int buf, unsigned int kb) {
+        // A: 64 rows x 64 bytes = 256 x 16 B (two per thread).
+        {
+            const unsigned int j = t;
+            const unsigned int row = j >> 2, col = (j & 3) << 4;
+            const bool valid = (cta_m_local + row) < M_eff;
+            const unsigned int a_row = (unsigned int)sTok[row];
+            moe_cp_async_pred_16(&sA[buf][row][col],
+                &A_packed[(unsigned long long)a_row * (K / 2) + kb / 2 + col], valid);
+        }
+        // A scales: 64 rows x 8 bytes.
+        if (t < M_TILE) {
+            const bool valid = (cta_m_local + t) < M_eff;
+            const unsigned int a_row = (unsigned int)sTok[t];
+            moe_cp_async_pred_8(&sAs[buf][t][0],
+                &A_scale[(unsigned long long)a_row * (K / GROUP_SIZE) + kb / GROUP_SIZE], valid);
+        }
+        // B (K-major [N, K/2]): 128 rows x 64 bytes = 512 x 16 B, straight
+        // into the MMA-ready layout.
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const unsigned int j = t + r * 256;
+            const unsigned int n = j >> 2, col = (j & 3) << 4;
+            moe_cp_async_pred_16(&sBt[buf][n][col],
+                &B_expert[(unsigned long long)(cta_n + n) * (K / 2) + kb / 2 + col], true);
+        }
+        // B scales ([N, K/16]): 8 contiguous bytes per column.
+        if (t < N_TILE_LG) {
+            moe_cp_async_pred_8(&sSt[buf][t][0],
+                &S_expert[(unsigned long long)(cta_n + t) * (K / GROUP_SIZE) + kb / GROUP_SIZE], true);
+        }
+    };
+
+    float acc[8][4];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+
+    const unsigned int stages = K / PQ2_KS;
+    issue(0, 0);
+    moe_cp_async_commit();
+    for (unsigned int st = 0; st < stages; ++st) {
+        const int buf = st & 1;
+        moe_cp_async_wait_all();
+        __syncthreads();   // stage `st` landed; every warp finished stage st-1
+        if (st + 1 < stages) {
+            issue(buf ^ 1, (st + 1) * PQ2_KS);
+            moe_cp_async_commit();
+        }
+        #pragma unroll
+        for (int sl = 0; sl < 2; ++sl) {
+            const unsigned int ko = sl * 32;   // packed-byte offset of this k64 slice
+            // A fragment via one ldmatrix.x4: matrices (rows 0-7 | 8-15) x
+            // (bytes 0-15 | 16-31) give exactly a0..a3 of the m16n8k64 layout.
+            unsigned int a0, a1, a2, a3;
+            {
+                const unsigned int j = lane_id >> 3, r = lane_id & 7;
+                const unsigned int addr = __cvta_generic_to_shared(
+                    &sA[buf][warp_m_offset + r + (j & 1) * 8][ko + (j >> 1) * 16]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                             : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr));
+            }
+            const unsigned int sfa_m = (lane_id & 1) * 8 + (lane_id >> 2);
+            const unsigned int sfa = *(const unsigned int*)&sAs[buf][warp_m_offset + sfa_m][sl * 4];
+            #pragma unroll
+            for (int np = 0; np < 4; np++) {
+                // B fragments of n-subtiles 2np and 2np+1 via one ldmatrix.x4.
+                unsigned int b[4];
+                {
+                    const unsigned int j = lane_id >> 3, r = lane_id & 7;
+                    const unsigned int addr = __cvta_generic_to_shared(
+                        &sBt[buf][warp_n_offset + np * 16 + (j >> 1) * 8 + r][ko + (j & 1) * 16]);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                                 : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(addr));
+                }
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int nt = np * 2 + h;
+                    const unsigned int b0 = b[h * 2], b1 = b[h * 2 + 1];
+                    const unsigned int sfb = *(const unsigned int*)&sSt[buf][warp_n_offset + nt * 8 + (lane_id >> 2)][sl * 4];
+                    unsigned short bidA = 0, tidA_ = 0, bidB = 0, tidB_ = 0;
+                    asm volatile(
+                        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"
+                        "{%14},{%15,%16},{%17},{%18,%19};"
+                        :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3])
+                        :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),
+                         "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3]),
+                         "r"(sfa),"h"(bidA),"h"(tidA_),"r"(sfb),"h"(bidB),"h"(tidB_));
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+        const unsigned int c0 = cta_n + warp_n_offset + nt * 8 + tid * 2, c1 = c0 + 1;
+        const unsigned int r0 = cta_m + warp_m_offset + group_id, r1 = r0 + 8;
+        const bool r0v = (int)(warp_m_offset + group_id + cta_m_local) < M_expert;
+        const bool r1v = (int)(warp_m_offset + group_id + 8 + cta_m_local) < M_expert;
+        if (r0v && c0 < N) C[r0 * N + c0] = __float2bfloat16(acc[nt][0] * scale2);
+        if (r0v && c1 < N) C[r0 * N + c1] = __float2bfloat16(acc[nt][1] * scale2);
+        if (r1v && c0 < N) C[r1 * N + c0] = __float2bfloat16(acc[nt][2] * scale2);
+        if (r1v && c1 < N) C[r1 * N + c1] = __float2bfloat16(acc[nt][3] * scale2);
+    }
+}
+
 // Projection-multiplexed compact gate/up dispatch.  The y grid selects the
 // pointer table and destination while x retains the proven compact work item.
 // This removes one host submission per MoE layer without changing the native

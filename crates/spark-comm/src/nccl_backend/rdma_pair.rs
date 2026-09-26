@@ -100,17 +100,16 @@ impl RdmaPair {
         std::env::var("ATLAS_RDMA_ALLREDUCE").as_deref() == Ok("1")
     }
 
-    /// Bring up one RC QP per rail (`ATLAS_RDMA_RAILS`, default both 200G
-    /// ports) against the peer, exchanging identities over TCP on `port`
+    /// Bring up one RC QP per rail (`ATLAS_RDMA_RAILS`, else the NCCL HCA
+    /// list) against the peer, exchanging identities over TCP on `port`
     /// (rank 0 listens). `capacity` is the largest payload in bytes.
     pub(super) fn connect(rank: usize, master_addr: &str, port: u16, capacity: usize) -> Result<Self> {
         ensure!(capacity % 64 == 0 && capacity > 0, "RDMA pair capacity must be 64-byte aligned");
-        let rails: Vec<String> = std::env::var("ATLAS_RDMA_RAILS")
-            .unwrap_or_else(|_| "rocep1s0f0,roceP2p1s0f0".into())
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
+        let rails = rail_names(
+            std::env::var("ATLAS_RDMA_RAILS").ok(),
+            std::env::var("NCCL_IB_HCA").ok(),
+        );
+        ensure!(!rails.is_empty(), "RDMA pair: no rails (set ATLAS_RDMA_RAILS or NCCL_IB_HCA)");
         let gid_idx: u32 = std::env::var("ATLAS_RDMA_GID")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -250,6 +249,18 @@ struct Peer {
     rkeys: Vec<u32>,
 }
 
+/// Rail device names: `ATLAS_RDMA_RAILS`, else `NCCL_IB_HCA` without NCCL's
+/// `^`/`=` match prefixes and `:port` suffixes, else the first GB10 port.
+fn rail_names(rails: Option<String>, nccl: Option<String>) -> Vec<String> {
+    let list = rails.or(nccl).unwrap_or_else(|| "rocep1s0f0".into());
+    list.trim_start_matches(['^', '='])
+        .split(',')
+        .filter_map(|s| s.split(':').next())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn exchange_stream(rank: usize, master_addr: &str, port: u16) -> Result<TcpStream> {
     let stream = if rank == 0 {
         let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
@@ -384,6 +395,14 @@ fn proxy_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rails_prefer_explicit_then_nccl_list() {
+        let own = |v: &str| Some(v.to_owned());
+        assert_eq!(rail_names(own("a,b"), own("c")), ["a", "b"]);
+        assert_eq!(rail_names(None, own("=c:1,d:1")), ["c", "d"]);
+        assert_eq!(rail_names(None, None), ["rocep1s0f0"]);
+    }
 
     #[test]
     fn region_layout_is_disjoint_and_aligned() {

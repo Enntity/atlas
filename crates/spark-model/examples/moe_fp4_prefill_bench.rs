@@ -22,12 +22,17 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 const MODULE: &str = "moe_w4a16";
 const REFERENCE: &str = "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale";
-/// (kernel, CTA N tile, threads per CTA).
-const CANDIDATES: &[(&str, u32, u32)] = &[
-    ("moe_w4a4_grouped_gemm_prequant_t_k128", 128, 256),
+/// (kernel, CTA N tile, threads per CTA, reads K-major `[N, K/2]` weights).
+const CANDIDATES: &[(&str, u32, u32, bool)] = &[
+    ("moe_w4a4_grouped_gemm_prequant_t_k128", 128, 256, false),
+    ("moe_w4a4_grouped_gemm_prequant_nk_k128", 128, 256, true),
 ];
 const EXPERTS: usize = 144;
-const ROWS: usize = 16384;
+/// Routed rows on one EP2 rank: 16384 at a 4K chunk (top-8 over two ranks);
+/// `MOE_BENCH_ROWS` overrides (32768 = an 8K chunk).
+fn rows_total() -> usize {
+    std::env::var("MOE_BENCH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16384)
+}
 
 struct Lcg(u64);
 impl Lcg {
@@ -46,12 +51,12 @@ fn up(g: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
     Ok(p)
 }
 
-/// Expert row counts: a Zipf-like skew (hottest ~3K rows), summing to ROWS.
+/// Expert row counts: a Zipf-like skew (hottest ~3K rows), summing to rows_total().
 fn expert_rows() -> Vec<usize> {
     let weights: Vec<f64> = (0..EXPERTS).map(|e| 1.0 / (1.0 + e as f64).powf(0.9)).collect();
     let total: f64 = weights.iter().sum();
-    let mut rows: Vec<usize> = weights.iter().map(|w| (w / total * ROWS as f64) as usize).collect();
-    let short = ROWS - rows.iter().sum::<usize>();
+    let mut rows: Vec<usize> = weights.iter().map(|w| (w / total * rows_total() as f64) as usize).collect();
+    let short = rows_total() - rows.iter().sum::<usize>();
     rows[EXPERTS - 1] += short;
     rows
 }
@@ -93,25 +98,43 @@ fn main() -> Result<()> {
     for (name, n, k) in [("gate [2048 x 4096]", 2048u32, 4096u32), ("down [4096 x 2048]", 4096, 2048)] {
         let (nu, ku) = (n as usize, k as usize);
         // A: packed E2M1 rows + UE4M3 group scales in a sane exponent range.
-        let a: Vec<u8> = (0..ROWS * ku / 2).map(|_| rng.next() as u8).collect();
-        let a_s: Vec<u8> = (0..ROWS * ku / 16).map(|_| 0x30 + (rng.next() % 16) as u8).collect();
+        let a: Vec<u8> = (0..rows_total() * ku / 2).map(|_| rng.next() as u8).collect();
+        let a_s: Vec<u8> = (0..rows_total() * ku / 16).map(|_| 0x30 + (rng.next() % 16) as u8).collect();
         let (d_a, d_as) = (up(g, &a)?, up(g, &a_s)?);
-        let mut packed_ptrs = Vec::new();
-        let mut scale_ptrs = Vec::new();
+        let (mut packed_ptrs, mut scale_ptrs) = (Vec::new(), Vec::new());
+        let (mut packed_nk, mut scale_nk) = (Vec::new(), Vec::new());
         let mut owned = Vec::new();
         for _ in 0..EXPERTS {
+            // Atlas transposed [K/2, N] + [K/16, N], and the same bytes
+            // K-major [N, K/2] + [N, K/16] (each byte keeps its k-pair).
             let w: Vec<u8> = (0..nu * ku / 2).map(|_| rng.next() as u8).collect();
             let s: Vec<u8> = (0..nu * ku / 16).map(|_| 0x30 + (rng.next() % 16) as u8).collect();
-            let (dw, ds) = (up(g, &w)?, up(g, &s)?);
+            let mut w_nk = vec![0u8; w.len()];
+            for kp in 0..ku / 2 {
+                for n in 0..nu {
+                    w_nk[n * (ku / 2) + kp] = w[kp * nu + n];
+                }
+            }
+            let mut s_nk = vec![0u8; s.len()];
+            for gi in 0..ku / 16 {
+                for n in 0..nu {
+                    s_nk[n * (ku / 16) + gi] = s[gi * nu + n];
+                }
+            }
+            let (dw, ds, dwk, dsk) = (up(g, &w)?, up(g, &s)?, up(g, &w_nk)?, up(g, &s_nk)?);
             packed_ptrs.extend_from_slice(&dw.0.to_le_bytes());
             scale_ptrs.extend_from_slice(&ds.0.to_le_bytes());
-            owned.push((dw, ds));
+            packed_nk.extend_from_slice(&dwk.0.to_le_bytes());
+            scale_nk.extend_from_slice(&dsk.0.to_le_bytes());
+            owned.extend([dw, ds, dwk, dsk]);
         }
         let scale2: Vec<u8> = (0..EXPERTS).flat_map(|_| 1.0f32.to_le_bytes()).collect();
         let (d_pp, d_sp, d_s2) = (up(g, &packed_ptrs)?, up(g, &scale_ptrs)?, up(g, &scale2)?);
-        let (c_ref, c_new) = (g.alloc(ROWS * nu * 2)?, g.alloc(ROWS * nu * 2)?);
+        let (d_ppk, d_spk) = (up(g, &packed_nk)?, up(g, &scale_nk)?);
+        let (c_ref, c_new) = (g.alloc(rows_total() * nu * 2)?, g.alloc(rows_total() * nu * 2)?);
         let args = |c| [d_a, d_as, d_pp, d_sp, d_s2, c, d_off, DevicePtr(0)];
-        let flop = 2.0 * ROWS as f64 * n as f64 * k as f64;
+        let args_nk = |c| [d_a, d_as, d_ppk, d_spk, d_s2, c, d_off, DevicePtr(0)];
+        let flop = 2.0 * rows_total() as f64 * n as f64 * k as f64;
         let time = |f: &dyn Fn() -> Result<()>| -> Result<f64> {
             f()?;
             g.synchronize(0)?;
@@ -129,17 +152,18 @@ fn main() -> Result<()> {
             t_ref * 1e6,
             flop / t_ref / 1e12
         );
-        let mut want = vec![0u8; ROWS * nu * 2];
+        let mut want = vec![0u8; rows_total() * nu * 2];
         g.copy_d2h(c_ref, &mut want)?;
-        for &(kname, n_tile, threads) in CANDIDATES {
+        for &(kname, n_tile, threads, k_major) in CANDIDATES {
             let Ok(kernel) = g.kernel(MODULE, kname) else {
                 println!("  {kname}: absent");
                 continue;
             };
-            g.memset(c_new, 0, ROWS * nu * 2)?;
-            let run = || launch(g, kernel, n_tile, threads, &args(c_new), n, k, max_m_tiles);
+            g.memset(c_new, 0, rows_total() * nu * 2)?;
+            let a = if k_major { args_nk(c_new) } else { args(c_new) };
+            let run = || launch(g, kernel, n_tile, threads, &a, n, k, max_m_tiles);
             let t = time(&run)?;
-            let mut got = vec![0u8; ROWS * nu * 2];
+            let mut got = vec![0u8; rows_total() * nu * 2];
             g.copy_d2h(c_new, &mut got)?;
             let diff = want.chunks_exact(2).zip(got.chunks_exact(2)).filter(|(a, b)| a != b).count();
             fail |= diff != 0;
@@ -150,11 +174,10 @@ fn main() -> Result<()> {
                 if diff == 0 { "bitwise".to_string() } else { format!("MISMATCH {diff} values") }
             );
         }
-        for (w, s) in owned {
-            g.free(w)?;
-            g.free(s)?;
+        for p in owned {
+            g.free(p)?;
         }
-        for p in [d_a, d_as, d_pp, d_sp, d_s2, c_ref, c_new] {
+        for p in [d_a, d_as, d_pp, d_sp, d_s2, d_ppk, d_spk, c_ref, c_new] {
             g.free(p)?;
         }
     }
