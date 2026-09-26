@@ -118,59 +118,6 @@ impl BlockDiffusionDraftHead {
             .ok_or_else(|| anyhow::anyhow!("DFlash proposer state has no generation owner"))?;
         lifecycle.advance(owner, position, self.gamma, lifecycle.row_stride_bytes())?;
 
-        // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator at propose entry ──
-        // Gated ATLAS_DFLASH_CTX_PARITY_DUMP=1. One-shot. Writes the ENTIRE
-        // accumulated 5×target_hidden context the drafter conditions on, so a
-        // PyTorch/vLLM reference can diff slot-count + values against
-        // `target_hidden_states[:num_context]` (vLLM feeds num_context = ALL
-        // accepted-prefix tokens; this proves whether Atlas's accumulator has
-        // the same BREADTH and the same per-slot 5-layer values).
-        //
-        // Layout of /tmp/atlas_ctx_parity.bin: contiguous BF16,
-        // ctx_len slots × target_layer_ids.len() layers × target_hidden_size,
-        // i.e. ctx_len × ctx_slot_bytes bytes. Companion JSON carries
-        // ctx_len, n_layers, target_hidden_size, position, last_token so the
-        // harness reconstructs shape without log-scraping.
-        {
-            // Per-model latch (see `ModelStats::dumped`) rather than a static: an
-            // operator who sets the flag and then swaps models must still get the
-            // dump, instead of it being swallowed by the previous model's shot.
-            if self.startup.diagnostics.ctx_parity_dump
-                && dstate.ctx_len > 0
-                && ctx.stats.dumped.keyed("dflash_ctx_parity")
-            {
-                let n_bytes = dstate.ctx_len * dstate.ctx_slot_bytes;
-                let mut buf = vec![0u8; n_bytes];
-                ctx.gpu.synchronize(_stream)?;
-                ctx.gpu.copy_d2h(dstate.ctx_hidden_acc, &mut buf)?;
-                match std::fs::write("/tmp/atlas_ctx_parity.bin", &buf) {
-                    Ok(()) => {
-                        let elems_per_slot = dstate.ctx_slot_bytes / 2;
-                        let meta = format!(
-                            "{{\"ctx_len\":{},\"ctx_slot_bytes\":{},\"elems_per_slot\":{},\"position\":{},\"last_token\":{},\"n_bytes\":{}}}",
-                            dstate.ctx_len,
-                            dstate.ctx_slot_bytes,
-                            elems_per_slot,
-                            position,
-                            last_token,
-                            n_bytes,
-                        );
-                        let _ = std::fs::write("/tmp/atlas_ctx_parity.json", meta);
-                        tracing::info!(
-                            "DFLASH CTX_PARITY: wrote {} bytes — ctx_len={} slots × {} BF16 elems/slot (position={}, last_token={}) to /tmp/atlas_ctx_parity.bin",
-                            n_bytes,
-                            dstate.ctx_len,
-                            dstate.ctx_slot_bytes / 2,
-                            position,
-                            last_token,
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("DFLASH CTX_PARITY: write failed: {e}");
-                    }
-                }
-            }
-        }
 
         // ── Phase 2.5b kernel-chain scaffold (commented for next-session
         // fill-in; current path falls through to empty-Vec stub below) ──
@@ -352,6 +299,62 @@ impl BlockDiffusionDraftHead {
             debug_assert_eq!(dstate.ctx_positions.len(), dstate.ctx_len);
             dstate.ctx_positions.push(position.saturating_sub(1) as i32);
             dstate.ctx_len += 1;
+        }
+
+        // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator after the decode append (what the block forward attends) ──
+        // Gated ATLAS_DFLASH_CTX_PARITY_DUMP=1. One-shot. Writes the ENTIRE
+        // accumulated 5×target_hidden context the drafter conditions on, so a
+        // PyTorch/vLLM reference can diff slot-count + values against
+        // `target_hidden_states[:num_context]` (vLLM feeds num_context = ALL
+        // accepted-prefix tokens; this proves whether Atlas's accumulator has
+        // the same BREADTH and the same per-slot 5-layer values).
+        //
+        // Layout of /tmp/atlas_ctx_parity.bin: contiguous BF16,
+        // ctx_len slots × target_layer_ids.len() layers × target_hidden_size,
+        // i.e. ctx_len × ctx_slot_bytes bytes. Companion JSON carries
+        // ctx_len, n_layers, target_hidden_size, position, last_token so the
+        // harness reconstructs shape without log-scraping.
+        {
+            // Per-model latch (see `ModelStats::dumped`) rather than a static: an
+            // operator who sets the flag and then swaps models must still get the
+            // dump, instead of it being swallowed by the previous model's shot.
+            if self.startup.diagnostics.ctx_parity_dump
+                && dstate.ctx_len > 0
+                && position >= self.startup.diagnostics.block_dump_at_pos
+                && ctx.stats.dumped.keyed("dflash_ctx_parity")
+            {
+                let n_bytes = dstate.ctx_len * dstate.ctx_slot_bytes;
+                let mut buf = vec![0u8; n_bytes];
+                ctx.gpu.synchronize(_stream)?;
+                ctx.gpu.copy_d2h(dstate.ctx_hidden_acc, &mut buf)?;
+                match std::fs::write("/tmp/atlas_ctx_parity.bin", &buf) {
+                    Ok(()) => {
+                        let elems_per_slot = dstate.ctx_slot_bytes / 2;
+                        let meta = format!(
+                            "{{\"ctx_len\":{},\"ctx_slot_bytes\":{},\"elems_per_slot\":{},\"position\":{},\"last_token\":{},\"n_bytes\":{},\"positions\":{:?}}}",
+                            dstate.ctx_len,
+                            dstate.ctx_slot_bytes,
+                            elems_per_slot,
+                            position,
+                            last_token,
+                            n_bytes,
+                            dstate.ctx_positions,
+                        );
+                        let _ = std::fs::write("/tmp/atlas_ctx_parity.json", meta);
+                        tracing::info!(
+                            "DFLASH CTX_PARITY: wrote {} bytes — ctx_len={} slots × {} BF16 elems/slot (position={}, last_token={}) to /tmp/atlas_ctx_parity.bin",
+                            n_bytes,
+                            dstate.ctx_len,
+                            dstate.ctx_slot_bytes / 2,
+                            position,
+                            last_token,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("DFLASH CTX_PARITY: write failed: {e}");
+                    }
+                }
+            }
         }
 
         // ── Phase 2 Option B: lazy block_table allocation ─────────────
