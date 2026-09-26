@@ -1750,4 +1750,153 @@ w4a16_gemv_tc8(
         if (n < N && m < M) C[(unsigned long long)m * N + n] = __float2bfloat16(v * scale2);
     }
 }
+
+// ── Wider tensor-core tiers (9..32 rows): owner-batched verify blocks ──
+// Same mapping as w4a16_gemv_tc8 with NT 8-row activation tiles sharing each
+// dequantized weight fragment, so the weight is read once for up to NT*8 rows.
+// Lanes cover 16 K values (one scale group) per 64-wide chunk to keep the
+// NT activation tiles and the one-chunk prefetch in registers.
+template <int NT>
+struct W4a16TcnChunk {
+    uint2 w0, w1;          // 16 E2M1 values of rows g and g+8
+    uint4 x[NT][2];        // 16 BF16 activations of row 8t+g per tile t
+    unsigned int s0, s1;   // group-scale bytes of rows g, g+8
+};
+
+template <int NT>
+__device__ __forceinline__ void w4a16_tcn_load(
+    W4a16TcnChunk<NT>& t, const unsigned char* w0p, const unsigned char* w1p,
+    const unsigned char* s0p, const unsigned char* s1p, const __nv_bfloat16* A,
+    unsigned int g, unsigned int M, unsigned int K, unsigned int kb, bool v0, bool v1
+) {
+    const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+    t.w0 = make_uint2(0u, 0u); t.w1 = t.w0; t.s0 = 0u; t.s1 = 0u;
+    #pragma unroll
+    for (int i = 0; i < NT; i++) { t.x[i][0] = z; t.x[i][1] = z; }
+    if (kb >= K) return;
+    if (v0) { t.w0 = *(const uint2*)(w0p + kb / 2u); t.s0 = s0p[kb / GROUP_SIZE]; }
+    if (v1) { t.w1 = *(const uint2*)(w1p + kb / 2u); t.s1 = s1p[kb / GROUP_SIZE]; }
+    #pragma unroll
+    for (int i = 0; i < NT; i++) {
+        const unsigned int row = 8u * i + g;
+        if (row < M) {
+            const uint4* xp = (const uint4*)(A + (unsigned long long)row * K + kb);
+            t.x[i][0] = xp[0];
+            t.x[i][1] = xp[1];
+        }
+    }
+}
+
+template <int NT>
+__device__ __forceinline__ void w4a16_gemv_tcn_impl(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    __shared__ unsigned int s_pair[256];
+    __shared__ float s_red[W4A16_TC_WARPS][WARP_SIZE][NT * 4];
+    for (unsigned int i = threadIdx.x; i < 256; i += blockDim.x) {
+        const __nv_bfloat162 v = __floats2bfloat162_rn(E2M1_LUT[i & 0xF], E2M1_LUT[i >> 4]);
+        s_pair[i] = *reinterpret_cast<const unsigned int*>(&v);
+    }
+    __syncthreads();
+
+    const unsigned int warp = threadIdx.x / WARP_SIZE;
+    const unsigned int lane = threadIdx.x % WARP_SIZE;
+    const unsigned int g = lane >> 2, c = lane & 3u;
+    const unsigned int r0 = blockIdx.x * 16u + g, r1 = r0 + 8u;
+    const bool v0 = r0 < N, v1 = r1 < N;
+    const unsigned long long half_K = K / 2u, groups = K / GROUP_SIZE;
+    const unsigned char* w0p = B_packed + (unsigned long long)(v0 ? r0 : 0u) * half_K;
+    const unsigned char* w1p = B_packed + (unsigned long long)(v1 ? r1 : 0u) * half_K;
+    const unsigned char* s0p = B_scale + (unsigned long long)(v0 ? r0 : 0u) * groups;
+    const unsigned char* s1p = B_scale + (unsigned long long)(v1 ? r1 : 0u) * groups;
+
+    float acc[NT][4];
+    #pragma unroll
+    for (int i = 0; i < NT; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+    const unsigned int chunks = (K + 63u) / 64u;
+    W4a16TcnChunk<NT> cur, nxt;
+    unsigned int ch = warp;
+    if (ch < chunks) w4a16_tcn_load<NT>(cur, w0p, w1p, s0p, s1p, A, g, M, K, ch * 64u + 16u * c, v0, v1);
+    for (; ch < chunks; ch += W4A16_TC_WARPS) {
+        const unsigned int next = ch + W4A16_TC_WARPS;
+        if (next < chunks)
+            w4a16_tcn_load<NT>(nxt, w0p, w1p, s0p, s1p, A, g, M, K, next * 64u + 16u * c, v0, v1);
+        const __nv_bfloat162 sc0 = w4a16_tc_scale(cur.s0);
+        const __nv_bfloat162 sc1 = w4a16_tc_scale(cur.s1);
+        const unsigned int wb0[2] = {cur.w0.x, cur.w0.y}, wb1[2] = {cur.w1.x, cur.w1.y};
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const unsigned int word0 = wb0[j >> 1] >> ((j & 1) * 16);
+            const unsigned int word1 = wb1[j >> 1] >> ((j & 1) * 16);
+            unsigned int a[4];
+            __nv_bfloat162 v;
+            v = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&s_pair[word0 & 0xFFu]), sc0);
+            a[0] = *reinterpret_cast<unsigned int*>(&v);
+            v = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&s_pair[word1 & 0xFFu]), sc1);
+            a[1] = *reinterpret_cast<unsigned int*>(&v);
+            v = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&s_pair[(word0 >> 8) & 0xFFu]), sc0);
+            a[2] = *reinterpret_cast<unsigned int*>(&v);
+            v = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&s_pair[(word1 >> 8) & 0xFFu]), sc1);
+            a[3] = *reinterpret_cast<unsigned int*>(&v);
+            #pragma unroll
+            for (int i = 0; i < NT; i++) {
+                // Values 4j..4j+3 of the tile row's 16-value run = words 2j, 2j+1.
+                const uint4 lo = cur.x[i][0], hi = cur.x[i][1];
+                const unsigned int xw[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(acc[i][0]), "+f"(acc[i][1]), "+f"(acc[i][2]), "+f"(acc[i][3])
+                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                      "r"(xw[2 * j]), "r"(xw[2 * j + 1]));
+            }
+        }
+        cur = nxt;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < NT; i++) {
+        #pragma unroll
+        for (int q = 0; q < 4; q++) s_red[warp][lane][i * 4 + q] = acc[i][q];
+    }
+    __syncthreads();
+    if (warp != 0) return;
+    #pragma unroll
+    for (int i = 0; i < NT; i++) {
+        #pragma unroll
+        for (int q = 0; q < 4; q++) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < W4A16_TC_WARPS; w++) v += s_red[w][lane][i * 4 + q];
+            const unsigned int n = (q < 2) ? r0 : r1;
+            const unsigned int m = 8u * i + 2u * c + (q & 1u);
+            if (n < N && m < M) C[(unsigned long long)m * N + n] = __float2bfloat16(v * scale2);
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc16(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K
+) {
+    w4a16_gemv_tcn_impl<2>(A, B_packed, B_scale, scale2, C, M, N, K);
+}
+
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc32(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K
+) {
+    w4a16_gemv_tcn_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K);
+}
 #endif

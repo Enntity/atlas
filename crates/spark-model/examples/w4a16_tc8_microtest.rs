@@ -90,9 +90,11 @@ fn launch(
 fn main() -> Result<()> {
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
-    let (Ok(b8), Ok(tc8)) = (
+    let (Ok(b8), Ok(tc8), Ok(tc16), Ok(tc32)) = (
         g.kernel("w4a16_gemv", "w4a16_gemv_batch8"),
         g.kernel("w4a16_gemv", "w4a16_gemv_tc8"),
+        g.kernel("w4a16_gemv", "w4a16_gemv_tc16"),
+        g.kernel("w4a16_gemv", "w4a16_gemv_tc32"),
     ) else {
         eprintln!("w4a16_gemv_batch8 / w4a16_gemv_tc8 absent from this target");
         std::process::exit(2);
@@ -100,7 +102,7 @@ fn main() -> Result<()> {
     let mut fail = false;
     for (name, n, k) in SHAPES {
         let mut rng = Lcg(0x5EED ^ (n * 31 + k) as u64);
-        let a: Vec<u8> = (0..8 * k)
+        let a: Vec<u8> = (0..32 * k)
             .flat_map(|_| bf16::from_f32(rng.f() * 3.0 - 1.5).to_bits().to_le_bytes())
             .collect();
         let w: Vec<u8> = (0..n * k / 2).map(|_| (rng.f() * 256.0) as u8).collect();
@@ -114,11 +116,35 @@ fn main() -> Result<()> {
         let rot: Vec<(DevicePtr, DevicePtr)> = (0..copies)
             .map(|_| Ok((up(g, &w)?, up(g, &ws)?)))
             .collect::<Result<_>>()?;
-        let (c_ref, c_tc) = (g.alloc(8 * n * 2)?, g.alloc(8 * n * 2)?);
+        let (c_ref, c_tc) = (g.alloc(32 * n * 2)?, g.alloc(32 * n * 2)?);
         let weight_bytes = (n * k / 2 + n * k / GROUP_SIZE) as f64;
-        for m in 1..=8u32 {
-            launch(g, b8, false, ad, wd, wsd, c_ref, m, n as u32, k as u32)?;
-            launch(g, tc8, true, ad, wd, wsd, c_tc, m, n as u32, k as u32)?;
+        // The scalar reference runs in 8-row slices (its row cap).
+        let reference = |w: DevicePtr, s: DevicePtr, m: u32| -> Result<()> {
+            for r in (0..m).step_by(8) {
+                let rows = (m - r).min(8);
+                launch(
+                    g,
+                    b8,
+                    false,
+                    ad.offset(r as usize * k * 2),
+                    w,
+                    s,
+                    c_ref.offset(r as usize * n * 2),
+                    rows,
+                    n as u32,
+                    k as u32,
+                )?;
+            }
+            Ok(())
+        };
+        for m in (1..=8u32).chain([12, 16, 24, 32]) {
+            let tck = match m {
+                1..=8 => tc8,
+                9..=16 => tc16,
+                _ => tc32,
+            };
+            reference(wd, wsd, m)?;
+            launch(g, tck, true, ad, wd, wsd, c_tc, m, n as u32, k as u32)?;
             g.synchronize(0)?;
             let (r, t) = (down(g, c_ref, m as usize * n)?, down(g, c_tc, m as usize * n)?);
             let mut worst = 0f32;
@@ -129,20 +155,21 @@ fn main() -> Result<()> {
             }
             let ok = worst <= 1.0;
             fail |= !ok;
-            let time = |kh, tc| -> Result<f64> {
+            let time = |f: &dyn Fn(DevicePtr, DevicePtr) -> Result<()>| -> Result<f64> {
                 let reps = 4 * copies;
                 g.synchronize(0)?;
                 let t0 = std::time::Instant::now();
                 for i in 0..reps {
                     let (w, s) = rot[i % copies];
-                    launch(g, kh, tc, ad, w, s, c_ref, m, n as u32, k as u32)?;
+                    f(w, s)?;
                 }
                 g.synchronize(0)?;
                 Ok(t0.elapsed().as_secs_f64() / reps as f64)
             };
-            let (t8, ttc) = (time(b8, false)?, time(tc8, true)?);
+            let t8 = time(&|w, s| reference(w, s, m))?;
+            let ttc = time(&|w, s| launch(g, tck, true, ad, w, s, c_tc, m, n as u32, k as u32))?;
             println!(
-                "{name} M={m}: worst/tol {worst:.3} {}  batch8 {:6.1}us {:5.0}GB/s  tc8 {:6.1}us {:5.0}GB/s",
+                "{name} M={m}: worst/tol {worst:.3} {}  batch8 {:6.1}us {:5.0}GB/s  tc {:6.1}us {:5.0}GB/s",
                 if ok { "ok" } else { "FAIL" },
                 t8 * 1e6,
                 weight_bytes / t8 / 1e9,

@@ -104,14 +104,32 @@ pub fn select_tier(
         .map(|(i, _)| i)
 }
 
-/// `ATLAS_W4A16_TC=1`: serve M=2..8 with the tensor-core `w4a16_gemv_tc8`
-/// (DRAM-bound, not bit-identical to the scalar tiers). Resolved once, when a
-/// tier table is first built; [`tc8_kernel`] is how the launch op recognizes it.
-static TC8: std::sync::OnceLock<KernelHandle> = std::sync::OnceLock::new();
+/// `ATLAS_W4A16_TC=1`: serve M=2..=32 with the tensor-core
+/// `w4a16_gemv_tc8/16/32` (DRAM-bound, not bit-identical to the scalar
+/// tiers). Resolved once, when a tier table is first built; [`tc_kernel`] and
+/// [`tc_rows`] are how callers and the launch op pick and recognize them.
+static TC: std::sync::OnceLock<[KernelHandle; 3]> = std::sync::OnceLock::new();
+const TC_ROWS: [u32; 3] = [8, 16, 32];
 
-/// The resolved tensor-core tier, or a zero handle when it is off/absent.
-pub fn tc8_kernel() -> KernelHandle {
-    TC8.get().copied().unwrap_or(KernelHandle(0))
+/// The narrowest resolved tensor-core tier covering `m` rows, or a zero handle.
+pub fn tc_kernel(m: u32) -> KernelHandle {
+    let Some(handles) = TC.get() else {
+        return KernelHandle(0);
+    };
+    TC_ROWS
+        .iter()
+        .zip(handles)
+        .find(|&(&rows, h)| m <= rows && h.0 != 0)
+        .map_or(KernelHandle(0), |(_, &h)| h)
+}
+
+/// Row capacity of `kernel` when it is a tensor-core tier.
+pub fn tc_rows(kernel: KernelHandle) -> Option<u32> {
+    let handles = TC.get()?;
+    (kernel.0 != 0)
+        .then(|| handles.iter().position(|h| h.0 == kernel.0))
+        .flatten()
+        .map(|i| TC_ROWS[i])
 }
 
 /// Resolved handles for the narrow `w4a16_gemv_batch{M}` family.
@@ -146,7 +164,9 @@ impl W4a16BatchmTiers {
             *h = super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_batch{w}"));
         }
         if std::env::var("ATLAS_W4A16_TC").as_deref() == Ok("1") {
-            TC8.get_or_init(|| super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_tc8"));
+            TC.get_or_init(|| {
+                TC_ROWS.map(|rows| super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}")))
+            });
         }
         Self { handles }
     }
@@ -160,8 +180,8 @@ impl W4a16BatchmTiers {
     /// Narrowest resolved tier covering `m` rows, or `KernelHandle(0)` when
     /// this family cannot serve `m`.
     pub fn kernel(&self, m: u32) -> KernelHandle {
-        let tc = tc8_kernel();
-        if tc.0 != 0 && (2..=8).contains(&m) {
+        let tc = tc_kernel(m);
+        if (2..=8).contains(&m) && tc.0 != 0 {
             return tc;
         }
         select_tier(m, self.present(), exact_m_tiers_enabled())

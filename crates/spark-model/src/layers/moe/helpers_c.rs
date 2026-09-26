@@ -302,6 +302,24 @@ impl MoeLayer {
                 stream,
             );
         }
+        // Owner-batched verify rows (9..=32): one tensor-core weight pass.
+        if ctx.config.model_type == "glm5_next"
+            && let tc = ops::dense_tc_kernel(ctx.gpu, num_tokens)
+            && tc.0 != 0
+        {
+            return ops::dense_gemv_bf16_tc(
+                ctx.gpu,
+                tc,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                num_tokens,
+                num_experts,
+                hidden_size,
+                num_experts,
+                stream,
+            );
+        }
         if self.try_router_prefill_bn32(
             router_in,
             gate_logits,

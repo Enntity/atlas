@@ -94,6 +94,12 @@ impl Glm5KdaLayer {
     ) -> Result<()> {
         if (2..=8).contains(&m) {
             self.project_hot_multi_decode(input, weight, output, m, n, k, ctx, stream)
+        } else if m > 8
+            && let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(m)
+            && tc.0 != 0
+        {
+            // One tensor-core pass reads the weight once for all owner rows.
+            ops::w4a16_gemv_batchm(ctx.gpu, tc, input, &weight.nvfp4, output, m, n, k, stream)
         } else if m > 8 {
             // Owner-batched verify: the batch-M GEMV tiers stream the weight
             // at near-peak bandwidth where the M64-tile prefill GEMM mostly
@@ -134,6 +140,11 @@ impl Glm5KdaLayer {
             self.project_dense(input, weight, output, m, n, k, ctx, stream)
         } else if m <= ops::DENSE_GEMV_BATCHM_MAX_M {
             self.project_dense_multi_decode(input, weight, output, m, n, k, ctx, stream)
+        } else if let tc = ops::dense_tc_kernel(ctx.gpu, m)
+            && tc.0 != 0
+            && k % 8 == 0
+        {
+            ops::dense_gemv_bf16_tc(ctx.gpu, tc, input, weight, output, m, n, k, n, stream)
         } else {
             // Owner-batched verify rows exceed the batch-M kernel's cap. These
             // side projections are small; read them once per <=8-row chunk.
