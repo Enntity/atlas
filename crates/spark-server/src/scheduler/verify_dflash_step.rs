@@ -128,6 +128,7 @@ fn step_verify_dflash_inner(
         verified_argmax,
         step_timing,
         verify_ms,
+        false,
     );
 }
 
@@ -149,7 +150,8 @@ pub(super) fn verify_dflash_tail(
     verified_argmax: Vec<u32>,
     step_timing: bool,
     verify_ms: f64,
-) {
+    defer_propose: bool,
+) -> Option<usize> {
     let raw_trace = if std::env::var("ATLAS_LIGHTNING_VERIFY_TOKEN_TRACE").as_deref() == Ok("1") {
         Some(verified_argmax.clone())
     } else {
@@ -264,7 +266,7 @@ pub(super) fn verify_dflash_tail(
     if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
         tracing::error!("EP broadcast generic verify result: {e:#}");
         a.finished = true;
-        return;
+        return None;
     }
     crate::scheduler::mtp_accept_debug::record(
         1,
@@ -307,7 +309,7 @@ pub(super) fn verify_dflash_tail(
     {
         tracing::error!("GLM verified-pair record: {e:#}");
         a.finished = true;
-        return;
+        return None;
     }
 
     // EAGLE-fix (ATLAS_DFLASH_EAGLE_FIX=1): append one ctx slot per committed
@@ -336,7 +338,7 @@ pub(super) fn verify_dflash_tail(
     for i in 0..num_accepted {
         emit_token(a, drafts[i], verify_lps.get(i).cloned(), sched);
         if a.finished {
-            return;
+            return None;
         }
     }
 
@@ -347,7 +349,7 @@ pub(super) fn verify_dflash_tail(
         let bonus = verified[bonus_idx];
         emit_token(a, bonus, verify_lps.get(bonus_idx).cloned(), sched);
         if a.finished {
-            return;
+            return None;
         }
         a.last_token = bonus;
     }
@@ -387,7 +389,7 @@ pub(super) fn verify_dflash_tail(
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
         tracing::error!("commit_accepted_prefix (dflash): {e:#}");
         a.finished = true;
-        return;
+        return None;
     }
 
     // DFlash hidden is captured per-layer inside the verify graph
@@ -400,7 +402,7 @@ pub(super) fn verify_dflash_tail(
         tracing::error!("save_hidden_for_mtp (dflash): {e:#}");
         if spark_model::speculative::glm_repair_policy::enabled() {
             a.finished = true;
-            return;
+            return None;
         }
     }
 
@@ -408,7 +410,7 @@ pub(super) fn verify_dflash_tail(
         tracing::error!("trim_proposer_state: {e:#}");
         if spark_model::speculative::glm_repair_policy::enabled() {
             a.finished = true;
-            return;
+            return None;
         }
     }
 
@@ -423,6 +425,10 @@ pub(super) fn verify_dflash_tail(
             a.mtp_acct
                 .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt)
         };
+        // Owner-batched callers propose every owner in one drafter pass.
+        if defer_propose && _mtp_grammar_mask.is_none() {
+            return Some(next_num_drafts);
+        }
         let proposal: anyhow::Result<Vec<u32>> =
             if model.mtp_propose_batch_min() == 1 && _mtp_grammar_mask.is_none() {
                 let one_token = [a.last_token];
@@ -497,6 +503,7 @@ pub(super) fn verify_dflash_tail(
             num_accepted,
         );
     }
+    None
 }
 
 /// Owner-batched GLM verify (repaired K3 or DFlash block): one target
@@ -562,20 +569,49 @@ pub fn step_verify_glm_long_batched(
     } else {
         0.0
     };
-    for owner in 0..group.len() {
+    // DFlash captures each owner's verify rows into its stable hidden-save
+    // slot. A tail's commit_ctx reads the front slot, so each owner's region is
+    // packed there first; slot 0 IS the front, so its owner runs last, after
+    // the preserved front is restored.
+    let n = group.len();
+    let save_slots: Vec<Option<usize>> = group
+        .iter()
+        .map(|a| {
+            dflash_verify_raw_argmax
+                .then(|| a.seq.dflash_hidden_save_slot().ok())
+                .flatten()
+        })
+        .collect();
+    let front_owner = (0..n).find(|&o| save_slots[o] == Some(0));
+    let order: Vec<usize> = (0..n)
+        .filter(|&o| Some(o) != front_owner)
+        .chain(front_owner)
+        .collect();
+    if front_owner.is_some()
+        && let Err(e) = model.preserve_dflash_save_front(rows, 0)
+    {
+        tracing::error!("preserve_dflash_save_front: {e:#}");
+        fail_all(group);
+        return;
+    }
+    let mut deferred: Vec<(usize, usize)> = Vec::new();
+    for (done, &owner) in order.iter().enumerate() {
         let a = &mut *group[owner];
         let _step_timer =
             crate::scheduler::mtp_timing::StepTimer::new(&sched.timing, positions[owner]);
-        if let Err(e) =
-            model.begin_glm_long_owner_tail(a.seq.slot_idx as u32, owner, &tokens[owner])
-        {
+        let begun = model
+            .begin_glm_long_owner_tail(a.seq.slot_idx as u32, owner, &tokens[owner])
+            .and_then(|()| front_save_slot(model, save_slots[owner], rows));
+        if let Err(e) = begun {
             tracing::error!("begin_glm_long_owner_tail (owner={owner}): {e:#}");
-            fail_all(&mut group[owner..]);
+            for &o in &order[done..] {
+                group[o].finished = true;
+            }
             return;
         }
         a.last_token_time = Instant::now();
         let ledger_enabled = ledger::enabled_for(&a.seq);
-        verify_dflash_tail(
+        if let Some(next) = verify_dflash_tail(
             model,
             a,
             sched,
@@ -589,13 +625,114 @@ pub fn step_verify_glm_long_batched(
             verified[owner * rows..(owner + 1) * rows].to_vec(),
             step_timing,
             verify_ms,
-        );
+            dflash_verify_raw_argmax,
+        ) {
+            deferred.push((owner, next));
+        }
     }
+    propose_owner_batch(model, group, &deferred, &save_slots, rows, sched, step_timing);
     if step_timing {
         tracing::info!(
             "GLM OWNER STEP_TIMING: owners={} rows={rows} sync={sync_ms:.1}ms verify={verify_ms:.1}ms total={:.1}ms",
             group.len(),
             t_step.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// Put `slot`'s hidden-save region at the front the DFlash commit and
+/// per-sequence propose read (restoring the preserved front for slot 0).
+fn front_save_slot(model: &dyn Model, slot: Option<usize>, rows: usize) -> anyhow::Result<()> {
+    match slot {
+        Some(0) => model.restore_dflash_save_front(rows, 0),
+        Some(slot) => model.pack_dflash_save_seq(slot, rows, 0),
+        None => Ok(()),
+    }
+}
+
+/// One drafter pass for every owner whose tail deferred its re-propose
+/// (`(owner, drafts)`), falling back to per-sequence proposals when the
+/// proposer declines or the draft counts differ.
+fn propose_owner_batch(
+    model: &dyn Model,
+    group: &mut [&mut ActiveSeq],
+    deferred: &[(usize, usize)],
+    save_slots: &[Option<usize>],
+    rows: usize,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    step_timing: bool,
+) {
+    if deferred.is_empty() {
+        return;
+    }
+    let t_propose = Instant::now();
+    let num_drafts = deferred[0].1;
+    let mut owners: Vec<usize> = deferred.iter().map(|&(o, _)| o).collect();
+    owners.sort_unstable();
+    let batched = if owners.len() >= 2 && deferred.iter().all(|&(_, d)| d == num_drafts) {
+        let tokens: Vec<u32> = owners.iter().map(|&o| group[o].last_token).collect();
+        let positions: Vec<usize> = owners.iter().map(|&o| group[o].seq.seq_len).collect();
+        let stash = vec![0usize; owners.len()];
+        let mut seqs: Vec<&mut SequenceState> = group
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| owners.binary_search(i).is_ok())
+            .map(|(_, a)| &mut a.seq)
+            .collect();
+        model.run_mtp_propose_batched(&tokens, &positions, &stash, num_drafts, &mut seqs, 0, None)
+    } else {
+        Ok(None)
+    };
+    let fail = |a: &mut ActiveSeq, outcome| {
+        crate::scheduler::helpers::handle_dspark_repropose_failure(model, a, outcome);
+        if spark_model::speculative::glm_repair_policy::enabled() {
+            a.finished = true;
+        }
+    };
+    match batched {
+        Ok(Some(all)) if all.len() == owners.len() => {
+            for (&o, d) in owners.iter().zip(all) {
+                if d.is_empty() {
+                    fail(group[o], crate::scheduler::helpers::ProposalOutcome::Empty);
+                } else {
+                    group[o].pending_drafts = d;
+                }
+            }
+        }
+        other => {
+            if let Err(e) = other {
+                tracing::error!("run_mtp_propose_batched (owners={}): {e:#}", owners.len());
+            }
+            // Slot 0 last: its region is the (restored) front.
+            let front = deferred.iter().position(|&(o, _)| save_slots[o] == Some(0));
+            let order = (0..deferred.len())
+                .filter(|&i| Some(i) != front)
+                .chain(front);
+            for i in order {
+                let (o, drafts) = deferred[i];
+                let a = &mut *group[o];
+                let proposal = front_save_slot(model, save_slots[o], rows).and_then(|()| {
+                    model.run_mtp_propose_multi(a.last_token, a.seq.seq_len, drafts, &mut a.seq, 0, None)
+                });
+                match proposal {
+                    Ok(d) if !d.is_empty() => a.pending_drafts = d,
+                    Ok(_) => fail(a, crate::scheduler::helpers::ProposalOutcome::Empty),
+                    Err(e) => {
+                        tracing::error!("run_mtp_propose_multi (owner {o}): {e:#}");
+                        fail(a, crate::scheduler::helpers::ProposalOutcome::Error);
+                    }
+                }
+            }
+        }
+    }
+    sched
+        .timing
+        .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
+    if step_timing {
+        tracing::info!(
+            "GLM OWNER PROPOSE: owners={} {:.1}ms",
+            deferred.len(),
+            t_propose.elapsed().as_secs_f64() * 1000.0
         );
     }
 }

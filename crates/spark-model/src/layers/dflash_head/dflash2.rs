@@ -336,3 +336,330 @@ impl BlockDiffusionDraftHead {
         )
     }
 }
+
+/// Batched (`[n, γ]`) DFlash2 proposal forward. Mirrors the single-sequence
+/// Option-B layer (`forward_block_layer_pre_attn` / `_attention` /
+/// `_post_attn`) and the selector tail with every projection run once over all
+/// `n·γ` rows, so the drafter weights are read once per step instead of once
+/// per sequence. Convs are block-local (`block_size = γ`), attention and the
+/// selector walk run per sequence.
+///
+/// Inputs are the staged batch buffers of `propose_batch`: query embeddings in
+/// `batch_query_embed`, packed positions, slot mapping, per-sequence
+/// `[kv_len, q_offset, q_rope_pos]` in `batch_attention_args` and anchors in
+/// `batch_markov_prev`. Writes `n·γ` row tokens to `batch_tokens` (row 0 of
+/// each sequence = anchor argmax, rows 1.. = the walk), the same row order as
+/// the single-sequence `draft_tokens_dev`.
+impl BlockDiffusionDraftHead {
+    /// Whether this head batches DFlash2 proposals natively (BF16 weights,
+    /// one proposal lane). `ATLAS_DFLASH2_BATCH=0` keeps the serial fallback.
+    pub(super) fn dflash2_batch_enabled(&self) -> bool {
+        self.dflash2.is_some()
+            && self.lane_count() == 1
+            && self.lm_head_nvfp4.is_none()
+            && !matches!(self.quant, super::DflashQuantization::Fp8Weights)
+            && std::env::var("ATLAS_DFLASH2_BATCH").as_deref() != Ok("0")
+    }
+
+    /// `conv.prepare` (`side == 0`, projects `deltas` from `x` first) or
+    /// `conv.finish` (`side == 1`) over `rows` block rows at `x`, in place.
+    #[allow(clippy::too_many_arguments)]
+    fn dflash2_batch_conv(
+        &self,
+        gpu: &dyn GpuBackend,
+        head: &Dflash2Head,
+        layer_idx: usize,
+        site: ConvSite,
+        side: usize,
+        x: DevicePtr,
+        deltas: DevicePtr,
+        rows: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let conv = head.conv(layer_idx, site)?;
+        let hidden = self.hidden_size as u32;
+        let width = head.delta_width(self.hidden_size) as u32;
+        if side == 0 {
+            self.kernels
+                .linear(gpu, x, &conv.kernel_projection, deltas, rows, width, hidden, stream)?;
+        }
+        let taps = head.conv_taps;
+        let groups = self.hidden_size / head.conv_group_size;
+        ops::dflash2_grouped_conv(
+            gpu,
+            head.kernels.grouped_conv,
+            x,
+            deltas,
+            conv.base_kernel
+                .weight
+                .offset(side * taps * self.hidden_size * 2),
+            rows,
+            hidden,
+            head.conv_group_size as u32,
+            taps as u32,
+            self.gamma as u32,
+            width,
+            (side * taps * groups) as u32,
+            stream,
+        )
+    }
+
+    pub(super) fn run_batched_dflash2(
+        &self,
+        n: usize,
+        block_tables: &[u64],
+        ctx: &crate::layer::ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let head = self
+            .dflash2
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("batched DFlash2 on a DFlash v1 head"))?;
+        let gpu = ctx.gpu;
+        let g = self.gamma;
+        let rows = u32::try_from(n * g)?;
+        let h = self.hidden_size as u32;
+        let q_dim = (self.num_q_heads * self.head_dim) as u32;
+        let kv_dim = (self.num_kv_heads * self.head_dim) as u32;
+        let inter = self.intermediate_size as u32;
+        let vocab = self.vocab_size as u32;
+        let rank = head.selector_rank as u32;
+        let width = head.delta_width(self.hidden_size);
+        anyhow::ensure!(
+            block_tables.len() == n && width <= self.hidden_size && width <= self.intermediate_size,
+            "batched DFlash2 needs {n} block tables and conv deltas within the borrowed buffers"
+        );
+        // Conv deltas live in buffers idle during their sublayer: the MLP up
+        // rows around attention, the attention projection rows around the MLP.
+        let (attn_deltas, mlp_deltas) = (self.batch_mlp_up, self.batch_attn_proj);
+        let q_seq_bytes = g * q_dim as usize * 2;
+        let inv_sqrt_d = 1.0 / (self.head_dim as f32).sqrt();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            ops::rms_norm(
+                gpu,
+                self.kernels.rms_norm,
+                self.batch_query_embed,
+                &layer.input_layernorm,
+                self.batch_norm,
+                rows,
+                h,
+                self.rms_norm_eps,
+                stream,
+            )?;
+            self.dflash2_batch_conv(
+                gpu, head, layer_idx, ConvSite::Attention, 0, self.batch_norm, attn_deltas, rows,
+                stream,
+            )?;
+            let lin = |x, w: &DenseWeight, y, n_out, k_in| {
+                self.kernels.linear(gpu, x, w, y, rows, n_out, k_in, stream)
+            };
+            lin(self.batch_norm, &layer.q_proj, self.batch_q, q_dim, h)?;
+            ops::rms_norm(
+                gpu,
+                self.kernels.rms_norm,
+                self.batch_q,
+                &layer.q_norm,
+                self.batch_q,
+                rows * self.num_q_heads as u32,
+                self.head_dim as u32,
+                self.rms_norm_eps,
+                stream,
+            )?;
+            lin(self.batch_norm, &layer.k_proj, self.batch_k, kv_dim, h)?;
+            ops::rms_norm(
+                gpu,
+                self.kernels.rms_norm,
+                self.batch_k,
+                &layer.k_norm,
+                self.batch_k,
+                rows * self.num_kv_heads as u32,
+                self.head_dim as u32,
+                self.rms_norm_eps,
+                stream,
+            )?;
+            lin(self.batch_norm, &layer.v_proj, self.batch_v, kv_dim, h)?;
+            ops::rope_yarn(
+                gpu,
+                self.kernels.rope_qwen3,
+                self.batch_q,
+                self.batch_k,
+                self.batch_position_ids,
+                rows,
+                self.num_q_heads as u32,
+                self.num_kv_heads as u32,
+                self.head_dim as u32,
+                self.rotary_dim as u32,
+                self.yarn_inv_freq,
+                self.rope_theta,
+                stream,
+            )?;
+            let (k_pool, v_pool) = {
+                let cache = self.kv_cache.lock();
+                (cache.k_pool_ptr(layer_idx), cache.v_pool_ptr(layer_idx))
+            };
+            ops::reshape_and_cache(
+                gpu,
+                self.kernels.reshape_cache_bf16,
+                self.batch_k,
+                self.batch_v,
+                k_pool,
+                v_pool,
+                self.batch_slot_mapping,
+                rows,
+                self.num_kv_heads as u32,
+                self.head_dim as u32,
+                16,
+                kv_dim,
+                kv_dim,
+                0,
+                stream,
+            )?;
+            let sinks = layer
+                .attention_sink_bias
+                .as_ref()
+                .map_or(DevicePtr::NULL, |w| w.weight);
+            for (sequence, &table) in block_tables.iter().enumerate() {
+                ops::prefill_attention_paged_dflash_bf16_indirect(
+                    gpu,
+                    self.kernels.prefill_attn_dflash_bf16_indirect,
+                    self.batch_q.offset(sequence * q_seq_bytes),
+                    k_pool,
+                    v_pool,
+                    self.batch_attn_out.offset(sequence * q_seq_bytes),
+                    DevicePtr(table),
+                    g as u32,
+                    self.batch_attention_args.offset(sequence * 12),
+                    self.num_q_heads as u32,
+                    self.num_kv_heads as u32,
+                    self.head_dim as u32,
+                    16,
+                    self.attn_sliding_window(),
+                    self.attn_causal(),
+                    inv_sqrt_d,
+                    sinks,
+                    stream,
+                )?;
+            }
+            lin(self.batch_attn_out, &layer.o_proj, self.batch_attn_proj, h, q_dim)?;
+            self.dflash2_batch_conv(
+                gpu, head, layer_idx, ConvSite::Attention, 1, self.batch_attn_proj, attn_deltas,
+                rows, stream,
+            )?;
+            ops::residual_add(
+                gpu,
+                self.kernels.residual_add,
+                self.batch_query_embed,
+                self.batch_attn_proj,
+                rows * h,
+                stream,
+            )?;
+            ops::rms_norm(
+                gpu,
+                self.kernels.rms_norm,
+                self.batch_query_embed,
+                &layer.post_attention_layernorm,
+                self.batch_norm,
+                rows,
+                h,
+                self.rms_norm_eps,
+                stream,
+            )?;
+            self.dflash2_batch_conv(
+                gpu, head, layer_idx, ConvSite::Mlp, 0, self.batch_norm, mlp_deltas, rows, stream,
+            )?;
+            lin(self.batch_norm, &layer.gate_proj, self.batch_mlp_gate, inter, h)?;
+            lin(self.batch_norm, &layer.up_proj, self.batch_mlp_up, inter, h)?;
+            ops::silu_mul(
+                gpu,
+                self.kernels.silu_mul,
+                self.batch_mlp_gate,
+                self.batch_mlp_up,
+                self.batch_mlp_gate,
+                rows * inter,
+                stream,
+            )?;
+            lin(self.batch_mlp_gate, &layer.down_proj, self.batch_mlp_down, h, inter)?;
+            self.dflash2_batch_conv(
+                gpu, head, layer_idx, ConvSite::Mlp, 1, self.batch_mlp_down, mlp_deltas, rows,
+                stream,
+            )?;
+            ops::residual_add(
+                gpu,
+                self.kernels.residual_add,
+                self.batch_query_embed,
+                self.batch_mlp_down,
+                rows * h,
+                stream,
+            )?;
+        }
+
+        // Selector tail. Candidates and selector rows borrow the (now idle)
+        // MLP gate rows.
+        ops::rms_norm(
+            gpu,
+            self.kernels.rms_norm,
+            self.batch_query_embed,
+            &self.norm,
+            self.batch_norm,
+            rows,
+            h,
+            self.rms_norm_eps,
+            stream,
+        )?;
+        self.kernels.linear(
+            gpu,
+            self.batch_norm,
+            &DenseWeight {
+                weight: self.lm_head_shared,
+            },
+            self.batch_logits,
+            rows,
+            vocab,
+            h,
+            stream,
+        )?;
+        let cand_bytes = n * g * ops::DFLASH2_TOPK * 4;
+        let (cand_ids, cand_vals) = (self.batch_mlp_gate, self.batch_mlp_gate.offset(cand_bytes));
+        let selector_hidden = self.batch_mlp_gate.offset(2 * cand_bytes);
+        anyhow::ensure!(
+            2 * cand_bytes + n * g * rank as usize * 2 <= n * g * self.intermediate_size * 2,
+            "batched DFlash2 selector scratch exceeds the MLP rows"
+        );
+        ops::dflash2_topk(
+            gpu,
+            head.kernels.topk,
+            self.batch_logits,
+            cand_ids,
+            cand_vals,
+            rows,
+            vocab,
+            stream,
+        )?;
+        self.kernels.linear(
+            gpu,
+            self.batch_norm,
+            &head.hidden_projection,
+            selector_hidden,
+            rows,
+            rank,
+            h,
+            stream,
+        )?;
+        ops::dflash2_selector_walk(
+            gpu,
+            head.kernels.selector_walk,
+            cand_ids,
+            cand_vals,
+            selector_hidden,
+            head.predecessor_codebook.weight,
+            head.successor_codebook.weight,
+            self.batch_markov_prev,
+            self.batch_tokens,
+            u32::try_from(n)?,
+            g as u32,
+            rank,
+            vocab,
+            stream,
+        )
+    }
+}

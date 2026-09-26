@@ -216,8 +216,36 @@ pub(crate) fn validate_batch_input_lengths(
 }
 
 impl DsparkBatchInput {
+    /// Lightning DSpark: the served gamma is part of the admitted contract.
     #[allow(clippy::too_many_arguments)]
     pub fn validate(
+        gamma: usize,
+        capacity: usize,
+        owners: &[SequenceGeneration],
+        last_tokens: &[u32],
+        positions: &[usize],
+        target_hiddens: &[DevicePtr],
+        expected_owners: &[SequenceGeneration],
+        lifecycles: &[Option<CaptureDescriptor>],
+    ) -> Result<Self, DsparkBatchInputError> {
+        Self::validate_gamma(
+            Some(LIGHTNING_SERVED_GAMMA),
+            gamma,
+            capacity,
+            owners,
+            last_tokens,
+            positions,
+            target_hiddens,
+            expected_owners,
+            lifecycles,
+        )
+    }
+
+    /// Same checks with the served gamma pinned only when `served` is set
+    /// (generic DFlash2 heads batch at their configured gamma).
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_gamma(
+        served: Option<usize>,
         gamma: usize,
         capacity: usize,
         owners: &[SequenceGeneration],
@@ -230,9 +258,11 @@ impl DsparkBatchInput {
         if gamma == 0 {
             return Err(DsparkBatchInputError::GammaZero);
         }
-        if gamma != LIGHTNING_SERVED_GAMMA {
+        if let Some(expected) = served
+            && gamma != expected
+        {
             return Err(DsparkBatchInputError::GammaMismatch {
-                expected: LIGHTNING_SERVED_GAMMA,
+                expected,
                 found: gamma,
             });
         }

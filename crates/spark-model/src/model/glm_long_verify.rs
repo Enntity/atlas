@@ -318,6 +318,14 @@ impl TransformerModel {
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(),
         };
+        let save_slots = self
+            .dflash_hidden_save
+            .map(|_| {
+                seqs.iter()
+                    .map(|s| s.dflash_hidden_save_slot())
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
         let verify_profile = std::env::var("ATLAS_GLM_VERIFY_PROFILE").as_deref() == Ok("1");
         let (mut kda_us, mut mla_us) = (0u128, 0u128);
         for (li, layer) in self.layers.iter().enumerate() {
@@ -352,16 +360,16 @@ impl TransformerModel {
                     .collect();
                 layer.decode_glm_long_owners(&mut owners, &mut kv_cache, &stage, &ctx, stream)?;
             }
-            // DFlash: owner o's rows land in save region o; its tail packs
-            // that region to the front commit_ctx reads.
-            if self.dflash_hidden_save.is_some() {
+            // DFlash: each owner's rows land in its stable hidden-save slot,
+            // which its tail packs to the front and the batched re-propose
+            // reads in place.
+            if let Some(regions) = save_slots.as_deref() {
                 let offs: Vec<usize> = (0..n).map(|o| o * rows).collect();
-                let regions: Vec<usize> = (0..n).collect();
                 self.try_dflash_capture_batched_at(
                     li,
                     &vec![rows; n],
                     &offs,
-                    Some(&regions),
+                    Some(regions),
                     stream,
                 )?;
             }
@@ -690,8 +698,7 @@ impl TransformerModel {
         self.ep_broadcast_seq_and_cmd(slot, EP_CMD_GLM_LONG_TAIL, true)?;
         self.ep_broadcast_u32(encode_width(owner, rows))?;
         self.ep_broadcast_tokens(tokens)?;
-        self.glm_long_restore_owner(owner, rows)?;
-        self.pack_dflash_save_region(owner, rows, self.gpu.default_stream())
+        self.glm_long_restore_owner(owner, rows)
     }
 
     /// Worker side of E9.

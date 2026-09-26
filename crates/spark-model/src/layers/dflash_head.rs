@@ -967,7 +967,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
         } else {
             (None, None)
         };
-        if native_authoritative && parity_oracle.is_none() {
+        let dflash2_batch = self.dflash2_batch_enabled();
+        if (native_authoritative || dflash2_batch) && parity_oracle.is_none() {
             for i in 0..n {
                 self.prepare_drafts_state(
                     last_tokens[i],
@@ -1048,7 +1049,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
             );
         }
         let batch_slot_mapping = batch_slot_mapping.unwrap_or_default();
-        let batch_inputs = DsparkBatchInput::validate(
+        let batch_inputs = DsparkBatchInput::validate_gamma(
+            (!dflash2_batch).then_some(LIGHTNING_SERVED_GAMMA),
             self.gamma,
             self.batch_capacity,
             &owners,
@@ -1142,6 +1144,39 @@ impl DraftProposer for BlockDiffusionDraftHead {
             self.hidden_size as u32,
             stream,
         )?;
+        if dflash2_batch && batch_slots_ready {
+            self.run_batched_dflash2(n, &block_table_ptrs, ctx, stream)?;
+            ctx.gpu.synchronize(stream)?;
+            let mut raw = vec![0u8; batch_inputs.total_rows() * 4];
+            ctx.gpu.copy_d2h(self.batch_tokens, &mut raw)?;
+            let row_tokens: Vec<u32> = raw
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .collect();
+            // Same cap as the single-sequence propose.
+            let cap = self
+                .startup
+                .draft_cap_override
+                .unwrap_or(num_drafts.min(self.gamma.saturating_sub(1)).max(1));
+            let mut drafts = batch_inputs.reorder_sampled_rows(&row_tokens)?;
+            for (sequence, (tokens, state)) in drafts.iter_mut().zip(states.iter_mut()).enumerate() {
+                tokens.truncate(cap);
+                if let Some(oracle) = parity_oracle.as_ref() {
+                    anyhow::ensure!(
+                        *tokens == oracle[sequence],
+                        "DFlash2 batch parity mismatch at sequence {sequence}: batched={tokens:?} serial={:?}",
+                        oracle[sequence]
+                    );
+                }
+                if let Some(dstate) = state.as_any_mut().downcast_mut::<DflashProposerState>() {
+                    dstate.last_num_drafted = tokens.len();
+                }
+            }
+            if parity_oracle.is_some() {
+                tracing::info!("DFlash2 batch parity PASS: batch={n}");
+            }
+            return Ok(Some(drafts));
+        }
         let batch_rows = u32::try_from(batch_inputs.total_rows())
             .map_err(|_| anyhow::anyhow!("DFlash batch row count exceeds u32"))?;
         let batch_size =
