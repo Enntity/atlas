@@ -211,9 +211,16 @@ pub fn w4a16_gemv_batchm(
         (1..=32).contains(&m),
         "w4a16_gemv_batchm: m={m} outside 1..=32"
     );
+    // The tensor-core tier owns 16 outputs per 8-warp CTA.
+    let tc = kernel.0 != 0 && kernel.0 == crate::layers::w4a16_gemv_tiers::tc8_kernel().0;
+    anyhow::ensure!(
+        !tc || (m <= 8 && k % 16 == 0),
+        "w4a16_gemv_tc8: m={m} k={k} unsupported"
+    );
+    let (grid, block) = if tc { (div_ceil(n, 16), 256) } else { (div_ceil(n, 4), 256) };
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 4), 1, 1])
-        .block([256, 1, 1])
+        .grid([grid, 1, 1])
+        .block([block, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)
         .arg_ptr(weight.weight_scale)

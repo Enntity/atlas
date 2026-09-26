@@ -104,6 +104,16 @@ pub fn select_tier(
         .map(|(i, _)| i)
 }
 
+/// `ATLAS_W4A16_TC=1`: serve M=2..8 with the tensor-core `w4a16_gemv_tc8`
+/// (DRAM-bound, not bit-identical to the scalar tiers). Resolved once, when a
+/// tier table is first built; [`tc8_kernel`] is how the launch op recognizes it.
+static TC8: std::sync::OnceLock<KernelHandle> = std::sync::OnceLock::new();
+
+/// The resolved tensor-core tier, or a zero handle when it is off/absent.
+pub fn tc8_kernel() -> KernelHandle {
+    TC8.get().copied().unwrap_or(KernelHandle(0))
+}
+
 /// Resolved handles for the narrow `w4a16_gemv_batch{M}` family.
 ///
 /// A zero handle means "this target did not load that tier"; every consumer
@@ -135,6 +145,9 @@ impl W4a16BatchmTiers {
         for (h, w) in handles.iter_mut().zip(W4A16_BATCHM_WIDTHS) {
             *h = super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_batch{w}"));
         }
+        if std::env::var("ATLAS_W4A16_TC").as_deref() == Ok("1") {
+            TC8.get_or_init(|| super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_tc8"));
+        }
         Self { handles }
     }
 
@@ -147,6 +160,10 @@ impl W4a16BatchmTiers {
     /// Narrowest resolved tier covering `m` rows, or `KernelHandle(0)` when
     /// this family cannot serve `m`.
     pub fn kernel(&self, m: u32) -> KernelHandle {
+        let tc = tc8_kernel();
+        if tc.0 != 0 && (2..=8).contains(&m) {
+            return tc;
+        }
         select_tier(m, self.present(), exact_m_tiers_enabled())
             .map_or(KernelHandle(0), |i| self.handles[i])
     }

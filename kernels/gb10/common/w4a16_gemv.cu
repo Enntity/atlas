@@ -1579,3 +1579,175 @@ extern "C" __global__ void w4a16_gemv_dual_batch3(
         C_out2[n] = __float2bfloat16(result2);
     }
 }
+
+#if !defined(__SCALE__) && !defined(__HIP_PLATFORM_AMD__)
+// ============================================================
+// W4A16 GEMV on tensor cores for M <= 8 rows (speculative verify blocks).
+// ============================================================
+// `w4a16_gemv_batchm_impl` keeps the M=1 kernel's scalar FMA chain so its rows
+// are bit-identical to decode, which leaves it issue-bound at M >= 5 (batch8
+// at M=8 reaches ~50% of DRAM peak). Where no M=1 decode must be matched (the
+// GLM DFlash lane verifies every step as one block) the rows can go to the
+// tensor cores instead: `mma.m16n8k16` takes 16 dequantized weight rows as A
+// (16 outputs x 16 k) and the activation rows as B (16 k x 8 rows), so an
+// 8-row block fills the MMA's N dimension with no padding and the kernel is
+// DRAM-bound.
+//
+// Dequantization is exact: an E2M1 value times an E4M3 group scale has at most
+// 7 significant bits and lands inside BF16's range, so the BF16 A operand is
+// the true weight / scale2. Accumulation is FP32 and scale2 is applied once
+// per output. Rows are independent of each other; the summation order differs
+// from `w4a16_gemv`, so this is NOT bit-identical to it.
+//
+// Mapping: warp w of a CTA owns weight rows [16*blockIdx.x, +16) and the
+// 128-wide K chunks w, w+TC_WARPS, ... Lane (g = lane/4, c = lane%4) loads 32
+// consecutive K values (16 bytes) of rows g and g+8 and of activation row g,
+// prefetching its next chunk while the current one is on the tensor cores.
+// MMA step j (0..7) feeds k-slots {2c,2c+1} <- values 4j+{0,1} and
+// {2c+8,2c+9} <- values 4j+{2,3} of the lane's run; A and B use the same slot
+// -> K map, so each product pairs the right weight with the right activation.
+//
+// A:[M,K] BF16, B_packed:[N,K/2], B_scale:[N,K/16] E4M3, C:[M,N] BF16.
+// K % 16 == 0. Grid: (ceil(N/16),1,1) Block: (TC_WARPS*32,1,1).
+#define W4A16_TC_WARPS 8
+
+struct W4a16TcChunk {
+    uint4 w0, w1;          // 32 E2M1 values of rows g and g+8
+    uint4 x[4];            // 32 BF16 activations of row g
+    unsigned int s0, s1;   // group-scale bytes (two groups) of rows g, g+8
+};
+
+__device__ __forceinline__ void w4a16_tc_load(
+    W4a16TcChunk& t, const unsigned char* w0p, const unsigned char* w1p,
+    const unsigned char* s0p, const unsigned char* s1p, const __nv_bfloat16* ap,
+    unsigned int kb, unsigned int K, bool v0, bool v1, bool vm
+) {
+    const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+    t.w0 = z; t.w1 = z; t.x[0] = z; t.x[1] = z; t.x[2] = z; t.x[3] = z;
+    t.s0 = 0u; t.s1 = 0u;
+    if (kb >= K) return;
+    const bool full = kb + 16u < K;  // second 16-value group present
+    if (v0) {
+        if (full) t.w0 = *(const uint4*)(w0p + kb / 2u);
+        else { const uint2 h = *(const uint2*)(w0p + kb / 2u); t.w0.x = h.x; t.w0.y = h.y; }
+        t.s0 = s0p[kb / GROUP_SIZE] | (full ? (unsigned int)s0p[kb / GROUP_SIZE + 1u] << 8 : 0u);
+    }
+    if (v1) {
+        if (full) t.w1 = *(const uint4*)(w1p + kb / 2u);
+        else { const uint2 h = *(const uint2*)(w1p + kb / 2u); t.w1.x = h.x; t.w1.y = h.y; }
+        t.s1 = s1p[kb / GROUP_SIZE] | (full ? (unsigned int)s1p[kb / GROUP_SIZE + 1u] << 8 : 0u);
+    }
+    if (vm) {
+        const uint4* xp = (const uint4*)(ap + kb);
+        t.x[0] = xp[0]; t.x[1] = xp[1];
+        if (full) { t.x[2] = xp[2]; t.x[3] = xp[3]; }
+    }
+}
+
+__device__ __forceinline__ __nv_bfloat162 w4a16_tc_scale(unsigned int byte) {
+    __nv_fp8_e4m3 f;
+    *(unsigned char*)&f = (unsigned char)byte;
+    return __float2bfloat162_rn((float)f);
+}
+
+__device__ __forceinline__ void w4a16_tc_mma(
+    float acc[4], const W4a16TcChunk& t, const unsigned int* s_pair
+) {
+    const unsigned int wb0[4] = {t.w0.x, t.w0.y, t.w0.z, t.w0.w};
+    const unsigned int wb1[4] = {t.w1.x, t.w1.y, t.w1.z, t.w1.w};
+    const unsigned int xw[16] = {t.x[0].x, t.x[0].y, t.x[0].z, t.x[0].w,
+                                 t.x[1].x, t.x[1].y, t.x[1].z, t.x[1].w,
+                                 t.x[2].x, t.x[2].y, t.x[2].z, t.x[2].w,
+                                 t.x[3].x, t.x[3].y, t.x[3].z, t.x[3].w};
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        const __nv_bfloat162 sc0 = w4a16_tc_scale(t.s0 >> (8 * half));
+        const __nv_bfloat162 sc1 = w4a16_tc_scale(t.s1 >> (8 * half));
+        #pragma unroll
+        for (int jj = 0; jj < 4; jj++) {
+            const int j = half * 4 + jj;
+            // Bytes 2j, 2j+1 of each row's 16-byte run = values 4j..4j+3.
+            const unsigned int word0 = wb0[j >> 1] >> ((j & 1) * 16);
+            const unsigned int word1 = wb1[j >> 1] >> ((j & 1) * 16);
+            unsigned int a[4];
+            __nv_bfloat162 v;
+            v = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&s_pair[word0 & 0xFFu]), sc0);
+            a[0] = *reinterpret_cast<unsigned int*>(&v);
+            v = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&s_pair[word1 & 0xFFu]), sc1);
+            a[1] = *reinterpret_cast<unsigned int*>(&v);
+            v = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&s_pair[(word0 >> 8) & 0xFFu]), sc0);
+            a[2] = *reinterpret_cast<unsigned int*>(&v);
+            v = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&s_pair[(word1 >> 8) & 0xFFu]), sc1);
+            a[3] = *reinterpret_cast<unsigned int*>(&v);
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                  "r"(xw[2 * j]), "r"(xw[2 * j + 1]));
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc8(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    // Byte -> packed BF16x2 {low nibble, high nibble} of unscaled E2M1.
+    __shared__ unsigned int s_pair[256];
+    __shared__ float s_red[W4A16_TC_WARPS][WARP_SIZE][4];
+    for (unsigned int i = threadIdx.x; i < 256; i += blockDim.x) {
+        const __nv_bfloat162 v = __floats2bfloat162_rn(E2M1_LUT[i & 0xF], E2M1_LUT[i >> 4]);
+        s_pair[i] = *reinterpret_cast<const unsigned int*>(&v);
+    }
+    __syncthreads();
+
+    const unsigned int warp = threadIdx.x / WARP_SIZE;
+    const unsigned int lane = threadIdx.x % WARP_SIZE;
+    const unsigned int g = lane >> 2, c = lane & 3u;
+    const unsigned int r0 = blockIdx.x * 16u + g, r1 = r0 + 8u;
+    const bool v0 = r0 < N, v1 = r1 < N, vm = g < M;
+    const unsigned long long half_K = K / 2u, groups = K / GROUP_SIZE;
+    const unsigned char* w0p = B_packed + (unsigned long long)(v0 ? r0 : 0u) * half_K;
+    const unsigned char* w1p = B_packed + (unsigned long long)(v1 ? r1 : 0u) * half_K;
+    const unsigned char* s0p = B_scale + (unsigned long long)(v0 ? r0 : 0u) * groups;
+    const unsigned char* s1p = B_scale + (unsigned long long)(v1 ? r1 : 0u) * groups;
+    const __nv_bfloat16* ap = A + (unsigned long long)(vm ? g : 0u) * K;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const unsigned int chunks = (K + 127u) / 128u;
+    W4a16TcChunk cur, nxt;
+    unsigned int ch = warp;
+    if (ch < chunks) w4a16_tc_load(cur, w0p, w1p, s0p, s1p, ap, ch * 128u + 32u * c, K, v0, v1, vm);
+    for (; ch < chunks; ch += W4A16_TC_WARPS) {
+        const unsigned int next = ch + W4A16_TC_WARPS;
+        if (next < chunks)
+            w4a16_tc_load(nxt, w0p, w1p, s0p, s1p, ap, next * 128u + 32u * c, K, v0, v1, vm);
+        w4a16_tc_mma(acc, cur, s_pair);
+        cur = nxt;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) s_red[warp][lane][i] = acc[i];
+    __syncthreads();
+    if (warp != 0) return;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        float v = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < W4A16_TC_WARPS; w++) v += s_red[w][lane][i];
+        // C fragment: acc[0..1] -> output row g, acc[2..3] -> row g+8;
+        // columns (activation rows) 2c and 2c+1.
+        const unsigned int n = (i < 2) ? r0 : r1;
+        const unsigned int m = 2u * c + (i & 1u);
+        if (n < N && m < M) C[(unsigned long long)m * N + n] = __float2bfloat16(v * scale2);
+    }
+}
+#endif
