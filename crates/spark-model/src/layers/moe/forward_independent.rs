@@ -42,7 +42,7 @@ impl MoeLayer {
     }
     pub(super) fn independent_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
         // The public entry performs fallible validation before entering prefill.
-        crate::model::glm_independent::selected(ctx, rows as usize).unwrap_or(false)
+        crate::model::glm_independent::ffn_rows_selected(ctx, rows as usize).unwrap_or(false)
             && super::prequant_fp4::glm_grouped_shape(ctx.config)
             && self.glm_grouped_resources(ctx)
             && self.use_t_layout_for_prefill()
@@ -57,7 +57,7 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<DevicePtr> {
         anyhow::ensure!(
-            crate::model::glm_independent::selected(ctx, rows)?
+            crate::model::glm_independent::ffn_rows_selected(ctx, rows)?
                 && self.independent_grouped(ctx, rows as u32)
                 && !self.is_dflash_capture_layer
                 && input == ctx.buffers.norm_output()

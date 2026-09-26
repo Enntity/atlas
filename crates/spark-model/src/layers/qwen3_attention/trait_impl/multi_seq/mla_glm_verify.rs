@@ -16,15 +16,21 @@ impl Qwen3AttentionLayer {
         if !glm_long_context::enabled(&c.fwd.config.model_type) {
             return Ok(false);
         }
+        use crate::speculative::glm_repair_policy as policy;
+        // Repaired MTP verifies exactly K3; the DFlash lane verifies its block.
+        let rows_ok = if policy::enabled() {
+            c.n == 3
+        } else {
+            policy::dflash_enabled() && (2..=policy::MAX_DFLASH_VERIFY_ROWS).contains(&c.n)
+        };
         ensure!(
-            crate::speculative::glm_repair_policy::enabled()
-                && c.n == 3
-                && c.seq_lens.len() == 3
+            rows_ok
+                && c.seq_lens.len() == c.n
                 && c.fwd.config.tp_world_size == 2
                 && c.fwd.config.ep_world_size == 2
                 && !c.fwd.graph_capture
                 && !c.fwd.gpu.stream_is_capturing(c.stream),
-            "GLM long MTP attention requires repaired eager K3 TP2/EP2"
+            "GLM long verify requires repaired eager K3 or the DFlash lane, TP2/EP2"
         );
         let mla = self.mla.as_ref().expect("MLA dispatch owns weights");
         ensure!(
@@ -54,23 +60,23 @@ impl Qwen3AttentionLayer {
             "GLM long MTP requires BF16 K/V and semantic index"
         );
         ensure!(
-            meta.num_seqs == 3
+            meta.num_seqs as usize == c.n
                 && !meta.slot.is_null()
                 && !meta.seq_len.is_null()
                 && !meta.block_table.is_null(),
-            "GLM K3 metadata incomplete"
+            "GLM long verify metadata incomplete"
         );
         let shape = ops::GlmDynamicShape::new(meta.max_blocks_per_seq, c.bs)?;
         shape.validate_positions(
             c.seq_lens.iter().copied(),
-            3,
+            c.n,
             c.fwd.config.max_position_embeddings,
         )?;
         ensure!(
             c.seq_lens
                 .windows(2)
                 .all(|p| p[0].checked_add(1) == Some(p[1])),
-            "GLM K3 positions must be causal and consecutive"
+            "GLM long verify positions must be causal and consecutive"
         );
         shape.validate_arenas(
             c.fwd.buffers.sizes().expert_down_out,
@@ -114,7 +120,7 @@ impl Qwen3AttentionLayer {
             .checked_mul(3 * 4)
             .ok_or_else(|| anyhow::anyhow!("GLM split block table span overflow"))?;
         let live = [
-            (c.normed, 3 * 4096 * 2),
+            (c.normed, c.n * 4096 * 2),
             (b.expert_up_out(), s.expert_up_out),
             (b.expert_down_out(), s.expert_down_out),
             (b.qkv_output(), s.qkv_output),

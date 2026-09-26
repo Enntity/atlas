@@ -40,7 +40,7 @@ impl Qwen3AttentionLayer {
             comb,
             diag_this,
         } = phase;
-        let independent = crate::model::glm_independent::selected(ctx, n)?;
+        let independent = crate::model::glm_independent::ffn_rows_selected(ctx, n)?;
         let glm_batched_ffn = ctx.config.model_type == "glm5_next" && matches!(n, 3..=5);
         let compact_c2 = if !independent && n == 2 {
             self.ffn.try_forward_c2_compact(c.normed, ctx, stream)?

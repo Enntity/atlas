@@ -14,8 +14,8 @@ impl FfnComponent {
         stream: u64,
     ) -> Result<DevicePtr> {
         ensure!(
-            crate::model::glm_independent::selected(ctx, rows)?,
-            "independent FFN requires actual indexed independent rows"
+            crate::model::glm_independent::ffn_rows_selected(ctx, rows)?,
+            "independent FFN requires independent rows or a GLM DFlash verify block"
         );
         match self {
             Self::Moe(m) => m.forward_independent(input, rows, ctx, stream),

@@ -26,11 +26,12 @@ fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<O
     }
     if spark_model::speculative::glm_repair_policy::long_context_enabled() {
         anyhow::ensure!(
-            spark_model::speculative::glm_repair_policy::enabled()
+            (spark_model::speculative::glm_repair_policy::enabled()
+                || (args.dflash && spark_model::speculative::glm_repair_policy::dflash_enabled()))
                 && config.model_type == "glm5_next"
                 && !args.glm_paired_mtp
                 && !spark_model::model::glm_independent::enabled(&config.model_type)?,
-            "long MTP preparation requires the repaired GLM dispatcher"
+            "long-context GLM preparation requires the repaired MTP or DFlash dispatcher"
         );
         let topology = resolve_topology(args, config)?;
         anyhow::ensure!(

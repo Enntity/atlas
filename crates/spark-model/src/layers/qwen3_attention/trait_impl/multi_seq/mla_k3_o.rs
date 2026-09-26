@@ -11,7 +11,8 @@ impl Qwen3AttentionLayer {
         output: DevicePtr,
     ) -> Result<Option<glm_k3_mla_o::StagePlan>> {
         let compare = glm_k3_mla_o::compare::enabled(&c.fwd.config.model_type)?;
-        if !glm_k3_mla_o::enabled(&c.fwd.config.model_type)? || !long_verify {
+        // Wider (DFlash) verifies keep the scalar per-row O projection.
+        if !glm_k3_mla_o::enabled(&c.fwd.config.model_type)? || !long_verify || c.n != 3 {
             return Ok(None);
         }
         // validate_glm_long_verify already establishes causal consecutive rows,

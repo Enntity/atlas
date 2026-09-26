@@ -162,6 +162,19 @@ pub fn validate_projection_handles(nvfp4: [u64; 7], bf16: u64) -> Result<()> {
     );
     Ok(())
 }
+/// Rows whose FFN may take the exact independent 2..8-row MoE: the actual
+/// independent decode lane, or one GLM DFlash verify block.
+pub fn ffn_rows_selected(ctx: &ForwardContext, rows: usize) -> Result<bool> {
+    if selected(ctx, rows)? {
+        return Ok(true);
+    }
+    Ok(crate::speculative::glm_repair_policy::dflash_enabled()
+        && ctx.config.model_type == "glm5_next"
+        && ctx.config.tp_world_size == 2
+        && ctx.config.ep_world_size == 2
+        && (2..=crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS).contains(&rows))
+}
+
 /// The indexed view is produced only by the actual independent model path.
 /// Temporal verifier contexts have no such view, even when their width is5.
 pub fn selected(ctx: &ForwardContext, rows: usize) -> Result<bool> {

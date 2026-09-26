@@ -62,9 +62,11 @@ impl GlmDynamicShape {
         rows: usize,
         model_limit: usize,
     ) -> Result<()> {
+        // Rows are indexed one at a time through the shared selection arena,
+        // so the width is bounded only by the widest admitted verify block.
         ensure!(
-            matches!(rows, 2 | 3),
-            "GLM dynamic index requires exact C2/C3 rows"
+            (2..=crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS).contains(&rows),
+            "GLM dynamic index requires 2..=8 verify rows"
         );
         let mut count = 0;
         for position in positions {
@@ -219,13 +221,15 @@ mod tests {
         for (positions, rows, limit) in [
             (vec![0], 1, 2048),
             (vec![0, 1], 3, 2048),
-            (vec![0, 1, 2, 3], 4, 2048),
+            ((0..9).collect(), 9, 2048),
             (vec![2048, 0], 2, 4096),
             (vec![1024, 0], 2, 1024),
             (vec![usize::MAX, 0], 2, usize::MAX),
         ] {
             assert!(shape.validate_positions(positions, rows, limit).is_err());
         }
+        // A DFlash verify block of up to eight causal rows is admitted.
+        assert!(shape.validate_positions(2040..2048, 8, 4096).is_ok());
     }
 
     #[test]

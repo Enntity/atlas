@@ -34,6 +34,11 @@ impl Glm5KdaLayer {
                     .forward_k5_for_hc(normed, self.hc_post_moe_blend_k.0 != 0, ctx, stream)?;
             deferred_shared_gate = gate;
             out
+        } else if capture_verify_intermediates
+            && crate::model::glm_independent::ffn_rows_selected(ctx, tokens)?
+        {
+            // GLM DFlash verify block: one exact grouped pass over its rows.
+            self.ffn.forward_independent(normed, tokens, ctx, stream)?
         } else if capture_verify_intermediates {
             self.ffn.forward_batched(normed, tokens, ctx, stream)?;
             ctx.buffers.moe_output()

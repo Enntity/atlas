@@ -332,7 +332,7 @@ impl Glm5KdaLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
-        let compact_c2 = if independent {
+        let compact_c2 = if independent || crate::model::glm_independent::ffn_rows_selected(ctx, n)? {
             Some(self.ffn.forward_independent(normed, n, ctx, stream)?)
         } else if n == 2 {
             self.ffn.try_forward_c2_compact(normed, ctx, stream)?

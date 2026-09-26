@@ -9,6 +9,20 @@ pub fn enabled() -> bool {
     std::env::var("ATLAS_GLM_MTP_REPAIR").as_deref() == Ok("1")
 }
 
+/// GLM DFlash lane: block verification through the long-context sparse path
+/// without the MTP repair machinery (`ATLAS_GLM_DFLASH=1` with `--dflash`).
+pub fn dflash_enabled() -> bool {
+    std::env::var("ATLAS_GLM_DFLASH").as_deref() == Ok("1")
+}
+
+/// A retained long-context GLM verify owner is active: repaired MTP or DFlash.
+pub fn long_lane_enabled() -> bool {
+    enabled() || dflash_enabled()
+}
+
+/// Widest DFlash block the GLM long-context verify admits (bonus + drafts).
+pub const MAX_DFLASH_VERIFY_ROWS: usize = 8;
+
 pub fn long_context_enabled() -> bool {
     std::env::var("ATLAS_GLM_MTP_LONG_CONTEXT").as_deref() == Ok("1")
 }

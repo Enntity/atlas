@@ -57,7 +57,7 @@ impl Qwen3AttentionLayer {
 
         if super::super::glm_long_context::enabled(&ctx.config.model_type) {
             anyhow::ensure!(
-                crate::speculative::glm_repair_policy::enabled()
+                crate::speculative::glm_repair_policy::long_lane_enabled()
                     && !ctx.graph_capture
                     && !ctx.gpu.stream_is_capturing(stream)
                     && mla.glm_indexer.is_some()

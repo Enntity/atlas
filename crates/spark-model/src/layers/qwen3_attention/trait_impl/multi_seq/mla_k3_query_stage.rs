@@ -13,7 +13,8 @@ impl Qwen3AttentionLayer {
     ) -> Result<Option<QueryPlan>> {
         let batchm = enabled(&c.fwd.config.model_type)?;
         let compare = compare_enabled(&c.fwd.config.model_type, batchm)?;
-        if !batchm || !long_verify {
+        // Wider (DFlash) verifies keep the scalar per-row query projection.
+        if !batchm || !long_verify || c.n != ROWS {
             return Ok(None);
         }
         ensure!(

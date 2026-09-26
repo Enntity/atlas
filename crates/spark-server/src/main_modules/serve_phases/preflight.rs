@@ -80,8 +80,10 @@ pub(crate) fn preflight_reserve(
     let independent = spark_model::model::glm_independent::enabled(&config.model_type)?;
     let long_mtp = spark_model::speculative::glm_repair_policy::long_context_enabled();
     anyhow::ensure!(
-        !long_mtp || spark_model::speculative::glm_repair_policy::enabled(),
-        "GLM long-context MTP requires repaired ownership"
+        !long_mtp
+            || spark_model::speculative::glm_repair_policy::enabled()
+            || (args.dflash && spark_model::speculative::glm_repair_policy::dflash_enabled()),
+        "GLM long-context verification requires repaired MTP or DFlash ownership"
     );
     anyhow::ensure!(
         !long_mtp || (!args.glm_paired_mtp && !independent),
@@ -451,7 +453,7 @@ pub(crate) fn preflight_reserve(
     } else {
         0
     };
-    let repair_private_bytes = if long_mtp {
+    let repair_private_bytes = if long_mtp && spark_model::speculative::glm_repair_policy::enabled() {
         let private = spark_model::layers::Glm5MtpHead::repair_private_reserve_bytes(
             config,
             args.max_seq_len,
