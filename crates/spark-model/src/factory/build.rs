@@ -106,6 +106,7 @@ pub fn build_model(
             kv_dtype,
             layer_dtypes: &layer_dtypes,
             alternate_owner: dflash_args.is_some() || lora_args.is_some(),
+            dflash: dflash_args.is_some() && lora_args.is_none(),
         },
     )?;
     // Explicit native module initialization precedes layers, arena, and the KV

@@ -17,6 +17,8 @@ pub(super) struct BuildPolicy<'a> {
     pub kv_dtype: KvCacheDtype,
     pub layer_dtypes: &'a [KvCacheDtype],
     pub alternate_owner: bool,
+    /// `--dflash` on the GLM DFlash verify lane (`ATLAS_GLM_DFLASH=1`).
+    pub dflash: bool,
 }
 
 /// The repaired sparse verifier has a fixed 32K indexed domain. The serving
@@ -29,25 +31,30 @@ pub(super) fn repair_context(context: usize) -> usize {
 
 impl BuildPolicy<'_> {
     fn validate(&self, repaired: bool, long_context: bool) -> Result<()> {
+        let repaired_mtp2 = self.mode == GlmMtpBuildMode::Legacy
+            && self.speculative
+            && !self.self_speculative
+            && self.drafts == 2
+            && self.owners == 4
+            && !self.alternate_owner
+            && repaired;
+        let dflash_lane = self.dflash
+            && !self.self_speculative
+            && crate::speculative::glm_repair_policy::dflash_enabled();
         ensure!(
             self.config.model_type == "glm5_next"
                 && self.config.tp_world_size == 2
                 && self.config.ep_world_size == 2
                 // Serving topology has already converted this to local heads.
                 && self.config.num_attention_heads == 32
-                && self.mode == GlmMtpBuildMode::Legacy
-                && self.speculative
-                && !self.self_speculative
-                && self.drafts == 2
-                && self.owners == 4
-                && (2049..=32768).contains(&self.context)
+                && (2049..=crate::speculative::glm_repair_policy::max_long_context())
+                    .contains(&self.context)
                 && self.block_size == 16
                 && self.kv_dtype == KvCacheDtype::Bf16
                 && self.layer_dtypes.iter().all(|d| *d == KvCacheDtype::Bf16)
-                && !self.alternate_owner
-                && repaired
+                && (repaired_mtp2 || dflash_lane)
                 && long_context,
-            "GLM sparse decode TC requires repaired long-context MTP2, four owners, TP2/EP2 local32 heads and BF16 block16 caches"
+            "GLM sparse decode TC requires repaired long-context MTP2 (four owners) or the GLM DFlash lane, TP2/EP2 local32 heads and BF16 block16 caches"
         );
         Ok(())
     }

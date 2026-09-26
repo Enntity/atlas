@@ -23,6 +23,7 @@ fn policy(c: &ModelConfig) -> BuildPolicy<'_> {
         kv_dtype: KvCacheDtype::Bf16,
         layer_dtypes: &[],
         alternate_owner: false,
+        dflash: false,
     }
 }
 
