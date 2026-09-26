@@ -419,7 +419,7 @@ impl TransformerModel {
         };
         // Owner-batched long-context verify stage (4 owners x 8 rows): ~13 MB,
         // allocated before KV sizing so the pool accounts for it.
-        let glm_long_stage = if has_mtp
+        let glm_long_stage = if (has_mtp || crate::speculative::glm_repair_policy::dflash_enabled())
             && config.model_type == "glm5_next"
             && crate::layer::glm_long_owner::enabled()?
         {

@@ -499,9 +499,9 @@ pub(super) fn verify_dflash_tail(
     }
 }
 
-/// Owner-batched repaired long-context K3 verify: one target traversal for
-/// every owner, then each owner's ordinary tail in order, each preceded by
-/// restoring that owner's verify rows on both ranks.
+/// Owner-batched GLM verify (repaired K3 or DFlash block): one target
+/// traversal for every owner, then each owner's ordinary tail in order, each
+/// preceded by restoring that owner's verify rows on both ranks.
 pub fn step_verify_glm_long_batched(
     model: &dyn Model,
     group: &mut [&mut ActiveSeq],
@@ -511,11 +511,13 @@ pub fn step_verify_glm_long_batched(
     dflash_verify_raw_argmax: bool,
 ) {
     let fail_all = |group: &mut [&mut ActiveSeq]| group.iter_mut().for_each(|a| a.finished = true);
+    let t_step = Instant::now();
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
         fail_all(group);
         return;
     }
+    let sync_ms = t_step.elapsed().as_secs_f64() * 1000.0;
     let drafts: Vec<Vec<u32>> = group
         .iter_mut()
         .map(|a| {
@@ -523,22 +525,31 @@ pub fn step_verify_glm_long_batched(
             std::mem::take(&mut a.pending_drafts)
         })
         .collect();
-    let tokens: Vec<[u32; 3]> = group
+    let rows = drafts[0].len() + 1;
+    let tokens: Vec<Vec<u32>> = group
         .iter()
         .zip(&drafts)
-        .map(|(a, d)| [a.last_token, d[0], d[1]])
+        .map(|(a, d)| {
+            std::iter::once(a.last_token)
+                .chain(d.iter().copied())
+                .collect()
+        })
         .collect();
+    let flat: Vec<u32> = tokens.concat();
     let positions: Vec<usize> = group.iter().map(|a| a.seq.seq_len).collect();
     let step_timing = std::env::var("ATLAS_DFLASH_STEP_TIMING").ok().as_deref() == Some("1");
     let t_verify = std::time::Instant::now();
     let verified = {
         let mut seqs: Vec<&mut SequenceState> = group.iter_mut().map(|a| &mut a.seq).collect();
-        model.decode_verify_glm_long_owners(&tokens, &mut seqs)
+        model.decode_verify_glm_long_owner_rows(rows, &flat, &mut seqs)
     };
     let verified = match verified {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("decode_verify_glm_long_owners (n={}): {e:#}", group.len());
+            tracing::error!(
+                "decode_verify_glm_long_owner_rows (n={} rows={rows}): {e:#}",
+                group.len()
+            );
             fail_all(group);
             return;
         }
@@ -575,9 +586,16 @@ pub fn step_verify_glm_long_batched(
             ledger_enabled,
             positions[owner],
             &tokens[owner],
-            verified[owner].to_vec(),
+            verified[owner * rows..(owner + 1) * rows].to_vec(),
             step_timing,
             verify_ms,
+        );
+    }
+    if step_timing {
+        tracing::info!(
+            "GLM OWNER STEP_TIMING: owners={} rows={rows} sync={sync_ms:.1}ms verify={verify_ms:.1}ms total={:.1}ms",
+            group.len(),
+            t_step.elapsed().as_secs_f64() * 1000.0
         );
     }
 }

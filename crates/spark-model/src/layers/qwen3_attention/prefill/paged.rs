@@ -11,6 +11,59 @@ use crate::layer::{BatchedAttnMetadata, ForwardContext};
 use crate::layers::ops;
 
 impl Qwen3AttentionLayer {
+    fn mla_prefill_args(
+        &self,
+        normed: DevicePtr,
+        num_tokens: usize,
+        seq_len_start: usize,
+        bs: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> super::paged_mla::MlaPrefillArgs {
+        let nkv = self
+            .num_kv_heads_override
+            .unwrap_or(ctx.config.num_key_value_heads) as u32;
+        let hd = self.head_dim_override.unwrap_or(ctx.config.head_dim) as u32;
+        super::paged_mla::MlaPrefillArgs {
+            normed,
+            num_tokens,
+            n: num_tokens as u32,
+            h: ctx.config.hidden_size as u32,
+            nq: self
+                .num_q_heads_override
+                .unwrap_or(ctx.config.num_attention_heads) as u32,
+            nkv,
+            hd,
+            seq_len_start,
+            kv_dim: (nkv * hd) as usize,
+            eps: ctx.config.rms_norm_eps as f32,
+            bf16: 2,
+            bs: bs as u32,
+            stream,
+        }
+    }
+
+    /// GLM MLA attention of one owner's `num_tokens` verify rows continuing
+    /// at `seq_len_start` (a causal prefill chunk; `ctx.attn_metadata` is the
+    /// owner's single-sequence metadata). Returns the pre-all-reduce output.
+    pub(in crate::layers::qwen3_attention) fn prefill_attention_glm_chunk(
+        &self,
+        normed: DevicePtr,
+        num_tokens: usize,
+        seq_len_start: usize,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        anyhow::ensure!(
+            self.mla.as_ref().is_some_and(|m| m.glm_indexer.is_some()),
+            "GLM chunk attention requires a GLM MLA layer"
+        );
+        let bs = kv_cache.block_size();
+        let args = self.mla_prefill_args(normed, num_tokens, seq_len_start, bs, ctx, stream);
+        self.prefill_attention_paged_glm_dense(kv_cache, ctx, &args, seq_len_start)
+    }
+
     pub(in crate::layers::qwen3_attention) fn prefill_attention_paged(
         &self,
         state: &mut dyn crate::layer::LayerState,
@@ -63,21 +116,7 @@ impl Qwen3AttentionLayer {
 
         // ── MLA 2-step prefill (reference: HuggingFace modeling_mistral4.py) ──
         if let Some(ref mla) = self.mla {
-            let args = super::paged_mla::MlaPrefillArgs {
-                normed,
-                num_tokens,
-                n,
-                h,
-                nq,
-                nkv,
-                hd,
-                seq_len_start,
-                kv_dim,
-                eps,
-                bf16,
-                bs: bs as u32,
-                stream,
-            };
+            let args = self.mla_prefill_args(normed, num_tokens, seq_len_start, bs, ctx, stream);
             // DeepSeek-V4-Flash: o_lora_rank > 0 selects the V4 prefill path
             // (wo_a→wo_b output LoRA, GQA FlashAttention). Non-V4 MLA models
             // (Mistral, DeepSeek-V3) keep o_lora_rank == 0 and fall through.

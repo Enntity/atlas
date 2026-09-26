@@ -691,31 +691,11 @@ pub trait Model: Send + Sync {
         bail!("decode_verify_batched: unsupported by this model")
     }
 
-    /// Whether [`Self::decode_verify_glm_long_owners`] can verify `owners`
-    /// repaired long-context K3 sequences in one target traversal.
-    fn can_batch_glm_long_verify(&self, owners: usize) -> bool {
-        self.can_batch_glm_long_verify_rows(owners, crate::layer::glm_long_owner::K3_ROWS)
-    }
-
     /// Whether [`Self::decode_verify_glm_long_owner_rows`] can verify `owners`
     /// long-context sequences of `rows` rows each in one target traversal:
     /// K3 on the repaired MTP lane, a 2..=8 row block on the GLM DFlash lane.
     fn can_batch_glm_long_verify_rows(&self, _owners: usize, _rows: usize) -> bool {
         false
-    }
-
-    /// Owner-batched repaired long-context K3 verify: every owner's
-    /// `[last, d0, d1]` in one traversal (EP-coherent). The K3 form of
-    /// [`Self::decode_verify_glm_long_owner_rows`]; returns the per-owner
-    /// argmax triples in owner order.
-    fn decode_verify_glm_long_owners(
-        &self,
-        tokens: &[[u32; 3]],
-        seqs: &mut [&mut SequenceState],
-    ) -> Result<Vec<[u32; 3]>> {
-        let flat: Vec<u32> = tokens.iter().flatten().copied().collect();
-        let ids = self.decode_verify_glm_long_owner_rows(3, &flat, seqs)?;
-        Ok(ids.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
     }
 
     /// Owner-batched long-context verify of `seqs.len()` owners of `rows`

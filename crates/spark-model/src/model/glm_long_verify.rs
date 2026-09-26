@@ -352,6 +352,19 @@ impl TransformerModel {
                     .collect();
                 layer.decode_glm_long_owners(&mut owners, &mut kv_cache, &stage, &ctx, stream)?;
             }
+            // DFlash: owner o's rows land in save region o; its tail packs
+            // that region to the front commit_ctx reads.
+            if self.dflash_hidden_save.is_some() {
+                let offs: Vec<usize> = (0..n).map(|o| o * rows).collect();
+                let regions: Vec<usize> = (0..n).collect();
+                self.try_dflash_capture_batched_at(
+                    li,
+                    &vec![rows; n],
+                    &offs,
+                    Some(&regions),
+                    stream,
+                )?;
+            }
             if let Some(started) = started {
                 self.gpu.synchronize(stream)?;
                 let us = started.elapsed().as_micros();
@@ -677,7 +690,8 @@ impl TransformerModel {
         self.ep_broadcast_seq_and_cmd(slot, EP_CMD_GLM_LONG_TAIL, true)?;
         self.ep_broadcast_u32(encode_width(owner, rows))?;
         self.ep_broadcast_tokens(tokens)?;
-        self.glm_long_restore_owner(owner, rows)
+        self.glm_long_restore_owner(owner, rows)?;
+        self.pack_dflash_save_region(owner, rows, self.gpu.default_stream())
     }
 
     /// Worker side of E9.

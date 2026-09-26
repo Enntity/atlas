@@ -598,21 +598,41 @@ pub fn step_mtp(
             serial_idxs.extend_from_slice(chunk);
         }
     }
-    // Owner-batched repaired long-context K3 (`ATLAS_GLM_LONG_BATCH_VERIFY`):
-    // grammarless two-draft owners verify in ONE target traversal instead of
-    // one traversal per owner. Everything else keeps the per-sequence path.
-    if glm_repaired_narrow && !dflash_verify_raw_argmax && ladder_nd >= 2 {
+    // Owner-batched GLM verify: grammarless owners with the same draft width
+    // verify in ONE target traversal instead of one traversal per owner —
+    // two drafts on the repaired long-context K3 lane, the most common width
+    // on the DFlash lane. Everything else keeps the per-sequence path.
+    let owner_drafts = if glm_repaired_narrow && !dflash_verify_raw_argmax && ladder_nd >= 2 {
+        Some(2)
+    } else if dflash_verify_raw_argmax {
+        let mut counts = std::collections::BTreeMap::<usize, usize>::new();
+        for &i in &serial_idxs {
+            if active[i].grammar_state.is_none() && !active[i].pending_drafts.is_empty() {
+                *counts.entry(active[i].pending_drafts.len()).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(len, n)| (n, len))
+            .map(|(len, _)| len)
+    } else {
+        None
+    };
+    if let Some(width) = owner_drafts {
         let group: Vec<usize> = serial_idxs
             .iter()
             .copied()
-            .filter(|&i| active[i].grammar_state.is_none() && active[i].pending_drafts.len() == 2)
+            .filter(|&i| {
+                active[i].grammar_state.is_none() && active[i].pending_drafts.len() == width
+            })
             .collect();
         let min_group = std::env::var("ATLAS_GLM_LONG_BATCH_MIN")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(2)
             .max(1);
-        if group.len() >= min_group && model.can_batch_glm_long_verify(group.len()) {
+        if group.len() >= min_group && model.can_batch_glm_long_verify_rows(group.len(), width + 1)
+        {
             serial_idxs.retain(|i| !group.contains(i));
             let mut sorted = group.clone();
             sorted.sort_unstable();

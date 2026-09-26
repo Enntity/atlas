@@ -10,6 +10,7 @@
 //! runs through `ffn_per_owner`; the mHC post is joint.
 
 use super::*;
+use crate::layer::AttnMetadataDev;
 use crate::layer::glm_long_owner::{self as long_owner, GlmLongOwner, GlmLongStage};
 use anyhow::{Context, ensure};
 
@@ -30,6 +31,9 @@ impl Qwen3AttentionLayer {
             self.block_idx != 0 && self.block_idx + 1 != ctx.config.num_hidden_layers,
             "GLM long owner batch MLA cannot be the first or last layer"
         );
+        if crate::speculative::glm_repair_policy::dflash_enabled() {
+            return self.glm_long_owners_mla_chunk(owners, kv_cache, stage, ctx, stream);
+        }
         let rows = long_owner::owner_rows(owners)?;
         let total = owners.len() * rows;
         let b = ctx.buffers;
@@ -103,6 +107,141 @@ impl Qwen3AttentionLayer {
             },
             ffn_out,
             ctx,
+            stream,
+        )
+    }
+
+    /// DFlash lane: the single-owner verify runs MLA layers as a causal
+    /// prefill chunk, so here every row-wise step (mHC pre/post, norms, TP
+    /// all-reduce, FFN) runs once over all owners' rows and only the chunk
+    /// attention runs per owner, through the same prefill kernels.
+    fn glm_long_owners_mla_chunk(
+        &self,
+        owners: &mut [GlmLongOwner<'_>],
+        kv_cache: &mut PagedKvCache,
+        stage: &GlmLongStage,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let hc = self.hc.as_ref().context("GLM long owner MLA needs mHC")?;
+        ensure!(
+            ops::HcVariant::of(hc).applies_block_input_norm() && self.post_attn_out_norm.is_none(),
+            "GLM long owner MLA chunk expects GLM's mHC norm layout"
+        );
+        let rows = long_owner::owner_rows(owners)?;
+        let total = owners.len() * rows;
+        let n = total as u32;
+        let h = ctx.config.hidden_size;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let b = ctx.buffers;
+        let r = stage.rows;
+        let (hidden, normed) = (b.hidden_states(), b.norm_output());
+        self.hc_pre_prefill(&hc.attn, hc, hidden, n, ctx, stream)?;
+        ops::rms_norm(
+            ctx.gpu,
+            self.rms_norm_w_k,
+            hidden,
+            &self.input_norm,
+            normed,
+            n,
+            h as u32,
+            eps,
+            stream,
+        )?;
+        // Joint attention inputs and mHC coefficients survive the per-owner
+        // attention in the stage; attention outputs collect in `stage.hidden`.
+        let joint = [
+            (normed, stage.norm, r.hidden),
+            (b.hc_post(), stage.post, r.post),
+            (b.hc_comb(), stage.comb, r.comb),
+        ];
+        stage.copy(ctx.gpu, &joint, 0, 0, total, true, stream)?;
+        let mut attn_out = DevicePtr::NULL;
+        for (owner, input) in owners.iter().enumerate() {
+            let first = owner * rows;
+            stage.copy(ctx.gpu, &joint[..1], 0, first, rows, false, stream)?;
+            let owner_ctx = ForwardContext {
+                attn_metadata: Some(AttnMetadataDev {
+                    num_seqs: 1,
+                    // Chunk-total length: the last row's causal extent.
+                    seq_len: input.meta.seq_len.offset((rows - 1) * 4),
+                    ..input.meta
+                }),
+                midchunk_capture: None,
+                ..*ctx
+            };
+            attn_out = self.prefill_attention_glm_chunk(
+                normed,
+                rows,
+                input.positions[0],
+                kv_cache,
+                &owner_ctx,
+                stream,
+            )?;
+            stage.copy(
+                ctx.gpu,
+                &[(attn_out, stage.hidden, r.hidden)],
+                0,
+                first,
+                rows,
+                true,
+                stream,
+            )?;
+        }
+        stage.copy(
+            ctx.gpu,
+            &[(attn_out, stage.hidden, r.hidden)],
+            0,
+            0,
+            total,
+            false,
+            stream,
+        )?;
+        stage.copy(ctx.gpu, &joint[1..], 0, 0, total, false, stream)?;
+        if ctx.config.tp_world_size > 1
+            && let Some(comm) = ctx.comm
+        {
+            comm.all_reduce_async(attn_out.0, total * r.hidden, stream)?;
+        }
+        let streams = b.hc_streams();
+        let (post, comb) = (b.hc_post(), b.hc_comb());
+        ops::hc_post_site(
+            ctx.gpu,
+            self.hc_post_k,
+            hc,
+            attn_out,
+            streams,
+            post,
+            comb,
+            streams,
+            n,
+            h as u32,
+            stream,
+        )?;
+        self.hc_pre_prefill(&hc.ffn, hc, hidden, n, ctx, stream)?;
+        ops::rms_norm(
+            ctx.gpu,
+            self.rms_norm_w_k,
+            hidden,
+            &self.post_attn_norm,
+            normed,
+            n,
+            h as u32,
+            eps,
+            stream,
+        )?;
+        let ffn_out = long_owner::ffn_per_owner(&self.ffn, owners.len(), rows, stage, ctx, stream)?;
+        ops::hc_post_site(
+            ctx.gpu,
+            self.hc_post_k,
+            hc,
+            ffn_out,
+            streams,
+            post,
+            comb,
+            streams,
+            n,
+            h as u32,
             stream,
         )
     }
