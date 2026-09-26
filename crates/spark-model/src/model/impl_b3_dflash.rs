@@ -140,12 +140,19 @@ impl TransformerModel {
         let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
         let max_ctx = dstate.max_ctx_len;
-        // Positions past the accumulator are dropped.
-        let rows = proc_count.min(max_ctx.saturating_sub(chunk_start));
+        // The accumulator holds the LAST `max_ctx` prompt positions (the
+        // drafter's context window), not the first: slot 0 is position
+        // `window_start`. Earlier rows of this chunk are dropped.
+        let end = chunk_start + proc_count;
+        let window_start = seq.tokens.len().max(end).saturating_sub(max_ctx);
+        let first = window_start.max(chunk_start);
+        if first >= end {
+            return Ok(());
+        }
         self.dflash_capture_rows(
-            0,
-            rows,
-            acc_base.offset(chunk_start * n_capture * h * bf16 + slot_idx * h * bf16),
+            first - chunk_start,
+            end - first,
+            acc_base.offset((first - window_start) * n_capture * h * bf16 + slot_idx * h * bf16),
             n_capture * h * bf16,
             stream,
         )
@@ -173,13 +180,15 @@ impl TransformerModel {
                 .as_any_mut()
                 .downcast_mut::<crate::layers::DflashProposerState>()
         {
-            let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
+            let end = chunk_start + proc_count;
+            let window_start = seq.tokens.len().max(end).saturating_sub(dstate.max_ctx_len);
+            let new_len = end.saturating_sub(window_start).min(dstate.max_ctx_len);
             dstate.ctx_len = new_len;
             // Phase I (v2): seed per-slot fixed positions for the prompt
-            // captures. Prefill slot i holds prompt position i, so the
-            // fixed rope position is simply its index. Keep parallel to
-            // ctx_len. Re-seed idempotently across prefill chunks.
-            dstate.ctx_positions = (0..new_len).map(|i| i as i32).collect();
+            // captures. Slot i holds prompt position window_start + i (the
+            // tail window kept by try_dflash_prefill_capture_layer). Keep
+            // parallel to ctx_len. Re-seed idempotently across prefill chunks.
+            dstate.ctx_positions = (window_start..window_start + new_len).map(|i| i as i32).collect();
         }
         Ok(())
     }
