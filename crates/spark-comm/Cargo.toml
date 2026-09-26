@@ -20,6 +20,7 @@ metal = []
 
 [dependencies]
 anyhow = { workspace = true }
+atlas-rdma = { workspace = true }
 tracing = "0.1"
 parking_lot = { workspace = true }
 

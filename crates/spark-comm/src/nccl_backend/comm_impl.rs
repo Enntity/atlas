@@ -21,6 +21,9 @@ use std::sync::atomic::Ordering;
 impl CommBackend for NcclBackend {
     fn all_reduce(&self, ptr: u64, bytes: usize) -> Result<()> {
         if self.world_size == 2 && self.add_kernel.load(Ordering::Relaxed) != 0 {
+            if self.try_rdma_all_reduce(ptr, bytes, self.legacy_stream)? {
+                return Ok(());
+            }
             return self.all_reduce_2rank(ptr, bytes, self.legacy_stream);
         }
         // Fallback: ncclAllReduce reduces IN-PLACE on `ptr` and never touches
@@ -45,6 +48,11 @@ impl CommBackend for NcclBackend {
 
     fn all_reduce_async(&self, ptr: u64, bytes: usize, compute_stream: u64) -> Result<()> {
         if self.world_size == 2 && self.add_kernel.load(Ordering::Relaxed) != 0 {
+            // The RDMA pair waits on the compute stream itself: no comm-stream
+            // event hop.
+            if self.try_rdma_all_reduce(ptr, bytes, compute_stream)? {
+                return Ok(());
+            }
             // Use event-based async with 2-rank send/recv path.
             nccl::record_event(self.compute_done_event, compute_stream)?;
             nccl::stream_wait_event(self.comm_stream, self.compute_done_event)?;

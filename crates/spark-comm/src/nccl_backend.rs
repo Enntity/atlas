@@ -67,6 +67,8 @@ unsafe extern "C" {
 }
 
 mod recv_buffer;
+#[cfg(atlas_rdma_verbs)]
+mod rdma_pair;
 use recv_buffer::ensure_payload_fits;
 pub use recv_buffer::{ALL_REDUCE_DTYPE_BYTES, required_recv_bytes};
 
@@ -105,6 +107,9 @@ pub struct NcclBackend {
     /// Bootstrap parameters stored for reconnection.
     master_addr: String,
     master_port: u16,
+    /// Direct RDMA 2-rank all-reduce (`ATLAS_RDMA_ALLREDUCE=1`).
+    #[cfg(atlas_rdma_verbs)]
+    rdma: Option<rdma_pair::RdmaPair>,
 }
 
 // SAFETY: `NcclComm` is an opaque NCCL handle. NCCL guarantees the handle
@@ -186,6 +191,19 @@ impl NcclBackend {
             }
         }
 
+        // Port +1 is the reconnect bootstrap; +2 carries the RDMA identities.
+        #[cfg(atlas_rdma_verbs)]
+        let rdma = if world_size == 2 && rdma_pair::RdmaPair::requested() {
+            Some(rdma_pair::RdmaPair::connect(
+                rank,
+                master_addr,
+                master_port.wrapping_add(2),
+                recv_capacity.next_multiple_of(64),
+            )?)
+        } else {
+            None
+        };
+
         Ok(Self {
             comm: Mutex::new(comm),
             rank,
@@ -202,6 +220,8 @@ impl NcclBackend {
             reconnect_count: AtomicU64::new(0),
             master_addr: master_addr.to_owned(),
             master_port,
+            #[cfg(atlas_rdma_verbs)]
+            rdma,
         })
     }
 
@@ -417,41 +437,62 @@ impl NcclBackend {
         self.check_async_error(comm);
 
         // Local BF16 addition: ptr[i] += recv_buffer[i]
+        self.launch_add(ptr, self.recv_buffer, count, stream)
+    }
+
+    /// `dst[i] += src[i]` over `count` BF16 values on `stream`.
+    fn launch_add(&self, dst: u64, src: u64, count: usize, stream: u64) -> Result<()> {
         let kernel = self.add_kernel.load(Ordering::Relaxed);
-        if kernel != 0 {
-            let threads: u32 = 256;
-            let blocks: u32 = (count as u32).div_ceil(threads);
-            let mut p_dst = ptr;
-            let mut p_src = self.recv_buffer;
-            let mut p_n = count as i32;
-            let mut params: [*mut c_void; 3] = [
-                &mut p_dst as *mut u64 as *mut c_void,
-                &mut p_src as *mut u64 as *mut c_void,
-                &mut p_n as *mut i32 as *mut c_void,
-            ];
-            let status = unsafe {
-                cuLaunchKernel(
-                    kernel,
-                    blocks,
-                    1,
-                    1,
-                    threads,
-                    1,
-                    1,
-                    0,
-                    stream,
-                    params.as_mut_ptr(),
-                    ptr::null_mut(),
-                )
-            };
-            if status != 0 {
-                anyhow::bail!("cuLaunchKernel (bf16_add_inplace) failed: status {status}");
-            }
-        } else {
+        if kernel == 0 {
             anyhow::bail!("bf16_add_inplace kernel not set — call set_add_kernel() first");
         }
-
+        let threads: u32 = 256;
+        let blocks: u32 = (count as u32).div_ceil(threads);
+        let mut p_dst = dst;
+        let mut p_src = src;
+        let mut p_n = count as i32;
+        let mut params: [*mut c_void; 3] = [
+            &mut p_dst as *mut u64 as *mut c_void,
+            &mut p_src as *mut u64 as *mut c_void,
+            &mut p_n as *mut i32 as *mut c_void,
+        ];
+        let status = unsafe {
+            cuLaunchKernel(
+                kernel,
+                blocks,
+                1,
+                1,
+                threads,
+                1,
+                1,
+                0,
+                stream,
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            anyhow::bail!("cuLaunchKernel (bf16_add_inplace) failed: status {status}");
+        }
         Ok(())
+    }
+
+    /// 2-rank all-reduce over the RDMA pair on `stream` when it is up and the
+    /// payload qualifies; `false` means the caller takes the NCCL path.
+    fn try_rdma_all_reduce(&self, ptr: u64, bytes: usize, stream: u64) -> Result<bool> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(rdma) = &self.rdma {
+            ensure_payload_fits(bytes, self.recv_capacity, self.rank, self.world_size)?;
+            if bytes == 0 {
+                return Ok(true);
+            }
+            if let Some(peer) = rdma.exchange(ptr, bytes, stream)? {
+                self.launch_add(ptr, peer, bytes / ALL_REDUCE_DTYPE_BYTES, stream)?;
+                return Ok(true);
+            }
+        }
+        let _ = (ptr, bytes, stream);
+        Ok(false)
     }
 
     fn generate_unique_id() -> Result<NcclUniqueId> {

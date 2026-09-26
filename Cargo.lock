@@ -2382,6 +2382,7 @@ name = "spark-comm"
 version = "1.0.0-beta-preview"
 dependencies = [
  "anyhow",
+ "atlas-rdma",
  "parking_lot",
  "tracing",
 ]
