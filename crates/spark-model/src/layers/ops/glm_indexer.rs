@@ -38,6 +38,7 @@ pub fn glm_index_tail_write(
     keys: DevicePtr,
     gates: DevicePtr,
     tail: DevicePtr,
+    tail_map: DevicePtr,
     slots: DevicePtr,
     num_tokens: u32,
     block_size: u32,
@@ -52,6 +53,7 @@ pub fn glm_index_tail_write(
         .arg_ptr(keys)
         .arg_ptr(gates)
         .arg_ptr(tail)
+        .arg_ptr(tail_map)
         .arg_ptr(slots)
         .arg_u32(num_tokens)
         .arg_u32(block_size)
@@ -66,6 +68,7 @@ pub fn glm_index_kpool_finalize(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     tail: DevicePtr,
+    tail_map: DevicePtr,
     ape: DevicePtr,
     cache: DevicePtr,
     slots: DevicePtr,
@@ -81,6 +84,7 @@ pub fn glm_index_kpool_finalize(
         .grid([num_tokens, 1, 1])
         .block([128, 1, 1])
         .arg_ptr(tail)
+        .arg_ptr(tail_map)
         .arg_ptr(ape)
         .arg_ptr(cache)
         .arg_ptr(slots)

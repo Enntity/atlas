@@ -7,7 +7,7 @@ use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::GpuBackend;
-use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache, TailSlotPlan};
 use spark_runtime::prefix_cache::PrefixCache;
 use spark_runtime::weights::WeightStore;
 
@@ -328,8 +328,11 @@ pub fn build_model(
             config.ep_world_size,
         );
     }
+    // A DFlash drafter replaces this proposer, so the module, its private
+    // context-sized cache and the draft LM head would be dead weight.
     let glm5_mtp_module = if config.model_type == "glm5_next"
         && use_speculative
+        && dflash_args.is_none()
         && (config.ep_rank == 0 || glm5_mtp_distributed)
     {
         match crate::weight_loader::glm5::load_glm5_mtp_module(&store, &config, gpu.as_ref()) {
@@ -387,6 +390,7 @@ pub fn build_model(
     // MTP head bundled, so speculative decoding will silently no-op. Surface
     // this loudly so the user knows the flag was inert.
     if use_speculative
+        && dflash_args.is_none()
         && mtp_weights.is_empty()
         && v4_mtp_module.is_none()
         && glm5_mtp_module.is_none()
@@ -559,8 +563,29 @@ pub fn build_model(
     let sparse_index = glm_cache_shape
         .map(|shape| shape.bf16_index(config.index_kpool, config.index_head_dim))
         .transpose()?;
+    // Raw index tails are only read to finalize a sequence's newest pools, so
+    // lend them to trailing blocks instead of carrying one in every block.
+    // Kept per block where a resume is not lag-bounded: prefix sharing, HSS,
+    // and non-speculative decode (whose rollback ring rewinds arbitrarily).
+    // ATLAS_GLM_INDEX_TAIL_SLOTS=0 restores per-block tails.
+    let tail_slots = (sparse_index.is_some()
+        && use_speculative
+        && !prefix_cache.is_active()
+        && hss_cache_blocks_per_seq.is_none()
+        && std::env::var("ATLAS_GLM_INDEX_TAIL_SLOTS").as_deref() != Ok("0"))
+    .then(|| TailSlotPlan {
+        lag_blocks: max_batch_tokens.div_ceil(kv_block_size) + 2,
+        sequences: max_batch_size + 1,
+    });
+    // GLM-5 writes one NoPE latent to both cache sides, so V aliases K.
     let glm_cache_plan = glm_cache_shape
-        .map(|shape| GlmCachePlan::new(shape, &kv_config, sparse_index))
+        .map(|shape| {
+            let plan = GlmCachePlan::new(shape, &kv_config, sparse_index)?.aliased_v(&kv_config);
+            anyhow::Ok(match (sparse_index, tail_slots) {
+                (Some(index), Some(slots)) => plan.slotted_tails(&kv_config, index, slots),
+                _ => plan,
+            })
+        })
         .transpose()?;
 
     if hss_cache_blocks_per_seq.is_some() {
@@ -730,6 +755,19 @@ pub fn build_model(
             n
         }
     };
+    // Every rank mirrors the head's sequences into its own pool, so a rank
+    // with less headroom (e.g. no drafter, different co-tenants) must not
+    // size a pool the others cannot back: all ranks take the minimum.
+    if let Some(comm) = comm.as_deref().filter(|c| c.world_size() > 1) {
+        let agreed = min_across_ranks(comm, gpu.as_ref(), num_kv_blocks)?;
+        if agreed < num_kv_blocks {
+            tracing::info!(
+                "KV cache: rank {} fits {num_kv_blocks} blocks; all ranks agree on {agreed}",
+                comm.rank()
+            );
+        }
+        num_kv_blocks = agreed;
+    }
     // ATLAS_GLM_KV_CAP_TO_CONTEXTS=1: keep the target pool at exactly the
     // geometry the retained owners verify (surplus blocks consume host
     // reserve without increasing the declared context capacity). The helper re-checks the budget
@@ -883,9 +921,15 @@ pub fn build_model(
             );
         }
     }
-    let mut kv_cache = PagedKvCache::new(kv_config, num_kv_blocks, gpu.as_ref())?;
+    let mut kv_cache =
+        PagedKvCache::new_with_v_alias(
+            kv_config,
+            num_kv_blocks,
+            gpu.as_ref(),
+            glm_cache_plan.is_some(),
+        )?;
     if let Some(index) = sparse_index {
-        kv_cache.attach_sparse_index(index, gpu.as_ref())?;
+        kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
     }
 
     // ── Step 6: Assemble model ──
@@ -1114,4 +1158,26 @@ pub fn build_model(
     // nothing owning the ability to release it.
     model.adopt_weight_store(store);
     Ok(Box::new(model.into_inner()))
+}
+
+/// The minimum of `value` over all ranks (one 8-byte all-gather).
+fn min_across_ranks(
+    comm: &dyn spark_comm::CommBackend,
+    gpu: &dyn GpuBackend,
+    value: usize,
+) -> Result<usize> {
+    let world = comm.world_size();
+    let buf = gpu.alloc(8 * (world + 1))?;
+    let result = (|| {
+        gpu.copy_h2d(&(value as u64).to_le_bytes(), buf)?;
+        comm.all_gather(buf.0, buf.offset(8).0, 8)?;
+        let mut all = vec![0u8; 8 * world];
+        gpu.copy_d2h(buf.offset(8), &mut all)?;
+        all.chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("8-byte rank value")) as usize)
+            .min()
+            .ok_or_else(|| anyhow::anyhow!("empty rank gather"))
+    })();
+    gpu.free(buf)?;
+    result
 }

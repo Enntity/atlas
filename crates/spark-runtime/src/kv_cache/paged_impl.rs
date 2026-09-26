@@ -13,6 +13,18 @@ use crate::gpu::{DevicePtr, GpuBackend};
 impl PagedKvCache {
     /// Allocate the KV cache pool on the GPU.
     pub fn new(config: KvCacheConfig, num_blocks: usize, gpu: &dyn GpuBackend) -> Result<Self> {
+        Self::new_with_v_alias(config, num_blocks, gpu, false)
+    }
+
+    /// [`Self::new`], optionally with every layer's V side aliasing its K
+    /// storage: for caches whose writers store one latent on both sides
+    /// (GLM-5 NoPE MLA), which halves the pool.
+    pub fn new_with_v_alias(
+        config: KvCacheConfig,
+        num_blocks: usize,
+        gpu: &dyn GpuBackend,
+        v_aliases_k: bool,
+    ) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_layers);
         let mut total_bytes: usize = 0;
         for i in 0..config.num_layers {
@@ -21,11 +33,15 @@ impl PagedKvCache {
             // and the V pool is allocated turbo3-sized — avoids the 4× V over-
             // allocation that would result from a single MAX-sized stride.
             let k_block_bytes = config.k_block_bytes_for_layer(i);
-            let v_block_bytes = config.v_block_bytes_for_layer(i);
             let k_pool_bytes = num_blocks * k_block_bytes;
-            let v_pool_bytes = num_blocks * v_block_bytes;
             let k_pool = gpu.alloc(k_pool_bytes)?;
-            let v_pool = gpu.alloc(v_pool_bytes)?;
+            let (v_pool, v_block_bytes, v_pool_bytes) = if v_aliases_k {
+                (k_pool, k_block_bytes, 0)
+            } else {
+                let v_block_bytes = config.v_block_bytes_for_layer(i);
+                let v_pool_bytes = num_blocks * v_block_bytes;
+                (gpu.alloc(v_pool_bytes)?, v_block_bytes, v_pool_bytes)
+            };
             total_bytes += k_pool_bytes + v_pool_bytes;
             layers.push(LayerPool {
                 k_pool,
@@ -62,12 +78,11 @@ impl PagedKvCache {
             );
         } else {
             tracing::info!(
-                "KV cache: {} blocks × {} layers × {} bytes/block = {:.1} GB total",
+                "KV cache: {} blocks × {} layers = {:.1} GB total{}",
                 num_blocks,
                 config.num_layers,
-                config.block_bytes_kv(),
-                (num_blocks * config.num_layers * config.block_bytes_kv()) as f64
-                    / (1024.0 * 1024.0 * 1024.0),
+                total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                if v_aliases_k { " (V aliases K)" } else { "" },
             );
         }
 
@@ -78,6 +93,7 @@ impl PagedKvCache {
             block_ref_counts,
             config,
             sparse_index_config: None,
+            tail_slots: None,
             trace: BlockTrace::new(num_blocks),
         })
     }
@@ -133,13 +149,19 @@ impl PagedKvCache {
         gpu: &dyn crate::gpu::GpuBackend,
         stream: u64,
     ) -> anyhow::Result<()> {
+        // Slotted tails are indexed by slot, not block, and every row is
+        // written before its pool is finalized: nothing to zero.
+        let slotted = self.tail_slots.is_some();
         for layer in &self.layers {
             for (base, stride) in [
                 (layer.k_pool, layer.k_block_stride),
-                (layer.v_pool, layer.v_block_stride),
+                (layer.owned_v_pool(), layer.v_block_stride),
                 (layer.sparse_index_values, layer.sparse_index_values_block_stride),
                 (layer.sparse_index_scales, layer.sparse_index_scales_block_stride),
-                (layer.sparse_index_tail, layer.sparse_index_tail_block_stride),
+                (
+                    if slotted { DevicePtr::NULL } else { layer.sparse_index_tail },
+                    layer.sparse_index_tail_block_stride,
+                ),
             ] {
                 if base.is_null() || stride == 0 {
                     continue;
@@ -246,6 +268,7 @@ impl PagedKvCache {
         }
         if self.block_ref_counts[idx] == 0 {
             self.free_blocks.push(block_idx);
+            self.release_tail_slot_if_freed(block_idx);
             true
         } else {
             false
@@ -313,6 +336,7 @@ impl PagedKvCache {
         }
         if self.block_ref_counts[idx] == 0 {
             self.free_blocks.push(idx as u32);
+            self.release_tail_slot_if_freed(block_idx);
         }
     }
 

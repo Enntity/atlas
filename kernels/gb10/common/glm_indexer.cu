@@ -48,6 +48,16 @@ extern "C" __global__ void glm_index_layernorm_bf16(
     }
 }
 
+// Raw tails are indexed by physical block, or through `tail_map` (block ->
+// lent tail slot) when the cache slot-maps them; an unmapped block is skipped.
+__device__ __forceinline__ bool glm_index_tail_index(
+    const unsigned int* __restrict__ tail_map,
+    unsigned int physical_block,
+    unsigned int* tail_index) {
+    *tail_index = tail_map ? tail_map[physical_block] : physical_block;
+    return *tail_index != 0xFFFFFFFFu;
+}
+
 // Persist the raw key and gate for every token in the physical block that owns
 // it. This is deliberately a separate launch from finalization: CUDA provides
 // stream ordering between launches, while different CTAs in one launch cannot
@@ -56,6 +66,7 @@ extern "C" __global__ void glm_index_tail_write_bf16(
     const __nv_bfloat16* __restrict__ keys,
     const __nv_bfloat16* __restrict__ gates,
     __nv_bfloat16* __restrict__ tail,
+    const unsigned int* __restrict__ tail_map,
     const long long* __restrict__ slots,
     unsigned int num_tokens,
     unsigned int block_size,
@@ -68,8 +79,10 @@ extern "C" __global__ void glm_index_tail_write_bf16(
     if (slot < 0) return;
     const unsigned int physical_block = (unsigned int)(slot / block_size);
     const unsigned int raw_offset = (unsigned int)(slot % block_size);
+    unsigned int tail_index;
+    if (!glm_index_tail_index(tail_map, physical_block, &tail_index)) return;
     __nv_bfloat16* block_tail = (__nv_bfloat16*)((char*)tail
-        + (unsigned long long)physical_block * tail_block_stride_bytes);
+        + (unsigned long long)tail_index * tail_block_stride_bytes);
     __nv_bfloat16* key_dst = block_tail + (unsigned long long)raw_offset * head_dim;
     __nv_bfloat16* gate_dst = block_tail
         + (unsigned long long)block_size * head_dim
@@ -87,6 +100,7 @@ extern "C" __global__ void glm_index_tail_write_bf16(
 // physical-block offset makes arbitrary scheduler chunk boundaries exact.
 extern "C" __global__ void glm_index_kpool_finalize_bf16(
     const __nv_bfloat16* __restrict__ tail,
+    const unsigned int* __restrict__ tail_map,
     const __nv_bfloat16* __restrict__ ape,
     __nv_bfloat16* __restrict__ cache,
     const long long* __restrict__ slots,
@@ -103,8 +117,10 @@ extern "C" __global__ void glm_index_kpool_finalize_bf16(
     const unsigned int physical_block = (unsigned int)(slot / block_size);
     const unsigned int raw_offset = (unsigned int)(slot % block_size);
     if (raw_offset % pool_size != pool_size - 1) return;
+    unsigned int tail_index;
+    if (!glm_index_tail_index(tail_map, physical_block, &tail_index)) return;
     const __nv_bfloat16* block_tail = (const __nv_bfloat16*)((const char*)tail
-        + (unsigned long long)physical_block * tail_block_stride_bytes);
+        + (unsigned long long)tail_index * tail_block_stride_bytes);
     const unsigned int first = raw_offset - (pool_size - 1);
     const __nv_bfloat16* tail_keys = block_tail
         + (unsigned long long)first * head_dim;

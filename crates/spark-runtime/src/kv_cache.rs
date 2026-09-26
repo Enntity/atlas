@@ -419,6 +419,17 @@ struct LayerPool {
     sparse_index_tail_block_stride: usize,
 }
 
+impl LayerPool {
+    /// The V allocation this layer owns: NULL when V aliases K.
+    fn owned_v_pool(&self) -> DevicePtr {
+        if self.v_pool == self.k_pool {
+            DevicePtr::NULL
+        } else {
+            self.v_pool
+        }
+    }
+}
+
 /// Paged KV cache across all attention layers.
 pub struct PagedKvCache {
     layers: Vec<LayerPool>,
@@ -429,6 +440,8 @@ pub struct PagedKvCache {
     block_ref_counts: Vec<u32>,
     config: KvCacheConfig,
     sparse_index_config: Option<SparseIndexCacheConfig>,
+    /// Slot-mapped sparse-index tails; `None` = one tail per physical block.
+    tail_slots: Option<tail_slots::TailSlots>,
     /// Per-block refcount event history (`ATLAS_KV_TRACE=1`; inert otherwise).
     trace: block_trace::BlockTrace,
 }
@@ -438,6 +451,8 @@ mod catalog;
 mod paged_impl;
 mod sparse_index;
 mod sparse_index_impl;
+mod tail_slots;
+pub use tail_slots::{NO_TAIL, TailSlotPlan};
 pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
 /// Release K/V and any attached sparse-index pools for every layer.
 ///
@@ -455,7 +470,7 @@ impl atlas_core::scope::ModelResource<dyn crate::gpu::GpuBackend> for PagedKvCac
         for layer in self.layers.drain(..) {
             for ptr in [
                 layer.k_pool,
-                layer.v_pool,
+                layer.owned_v_pool(),
                 layer.sparse_index_values,
                 layer.sparse_index_scales,
                 layer.sparse_index_tail,
@@ -469,6 +484,12 @@ impl atlas_core::scope::ModelResource<dyn crate::gpu::GpuBackend> for PagedKvCac
                     first_error = Some(e);
                 }
             }
+        }
+        if let Some(tails) = self.tail_slots.take()
+            && let Err(e) = gpu.free(tails.map)
+            && first_error.is_none()
+        {
+            first_error = Some(e);
         }
         self.free_blocks.clear();
         self.block_ref_counts.clear();

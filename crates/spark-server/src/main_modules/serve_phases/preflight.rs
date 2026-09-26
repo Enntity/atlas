@@ -238,7 +238,15 @@ pub(crate) fn preflight_reserve(
     }
     let h_state_bytes = config.ssm_h_state_bytes();
     let conv_state_bytes = config.ssm_conv_state_bytes();
-    let spec_on_pool = args.speculative || args.self_speculative || args.ngram_speculative;
+    // `--dflash` allocates the same verify pools, sized by its γ-derived
+    // draft count (see `build_model`), not the MTP `--num-drafts`.
+    let spec_on_pool =
+        args.speculative || args.dflash || args.self_speculative || args.ngram_speculative;
+    let pool_drafts = if args.dflash {
+        super::build::checked_dflash_num_drafts(args.dflash_gamma)?
+    } else {
+        args.resolved_num_drafts()
+    };
     ssm_h_fp16_preconditions(args, config)?;
     // SSM state pool = per-seq live state (max_batch blobs) + MTP verify
     // state (intermediates + checkpoint) for the slots spec dispatch can
@@ -274,7 +282,7 @@ pub(crate) fn preflight_reserve(
         config.num_ssm_layers() * h_state_bytes,
         config.num_ssm_layers() * conv_state_bytes,
         spec_on_pool,
-        args.resolved_num_drafts(),
+        pool_drafts,
         mtp_state_slots,
         args.dflash,
         // Stage-3 f16-SIZED pool: mirrors `SsmStatePool::new`'s narrowing.
@@ -296,7 +304,7 @@ pub(crate) fn preflight_reserve(
             config.num_ssm_layers() * h_state_bytes,
             config.num_ssm_layers() * conv_state_bytes,
             true,
-            args.resolved_num_drafts(),
+            pool_drafts,
             1,
             true,
             spark_model::layers::qwen3_ssm::ssm_h_f16_pool_enabled(),
@@ -321,7 +329,7 @@ pub(crate) fn preflight_reserve(
                 config.ssm_qkvz_size(),
                 config.linear_num_value_heads,
             ),
-            args.resolved_num_drafts() + 1,
+            pool_drafts + 1,
             mtp_state_slots + usize::from(long_mtp),
         )
     } else {

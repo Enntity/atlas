@@ -3,7 +3,7 @@
 //! Validated GLM NoPE cache geometry and current-layout byte accounting.
 
 use anyhow::{Result, ensure};
-use spark_runtime::kv_cache::{KvCacheConfig, SparseIndexCacheConfig};
+use spark_runtime::kv_cache::{KvCacheConfig, SparseIndexCacheConfig, TailSlotPlan};
 
 /// Only constructible for the GLM shape supported by the existing kernels.
 /// This describes geometry, not a new KV dtype or allocation policy.
@@ -68,6 +68,8 @@ impl GlmMlaShape {
 pub(crate) struct GlmCachePlan {
     token_block_size: usize,
     block_bytes_all_layers: usize,
+    /// Pool-size-independent bytes (slot-mapped index tails).
+    fixed_bytes: usize,
 }
 
 impl GlmCachePlan {
@@ -126,7 +128,37 @@ impl GlmCachePlan {
         Ok(Self {
             token_block_size: config.block_size,
             block_bytes_all_layers: total,
+            fixed_bytes: 0,
         })
+    }
+
+    /// The plan when index tails are lent per `plan`
+    /// (`PagedKvCache::attach_sparse_index_with_tail_slots`): each block
+    /// keeps only a `u32` map entry, and the slot pool is a fixed cost.
+    pub(crate) fn slotted_tails(
+        self,
+        config: &KvCacheConfig,
+        index: SparseIndexCacheConfig,
+        plan: TailSlotPlan,
+    ) -> Self {
+        let tail = index.tail_block_bytes(config.block_size) * config.num_layers;
+        Self {
+            block_bytes_all_layers: self.block_bytes_all_layers - tail + std::mem::size_of::<u32>(),
+            fixed_bytes: self.fixed_bytes + plan.capacity() * tail,
+            ..self
+        }
+    }
+
+    /// The plan when every layer's V side aliases its K storage
+    /// (`PagedKvCache::new_with_v_alias`): the V bytes are not allocated.
+    pub(crate) fn aliased_v(self, config: &KvCacheConfig) -> Self {
+        let v_bytes: usize = (0..config.num_layers)
+            .map(|layer| config.v_block_bytes_for_layer(layer))
+            .sum();
+        Self {
+            block_bytes_all_layers: self.block_bytes_all_layers - v_bytes,
+            ..self
+        }
     }
 
     pub(crate) fn block_bytes_all_layers(self) -> usize {
@@ -134,7 +166,7 @@ impl GlmCachePlan {
     }
 
     pub(crate) fn num_blocks_for_budget(self, available_bytes: usize) -> usize {
-        available_bytes / self.block_bytes_all_layers
+        available_bytes.saturating_sub(self.fixed_bytes) / self.block_bytes_all_layers
     }
 
     pub(crate) fn bytes_for_blocks(self, blocks: usize) -> Result<usize> {
@@ -151,6 +183,7 @@ impl GlmCachePlan {
         );
         blocks
             .checked_mul(self.block_bytes_all_layers)
+            .and_then(|n| n.checked_add(self.fixed_bytes))
             .ok_or_else(|| anyhow::anyhow!("GLM cache allocation byte count overflow"))
     }
 }
@@ -174,6 +207,41 @@ mod tests {
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         }
+    }
+
+    #[test]
+    fn slotted_tails_move_tail_bytes_from_blocks_to_a_fixed_pool() {
+        let shape = GlmMlaShape::new(512, 0).unwrap();
+        let cfg = config(11, KvCacheDtype::Bf16);
+        let index = shape.bf16_index(4, 128).unwrap();
+        let plan = GlmCachePlan::new(shape, &cfg, Some(index)).unwrap().aliased_v(&cfg);
+        let slots = TailSlotPlan { lag_blocks: 258, sequences: 5 };
+        let slotted = plan.slotted_tails(&cfg, index, slots);
+        // 8 KiB raw key+gate tail per layer leaves each block; a u32 map
+        // entry joins it; 5 × 260 lent tails become fixed.
+        assert_eq!(
+            slotted.block_bytes_all_layers(),
+            plan.block_bytes_all_layers() - 11 * 8192 + 4
+        );
+        assert_eq!(
+            slotted.bytes_for_blocks(1).unwrap(),
+            slotted.block_bytes_all_layers() + 1300 * 11 * 8192
+        );
+        assert_eq!(slotted.num_blocks_for_budget(1300 * 11 * 8192), 0);
+        assert_eq!(
+            slotted.num_blocks_for_budget(1300 * 11 * 8192 + 3 * slotted.block_bytes_all_layers()),
+            3
+        );
+    }
+
+    #[test]
+    fn aliased_v_drops_exactly_the_v_bytes() {
+        let shape = GlmMlaShape::new(512, 0).unwrap();
+        let cfg = config(11, KvCacheDtype::Bf16);
+        let plan = GlmCachePlan::new(shape, &cfg, None).unwrap();
+        // BF16 NoPE512, 16-token blocks: 16 KiB per side per layer.
+        assert_eq!(plan.block_bytes_all_layers(), 11 * 2 * 16384);
+        assert_eq!(plan.aliased_v(&cfg).block_bytes_all_layers(), 11 * 16384);
     }
 
     #[test]

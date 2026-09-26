@@ -15,10 +15,25 @@ impl PagedKvCache {
         spec: SparseIndexCacheConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
+        self.attach_sparse_index_with_tail_slots(spec, None, gpu)
+    }
+
+    /// [`Self::attach_sparse_index`] with raw tails lent per `tail_slots`
+    /// (see `tail_slots.rs`) instead of one tail per physical block.
+    pub fn attach_sparse_index_with_tail_slots(
+        &mut self,
+        spec: SparseIndexCacheConfig,
+        tail_slots: Option<super::TailSlotPlan>,
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
         if self.sparse_index_config.is_some() {
             bail!("sparse index cache is already attached");
         }
         spec.block_bytes(self.config.block_size)?;
+        let tails = tail_slots
+            .map(|plan| super::tail_slots::TailSlots::new(self.num_blocks, plan, gpu))
+            .transpose()?;
+        let tail_entries = tails.as_ref().map_or(self.num_blocks, |t| t.capacity());
         let values_stride = spec.values_block_bytes(self.config.block_size);
         let scales_stride = spec.scales_block_bytes(self.config.block_size);
         let tail_stride = spec.tail_block_bytes(self.config.block_size);
@@ -44,7 +59,7 @@ impl PagedKvCache {
                     }
                 }
             };
-            let tail = match gpu.alloc(self.num_blocks * tail_stride) {
+            let tail = match gpu.alloc(tail_entries * tail_stride) {
                 Ok(ptr) => ptr,
                 Err(error) => {
                     let _ = gpu.free(values);
@@ -52,6 +67,9 @@ impl PagedKvCache {
                         let _ = gpu.free(scales);
                     }
                     free_allocations(gpu, allocations);
+                    if let Some(tails) = tails {
+                        let _ = gpu.free(tails.map);
+                    }
                     return Err(error);
                 }
             };
@@ -66,13 +84,18 @@ impl PagedKvCache {
             layer.sparse_index_tail_block_stride = tail_stride;
         }
         self.sparse_index_config = Some(spec);
+        self.tail_slots = tails;
+        let block_bytes = spec.block_bytes(self.config.block_size)? - tail_stride;
         let total =
-            self.num_blocks * self.layers.len() * spec.block_bytes(self.config.block_size)?;
+            self.layers.len() * (self.num_blocks * block_bytes + tail_entries * tail_stride);
         tracing::info!(
-            "Sparse index cache: {} blocks × {} layers × {} bytes/block = {:.1} MiB",
+            "Sparse index cache: {} blocks × {} layers × {} bytes/block + {} tails ({}) \
+             = {:.1} MiB",
             self.num_blocks,
             self.layers.len(),
-            spec.block_bytes(self.config.block_size)?,
+            block_bytes,
+            tail_entries,
+            if tail_slots.is_some() { "slot-mapped" } else { "one per block" },
             total as f64 / (1024.0 * 1024.0),
         );
         Ok(())

@@ -877,7 +877,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // higher batch we may want to reduce to a smaller working window.
         let bf16 = 2usize;
         let ctx_slot_bytes = self.target_layer_ids.len() * self.target_hidden_size * bf16;
-        let total = self.max_seq_len * ctx_slot_bytes;
+        // The accumulator holds the drafter's context window, not the whole
+        // sequence: prefill capture keeps the prompt's last `max_ctx_len`
+        // rows and commits slide past it (see `commit_ctx`).
+        let max_ctx_len = self.window_size.unwrap_or(self.max_seq_len).min(self.max_seq_len);
+        let total = max_ctx_len * ctx_slot_bytes;
         let ctx_hidden_acc = gpu.alloc(total)?;
         // Initialize to zero so stale data doesn't leak between sequences.
         // Transactional: a failed memset frees the accumulator instead of
@@ -903,10 +907,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_len: 0,
             last_num_accepted: 0,
             skip_next_decode_append: false,
-            max_ctx_len: self
-                .window_size
-                .unwrap_or(self.max_seq_len)
-                .min(self.max_seq_len),
+            max_ctx_len,
             ctx_slot_bytes,
             // Phase 2 Option B: lazily allocated on first propose when
             // ATLAS_DFLASH_OPTION_B=1. None until then to keep alloc_state

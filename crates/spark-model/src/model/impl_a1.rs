@@ -475,7 +475,10 @@ impl TransformerModel {
                 && crate::speculative::glm_repair_policy::long_context_enabled(),
             max_seq_len,
         );
+        // A DFlash head never prefills from this buffer (its context comes
+        // from the multi-layer capture below), so it is not allocated.
         let mtp_prefill_hidden = if has_mtp
+            && dflash_kgamma == 0
             && mtp_quant.supports_drafter_prefill()
             && crate::layers::mtp_drafter_prefill_enabled(&levers)
         {

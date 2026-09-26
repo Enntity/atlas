@@ -152,8 +152,9 @@ int main() {
         auto* tail = candidate ? new_tail.ptr : old_tail.ptr;
         auto* pool = candidate ? new_pool.ptr : old_pool.ptr;
         glm_index_tail_write_bf16<<<1, 128, 0, stream>>>(raw_keys.ptr + row * 128,
-            raw_gates.ptr + row * 128, tail, slots.ptr + row, 1, block, 4, 128, tail_bytes);
-        glm_index_kpool_finalize_bf16<<<1, 128, 0, stream>>>(tail, ape.ptr, pool,
+            raw_gates.ptr + row * 128, tail, nullptr, slots.ptr + row, 1, block, 4, 128,
+            tail_bytes);
+        glm_index_kpool_finalize_bf16<<<1, 128, 0, stream>>>(tail, nullptr, ape.ptr, pool,
             slots.ptr + row, 1, block, 4, 128, tail_bytes, pool_bytes);
     };
     const auto dense = [&](unsigned row, const unsigned* len, __nv_bfloat16* out) {

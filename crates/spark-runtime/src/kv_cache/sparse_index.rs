@@ -63,7 +63,7 @@ impl SparseIndexCacheConfig {
     /// Uncompressed keys and gates for the pool currently being assembled.
     /// Keeping this paged (rather than in per-layer scalar state) makes a
     /// prefill/decode seam and interleaved sequences obey identical ownership.
-    pub(super) fn tail_block_bytes(self, kv_block_size: usize) -> usize {
+    pub fn tail_block_bytes(self, kv_block_size: usize) -> usize {
         kv_block_size * self.head_dim * 2 * std::mem::size_of::<u16>()
     }
 }

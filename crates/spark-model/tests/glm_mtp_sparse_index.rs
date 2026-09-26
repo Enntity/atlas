@@ -17,6 +17,7 @@ fn bf16(value: f32) -> [u8; 2] {
 }
 struct Pool {
     tail: DevicePtr,
+    tail_map: DevicePtr,
     keys: DevicePtr,
     blocks: usize,
 }
@@ -25,7 +26,23 @@ fn pool(gpu: &dyn GpuBackend, blocks: usize) -> Result<Pool> {
     let keys = gpu.alloc(blocks * 1024)?;
     gpu.memset(tail, 0, blocks * 8192)?;
     gpu.memset(keys, 0, blocks * 1024)?;
-    Ok(Pool { tail, keys, blocks })
+    Ok(Pool {
+        tail,
+        tail_map: DevicePtr::NULL,
+        keys,
+        blocks,
+    })
+}
+/// Tails lent through a block -> slot map; a rotation keeps it a bijection
+/// that never coincides with physical addressing.
+fn slotted_pool(gpu: &dyn GpuBackend, blocks: usize) -> Result<Pool> {
+    let map: Vec<u8> = (0..blocks)
+        .flat_map(|b| (((b + blocks / 2 + 1) % blocks) as u32).to_le_bytes())
+        .collect();
+    Ok(Pool {
+        tail_map: upload(gpu, &map)?,
+        ..pool(gpu, blocks)?
+    })
 }
 fn write(
     gpu: &dyn GpuBackend,
@@ -66,6 +83,7 @@ fn write(
         key,
         gate,
         pool.tail,
+        pool.tail_map,
         slot,
         rows as u32,
         16,
@@ -78,6 +96,7 @@ fn write(
         gpu,
         gpu.kernel("glm_indexer", "glm_index_kpool_finalize_bf16")?,
         pool.tail,
+        pool.tail_map,
         ape,
         pool.keys,
         slot,
@@ -248,11 +267,27 @@ fn rejected_pool_and_block_boundaries_match_clean_history() -> Result<()> {
                 .flat_map(|b| ((blocks - 1 - b) as i32).to_le_bytes())
                 .collect::<Vec<_>>(),
         )?;
-        for accepted_drafts in 0..=2 {
-            let actual = pool(&gpu, blocks)?;
+        for (accepted_drafts, slotted) in (0..=2).flat_map(|a| [(a, false), (a, true)]) {
+            let actual = if slotted {
+                slotted_pool(&gpu, blocks)?
+            } else {
+                pool(&gpu, blocks)?
+            };
             let clean = pool(&gpu, blocks)?;
             write(&gpu, &actual, ape, blocks, 0, base, None)?;
             write(&gpu, &clean, ape, blocks, 0, base + 7, None)?;
+            if slotted {
+                // Position 0 lives in physical block `blocks - 1`; its raw key
+                // must sit in that block's lent slot, not at its block id
+                // (another block's rows land there, with a different key).
+                let slot = (blocks - 1 + blocks / 2 + 1) % blocks;
+                let mut raw = [0u8; 2];
+                gpu.copy_d2h(actual.tail.offset(slot * 8192), &mut raw)?;
+                ensure!(
+                    u16::from_le_bytes(raw) == 0x2800,
+                    "slot-mapped tail row landed outside its slot (base={base})"
+                );
+            }
             let kept = 1 + accepted_drafts;
             write(&gpu, &actual, ape, blocks, base, 3, Some(base + kept))?;
             // At rollback, future completed pools must be excluded by length.
@@ -273,6 +308,9 @@ fn rejected_pool_and_block_boundaries_match_clean_history() -> Result<()> {
             }
             for p in [actual.tail, actual.keys, clean.tail, clean.keys] {
                 gpu.free(p)?;
+            }
+            if slotted {
+                gpu.free(actual.tail_map)?;
             }
         }
         gpu.free(table)?;
