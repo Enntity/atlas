@@ -244,6 +244,7 @@ fn load_moe(
         // its block-scale swizzle. Avoid materializing the much larger Atlas
         // transposed expert twins in this mode.
         layer.build_cutlass_grouped_sfb(gpu, config, gpu.default_stream())?;
+        layer.transpose_shared_only(gpu, config)?;
     } else if allow_prefill_layout
         && unified_moe_layout_enabled(std::env::var("ATLAS_UNIFIED_MOE_LAYOUT").ok().as_deref())
     {

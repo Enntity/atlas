@@ -64,6 +64,10 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<DevicePtr> {
         self.btile_input_guard(input, 1, ctx, stream)?;
+        if self.routed_scales_released {
+            self.forward_prefill(input, 1, ctx, stream)?;
+            return Ok(ctx.buffers.moe_output());
+        }
         // SOLID Incr-4: a genuine single-token decode (num_seqs == 1) folds the
         // routed expert down_proj LoRA delta below (before the wsum blend). The
         // multi-seq per-token reuse of this fn (num_seqs > 1 — decode_batch's

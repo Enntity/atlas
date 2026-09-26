@@ -218,6 +218,9 @@ pub struct MoeLayer {
     cutlass_grouped_host: Option<ops::MoeCutlassHostTables>,
     /// Keeps the per-expert SFB buffers alive.
     _cutlass_sfb_owned: Vec<DevicePtr>,
+    /// Routed checkpoint scales were freed after the CUTLASS SFB swizzle; every
+    /// routed-expert call must take the grouped CUTLASS path.
+    routed_scales_released: bool,
     /// Lazy down_proj transpose scratch — populated at the start of each
     /// prefill call when the persistent transpose pass couldn't fit
     /// down_proj. Decode keeps using `down_ptrs` (untransposed); prefill

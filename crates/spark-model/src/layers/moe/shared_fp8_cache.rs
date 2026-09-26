@@ -130,11 +130,7 @@ pub fn validate_shared_fp8_cache_profile(
     validate_config(config)?;
     ensure!(!has_adapters, "shared FP8 cache excludes adapters");
     prefill_rows::validate_budget(prefill_budget, extended.unwrap_or(1024))?;
-    for key in [
-        "ATLAS_GLM_K5_BATCHED_SHARED",
-        "ATLAS_NVFP4_MMQ_MOE",
-        "ATLAS_MOE_GROUPED_CUTLASS",
-    ] {
+    for key in ["ATLAS_GLM_K5_BATCHED_SHARED", "ATLAS_NVFP4_MMQ_MOE"] {
         let value = std::env::var(key).unwrap_or_default();
         ensure!(
             value != "1" && !value.eq_ignore_ascii_case("true"),

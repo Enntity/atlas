@@ -37,7 +37,7 @@ impl MoeLayer {
         // pipeline as ordinary prefill rather than interpreting repacked bytes
         // with the old-layout kernels. `forward_prefill` does not bounce MMQ
         // layers back here, so this cannot recurse.
-        if self.nvfp4_mmq_layout {
+        if self.nvfp4_mmq_layout || self.routed_scales_released {
             return self.forward_prefill(input, num_tokens, ctx, stream);
         }
 

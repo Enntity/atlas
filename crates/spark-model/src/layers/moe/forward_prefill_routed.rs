@@ -489,9 +489,18 @@ impl MoeLayer {
                 ctx,
                 stream,
             )?;
+            // CUTLASS grouped down packs its own A from the BF16 SiLU output in
+            // `expert_gate_out`, so it must not take the FP4-quantizing SiLU.
+            let cutlass_down = grouped_cutlass_gate_up_enabled()
+                && grouped_cutlass_down_enabled()
+                && self
+                    .cutlass_grouped_host
+                    .as_ref()
+                    .is_some_and(|t| t.down.is_some());
             let fused_nvfp4_down = self.nvfp4_prequant_moe
                 && self.nvfp4_fused_silu_quant
-                && self.silu_mul_quant_nvfp4_k.0 != 0;
+                && self.silu_mul_quant_nvfp4_k.0 != 0
+                && !cutlass_down;
             if fused_nvfp4_down {
                 self.fused_silu_prequant_fp4_down(
                     expert_gate_out,
@@ -520,12 +529,11 @@ impl MoeLayer {
             // Compounds with the FP4 gate_up path to run the whole FFN at FP4.
             // CUTLASS grouped down reads the ORIGINAL [N,K/2] table, so like
             // gate_up it must be reachable without down_ptrs_t.
-            if grouped_cutlass_gate_up_enabled()
+            if cutlass_down
                 && let Some(down_host) = self
                     .cutlass_grouped_host
                     .as_ref()
                     .and_then(|t| t.down.as_ref())
-                && grouped_cutlass_down_enabled()
             {
                 // ── CUTLASS grouped NVFP4 down (ATLAS_HOLO_MOE_GROUPED_CUTLASS
                 //    + ATLAS_HOLO_MOE_GROUPED_DOWN) ──

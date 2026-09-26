@@ -410,6 +410,7 @@ impl MoeLayer {
             down_ptrs_t: None,
             cutlass_grouped_host: None,
             _cutlass_sfb_owned: Vec::new(),
+            routed_scales_released: false,
             down_t_scratch_packed: None,
             down_t_scratch_scale: None,
             moe_transpose_u8_batched_k: gpu
