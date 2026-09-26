@@ -104,6 +104,7 @@ impl TransformerModel {
             kv_valid_tokens: 0,
             last_decode_ckpt_block: 0,
             prompt_len: 0,
+            eos_ban: crate::traits::EosBan::default(),
             collect_prompt_logprobs: None,
             prompt_logprobs: Vec::new(),
             disk_block_ids: Vec::new(),

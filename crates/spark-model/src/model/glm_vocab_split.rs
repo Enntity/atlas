@@ -3,8 +3,10 @@
 //!
 //! Each rank projects only its contiguous half of the BF16 head with the same
 //! batched GEMV (per-column arithmetic unchanged), reduces it with
-//! `argmax_bf16_value`, and swaps one `(f32, u32)` pair per row with its peer;
-//! a device merge applies the full-vocabulary tie rule. The other half of the
+//! `argmax_bf16_value_ban` (the best pair and the best pair outside the
+//! min_tokens end tokens), and swaps both `(f32, u32)` pairs per row with its
+//! peer; a device merge applies the full-vocabulary tie rule, taking the
+//! unbanned pair on rows under a min_tokens floor. The other half of the
 //! logits buffer is left stale, so this serves only argmax-consuming verify.
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
@@ -12,6 +14,7 @@ use spark_runtime::kernel_args::KernelLaunch;
 use std::sync::OnceLock;
 
 use super::types::TransformerModel;
+use crate::traits::EosBan;
 use crate::layers::ops;
 use crate::weight_map::DenseWeight;
 
@@ -26,12 +29,14 @@ fn enabled() -> bool {
 
 impl TransformerModel {
     /// Project `normed` [rows, H] and write global argmax IDs to `out` [rows].
+    /// Rows whose bit is set in `ban_rows` never pick one of `ban.ids`.
     /// Returns `Ok(false)` without launching when the split does not apply.
     pub(super) fn glm_split_head_argmax(
         &self,
         normed: DevicePtr,
         rows: usize,
         out: DevicePtr,
+        ban: (u64, &EosBan),
         stream: u64,
     ) -> Result<bool> {
         let Some(comm) = self.comm.as_ref() else {
@@ -47,7 +52,7 @@ impl TransformerModel {
             || self.logit_softcap_kernel.0 != 0
             || self.dense_gemv_batchm_kernel.0 == 0
             || rows == 0
-            || rows * 8 > PAIRS_BYTES
+            || rows * 16 > PAIRS_BYTES
         {
             return Ok(false);
         }
@@ -56,8 +61,8 @@ impl TransformerModel {
             Some(k) => *k,
             None => *KERNELS.get_or_init(|| {
                 (
-                    self.gpu.kernel("argmax", "argmax_bf16_value").unwrap_or(KernelHandle(0)),
-                    self.gpu.kernel("argmax", "argmax_pair_merge").unwrap_or(KernelHandle(0)),
+                    self.gpu.kernel("argmax", "argmax_bf16_value_ban").unwrap_or(KernelHandle(0)),
+                    self.gpu.kernel("argmax", "argmax_pair_merge_ban").unwrap_or(KernelHandle(0)),
                 )
             }),
         };
@@ -126,17 +131,29 @@ impl TransformerModel {
         }
         let local = self.buffers.scratch().offset(PAIRS_OFFSET);
         let peer = local.offset(PAIRS_BYTES);
-        for r in 0..rows {
-            ops::argmax_bf16_value(
-                self.gpu.as_ref(),
-                value_k,
-                logits.offset((r * vocab + start) * 2),
-                local.offset(r * 8),
-                shard as u32,
-                stream,
-            )?;
+        let (ban_rows, ban) = ban;
+        ensure!(
+            ban_rows == 0 || !self.gpu.stream_is_capturing(stream),
+            "min_tokens verify ban cannot be graph-captured"
+        );
+        let local_id = |id: u32| {
+            (id as usize)
+                .checked_sub(start)
+                .filter(|&i| i < shard)
+                .map_or(u32::MAX, |i| i as u32)
+        };
+        let mut launch = KernelLaunch::new(self.gpu.as_ref(), value_k)
+            .grid([rows as u32, 1, 1])
+            .block([1024, 1, 1])
+            .arg_ptr(logits.offset(start * 2))
+            .arg_ptr(local)
+            .arg_u32(shard as u32)
+            .arg_u32(vocab as u32);
+        for id in ban.ids {
+            launch = launch.arg_u32(local_id(id));
         }
-        comm.peer_exchange_async(local.0, peer.0, rows * 8, stream)?;
+        launch.launch(stream)?;
+        comm.peer_exchange_async(local.0, peer.0, rows * 16, stream)?;
         KernelLaunch::new(self.gpu.as_ref(), merge_k)
             .grid([1, 1, 1])
             .block([32, 1, 1])
@@ -146,6 +163,8 @@ impl TransformerModel {
             .arg_u32(rows as u32)
             .arg_u32(shard as u32)
             .arg_u32(comm.rank() as u32)
+            .arg_u32(ban_rows as u32)
+            .arg_u32((ban_rows >> 32) as u32)
             .launch(stream)?;
         Ok(true)
     }

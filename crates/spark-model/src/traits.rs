@@ -197,6 +197,10 @@ pub struct SequenceState {
     /// (needs a fresh bump so `release` in `free_sequence` leaves the
     /// cache's baseline ref intact). 0 before the first prefill.
     pub prompt_len: usize,
+    /// `min_tokens` for greedy verify heads: end tokens are masked out of
+    /// rows that predict a position below the floor (vLLM semantics), so a
+    /// suppressed end token never reaches the KV cache.
+    pub eos_ban: EosBan,
     /// Disk-block-ID list for `--high-speed-swap` (Phase 6.1.c).
     /// Each entry is a stable disk-side identifier that outlives HBM block
     /// recycling. `disk_block_ids` grows monotonically with the sequence
@@ -271,6 +275,38 @@ pub struct SequenceState {
     pub early_stopping: bool,
 }
 
+/// End tokens a greedy verify head may not pick below `floor` (the sequence
+/// position `prompt_len + min_tokens`). Unused id slots are `u32::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EosBan {
+    pub floor: usize,
+    pub ids: [u32; 4],
+}
+
+impl Default for EosBan {
+    fn default() -> Self {
+        Self { floor: 0, ids: [u32::MAX; 4] }
+    }
+}
+
+impl EosBan {
+    pub fn new(prompt_len: usize, min_tokens: usize, eos_tokens: &[u32]) -> Self {
+        let mut ids = [u32::MAX; 4];
+        for (slot, &id) in ids.iter_mut().zip(eos_tokens) {
+            *slot = id;
+        }
+        Self { floor: if min_tokens == 0 { 0 } else { prompt_len + min_tokens }, ids }
+    }
+
+    /// Bit `j` is set when verify row `j` of a pass whose first input sits at
+    /// `base_pos` predicts a position below the floor (row `j` predicts
+    /// `base_pos + j + 1`). `rows` is at most 64.
+    pub fn row_mask(&self, base_pos: usize, rows: usize) -> u64 {
+        let banned = self.floor.saturating_sub(base_pos + 1).min(rows).min(64);
+        if banned == 64 { u64::MAX } else { (1u64 << banned) - 1 }
+    }
+}
+
 impl SequenceState {
     /// A detached, host-only sequence state: no GPU resources, no SSM
     /// slot, no layer states, every counter zeroed. The single source
@@ -306,6 +342,7 @@ impl SequenceState {
             kv_valid_tokens: 0,
             last_decode_ckpt_block: 0,
             prompt_len: 0,
+            eos_ban: EosBan::default(),
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: Vec::new(),
             collect_prompt_logprobs: None,
@@ -391,3 +428,22 @@ mod logprobs;
 mod model;
 pub use logprobs::*;
 pub use model::{BeamReq, Model, padded_batch_n};
+
+#[cfg(test)]
+mod eos_ban_tests {
+    use super::EosBan;
+
+    #[test]
+    fn rows_below_the_min_tokens_floor_are_masked() {
+        // prompt 100, min_tokens 10: output index i sits at position 100 + i,
+        // so positions below 110 may not end the turn.
+        let ban = EosBan::new(100, 10, &[7, 9]);
+        assert_eq!(ban.ids, [7, 9, u32::MAX, u32::MAX]);
+        assert_eq!(ban.row_mask(100, 8), 0xFF); // predicts 101..=108
+        assert_eq!(ban.row_mask(105, 8), 0b1111); // 106..=109 banned, 110.. free
+        assert_eq!(ban.row_mask(109, 8), 0);
+        assert_eq!(ban.row_mask(0, 64), u64::MAX); // all 64 rows below 110
+        assert_eq!(EosBan::new(100, 0, &[7]).row_mask(0, 8), 0);
+        assert_eq!(EosBan::default().row_mask(0, 8), 0);
+    }
+}

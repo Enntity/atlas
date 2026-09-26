@@ -148,8 +148,11 @@ pub(super) fn build_active_seq_from_prefill(
         think_end_token,
         glm_tool_boundary.filter(|_| p.tools_present),
     );
+    let mut seq = p.seq;
+    // Greedy verify heads mask end tokens below the min_tokens floor.
+    seq.eos_ban = spark_model::traits::EosBan::new(seq.prompt_len, p.min_tokens, &p.eos_tokens);
     ActiveSeq {
-        seq: p.seq,
+        seq,
         session_hash: p.session_hash,
         last_token: first,
         output_tokens: if (!immediate_finish && spontaneous_think) || p.max_tokens == 0 {

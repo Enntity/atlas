@@ -212,6 +212,15 @@ impl TransformerModel {
             self.can_batch_glm_long_verify_impl(n, rows) && tokens.len() == n * rows,
             "GLM long owner verify refused for {n} owners x {rows} rows"
         );
+        // Owner o's rows sit at o * rows; its min_tokens floor masks them there.
+        let ban = seqs.first().map(|s| s.eos_ban).unwrap_or_default();
+        let ban_rows = seqs.iter().enumerate().fold(0u64, |mask, (o, seq)| {
+            mask | seq
+                .eos_ban
+                .row_mask(seq.seq_len, rows)
+                .checked_shl((o * rows) as u32)
+                .unwrap_or(0)
+        });
         let stage = self
             .glm_long_stage
             .context("GLM long owner stage missing")?;
@@ -404,7 +413,7 @@ impl TransformerModel {
             stream,
         )?;
         let argmax = self.buffers.scratch();
-        if !self.glm_split_head_argmax(normed, total, argmax, stream)? {
+        if !self.glm_split_head_argmax(normed, total, argmax, (ban_rows, &ban), stream)? {
             self.lm_head_batched(normed, total as u32, self.buffers.logits(), stream)?;
             let vocab = self.config.vocab_size;
             for r in 0..total {

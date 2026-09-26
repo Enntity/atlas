@@ -281,25 +281,92 @@ extern "C" __global__ void argmax_fp32(
     if (tid == 0) out[0] = s_idx[0];
 }
 
-// Merge per-row TP2 shard pairs from argmax_bf16_value into global token IDs,
-// on device so a graph-captured verify needs no host round trip. `local` and
-// `peer` hold [rows][value_bits, shard_index]; `rank` orders them. The rule is
-// the host glm5_mtp argmax_merge::merge: a valid tie picks the higher global
-// ID (rank one); two untouched sentinels keep index zero.
+// Per-row TP2 shard argmax that also reports the best index outside a small
+// banned set (min_tokens end tokens), in one pass. Row r reads
+// logits[r * row_stride .. + n]; `ban0..3` are shard-local indices
+// (0xFFFFFFFF = unused). out[r] = {best bits, best index, unbanned bits,
+// unbanned index}, same comparator as argmax_bf16_value.
+// Grid: (rows, 1, 1)  Block: (1024, 1, 1)
+extern "C" __global__ void argmax_bf16_value_ban(
+    const __nv_bfloat16* __restrict__ logits,
+    unsigned int* __restrict__ out,
+    unsigned int n,
+    unsigned int row_stride,
+    unsigned int ban0,
+    unsigned int ban1,
+    unsigned int ban2,
+    unsigned int ban3
+) {
+    __shared__ float s_val[2][1024];
+    __shared__ unsigned int s_idx[2][1024];
+
+    const unsigned int tid = threadIdx.x;
+    const __nv_bfloat16* row = logits + (size_t)blockIdx.x * row_stride;
+    float best = -1e30f, free_best = -1e30f;
+    unsigned int best_idx = 0, free_idx = 0;
+    for (unsigned int i = tid; i < n; i += blockDim.x) {
+        const float v = __bfloat162float(row[i]);
+        if (argmax_other_better(v, i, best, best_idx)) {
+            best = v;
+            best_idx = i;
+        }
+        const bool banned = i == ban0 || i == ban1 || i == ban2 || i == ban3;
+        if (!banned && argmax_other_better(v, i, free_best, free_idx)) {
+            free_best = v;
+            free_idx = i;
+        }
+    }
+    s_val[0][tid] = best;
+    s_idx[0][tid] = best_idx;
+    s_val[1][tid] = free_best;
+    s_idx[1][tid] = free_idx;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            for (int k = 0; k < 2; ++k) {
+                if (argmax_other_better(
+                        s_val[k][tid + s], s_idx[k][tid + s], s_val[k][tid], s_idx[k][tid])) {
+                    s_val[k][tid] = s_val[k][tid + s];
+                    s_idx[k][tid] = s_idx[k][tid + s];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        unsigned int* o = out + 4 * blockIdx.x;
+        o[0] = __float_as_uint(s_val[0][0]);
+        o[1] = s_idx[0][0];
+        o[2] = __float_as_uint(s_val[1][0]);
+        o[3] = s_idx[1][0];
+    }
+}
+
+// Merge per-row TP2 shard quads from argmax_bf16_value_ban into global token
+// IDs, on device so a graph-captured verify needs no host round trip. The rule
+// is the host glm5_mtp argmax_merge::merge: a valid tie picks the higher
+// global ID (rank one); two untouched sentinels keep index zero. Row r merges
+// the unbanned pairs when bit r of (mask_hi:mask_lo) is set, else the best pairs.
+//
 // Grid: (1, 1, 1)  Block: (32, 1, 1)
-extern "C" __global__ void argmax_pair_merge(
+extern "C" __global__ void argmax_pair_merge_ban(
     const unsigned int* __restrict__ local,
     const unsigned int* __restrict__ peer,
     unsigned int* __restrict__ out,
     unsigned int rows,
     unsigned int shard,
-    unsigned int rank
+    unsigned int rank,
+    unsigned int mask_lo,
+    unsigned int mask_hi
 ) {
     for (unsigned int r = threadIdx.x; r < rows; r += blockDim.x) {
+        const unsigned int word = r < 32 ? mask_lo : mask_hi;
+        const unsigned int o = 4 * r + (((word >> (r & 31)) & 1u) ? 2 : 0);
         const unsigned int* p0 = rank == 0 ? local : peer;
         const unsigned int* p1 = rank == 0 ? peer : local;
-        const float v0 = __uint_as_float(p0[2 * r]);
-        const float v1 = __uint_as_float(p1[2 * r]);
-        out[r] = (v1 > v0 || (v1 == v0 && v1 > -1e30f)) ? p1[2 * r + 1] + shard : p0[2 * r + 1];
+        const float v0 = __uint_as_float(p0[o]);
+        const float v1 = __uint_as_float(p1[o]);
+        out[r] = (v1 > v0 || (v1 == v0 && v1 > -1e30f)) ? p1[o + 1] + shard : p0[o + 1];
     }
 }

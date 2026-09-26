@@ -31,6 +31,8 @@ impl TransformerModel {
         if k == 0 {
             return Ok(Vec::new());
         }
+        let ban = seq.eos_ban;
+        let ban_rows = ban.row_mask(seq.seq_len, k);
         if self.lightning_dspark_identity.policy().is_some()
             && std::env::var("ATLAS_LIGHTNING_VERIFY_SERIAL_M1").as_deref() == Ok("1")
         {
@@ -487,7 +489,7 @@ impl TransformerModel {
             // LM head + argmax for K tokens, inside the graph (fixed scratch
             // addresses — graph-safe).
             let argmax_out = self.buffers.scratch();
-            if !self.glm_split_head_argmax(normed, k, argmax_out, stream)? {
+            if !self.glm_split_head_argmax(normed, k, argmax_out, (ban_rows, &ban), stream)? {
                 self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
                 let vocab = self.config.vocab_size;
                 for t in 0..k {
