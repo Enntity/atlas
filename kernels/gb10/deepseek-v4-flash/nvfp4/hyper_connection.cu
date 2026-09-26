@@ -53,6 +53,20 @@ extern "C" __global__ void hc_expand(
 }
 
 // GLM-5 has no learned HC head: contract the final residual highway by mean.
+__device__ __forceinline__ void hc_contract_row(
+    const float* __restrict__ streams,
+    __nv_bfloat16* __restrict__ out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    for (unsigned int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+        float sum = 0.0f;
+        const float* x = streams + d;
+        for (unsigned int i = 0; i < hc_mult; ++i) sum += x[(size_t)i * hidden_size];
+        out[d] = __float2bfloat16(sum / (float)hc_mult);
+    }
+}
+
 extern "C" __global__ void hc_contract(
     const float* __restrict__ streams,
     __nv_bfloat16* __restrict__ hidden,
@@ -60,12 +74,22 @@ extern "C" __global__ void hc_contract(
     const unsigned int hc_mult
 ) {
     const unsigned int t = blockIdx.x;
-    for (unsigned int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-        float sum = 0.0f;
-        const float* x = streams + (size_t)t * hc_mult * hidden_size + d;
-        for (unsigned int i = 0; i < hc_mult; ++i) sum += x[(size_t)i * hidden_size];
-        hidden[(size_t)t * hidden_size + d] = __float2bfloat16(sum / (float)hc_mult);
-    }
+    hc_contract_row(streams + (size_t)t * hc_mult * hidden_size,
+                    hidden + (size_t)t * hidden_size, hidden_size, hc_mult);
+}
+
+// Same contraction into rows `out_stride` BF16 elements apart, e.g. one
+// layer's slot of a [T, layers, H] DFlash target-hidden capture.
+extern "C" __global__ void hc_contract_strided(
+    const float* __restrict__ streams,
+    __nv_bfloat16* __restrict__ out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int out_stride
+) {
+    const unsigned int t = blockIdx.x;
+    hc_contract_row(streams + (size_t)t * hc_mult * hidden_size,
+                    out + (size_t)t * out_stride, hidden_size, hc_mult);
 }
 
 // ── hc_pre ──
