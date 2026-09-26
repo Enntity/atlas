@@ -880,6 +880,10 @@ impl BlockDiffusionDraftHead {
             stream,
         )?;
 
+        if args.block_dump {
+            self.block_dump_buf(ctx, scratch.stream_buf, args.layer_idx, "post_attn", g, h, stream)?;
+        }
+
         // 3i. post_attention_layernorm — input is stream_buf after 3h.
         // dflash.py:139-140  residual = hidden_states
         //                    hidden_states = self.post_attention_layernorm(hidden_states)
@@ -961,6 +965,10 @@ impl BlockDiffusionDraftHead {
             scratch.stream_acc,
             stream,
         )?;
+
+        if args.block_dump {
+            self.block_dump_buf(ctx, scratch.stream_acc, args.layer_idx, "mlp_out", g, h, stream)?;
+        }
 
         // 3k. Second residual add: hidden = (residual + attn) + mlp_output.
         // dflash.py:142  hidden_states = residual + hidden_states

@@ -194,7 +194,9 @@ impl BlockDiffusionDraftHead {
                 "inferspark_prefill_paged_batched_sink",
                 "inferspark_prefill_paged_batched_sink",
             )?,
-            silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
+            // The drafter checkpoint declares no SwiGLU limit; the target's
+            // `moe_silu_mul` may be a clamping shadow (GLM-5.3 -> DeepSeek-V4).
+            silu_mul: gpu.kernel("silu_mul_plain", "silu_mul_plain")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
             argmax_batch: gpu.kernel("argmax", "argmax_bf16_batch")?,
