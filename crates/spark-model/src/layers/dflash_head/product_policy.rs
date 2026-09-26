@@ -301,6 +301,10 @@ pub struct DsparkStartupExecution {
     pub proposal_lane_count: usize,
     /// Diagnostic draft-depth cap override; `None` keeps scheduler K.
     pub draft_cap_override: Option<usize>,
+    /// Draft-depth cap for proposals batched over two or more sequences
+    /// (`ATLAS_DFLASH_MULTI_DRAFT_CAP`). Each extra verify row pulls more
+    /// distinct routed experts, so owner-batched steps pay more per row.
+    pub multi_owner_draft_cap: Option<usize>,
     /// Option B no-context ablation forces zero drafter context.
     pub option_b_no_ctx: bool,
     /// Per-forward debug dumps are active (graph-ineligible).
@@ -324,6 +328,7 @@ impl DsparkStartupExecution {
             option_b_enabled: toggles.option_b_enabled,
             proposal_lane_count: toggles.proposal_lane_count,
             draft_cap_override: toggles.draft_cap_override,
+            multi_owner_draft_cap: None,
             option_b_no_ctx: false,
             debug_dump: false,
             graph_ineligible_diags: !(toggles.proposal_graph_eligible
@@ -368,6 +373,9 @@ impl DsparkStartupExecution {
                 .unwrap_or(1)
                 .max(1),
             draft_cap_override: std::env::var("ATLAS_DFLASH_DRAFT_CAP")
+                .ok()
+                .and_then(|raw| raw.parse().ok()),
+            multi_owner_draft_cap: std::env::var("ATLAS_DFLASH_MULTI_DRAFT_CAP")
                 .ok()
                 .and_then(|raw| raw.parse().ok()),
             option_b_no_ctx: one("ATLAS_DFLASH_OPTION_B_NO_CTX"),

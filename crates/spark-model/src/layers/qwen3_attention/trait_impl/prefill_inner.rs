@@ -796,19 +796,35 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            attn_out,
-            hc_streams,
-            post,
-            comb,
-            hc_streams,
-            n,
-            h as u32,
-            stream,
-        )?;
+        // GLM: this site's post fused with the FFN site's pre-mix.
+        let seam = ctx.config.model_type == "glm5_next"
+            && !diag_this
+            && super::super::hc_post_pre_prefill_fused(
+                &hc.ffn,
+                attn_out,
+                hidden,
+                n,
+                hc_mult,
+                hc.sinkhorn_iters as u32,
+                hc.hc_eps,
+                ctx,
+                stream,
+            )?;
+        if !seam {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                attn_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                n,
+                h as u32,
+                stream,
+            )?;
+        }
         if diag_this {
             super::diag_norm_f32(
                 ctx.gpu,
@@ -840,7 +856,9 @@ impl Qwen3AttentionLayer {
         );
 
         // ── FFN sublayer ──
-        if ctx.config.model_type == "glm5_next" {
+        if seam {
+            // The fused seam already wrote the FFN input and post/comb.
+        } else if ctx.config.model_type == "glm5_next" {
             self.hc_pre_prefill(&hc.ffn, hc, hidden, n, ctx, stream)?;
         } else {
             ops::hc_pre_site(

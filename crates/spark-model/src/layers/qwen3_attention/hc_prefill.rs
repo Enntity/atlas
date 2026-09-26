@@ -68,24 +68,7 @@ pub(crate) fn hc_pre_prefill_mix(
             .arg_ptr(ss)
             .arg_u32(tokens)
             .launch(stream)?;
-        return KernelLaunch::new(
-            ctx.gpu,
-            ctx.gpu.kernel("glm_hc_prefill_vec", &name("glm_hc_pre_finalize_ss_vec"))?,
-        )
-        .grid([tokens, 1, 1])
-        .block([256, 1, 1])
-        .arg_ptr(streams)
-        .arg_ptr(raw_mix)
-        .arg_ptr(ss)
-        .arg_ptr(site.hc_scale)
-        .arg_ptr(site.hc_base)
-        .arg_ptr(hidden)
-        .arg_ptr(ctx.buffers.hc_post())
-        .arg_ptr(ctx.buffers.hc_comb())
-        .arg_u32(sinkhorn_iters)
-        .arg_f32(norm_eps)
-        .arg_f32(hc_eps)
-        .launch(stream);
+        return finalize_ss(site, hidden, tokens, sinkhorn_iters, hc_eps, ctx, stream);
     }
     ensure!(
         ctx.buffers.sizes().gate_logits_f32 >= tokens as usize * mix as usize * 4,
@@ -125,6 +108,86 @@ pub(crate) fn hc_pre_prefill_mix(
         hc_eps,
         stream,
     )
+}
+
+/// Split/Sinkhorn/collapse from the raw mix and sum of squares that
+/// `glm_hc_mix_ss` or `glm_hc_post_mix_ss` left in `gate_logits_f32`.
+fn finalize_ss(
+    site: &HcSiteWeights,
+    hidden: DevicePtr,
+    tokens: u32,
+    sinkhorn_iters: u32,
+    hc_eps: f32,
+    ctx: &ForwardContext,
+    stream: u64,
+) -> Result<()> {
+    let raw_mix = ctx.buffers.gate_logits_f32();
+    let ss = raw_mix.offset(tokens as usize * 24 * 4);
+    let name = ops::hc_kernel_name(&ctx.config.model_type, "glm_hc_pre_finalize_ss_vec");
+    KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name)?)
+        .grid([tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(ctx.buffers.hc_streams())
+        .arg_ptr(raw_mix)
+        .arg_ptr(ss)
+        .arg_ptr(site.hc_scale)
+        .arg_ptr(site.hc_base)
+        .arg_ptr(hidden)
+        .arg_ptr(ctx.buffers.hc_post())
+        .arg_ptr(ctx.buffers.hc_comb())
+        .arg_u32(sinkhorn_iters)
+        .arg_f32(ctx.config.rms_norm_eps as f32)
+        .arg_f32(hc_eps)
+        .launch(stream)
+}
+
+/// GLM HC4 prefill seam (`ATLAS_GLM_HC_POST_MIX=1`): the finishing site's
+/// `hc_post` of `block_out` fused with the next site's pre-mix in one highway
+/// pass, then the usual finalizer writes `hidden` and the next post/comb.
+/// Returns false (nothing launched) when the seam does not qualify; callers
+/// then run `hc_post` + `hc_pre` separately.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hc_post_pre_prefill_fused(
+    next: &HcSiteWeights,
+    block_out: DevicePtr,
+    hidden: DevicePtr,
+    tokens: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    hc_eps: f32,
+    ctx: &ForwardContext,
+    stream: u64,
+) -> Result<bool> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("ATLAS_GLM_HC_POST_MIX").as_deref() == Ok("1"));
+    // Measured: 1.78 vs 2.50 ms at 4096 rows, 0.40 vs 0.55 at 1000; at
+    // ~128 rows the 32-token CTAs leave most SMs idle and the pair wins.
+    if !on
+        || tokens < 512
+        || hc_mult != 4
+        || ctx.config.hidden_size != 4096
+        || ctx.config.model_type != "glm5_next"
+        || !(ops::hc_bf16_for(&ctx.config.model_type) || fused_prefill("glm5_next", 4096, 4, tokens))
+        || ctx.buffers.sizes().gate_logits_f32 < tokens as usize * 25 * 4
+    {
+        return Ok(false);
+    }
+    let raw_mix = ctx.buffers.gate_logits_f32();
+    let name = ops::hc_kernel_name(&ctx.config.model_type, "glm_hc_post_mix_ss");
+    KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name)?)
+        .grid([tokens.div_ceil(32), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(block_out)
+        .arg_ptr(ctx.buffers.hc_streams())
+        .arg_ptr(ctx.buffers.hc_post())
+        .arg_ptr(ctx.buffers.hc_comb())
+        .arg_ptr(next.hc_fn)
+        .arg_ptr(raw_mix)
+        .arg_ptr(raw_mix.offset(tokens as usize * 24 * 4))
+        .arg_u32(tokens)
+        .launch(stream)?;
+    finalize_ss(next, hidden, tokens, sinkhorn_iters, hc_eps, ctx, stream)?;
+    Ok(true)
 }
 
 impl Qwen3AttentionLayer {

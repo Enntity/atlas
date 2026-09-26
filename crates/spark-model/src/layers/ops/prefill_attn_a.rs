@@ -398,6 +398,13 @@ pub fn glm_paged_grouped_gemm_mla(
     } else {
         false
     };
+    if enabled && super::bf16_gemm_cutlass_rows(m) {
+        // Head-batched CUTLASS (bench: ~1.12 ms vs cuBLASLt's 1.65 ms at
+        // 4096 rows, both head shapes).
+        return spark_runtime::cutlass::bf16_grouped_gemm_act_weight_t(
+            a.0, b.0, c.0, m, g, n_g, k_g, a_stride, c_stride, stream,
+        );
+    }
     if enabled {
         return spark_runtime::cublaslt::bf16_grouped_gemm_act_weight_t(
             a.0, b.0, c.0, m, g, n_g, k_g, a_stride, c_stride, stream,

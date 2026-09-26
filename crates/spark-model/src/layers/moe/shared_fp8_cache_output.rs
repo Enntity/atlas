@@ -124,6 +124,14 @@ impl MoeLayer {
         // supports it; keep that existing precision/ABI without extending the
         // separately validated FP8 kernel envelope or fabricating oracle passes.
         if rows > 1024 {
+            if ops::bf16_gemm_cutlass_rows(rows) {
+                // E4M3 widens exactly to BF16, so the tuned BF16 tensor-core
+                // GEMM computes the same products as the FP8 M64 kernel.
+                let count = n as usize * k as usize;
+                let wide = ctx.gpu.op_cache().scratch(ctx.gpu, "shared_fp8_bf16_weight", count * 2)?;
+                ops::fp8_e4m3_to_bf16(ctx.gpu, weight, wide, count, stream)?;
+                return ops::bf16_gemm(input, wide.0, output, rows, n, k, stream);
+            }
             if let Some(budget) = super::shared_fp8_cache::prefill_slab_budget()? {
                 // Keep the previously qualified M64 row envelope. Only the
                 // explicit larger-prefill profile replaces the legacy T fallback.

@@ -19,6 +19,8 @@ mod derived_weights;
 mod dflash2;
 #[path = "ops/mxfp8.rs"]
 mod mxfp8;
+#[path = "ops/bf16_gemm_cutlass.rs"]
+mod bf16_gemm_cutlass;
 #[path = "ops/dispatch_config.rs"]
 mod dispatch_config;
 #[path = "ops/dispatch_helpers.rs"]
@@ -205,6 +207,7 @@ pub use activations::*;
 pub use derived_weights::{Derivation, DerivedWeights};
 pub use dflash2::*;
 pub use mxfp8::*;
+pub use bf16_gemm_cutlass::*;
 pub use dispatch_config::GemmDispatch;
 pub use dispatch_helpers::*;
 pub use dispatch_proj::*;

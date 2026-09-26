@@ -239,6 +239,120 @@ __device__ __forceinline__ void glm_hc_mix_ss_t(
     }
 }
 
+// hc_post of one site fused with glm_hc_mix_ss of the next: one highway pass
+// computes out[t,j,d] = post[t,j]*block_out[t,d] + sum_i comb[t,i,j]*x[t,i,d]
+// (hc_post_t's exact expression and order), stores it in place, and feeds the
+// stored (rounded) values into the next site's 24 mix dots and sum of squares.
+// Only the FP32 order of those dot sums differs from glm_hc_mix_ss.
+// Grid: (ceil(T / GLM_HC_MIX_TOKENS), 1, 1)  Block: (256, 1, 1).
+#define GLM_HC_PM_DC 64
+__device__ __forceinline__ float2 hc_ld2(const float* p) { return *(const float2*)p; }
+__device__ __forceinline__ float2 hc_ld2(const __nv_bfloat16* p) {
+    const unsigned u = *(const unsigned*)p;
+    return make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
+}
+__device__ __forceinline__ float hc_round(float v, const float*) { return v; }
+__device__ __forceinline__ float hc_round(float v, const __nv_bfloat16*) {
+    return __bfloat162float(__float2bfloat16(v));
+}
+__device__ __forceinline__ void hc_st2(float* p, float a, float b) { *(float2*)p = make_float2(a, b); }
+__device__ __forceinline__ void hc_st2(__nv_bfloat16* p, float a, float b) {
+    *(unsigned*)p = (unsigned)__bfloat16_as_ushort(__float2bfloat16(a))
+        | ((unsigned)__bfloat16_as_ushort(__float2bfloat16(b)) << 16);
+}
+template <typename HT>
+__device__ __forceinline__ void glm_hc_post_mix_ss_t(
+    const __nv_bfloat16* __restrict__ block_out, // [T, 4096]
+    HT* __restrict__ streams,                    // [T, 4, 4096], updated in place
+    const float* __restrict__ post,              // [T, 4]
+    const float* __restrict__ comb,              // [T, 4, 4]
+    const float* __restrict__ hc_fn,             // [24, 16384] of the next site
+    float* __restrict__ raw_mix,                 // [T, 24]
+    float* __restrict__ ss_out,                  // [T]
+    const unsigned int tokens
+) {
+    constexpr unsigned int H = 4096, K = 4 * H, M = 24, PC = 20;
+    __shared__ float2 s_fn[M * 4 * (GLM_HC_PM_DC / 2)]; // [m][stream][d/2]
+    __shared__ float s_pc[GLM_HC_MIX_TOKENS * PC];      // post[4], comb[16]
+    const unsigned int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const unsigned int b0 = blockIdx.x * GLM_HC_MIX_TOKENS;
+    for (unsigned int i = tid; i < GLM_HC_MIX_TOKENS * PC; i += 256) {
+        const unsigned int t = min(b0 + i / PC, tokens - 1), e = i % PC;
+        s_pc[i] = e < 4 ? post[(size_t)t * 4 + e] : comb[(size_t)t * 16 + e - 4];
+    }
+    float acc[GLM_HC_MIX_TPW][M];
+    float ss[GLM_HC_MIX_TPW];
+    #pragma unroll
+    for (unsigned int j = 0; j < GLM_HC_MIX_TPW; ++j) {
+        ss[j] = 0.f;
+        #pragma unroll
+        for (unsigned int m = 0; m < M; ++m) acc[j][m] = 0.f;
+    }
+    const unsigned int t0 = b0 + warp * GLM_HC_MIX_TPW;
+    #pragma unroll 1
+    for (unsigned int d0 = 0; d0 < H; d0 += GLM_HC_PM_DC) {
+        __syncthreads();
+        for (unsigned int i = tid; i < M * 4 * (GLM_HC_PM_DC / 2); i += 256) {
+            const unsigned int row = i / (GLM_HC_PM_DC / 2), c = i % (GLM_HC_PM_DC / 2);
+            const unsigned int m = row / 4, st = row % 4;
+            s_fn[i] = __ldg((const float2*)(hc_fn + (size_t)m * K + st * H + d0) + c);
+        }
+        __syncthreads();
+        const unsigned int d = d0 + 2 * lane;
+        // Old highway and block output of this warp's tokens at columns d, d+1.
+        float2 rv[GLM_HC_MIX_TPW][4], o[GLM_HC_MIX_TPW];
+        #pragma unroll
+        for (unsigned int j = 0; j < GLM_HC_MIX_TPW; ++j) {
+            const unsigned int t = min(t0 + j, tokens - 1);
+            o[j] = hc_ld2(block_out + (size_t)t * H + d);
+            #pragma unroll
+            for (unsigned int i = 0; i < 4; ++i) rv[j][i] = hc_ld2(streams + (size_t)t * K + i * H + d);
+        }
+        #pragma unroll
+        for (unsigned int st = 0; st < 4; ++st) {
+            float2 nv[GLM_HC_MIX_TPW];
+            #pragma unroll
+            for (unsigned int j = 0; j < GLM_HC_MIX_TPW; ++j) {
+                const float* pc = s_pc + (warp * GLM_HC_MIX_TPW + j) * PC;
+                float a = pc[st] * o[j].x, b = pc[st] * o[j].y;
+                #pragma unroll
+                for (unsigned int i = 0; i < 4; ++i) {
+                    a += pc[4 + i * 4 + st] * rv[j][i].x;
+                    b += pc[4 + i * 4 + st] * rv[j][i].y;
+                }
+                // Clamped duplicate rows (t >= tokens) never store.
+                if (t0 + j < tokens) hc_st2(streams + (size_t)(t0 + j) * K + st * H + d, a, b);
+                nv[j] = make_float2(hc_round(a, streams), hc_round(b, streams));
+                ss[j] += nv[j].x * nv[j].x + nv[j].y * nv[j].y;
+            }
+            #pragma unroll
+            for (unsigned int m = 0; m < M; ++m) {
+                const float2 f = s_fn[(m * 4 + st) * (GLM_HC_PM_DC / 2) + lane];
+                #pragma unroll
+                for (unsigned int j = 0; j < GLM_HC_MIX_TPW; ++j)
+                    acc[j][m] += f.x * nv[j].x + f.y * nv[j].y;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned int j = 0; j < GLM_HC_MIX_TPW; ++j) {
+        #pragma unroll
+        for (unsigned int o = 16; o > 0; o >>= 1) {
+            ss[j] += __shfl_xor_sync(0xffffffffu, ss[j], o);
+            #pragma unroll
+            for (unsigned int m = 0; m < M; ++m)
+                acc[j][m] += __shfl_xor_sync(0xffffffffu, acc[j][m], o);
+        }
+        const unsigned int t = t0 + j;
+        if (t < tokens) {
+            #pragma unroll
+            for (unsigned int m = 0; m < M; ++m)
+                if (lane == m) raw_mix[(size_t)t * M + m] = acc[j][m];
+            if (lane == 0) ss_out[t] = ss[j];
+        }
+    }
+}
+
 // Finalizer for glm_hc_mix_ss: identical split/Sinkhorn/collapse, RMS scale
 // taken from the fused pass instead of a second highway read.
 template <typename HT>
@@ -354,4 +468,30 @@ extern "C" __global__ void glm_hc_pre_finalize_ss_vec_bf16(
     const float hc_eps
 ) {
     glm_hc_pre_finalize_ss_vec_t<__nv_bfloat16>(streams, raw_mix, ss_in, hc_scale, hc_base, y_out, post_out, comb_out, sinkhorn_iters, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void __launch_bounds__(256) glm_hc_post_mix_ss(
+    const __nv_bfloat16* __restrict__ block_out,
+    float* __restrict__ streams,
+    const float* __restrict__ post,
+    const float* __restrict__ comb,
+    const float* __restrict__ hc_fn,
+    float* __restrict__ raw_mix,
+    float* __restrict__ ss_out,
+    const unsigned int tokens
+) {
+    glm_hc_post_mix_ss_t<float>(block_out, streams, post, comb, hc_fn, raw_mix, ss_out, tokens);
+}
+
+extern "C" __global__ void __launch_bounds__(256) glm_hc_post_mix_ss_bf16(
+    const __nv_bfloat16* __restrict__ block_out,
+    __nv_bfloat16* __restrict__ streams,
+    const float* __restrict__ post,
+    const float* __restrict__ comb,
+    const float* __restrict__ hc_fn,
+    float* __restrict__ raw_mix,
+    float* __restrict__ ss_out,
+    const unsigned int tokens
+) {
+    glm_hc_post_mix_ss_t<__nv_bfloat16>(block_out, streams, post, comb, hc_fn, raw_mix, ss_out, tokens);
 }

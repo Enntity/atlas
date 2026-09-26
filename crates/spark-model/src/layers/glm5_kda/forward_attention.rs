@@ -434,6 +434,7 @@ impl Glm5KdaLayer {
             comm.all_reduce_async(normed.0, tokens * self.hidden_size * 2, stream)?;
         }
         profile::step(ctx, stream, &mut profile_timer, "tp_reduce")?;
+        let mut seam = false;
         if fused_tp_hc {
             ops::hc_post_bf16_add(
                 ctx.gpu,
@@ -450,11 +451,26 @@ impl Glm5KdaLayer {
                 stream,
             )?;
         } else {
-            self.hc_post(normed, m, ctx, stream)?;
+            seam = crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
+                &self.hc.ffn,
+                normed,
+                hidden,
+                m,
+                self.hc.hc_mult as u32,
+                self.hc.sinkhorn_iters as u32,
+                self.hc.hc_eps,
+                ctx,
+                stream,
+            )?;
+            if !seam {
+                self.hc_post(normed, m, ctx, stream)?;
+            }
         }
         profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
 
-        self.hc_pre(&self.hc.ffn, hidden, m, ctx, stream)?;
+        if !seam {
+            self.hc_pre(&self.hc.ffn, hidden, m, ctx, stream)?;
+        }
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_k,

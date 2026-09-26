@@ -1201,10 +1201,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 .chunks_exact(4)
                 .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
                 .collect();
-            // Same cap as the single-sequence propose.
-            let cap = self
-                .startup
-                .draft_cap_override
+            // Same cap as the single-sequence propose, plus the optional
+            // tighter cap for owner-batched steps.
+            let multi = if n >= 2 { self.startup.multi_owner_draft_cap } else { None };
+            let cap = multi
+                .or(self.startup.draft_cap_override)
                 .unwrap_or(num_drafts.min(self.gamma.saturating_sub(1)).max(1));
             let mut drafts = batch_inputs.reorder_sampled_rows(&row_tokens)?;
             for (sequence, (tokens, state)) in drafts.iter_mut().zip(states.iter_mut()).enumerate() {

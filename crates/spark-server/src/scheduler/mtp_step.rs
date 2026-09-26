@@ -605,25 +605,31 @@ pub fn step_mtp(
     let owner_drafts = if glm_repaired_narrow && !dflash_verify_raw_argmax && ladder_nd >= 2 {
         Some(2)
     } else if dflash_verify_raw_argmax {
-        let mut counts = std::collections::BTreeMap::<usize, usize>::new();
-        for &i in &serial_idxs {
-            if active[i].grammar_state.is_none() && !active[i].pending_drafts.is_empty() {
-                *counts.entry(active[i].pending_drafts.len()).or_default() += 1;
-            }
-        }
-        counts
-            .into_iter()
-            .max_by_key(|&(len, n)| (n, len))
-            .map(|(len, _)| len)
+        // Owners with at least `w` drafts can verify together at width `w`;
+        // take the width that verifies the most rows.
+        let lens: Vec<usize> = serial_idxs
+            .iter()
+            .filter(|&&i| active[i].grammar_state.is_none())
+            .map(|&i| active[i].pending_drafts.len())
+            .filter(|&len| len > 0)
+            .collect();
+        lens.iter()
+            .copied()
+            .max_by_key(|&w| (lens.iter().filter(|&&len| len >= w).count() * (w + 1), w))
     } else {
         None
     };
     if let Some(width) = owner_drafts {
+        // DFlash owners holding more drafts than the common width join at
+        // that width: the drafter's rollback keys on accepted rows only, and
+        // one shared traversal beats a second per-owner one.
         let group: Vec<usize> = serial_idxs
             .iter()
             .copied()
             .filter(|&i| {
-                active[i].grammar_state.is_none() && active[i].pending_drafts.len() == width
+                let len = active[i].pending_drafts.len();
+                active[i].grammar_state.is_none()
+                    && (len == width || (dflash_verify_raw_argmax && len > width))
             })
             .collect();
         let min_group = std::env::var("ATLAS_GLM_LONG_BATCH_MIN")
@@ -634,6 +640,10 @@ pub fn step_mtp(
         if group.len() >= min_group && model.can_batch_glm_long_verify_rows(group.len(), width + 1)
         {
             serial_idxs.retain(|i| !group.contains(i));
+            for &i in &group {
+                active[i].pending_drafts.truncate(width);
+                active[i].pending_draft_conf.truncate(width);
+            }
             let mut sorted = group.clone();
             sorted.sort_unstable();
             let mut batch: Vec<&mut ActiveSeq> = active
