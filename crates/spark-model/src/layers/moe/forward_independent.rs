@@ -56,6 +56,15 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        // A DFlash verify block on experts without the transposed layout
+        // (e.g. ATLAS_MOE_GROUPED_CUTLASS) takes the grouped prefill MoE.
+        if !self.independent_grouped(ctx, rows as u32)
+            && !crate::model::glm_independent::selected(ctx, rows)?
+            && crate::model::glm_independent::ffn_rows_selected(ctx, rows)?
+        {
+            self.forward_prefill(input, rows, ctx, stream)?;
+            return Ok(ctx.buffers.moe_output());
+        }
         anyhow::ensure!(
             crate::model::glm_independent::ffn_rows_selected(ctx, rows)?
                 && self.independent_grouped(ctx, rows as u32)

@@ -242,6 +242,37 @@ impl TransformerModel {
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
         };
 
+        // GLM DFlash lane: a verify block is an ordinary causal prefill chunk
+        // of k rows continuing at seq_len, so full-attention (MLA) layers take
+        // the multi-row prefill path (batched projections, row-tiled index
+        // selection and sparse attention) instead of one decode chain per row.
+        // Rejected rows' K/V and per-token index entries are rewritten by the
+        // next block, which re-finalizes the pools it touches. KDA layers keep
+        // the verify path that snapshots per-row recurrent state.
+        let glm_prefill_ctx = (self.config.model_type == "glm5_next"
+            && crate::speculative::glm_repair_policy::dflash_enabled()
+            && std::env::var("ATLAS_GLM_DFLASH_PREFILL_VERIFY").as_deref() != Ok("0")
+            && !hss_engaged
+            && !use_graphs
+            && k >= 2)
+            .then(|| ForwardContext {
+                attn_metadata: Some(AttnMetadataDev {
+                    positions: metadata.positions,
+                    positions_h: metadata.positions,
+                    positions_w: metadata.positions,
+                    slot: metadata.slot,
+                    // Chunk-total length: the last row's causal extent.
+                    seq_len: metadata.seq_len.offset((k - 1) * 4),
+                    block_table: metadata.block_table,
+                    max_blocks_per_seq: metadata.max_blocks_per_seq,
+                    num_seqs: 1,
+                    seq_slot: metadata.seq_slot,
+                    moe_row_adapter: spark_runtime::gpu::DevicePtr::NULL,
+                }),
+                midchunk_capture: None,
+                ..ctx
+            });
+
         // ── Phase 2: CUDA graph capture / replay ──
 
         let mut graph_cache = if use_graphs {
@@ -294,7 +325,24 @@ impl TransformerModel {
                 }
                 let t0 = Instant::now();
 
-                if layer_type == LayerType::FullAttention {
+                if layer_type == LayerType::FullAttention
+                    && let Some(ref prefill_ctx) = glm_prefill_ctx
+                {
+                    layer.prefill(
+                        hidden,
+                        residual,
+                        k,
+                        seq.layer_states[layer_idx].as_mut(),
+                        &mut kv_cache,
+                        seq.seq_len,
+                        &mut seq.block_table,
+                        &mut seq.disk_block_ids,
+                        &mut seq.disk_last_offloaded_per_layer,
+                        0,
+                        prefill_ctx,
+                        stream,
+                    )?;
+                } else if layer_type == LayerType::FullAttention {
                     if hss_engaged {
                         // HSS path: decode_multi_seq's paged-decode kernel
                         // reads K/V from HBM only, missing the long-context
