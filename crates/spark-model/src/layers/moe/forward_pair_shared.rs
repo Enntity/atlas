@@ -104,6 +104,39 @@ impl MoeLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Shared expert for an owner-batched verify of `rows` (9..=32) rows:
+    /// the native NVFP4 projections through one tensor-core weight pass each
+    /// (`kernel` from `w4a16_gemv_tiers::tc_kernel`), the arithmetic the
+    /// <=8-row verify already uses.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_shared_tc(
+        &self,
+        kernel: KernelHandle,
+        input: DevicePtr,
+        shared_gate_out: DevicePtr,
+        shared_up_out: DevicePtr,
+        shared_down_out: DevicePtr,
+        rows: u32,
+        h: u32,
+        shared_inter: u32,
+        ctx: &ForwardContext,
+        aux: u64,
+    ) -> Result<()> {
+        let shared = &self.weights.shared_expert;
+        ops::w4a16_gemv_batchm(ctx.gpu, kernel, input, &shared.gate_proj, shared_gate_out, rows, shared_inter, h, aux)?;
+        ops::w4a16_gemv_batchm(ctx.gpu, kernel, input, &shared.up_proj, shared_up_out, rows, shared_inter, h, aux)?;
+        ops::silu_mul(
+            ctx.gpu,
+            self.moe_act_mul,
+            shared_gate_out,
+            shared_up_out,
+            shared_gate_out,
+            rows * shared_inter,
+            aux,
+        )?;
+        ops::w4a16_gemv_batchm(ctx.gpu, kernel, shared_gate_out, &shared.down_proj, shared_down_out, rows, h, shared_inter, aux)
+    }
+
     pub(super) fn run_exact_k5_shared(
         &self,
         input: DevicePtr,

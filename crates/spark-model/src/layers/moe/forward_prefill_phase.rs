@@ -124,6 +124,31 @@ impl MoeLayer {
             && !self.weights.shared_expert.gate_proj.is_null()
             && !self.weights.shared_expert.up_proj.is_null()
             && !self.weights.shared_expert.down_proj.is_null();
+        let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(n);
+        if n > 8
+            && tc.0 != 0
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && !self.weights.shared_expert.gate_proj.is_null()
+            && !self.weights.shared_expert.up_proj.is_null()
+            && !self.weights.shared_expert.down_proj.is_null()
+        {
+            self.run_shared_tc(
+                tc,
+                input,
+                shared_gate_out,
+                shared_up_out,
+                shared_down_out,
+                n,
+                h,
+                shared_inter,
+                ctx,
+                aux,
+            )?;
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
         if exact_k5 {
             self.run_exact_k5_shared(
                 input,
