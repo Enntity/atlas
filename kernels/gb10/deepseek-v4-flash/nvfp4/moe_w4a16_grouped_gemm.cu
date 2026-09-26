@@ -2045,6 +2045,234 @@ extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact
         worklist, total_tiles, max_tiles);
 }
 
+// ── Prequant native-FP4 grouped GEMM, K128 stages (prefill) ───────────────
+// Same grid (N/128, m_tiles, experts), 64 x 128 tile, MMA sequence and stores
+// as moe_w4a4_grouped_gemm_prequant_t_k64_vecscale, so outputs match bit for
+// bit (every element accumulates the same k64 MMAs in the same order); only
+// the data movement around the MMAs changes (moe_fp4_prefill_bench: 53 -> 65
+// TFLOPS gate, 51 -> 59 down at a 4K-chunk EP2 routing):
+//   * 256 threads: 8 warps of 16 rows x 64 columns (half the accumulators);
+//   * K stages of 128 (two k64 MMA slices) halve the barriers per K, and the
+//     next stage's cp.async overlaps this stage's transpose + MMAs;
+//   * the [K/2, N] weight tile is transposed with 32-bit loads and a 4x4
+//     byte PRMT transpose per thread instead of per-byte shared loads;
+//   * A and B fragments come from ldmatrix.x4 (the m16n8k64 FP4 fragments
+//     are exactly its 8x16-byte tiles), and B block scales are transposed
+//     once per stage so each MMA reads its four scales with one load.
+// Requires K % 128 == 0 and N % 128 == 0.
+#define PQ2_KS 128                       // K per stage
+#define PQ2_KP (PQ2_KS / 2)              // packed bytes per row per stage
+#define PQ2_AP (PQ2_KP + 16)             // A row pitch (16-byte aligned)
+#define PQ2_BP (PQ2_KP + 16)             // transposed B row pitch
+#define PQ2_BTP (N_TILE_LG + 16)         // raw [kp][n] B row pitch
+
+__device__ __forceinline__ void moe_cp_async_pred_8(void* dst_smem, const void* src_gmem, bool pred) {
+    unsigned int dst = __cvta_generic_to_shared(dst_smem);
+    unsigned int src_bytes = pred ? 8 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;"
+                 :: "r"(dst), "l"(src_gmem), "r"(src_bytes));
+}
+
+__device__ __forceinline__ unsigned int pq2_prmt(unsigned int a, unsigned int b, unsigned int sel) {
+    unsigned int r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+    return r;
+}
+
+extern "C" __global__ void __launch_bounds__(256) moe_w4a4_grouped_gemm_prequant_t_k128(
+    const unsigned char* __restrict__ A_packed,
+    const unsigned char* __restrict__ A_scale,
+    const unsigned long long* __restrict__ B_packed_ptrs,
+    const unsigned long long* __restrict__ B_scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int num_experts,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int expert_id = blockIdx.z;
+    if (expert_id >= num_experts) return;
+    const int m_start = expert_offsets[expert_id];
+    const int M_expert = expert_offsets[expert_id + 1] - m_start;
+    if (M_expert <= 0) return;
+    const int cta_m_local = blockIdx.y * M_TILE;
+    if (cta_m_local >= M_expert) return;
+    const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[expert_id];
+    const unsigned char* S_expert = (const unsigned char*)B_scale_ptrs[expert_id];
+    if (B_expert == 0) return;
+    const float scale2 = scale2_vals[expert_id];
+    const unsigned int cta_m = m_start + cta_m_local;
+    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
+
+    const unsigned int t = threadIdx.x;
+    const unsigned int warp_id = t / 32, lane_id = t % 32;
+    const unsigned int warp_m_offset = (warp_id & 3) * 16;
+    const unsigned int warp_n_offset = (warp_id >> 2) * 64;
+    const unsigned int group_id = lane_id >> 2, tid = lane_id & 3;
+
+    __shared__ __align__(16) unsigned char sA[2][M_TILE][PQ2_AP];
+    __shared__ __align__(16) unsigned char sAs[2][M_TILE][PQ2_KS / GROUP_SIZE];
+    __shared__ __align__(16) unsigned char sBraw[2][PQ2_KP][PQ2_BTP];
+    __shared__ __align__(16) unsigned char sSraw[2][PQ2_KS / GROUP_SIZE][N_TILE_LG];
+    __shared__ __align__(16) unsigned char sBt[N_TILE_LG][PQ2_BP];
+    __shared__ __align__(16) unsigned char sSt[N_TILE_LG][PQ2_KS / GROUP_SIZE];
+    __shared__ int sTok[M_TILE];
+
+    if (t < M_TILE) {
+        const bool live = (cta_m_local + (int)t) < M_expert;
+        sTok[t] = (sorted_token_ids && live) ? sorted_token_ids[cta_m + t] : (int)(cta_m + t);
+    }
+    __syncthreads();
+
+    const unsigned int M_eff = (unsigned int)M_expert;
+    auto issue = [&](int buf, unsigned int kb) {
+        // A: 64 rows x 64 bytes = 256 x 16 B (two per thread).
+        {
+            const unsigned int j = t;
+            const unsigned int row = j >> 2, col = (j & 3) << 4;
+            const bool valid = (cta_m_local + row) < M_eff;
+            const unsigned int a_row = (unsigned int)sTok[row];
+            moe_cp_async_pred_16(&sA[buf][row][col],
+                &A_packed[(unsigned long long)a_row * (K / 2) + kb / 2 + col], valid);
+        }
+        // A scales: 64 rows x 8 bytes.
+        if (t < M_TILE) {
+            const bool valid = (cta_m_local + t) < M_eff;
+            const unsigned int a_row = (unsigned int)sTok[t];
+            moe_cp_async_pred_8(&sAs[buf][t][0],
+                &A_scale[(unsigned long long)a_row * (K / GROUP_SIZE) + kb / GROUP_SIZE], valid);
+        }
+        // B: 64 kp rows x 128 bytes = 512 x 16 B (four per thread).
+        #pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const unsigned int j = t + r * 256;
+            const unsigned int kp = j >> 3, ns = (j & 7) << 4;
+            moe_cp_async_pred_16(&sBraw[buf][kp][ns],
+                &B_expert[(unsigned long long)(kb / 2 + kp) * N + cta_n + ns], true);
+        }
+        // B scales: 8 groups x 128 bytes = 64 x 16 B.
+        if (t < 64) {
+            const unsigned int g = t >> 3, ns = (t & 7) << 4;
+            moe_cp_async_pred_16(&sSraw[buf][g][ns],
+                &S_expert[(unsigned long long)(kb / GROUP_SIZE + g) * N + cta_n + ns], true);
+        }
+    };
+
+    float acc[8][4];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+
+    const unsigned int stages = K / PQ2_KS;
+    issue(0, 0);
+    moe_cp_async_commit();
+    for (unsigned int st = 0; st < stages; ++st) {
+        const int buf = st & 1;
+        moe_cp_async_wait_all();
+        __syncthreads();   // stage `st` landed; every warp finished stage st-1
+        if (st + 1 < stages) {
+            issue(buf ^ 1, (st + 1) * PQ2_KS);
+            moe_cp_async_commit();
+        }
+        // Transpose B: thread -> columns 4*cb..+3, kp 8*kb..+7. Each lane
+        // rotates which of its four columns it stores first so an 8-lane
+        // store phase hits eight distinct 16-byte bank slots (pitch 80).
+        {
+            const unsigned int cb = t & 31, kb8 = t >> 5;
+            unsigned int col[4][2];
+            #pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const unsigned int kp0 = kb8 * 8 + q * 4;
+                const unsigned int w0 = *(const unsigned int*)&sBraw[buf][kp0 + 0][cb * 4];
+                const unsigned int w1 = *(const unsigned int*)&sBraw[buf][kp0 + 1][cb * 4];
+                const unsigned int w2 = *(const unsigned int*)&sBraw[buf][kp0 + 2][cb * 4];
+                const unsigned int w3 = *(const unsigned int*)&sBraw[buf][kp0 + 3][cb * 4];
+                const unsigned int t0 = pq2_prmt(w0, w1, 0x5140), t1 = pq2_prmt(w2, w3, 0x5140);
+                const unsigned int t2 = pq2_prmt(w0, w1, 0x7362), t3 = pq2_prmt(w2, w3, 0x7362);
+                col[0][q] = pq2_prmt(t0, t1, 0x5410);
+                col[1][q] = pq2_prmt(t0, t1, 0x7632);
+                col[2][q] = pq2_prmt(t2, t3, 0x5410);
+                col[3][q] = pq2_prmt(t2, t3, 0x7632);
+            }
+            const unsigned int rot = cb >> 1;
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const unsigned int cc = (c + rot) & 3;
+                const unsigned int lo = cc == 0 ? col[0][0] : cc == 1 ? col[1][0] : cc == 2 ? col[2][0] : col[3][0];
+                const unsigned int hi = cc == 0 ? col[0][1] : cc == 1 ? col[1][1] : cc == 2 ? col[2][1] : col[3][1];
+                *(uint2*)&sBt[cb * 4 + cc][kb8 * 8] = make_uint2(lo, hi);
+            }
+            // Scales: threads 0..127 -> column t, 8 groups.
+            if (t < N_TILE_LG) {
+                unsigned int lo = 0, hi = 0;
+                #pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    lo |= (unsigned int)sSraw[buf][g][t] << (8 * g);
+                    hi |= (unsigned int)sSraw[buf][g + 4][t] << (8 * g);
+                }
+                *(uint2*)&sSt[t][0] = make_uint2(lo, hi);
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int sl = 0; sl < 2; ++sl) {
+            const unsigned int ko = sl * 32;   // packed-byte offset of this k64 slice
+            // A fragment via one ldmatrix.x4: matrices (rows 0-7 | 8-15) x
+            // (bytes 0-15 | 16-31) give exactly a0..a3 of the m16n8k64 layout.
+            unsigned int a0, a1, a2, a3;
+            {
+                const unsigned int j = lane_id >> 3, r = lane_id & 7;
+                const unsigned int addr = __cvta_generic_to_shared(
+                    &sA[buf][warp_m_offset + r + (j & 1) * 8][ko + (j >> 1) * 16]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                             : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr));
+            }
+            const unsigned int sfa_m = (lane_id & 1) * 8 + (lane_id >> 2);
+            const unsigned int sfa = *(const unsigned int*)&sAs[buf][warp_m_offset + sfa_m][sl * 4];
+            #pragma unroll
+            for (int np = 0; np < 4; np++) {
+                // B fragments of n-subtiles 2np and 2np+1 via one ldmatrix.x4.
+                unsigned int b[4];
+                {
+                    const unsigned int j = lane_id >> 3, r = lane_id & 7;
+                    const unsigned int addr = __cvta_generic_to_shared(
+                        &sBt[warp_n_offset + np * 16 + (j >> 1) * 8 + r][ko + (j & 1) * 16]);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                                 : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(addr));
+                }
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int nt = np * 2 + h;
+                    const unsigned int b0 = b[h * 2], b1 = b[h * 2 + 1];
+                    const unsigned int sfb = *(const unsigned int*)&sSt[warp_n_offset + nt * 8 + (lane_id >> 2)][sl * 4];
+                    unsigned short bidA = 0, tidA_ = 0, bidB = 0, tidB_ = 0;
+                    asm volatile(
+                        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"
+                        "{%14},{%15,%16},{%17},{%18,%19};"
+                        :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3])
+                        :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),
+                         "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3]),
+                         "r"(sfa),"h"(bidA),"h"(tidA_),"r"(sfb),"h"(bidB),"h"(tidB_));
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+        const unsigned int c0 = cta_n + warp_n_offset + nt * 8 + tid * 2, c1 = c0 + 1;
+        const unsigned int r0 = cta_m + warp_m_offset + group_id, r1 = r0 + 8;
+        const bool r0v = (int)(warp_m_offset + group_id + cta_m_local) < M_expert;
+        const bool r1v = (int)(warp_m_offset + group_id + 8 + cta_m_local) < M_expert;
+        if (r0v && c0 < N) C[r0 * N + c0] = __float2bfloat16(acc[nt][0] * scale2);
+        if (r0v && c1 < N) C[r0 * N + c1] = __float2bfloat16(acc[nt][1] * scale2);
+        if (r1v && c0 < N) C[r1 * N + c0] = __float2bfloat16(acc[nt][2] * scale2);
+        if (r1v && c1 < N) C[r1 * N + c1] = __float2bfloat16(acc[nt][3] * scale2);
+    }
+}
+
 // Projection-multiplexed compact gate/up dispatch.  The y grid selects the
 // pointer table and destination while x retains the proven compact work item.
 // This removes one host submission per MoE layer without changing the native

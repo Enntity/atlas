@@ -76,6 +76,7 @@ fn zero_head() -> BlockDiffusionDraftHead {
         lm_head_shared: DevicePtr(0),
         lm_head_nvfp4: None,
         lm_head_shared_fp8: None,
+        lm_head_mx: None,
         hidden_norm: DenseWeight {
             weight: DevicePtr(0),
         },

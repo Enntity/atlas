@@ -339,6 +339,9 @@ pub struct MoeLayer {
     moe_grouped_gemm_t_k64_m32: KernelHandle,
     moe_w4a4_prequant_t_k64: KernelHandle,
     moe_w4a4_prequant_t_k64_vecscale: KernelHandle,
+    /// Same prequant FP4 grouped GEMM with K128 stages and ldmatrix-fed MMAs
+    /// (bitwise-identical outputs); `ATLAS_MOE_PREQUANT_K128=1`, else null.
+    moe_w4a4_prequant_t_k128: KernelHandle,
     /// Compact-worklist twins of the prequantized native-FP4 MoE kernel.
     /// Optional and used only for guarded K=5 gate/up verification.
     moe_w4a4_prequant_t_k64_compact: KernelHandle,

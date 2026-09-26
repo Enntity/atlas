@@ -607,12 +607,13 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
-        self.kernels.linear(
+        self.kernels.project(
             gpu,
             self.batch_norm,
             &DenseWeight {
                 weight: self.lm_head_shared,
             },
+            self.lm_head_mx.as_ref(),
             self.batch_logits,
             rows,
             vocab,

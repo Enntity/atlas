@@ -376,9 +376,10 @@ impl MoeLayer {
                     stream,
                 )?;
             } else {
+                let (kernel, threads) = self.prequant_grouped_kernel(grouped_kernel, inter, h);
                 ops::moe_w4a4_grouped_gemm_prequant_n128(
                     ctx.gpu,
-                    grouped_kernel,
+                    kernel,
                     a_packed,
                     a_scale,
                     weight.packed_ptrs,
@@ -391,11 +392,22 @@ impl MoeLayer {
                     inter,
                     h,
                     max_m_tiles,
+                    threads,
                     stream,
                 )?;
             }
         }
         Ok(())
+    }
+
+    /// The K128 prequant kernel (256 threads) when enabled and the shape is
+    /// K128/N128-aligned, else `fallback` (128 threads).
+    fn prequant_grouped_kernel(&self, fallback: KernelHandle, n: u32, k: u32) -> (KernelHandle, u32) {
+        if self.moe_w4a4_prequant_t_k128.0 != 0 && n % 128 == 0 && k % 128 == 0 {
+            (self.moe_w4a4_prequant_t_k128, 256)
+        } else {
+            (fallback, 128)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -423,9 +435,10 @@ impl MoeLayer {
         } else {
             self.moe_w4a4_prequant_t_k64
         };
+        let (kernel, threads) = self.prequant_grouped_kernel(grouped_kernel, h, inter);
         ops::moe_w4a4_grouped_gemm_prequant_n128(
             ctx.gpu,
-            grouped_kernel,
+            kernel,
             a_packed,
             a_scale,
             down.packed_ptrs,
@@ -438,6 +451,7 @@ impl MoeLayer {
             h,
             inter,
             max_m_tiles,
+            threads,
             stream,
         )
     }

@@ -564,6 +564,10 @@ pub struct BlockDiffusionDraftHead {
     /// it must not mutate the target model's lm_head. `None` on the
     /// BF16 path.
     pub lm_head_shared_fp8: Option<crate::weight_map::Fp8DenseWeight>,
+    /// MXFP8 mirror of the BF16 shared lm_head for the drafter's logits
+    /// (`ATLAS_DFLASH_MXFP8_HEAD=1`): the full-vocab head is the largest
+    /// read of every proposal, and drafts only need its top-K.
+    pub lm_head_mx: Option<Mxfp8Weight>,
 
     // === Weights from the drafter checkpoint ===
     /// Hidden-norm applied to the projected target context before mixing

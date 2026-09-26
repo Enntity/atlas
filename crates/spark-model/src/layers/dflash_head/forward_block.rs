@@ -578,12 +578,13 @@ impl BlockDiffusionDraftHead {
                         )?;
                     }
                     None => {
-                        self.kernels.linear(
+                        self.kernels.project(
                             gpu,
                             norm_noise_local,
                             &crate::weight_map::DenseWeight {
                                 weight: self.lm_head_shared,
                             },
+                            self.lm_head_mx.as_ref(),
                             scratch.logits,
                             self.gamma as u32,
                             self.vocab_size as u32,
@@ -593,12 +594,13 @@ impl BlockDiffusionDraftHead {
                     }
                 }
             } else {
-                self.kernels.linear(
+                self.kernels.project(
                     gpu,
                     norm_noise_local,
                     &crate::weight_map::DenseWeight {
                         weight: self.lm_head_shared,
                     },
+                    self.lm_head_mx.as_ref(),
                     scratch.logits,
                     self.gamma as u32,
                     self.vocab_size as u32,

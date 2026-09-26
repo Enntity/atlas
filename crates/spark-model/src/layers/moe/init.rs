@@ -182,6 +182,13 @@ impl MoeLayer {
                 "moe_w4a16",
                 "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale",
             ),
+            moe_w4a4_prequant_t_k128: if std::env::var("ATLAS_MOE_PREQUANT_K128").as_deref()
+                == Ok("1")
+            {
+                super::super::try_kernel(gpu, "moe_w4a16", "moe_w4a4_grouped_gemm_prequant_t_k128")
+            } else {
+                KernelHandle(0)
+            },
             moe_w4a4_prequant_t_k64_compact: if config.model_type == "glm5_next" {
                 super::super::try_kernel(
                     gpu,

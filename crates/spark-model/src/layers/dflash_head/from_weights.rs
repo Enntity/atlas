@@ -667,6 +667,7 @@ impl BlockDiffusionDraftHead {
             lm_head_shared,
             lm_head_nvfp4,
             lm_head_shared_fp8: None,
+            lm_head_mx: None,
             hidden_norm: weights.hidden_norm,
             norm: weights.norm,
             fc: weights.fc,

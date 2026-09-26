@@ -137,8 +137,21 @@ impl BlockDiffusionDraftHead {
             layer.up_proj_mx = Some(quantize(&layer.up_proj, inter, h)?);
             layer.down_proj_mx = Some(quantize(&layer.down_proj, h, inter)?);
         }
+        if std::env::var("ATLAS_DFLASH_MXFP8_HEAD").as_deref() == Ok("1")
+            && self.lm_head_nvfp4.is_none()
+            && self.lm_head_shared.0 != 0
+        {
+            let head = DenseWeight {
+                weight: self.lm_head_shared,
+            };
+            self.lm_head_mx = Some(quantize(&head, self.vocab_size, h)?);
+        }
         gpu.synchronize(stream)?;
-        tracing::info!("DFlash MXFP8: {} layers x 5 projections", self.layers.len());
+        tracing::info!(
+            "DFlash MXFP8: {} layers x 5 projections, lm_head {}",
+            self.layers.len(),
+            self.lm_head_mx.is_some()
+        );
         Ok(())
     }
 

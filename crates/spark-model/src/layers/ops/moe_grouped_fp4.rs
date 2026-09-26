@@ -67,11 +67,12 @@ pub fn moe_w4a4_grouped_gemm_prequant_n128(
     n_out: u32,
     k: u32,
     max_m_tiles: u32,
+    threads: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n_out, 128), max_m_tiles, num_experts])
-        .block([128, 1, 1])
+        .block([threads, 1, 1])
         .arg_ptr(a_packed)
         .arg_ptr(a_scale)
         .arg_ptr(b_packed_ptrs)
