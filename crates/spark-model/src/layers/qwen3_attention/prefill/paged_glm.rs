@@ -12,7 +12,7 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 
-use super::super::Qwen3AttentionLayer;
+use super::super::{MlaWeights, Qwen3AttentionLayer};
 use super::paged_mla::MlaPrefillArgs;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
@@ -47,13 +47,36 @@ impl Qwen3AttentionLayer {
         let meta = ctx
             .attn_metadata
             .expect("GLM paged prefill requires metadata");
-        let owner = GlmChunkOwner {
-            row0: 0,
-            rows: args.num_tokens,
+        let pieces = crate::layer::prefill_attention_pieces(
             seq_len_start,
-            meta,
+            args.num_tokens,
+            ctx.config.index_topk,
+        );
+        // Several pieces: consecutive same-sequence owners. The joint cache
+        // write lands every row first; piece k's causal extent is entry 1 + k
+        // of the chunk's seq_len buffer (Model::upload_chunk_seq_lens).
+        let owners: Vec<GlmChunkOwner> = if pieces.len() == 1 {
+            vec![GlmChunkOwner { row0: 0, rows: args.num_tokens, seq_len_start, meta }]
+        } else {
+            pieces
+                .iter()
+                .enumerate()
+                .map(|(k, &(row0, rows))| GlmChunkOwner {
+                    row0,
+                    rows,
+                    seq_len_start: seq_len_start + row0,
+                    meta: crate::layer::AttnMetadataDev {
+                        positions: meta.positions.offset(row0 * 4),
+                        positions_h: meta.positions_h.offset(row0 * 4),
+                        positions_w: meta.positions_w.offset(row0 * 4),
+                        slot: meta.slot.offset(row0 * 8),
+                        seq_len: meta.seq_len.offset((1 + k) * 4),
+                        ..meta
+                    },
+                })
+                .collect()
         };
-        self.glm_chunk_attention(&[owner], kv_cache, ctx, args)
+        self.glm_chunk_attention(&owners, kv_cache, ctx, args)
     }
 
     /// GLM MLA over the causal chunks of one or more sequences whose rows are
@@ -158,16 +181,12 @@ impl Qwen3AttentionLayer {
         // Per owner: semantic index, q_b + absorb, attention.
         let attn_latent = ctx.buffers.attn_output();
         let latent_row = nq as usize * kv_lora as usize * bf16;
-        let parked = if owners.len() > 1 {
-            let bytes = num_tokens * latent_row;
-            ensure!(
-                ctx.buffers.sizes().logits >= bytes,
-                "GLM multi-owner attention park exceeds the logits arena"
-            );
-            Some(ctx.buffers.logits())
-        } else {
-            None
-        };
+        // Owners share the attention scratch, so each one's latent result is
+        // parked for one joint W_uv + o_proj. When the chunk outgrows the
+        // park (8K sub-chunked prefill) each owner projects its own rows.
+        let o_out = ctx.buffers.norm_output();
+        let per_owner = owners.len() > 1 && ctx.buffers.sizes().logits < num_tokens * latent_row;
+        let parked = (owners.len() > 1 && !per_owner).then(|| ctx.buffers.logits());
         for o in owners {
             let on = o.rows as u32;
             let octx = ForwardContext {
@@ -308,7 +327,17 @@ impl Qwen3AttentionLayer {
 
             // Convert the latent attention result back to each head's value
             // width, then apply the row-parallel output projection.
-            if let Some(park) = parked {
+            if per_owner {
+                self.paged_glm_output(
+                    mla,
+                    attn_latent,
+                    o_out.offset(o.row0 * h as usize * bf16),
+                    [o.rows as u32, nq, h],
+                    &octx,
+                    stream,
+                    accelerated,
+                )?;
+            } else if let Some(park) = parked {
                 ctx.gpu.copy_d2d_async(
                     attn_latent,
                     park.offset(o.row0 * latent_row),
@@ -318,16 +347,35 @@ impl Qwen3AttentionLayer {
             }
         }
 
-        // Joint: W_uv and o_proj.
+        if !per_owner {
+            self.paged_glm_output(mla, parked.unwrap_or(attn_latent), o_out, [n, nq, h], ctx, stream, accelerated)?;
+        }
+        Ok(o_out)
+    }
+
+    /// W_uv then the row-parallel o_proj for `rows` latent attention rows
+    /// of `nq` local heads into `h` hidden columns.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_glm_output(
+        &self,
+        mla: &MlaWeights,
+        latent: DevicePtr,
+        out: DevicePtr,
+        [rows, nq, h]: [u32; 3],
+        ctx: &ForwardContext,
+        stream: u64,
+        accelerated: bool,
+    ) -> Result<()> {
+        let (kv_lora, v_dim) = (mla.kv_lora_rank as u32, mla.v_dim as u32);
         let v_extracted = ctx.buffers.qkv_output();
         ops::glm_paged_grouped_gemm_mla(
             ctx.gpu,
             self.grouped_gemm_mla_k,
             &ctx.config.model_type,
-            parked.unwrap_or(attn_latent),
+            latent,
             mla.w_uv.weight,
             v_extracted,
-            n,
+            rows,
             nq,
             kv_lora,
             v_dim,
@@ -335,19 +383,7 @@ impl Qwen3AttentionLayer {
             nq * v_dim,
             stream,
         )?;
-        let o_out = ctx.buffers.norm_output();
-        self.paged_glm_projection(
-            v_extracted,
-            &mla.wo,
-            o_out,
-            n,
-            h,
-            nq * v_dim,
-            ctx,
-            stream,
-            accelerated,
-        )?;
-        Ok(o_out)
+        self.paged_glm_projection(v_extracted, &mla.wo, out, rows, h, nq * v_dim, ctx, stream, accelerated)
     }
 }
 

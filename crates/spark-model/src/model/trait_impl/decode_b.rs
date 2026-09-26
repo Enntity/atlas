@@ -325,18 +325,7 @@ impl TransformerModel {
                     .uploaded_blocks = current_blocks;
             }
 
-            let seq_len_val = (proc_start + proc_count) as u32;
-            // SAFETY: exactly `size_of::<u32>()` bytes over the live, fully
-            // initialised `seq_len_val` local on the line above.
-            let seq_len_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &seq_len_val as *const u32 as *const u8,
-                    std::mem::size_of::<u32>(),
-                )
-            };
-            let seq_len_base = prefill_seq.chunked_prefill_meta.as_ref().unwrap().seq_len;
-            self.gpu
-                .copy_h2d_async(seq_len_bytes, seq_len_base, stream)?;
+            self.upload_chunk_seq_lens(prefill_seq, proc_start, proc_count, stream)?;
 
             let block_table_base = prefill_seq
                 .chunked_prefill_meta

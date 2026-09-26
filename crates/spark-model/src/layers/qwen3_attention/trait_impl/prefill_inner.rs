@@ -677,7 +677,12 @@ impl Qwen3AttentionLayer {
                  got seq_len_start=0."
             );
         }
-        let attn_out = if seq_len_start == 0 {
+        // GLM semantic-index MLA runs every chunk, the first included, through
+        // the paged sparse path: the dense cache-skip arm attends to every
+        // earlier row (not the top-k selection) and is quadratic in the chunk.
+        let glm_paged = ctx.attn_metadata.is_some_and(|m| !m.block_table.is_null())
+            && self.mla.as_ref().is_some_and(|mla| mla.glm_indexer.is_some());
+        let attn_out = if seq_len_start == 0 && !glm_paged {
             self.prefill_attention_with_cache_skip(
                 state,
                 normed,

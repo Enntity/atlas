@@ -87,7 +87,8 @@ impl TransformerModel {
         } else {
             (pos_stream_bytes + 7) & !7
         };
-        let needs_paged = effective_seq_len_start > 0;
+        // GLM-5 MLA attends through the paged cache from the first chunk on.
+        let needs_paged = effective_seq_len_start > 0 || self.config.model_type == "glm5_next";
 
         // Lock staging, build positions plus non-paged slots, and upload.
         {
