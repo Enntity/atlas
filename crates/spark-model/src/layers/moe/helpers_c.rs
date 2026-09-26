@@ -283,6 +283,25 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // GLM prefill (`ATLAS_GLM_ROUTER_PREFILL_CUBLAS=1`): tensor-core BF16
+        // GEMM with FP32 accumulation instead of the order-preserving BN32
+        // kernel (~5 TFLOPS). Routing arithmetic then differs from decode's
+        // in summation order only.
+        if ctx.config.model_type == "glm5_next"
+            && num_tokens > 64
+            && !ctx.graph_capture
+            && glm_router_prefill_cublas()
+        {
+            return spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+                router_in.0,
+                self.weights.gate.weight.0,
+                gate_logits.0,
+                num_tokens,
+                num_experts,
+                hidden_size,
+                stream,
+            );
+        }
         if self.try_router_prefill_bn32(
             router_in,
             gate_logits,
@@ -366,4 +385,9 @@ impl MoeLayer {
         )?;
         Ok(normed)
     }
+}
+
+fn glm_router_prefill_cublas() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_ROUTER_PREFILL_CUBLAS").as_deref() == Ok("1"))
 }
