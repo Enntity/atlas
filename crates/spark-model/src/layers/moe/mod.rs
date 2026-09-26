@@ -134,6 +134,8 @@ pub struct MoeLayer {
     pub pre_expert_norm: Option<crate::weight_map::DenseWeight>,
     pre_expert_norm_k: spark_runtime::gpu::KernelHandle,
     dense_gemv: KernelHandle,
+    /// `dense_gemv_bf16_batchm` (bit-identical per row to `dense_gemv`), or 0.
+    dense_gemv_batchm: KernelHandle,
     w4a16_gemv: KernelHandle,
     /// Single-warp `w4a16_gemv_sw`. `KernelHandle(0)` on miss → base GEMV.
     w4a16_gemv_sw: KernelHandle,

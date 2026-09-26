@@ -85,6 +85,11 @@ impl MoeLayer {
             pre_expert_norm: None,
             pre_expert_norm_k: rms_norm_k,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemv_batchm: super::super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batchm",
+            ),
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,

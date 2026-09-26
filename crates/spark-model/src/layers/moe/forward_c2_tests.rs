@@ -151,7 +151,7 @@ fn actual_c2_compact_entry_and_literal_off_control() {
                 ctx.levers = &levers;
                 ctx.graph_capture = capture;
                 gpu.capture.store(capture, Ordering::Relaxed);
-                let router = layer.dense_gemv.0;
+                let router = layer.dense_gemv_batchm.0;
                 let shared = layer.w4a16_gemv_batch2.0;
                 let builder = layer.moe_build_tile_worklist_k.0;
                 let fused = if vector {
@@ -244,14 +244,11 @@ fn actual_c2_compact_entry_and_literal_off_control() {
                         }
                     })
                     .collect();
+                // One batched router pass covers both rows.
                 let routers: Vec<_> = kernels.iter().filter(|k| k.0 == router).collect();
-                assert_eq!(routers.len(), 2);
-                for (row, kernel) in routers.iter().enumerate() {
-                    assert_eq!(
-                        kernel.4[0],
-                        Arg::Ptr(arena.norm_output().offset(row * 8192))
-                    );
-                }
+                assert_eq!(routers.len(), 1);
+                assert_eq!(routers[0].4[0], Arg::Ptr(arena.norm_output()));
+                assert_eq!(routers[0].4[3], Arg::Bytes(2u32.to_ne_bytes().to_vec()));
                 assert_eq!(kernels.iter().filter(|k| k.0 == shared).count(), 3);
                 for shared_call in kernels.iter().filter(|k| k.0 == shared) {
                     assert_eq!(shared_call.4.len(), 7, "batch2 ABI has no runtime M");

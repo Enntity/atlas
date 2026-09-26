@@ -176,6 +176,23 @@ impl MoeLayer {
     ) -> Result<()> {
         let h = ctx.config.hidden_size;
         let experts = ctx.config.num_experts;
+        // One weight pass for every row; per-row arithmetic equals dense_gemv.
+        if self.dense_gemv_batchm.0 != 0
+            && (1..=ops::DENSE_GEMV_BATCHM_MAX_M as usize).contains(&rows)
+        {
+            return ops::dense_gemv_batchm(
+                ctx.gpu,
+                self.dense_gemv_batchm,
+                input,
+                &self.weights.gate,
+                output,
+                rows as u32,
+                experts as u32,
+                h as u32,
+                experts as u32,
+                stream,
+            );
+        }
         for row in 0..rows {
             ops::dense_gemv(
                 ctx.gpu,
