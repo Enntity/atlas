@@ -52,6 +52,7 @@ fn zero_scratch() -> DflashScratch {
         markov_prev_dev: DevicePtr(0),
         markov_prev_host_pinned: Default::default(),
         position_ids: DevicePtr(0),
+        dflash2: None,
     }
 }
 
@@ -87,6 +88,7 @@ fn zero_head() -> BlockDiffusionDraftHead {
         markov_w1: None,
         markov_w2: None,
         markov_rank: 0,
+        dflash2: None,
         draft_id_to_target_id: None,
         layers: Vec::new(),
         fused_kv_weight: None,

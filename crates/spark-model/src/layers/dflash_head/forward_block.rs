@@ -616,7 +616,23 @@ impl BlockDiffusionDraftHead {
                     let _ = std::fs::write("/tmp/atlas_block_logits_pre.bin", &pre);
                 }
             }
-            self.argmax_block_logits(last_token, gpu, stream, scratch, markov_embed, markov_bias)?;
+            // ATLAS_DFLASH2_ARGMAX=1 bypasses the selector walk (diagnostic).
+            if self.dflash2.is_some()
+                && std::env::var("ATLAS_DFLASH2_ARGMAX").as_deref() != Ok("1")
+            {
+                // DFlash2: lm_head top-K + candidate-selector walk from the
+                // anchor (seeded in markov_prev_dev) replaces the argmax.
+                self.dflash2_select_drafts(gpu, scratch, norm_noise_local, stream)?;
+            } else {
+                self.argmax_block_logits(
+                    last_token,
+                    gpu,
+                    stream,
+                    scratch,
+                    markov_embed,
+                    markov_bias,
+                )?;
+            }
 
             // ── BLOCK-FORWARD PARITY DUMP (Friday 2026-06-11) ──────────────
             // Tests Ronald's theory: is the block-diffusion forward COMPUTING

@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 
+use super::dflash2::ConvSite;
 use super::{BlockDiffusionDraftHead, DflashLayer, DflashScratch};
 use crate::layer::ForwardContext;
 
@@ -85,6 +86,17 @@ impl BlockDiffusionDraftHead {
             n_attn,
             h,
             self.rms_norm_eps,
+            stream,
+        )?;
+        // DFlash2 convs act on the γ noise rows only (ctx rows are
+        // discarded and ctx K/V bypass the conv). No-ops for v1.
+        let noise_h = eff_ctx * self.hidden_size * bf16;
+        self.dflash2_conv_prepare(
+            gpu,
+            scratch,
+            layer_idx,
+            ConvSite::Attention,
+            scratch.norm_buf.offset(noise_h),
             stream,
         )?;
 
@@ -306,6 +318,14 @@ impl BlockDiffusionDraftHead {
             q_dim,
             stream,
         )?;
+        self.dflash2_conv_finish(
+            gpu,
+            scratch,
+            layer_idx,
+            ConvSite::Attention,
+            scratch.stream_acc.offset(noise_h),
+            stream,
+        )?;
         if layer_idx == 0 {
             let noise_offset = eff_ctx * self.hidden_size * bf16;
             dump_bf16(
@@ -358,6 +378,14 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
+        self.dflash2_conv_prepare(
+            gpu,
+            scratch,
+            layer_idx,
+            ConvSite::Mlp,
+            scratch.norm_buf.offset(noise_h),
+            stream,
+        )?;
 
         // 3i. MLP: gate + up.
         ops::dense_gemm_bf16_pipelined(
@@ -404,6 +432,14 @@ impl BlockDiffusionDraftHead {
             n_attn,
             h,
             inter,
+            stream,
+        )?;
+        self.dflash2_conv_finish(
+            gpu,
+            scratch,
+            layer_idx,
+            ConvSite::Mlp,
+            scratch.stream_acc.offset(noise_h),
             stream,
         )?;
 

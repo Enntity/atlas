@@ -15,6 +15,8 @@
 mod activations;
 #[path = "ops/derived_weights.rs"]
 mod derived_weights;
+#[path = "ops/dflash2.rs"]
+mod dflash2;
 #[path = "ops/dispatch_config.rs"]
 mod dispatch_config;
 #[path = "ops/dispatch_helpers.rs"]
@@ -199,6 +201,7 @@ mod wide_prefill;
 
 pub use activations::*;
 pub use derived_weights::{Derivation, DerivedWeights};
+pub use dflash2::*;
 pub use dispatch_config::GemmDispatch;
 pub use dispatch_helpers::*;
 pub use dispatch_proj::*;

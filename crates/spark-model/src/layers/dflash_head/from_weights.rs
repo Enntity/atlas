@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use parking_lot::Mutex;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::{
@@ -19,7 +19,7 @@ use crate::weight_loader::DflashWeights;
 
 impl BlockDiffusionDraftHead {
     pub fn from_weights(
-        weights: DflashWeights,
+        mut weights: DflashWeights,
         embed_tokens_shared: DevicePtr,
         lm_head_shared: DevicePtr,
         lm_head_nvfp4: Option<crate::weight_map::QuantizedWeight>,
@@ -52,19 +52,8 @@ impl BlockDiffusionDraftHead {
             .as_ref()
             .map(|c| c.mask_token_id)
             .unwrap_or(0);
-        let query_causal = weights
-            .config
-            .dflash_config
-            .as_ref()
-            .and_then(|c| c.causal)
-            .unwrap_or(false);
-        let window_size = window_size.or_else(|| {
-            weights
-                .config
-                .dflash_config
-                .as_ref()
-                .and_then(|c| c.swa_window_size)
-        });
+        let query_causal = weights.config.query_causal();
+        let window_size = window_size.or_else(|| weights.config.sliding_window());
 
         if target_layer_ids.is_empty() {
             anyhow::bail!(
@@ -92,6 +81,25 @@ impl BlockDiffusionDraftHead {
         let head_dim = weights.config.head_dim;
         let vocab_size = weights.config.vocab_size;
         let gamma_val = gamma.unwrap_or(weights.config.block_size);
+        let dflash2 = weights
+            .dflash2
+            .take()
+            .map(|d| super::Dflash2Head::new(d, num_layers, gpu))
+            .transpose()?;
+        if dflash2.is_some() {
+            anyhow::ensure!(
+                gamma_val >= 2,
+                "DFlash2 needs γ >= 2 (anchor + mask rows), got {gamma_val}"
+            );
+            anyhow::ensure!(
+                weights.markov_rank == 0,
+                "DFlash2 candidate selector and DSpark Markov head are mutually exclusive"
+            );
+            anyhow::ensure!(
+                !startup.native_batch_authoritative,
+                "DFlash2 is not supported on the native batched (Lightning) proposer"
+            );
+        }
 
         // Allocate the drafter's paged FP8 KV cache. One multi-layer cache,
         // sized for `max_seq_len + γ + 1` positions (prompt + γ drafts +
@@ -225,11 +233,7 @@ impl BlockDiffusionDraftHead {
             // try_kernel: absent on targets whose w4a16 module predates
             // Phase G — the FP8 drafter path is then skipped at the
             // ATLAS_DFLASH_DRAFTER_FP8 gate below (BF16 fallback).
-            fp8_gemm_n128_row_scaled: crate::layers::try_kernel(
-                gpu,
-                "w4a16",
-                "fp8_gemm_t_row_scaled",
-            ),
+            fp8_gemm_n128_row_scaled: fp8_drafter_kernel(gpu, "fp8_gemm_t_row_scaled"),
             // Phase G — Row-scaled BF16 × FP8 → BF16 GEMV (M=1). Used
             // by the lm_head GEMM swap in a γ-loop, since the
             // fp8_gemm_n128 GEMM kernel wastes 75% of its M_TILE at
@@ -238,11 +242,7 @@ impl BlockDiffusionDraftHead {
             // Phase G — Small-M (M≤16) row-scaled FP8 GEMM for lm_head.
             // Single warp per CTA, no M_TILE waste. Custom kernel in
             // w4a16_gemm.cu, module namespace "w4a16".
-            fp8_gemm_n128_row_scaled_m16: crate::layers::try_kernel(
-                gpu,
-                "w4a16",
-                "fp8_gemm_t_row_scaled_m16",
-            ),
+            fp8_gemm_n128_row_scaled_m16: fp8_drafter_kernel(gpu, "fp8_gemm_t_row_scaled_m16"),
             w4a16_gemv_batch4: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch4")?,
             w4a16_gemv_batch8: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
             w4a16_gemv_batch16: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
@@ -339,6 +339,10 @@ impl BlockDiffusionDraftHead {
                     gpu.alloc_host_pinned(4)?,
                 ),
                 position_ids: gpu.alloc(n_attn * 4)?,
+                dflash2: dflash2
+                    .as_ref()
+                    .map(|d| d.alloc_scratch(gpu, g, hidden_size))
+                    .transpose()?,
             };
             // C1 diagnostic: zero ALL device buffers so any uninitialized
             // read sees deterministic zeros instead of per-lane garbage.
@@ -664,6 +668,7 @@ impl BlockDiffusionDraftHead {
             markov_w1: weights.markov_w1,
             markov_w2: weights.markov_w2,
             markov_rank: weights.markov_rank,
+            dflash2,
             lane0_markov_embed: if weights.markov_rank > 0 {
                 gpu.alloc(weights.markov_rank * 2)?
             } else {
@@ -746,7 +751,7 @@ impl BlockDiffusionDraftHead {
             yarn_inv_freq,
             rope_theta,
             rotary_dim,
-            rms_norm_eps: 1e-6,
+            rms_norm_eps: weights.config.rms_norm_eps,
             ctx_window,
             // Phase F: per-subgraph graph state — empty until the first
             // capture pass lands. Layout: [pre_0, post_0, ..., tail].
@@ -761,7 +766,7 @@ impl BlockDiffusionDraftHead {
 
         tracing::info!(
             "BlockDiffusionDraftHead loaded: {} layers, hidden={}, intermediate={}, \
-             GQA {}/{}, head_dim={}, γ={}, vocab={}, mask_token_id={}, causal={}, window={:?}, sinks={}, target_layers={:?}",
+             GQA {}/{}, head_dim={}, γ={}, vocab={}, mask_token_id={}, causal={}, window={:?}, sinks={}, dflash2={}, eps={}, rope_theta={}, target_layers={:?}",
             head.num_layers,
             head.hidden_size,
             head.intermediate_size,
@@ -777,6 +782,9 @@ impl BlockDiffusionDraftHead {
                 .iter()
                 .filter(|l| l.attention_sink_bias.is_some())
                 .count(),
+            head.dflash2.is_some(),
+            head.rms_norm_eps,
+            head.rope_theta,
             head.target_layer_ids,
         );
 
@@ -789,7 +797,7 @@ impl BlockDiffusionDraftHead {
         // Acceptance gate (G.4 design doc §16.7): bench must hold
         // ≥43% accept (vs 44.9% BF16) AND ≥11.0 tok/s (vs 8.70). If hard
         // fail, layer-by-layer ablation; skip layer 0 first.
-        let fp8_requested = std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() == Some("1");
+        let fp8_requested = fp8_drafter_requested();
         let fp8_kernels_present = head.kernels.fp8_gemm_n128_row_scaled.0 != 0
             && head.kernels.fp8_gemm_n128_row_scaled_m16.0 != 0;
         if fp8_requested && !fp8_kernels_present {
@@ -913,5 +921,20 @@ impl BlockDiffusionDraftHead {
     /// SWA window in tokens. 0 = no window (full context).
     pub(super) fn attn_sliding_window(&self) -> u32 {
         self.window_size.unwrap_or(0) as u32
+    }
+}
+
+fn fp8_drafter_requested() -> bool {
+    std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() == Some("1")
+}
+
+/// The Phase G FP8 drafter kernels are looked up only when that path is
+/// requested, so targets that never ship them do not report a silent fallback.
+#[track_caller]
+fn fp8_drafter_kernel(gpu: &dyn GpuBackend, func: &str) -> KernelHandle {
+    if fp8_drafter_requested() {
+        crate::layers::try_kernel(gpu, "w4a16", func)
+    } else {
+        KernelHandle(0)
     }
 }

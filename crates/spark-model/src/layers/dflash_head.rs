@@ -202,6 +202,8 @@ pub struct DflashScratch {
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
     pub position_ids: DevicePtr,
+    /// DFlash2 conv/selector scratch. `None` unless the head is DFlash2.
+    pub dflash2: Option<Dflash2Scratch>,
 }
 
 /// Drafter-side weight precision. Defaults to BF16. **Phase G (2026-05-28)**
@@ -500,6 +502,8 @@ pub struct BlockDiffusionDraftHead {
     /// DSpark Markov `w2` `[vocab, rank]` BF16.
     pub markov_w2: Option<DenseWeight>,
     pub markov_rank: usize,
+    /// DFlash2 grouped conv + candidate selector. `None` for DFlash v1/DSpark.
+    pub dflash2: Option<Dflash2Head>,
     /// Optional draft-vocab-id → target-vocab-id remap. `None` when the
     /// drafter shares vocab with the target (Qwen3.6-35B-A3B-DFlash case:
     /// vocab_size == draft_vocab_size == 248320).
@@ -674,6 +678,8 @@ mod batch_forward;
 #[cfg(test)]
 mod batch_inputs_tests;
 mod batch_projection;
+mod dflash2;
+pub use dflash2::{Dflash2Head, Dflash2Kernels, Dflash2Scratch};
 mod lifecycle;
 #[cfg(test)]
 mod row_contract_tests;

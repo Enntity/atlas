@@ -38,6 +38,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
+use super::dflash2::ConvSite;
 use super::{BlockDiffusionDraftHead, DflashLayer, DflashScratch};
 use crate::layer::ForwardContext;
 
@@ -200,6 +201,15 @@ impl BlockDiffusionDraftHead {
         if args.block_dump {
             self.block_dump_buf(ctx, scratch.norm_buf, layer_idx, "input_norm", g, h, stream)?;
         }
+        // DFlash2: attention_conv.prepare on the normed rows (no-op for v1).
+        self.dflash2_conv_prepare(
+            gpu,
+            scratch,
+            layer_idx,
+            ConvSite::Attention,
+            scratch.norm_buf,
+            stream,
+        )?;
 
         // Phase G: when self.quant == Fp8Weights, swap each dense_gemm
         // for fp8_gemm_n128_row_scaled against the FP8 mirror weight.
@@ -801,6 +811,7 @@ impl BlockDiffusionDraftHead {
         use crate::layers::ops;
 
         let PagedLayerArgs {
+            layer_idx,
             h,
             q_dim,
             inter,
@@ -839,6 +850,15 @@ impl BlockDiffusionDraftHead {
             h,
             q_dim,
         )?;
+        // DFlash2: attention_conv.finish on the o_proj output.
+        self.dflash2_conv_finish(
+            gpu,
+            scratch,
+            layer_idx,
+            ConvSite::Attention,
+            scratch.stream_acc,
+            stream,
+        )?;
 
         // 3h. First residual add: hidden = residual + attn_output.
         // dflash.py:138  hidden_states = residual + hidden_states
@@ -869,6 +889,15 @@ impl BlockDiffusionDraftHead {
             g,
             h,
             self.rms_norm_eps,
+            stream,
+        )?;
+        // DFlash2: mlp_conv.prepare on the post-attention normed rows.
+        self.dflash2_conv_prepare(
+            gpu,
+            scratch,
+            layer_idx,
+            ConvSite::Mlp,
+            scratch.norm_buf,
             stream,
         )?;
 
@@ -913,6 +942,15 @@ impl BlockDiffusionDraftHead {
             scratch.stream_acc,
             h,
             inter,
+        )?;
+        // DFlash2: mlp_conv.finish on the down_proj output.
+        self.dflash2_conv_finish(
+            gpu,
+            scratch,
+            layer_idx,
+            ConvSite::Mlp,
+            scratch.stream_acc,
+            stream,
         )?;
 
         // 3k. Second residual add: hidden = (residual + attn) + mlp_output.
