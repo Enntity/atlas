@@ -231,18 +231,18 @@ impl Glm5KdaLayer {
     }
 
     /// Owner-batched verify recurrence: pack every owner's rows once, then
-    /// advance each owner's own state over its own three rows, in order.
+    /// advance each owner's own state over its own `rows` rows, in order.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_recurrent_owners(
         &self,
         projected: DevicePtr,
         g1: DevicePtr,
         beta: DevicePtr,
         owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        rows: usize,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
-        use crate::layer::glm_long_owner::ROWS;
-        let rows = owners.len() * ROWS;
         let p = self.heads * self.dim;
         let packed = ctx.buffers.ssm_qkvz();
         ops::kda_pack_qkv(
@@ -250,7 +250,7 @@ impl Glm5KdaLayer {
             self.pack_k,
             projected,
             packed,
-            rows as u32,
+            (owners.len() * rows) as u32,
             p as u32,
             stream,
         )?;
@@ -270,8 +270,8 @@ impl Glm5KdaLayer {
                 beta,
                 core_out,
                 state,
-                owner * ROWS,
-                ROWS,
+                owner * rows,
+                rows,
                 ctx,
                 stream,
             )?;

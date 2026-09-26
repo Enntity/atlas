@@ -1,22 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Owner-batched repaired long-context K3 verify (see `layer::glm_long_owner`).
+//! Owner-batched long-context verify (see `layer::glm_long_owner`): N owners
+//! of R rows each, R = 3 on the repaired MTP K3 lane or 2..=8 on DFlash.
 //!
 //! Wire protocol, both commands v2-addressed:
 //!
 //! ```text
-//! E9  (seq_id 0)     N, slots[N], tokens[3N]      -> both ranks run one traversal
-//! EA  (seq_id slot)  owner, tokens[3], verdict    -> per owner, in order
+//! E9  (seq_id 0)     width(N, R), slots[N], tokens[R*N]  -> both ranks run one traversal
+//! EA  (seq_id slot)  width(owner, R), tokens[R], verdict -> per owner, in order
 //! ```
 //!
+//! `width` packs R into the high half-word of the owner word and encodes K3 as
+//! 0 there, so the K3 wire is unchanged from the fixed-width protocol.
+//!
 //! After E9 both ranks hold every owner's final rows in the stage. Before each
-//! owner's verdict EA restores that owner's rows to arena rows [0, 3), so the
+//! owner's verdict EA restores that owner's rows to arena rows [0, R), so the
 //! unchanged single-owner tail (verdict, repair record, commit, the owner's own
 //! distributed propose) observes exactly what a single-owner verify leaves.
 
 use super::TransformerModel;
 use super::block_mgmt::ensure_blocks_through_decode;
-use crate::layer::glm_long_owner::{self as owner, GlmLongOwner, GlmLongStage, MAX_OWNERS, ROWS};
+use crate::layer::glm_long_owner::{
+    self as owner, GlmLongOwner, GlmLongStage, K3_ROWS, MAX_OWNERS, MAX_ROWS,
+};
 use crate::layer::{AttnMetadataDev, ForwardContext};
 use crate::layers::ops;
 use crate::traits::{Model, SequenceState};
@@ -33,9 +39,64 @@ const META_SEQ_LENS: usize = 512;
 const META_BLOCK_TABLE: usize = 768;
 /// verify_d's metadata base, after the MTP metadata reservation.
 const META_BASE: usize = 32768;
+// The fixed per-row regions (u32 positions, seq slots, i64 slots, i32
+// seq_lens) must each hold MAX_ROWS rows below the block table.
+const _: () = assert!(
+    MAX_ROWS * 4 <= META_SEQ_SLOT
+        && MAX_ROWS * 4 <= META_SLOTS - META_SEQ_SLOT
+        && MAX_ROWS * 8 <= META_SEQ_LENS - META_SLOTS
+        && MAX_ROWS * 4 <= META_BLOCK_TABLE - META_SEQ_LENS
+);
 
 fn align(bytes: usize) -> usize {
     bytes.div_ceil(256) * 256
+}
+
+/// Scratch layout of one call's metadata: the joint block for every row at
+/// `META_BASE`, then one block per owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MetaLayout {
+    joint_bytes: usize,
+    owner_bytes: usize,
+    owners: usize,
+}
+
+impl MetaLayout {
+    fn new(owners: usize, rows: usize, max_blocks: usize) -> Self {
+        Self {
+            joint_bytes: align(META_BLOCK_TABLE + owners * rows * max_blocks * 4),
+            owner_bytes: align(META_BLOCK_TABLE + rows * max_blocks * 4),
+            owners,
+        }
+    }
+    /// Scratch offset of owner `o`'s metadata block.
+    fn owner_offset(&self, o: usize) -> usize {
+        META_BASE + self.joint_bytes + o * self.owner_bytes
+    }
+    /// Scratch bytes the layout ends at.
+    fn end(&self) -> usize {
+        self.owner_offset(self.owners)
+    }
+}
+
+/// Whether owner index `owner` exists in a call of `rows` rows per owner.
+fn owner_supported(owner: usize, rows: usize) -> bool {
+    owner < MAX_OWNERS && owner::width_supported(owner + 1, rows)
+}
+
+/// K3 is 0 in the high half-word, keeping the fixed-width K3 wire.
+fn encode_width(word: usize, rows: usize) -> u32 {
+    let rows = if rows == K3_ROWS { 0 } else { rows };
+    (word | rows << 16) as u32
+}
+
+/// Inverse of [`encode_width`]: `(word, rows)`.
+fn decode_width(raw: u32) -> (usize, usize) {
+    let rows = (raw >> 16) as usize;
+    (
+        (raw & 0xFFFF) as usize,
+        if rows == 0 { K3_ROWS } else { rows },
+    )
 }
 
 impl TransformerModel {
@@ -47,15 +108,23 @@ impl TransformerModel {
         )
     }
 
-    pub(super) fn can_batch_glm_long_verify_impl(&self, owners: usize) -> bool {
+    /// `owners` owners of `rows` rows each. The width follows the lane the
+    /// MLA verify admits (`validate_glm_long_verify`): exactly K3 on repaired
+    /// long-context MTP, a 2..=8 row block on the GLM DFlash lane.
+    pub(super) fn can_batch_glm_long_verify_impl(&self, owners: usize, rows: usize) -> bool {
+        use crate::speculative::glm_repair_policy as policy;
+        let lane = if policy::enabled() {
+            rows == K3_ROWS && policy::long_context_enabled()
+        } else {
+            policy::dflash_enabled()
+        };
         self.glm_long_stage.is_some()
-            && (1..=MAX_OWNERS).contains(&owners)
+            && owner::width_supported(owners, rows)
+            && lane
             && self.config.model_type == "glm5_next"
             && self.config.tp_world_size == 2
             && self.config.ep_world_size == 2
             && self.config.hc_mult == 4
-            && crate::speculative::glm_repair_policy::enabled()
-            && crate::speculative::glm_repair_policy::long_context_enabled()
             && self.lora.is_none()
             && self.paired_handoff().is_none()
             && self.multi_rank_protocol_active()
@@ -128,25 +197,31 @@ impl TransformerModel {
         })
     }
 
-    /// One target traversal for every owner, identical on both ranks. On Ok
-    /// each owner advanced by three rows (the caller's verdict rewinds), the
-    /// stage holds every owner's final rows, and the argmax IDs are returned.
+    /// One target traversal for every owner, identical on both ranks.
+    /// `tokens` is owner-major, `rows` per owner. On Ok each owner advanced by
+    /// `rows` rows (the caller's verdict rewinds), the stage holds every
+    /// owner's final rows, and the owner-major argmax IDs are returned.
     pub(super) fn glm_long_owner_compute(
         &self,
-        tokens: &[[u32; ROWS]],
+        rows: usize,
+        tokens: &[u32],
         seqs: &mut [&mut SequenceState],
-    ) -> Result<Vec<[u32; ROWS]>> {
+    ) -> Result<Vec<u32>> {
         let n = seqs.len();
         ensure!(
-            self.can_batch_glm_long_verify_impl(n) && tokens.len() == n,
-            "GLM long owner verify refused for {n} owners"
+            self.can_batch_glm_long_verify_impl(n, rows) && tokens.len() == n * rows,
+            "GLM long owner verify refused for {n} owners x {rows} rows"
         );
         let stage = self
             .glm_long_stage
             .context("GLM long owner stage missing")?;
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
-        let rows = n * ROWS;
+        let total = n * rows;
+        ensure!(
+            stage.rows.arena_fits(self.buffers.sizes(), total),
+            "GLM long owner verify arena holds fewer than {total} rows"
+        );
         let hidden = self.buffers.hidden_states();
         let mut kv_cache = self.kv_cache.lock();
         ensure!(
@@ -155,10 +230,9 @@ impl TransformerModel {
         );
         let bs = kv_cache.block_size();
         let mb = self.max_blocks_per_seq as usize;
-        let joint_bytes = align(META_BLOCK_TABLE + rows * mb * 4);
-        let owner_bytes = align(META_BLOCK_TABLE + ROWS * mb * 4);
+        let layout = MetaLayout::new(n, rows, mb);
         ensure!(
-            META_BASE + joint_bytes + n * owner_bytes <= self.buffers.sizes().scratch,
+            layout.end() <= self.buffers.sizes().scratch,
             "GLM long owner verify metadata exceeds scratch"
         );
 
@@ -168,13 +242,11 @@ impl TransformerModel {
         } else {
             None
         };
-        for (o, t) in tokens.iter().enumerate() {
-            for (r, &token) in t.iter().enumerate() {
-                self.embed(token, hidden.offset((o * ROWS + r) * h * 2), stream)?;
-            }
+        for (row, &token) in tokens.iter().enumerate() {
+            self.embed(token, hidden.offset(row * h * 2), stream)?;
         }
         for seq in seqs.iter_mut() {
-            for t in 0..ROWS {
+            for t in 0..rows {
                 ensure_blocks_through_decode(
                     seq,
                     (seq.seq_len + t) / bs,
@@ -189,7 +261,7 @@ impl TransformerModel {
         if std::env::var("ATLAS_GLM_LONG_BATCH_ALIAS_CHECK").as_deref() == Ok("1") {
             let mut owner_of = std::collections::HashMap::new();
             for (o, seq) in seqs.iter().enumerate() {
-                let used = (seq.seq_len + ROWS).div_ceil(bs);
+                let used = (seq.seq_len + rows).div_ceil(bs);
                 for (idx, &block) in seq.block_table.iter().take(used).enumerate() {
                     if let Some((prev, prev_idx)) = owner_of.insert(block, (o, idx)) {
                         tracing::error!(
@@ -203,12 +275,12 @@ impl TransformerModel {
             }
         }
         let scratch = self.buffers.scratch();
-        let mut joint_rows = Vec::with_capacity(rows);
+        let mut joint_rows = Vec::with_capacity(total);
         let mut metas = Vec::with_capacity(n);
         for (o, seq) in seqs.iter().enumerate() {
             let own: Vec<(usize, &SequenceState)> =
-                (0..ROWS).map(|t| (seq.seq_len + t, &**seq)).collect();
-            let base = scratch.offset(META_BASE + joint_bytes + o * owner_bytes);
+                (0..rows).map(|t| (seq.seq_len + t, &**seq)).collect();
+            let base = scratch.offset(layout.owner_offset(o));
             metas.push(self.glm_long_upload_meta(base, &own, bs, stream)?);
             joint_rows.extend(own);
         }
@@ -216,7 +288,7 @@ impl TransformerModel {
             self.glm_long_upload_meta(scratch.offset(META_BASE), &joint_rows, bs, stream)?;
         drop(joint_rows);
 
-        for (seq, t) in seqs.iter_mut().zip(tokens) {
+        for (seq, t) in seqs.iter_mut().zip(tokens.chunks_exact(rows)) {
             for (li, layer) in self.layers.iter().enumerate() {
                 layer.verify_prestage(
                     t,
@@ -226,7 +298,6 @@ impl TransformerModel {
                 )?;
             }
         }
-        let flat: Vec<u32> = tokens.iter().flatten().copied().collect();
         let ctx = ForwardContext {
             ssm_batch: None,
             buffers: &self.buffers,
@@ -242,7 +313,7 @@ impl TransformerModel {
             graph_capture: false,
             gdn_exact_replay: false,
             token_ids: None,
-            host_token_ids: Some(&flat),
+            host_token_ids: Some(tokens),
             routed_lora_layers: None,
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(),
@@ -259,13 +330,22 @@ impl TransformerModel {
             let attention =
                 self.config.layer_type(li) == atlas_core::config::LayerType::FullAttention;
             if serial_diagnostic(attention) {
-                self.glm_long_serial_layer(li, seqs, &metas, &stage, &mut kv_cache, &ctx, stream)?;
+                self.glm_long_serial_layer(
+                    li,
+                    rows,
+                    seqs,
+                    &metas,
+                    &stage,
+                    &mut kv_cache,
+                    &ctx,
+                    stream,
+                )?;
             } else {
                 let mut owners: Vec<GlmLongOwner<'_>> = seqs
                     .iter_mut()
                     .zip(&metas)
                     .map(|(seq, &meta)| GlmLongOwner {
-                        positions: [seq.seq_len, seq.seq_len + 1, seq.seq_len + 2],
+                        positions: (seq.seq_len..seq.seq_len + rows).collect(),
                         state: seq.layer_states[li].as_mut(),
                         meta,
                     })
@@ -284,7 +364,7 @@ impl TransformerModel {
         }
         if verify_profile {
             tracing::info!(
-                "GLM long owner verify profile owners={n}: kda={:.2}ms mla={:.2}ms",
+                "GLM long owner verify profile owners={n} rows={rows}: kda={:.2}ms mla={:.2}ms",
                 kda_us as f64 / 1000.0,
                 mla_us as f64 / 1000.0
             );
@@ -297,16 +377,16 @@ impl TransformerModel {
             hidden,
             &self.final_norm,
             normed,
-            rows as u32,
+            total as u32,
             h as u32,
             self.config.rms_norm_eps as f32,
             stream,
         )?;
         let argmax = self.buffers.scratch();
-        if !self.glm_split_head_argmax(normed, rows, argmax, stream)? {
-            self.lm_head_batched(normed, rows as u32, self.buffers.logits(), stream)?;
+        if !self.glm_split_head_argmax(normed, total, argmax, stream)? {
+            self.lm_head_batched(normed, total as u32, self.buffers.logits(), stream)?;
             let vocab = self.config.vocab_size;
-            for r in 0..rows {
+            for r in 0..total {
                 ops::argmax_bf16(
                     self.gpu.as_ref(),
                     self.argmax_kernel,
@@ -322,11 +402,11 @@ impl TransformerModel {
             &self.glm_long_final_spans(&stage),
             0,
             0,
-            rows,
+            total,
             true,
             stream,
         )?;
-        let mut buf = vec![0u8; rows * 4];
+        let mut buf = vec![0u8; total * 4];
         self.gpu.copy_d2h(argmax, &mut buf)?;
         let ids: Vec<u32> = buf
             .chunks_exact(4)
@@ -334,22 +414,23 @@ impl TransformerModel {
             .collect();
         if let Some(snapshot) = snapshot {
             drop(kv_cache);
-            return self.glm_long_oracle(tokens, seqs, &stage, snapshot, &ids);
+            return self.glm_long_oracle(rows, tokens, seqs, &stage, snapshot, &ids);
         }
-        for (seq, t) in seqs.iter_mut().zip(tokens) {
+        for (seq, t) in seqs.iter_mut().zip(tokens.chunks_exact(rows)) {
             seq.tokens.extend_from_slice(t);
-            seq.seq_len += ROWS;
+            seq.seq_len += rows;
         }
-        Ok(ids.chunks_exact(ROWS).map(|c| [c[0], c[1], c[2]]).collect())
+        Ok(ids)
     }
 
     /// Diagnostic (`ATLAS_GLM_LONG_BATCH_SERIAL`): run one layer through its
     /// ordinary single-owner verify, owner by owner, with each owner's hidden
-    /// and highway rows moved to arena rows [0, 3) and back.
+    /// and highway rows moved to arena rows [0, rows) and back.
     #[allow(clippy::too_many_arguments)]
     fn glm_long_serial_layer(
         &self,
         li: usize,
+        rows: usize,
         seqs: &mut [&mut SequenceState],
         metas: &[AttnMetadataDev],
         stage: &GlmLongStage,
@@ -362,29 +443,29 @@ impl TransformerModel {
             (b.hidden_states(), stage.hidden, stage.rows.hidden),
             (b.hc_streams(), stage.highway, stage.rows.highway),
         ];
-        let rows = seqs.len() * ROWS;
+        let total = seqs.len() * rows;
         let gpu = self.gpu.as_ref();
-        stage.copy(gpu, &spans, 0, 0, rows, true, stream)?;
+        stage.copy(gpu, &spans, 0, 0, total, true, stream)?;
         let layer = &self.layers[li];
         let attention = self.config.layer_type(li) == atlas_core::config::LayerType::FullAttention;
         for (o, seq) in seqs.iter_mut().enumerate() {
-            stage.copy(gpu, &spans, 0, o * ROWS, ROWS, false, stream)?;
+            stage.copy(gpu, &spans, 0, o * rows, rows, false, stream)?;
             let owner_ctx = ForwardContext {
                 attn_metadata: Some(metas[o]),
                 midchunk_capture: None,
                 ..*ctx
             };
             if attention {
-                let positions: Vec<usize> = (0..ROWS).map(|t| seq.seq_len + t).collect();
-                let tables = vec![seq.block_table.clone(); ROWS];
+                let positions: Vec<usize> = (seq.seq_len..seq.seq_len + rows).collect();
+                let tables = vec![seq.block_table.clone(); rows];
                 let mut states: [&mut (dyn crate::layer::LayerState + 'static); 1] =
                     [seq.layer_states[li].as_mut()];
                 layer.decode_multi_seq_rows(
                     b.hidden_states(),
                     b.residual(),
-                    ROWS,
+                    rows,
                     &mut states,
-                    &[0; ROWS],
+                    &vec![0; rows],
                     kv_cache,
                     &positions,
                     &tables,
@@ -396,7 +477,7 @@ impl TransformerModel {
                 layer.decode_batched(
                     b.hidden_states(),
                     b.residual(),
-                    ROWS,
+                    rows,
                     seq.layer_states[li].as_mut(),
                     kv_cache,
                     seq.seq_len,
@@ -407,9 +488,9 @@ impl TransformerModel {
                     stream,
                 )?;
             }
-            stage.copy(gpu, &spans, 0, o * ROWS, ROWS, true, stream)?;
+            stage.copy(gpu, &spans, 0, o * rows, rows, true, stream)?;
         }
-        stage.copy(gpu, &spans, 0, 0, rows, false, stream)
+        stage.copy(gpu, &spans, 0, 0, total, false, stream)
     }
 
     /// Oracle helper: copy every owner's KDA recurrent/conv state into a fresh
@@ -453,19 +534,20 @@ impl TransformerModel {
     /// serial top-2 margin per row.
     fn glm_long_oracle(
         &self,
-        tokens: &[[u32; ROWS]],
+        rows: usize,
+        tokens: &[u32],
         seqs: &mut [&mut SequenceState],
         stage: &GlmLongStage,
         snapshot: DevicePtr,
         batched_ids: &[u32],
-    ) -> Result<Vec<[u32; ROWS]>> {
+    ) -> Result<Vec<u32>> {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         static ROWS_SEEN: AtomicU64 = AtomicU64::new(0);
         static MISMATCH: AtomicU64 = AtomicU64::new(0);
         let vocab = self.config.vocab_size;
         let row_bytes = vocab * 2;
         let n = seqs.len();
-        let mut batched = vec![0u8; n * ROWS * row_bytes];
+        let mut batched = vec![0u8; n * rows * row_bytes];
         self.gpu.copy_d2h(self.buffers.logits(), &mut batched)?;
         self.glm_long_snapshot(seqs, false, Some(snapshot))?;
         self.gpu.synchronize(self.gpu.default_stream())?;
@@ -473,22 +555,27 @@ impl TransformerModel {
         let bf = |b: &[u8], i: usize| {
             f32::from_bits((u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as u32) << 16)
         };
-        let mut out = Vec::with_capacity(n);
-        for (o, seq) in seqs.iter_mut().enumerate() {
-            let ids = self.decode_verify_graphed_kgamma(&tokens[o], seq, 0)?;
-            let mut serial = vec![0u8; ROWS * row_bytes];
+        let mut out = Vec::with_capacity(n * rows);
+        for ((o, seq), t) in seqs.iter_mut().enumerate().zip(tokens.chunks_exact(rows)) {
+            let ids = self.decode_verify_graphed_kgamma(t, seq, 0)?;
+            ensure!(
+                ids.len() == rows,
+                "GLM long oracle serial verify returned {} ids",
+                ids.len()
+            );
+            let mut serial = vec![0u8; rows * row_bytes];
             self.gpu.copy_d2h(self.buffers.logits(), &mut serial)?;
             stage.copy(
                 self.gpu.as_ref(),
                 &self.glm_long_final_spans(stage),
                 0,
-                o * ROWS,
-                ROWS,
+                o * rows,
+                rows,
                 true,
                 self.gpu.default_stream(),
             )?;
-            for r in 0..ROWS {
-                let b = &batched[(o * ROWS + r) * row_bytes..][..row_bytes];
+            for r in 0..rows {
+                let b = &batched[(o * rows + r) * row_bytes..][..row_bytes];
                 let s = &serial[r * row_bytes..][..row_bytes];
                 let (mut diff, mut top, mut second) = (0f32, f32::MIN, f32::MIN);
                 for i in 0..vocab {
@@ -502,13 +589,13 @@ impl TransformerModel {
                     }
                 }
                 ROWS_SEEN.fetch_add(1, Relaxed);
-                let batched_id = batched_ids[o * ROWS + r];
+                let batched_id = batched_ids[o * rows + r];
                 if batched_id != ids[r] {
                     MISMATCH.fetch_add(1, Relaxed);
                     tracing::warn!(
                         "GLM long oracle MISMATCH owner={o} row={r} pos={} batched={batched_id} \
                          serial={} max_dlogit={diff:.4} serial_margin={:.4}",
-                        seq.seq_len - ROWS + r,
+                        seq.seq_len - rows + r,
                         ids[r],
                         top - second
                     );
@@ -519,10 +606,10 @@ impl TransformerModel {
                     );
                 }
             }
-            out.push([ids[0], ids[1], ids[2]]);
+            out.extend(ids);
         }
         let seen = ROWS_SEEN.load(Relaxed);
-        if seen % 600 < (n * ROWS) as u64 {
+        if seen % 600 < (n * rows) as u64 {
             tracing::info!(
                 "GLM long oracle summary: rows={seen} argmax_mismatch={}",
                 MISMATCH.load(Relaxed)
@@ -531,9 +618,13 @@ impl TransformerModel {
         Ok(out)
     }
 
-    /// Put owner `owner`'s final verify rows back at arena rows [0, 3).
-    pub(super) fn glm_long_restore_owner(&self, owner: usize) -> Result<()> {
-        ensure!(owner < MAX_OWNERS, "GLM long owner index {owner}");
+    /// Put owner `owner`'s final `rows` verify rows back at arena rows
+    /// [0, rows).
+    pub(super) fn glm_long_restore_owner(&self, owner: usize, rows: usize) -> Result<()> {
+        ensure!(
+            owner_supported(owner, rows),
+            "GLM long owner index {owner} x {rows} rows"
+        );
         let stage = self
             .glm_long_stage
             .context("GLM long owner stage missing")?;
@@ -541,44 +632,52 @@ impl TransformerModel {
             self.gpu.as_ref(),
             &self.glm_long_final_spans(&stage),
             0,
-            owner * ROWS,
-            ROWS,
+            owner * rows,
+            rows,
             false,
             self.gpu.default_stream(),
         )
     }
 
-    /// Head: announce and run the batched traversal.
+    /// Head: announce and run the batched traversal of `seqs.len()` owners
+    /// of `rows` rows each (`tokens` owner-major).
     pub(super) fn decode_verify_glm_long_owners_impl(
         &self,
-        tokens: &[[u32; ROWS]],
+        rows: usize,
+        tokens: &[u32],
         seqs: &mut [&mut SequenceState],
-    ) -> Result<Vec<[u32; ROWS]>> {
+    ) -> Result<Vec<u32>> {
         ensure!(
-            self.can_batch_glm_long_verify_impl(seqs.len()),
+            self.can_batch_glm_long_verify_impl(seqs.len(), rows)
+                && tokens.len() == seqs.len() * rows,
             "GLM long owner verify is not available"
         );
         let slots: Vec<u32> = seqs.iter().map(|s| s.slot_idx as u32).collect();
-        let flat: Vec<u32> = tokens.iter().flatten().copied().collect();
         self.ep_broadcast_seq_and_cmd(0, EP_CMD_GLM_LONG_VERIFY, true)?;
-        self.ep_broadcast_u32(slots.len() as u32)?;
+        self.ep_broadcast_u32(encode_width(slots.len(), rows))?;
         self.ep_broadcast_tokens(&slots)?;
-        self.ep_broadcast_tokens(&flat)?;
-        self.glm_long_owner_compute(tokens, seqs)
+        self.ep_broadcast_tokens(tokens)?;
+        self.glm_long_owner_compute(rows, tokens, seqs)
     }
 
-    /// Head: announce owner `owner`'s tail and restore its rows. The caller
-    /// then runs the ordinary verdict tail, beginning with its verdict word.
+    /// Head: announce owner `owner`'s tail and restore its `tokens.len()`
+    /// rows. The caller then runs the ordinary verdict tail, beginning with
+    /// its verdict word.
     pub(super) fn begin_glm_long_owner_tail_impl(
         &self,
         slot: u32,
         owner: usize,
-        tokens: &[u32; ROWS],
+        tokens: &[u32],
     ) -> Result<()> {
+        let rows = tokens.len();
+        ensure!(
+            owner_supported(owner, rows),
+            "GLM long owner tail {owner} x {rows} rows"
+        );
         self.ep_broadcast_seq_and_cmd(slot, EP_CMD_GLM_LONG_TAIL, true)?;
-        self.ep_broadcast_u32(owner as u32)?;
+        self.ep_broadcast_u32(encode_width(owner, rows))?;
         self.ep_broadcast_tokens(tokens)?;
-        self.glm_long_restore_owner(owner)
+        self.glm_long_restore_owner(owner, rows)
     }
 
     /// Worker side of E9.
@@ -586,13 +685,13 @@ impl TransformerModel {
         &self,
         slots: &mut [Option<SequenceState>],
     ) -> Result<bool> {
-        let n = self.ep_broadcast_u32(0)? as usize;
+        let (n, rows) = decode_width(self.ep_broadcast_u32(0)?);
         ensure!(
-            (1..=MAX_OWNERS).contains(&n) && n <= slots.len(),
-            "GLM long owner verify width {n}"
+            owner::width_supported(n, rows) && n <= slots.len(),
+            "GLM long owner verify width {n} x {rows} rows"
         );
         let ids = self.ep_broadcast_tokens(&vec![0u32; n])?;
-        let flat = self.ep_broadcast_tokens(&vec![0u32; n * ROWS])?;
+        let tokens = self.ep_broadcast_tokens(&vec![0u32; n * rows])?;
         let mut seen = [false; 64];
         for &id in &ids {
             let id = id as usize;
@@ -615,25 +714,28 @@ impl TransformerModel {
                 .with_context(|| format!("GLM long owner verify slot {id} unallocated"))?;
             seqs.push(refs.swap_remove(at).1);
         }
-        let tokens: Vec<[u32; ROWS]> = flat
-            .chunks_exact(ROWS)
-            .map(|c| [c[0], c[1], c[2]])
-            .collect();
         self.sync_secondary()?;
-        self.glm_long_owner_compute(&tokens, &mut seqs)?;
+        self.glm_long_owner_compute(rows, &tokens, &mut seqs)?;
         Ok(true)
     }
 
     /// Worker side of EA: restore this owner's rows, then the F5 verdict tail.
     pub(super) fn glm_long_receive_tail(&self, seq: &mut SequenceState) -> Result<()> {
-        let owner = self.ep_broadcast_u32(0)? as usize;
-        let tokens = self.ep_broadcast_tokens(&[0u32; ROWS])?;
-        self.glm_long_restore_owner(owner)?;
+        let (owner, rows) = decode_width(self.ep_broadcast_u32(0)?);
+        ensure!(
+            owner_supported(owner, rows),
+            "GLM long owner tail {owner} x {rows} rows"
+        );
+        let tokens = self.ep_broadcast_tokens(&vec![0u32; rows])?;
+        self.glm_long_restore_owner(owner, rows)?;
         let accepted = self.ep_broadcast_u32(0)? as usize;
-        ensure!(accepted < ROWS, "GLM long owner verdict {accepted} for K3");
+        ensure!(
+            accepted < rows,
+            "GLM long owner verdict {accepted} for {rows} rows"
+        );
         let base = seq
             .seq_len
-            .checked_sub(ROWS)
+            .checked_sub(rows)
             .context("GLM long owner verify base underflow")?;
         self.ep_worker_apply_verdict(seq, base, &tokens, accepted)
     }
@@ -657,3 +759,7 @@ fn oracle_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_LONG_BATCH_ORACLE").as_deref() == Ok("1"))
 }
+
+#[cfg(test)]
+#[path = "glm_long_verify_tests.rs"]
+mod tests;

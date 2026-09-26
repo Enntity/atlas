@@ -360,23 +360,23 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        use crate::layer::glm_long_owner as owner;
         // Every row-local stage (mHC, norms, projections, TP reduce) runs once
         // over all owners' rows; only the recurrence is per owner.
-        let rows = owners.len() * crate::layer::glm_long_owner::ROWS;
+        let rows = owner::owner_rows(owners)?;
+        let owners_n = owners.len();
         let phase = self.forward_attention_rows(
             ctx.buffers.hidden_states(),
-            rows,
+            owners_n * rows,
             false,
             true,
             ctx,
             stream,
             &mut |projected, g1, beta| {
-                self.forward_recurrent_owners(projected, g1, beta, owners, ctx, stream)
+                self.forward_recurrent_owners(projected, g1, beta, owners, rows, ctx, stream)
             },
         )?;
-        let owners_n = rows / crate::layer::glm_long_owner::ROWS;
-        let ffn_out =
-            crate::layer::glm_long_owner::ffn_per_owner(&self.ffn, owners_n, stage, ctx, stream)?;
+        let ffn_out = owner::ffn_per_owner(&self.ffn, owners_n, rows, stage, ctx, stream)?;
         self.forward_ffn_post(phase, ffn_out, None, ctx, stream)
     }
 

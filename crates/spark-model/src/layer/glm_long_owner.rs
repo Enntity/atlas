@@ -1,24 +1,45 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Owner-batched repaired long-context K3 verify: 2..=4 owners x 3 temporal
-//! rows in one target traversal instead of one traversal per owner.
+//! Owner-batched long-context verify: 1..=4 owners x `rows` temporal rows in
+//! one target traversal instead of one traversal per owner. `rows` is chosen
+//! per call and uniform across that call's owners: 3 on the repaired MTP K3
+//! lane, 2..=8 (a DFlash block) on the GLM DFlash lane.
 //!
-//! Rows are flat and owner-major: owner `o` holds rows `[3o, 3o + 3)`. Every
-//! per-owner state (KDA recurrence and its rollback snapshots, MLA cache
-//! writes and causal semantic index) advances only against that owner's own
-//! rows, in the same order as the single-owner verifier. Stateless work
-//! (projections, mHC, norms, the FFN and the LM head) runs once over all rows,
-//! so each weight is read once per step rather than once per owner.
+//! Rows are flat and owner-major: owner `o` holds rows `[rows*o, rows*o +
+//! rows)`. Every per-owner state (KDA recurrence and its rollback snapshots,
+//! MLA cache writes and causal semantic index) advances only against that
+//! owner's own rows, in the same order as the single-owner verifier.
+//! Stateless work (projections, mHC, norms, the FFN and the LM head) runs once
+//! over all rows, so each weight is read once per step rather than once per
+//! owner.
 
 use super::{AttnMetadataDev, LayerState};
 use anyhow::{Result, ensure};
+use spark_runtime::buffers::BufferSizes;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-/// Verify rows per owner: the served `--num-drafts=2` long-context lane.
-pub const ROWS: usize = 3;
-/// The repaired long-context lane admits exactly four owners.
+/// Verify rows per owner on the served `--num-drafts=2` repaired MTP lane.
+pub const K3_ROWS: usize = 3;
+/// Widest per-owner verify block: one GLM DFlash block (bonus + drafts).
+pub const MAX_OWNER_ROWS: usize = crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS;
+/// The long-context lane admits at most four owners.
 pub const MAX_OWNERS: usize = 4;
-pub const MAX_ROWS: usize = ROWS * MAX_OWNERS;
+pub const MAX_ROWS: usize = MAX_OWNER_ROWS * MAX_OWNERS;
+
+/// Whether one call may verify `owners` owners of `rows` rows each.
+pub fn width_supported(owners: usize, rows: usize) -> bool {
+    (1..=MAX_OWNERS).contains(&owners) && (2..=MAX_OWNER_ROWS).contains(&rows)
+}
+
+/// The uniform per-owner row count of one call, validated.
+pub fn owner_rows(owners: &[GlmLongOwner<'_>]) -> Result<usize> {
+    let rows = owners.first().map_or(0, |o| o.positions.len());
+    ensure!(
+        width_supported(owners.len(), rows) && owners.iter().all(|o| o.positions.len() == rows),
+        "GLM long owner batch needs 1..={MAX_OWNERS} owners of one 2..={MAX_OWNER_ROWS} row width"
+    );
+    Ok(rows)
+}
 
 /// `ATLAS_GLM_LONG_BATCH_VERIFY=1` opts in; anything but 0/1 is refused.
 pub fn enabled() -> Result<bool> {
@@ -33,9 +54,10 @@ pub fn enabled() -> Result<bool> {
 /// One owner's inputs for one layer.
 pub struct GlmLongOwner<'a> {
     pub state: &'a mut (dyn LayerState + 'static),
-    /// Absolute positions of this owner's three rows (consecutive).
-    pub positions: [usize; ROWS],
-    /// This owner's own three-row attention metadata.
+    /// Absolute positions of this owner's rows (consecutive); its length is
+    /// the call's uniform per-owner row count.
+    pub positions: Vec<usize>,
+    /// This owner's own attention metadata for exactly those rows.
     pub meta: AttnMetadataDev,
 }
 
@@ -62,15 +84,30 @@ impl RowBytes {
     fn total(&self) -> usize {
         MAX_ROWS * (3 * self.hidden + self.highway + self.post + self.comb + self.logits)
     }
+
+    /// Whether every arena span the stage copies touch holds `rows` rows.
+    pub fn arena_fits(&self, sizes: &BufferSizes, rows: usize) -> bool {
+        [
+            (sizes.hidden_states, self.hidden),
+            (sizes.norm_output, self.hidden),
+            (sizes.moe_output, self.hidden),
+            (sizes.hc_streams, self.highway),
+            (sizes.hc_post, self.post),
+            (sizes.hc_comb, self.comb),
+            (sizes.logits, self.logits),
+        ]
+        .into_iter()
+        .all(|(capacity, row)| rows.checked_mul(row).is_some_and(|b| b <= capacity))
+    }
 }
 
 /// Dedicated device staging, disjoint from the arena, for up to `MAX_ROWS`.
 ///
 /// During the traversal MLA layers verify each owner in place at arena rows
-/// `[0, 3)`; `highway`/`post`/`comb`/`norm` hold every owner's rows between
+/// `[0, rows)`; `highway`/`post`/`comb`/`norm` hold every owner's rows between
 /// that per-owner attention and the joint FFN. After the traversal the same
 /// storage (plus `hidden`/`logits`) holds each owner's final rows, which
-/// `restore` copies back to rows `[0, 3)` so the unchanged single-owner
+/// `restore` copies back to rows `[0, rows)` so the unchanged single-owner
 /// verdict, repair and propose tail sees exactly a single-owner verify.
 #[derive(Clone, Copy, Debug)]
 pub struct GlmLongStage {
@@ -81,7 +118,7 @@ pub struct GlmLongStage {
     pub post: DevicePtr,
     pub comb: DevicePtr,
     pub logits: DevicePtr,
-    /// Joint FFN output, one owner's three rows at a time.
+    /// Joint FFN output, one owner's rows at a time.
     pub ffn: DevicePtr,
 }
 
@@ -134,52 +171,88 @@ impl GlmLongStage {
     }
 }
 
-/// The FFN of every owner with exactly the single-owner K=3 verifier's
-/// arithmetic. Routed MoE runs once over all rows through the served C3
-/// grouped path; other FFNs run per owner from arena rows [0, 3). Returns the
-/// `[owners * 3, H]` output.
+/// The FFN of every owner's `rows` rows; returns the `[owners * rows, H]`
+/// output. Numerics per width:
+///
+/// - `rows == 3` (repaired MTP K3): exactly the single-owner K=3 verifier's
+///   arithmetic. Routed MoE runs once over all rows through the served C3
+///   grouped path; other FFNs run per owner from arena rows `[0, 3)`.
+/// - other widths, at most `MAX_DFLASH_VERIFY_ROWS` rows in total: the exact
+///   independent grouped FFN (`FfnComponent::forward_independent`) once over
+///   every row. Its arithmetic is row-independent, so each row matches the
+///   single-owner DFlash block verify of the MLA layers.
+/// - other widths, more rows in total: the plain grouped `forward_prefill`
+///   over every row. Row-local but NOT the single-owner verifier's arithmetic
+///   (like the `prefill` diagnostic); `owner` keeps it per owner.
 pub fn ffn_per_owner(
     ffn: &crate::layers::FfnComponent,
     owners: usize,
+    rows: usize,
     stage: &GlmLongStage,
     ctx: &super::ForwardContext,
     stream: u64,
 ) -> Result<DevicePtr> {
     let b = ctx.buffers;
-    let rows = owners * ROWS;
+    let total = owners * rows;
     match (ffn_mode(), ffn) {
-        (FfnMode::Grouped, crate::layers::FfnComponent::Moe(_)) => {
+        (FfnMode::Grouped, crate::layers::FfnComponent::Moe(_)) if rows == K3_ROWS => {
             // The served K3 MoE is the C3 grouped path; run it once over every
             // owner's rows with the same row-for-row arithmetic.
-            crate::layers::moe::with_owner_rows(rows as u32, || {
-                ffn.forward_prefill(b.norm_output(), rows, ctx, stream)
+            crate::layers::moe::with_owner_rows(total as u32, || {
+                ffn.forward_prefill(b.norm_output(), total, ctx, stream)
             })?;
             return Ok(b.moe_output());
         }
+        (FfnMode::Grouped, _) if rows != K3_ROWS => return rows_ffn(ffn, total, ctx, stream),
         (FfnMode::Prefill, _) => {
-            ffn.forward_prefill(b.norm_output(), rows, ctx, stream)?;
+            ffn.forward_prefill(b.norm_output(), total, ctx, stream)?;
             return Ok(b.moe_output());
         }
         _ => {}
     }
     let bytes = stage.rows.hidden;
     let input = [(b.norm_output(), stage.norm, bytes)];
-    let output = [(b.moe_output(), stage.ffn, bytes)];
-    stage.copy(ctx.gpu, &input, 0, 0, owners * ROWS, true, stream)?;
+    stage.copy(ctx.gpu, &input, 0, 0, total, true, stream)?;
     for owner in 0..owners {
-        stage.copy(ctx.gpu, &input, 0, owner * ROWS, ROWS, false, stream)?;
-        ffn.forward_k3(b.norm_output(), ctx, stream)?;
-        stage.copy(ctx.gpu, &output, 0, owner * ROWS, ROWS, true, stream)?;
+        stage.copy(ctx.gpu, &input, 0, owner * rows, rows, false, stream)?;
+        let out = if rows == K3_ROWS {
+            ffn.forward_k3(b.norm_output(), ctx, stream)?;
+            b.moe_output()
+        } else {
+            rows_ffn(ffn, rows, ctx, stream)?
+        };
+        let output = [(out, stage.ffn, bytes)];
+        stage.copy(ctx.gpu, &output, 0, owner * rows, rows, true, stream)?;
     }
     Ok(stage.ffn)
 }
 
+/// FFN of `rows` rows at `norm_output` for a non-K3 width (see
+/// [`ffn_per_owner`]): exact independent grouped when selected, else prefill.
+fn rows_ffn(
+    ffn: &crate::layers::FfnComponent,
+    rows: usize,
+    ctx: &super::ForwardContext,
+    stream: u64,
+) -> Result<DevicePtr> {
+    let b = ctx.buffers;
+    // Selected only for 2..=MAX_DFLASH_VERIFY_ROWS rows on the DFlash lane.
+    if crate::model::glm_independent::ffn_rows_selected(ctx, rows)? {
+        // `forward_independent` requires its input at `norm_output`.
+        return ffn.forward_independent(b.norm_output(), rows, ctx, stream);
+    }
+    ffn.forward_prefill(b.norm_output(), rows, ctx, stream)?;
+    Ok(b.moe_output())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FfnMode {
-    /// Default: routed MoE jointly through the exact C3 grouped arithmetic;
-    /// dense FFN layers per owner.
+    /// Default: at K3 routed MoE jointly through the exact C3 grouped
+    /// arithmetic and dense FFN layers per owner; other widths jointly (see
+    /// [`ffn_per_owner`]).
     Grouped,
-    /// Every FFN per owner through `forward_k3` (diagnostic).
+    /// Every FFN per owner through the single-owner FFN of its width
+    /// (`forward_k3` at K3) (diagnostic).
     Owner,
     /// Generic prefill FFN over all rows. Measurably NOT the verifier's
     /// arithmetic (diagnostic only).
@@ -197,3 +270,7 @@ fn ffn_mode() -> FfnMode {
         },
     )
 }
+
+#[cfg(test)]
+#[path = "glm_long_owner_tests.rs"]
+mod tests;

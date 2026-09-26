@@ -501,17 +501,18 @@ impl Model for TransformerModel {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream)
     }
-    fn can_batch_glm_long_verify(&self, owners: usize) -> bool {
-        self.can_batch_glm_long_verify_impl(owners)
+    fn can_batch_glm_long_verify_rows(&self, owners: usize, rows: usize) -> bool {
+        self.can_batch_glm_long_verify_impl(owners, rows)
     }
-    fn decode_verify_glm_long_owners(
+    fn decode_verify_glm_long_owner_rows(
         &self,
-        tokens: &[[u32; 3]],
+        rows: usize,
+        tokens: &[u32],
         seqs: &mut [&mut SequenceState],
-    ) -> Result<Vec<[u32; 3]>> {
-        self.decode_verify_glm_long_owners_impl(tokens, seqs)
+    ) -> Result<Vec<u32>> {
+        self.decode_verify_glm_long_owners_impl(rows, tokens, seqs)
     }
-    fn begin_glm_long_owner_tail(&self, slot: u32, owner: usize, tokens: &[u32; 3]) -> Result<()> {
+    fn begin_glm_long_owner_tail(&self, slot: u32, owner: usize, tokens: &[u32]) -> Result<()> {
         self.begin_glm_long_owner_tail_impl(slot, owner, tokens)
     }
     fn can_batch_verify(&self, ks: &[usize]) -> bool {

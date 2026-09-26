@@ -693,32 +693,51 @@ pub trait Model: Send + Sync {
 
     /// Whether [`Self::decode_verify_glm_long_owners`] can verify `owners`
     /// repaired long-context K3 sequences in one target traversal.
-    fn can_batch_glm_long_verify(&self, _owners: usize) -> bool {
+    fn can_batch_glm_long_verify(&self, owners: usize) -> bool {
+        self.can_batch_glm_long_verify_rows(owners, crate::layer::glm_long_owner::K3_ROWS)
+    }
+
+    /// Whether [`Self::decode_verify_glm_long_owner_rows`] can verify `owners`
+    /// long-context sequences of `rows` rows each in one target traversal:
+    /// K3 on the repaired MTP lane, a 2..=8 row block on the GLM DFlash lane.
+    fn can_batch_glm_long_verify_rows(&self, _owners: usize, _rows: usize) -> bool {
         false
     }
 
     /// Owner-batched repaired long-context K3 verify: every owner's
-    /// `[last, d0, d1]` in one traversal (EP-coherent). On success each
-    /// sequence advanced by three rows, like the per-sequence verify, and the
-    /// per-owner argmax triples are returned in owner order. Before each
-    /// owner's verdict tail the caller must call
-    /// [`Self::begin_glm_long_owner_tail`] for that owner.
+    /// `[last, d0, d1]` in one traversal (EP-coherent). The K3 form of
+    /// [`Self::decode_verify_glm_long_owner_rows`]; returns the per-owner
+    /// argmax triples in owner order.
     fn decode_verify_glm_long_owners(
         &self,
-        _tokens: &[[u32; 3]],
-        _seqs: &mut [&mut SequenceState],
+        tokens: &[[u32; 3]],
+        seqs: &mut [&mut SequenceState],
     ) -> Result<Vec<[u32; 3]>> {
-        bail!("decode_verify_glm_long_owners: unsupported by this model")
+        let flat: Vec<u32> = tokens.iter().flatten().copied().collect();
+        let ids = self.decode_verify_glm_long_owner_rows(3, &flat, seqs)?;
+        Ok(ids.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
     }
 
-    /// Restore owner `owner`'s verify rows on every rank so its ordinary
-    /// single-owner verdict/commit/propose tail can run unchanged.
-    fn begin_glm_long_owner_tail(
+    /// Owner-batched long-context verify of `seqs.len()` owners of `rows`
+    /// rows each in one traversal (EP-coherent). `tokens` is owner-major,
+    /// `rows` per owner. On success each sequence advanced by `rows` rows,
+    /// like the per-sequence verify, and the owner-major argmax IDs are
+    /// returned. Before each owner's verdict tail the caller must call
+    /// [`Self::begin_glm_long_owner_tail`] for that owner with its `rows`
+    /// tokens.
+    fn decode_verify_glm_long_owner_rows(
         &self,
-        _slot: u32,
-        _owner: usize,
-        _tokens: &[u32; 3],
-    ) -> Result<()> {
+        _rows: usize,
+        _tokens: &[u32],
+        _seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<u32>> {
+        bail!("decode_verify_glm_long_owner_rows: unsupported by this model")
+    }
+
+    /// Restore owner `owner`'s `tokens.len()` verify rows on every rank so
+    /// its ordinary single-owner verdict/commit/propose tail can run
+    /// unchanged.
+    fn begin_glm_long_owner_tail(&self, _slot: u32, _owner: usize, _tokens: &[u32]) -> Result<()> {
         bail!("begin_glm_long_owner_tail: unsupported by this model")
     }
 
