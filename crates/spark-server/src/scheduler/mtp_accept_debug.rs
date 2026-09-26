@@ -190,6 +190,9 @@ pub struct RequestAccept {
     mtp_steps: u64,
     d1: u64,
     na: u64,
+    /// Verifies that accepted at least `i + 1` drafts (the per-position
+    /// survival curve that sizes the draft cap).
+    survive: [u64; SURVIVAL_POSITIONS],
     pub regime_reprobes: u64,
     // Per-request K=3/K=5 controller.  Zero is deliberately the deep state so
     // `Default` starts every request with an informative K=5 probe.
@@ -202,6 +205,7 @@ pub struct RequestAccept {
     depth_switches: u16,
 }
 
+const SURVIVAL_POSITIONS: usize = 7;
 const DEPTH_DEEP: u8 = 0;
 const DEPTH_SHALLOW: u8 = 1;
 const DEPTH_WINDOW: u16 = 12;
@@ -220,6 +224,9 @@ impl RequestAccept {
         self.na = self.na.saturating_add(accepted);
         if accepted > 0 {
             self.d1 = self.d1.saturating_add(1);
+        }
+        for s in self.survive.iter_mut().take(accepted as usize) {
+            *s = s.saturating_add(1);
         }
     }
 
@@ -364,8 +371,14 @@ impl RequestAccept {
     }
 
     pub fn done_suffix(&self) -> String {
+        let steps = self.mtp_steps.max(1) as f64;
+        let survival: Vec<String> = self
+            .survive
+            .iter()
+            .map(|&s| format!("{:.2}", s as f64 / steps))
+            .collect();
         format!(
-            "serial={:.2} mtp={:.2} p1={:.3} mean_na={:.3} tok_step={:.3} regime_reprobes={} depth={} depth_switches={}",
+            "serial={:.2} mtp={:.2} p1={:.3} mean_na={:.3} tok_step={:.3} regime_reprobes={} depth={} depth_switches={} surv={}",
             self.serial_frac(),
             self.mtp_frac(),
             self.p1(),
@@ -381,6 +394,7 @@ impl RequestAccept {
                 _ => "k5",
             },
             self.depth_switches,
+            survival.join(","),
         )
     }
 

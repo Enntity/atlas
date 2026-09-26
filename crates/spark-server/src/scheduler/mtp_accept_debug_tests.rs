@@ -48,8 +48,17 @@ fn empty_suffix_is_zeros() {
     let a = RequestAccept::default();
     assert_eq!(
         a.done_suffix(),
-        "serial=0.00 mtp=0.00 p1=0.000 mean_na=0.000 tok_step=1.000 regime_reprobes=0 depth=k5 depth_switches=0"
+        "serial=0.00 mtp=0.00 p1=0.000 mean_na=0.000 tok_step=1.000 regime_reprobes=0 depth=k5 depth_switches=0 surv=0.00,0.00,0.00,0.00,0.00,0.00,0.00"
     );
+}
+
+#[test]
+fn survival_curve_counts_steps_accepting_at_least_each_position() {
+    let mut a = RequestAccept::default();
+    for emitted in [1, 2, 4, 8, 8] {
+        a.record_verify_emitted(emitted); // accepted 0, 1, 3, 7, 7
+    }
+    assert!(a.done_suffix().ends_with("surv=0.80,0.60,0.60,0.40,0.40,0.40,0.40"));
 }
 
 #[test]
