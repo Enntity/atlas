@@ -22,6 +22,7 @@ mod paged_attn_batched;
 mod paged_attn_fp8k;
 mod paged_attn_turbok;
 mod paged_glm;
+pub(in crate::layers::qwen3_attention) use paged_glm::GlmChunkOwner;
 mod paged_mla;
 mod paged_oproj;
 mod paged_qkv;

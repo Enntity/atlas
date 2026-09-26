@@ -148,56 +148,30 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
-        // Joint attention inputs and mHC coefficients survive the per-owner
-        // attention in the stage; attention outputs collect in `stage.hidden`.
-        let joint = [
-            (normed, stage.norm, r.hidden),
+        // The mHC coefficients survive the attention in the stage.
+        let coeffs = [
             (b.hc_post(), stage.post, r.post),
             (b.hc_comb(), stage.comb, r.comb),
         ];
-        stage.copy(ctx.gpu, &joint, 0, 0, total, true, stream)?;
-        let mut attn_out = DevicePtr::NULL;
-        for (owner, input) in owners.iter().enumerate() {
-            let first = owner * rows;
-            stage.copy(ctx.gpu, &joint[..1], 0, first, rows, false, stream)?;
-            let owner_ctx = ForwardContext {
-                attn_metadata: Some(AttnMetadataDev {
+        stage.copy(ctx.gpu, &coeffs, 0, 0, total, true, stream)?;
+        let chunk_owners: Vec<crate::layers::qwen3_attention::prefill::GlmChunkOwner> = owners
+            .iter()
+            .enumerate()
+            .map(|(owner, input)| crate::layers::qwen3_attention::prefill::GlmChunkOwner {
+                row0: owner * rows,
+                rows,
+                seq_len_start: input.positions[0],
+                meta: AttnMetadataDev {
                     num_seqs: 1,
                     // Chunk-total length: the last row's causal extent.
                     seq_len: input.meta.seq_len.offset((rows - 1) * 4),
                     ..input.meta
-                }),
-                midchunk_capture: None,
-                ..*ctx
-            };
-            attn_out = self.prefill_attention_glm_chunk(
-                normed,
-                rows,
-                input.positions[0],
-                kv_cache,
-                &owner_ctx,
-                stream,
-            )?;
-            stage.copy(
-                ctx.gpu,
-                &[(attn_out, stage.hidden, r.hidden)],
-                0,
-                first,
-                rows,
-                true,
-                stream,
-            )?;
-        }
-        stage.copy(
-            ctx.gpu,
-            &[(attn_out, stage.hidden, r.hidden)],
-            0,
-            0,
-            total,
-            false,
-            stream,
-        )?;
-        stage.copy(ctx.gpu, &joint[1..], 0, 0, total, false, stream)?;
+                },
+            })
+            .collect();
+        let attn_out =
+            self.prefill_attention_glm_owners(&chunk_owners, normed, total, kv_cache, ctx, stream)?;
+        stage.copy(ctx.gpu, &coeffs, 0, 0, total, false, stream)?;
         if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {

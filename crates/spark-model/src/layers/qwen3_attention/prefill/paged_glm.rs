@@ -24,6 +24,17 @@ fn dense_selection_is_exact(sequence_end: usize, index_topk: usize) -> bool {
     index_topk > 0 && sequence_end <= index_topk
 }
 
+/// One owner of a (possibly multi-sequence) GLM chunk attention: `rows`
+/// rows at `row0` of the joint inputs, continuing its sequence at
+/// `seq_len_start` with its own single-sequence metadata.
+#[derive(Clone, Copy)]
+pub(in crate::layers::qwen3_attention) struct GlmChunkOwner {
+    pub row0: usize,
+    pub rows: usize,
+    pub seq_len_start: usize,
+    pub meta: crate::layer::AttnMetadataDev,
+}
+
 impl Qwen3AttentionLayer {
     /// Chunked zero-RoPE MLA using the 512-wide absorbed cache.
     pub(super) fn prefill_attention_paged_glm_dense(
@@ -32,6 +43,32 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         args: &MlaPrefillArgs,
         seq_len_start: usize,
+    ) -> Result<DevicePtr> {
+        let meta = ctx
+            .attn_metadata
+            .expect("GLM paged prefill requires metadata");
+        let owner = GlmChunkOwner {
+            row0: 0,
+            rows: args.num_tokens,
+            seq_len_start,
+            meta,
+        };
+        self.glm_chunk_attention(&[owner], kv_cache, ctx, args)
+    }
+
+    /// GLM MLA over the causal chunks of one or more sequences whose rows are
+    /// stacked in `args.normed` (`ctx.attn_metadata` covers every row).
+    /// Row-wise projections (q_a, kv_a, W_uv, o) and the KV cache write run
+    /// once over all rows; the semantic index, q_b + W_uk absorb and sparse
+    /// attention run per owner in the pinned native-sparse operand buffers.
+    /// With several owners each owner's attention rows are parked in the
+    /// (idle until the LM head) logits arena until the joint W_uv.
+    pub(super) fn glm_chunk_attention(
+        &self,
+        owners: &[GlmChunkOwner],
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        args: &MlaPrefillArgs,
     ) -> Result<DevicePtr> {
         let MlaPrefillArgs {
             normed,
@@ -61,12 +98,13 @@ impl Qwen3AttentionLayer {
             "GLM chunked prefill currently requires BF16 KV cache; got {:?}",
             self.kv_dtype
         );
-        let sequence_end = seq_len_start
-            .checked_add(num_tokens)
-            .ok_or_else(|| anyhow::anyhow!("GLM prefill sequence length overflow"))?;
-        let use_dense = dense_selection_is_exact(sequence_end, ctx.config.index_topk);
+        ensure!(
+            !owners.is_empty()
+                && owners.iter().map(|o| o.rows).sum::<usize>() == num_tokens
+                && owners.windows(2).all(|w| w[0].row0 + w[0].rows == w[1].row0),
+            "GLM chunk owners must tile the stacked rows"
+        );
         let accelerated = projection::enabled(&ctx.config.model_type)?;
-
         let q_lora = mla.q_lora_rank as u32;
         let kv_lora = mla.kv_lora_rank as u32;
         let nope = mla.nope as u32;
@@ -76,103 +114,13 @@ impl Qwen3AttentionLayer {
             "unsupported GLM MLA geometry: kv_lora={kv_lora}, nope={nope}, v={v_dim}, hd={hd}"
         );
 
-        // Q down/up projections. q_full is [N, nq, nope].
+        // Joint: q_a (+ norm), kv_a (+ norm) and the cache write.
         let q_latent = ctx.buffers.ssm_ba();
-        self.paged_glm_projection(
-            normed,
-            &mla.wq_a,
-            q_latent,
-            n,
-            q_lora,
-            h,
-            ctx,
-            stream,
-            accelerated,
-        )?;
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            q_latent,
-            &mla.q_a_norm,
-            q_latent,
-            n,
-            q_lora,
-            eps,
-            stream,
-        )?;
-        self.glm_index_prefill_cache_update(normed, n, kv_cache, ctx, stream)?;
-        let sparse_indices = if use_dense {
-            None
-        } else {
-            Some(self.glm_index_prefill_select(
-                q_latent,
-                normed,
-                n,
-                seq_len_start,
-                kv_cache,
-                ctx,
-                stream,
-            )?)
-        };
-        let q_full = ctx.buffers.qkv_output();
-        self.paged_glm_projection(
-            q_latent,
-            &mla.wq_b,
-            q_full,
-            n,
-            nq * hd,
-            q_lora,
-            ctx,
-            stream,
-            accelerated,
-        )?;
-
-        // Absorb W_UK into Q. This is the same representation used by Atlas's
-        // established GLM decode path: [N, nq, kv_lora].
-        let q_absorbed = ctx.buffers.ssm_deinterleaved();
-        ops::glm_paged_grouped_gemm_mla(
-            ctx.gpu,
-            self.grouped_gemm_mla_k,
-            &ctx.config.model_type,
-            q_full,
-            mla.w_uk_t.weight,
-            q_absorbed,
-            n,
-            nq,
-            nope,
-            kv_lora,
-            nq * hd,
-            nq * kv_lora,
-            stream,
-        )?;
-
-        // Project the shared KV latent. With zero RoPE both physical cache
-        // sides contain this identical vector; retaining the conventional two
-        // pools keeps this correctness milestone compatible with the existing
-        // paged-attention kernels.
+        self.paged_glm_projection(normed, &mla.wq_a, q_latent, n, q_lora, h, ctx, stream, accelerated)?;
+        ops::rms_norm(ctx.gpu, self.rms_norm_w_k, q_latent, &mla.q_a_norm, q_latent, n, q_lora, eps, stream)?;
         let kv_latent = ctx.buffers.expert_gate_out();
-        self.paged_glm_projection(
-            normed,
-            &mla.wkv_a,
-            kv_latent,
-            n,
-            kv_lora,
-            h,
-            ctx,
-            stream,
-            accelerated,
-        )?;
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            kv_latent,
-            &mla.kv_a_norm,
-            kv_latent,
-            n,
-            kv_lora,
-            eps,
-            stream,
-        )?;
+        self.paged_glm_projection(normed, &mla.wkv_a, kv_latent, n, kv_lora, h, ctx, stream, accelerated)?;
+        ops::rms_norm(ctx.gpu, self.rms_norm_w_k, kv_latent, &mla.kv_a_norm, kv_latent, n, kv_lora, eps, stream)?;
         let k_entries = ctx.buffers.ssm_qkvz();
         let v_entries = k_entries.offset(num_tokens * kv_lora as usize * bf16);
         ops::mla_cache_assemble_batched(
@@ -188,7 +136,7 @@ impl Qwen3AttentionLayer {
             kv_lora,
             stream,
         )?;
-        let meta = ctx
+        let joint = ctx
             .attn_metadata
             .expect("GLM paged prefill requires metadata");
         self.write_kv_cache(
@@ -196,7 +144,7 @@ impl Qwen3AttentionLayer {
             k_entries,
             v_entries,
             kv_cache,
-            meta.slot,
+            joint.slot,
             n,
             1,
             kv_lora,
@@ -207,105 +155,176 @@ impl Qwen3AttentionLayer {
             ctx.graph_capture,
         )?;
 
+        // Per owner: semantic index, q_b + absorb, attention.
         let attn_latent = ctx.buffers.attn_output();
-        if let Some((indices, index_width)) = sparse_indices {
-            let mut profile = super::glm_index::profile_start(ctx, stream)?;
-            let sparse_args = ops::GlmSparsePrefillTc {
-                config: ctx.config,
-                dtype: self.kv_dtype,
-                // mla_cache_assemble_batched above writes the same normalized
-                // NoPE latent to both conventional paged cache sides.
-                identical_kv_latent: true,
-                query: q_absorbed,
-                k_cache: kv_cache.k_pool_ptr(self.attn_layer_idx),
-                v_cache: kv_cache.v_pool_ptr(self.attn_layer_idx),
-                indices,
-                output: attn_latent,
-                block_table: meta.block_table,
-                rows: n,
-                heads: nq,
-                head_dim: kv_lora,
-                index_width,
-                block_size: bs,
-                scale: self.effective_attn_scale(hd),
+        let latent_row = nq as usize * kv_lora as usize * bf16;
+        let parked = if owners.len() > 1 {
+            let bytes = num_tokens * latent_row;
+            ensure!(
+                ctx.buffers.sizes().logits >= bytes,
+                "GLM multi-owner attention park exceeds the logits arena"
+            );
+            Some(ctx.buffers.logits())
+        } else {
+            None
+        };
+        for o in owners {
+            let on = o.rows as u32;
+            let octx = ForwardContext {
+                attn_metadata: Some(o.meta),
+                midchunk_capture: None,
+                ..*ctx
             };
-            let accelerated = ops::try_glm_sparse_native(
-                ctx,
-                &sparse_args,
-                seq_len_start,
-                kv_cache.num_blocks(),
-                meta.max_blocks_per_seq as usize,
-                kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
-                // This caller is ordinary continued prefill. Repaired K3
-                // verification has a separate multi-sequence attention path.
-                false,
+            let sequence_end = o
+                .seq_len_start
+                .checked_add(o.rows)
+                .ok_or_else(|| anyhow::anyhow!("GLM prefill sequence length overflow"))?;
+            let use_dense = dense_selection_is_exact(sequence_end, ctx.config.index_topk);
+            let o_normed = normed.offset(o.row0 * h as usize * bf16);
+            let o_latent = q_latent.offset(o.row0 * q_lora as usize * bf16);
+            self.glm_index_prefill_cache_update(o_normed, on, kv_cache, &octx, stream)?;
+            let sparse_indices = if use_dense {
+                None
+            } else {
+                Some(self.glm_index_prefill_select(
+                    o_latent,
+                    o_normed,
+                    on,
+                    o.seq_len_start,
+                    kv_cache,
+                    &octx,
+                    stream,
+                )?)
+            };
+            let q_full = ctx.buffers.qkv_output();
+            self.paged_glm_projection(
+                o_latent, &mla.wq_b, q_full, on, nq * hd, q_lora, &octx, stream, accelerated,
+            )?;
+            let q_absorbed = ctx.buffers.ssm_deinterleaved();
+            ops::glm_paged_grouped_gemm_mla(
+                ctx.gpu,
+                self.grouped_gemm_mla_k,
+                &ctx.config.model_type,
+                q_full,
+                mla.w_uk_t.weight,
+                q_absorbed,
+                on,
+                nq,
+                nope,
+                kv_lora,
+                nq * hd,
+                nq * kv_lora,
                 stream,
-            )? || ops::try_glm_sparse_prefill_tc(ctx.gpu, &sparse_args, stream)?;
-            if !accelerated {
-                ops::glm_sparse_mla_prefill(
+            )?;
+            if let Some((indices, index_width)) = sparse_indices {
+                let mut profile = super::glm_index::profile_start(&octx, stream)?;
+                let sparse_args = ops::GlmSparsePrefillTc {
+                    config: ctx.config,
+                    dtype: self.kv_dtype,
+                    // mla_cache_assemble_batched above writes the same normalized
+                    // NoPE latent to both conventional paged cache sides.
+                    identical_kv_latent: true,
+                    query: q_absorbed,
+                    k_cache: kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    v_cache: kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    indices,
+                    output: attn_latent,
+                    block_table: o.meta.block_table,
+                    rows: on,
+                    heads: nq,
+                    head_dim: kv_lora,
+                    index_width,
+                    block_size: bs,
+                    scale: self.effective_attn_scale(hd),
+                };
+                let accelerated = ops::try_glm_sparse_native(
+                    &octx,
+                    &sparse_args,
+                    o.seq_len_start,
+                    kv_cache.num_blocks(),
+                    o.meta.max_blocks_per_seq as usize,
+                    kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
+                    // This caller is ordinary continued prefill. Repaired K3
+                    // verification has a separate multi-sequence attention path.
+                    false,
+                    stream,
+                )? || ops::try_glm_sparse_prefill_tc(ctx.gpu, &sparse_args, stream)?;
+                if !accelerated {
+                    ops::glm_sparse_mla_prefill(
+                        ctx.gpu,
+                        self.glm_sparse_attn_k,
+                        q_absorbed,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        indices,
+                        attn_latent,
+                        o.meta.block_table,
+                        on,
+                        nq,
+                        kv_lora,
+                        index_width,
+                        bs,
+                        self.glm_sparse_attn_heads_per_cta,
+                        self.effective_attn_scale(hd),
+                        stream,
+                    )?;
+                }
+                let sparse_attention_us = super::glm_index::profile_lap(&octx, stream, &mut profile)?;
+                if profile.is_some() {
+                    tracing::info!(
+                        "ATLAS_GLM_INDEX_PROFILE phase=attention layer={} rows={} seq_end={} selected={} sparse_attention_us={}",
+                        self.attn_layer_idx,
+                        on,
+                        sequence_end,
+                        index_width,
+                        sparse_attention_us,
+                    );
+                }
+            } else {
+                ensure!(
+                    self.prefill_attn_paged_512_k.0 != 0,
+                    "GLM paged prefill kernel inferspark_prefill_paged_512 is unavailable"
+                );
+                ops::prefill_attention_paged_512(
                     ctx.gpu,
-                    self.glm_sparse_attn_k,
+                    self.prefill_attn_paged_512_k,
                     q_absorbed,
                     kv_cache.k_pool_ptr(self.attn_layer_idx),
                     kv_cache.v_pool_ptr(self.attn_layer_idx),
-                    indices,
                     attn_latent,
-                    meta.block_table,
-                    n,
+                    o.meta.block_table,
+                    on,
+                    sequence_end as u32,
+                    o.seq_len_start as u32,
                     nq,
+                    1,
                     kv_lora,
-                    index_width,
                     bs,
-                    self.glm_sparse_attn_heads_per_cta,
+                    0,
                     self.effective_attn_scale(hd),
                     stream,
                 )?;
             }
-            let sparse_attention_us = super::glm_index::profile_lap(ctx, stream, &mut profile)?;
-            if profile.is_some() {
-                tracing::info!(
-                    "ATLAS_GLM_INDEX_PROFILE phase=attention layer={} rows={} seq_end={} selected={} sparse_attention_us={}",
-                    self.attn_layer_idx,
-                    n,
-                    sequence_end,
-                    index_width,
-                    sparse_attention_us,
-                );
+
+            // Convert the latent attention result back to each head's value
+            // width, then apply the row-parallel output projection.
+            if let Some(park) = parked {
+                ctx.gpu.copy_d2d_async(
+                    attn_latent,
+                    park.offset(o.row0 * latent_row),
+                    o.rows * latent_row,
+                    stream,
+                )?;
             }
-        } else {
-            ensure!(
-                self.prefill_attn_paged_512_k.0 != 0,
-                "GLM paged prefill kernel inferspark_prefill_paged_512 is unavailable"
-            );
-            ops::prefill_attention_paged_512(
-                ctx.gpu,
-                self.prefill_attn_paged_512_k,
-                q_absorbed,
-                kv_cache.k_pool_ptr(self.attn_layer_idx),
-                kv_cache.v_pool_ptr(self.attn_layer_idx),
-                attn_latent,
-                meta.block_table,
-                n,
-                sequence_end as u32,
-                seq_len_start as u32,
-                nq,
-                1,
-                kv_lora,
-                bs,
-                0,
-                self.effective_attn_scale(hd),
-                stream,
-            )?;
         }
 
-        // Convert the latent attention result back to each head's value
-        // width, then apply the row-parallel output projection.
+        // Joint: W_uv and o_proj.
         let v_extracted = ctx.buffers.qkv_output();
         ops::glm_paged_grouped_gemm_mla(
             ctx.gpu,
             self.grouped_gemm_mla_k,
             &ctx.config.model_type,
-            attn_latent,
+            parked.unwrap_or(attn_latent),
             mla.w_uv.weight,
             v_extracted,
             n,

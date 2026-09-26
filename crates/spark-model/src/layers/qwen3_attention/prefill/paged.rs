@@ -43,14 +43,14 @@ impl Qwen3AttentionLayer {
         }
     }
 
-    /// GLM MLA attention of one owner's `num_tokens` verify rows continuing
-    /// at `seq_len_start` (a causal prefill chunk; `ctx.attn_metadata` is the
-    /// owner's single-sequence metadata). Returns the pre-all-reduce output.
-    pub(in crate::layers::qwen3_attention) fn prefill_attention_glm_chunk(
+    /// GLM MLA attention of stacked causal chunks of several sequences
+    /// (`owners` tile the `rows` rows at `normed`; `ctx.attn_metadata` covers
+    /// every row). Returns the pre-all-reduce output for all rows.
+    pub(in crate::layers::qwen3_attention) fn prefill_attention_glm_owners(
         &self,
+        owners: &[super::paged_glm::GlmChunkOwner],
         normed: DevicePtr,
-        num_tokens: usize,
-        seq_len_start: usize,
+        rows: usize,
         kv_cache: &mut PagedKvCache,
         ctx: &ForwardContext,
         stream: u64,
@@ -60,9 +60,10 @@ impl Qwen3AttentionLayer {
             "GLM chunk attention requires a GLM MLA layer"
         );
         let bs = kv_cache.block_size();
-        let args = self.mla_prefill_args(normed, num_tokens, seq_len_start, bs, ctx, stream);
-        self.prefill_attention_paged_glm_dense(kv_cache, ctx, &args, seq_len_start)
+        let args = self.mla_prefill_args(normed, rows, 0, bs, ctx, stream);
+        self.glm_chunk_attention(owners, kv_cache, ctx, &args)
     }
+
 
     pub(in crate::layers::qwen3_attention) fn prefill_attention_paged(
         &self,
