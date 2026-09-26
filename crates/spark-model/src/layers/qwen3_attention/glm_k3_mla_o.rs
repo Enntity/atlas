@@ -76,7 +76,7 @@ pub(crate) fn initialize(
             && config.ep_world_size == 2
             && dtype == KvCacheDtype::Bf16
             && super::glm_long_context::enabled(&config.model_type)
-            && crate::speculative::glm_repair_policy::enabled(),
+            && crate::speculative::glm_repair_policy::long_lane_enabled(),
         "{FLAG} requires repaired long-context GLM TP2/EP2 BF16 MLA"
     );
     validate_weight(ptr, n, k)?;

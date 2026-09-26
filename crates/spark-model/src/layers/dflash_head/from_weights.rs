@@ -181,9 +181,9 @@ impl BlockDiffusionDraftHead {
             prefill_attn_dflash_bf16: gpu
                 .kernel("prefill_paged_sink", "inferspark_prefill_paged_sink")?,
             // Phase 5 (CUDA graph): indirect-args BF16 paged dispatcher + sinks.
-            prefill_attn_dflash_bf16_indirect: gpu.kernel(
-                "prefill_paged_indirect_sink",
-                "inferspark_prefill_paged_indirect_sink",
+            prefill_attn_dflash_bf16_indirect: dflash_paged_attention_kernel(
+                gpu,
+                weights.config.head_dim,
             )?,
             prefill_attn_dflash_bf16_batched_sink: gpu.kernel(
                 "inferspark_prefill_paged_batched_sink",
@@ -946,4 +946,18 @@ fn fp8_drafter_kernel(gpu: &dyn GpuBackend, func: &str) -> KernelHandle {
     } else {
         KernelHandle(0)
     }
+}
+
+/// The paged indirect kernel's tiles are sized by its compile-time HDIM. A
+/// 128-dim drafter prefers the explicit HDIM=128 build; targets whose default
+/// module is already 128 do not ship it and keep the default.
+fn dflash_paged_attention_kernel(gpu: &dyn GpuBackend, head_dim: usize) -> Result<KernelHandle> {
+    const SYMBOL: &str = "inferspark_prefill_paged_indirect_sink";
+    if head_dim == 128 {
+        let h128 = crate::layers::try_kernel(gpu, "inferspark_prefill_paged_indirect_sink_h128", SYMBOL);
+        if h128.0 != 0 {
+            return Ok(h128);
+        }
+    }
+    gpu.kernel("prefill_paged_indirect_sink", SYMBOL)
 }
