@@ -38,6 +38,31 @@ pub use startup_diagnostics::DsparkDiagnostics;
 #[cfg(test)]
 mod product_policy_tests;
 
+impl DflashKernels {
+    /// BF16 `C[m, n] = A[m, k] · W[n, k]ᵀ`. Drafter blocks are at most a few
+    /// rows, where the batch-M GEMV reads each weight once at bandwidth; the
+    /// 128-row tiled GEMM would be almost all padding and under-fill the SMs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear(
+        &self,
+        gpu: &dyn GpuBackend,
+        input: DevicePtr,
+        weight: &DenseWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        use crate::layers::ops;
+        if m <= ops::DENSE_GEMV_BATCHM_MAX_M && k % 8 == 0 {
+            ops::dense_gemv_batchm(gpu, self.dense_gemv_batchm, input, weight, output, m, n, k, n, stream)
+        } else {
+            ops::dense_gemm_bf16_pipelined(gpu, self.dense_gemm_pipelined, input, weight, output, m, n, k, stream)
+        }
+    }
+}
+
 /// Kernel handles for the DFlash γ-block forward chain. All resolved once
 /// at `BlockDiffusionDraftHead::from_weights` against the active GPU backend
 /// (which compiles target-specific PTX at startup); subsequent

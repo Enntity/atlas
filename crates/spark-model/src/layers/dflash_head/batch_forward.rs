@@ -293,9 +293,8 @@ impl BlockDiffusionDraftHead {
                     stream,
                 )?;
             } else {
-                crate::layers::ops::dense_gemm_bf16_pipelined(
+                self.kernels.linear(
                     ctx.gpu,
-                    self.kernels.dense_gemm_pipelined,
                     self.batch_norm,
                     &crate::weight_map::DenseWeight {
                         weight: self.lm_head_shared,
@@ -353,9 +352,8 @@ impl BlockDiffusionDraftHead {
                 )?;
             }
         } else {
-            crate::layers::ops::dense_gemm_bf16_pipelined(
+            self.kernels.linear(
                 ctx.gpu,
-                self.kernels.dense_gemm_pipelined,
                 self.batch_norm,
                 &crate::weight_map::DenseWeight {
                     weight: self.lm_head_shared,

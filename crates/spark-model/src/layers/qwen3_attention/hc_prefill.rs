@@ -151,6 +151,32 @@ impl Qwen3AttentionLayer {
                 stream,
             );
         }
+        // Short batches (verify blocks): the exact split mix + finalize
+        // spreads the mix over the SMs instead of one CTA per token.
+        if ops::try_hc_pre_split(
+            ctx.gpu,
+            self.hc_pre_k,
+            self.hc_pre_mix_k,
+            self.hc_pre_from_raw_mix_k,
+            ctx.buffers.gate_logits_f32(),
+            ctx.buffers.sizes().gate_logits_f32,
+            streams,
+            site.hc_fn,
+            site.hc_scale,
+            site.hc_base,
+            hidden,
+            ctx.buffers.hc_post(),
+            ctx.buffers.hc_comb(),
+            tokens,
+            h,
+            hc_mult,
+            hc.sinkhorn_iters as u32,
+            ctx.config.rms_norm_eps as f32,
+            hc.hc_eps,
+            stream,
+        )? {
+            return Ok(());
+        }
         ops::hc_pre(
             ctx.gpu,
             self.hc_pre_k,

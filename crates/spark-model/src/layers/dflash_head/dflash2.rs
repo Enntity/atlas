@@ -192,9 +192,8 @@ impl BlockDiffusionDraftHead {
                 stream,
             )
         } else {
-            ops::dense_gemm_bf16_pipelined(
+            self.kernels.linear(
                 gpu,
-                self.kernels.dense_gemm_pipelined,
                 input,
                 weight,
                 output,
