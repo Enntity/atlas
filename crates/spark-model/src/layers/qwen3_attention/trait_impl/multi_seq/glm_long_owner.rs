@@ -179,20 +179,33 @@ impl Qwen3AttentionLayer {
         }
         let streams = b.hc_streams();
         let (post, comb) = (b.hc_post(), b.hc_comb());
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            attn_out,
-            streams,
-            post,
-            comb,
-            streams,
+        let seam = crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
+            &hc.ffn,
+            Some(attn_out),
+            hidden,
             n,
-            h as u32,
+            hc.hc_mult as u32,
+            hc.sinkhorn_iters as u32,
+            hc.hc_eps,
+            ctx,
             stream,
         )?;
-        self.hc_pre_prefill(&hc.ffn, hc, hidden, n, ctx, stream)?;
+        if !seam {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                attn_out,
+                streams,
+                post,
+                comb,
+                streams,
+                n,
+                h as u32,
+                stream,
+            )?;
+            self.hc_pre_prefill(&hc.ffn, hc, hidden, n, ctx, stream)?;
+        }
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_w_k,

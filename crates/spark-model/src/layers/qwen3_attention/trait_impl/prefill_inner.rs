@@ -801,7 +801,7 @@ impl Qwen3AttentionLayer {
             && !diag_this
             && super::super::hc_post_pre_prefill_fused(
                 &hc.ffn,
-                attn_out,
+                Some(attn_out),
                 hidden,
                 n,
                 hc_mult,

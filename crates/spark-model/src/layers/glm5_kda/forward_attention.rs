@@ -453,7 +453,7 @@ impl Glm5KdaLayer {
         } else {
             seam = crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
                 &self.hc.ffn,
-                normed,
+                Some(normed),
                 hidden,
                 m,
                 self.hc.hc_mult as u32,

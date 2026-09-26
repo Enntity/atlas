@@ -29,6 +29,21 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if tokens <= 32
+            && crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
+                site,
+                None,
+                hidden,
+                tokens,
+                self.hc.hc_mult as u32,
+                self.hc.sinkhorn_iters as u32,
+                self.hc.hc_eps,
+                ctx,
+                stream,
+            )?
+        {
+            return Ok(());
+        }
         if fast_prefill(tokens) {
             return crate::layers::qwen3_attention::hc_pre_prefill_mix(
                 site,

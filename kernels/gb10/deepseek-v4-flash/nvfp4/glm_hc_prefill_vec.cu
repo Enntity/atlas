@@ -382,6 +382,113 @@ __device__ __forceinline__ void glm_hc_pre_finalize_ss_vec_t(
                         y_out, post_out, comb_out, t, tid, sinkhorn_iters, hc_eps);
 }
 
+// ── Decode/verify mHC seam (T <= 32 rows) ────────────────────────────────
+// The per-token kernels leave most SMs idle at verify widths (one CTA per
+// row, three launches per site). Here the 4x4096 highway is split across
+// GLM_HCD_SPLIT CTAs of 4 warps (warp = stream, 2 columns per lane): each
+// optionally applies the finishing site's hc_post (hc_post_t's expression and
+// order, so the stored highway is bitwise identical), then accumulates its
+// slice of the next site's 24 mix dots and sum of squares from an hc_fn slice
+// staged once. glm_hc_decode_finalize sums the partials and runs the shared
+// vector finalizer. Mix/RMS sums differ from glm_hc_mix_ss only in FP32 order.
+// partial: [GLM_HCD_SPLIT][T][25]. Grid (GLM_HCD_SPLIT, ceil(T / GLM_HCD_TG)),
+// block 128.
+#define GLM_HCD_SPLIT 64
+#define GLM_HCD_TG 4
+#define GLM_HCD_COLS (4096 / GLM_HCD_SPLIT)   // 64 columns per stream per CTA
+template <typename HT, bool POST>
+__device__ __forceinline__ void glm_hc_decode_partial_t(
+    const __nv_bfloat16* __restrict__ block_out, // [T, 4096] (POST only)
+    HT* __restrict__ streams,                    // [T, 4, 4096]
+    const float* __restrict__ post,              // [T, 4]   (POST only)
+    const float* __restrict__ comb,              // [T, 4, 4] (POST only)
+    const float* __restrict__ hc_fn,             // [24, 16384] of the next site
+    float* __restrict__ partial,
+    const unsigned int tokens
+) {
+    constexpr unsigned int H = 4096, K = 4 * H, M = 24;
+    __shared__ float s_fn[M][4][GLM_HCD_COLS];
+    __shared__ float s_x[4][GLM_HCD_COLS];
+    __shared__ float s_red[4][M + 1];
+    const unsigned int tid = threadIdx.x, st = tid >> 5, lane = tid & 31;
+    const unsigned int d0 = blockIdx.x * GLM_HCD_COLS;
+    for (unsigned int i = tid; i < M * 4 * GLM_HCD_COLS; i += 128) {
+        const unsigned int m = i / (4 * GLM_HCD_COLS), r = i % (4 * GLM_HCD_COLS);
+        const unsigned int s4 = r / GLM_HCD_COLS, c = r % GLM_HCD_COLS;
+        s_fn[m][s4][c] = hc_fn[(size_t)m * K + s4 * H + d0 + c];
+    }
+    __syncthreads();
+    const unsigned int t_end = min(tokens, (blockIdx.y + 1) * GLM_HCD_TG);
+    for (unsigned int t = blockIdx.y * GLM_HCD_TG; t < t_end; ++t) {
+        HT* x = streams + (size_t)t * K;
+        float v[2];
+        #pragma unroll
+        for (unsigned int e = 0; e < 2; ++e) {
+            const unsigned int c = lane + e * 32, d = d0 + c;
+            if constexpr (POST) {
+                s_x[st][c] = (float)x[st * H + d];
+                __syncthreads();
+                float acc = post[t * 4 + st] * __bfloat162float(block_out[(size_t)t * H + d]);
+                #pragma unroll
+                for (unsigned int i = 0; i < 4; ++i) acc += comb[t * 16 + i * 4 + st] * s_x[i][c];
+                x[st * H + d] = (HT)acc;
+                v[e] = (float)(HT)acc;
+                __syncthreads();
+            } else {
+                v[e] = (float)x[st * H + d];
+            }
+        }
+        float ss = v[0] * v[0] + v[1] * v[1];
+        #pragma unroll
+        for (unsigned int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        if (lane == 0) s_red[st][M] = ss;
+        #pragma unroll
+        for (unsigned int m = 0; m < M; ++m) {
+            float a = s_fn[m][st][lane] * v[0] + s_fn[m][st][lane + 32] * v[1];
+            #pragma unroll
+            for (unsigned int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+            if (lane == 0) s_red[st][m] = a;
+        }
+        __syncthreads();
+        if (tid <= M)
+            partial[((size_t)blockIdx.x * tokens + t) * (M + 1) + tid] =
+                s_red[0][tid] + s_red[1][tid] + s_red[2][tid] + s_red[3][tid];
+        __syncthreads();
+    }
+}
+
+// Sum the GLM_HCD_SPLIT partials of row blockIdx.x, then the shared finalizer
+// (split, Sinkhorn, collapse). Grid (T), block 256.
+template <typename HT>
+__device__ __forceinline__ void glm_hc_decode_finalize_t(
+    const HT* __restrict__ streams,
+    const float* __restrict__ partial,
+    const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int tokens,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    const unsigned int t = blockIdx.x, tid = threadIdx.x;
+    __shared__ float s_rsqrt;
+    __shared__ float s_mix[HC_MAX_MIX];
+    __shared__ float s_pre[HC_MAX_MULT];
+    if (tid <= 24) {
+        float acc = 0.f;
+        for (unsigned int c = 0; c < GLM_HCD_SPLIT; ++c)
+            acc += partial[((size_t)c * tokens + t) * 25 + tid];
+        if (tid < 24) s_mix[tid] = acc;
+        else s_rsqrt = rsqrtf(acc / (float)(4 * 4096) + norm_eps);
+    }
+    __syncthreads();
+    glm_hc_vec_finalize(streams + (size_t)t * 4 * 4096, s_rsqrt, s_mix, s_pre, hc_scale, hc_base,
+                        y_out, post_out, comb_out, t, tid, sinkhorn_iters, hc_eps);
+}
+
 // ── FP32 (existing) and BF16-highway entry points ──
 
 extern "C" __global__ void glm_hc_pre_from_raw_mix_vec(
@@ -494,4 +601,56 @@ extern "C" __global__ void __launch_bounds__(256) glm_hc_post_mix_ss_bf16(
     const unsigned int tokens
 ) {
     glm_hc_post_mix_ss_t<__nv_bfloat16>(block_out, streams, post, comb, hc_fn, raw_mix, ss_out, tokens);
+}
+
+extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_post_partial(
+    const __nv_bfloat16* __restrict__ block_out, float* __restrict__ streams,
+    const float* __restrict__ post, const float* __restrict__ comb,
+    const float* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens
+) {
+    glm_hc_decode_partial_t<float, true>(block_out, streams, post, comb, hc_fn, partial, tokens);
+}
+
+extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_partial(
+    const __nv_bfloat16* __restrict__ block_out, float* __restrict__ streams,
+    const float* __restrict__ post, const float* __restrict__ comb,
+    const float* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens
+) {
+    glm_hc_decode_partial_t<float, false>(block_out, streams, post, comb, hc_fn, partial, tokens);
+}
+
+extern "C" __global__ void __launch_bounds__(256) glm_hc_decode_finalize(
+    const float* __restrict__ streams, const float* __restrict__ partial,
+    const float* __restrict__ hc_scale, const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out, float* __restrict__ post_out, float* __restrict__ comb_out,
+    const unsigned int tokens, const unsigned int sinkhorn_iters, const float norm_eps, const float hc_eps
+) {
+    glm_hc_decode_finalize_t<float>(streams, partial, hc_scale, hc_base, y_out, post_out, comb_out,
+                                  tokens, sinkhorn_iters, norm_eps, hc_eps);
+}
+
+extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_post_partial_bf16(
+    const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams,
+    const float* __restrict__ post, const float* __restrict__ comb,
+    const float* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens
+) {
+    glm_hc_decode_partial_t<__nv_bfloat16, true>(block_out, streams, post, comb, hc_fn, partial, tokens);
+}
+
+extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_partial_bf16(
+    const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams,
+    const float* __restrict__ post, const float* __restrict__ comb,
+    const float* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens
+) {
+    glm_hc_decode_partial_t<__nv_bfloat16, false>(block_out, streams, post, comb, hc_fn, partial, tokens);
+}
+
+extern "C" __global__ void __launch_bounds__(256) glm_hc_decode_finalize_bf16(
+    const __nv_bfloat16* __restrict__ streams, const float* __restrict__ partial,
+    const float* __restrict__ hc_scale, const float* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out, float* __restrict__ post_out, float* __restrict__ comb_out,
+    const unsigned int tokens, const unsigned int sinkhorn_iters, const float norm_eps, const float hc_eps
+) {
+    glm_hc_decode_finalize_t<__nv_bfloat16>(streams, partial, hc_scale, hc_base, y_out, post_out, comb_out,
+                                  tokens, sinkhorn_iters, norm_eps, hc_eps);
 }

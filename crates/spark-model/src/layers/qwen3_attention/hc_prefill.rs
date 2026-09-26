@@ -141,15 +141,20 @@ fn finalize_ss(
         .launch(stream)
 }
 
-/// GLM HC4 prefill seam (`ATLAS_GLM_HC_POST_MIX=1`): the finishing site's
-/// `hc_post` of `block_out` fused with the next site's pre-mix in one highway
-/// pass, then the usual finalizer writes `hidden` and the next post/comb.
-/// Returns false (nothing launched) when the seam does not qualify; callers
-/// then run `hc_post` + `hc_pre` separately.
+/// GLM HC4 seam: the finishing site's `hc_post` of `block_out` fused with
+/// the next site's pre-mix, then the finalizer writes `hidden` and the next
+/// post/comb. `block_out = None` runs the next site's pre alone.
+/// * >= 512 rows with a post (`ATLAS_GLM_HC_POST_MIX=1`): one highway pass
+///   over 32-token CTAs (measured 1.78 vs 2.50 ms at 4096 rows).
+/// * <= 32 rows (`ATLAS_GLM_HC_DECODE_SEAM=1`): the highway split across 64
+///   CTAs x 4-row groups, then one finalize block per row (20.6 vs ~57 us per
+///   site at 8 verify rows).
+/// Returns false (nothing launched) when neither applies; callers then run
+/// `hc_post` + `hc_pre` separately.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hc_post_pre_prefill_fused(
     next: &HcSiteWeights,
-    block_out: DevicePtr,
+    block_out: Option<DevicePtr>,
     hidden: DevicePtr,
     tokens: u32,
     hc_mult: u32,
@@ -158,29 +163,62 @@ pub(crate) fn hc_post_pre_prefill_fused(
     ctx: &ForwardContext,
     stream: u64,
 ) -> Result<bool> {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var("ATLAS_GLM_HC_POST_MIX").as_deref() == Ok("1"));
-    // Measured: 1.78 vs 2.50 ms at 4096 rows, 0.40 vs 0.55 at 1000; at
-    // ~128 rows the 32-token CTAs leave most SMs idle and the pair wins.
-    if !on
-        || tokens < 512
+    static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let (prefill_on, decode_on) = *ON.get_or_init(|| {
+        let flag = |k| std::env::var(k).as_deref() == Ok("1");
+        (flag("ATLAS_GLM_HC_POST_MIX"), flag("ATLAS_GLM_HC_DECODE_SEAM"))
+    });
+    let prefill = prefill_on && block_out.is_some() && tokens >= 512;
+    let decode = decode_on && (1..=32).contains(&tokens);
+    if !(prefill || decode)
         || hc_mult != 4
         || ctx.config.hidden_size != 4096
         || ctx.config.model_type != "glm5_next"
         || !(ops::hc_bf16_for(&ctx.config.model_type) || fused_prefill("glm5_next", 4096, 4, tokens))
-        || ctx.buffers.sizes().gate_logits_f32 < tokens as usize * 25 * 4
+        || ctx.buffers.sizes().gate_logits_f32 < (tokens as usize * 25 * 4).max(64 * 32 * 25 * 4)
     {
         return Ok(false);
     }
     let raw_mix = ctx.buffers.gate_logits_f32();
-    let name = ops::hc_kernel_name(&ctx.config.model_type, "glm_hc_post_mix_ss");
-    KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name)?)
+    let name = |base| ops::hc_kernel_name(&ctx.config.model_type, base);
+    let (streams, post, comb) = (ctx.buffers.hc_streams(), ctx.buffers.hc_post(), ctx.buffers.hc_comb());
+    if decode {
+        let partial = if block_out.is_some() { "glm_hc_decode_post_partial" } else { "glm_hc_decode_partial" };
+        KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name(partial))?)
+            .grid([64, tokens.div_ceil(4), 1])
+            .block([128, 1, 1])
+            .arg_ptr(block_out.unwrap_or(DevicePtr::NULL))
+            .arg_ptr(streams)
+            .arg_ptr(post)
+            .arg_ptr(comb)
+            .arg_ptr(next.hc_fn)
+            .arg_ptr(raw_mix)
+            .arg_u32(tokens)
+            .launch(stream)?;
+        KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name("glm_hc_decode_finalize"))?)
+            .grid([tokens, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(streams)
+            .arg_ptr(raw_mix)
+            .arg_ptr(next.hc_scale)
+            .arg_ptr(next.hc_base)
+            .arg_ptr(hidden)
+            .arg_ptr(post)
+            .arg_ptr(comb)
+            .arg_u32(tokens)
+            .arg_u32(sinkhorn_iters)
+            .arg_f32(ctx.config.rms_norm_eps as f32)
+            .arg_f32(hc_eps)
+            .launch(stream)?;
+        return Ok(true);
+    }
+    KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name("glm_hc_post_mix_ss"))?)
         .grid([tokens.div_ceil(32), 1, 1])
         .block([256, 1, 1])
-        .arg_ptr(block_out)
-        .arg_ptr(ctx.buffers.hc_streams())
-        .arg_ptr(ctx.buffers.hc_post())
-        .arg_ptr(ctx.buffers.hc_comb())
+        .arg_ptr(block_out.expect("prefill seam requires a post"))
+        .arg_ptr(streams)
+        .arg_ptr(post)
+        .arg_ptr(comb)
         .arg_ptr(next.hc_fn)
         .arg_ptr(raw_mix)
         .arg_ptr(raw_mix.offset(tokens as usize * 24 * 4))
@@ -204,6 +242,21 @@ impl Qwen3AttentionLayer {
         let streams = ctx.buffers.hc_streams();
         let h = ctx.config.hidden_size as u32;
         let hc_mult = hc.hc_mult as u32;
+        if tokens <= 32
+            && hc_post_pre_prefill_fused(
+                site,
+                None,
+                hidden,
+                tokens,
+                hc_mult,
+                hc.sinkhorn_iters as u32,
+                hc.hc_eps,
+                ctx,
+                stream,
+            )?
+        {
+            return Ok(());
+        }
         if fast_prefill(tokens) {
             return hc_pre_prefill_mix(
                 site,

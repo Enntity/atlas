@@ -147,5 +147,99 @@ fn main() -> Result<()> {
             tb * 1e6
         );
     }
+    fail |= decode_seam(g)?;
     std::process::exit(if fail { 1 } else { 0 });
+}
+
+/// Decode/verify seam (`glm_hc_decode_post_partial_bf16` + `_finalize_bf16`)
+/// against `hc_post_bf16` + `glm_hc_mix_ss_bf16` + `glm_hc_pre_finalize_ss_vec_bf16`:
+/// highway bitwise, hidden/post/comb within FP32-reorder noise.
+fn decode_seam(g: &dyn GpuBackend) -> Result<bool> {
+    let m = "glm_hc_prefill_vec";
+    let (post_k, mix_k, fin_k) = (
+        g.kernel("hyper_connection", "hc_post_bf16")?,
+        g.kernel(m, "glm_hc_mix_ss_bf16")?,
+        g.kernel(m, "glm_hc_pre_finalize_ss_vec_bf16")?,
+    );
+    let (part_k, dfin_k) = (
+        g.kernel(m, "glm_hc_decode_post_partial_bf16")?,
+        g.kernel(m, "glm_hc_decode_finalize_bf16")?,
+    );
+    let mut fail = false;
+    for tokens in [1usize, 8, 32] {
+        let mut r = Lcg(0xDEC0 + tokens as u64);
+        let highway: Vec<f32> = (0..tokens * 4 * H).map(|_| r.f() * 4.0).collect();
+        let block: Vec<f32> = (0..tokens * H).map(|_| r.f() * 2.0).collect();
+        let post: Vec<f32> = (0..tokens * 4).map(|_| r.f() + 1.0).collect();
+        let comb: Vec<f32> = (0..tokens * 16).map(|_| r.f() * 0.5 + 0.25).collect();
+        let fn_: Vec<f32> = (0..24 * 4 * H).map(|_| r.f() * 0.02).collect();
+        let scale: Vec<f32> = vec![0.7, 0.9, 1.1];
+        let base: Vec<f32> = (0..24).map(|_| r.f()).collect();
+        let (hw_a, hw_b) = (up(g, &bf(&highway))?, up(g, &bf(&highway))?);
+        let (blk, fnd, sc, bs) = (up(g, &bf(&block))?, up(g, &f32b(&fn_))?, up(g, &f32b(&scale))?, up(g, &f32b(&base))?);
+        let (post_a, comb_a) = (up(g, &f32b(&post))?, up(g, &f32b(&comb))?);
+        let (post_b, comb_b) = (up(g, &f32b(&post))?, up(g, &f32b(&comb))?);
+        let (y_a, y_b) = (g.alloc(tokens * H * 2)?, g.alloc(tokens * H * 2)?);
+        let scratch = g.alloc(64 * 32 * 25 * 4)?;
+        let t = tokens as u32;
+        let reference = |hw: DevicePtr| -> Result<()> {
+            KernelLaunch::new(g, post_k).grid([t, 1, 1]).block([256, 1, 1])
+                .arg_ptr(blk).arg_ptr(hw).arg_ptr(post_a).arg_ptr(comb_a).arg_ptr(hw)
+                .arg_u32(H as u32).arg_u32(4).launch(0)?;
+            KernelLaunch::new(g, mix_k).grid([t.div_ceil(32), 1, 1]).block([256, 1, 1])
+                .arg_ptr(hw).arg_ptr(fnd).arg_ptr(scratch).arg_ptr(scratch.offset(tokens * 96))
+                .arg_u32(t).launch(0)?;
+            KernelLaunch::new(g, fin_k).grid([t, 1, 1]).block([256, 1, 1])
+                .arg_ptr(hw).arg_ptr(scratch).arg_ptr(scratch.offset(tokens * 96)).arg_ptr(sc)
+                .arg_ptr(bs).arg_ptr(y_a).arg_ptr(post_a).arg_ptr(comb_a)
+                .arg_u32(3).arg_f32(1e-6).arg_f32(1e-6).launch(0)
+        };
+        let seam = |hw: DevicePtr| -> Result<()> {
+            KernelLaunch::new(g, part_k).grid([64, t.div_ceil(4), 1]).block([128, 1, 1])
+                .arg_ptr(blk).arg_ptr(hw).arg_ptr(post_b).arg_ptr(comb_b).arg_ptr(fnd)
+                .arg_ptr(scratch).arg_u32(t).launch(0)?;
+            KernelLaunch::new(g, dfin_k).grid([t, 1, 1]).block([256, 1, 1])
+                .arg_ptr(hw).arg_ptr(scratch).arg_ptr(sc).arg_ptr(bs).arg_ptr(y_b)
+                .arg_ptr(post_b).arg_ptr(comb_b).arg_u32(t).arg_u32(3).arg_f32(1e-6)
+                .arg_f32(1e-6).launch(0)
+        };
+        reference(hw_a)?;
+        g.synchronize(0)?;
+        seam(hw_b)?;
+        g.synchronize(0)?;
+        let bytes = tokens * 4 * H * 2;
+        let same = down(g, hw_a, bytes)? == down(g, hw_b, bytes)?;
+        let to_bf = |b: Vec<u8>| -> Vec<f32> {
+            b.chunks_exact(2).map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect()
+        };
+        let (ya, yb) = (to_bf(down(g, y_a, tokens * H * 2)?), to_bf(down(g, y_b, tokens * H * 2)?));
+        let (pa, pb) = (as_f32(&down(g, post_a, tokens * 16)?), as_f32(&down(g, post_b, tokens * 16)?));
+        let (ca, cb) = (as_f32(&down(g, comb_a, tokens * 64)?), as_f32(&down(g, comb_b, tokens * 64)?));
+        let rel = |a: &[f32], b: &[f32]| {
+            let scale = a.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+            a.iter().zip(b).map(|(x, y)| (x - y).abs() / scale).fold(0f32, f32::max)
+        };
+        let (ey, ep, ec) = (rel(&ya, &yb), rel(&pa, &pb), rel(&ca, &cb));
+        let ok = same && ey < 1e-2 && ep < 1e-4 && ec < 1e-4;
+        fail |= !ok;
+        let time = |f: &dyn Fn(DevicePtr) -> Result<()>, hw: DevicePtr| -> Result<f64> {
+            f(hw)?;
+            g.synchronize(0)?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..50 {
+                f(hw)?;
+            }
+            g.synchronize(0)?;
+            Ok(t0.elapsed().as_secs_f64() / 50.0)
+        };
+        let (ta, tb) = (time(&reference, hw_a)?, time(&seam, hw_b)?);
+        println!(
+            "decode T={tokens}: highway {} y {ey:.1e} post {ep:.1e} comb {ec:.1e} {}  3-kernel {:6.1}us  seam {:6.1}us",
+            if same { "bitwise" } else { "DIFFERS" },
+            if ok { "ok" } else { "FAIL" },
+            ta * 1e6,
+            tb * 1e6
+        );
+    }
+    Ok(fail)
 }
