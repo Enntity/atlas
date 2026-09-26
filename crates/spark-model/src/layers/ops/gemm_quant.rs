@@ -222,6 +222,42 @@ pub fn dense_gemv_batchm(
         .launch(stream)
 }
 
+/// Widest row count [`dense_gemv_bf16_tc`] serves (`dense_gemv_bf16_tc32`).
+pub const DENSE_GEMV_TC_MAX_M: u32 = 32;
+
+/// BF16 `C[m, n] = A[m, k] · W[n, k]ᵀ` for 9..=32 rows on the tensor cores:
+/// one weight pass for all rows (see `dense_gemv_bf16_tc_impl`). `kernel` is
+/// `dense_gemv_bf16_tc16` (m <= 16) or `dense_gemv_bf16_tc32` (m <= 32).
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_bf16_tc(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        (1..=DENSE_GEMV_TC_MAX_M).contains(&m) && k % 8 == 0,
+        "dense_gemv_bf16_tc: m={m} k={k} unsupported"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 16), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(out_stride)
+        .launch(stream)
+}
+
 /// Two same-shape exact-M=5 BF16 projections in one two-plane launch.
 #[allow(clippy::too_many_arguments)]
 pub fn dense_gemv_batch5_dual(

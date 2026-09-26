@@ -73,22 +73,56 @@ impl TransformerModel {
         let shard_weight = DenseWeight {
             weight: self.lm_head_weight.weight.offset(start * h * 2),
         };
-        // batchm is bit-identical per row at every M, so wide verifies chunk.
-        let max_m = ops::DENSE_GEMV_BATCHM_MAX_M as usize;
+        // Up to 8 rows per batch-M pass; wider owner-batched verifies read the
+        // shard once per 32 rows on the tensor cores.
+        static TC: OnceLock<(KernelHandle, KernelHandle)> = OnceLock::new();
+        let (tc16, tc32) = *TC.get_or_init(|| {
+            let k = |name| {
+                self.gpu
+                    .kernel("dense_gemv_bf16_batchm", name)
+                    .unwrap_or(KernelHandle(0))
+            };
+            (k("dense_gemv_bf16_tc16"), k("dense_gemv_bf16_tc32"))
+        });
+        let max_m = if rows > ops::DENSE_GEMV_BATCHM_MAX_M as usize && tc32.0 != 0 {
+            ops::DENSE_GEMV_TC_MAX_M as usize
+        } else {
+            ops::DENSE_GEMV_BATCHM_MAX_M as usize
+        };
         for first in (0..rows).step_by(max_m) {
             let m = (rows - first).min(max_m);
-            ops::dense_gemv_batchm(
-                self.gpu.as_ref(),
-                self.dense_gemv_batchm_kernel,
+            let (input, output) = (
                 normed.offset(first * h * 2),
-                &shard_weight,
                 logits.offset((first * vocab + start) * 2),
-                m as u32,
-                shard as u32,
-                h as u32,
-                vocab as u32,
-                stream,
-            )?;
+            );
+            if m > ops::DENSE_GEMV_BATCHM_MAX_M as usize {
+                let kernel = if m <= 16 { tc16 } else { tc32 };
+                ops::dense_gemv_bf16_tc(
+                    self.gpu.as_ref(),
+                    kernel,
+                    input,
+                    &shard_weight,
+                    output,
+                    m as u32,
+                    shard as u32,
+                    h as u32,
+                    vocab as u32,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemv_batchm(
+                    self.gpu.as_ref(),
+                    self.dense_gemv_batchm_kernel,
+                    input,
+                    &shard_weight,
+                    output,
+                    m as u32,
+                    shard as u32,
+                    h as u32,
+                    vocab as u32,
+                    stream,
+                )?;
+            }
         }
         let local = self.buffers.scratch().offset(PAIRS_OFFSET);
         let peer = local.offset(PAIRS_BYTES);

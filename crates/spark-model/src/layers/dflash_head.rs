@@ -39,9 +39,10 @@ pub use startup_diagnostics::DsparkDiagnostics;
 mod product_policy_tests;
 
 impl DflashKernels {
-    /// BF16 `C[m, n] = A[m, k] · W[n, k]ᵀ`. Drafter blocks are at most a few
-    /// rows, where the batch-M GEMV reads each weight once at bandwidth; the
-    /// 128-row tiled GEMM would be almost all padding and under-fill the SMs.
+    /// BF16 `C[m, n] = A[m, k] · W[n, k]ᵀ`. Drafter blocks (and batched
+    /// proposals up to 32 rows) read each weight once at bandwidth through the
+    /// batch-M / tensor-core GEMVs; the 128-row tiled GEMM would be almost all
+    /// padding and under-fill the SMs.
     #[allow(clippy::too_many_arguments)]
     pub fn linear(
         &self,
@@ -57,6 +58,9 @@ impl DflashKernels {
         use crate::layers::ops;
         if m <= ops::DENSE_GEMV_BATCHM_MAX_M && k % 8 == 0 {
             ops::dense_gemv_batchm(gpu, self.dense_gemv_batchm, input, weight, output, m, n, k, n, stream)
+        } else if m <= ops::DENSE_GEMV_TC_MAX_M && k % 8 == 0 && self.dense_gemv_tc32.0 != 0 {
+            let kernel = if m <= 16 { self.dense_gemv_tc16 } else { self.dense_gemv_tc32 };
+            ops::dense_gemv_bf16_tc(gpu, kernel, input, weight, output, m, n, k, n, stream)
         } else {
             ops::dense_gemm_bf16_pipelined(gpu, self.dense_gemm_pipelined, input, weight, output, m, n, k, stream)
         }
@@ -72,6 +76,9 @@ pub struct DflashKernels {
     pub residual_rms_norm: KernelHandle,
     pub dense_gemv: KernelHandle,
     pub dense_gemv_batchm: KernelHandle,
+    /// Tensor-core BF16 GEMV for 9..=16 / 17..=32 rows (batched proposals).
+    pub dense_gemv_tc16: KernelHandle,
+    pub dense_gemv_tc32: KernelHandle,
     pub dense_gemm: KernelHandle,
     /// NVFP4 GEMM for the final logits when the shared lm_head is NVFP4
     /// (e.g. Holo): a BF16 `dense_gemm` on NVFP4-packed bytes reads garbage

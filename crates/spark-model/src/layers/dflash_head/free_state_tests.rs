@@ -147,6 +147,8 @@ fn zero_kernels() -> DflashKernels {
         residual_rms_norm: zero,
         dense_gemv: zero,
         dense_gemv_batchm: zero,
+        dense_gemv_tc16: zero,
+        dense_gemv_tc32: zero,
         dense_gemm: zero,
         w4a16_gemm: zero,
         dense_gemm_pipelined: zero,

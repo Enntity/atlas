@@ -216,3 +216,139 @@ extern "C" __global__ void dense_gemv_bf16_batch5_triple_n(
     const unsigned int N = plane == 0u ? N0 : N12;
     dense_gemv_bf16_batchm_impl<5>(A, B, C, 5, N, K, N, smem);
 }
+
+// ============================================================
+// BF16 GEMV on tensor cores for 9..32 rows (batched verify / drafter blocks).
+// ============================================================
+// dense_gemv_bf16_batchm caps at 8 rows; wider row counts used to loop it
+// (re-reading the weight per 8 rows) or fall to a 128-row tiled GEMM that is
+// mostly padding. Here `mma.m16n8k16` takes 16 weight rows as A and each
+// 8-row slice of the activations as one B tile, so a CTA reads its weight
+// slice ONCE for up to NT*8 rows. FP32 accumulation; not bit-identical to the
+// scalar batch-M kernel.
+//
+// Mapping: CTA = 16 output rows, DG_TC_WARPS warps split K in 32-wide chunks.
+// Lane (g = lane/4, c = lane%4) loads 8 consecutive K values (16 bytes) of
+// weight rows g, g+8 and of activation row 8t+g for each tile t, prefetching
+// its next chunk. MMA step j (0..1) feeds k-slots {2c,2c+1} <- values
+// 4j+{0,1} and {2c+8,2c+9} <- 4j+{2,3} of the lane's run in both A and B.
+//
+// A:[M,K] BF16 (row stride K), B:[N,K] BF16, C rows at C + m*out_stride.
+// K % 8 == 0. Grid: (ceil(N/16),1,1) Block: (DG_TC_WARPS*32,1,1).
+#define DG_TC_WARPS 8
+
+template <int NT>
+struct DgTcChunk {
+    uint4 w0, w1;
+    uint4 x[NT];
+};
+
+template <int NT>
+__device__ __forceinline__ void dg_tc_load(
+    DgTcChunk<NT>& t, const __nv_bfloat16* w0p, const __nv_bfloat16* w1p,
+    const __nv_bfloat16* A, unsigned int g, unsigned int M, unsigned int K,
+    unsigned int kb, bool v0, bool v1
+) {
+    const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+    t.w0 = z; t.w1 = z;
+    #pragma unroll
+    for (int i = 0; i < NT; i++) t.x[i] = z;
+    if (kb >= K) return;
+    if (v0) t.w0 = *(const uint4*)(w0p + kb);
+    if (v1) t.w1 = *(const uint4*)(w1p + kb);
+    #pragma unroll
+    for (int i = 0; i < NT; i++) {
+        const unsigned int row = 8u * i + g;
+        if (row < M) t.x[i] = *(const uint4*)(A + (unsigned long long)row * K + kb);
+    }
+}
+
+template <int NT>
+__device__ __forceinline__ void dense_gemv_bf16_tc_impl(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int out_stride
+) {
+    __shared__ float s_red[DG_TC_WARPS][WARP_SIZE][NT * 4];
+    const unsigned int warp = threadIdx.x / WARP_SIZE;
+    const unsigned int lane = threadIdx.x % WARP_SIZE;
+    const unsigned int g = lane >> 2, c = lane & 3u;
+    const unsigned int r0 = blockIdx.x * 16u + g, r1 = r0 + 8u;
+    const bool v0 = r0 < N, v1 = r1 < N;
+    const __nv_bfloat16* w0p = B + (unsigned long long)(v0 ? r0 : 0u) * K;
+    const __nv_bfloat16* w1p = B + (unsigned long long)(v1 ? r1 : 0u) * K;
+
+    float acc[NT][4];
+    #pragma unroll
+    for (int i = 0; i < NT; i++) acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+    const unsigned int chunks = (K + 31u) / 32u;
+    DgTcChunk<NT> cur, nxt;
+    unsigned int ch = warp;
+    if (ch < chunks) dg_tc_load<NT>(cur, w0p, w1p, A, g, M, K, ch * 32u + 8u * c, v0, v1);
+    for (; ch < chunks; ch += DG_TC_WARPS) {
+        const unsigned int next = ch + DG_TC_WARPS;
+        if (next < chunks) dg_tc_load<NT>(nxt, w0p, w1p, A, g, M, K, next * 32u + 8u * c, v0, v1);
+        const unsigned int w0w[4] = {cur.w0.x, cur.w0.y, cur.w0.z, cur.w0.w};
+        const unsigned int w1w[4] = {cur.w1.x, cur.w1.y, cur.w1.z, cur.w1.w};
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            // Values 4j..4j+3 of each row's 8-value run = words 2j, 2j+1.
+            const unsigned int a0 = w0w[2 * j], a1 = w1w[2 * j];
+            const unsigned int a2 = w0w[2 * j + 1], a3 = w1w[2 * j + 1];
+            #pragma unroll
+            for (int i = 0; i < NT; i++) {
+                const unsigned int xw[4] = {cur.x[i].x, cur.x[i].y, cur.x[i].z, cur.x[i].w};
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(acc[i][0]), "+f"(acc[i][1]), "+f"(acc[i][2]), "+f"(acc[i][3])
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(xw[2 * j]), "r"(xw[2 * j + 1]));
+            }
+        }
+        cur = nxt;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < NT; i++) {
+        #pragma unroll
+        for (int q = 0; q < 4; q++) s_red[warp][lane][i * 4 + q] = acc[i][q];
+    }
+    __syncthreads();
+    if (warp != 0) return;
+    #pragma unroll
+    for (int i = 0; i < NT; i++) {
+        #pragma unroll
+        for (int q = 0; q < 4; q++) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < DG_TC_WARPS; w++) v += s_red[w][lane][i * 4 + q];
+            // C fragment: q 0..1 -> output row g, 2..3 -> g+8; column 2c + (q&1)
+            // of tile i is activation row 8i + 2c + (q&1).
+            const unsigned int n = (q < 2) ? r0 : r1;
+            const unsigned int m = 8u * i + 2u * c + (q & 1u);
+            if (n < N && m < M) C[(unsigned long long)m * out_stride + n] = __float2bfloat16(v);
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE)
+dense_gemv_bf16_tc16(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int out_stride
+) {
+    dense_gemv_bf16_tc_impl<2>(A, B, C, M, N, K, out_stride);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE)
+dense_gemv_bf16_tc32(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int out_stride
+) {
+    dense_gemv_bf16_tc_impl<4>(A, B, C, M, N, K, out_stride);
+}
