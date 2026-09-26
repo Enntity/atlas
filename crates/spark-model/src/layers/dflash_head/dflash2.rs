@@ -25,7 +25,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use super::{BlockDiffusionDraftHead, DflashScratch};
 use crate::layers::ops;
 use crate::weight_loader::dflash_loader::{Dflash2ConvWeights, Dflash2Weights};
-use crate::weight_map::DenseWeight;
+use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 /// Which grouped conv of a DFlash2 layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,11 +450,18 @@ impl BlockDiffusionDraftHead {
                 gpu, head, layer_idx, ConvSite::Attention, 0, self.batch_norm, attn_deltas, rows,
                 stream,
             )?;
-            let lin = |x, w: &DenseWeight, mx: Option<&super::Mxfp8Weight>, y, n_out, k_in| {
-                self.kernels
-                    .project(gpu, x, w, mx, y, rows, n_out, k_in, stream)
+            // NVFP4 twins (ATLAS_DFLASH_NVFP4_TC) take the tensor-core tier.
+            let tc = Some(crate::layers::w4a16_gemv_tiers::tc_kernel(rows))
+                .filter(|k| k.0 != 0 && matches!(self.quant, super::DflashQuantization::Nvfp4Weights));
+            let lin = |x, w: &DenseWeight, q4: Option<&QuantizedWeight>, mx: Option<&super::Mxfp8Weight>, y, n_out, k_in| {
+                match (tc, q4) {
+                    (Some(kernel), Some(q4)) => {
+                        ops::w4a16_gemv_batchm(gpu, kernel, x, q4, y, rows, n_out, k_in, stream)
+                    }
+                    _ => self.kernels.project(gpu, x, w, mx, y, rows, n_out, k_in, stream),
+                }
             };
-            lin(self.batch_norm, &layer.q_proj, layer.q_proj_mx.as_ref(), self.batch_q, q_dim, h)?;
+            lin(self.batch_norm, &layer.q_proj, layer.q_proj_nvfp4.as_ref(), layer.q_proj_mx.as_ref(), self.batch_q, q_dim, h)?;
             ops::rms_norm(
                 gpu,
                 self.kernels.rms_norm,
@@ -466,7 +473,7 @@ impl BlockDiffusionDraftHead {
                 self.rms_norm_eps,
                 stream,
             )?;
-            lin(self.batch_norm, &layer.k_proj, None, self.batch_k, kv_dim, h)?;
+            lin(self.batch_norm, &layer.k_proj, layer.k_proj_nvfp4.as_ref(), None, self.batch_k, kv_dim, h)?;
             ops::rms_norm(
                 gpu,
                 self.kernels.rms_norm,
@@ -478,7 +485,7 @@ impl BlockDiffusionDraftHead {
                 self.rms_norm_eps,
                 stream,
             )?;
-            lin(self.batch_norm, &layer.v_proj, None, self.batch_v, kv_dim, h)?;
+            lin(self.batch_norm, &layer.v_proj, layer.v_proj_nvfp4.as_ref(), None, self.batch_v, kv_dim, h)?;
             ops::rope_yarn(
                 gpu,
                 self.kernels.rope_qwen3,
@@ -541,7 +548,7 @@ impl BlockDiffusionDraftHead {
                     stream,
                 )?;
             }
-            lin(self.batch_attn_out, &layer.o_proj, layer.o_proj_mx.as_ref(), self.batch_attn_proj, h, q_dim)?;
+            lin(self.batch_attn_out, &layer.o_proj, layer.o_proj_nvfp4.as_ref(), layer.o_proj_mx.as_ref(), self.batch_attn_proj, h, q_dim)?;
             self.dflash2_batch_conv(
                 gpu, head, layer_idx, ConvSite::Attention, 1, self.batch_attn_proj, attn_deltas,
                 rows, stream,
@@ -568,8 +575,8 @@ impl BlockDiffusionDraftHead {
             self.dflash2_batch_conv(
                 gpu, head, layer_idx, ConvSite::Mlp, 0, self.batch_norm, mlp_deltas, rows, stream,
             )?;
-            lin(self.batch_norm, &layer.gate_proj, layer.gate_proj_mx.as_ref(), self.batch_mlp_gate, inter, h)?;
-            lin(self.batch_norm, &layer.up_proj, layer.up_proj_mx.as_ref(), self.batch_mlp_up, inter, h)?;
+            lin(self.batch_norm, &layer.gate_proj, layer.gate_proj_nvfp4.as_ref(), layer.gate_proj_mx.as_ref(), self.batch_mlp_gate, inter, h)?;
+            lin(self.batch_norm, &layer.up_proj, layer.up_proj_nvfp4.as_ref(), layer.up_proj_mx.as_ref(), self.batch_mlp_up, inter, h)?;
             ops::silu_mul(
                 gpu,
                 self.kernels.silu_mul,
@@ -579,7 +586,7 @@ impl BlockDiffusionDraftHead {
                 rows * inter,
                 stream,
             )?;
-            lin(self.batch_mlp_gate, &layer.down_proj, layer.down_proj_mx.as_ref(), self.batch_mlp_down, h, inter)?;
+            lin(self.batch_mlp_gate, &layer.down_proj, layer.down_proj_nvfp4.as_ref(), layer.down_proj_mx.as_ref(), self.batch_mlp_down, h, inter)?;
             self.dflash2_batch_conv(
                 gpu, head, layer_idx, ConvSite::Mlp, 1, self.batch_mlp_down, mlp_deltas, rows,
                 stream,

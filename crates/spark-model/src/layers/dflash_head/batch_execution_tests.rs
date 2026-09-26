@@ -129,7 +129,9 @@ fn batched_backbone_reaches_every_remaining_layer_in_serial_operation_order() {
     assert!(attention_source.contains("prefill_attention_paged_dflash_bf16_indirect"));
     assert!(attention_source.contains("prefill_attention_paged_batched_sink"));
     let projection_source = include_str!("batch_projection.rs");
-    assert!(projection_source.contains("(total_rows - row).min(16)"));
+    // Scalar tiers stage 16 rows per launch; the tensor-core tier 32.
+    assert!(projection_source.contains("(total_rows - row).min(width)"));
+    assert!(projection_source.contains("(scalar, 16)") && projection_source.contains("(tc, 32)"));
     assert!(!projection_source.contains("w4a16_gemv_batch32"));
     let tail = &source[source.find("fn run_batched_tail_base").unwrap()..];
     let final_norm = tail.find("&self.norm").unwrap();
@@ -211,6 +213,8 @@ fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispa
     for tier in ["batch4", "batch8", "batch16"] {
         assert!(projection_source.contains(tier));
     }
-    assert!(projection_source.contains("(total_rows - row).min(16)"));
+    // Scalar tiers stage 16 rows per launch; the tensor-core tier 32.
+    assert!(projection_source.contains("(total_rows - row).min(width)"));
+    assert!(projection_source.contains("(scalar, 16)") && projection_source.contains("(tc, 32)"));
     assert!(!projection_source.contains("w4a16_gemv_batch32"));
 }

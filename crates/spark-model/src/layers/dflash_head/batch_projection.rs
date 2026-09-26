@@ -24,16 +24,22 @@ impl BlockDiffusionDraftHead {
         if matches!(self.quant, super::DflashQuantization::Nvfp4Weights)
             && let Some(weight) = weight_nvfp4
         {
-            let kernel = match total_rows {
-                1..=4 => self.kernels.w4a16_gemv_batch4,
-                5..=8 => self.kernels.w4a16_gemv_batch8,
-                9..=32 => self.kernels.w4a16_gemv_batch16,
-                _ => spark_runtime::gpu::KernelHandle(0),
+            let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(total_rows.min(32));
+            let (kernel, width) = if tc.0 != 0 {
+                (tc, 32)
+            } else {
+                let scalar = match total_rows {
+                    1..=4 => self.kernels.w4a16_gemv_batch4,
+                    5..=8 => self.kernels.w4a16_gemv_batch8,
+                    9..=32 => self.kernels.w4a16_gemv_batch16,
+                    _ => spark_runtime::gpu::KernelHandle(0),
+                };
+                (scalar, 16)
             };
             if kernel.0 != 0 {
                 let mut row = 0u32;
                 while row < total_rows {
-                    let rows = (total_rows - row).min(16);
+                    let rows = (total_rows - row).min(width);
                     crate::layers::ops::w4a16_gemv_batchm(
                         ctx.gpu,
                         kernel,

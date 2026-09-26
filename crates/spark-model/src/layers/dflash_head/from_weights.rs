@@ -905,9 +905,13 @@ impl BlockDiffusionDraftHead {
             );
         }
 
-        if std::env::var("ATLAS_DFLASH_MXFP8").as_deref() == Ok("1") {
+        let mxfp8 = std::env::var("ATLAS_DFLASH_MXFP8").as_deref() == Ok("1");
+        if mxfp8 {
             head.install_mxfp8(gpu)?;
-        } else {
+        }
+        // ATLAS_DFLASH_NVFP4_TC=1 layers NVFP4 projections (tensor-core
+        // tier) over the MXFP8 install, which keeps serving the head.
+        if !mxfp8 || std::env::var("ATLAS_DFLASH_NVFP4_TC").as_deref() == Ok("1") {
             head.try_install_nvfp4(gpu)?;
         }
         Ok(head)

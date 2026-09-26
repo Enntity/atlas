@@ -170,21 +170,21 @@ impl BlockDiffusionDraftHead {
     ) -> Result<()> {
         let g = self.gamma as u32;
         if matches!(self.quant, DflashQuantization::Nvfp4Weights)
-            && g <= 4
             && let Some(w) = w_nvfp4
-            && self.kernels.w4a16_gemv_batch4.0 != 0
         {
-            return ops::w4a16_gemv_batchm(
-                gpu,
-                self.kernels.w4a16_gemv_batch4,
-                src,
-                w,
-                dst,
-                g,
-                n_out,
-                k_in,
-                stream,
-            );
+            // The target's tensor-core tier serves the whole γ block; the
+            // scalar batch4 kernel only blocks of up to four rows.
+            let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(g);
+            let kernel = if tc.0 != 0 {
+                tc
+            } else if g <= 4 {
+                self.kernels.w4a16_gemv_batch4
+            } else {
+                spark_runtime::gpu::KernelHandle(0)
+            };
+            if kernel.0 != 0 {
+                return ops::w4a16_gemv_batchm(gpu, kernel, src, w, dst, g, n_out, k_in, stream);
+            }
         }
         if matches!(self.quant, DflashQuantization::Fp8Weights)
             && let Some(fp8) = w_fp8
