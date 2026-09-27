@@ -75,6 +75,8 @@ pub(crate) mod impl_b2;
 pub(crate) mod impl_b3;
 pub(crate) mod impl_b3_accessors;
 pub(crate) mod impl_b3_dflash;
+#[cfg(test)]
+mod impl_b3_dflash_tests;
 pub(crate) mod impl_lora;
 pub(crate) mod impl_lora_swap;
 mod impl_ngram;

@@ -623,8 +623,6 @@ impl TransformerModel {
                     tokens,
                     seq,
                     &mut kv_cache,
-                    chunk_start,
-                    cl,
                     m.proc_count,
                     // hidden_stream_offset_tokens = proc_off[b] (Σ proc_count of
                     // prior streams, the cu_seqlens layout) — NOT cu_off[b].

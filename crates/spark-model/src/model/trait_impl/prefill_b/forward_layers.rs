@@ -249,12 +249,16 @@ impl TransformerModel {
                 t_in_prefill += t.elapsed();
             }
             let t_df = host_timing.then(std::time::Instant::now);
-            // DFlash chunked-prefill capture.
+            // DFlash chunked-prefill capture: hidden row 0 is prompt position
+            // `effective_seq_len_start`; computing starts at the chunk-0
+            // prefix-cache skip point.
+            let dflash_lo = seq.marconi_skip_to;
             self.try_dflash_prefill_capture_layer(
                 seq,
                 i,
-                layer_kv_write_start,
+                effective_seq_len_start,
                 proc_count,
+                dflash_lo,
                 stream,
             )?;
             // Riding owners' rows land in their stable hidden-save slots, as
