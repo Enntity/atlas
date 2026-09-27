@@ -74,7 +74,7 @@ pub(crate) fn initialize(
             && config.qk_rope_head_dim == 0
             && config.tp_world_size == 2
             && config.ep_world_size == 2
-            && dtype == KvCacheDtype::Bf16
+            && matches!(dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128)
             && super::glm_long_context::enabled(&config.model_type)
             && crate::speculative::glm_repair_policy::long_lane_enabled(),
         "{FLAG} requires repaired long-context GLM TP2/EP2 BF16 MLA"

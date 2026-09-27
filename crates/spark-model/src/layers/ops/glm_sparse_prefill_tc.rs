@@ -51,8 +51,14 @@ fn enabled(model: &str, name: &str) -> Result<bool> {
     }
 }
 
-fn kernel_spec(kv_reuse: bool) -> (&'static str, &'static str, u32) {
-    if kv_reuse {
+fn kernel_spec(kv_reuse: bool, dtype: KvCacheDtype) -> (&'static str, &'static str, u32) {
+    if dtype == KvCacheDtype::Fp8G128 {
+        (
+            "glm_sparse_prefill_kv_reuse",
+            "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad",
+            69376,
+        )
+    } else if kv_reuse {
         (
             "glm_sparse_prefill_kv_reuse",
             "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad",
@@ -95,17 +101,24 @@ fn dispatch(
         !kv_reuse || enabled,
         "ATLAS_GLM_SPARSE_PREFILL_KV_REUSE=1 requires ATLAS_GLM_SPARSE_PREFILL_TC=1"
     );
-    if !enabled || a.rows == 1 {
+    // An `fp8_g128` cache has no other sparse reader, so it takes single rows
+    // too and needs the K=V (kv_reuse) kernel.
+    let fp8 = a.dtype == KvCacheDtype::Fp8G128;
+    if !enabled || (a.rows == 1 && !fp8) {
         return Ok(false);
     }
     ensure!(
-        !kv_reuse || a.identical_kv_latent,
+        (!kv_reuse && !fp8) || a.identical_kv_latent,
         "GLM sparse KV reuse requires the identical zero-RoPE latent cache writer"
+    );
+    ensure!(
+        kv_reuse || !fp8,
+        "fp8_g128 GLM sparse prefill requires ATLAS_GLM_SPARSE_PREFILL_KV_REUSE=1"
     );
     validate_geometry(a)?;
     ensure!(
-        (2..=65535).contains(&a.rows),
-        "GLM sparse TC prefill requires 2..=65535 rows"
+        (if fp8 { 1 } else { 2 }..=65535).contains(&a.rows),
+        "GLM sparse TC prefill requires up to 65535 rows"
     );
     validate_storage(a)?;
     launch(gpu, a, stream, kv_reuse, a.rows)?;
@@ -128,13 +141,13 @@ fn validate_config(config: &ModelConfig) -> Result<()> {
 fn validate_geometry(a: &GlmSparsePrefillTc<'_>) -> Result<()> {
     validate_config(a.config)?;
     ensure!(
-        a.dtype == KvCacheDtype::Bf16
+        matches!(a.dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128)
             && a.heads == 32
             && a.head_dim == 512
             && a.index_width == 2051
             && a.block_size == 16
             && a.scale == 0.0625,
-        "GLM sparse TC requires BF16, 32 heads, 2051 selected slots, block16 and scale1/16"
+        "GLM sparse TC requires BF16 or fp8_g128, 32 heads, 2051 selected slots, block16 and scale1/16"
     );
     Ok(())
 }
@@ -163,7 +176,7 @@ fn launch(
     kv_reuse: bool,
     grid_rows: u32,
 ) -> Result<()> {
-    let (module, symbol, shared_mem) = kernel_spec(kv_reuse);
+    let (module, symbol, shared_mem) = kernel_spec(kv_reuse, a.dtype);
     let kernel = gpu.kernel(module, symbol)?;
     ensure!(kernel.0 != 0, "GLM sparse TC prefill kernel is unavailable");
     KernelLaunch::new(gpu, kernel)

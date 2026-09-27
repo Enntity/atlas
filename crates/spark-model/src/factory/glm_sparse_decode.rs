@@ -50,8 +50,8 @@ impl BuildPolicy<'_> {
                 && (2049..=crate::speculative::glm_repair_policy::max_long_context())
                     .contains(&self.context)
                 && self.block_size == 16
-                && self.kv_dtype == KvCacheDtype::Bf16
-                && self.layer_dtypes.iter().all(|d| *d == KvCacheDtype::Bf16)
+                && matches!(self.kv_dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128)
+                && self.layer_dtypes.iter().all(|d| *d == self.kv_dtype)
                 && (repaired_mtp2 || dflash_lane)
                 && long_context,
             "GLM sparse decode TC requires repaired long-context MTP2 (four owners) or the GLM DFlash lane, TP2/EP2 local32 heads and BF16 block16 caches"

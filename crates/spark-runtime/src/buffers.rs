@@ -129,6 +129,14 @@ pub struct BufferArena {
     /// (`ATLAS_GGUF_NATIVE_Q2_MMQ`). Shared by every kept-packed projection;
     /// each seam quantizes its activation here then runs the packed MMQ GEMM.
     q2_act_q8: DevicePtr,
+    /// BF16 view of one owner's GLM `fp8_g128` latents `[tokens, 512]`, read
+    /// through `glm_identity_table` by the BF16 dense/native prefill kernels.
+    /// NULL unless attached (see [`BufferArena::attach_glm_latent_scratch`]).
+    glm_latent_bf16: DevicePtr,
+    /// `u32[tokens / 16]` identity block table over `glm_latent_bf16`.
+    glm_identity_table: DevicePtr,
+    /// Token capacity of `glm_latent_bf16` (not an allocation).
+    glm_latent_tokens: usize,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
     /// Derived batched-decode metadata layout (rows = max(32, serve
@@ -307,10 +315,36 @@ impl BufferArena {
             lora_hact,
             lora_seq_slot,
             q2_act_q8,
+            glm_latent_bf16: DevicePtr::NULL,
+            glm_identity_table: DevicePtr::NULL,
+            glm_latent_tokens: 0,
             max_batch_tokens,
             decode_meta,
             sizes,
         })
+    }
+
+    /// Allocate the BF16 latent view for an `fp8_g128` GLM cache: `tokens`
+    /// latents (a multiple of 16) plus their identity block table.
+    pub fn attach_glm_latent_scratch(&mut self, tokens: usize, gpu: &dyn GpuBackend) -> Result<()> {
+        anyhow::ensure!(
+            self.glm_latent_bf16.is_null() && tokens > 0 && tokens.is_multiple_of(16),
+            "GLM latent scratch needs one attach of a positive multiple of 16 tokens"
+        );
+        let blocks = tokens / 16;
+        let table: Vec<u8> = (0..blocks as u32).flat_map(u32::to_le_bytes).collect();
+        let latent = gpu.alloc(tokens * 512 * 2)?;
+        let identity = match gpu.alloc(table.len()).and_then(|t| gpu.copy_h2d(&table, t).map(|()| t)) {
+            Ok(t) => t,
+            Err(error) => {
+                let _ = gpu.free(latent);
+                return Err(error);
+            }
+        };
+        self.glm_latent_bf16 = latent;
+        self.glm_identity_table = identity;
+        self.glm_latent_tokens = tokens;
+        Ok(())
     }
 }
 
@@ -375,6 +409,9 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             lora_seq_slot,
             q2_dequant_scratch,
             q2_act_q8,
+            glm_latent_bf16,
+            glm_identity_table,
+            glm_latent_tokens: _,
         } = self;
         // Every pointer, then NULL it: `release` must be idempotent because a
         // `Drop` backstop may call it again, and `free` already no-ops on NULL.
@@ -420,6 +457,8 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             *lora_seq_slot,
             *q2_dequant_scratch,
             *q2_act_q8,
+            *glm_latent_bf16,
+            *glm_identity_table,
         ];
         let mut first_error = None;
         for ptr in owned {
@@ -470,6 +509,8 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
         *lora_seq_slot = DevicePtr::NULL;
         *q2_dequant_scratch = DevicePtr::NULL;
         *q2_act_q8 = DevicePtr::NULL;
+        *glm_latent_bf16 = DevicePtr::NULL;
+        *glm_identity_table = DevicePtr::NULL;
         match first_error {
             Some(e) => Err(e),
             None => Ok(()),

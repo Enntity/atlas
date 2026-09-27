@@ -65,6 +65,12 @@ impl Qwen3AttentionLayer {
         let meta = ctx
             .attn_metadata
             .expect("MLA decode requires pre-uploaded metadata");
+        // Its dense/sparse readers here are BF16-only; an fp8_g128 GLM cache
+        // is read by the chunk (prefill/verify) path, like DFlash decode.
+        anyhow::ensure!(
+            self.kv_dtype != spark_runtime::kv_cache::KvCacheDtype::Fp8G128,
+            "fp8_g128 GLM caches are served by the chunk verify path; single-row MLA decode is unsupported"
+        );
 
         let q_lora = mla.q_lora_rank as u32;
         let kv_lora = mla.kv_lora_rank as u32;

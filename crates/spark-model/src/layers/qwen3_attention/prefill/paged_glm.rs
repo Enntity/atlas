@@ -35,6 +35,15 @@ pub(in crate::layers::qwen3_attention) struct GlmChunkOwner {
     pub meta: crate::layer::AttnMetadataDev,
 }
 
+/// An `fp8_g128` owner's latents dequantized to BF16 in the arena scratch,
+/// addressed through an identity block table of `blocks` entries.
+#[derive(Clone, Copy)]
+struct Bf16LatentView {
+    latents: DevicePtr,
+    identity_table: DevicePtr,
+    blocks: usize,
+}
+
 impl Qwen3AttentionLayer {
     /// Chunked zero-RoPE MLA using the 512-wide absorbed cache.
     pub(super) fn prefill_attention_paged_glm_dense(
@@ -117,8 +126,8 @@ impl Qwen3AttentionLayer {
             "GLM paged prefill requires the zero-RoPE semantic-index MLA shape"
         );
         ensure!(
-            self.kv_dtype == KvCacheDtype::Bf16,
-            "GLM chunked prefill currently requires BF16 KV cache; got {:?}",
+            matches!(self.kv_dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128),
+            "GLM chunked prefill requires a BF16 or fp8_g128 KV cache; got {:?}",
             self.kv_dtype
         );
         ensure!(
@@ -215,6 +224,30 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?)
             };
+            // The BF16 dense and native kernels read an fp8_g128 owner through
+            // a dequantized view; long owners and verify rows read FP8 directly.
+            let view = self.glm_owner_bf16_view(
+                kv_cache,
+                o.meta.block_table,
+                sequence_end,
+                use_dense || on >= 2048,
+                bs,
+                ctx,
+                stream,
+            )?;
+            ensure!(
+                !use_dense || self.kv_dtype == KvCacheDtype::Bf16 || view.is_some(),
+                "GLM dense prefill has no BF16 view of the fp8_g128 cache"
+            );
+            let (k_cache, v_cache, block_table, cache_dtype) = match view {
+                Some(v) => (v.latents, v.latents, v.identity_table, KvCacheDtype::Bf16),
+                None => (
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    o.meta.block_table,
+                    self.kv_dtype,
+                ),
+            };
             let q_full = ctx.buffers.qkv_output();
             self.paged_glm_projection(
                 o_latent, &mla.wq_b, q_full, on, nq * hd, q_lora, &octx, stream, accelerated,
@@ -239,16 +272,16 @@ impl Qwen3AttentionLayer {
                 let mut profile = super::glm_index::profile_start(&octx, stream)?;
                 let sparse_args = ops::GlmSparsePrefillTc {
                     config: ctx.config,
-                    dtype: self.kv_dtype,
+                    dtype: cache_dtype,
                     // mla_cache_assemble_batched above writes the same normalized
                     // NoPE latent to both conventional paged cache sides.
                     identical_kv_latent: true,
                     query: q_absorbed,
-                    k_cache: kv_cache.k_pool_ptr(self.attn_layer_idx),
-                    v_cache: kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    k_cache,
+                    v_cache,
                     indices,
                     output: attn_latent,
-                    block_table: o.meta.block_table,
+                    block_table,
                     rows: on,
                     heads: nq,
                     head_dim: kv_lora,
@@ -256,28 +289,43 @@ impl Qwen3AttentionLayer {
                     block_size: bs,
                     scale: self.effective_attn_scale(hd),
                 };
-                let accelerated = ops::try_glm_sparse_native(
-                    &octx,
-                    &sparse_args,
-                    o.seq_len_start,
-                    kv_cache.num_blocks(),
-                    o.meta.max_blocks_per_seq as usize,
-                    kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
-                    // This caller is ordinary continued prefill. Repaired K3
-                    // verification has a separate multi-sequence attention path.
-                    false,
-                    stream,
-                )? || ops::try_glm_sparse_prefill_tc(ctx.gpu, &sparse_args, stream)?;
+                let (physical_blocks, table_blocks, block_bytes) = match view {
+                    Some(v) => (v.blocks, v.blocks, 16 * 512 * 2),
+                    None => (
+                        kv_cache.num_blocks(),
+                        o.meta.max_blocks_per_seq as usize,
+                        kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
+                    ),
+                };
+                let native = cache_dtype == KvCacheDtype::Bf16
+                    && ops::try_glm_sparse_native(
+                        &octx,
+                        &sparse_args,
+                        o.seq_len_start,
+                        physical_blocks,
+                        table_blocks,
+                        block_bytes,
+                        // This caller is ordinary continued prefill. Repaired K3
+                        // verification has a separate multi-sequence attention path.
+                        false,
+                        stream,
+                    )?;
+                let accelerated =
+                    native || ops::try_glm_sparse_prefill_tc(ctx.gpu, &sparse_args, stream)?;
                 if !accelerated {
+                    ensure!(
+                        cache_dtype == KvCacheDtype::Bf16,
+                        "fp8_g128 GLM sparse attention requires ATLAS_GLM_SPARSE_PREFILL_TC=1"
+                    );
                     ops::glm_sparse_mla_prefill(
                         ctx.gpu,
                         self.glm_sparse_attn_k,
                         q_absorbed,
-                        kv_cache.k_pool_ptr(self.attn_layer_idx),
-                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        k_cache,
+                        v_cache,
                         indices,
                         attn_latent,
-                        o.meta.block_table,
+                        block_table,
                         on,
                         nq,
                         kv_lora,
@@ -308,10 +356,10 @@ impl Qwen3AttentionLayer {
                     ctx.gpu,
                     self.prefill_attn_paged_512_k,
                     q_absorbed,
-                    kv_cache.k_pool_ptr(self.attn_layer_idx),
-                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    k_cache,
+                    v_cache,
                     attn_latent,
-                    o.meta.block_table,
+                    block_table,
                     on,
                     sequence_end as u32,
                     o.seq_len_start as u32,
@@ -384,6 +432,47 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
         self.paged_glm_projection(v_extracted, &mla.wo, out, rows, h, nq * v_dim, ctx, stream, accelerated)
+    }
+
+    /// When `wanted` and the cache is `fp8_g128`, dequantize the owner's
+    /// tokens `[0, end)` into the BF16 view — unless they outgrow it, in
+    /// which case the caller reads the FP8 cache directly.
+    #[allow(clippy::too_many_arguments)]
+    fn glm_owner_bf16_view(
+        &self,
+        kv_cache: &PagedKvCache,
+        block_table: DevicePtr,
+        end: usize,
+        wanted: bool,
+        block_size: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Option<Bf16LatentView>> {
+        if self.kv_dtype != KvCacheDtype::Fp8G128 || !wanted {
+            return Ok(None);
+        }
+        let (latents, identity_table, capacity) = ctx
+            .buffers
+            .glm_latent_scratch()
+            .ok_or_else(|| anyhow::anyhow!("fp8_g128 GLM cache has no BF16 view scratch"))?;
+        if end > capacity {
+            return Ok(None);
+        }
+        ops::glm_latent_dequant_fp8g128(
+            ctx.gpu,
+            self.glm_latent_dequant_k,
+            kv_cache.k_pool_ptr(self.attn_layer_idx),
+            block_table,
+            latents,
+            end as u32,
+            block_size,
+            stream,
+        )?;
+        Ok(Some(Bf16LatentView {
+            latents,
+            identity_table,
+            blocks: capacity / 16,
+        }))
     }
 }
 

@@ -348,6 +348,11 @@ impl Qwen3AttentionLayer {
             ),
             rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
             reshape_cache_k: gpu.kernel(reshape_mod, reshape_fn)?,
+            glm_latent_dequant_k: if kv_dtype == KvCacheDtype::Fp8G128 {
+                gpu.kernel("reshape_and_cache", "glm_latent_dequant_fp8g128")?
+            } else {
+                KernelHandle(0)
+            },
             glm_latent_qdq_k: if std::env::var("ATLAS_GLM_LATENT_QDQ").as_deref() == Ok("1") {
                 gpu.kernel("reshape_and_cache", "glm_latent_qdq_fp8g128")?
             } else {
@@ -411,6 +416,8 @@ impl Qwen3AttentionLayer {
                     "paged_decode_turbo4_512",
                     "paged_decode_attn_turbo4",
                 ),
+                // The GLM latent is read by its chunk path, never this one.
+                KvCacheDtype::Fp8G128 => KernelHandle(0),
                 _ => gate(
                     probes.wide_head_dim,
                     gpu,

@@ -6,6 +6,7 @@
 // Requires identical K/V bytes. Grid=(ceil(heads/32),rows), block256, shared69376 bytes. Shared Q/K row stride is 520 BF16 values.
 #include <cuda_bf16.h>
 #include <math.h>
+#include "../../common/glm_fp8g128.cuh"
 
 #undef LOAD_KV_TILE_512
 #define LOAD_KV_TILE_512(cache, bt, smem_ptr, kv_s, kv_l, t, stride) \
@@ -68,10 +69,41 @@ __device__ __forceinline__ float glm_kvp_exp(float x) {
 #define N_TILES_PER_WARP_512 16  // (HDIM/8) / 4 col-groups
 #define TILE_CHUNKS_512 (BR_512 * (HDIM_512 / 8))
 
-extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad(
+// Gather one K=V tile of selected tokens into BF16 shared rows, from a BF16
+// or an `fp8_g128` cache (glm_fp8g128.cuh).
+template <bool FP8>
+__device__ __forceinline__ void glm_kvp_load_tile(
+    const void* cache, const unsigned int* bt, __nv_bfloat16* smem_ptr,
+    unsigned int kv_s, unsigned int kv_l, const int* indices,
+    unsigned int cache_block_size, unsigned int t, unsigned int stride) {
+    if constexpr (!FP8) {
+        LOAD_KV_TILE_512(static_cast<const __nv_bfloat16*>(cache), bt, smem_ptr, kv_s, kv_l, t, stride);
+    } else {
+        for (unsigned int i = t; i < BR_512 * (HDIM_512 / 16); i += stride) {
+            const unsigned int row = i / 32, col = (i % 32) * 16;
+            const unsigned int selected = kv_s + row;
+            const int token = selected < kv_l ? indices[selected] : -1;
+            uint4 lo = make_uint4(0, 0, 0, 0), hi = lo;
+            if (token >= 0) {
+                const unsigned int physical = bt[(unsigned int)token / cache_block_size];
+                const unsigned int offset = (unsigned int)token % cache_block_size;
+                const uint4 q = *reinterpret_cast<const uint4*>(
+                    glm_fp8g128_values(cache, physical, offset, cache_block_size) + col);
+                const float scale =
+                    glm_fp8g128_scales(cache, physical, offset, cache_block_size)[col / 128u];
+                lo = glm_fp8g128_dequant8(make_uint2(q.x, q.y), scale);
+                hi = glm_fp8g128_dequant8(make_uint2(q.z, q.w), scale);
+            }
+            *reinterpret_cast<uint4*>(&smem_ptr[row * GLM_KVP_STRIDE + col]) = lo;
+            *reinterpret_cast<uint4*>(&smem_ptr[row * GLM_KVP_STRIDE + col + 8]) = hi;
+        }
+    }
+}
+
+template <bool FP8>
+__device__ __forceinline__ void glm_kv_pad_body(
     const __nv_bfloat16* Q,
-    const __nv_bfloat16* __restrict__ K_cache,
-    const __nv_bfloat16* __restrict__ V_cache,
+    const void* __restrict__ K_cache,
     const int* __restrict__ token_indices,
     __nv_bfloat16* O,
     const unsigned int* __restrict__ block_table,
@@ -137,7 +169,7 @@ extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad(
             } else { *((uint4*)&smem_Q[row * GLM_KVP_STRIDE + col]) = make_uint4(0,0,0,0); }
         }
         if (num_kv_blocks > 0) {
-            LOAD_KV_TILE_512(K_cache, block_table, smem_K, 0, kv_len, tid, blockDim.x);
+            glm_kvp_load_tile<FP8>(K_cache, block_table, smem_K, 0, kv_len, indices, cache_block_size, tid, blockDim.x);
         }
         asm volatile("cp.async.commit_group;");
         asm volatile("cp.async.wait_group 0;");
@@ -303,7 +335,7 @@ extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad(
 
         // === Sequential K[next] load (single-buffered, all 256 threads) ===
         if(kv_block+1 < num_kv_blocks){
-            LOAD_KV_TILE_512(K_cache, block_table, smem_K, (kv_block+1)*BC_512, kv_len, tid, blockDim.x);
+            glm_kvp_load_tile<FP8>(K_cache, block_table, smem_K, (kv_block+1)*BC_512, kv_len, indices, cache_block_size, tid, blockDim.x);
             asm volatile("cp.async.commit_group;");
             asm volatile("cp.async.wait_group 0;");
             __syncthreads();
@@ -340,4 +372,24 @@ extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad(
             }
         }
     }
+}
+
+// V aliases K in both layouts; `V_cache` is kept for the launch ABI.
+#define GLM_KV_PAD_ARGS \
+    const __nv_bfloat16* Q, const void* __restrict__ K_cache, const void* __restrict__ V_cache, \
+    const int* __restrict__ token_indices, __nv_bfloat16* O, \
+    const unsigned int* __restrict__ block_table, unsigned int rows, unsigned int num_heads, \
+    unsigned int head_dim, unsigned int index_width, unsigned int cache_block_size, float inv_sqrt_d
+#define GLM_KV_PAD_FORWARD \
+    Q, K_cache, token_indices, O, block_table, rows, num_heads, head_dim, index_width, \
+    cache_block_size, inv_sqrt_d
+
+extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad(GLM_KV_PAD_ARGS) {
+    (void)V_cache;
+    glm_kv_pad_body<false>(GLM_KV_PAD_FORWARD);
+}
+
+extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad(GLM_KV_PAD_ARGS) {
+    (void)V_cache;
+    glm_kv_pad_body<true>(GLM_KV_PAD_FORWARD);
 }

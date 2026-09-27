@@ -51,9 +51,10 @@ fn validate_startup(
             && seq == plan::MAX_CONTEXT
             && block == 16
             && active == 4
-            && dtype == KvCacheDtype::Bf16
-            && layer_dtypes.iter().all(|&d| d == KvCacheDtype::Bf16),
-        "native sparse requires4100-row arena,32K context,C4,block16,BF16 cache"
+            // An fp8_g128 cache reaches the library through its BF16 view.
+            && matches!(dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128)
+            && layer_dtypes.iter().all(|&d| d == dtype),
+        "native sparse requires4100-row arena,32K context,C4,block16,BF16/fp8_g128 cache"
     );
     let sizes = BufferSizes::from_config(c, rows, seq, block, active);
     let (required, _) =

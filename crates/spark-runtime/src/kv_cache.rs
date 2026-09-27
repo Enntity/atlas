@@ -9,6 +9,8 @@ use crate::gpu::DevicePtr;
 use anyhow::{Result, bail};
 
 pub(crate) const NVFP4_GROUP_SIZE: usize = 16;
+/// Elements sharing one FP32 scale in [`KvCacheDtype::Fp8G128`].
+pub const FP8_G128_GROUP: usize = 128;
 
 /// KV cache quantization dtype.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +73,11 @@ pub enum KvCacheDtype {
     /// llama-cpp-turboquant's `q8_0/turbo2`). Best compression-to-quality
     /// ratio for turbo2 V on tested models.
     Fp8KTurbo2V,
+    /// FP8-E4M3 values with one FP32 scale per 128 elements of each token
+    /// (amax/448): a block stores its tokens' values, then their scales.
+    /// The GLM NoPE-512 latent layout — the one the native sparse prefill
+    /// already packs — at 528 bytes per token instead of 1024.
+    Fp8G128,
 }
 
 impl std::fmt::Display for KvCacheDtype {
@@ -152,6 +159,7 @@ impl std::str::FromStr for KvCacheDtype {
             "fp8k_turbo3v" | "fp8k3v" => Ok(KvCacheDtype::Fp8KTurbo3V),
             "bf16k_turbo2v" | "bf16k2v" => Ok(KvCacheDtype::Bf16KTurbo2V),
             "fp8k_turbo2v" | "fp8k2v" => Ok(KvCacheDtype::Fp8KTurbo2V),
+            "fp8_g128" => Ok(KvCacheDtype::Fp8G128),
             other => bail!(
                 "Unsupported --kv-cache-dtype '{other}'. Symmetric: 'bf16', 'fp8', 'nvfp4', 'turbo4', 'turbo3', 'turbo8'. \
                 Asymmetric (TQ+): turbo*_turbo*v, bf16k_turbo[34]v (safer asym: K baseline, V compressed), fp8k_turbo[34]v."
@@ -218,6 +226,7 @@ impl KvCacheConfig {
             | KvCacheDtype::Fp8KTurbo4V
             | KvCacheDtype::Fp8KTurbo3V
             | KvCacheDtype::Fp8KTurbo2V => elems,
+            KvCacheDtype::Fp8G128 => elems + elems / FP8_G128_GROUP * std::mem::size_of::<f32>(),
             KvCacheDtype::Nvfp4
             | KvCacheDtype::Turbo4
             | KvCacheDtype::Turbo4KTurbo3V

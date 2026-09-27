@@ -491,6 +491,24 @@ impl Qwen3AttentionLayer {
                 }
                 Ok(())
             }
+            // GLM latent: V aliases K, so only the K side is written.
+            KvCacheDtype::Fp8G128 => {
+                anyhow::ensure!(
+                    num_kv_heads == 1 && head_dim == 512,
+                    "fp8_g128 KV cache stores the GLM NoPE-512 latent only"
+                );
+                ops::glm_latent_cache_write_fp8g128(
+                    gpu,
+                    self.reshape_cache_k,
+                    k,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    slot,
+                    num_tokens,
+                    block_size,
+                    key_stride,
+                    stream,
+                )
+            }
             _ => {
                 // FP8 KV cache
                 if !graph_capture && let Some(ref cal) = self.fp8_calibration {

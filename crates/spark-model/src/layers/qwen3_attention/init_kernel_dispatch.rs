@@ -185,6 +185,14 @@ pub(super) fn kernel_modules_for_dtype(
             "paged_decode_fp8",
             "paged_decode_attn_fp8",
         ),
+        // GLM latent only (validated at build): its readers are the GLM MLA
+        // kernels; the generic decode pair is bound but never dispatched.
+        KvCacheDtype::Fp8G128 => (
+            "reshape_and_cache",
+            "glm_latent_cache_write_fp8g128",
+            "paged_decode",
+            "paged_decode_attn",
+        ),
     }
 }
 

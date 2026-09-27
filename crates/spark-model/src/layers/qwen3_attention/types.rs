@@ -231,6 +231,9 @@ pub struct Qwen3AttentionLayer {
     /// `ATLAS_GLM_LATENT_QDQ=1`: FP8 fake-quant of cached GLM latents
     /// (quality probe for an FP8 latent cache). Null when off.
     pub(super) glm_latent_qdq_k: KernelHandle,
+    /// `fp8_g128` GLM latents -> BF16 view for the BF16 prefill kernels.
+    /// Null unless the cache is `fp8_g128`.
+    pub(super) glm_latent_dequant_k: KernelHandle,
     /// Fused k_norm + RoPE + paged BF16 cache write — eliminates two
     /// intermediate BF16 rounding steps that cause the documented L35-L39
     /// cliff in chunked-prefill BF16 KV mode (memory:

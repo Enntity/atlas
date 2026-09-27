@@ -496,7 +496,7 @@ pub fn build_model(
         inference_reserve,
         false,
     )?;
-    let buffers = BufferArena::new(
+    let mut buffers = BufferArena::new(
         &config,
         max_batch_tokens,
         max_seq_len,
@@ -504,6 +504,15 @@ pub fn build_model(
         max_batch_size,
         gpu.as_ref(),
     )?;
+    // The BF16 dense (<=2048) and native (<=32768) GLM prefill kernels read an
+    // `fp8_g128` owner's latents through a dequantized BF16 view; allocated
+    // before KV sizing so the budget sees it.
+    if kv_dtype == KvCacheDtype::Fp8G128 && config.model_type == "glm5_next" {
+        buffers.attach_glm_latent_scratch(
+            crate::layers::ops::GLM_LATENT_BF16_VIEW_TOKENS.min(max_seq_len.next_multiple_of(16)),
+            gpu.as_ref(),
+        )?;
+    }
     crate::layers::ops::validate_glm_sparse_decode_split_scratch(
         &config.model_type,
         buffers.expert_gate_out(),
@@ -529,6 +538,13 @@ pub fn build_model(
         config.kv_lora_rank,
         config.qk_rope_head_dim,
     )?;
+    anyhow::ensure!(
+        glm_cache_shape.is_some()
+            || (kv_dtype != KvCacheDtype::Fp8G128
+                && !layer_dtypes.contains(&KvCacheDtype::Fp8G128)),
+        "--kv-cache-dtype fp8_g128 stores the GLM NoPE-512 latent; {} has none",
+        config.model_type
+    );
     let (kv_num_heads, kv_head_dim) = if let Some(shape) = glm_cache_shape {
         (shape.num_kv_heads(), shape.head_dim())
     } else if config.kv_lora_rank > 0 {
