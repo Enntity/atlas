@@ -164,6 +164,21 @@ impl CommBackend for NcclBackend {
         self.world_size == 2
     }
 
+    fn exchange_async(
+        &self,
+        send: u64,
+        dst: u64,
+        bytes: usize,
+        add: bool,
+        compute_stream: u64,
+    ) -> Result<bool> {
+        self.try_rdma_exchange(send, dst, bytes, add, compute_stream)
+    }
+
+    fn supports_exchange_async(&self, bytes: usize) -> bool {
+        self.rdma_capacity().is_some_and(|capacity| bytes <= capacity)
+    }
+
     fn register_buffer(&self, ptr: u64, bytes: usize) -> Result<u64> {
         let mut handle: *mut c_void = ptr::null_mut();
         let comm = *self.comm.lock();

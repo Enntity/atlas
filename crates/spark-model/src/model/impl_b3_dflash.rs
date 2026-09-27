@@ -153,12 +153,16 @@ impl TransformerModel {
         // `window_start`. Earlier rows of this chunk are dropped.
         let end = chunk_start + proc_count;
         let window_start = seq.tokens.len().max(end).saturating_sub(max_ctx);
-        let first = window_start.max(chunk_start);
+        let mut first = window_start.max(chunk_start);
+        // A sequence-parallel chunk keeps only this rank's rows (rank 0: the
+        // upper half, compacted at row 0) in the highway.
+        let sp_row0 = crate::layers::glm_sp::current().map_or(0, |sp| sp.row0);
+        first = first.max(chunk_start + sp_row0);
         if first >= end {
             return Ok(());
         }
         self.dflash_capture_rows(
-            first - chunk_start,
+            first - chunk_start - sp_row0,
             end - first,
             acc_base.offset((first - window_start) * n_capture * h * bf16 + slot_idx * h * bf16),
             n_capture * h * bf16,

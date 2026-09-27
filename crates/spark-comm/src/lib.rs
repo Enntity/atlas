@@ -94,6 +94,27 @@ pub trait CommBackend: Send + Sync {
         false
     }
 
+    /// Two-rank stream-ordered exchange: send `bytes` from `send` and land the
+    /// peer's `bytes` in `dst`, added in place (BF16) when `add`, else copied.
+    /// With equal halves this is a reduce-scatter (`add`) or an all-gather
+    /// step. Both ranks must call it with the same `bytes`. Returns `false`
+    /// (nothing enqueued) when unavailable for this call.
+    fn exchange_async(
+        &self,
+        _send: u64,
+        _dst: u64,
+        _bytes: usize,
+        _add: bool,
+        _compute_stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Whether [`Self::exchange_async`] can serve payloads up to `bytes`.
+    fn supports_exchange_async(&self, _bytes: usize) -> bool {
+        false
+    }
+
     /// Pre-register a GPU buffer with the communication backend.
     ///
     /// For NCCL over IB/RoCE, this caches the IB memory registration

@@ -486,7 +486,7 @@ impl NcclBackend {
             if bytes == 0 {
                 return Ok(true);
             }
-            if rdma.exchange(ptr, bytes, stream, |dst, src, len| {
+            if rdma.exchange(ptr, ptr, bytes, stream, |dst, src, len| {
                 self.launch_add(dst, src, len / ALL_REDUCE_DTYPE_BYTES, stream)
             })? {
                 return Ok(true);
@@ -494,6 +494,35 @@ impl NcclBackend {
         }
         let _ = (ptr, bytes, stream);
         Ok(false)
+    }
+
+    /// Reduce-scatter/all-gather step over the RDMA pair (see
+    /// `CommBackend::exchange_async`); `false` when the pair is not up.
+    fn try_rdma_exchange(&self, send: u64, dst: u64, bytes: usize, add: bool, stream: u64) -> Result<bool> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(rdma) = &self.rdma
+            && bytes > 0
+            && (!add || self.add_kernel.load(Ordering::Relaxed) != 0)
+        {
+            return rdma.exchange(send, dst, bytes, stream, |dst, src, len| {
+                if add {
+                    self.launch_add(dst, src, len / ALL_REDUCE_DTYPE_BYTES, stream)
+                } else {
+                    rdma_pair::copy_async(dst, src, len, stream)
+                }
+            });
+        }
+        let _ = (send, dst, bytes, add, stream);
+        Ok(false)
+    }
+
+    /// RDMA pair payload capacity, when the pair is up.
+    fn rdma_capacity(&self) -> Option<usize> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(rdma) = &self.rdma {
+            return Some(rdma.capacity());
+        }
+        None
     }
 
     fn generate_unique_id() -> Result<NcclUniqueId> {

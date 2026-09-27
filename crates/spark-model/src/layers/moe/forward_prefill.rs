@@ -188,6 +188,18 @@ impl MoeLayer {
         // then overlap them with the routed-output NCCL all-reduce. Keep graph
         // capture and profiling sequential; both require deterministic stream
         // ownership/timing.
+        // Sequence-parallel prefill (`layers::glm_sp`): routed experts run every
+        // row; the shared expert and its blend run only this rank's rows, and
+        // the EP all-reduce becomes a reduce-scatter into them.
+        let sp = crate::layers::glm_sp::current().filter(|sp| {
+            is_ep_prefill
+                && num_tokens == 2 * sp.rows
+                && matches!(mode, super::forward_pair_verify::PrefillMode::Legacy)
+        });
+        let (shared_in, shared_n) = match sp {
+            Some(sp) => (sp.local(input, h as usize), sp.rows as u32),
+            None => (input, n),
+        };
         let overlap_shared_reduce = has_shared
             && is_ep_prefill
             && num_tokens > 64
@@ -204,8 +216,8 @@ impl MoeLayer {
                     self.run_verify_shared_rows(input, ctx, stream, shape.rows(), shape.rows())?
                 }
                 super::forward_pair_verify::PrefillMode::Legacy => self.run_shared_expert_prefill(
-                    input,
-                    n,
+                    shared_in,
+                    shared_n,
                     h,
                     shared_inter,
                     stream,
@@ -509,8 +521,8 @@ impl MoeLayer {
         // for this point; event_b is joined immediately before the shared blend.
         if overlap_shared_reduce {
             self.run_shared_expert_prefill(
-                input,
-                n,
+                shared_in,
+                shared_n,
                 h,
                 shared_inter,
                 self.prefill_stream,
@@ -530,7 +542,9 @@ impl MoeLayer {
             } else {
                 None
             };
-            if ctx.graph_capture {
+            if let Some(sp) = sp {
+                sp.reduce_scatter(output, h as usize, ctx, stream)?;
+            } else if ctx.graph_capture {
                 comm.all_reduce(output.0, num_tokens * h as usize * 2)?;
             } else {
                 comm.all_reduce_async(output.0, num_tokens * h as usize * 2, stream)?;
@@ -552,12 +566,12 @@ impl MoeLayer {
                 ops::moe_batched_blend(
                     ctx.gpu,
                     self.moe_batched_blend,
-                    output,
+                    sp.map_or(output, |sp| sp.local(output, h as usize)),
                     shared_down_out,
-                    input,
+                    shared_in,
                     self.weights.shared_expert_gate.weight,
                     h,
-                    n,
+                    shared_n,
                     stream,
                 )?;
             }

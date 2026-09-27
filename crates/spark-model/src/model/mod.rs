@@ -44,6 +44,7 @@ pub mod glm_independent;
 pub(crate) mod glm_k3_head;
 mod glm_fused_chunk;
 mod glm_long_verify;
+mod glm_prefill_sp;
 mod glm_vocab_split;
 pub(crate) use glm_vocab_split::prepare_shard_mxfp8 as prepare_glm_head_mxfp8;
 pub(crate) mod glm_mtp_prompt_trace;

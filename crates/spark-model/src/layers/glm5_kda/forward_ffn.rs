@@ -18,7 +18,11 @@ impl Glm5KdaLayer {
             phase.capture_verify_intermediates,
         );
         let mut deferred_shared_gate = None;
-        let ffn_out = if capture_verify_intermediates && tokens == 2 {
+        let sp = crate::layers::glm_sp::current()
+            .filter(|sp| !decode && !capture_verify_intermediates && tokens == 2 * sp.rows);
+        let ffn_out = if let Some(sp) = sp {
+            self.ffn.forward_prefill_sp(normed, sp, ctx, stream)?
+        } else if capture_verify_intermediates && tokens == 2 {
             self.ffn.forward_k2(normed, ctx, stream)?;
             ctx.buffers.moe_output()
         } else if capture_verify_intermediates && tokens == 3 {
@@ -63,10 +67,15 @@ impl Glm5KdaLayer {
             hidden,
             normed,
             tokens,
+            decode,
+            capture_verify_intermediates,
             mut profile_timer,
-            ..
         } = phase;
-        let m = tokens as u32;
+        // Sequence-parallel prefill: `ffn_out` and the highway hold this
+        // rank's rows; the contracted rows land at their chunk position.
+        let sp = crate::layers::glm_sp::current()
+            .filter(|sp| !decode && !capture_verify_intermediates && tokens == 2 * sp.rows);
+        let m = sp.map_or(tokens as u32, |sp| sp.rows as u32);
         let h = self.hidden_size as u32;
         profile::step(ctx, stream, &mut profile_timer, "ffn")?;
         if let Some(gate_weight) = deferred_shared_gate {
@@ -151,7 +160,7 @@ impl Glm5KdaLayer {
                 ctx.gpu,
                 self.hc_contract_k,
                 ctx.buffers.hc_streams(),
-                hidden,
+                sp.map_or(hidden, |sp| sp.local(hidden, self.hidden_size)),
                 m,
                 h,
                 self.hc.hc_mult as u32,

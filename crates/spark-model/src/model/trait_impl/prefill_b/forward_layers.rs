@@ -184,6 +184,11 @@ impl TransformerModel {
         let t_loop = host_timing.then(std::time::Instant::now);
         let mut t_in_prefill = std::time::Duration::ZERO;
         let mut t_dflash = std::time::Duration::ZERO;
+        // Sequence-parallel chunk: each rank runs the row-local work over half
+        // the rows (`layers::glm_sp`); the last layer leaves this rank's rows
+        // of the contracted `hidden`, gathered below.
+        let sp = self.glm_prefill_sp_rows(proc_count, passengers.is_some() || use_decode_path || midcap.is_some(), &ctx);
+        let sp_scope = sp.map(crate::layers::glm_sp::enter);
         for (i, layer) in self.layers.iter().enumerate() {
             let t_pf = host_timing.then(std::time::Instant::now);
             let lt0 = if profile_now {
@@ -373,6 +378,10 @@ impl TransformerModel {
                     &vals[..2.min(vals.len())]
                 );
             }
+        }
+        drop(sp_scope);
+        if let Some(sp) = sp {
+            sp.all_gather(hidden, self.config.hidden_size, &ctx, stream)?;
         }
         if let Some(t) = t_loop {
             let wall = t.elapsed();

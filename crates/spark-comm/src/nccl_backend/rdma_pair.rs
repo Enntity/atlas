@@ -236,17 +236,19 @@ impl RdmaPair {
         })
     }
 
-    /// All-reduce `ptr[..bytes]` on `stream`: copy each segment into the send
-    /// slot, then `add(dst, src, len)` the peer's partial into `ptr` as each
-    /// segment lands.
+    /// Exchange on `stream`: copy each segment of `src[..bytes]` into the send
+    /// slot, then `land(dst, recv, len)` the peer's matching segment into
+    /// `dst` as it arrives (an in-place add for an all-reduce with
+    /// `src == dst`, or a copy for an all-gather step).
     /// Returns `false` (nothing enqueued) when the payload exceeds the
     /// capacity or `stream` is capturing — both ranks see the same answer.
     pub(super) fn exchange(
         &self,
-        ptr: u64,
+        src: u64,
+        dst: u64,
         bytes: usize,
         stream: u64,
-        add: impl Fn(u64, u64, usize) -> Result<()>,
+        land: impl Fn(u64, u64, usize) -> Result<()>,
     ) -> Result<bool> {
         if bytes > self.capacity {
             return Ok(false);
@@ -265,7 +267,7 @@ impl RdmaPair {
         let first = self.segs.fetch_add(parts.len() as u64, Ordering::Relaxed);
         for (i, &(off, len)) in parts.iter().enumerate() {
             cu(
-                unsafe { cuMemcpyAsync(send + off as u64, ptr + off as u64, len, stream) },
+                unsafe { cuMemcpyAsync(send + off as u64, src + off as u64, len, stream) },
                 "cuMemcpyAsync(RDMA send slot)",
             )?;
             // Default flags fence prior writes (the copy) before the value lands.
@@ -288,10 +290,22 @@ impl RdmaPair {
                 },
                 "cuStreamWaitValue64(arrived)",
             )?;
-            add(ptr + off as u64, recv + off as u64, len)?;
+            land(dst + off as u64, recv + off as u64, len)?;
         }
         Ok(true)
     }
+}
+
+impl RdmaPair {
+    /// Largest payload in bytes.
+    pub(super) fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+/// Stream-ordered copy (e.g. a landed receive segment into its destination).
+pub(super) fn copy_async(dst: u64, src: u64, bytes: usize, stream: u64) -> Result<()> {
+    cu(unsafe { cuMemcpyAsync(dst, src, bytes, stream) }, "cuMemcpyAsync(RDMA land)")
 }
 
 impl Drop for RdmaPair {

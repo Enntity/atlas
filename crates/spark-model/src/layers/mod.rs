@@ -6,6 +6,7 @@ pub mod dflash_head;
 pub mod ep_dispatch;
 pub mod fp8_calibration;
 mod glm5_kda;
+pub mod glm_sp;
 pub mod glm5_mtp;
 pub mod moe;
 pub mod mtp_head;
@@ -513,6 +514,31 @@ impl FfnComponent {
                 let _ = (input, num_tokens);
                 Ok(())
             }
+        }
+    }
+
+    /// Sequence-parallel prefill FFN over a normed `[2 * sp.rows, H]` input
+    /// (all rows gathered). Returns this rank's `[sp.rows, H]` output rows:
+    /// the MoE runs every row and reduce-scatters (`layers::glm_sp`), the
+    /// replicated dense FFN runs only the local rows.
+    pub fn forward_prefill_sp(
+        &self,
+        normed: DevicePtr,
+        sp: glm_sp::SpRows,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let h = ctx.config.hidden_size;
+        match self {
+            Self::Moe(m) => {
+                m.forward_prefill(normed, 2 * sp.rows, ctx, stream)?;
+                Ok(sp.local(ctx.buffers.moe_output(), h))
+            }
+            Self::Dense(d) => {
+                d.forward_prefill(sp.local(normed, h), sp.rows, ctx, stream)?;
+                Ok(ctx.buffers.moe_output())
+            }
+            Self::None => anyhow::bail!("SP prefill FFN on a layer without an FFN"),
         }
     }
 

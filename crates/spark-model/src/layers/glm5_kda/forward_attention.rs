@@ -62,32 +62,41 @@ impl Glm5KdaLayer {
         let p = self.heads * self.dim;
         let bf16 = 2usize;
         let mut profile_timer = profile::start(ctx, stream)?;
+        // Sequence-parallel prefill: the highway and `hidden` hold this rank's
+        // rows compacted at row 0 (`layers::glm_sp`); `m_hc` is their count.
+        let sp = crate::layers::glm_sp::current()
+            .filter(|sp| !decode && !capture_verify_intermediates && tokens == 2 * sp.rows);
+        let m_hc = sp.map_or(m, |sp| sp.rows as u32);
+        let local = |x: DevicePtr| sp.map_or(x, |sp| sp.local(x, self.hidden_size));
 
         if self.layer_idx == 0 {
             ops::hc_expand(
                 ctx.gpu,
                 self.hc_expand_k,
-                hidden,
+                local(hidden),
                 ctx.buffers.hc_streams(),
-                m,
+                m_hc,
                 h,
                 self.hc.hc_mult as u32,
                 stream,
             )?;
         }
-        self.hc_pre(&self.hc.attn, hidden, m, ctx, stream)?;
+        self.hc_pre(&self.hc.attn, hidden, m_hc, ctx, stream)?;
         let normed = ctx.buffers.norm_output();
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_k,
             hidden,
             &self.input_norm,
-            normed,
-            m,
+            local(normed),
+            m_hc,
             h,
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
+        if let Some(sp) = sp {
+            sp.all_gather(normed, self.hidden_size, ctx, stream)?;
+        }
         profile::step(ctx, stream, &mut profile_timer, "hc_attn_norm")?;
 
         let projected = ctx.buffers.qkv_output();
@@ -434,6 +443,8 @@ impl Glm5KdaLayer {
                 tokens * self.hidden_size * 2,
                 stream,
             )?;
+        } else if let Some(sp) = sp {
+            sp.reduce_scatter(normed, self.hidden_size, ctx, stream)?;
         } else if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {
@@ -459,9 +470,9 @@ impl Glm5KdaLayer {
         } else {
             seam = crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
                 &self.hc.ffn,
-                Some(normed),
+                Some(local(normed)),
                 hidden,
-                m,
+                m_hc,
                 self.hc.hc_mult as u32,
                 self.hc.sinkhorn_iters as u32,
                 self.hc.hc_eps,
@@ -469,25 +480,28 @@ impl Glm5KdaLayer {
                 stream,
             )?;
             if !seam {
-                self.hc_post(normed, m, ctx, stream)?;
+                self.hc_post(local(normed), m_hc, ctx, stream)?;
             }
         }
         profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
 
         if !seam {
-            self.hc_pre(&self.hc.ffn, hidden, m, ctx, stream)?;
+            self.hc_pre(&self.hc.ffn, hidden, m_hc, ctx, stream)?;
         }
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_k,
             hidden,
             &self.post_attn_norm,
-            normed,
-            m,
+            local(normed),
+            m_hc,
             h,
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
+        if let Some(sp) = sp {
+            sp.all_gather(normed, self.hidden_size, ctx, stream)?;
+        }
         profile::step(ctx, stream, &mut profile_timer, "hc_ffn_norm")?;
         Ok(FfnPhase {
             hidden,
