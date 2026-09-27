@@ -788,6 +788,12 @@ pub(crate) fn load_model_selected(
     // Phase 6.3 — HSS config built early so the EP worker can install it.
     let early_high_speed_swap_cfg = serve_phases::build_high_speed_swap_config(&args)?;
 
+    // Build EOS token list from generation_config.json (authoritative) or config.json fallback.
+    // Loaded before the worker split: every rank's verify head bans these below a
+    // request's min_tokens floor.
+    let mut eos_tokens = serve_phases::load_eos_tokens(&model_dir, &config);
+    spark_model::traits::EosBan::install_model_end_tokens(&eos_tokens);
+
     // EP worker: rank > 0 enters command loop, returns when head exits.
     let model = match model {
         #[cfg(target_os = "linux")]
@@ -806,9 +812,6 @@ pub(crate) fn load_model_selected(
             ServingModel::Ordinary(model_opt.expect("head retains model on rank 0"))
         }
     };
-
-    // Build EOS token list from generation_config.json (authoritative) or config.json fallback
-    let mut eos_tokens = serve_phases::load_eos_tokens(&model_dir, &config);
 
     // Read default sampling parameters from generation_config.json.
     let serve_phases::SamplingDefaults {

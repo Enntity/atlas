@@ -42,18 +42,28 @@ impl TransformerModel {
         let Some(comm) = self.comm.as_ref() else {
             return Ok(false);
         };
-        if !enabled()
-            || self.config.model_type != "glm5_next"
-            || comm.world_size() != 2
-            || !comm.supports_peer_exchange_async()
-            || self.lm_head_fp8.is_some()
-            || self.lm_head_nvfp4.is_some()
-            || self.overlays.is_some()
-            || self.logit_softcap_kernel.0 != 0
-            || self.dense_gemv_batchm_kernel.0 == 0
-            || rows == 0
-            || rows * 16 > PAIRS_BYTES
-        {
+        let decline = [
+            (!enabled(), "disabled"),
+            (self.config.model_type != "glm5_next", "model"),
+            (comm.world_size() != 2, "world"),
+            (!comm.supports_peer_exchange_async(), "peer_exchange"),
+            (self.lm_head_fp8.is_some(), "lm_head_fp8"),
+            (self.lm_head_nvfp4.is_some(), "lm_head_nvfp4"),
+            (self.overlays.is_some(), "overlays"),
+            (self.logit_softcap_kernel.0 != 0, "softcap"),
+            (self.dense_gemv_batchm_kernel.0 == 0, "batchm_kernel"),
+            (rows == 0 || rows * 16 > PAIRS_BYTES, "rows"),
+        ]
+        .into_iter()
+        .find_map(|(hit, why)| hit.then_some(why));
+        if let Some(why) = decline {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::warn!(
+                    "GLM vocab-split verify head declined ({why}, rows={rows}); \
+                     min_tokens end-token ban inactive"
+                )
+            });
             return Ok(false);
         }
         static KERNELS: OnceLock<(KernelHandle, KernelHandle)> = OnceLock::new();
@@ -149,7 +159,7 @@ impl TransformerModel {
             .arg_ptr(local)
             .arg_u32(shard as u32)
             .arg_u32(vocab as u32);
-        for id in ban.ids {
+        for id in ban.head_ids() {
             launch = launch.arg_u32(local_id(id));
         }
         launch.launch(stream)?;

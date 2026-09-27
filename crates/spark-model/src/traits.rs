@@ -283,6 +283,8 @@ pub struct EosBan {
     pub ids: [u32; 4],
 }
 
+static MODEL_END_TOKENS: std::sync::OnceLock<[u32; 4]> = std::sync::OnceLock::new();
+
 impl Default for EosBan {
     fn default() -> Self {
         Self { floor: 0, ids: [u32::MAX; 4] }
@@ -296,6 +298,20 @@ impl EosBan {
             *slot = id;
         }
         Self { floor: if min_tokens == 0 { 0 } else { prompt_len + min_tokens }, ids }
+    }
+
+    /// Install the model's end tokens on every rank. A TP2 vocabulary-split
+    /// head bans them in each rank's half, and only the head rank carries the
+    /// per-request `EosBan`: without this the worker's half (which holds GLM's
+    /// `<|user|>`) returns its end token as the "unbanned" pick.
+    pub fn install_model_end_tokens(eos_tokens: &[u32]) {
+        let _ = MODEL_END_TOKENS.set(Self::new(0, 0, eos_tokens).ids);
+    }
+
+    /// End ids a split verify head excludes from its unbanned pick: the
+    /// installed model end tokens, else this sequence's own.
+    pub fn head_ids(&self) -> [u32; 4] {
+        MODEL_END_TOKENS.get().copied().unwrap_or(self.ids)
     }
 
     /// Bit `j` is set when verify row `j` of a pass whose first input sits at
@@ -445,5 +461,13 @@ mod eos_ban_tests {
         assert_eq!(ban.row_mask(0, 64), u64::MAX); // all 64 rows below 110
         assert_eq!(EosBan::new(100, 0, &[7]).row_mask(0, 8), 0);
         assert_eq!(EosBan::default().row_mask(0, 8), 0);
+    }
+
+    #[test]
+    fn split_head_bans_model_end_tokens_on_every_rank() {
+        // A worker rank's sequence carries the default ban (no ids), yet GLM's
+        // <|user|> lives in its vocabulary half.
+        EosBan::install_model_end_tokens(&[154820, 154827, 154829]);
+        assert_eq!(EosBan::default().head_ids(), [154820, 154827, 154829, u32::MAX]);
     }
 }
