@@ -23,6 +23,7 @@ pub(super) fn try_project(
     scratch_bytes: usize,
     arena_rows: usize,
     enabled: bool,
+    cast: bool,
     stream: u64,
 ) -> Result<bool> {
     run(
@@ -40,6 +41,7 @@ pub(super) fn try_project(
         scratch_bytes,
         arena_rows,
         enabled,
+        cast,
         stream,
         |a, w, o, m, n, k, s| {
             spark_runtime::cublaslt::fp8_gemm_act_weight_t_tensorwise(a, w, o, m, n, k, s)
@@ -63,6 +65,7 @@ fn run(
     scratch_bytes: usize,
     arena_rows: usize,
     enabled: bool,
+    cast: bool,
     stream: u64,
     lt: impl FnOnce(u64, u64, u64, u32, u32, u32, u64) -> Result<()>,
 ) -> Result<bool> {
@@ -92,15 +95,26 @@ fn run(
     )
     .map_err(anyhow::Error::msg)?;
     let cache = gpu.op_cache();
-    let cast = cache.kernel(gpu, "w4a16", "bf16_to_fp8")?;
+    let cast_k = cache.kernel(gpu, "w4a16", "bf16_to_fp8")?;
     let dequant = cache.kernel(gpu, "w4a16", "predequant_nvfp4_to_fp8")?;
     ensure!(
-        cast.0 != 0 && dequant.0 != 0,
+        cast_k.0 != 0 && dequant.0 != 0,
         "KDA Lt conversion kernel missing"
     );
     // expert_gate_out is dead during Q/K/V and after the recurrence before O.
     // The recurrence and FFN reuse it only later on this same caller stream.
-    ops::bf16_to_fp8(gpu, cast, input, DevicePtr(plan.activation), m * k, stream)?;
+    // The activation slot depends only on the scratch and `m`, so a caller
+    // projecting the same input again may skip the cast (`cast == false`).
+    if cast {
+        ops::bf16_to_fp8(
+            gpu,
+            cast_k,
+            input,
+            DevicePtr(plan.activation),
+            m * k,
+            stream,
+        )?;
+    }
     ops::predequant_nvfp4_to_fp8(
         gpu,
         dequant,
@@ -147,6 +161,7 @@ mod tests {
                     DevicePtr(0x1000_0000),
                     64 << 20,
                     4100,
+                    true,
                     true,
                     77,
                     |a, w, o, got_m, n, k, s| {
@@ -195,6 +210,7 @@ mod tests {
                     0,
                     0,
                     enabled,
+                    true,
                     77,
                     |_, _, _, _, _, _, _| panic!("unexpected Lt")
                 )
@@ -207,7 +223,7 @@ mod tests {
     #[test]
     fn kda_lt_fp8_bounds_fail_before_casts_and_lt_error_propagates() {
         let gpu = MockGpuBackend::new();
-        let call = |capacity, lt| {
+        let call = |capacity, cast, lt: fn(u64, u64, u64, u32, u32, u32, u64) -> Result<()>| {
             run(
                 &gpu,
                 DevicePtr(0x2000_0000),
@@ -223,6 +239,7 @@ mod tests {
                 capacity,
                 4100,
                 true,
+                cast,
                 77,
                 lt,
             )
@@ -230,9 +247,16 @@ mod tests {
         fn fail(_: u64, _: u64, _: u64, _: u32, _: u32, _: u32, _: u64) -> Result<()> {
             anyhow::bail!("Lt injected failure")
         }
-        assert!(call(1, fail).is_err());
+        fn ok(_: u64, _: u64, _: u64, _: u32, _: u32, _: u32, _: u64) -> Result<()> {
+            Ok(())
+        }
+        assert!(call(1, true, fail).is_err());
         assert_eq!(gpu.launch_count(), 0);
-        assert!(call(64 << 20, fail).is_err());
+        assert!(call(64 << 20, true, fail).is_err());
         assert_eq!(gpu.launch_count(), 2);
+        // A projection reusing the previous cast of the same input launches
+        // only the weight conversion.
+        assert!(call(64 << 20, false, ok).unwrap());
+        assert_eq!(gpu.launch_count(), 3);
     }
 }

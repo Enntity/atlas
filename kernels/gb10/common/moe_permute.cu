@@ -291,9 +291,11 @@ extern "C" __global__ void moe_sort_by_expert(
 //   worklist[w*2 + 1] = (m_tile << 6) | n_tile      (n_tile < 64, 6 bits)
 //   total_tiles[0]    = number of emitted work-items
 //
-// Single block, thread-0 serial loop — mirrors moe_sort_by_expert Phase-2's
-// serial prefix-sum so the same expert-ordering invariant holds. Experts with
-// no tokens (M_e <= 0) OR a NULL weight pointer (remote expert under EP) are
+// One block: each thread counts one expert's items, a block scan (in chunks
+// of blockDim.x experts, expert order) places them, and the thread writes its
+// expert's items — the same list, in the same expert/m/n order, as a serial
+// walk (which cost ~45 us of dependent loads at 288 experts). Experts with no
+// tokens (M_e <= 0) OR a NULL weight pointer (remote expert under EP) are
 // skipped, exactly like the grouped-GEMM per-tile `if (M_expert <= 0)` /
 // `if (B_exp == 0) continue;` guards — so the emitted work-list is the set of
 // tiles the dense grid would NOT have early-exited on.
@@ -312,15 +314,28 @@ extern "C" __global__ void moe_build_tile_worklist(
     unsigned int n_tiles,                                    // ceil(N / PM4_N_TILE)
     unsigned int m_tile                                      // PM4_M_TILE (=128)
 ) {
-    if (threadIdx.x != 0) return;
-
-    unsigned int w = 0;
-    for (unsigned int e = 0; e < num_experts; e++) {
-        int m_start = expert_offsets[e];
-        int M_e = expert_offsets[e + 1] - m_start;
-        if (M_e <= 0 || B_weight_ptrs[e] == 0) continue;   // mirror grouped-GEMM early-exit guards
-
-        unsigned int mt_e = ((unsigned int)M_e + m_tile - 1) / m_tile;
+    __shared__ unsigned int s_scan[1024];
+    __shared__ unsigned int s_base;
+    const unsigned int tid = threadIdx.x;
+    if (tid == 0) s_base = 0;
+    for (unsigned int e0 = 0; e0 < num_experts; e0 += blockDim.x) {
+        const unsigned int e = e0 + tid;
+        unsigned int mt_e = 0;
+        if (e < num_experts) {
+            const int M_e = expert_offsets[e + 1] - expert_offsets[e];
+            if (M_e > 0 && B_weight_ptrs[e] != 0)   // mirror grouped-GEMM early-exit guards
+                mt_e = ((unsigned int)M_e + m_tile - 1) / m_tile;
+        }
+        const unsigned int items = mt_e * n_tiles;
+        s_scan[tid] = items;
+        __syncthreads();
+        for (unsigned int d = 1; d < blockDim.x; d <<= 1) {
+            const unsigned int add = tid >= d ? s_scan[tid - d] : 0;
+            __syncthreads();
+            s_scan[tid] += add;
+            __syncthreads();
+        }
+        unsigned int w = s_base + s_scan[tid] - items;
         for (unsigned int mt = 0; mt < mt_e; mt++) {
             for (unsigned int nt = 0; nt < n_tiles; nt++) {
                 // R2: packing overflow guard. n_tile must fit in 6 bits and
@@ -331,6 +346,9 @@ extern "C" __global__ void moe_build_tile_worklist(
                 w++;
             }
         }
+        __syncthreads();
+        if (tid == blockDim.x - 1) s_base += s_scan[tid];
+        __syncthreads();
     }
-    total_tiles[0] = (int)w;
+    if (tid == 0) total_tiles[0] = (int)s_base;
 }

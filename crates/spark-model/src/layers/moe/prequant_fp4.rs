@@ -52,6 +52,16 @@ pub(super) fn glm_grouped_shape(config: &atlas_core::config::ModelConfig) -> boo
         && config.scoring_func == "sigmoid"
 }
 
+/// Row-tile grid of the K128W kernel over `rows` sorted rows: the device
+/// prefix of the local experts' M64 tiles and a host upper bound on their
+/// count.
+#[derive(Clone, Copy)]
+pub(super) struct MtileGrid {
+    pub prefix: DevicePtr,
+    pub bound: u32,
+    pub rows: u32,
+}
+
 pub(super) fn compact_gate_up_worklist_bytes(rows: u32, top_k: u32, inter: u32) -> usize {
     16 + rows as usize * top_k as usize * inter.div_ceil(128) as usize * 8
 }
@@ -245,6 +255,10 @@ impl MoeLayer {
         Ok(())
     }
 
+    /// Prequantized native-FP4 gate and up projections of the sorted rows.
+    /// Returns true when the K128W launch also applied `silu_mul_quant_nvfp4`
+    /// (its NVFP4 bytes in `expert_up_out`, as `fused_silu_prequant_fp4_down`
+    /// leaves them), which then must not run.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prequant_fp4_gate_up(
         &self,
@@ -261,10 +275,11 @@ impl MoeLayer {
         num_experts: u32,
         max_m_tiles: u32,
         compact: Option<CompactMoeWorklist>,
+        wide: Option<MtileGrid>,
         mode: super::forward_pair_verify::PrefillMode,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // expert_down_out is not consumed until after gate/up and has ample
         // capacity for packed token-major A followed by its group scales.
         let a_packed = ctx.buffers.expert_down_out();
@@ -301,7 +316,7 @@ impl MoeLayer {
                 self.moe_w4a4_prequant_t_k64_compact_gate_up
             };
             if fused_kernel.0 != 0 {
-                return self.m16_gate_up.run(
+                self.m16_gate_up.run(
                     super::gate_up_m16::GateUpCall {
                         rows: n,
                         n: inter,
@@ -344,8 +359,37 @@ impl MoeLayer {
                             stream,
                         )
                     },
-                );
+                )?;
+                return Ok(false);
             }
+        }
+        if let Some(grid) = wide
+            && self.moe_w4a4_prequant_gate_up_silu.0 != 0
+            && self.nvfp4_fused_silu_quant
+            && self.silu_mul_quant_nvfp4_k.0 != 0
+            && self.lora.is_none()
+            && inter % 128 == 0
+            && h % 128 == 0
+        {
+            ops::moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w(
+                ctx.gpu,
+                self.moe_w4a4_prequant_gate_up_silu,
+                a_packed,
+                a_scale,
+                [gate.packed_ptrs, gate.scale_ptrs, gate.scale2_vals],
+                [up.packed_ptrs, up.scale_ptrs, up.scale2_vals],
+                expert_up_out,
+                expert_up_out.offset(grid.rows as usize * inter as usize / 2),
+                expert_offsets,
+                sorted_token_ids,
+                num_experts,
+                inter,
+                h,
+                grid.prefix,
+                grid.bound,
+                stream,
+            )?;
+            return Ok(true);
         }
         for (weight, output) in [(gate, expert_gate_out), (up, expert_up_out)] {
             if let Some(work) = compact {
@@ -376,38 +420,131 @@ impl MoeLayer {
                     stream,
                 )?;
             } else {
-                let (kernel, threads) = self.prequant_grouped_kernel(grouped_kernel, inter, h);
-                ops::moe_w4a4_grouped_gemm_prequant_n128(
-                    ctx.gpu,
-                    kernel,
-                    a_packed,
-                    a_scale,
-                    weight.packed_ptrs,
-                    weight.scale_ptrs,
-                    weight.scale2_vals,
+                self.prequant_grouped(
+                    grouped_kernel,
+                    [a_packed, a_scale],
+                    weight,
                     output,
                     expert_offsets,
                     sorted_token_ids,
                     num_experts,
-                    inter,
-                    h,
+                    [inter, h],
                     max_m_tiles,
-                    threads,
+                    wide,
+                    ctx,
                     stream,
                 )?;
             }
         }
-        Ok(())
+        Ok(false)
     }
 
-    /// The K128 prequant kernel (256 threads) when enabled and the shape is
-    /// K128/N128-aligned, else `fallback` (128 threads).
-    fn prequant_grouped_kernel(&self, fallback: KernelHandle, n: u32, k: u32) -> (KernelHandle, u32) {
-        if self.moe_w4a4_prequant_t_k128.0 != 0 && n % 128 == 0 && k % 128 == 0 {
-            (self.moe_w4a4_prequant_t_k128, 256)
-        } else {
-            (fallback, 128)
+    /// The local experts' row-tile grid for the K128W kernel over
+    /// `total_expanded` sorted rows, when it is loaded. The prefix lives in the
+    /// router FP32 workspace, which GLM's correction-bias router leaves dead
+    /// through the routed FFN.
+    pub(super) fn mtile_grid(
+        &self,
+        expert_offsets: DevicePtr,
+        local_ptrs: DevicePtr,
+        total_expanded: u32,
+        num_experts: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Option<MtileGrid>> {
+        if self.moe_w4a4_prequant_t_k128w.0 == 0 || self.moe_mtile_prefix_k.0 == 0 {
+            return Ok(None);
         }
+        anyhow::ensure!(
+            num_experts <= 1024
+                && ctx.buffers.sizes().moe_router_in_f32 >= (num_experts as usize + 1) * 4,
+            "K128W row-tile prefix exceeds router scratch"
+        );
+        let prefix = ctx.buffers.moe_router_in_f32();
+        ops::moe_mtile_prefix(
+            ctx.gpu,
+            self.moe_mtile_prefix_k,
+            expert_offsets,
+            local_ptrs,
+            prefix,
+            num_experts,
+            stream,
+        )?;
+        // Every sorted row in M64 tiles plus one partial tile per expert.
+        Ok(Some(MtileGrid {
+            prefix,
+            bound: total_expanded.div_ceil(64) + num_experts,
+            rows: total_expanded,
+        }))
+    }
+
+    /// One prequant grouped projection `[rows, k] x [k, n]`: the K128W kernel
+    /// over `wide` when it fits, else the K128 kernel (256 threads) when
+    /// enabled and K128/N128-aligned, else `fallback` (128 threads) over the
+    /// dense `(n/128, max_m_tiles, experts)` grid. All three agree bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    fn prequant_grouped(
+        &self,
+        fallback: KernelHandle,
+        [a_packed, a_scale]: [DevicePtr; 2],
+        weight: &ExpertPtrTable,
+        output: DevicePtr,
+        expert_offsets: DevicePtr,
+        sorted_token_ids: DevicePtr,
+        num_experts: u32,
+        [n, k]: [u32; 2],
+        max_m_tiles: u32,
+        wide: Option<MtileGrid>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if let Some(grid) = wide
+            && n % 256 == 0
+            && k % 128 == 0
+        {
+            return ops::moe_w4a4_grouped_gemm_prequant_k128w(
+                ctx.gpu,
+                self.moe_w4a4_prequant_t_k128w,
+                a_packed,
+                a_scale,
+                weight.packed_ptrs,
+                weight.scale_ptrs,
+                weight.scale2_vals,
+                output,
+                expert_offsets,
+                sorted_token_ids,
+                num_experts,
+                n,
+                k,
+                grid.prefix,
+                grid.bound,
+                stream,
+            );
+        }
+        let (kernel, threads) =
+            if self.moe_w4a4_prequant_t_k128.0 != 0 && n % 128 == 0 && k % 128 == 0 {
+                (self.moe_w4a4_prequant_t_k128, 256)
+            } else {
+                (fallback, 128)
+            };
+        ops::moe_w4a4_grouped_gemm_prequant_n128(
+            ctx.gpu,
+            kernel,
+            a_packed,
+            a_scale,
+            weight.packed_ptrs,
+            weight.scale_ptrs,
+            weight.scale2_vals,
+            output,
+            expert_offsets,
+            sorted_token_ids,
+            num_experts,
+            n,
+            k,
+            max_m_tiles,
+            threads,
+            stream,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -422,6 +559,7 @@ impl MoeLayer {
         inter: u32,
         num_experts: u32,
         max_m_tiles: u32,
+        wide: Option<MtileGrid>,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -435,23 +573,18 @@ impl MoeLayer {
         } else {
             self.moe_w4a4_prequant_t_k64
         };
-        let (kernel, threads) = self.prequant_grouped_kernel(grouped_kernel, h, inter);
-        ops::moe_w4a4_grouped_gemm_prequant_n128(
-            ctx.gpu,
-            kernel,
-            a_packed,
-            a_scale,
-            down.packed_ptrs,
-            down.scale_ptrs,
-            down.scale2_vals,
+        self.prequant_grouped(
+            grouped_kernel,
+            [a_packed, a_scale],
+            down,
             expert_down_out,
             expert_offsets,
             DevicePtr(0),
             num_experts,
-            h,
-            inter,
+            [h, inter],
             max_m_tiles,
-            threads,
+            wide,
+            ctx,
             stream,
         )
     }

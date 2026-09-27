@@ -178,6 +178,10 @@ impl MoeLayer {
         // Host expert_offsets from the CUTLASS gate_up, reused by down to skip
         // a second D2H + host-blocking synchronize.
         let mut cutlass_eoff: Option<Vec<i32>> = None;
+        // The K128W row-tile grid, built with gate/up and reused by down, and
+        // whether gate/up already applied the SiLU·mul NVFP4 quantization.
+        let mut wide = None;
+        let mut silu_done = false;
         if max_m_tiles > 0 {
             // CUTLASS grouped NVFP4 gate_up reads the ORIGINAL [N,K/2] tables
             // (CUTLASS B is ColumnMajor = K-contiguous), NOT the Atlas
@@ -306,7 +310,17 @@ impl MoeLayer {
                     } else {
                         None
                     };
-                    self.prequant_fp4_gate_up(
+                    if compact.is_none() {
+                        wide = self.mtile_grid(
+                            expert_offsets,
+                            gp.packed_ptrs,
+                            total_expanded,
+                            num_experts,
+                            ctx,
+                            stream,
+                        )?;
+                    }
+                    silu_done = self.prequant_fp4_gate_up(
                         expert_input,
                         gp,
                         up,
@@ -320,6 +334,7 @@ impl MoeLayer {
                         num_experts,
                         max_m_tiles,
                         compact,
+                        wide,
                         mode,
                         ctx,
                         stream,
@@ -501,7 +516,10 @@ impl MoeLayer {
                 && self.nvfp4_fused_silu_quant
                 && self.silu_mul_quant_nvfp4_k.0 != 0
                 && !cutlass_down;
-            if fused_nvfp4_down {
+            debug_assert!(!silu_done || fused_nvfp4_down);
+            if silu_done {
+                // Applied in the gate/up epilogue.
+            } else if fused_nvfp4_down {
                 self.fused_silu_prequant_fp4_down(
                     expert_gate_out,
                     expert_up_out,
@@ -602,6 +620,7 @@ impl MoeLayer {
                         inter,
                         num_experts,
                         max_m_tiles,
+                        wide,
                         ctx,
                         stream,
                     )?;

@@ -72,6 +72,9 @@ impl MoeLayer {
             weights.correction_bias.map(|dw| dw.weight);
 
         let _ = num_experts;
+        let k128w = config.model_type == "glm5_next"
+            && std::env::var("ATLAS_MOE_PREQUANT_K128").as_deref() == Ok("1")
+            && std::env::var("ATLAS_MOE_PREQUANT_K128W").as_deref() != Ok("0");
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
         let mut layer = Self {
             weights,
@@ -186,6 +189,31 @@ impl MoeLayer {
                 == Ok("1")
             {
                 super::super::try_kernel(gpu, "moe_w4a16", "moe_w4a4_grouped_gemm_prequant_t_k128")
+            } else {
+                KernelHandle(0)
+            },
+            moe_w4a4_prequant_t_k128w: if k128w {
+                super::super::try_kernel(
+                    gpu,
+                    "moe_w4a16",
+                    "moe_w4a4_grouped_gemm_prequant_t_k128w_compact",
+                )
+            } else {
+                KernelHandle(0)
+            },
+            moe_w4a4_prequant_gate_up_silu: if k128w
+                && std::env::var("ATLAS_MOE_GATE_UP_SILU").as_deref() != Ok("0")
+            {
+                super::super::try_kernel(
+                    gpu,
+                    "moe_w4a16",
+                    "moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w",
+                )
+            } else {
+                KernelHandle(0)
+            },
+            moe_mtile_prefix_k: if k128w {
+                super::super::try_kernel(gpu, "moe_w4a16", "moe_mtile_prefix")
             } else {
                 KernelHandle(0)
             },

@@ -97,6 +97,14 @@ name = "gdn_cdh_vblock_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "moe_fp4_prefill_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm_hc_seam_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "w4a16_lmhead_716_repro"
 required-features = ["cuda", "gpu-examples"]
 

@@ -342,6 +342,16 @@ pub struct MoeLayer {
     /// Same prequant FP4 grouped GEMM with K128 stages and ldmatrix-fed MMAs
     /// (bitwise-identical outputs); `ATLAS_MOE_PREQUANT_K128=1`, else null.
     moe_w4a4_prequant_t_k128: KernelHandle,
+    /// 64x256-tile twin of `moe_w4a4_prequant_t_k128` launched over only the
+    /// local experts' row tiles (`moe_mtile_prefix_k`), bitwise-identical
+    /// outputs; null unless the K128 kernel is on and GLM
+    /// (`ATLAS_MOE_PREQUANT_K128W=0` disables).
+    moe_w4a4_prequant_t_k128w: KernelHandle,
+    moe_mtile_prefix_k: KernelHandle,
+    /// K128W gate and up in one launch with `silu_mul_quant_nvfp4` applied in
+    /// its epilogue (same bytes); loaded with `moe_w4a4_prequant_t_k128w`
+    /// unless `ATLAS_MOE_GATE_UP_SILU=0`.
+    moe_w4a4_prequant_gate_up_silu: KernelHandle,
     /// Compact-worklist twins of the prequantized native-FP4 MoE kernel.
     /// Optional and used only for guarded K=5 gate/up verification.
     moe_w4a4_prequant_t_k64_compact: KernelHandle,

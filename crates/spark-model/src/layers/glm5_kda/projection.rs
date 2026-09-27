@@ -257,6 +257,27 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.project_hot_cast(input, weight, output, m, n, k, decode, true, ctx, stream)
+            .map(|_| ())
+    }
+
+    /// `project_hot`, returning whether it took the Lt FP8 route. `cast` false
+    /// reuses the E4M3 input the previous Lt FP8 projection of this same
+    /// `input` and `m` left in the scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn project_hot_cast(
+        &self,
+        input: DevicePtr,
+        weight: &Glm5Projection,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        decode: bool,
+        cast: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
         if !decode
             && m >= 2048
             && fp8::try_project(
@@ -273,12 +294,13 @@ impl Glm5KdaLayer {
                 ctx.buffers.sizes().expert_gate_out,
                 ctx.buffers.max_batch_tokens(),
                 std::env::var("ATLAS_GLM_KDA_PREFILL_LT_FP8").as_deref() == Ok("1"),
+                cast,
                 stream,
             )?
         {
-            return Ok(());
+            return Ok(true);
         }
-        match ProjectionPath::for_forward(decode, weight.prefill_nvfp4_t.is_some(), m) {
+        let () = match ProjectionPath::for_forward(decode, weight.prefill_nvfp4_t.is_some(), m) {
             ProjectionPath::DecodeGemv => ops::w4a16_decode_gemv(
                 ctx.gpu,
                 self.w4a16_gemv_k,
@@ -313,7 +335,8 @@ impl Glm5KdaLayer {
                 k,
                 stream,
             ),
-        }
+        }?;
+        Ok(false)
     }
 
     #[allow(clippy::too_many_arguments)]
