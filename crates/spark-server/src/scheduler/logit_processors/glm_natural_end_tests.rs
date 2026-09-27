@@ -108,7 +108,13 @@ fn glm_natural_end_actual_model_policy_has_no_minimum_reasoning_bias() {
         policy.tool_call_parser, "poolside_v1",
         "actual GLM metadata read"
     );
-    assert!(policy.enable_loop_watchdog && policy.enable_think_loop_watchdog);
+    // Content and stream loop guards off (they cut legitimate counting and
+    // code); the thinking-loop watchdog stays armed.
+    assert!(
+        !policy.enable_loop_watchdog
+            && !policy.enable_stream_loop_guards
+            && policy.enable_think_loop_watchdog
+    );
     // Disable only the mid-word input to isolate A4. No global atomic writes.
     assert_eq!(
         pick(true, false, policy.min_reasoning_floor_tokens, false),

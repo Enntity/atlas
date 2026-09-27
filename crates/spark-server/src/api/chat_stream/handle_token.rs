@@ -639,9 +639,13 @@ fn process_detector_content(
     let sanitized = sanitized_or_raw;
 
     // F4 SimHash guard.
-    let watchdog_floor_reached =
-        crate::api::stream_guards::watchdog_floor_reached(state.generated_tokens, ctx.min_tokens);
-    let semantic_trip = if watchdog_floor_reached && !state.loop_watchdog_triggered {
+    // The model's `enable_stream_loop_guards`, past the min_tokens floor.
+    let guards_armed = ctx.state.chat.stream_loop_guards
+        && crate::api::stream_guards::watchdog_floor_reached(
+            state.generated_tokens,
+            ctx.min_tokens,
+        );
+    let semantic_trip = if guards_armed && !state.loop_watchdog_triggered {
         state.simhash_pending.push_str(sanitized);
         let mut dup = false;
         if crate::loop_simhash::ends_at_sentence_boundary(&state.simhash_pending).is_some()
@@ -659,7 +663,7 @@ fn process_detector_content(
         false
     };
 
-    let token_trip = watchdog_floor_reached
+    let token_trip = guards_armed
         && check_loop_watchdog(
             sanitized,
             &mut state.loop_scan_buf,

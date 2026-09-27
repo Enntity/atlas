@@ -155,6 +155,12 @@ fn run(first_chunk: bool) {
             &sched,
             &mut completed,
             &mut mixed,
+            4,
+            &super::SpecStep {
+                num_drafts: 0,
+                dflash_verify_raw_argmax: false,
+            },
+            &mut vec![],
         );
         assert_eq!(p.chunk_offset, 8);
         assert!(completed.is_empty() && !mixed);

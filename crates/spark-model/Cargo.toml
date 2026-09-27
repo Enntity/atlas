@@ -113,6 +113,10 @@ name = "kda_verify_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "concurrency_probe"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "w4a16_lmhead_716_repro"
 required-features = ["cuda", "gpu-examples"]
 

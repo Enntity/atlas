@@ -39,7 +39,12 @@ thinking_in_tools = false
 # Preserve native brief reasoning instead of imposing the generic A4 bias.
 min_reasoning_floor_tokens = 0
 tool_call_parser = "poolside_v1"
-enable_loop_watchdog = true
+# Both loop guards off: they end legitimate repetitive output (counting
+# "1, 2, 3, ..." trips the digit-normalized period-2 detector at 48 tokens;
+# code with similar lines trips the stream's SimHash sentence guard), and
+# GLM-5.3 has no observed degenerate-loop mode needing them. vLLM has neither.
+enable_loop_watchdog = false
+enable_stream_loop_guards = false
 default_num_drafts = 0
 default_kv_dtype = "bf16"
 

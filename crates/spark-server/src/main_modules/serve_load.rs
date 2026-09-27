@@ -1294,6 +1294,7 @@ pub(crate) fn load_model_selected(
         chat: crate::api::chat::levers::ChatLevers::resolve(
             ptx_set.behavior.tscg,
             ptx_set.behavior.disable_cwd_hint_injection,
+            ptx_set.behavior.enable_stream_loop_guards,
         ),
         vision_config: config.vision.clone(),
         vision_max_pixels,

@@ -45,6 +45,10 @@ pub struct ChatLevers {
     /// family whose native tool syntax plausibly appears in legitimate
     /// reasoning.
     pub in_think_leak_openers: u32,
+    /// MODEL.toml `[behavior] enable_stream_loop_guards` (default true) —
+    /// arm the stream's SimHash sentence-repeat and token-loop guards,
+    /// which end the response on a detected loop.
+    pub stream_loop_guards: bool,
 }
 
 impl Default for ChatLevers {
@@ -67,11 +71,13 @@ impl ChatLevers {
         disable_cwd_hint_injection: false,
         // 1 = cancel on the first opener, the pre-knob behaviour.
         in_think_leak_openers: 1,
+        // Armed, the historical behaviour.
+        stream_loop_guards: true,
     };
 
     /// Resolve from the environment plus this model's `[behavior]` table.
     /// Called once, when the server's `AppState` is built.
-    pub fn resolve(tscg: bool, disable_cwd_hint_injection: bool) -> Self {
+    pub fn resolve(tscg: bool, disable_cwd_hint_injection: bool, stream_loop_guards: bool) -> Self {
         Self {
             prompt: PromptLevers::new(tscg),
             bash_wander: std::env::var("ATLAS_BASH_WANDER_WATCHDOG").as_deref() == Ok("1"),
@@ -82,6 +88,7 @@ impl ChatLevers {
                     .ok()
                     .as_deref(),
             ),
+            stream_loop_guards,
         }
     }
 }
@@ -129,8 +136,10 @@ mod tests {
         // `resolve` reads the env for the two diagnostics but takes `tscg`
         // from the caller, because it is MODEL.toml state and not a
         // process-wide setting.
-        assert!(ChatLevers::resolve(true, false).prompt.tscg);
-        assert!(!ChatLevers::resolve(false, false).prompt.tscg);
-        assert!(ChatLevers::resolve(false, true).disable_cwd_hint_injection);
+        assert!(ChatLevers::resolve(true, false, true).prompt.tscg);
+        assert!(!ChatLevers::resolve(false, false, true).prompt.tscg);
+        assert!(ChatLevers::resolve(false, true, true).disable_cwd_hint_injection);
+        assert!(!ChatLevers::resolve(false, false, false).stream_loop_guards);
+        assert!(ChatLevers::OFF.stream_loop_guards);
     }
 }
