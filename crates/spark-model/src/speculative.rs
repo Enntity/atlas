@@ -32,6 +32,9 @@ use crate::layer::ForwardContext;
 pub trait ProposerState: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+    /// The request's min_tokens floor (`EosBan::floor`, 0 = none): drafts
+    /// for positions below it should not end the turn. Default: ignored.
+    fn set_end_floor(&mut self, _floor: usize) {}
 }
 
 /// A draft token proposer for speculative decoding.

@@ -226,6 +226,8 @@ extern "C" __global__ void dflash2_topk_bf16(
 // hidden:    [batch * gamma, rank] BF16 hidden_projection of final-normed rows
 // pred/succ: [vocab, rank] BF16 predecessor / successor codebooks
 // anchors:   [batch] u32 block anchor (bonus) token
+// ban_depth: [batch] u32: depths 1..ban_depth[b] never draft end0..end3 (the
+//            target may not end the turn there under min_tokens); may be null
 // tokens:    [batch * gamma] u32 out: row 0 = top-1 of the anchor row (plain
 //            argmax, matching the non-selector path), rows 1.. = walk.
 //
@@ -238,10 +240,15 @@ extern "C" __global__ void dflash2_selector_walk(
     const __nv_bfloat16* __restrict__ pred,
     const __nv_bfloat16* __restrict__ succ,
     const unsigned int* __restrict__ anchors,
+    const unsigned int* __restrict__ ban_depth,
     unsigned int* __restrict__ tokens,
     unsigned int gamma,
     unsigned int rank,
-    unsigned int vocab
+    unsigned int vocab,
+    unsigned int end0,
+    unsigned int end1,
+    unsigned int end2,
+    unsigned int end3
 ) {
     __shared__ float s_query[DFLASH2_MAX_RANK];
     __shared__ float s_score[DFLASH2_TOPK];
@@ -251,6 +258,7 @@ extern "C" __global__ void dflash2_selector_walk(
     const unsigned int lane = tid & 31;
     const unsigned int warp = tid >> 5;
     const size_t first_row = (size_t)blockIdx.x * gamma;
+    const unsigned int banned_to = ban_depth ? ban_depth[blockIdx.x] : 0u;
 
     if (tid == 0) {
         tokens[first_row] = cand_ids[first_row * DFLASH2_TOPK];
@@ -279,7 +287,10 @@ extern "C" __global__ void dflash2_selector_walk(
                 acc += __shfl_xor_sync(0xFFFFFFFFu, acc, offset);
             }
             if (lane == 0) {
-                s_score[warp] = cand_vals[row * DFLASH2_TOPK + warp] + acc;
+                const bool end = cand == end0 || cand == end1 || cand == end2 || cand == end3;
+                s_score[warp] = depth <= banned_to && end
+                    ? -INFINITY
+                    : cand_vals[row * DFLASH2_TOPK + warp] + acc;
             }
         }
         __syncthreads();

@@ -314,6 +314,17 @@ impl EosBan {
         MODEL_END_TOKENS.get().copied().unwrap_or(self.ids)
     }
 
+    /// The installed model end tokens (unused slots `u32::MAX`).
+    pub fn model_end_ids() -> [u32; 4] {
+        Self::default().head_ids()
+    }
+
+    /// Leading draft depths (depth `d` drafts position `anchor_pos + d`) that
+    /// may not be an end token: those below `floor` (0 = no min_tokens).
+    pub fn banned_draft_depth(floor: usize, anchor_pos: usize, max_depth: usize) -> u32 {
+        floor.saturating_sub(anchor_pos + 1).min(max_depth) as u32
+    }
+
     /// Bit `j` is set when verify row `j` of a pass whose first input sits at
     /// `base_pos` predicts a position below the floor (row `j` predicts
     /// `base_pos + j + 1`). `rows` is at most 64.
@@ -461,6 +472,16 @@ mod eos_ban_tests {
         assert_eq!(ban.row_mask(0, 64), u64::MAX); // all 64 rows below 110
         assert_eq!(EosBan::new(100, 0, &[7]).row_mask(0, 8), 0);
         assert_eq!(EosBan::default().row_mask(0, 8), 0);
+    }
+
+    #[test]
+    fn drafts_below_the_floor_skip_end_tokens() {
+        // Floor 110; depth d drafts anchor + d, so an anchor at 105 bans
+        // depths 1..=4 (positions 106..=109).
+        assert_eq!(EosBan::banned_draft_depth(110, 105, 7), 4);
+        assert_eq!(EosBan::banned_draft_depth(110, 109, 7), 0);
+        assert_eq!(EosBan::banned_draft_depth(110, 50, 7), 7);
+        assert_eq!(EosBan::banned_draft_depth(0, 50, 7), 0);
     }
 
     #[test]

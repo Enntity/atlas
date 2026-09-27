@@ -341,9 +341,9 @@ impl BlockDiffusionDraftHead {
                 // cw=4096 for rows nothing ever touches (γ rows ≈ 8.4 MB).
                 logits: gpu.alloc(g * vocab_size * bf16)?,
                 draft_tokens_dev: gpu.alloc(n_attn * 4)?,
-                markov_prev_dev: gpu.alloc(4)?,
+                markov_prev_dev: gpu.alloc(super::MARKOV_PREV_BYTES)?,
                 markov_prev_host_pinned: std::sync::atomic::AtomicPtr::new(
-                    gpu.alloc_host_pinned(4)?,
+                    gpu.alloc_host_pinned(super::MARKOV_PREV_BYTES)?,
                 ),
                 position_ids: gpu.alloc(n_attn * 4)?,
                 dflash2: dflash2
@@ -373,7 +373,7 @@ impl BlockDiffusionDraftHead {
                 (s.option_b_indirect_args_dev, 12),
                 (s.logits, g * vocab_size * bf16),
                 (s.draft_tokens_dev, n_attn * 4),
-                (s.markov_prev_dev, 4),
+                (s.markov_prev_dev, super::MARKOV_PREV_BYTES),
                 (s.position_ids, n_attn * 4),
             ] {
                 gpu.memset(p, 0, bytes)?;
@@ -430,7 +430,7 @@ impl BlockDiffusionDraftHead {
         let batch_mlp_down = gpu.alloc(batch_norm_bytes)?;
         let batch_logits = gpu.alloc(batch_logits_bytes)?;
         let batch_tokens = gpu.alloc(batch_rows * 4)?;
-        let batch_markov_prev = gpu.alloc(batch_capacity * 4)?;
+        let batch_markov_prev = gpu.alloc(batch_capacity * super::MARKOV_PREV_BYTES)?;
         let batch_markov_embed_bytes = batch_capacity
             .checked_mul(weights.markov_rank)
             .and_then(|n| n.checked_mul(bf16))
@@ -471,7 +471,7 @@ impl BlockDiffusionDraftHead {
         gpu.memset(batch_mlp_down, 0, batch_norm_bytes)?;
         gpu.memset(batch_logits, 0, batch_logits_bytes)?;
         gpu.memset(batch_tokens, 0, batch_rows * 4)?;
-        gpu.memset(batch_markov_prev, 0, batch_capacity * 4)?;
+        gpu.memset(batch_markov_prev, 0, batch_capacity * super::MARKOV_PREV_BYTES)?;
         if weights.markov_rank > 0 {
             gpu.memset(batch_markov_embed, 0, batch_markov_embed_bytes)?;
             gpu.memset(batch_markov_bias, 0, batch_markov_bias_bytes)?;

@@ -33,6 +33,7 @@ impl BlockDiffusionDraftHead {
         graph_owner: SequenceGeneration,
         graph_lane: usize,
         defer_readback: bool,
+        ban_depth: u32,
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
 
@@ -801,7 +802,7 @@ impl BlockDiffusionDraftHead {
 
         // Seed Markov prev from a pinned host word BEFORE any tail
         // capture/replay. The tail graph must not H2D a stack last_token.
-        self.seed_markov_prev(last_token, gpu, stream, scratch)?;
+        self.seed_markov_prev(last_token, ban_depth, gpu, stream, scratch)?;
 
         // Phase F.2: piecewise capture/replay path. Only enabled for
         // option_b (paged) — legacy path stays single-shot eager since

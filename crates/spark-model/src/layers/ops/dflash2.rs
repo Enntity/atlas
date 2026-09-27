@@ -85,10 +85,11 @@ pub fn dflash2_topk(
 
 /// Greedy candidate-selector walk, one block per sequence of `gamma` rows.
 /// Writes `tokens[b * gamma + 0]` = top-1 of the anchor row and
-/// `tokens[b * gamma + 1..gamma]` = the walked drafts.
+/// `tokens[b * gamma + 1..gamma]` = the walked drafts. Depths
+/// `1..=ban_depth[b]` never draft one of `end_ids` (`ban_depth` may be null).
 ///
 /// Kernel: `dflash2_selector_walk(cand_ids, cand_vals, hidden, pred, succ,
-/// anchors, tokens, gamma, rank, vocab)`
+/// anchors, ban_depth, tokens, gamma, rank, vocab, end0..end3)`
 /// Grid: (batch, 1, 1)  Block: (32 * DFLASH2_TOPK = 512, 1, 1)
 #[allow(clippy::too_many_arguments)]
 pub fn dflash2_selector_walk(
@@ -100,6 +101,8 @@ pub fn dflash2_selector_walk(
     predecessor_codebook: DevicePtr,
     successor_codebook: DevicePtr,
     anchors: DevicePtr,
+    ban_depth: DevicePtr,
+    end_ids: [u32; 4],
     tokens: DevicePtr,
     batch: u32,
     gamma: u32,
@@ -111,7 +114,7 @@ pub fn dflash2_selector_walk(
         (1..=DFLASH2_MAX_RANK as u32).contains(&rank),
         "dflash2_selector_walk: rank={rank} outside 1..={DFLASH2_MAX_RANK}"
     );
-    KernelLaunch::new(gpu, kernel)
+    let mut launch = KernelLaunch::new(gpu, kernel)
         .grid([batch, 1, 1])
         .block([32 * DFLASH2_TOPK as u32, 1, 1])
         .arg_ptr(cand_ids)
@@ -120,11 +123,15 @@ pub fn dflash2_selector_walk(
         .arg_ptr(predecessor_codebook)
         .arg_ptr(successor_codebook)
         .arg_ptr(anchors)
+        .arg_ptr(ban_depth)
         .arg_ptr(tokens)
         .arg_u32(gamma)
         .arg_u32(rank)
-        .arg_u32(vocab)
-        .launch(stream)
+        .arg_u32(vocab);
+    for id in end_ids {
+        launch = launch.arg_u32(id);
+    }
+    launch.launch(stream)
 }
 
 #[cfg(test)]

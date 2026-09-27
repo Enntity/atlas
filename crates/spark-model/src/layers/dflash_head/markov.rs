@@ -137,11 +137,13 @@ impl BlockDiffusionDraftHead {
         Ok(())
     }
 
-    /// Write `last_token` into the stable device slot the tail graph reads.
-    /// Must run on `stream` BEFORE begin_capture(tail) / launch_graph(tail).
+    /// Write `[last_token, ban_depth]` into the stable device slots the tail
+    /// graph reads. Must run on `stream` BEFORE begin_capture(tail) /
+    /// launch_graph(tail).
     pub(super) fn seed_markov_prev(
         &self,
         last_token: u32,
+        ban_depth: u32,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         stream: u64,
         scratch: &DflashScratch,
@@ -150,10 +152,12 @@ impl BlockDiffusionDraftHead {
             .markov_prev_host_pinned
             .load(std::sync::atomic::Ordering::Relaxed);
         anyhow::ensure!(!ptr.is_null(), "markov_prev_host_pinned is null");
+        // SAFETY: `ptr` is the page-locked MARKOV_PREV_BYTES allocation made
+        // in `from_weights`, reached only through this scratch on its stream.
         unsafe {
-            std::ptr::write(ptr as *mut u32, last_token);
+            std::ptr::write_unaligned(ptr as *mut [u32; 2], [last_token, ban_depth]);
         }
-        let host = unsafe { std::slice::from_raw_parts(ptr, 4) };
+        let host = unsafe { std::slice::from_raw_parts(ptr, super::MARKOV_PREV_BYTES) };
         gpu.copy_h2d_async(host, scratch.markov_prev_dev, stream)
     }
 }
