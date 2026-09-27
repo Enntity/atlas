@@ -121,3 +121,7 @@ mod enc_impl;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "vision_encoder/glm_oracle_tests.rs"]
 mod glm_oracle_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "vision_encoder/glm_attention_gpu_tests.rs"]
+mod glm_attention_gpu_tests;

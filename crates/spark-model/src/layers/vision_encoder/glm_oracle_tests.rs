@@ -25,6 +25,10 @@ use crate::weight_loader::{Glm5WeightLoader, ModelWeightLoader};
 
 const REFERENCE_REVISION: &str = "487ecf187d3dfe74d2cf6119a92881dba403c219";
 const MIN_FREE_BYTES_BEFORE_LOAD: usize = 5 * 1024 * 1024 * 1024;
+/// Wall-time budget for one fixture, including first-launch module loading.
+/// A 1024x1024 image encodes in well under a second; the scalar reference
+/// kernels this replaced needed hours.
+const MAX_ENCODE: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -210,7 +214,14 @@ fn glm5_vision_native_encoder_oracle_dump() -> Result<()> {
         .context("native GLM vision loader returned no encoder")?;
     let stream = gpu.default_stream();
 
-    let fixtures = [("square_112", 112, 112), ("wide_112x224", 224, 112)];
+    // `odd_196x140` leaves the last 64-query attention tile partial;
+    // `square_1024` is the full-size image whose encode used to take hours.
+    let fixtures = [
+        ("square_112", 112, 112),
+        ("wide_112x224", 224, 112),
+        ("odd_196x140", 196, 140),
+        ("square_1024", 1024, 1024),
+    ];
     let mut cases = Vec::with_capacity(fixtures.len());
     for (name, width, height) in fixtures {
         let uri = fixture_png(width, height)?;
@@ -222,11 +233,17 @@ fn glm5_vision_native_encoder_oracle_dump() -> Result<()> {
         );
         let item = VisionItem::image(pixels.clone(), grid_h, grid_w);
         let items = [&item];
+        let started = std::time::Instant::now();
         let geometry = encoder
             .forward_items(&items, gpu, stream)
             .with_context(|| format!("native GLM forward {name}"))?;
         gpu.synchronize(stream)
             .context("synchronize native encoder")?;
+        let encode = started.elapsed();
+        ensure!(
+            encode < MAX_ENCODE,
+            "native GLM forward {name} ({grid_h}x{grid_w} patches) took {encode:?}"
+        );
         ensure!(
             geometry.len() == 1,
             "one fixture must produce one output geometry"

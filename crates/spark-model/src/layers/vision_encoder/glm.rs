@@ -13,7 +13,22 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use crate::vision_preprocess::derive_glm_max_patches;
 
 mod forward;
+#[cfg(test)]
+#[path = "glm/forward_tests.rs"]
+mod forward_tests;
 mod ops;
+
+/// Queries per flash-attention block (four warps of 16 rows).
+const FLASH_QUERY_ROWS: u32 = 64;
+/// Head width the flash-attention kernel is compiled for.
+const FLASH_HEAD_DIM: usize = 64;
+
+/// Merged rows `buf_out` holds for one request. Every item is encoded as its
+/// own attention sequence (at most `p_max` input patches), but the merged rows
+/// of all items are packed back to back and spliced from this one buffer, so
+/// a request may carry several full-size images: 16384 rows is eleven
+/// 1024x1024 images at 1369 rows each (128 MiB at `out_hidden_size` 4096).
+pub(crate) const GLM_MAX_OUTPUT_ROWS: usize = 16_384;
 
 #[derive(Clone, Copy)]
 pub(crate) struct GlmVisionBlockWeights {
@@ -54,6 +69,8 @@ pub(crate) struct GlmVisionEncoder {
     pub buf_out: DevicePtr,
     pub out_hidden_size: usize,
     pub p_max: usize,
+    /// Row capacity of `buf_out`; see [`GLM_MAX_OUTPUT_ROWS`].
+    pub out_rows: usize,
     patch_embed_w: DevicePtr,
     patch_embed_b: DevicePtr,
     blocks: Vec<GlmVisionBlockWeights>,
@@ -70,14 +87,15 @@ pub(crate) struct GlmVisionEncoder {
     rms_norm_eps: f32,
     swiglu_limit: f32,
     k_gemm: KernelHandle,
-    k_gemm_bias: KernelHandle,
+    k_add_bias: KernelHandle,
     k_rms_norm: KernelHandle,
+    k_qk_norm_rope: KernelHandle,
     k_attention: KernelHandle,
     k_swiglu: KernelHandle,
     k_add: KernelHandle,
     k_layer_norm: KernelHandle,
     k_gelu: KernelHandle,
-    k_conv2d: KernelHandle,
+    k_merge_reorder: KernelHandle,
     k_f32_bf16: KernelHandle,
     buf_f32: DevicePtr,
     buf_pixels: DevicePtr,
@@ -121,6 +139,10 @@ impl GlmVisionEncoder {
             );
         }
         let head_dim = config.hidden_size / config.num_heads;
+        ensure!(
+            head_dim == FLASH_HEAD_DIM,
+            "GLM vision attention supports head_dim {FLASH_HEAD_DIM}, got {head_dim}"
+        );
         let patch_dim =
             config.in_channels * config.temporal_patch_size * config.patch_size * config.patch_size;
         let wide = (config.hidden_size * 3)
@@ -141,13 +163,14 @@ impl GlmVisionEncoder {
         )?;
         let buf_conv = gpu.alloc(p_max * config.out_hidden_size * 2)?;
         let buf_merger = gpu.alloc(p_max * config.out_hidden_size * 2)?;
-        let buf_out = gpu.alloc(p_max * config.out_hidden_size * 2)?;
+        let buf_out = gpu.alloc(GLM_MAX_OUTPUT_ROWS * config.out_hidden_size * 2)?;
         let buf_rope_cos = gpu.alloc(p_max * head_dim * 2)?;
         let buf_rope_sin = gpu.alloc(p_max * head_dim * 2)?;
         Ok(Self {
             buf_out,
             out_hidden_size: config.out_hidden_size,
             p_max,
+            out_rows: GLM_MAX_OUTPUT_ROWS,
             patch_embed_w: weights.patch_embed_w,
             patch_embed_b: weights.patch_embed_b,
             blocks: weights.blocks,
@@ -163,15 +186,16 @@ impl GlmVisionEncoder {
             projection_intermediate_size: config.projection_intermediate_size,
             rms_norm_eps: config.rms_norm_eps as f32,
             swiglu_limit: config.swiglu_limit,
-            k_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
-            k_gemm_bias: gpu.kernel("glm_vision_encoder", "glm_vision_gemm_bias")?,
+            k_gemm: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
+            k_add_bias: gpu.kernel("glm_vision_encoder", "glm_vision_add_bias")?,
             k_rms_norm: gpu.kernel("glm_vision_encoder", "glm_vision_rms_norm")?,
-            k_attention: gpu.kernel("glm_vision_encoder", "glm_vision_attention")?,
+            k_qk_norm_rope: gpu.kernel("glm_vision_encoder", "glm_vision_qk_norm_rope")?,
+            k_attention: gpu.kernel("glm_vision_encoder", "glm_vision_flash_attention")?,
             k_swiglu: gpu.kernel("glm_vision_encoder", "glm_vision_swiglu_clamp")?,
             k_add: gpu.kernel("glm_vision_encoder", "glm_vision_add")?,
             k_layer_norm: gpu.kernel("glm_vision_encoder", "glm_vision_layer_norm")?,
             k_gelu: gpu.kernel("glm_vision_encoder", "glm_vision_gelu")?,
-            k_conv2d: gpu.kernel("glm_vision_encoder", "glm_vision_conv2d")?,
+            k_merge_reorder: gpu.kernel("glm_vision_encoder", "glm_vision_merge_reorder")?,
             k_f32_bf16: gpu.kernel("glm_vision_encoder", "glm_vision_f32_to_bf16")?,
             buf_f32,
             buf_pixels,

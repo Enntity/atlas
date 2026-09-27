@@ -496,8 +496,8 @@ impl TransformerModel {
                 owned_images,
                 slice_rows: if owned_images == 0 { rows } else { slice_rows },
             };
-            let state = validate_state(&state, ve.p_max)?;
-            let payload = payload_bytes(&state, ve.out_hidden_size, ve.p_max)?;
+            let state = validate_state(&state, ve.output_rows())?;
+            let payload = payload_bytes(&state, ve.out_hidden_size, ve.output_rows())?;
             anyhow::ensure!(
                 payload > 0,
                 "vision request produced an empty encoder payload"
@@ -698,7 +698,10 @@ impl TransformerModel {
         match cmd {
             EP_CMD_VISION_STATE => {
                 let header = self.ep_broadcast_tokens(&vec![0; VISION_HEADER_WORDS])?;
-                let max_rows = self.vision_encoder.as_ref().map_or(0, |ve| ve.p_max);
+                let max_rows = self
+                    .vision_encoder
+                    .as_ref()
+                    .map_or(0, |ve| ve.output_rows());
                 let state = parse_state_header(&header, max_rows)?;
                 let grid_words = if state.grid_count > 0 {
                     self.ep_broadcast_tokens(&vec![0; state.grid_count * 3])?
@@ -707,7 +710,7 @@ impl TransformerModel {
                 };
                 let grids = parse_grid_words(&grid_words, &state)?;
                 let payload = if let Some(ve) = &self.vision_encoder {
-                    payload_bytes(&state, ve.out_hidden_size, ve.p_max)?
+                    payload_bytes(&state, ve.out_hidden_size, ve.output_rows())?
                 } else {
                     anyhow::ensure!(
                         state.rows == 0,
