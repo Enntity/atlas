@@ -201,6 +201,7 @@ impl Qwen3AttentionLayer {
             o_weight: None,
             o_dense_bf16: None,
             mla: None,
+            mla_mx: Vec::new(),
             // ── DeepSeek-V4 Manifold-Constrained Hyper-Connections (mHC) ──
             // `hc` stays None for non-V4 models; the V4 loader attaches real
             // HcWeights after this constructor. Kernel handles are lazy (null
@@ -624,6 +625,9 @@ impl Qwen3AttentionLayer {
                 "dense_gemm_splitk_reduce",
             ),
             dense_gemm_tc_k: super::super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc"),
+            mxfp8_gemv_k: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
+                .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
+            mxfp8_quantize_k: super::super::try_kernel(gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
             paged_decode_splitk_k: match kv_dtype {
                 KvCacheDtype::Nvfp4 => {
                     Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_splitk_nvfp4")?)

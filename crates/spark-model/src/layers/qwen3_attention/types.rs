@@ -114,6 +114,10 @@ pub struct Qwen3AttentionLayer {
     pub(super) o_dense_bf16: Option<DenseWeight>,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,
+    /// MXFP8 twins of MLA projections keyed by the BF16 weight pointer
+    /// (`ATLAS_GLM_MLA_MXFP8=1`): decode/verify rows (<= 32) read half the
+    /// bytes; prefill keeps BF16.
+    pub(crate) mla_mx: Vec<(DevicePtr, crate::layers::dflash_head::Mxfp8Weight)>,
     // ── Manifold-Constrained Hyper-Connections (mHC) — DeepSeek-V4 ──
     /// Per-block HC parameters. `Some` only for DeepSeek-V4 (`hc_mult > 0`),
     /// in which case the attn/ffn residual sites use `hc_pre`/`hc_post`
@@ -318,6 +322,9 @@ pub struct Qwen3AttentionLayer {
     pub(super) gemm_splitk_reduce_k: KernelHandle,
     /// Tensor-core BF16 GEMM (m16n8k16 MMA).
     pub(super) dense_gemm_tc_k: KernelHandle,
+    /// `mxfp8_gemv_tc8/16/32` (null when the module is absent).
+    pub(super) mxfp8_gemv_k: [KernelHandle; 3],
+    pub(super) mxfp8_quantize_k: KernelHandle,
     pub(super) paged_decode_splitk_k: Option<KernelHandle>,
     pub(super) paged_decode_reduce_k: Option<KernelHandle>,
     pub(super) residual_add_k: KernelHandle,

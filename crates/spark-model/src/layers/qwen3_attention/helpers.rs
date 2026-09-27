@@ -46,6 +46,38 @@ impl Qwen3AttentionLayer {
         self.mla = Some(mla);
     }
 
+    /// Quantize BF16 projections `(weight, n, k)` to MXFP8 twins that
+    /// `mla_prefill_dense` uses for up to 32 rows. Runs at load, before KV
+    /// sizing, so the twins come out of the KV budget.
+    pub fn install_mla_mxfp8(
+        &mut self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        weights: &[(DevicePtr, usize, usize)],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.mxfp8_quantize_k.0 != 0 && self.mxfp8_gemv_k.iter().all(|k| k.0 != 0),
+            "ATLAS_GLM_MLA_MXFP8=1 but the mxfp8_gemv kernels are missing"
+        );
+        let stream = gpu.default_stream();
+        for &(weight, n, k) in weights {
+            let data = gpu.alloc(n * k)?;
+            let scales = gpu.alloc(n * k / crate::layers::ops::MXFP8_BLOCK)?;
+            crate::layers::ops::mxfp8_quantize(
+                gpu,
+                self.mxfp8_quantize_k,
+                weight,
+                data,
+                scales,
+                n,
+                k,
+                stream,
+            )?;
+            self.mla_mx
+                .push((weight, crate::layers::dflash_head::Mxfp8Weight { data, scales }));
+        }
+        gpu.synchronize(stream)
+    }
+
     /// Set per-block Manifold-Constrained Hyper-Connection weights
     /// (DeepSeek-V4). When set, the attn/ffn residual sites route through
     /// `hc_pre`/`hc_post` against the model-level `hc_streams` buffer.
