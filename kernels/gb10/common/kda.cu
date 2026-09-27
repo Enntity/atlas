@@ -191,6 +191,134 @@ extern "C" __global__ void kda_recurrent_bf16_verify_snap(
     }
 }
 
+// Owner-batched, register-resident kda_recurrent_bf16_verify_snap: grid
+// (heads, owners), owner o advancing its own state (and rollback slab) over
+// its `tokens` rows at row o * tokens. Each thread holds its state column in
+// registers, so H is loaded and stored once per launch instead of read twice
+// and written once per row. The per-row expressions are verify_snap's:
+// states and snapshots match it bit for bit, while a few BF16 outputs can
+// round differently (FMA contraction of the output dot).
+// Up to four owners; dim == 128, block 128.
+extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_snap_owners(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ raw_gate,
+    const __nv_bfloat16* __restrict__ raw_beta,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    __nv_bfloat16* __restrict__ output,
+    float* state0, float* state1, float* state2, float* state3,
+    float* inter0, float* inter1, float* inter2, float* inter3,
+    unsigned long long inter_stride,
+    unsigned int tokens,
+    unsigned int heads,
+    unsigned int dim,
+    float lower_bound
+) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int owner = blockIdx.y;
+    const unsigned int vrow = threadIdx.x;
+    if (head >= heads || owner >= 4 || dim != 128 || blockDim.x != 128) return;
+    float* const states[4] = {state0, state1, state2, state3};
+    float* const inters[4] = {inter0, inter1, inter2, inter3};
+    const unsigned long long row0 = (unsigned long long)owner * tokens;
+    qkv += row0 * 3 * heads * 128;
+    raw_gate += row0 * heads * 128;
+    raw_beta += row0 * heads;
+    output += row0 * heads * 128;
+    float* state_inter = inters[owner];
+
+    __shared__ float qv[128];
+    __shared__ float kv[128];
+    __shared__ float gate_exp[128];
+    __shared__ float red_q[128];
+    __shared__ float red_k[128];
+    __shared__ float inv_q;
+    __shared__ float inv_k;
+    __shared__ float beta;
+
+    float* H = states[owner] + (unsigned long long)head * 128 * 128;
+    float h[128];
+    #pragma unroll
+    for (unsigned int k = 0; k < 128; ++k) h[k] = H[(unsigned long long)k * 128 + vrow];
+    const float a = expf(a_log[head]);
+    const float scale = rsqrtf((float)dim);
+
+    for (unsigned int t = 0; t < tokens; ++t) {
+        const unsigned long long qbase = (unsigned long long)t * 3 * heads * 128;
+        {
+            float q = (float)qkv[qbase + (unsigned long long)head * 128 + vrow];
+            float k = (float)qkv[qbase + (unsigned long long)heads * 128
+                              + (unsigned long long)head * 128 + vrow];
+            qv[vrow] = q;
+            kv[vrow] = k;
+            red_q[vrow] = q * q;
+            red_k[vrow] = k * k;
+            float g = (float)raw_gate[((unsigned long long)t * heads + head) * 128 + vrow];
+            float log_decay = lower_bound /
+                (1.0f + expf(-a * (g + dt_bias[(unsigned long long)head * 128 + vrow])));
+            gate_exp[vrow] = expf(log_decay);
+        }
+        __syncthreads();
+
+        for (unsigned int stride = 64; stride > 0; stride >>= 1) {
+            if (vrow < stride) {
+                red_q[vrow] += red_q[vrow + stride];
+                red_k[vrow] += red_k[vrow + stride];
+            }
+            __syncthreads();
+        }
+        if (vrow == 0) {
+            inv_q = rsqrtf(red_q[0] + 1.0e-6f) * scale;
+            inv_k = rsqrtf(red_k[0] + 1.0e-6f);
+            float b = (float)raw_beta[(unsigned long long)t * heads + head];
+            beta = 1.0f / (1.0f + expf(-b));
+        }
+        __syncthreads();
+
+        float dot_k = 0.0f;
+        #pragma unroll
+        for (unsigned int k = 0; k < 128; k += 4) {
+            float h0 = h[k + 0] * gate_exp[k + 0];
+            float h1 = h[k + 1] * gate_exp[k + 1];
+            float h2 = h[k + 2] * gate_exp[k + 2];
+            float h3 = h[k + 3] * gate_exp[k + 3];
+            dot_k += h0 * (kv[k + 0] * inv_k) + h1 * (kv[k + 1] * inv_k)
+                   + h2 * (kv[k + 2] * inv_k) + h3 * (kv[k + 3] * inv_k);
+        }
+        const unsigned long long vbase = qbase + (unsigned long long)2 * heads * 128;
+        float delta = ((float)qkv[vbase + (unsigned long long)head * 128 + vrow]
+                       - dot_k) * beta;
+        float out = 0.0f;
+        float* snapshot = (t + 1u < tokens)
+            ? state_inter + (unsigned long long)t * inter_stride
+                + (unsigned long long)head * 128 * 128
+            : nullptr;
+        #pragma unroll
+        for (unsigned int k = 0; k < 128; k += 4) {
+            float h0 = h[k + 0] * gate_exp[k + 0] + delta * (kv[k + 0] * inv_k);
+            float h1 = h[k + 1] * gate_exp[k + 1] + delta * (kv[k + 1] * inv_k);
+            float h2 = h[k + 2] * gate_exp[k + 2] + delta * (kv[k + 2] * inv_k);
+            float h3 = h[k + 3] * gate_exp[k + 3] + delta * (kv[k + 3] * inv_k);
+            h[k + 0] = h0;
+            h[k + 1] = h1;
+            h[k + 2] = h2;
+            h[k + 3] = h3;
+            if (snapshot != nullptr) {
+                snapshot[(unsigned long long)(k + 0) * 128 + vrow] = h0;
+                snapshot[(unsigned long long)(k + 1) * 128 + vrow] = h1;
+                snapshot[(unsigned long long)(k + 2) * 128 + vrow] = h2;
+                snapshot[(unsigned long long)(k + 3) * 128 + vrow] = h3;
+            }
+            out += h0 * (qv[k + 0] * inv_q) + h1 * (qv[k + 1] * inv_q)
+                 + h2 * (qv[k + 2] * inv_q) + h3 * (qv[k + 3] * inv_q);
+        }
+        output[((unsigned long long)t * heads + head) * 128 + vrow] = __float2bfloat16(out);
+        __syncthreads();
+    }
+    #pragma unroll
+    for (unsigned int k = 0; k < 128; ++k) H[(unsigned long long)k * 128 + vrow] = h[k];
+}
+
 // Precompute normalized Q/K and row decay once per token/head. The recurrence
 // fans each token out across 32 column groups, so doing the reductions and
 // transcendental operations there would repeat the expensive work 32 times.

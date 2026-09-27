@@ -105,6 +105,14 @@ name = "glm_hc_seam_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm_sparse_split_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "kda_verify_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "w4a16_lmhead_716_repro"
 required-features = ["cuda", "gpu-examples"]
 

@@ -131,9 +131,20 @@ fn dispatch(
         scratch.offset(PART_O_BYTES + PART_LSE_BYTES),
         1,
         32,
+        SPLITS,
         stream,
     )?;
     Ok(true)
+}
+
+pub(super) fn merge_kernel(gpu: &dyn GpuBackend) -> Result<KernelHandle> {
+    let merge = gpu.op_cache().kernel(
+        gpu,
+        "glm_sparse_decode_split_merge",
+        "glm_sparse_decode_split_merge",
+    )?;
+    ensure!(merge.0 != 0, "GLM split merge kernel unavailable");
+    Ok(merge)
 }
 
 fn kernels(gpu: &dyn GpuBackend) -> Result<(KernelHandle, KernelHandle)> {
@@ -141,16 +152,8 @@ fn kernels(gpu: &dyn GpuBackend) -> Result<(KernelHandle, KernelHandle)> {
     let split =
         gpu.op_cache()
             .kernel(gpu, "glm_sparse_decode_split", "atlas_sparse_decode_split")?;
-    let merge = gpu.op_cache().kernel(
-        gpu,
-        "glm_sparse_decode_split_merge",
-        "glm_sparse_decode_split_merge",
-    )?;
-    ensure!(
-        split.0 != 0 && merge.0 != 0,
-        "GLM split kernels unavailable"
-    );
-    Ok((split, merge))
+    ensure!(split.0 != 0, "GLM split kernels unavailable");
+    Ok((split, merge_kernel(gpu)?))
 }
 
 fn launch_split(
@@ -182,8 +185,9 @@ fn launch_split(
         .launch(stream)
 }
 
+/// `glm_sparse_decode_split_merge` over `grid` = rows x 32 heads.
 #[allow(clippy::too_many_arguments)]
-fn launch_merge(
+pub(super) fn launch_merge(
     gpu: &dyn GpuBackend,
     k: KernelHandle,
     part: DevicePtr,
@@ -192,6 +196,7 @@ fn launch_merge(
     lse: DevicePtr,
     rows: u32,
     grid: u32,
+    splits: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, k)
@@ -204,7 +209,7 @@ fn launch_merge(
         .arg_u32(rows)
         .arg_u32(32)
         .arg_u32(512)
-        .arg_u32(SPLITS)
+        .arg_u32(splits)
         .launch(stream)
 }
 
@@ -254,6 +259,7 @@ fn initialize(gpu: &dyn GpuBackend, c: &ModelConfig, on: bool, tc: bool) -> Resu
         DevicePtr::NULL,
         0,
         1,
+        SPLITS,
         stream,
     )?;
     gpu.synchronize(stream)

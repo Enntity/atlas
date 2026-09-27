@@ -198,6 +198,107 @@ fn launch(
         .launch(stream)
 }
 
+/// Splits of the selected IDs for `rows` query rows: the count (at most 16,
+/// the merge's cap) minimizing waves x 32-key tiles per CTA, with one CTA
+/// per SM (69 KB of shared memory) on GB10's 48 SMs. 1 = the unsplit kernel.
+pub(crate) fn sparse_split_count(rows: u32, heads: u32, index_width: u32) -> u32 {
+    let ctas = rows * heads.div_ceil(32);
+    let tiles = index_width.div_ceil(32);
+    let cost = |s: u32| (ctas * s).div_ceil(48) * tiles.div_ceil(s);
+    (1..=16u32).min_by_key(|&s| (cost(s), s)).unwrap_or(1)
+}
+
+/// Bytes of split scratch: FP32 partial outputs, their LSEs, merged LSEs.
+pub(crate) fn sparse_split_scratch_bytes(
+    splits: u32,
+    rows: u32,
+    heads: u32,
+    head_dim: u32,
+) -> usize {
+    let rh = rows as usize * heads as usize;
+    splits as usize * rh * (head_dim as usize + 1) * 4 + rh * 4
+}
+
+/// `try_glm_sparse_prefill_tc` for few-row callers (verify owners): split
+/// over the selected IDs (`*_split` kernel + `glm_sparse_decode_split_merge`)
+/// when `sparse_split_count` > 1 and `scratch` fits, so the rows fill the GPU
+/// instead of one CTA each. Partial sums in a different order than the
+/// unsplit kernel. `ATLAS_GLM_SPARSE_VERIFY_SPLIT=0` disables.
+pub fn try_glm_sparse_prefill_tc_split(
+    gpu: &dyn GpuBackend,
+    a: &GlmSparsePrefillTc<'_>,
+    scratch: DevicePtr,
+    scratch_bytes: usize,
+    stream: u64,
+) -> Result<bool> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on =
+        *ON.get_or_init(|| std::env::var("ATLAS_GLM_SPARSE_VERIFY_SPLIT").as_deref() != Ok("0"));
+    let model = &a.config.model_type;
+    let (tc, kv_reuse) = (
+        enabled(model, "ATLAS_GLM_SPARSE_PREFILL_TC")?,
+        enabled(model, "ATLAS_GLM_SPARSE_PREFILL_KV_REUSE")?,
+    );
+    let splits = sparse_split_count(a.rows, a.heads, a.index_width);
+    let need = sparse_split_scratch_bytes(splits, a.rows, a.heads, a.head_dim);
+    if !on
+        || !tc
+        || !kv_reuse
+        || !a.identical_kv_latent
+        || splits <= 1
+        || scratch.0 == 0
+        || !scratch.0.is_multiple_of(16)
+        || scratch_bytes < need
+    {
+        return dispatch(gpu, a, stream, tc, kv_reuse);
+    }
+    validate_geometry(a)?;
+    validate_storage(a)?;
+    let rh = a.rows as usize * a.heads as usize;
+    let part_lse = scratch.offset(splits as usize * rh * a.head_dim as usize * 4);
+    let out_lse = part_lse.offset(splits as usize * rh * 4);
+    let (module, _, shared_mem) = kernel_spec(true, a.dtype);
+    let symbol = if a.dtype == KvCacheDtype::Fp8G128 {
+        "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split"
+    } else {
+        "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split"
+    };
+    let kernel = gpu.op_cache().kernel(gpu, module, symbol)?;
+    ensure!(kernel.0 != 0, "GLM sparse split kernel is unavailable");
+    KernelLaunch::new(gpu, kernel)
+        .grid([a.heads.div_ceil(32), a.rows, splits])
+        .block([256, 1, 1])
+        .shared_mem(shared_mem)
+        .arg_ptr(a.query)
+        .arg_ptr(a.k_cache)
+        .arg_ptr(a.v_cache)
+        .arg_ptr(a.indices)
+        .arg_ptr(a.output)
+        .arg_ptr(a.block_table)
+        .arg_u32(a.rows)
+        .arg_u32(a.heads)
+        .arg_u32(a.head_dim)
+        .arg_u32(a.index_width)
+        .arg_u32(a.block_size)
+        .arg_f32(a.scale)
+        .arg_ptr(scratch)
+        .arg_ptr(part_lse)
+        .launch(stream)?;
+    decode_split::launch_merge(
+        gpu,
+        decode_split::merge_kernel(gpu)?,
+        scratch,
+        part_lse,
+        a.output,
+        out_lse,
+        a.rows,
+        a.rows * a.heads,
+        splits,
+        stream,
+    )?;
+    Ok(true)
+}
+
 /// Single source of truth for the independent repaired-decode opt-in.
 pub fn glm_sparse_decode_tc_enabled(model: &str) -> Result<bool> {
     enabled(model, "ATLAS_GLM_SPARSE_DECODE_TC")

@@ -192,12 +192,109 @@ impl Glm5KdaLayer {
                         .all(|(t, ptr)| ptr.0 == base.0 + (t * stride) as u64)
             })
         };
-        let fused_conv = self.conv_prefill_tp_snap_k.0 != 0
-            && verify_batched_conv_snapshot_enabled()
-            && contiguous(&state.conv_state_intermediates, self.conv_state_bytes);
+        self.verify_conv_rows(packed, convolved, state, 0, tokens, ctx, stream)?;
         let fused_recurrent = self.recurrent_verify_snap_k.0 != 0
             && verify_batched_recurrent_snapshot_enabled()
             && contiguous(&state.h_state_intermediates, self.h_state_bytes);
+        let m = tokens as u32;
+        if fused_recurrent && self.recurrent_verify_owners_k.0 != 0 && self.dim == 128 {
+            // The register-resident kernel with one owner: same states and
+            // snapshots, output BF16 rounding may differ in rare elements.
+            ops::kda_recurrent_verify_snap_owners(
+                ctx.gpu,
+                self.recurrent_verify_owners_k,
+                convolved,
+                g1,
+                beta,
+                self.weights.a_log.weight,
+                self.weights.dt_bias.weight,
+                core_out,
+                &[state.h_state],
+                &[state.h_state_intermediates[0]],
+                self.h_state_bytes / size_of::<f32>(),
+                m,
+                self.heads as u32,
+                self.dim as u32,
+                self.lower_bound,
+                stream,
+            )?;
+        } else if fused_recurrent {
+            ops::kda_recurrent_verify_snap(
+                ctx.gpu,
+                self.recurrent_verify_snap_k,
+                convolved,
+                g1,
+                beta,
+                self.weights.a_log.weight,
+                self.weights.dt_bias.weight,
+                state.h_state,
+                core_out,
+                state.h_state_intermediates[0],
+                self.h_state_bytes / size_of::<f32>(),
+                m,
+                self.heads as u32,
+                self.dim as u32,
+                self.lower_bound,
+                stream,
+            )?;
+        } else {
+            for t in 0..tokens {
+                self.run_recurrent(
+                    convolved.offset(t * packed_row_bytes),
+                    g1.offset(t * gate_row_bytes),
+                    beta.offset(t * beta_row_bytes),
+                    state.h_state,
+                    core_out.offset(t * gate_row_bytes),
+                    1,
+                    true,
+                    ctx,
+                    stream,
+                )?;
+                // A partial accept can select states after rows 0..K-2;
+                // the post-row K-1 state is already canonical on full accept.
+                if t + 1 < tokens {
+                    ctx.gpu.copy_d2d_async(
+                        state.h_state,
+                        state.h_state_intermediates[t],
+                        self.h_state_bytes,
+                        stream,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The snapshot verify convolution of `tokens` rows at `row0`.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_conv_rows(
+        &self,
+        packed: DevicePtr,
+        convolved: DevicePtr,
+        state: &mut SsmLayerState,
+        row0: usize,
+        tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let p = self.heads * self.dim;
+        let packed_row_bytes = 3 * p * 2;
+        let (packed, convolved) = (
+            packed.offset(row0 * packed_row_bytes),
+            convolved.offset(row0 * packed_row_bytes),
+        );
+        let contiguous = |ptrs: &[DevicePtr], stride: usize| {
+            ptrs.first().is_some_and(|base| {
+                !base.is_null()
+                    && ptrs[..tokens - 1]
+                        .iter()
+                        .enumerate()
+                        .all(|(t, ptr)| ptr.0 == base.0 + (t * stride) as u64)
+            })
+        };
+        let fused_conv = self.conv_prefill_tp_snap_k.0 != 0
+            && verify_batched_conv_snapshot_enabled()
+            && contiguous(&state.conv_state_intermediates, self.conv_state_bytes);
         let m = tokens as u32;
         if fused_conv {
             ops::conv1d_update_prefill_tp_snap(
@@ -240,50 +337,6 @@ impl Glm5KdaLayer {
                         state.conv_state,
                         state.conv_state_intermediates[t],
                         self.conv_state_bytes,
-                        stream,
-                    )?;
-                }
-            }
-        }
-        if fused_recurrent {
-            ops::kda_recurrent_verify_snap(
-                ctx.gpu,
-                self.recurrent_verify_snap_k,
-                convolved,
-                g1,
-                beta,
-                self.weights.a_log.weight,
-                self.weights.dt_bias.weight,
-                state.h_state,
-                core_out,
-                state.h_state_intermediates[0],
-                self.h_state_bytes / size_of::<f32>(),
-                m,
-                self.heads as u32,
-                self.dim as u32,
-                self.lower_bound,
-                stream,
-            )?;
-        } else {
-            for t in 0..tokens {
-                self.run_recurrent(
-                    convolved.offset(t * packed_row_bytes),
-                    g1.offset(t * gate_row_bytes),
-                    beta.offset(t * beta_row_bytes),
-                    state.h_state,
-                    core_out.offset(t * gate_row_bytes),
-                    1,
-                    true,
-                    ctx,
-                    stream,
-                )?;
-                // A partial accept can select states after rows 0..K-2;
-                // the post-row K-1 state is already canonical on full accept.
-                if t + 1 < tokens {
-                    ctx.gpu.copy_d2d_async(
-                        state.h_state,
-                        state.h_state_intermediates[t],
-                        self.h_state_bytes,
                         stream,
                     )?;
                 }
@@ -340,6 +393,11 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.owner_batched_recurrence(
+            packed, convolved, g1, beta, core_out, row0, owners, rows, ctx, stream,
+        )? {
+            return Ok(());
+        }
         for (owner, input) in owners.iter_mut().enumerate() {
             let state = input
                 .state
@@ -361,5 +419,92 @@ impl Glm5KdaLayer {
             )?;
         }
         Ok(())
+    }
+}
+
+impl Glm5KdaLayer {
+    /// Every owner's conv (per owner), then one owner-batched recurrence
+    /// launch (`kda_recurrent_bf16_verify_snap_owners`, bit-identical to the
+    /// per-owner snapshot kernel) when each owner's rollback slabs are
+    /// contiguous. Returns false, having done nothing, otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn owner_batched_recurrence(
+        &self,
+        packed: DevicePtr,
+        convolved: DevicePtr,
+        g1: DevicePtr,
+        beta: DevicePtr,
+        core_out: DevicePtr,
+        row0: usize,
+        owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        if self.recurrent_verify_owners_k.0 == 0
+            || !(1..=4).contains(&owners.len())
+            || rows < 2
+            || self.dim != 128
+            || !verify_batched_recurrent_snapshot_enabled()
+        {
+            return Ok(false);
+        }
+        let mut states = Vec::with_capacity(owners.len());
+        for input in owners.iter_mut() {
+            let state = input
+                .state
+                .as_any_mut()
+                .downcast_mut::<SsmLayerState>()
+                .ok_or_else(|| anyhow::anyhow!("GLM-5 KDA owner expected SsmLayerState"))?;
+            let contiguous = !state.h_is_f16
+                && state.h_state_intermediates.len() + 1 >= rows
+                && state.h_state_intermediates[..rows - 1]
+                    .iter()
+                    .enumerate()
+                    .all(|(t, p)| {
+                        p.0 == state.h_state_intermediates[0].0 + (t * self.h_state_bytes) as u64
+                    });
+            if !contiguous {
+                return Ok(false);
+            }
+            states.push((state.h_state, state.h_state_intermediates[0]));
+        }
+        for (owner, input) in owners.iter_mut().enumerate() {
+            let state = input
+                .state
+                .as_any_mut()
+                .downcast_mut::<SsmLayerState>()
+                .ok_or_else(|| anyhow::anyhow!("GLM-5 KDA owner expected SsmLayerState"))?;
+            self.verify_conv_rows(
+                packed,
+                convolved,
+                state,
+                row0 + owner * rows,
+                rows,
+                ctx,
+                stream,
+            )?;
+        }
+        let p = self.heads * self.dim;
+        let (h, i): (Vec<_>, Vec<_>) = states.into_iter().unzip();
+        ops::kda_recurrent_verify_snap_owners(
+            ctx.gpu,
+            self.recurrent_verify_owners_k,
+            convolved.offset(row0 * 3 * p * 2),
+            g1.offset(row0 * p * 2),
+            beta.offset(row0 * self.heads * 2),
+            self.weights.a_log.weight,
+            self.weights.dt_bias.weight,
+            core_out.offset(row0 * p * 2),
+            &h,
+            &i,
+            self.h_state_bytes / size_of::<f32>(),
+            rows as u32,
+            self.heads as u32,
+            self.dim as u32,
+            self.lower_bound,
+            stream,
+        )?;
+        Ok(true)
     }
 }

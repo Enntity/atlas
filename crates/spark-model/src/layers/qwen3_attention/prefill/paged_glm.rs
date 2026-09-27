@@ -27,6 +27,20 @@ fn dense_selection_is_exact(sequence_end: usize, index_topk: usize) -> bool {
 /// One owner of a (possibly multi-sequence) GLM chunk attention: `rows`
 /// rows at `row0` of the joint inputs, continuing its sequence at
 /// `seq_len_start` with its own single-sequence metadata.
+/// Row-wise projections of an owner-batched verify, one row per stacked row:
+/// owner rows start at `row0 * <row bytes>`.
+#[derive(Clone, Copy)]
+struct GlmOwnerProjections {
+    keys: DevicePtr,
+    gates: DevicePtr,
+    index_query: DevicePtr,
+    weights: DevicePtr,
+    q_absorbed: DevicePtr,
+    key_row: usize,
+    query_row: usize,
+    weight_row: usize,
+}
+
 #[derive(Clone, Copy)]
 pub(in crate::layers::qwen3_attention) struct GlmChunkOwner {
     pub row0: usize,
@@ -101,6 +115,106 @@ impl Qwen3AttentionLayer {
     /// attention run per owner in the pinned native-sparse operand buffers.
     /// With several owners each owner's attention rows are parked in the
     /// (idle until the LM head) logits arena until the joint W_uv.
+    /// W_uk absorb of `rows` q_b outputs into `nq` per-head latent queries.
+    #[allow(clippy::too_many_arguments)]
+    fn glm_absorb_queries(
+        &self,
+        q_full: DevicePtr,
+        q_absorbed: DevicePtr,
+        rows: u32,
+        nq: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let mla = self.mla.as_ref().expect("GLM absorb without MLA");
+        let (hd, kv_lora) = (mla.nope as u32, mla.kv_lora_rank as u32);
+        ops::glm_paged_grouped_gemm_mla(
+            ctx.gpu,
+            self.grouped_gemm_mla_k,
+            &ctx.config.model_type,
+            q_full,
+            mla.w_uk_t.weight,
+            q_absorbed,
+            rows,
+            nq,
+            hd,
+            kv_lora,
+            nq * hd,
+            nq * kv_lora,
+            stream,
+        )
+    }
+
+    /// Owner-batched projections for a verify batch (several owners, few
+    /// rows), when the scratch holds every row; `None` projects per owner.
+    #[allow(clippy::too_many_arguments)]
+    fn glm_owner_projections(
+        &self,
+        owners: &[GlmChunkOwner],
+        normed: DevicePtr,
+        q_latent: DevicePtr,
+        rows: usize,
+        nq: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Option<GlmOwnerProjections>> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on =
+            *ON.get_or_init(|| std::env::var("ATLAS_GLM_OWNER_BATCH_PROJ").as_deref() != Ok("0"));
+        let mla = self
+            .mla
+            .as_ref()
+            .expect("GLM owner projections without MLA");
+        let c = ctx.config;
+        let (hd, kv_lora) = (mla.nope, mla.kv_lora_rank);
+        let key_row = c.index_head_dim * 2;
+        let query_row = c.index_n_heads * c.index_head_dim * 2;
+        let weight_row = c.index_n_heads * 2;
+        let latent_row = nq * kv_lora * 2;
+        let sizes = ctx.buffers.sizes();
+        if !on
+            || owners.len() < 2
+            || rows > 64
+            || sizes.ssm_qkvz < 2 * rows * key_row
+            || sizes.ssm_deinterleaved < rows * (latent_row + query_row)
+            || sizes.qkv_output < rows * nq * hd * 2
+            || sizes.ssm_gates < rows * weight_row
+        {
+            return Ok(None);
+        }
+        let n = rows as u32;
+        let keys = ctx.buffers.ssm_qkvz();
+        let gates = keys.offset(rows * key_row);
+        self.glm_index_project_keys(normed, n, keys, gates, ctx, stream)?;
+        let q_absorbed = ctx.buffers.ssm_deinterleaved();
+        let index_query = q_absorbed.offset(rows * latent_row);
+        let weights = ctx.buffers.ssm_gates();
+        self.glm_index_project_query(q_latent, normed, n, index_query, weights, ctx, stream)?;
+        let q_full = ctx.buffers.qkv_output();
+        self.paged_glm_projection(
+            q_latent,
+            &mla.wq_b,
+            q_full,
+            n,
+            (nq * hd) as u32,
+            mla.q_lora_rank as u32,
+            ctx,
+            stream,
+            projection::enabled(&c.model_type)?,
+        )?;
+        self.glm_absorb_queries(q_full, q_absorbed, n, nq as u32, ctx, stream)?;
+        Ok(Some(GlmOwnerProjections {
+            keys,
+            gates,
+            index_query,
+            weights,
+            q_absorbed,
+            key_row,
+            query_row,
+            weight_row,
+        }))
+    }
+
     pub(super) fn glm_chunk_attention(
         &self,
         owners: &[GlmChunkOwner],
@@ -202,6 +316,19 @@ impl Qwen3AttentionLayer {
         let o_out = ctx.buffers.norm_output();
         let per_owner = owners.len() > 1 && ctx.buffers.sizes().logits < num_tokens * latent_row;
         let parked = (owners.len() > 1 && !per_owner).then(|| ctx.buffers.logits());
+        // Owner-batched verify: every row-wise projection (index keys, gates,
+        // queries and weights, q_b and the W_uk absorb) runs once over all
+        // owners' rows, so each weight is read once per layer rather than once
+        // per owner; only cache writes, selection and attention stay per owner.
+        let batched = self.glm_owner_projections(
+            owners,
+            normed,
+            q_latent,
+            num_tokens,
+            nq as usize,
+            ctx,
+            stream,
+        )?;
         for o in owners {
             let on = o.rows as u32;
             let octx = ForwardContext {
@@ -216,7 +343,15 @@ impl Qwen3AttentionLayer {
             let use_dense = dense_selection_is_exact(sequence_end, ctx.config.index_topk);
             let o_normed = normed.offset(o.row0 * h as usize * bf16);
             let o_latent = q_latent.offset(o.row0 * q_lora as usize * bf16);
-            self.glm_index_prefill_cache_update(o_normed, on, kv_cache, &octx, stream)?;
+            let rows_of = |base: DevicePtr, row_bytes: usize| base.offset(o.row0 * row_bytes);
+            self.glm_index_prefill_cache_update(
+                o_normed,
+                on,
+                kv_cache,
+                &octx,
+                stream,
+                batched.map(|b| (rows_of(b.keys, b.key_row), rows_of(b.gates, b.key_row))),
+            )?;
             let sparse_indices = if use_dense {
                 None
             } else {
@@ -228,6 +363,12 @@ impl Qwen3AttentionLayer {
                     kv_cache,
                     &octx,
                     stream,
+                    batched.map(|b| {
+                        (
+                            rows_of(b.index_query, b.query_row),
+                            rows_of(b.weights, b.weight_row),
+                        )
+                    }),
                 )?)
             };
             // The BF16 dense and native kernels read an fp8_g128 owner through
@@ -254,26 +395,18 @@ impl Qwen3AttentionLayer {
                     self.kv_dtype,
                 ),
             };
-            let q_full = ctx.buffers.qkv_output();
-            self.paged_glm_projection(
-                o_latent, &mla.wq_b, q_full, on, nq * hd, q_lora, &octx, stream, accelerated,
-            )?;
-            let q_absorbed = ctx.buffers.ssm_deinterleaved();
-            ops::glm_paged_grouped_gemm_mla(
-                ctx.gpu,
-                self.grouped_gemm_mla_k,
-                &ctx.config.model_type,
-                q_full,
-                mla.w_uk_t.weight,
-                q_absorbed,
-                on,
-                nq,
-                nope,
-                kv_lora,
-                nq * hd,
-                nq * kv_lora,
-                stream,
-            )?;
+            let q_absorbed = match batched {
+                Some(b) => rows_of(b.q_absorbed, latent_row),
+                None => {
+                    let q_full = ctx.buffers.qkv_output();
+                    self.paged_glm_projection(
+                        o_latent, &mla.wq_b, q_full, on, nq * hd, q_lora, &octx, stream, accelerated,
+                    )?;
+                    let q_absorbed = ctx.buffers.ssm_deinterleaved();
+                    self.glm_absorb_queries(q_full, q_absorbed, on, nq, ctx, stream)?;
+                    q_absorbed
+                }
+            };
             if let Some((indices, index_width)) = sparse_indices {
                 let mut profile = super::glm_index::profile_start(&octx, stream)?;
                 let sparse_args = ops::GlmSparsePrefillTc {
@@ -316,8 +449,16 @@ impl Qwen3AttentionLayer {
                         false,
                         stream,
                     )?;
-                let accelerated =
-                    native || ops::try_glm_sparse_prefill_tc(ctx.gpu, &sparse_args, stream)?;
+                // Few-row owners (verify) split over the selected IDs; the MoE
+                // expert scratch is dead until this layer's FFN.
+                let accelerated = native
+                    || ops::try_glm_sparse_prefill_tc_split(
+                        ctx.gpu,
+                        &sparse_args,
+                        ctx.buffers.expert_gate_out(),
+                        ctx.buffers.sizes().expert_gate_out,
+                        stream,
+                    )?;
                 if !accelerated {
                     ensure!(
                         cache_dtype == KvCacheDtype::Bf16,

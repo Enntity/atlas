@@ -95,6 +95,54 @@ pub fn kda_recurrent_verify_snap(
         .launch(stream)
 }
 
+/// `kda_recurrent_verify_snap` for up to four owners in one launch: owner
+/// `o` advances `states[o]` over its `tokens` rows at row `o * tokens`,
+/// writing its rollback slab `inters[o]`; bit-identical per owner.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_recurrent_verify_snap_owners(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    qkv: DevicePtr,
+    raw_gate: DevicePtr,
+    raw_beta: DevicePtr,
+    a_log: DevicePtr,
+    dt_bias: DevicePtr,
+    output: DevicePtr,
+    states: &[DevicePtr],
+    inters: &[DevicePtr],
+    inter_stride: usize,
+    tokens: u32,
+    heads: u32,
+    dim: u32,
+    lower_bound: f32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        (1..=4).contains(&states.len()) && inters.len() == states.len(),
+        "KDA owner-batched verify takes 1..=4 owners"
+    );
+    let mut l = KernelLaunch::new(gpu, kernel)
+        .grid([heads, states.len() as u32, 1])
+        .block([128, 1, 1])
+        .arg_ptr(qkv)
+        .arg_ptr(raw_gate)
+        .arg_ptr(raw_beta)
+        .arg_ptr(a_log)
+        .arg_ptr(dt_bias)
+        .arg_ptr(output);
+    for list in [states, inters] {
+        for o in 0..4 {
+            l = l.arg_ptr(list.get(o).copied().unwrap_or(DevicePtr::NULL));
+        }
+    }
+    l.arg_u64(inter_stride as u64)
+        .arg_u32(tokens)
+        .arg_u32(heads)
+        .arg_u32(dim)
+        .arg_f32(lower_bound)
+        .launch(stream)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn kda_recurrent_regresident(
     gpu: &dyn GpuBackend,

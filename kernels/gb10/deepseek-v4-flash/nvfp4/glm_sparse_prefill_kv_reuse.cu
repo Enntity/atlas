@@ -100,7 +100,11 @@ __device__ __forceinline__ void glm_kvp_load_tile(
     }
 }
 
-template <bool FP8>
+// SPLIT: CTA z covers the z-th contiguous run of 32-key tiles of the selected
+// IDs and writes its normalized FP32 output and natural LSE (-inf when empty)
+// for glm_sparse_decode_split_merge, instead of the BF16 output. Few-row
+// callers (verify owners) then fill the GPU; one split is the unsplit kernel.
+template <bool FP8, bool SPLIT>
 __device__ __forceinline__ void glm_kv_pad_body(
     const __nv_bfloat16* Q,
     const void* __restrict__ K_cache,
@@ -112,7 +116,9 @@ __device__ __forceinline__ void glm_kv_pad_body(
     unsigned int head_dim,
     unsigned int index_width,
     unsigned int cache_block_size,
-    float inv_sqrt_d
+    float inv_sqrt_d,
+    float* __restrict__ part_o,     // SPLIT: [splits, rows, heads, 512]
+    float* __restrict__ part_lse    // SPLIT: [splits, rows, heads]
 ) {
     const unsigned int token_row = blockIdx.y;
     const unsigned int head_start = blockIdx.x * 32;
@@ -124,7 +130,14 @@ __device__ __forceinline__ void glm_kv_pad_body(
     const unsigned int q_len = min(32u, num_heads - head_start);
     const unsigned int q_tile_len = q_len;
     const unsigned int q_seq_stride = head_dim;
-    const unsigned int kv_len = index_width;
+    // This CTA's selected-ID range [kv_begin, kv_len).
+    unsigned int kv_begin = 0, kv_len = index_width;
+    if constexpr (SPLIT) {
+        const unsigned int tiles = (index_width + BC_512 - 1) / BC_512;
+        const unsigned int per = (tiles + gridDim.z - 1) / gridDim.z;
+        kv_begin = min(blockIdx.z * per * BC_512, index_width);
+        kv_len = min(kv_begin + per * BC_512, index_width);
+    }
     const int* indices = token_indices + (unsigned long long)token_row * index_width;
     Q += ((unsigned long long)token_row * num_heads + head_start) * head_dim;
     O += ((unsigned long long)token_row * num_heads + head_start) * head_dim;
@@ -155,7 +168,7 @@ __device__ __forceinline__ void glm_kv_pad_body(
     float m_r0 = -1e30f, m_r1 = -1e30f;
     float l_r0 = 0.f,    l_r1 = 0.f;
 
-    unsigned int num_kv_blocks = (kv_len + BC_512 - 1) / BC_512;
+    unsigned int num_kv_blocks = (kv_len - kv_begin + BC_512 - 1) / BC_512;
 
     // === Initial Q + K[0] load (256 threads) ===
     {
@@ -169,7 +182,7 @@ __device__ __forceinline__ void glm_kv_pad_body(
             } else { *((uint4*)&smem_Q[row * GLM_KVP_STRIDE + col]) = make_uint4(0,0,0,0); }
         }
         if (num_kv_blocks > 0) {
-            glm_kvp_load_tile<FP8>(K_cache, block_table, smem_K, 0, kv_len, indices, cache_block_size, tid, blockDim.x);
+            glm_kvp_load_tile<FP8>(K_cache, block_table, smem_K, kv_begin, kv_len, indices, cache_block_size, tid, blockDim.x);
         }
         asm volatile("cp.async.commit_group;");
         asm volatile("cp.async.wait_group 0;");
@@ -177,7 +190,7 @@ __device__ __forceinline__ void glm_kv_pad_body(
     __syncthreads();
 
     for (unsigned int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
-        unsigned int kv_start = kv_block * BC_512;
+        unsigned int kv_start = kv_begin + kv_block * BC_512;
         unsigned int kv_end   = min(kv_start + BC_512, kv_len);
         unsigned int kv_tile_len = kv_end - kv_start;
 
@@ -335,7 +348,7 @@ __device__ __forceinline__ void glm_kv_pad_body(
 
         // === Sequential K[next] load (single-buffered, all 256 threads) ===
         if(kv_block+1 < num_kv_blocks){
-            glm_kvp_load_tile<FP8>(K_cache, block_table, smem_K, (kv_block+1)*BC_512, kv_len, indices, cache_block_size, tid, blockDim.x);
+            glm_kvp_load_tile<FP8>(K_cache, block_table, smem_K, kv_begin + (kv_block+1)*BC_512, kv_len, indices, cache_block_size, tid, blockDim.x);
             asm volatile("cp.async.commit_group;");
             asm volatile("cp.async.wait_group 0;");
             __syncthreads();
@@ -355,6 +368,27 @@ __device__ __forceinline__ void glm_kv_pad_body(
             il1=(lv1>0)?(1.f/lv1):0;
         }
 
+        if constexpr (SPLIT) {
+            const unsigned long long part =
+                ((unsigned long long)blockIdx.z * rows + token_row) * num_heads + head_start;
+            float* po = part_o + part * head_dim;
+            #pragma unroll
+            for(int nt=0;nt<N_TILES_PER_WARP_512;nt++){
+                const unsigned int c0 = (pv_n_start+nt)*8 + tid_in_group*2;
+                if (r0 < q_tile_len)
+                    *(float2*)&po[r0*q_seq_stride+c0] = make_float2(acc_o[nt][0]*il0, acc_o[nt][1]*il0);
+                if (r1 < q_tile_len)
+                    *(float2*)&po[r1*q_seq_stride+c0] = make_float2(acc_o[nt][2]*il1, acc_o[nt][3]*il1);
+            }
+            if (warp_id < 2 && tid_in_group == 0) {
+                const unsigned int w0 = qk_warp_m + group_id, w1 = w0 + 8;
+                if (w0 < q_tile_len)
+                    part_lse[part + w0] = l_r0 > 0.f ? m_r0 + logf(l_r0) : -INFINITY;
+                if (w1 < q_tile_len)
+                    part_lse[part + w1] = l_r1 > 0.f ? m_r1 + logf(l_r1) : -INFINITY;
+            }
+            return;
+        }
         __nv_bfloat16* ob = O;
         #pragma unroll
         for(int nt=0;nt<N_TILES_PER_WARP_512;nt++){
@@ -386,10 +420,23 @@ __device__ __forceinline__ void glm_kv_pad_body(
 
 extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad(GLM_KV_PAD_ARGS) {
     (void)V_cache;
-    glm_kv_pad_body<false>(GLM_KV_PAD_FORWARD);
+    glm_kv_pad_body<false, false>(GLM_KV_PAD_FORWARD, nullptr, nullptr);
 }
 
 extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad(GLM_KV_PAD_ARGS) {
     (void)V_cache;
-    glm_kv_pad_body<true>(GLM_KV_PAD_FORWARD);
+    glm_kv_pad_body<true, false>(GLM_KV_PAD_FORWARD, nullptr, nullptr);
+}
+
+// Split variants: grid (ceil(heads/32), rows, splits); O is unused.
+extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split(
+    GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse) {
+    (void)V_cache;
+    glm_kv_pad_body<false, true>(GLM_KV_PAD_FORWARD, part_o, part_lse);
+}
+
+extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split(
+    GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse) {
+    (void)V_cache;
+    glm_kv_pad_body<true, true>(GLM_KV_PAD_FORWARD, part_o, part_lse);
 }

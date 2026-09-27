@@ -123,6 +123,9 @@ pub struct Glm5KdaLayer {
     recurrent_k: KernelHandle,
     recurrent_indexed_k: KernelHandle,
     recurrent_verify_snap_k: KernelHandle,
+    /// Owner-batched, register-resident twin of `recurrent_verify_snap_k`
+    /// (bit-identical); `ATLAS_KDA_VERIFY_OWNERS=0` disables.
+    recurrent_verify_owners_k: KernelHandle,
     preprocess_regresident_k: KernelHandle,
     recurrent_regresident_k: KernelHandle,
     register_resident_prefill: bool,
@@ -266,6 +269,13 @@ impl Glm5KdaLayer {
                 "kda",
                 "kda_recurrent_bf16_verify_snap",
             ),
+            recurrent_verify_owners_k: if std::env::var("ATLAS_KDA_VERIFY_OWNERS").as_deref()
+                == Ok("0")
+            {
+                KernelHandle(0)
+            } else {
+                super::try_kernel(gpu, "kda", "kda_recurrent_bf16_verify_snap_owners")
+            },
             preprocess_regresident_k,
             recurrent_regresident_k,
             register_resident_prefill,

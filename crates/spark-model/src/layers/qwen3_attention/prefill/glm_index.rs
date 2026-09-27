@@ -41,6 +41,86 @@ pub(super) fn profile_lap(
 }
 
 impl Qwen3AttentionLayer {
+    /// Semantic-index keys (projected + layernorm) and pool gates of `n`
+    /// normed rows into `keys` / `gates` (`[n, index_head_dim]` BF16 each).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn glm_index_project_keys(
+        &self,
+        normed: spark_runtime::gpu::DevicePtr,
+        n: u32,
+        keys: spark_runtime::gpu::DevicePtr,
+        gates: spark_runtime::gpu::DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let indexer = self
+            .mla
+            .as_ref()
+            .and_then(|m| m.glm_indexer.as_ref())
+            .expect("GLM index keys without indexer weights");
+        let h = ctx.config.hidden_size as u32;
+        let dim = ctx.config.index_head_dim as u32;
+        self.mla_prefill_dense(normed, &indexer.wk, keys, n, dim, h, ctx, stream)?;
+        ops::glm_index_layernorm(
+            ctx.gpu,
+            self.glm_index_layernorm_k,
+            keys,
+            indexer.k_norm_weight.weight,
+            indexer.k_norm_bias.weight,
+            n,
+            dim,
+            1e-6,
+            stream,
+        )?;
+        self.mla_prefill_dense(normed, &indexer.kpool_gate, gates, n, dim, h, ctx, stream)
+    }
+
+    /// Semantic-index queries (`[n, heads * dim]`) and per-head weights
+    /// (`[n, heads]`) of `n` rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn glm_index_project_query(
+        &self,
+        q_latent: spark_runtime::gpu::DevicePtr,
+        normed: spark_runtime::gpu::DevicePtr,
+        n: u32,
+        index_query: spark_runtime::gpu::DevicePtr,
+        weights: spark_runtime::gpu::DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let mla = self.mla.as_ref().expect("GLM index query without MLA");
+        let indexer = mla
+            .glm_indexer
+            .as_ref()
+            .expect("GLM index query without indexer weights");
+        let index_heads = ctx.config.index_n_heads as u32;
+        self.mla_prefill_dense(
+            q_latent,
+            &indexer.wq_b,
+            index_query,
+            n,
+            index_heads * ctx.config.index_head_dim as u32,
+            mla.q_lora_rank as u32,
+            ctx,
+            stream,
+        )?;
+        // BF16 is sufficient for the first functional selector. A later
+        // measured refinement will retain this projection's FP32 accumulator,
+        // matching upstream's near-tie ranking treatment.
+        self.mla_prefill_dense(
+            normed,
+            &indexer.weights_proj,
+            weights,
+            n,
+            index_heads,
+            ctx.config.hidden_size as u32,
+            ctx,
+            stream,
+        )
+    }
+
+    /// `projected`: this chunk's keys and gates already produced by
+    /// `glm_index_project_keys` (owner-batched verify), else projected here.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_index_prefill_cache_update(
         &self,
@@ -49,6 +129,7 @@ impl Qwen3AttentionLayer {
         kv_cache: &PagedKvCache,
         ctx: &ForwardContext,
         stream: u64,
+        projected: Option<(spark_runtime::gpu::DevicePtr, spark_runtime::gpu::DevicePtr)>,
     ) -> Result<()> {
         let mla = self
             .mla
@@ -77,34 +158,17 @@ impl Qwen3AttentionLayer {
         let mut profile = profile_start(ctx, stream)?;
 
         let rows = n;
-        let h = ctx.config.hidden_size as u32;
         let dim = spec.head_dim as u32;
-        let keys = ctx.buffers.ssm_qkvz();
-        let gates = keys.offset(n as usize * spec.head_dim * 2);
-        self.mla_prefill_dense(normed, &indexer.wk, keys, rows, dim, h, ctx, stream)?;
-        ops::glm_index_layernorm(
-            ctx.gpu,
-            self.glm_index_layernorm_k,
-            keys,
-            indexer.k_norm_weight.weight,
-            indexer.k_norm_bias.weight,
-            rows,
-            dim,
-            1e-6,
-            stream,
-        )?;
-        let key_projection_us = profile_lap(ctx, stream, &mut profile)?;
-        self.mla_prefill_dense(
-            normed,
-            &indexer.kpool_gate,
-            gates,
-            rows,
-            dim,
-            h,
-            ctx,
-            stream,
-        )?;
-        let gate_projection_us = profile_lap(ctx, stream, &mut profile)?;
+        let (keys, gates) = match projected {
+            Some(p) => p,
+            None => {
+                let keys = ctx.buffers.ssm_qkvz();
+                let gates = keys.offset(n as usize * spec.head_dim * 2);
+                self.glm_index_project_keys(normed, n, keys, gates, ctx, stream)?;
+                (keys, gates)
+            }
+        };
+        let projection_us = profile_lap(ctx, stream, &mut profile)?;
         let meta = ctx
             .attn_metadata
             .expect("GLM index cache update requires slot metadata");
@@ -142,11 +206,10 @@ impl Qwen3AttentionLayer {
         let cache_write_us = profile_lap(ctx, stream, &mut profile)?;
         if profile.is_some() {
             tracing::info!(
-                "ATLAS_GLM_INDEX_PROFILE phase=cache layer={} rows={} key_projection_us={} gate_projection_us={} cache_write_us={}",
+                "ATLAS_GLM_INDEX_PROFILE phase=cache layer={} rows={} projection_us={} cache_write_us={}",
                 self.attn_layer_idx,
                 rows,
-                key_projection_us,
-                gate_projection_us,
+                projection_us,
                 cache_write_us,
             );
         }
@@ -157,6 +220,10 @@ impl Qwen3AttentionLayer {
     /// every row in this prefill chunk. Logits are processed in bounded row
     /// tiles using the existing MoE activation arena, so scratch does not grow
     /// with the configured model context.
+    ///
+    /// `projected`: the rows' queries and weights already produced by
+    /// `glm_index_project_query` (owner-batched verify), else projected here.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_index_prefill_select(
         &self,
         q_latent: DevicePtr,
@@ -166,12 +233,12 @@ impl Qwen3AttentionLayer {
         kv_cache: &PagedKvCache,
         ctx: &ForwardContext,
         stream: u64,
+        projected: Option<(DevicePtr, DevicePtr)>,
     ) -> Result<(DevicePtr, u32)> {
-        let mla = self.mla.as_ref().expect("GLM index selection without MLA");
-        let indexer = mla
-            .glm_indexer
-            .as_ref()
-            .expect("GLM index selection without indexer weights");
+        ensure!(
+            self.mla.as_ref().is_some_and(|m| m.glm_indexer.is_some()),
+            "GLM index selection without indexer weights"
+        );
         ensure!(
             self.glm_index_logits_k.0 != 0
                 && self.glm_index_topk_expand_k.0 != 0
@@ -187,31 +254,14 @@ impl Qwen3AttentionLayer {
         let logits_stride = sequence_end.div_ceil(pool_size as usize) as u32;
 
         let mut profile = profile_start(ctx, stream)?;
-        let index_query = ctx.buffers.ssm_deinterleaved();
-        self.mla_prefill_dense(
-            q_latent,
-            &indexer.wq_b,
-            index_query,
-            n,
-            index_heads * index_dim,
-            mla.q_lora_rank as u32,
-            ctx,
-            stream,
-        )?;
-        // BF16 is sufficient for the first functional selector. A later
-        // measured refinement will retain this projection's FP32 accumulator,
-        // matching upstream's near-tie ranking treatment.
-        let weights = ctx.buffers.ssm_gates();
-        self.mla_prefill_dense(
-            normed,
-            &indexer.weights_proj,
-            weights,
-            n,
-            index_heads,
-            ctx.config.hidden_size as u32,
-            ctx,
-            stream,
-        )?;
+        let (index_query, weights) = match projected {
+            Some(p) => p,
+            None => {
+                let (q, w) = (ctx.buffers.ssm_deinterleaved(), ctx.buffers.ssm_gates());
+                self.glm_index_project_query(q_latent, normed, n, q, w, ctx, stream)?;
+                (q, w)
+            }
+        };
 
         let logits = ctx.buffers.expert_up_out();
         let tile_rows = super::super::glm_index_capacity::tile_rows(
