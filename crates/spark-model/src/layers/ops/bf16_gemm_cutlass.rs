@@ -46,25 +46,46 @@ pub fn bf16_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    if enabled()
-        && m >= MIN_ROWS
-        && spark_runtime::cutlass::bf16_gemm_tuned(
-            act.0,
-            weight,
-            out.0,
-            m,
-            n,
-            k,
-            k,
-            n,
-            config(n, k),
-            stream,
-        )
-        .is_ok()
-    {
-        return Ok(());
+    if enabled() && m >= MIN_ROWS {
+        let cfg = config(n, k);
+        let ok = row_blocks(m, k, cfg).all(|(row, rows)| {
+            spark_runtime::cutlass::bf16_gemm_tuned(
+                act.0 + u64::from(row) * u64::from(k) * 2,
+                weight,
+                out.0 + u64::from(row) * u64::from(n) * 2,
+                rows,
+                n,
+                k,
+                k,
+                n,
+                cfg,
+                stream,
+            )
+            .is_ok()
+        });
+        if ok {
+            return Ok(());
+        }
     }
     spark_runtime::cublaslt::bf16_gemm_act_weight_t(act.0, weight, out.0, m, n, k, stream)
+}
+
+/// Activation bytes the unswizzled raster (config 0) keeps L2-resident while
+/// every column of tiles re-reads them: 4096 rows at K 2048. Past this (an
+/// 8K prefill chunk) each re-read goes to DRAM, ~7x slower, so wider calls
+/// run as consecutive row blocks (rows are independent: identical output).
+const UNSWIZZLED_ACT_BYTES: u64 = 16 << 20;
+
+fn row_blocks(m: u32, k: u32, cfg: u32) -> impl Iterator<Item = (u32, u32)> {
+    let limit = ((UNSWIZZLED_ACT_BYTES / (u64::from(k) * 2)) as u32 / 128 * 128).max(128);
+    // A few scheduling rows past the limit (a 4100-row chunk) stay whole
+    // rather than pay a tiny tail launch that re-reads the weight.
+    let block = if cfg == 0 && m > limit + 64 {
+        m.div_ceil(m.div_ceil(limit)).next_multiple_of(128)
+    } else {
+        m
+    };
+    (0..m.div_ceil(block)).map(move |i| (i * block, block.min(m - i * block)))
 }
 
 /// Whether [`bf16_gemm`] routes `m` rows through CUTLASS.
@@ -94,7 +115,17 @@ pub fn fp8_e4m3_to_bf16(
 
 #[cfg(test)]
 mod tests {
-    use super::config;
+    use super::{config, row_blocks};
+
+    #[test]
+    fn unswizzled_calls_split_into_l2_resident_row_blocks() {
+        let blocks: Vec<_> = row_blocks(8188, 2048, 0).collect();
+        assert_eq!(blocks, [(0, 4096), (4096, 4092)]);
+        assert_eq!(row_blocks(4100, 2048, 0).collect::<Vec<_>>(), [(0, 4100)]);
+        assert_eq!(row_blocks(16388, 2048, 0).count(), 5);
+        // Swizzled configs keep one launch.
+        assert_eq!(row_blocks(8188, 4096, 9).collect::<Vec<_>>(), [(0, 8188)]);
+    }
 
     #[test]
     fn config_follows_measured_glm_shapes() {

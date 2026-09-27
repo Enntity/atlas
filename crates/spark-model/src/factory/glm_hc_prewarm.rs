@@ -6,6 +6,7 @@ use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 const FLAG: &str = "ATLAS_GLM_HC_TF32_PREWARM";
+/// Warmed shapes after the full arena: a 4K chunk and a common final chunk.
 const ROWS: [u32; 3] = [4100, 4096, 3515];
 
 fn parse(value: Option<&str>) -> Result<bool> {
@@ -37,8 +38,19 @@ struct Plan {
     activation_bytes: usize,
     scratch_bytes: usize,
     output: DevicePtr,
+    max_rows: u32,
     n: u32,
     k: u32,
+}
+
+impl Plan {
+    /// The full-arena shape first, so its library residency lands before
+    /// the KV free snapshot, then the remaining `ROWS`.
+    fn rows(&self) -> Vec<u32> {
+        let mut rows = vec![self.max_rows];
+        rows.extend(ROWS.into_iter().filter(|&m| m < self.max_rows));
+        rows
+    }
 }
 
 fn bytes(rows: usize, columns: usize) -> Result<usize> {
@@ -68,11 +80,9 @@ impl Plan {
             config.model_type == "glm5_next"
                 && config.hidden_size == 4096
                 && config.hc_mult == 4
-                // Plus the verify rows a fused prefill chunk may carry.
-                && (ROWS[0] as usize..=ROWS[0] as usize + crate::layer::glm_long_owner::MAX_ROWS)
-                    .contains(&max_rows)
+                && max_rows >= ROWS[0] as usize
                 && config.max_batch_tokens == max_rows,
-            "HC TF32 prewarm requires GLM H4096/HC4 and a 4100-row arena"
+            "HC TF32 prewarm requires GLM H4096/HC4 and a >=4100-row arena"
         );
         ensure!(
             matches!(hc_flag, Some("1" | "true" | "yes")),
@@ -119,6 +129,7 @@ impl Plan {
             activation_bytes,
             scratch_bytes,
             output,
+            max_rows: u32::try_from(max_rows)?,
             n: u32::try_from(n)?,
             k: u32::try_from(k)?,
         })
@@ -147,7 +158,7 @@ fn execute(
     let result = (|| {
         gpu.memset_async(plan.storage.activation, 0, plan.activation_bytes, stream)?;
         gpu.memset_async(plan.storage.scratch, 0, plan.scratch_bytes, stream)?;
-        for m in ROWS {
+        for m in plan.rows() {
             project(Projection {
                 activation: plan.storage.activation,
                 weight: plan.storage.scratch,
@@ -209,7 +220,7 @@ pub(super) fn initialize(
     let free_after = gpu.free_memory()?;
     tracing::info!(
         rank = config.ep_rank,
-        rows = ?ROWS,
+        rows = ?plan.rows(),
         n = plan.n,
         k = plan.k,
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.,

@@ -64,7 +64,8 @@ fn explicit_4096_installed_dispatch_slabs_with_exact_row_offsets_and_no_oracle_c
     for capacity in [4096, 4101] {
         fixture(capacity, |layer, ctx, gpu| {
             let (cache, output, n, k, _) = projection(layer, ctx, 0);
-            let rows = if capacity == 4096 { 4097 } else { 4101 };
+            // One row past the arena.
+            let rows = if capacity == 4096 { 4097 } else { 4102 };
             assert!(
                 layer
                     .run_shared_fp8_cache(

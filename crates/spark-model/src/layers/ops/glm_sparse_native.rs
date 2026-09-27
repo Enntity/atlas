@@ -46,9 +46,9 @@ fn validate_startup(
 ) -> Result<()> {
     validate_geometry(c)?;
     ensure!(
-        // 4100 rows, plus the verify rows a fused chunk may carry (the
-        // native attention itself still sees at most 4100 rows per owner).
-        (4100..=4100 + crate::layer::glm_long_owner::MAX_ROWS).contains(&rows)
+        // At least a 4K chunk; wider chunks reach the native attention in
+        // pieces of at most 4096 rows (`PREFILL_ATTENTION_ROWS`).
+        rows >= 4100
             && c.max_batch_tokens == rows
             && seq == plan::MAX_CONTEXT
             && block == 16
@@ -56,7 +56,7 @@ fn validate_startup(
             // An fp8_g128 cache reaches the library through its BF16 view.
             && matches!(dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128)
             && layer_dtypes.iter().all(|&d| d == dtype),
-        "native sparse requires4100-row arena,32K context,C4,block16,BF16/fp8_g128 cache"
+        "native sparse requires a >=4100-row arena,32K context,C4,block16,BF16/fp8_g128 cache"
     );
     let sizes = BufferSizes::from_config(c, rows, seq, block, active);
     let (required, _) =

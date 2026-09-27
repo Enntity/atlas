@@ -43,8 +43,19 @@ fn enabled(value: Option<&str>) -> Result<bool> {
     }
 }
 
+/// Rows one library call accepts (compiled into the pinned bridge).
+const PIECE_ROWS: std::ops::RangeInclusive<usize> = 2048..=4100;
+
 pub(super) fn eligible(tokens: usize, decode: bool, graph_capture: bool) -> bool {
-    !decode && !graph_capture && (2048..=4100).contains(&tokens)
+    !decode && !graph_capture && tokens >= *PIECE_ROWS.start()
+}
+
+/// Near-equal consecutive pieces within `PIECE_ROWS` covering `tokens`
+/// rows; the recurrent state carries across calls in place.
+fn pieces(tokens: usize) -> impl Iterator<Item = (usize, usize)> {
+    let n = tokens.div_ceil(*PIECE_ROWS.end());
+    let piece = tokens.div_ceil(n);
+    (0..n).map(move |i| (i * piece, piece.min(tokens - i * piece)))
 }
 
 fn checked_ranges(ranges: &[(DevicePtr, usize)]) -> Result<()> {
@@ -102,7 +113,7 @@ impl FlashPrefill {
         };
         tracing::info!(
             library = path,
-            "FlashKDA prefill enabled for 2048..=4100 rows; decode and verification unchanged"
+            "FlashKDA prefill enabled for >=2048 rows (2048..=4100 per call); decode and verification unchanged"
         );
         Ok(Some(Self {
             _library: library,
@@ -129,6 +140,39 @@ impl FlashPrefill {
             eligible(tokens, false, ctx.graph_capture),
             "Unqualified FlashKDA invocation"
         );
+        let plane_row = 32 * 128 * 2;
+        for (row, rows) in pieces(tokens) {
+            self.forward_piece(
+                qkv.offset(row * 3 * plane_row),
+                gate.offset(row * plane_row),
+                beta.offset(row * 32 * 2),
+                a,
+                bias,
+                state,
+                output.offset(row * plane_row),
+                rows,
+                ctx,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_piece(
+        &self,
+        qkv: DevicePtr,
+        gate: DevicePtr,
+        beta: DevicePtr,
+        a: DevicePtr,
+        bias: DevicePtr,
+        state: DevicePtr,
+        output: DevicePtr,
+        tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(PIECE_ROWS.contains(&tokens), "Unqualified FlashKDA piece");
         let heads = 32usize;
         let plane = tokens * heads * 128 * 2;
         let state_bytes = heads * 128 * 128 * 4;
@@ -206,13 +250,26 @@ mod tests {
     }
     #[test]
     fn qualification_excludes_decode_capture_and_short_tails() {
-        assert!(eligible(2048, false, false));
-        assert!(eligible(4100, false, false));
-        for n in [0, 1, 3, 2047, 4101, 32768] {
+        for n in [2048, 4100, 4101, 8196, 16388] {
+            assert!(eligible(n, false, false));
+        }
+        for n in [0, 1, 3, 2047] {
             assert!(!eligible(n, false, false));
         }
         assert!(!eligible(4096, true, false));
         assert!(!eligible(4096, false, true));
+    }
+    #[test]
+    fn pieces_tile_rows_within_the_bridge_range() {
+        for tokens in [2048, 4096, 4100, 4101, 4104, 6000, 8192, 8196, 12292, 16388, 65520] {
+            let mut next = 0;
+            for (row, rows) in pieces(tokens) {
+                assert_eq!(row, next);
+                assert!(PIECE_ROWS.contains(&rows), "{tokens}: piece {rows}");
+                next += rows;
+            }
+            assert_eq!(next, tokens);
+        }
     }
     #[test]
     fn overlaps_and_address_wrap_are_rejected() {

@@ -7,8 +7,9 @@ pub(crate) fn validate_budget(rows: usize, limit: usize) -> Result<()> {
         matches!(limit, 1024 | 2048 | 4096),
         "unknown shared FP8 prefill profile"
     );
+    // The 4096 profile's 1024-row slabs cover any wider chunk too.
     ensure!(
-        (1..=limit).contains(&rows),
+        rows >= 1 && (limit == 4096 || rows <= limit),
         "shared FP8 cache prefill must be 1..{limit}"
     );
     Ok(())
@@ -34,9 +35,10 @@ pub(crate) fn plan(
         matches!(budget, 2048 | 4096),
         "unknown shared FP8 slab profile"
     );
-    // A configured chunk may include four aligned scheduling rows.
+    // A configured chunk may include four aligned scheduling rows; the
+    // 4096 profile admits any arena-bounded chunk.
     ensure!(
-        rows > 0 && rows as usize <= budget + 4 && rows as usize <= arena_rows,
+        rows > 0 && (budget == 4096 || rows as usize <= budget + 4) && rows as usize <= arena_rows,
         "shared FP8 slab capacity"
     );
     ensure!(
@@ -130,7 +132,7 @@ mod tests {
     #[test]
     fn explicit_4096_profile_preserves_1024_slabs_and_checks_tail_and_arena() {
         assert!(validate_budget(4096, 4096).is_ok());
-        assert!(validate_budget(4097, 4096).is_err());
+        assert!(validate_budget(8192, 4096).is_ok());
         assert!(validate_budget(4096, 2048).is_err());
         for (n, k) in [(2048, 4096), (4096, 2048)] {
             let slabs = plan(4100, 4100, n, k, 0x100000, 0x10000000, 4096).unwrap();
@@ -142,7 +144,7 @@ mod tests {
             assert_eq!(slabs[4].output, 0x10000000 + 4096 * u64::from(n) * 2);
         }
         assert!(plan(4100, 4099, 2048, 4096, 16, 32, 4096).is_err());
-        assert!(plan(4101, 8192, 2048, 4096, 16, 32, 4096).is_err());
+        assert_eq!(plan(8196, 8196, 2048, 4096, 16, 32, 4096).unwrap().len(), 9);
         assert!(plan(2053, 4100, 2048, 4096, 16, 32, 2048).is_err());
     }
 }

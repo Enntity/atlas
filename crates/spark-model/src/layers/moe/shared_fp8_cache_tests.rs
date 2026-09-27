@@ -247,11 +247,11 @@ fn explicit_2048_profile_checks_flag_and_configured_budget_before_loading() {
 fn explicit_4096_profile_bounds_and_conflicting_flags_fail_before_loading() {
     const CHILD: &str = "ATLAS_TEST_SHARED_4096_PROFILE";
     if let Ok(case) = std::env::var(CHILD) {
-        for rows in [0, 1, 1024, 1025, 2048, 2049, 4096, 4097, 4100] {
+        for rows in [0, 1, 1024, 1025, 2048, 2049, 4096, 4097, 4100, 8196] {
             assert_eq!(
                 validate_shared_fp8_cache_profile(&config(), rows, false).is_ok(),
                 match case.as_str() {
-                    "on" => (1..=4096).contains(&rows),
+                    "on" => rows >= 1,
                     "off" => (1..=1024).contains(&rows),
                     "both" | "bad" => false,
                     _ => unreachable!(),

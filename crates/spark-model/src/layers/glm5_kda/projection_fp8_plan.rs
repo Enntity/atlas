@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! CPU-only admission and scratch proof for the qualified KDA Lt FP8 route.
 
-/// Widest qualified projection: a full prefill chunk plus the DFlash verify
-/// rows that may ride it (`glm_fused_chunk`).
-const MAX_M: u32 = 4100 + crate::layer::glm_long_owner::MAX_ROWS as u32;
+/// Widest qualified projection (the arena bound is checked by `plan`).
+const MAX_M: u32 = u16::MAX as u32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Span {
     pub ptr: u64,
@@ -180,6 +179,7 @@ mod tests {
             )
             .is_err()
         );
+        // Wider than the fixture's 4100-row arena.
         assert!(fixture(4101, 64 << 20).is_err());
     }
 }
