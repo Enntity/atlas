@@ -123,18 +123,92 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let hc = self.hc.as_ref().context("GLM long owner MLA needs mHC")?;
+        let rows = long_owner::owner_rows(owners)?;
+        let chunk_owners: Vec<_> = owners
+            .iter()
+            .enumerate()
+            .map(|(owner, input)| owner_chunk(owner * rows, input))
+            .collect();
+        self.glm_mla_chunk_owners(
+            &chunk_owners,
+            Some(stage),
+            kv_cache,
+            ctx,
+            stream,
+            &mut || long_owner::ffn_per_owner(&self.ffn, owners.len(), rows, stage, ctx, stream),
+        )
+    }
+
+    /// A prefill chunk of `num_tokens` rows (`ctx.attn_metadata` holds the
+    /// chunk's paged metadata, with positions and slots covering every row)
+    /// carrying verify owners at `num_tokens + owner * rows`: the chunk's
+    /// pieces and one chunk owner per passenger share one row-wise pass.
+    pub(in crate::layers::qwen3_attention) fn prefill_glm_passengers_mla(
+        &self,
+        num_tokens: usize,
+        seq_len_start: usize,
+        passengers: &[GlmLongOwner<'_>],
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            self.mla.as_ref().is_some_and(|m| m.glm_indexer.is_some())
+                && self.hc.is_some()
+                && !self.ffn.is_none(),
+            "GLM fused prefill + verify requires an mHC GLM MLA layer with FFN"
+        );
+        ensure!(
+            self.block_idx != 0 && self.block_idx + 1 != ctx.config.num_hidden_layers,
+            "GLM fused prefill + verify MLA cannot be the first or last layer"
+        );
+        let rows = long_owner::owner_rows(passengers)?;
+        let meta = ctx
+            .attn_metadata
+            .context("GLM fused prefill + verify requires chunk metadata")?;
+        let mut owners = crate::layers::qwen3_attention::prefill::glm_chunk_pieces(
+            meta,
+            seq_len_start,
+            num_tokens,
+            ctx.config.index_topk,
+        );
+        owners.extend(
+            passengers
+                .iter()
+                .enumerate()
+                .map(|(owner, input)| owner_chunk(num_tokens + owner * rows, input)),
+        );
+        let total = num_tokens + passengers.len() * rows;
+        let b = ctx.buffers;
+        self.glm_mla_chunk_owners(&owners, None, kv_cache, ctx, stream, &mut || {
+            self.ffn.forward_prefill(b.norm_output(), total, ctx, stream)?;
+            Ok(b.moe_output())
+        })
+    }
+
+    /// GLM's MLA layer over chunk owners that tile the stacked rows: mHC
+    /// pre/post, norms, TP all-reduce and `ffn` run once over every row and
+    /// `glm_chunk_attention` per owner. `stash` keeps the mHC coefficients in
+    /// the verify stage across the attention.
+    fn glm_mla_chunk_owners(
+        &self,
+        owners: &[crate::layers::qwen3_attention::prefill::GlmChunkOwner],
+        stash: Option<&GlmLongStage>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+        ffn: &mut dyn FnMut() -> Result<DevicePtr>,
+    ) -> Result<()> {
+        let hc = self.hc.as_ref().context("GLM MLA chunk owners need mHC")?;
         ensure!(
             ops::HcVariant::of(hc).applies_block_input_norm() && self.post_attn_out_norm.is_none(),
-            "GLM long owner MLA chunk expects GLM's mHC norm layout"
+            "GLM MLA chunk owners expect GLM's mHC norm layout"
         );
-        let rows = long_owner::owner_rows(owners)?;
-        let total = owners.len() * rows;
+        let total: usize = owners.iter().map(|o| o.rows).sum();
         let n = total as u32;
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
         let b = ctx.buffers;
-        let r = stage.rows;
         let (hidden, normed) = (b.hidden_states(), b.norm_output());
         self.hc_pre_prefill(&hc.attn, hc, hidden, n, ctx, stream)?;
         ops::rms_norm(
@@ -148,34 +222,24 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
-        // The mHC coefficients survive the attention in the stage.
-        let coeffs = [
-            (b.hc_post(), stage.post, r.post),
-            (b.hc_comb(), stage.comb, r.comb),
-        ];
-        stage.copy(ctx.gpu, &coeffs, 0, 0, total, true, stream)?;
-        let chunk_owners: Vec<crate::layers::qwen3_attention::prefill::GlmChunkOwner> = owners
-            .iter()
-            .enumerate()
-            .map(|(owner, input)| crate::layers::qwen3_attention::prefill::GlmChunkOwner {
-                row0: owner * rows,
-                rows,
-                seq_len_start: input.positions[0],
-                meta: AttnMetadataDev {
-                    num_seqs: 1,
-                    // Chunk-total length: the last row's causal extent.
-                    seq_len: input.meta.seq_len.offset((rows - 1) * 4),
-                    ..input.meta
-                },
-            })
-            .collect();
+        let coeffs = stash.map(|stage| {
+            [
+                (b.hc_post(), stage.post, stage.rows.post),
+                (b.hc_comb(), stage.comb, stage.rows.comb),
+            ]
+        });
+        if let (Some(stage), Some(coeffs)) = (stash, &coeffs) {
+            stage.copy(ctx.gpu, coeffs, 0, 0, total, true, stream)?;
+        }
         let attn_out =
-            self.prefill_attention_glm_owners(&chunk_owners, normed, total, kv_cache, ctx, stream)?;
-        stage.copy(ctx.gpu, &coeffs, 0, 0, total, false, stream)?;
+            self.prefill_attention_glm_owners(owners, normed, total, kv_cache, ctx, stream)?;
+        if let (Some(stage), Some(coeffs)) = (stash, &coeffs) {
+            stage.copy(ctx.gpu, coeffs, 0, 0, total, false, stream)?;
+        }
         if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {
-            comm.all_reduce_async(attn_out.0, total * r.hidden, stream)?;
+            comm.all_reduce_async(attn_out.0, total * h * 2, stream)?;
         }
         let streams = b.hc_streams();
         let (post, comb) = (b.hc_post(), b.hc_comb());
@@ -217,7 +281,7 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
-        let ffn_out = long_owner::ffn_per_owner(&self.ffn, owners.len(), rows, stage, ctx, stream)?;
+        let ffn_out = ffn()?;
         ops::hc_post_site(
             ctx.gpu,
             self.hc_post_k,
@@ -231,5 +295,23 @@ impl Qwen3AttentionLayer {
             h as u32,
             stream,
         )
+    }
+}
+
+/// One verify owner's `rows` rows at `row0` as a causal chunk owner.
+fn owner_chunk(
+    row0: usize,
+    input: &GlmLongOwner<'_>,
+) -> crate::layers::qwen3_attention::prefill::GlmChunkOwner {
+    crate::layers::qwen3_attention::prefill::GlmChunkOwner {
+        row0,
+        rows: input.positions.len(),
+        seq_len_start: input.positions[0],
+        meta: AttnMetadataDev {
+            num_seqs: 1,
+            // Chunk-total length: the last row's causal extent.
+            seq_len: input.meta.seq_len.offset((input.positions.len() - 1) * 4),
+            ..input.meta
+        },
     }
 }

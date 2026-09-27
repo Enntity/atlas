@@ -382,6 +382,44 @@ impl TransformerLayer for Glm5KdaLayer {
         self.forward_ffn_post(phase, ffn_out, None, ctx, stream)
     }
 
+    fn prefill_with_glm_passengers(
+        &self,
+        hidden: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        _seq_len_start: usize,
+        passengers: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        _cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let rows = crate::layer::glm_long_owner::owner_rows(passengers)?;
+        ensure!(
+            ctx.midchunk_capture.is_none(),
+            "GLM fused prefill + verify does not split the chunk recurrence"
+        );
+        let state = state
+            .as_any_mut()
+            .downcast_mut::<SsmLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("GLM-5 KDA expected SsmLayerState"))?;
+        ensure!(!state.h_is_f16, "GLM-5 KDA requires FP32 recurrent state");
+        // Prefill kernels over every row; only the recurrences split.
+        let phase = self.forward_attention_rows(
+            hidden,
+            num_tokens + passengers.len() * rows,
+            false,
+            false,
+            ctx,
+            stream,
+            &mut |projected, g1, beta| {
+                self.forward_recurrent_passengers(
+                    projected, g1, beta, state, num_tokens, passengers, rows, ctx, stream,
+                )
+            },
+        )?;
+        self.forward_ffn(phase, ctx, stream)
+    }
+
     fn supports_glm_pair_verify(&self) -> bool {
         self.pair_supported()
     }

@@ -110,7 +110,7 @@ use logprobs::*;
 use mod_helpers::*;
 use mtp_bootstrap_step::*;
 use mtp_step::*;
-use phase_continue_prefills::continue_in_progress_prefills;
+use phase_continue_prefills::{SpecStep, continue_in_progress_prefills};
 use phase_start_prefills::start_new_requests;
 use prefill_a_step::*;
 use prefill_b_step::*;
@@ -647,6 +647,13 @@ pub fn run(
 
         // ── Continue in-progress prefills ──
         let t_loop = std::time::Instant::now();
+        let mut rode: Vec<usize> = Vec::new();
+        let spec_step = SpecStep {
+            num_drafts: model
+                .verify_max_drafts()
+                .map_or(num_drafts, |max| num_drafts.min(max)),
+            dflash_verify_raw_argmax: use_mtp && dflash_verify_raw_argmax,
+        };
         let did_mixed_step = continue_in_progress_prefills(
             &*model,
             &*policy,
@@ -667,6 +674,8 @@ pub fn run(
             tool_call_end_token,
             adaptive_sampling,
             &sched,
+            &spec_step,
+            &mut rode,
         );
         sched.timing.record(mtp_timing::Phase::LoopPrefill, t_loop);
 
@@ -690,8 +699,20 @@ pub fn run(
             }
         }
 
+        // Owners whose verify rode this tick's prefill chunk already stepped;
+        // they rejoin before retirement.
+        let rode_seqs: Vec<ActiveSeq> = if rode.is_empty() {
+            Vec::new()
+        } else {
+            let (rode_seqs, rest) = std::mem::take(&mut active)
+                .into_iter()
+                .partition(|a| rode.contains(&a.seq.slot_idx));
+            active = rest;
+            rode_seqs
+        };
+
         // Skip decode when mixed_forward already processed decode logits.
-        if !did_mixed_step {
+        if !did_mixed_step && !active.is_empty() {
             // Ensure any in-flight prefill work on the prefill stream is complete
             // before decode starts on the default stream.
             if !prefilling.is_empty() {
@@ -706,21 +727,12 @@ pub fn run(
             // think-end/pin-tool-call/forced-token/grammar). Without
             // this context the MTP/spec verify path emits unmasked
             // GPU-argmax tokens (Phase C-2 root cause, 2026-05-24).
-            let verify_ctx = crate::scheduler::logit_processors::LogitsContext {
-                glm_tool_boundary: sched.limits.glm_tool_boundary,
-                watchdog: sched.watchdog,
-                scratch: &sched.scratch,
-                dumps: &sched.dumps,
-                stats: sched.stats.clone(),
+            let verify_ctx = sched.verify_logits_ctx(
                 think_end_token,
                 think_start_token,
                 tool_call_start_token,
                 tool_call_end_token,
-                boundary_mask: sched.masks.boundary.clone(),
-                mid_word_mask: sched.masks.mid_word.clone(),
-                sampling: sched.levers.sampling(),
-                timing: sched.timing.clone(),
-            };
+            );
             // Spec-resume guard (ATLAS_DFLASH_RESUME_GUARD=N, default 0 = off):
             // keep the first N post-`</think>` tokens on plain serial decode.
             // The T=0 verify-vs-decode low-margin flips measured 2026-07-07
@@ -1026,6 +1038,8 @@ pub fn run(
                 }
             }
         }
+
+        active.extend(rode_seqs);
 
         let t_loop = std::time::Instant::now();
         // Deadline sweep BEFORE retirement, so a timed-out sequence retires

@@ -76,6 +76,26 @@ pub trait TransformerLayer: Send + Sync {
         anyhow::bail!("GLM long-context owner-batched verify is unsupported for this layer")
     }
 
+    /// A prefill chunk of `num_tokens` rows at arena rows `[0, num_tokens)`
+    /// that DFlash verify owners ride (`glm_long_owner`): owner `o`'s rows sit
+    /// at `num_tokens + o * rows`. Row-local work runs once over every row;
+    /// each sequence advances only its own state. Unsupported layers refuse
+    /// before any work.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_with_glm_passengers(
+        &self,
+        _hidden: DevicePtr,
+        _num_tokens: usize,
+        _state: &mut dyn LayerState,
+        _seq_len_start: usize,
+        _passengers: &mut [super::glm_long_owner::GlmLongOwner<'_>],
+        _cache: &mut PagedKvCache,
+        _ctx: &ForwardContext<'_>,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM fused prefill + verify is unsupported for this layer")
+    }
+
     /// Fixed eager GLM [5,5] compute support, not request/transaction authority.
     fn supports_glm_pair_verify(&self) -> bool {
         false

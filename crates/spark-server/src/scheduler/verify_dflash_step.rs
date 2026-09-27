@@ -217,7 +217,8 @@ pub(super) fn verify_dflash_tail(
     }
     if let Some(raw) = raw_trace {
         tracing::info!(
-            "LIGHTNING VERIFY TOKEN TRACE last={} drafts={:?} raw={:?} processed={:?} accepted={}",
+            "LIGHTNING VERIFY TOKEN TRACE slot={} last={} drafts={:?} raw={:?} processed={:?} accepted={}",
+            a.seq.slot_idx,
             a.last_token,
             drafts,
             raw,
@@ -517,6 +518,33 @@ pub fn step_verify_glm_long_batched(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
+    step_verify_glm_long_with(
+        model,
+        group,
+        sched,
+        num_drafts,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+        &mut |rows, tokens, seqs| model.decode_verify_glm_long_owner_rows(rows, tokens, seqs),
+    );
+}
+
+/// [`step_verify_glm_long_batched`] with the owners' target traversal
+/// supplied: `traverse(rows, owner-major tokens, seqs)` must leave each owner
+/// advanced by `rows` rows and its final rows staged for
+/// `begin_glm_long_owner_tail`, returning the owner-major argmax IDs (as
+/// `decode_verify_glm_long_owner_rows` does, or a prefill chunk carrying the
+/// owners).
+#[allow(clippy::too_many_arguments)]
+pub fn step_verify_glm_long_with(
+    model: &dyn Model,
+    group: &mut [&mut ActiveSeq],
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    num_drafts: usize,
+    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
+    dflash_verify_raw_argmax: bool,
+    traverse: &mut dyn FnMut(usize, &[u32], &mut [&mut SequenceState]) -> anyhow::Result<Vec<u32>>,
+) {
     let fail_all = |group: &mut [&mut ActiveSeq]| group.iter_mut().for_each(|a| a.finished = true);
     let t_step = Instant::now();
     if let Err(e) = model.sync_secondary() {
@@ -548,15 +576,12 @@ pub fn step_verify_glm_long_batched(
     let t_verify = std::time::Instant::now();
     let verified = {
         let mut seqs: Vec<&mut SequenceState> = group.iter_mut().map(|a| &mut a.seq).collect();
-        model.decode_verify_glm_long_owner_rows(rows, &flat, &mut seqs)
+        traverse(rows, &flat, &mut seqs)
     };
     let verified = match verified {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!(
-                "decode_verify_glm_long_owner_rows (n={} rows={rows}): {e:#}",
-                group.len()
-            );
+            tracing::error!("GLM owner traversal (n={} rows={rows}): {e:#}", group.len());
             fail_all(group);
             return;
         }

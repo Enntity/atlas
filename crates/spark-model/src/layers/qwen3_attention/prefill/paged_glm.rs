@@ -35,6 +35,40 @@ pub(in crate::layers::qwen3_attention) struct GlmChunkOwner {
     pub meta: crate::layer::AttnMetadataDev,
 }
 
+/// One sequence's prefill chunk of `rows` rows from `seq_len_start` as chunk
+/// owners at rows `[0, rows)` of `meta`. Several pieces are consecutive
+/// same-sequence owners: the joint cache write lands every row first, and
+/// piece k's causal extent is entry 1 + k of the chunk's seq_len buffer
+/// (Model::upload_chunk_seq_lens).
+pub(in crate::layers::qwen3_attention) fn glm_chunk_pieces(
+    meta: crate::layer::AttnMetadataDev,
+    seq_len_start: usize,
+    rows: usize,
+    index_topk: usize,
+) -> Vec<GlmChunkOwner> {
+    let pieces = crate::layer::prefill_attention_pieces(seq_len_start, rows, index_topk);
+    if pieces.len() == 1 {
+        return vec![GlmChunkOwner { row0: 0, rows, seq_len_start, meta }];
+    }
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(k, &(row0, rows))| GlmChunkOwner {
+            row0,
+            rows,
+            seq_len_start: seq_len_start + row0,
+            meta: crate::layer::AttnMetadataDev {
+                positions: meta.positions.offset(row0 * 4),
+                positions_h: meta.positions_h.offset(row0 * 4),
+                positions_w: meta.positions_w.offset(row0 * 4),
+                slot: meta.slot.offset(row0 * 8),
+                seq_len: meta.seq_len.offset((1 + k) * 4),
+                ..meta
+            },
+        })
+        .collect()
+}
+
 /// An `fp8_g128` owner's latents dequantized to BF16 in the arena scratch,
 /// addressed through an identity block table of `blocks` entries.
 #[derive(Clone, Copy)]
@@ -56,35 +90,7 @@ impl Qwen3AttentionLayer {
         let meta = ctx
             .attn_metadata
             .expect("GLM paged prefill requires metadata");
-        let pieces = crate::layer::prefill_attention_pieces(
-            seq_len_start,
-            args.num_tokens,
-            ctx.config.index_topk,
-        );
-        // Several pieces: consecutive same-sequence owners. The joint cache
-        // write lands every row first; piece k's causal extent is entry 1 + k
-        // of the chunk's seq_len buffer (Model::upload_chunk_seq_lens).
-        let owners: Vec<GlmChunkOwner> = if pieces.len() == 1 {
-            vec![GlmChunkOwner { row0: 0, rows: args.num_tokens, seq_len_start, meta }]
-        } else {
-            pieces
-                .iter()
-                .enumerate()
-                .map(|(k, &(row0, rows))| GlmChunkOwner {
-                    row0,
-                    rows,
-                    seq_len_start: seq_len_start + row0,
-                    meta: crate::layer::AttnMetadataDev {
-                        positions: meta.positions.offset(row0 * 4),
-                        positions_h: meta.positions_h.offset(row0 * 4),
-                        positions_w: meta.positions_w.offset(row0 * 4),
-                        slot: meta.slot.offset(row0 * 8),
-                        seq_len: meta.seq_len.offset((1 + k) * 4),
-                        ..meta
-                    },
-                })
-                .collect()
-        };
+        let owners = glm_chunk_pieces(meta, seq_len_start, args.num_tokens, ctx.config.index_topk);
         self.glm_chunk_attention(&owners, kv_cache, ctx, args)
     }
 

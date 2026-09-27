@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! CPU-only admission and scratch proof for the qualified KDA Lt FP8 route.
+
+/// Widest qualified projection: a full prefill chunk plus the DFlash verify
+/// rows that may ride it (`glm_fused_chunk`).
+const MAX_M: u32 = 4100 + crate::layer::glm_long_owner::MAX_ROWS as u32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Span {
     pub ptr: u64,
@@ -23,7 +27,7 @@ pub(super) fn selected(
         && !decode
         && !capture
         && transposed
-        && (2048..=4100).contains(&m)
+        && (2048..=MAX_M).contains(&m)
         && n == 4096
         && k == 4096
 }
@@ -36,7 +40,7 @@ pub(super) fn plan(
     weight: u64,
     scales: u64,
 ) -> Result<Plan, &'static str> {
-    if !(2048..=4100).contains(&m) || m as usize > arena_rows {
+    if !(2048..=MAX_M).contains(&m) || m as usize > arena_rows {
         return Err("KDA Lt row capacity");
     }
     let weight_bytes = 4096usize * 4096;
@@ -111,10 +115,11 @@ mod tests {
     }
     #[test]
     fn kda_lt_fp8_selection_preserves_decode_and_unqualified_rows() {
-        for m in [1, 2, 3, 4, 5, 8, 128, 2047, 4101] {
+        for m in [1, 2, 3, 4, 5, 8, 128, 2047, MAX_M + 1] {
             assert!(!selected(true, false, false, true, m, 4096, 4096));
         }
-        for m in [2048, 4096, 4100] {
+        // A full chunk, and one carrying the widest riding verify rows.
+        for m in [2048, 4096, 4100, MAX_M] {
             assert!(selected(true, false, false, true, m, 4096, 4096));
         }
         for (enabled, decode, capture, twin) in [

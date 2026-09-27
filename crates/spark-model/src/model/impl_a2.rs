@@ -611,6 +611,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF6: set request-local native-only fence → disabled (0/1)
     /// - 0xFFFFFFF7: synchronize vision metadata and BF16 encoder rows
     /// - 0xFFFFFFE1: distributed GLM MTP propose → token, position, drafts, hidden row
+    /// - 0xFFFFFFEB: prefill chunk carrying DFlash verify owners (`glm_fused_chunk`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let (seq_id, cmd) = self.ep_recv_seq_and_cmd(self.ep_protocol_v2)?;
@@ -629,6 +630,9 @@ impl TransformerModel {
         }
         if cmd == super::glm_long_verify::EP_CMD_GLM_LONG_VERIFY {
             return self.glm_long_receive_verify(slots);
+        }
+        if cmd == super::glm_fused_chunk::EP_CMD_GLM_FUSED_CHUNK {
+            return self.glm_fused_receive(seq_id, slots);
         }
         if cmd == super::glm_c2_pair_transport::EP_GLM_PAIR_VERIFY {
             return self.paired_receive_verify_pair(seq_id, slots);

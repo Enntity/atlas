@@ -36,7 +36,7 @@ pub(super) const EP_CMD_GLM_LONG_TAIL: u32 = 0xFFFF_FFEA;
 const META_SEQ_SLOT: usize = 128;
 const META_SLOTS: usize = 256;
 const META_SEQ_LENS: usize = 512;
-const META_BLOCK_TABLE: usize = 768;
+pub(super) const META_BLOCK_TABLE: usize = 768;
 /// verify_d's metadata base, after the MTP metadata reservation.
 const META_BASE: usize = 32768;
 // The fixed per-row regions (u32 positions, seq slots, i64 slots, i32
@@ -85,13 +85,13 @@ fn owner_supported(owner: usize, rows: usize) -> bool {
 }
 
 /// K3 is 0 in the high half-word, keeping the fixed-width K3 wire.
-fn encode_width(word: usize, rows: usize) -> u32 {
+pub(super) fn encode_width(word: usize, rows: usize) -> u32 {
     let rows = if rows == K3_ROWS { 0 } else { rows };
     (word | rows << 16) as u32
 }
 
 /// Inverse of [`encode_width`]: `(word, rows)`.
-fn decode_width(raw: u32) -> (usize, usize) {
+pub(super) fn decode_width(raw: u32) -> (usize, usize) {
     let rows = (raw >> 16) as usize;
     (
         (raw & 0xFFFF) as usize,
@@ -144,7 +144,7 @@ impl TransformerModel {
     }
 
     /// Upload one verify metadata block for `rows` = `(position, sequence)`.
-    fn glm_long_upload_meta(
+    pub(super) fn glm_long_upload_meta(
         &self,
         base: DevicePtr,
         rows: &[(usize, &SequenceState)],

@@ -37,6 +37,9 @@ pub(super) fn run_standard_chunk_loop(
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     completed_indices: &mut Vec<(usize, Option<u32>)>,
     did_mixed_step: &mut bool,
+    max_batch_tokens: usize,
+    spec: &super::SpecStep,
+    rode: &mut Vec<usize>,
 ) {
     // TQ+ InnerQ: poll once per chunk to see if calibration has banked
     // enough K² stats to finalize scales. The driver itself is idempotent
@@ -242,6 +245,29 @@ pub(super) fn run_standard_chunk_loop(
                 completed_indices.push((idx, None));
             }
         }
+        return;
+    }
+
+    // ── Fused: the active DFlash owners' verify rows ride this chunk ──
+    let verify_ctx = sched.verify_logits_ctx(
+        think_end_token,
+        think_start_token,
+        tool_call_start_token,
+        tool_call_end_token,
+    );
+    if super::run_fused::try_fused_chunk(
+        model,
+        p,
+        idx,
+        active,
+        chunk_len,
+        max_batch_tokens,
+        spec,
+        &verify_ctx,
+        sched,
+        completed_indices,
+        rode,
+    ) {
         return;
     }
 

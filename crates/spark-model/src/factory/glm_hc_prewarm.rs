@@ -68,7 +68,9 @@ impl Plan {
             config.model_type == "glm5_next"
                 && config.hidden_size == 4096
                 && config.hc_mult == 4
-                && max_rows == ROWS[0] as usize
+                // Plus the verify rows a fused prefill chunk may carry.
+                && (ROWS[0] as usize..=ROWS[0] as usize + crate::layer::glm_long_owner::MAX_ROWS)
+                    .contains(&max_rows)
                 && config.max_batch_tokens == max_rows,
             "HC TF32 prewarm requires GLM H4096/HC4 and a 4100-row arena"
         );

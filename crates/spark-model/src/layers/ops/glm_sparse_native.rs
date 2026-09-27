@@ -46,7 +46,9 @@ fn validate_startup(
 ) -> Result<()> {
     validate_geometry(c)?;
     ensure!(
-        rows == 4100
+        // 4100 rows, plus the verify rows a fused chunk may carry (the
+        // native attention itself still sees at most 4100 rows per owner).
+        (4100..=4100 + crate::layer::glm_long_owner::MAX_ROWS).contains(&rows)
             && c.max_batch_tokens == rows
             && seq == plan::MAX_CONTEXT
             && block == 16

@@ -28,55 +28,117 @@ impl Glm5KdaLayer {
                 packed, convolved, g1, beta, core_out, state, 0, tokens, ctx, stream,
             )?;
         } else {
-            ops::conv1d_update_prefill(
-                ctx.gpu,
-                self.conv_prefill_k,
-                self.conv_prefill_tp_k,
-                state.conv_state,
-                packed,
-                &self.weights.conv,
-                DevicePtr::NULL,
-                convolved,
-                (3 * p) as u32,
-                self.conv_width as u32,
-                m,
-                (3 * p) as u32,
-                (3 * p) as u32,
-                stream,
+            self.sequence_recurrent_rows(
+                packed, convolved, g1, beta, core_out, state, tokens, decode, ctx, stream,
             )?;
-            if let Some(flash) = self
-                .flash_prefill
-                .as_ref()
-                .filter(|_| flash_prefill::eligible(tokens, decode, ctx.graph_capture))
-            {
-                // Convolution has finished reading packed. Its storage and the
-                // idle expert buffers can now be borrowed on this same stream.
-                flash.forward(
-                    convolved,
-                    g1,
-                    beta,
-                    self.weights.a_log.weight,
-                    self.weights.dt_bias.weight,
-                    state.h_state,
-                    core_out,
-                    tokens,
-                    ctx,
-                    stream,
-                )?;
-            } else {
-                self.run_recurrent(
-                    convolved,
-                    g1,
-                    beta,
-                    state.h_state,
-                    core_out,
-                    m,
-                    decode,
-                    ctx,
-                    stream,
-                )?;
-            }
         }
+        Ok(core_out)
+    }
+
+    /// Convolution + recurrence of one sequence over rows `[0, tokens)` of
+    /// already-packed `packed`/`g1`/`beta` (prefill or single-row decode).
+    #[allow(clippy::too_many_arguments)]
+    fn sequence_recurrent_rows(
+        &self,
+        packed: DevicePtr,
+        convolved: DevicePtr,
+        g1: DevicePtr,
+        beta: DevicePtr,
+        core_out: DevicePtr,
+        state: &mut SsmLayerState,
+        tokens: usize,
+        decode: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let m = tokens as u32;
+        let p = self.heads * self.dim;
+        ops::conv1d_update_prefill(
+            ctx.gpu,
+            self.conv_prefill_k,
+            self.conv_prefill_tp_k,
+            state.conv_state,
+            packed,
+            &self.weights.conv,
+            DevicePtr::NULL,
+            convolved,
+            (3 * p) as u32,
+            self.conv_width as u32,
+            m,
+            (3 * p) as u32,
+            (3 * p) as u32,
+            stream,
+        )?;
+        if let Some(flash) = self
+            .flash_prefill
+            .as_ref()
+            .filter(|_| flash_prefill::eligible(tokens, decode, ctx.graph_capture))
+        {
+            // Convolution has finished reading packed. Its storage and the
+            // idle expert buffers can now be borrowed on this same stream.
+            flash.forward(
+                convolved,
+                g1,
+                beta,
+                self.weights.a_log.weight,
+                self.weights.dt_bias.weight,
+                state.h_state,
+                core_out,
+                tokens,
+                ctx,
+                stream,
+            )
+        } else {
+            self.run_recurrent(
+                convolved,
+                g1,
+                beta,
+                state.h_state,
+                core_out,
+                m,
+                decode,
+                ctx,
+                stream,
+            )
+        }
+    }
+
+    /// Fused prefill chunk + verify owners: pack every row once, advance
+    /// each owner over its own `rows` rows at `chunk + owner * rows`, then
+    /// the chunk's own state over rows `[0, chunk)`. The owners go first
+    /// because the chunk's flash recurrence borrows the packed buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_recurrent_passengers(
+        &self,
+        projected: DevicePtr,
+        g1: DevicePtr,
+        beta: DevicePtr,
+        state: &mut SsmLayerState,
+        chunk: usize,
+        owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let p = self.heads * self.dim;
+        let packed = ctx.buffers.ssm_qkvz();
+        ops::kda_pack_qkv(
+            ctx.gpu,
+            self.pack_k,
+            projected,
+            packed,
+            (chunk + owners.len() * rows) as u32,
+            p as u32,
+            stream,
+        )?;
+        let convolved = ctx.buffers.ssm_conv_out_f32();
+        let core_out = ctx.buffers.attn_output();
+        self.owner_recurrent_rows(
+            packed, convolved, g1, beta, core_out, chunk, owners, rows, ctx, stream,
+        )?;
+        self.sequence_recurrent_rows(
+            packed, convolved, g1, beta, core_out, state, chunk, false, ctx, stream,
+        )?;
         Ok(core_out)
     }
 
@@ -256,6 +318,28 @@ impl Glm5KdaLayer {
         )?;
         let convolved = ctx.buffers.ssm_conv_out_f32();
         let core_out = ctx.buffers.attn_output();
+        self.owner_recurrent_rows(
+            packed, convolved, g1, beta, core_out, 0, owners, rows, ctx, stream,
+        )?;
+        Ok(core_out)
+    }
+
+    /// Each owner's snapshot verify recurrence over its rows at
+    /// `row0 + owner * rows`, in owner order.
+    #[allow(clippy::too_many_arguments)]
+    fn owner_recurrent_rows(
+        &self,
+        packed: DevicePtr,
+        convolved: DevicePtr,
+        g1: DevicePtr,
+        beta: DevicePtr,
+        core_out: DevicePtr,
+        row0: usize,
+        owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
         for (owner, input) in owners.iter_mut().enumerate() {
             let state = input
                 .state
@@ -270,12 +354,12 @@ impl Glm5KdaLayer {
                 beta,
                 core_out,
                 state,
-                owner * rows,
+                row0 + owner * rows,
                 rows,
                 ctx,
                 stream,
             )?;
         }
-        Ok(core_out)
+        Ok(())
     }
 }

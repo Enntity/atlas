@@ -30,13 +30,15 @@ impl TransformerModel {
         chunk_len: usize,
         proc_start: usize,
         proc_count: usize,
+        // Rows after the chunk's that share its MoE routing (fused verify).
+        extra_rows: usize,
         effective_seq_len_start: usize,
         kv_cache: &PagedKvCache,
         stream: u64,
     ) -> Result<MetaLayout> {
         // Single-stream entry point: lay metadata at the default offset
         // after the MoE topk staging area.
-        let moe_scratch_bytes = proc_count * self.config.num_experts_per_tok * 4 * 2;
+        let moe_scratch_bytes = (proc_count + extra_rows) * self.config.num_experts_per_tok * 4 * 2;
         let meta_offset = (moe_scratch_bytes + 7) & !7;
         let meta_base = self.buffers.scratch().offset(meta_offset);
         self.prefill_b_upload_meta_at(

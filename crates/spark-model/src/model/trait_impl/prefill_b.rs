@@ -52,7 +52,32 @@ impl TransformerModel {
         is_last_chunk: bool,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.prefill_chunk_dispatch_with(
+            tokens,
+            seq,
+            chunk_start,
+            chunk_len,
+            is_last_chunk,
+            stream,
+            None,
+        )
+    }
+
+    /// The chunk, optionally carrying DFlash verify owners after its rows
+    /// (`glm_fused_chunk`).
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::model) fn prefill_chunk_dispatch_with(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        chunk_start: usize,
+        chunk_len: usize,
+        is_last_chunk: bool,
+        stream: u64,
+        mut passengers: Option<&mut super::super::glm_fused_chunk::Passengers<'_, '_>>,
+    ) -> Result<DevicePtr> {
         let total = tokens.len();
+        let passenger_rows = passengers.as_ref().map_or(0, |p| p.total());
         assert!(
             chunk_start + chunk_len <= total,
             "chunk_start({chunk_start}) + chunk_len({chunk_len}) > total({total})"
@@ -128,6 +153,10 @@ impl TransformerModel {
             // checkpoint this split exists to create.
             let split_disabled = std::env::var("ATLAS_NO_TAIL_SPLIT").as_deref() == Ok("1");
             if !split_disabled && cut > chunk_start && cut < total {
+                anyhow::ensure!(
+                    passengers.is_none(),
+                    "GLM fused chunk cannot take the tail-checkpoint split"
+                );
                 self.prefill_chunk_dispatch(
                     tokens,
                     seq,
@@ -144,7 +173,7 @@ impl TransformerModel {
         // Exceeding this causes CUDA illegal memory access (error 700)
         // which permanently corrupts GPU state.
         let arena_cap = self.buffers.max_batch_tokens();
-        if chunk_len > arena_cap {
+        if chunk_len + passenger_rows > arena_cap {
             anyhow::bail!(
                 "Prefill chunk ({chunk_len} tokens) exceeds buffer arena capacity ({arena_cap} tokens). \
                  Reduce --max-prefill-tokens or prompt length."
@@ -265,6 +294,7 @@ impl TransformerModel {
             chunk_len,
             proc_start,
             proc_count,
+            passenger_rows,
             effective_seq_len_start,
             &kv_cache,
             stream,
@@ -291,6 +321,29 @@ impl TransformerModel {
         // per chunk but prevents the illegal memory access.
         self.gpu.synchronize(stream)?;
 
+        // Verify owners riding this chunk: rows after the chunk's, metadata
+        // after the chunk's. Every prefill phase that would change the
+        // chunk's rows is refused upfront (`glm_fused_chunk_supported`).
+        let passenger_run = match passengers.as_deref_mut() {
+            Some(p) => {
+                anyhow::ensure!(
+                    proc_start == chunk_start
+                        && proc_count == chunk_len
+                        && kv_write_start == 0
+                        && !marconi_skip,
+                    "GLM fused chunk needs the whole chunk computed"
+                );
+                let meta = super::super::glm_fused_chunk::ChunkMeta {
+                    base: meta_base,
+                    pos_stream_bytes,
+                    slot_offset,
+                    use_mrope,
+                };
+                Some(self.glm_passengers_setup(p, proc_count, &meta, &mut kv_cache, stream)?)
+            }
+            None => None,
+        };
+
         // ── Mid-chunk tail SSM capture (opt-in): plan BEFORE the forward
         // pass so SSM layers split their h/conv kernels at `tb` in-pass.
         // `None` (flag off or pass doesn't span `tb`) => no split. ──
@@ -301,6 +354,10 @@ impl TransformerModel {
             proc_start,
             proc_count,
             stream,
+        );
+        anyhow::ensure!(
+            midcap_plan.is_none() || passenger_run.is_none(),
+            "GLM fused chunk cannot split the SSM recurrence mid-chunk"
         );
 
         // ── Phase 4: forward through all layers ──
@@ -320,8 +377,13 @@ impl TransformerModel {
             use_mrope,
             needs_paged,
             midcap_plan.as_ref(),
+            passengers.as_deref_mut().zip(passenger_run.as_ref()),
             stream,
         )?;
+        if let Some(p) = passengers {
+            // Before the chunk's finalize, which reuses the logits rows.
+            self.glm_passengers_finish(p, proc_count, stream)?;
+        }
 
         // Register the reserved slot as the session tail once the full pass has
         // captured the @tb state into it (no-op when no capture was planned).

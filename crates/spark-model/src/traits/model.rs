@@ -714,6 +714,39 @@ pub trait Model: Send + Sync {
         bail!("decode_verify_glm_long_owner_rows: unsupported by this model")
     }
 
+    /// Whether a prefill chunk of `chunk_len` rows of `prompt` may carry
+    /// `owners` DFlash verify owners of `rows` rows each after its own rows.
+    fn can_fuse_glm_prefill_verify(
+        &self,
+        _prompt: &[u32],
+        _seq: &SequenceState,
+        _chunk_len: usize,
+        _owners: usize,
+        _rows: usize,
+    ) -> bool {
+        false
+    }
+
+    /// One prefill chunk of `prompt` for `seq` carrying the verify rows of
+    /// `owners` (`tokens` owner-major, `rows` per owner) in the same
+    /// traversal (EP-coherent). Returns the chunk's logits (NULL before the
+    /// last chunk) and the owners' argmax IDs; each owner advanced by `rows`
+    /// rows exactly as after [`Self::decode_verify_glm_long_owner_rows`], so
+    /// its tail begins with [`Self::begin_glm_long_owner_tail`].
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_chunk_with_glm_owner_rows(
+        &self,
+        _prompt: &[u32],
+        _seq: &mut SequenceState,
+        _chunk_start: usize,
+        _chunk_len: usize,
+        _rows: usize,
+        _tokens: &[u32],
+        _owners: &mut [&mut SequenceState],
+    ) -> Result<(DevicePtr, Vec<u32>)> {
+        bail!("prefill_chunk_with_glm_owner_rows: unsupported by this model")
+    }
+
     /// Restore owner `owner`'s `tokens.len()` verify rows on every rank so
     /// its ordinary single-owner verdict/commit/propose tail can run
     /// unchanged.

@@ -42,6 +42,7 @@ pub mod glm_c4;
 pub(crate) mod glm_cache_plan;
 pub mod glm_independent;
 pub(crate) mod glm_k3_head;
+mod glm_fused_chunk;
 mod glm_long_verify;
 mod glm_vocab_split;
 pub(crate) mod glm_mtp_prompt_trace;

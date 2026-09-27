@@ -512,6 +512,28 @@ impl Model for TransformerModel {
     ) -> Result<Vec<u32>> {
         self.decode_verify_glm_long_owners_impl(rows, tokens, seqs)
     }
+    fn can_fuse_glm_prefill_verify(
+        &self,
+        prompt: &[u32],
+        seq: &SequenceState,
+        chunk_len: usize,
+        owners: usize,
+        rows: usize,
+    ) -> bool {
+        self.glm_fused_chunk_supported(prompt, seq, chunk_len, owners, rows)
+    }
+    fn prefill_chunk_with_glm_owner_rows(
+        &self,
+        prompt: &[u32],
+        seq: &mut SequenceState,
+        chunk_start: usize,
+        chunk_len: usize,
+        rows: usize,
+        tokens: &[u32],
+        owners: &mut [&mut SequenceState],
+    ) -> Result<(DevicePtr, Vec<u32>)> {
+        self.prefill_chunk_with_glm_owners_impl(prompt, seq, chunk_start, chunk_len, rows, tokens, owners)
+    }
     fn begin_glm_long_owner_tail(&self, slot: u32, owner: usize, tokens: &[u32]) -> Result<()> {
         self.begin_glm_long_owner_tail_impl(slot, owner, tokens)
     }
