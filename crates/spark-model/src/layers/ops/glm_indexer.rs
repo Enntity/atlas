@@ -116,6 +116,25 @@ pub fn glm_index_fill_causal(
         .launch(stream)
 }
 
+/// [`glm_index_fill_causal`] for one decode row whose length is read on the
+/// device (`kv_len`: the i32 sequence length including the new token).
+pub fn glm_index_fill_causal_dev(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    output: DevicePtr,
+    kv_len: DevicePtr,
+    width: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(width, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(output)
+        .arg_ptr(kv_len)
+        .arg_u32(width)
+        .launch(stream)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct IndexLogitsLaunch {
     grid: [u32; 3],

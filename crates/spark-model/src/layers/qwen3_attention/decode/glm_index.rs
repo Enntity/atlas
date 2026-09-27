@@ -30,8 +30,11 @@ impl Qwen3AttentionLayer {
             .ok_or_else(|| anyhow::anyhow!("GLM semantic-index cache is not attached"))?;
         ensure!(
             spec.dtype == SparseIndexCacheDtype::Bf16
-                && kv_cache.dtype_for_layer(self.attn_layer_idx) == KvCacheDtype::Bf16,
-            "GLM sparse decode correctness path currently requires BF16 index and KV caches"
+                && matches!(
+                    kv_cache.dtype_for_layer(self.attn_layer_idx),
+                    KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128
+                ),
+            "GLM sparse decode requires a BF16 index cache and a BF16 or fp8_g128 KV cache"
         );
         ensure!(
             self.glm_index_layernorm_k.0 != 0

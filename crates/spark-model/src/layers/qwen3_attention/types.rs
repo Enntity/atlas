@@ -234,6 +234,8 @@ pub struct Qwen3AttentionLayer {
     /// `fp8_g128` GLM latents -> BF16 view for the BF16 prefill kernels.
     /// Null unless the cache is `fp8_g128`.
     pub(super) glm_latent_dequant_k: KernelHandle,
+    /// Device-length causal index fill for dense fp8_g128 single-row decode.
+    pub(super) glm_index_fill_causal_dev_k: KernelHandle,
     /// Fused k_norm + RoPE + paged BF16 cache write — eliminates two
     /// intermediate BF16 rounding steps that cause the documented L35-L39
     /// cliff in chunked-prefill BF16 KV mode (memory:

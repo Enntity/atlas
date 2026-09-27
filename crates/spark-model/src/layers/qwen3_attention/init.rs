@@ -353,6 +353,11 @@ impl Qwen3AttentionLayer {
             } else {
                 KernelHandle(0)
             },
+            glm_index_fill_causal_dev_k: if kv_dtype == KvCacheDtype::Fp8G128 {
+                gpu.kernel("glm_indexer", "glm_index_fill_causal_dev")?
+            } else {
+                KernelHandle(0)
+            },
             glm_latent_qdq_k: if std::env::var("ATLAS_GLM_LATENT_QDQ").as_deref() == Ok("1") {
                 gpu.kernel("reshape_and_cache", "glm_latent_qdq_fp8g128")?
             } else {

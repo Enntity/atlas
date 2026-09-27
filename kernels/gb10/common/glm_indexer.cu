@@ -164,6 +164,16 @@ extern "C" __global__ void glm_index_fill_causal(
     output[(unsigned long long)row * width + col] = col <= query_pos ? (int)col : -1;
 }
 
+// One decode row selecting every cached token: `kv_len[0]` (the device
+// sequence length including the new token) stays graph-capture safe.
+extern "C" __global__ void glm_index_fill_causal_dev(
+    int* __restrict__ output,
+    const int* __restrict__ kv_len,
+    unsigned int width) {
+    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < width) output[col] = (int)col < kv_len[0] ? (int)col : -1;
+}
+
 // Eight warps score eight pooled keys per CTA. Each warp holds one pool and
 // accumulates its 32 index-head dot products without materializing headwise
 // logits. The cache remains paged with the main KV block table.

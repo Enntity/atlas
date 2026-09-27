@@ -85,7 +85,9 @@ fn dispatch(
     on: bool,
     tc: bool,
 ) -> Result<bool> {
-    if !on {
+    // The split kernel reads BF16 latents; an fp8_g128 cache declines to the
+    // TC kernel, which has its reader. Other dtypes still fail validation.
+    if !on || a.dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8G128 {
         return Ok(false);
     }
     ensure!(tc, "GLM split requires ATLAS_GLM_SPARSE_DECODE_TC=1");

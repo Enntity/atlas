@@ -122,6 +122,16 @@ fn split_bad_geometry_storage_capacity_and_tc_dependency_fail_before_lookup() {
     assert!(validate_scratch(p, SCRATCH_BYTES, &[(p.offset(SCRATCH_BYTES), 16)]).is_ok());
 }
 #[test]
+fn split_declines_fp8_g128_before_any_lookup() {
+    let gpu = Capture::default();
+    let c = config();
+    let mut a = args(&c);
+    a.dtype = KvCacheDtype::Fp8G128;
+    assert!(!dispatch(&gpu, &a, DevicePtr(0x800000), SCRATCH_BYTES, 19, true, true).unwrap());
+    assert_eq!(gpu.lookups.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(gpu.arguments.lock().unwrap().is_empty());
+}
+#[test]
 fn split_startup_uses_two_zero_row_null_launches_then_one_sync() {
     let gpu = Capture::default();
     let c = config();

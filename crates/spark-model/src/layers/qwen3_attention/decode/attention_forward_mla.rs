@@ -65,12 +65,6 @@ impl Qwen3AttentionLayer {
         let meta = ctx
             .attn_metadata
             .expect("MLA decode requires pre-uploaded metadata");
-        // Its dense/sparse readers here are BF16-only; an fp8_g128 GLM cache
-        // is read by the chunk (prefill/verify) path, like DFlash decode.
-        anyhow::ensure!(
-            self.kv_dtype != spark_runtime::kv_cache::KvCacheDtype::Fp8G128,
-            "fp8_g128 GLM caches are served by the chunk verify path; single-row MLA decode is unsupported"
-        );
 
         let q_lora = mla.q_lora_rank as u32;
         let kv_lora = mla.kv_lora_rank as u32;
@@ -400,6 +394,24 @@ impl Qwen3AttentionLayer {
         } else {
             None
         };
+        // An fp8_g128 latent has one reader, the TC kernel: dense rows select
+        // every cached token (device length, so decode graphs stay valid).
+        let fp8 = self.kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8G128;
+        let sparse_indices = match sparse_indices {
+            None if fp8 => {
+                let indices = ctx.buffers.expert_gate_out();
+                ops::glm_index_fill_causal_dev(
+                    ctx.gpu,
+                    self.glm_index_fill_causal_dev_k,
+                    indices,
+                    meta.seq_len,
+                    2051,
+                    stream,
+                )?;
+                Some((indices, 2051))
+            }
+            other => other,
+        };
         prof!("paged_attn", {
             if let Some((indices, index_width)) = sparse_indices {
                 if self.try_glm_sparse_tc_decode_heads(
@@ -417,6 +429,10 @@ impl Qwen3AttentionLayer {
                 )? {
                     Ok(())
                 } else {
+                    anyhow::ensure!(
+                        !fp8,
+                        "fp8_g128 GLM decode requires ATLAS_GLM_SPARSE_DECODE_TC=1"
+                    );
                     ops::glm_sparse_mla_prefill(
                         ctx.gpu,
                         self.glm_sparse_attn_decode_k,
@@ -563,7 +579,11 @@ impl Qwen3AttentionLayer {
             || index_width != 2051
             || kv_cache.block_size() != 16
             || scale != 0.0625
-            || self.kv_dtype != spark_runtime::kv_cache::KvCacheDtype::Bf16
+            || !matches!(
+                self.kv_dtype,
+                spark_runtime::kv_cache::KvCacheDtype::Bf16
+                    | spark_runtime::kv_cache::KvCacheDtype::Fp8G128
+            )
             || ctx.config.qk_rope_head_dim != 0
             || !query.0.is_multiple_of(16)
             || !output.0.is_multiple_of(4)
