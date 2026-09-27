@@ -383,10 +383,31 @@ __device__ __forceinline__ unsigned int glm_ordered_float(float value) {
     return bits ^ flip;
 }
 
-// Exact per-row top-K for signed FP32 logits using a radix threshold.
-// Once the Kth score's bit pattern is known, all larger pools and enough equal
-// pools are expanded to their four raw token IDs. Ordering is immaterial to
-// attention; ties at the threshold may choose any equivalent pool.
+// Exact per-row top-K for signed FP32 logits using a radix threshold, found
+// with four 8-bit histogram passes over the row (a bit-at-a-time search read
+// it 32 times). The selected pools — every pool above the Kth score, then the
+// lowest-indexed pools equal to it — are expanded to their four raw token IDs
+// in ascending order, so the selection and the attention's summation order
+// are deterministic. Block: any multiple of 32 up to 1024 threads.
+__device__ __forceinline__ unsigned int glm_topk_block_exclusive_scan(
+    unsigned int flag, unsigned int* warp_sums, unsigned int& total) {
+    const unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const unsigned int warps = (blockDim.x + 31) >> 5;
+    const unsigned int ballot = __ballot_sync(0xffffffffu, flag);
+    const unsigned int in_warp = __popc(ballot & ((1u << lane) - 1u));
+    __syncthreads();   // warp_sums free from any previous scan
+    if (lane == 0) warp_sums[warp] = __popc(ballot);
+    __syncthreads();
+    unsigned int before = 0;
+    total = 0;
+    for (unsigned int w = 0; w < warps; ++w) {
+        const unsigned int c = warp_sums[w];
+        if (w < warp) before += c;
+        total += c;
+    }
+    return before + in_warp;
+}
+
 __device__ __forceinline__ void glm_index_topk_expand_impl(
     const float* __restrict__ logits,
     int* __restrict__ output,
@@ -398,69 +419,69 @@ __device__ __forceinline__ void glm_index_topk_expand_impl(
     unsigned int output_width) {
     const unsigned int row = blockIdx.x;
     if (row >= rows) return;
-    extern __shared__ unsigned int shared[];
-    unsigned int& prefix = shared[0];
-    unsigned int& rank = shared[1];
-    unsigned int& count = shared[2];
-    unsigned int& written = shared[3];
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned int warp_sums[32];
+    __shared__ unsigned int s_prefix, s_rank;
     const unsigned int pool_count = seq_len / pool_size;
     const unsigned int pool_budget = topk_tokens / pool_size;
     const unsigned int select_pools = pool_budget < pool_count ? pool_budget : pool_count;
     int* out = output + (unsigned long long)row * output_width;
     for (unsigned int i = threadIdx.x; i < output_width; i += blockDim.x) out[i] = -1;
-    if (threadIdx.x == 0) {
-        prefix = 0;
-        rank = select_pools;
-    }
-    __syncthreads();
-
     const float* row_logits = logits + (unsigned long long)row * logits_stride;
-    unsigned int mask = 0;
-    for (int bit_idx = 31; bit_idx >= 0; --bit_idx) {
-        if (threadIdx.x == 0) count = 0;
-        __syncthreads();
-        const unsigned int bit = 1u << bit_idx;
-        const unsigned int candidate = prefix | bit;
-        const unsigned int candidate_mask = mask | bit;
-        unsigned int local = 0;
-        for (unsigned int p = threadIdx.x; p < pool_count; p += blockDim.x) {
-            const unsigned int bits = glm_ordered_float(row_logits[p]);
-            local += (bits & candidate_mask) == candidate;
+
+    // Threshold: the select_pools-th largest ordered score, and how many
+    // pools equal to it are taken (`rank`).
+    unsigned int prefix = 0, mask = 0, rank = select_pools;
+    if (select_pools == pool_count) {
+        prefix = 0;      // everything: any score is >= 0 in ordered space
+        rank = 0;        // ... and no tie filling is needed
+    } else {
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            for (unsigned int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+            __syncthreads();
+            for (unsigned int p = threadIdx.x; p < pool_count; p += blockDim.x) {
+                const unsigned int bits = glm_ordered_float(row_logits[p]);
+                if ((bits & mask) == prefix) atomicAdd(&hist[(bits >> shift) & 255u], 1u);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                unsigned int need = rank, bin = 255;
+                for (;; --bin) {
+                    const unsigned int c = hist[bin];
+                    if (c >= need || bin == 0) break;
+                    need -= c;
+                }
+                s_prefix = prefix | (bin << shift);
+                s_rank = need;
+            }
+            __syncthreads();
+            prefix = s_prefix;
+            rank = s_rank;
+            mask |= 255u << shift;
         }
-        if (local) atomicAdd(&count, local);
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            if (count >= rank) prefix = candidate;
-            else rank -= count;
-        }
-        mask = candidate_mask;
-        __syncthreads();
     }
 
-    if (threadIdx.x == 0) written = 0;
-    __syncthreads();
-    for (unsigned int p = threadIdx.x; p < pool_count; p += blockDim.x) {
-        const unsigned int bits = glm_ordered_float(row_logits[p]);
-        if (bits > prefix) {
-            const unsigned int dst_pool = atomicAdd(&written, 1u);
-            if (dst_pool < select_pools) {
-                for (unsigned int i = 0; i < pool_size; ++i)
-                    out[dst_pool * pool_size + i] = (int)(p * pool_size + i);
-            }
+    // Ordered selection: scores above the threshold, then the first `rank`
+    // pools equal to it, written in ascending pool order.
+    unsigned int ties_seen = 0, written = 0;
+    for (unsigned int base = 0; base < pool_count; base += blockDim.x) {
+        const unsigned int p = base + threadIdx.x;
+        const bool live = p < pool_count;
+        const unsigned int bits = live ? glm_ordered_float(row_logits[p]) : 0u;
+        const bool gt = live && (select_pools == pool_count || bits > prefix);
+        const bool eq = live && select_pools != pool_count && bits == prefix;
+        unsigned int eq_total;
+        const unsigned int tie_rank = ties_seen + glm_topk_block_exclusive_scan(eq, warp_sums, eq_total);
+        const bool take = gt || (eq && tie_rank < rank);
+        unsigned int take_total;
+        const unsigned int dst = written + glm_topk_block_exclusive_scan(take, warp_sums, take_total);
+        if (take && dst < select_pools) {
+            for (unsigned int i = 0; i < pool_size; ++i)
+                out[dst * pool_size + i] = (int)(p * pool_size + i);
         }
+        ties_seen += eq_total;
+        written += take_total;
     }
-    __syncthreads();
-    for (unsigned int p = threadIdx.x; p < pool_count; p += blockDim.x) {
-        const unsigned int bits = glm_ordered_float(row_logits[p]);
-        if (bits == prefix) {
-            const unsigned int dst_pool = atomicAdd(&written, 1u);
-            if (dst_pool < select_pools) {
-                for (unsigned int i = 0; i < pool_size; ++i)
-                    out[dst_pool * pool_size + i] = (int)(p * pool_size + i);
-            }
-        }
-    }
-    __syncthreads();
     const unsigned int tail_start = pool_count * pool_size;
     const unsigned int tail_count = seq_len - tail_start;
     for (unsigned int i = threadIdx.x; i < tail_count; i += blockDim.x) {

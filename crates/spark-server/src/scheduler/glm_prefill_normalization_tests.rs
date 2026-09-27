@@ -2,7 +2,7 @@
 //! Actual scheduler/Model/F0 dispatch, with real pooled SSM owners. Recorded
 //! normalization launches are not CUDA clamp numerics or concurrent NCCL proof.
 use super::super::{prefill_a_step::start_chunked_prefill, sched_ctx::SchedCtx, *};
-use spark_model::model::glm_c2_test_support::{Event, Fixture};
+use spark_model::model::glm_c2_test_support::{Event, Fixture, Wire};
 use spark_model::traits::Model;
 
 fn request() -> InferenceRequest {
@@ -48,6 +48,20 @@ fn request() -> InferenceRequest {
         timeout_at: None,
         response_tx,
     }
+}
+
+fn replay(
+    worker: &impl Model,
+    slots: &mut [Option<SequenceState>],
+    tx: &Wire,
+    rx: &Wire,
+    commands: usize,
+) {
+    rx.queue(&tx.packets());
+    for _ in 0..commands {
+        assert!(worker.ep_worker_step(slots).unwrap());
+    }
+    rx.assert_drained();
 }
 
 fn run(first_chunk: bool) {
@@ -125,9 +139,9 @@ fn run(first_chunk: bool) {
         panic!("expected actual first chunk, not complete prompt");
     };
     assert_eq!((p.seq.slot_idx, p.chunk_offset), (1, 4));
-    rx.queue(&tx.packets());
-    assert!(worker.ep_worker_step(&mut slots).unwrap());
-    rx.assert_drained();
+    // One worker step per (seq, cmd) preamble: native-only fence, vision
+    // state clear, then the chunk itself.
+    replay(&worker, &mut slots, &tx, &rx, 3);
     if !first_chunk {
         tx.clear();
         observer.clear();
@@ -164,9 +178,8 @@ fn run(first_chunk: bool) {
         );
         assert_eq!(p.chunk_offset, 8);
         assert!(completed.is_empty() && !mixed);
-        rx.queue(&tx.packets());
-        assert!(worker.ep_worker_step(&mut slots).unwrap());
-        rx.assert_drained();
+        // Continuations re-send the fence but not vision state.
+        replay(&worker, &mut slots, &tx, &rx, 2);
     }
     let offset = if first_chunk { 0 } else { 4 };
     for events in [observer.events(), peer_observer.events()] {
