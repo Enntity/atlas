@@ -499,7 +499,8 @@ impl Glm5KdaLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
-        if let Some(sp) = sp {
+        // The routed MoE needs every row; a dense FFN runs only the local ones.
+        if let Some(sp) = sp.filter(|_| matches!(self.ffn, crate::layers::FfnComponent::Moe(_))) {
             sp.all_gather(normed, self.hidden_size, ctx, stream)?;
         }
         profile::step(ctx, stream, &mut profile_timer, "hc_ffn_norm")?;
