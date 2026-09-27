@@ -1,8 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use std::ops::Range;
+
 use anyhow::Result;
 
 use super::types::TransformerModel;
+
+/// Prompt positions the DFlash ctx accumulator holds after prefill (slot `i`
+/// holds position `start + i`): the last `max_ctx` prompt positions, but none
+/// below `lo`, the first position the prefill computes — earlier positions
+/// come from the prefix cache and have no hidden rows.
+pub(crate) fn dflash_prefill_window(prompt_len: usize, lo: usize, max_ctx: usize) -> Range<usize> {
+    prompt_len.saturating_sub(max_ctx).max(lo).min(prompt_len)..prompt_len
+}
+
+/// The rows of a pass that land in `window`, as `(resident row, rows, slot)`.
+/// The pass's row 0 is prompt position `row0_pos`; rows from `local0` on are
+/// resident (a sequence-parallel pass keeps only its upper half, compacted to
+/// row 0).
+pub(crate) fn dflash_prefill_capture_span(
+    window: &Range<usize>,
+    row0_pos: usize,
+    proc_count: usize,
+    local0: usize,
+) -> Option<(usize, usize, usize)> {
+    let first = window.start.max(row0_pos + local0);
+    let end = window.end.min(row0_pos + proc_count);
+    (first < end).then(|| (first - row0_pos - local0, end - first, first - window.start))
+}
 
 impl TransformerModel {
     /// Copy `rows` target hidden rows, starting at forward row `row0`, into
@@ -105,19 +130,16 @@ impl TransformerModel {
     ///   - The seq has no `DflashProposerState`
     ///   - Rank > 0 under EP/TP (drafter is rank-0 only)
     ///
-    /// Layout: writes `hidden[t]` BF16 into
-    /// `acc[(chunk_start + t) * 5 * h + slot_idx * h]` for each t.
-    /// Per-layer call performs `proc_count` strided d2d_async copies —
-    /// at typical prefill of 128–4096 tokens × 5 capture layers, total
-    /// 640–20480 launches per prefill. Acceptable launch overhead for
-    /// first land; replace with a strided-scatter kernel if profiling
-    /// shows it's a bottleneck.
+    /// Layout: `hidden[t]` is prompt position `row0_pos + t`; the rows inside
+    /// [`dflash_prefill_window`] go to `acc[(pos - window.start) * 5 * h +
+    /// slot_idx * h]`. `lo` is the first position this prefill computes.
     pub(super) fn try_dflash_prefill_capture_layer(
         &self,
         seq: &mut crate::traits::SequenceState,
         layer_idx: usize,
-        chunk_start: usize,
+        row0_pos: usize,
         proc_count: usize,
+        lo: usize,
         stream: u64,
     ) -> Result<()> {
         if self.dflash_capture_layers.is_empty() {
@@ -149,38 +171,35 @@ impl TransformerModel {
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
-        let acc_base = dstate.ctx_hidden_acc;
-        let max_ctx = dstate.max_ctx_len;
-        // The accumulator holds the LAST `max_ctx` prompt positions (the
-        // drafter's context window), not the first: slot 0 is position
-        // `window_start`. Earlier rows of this chunk are dropped.
-        let end = chunk_start + proc_count;
-        let window_start = seq.tokens.len().max(end).saturating_sub(max_ctx);
-        let mut first = window_start.max(chunk_start);
+        // The window comes from the whole prompt, not `seq.tokens`, which
+        // holds only the chunks before this one while it runs.
+        let window = dflash_prefill_window(seq.prompt_len, lo, dstate.max_ctx_len);
         // A sequence-parallel chunk keeps only this rank's rows (rank 0: the
         // upper half, compacted at row 0) in the highway.
         let sp_row0 = crate::layers::glm_sp::current().map_or(0, |sp| sp.row0);
-        first = first.max(chunk_start + sp_row0);
-        if first >= end {
+        let Some((row, rows, slot)) =
+            dflash_prefill_capture_span(&window, row0_pos, proc_count, sp_row0)
+        else {
             return Ok(());
-        }
+        };
         self.dflash_capture_rows(
-            first - chunk_start - sp_row0,
-            end - first,
-            acc_base.offset((first - window_start) * n_capture * h * bf16 + slot_idx * h * bf16),
+            row,
+            rows,
+            dstate
+                .ctx_hidden_acc
+                .offset(slot * n_capture * h * bf16 + slot_idx * h * bf16),
             n_capture * h * bf16,
             stream,
         )
     }
 
-    /// After prefill completes, advance the seq's DFlash `ctx_len` to
-    /// `chunk_start + proc_count` so the drafter sees all captured prompt
-    /// positions on the first propose() call.
+    /// After prefill completes, set the seq's DFlash `ctx_len` and
+    /// `ctx_positions` to the window `try_dflash_prefill_capture_layer`
+    /// filled, so the first propose() sees the captured prompt positions.
     pub(super) fn update_dflash_ctx_len_after_prefill(
         &self,
         seq: &mut crate::traits::SequenceState,
-        chunk_start: usize,
-        proc_count: usize,
+        lo: usize,
     ) -> Result<()> {
         if self.dflash_capture_layers.is_empty() {
             return Ok(());
@@ -195,17 +214,11 @@ impl TransformerModel {
                 .as_any_mut()
                 .downcast_mut::<crate::layers::DflashProposerState>()
         {
-            let end = chunk_start + proc_count;
-            let window_start = seq.tokens.len().max(end).saturating_sub(dstate.max_ctx_len);
-            let new_len = end.saturating_sub(window_start).min(dstate.max_ctx_len);
-            dstate.ctx_len = new_len;
+            let window = dflash_prefill_window(seq.prompt_len, lo, dstate.max_ctx_len);
+            dstate.ctx_len = window.len();
             // Phase I (v2): seed per-slot fixed positions for the prompt
-            // captures. Slot i holds prompt position window_start + i (the
-            // tail window kept by try_dflash_prefill_capture_layer). Keep
-            // parallel to ctx_len. Re-seed idempotently across prefill chunks.
-            dstate.ctx_positions = (window_start..window_start + new_len)
-                .map(|i| i as i32)
-                .collect();
+            // captures. Keep parallel to ctx_len.
+            dstate.ctx_positions = window.map(|i| i as i32).collect();
         }
         Ok(())
     }
