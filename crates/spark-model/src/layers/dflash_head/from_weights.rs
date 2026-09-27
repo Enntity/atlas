@@ -908,12 +908,14 @@ impl BlockDiffusionDraftHead {
         }
 
         let mxfp8 = std::env::var("ATLAS_DFLASH_MXFP8").as_deref() == Ok("1");
+        // ATLAS_DFLASH_NVFP4_TC=1 serves the layer projections from NVFP4
+        // tensor-core tiers; MXFP8 then keeps only the head (layer rows those
+        // tiers cannot take fall back to BF16, never to MXFP8 twins).
+        let nvfp4_tc = std::env::var("ATLAS_DFLASH_NVFP4_TC").as_deref() == Ok("1");
         if mxfp8 {
-            head.install_mxfp8(gpu)?;
+            head.install_mxfp8(gpu, !nvfp4_tc)?;
         }
-        // ATLAS_DFLASH_NVFP4_TC=1 layers NVFP4 projections (tensor-core
-        // tier) over the MXFP8 install, which keeps serving the head.
-        if !mxfp8 || std::env::var("ATLAS_DFLASH_NVFP4_TC").as_deref() == Ok("1") {
+        if !mxfp8 || nvfp4_tc {
             head.try_install_nvfp4(gpu)?;
         }
         Ok(head)

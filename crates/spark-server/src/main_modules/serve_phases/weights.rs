@@ -214,6 +214,19 @@ pub(crate) fn load_dflash_drafter(
         })?;
     let drafter_config =
         spark_model::weight_loader::dflash_loader::parse_dflash_config(&drafter_config_json)?;
+    // Only the head proposes. A worker keeps the drafter's config (its target
+    // capture layers shape the verify rows and SSM pools) but no weights, so
+    // no proposer is built there and its memory goes to the KV pool.
+    if args.rank != 0 {
+        tracing::info!(
+            "DFlash: rank {} keeps the drafter config only; the head proposes",
+            args.rank
+        );
+        return Ok(Some((
+            spark_runtime::weights::WeightStore::empty(),
+            drafter_config,
+        )));
+    }
     let mut loader = spark_runtime::weights::SafetensorsLoader::new();
     loader.peak_memory_multiplier = None;
     let drafter_store = loader

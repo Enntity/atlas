@@ -111,10 +111,10 @@ impl BlockDiffusionDraftHead {
         Ok(())
     }
 
-    /// Quantize the five large drafter projections to MXFP8 twins
-    /// (`ATLAS_DFLASH_MXFP8=1`). BF16 originals stay: they serve rows the
-    /// tensor-core GEMVs do not (wider than 32).
-    pub(super) fn install_mxfp8(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+    /// Quantize the five large drafter projections (when `layers`) and the
+    /// head to MXFP8 twins (`ATLAS_DFLASH_MXFP8=1`). BF16 originals stay:
+    /// they serve rows the tensor-core GEMVs do not (wider than 32).
+    pub(super) fn install_mxfp8(&mut self, gpu: &dyn GpuBackend, layers: bool) -> Result<()> {
         let quant = self.kernels.mxfp8_quantize;
         anyhow::ensure!(
             quant.0 != 0 && self.kernels.mxfp8_gemv.iter().all(|k| k.0 != 0),
@@ -130,7 +130,7 @@ impl BlockDiffusionDraftHead {
             ops::mxfp8_quantize(gpu, quant, w.weight, data, scales, n, k, stream)?;
             Ok(super::Mxfp8Weight { data, scales })
         };
-        for layer in &mut self.layers {
+        for layer in self.layers.iter_mut().filter(|_| layers) {
             layer.q_proj_mx = Some(quantize(&layer.q_proj, q_dim, h)?);
             layer.o_proj_mx = Some(quantize(&layer.o_proj, h, q_dim)?);
             layer.gate_proj_mx = Some(quantize(&layer.gate_proj, inter, h)?);
@@ -149,7 +149,7 @@ impl BlockDiffusionDraftHead {
         gpu.synchronize(stream)?;
         tracing::info!(
             "DFlash MXFP8: {} layers x 5 projections, lm_head {}",
-            self.layers.len(),
+            if layers { self.layers.len() } else { 0 },
             self.lm_head_mx.is_some()
         );
         Ok(())

@@ -1086,7 +1086,8 @@ pub fn build_model(
     // first makes that precondition observable instead of bypassable.
     model.set_lora_weights(lora_weights)?;
 
-    if let Some(args) = dflash_args {
+    // A worker rank carries the drafter config only; the head proposes.
+    if let Some(args) = dflash_args.filter(|a| a.drafter_store.len() > 0) {
         let weights = load_dflash_weights(
             args.drafter_store,
             &args.drafter_config,
