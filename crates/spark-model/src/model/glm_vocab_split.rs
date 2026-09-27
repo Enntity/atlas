@@ -9,7 +9,8 @@
 //! unbanned pair on rows under a min_tokens floor. The other half of the
 //! logits buffer is left stale, so this serves only argmax-consuming verify.
 use anyhow::{Result, ensure};
-use spark_runtime::gpu::{DevicePtr, KernelHandle};
+use atlas_core::config::ModelConfig;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 use std::sync::OnceLock;
 
@@ -25,6 +26,41 @@ const PAIRS_BYTES: usize = 1024;
 fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_VERIFY_VOCAB_SPLIT").as_deref() == Ok("1"))
+}
+
+/// This rank's shard as MXFP8 (first vocab row, weight), when prepared.
+static SHARD_MX: OnceLock<(usize, crate::layers::dflash_head::Mxfp8Weight)> = OnceLock::new();
+
+/// Quantize this rank's half of a BF16 GLM head to MXFP8 before KV sizing
+/// (`ATLAS_GLM_LM_HEAD_MXFP8=1`, ~0.33 GB); the split verify head then
+/// streams half the bytes for up to 32 rows at a time.
+pub(crate) fn prepare_shard_mxfp8(
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    lm_head: DevicePtr,
+    bf16_head: bool,
+) -> Result<()> {
+    if config.model_type != "glm5_next"
+        || !bf16_head
+        || config.ep_world_size != 2
+        || !enabled()
+        || std::env::var("ATLAS_GLM_LM_HEAD_MXFP8").as_deref() != Ok("1")
+    {
+        return Ok(());
+    }
+    let (vocab, h) = (config.vocab_size, config.hidden_size);
+    ensure!(vocab % 2 == 0, "GLM vocab split needs an even vocabulary ({vocab})");
+    let shard = vocab / 2;
+    let start = config.ep_rank * shard;
+    let quantize = gpu.kernel("mxfp8_gemv", "mxfp8_quantize_bf16")?;
+    let data = gpu.alloc(shard * h)?;
+    let scales = gpu.alloc(shard * h / ops::MXFP8_BLOCK)?;
+    let stream = gpu.default_stream();
+    ops::mxfp8_quantize(gpu, quantize, lm_head.offset(start * h * 2), data, scales, shard, h, stream)?;
+    gpu.synchronize(stream)?;
+    let _ = SHARD_MX.set((start, crate::layers::dflash_head::Mxfp8Weight { data, scales }));
+    tracing::info!(rank = config.ep_rank, shard, "GLM split verify head: MXFP8 shard ready");
+    Ok(())
 }
 
 impl TransformerModel {
@@ -104,7 +140,38 @@ impl TransformerModel {
         } else {
             ops::DENSE_GEMV_BATCHM_MAX_M as usize
         };
-        for first in (0..rows).step_by(max_m) {
+        static MX: OnceLock<[KernelHandle; 3]> = OnceLock::new();
+        let mx = SHARD_MX.get().filter(|(s, _)| *s == start).map(|(_, w)| {
+            let k = *MX.get_or_init(|| {
+                ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"].map(|name| {
+                    self.gpu.kernel("mxfp8_gemv", name).unwrap_or(KernelHandle(0))
+                })
+            });
+            (*w, k)
+        });
+        if let Some((w, k)) = mx.filter(|(_, k)| k.iter().all(|k| k.0 != 0)) {
+            for first in (0..rows).step_by(32) {
+                let m = (rows - first).min(32);
+                ops::mxfp8_gemv(
+                    self.gpu.as_ref(),
+                    k[match m {
+                        0..=8 => 0,
+                        9..=16 => 1,
+                        _ => 2,
+                    }],
+                    normed.offset(first * h * 2),
+                    w.data,
+                    w.scales,
+                    logits.offset((first * vocab + start) * 2),
+                    m as u32,
+                    shard as u32,
+                    h as u32,
+                    vocab as u32,
+                    stream,
+                )?;
+            }
+        }
+        for first in (0..rows).step_by(max_m).filter(|_| mx.is_none()) {
             let m = (rows - first).min(max_m);
             let (input, output) = (
                 normed.offset(first * h * 2),

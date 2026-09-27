@@ -522,6 +522,12 @@ pub fn build_model(
     // Both ranks initialize HC's TF32 library path before state construction
     // and the actual-free KV snapshot; the optional helper reuses dead scratch.
     super::glm_hc_prewarm::initialize(&config, gpu.as_ref(), &buffers, max_batch_tokens)?;
+    crate::model::prepare_glm_head_mxfp8(
+        &config,
+        gpu.as_ref(),
+        lm_head.weight,
+        lm_head_fp8.is_none() && lm_head_nvfp4.is_none(),
+    )?;
     crate::layers::moe::bind_resident_btile_arenas(
         &config,
         &store,
