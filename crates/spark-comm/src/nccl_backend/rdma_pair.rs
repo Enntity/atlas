@@ -9,11 +9,17 @@
 //! memory directly.
 //!
 //! Per all-reduce `seq`, on the caller's stream: copy the partial into the
-//! pinned send slot `seq % 2`, write `seq` to the host `ready` word, wait until
-//! the host `arrived` word reaches `seq`, then add the peer's receive slot in
-//! place. A proxy thread watches `ready`, RDMA-WRITEs the send slot into the
-//! peer's receive slot (split across rails when large) and, once those
-//! complete, WRITEs `seq` into the peer's `arrived` word.
+//! pinned send slot `seq % 2`, write the segment count to the host `ready`
+//! word, wait until the host `arrived` word reaches it, then add the peer's
+//! receive slot in place. A proxy thread watches `ready`, RDMA-WRITEs the send
+//! slot into the peer's receive slot (split across rails when large) and, once
+//! those complete, WRITEs the count into the peer's `arrived` word.
+//!
+//! Large payloads (prefill chunks) go as `segment_count()` pieces: each is sent as
+//! soon as its copy lands and added as soon as it arrives, so the staging
+//! copies and the adds overlap the wire. The flag words count segments; both
+//! ranks segment identically (by size). Staging stays on the copy engine: SM
+//! stores to the pinned slot were occasionally read stale by the NIC.
 //!
 //! Two slots per direction suffice. A rank only signals `seq + 2` after its
 //! add of `seq` (stream order), and the peer only sends `seq + 2` after its
@@ -44,6 +50,21 @@ const CU_MEMHOSTALLOC_PORTABLE_DEVICEMAP: u32 = 0x1 | 0x2;
 const CU_STREAM_WAIT_VALUE_GEQ: u32 = 0x0;
 /// Payloads below this go over one rail: splitting only adds a completion.
 const SPLIT_MIN: usize = 1 << 20;
+/// Payloads from this size are pipelined as `segment_count()` pieces.
+const SEGMENT_MIN: usize = 8 << 20;
+
+/// `ATLAS_RDMA_PAIR_SEGMENTS` (default 4; 1 = one copy/send/add per payload).
+/// Read from the shared profile, so both ranks agree.
+fn segment_count() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ATLAS_RDMA_PAIR_SEGMENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+            .clamp(1, 16)
+    })
+}
 /// Flag page: `ready` (GPU -> proxy), `arrived` (peer -> GPU), and the two
 /// local source words the proxy RDMA-WRITEs as the peer's `arrived`.
 const READY: usize = 0;
@@ -56,7 +77,23 @@ const RAIL_WIRE: usize = 4 + 4 + 16 + 4;
 
 struct Job {
     seq: u64,
-    bytes: usize,
+    /// Segment count before this job (flag words carry segment counts).
+    first: u64,
+    /// `(offset, len)` of each segment.
+    parts: Vec<(usize, usize)>,
+}
+
+/// Segment layout of a `bytes` payload; identical on both ranks.
+fn segments(bytes: usize) -> Vec<(usize, usize)> {
+    let n = if bytes >= SEGMENT_MIN {
+        segment_count()
+    } else {
+        1
+    };
+    let seg = bytes.div_ceil(n).next_multiple_of(64);
+    (0..bytes.div_ceil(seg))
+        .map(|i| (i * seg, seg.min(bytes - i * seg)))
+        .collect()
 }
 
 pub(super) struct RdmaPair {
@@ -65,6 +102,8 @@ pub(super) struct RdmaPair {
     dev: u64,
     capacity: usize,
     seq: AtomicU64,
+    /// Segments enqueued so far (mirrors the flag words).
+    segs: AtomicU64,
     jobs: Arc<Mutex<VecDeque<Job>>>,
     stop: Arc<AtomicBool>,
     proxy: Option<std::thread::JoinHandle<()>>,
@@ -190,47 +229,68 @@ impl RdmaPair {
             dev,
             capacity,
             seq: AtomicU64::new(0),
+            segs: AtomicU64::new(0),
             jobs,
             stop,
             proxy: Some(proxy),
         })
     }
 
-    /// Enqueue the exchange for `ptr[..bytes]` on `stream`; the caller then
-    /// adds `peer` (returned device pointer to the received partial) into
-    /// `ptr`. Returns `None` (nothing enqueued) when the payload exceeds the
+    /// All-reduce `ptr[..bytes]` on `stream`: copy each segment into the send
+    /// slot, then `add(dst, src, len)` the peer's partial into `ptr` as each
+    /// segment lands.
+    /// Returns `false` (nothing enqueued) when the payload exceeds the
     /// capacity or `stream` is capturing — both ranks see the same answer.
-    pub(super) fn exchange(&self, ptr: u64, bytes: usize, stream: u64) -> Result<Option<u64>> {
+    pub(super) fn exchange(
+        &self,
+        ptr: u64,
+        bytes: usize,
+        stream: u64,
+        add: impl Fn(u64, u64, usize) -> Result<()>,
+    ) -> Result<bool> {
         if bytes > self.capacity {
-            return Ok(None);
+            return Ok(false);
         }
         let mut capturing = 0i32;
         cu(unsafe { cuStreamIsCapturing(stream, &mut capturing) }, "cuStreamIsCapturing")?;
         if capturing != 0 {
-            return Ok(None);
+            return Ok(false);
         }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let slot = (seq & 1) as usize;
         let flags = self.dev + flag_off(self.capacity) as u64;
-        cu(
-            unsafe {
-                cuMemcpyAsync(self.dev + send_off(self.capacity, slot) as u64, ptr, bytes, stream)
-            },
-            "cuMemcpyAsync(RDMA send slot)",
-        )?;
-        // Default flags fence prior writes (the copy) before the value lands.
-        cu(
-            unsafe { cuStreamWriteValue64_v2(stream, flags + READY as u64, seq, 0) },
-            "cuStreamWriteValue64(ready)",
-        )?;
-        self.jobs.lock().push_back(Job { seq, bytes });
-        cu(
-            unsafe {
-                cuStreamWaitValue64_v2(stream, flags + ARRIVED as u64, seq, CU_STREAM_WAIT_VALUE_GEQ)
-            },
-            "cuStreamWaitValue64(arrived)",
-        )?;
-        Ok(Some(self.dev + recv_off(self.capacity, slot) as u64))
+        let send = self.dev + send_off(self.capacity, slot) as u64;
+        let recv = self.dev + recv_off(self.capacity, slot) as u64;
+        let parts = segments(bytes);
+        let first = self.segs.fetch_add(parts.len() as u64, Ordering::Relaxed);
+        for (i, &(off, len)) in parts.iter().enumerate() {
+            cu(
+                unsafe { cuMemcpyAsync(send + off as u64, ptr + off as u64, len, stream) },
+                "cuMemcpyAsync(RDMA send slot)",
+            )?;
+            // Default flags fence prior writes (the copy) before the value lands.
+            let ready = first + i as u64 + 1;
+            cu(
+                unsafe { cuStreamWriteValue64_v2(stream, flags + READY as u64, ready, 0) },
+                "cuStreamWriteValue64(ready)",
+            )?;
+        }
+        self.jobs.lock().push_back(Job {
+            seq,
+            first,
+            parts: parts.clone(),
+        });
+        for (i, &(off, len)) in parts.iter().enumerate() {
+            let arrived = first + i as u64 + 1;
+            cu(
+                unsafe {
+                    cuStreamWaitValue64_v2(stream, flags + ARRIVED as u64, arrived, CU_STREAM_WAIT_VALUE_GEQ)
+                },
+                "cuStreamWaitValue64(arrived)",
+            )?;
+            add(ptr + off as u64, recv + off as u64, len)?;
+        }
+        Ok(true)
     }
 }
 
@@ -316,77 +376,81 @@ fn proxy_loop(
             continue;
         };
         idle = 0;
-        let t0 = std::time::Instant::now();
-        while ready.load(Ordering::Acquire) < job.seq {
-            if stop.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            std::hint::spin_loop();
-        }
         let slot = (job.seq & 1) as usize;
-        let src = host + send_off(capacity, slot);
-        let dst = peer.base + recv_off(capacity, slot) as u64;
-        let used = if job.bytes >= SPLIT_MIN { rails.len() } else { 1 };
-        let part = job.bytes.div_ceil(used).next_multiple_of(64);
-        let mut posted = 0;
-        for (r, rail) in rails.iter_mut().enumerate().take(used) {
-            let off = r * part;
-            if off >= job.bytes {
-                break;
+        let bytes: usize = job.parts.iter().map(|p| p.1).sum();
+        for (i, &(seg_off, seg_len)) in job.parts.iter().enumerate() {
+            let count = job.first + i as u64 + 1;
+            let t0 = std::time::Instant::now();
+            while ready.load(Ordering::Acquire) < count {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                std::hint::spin_loop();
             }
-            let len = part.min(job.bytes - off);
-            // SAFETY: src..+len lies in the registered region (send slot);
-            // the slot is not rewritten until this seq's flag is consumed.
+            let src = host + send_off(capacity, slot) + seg_off;
+            let dst = peer.base + (recv_off(capacity, slot) + seg_off) as u64;
+            let used = if seg_len >= SPLIT_MIN { rails.len() } else { 1 };
+            let part = seg_len.div_ceil(used).next_multiple_of(64);
+            let mut posted = 0;
+            for (r, rail) in rails.iter_mut().enumerate().take(used) {
+                let off = r * part;
+                if off >= seg_len {
+                    break;
+                }
+                let len = part.min(seg_len - off);
+                // SAFETY: src..+len lies in the registered region (send slot);
+                // the slot is not rewritten until this seq's flag is consumed.
+                unsafe {
+                    rail.post_write(
+                        (src + off) as *mut c_void,
+                        lkeys[r],
+                        dst + off as u64,
+                        peer.rkeys[r],
+                        u32::try_from(len)?,
+                        count,
+                    )
+                }?;
+                posted += 1;
+            }
+            let t1 = std::time::Instant::now();
+            for rail in rails.iter_mut().take(posted) {
+                rail.poll()?;
+            }
+            let t2 = std::time::Instant::now();
+            let src_flag = flags + FLAG_SRC + slot * 8;
+            // SAFETY: the flag source word is ours; the previous WRITE from this
+            // word completed before that segment's poll returned.
+            unsafe { (src_flag as *mut u64).write_volatile(count) };
             unsafe {
-                rail.post_write(
-                    (src + off) as *mut c_void,
-                    lkeys[r],
-                    dst + off as u64,
-                    peer.rkeys[r],
-                    u32::try_from(len)?,
-                    job.seq,
+                rails[0].post_write(
+                    src_flag as *mut c_void,
+                    lkeys[0],
+                    peer.base + (flag_off(capacity) + ARRIVED) as u64,
+                    peer.rkeys[0],
+                    8,
+                    count,
                 )
             }?;
-            posted += 1;
-        }
-        let t1 = std::time::Instant::now();
-        for rail in rails.iter_mut().take(posted) {
-            rail.poll()?;
-        }
-        let t2 = std::time::Instant::now();
-        let src_flag = flags + FLAG_SRC + slot * 8;
-        // SAFETY: the flag source word is ours; the previous WRITE from this
-        // word (seq - 2) completed before that job's poll returned.
-        unsafe { (src_flag as *mut u64).write_volatile(job.seq) };
-        unsafe {
-            rails[0].post_write(
-                src_flag as *mut c_void,
-                lkeys[0],
-                peer.base + (flag_off(capacity) + ARRIVED) as u64,
-                peer.rkeys[0],
-                8,
-                job.seq,
-            )
-        }?;
-        rails[0].poll()?;
-        if stats {
-            let t3 = std::time::Instant::now();
-            acc[0] += (t1 - t0).as_secs_f64() * 1e6;
-            acc[1] += (t2 - t1).as_secs_f64() * 1e6;
-            acc[2] += (t3 - t2).as_secs_f64() * 1e6;
-            if job.bytes >= SPLIT_MIN {
-                jobs_large += 1;
-            } else {
-                jobs_small += 1;
-            }
-            let n = jobs_small + jobs_large;
-            if n % 4096 == 0 {
-                tracing::info!(
-                    "RDMA pair stats: {n} jobs ({jobs_small} small, {jobs_large} large); mean us: ready-wait {:.1} data {:.1} flag {:.1}",
-                    acc[0] / n as f64,
-                    acc[1] / n as f64,
-                    acc[2] / n as f64
-                );
+            rails[0].poll()?;
+            if stats {
+                let t3 = std::time::Instant::now();
+                acc[0] += (t1 - t0).as_secs_f64() * 1e6;
+                acc[1] += (t2 - t1).as_secs_f64() * 1e6;
+                acc[2] += (t3 - t2).as_secs_f64() * 1e6;
+                if bytes >= SPLIT_MIN {
+                    jobs_large += 1;
+                } else {
+                    jobs_small += 1;
+                }
+                let n = jobs_small + jobs_large;
+                if n % 4096 == 0 {
+                    tracing::info!(
+                        "RDMA pair stats: {n} jobs ({jobs_small} small, {jobs_large} large); mean us: ready-wait {:.1} data {:.1} flag {:.1}",
+                        acc[0] / n as f64,
+                        acc[1] / n as f64,
+                        acc[2] / n as f64
+                    );
+                }
             }
         }
     }
@@ -402,6 +466,23 @@ mod tests {
         assert_eq!(rail_names(own("a,b"), own("c")), ["a", "b"]);
         assert_eq!(rail_names(None, own("=c:1,d:1")), ["c", "d"]);
         assert_eq!(rail_names(None, None), ["rocep1s0f0"]);
+    }
+
+    #[test]
+    fn large_staged_payloads_split_into_aligned_segments() {
+        // An 8K-row prefill chunk: four 16 MiB pieces covering the payload.
+        let bytes = 8196 * 4096 * 2;
+        let parts = segments(bytes);
+        assert_eq!(parts.len(), segment_count());
+        let mut next = 0;
+        for &(off, len) in &parts {
+            assert_eq!(off, next);
+            assert!(off % 64 == 0 && len > 0);
+            next += len;
+        }
+        assert_eq!(next, bytes);
+        // Decode payloads stay whole.
+        assert_eq!(segments(64 << 10), [(0, 64 << 10)]);
     }
 
     #[test]

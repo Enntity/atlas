@@ -486,8 +486,9 @@ impl NcclBackend {
             if bytes == 0 {
                 return Ok(true);
             }
-            if let Some(peer) = rdma.exchange(ptr, bytes, stream)? {
-                self.launch_add(ptr, peer, bytes / ALL_REDUCE_DTYPE_BYTES, stream)?;
+            if rdma.exchange(ptr, bytes, stream, |dst, src, len| {
+                self.launch_add(dst, src, len / ALL_REDUCE_DTYPE_BYTES, stream)
+            })? {
                 return Ok(true);
             }
         }
