@@ -13,10 +13,11 @@ fn mixed_dense_moe_sizes_for_widest_ffn() {
 
     let sizes = BufferSizes::from_config(&cfg, 4, 4096, 16, 32);
     assert_eq!(sizes.expert_gate_out, 4 * 12_288 * 2);
-    // Default dense prefill: NVFP4 MMQ scratch only, no int8/FP4 requant pair.
-    assert_eq!(sizes.ffn_act_a, 0);
-    assert_eq!(sizes.ffn_act_scale, 0);
-    assert_eq!(sizes.ffn_act_q8, 4 * (12_288 / 256) * 144 + (1 << 20));
+    // Hybrid dense/MoE models size the dense-FFN activation scratch for the
+    // widest dense projection, exactly as dense models do.
+    assert_eq!(sizes.ffn_act_a, 4 * 12_288);
+    assert_eq!(sizes.ffn_act_scale, 4 * (12_288 / 16) * 4);
+    assert_eq!(sizes.ffn_act_q8, 4 * 12_288 * 4 + (1 << 20));
     // The Marlin cfg4 prefill path pads each expert's M dimension by 32 rows
     // (tm=2). The gate output is the unpadded logical extent; the up output
     // must include that extra extent because the activation kernel consumes

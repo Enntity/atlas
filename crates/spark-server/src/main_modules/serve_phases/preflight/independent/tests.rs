@@ -156,7 +156,11 @@ fn assert_allocation(
 fn default_glm_reserve_keeps_late_topology() {
     if isolated(
         "default_glm_reserve_keeps_late_topology",
-        &[("ATLAS_GLM_C4_DECODE", "1")],
+        &[
+            ("ATLAS_GLM_C4_DECODE", "1"),
+            ("ATLAS_GLM_KDA_MULTI_SEQ", "1"),
+            ("ATLAS_GLM_MLA_MULTI_SEQ", "1"),
+        ],
     ) {
         return;
     }
