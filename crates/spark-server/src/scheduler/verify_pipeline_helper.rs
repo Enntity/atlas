@@ -56,13 +56,6 @@ mod scratch;
 mod selection;
 mod selection_io;
 
-#[cfg(test)]
-mod checked_tests;
-#[cfg(test)]
-mod test_model;
-#[cfg(test)]
-mod tests;
-
 use crate::scheduler::ActiveSeq;
 use crate::scheduler::helpers::bf16_to_f32;
 use crate::scheduler::logit_processors::LogitsContext;

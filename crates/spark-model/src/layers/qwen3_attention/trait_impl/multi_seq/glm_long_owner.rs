@@ -183,7 +183,8 @@ impl Qwen3AttentionLayer {
         let total = num_tokens + passengers.len() * rows;
         let b = ctx.buffers;
         self.glm_mla_chunk_owners(&owners, None, kv_cache, ctx, stream, &mut || {
-            self.ffn.forward_prefill(b.norm_output(), total, ctx, stream)?;
+            self.ffn
+                .forward_prefill(b.norm_output(), total, ctx, stream)?;
             Ok(b.moe_output())
         })
     }

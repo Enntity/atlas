@@ -13,6 +13,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static PEER_EXIT_EXPECTED: AtomicBool = AtomicBool::new(false);
 
+/// Exit status when an EP rank stops because its pair's state is uncertain.
+const EXIT_EP_PAIR_UNCERTAIN: i32 = 74;
+
+/// Stop this rank immediately. The peer may be blocked in a collective, so no
+/// destructor, `atexit` handler or device call may run first.
+pub(crate) fn terminate() -> ! {
+    // SAFETY: `_exit` never returns and touches no Rust state.
+    unsafe { libc::_exit(EXIT_EP_PAIR_UNCERTAIN) }
+}
+
 #[cfg(feature = "nccl")]
 pub(crate) fn watch(backend: &spark_comm::NcclBackend) -> anyhow::Result<()> {
     if std::env::var("ATLAS_EP_PEER_LIFELINE").as_deref() == Ok("0") {
@@ -39,5 +49,5 @@ fn on_peer_lost(how: String) {
     let reason = format!("EP peer lost: {how}");
     tracing::error!("{reason}; terminating rank");
     atlas_core::fault::global().latch(reason);
-    crate::glm_terminal_session::terminate();
+    terminate();
 }

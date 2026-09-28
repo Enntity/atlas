@@ -4,13 +4,6 @@
 
 use super::*;
 
-#[path = "verify_dflash_ledger.rs"]
-pub(super) mod ledger;
-
-#[cfg(test)]
-#[path = "verify_dflash_repair_tests.rs"]
-mod repair_tests;
-
 /// Width-generic γ-token verify with accept-prefix.
 ///
 /// Routes `[last_token, drafts...]` through Atlas's width-generic target
@@ -31,7 +24,6 @@ pub fn step_verify_dflash(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
-    let ledger_enabled = ledger::enabled_for(&a.seq);
     step_verify_dflash_inner(
         model,
         a,
@@ -40,12 +32,9 @@ pub fn step_verify_dflash(
         num_drafts,
         verify_ctx,
         dflash_verify_raw_argmax,
-        ledger_enabled,
     );
 }
 
-// Keep diagnostic eligibility outside the inference body: tests can exercise
-// the actual host-only K5 path without changing process-wide environment.
 #[allow(clippy::too_many_arguments)]
 fn step_verify_dflash_inner(
     model: &dyn Model,
@@ -55,10 +44,8 @@ fn step_verify_dflash_inner(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
-    ledger_enabled: bool,
 ) {
     let _step_timer = crate::scheduler::mtp_timing::StepTimer::new(&sched.timing, a.seq.seq_len);
-    let ledger_position = a.seq.seq_len;
 
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
@@ -124,8 +111,6 @@ fn step_verify_dflash_inner(
         num_drafts,
         verify_ctx,
         dflash_verify_raw_argmax,
-        ledger_enabled,
-        ledger_position,
         &tokens,
         verified_argmax,
         step_timing,
@@ -146,8 +131,6 @@ pub(super) fn verify_dflash_tail(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
-    ledger_enabled: bool,
-    ledger_position: usize,
     tokens: &[u32],
     verified_argmax: Vec<u32>,
     step_timing: bool,
@@ -156,21 +139,6 @@ pub(super) fn verify_dflash_tail(
 ) -> Option<usize> {
     let raw_trace = if std::env::var("ATLAS_LIGHTNING_VERIFY_TOKEN_TRACE").as_deref() == Ok("1") {
         Some(verified_argmax.clone())
-    } else {
-        None
-    };
-
-    // Preserve only the diagnostic's fixed five IDs before the existing
-    // selection branch may move the Vec. Disabled/exhausted paths copy none.
-    let ledger_capture = if ledger_enabled {
-        a.mtp_acct.glm_k5_ledger.prepare(
-            true,
-            ledger_position,
-            a.last_token,
-            drafts,
-            &verified_argmax,
-            model.vocab_size(),
-        )
     } else {
         None
     };
@@ -259,14 +227,6 @@ pub(super) fn verify_dflash_tail(
         Vec::new()
     };
 
-    if let Some(record) = a
-        .mtp_acct
-        .glm_k5_ledger
-        .finish(ledger_capture, &verified, num_accepted)
-    {
-        ledger::emit(a.seq.slot_idx, &record);
-    }
-
     if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
         tracing::error!("EP broadcast generic verify result: {e:#}");
         a.finished = true;
@@ -308,13 +268,6 @@ pub(super) fn verify_dflash_tail(
         for _ in 0..pop_n {
             a.seq.tokens.pop();
         }
-    }
-
-    if let Err(e) = model.record_glm_mtp_verified(&mut a.seq, pre_verify_len, &tokens, num_accepted)
-    {
-        tracing::error!("GLM verified-pair record: {e:#}");
-        a.finished = true;
-        return None;
     }
 
     // EAGLE-fix (ATLAS_DFLASH_EAGLE_FIX=1): append one ctx slot per committed
@@ -642,7 +595,6 @@ pub fn step_verify_glm_long_with(
             return;
         }
         a.last_token_time = Instant::now();
-        let ledger_enabled = ledger::enabled_for(&a.seq);
         if let Some(next) = verify_dflash_tail(
             model,
             a,
@@ -651,8 +603,6 @@ pub fn step_verify_glm_long_with(
             num_drafts,
             verify_ctx,
             dflash_verify_raw_argmax,
-            ledger_enabled,
-            positions[owner],
             &tokens[owner],
             verified[owner * rows..(owner + 1) * rows].to_vec(),
             step_timing,
@@ -662,7 +612,15 @@ pub fn step_verify_glm_long_with(
             deferred.push((owner, next));
         }
     }
-    propose_owner_batch(model, group, &deferred, &save_slots, rows, sched, step_timing);
+    propose_owner_batch(
+        model,
+        group,
+        &deferred,
+        &save_slots,
+        rows,
+        sched,
+        step_timing,
+    );
     if step_timing {
         tracing::info!(
             "GLM OWNER STEP_TIMING: owners={} rows={rows} sync={sync_ms:.1}ms verify={verify_ms:.1}ms total={:.1}ms",
@@ -711,7 +669,9 @@ fn propose_owner_batch(
             .filter(|(i, _)| owners.binary_search(i).is_ok())
             .map(|(_, a)| &mut a.seq)
             .collect();
-        model.run_mtp_propose_batched(&tokens, &positions, &stash, num_drafts, &mut seqs, 0, None)
+        model.run_mtp_propose_batched(
+            &tokens, &positions, &stash, num_drafts, &mut seqs, 0, None, None,
+        )
     } else {
         Ok(None)
     };
@@ -744,7 +704,14 @@ fn propose_owner_batch(
                 let (o, drafts) = deferred[i];
                 let a = &mut *group[o];
                 let proposal = front_save_slot(model, save_slots[o], rows).and_then(|()| {
-                    model.run_mtp_propose_multi(a.last_token, a.seq.seq_len, drafts, &mut a.seq, 0, None)
+                    model.run_mtp_propose_multi(
+                        a.last_token,
+                        a.seq.seq_len,
+                        drafts,
+                        &mut a.seq,
+                        0,
+                        None,
+                    )
                 });
                 match proposal {
                     Ok(d) if !d.is_empty() => a.pending_drafts = d,

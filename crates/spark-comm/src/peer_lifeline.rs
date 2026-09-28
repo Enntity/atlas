@@ -90,8 +90,18 @@ mod keepalive {
         let fd = stream.as_raw_fd();
         for (level, name, value, label) in [
             (libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1, "SO_KEEPALIVE"),
-            (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, IDLE_SECS, "TCP_KEEPIDLE"),
-            (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, INTERVAL_SECS, "TCP_KEEPINTVL"),
+            (
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPIDLE,
+                IDLE_SECS,
+                "TCP_KEEPIDLE",
+            ),
+            (
+                libc::IPPROTO_TCP,
+                libc::TCP_KEEPINTVL,
+                INTERVAL_SECS,
+                "TCP_KEEPINTVL",
+            ),
             (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, PROBES, "TCP_KEEPCNT"),
         ] {
             // SAFETY: `fd` is a live socket owned by `stream` for this call;

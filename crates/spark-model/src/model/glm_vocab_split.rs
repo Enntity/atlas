@@ -15,8 +15,8 @@ use spark_runtime::kernel_args::KernelLaunch;
 use std::sync::OnceLock;
 
 use super::types::TransformerModel;
-use crate::traits::EosBan;
 use crate::layers::ops;
+use crate::traits::EosBan;
 use crate::weight_map::DenseWeight;
 
 /// Local pairs, then peer pairs, above the verify argmax words in scratch.
@@ -29,7 +29,7 @@ fn enabled() -> bool {
 }
 
 /// This rank's shard as MXFP8 (first vocab row, weight), when prepared.
-static SHARD_MX: OnceLock<(usize, crate::layers::dflash_head::Mxfp8Weight)> = OnceLock::new();
+static SHARD_MX: OnceLock<(usize, crate::weight_map::Mxfp8Weight)> = OnceLock::new();
 
 /// Quantize this rank's half of a BF16 GLM head to MXFP8 before KV sizing
 /// (`ATLAS_GLM_LM_HEAD_MXFP8=1`, ~0.33 GB); the split verify head then
@@ -49,17 +49,33 @@ pub(crate) fn prepare_shard_mxfp8(
         return Ok(());
     }
     let (vocab, h) = (config.vocab_size, config.hidden_size);
-    ensure!(vocab % 2 == 0, "GLM vocab split needs an even vocabulary ({vocab})");
+    ensure!(
+        vocab % 2 == 0,
+        "GLM vocab split needs an even vocabulary ({vocab})"
+    );
     let shard = vocab / 2;
     let start = config.ep_rank * shard;
     let quantize = gpu.kernel("mxfp8_gemv", "mxfp8_quantize_bf16")?;
     let data = gpu.alloc(shard * h)?;
     let scales = gpu.alloc(shard * h / ops::MXFP8_BLOCK)?;
     let stream = gpu.default_stream();
-    ops::mxfp8_quantize(gpu, quantize, lm_head.offset(start * h * 2), data, scales, shard, h, stream)?;
+    ops::mxfp8_quantize(
+        gpu,
+        quantize,
+        lm_head.offset(start * h * 2),
+        data,
+        scales,
+        shard,
+        h,
+        stream,
+    )?;
     gpu.synchronize(stream)?;
-    let _ = SHARD_MX.set((start, crate::layers::dflash_head::Mxfp8Weight { data, scales }));
-    tracing::info!(rank = config.ep_rank, shard, "GLM split verify head: MXFP8 shard ready");
+    let _ = SHARD_MX.set((start, crate::weight_map::Mxfp8Weight { data, scales }));
+    tracing::info!(
+        rank = config.ep_rank,
+        shard,
+        "GLM split verify head: MXFP8 shard ready"
+    );
     Ok(())
 }
 
@@ -107,8 +123,12 @@ impl TransformerModel {
             Some(k) => *k,
             None => *KERNELS.get_or_init(|| {
                 (
-                    self.gpu.kernel("argmax", "argmax_bf16_value_ban").unwrap_or(KernelHandle(0)),
-                    self.gpu.kernel("argmax", "argmax_pair_merge_ban").unwrap_or(KernelHandle(0)),
+                    self.gpu
+                        .kernel("argmax", "argmax_bf16_value_ban")
+                        .unwrap_or(KernelHandle(0)),
+                    self.gpu
+                        .kernel("argmax", "argmax_pair_merge_ban")
+                        .unwrap_or(KernelHandle(0)),
                 )
             }),
         };
@@ -117,7 +137,10 @@ impl TransformerModel {
         }
         let vocab = self.config.vocab_size;
         let h = self.config.hidden_size;
-        ensure!(vocab % 2 == 0, "GLM vocab split needs an even vocabulary ({vocab})");
+        ensure!(
+            vocab % 2 == 0,
+            "GLM vocab split needs an even vocabulary ({vocab})"
+        );
         let shard = vocab / 2;
         let start = comm.rank() * shard;
         let logits = self.buffers.logits();
@@ -144,7 +167,9 @@ impl TransformerModel {
         let mx = SHARD_MX.get().filter(|(s, _)| *s == start).map(|(_, w)| {
             let k = *MX.get_or_init(|| {
                 ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"].map(|name| {
-                    self.gpu.kernel("mxfp8_gemv", name).unwrap_or(KernelHandle(0))
+                    self.gpu
+                        .kernel("mxfp8_gemv", name)
+                        .unwrap_or(KernelHandle(0))
                 })
             });
             (*w, k)

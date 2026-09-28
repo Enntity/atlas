@@ -59,15 +59,19 @@ pub(crate) fn hc_pre_prefill_mix(
         );
         let ss = raw_mix.offset(tokens as usize * mix as usize * 4);
         let name = |base| ops::hc_kernel_name(&ctx.config.model_type, base);
-        KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name("glm_hc_mix_ss"))?)
-            .grid([tokens.div_ceil(32), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(streams)
-            .arg_ptr(site.hc_fn)
-            .arg_ptr(raw_mix)
-            .arg_ptr(ss)
-            .arg_u32(tokens)
-            .launch(stream)?;
+        KernelLaunch::new(
+            ctx.gpu,
+            ctx.gpu
+                .kernel("glm_hc_prefill_vec", &name("glm_hc_mix_ss"))?,
+        )
+        .grid([tokens.div_ceil(32), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(streams)
+        .arg_ptr(site.hc_fn)
+        .arg_ptr(raw_mix)
+        .arg_ptr(ss)
+        .arg_u32(tokens)
+        .launch(stream)?;
         return finalize_ss(site, hidden, tokens, sinkhorn_iters, hc_eps, ctx, stream);
     }
     ensure!(
@@ -166,7 +170,10 @@ pub(crate) fn hc_post_pre_prefill_fused(
     static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
     let (prefill_on, decode_on) = *ON.get_or_init(|| {
         let flag = |k| std::env::var(k).as_deref() == Ok("1");
-        (flag("ATLAS_GLM_HC_POST_MIX"), flag("ATLAS_GLM_HC_DECODE_SEAM"))
+        (
+            flag("ATLAS_GLM_HC_POST_MIX"),
+            flag("ATLAS_GLM_HC_DECODE_SEAM"),
+        )
     });
     let prefill = prefill_on && block_out.is_some() && tokens >= 512;
     let decode = decode_on && (1..=32).contains(&tokens);
@@ -174,56 +181,76 @@ pub(crate) fn hc_post_pre_prefill_fused(
         || hc_mult != 4
         || ctx.config.hidden_size != 4096
         || ctx.config.model_type != "glm5_next"
-        || !(ops::hc_bf16_for(&ctx.config.model_type) || fused_prefill("glm5_next", 4096, 4, tokens))
+        || !(ops::hc_bf16_for(&ctx.config.model_type)
+            || fused_prefill("glm5_next", 4096, 4, tokens))
         || ctx.buffers.sizes().gate_logits_f32 < (tokens as usize * 25 * 4).max(64 * 32 * 25 * 4)
     {
         return Ok(false);
     }
     let raw_mix = ctx.buffers.gate_logits_f32();
     let name = |base| ops::hc_kernel_name(&ctx.config.model_type, base);
-    let (streams, post, comb) = (ctx.buffers.hc_streams(), ctx.buffers.hc_post(), ctx.buffers.hc_comb());
+    let (streams, post, comb) = (
+        ctx.buffers.hc_streams(),
+        ctx.buffers.hc_post(),
+        ctx.buffers.hc_comb(),
+    );
     if decode {
-        let partial = if block_out.is_some() { "glm_hc_decode_post_partial" } else { "glm_hc_decode_partial" };
-        KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name(partial))?)
-            .grid([64, tokens.div_ceil(4), 1])
-            .block([128, 1, 1])
-            .arg_ptr(block_out.unwrap_or(DevicePtr::NULL))
-            .arg_ptr(streams)
-            .arg_ptr(post)
-            .arg_ptr(comb)
-            .arg_ptr(next.hc_fn)
-            .arg_ptr(raw_mix)
-            .arg_u32(tokens)
-            .launch(stream)?;
-        KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name("glm_hc_decode_finalize"))?)
-            .grid([tokens, 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(streams)
-            .arg_ptr(raw_mix)
-            .arg_ptr(next.hc_scale)
-            .arg_ptr(next.hc_base)
-            .arg_ptr(hidden)
-            .arg_ptr(post)
-            .arg_ptr(comb)
-            .arg_u32(tokens)
-            .arg_u32(sinkhorn_iters)
-            .arg_f32(ctx.config.rms_norm_eps as f32)
-            .arg_f32(hc_eps)
-            .launch(stream)?;
-        return Ok(true);
-    }
-    KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name("glm_hc_post_mix_ss"))?)
-        .grid([tokens.div_ceil(32), 1, 1])
-        .block([256, 1, 1])
-        .arg_ptr(block_out.expect("prefill seam requires a post"))
+        let partial = if block_out.is_some() {
+            "glm_hc_decode_post_partial"
+        } else {
+            "glm_hc_decode_partial"
+        };
+        KernelLaunch::new(
+            ctx.gpu,
+            ctx.gpu.kernel("glm_hc_prefill_vec", &name(partial))?,
+        )
+        .grid([64, tokens.div_ceil(4), 1])
+        .block([128, 1, 1])
+        .arg_ptr(block_out.unwrap_or(DevicePtr::NULL))
         .arg_ptr(streams)
         .arg_ptr(post)
         .arg_ptr(comb)
         .arg_ptr(next.hc_fn)
         .arg_ptr(raw_mix)
-        .arg_ptr(raw_mix.offset(tokens as usize * 24 * 4))
         .arg_u32(tokens)
         .launch(stream)?;
+        KernelLaunch::new(
+            ctx.gpu,
+            ctx.gpu
+                .kernel("glm_hc_prefill_vec", &name("glm_hc_decode_finalize"))?,
+        )
+        .grid([tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(streams)
+        .arg_ptr(raw_mix)
+        .arg_ptr(next.hc_scale)
+        .arg_ptr(next.hc_base)
+        .arg_ptr(hidden)
+        .arg_ptr(post)
+        .arg_ptr(comb)
+        .arg_u32(tokens)
+        .arg_u32(sinkhorn_iters)
+        .arg_f32(ctx.config.rms_norm_eps as f32)
+        .arg_f32(hc_eps)
+        .launch(stream)?;
+        return Ok(true);
+    }
+    KernelLaunch::new(
+        ctx.gpu,
+        ctx.gpu
+            .kernel("glm_hc_prefill_vec", &name("glm_hc_post_mix_ss"))?,
+    )
+    .grid([tokens.div_ceil(32), 1, 1])
+    .block([256, 1, 1])
+    .arg_ptr(block_out.expect("prefill seam requires a post"))
+    .arg_ptr(streams)
+    .arg_ptr(post)
+    .arg_ptr(comb)
+    .arg_ptr(next.hc_fn)
+    .arg_ptr(raw_mix)
+    .arg_ptr(raw_mix.offset(tokens as usize * 24 * 4))
+    .arg_u32(tokens)
+    .launch(stream)?;
     finalize_ss(next, hidden, tokens, sinkhorn_iters, hc_eps, ctx, stream)?;
     Ok(true)
 }

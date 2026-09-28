@@ -56,9 +56,6 @@ fn target_has_required_vision_module(is_glm5_next: bool, modules: &[(&str, &[u8]
     modules.iter().any(|(name, _)| *name == required)
 }
 
-mod selected_handoff;
-use selected_handoff::ServingModel;
-
 /// Load a model and build everything derived from it.
 ///
 /// State that OUTLIVES any model and must be carried across a swap.
@@ -105,27 +102,10 @@ impl Carried {
 /// `Ok(None)` means this rank is an EP worker: it ran its command loop and has
 /// nothing for the async tail to serve.
 pub(crate) fn load_model(
-    args: cli::ServeArgs,
-    tui_handles_tx: Option<std::sync::mpsc::Sender<crate::tui::RunHandles>>,
-    carried: Carried,
-) -> Result<Option<Prepared>> {
-    anyhow::ensure!(
-        !args.glm_paired_mtp,
-        "paired session cannot hot-swap or load without inherited authority"
-    );
-    load_model_selected(args, tui_handles_tx, carried, None)
-}
-
-pub(crate) fn load_model_selected(
     mut args: cli::ServeArgs,
     tui_handles_tx: Option<std::sync::mpsc::Sender<crate::tui::RunHandles>>,
     carried: Carried,
-    selected: Option<crate::glm_terminal_session::startup::SelectedStartup>,
 ) -> Result<Option<Prepared>> {
-    anyhow::ensure!(
-        args.glm_paired_mtp == selected.is_some(),
-        "selected launch authority mismatch"
-    );
     // 0. Resolve model directory from HF ID or path
     spark_runtime::progress::phase(1, "model resolve");
     let model_dir = serve_phases::resolve_model_dir(&args)?;
@@ -429,28 +409,11 @@ pub(crate) fn load_model_selected(
     // `args.num_drafts` is Some and `args.resolved_num_drafts()` is valid.
     serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);
 
-    #[cfg(target_os = "linux")]
-    if let Some(startup) = &selected {
-        crate::glm_terminal_session::startup::validate_args(&args, &startup.received.recipe)?;
-        anyhow::ensure!(
-            config.model_type == "glm5_next"
-                && model_quant == "nvfp4"
-                && config.hidden_size == 4096
-                && config.kv_lora_rank == 512
-                && config.qk_rope_head_dim == 0
-                && config.vision.is_none(),
-            "paired serving requires the resolved text GLM5.3 NVFP4 target"
-        );
-    }
-
     // ── Pre-load reserve preflight ──
     let (gpu, free_mem, prepared_topology, reserve) =
         serve_phases::prepare_reserve(&args, &mut config, || {
             serve_phases::init_gpu_backend(&args, &ptx_set)
         })?;
-    // Preserve the native owner on any selected startup Err before the actual
-    // factory takes ownership. Its selected constructor applies the same rule.
-    let gpu = spark_model::factory::ColdOwner::new(gpu, selected.is_some());
     let serve_phases::ReservePreflight {
         inference_reserve,
         buffer_arena_bytes,
@@ -646,7 +609,6 @@ pub(crate) fn load_model_selected(
         max_batch_tokens,
         config.hidden_size,
     )?;
-    let comm = spark_model::factory::ColdOwner::new(comm, selected.is_some());
     // Carried on the config rather than written into the environment: the old
     // `unsafe set_var` claimed "called before any threads are spawned", which
     // was false by this point (tokio pool, this blocking thread, the signal
@@ -785,35 +747,19 @@ pub(crate) fn load_model_selected(
         // Moved, not borrowed: the model keeps the ledger so it can free the
         // weights at teardown. Nothing after this point reads the store.
         store,
-        gpu.into_inner(),
+        gpu,
         max_batch_tokens,
         kv_dtype,
         inference_reserve,
         layer_dtypes,
         hss_cache_blocks_per_seq,
         prefix_cache,
-        comm.into_inner(),
+        comm,
         dflash_args,
         lora_args,
         nllb_lang,
         nllb_lora_dir,
     )?;
-
-    // Register the actual capability before any fallible post-build work or
-    // worker/scheduler handoff can drop this selected Model.
-    #[cfg(target_os = "linux")]
-    let model = match selected {
-        Some(startup) => {
-            ServingModel::Selected(crate::glm_terminal_session::SelectedModel::register(
-                model,
-                startup.received,
-                args.rank as u8,
-            ))
-        }
-        None => ServingModel::Ordinary(model),
-    };
-    #[cfg(not(target_os = "linux"))]
-    let model = ServingModel::Ordinary(model);
 
     // Kernel load audit + the fail-closed boot gate. Every lookup is eager, so
     // by here the audit holds this model's COMPLETE lookup set — see
@@ -834,23 +780,13 @@ pub(crate) fn load_model_selected(
     spark_model::traits::EosBan::install_model_end_tokens(&eos_tokens);
 
     // EP worker: rank > 0 enters command loop, returns when head exits.
-    let model = match model {
-        #[cfg(target_os = "linux")]
-        ServingModel::Selected(owner) => {
-            if args.rank > 0 {
-                owner.run_worker();
-            }
-            ServingModel::Selected(owner)
-        }
-        ServingModel::Ordinary(model) => {
-            let mut model_opt = Some(model);
-            if serve_phases::maybe_run_ep_worker(&args, &mut model_opt, &early_high_speed_swap_cfg)?
-            {
-                return Ok(None);
-            }
-            ServingModel::Ordinary(model_opt.expect("head retains model on rank 0"))
-        }
-    };
+    let mut model_opt = Some(model);
+    if serve_phases::maybe_run_ep_worker(&args, &mut model_opt, &early_high_speed_swap_cfg)? {
+        // An EP worker (rank > 0) never serves HTTP: it ran its command loop and
+        // the head has exited. `None` = nothing for the async tail to do.
+        return Ok(None);
+    }
+    let model = model_opt.expect("head retains model on rank 0");
 
     // Read default sampling parameters from generation_config.json.
     let serve_phases::SamplingDefaults {
@@ -1136,28 +1072,6 @@ pub(crate) fn load_model_selected(
     };
     let scheduler_handle = std::thread::spawn(move || {
         super::scheduler_supervisor::run_supervised(atlas_core::fault::global(), move || {
-            let scheduler_model = match scheduler_model {
-                #[cfg(target_os = "linux")]
-                ServingModel::Selected(owner) => scheduler::run_selected(
-                    owner,
-                    request_rx,
-                    rotation_rx,
-                    scheduler_eos,
-                    think_end_token,
-                    think_start_token,
-                    tool_call_start_token,
-                    tool_call_end_token,
-                    scheduler_spontaneous_think_budget,
-                    scheduler::sched_ctx::SchedCtx::new(
-                        vocab_masks,
-                        run_levers,
-                        run_snapshot,
-                        sched_limits,
-                        watchdog_params,
-                    ),
-                ),
-                ServingModel::Ordinary(model) => model,
-            };
             scheduler::run(
                 scheduler_model,
                 request_rx,

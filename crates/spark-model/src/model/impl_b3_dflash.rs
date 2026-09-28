@@ -69,7 +69,10 @@ impl TransformerModel {
                 }),
             };
             anyhow::ensure!(kernel.0 != 0, "DFlash mHC capture kernel unavailable");
-            anyhow::ensure!(dst_stride % 2 == 0, "DFlash capture stride must be BF16-aligned");
+            anyhow::ensure!(
+                dst_stride % 2 == 0,
+                "DFlash capture stride must be BF16-aligned"
+            );
             return spark_runtime::kernel_args::KernelLaunch::new(self.gpu.as_ref(), kernel)
                 .grid([rows as u32, 1, 1])
                 .block([256, 1, 1])

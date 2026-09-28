@@ -69,38 +69,17 @@ impl Glm5KdaLayer {
             (3 * p) as u32,
             stream,
         )?;
-        if let Some(flash) = self
-            .flash_prefill
-            .as_ref()
-            .filter(|_| flash_prefill::eligible(tokens, decode, ctx.graph_capture))
-        {
-            // Convolution has finished reading packed. Its storage and the
-            // idle expert buffers can now be borrowed on this same stream.
-            flash.forward(
-                convolved,
-                g1,
-                beta,
-                self.weights.a_log.weight,
-                self.weights.dt_bias.weight,
-                state.h_state,
-                core_out,
-                tokens,
-                ctx,
-                stream,
-            )
-        } else {
-            self.run_recurrent(
-                convolved,
-                g1,
-                beta,
-                state.h_state,
-                core_out,
-                m,
-                decode,
-                ctx,
-                stream,
-            )
-        }
+        self.run_recurrent(
+            convolved,
+            g1,
+            beta,
+            state.h_state,
+            core_out,
+            m,
+            decode,
+            ctx,
+            stream,
+        )
     }
 
     /// Fused prefill chunk + verify owners: pack every row once, advance
@@ -491,7 +470,11 @@ impl Glm5KdaLayer {
         let p = self.heads * self.dim;
         let (h, i): (Vec<_>, Vec<_>) = states.into_iter().unzip();
         // The kernel takes up to four owners; larger batches launch per four.
-        for (c, (h, i)) in h.chunks(OWNERS_PER_LAUNCH).zip(i.chunks(OWNERS_PER_LAUNCH)).enumerate() {
+        for (c, (h, i)) in h
+            .chunks(OWNERS_PER_LAUNCH)
+            .zip(i.chunks(OWNERS_PER_LAUNCH))
+            .enumerate()
+        {
             let r = row0 + c * OWNERS_PER_LAUNCH * rows;
             ops::kda_recurrent_verify_snap_owners(
                 ctx.gpu,

@@ -128,27 +128,6 @@ pub(super) fn admit_count(
     max_seq_len: usize,
     block_size: usize,
 ) -> (usize, bool) {
-    admit_with_spill(
-        total_blocks,
-        committed,
-        reqs,
-        watermark,
-        max_seq_len,
-        block_size,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn admit_with_spill(
-    total_blocks: usize,
-    committed: usize,
-    reqs: &[(usize, usize)],
-    watermark: usize,
-    max_seq_len: usize,
-    block_size: usize,
-    shared_spill: Option<usize>,
-) -> (usize, bool) {
     let mut used = committed;
     let mut n = 0usize;
     for &(prompt, max_tokens) in reqs {
@@ -160,12 +139,11 @@ fn admit_with_spill(
             watermark,
             max_seq_len,
             block_size,
-        )
-        .saturating_add(shared_spill.unwrap_or(0));
+        );
         if used.saturating_add(need) <= total_blocks {
             used += need;
             n += 1;
-        } else if n == 0 && committed == 0 && shared_spill.is_none() {
+        } else if n == 0 && committed == 0 {
             return (1, true);
         } else {
             break;
@@ -180,7 +158,6 @@ fn reject_oversized(
     watermark: usize,
     max_seq_len: usize,
     block_size: usize,
-    spill: usize,
 ) -> Vec<InferenceRequest> {
     new_reqs
         .into_iter()
@@ -189,14 +166,13 @@ fn reject_oversized(
                 current_tokens: req.prompt_len(),
                 budget_tokens: req.max_tokens(),
             };
-            let need = seq_commitment_blocks(&demand, watermark, max_seq_len, block_size)
-                .saturating_add(spill);
+            let need = seq_commitment_blocks(&demand, watermark, max_seq_len, block_size);
             if need <= total_blocks {
                 return Some(req);
             }
             let message = format!(
-                "Request needs {need} KV blocks including generation and spill, \
-                 but the shared pool has {total_blocks} usable blocks"
+                "Request needs {need} KV blocks including generation, \
+                 but the pool has {total_blocks} usable blocks"
             );
             let mut sink = match req {
                 InferenceRequest::Streaming { token_tx, .. } => ResponseSink::Streaming(token_tx),
@@ -225,13 +201,12 @@ pub(super) fn gate_admissions(
     watermark: usize,
     max_seq_len: usize,
     block_size: usize,
-    shared_spill: Option<usize>,
 ) -> Vec<InferenceRequest> {
     if new_reqs.is_empty() {
         return new_reqs;
     }
     let total_blocks = model.num_total_blocks();
-    if total_blocks == 0 && shared_spill.is_none() {
+    if total_blocks == 0 {
         // Backend without a paged KV pool (or no occupancy info): nothing to
         // reserve against — admit as before.
         return new_reqs;
@@ -239,17 +214,8 @@ pub(super) fn gate_admissions(
     // Under EP a worker cannot back-pressure: its block allocation failure is
     // fatal to the pair. A request that can never fit the pool is refused
     // with an error instead of being forced in.
-    let new_reqs = if let Some(spill) = shared_spill {
-        reject_oversized(
-            new_reqs,
-            total_blocks,
-            watermark,
-            max_seq_len,
-            block_size,
-            spill,
-        )
-    } else if model.is_ep() {
-        reject_oversized(new_reqs, total_blocks, watermark, max_seq_len, block_size, 0)
+    let new_reqs = if model.is_ep() {
+        reject_oversized(new_reqs, total_blocks, watermark, max_seq_len, block_size)
     } else {
         new_reqs
     };
@@ -272,32 +238,19 @@ pub(super) fn gate_admissions(
         current_tokens: p.tokens.len() + 1,
         budget_tokens: p.a.remaining,
     }));
-    let committed = committed_blocks(&demands, watermark, max_seq_len, block_size)
-        .saturating_add(shared_spill.unwrap_or(0).saturating_mul(demands.len()));
+    let committed = committed_blocks(&demands, watermark, max_seq_len, block_size);
     let infos: Vec<(usize, usize)> = new_reqs
         .iter()
         .map(|r| (r.prompt_len(), r.max_tokens()))
         .collect();
-    let (admit, forced) = if shared_spill.is_some() {
-        admit_with_spill(
-            total_blocks,
-            committed,
-            &infos,
-            watermark,
-            max_seq_len,
-            block_size,
-            shared_spill,
-        )
-    } else {
-        admit_count(
-            total_blocks,
-            committed,
-            &infos,
-            watermark,
-            max_seq_len,
-            block_size,
-        )
-    };
+    let (admit, forced) = admit_count(
+        total_blocks,
+        committed,
+        &infos,
+        watermark,
+        max_seq_len,
+        block_size,
+    );
     if forced {
         tracing::warn!(
             "admitting a request whose reservation exceeds the whole KV pool \

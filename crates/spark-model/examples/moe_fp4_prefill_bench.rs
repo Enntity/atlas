@@ -27,9 +27,27 @@ const REFERENCE: &str = "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale";
 /// (kernel, CTA N tile, threads per CTA, reads K-major `[N, K/2]` weights,
 /// compact row-tile grid over `moe_mtile_prefix`).
 const CANDIDATES: &[(&str, u32, u32, bool, bool)] = &[
-    ("moe_w4a4_grouped_gemm_prequant_t_k128", 128, 256, false, false),
-    ("moe_w4a4_grouped_gemm_prequant_t_k128w_compact", 256, 256, false, true),
-    ("moe_w4a4_grouped_gemm_prequant_nk_k128", 128, 256, true, false),
+    (
+        "moe_w4a4_grouped_gemm_prequant_t_k128",
+        128,
+        256,
+        false,
+        false,
+    ),
+    (
+        "moe_w4a4_grouped_gemm_prequant_t_k128w_compact",
+        256,
+        256,
+        false,
+        true,
+    ),
+    (
+        "moe_w4a4_grouped_gemm_prequant_nk_k128",
+        128,
+        256,
+        true,
+        false,
+    ),
 ];
 /// Local experts; the grid covers twice as many (the remote rank's half).
 const EXPERTS: usize = 144;
@@ -37,7 +55,10 @@ const GRID_EXPERTS: usize = 2 * EXPERTS;
 /// Routed rows on one EP2 rank: 16384 at a 4K chunk (top-8 over two ranks);
 /// `MOE_BENCH_ROWS` overrides (32768 = an 8K chunk).
 fn rows_total() -> usize {
-    std::env::var("MOE_BENCH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(16384)
+    std::env::var("MOE_BENCH_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16384)
 }
 
 struct Lcg(u64);
@@ -59,9 +80,14 @@ fn up(g: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
 
 /// Expert row counts: a Zipf-like skew (hottest ~3K rows), summing to rows_total().
 fn expert_rows() -> Vec<usize> {
-    let weights: Vec<f64> = (0..EXPERTS).map(|e| 1.0 / (1.0 + e as f64).powf(0.9)).collect();
+    let weights: Vec<f64> = (0..EXPERTS)
+        .map(|e| 1.0 / (1.0 + e as f64).powf(0.9))
+        .collect();
     let total: f64 = weights.iter().sum();
-    let mut rows: Vec<usize> = weights.iter().map(|w| (w / total * rows_total() as f64) as usize).collect();
+    let mut rows: Vec<usize> = weights
+        .iter()
+        .map(|w| (w / total * rows_total() as f64) as usize)
+        .collect();
     let short = rows_total() - rows.iter().sum::<usize>();
     rows[EXPERTS - 1] += short;
     rows
@@ -72,12 +98,19 @@ fn expert_rows() -> Vec<usize> {
 /// K-major `[N, K/2]` + `[N, K/16]` (each byte keeps its k-pair). Returns
 /// (packed, scales, packed K-major, scales K-major) pointer tables and the
 /// allocations to free.
-fn expert_tables(g: &dyn GpuBackend, rng: &mut Lcg, n: usize, k: usize) -> Result<([DevicePtr; 4], Vec<DevicePtr>)> {
+fn expert_tables(
+    g: &dyn GpuBackend,
+    rng: &mut Lcg,
+    n: usize,
+    k: usize,
+) -> Result<([DevicePtr; 4], Vec<DevicePtr>)> {
     let mut tables = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut owned = Vec::new();
     for _ in 0..EXPERTS {
         let w: Vec<u8> = (0..n * k / 2).map(|_| rng.next() as u8).collect();
-        let s: Vec<u8> = (0..n * k / 16).map(|_| 0x30 + (rng.next() % 16) as u8).collect();
+        let s: Vec<u8> = (0..n * k / 16)
+            .map(|_| 0x30 + (rng.next() % 16) as u8)
+            .collect();
         let mut w_nk = vec![0u8; w.len()];
         for kp in 0..k / 2 {
             for c in 0..n {
@@ -128,7 +161,11 @@ fn launch(
     max_m_tiles: u32,
     prefix: Option<DevicePtr>,
 ) -> Result<()> {
-    let z = if prefix.is_some() { 1 } else { GRID_EXPERTS as u32 };
+    let z = if prefix.is_some() {
+        1
+    } else {
+        GRID_EXPERTS as u32
+    };
     let mut l = KernelLaunch::new(g, kernel)
         .grid([div_ceil(n, n_tile), max_m_tiles, z])
         .block([threads, 1, 1]);
@@ -163,14 +200,21 @@ fn main() -> Result<()> {
     let d_off = up(g, &off_bytes)?;
     let mut rng = Lcg(0xF4F4);
     let mut fail = false;
-    for (name, n, k) in [("gate [2048 x 4096]", 2048u32, 4096u32), ("down [4096 x 2048]", 4096, 2048)] {
+    for (name, n, k) in [
+        ("gate [2048 x 4096]", 2048u32, 4096u32),
+        ("down [4096 x 2048]", 4096, 2048),
+    ] {
         let (nu, ku) = (n as usize, k as usize);
         // A: packed E2M1 rows + UE4M3 group scales in a sane exponent range.
         let a: Vec<u8> = (0..all_rows * ku / 2).map(|_| rng.next() as u8).collect();
-        let a_s: Vec<u8> = (0..all_rows * ku / 16).map(|_| 0x30 + (rng.next() % 16) as u8).collect();
+        let a_s: Vec<u8> = (0..all_rows * ku / 16)
+            .map(|_| 0x30 + (rng.next() % 16) as u8)
+            .collect();
         let (d_a, d_as) = (up(g, &a)?, up(g, &a_s)?);
         let ([d_pp, d_sp, d_ppk, d_spk], owned) = expert_tables(g, &mut rng, nu, ku)?;
-        let scale2: Vec<u8> = (0..GRID_EXPERTS).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        let scale2: Vec<u8> = (0..GRID_EXPERTS)
+            .flat_map(|_| 1.0f32.to_le_bytes())
+            .collect();
         let d_s2 = up(g, &scale2)?;
         let c_bytes = all_rows * nu * 2;
         let (c_ref, c_new) = (g.alloc(c_bytes)?, g.alloc(c_bytes)?);
@@ -178,7 +222,19 @@ fn main() -> Result<()> {
         let args = |c| [d_a, d_as, d_pp, d_sp, d_s2, c, d_off, DevicePtr(0)];
         let args_nk = |c| [d_a, d_as, d_ppk, d_spk, d_s2, c, d_off, DevicePtr(0)];
         let flop = 2.0 * rows_total() as f64 * n as f64 * k as f64;
-        let run_ref = || launch(g, reference, 128, 128, &args(c_ref), n, k, max_m_tiles, None);
+        let run_ref = || {
+            launch(
+                g,
+                reference,
+                128,
+                128,
+                &args(c_ref),
+                n,
+                k,
+                max_m_tiles,
+                None,
+            )
+        };
         let t_ref = time(g, &run_ref)?;
         println!(
             "{name}: reference {:7.1}us {:5.1} TFLOPS (max_m_tiles {max_m_tiles})",
@@ -206,18 +262,36 @@ fn main() -> Result<()> {
                     .arg_ptr(d_prefix)
                     .arg_u32(GRID_EXPERTS as u32)
                     .launch(0)?;
-                launch(g, kernel, n_tile, threads, &a, n, k, tile_bound, Some(d_prefix))
+                launch(
+                    g,
+                    kernel,
+                    n_tile,
+                    threads,
+                    &a,
+                    n,
+                    k,
+                    tile_bound,
+                    Some(d_prefix),
+                )
             };
             let t = time(g, &run)?;
             let mut got = vec![0u8; c_bytes];
             g.copy_d2h(c_new, &mut got)?;
-            let diff = want.chunks_exact(2).zip(got.chunks_exact(2)).filter(|(a, b)| a != b).count();
+            let diff = want
+                .chunks_exact(2)
+                .zip(got.chunks_exact(2))
+                .filter(|(a, b)| a != b)
+                .count();
             fail |= diff != 0;
             println!(
                 "  {kname}: {:7.1}us {:5.1} TFLOPS  {}",
                 t * 1e6,
                 flop / t / 1e12,
-                if diff == 0 { "bitwise".to_string() } else { format!("MISMATCH {diff} values") }
+                if diff == 0 {
+                    "bitwise".to_string()
+                } else {
+                    format!("MISMATCH {diff} values")
+                }
             );
         }
         for p in owned.into_iter().chain([d_a, d_as, d_s2, c_ref, c_new]) {
@@ -252,21 +326,36 @@ fn gate_up_silu(
         return Ok(false);
     };
     let a: Vec<u8> = (0..all_rows * ku / 2).map(|_| rng.next() as u8).collect();
-    let a_s: Vec<u8> = (0..all_rows * ku / 16).map(|_| 0x30 + (rng.next() % 16) as u8).collect();
+    let a_s: Vec<u8> = (0..all_rows * ku / 16)
+        .map(|_| 0x30 + (rng.next() % 16) as u8)
+        .collect();
     let (d_a, d_as) = (up(g, &a)?, up(g, &a_s)?);
     let ([g_pp, g_sp, ..], mut owned) = expert_tables(g, rng, nu, ku)?;
     let ([u_pp, u_sp, ..], u_owned) = expert_tables(g, rng, nu, ku)?;
     owned.extend(u_owned);
     // Output scales that put the SiLU inputs around the clamp and below it.
     let s2 = |base: f32| -> Vec<u8> {
-        (0..GRID_EXPERTS).flat_map(|e| (base * (1.0 + (e % 5) as f32 * 0.25)).to_le_bytes()).collect()
+        (0..GRID_EXPERTS)
+            .flat_map(|e| (base * (1.0 + (e % 5) as f32 * 0.25)).to_le_bytes())
+            .collect()
     };
     let (g_s2, u_s2) = (up(g, &s2(1.0 / 256.0))?, up(g, &s2(1.0 / 128.0))?);
     let (c_g, c_u) = (g.alloc(all_rows * nu * 2)?, g.alloc(all_rows * nu * 2)?);
     let (q_bytes, s_bytes) = (all_rows * nu / 2, all_rows * nu / 16);
-    let (ref_q, ref_s, new_q, new_s) =
-        (g.alloc(q_bytes)?, g.alloc(s_bytes)?, g.alloc(q_bytes)?, g.alloc(s_bytes)?);
-    for (p, b) in [(c_g, all_rows * nu * 2), (c_u, all_rows * nu * 2), (ref_q, q_bytes), (ref_s, s_bytes), (new_q, q_bytes), (new_s, s_bytes)] {
+    let (ref_q, ref_s, new_q, new_s) = (
+        g.alloc(q_bytes)?,
+        g.alloc(s_bytes)?,
+        g.alloc(q_bytes)?,
+        g.alloc(s_bytes)?,
+    );
+    for (p, b) in [
+        (c_g, all_rows * nu * 2),
+        (c_u, all_rows * nu * 2),
+        (ref_q, q_bytes),
+        (ref_s, s_bytes),
+        (new_q, q_bytes),
+        (new_s, s_bytes),
+    ] {
         g.memset(p, 0, b)?;
     }
     let prefix = |pp| {
@@ -282,7 +371,17 @@ fn gate_up_silu(
     let run_ref = || -> Result<()> {
         prefix(g_pp)?;
         for (pp, sp, s2p, c) in [(g_pp, g_sp, g_s2, c_g), (u_pp, u_sp, u_s2, c_u)] {
-            launch(g, wide, 256, 256, &[d_a, d_as, pp, sp, s2p, c, d_off, DevicePtr(0)], n, k, tile_bound, Some(d_prefix))?;
+            launch(
+                g,
+                wide,
+                256,
+                256,
+                &[d_a, d_as, pp, sp, s2p, c, d_off, DevicePtr(0)],
+                n,
+                k,
+                tile_bound,
+                Some(d_prefix),
+            )?;
         }
         KernelLaunch::new(g, silu)
             .grid([all_rows as u32, 1, 1])
@@ -326,16 +425,29 @@ fn gate_up_silu(
         g.copy_d2h(p, &mut v)?;
         Ok(v)
     };
-    let (rq, rs, nq, ns) = (fetch(ref_q, q_bytes)?, fetch(ref_s, s_bytes)?, fetch(new_q, q_bytes)?, fetch(new_s, s_bytes)?);
-    let diff = rq.iter().zip(&nq).filter(|(a, b)| a != b).count() + rs.iter().zip(&ns).filter(|(a, b)| a != b).count();
+    let (rq, rs, nq, ns) = (
+        fetch(ref_q, q_bytes)?,
+        fetch(ref_s, s_bytes)?,
+        fetch(new_q, q_bytes)?,
+        fetch(new_s, s_bytes)?,
+    );
+    let diff = rq.iter().zip(&nq).filter(|(a, b)| a != b).count()
+        + rs.iter().zip(&ns).filter(|(a, b)| a != b).count();
     let zero_scales = rs.iter().filter(|&&b| b == 0).count();
     println!(
         "gate/up + SiLU quant: gate+up+silu {:7.1}us, fused {:7.1}us  {} ({zero_scales} of {s_bytes} reference scales zero)",
         t_ref * 1e6,
         t_new * 1e6,
-        if diff == 0 { "bitwise".to_string() } else { format!("MISMATCH {diff} bytes") }
+        if diff == 0 {
+            "bitwise".to_string()
+        } else {
+            format!("MISMATCH {diff} bytes")
+        }
     );
-    for p in owned.into_iter().chain([d_a, d_as, g_s2, u_s2, c_g, c_u, ref_q, ref_s, new_q, new_s]) {
+    for p in owned
+        .into_iter()
+        .chain([d_a, d_as, g_s2, u_s2, c_g, c_u, ref_q, ref_s, new_q, new_s])
+    {
         g.free(p)?;
     }
     Ok(diff != 0)
@@ -383,7 +495,10 @@ fn tile_worklist(g: &dyn GpuBackend, offsets: &[i32]) -> Result<bool> {
     g.copy_d2h(d_total, &mut total)?;
     let mut got = vec![0u8; want.len() * 4];
     g.copy_d2h(d_list, &mut got)?;
-    let got: Vec<u32> = got.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let got: Vec<u32> = got
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
     let ok = i32::from_le_bytes(total) as usize * 2 == want.len() && got == want;
     println!(
         "tile worklist: {} items {:5.1}us  {}",

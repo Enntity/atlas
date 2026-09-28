@@ -101,8 +101,13 @@ pub fn fp8_e4m3_to_bf16(
     count: usize,
     stream: u64,
 ) -> Result<()> {
-    ensure!(count % 8 == 0, "E4M3 widening needs count % 8 == 0 ({count})");
-    let kernel = gpu.op_cache().kernel(gpu, "fp8_e4m3_to_bf16", "fp8_e4m3_to_bf16")?;
+    ensure!(
+        count % 8 == 0,
+        "E4M3 widening needs count % 8 == 0 ({count})"
+    );
+    let kernel = gpu
+        .op_cache()
+        .kernel(gpu, "fp8_e4m3_to_bf16", "fp8_e4m3_to_bf16")?;
     let count8 = (count / 8) as u64;
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(u32::try_from(count8)?, 256), 1, 1])

@@ -44,13 +44,39 @@ impl SpRows {
 
     /// Reduce-scatter a `[total, width]` BF16 partial: the local rows end
     /// up holding the sum of both ranks' partials.
-    pub fn reduce_scatter(self, ptr: DevicePtr, width: usize, ctx: &ForwardContext, stream: u64) -> Result<()> {
-        self.exchange(ptr.offset(self.peer0 * width * 2), self.local(ptr, width), width, true, ctx, stream)
+    pub fn reduce_scatter(
+        self,
+        ptr: DevicePtr,
+        width: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.exchange(
+            ptr.offset(self.peer0 * width * 2),
+            self.local(ptr, width),
+            width,
+            true,
+            ctx,
+            stream,
+        )
     }
 
     /// All-gather a `[total, width]` BF16 tensor whose local rows are set.
-    pub fn all_gather(self, ptr: DevicePtr, width: usize, ctx: &ForwardContext, stream: u64) -> Result<()> {
-        self.exchange(self.local(ptr, width), ptr.offset(self.peer0 * width * 2), width, false, ctx, stream)
+    pub fn all_gather(
+        self,
+        ptr: DevicePtr,
+        width: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.exchange(
+            self.local(ptr, width),
+            ptr.offset(self.peer0 * width * 2),
+            width,
+            false,
+            ctx,
+            stream,
+        )
     }
 
     fn exchange(
@@ -108,10 +134,27 @@ mod tests {
 
     #[test]
     fn rank0_owns_the_upper_half() {
-        assert_eq!(SpRows::for_rank(8196, 0), SpRows { row0: 4098, rows: 4098, peer0: 0 });
-        assert_eq!(SpRows::for_rank(8196, 1), SpRows { row0: 0, rows: 4098, peer0: 4098 });
+        assert_eq!(
+            SpRows::for_rank(8196, 0),
+            SpRows {
+                row0: 4098,
+                rows: 4098,
+                peer0: 0
+            }
+        );
+        assert_eq!(
+            SpRows::for_rank(8196, 1),
+            SpRows {
+                row0: 0,
+                rows: 4098,
+                peer0: 4098
+            }
+        );
         let r = SpRows::for_rank(8, 0);
-        assert_eq!(r.local(DevicePtr(0x1000), 4096), DevicePtr(0x1000 + 4 * 4096 * 2));
+        assert_eq!(
+            r.local(DevicePtr(0x1000), 4096),
+            DevicePtr(0x1000 + 4 * 4096 * 2)
+        );
     }
 
     #[test]

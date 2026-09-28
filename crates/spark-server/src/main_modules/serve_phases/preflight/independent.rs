@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Preparation seam: selected topology must precede allocation accounting.
+//! Preparation seam: the long-context GLM lane resolves its topology before
+//! allocation accounting, so every reserve uses the local shapes it allocates.
 use super::super::{Topology, resolve_topology};
 use super::*;
 
@@ -12,26 +13,17 @@ pub(crate) fn prepare_reserve<B>(
     // OFF retains the original backend -> reserve -> late topology order.
     let topology = prepare_topology(args, config)?;
     let (backend, free_mem) = init_backend()?;
-    let backend = spark_model::factory::ColdOwner::new(backend, args.glm_paired_mtp);
     let reserve = preflight_reserve(args, config, free_mem)?;
-    Ok((backend.into_inner(), free_mem, topology, reserve))
+    Ok((backend, free_mem, topology, reserve))
 }
 
 fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<Option<Topology>> {
-    if spark_model::model::glm_c2_pair_policy::requested()?.is_some() {
-        anyhow::ensure!(
-            args.glm_paired_mtp && args.max_prefill_tokens >= 20,
-            "joint verification requires selected paired serving and at least20 prefill rows"
-        );
-    }
     if spark_model::speculative::glm_repair_policy::long_context_enabled() {
         anyhow::ensure!(
-            (spark_model::speculative::glm_repair_policy::enabled()
-                || (args.dflash && spark_model::speculative::glm_repair_policy::dflash_enabled()))
-                && config.model_type == "glm5_next"
-                && !args.glm_paired_mtp
-                && !spark_model::model::glm_independent::enabled(&config.model_type)?,
-            "long-context GLM preparation requires the repaired MTP or DFlash dispatcher"
+            args.dflash
+                && spark_model::speculative::glm_repair_policy::dflash_enabled()
+                && config.model_type == "glm5_next",
+            "long-context GLM preparation requires the GLM DFlash lane"
         );
         let topology = resolve_topology(args, config)?;
         anyhow::ensure!(
@@ -41,75 +33,13 @@ fn prepare_topology(args: &cli::ServeArgs, config: &mut ModelConfig) -> Result<O
                 && config.tp_rank == config.ep_rank
                 && config.ep_rank == args.rank
                 && args.rank < topology.world_size,
-            "resolved long MTP topology mismatch before GPU initialization"
+            "resolved long-context GLM topology mismatch before GPU initialization"
         );
         // The serve handoff consumes Some(topology), so global heads are divided
         // exactly once and every reserve uses the same local shapes as allocation.
         return Ok(Some(topology));
     }
-    if args.glm_paired_mtp {
-        anyhow::ensure!(
-            (2..=8).contains(&args.max_batch_size) && args.max_num_seqs == args.max_batch_size,
-            "selected paired active/admitted capacities must agree within2..8"
-        );
-        let topology = resolve_topology(args, config)?;
-        anyhow::ensure!(
-            topology.world_size == 2
-                && topology.tp_size == 2
-                && topology.ep_size == 2
-                && config.tp_rank == config.ep_rank
-                && config.ep_rank == args.rank,
-            "resolved paired topology mismatch before GPU initialization"
-        );
-        spark_model::layers::Glm5MtpHead::paired_private_reserve_bytes(
-            config,
-            args.max_seq_len,
-            args.max_batch_size,
-        )?;
-        return Ok(Some(topology));
-    }
-    if !spark_model::model::glm_independent::enabled(&config.model_type)? {
-        return Ok(None);
-    }
-    // This is the actual resolver and the only division of global heads. The
-    // returned topology is retained through the later weight/build handoff.
-    let topology = resolve_topology(args, config)?;
-    let independent =
-        !(args.speculative || args.self_speculative || args.ngram_speculative || args.dflash);
-    let ep_v2 = std::env::var("ATLAS_EP_PROTOCOL").as_deref() == Ok("v2");
-    spark_model::model::glm_independent::Launch {
-        model_type: &config.model_type,
-        world: topology.world_size,
-        tp: topology.tp_size,
-        ep: topology.ep_size,
-        ep_v2,
-        active: args.max_batch_size,
-        admitted: args.max_num_seqs,
-        context: args.max_seq_len,
-        bf16: args.kv_cache_dtype.as_deref() == Some("bf16"),
-        independent,
-        lora: !args.lora_adapter.is_empty()
-            || !args.lora_stageable.is_empty()
-            || !args.lora_stageable_disk.is_empty(),
-        hss: args.high_speed_swap,
-        swap: args.swap_space_gb != 0,
-    }
-    .validate()?;
-    anyhow::ensure!(
-        args.rank < topology.world_size,
-        "independent rank exceeds world"
-    );
-    anyhow::ensure!(
-        (1..=2048).contains(&args.max_prefill_tokens) && args.block_size > 0,
-        "independent decode requires bounded prefill1..2048 and a nonzero block size"
-    );
-    spark_model::model::glm_independent::validate_runtime(
-        config,
-        topology.world_size,
-        ep_v2,
-        independent,
-    )?;
-    Ok(Some(topology))
+    Ok(None)
 }
 
 #[cfg(test)]

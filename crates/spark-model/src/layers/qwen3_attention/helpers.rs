@@ -73,7 +73,7 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
             self.mla_mx
-                .push((weight, crate::layers::dflash_head::Mxfp8Weight { data, scales }));
+                .push((weight, crate::weight_map::Mxfp8Weight { data, scales }));
         }
         gpu.synchronize(stream)
     }

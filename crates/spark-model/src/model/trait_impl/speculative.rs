@@ -117,7 +117,6 @@ impl TransformerModel {
         ctx: &ForwardContext,
         stream: u64,
     ) -> anyhow::Result<()> {
-        let diagnostic = self.arm_glm_prompt_trace(seq, ctx, stream)?;
         // Disjoint field borrows: the proposer state is mutated while the
         // token slice is read. Destructuring is what makes that legal, and it
         // avoids cloning a 12k-token vector on every propose.
@@ -176,15 +175,8 @@ impl TransformerModel {
                     ctx,
                     stream,
                 ) {
-                    if diagnostic {
-                        return Err(e);
-                    }
                     tracing::warn!("MTP drafter prefill failed (continuing without): {e:#}");
                 }
-                anyhow::ensure!(
-                    !diagnostic || proposer.drafter_rows(prop_state.as_mut()) == p - 1,
-                    "GLM prompt diagnostic primer did not commit expected rows"
-                );
             } else if carry_on && first_propose && p >= 2 {
                 // WARM turn: adopt the previous turn's drafter KV and append
                 // only this turn's newly-computed span. See `try_carry_drafter`.
@@ -426,7 +418,10 @@ impl TransformerModel {
         if hc == 0 || std::env::var("ATLAS_MTP_STREAM_ROW_FIX").ok().as_deref() == Some("0") {
             return None;
         }
-        Some(hc * self.config.hidden_size * crate::layers::ops::hc_elem_bytes(&self.config.model_type))
+        Some(
+            hc * self.config.hidden_size
+                * crate::layers::ops::hc_elem_bytes(&self.config.model_type),
+        )
     }
 
     /// Batched-verify Phase 3: stash slot `idx` → `mtp_hidden_save` (the MTP
@@ -529,50 +524,8 @@ impl TransformerModel {
         _stream: u64,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
-        self.validate_glm_mtp_repair(
-            seq,
-            token,
-            position,
-            num_drafts,
-            self.last_mtp_hidden_idx
-                .load(std::sync::atomic::Ordering::Relaxed),
-            grammar_bitmask.is_some(),
-        )?;
-        if crate::layers::glm5_mtp::distributed_enabled() {
-            anyhow::ensure!(
-                self.config.model_type == "glm5_next"
-                    && self.config.tp_world_size == 2
-                    && self.config.ep_world_size == 2
-                    && crate::layers::glm5_mtp::repair_owned::permits_capacity(
-                        self.levers.max_decode_seqs
-                    ),
-                "distributed GLM MTP requires GLM TP2/EP2 with max_batch_size=1"
-            );
-            anyhow::ensure!(
-                grammar_bitmask.is_none() || num_drafts == 1,
-                "distributed GLM MTP supports grammar masking only at one draft"
-            );
-            anyhow::ensure!(
-                (1..=4).contains(&num_drafts),
-                "distributed GLM MTP draft count must be 1..=4, got {num_drafts}"
-            );
-            anyhow::ensure!(position <= u32::MAX as usize, "MTP position exceeds u32");
-            let hidden_row = self
-                .last_mtp_hidden_idx
-                .load(std::sync::atomic::Ordering::Relaxed);
-            anyhow::ensure!(hidden_row < 32, "MTP hidden row exceeds verify limit");
-            self.ep_broadcast_seq_and_cmd(
-                seq.slot_idx as u32,
-                super::super::impl_a2::EP_CMD_GLM_MTP_PROPOSE,
-                self.ep_protocol_v2,
-            )?;
-            self.ep_broadcast_tokens(&[
-                token,
-                position as u32,
-                num_drafts as u32,
-                hidden_row as u32,
-            ])?;
-        }
+        // MTP loads ALL experts on every rank — no EP all_reduce needed.
+        // Rank 1 does not participate in MTP propose.
         self.run_mtp_propose_inner(token, position, num_drafts, seq, grammar_bitmask)
     }
 

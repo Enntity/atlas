@@ -152,11 +152,6 @@ pub(crate) fn build_model(
         lora_args,
         nllb_lang,
         nllb_lora_dir,
-        if args.glm_paired_mtp {
-            spark_model::factory::GlmMtpBuildMode::Paired
-        } else {
-            spark_model::factory::GlmMtpBuildMode::Legacy
-        },
     )
     .context("Failed to build model")
 }
@@ -338,7 +333,7 @@ pub(crate) fn maybe_run_ep_worker(
                     // rank/process exits together after communicator state is
                     // uncertain.
                     tracing::error!("EP worker fatal error: {e:#}; terminating rank");
-                    crate::glm_terminal_session::terminate();
+                    crate::ep_peer_lifeline::terminate();
                 }
             }
         }

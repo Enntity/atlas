@@ -17,7 +17,10 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 /// Rows (`BF16_BENCH_M` overrides, e.g. 8196 for an 8K prefill chunk).
 fn rows() -> u32 {
-    std::env::var("BF16_BENCH_M").ok().and_then(|v| v.parse().ok()).unwrap_or(4096)
+    std::env::var("BF16_BENCH_M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096)
 }
 const CONFIGS: [u32; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 const SHAPES: [(&str, u32, u32); 7] = [
@@ -37,7 +40,9 @@ fn main() -> Result<()> {
     let mut fill = |p: DevicePtr, count: usize| -> Result<()> {
         let bytes: Vec<u8> = (0..count)
             .flat_map(|_| {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let v = ((rng >> 40) as f32 / (1u64 << 24) as f32) - 0.5;
                 bf16::from_f32(v).to_bits().to_le_bytes()
             })
@@ -77,12 +82,15 @@ fn main() -> Result<()> {
         fill(a, mu * ku)?;
         fill(w, nu * ku)?;
         let flop = 2.0 * M as f64 * n as f64 * k as f64;
-        let lt = time(&|| spark_runtime::cublaslt::bf16_gemm_act_weight_t(a.0, w.0, c.0, M, n, k, 0))?;
+        let lt =
+            time(&|| spark_runtime::cublaslt::bf16_gemm_act_weight_t(a.0, w.0, c.0, M, n, k, 0))?;
         let reference = read(c, mu * nu)?;
         let mut line = format!("{name}: cuBLASLt {:5.1}TF | CUTLASS", flop / lt / 1e12);
         let mut err = 0f32;
         for config in CONFIGS {
-            let run = || spark_runtime::cutlass::bf16_gemm_tuned(a.0, w.0, c2.0, M, n, k, k, n, config, 0);
+            let run = || {
+                spark_runtime::cutlass::bf16_gemm_tuned(a.0, w.0, c2.0, M, n, k, k, n, config, 0)
+            };
             match run() {
                 Ok(()) => {
                     line += &format!(" {config}:{:5.1}", flop / time(&run)? / 1e12);
@@ -100,7 +108,10 @@ fn main() -> Result<()> {
     // MLA absorb (q_nope -> latent) and V-up (latent -> v): 32 TP-local heads,
     // token rows interleaved across heads.
     let heads = 32u32;
-    for (name, gk, gn) in [("absorb 32x[256->512]", 256u32, 512u32), ("v-up   32x[512->256]", 512, 256)] {
+    for (name, gk, gn) in [
+        ("absorb 32x[256->512]", 256u32, 512u32),
+        ("v-up   32x[512->256]", 512, 256),
+    ] {
         let (a_stride, c_stride) = (heads * gk, heads * gn);
         let rows = M as usize * c_stride as usize;
         let a = g.alloc(M as usize * a_stride as usize * 2)?;

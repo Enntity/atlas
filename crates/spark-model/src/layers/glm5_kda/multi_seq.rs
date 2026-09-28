@@ -332,7 +332,8 @@ impl Glm5KdaLayer {
             ctx.config.rms_norm_eps as f32,
             stream,
         )?;
-        let compact_c2 = if independent || crate::model::glm_independent::ffn_rows_selected(ctx, n)? {
+        let compact_c2 = if independent || crate::model::glm_independent::ffn_rows_selected(ctx, n)?
+        {
             Some(self.ffn.forward_independent(normed, n, ctx, stream)?)
         } else if n == 2 {
             self.ffn.try_forward_c2_compact(normed, ctx, stream)?
@@ -352,10 +353,9 @@ impl Glm5KdaLayer {
             // next row overwrites it.
             for i in 0..n {
                 let ffn_out = self.ffn.forward(normed.offset(i * h * bf16), ctx, stream)?;
-                let hc_streams_i = ctx
-                    .buffers
-                    .hc_streams()
-                    .offset(i * self.hc.hc_mult * h * super::super::ops::hc_elem_bytes("glm5_next"));
+                let hc_streams_i = ctx.buffers.hc_streams().offset(
+                    i * self.hc.hc_mult * h * super::super::ops::hc_elem_bytes("glm5_next"),
+                );
                 let post_i = ctx
                     .buffers
                     .hc_post()

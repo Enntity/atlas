@@ -215,7 +215,10 @@ fn an_animated_gif_decodes_to_its_frames() {
     // 100 ms per frame → 10 fps.
     let steps: Vec<f32> = timestamps.windows(2).map(|w| w[1] - w[0]).collect();
     let mean_step = steps.iter().sum::<f32>() / steps.len() as f32;
-    assert!((mean_step - 0.1).abs() < 0.02, "timestamps were {timestamps:?}");
+    assert!(
+        (mean_step - 0.1).abs() < 0.02,
+        "timestamps were {timestamps:?}"
+    );
 }
 
 /// The shape contract the encoder depends on: one buffer per temporal group,

@@ -258,8 +258,8 @@ fn decode_gif(
     // pixel buffers, to count frames and accumulate the declared duration. The
     // decoder still decompresses each frame here, but the buffers are dropped
     // as they arrive rather than collected, so peak memory is one frame.
-    let header = GifDecoder::new(std::io::Cursor::new(bytes.to_vec()))
-        .context("not a decodable GIF")?;
+    let header =
+        GifDecoder::new(std::io::Cursor::new(bytes.to_vec())).context("not a decodable GIF")?;
     let mut count = 0usize;
     let mut total_ms = 0f64;
     // The largest declared frame area seen, for the memory bound below.
@@ -350,9 +350,7 @@ fn decode_gif(
             continue;
         }
         let frame = frame.context("failed to decode animation frames")?;
-        chosen[i] = Some(
-            image::DynamicImage::ImageRgba8(frame.into_buffer()).to_rgb8(),
-        );
+        chosen[i] = Some(image::DynamicImage::ImageRgba8(frame.into_buffer()).to_rgb8());
     }
 
     let mut frames = Vec::with_capacity(wanted_indices.len());

@@ -291,10 +291,6 @@ impl super::TransformerModel {
 }
 
 #[cfg(test)]
-#[path = "glm_independent_transport_tests.rs"]
-mod transport_tests;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

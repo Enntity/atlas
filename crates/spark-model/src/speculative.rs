@@ -5,11 +5,7 @@
 //! Defines the [`DraftProposer`] trait for speculative decoding strategies.
 //! MTP implements this first; EAGLE-3 can implement later without engine changes.
 
-pub mod glm_pair_plan;
-pub mod glm_paired_execution;
-pub mod glm_repair;
 pub mod glm_repair_policy;
-pub mod glm_shared_kv;
 pub mod ladder;
 pub mod tree_shape;
 pub mod verify_key;
@@ -293,11 +289,6 @@ pub fn hidden_fingerprint(gpu: &dyn GpuBackend, p: DevicePtr, h: usize) -> u64 {
 }
 
 pub trait DraftProposer: Send + Sync {
-    /// Optional checked GLM accepted-pair writer; unrelated proposers retain
-    /// their existing state/conditioning contract.
-    fn glm_pair_repair(&self) -> Option<&dyn glm_repair::GlmPairRepair> {
-        None
-    }
     /// Allocate per-sequence proposer state.
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>>;
 

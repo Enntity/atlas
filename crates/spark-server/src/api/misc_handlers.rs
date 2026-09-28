@@ -247,7 +247,8 @@ pub async fn tokenize(
         }
     } else if body.get("messages").is_some() {
         if let Some(obj) = body.as_object_mut() {
-            obj.entry("model").or_insert_with(|| serde_json::Value::String(String::new()));
+            obj.entry("model")
+                .or_insert_with(|| serde_json::Value::String(String::new()));
         }
         let chat: ChatCompletionRequest = match serde_json::from_value(body) {
             Ok(c) => c,

@@ -1,46 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Narrow startup admission for the experimental repaired-K3 BF16 attention lane.
-use super::GlmMtpBuildMode;
+//! Startup admission for the GLM sparse-decode tensor-core / split kernels on
+//! the DFlash long-context lane.
 use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
 use spark_runtime::{gpu::GpuBackend, kv_cache::KvCacheDtype};
 
 pub(super) struct BuildPolicy<'a> {
     pub config: &'a ModelConfig,
-    pub mode: GlmMtpBuildMode,
-    pub speculative: bool,
     pub self_speculative: bool,
-    pub drafts: usize,
-    pub owners: usize,
     pub context: usize,
     pub block_size: usize,
     pub kv_dtype: KvCacheDtype,
     pub layer_dtypes: &'a [KvCacheDtype],
-    pub alternate_owner: bool,
     /// `--dflash` on the GLM DFlash verify lane (`ATLAS_GLM_DFLASH=1`).
     pub dflash: bool,
 }
 
-/// The repaired sparse verifier has a fixed 32K indexed domain. The serving
-/// context may be larger because requests beyond that domain are admitted to
-/// the native/plain lane and keep MTP disabled; startup must still validate
-/// the verifier against its own bounded domain.
+/// The sparse verifier has a bounded indexed domain. The serving context may
+/// be larger because requests beyond that domain are admitted to the native
+/// lane with speculation disabled; startup must still validate the verifier
+/// against its own bounded domain.
 pub(super) fn repair_context(context: usize) -> usize {
     context.min(crate::speculative::glm_repair_policy::MAX_LONG_CONTEXT)
 }
 
 impl BuildPolicy<'_> {
-    fn validate(&self, repaired: bool, long_context: bool) -> Result<()> {
-        let repaired_mtp2 = self.mode == GlmMtpBuildMode::Legacy
-            && self.speculative
-            && !self.self_speculative
-            && self.drafts == 2
-            && self.owners == 4
-            && !self.alternate_owner
-            && repaired;
-        let dflash_lane = self.dflash
-            && !self.self_speculative
-            && crate::speculative::glm_repair_policy::dflash_enabled();
+    fn validate(&self, dflash_lane_enabled: bool, long_context: bool) -> Result<()> {
+        let dflash_lane = self.dflash && !self.self_speculative && dflash_lane_enabled;
         ensure!(
             self.config.model_type == "glm5_next"
                 && self.config.tp_world_size == 2
@@ -52,9 +38,9 @@ impl BuildPolicy<'_> {
                 && self.block_size == 16
                 && matches!(self.kv_dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128)
                 && self.layer_dtypes.iter().all(|d| *d == self.kv_dtype)
-                && (repaired_mtp2 || dflash_lane)
+                && dflash_lane
                 && long_context,
-            "GLM sparse decode TC requires repaired long-context MTP2 (four owners) or the GLM DFlash lane, TP2/EP2 local32 heads and BF16 block16 caches"
+            "GLM sparse decode TC requires the GLM DFlash lane, TP2/EP2 local32 heads and BF16 or fp8_g128 block16 caches"
         );
         Ok(())
     }
@@ -71,7 +57,7 @@ pub(super) fn initialize(gpu: &dyn GpuBackend, policy: BuildPolicy<'_>) -> Resul
         return Ok(());
     }
     policy.validate(
-        crate::speculative::glm_repair_policy::enabled(),
+        crate::speculative::glm_repair_policy::dflash_enabled(),
         crate::speculative::glm_repair_policy::long_context_enabled(),
     )?;
     crate::layers::ops::initialize_glm_sparse_decode_tc(gpu, policy.config)?;

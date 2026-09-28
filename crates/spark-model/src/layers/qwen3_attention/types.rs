@@ -117,7 +117,7 @@ pub struct Qwen3AttentionLayer {
     /// MXFP8 twins of MLA projections keyed by the BF16 weight pointer
     /// (`ATLAS_GLM_MLA_MXFP8=1`): decode/verify rows (<= 32) read half the
     /// bytes; prefill keeps BF16.
-    pub(crate) mla_mx: Vec<(DevicePtr, crate::layers::dflash_head::Mxfp8Weight)>,
+    pub(crate) mla_mx: Vec<(DevicePtr, crate::weight_map::Mxfp8Weight)>,
     // ── Manifold-Constrained Hyper-Connections (mHC) — DeepSeek-V4 ──
     /// Per-block HC parameters. `Some` only for DeepSeek-V4 (`hc_mult > 0`),
     /// in which case the attn/ffn residual sites use `hc_pre`/`hc_post`

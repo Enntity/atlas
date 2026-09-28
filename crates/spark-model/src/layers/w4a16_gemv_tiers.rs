@@ -181,10 +181,14 @@ impl W4a16BatchmTiers {
         }
         if std::env::var("ATLAS_W4A16_TC").as_deref() == Ok("1") {
             TC.get_or_init(|| {
-                TC_ROWS.map(|rows| super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}")))
+                TC_ROWS.map(|rows| {
+                    super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}"))
+                })
             });
             TC_LD.get_or_init(|| {
-                TC_ROWS.map(|rows| super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}_ld")))
+                TC_ROWS.map(|rows| {
+                    super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}_ld"))
+                })
             });
         }
         Self { handles }

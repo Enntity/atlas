@@ -19,10 +19,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[path = "spec_stats/glm_c2.rs"]
-mod glm_c2;
-pub use glm_c2::GlmC2Stats;
-
 /// How many verify steps between summary log lines.
 pub const SUMMARY_PERIOD: u64 = 512;
 
@@ -30,8 +26,6 @@ pub const SUMMARY_PERIOD: u64 = 512;
 /// chains also bucket by how many drafts were accepted.
 #[derive(Debug, Default)]
 pub struct SpecStats {
-    /// Selected C2 transactions only; never mixed with legacy chain counters.
-    pub glm_c2: GlmC2Stats,
     /// One-shot log latches for this run, keyed by a `&'static str`.
     fired: std::sync::Mutex<std::collections::BTreeSet<&'static str>>,
     // ── K=2 ──

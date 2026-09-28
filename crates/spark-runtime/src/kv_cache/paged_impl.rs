@@ -180,17 +180,32 @@ impl PagedKvCache {
             for (base, stride) in [
                 (layer.k_pool, layer.k_block_stride),
                 (layer.owned_v_pool(), layer.v_block_stride),
-                (layer.sparse_index_values, layer.sparse_index_values_block_stride),
-                (layer.sparse_index_scales, layer.sparse_index_scales_block_stride),
                 (
-                    if slotted { DevicePtr::NULL } else { layer.sparse_index_tail },
+                    layer.sparse_index_values,
+                    layer.sparse_index_values_block_stride,
+                ),
+                (
+                    layer.sparse_index_scales,
+                    layer.sparse_index_scales_block_stride,
+                ),
+                (
+                    if slotted {
+                        DevicePtr::NULL
+                    } else {
+                        layer.sparse_index_tail
+                    },
                     layer.sparse_index_tail_block_stride,
                 ),
             ] {
                 if base.is_null() || stride == 0 {
                     continue;
                 }
-                gpu.memset_async(base.offset(first as usize * stride), 0, count * stride, stream)?;
+                gpu.memset_async(
+                    base.offset(first as usize * stride),
+                    0,
+                    count * stride,
+                    stream,
+                )?;
             }
         }
         Ok(())

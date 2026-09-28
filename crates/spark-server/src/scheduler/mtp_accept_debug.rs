@@ -184,8 +184,6 @@ pub(super) fn record(n: usize, k_drafts: usize, d1_match: bool, num_accepted: us
 /// Not a new telemetry product — the request-finished line is the sink.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RequestAccept {
-    /// First-eight native GLM K5 diagnostic window; reset with this request.
-    pub(super) glm_k5_ledger: super::verify_dflash_step::ledger::Ledger,
     serial_steps: u64,
     mtp_steps: u64,
     d1: u64,

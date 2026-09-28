@@ -147,7 +147,13 @@ impl MoeLayer {
         let mut row = 0usize;
         while row < rows as usize {
             let left = rows as usize - row;
-            let wide = if left <= 8 { left } else if left <= 12 { 6 } else { 8 };
+            let wide = if left <= 8 {
+                left
+            } else if left <= 12 {
+                6
+            } else {
+                8
+            };
             let kernel = self.w4a16_batchm.kernel(wide as u32);
             let take = if wide == 3 || kernel.0 == 0 { 3 } else { wide };
             let (x, g, u, d) = (
@@ -156,35 +162,44 @@ impl MoeLayer {
                 up_out.offset(row * inter * 2),
                 down_out.offset(row * h * 2),
             );
-            let gemv = |x: DevicePtr, weight: &QuantizedWeight, out: DevicePtr, n: usize, k: usize| {
-                if take == 3 {
-                    ops::w4a16_gemv_batch3(
-                        ctx.gpu,
-                        self.w4a16_gemv_batch3,
-                        x,
-                        weight,
-                        out,
-                        n as u32,
-                        k as u32,
-                        stream,
-                    )
-                } else {
-                    ops::w4a16_gemv_batchm(
-                        ctx.gpu,
-                        kernel,
-                        x,
-                        weight,
-                        out,
-                        take as u32,
-                        n as u32,
-                        k as u32,
-                        stream,
-                    )
-                }
-            };
+            let gemv =
+                |x: DevicePtr, weight: &QuantizedWeight, out: DevicePtr, n: usize, k: usize| {
+                    if take == 3 {
+                        ops::w4a16_gemv_batch3(
+                            ctx.gpu,
+                            self.w4a16_gemv_batch3,
+                            x,
+                            weight,
+                            out,
+                            n as u32,
+                            k as u32,
+                            stream,
+                        )
+                    } else {
+                        ops::w4a16_gemv_batchm(
+                            ctx.gpu,
+                            kernel,
+                            x,
+                            weight,
+                            out,
+                            take as u32,
+                            n as u32,
+                            k as u32,
+                            stream,
+                        )
+                    }
+                };
             gemv(x, &self.weights.shared_expert.gate_proj, g, inter, h)?;
             gemv(x, &self.weights.shared_expert.up_proj, u, inter, h)?;
-            ops::silu_mul(ctx.gpu, self.moe_silu_mul, g, u, g, (take * inter) as u32, stream)?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.moe_silu_mul,
+                g,
+                u,
+                g,
+                (take * inter) as u32,
+                stream,
+            )?;
             gemv(g, &self.weights.shared_expert.down_proj, d, h, inter)?;
             row += take;
         }
@@ -276,7 +291,6 @@ impl MoeLayer {
         max_m_tiles: u32,
         compact: Option<CompactMoeWorklist>,
         wide: Option<MtileGrid>,
-        mode: super::forward_pair_verify::PrefillMode,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
@@ -301,8 +315,7 @@ impl MoeLayer {
             self.moe_w4a4_prequant_t_k64
         };
         if let Some(work) = compact
-            && (mode.is_verify_group()
-                || std::env::var("ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP").as_deref() == Ok("1")
+            && (std::env::var("ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP").as_deref() == Ok("1")
                 || self.glm_c3_grouped(ctx, n)
                 || self.glm_c2_grouped(ctx, n)
                 || self.independent_grouped(ctx, n)

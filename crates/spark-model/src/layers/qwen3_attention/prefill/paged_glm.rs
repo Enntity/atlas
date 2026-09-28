@@ -62,7 +62,12 @@ pub(in crate::layers::qwen3_attention) fn glm_chunk_pieces(
 ) -> Vec<GlmChunkOwner> {
     let pieces = crate::layer::prefill_attention_pieces(seq_len_start, rows, index_topk);
     if pieces.len() == 1 {
-        return vec![GlmChunkOwner { row0: 0, rows, seq_len_start, meta }];
+        return vec![GlmChunkOwner {
+            row0: 0,
+            rows,
+            seq_len_start,
+            meta,
+        }];
     }
     pieces
         .iter()
@@ -84,12 +89,11 @@ pub(in crate::layers::qwen3_attention) fn glm_chunk_pieces(
 }
 
 /// An `fp8_g128` owner's latents dequantized to BF16 in the arena scratch,
-/// addressed through an identity block table of `blocks` entries.
+/// addressed through an identity block table.
 #[derive(Clone, Copy)]
 struct Bf16LatentView {
     latents: DevicePtr,
     identity_table: DevicePtr,
-    blocks: usize,
 }
 
 impl Qwen3AttentionLayer {
@@ -253,7 +257,9 @@ impl Qwen3AttentionLayer {
         ensure!(
             !owners.is_empty()
                 && owners.iter().map(|o| o.rows).sum::<usize>() == num_tokens
-                && owners.windows(2).all(|w| w[0].row0 + w[0].rows == w[1].row0),
+                && owners
+                    .windows(2)
+                    .all(|w| w[0].row0 + w[0].rows == w[1].row0),
             "GLM chunk owners must tile the stacked rows"
         );
         let accelerated = projection::enabled(&ctx.config.model_type)?;
@@ -268,11 +274,51 @@ impl Qwen3AttentionLayer {
 
         // Joint: q_a (+ norm), kv_a (+ norm) and the cache write.
         let q_latent = ctx.buffers.ssm_ba();
-        self.paged_glm_projection(normed, &mla.wq_a, q_latent, n, q_lora, h, ctx, stream, accelerated)?;
-        ops::rms_norm(ctx.gpu, self.rms_norm_w_k, q_latent, &mla.q_a_norm, q_latent, n, q_lora, eps, stream)?;
+        self.paged_glm_projection(
+            normed,
+            &mla.wq_a,
+            q_latent,
+            n,
+            q_lora,
+            h,
+            ctx,
+            stream,
+            accelerated,
+        )?;
+        ops::rms_norm(
+            ctx.gpu,
+            self.rms_norm_w_k,
+            q_latent,
+            &mla.q_a_norm,
+            q_latent,
+            n,
+            q_lora,
+            eps,
+            stream,
+        )?;
         let kv_latent = ctx.buffers.expert_gate_out();
-        self.paged_glm_projection(normed, &mla.wkv_a, kv_latent, n, kv_lora, h, ctx, stream, accelerated)?;
-        ops::rms_norm(ctx.gpu, self.rms_norm_w_k, kv_latent, &mla.kv_a_norm, kv_latent, n, kv_lora, eps, stream)?;
+        self.paged_glm_projection(
+            normed,
+            &mla.wkv_a,
+            kv_latent,
+            n,
+            kv_lora,
+            h,
+            ctx,
+            stream,
+            accelerated,
+        )?;
+        ops::rms_norm(
+            ctx.gpu,
+            self.rms_norm_w_k,
+            kv_latent,
+            &mla.kv_a_norm,
+            kv_latent,
+            n,
+            kv_lora,
+            eps,
+            stream,
+        )?;
         let k_entries = ctx.buffers.ssm_qkvz();
         let v_entries = k_entries.offset(num_tokens * kv_lora as usize * bf16);
         ops::mla_cache_assemble_batched(
@@ -400,7 +446,15 @@ impl Qwen3AttentionLayer {
                 None => {
                     let q_full = ctx.buffers.qkv_output();
                     self.paged_glm_projection(
-                        o_latent, &mla.wq_b, q_full, on, nq * hd, q_lora, &octx, stream, accelerated,
+                        o_latent,
+                        &mla.wq_b,
+                        q_full,
+                        on,
+                        nq * hd,
+                        q_lora,
+                        &octx,
+                        stream,
+                        accelerated,
                     )?;
                     let q_absorbed = ctx.buffers.ssm_deinterleaved();
                     self.glm_absorb_queries(q_full, q_absorbed, on, nq, ctx, stream)?;
@@ -428,37 +482,15 @@ impl Qwen3AttentionLayer {
                     block_size: bs,
                     scale: self.effective_attn_scale(hd),
                 };
-                let (physical_blocks, table_blocks, block_bytes) = match view {
-                    Some(v) => (v.blocks, v.blocks, 16 * 512 * 2),
-                    None => (
-                        kv_cache.num_blocks(),
-                        o.meta.max_blocks_per_seq as usize,
-                        kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
-                    ),
-                };
-                let native = cache_dtype == KvCacheDtype::Bf16
-                    && ops::try_glm_sparse_native(
-                        &octx,
-                        &sparse_args,
-                        o.seq_len_start,
-                        physical_blocks,
-                        table_blocks,
-                        block_bytes,
-                        // This caller is ordinary continued prefill. Repaired K3
-                        // verification has a separate multi-sequence attention path.
-                        false,
-                        stream,
-                    )?;
                 // Few-row owners (verify) split over the selected IDs; the MoE
                 // expert scratch is dead until this layer's FFN.
-                let accelerated = native
-                    || ops::try_glm_sparse_prefill_tc_split(
-                        ctx.gpu,
-                        &sparse_args,
-                        ctx.buffers.expert_gate_out(),
-                        ctx.buffers.sizes().expert_gate_out,
-                        stream,
-                    )?;
+                let accelerated = ops::try_glm_sparse_prefill_tc_split(
+                    ctx.gpu,
+                    &sparse_args,
+                    ctx.buffers.expert_gate_out(),
+                    ctx.buffers.sizes().expert_gate_out,
+                    stream,
+                )?;
                 if !accelerated {
                     ensure!(
                         cache_dtype == KvCacheDtype::Bf16,
@@ -483,7 +515,8 @@ impl Qwen3AttentionLayer {
                         stream,
                     )?;
                 }
-                let sparse_attention_us = super::glm_index::profile_lap(&octx, stream, &mut profile)?;
+                let sparse_attention_us =
+                    super::glm_index::profile_lap(&octx, stream, &mut profile)?;
                 if profile.is_some() {
                     tracing::info!(
                         "ATLAS_GLM_INDEX_PROFILE phase=attention layer={} rows={} seq_end={} selected={} sparse_attention_us={}",
@@ -543,7 +576,15 @@ impl Qwen3AttentionLayer {
         }
 
         if !per_owner {
-            self.paged_glm_output(mla, parked.unwrap_or(attn_latent), o_out, [n, nq, h], ctx, stream, accelerated)?;
+            self.paged_glm_output(
+                mla,
+                parked.unwrap_or(attn_latent),
+                o_out,
+                [n, nq, h],
+                ctx,
+                stream,
+                accelerated,
+            )?;
         }
         Ok(o_out)
     }
@@ -578,7 +619,17 @@ impl Qwen3AttentionLayer {
             nq * v_dim,
             stream,
         )?;
-        self.paged_glm_projection(v_extracted, &mla.wo, out, rows, h, nq * v_dim, ctx, stream, accelerated)
+        self.paged_glm_projection(
+            v_extracted,
+            &mla.wo,
+            out,
+            rows,
+            h,
+            nq * v_dim,
+            ctx,
+            stream,
+            accelerated,
+        )
     }
 
     /// When `wanted` and the cache is `fp8_g128`, dequantize the owner's
@@ -618,7 +669,6 @@ impl Qwen3AttentionLayer {
         Ok(Some(Bf16LatentView {
             latents,
             identity_table,
-            blocks: capacity / 16,
         }))
     }
 }

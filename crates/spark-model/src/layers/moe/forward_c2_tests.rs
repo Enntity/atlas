@@ -20,9 +20,6 @@ use std::sync::{Mutex, atomic::Ordering};
 #[path = "forward_independent_tests.rs"]
 mod independent;
 
-#[path = "forward_pair_verify_tests.rs"]
-mod pair_verify;
-
 struct Comm<'a> {
     gpu: &'a Gpu,
     rank: usize,

@@ -13,47 +13,41 @@ fn config() -> ModelConfig {
 fn policy(c: &ModelConfig) -> BuildPolicy<'_> {
     BuildPolicy {
         config: c,
-        mode: GlmMtpBuildMode::Legacy,
-        speculative: true,
         self_speculative: false,
-        drafts: 2,
-        owners: 4,
         context: 32768,
         block_size: 16,
         kv_dtype: KvCacheDtype::Bf16,
         layer_dtypes: &[],
-        alternate_owner: false,
-        dflash: false,
+        dflash: true,
     }
 }
 
 #[test]
-fn glm_sparse_decode_build_accepts_only_repaired_long_mtp2() {
+fn glm_sparse_decode_build_accepts_only_the_long_context_dflash_lane() {
     let c = config();
     assert!(policy(&c).validate(true, true).is_ok());
-    for variant in 0..13 {
+    let mut g128 = policy(&c);
+    g128.kv_dtype = KvCacheDtype::Fp8G128;
+    assert!(g128.validate(true, true).is_ok());
+    for variant in 0..9 {
         let mut p = policy(&c);
         let fp8 = [KvCacheDtype::Fp8];
         match variant {
-            0 => p.mode = GlmMtpBuildMode::Paired,
-            1 => p.speculative = false,
-            2 => p.self_speculative = true,
-            3 => p.drafts = 1,
-            4 => p.owners = 1,
-            5 => p.context = 32769,
-            6 => p.context = 2048,
-            7 => p.block_size = 32,
-            8 => p.kv_dtype = KvCacheDtype::Fp8,
-            9 => p.layer_dtypes = &fp8,
-            10 => p.alternate_owner = true,
-            11 => {
-                assert!(p.validate(false, true).is_err());
+            0 => p.dflash = false,
+            1 => p.self_speculative = true,
+            2 => p.context = 2048,
+            3 => p.block_size = 32,
+            4 => p.kv_dtype = KvCacheDtype::Fp8,
+            5 => p.layer_dtypes = &fp8,
+            6 => {
+                assert!(p.validate(false, true).is_err(), "lane disabled");
                 continue;
             }
-            _ => {
-                assert!(p.validate(true, false).is_err());
+            7 => {
+                assert!(p.validate(true, false).is_err(), "long context disabled");
                 continue;
             }
+            _ => p.context = crate::speculative::glm_repair_policy::max_long_context() + 1,
         }
         assert!(p.validate(true, true).is_err(), "variant {variant}");
     }
@@ -74,20 +68,9 @@ fn glm_sparse_decode_build_rejects_wrong_rank_geometry() {
 }
 
 #[test]
-fn larger_served_context_is_capped_only_for_repair_startup() {
+fn larger_served_context_is_capped_to_the_verifier_domain() {
+    let max = crate::speculative::glm_repair_policy::MAX_LONG_CONTEXT;
     assert_eq!(repair_context(2048), 2048);
-    assert_eq!(repair_context(32768), 32768);
-    assert_eq!(repair_context(36864), 32768);
-
-    let c = config();
-    let mut capped = policy(&c);
-    capped.context = repair_context(36864);
-    assert!(capped.validate(true, true).is_ok());
-
-    // Keep the verifier's upper bound strict. The cap belongs at the factory
-    // boundary; it must not turn an out-of-domain repair policy into a valid
-    // policy when callers construct one directly.
-    let mut uncapped = policy(&c);
-    uncapped.context = 36864;
-    assert!(uncapped.validate(true, true).is_err());
+    assert_eq!(repair_context(max), max);
+    assert_eq!(repair_context(max + 4096), max);
 }

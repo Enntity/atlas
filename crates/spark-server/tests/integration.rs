@@ -137,7 +137,6 @@ fn setup_model(
         None,               // lora_args (no LoRA adapter)
         None,               // nllb_lang (not an NLLB translation model)
         None,               // nllb_lora_dir
-        spark_model::factory::GlmMtpBuildMode::Legacy,
     )?;
 
     Ok((model, config))

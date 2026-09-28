@@ -58,7 +58,10 @@ fn survival_curve_counts_steps_accepting_at_least_each_position() {
     for emitted in [1, 2, 4, 8, 8] {
         a.record_verify_emitted(emitted); // accepted 0, 1, 3, 7, 7
     }
-    assert!(a.done_suffix().ends_with("surv=0.80,0.60,0.60,0.40,0.40,0.40,0.40"));
+    assert!(
+        a.done_suffix()
+            .ends_with("surv=0.80,0.60,0.60,0.40,0.40,0.40,0.40")
+    );
 }
 
 #[test]

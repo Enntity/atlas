@@ -72,7 +72,11 @@ fn launch(
     n: u32,
     k: u32,
 ) -> Result<()> {
-    let (grid, block) = if tc { (div_ceil(n, 16), 256) } else { (div_ceil(n, 4), 256) };
+    let (grid, block) = if tc {
+        (div_ceil(n, 16), 256)
+    } else {
+        (div_ceil(n, 4), 256)
+    };
     KernelLaunch::new(g, kh)
         .grid([grid, 1, 1])
         .block([block, 1, 1])
@@ -151,7 +155,10 @@ fn main() -> Result<()> {
             reference(wd, wsd, m)?;
             launch(g, tck, true, ad, wd, wsd, c_tc, m, n as u32, k as u32)?;
             g.synchronize(0)?;
-            let (r, t) = (down(g, c_ref, m as usize * n)?, down(g, c_tc, m as usize * n)?);
+            let (r, t) = (
+                down(g, c_ref, m as usize * n)?,
+                down(g, c_tc, m as usize * n)?,
+            );
             let mut worst = 0f32;
             for (x, y) in r.iter().zip(&t) {
                 // 2 BF16 ulps of the larger magnitude (+ a floor for ~0 outputs).
@@ -189,11 +196,19 @@ fn main() -> Result<()> {
         if let [Some(l8), Some(l16), Some(l32)] = tc_ld {
             let half = k / 2;
             let a_half = |h: usize| -> Vec<u8> {
-                a.chunks_exact(k * 2).flat_map(|row| row[h * half * 2..(h + 1) * half * 2].to_vec()).collect()
+                a.chunks_exact(k * 2)
+                    .flat_map(|row| row[h * half * 2..(h + 1) * half * 2].to_vec())
+                    .collect()
             };
             let (a0, a1) = (up(g, &a_half(0))?, up(g, &a_half(1))?);
             let (c0, c1) = (g.alloc(32 * n * 2)?, g.alloc(32 * n * 2)?);
-            let ld = |kh: KernelHandle, a: DevicePtr, w: DevicePtr, s: DevicePtr, c: DevicePtr, m: u32, kk: u32| {
+            let ld = |kh: KernelHandle,
+                      a: DevicePtr,
+                      w: DevicePtr,
+                      s: DevicePtr,
+                      c: DevicePtr,
+                      m: u32,
+                      kk: u32| {
                 KernelLaunch::new(g, kh)
                     .grid([div_ceil(n as u32, 16), 1, 1])
                     .block([256, 1, 1])
@@ -218,12 +233,23 @@ fn main() -> Result<()> {
                 launch(g, tck, true, ad, wd, wsd, c_tc, m, n as u32, k as u32)?;
                 ld(ldk, ad, wd, wsd, c_ref, m, k as u32)?;
                 ld(ldk, a0, wd, wsd, c0, m, half as u32)?;
-                ld(ldk, a1, wd.offset(half / 2), wsd.offset(half / GROUP_SIZE), c1, m, half as u32)?;
+                ld(
+                    ldk,
+                    a1,
+                    wd.offset(half / 2),
+                    wsd.offset(half / GROUP_SIZE),
+                    c1,
+                    m,
+                    half as u32,
+                )?;
                 g.synchronize(0)?;
                 let cnt = m as usize * n;
                 let (full, same) = (down(g, c_tc, cnt)?, down(g, c_ref, cnt)?);
                 let (h0, h1) = (down(g, c0, cnt)?, down(g, c1, cnt)?);
-                let bitwise = full.iter().zip(&same).all(|(x, y)| x.to_bits() == y.to_bits());
+                let bitwise = full
+                    .iter()
+                    .zip(&same)
+                    .all(|(x, y)| x.to_bits() == y.to_bits());
                 let mut worst = 0f32;
                 for ((x, y0), y1) in full.iter().zip(&h0).zip(&h1) {
                     let y = y0 + y1;

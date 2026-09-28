@@ -13,20 +13,20 @@
 
 #[path = "ops/activations.rs"]
 mod activations;
+#[path = "ops/bf16_gemm_cutlass.rs"]
+mod bf16_gemm_cutlass;
 #[path = "ops/derived_reserve.rs"]
 mod derived_reserve;
 #[path = "ops/derived_weights.rs"]
 mod derived_weights;
-#[path = "ops/mxfp8.rs"]
-mod mxfp8;
-#[path = "ops/bf16_gemm_cutlass.rs"]
-mod bf16_gemm_cutlass;
 #[path = "ops/dispatch_config.rs"]
 mod dispatch_config;
 #[path = "ops/dispatch_helpers.rs"]
 mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]
 mod dispatch_proj;
+#[path = "ops/mxfp8.rs"]
+mod mxfp8;
 // Row-wise FP8 routing, split out when it took dispatch_proj.rs over the cap.
 #[path = "ops/dispatch_proj_rowwise.rs"]
 mod dispatch_proj_rowwise;
@@ -84,8 +84,6 @@ mod glm_indexer;
 mod glm_indexer_dynamic;
 #[path = "ops/glm_router_bn4.rs"]
 mod glm_router_bn4;
-#[path = "ops/glm_sparse_native.rs"]
-mod glm_sparse_native;
 #[path = "ops/glm_sparse_prefill_tc.rs"]
 mod glm_sparse_prefill_tc;
 pub use glm_router_bn4::glm_router_bn4;
@@ -223,10 +221,9 @@ pub mod token_overlay;
 mod wide_prefill;
 
 pub use activations::*;
+pub use bf16_gemm_cutlass::*;
 pub use derived_reserve::{lazy_bf16_copy_bytes, lazy_bf16_reserve, lazy_bf16_reserve_enabled};
 pub use derived_weights::{Derivation, DerivedWeights};
-pub use mxfp8::*;
-pub use bf16_gemm_cutlass::*;
 pub use dispatch_config::GemmDispatch;
 pub use dispatch_helpers::*;
 pub use dispatch_proj::*;
@@ -249,7 +246,6 @@ pub use gemv_sw::*;
 pub use glm_hc_prefill::*;
 pub use glm_indexer::*;
 pub use glm_indexer_dynamic::*;
-pub use glm_sparse_native::*;
 pub use glm_sparse_prefill_tc::*;
 pub use hyper_connection::*;
 pub use hyper_connection_dispatch::*;
@@ -273,6 +269,7 @@ pub use moe_grouped_fp4::*;
 pub use moe_lora_grouped::*;
 pub use moe_nvfp4_mmq::*;
 pub use moe_prefill::*;
+pub use mxfp8::*;
 pub use norm::*;
 pub use nvfp4_mmq::*;
 pub use ple::*;

@@ -60,15 +60,6 @@ pub(crate) async fn serve(
     args: cli::ServeArgs,
     tui_progress: Option<std::sync::mpsc::Receiver<crate::tui::capture_layer::ProgressEvent>>,
 ) -> Result<()> {
-    serve_supervised(args, tui_progress, None).await
-}
-
-pub(crate) async fn serve_supervised(
-    args: cli::ServeArgs,
-    tui_progress: Option<std::sync::mpsc::Receiver<crate::tui::capture_layer::ProgressEvent>>,
-    selected: Option<crate::glm_terminal_session::startup::SelectedStartup>,
-) -> Result<()> {
-    let paired = selected.is_some();
     // One host for the process lifetime, created BEFORE startup so the
     // dashboard can hold it and trigger a swap. The load publishes into it.
     let host = Arc::new(crate::main_modules::model_host::ModelHost::empty());
@@ -86,9 +77,7 @@ pub(crate) async fn serve_supervised(
     // Likewise process-scoped, and in force before the first model exists.
     host.set_process(super::serve_load::Carried::from_env());
     let startup_host = host.clone();
-    match tokio::task::spawn_blocking(move || startup(args, tui_progress, startup_host, selected))
-        .await??
-    {
+    match tokio::task::spawn_blocking(move || startup(args, tui_progress, startup_host)).await?? {
         Startup::Serve(prepared) => {
             host.publish(prepared.state);
             // The first load's scheduler belongs to the host too, or the first
@@ -101,12 +90,6 @@ pub(crate) async fn serve_supervised(
                 prepared.port,
             )
             .await;
-            if paired && result.is_ok() && crate::tui::shutdown::requested() {
-                // HTTP drain is not the two-rank completion certificate. The
-                // retained scheduler/worker owner exits the process on release;
-                // the guard's independent deadlines bound a missing release.
-                std::future::pending::<()>().await;
-            }
             let h = host.clone();
             tokio::task::spawn_blocking(move || crate::main_modules::model_swap::shutdown(&h))
                 .await?;
@@ -139,7 +122,6 @@ fn startup(
     args: cli::ServeArgs,
     tui_progress: Option<std::sync::mpsc::Receiver<crate::tui::capture_layer::ProgressEvent>>,
     host: Arc<crate::main_modules::model_host::ModelHost>,
-    selected: Option<crate::glm_terminal_session::startup::SelectedStartup>,
 ) -> Result<Startup> {
     tracing::info!("Atlas Spark starting...");
     tracing::info!("Licensed under AGPL-3.0-only — see /LICENSE in this container");
@@ -211,7 +193,7 @@ fn startup(
     let carried = host
         .process()
         .expect("process-scoped state is installed before startup");
-    match super::serve_load::load_model_selected(args, tui_handles_tx, carried, selected)? {
+    match super::serve_load::load_model(args, tui_handles_tx, carried)? {
         Some(prepared) => Ok(Startup::Serve(prepared)),
         None => Ok(Startup::Worker),
     }

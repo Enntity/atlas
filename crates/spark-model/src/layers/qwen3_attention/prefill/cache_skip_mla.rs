@@ -173,7 +173,9 @@ impl Qwen3AttentionLayer {
                 9..=16 => 1,
                 _ => 2,
             }];
-            return ops::mxfp8_gemv(ctx.gpu, kernel, input, mx.data, mx.scales, output, m, n, k, n, stream);
+            return ops::mxfp8_gemv(
+                ctx.gpu, kernel, input, mx.data, mx.scales, output, m, n, k, n, stream,
+            );
         }
         if use_cublas_mla_prefill(ctx.dispatch.cublas_gemm, m) {
             return ops::cublas_bf16_proj_dense(input, weight.weight, output, m, n, k, stream);

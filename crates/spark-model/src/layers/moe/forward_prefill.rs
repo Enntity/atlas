@@ -36,11 +36,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
         defer_shared_hc: bool,
-        mode: super::forward_pair_verify::PrefillMode,
     ) -> Result<()> {
-        if let super::forward_pair_verify::PrefillMode::OwnerVerify(shape) = mode {
-            anyhow::ensure!(num_tokens == shape.rows(), "owner FFN row shape changed");
-        }
         self.btile_input_guard(input, num_tokens, ctx, stream)?;
         anyhow::ensure!(
             !self.btile_storage.is_published() || self.nvfp4_prequant_moe,
@@ -220,11 +216,8 @@ impl MoeLayer {
         // Sequence-parallel prefill (`layers::glm_sp`): routed experts run every
         // row; the shared expert and its blend run only this rank's rows, and
         // the EP all-reduce becomes a reduce-scatter into them.
-        let sp = crate::layers::glm_sp::current().filter(|sp| {
-            is_ep_prefill
-                && num_tokens == 2 * sp.rows
-                && matches!(mode, super::forward_pair_verify::PrefillMode::Legacy)
-        });
+        let sp = crate::layers::glm_sp::current()
+            .filter(|sp| is_ep_prefill && num_tokens == 2 * sp.rows);
         let (shared_in, shared_n) = match sp {
             Some(sp) => (sp.local(input, h as usize), sp.rows as u32),
             None => (input, n),
@@ -245,29 +238,20 @@ impl MoeLayer {
             && sp.is_none()
             && !overlap_shared_reduce
             && !defer_shared_hc
-            && matches!(mode, super::forward_pair_verify::PrefillMode::Legacy)
             && self.shared_split_ready(ctx, n);
         if split {
             self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
         } else if has_shared && !overlap_shared_reduce {
-            match mode {
-                super::forward_pair_verify::PrefillMode::PairVerify(shared) => {
-                    self.run_pair_shared(input, ctx, stream, shared)?
-                }
-                super::forward_pair_verify::PrefillMode::OwnerVerify(shape) => {
-                    self.run_verify_shared_rows(input, ctx, stream, shape.rows(), shape.rows())?
-                }
-                super::forward_pair_verify::PrefillMode::Legacy => self.run_shared_expert_prefill(
-                    shared_in,
-                    shared_n,
-                    h,
-                    shared_inter,
-                    stream,
-                    stream,
-                    false,
-                    ctx,
-                )?,
-            }
+            self.run_shared_expert_prefill(
+                shared_in,
+                shared_n,
+                h,
+                shared_inter,
+                stream,
+                stream,
+                false,
+                ctx,
+            )?;
         }
         prof_step!("shared_expert");
 
@@ -492,7 +476,6 @@ impl MoeLayer {
             num_tokens,
             ne,
             &mut t0,
-            mode,
             ctx,
             stream,
         )?;

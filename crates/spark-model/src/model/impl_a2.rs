@@ -31,8 +31,6 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
-pub(super) const EP_CMD_GLM_MTP_PROPOSE: u32 = 0xFFFFFFE1;
-
 #[cfg(test)]
 #[path = "impl_a2/idle_command_tests.rs"]
 mod idle_command_tests;
@@ -124,9 +122,9 @@ impl TransformerModel {
         if seq.chunked_prefill_meta.is_none() {
             seq.chunked_prefill_meta = Some(ChunkedPrefillPageMetadata {
                 block_table: self.gpu.alloc(required_blocks.max(1) * 4)?,
-                seq_len: self
-                    .gpu
-                    .alloc((1 + crate::layer::PREFILL_MAX_SUB_CHUNKS) * std::mem::size_of::<u32>())?,
+                seq_len: self.gpu.alloc(
+                    (1 + crate::layer::PREFILL_MAX_SUB_CHUNKS) * std::mem::size_of::<u32>(),
+                )?,
                 block_capacity: required_blocks,
                 uploaded_blocks: 0,
             });
@@ -162,7 +160,11 @@ impl TransformerModel {
                 pieces.len() <= PREFILL_MAX_SUB_CHUNKS,
                 "prefill chunk of {proc_count} rows exceeds {PREFILL_MAX_SUB_CHUNKS} attention pieces"
             );
-            values.extend(pieces.iter().map(|&(row0, rows)| (proc_start + row0 + rows) as u32));
+            values.extend(
+                pieces
+                    .iter()
+                    .map(|&(row0, rows)| (proc_start + row0 + rows) as u32),
+            );
         }
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let base = seq
@@ -634,14 +636,6 @@ impl TransformerModel {
         if cmd == super::glm_fused_chunk::EP_CMD_GLM_FUSED_CHUNK {
             return self.glm_fused_receive(seq_id, slots);
         }
-        if cmd == super::glm_c2_pair_transport::EP_GLM_PAIR_VERIFY {
-            return self.paired_receive_verify_pair(seq_id, slots);
-        }
-        if cmd == super::glm_owner_wire::EP_GLM_OWNER_VERIFY
-            || cmd == super::glm_owner8_wire::EP_GLM_OWNER8_VERIFY
-        {
-            return self.owner_receive_verify(seq_id, cmd, slots);
-        }
 
         let slot_idx = seq_id as usize;
         if slot_idx >= slots.len() {
@@ -660,9 +654,6 @@ impl TransformerModel {
         // `claim_slot()` from a free-list pop in matched order. Defensive
         // bail if they ever diverge so we fail fast rather than corrupt KV.
         if cmd == 0xFFFFFFF1 {
-            if self.paired_handoff().is_some() {
-                return self.paired_replace_worker_slot(slots, slot_idx);
-            }
             if let Some(mut old) = slots[slot_idx].take() {
                 self.free_sequence(&mut old)?;
             }
@@ -750,57 +741,7 @@ impl TransformerModel {
                 );
                 seq.disable_mtp = disabled != 0;
             }
-            EP_CMD_GLM_MTP_PROPOSE => {
-                if self.paired_handoff().is_some() {
-                    return self.paired_receive_propose(seq);
-                }
-                anyhow::ensure!(
-                    crate::layers::glm5_mtp::distributed_enabled()
-                        && self.config.model_type == "glm5_next",
-                    "received distributed GLM MTP command while the feature is disabled"
-                );
-                anyhow::ensure!(
-                    crate::layers::glm5_mtp::repair_owned::permits_capacity(
-                        self.levers.max_decode_seqs
-                    ),
-                    "distributed GLM MTP currently requires max_batch_size=1"
-                );
-                let payload = self.ep_broadcast_tokens(&[0u32; 4])?;
-                let [token, position, num_drafts, hidden_row] = payload.as_slice() else {
-                    unreachable!("fixed-size GLM MTP payload")
-                };
-                let num_drafts = *num_drafts as usize;
-                anyhow::ensure!(
-                    (1..=4).contains(&num_drafts),
-                    "distributed GLM MTP draft count must be 1..=4, got {num_drafts}"
-                );
-                anyhow::ensure!(
-                    *hidden_row < 32,
-                    "distributed GLM MTP hidden row {} exceeds verify limit",
-                    hidden_row
-                );
-                self.validate_glm_mtp_repair(
-                    seq,
-                    *token,
-                    *position as usize,
-                    num_drafts,
-                    *hidden_row as usize,
-                    false,
-                )?;
-                self.save_hidden_for_mtp(*hidden_row as usize, stream)?;
-                let drafts =
-                    self.run_mtp_propose_inner(*token, *position as usize, num_drafts, seq, None)?;
-                anyhow::ensure!(
-                    drafts.len() == num_drafts,
-                    "worker GLM MTP proposer returned {} drafts, expected {num_drafts}",
-                    drafts.len()
-                );
-            }
             0xFFFFFFF0 => {
-                if self.paired_handoff().is_some() {
-                    self.paired_receive_cold_prefill(seq)?;
-                    return Ok(true);
-                }
                 // Prefill chunk: receive chunk_len, chunk_start, full prompt length,
                 // then ALL prompt tokens via bulk broadcast (single NCCL op).
                 let chunk_len = self.ep_broadcast_u32(0)? as usize;
@@ -898,68 +839,27 @@ impl TransformerModel {
                 }
             }
             0xFFFFFFF5 => {
-                let selected = self.paired_handoff().is_some();
-                let result = (|| {
-                    if selected {
-                        self.paired_wire_profile(1)?;
-                    }
-                    // Width-generic verify, used by four-draft MTP (K=5) and
-                    // DFlash. Keep this protocol separate from the fixed-width
-                    // commands so existing ranks remain byte-for-byte unchanged.
-                    let k = self.ep_broadcast_u32(0)? as usize;
-                    if selected {
-                        anyhow::ensure!(k == 5, "paired F5 requires fixed K5");
-                    }
-                    anyhow::ensure!(
-                        (2..=32).contains(&k),
-                        "EP generic verify width must be 2..=32, got {k}"
-                    );
-                    let tokens = self.ep_broadcast_tokens(&vec![0u32; k])?;
-                    let paired_base = self.paired_handoff().map(|_| seq.seq_len);
-                    if selected {
-                        self.paired_validate_verify(seq, &tokens)?;
-                    }
-                    self.sync_secondary()?;
-                    self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
-
-                    let num_accepted = self
-                        .ep_broadcast_u32(0)
-                        .map_err(|error| self.paired_failed_transaction(seq, error))?
-                        as usize;
-                    if num_accepted >= k {
-                        return Err(self.paired_failed_transaction(
-                            seq,
-                            anyhow::anyhow!(
-                                "EP generic verify accepted {num_accepted} drafts for K={k}"
-                            ),
-                        ));
-                    }
-                    let verify_base = if let Some(base) = paired_base {
-                        base
-                    } else if crate::speculative::glm_repair_policy::enabled() {
-                        seq.seq_len
-                            .checked_sub(k)
-                            .ok_or_else(|| anyhow::anyhow!("EP verify base underflow"))?
-                    } else {
-                        0
-                    };
-                    self.ep_worker_apply_verdict(seq, verify_base, &tokens, num_accepted)
-                })();
-                result.map_err(|error| {
-                    if selected {
-                        self.paired_transport_error(error)
-                    } else {
-                        error
-                    }
-                })?;
+                // Width-generic verify, used by four-draft MTP (K=5) and
+                // DFlash. Keep this protocol separate from the fixed-width
+                // commands so existing ranks remain byte-for-byte unchanged.
+                let k = self.ep_broadcast_u32(0)? as usize;
+                anyhow::ensure!(
+                    (2..=32).contains(&k),
+                    "EP generic verify width must be 2..=32, got {k}"
+                );
+                let tokens = self.ep_broadcast_tokens(&vec![0u32; k])?;
+                self.sync_secondary()?;
+                self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                anyhow::ensure!(
+                    num_accepted < k,
+                    "EP generic verify accepted {num_accepted} drafts for K={k}"
+                );
+                self.ep_worker_apply_verdict(seq, &tokens, num_accepted)?;
             }
             token => {
                 // Regular decode
-                if self.paired_handoff().is_some() {
-                    self.paired_receive_bootstrap(seq, token)?;
-                } else {
-                    self.decode(token, seq, stream)?;
-                }
+                self.decode(token, seq, stream)?;
             }
         }
 
@@ -967,12 +867,11 @@ impl TransformerModel {
     }
 
     /// Worker side of a verified K-row step once the head's accepted-draft
-    /// count has arrived: roll back the rejected rows, record the repair
-    /// verdict, trim the proposer and commit the accepted SSM prefix.
+    /// count has arrived: roll back the rejected rows, trim the proposer and
+    /// commit the accepted SSM prefix.
     pub(super) fn ep_worker_apply_verdict(
         &self,
         seq: &mut SequenceState,
-        verify_base: usize,
         tokens: &[u32],
         num_accepted: usize,
     ) -> Result<()> {
@@ -992,7 +891,6 @@ impl TransformerModel {
                 seq.tokens.pop();
             }
         }
-        self.record_glm_mtp_verified_impl(seq, verify_base, tokens, num_accepted)?;
         self.trim_proposer_state(seq, num_accepted, 0)?;
         self.commit_accepted_prefix(seq, committed, k)?;
         Ok(())
