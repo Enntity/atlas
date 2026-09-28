@@ -346,7 +346,10 @@ impl BufferSizes {
             0
         };
 
+        // GDN (qwen3_ssm) only: GLM-5's KDA layers share the 128-dim heads but
+        // never read this scratch.
         let gdn_fla_scratch = if config.linear_num_value_heads > 0
+            && config.model_type != "glm5_next"
             && config.linear_key_head_dim == 128
             && config.linear_value_head_dim == 128
         {
@@ -379,13 +382,24 @@ impl BufferSizes {
         // Pure MoE models never take the dense_ffn path, but hybrid models do:
         // GLM-5 has routed experts globally plus three `mlp_only_layers`.
         let has_dense_ffn = config.num_experts == 0 || !config.mlp_only_layers.is_empty();
+        // The q8_1 size serves Q4_K MMQ (`ATLAS_FFN_MMQ`); the default NVFP4
+        // MMQ needs only its block_fp4_mmq form (`fp4_act_scratch_bytes`:
+        // 144 B per 256 values). The int8/FP4 activation pair is read only by
+        // `ATLAS_INT8_PREFILL`, `ATLAS_FFN_MMQ` (faith2 down) and `ATLAS_FP4_PREFILL`.
         let (ffn_act_q8, ffn_act_a, ffn_act_scale) = if has_dense_ffn {
             let kmax = h.max(config.intermediate_size);
             let kpad = kmax.div_ceil(256) * 256;
+            let env = |name| std::env::var_os(name).is_some();
+            let q4k = env("ATLAS_FFN_MMQ");
+            let requant = q4k || env("ATLAS_INT8_PREFILL") || env("ATLAS_FP4_PREFILL");
             (
-                m * kpad * 4 + (1 << 20), // q8_1_mmq: m*kpad*4 + 1MB (matches q8_1_scratch_bytes)
-                m * kmax,                 // int8 a_i8 [m,K] ≥ NVFP4 packed [m,K/2]
-                m * (kmax / 32) * 4,      // int8 a_scale [m,K/32]*4 ≥ NVFP4 scale [m,K/16]
+                if q4k {
+                    m * kpad * 4 + (1 << 20) // q8_1_mmq: m*kpad*4 + 1MB (matches q8_1_scratch_bytes)
+                } else {
+                    m * (kpad / 256) * 144 + (1 << 20) // block_fp4_mmq
+                },
+                if requant { m * kmax } else { 0 }, // int8 a_i8 [m,K] ≥ NVFP4 packed [m,K/2]
+                if requant { m * (kmax / 32) * 4 } else { 0 }, // int8 a_scale [m,K/32]*4 ≥ NVFP4 scale [m,K/16]
             )
         } else {
             (0, 0, 0)
