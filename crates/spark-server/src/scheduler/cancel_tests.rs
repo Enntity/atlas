@@ -15,8 +15,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-#[path = "cancel_test_model.rs"]
-mod model;
+use crate::scheduler::cancel_test_model as model;
 use model::TestModel;
 
 fn row() -> (ActiveSeq, tokio::sync::mpsc::Receiver<StreamEvent>) {

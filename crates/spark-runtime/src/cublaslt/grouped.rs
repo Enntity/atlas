@@ -218,7 +218,7 @@ pub fn bf16_grouped_gemm_act_weight_t(
 
 fn end_address(ptr: u64, elements: u64) -> Result<u64> {
     ensure!(
-        ptr > 0 && ptr % 2 == 0,
+        ptr > 0 && ptr.is_multiple_of(2),
         "grouped GEMM requires BF16 aligned pointers"
     );
     elements

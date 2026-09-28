@@ -55,7 +55,7 @@ impl MoeLayer {
         for (expert, weights) in self.weights.experts.iter().enumerate() {
             let q = weights.down_proj;
             anyhow::ensure!(
-                !q.is_null() == config.is_local_expert(expert),
+                q.is_null() != config.is_local_expert(expert),
                 "checkpoint down locality mismatch"
             );
             if q.is_null() {

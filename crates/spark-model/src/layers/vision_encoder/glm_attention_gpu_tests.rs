@@ -63,7 +63,7 @@ fn reference(qkv: &[u16], seq: usize) -> Vec<f32> {
 #[test]
 #[ignore = "requires a CUDA host"]
 fn glm_vision_flash_attention_matches_fp32_reference() -> Result<()> {
-    let target = atlas_kernels::ptx_for_exact_target("glm-5.3-flash-nvfp4", "nvfp4")
+    let target = atlas_kernels::ptx_for_exact_target("glm-5.3-flash", "nvfp4")
         .context("resolve exact GLM CUDA kernel target")?;
     let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &target.modules)
         .context("create CUDA backend")?;

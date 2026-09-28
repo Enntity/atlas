@@ -121,7 +121,7 @@ impl GlmVisionEncoder {
             "GLM vision constructor received a non-GLM config"
         );
         ensure!(
-            config.hidden_size % config.num_heads == 0,
+            config.hidden_size.is_multiple_of(config.num_heads),
             "GLM vision hidden_size must divide num_heads"
         );
         ensure!(

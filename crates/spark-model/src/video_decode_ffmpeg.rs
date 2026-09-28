@@ -380,7 +380,7 @@ fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<ClipTiming> {
     // about the container. It is never used in place of the duration.
     let native_fps = ["avg_frame_rate", "r_frame_rate"]
         .into_iter()
-        .find_map(|k| field(k))
+        .find_map(field)
         .and_then(|v| parse_rate(&v))
         .and_then(crate::video_sample::finite_positive)
         .unwrap_or(policy.fps);

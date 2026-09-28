@@ -8,7 +8,7 @@
 //! Exit: 0 pass, 1 mismatch.
 //!
 //! Run:
-//!   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=glm-5.3-flash-nvfp4 \
+//!   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=glm-5.3-flash \
 //!   ATLAS_TARGET_QUANT=nvfp4 cargo run -p spark-model --release \
 //!     --features cuda,gpu-examples --example glm_topk_bench
 

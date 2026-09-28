@@ -271,7 +271,7 @@ pub fn dense_gemv_bf16_tc(
     stream: u64,
 ) -> Result<()> {
     ensure!(
-        (1..=DENSE_GEMV_TC_MAX_M).contains(&m) && k % 8 == 0,
+        (1..=DENSE_GEMV_TC_MAX_M).contains(&m) && k.is_multiple_of(8),
         "dense_gemv_bf16_tc: m={m} k={k} unsupported"
     );
     KernelLaunch::new(gpu, kernel)

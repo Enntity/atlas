@@ -269,12 +269,12 @@ mod tests {
     #[test]
     fn accounting_preserves_bf16_fp8_and_mixed_dtype_layouts() {
         let shape = GlmMlaShape::new(512, 0).unwrap();
-        let index = Some(SparseIndexCacheConfig::bf16(4, 128));
+        let index_cfg = SparseIndexCacheConfig::bf16(4, 128);
+        let index = Some(index_cfg);
         for dtype in [KvCacheDtype::Bf16, KvCacheDtype::Fp8] {
             let cfg = config(11, dtype);
             let plan = GlmCachePlan::new(shape, &cfg, index).unwrap();
-            let legacy =
-                cfg.block_bytes_kv_all_layers() + index.unwrap().block_bytes(16).unwrap() * 11;
+            let legacy = cfg.block_bytes_kv_all_layers() + index_cfg.block_bytes(16).unwrap() * 11;
             assert_eq!(plan.block_bytes_all_layers(), legacy);
             assert_eq!(plan.num_blocks_for_budget(legacy * 7 + legacy - 1), 7);
             assert_eq!(plan.bytes_for_blocks(2).unwrap(), legacy * 2);
@@ -299,7 +299,7 @@ mod tests {
         );
         let scaled_index = SparseIndexCacheConfig {
             dtype: spark_runtime::kv_cache::SparseIndexCacheDtype::Fp8E4m3Scaled,
-            ..index.unwrap()
+            ..index_cfg
         };
         let cfg = config(1, KvCacheDtype::Fp8);
         let plan = GlmCachePlan::new(shape, &cfg, Some(scaled_index)).unwrap();

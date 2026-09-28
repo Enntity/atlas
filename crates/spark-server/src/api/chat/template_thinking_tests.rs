@@ -71,13 +71,19 @@ fn rendered_glm_generation_tail_reconciles_requested_thinking() {
         let open = tokenizer
             .apply_chat_template_openai(&messages, None, requested, false)
             .unwrap();
-        assert!(open.ends_with(suffix), "plain request thinking={requested}");
+        // Without tools, thinking-off renders GLM's low-effort reasoning: the
+        // prompt still ends with an open <think>, and the server treats it as
+        // template-forced thinking with the maximum budget.
+        assert!(
+            open.ends_with(&[START]),
+            "plain request thinking={requested}"
+        );
         assert_eq!(
             reconcile_prompt_thinking(&open, Some(START), Some(END), requested, Some(32), 128),
             if requested {
                 (true, Some(32))
             } else {
-                (false, None)
+                (true, Some(128))
             }
         );
     }

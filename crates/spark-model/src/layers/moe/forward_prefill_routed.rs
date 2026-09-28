@@ -715,42 +715,40 @@ impl MoeLayer {
                             max_m_tiles,
                             stream,
                         )?;
+                    } else if self.nvfp4_down_m32 && self.moe_grouped_gemm_t_k64_m32.0 != 0 {
+                        ops::moe_w4a16_grouped_gemm_ptrtable_k64_m32_n128(
+                            ctx.gpu,
+                            self.moe_grouped_gemm_t_k64_m32,
+                            expert_gate_out,
+                            dp.packed_ptrs,
+                            dp.scale_ptrs,
+                            dp.scale2_vals,
+                            expert_down_out,
+                            expert_offsets,
+                            DevicePtr(0),
+                            num_experts,
+                            h,
+                            inter,
+                            max_m_tiles,
+                            stream,
+                        )?;
                     } else {
-                        if self.nvfp4_down_m32 && self.moe_grouped_gemm_t_k64_m32.0 != 0 {
-                            ops::moe_w4a16_grouped_gemm_ptrtable_k64_m32_n128(
-                                ctx.gpu,
-                                self.moe_grouped_gemm_t_k64_m32,
-                                expert_gate_out,
-                                dp.packed_ptrs,
-                                dp.scale_ptrs,
-                                dp.scale2_vals,
-                                expert_down_out,
-                                expert_offsets,
-                                DevicePtr(0),
-                                num_experts,
-                                h,
-                                inter,
-                                max_m_tiles,
-                                stream,
-                            )?;
-                        } else {
-                            ops::moe_w4a16_grouped_gemm_ptrtable_n128(
-                                ctx.gpu,
-                                self.moe_grouped_gemm_t_k64,
-                                expert_gate_out,
-                                dp.packed_ptrs,
-                                dp.scale_ptrs,
-                                dp.scale2_vals,
-                                expert_down_out,
-                                expert_offsets,
-                                DevicePtr(0),
-                                num_experts,
-                                h,
-                                inter,
-                                grid_m_strided,
-                                stream,
-                            )?;
-                        }
+                        ops::moe_w4a16_grouped_gemm_ptrtable_n128(
+                            ctx.gpu,
+                            self.moe_grouped_gemm_t_k64,
+                            expert_gate_out,
+                            dp.packed_ptrs,
+                            dp.scale_ptrs,
+                            dp.scale2_vals,
+                            expert_down_out,
+                            expert_offsets,
+                            DevicePtr(0),
+                            num_experts,
+                            h,
+                            inter,
+                            grid_m_strided,
+                            stream,
+                        )?;
                     }
                 }
             } else {

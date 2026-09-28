@@ -48,7 +48,7 @@ pub(crate) fn enabled(model: &str) -> Result<bool> {
 }
 fn validate_weight(ptr: DevicePtr, n: usize, k: usize) -> Result<()> {
     ensure!(
-        n == 4096 && k == 8192 && ptr.0 != 0 && ptr.0 % 16 == 0,
+        n == 4096 && k == 8192 && ptr.0 != 0 && ptr.0.is_multiple_of(16),
         "{FLAG} requires aligned resident BF16 O[4096,8192]"
     );
     Ok(())
@@ -138,7 +138,7 @@ impl StagePlan {
             "{FLAG}: {rows} rows need {scratch_bytes} scratch bytes and {output_bytes} output bytes"
         );
         ensure!(
-            scratch.0 % 16 == 0 && output.0 % 2 == 0,
+            scratch.0.is_multiple_of(16) && output.0.is_multiple_of(2),
             "{FLAG}: invalid operand alignment"
         );
         let whole = span(scratch, scratch_bytes)?;

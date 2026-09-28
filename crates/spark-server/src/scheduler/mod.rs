@@ -16,6 +16,8 @@ mod adaptive_rung;
 mod adaptive_spec;
 mod admission;
 mod beam_prefill;
+#[cfg(test)]
+mod cancel_test_model;
 mod confidence;
 mod decode_logits_content;
 mod decode_logits_seq;

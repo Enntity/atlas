@@ -294,7 +294,7 @@ impl Qwen3AttentionLayer {
         let v_row = (nq * v_dim) as usize * bf16;
         let batch23 = c.fwd.config.model_type == "glm5_next"
             && std::env::var("ATLAS_GLM_MLA_BATCH23").as_deref() == Ok("1");
-        let batched_kernel = independent_kernel.unwrap_or_else(|| match c.n {
+        let batched_kernel = independent_kernel.unwrap_or(match c.n {
             2 if batch23 => self.mla_batched_gemv_batch2_k,
             3 if batch23 => self.mla_batched_gemv_batch3_k,
             4 => batch4,

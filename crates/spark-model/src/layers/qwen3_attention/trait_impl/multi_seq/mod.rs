@@ -295,7 +295,7 @@ impl Qwen3AttentionLayer {
 
         // ── QSA ingest continuity (all rows inert; see `qsa_rows.rs`) ──
         if !qsa_rows && self.qsa.is_some() {
-            let states = states.as_deref_mut().ok_or_else(|| {
+            let states = states.ok_or_else(|| {
                 anyhow::anyhow!("QSA batched HC requires actual per-sequence state")
             })?;
             self.ms_qsa_ingest_rows(c, states, row_owner, seq_lens, kv_cache, meta)?;

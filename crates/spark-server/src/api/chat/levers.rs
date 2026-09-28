@@ -148,6 +148,6 @@ mod tests {
         );
         assert!(ChatLevers::resolve(false, false, true, true).disable_cwd_hint_injection);
         assert!(!ChatLevers::resolve(false, false, false, false).stream_loop_guards);
-        assert!(ChatLevers::OFF.stream_loop_guards);
+        const _: () = assert!(ChatLevers::OFF.stream_loop_guards);
     }
 }

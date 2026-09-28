@@ -128,12 +128,12 @@ impl Model for TransformerModel {
         // Full prefill computes on default; its eager consumer must follow it.
         let stream = self.gpu.default_stream();
         self.stamp_overlay_route(seq.adapter_slot);
-        let result = (|| {
+
+        (|| {
             let logits = self.prefill_dispatch(tokens, seq, stream)?;
             self.try_eager_drafter_prefill(seq, true, stream)?;
             Ok(logits)
-        })();
-        result
+        })()
     }
     fn prefill_chunk(
         &self,
@@ -152,7 +152,8 @@ impl Model for TransformerModel {
             stream
         };
         self.stamp_overlay_route(seq.adapter_slot);
-        let result = (|| {
+
+        (|| {
             let logits = self.prefill_chunk_dispatch(
                 tokens,
                 seq,
@@ -163,8 +164,7 @@ impl Model for TransformerModel {
             )?;
             self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
             Ok(logits)
-        })();
-        result
+        })()
     }
     fn prefill_twophase(
         &self,
@@ -179,12 +179,12 @@ impl Model for TransformerModel {
             stream
         };
         self.stamp_overlay_route(seq.adapter_slot);
-        let result = (|| {
+
+        (|| {
             let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
             self.try_eager_drafter_prefill(seq, true, stream)?;
             Ok(logits)
-        })();
-        result
+        })()
     }
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
         self.stamp_overlay_route(seq.adapter_slot);

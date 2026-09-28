@@ -12,7 +12,7 @@ pub(super) struct CompactMoeWorklist {
 }
 
 fn c3_grouped_shape(config: &atlas_core::config::ModelConfig, rows: u32, decode_rows: u32) -> bool {
-    (rows == 3 || (rows % 3 == 0 && rows <= 12 && OWNER_ROWS.with(|r| r.get()) == rows))
+    (rows == 3 || (rows.is_multiple_of(3) && rows <= 12 && OWNER_ROWS.with(|r| r.get()) == rows))
         && decode_rows >= 3
         && glm_grouped_shape(config)
 }
@@ -142,7 +142,10 @@ impl MoeLayer {
         // to batch3 and to M x w4a16_gemv, per w4a16_batch_bitparity_microtest),
         // so several owners' shared-expert rows share one weight read while each
         // row keeps the single-owner K3 arithmetic.
-        anyhow::ensure!(rows % 3 == 0 && rows > 0, "C3 shared expert rows {rows}");
+        anyhow::ensure!(
+            rows.is_multiple_of(3) && rows > 0,
+            "C3 shared expert rows {rows}"
+        );
         let (h, inter) = (h as usize, inter as usize);
         let mut row = 0usize;
         while row < rows as usize {
@@ -381,8 +384,8 @@ impl MoeLayer {
             && self.nvfp4_fused_silu_quant
             && self.silu_mul_quant_nvfp4_k.0 != 0
             && self.lora.is_none()
-            && inter % 128 == 0
-            && h % 128 == 0
+            && inter.is_multiple_of(128)
+            && h.is_multiple_of(128)
         {
             ops::moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w(
                 ctx.gpu,

@@ -16,7 +16,7 @@ pub struct GlmSparsePrefillTc<'a> {
     pub config: &'a ModelConfig,
     pub dtype: KvCacheDtype,
     /// The caller populated both cache sides from the same zero-RoPE latent
-    /// using mla_cache_assemble[_batched] and the conventional paged cache writer.
+    /// using `mla_cache_assemble[_batched]` and the conventional paged cache writer.
     pub identical_kv_latent: bool,
     pub query: DevicePtr,
     pub k_cache: DevicePtr,

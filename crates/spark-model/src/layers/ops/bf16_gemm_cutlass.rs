@@ -102,7 +102,7 @@ pub fn fp8_e4m3_to_bf16(
     stream: u64,
 ) -> Result<()> {
     ensure!(
-        count % 8 == 0,
+        count.is_multiple_of(8),
         "E4M3 widening needs count % 8 == 0 ({count})"
     );
     let kernel = gpu

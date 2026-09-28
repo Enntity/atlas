@@ -10,8 +10,7 @@ use crate::scheduler::{
 use spark_runtime::gpu::DevicePtr;
 use std::time::Instant;
 
-#[path = "cancel_test_model.rs"]
-mod model;
+use crate::scheduler::cancel_test_model as model;
 
 const OPEN: u32 = 101; // Existing deterministic FP32 logits provider's winner.
 const START: u32 = 900;

@@ -598,6 +598,8 @@ mod helpers_c;
 mod shared_fp8_cache;
 mod shared_fp8_cache_load;
 mod shared_fp8_cache_output;
+#[cfg(test)]
+mod shared_fp8_cache_test_gpu;
 mod shared_fp8_origin;
 pub(crate) use gate_up_m16::validate_m16_gate_up_graphs;
 pub(crate) use shared_fp8_cache::SharedFp8Reserve;

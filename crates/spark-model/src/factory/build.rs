@@ -1108,7 +1108,7 @@ pub fn build_model(
     }
 
     // A worker rank carries the drafter config only; the head proposes.
-    if let Some(args) = dflash_args.filter(|a| a.drafter_store.len() > 0) {
+    if let Some(args) = dflash_args.filter(|a| !a.drafter_store.is_empty()) {
         let weights = load_dflash_weights(
             args.drafter_store,
             &args.drafter_config,

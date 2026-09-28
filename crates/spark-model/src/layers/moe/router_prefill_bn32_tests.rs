@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
+use crate::layers::moe::shared_fp8_cache_test_gpu::RecordingGpu;
 use spark_runtime::buffers::BufferArena;
-#[path = "shared_fp8_cache_test_gpu.rs"]
-mod recording;
-use recording::RecordingGpu;
 fn fixture(run: impl FnOnce(&mut MoeLayer, &ForwardContext, &RecordingGpu)) {
     fixture_model("glm5_next", run);
 }
@@ -76,12 +74,21 @@ fn router_prefill_bn32_actual_dispatch_changes_only_enabled_long_glm_rows() {
             assert_eq!(call.block, [8, 16, 1]);
             assert_eq!(call.stream, 19);
             assert_eq!(call.shared, 0);
-            assert_eq!(call.args[0], recording::Arg::Ptr(input));
-            assert_eq!(call.args[1], recording::Arg::Ptr(layer.weights.gate.weight));
-            assert_eq!(call.args[2], recording::Arg::Ptr(output));
+            assert_eq!(
+                call.args[0],
+                crate::layers::moe::shared_fp8_cache_test_gpu::Arg::Ptr(input)
+            );
+            assert_eq!(
+                call.args[1],
+                crate::layers::moe::shared_fp8_cache_test_gpu::Arg::Ptr(layer.weights.gate.weight)
+            );
+            assert_eq!(
+                call.args[2],
+                crate::layers::moe::shared_fp8_cache_test_gpu::Arg::Ptr(output)
+            );
             assert_eq!(
                 call.args[3],
-                recording::Arg::Bytes(m.to_ne_bytes().to_vec())
+                crate::layers::moe::shared_fp8_cache_test_gpu::Arg::Bytes(m.to_ne_bytes().to_vec())
             );
         }
     });

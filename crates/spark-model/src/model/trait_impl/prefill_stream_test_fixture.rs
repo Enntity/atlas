@@ -95,19 +95,21 @@ impl GpuBackend for Gpu {
         args: &[KernelArg<'_>],
     ) -> Result<()> {
         let base = self.record.capture.load(Ordering::Relaxed);
-        if let Some(KernelArg::Buffer(dst)) = args.get(2) {
-            if base != 0 && dst.0 >= base && dst.0 < base + (CAPACITY * ROW_BYTES) as u64 {
-                // Real rms_norm argument ABI, actual owned capture destination.
-                anyhow::ensure!(args.len() == 5, "capture must use actual norm ABI");
-                self.record
-                    .events
-                    .lock()
-                    .push(Event::Capture(grid[0] as usize, stream));
-                anyhow::ensure!(
-                    !self.record.capture_failure.load(Ordering::Relaxed),
-                    "injected capture failure"
-                );
-            }
+        if let Some(KernelArg::Buffer(dst)) = args.get(2)
+            && base != 0
+            && dst.0 >= base
+            && dst.0 < base + (CAPACITY * ROW_BYTES) as u64
+        {
+            // Real rms_norm argument ABI, actual owned capture destination.
+            anyhow::ensure!(args.len() == 5, "capture must use actual norm ABI");
+            self.record
+                .events
+                .lock()
+                .push(Event::Capture(grid[0] as usize, stream));
+            anyhow::ensure!(
+                !self.record.capture_failure.load(Ordering::Relaxed),
+                "injected capture failure"
+            );
         }
         Ok(())
     }

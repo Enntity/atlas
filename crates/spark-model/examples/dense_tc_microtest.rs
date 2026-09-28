@@ -6,7 +6,7 @@
 //! Exit: 0 pass, 1 any leg beyond 2 BF16 ulps, 2 kernels absent.
 //!
 //! Run:
-//!   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=glm-5.3-flash-nvfp4 \
+//!   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=glm-5.3-flash \
 //!   ATLAS_TARGET_QUANT=nvfp4 cargo run -p spark-model --release \
 //!     --features cuda,gpu-examples --example dense_tc_microtest
 
