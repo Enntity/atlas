@@ -20,7 +20,10 @@ pub fn mxfp8_quantize(
     k: usize,
     stream: u64,
 ) -> Result<()> {
-    ensure!(k % MXFP8_BLOCK == 0, "MXFP8 needs K % 32 == 0 (K={k})");
+    ensure!(
+        k.is_multiple_of(MXFP8_BLOCK),
+        "MXFP8 needs K % 32 == 0 (K={k})"
+    );
     let blocks = (n * k / MXFP8_BLOCK) as u64;
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(blocks as u32, 256), 1, 1])
@@ -49,7 +52,7 @@ pub fn mxfp8_gemv(
     stream: u64,
 ) -> Result<()> {
     ensure!(
-        (1..=32).contains(&m) && k as usize % MXFP8_BLOCK == 0,
+        (1..=32).contains(&m) && (k as usize).is_multiple_of(MXFP8_BLOCK),
         "mxfp8_gemv: m={m} k={k} unsupported"
     );
     KernelLaunch::new(gpu, kernel)

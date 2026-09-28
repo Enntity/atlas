@@ -204,7 +204,7 @@ fn every_launch_is_a_parallel_tile_and_attention_is_flash_tiled() {
 fn over_capacity_request_fails_before_queuing_any_work() {
     // Eight 1024x1024 images (74x74 patches, 1369 merged rows each) must fit
     // the packed output a GLM request splices from.
-    assert!(8 * 37 * 37 <= GLM_MAX_OUTPUT_ROWS);
+    const _: () = assert!(8 * 37 * 37 <= GLM_MAX_OUTPUT_ROWS);
 
     let gpu = NamedGpu::default();
     let mut enc = encoder(&gpu);

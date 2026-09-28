@@ -28,7 +28,7 @@ impl TransformerModel {
             && c.ep_world_size == 2
             && comm.world_size() == 2
             && rows >= 4096
-            && rows % 2 == 0
+            && rows.is_multiple_of(2)
             && self.mtp_prefill_hidden.is_null()
             // The first and last layers (expand/contract) are KDA layers.
             && layers > 1

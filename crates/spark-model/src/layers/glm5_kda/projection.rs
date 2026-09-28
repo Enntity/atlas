@@ -142,7 +142,7 @@ impl Glm5KdaLayer {
             self.project_dense_multi_decode(input, weight, output, m, n, k, ctx, stream)
         } else if let tc = ops::dense_tc_kernel(ctx.gpu, m)
             && tc.0 != 0
-            && k % 8 == 0
+            && k.is_multiple_of(8)
         {
             ops::dense_gemv_bf16_tc(ctx.gpu, tc, input, weight, output, m, n, k, n, stream)
         } else {

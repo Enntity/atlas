@@ -215,7 +215,7 @@ pub fn w4a16_gemv_batchm(
     let tc_rows = crate::layers::w4a16_gemv_tiers::tc_rows(kernel);
     let tc = tc_rows.is_some();
     anyhow::ensure!(
-        tc_rows.is_none_or(|rows| m <= rows && k % 16 == 0),
+        tc_rows.is_none_or(|rows| m <= rows && k.is_multiple_of(16)),
         "w4a16 tensor-core GEMV: m={m} k={k} exceeds {tc_rows:?} rows"
     );
     let (grid, block) = if tc {
@@ -258,7 +258,7 @@ pub fn w4a16_gemv_tc_ld(
     anyhow::ensure!(
         kernel.0 != 0
             && (1..=32).contains(&m)
-            && k % 16 == 0
+            && k.is_multiple_of(16)
             && ld_half >= k / 2
             && ld_groups >= k / 16,
         "w4a16 strided tensor-core GEMV: m={m} k={k} ld={ld_half}/{ld_groups}"

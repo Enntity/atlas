@@ -692,7 +692,7 @@ impl TransformerModel {
 
         match cmd {
             EP_CMD_VISION_STATE => {
-                let header = self.ep_broadcast_tokens(&vec![0; VISION_HEADER_WORDS])?;
+                let header = self.ep_broadcast_tokens(&[0; VISION_HEADER_WORDS])?;
                 let max_rows = self
                     .vision_encoder
                     .as_ref()

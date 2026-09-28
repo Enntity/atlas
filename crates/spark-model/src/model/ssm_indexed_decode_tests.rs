@@ -171,7 +171,7 @@ fn present_non_fp32_missing_and_stale_layer_states_fail_closed() {
     let pool = SsmPoolView::new(&h, &c, 64, 64, 32, 8).unwrap();
     let kinds = [LayerType::LinearAttention];
     let layout = DecodeMetaLayout::for_max_batch_size(4);
-    let mut states = vec![state(0x1000, 0x3000)];
+    let mut states = [state(0x1000, 0x3000)];
     for mode in 0..5 {
         let st = states[0]
             .as_any_mut()

@@ -38,7 +38,7 @@ struct Heuristic {
     reserved: [i32; 4],
 }
 
-/// Row-major out[M,N] = act[M,K] * weight[N,K]^T. Both operands are already
+/// Row-major `out[M,N] = act[M,K] * weight[N,K]^T`. Both operands are already
 /// E4M3 with tensor scales exactly one. Calls serialize on the existing model
 /// forward stream and share the existing process CUDA64MiB workspace.
 #[allow(clippy::too_many_arguments)]

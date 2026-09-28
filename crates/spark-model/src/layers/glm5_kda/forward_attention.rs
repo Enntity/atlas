@@ -334,50 +334,48 @@ impl Glm5KdaLayer {
                 self.dim as u32,
                 stream,
             )?;
+        } else if capture_verify_intermediates {
+            self.project_dense_verify(
+                fa,
+                &self.weights.f_b_proj,
+                g1,
+                m,
+                p as u32,
+                self.dim as u32,
+                ctx,
+                stream,
+            )?;
+            self.project_dense_verify(
+                ga,
+                &self.weights.g_b_proj,
+                g2,
+                m,
+                p as u32,
+                self.dim as u32,
+                ctx,
+                stream,
+            )?;
         } else {
-            if capture_verify_intermediates {
-                self.project_dense_verify(
-                    fa,
-                    &self.weights.f_b_proj,
-                    g1,
-                    m,
-                    p as u32,
-                    self.dim as u32,
-                    ctx,
-                    stream,
-                )?;
-                self.project_dense_verify(
-                    ga,
-                    &self.weights.g_b_proj,
-                    g2,
-                    m,
-                    p as u32,
-                    self.dim as u32,
-                    ctx,
-                    stream,
-                )?;
-            } else {
-                self.project_dense(
-                    fa,
-                    &self.weights.f_b_proj,
-                    g1,
-                    m,
-                    p as u32,
-                    self.dim as u32,
-                    ctx,
-                    stream,
-                )?;
-                self.project_dense(
-                    ga,
-                    &self.weights.g_b_proj,
-                    g2,
-                    m,
-                    p as u32,
-                    self.dim as u32,
-                    ctx,
-                    stream,
-                )?;
-            }
+            self.project_dense(
+                fa,
+                &self.weights.f_b_proj,
+                g1,
+                m,
+                p as u32,
+                self.dim as u32,
+                ctx,
+                stream,
+            )?;
+            self.project_dense(
+                ga,
+                &self.weights.g_b_proj,
+                g2,
+                m,
+                p as u32,
+                self.dim as u32,
+                ctx,
+                stream,
+            )?;
         }
         profile::step(ctx, stream, &mut profile_timer, "g_a_f_b_g_b")?;
 

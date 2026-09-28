@@ -1051,8 +1051,7 @@ pub fn process_decode_logits(
 }
 
 #[cfg(test)]
-#[path = "cancel_test_model.rs"]
-mod auto_tool_eos_test_model;
+use crate::scheduler::cancel_test_model as auto_tool_eos_test_model;
 
 #[cfg(test)]
 mod auto_tool_eos_tests {

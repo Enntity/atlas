@@ -935,7 +935,7 @@ pub fn build_model(
     model.set_lora_weights(lora_weights)?;
 
     // A worker rank carries the drafter config only; the head proposes.
-    if let Some(args) = dflash_args.filter(|a| a.drafter_store.len() > 0) {
+    if let Some(args) = dflash_args.filter(|a| !a.drafter_store.is_empty()) {
         let weights = load_dflash_weights(
             args.drafter_store,
             &args.drafter_config,

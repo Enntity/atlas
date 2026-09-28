@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
+use crate::layers::moe::shared_fp8_cache_test_gpu::{Arg, RecordingGpu};
 use spark_runtime::buffers::BufferArena;
-#[path = "shared_fp8_cache_test_gpu.rs"]
-mod recording;
-use recording::{Arg, RecordingGpu};
 
 fn fixture(rows: usize, run: impl FnOnce(&mut MoeLayer, &mut ForwardContext, &RecordingGpu)) {
     fixture_capacity(rows, false, run);

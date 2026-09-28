@@ -4,6 +4,10 @@
 
 use super::*;
 
+/// One owner-group target traversal: `(rows, tokens, seqs) -> verified`.
+type OwnerTraverse<'a> =
+    dyn FnMut(usize, &[u32], &mut [&mut SequenceState]) -> anyhow::Result<Vec<u32>> + 'a;
+
 /// Width-generic γ-token verify with accept-prefix.
 ///
 /// Routes `[last_token, drafts...]` through Atlas's width-generic target
@@ -503,7 +507,7 @@ pub fn step_verify_glm_long_with(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
-    traverse: &mut dyn FnMut(usize, &[u32], &mut [&mut SequenceState]) -> anyhow::Result<Vec<u32>>,
+    traverse: &mut OwnerTraverse<'_>,
 ) {
     let fail_all = |group: &mut [&mut ActiveSeq]| group.iter_mut().for_each(|a| a.finished = true);
     let t_step = Instant::now();

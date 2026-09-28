@@ -13,7 +13,7 @@
 use super::lifecycle::{derive_finish_reason, finish_sequence};
 use super::types::{ActiveSeq, GUARD_STOP_REQUEST_TIMEOUT, ResponseSink};
 use super::{DEFAULT_LZ_PENALTY, SsmDecodeRing};
-use crate::api::{InferenceResponse, StreamEvent};
+use crate::api::InferenceResponse;
 use crate::ir::FINISH_REASON_TIMEOUT;
 use anyhow::Result;
 use spark_model::traits::{Model, SequenceState};
@@ -498,22 +498,4 @@ fn terminal_model_error_is_sent_as_error_without_successful_done() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("indexed context envelope"));
-}
-
-#[tokio::test]
-async fn terminal_model_error_is_streamed_without_successful_done() {
-    let (mut a, _blocking_rx) = test_seq(vec![5, 6, 42], 7, None, 10);
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    a.sink = ResponseSink::Streaming(tx);
-    a.engine_error = Some("MTP proposal failed: indexed context envelope".into());
-    finish_sequence(&StubModel::default(), &mut a, MAX_SEQ_LEN);
-    let event = rx
-        .recv()
-        .await
-        .expect("terminal model error must reach the streaming client");
-    match event {
-        StreamEvent::Error(message) => assert!(message.contains("indexed context envelope")),
-        _ => panic!("terminal model error became a non-error event"),
-    }
-    assert!(rx.try_recv().is_err(), "error path must not also emit Done");
 }

@@ -62,7 +62,7 @@ fn all_targets_have_modules() {
 #[test]
 #[ignore = "requires nvcc and ATLAS_SKIP_BUILD unset"]
 fn glm5_target_ships_native_vision_module() {
-    let target = ptx_for_exact_target("glm-5.3-flash-nvfp4", "nvfp4")
+    let target = ptx_for_exact_target("glm-5.3-flash", "nvfp4")
         .expect("the GLM-5.3 NVFP4 kernel target must be compiled");
     assert!(
         target

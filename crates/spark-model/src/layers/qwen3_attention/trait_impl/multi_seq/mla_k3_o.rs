@@ -27,7 +27,7 @@ impl Qwen3AttentionLayer {
                 && mla.o_lora_rank == 0
                 && mla.wo_nvfp4.is_none()
                 && mla.wo.weight.0 != 0
-                && mla.wo.weight.0 % 16 == 0
+                && mla.wo.weight.0.is_multiple_of(16)
                 && self.dense_gemv_batchm_k.0 != 0,
             "ATLAS_GLM_K3_MLA_O_BATCHM: unqualified K3 O geometry/weight/kernel"
         );

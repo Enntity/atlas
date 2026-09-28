@@ -2,8 +2,8 @@
 use super::*;
 use clap::Parser;
 
-#[path = "long_mtp_tests.rs"]
-mod long_mtp;
+#[path = "long_context_tests.rs"]
+mod long_context;
 
 // Supply only the I/O boundary; all topology/admission/accounting is production.
 fn prepare_reserve(
@@ -73,7 +73,7 @@ fn config() -> ModelConfig {
 }
 
 fn isolated(name: &str, overrides: &[(&str, &str)]) -> bool {
-    const CHILD: &str = "ATLAS_SERVER_INDEPENDENT_TEST_CHILD";
+    const CHILD: &str = "ATLAS_SERVER_LONG_CONTEXT_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
         for (key, _) in std::env::vars_os() {
@@ -88,7 +88,6 @@ fn isolated(name: &str, overrides: &[(&str, &str)]) -> bool {
             ))
             .arg("--nocapture")
             .env(CHILD, "1")
-            .env("ATLAS_GLM_INDEPENDENT_DECODE", "1")
             .env("ATLAS_EP_PROTOCOL", "v2")
             .envs(overrides.iter().copied())
             .output()
@@ -154,15 +153,10 @@ fn assert_allocation(
 }
 
 #[test]
-fn off_keeps_legacy_global_reserve_and_late_topology() {
+fn default_glm_reserve_keeps_late_topology() {
     if isolated(
-        "off_keeps_legacy_global_reserve_and_late_topology",
-        &[
-            ("ATLAS_GLM_INDEPENDENT_DECODE", "0"),
-            ("ATLAS_GLM_C4_DECODE", "1"),
-            ("ATLAS_GLM_KDA_MULTI_SEQ", "1"),
-            ("ATLAS_GLM_MLA_MULTI_SEQ", "1"),
-        ],
+        "default_glm_reserve_keeps_late_topology",
+        &[("ATLAS_GLM_C4_DECODE", "1")],
     ) {
         return;
     }
@@ -170,11 +164,22 @@ fn off_keeps_legacy_global_reserve_and_late_topology() {
         let a = args(4, rank);
         let mut cfg = config();
         let (topology, reserve) = prepare_reserve(&a, &mut cfg, 128usize << 30).unwrap();
-        assert!(topology.is_none());
+        assert!(
+            topology.is_none(),
+            "only the long-context lane resolves early"
+        );
         assert!(reserve.resolved_prefill.is_none());
-        assert_eq!(cfg.linear_num_key_heads, 64);
+        assert_eq!(
+            cfg.linear_num_key_heads, 64,
+            "heads stay global until resolution"
+        );
         assert_eq!(reserve.max_batch_tokens_pre, 1024);
-        assert_eq!(reserve.inference_reserve, 8732016640); // Historical8327.5MiB.
+        // SSM pools are allocated before the KV snapshot, so the reserve is the
+        // GDN two-phase scratch plus the non-speculative CUDA headroom.
+        assert_eq!(
+            reserve.inference_reserve,
+            reserve.gdn_two_phase_bytes + (512usize << 20)
+        );
         assert_eq!(
             reserve.buffer_arena_bytes,
             spark_runtime::buffers::BufferSizes::from_config(&cfg, 1024, 2048, 16, 4).total_bytes()
@@ -183,5 +188,4 @@ fn off_keeps_legacy_global_reserve_and_late_topology() {
         assert_eq!(topology.tp_rank, rank);
         assert_eq!(cfg.linear_num_key_heads, 32);
     }
-    assert!(prepare_reserve(&args(8, 0), &mut config(), 128usize << 30).is_err());
 }

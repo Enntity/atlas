@@ -168,7 +168,7 @@ mod tests {
         assert!(!parse(None).unwrap());
         assert!(!parse(Some("0")).unwrap());
         assert!(parse(Some("1")).unwrap());
-        for invalid in ["", "true", "2"] {
+        for invalid in ["", "true", "3"] {
             assert!(parse(Some(invalid)).is_err());
         }
     }

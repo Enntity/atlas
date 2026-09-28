@@ -111,7 +111,7 @@ fn disjoint(a: (u64, u64), b: (u64, u64)) -> bool {
 
 fn aligned_nonnull(ptr: DevicePtr, alignment: u64, name: &str) -> Result<()> {
     ensure!(
-        ptr.0 != 0 && ptr.0 % alignment == 0,
+        ptr.0 != 0 && ptr.0.is_multiple_of(alignment),
         "{FLAG}: {name} must be non-null and {alignment}-byte aligned"
     );
     Ok(())

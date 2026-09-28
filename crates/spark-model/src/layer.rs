@@ -123,16 +123,6 @@ impl LayerState for SsmLayerState {
     }
 }
 
-/// Pre-uploaded attention metadata device pointers.
-///
-/// Uploaded once per decode step in the model loop, reused across all
-/// 12 attention layers. Eliminates 44 redundant H2D copies per step.
-///
-/// For batched decode (num_seqs > 1), arrays are contiguous:
-/// - positions: `[N]` u32
-/// - slots: `[N]` i64
-/// - seq_lens: `[N]` i32
-/// - block_table: `[N * max_blocks_per_seq]` i32 (row-major)
 /// Widest attention sub-chunk of a paged prefill chunk: the GLM native sparse
 /// attention and FlashKDA are qualified up to 4100 rows. Wider chunks keep
 /// their token-parallel work (projections, MoE) whole and run attention per
@@ -188,6 +178,16 @@ mod prefill_piece_tests {
     }
 }
 
+/// Pre-uploaded attention metadata device pointers.
+///
+/// Uploaded once per decode step in the model loop, reused across all
+/// 12 attention layers. Eliminates 44 redundant H2D copies per step.
+///
+/// For batched decode (num_seqs > 1), arrays are contiguous:
+/// - positions: `[N]` u32
+/// - slots: `[N]` i64
+/// - seq_lens: `[N]` i32
+/// - block_table: `[N * max_blocks_per_seq]` i32 (row-major)
 #[derive(Clone, Copy)]
 pub struct AttnMetadataDev {
     /// Position values: `[N]` u32 at this device address. For multi-modal
