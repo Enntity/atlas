@@ -328,6 +328,11 @@ pub fn build_model(
             config.ep_world_size,
         );
     }
+    anyhow::ensure!(
+        !(config.expert_tp && use_speculative && dflash_args.is_none()),
+        "ATLAS_GLM_EXPERT_TP=1 serves with the DFlash drafter only: the appended \
+         MTP layer keeps whole experts, which the sliced routed path cannot run"
+    );
     // A DFlash drafter replaces this proposer, so the module, its private
     // context-sized cache and the draft LM head would be dead weight.
     let glm5_mtp_module = if config.model_type == "glm5_next"
@@ -943,13 +948,12 @@ pub fn build_model(
             );
         }
     }
-    let mut kv_cache =
-        PagedKvCache::new_with_v_alias(
-            kv_config,
-            num_kv_blocks,
-            gpu.as_ref(),
-            glm_cache_plan.is_some(),
-        )?;
+    let mut kv_cache = PagedKvCache::new_with_v_alias(
+        kv_config,
+        num_kv_blocks,
+        gpu.as_ref(),
+        glm_cache_plan.is_some(),
+    )?;
     if let Some(index) = sparse_index {
         kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
     }

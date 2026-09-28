@@ -24,6 +24,23 @@ use super::FastSafetensorsLoader;
 use crate::weights::parse_expert_index;
 
 impl FastSafetensorsLoader {
+    /// Expert TP: a routed expert's packed weight or block scale, which the
+    /// model loader slices straight from disk. The appended predictor layer
+    /// keeps its own replication rules, and the scalars load as usual.
+    pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+        self.expert_tp
+            && !name.starts_with("mtp.")
+            && (name.ends_with(".weight") || name.ends_with(".weight_scale"))
+            && parse_expert_index(name).is_some()
+            && ![
+                &self.replicated_expert_prefix,
+                &self.rank0_only_expert_prefix,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|prefix| name.contains(prefix.as_str()))
+    }
+
     pub(super) fn should_skip_tensor(&self, name: &str) -> bool {
         if self
             .skip_layer_prefix
@@ -84,6 +101,9 @@ impl FastSafetensorsLoader {
                 .is_some_and(|prefix| name.contains(prefix))
             {
                 return self.ep_rank != 0;
+            }
+            if self.expert_tp {
+                return false;
             }
             let per_rank = self.num_experts / self.ep_world_size;
             let local_start = self.ep_rank * per_rank;

@@ -4,6 +4,7 @@
 
 mod components;
 mod dense;
+mod expert_tp;
 mod layers;
 mod mtp;
 pub(crate) mod retirement;

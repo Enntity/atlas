@@ -64,7 +64,9 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<DevicePtr> {
         self.btile_input_guard(input, 1, ctx, stream)?;
-        if self.routed_scales_released {
+        // Expert TP slices the routed width, which the fused routed+shared
+        // decode kernels assume equals the shared expert's; take the grouped path.
+        if self.routed_scales_released || ctx.config.expert_tp {
             self.forward_prefill(input, 1, ctx, stream)?;
             return Ok(ctx.buffers.moe_output());
         }

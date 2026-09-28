@@ -76,6 +76,9 @@ pub fn load_glm5_mtp_module(
     draft_config.tp_world_size = 1;
     draft_config.ep_rank = 0;
     draft_config.ep_world_size = 1;
+    // The appended layer keeps whole experts (see the loader's replication
+    // prefixes), so it never takes the expert-TP slices.
+    draft_config.expert_tp = false;
 
     let variant = detect_nvfp4_variant(store, &draft_config);
     let qctx = QuantizeCtx {

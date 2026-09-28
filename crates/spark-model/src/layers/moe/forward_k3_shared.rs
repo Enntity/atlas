@@ -14,7 +14,7 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<()> {
         self.btile_input_guard(input, 3, ctx, stream)?;
-        if self.glm_c3_grouped(ctx, 3) {
+        if self.glm_c3_grouped(ctx, 3) || ctx.config.expert_tp {
             return self.forward_prefill(input, 3, ctx, stream);
         }
         let optimized = self.lora.is_none()

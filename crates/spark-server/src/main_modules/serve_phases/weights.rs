@@ -128,6 +128,7 @@ pub(crate) fn load_weight_store(
                 }
             }
             loader.peak_memory_multiplier = mult;
+            loader.expert_tp = config.expert_tp;
             loader.demand_paged_patterns = demand_paged_patterns(config);
             if !loader.demand_paged_patterns.is_empty() {
                 tracing::info!(
@@ -154,6 +155,10 @@ pub(crate) fn load_weight_store(
             anyhow::bail!("--fast-load requires a Unix host (needs O_DIRECT / posix_fadvise)");
         }
     } else {
+        anyhow::ensure!(
+            !config.expert_tp,
+            "ATLAS_GLM_EXPERT_TP=1 needs the fast weight loader (ATLAS_FAST_LOAD)"
+        );
         let mut loader = if ep_size > 1 {
             spark_runtime::weights::SafetensorsLoader::with_ep(ep_rank, ep_size, config.num_experts)
         } else {
