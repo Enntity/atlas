@@ -111,6 +111,15 @@ pub(super) fn decode_batch_with_preemption(
                 };
                 let Some(vi) = victim else {
                     tracing::error!("decode_batch error: {e:#}");
+                    // The EP worker treats the same step error as fatal and
+                    // exits; a head that carried on would block forever in
+                    // its next collective while reporting healthy. Exit too,
+                    // so clients see the connection drop and a supervisor
+                    // restarts the pair.
+                    if model.is_ep() {
+                        eprintln!("EP head step error (peer exits on it too); terminating: {e:#}");
+                        crate::glm_terminal_session::terminate();
+                    }
                     for mut a in active.drain(..) {
                         send_error(model, &mut a, &format!("{e:#}"));
                     }
