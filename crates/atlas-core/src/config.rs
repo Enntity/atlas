@@ -71,6 +71,11 @@ pub struct ModelConfig {
     /// 1D causal-conv kernel size on the SSM input (typically 3 or 4).
     #[serde(default = "default_conv_kernel")]
     pub linear_conv_kernel_dim: usize,
+    /// Bounded KDA decay-gate lower bound. `0.0` selects the regular GDN
+    /// `-exp(A) * softplus(.)` gate; GLM-5.3 sets `-5.0` and uses
+    /// `lower_bound * sigmoid(exp(A) * (. + dt_bias))` per key channel.
+    #[serde(default)]
+    pub kda_gate_lower_bound: f32,
 
     // ── MoE ──
     #[serde(default)]
@@ -341,15 +346,23 @@ pub struct ModelConfig {
     /// Length equals num_hidden_layers. Empty = all layers full attention.
     #[serde(default)]
     pub compress_ratios: Vec<usize>,
-    /// Number of semantic-indexer heads used by DeepSeek-V4 CSA layers.
+    /// Number of semantic-indexer heads used by sparse-attention layers.
     #[serde(default)]
     pub index_n_heads: usize,
-    /// Per-head dimension of the DeepSeek-V4 semantic indexer.
+    /// Per-head dimension of the semantic indexer.
     #[serde(default)]
     pub index_head_dim: usize,
     /// Maximum compressed-history rows selected per query by the semantic indexer.
     #[serde(default)]
     pub index_topk: usize,
+    /// Number of adjacent raw tokens represented by one GLM-5 indexer pool.
+    /// Zero means the architecture does not use k-pool compression.
+    #[serde(default)]
+    pub index_kpool: usize,
+    /// Whether GLM-5 appends the visible, incomplete k-pool tail to the
+    /// expanded top-k token indices.
+    #[serde(default)]
+    pub index_kpool_always_select_tail: bool,
     /// Indexer compression ratio, recorded WITHOUT populating
     /// `compress_ratios`.
     ///
@@ -812,6 +825,8 @@ mod ngram_qwen4exp;
 mod parsers;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_glm5_next;
 
 pub use dispatch::parse_config;
 pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
@@ -822,8 +837,8 @@ pub use parsers::{
     parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{
-    parse_deepseek_v4, parse_gemma4_params, parse_laguna, parse_longcat_ngram, parse_minimax_m2,
-    parse_qwen4_exp, parse_step3p7, parse_vision_config,
+    parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_laguna, parse_longcat_ngram,
+    parse_minimax_m2, parse_qwen4_exp, parse_step3p7, parse_vision_config,
 };
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
