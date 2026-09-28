@@ -61,3 +61,11 @@ fn a_full_accept_reopens_the_width() {
     s.record(3, 3);
     assert!(best([&s].into_iter(), 7) > 3);
 }
+
+#[test]
+fn eight_owners_stay_within_the_row_budget() {
+    let counting = curve(7, 7, 60);
+    let eight = [&counting; 8];
+    // 8 owners x 4 rows is the widest batch the 32-row budget admits.
+    assert_eq!(best(eight.into_iter(), 7), 3);
+}

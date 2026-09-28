@@ -608,7 +608,11 @@ pub fn step_mtp(
             .copied()
             .filter(|&i| active[i].grammar_state.is_none() && !active[i].pending_drafts.is_empty())
             .collect();
-        let max = owners.iter().map(|&i| active[i].pending_drafts.len()).min().unwrap_or(0);
+        // Widest width every owner holds that the batch's row budget admits.
+        let fits = (1..=owners.iter().map(|&i| active[i].pending_drafts.len()).min().unwrap_or(0))
+            .rev()
+            .find(|&w| model.can_batch_glm_long_verify_rows(owners.len(), w + 1));
+        let max = fits.unwrap_or(0);
         (owners.len() >= 2)
             .then(|| super::dflash_width::choose(owners.iter().map(|&i| &active[i].spec_adapt.survival), max))
             .flatten()
@@ -629,9 +633,11 @@ pub fn step_mtp(
             .map(|&i| active[i].pending_drafts.len())
             .filter(|&len| len > 0)
             .collect();
+        let owners_at = |w: usize| lens.iter().filter(|&&len| len >= w).count();
         lens.iter()
             .copied()
-            .max_by_key(|&w| (lens.iter().filter(|&&len| len >= w).count() * (w + 1), w))
+            .filter(|&w| owners_at(w) < 2 || model.can_batch_glm_long_verify_rows(owners_at(w), w + 1))
+            .max_by_key(|&w| (owners_at(w) * (w + 1), w))
     } else {
         None
     };

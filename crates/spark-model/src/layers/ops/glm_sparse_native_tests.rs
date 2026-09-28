@@ -73,7 +73,8 @@ fn native_sparse_startup_uses_real_arena_formula_and_rejects_wrong_profile() {
         (4096, 32768, 16, 4),
         (4100, 16384, 16, 4),
         (4100, 32768, 64, 4),
-        (4100, 32768, 16, 1),
+        (4100, 32768, 16, 0),
+        (4100, 32768, 16, 9),
     ] {
         assert!(
             validate_startup(&config(), rows, seq, block, active, KvCacheDtype::Bf16, &[]).is_err()

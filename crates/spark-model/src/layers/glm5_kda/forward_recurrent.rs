@@ -422,6 +422,9 @@ impl Glm5KdaLayer {
     }
 }
 
+/// Owners one `kda_recurrent_bf16_verify_snap_owners` launch takes.
+const OWNERS_PER_LAUNCH: usize = 4;
+
 impl Glm5KdaLayer {
     /// Every owner's conv (per owner), then one owner-batched recurrence
     /// launch (`kda_recurrent_bf16_verify_snap_owners`, bit-identical to the
@@ -442,7 +445,7 @@ impl Glm5KdaLayer {
         stream: u64,
     ) -> Result<bool> {
         if self.recurrent_verify_owners_k.0 == 0
-            || !(1..=4).contains(&owners.len())
+            || !(1..=crate::layer::glm_long_owner::MAX_OWNERS).contains(&owners.len())
             || rows < 2
             || self.dim != 128
             || !verify_batched_recurrent_snapshot_enabled()
@@ -487,24 +490,28 @@ impl Glm5KdaLayer {
         }
         let p = self.heads * self.dim;
         let (h, i): (Vec<_>, Vec<_>) = states.into_iter().unzip();
-        ops::kda_recurrent_verify_snap_owners(
-            ctx.gpu,
-            self.recurrent_verify_owners_k,
-            convolved.offset(row0 * 3 * p * 2),
-            g1.offset(row0 * p * 2),
-            beta.offset(row0 * self.heads * 2),
-            self.weights.a_log.weight,
-            self.weights.dt_bias.weight,
-            core_out.offset(row0 * p * 2),
-            &h,
-            &i,
-            self.h_state_bytes / size_of::<f32>(),
-            rows as u32,
-            self.heads as u32,
-            self.dim as u32,
-            self.lower_bound,
-            stream,
-        )?;
+        // The kernel takes up to four owners; larger batches launch per four.
+        for (c, (h, i)) in h.chunks(OWNERS_PER_LAUNCH).zip(i.chunks(OWNERS_PER_LAUNCH)).enumerate() {
+            let r = row0 + c * OWNERS_PER_LAUNCH * rows;
+            ops::kda_recurrent_verify_snap_owners(
+                ctx.gpu,
+                self.recurrent_verify_owners_k,
+                convolved.offset(r * 3 * p * 2),
+                g1.offset(r * p * 2),
+                beta.offset(r * self.heads * 2),
+                self.weights.a_log.weight,
+                self.weights.dt_bias.weight,
+                core_out.offset(r * p * 2),
+                h,
+                i,
+                self.h_state_bytes / size_of::<f32>(),
+                rows as u32,
+                self.heads as u32,
+                self.dim as u32,
+                self.lower_bound,
+                stream,
+            )?;
+        }
         Ok(true)
     }
 }

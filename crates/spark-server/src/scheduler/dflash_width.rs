@@ -114,17 +114,24 @@ impl DraftSurvival {
 
 /// Measured verify step cost in ms for `owners` sequences of `rows` rows
 /// each: median scheduler step interval (verify + re-propose) on GLM-5.3
-/// Flash TP2 GB10, prose, 2026-09-28 (`ATLAS_DFLASH_FIXED_WIDTH` sweep).
+/// Flash TP2 GB10, prose, 2026-09-28 (`ATLAS_DFLASH_FIXED_WIDTH` sweeps; 5..=8
+/// owners on the eight-sequence profile).
 fn step_ms(owners: usize, rows: usize) -> f32 {
-    // Rows 2..=8, owners 1..=4. A lone owner's 2-row verify takes a slower
-    // path than 3 rows.
-    const MS: [[f32; 7]; 4] = [
+    // Rows 2..=8, owners 1..=8. A lone owner's 2-row verify takes a slower
+    // path than 3 rows. Owners x rows past the 32-row verify budget never
+    // run (infinite cost).
+    const X: f32 = f32::INFINITY;
+    const MS: [[f32; 7]; 8] = [
         [83.8, 73.5, 81.7, 88.7, 97.0, 104.1, 111.2],
         [93.2, 109.4, 123.1, 144.0, 155.3, 165.2, 175.9],
         [114.1, 141.0, 161.2, 176.3, 191.6, 202.7, 216.3],
         [132.1, 163.1, 186.2, 206.4, 222.1, 236.2, 248.4],
+        [167.9, 189.5, 218.6, 241.4, 259.3, X, X],
+        [184.0, 210.2, 240.4, 263.6, X, X, X],
+        [197.8, 229.0, 262.6, X, X, X, X],
+        [210.2, 246.1, 279.6, X, X, X, X],
     ];
-    MS[owners.clamp(1, 4) - 1][rows.clamp(2, 8) - 2]
+    MS[owners.clamp(1, 8) - 1][rows.clamp(2, 8) - 2]
 }
 
 pub(crate) fn enabled() -> bool {

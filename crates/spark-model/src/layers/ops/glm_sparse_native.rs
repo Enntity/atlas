@@ -52,7 +52,9 @@ fn validate_startup(
             && c.max_batch_tokens == rows
             && seq == plan::MAX_CONTEXT
             && block == 16
-            && active == 4
+            // Only the arena capacity below depends on the sequence count;
+            // the library runs each sequence's attention on its own.
+            && (1..=crate::layer::glm_long_owner::MAX_OWNERS).contains(&active)
             // An fp8_g128 cache reaches the library through its BF16 view.
             && matches!(dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128)
             && layer_dtypes.iter().all(|&d| d == dtype),

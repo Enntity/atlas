@@ -22,13 +22,26 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 pub const K3_ROWS: usize = 3;
 /// Widest per-owner verify block: one GLM DFlash block (bonus + drafts).
 pub const MAX_OWNER_ROWS: usize = crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS;
-/// The long-context lane admits at most four owners.
-pub const MAX_OWNERS: usize = 4;
-pub const MAX_ROWS: usize = MAX_OWNER_ROWS * MAX_OWNERS;
+/// The long-context lane batches at most eight owners...
+pub const MAX_OWNERS: usize = 8;
+/// ...within one budget of verify rows across all owners (8x4, 6x5, 4x8).
+/// Stage, metadata, EOS-ban and split-head buffers are sized to it.
+pub const MAX_ROWS: usize = 32;
 
 /// Whether one call may verify `owners` owners of `rows` rows each.
 pub fn width_supported(owners: usize, rows: usize) -> bool {
-    (1..=MAX_OWNERS).contains(&owners) && (2..=MAX_OWNER_ROWS).contains(&rows)
+    (1..=MAX_OWNERS).contains(&owners)
+        && (2..=MAX_OWNER_ROWS).contains(&rows)
+        && owners * rows <= MAX_ROWS
+}
+
+/// Widest per-owner block `owners` owners can verify together (0 if none).
+pub fn max_rows_per_owner(owners: usize) -> usize {
+    if (1..=MAX_OWNERS).contains(&owners) {
+        (MAX_ROWS / owners).min(MAX_OWNER_ROWS)
+    } else {
+        0
+    }
 }
 
 /// The uniform per-owner row count of one call, validated.
@@ -36,7 +49,7 @@ pub fn owner_rows(owners: &[GlmLongOwner<'_>]) -> Result<usize> {
     let rows = owners.first().map_or(0, |o| o.positions.len());
     ensure!(
         width_supported(owners.len(), rows) && owners.iter().all(|o| o.positions.len() == rows),
-        "GLM long owner batch needs 1..={MAX_OWNERS} owners of one 2..={MAX_OWNER_ROWS} row width"
+        "GLM long owner batch needs 1..={MAX_OWNERS} owners of one 2..={MAX_OWNER_ROWS} row width, at most {MAX_ROWS} rows"
     );
     Ok(rows)
 }

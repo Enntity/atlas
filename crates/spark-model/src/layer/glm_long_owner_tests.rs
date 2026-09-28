@@ -12,19 +12,32 @@ fn small_rows() -> RowBytes {
 }
 
 #[test]
-fn widths_admit_one_to_four_owners_of_two_to_eight_rows() {
-    assert_eq!((K3_ROWS, MAX_OWNER_ROWS, MAX_ROWS), (3, 8, 32));
+fn widths_admit_up_to_eight_owners_within_the_row_budget() {
+    assert_eq!(
+        (K3_ROWS, MAX_OWNER_ROWS, MAX_OWNERS, MAX_ROWS),
+        (3, 8, 8, 32)
+    );
     for owners in 1..=MAX_OWNERS {
-        for rows in WIDTHS {
-            assert!(width_supported(owners, rows), "{owners}x{rows}");
+        for rows in 2..=MAX_OWNER_ROWS {
+            assert_eq!(
+                width_supported(owners, rows),
+                owners * rows <= MAX_ROWS,
+                "{owners}x{rows}"
+            );
         }
         for rows in [0, 1, MAX_OWNER_ROWS + 1] {
             assert!(!width_supported(owners, rows), "{owners}x{rows}");
         }
     }
-    for owners in [0, MAX_OWNERS + 1] {
-        assert!(!width_supported(owners, K3_ROWS));
+    for (owners, rows) in [(8, 4), (6, 5), (5, 6), (4, 8), (1, 8)] {
+        assert!(width_supported(owners, rows), "{owners}x{rows}");
     }
+    for (owners, rows) in [(8, 5), (5, 7), (0, K3_ROWS), (MAX_OWNERS + 1, 2)] {
+        assert!(!width_supported(owners, rows), "{owners}x{rows}");
+    }
+    assert_eq!(max_rows_per_owner(8), 4);
+    assert_eq!(max_rows_per_owner(3), 8);
+    assert_eq!(max_rows_per_owner(9), 0);
 }
 
 #[test]
@@ -107,7 +120,7 @@ fn stage_places_each_owner_at_owner_major_rows() {
         ),
     ];
     for rows in WIDTHS {
-        for owners in 1..=MAX_OWNERS {
+        for owners in (1..=MAX_OWNERS).filter(|&o| width_supported(o, rows)) {
             let total = owners * rows;
             for &(a, s, bytes) in &arena {
                 fill(&gpu, a, MAX_ROWS, bytes, 1);
