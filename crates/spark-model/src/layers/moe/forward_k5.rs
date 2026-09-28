@@ -7,7 +7,7 @@ use super::*;
 
 impl MoeLayer {
     /// Materialize the established shared-expert blend after
-    /// [`forward_k5_for_hc`] deferred it. Used only by the one-shot exactness
+    /// [`Self::forward_k5_for_hc`] deferred it. Used only by the one-shot exactness
     /// oracle; the optimized path consumes the same operands in mHC directly.
     pub fn finish_k5_deferred_shared_blend(
         &self,

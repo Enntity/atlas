@@ -101,8 +101,8 @@ fn glm_natural_end_mid_word_mask_preserves_native_winner() {
 
 #[test]
 fn glm_natural_end_actual_model_policy_has_no_minimum_reasoning_bias() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../kernels/gb10/glm-5.3-flash-nvfp4");
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/gb10/glm-5.3-flash");
     let policy = build_behavior::parse_behavior(&dir);
     assert_eq!(
         policy.tool_call_parser, "poolside_v1",

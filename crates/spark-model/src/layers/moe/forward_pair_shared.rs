@@ -78,7 +78,7 @@ impl MoeLayer {
         let inter = ctx.config.shared_expert_intermediate_size;
         on && ctx.config.ep_world_size == 2
             && ctx.comm.is_some_and(|c| c.world_size() == 2)
-            && inter % 32 == 0
+            && inter.is_multiple_of(32)
             && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
             && [&shared.gate_proj, &shared.up_proj, &shared.down_proj]
                 .iter()

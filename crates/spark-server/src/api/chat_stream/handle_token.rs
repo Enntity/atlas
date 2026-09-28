@@ -149,72 +149,70 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
         && state.detector.is_some()
         && ctx.state.glm_tool_boundary == Some(tok);
     // ── Thinking-phase: token-ID based boundary detection ──────────
-    if !state.thinking_done {
-        if ctx.state.think_end_token_id == Some(tok) || implicit_tool {
-            // Keep the opener out of a residual reasoning delta's token IDs;
-            // it will be restored once, with the retained content token below.
-            if implicit_tool && ctx.req_return_token_ids {
-                state.pending_token_ids.pop();
-            }
-            state.thinking_done = true;
-            // Emit only the residual reasoning delta not yet sent
-            // by incremental streaming (e.g. trailing bytes held
-            // back due to incomplete UTF-8 at prior token boundary).
-            // The full reasoning has already been streamed
-            // incrementally via reasoning_chunk deltas above —
-            // re-emitting the full text here would double it.
-            if ctx.enable_thinking && state.all_toks.len() > 1 {
-                let full = ctx
-                    .state
-                    .tokenizer
-                    .decode(&state.all_toks[..state.all_toks.len() - 1])
-                    .unwrap_or_default();
-                let stable = full.trim_end_matches('\u{FFFD}');
-                if stable.len() > state.emitted {
-                    let residual = &stable[state.emitted..];
-                    // Same fix as the in-loop emit: whitespace-only residuals
-                    // are legitimate `\n   ` indents that the model emitted;
-                    // dropping them would lose chars permanently.
-                    if !residual.is_empty() {
-                        deltas.push(StreamDelta::Reasoning {
-                            text: residual.to_string(),
-                            token_ids: state.take_ids_if(ctx.req_return_token_ids),
-                        });
-                    }
-                }
-            }
-            // Flush the reasoning sanitizer's tail buffer. Without this, up to
-            // ~18 trailing bytes of the final thinking block (or anything held
-            // back for partial-tag fusion) are silently dropped. Skip when
-            // suppression is active (no close arrived during thinking) — those
-            // bytes are intentionally not surfaced.
-            if !state.reasoning_suppressing_leak && !state.reasoning_tag_scan_buf.is_empty() {
-                let tail = std::mem::take(&mut state.reasoning_tag_scan_buf);
-                // Whitespace-only tail can be a real trailing `\n   ` indent
-                // — emit anything non-empty so byte boundaries align.
-                if !tail.is_empty() {
+    if !state.thinking_done && (ctx.state.think_end_token_id == Some(tok) || implicit_tool) {
+        // Keep the opener out of a residual reasoning delta's token IDs;
+        // it will be restored once, with the retained content token below.
+        if implicit_tool && ctx.req_return_token_ids {
+            state.pending_token_ids.pop();
+        }
+        state.thinking_done = true;
+        // Emit only the residual reasoning delta not yet sent
+        // by incremental streaming (e.g. trailing bytes held
+        // back due to incomplete UTF-8 at prior token boundary).
+        // The full reasoning has already been streamed
+        // incrementally via reasoning_chunk deltas above —
+        // re-emitting the full text here would double it.
+        if ctx.enable_thinking && state.all_toks.len() > 1 {
+            let full = ctx
+                .state
+                .tokenizer
+                .decode(&state.all_toks[..state.all_toks.len() - 1])
+                .unwrap_or_default();
+            let stable = full.trim_end_matches('\u{FFFD}');
+            if stable.len() > state.emitted {
+                let residual = &stable[state.emitted..];
+                // Same fix as the in-loop emit: whitespace-only residuals
+                // are legitimate `\n   ` indents that the model emitted;
+                // dropping them would lose chars permanently.
+                if !residual.is_empty() {
                     deltas.push(StreamDelta::Reasoning {
-                        text: tail,
-                        token_ids: Vec::new(),
+                        text: residual.to_string(),
+                        token_ids: state.take_ids_if(ctx.req_return_token_ids),
                     });
                 }
             }
-            // Reset tool detector to clear any thinking-era tag fragments.
-            if let Some(ref mut det) = state.detector {
-                det.reset();
+        }
+        // Flush the reasoning sanitizer's tail buffer. Without this, up to
+        // ~18 trailing bytes of the final thinking block (or anything held
+        // back for partial-tag fusion) are silently dropped. Skip when
+        // suppression is active (no close arrived during thinking) — those
+        // bytes are intentionally not surfaced.
+        if !state.reasoning_suppressing_leak && !state.reasoning_tag_scan_buf.is_empty() {
+            let tail = std::mem::take(&mut state.reasoning_tag_scan_buf);
+            // Whitespace-only tail can be a real trailing `\n   ` indent
+            // — emit anything non-empty so byte boundaries align.
+            if !tail.is_empty() {
+                deltas.push(StreamDelta::Reasoning {
+                    text: tail,
+                    token_ids: Vec::new(),
+                });
             }
-            state.emitted = 0; // Reset — next decode will be content-only
-            state.all_toks.clear(); // Clear thinking tokens from accumulator
-            state.content_decoded.clear();
-            state.detok_prefix_offset = 0;
-            state.detok_read_offset = 0;
-            if !implicit_tool {
-                return deltas;
-            }
-            state.all_toks.push(tok);
-            if ctx.req_return_token_ids {
-                state.pending_token_ids.push(tok);
-            }
+        }
+        // Reset tool detector to clear any thinking-era tag fragments.
+        if let Some(ref mut det) = state.detector {
+            det.reset();
+        }
+        state.emitted = 0; // Reset — next decode will be content-only
+        state.all_toks.clear(); // Clear thinking tokens from accumulator
+        state.content_decoded.clear();
+        state.detok_prefix_offset = 0;
+        state.detok_read_offset = 0;
+        if !implicit_tool {
+            return deltas;
+        }
+        state.all_toks.push(tok);
+        if ctx.req_return_token_ids {
+            state.pending_token_ids.push(tok);
         }
     }
     if !state.thinking_done {

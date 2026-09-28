@@ -72,9 +72,10 @@ fn unused_appended_layer_skips_load_and_estimate_on_both_ep_ranks() {
         fast.try_direct_io = false;
         baseline.skip_layer_prefix = Some(PREFIX.into());
         fast.skip_layer_prefix = Some(PREFIX.into());
-        let estimated =
-            estimate_load_bytes(&[path.clone()], &|name| baseline.should_skip_tensor(name))
-                .unwrap();
+        let estimated = estimate_load_bytes(std::slice::from_ref(&path), &|name| {
+            baseline.should_skip_tensor(name)
+        })
+        .unwrap();
         assert_eq!(
             estimated, 12,
             "only one target expert plus two boundary controls"

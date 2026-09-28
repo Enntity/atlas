@@ -235,10 +235,10 @@ impl<'s, 'g> NativeGateUpLayer<'s, 'g> {
         // A foreign/shared/down/MTP store entry must not alias a destination.
         // Scan without retaining the model's tensors or copying their bytes.
         for name in store.names().filter(|name| !names.contains(*name)) {
-            if let Some(log) = retirement {
-                if !log.is_live(name, gpu)? {
-                    continue;
-                }
+            if let Some(log) = retirement
+                && !log.is_live(name, gpu)?
+            {
+                continue;
             }
             let w = store.get(name)?;
             let bytes = w

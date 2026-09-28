@@ -51,7 +51,7 @@ pub(super) fn plan(
         return Err("KDA Lt scratch capacity");
     }
     let end = |span: Span| -> Result<u64, &'static str> {
-        if span.ptr == 0 || span.ptr % 16 != 0 || span.bytes == 0 {
+        if span.ptr == 0 || !span.ptr.is_multiple_of(16) || span.bytes == 0 {
             return Err("KDA Lt pointer alignment");
         }
         span.ptr

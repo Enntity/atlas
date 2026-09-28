@@ -70,7 +70,7 @@ fn initialize(
         weight.dtype == WeightDtype::BF16
             && (weight.shape == [154856, 4096] || weight.shape == [154880, 4096])
             && weight.ptr.0 != 0
-            && weight.ptr.0 % 16 == 0,
+            && weight.ptr.0.is_multiple_of(16),
         "{FLAG} requires 16-byte-aligned BF16 lm_head.weight [154856,4096] or [154880,4096], got {:?} {:?}",
         weight.dtype,
         weight.shape
@@ -132,7 +132,9 @@ fn dispatch(
         // A/W are read as uint4; output stores are scalar BF16. K=4096
         // preserves 16-byte alignment across every input and weight row.
         ensure!(
-            input.0 % 16 == 0 && weight.weight.0 % 16 == 0 && output.0 % 2 == 0,
+            input.0.is_multiple_of(16)
+                && weight.weight.0.is_multiple_of(16)
+                && output.0.is_multiple_of(2),
             "{FLAG}: input/weight require 16-byte alignment and output 2-byte alignment"
         );
     }

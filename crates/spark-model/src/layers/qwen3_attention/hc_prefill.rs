@@ -148,11 +148,13 @@ fn finalize_ss(
 /// GLM HC4 seam: the finishing site's `hc_post` of `block_out` fused with
 /// the next site's pre-mix, then the finalizer writes `hidden` and the next
 /// post/comb. `block_out = None` runs the next site's pre alone.
-/// * >= 512 rows with a post (`ATLAS_GLM_HC_POST_MIX=1`): one highway pass
+///
+/// * At >= 512 rows with a post (`ATLAS_GLM_HC_POST_MIX=1`): one highway pass
 ///   over 32-token CTAs (measured 1.78 vs 2.50 ms at 4096 rows).
-/// * <= 32 rows (`ATLAS_GLM_HC_DECODE_SEAM=1`): the highway split across 64
+/// * At <= 32 rows (`ATLAS_GLM_HC_DECODE_SEAM=1`): the highway split across 64
 ///   CTAs x 4-row groups, then one finalize block per row (20.6 vs ~57 us per
 ///   site at 8 verify rows).
+///
 /// Returns false (nothing launched) when neither applies; callers then run
 /// `hc_post` + `hc_pre` separately.
 #[allow(clippy::too_many_arguments)]

@@ -138,7 +138,7 @@ impl TransformerModel {
         let vocab = self.config.vocab_size;
         let h = self.config.hidden_size;
         ensure!(
-            vocab % 2 == 0,
+            vocab.is_multiple_of(2),
             "GLM vocab split needs an even vocabulary ({vocab})"
         );
         let shard = vocab / 2;

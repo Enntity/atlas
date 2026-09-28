@@ -75,7 +75,7 @@ impl StagePlan {
     ) -> Result<Self> {
         let bytes = output_bytes(self.rows);
         ensure!(
-            capacity >= bytes && candidate.0 % 2 == 0,
+            capacity >= bytes && candidate.0.is_multiple_of(2),
             "{COMPARE_FLAG}: need aligned {bytes}-byte comparison output"
         );
         let out = span(candidate, bytes)?;

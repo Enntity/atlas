@@ -574,7 +574,7 @@ impl Qwen3AttentionLayer {
         const SPLIT_SCRATCH_BYTES: usize = 8 * 32 * 512 * 4 + 8 * 32 * 4 + 32 * 4;
         if !ops::glm_sparse_decode_tc_enabled(&ctx.config.model_type)?
             || heads == 0
-            || heads % GROUP != 0
+            || !heads.is_multiple_of(GROUP)
             || head_dim != 512
             || index_width != 2051
             || kv_cache.block_size() != 16

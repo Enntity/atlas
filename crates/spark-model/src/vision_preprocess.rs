@@ -21,7 +21,7 @@ pub(crate) const STD: [f32; 3] = [0.5, 0.5, 0.5];
 /// GLM-5.3 ships the OpenAI CLIP processor constants in its nested
 /// `processor_config.json`, rather than the Qwen/SigLIP defaults above.
 pub(crate) const GLM_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
-pub(crate) const GLM_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub(crate) const GLM_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 
 /// The pinned GLM processor expresses its geometry as token budgets.  A
 /// vision token covers one temporal group and one 2×2 patch merge.

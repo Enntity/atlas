@@ -28,7 +28,7 @@ impl TransformerModel {
             && c.ep_world_size == 2
             && comm.world_size() == 2
             && rows >= 4096
-            && rows % 2 == 0
+            && rows.is_multiple_of(2)
             // DFlash captures the complete target-hidden window on rank 0;
             // SP leaves only rank-local rows and would publish capture holes.
             && c.dflash_capture_layers.is_empty()
