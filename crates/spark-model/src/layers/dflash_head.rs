@@ -102,6 +102,21 @@ impl DflashKernels {
         } else if m <= ops::DENSE_GEMV_TC_MAX_M && k % 8 == 0 && self.dense_gemv_tc32.0 != 0 {
             let kernel = if m <= 16 { self.dense_gemv_tc16 } else { self.dense_gemv_tc32 };
             ops::dense_gemv_bf16_tc(gpu, kernel, input, weight, output, m, n, k, n, stream)
+        } else if m <= 2 * ops::DENSE_GEMV_TC_MAX_M && k % 8 == 0 && self.dense_gemv_tc32.0 != 0 {
+            // A few rows past one tier (many owners' blocks): two tensor-core
+            // pieces beat the 128-row tiled GEMM, which is mostly padding.
+            let first = ops::DENSE_GEMV_TC_MAX_M;
+            self.linear(gpu, input, weight, output, first, n, k, stream)?;
+            self.linear(
+                gpu,
+                input.offset(first as usize * k as usize * 2),
+                weight,
+                output.offset(first as usize * n as usize * 2),
+                m - first,
+                n,
+                k,
+                stream,
+            )
         } else {
             ops::dense_gemm_bf16_pipelined(gpu, self.dense_gemm_pipelined, input, weight, output, m, n, k, stream)
         }
@@ -624,6 +639,11 @@ pub struct BlockDiffusionDraftHead {
     /// stage 3: pyref bit-exact diff). Layout (K then V per layer) chosen
     /// to match vLLM's `_fused_kv_weight` in `qwen3_dflash.py:381-389`.
     pub fused_kv_weight: Option<DevicePtr>,
+    /// NVFP4 twins of `fc` and the fused K/V weight (`ATLAS_DFLASH_CTX_NVFP4=1`)
+    /// for context precomputes of up to 32 rows on the tensor-core tier; the
+    /// BF16 originals serve wider precomputes (prompt catch-up). Drafts only:
+    /// the target verifies every token, so this can move acceptance, not output.
+    pub ctx_q4: Option<[QuantizedWeight; 2]>,
 
     /// Paged FP8 KV cache. One cache holding all `num_layers` drafter layers,
     /// laid out the same way the target's KV cache is — block-table-keyed,

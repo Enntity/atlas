@@ -731,6 +731,7 @@ impl BlockDiffusionDraftHead {
             // from each layer's k_proj/v_proj. precompute_ctx_kv will
             // GEMM against it in stage 3 once we wire the call site.
             fused_kv_weight: Some(fused_kv_weight),
+            ctx_q4: None,
             kv_cache: Mutex::new(kv_cache),
             scratch,
             batch_capacity,

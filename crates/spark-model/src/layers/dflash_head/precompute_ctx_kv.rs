@@ -119,16 +119,33 @@ impl BlockDiffusionDraftHead {
         // py:175  `target_hidden = self.hidden_norm(self.fc(target_hidden))`
         //   first half: fc maps [n, L_t*h_t] → [n, h].
         let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
-        self.kernels.linear(
-            gpu,
-            src,
-            &self.fc,
-            scratch.fc_proj,
-            n,
-            h,
-            target_hidden_dim as u32,
-            stream,
-        )?;
+        // NVFP4 context twins on the tensor-core tier for up to 32 rows.
+        let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(n);
+        let ctx_q4 = self.ctx_q4.as_ref().filter(|_| n <= 32 && tc.0 != 0);
+        if let Some([fc_q4, _]) = ctx_q4 {
+            ops::w4a16_gemv_batchm(
+                gpu,
+                tc,
+                src,
+                fc_q4,
+                scratch.fc_proj,
+                n,
+                h,
+                target_hidden_dim as u32,
+                stream,
+            )?;
+        } else {
+            self.kernels.linear(
+                gpu,
+                src,
+                &self.fc,
+                scratch.fc_proj,
+                n,
+                h,
+                target_hidden_dim as u32,
+                stream,
+            )?;
+        }
         dump_buf(
             "fc_proj",
             scratch.fc_proj,
@@ -162,16 +179,30 @@ impl BlockDiffusionDraftHead {
         // Layout per row: [K_0 | V_0 | K_1 | V_1 | … | K_{L-1} | V_{L-1}].
         let fused_w = DenseWeight { weight: fused_kv };
         let fused_n_cols = (l_total as u32) * 2 * kv_dim;
-        self.kernels.linear(
-            gpu,
-            scratch.fc_proj,
-            &fused_w,
-            scratch.fused_kv_out,
-            n,
-            fused_n_cols,
-            h,
-            stream,
-        )?;
+        if let Some([_, fused_q4]) = ctx_q4 {
+            ops::w4a16_gemv_batchm(
+                gpu,
+                tc,
+                scratch.fc_proj,
+                fused_q4,
+                scratch.fused_kv_out,
+                n,
+                fused_n_cols,
+                h,
+                stream,
+            )?;
+        } else {
+            self.kernels.linear(
+                gpu,
+                scratch.fc_proj,
+                &fused_w,
+                scratch.fused_kv_out,
+                n,
+                fused_n_cols,
+                h,
+                stream,
+            )?;
+        }
         dump_buf(
             "fused_kv_out",
             scratch.fused_kv_out,

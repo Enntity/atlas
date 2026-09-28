@@ -94,6 +94,7 @@ fn zero_head() -> BlockDiffusionDraftHead {
         draft_id_to_target_id: None,
         layers: Vec::new(),
         fused_kv_weight: None,
+        ctx_q4: None,
         kv_cache: parking_lot::Mutex::new(zero_kv_cache()),
         scratch: zero_scratch(),
         batch_capacity: 1,

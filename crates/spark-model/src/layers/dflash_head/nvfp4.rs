@@ -122,8 +122,22 @@ impl BlockDiffusionDraftHead {
                 )?,
             });
         }
+        if std::env::var("ATLAS_DFLASH_CTX_NVFP4").as_deref() == Ok("1")
+            && let Some(fused_kv) = self.fused_kv_weight
+        {
+            let fc_in = self.target_layer_ids.len() * self.target_hidden_size;
+            let fused_n = self.num_layers * 2 * kv_dim;
+            let fused = DenseWeight { weight: fused_kv };
+            self.ctx_q4 = Some([
+                quantize_to_nvfp4(&self.fc, h, fc_in, gpu, absmax, quant, stream)?,
+                quantize_to_nvfp4(&fused, fused_n, h, gpu, absmax, quant, stream)?,
+            ]);
+        }
         self.quant = DflashQuantization::Nvfp4Weights;
-        tracing::info!("DFlash NVFP4: ready (quant = Nvfp4Weights)");
+        tracing::info!(
+            "DFlash NVFP4: ready (quant = Nvfp4Weights, context twins {})",
+            self.ctx_q4.is_some()
+        );
         Ok(())
     }
 
@@ -197,11 +211,27 @@ impl BlockDiffusionDraftHead {
         stream: u64,
     ) -> Result<()> {
         let (vocab, h) = (self.vocab_size as u32, self.hidden_size as u32);
-        if let Some(q4) = self.lm_head_q4.as_ref().filter(|_| rows <= 32) {
-            let kernel = crate::layers::w4a16_gemv_tiers::tc_kernel(rows);
-            if kernel.0 != 0 {
-                return ops::w4a16_gemv_batchm(gpu, kernel, input, q4, out, rows, vocab, h, stream);
+        // Wider batches (many owners' blocks) run the tier in 32-row pieces:
+        // the NVFP4 head read twice still beats one BF16 head read.
+        let pieces = || (0..rows).step_by(32).map(move |r0| (r0, (rows - r0).min(32)));
+        let tier = crate::layers::w4a16_gemv_tiers::tc_kernel;
+        if let Some(q4) = self.lm_head_q4.as_ref()
+            && pieces().all(|(_, n)| tier(n).0 != 0)
+        {
+            for (r0, n) in pieces() {
+                ops::w4a16_gemv_batchm(
+                    gpu,
+                    tier(n),
+                    input.offset(r0 as usize * h as usize * 2),
+                    q4,
+                    out.offset(r0 as usize * vocab as usize * 2),
+                    n,
+                    vocab,
+                    h,
+                    stream,
+                )?;
             }
+            return Ok(());
         }
         let head = DenseWeight {
             weight: self.lm_head_shared,
