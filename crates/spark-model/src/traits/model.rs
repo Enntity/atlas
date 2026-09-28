@@ -714,6 +714,13 @@ pub trait Model: Send + Sync {
         bail!("decode_verify_glm_long_owner_rows: unsupported by this model")
     }
 
+    /// Whether prompt prefills share one capture buffer (one writer), so a
+    /// new prompt may not start while another is chunking. Conservatively
+    /// true unless the model knows otherwise.
+    fn has_shared_prompt_capture(&self) -> bool {
+        true
+    }
+
     /// Whether a prefill chunk of `chunk_len` rows of `prompt` may carry
     /// `owners` DFlash verify owners of `rows` rows each after its own rows.
     fn can_fuse_glm_prefill_verify(

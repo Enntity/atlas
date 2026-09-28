@@ -512,6 +512,11 @@ impl Model for TransformerModel {
     ) -> Result<Vec<u32>> {
         self.decode_verify_glm_long_owners_impl(rows, tokens, seqs)
     }
+    fn has_shared_prompt_capture(&self) -> bool {
+        // Only the MTP drafter's prompt capture is shared; DFlash captures
+        // into per-sequence proposer state.
+        !self.mtp_prefill_hidden.is_null()
+    }
     fn can_fuse_glm_prefill_verify(
         &self,
         prompt: &[u32],

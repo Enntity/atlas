@@ -449,6 +449,7 @@ pub fn run(
             &preempted,
             &*policy,
             max_batch_size,
+            model.has_shared_prompt_capture(),
             // Parked sequences (spilled or requeued) are waiting on blocks,
             // not on new requests — never block on the request condvar while
             // any exist, or an empty active set would strand them forever.
@@ -624,6 +625,7 @@ pub fn run(
 
         // ── Start new requests ──
         let t_loop = std::time::Instant::now();
+        let prefill_queue_was_empty = prefilling.is_empty();
         start_new_requests(
             &*model,
             &sched,
@@ -655,7 +657,12 @@ pub fn run(
                 .map_or(num_drafts, |max| num_drafts.min(max)),
             dflash_verify_raw_argmax: use_mtp && dflash_verify_raw_argmax,
         };
-        let did_mixed_step = continue_in_progress_prefills(
+        // Under EP a new prompt's first chunk ran inline just above. End
+        // the tick before its second chunk: decoders get their step, and
+        // prompts that arrived during the first chunk are admitted at the
+        // next boundary (two back-to-back 8K chunks held both ~6 s).
+        let head_just_started = model.is_ep() && prefill_queue_was_empty && !prefilling.is_empty();
+        let did_mixed_step = !head_just_started && continue_in_progress_prefills(
             &*model,
             &*policy,
             &mut active,
