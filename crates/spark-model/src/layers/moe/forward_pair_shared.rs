@@ -137,6 +137,75 @@ impl MoeLayer {
         ops::w4a16_gemv_batchm(ctx.gpu, kernel, shared_gate_out, &shared.down_proj, shared_down_out, rows, h, shared_inter, aux)
     }
 
+    /// Whether the shared expert can run TP-split for `rows` replicated rows
+    /// (`ATLAS_GLM_SHARED_TP_SPLIT=1`, EP2, NVFP4 shared weights with scalar
+    /// scale2, strided tensor-core tiers for `rows`).
+    pub(super) fn shared_split_ready(&self, ctx: &ForwardContext, rows: u32) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("ATLAS_GLM_SHARED_TP_SPLIT").as_deref() == Ok("1"));
+        let shared = &self.weights.shared_expert;
+        let inter = ctx.config.shared_expert_intermediate_size;
+        on && ctx.config.ep_world_size == 2
+            && ctx.comm.is_some_and(|c| c.world_size() == 2)
+            && inter % 32 == 0
+            && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && [&shared.gate_proj, &shared.up_proj, &shared.down_proj]
+                .iter()
+                .all(|w| !w.is_null() && !w.has_per_row_scale2())
+            && crate::layers::w4a16_gemv_tiers::tc_kernel(rows).0 != 0
+            && crate::layers::w4a16_gemv_tiers::tc_ld_kernel(rows).0 != 0
+    }
+
+    /// This rank's half of the shared expert: intermediate columns
+    /// `[rank * inter/2, +inter/2)` — gate/up rows (a pointer offset) and the
+    /// matching K-slice of down (strided tier). `attn_output` then holds this
+    /// rank's partial of the shared output; the EP all-reduce sums the two.
+    pub(super) fn run_shared_split(
+        &self,
+        input: DevicePtr,
+        rows: u32,
+        h: u32,
+        inter: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let shared = &self.weights.shared_expert;
+        let half = inter / 2;
+        let col0 = (ctx.config.ep_rank as u32 * half) as usize;
+        let gate_up_rows = |w: &QuantizedWeight| QuantizedWeight {
+            weight: w.weight.offset(col0 * h as usize / 2),
+            weight_scale: w.weight_scale.offset(col0 * h as usize / 16),
+            ..*w
+        };
+        let down_cols = QuantizedWeight {
+            weight: shared.down_proj.weight.offset(col0 / 2),
+            weight_scale: shared.down_proj.weight_scale.offset(col0 / 16),
+            ..shared.down_proj
+        };
+        let (gate_out, up_out, down_out) = (
+            ctx.buffers.ssm_deinterleaved(),
+            ctx.buffers.ssm_qkvz(),
+            ctx.buffers.attn_output(),
+        );
+        let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(rows);
+        ops::w4a16_gemv_batchm(ctx.gpu, tc, input, &gate_up_rows(&shared.gate_proj), gate_out, rows, half, h, stream)?;
+        ops::w4a16_gemv_batchm(ctx.gpu, tc, input, &gate_up_rows(&shared.up_proj), up_out, rows, half, h, stream)?;
+        ops::silu_mul(ctx.gpu, self.moe_act_mul, gate_out, up_out, gate_out, rows * half, stream)?;
+        ops::w4a16_gemv_tc_ld(
+            ctx.gpu,
+            crate::layers::w4a16_gemv_tiers::tc_ld_kernel(rows),
+            gate_out,
+            &down_cols,
+            down_out,
+            rows,
+            h,
+            half,
+            inter / 2,
+            inter / 16,
+            stream,
+        )
+    }
+
     pub(super) fn run_exact_k5_shared(
         &self,
         input: DevicePtr,

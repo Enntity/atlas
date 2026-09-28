@@ -99,6 +99,11 @@ fn main() -> Result<()> {
         eprintln!("w4a16_gemv_batch8 / w4a16_gemv_tc8 absent from this target");
         std::process::exit(2);
     };
+    let tc_ld = [
+        g.kernel("w4a16_gemv", "w4a16_gemv_tc8_ld").ok(),
+        g.kernel("w4a16_gemv", "w4a16_gemv_tc16_ld").ok(),
+        g.kernel("w4a16_gemv", "w4a16_gemv_tc32_ld").ok(),
+    ];
     let mut fail = false;
     for (name, n, k) in SHAPES {
         let mut rng = Lcg(0x5EED ^ (n * 31 + k) as u64);
@@ -176,6 +181,63 @@ fn main() -> Result<()> {
                 ttc * 1e6,
                 weight_bytes / ttc / 1e9,
             );
+        }
+        // Strided tiers: at the natural stride they must equal the plain tier
+        // bit for bit; over the two K-halves of the weight (rows k/2 bytes
+        // apart, contiguous half-width activations) their sum must match the
+        // full product within the same tolerance.
+        if let [Some(l8), Some(l16), Some(l32)] = tc_ld {
+            let half = k / 2;
+            let a_half = |h: usize| -> Vec<u8> {
+                a.chunks_exact(k * 2).flat_map(|row| row[h * half * 2..(h + 1) * half * 2].to_vec()).collect()
+            };
+            let (a0, a1) = (up(g, &a_half(0))?, up(g, &a_half(1))?);
+            let (c0, c1) = (g.alloc(32 * n * 2)?, g.alloc(32 * n * 2)?);
+            let ld = |kh: KernelHandle, a: DevicePtr, w: DevicePtr, s: DevicePtr, c: DevicePtr, m: u32, kk: u32| {
+                KernelLaunch::new(g, kh)
+                    .grid([div_ceil(n as u32, 16), 1, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(a)
+                    .arg_ptr(w)
+                    .arg_ptr(s)
+                    .arg_f32(SCALE2)
+                    .arg_ptr(c)
+                    .arg_u32(m)
+                    .arg_u32(n as u32)
+                    .arg_u32(kk)
+                    .arg_u32((k / 2) as u32)
+                    .arg_u32((k / GROUP_SIZE) as u32)
+                    .launch(0)
+            };
+            for m in [1u32, 8, 16, 32] {
+                let (tck, ldk) = match m {
+                    1..=8 => (tc8, l8),
+                    9..=16 => (tc16, l16),
+                    _ => (tc32, l32),
+                };
+                launch(g, tck, true, ad, wd, wsd, c_tc, m, n as u32, k as u32)?;
+                ld(ldk, ad, wd, wsd, c_ref, m, k as u32)?;
+                ld(ldk, a0, wd, wsd, c0, m, half as u32)?;
+                ld(ldk, a1, wd.offset(half / 2), wsd.offset(half / GROUP_SIZE), c1, m, half as u32)?;
+                g.synchronize(0)?;
+                let cnt = m as usize * n;
+                let (full, same) = (down(g, c_tc, cnt)?, down(g, c_ref, cnt)?);
+                let (h0, h1) = (down(g, c0, cnt)?, down(g, c1, cnt)?);
+                let bitwise = full.iter().zip(&same).all(|(x, y)| x.to_bits() == y.to_bits());
+                let mut worst = 0f32;
+                for ((x, y0), y1) in full.iter().zip(&h0).zip(&h1) {
+                    let y = y0 + y1;
+                    // Each half rounds to BF16 on its own, so scale by the halves too.
+                    let tol = x.abs().max(y0.abs() + y1.abs()) * (3.0 / 128.0) + 2e-3;
+                    worst = worst.max((x - y).abs() / tol);
+                }
+                let ok = bitwise && worst <= 1.0;
+                fail |= !ok;
+                println!(
+                    "{name} M={m}: strided natural-stride bitwise {bitwise}, K-halves worst/tol {worst:.3} {}",
+                    if ok { "ok" } else { "FAIL" }
+                );
+            }
         }
     }
     std::process::exit(if fail { 1 } else { 0 });

@@ -1689,8 +1689,9 @@ __device__ __forceinline__ void w4a16_tc_mma(
     }
 }
 
-extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
-w4a16_gemv_tc8(
+// `ld_half` / `ld_groups`: bytes between weight rows and between scale rows
+// (K/2 and K/16 for a whole weight; larger for a K-slice of a wider one).
+__device__ __forceinline__ void w4a16_gemv_tc8_impl(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ B_packed,
     const unsigned char* __restrict__ B_scale,
@@ -1698,7 +1699,9 @@ w4a16_gemv_tc8(
     __nv_bfloat16* __restrict__ C,
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned long long ld_half,
+    unsigned long long ld_groups
 ) {
     // Byte -> packed BF16x2 {low nibble, high nibble} of unscaled E2M1.
     __shared__ unsigned int s_pair[256];
@@ -1714,11 +1717,10 @@ w4a16_gemv_tc8(
     const unsigned int g = lane >> 2, c = lane & 3u;
     const unsigned int r0 = blockIdx.x * 16u + g, r1 = r0 + 8u;
     const bool v0 = r0 < N, v1 = r1 < N, vm = g < M;
-    const unsigned long long half_K = K / 2u, groups = K / GROUP_SIZE;
-    const unsigned char* w0p = B_packed + (unsigned long long)(v0 ? r0 : 0u) * half_K;
-    const unsigned char* w1p = B_packed + (unsigned long long)(v1 ? r1 : 0u) * half_K;
-    const unsigned char* s0p = B_scale + (unsigned long long)(v0 ? r0 : 0u) * groups;
-    const unsigned char* s1p = B_scale + (unsigned long long)(v1 ? r1 : 0u) * groups;
+    const unsigned char* w0p = B_packed + (unsigned long long)(v0 ? r0 : 0u) * ld_half;
+    const unsigned char* w1p = B_packed + (unsigned long long)(v1 ? r1 : 0u) * ld_half;
+    const unsigned char* s0p = B_scale + (unsigned long long)(v0 ? r0 : 0u) * ld_groups;
+    const unsigned char* s1p = B_scale + (unsigned long long)(v1 ? r1 : 0u) * ld_groups;
     const __nv_bfloat16* ap = A + (unsigned long long)(vm ? g : 0u) * K;
 
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1749,6 +1751,26 @@ w4a16_gemv_tc8(
         const unsigned int m = 2u * c + (i & 1u);
         if (n < N && m < M) C[(unsigned long long)m * N + n] = __float2bfloat16(v * scale2);
     }
+}
+
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc8(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K
+) {
+    w4a16_gemv_tc8_impl(A, B_packed, B_scale, scale2, C, M, N, K, K / 2u, K / GROUP_SIZE);
+}
+
+// K-slice of a wider weight: rows `ld_half` / `ld_groups` bytes apart.
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc8_ld(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ld_half, unsigned int ld_groups
+) {
+    w4a16_gemv_tc8_impl(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
 }
 
 // ── Wider tensor-core tiers (9..32 rows): owner-batched verify blocks ──
@@ -1796,7 +1818,9 @@ __device__ __forceinline__ void w4a16_gemv_tcn_impl(
     __nv_bfloat16* __restrict__ C,
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned long long ld_half,
+    unsigned long long ld_groups
 ) {
     __shared__ unsigned int s_pair[256];
     __shared__ float s_red[W4A16_TC_WARPS][WARP_SIZE][NT * 4];
@@ -1811,11 +1835,10 @@ __device__ __forceinline__ void w4a16_gemv_tcn_impl(
     const unsigned int g = lane >> 2, c = lane & 3u;
     const unsigned int r0 = blockIdx.x * 16u + g, r1 = r0 + 8u;
     const bool v0 = r0 < N, v1 = r1 < N;
-    const unsigned long long half_K = K / 2u, groups = K / GROUP_SIZE;
-    const unsigned char* w0p = B_packed + (unsigned long long)(v0 ? r0 : 0u) * half_K;
-    const unsigned char* w1p = B_packed + (unsigned long long)(v1 ? r1 : 0u) * half_K;
-    const unsigned char* s0p = B_scale + (unsigned long long)(v0 ? r0 : 0u) * groups;
-    const unsigned char* s1p = B_scale + (unsigned long long)(v1 ? r1 : 0u) * groups;
+    const unsigned char* w0p = B_packed + (unsigned long long)(v0 ? r0 : 0u) * ld_half;
+    const unsigned char* w1p = B_packed + (unsigned long long)(v1 ? r1 : 0u) * ld_half;
+    const unsigned char* s0p = B_scale + (unsigned long long)(v0 ? r0 : 0u) * ld_groups;
+    const unsigned char* s1p = B_scale + (unsigned long long)(v1 ? r1 : 0u) * ld_groups;
 
     float acc[NT][4];
     #pragma unroll
@@ -1888,7 +1911,17 @@ w4a16_gemv_tc16(
     const unsigned char* __restrict__ B_scale, const float scale2,
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K
 ) {
-    w4a16_gemv_tcn_impl<2>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_tcn_impl<2>(A, B_packed, B_scale, scale2, C, M, N, K, K / 2u, K / GROUP_SIZE);
+}
+
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc16_ld(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ld_half, unsigned int ld_groups
+) {
+    w4a16_gemv_tcn_impl<2>(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
 }
 
 extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
@@ -1897,6 +1930,16 @@ w4a16_gemv_tc32(
     const unsigned char* __restrict__ B_scale, const float scale2,
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K
 ) {
-    w4a16_gemv_tcn_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_tcn_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K, K / 2u, K / GROUP_SIZE);
+}
+
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc32_ld(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ld_half, unsigned int ld_groups
+) {
+    w4a16_gemv_tcn_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
 }
 #endif

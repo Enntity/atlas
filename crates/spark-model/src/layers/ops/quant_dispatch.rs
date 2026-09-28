@@ -233,6 +233,44 @@ pub fn w4a16_gemv_batchm(
         .launch(stream)
 }
 
+/// Tensor-core `C[m, n] = A[m, k] · W[:, col0..col0+k]ᵀ` for a K-slice of a
+/// wider NVFP4 weight: `weight` points at the slice's first column (packed
+/// byte and scale group), rows `ld_half` / `ld_groups` bytes apart. `kernel`
+/// is a `w4a16_gemv_tc{8,16,32}_ld` tier ([`crate::layers::w4a16_gemv_tiers::tc_ld_kernel`]).
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_tc_ld(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    ld_half: u32,
+    ld_groups: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        kernel.0 != 0 && (1..=32).contains(&m) && k % 16 == 0 && ld_half >= k / 2 && ld_groups >= k / 16,
+        "w4a16 strided tensor-core GEMV: m={m} k={k} ld={ld_half}/{ld_groups}"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 16), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(ld_half)
+        .arg_u32(ld_groups)
+        .launch(stream)
+}
+
 /// Exact-M=5 native-NVFP4 Q/K/V projections in one three-plane launch.
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16_gemv_batch5_qkv(

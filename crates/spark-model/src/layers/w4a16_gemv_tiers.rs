@@ -123,6 +123,22 @@ pub fn tc_kernel(m: u32) -> KernelHandle {
         .map_or(KernelHandle(0), |(_, &h)| h)
 }
 
+/// The tensor-core tiers taking explicit row strides (`w4a16_gemv_tc{8,16,32}_ld`).
+static TC_LD: std::sync::OnceLock<[KernelHandle; 3]> = std::sync::OnceLock::new();
+
+/// The narrowest resolved strided tensor-core tier covering `m` rows, or a
+/// zero handle.
+pub fn tc_ld_kernel(m: u32) -> KernelHandle {
+    let Some(handles) = TC_LD.get() else {
+        return KernelHandle(0);
+    };
+    TC_ROWS
+        .iter()
+        .zip(handles)
+        .find(|&(&rows, h)| m <= rows && h.0 != 0)
+        .map_or(KernelHandle(0), |(_, &h)| h)
+}
+
 /// Row capacity of `kernel` when it is a tensor-core tier.
 pub fn tc_rows(kernel: KernelHandle) -> Option<u32> {
     let handles = TC.get()?;
@@ -166,6 +182,9 @@ impl W4a16BatchmTiers {
         if std::env::var("ATLAS_W4A16_TC").as_deref() == Ok("1") {
             TC.get_or_init(|| {
                 TC_ROWS.map(|rows| super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}")))
+            });
+            TC_LD.get_or_init(|| {
+                TC_ROWS.map(|rows| super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}_ld")))
             });
         }
         Self { handles }

@@ -207,7 +207,20 @@ impl MoeLayer {
             && !ctx.profile
             && std::env::var("ATLAS_MOE_SHARED_REDUCE_OVERLAP").as_deref() == Ok("1");
 
-        if has_shared && !overlap_shared_reduce {
+        // `ATLAS_GLM_SHARED_TP_SPLIT=1`: with rows replicated on both ranks
+        // (decode / verify), each rank computes half the shared expert's
+        // intermediate columns and blends that partial before the EP
+        // all-reduce, which sums the halves; each rank reads half the weights.
+        let split = has_shared
+            && is_ep_prefill
+            && sp.is_none()
+            && !overlap_shared_reduce
+            && !defer_shared_hc
+            && matches!(mode, super::forward_pair_verify::PrefillMode::Legacy)
+            && self.shared_split_ready(ctx, n);
+        if split {
+            self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
+        } else if has_shared && !overlap_shared_reduce {
             match mode {
                 super::forward_pair_verify::PrefillMode::PairVerify(shared) => {
                     self.run_pair_shared(input, ctx, stream, shared)?
@@ -532,6 +545,20 @@ impl MoeLayer {
             )?;
         }
 
+        if split {
+            ops::moe_batched_blend(
+                ctx.gpu,
+                self.moe_batched_blend,
+                output,
+                ctx.buffers.attn_output(),
+                input,
+                self.weights.shared_expert_gate.weight,
+                h,
+                n,
+                stream,
+            )?;
+        }
+
         // EP all-reduce
         if let Some(comm) = ctx.comm
             && ctx.config.ep_world_size > 1
@@ -558,7 +585,7 @@ impl MoeLayer {
                 );
             }
             // Add shared expert ONCE after all-reduce (prevents EP doubling)
-            if has_shared && !defer_shared_hc {
+            if has_shared && !defer_shared_hc && !split {
                 let shared_down_out = ctx.buffers.attn_output();
                 if overlap_shared_reduce {
                     ctx.gpu.stream_wait_event(stream, self.event_b)?;
