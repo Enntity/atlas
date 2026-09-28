@@ -40,6 +40,7 @@ pub mod completions_exec;
 pub mod completions_logprobs;
 pub mod conversations;
 pub mod inference_impl;
+mod inference_repair;
 pub mod inference_types;
 pub mod lora_control;
 pub mod misc_handlers;

@@ -34,10 +34,20 @@ pub(super) fn test_seq(
     guard_stop: Option<&'static str>,
     seq_len: usize,
 ) -> (ActiveSeq, RespRx) {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let now = Instant::now();
     let mut seq = SequenceState::host_only(0);
     seq.seq_len = seq_len;
+    test_owned_seq(seq, output_tokens, remaining, guard_stop)
+}
+
+/// Consumes one real owner; never replaces a live state with a placeholder.
+pub(super) fn test_owned_seq(
+    seq: SequenceState,
+    output_tokens: Vec<u32>,
+    remaining: usize,
+    guard_stop: Option<&'static str>,
+) -> (ActiveSeq, RespRx) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let now = Instant::now();
     let a = ActiveSeq {
         seq,
         session_hash: 0,

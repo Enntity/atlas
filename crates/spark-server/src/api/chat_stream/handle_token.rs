@@ -25,6 +25,9 @@ use super::tool_handlers::{
 
 type DeltaVec = Vec<StreamDelta>;
 
+#[path = "terminal_token.rs"]
+mod terminal_token;
+
 /// Maximum consecutive tokens the stream may spend with
 /// `state.suppressing_param_leak == true` (sanitizer holding content
 /// because of an orphan `<parameter=` / `<tool_call>` opener without
@@ -77,9 +80,12 @@ pub(super) fn strip_bare_role_literal(delta: &mut String, inside_tool_call: bool
 /// through is taken, leaving the doom-loop case (long suppressed
 /// stream of orphan `<tool_call>` openers) uncaught.
 pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {
-    // Count the token HERE, as it is produced, so the dashboard's tok/s is a
-    // live rate rather than one spike at completion. See DECODED_TOKENS_TOTAL.
+    // Count generated tokens without reopening a terminal parser/stream.
     crate::metrics::DECODED_TOKENS_TOTAL.inc();
+    terminal_token::while_open(state, |state| handle_open_token(state, ctx, tok))
+}
+
+fn handle_open_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {
     let result = handle_token_inner(state, ctx, tok);
 
     // Orphan-suppression streak watchdog. The sanitizer flips
@@ -127,6 +133,7 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
 
 fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> DeltaVec {
     let mut deltas: DeltaVec = Vec::new();
+    state.generated_tokens = state.generated_tokens.saturating_add(1);
     state.all_toks.push(tok);
     // One push per call == one sampled token == one increment of
     // `usage.completion_tokens`. Drained onto the next client-visible
@@ -135,11 +142,20 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
         state.pending_token_ids.push(tok);
     }
 
-    // ── Thinking-phase: token-ID based </think> detection ────────────
+    // GLM's native opener ends reasoning and must also reach the existing
+    // content/tool parser. The startup carrier is model-scoped, not inferred
+    // from the display name or from tool-shaped reasoning text.
+    let implicit_tool = !state.thinking_done
+        && state.detector.is_some()
+        && ctx.state.glm_tool_boundary == Some(tok);
+    // ── Thinking-phase: token-ID based boundary detection ──────────
     if !state.thinking_done {
-        if let Some(end_id) = ctx.state.think_end_token_id
-            && tok == end_id
-        {
+        if ctx.state.think_end_token_id == Some(tok) || implicit_tool {
+            // Keep the opener out of a residual reasoning delta's token IDs;
+            // it will be restored once, with the retained content token below.
+            if implicit_tool && ctx.req_return_token_ids {
+                state.pending_token_ids.pop();
+            }
             state.thinking_done = true;
             // Emit only the residual reasoning delta not yet sent
             // by incremental streaming (e.g. trailing bytes held
@@ -192,8 +208,16 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
             state.content_decoded.clear();
             state.detok_prefix_offset = 0;
             state.detok_read_offset = 0;
-            return deltas;
+            if !implicit_tool {
+                return deltas;
+            }
+            state.all_toks.push(tok);
+            if ctx.req_return_token_ids {
+                state.pending_token_ids.push(tok);
+            }
         }
+    }
+    if !state.thinking_done {
         // Still in thinking — accumulate but don't emit as content
         if ctx.enable_thinking {
             // Layer-A one-shot guard: after the in-think tool-call leak
@@ -506,19 +530,10 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
     }
 
     if state.stop_string_triggered {
-        // The tool guards (F11 within-response dedup, hard-validation
-        // reject, loop cap) reuse `stop_string_triggered` as a generic
-        // "end this response" flag. But the scheduler keeps generating for
-        // a few tokens after the flag is set (cancel latency), and on a
-        // tool-call *runaway* those tokens are raw markup —
-        // `<tool_call><function=…><parameter=…>…</tool_call></_call>` —
-        // re-emitted here. A raw passthrough (the old behaviour) leaked
-        // that markup into `content` because this branch returns BEFORE the
-        // detector/sanitizer fork below. Route the delta through the
-        // buffered `sanitize_content_chunk` so multi-token markers that
-        // straddle deltas (`</_call>` = `</` `_` `call` `>`) are reassembled
-        // and scrubbed. For a genuine stop string, legitimate trailing
-        // content is untouched — the sanitizer only removes tool markup.
+        // Only the current token's genuine client stop match can reach this
+        // branch. Emit its pre-stop prefix once, preserving markup sanitization.
+        // Tokens queued AFTER a guard or stop match are rejected at handle_token
+        // entry, before detokenization, content accumulation or token-ID tracking.
         if !delta.is_empty() {
             let cleaned = sanitize_content_chunk(
                 &delta,
@@ -625,8 +640,14 @@ fn process_detector_content(
 
     // F4 SimHash guard — fence-aware sentence-loop state machine
     // (`simhash_step` owns the rules; this call site only threads the
-    // per-stream state through).
-    let semantic_trip = if !state.loop_watchdog_triggered {
+    // per-stream state through). Armed by the model's
+    // `enable_stream_loop_guards`, past the min_tokens floor.
+    let guards_armed = ctx.state.chat.stream_loop_guards
+        && crate::api::stream_guards::watchdog_floor_reached(
+            state.generated_tokens,
+            ctx.min_tokens,
+        );
+    let semantic_trip = if guards_armed && !state.loop_watchdog_triggered {
         crate::loop_simhash::simhash_step(
             &mut state.simhash_pending,
             &mut state.simhash_in_fence,
@@ -638,11 +659,12 @@ fn process_detector_content(
         false
     };
 
-    let token_trip = check_loop_watchdog(
-        sanitized,
-        &mut state.loop_scan_buf,
-        state.loop_watchdog_triggered,
-    );
+    let token_trip = guards_armed
+        && check_loop_watchdog(
+            sanitized,
+            &mut state.loop_scan_buf,
+            state.loop_watchdog_triggered,
+        );
 
     if semantic_trip || token_trip {
         if semantic_trip {

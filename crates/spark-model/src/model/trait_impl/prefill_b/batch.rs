@@ -365,6 +365,7 @@ impl TransformerModel {
                     chunk_len,
                     proc_start,
                     proc_count,
+                    0,
                     effective_seq_len_start,
                     &kv_cache,
                     stream,
@@ -405,6 +406,7 @@ impl TransformerModel {
                     use_mrope,
                     needs_paged,
                     // Batched path does not do mid-chunk tail capture (single-seq only).
+                    None,
                     None,
                     stream,
                 )?;

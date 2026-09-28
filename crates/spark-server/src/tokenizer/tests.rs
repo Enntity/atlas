@@ -5,6 +5,7 @@
 use super::*;
 
 mod deepseek_v4;
+mod glm5_next;
 use serde_json::json;
 
 mod laguna;
@@ -68,6 +69,20 @@ fn render_holo_template(messages: &[serde_json::Value], enable_thinking: bool) -
         add_vision_id => false,
     };
     tmpl.render(ctx).expect("template renders")
+}
+
+#[test]
+fn chat_templates_support_loop_controls() {
+    let env = super::jinja_helpers::build_jinja_env(
+        "{% for item in items %}{{ item }}{% break %}{% endfor %}",
+    )
+    .expect("Hugging Face templates using break must compile");
+    let rendered = env
+        .get_template("chat")
+        .unwrap()
+        .render(minijinja::context! { items => ["first", "second"] })
+        .expect("loop-control template renders");
+    assert_eq!(rendered, "first");
 }
 
 #[test]

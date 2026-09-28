@@ -13,6 +13,9 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::ssm_pool::SsmStatePool;
+#[cfg(test)]
+#[path = "btile_teardown_tests.rs"]
+mod btile_teardown_tests;
 use super::ssm_snapshot::SsmSnapshotPool;
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
@@ -90,12 +93,18 @@ pub struct TransformerModel {
     pub(super) lm_head_fp8: Option<Fp8DenseWeight>,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     pub(super) buffers: BufferArena,
+    /// Constructor-selected eager temporal pair compute; None preserves serial MTP.
+    pub(super) glm_pair_verify_mode: Option<crate::layer::glm_pair_verify::GlmPairFfn>,
+    pub(super) glm_owner_verify_mode: Option<super::glm_owner_wire::Mode>,
     /// Startup-static LoRA adapter (pool + per-layer pairs + M2 pointer
     /// tables). `None` = no adapter. Installed post-construction via
     /// `set_lora_weights`, which also copies the per-layer pairs into the
     /// layer structs; kept here as the owner of the pool/tables and for
     /// status introspection.
     pub(super) lora: Option<crate::lora::LoraWeights>,
+    /// Sticky diagnostic ownership proof: a failed install or later detach
+    /// may leave layer fields installed even when the pool owner is absent.
+    pub(super) lora_install_attempted: bool,
     /// True when runtime adapter rotation is ARMED: `ATLAS_LORA_ROTATE=1`, or
     /// `$ATLAS_LORA_PEER` set. Armed ⇒ decode runs eager (no CUDA-graph
     /// capture) so a `set_active_lora` re-point is immediately live
@@ -244,6 +253,9 @@ pub struct TransformerModel {
     /// `verify_hidden_stash`, for drafters consuming the PRE-mixer
     /// highway. NULL without a proposer or without a highway.
     pub(super) verify_stream_stash: DevicePtr,
+    /// Owner-batched long-context K3 verify staging (`glm_long_owner`);
+    /// `None` unless that opt-in lane is configured.
+    pub(super) glm_long_stage: Option<crate::layer::glm_long_owner::GlmLongStage>,
     /// ATLAS_MTP_CATCHUP: circular per-position final-hidden ring captured
     /// during serial-decode stretches (BF16 rows, slot = position % ring
     /// len). Feeds the drafter catch-up on the next propose. NULL when the
@@ -426,6 +438,9 @@ pub struct TransformerModel {
     pub(super) vision_row_base: Mutex<usize>,
     pub(super) vision_grid_base: Mutex<usize>,
     pub(super) vision_owned_images: Mutex<usize>,
+    /// Number of encoded rows owned by the current co-dispatched request.
+    /// Zero means the legacy single-request range (or no pending vision).
+    pub(super) vision_slice_rows: Mutex<usize>,
     /// Page-locked host staging for batched metadata H2D transfers.
     /// Allocated once at init via cuMemAllocHost, freed in Drop.
     ///
@@ -605,9 +620,9 @@ unsafe impl Sync for TransformerModel {}
 /// because it attempts every resource even after one fails: a half-torn-down
 /// GPU is worse than a reported error.
 ///
-/// NOT released here: the weights. `build_model` takes `store: &WeightStore`
-/// and the layers only copy pointers out of it, so this model does not own
-/// them — the host that retained the store releases it after this returns.
+/// The builder transfers its owned WeightStore through `adopt_weight_store`.
+/// Its remaining checkpoint allocations are released here after the pools;
+/// published resident readers are invalidated before any owner is freed.
 impl TransformerModel {
     /// Hand the model the ledger of its own weights, for teardown.
     pub fn adopt_weight_store(&mut self, store: spark_runtime::weights::WeightStore) {
@@ -615,6 +630,10 @@ impl TransformerModel {
     }
 
     pub(super) fn release_pools(&mut self) -> anyhow::Result<()> {
+        if let Some(capability) = self.paired_handoff() {
+            capability.close(self.gpu.as_ref(), self.secondary_stream)?;
+        }
+        crate::layers::moe::invalidate_resident_btile_readers(&self.config, &mut self.layers);
         use atlas_core::scope::ModelResource;
 
         let gpu: &dyn GpuBackend = self.gpu.as_ref();

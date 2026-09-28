@@ -212,6 +212,7 @@ pub(crate) fn init_nccl_comm(
     )
     .context("Failed to initialize NCCL")?;
     tracing::info!("NCCL initialized: rank {}", backend.rank());
+    crate::ep_peer_lifeline::watch(&backend).context("Failed to arm the EP peer lifeline")?;
     Ok(Some(
         std::sync::Arc::new(backend) as std::sync::Arc<dyn spark_comm::CommBackend>
     ))

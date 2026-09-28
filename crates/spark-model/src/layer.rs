@@ -13,6 +13,12 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
+pub mod glm_long_owner;
+pub mod glm_owner_verify;
+pub mod glm_pair_verify;
+pub(crate) mod glm_verify_ffn;
+pub(crate) mod glm_verify_scratch;
+pub mod ssm_batch;
 mod transformer_layer;
 pub use transformer_layer::{
     TransformerLayer, VERIFY_WY_LAYER_STRIDE_BYTES, VERIFY_WY_TABLE_SEQS,
@@ -166,6 +172,55 @@ impl LayerState for SsmLayerState {
 /// - slots: `[N]` i64
 /// - seq_lens: `[N]` i32
 /// - block_table: `[N * max_blocks_per_seq]` i32 (row-major)
+/// Widest attention sub-chunk of a paged prefill chunk: the GLM native sparse
+/// attention and FlashKDA are qualified up to 4100 rows. Wider chunks keep
+/// their token-parallel work (projections, MoE) whole and run attention per
+/// sub-chunk; chunk metadata then carries each sub-chunk's causal extent.
+pub const PREFILL_ATTENTION_ROWS: usize = 4096;
+/// Sub-chunk extents a chunk's `seq_len` buffer holds after its total.
+pub const PREFILL_MAX_SUB_CHUNKS: usize = 8;
+
+/// Attention pieces `(row0, rows)` of a prefill chunk starting at sequence
+/// position `seq_start`. A chunk that crosses the semantic top-k boundary
+/// splits there: rows before it attend their whole causal history (dense is
+/// exact), rows after it select. The rest are at most
+/// [`PREFILL_ATTENTION_ROWS`] rows each.
+pub fn prefill_attention_pieces(seq_start: usize, rows: usize, topk: usize) -> Vec<(usize, usize)> {
+    let mut pieces = Vec::new();
+    let mut row0 = 0;
+    if seq_start < topk && seq_start + rows > topk {
+        row0 = topk - seq_start;
+        pieces.push((0, row0));
+    }
+    while row0 < rows {
+        let n = (rows - row0).min(PREFILL_ATTENTION_ROWS);
+        pieces.push((row0, n));
+        row0 += n;
+    }
+    pieces
+}
+
+#[cfg(test)]
+mod prefill_piece_tests {
+    use super::prefill_attention_pieces as pieces;
+
+    #[test]
+    fn first_chunk_splits_at_the_topk_boundary_then_by_attention_rows() {
+        assert_eq!(pieces(0, 4096, 2048), [(0, 2048), (2048, 2048)]);
+        assert_eq!(pieces(0, 8196, 2048), [(0, 2048), (2048, 4096), (6144, 2052)]);
+        assert_eq!(pieces(1000, 4096, 2048), [(0, 1048), (1048, 3048)]);
+    }
+
+    #[test]
+    fn chunks_past_or_before_the_boundary_split_only_by_attention_rows() {
+        assert_eq!(pieces(4096, 4096, 2048), [(0, 4096)]);
+        assert_eq!(pieces(8192, 8196, 2048), [(0, 4096), (4096, 4096), (8192, 4)]);
+        assert_eq!(pieces(0, 1500, 2048), [(0, 1500)]);
+        assert_eq!(pieces(0, 2048, 2048), [(0, 2048)]);
+        assert_eq!(pieces(0, 4096, 0), [(0, 4096)]);
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct AttnMetadataDev {
     /// Position values: `[N]` u32 at this device address. For multi-modal
@@ -345,6 +400,9 @@ pub struct ForwardContext<'a> {
     pub stats: &'a crate::layers::ops::ModelStats,
     /// Pre-uploaded attention metadata (None if no attention layers).
     pub attn_metadata: Option<AttnMetadataDev>,
+    /// Independent live FP32 SSM rows, validated and refreshed before replay.
+    /// None for prefill, temporal verification, and unsupported decode scopes.
+    pub ssm_batch: Option<ssm_batch::SsmBatchView<'a>>,
     /// Profile mode: sync+time per-operation within layers.
     pub profile: bool,
     /// Communication backend for expert parallelism (EP) all-reduce.

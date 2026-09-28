@@ -15,6 +15,8 @@ mod attention_forward_kv;
 pub(in crate::layers::qwen3_attention) mod attention_forward_mla;
 mod attention_forward_oproj;
 mod attention_forward_v4;
+mod glm_index;
+mod glm_index_dynamic;
 mod high_speed_swap;
 mod run_paged_decode;
 mod write_kv_cache;

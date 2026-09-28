@@ -911,6 +911,15 @@ pub fn detect_token_loop(
     false
 }
 
+/// Request-local floor for semantic and token-pattern watchdogs. The
+/// scheduler's hard safety stops use their own budget, deadline, cancellation,
+/// and EOS checks; this predicate only keeps quality heuristics from cutting a
+/// response before an explicit `min_tokens` request floor.
+#[inline]
+pub fn watchdog_floor_reached(output_tokens: usize, min_tokens: usize) -> bool {
+    output_tokens >= min_tokens
+}
+
 /// vLLM-style anchored detector (port of
 /// `vllm/v1/core/sched/utils.py::_has_repeating_pattern`). For each
 /// position `n ∈ [1, pattern_len]` in the LAST `pattern_len` tokens,
@@ -1052,7 +1061,7 @@ mod inter_tool_prose_tests {
 mod content_loop_override_tests {
     use super::{
         CONTENT_LOOP_MIN_REPEATS, CONTENT_LOOP_PERIOD_MAX, CONTENT_LOOP_PERIOD_MIN, WatchdogParams,
-        detect_content_token_loop_with, resolve_content_loop_watchdog,
+        detect_content_token_loop_with, resolve_content_loop_watchdog, watchdog_floor_reached,
     };
     use crate::api::inference_types::RepetitionDetectionParams;
 
@@ -1104,6 +1113,13 @@ mod content_loop_override_tests {
         let p = WatchdogParams::from_behavior(&atlas_kernels::ModelBehavior::default(), None, None);
         assert_eq!(p.content_loop_min_repeats, None);
         assert!(p.content_loop_params(None).is_none());
+    }
+
+    #[test]
+    fn request_min_tokens_floor_is_inclusive_for_quality_watchdogs() {
+        assert!(!watchdog_floor_reached(281, 400));
+        assert!(watchdog_floor_reached(400, 400));
+        assert!(watchdog_floor_reached(0, 0));
     }
 
     #[test]

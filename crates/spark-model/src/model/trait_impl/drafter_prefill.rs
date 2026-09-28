@@ -53,7 +53,12 @@ use spark_runtime::gpu::DevicePtr;
 
 use super::super::types::TransformerModel;
 use crate::layer::ForwardContext;
+use crate::layers::ops;
 use crate::traits::SequenceState;
+
+#[cfg(test)]
+#[path = "drafter_prompt_tests.rs"]
+mod prompt_tests;
 
 /// `ATLAS_NO_MTP_EAGER_DRAFTER` (PRESENCE): restore the propose-site-only
 /// consume, i.e. the pre-fix behaviour where only the last-prefilled sequence
@@ -64,9 +69,12 @@ pub fn eager_drafter_disabled() -> bool {
 }
 
 impl TransformerModel {
-    /// ATLAS_MTP_DRAFTER_PREFILL: copy this prefill chunk's final-layer
+    /// ATLAS_MTP_DRAFTER_PREFILL: capture this prefill chunk's final-layer
     /// hiddens (`[proc_count, h]` BF16, contiguous at the head of the hidden
-    /// buffer) into the whole-prompt capture at row `chunk_start`.
+    /// buffer) at row `chunk_start`. GLM-5's MTP contract consumes the base
+    /// model's post-final-norm rows (the same representation decode supplies),
+    /// so GLM normalizes while capturing. Other proposers retain the legacy
+    /// pre-final-norm capture until their upstream contracts are audited.
     ///
     /// Contiguity-tracked: `chunk_start == 0` (re)starts the capture; a chunk
     /// extending the current range appends; anything else (prefix-cache
@@ -102,7 +110,14 @@ impl TransformerModel {
         src: DevicePtr,
         stream: u64,
     ) -> Result<()> {
-        if self.mtp_prefill_hidden.is_null() || proc_count == 0 {
+        // Native-only sequences must not touch the single shared capture
+        // buffer; doing so would make a plain fallback mutate the next repair
+        // owner's input.
+        if self.mtp_prefill_hidden.is_null()
+            || proc_count == 0
+            || seq.disable_mtp
+            || seq.proposer_state.is_none()
+        {
             return Ok(());
         }
         use std::sync::atomic::Ordering;
@@ -142,12 +157,28 @@ impl TransformerModel {
         }
         let h = self.config.hidden_size;
         let bf16 = 2usize;
-        self.gpu.copy_d2d_async(
-            src,
-            self.mtp_prefill_hidden.offset(chunk_start * h * bf16),
-            proc_count * h * bf16,
-            stream,
-        )?;
+        let dst = self.mtp_prefill_hidden.offset(chunk_start * h * bf16);
+        if self.config.model_type == "glm5_next" {
+            // vLLM's Glm5NextModel applies its final RMSNorm before returning
+            // the per-position target hiddens consumed by the MTP model. The
+            // normal Atlas prefill path only final-normalizes the last row for
+            // logits, so a plain copy here made prompt rows use a different
+            // representation from every subsequent decode row.
+            ops::rms_norm(
+                self.gpu.as_ref(),
+                self.rms_norm_kernel,
+                src,
+                &self.final_norm,
+                dst,
+                proc_count as u32,
+                h as u32,
+                self.config.rms_norm_eps as f32,
+                stream,
+            )?;
+        } else {
+            self.gpu
+                .copy_d2d_async(src, dst, proc_count * h * bf16, stream)?;
+        }
         if let Some(new_len) = contiguous_from_zero {
             self.mtp_prefill_capture_len
                 .store(new_len, Ordering::Relaxed);
@@ -171,24 +202,44 @@ impl TransformerModel {
     /// the pre-existing contract (the propose-site consume already read this
     /// buffer from `default_stream`).
     ///
-    /// Never fails a prefill: a drafter with fewer rows costs acceptance, not
-    /// correctness, because the target verifies every draft.
+    /// Legacy primer errors remain best-effort. A selected prompt diagnostic
+    /// propagates failure so eager fallback cannot disguise missing evidence.
     pub(super) fn try_eager_drafter_prefill(
         &self,
         seq: &mut SequenceState,
         is_last: bool,
         stream: u64,
-    ) {
+    ) -> Result<()> {
+        // Native/plain requests are admitted with MTP disabled.  Return
+        // before touching the paired path, proposer state, or retained
+        // capture so a request-local fallback cannot accidentally run a
+        // drafter through an eager-prefill call.
+        if seq.disable_mtp {
+            return Ok(());
+        }
+        if self.try_glm_paired_eager(seq, is_last, stream)? {
+            return Ok(());
+        }
+        if is_last
+            && crate::layers::glm5_mtp::hidden_trace::prompt_selected(seq)
+            && (eager_drafter_disabled()
+                || self.mtp_prefill_hidden.is_null()
+                || self.proposer.is_none())
+        {
+            crate::layers::glm5_mtp::hidden_trace::spend_prompt(seq)?;
+            anyhow::bail!("GLM prompt diagnostic requires eager capture/proposer owner");
+        }
         if !is_last || eager_drafter_disabled() || self.mtp_prefill_hidden.is_null() {
-            return;
+            return Ok(());
         }
         let Some(proposer) = self.proposer.clone() else {
-            return;
+            return Ok(());
         };
         if seq.proposer_state.is_none() {
-            return;
+            return Ok(());
         }
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -202,6 +253,8 @@ impl TransformerModel {
             stats: &self.stats,
             attn_metadata: None,
             profile: false,
+            // GLM's opt-in split-vocabulary path mirrors the proven full MTP
+            // body locally; prompt KV construction therefore stays no-comm.
             comm: None,
             graph_capture: false,
             gdn_exact_replay: false,
@@ -210,7 +263,35 @@ impl TransformerModel {
             routed_lora_layers: None,
             midchunk_capture: None,
         };
-        self.ensure_drafter_context(proposer.as_ref(), seq, &ctx, stream);
+        self.ensure_drafter_context(proposer.as_ref(), seq, &ctx, stream)?;
+        if crate::layers::glm5_mtp::repair_owned::enabled() {
+            use std::sync::atomic::Ordering;
+            anyhow::ensure!(
+                seq.mtp_capture_gen != 0
+                    && seq.mtp_capture_gen == self.mtp_prefill_capture_gen.load(Ordering::Relaxed)
+                    && self.mtp_prefill_capture_len.load(Ordering::Relaxed) == seq.prompt_len,
+                "GLM concurrent repair requires complete owned prompt capture"
+            );
+            let row_bytes = self.config.hidden_size * 2;
+            let source = self
+                .mtp_prefill_hidden
+                .offset((seq.prompt_len - 1) * row_bytes);
+            let state = seq
+                .proposer_state
+                .as_mut()
+                .expect("checked above")
+                .as_any_mut()
+                .downcast_mut::<crate::layers::Glm5MtpProposerState>()
+                .ok_or_else(|| anyhow::anyhow!("GLM retained tail has foreign proposer state"))?;
+            state.retain_repair_prompt_tail(
+                self.gpu.as_ref(),
+                source,
+                seq.mtp_capture_gen,
+                seq.prompt_len,
+                row_bytes,
+                stream,
+            )?;
+        }
         if crate::speculative::mtp_accept_debug() {
             let rows =
                 proposer.drafter_rows(seq.proposer_state.as_mut().expect("checked above").as_mut());
@@ -230,5 +311,6 @@ impl TransformerModel {
                  can build drafter KV over its own prompt"
             );
         }
+        Ok(())
     }
 }

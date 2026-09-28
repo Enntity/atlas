@@ -27,7 +27,7 @@ mod decode_b;
 mod decode_b2;
 mod decode_checkpoint;
 mod decode_graph_key;
-mod drafter_prefill;
+pub(super) mod drafter_prefill;
 mod ep_misc;
 mod graph_borrow;
 mod lm_head_batched;
@@ -38,6 +38,8 @@ mod prefill_a;
 mod prefill_b;
 mod prefill_c;
 mod prefill_d;
+#[cfg(test)]
+mod prefill_stream_tests;
 mod sequence;
 mod speculative;
 pub(in crate::model) mod ssm_fault_in;
@@ -53,6 +55,12 @@ mod verify_fused;
 mod verify_layer_trace;
 
 impl Model for TransformerModel {
+    fn glm_paired_execution(
+        &self,
+    ) -> Option<&dyn crate::speculative::glm_paired_execution::GlmPairedExecution> {
+        self.paired_handoff()
+            .map(|_| self as &dyn crate::speculative::glm_paired_execution::GlmPairedExecution)
+    }
     fn lightning_dspark_product_policy(
         &self,
     ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
@@ -83,10 +91,35 @@ impl Model for TransformerModel {
     ) -> Result<Vec<(usize, usize, usize, usize)>> {
         self.prepare_vision_embed_batched_dispatch(per_request)
     }
-    fn set_vision_slice_base(&self, row_base: usize, grid_base: usize, owned_images: usize) {
+    fn set_vision_slice_base(
+        &self,
+        row_base: usize,
+        grid_base: usize,
+        owned_images: usize,
+        slice_rows: usize,
+    ) {
         *self.vision_row_base.lock() = row_base;
         *self.vision_grid_base.lock() = grid_base;
         *self.vision_owned_images.lock() = owned_images;
+        *self.vision_slice_rows.lock() = slice_rows;
+    }
+    fn ep_broadcast_vision_state_for_seq(
+        &self,
+        seq_id: u32,
+        enabled: bool,
+        row_base: usize,
+        grid_base: usize,
+        owned_images: usize,
+        slice_rows: usize,
+    ) -> Result<()> {
+        self.ep_broadcast_vision_state_for_seq_dispatch(
+            seq_id,
+            enabled,
+            row_base,
+            grid_base,
+            owned_images,
+            slice_rows,
+        )
     }
     // The four prefill entry points each end with `try_eager_drafter_prefill`:
     // the whole-prompt drafter capture is a single shared slot, so it must be
@@ -97,11 +130,17 @@ impl Model for TransformerModel {
     fn tokens_contain_vision_pad(&self, tokens: &[u32]) -> bool {
         self.tokens_have_vision_pad(tokens)
     }
-    fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
+    fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
+        // Full prefill computes on default; its eager consumer must follow it.
+        let stream = self.gpu.default_stream();
+        self.paired_prefill_preflight(tokens, seq, 0, tokens.len(), true, stream)?;
         self.stamp_overlay_route(seq.adapter_slot);
-        let logits = self.prefill_dispatch(tokens, seq, stream)?;
-        self.try_eager_drafter_prefill(seq, true, stream);
-        Ok(logits)
+        let result = (|| {
+            let logits = self.prefill_dispatch(tokens, seq, stream)?;
+            self.try_eager_drafter_prefill(seq, true, stream)?;
+            Ok(logits)
+        })();
+        self.paired_prefill_result(seq, result)
     }
     fn prefill_chunk(
         &self,
@@ -112,17 +151,28 @@ impl Model for TransformerModel {
         is_last_chunk: bool,
         stream: u64,
     ) -> Result<DevicePtr> {
+        // Distributed dispatch uses default for command/collective ordering.
+        // Keep capture consumption and scratch reuse on that same stream.
+        let stream = if self.multi_rank_protocol_active() {
+            self.gpu.default_stream()
+        } else {
+            stream
+        };
+        self.paired_prefill_preflight(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream)?;
         self.stamp_overlay_route(seq.adapter_slot);
-        let logits = self.prefill_chunk_dispatch(
-            tokens,
-            seq,
-            chunk_start,
-            chunk_len,
-            is_last_chunk,
-            stream,
-        )?;
-        self.try_eager_drafter_prefill(seq, is_last_chunk, stream);
-        Ok(logits)
+        let result = (|| {
+            let logits = self.prefill_chunk_dispatch(
+                tokens,
+                seq,
+                chunk_start,
+                chunk_len,
+                is_last_chunk,
+                stream,
+            )?;
+            self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
+            Ok(logits)
+        })();
+        self.paired_prefill_result(seq, result)
     }
     fn prefill_twophase(
         &self,
@@ -131,15 +181,37 @@ impl Model for TransformerModel {
         chunk_size: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
+        let stream = if self.multi_rank_protocol_active() {
+            self.gpu.default_stream()
+        } else {
+            stream
+        };
+        self.paired_prefill_preflight(
+            tokens,
+            seq,
+            0,
+            tokens.len(),
+            chunk_size >= tokens.len(),
+            stream,
+        )?;
         self.stamp_overlay_route(seq.adapter_slot);
-        let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
-        self.try_eager_drafter_prefill(seq, true, stream);
-        Ok(logits)
+        let result = (|| {
+            let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
+            self.try_eager_drafter_prefill(seq, true, stream)?;
+            Ok(logits)
+        })();
+        self.paired_prefill_result(seq, result)
     }
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
+        let paired = self.paired_before_decode(seq, token)?;
         self.stamp_overlay_route(seq.adapter_slot);
         self.stamp_decode_moe_single(seq.adapter_slot);
-        self.decode_dispatch(token, seq, _stream)
+        let result = self.decode_dispatch(token, seq, _stream);
+        if paired {
+            self.paired_after_decode(seq, token, result)
+        } else {
+            result
+        }
     }
     fn decode_batch(
         &self,
@@ -147,6 +219,7 @@ impl Model for TransformerModel {
         seqs: &mut [&mut SequenceState],
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.reject_paired_batch_producer()?;
         self.stamp_overlay_route_batch(seqs);
         self.stamp_decode_moe_batch(seqs);
         let r = self.decode_batch_dispatch(tokens, seqs, stream);
@@ -172,6 +245,7 @@ impl Model for TransformerModel {
         prefill_is_last: bool,
         stream: u64,
     ) -> Result<crate::traits::MixedForwardResult> {
+        self.reject_paired_batch_producer()?;
         // Mixed decode+prefill batch spans multiple adapters ⇒ mark mixed so the
         // overlay hooks skip (per-token seq_slot routing is SOLID Incr-4).
         self.overlay_route_slot
@@ -194,7 +268,7 @@ impl Model for TransformerModel {
             self.gpu.abort_capture_if_active(self.gpu.default_stream());
         }
         let out = r?;
-        self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream);
+        self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream)?;
         Ok(out)
     }
 
@@ -217,6 +291,7 @@ impl Model for TransformerModel {
         stream: u64,
         row_base: usize,
     ) -> Result<Vec<DevicePtr>> {
+        self.reject_paired_batch_producer()?;
         self.prefill_batch_chunk_dispatch(streams, stream, row_base)
     }
     fn vocab_size(&self) -> usize {
@@ -288,6 +363,7 @@ impl Model for TransformerModel {
         self.high_speed_swap_dims_dispatch()
     }
     fn normalize_ssm_states(&self, seq: &SequenceState, stream: u64) -> Result<()> {
+        self.reject_paired_batch_producer()?;
         self.normalize_ssm_states_dispatch(seq, stream)
     }
     fn bind_gpu_to_thread(&self) -> Result<()> {
@@ -320,6 +396,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         stream: u64,
     ) -> Result<Vec<u32>> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len());
         let r = self.decode_verify_dispatch(tokens, seq, stream);
@@ -335,6 +412,7 @@ impl Model for TransformerModel {
         self.checkpoint_ssm_states_dispatch(seq)
     }
     fn rollback_ssm_states(&self, seq: &mut SequenceState, num_accepted: usize) -> Result<()> {
+        self.reject_paired_batch_producer()?;
         self.rollback_ssm_states_dispatch(seq, num_accepted)
     }
     fn has_ssm_layers(&self) -> bool {
@@ -354,6 +432,7 @@ impl Model for TransformerModel {
         self.save_decode_ssm_snapshot_dispatch(seq, ring_slot)
     }
     fn restore_decode_ssm_snapshot(&self, seq: &SequenceState, ring_slot: usize) -> Result<()> {
+        self.reject_paired_batch_producer()?;
         self.restore_decode_ssm_snapshot_dispatch(seq, ring_slot)
     }
     fn requires_aux_state(&self) -> bool {
@@ -445,6 +524,7 @@ impl Model for TransformerModel {
         self.has_self_speculative_dispatch()
     }
     fn decode_draft(&self, token: u32, seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
+        self.reject_paired_batch_producer()?;
         self.decode_draft_dispatch(token, seq, stream)
     }
     fn cache_sequence(&self, seq: &SequenceState) {
@@ -462,6 +542,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 2]> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len());
         self.decode_verify_graphed_dispatch(tokens, seq, _stream)
@@ -472,6 +553,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 3]> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len());
         self.decode_verify_graphed_k3_dispatch(tokens, seq, _stream)
@@ -482,9 +564,51 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 4]> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len());
         self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream)
+    }
+    fn can_batch_glm_long_verify_rows(&self, owners: usize, rows: usize) -> bool {
+        self.can_batch_glm_long_verify_impl(owners, rows)
+    }
+    fn decode_verify_glm_long_owner_rows(
+        &self,
+        rows: usize,
+        tokens: &[u32],
+        seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<u32>> {
+        self.decode_verify_glm_long_owners_impl(rows, tokens, seqs)
+    }
+    fn has_shared_prompt_capture(&self) -> bool {
+        // Only the MTP drafter's prompt capture is shared; DFlash captures
+        // into per-sequence proposer state.
+        !self.mtp_prefill_hidden.is_null()
+    }
+    fn can_fuse_glm_prefill_verify(
+        &self,
+        prompt: &[u32],
+        seq: &SequenceState,
+        chunk_len: usize,
+        owners: usize,
+        rows: usize,
+    ) -> bool {
+        self.glm_fused_chunk_supported(prompt, seq, chunk_len, owners, rows)
+    }
+    fn prefill_chunk_with_glm_owner_rows(
+        &self,
+        prompt: &[u32],
+        seq: &mut SequenceState,
+        chunk_start: usize,
+        chunk_len: usize,
+        rows: usize,
+        tokens: &[u32],
+        owners: &mut [&mut SequenceState],
+    ) -> Result<(DevicePtr, Vec<u32>)> {
+        self.prefill_chunk_with_glm_owners_impl(prompt, seq, chunk_start, chunk_len, rows, tokens, owners)
+    }
+    fn begin_glm_long_owner_tail(&self, slot: u32, owner: usize, tokens: &[u32]) -> Result<()> {
+        self.begin_glm_long_owner_tail_impl(slot, owner, tokens)
     }
     fn can_batch_verify(&self, ks: &[usize]) -> bool {
         self.can_batch_verify_dispatch(ks)
@@ -496,6 +620,7 @@ impl Model for TransformerModel {
         seqs: &mut [&mut SequenceState],
         _stream: u64,
     ) -> Result<Vec<u32>> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         anyhow::ensure!(
             ks.len() == seqs.len(),
@@ -555,7 +680,13 @@ impl Model for TransformerModel {
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len());
-        self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream)
+        let paired = self.paired_before_verify(tokens, seq)?;
+        let result = self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream);
+        if paired {
+            self.paired_after_verify(tokens, seq, result)
+        } else {
+            result
+        }
     }
     fn decode_and_verify_fused(
         &self,
@@ -563,6 +694,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<Vec<u32>> {
+        self.reject_paired_batch_producer()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len());
         self.decode_and_verify_fused_dispatch(tokens, seq, _stream)
@@ -873,8 +1005,22 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<Option<u32>> {
+        anyhow::ensure!(
+            !seq.disable_mtp,
+            "MTP propose invoked for native-only sequence"
+        );
         self.run_mtp_propose_dispatch(token, position, seq, _stream)
     }
+    fn record_glm_mtp_verified(
+        &self,
+        seq: &mut SequenceState,
+        base: usize,
+        tokens: &[u32],
+        accepted: usize,
+    ) -> Result<()> {
+        self.record_glm_mtp_verified_impl(seq, base, tokens, accepted)
+    }
+
     fn run_mtp_propose_multi(
         &self,
         token: u32,
@@ -884,6 +1030,10 @@ impl Model for TransformerModel {
         _stream: u64,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
+        anyhow::ensure!(
+            !seq.disable_mtp,
+            "MTP propose invoked for native-only sequence"
+        );
         self.run_mtp_propose_multi_dispatch(
             token,
             position,
@@ -905,6 +1055,7 @@ impl Model for TransformerModel {
         self.trim_proposer_state_dispatch(seq, num_accepted, _stream)
     }
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<bool> {
+        self.reject_paired_batch_producer()?;
         self.compact_sequence_dispatch(seq, new_slot)
     }
     fn detach_slot_for_reuse(&self, seq: &mut SequenceState) {
@@ -923,6 +1074,7 @@ impl Model for TransformerModel {
         num_blocks: usize,
         reader: &mut dyn std::io::Read,
     ) -> Result<()> {
+        self.reject_paired_batch_producer()?;
         self.restore_sequence_state_dispatch(seq, num_blocks, reader)
     }
     fn num_free_blocks(&self) -> usize {
@@ -942,6 +1094,7 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         num_accepted: usize,
     ) -> Result<()> {
+        self.reject_paired_batch_producer()?;
         self.start_rollback_and_checkpoint_async_dispatch(seq, num_accepted)
     }
     fn sync_secondary(&self) -> Result<()> {
@@ -953,7 +1106,14 @@ impl Model for TransformerModel {
         num_accepted: usize,
         k: usize,
     ) -> Result<()> {
-        self.commit_accepted_prefix_dispatch(seq, num_accepted, k)
+        if self.paired_handoff().is_none() {
+            return self.commit_accepted_prefix_dispatch(seq, num_accepted, k);
+        }
+        self.paired_commit_check(seq, num_accepted, k, false)?;
+        let result = self
+            .commit_accepted_prefix_dispatch(seq, num_accepted, k)
+            .and_then(|()| self.paired_commit_check(seq, num_accepted, k, true));
+        result.map_err(|error| self.paired_failed_transaction(seq, error))
     }
     fn ep_worker_step(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         self.ep_worker_step_dispatch(slots)
@@ -967,6 +1127,11 @@ impl Model for TransformerModel {
 
     fn is_mla(&self) -> bool {
         self.is_mla_dispatch()
+    }
+    fn supports_chunked_mla(&self) -> bool {
+        self.config.model_type == "glm5_next"
+            && self.config.index_kpool > 0
+            && self.config.index_topk > 0
     }
 
     fn kv_block_size(&self) -> Option<usize> {

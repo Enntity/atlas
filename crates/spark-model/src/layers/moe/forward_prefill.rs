@@ -21,6 +21,31 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.forward_prefill_impl(input, num_tokens, ctx, stream, false)
+    }
+
+    /// Internal entry used by the exact GLM K=5 verifier to leave the shared
+    /// expert blend for the immediately following hyperconnection post-step.
+    /// Normal prefill and every other model always pass `false` through the
+    /// public wrapper above.
+    #[allow(unused_assignments)]
+    pub(super) fn forward_prefill_mode(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+        defer_shared_hc: bool,
+        mode: super::forward_pair_verify::PrefillMode,
+    ) -> Result<()> {
+        if let super::forward_pair_verify::PrefillMode::OwnerVerify(shape) = mode {
+            anyhow::ensure!(num_tokens == shape.rows(), "owner FFN row shape changed");
+        }
+        self.btile_input_guard(input, num_tokens, ctx, stream)?;
+        anyhow::ensure!(
+            !self.btile_storage.is_published() || self.nvfp4_prequant_moe,
+            "B-tile BF16 grouped reader unsupported"
+        );
         // Native-HIP (gfx1151) has NO ported grouped-GEMM MoE path:
         // moe_fp8_grouped_gemm is a compile stub (kernels/strix-hip/.../
         // moe_fp8_grouped_gemm.cu writes nothing) and the grouped prefill
@@ -170,7 +195,7 @@ impl MoeLayer {
             };
         }
 
-        // ── Shared expert on secondary stream (overlaps with routed path) ──
+        // ── Shared expert ──
         // Shared expert only reads `input` and writes to separate buffers
         // (ssm_deinterleaved, ssm_qkvz, attn_output) — no data conflict
         // with the routed expert path.  In profile mode, run sequentially
@@ -180,24 +205,69 @@ impl MoeLayer {
         // e.g. Qwen3-VL-30B which has no shared_expert_intermediate_size).
         // Launching kernels with N=0 produces CUDA_ERROR_INVALID_VALUE (grid.x=0).
         let has_shared = shared_inter > 0;
-        let use_overlap = false; // disabled: dual-stream contention worsens LPDDR5X bandwidth
-        let aux = if use_overlap {
-            self.prefill_stream
-        } else {
-            stream
+        let is_ep_prefill = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+        let defer_shared_hc = defer_shared_hc
+            && has_shared
+            && is_ep_prefill
+            && num_tokens == 5
+            && ctx.config.model_type == "glm5_next";
+        // Overlapping shared and routed GEMMs regresses on unified-memory GB10
+        // because both streams compete for LPDDR5X bandwidth. In EP mode there
+        // is a better pairing: defer the shared GEMMs until routed work is done,
+        // then overlap them with the routed-output NCCL all-reduce. Keep graph
+        // capture and profiling sequential; both require deterministic stream
+        // ownership/timing.
+        // Sequence-parallel prefill (`layers::glm_sp`): routed experts run every
+        // row; the shared expert and its blend run only this rank's rows, and
+        // the EP all-reduce becomes a reduce-scatter into them.
+        let sp = crate::layers::glm_sp::current().filter(|sp| {
+            is_ep_prefill
+                && num_tokens == 2 * sp.rows
+                && matches!(mode, super::forward_pair_verify::PrefillMode::Legacy)
+        });
+        let (shared_in, shared_n) = match sp {
+            Some(sp) => (sp.local(input, h as usize), sp.rows as u32),
+            None => (input, n),
         };
+        let overlap_shared_reduce = has_shared
+            && is_ep_prefill
+            && num_tokens > 64
+            && !ctx.graph_capture
+            && !ctx.profile
+            && std::env::var("ATLAS_MOE_SHARED_REDUCE_OVERLAP").as_deref() == Ok("1");
 
-        if has_shared {
-            self.run_shared_expert_prefill(
-                input,
-                n,
-                h,
-                shared_inter,
-                aux,
-                stream,
-                use_overlap,
-                ctx,
-            )?;
+        // `ATLAS_GLM_SHARED_TP_SPLIT=1`: with rows replicated on both ranks
+        // (decode / verify), each rank computes half the shared expert's
+        // intermediate columns and blends that partial before the EP
+        // all-reduce, which sums the halves; each rank reads half the weights.
+        let split = has_shared
+            && is_ep_prefill
+            && sp.is_none()
+            && !overlap_shared_reduce
+            && !defer_shared_hc
+            && matches!(mode, super::forward_pair_verify::PrefillMode::Legacy)
+            && self.shared_split_ready(ctx, n);
+        if split {
+            self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
+        } else if has_shared && !overlap_shared_reduce {
+            match mode {
+                super::forward_pair_verify::PrefillMode::PairVerify(shared) => {
+                    self.run_pair_shared(input, ctx, stream, shared)?
+                }
+                super::forward_pair_verify::PrefillMode::OwnerVerify(shape) => {
+                    self.run_verify_shared_rows(input, ctx, stream, shape.rows(), shape.rows())?
+                }
+                super::forward_pair_verify::PrefillMode::Legacy => self.run_shared_expert_prefill(
+                    shared_in,
+                    shared_n,
+                    h,
+                    shared_inter,
+                    stream,
+                    stream,
+                    false,
+                    ctx,
+                )?,
+            }
         }
         prof_step!("shared_expert");
 
@@ -233,6 +303,16 @@ impl MoeLayer {
                 h,
                 stream,
             )?;
+        } else if self.independent_grouped(ctx, n) {
+            self.independent_router_logits(router_in, gate_logits, n as usize, ctx, stream)?;
+        } else if self.glm_c3_grouped(ctx, n) {
+            // Preserve forward_k3's router logits and expert weights exactly;
+            // the experiment changes routed activation precision, not routing.
+            self.c3_router_logits(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
+        } else if self.glm_c2_grouped(ctx, n) {
+            self.independent_router_logits(router_in, gate_logits, 2, ctx, stream)?;
+        } else if self.glm_c4_grouped(ctx, n) {
+            self.c4_router_logits(router_in, gate_logits, ctx, stream)?;
         } else {
             // Selection numerics — see router_gate_gemm_dense for why this
             // must stay on the scalar kernel and why ATLAS_CUBLAS_GEMM must
@@ -412,6 +492,7 @@ impl MoeLayer {
             num_tokens,
             ne,
             &mut t0,
+            mode,
             ctx,
             stream,
         )?;
@@ -423,6 +504,7 @@ impl MoeLayer {
             sorted_token_ids,
             total_expanded,
             token_to_perm,
+            indices_dev,
             weights_dev,
             h,
             n,
@@ -430,10 +512,14 @@ impl MoeLayer {
             num_tokens,
             has_shared,
             use_overlap,
+            sp,
+            split,
+            overlap_shared_reduce,
+            shared_in,
+            shared_n,
+            defer_shared_hc,
             ctx,
             stream,
         )?;
 
         Ok(())
-    }
-}

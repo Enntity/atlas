@@ -11,6 +11,7 @@ use axum::response::Response;
 use std::sync::Arc;
 
 use crate::AppState;
+use crate::tokenizer::Glm5VisionPlaceholder;
 
 use super::super::compact::{compact_messages, openai_error_response};
 use super::msg_entry::MsgEntry;
@@ -31,6 +32,7 @@ pub(super) fn render_template(
     tools: &[crate::tool_parser::ToolDefinition],
     messages: &[MsgEntry],
     image_pad_counts: &[usize],
+    vision_placeholders: &[Glm5VisionPlaceholder],
     enable_thinking: bool,
     thinking_budget: Option<u32>,
     reasoning_effort: Option<crate::ir::ReasoningEffort>,
@@ -107,8 +109,25 @@ pub(super) fn render_template(
         }
     };
 
-    // Expand image pads when needed.
-    let prompt_tokens = if image_pad_counts.iter().any(|&c| c > 1) {
+    // GLM-5's shipped template intentionally emits canonical compact marker
+    // triples. Its checkpoint processor leaves the rendered text unchanged;
+    // expand those triples here so every image/video encoder row has a
+    // matching input token. Other model families keep the legacy pad-only
+    // expansion below.
+    let prompt_tokens = if !vision_placeholders.is_empty() {
+        match state
+            .tokenizer
+            .expand_glm5_vision_placeholders(prompt_tokens, vision_placeholders)
+        {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                return Err(openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("GLM-5 vision placeholder error: {e}"),
+                ));
+            }
+        }
+    } else if image_pad_counts.iter().any(|&c| c > 1) {
         state
             .tokenizer
             .expand_vision_pads(prompt_tokens, image_pad_counts)
@@ -116,11 +135,40 @@ pub(super) fn render_template(
         prompt_tokens
     };
 
-    // Template-forced thinking detection.
-    let (enable_thinking, thinking_budget) = if let Some(think_start) = state.think_start_token_id {
+    let (enable_thinking, thinking_budget) = reconcile_prompt_thinking(
+        &prompt_tokens,
+        state.think_start_token_id,
+        state.think_end_token_id,
+        enable_thinking,
+        thinking_budget,
+        state.behavior.max_thinking_budget,
+    );
+
+    Ok(TemplateOut {
+        prompt_tokens,
+        enable_thinking,
+        thinking_budget,
+    })
+}
+
+fn reconcile_prompt_thinking(
+    prompt_tokens: &[u32],
+    think_start_token_id: Option<u32>,
+    think_end_token_id: Option<u32>,
+    enable_thinking: bool,
+    thinking_budget: Option<u32>,
+    max_thinking_budget: u32,
+) -> (bool, Option<u32>) {
+    if let Some(think_start) = think_start_token_id {
+        // An explicit empty reasoning suffix has already closed thinking before
+        // generation (GLM tools). Do not mistake a historical pair followed by
+        // another assistant header or prompt text for this terminal boundary.
+        if think_end_token_id.is_some_and(|end| prompt_tokens.ends_with(&[think_start, end])) {
+            return (false, None);
+        }
         let tail = &prompt_tokens[prompt_tokens.len().saturating_sub(8)..];
         let last_start = tail.iter().rposition(|t| *t == think_start);
-        let has_unclosed_think = match (last_start, state.think_end_token_id) {
+        let has_unclosed_think = match (last_start, think_end_token_id) {
             (Some(si), Some(end_tok)) => !tail[si + 1..].contains(&end_tok),
             (Some(_), None) => true,
             (None, _) => false,
@@ -129,22 +177,20 @@ pub(super) fn render_template(
             tracing::info!(
                 "Template-forced thinking detected (unclosed \\<think\\> in prompt tail) — \
                  overriding enable_thinking=true with budget={}",
-                state.behavior.max_thinking_budget,
+                max_thinking_budget,
             );
-            (true, Some(state.behavior.max_thinking_budget))
+            (true, Some(max_thinking_budget))
         } else {
             (enable_thinking, thinking_budget)
         }
     } else {
         (enable_thinking, thinking_budget)
-    };
-
-    Ok(TemplateOut {
-        prompt_tokens,
-        enable_thinking,
-        thinking_budget,
-    })
+    }
 }
+
+#[cfg(test)]
+#[path = "template_thinking_tests.rs"]
+mod thinking_tests;
 
 /// Build the Jinja-facing JSON message array from the processed
 /// [`MsgEntry`] vec. Pure (no tokenizer/state) so it can be

@@ -32,6 +32,10 @@ impl TransformerModel {
         use_mrope: bool,
         needs_paged: bool,
         midcap: Option<&super::midchunk_capture::MidCapturePlan>,
+        mut passengers: Option<(
+            &mut crate::model::glm_fused_chunk::Passengers<'_, '_>,
+            &crate::model::glm_fused_chunk::PassengerRun,
+        )>,
         stream: u64,
     ) -> Result<()> {
         let h = self.config.hidden_size;
@@ -67,11 +71,26 @@ impl TransformerModel {
             self.buffers.lora_seq_slot(),
             stream,
         )?;
+        // Riding verify owners: positions and slots cover every row.
+        let (positions_dev, positions_h_dev, positions_w_dev, slot_dev) = match &passengers {
+            Some((_, run)) => (
+                run.positions[0],
+                run.positions[1],
+                run.positions[2],
+                run.slots,
+            ),
+            None => (
+                meta_base,
+                positions_h_dev,
+                positions_w_dev,
+                meta_base.offset(slot_offset),
+            ),
+        };
         let attn_metadata = AttnMetadataDev {
-            positions: meta_base,
+            positions: positions_dev,
             positions_h: positions_h_dev,
             positions_w: positions_w_dev,
-            slot: meta_base.offset(slot_offset),
+            slot: slot_dev,
             seq_len: seq_len_dev,
             block_table: block_table_dev,
             max_blocks_per_seq: seq.block_table.len() as u32,
@@ -103,6 +122,7 @@ impl TransformerModel {
         });
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -174,6 +194,11 @@ impl TransformerModel {
         let t_loop = host_timing.then(std::time::Instant::now);
         let mut t_in_prefill = std::time::Duration::ZERO;
         let mut t_dflash = std::time::Duration::ZERO;
+        // Sequence-parallel chunk: each rank runs the row-local work over half
+        // the rows (`layers::glm_sp`); the last layer leaves this rank's rows
+        // of the contracted `hidden`, gathered below.
+        let sp = self.glm_prefill_sp_rows(proc_count, passengers.is_some() || use_decode_path || midcap.is_some(), &ctx);
+        let sp_scope = sp.map(crate::layers::glm_sp::enter);
         for (i, layer) in self.layers.iter().enumerate() {
             let t_pf = host_timing.then(std::time::Instant::now);
             let lt0 = if profile_now {
@@ -182,7 +207,22 @@ impl TransformerModel {
             } else {
                 None
             };
-            if use_decode_path {
+            if let Some((p, run)) = passengers.as_mut() {
+                anyhow::ensure!(!use_decode_path, "GLM fused chunk needs the prefill path");
+                let mut owners = TransformerModel::glm_passenger_owners(p, run, i);
+                layer
+                    .prefill_with_glm_passengers(
+                        hidden,
+                        proc_count,
+                        seq.layer_states[i].as_mut(),
+                        effective_seq_len_start,
+                        &mut owners,
+                        kv_cache,
+                        &ctx,
+                        stream,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Fused chunk layer {i} failed: {e}"))?;
+            } else if use_decode_path {
                 layer
                     .decode(
                         hidden,
@@ -231,6 +271,21 @@ impl TransformerModel {
                 proc_count,
                 stream,
             )?;
+            // Riding owners' rows land in their stable hidden-save slots, as
+            // after an owner-batched verify.
+            if let Some((p, run)) = passengers.as_ref()
+                && let Some(regions) = run.save_slots.as_deref()
+            {
+                let n = p.seqs.len();
+                let offs: Vec<usize> = (0..n).map(|o| proc_count + o * p.rows).collect();
+                self.try_dflash_capture_batched_at(
+                    i,
+                    &vec![p.rows; n],
+                    &offs,
+                    Some(regions),
+                    stream,
+                )?;
+            }
             if let Some(t) = t_df {
                 t_dflash += t.elapsed();
             }
@@ -340,6 +395,10 @@ impl TransformerModel {
                     &vals[..2.min(vals.len())]
                 );
             }
+        }
+        drop(sp_scope);
+        if let Some(sp) = sp {
+            sp.all_gather(hidden, self.config.hidden_size, &ctx, stream)?;
         }
         if let Some(t) = t_loop {
             let wall = t.elapsed();
