@@ -28,6 +28,10 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+#[cfg(test)]
+#[path = "glm_ssm_normalization_tests.rs"]
+mod glm_ssm_normalization_tests;
+
 impl TransformerModel {
     pub(super) fn vocab_size_dispatch(&self) -> usize {
         self.config.vocab_size
@@ -173,6 +177,15 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<()> {
         use spark_runtime::kernel_args::KernelLaunch;
+
+        // GLM's reference KDA recurrence does not clamp its recurrent state.
+        // Keep the upstream policy unless this semantic experiment explicitly
+        // opts out; never change normalization for another model family.
+        if self.config.model_type == "glm5_next"
+            && std::env::var("ATLAS_GLM_SSM_NORMALIZE").as_deref() == Ok("0")
+        {
+            return Ok(());
+        }
 
         let num_ssm = self.ssm_pool.num_ssm_layers;
         if num_ssm == 0 || self.ssm_state_norm_kernel.0 == 0 {

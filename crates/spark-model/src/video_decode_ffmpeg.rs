@@ -30,7 +30,15 @@
 //! - **`-nostdin`, and stdin is the pipe** — ffmpeg cannot reach for a
 //!   terminal or block waiting on one.
 //! - **Frame count** capped with `-frames:v`, so a long clip cannot decode
-//!   forever.
+//!   forever — but the cap is applied to a plan that SPANS the clip
+//!   ([`crate::video_sample`]) rather than to a fixed-rate walk that would
+//!   stop `max_frames / fps` seconds in. See [`decode_frames`].
+//! - **Duration probed first**, with ffprobe, because a plan that covers the
+//!   whole clip has to know where the clip ends. A duration that cannot be
+//!   determined is an ERROR, never a silent fallback to the first frames.
+//! - **Decoded pixel memory** bounded by scaling each frame before it is read
+//!   back: the PNG-size cap bounds what is READ from the pipe, not what the
+//!   returned `Vec<RgbImage>` holds once it is parsed.
 //! - **Output size** capped while reading, and the child is killed the moment
 //!   the cap is passed.
 //! - **Wall clock** capped by a watchdog that kills the child; a decoder that
@@ -43,8 +51,11 @@
 use anyhow::{Context, Result, bail, ensure};
 use image::RgbImage;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+
+use crate::video_sample::{grid_step, sample_plan, wanted_frames};
 
 /// Operator policy for subprocess decoding.
 #[derive(Debug, Clone)]
@@ -53,21 +64,44 @@ pub struct FfmpegPolicy {
     /// Binary to run. A name is resolved on PATH; an absolute path is used
     /// as given, so a deployment can pin a known build.
     pub binary: String,
+    /// ffprobe binary, used to determine the clip's duration. Defaults to
+    /// `ffprobe`, which ships with ffmpeg; when that is not on PATH a sibling
+    /// of [`Self::binary`] named `ffprobe` is tried before giving up.
+    pub probe_binary: String,
     pub max_frames: usize,
     pub max_output_bytes: usize,
     pub timeout_secs: u64,
+    /// Frames per second to sample at. The plan never exceeds it; a clip short
+    /// enough for the frame cap is sampled at its OWN rate, so motion the cap
+    /// can hold is not discarded.
+    pub fps: f32,
+    /// Ceiling, in pixels, on one decoded frame's area. Each planned frame is
+    /// scaled to fit BEFORE it is read back as RGB, which is what bounds the
+    /// returned frame collection at `max_frames × max_decoded_pixels`.
+    pub max_decoded_pixels: usize,
 }
+
+/// Default decoded-frame area cap: 640×640.
+///
+/// At the 768-frame default this bounds the returned RGB at ~0.9 GiB
+/// (768 × 640 × 640 × 3) where a 3840×2160 clip would otherwise cost ~10 GiB
+/// inside a request. Well above the vision grid the preprocessor builds from
+/// a frame, so it costs no resolution the encoder would have seen.
+const DEFAULT_MAX_DECODED_PIXELS: usize = 640 * 640;
 
 impl Default for FfmpegPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
             binary: "ffmpeg".to_string(),
+            probe_binary: "ffprobe".to_string(),
             max_frames: 768,
             // 768 frames of 1280x720 PNG is comfortably under this; it exists
             // to bound a pathological stream, not to size a normal one.
             max_output_bytes: 512 * 1024 * 1024,
             timeout_secs: 120,
+            fps: 2.0,
+            max_decoded_pixels: DEFAULT_MAX_DECODED_PIXELS,
         }
     }
 }
@@ -121,27 +155,267 @@ pub fn probe(policy: &FfmpegPolicy) -> Availability {
     }
 }
 
-/// Decode `bytes` to RGB frames sampled at `target_fps`.
+/// Decode `bytes` to RGB frames that SPAN the clip.
 ///
-/// ffmpeg performs the temporal sampling itself (`-vf fps=`), which is both
-/// faster and more accurate than decoding everything and discarding most of
-/// it — and it means the caller does not have to know the source frame rate.
-/// The returned frames are therefore ALREADY at `target_fps`.
+/// The clip's duration and native frame rate are probed first, a plan is
+/// derived that covers the whole duration at no more than `target_fps`, and
+/// ffmpeg is asked for exactly those frames. The result does not carry
+/// timestamps here — [`decode_with_plan`] is the form callers that need them
+/// (the preprocessor, for the prompt's per-group times) should use.
 pub fn decode_frames(
     bytes: &[u8],
     target_fps: f32,
     policy: &FfmpegPolicy,
 ) -> Result<Vec<RgbImage>> {
+    Ok(decode_with_plan(bytes, target_fps, policy)?.0)
+}
+
+/// What a probe found, or the error that says it could not be determined.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClipTiming {
+    /// Duration in seconds, from the container.
+    pub duration_secs: f32,
+    /// The video stream's own rate: an average when the container declares
+    /// one, otherwise the instantaneous rate. Used only to plan coverage.
+    pub native_fps: f32,
+}
+
+/// Decode `bytes` to RGB frames spanning the clip, plus the plan that
+/// produced them.
+///
+/// The returned timestamps are the times, in source seconds, of the frames
+/// that came back — indexed exactly like the frames, so callers derive their
+/// own group timestamps from the frames they actually kept rather than from
+/// an assumed constant rate.
+pub fn decode_with_plan(
+    bytes: &[u8],
+    target_fps: f32,
+    policy: &FfmpegPolicy,
+) -> Result<(Vec<RgbImage>, Vec<f32>)> {
     ensure!(
         policy.enabled,
         "this container needs ffmpeg to decode and subprocess decoding is disabled; \
          pass --video-allow-ffmpeg to enable it, or send an animated GIF"
     );
+    // Check the decoder BEFORE probing the clip. Otherwise a missing binary
+    // surfaces as an unprobeable clip, which sends the operator hunting for a
+    // corrupt video when the real fix is to install ffmpeg. `probe` names the
+    // binary and the remedy.
+    if let Availability::Missing(detail) = probe(policy) {
+        anyhow::bail!(
+            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
+             could not run) — install ffmpeg with its ffprobe companion, or point \
+             --video-ffmpeg-path at a usable build"
+        );
+    }
+    // A caller that passes a usable rate wins; anything else falls back to the
+    // policy's, which is the operator's SSOT for video sampling.
+    let policy_fps = crate::video_sample::finite_positive(policy.fps)
+        .unwrap_or(crate::video_preprocess::DEFAULT_FPS);
     let fps = if target_fps.is_finite() && target_fps > 0.0 {
         target_fps
     } else {
-        2.0
+        policy_fps
     };
+
+    let timing = probe_duration(bytes, policy)?;
+    let want = wanted_frames(
+        timing.duration_secs,
+        timing.native_fps,
+        fps,
+        policy.max_frames,
+        fps,
+    );
+    // The plan converts the frame COUNT into evenly spaced positions across
+    // the probed duration — this, and not the frame count, is what makes the
+    // samples cover the whole clip instead of stopping `cap / fps` seconds in.
+    let plan = sample_plan(want, timing.duration_secs)?;
+    // The grid runs at the SOURCE rate, subdivided so the selector's indices
+    // land on a dense-enough grid to name the plan's positions. The coverage
+    // bound the operator's `fps` represents is enforced by how MANY samples
+    // the plan asks for, not by ffmpeg dropping the rest — which is exactly
+    // the distinction the old `fps=` filter could not make.
+    let native = crate::video_sample::finite_positive(timing.native_fps).unwrap_or(fps);
+    let step = grid_step(native, fps, fps);
+    // `fps=A/B` samples one frame every `B/A` seconds, so the frame the
+    // selector names for index K is the grid frame at time `K × B/A`.
+    let grid = format!("fps={native}/{step}");
+    let frames = run_ffmpeg(bytes, &plan, &grid, policy)?;
+
+    // The frame-bearing timestamps come from the plan, clipped to the frames
+    // that were actually produced: a container whose last frame lands earlier
+    // than its declared duration must not be reported with timestamps for
+    // frames the model never received.
+    let times = plan.times.iter().copied().take(frames.len()).collect();
+    Ok((frames, times))
+}
+
+/// Resolve the ffprobe binary to use.
+///
+/// `probe_binary` is the configured name/path. When it cannot be run at all
+/// (a deployment that pinned `ffmpeg` to an absolute path and has no
+/// `ffprobe` on PATH), the sibling of the configured `ffmpeg` binary is tried
+/// — that is where a packaged install keeps it. Never guesses past those two.
+fn probe_command(policy: &FfmpegPolicy) -> Command {
+    let configured = Path::new(&policy.probe_binary);
+    let sibling = Path::new(&policy.binary).parent().map(|d| d.join("ffprobe"));
+    let mut cmd = Command::new(&policy.probe_binary);
+    // Only swap to the sibling when the configured name is not an absolute
+    // path that exists and the sibling does: otherwise the operator's choice
+    // is authoritative and the failure should name it.
+    if !configured.is_file()
+        && let Some(sib) = sibling
+        && sib.is_file()
+    {
+        cmd = Command::new(sib);
+    }
+    cmd
+}
+
+/// Read the clip's duration and native frame rate.
+///
+/// A plan that covers the whole clip has to know where the clip ends, so this
+/// is a hard prerequisite: an unprobeable duration is an explicit error
+/// naming `duration`, never a silent fall back to sampling the first frames
+/// (which is the bug this module exists to remove). Duration comes from the
+/// container's `format` entry; the rate is the stream's average when declared,
+/// otherwise its instantaneous rate — used only to plan coverage, and NOT as a
+/// substitute for a duration that could not be read.
+fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<ClipTiming> {
+    let mut child = probe_command(policy)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "format=duration:stream=avg_frame_rate,r_frame_rate",
+            "-of",
+            "default=nw=1",
+            "pipe:0",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "could not run {:?} to determine the clip's duration — is ffprobe installed \
+                 and on PATH? (it ships with ffmpeg; set --video-ffmpeg-path to a build that \
+                 has it)",
+                policy.probe_binary
+            )
+        })?;
+
+    // Same reason ffmpeg's input is fed on a thread: the child writes its
+    // report while still draining stdin, so a write-then-read sequence can
+    // deadlock on a large container.
+    let mut stdin = child.stdin.take().context("no ffprobe stdin pipe")?;
+    let input = bytes.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+        drop(stdin);
+    });
+
+    let mut out = Vec::new();
+    let read_res = child
+        .stdout
+        .take()
+        .context("no ffprobe stdout pipe")?
+        .read_to_end(&mut out);
+
+    // Bound the wait the same way the decoder is bounded: a probe that hangs
+    // must not hold a request thread. The watchdog kills the child, which
+    // closes its stdout and releases the reader above.
+    let mut err_text = String::new();
+    let status = {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(policy.timeout_secs.max(1));
+        loop {
+            match child.try_wait().context("waiting for ffprobe")? {
+                Some(s) => break s,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "probing the clip's duration exceeded {}s and was stopped",
+                        policy.timeout_secs
+                    );
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+    };
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut err_text);
+    }
+    let _ = writer.join();
+    read_res.context("reading the ffprobe report")?;
+
+    let text = String::from_utf8_lossy(&out);
+    let field = |name: &str| -> Option<String> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix('=').map(str::to_string))
+    };
+
+    let duration = field("duration")
+        .and_then(|v| v.parse::<f32>().ok())
+        .and_then(crate::video_sample::finite_positive);
+    let Some(duration_secs) = duration else {
+        let why = err_text.lines().next_back().unwrap_or("no detail").trim();
+        // The binary itself was checked before this point, so a probe that
+        // cannot read the payload means the payload is not a decodable video.
+        // Say which of the two it is instead of leaving that to be guessed.
+        bail!(
+            "decoder failed: the clip's duration could not be determined, so there is no span to \
+             sample across (ffprobe exited {status}: {why}) — the payload may not be a decodable \
+             video at all"
+        );
+    };
+
+    // The rate picks a grid; when the container gives none the plan falls back
+    // to the operator's fps, which is a sampling decision rather than a claim
+    // about the container. It is never used in place of the duration.
+    let native_fps = ["avg_frame_rate", "r_frame_rate"]
+        .into_iter()
+        .find_map(|k| field(k))
+        .and_then(|v| parse_rate(&v))
+        .and_then(crate::video_sample::finite_positive)
+        .unwrap_or(policy.fps);
+
+    Ok(ClipTiming {
+        duration_secs,
+        native_fps,
+    })
+}
+
+/// Parse ffprobe's `num/den` frame-rate form. Returns `None` for `0/0` and
+/// other degenerate rates rather than dividing by zero.
+fn parse_rate(s: &str) -> Option<f32> {
+    let (num, den) = s.trim().split_once('/')?;
+    let num: f32 = num.trim().parse().ok()?;
+    let den: f32 = den.trim().parse().ok()?;
+    (den != 0.0).then(|| num / den)
+}
+
+/// Spawn ffmpeg with the plan's filter and collect the frames.
+///
+/// Split out so the argument construction (the part with the correctness
+/// claims: `select` instead of a bare `fps`, and a `scale` that bounds decoded
+/// RGB) is readable on its own.
+fn run_ffmpeg(
+    bytes: &[u8],
+    plan: &crate::video_sample::SamplePlan,
+    grid: &str,
+    policy: &FfmpegPolicy,
+) -> Result<Vec<RgbImage>> {
+    // `select` first, `scale` after: at most `plan.len()` frames are ever
+    // scaled, and the scale is what caps the RGB the returned Vec holds.
+    let filter = format!(
+        "{grid},{},scale='min({px},iw)':'min({px},ih)':force_original_aspect_ratio=decrease",
+        plan.select_filter(),
+        px = policy.max_decoded_pixels.max(1),
+    );
 
     let mut child = Command::new(&policy.binary)
         .args([
@@ -153,9 +427,9 @@ pub fn decode_frames(
             "-i",
             "pipe:0",
             "-vf",
-            &format!("fps={fps}"),
+            &filter,
             "-frames:v",
-            &policy.max_frames.to_string(),
+            &plan.len().to_string(),
             "-f",
             "image2pipe",
             "-vcodec",

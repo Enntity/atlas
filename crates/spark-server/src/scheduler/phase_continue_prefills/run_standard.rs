@@ -37,6 +37,9 @@ pub(super) fn run_standard_chunk_loop(
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     completed_indices: &mut Vec<(usize, Option<u32>)>,
     did_mixed_step: &mut bool,
+    max_batch_tokens: usize,
+    spec: &super::SpecStep,
+    rode: &mut Vec<usize>,
 ) {
     // TQ+ InnerQ: poll once per chunk to see if calibration has banked
     // enough K² stats to finalize scales. The driver itself is idempotent
@@ -55,7 +58,8 @@ pub(super) fn run_standard_chunk_loop(
     // silently corrupts attention output. Force single-chunk until a
     // paged-MLA prefill kernel lands. Hurts cold TTFT on long MLA
     // prompts but preserves correctness.
-    let effective_max = if model.is_mla() {
+    let force_single_chunk = model.is_mla() && !model.supports_chunked_mla();
+    let effective_max = if force_single_chunk {
         remaining
     } else {
         max_prefill_tokens
@@ -66,7 +70,7 @@ pub(super) fn run_standard_chunk_loop(
     // is a no-op and the chunk cap is unchanged (byte-identical resting path).
     // MLA keeps its forced full-remaining chunk (correctness gate above) — the
     // slice budget never applies there.
-    let cap = if model.is_mla() {
+    let cap = if force_single_chunk {
         effective_max
     } else {
         effective_max.min(slice_budget)
@@ -244,9 +248,33 @@ pub(super) fn run_standard_chunk_loop(
         return;
     }
 
+    // ── Fused: the active DFlash owners' verify rows ride this chunk ──
+    let verify_ctx = sched.verify_logits_ctx(
+        think_end_token,
+        think_start_token,
+        tool_call_start_token,
+        tool_call_end_token,
+    );
+    if super::run_fused::try_fused_chunk(
+        model,
+        p,
+        idx,
+        active,
+        chunk_len,
+        max_batch_tokens,
+        spec,
+        &verify_ctx,
+        sched,
+        completed_indices,
+        rode,
+    ) {
+        return;
+    }
+
     // ── Standard path: prefill chunk only, decode separately ──
     // EP: broadcast chunk tokens to worker (bulk, single NCCL op).
     let ep_ok = (|| -> Result<()> {
+        model.ep_broadcast_disable_mtp_for_seq(p.seq.slot_idx as u32, p.disable_mtp)?;
         model.ep_broadcast_cmd_for_seq(p.seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(chunk_len as u32)?;
         model.ep_broadcast_cmd(p.chunk_offset as u32)?;
@@ -321,7 +349,9 @@ pub(super) fn run_standard_chunk_loop(
                 p.prompt_tokens.len(),
             );
             // Normalize SSM states after EVERY chunk to prevent state drift.
-            if let Err(e) = model.normalize_ssm_states(&p.seq, prefill_stream) {
+            if let Err(e) =
+                super::super::prefill_normalization::continuation(model, &p.seq, prefill_stream)
+            {
                 tracing::warn!("SSM state normalization failed: {e:#}");
             }
             if is_last {

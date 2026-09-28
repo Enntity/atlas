@@ -85,11 +85,84 @@ pub fn diag_norm_f32(
     );
 }
 
-// The `OnceLock<bool>` static that lived here is now
-// `layers::ops::ModelLevers::gemma4_diag`, resolved when the model is built
-// and carried on `ForwardContext`.
+#[path = "trait_impl/state.rs"]
+mod state;
 
 impl TransformerLayer for Qwen3AttentionLayer {
+    fn validate_glm_owner_verify(
+        &self,
+        ctx: &ForwardContext,
+        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate_verify_mla(
+            ctx,
+            crate::layer::glm_verify_ffn::GlmVerifyFfn::Owners(shape),
+            stream,
+        )
+    }
+
+    fn decode_glm_owner_verify(
+        &self,
+        owners: &mut [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>],
+        cache: &mut PagedKvCache,
+        workspace: &mut crate::layer::glm_owner_verify::GlmOwnerBatchWorkspace,
+        ctx: &[&ForwardContext],
+        stream: u64,
+    ) -> Result<()> {
+        let mode = crate::layer::glm_verify_ffn::GlmVerifyFfn::Owners(workspace.shape());
+        self.decode_verify_mla(owners, cache, &mut workspace.scratch, ctx, mode, stream)
+    }
+
+    fn decode_glm_long_owners(
+        &self,
+        owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        cache: &mut PagedKvCache,
+        stage: &crate::layer::glm_long_owner::GlmLongStage,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_glm_long_owners_mla(owners, cache, stage, ctx, stream)
+    }
+
+    fn prefill_with_glm_passengers(
+        &self,
+        _hidden: DevicePtr,
+        num_tokens: usize,
+        _state: &mut dyn LayerState,
+        seq_len_start: usize,
+        passengers: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
+        cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_glm_passengers_mla(num_tokens, seq_len_start, passengers, cache, ctx, stream)
+    }
+
+    fn supports_glm_pair_verify(&self) -> bool {
+        self.pair_mla_supported()
+    }
+
+    fn validate_glm_pair_verify(
+        &self,
+        ctx: &ForwardContext,
+        mode: crate::layer::glm_pair_verify::GlmPairFfn,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate_pair_mla(ctx, mode, stream)
+    }
+
+    fn decode_glm_pair_verify(
+        &self,
+        owners: [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>; 2],
+        cache: &mut PagedKvCache,
+        workspace: &mut crate::layer::glm_pair_verify::GlmPairWorkspace,
+        ctx: [&ForwardContext; 2],
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_pair_mla(owners, cache, workspace, ctx, stream)
+    }
+
     fn uses_local_mla_prefill(&self) -> bool {
         self.mla.is_some()
     }
@@ -102,6 +175,22 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.fp8_calibration
             .as_ref()
             .map(|cal| !cal.is_calibrating())
+    }
+
+    fn supports_mla_kv_only(&self) -> bool {
+        self.mla.as_ref().is_some_and(|mla| mla.rope == 0)
+    }
+
+    fn prefill_mla_kv_only(
+        &self,
+        hidden: DevicePtr,
+        num_tokens: usize,
+        kv_cache: &mut PagedKvCache,
+        slots: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        self.prefill_mla_kv_only_impl(hidden, num_tokens, kv_cache, slots, ctx, stream)
     }
 
     /// An indexer vetoes decode-graph capture: its ingest counter is host
@@ -377,23 +466,9 @@ impl TransformerLayer for Qwen3AttentionLayer {
         Ok(Box::new(crate::layer::AttnLayerState::default()))
     }
 
-    /// Release the QSA indexer carry: ~2.5 MB per sequence on each of the 12
-    /// full-attention layers, which is the bulk of the ~30 MB per request that
-    /// used to leak (see `TransformerLayer::free_state`).
+    /// Release the per-sequence QSA indexer carry.
     fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn LayerState) -> Result<()> {
-        let Some(qsa) = self.qsa.as_ref() else {
-            return Ok(());
-        };
-        let Some(attn) = state
-            .as_any_mut()
-            .downcast_mut::<crate::layer::AttnLayerState>()
-        else {
-            return Ok(());
-        };
-        if let Some(st) = attn.qsa.as_mut() {
-            qsa.free_seq_state(st, gpu)?;
-        }
-        Ok(())
+        state::free_attention_state(self, gpu, state)
     }
 
     fn transpose_moe_for_prefill(
@@ -479,18 +554,5 @@ impl TransformerLayer for Qwen3AttentionLayer {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use spark_runtime::gpu::mock::MockGpuBackend;
-
-    #[test]
-    fn test_alloc_state_returns_empty() {
-        let gpu = MockGpuBackend::new();
-        assert!(gpu.kernel("norm", "rms_norm").is_ok());
-        assert!(gpu.kernel("rope", "rope_forward").is_ok());
-        assert!(
-            gpu.kernel("paged_decode_fp8", "paged_decode_attn_fp8")
-                .is_ok()
-        );
-    }
-}
+#[path = "trait_impl/state_tests.rs"]
+mod tests;

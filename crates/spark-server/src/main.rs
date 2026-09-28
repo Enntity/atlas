@@ -30,7 +30,10 @@ mod citation_structured;
 mod cli;
 mod conversation_store;
 mod disk_guard;
+mod ep_peer_lifeline;
 mod error_hints;
+mod glm_terminal_session;
+mod glm_tool_boundary;
 pub mod grammar;
 mod halluc_probe;
 mod hint_injector;
@@ -70,18 +73,48 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::cli::{Cli, Command};
-use crate::main_modules::serve;
+use crate::main_modules::serve::serve_supervised as serve;
 
 pub(crate) use crate::main_modules::AppState;
 
 /// Re-export for convenience in api.rs / anthropic.rs.
 pub type ModelBehavior = atlas_kernels::ModelBehavior;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    glm_terminal_session::install_panic_ingress();
+    let cli = Cli::parse();
+    // FD3/startup-file ownership must be resolved before Tokio creates threads.
+    let selected = match glm_terminal_session::startup::SelectedStartup::receive(&cli) {
+        Ok(selected) => selected,
+        Err(error) => {
+            eprintln!("paired startup refused: {error:#}");
+            glm_terminal_session::terminate()
+        }
+    };
+    let paired = selected.is_some();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build();
+    let runtime = match runtime {
+        Ok(runtime) => runtime,
+        Err(error) if !paired => return Err(error.into()),
+        Err(_) => glm_terminal_session::terminate(),
+    };
+    let result = runtime.block_on(run(cli, selected));
+    if paired {
+        // A selected success is nonreturning paired release, never main cleanup.
+        glm_terminal_session::terminate();
+    }
+    result
+}
+
+async fn run(
+    cli: Cli,
+    selected: Option<glm_terminal_session::startup::SelectedStartup>,
+) -> Result<()> {
+    let paired = selected.is_some();
     // Parse BEFORE subscriber install so the TUI gate can see `--no-tui`.
     // clap emits no tracing events, so plain-mode output is unchanged.
-    let cli = Cli::parse();
     let no_tui = match &cli.command {
         // `--check-kernels` is a script's entry point too: it prints a report
         // and a JSON line on stdout and exits, so a dashboard would take the
@@ -126,7 +159,7 @@ async fn main() -> Result<()> {
             cli::bench_run::dispatch(args).await
         }
         Command::Serve(args) => {
-            let serving = serve(args, tui_channels);
+            let serving = serve(args, tui_channels, selected);
             tokio::pin!(serving);
             // Only a SEND means shutdown. The sender is parked for the life of the
             // process rather than dropped when startup ends, so the channel should
@@ -142,6 +175,9 @@ async fn main() -> Result<()> {
             tokio::select! {
                 res = &mut serving => res,
                 reason = &mut shutdown_signal => {
+                    if paired {
+                        glm_terminal_session::terminate();
+                    }
                     // Cancelled before the server came up. Nothing is in flight
                     // and no client is connected, so there is nothing to drain —
                     // the startup task is abandoned where it stands.
@@ -167,6 +203,9 @@ async fn main() -> Result<()> {
             }
         }
     };
+    if paired {
+        glm_terminal_session::terminate();
+    }
     // If serve() returned while the TUI owned the screen (startup error, clean
     // shutdown), stop the dashboard thread and wait for its TerminalGuard to
     // drop BEFORE the error prints — main's exit never runs another thread's

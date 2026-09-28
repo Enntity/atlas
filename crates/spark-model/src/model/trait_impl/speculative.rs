@@ -27,6 +27,9 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+#[path = "mtp_hidden.rs"]
+mod mtp_hidden;
+
 impl TransformerModel {
     pub(super) fn generate_speculative_dispatch(
         &self,
@@ -113,7 +116,8 @@ impl TransformerModel {
         seq: &mut SequenceState,
         ctx: &ForwardContext,
         stream: u64,
-    ) {
+    ) -> anyhow::Result<()> {
+        let diagnostic = self.arm_glm_prompt_trace(seq, ctx, stream)?;
         // Disjoint field borrows: the proposer state is mutated while the
         // token slice is read. Destructuring is what makes that legal, and it
         // avoids cloning a 12k-token vector on every propose.
@@ -125,7 +129,7 @@ impl TransformerModel {
             ..
         } = seq;
         let Some(prop_state) = proposer_state.as_mut() else {
-            return;
+            return Ok(());
         };
         let prompt_len = *prompt_len;
         // ATLAS_MTP_DRAFTER_PREFILL: on the FIRST propose of a sequence,
@@ -172,8 +176,15 @@ impl TransformerModel {
                     ctx,
                     stream,
                 ) {
+                    if diagnostic {
+                        return Err(e);
+                    }
                     tracing::warn!("MTP drafter prefill failed (continuing without): {e:#}");
                 }
+                anyhow::ensure!(
+                    !diagnostic || proposer.drafter_rows(prop_state.as_mut()) == p - 1,
+                    "GLM prompt diagnostic primer did not commit expected rows"
+                );
             } else if carry_on && first_propose && p >= 2 {
                 // WARM turn: adopt the previous turn's drafter KV and append
                 // only this turn's newly-computed span. See `try_carry_drafter`.
@@ -193,6 +204,7 @@ impl TransformerModel {
                 }
             }
         }
+        Ok(())
     }
 
     /// ATLAS_MTP_CARRY_DRAFTER: give the drafter this turn's prompt context on
@@ -290,14 +302,19 @@ impl TransformerModel {
     ) -> Result<()> {
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
-        // Residual stream is always BF16, so the saved hidden is BF16.
-        let fp32 = 2usize;
-        // Save the RAW hidden state (before final_norm), not norm_output.
-        // The MTP head applies its own pre_fc_norm_hidden — passing norm_output
-        // would double-normalize and degrade prediction accuracy.
-        let src = self.buffers.hidden_states().offset(token_idx * h * fp32);
-        self.gpu
-            .copy_d2d_async(src, self.mtp_hidden_save, h * fp32, stream)?;
+        // GLM consumes post-final-norm; other families retain raw hidden.
+        // The verifier's SSM commit touches only state-pool H/conv storage,
+        // so both source tensors are still live when this copy is queued.
+        mtp_hidden::copy_target_hidden_row(
+            self.gpu.as_ref(),
+            &self.config.model_type,
+            self.buffers.hidden_states(),
+            self.buffers.norm_output(),
+            self.mtp_hidden_save,
+            h,
+            token_idx,
+            stream,
+        )?;
         self.last_mtp_hidden_idx
             .store(token_idx, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -331,11 +348,11 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// Batched-verify Phase 2: copy the raw-hidden row `rows[i]` (the
+    /// Batched-verify Phase 2: copy the model-specific hidden row `rows[i]` (the
     /// accepted position of sequence i in the just-run batched verify
     /// forward) into stash slot i, BEFORE any propose clobbers the shared
     /// `hidden_states` buffer (every drafter `forward_one` writes into it —
-    /// mtp_multi.rs). Same RAW-hidden (pre-final-norm) contract as
+    /// mtp_multi.rs). Same model-specific representation contract as
     /// `save_hidden_for_mtp_dispatch`.
     pub(super) fn stash_verify_hidden_rows_dispatch(
         &self,
@@ -354,11 +371,19 @@ impl TransformerModel {
         );
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
-        let bf16 = 2usize; // residual stream is BF16
+        let bf16 = 2usize; // both target representations are BF16
         for (i, &row) in rows.iter().enumerate() {
-            let src = self.buffers.hidden_states().offset(row * h * bf16);
             let dst = self.verify_hidden_stash.offset(i * h * bf16);
-            self.gpu.copy_d2d_async(src, dst, h * bf16, stream)?;
+            mtp_hidden::copy_target_hidden_row(
+                self.gpu.as_ref(),
+                &self.config.model_type,
+                self.buffers.hidden_states(),
+                self.buffers.norm_output(),
+                dst,
+                h,
+                row,
+                stream,
+            )?;
         }
         // Same rows, the stream highway. Staged together with the hiddens and
         // restored together, so the two inputs can never name different
@@ -401,7 +426,7 @@ impl TransformerModel {
         if hc == 0 || std::env::var("ATLAS_MTP_STREAM_ROW_FIX").ok().as_deref() == Some("0") {
             return None;
         }
-        Some(hc * self.config.hidden_size * 4)
+        Some(hc * self.config.hidden_size * crate::layers::ops::hc_elem_bytes(&self.config.model_type))
     }
 
     /// Batched-verify Phase 3: stash slot `idx` → `mtp_hidden_save` (the MTP
@@ -504,8 +529,50 @@ impl TransformerModel {
         _stream: u64,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
-        // MTP loads ALL experts on every rank — no EP all_reduce needed.
-        // Rank 1 does not participate in MTP propose.
+        self.validate_glm_mtp_repair(
+            seq,
+            token,
+            position,
+            num_drafts,
+            self.last_mtp_hidden_idx
+                .load(std::sync::atomic::Ordering::Relaxed),
+            grammar_bitmask.is_some(),
+        )?;
+        if crate::layers::glm5_mtp::distributed_enabled() {
+            anyhow::ensure!(
+                self.config.model_type == "glm5_next"
+                    && self.config.tp_world_size == 2
+                    && self.config.ep_world_size == 2
+                    && crate::layers::glm5_mtp::repair_owned::permits_capacity(
+                        self.levers.max_decode_seqs
+                    ),
+                "distributed GLM MTP requires GLM TP2/EP2 with max_batch_size=1"
+            );
+            anyhow::ensure!(
+                grammar_bitmask.is_none() || num_drafts == 1,
+                "distributed GLM MTP supports grammar masking only at one draft"
+            );
+            anyhow::ensure!(
+                (1..=4).contains(&num_drafts),
+                "distributed GLM MTP draft count must be 1..=4, got {num_drafts}"
+            );
+            anyhow::ensure!(position <= u32::MAX as usize, "MTP position exceeds u32");
+            let hidden_row = self
+                .last_mtp_hidden_idx
+                .load(std::sync::atomic::Ordering::Relaxed);
+            anyhow::ensure!(hidden_row < 32, "MTP hidden row exceeds verify limit");
+            self.ep_broadcast_seq_and_cmd(
+                seq.slot_idx as u32,
+                super::super::impl_a2::EP_CMD_GLM_MTP_PROPOSE,
+                self.ep_protocol_v2,
+            )?;
+            self.ep_broadcast_tokens(&[
+                token,
+                position as u32,
+                num_drafts as u32,
+                hidden_row as u32,
+            ])?;
+        }
         self.run_mtp_propose_inner(token, position, num_drafts, seq, grammar_bitmask)
     }
 
@@ -539,6 +606,7 @@ impl TransformerModel {
         }
         let stream = self.gpu.default_stream();
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -563,7 +631,7 @@ impl TransformerModel {
         // First-propose drafter context (cold-turn prefill); fast no-op on
         // every later call — same as the per-seq path.
         for seq in seqs.iter_mut() {
-            self.ensure_drafter_context(proposer, seq, &ctx, stream);
+            self.ensure_drafter_context(proposer, seq, &ctx, stream)?;
         }
         let h = self.config.hidden_size;
         // DFlash drafts from the 5-layer target stack: read the seq's own

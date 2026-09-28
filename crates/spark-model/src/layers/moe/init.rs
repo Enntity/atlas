@@ -30,6 +30,12 @@ impl MoeLayer {
         // Sanity-check the routing config: top-k that exceeds the
         // expert count would index OOB in the topk kernel and produce
         // silent NaN routing. Catch the misconfiguration at load time.
+        let c2_toggle = match std::env::var("ATLAS_GLM_C2_COMPACT_MOE") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let c2_compact_moe = super::forward_c2::parse_toggle(c2_toggle.as_deref())?;
         anyhow::ensure!(
             config.num_experts_per_tok <= num_experts && num_experts > 0,
             "MoE config invalid: num_experts_per_tok={} must be in 1..={}",
@@ -52,6 +58,8 @@ impl MoeLayer {
             num_experts,
             crate::layers::ops::MOE_TOPK_SIGMOID_MAX_EXPERTS,
         );
+        let m16_gate_up = super::gate_up_m16::M16GateUp::new(gpu, config)?;
+        let m5_projections = super::m5_projections::M5Projections::new(gpu, config)?;
         let gate_ptrs = build_ptr_table(&weights.experts, |e| &e.gate_proj, gpu)?;
         let up_ptrs = build_ptr_table(&weights.experts, |e| &e.up_proj, gpu)?;
         let down_ptrs = build_ptr_table(&weights.experts, |e| &e.down_proj, gpu)?;
@@ -64,9 +72,13 @@ impl MoeLayer {
             weights.correction_bias.map(|dw| dw.weight);
 
         let _ = num_experts;
+        let k128w = config.model_type == "glm5_next"
+            && std::env::var("ATLAS_MOE_PREQUANT_K128").as_deref() == Ok("1")
+            && std::env::var("ATLAS_MOE_PREQUANT_K128W").as_deref() != Ok("0");
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
-        Ok(Self {
+        let mut layer = Self {
             weights,
+            btile_storage: super::gate_up_repack::Storage::Legacy,
             // Default: standard NVFP4 (FP8-E4M3 per-16 + f32 global). The
             // DeepSeek-V4 native-MXFP4 loader overrides this to `Mxfp4E8m0`
             // after construction (see deepseek_v4/assemble.rs).
@@ -76,11 +88,27 @@ impl MoeLayer {
             pre_expert_norm: None,
             pre_expert_norm_k: rms_norm_k,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemv_batchm: super::super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batchm",
+            ),
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             dense_gemm_router: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_router"),
+            router_prefill_bn32: router_prefill_bn32::resolve(config, gpu)?,
+            dense_gemm_router_m5: super::super::try_kernel(
+                gpu,
+                "gemm",
+                "dense_gemm_bf16_router_m5",
+            ),
+            dense_gemm_router_rows: super::super::try_kernel(
+                gpu,
+                "gemm",
+                "dense_gemm_bf16_router_rows",
+            ),
             dense_gemm_pipelined: super::super::try_kernel(
                 gpu,
                 "gemm",
@@ -113,6 +141,12 @@ impl MoeLayer {
             moe_weighted_sum_blend_batch3: gpu
                 .kernel("moe_fused_batch3", "moe_weighted_sum_blend_batch3")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
+            w4a16_batch5_dual_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_batch5_dual",
+            ),
             moe_expert_gate_up_shared_token_major: gpu
                 .kernel("moe_prefill", "moe_expert_gate_up_shared_prefill")?,
             moe_expert_silu_down_shared_token_major: gpu
@@ -136,6 +170,137 @@ impl MoeLayer {
             moe_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t")?,
             moe_grouped_gemm_t_k64: gpu
                 .kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t_k64")?,
+            moe_grouped_gemm_t_k64_m32: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a16_grouped_gemm_ptrtable_t_k64_m32",
+            ),
+            moe_w4a4_prequant_t_k64: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a4_grouped_gemm_prequant_t_k64",
+            ),
+            moe_w4a4_prequant_t_k64_vecscale: super::super::try_kernel(
+                gpu,
+                "moe_w4a16",
+                "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale",
+            ),
+            moe_w4a4_prequant_t_k128: if std::env::var("ATLAS_MOE_PREQUANT_K128").as_deref()
+                == Ok("1")
+            {
+                super::super::try_kernel(gpu, "moe_w4a16", "moe_w4a4_grouped_gemm_prequant_t_k128")
+            } else {
+                KernelHandle(0)
+            },
+            moe_w4a4_prequant_t_k128w: if k128w {
+                super::super::try_kernel(
+                    gpu,
+                    "moe_w4a16",
+                    "moe_w4a4_grouped_gemm_prequant_t_k128w_compact",
+                )
+            } else {
+                KernelHandle(0)
+            },
+            moe_w4a4_prequant_gate_up_silu: if k128w
+                && std::env::var("ATLAS_MOE_GATE_UP_SILU").as_deref() != Ok("0")
+            {
+                super::super::try_kernel(
+                    gpu,
+                    "moe_w4a16",
+                    "moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w",
+                )
+            } else {
+                KernelHandle(0)
+            },
+            moe_mtile_prefix_k: if k128w {
+                super::super::try_kernel(gpu, "moe_w4a16", "moe_mtile_prefix")
+            } else {
+                KernelHandle(0)
+            },
+            moe_w4a4_prequant_t_k64_compact: if config.model_type == "glm5_next" {
+                super::super::try_kernel(
+                    gpu,
+                    "moe_w4a16",
+                    "moe_w4a4_grouped_gemm_prequant_t_k64_compact",
+                )
+            } else {
+                KernelHandle(0)
+            },
+            moe_w4a4_prequant_t_k64_vecscale_compact: if config.model_type == "glm5_next" {
+                super::super::try_kernel(
+                    gpu,
+                    "moe_w4a16",
+                    "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact",
+                )
+            } else {
+                KernelHandle(0)
+            },
+            m16_gate_up,
+            m5_projections,
+            moe_w4a4_prequant_t_k64_compact_gate_up: if config.model_type == "glm5_next" {
+                super::super::try_kernel(
+                    gpu,
+                    "moe_w4a16",
+                    "moe_w4a4_grouped_gemm_prequant_t_k64_compact_gate_up",
+                )
+            } else {
+                KernelHandle(0)
+            },
+            moe_w4a4_prequant_t_k64_vecscale_compact_gate_up: if config.model_type == "glm5_next" {
+                super::super::try_kernel(
+                    gpu,
+                    "moe_w4a16",
+                    "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact_gate_up",
+                )
+            } else {
+                KernelHandle(0)
+            },
+            moe_nvfp4_mmq_gate_up_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_mmq64_gate_up",
+            ),
+            moe_nvfp4_mmq_down_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_mmq64_down",
+            ),
+            moe_nvfp4_mmq_quantize_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_quantize_bf16",
+            ),
+            moe_nvfp4_mmq_repack_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_repack_batched",
+            ),
+            moe_nvfp4_mmq_silu_scale2_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_silu_scale2",
+            ),
+            moe_nvfp4_mmq_scale2_rows_k: super::super::try_kernel(
+                gpu,
+                "moe_nvfp4_mmq",
+                "atlas_moe_nvfp4_scale2_rows",
+            ),
+            moe_expert_gate_up_shared_mmq_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_mmq",
+                "moe_expert_gate_up_shared_mmq",
+            ),
+            moe_expert_silu_down_shared_mmq_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_mmq",
+                "moe_expert_silu_down_shared_mmq",
+            ),
+            quantize_nvfp4_k: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+            silu_mul_quant_nvfp4_k: super::super::try_kernel(
+                gpu,
+                "moe_silu_mul",
+                "silu_mul_quant_nvfp4",
+            ),
             moe_fused_gate_up_t: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t")?,
             moe_fused_gate_up_t_k64: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64")?,
             // ARM-2 Phase-K native-MXFP4 (E8M0) prefill variants — try_kernel:
@@ -270,6 +435,7 @@ impl MoeLayer {
             moe_act_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?, // default: SiLU
             gelu_activation: false,
             moe_unpermute_reduce: gpu.kernel("moe", "moe_unpermute_reduce_indexed")?,
+            moe_unpermute_reduce_ep: gpu.kernel("moe", "moe_unpermute_reduce_indexed_ep")?,
             moe_batched_blend: gpu.kernel("moe", "moe_batched_blend")?,
             gate_ptrs,
             up_ptrs,
@@ -279,6 +445,7 @@ impl MoeLayer {
             down_ptrs_t: None,
             cutlass_grouped_host: None,
             _cutlass_sfb_owned: Vec::new(),
+            routed_scales_released: false,
             down_t_scratch_packed: None,
             down_t_scratch_scale: None,
             moe_transpose_u8_batched_k: gpu
@@ -386,10 +553,25 @@ impl MoeLayer {
             unified_layout: std::env::var("ATLAS_UNIFIED_MOE_LAYOUT")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            nvfp4_mmq_layout: false,
+            _nvfp4_mmq_owned: Vec::new(),
             hybrid_layout: std::env::var("ATLAS_HYBRID_MOE_LAYOUT")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             nvfp4_gate_up_m128: std::env::var("ATLAS_NVFP4_GATE_UP_M128")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            nvfp4_down_m32: std::env::var("ATLAS_NVFP4_DOWN_M32")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            nvfp4_prequant_moe: std::env::var("ATLAS_NVFP4_PREQUANT_MOE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            c2_compact_moe,
+            nvfp4_vecscale: std::env::var("ATLAS_NVFP4_VECSCALE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            nvfp4_fused_silu_quant: std::env::var("ATLAS_NVFP4_FUSED_SILU_QUANT")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             // FP4 prefill MoE over the shared FAST_MOE=full [K/2,N] tables.
@@ -400,10 +582,13 @@ impl MoeLayer {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             shared_gate_t: None,
+            shared_gate_up_receipt: None,
             shared_up_t: None,
             shared_down_t: None,
             gate_fp8: None,
             shared_gate_fp8: None,
+            shared_fp8_cache: Default::default(),
+            shared_fp8_origins: None,
             shared_up_fp8: None,
             shared_down_fp8: None,
             prefill_stream: gpu.create_stream()?,
@@ -485,6 +670,12 @@ impl MoeLayer {
                 "moe_topk_sig",
                 "moe_topk_sigmoid_batched",
             ),
-        })
+        };
+        if crate::model::glm_independent::enabled(&config.model_type)? {
+            layer.nvfp4_prequant_moe = true;
+            layer.nvfp4_fused_silu_quant = true;
+            layer.validate_independent_handles()?;
+        }
+        Ok(layer)
     }
 }

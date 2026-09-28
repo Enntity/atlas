@@ -13,6 +13,11 @@
 
 use anyhow::Result;
 
+mod broadcast;
+#[cfg(test)]
+mod idle_command_tests;
+pub mod peer_lifeline;
+
 // NCCL FFI + the multi-GPU `NcclBackend` are gated on the `nccl`
 // feature because they `#[link(name = "nccl")]`. `nccl` is separate
 // from `cuda` so SCALE/AMD (gfx1151) builds can use the CUDA compute
@@ -43,6 +48,18 @@ pub trait CommBackend: Send + Sync {
     /// Broadcast from root rank to all ranks.
     fn broadcast(&self, ptr: u64, bytes: usize, root: usize) -> Result<()>;
 
+    /// Receive exactly the first four-byte word of an outer worker command
+    /// from rank zero. Only non-root ranks of a multi-rank communicator may
+    /// call this, with an aligned, live device word. This explicit boundary
+    /// may wait for a future command: NCCL excludes that idle duration from
+    /// its post-completion slow-broadcast latch, but keeps all error checks.
+    /// Subsequent words and payloads must use ordinary [Self::broadcast].
+    /// Other backends retain their ordinary broadcast behavior by default.
+    fn receive_idle_command_word(&self, ptr: u64) -> Result<()> {
+        broadcast::validate_idle_receiver(self.rank(), self.world_size(), ptr)?;
+        self.broadcast(ptr, 4, 0)
+    }
+
     /// Barrier: block until all ranks reach this point.
     fn barrier(&self) -> Result<()>;
 
@@ -54,6 +71,49 @@ pub trait CommBackend: Send + Sync {
     fn all_reduce_async(&self, ptr: u64, bytes: usize, compute_stream: u64) -> Result<()> {
         let _ = compute_stream;
         self.all_reduce(ptr, bytes)
+    }
+
+    /// Asynchronously exchange one BF16 payload with the other rank.
+    ///
+    /// Unlike an all-reduce, `recv_ptr` receives the peer's unmodified payload.
+    /// This lets a consumer fuse Atlas's established local reduction arithmetic
+    /// with its immediately-dependent kernel without materialising an
+    /// intermediate reduced buffer. Only available on backends that explicitly
+    /// support the two-rank event-ordered path.
+    fn peer_exchange_async(
+        &self,
+        _send_ptr: u64,
+        _recv_ptr: u64,
+        _bytes: usize,
+        _compute_stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("peer_exchange_async is not supported by this CommBackend")
+    }
+
+    /// Whether [`Self::peer_exchange_async`] is available for this communicator.
+    fn supports_peer_exchange_async(&self) -> bool {
+        false
+    }
+
+    /// Two-rank stream-ordered exchange: send `bytes` from `send` and land the
+    /// peer's `bytes` in `dst`, added in place (BF16) when `add`, else copied.
+    /// With equal halves this is a reduce-scatter (`add`) or an all-gather
+    /// step. Both ranks must call it with the same `bytes`. Returns `false`
+    /// (nothing enqueued) when unavailable for this call.
+    fn exchange_async(
+        &self,
+        _send: u64,
+        _dst: u64,
+        _bytes: usize,
+        _add: bool,
+        _compute_stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Whether [`Self::exchange_async`] can serve payloads up to `bytes`.
+    fn supports_exchange_async(&self, _bytes: usize) -> bool {
+        false
     }
 
     /// Pre-register a GPU buffer with the communication backend.

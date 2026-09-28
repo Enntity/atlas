@@ -118,6 +118,7 @@ pub(crate) fn render_chat(
         preserve_thinking => preserve_thinking,
         disable_tool_steering => flags.disable_tool_steering,
         add_vision_id => false,
+        glm_empty_think_off => glm_empty_think_off(),
     };
 
     let mut rendered = tmpl.render(ctx).map_err(|e| {
@@ -136,4 +137,11 @@ pub(crate) fn render_chat(
     }
 
     Ok(rendered)
+}
+
+/// `ATLAS_GLM_EMPTY_THINK_OFF=1`: GLM-5.3 renders thinking-off as an empty
+/// `<think></think>` instead of its low-effort reasoning mode.
+fn glm_empty_think_off() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_EMPTY_THINK_OFF").as_deref() == Ok("1"))
 }

@@ -5,6 +5,94 @@ use anyhow::Result;
 use super::types::TransformerModel;
 
 impl TransformerModel {
+    /// Copy `rows` target hidden rows, starting at forward row `row0`, into
+    /// capture storage whose rows are `dst_stride` bytes apart. mHC targets
+    /// (GLM-5) keep the residual in the FP32 highway and `hidden_states` holds
+    /// only the next sublayer's mixed input, so they contract the highway by
+    /// stream mean — the reference DFlash target hidden — instead.
+    fn dflash_capture_rows(
+        &self,
+        row0: usize,
+        rows: usize,
+        dst: spark_runtime::gpu::DevicePtr,
+        dst_stride: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let h = self.config.hidden_size;
+        if rows == 0 {
+            return Ok(());
+        }
+        let trace = std::env::var("ATLAS_DFLASH_CAPTURE_TRACE").as_deref() == Ok("1");
+        let result = self.dflash_capture_rows_inner(row0, rows, dst, dst_stride, stream);
+        if trace && result.is_ok() {
+            // Debug only: synchronous readback of the first captured row.
+            self.gpu.synchronize(stream)?;
+            let mut raw = vec![0u8; h * 2];
+            self.gpu.copy_d2h(dst, &mut raw)?;
+            let norm = raw
+                .chunks_exact(2)
+                .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
+                .map(|v| v * v)
+                .sum::<f32>()
+                .sqrt();
+            tracing::info!(row0, rows, dst_stride, norm, "DFlash capture trace");
+        }
+        result
+    }
+
+    fn dflash_capture_rows_inner(
+        &self,
+        row0: usize,
+        rows: usize,
+        dst: spark_runtime::gpu::DevicePtr,
+        dst_stride: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let h = self.config.hidden_size;
+        let hc = self.config.hc_mult;
+        if hc > 1 {
+            static KERNEL: std::sync::OnceLock<spark_runtime::gpu::KernelHandle> =
+                std::sync::OnceLock::new();
+            let kernel = match KERNEL.get() {
+                Some(k) => *k,
+                None => *KERNEL.get_or_init(|| {
+                    self.gpu
+                        .kernel(
+                            "hyper_connection",
+                            &crate::layers::ops::hc_kernel_name(
+                                &self.config.model_type,
+                                "hc_contract_strided",
+                            ),
+                        )
+                        .unwrap_or(spark_runtime::gpu::KernelHandle(0))
+                }),
+            };
+            anyhow::ensure!(kernel.0 != 0, "DFlash mHC capture kernel unavailable");
+            anyhow::ensure!(dst_stride % 2 == 0, "DFlash capture stride must be BF16-aligned");
+            return spark_runtime::kernel_args::KernelLaunch::new(self.gpu.as_ref(), kernel)
+                .grid([rows as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(self.buffers.hc_streams().offset(
+                    row0 * hc * h * crate::layers::ops::hc_elem_bytes(&self.config.model_type),
+                ))
+                .arg_ptr(dst)
+                .arg_u32(h as u32)
+                .arg_u32(hc as u32)
+                .arg_u32((dst_stride / 2) as u32)
+                .launch(stream);
+        }
+        let src = self.buffers.hidden_states();
+        for t in 0..rows {
+            self.gpu.copy_d2d_async(
+                src.offset((row0 + t) * h * 2),
+                dst.offset(t * dst_stride),
+                h * 2,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     /// DFlash prefill capture: copy `proc_count` tokens × hidden_size BF16
     /// from `self.buffers.hidden_states()` (filled by the just-completed
     /// prefill layer) into the per-sequence DFlash accumulator. Called
@@ -60,18 +148,26 @@ impl TransformerModel {
         let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
         let max_ctx = dstate.max_ctx_len;
-        let src_base = self.buffers.hidden_states();
-        for t in 0..proc_count {
-            let abs_pos = chunk_start + t;
-            if abs_pos >= max_ctx {
-                break; // accumulator full; drop later positions
-            }
-            let src = src_base.offset(t * h * bf16);
-            let dst_offset = abs_pos * n_capture * h * bf16 + slot_idx * h * bf16;
-            self.gpu
-                .copy_d2d_async(src, acc_base.offset(dst_offset), h * bf16, stream)?;
+        // The accumulator holds the LAST `max_ctx` prompt positions (the
+        // drafter's context window), not the first: slot 0 is position
+        // `window_start`. Earlier rows of this chunk are dropped.
+        let end = chunk_start + proc_count;
+        let window_start = seq.tokens.len().max(end).saturating_sub(max_ctx);
+        let mut first = window_start.max(chunk_start);
+        // A sequence-parallel chunk keeps only this rank's rows (rank 0: the
+        // upper half, compacted at row 0) in the highway.
+        let sp_row0 = crate::layers::glm_sp::current().map_or(0, |sp| sp.row0);
+        first = first.max(chunk_start + sp_row0);
+        if first >= end {
+            return Ok(());
         }
-        Ok(())
+        self.dflash_capture_rows(
+            first - chunk_start - sp_row0,
+            end - first,
+            acc_base.offset((first - window_start) * n_capture * h * bf16 + slot_idx * h * bf16),
+            n_capture * h * bf16,
+            stream,
+        )
     }
 
     /// After prefill completes, advance the seq's DFlash `ctx_len` to
@@ -96,13 +192,15 @@ impl TransformerModel {
                 .as_any_mut()
                 .downcast_mut::<crate::layers::DflashProposerState>()
         {
-            let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
+            let end = chunk_start + proc_count;
+            let window_start = seq.tokens.len().max(end).saturating_sub(dstate.max_ctx_len);
+            let new_len = end.saturating_sub(window_start).min(dstate.max_ctx_len);
             dstate.ctx_len = new_len;
             // Phase I (v2): seed per-slot fixed positions for the prompt
-            // captures. Prefill slot i holds prompt position i, so the
-            // fixed rope position is simply its index. Keep parallel to
-            // ctx_len. Re-seed idempotently across prefill chunks.
-            dstate.ctx_positions = (0..new_len).map(|i| i as i32).collect();
+            // captures. Slot i holds prompt position window_start + i (the
+            // tail window kept by try_dflash_prefill_capture_layer). Keep
+            // parallel to ctx_len. Re-seed idempotently across prefill chunks.
+            dstate.ctx_positions = (window_start..window_start + new_len).map(|i| i as i32).collect();
         }
         Ok(())
     }
@@ -146,12 +244,7 @@ impl TransformerModel {
         };
         let h = self.config.hidden_size;
         let bf16 = 2usize;
-        // The residual stream is always BF16, so DFlash hidden capture
-        // copies BF16 bytes directly with no downcast.
-        let src = self.buffers.hidden_states().offset(token_idx * h * bf16);
-        let dst_slot = dst.offset(slot * h * bf16);
-        self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
-        Ok(())
+        self.dflash_capture_rows(token_idx, 1, dst.offset(slot * h * bf16), h * bf16, stream)
     }
 
     /// Capture `hidden_states[token_idx]` for every DFlash capture layer into
@@ -204,13 +297,13 @@ impl TransformerModel {
             k <= kmax,
             "try_dflash_capture_all: k={k} exceeds dflash_hidden_save_rows={kmax}"
         );
-        let k_capped = k.min(kmax);
-        for t in 0..k_capped {
-            let src = self.buffers.hidden_states().offset(t * h * bf16);
-            let dst_slot = dst.offset(t * ctx_slot_bytes + slot * h * bf16);
-            self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
-        }
-        Ok(())
+        self.dflash_capture_rows(
+            0,
+            k.min(kmax),
+            dst.offset(slot * h * bf16),
+            ctx_slot_bytes,
+            stream,
+        )
     }
 
     /// Batched UNIFIED_CTX capture: seq i owns rows
@@ -271,7 +364,6 @@ impl TransformerModel {
                 ks.len()
             );
         }
-        let hidden = self.buffers.hidden_states();
         for (i, &k) in ks.iter().enumerate() {
             let region = slots.map(|s| s[i]).unwrap_or(i);
             anyhow::ensure!(
@@ -279,11 +371,13 @@ impl TransformerModel {
                 "DFlash batched capture owner slot {region} exceeds capacity {nseq}"
             );
             let seq_base = dst.offset(region * kmax * ctx_slot_bytes);
-            for t in 0..k.min(kmax) {
-                let src = hidden.offset((off[i] + t) * h * bf16);
-                let dst_slot = seq_base.offset(t * ctx_slot_bytes + slot * h * bf16);
-                self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
-            }
+            self.dflash_capture_rows(
+                off[i],
+                k.min(kmax),
+                seq_base.offset(slot * h * bf16),
+                ctx_slot_bytes,
+                stream,
+            )?;
         }
         Ok(())
     }

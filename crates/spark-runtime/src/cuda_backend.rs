@@ -328,6 +328,16 @@ pub fn spawn_oom_watchdog(
     threshold_mb: usize,
     interval: std::time::Duration,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_oom_watchdog_with_exit(threshold_mb, interval, legacy_oom_exit)
+}
+
+/// Preserve the same memory watchdog while an explicitly supervised caller
+/// supplies its nonreturning terminal sink. No threshold or polling override.
+pub fn spawn_oom_watchdog_with_exit(
+    threshold_mb: usize,
+    interval: std::time::Duration,
+    on_oom: fn() -> !,
+) -> Option<tokio::task::JoinHandle<()>> {
     if WATCHDOG_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return None;
     }
@@ -354,8 +364,7 @@ pub fn spawn_oom_watchdog(
                             "OOM watchdog: 3 consecutive readings below threshold. \
                              Terminating to prevent system freeze."
                         );
-                        // Flush logs before exit
-                        std::process::exit(1);
+                        dispatch_oom_exit(on_oom);
                     }
                 } else {
                     consecutive_low = 0;
@@ -363,6 +372,14 @@ pub fn spawn_oom_watchdog(
             }
         }
     }))
+}
+
+fn legacy_oom_exit() -> ! {
+    std::process::exit(1)
+}
+
+fn dispatch_oom_exit(on_oom: fn() -> !) -> ! {
+    on_oom()
 }
 
 #[cfg(test)]

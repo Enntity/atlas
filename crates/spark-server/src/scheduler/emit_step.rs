@@ -4,6 +4,41 @@
 
 use super::*;
 
+/// Cooperative cancellation only marks retirement; lifecycle owns state cleanup.
+/// An already-issued forward cannot be undone here. Preserve finish-reason and
+/// hard-limit metadata rather than inventing a new cancellation reason.
+pub(super) fn retire_if_cancelled(a: &mut ActiveSeq) -> bool {
+    if a.cancel_flag
+        .as_ref()
+        .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
+    {
+        a.finished = true;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+#[path = "cancel_tests.rs"]
+mod cancellation_tests;
+
+#[cfg(test)]
+#[path = "emit_thinking_tests.rs"]
+mod thinking_tests;
+
+#[cfg(test)]
+#[path = "glm_c2_emit_position_tests.rs"]
+mod position_tests;
+
+#[cfg(test)]
+#[path = "glm_tool_boundary_tests.rs"]
+mod glm_tool_boundary_tests;
+
+#[cfg(test)]
+#[path = "glm_native_eos_tests.rs"]
+mod glm_native_eos_tests;
+
 /// Emit a token for an active sequence (stream + bookkeeping).
 ///
 /// Per OpenAI spec, stop/EOS tokens are NOT streamed to the client —
@@ -18,6 +53,19 @@ pub fn emit_token(
     logprobs: Option<crate::api::TokenLogprobs>,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
 ) {
+    emit_token_at_position(a, tok, logprobs, sched, a.seq.seq_len);
+}
+
+/// Emit one already-verified row after its whole target prefix was committed.
+/// The caller supplies the validated logical position for ceiling checks only;
+/// canonical model state and all other emission/accounting semantics stay intact.
+pub(super) fn emit_token_at_position(
+    a: &mut ActiveSeq,
+    tok: u32,
+    logprobs: Option<crate::api::TokenLogprobs>,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    position: usize,
+) {
     // Cooperative cancellation from the streaming pipeline. The
     // stream-side guards (Bug-2 name-run cap, F11 within-dedup, F44
     // perm-fail, loop-watchdog, client stop-sequence match) flip this
@@ -25,10 +73,7 @@ pub fn emit_token(
     // EOS: finalise now (lifecycle derives "stop" — budget not hit —
     // and `handle_done`'s overrides refine it) instead of letting the
     // model keep emitting tokens that just get suppressed.
-    if let Some(ref f) = a.cancel_flag
-        && f.load(std::sync::atomic::Ordering::Acquire)
-    {
-        a.finished = true;
+    if retire_if_cancelled(a) {
         return;
     }
 
@@ -79,6 +124,8 @@ pub fn emit_token(
         tracing::debug!("<tool_response> hard-stop fired (id={trs}); ending turn");
         return;
     }
+
+    first_token_thinking::apply_native_tool_boundary(a, tok, sched.limits.glm_tool_boundary);
 
     // Spontaneous <think>: model generates <think> even when thinking was not
     // requested. Enter thinking mode so EOS is suppressed and thinking content
@@ -220,6 +267,12 @@ pub fn emit_token(
     // force-stop at function end then finishes the sequence even while inside
     // thinking. No-op for direct-mode (thinking-OFF) turns.
     // Detect </think> transition. Track thinking token count for budget enforcement.
+    let native_glm_eos = crate::glm_tool_boundary::native_eos_while_thinking(
+        sched.limits.glm_tool_boundary,
+        a.inside_thinking,
+        tok,
+        &a.eos_tokens,
+    );
     if a.inside_thinking {
         a.consume_generation_budget();
         if a.think_end_token == Some(tok) {
@@ -238,7 +291,7 @@ pub fn emit_token(
                 a.thinking_tokens,
                 a.thinking_budget,
             );
-        } else {
+        } else if !native_glm_eos {
             a.thinking_tokens += 1;
             if let Some(budget) = a.thinking_budget
                 && a.thinking_tokens >= budget
@@ -326,6 +379,7 @@ pub fn emit_token(
         if !sched.levers.disable_watchdogs
             && sched.levers.loop_watchdog()
             && !a.inside_tool_body
+            && watchdog_floor_reached(a.output_tokens.len(), a.min_tokens)
             && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
             && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
             && (detect_content_token_loop_with(&a.output_tokens, loop_params)
@@ -412,19 +466,27 @@ pub fn emit_token(
     //
     // `inside_thinking` term: the matcher is PAUSED during `<think>` (tokens
     // are neither masked nor accepted), so stop-legality is undefined there.
-    // Preserve the historical emit-path behavior — a spurious EOS inside a
-    // thinking span on a grammar-armed turn is discarded, `</think>` is the
-    // only legal exit (the non-MTP path does this via its explicit
-    // `thinking_suppresses_eos` term, which emit_token never had).
+    // The separate thinking suppression below also covers grammarless turns,
+    // matching ordinary decode: `</think>` is the normal thinking exit.
     let grammar_suppresses_eos = a.eos_tokens.contains(&tok)
         && !eos_escape
         && ((a.inside_thinking && a.grammar_state.is_some())
             || crate::grammar::grammar_blocks_stop(a.grammar_state.as_mut(), &a.eos_tokens));
     let legacy_suppresses_eos = a.require_tool_call;
     let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-    let suppress_eos = grammar_suppresses_eos || legacy_suppresses_eos || min_tokens_suppresses;
+    let hard_ceiling = hard_ceiling_hit(a.remaining, position, sched.limits.max_seq_len);
+    // Native GLM EOS ends the turn, not the reasoning block. The independent
+    // grammar-inside-thinking guard above is intentionally unchanged.
+    let thinking_suppresses_eos =
+        eos_suppressed_by_thinking(a.inside_thinking, hard_ceiling) && !native_glm_eos;
+    let suppress_eos = grammar_suppresses_eos
+        || legacy_suppresses_eos
+        || min_tokens_suppresses
+        || thinking_suppresses_eos;
 
-    if a.eos_tokens.contains(&tok) && !suppress_eos {
+    // The suppressed-EOS return below precedes the bottom length check. Do
+    // not let any suppression policy bypass an exhausted output/KV ceiling.
+    if a.eos_tokens.contains(&tok) && (hard_ceiling || !suppress_eos) {
         a.finished = true;
         return;
     }
@@ -452,7 +514,7 @@ pub fn emit_token(
     // (twin of the non-MTP guard in `decode_logits_step`), so the MTP/emit path
     // also cannot run KV past the context ceiling. No-op when `max_seq_len` is
     // unset (0) or not yet reached.
-    if a.remaining == 0 || seqlen_force_stop(a.seq.seq_len, sched.limits.max_seq_len) {
+    if a.remaining == 0 || seqlen_force_stop(position, sched.limits.max_seq_len) {
         // #144: before the hard length-stop, if a grammar is active and the
         // stop token is not legal at the current position (e.g. mid JSON
         // string), emit the shortest grammar-legal close so the truncated

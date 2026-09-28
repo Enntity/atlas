@@ -9,6 +9,8 @@ use crate::gpu::DevicePtr;
 use anyhow::{Result, bail};
 
 pub(crate) const NVFP4_GROUP_SIZE: usize = 16;
+/// Elements sharing one FP32 scale in [`KvCacheDtype::Fp8G128`].
+pub const FP8_G128_GROUP: usize = 128;
 
 /// KV cache quantization dtype.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +73,11 @@ pub enum KvCacheDtype {
     /// llama-cpp-turboquant's `q8_0/turbo2`). Best compression-to-quality
     /// ratio for turbo2 V on tested models.
     Fp8KTurbo2V,
+    /// FP8-E4M3 values with one FP32 scale per 128 elements of each token
+    /// (amax/448): a block stores its tokens' values, then their scales.
+    /// The GLM NoPE-512 latent layout — the one the native sparse prefill
+    /// already packs — at 528 bytes per token instead of 1024.
+    Fp8G128,
 }
 
 impl std::fmt::Display for KvCacheDtype {
@@ -152,6 +159,7 @@ impl std::str::FromStr for KvCacheDtype {
             "fp8k_turbo3v" | "fp8k3v" => Ok(KvCacheDtype::Fp8KTurbo3V),
             "bf16k_turbo2v" | "bf16k2v" => Ok(KvCacheDtype::Bf16KTurbo2V),
             "fp8k_turbo2v" | "fp8k2v" => Ok(KvCacheDtype::Fp8KTurbo2V),
+            "fp8_g128" => Ok(KvCacheDtype::Fp8G128),
             other => bail!(
                 "Unsupported --kv-cache-dtype '{other}'. Symmetric: 'bf16', 'fp8', 'nvfp4', 'turbo4', 'turbo3', 'turbo8'. \
                 Asymmetric (TQ+): turbo*_turbo*v, bf16k_turbo[34]v (safer asym: K baseline, V compressed), fp8k_turbo[34]v."
@@ -218,6 +226,7 @@ impl KvCacheConfig {
             | KvCacheDtype::Fp8KTurbo4V
             | KvCacheDtype::Fp8KTurbo3V
             | KvCacheDtype::Fp8KTurbo2V => elems,
+            KvCacheDtype::Fp8G128 => elems + elems / FP8_G128_GROUP * std::mem::size_of::<f32>(),
             KvCacheDtype::Nvfp4
             | KvCacheDtype::Turbo4
             | KvCacheDtype::Turbo4KTurbo3V
@@ -411,6 +420,23 @@ struct LayerPool {
     v_block_stride: usize,
     /// Effective dtype for this layer.
     dtype: KvCacheDtype,
+    sparse_index_values: DevicePtr,
+    sparse_index_scales: DevicePtr,
+    sparse_index_tail: DevicePtr,
+    sparse_index_values_block_stride: usize,
+    sparse_index_scales_block_stride: usize,
+    sparse_index_tail_block_stride: usize,
+}
+
+impl LayerPool {
+    /// The V allocation this layer owns: NULL when V aliases K.
+    fn owned_v_pool(&self) -> DevicePtr {
+        if self.v_pool == self.k_pool {
+            DevicePtr::NULL
+        } else {
+            self.v_pool
+        }
+    }
 }
 
 /// Paged KV cache across all attention layers.
@@ -422,6 +448,9 @@ pub struct PagedKvCache {
     /// Default: 1 on alloc, freed when decremented to 0.
     block_ref_counts: Vec<u32>,
     config: KvCacheConfig,
+    sparse_index_config: Option<SparseIndexCacheConfig>,
+    /// Slot-mapped sparse-index tails; `None` = one tail per physical block.
+    tail_slots: Option<tail_slots::TailSlots>,
     /// Per-block refcount event history (`ATLAS_KV_TRACE=1`; inert otherwise).
     trace: block_trace::BlockTrace,
 }
@@ -429,7 +458,12 @@ pub struct PagedKvCache {
 mod block_trace;
 mod catalog;
 mod paged_impl;
-/// Release both pools of every layer.
+mod sparse_index;
+mod sparse_index_impl;
+mod tail_slots;
+pub use tail_slots::{NO_TAIL, TailSlotPlan};
+pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
+/// Release K/V and any attached sparse-index pools for every layer.
 ///
 /// Each layer allocates its K and V pools separately, so freeing per layer is
 /// correct. The block bookkeeping (`free_blocks`, `block_ref_counts`) is host
@@ -443,13 +477,28 @@ impl atlas_core::scope::ModelResource<dyn crate::gpu::GpuBackend> for PagedKvCac
     fn release(&mut self, gpu: &dyn crate::gpu::GpuBackend) -> anyhow::Result<()> {
         let mut first_error = None;
         for layer in self.layers.drain(..) {
-            for ptr in [layer.k_pool, layer.v_pool] {
+            for ptr in [
+                layer.k_pool,
+                layer.owned_v_pool(),
+                layer.sparse_index_values,
+                layer.sparse_index_scales,
+                layer.sparse_index_tail,
+            ] {
+                if ptr.is_null() {
+                    continue;
+                }
                 if let Err(e) = gpu.free(ptr)
                     && first_error.is_none()
                 {
                     first_error = Some(e);
                 }
             }
+        }
+        if let Some(tails) = self.tail_slots.take()
+            && let Err(e) = gpu.free(tails.map)
+            && first_error.is_none()
+        {
+            first_error = Some(e);
         }
         self.free_blocks.clear();
         self.block_ref_counts.clear();

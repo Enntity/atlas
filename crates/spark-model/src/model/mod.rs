@@ -26,6 +26,35 @@
 pub(crate) mod block_mgmt;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
+mod glm_c2_handoff;
+pub mod glm_c2_pair_policy;
+mod glm_c2_pair_transport;
+mod glm_c2_pair_verify;
+mod glm_c2_sequence_allocation;
+mod glm_c2_sequence_ownership;
+#[cfg(feature = "glm-c2-test-utils")]
+pub mod glm_c2_test_support;
+#[cfg(all(test, not(feature = "glm-c2-test-utils")))]
+pub(crate) mod glm_c2_test_support;
+pub mod glm_c4;
+pub(crate) mod glm_cache_plan;
+pub mod glm_independent;
+pub(crate) mod glm_k3_head;
+mod glm_fused_chunk;
+mod glm_long_verify;
+mod glm_prefill_sp;
+mod glm_vocab_split;
+pub(crate) use glm_vocab_split::prepare_shard_mxfp8 as prepare_glm_head_mxfp8;
+pub(crate) mod glm_mtp_prompt_trace;
+mod glm_mtp_repair;
+pub(crate) mod glm_owner8_wire;
+mod glm_owner_compute;
+mod glm_owner_metadata;
+mod glm_owner_policy;
+mod glm_owner_preflight;
+mod glm_owner_transport;
+pub(crate) mod glm_owner_wire;
+pub use glm_c2_handoff::GlmPairedInput;
 pub(crate) mod dspark_generation;
 #[cfg(test)]
 mod dspark_generation_tests;
@@ -33,6 +62,8 @@ pub(crate) mod dspark_pool;
 #[cfg(test)]
 mod dspark_pool_tests;
 mod final_norm;
+#[cfg(test)]
+mod glm_c2_handoff_tests;
 pub(crate) mod impl_a1;
 pub(crate) mod impl_a1_init;
 pub(crate) mod impl_a2;
@@ -49,6 +80,7 @@ mod impl_ngram;
 pub(crate) mod mtp_carry;
 pub(crate) mod pinned_pack;
 pub(crate) mod ssm_batched_copy;
+pub(crate) mod ssm_indexed_decode;
 pub(crate) mod ssm_pool;
 pub(crate) mod ssm_pools;
 pub(crate) mod ssm_snapshot;
@@ -61,6 +93,7 @@ pub(crate) mod ssm_tier;
 pub(crate) mod token_overlay;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
+pub(crate) mod vision_transport;
 
 // Served NLLB-200 / M2M-100 encoder-decoder model (CUDA/GB10 serving path).
 #[cfg(feature = "cuda")]

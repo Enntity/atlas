@@ -346,6 +346,11 @@ pub fn resume_swapped_seq(
     model.restore_sequence_state(&mut seq, s.num_blocks, &mut reader)?;
     drop(reader);
     spill.remove_file(s.swap_id)?;
+    // Swap restore allocates a fresh local sequence without rerunning prefill;
+    // carry the native-only fence to both this rank and the worker before the
+    // resumed decode can issue any TP2/EP2 command.
+    seq.disable_mtp = s.disable_mtp;
+    model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, s.disable_mtp)?;
 
     // Restore CPU-side metadata.
     seq.tokens = s.tokens;

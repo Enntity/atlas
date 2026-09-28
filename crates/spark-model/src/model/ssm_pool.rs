@@ -418,6 +418,19 @@ impl SsmStatePool {
         })
     }
 
+    /// Guard exactly the index removed by the existing specific-claim path.
+    /// Refusal never consumes another available slot; generic claims stay LIFO.
+    pub(super) fn claim_specific_guarded(self: &Arc<Self>, slot: usize) -> Result<SlotGuard> {
+        anyhow::ensure!(
+            slot < self.max_slots && self.claim_specific(slot),
+            "SSM target slot {slot} unavailable or out of range"
+        );
+        Ok(SlotGuard {
+            pool: Arc::clone(self),
+            idx: Some(slot),
+        })
+    }
+
     pub(super) fn release_slot(&self, idx: usize) {
         let mut free = self.free_slots.lock();
         debug_assert!(
@@ -868,6 +881,11 @@ pub(crate) struct SlotGuard {
 }
 
 impl SlotGuard {
+    /// Read-only owner identity for selected checked request-state consumers.
+    pub(crate) fn belongs_to(&self, pool: &Arc<SsmStatePool>) -> bool {
+        Arc::ptr_eq(&self.pool, pool)
+    }
+
     /// A guard that owns no slot (released/migrated, or a placeholder for the
     /// reserved-dummy / sentinel paths). Holds an `Arc` to the pool but its
     /// `Drop` is a no-op while `idx` is `None`.
@@ -1187,6 +1205,10 @@ mod h_stored_geometry_tests {
 }
 
 #[cfg(test)]
+#[path = "ssm_pool_aligned_claim_tests.rs"]
+mod aligned_claim_tests;
+
+#[cfg(test)]
 mod slot_guard_tests {
     use super::*;
 
@@ -1194,7 +1216,7 @@ mod slot_guard_tests {
     /// (`free_slots`/`max_slots`). All GPU pointer vectors are empty; the guard
     /// path and `claim_slot`/`release_slot` never dereference them, so no GPU is
     /// required to validate the exactly-once release invariant.
-    fn bare_pool(max_slots: usize) -> Arc<SsmStatePool> {
+    pub(super) fn bare_pool(max_slots: usize) -> Arc<SsmStatePool> {
         Arc::new(SsmStatePool {
             h_state_pools: Vec::new(),
             conv_state_pools: Vec::new(),

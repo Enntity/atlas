@@ -152,6 +152,11 @@ pub(crate) fn build_model(
         lora_args,
         nllb_lang,
         nllb_lora_dir,
+        if args.glm_paired_mtp {
+            spark_model::factory::GlmMtpBuildMode::Paired
+        } else {
+            spark_model::factory::GlmMtpBuildMode::Legacy
+        },
     )
     .context("Failed to build model")
 }
@@ -320,10 +325,20 @@ pub(crate) fn maybe_run_ep_worker(
         loop {
             match model_owned.ep_worker_step(&mut slots) {
                 Ok(true) => {}
-                Ok(false) => break,
-                Err(e) => {
-                    tracing::error!("EP worker error: {e:#}");
+                Ok(false) => {
+                    crate::ep_peer_lifeline::expect_peer_exit();
                     break;
+                }
+                Err(e) => {
+                    // An EP worker error may follow a failed collective.  A
+                    // local break leaves the rank alive and lets the head
+                    // issue another collective against a dead peer, which
+                    // turns a reportable failure into an indefinite hang.
+                    // Use the existing fail-fast propagation path so every
+                    // rank/process exits together after communicator state is
+                    // uncertain.
+                    tracing::error!("EP worker fatal error: {e:#}; terminating rank");
+                    crate::glm_terminal_session::terminate();
                 }
             }
         }

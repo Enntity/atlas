@@ -139,6 +139,7 @@ fn run_batched_verify(
     let levers = crate::layers::ops::ModelLevers::defaults();
     let stats = crate::layers::ops::ModelStats::new();
     let ctx = ForwardContext {
+        ssm_batch: None,
         dispatch: &dispatch,
         derived: &derived,
         levers: &levers,
@@ -357,6 +358,7 @@ fn active_row_without_ple_carry_is_refused() {
         gdn_exact_replay: false,
         token_ids: None,
         host_token_ids: Some(&[42]),
+        ssm_batch: None,
         routed_lora_layers: None,
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,

@@ -109,6 +109,9 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        if self.paired_handoff().is_some() {
+            return self.free_paired_sequence(seq);
+        }
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
         // CRITICAL: release SSM slot FIRST to prevent slot leak if later
@@ -460,7 +463,9 @@ impl TransformerModel {
     }
 
     pub(super) fn num_total_blocks_dispatch(&self) -> usize {
-        self.kv_cache.lock().num_blocks()
+        // The constructor permanently owns one zeroed padding block. Admission
+        // and occupancy report only capacity available to real sequences.
+        self.kv_cache.lock().num_blocks().saturating_sub(1)
     }
 
     pub(super) fn reclaim_prefix_blocks_dispatch(&self, num_blocks: usize) -> usize {

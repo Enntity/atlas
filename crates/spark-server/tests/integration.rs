@@ -72,9 +72,12 @@ fn setup_model(
         ep_rank: 0,
         ep_world_size: 1,
         num_experts: 0,
+        rank0_only_expert_prefix: None,
+        replicated_expert_prefix: None,
         peak_memory_multiplier: None,
         skip_activation_scales: false,
         skip_mtp: false,
+        skip_layer_prefix: None,
     };
     use spark_runtime::weights::WeightLoader;
     let store = loader.load(model_dir, gpu.as_ref(), 1024 * 1024 * 1024)?;
@@ -134,6 +137,7 @@ fn setup_model(
         None,               // lora_args (no LoRA adapter)
         None,               // nllb_lang (not an NLLB translation model)
         None,               // nllb_lora_dir
+        spark_model::factory::GlmMtpBuildMode::Legacy,
     )?;
 
     Ok((model, config))

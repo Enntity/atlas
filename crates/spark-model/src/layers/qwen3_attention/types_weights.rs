@@ -7,6 +7,27 @@ use spark_runtime::gpu::DevicePtr;
 
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
+/// GLM-5.3 k-pool semantic-indexer weights.
+///
+/// The indexer scores groups of `index_kpool` history tokens independently
+/// from the main MLA projections, then expands the selected pools into raw
+/// token indices for sparse attention.
+pub struct GlmIndexerWeights {
+    /// `[index_n_heads * index_head_dim, q_lora_rank]`.
+    pub wq_b: DenseWeight,
+    /// `[index_head_dim, hidden]`.
+    pub wk: DenseWeight,
+    /// `[index_n_heads, hidden]`.
+    pub weights_proj: DenseWeight,
+    /// `[index_head_dim, hidden]`.
+    pub kpool_gate: DenseWeight,
+    /// `[index_kpool, index_head_dim]`.
+    pub kpool_ape: DenseWeight,
+    /// Standard LayerNorm affine parameters for projected history keys.
+    pub k_norm_weight: DenseWeight,
+    pub k_norm_bias: DenseWeight,
+}
+
 /// MLA (Multi-head Latent Attention) weight components for 2-step decode.
 ///
 /// Instead of a single Q GEMV: `input × Q_expanded → Q[n_heads*hd]`,
@@ -77,6 +98,8 @@ pub struct MlaWeights {
     pub nope: usize,
     pub rope: usize,
     pub v_dim: usize,
+    /// GLM-5.3 semantic indexer. `None` for other MLA architectures.
+    pub glm_indexer: Option<GlmIndexerWeights>,
     /// DeepSeek Sparse Attention compressor (CSA ratio-4 / HCA ratio-128).
     /// `None` for full-attention layers (`compress_ratios[L]` == 0).
     pub compressor: Option<CompressorWeights>,

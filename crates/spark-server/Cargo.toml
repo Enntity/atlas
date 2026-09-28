@@ -88,7 +88,7 @@ toml = "0.8"
 # order) instead of BTreeMap (sorted). Without this, `Value::from_serialize`
 # re-sorts tool-schema keys before the custom `tojson` filter renders them,
 # defeating the transformers key-order match in the `<tools>` block.
-minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "preserve_order"] }
+minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "loop_controls", "preserve_order"] }
 # Pure-Rust grammar-constrained decoding (W7: was the C++-backed
 # `xgrammar-rs = "0.1"` patched to `vendor/xgrammar-rs`; now the
 # from-scratch Rust port at `crates/xgrammar`). The crate's lib is
@@ -99,8 +99,14 @@ lazy_static = "1"
 tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
 base64 = "0.22"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+atlas-glm-pair-wire = { path = "../atlas-glm-pair-wire" }
+atlas-glm-pair-io = { path = "../atlas-glm-pair-io" }
+
 [dev-dependencies]
+spark-model = { path = "../spark-model", default-features = false, features = ["glm-c2-test-utils"] }
 tempfile = "3"
+spark-runtime = { path = "../spark-runtime", default-features = false, features = ["test-utils"] }
 
 [lints]
 workspace = true

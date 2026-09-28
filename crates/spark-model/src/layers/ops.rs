@@ -17,6 +17,10 @@ mod activations;
 mod derived_reserve;
 #[path = "ops/derived_weights.rs"]
 mod derived_weights;
+#[path = "ops/mxfp8.rs"]
+mod mxfp8;
+#[path = "ops/bf16_gemm_cutlass.rs"]
+mod bf16_gemm_cutlass;
 #[path = "ops/dispatch_config.rs"]
 mod dispatch_config;
 #[path = "ops/dispatch_helpers.rs"]
@@ -56,6 +60,8 @@ mod gemm_dense_int8;
 mod gemm_fp4;
 #[path = "ops/model_stats.rs"]
 pub mod model_stats;
+#[path = "ops/moe_gate_up_repack.rs"]
+pub(crate) mod moe_gate_up_repack;
 pub use model_stats::ModelStats;
 
 #[path = "ops/gemm_fp8_prefill.rs"]
@@ -68,12 +74,29 @@ mod gemv_q2;
 mod gemv_q2_vec;
 #[path = "ops/gemv_sw.rs"]
 mod gemv_sw;
+#[path = "ops/glm_hc_prefill.rs"]
+mod glm_hc_prefill;
+#[path = "ops/glm_indexer.rs"]
+mod glm_indexer;
+#[path = "ops/glm_indexer_dynamic.rs"]
+mod glm_indexer_dynamic;
+#[path = "ops/glm_router_bn4.rs"]
+mod glm_router_bn4;
+#[path = "ops/glm_sparse_native.rs"]
+mod glm_sparse_native;
+#[path = "ops/glm_sparse_prefill_tc.rs"]
+mod glm_sparse_prefill_tc;
+pub use glm_router_bn4::glm_router_bn4;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
 #[path = "ops/hyper_connection_dispatch.rs"]
 mod hyper_connection_dispatch;
 #[path = "ops/hyper_connection_lowrank.rs"]
 mod hyper_connection_lowrank;
+#[path = "ops/kda.rs"]
+mod kda;
+#[path = "ops/kda_indexed.rs"]
+mod kda_indexed;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
 #[path = "ops/hyper_connection_lowrank_gemm.rs"]
 mod hyper_connection_lowrank_gemm;
@@ -120,6 +143,8 @@ mod moe_grouped_b;
 mod moe_grouped_fp4;
 #[path = "ops/moe_lora_grouped.rs"]
 pub mod moe_lora_grouped;
+#[path = "ops/moe_nvfp4_mmq.rs"]
+mod moe_nvfp4_mmq;
 #[path = "ops/moe_prefill.rs"]
 mod moe_prefill;
 #[path = "ops/norm.rs"]
@@ -195,6 +220,8 @@ mod wide_prefill;
 pub use activations::*;
 pub use derived_reserve::{lazy_bf16_copy_bytes, lazy_bf16_reserve, lazy_bf16_reserve_enabled};
 pub use derived_weights::{Derivation, DerivedWeights};
+pub use mxfp8::*;
+pub use bf16_gemm_cutlass::*;
 pub use dispatch_config::GemmDispatch;
 pub use dispatch_helpers::*;
 pub use dispatch_proj::*;
@@ -213,9 +240,16 @@ pub use gemm_quant::*;
 pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
+pub use glm_hc_prefill::*;
+pub use glm_indexer::*;
+pub use glm_indexer_dynamic::*;
+pub use glm_sparse_native::*;
+pub use glm_sparse_prefill_tc::*;
 pub use hyper_connection::*;
 pub use hyper_connection_dispatch::*;
 pub use hyper_connection_lowrank::*;
+pub use kda::*;
+pub use kda_indexed::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
 pub use kv_cache_turbok::*;
@@ -231,6 +265,7 @@ pub use moe_grouped_a2::*;
 pub(crate) use moe_grouped_b::*;
 pub use moe_grouped_fp4::*;
 pub use moe_lora_grouped::*;
+pub use moe_nvfp4_mmq::*;
 pub use moe_prefill::*;
 pub use norm::*;
 pub use nvfp4_mmq::*;

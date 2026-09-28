@@ -11,7 +11,14 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layer::ForwardContext;
 use crate::layers::ops;
+use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeight};
+mod btile_model_owners;
+pub(crate) use btile_model_owners::{
+    bind as bind_resident_btile_arenas, invalidate as invalidate_resident_btile_readers,
+};
+#[cfg(test)]
+pub(crate) use gate_up_repack::model_fixture as btile_model_fixture;
 
 /// Device-side pointer table for one projection across all experts.
 ///
@@ -19,12 +26,21 @@ use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeigh
 /// expert_id from device memory, then indexes these tables to find
 /// the correct weight pointers — no CPU involvement needed.
 pub(crate) struct ExpertPtrTable {
+    allocation: Option<ptr_table_build::receipt::TableAllocation>,
     /// `[num_experts]` u64 device pointers to each expert's B_packed.
     pub(crate) packed_ptrs: DevicePtr,
     /// `[num_experts]` u64 device pointers to each expert's B_scale.
     pub(crate) scale_ptrs: DevicePtr,
     /// `[num_experts]` f32 per-expert scale2 values.
     pub(crate) scale2_vals: DevicePtr,
+}
+
+/// Device-resident top-k routing results that can be sliced across fused
+/// small-M expert waves without recomputing the router projection.
+#[derive(Clone, Copy)]
+pub(super) struct PrecomputedRoutes {
+    indices: DevicePtr,
+    weights: DevicePtr,
 }
 
 /// Device-side pointer table for FP8 expert dispatch (one projection).
@@ -93,6 +109,7 @@ pub(crate) enum ExpertPtrSet {
 #[allow(dead_code)]
 pub struct MoeLayer {
     pub weights: MoeWeights,
+    btile_storage: gate_up_repack::Storage,
     /// Quant format of the ROUTED experts as landed in GPU memory. `Nvfp4`
     /// (default) = packed E2M1 + FP8-E4M3 per-16 block scales + f32 per-tensor
     /// global. Set to `Mxfp4E8m0` by the DeepSeek-V4 native-MXFP4 loader
@@ -117,6 +134,8 @@ pub struct MoeLayer {
     pub pre_expert_norm: Option<crate::weight_map::DenseWeight>,
     pre_expert_norm_k: spark_runtime::gpu::KernelHandle,
     dense_gemv: KernelHandle,
+    /// `dense_gemv_bf16_batchm` (bit-identical per row to `dense_gemv`), or 0.
+    dense_gemv_batchm: KernelHandle,
     w4a16_gemv: KernelHandle,
     /// Single-warp `w4a16_gemv_sw`. `KernelHandle(0)` on miss → base GEMV.
     w4a16_gemv_sw: KernelHandle,
@@ -127,6 +146,10 @@ pub struct MoeLayer {
     /// `--fmad=false` build) at ~2x speed. `KernelHandle(0)` on miss → the
     /// pinned scalar kernel. Used ONLY by `router_gate_gemm_dense`.
     dense_gemm_router: KernelHandle,
+    router_prefill_bn32: KernelHandle,
+    /// Exact-M=5, scalar-order router specialization for GLM verification.
+    dense_gemm_router_m5: KernelHandle,
+    dense_gemm_router_rows: KernelHandle,
     dense_gemm_pipelined: KernelHandle,
     /// FP32-output router GEMM + FP32-input top-K for the ATLAS_FP32_GATE path.
     /// Zero (unresolved) when the kernels are absent; dispatch falls back to BF16.
@@ -151,6 +174,11 @@ pub struct MoeLayer {
     moe_expert_silu_down_shared_batch3: KernelHandle,
     moe_weighted_sum_blend_batch3: KernelHandle,
     w4a16_gemv_batch3: KernelHandle,
+    /// Exact-M GEMVs used to read GLM's retained shared expert once during
+    /// K=4/K=5 verification (routed experts remain on fused K2/K3 kernels).
+    w4a16_batchm: W4a16BatchmTiers,
+    /// Two-plane exact-M=5 shared-expert gate/up projection for GLM verify.
+    w4a16_batch5_dual_k: KernelHandle,
     // Generic token-major NVFP4 MoE kernels. Used as an opt-in decode
     // concurrency experiment for N>=4 without grouped-GEMM sorting.
     moe_expert_gate_up_shared_token_major: KernelHandle,
@@ -169,6 +197,7 @@ pub struct MoeLayer {
     /// When true, decode uses the sorted prefill path (avoids fused SiLU kernels).
     gelu_activation: bool,
     moe_unpermute_reduce: KernelHandle,
+    moe_unpermute_reduce_ep: KernelHandle,
     moe_batched_blend: KernelHandle,
     /// Pointer tables for batched expert dispatch.
     gate_ptrs: ExpertPtrTable,
@@ -189,6 +218,9 @@ pub struct MoeLayer {
     cutlass_grouped_host: Option<ops::MoeCutlassHostTables>,
     /// Keeps the per-expert SFB buffers alive.
     _cutlass_sfb_owned: Vec<DevicePtr>,
+    /// Routed checkpoint scales were freed after the CUTLASS SFB swizzle; every
+    /// routed-expert call must take the grouped CUTLASS path.
+    routed_scales_released: bool,
     /// Lazy down_proj transpose scratch — populated at the start of each
     /// prefill call when the persistent transpose pass couldn't fit
     /// down_proj. Decode keeps using `down_ptrs` (untransposed); prefill
@@ -252,6 +284,12 @@ pub struct MoeLayer {
     /// dispatch falls through to the original `[N, K/2]` kernels.
     /// Resolved once at construction.
     unified_layout: bool,
+    /// Equal-size block_nvfp4 routed-weight replacement used by the grouped
+    /// Blackwell MMQ prefill path and its decode-compatible GEMV kernels.
+    nvfp4_mmq_layout: bool,
+    /// Slab allocations backing `gate_ptrs` / `up_ptrs` / `down_ptrs` while
+    /// `nvfp4_mmq_layout` is active. Pointer tables do not own their targets.
+    _nvfp4_mmq_owned: Vec<DevicePtr>,
     /// `ATLAS_NVFP4_GATE_UP_M128=1` opts in to the M=128 fused gate+up
     /// kernel (Block D #3, Atlas tile-shape rewrite). Halves block count
     /// at large prefill — better SM amortization on GB10's 25-SM budget.
@@ -259,6 +297,20 @@ pub struct MoeLayer {
     /// `moe_fused_gate_up_t_k64_m128 == KernelHandle(0)` and dispatch
     /// falls through to the M=64 path even when the env var is set.
     nvfp4_gate_up_m128: bool,
+    /// `ATLAS_NVFP4_DOWN_M32=1` opts routed prefill down projection into a
+    /// two-warp M=32 specialization. This targets sparse expert batches and
+    /// is intentionally independent of gate/up while it is being measured.
+    nvfp4_down_m32: bool,
+    /// Quantize routed activations once, then use native block-scaled FP4 MMA
+    /// for gate/up/down without any persistent weight duplication.
+    nvfp4_prequant_moe: bool,
+    /// Immutable, default-off independent C2 compact FFN experiment.
+    c2_compact_moe: bool,
+    /// Vectorize NVFP4 activation/weight scale staging with cp.async.
+    nvfp4_vecscale: bool,
+    /// Fuse DeepSeek/GLM SiLU·mul with activation NVFP4 quantization. The
+    /// compact result is staged safely through down scratch before down GEMM.
+    nvfp4_fused_silu_quant: bool,
     /// `ATLAS_HOLO_MOE_GATEUP_FP4=1` opts the prefill fused gate_up onto the
     /// block-scaled FP4 kernel. Reads the SHARED FAST_MOE=full `gate_ptrs_t`/
     /// `up_ptrs_t` `[K/2,N]` tables (no extra MoE memory); dispatch also requires
@@ -278,10 +330,46 @@ pub struct MoeLayer {
     hybrid_layout: bool,
     /// Transposed shared expert weights for prefill.
     shared_gate_t: Option<QuantizedWeight>,
+    shared_gate_up_receipt: Option<helpers_a::SharedGateUpReceipt>,
     shared_up_t: Option<QuantizedWeight>,
     shared_down_t: Option<QuantizedWeight>,
     moe_grouped_gemm_t: KernelHandle,
     moe_grouped_gemm_t_k64: KernelHandle,
+    /// Optional M=32 NVFP4 twin of `moe_grouped_gemm_t_k64`.
+    moe_grouped_gemm_t_k64_m32: KernelHandle,
+    moe_w4a4_prequant_t_k64: KernelHandle,
+    moe_w4a4_prequant_t_k64_vecscale: KernelHandle,
+    /// Same prequant FP4 grouped GEMM with K128 stages and ldmatrix-fed MMAs
+    /// (bitwise-identical outputs); `ATLAS_MOE_PREQUANT_K128=1`, else null.
+    moe_w4a4_prequant_t_k128: KernelHandle,
+    /// 64x256-tile twin of `moe_w4a4_prequant_t_k128` launched over only the
+    /// local experts' row tiles (`moe_mtile_prefix_k`), bitwise-identical
+    /// outputs; null unless the K128 kernel is on and GLM
+    /// (`ATLAS_MOE_PREQUANT_K128W=0` disables).
+    moe_w4a4_prequant_t_k128w: KernelHandle,
+    moe_mtile_prefix_k: KernelHandle,
+    /// K128W gate and up in one launch with `silu_mul_quant_nvfp4` applied in
+    /// its epilogue (same bytes); loaded with `moe_w4a4_prequant_t_k128w`
+    /// unless `ATLAS_MOE_GATE_UP_SILU=0`.
+    moe_w4a4_prequant_gate_up_silu: KernelHandle,
+    /// Compact-worklist twins of the prequantized native-FP4 MoE kernel.
+    /// Optional and used only for guarded K=5 gate/up verification.
+    moe_w4a4_prequant_t_k64_compact: KernelHandle,
+    moe_w4a4_prequant_t_k64_vecscale_compact: KernelHandle,
+    moe_w4a4_prequant_t_k64_compact_gate_up: KernelHandle,
+    moe_w4a4_prequant_t_k64_vecscale_compact_gate_up: KernelHandle,
+    m16_gate_up: gate_up_m16::M16GateUp,
+    m5_projections: m5_projections::M5Projections,
+    moe_nvfp4_mmq_gate_up_k: KernelHandle,
+    moe_nvfp4_mmq_down_k: KernelHandle,
+    moe_nvfp4_mmq_quantize_k: KernelHandle,
+    moe_nvfp4_mmq_repack_k: KernelHandle,
+    moe_nvfp4_mmq_silu_scale2_k: KernelHandle,
+    moe_nvfp4_mmq_scale2_rows_k: KernelHandle,
+    moe_expert_gate_up_shared_mmq_k: KernelHandle,
+    moe_expert_silu_down_shared_mmq_k: KernelHandle,
+    quantize_nvfp4_k: KernelHandle,
+    silu_mul_quant_nvfp4_k: KernelHandle,
     moe_fused_gate_up_t: KernelHandle,
     moe_fused_gate_up_t_k64: KernelHandle,
     // ARM-2 Phase-K: native-MXFP4 (E8M0 per-32) prefill variants of the W4A16
@@ -311,6 +399,8 @@ pub struct MoeLayer {
     /// Pre-dequanted FP8 weights for zero-overhead prefill GEMMs.
     gate_fp8: Option<DevicePtr>,
     shared_gate_fp8: Option<DevicePtr>,
+    shared_fp8_cache: shared_fp8_cache::SharedFp8CacheState,
+    shared_fp8_origins: Option<[shared_fp8_origin::SharedFp8Origin; 3]>,
     shared_up_fp8: Option<DevicePtr>,
     shared_down_fp8: Option<DevicePtr>,
     fp8_gemm_k: KernelHandle,
@@ -467,7 +557,9 @@ impl MoeLayer {
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod compact_layout;
 mod dump;
+mod ep_prefill;
 mod forward;
 mod lora;
 mod lora_gateup;
@@ -476,9 +568,19 @@ pub(crate) use lora::MoeLoraWeights;
 mod forward_atomic_c4;
 mod forward_batched;
 mod forward_batched_gate;
+mod forward_c2;
+mod forward_c4;
+mod forward_independent;
+mod forward_owner_verify;
+mod forward_pair_shared;
+mod forward_pair_validate;
+mod forward_pair_verify;
+pub(crate) use forward_independent::validate_independent_environment;
 mod forward_ep;
 mod forward_k2;
 mod forward_k3;
+mod forward_k4;
+mod forward_k5;
 mod forward_phase;
 mod forward_prefill;
 mod forward_prefill_bf16;
@@ -487,12 +589,35 @@ mod forward_prefill_phase;
 mod forward_prefill_routed;
 mod forward_prefill_router;
 mod forward_token_major;
+mod gate_up_m16;
+mod gate_up_repack;
+#[cfg(test)]
+mod gate_up_repack_test_gpu;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;
+mod shared_fp8_cache;
+mod shared_fp8_cache_load;
+mod shared_fp8_cache_output;
+mod shared_fp8_origin;
+pub(crate) use gate_up_m16::validate_m16_gate_up_graphs;
+pub(crate) use shared_fp8_cache::SharedFp8Reserve;
+pub(crate) use shared_fp8_cache::validate_shared_fp8_cache_factory_reserve;
+pub use shared_fp8_cache::{validate_shared_fp8_cache_graphs, validate_shared_fp8_cache_profile};
+pub(crate) use shared_fp8_origin::load_glm_shared_fp8_weight;
 mod init;
+mod m5_projection_oracle;
+mod m5_projections;
+mod mmq_layout;
+mod router_bn4;
+mod router_prefill_bn32;
+mod shared_fp8_cache_bytes;
+mod shared_m16;
+pub(crate) use m5_projections::validate_m5_projection_graphs;
 #[cfg(test)]
 mod mod_tests;
+mod prequant_fp4;
+pub(crate) use prequant_fp4::with_owner_rows;
 mod ptr_table_build;
 mod union_stats;
 pub(crate) use ptr_table_build::*;

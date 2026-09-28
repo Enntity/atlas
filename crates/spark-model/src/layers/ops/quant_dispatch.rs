@@ -211,14 +211,130 @@ pub fn w4a16_gemv_batchm(
         (1..=32).contains(&m),
         "w4a16_gemv_batchm: m={m} outside 1..=32"
     );
+    // Tensor-core tiers own 16 outputs per 8-warp CTA.
+    let tc_rows = crate::layers::w4a16_gemv_tiers::tc_rows(kernel);
+    let tc = tc_rows.is_some();
+    anyhow::ensure!(
+        tc_rows.is_none_or(|rows| m <= rows && k % 16 == 0),
+        "w4a16 tensor-core GEMV: m={m} k={k} exceeds {tc_rows:?} rows"
+    );
+    let (grid, block) = if tc { (div_ceil(n, 16), 256) } else { (div_ceil(n, 4), 256) };
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 4), 1, 1])
+        .grid([grid, 1, 1])
+        .block([block, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Tensor-core `C[m, n] = A[m, k] · W[:, col0..col0+k]ᵀ` for a K-slice of a
+/// wider NVFP4 weight: `weight` points at the slice's first column (packed
+/// byte and scale group), rows `ld_half` / `ld_groups` bytes apart. `kernel`
+/// is a `w4a16_gemv_tc{8,16,32}_ld` tier ([`crate::layers::w4a16_gemv_tiers::tc_ld_kernel`]).
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_tc_ld(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    ld_half: u32,
+    ld_groups: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        kernel.0 != 0 && (1..=32).contains(&m) && k % 16 == 0 && ld_half >= k / 2 && ld_groups >= k / 16,
+        "w4a16 strided tensor-core GEMV: m={m} k={k} ld={ld_half}/{ld_groups}"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 16), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)
         .arg_ptr(weight.weight_scale)
         .arg_f32(weight.weight_scale_2)
         .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(ld_half)
+        .arg_u32(ld_groups)
+        .launch(stream)
+}
+
+/// Exact-M=5 native-NVFP4 Q/K/V projections in one three-plane launch.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_batch5_qkv(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    q: &QuantizedWeight,
+    k_weight: &QuantizedWeight,
+    v: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert_eq!(m, 5);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 3])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(q.weight)
+        .arg_ptr(q.weight_scale)
+        .arg_f32(q.weight_scale_2)
+        .arg_ptr(k_weight.weight)
+        .arg_ptr(k_weight.weight_scale)
+        .arg_f32(k_weight.weight_scale_2)
+        .arg_ptr(v.weight)
+        .arg_ptr(v.weight_scale)
+        .arg_f32(v.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Exact-M=5 pair of same-shape native-NVFP4 projections in one launch.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_batch5_dual(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    first: &QuantizedWeight,
+    second: &QuantizedWeight,
+    first_output: DevicePtr,
+    second_output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert_eq!(m, 5);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 2])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(first.weight)
+        .arg_ptr(first.weight_scale)
+        .arg_f32(first.weight_scale_2)
+        .arg_ptr(second.weight)
+        .arg_ptr(second.weight_scale)
+        .arg_f32(second.weight_scale_2)
+        .arg_ptr(first_output)
+        .arg_ptr(second_output)
         .arg_u32(m)
         .arg_u32(n)
         .arg_u32(k)
