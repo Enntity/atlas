@@ -5,15 +5,12 @@
 mod components;
 mod dense;
 mod layers;
-mod mtp;
 pub(crate) mod retirement;
 mod tp;
 mod vision;
 
 #[cfg(test)]
 mod nvidia_dense_tests;
-
-pub(crate) use mtp::{Glm5MtpModule, load_glm5_mtp_module};
 
 use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;

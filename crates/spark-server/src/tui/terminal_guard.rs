@@ -2,7 +2,7 @@
 
 //! Raw-mode/alternate-screen lifecycle with crash safety.
 //!
-//! The terminal MUST be restored on ordinary exit paths — clean quit, detach,
+//! The terminal MUST be restored on every exit path — clean quit, detach,
 //! `?`-panic on ANY thread (CUDA `.expect()`s in the scheduler thread
 //! included), or the process unwinding out of `main`. Three layers:
 //!
@@ -16,8 +16,6 @@
 //!     lines to stderr and points at the tee file.
 //!
 //! SIGKILL cannot be caught; `reset`/`stty sane` is the documented recovery.
-//! A future selected paired session's terminal failure likewise skips restoration
-//! so that neither logging locks nor cleanup can delay immediate process exit.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -162,7 +160,6 @@ impl Drop for TerminalGuard {
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        crate::glm_terminal_session::panic_if_selected_live();
         // 1. Sane screen first, so everything below is actually visible.
         restore();
         // 2. Recent context: the last lines the operator saw in the TUI.

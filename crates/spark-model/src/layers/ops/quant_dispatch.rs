@@ -224,7 +224,11 @@ pub fn w4a16_gemv_batchm(
         tc_rows.is_none_or(|rows| m <= rows && k % 16 == 0),
         "w4a16 tensor-core GEMV: m={m} k={k} exceeds {tc_rows:?} rows"
     );
-    let (grid, block) = if tc { (div_ceil(n, 16), 256) } else { (div_ceil(n, 4), 256) };
+    let (grid, block) = if tc {
+        (div_ceil(n, 16), 256)
+    } else {
+        (div_ceil(n, 4), 256)
+    };
     KernelLaunch::new(gpu, kernel)
         .grid([grid, 1, 1])
         .block([block, 1, 1])
@@ -258,7 +262,11 @@ pub fn w4a16_gemv_tc_ld(
     stream: u64,
 ) -> Result<()> {
     anyhow::ensure!(
-        kernel.0 != 0 && (1..=32).contains(&m) && k % 16 == 0 && ld_half >= k / 2 && ld_groups >= k / 16,
+        kernel.0 != 0
+            && (1..=32).contains(&m)
+            && k % 16 == 0
+            && ld_half >= k / 2
+            && ld_groups >= k / 16,
         "w4a16 strided tensor-core GEMV: m={m} k={k} ld={ld_half}/{ld_groups}"
     );
     KernelLaunch::new(gpu, kernel)

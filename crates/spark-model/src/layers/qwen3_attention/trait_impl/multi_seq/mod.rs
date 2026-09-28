@@ -15,8 +15,8 @@ mod attn;
 mod c4;
 mod ctx;
 mod ffn;
-mod guard;
 mod glm_long_owner;
+mod guard;
 mod hc_ffn;
 mod hc_generic;
 mod mla;
@@ -25,7 +25,6 @@ mod mla_glm;
 mod mla_glm_sparse;
 mod mla_independent;
 mod nemotron_serial;
-mod pair;
 mod qkv;
 mod qkv_dp4a;
 mod qkv_fp8;
@@ -170,18 +169,6 @@ impl Qwen3AttentionLayer {
             self.ms_hc_ffn_post(&c, phase, ctx, stream)?;
         }
         Ok(())
-    }
-
-    /// Attention plus the original FFN collapse/norm. None means the original
-    /// standalone-attention path already performed its final head operation.
-    fn ms_hc_attention_norm(
-        &self,
-        c: &ctx::MultiSeqCtx<'_>,
-        kv_cache: &mut PagedKvCache,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<Option<hc_ffn::HcFfnPhase>> {
-        self.ms_hc_attention_norm_impl(c, kv_cache, ctx, stream, None, None, false, c.seq_lens)
     }
 
     #[allow(clippy::too_many_arguments)]

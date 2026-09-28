@@ -99,8 +99,6 @@ pub(super) fn drain_pending_requests(
     pending: &Arc<(Mutex<PendingQueue>, Condvar)>,
     active: &[ActiveSeq],
     prefilling: &[PrefillInProgress],
-    swapped: &[SwappedSeq],
-    preempted: &[PreemptedSeq],
     policy: &dyn SchedulingPolicy,
     max_batch_size: usize,
     // `Model::has_shared_prompt_capture`: new prompts wait for the one in
@@ -219,26 +217,16 @@ pub(super) fn drain_pending_requests(
         cap
     };
 
-    let (eligible_prefix, effective_cap) = super::repair_admission_gate::limit_requests(
-        &g.requests,
-        active,
-        prefilling,
-        swapped,
-        preempted,
-        cap,
-        spark_model::speculative::glm_repair_policy::enabled(),
-    );
     let infos: Vec<PendingRequestInfo> = g
         .requests
         .iter()
-        .take(eligible_prefix)
         .enumerate()
         .map(|(i, req)| PendingRequestInfo {
             prompt_len: req.prompt_len(),
             index: i,
         })
         .collect();
-    let selected = policy.select_prefills(&infos, effective_cap);
+    let selected = policy.select_prefills(&infos, cap);
 
     // Remove selected indices from pending (reverse order to preserve indices).
     let mut remove_indices = selected.clone();
@@ -379,67 +367,6 @@ pub(super) fn retire_finished_sequences(
     compact_survivors_into_range(model, &mut survivors);
     *active = survivors;
 }
-
-/// Paired-only retirement: the selected caller handles Err while still armed,
-/// before any ordinary cleanup can drop the retained host owners.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(super) fn retire_selected_finished_sequences(
-    model: &dyn Model,
-    active: &mut Vec<ActiveSeq>,
-    max_seq_len: usize,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        model.glm_paired_execution().is_some() && model.ep_protocol_v2(),
-        "selected retirement requires actual paired EP-v2 Model"
-    );
-    let capacity = model
-        .glm_paired_execution()
-        .expect("validated selected retirement capability")
-        .owner_capacity()?;
-    anyhow::ensure!(
-        (2..=8).contains(&capacity),
-        "selected retirement requires actual owner capacity 2..=8"
-    );
-    let mut seen = [false; 8];
-    for a in active.iter() {
-        let slot = a.seq.slot_idx;
-        anyhow::ensure!(
-            slot < capacity && !seen[slot],
-            "selected retirement owner slots must be distinct and below actual capacity"
-        );
-        seen[slot] = true;
-    }
-    for slot in 0..capacity {
-        if crate::tui::shutdown::requested() {
-            return Ok(());
-        }
-        let Some(index) = active
-            .iter()
-            .position(|a| a.finished && a.seq.slot_idx == slot)
-        else {
-            continue;
-        };
-        let a = &mut active[index];
-        // Keep the actual host owner live on either failure. Local resources may
-        // already be retired when F1 fails: this is terminal, never rollback/retry.
-        model.free_sequence(&mut a.seq)?;
-        model.ep_broadcast_cmd_for_seq(slot as u32, 0xFFFFFFF1)?;
-        model
-            .glm_paired_execution()
-            .expect("validated selected retirement capability")
-            .check_communication_health()?;
-        if crate::tui::shutdown::requested() {
-            return Ok(());
-        }
-        super::lifecycle::finish_response(a, max_seq_len);
-        active.remove(index);
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-#[path = "glm_c2_retirement_tests.rs"]
-mod selected_retirement_tests;
 
 /// Compact live sequences towards contiguous SSM slots `[0..n)` (n = the
 /// slice length), claiming each migration target exclusively from the pool's

@@ -61,7 +61,11 @@ fn launch(
     n: u32,
     k: u32,
 ) -> Result<()> {
-    let (grid, block) = if tc { (div_ceil(n, 16), 256) } else { (div_ceil(n, 4), 256) };
+    let (grid, block) = if tc {
+        (div_ceil(n, 16), 256)
+    } else {
+        (div_ceil(n, 4), 256)
+    };
     KernelLaunch::new(g, kh)
         .grid([grid, 1, 1])
         .block([block, 1, 1])
@@ -94,7 +98,11 @@ fn main() -> Result<()> {
             .flat_map(|_| bf16::from_f32(rng.f() * 2.0 - 1.0).to_bits().to_le_bytes())
             .collect();
         let w: Vec<u8> = (0..n * k)
-            .flat_map(|_| bf16::from_f32((rng.f() * 2.0 - 1.0) * 0.05).to_bits().to_le_bytes())
+            .flat_map(|_| {
+                bf16::from_f32((rng.f() * 2.0 - 1.0) * 0.05)
+                    .to_bits()
+                    .to_le_bytes()
+            })
             .collect();
         let (ad, wd) = (up(g, &a)?, up(g, &w)?);
         let (c_ref, c_tc) = (g.alloc(32 * n * 2)?, g.alloc(32 * n * 2)?);
@@ -118,7 +126,10 @@ fn main() -> Result<()> {
             let tk = if m <= 16 { t16 } else { t32 };
             launch(g, tk, true, ad, wd, c_tc, m, n as u32, k as u32)?;
             g.synchronize(0)?;
-            let (r, t) = (down(g, c_ref, m as usize * n)?, down(g, c_tc, m as usize * n)?);
+            let (r, t) = (
+                down(g, c_ref, m as usize * n)?,
+                down(g, c_tc, m as usize * n)?,
+            );
             let mut worst = 0f32;
             for (x, y) in r.iter().zip(&t) {
                 let tol = x.abs().max(y.abs()) * (2.0 / 128.0) + 1e-3;
@@ -139,7 +150,17 @@ fn main() -> Result<()> {
             let t_ref = time(&|wp| {
                 for s in (0..m).step_by(8) {
                     let rows = (m - s).min(8);
-                    launch(g, bm, false, ad.offset(s as usize * k * 2), wp, c_ref.offset(s as usize * n * 2), rows, n as u32, k as u32)?;
+                    launch(
+                        g,
+                        bm,
+                        false,
+                        ad.offset(s as usize * k * 2),
+                        wp,
+                        c_ref.offset(s as usize * n * 2),
+                        rows,
+                        n as u32,
+                        k as u32,
+                    )?;
                 }
                 Ok(())
             })?;

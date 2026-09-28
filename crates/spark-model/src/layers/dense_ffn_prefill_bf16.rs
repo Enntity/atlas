@@ -118,7 +118,11 @@ impl DenseFfnLayer {
             if let Some(w) = &self.prefill_bf16_weights {
                 return Ok([w.gate_proj.weight, w.up_proj.weight, w.down_proj.weight][i]);
             }
-            let src = [&self.weights.gate_proj, &self.weights.up_proj, &self.weights.down_proj][i];
+            let src = [
+                &self.weights.gate_proj,
+                &self.weights.up_proj,
+                &self.weights.down_proj,
+            ][i];
             let scratch = ctx.buffers.expert_down_out();
             ensure!(
                 ctx.buffers.sizes().expert_down_out >= n as usize * k as usize * 2,

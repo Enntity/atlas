@@ -268,7 +268,11 @@ pub(super) fn load_mla_layer(
         (mla.wq_a.weight, config.q_lora_rank, config.hidden_size),
         (mla.wkv_a.weight, config.kv_lora_rank, config.hidden_size),
         (mla.wq_b.weight, wq_b_shape[0], wq_b_shape[1]),
-        (mla.wo.weight, config.hidden_size, tp.local_q_heads * tp.v_head_dim),
+        (
+            mla.wo.weight,
+            config.hidden_size,
+            tp.local_q_heads * tp.v_head_dim,
+        ),
     ];
     layer.set_mla_weights(mla);
     // Target layers only: the replicated MTP body keeps its own paths.

@@ -242,6 +242,18 @@ impl Fixture {
             inner: inner.clone(),
             record: record.clone(),
         });
+        let ssm_pools = crate::model::ssm_pools::SsmPools::new(
+            &cfg,
+            1,
+            false,
+            false,
+            true,
+            false,
+            4,
+            1,
+            gpu.as_ref(),
+        )
+        .unwrap();
         let mut model = TransformerModel::new(
             cfg,
             dense,
@@ -259,15 +271,14 @@ impl Fixture {
             1,
             crate::layers::MtpQuantization::Bf16,
             false,
-            false,
             Box::new(spark_runtime::prefix_cache::NoPrefixCaching),
             8,
             Some(comm),
             false,
-            4,
             None,
             1,
             16,
+            ssm_pools,
         )
         .unwrap();
         model.ep_protocol_v2 = v2;

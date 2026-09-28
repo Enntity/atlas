@@ -104,8 +104,14 @@ fn an_unknown_or_invalid_duration_is_refused() {
 #[test]
 fn the_select_filter_names_every_planned_frame() {
     let p = sample_plan(4, 10.0).expect("plan");
-    assert_eq!(p.select_filter(), "select='eq(n\\,0)+eq(n\\,1)+eq(n\\,2)+eq(n\\,3)'");
-    assert_eq!(sample_plan(1, 10.0).unwrap().select_filter(), "select='eq(n\\,0)'");
+    assert_eq!(
+        p.select_filter(),
+        "select='eq(n\\,0)+eq(n\\,1)+eq(n\\,2)+eq(n\\,3)'"
+    );
+    assert_eq!(
+        sample_plan(1, 10.0).unwrap().select_filter(),
+        "select='eq(n\\,0)'"
+    );
 }
 
 /// A container declaring an absurd rate must be refused by the planner rather
@@ -113,7 +119,9 @@ fn the_select_filter_names_every_planned_frame() {
 #[test]
 fn an_absurd_frame_count_is_refused_rather_than_built() {
     assert!(sample_plan(MAX_SAMPLE_PLAN, 1.0).is_ok());
-    let err = sample_plan(MAX_SAMPLE_PLAN + 1, 1.0).unwrap_err().to_string();
+    let err = sample_plan(MAX_SAMPLE_PLAN + 1, 1.0)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("planning limit"), "{err}");
 }
 

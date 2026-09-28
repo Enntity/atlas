@@ -14,7 +14,6 @@
 // ── Submodules (split for ≤500 LoC files) ──────────────────────────────────
 mod adaptive_rung;
 mod adaptive_spec;
-mod dflash_width;
 mod admission;
 mod beam_prefill;
 mod confidence;
@@ -22,6 +21,7 @@ mod decode_logits_content;
 mod decode_logits_seq;
 mod decode_logits_step;
 mod decode_step;
+mod dflash_width;
 #[cfg(test)]
 mod dspark_fail_closed_tests;
 mod emit_step;
@@ -29,15 +29,6 @@ mod fast_greedy;
 #[cfg(test)]
 mod finish_guard_tests;
 mod first_token_thinking;
-mod glm_c2_pair_step;
-#[cfg(target_os = "linux")]
-mod glm_c2_selected;
-#[cfg(target_os = "linux")]
-mod glm_c2_selected_prefill;
-mod glm_c2_serial;
-mod glm_owner_step;
-#[cfg(target_os = "linux")]
-pub(crate) use glm_c2_selected::run_selected;
 mod helpers;
 mod lifecycle;
 #[cfg(test)]
@@ -50,8 +41,6 @@ mod logprobs;
 mod mod_helpers;
 pub use mod_helpers::capture_runtime_handle;
 pub mod dumps;
-#[cfg(test)]
-mod glm_c2_fixture_tests;
 pub mod levers;
 pub mod limits;
 mod mtp_accept_debug;
@@ -72,7 +61,6 @@ mod prefill_a_step;
 mod prefill_a_step_params;
 mod prefill_b_step;
 mod prefill_normalization;
-mod repair_admission_gate;
 mod repetition;
 mod rollback;
 mod sample_step;
@@ -365,15 +353,6 @@ pub fn run(
     // context ceiling, i.e. reserve each request's own max_tokens; see
     // `admission` module docs and ATLAS_KV_ADMIT_WATERMARK).
     let admit_watermark = admission::resolve_admit_watermark(sched.limits.max_seq_len);
-    // The factory validates this opt-in and forbids a reduced watermark.
-    // Charge transient draft blocks per owner in addition to ordinary decode.
-    let shared_kv_spill = spark_model::speculative::glm_shared_kv::parse(
-        std::env::var(spark_model::speculative::glm_shared_kv::ENV)
-            .ok()
-            .as_deref(),
-    )
-    .expect("shared KV policy must pass factory validation before scheduler startup")
-    .map(|_| num_drafts.div_ceil(block_size.max(1)));
 
     let pending = Arc::new((
         Mutex::new(PendingQueue {
@@ -481,8 +460,6 @@ pub fn run(
             &pending,
             &active,
             &prefilling,
-            &swapped,
-            &preempted,
             &*policy,
             max_batch_size,
             model.has_shared_prompt_capture(),
@@ -504,7 +481,6 @@ pub fn run(
             admit_watermark,
             sched.limits.max_seq_len,
             block_size,
-            shared_kv_spill,
         );
         sched.timing.record(mtp_timing::Phase::LoopDrain, t_loop);
 
@@ -698,29 +674,30 @@ pub fn run(
         // prompts that arrived during the first chunk are admitted at the
         // next boundary (two back-to-back 8K chunks held both ~6 s).
         let head_just_started = model.is_ep() && prefill_queue_was_empty && !prefilling.is_empty();
-        let did_mixed_step = !head_just_started && continue_in_progress_prefills(
-            &*model,
-            &*policy,
-            &mut active,
-            &mut prefilling,
-            max_prefill_tokens,
-            max_batch_tokens,
-            always_mixed,
-            prefill_stream,
-            prefill_event,
-            use_mtp,
-            use_self_speculative,
-            use_ngram_speculative,
-            think_end_token,
-            think_start_token,
-            code_fence_token,
-            tool_call_start_token,
-            tool_call_end_token,
-            adaptive_sampling,
-            &sched,
-            &spec_step,
-            &mut rode,
-        );
+        let did_mixed_step = !head_just_started
+            && continue_in_progress_prefills(
+                &*model,
+                &*policy,
+                &mut active,
+                &mut prefilling,
+                max_prefill_tokens,
+                max_batch_tokens,
+                always_mixed,
+                prefill_stream,
+                prefill_event,
+                use_mtp,
+                use_self_speculative,
+                use_ngram_speculative,
+                think_end_token,
+                think_start_token,
+                code_fence_token,
+                tool_call_start_token,
+                tool_call_end_token,
+                adaptive_sampling,
+                &sched,
+                &spec_step,
+                &mut rode,
+            );
         sched.timing.record(mtp_timing::Phase::LoopPrefill, t_loop);
 
         if active.is_empty() {

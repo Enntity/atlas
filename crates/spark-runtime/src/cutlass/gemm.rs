@@ -82,7 +82,9 @@ pub fn bf16_gemm_tuned(
             )
         };
         if status != 0 {
-            bail!("CUTLASS tuned bf16 GEMM failed: status {status} for {m}x{n}x{k} config {config}");
+            bail!(
+                "CUTLASS tuned bf16 GEMM failed: status {status} for {m}x{n}x{k} config {config}"
+            );
         }
         Ok(())
     }

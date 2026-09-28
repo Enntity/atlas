@@ -7,13 +7,6 @@ use crate::layers::qwen3_attention::{HcSiteWeights, HcWeights};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
-#[path = "owner_kda_tests.rs"]
-mod owner_batch;
-#[path = "owner_mla_tests.rs"]
-mod owner_mla;
-#[path = "pair_kda_tests.rs"]
-mod pair;
-
 fn with_kda(rank: usize, run: impl FnOnce(&Gpu, &atlas_core::config::ModelConfig, &Glm5KdaLayer)) {
     with_kda_ffn(rank, false, run);
 }

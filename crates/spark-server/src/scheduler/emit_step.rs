@@ -28,10 +28,6 @@ mod cancellation_tests;
 mod thinking_tests;
 
 #[cfg(test)]
-#[path = "glm_c2_emit_position_tests.rs"]
-mod position_tests;
-
-#[cfg(test)]
 #[path = "glm_tool_boundary_tests.rs"]
 mod glm_tool_boundary_tests;
 

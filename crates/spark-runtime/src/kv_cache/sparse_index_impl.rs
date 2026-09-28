@@ -95,7 +95,11 @@ impl PagedKvCache {
             self.layers.len(),
             block_bytes,
             tail_entries,
-            if tail_slots.is_some() { "slot-mapped" } else { "one per block" },
+            if tail_slots.is_some() {
+                "slot-mapped"
+            } else {
+                "one per block"
+            },
             total as f64 / (1024.0 * 1024.0),
         );
         Ok(())

@@ -126,7 +126,6 @@ impl TransformerModel {
             && self.config.ep_world_size == 2
             && self.config.hc_mult == 4
             && self.lora.is_none()
-            && self.paired_handoff().is_none()
             && self.multi_rank_protocol_active()
             && self.ep_protocol_v2
     }
@@ -763,11 +762,7 @@ impl TransformerModel {
             accepted < rows,
             "GLM long owner verdict {accepted} for {rows} rows"
         );
-        let base = seq
-            .seq_len
-            .checked_sub(rows)
-            .context("GLM long owner verify base underflow")?;
-        self.ep_worker_apply_verdict(seq, base, &tokens, accepted)
+        self.ep_worker_apply_verdict(seq, &tokens, accepted)
     }
 }
 

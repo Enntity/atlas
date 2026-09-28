@@ -437,7 +437,11 @@ impl MoeLayer {
     pub(super) fn release_routed_scales(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
         let mut freed = 0usize;
         for expert in self.weights.experts.iter_mut() {
-            for proj in [&mut expert.gate_proj, &mut expert.up_proj, &mut expert.down_proj] {
+            for proj in [
+                &mut expert.gate_proj,
+                &mut expert.up_proj,
+                &mut expert.down_proj,
+            ] {
                 if !proj.weight_scale.is_null() {
                     gpu.free(proj.weight_scale)?;
                     proj.weight_scale = DevicePtr::NULL;

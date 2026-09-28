@@ -50,7 +50,6 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         // Use backend's own stream (non-default, required for CUDA graph capture).
         let stream = self.gpu.default_stream();
-        let selected_paired = self.paired_handoff().is_some();
         // ATLAS_SSM_H_FP16: narrow this sequence's SSM h-state to FP16 exactly
         // once, HERE — outside the CUDA-graph region. No-op without the flag.
         self.ssm_h_to_f16_dispatch(seq)?;
@@ -265,9 +264,6 @@ impl TransformerModel {
         // dropping ~12% on the every-64th eager step.
         let seq64_boundary = seq.seq_len.is_multiple_of(64);
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
-            // The selected paired scalar bootstrap is an eager-only producer.
-            // Its terminal error path must not destroy/fallback a partial graph.
-            && !selected_paired
             // C3/C2 can drain to C1. Its selector also embeds host positions;
             // keep the final row eager throughout the opt-in sparse session.
             && !crate::layers::qwen3_attention::glm_multi_seq_sparse_enabled(
@@ -383,11 +379,7 @@ impl TransformerModel {
             // `synchronize`) fails with STREAM_CAPTURE_UNSUPPORTED and every
             // subsequent op on this stream is poisoned — a single refused request
             // bricks the whole server. Release the stream (discarding the partial
-            // graph) on the ordinary legacy path. Selected paired eager
-            // execution is terminal: no graph cleanup or retry after failure.
-            if selected_paired {
-                return Err(e);
-            }
+            // graph).
             self.gpu.abort_capture_if_active(stream);
             // A capture-poison error (900 CAPTURE_UNSUPPORTED / 901
             // CAPTURE_INVALIDATED) is a property of the graph attempt, not of

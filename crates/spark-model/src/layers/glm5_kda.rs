@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! GLM-5 KDA recurrent block for the conservative GB10 bring-up path.
-mod flash_prefill;
 mod forward_attention;
 mod forward_ffn;
 mod forward_recurrent;
 mod hc;
 mod indexed_core;
 mod multi_seq;
-mod paired_verify;
 mod profile;
 mod projection;
 mod recurrent;
@@ -129,7 +127,6 @@ pub struct Glm5KdaLayer {
     preprocess_regresident_k: KernelHandle,
     recurrent_regresident_k: KernelHandle,
     register_resident_prefill: bool,
-    flash_prefill: Option<flash_prefill::FlashPrefill>,
     gated_norm_k: KernelHandle,
     hc_expand_k: KernelHandle,
     hc_pre_k: KernelHandle,
@@ -279,20 +276,24 @@ impl Glm5KdaLayer {
             preprocess_regresident_k,
             recurrent_regresident_k,
             register_resident_prefill,
-            flash_prefill: flash_prefill::FlashPrefill::load(
-                heads,
-                dim,
-                config.kda_gate_lower_bound,
-            )?,
             gated_norm_k: gpu.kernel("kda", "kda_sigmoid_gated_rms_norm")?,
             // Highway-storage-specific mHC kernels (FP32, or BF16 twins).
             hc_expand_k: gpu.kernel("hyper_connection", &hc_name("hc_expand"))?,
             hc_pre_k: gpu.kernel("hyper_connection", &hc_name("hc_pre"))?,
-            hc_pre_from_raw_mix_k: gpu.kernel("hyper_connection", &hc_name("hc_pre_from_raw_mix"))?,
+            hc_pre_from_raw_mix_k: gpu
+                .kernel("hyper_connection", &hc_name("hc_pre_from_raw_mix"))?,
             hc_pre_mix_k: super::try_kernel(gpu, "hyper_connection", &hc_name("hc_pre_mix")),
             hc_post_k: gpu.kernel("hyper_connection", &hc_name("hc_post"))?,
-            hc_post_bf16_add_k: super::try_kernel(gpu, "hyper_connection", &hc_name("hc_post_bf16_add")),
-            hc_post_moe_blend_k: super::try_kernel(gpu, "hyper_connection", &hc_name("hc_post_moe_blend")),
+            hc_post_bf16_add_k: super::try_kernel(
+                gpu,
+                "hyper_connection",
+                &hc_name("hc_post_bf16_add"),
+            ),
+            hc_post_moe_blend_k: super::try_kernel(
+                gpu,
+                "hyper_connection",
+                &hc_name("hc_post_moe_blend"),
+            ),
             hc_contract_k: gpu.kernel("hyper_connection", &hc_name("hc_contract"))?,
         };
         if crate::model::glm_independent::enabled(&config.model_type)? {
@@ -337,33 +338,6 @@ impl Glm5KdaLayer {
 }
 
 impl TransformerLayer for Glm5KdaLayer {
-    fn validate_glm_owner_verify(
-        &self,
-        ctx: &ForwardContext,
-        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
-        stream: u64,
-    ) -> Result<()> {
-        let workspace = crate::layer::glm_owner_verify::GlmOwnerBatchWorkspace::new(ctx, shape)?;
-        self.validate_temporal(
-            &workspace.scratch,
-            &[ctx; 8][..shape.owners()],
-            crate::layer::glm_verify_ffn::GlmVerifyFfn::Owners(shape),
-            stream,
-        )
-    }
-
-    fn decode_glm_owner_verify(
-        &self,
-        owners: &mut [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>],
-        _cache: &mut PagedKvCache,
-        workspace: &mut crate::layer::glm_owner_verify::GlmOwnerBatchWorkspace,
-        ctx: &[&ForwardContext],
-        stream: u64,
-    ) -> Result<()> {
-        let mode = crate::layer::glm_verify_ffn::GlmVerifyFfn::Owners(workspace.shape());
-        self.decode_temporal(owners, &mut workspace.scratch, ctx, mode, stream)
-    }
-
     fn decode_glm_long_owners(
         &self,
         owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
@@ -428,31 +402,6 @@ impl TransformerLayer for Glm5KdaLayer {
             },
         )?;
         self.forward_ffn(phase, ctx, stream)
-    }
-
-    fn supports_glm_pair_verify(&self) -> bool {
-        self.pair_supported()
-    }
-
-    fn validate_glm_pair_verify(
-        &self,
-        ctx: &ForwardContext,
-        mode: crate::layer::glm_pair_verify::GlmPairFfn,
-        stream: u64,
-    ) -> Result<()> {
-        let workspace = crate::layer::glm_pair_verify::GlmPairWorkspace::new(ctx, mode)?;
-        self.validate_pair(&workspace, [ctx, ctx], stream)
-    }
-
-    fn decode_glm_pair_verify(
-        &self,
-        owners: [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>; 2],
-        _cache: &mut PagedKvCache,
-        workspace: &mut crate::layer::glm_pair_verify::GlmPairWorkspace,
-        ctx: [&ForwardContext; 2],
-        stream: u64,
-    ) -> Result<()> {
-        self.decode_pair(owners, workspace, ctx, stream)
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

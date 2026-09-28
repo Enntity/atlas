@@ -36,7 +36,9 @@ fn up(g: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
     Ok(p)
 }
 fn bf(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| bf16::from_f32(*x).to_bits().to_le_bytes()).collect()
+    v.iter()
+        .flat_map(|x| bf16::from_f32(*x).to_bits().to_le_bytes())
+        .collect()
 }
 fn f32b(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -47,7 +49,9 @@ fn down(g: &dyn GpuBackend, p: DevicePtr, bytes: usize) -> Result<Vec<u8>> {
     Ok(b)
 }
 fn as_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn main() -> Result<()> {
@@ -176,32 +180,81 @@ fn decode_seam(g: &dyn GpuBackend) -> Result<bool> {
         let scale: Vec<f32> = vec![0.7, 0.9, 1.1];
         let base: Vec<f32> = (0..24).map(|_| r.f()).collect();
         let (hw_a, hw_b) = (up(g, &bf(&highway))?, up(g, &bf(&highway))?);
-        let (blk, fnd, sc, bs) = (up(g, &bf(&block))?, up(g, &f32b(&fn_))?, up(g, &f32b(&scale))?, up(g, &f32b(&base))?);
+        let (blk, fnd, sc, bs) = (
+            up(g, &bf(&block))?,
+            up(g, &f32b(&fn_))?,
+            up(g, &f32b(&scale))?,
+            up(g, &f32b(&base))?,
+        );
         let (post_a, comb_a) = (up(g, &f32b(&post))?, up(g, &f32b(&comb))?);
         let (post_b, comb_b) = (up(g, &f32b(&post))?, up(g, &f32b(&comb))?);
         let (y_a, y_b) = (g.alloc(tokens * H * 2)?, g.alloc(tokens * H * 2)?);
         let scratch = g.alloc(64 * 32 * 25 * 4)?;
         let t = tokens as u32;
         let reference = |hw: DevicePtr| -> Result<()> {
-            KernelLaunch::new(g, post_k).grid([t, 1, 1]).block([256, 1, 1])
-                .arg_ptr(blk).arg_ptr(hw).arg_ptr(post_a).arg_ptr(comb_a).arg_ptr(hw)
-                .arg_u32(H as u32).arg_u32(4).launch(0)?;
-            KernelLaunch::new(g, mix_k).grid([t.div_ceil(32), 1, 1]).block([256, 1, 1])
-                .arg_ptr(hw).arg_ptr(fnd).arg_ptr(scratch).arg_ptr(scratch.offset(tokens * 96))
-                .arg_u32(t).launch(0)?;
-            KernelLaunch::new(g, fin_k).grid([t, 1, 1]).block([256, 1, 1])
-                .arg_ptr(hw).arg_ptr(scratch).arg_ptr(scratch.offset(tokens * 96)).arg_ptr(sc)
-                .arg_ptr(bs).arg_ptr(y_a).arg_ptr(post_a).arg_ptr(comb_a)
-                .arg_u32(3).arg_f32(1e-6).arg_f32(1e-6).launch(0)
+            KernelLaunch::new(g, post_k)
+                .grid([t, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(blk)
+                .arg_ptr(hw)
+                .arg_ptr(post_a)
+                .arg_ptr(comb_a)
+                .arg_ptr(hw)
+                .arg_u32(H as u32)
+                .arg_u32(4)
+                .launch(0)?;
+            KernelLaunch::new(g, mix_k)
+                .grid([t.div_ceil(32), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(hw)
+                .arg_ptr(fnd)
+                .arg_ptr(scratch)
+                .arg_ptr(scratch.offset(tokens * 96))
+                .arg_u32(t)
+                .launch(0)?;
+            KernelLaunch::new(g, fin_k)
+                .grid([t, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(hw)
+                .arg_ptr(scratch)
+                .arg_ptr(scratch.offset(tokens * 96))
+                .arg_ptr(sc)
+                .arg_ptr(bs)
+                .arg_ptr(y_a)
+                .arg_ptr(post_a)
+                .arg_ptr(comb_a)
+                .arg_u32(3)
+                .arg_f32(1e-6)
+                .arg_f32(1e-6)
+                .launch(0)
         };
         let seam = |hw: DevicePtr| -> Result<()> {
-            KernelLaunch::new(g, part_k).grid([64, t.div_ceil(4), 1]).block([128, 1, 1])
-                .arg_ptr(blk).arg_ptr(hw).arg_ptr(post_b).arg_ptr(comb_b).arg_ptr(fnd)
-                .arg_ptr(scratch).arg_u32(t).launch(0)?;
-            KernelLaunch::new(g, dfin_k).grid([t, 1, 1]).block([256, 1, 1])
-                .arg_ptr(hw).arg_ptr(scratch).arg_ptr(sc).arg_ptr(bs).arg_ptr(y_b)
-                .arg_ptr(post_b).arg_ptr(comb_b).arg_u32(t).arg_u32(3).arg_f32(1e-6)
-                .arg_f32(1e-6).launch(0)
+            KernelLaunch::new(g, part_k)
+                .grid([64, t.div_ceil(4), 1])
+                .block([128, 1, 1])
+                .arg_ptr(blk)
+                .arg_ptr(hw)
+                .arg_ptr(post_b)
+                .arg_ptr(comb_b)
+                .arg_ptr(fnd)
+                .arg_ptr(scratch)
+                .arg_u32(t)
+                .launch(0)?;
+            KernelLaunch::new(g, dfin_k)
+                .grid([t, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(hw)
+                .arg_ptr(scratch)
+                .arg_ptr(sc)
+                .arg_ptr(bs)
+                .arg_ptr(y_b)
+                .arg_ptr(post_b)
+                .arg_ptr(comb_b)
+                .arg_u32(t)
+                .arg_u32(3)
+                .arg_f32(1e-6)
+                .arg_f32(1e-6)
+                .launch(0)
         };
         reference(hw_a)?;
         g.synchronize(0)?;
@@ -210,14 +263,28 @@ fn decode_seam(g: &dyn GpuBackend) -> Result<bool> {
         let bytes = tokens * 4 * H * 2;
         let same = down(g, hw_a, bytes)? == down(g, hw_b, bytes)?;
         let to_bf = |b: Vec<u8>| -> Vec<f32> {
-            b.chunks_exact(2).map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect()
+            b.chunks_exact(2)
+                .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                .collect()
         };
-        let (ya, yb) = (to_bf(down(g, y_a, tokens * H * 2)?), to_bf(down(g, y_b, tokens * H * 2)?));
-        let (pa, pb) = (as_f32(&down(g, post_a, tokens * 16)?), as_f32(&down(g, post_b, tokens * 16)?));
-        let (ca, cb) = (as_f32(&down(g, comb_a, tokens * 64)?), as_f32(&down(g, comb_b, tokens * 64)?));
+        let (ya, yb) = (
+            to_bf(down(g, y_a, tokens * H * 2)?),
+            to_bf(down(g, y_b, tokens * H * 2)?),
+        );
+        let (pa, pb) = (
+            as_f32(&down(g, post_a, tokens * 16)?),
+            as_f32(&down(g, post_b, tokens * 16)?),
+        );
+        let (ca, cb) = (
+            as_f32(&down(g, comb_a, tokens * 64)?),
+            as_f32(&down(g, comb_b, tokens * 64)?),
+        );
         let rel = |a: &[f32], b: &[f32]| {
             let scale = a.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
-            a.iter().zip(b).map(|(x, y)| (x - y).abs() / scale).fold(0f32, f32::max)
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs() / scale)
+                .fold(0f32, f32::max)
         };
         let (ey, ep, ec) = (rel(&ya, &yb), rel(&pa, &pb), rel(&ca, &cb));
         let ok = same && ey < 1e-2 && ep < 1e-4 && ec < 1e-4;

@@ -326,6 +326,18 @@ impl Fixture {
         };
         let comm =
             (tp > 1 || ep > 1).then(|| Arc::new(Rank(rank)) as Arc<dyn spark_comm::CommBackend>);
+        let ssm_pools = crate::model::ssm_pools::SsmPools::new(
+            &cfg,
+            1,
+            false,
+            false,
+            true,
+            false,
+            4,
+            1,
+            gpu.as_ref(),
+        )
+        .unwrap();
         let mut model = TransformerModel::new(
             cfg,
             dense,
@@ -343,15 +355,14 @@ impl Fixture {
             1,
             crate::layers::MtpQuantization::Bf16,
             false,
-            false,
             Box::new(spark_runtime::prefix_cache::NoPrefixCaching),
             8,
             comm,
             false,
-            4,
             None,
             1,
             16,
+            ssm_pools,
         )
         .unwrap();
         model.levers.max_decode_seqs = 1;

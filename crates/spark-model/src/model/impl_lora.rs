@@ -13,9 +13,6 @@ use spark_runtime::gpu::DevicePtr;
 use super::types::TransformerModel;
 use crate::layers::ops;
 
-#[path = "impl_lora_history.rs"]
-mod history;
-
 impl TransformerModel {
     /// Install a startup-static LoRA adapter (post-construction, mirroring
     /// [`Self::set_dflash_proposer`]). Walks the model layers by GLOBAL

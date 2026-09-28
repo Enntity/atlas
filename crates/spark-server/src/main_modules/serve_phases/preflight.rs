@@ -42,13 +42,6 @@ fn glm5_context_supported(max_seq_len: usize, max_prefill_tokens: usize, model_m
     max_seq_len <= model_max && max_prefill_tokens > 0
 }
 
-fn glm5_mtp_context_supported(max_seq_len: usize, num_drafts: usize, index_topk: usize) -> bool {
-    // Scheduler clamps zero drafts to one; the verifier has no semantic index.
-    max_seq_len
-        .checked_add(num_drafts.max(1))
-        .is_some_and(|verify_end| verify_end <= index_topk)
-}
-
 fn glm5_long_context_concurrency_supported(
     max_seq_len: usize,
     index_topk: usize,
@@ -77,57 +70,16 @@ pub(crate) fn preflight_reserve(
     config: &ModelConfig,
     free_mem: usize,
 ) -> Result<ReservePreflight> {
-    let independent = spark_model::model::glm_independent::enabled(&config.model_type)?;
-    let long_mtp = spark_model::speculative::glm_repair_policy::long_context_enabled();
+    // The GLM long-context lane: DFlash verification over the bounded sparse
+    // domain, with the topology resolved before any reserve (`independent.rs`).
+    let long_context = spark_model::speculative::glm_repair_policy::long_context_enabled();
     anyhow::ensure!(
-        !long_mtp
-            || spark_model::speculative::glm_repair_policy::enabled()
+        !long_context
             || (args.dflash && spark_model::speculative::glm_repair_policy::dflash_enabled()),
-        "GLM long-context verification requires repaired MTP or DFlash ownership"
+        "GLM long-context verification requires the GLM DFlash lane"
     );
-    anyhow::ensure!(
-        !long_mtp || (!args.glm_paired_mtp && !independent),
-        "GLM long-context MTP2 uses its retained serial verifier, not another dispatcher"
-    );
-    // Selected dispatchers retain TP-local topology and the exact row budget.
-    // Speculative profiles keep their intermediates and full CUDA headroom.
-    let bounded = independent || args.glm_paired_mtp || long_mtp;
-    if spark_model::speculative::glm_repair_policy::parse(
-        std::env::var("ATLAS_GLM_MTP_REPAIR").ok().as_deref(),
-    )? {
-        anyhow::ensure!(
-            !args.high_speed_swap && args.swap_space_gb == 0,
-            "GLM repair first lane requires resident state with swap disabled"
-        );
-        spark_model::speculative::glm_repair_policy::RepairPolicy {
-            model_type: &config.model_type,
-            world: args.world_size,
-            tp: args.tp_size,
-            ep: args.ep_size,
-            active: args.max_batch_size,
-            admitted: args.max_num_seqs,
-            // The repair verifier's indexed domain ends at 32K. A larger
-            // served native context remains usable, but requests whose
-            // prompt+max_tokens budget crosses that domain are fenced into
-            // native decode by scheduler admission.
-            context: args
-                .max_seq_len
-                .min(spark_model::speculative::glm_repair_policy::max_long_context()),
-            drafts: args.resolved_num_drafts(),
-            native_only: args.speculative
-                && !(args.dflash || args.self_speculative || args.ngram_speculative),
-            bf16: args.kv_cache_dtype.as_deref() == Some("bf16"),
-            prefix_reuse: args.enable_prefix_caching,
-            force: args
-                .mtp_gate
-                .as_deref()
-                .map(|v| v == "force")
-                .unwrap_or_else(|| std::env::var("ATLAS_MTP_GATE_FORCE").as_deref() == Ok("1")),
-            long_context: long_mtp,
-        }
-        .validate()?;
-        spark_model::speculative::glm_repair_policy::validate_environment()?;
-    }
+    // The long-context lane retains TP-local topology and the exact row budget.
+    let bounded = long_context;
     let c4_sparse = spark_model::model::glm_c4::validate_sparse_flag(
         &config.model_type,
         std::env::var("ATLAS_GLM_C4_SPARSE").ok().as_deref(),
@@ -138,7 +90,7 @@ pub(crate) fn preflight_reserve(
         anyhow::ensure!(
             !sparse_decode
                 || !(args.speculative || args.self_speculative || args.ngram_speculative),
-            "ATLAS_GLM_MULTI_SEQ_SPARSE=1 supports independent non-speculative decode only"
+            "ATLAS_GLM_MULTI_SEQ_SPARSE=1 supports non-speculative decode only"
         );
         anyhow::ensure!(
             glm5_context_supported(
@@ -151,19 +103,15 @@ pub(crate) fn preflight_reserve(
         );
         let ep_v2 = matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"));
         anyhow::ensure!(
-            !long_mtp || args.max_batch_size == 1 || ep_v2,
-            "GLM concurrent MTP2 requires ATLAS_EP_PROTOCOL=v2 for owner slot identity"
+            !long_context || args.max_batch_size == 1 || ep_v2,
+            "GLM concurrent long-context verification requires ATLAS_EP_PROTOCOL=v2 for owner slot identity"
         );
         let c4 = spark_model::model::glm_c4::enabled(&config.model_type);
         anyhow::ensure!(
-            independent || std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() != Ok("1") || c4,
+            std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() != Ok("1") || c4,
             "ATLAS_GLM_C4_GROUPED_MOE=1 requires ATLAS_GLM_C4_DECODE=1"
         );
-        if !independent
-            && !args.glm_paired_mtp
-            && !long_mtp
-            && (c4 || c4_sparse || args.max_batch_size == 4)
-        {
+        if !long_context && (c4 || c4_sparse || args.max_batch_size == 4) {
             spark_model::model::glm_c4::validate_prefill_budget(
                 args.max_prefill_tokens,
                 c4_sparse,
@@ -188,16 +136,14 @@ pub(crate) fn preflight_reserve(
             )?;
         }
         anyhow::ensure!(
-            independent
-                || long_mtp
-                || args.glm_paired_mtp
+            long_context
                 || glm5_concurrency_supported(args.max_batch_size, args.max_num_seqs, ep_v2, c4),
             "GLM-5 dual-Spark concurrency supports --max-batch-size 1..=3 and \
              --max-num-seqs max_batch..=5, or explicitly opted-in C4 with active/admitted4; \
              batches above one require ATLAS_EP_PROTOCOL=v2"
         );
         anyhow::ensure!(
-            long_mtp
+            long_context
                 || glm5_long_context_concurrency_supported(
                     args.max_seq_len,
                     config.index_topk,
@@ -210,29 +156,12 @@ pub(crate) fn preflight_reserve(
             config.index_topk,
         );
         anyhow::ensure!(
-            !(args.self_speculative || args.ngram_speculative),
-            "GLM-5 supports its checkpoint MTP layer via --speculative; self/ngram speculative modes are unsupported"
+            !(args.speculative || args.self_speculative || args.ngram_speculative),
+            "GLM-5 speculative decoding is served through --dflash; its native MTP layer \
+             and self/n-gram speculation are not supported"
         );
-        if args.speculative {
-            anyhow::ensure!(
-                long_mtp
-                    || glm5_mtp_context_supported(
-                        args.max_seq_len,
-                        args.resolved_num_drafts(),
-                        config.index_topk,
-                    ),
-                "GLM-5 MTP requires --max-seq-len + max(--num-drafts, 1) <= {}; verifier semantic indexing is not implemented",
-                config.index_topk,
-            );
-            anyhow::ensure!(
-                args.max_batch_size == 1
-                    || long_mtp
-                    || (args.glm_paired_mtp && (2..=8).contains(&args.max_batch_size)),
-                "GLM-5 MTP requires C1 or the supervised bounded-owner dispatcher"
-            );
-        }
         anyhow::ensure!(
-            independent || glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size),
+            glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size),
             "GLM-5 dual-Spark support requires --world-size 2 --ep-size 2 and either --tp-size 1 (EP fallback) or --tp-size 2 (overlapping TP+EP)"
         );
     }
@@ -243,7 +172,7 @@ pub(crate) fn preflight_reserve(
     let spec_on_pool =
         args.speculative || args.dflash || args.self_speculative || args.ngram_speculative;
     let pool_drafts = if args.dflash {
-        super::build::checked_dflash_num_drafts(args.dflash_gamma)?
+        super::build::checked_dflash_num_drafts(args.resolved_dflash_gamma())?
     } else {
         args.resolved_num_drafts()
     };
@@ -278,7 +207,7 @@ pub(crate) fn preflight_reserve(
     // Selected FP32 pools allocate one additional live dummy slot.
     // It has no prefix/rollback snapshots; do not inflate those counts.
     let live_slots = args.max_batch_size + usize::from(bounded);
-    let mut ssm_pool_bytes = spark_model::ssm_reserve::ssm_pool_reserve_bytes(
+    let ssm_pool_bytes = spark_model::ssm_reserve::ssm_pool_reserve_bytes(
         live_slots,
         config.num_ssm_layers() * h_state_bytes,
         config.num_ssm_layers() * conv_state_bytes,
@@ -519,7 +448,7 @@ pub(crate) fn preflight_reserve(
 mod tests {
     use super::{
         glm5_concurrency_supported, glm5_context_supported, glm5_dual_spark_parallelism,
-        glm5_long_context_concurrency_supported, glm5_mtp_context_supported,
+        glm5_long_context_concurrency_supported,
     };
 
     #[test]
@@ -550,20 +479,6 @@ mod tests {
         assert!(glm5_context_supported(100_000, 1024, 1_048_576));
         assert!(!glm5_context_supported(1_048_577, 1024, 1_048_576));
         assert!(!glm5_context_supported(100_000, 0, 1_048_576));
-    }
-
-    #[test]
-    fn glm5_mtp_context_includes_all_drafts_and_rejects_overflow() {
-        assert!(glm5_mtp_context_supported(2044, 4, 2048));
-        assert!(!glm5_mtp_context_supported(2045, 4, 2048));
-        assert!(glm5_mtp_context_supported(2047, 1, 2048));
-        assert!(!glm5_mtp_context_supported(2048, 1, 2048));
-        assert!(glm5_mtp_context_supported(2047, 0, 2048));
-        assert!(!glm5_mtp_context_supported(2048, 0, 2048));
-        assert!(!glm5_mtp_context_supported(16384, 4, 2048));
-        assert!(!glm5_mtp_context_supported(usize::MAX, 1, usize::MAX));
-        assert!(!glm5_mtp_context_supported(1, usize::MAX, usize::MAX));
-        assert!(!glm5_mtp_context_supported(0, 1, 0));
     }
 
     #[test]
