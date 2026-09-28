@@ -1,0 +1,152 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// GLM-5.3-Flash: the common `argmax_bf16.cu` kernels verbatim, plus the GLM-only
+// entry points below. Including (not copying) keeps this shadow in step
+// with its namesake.
+#include "../../common/argmax_bf16.cu"
+
+// Same tie rule as common/argmax_bf16.cu: maximize value, then take the
+// LOWER vocabulary index, so both TP2 vocabulary halves and every serial
+// call agree.
+__device__ __forceinline__ bool glm_argmax_other_better(
+    float other,
+    unsigned int other_idx,
+    float mine,
+    unsigned int mine_idx
+) {
+    return other > mine || (other == mine && other_idx < mine_idx);
+}
+
+// Local shard argmax for distributed vocabulary projection. The reduction is
+// byte-for-byte the same as `argmax_bf16`; thread zero additionally preserves
+// the winning BF16 value as FP32 beside its shard-local index. Two ranks can
+// exchange this 8-byte pair instead of all BF16 logits. A tied valid maximum
+// selects rank one (higher vocabulary IDs); two untouched -1e30f sentinels
+// select index zero, preserving the full-row all-invalid fallback. No BF16
+// value equals that FP32 sentinel, so the host can distinguish those cases.
+extern "C" __global__ void argmax_bf16_value(
+    const __nv_bfloat16* __restrict__ logits,
+    unsigned int* __restrict__ out_value_index,
+    unsigned int n
+) {
+    __shared__ float s_val[1024];
+    __shared__ unsigned int s_idx[1024];
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int stride = blockDim.x;
+    float local_max = -1e30f;
+    unsigned int local_idx = 0;
+    for (unsigned int i = tid; i < n; i += stride) {
+        const float v = __bfloat162float(logits[i]);
+        if (glm_argmax_other_better(v, i, local_max, local_idx)) {
+            local_max = v;
+            local_idx = i;
+        }
+    }
+    s_val[tid] = local_max;
+    s_idx[tid] = local_idx;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && glm_argmax_other_better(
+                s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
+            s_val[tid] = s_val[tid + s];
+            s_idx[tid] = s_idx[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out_value_index[0] = __float_as_uint(s_val[0]);
+        out_value_index[1] = s_idx[0];
+    }
+}
+
+// Per-row TP2 shard argmax that also reports the best index outside a small
+// banned set (min_tokens end tokens), in one pass. Row r reads
+// logits[r * row_stride .. + n]; `ban0..3` are shard-local indices
+// (0xFFFFFFFF = unused). out[r] = {best bits, best index, unbanned bits,
+// unbanned index}, same comparator as argmax_bf16_value.
+// Grid: (rows, 1, 1)  Block: (1024, 1, 1)
+extern "C" __global__ void argmax_bf16_value_ban(
+    const __nv_bfloat16* __restrict__ logits,
+    unsigned int* __restrict__ out,
+    unsigned int n,
+    unsigned int row_stride,
+    unsigned int ban0,
+    unsigned int ban1,
+    unsigned int ban2,
+    unsigned int ban3
+) {
+    __shared__ float s_val[2][1024];
+    __shared__ unsigned int s_idx[2][1024];
+
+    const unsigned int tid = threadIdx.x;
+    const __nv_bfloat16* row = logits + (size_t)blockIdx.x * row_stride;
+    float best = -1e30f, free_best = -1e30f;
+    unsigned int best_idx = 0, free_idx = 0;
+    for (unsigned int i = tid; i < n; i += blockDim.x) {
+        const float v = __bfloat162float(row[i]);
+        if (glm_argmax_other_better(v, i, best, best_idx)) {
+            best = v;
+            best_idx = i;
+        }
+        const bool banned = i == ban0 || i == ban1 || i == ban2 || i == ban3;
+        if (!banned && glm_argmax_other_better(v, i, free_best, free_idx)) {
+            free_best = v;
+            free_idx = i;
+        }
+    }
+    s_val[0][tid] = best;
+    s_idx[0][tid] = best_idx;
+    s_val[1][tid] = free_best;
+    s_idx[1][tid] = free_idx;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            for (int k = 0; k < 2; ++k) {
+                if (glm_argmax_other_better(
+                        s_val[k][tid + s], s_idx[k][tid + s], s_val[k][tid], s_idx[k][tid])) {
+                    s_val[k][tid] = s_val[k][tid + s];
+                    s_idx[k][tid] = s_idx[k][tid + s];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        unsigned int* o = out + 4 * blockIdx.x;
+        o[0] = __float_as_uint(s_val[0][0]);
+        o[1] = s_idx[0][0];
+        o[2] = __float_as_uint(s_val[1][0]);
+        o[3] = s_idx[1][0];
+    }
+}
+
+// Merge per-row TP2 shard quads from argmax_bf16_value_ban into global token
+// IDs, on device so a graph-captured verify needs no host round trip. The rule
+// is the host glm5_mtp argmax_merge::merge: a valid tie picks the higher
+// global ID (rank one); two untouched sentinels keep index zero. Row r merges
+// the unbanned pairs when bit r of (mask_hi:mask_lo) is set, else the best pairs.
+//
+// Grid: (1, 1, 1)  Block: (32, 1, 1)
+extern "C" __global__ void argmax_pair_merge_ban(
+    const unsigned int* __restrict__ local,
+    const unsigned int* __restrict__ peer,
+    unsigned int* __restrict__ out,
+    unsigned int rows,
+    unsigned int shard,
+    unsigned int rank,
+    unsigned int mask_lo,
+    unsigned int mask_hi
+) {
+    for (unsigned int r = threadIdx.x; r < rows; r += blockDim.x) {
+        const unsigned int word = r < 32 ? mask_lo : mask_hi;
+        const unsigned int o = 4 * r + (((word >> (r & 31)) & 1u) ? 2 : 0);
+        const unsigned int* p0 = rank == 0 ? local : peer;
+        const unsigned int* p1 = rank == 0 ? peer : local;
+        const float v0 = __uint_as_float(p0[o]);
+        const float v1 = __uint_as_float(p1[o]);
+        out[r] = (v1 > v0 || (v1 == v0 && v1 > -1e30f)) ? p1[o + 1] + shard : p0[o + 1];
+    }
+}
