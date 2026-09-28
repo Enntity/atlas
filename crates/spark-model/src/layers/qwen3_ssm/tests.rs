@@ -116,6 +116,7 @@ fn mk_state(gpu: &MockGpuBackend, layer: &Qwen3SsmLayer, n_inter: usize) -> SsmL
         h_state_checkpoint: None,
         conv_state_checkpoint: None,
         h_state_intermediates: (0..n_inter).map(|i| h_slab.offset(i * h_bytes)).collect(),
+        kda_records: spark_runtime::gpu::DevicePtr::NULL,
         conv_state_intermediates: (0..n_inter)
             .map(|i| conv_slab.offset(i * conv_bytes))
             .collect(),

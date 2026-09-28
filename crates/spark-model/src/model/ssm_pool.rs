@@ -103,6 +103,12 @@ pub(crate) struct SsmStatePool {
     /// Empty in snapshot mode. Allocated so boot sizing is honest; the
     /// capture that would fill it is not wired yet.
     pub(super) replay_input_rings: Vec<DevicePtr>,
+    /// GLM KDA fold records (`--ssm-rollback-mode records`), one region
+    /// per SSM layer of `(mtp_slots + 1) × num_intermediates` rows of
+    /// `kda_record_row_bytes`; replaces the H snapshot pools, which are then
+    /// not allocated. Empty otherwise.
+    pub(super) kda_record_pools: Vec<DevicePtr>,
+    pub(super) kda_record_row_bytes: usize,
     pub(super) free_slots: Mutex<Vec<usize>>,
 }
 
@@ -273,10 +279,28 @@ impl SsmStatePool {
         };
         let (h_inter_offsets, h_inter_total) = h_inter_layout(&h_inter_counts);
         let mut replay_input_rings = Vec::new();
+        let records = has_mtp && rollback_mode == crate::ssm_reserve::SsmRollbackMode::Records;
+        anyhow::ensure!(
+            !records || (config.model_type == "glm5_next" && h_stored_bytes == h_bytes),
+            "--ssm-rollback-mode records serves GLM-5 KDA with an FP32 h state only"
+        );
+        let kda_record_row_bytes = if records {
+            crate::ssm_reserve::kda_record_row_bytes(h_bytes)
+        } else {
+            0
+        };
+        let mut kda_record_pools = Vec::new();
+        // H snapshot units the pools really hold (0 under KDA records).
+        let h_inter_held = if records { 0 } else { h_inter_total };
         if has_mtp {
             let ni = num_intermediates;
             let mtp_total = mtp_slots + 1;
-            if !replay {
+            if records {
+                kda_record_pools =
+                    alloc_layer_pools(gpu, num_ssm_layers, mtp_total * ni * kda_record_row_bytes)?;
+                conv_intermediate_pools =
+                    alloc_layer_pools(gpu, num_ssm_layers, mtp_total * ni * conv_bytes)?;
+            } else if !replay {
                 h_intermediate_pools =
                     alloc_layer_pools(gpu, num_ssm_layers, h_inter_total * h_stored_bytes)?;
                 conv_intermediate_pools =
@@ -301,8 +325,9 @@ impl SsmStatePool {
             conv_checkpoint_pools = alloc_layer_pools(gpu, num_ssm_layers, mtp_total * conv_bytes)?;
 
             let mtp_mb = num_ssm_layers
-                * (h_inter_total * h_stored_bytes
-                    + mtp_total * (ni * conv_bytes + h_stored_bytes + conv_bytes))
+                * (h_inter_held * h_stored_bytes
+                    + mtp_total
+                        * (ni * (conv_bytes + kda_record_row_bytes) + h_stored_bytes + conv_bytes))
                 / (1024 * 1024);
             // Baseline for the log: FULL-WIDTH UNIFORM sizing at today's
             // per-slot shape ((ni-1) H + ni conv + checkpoint).
@@ -358,6 +383,8 @@ impl SsmStatePool {
             h_inter_offsets,
             rollback_mode,
             replay_input_rings,
+            kda_record_pools,
+            kda_record_row_bytes,
             free_slots: Mutex::new(free_slots),
         })
     }
@@ -581,6 +608,28 @@ impl SsmStatePool {
             .offset((self.h_inter_offsets[slot] + token_idx) * self.h_stored_bytes)
     }
 
+    /// H snapshots actually held for `slot`: its tiered count, or 0 under
+    /// KDA records (per-step scratch with nothing to reset or migrate).
+    pub(super) fn h_snapshot_count(&self, slot: usize) -> usize {
+        if self.h_intermediate_pools.is_empty() {
+            0
+        } else {
+            self.h_inter_count(slot)
+        }
+    }
+
+    /// Slot `slot`'s KDA fold records in SSM layer `ssm_layer_idx`
+    /// (`num_intermediates` rows), NULL unless KDA records are on.
+    pub(super) fn kda_records(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
+        self.kda_record_pools
+            .get(ssm_layer_idx)
+            .map_or(DevicePtr::NULL, |pool| {
+                pool.offset(
+                    self.mtp_slot(slot) * self.num_intermediates * self.kda_record_row_bytes,
+                )
+            })
+    }
+
     /// Number of H intermediates allocated for `slot` (tiered — see
     /// `h_inter_counts`). Uncovered slots clamp onto the full-width MTP
     /// dummy, mirroring the pointer accessors. 0 when `!has_mtp`.
@@ -669,7 +718,7 @@ impl SsmStatePool {
             gpu.memset(self.h_state(i, slot), 0, self.h_stored_bytes)?;
             gpu.memset(self.conv_state(i, slot), 0, self.conv_bytes)?;
             if reset_mtp {
-                for t in 0..self.h_inter_count(slot) {
+                for t in 0..self.h_snapshot_count(slot) {
                     gpu.memset(self.h_intermediate(i, slot, t), 0, self.h_stored_bytes)?;
                 }
                 for t in 0..self.num_intermediates {
@@ -716,7 +765,7 @@ impl SsmStatePool {
                 // is lossless. The intermediates are per-verify-step scratch
                 // regardless — nothing in them survives a step — so even a
                 // truncated copy could not lose live state.
-                for t in 0..self.h_inter_count(from).min(self.h_inter_count(to)) {
+                for t in 0..self.h_snapshot_count(from).min(self.h_snapshot_count(to)) {
                     gpu.copy_d2d_async(
                         self.h_intermediate(i, from, t),
                         self.h_intermediate(i, to, t),
@@ -849,6 +898,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for SsmStatePool {
             &mut self.conv_intermediate_pools,
             &mut self.h_checkpoint_pools,
             &mut self.conv_checkpoint_pools,
+            &mut self.kda_record_pools,
         ] {
             for ptr in pool.drain(..) {
                 if let Err(e) = gpu.free(ptr)
@@ -1133,6 +1183,8 @@ mod slot_guard_tests {
             h_inter_offsets: Vec::new(),
             rollback_mode: crate::ssm_reserve::SsmRollbackMode::Snapshot,
             replay_input_rings: Vec::new(),
+            kda_record_pools: Vec::new(),
+            kda_record_row_bytes: 0,
             free_slots: Mutex::new((0..max_slots).rev().collect()),
         })
     }

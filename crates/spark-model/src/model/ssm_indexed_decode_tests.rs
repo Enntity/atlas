@@ -90,6 +90,7 @@ fn state(h: u64, conv: u64) -> Box<dyn LayerState> {
         h_state_checkpoint: None,
         conv_state_checkpoint: None,
         h_state_intermediates: vec![],
+        kda_records: spark_runtime::gpu::DevicePtr::NULL,
         conv_state_intermediates: vec![],
         h_is_f16: false,
         h_prefill_stage: None,

@@ -146,6 +146,7 @@ pub(super) fn prepared(rank: usize) -> (Fixture, [flow::History; 2]) {
             h_state_intermediates: (0..4)
                 .map(|row| pool.h_intermediate(0, owner, row))
                 .collect(),
+            kda_records: spark_runtime::gpu::DevicePtr::NULL,
             conv_state_intermediates: (0..5)
                 .map(|row| pool.conv_intermediate(0, owner, row))
                 .collect(),

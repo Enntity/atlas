@@ -83,6 +83,10 @@ pub struct SsmLayerState {
     pub h_state_intermediates: Vec<DevicePtr>,
     /// Intermediate conv_state snapshots during batched verification.
     pub conv_state_intermediates: Vec<DevicePtr>,
+    /// GLM KDA fold records of a verify (`--ssm-rollback-mode records`): the
+    /// verify leaves `h_state` untouched and the commit folds the accepted
+    /// rows into it (NULL, with snapshots in `h_state_intermediates`, off).
+    pub kda_records: DevicePtr,
     /// Storage dtype of `h_state`: `false` = FP32, `true` = FP16
     /// (`--ssm-h-dtype f16`).
     ///

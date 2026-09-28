@@ -241,6 +241,7 @@ impl TransformerModel {
                 ssm.h_state_checkpoint = None;
                 ssm.conv_state_checkpoint = None;
                 ssm.h_state_intermediates.clear();
+                ssm.kda_records = DevicePtr(0);
                 ssm.conv_state_intermediates.clear();
             }
         }
@@ -391,6 +392,9 @@ impl TransformerModel {
                         if ssm.conv_state_checkpoint.is_some() {
                             ssm.conv_state_checkpoint =
                                 Some(self.ssm_pool.conv_checkpoint(ssm_layer_idx, new_slot));
+                        }
+                        if !ssm.kda_records.is_null() {
+                            ssm.kda_records = self.ssm_pool.kda_records(ssm_layer_idx, new_slot);
                         }
                         if !ssm.h_state_intermediates.is_empty() {
                             ssm.h_state_intermediates.clear();

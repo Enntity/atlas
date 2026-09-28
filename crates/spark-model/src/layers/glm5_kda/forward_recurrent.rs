@@ -163,9 +163,10 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let records = !state.kda_records.is_null();
         ensure!(
             tokens >= 1
-                && state.h_state_intermediates.len() + 1 >= tokens
+                && (records || state.h_state_intermediates.len() + 1 >= tokens)
                 && state.conv_state_intermediates.len() >= tokens,
             "GLM-5 KDA verify needs K-1 h and K conv intermediates (h={}, conv={}, K={tokens})",
             state.h_state_intermediates.len(),
@@ -193,6 +194,19 @@ impl Glm5KdaLayer {
             })
         };
         self.verify_conv_rows(packed, convolved, state, 0, tokens, ctx, stream)?;
+        if records {
+            return self.records_recurrence(
+                convolved,
+                g1,
+                beta,
+                core_out,
+                &[state.h_state],
+                &[state.kda_records],
+                tokens,
+                ctx,
+                stream,
+            );
+        }
         let fused_recurrent = self.recurrent_verify_snap_k.0 != 0
             && verify_batched_recurrent_snapshot_enabled()
             && contiguous(&state.h_state_intermediates, self.h_state_bytes);
@@ -422,6 +436,48 @@ impl Glm5KdaLayer {
     }
 }
 
+impl Glm5KdaLayer {
+    /// Records-mode verify of up to four owners over `tokens` rows each
+    /// (`--ssm-rollback-mode records`): the states are only read and each
+    /// owner's fold records are written for `commit_kda_records`.
+    #[allow(clippy::too_many_arguments)]
+    fn records_recurrence(
+        &self,
+        convolved: DevicePtr,
+        g1: DevicePtr,
+        beta: DevicePtr,
+        core_out: DevicePtr,
+        states: &[DevicePtr],
+        records: &[DevicePtr],
+        tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            self.recurrent_verify_rec_k.0 != 0 && self.dim == 128,
+            "KDA records verify needs kda_recurrent_bf16_verify_rec_owners at dim 128"
+        );
+        ops::kda_recurrent_verify_snap_owners(
+            ctx.gpu,
+            self.recurrent_verify_rec_k,
+            convolved,
+            g1,
+            beta,
+            self.weights.a_log.weight,
+            self.weights.dt_bias.weight,
+            core_out,
+            states,
+            records,
+            self.heads * ops::KDA_RECORD_FLOATS,
+            tokens as u32,
+            self.heads as u32,
+            self.dim as u32,
+            self.lower_bound,
+            stream,
+        )
+    }
+}
+
 /// Owners one `kda_recurrent_bf16_verify_snap_owners` launch takes.
 const OWNERS_PER_LAUNCH: usize = 4;
 
@@ -444,11 +500,18 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        if self.recurrent_verify_owners_k.0 == 0
-            || !(1..=crate::layer::glm_long_owner::MAX_OWNERS).contains(&owners.len())
+        let records = owners.iter_mut().all(|o| {
+            o.state
+                .as_any_mut()
+                .downcast_mut::<SsmLayerState>()
+                .is_some_and(|s| !s.kda_records.is_null())
+        });
+        if !(1..=crate::layer::glm_long_owner::MAX_OWNERS).contains(&owners.len())
             || rows < 2
             || self.dim != 128
-            || !verify_batched_recurrent_snapshot_enabled()
+            || (!records
+                && (self.recurrent_verify_owners_k.0 == 0
+                    || !verify_batched_recurrent_snapshot_enabled()))
         {
             return Ok(false);
         }
@@ -459,6 +522,10 @@ impl Glm5KdaLayer {
                 .as_any_mut()
                 .downcast_mut::<SsmLayerState>()
                 .ok_or_else(|| anyhow::anyhow!("GLM-5 KDA owner expected SsmLayerState"))?;
+            if records {
+                states.push((state.h_state, state.kda_records));
+                continue;
+            }
             let contiguous = !state.h_is_f16
                 && state.h_state_intermediates.len() + 1 >= rows
                 && state.h_state_intermediates[..rows - 1]
@@ -490,8 +557,33 @@ impl Glm5KdaLayer {
         }
         let p = self.heads * self.dim;
         let (h, i): (Vec<_>, Vec<_>) = states.into_iter().unzip();
+        if records {
+            for (c, (h, i)) in h
+                .chunks(OWNERS_PER_LAUNCH)
+                .zip(i.chunks(OWNERS_PER_LAUNCH))
+                .enumerate()
+            {
+                let r = row0 + c * OWNERS_PER_LAUNCH * rows;
+                self.records_recurrence(
+                    convolved.offset(r * 3 * p * 2),
+                    g1.offset(r * p * 2),
+                    beta.offset(r * self.heads * 2),
+                    core_out.offset(r * p * 2),
+                    h,
+                    i,
+                    rows,
+                    ctx,
+                    stream,
+                )?;
+            }
+            return Ok(true);
+        }
         // The kernel takes up to four owners; larger batches launch per four.
-        for (c, (h, i)) in h.chunks(OWNERS_PER_LAUNCH).zip(i.chunks(OWNERS_PER_LAUNCH)).enumerate() {
+        for (c, (h, i)) in h
+            .chunks(OWNERS_PER_LAUNCH)
+            .zip(i.chunks(OWNERS_PER_LAUNCH))
+            .enumerate()
+        {
             let r = row0 + c * OWNERS_PER_LAUNCH * rows;
             ops::kda_recurrent_verify_snap_owners(
                 ctx.gpu,
