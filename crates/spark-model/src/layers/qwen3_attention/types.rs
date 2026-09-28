@@ -27,6 +27,9 @@ pub struct Qwen3AttentionLayer {
     pub(super) post_attn_norm: DenseWeight,
     pub(super) ffn: FfnComponent,
     pub(super) attn_layer_idx: usize,
+    /// Absolute transformer block index; differs from the KV-layer index in
+    /// hybrid architectures such as GLM-5.
+    pub(super) block_idx: usize,
     /// Startup-static LoRA adapter overlay for the K/V/O projections (v0;
     /// q_proj excluded — gated Q+gate interleave). Installed
     /// post-construction via `set_lora_weights`; `None` = base-only.
@@ -111,6 +114,10 @@ pub struct Qwen3AttentionLayer {
     pub(super) o_dense_bf16: Option<DenseWeight>,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,
+    /// MXFP8 twins of MLA projections keyed by the BF16 weight pointer
+    /// (`ATLAS_GLM_MLA_MXFP8=1`): decode/verify rows (<= 32) read half the
+    /// bytes; prefill keeps BF16.
+    pub(crate) mla_mx: Vec<(DevicePtr, crate::layers::dflash_head::Mxfp8Weight)>,
     // ── Manifold-Constrained Hyper-Connections (mHC) — DeepSeek-V4 ──
     /// Per-block HC parameters. `Some` only for DeepSeek-V4 (`hc_mult > 0`),
     /// in which case the attn/ffn residual sites use `hc_pre`/`hc_post`
@@ -123,12 +130,20 @@ pub struct Qwen3AttentionLayer {
     pub(crate) qsa: Option<crate::layers::qsa::QsaIndexer>,
     /// HC `hc_pre` kernel handle (NULL when HC disabled).
     pub(super) hc_pre_k: KernelHandle,
+    /// Finalizer for the prefill-only batched TF32 mHC pre-mix.
+    pub(super) hc_pre_from_raw_mix_k: KernelHandle,
+    /// Exact per-(mix row, token) split of `hc_pre` for short batches.
+    pub(super) hc_pre_mix_k: KernelHandle,
     /// HC `hc_post` kernel handle (NULL when HC disabled).
     pub(super) hc_post_k: KernelHandle,
+    /// GLM K=5 shared-expert blend fused into `hc_post`.
+    pub(super) hc_post_moe_blend_k: KernelHandle,
     /// HC `hc_expand` kernel handle (NULL when HC disabled).
     pub(super) hc_expand_k: KernelHandle,
     /// HC `hc_head` kernel handle (NULL when HC disabled).
     pub(super) hc_head_k: KernelHandle,
+    /// Non-learned final mean contraction used by GLM-5 mHC.
+    pub(super) hc_contract_k: KernelHandle,
     // ── Transposed weights for prefill GEMM ──
     /// Fused [q|k|v] transposed twin (N = q_proj_dim + 2*kv_dim). Present only
     /// when the three projections share one `weight_scale_2` — the GEMM applies
@@ -191,6 +206,9 @@ pub struct Qwen3AttentionLayer {
     /// models whose attention weights are plain BF16 -- the quantized paths have
     /// w4a16/w8a16 batch tiers, BF16 had none.
     pub(super) dense_gemv_batchm_k: KernelHandle,
+    /// Exact five-row BF16 GEMV tier for GLM K=5 verification. Optional so
+    /// kernel sets built before this optimization retain the generic fallback.
+    pub(super) dense_gemv_batch5_k: KernelHandle,
     pub(super) w4a16_gemv_k: KernelHandle,
     /// Single-warp `w4a16_gemv_sw`. `KernelHandle(0)` on miss → base GEMV.
     pub(super) w4a16_gemv_sw_k: KernelHandle,
@@ -223,6 +241,14 @@ pub struct Qwen3AttentionLayer {
     /// Proportional RoPE kernel (Gemma-4 full-attention layers).
     pub(super) rope_proportional_k: KernelHandle,
     pub(super) reshape_cache_k: KernelHandle,
+    /// `ATLAS_GLM_LATENT_QDQ=1`: FP8 fake-quant of cached GLM latents
+    /// (quality probe for an FP8 latent cache). Null when off.
+    pub(super) glm_latent_qdq_k: KernelHandle,
+    /// `fp8_g128` GLM latents -> BF16 view for the BF16 prefill kernels.
+    /// Null unless the cache is `fp8_g128`.
+    pub(super) glm_latent_dequant_k: KernelHandle,
+    /// Device-length causal index fill for dense fp8_g128 single-row decode.
+    pub(super) glm_index_fill_causal_dev_k: KernelHandle,
     /// Fused k_norm + RoPE + paged BF16 cache write — eliminates two
     /// intermediate BF16 rounding steps that cause the documented L35-L39
     /// cliff in chunked-prefill BF16 KV mode (memory:
@@ -256,6 +282,16 @@ pub struct Qwen3AttentionLayer {
     pub(super) mla_paged_decode_fp8_k: KernelHandle,
     /// MLA batched GEMV for Q absorption and V extraction.
     pub(super) mla_batched_gemv_k: KernelHandle,
+    /// Exact two/three-row MLA GEMV for independent GLM-5 decode sessions.
+    pub(super) mla_batched_gemv_batch2_k: KernelHandle,
+    pub(super) mla_batched_gemv_batch3_k: KernelHandle,
+    /// Opt-in exact four-row MLA GEMV for independent short GLM decode.
+    pub(super) mla_batched_gemv_batch4_k: KernelHandle,
+    /// Exact five-row MLA GEMV for GLM-5 K=5 speculative verification.
+    pub(super) mla_batched_gemv_batch5_k: KernelHandle,
+    pub(super) mla_batched_gemv_batch6_k: KernelHandle,
+    pub(super) mla_batched_gemv_batch7_k: KernelHandle,
+    pub(super) mla_batched_gemv_batch8_k: KernelHandle,
     /// MLA fused kernels — decode.
     pub(super) mla_q_rope_scatter_k: KernelHandle,
     pub(super) mla_q_rope_writeback_k: KernelHandle,
@@ -269,6 +305,23 @@ pub struct Qwen3AttentionLayer {
     pub(super) prefill_attn_mla320_k: KernelHandle,
     /// Grouped GEMM for MLA Q absorption + V extraction.
     pub(super) grouped_gemm_mla_k: KernelHandle,
+    /// GLM-5 semantic index primitives: affine LayerNorm, four-token pool
+    /// compression/write, and the exact short-context causal index fill.
+    pub(super) glm_index_layernorm_k: KernelHandle,
+    pub(super) glm_index_tail_write_k: KernelHandle,
+    pub(super) glm_index_kpool_finalize_k: KernelHandle,
+    pub(super) glm_index_fill_causal_k: KernelHandle,
+    pub(super) glm_index_logits_k: KernelHandle,
+    pub(super) glm_index_logits_rows_per_cta: u32,
+    pub(super) glm_index_logits_pools_per_cta: u32,
+    pub(super) glm_index_logits_decode_k: KernelHandle,
+    pub(super) glm_index_topk_expand_k: KernelHandle,
+    pub(super) glm_sparse_attn_k: KernelHandle,
+    pub(super) glm_sparse_attn_heads_per_cta: u32,
+    pub(super) glm_sparse_attn_decode_k: KernelHandle,
+    pub(super) glm_index_logits_dynamic_k: KernelHandle,
+    pub(super) glm_index_topk_dynamic_k: KernelHandle,
+    pub(super) glm_sparse_attn_dynamic_k: KernelHandle,
     /// Q_final assembly: [absorbed|rope] per head.
     pub(super) mla_q_final_assemble_k: KernelHandle,
     /// Fused MLA prefill: Q_absorb + attention + V_extract in one kernel.
@@ -278,6 +331,9 @@ pub struct Qwen3AttentionLayer {
     pub(super) gemm_splitk_reduce_k: KernelHandle,
     /// Tensor-core BF16 GEMM (m16n8k16 MMA).
     pub(super) dense_gemm_tc_k: KernelHandle,
+    /// `mxfp8_gemv_tc8/16/32` (null when the module is absent).
+    pub(super) mxfp8_gemv_k: [KernelHandle; 3],
+    pub(super) mxfp8_quantize_k: KernelHandle,
     pub(super) paged_decode_splitk_k: Option<KernelHandle>,
     pub(super) paged_decode_reduce_k: Option<KernelHandle>,
     pub(super) residual_add_k: KernelHandle,

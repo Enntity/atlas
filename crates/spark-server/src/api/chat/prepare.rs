@@ -107,6 +107,7 @@ pub(crate) fn prepare_chat_prompt(
         cwd_hint,
         image_pixels,
         image_pad_counts,
+        vision_placeholders,
     } = msg_entry::build_msg_entries(
         state.vision_config.as_ref(),
         state.vision_max_pixels,
@@ -152,6 +153,7 @@ pub(crate) fn prepare_chat_prompt(
         &req.tools,
         &messages,
         &image_pad_counts,
+        &vision_placeholders,
         enable_thinking,
         thinking_budget,
         reasoning_effort,

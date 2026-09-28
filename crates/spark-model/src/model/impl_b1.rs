@@ -446,6 +446,7 @@ impl TransformerModel {
         } else {
             // Suppress per-op profiling by creating a non-profile context
             &ForwardContext {
+                ssm_batch: None,
                 buffers: ctx.buffers,
                 gpu: ctx.gpu,
                 config: ctx.config,
@@ -570,6 +571,7 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<DevicePtr> {
+        self.reject_paired_batch_producer()?;
         let stream = self.gpu.default_stream();
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
@@ -645,6 +647,7 @@ impl TransformerModel {
         };
 
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,

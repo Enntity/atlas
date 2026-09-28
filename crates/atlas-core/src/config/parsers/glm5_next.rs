@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
-use super::super::{LayerType, ModelConfig, finalize_config};
+use super::super::{LayerType, ModelConfig, finalize_config, parse_glm5_vision_config};
 
 fn usize_field(raw: &Value, name: &str) -> Result<usize> {
     let value = raw
@@ -158,10 +158,7 @@ pub fn parse_glm5_next(raw: &Value) -> Result<ModelConfig> {
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
     config.mtp_num_hidden_layers = config.num_mtp_modules;
-    // The checkpoint ships a vision tower; Atlas does not serve it yet, so the
-    // text model loads without it and requests carrying images are rejected
-    // (`api/chat/msg_entry.rs`: "no vision config").
-    config.vision = None;
+    config.vision = parse_glm5_vision_config(raw, text)?;
     finalize_config(&mut config, raw)?;
     Ok(config)
 }

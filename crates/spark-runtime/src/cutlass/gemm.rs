@@ -48,6 +48,95 @@ pub fn bf16_gemm_act_weight_t(
     }
 }
 
+/// Row-major `out[m, ldc] = act[m, lda] @ weight[n, k]^T` (BF16, FP32
+/// accumulate) through a CUTLASS tile/stage/CTA-swizzle `config`:
+/// 0 = 128x128x32/4-stage, 4 = 128x256x32/3-stage swizzle 4,
+/// 5 = 128x256x32/3-stage swizzle 8, 9 = 128x128x64/3-stage swizzle 8.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_tuned(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    config: u32,
+    stream: u64,
+) -> Result<()> {
+    #[cfg(atlas_cutlass)]
+    {
+        let status = unsafe {
+            atlas_cutlass_bf16_gemm_tuned(
+                act as *const c_void,
+                weight as *const c_void,
+                out as *mut c_void,
+                m as i32,
+                n as i32,
+                k as i32,
+                lda as i32,
+                ldc as i32,
+                config as i32,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!("CUTLASS tuned bf16 GEMM failed: status {status} for {m}x{n}x{k} config {config}");
+        }
+        Ok(())
+    }
+    #[cfg(not(atlas_cutlass))]
+    {
+        let _ = (act, weight, out, m, n, k, lda, ldc, config, stream);
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
+/// Head-batched BF16 GEMM with the `cublaslt::bf16_grouped_gemm_act_weight_t`
+/// contract: `out[t*c_stride+h*n+j] = sum_i act[t*a_stride+h*k+i]*w[h,j,i]`.
+/// One strided batch per head, 128x128x32 tiles, 3 stages.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_grouped_gemm_act_weight_t(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    g: u32,
+    n: u32,
+    k: u32,
+    a_stride: u32,
+    c_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    #[cfg(atlas_cutlass)]
+    {
+        let status = unsafe {
+            atlas_cutlass_bf16_grouped_gemm_act_weight_t(
+                act as *const c_void,
+                weight as *const c_void,
+                out as *mut c_void,
+                m as i32,
+                g as i32,
+                n as i32,
+                k as i32,
+                a_stride as i32,
+                c_stride as i32,
+                stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            bail!("CUTLASS grouped bf16 GEMM failed: status {status} for {m}x{g}x{n}x{k}");
+        }
+        Ok(())
+    }
+    #[cfg(not(atlas_cutlass))]
+    {
+        let _ = (act, weight, out, m, g, n, k, a_stride, c_stride, stream);
+        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+    }
+}
+
 /// Native CUTLASS NVFP4 dense projection:
 /// `out[M,N] = quant_nvfp4(act[M,K]) @ weight_t[N,K]^T -> BF16`.
 ///

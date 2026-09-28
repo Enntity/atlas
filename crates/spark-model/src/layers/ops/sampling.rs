@@ -36,6 +36,25 @@ pub fn argmax_bf16(
         .launch(stream)
 }
 
+/// Shard-local BF16 argmax that writes `(max_value: f32, local_index: u32)`.
+/// Its reduction and tie semantics match [`argmax_bf16`].
+pub fn argmax_bf16_value(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    logits: DevicePtr,
+    out_value_index: DevicePtr,
+    vocab_size: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(logits)
+        .arg_ptr(out_value_index)
+        .arg_u32(vocab_size)
+        .launch(stream)
+}
+
 /// Batched argmax: ONE launch, one block per row, instead of n serial launches of
 /// the single-row `argmax_bf16` (which is a one-CTA reduction and so uses 1 of 48
 /// SMs). Byte-identical — each block runs the identical per-row body.

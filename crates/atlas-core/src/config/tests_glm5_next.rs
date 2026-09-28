@@ -63,10 +63,11 @@ fn nvidia_checkpoint_maps_hybrid_kda_mla_moe_shape() {
     assert!(cfg.index_kpool_always_select_tail);
 
     assert_eq!(cfg.num_mtp_modules, 1);
-    assert!(
-        cfg.vision.is_none(),
-        "the GLM vision tower is not served yet"
-    );
+    let vision = cfg.vision.as_ref().expect("GLM vision config");
+    assert!(vision.is_glm5_next);
+    assert_eq!(vision.in_channels, 3);
+    assert_eq!(vision.out_hidden_size, 4096);
+    assert!(vision.image_start_token_id != 0 && vision.image_end_token_id != 0);
     let quant = cfg
         .quantization_config
         .expect("ModelOpt quantization config");

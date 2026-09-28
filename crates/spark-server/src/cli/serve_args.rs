@@ -526,6 +526,12 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub speculative: bool,
 
+    /// Supervised, fixed-profile GLM TP2/EP2 paired MTP4 serving.
+    /// Requires the one-shot inherited guard channel and matching launch recipe;
+    /// this flag alone never authorizes model construction or serving.
+    #[arg(long)]
+    pub glm_paired_mtp: bool,
+
     /// Enable self-speculative decoding: draft via layer-skipping (no MTP weights needed).
     /// Skips SSM layers during drafting for cheap predictions, then verifies with full model.
     #[arg(long, default_value_t = false)]
@@ -889,9 +895,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub fast_load_prefetch_shards: bool,
 
-    /// Vision input AREA bound in pixels, applied before patching. Overrides
-    /// the checkpoint in BOTH directions — it may raise the bound as well as
-    /// lower it.
+    /// Vision input pixel budget, applied before patching. Overrides the
+    /// checkpoint in BOTH directions — it may raise the bound as well as lower
+    /// it. Qwen paths interpret this as spatial H×W; GLM-5.3 interprets it as
+    /// the processor's temporal volume T×H×W and still applies its bounded
+    /// native encoder capacity.
     ///
     /// 0 (the default) means "use the checkpoint's own bound", read from
     /// `preprocessor_config.json` (`size.longest_edge`, or `max_pixels`;

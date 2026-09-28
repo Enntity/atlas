@@ -9,6 +9,10 @@ use std::time::Instant;
 
 use super::*;
 
+#[cfg(test)]
+#[path = "first_token_thinking_promotion_tests.rs"]
+mod first_token_thinking_tests;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn promote_completed_prefills(
     model: &dyn Model,
@@ -22,13 +26,18 @@ pub(super) fn promote_completed_prefills(
     // Served context ceiling (`sched.limits.max_seq_len`) — finish_sequence
     // needs it for the budget-derived `finish_reason` decision.
     max_seq_len: usize,
+    glm_tool_boundary: Option<u32>,
 ) {
     // Process in reverse order so swap_remove indices stay valid.
     completed_indices.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
     for (idx, maybe_token) in completed_indices {
         let mut p = prefilling.swap_remove(idx);
         let Some(first) = maybe_token else {
-            // Error path: free the sequence.
+            // Every producer uses None to mark a failed forward/sampling
+            // operation.  Complete the request before releasing its owner;
+            // otherwise the scheduler frees/reallocates the slot while the
+            // client waits forever behind SSE keepalives.
+            super::lifecycle::send_error_to_sink(&mut p.sink, "prefill failed");
             let mut seq = p.seq;
             if let Err(e) = model.free_sequence(&mut seq) {
                 tracing::error!("phase_promote_prefills: free_sequence (error path): {e:#}");
@@ -96,6 +105,7 @@ pub(super) fn promote_completed_prefills(
             tool_call_start_token,
             tool_call_end_token,
             model.decode_rollback_ring_slots(),
+            glm_tool_boundary,
         );
         if immediate_finish {
             finish_sequence(model, &mut a, max_seq_len);
@@ -110,7 +120,7 @@ pub(super) fn promote_completed_prefills(
 /// near-identical field initialisation; this helper reuses the same record
 /// and the caller decides whether to push onto active or finish_sequence.
 #[allow(clippy::too_many_arguments)]
-fn build_active_seq_from_prefill(
+pub(super) fn build_active_seq_from_prefill(
     p: PrefillInProgress,
     first: u32,
     spontaneous_think: bool,
@@ -124,13 +134,30 @@ fn build_active_seq_from_prefill(
     tool_call_end_token: Option<u32>,
     // Phase-C decode-rollback ring capacity (`model.decode_rollback_ring_slots()`).
     ssm_ring_capacity: usize,
+    glm_tool_boundary: Option<u32>,
 ) -> ActiveSeq {
     let temperature = p.temperature;
     // F4: sticky tool-request flag — grammar attached OR legacy tool path.
     // Computed before `p.grammar_state` is moved into the struct below.
     let tool_request = p.grammar_state.is_some() || use_legacy_tool_call;
+    let native_tool_open = p.max_tokens > 0 && p.tools_present && glm_tool_boundary == Some(first);
+    let thinking = first_token_thinking::FirstTokenThinking::resolve_with_tool_boundary(
+        p.enable_thinking,
+        first,
+        think_start_token,
+        think_end_token,
+        glm_tool_boundary.filter(|_| p.tools_present),
+    );
+    let mut seq = p.seq;
+    // Greedy verify heads mask end tokens below the min_tokens floor.
+    seq.eos_ban = spark_model::traits::EosBan::new(seq.prompt_len, p.min_tokens, &p.eos_tokens);
+    // ... and the drafter skips them there, so a banned end token never
+    // truncates an otherwise acceptable draft chain.
+    if let Some(proposer) = seq.proposer_state.as_mut() {
+        proposer.set_end_floor(seq.eos_ban.floor);
+    }
     ActiveSeq {
-        seq: p.seq,
+        seq,
         session_hash: p.session_hash,
         last_token: first,
         output_tokens: if (!immediate_finish && spontaneous_think) || p.max_tokens == 0 {
@@ -168,11 +195,7 @@ fn build_active_seq_from_prefill(
         logit_bias: p.logit_bias,
         pending_drafts: Vec::new(),
         pending_draft_conf: Vec::new(),
-        inside_thinking: if immediate_finish {
-            p.enable_thinking && think_end_token.is_some()
-        } else {
-            spontaneous_think || (p.enable_thinking && think_end_token.is_some())
-        },
+        inside_thinking: thinking.inside_thinking,
         enable_thinking: p.enable_thinking,
         thinking_budget: if !immediate_finish && spontaneous_think {
             Some(p.spontaneous_think_budget)
@@ -191,24 +214,17 @@ fn build_active_seq_from_prefill(
         in_code_fence: false,
         think_end_token,
         think_start_token,
-        // When thinking is disabled but model supports thinking, the template
-        // pre-closes with `<think>\n\n</think>\n\n`. Set think_ended=true so
-        // the </think> logit suppression is active from the start.
-        think_ended: if !immediate_finish && spontaneous_think {
-            false
-        } else {
-            !p.enable_thinking && think_end_token.is_some()
-        },
-        think_just_ended: false,
+        think_ended: thinking.think_ended,
+        think_just_ended: thinking.think_just_ended,
         post_think_emitted: 0,
         spec_adapt: Default::default(),
         think_skip_count: 0,
-        require_tool_call: use_legacy_tool_call,
+        require_tool_call: use_legacy_tool_call && !native_tool_open,
         tool_request,
         tools_present: p.tools_present,
         tool_call_start_token,
-        tool_call_opened: false,
-        inside_tool_body: false,
+        tool_call_opened: native_tool_open,
+        inside_tool_body: native_tool_open,
         tool_call_completed: false,
         post_completion_tool_opens: 0,
         tool_body_streak_tokens: 0,
@@ -234,4 +250,73 @@ fn build_active_seq_from_prefill(
         timeout_at: p.timeout_at,
         adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(temperature),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn failed_prefill_notifies_request_before_releasing_owner() {
+    let (a, mut response_rx) = super::test_support::test_seq(vec![], 8, None, 4);
+    let now = Instant::now();
+    let p = super::prefill_a_step_params::build_prefill_in_progress(
+        std::sync::Arc::new(vec![7; 4]),
+        0,
+        a.seq,
+        4,
+        8,
+        0,
+        super::test_support::EOS.to_vec(),
+        a.sink,
+        None,
+        now,
+        0.0,
+        0,
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0,
+        vec![],
+        false,
+        None,
+        None,
+        0,
+        false,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut prefilling = vec![p];
+    let mut active = Vec::new();
+
+    promote_completed_prefills(
+        &super::lifecycle_tests::StubModel::default(),
+        &mut prefilling,
+        vec![(0, None)],
+        &mut active,
+        None,
+        None,
+        None,
+        None,
+        64,
+        None,
+    );
+
+    let delivered = response_rx
+        .try_recv()
+        .unwrap_or_else(|e| panic!("failed prefill did not terminate request: {e:?}"));
+    match delivered {
+        Ok(_) => panic!("failed prefill unexpectedly returned a successful response"),
+        Err(e) => assert!(e.to_string().contains("prefill failed"), "{e:#}"),
+    }
+    assert!(prefilling.is_empty());
+    assert!(active.is_empty());
 }

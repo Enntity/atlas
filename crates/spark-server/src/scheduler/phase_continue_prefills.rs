@@ -27,8 +27,14 @@ mod prefill_waves;
 mod run_batched_mixed;
 #[path = "phase_continue_prefills/run_batched_prefill.rs"]
 mod run_batched_prefill;
+#[path = "phase_continue_prefills/run_fused.rs"]
+mod run_fused;
 #[path = "phase_continue_prefills/run_standard.rs"]
 mod run_standard;
+
+#[cfg(test)]
+#[path = "glm_prefill_normalization_tests.rs"]
+mod normalization_tests;
 
 use std::time::Instant;
 
@@ -42,6 +48,8 @@ use crate::scheduling_policy::{ActiveSeqTiming, SchedulingPolicy};
 use run_batched_mixed::run_batched_mixed_step;
 use run_batched_prefill::run_batched_prefill_step;
 use run_standard::run_standard_chunk_loop;
+
+pub(super) use run_fused::SpecStep;
 
 /// Shared per-chunk InnerQ poll used by every prefill path (standard /
 /// batched-prefill / batched-mixed). `maybe_finalize` is idempotent post
@@ -75,6 +83,10 @@ pub(super) fn continue_in_progress_prefills(
     tool_call_end_token: Option<u32>,
     adaptive_sampling: bool,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
+    spec: &SpecStep,
+    // Slots of the owners whose verify rode a prefill chunk this tick; they
+    // sit out its decode step.
+    rode: &mut Vec<usize>,
 ) -> bool {
     let mut did_mixed_step = false;
 
@@ -227,6 +239,7 @@ pub(super) fn continue_in_progress_prefills(
             tool_call_start_token,
             tool_call_end_token,
             sched.limits.max_seq_len,
+            sched.limits.glm_tool_boundary,
         );
         return did_mixed_step;
     }
@@ -261,6 +274,7 @@ pub(super) fn continue_in_progress_prefills(
             tool_call_start_token,
             tool_call_end_token,
             sched.limits.max_seq_len,
+            sched.limits.glm_tool_boundary,
         );
         return did_mixed_step;
     }
@@ -360,6 +374,9 @@ pub(super) fn continue_in_progress_prefills(
                 sched,
                 &mut completed_indices,
                 &mut did_mixed_step,
+                max_batch_tokens,
+                spec,
+                rode,
             );
         }
     }
@@ -375,6 +392,7 @@ pub(super) fn continue_in_progress_prefills(
         tool_call_start_token,
         tool_call_end_token,
         sched.limits.max_seq_len,
+        sched.limits.glm_tool_boundary,
     );
 
     did_mixed_step

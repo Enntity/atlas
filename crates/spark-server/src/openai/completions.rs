@@ -71,6 +71,12 @@ pub struct CompletionRequest {
     pub stop: Vec<String>,
     /// Seed for deterministic sampling (same as chat completions).
     pub seed: Option<u64>,
+    /// Per-request inference deadline in seconds. `None` uses the server's
+    /// `--request-timeout`; zero disables the deadline for this request.
+    /// Keep this aligned with `ChatCompletionRequest::timeout` so long raw
+    /// completions can override the production default too.
+    #[serde(default)]
+    pub timeout: Option<f32>,
     /// Per-request override for the vLLM-anchored token-loop detector
     /// (see `RepetitionDetectionParams` in `chat_request.rs`). None =
     /// use server default.
@@ -329,17 +335,6 @@ impl CompletionChunk {
 }
 
 // ── Tokenize endpoint types ──
-
-/// Request body for POST /tokenize.
-#[derive(Debug, Deserialize)]
-pub struct TokenizeRequest {
-    #[allow(dead_code)]
-    pub model: Option<String>,
-    /// Raw text to tokenize (mutually exclusive with `messages`).
-    pub prompt: Option<String>,
-    /// Chat messages to tokenize via the chat template (mutually exclusive with `prompt`).
-    pub messages: Option<Vec<IncomingMessage>>,
-}
 
 /// Response body for POST /tokenize.
 #[derive(Debug, Serialize)]

@@ -4,6 +4,12 @@
 
 use super::*;
 
+#[inline]
+fn glm_k5_router_m5_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_K5_ROUTER_M5").as_deref() == Ok("1"))
+}
+
 impl MoeLayer {
     /// Pre-dequant dense (non-expert) NVFP4 weights to FP8 for zero-overhead prefill.
     ///
@@ -15,6 +21,7 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
         stream: u64,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
         let shared_inter = config.shared_expert_intermediate_size;
         let num_experts = config.num_experts;
@@ -69,6 +76,7 @@ impl MoeLayer {
         shared_expert: Fp8ExpertWeight,
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         self.fp8_gate_weight_ptrs = Some(build_fp8_ptr_table(experts, |e| &e.gate_proj, gpu)?);
         self.fp8_up_weight_ptrs = Some(build_fp8_ptr_table(experts, |e| &e.up_proj, gpu)?);
         self.fp8_down_weight_ptrs = Some(build_fp8_ptr_table(experts, |e| &e.down_proj, gpu)?);
@@ -95,6 +103,7 @@ impl MoeLayer {
         shared_down: DevicePtr,
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         use super::build_bf16_ptr_table;
         self.bf16_gate_weight_ptrs = Some(build_bf16_ptr_table(gate_experts, gpu)?);
         self.bf16_up_weight_ptrs = Some(build_bf16_ptr_table(up_experts, gpu)?);
@@ -123,6 +132,7 @@ impl MoeLayer {
         up_proj: DenseWeight,
         down_proj: DenseWeight,
     ) -> Result<()> {
+        self.btile_storage.require_legacy()?;
         self.bf16_shared_expert = Some(Bf16SharedExpert::new(gate_proj, up_proj, down_proj)?);
         Ok(())
     }
@@ -273,6 +283,63 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // GLM prefill (`ATLAS_GLM_ROUTER_PREFILL_CUBLAS=1`): tensor-core BF16
+        // GEMM with FP32 accumulation instead of the order-preserving BN32
+        // kernel (~5 TFLOPS). Routing arithmetic then differs from decode's
+        // in summation order only.
+        if ctx.config.model_type == "glm5_next"
+            && num_tokens > 64
+            && !ctx.graph_capture
+            && glm_router_prefill_cublas()
+        {
+            return spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+                router_in.0,
+                self.weights.gate.weight.0,
+                gate_logits.0,
+                num_tokens,
+                num_experts,
+                hidden_size,
+                stream,
+            );
+        }
+        // Owner-batched verify rows (9..=32): one tensor-core weight pass.
+        if ctx.config.model_type == "glm5_next"
+            && let tc = ops::dense_tc_kernel(ctx.gpu, num_tokens)
+            && tc.0 != 0
+        {
+            return ops::dense_gemv_bf16_tc(
+                ctx.gpu,
+                tc,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                num_tokens,
+                num_experts,
+                hidden_size,
+                num_experts,
+                stream,
+            );
+        }
+        if self.try_router_prefill_bn32(
+            router_in,
+            gate_logits,
+            num_tokens,
+            num_experts,
+            hidden_size,
+            ctx,
+            stream,
+        )? {
+            return Ok(());
+        }
+        if ctx.config.model_type == "glm5_next"
+            && num_tokens == 5
+            && num_experts == 288
+            && hidden_size == 4096
+            && self.dense_gemm_router_m5.0 != 0
+            && glm_k5_router_m5_enabled()
+        {
+            return self.run_router_bn4(router_in, gate_logits, ctx, stream);
+        }
         if self.dense_gemm_router.0 != 0 {
             return ops::dense_gemm_router(
                 ctx.gpu,
@@ -336,4 +403,9 @@ impl MoeLayer {
         )?;
         Ok(normed)
     }
+}
+
+fn glm_router_prefill_cublas() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_ROUTER_PREFILL_CUBLAS").as_deref() == Ok("1"))
 }

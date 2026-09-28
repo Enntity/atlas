@@ -34,6 +34,7 @@ pub mod tp_shard;
 pub mod traits;
 pub mod video_decode_ffmpeg;
 pub mod video_preprocess;
+pub mod video_sample;
 pub mod vision_item;
 pub mod vision_preprocess;
 pub use vision_item::VisionItem;
@@ -62,7 +63,7 @@ pub fn ships_vanilla_norm_weights(config: &atlas_core::config::ModelConfig) -> b
 /// The dispatch predicate itself, on the bare `model_type`, so it is unit-testable
 /// without constructing a full `ModelConfig`.
 pub fn model_type_ships_vanilla_norm_weights(model_type: &str) -> bool {
-    matches!(model_type, "deepseek_v4" | "laguna")
+    matches!(model_type, "deepseek_v4" | "glm5_next" | "laguna")
 }
 
 #[cfg(test)]
@@ -75,6 +76,7 @@ mod norm_convention_tests {
     #[test]
     fn vanilla_norm_models_are_explicit() {
         assert!(vanilla("deepseek_v4"));
+        assert!(vanilla("glm5_next"));
         assert!(vanilla("laguna"));
         for other in [
             "qwen3_next",

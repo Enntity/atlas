@@ -11,15 +11,17 @@
 //! `StreamEvent` channel): a preempted victim's channel must stay OPEN and
 //! EMPTY — no `StreamEvent::Error`, no premature `Done`.
 
+use super::lifecycle::resume_swapped_seq;
 use super::preempt::{
     PREEMPT_IMMUNITY_TOKENS, choose_decode_victim, decode_batch_with_preemption, preempt_requeue,
-    resume_preempted_seq, resume_preempted_seqs,
+    resume_preempted_seq, resume_preempted_seqs, spill_out_sequence,
 };
 use super::test_support::test_seq;
 use super::types::{ActiveSeq, ResponseSink};
 use anyhow::Result;
 use spark_model::traits::{Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
+use spark_runtime::kv_spill::KvSpillManager;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -191,6 +193,21 @@ impl Model for PreemptStubModel {
     }
     fn cache_sequence(&self, _s: &SequenceState) {
         self.cached_seqs.fetch_add(1, Ordering::SeqCst);
+    }
+    fn save_sequence_state(
+        &self,
+        _s: &SequenceState,
+        _writer: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn restore_sequence_state(
+        &self,
+        _s: &mut SequenceState,
+        _num_blocks: usize,
+        _reader: &mut dyn std::io::Read,
+    ) -> Result<()> {
+        Ok(())
     }
     fn free_sequence(&self, s: &mut SequenceState) -> Result<()> {
         self.freed_slots.lock().unwrap().push(s.slot_idx);
@@ -393,7 +410,8 @@ fn victim_policy_vision_requeue_excluded_but_spill_allowed() {
 #[test]
 fn resume_reprefills_exact_history_and_preserves_stream_state() {
     let model = PreemptStubModel::default();
-    let (a, _rx) = active_seq(3, 6);
+    let (mut a, _rx) = active_seq(3, 6);
+    a.disable_mtp = true;
     let last_token = a.last_token;
     let out_before = a.output_tokens.clone();
     let remaining_before = a.remaining;
@@ -412,12 +430,36 @@ fn resume_reprefills_exact_history_and_preserves_stream_state() {
     assert_eq!(resumed.last_token, last_token);
     assert_eq!(resumed.output_tokens, out_before);
     assert_eq!(resumed.remaining, remaining_before);
+    assert!(resumed.disable_mtp);
+    assert!(resumed.seq.disable_mtp);
     assert!(!resumed.finished);
     // Starvation guard armed.
     assert_eq!(
         resumed.preempt_immune_until_tokens,
         out_before.len() + PREEMPT_IMMUNITY_TOKENS
     );
+}
+
+#[test]
+fn swap_resume_restores_native_only_sequence_fence() {
+    let model = PreemptStubModel::default();
+    let (mut a, _rx) = active_seq(3, 6);
+    a.disable_mtp = true;
+    let dir = std::env::temp_dir().join(format!(
+        "atlas_preempt_swap_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut spill = KvSpillManager::new(dir, 1024 * 1024).unwrap();
+    let swapped = match spill_out_sequence(&model, a, &mut spill) {
+        Ok(swapped) => swapped,
+        Err((_active, error)) => panic!("swap out failed: {error:#}"),
+    };
+    let resumed = resume_swapped_seq(None, None, &model, swapped, &mut spill).unwrap();
+    assert!(resumed.disable_mtp);
+    assert!(resumed.seq.disable_mtp);
 }
 
 #[test]

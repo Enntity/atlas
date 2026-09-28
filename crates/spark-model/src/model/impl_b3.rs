@@ -2,23 +2,14 @@
 
 #![allow(unused_imports, dead_code)]
 
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use anyhow::{Context, Result, bail};
-use atlas_core::config::{LayerType, ModelConfig};
-use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
-use spark_runtime::kv_cache::PagedKvCache;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
-use super::ssm_pool::SsmStatePool;
-use super::ssm_snapshot::SsmSnapshotPool;
-use super::types::{PinnedMetaStaging, TransformerModel};
+use super::types::TransformerModel;
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
@@ -80,10 +71,17 @@ impl TransformerModel {
         }
         let stream = self.gpu.default_stream();
         let draft_embed_target = None;
-        // MTP loads ALL experts on every rank (no EP filtering), so its MoE
-        // output is already complete — no all_reduce needed. Passing comm: None
-        // prevents MoeLayer::forward() from doubling the output via SUM.
+        // The legacy proposer loads every expert on rank 0 and therefore uses
+        // no communicator. The opt-in GLM path keeps that body arithmetic on
+        // both ranks and supplies the communicator only for matched split-vocab
+        // projection collectives.
+        let mtp_comm = if crate::layers::glm5_mtp::distributed_enabled() {
+            self.comm_ref()
+        } else {
+            None
+        };
         let ctx = ForwardContext {
+            ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
@@ -93,7 +91,7 @@ impl TransformerModel {
             stats: &self.stats,
             attn_metadata: None,
             profile: false,
-            comm: None,
+            comm: mtp_comm,
             graph_capture: false,
             gdn_exact_replay: false,
             token_ids: None,
@@ -105,7 +103,35 @@ impl TransformerModel {
         // Give the drafter its prompt context on the first propose of this
         // sequence: whole-prompt prefill on a COLD turn, carried rows + a
         // short append on a WARM one. See `ensure_drafter_context`.
-        self.ensure_drafter_context(proposer, seq, &ctx, stream);
+        if let Some(drafts) = self.try_glm_paired_propose(
+            seq,
+            token,
+            position,
+            num_drafts,
+            grammar_bitmask.is_some(),
+            &ctx,
+            stream,
+        )? {
+            return Ok(drafts);
+        }
+        if crate::speculative::glm_repair_policy::enabled() {
+            self.prepare_glm_mtp_repair(seq, token, position, num_drafts, stream)?;
+        } else {
+            self.ensure_drafter_context(proposer, seq, &ctx, stream)?;
+        }
+        crate::layers::glm5_mtp::hidden_trace::arm_prepared(
+            seq,
+            token,
+            position,
+            num_drafts,
+            self.mtp_hidden_save,
+            self.last_mtp_hidden_idx
+                .load(std::sync::atomic::Ordering::Relaxed),
+            grammar_bitmask.is_some(),
+            &ctx,
+            stream,
+            || self.hidden_trace_adapter_ownership(),
+        )?;
         let expected_owner = seq.expected_dspark_owner()?;
         let prop_state = seq
             .proposer_state

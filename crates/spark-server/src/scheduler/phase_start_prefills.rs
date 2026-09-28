@@ -10,6 +10,9 @@ use super::*;
 use crate::api::InferenceRequest;
 use crate::grammar::GrammarEngine;
 
+mod initial_budget;
+mod repair_admission;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_new_requests(
     model: &dyn Model,
@@ -31,6 +34,10 @@ pub(super) fn start_new_requests(
     active: &mut Vec<ActiveSeq>,
     prefilling: &mut Vec<PrefillInProgress>,
 ) {
+    let new_reqs = repair_admission::filter(
+        new_reqs,
+        spark_model::speculative::glm_repair_policy::enabled(),
+    );
     // Co-dispatch (ATLAS_PREFILL_CODISPATCH=1): when >=2 non-vision requests are
     // co-admitted this tick with no active decode to starve, DEFER their chunk-0
     // prefill so they batch into one forward via run_batched_prefill_step (which
@@ -246,11 +253,17 @@ pub(super) fn start_new_requests(
             // When no active sequences are decoding, process as much of the
             // prompt as buffers allow — avoids per-token paged decode fallback
             // in chunk 2+. Capped at max_batch_tokens (buffer capacity).
-            let budget = if active.is_empty() && prefilling.is_empty() {
-                max_batch_tokens
-            } else {
-                max_prefill_tokens
-            };
+            // The actual chunked-MLA implementation currently identifies the
+            // GLM semantic-index path; the C4 sparse selector is an additional
+            // opt-in, not inferred from arena size or request concurrency.
+            let glm_c4_sparse = model.supports_chunked_mla()
+                && spark_model::model::glm_c4::sparse_enabled("glm5_next");
+            let budget = initial_budget::initial_chunk_budget(
+                max_prefill_tokens,
+                max_batch_tokens,
+                active.is_empty() && prefilling.is_empty(),
+                glm_c4_sparse,
+            );
             match start_chunked_prefill(
                 sched,
                 think_end_token,

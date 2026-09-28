@@ -137,6 +137,27 @@ pub(super) fn penalty_params_for(
     seed: Option<u64>,
     base_logit_bias: Vec<(u32, f32)>,
 ) -> SamplingParams {
+    penalty_params_for_with_floor(
+        a,
+        kind,
+        temperature,
+        seed,
+        base_logit_bias,
+        min_reasoning_floor(),
+    )
+}
+
+/// Shared parameter construction with the already-resolved model floor.
+/// The production wrapper reads its existing boot-installed value; tests can
+/// exercise another model's policy without changing that process-wide value.
+pub(super) fn penalty_params_for_with_floor(
+    a: &ActiveSeq,
+    kind: PositionKind,
+    temperature: f32,
+    seed: Option<u64>,
+    base_logit_bias: Vec<(u32, f32)>,
+    floor: u32,
+) -> SamplingParams {
     // `Verify` positions are a penalty-aware greedy ARGMAX, so the contract
     // is temperature 0.0, no seed, no caller-supplied base bias. Pin it so a
     // future caller can't silently pass stochastic params on the speculative
@@ -179,7 +200,6 @@ pub(super) fn penalty_params_for(
     // <|im_end|>/<|im_start|> and sampled runs EOS inside think (empty
     // body) or simulate new template turns (measured on qwen4_exp,
     // 2026-08-26, via ATLAS_LOGIT_DUMP).
-    let floor = min_reasoning_floor();
     if floor > 0
         && a.inside_thinking
         && a.thinking_tokens < floor

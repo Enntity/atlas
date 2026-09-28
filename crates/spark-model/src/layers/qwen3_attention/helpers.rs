@@ -36,10 +36,46 @@ pub(crate) fn yarn_rope_mscale(config: &atlas_core::config::ModelConfig) -> f32 
 }
 
 impl Qwen3AttentionLayer {
+    /// Factory-only access: use the global block ordinal, not the MLA index.
+    pub(crate) fn glm_shared_cache_ffn(&mut self) -> (usize, &mut FfnComponent) {
+        (self.block_idx, &mut self.ffn)
+    }
     /// Set MLA weights for 2-step latent decode. When set, decode uses
     /// latent→norm→expand instead of single-step GEMV.
     pub fn set_mla_weights(&mut self, mla: MlaWeights) {
         self.mla = Some(mla);
+    }
+
+    /// Quantize BF16 projections `(weight, n, k)` to MXFP8 twins that
+    /// `mla_prefill_dense` uses for up to 32 rows. Runs at load, before KV
+    /// sizing, so the twins come out of the KV budget.
+    pub fn install_mla_mxfp8(
+        &mut self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        weights: &[(DevicePtr, usize, usize)],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.mxfp8_quantize_k.0 != 0 && self.mxfp8_gemv_k.iter().all(|k| k.0 != 0),
+            "ATLAS_GLM_MLA_MXFP8=1 but the mxfp8_gemv kernels are missing"
+        );
+        let stream = gpu.default_stream();
+        for &(weight, n, k) in weights {
+            let data = gpu.alloc(n * k)?;
+            let scales = gpu.alloc(n * k / crate::layers::ops::MXFP8_BLOCK)?;
+            crate::layers::ops::mxfp8_quantize(
+                gpu,
+                self.mxfp8_quantize_k,
+                weight,
+                data,
+                scales,
+                n,
+                k,
+                stream,
+            )?;
+            self.mla_mx
+                .push((weight, crate::layers::dflash_head::Mxfp8Weight { data, scales }));
+        }
+        gpu.synchronize(stream)
     }
 
     /// Set per-block Manifold-Constrained Hyper-Connection weights
@@ -47,6 +83,12 @@ impl Qwen3AttentionLayer {
     /// `hc_pre`/`hc_post` against the model-level `hc_streams` buffer.
     pub fn set_hc_weights(&mut self, hc: HcWeights) {
         self.hc = Some(hc);
+    }
+
+    /// Set the absolute block index when attention layers are sparse in the
+    /// model schedule. KV-cache indexing remains `attn_layer_idx`.
+    pub fn set_block_idx(&mut self, block_idx: usize) {
+        self.block_idx = block_idx;
     }
 
     /// Attach the QSA indexer (Qwen3.8-Flash-Next full-attention layers).

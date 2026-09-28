@@ -135,6 +135,12 @@ impl BufferArena {
     pub fn q2_act_q8_bytes(&self) -> usize {
         self.sizes.q2_act_q8
     }
+    /// `(bf16 latents, identity table, token capacity)` when an `fp8_g128`
+    /// GLM cache attached its BF16 view.
+    pub fn glm_latent_scratch(&self) -> Option<(DevicePtr, DevicePtr, usize)> {
+        (!self.glm_latent_bf16.is_null())
+            .then_some((self.glm_latent_bf16, self.glm_identity_table, self.glm_latent_tokens))
+    }
     pub fn splitk_workspace(&self) -> DevicePtr {
         self.splitk_workspace
     }

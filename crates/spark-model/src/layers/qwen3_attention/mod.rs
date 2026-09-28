@@ -18,6 +18,11 @@ mod decode;
 // V4: `pub(crate)` so the DeepSeek-V4 weight loader (`weight_loader::deepseek_v4`)
 // and the V4 attention submodules can call `helpers::yarn_rope_mscale`. Non-V4
 // code paths are unaffected by the wider visibility.
+mod glm_index_capacity;
+pub(crate) mod glm_k3_mla_o;
+mod glm_long_context;
+mod glm_sparse_graphs_policy;
+mod hc_prefill;
 pub(crate) mod helpers;
 mod init;
 mod init_arch_gates;
@@ -40,11 +45,20 @@ mod types_weights;
 pub use innerq_driver::InnerQDriver;
 // V4: re-export the new hyper-connection / compressor weight types alongside the
 // existing ones. These are only constructed under DeepSeek-V4 detection.
+pub use glm_sparse_graphs_policy::glm_multi_seq_sparse_graphs_enabled;
+pub(crate) use hc_prefill::{hc_post_pre_prefill_fused, hc_pre_prefill_mix};
 pub(crate) use types::HeadGateActivation;
 pub use types::Qwen3AttentionLayer;
 pub use types_weights::{
-    CompressorWeights, HcHeadWeights, HcLowRank, HcSiteWeights, HcWeights, MlaWeights,
+    CompressorWeights, GlmIndexerWeights, HcHeadWeights, HcLowRank, HcSiteWeights, HcWeights,
+    MlaWeights,
 };
+
+/// Opt-in eager semantic indexing for independent GLM C2/C3 decode rows.
+/// The model and server share this gate so admission and graph policy agree.
+pub fn glm_multi_seq_sparse_enabled(model_type: &str) -> bool {
+    model_type == "glm5_next" && std::env::var("ATLAS_GLM_MULTI_SEQ_SPARSE").as_deref() == Ok("1")
+}
 
 /// Startup fail-fast for `--kv-cache-dtype`: resolve every kernel handle the
 /// dtype's dispatch arms require (chunked-prefill kernel, WHT bookends) and

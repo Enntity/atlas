@@ -16,6 +16,7 @@ use atlas_core::config::VisionConfig;
 use crate::ir::{ContentPart, ImageData, MediaKind, Message, Role};
 
 use super::super::compact::openai_error_response;
+use crate::tokenizer::{Glm5VisionKind, Glm5VisionPlaceholder};
 
 /// What the request path needs to decode a video: the operator's subprocess
 /// policy and the sampling rate. Bundled so the signature does not grow two
@@ -64,6 +65,10 @@ pub(super) struct BuildOut {
     pub(super) cwd_hint: Option<String>,
     pub(super) image_pixels: Vec<spark_model::VisionItem>,
     pub(super) image_pad_counts: Vec<usize>,
+    /// GLM-5-specific placeholder geometry. Empty for Qwen/text families;
+    /// the template renderer uses this to expand GLM's image/video marker
+    /// triples after Jinja rendering.
+    pub(super) vision_placeholders: Vec<Glm5VisionPlaceholder>,
 }
 
 /// One media item on its way to the vision path: what it is, and the
@@ -73,6 +78,20 @@ pub(super) struct BuildOut {
 struct MediaInput {
     kind: MediaKind,
     uri: String,
+}
+
+fn checked_glm5_video_timestamps(
+    timestamps: Vec<f32>,
+    frame_count: usize,
+) -> Result<Vec<f32>, String> {
+    if timestamps.len() != frame_count {
+        return Err(format!(
+            "GLM-5 video metadata has {} timestamps for {} temporal groups",
+            timestamps.len(),
+            frame_count
+        ));
+    }
+    Ok(timestamps)
 }
 
 /// Append every media part on `m` to `media` **in content order**, growing
@@ -145,7 +164,11 @@ fn resolve_media_uri(
                     ),
                 ));
             }
-            match super::remote_image::fetch_as_data_uri(url, remote) {
+            let remote_kind = match kind {
+                MediaKind::Image => super::remote_image::RemoteMediaKind::Image,
+                MediaKind::Video => super::remote_image::RemoteMediaKind::Video,
+            };
+            match super::remote_image::fetch_media_as_data_uri(url, remote, remote_kind) {
                 Ok(data_uri) => Ok(data_uri),
                 Err(why) => {
                     // The reason is surfaced rather than flattened to "could
@@ -177,6 +200,7 @@ pub(super) fn build_msg_entries(
     let mut messages: Vec<MsgEntry> = Vec::with_capacity(input.len());
     let mut media: Vec<MediaInput> = Vec::new();
     let mut image_pad_counts: Vec<usize> = Vec::new();
+    let mut vision_placeholders: Vec<Glm5VisionPlaceholder> = Vec::new();
     let mut consecutive_tool_errors: u32 = 0;
     // BW1 bash-wandering watchdog: tally tool-call productivity across the
     // conversation so a steering nudge can fire if the agent explores/runs
@@ -404,16 +428,17 @@ pub(super) fn build_msg_entries(
             ));
         };
         for (idx, input) in media.iter().enumerate() {
-            let item = match input.kind {
+            let (item, video_timestamps) = match input.kind {
                 MediaKind::Image => {
                     match spark_model::vision_preprocess::preprocess_image_with_max_pixels(
                         &input.uri,
                         vcfg,
                         vision_max_pixels,
                     ) {
-                        Ok((pixels, grid_h, grid_w)) => {
-                            spark_model::VisionItem::image(pixels, grid_h, grid_w)
-                        }
+                        Ok((pixels, grid_h, grid_w)) => (
+                            spark_model::VisionItem::image(pixels, grid_h, grid_w),
+                            Vec::new(),
+                        ),
                         Err(e) => {
                             return Err(openai_error_response(
                                 StatusCode::BAD_REQUEST,
@@ -430,11 +455,17 @@ pub(super) fn build_msg_entries(
                         video.fps,
                         video.ffmpeg,
                     ) {
-                        Ok(v) => spark_model::VisionItem {
-                            groups: v.groups,
-                            grid_h: v.grid_h,
-                            grid_w: v.grid_w,
-                        },
+                        Ok(v) => {
+                            let timestamps = v.timestamps.clone();
+                            (
+                                spark_model::VisionItem {
+                                    groups: v.groups,
+                                    grid_h: v.grid_h,
+                                    grid_w: v.grid_w,
+                                },
+                                timestamps,
+                            )
+                        }
                         Err(e) => {
                             return Err(openai_error_response(
                                 StatusCode::BAD_REQUEST,
@@ -445,6 +476,29 @@ pub(super) fn build_msg_entries(
                 }
             };
             image_pad_counts[idx] = item.pad_count(vcfg.spatial_merge_size);
+            if vcfg.is_glm5_next {
+                let frame_count = item.t_len();
+                let frame_pad_count = image_pad_counts[idx] / frame_count.max(1);
+                let timestamps = if input.kind == MediaKind::Video {
+                    match checked_glm5_video_timestamps(video_timestamps, frame_count) {
+                        Ok(timestamps) => timestamps,
+                        Err(message) => {
+                            return Err(openai_error_response(StatusCode::BAD_REQUEST, message));
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                vision_placeholders.push(Glm5VisionPlaceholder {
+                    kind: match input.kind {
+                        MediaKind::Image => Glm5VisionKind::Image,
+                        MediaKind::Video => Glm5VisionKind::Video,
+                    },
+                    pad_count: image_pad_counts[idx],
+                    per_frame_pad_count: frame_pad_count,
+                    timestamps,
+                });
+            }
             if input.kind == MediaKind::Video {
                 // Logged at the media index, not a video ordinal: the index
                 // is what lines the clip up with its pad run and its
@@ -482,6 +536,7 @@ pub(super) fn build_msg_entries(
         cwd_hint,
         image_pixels,
         image_pad_counts,
+        vision_placeholders,
     })
 }
 

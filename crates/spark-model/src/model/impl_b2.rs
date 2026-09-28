@@ -200,6 +200,7 @@ impl TransformerModel {
             let target_hidden = self.hidden_after_norm();
             let position = seq.seq_len;
             let ctx = ForwardContext {
+                ssm_batch: None,
                 buffers: &self.buffers,
                 gpu: self.gpu.as_ref(),
                 config: &self.config,
