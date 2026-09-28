@@ -602,8 +602,24 @@ pub fn step_mtp(
     // verify in ONE target traversal instead of one traversal per owner —
     // two drafts on the repaired long-context K3 lane, the most common width
     // on the DFlash lane. Everything else keeps the per-sequence path.
+    let adaptive_width = if dflash_verify_raw_argmax {
+        let owners: Vec<usize> = serial_idxs
+            .iter()
+            .copied()
+            .filter(|&i| active[i].grammar_state.is_none() && !active[i].pending_drafts.is_empty())
+            .collect();
+        let max = owners.iter().map(|&i| active[i].pending_drafts.len()).min().unwrap_or(0);
+        (owners.len() >= 2)
+            .then(|| super::dflash_width::choose(owners.iter().map(|&i| &active[i].spec_adapt.survival), max))
+            .flatten()
+    } else {
+        None
+    };
     let owner_drafts = if glm_repaired_narrow && !dflash_verify_raw_argmax && ladder_nd >= 2 {
         Some(2)
+    } else if let Some(width) = adaptive_width {
+        // Cost-aware width: every owner holds at least `width` drafts.
+        Some(width)
     } else if dflash_verify_raw_argmax {
         // Owners with at least `w` drafts can verify together at width `w`;
         // take the width that verifies the most rows.
@@ -644,6 +660,7 @@ pub fn step_mtp(
                 active[i].pending_drafts.truncate(width);
                 active[i].pending_draft_conf.truncate(width);
             }
+            super::dflash_width::log_verify(group.len(), width);
             let mut sorted = group.clone();
             sorted.sort_unstable();
             let mut batch: Vec<&mut ActiveSeq> = active
@@ -670,6 +687,16 @@ pub fn step_mtp(
         a.pending_draft_conf.clear();
         if drafts.is_empty() {
             continue;
+        }
+        // A lone DFlash verify pays single-owner cost for each row it adds.
+        if dflash_verify_raw_argmax
+            && let Some(width) =
+                super::dflash_width::choose(std::iter::once(&a.spec_adapt.survival), drafts.len())
+        {
+            drafts.truncate(width);
+        }
+        if dflash_verify_raw_argmax {
+            super::dflash_width::log_verify(1, drafts.len());
         }
 
         // Spec-decode boundary awareness (arXiv:2512.15834): when a

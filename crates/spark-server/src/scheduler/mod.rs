@@ -14,6 +14,7 @@
 // ── Submodules (split for ≤500 LoC files) ──────────────────────────────────
 mod adaptive_rung;
 mod adaptive_spec;
+mod dflash_width;
 mod admission;
 mod beam_prefill;
 mod confidence;
