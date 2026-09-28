@@ -413,10 +413,6 @@ impl TransformerModel {
             kv_write_start
         };
         let diag_prefill = self.profile && proc_count > 1; // Only with --profile
-        // First prompt position this pass computes; a skipped prefix has no
-        // hidden rows for the DFlash window (an exact hit re-runs only the
-        // last token, which is not a context row).
-        let dflash_lo = if marconi_skip { kv_write_start } else { 0 };
         for (i, layer) in self.layers.iter().enumerate() {
             layer
                 .prefill(
@@ -434,15 +430,15 @@ impl TransformerModel {
                     stream,
                 )
                 .map_err(|e| anyhow::anyhow!("Prefill layer {i} failed: {e}"))?;
-            // DFlash prefill capture: hidden row 0 is prompt position
-            // `seq_len_start`; keeps the prompt-tail window. No-op when
-            // DFlash is disabled.
+            // DFlash prefill capture: writes layer i's hidden output for
+            // all `proc_count` tokens into the seq's accumulator at slots
+            // [layer_kv_write_start .. layer_kv_write_start + proc_count].
+            // No-op when DFlash is disabled.
             self.try_dflash_prefill_capture_layer(
                 seq,
                 i,
-                seq_len_start,
+                layer_kv_write_start,
                 proc_count,
-                dflash_lo,
                 stream,
             )?;
 
@@ -535,7 +531,7 @@ impl TransformerModel {
 
         // DFlash: advance the seq's `ctx_len` to span all just-prefilled
         // positions so the next propose() can read them.
-        self.update_dflash_ctx_len_after_prefill(seq, dflash_lo)?;
+        self.update_dflash_ctx_len_after_prefill(seq, layer_kv_write_start, proc_count)?;
 
         Ok(self.decode_logits_ptr())
     }

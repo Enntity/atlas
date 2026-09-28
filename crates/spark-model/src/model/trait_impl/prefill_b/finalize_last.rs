@@ -23,10 +23,22 @@ impl TransformerModel {
         tokens: &[u32],
         seq: &mut SequenceState,
         kv_cache: &mut PagedKvCache,
+        chunk_start: usize,
+        chunk_len: usize,
         proc_count: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
-        self.prefill_b_finalize_last_at(tokens, seq, kv_cache, proc_count, 0, 0, stream)
+        self.prefill_b_finalize_last_at(
+            tokens,
+            seq,
+            kv_cache,
+            chunk_start,
+            chunk_len,
+            proc_count,
+            0,
+            0,
+            stream,
+        )
     }
 
     /// Q12 Path B: stream-offset-aware finalize for the kernel-batched
@@ -38,6 +50,8 @@ impl TransformerModel {
         tokens: &[u32],
         seq: &mut SequenceState,
         kv_cache: &mut PagedKvCache,
+        chunk_start: usize,
+        chunk_len: usize,
         proc_count: usize,
         hidden_stream_offset_tokens: usize,
         logits_row: usize,
@@ -430,8 +444,7 @@ impl TransformerModel {
         }
 
         // DFlash: advance ctx_len after the LAST chunk of chunked prefill.
-        let dflash_lo = seq.marconi_skip_to;
-        self.update_dflash_ctx_len_after_prefill(seq, dflash_lo)?;
+        self.update_dflash_ctx_len_after_prefill(seq, chunk_start, chunk_len)?;
 
         Ok(logits_ptr)
     }

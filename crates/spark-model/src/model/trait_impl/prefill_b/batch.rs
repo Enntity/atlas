@@ -434,6 +434,8 @@ impl TransformerModel {
                         tokens,
                         seq,
                         &mut kv_cache,
+                        chunk_start,
+                        chunk_len,
                         proc_count,
                         0,
                         row_base + stream_idx,

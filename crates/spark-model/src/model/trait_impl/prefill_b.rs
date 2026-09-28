@@ -417,7 +417,15 @@ impl TransformerModel {
 
         if is_last_chunk {
             // ── Phase 6+7+8: final norm, lm_head, prefix-cache + snapshot save ──
-            self.prefill_b_finalize_last(tokens, seq, &mut kv_cache, proc_count, stream)
+            self.prefill_b_finalize_last(
+                tokens,
+                seq,
+                &mut kv_cache,
+                chunk_start,
+                chunk_len,
+                proc_count,
+                stream,
+            )
         } else {
             // ── Phase 9: intermediate Marconi checkpoint ──
             self.prefill_b_save_checkpoint(
