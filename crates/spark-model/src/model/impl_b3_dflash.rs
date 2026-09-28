@@ -68,7 +68,10 @@ impl TransformerModel {
                 }),
             };
             anyhow::ensure!(kernel.0 != 0, "DFlash mHC capture kernel unavailable");
-            anyhow::ensure!(dst_stride % 2 == 0, "DFlash capture stride must be BF16-aligned");
+            anyhow::ensure!(
+                dst_stride % 2 == 0,
+                "DFlash capture stride must be BF16-aligned"
+            );
             return spark_runtime::kernel_args::KernelLaunch::new(self.gpu.as_ref(), kernel)
                 .grid([rows as u32, 1, 1])
                 .block([256, 1, 1])
@@ -200,7 +203,9 @@ impl TransformerModel {
             // captures. Slot i holds prompt position window_start + i (the
             // tail window kept by try_dflash_prefill_capture_layer). Keep
             // parallel to ctx_len. Re-seed idempotently across prefill chunks.
-            dstate.ctx_positions = (window_start..window_start + new_len).map(|i| i as i32).collect();
+            dstate.ctx_positions = (window_start..window_start + new_len)
+                .map(|i| i as i32)
+                .collect();
         }
         Ok(())
     }

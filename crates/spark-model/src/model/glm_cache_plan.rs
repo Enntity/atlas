@@ -214,8 +214,13 @@ mod tests {
         let shape = GlmMlaShape::new(512, 0).unwrap();
         let cfg = config(11, KvCacheDtype::Bf16);
         let index = shape.bf16_index(4, 128).unwrap();
-        let plan = GlmCachePlan::new(shape, &cfg, Some(index)).unwrap().aliased_v(&cfg);
-        let slots = TailSlotPlan { lag_blocks: 258, sequences: 5 };
+        let plan = GlmCachePlan::new(shape, &cfg, Some(index))
+            .unwrap()
+            .aliased_v(&cfg);
+        let slots = TailSlotPlan {
+            lag_blocks: 258,
+            sequences: 5,
+        };
         let slotted = plan.slotted_tails(&cfg, index, slots);
         // 8 KiB raw key+gate tail per layer leaves each block; a u32 map
         // entry joins it; 5 × 260 lent tails become fixed.

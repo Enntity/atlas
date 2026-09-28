@@ -176,7 +176,8 @@ impl CommBackend for NcclBackend {
     }
 
     fn supports_exchange_async(&self, bytes: usize) -> bool {
-        self.rdma_capacity().is_some_and(|capacity| bytes <= capacity)
+        self.rdma_capacity()
+            .is_some_and(|capacity| bytes <= capacity)
     }
 
     fn register_buffer(&self, ptr: u64, bytes: usize) -> Result<u64> {

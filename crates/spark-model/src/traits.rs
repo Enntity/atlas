@@ -5,9 +5,6 @@
 //! The Model trait defines the interface for running inference. Business
 //! logic (scheduler, engine) programs against this trait, not concrete types.
 
-pub mod ep_execution_codec;
-pub mod execution_plan;
-
 use spark_runtime::gpu::DevicePtr;
 
 use crate::layer::LayerState;
@@ -287,7 +284,10 @@ static MODEL_END_TOKENS: std::sync::OnceLock<[u32; 4]> = std::sync::OnceLock::ne
 
 impl Default for EosBan {
     fn default() -> Self {
-        Self { floor: 0, ids: [u32::MAX; 4] }
+        Self {
+            floor: 0,
+            ids: [u32::MAX; 4],
+        }
     }
 }
 
@@ -297,7 +297,14 @@ impl EosBan {
         for (slot, &id) in ids.iter_mut().zip(eos_tokens) {
             *slot = id;
         }
-        Self { floor: if min_tokens == 0 { 0 } else { prompt_len + min_tokens }, ids }
+        Self {
+            floor: if min_tokens == 0 {
+                0
+            } else {
+                prompt_len + min_tokens
+            },
+            ids,
+        }
     }
 
     /// Install the model's end tokens on every rank. A TP2 vocabulary-split
@@ -330,7 +337,11 @@ impl EosBan {
     /// `base_pos + j + 1`). `rows` is at most 64.
     pub fn row_mask(&self, base_pos: usize, rows: usize) -> u64 {
         let banned = self.floor.saturating_sub(base_pos + 1).min(rows).min(64);
-        if banned == 64 { u64::MAX } else { (1u64 << banned) - 1 }
+        if banned == 64 {
+            u64::MAX
+        } else {
+            (1u64 << banned) - 1
+        }
     }
 }
 
@@ -489,6 +500,9 @@ mod eos_ban_tests {
         // A worker rank's sequence carries the default ban (no ids), yet GLM's
         // <|user|> lives in its vocabulary half.
         EosBan::install_model_end_tokens(&[154820, 154827, 154829]);
-        assert_eq!(EosBan::default().head_ids(), [154820, 154827, 154829, u32::MAX]);
+        assert_eq!(
+            EosBan::default().head_ids(),
+            [154820, 154827, 154829, u32::MAX]
+        );
     }
 }

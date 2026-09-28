@@ -118,7 +118,7 @@ pub(super) fn decode_batch_with_preemption(
                     // restarts the pair.
                     if model.is_ep() {
                         eprintln!("EP head step error (peer exits on it too); terminating: {e:#}");
-                        crate::glm_terminal_session::terminate();
+                        crate::ep_peer_lifeline::terminate();
                     }
                     for mut a in active.drain(..) {
                         send_error(model, &mut a, &format!("{e:#}"));

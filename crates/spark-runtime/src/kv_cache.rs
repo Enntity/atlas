@@ -461,8 +461,8 @@ mod paged_impl;
 mod sparse_index;
 mod sparse_index_impl;
 mod tail_slots;
-pub use tail_slots::{NO_TAIL, TailSlotPlan};
 pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
+pub use tail_slots::{NO_TAIL, TailSlotPlan};
 /// Release K/V and any attached sparse-index pools for every layer.
 ///
 /// Each layer allocates its K and V pools separately, so freeing per layer is

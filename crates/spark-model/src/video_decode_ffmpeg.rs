@@ -258,7 +258,9 @@ pub fn decode_with_plan(
 /// — that is where a packaged install keeps it. Never guesses past those two.
 fn probe_command(policy: &FfmpegPolicy) -> Command {
     let configured = Path::new(&policy.probe_binary);
-    let sibling = Path::new(&policy.binary).parent().map(|d| d.join("ffprobe"));
+    let sibling = Path::new(&policy.binary)
+        .parent()
+        .map(|d| d.join("ffprobe"));
     let mut cmd = Command::new(&policy.probe_binary);
     // Only swap to the sibling when the configured name is not an absolute
     // path that exists and the sibling does: otherwise the operator's choice
@@ -329,8 +331,8 @@ fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<ClipTiming> {
     // closes its stdout and releases the reader above.
     let mut err_text = String::new();
     let status = {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(policy.timeout_secs.max(1));
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(policy.timeout_secs.max(1));
         loop {
             match child.try_wait().context("waiting for ffprobe")? {
                 Some(s) => break s,

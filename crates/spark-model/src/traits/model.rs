@@ -96,12 +96,6 @@ pub fn padded_batch_n(n: usize) -> usize {
 }
 
 pub trait Model: Send + Sync {
-    /// Optional checked GLM paired execution; absent on legacy/other models.
-    fn glm_paired_execution(
-        &self,
-    ) -> Option<&dyn crate::speculative::glm_paired_execution::GlmPairedExecution> {
-        None
-    }
     /// Release the device memory this model owns, in reverse construction
     /// order.
     ///
@@ -1022,18 +1016,6 @@ pub trait Model: Send + Sync {
         _seq: &mut SequenceState,
         _num_committed: usize,
         _base_pos: usize,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    /// Record an actual K5 verified commit, distinct from unverified discard.
-    /// Default no-op; the GLM repair lane binds request-owned pending state.
-    fn record_glm_mtp_verified(
-        &self,
-        _seq: &mut SequenceState,
-        _base: usize,
-        _tokens: &[u32],
-        _accepted: usize,
     ) -> Result<()> {
         Ok(())
     }

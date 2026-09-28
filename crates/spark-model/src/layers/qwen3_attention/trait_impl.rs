@@ -89,31 +89,6 @@ pub fn diag_norm_f32(
 mod state;
 
 impl TransformerLayer for Qwen3AttentionLayer {
-    fn validate_glm_owner_verify(
-        &self,
-        ctx: &ForwardContext,
-        shape: crate::layer::glm_owner_verify::GlmOwnerBatchShape,
-        stream: u64,
-    ) -> Result<()> {
-        self.validate_verify_mla(
-            ctx,
-            crate::layer::glm_verify_ffn::GlmVerifyFfn::Owners(shape),
-            stream,
-        )
-    }
-
-    fn decode_glm_owner_verify(
-        &self,
-        owners: &mut [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>],
-        cache: &mut PagedKvCache,
-        workspace: &mut crate::layer::glm_owner_verify::GlmOwnerBatchWorkspace,
-        ctx: &[&ForwardContext],
-        stream: u64,
-    ) -> Result<()> {
-        let mode = crate::layer::glm_verify_ffn::GlmVerifyFfn::Owners(workspace.shape());
-        self.decode_verify_mla(owners, cache, &mut workspace.scratch, ctx, mode, stream)
-    }
-
     fn decode_glm_long_owners(
         &self,
         owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],
@@ -137,30 +112,6 @@ impl TransformerLayer for Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<()> {
         self.prefill_glm_passengers_mla(num_tokens, seq_len_start, passengers, cache, ctx, stream)
-    }
-
-    fn supports_glm_pair_verify(&self) -> bool {
-        self.pair_mla_supported()
-    }
-
-    fn validate_glm_pair_verify(
-        &self,
-        ctx: &ForwardContext,
-        mode: crate::layer::glm_pair_verify::GlmPairFfn,
-        stream: u64,
-    ) -> Result<()> {
-        self.validate_pair_mla(ctx, mode, stream)
-    }
-
-    fn decode_glm_pair_verify(
-        &self,
-        owners: [crate::layer::glm_pair_verify::GlmPairLayerInput<'_>; 2],
-        cache: &mut PagedKvCache,
-        workspace: &mut crate::layer::glm_pair_verify::GlmPairWorkspace,
-        ctx: [&ForwardContext; 2],
-        stream: u64,
-    ) -> Result<()> {
-        self.decode_pair_mla(owners, cache, workspace, ctx, stream)
     }
 
     fn uses_local_mla_prefill(&self) -> bool {

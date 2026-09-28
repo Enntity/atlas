@@ -337,7 +337,10 @@ impl BufferArena {
         let blocks = tokens / 16;
         let table: Vec<u8> = (0..blocks as u32).flat_map(u32::to_le_bytes).collect();
         let latent = gpu.alloc(tokens * 512 * 2)?;
-        let identity = match gpu.alloc(table.len()).and_then(|t| gpu.copy_h2d(&table, t).map(|()| t)) {
+        let identity = match gpu
+            .alloc(table.len())
+            .and_then(|t| gpu.copy_h2d(&table, t).map(|()| t))
+        {
             Ok(t) => t,
             Err(error) => {
                 let _ = gpu.free(latent);

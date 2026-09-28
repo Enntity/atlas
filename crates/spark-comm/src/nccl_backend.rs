@@ -69,9 +69,9 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-mod recv_buffer;
 #[cfg(atlas_rdma_verbs)]
 mod rdma_pair;
+mod recv_buffer;
 use recv_buffer::ensure_payload_fits;
 pub use recv_buffer::{ALL_REDUCE_DTYPE_BYTES, required_recv_bytes};
 
@@ -507,7 +507,14 @@ impl NcclBackend {
 
     /// Reduce-scatter/all-gather step over the RDMA pair (see
     /// `CommBackend::exchange_async`); `false` when the pair is not up.
-    fn try_rdma_exchange(&self, send: u64, dst: u64, bytes: usize, add: bool, stream: u64) -> Result<bool> {
+    fn try_rdma_exchange(
+        &self,
+        send: u64,
+        dst: u64,
+        bytes: usize,
+        add: bool,
+        stream: u64,
+    ) -> Result<bool> {
         #[cfg(atlas_rdma_verbs)]
         if let Some(rdma) = &self.rdma
             && bytes > 0

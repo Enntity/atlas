@@ -7,7 +7,6 @@ pub mod ep_dispatch;
 pub mod fp8_calibration;
 mod glm5_kda;
 pub mod glm_sp;
-pub mod glm5_mtp;
 pub mod moe;
 pub mod mtp_head;
 pub(crate) mod mtp_meta;
@@ -67,7 +66,6 @@ pub use dflash_head::{
     BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,
 };
 pub use glm5_kda::{Glm5KdaLayer, Glm5KdaWeights, Glm5Projection};
-pub use glm5_mtp::{Glm5MtpHead, Glm5MtpProposerState};
 pub use moe::MoeLayer;
 pub use mtp_head::{MtpHead, MtpQuantization, mtp_drafter_prefill_enabled};
 pub use nemotron_mamba2::NemotronMamba2Layer;

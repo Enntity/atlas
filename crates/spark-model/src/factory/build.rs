@@ -11,7 +11,6 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache, TailSlo
 use spark_runtime::prefix_cache::PrefixCache;
 use spark_runtime::weights::WeightStore;
 
-use super::GlmMtpBuildMode;
 use super::dspark_admission;
 use super::loader_for_config;
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
@@ -19,13 +18,10 @@ use super::{DflashBuildArgs, LoraBuildArgs, admit_lightning_dspark_product_build
 use crate::layers::MtpQuantization;
 use crate::layers::dflash_head::{DsparkStartupExecution, LightningDsparkRuntimeToggles};
 use crate::model::TransformerModel;
-use crate::model::construction_owner::ColdOwner;
 use crate::model::glm_cache_plan::{GlmCachePlan, GlmMlaShape};
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
-#[path = "glm_mtp_capacity.rs"]
-mod glm_mtp_capacity;
 mod kv_summary;
 
 pub fn build_model(
@@ -70,55 +66,18 @@ pub fn build_model(
     // NLLB / M2M-100 PEFT LoRA adapter directory (`--lora-adapter` for an
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
-    glm_mtp_mode: GlmMtpBuildMode,
 ) -> Result<Box<dyn Model>> {
-    let retain = glm_mtp_mode == GlmMtpBuildMode::Paired;
-    let gpu = ColdOwner::new(gpu, retain);
-    let comm = ColdOwner::new(comm, retain);
-    super::glm_paired::validate(
-        glm_mtp_mode,
-        &config,
-        max_batch_tokens,
-        max_seq_len,
-        max_batch_size,
-        mtp_quant,
-        use_speculative,
-        self_speculative,
-        num_drafts,
-        kv_dtype,
-        &layer_dtypes,
-        comm.as_deref(),
-        hss_cache_blocks_per_seq,
-        dflash_args.is_some(),
-        lora_args.is_some(),
-    )?;
     super::glm_sparse_decode::initialize(
         gpu.as_ref(),
         super::glm_sparse_decode::BuildPolicy {
             config: &config,
-            mode: glm_mtp_mode,
-            speculative: use_speculative,
             self_speculative,
-            drafts: num_drafts,
-            owners: max_batch_size,
             context: super::glm_sparse_decode::repair_context(max_seq_len),
             block_size: kv_block_size,
             kv_dtype,
             layer_dtypes: &layer_dtypes,
-            alternate_owner: dflash_args.is_some() || lora_args.is_some(),
             dflash: dflash_args.is_some() && lora_args.is_none(),
         },
-    )?;
-    // Explicit native module initialization precedes layers, arena, and the KV
-    // free-memory snapshot; requested load/ABI/configuration failures abort.
-    crate::layers::ops::initialize_glm_sparse_native(
-        &config,
-        max_batch_tokens,
-        max_seq_len,
-        kv_block_size,
-        max_batch_size,
-        kv_dtype,
-        &layer_dtypes,
     )?;
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
@@ -142,7 +101,7 @@ pub fn build_model(
         let model = crate::model::nllb::NllbGpuModel::new(
             &config,
             &store,
-            gpu.into_inner(),
+            gpu,
             lang,
             max_seq_len,
             max_batch_size,
@@ -307,60 +266,6 @@ pub fn build_model(
             None
         };
 
-    // GLM-5.3 likewise ships a model-specific full decoder MTP layer under
-    // `model.language_model.layers.<num_hidden_layers>`. The default path is
-    // replicated on rank 0 and proposes without collectives. The opt-in
-    // distributed path loads an identical full body on both ranks; its exact
-    // vocabulary projection is split and exchanged by the proposer path.
-    let glm5_mtp_distributed =
-        std::env::var("ATLAS_GLM_MTP_DISTRIBUTED").ok().as_deref() == Some("1");
-    if glm5_mtp_distributed {
-        anyhow::ensure!(
-            config.model_type == "glm5_next"
-                && use_speculative
-                && config.tp_world_size == 2
-                && config.ep_world_size == 2,
-            "ATLAS_GLM_MTP_DISTRIBUTED=1 requires speculative GLM with overlapping \
-             TP=EP=world=2 (model={}, speculative={}, TP={}, EP={})",
-            config.model_type,
-            use_speculative,
-            config.tp_world_size,
-            config.ep_world_size,
-        );
-    }
-    // A DFlash drafter replaces this proposer, so the module, its private
-    // context-sized cache and the draft LM head would be dead weight.
-    let glm5_mtp_module = if config.model_type == "glm5_next"
-        && use_speculative
-        && dflash_args.is_none()
-        && (config.ep_rank == 0 || glm5_mtp_distributed)
-    {
-        match crate::weight_loader::glm5::load_glm5_mtp_module(&store, &config, gpu.as_ref()) {
-            Ok(Some(module)) => Some(module),
-            Ok(None) if glm5_mtp_distributed => {
-                anyhow::bail!(
-                    "distributed GLM MTP requested, but rank {} found no appended predictor layer",
-                    config.ep_rank
-                )
-            }
-            Ok(None) => {
-                tracing::info!("GLM-5: no appended MTP module in checkpoint (MTP off)");
-                None
-            }
-            Err(error) if glm5_mtp_distributed => {
-                return Err(error.context(format!(
-                    "distributed GLM MTP module load failed on rank {}",
-                    config.ep_rank
-                )));
-            }
-            Err(error) => {
-                tracing::error!("GLM-5 MTP module load FAILED: {error:#}");
-                None
-            }
-        }
-    } else {
-        None
-    };
     // Qwen3.8-Flash-Next ships an MTP block that is architecturally a full
     // layer (gated attention + QSA indexer + mHC + 512-expert MoE), not the
     // Qwen-shaped `MtpWeights`, so it loads through its own path exactly like
@@ -393,7 +298,6 @@ pub fn build_model(
         && dflash_args.is_none()
         && mtp_weights.is_empty()
         && v4_mtp_module.is_none()
-        && glm5_mtp_module.is_none()
         && !q4e_mtp_loaded
     {
         tracing::warn!(
@@ -460,7 +364,7 @@ pub fn build_model(
         &config,
         gpu.as_ref(),
         use_speculative,
-        !mtp_weights.is_empty() || (glm5_mtp_module.is_some() && num_drafts > 2),
+        !mtp_weights.is_empty(),
     )?;
 
     // Capture the shared embed + resolved draft NVFP4 head for the DeepSeek-V4
@@ -474,13 +378,6 @@ pub fn build_model(
     // same BF16 head via dense_gemv (drafts are re-verified by the target, so the
     // draft head only affects acceptance). DenseWeight is Copy.
     let v4_mtp_lm_head = lm_head;
-    let glm5_mtp_embed = embed;
-    let glm5_mtp_lm_head = lm_head;
-    // GLM's tied BF16 target head is deliberately retained for final
-    // verification, but drafting can use the existing approximate NVFP4 copy.
-    // Every proposal is still checked by the target head before emission.
-    let glm5_mtp_lm_head_nvfp4 = mtp_lm_head_nvfp4.or(lm_head_nvfp4);
-
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
     // MiniMax M2.7-NVFP4 EP=2 has ~46 GB free at layer-0 load time but
@@ -857,97 +754,6 @@ pub fn build_model(
         }
         num_kv_blocks = agreed;
     }
-    // ATLAS_GLM_KV_CAP_TO_CONTEXTS=1: keep the target pool at exactly the
-    // geometry the retained owners verify (surplus blocks consume host
-    // reserve without increasing the declared context capacity). The helper re-checks the budget
-    // before narrowing, so a pool that cannot fit its own owners still
-    // fails here rather than looking capped. Resolution happens before any
-    // KV / sparse-index pool is allocated below.
-    let cap = glm_mtp_capacity::parse_cap(
-        std::env::var("ATLAS_GLM_KV_CAP_TO_CONTEXTS")
-            .ok()
-            .as_deref(),
-    )?;
-    let shared_kv = crate::speculative::glm_shared_kv::parse(
-        std::env::var(crate::speculative::glm_shared_kv::ENV)
-            .ok()
-            .as_deref(),
-    )?;
-    if let Some(tokens) = shared_kv {
-        anyhow::ensure!(
-            !cap && config.model_type == "glm5_next"
-                && crate::speculative::glm_repair_policy::enabled()
-                && crate::speculative::glm_repair_policy::long_context_enabled()
-                && hss_cache_blocks_per_seq.is_none()
-                && max_batch_size == 4
-                && num_drafts == 2,
-            "shared GLM KV requires repaired MTP2/C4, no HSS, and ATLAS_GLM_KV_CAP_TO_CONTEXTS disabled"
-        );
-        crate::speculative::glm_shared_kv::validate_watermark(
-            std::env::var("ATLAS_KV_ADMIT_WATERMARK").ok().as_deref(),
-            max_seq_len,
-        )?;
-        let physical = crate::speculative::glm_shared_kv::physical_blocks(
-            tokens,
-            max_seq_len,
-            max_batch_size,
-            num_drafts,
-            kv_block_size,
-        )?;
-        anyhow::ensure!(
-            num_kv_blocks >= physical,
-            "shared GLM KV needs {physical} physical blocks including its dummy, but only {num_kv_blocks} fit the memory budget"
-        );
-        tracing::info!(
-            "GLM shared KV: budget={} blocks, allocating={} physical/{} usable blocks, served context={}, repaired context={}",
-            num_kv_blocks,
-            physical,
-            physical - 1,
-            max_seq_len,
-            crate::speculative::glm_repair_policy::repair_context(max_seq_len)
-        );
-        num_kv_blocks = physical;
-    }
-    if let Some(capped) = glm_mtp_capacity::capped_blocks(
-        cap,
-        config.model_type == "glm5_next",
-        crate::speculative::glm_repair_policy::enabled()
-            && crate::speculative::glm_repair_policy::long_context_enabled(),
-        hss_cache_blocks_per_seq.is_some(),
-        max_seq_len,
-        num_drafts,
-        kv_block_size,
-        max_batch_size,
-        num_kv_blocks,
-    )? {
-        tracing::info!(
-            "ATLAS_GLM_KV_CAP_TO_CONTEXTS=1: budget allows {} blocks, capping to \
-             {} blocks = {} owner(s) × ceil(({} context + {} speculative rows) / \
-             {} tok/block)",
-            num_kv_blocks,
-            capped,
-            max_batch_size,
-            max_seq_len,
-            num_drafts,
-            kv_block_size,
-        );
-        num_kv_blocks = capped;
-    }
-    if config.model_type == "glm5_next"
-        && crate::speculative::glm_repair_policy::enabled()
-        && crate::speculative::glm_repair_policy::long_context_enabled()
-        && shared_kv.is_none()
-    {
-        // Selected retained owners must fit every transient K-row verifier,
-        // independently of the legacy paged-KV overcommit setting below.
-        glm_mtp_capacity::validate_target_pool(
-            max_seq_len,
-            num_drafts,
-            kv_block_size,
-            max_batch_size,
-            num_kv_blocks,
-        )?;
-    }
     if let Some(plan) = glm_cache_plan {
         plan.bytes_for_blocks(num_kv_blocks)?;
     }
@@ -962,7 +768,7 @@ pub fn build_model(
         None => max_seq_len.div_ceil(kv_block_size),
     };
     let max_concurrent = num_kv_blocks / blocks_per_seq.max(1);
-    if max_concurrent < max_batch_size && shared_kv.is_none() {
+    if max_concurrent < max_batch_size {
         // Suggest a max_seq_len that lets the requested batch size fit.
         let suggested_max_seq_len = (num_kv_blocks / max_batch_size.max(1)) * kv_block_size;
         // The check is WORST-CASE: it assumes every concurrent sequence reaches
@@ -1010,13 +816,12 @@ pub fn build_model(
             );
         }
     }
-    let mut kv_cache =
-        PagedKvCache::new_with_v_alias(
-            kv_config,
-            num_kv_blocks,
-            gpu.as_ref(),
-            glm_cache_plan.is_some(),
-        )?;
+    let mut kv_cache = PagedKvCache::new_with_v_alias(
+        kv_config,
+        num_kv_blocks,
+        gpu.as_ref(),
+        glm_cache_plan.is_some(),
+    )?;
     if let Some(index) = sparse_index {
         kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
     }
@@ -1087,22 +892,6 @@ pub fn build_model(
         }
     }
 
-    // ── Step 6c: GLM-5 appended-layer MTP proposer (optional) ──
-    model = ColdOwner::new(
-        super::glm_paired::install_head(
-            model.into_inner(),
-            glm_mtp_mode,
-            glm5_mtp_module,
-            glm5_mtp_embed,
-            glm5_mtp_lm_head,
-            glm5_mtp_lm_head_nvfp4,
-            mtp_vocab_size,
-            max_seq_len,
-            max_batch_size,
-            glm5_mtp_distributed,
-        )?,
-        retain,
-    );
     // ── Step 6c: Qwen3.8-Flash-Next MTP proposer (optional) ──
     //
     // Same shape as 6b: the module holds a reused trunk layer, and the
@@ -1234,7 +1023,7 @@ pub fn build_model(
     // to happen — orphaned the memory: live, referenced by the layers, with
     // nothing owning the ability to release it.
     model.adopt_weight_store(store);
-    Ok(Box::new(model.into_inner()))
+    Ok(Box::new(model))
 }
 
 /// The minimum of `value` over all ranks (one 8-byte all-gather).

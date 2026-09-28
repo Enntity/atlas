@@ -56,10 +56,6 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::traits::SequenceState;
 
-#[cfg(test)]
-#[path = "drafter_prompt_tests.rs"]
-mod prompt_tests;
-
 /// `ATLAS_NO_MTP_EAGER_DRAFTER` (PRESENCE): restore the propose-site-only
 /// consume, i.e. the pre-fix behaviour where only the last-prefilled sequence
 /// of a concurrent group can prefill its drafter.
@@ -217,18 +213,6 @@ impl TransformerModel {
         if seq.disable_mtp {
             return Ok(());
         }
-        if self.try_glm_paired_eager(seq, is_last, stream)? {
-            return Ok(());
-        }
-        if is_last
-            && crate::layers::glm5_mtp::hidden_trace::prompt_selected(seq)
-            && (eager_drafter_disabled()
-                || self.mtp_prefill_hidden.is_null()
-                || self.proposer.is_none())
-        {
-            crate::layers::glm5_mtp::hidden_trace::spend_prompt(seq)?;
-            anyhow::bail!("GLM prompt diagnostic requires eager capture/proposer owner");
-        }
         if !is_last || eager_drafter_disabled() || self.mtp_prefill_hidden.is_null() {
             return Ok(());
         }
@@ -253,8 +237,6 @@ impl TransformerModel {
             stats: &self.stats,
             attn_metadata: None,
             profile: false,
-            // GLM's opt-in split-vocabulary path mirrors the proven full MTP
-            // body locally; prompt KV construction therefore stays no-comm.
             comm: None,
             graph_capture: false,
             gdn_exact_replay: false,
@@ -264,34 +246,6 @@ impl TransformerModel {
             midchunk_capture: None,
         };
         self.ensure_drafter_context(proposer.as_ref(), seq, &ctx, stream)?;
-        if crate::layers::glm5_mtp::repair_owned::enabled() {
-            use std::sync::atomic::Ordering;
-            anyhow::ensure!(
-                seq.mtp_capture_gen != 0
-                    && seq.mtp_capture_gen == self.mtp_prefill_capture_gen.load(Ordering::Relaxed)
-                    && self.mtp_prefill_capture_len.load(Ordering::Relaxed) == seq.prompt_len,
-                "GLM concurrent repair requires complete owned prompt capture"
-            );
-            let row_bytes = self.config.hidden_size * 2;
-            let source = self
-                .mtp_prefill_hidden
-                .offset((seq.prompt_len - 1) * row_bytes);
-            let state = seq
-                .proposer_state
-                .as_mut()
-                .expect("checked above")
-                .as_any_mut()
-                .downcast_mut::<crate::layers::Glm5MtpProposerState>()
-                .ok_or_else(|| anyhow::anyhow!("GLM retained tail has foreign proposer state"))?;
-            state.retain_repair_prompt_tail(
-                self.gpu.as_ref(),
-                source,
-                seq.mtp_capture_gen,
-                seq.prompt_len,
-                row_bytes,
-                stream,
-            )?;
-        }
         if crate::speculative::mtp_accept_debug() {
             let rows =
                 proposer.drafter_rows(seq.proposer_state.as_mut().expect("checked above").as_mut());

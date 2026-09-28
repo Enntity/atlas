@@ -28,10 +28,6 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
-#[cfg(test)]
-#[path = "glm_ssm_normalization_tests.rs"]
-mod glm_ssm_normalization_tests;
-
 impl TransformerModel {
     pub(super) fn vocab_size_dispatch(&self) -> usize {
         self.config.vocab_size
@@ -389,6 +385,8 @@ impl TransformerModel {
             );
         }
         Ok(SequenceState {
+            disable_mtp: false,
+            eos_ban: crate::traits::EosBan::default(),
             adapter_id: 0,
             adapter_slot: -1,          // default: defer to installed active adapter
             acquired_adapter_slot: -1, // Task #25: no ref held until prefill acquires

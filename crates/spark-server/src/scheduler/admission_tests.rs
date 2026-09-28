@@ -134,52 +134,6 @@ fn watermark_zero_reserves_prompt_only_legacy() {
     assert_eq!(n, 128);
     assert!(!forced);
 }
-#[test]
-fn shared_long_and_short_demands_queue_with_spill_reserved() {
-    let usable = 16896;
-    let context = 262144;
-    let long = (context - 1024, 1024);
-    let short = (16384, 400);
-    assert_eq!(
-        admit_with_spill(usable, 0, &[long, short], context, context, 16, Some(1)),
-        (1, false)
-    );
-    assert_eq!(
-        admit_with_spill(usable, 0, &[short; 4], context, context, 16, Some(1)),
-        (4, false)
-    );
-    assert_eq!(
-        admit_with_spill(usable, 16386, &[short], context, context, 16, Some(1)),
-        (0, false)
-    );
-    // An impossible singleton must be rejected by the gate, never forced.
-    assert_eq!(
-        admit_with_spill(100, 0, &[long], context, context, 16, Some(1)),
-        (0, false)
-    );
-    assert_eq!(
-        admit_count(100, 0, &[long], context, context, 16),
-        (1, true)
-    );
-}
-#[test]
-fn shared_exact_fit_excludes_dummy_and_charges_every_owner() {
-    let request = (32766, 2);
-    let need = 2050;
-    assert_eq!(
-        admit_with_spill(need, 0, &[request], 262144, 262144, 16, Some(1)),
-        (1, false)
-    );
-    assert_eq!(
-        admit_with_spill(need - 1, 0, &[request], 262144, 262144, 16, Some(1)),
-        (0, false)
-    );
-    assert_eq!(
-        admit_with_spill(4 * need - 1, 0, &[request; 4], 262144, 262144, 16, Some(1)),
-        (3, false)
-    );
-}
-
 macro_rules! oversized_request {
     ($variant:ident, $($extra:tt)*) => {
         InferenceRequest::$variant {
@@ -227,31 +181,27 @@ macro_rules! oversized_request {
 }
 
 #[test]
-fn shared_oversized_blocking_request_gets_error_before_allocation() {
+fn ep_oversized_blocking_request_gets_error_before_allocation() {
     let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
     let request = oversized_request!(Blocking, response_tx,);
-    assert!(reject_oversized(vec![request], 16, 262144, 262144, 16, 1).is_empty());
+    assert!(reject_oversized(vec![request], 16, 262144, 262144, 16).is_empty());
     let error = response_rx
         .try_recv()
         .unwrap()
         .err()
         .expect("capacity error");
-    assert!(
-        error
-            .to_string()
-            .contains("shared pool has 16 usable blocks")
-    );
+    assert!(error.to_string().contains("pool has 16 usable blocks"));
 }
 
 #[test]
-fn shared_oversized_stream_gets_engine_error_before_allocation() {
+fn ep_oversized_stream_gets_error_before_allocation() {
     let (token_tx, mut token_rx) = tokio::sync::mpsc::channel(4);
     let request = oversized_request!(Streaming, token_tx,
         cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),);
-    assert!(reject_oversized(vec![request], 16, 262144, 262144, 16, 1).is_empty());
+    assert!(reject_oversized(vec![request], 16, 262144, 262144, 16).is_empty());
     match token_rx.try_recv().unwrap() {
         StreamEvent::Error(message) => {
-            assert!(message.contains("shared pool has 16 usable blocks"))
+            assert!(message.contains("pool has 16 usable blocks"))
         }
         _ => panic!("expected explicit capacity error"),
     }
@@ -259,9 +209,9 @@ fn shared_oversized_stream_gets_engine_error_before_allocation() {
 }
 
 #[test]
-fn shared_zero_capacity_rejects_even_a_single_request() {
+fn ep_zero_capacity_rejects_even_a_single_request() {
     let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
     let request = oversized_request!(Blocking, response_tx,);
-    assert!(reject_oversized(vec![request], 0, 262144, 262144, 16, 1).is_empty());
+    assert!(reject_oversized(vec![request], 0, 262144, 262144, 16).is_empty());
     assert!(response_rx.try_recv().unwrap().is_err());
 }

@@ -230,11 +230,16 @@ pub const DENSE_GEMV_TC_MAX_M: u32 = 32;
 /// verify tiers are enabled (`ATLAS_W4A16_TC=1`), else a zero handle.
 pub fn dense_tc_kernel(gpu: &dyn GpuBackend, m: u32) -> KernelHandle {
     static TC: std::sync::OnceLock<(KernelHandle, KernelHandle)> = std::sync::OnceLock::new();
-    if !(9..=DENSE_GEMV_TC_MAX_M).contains(&m) || std::env::var("ATLAS_W4A16_TC").as_deref() != Ok("1") {
+    if !(9..=DENSE_GEMV_TC_MAX_M).contains(&m)
+        || std::env::var("ATLAS_W4A16_TC").as_deref() != Ok("1")
+    {
         return KernelHandle(0);
     }
     let (tc16, tc32) = *TC.get_or_init(|| {
-        let k = |name| gpu.kernel("dense_gemv_bf16_batchm", name).unwrap_or(KernelHandle(0));
+        let k = |name| {
+            gpu.kernel("dense_gemv_bf16_batchm", name)
+                .unwrap_or(KernelHandle(0))
+        };
         (k("dense_gemv_bf16_tc16"), k("dense_gemv_bf16_tc32"))
     });
     if m <= 16 { tc16 } else { tc32 }

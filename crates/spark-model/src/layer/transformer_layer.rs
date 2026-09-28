@@ -45,27 +45,6 @@ pub const VERIFY_WY_LAYER_STRIDE_BYTES: usize =
     VERIFY_WY_TABLES_PER_LAYER * VERIFY_WY_TABLE_STRIDE_BYTES;
 
 pub trait TransformerLayer: Send + Sync {
-    /// Bounded wider temporal compute only, not request or transaction authority.
-    fn validate_glm_owner_verify(
-        &self,
-        _ctx: &ForwardContext<'_>,
-        _shape: super::glm_owner_verify::GlmOwnerBatchShape,
-        _stream: u64,
-    ) -> Result<()> {
-        anyhow::bail!("GLM owner-batch layer verification is unsupported")
-    }
-
-    fn decode_glm_owner_verify(
-        &self,
-        _owners: &mut [super::glm_pair_verify::GlmPairLayerInput<'_>],
-        _cache: &mut PagedKvCache,
-        _workspace: &mut super::glm_owner_verify::GlmOwnerBatchWorkspace<'_>,
-        _ctx: &[&ForwardContext<'_>],
-        _stream: u64,
-    ) -> Result<()> {
-        anyhow::bail!("GLM owner-batch layer verification is unsupported")
-    }
-
     /// Long-context verify of several owners, `rows` rows each, in one
     /// traversal (`glm_long_owner`). Unsupported layers refuse before any work.
     fn decode_glm_long_owners(
@@ -97,33 +76,6 @@ pub trait TransformerLayer: Send + Sync {
         _stream: u64,
     ) -> Result<()> {
         anyhow::bail!("GLM fused prefill + verify is unsupported for this layer")
-    }
-
-    /// Fixed eager GLM [5,5] compute support, not request/transaction authority.
-    fn supports_glm_pair_verify(&self) -> bool {
-        false
-    }
-
-    /// Read-only support/handle/profile check before any layer in a pair runs.
-    fn validate_glm_pair_verify(
-        &self,
-        _ctx: &ForwardContext<'_>,
-        _mode: super::glm_pair_verify::GlmPairFfn,
-        _stream: u64,
-    ) -> Result<()> {
-        anyhow::bail!("GLM pair layer verification is unsupported")
-    }
-
-    /// One layer for two temporal owners. Unsupported layers refuse before work.
-    fn decode_glm_pair_verify(
-        &self,
-        _owners: [super::glm_pair_verify::GlmPairLayerInput<'_>; 2],
-        _cache: &mut PagedKvCache,
-        _workspace: &mut super::glm_pair_verify::GlmPairWorkspace<'_>,
-        _ctx: [&ForwardContext<'_>; 2],
-        _stream: u64,
-    ) -> Result<()> {
-        anyhow::bail!("GLM pair layer verification is unsupported")
     }
 
     /// True when this layer's PREFILL attends only over the tokens it is

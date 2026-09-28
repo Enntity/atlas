@@ -142,13 +142,24 @@ impl RdmaPair {
     /// Bring up one RC QP per rail (`ATLAS_RDMA_RAILS`, else the NCCL HCA
     /// list) against the peer, exchanging identities over TCP on `port`
     /// (rank 0 listens). `capacity` is the largest payload in bytes.
-    pub(super) fn connect(rank: usize, master_addr: &str, port: u16, capacity: usize) -> Result<Self> {
-        ensure!(capacity % 64 == 0 && capacity > 0, "RDMA pair capacity must be 64-byte aligned");
+    pub(super) fn connect(
+        rank: usize,
+        master_addr: &str,
+        port: u16,
+        capacity: usize,
+    ) -> Result<Self> {
+        ensure!(
+            capacity % 64 == 0 && capacity > 0,
+            "RDMA pair capacity must be 64-byte aligned"
+        );
         let rails = rail_names(
             std::env::var("ATLAS_RDMA_RAILS").ok(),
             std::env::var("NCCL_IB_HCA").ok(),
         );
-        ensure!(!rails.is_empty(), "RDMA pair: no rails (set ATLAS_RDMA_RAILS or NCCL_IB_HCA)");
+        ensure!(
+            !rails.is_empty(),
+            "RDMA pair: no rails (set ATLAS_RDMA_RAILS or NCCL_IB_HCA)"
+        );
         let gid_idx: u32 = std::env::var("ATLAS_RDMA_GID")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -254,7 +265,10 @@ impl RdmaPair {
             return Ok(false);
         }
         let mut capturing = 0i32;
-        cu(unsafe { cuStreamIsCapturing(stream, &mut capturing) }, "cuStreamIsCapturing")?;
+        cu(
+            unsafe { cuStreamIsCapturing(stream, &mut capturing) },
+            "cuStreamIsCapturing",
+        )?;
         if capturing != 0 {
             return Ok(false);
         }
@@ -286,7 +300,12 @@ impl RdmaPair {
             let arrived = first + i as u64 + 1;
             cu(
                 unsafe {
-                    cuStreamWaitValue64_v2(stream, flags + ARRIVED as u64, arrived, CU_STREAM_WAIT_VALUE_GEQ)
+                    cuStreamWaitValue64_v2(
+                        stream,
+                        flags + ARRIVED as u64,
+                        arrived,
+                        CU_STREAM_WAIT_VALUE_GEQ,
+                    )
                 },
                 "cuStreamWaitValue64(arrived)",
             )?;
@@ -305,7 +324,10 @@ impl RdmaPair {
 
 /// Stream-ordered copy (e.g. a landed receive segment into its destination).
 pub(super) fn copy_async(dst: u64, src: u64, bytes: usize, stream: u64) -> Result<()> {
-    cu(unsafe { cuMemcpyAsync(dst, src, bytes, stream) }, "cuMemcpyAsync(RDMA land)")
+    cu(
+        unsafe { cuMemcpyAsync(dst, src, bytes, stream) },
+        "cuMemcpyAsync(RDMA land)",
+    )
 }
 
 impl Drop for RdmaPair {
@@ -516,4 +538,3 @@ mod tests {
         assert!(FLAG_SRC + 16 <= FLAG_PAGE && ARRIVED % 8 == 0);
     }
 }
-

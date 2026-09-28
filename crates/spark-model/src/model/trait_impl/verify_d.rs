@@ -50,7 +50,6 @@ impl TransformerModel {
 
         let mut kv_cache = self.kv_cache.lock();
 
-        let paired = self.paired_allocate_target(seq, &mut kv_cache, k, stream)?;
         // ── Phase 1: Pre-graph (varies per step, NOT captured) ──
 
         // 1a. Embed K tokens
@@ -60,7 +59,7 @@ impl TransformerModel {
 
         // 1b. Allocate KV blocks for all K positions
         let bs = kv_cache.block_size();
-        for t in 0..if paired { 0 } else { k } {
+        for t in 0..k {
             let pos = seq.seq_len + t;
             let blocks_needed = (pos / bs) + 1;
             ensure_blocks_through_decode(
@@ -97,7 +96,7 @@ impl TransformerModel {
             let pos = seq.seq_len + t;
             let block_idx = pos / bs;
             let block_offset = pos % bs;
-            let physical_block = self.paired_physical_block(seq, block_idx, paired)?;
+            let physical_block = seq.physical_block_for(block_idx).unwrap_or(0);
             slots[t] = (physical_block as i64) * (bs as i64) + (block_offset as i64);
         }
         // 256-byte gap mirrors K=4 layout for ABI compatibility with

@@ -109,9 +109,6 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
-        if self.paired_handoff().is_some() {
-            return self.free_paired_sequence(seq);
-        }
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
         // CRITICAL: release SSM slot FIRST to prevent slot leak if later

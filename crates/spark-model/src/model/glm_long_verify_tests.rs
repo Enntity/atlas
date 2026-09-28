@@ -64,7 +64,11 @@ fn width_word_keeps_the_k3_wire_and_round_trips_other_widths() {
 fn owner_index_is_bounded_by_owners_and_width() {
     for rows in WIDTHS {
         for o in 0..MAX_OWNERS {
-            assert_eq!(owner_supported(o, rows), (o + 1) * rows <= MAX_ROWS, "{o}x{rows}");
+            assert_eq!(
+                owner_supported(o, rows),
+                (o + 1) * rows <= MAX_ROWS,
+                "{o}x{rows}"
+            );
         }
         assert!(!owner_supported(MAX_OWNERS, rows));
     }

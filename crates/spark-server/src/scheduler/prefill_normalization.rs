@@ -5,7 +5,7 @@ use anyhow::Result;
 use spark_model::traits::{Model, SequenceState};
 
 fn ordinary_glm_ep(model: &dyn Model) -> bool {
-    model.is_ep() && model.supports_chunked_mla() && model.glm_paired_execution().is_none()
+    model.is_ep() && model.supports_chunked_mla()
 }
 
 pub(super) fn initial(model: &dyn Model, seq: &SequenceState) -> Result<()> {

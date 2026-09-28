@@ -266,7 +266,10 @@ fn zero_blocks_zeroes_exactly_the_given_blocks_one_memset_per_run() {
         for blk in 0..10 {
             let (k, v) = cache.read_block(layer, blk, &gpu).unwrap();
             let want = if [3, 4, 5, 7].contains(&blk) { 0 } else { 0xAB };
-            assert!(k.iter().chain(&v).all(|&b| b == want), "layer {layer} block {blk}");
+            assert!(
+                k.iter().chain(&v).all(|&b| b == want),
+                "layer {layer} block {blk}"
+            );
         }
     }
 }
@@ -280,11 +283,20 @@ fn aliased_v_pool_shares_k_storage_and_frees_once() {
         assert_eq!(cache.k_pool_ptr(layer), cache.v_pool_ptr(layer));
     }
     let stride = cache.block_stride_bytes();
-    cache.write_block(3, 2, &vec![7u8; stride], &vec![7u8; stride], &gpu).unwrap();
+    cache
+        .write_block(3, 2, &vec![7u8; stride], &vec![7u8; stride], &gpu)
+        .unwrap();
     let (k, v) = cache.read_block(3, 2, &gpu).unwrap();
     assert!(k.iter().chain(&v).all(|&b| b == 7));
     cache.zero_blocks(&[2], &gpu, 0).unwrap();
-    assert!(cache.read_block(3, 2, &gpu).unwrap().0.iter().all(|&b| b == 0));
+    assert!(
+        cache
+            .read_block(3, 2, &gpu)
+            .unwrap()
+            .0
+            .iter()
+            .all(|&b| b == 0)
+    );
     cache.release(&gpu).unwrap();
 }
 
@@ -517,7 +529,8 @@ fn alloc_after_free_round_trip_returns_same_block_lifo() {
 
 fn device_tail_map(cache: &PagedKvCache, gpu: &MockGpuBackend) -> Vec<u32> {
     let mut bytes = vec![0u8; cache.num_blocks() * 4];
-    gpu.copy_d2h(cache.sparse_index_tail_map_ptr(), &mut bytes).unwrap();
+    gpu.copy_d2h(cache.sparse_index_tail_map_ptr(), &mut bytes)
+        .unwrap();
     bytes
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
@@ -528,7 +541,10 @@ fn device_tail_map(cache: &PagedKvCache, gpu: &MockGpuBackend) -> Vec<u32> {
 fn slotted_tails_are_lent_to_fresh_blocks_and_published() {
     let gpu = MockGpuBackend::new();
     let mut cache = PagedKvCache::new(test_config(), 64, &gpu).unwrap();
-    let plan = TailSlotPlan { lag_blocks: 2, sequences: 2 };
+    let plan = TailSlotPlan {
+        lag_blocks: 2,
+        sequences: 2,
+    };
     cache
         .attach_sparse_index_with_tail_slots(SparseIndexCacheConfig::bf16(4, 128), Some(plan), &gpu)
         .unwrap();
@@ -553,7 +569,10 @@ fn slotted_tails_are_lent_to_fresh_blocks_and_published() {
 fn slotted_tails_release_only_blocks_beyond_the_lag() {
     let gpu = MockGpuBackend::new();
     let mut cache = PagedKvCache::new(test_config(), 64, &gpu).unwrap();
-    let plan = TailSlotPlan { lag_blocks: 2, sequences: 1 };
+    let plan = TailSlotPlan {
+        lag_blocks: 2,
+        sequences: 1,
+    };
     cache
         .attach_sparse_index_with_tail_slots(SparseIndexCacheConfig::bf16(4, 128), Some(plan), &gpu)
         .unwrap();
@@ -580,7 +599,10 @@ fn slotted_tails_release_only_blocks_beyond_the_lag() {
 fn slotted_tails_return_on_free_and_refuse_exhaustion() {
     let gpu = MockGpuBackend::new();
     let mut cache = PagedKvCache::new(test_config(), 64, &gpu).unwrap();
-    let plan = TailSlotPlan { lag_blocks: 0, sequences: 1 };
+    let plan = TailSlotPlan {
+        lag_blocks: 0,
+        sequences: 1,
+    };
     cache
         .attach_sparse_index_with_tail_slots(SparseIndexCacheConfig::bf16(4, 128), Some(plan), &gpu)
         .unwrap();
@@ -607,7 +629,10 @@ fn slotted_tails_are_not_zeroed_by_block() {
     cache
         .attach_sparse_index_with_tail_slots(
             SparseIndexCacheConfig::bf16(4, 128),
-            Some(TailSlotPlan { lag_blocks: 1, sequences: 1 }),
+            Some(TailSlotPlan {
+                lag_blocks: 1,
+                sequences: 1,
+            }),
             &gpu,
         )
         .unwrap();

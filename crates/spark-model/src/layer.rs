@@ -14,10 +14,6 @@ use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 pub mod glm_long_owner;
-pub mod glm_owner_verify;
-pub mod glm_pair_verify;
-pub(crate) mod glm_verify_ffn;
-pub(crate) mod glm_verify_scratch;
 pub mod ssm_batch;
 mod transformer_layer;
 pub use transformer_layer::{
@@ -172,14 +168,20 @@ mod prefill_piece_tests {
     #[test]
     fn first_chunk_splits_at_the_topk_boundary_then_by_attention_rows() {
         assert_eq!(pieces(0, 4096, 2048), [(0, 2048), (2048, 2048)]);
-        assert_eq!(pieces(0, 8196, 2048), [(0, 2048), (2048, 4096), (6144, 2052)]);
+        assert_eq!(
+            pieces(0, 8196, 2048),
+            [(0, 2048), (2048, 4096), (6144, 2052)]
+        );
         assert_eq!(pieces(1000, 4096, 2048), [(0, 1048), (1048, 3048)]);
     }
 
     #[test]
     fn chunks_past_or_before_the_boundary_split_only_by_attention_rows() {
         assert_eq!(pieces(4096, 4096, 2048), [(0, 4096)]);
-        assert_eq!(pieces(8192, 8196, 2048), [(0, 4096), (4096, 4096), (8192, 4)]);
+        assert_eq!(
+            pieces(8192, 8196, 2048),
+            [(0, 4096), (4096, 4096), (8192, 4)]
+        );
         assert_eq!(pieces(0, 1500, 2048), [(0, 1500)]);
         assert_eq!(pieces(0, 2048, 2048), [(0, 2048)]);
         assert_eq!(pieces(0, 4096, 0), [(0, 4096)]);

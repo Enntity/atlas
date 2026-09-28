@@ -93,9 +93,6 @@ pub struct TransformerModel {
     pub(super) lm_head_fp8: Option<Fp8DenseWeight>,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     pub(super) buffers: BufferArena,
-    /// Constructor-selected eager temporal pair compute; None preserves serial MTP.
-    pub(super) glm_pair_verify_mode: Option<crate::layer::glm_pair_verify::GlmPairFfn>,
-    pub(super) glm_owner_verify_mode: Option<super::glm_owner_wire::Mode>,
     /// Startup-static LoRA adapter (pool + per-layer pairs + M2 pointer
     /// tables). `None` = no adapter. Installed post-construction via
     /// `set_lora_weights`, which also copies the per-layer pairs into the
@@ -630,9 +627,6 @@ impl TransformerModel {
     }
 
     pub(super) fn release_pools(&mut self) -> anyhow::Result<()> {
-        if let Some(capability) = self.paired_handoff() {
-            capability.close(self.gpu.as_ref(), self.secondary_stream)?;
-        }
         crate::layers::moe::invalidate_resident_btile_readers(&self.config, &mut self.layers);
         use atlas_core::scope::ModelResource;
 

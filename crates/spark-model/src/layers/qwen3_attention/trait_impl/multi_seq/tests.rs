@@ -76,6 +76,7 @@ fn qkv_phase_d2d(gpu: &MockGpuBackend, config: &ModelConfig, layer: &Qwen3Attent
     let levers = crate::layers::ops::ModelLevers::defaults();
     let stats = crate::layers::ops::ModelStats::new();
     let fwd = ForwardContext {
+        ssm_batch: None,
         dispatch: &dispatch,
         derived: &derived,
         levers: &levers,
@@ -100,6 +101,7 @@ fn qkv_phase_d2d(gpu: &MockGpuBackend, config: &ModelConfig, layer: &Qwen3Attent
         buffers.hidden_states(),
         buffers.residual(),
         4,
+        &[1; 4],
         16,
         0,
     );

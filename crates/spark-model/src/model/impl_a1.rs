@@ -688,8 +688,6 @@ impl TransformerModel {
             lm_head_fp8,
             layers,
             buffers,
-            glm_pair_verify_mode: None,
-            glm_owner_verify_mode: None,
             lora: None,
             lora_install_attempted: false,
             lora_rotatable: false,

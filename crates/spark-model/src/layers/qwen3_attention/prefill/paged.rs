@@ -64,7 +64,6 @@ impl Qwen3AttentionLayer {
         self.glm_chunk_attention(owners, kv_cache, ctx, &args)
     }
 
-
     pub(in crate::layers::qwen3_attention) fn prefill_attention_paged(
         &self,
         state: &mut dyn crate::layer::LayerState,

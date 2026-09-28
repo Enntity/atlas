@@ -146,7 +146,10 @@ fn actual_independent_width_entry() {
                 let routers: Vec<_> = kernels.iter().filter(|k| k.0 == router).collect();
                 assert_eq!(routers.len(), 1);
                 assert_eq!(routers[0].1[0], Arg::Ptr(arena.norm_output()));
-                assert_eq!(routers[0].1[3], Arg::Bytes((rows as u32).to_ne_bytes().to_vec()));
+                assert_eq!(
+                    routers[0].1[3],
+                    Arg::Bytes((rows as u32).to_ne_bytes().to_vec())
+                );
                 let shared_calls: Vec<_> = kernels.iter().filter(|k| k.0 == shared).collect();
                 assert_eq!(shared_calls.len(), 3);
                 for call in shared_calls {
