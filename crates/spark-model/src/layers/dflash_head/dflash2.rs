@@ -616,19 +616,7 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
-        self.kernels.project(
-            gpu,
-            self.batch_norm,
-            &DenseWeight {
-                weight: self.lm_head_shared,
-            },
-            self.lm_head_mx.as_ref(),
-            self.batch_logits,
-            rows,
-            vocab,
-            h,
-            stream,
-        )?;
+        self.project_head(gpu, self.batch_norm, self.batch_logits, rows, stream)?;
         let cand_bytes = n * g * ops::DFLASH2_TOPK * 4;
         let (cand_ids, cand_vals) = (self.batch_mlp_gate, self.batch_mlp_gate.offset(cand_bytes));
         let selector_hidden = self.batch_mlp_gate.offset(2 * cand_bytes);

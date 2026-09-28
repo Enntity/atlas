@@ -137,22 +137,61 @@ impl BlockDiffusionDraftHead {
             layer.up_proj_mx = Some(quantize(&layer.up_proj, inter, h)?);
             layer.down_proj_mx = Some(quantize(&layer.down_proj, h, inter)?);
         }
-        if std::env::var("ATLAS_DFLASH_MXFP8_HEAD").as_deref() == Ok("1")
+        let head = DenseWeight {
+            weight: self.lm_head_shared,
+        };
+        if std::env::var("ATLAS_DFLASH_NVFP4_HEAD").as_deref() == Ok("1")
             && self.lm_head_nvfp4.is_none()
             && self.lm_head_shared.0 != 0
         {
-            let head = DenseWeight {
-                weight: self.lm_head_shared,
-            };
+            self.lm_head_q4 = Some(crate::weight_map::quantize_to_nvfp4(
+                &head,
+                self.vocab_size,
+                h,
+                gpu,
+                gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
+                gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+                stream,
+            )?);
+        } else if std::env::var("ATLAS_DFLASH_MXFP8_HEAD").as_deref() == Ok("1")
+            && self.lm_head_nvfp4.is_none()
+            && self.lm_head_shared.0 != 0
+        {
             self.lm_head_mx = Some(quantize(&head, self.vocab_size, h)?);
         }
         gpu.synchronize(stream)?;
         tracing::info!(
-            "DFlash MXFP8: {} layers x 5 projections, lm_head {}",
+            "DFlash MXFP8: {} layers x 5 projections, lm_head {} (NVFP4 head {})",
             if layers { self.layers.len() } else { 0 },
-            self.lm_head_mx.is_some()
+            self.lm_head_mx.is_some(),
+            self.lm_head_q4.is_some()
         );
         Ok(())
+    }
+
+    /// Drafter logits `out[rows, vocab] = input[rows, H] · lm_headᵀ`: the NVFP4
+    /// twin on the tensor-core GEMV tier when present (up to 32 rows), else
+    /// the MXFP8 twin / BF16 head.
+    pub(super) fn project_head(
+        &self,
+        gpu: &dyn GpuBackend,
+        input: DevicePtr,
+        out: DevicePtr,
+        rows: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let (vocab, h) = (self.vocab_size as u32, self.hidden_size as u32);
+        if let Some(q4) = self.lm_head_q4.as_ref().filter(|_| rows <= 32) {
+            let kernel = crate::layers::w4a16_gemv_tiers::tc_kernel(rows);
+            if kernel.0 != 0 {
+                return ops::w4a16_gemv_batchm(gpu, kernel, input, q4, out, rows, vocab, h, stream);
+            }
+        }
+        let head = DenseWeight {
+            weight: self.lm_head_shared,
+        };
+        self.kernels
+            .project(gpu, input, &head, self.lm_head_mx.as_ref(), out, rows, vocab, h, stream)
     }
 
     pub(super) fn drafter_gemm(

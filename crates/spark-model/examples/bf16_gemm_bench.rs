@@ -15,8 +15,11 @@ use half::bf16;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-const M: u32 = 4096;
-const CONFIGS: [u32; 4] = [0, 4, 5, 9];
+/// Rows (`BF16_BENCH_M` overrides, e.g. 8196 for an 8K prefill chunk).
+fn rows() -> u32 {
+    std::env::var("BF16_BENCH_M").ok().and_then(|v| v.parse().ok()).unwrap_or(4096)
+}
+const CONFIGS: [u32; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 const SHAPES: [(&str, u32, u32); 7] = [
     ("q_a      [1536 x 4096]", 1536, 4096),
     ("q_b      [8192 x 1536]", 8192, 1536),
@@ -65,6 +68,8 @@ fn main() -> Result<()> {
             .fold(0f32, f32::max)
     };
 
+    #[allow(non_snake_case)]
+    let M = rows();
     for (name, n, k) in SHAPES {
         let (mu, nu, ku) = (M as usize, n as usize, k as usize);
         let (a, w) = (g.alloc(mu * ku * 2)?, g.alloc(nu * ku * 2)?);

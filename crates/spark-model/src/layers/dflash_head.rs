@@ -576,6 +576,10 @@ pub struct BlockDiffusionDraftHead {
     /// (`ATLAS_DFLASH_MXFP8_HEAD=1`): the full-vocab head is the largest
     /// read of every proposal, and drafts only need its top-K.
     pub lm_head_mx: Option<Mxfp8Weight>,
+    /// NVFP4 mirror of the shared lm_head for the drafter's logits
+    /// (`ATLAS_DFLASH_NVFP4_HEAD=1`, half the MXFP8 bytes), read by the
+    /// tensor-core GEMV tier. Unlike `lm_head_nvfp4` it keeps batched DFlash2.
+    pub lm_head_q4: Option<QuantizedWeight>,
 
     // === Weights from the drafter checkpoint ===
     /// Hidden-norm applied to the projected target context before mixing
