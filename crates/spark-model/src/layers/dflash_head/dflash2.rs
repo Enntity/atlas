@@ -452,13 +452,21 @@ impl BlockDiffusionDraftHead {
                 gpu, head, layer_idx, ConvSite::Attention, 0, self.batch_norm, attn_deltas, rows,
                 stream,
             )?;
-            // NVFP4 twins (ATLAS_DFLASH_NVFP4_TC) take the tensor-core tier.
-            let tc = Some(crate::layers::w4a16_gemv_tiers::tc_kernel(rows))
+            // NVFP4 twins (ATLAS_DFLASH_NVFP4_TC) take the tensor-core tier,
+            // 32 rows at a time.
+            let tc = Some(crate::layers::w4a16_gemv_tiers::tc_kernel(rows.min(32)))
                 .filter(|k| k.0 != 0 && matches!(self.quant, super::DflashQuantization::Nvfp4Weights));
-            let lin = |x, w: &DenseWeight, q4: Option<&QuantizedWeight>, mx: Option<&super::Mxfp8Weight>, y, n_out, k_in| {
+            let lin = |x: DevicePtr, w: &DenseWeight, q4: Option<&QuantizedWeight>, mx: Option<&super::Mxfp8Weight>, y: DevicePtr, n_out: u32, k_in: u32| {
                 match (tc, q4) {
                     (Some(kernel), Some(q4)) => {
-                        ops::w4a16_gemv_batchm(gpu, kernel, x, q4, y, rows, n_out, k_in, stream)
+                        for row in (0..rows).step_by(32) {
+                            let m = (rows - row).min(32);
+                            ops::w4a16_gemv_batchm(
+                                gpu, kernel, x.offset(row as usize * k_in as usize * 2), q4,
+                                y.offset(row as usize * n_out as usize * 2), m, n_out, k_in, stream,
+                            )?;
+                        }
+                        Ok(())
                     }
                     _ => self.kernels.project(gpu, x, w, mx, y, rows, n_out, k_in, stream),
                 }

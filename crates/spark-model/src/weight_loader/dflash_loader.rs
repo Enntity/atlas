@@ -449,6 +449,11 @@ pub fn load_dflash_weights(
     let layer_count = drafter_config.num_hidden_layers;
     let mut layers = Vec::with_capacity(layer_count);
     let mut sink_layers = 0usize;
+    // Projections `ATLAS_DFLASH_DROP_BF16` already moved to NVFP4 twins.
+    let projection = |name: &str| match super::dflash_preshrink::dropped_weight(drafter_store, name) {
+        Some(dropped) => Ok(dropped),
+        None => dense_auto(drafter_store, name, gpu),
+    };
     for i in 0..layer_count {
         let lp = format!("{prefix}layers.{i}");
         let sink_name = format!("{lp}.self_attn.attention_sink_bias");
@@ -473,15 +478,15 @@ pub fn load_dflash_weights(
                 &format!("{lp}.post_attention_layernorm.weight"),
                 gpu,
             )?,
-            q_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.q_proj.weight"), gpu)?,
+            q_proj: projection(&format!("{lp}.self_attn.q_proj.weight"))?,
             k_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.k_proj.weight"), gpu)?,
             v_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.v_proj.weight"), gpu)?,
-            o_proj: dense_auto(drafter_store, &format!("{lp}.self_attn.o_proj.weight"), gpu)?,
+            o_proj: projection(&format!("{lp}.self_attn.o_proj.weight"))?,
             q_norm: dense_auto(drafter_store, &format!("{lp}.self_attn.q_norm.weight"), gpu)?,
             k_norm: dense_auto(drafter_store, &format!("{lp}.self_attn.k_norm.weight"), gpu)?,
-            gate_proj: dense_auto(drafter_store, &format!("{lp}.mlp.gate_proj.weight"), gpu)?,
-            up_proj: dense_auto(drafter_store, &format!("{lp}.mlp.up_proj.weight"), gpu)?,
-            down_proj: dense_auto(drafter_store, &format!("{lp}.mlp.down_proj.weight"), gpu)?,
+            gate_proj: projection(&format!("{lp}.mlp.gate_proj.weight"))?,
+            up_proj: projection(&format!("{lp}.mlp.up_proj.weight"))?,
+            down_proj: projection(&format!("{lp}.mlp.down_proj.weight"))?,
             attention_sink_bias,
         };
         layers.push(layer);

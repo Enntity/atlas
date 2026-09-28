@@ -236,6 +236,11 @@ impl WeightStore {
             .ok_or_else(|| anyhow::anyhow!("Weight '{name}' not found in store"))
     }
 
+    /// Take a weight out of the store; the caller then owns (and frees) it.
+    pub fn remove(&mut self, name: &str) -> Option<WeightTensor> {
+        self.weights.remove(name)
+    }
+
     /// Check if a weight exists.
     pub fn contains(&self, name: &str) -> bool {
         self.weights.contains_key(name)

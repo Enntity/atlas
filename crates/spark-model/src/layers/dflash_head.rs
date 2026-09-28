@@ -93,6 +93,10 @@ impl DflashKernels {
         stream: u64,
     ) -> Result<()> {
         use crate::layers::ops;
+        anyhow::ensure!(
+            weight.weight.0 != 0,
+            "DFlash BF16 projection [{n}, {k}] was dropped (ATLAS_DFLASH_DROP_BF16) but {m} rows need it"
+        );
         if m <= ops::DENSE_GEMV_BATCHM_MAX_M && k % 8 == 0 {
             ops::dense_gemv_batchm(gpu, self.dense_gemv_batchm, input, weight, output, m, n, k, n, stream)
         } else if m <= ops::DENSE_GEMV_TC_MAX_M && k % 8 == 0 && self.dense_gemv_tc32.0 != 0 {

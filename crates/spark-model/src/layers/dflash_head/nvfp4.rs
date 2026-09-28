@@ -7,6 +7,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::{BlockDiffusionDraftHead, DflashQuantization};
 use crate::layers::ops;
+use crate::weight_loader::dflash_preshrink::take_twin;
 use crate::weight_map::{DenseWeight, Fp8DenseWeight, QuantizedWeight, quantize_to_nvfp4};
 
 impl BlockDiffusionDraftHead {
@@ -41,16 +42,19 @@ impl BlockDiffusionDraftHead {
             "DFlash NVFP4: quantizing {} layers × 7 GEMMs for w4a16_gemv_batch4",
             self.layers.len()
         );
-        for layer in &mut self.layers {
-            layer.q_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.q_proj,
-                q_dim,
-                h,
-                gpu,
-                absmax,
-                quant,
-                stream,
-            )?);
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            layer.q_proj_nvfp4 = Some(match take_twin(i, "q_proj") {
+                Some(twin) => twin,
+                None => quantize_to_nvfp4(
+                    &layer.q_proj,
+                    q_dim,
+                    h,
+                    gpu,
+                    absmax,
+                    quant,
+                    stream,
+                )?,
+            });
             layer.k_proj_nvfp4 = Some(quantize_to_nvfp4(
                 &layer.k_proj,
                 kv_dim,
@@ -69,42 +73,54 @@ impl BlockDiffusionDraftHead {
                 quant,
                 stream,
             )?);
-            layer.o_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.o_proj,
-                h,
-                q_dim,
-                gpu,
-                absmax,
-                quant,
-                stream,
-            )?);
-            layer.gate_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.gate_proj,
-                inter,
-                h,
-                gpu,
-                absmax,
-                quant,
-                stream,
-            )?);
-            layer.up_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.up_proj,
-                inter,
-                h,
-                gpu,
-                absmax,
-                quant,
-                stream,
-            )?);
-            layer.down_proj_nvfp4 = Some(quantize_to_nvfp4(
-                &layer.down_proj,
-                h,
-                inter,
-                gpu,
-                absmax,
-                quant,
-                stream,
-            )?);
+            layer.o_proj_nvfp4 = Some(match take_twin(i, "o_proj") {
+                Some(twin) => twin,
+                None => quantize_to_nvfp4(
+                    &layer.o_proj,
+                    h,
+                    q_dim,
+                    gpu,
+                    absmax,
+                    quant,
+                    stream,
+                )?,
+            });
+            layer.gate_proj_nvfp4 = Some(match take_twin(i, "gate_proj") {
+                Some(twin) => twin,
+                None => quantize_to_nvfp4(
+                    &layer.gate_proj,
+                    inter,
+                    h,
+                    gpu,
+                    absmax,
+                    quant,
+                    stream,
+                )?,
+            });
+            layer.up_proj_nvfp4 = Some(match take_twin(i, "up_proj") {
+                Some(twin) => twin,
+                None => quantize_to_nvfp4(
+                    &layer.up_proj,
+                    inter,
+                    h,
+                    gpu,
+                    absmax,
+                    quant,
+                    stream,
+                )?,
+            });
+            layer.down_proj_nvfp4 = Some(match take_twin(i, "down_proj") {
+                Some(twin) => twin,
+                None => quantize_to_nvfp4(
+                    &layer.down_proj,
+                    h,
+                    inter,
+                    gpu,
+                    absmax,
+                    quant,
+                    stream,
+                )?,
+            });
         }
         self.quant = DflashQuantization::Nvfp4Weights;
         tracing::info!("DFlash NVFP4: ready (quant = Nvfp4Weights)");
