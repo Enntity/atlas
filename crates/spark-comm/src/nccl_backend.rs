@@ -15,6 +15,8 @@
 //! - Flags timed broadcasts after a stream sync taking at least 30s; this is
 //!   a post-completion duration check, not an interrupting watchdog
 //! - Aborts dead communicators via `ncclCommAbort` and reconnects
+//! - Keeps the bootstrap TCP connections open as a [`PeerLifeline`], so a
+//!   rank can detect its peer's process exit without waiting on NCCL
 //!
 //! ## Safety contract for the `unsafe { ... }` calls below
 //!
@@ -46,6 +48,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::nccl::{self, NcclComm, NcclDataType, NcclResult, NcclUniqueId};
+use crate::peer_lifeline::PeerLifeline;
 
 // CUDA driver API for recv buffer allocation and kernel launch.
 unsafe extern "C" {
@@ -107,6 +110,8 @@ pub struct NcclBackend {
     /// Bootstrap parameters stored for reconnection.
     master_addr: String,
     master_port: u16,
+    /// Initial bootstrap connections, held open for the backend's lifetime.
+    peer_lifeline: PeerLifeline,
     /// Direct RDMA 2-rank all-reduce (`ATLAS_RDMA_ALLREDUCE=1`).
     #[cfg(atlas_rdma_verbs)]
     rdma: Option<rdma_pair::RdmaPair>,
@@ -142,12 +147,13 @@ impl NcclBackend {
     ) -> Result<Self> {
         Self::log_nccl_env_vars();
 
-        let unique_id = if rank == 0 {
+        let (unique_id, peers) = if rank == 0 {
             let id = Self::generate_unique_id()?;
-            Self::distribute_id(&id, master_addr, master_port, world_size)?;
-            id
+            let peers = Self::distribute_id(&id, master_addr, master_port, world_size)?;
+            (id, peers)
         } else {
-            Self::receive_id(master_addr, master_port)?
+            let (id, master) = Self::receive_id(master_addr, master_port)?;
+            (id, vec![master])
         };
 
         let mut comm: NcclComm = ptr::null_mut();
@@ -220,6 +226,7 @@ impl NcclBackend {
             reconnect_count: AtomicU64::new(0),
             master_addr: master_addr.to_owned(),
             master_port,
+            peer_lifeline: PeerLifeline::new(peers),
             #[cfg(atlas_rdma_verbs)]
             rdma,
         })
@@ -299,13 +306,15 @@ impl NcclBackend {
 
         // Re-bootstrap: rank 0 distributes a new unique ID.
         // Use master_port + 1 to avoid bind conflicts with a lingering listener.
+        // The initial bootstrap connections remain the peer lifeline, so these
+        // are closed as soon as the ID is exchanged.
         let reconnect_port = self.master_port.wrapping_add(1);
         let unique_id = if self.rank == 0 {
             let id = Self::generate_unique_id()?;
             Self::distribute_id(&id, &self.master_addr, reconnect_port, self.world_size)?;
             id
         } else {
-            Self::receive_id(&self.master_addr, reconnect_port)?
+            Self::receive_id(&self.master_addr, reconnect_port)?.0
         };
 
         let mut new_comm: NcclComm = ptr::null_mut();
@@ -516,6 +525,12 @@ impl NcclBackend {
         Ok(false)
     }
 
+    /// Connections to this rank's peers from the initial bootstrap; watch them
+    /// to learn when a peer process exits.
+    pub fn peer_lifeline(&self) -> &PeerLifeline {
+        &self.peer_lifeline
+    }
+
     /// RDMA pair payload capacity, when the pair is up.
     fn rdma_capacity(&self) -> Option<usize> {
         #[cfg(atlas_rdma_verbs)]
@@ -535,7 +550,13 @@ impl NcclBackend {
     }
 
     /// Rank 0: listen, accept (world_size - 1) connections, send the unique ID.
-    fn distribute_id(id: &NcclUniqueId, addr: &str, port: u16, world_size: usize) -> Result<()> {
+    /// Returns the accepted connections.
+    fn distribute_id(
+        id: &NcclUniqueId,
+        addr: &str,
+        port: u16,
+        world_size: usize,
+    ) -> Result<Vec<TcpStream>> {
         let bind_addr = format!("0.0.0.0:{port}");
         let listener = TcpListener::bind(&bind_addr)
             .with_context(|| format!("Rank 0: failed to bind {bind_addr}"))?;
@@ -545,19 +566,22 @@ impl NcclBackend {
             bind_addr
         );
 
+        let mut peers = Vec::with_capacity(world_size - 1);
         for i in 0..(world_size - 1) {
             let (mut stream, peer_addr) = listener.accept().context("Rank 0: accept failed")?;
             stream
                 .write_all(&id.internal)
                 .context("Rank 0: failed to send unique ID")?;
             tracing::info!("Rank 0: sent unique ID to worker {} ({})", i + 1, peer_addr);
+            peers.push(stream);
         }
         let _ = addr; // master_addr not used on rank 0 (we bind 0.0.0.0)
-        Ok(())
+        Ok(peers)
     }
 
-    /// Non-zero rank: connect to rank 0, receive the unique ID.
-    fn receive_id(addr: &str, port: u16) -> Result<NcclUniqueId> {
+    /// Non-zero rank: connect to rank 0, receive the unique ID. Returns the
+    /// connection with it.
+    fn receive_id(addr: &str, port: u16) -> Result<(NcclUniqueId, TcpStream)> {
         let target = format!("{addr}:{port}");
         tracing::info!("Rank N: connecting to master at {target}");
 
@@ -600,12 +624,12 @@ impl NcclBackend {
         let mut id = NcclUniqueId {
             internal: [0u8; 128],
         };
+        let mut stream = stream.unwrap();
         stream
-            .unwrap()
             .read_exact(&mut id.internal)
             .context("Failed to receive unique ID from rank 0")?;
         tracing::info!("Received NCCL unique ID from master");
-        Ok(id)
+        Ok((id, stream))
     }
 }
 

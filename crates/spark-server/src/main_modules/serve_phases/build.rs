@@ -300,7 +300,10 @@ pub(crate) fn maybe_run_ep_worker(
         loop {
             match model_owned.ep_worker_step(&mut slots) {
                 Ok(true) => {}
-                Ok(false) => break,
+                Ok(false) => {
+                    crate::ep_peer_lifeline::expect_peer_exit();
+                    break;
+                }
                 Err(e) => {
                     // An EP worker error may follow a failed collective.  A
                     // local break leaves the rank alive and lets the head

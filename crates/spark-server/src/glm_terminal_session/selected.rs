@@ -113,6 +113,7 @@ impl SelectedModel {
         }
         let operation = self.begin();
         self.check_health();
+        crate::ep_peer_lifeline::expect_peer_exit();
         operation.require(self.model().ep_broadcast_cmd_for_seq(0, u32::MAX));
         operation.complete();
         self.exit_quiescent()
@@ -123,6 +124,7 @@ impl SelectedModel {
         if self.rank != 1 {
             super::terminate();
         }
+        crate::ep_peer_lifeline::expect_peer_exit();
         self.exit_quiescent()
     }
 

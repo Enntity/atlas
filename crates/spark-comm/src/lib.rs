@@ -16,6 +16,7 @@ use anyhow::Result;
 mod broadcast;
 #[cfg(test)]
 mod idle_command_tests;
+pub mod peer_lifeline;
 
 // NCCL FFI + the multi-GPU `NcclBackend` are gated on the `nccl`
 // feature because they `#[link(name = "nccl")]`. `nccl` is separate

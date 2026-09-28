@@ -1163,6 +1163,7 @@ pub fn run(
         let _ = model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF1);
     }
     // Shutdown applies to every slot the worker has; seq_id is ignored.
+    crate::ep_peer_lifeline::expect_peer_exit();
     let _ = model.ep_broadcast_cmd_for_seq(0, 0xFFFFFFFF);
 
     // Release the model's device memory HERE, in order and able to report a
