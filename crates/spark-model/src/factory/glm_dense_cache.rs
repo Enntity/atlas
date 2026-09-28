@@ -7,9 +7,17 @@ pub(crate) const CACHE_BYTES: usize = 9 * 12288 * 4096 * 2;
 fn parse(value: Option<&str>) -> Result<bool> {
     match value {
         None | Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        _ => anyhow::bail!("ATLAS_GLM_DENSE_PREFILL_BF16 must be 0 or 1"),
+        Some("1" | "2") => Ok(true),
+        _ => anyhow::bail!("ATLAS_GLM_DENSE_PREFILL_BF16 must be 0, 1 or 2"),
     }
+}
+
+/// `ATLAS_GLM_DENSE_PREFILL_BF16=2`: the same BF16 prefill GEMMs, with each
+/// weight dequantized into idle arena scratch just before its GEMM instead of
+/// a persistent 906 MB cache (bit-identical weights; ~0.5 ms per projection).
+pub(crate) fn transient() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_DENSE_PREFILL_BF16").as_deref() == Ok("2"))
 }
 fn required(arena: usize, inference: usize) -> Result<usize> {
     arena
@@ -42,6 +50,10 @@ pub(super) fn initialize(
         return Ok(());
     }
     validate(config)?;
+    if transient() {
+        tracing::info!("GLM dense BF16 prefill: transient per-call dequant (no persistent cache)");
+        return Ok(());
+    }
     ensure!(
         crate::layers::ops::GemmDispatch::from_env().cublas_gemm,
         "dense BF16 prefill cache requires ATLAS_CUBLAS_GEMM=1"

@@ -86,9 +86,12 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        let Some(w) = &self.prefill_bf16_weights else {
+        let transient = self.prefill_bf16_weights.is_none()
+            && crate::factory::glm_dense_cache::transient()
+            && self.dequant_nvfp4_bf16_k.0 != 0;
+        if self.prefill_bf16_weights.is_none() && !transient {
             return Ok(false);
-        };
+        }
         // All existing native speculative verification widths retain W4A16,
         // including fallbacks that happen to enter forward_prefill_inner.
         if rows <= 8 {
@@ -108,12 +111,38 @@ impl DenseFfnLayer {
         let inter = ctx.config.intermediate_size as u32;
         let gate = ctx.buffers.expert_gate_out();
         let up = ctx.buffers.expert_up_out();
-        ops::cublas_bf16_proj_dense(input, w.gate_proj.weight, gate, m, inter, h, stream)?;
-        ops::cublas_bf16_proj_dense(input, w.up_proj.weight, up, m, inter, h, stream)?;
+        // Cached BF16 weight `i` (gate, up, down), or the NVFP4 weight
+        // dequantized into `expert_down_out`, idle for a dense layer; each
+        // GEMM reads it before the next dequant on this stream overwrites it.
+        let weight = |i: usize, n: u32, k: u32| -> Result<DevicePtr> {
+            if let Some(w) = &self.prefill_bf16_weights {
+                return Ok([w.gate_proj.weight, w.up_proj.weight, w.down_proj.weight][i]);
+            }
+            let src = [&self.weights.gate_proj, &self.weights.up_proj, &self.weights.down_proj][i];
+            let scratch = ctx.buffers.expert_down_out();
+            ensure!(
+                ctx.buffers.sizes().expert_down_out >= n as usize * k as usize * 2,
+                "dense BF16 transient weight exceeds expert_down_out"
+            );
+            ops::dequant_nvfp4_to_bf16(
+                ctx.gpu,
+                self.dequant_nvfp4_bf16_k,
+                src.weight,
+                src.weight_scale,
+                scratch,
+                src.weight_scale_2,
+                n,
+                k,
+                stream,
+            )?;
+            Ok(scratch)
+        };
+        ops::cublas_bf16_proj_dense(input, weight(0, inter, h)?, gate, m, inter, h, stream)?;
+        ops::cublas_bf16_proj_dense(input, weight(1, inter, h)?, up, m, inter, h, stream)?;
         ops::silu_mul(ctx.gpu, self.act_mul, gate, up, gate, m * inter, stream)?;
         ops::cublas_bf16_proj_dense(
             gate,
-            w.down_proj.weight,
+            weight(2, h, inter)?,
             ctx.buffers.moe_output(),
             m,
             h,
