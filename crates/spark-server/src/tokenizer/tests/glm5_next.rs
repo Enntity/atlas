@@ -56,17 +56,17 @@ fn glm5_tools_respect_resolved_thinking_before_generation() {
 }
 
 #[test]
-fn glm5_without_tools_preserves_stock_reasoning_prompt() {
+fn glm5_without_tools_opens_think_even_when_thinking_is_off() {
+    // GLM-5.3 always reasons; an empty `<think></think>` is out of
+    // distribution (lower draft acceptance, degraded long outputs), so
+    // thinking-off renders the model's own low-effort mode instead.
     let messages = [json!({"role": "user", "content": "What is the weather in Paris?"})];
-    for enabled in [false, true] {
-        let rendered = render(&messages, None, enabled);
-        let suffix = if enabled {
-            "<|assistant|><think>"
-        } else {
-            "<|assistant|><think></think>"
-        };
-        assert!(rendered.ends_with(suffix), "resolved thinking={enabled}");
-    }
+    let off = render(&messages, None, false);
+    assert!(off.ends_with("<|assistant|><think>"));
+    assert!(off.contains("Reasoning Effort: Low"));
+    let on = render(&messages, None, true);
+    assert!(on.ends_with("<|assistant|><think>"));
+    assert!(on.contains("Reasoning Effort: Max"));
 }
 
 #[test]

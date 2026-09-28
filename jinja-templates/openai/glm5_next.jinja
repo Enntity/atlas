@@ -4,7 +4,11 @@
 {%- else -%}
 {%- set thinking_enabled = true -%}
 {%- endif -%}
-{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max' -%}
+{#- Thinking off (without tools) renders GLM's own low-effort reasoning: an
+    empty think block is out of distribution. ATLAS_GLM_EMPTY_THINK_OFF=1
+    (glm_empty_think_off) restores the empty block. -#}
+{%- set low_think = not thinking_enabled and not tools and not (glm_empty_think_off is defined and glm_empty_think_off) -%}
+{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else ('low' if low_think else 'max') -%}
 {%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
 {%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}
 {%- if tools -%}
@@ -262,5 +266,5 @@ For each function call, output the function name and arguments within the follow
 {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
-    <|assistant|>{{- '<think>' if thinking_enabled else '<think></think>' -}}
+    <|assistant|>{{- '<think>' if thinking_enabled or low_think else '<think></think>' -}}
 {%- endif -%}
