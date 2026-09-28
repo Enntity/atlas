@@ -236,6 +236,9 @@ pub(super) fn gate_admissions(
         // reserve against — admit as before.
         return new_reqs;
     }
+    // Under EP a worker cannot back-pressure: its block allocation failure is
+    // fatal to the pair. A request that can never fit the pool is refused
+    // with an error instead of being forced in.
     let new_reqs = if let Some(spill) = shared_spill {
         reject_oversized(
             new_reqs,
@@ -245,6 +248,8 @@ pub(super) fn gate_admissions(
             block_size,
             spill,
         )
+    } else if model.is_ep() {
+        reject_oversized(new_reqs, total_blocks, watermark, max_seq_len, block_size, 0)
     } else {
         new_reqs
     };
