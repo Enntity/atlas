@@ -160,13 +160,13 @@ impl TransformerModel {
         // blocks and ratchet across turns). `seq.cached_prefix_tokens` is
         // the radix-tree match point; tokens at or past it are new and are
         // written normally.
-        let layer_kv_write_start = if marconi_skip {
-            seq.cached_prefix_tokens
-                .saturating_sub(effective_seq_len_start)
-                .min(proc_count)
-        } else {
-            kv_write_start
-        };
+        let layer_kv_write_start = super::proc_range::layer_kv_write_floor(
+            marconi_skip,
+            seq.cached_prefix_tokens,
+            effective_seq_len_start,
+            proc_count,
+            kv_write_start,
+        );
         let prefill_t0 = if profile_now {
             self.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
