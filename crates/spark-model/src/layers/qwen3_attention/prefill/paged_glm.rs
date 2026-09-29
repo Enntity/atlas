@@ -12,7 +12,7 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 
-use super::super::{MlaWeights, Qwen3AttentionLayer};
+use super::super::Qwen3AttentionLayer;
 use super::paged_mla::MlaPrefillArgs;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
@@ -20,80 +20,14 @@ use crate::layers::ops;
 #[path = "paged_glm_projection.rs"]
 mod projection;
 
+#[path = "paged_glm_output.rs"]
+mod output;
+#[path = "paged_glm_owner.rs"]
+mod owner;
+pub(in crate::layers::qwen3_attention) use owner::{GlmChunkOwner, glm_chunk_pieces};
+
 fn dense_selection_is_exact(sequence_end: usize, index_topk: usize) -> bool {
     index_topk > 0 && sequence_end <= index_topk
-}
-
-/// One owner of a (possibly multi-sequence) GLM chunk attention: `rows`
-/// rows at `row0` of the joint inputs, continuing its sequence at
-/// `seq_len_start` with its own single-sequence metadata.
-/// Row-wise projections of an owner-batched verify, one row per stacked row:
-/// owner rows start at `row0 * <row bytes>`.
-#[derive(Clone, Copy)]
-struct GlmOwnerProjections {
-    keys: DevicePtr,
-    gates: DevicePtr,
-    index_query: DevicePtr,
-    weights: DevicePtr,
-    q_absorbed: DevicePtr,
-    key_row: usize,
-    query_row: usize,
-    weight_row: usize,
-}
-
-#[derive(Clone, Copy)]
-pub(in crate::layers::qwen3_attention) struct GlmChunkOwner {
-    pub row0: usize,
-    pub rows: usize,
-    pub seq_len_start: usize,
-    pub meta: crate::layer::AttnMetadataDev,
-}
-
-/// One sequence's prefill chunk of `rows` rows from `seq_len_start` as chunk
-/// owners at rows `[0, rows)` of `meta`. Several pieces are consecutive
-/// same-sequence owners: the joint cache write lands every row first, and
-/// piece k's causal extent is entry 1 + k of the chunk's seq_len buffer
-/// (Model::upload_chunk_seq_lens).
-pub(in crate::layers::qwen3_attention) fn glm_chunk_pieces(
-    meta: crate::layer::AttnMetadataDev,
-    seq_len_start: usize,
-    rows: usize,
-    index_topk: usize,
-) -> Vec<GlmChunkOwner> {
-    let pieces = crate::layer::prefill_attention_pieces(seq_len_start, rows, index_topk);
-    if pieces.len() == 1 {
-        return vec![GlmChunkOwner {
-            row0: 0,
-            rows,
-            seq_len_start,
-            meta,
-        }];
-    }
-    pieces
-        .iter()
-        .enumerate()
-        .map(|(k, &(row0, rows))| GlmChunkOwner {
-            row0,
-            rows,
-            seq_len_start: seq_len_start + row0,
-            meta: crate::layer::AttnMetadataDev {
-                positions: meta.positions.offset(row0 * 4),
-                positions_h: meta.positions_h.offset(row0 * 4),
-                positions_w: meta.positions_w.offset(row0 * 4),
-                slot: meta.slot.offset(row0 * 8),
-                seq_len: meta.seq_len.offset((1 + k) * 4),
-                ..meta
-            },
-        })
-        .collect()
-}
-
-/// An `fp8_g128` owner's latents dequantized to BF16 in the arena scratch,
-/// addressed through an identity block table.
-#[derive(Clone, Copy)]
-struct Bf16LatentView {
-    latents: DevicePtr,
-    identity_table: DevicePtr,
 }
 
 impl Qwen3AttentionLayer {
@@ -119,106 +53,6 @@ impl Qwen3AttentionLayer {
     /// attention run per owner in the pinned native-sparse operand buffers.
     /// With several owners each owner's attention rows are parked in the
     /// (idle until the LM head) logits arena until the joint W_uv.
-    /// W_uk absorb of `rows` q_b outputs into `nq` per-head latent queries.
-    #[allow(clippy::too_many_arguments)]
-    fn glm_absorb_queries(
-        &self,
-        q_full: DevicePtr,
-        q_absorbed: DevicePtr,
-        rows: u32,
-        nq: u32,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        let mla = self.mla.as_ref().expect("GLM absorb without MLA");
-        let (hd, kv_lora) = (mla.nope as u32, mla.kv_lora_rank as u32);
-        ops::glm_paged_grouped_gemm_mla(
-            ctx.gpu,
-            self.grouped_gemm_mla_k,
-            &ctx.config.model_type,
-            q_full,
-            mla.w_uk_t.weight,
-            q_absorbed,
-            rows,
-            nq,
-            hd,
-            kv_lora,
-            nq * hd,
-            nq * kv_lora,
-            stream,
-        )
-    }
-
-    /// Owner-batched projections for a verify batch (several owners, few
-    /// rows), when the scratch holds every row; `None` projects per owner.
-    #[allow(clippy::too_many_arguments)]
-    fn glm_owner_projections(
-        &self,
-        owners: &[GlmChunkOwner],
-        normed: DevicePtr,
-        q_latent: DevicePtr,
-        rows: usize,
-        nq: usize,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<Option<GlmOwnerProjections>> {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on =
-            *ON.get_or_init(|| std::env::var("ATLAS_GLM_OWNER_BATCH_PROJ").as_deref() != Ok("0"));
-        let mla = self
-            .mla
-            .as_ref()
-            .expect("GLM owner projections without MLA");
-        let c = ctx.config;
-        let (hd, kv_lora) = (mla.nope, mla.kv_lora_rank);
-        let key_row = c.index_head_dim * 2;
-        let query_row = c.index_n_heads * c.index_head_dim * 2;
-        let weight_row = c.index_n_heads * 2;
-        let latent_row = nq * kv_lora * 2;
-        let sizes = ctx.buffers.sizes();
-        if !on
-            || owners.len() < 2
-            || rows > 64
-            || sizes.ssm_qkvz < 2 * rows * key_row
-            || sizes.ssm_deinterleaved < rows * (latent_row + query_row)
-            || sizes.qkv_output < rows * nq * hd * 2
-            || sizes.ssm_gates < rows * weight_row
-        {
-            return Ok(None);
-        }
-        let n = rows as u32;
-        let keys = ctx.buffers.ssm_qkvz();
-        let gates = keys.offset(rows * key_row);
-        self.glm_index_project_keys(normed, n, keys, gates, ctx, stream)?;
-        let q_absorbed = ctx.buffers.ssm_deinterleaved();
-        let index_query = q_absorbed.offset(rows * latent_row);
-        let weights = ctx.buffers.ssm_gates();
-        self.glm_index_project_query(q_latent, normed, n, index_query, weights, ctx, stream)?;
-        let q_full = ctx.buffers.qkv_output();
-        self.paged_glm_projection(
-            q_latent,
-            &mla.wq_b,
-            q_full,
-            n,
-            (nq * hd) as u32,
-            mla.q_lora_rank as u32,
-            ctx,
-            stream,
-            projection::enabled(&c.model_type)?,
-        )?;
-        self.glm_absorb_queries(q_full, q_absorbed, n, nq as u32, ctx, stream)?;
-        Ok(Some(GlmOwnerProjections {
-            keys,
-            gates,
-            index_query,
-            weights,
-            q_absorbed,
-            key_row,
-            query_row,
-            weight_row,
-        }))
-    }
-
     pub(super) fn glm_chunk_attention(
         &self,
         owners: &[GlmChunkOwner],
@@ -588,99 +422,8 @@ impl Qwen3AttentionLayer {
         }
         Ok(o_out)
     }
-
-    /// W_uv then the row-parallel o_proj for `rows` latent attention rows
-    /// of `nq` local heads into `h` hidden columns.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_glm_output(
-        &self,
-        mla: &MlaWeights,
-        latent: DevicePtr,
-        out: DevicePtr,
-        [rows, nq, h]: [u32; 3],
-        ctx: &ForwardContext,
-        stream: u64,
-        accelerated: bool,
-    ) -> Result<()> {
-        let (kv_lora, v_dim) = (mla.kv_lora_rank as u32, mla.v_dim as u32);
-        let v_extracted = ctx.buffers.qkv_output();
-        ops::glm_paged_grouped_gemm_mla(
-            ctx.gpu,
-            self.grouped_gemm_mla_k,
-            &ctx.config.model_type,
-            latent,
-            mla.w_uv.weight,
-            v_extracted,
-            rows,
-            nq,
-            kv_lora,
-            v_dim,
-            nq * kv_lora,
-            nq * v_dim,
-            stream,
-        )?;
-        self.paged_glm_projection(
-            v_extracted,
-            &mla.wo,
-            out,
-            rows,
-            h,
-            nq * v_dim,
-            ctx,
-            stream,
-            accelerated,
-        )
-    }
-
-    /// When `wanted` and the cache is `fp8_g128`, dequantize the owner's
-    /// tokens `[0, end)` into the BF16 view — unless they outgrow it, in
-    /// which case the caller reads the FP8 cache directly.
-    #[allow(clippy::too_many_arguments)]
-    fn glm_owner_bf16_view(
-        &self,
-        kv_cache: &PagedKvCache,
-        block_table: DevicePtr,
-        end: usize,
-        wanted: bool,
-        block_size: u32,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<Option<Bf16LatentView>> {
-        if self.kv_dtype != KvCacheDtype::Fp8G128 || !wanted {
-            return Ok(None);
-        }
-        let (latents, identity_table, capacity) = ctx
-            .buffers
-            .glm_latent_scratch()
-            .ok_or_else(|| anyhow::anyhow!("fp8_g128 GLM cache has no BF16 view scratch"))?;
-        if end > capacity {
-            return Ok(None);
-        }
-        ops::glm_latent_dequant_fp8g128(
-            ctx.gpu,
-            self.glm_latent_dequant_k,
-            kv_cache.k_pool_ptr(self.attn_layer_idx),
-            block_table,
-            latents,
-            end as u32,
-            block_size,
-            stream,
-        )?;
-        Ok(Some(Bf16LatentView {
-            latents,
-            identity_table,
-        }))
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::dense_selection_is_exact;
-
-    #[test]
-    fn dense_reference_stops_at_the_semantic_topk_boundary() {
-        assert!(dense_selection_is_exact(2048, 2048));
-        assert!(!dense_selection_is_exact(2049, 2048));
-        assert!(!dense_selection_is_exact(1, 0));
-    }
-}
+#[path = "paged_glm_tests.rs"]
+mod tests;

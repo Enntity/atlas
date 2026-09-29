@@ -13,6 +13,7 @@
 
 mod cache_skip;
 mod cache_skip_mla;
+mod cache_skip_mla_kv_only;
 mod cache_skip_qkv;
 mod cache_skip_v4;
 mod glm_index;
@@ -24,6 +25,7 @@ mod paged_attn_turbok;
 mod paged_glm;
 pub(in crate::layers::qwen3_attention) use paged_glm::{GlmChunkOwner, glm_chunk_pieces};
 mod paged_mla;
+mod paged_mla_args;
 mod paged_oproj;
 mod paged_qkv;
 mod paged_v4;
