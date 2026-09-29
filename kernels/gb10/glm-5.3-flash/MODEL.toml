@@ -49,9 +49,10 @@ default_kv_dtype = "bf16"
 
 # These optional lookups were harvested from an EP=2 boot audit on two DGX
 # Sparks. Both ranks reported the same 33 unresolved probes; the 2026-09-28
-# port smoke added the moe_persist_marker and K16-tile probes. Each lookup is
-# handle-gated or has a resolved fallback in the inherited DeepSeek kernel set;
-# none is required by the default GLM-5.3 NVFP4 execution path.
+# port smoke added the moe_persist_marker, K16-tile and head-rank FP8 drafter
+# probes. Each lookup is handle-gated or has a resolved fallback in the
+# inherited DeepSeek kernel set; none is required by the default GLM-5.3 NVFP4
+# execution path.
 
 [expected_absent.inferspark_prefill_512tc]
 inferspark_prefill_512tc = """
@@ -102,6 +103,8 @@ atlas_q8_1_quantize_ds4_bf16 = "Q4_K activation helper; used only when the compl
 q4k_quantize = "Q4_K weight helper; used only when the complete optional Q4_K family resolves and is enabled."
 
 [expected_absent.w4a16]
+fp8_gemm_t_row_scaled = "Optional FP8 drafter probe (DFlash head, rank 0 only); used only under ATLAS_DFLASH_DRAFTER_FP8, which GLM does not set. The GLM drafter runs its BF16/MXFP8/NVFP4 paths when this handle is absent."
+fp8_gemm_t_row_scaled_m16 = "Optional small-M FP8 drafter lm_head twin; same ATLAS_DFLASH_DRAFTER_FP8 gate, unused on GLM."
 int8_gemm_faith2 = "Optional lossy W4A8 prefill arm; dispatch requires both a nonzero handle and ATLAS_INT8_PREFILL."
 int8_gemm_i32acc = "Optional W4A8 accumulator arm; dispatch requires both a nonzero handle and ATLAS_INT8_PREFILL."
 requant_a_bf16_int8 = "Activation helper for the optional ATLAS_INT8_PREFILL family; never materialized when its GEMM handles are absent."
