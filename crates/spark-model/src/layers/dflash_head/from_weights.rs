@@ -285,6 +285,9 @@ impl BlockDiffusionDraftHead {
             w4a16_gemv_batch8: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8")?,
             w4a16_gemv_batch16: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
             w4a16_gemv_batch32: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch32")?,
+            mxfp8_quantize: crate::layers::try_kernel(gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
+            mxfp8_gemv: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
+                .map(|name| crate::layers::try_kernel(gpu, "mxfp8_gemv", name)),
         };
 
         // Per-step scratch buffers. BF16 = 2 bytes/element.
@@ -842,6 +845,7 @@ impl BlockDiffusionDraftHead {
                         gate_proj_nvfp4: None,
                         up_proj_nvfp4: None,
                         down_proj_nvfp4: None,
+                        mx: None,
                     })
                     .collect()
             },
@@ -932,6 +936,7 @@ impl BlockDiffusionDraftHead {
             suppress_graphs: std::sync::atomic::AtomicBool::new(false),
             propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
             quant: DflashQuantization::Bf16,
+            twins: Default::default(),
             startup,
             ctx_carry: Mutex::new(None),
         };
@@ -1101,7 +1106,7 @@ impl BlockDiffusionDraftHead {
             );
         }
 
-        head.try_install_nvfp4(gpu)?;
+        head.install_twins(gpu)?;
         Ok(head)
     }
 
