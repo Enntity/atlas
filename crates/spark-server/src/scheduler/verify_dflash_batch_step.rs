@@ -127,7 +127,7 @@ pub(super) fn step_verify_dflash_batched(
         let a = &mut batch[i];
         let drafts = &drafts_per_seq[i];
         let raw = &results[off[i]..off[i + 1]];
-        let verified: Vec<u32> = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
+        let mut verified: Vec<u32> = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
             dflash_verify_raw_argmax,
             sched.levers.dflash_masked_verify,
             model,
@@ -139,17 +139,13 @@ pub(super) fn step_verify_dflash_batched(
                 model, raw, a, verify_ctx, off[i],
             )
         };
-        let mut num_accepted = 0usize;
-        for j in 0..drafts.len() {
-            if j + 1 >= verified.len() {
-                break;
-            }
-            if drafts[j] == verified[j] {
-                num_accepted += 1;
-            } else {
-                break;
-            }
-        }
+        let num_accepted = super::verify_dflash_step::accept_with_forced_think_end(
+            a,
+            verify_ctx.think_end_token,
+            verify_ctx.boundary_mask.as_deref(),
+            drafts,
+            &mut verified,
+        );
         accepts.push(num_accepted);
         verifieds.push(verified);
     }
