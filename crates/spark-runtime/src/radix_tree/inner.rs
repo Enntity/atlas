@@ -7,14 +7,20 @@
 use std::collections::HashMap;
 
 mod evict;
+mod nvme;
+
+pub(super) use nvme::NvmeIndex;
 
 type NodeId = usize;
 
 pub(super) struct RadixNode {
     /// Children keyed by the token chunk (block_size tokens).
     children: HashMap<Vec<u32>, NodeId>,
-    /// Physical KV cache block index stored at this node.
+    /// Physical KV cache block index stored at this node. `u32::MAX` on a
+    /// non-root node means the block is ON DISK at `nvme_slot` (spill tier).
     block_idx: u32,
+    /// NVMe spill-tier record slot; `u32::MAX` unless the node is on disk.
+    nvme_slot: u32,
     /// `--high-speed-swap` disk-block ID (Phase 6.1.e). `u32::MAX` when HSS
     /// is not in use. The cache holds a refcount on this disk_id (bumped
     /// at insert time, dropped at evict time) parallel to its physical-
@@ -68,13 +74,16 @@ pub(super) struct RadixTreeInner {
     /// the pre-LoRA single-root tree.
     roots: HashMap<u64, NodeId>,
     access_counter: u64,
+    /// NVMe spill tier (`None` = off: eviction deletes, the default).
+    pub(super) nvme: Option<NvmeIndex>,
 }
 
 impl RadixTreeInner {
     pub(super) fn new() -> Self {
         let root = RadixNode {
             children: HashMap::new(),
-            block_idx: u32::MAX,     // sentinel — root has no block
+            block_idx: u32::MAX, // sentinel — root has no block
+            nvme_slot: u32::MAX,
             disk_block_id: u32::MAX, // sentinel — root has no disk slot either
             context_hash: 0,         // root context hash is 0
             ref_count: 0,
@@ -90,6 +99,7 @@ impl RadixTreeInner {
             free_nodes: Vec::new(),
             roots,
             access_counter: 0,
+            nvme: None,
         }
     }
 
@@ -114,6 +124,7 @@ impl RadixTreeInner {
         let id = self.alloc_node(RadixNode {
             children: HashMap::new(),
             block_idx: u32::MAX,
+            nvme_slot: u32::MAX,
             disk_block_id: u32::MAX,
             context_hash: 0,
             ref_count: 0,
@@ -165,9 +176,11 @@ impl RadixTreeInner {
             match self.nodes[current].children.get(chunk) {
                 Some(&child)
                     if self.nodes[child].context_hash == expected_hash
-                        && self.nodes[child].ref_count > 0 =>
+                        && self.nodes[child].ref_count > 0
+                        && self.nodes[child].block_idx != u32::MAX =>
                 {
-                    // Context chain matches AND block is still live — safe to reuse.
+                    // Context chain matches AND block is still live (resident,
+                    // not spilled to NVMe) — safe to reuse.
                     matched_blocks.push(self.nodes[child].block_idx);
                     matched_disk.push(self.nodes[child].disk_block_id);
                     matched_tokens += block_size;
@@ -207,6 +220,7 @@ impl RadixTreeInner {
                     let expected = context_hash_combine(parent_ctx_hash, key);
                     if self.nodes[child_id].context_hash == expected
                         && self.nodes[child_id].ref_count > 0
+                        && self.nodes[child_id].block_idx != u32::MAX
                     {
                         matched_blocks.push(self.nodes[child_id].block_idx);
                         matched_disk.push(self.nodes[child_id].disk_block_id);
@@ -348,6 +362,11 @@ impl RadixTreeInner {
             };
 
             if let Some(&child) = self.nodes[current].children.get(chunk) {
+                // A node spilled to NVMe takes this sequence's freshly computed
+                // block instead (before its LRU key changes below).
+                if self.nvme_rehome(child, block_table[i]) {
+                    newly_owned_blocks.push(block_table[i]);
+                }
                 // Node exists — update access time, context_hash, and ensure
                 // the cache's ref is still held (ref_count >= 1).
                 self.nodes[child].last_access = access;
@@ -376,6 +395,7 @@ impl RadixTreeInner {
                 let node = RadixNode {
                     children: HashMap::new(),
                     block_idx: block_table[i],
+                    nvme_slot: u32::MAX,
                     disk_block_id: disk_id,
                     context_hash: ctx_hash,
                     ref_count: if is_seq_owned { 2 } else { 1 },

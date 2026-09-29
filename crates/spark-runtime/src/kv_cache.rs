@@ -453,10 +453,14 @@ pub struct PagedKvCache {
     tail_slots: Option<tail_slots::TailSlots>,
     /// Per-block refcount event history (`ATLAS_KV_TRACE=1`; inert otherwise).
     trace: block_trace::BlockTrace,
+    /// Prefix-cache NVMe spill store (`ATLAS_KV_NVME_DIR`); `None` = off.
+    nvme: Option<nvme_spill::NvmeSpill>,
 }
 
 mod block_trace;
 mod catalog;
+mod debug_impl;
+mod nvme_spill;
 mod paged_impl;
 mod release;
 mod sparse_index;

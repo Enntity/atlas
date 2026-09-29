@@ -171,3 +171,36 @@ fn direct_swap_file_grows_on_first_write() {
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 5 * rb as u64);
     let _ = std::fs::remove_file(path);
 }
+
+/// `read_records` returns consecutive records in slot order through both the
+/// aligned single-`pread` path and the unaligned per-record fallback, and a
+/// run reaching past the written end of the file is an error, not zeros.
+#[test]
+fn direct_swap_file_reads_consecutive_record_runs() {
+    let rb = 4096usize;
+    let Some((mut f, path)) = o_direct_file(rb, "runs") else {
+        return;
+    };
+    let mut src = vec![0u8; rb + 4096];
+    for slot in 0..4usize {
+        let rec = page_aligned(&mut src, rb);
+        rec.fill(0x10 + slot as u8);
+        f.write_record(slot, rec).unwrap();
+    }
+    let mut storage = vec![0u8; 3 * rb + 4096];
+    let aligned = page_aligned(&mut storage, 3 * rb);
+    f.read_records(1, aligned).unwrap();
+    for (i, rec) in aligned.chunks_exact(rb).enumerate() {
+        assert!(
+            rec.iter().all(|&b| b == 0x11 + i as u8),
+            "aligned record {i}"
+        );
+    }
+    let mut unaligned = vec![0u8; 2 * rb + 1];
+    f.read_records(2, &mut unaligned[1..]).unwrap();
+    assert!(unaligned[1..=rb].iter().all(|&b| b == 0x12));
+    assert!(unaligned[rb + 1..].iter().all(|&b| b == 0x13));
+    let mut past = vec![0u8; 2 * rb + 4096];
+    assert!(f.read_records(3, page_aligned(&mut past, 2 * rb)).is_err());
+    let _ = std::fs::remove_file(path);
+}
