@@ -192,8 +192,12 @@ pub(super) fn shard_plan(
         .filter(|c| c.world_size() == 2)
         .context("ATLAS_GLM_KV_SHARD=1 needs a two-rank communicator")?;
     ensure!(
-        config.tp_world_size == 2 && config.num_attention_heads == 64,
-        "ATLAS_GLM_KV_SHARD=1 needs TP2 over 64 attention heads (32 per rank)"
+        // Serving topology has already converted this to local heads.
+        config.tp_world_size == 2 && config.num_attention_heads == 32,
+        "ATLAS_GLM_KV_SHARD=1 needs TP2 over 64 attention heads (32 per rank); \
+         got tp_world_size={} num_attention_heads={}",
+        config.tp_world_size,
+        config.num_attention_heads
     );
     ensure!(
         kv_config.cache_blocks_per_seq.is_none(),
