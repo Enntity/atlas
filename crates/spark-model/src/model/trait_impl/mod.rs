@@ -28,6 +28,7 @@ mod decode_b2;
 mod decode_checkpoint;
 mod decode_graph_key;
 pub(super) mod drafter_prefill;
+mod entry;
 mod ep_misc;
 mod graph_borrow;
 mod lm_head_batched;
@@ -38,8 +39,6 @@ mod prefill_a;
 mod prefill_b;
 mod prefill_c;
 mod prefill_d;
-#[cfg(test)]
-mod prefill_stream_tests;
 mod sequence;
 mod speculative;
 pub(in crate::model) mod ssm_fault_in;
@@ -96,10 +95,7 @@ impl Model for TransformerModel {
         owned_images: usize,
         slice_rows: usize,
     ) {
-        *self.vision_row_base.lock() = row_base;
-        *self.vision_grid_base.lock() = grid_base;
-        *self.vision_owned_images.lock() = owned_images;
-        *self.vision_slice_rows.lock() = slice_rows;
+        self.set_vision_slice_base_entry(row_base, grid_base, owned_images, slice_rows);
     }
     fn ep_broadcast_vision_state_for_seq(
         &self,
@@ -129,15 +125,7 @@ impl Model for TransformerModel {
         self.tokens_have_vision_pad(tokens)
     }
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
-        // Full prefill computes on default; its eager consumer must follow it.
-        let stream = self.gpu.default_stream();
-        self.stamp_overlay_route(seq.adapter_slot);
-
-        (|| {
-            let logits = self.prefill_dispatch(tokens, seq, stream)?;
-            self.try_eager_drafter_prefill(seq, true, stream)?;
-            Ok(logits)
-        })()
+        self.prefill_entry(tokens, seq)
     }
     fn prefill_chunk(
         &self,
@@ -148,27 +136,7 @@ impl Model for TransformerModel {
         is_last_chunk: bool,
         stream: u64,
     ) -> Result<DevicePtr> {
-        // Distributed dispatch uses default for command/collective ordering.
-        // Keep capture consumption and scratch reuse on that same stream.
-        let stream = if self.multi_rank_protocol_active() {
-            self.gpu.default_stream()
-        } else {
-            stream
-        };
-        self.stamp_overlay_route(seq.adapter_slot);
-
-        (|| {
-            let logits = self.prefill_chunk_dispatch(
-                tokens,
-                seq,
-                chunk_start,
-                chunk_len,
-                is_last_chunk,
-                stream,
-            )?;
-            self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
-            Ok(logits)
-        })()
+        self.prefill_chunk_entry(tokens, seq, chunk_start, chunk_len, is_last_chunk, stream)
     }
     fn prefill_twophase(
         &self,
@@ -177,18 +145,7 @@ impl Model for TransformerModel {
         chunk_size: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
-        let stream = if self.multi_rank_protocol_active() {
-            self.gpu.default_stream()
-        } else {
-            stream
-        };
-        self.stamp_overlay_route(seq.adapter_slot);
-
-        (|| {
-            let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
-            self.try_eager_drafter_prefill(seq, true, stream)?;
-            Ok(logits)
-        })()
+        self.prefill_twophase_entry(tokens, seq, chunk_size, stream)
     }
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
         self.stamp_overlay_route(seq.adapter_slot);
@@ -552,9 +509,7 @@ impl Model for TransformerModel {
         self.decode_verify_glm_long_owners_impl(rows, tokens, seqs)
     }
     fn has_shared_prompt_capture(&self) -> bool {
-        // Only the MTP drafter's prompt capture is shared; DFlash captures
-        // into per-sequence proposer state.
-        !self.mtp_prefill_hidden.is_null()
+        self.has_shared_prompt_capture_impl()
     }
     fn can_fuse_glm_prefill_verify(
         &self,
@@ -976,13 +931,9 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<Option<u32>> {
-        anyhow::ensure!(
-            !seq.disable_mtp,
-            "MTP propose invoked for native-only sequence"
-        );
+        self.ensure_mtp_propose_allowed(seq)?;
         self.run_mtp_propose_dispatch(token, position, seq, _stream)
     }
-
     fn run_mtp_propose_multi(
         &self,
         token: u32,
@@ -992,10 +943,7 @@ impl Model for TransformerModel {
         _stream: u64,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
-        anyhow::ensure!(
-            !seq.disable_mtp,
-            "MTP propose invoked for native-only sequence"
-        );
+        self.ensure_mtp_propose_allowed(seq)?;
         self.run_mtp_propose_multi_dispatch(
             token,
             position,
@@ -1081,9 +1029,7 @@ impl Model for TransformerModel {
         self.is_mla_dispatch()
     }
     fn supports_chunked_mla(&self) -> bool {
-        self.config.model_type == "glm5_next"
-            && self.config.index_kpool > 0
-            && self.config.index_topk > 0
+        self.supports_chunked_mla_impl()
     }
 
     fn kv_block_size(&self) -> Option<usize> {
