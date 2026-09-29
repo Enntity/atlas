@@ -49,7 +49,8 @@ impl BlockDiffusionDraftHead {
         let mut batch_kv_lens = Vec::with_capacity(n);
         let mut batch_block_tables = Vec::with_capacity(n);
         let mut batch_ctx_counts = Vec::with_capacity(n);
-        for state in states.iter_mut() {
+        let mut ban_depths: Vec<u32> = Vec::with_capacity(n);
+        for (sequence, state) in states.iter_mut().enumerate() {
             let dstate = state
                 .as_any_mut()
                 .downcast_mut::<DflashProposerState>()
@@ -61,6 +62,13 @@ impl BlockDiffusionDraftHead {
                 .unwrap_or(expected_owners[owners.len()]);
             owners.push(owner);
             lifecycles.push(lifecycle);
+            ban_depths.push(positions.get(sequence).map_or(0, |&anchor| {
+                crate::traits::EosBan::banned_draft_depth(
+                    dstate.end_floor,
+                    anchor,
+                    self.gamma.saturating_sub(1),
+                )
+            }));
             let block_table_dev = dstate.block_table_dev.unwrap_or(DevicePtr::NULL);
             block_table_ptrs.push(block_table_dev.0);
             batch_ctx_counts.push(dstate.ctx_count_drafter);
@@ -145,6 +153,9 @@ impl BlockDiffusionDraftHead {
         ctx.gpu.copy_h2d(&position_bytes, self.batch_position_ids)?;
         ctx.gpu
             .copy_h2d(&last_token_bytes, self.batch_markov_prev)?;
+        // min_tokens: leading draft depths the selector walk may not end on.
+        let ban_depth_bytes: Vec<u8> = ban_depths.iter().flat_map(|d| d.to_le_bytes()).collect();
+        ctx.gpu.copy_h2d(&ban_depth_bytes, self.batch_ban_depth())?;
         let ptr_bytes: Vec<u8> = block_table_ptrs
             .iter()
             .flat_map(|pointer| pointer.to_le_bytes())

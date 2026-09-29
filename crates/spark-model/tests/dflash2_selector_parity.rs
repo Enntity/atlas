@@ -116,6 +116,9 @@ fn run_case(c: &Case) -> Result<()> {
     let d_pred = up_u16(&gpu, &pred)?;
     let d_succ = up_u16(&gpu, &succ)?;
     let d_out = gpu.alloc(c.gamma * 4)?;
+    // The anchor is read on device (graph-replay safe); no min_tokens ban.
+    let d_anchor = gpu.alloc(4)?;
+    gpu.copy_h2d(&last_token.to_le_bytes(), d_anchor)?;
 
     ops::dflash2_candidate_selector(
         &gpu,
@@ -125,7 +128,9 @@ fn run_case(c: &Case) -> Result<()> {
         d_pred,
         d_succ,
         d_out,
-        last_token,
+        d_anchor,
+        spark_runtime::gpu::DevicePtr::NULL,
+        [u32::MAX; 4],
         c.gamma as u32,
         c.vocab as u32,
         c.rank as u32,
