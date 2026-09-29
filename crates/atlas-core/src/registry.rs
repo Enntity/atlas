@@ -43,6 +43,12 @@ unsafe extern "C" {
         extra: *mut *mut c_void,
     ) -> i32;
     fn cuFuncSetAttribute(hfunc: *mut c_void, attrib: i32, value: i32) -> i32;
+    fn cuLaunchKernelEx(
+        config: *const CuLaunchConfig,
+        f: *mut c_void,
+        kernelParams: *mut *mut c_void,
+        extra: *mut *mut c_void,
+    ) -> i32;
     fn cuGetErrorName(error: i32, pStr: *mut *const i8) -> i32;
     fn cuGetErrorString(error: i32, pStr: *mut *const i8) -> i32;
     // Resolve a `__device__` symbol in a loaded CUmodule into a device pointer
@@ -128,6 +134,47 @@ unsafe impl Sync for RawCudaFunc {}
 /// Obtain one with [`AtlasRegistry::load`] and propagate it (`Arc<AtlasRegistry>`);
 /// there is deliberately no global accessor. Dropping the last handle unloads
 /// the modules.
+/// `CUlaunchAttribute` (driver API): id, padding, 64-byte value union.
+#[repr(C)]
+struct CuLaunchAttribute {
+    id: u32,
+    pad: [u8; 4],
+    value: [u8; 64],
+}
+
+/// `CUlaunchConfig` (driver API).
+#[repr(C)]
+struct CuLaunchConfig {
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared_mem_bytes: u32,
+    stream: *mut c_void,
+    attrs: *mut CuLaunchAttribute,
+    num_attrs: u32,
+}
+
+const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: u32 = 6;
+
+/// Functions launched with programmatic stream serialization (PDL): each one
+/// runs `atlas_pdl_enter()` (kernels/gb10/common/atlas_pdl.cuh) first, so it
+/// may be scheduled before its stream predecessor finishes.
+static PDL_FUNCS: std::sync::RwLock<Vec<usize>> = std::sync::RwLock::new(Vec::new());
+
+/// Launch `func` with programmatic dependent launch from now on.
+pub fn mark_pdl(func: RawCudaFunc) {
+    let mut funcs = PDL_FUNCS.write().unwrap_or_else(|e| e.into_inner());
+    if !funcs.contains(&(func.0 as usize)) {
+        funcs.push(func.0 as usize);
+    }
+}
+
+fn is_pdl(func: RawCudaFunc) -> bool {
+    PDL_FUNCS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&(func.0 as usize))
+}
+
 pub struct AtlasRegistry {
     host: Arc<CudaHost>,
     modules: HashMap<&'static str, Arc<CudaModule>>,
@@ -461,7 +508,32 @@ impl AtlasRegistry {
                 )));
             }
         }
-        let status = unsafe {
+        let status = if is_pdl(raw_func) {
+            let mut value = [0u8; 64];
+            value[..4].copy_from_slice(&1i32.to_ne_bytes());
+            let mut attr = CuLaunchAttribute {
+                id: CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+                pad: [0; 4],
+                value,
+            };
+            let config = CuLaunchConfig {
+                grid: [cfg.grid_dim.0, cfg.grid_dim.1, cfg.grid_dim.2],
+                block: [cfg.block_dim.0, cfg.block_dim.1, cfg.block_dim.2],
+                shared_mem_bytes: cfg.shared_mem_bytes,
+                stream: stream as *mut c_void,
+                attrs: &mut attr,
+                num_attrs: 1,
+            };
+            unsafe {
+                cuLaunchKernelEx(
+                    &config,
+                    raw_func.0,
+                    kernel_params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            }
+        } else {
+            unsafe {
             cuLaunchKernel(
                 raw_func.0,
                 cfg.grid_dim.0,
@@ -475,6 +547,7 @@ impl AtlasRegistry {
                 kernel_params.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
+            }
         };
         if status != 0 {
             return Err(AtlasError::KernelLaunch(format!(

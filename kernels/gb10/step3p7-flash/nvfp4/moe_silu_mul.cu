@@ -26,6 +26,7 @@
 //
 // Grid: (ceil(total_elements / 256), 1, 1)  Block: (256, 1, 1)
 
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 extern "C" __global__ void moe_silu_mul(
@@ -34,6 +35,7 @@ extern "C" __global__ void moe_silu_mul(
     __nv_bfloat16* __restrict__ output,        // [total_expanded, inter_size]
     unsigned int total_elements
 ) {
+    atlas_pdl_enter();
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total_elements) return;
 

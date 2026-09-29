@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <assert.h>   // device-side assert() for the work-list packing guard
 
@@ -131,6 +132,7 @@ extern "C" __global__ void moe_unpermute_reduce_indexed_ep(
     unsigned int local_expert_start,
     unsigned int local_expert_end
 ) {
+    atlas_pdl_enter();
     unsigned int token = blockIdx.x;
     if (token >= num_tokens) return;
 
@@ -164,6 +166,7 @@ extern "C" __global__ void moe_batched_blend(
     unsigned int hidden_size,
     unsigned int num_tokens
 ) {
+    atlas_pdl_enter();
     __shared__ float s_dot_partial[8]; // one per warp (256/32=8)
 
     unsigned int token = blockIdx.x;
@@ -240,6 +243,7 @@ extern "C" __global__ void moe_sort_by_expert(
     unsigned int num_experts,
     unsigned int topk
 ) {
+    atlas_pdl_enter();
     // Supports up to 512 experts (counts[512] + offsets[513] = 4100 bytes shared mem).
     __shared__ unsigned int counts[1024];
     __shared__ unsigned int offsets[1025];
@@ -314,6 +318,7 @@ extern "C" __global__ void moe_build_tile_worklist(
     unsigned int n_tiles,                                    // ceil(N / PM4_N_TILE)
     unsigned int m_tile                                      // PM4_M_TILE (=128)
 ) {
+    atlas_pdl_enter();
     __shared__ unsigned int s_scan[1024];
     __shared__ unsigned int s_base;
     const unsigned int tid = threadIdx.x;

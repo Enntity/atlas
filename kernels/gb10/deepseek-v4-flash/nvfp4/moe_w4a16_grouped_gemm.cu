@@ -10,6 +10,8 @@
 // - K_STEP_T=32 (halves outer loop iterations)
 // - Preloaded sorted_token_ids in smem for A indirection
 
+#include "../../common/atlas_pdl.cuh"
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -2093,6 +2095,8 @@ extern "C" __global__ void __launch_bounds__(256) moe_w4a4_grouped_gemm_prequant
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
+    atlas_pdl_enter();
     const unsigned int expert_id = blockIdx.z;
     if (expert_id >= num_experts) return;
     const int m_start = expert_offsets[expert_id];
@@ -2820,6 +2824,8 @@ extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_compact_gate_up(
 extern "C" __global__ void moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact_gate_up(
     PQ4_COMPACT_GATE_UP_ARGS
 ) {
+    atlas_pdl_enter();
+    atlas_pdl_enter();
     PQ4_COMPACT_GATE_UP_CALL(true);
 }
 

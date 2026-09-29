@@ -286,6 +286,9 @@ impl GpuBackend for AtlasCudaBackend {
         match registry.raw_function_cached(&cache, module, func_name) {
             Ok(raw) => {
                 crate::kernel_audit::record(module, func_name, true, site);
+                if pdl_enabled() && PDL_KERNELS.contains(&func_name) {
+                    atlas_core::registry::mark_pdl(raw);
+                }
                 Ok(KernelHandle(raw.0 as u64))
             }
             Err(e) => {
@@ -464,3 +467,42 @@ impl GpuBackend for AtlasCudaBackend {
         self.free_host_pinned_cu(ptr, _bytes)
     }
 }
+
+/// `ATLAS_PDL=1`: launch the kernels below with programmatic dependent launch.
+fn pdl_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_PDL").as_deref() == Ok("1"))
+}
+
+/// Kernels whose every copy starts with `atlas_pdl_enter()`
+/// (kernels/gb10/common/atlas_pdl.cuh). A kernel launched with PDL must not
+/// read its predecessor's output before that wait, so only these qualify.
+const PDL_KERNELS: &[&str] = &[
+    "w4a16_gemv_tc8",
+    "w4a16_gemv_tc8_ld",
+    "mxfp8_gemv_tc8",
+    "dense_gemv_bf16_batchm",
+    "dense_gemv_bf16_batchm_dual",
+    "dense_gemv_bf16_batchm_triple_n",
+    "rms_norm_vanilla",
+    "bf16_add_inplace",
+    "glm_hc_decode_partial_bf16",
+    "glm_hc_decode_post_partial_bf16",
+    "glm_hc_decode_finalize_bf16",
+    "hc_post_bf16",
+    "moe_topk_sigmoid_batched",
+    "moe_sort_by_expert",
+    "moe_build_tile_worklist",
+    "quantize_bf16_to_nvfp4",
+    "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact_gate_up",
+    "silu_mul_quant_nvfp4",
+    "moe_w4a4_grouped_gemm_prequant_t_k128",
+    "moe_unpermute_reduce_indexed_ep",
+    "moe_batched_blend",
+    "moe_silu_mul",
+    "kda_pack_qkv",
+    "causal_conv1d_update_prefill_tp_snap",
+    "kda_recurrent_bf16_verify_rec_owners",
+    "kda_commit_records",
+    "kda_sigmoid_gated_rms_norm",
+];

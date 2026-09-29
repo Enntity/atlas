@@ -18,6 +18,7 @@
 // Block: (seq_len clamped to 1024, 1, 1)  [prefill]
 //   or   (1, 1, 1)                         [decode]
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include "causal_conv1d_update_body.cuh"
 
@@ -658,6 +659,7 @@ causal_conv1d_update_prefill_tp_snap(
     unsigned int input_stride,
     unsigned int output_stride
 ) {
+    atlas_pdl_enter();
     const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= dim) return;
     const unsigned int t0 = (blockIdx.y * blockDim.y + threadIdx.y) * 8u;

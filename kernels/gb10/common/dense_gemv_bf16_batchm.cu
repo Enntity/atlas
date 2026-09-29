@@ -34,6 +34,7 @@
 //
 // Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define BLOCK_SIZE 256
@@ -152,6 +153,7 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
     unsigned int K,
     unsigned int out_stride
 ) {
+    atlas_pdl_enter();
     __shared__ float smem[MAX_M * N_PER_BLOCK * 2];
     dense_gemv_bf16_batchm_impl<MAX_M>(A, B, C, M, N, K, out_stride, smem);
 }
@@ -231,6 +233,7 @@ extern "C" __global__ void dense_gemv_bf16_batchm_dual(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     __shared__ float smem[MAX_M * N_PER_BLOCK * 2];
     const bool second = blockIdx.z != 0u;
     dense_gemv_bf16_batchm_impl<MAX_M>(second ? A1 : A0, second ? B1 : B0, second ? C1 : C0,
@@ -250,6 +253,7 @@ extern "C" __global__ void dense_gemv_bf16_batchm_triple_n(
     unsigned int N12,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     __shared__ float smem[MAX_M * N_PER_BLOCK * 2];
     const unsigned int plane = blockIdx.z;
     const __nv_bfloat16* B = plane == 0u ? B0 : (plane == 1u ? B1 : B2);

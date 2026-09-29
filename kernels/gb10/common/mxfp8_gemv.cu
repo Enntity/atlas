@@ -20,6 +20,7 @@
 // A: BF16 [M, K] (row stride K). C rows at C + m*out_stride. K % 32 == 0.
 // Grid: (ceil(N/16),1,1) Block: (256,1,1).
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -196,6 +197,7 @@ extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
     const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride) {
+    atlas_pdl_enter();
     mxfp8_gemv_tc_impl<1>(A, W, S, C, M, N, K, out_stride);
 }
 

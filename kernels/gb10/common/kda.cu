@@ -4,6 +4,7 @@
 // reference token order; it is the conservative correctness path used by the
 // first GB10 port and can later be replaced by a chunked implementation.
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include "kda_recurrent_body.cuh"
 
@@ -13,6 +14,7 @@ extern "C" __global__ void kda_pack_qkv(
     unsigned int tokens,
     unsigned int dim
 ) {
+    atlas_pdl_enter();
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long count = (unsigned long long)tokens * 3 * dim;
     if (i >= count) return;
@@ -367,6 +369,7 @@ extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_snap
 extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_rec_owners(
     KDA_VERIFY_OWNERS_ARGS
 ) {
+    atlas_pdl_enter();
     float* const inters[4] = {inter0, inter1, inter2, inter3};
     kda_verify_owners_impl<true>(qkv, raw_gate, raw_beta, a_log, dt_bias, output,
         state0, state1, state2, state3, inters, inter_stride, tokens, heads, dim, lower_bound);
@@ -383,6 +386,7 @@ extern "C" __global__ void __launch_bounds__(128) kda_commit_records(
     unsigned int rows,
     unsigned int heads
 ) {
+    atlas_pdl_enter();
     const unsigned int head = blockIdx.x;
     const unsigned int vrow = threadIdx.x;
     if (head >= heads || blockDim.x != 128) return;
@@ -567,6 +571,7 @@ extern "C" __global__ void kda_sigmoid_gated_rms_norm(
     unsigned int dim,
     float eps
 ) {
+    atlas_pdl_enter();
     const unsigned int row_id = blockIdx.x;
     const unsigned int d = threadIdx.x;
     if (dim > 128 || d >= dim) return;

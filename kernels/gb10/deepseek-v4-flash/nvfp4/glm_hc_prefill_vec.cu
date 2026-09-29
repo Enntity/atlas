@@ -2,6 +2,7 @@
 // Opt-in GLM HC4/4096 prefill finalizer with warp Sinkhorn and vector collapse.
 // Same RMS reduction, raw mix and arithmetic as hc_pre_from_raw_mix, with
 // only the independent 4x4 Sinkhorn cells distributed across 16 lanes.
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #ifndef HC_BLOCK
@@ -634,6 +635,7 @@ extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_post_partial_bf1
     const float* __restrict__ post, const float* __restrict__ comb,
     const float* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens
 ) {
+    atlas_pdl_enter();
     glm_hc_decode_partial_t<__nv_bfloat16, true>(block_out, streams, post, comb, hc_fn, partial, tokens);
 }
 
@@ -642,6 +644,7 @@ extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_partial_bf16(
     const float* __restrict__ post, const float* __restrict__ comb,
     const float* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens
 ) {
+    atlas_pdl_enter();
     glm_hc_decode_partial_t<__nv_bfloat16, false>(block_out, streams, post, comb, hc_fn, partial, tokens);
 }
 
@@ -651,6 +654,7 @@ extern "C" __global__ void __launch_bounds__(256) glm_hc_decode_finalize_bf16(
     __nv_bfloat16* __restrict__ y_out, float* __restrict__ post_out, float* __restrict__ comb_out,
     const unsigned int tokens, const unsigned int sinkhorn_iters, const float norm_eps, const float hc_eps
 ) {
+    atlas_pdl_enter();
     glm_hc_decode_finalize_t<__nv_bfloat16>(streams, partial, hc_scale, hc_base, y_out, post_out, comb_out,
                                   tokens, sinkhorn_iters, norm_eps, hc_eps);
 }
