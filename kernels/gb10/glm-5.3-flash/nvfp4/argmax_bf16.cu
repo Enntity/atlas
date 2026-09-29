@@ -124,9 +124,9 @@ extern "C" __global__ void argmax_bf16_value_ban(
 }
 
 // Merge per-row TP2 shard quads from argmax_bf16_value_ban into global token
-// IDs, on device so a graph-captured verify needs no host round trip. The rule
-// is the host glm5_mtp argmax_merge::merge: a valid tie picks the higher
-// global ID (rank one); two untouched sentinels keep index zero. Row r merges
+// IDs, on device so a graph-captured verify needs no host round trip. Ties
+// follow the engine's first-index-wins argmax: rank 0 holds the lower IDs, so
+// an exact tie (and two untouched sentinels) keeps rank 0's pair. Row r merges
 // the unbanned pairs when bit r of (mask_hi:mask_lo) is set, else the best pairs.
 //
 // Grid: (1, 1, 1)  Block: (32, 1, 1)
@@ -147,6 +147,6 @@ extern "C" __global__ void argmax_pair_merge_ban(
         const unsigned int* p1 = rank == 0 ? peer : local;
         const float v0 = __uint_as_float(p0[o]);
         const float v1 = __uint_as_float(p1[o]);
-        out[r] = (v1 > v0 || (v1 == v0 && v1 > -1e30f)) ? p1[o + 1] + shard : p0[o + 1];
+        out[r] = v1 > v0 ? p1[o + 1] + shard : p0[o + 1];
     }
 }
