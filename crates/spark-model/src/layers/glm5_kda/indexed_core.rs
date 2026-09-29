@@ -234,7 +234,7 @@ mod tests {
                 ordinal
             );
         }
-        let source = include_str!("../glm5_kda.rs");
+        let source = include_str!("init.rs");
         assert!(source.contains("indexed_core::ordinal(config, layer_idx)?"));
         assert!(source.contains("\"glm_kda_conv_indexed\""));
         assert!(source.contains("\"glm_kda_recurrent_indexed\""));

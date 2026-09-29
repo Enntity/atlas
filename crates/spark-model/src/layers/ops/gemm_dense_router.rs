@@ -10,7 +10,7 @@ use crate::weight_map::DenseWeight;
 
 /// Order-preserving router GEMM for `m <= 32` rows (kernel
 /// `dense_gemm_bf16_router_rows`): one warp per output column, one lane per
-/// row, strict k order — bit-identical to [`dense_gemm`] at decode/verify
+/// row, strict k order — bit-identical to [`super::dense_gemm`] at decode/verify
 /// widths where the tiled kernels launch only a handful of blocks.
 ///
 /// Grid: (ceil(N/4), 1, 1)  Block: (128, 1, 1)
