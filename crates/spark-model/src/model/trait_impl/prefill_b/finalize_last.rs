@@ -317,7 +317,9 @@ impl TransformerModel {
                 );
                 super::super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
             }
-        } else if self.ssm_snapshots.is_enabled() {
+        } else if self.ssm_snapshots.is_enabled()
+            && !crate::model::mtp_carry::marconi_prefill_only()
+        {
             if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
                 self.ssm_pool.debug_state_checksum(
                     seq.slot_idx,

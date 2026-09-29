@@ -95,6 +95,22 @@ pub fn marconi_min_tokens() -> usize {
     })
 }
 
+/// Keep only the block-aligned SSM checkpoints written during PREFILL
+/// (`ATLAS_MARCONI_PREFILL_ONLY=1`).
+///
+/// The prompt-end, finish-leaf and decode-cadence snapshots sit at arbitrary
+/// positions and, under speculative decode, are captured around verify
+/// commits. On GLM-5 with DFlash2 and KDA record rollback, restoring them gave
+/// neighbouring-record answers on long-context retrieval turns that a cold
+/// prefill of the same prompt answered correctly. A prefill checkpoint is a
+/// pure function of its block-aligned token prefix, so restoring it is exact;
+/// the cost is replaying the few tokens from that boundary to the match point.
+/// Default off (engine behaviour unchanged).
+pub fn marconi_prefill_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_MARCONI_PREFILL_ONLY").as_deref() == Ok("1"))
+}
+
 pub fn mtp_carry_drafter_enabled(levers: &crate::layers::ops::ModelLevers) -> bool {
     // Force-off in multi-seq MTP mode: the carry slot is single-sequence by
     // design (one slot, `active.len() == 1` assumption). See
