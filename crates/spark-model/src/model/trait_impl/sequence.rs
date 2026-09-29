@@ -479,7 +479,7 @@ impl TransformerModel {
         }
         let mut kv = self.kv_cache.lock();
         let before = kv.num_free_blocks();
-        super::super::block_mgmt::apply_evicted_blocks(evicted, &mut kv);
+        self.apply_evicted(evicted, &mut kv);
         kv.num_free_blocks().saturating_sub(before)
     }
 }

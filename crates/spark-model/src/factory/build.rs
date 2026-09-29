@@ -22,6 +22,7 @@ use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
 mod glm;
+mod kv_nvme;
 mod kv_summary;
 
 pub fn build_model(
@@ -744,6 +745,12 @@ pub fn build_model(
     if let Some(index) = sparse_index {
         kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
     }
+    kv_nvme::attach(
+        &mut kv_cache,
+        prefix_cache.as_ref(),
+        gpu.as_ref(),
+        comm.as_deref(),
+    )?;
 
     // ── Step 6: Assemble model ──
     // Capture pointers for any post-construction sharing (DFlash drafter

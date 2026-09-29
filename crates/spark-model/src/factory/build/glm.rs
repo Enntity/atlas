@@ -204,17 +204,30 @@ fn min_across_ranks(
     gpu: &dyn GpuBackend,
     value: usize,
 ) -> Result<usize> {
+    gather_u64(comm, gpu, value as u64)?
+        .into_iter()
+        .map(|v| v as usize)
+        .min()
+        .ok_or_else(|| anyhow::anyhow!("empty rank gather"))
+}
+
+/// Every rank's `value`, in rank order (one 8-byte all-gather).
+pub(super) fn gather_u64(
+    comm: &dyn spark_comm::CommBackend,
+    gpu: &dyn GpuBackend,
+    value: u64,
+) -> Result<Vec<u64>> {
     let world = comm.world_size();
     let buf = gpu.alloc(8 * (world + 1))?;
     let result = (|| {
-        gpu.copy_h2d(&(value as u64).to_le_bytes(), buf)?;
+        gpu.copy_h2d(&value.to_le_bytes(), buf)?;
         comm.all_gather(buf.0, buf.offset(8).0, 8)?;
         let mut all = vec![0u8; 8 * world];
         gpu.copy_d2h(buf.offset(8), &mut all)?;
-        all.chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().expect("8-byte rank value")) as usize)
-            .min()
-            .ok_or_else(|| anyhow::anyhow!("empty rank gather"))
+        Ok(all
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("8-byte rank value")))
+            .collect())
     })();
     gpu.free(buf)?;
     result
