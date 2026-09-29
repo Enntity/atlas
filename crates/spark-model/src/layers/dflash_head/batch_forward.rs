@@ -381,17 +381,13 @@ impl BlockDiffusionDraftHead {
                 )?;
             }
         } else {
-            crate::layers::ops::dense_gemm_bf16_pipelined(
+            // BF16 shared head (or its NVFP4/MXFP8 drafter twin) through the
+            // same dispatch as the serial tail.
+            self.project_head(
                 ctx.gpu,
-                self.kernels.dense_gemm_pipelined,
                 self.batch_norm,
-                &crate::weight_map::DenseWeight {
-                    weight: self.lm_head_shared,
-                },
                 self.batch_logits,
                 batch_rows,
-                vocab,
-                hidden,
                 stream,
             )?;
         }

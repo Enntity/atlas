@@ -607,31 +607,23 @@ impl BlockDiffusionDraftHead {
                         }
                     }
                     None => {
-                        self.drafter_dense_gemm(
+                        self.project_head(
                             gpu,
                             norm_noise_local,
-                            &crate::weight_map::DenseWeight {
-                                weight: self.lm_head_shared,
-                            },
                             scratch.logits,
                             self.gamma as u32,
-                            self.vocab_size as u32,
-                            h_local,
                             stream,
                         )?;
                     }
                 }
             } else {
-                self.drafter_dense_gemm(
+                // BF16 shared head, or its NVFP4/MXFP8 drafter twin.
+                debug_assert_eq!(h_local as usize, self.hidden_size);
+                self.project_head(
                     gpu,
                     norm_noise_local,
-                    &crate::weight_map::DenseWeight {
-                        weight: self.lm_head_shared,
-                    },
                     scratch.logits,
                     self.gamma as u32,
-                    self.vocab_size as u32,
-                    h_local,
                     stream,
                 )?;
             }
