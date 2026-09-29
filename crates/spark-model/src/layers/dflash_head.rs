@@ -218,12 +218,14 @@ pub struct DflashScratch {
     pub draft_tokens_event: u64,
     pub logits: DevicePtr,
     pub draft_tokens_dev: DevicePtr,
-    /// 4-byte device slot holding the Markov prev token. Host writes it
+    /// `[prev token, banned draft depth]` u32 device slots: the Markov prev
+    /// token / DFlash2 selector anchor, and how many leading draft depths may
+    /// not be an end token (min_tokens). Host writes both
     /// via pinned `markov_prev_host_pinned` BEFORE the captured tail
     /// graph; the graph only reads this pointer. Do not H2D last_token
     /// from a stack temporary inside the tail (replay would see garbage).
     pub markov_prev_dev: DevicePtr,
-    /// Pinned 4-byte host source for `markov_prev_dev`. Stable address
+    /// Pinned host source for `markov_prev_dev`. Stable address
     /// so a captured H2D (if any) would still be valid; we keep the
     /// H2D outside the graph anyway.
     pub markov_prev_host_pinned: std::sync::atomic::AtomicPtr<u8>,
@@ -427,6 +429,9 @@ pub struct DflashProposerState {
     /// + i` formula in `precompute_ctx_kv`. Prefill positions are seeded
     /// `0..prompt_len` in `update_dflash_ctx_len_after_prefill`.
     pub ctx_positions: Vec<i32>,
+    /// The request's min_tokens floor: drafts for positions below it skip
+    /// end tokens (the verify head bans them there). 0 = no floor.
+    pub end_floor: usize,
 }
 
 impl DflashProposerState {
@@ -495,6 +500,9 @@ impl ProposerState for DflashProposerState {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn set_end_floor(&mut self, floor: usize) {
+        self.end_floor = floor;
     }
 }
 
@@ -834,6 +842,11 @@ mod parity_report;
 mod precompute_ctx_kv;
 mod propose;
 mod small_m_gemm;
+
+/// Per-sequence anchor words: `[prev token, banned draft depth]` u32.
+const MARKOV_PREV_BYTES: usize = 8;
+/// Byte offset of the banned draft depth within `markov_prev_dev`.
+const MARKOV_BAN_DEPTH_OFFSET: usize = 4;
 mod twins;
 pub use twins::{DflashTwins, LayerMxfp8};
 
@@ -901,6 +914,12 @@ impl BlockDiffusionDraftHead {
                 bt.0
             );
         }
+    }
+
+    /// `[batch_capacity]` banned draft depths, after the batch anchors in
+    /// `batch_markov_prev`.
+    fn batch_ban_depth(&self) -> DevicePtr {
+        self.batch_markov_prev.offset(self.batch_capacity * 4)
     }
 
     /// Resolve a lane's mutable propose resources: (stream, scratch,
@@ -1031,6 +1050,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             max_ctx_count_drafter: 0,
             ctx_committed: 0,
             ctx_positions: Vec::new(),
+            end_floor: 0,
             // Propose lane: fixed for the seq lifetime (batch positions
             // reorder; captured graphs bake lane scratch pointers). Round-
             // robin keeps concurrent seqs spread across the lane streams.
@@ -1464,6 +1484,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         dstate.last_num_drafted = 0;
         dstate.last_num_accepted = 0;
         dstate.skip_next_decode_append = false;
+        dstate.end_floor = 0;
         Ok(())
     }
 
