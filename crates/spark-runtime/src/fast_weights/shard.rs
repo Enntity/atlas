@@ -24,6 +24,7 @@ pub(super) fn load_shard_fast(
     tensor_filter: Option<&[String]>,
     gpu: &dyn GpuBackend,
     skip_fn: &dyn Fn(&str) -> bool,
+    defer_fn: &dyn Fn(&str) -> bool,
     try_direct_io: bool,
     direct_io_tensor_cap: usize,
     prefetch_shards: bool,
@@ -52,7 +53,7 @@ pub(super) fn load_shard_fast(
     let mut deferred_here: Vec<(String, crate::weights::DeferredTensor)> = Vec::new();
     #[allow(clippy::items_after_statements)]
     tensors.retain(|t| {
-        if crate::weights::is_ngram_table(&t.name) {
+        if crate::weights::is_ngram_table(&t.name) || (!skip_fn(&t.name) && defer_fn(&t.name)) {
             deferred_here.push((
                 t.name.clone(),
                 crate::weights::DeferredTensor {
@@ -68,7 +69,7 @@ pub(super) fn load_shard_fast(
     });
     if !deferred_here.is_empty() {
         tracing::info!(
-            "Deferred {} n-gram table(s) in {} — served from disk, not uploaded",
+            "Deferred {} tensor(s) in {} — served from disk, not uploaded",
             deferred_here.len(),
             shard_path.display()
         );

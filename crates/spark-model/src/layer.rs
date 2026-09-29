@@ -94,6 +94,10 @@ pub struct SsmLayerState {
     /// `gated_delta_rule_commit` rather than the intermediates index-select.
     /// Cleared at commit / rollback.
     pub gdn_commit_pending: bool,
+    /// GLM KDA fold records of a verify (`--ssm-rollback-mode records`): the
+    /// verify leaves `h_state` untouched and the commit folds the accepted
+    /// rows into it (NULL, with snapshots in `h_state_intermediates`, off).
+    pub kda_records: DevicePtr,
     /// Storage dtype of `h_state`: `false` = FP32, `true` = FP16
     /// (`--ssm-h-dtype f16`).
     ///

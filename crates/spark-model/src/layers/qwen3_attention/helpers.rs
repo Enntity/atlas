@@ -78,6 +78,32 @@ impl Qwen3AttentionLayer {
         gpu.synchronize(stream)
     }
 
+    /// Quantize BF16 projections `(weight, n, k)` to NVFP4 twins for up to 32
+    /// rows (`ATLAS_GLM_MLA_NVFP4=1`). Lossy relative to the BF16 checkpoint
+    /// weights; runs at load, before KV sizing.
+    pub fn install_mla_nvfp4(
+        &mut self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        weights: &[(DevicePtr, usize, usize)],
+    ) -> anyhow::Result<()> {
+        let absmax = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
+        let quant = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+        let stream = gpu.default_stream();
+        for &(weight, n, k) in weights {
+            let q4 = crate::weight_map::quantize_to_nvfp4(
+                &crate::weight_map::DenseWeight { weight },
+                n,
+                k,
+                gpu,
+                absmax,
+                quant,
+                stream,
+            )?;
+            self.mla_q4.push((weight, q4));
+        }
+        gpu.synchronize(stream)
+    }
+
     /// Set per-block Manifold-Constrained Hyper-Connection weights
     /// (DeepSeek-V4). When set, the attn/ffn residual sites route through
     /// `hc_pre`/`hc_post` against the model-level `hc_streams` buffer.

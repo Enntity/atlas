@@ -285,6 +285,11 @@ pub fn build_model(
             None
         };
 
+    anyhow::ensure!(
+        !(config.expert_tp && use_speculative && dflash_args.is_none()),
+        "ATLAS_GLM_EXPERT_TP=1 serves with the DFlash drafter only: sliced routed \
+         experts have no whole-expert MTP path"
+    );
     // Qwen3.8-Flash-Next ships an MTP block that is architecturally a full
     // layer (gated attention + QSA indexer + mHC + 512-expert MoE), not the
     // Qwen-shaped `MtpWeights`, so it loads through its own path exactly like

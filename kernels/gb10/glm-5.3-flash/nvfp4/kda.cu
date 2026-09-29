@@ -4,6 +4,7 @@
 // reference token order; it is the conservative correctness path used by the
 // first GB10 port and can later be replaced by a chunked implementation.
 
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include "kda_recurrent_body.cuh"
 
@@ -13,6 +14,7 @@ extern "C" __global__ void kda_pack_qkv(
     unsigned int tokens,
     unsigned int dim
 ) {
+    atlas_pdl_enter();
     unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long count = (unsigned long long)tokens * 3 * dim;
     if (i >= count) return;
@@ -199,7 +201,15 @@ extern "C" __global__ void kda_recurrent_bf16_verify_snap(
 // states and snapshots match it bit for bit, while a few BF16 outputs can
 // round differently (FMA contraction of the output dot).
 // Up to four owners; dim == 128, block 128.
-extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_snap_owners(
+// Records-mode fold of one state element: decay, then the rank-1 delta-rule
+// update, in one explicit rounding order shared by the verify and the commit.
+#define KDA_RECORD_FLOATS 384u
+__device__ __forceinline__ float kda_fold(float h, float decay, float key, float delta) {
+    return __fmaf_rn(delta, key, __fmul_rn(h, decay));
+}
+
+template <bool RECORDS>
+__device__ __forceinline__ void kda_verify_owners_impl(
     const __nv_bfloat16* __restrict__ qkv,
     const __nv_bfloat16* __restrict__ raw_gate,
     const __nv_bfloat16* __restrict__ raw_beta,
@@ -207,7 +217,7 @@ extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_snap
     const float* __restrict__ dt_bias,
     __nv_bfloat16* __restrict__ output,
     float* state0, float* state1, float* state2, float* state3,
-    float* inter0, float* inter1, float* inter2, float* inter3,
+    float* const* inters,
     unsigned long long inter_stride,
     unsigned int tokens,
     unsigned int heads,
@@ -219,7 +229,6 @@ extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_snap
     const unsigned int vrow = threadIdx.x;
     if (head >= heads || owner >= 4 || dim != 128 || blockDim.x != 128) return;
     float* const states[4] = {state0, state1, state2, state3};
-    float* const inters[4] = {inter0, inter1, inter2, inter3};
     const unsigned long long row0 = (unsigned long long)owner * tokens;
     qkv += row0 * 3 * heads * 128;
     raw_gate += row0 * heads * 128;
@@ -289,16 +298,32 @@ extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_snap
         float delta = ((float)qkv[vbase + (unsigned long long)head * 128 + vrow]
                        - dot_k) * beta;
         float out = 0.0f;
-        float* snapshot = (t + 1u < tokens)
+        float* snapshot = (!RECORDS && t + 1u < tokens)
             ? state_inter + (unsigned long long)t * inter_stride
                 + (unsigned long long)head * 128 * 128
             : nullptr;
+        if (RECORDS) {
+            // Row t's fold record: decay, normalized key, correction.
+            float* rec = state_inter + (unsigned long long)t * inter_stride
+                + (unsigned long long)head * KDA_RECORD_FLOATS;
+            rec[vrow] = gate_exp[vrow];
+            rec[128 + vrow] = kv[vrow] * inv_k;
+            rec[256 + vrow] = delta;
+        }
         #pragma unroll
         for (unsigned int k = 0; k < 128; k += 4) {
-            float h0 = h[k + 0] * gate_exp[k + 0] + delta * (kv[k + 0] * inv_k);
-            float h1 = h[k + 1] * gate_exp[k + 1] + delta * (kv[k + 1] * inv_k);
-            float h2 = h[k + 2] * gate_exp[k + 2] + delta * (kv[k + 2] * inv_k);
-            float h3 = h[k + 3] * gate_exp[k + 3] + delta * (kv[k + 3] * inv_k);
+            float h0, h1, h2, h3;
+            if (RECORDS) {
+                h0 = kda_fold(h[k + 0], gate_exp[k + 0], kv[k + 0] * inv_k, delta);
+                h1 = kda_fold(h[k + 1], gate_exp[k + 1], kv[k + 1] * inv_k, delta);
+                h2 = kda_fold(h[k + 2], gate_exp[k + 2], kv[k + 2] * inv_k, delta);
+                h3 = kda_fold(h[k + 3], gate_exp[k + 3], kv[k + 3] * inv_k, delta);
+            } else {
+                h0 = h[k + 0] * gate_exp[k + 0] + delta * (kv[k + 0] * inv_k);
+                h1 = h[k + 1] * gate_exp[k + 1] + delta * (kv[k + 1] * inv_k);
+                h2 = h[k + 2] * gate_exp[k + 2] + delta * (kv[k + 2] * inv_k);
+                h3 = h[k + 3] * gate_exp[k + 3] + delta * (kv[k + 3] * inv_k);
+            }
             h[k + 0] = h0;
             h[k + 1] = h1;
             h[k + 2] = h2;
@@ -313,6 +338,73 @@ extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_snap
                  + h2 * (qv[k + 2] * inv_q) + h3 * (qv[k + 3] * inv_q);
         }
         output[((unsigned long long)t * heads + head) * 128 + vrow] = __float2bfloat16(out);
+        __syncthreads();
+    }
+    if (!RECORDS) {   // records: the live state waits for kda_commit_records
+        #pragma unroll
+        for (unsigned int k = 0; k < 128; ++k) H[(unsigned long long)k * 128 + vrow] = h[k];
+    }
+}
+
+
+#define KDA_VERIFY_OWNERS_ARGS \
+    const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ raw_gate, \
+    const __nv_bfloat16* __restrict__ raw_beta, const float* __restrict__ a_log, \
+    const float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ output, \
+    float* state0, float* state1, float* state2, float* state3, \
+    float* inter0, float* inter1, float* inter2, float* inter3, \
+    unsigned long long inter_stride, unsigned int tokens, unsigned int heads, \
+    unsigned int dim, float lower_bound
+
+extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_snap_owners(
+    KDA_VERIFY_OWNERS_ARGS
+) {
+    float* const inters[4] = {inter0, inter1, inter2, inter3};
+    kda_verify_owners_impl<false>(qkv, raw_gate, raw_beta, a_log, dt_bias, output,
+        state0, state1, state2, state3, inters, inter_stride, tokens, heads, dim, lower_bound);
+}
+
+// Records variant: `inter*` are each owner's record rows (`inter_stride`
+// floats apart, KDA_RECORD_FLOATS per head) and the states are only read.
+extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_rec_owners(
+    KDA_VERIFY_OWNERS_ARGS
+) {
+    atlas_pdl_enter();
+    float* const inters[4] = {inter0, inter1, inter2, inter3};
+    kda_verify_owners_impl<true>(qkv, raw_gate, raw_beta, a_log, dt_bias, output,
+        state0, state1, state2, state3, inters, inter_stride, tokens, heads, dim, lower_bound);
+}
+
+// Advance each head's live state over the first `rows` records written by
+// kda_recurrent_bf16_verify_rec_owners (the accepted prefix of a verify):
+// the same kda_fold per element, so the result is bit-identical to the
+// state the verify reached at row `rows - 1`. Grid: heads; block 128.
+extern "C" __global__ void __launch_bounds__(128) kda_commit_records(
+    float* __restrict__ state,
+    const float* __restrict__ records,
+    unsigned long long record_stride,
+    unsigned int rows,
+    unsigned int heads
+) {
+    atlas_pdl_enter();
+    const unsigned int head = blockIdx.x;
+    const unsigned int vrow = threadIdx.x;
+    if (head >= heads || blockDim.x != 128) return;
+    __shared__ float decay[128];
+    __shared__ float key[128];
+    float* H = state + (unsigned long long)head * 128 * 128;
+    float h[128];
+    #pragma unroll
+    for (unsigned int k = 0; k < 128; ++k) h[k] = H[(unsigned long long)k * 128 + vrow];
+    for (unsigned int t = 0; t < rows; ++t) {
+        const float* rec = records + (unsigned long long)t * record_stride
+            + (unsigned long long)head * KDA_RECORD_FLOATS;
+        decay[vrow] = rec[vrow];
+        key[vrow] = rec[128 + vrow];
+        const float delta = rec[256 + vrow];
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int k = 0; k < 128; ++k) h[k] = kda_fold(h[k], decay[k], key[k], delta);
         __syncthreads();
     }
     #pragma unroll
@@ -479,6 +571,7 @@ extern "C" __global__ void kda_sigmoid_gated_rms_norm(
     unsigned int dim,
     float eps
 ) {
+    atlas_pdl_enter();
     const unsigned int row_id = blockIdx.x;
     const unsigned int d = threadIdx.x;
     if (dim > 128 || d >= dim) return;

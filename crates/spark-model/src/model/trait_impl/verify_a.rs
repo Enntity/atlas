@@ -321,6 +321,34 @@ impl TransformerModel {
     ) -> Result<()> {
         use crate::layer::SsmLayerState;
 
+        // KDA records: the verify left h_state untouched. Fold the accepted
+        // rows in, or on a full reject restore conv alone from its checkpoint.
+        if self.ssm_pool.kda_record_row_bytes != 0 {
+            let stream = self.gpu.default_stream();
+            if num_accepted > 0 {
+                return self.commit_kda_records(seq, num_accepted, true, stream);
+            }
+            let conv_bytes = self.config.ssm_conv_state_bytes();
+            let mut conv_plan = Vec::new();
+            for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
+                if self.config.layer_type(i) != atlas_core::config::LayerType::LinearAttention {
+                    continue;
+                }
+                let ssm = layer_state
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
+                if let Some(ckpt) = ssm.conv_state_checkpoint {
+                    conv_plan.push(StateCopy {
+                        src: ckpt,
+                        dst: ssm.conv_state,
+                        bytes: conv_bytes,
+                    });
+                }
+            }
+            return run_ssm_state_copies(self.gpu.as_ref(), &[], &conv_plan, stream);
+        }
+
         // PRE-VALIDATION PASS — no GPU work is enqueued until every SSM layer
         // is known to be restorable. Bailing part-way through the copy loop
         // below would leave the first N layers rewound and the rest advanced

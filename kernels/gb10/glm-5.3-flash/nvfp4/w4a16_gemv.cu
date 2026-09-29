@@ -21,6 +21,7 @@
 // 4 outputs per block, 64 threads (2 warps) per output. Cross-warp smem reduction.
 // Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
 
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -1935,6 +1936,7 @@ w4a16_gemv_tc8(
     const unsigned char* __restrict__ B_scale, const float scale2,
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K
 ) {
+    atlas_pdl_enter();
     w4a16_gemv_tc8_impl(A, B_packed, B_scale, scale2, C, M, N, K, K / 2u, K / GROUP_SIZE);
 }
 
@@ -1946,6 +1948,7 @@ w4a16_gemv_tc8_ld(
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
     unsigned int ld_half, unsigned int ld_groups
 ) {
+    atlas_pdl_enter();
     w4a16_gemv_tc8_impl(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
 }
 

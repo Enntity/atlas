@@ -103,6 +103,8 @@ pub struct Glm5KdaLayer {
     dense_gemv_batch5_k: KernelHandle,
     dense_gemv_batch5_dual_k: KernelHandle,
     dense_gemv_batch5_triple_n_k: KernelHandle,
+    dense_gemv_batchm_dual_k: KernelHandle,
+    dense_gemv_batchm_triple_n_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
     w4a16_gemv_sw_k: KernelHandle,
     w4a16_gemv_batch2_k: KernelHandle,
@@ -124,6 +126,7 @@ pub struct Glm5KdaLayer {
     /// Owner-batched, register-resident twin of `recurrent_verify_snap_k`
     /// (bit-identical); `ATLAS_KDA_VERIFY_OWNERS=0` disables.
     recurrent_verify_owners_k: KernelHandle,
+    recurrent_verify_rec_k: KernelHandle,
     preprocess_regresident_k: KernelHandle,
     recurrent_regresident_k: KernelHandle,
     register_resident_prefill: bool,
@@ -236,6 +239,16 @@ impl Glm5KdaLayer {
                 "dense_gemv_bf16_batchm",
                 "dense_gemv_bf16_batch5_triple_n",
             ),
+            dense_gemv_batchm_dual_k: super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batchm_dual",
+            ),
+            dense_gemv_batchm_triple_n_k: super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batchm_triple_n",
+            ),
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw_k: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
@@ -273,6 +286,11 @@ impl Glm5KdaLayer {
             } else {
                 super::try_kernel(gpu, "kda", "kda_recurrent_bf16_verify_snap_owners")
             },
+            recurrent_verify_rec_k: super::try_kernel(
+                gpu,
+                "kda",
+                "kda_recurrent_bf16_verify_rec_owners",
+            ),
             preprocess_regresident_k,
             recurrent_regresident_k,
             register_resident_prefill,
@@ -527,6 +545,7 @@ impl TransformerLayer for Glm5KdaLayer {
             h_state_checkpoint: None,
             conv_state_checkpoint: None,
             h_state_intermediates: Vec::new(),
+            kda_records: spark_runtime::gpu::DevicePtr::NULL,
             conv_state_intermediates: Vec::new(),
             h_is_f16: false,
             h_prefill_stage: None,

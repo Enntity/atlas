@@ -208,7 +208,29 @@ impl Glm5KdaLayer {
             && m == 5
             && self.dense_gemv_batch5_triple_n_k.0 != 0
             && verify_fused_dense_triple_enabled();
-        if fused_dense_triple {
+        // Verify rows 2..=8 otherwise: the same batchm body per plane, one grid.
+        let batchm_fused = capture_verify_intermediates
+            && (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(&m)
+            && self.dense_gemv_batchm_triple_n_k.0 != 0
+            && self.dense_gemv_batchm_dual_k.0 != 0;
+        if batchm_fused && !fused_dense_triple {
+            ops::dense_gemv_batchm_triple_n(
+                ctx.gpu,
+                self.dense_gemv_batchm_triple_n_k,
+                normed,
+                [
+                    &self.weights.b_proj,
+                    &self.weights.f_a_proj,
+                    &self.weights.g_a_proj,
+                ],
+                [beta, fa, ga],
+                m,
+                [self.heads as u32, self.dim as u32],
+                h,
+                stream,
+            )?;
+            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
+        } else if fused_dense_triple {
             ops::dense_gemv_batch5_triple_n(
                 ctx.gpu,
                 self.dense_gemv_batch5_triple_n_k,
@@ -320,7 +342,19 @@ impl Glm5KdaLayer {
 
         let g1 = ctx.buffers.ssm_deinterleaved();
         let g2 = g1.offset(plane_bytes);
-        if fused_dense_pairs {
+        if batchm_fused && !fused_dense_pairs {
+            ops::dense_gemv_batchm_dual(
+                ctx.gpu,
+                self.dense_gemv_batchm_dual_k,
+                [fa, ga],
+                [&self.weights.f_b_proj, &self.weights.g_b_proj],
+                [g1, g2],
+                m,
+                p as u32,
+                self.dim as u32,
+                stream,
+            )?;
+        } else if fused_dense_pairs {
             ops::dense_gemv_batch5_dual(
                 ctx.gpu,
                 self.dense_gemv_batch5_dual_k,

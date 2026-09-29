@@ -34,6 +34,7 @@
 //
 // Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
 
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define BLOCK_SIZE 256
@@ -185,6 +186,7 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
     unsigned int K,
     unsigned int out_stride
 ) {
+    atlas_pdl_enter();
     __shared__ float smem[MAX_M * N_PER_BLOCK * 2];
     dense_gemv_bf16_batchm_impl<MAX_M>(A, B, C, M, N, K, out_stride, smem);
 }
@@ -248,6 +250,49 @@ extern "C" __global__ void dense_gemv_bf16_batch5_triple_n(
     __nv_bfloat16* C = plane == 0u ? C0 : (plane == 1u ? C1 : C2);
     const unsigned int N = plane == 0u ? N0 : N12;
     dense_gemv_bf16_batchm_impl<5>(A, B, C, 5, N, K, N, smem);
+}
+
+// Generic-M (<= MAX_M) twins of the two fused five-row tiers above: each
+// plane runs the unchanged dense_gemv_bf16_batchm body, so it is bit-identical
+// to its own batchm launch; fusing only puts the planes in one grid.
+extern "C" __global__ void dense_gemv_bf16_batchm_dual(
+    const __nv_bfloat16* __restrict__ A0,
+    const __nv_bfloat16* __restrict__ A1,
+    const __nv_bfloat16* __restrict__ B0,
+    const __nv_bfloat16* __restrict__ B1,
+    __nv_bfloat16* __restrict__ C0,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    atlas_pdl_enter();
+    __shared__ float smem[MAX_M * N_PER_BLOCK * 2];
+    const bool second = blockIdx.z != 0u;
+    dense_gemv_bf16_batchm_impl<MAX_M>(second ? A1 : A0, second ? B1 : B0, second ? C1 : C0,
+        M, N, K, N, smem);
+}
+
+extern "C" __global__ void dense_gemv_bf16_batchm_triple_n(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B0,
+    const __nv_bfloat16* __restrict__ B1,
+    const __nv_bfloat16* __restrict__ B2,
+    __nv_bfloat16* __restrict__ C0,
+    __nv_bfloat16* __restrict__ C1,
+    __nv_bfloat16* __restrict__ C2,
+    unsigned int M,
+    unsigned int N0,
+    unsigned int N12,
+    unsigned int K
+) {
+    atlas_pdl_enter();
+    __shared__ float smem[MAX_M * N_PER_BLOCK * 2];
+    const unsigned int plane = blockIdx.z;
+    const __nv_bfloat16* B = plane == 0u ? B0 : (plane == 1u ? B1 : B2);
+    __nv_bfloat16* C = plane == 0u ? C0 : (plane == 1u ? C1 : C2);
+    dense_gemv_bf16_batchm_impl<MAX_M>(A, B, C, M, plane == 0u ? N0 : N12, K,
+        plane == 0u ? N0 : N12, smem);
 }
 
 // ============================================================

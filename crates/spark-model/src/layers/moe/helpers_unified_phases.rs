@@ -113,7 +113,7 @@ impl MoeLayer {
         freed: &mut Vec<DevicePtr>,
     ) -> Result<Vec<QuantizedWeight>> {
         let h = config.hidden_size;
-        let inter = config.moe_intermediate_size;
+        let inter = config.routed_inter_local();
         let shared_inter = config.shared_expert_intermediate_size;
         // ── Phase C: transpose down routed experts ──
         let down_src: Vec<QuantizedWeight> = self

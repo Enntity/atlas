@@ -276,7 +276,11 @@ pub(super) fn load_mla_layer(
     ];
     layer.set_mla_weights(mla);
     // Target layers only: the replicated MTP body keeps its own paths.
-    if !force_dimension_overrides && std::env::var("ATLAS_GLM_MLA_MXFP8").as_deref() == Ok("1") {
+    if !force_dimension_overrides && std::env::var("ATLAS_GLM_MLA_NVFP4").as_deref() == Ok("1") {
+        layer.install_mla_nvfp4(gpu, &mx)?;
+    } else if !force_dimension_overrides
+        && std::env::var("ATLAS_GLM_MLA_MXFP8").as_deref() == Ok("1")
+    {
         layer.install_mla_mxfp8(gpu, &mx)?;
     }
     if let Some(hc) = hc {

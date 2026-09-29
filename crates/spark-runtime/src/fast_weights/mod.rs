@@ -31,6 +31,25 @@ mod shard;
 use header::resolve_shards;
 use shard::load_shard_fast;
 
+/// Run `f` over `len` bytes at `start` within a deferred tensor, read with
+/// `O_DIRECT` when the filesystem allows it (so the bytes never sit in the
+/// page cache on GB10 unified memory), else buffered.
+pub fn with_deferred_bytes<T>(
+    d: &crate::weights::DeferredTensor,
+    start: usize,
+    len: usize,
+    f: impl FnOnce(&[u8]) -> Result<T>,
+) -> Result<T> {
+    use std::os::unix::io::AsRawFd;
+    let (file, direct) = match direct_io::open_direct(&d.path) {
+        Ok(file) => (file, true),
+        Err(_) => (std::fs::File::open(&d.path)?, false),
+    };
+    let (buf, off) =
+        direct_io::read_tensor_aligned(file.as_raw_fd(), d.offset + start as u64, len, direct)?;
+    f(&buf.as_slice()[off..off + len])
+}
+
 /// Pure-Rust InstantTensor-style loader. Same public shape as
 /// [`crate::weights::SafetensorsLoader`].
 pub struct FastSafetensorsLoader {
@@ -102,6 +121,10 @@ pub struct FastSafetensorsLoader {
     /// from here — a name listed without a reader is simply absent from the
     /// store, and the model loader will fail on it by name.
     pub demand_paged_patterns: Vec<String>,
+    /// Expert TP: keep every routed expert (no EP filter) but defer their
+    /// packed weights and block scales, which the model loader reads from
+    /// disk as this rank's slice (see `should_defer_tensor`).
+    pub expert_tp: bool,
 }
 
 /// Default tensor-count cap for per-shard `O_DIRECT`. Above this, the fast
@@ -134,6 +157,7 @@ impl FastSafetensorsLoader {
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
             demand_paged_patterns: Vec::new(),
+            expert_tp: false,
         }
     }
 
@@ -152,6 +176,7 @@ impl FastSafetensorsLoader {
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
             demand_paged_patterns: Vec::new(),
+            expert_tp: false,
         }
     }
 }
@@ -175,7 +200,9 @@ impl WeightLoader for FastSafetensorsLoader {
         // uploaded, so counting them here refuses a model that fits. On
         // LongCat-Flash-Lite they are 62.8 of the checkpoint's 138 GB, which
         // is the difference between a 167 GB "peak" and a 98 GB one.
-        let preflight_skip = |name: &str| skip_fn(name) || crate::weights::is_ngram_table(name);
+        let defer_fn = |name: &str| self.should_defer_tensor(name);
+        let preflight_skip =
+            |name: &str| skip_fn(name) || defer_fn(name) || crate::weights::is_ngram_table(name);
         {
             let estimated = estimate_load_bytes(&shard_files, &preflight_skip)?;
             let has_fp8 = estimate_has_fp8(&shard_files, &preflight_skip)?;
@@ -246,6 +273,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 tensor_filter.as_deref(),
                 gpu,
                 &skip_fn,
+                &defer_fn,
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
@@ -293,6 +321,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 None,
                 gpu,
                 &skip_unused,
+                &|_| false,
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
@@ -324,5 +353,28 @@ mod expert_filter_tests {
         loader.replicated_expert_prefix = Some(".layers.45.".into());
         assert!(!loader.should_skip_tensor(appended));
         assert!(loader.should_skip_tensor(target));
+    }
+
+    #[test]
+    fn expert_tp_keeps_every_expert_and_defers_only_its_bulk() {
+        let mut loader = FastSafetensorsLoader::with_ep(1, 2, 288);
+        loader.expert_tp = true;
+        loader.rank0_only_expert_prefix = Some(".layers.45.".into());
+        let p = "model.language_model.layers.44.mlp.experts.1.gate_proj";
+        for suffix in ["weight", "weight_scale"] {
+            let name = format!("{p}.{suffix}");
+            assert!(!loader.should_skip_tensor(&name));
+            assert!(loader.should_defer_tensor(&name));
+        }
+        for suffix in ["weight_scale_2", "input_scale"] {
+            let name = format!("{p}.{suffix}");
+            assert!(!loader.should_skip_tensor(&name));
+            assert!(!loader.should_defer_tensor(&name));
+        }
+        let appended = "model.language_model.layers.45.mlp.experts.1.gate_proj.weight";
+        assert!(loader.should_skip_tensor(appended));
+        assert!(!loader.should_defer_tensor(appended));
+        let shared = "model.language_model.layers.44.mlp.shared_experts.gate_proj.weight";
+        assert!(!loader.should_defer_tensor(shared));
     }
 }

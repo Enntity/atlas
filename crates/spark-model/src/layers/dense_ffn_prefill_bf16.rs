@@ -79,6 +79,50 @@ impl DenseFfnLayer {
         Ok(())
     }
 
+    /// SiLU FFN over `rows` verify rows on the W4A16 tensor-core tier for that
+    /// width; false when the tier or a scalar-scale NVFP4 weight is missing.
+    fn glm_verify_rows_tc(
+        &self,
+        input: DevicePtr,
+        rows: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(rows);
+        let w = &self.weights;
+        let usable = |q: &crate::weight_map::QuantizedWeight| {
+            !q.weight.is_null() && !q.weight_scale.is_null() && !q.has_per_row_scale2()
+        };
+        if tc.0 == 0
+            || self.activation != FfnActivation::SiLU
+            || self.lora.is_some()
+            || ![&w.gate_proj, &w.up_proj, &w.down_proj]
+                .into_iter()
+                .all(usable)
+        {
+            return Ok(false);
+        }
+        let h = ctx.config.hidden_size as u32;
+        let inter = ctx.config.intermediate_size as u32;
+        let (gate, up) = (ctx.buffers.expert_gate_out(), ctx.buffers.expert_up_out());
+        ops::w4a16_gemv_batchm(
+            ctx.gpu,
+            tc,
+            input,
+            &w.gate_proj,
+            gate,
+            rows,
+            inter,
+            h,
+            stream,
+        )?;
+        ops::w4a16_gemv_batchm(ctx.gpu, tc, input, &w.up_proj, up, rows, inter, h, stream)?;
+        ops::silu_mul(ctx.gpu, self.act_mul, gate, up, gate, rows * inter, stream)?;
+        let out = ctx.buffers.moe_output();
+        ops::w4a16_gemv_batchm(ctx.gpu, tc, gate, &w.down_proj, out, rows, h, inter, stream)?;
+        Ok(true)
+    }
+
     pub(super) fn try_glm_prefill_bf16(
         &self,
         input: DevicePtr,
@@ -96,6 +140,11 @@ impl DenseFfnLayer {
         // including fallbacks that happen to enter forward_prefill_inner.
         if rows <= 8 {
             return Ok(false);
+        }
+        // Owner-batched verify blocks (9..=32 rows) read the NVFP4 weights once
+        // on the tensor-core tiers instead of dequantizing them to BF16 per step.
+        if rows <= 32 && self.glm_verify_rows_tc(input, rows as u32, ctx, stream)? {
+            return Ok(true);
         }
         crate::factory::glm_dense_cache::validate(ctx.config)?;
         ensure!(

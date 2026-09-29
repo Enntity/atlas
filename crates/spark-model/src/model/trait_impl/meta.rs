@@ -284,6 +284,7 @@ impl TransformerModel {
                     h_state_checkpoint: None,
                     conv_state_checkpoint: None,
                     h_state_intermediates: Vec::new(),
+                    kda_records: spark_runtime::gpu::DevicePtr::NULL,
                     conv_state_intermediates: Vec::new(),
                     gdn_commit_qkv: DevicePtr(0),
                     gdn_commit_gb: DevicePtr(0),
@@ -313,7 +314,9 @@ impl TransformerModel {
                     // Tiered pools: H count is per-SLOT (h_inter_count),
                     // conv count is uniform. The vec lengths are the
                     // capacity gates every verify arm checks before writing.
-                    for t in 0..self.ssm_pool.h_inter_count(slot) {
+                    // KDA records replace the H snapshots when allocated.
+                    ssm_state.kda_records = self.ssm_pool.kda_records(ssm_layer_idx, slot);
+                    for t in 0..self.ssm_pool.h_snapshot_count(slot) {
                         ssm_state
                             .h_state_intermediates
                             .push(self.ssm_pool.h_intermediate(ssm_layer_idx, slot, t));
