@@ -133,6 +133,8 @@ impl BlockDiffusionDraftHead {
         // `mtp_head.rs` plus the `extern "C" __global__` declarations under
         // `kernels/gb10/common/`.
         let paged_sink = super::paged_attn_modules::paged_sink_modules_for_head_dim(head_dim)?;
+        let dense_gemv_tc = ["dense_gemv_bf16_tc16", "dense_gemv_bf16_tc32"]
+            .map(|name| crate::layers::try_kernel(gpu, "dense_gemv_bf16_batchm", name));
         let kernels = DflashKernels {
             // DFlash drafter uses HF's vanilla RMSNorm convention
             // (`out = x * w / RMS(x)`), NOT Atlas's default offset-from-1
@@ -149,6 +151,11 @@ impl BlockDiffusionDraftHead {
                 .or_else(|_| gpu.kernel("residual_add", "bf16_residual_add"))?,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemv_batchm: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
+            dense_gemv_tc16: dense_gemv_tc[0],
+            dense_gemv_tc32: dense_gemv_tc[1],
+            small_m_gemv: super::small_m_gemm::small_m_gemv_enabled(
+                dense_gemv_tc.iter().all(|k| k.0 != 0),
+            ),
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             w4a16_gemm: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm"),
             dense_gemm_pipelined: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,

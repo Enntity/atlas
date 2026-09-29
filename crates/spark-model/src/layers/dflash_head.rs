@@ -52,6 +52,12 @@ pub struct DflashKernels {
     pub residual_rms_norm: KernelHandle,
     pub dense_gemv: KernelHandle,
     pub dense_gemv_batchm: KernelHandle,
+    /// Tensor-core BF16 GEMVs for 9..=16 / 17..=32 rows (0 on targets
+    /// without them); see `small_m_gemm`.
+    pub dense_gemv_tc16: KernelHandle,
+    pub dense_gemv_tc32: KernelHandle,
+    /// Startup-resolved small-M GEMV policy (`small_m_gemm::small_m_gemv_enabled`).
+    pub small_m_gemv: bool,
     pub dense_gemm: KernelHandle,
     pub dflash2_conv: Option<KernelHandle>,
     pub dflash2_candidate_selector: Option<KernelHandle>,

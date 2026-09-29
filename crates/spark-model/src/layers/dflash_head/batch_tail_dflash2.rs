@@ -76,7 +76,7 @@ impl BlockDiffusionDraftHead {
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash selector projected stride overflow"))?;
         if super::small_m_gemm::use_small_m_gemv(
-            super::small_m_gemm::small_m_gemv_enabled(),
+            self.kernels.small_m_gemv,
             self.kernels.dense_gemv_batchm.0 != 0,
             gamma,
         ) {
