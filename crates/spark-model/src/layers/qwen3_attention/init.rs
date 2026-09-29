@@ -11,13 +11,11 @@ use spark_runtime::kv_cache::KvCacheDtype;
 // function pointer: coercing a `#[track_caller]` fn to a pointer inserts a shim
 // and the audit would name the shim instead of the dispatch site below.
 use super::init_arch_gates::{ArchProbes, gated as gate};
+use super::init_glm::{GlmIndexSelection, paged_decode_mla};
 use super::types::{HeadGateActivation, Qwen3AttentionLayer};
 use crate::layers::FfnComponent;
 use crate::layers::fp8_calibration::Fp8KvCalibration;
 use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
-
-#[path = "init_independent.rs"]
-mod independent;
 
 impl Qwen3AttentionLayer {
     pub fn new(
@@ -117,43 +115,16 @@ impl Qwen3AttentionLayer {
         // model that ships no per-head Q/K norms (Nemotron-H). Compute it
         // before `attn` moves into the struct literal.
         let has_per_head_qk_norm = !attn.q_norm.weight.is_null() || !attn.k_norm.weight.is_null();
-        // Multi-head sparse MLA reuses GLM's shared compressed K/V rows. Keep
-        // the original one-head kernel available as an operational fallback.
-        let glm_sparse_attn_heads_per_cta =
-            if std::env::var("ATLAS_GLM_SPARSE_HEAD_GROUP").ok().as_deref() == Some("1") {
-                1
-            } else {
-                8
-            };
-        let glm_sparse_attn_fn = if glm_sparse_attn_heads_per_cta == 1 {
-            "glm_sparse_mla_prefill_bf16"
-        } else {
-            "glm_sparse_mla_prefill_bf16_head8"
-        };
-        // Tile semantic-index scoring over eight query rows during prefill so
-        // both queries and pooled keys are reused. Decode retains the original
-        // eight-pool kernel because it has only one live row.
-        let glm_index_logits_rows_per_cta =
-            if std::env::var("ATLAS_GLM_INDEX_ROW_GROUP").ok().as_deref() == Some("1") {
-                1
-            } else {
-                8
-            };
-        let glm_index_wmma = probes.glm_kpool_indexer
-            && config.index_n_heads == 32
-            && config.index_head_dim == 128
-            && config.index_kpool == 4
-            && glm_index_logits_rows_per_cta == 8
-            && std::env::var("ATLAS_GLM_INDEX_WMMA").ok().as_deref() == Some("1");
-        let glm_sparse_graphs = probes.glm_kpool_indexer
-            && super::glm_multi_seq_sparse_graphs_enabled(&config.model_type)?;
-        let glm_index_logits_fn = if glm_index_wmma {
-            "glm_index_logits_bf16_wmma_row8_pool32"
-        } else if glm_index_logits_rows_per_cta == 1 {
-            "glm_index_logits_bf16"
-        } else {
-            "glm_index_logits_bf16_row8"
-        };
+        let GlmIndexSelection {
+            glm_sparse_attn_heads_per_cta,
+            glm_sparse_attn_fn,
+            glm_index_logits_rows_per_cta,
+            glm_index_wmma,
+            glm_sparse_graphs,
+            glm_index_logits_fn,
+        } = GlmIndexSelection::from_config(config, &probes)?;
+        // Short gate flags so each GLM/hyper-connection lookup stays one line.
+        let (glm, hc) = (probes.glm_kpool_indexer, probes.hyper_connection);
         let layer = Self {
             input_norm,
             attn,
@@ -215,54 +186,19 @@ impl Qwen3AttentionLayer {
             // still start cleanly.
             hc: None,
             qsa: None,
-            hc_pre_k: gate(
-                probes.hyper_connection,
-                gpu,
-                "hyper_connection",
-                &hc_name("hc_pre"),
-            ),
+            hc_pre_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_pre")),
             hc_pre_from_raw_mix_k: gate(
-                probes.hyper_connection,
+                hc,
                 gpu,
                 "hyper_connection",
                 &hc_name("hc_pre_from_raw_mix"),
             ),
-            hc_pre_mix_k: gate(
-                probes.hyper_connection,
-                gpu,
-                "hyper_connection",
-                &hc_name("hc_pre_mix"),
-            ),
-            hc_post_k: gate(
-                probes.hyper_connection,
-                gpu,
-                "hyper_connection",
-                &hc_name("hc_post"),
-            ),
-            hc_post_moe_blend_k: gate(
-                probes.hyper_connection,
-                gpu,
-                "hyper_connection",
-                &hc_name("hc_post_moe_blend"),
-            ),
-            hc_expand_k: gate(
-                probes.hyper_connection,
-                gpu,
-                "hyper_connection",
-                &hc_name("hc_expand"),
-            ),
-            hc_head_k: gate(
-                probes.hyper_connection,
-                gpu,
-                "hyper_connection",
-                &hc_name("hc_head"),
-            ),
-            hc_contract_k: gate(
-                probes.hyper_connection,
-                gpu,
-                "hyper_connection",
-                &hc_name("hc_contract"),
-            ),
+            hc_pre_mix_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_pre_mix")),
+            hc_post_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_post")),
+            hc_post_moe_blend_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_post_moe_blend")),
+            hc_expand_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_expand")),
+            hc_head_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_head")),
+            hc_contract_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_contract")),
             qkv_nvfp4_t: None,
             q_nvfp4_t: None,
             k_nvfp4_t: None,
@@ -483,13 +419,7 @@ impl Qwen3AttentionLayer {
                     "paged_decode_attn_fp8",
                 ),
             },
-            // GLM's latent width is 512, not the inherited DeepSeek 576.
-            // Require its exact kernel; a missing module must not fall back.
-            paged_decode_mla_k: if config.model_type == "glm5_next" {
-                gpu.kernel(mla_decode_mod, "paged_decode_attn")?
-            } else {
-                gate(probes.mla, gpu, mla_decode_mod, "paged_decode_attn")
-            },
+            paged_decode_mla_k: paged_decode_mla(&probes, gpu, config, mla_decode_mod)?,
             // DeepSeek-V4-Flash MLA paged decode (compressed 576-dim KV cache).
             mla_paged_decode_k: gate(
                 probes.mla,
@@ -504,24 +434,9 @@ impl Qwen3AttentionLayer {
                 "mla_paged_decode_fp8",
             ),
             mla_batched_gemv_k: gate(probes.mla, gpu, "mla_absorbed", "mla_batched_gemv"),
-            mla_batched_gemv_batch2_k: gate(
-                probes.glm_kpool_indexer,
-                gpu,
-                "mla_absorbed",
-                "mla_batched_gemv_batch2",
-            ),
-            mla_batched_gemv_batch3_k: gate(
-                probes.glm_kpool_indexer,
-                gpu,
-                "mla_absorbed",
-                "mla_batched_gemv_batch3",
-            ),
-            mla_batched_gemv_batch4_k: gate(
-                probes.glm_kpool_indexer,
-                gpu,
-                "mla_absorbed",
-                "mla_batched_gemv_batch4",
-            ),
+            mla_batched_gemv_batch2_k: gate(glm, gpu, "mla_absorbed", "mla_batched_gemv_batch2"),
+            mla_batched_gemv_batch3_k: gate(glm, gpu, "mla_absorbed", "mla_batched_gemv_batch3"),
+            mla_batched_gemv_batch4_k: gate(glm, gpu, "mla_absorbed", "mla_batched_gemv_batch4"),
             mla_batched_gemv_batch5_k: gate(
                 probes.mla,
                 gpu,
@@ -580,30 +495,15 @@ impl Qwen3AttentionLayer {
                 "mla_prefill_attn_320",
             ),
             grouped_gemm_mla_k: gate(probes.mla, gpu, "grouped_gemm_mla", "grouped_gemm_mla"),
-            glm_index_layernorm_k: gate(
-                probes.glm_kpool_indexer,
-                gpu,
-                "glm_indexer",
-                "glm_index_layernorm_bf16",
-            ),
-            glm_index_tail_write_k: gate(
-                probes.glm_kpool_indexer,
-                gpu,
-                "glm_indexer",
-                "glm_index_tail_write_bf16",
-            ),
+            glm_index_layernorm_k: gate(glm, gpu, "glm_indexer", "glm_index_layernorm_bf16"),
+            glm_index_tail_write_k: gate(glm, gpu, "glm_indexer", "glm_index_tail_write_bf16"),
             glm_index_kpool_finalize_k: gate(
-                probes.glm_kpool_indexer,
+                glm,
                 gpu,
                 "glm_indexer",
                 "glm_index_kpool_finalize_bf16",
             ),
-            glm_index_fill_causal_k: gate(
-                probes.glm_kpool_indexer,
-                gpu,
-                "glm_indexer",
-                "glm_index_fill_causal",
-            ),
+            glm_index_fill_causal_k: gate(glm, gpu, "glm_indexer", "glm_index_fill_causal"),
             glm_index_logits_k: gate(
                 probes.glm_kpool_indexer,
                 gpu,
@@ -616,31 +516,11 @@ impl Qwen3AttentionLayer {
             ),
             glm_index_logits_rows_per_cta,
             glm_index_logits_pools_per_cta: if glm_index_wmma { 32 } else { 8 },
-            glm_index_logits_decode_k: gate(
-                probes.glm_kpool_indexer,
-                gpu,
-                "glm_indexer",
-                "glm_index_logits_bf16",
-            ),
-            glm_index_topk_expand_k: gate(
-                probes.glm_kpool_indexer,
-                gpu,
-                "glm_indexer",
-                "glm_index_topk_expand",
-            ),
-            glm_sparse_attn_k: gate(
-                probes.glm_kpool_indexer,
-                gpu,
-                "glm_indexer",
-                glm_sparse_attn_fn,
-            ),
+            glm_index_logits_decode_k: gate(glm, gpu, "glm_indexer", "glm_index_logits_bf16"),
+            glm_index_topk_expand_k: gate(glm, gpu, "glm_indexer", "glm_index_topk_expand"),
+            glm_sparse_attn_k: gate(glm, gpu, "glm_indexer", glm_sparse_attn_fn),
             glm_sparse_attn_heads_per_cta,
-            glm_sparse_attn_decode_k: gate(
-                probes.glm_kpool_indexer,
-                gpu,
-                "glm_indexer",
-                "glm_sparse_mla_prefill_bf16",
-            ),
+            glm_sparse_attn_decode_k: gate(glm, gpu, "glm_indexer", "glm_sparse_mla_prefill_bf16"),
             glm_index_logits_dynamic_k: gate(
                 glm_sparse_graphs,
                 gpu,
