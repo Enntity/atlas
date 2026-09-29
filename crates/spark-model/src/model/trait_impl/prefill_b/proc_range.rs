@@ -166,3 +166,23 @@ impl TransformerModel {
         }
     }
 }
+
+/// The per-pass KV write floor the prefill layers take: rows below it keep
+/// the K/V already in the pass's slots. On a Marconi warm hit the pass
+/// replays SSM state over positions whose K/V live in shared prefix-cache
+/// blocks (below `cached_prefix_tokens`), which must not be rewritten.
+pub(in crate::model) fn layer_kv_write_floor(
+    marconi_skip: bool,
+    cached_prefix_tokens: usize,
+    effective_seq_len_start: usize,
+    proc_count: usize,
+    kv_write_start: usize,
+) -> usize {
+    if marconi_skip {
+        cached_prefix_tokens
+            .saturating_sub(effective_seq_len_start)
+            .min(proc_count)
+    } else {
+        kv_write_start
+    }
+}
