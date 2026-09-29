@@ -114,11 +114,14 @@ impl BlockDiffusionDraftHead {
         // ── Step 1: batched fc projection ────────────────────────────
         // py:175  `target_hidden = self.hidden_norm(self.fc(target_hidden))`
         //   first half: fc maps [n, L_t*h_t] → [n, h].
+        // ≤32-row (decode) precomputes read the NVFP4 twins when
+        // ATLAS_DFLASH_CTX_NVFP4 built them (`twins.rs`).
         let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
-        self.drafter_dense_gemm(
+        self.ctx_projection(
             gpu,
-            src,
+            0,
             &self.fc,
+            src,
             scratch.fc_proj,
             n,
             h,
@@ -158,10 +161,11 @@ impl BlockDiffusionDraftHead {
         // Layout per row: [K_0 | V_0 | K_1 | V_1 | … | K_{L-1} | V_{L-1}].
         let fused_w = DenseWeight { weight: fused_kv };
         let fused_n_cols = (l_total as u32) * 2 * kv_dim;
-        self.drafter_dense_gemm(
+        self.ctx_projection(
             gpu,
-            scratch.fc_proj,
+            1,
             &fused_w,
+            scratch.fc_proj,
             scratch.fused_kv_out,
             n,
             fused_n_cols,
