@@ -26,6 +26,9 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+mod kda_records;
+mod specific_claim;
+
 /// Pre-allocated contiguous GPU memory pool for SSM layer states.
 ///
 /// Each pool slot has fixed GPU addresses for h_state and conv_state across
@@ -114,10 +117,7 @@ pub(crate) struct SsmStatePool {
     /// Per-slot byte sizes of the two staging pools above.
     pub(super) commit_qkv_slot_bytes: usize,
     pub(super) commit_gb_slot_bytes: usize,
-    /// GLM KDA fold records (`--ssm-rollback-mode records`), one region
-    /// per SSM layer of `(mtp_slots + 1) × num_intermediates` rows of
-    /// `kda_record_row_bytes`; replaces the H snapshot pools, which are then
-    /// not allocated. Empty otherwise.
+    /// GLM KDA fold records (`--ssm-rollback-mode records`); layout in `kda_records`.
     pub(super) kda_record_pools: Vec<DevicePtr>,
     pub(super) kda_record_row_bytes: usize,
     pub(super) free_slots: Mutex<Vec<usize>>,
@@ -317,18 +317,9 @@ impl SsmStatePool {
         let (h_inter_offsets, h_inter_total) = h_inter_layout(&h_inter_counts);
         let mut replay_input_rings = Vec::new();
         let records = has_mtp && rollback_mode == crate::ssm_reserve::SsmRollbackMode::Records;
-        anyhow::ensure!(
-            !records || (config.model_type == "glm5_next" && h_stored_bytes == h_bytes),
-            "--ssm-rollback-mode records serves GLM-5 KDA with an FP32 h state only"
-        );
-        let kda_record_row_bytes = if records {
-            crate::ssm_reserve::kda_record_row_bytes(h_bytes)
-        } else {
-            0
-        };
+        let (kda_record_row_bytes, h_inter_held) =
+            kda_records::plan(records, config, h_stored_bytes, h_bytes, h_inter_total)?;
         let mut kda_record_pools = Vec::new();
-        // H snapshot units the pools really hold (0 under KDA records).
-        let h_inter_held = if records { 0 } else { h_inter_total };
         if has_mtp {
             let ni = num_intermediates;
             let mtp_total = mtp_slots + 1;
@@ -473,19 +464,6 @@ impl SsmStatePool {
         Ok(SlotGuard {
             pool: Arc::clone(self),
             idx: Some(idx),
-        })
-    }
-
-    /// Guard exactly the index removed by the existing specific-claim path.
-    /// Refusal never consumes another available slot; generic claims stay LIFO.
-    pub(super) fn claim_specific_guarded(self: &Arc<Self>, slot: usize) -> Result<SlotGuard> {
-        anyhow::ensure!(
-            slot < self.max_slots && self.claim_specific(slot),
-            "SSM target slot {slot} unavailable or out of range"
-        );
-        Ok(SlotGuard {
-            pool: Arc::clone(self),
-            idx: Some(slot),
         })
     }
 
@@ -678,28 +656,6 @@ impl SsmStatePool {
         );
         self.h_intermediate_pools[ssm_layer_idx]
             .offset((self.h_inter_offsets[slot] + token_idx) * self.h_stored_bytes)
-    }
-
-    /// H snapshots actually held for `slot`: its tiered count, or 0 under
-    /// KDA records (per-step scratch with nothing to reset or migrate).
-    pub(super) fn h_snapshot_count(&self, slot: usize) -> usize {
-        if self.h_intermediate_pools.is_empty() {
-            0
-        } else {
-            self.h_inter_count(slot)
-        }
-    }
-
-    /// Slot `slot`'s KDA fold records in SSM layer `ssm_layer_idx`
-    /// (`num_intermediates` rows), NULL unless KDA records are on.
-    pub(super) fn kda_records(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
-        self.kda_record_pools
-            .get(ssm_layer_idx)
-            .map_or(DevicePtr::NULL, |pool| {
-                pool.offset(
-                    self.mtp_slot(slot) * self.num_intermediates * self.kda_record_row_bytes,
-                )
-            })
     }
 
     /// Number of H intermediates allocated for `slot` (tiered — see
@@ -992,11 +948,6 @@ pub(crate) struct SlotGuard {
 }
 
 impl SlotGuard {
-    /// Read-only owner identity for selected checked request-state consumers.
-    pub(crate) fn belongs_to(&self, pool: &Arc<SsmStatePool>) -> bool {
-        Arc::ptr_eq(&self.pool, pool)
-    }
-
     /// A guard that owns no slot (released/migrated, or a placeholder for the
     /// reserved-dummy / sentinel paths). Holds an `Arc` to the pool but its
     /// `Drop` is a no-op while `idx` is `None`.
@@ -1317,10 +1268,6 @@ mod h_stored_geometry_tests {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "ssm_pool_aligned_claim_tests.rs"]
-mod aligned_claim_tests;
 
 #[cfg(test)]
 mod slot_guard_tests {
