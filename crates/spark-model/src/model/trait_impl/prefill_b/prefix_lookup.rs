@@ -52,6 +52,9 @@ impl TransformerModel {
             } else if let Some(prefix_match) = reserved_match {
                 prefix_match
             } else {
+                // NVMe spill tier: page the on-disk continuation back in so
+                // the resident-only lookup below sees it (no-op when off).
+                self.nvme_restore_prefix(tokens, seq, kv_cache, stream);
                 self.prefix_cache
                     .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
             };
@@ -196,7 +199,9 @@ impl TransformerModel {
                 // turn anchor and forced recompute-all. See lookup_tiered.
                 // Below `marconi_min_tokens()` the snapshot restore costs more in lost
                 // drafter acceptance than the skipped prefill saves — see the helper.
-                if snap_tok >= crate::model::mtp_carry::marconi_min_tokens()
+                // With a spill tier on, every rank must take the SAME decision
+                // (a fault-in can succeed on one rank only) — see kv_nvme.rs.
+                let eligible = snap_tok >= crate::model::mtp_carry::marconi_min_tokens()
                     && snap_tok > 0
                     && matched <= total
                     && !exact_without_hidden
@@ -208,8 +213,8 @@ impl TransformerModel {
                     // Aux-carrying models (PLE/QSA) decline aux-less slots —
                     // e.g. mid-chunk tail captures — rather than restore a
                     // stale lexical state. See prefill_a.
-                    && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
-                {
+                    && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id));
+                if self.agree_marconi_restore(snap_tok, eligible)? {
                     // Cross-stream ordering: the snapshot we are about to read
                     // was SAVED on the default stream (decode_marconi_checkpoint
                     // / finish_leaf_snapshot / prefill_save_snapshot), but this
@@ -290,6 +295,7 @@ impl TransformerModel {
                     false
                 }
             } else {
+                self.agree_marconi_restore(0, false)?;
                 false
             };
             // CBD probe (env-gated, default OFF = current behavior): bypass the
@@ -380,105 +386,6 @@ impl TransformerModel {
             Ok((seq.marconi_skip_to, true))
         } else {
             Ok((0, false))
-        }
-    }
-
-    /// Acquire all cache matches before the batched path mutates any sequence
-    /// or KV state. On rejection, roll back exactly the references acquired by
-    /// this pass; a later cache insertion cannot make that rollback touch a
-    /// deeper node.
-    pub(in crate::model) fn prefill_b_reserve_batched_prefix_matches(
-        &self,
-        streams: &[PrefillSlice<'_>],
-        block_size: usize,
-    ) -> Option<Vec<PrefixMatch>> {
-        if !self.prefix_cache.is_active() || streams.first()?.chunk_start != 0 {
-            return Some(Vec::new());
-        }
-        // A multi-rank prefix match needs the normal EP min-reduction, which
-        // is not safe inside this transactional admission.
-        if self.multi_rank_protocol_active() {
-            tracing::info!(
-                target: "atlas::q12",
-                "batched prefix reservation declined: multi-rank world needs \
-                 the EP min-reduction — falling back to per-stream"
-            );
-            return None;
-        }
-
-        let mut matches = Vec::with_capacity(streams.len());
-        for slice in streams {
-            let seq = &*slice.seq;
-            if self.tokens_have_vision_pad(slice.prompt_tokens)
-                || seq.collect_prompt_logprobs.is_some()
-            {
-                tracing::info!(
-                    target: "atlas::q12",
-                    "batched prefix reservation declined: vision pads or \
-                     prompt-logprob collection — falling back to per-stream"
-                );
-                self.release_batched_prefix_reservations(streams, &matches, block_size);
-                return None;
-            }
-            matches.push(self.prefix_cache.lookup(
-                slice.prompt_tokens,
-                block_size,
-                seq.session_hash,
-                seq.adapter_id,
-            ));
-        }
-
-        // Hybrid-SSM models: a WARM prefix match implies a KV/Marconi skip
-        // whose recurrent-state interplay this transactional admission does
-        // not handle (the v1 rule). But a model-level blanket veto rejected
-        // COLD batches too, which serialized every chunk-0 wave on hybrid
-        // checkpoints — the entire measured C=32/C=128 prefill ramp
-        // (2026-08-16 stackval: every wave logged "cache plan not admitted").
-        // An all-cold reservation (matched_tokens == 0 everywhere) acquires
-        // no blocks, restores no snapshot and skips nothing — provably the
-        // same state as the cache-inactive admission above, which has always
-        // admitted hybrid models. Warm hybrid batches keep falling back to
-        // the per-stream path, whose restore logic is established.
-        if !super::batch_kernel::batched_reserve_hybrid_ssm_ok(
-            &matches,
-            self.config.num_ssm_layers() != 0,
-        ) {
-            tracing::info!(
-                target: "atlas::q12",
-                "batched prefix reservation declined: hybrid-SSM model with a \
-                 warm prefix match — falling back to per-stream"
-            );
-            self.release_batched_prefix_reservations(streams, &matches, block_size);
-            return None;
-        }
-
-        if !super::batch_kernel::cache_batch_matches_compatible(&matches, streams[0].chunk_len) {
-            tracing::info!(
-                target: "atlas::q12",
-                "batched prefix reservation declined: prefix matches not \
-                 batch-compatible — falling back to per-stream"
-            );
-            self.release_batched_prefix_reservations(streams, &matches, block_size);
-            return None;
-        }
-        Some(matches)
-    }
-
-    fn release_batched_prefix_reservations(
-        &self,
-        streams: &[PrefillSlice<'_>],
-        matches: &[PrefixMatch],
-        block_size: usize,
-    ) {
-        for (slice, prefix_match) in streams.iter().zip(matches) {
-            if prefix_match.matched_tokens > 0 {
-                self.prefix_cache.release_matched(
-                    slice.prompt_tokens,
-                    block_size,
-                    prefix_match.matched_tokens,
-                    slice.seq.adapter_id,
-                );
-            }
         }
     }
 }
