@@ -198,7 +198,14 @@ impl BlockDiffusionDraftHead {
                 .kernel(paged_sink.indirect.0, paged_sink.indirect.1)?,
             prefill_attn_dflash_bf16_batched_sink: gpu
                 .kernel(paged_sink.batched.0, paged_sink.batched.1)?,
-            silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
+            // The drafter checkpoint declares no SwiGLU limit, but a target's
+            // `moe_silu_mul` may be a clamping shadow (GLM-5.3 inherits
+            // DeepSeek-V4's gate/up <= 10; the DFlash2 drafter reaches 27/38).
+            // Targets that ship the never-shadowed `silu_mul_plain` use it.
+            silu_mul: match crate::layers::try_kernel(gpu, "silu_mul_plain", "silu_mul_plain") {
+                plain if plain.0 != 0 => plain,
+                _ => gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
+            },
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
             argmax_batch: gpu.kernel("argmax", "argmax_bf16_batch")?,
