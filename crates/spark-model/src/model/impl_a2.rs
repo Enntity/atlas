@@ -19,10 +19,6 @@ use super::block_mgmt::{
 use super::ssm_pool::SsmStatePool;
 use super::ssm_snapshot::SsmSnapshotPool;
 use super::types::{PinnedMetaStaging, TransformerModel};
-use super::vision_transport::{
-    EP_CMD_VISION_STATE, VISION_HEADER_WORDS, VisionWireState, parse_grid_words,
-    parse_state_header, payload_bytes, validate_state,
-};
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
@@ -30,10 +26,6 @@ use crate::layers::ops;
 use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
-
-#[cfg(test)]
-#[path = "impl_a2/idle_command_tests.rs"]
-mod idle_command_tests;
 
 impl TransformerModel {
     pub(super) fn comm_ref(&self) -> Option<&dyn spark_comm::CommBackend> {
@@ -139,40 +131,6 @@ impl TransformerModel {
             );
         }
         Ok(meta)
-    }
-
-    /// Upload a paged prefill chunk's causal extents: the chunk total, then
-    /// for chunks wider than [`crate::layer::PREFILL_ATTENTION_ROWS`] the end
-    /// of each attention sub-chunk (read by per-sub-chunk attention).
-    pub(super) fn upload_chunk_seq_lens(
-        &self,
-        seq: &SequenceState,
-        proc_start: usize,
-        proc_count: usize,
-        stream: u64,
-    ) -> Result<()> {
-        use crate::layer::{PREFILL_MAX_SUB_CHUNKS, prefill_attention_pieces};
-        let end = proc_start + proc_count;
-        let mut values = vec![end as u32];
-        let pieces = prefill_attention_pieces(proc_start, proc_count, self.config.index_topk);
-        if pieces.len() > 1 {
-            anyhow::ensure!(
-                pieces.len() <= PREFILL_MAX_SUB_CHUNKS,
-                "prefill chunk of {proc_count} rows exceeds {PREFILL_MAX_SUB_CHUNKS} attention pieces"
-            );
-            values.extend(
-                pieces
-                    .iter()
-                    .map(|&(row0, rows)| (proc_start + row0 + rows) as u32),
-            );
-        }
-        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let base = seq
-            .chunked_prefill_meta
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("paged prefill metadata missing"))?
-            .seq_len;
-        self.gpu.copy_h2d_async(&bytes, base, stream)
     }
 
     pub(super) fn free_chunked_prefill_meta(&self, seq: &mut SequenceState) -> Result<()> {
@@ -393,36 +351,6 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// Receive a `(seq_id, cmd)` pair from rank 0. Worker-side counterpart
-    /// of [`Self::ep_broadcast_seq_and_cmd`].
-    ///
-    /// With `v2` enabled the returned `seq_id` is the slot the head wants
-    /// the worker to dispatch the command into; with `v2` disabled the
-    /// returned `seq_id` is always 0 (the legacy singleton slot).
-    pub(super) fn ep_recv_seq_and_cmd(&self, v2: bool) -> Result<(u32, u32)> {
-        // Only this outer first word can be waiting for a future command.
-        // In v2 the following command word is already part of active traffic.
-        let first = self.ep_receive_idle_word()?;
-        if v2 {
-            Ok((first, self.ep_broadcast_u32(0)?))
-        } else {
-            Ok((0, first))
-        }
-    }
-
-    fn ep_receive_idle_word(&self) -> Result<u32> {
-        let comm = self
-            .comm
-            .as_ref()
-            .expect("ep_receive_idle_word without comm");
-        let stream = self.gpu.default_stream();
-        comm.receive_idle_command_word(self.ep_cmd_buf.0)?;
-        self.gpu.synchronize(stream)?;
-        let mut buf = [0u8; 4];
-        self.gpu.copy_d2h(self.ep_cmd_buf, &mut buf)?;
-        Ok(u32::from_le_bytes(buf))
-    }
-
     /// Broadcast a u32 command from rank 0 to all ranks.
     /// Rank 0 writes `val` to GPU buffer and broadcasts.
     /// Other ranks receive the value and return it.
@@ -445,153 +373,6 @@ impl TransformerModel {
         }
     }
 
-    /// Broadcast the rank-0 vision encoder result and its MRoPE metadata before
-    /// a worker enters the matching prefill command. The payload uses the
-    /// encoder's own device buffer, so it never aliases the small command or
-    /// token scratch buffers. `enabled=false` is an explicit text-state clear.
-    pub(crate) fn ep_broadcast_vision_state_for_seq_dispatch(
-        &self,
-        seq_id: u32,
-        enabled: bool,
-        row_base: usize,
-        grid_base: usize,
-        owned_images: usize,
-        slice_rows: usize,
-    ) -> Result<()> {
-        if !self.multi_rank_protocol_active() {
-            if !enabled {
-                *self.vision_embed_patches.lock() = 0;
-                self.vision_image_grids.lock().clear();
-                *self.vision_row_base.lock() = 0;
-                *self.vision_grid_base.lock() = 0;
-                *self.vision_owned_images.lock() = 0;
-                *self.vision_slice_rows.lock() = 0;
-            }
-            return Ok(());
-        }
-
-        // Keep the worker's command stream aligned even when a malformed
-        // rank-0 model has image input but no local encoder. Send an explicit
-        // text state before returning the local configuration error instead of
-        // leaving rank 1 blocked on the next header broadcast.
-        if enabled && self.vision_encoder.is_none() {
-            self.ep_broadcast_seq_and_cmd(seq_id, EP_CMD_VISION_STATE, self.ep_protocol_v2)?;
-            self.ep_broadcast_tokens(&[0; VISION_HEADER_WORDS])?;
-            *self.vision_embed_patches.lock() = 0;
-            self.vision_image_grids.lock().clear();
-            *self.vision_row_base.lock() = 0;
-            *self.vision_grid_base.lock() = 0;
-            *self.vision_owned_images.lock() = 0;
-            *self.vision_slice_rows.lock() = 0;
-            anyhow::bail!("vision request cannot use the multi-rank protocol without an encoder");
-        }
-
-        let (state, grids, payload) = if enabled {
-            let ve = self.vision_encoder.as_ref().expect("checked above");
-            let rows = *self.vision_embed_patches.lock();
-            let grids = self.vision_image_grids.lock().clone();
-            let state = VisionWireState {
-                rows,
-                grid_count: grids.len(),
-                row_base,
-                grid_base,
-                owned_images,
-                slice_rows: if owned_images == 0 { rows } else { slice_rows },
-            };
-            let state = validate_state(&state, ve.output_rows())?;
-            let payload = payload_bytes(&state, ve.out_hidden_size, ve.output_rows())?;
-            anyhow::ensure!(
-                payload > 0,
-                "vision request produced an empty encoder payload"
-            );
-            (state, grids, payload)
-        } else {
-            // Text requests must reset worker-global vision state. A stale
-            // buffer is otherwise observable by the next image request after
-            // slot reuse, even though this request contains no pad tokens.
-            *self.vision_embed_patches.lock() = 0;
-            self.vision_image_grids.lock().clear();
-            *self.vision_row_base.lock() = 0;
-            *self.vision_grid_base.lock() = 0;
-            *self.vision_owned_images.lock() = 0;
-            *self.vision_slice_rows.lock() = 0;
-            (
-                VisionWireState {
-                    rows: 0,
-                    grid_count: 0,
-                    row_base: 0,
-                    grid_base: 0,
-                    owned_images: 0,
-                    slice_rows: 0,
-                },
-                Vec::new(),
-                0,
-            )
-        };
-
-        *self.vision_slice_rows.lock() = state.slice_rows;
-
-        if enabled {
-            // The encoder launches on default_stream while NCCL uses its own
-            // legacy stream. Explicitly complete the producer before handing
-            // that pointer to NCCL; an event on the prefill stream would not
-            // order the communicator's stream.
-            self.gpu.synchronize(self.gpu.default_stream())?;
-        }
-
-        // Convert every local value before sending the command preamble. A
-        // wire-type failure must not leave rank 1 waiting for a header that
-        // rank 0 will never send.
-        let header = [
-            u32::try_from(state.rows)
-                .map_err(|_| anyhow::anyhow!("vision rows exceed u32 wire type"))?,
-            u32::try_from(state.grid_count)
-                .map_err(|_| anyhow::anyhow!("vision grid count exceeds u32 wire type"))?,
-            u32::try_from(state.row_base)
-                .map_err(|_| anyhow::anyhow!("vision row base exceeds u32 wire type"))?,
-            u32::try_from(state.grid_base)
-                .map_err(|_| anyhow::anyhow!("vision grid base exceeds u32 wire type"))?,
-            u32::try_from(state.owned_images)
-                .map_err(|_| anyhow::anyhow!("vision owned image count exceeds u32 wire type"))?,
-            u32::try_from(state.slice_rows)
-                .map_err(|_| anyhow::anyhow!("vision slice rows exceed u32 wire type"))?,
-        ];
-        debug_assert_eq!(header.len(), VISION_HEADER_WORDS);
-        let mut grid_words = Vec::with_capacity(state.grid_count * 3);
-        for (t_len, grid_h, grid_w) in &grids {
-            grid_words.extend([
-                u32::try_from(*t_len)
-                    .map_err(|_| anyhow::anyhow!("vision temporal length exceeds u32 wire type"))?,
-                u32::try_from(*grid_h)
-                    .map_err(|_| anyhow::anyhow!("vision grid height exceeds u32 wire type"))?,
-                u32::try_from(*grid_w)
-                    .map_err(|_| anyhow::anyhow!("vision grid width exceeds u32 wire type"))?,
-            ]);
-        }
-        // Apply the same bounded geometry and row-count validation locally
-        // before the command preamble. Otherwise rank 0 could enter the
-        // payload collective with metadata that rank 1 rejects first.
-        parse_grid_words(&grid_words, &state)?;
-
-        self.ep_broadcast_seq_and_cmd(seq_id, EP_CMD_VISION_STATE, self.ep_protocol_v2)?;
-        self.ep_broadcast_tokens(&header)?;
-        if state.grid_count > 0 {
-            self.ep_broadcast_tokens(&grid_words)?;
-        }
-        if payload > 0 {
-            let comm = self
-                .comm
-                .as_ref()
-                .expect("vision payload without communicator");
-            let ve = self
-                .vision_encoder
-                .as_ref()
-                .expect("vision payload without encoder");
-            comm.broadcast(ve.buf_out.0, payload, 0)?;
-        }
-        Ok(())
-    }
-
     /// EP worker step: receive a (seq_id, cmd) preamble from rank 0 and
     /// execute the command in the addressed slot.
     ///
@@ -609,11 +390,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF0: prefill start → chunk_len, chunk_start, full_len, then full_len tokens
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
-    /// - 0xFFFFFFF5: generic verify → K, K tokens, then num accepted drafts
-    /// - 0xFFFFFFF6: set request-local native-only fence → disabled (0/1)
-    /// - 0xFFFFFFF7: synchronize vision metadata and BF16 encoder rows
-    /// - 0xFFFFFFE1: distributed GLM MTP propose → token, position, drafts, hidden row
-    /// - 0xFFFFFFEB: prefill chunk carrying DFlash verify owners (`glm_fused_chunk`)
+    /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB: GLM/vision extensions (`impl_a2_ep_worker`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let (seq_id, cmd) = self.ep_recv_seq_and_cmd(self.ep_protocol_v2)?;
@@ -630,11 +407,8 @@ impl TransformerModel {
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
         }
-        if cmd == super::glm_long_verify::EP_CMD_GLM_LONG_VERIFY {
-            return self.glm_long_receive_verify(slots);
-        }
-        if cmd == super::glm_fused_chunk::EP_CMD_GLM_FUSED_CHUNK {
-            return self.glm_fused_receive(seq_id, slots);
+        if let Some(keep) = self.ep_worker_glm_cmd(seq_id, cmd, slots)? {
+            return Ok(keep);
         }
 
         let slot_idx = seq_id as usize;
@@ -691,56 +465,9 @@ impl TransformerModel {
         let stream = self.gpu.default_stream();
 
         match cmd {
-            EP_CMD_VISION_STATE => {
-                let header = self.ep_broadcast_tokens(&[0; VISION_HEADER_WORDS])?;
-                let max_rows = self
-                    .vision_encoder
-                    .as_ref()
-                    .map_or(0, |ve| ve.output_rows());
-                let state = parse_state_header(&header, max_rows)?;
-                let grid_words = if state.grid_count > 0 {
-                    self.ep_broadcast_tokens(&vec![0; state.grid_count * 3])?
-                } else {
-                    Vec::new()
-                };
-                let grids = parse_grid_words(&grid_words, &state)?;
-                let payload = if let Some(ve) = &self.vision_encoder {
-                    payload_bytes(&state, ve.out_hidden_size, ve.output_rows())?
-                } else {
-                    anyhow::ensure!(
-                        state.rows == 0,
-                        "vision payload received by a rank without an encoder"
-                    );
-                    0
-                };
-                if payload > 0 {
-                    let ve = self
-                        .vision_encoder
-                        .as_ref()
-                        .expect("validated vision payload without encoder");
-                    self.comm
-                        .as_ref()
-                        .expect("validated vision payload without communicator")
-                        .broadcast(ve.buf_out.0, payload, 0)?;
-                }
-                *self.vision_embed_patches.lock() = state.rows;
-                *self.vision_image_grids.lock() = grids;
-                *self.vision_row_base.lock() = state.row_base;
-                *self.vision_grid_base.lock() = state.grid_base;
-                *self.vision_owned_images.lock() = state.owned_images;
-                *self.vision_slice_rows.lock() = state.slice_rows;
-            }
-            super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => {
-                self.glm_long_receive_tail(seq)?;
-            }
-            0xFFFFFFF6 => {
-                let disabled = self.ep_broadcast_u32(0)?;
-                anyhow::ensure!(
-                    disabled <= 1,
-                    "native-only sequence fence must be 0 or 1, got {disabled}"
-                );
-                seq.disable_mtp = disabled != 0;
-            }
+            super::vision_transport::EP_CMD_VISION_STATE => self.ep_worker_recv_vision_state()?,
+            super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => self.glm_long_receive_tail(seq)?,
+            0xFFFFFFF6 => self.ep_worker_set_native_fence(seq)?,
             0xFFFFFFF0 => {
                 // Prefill chunk: receive chunk_len, chunk_start, full prompt length,
                 // then ALL prompt tokens via bulk broadcast (single NCCL op).
@@ -838,25 +565,7 @@ impl TransformerModel {
                     }
                 }
             }
-            0xFFFFFFF5 => {
-                // Width-generic verify, used by four-draft MTP (K=5) and
-                // DFlash. Keep this protocol separate from the fixed-width
-                // commands so existing ranks remain byte-for-byte unchanged.
-                let k = self.ep_broadcast_u32(0)? as usize;
-                anyhow::ensure!(
-                    (2..=32).contains(&k),
-                    "EP generic verify width must be 2..=32, got {k}"
-                );
-                let tokens = self.ep_broadcast_tokens(&vec![0u32; k])?;
-                self.sync_secondary()?;
-                self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
-                let num_accepted = self.ep_broadcast_u32(0)? as usize;
-                anyhow::ensure!(
-                    num_accepted < k,
-                    "EP generic verify accepted {num_accepted} drafts for K={k}"
-                );
-                self.ep_worker_apply_verdict(seq, &tokens, num_accepted)?;
-            }
+            0xFFFFFFF5 => self.ep_worker_generic_verify(seq, stream)?,
             token => {
                 // Regular decode
                 self.decode(token, seq, stream)?;
@@ -864,36 +573,6 @@ impl TransformerModel {
         }
 
         Ok(true)
-    }
-
-    /// Worker side of a verified K-row step once the head's accepted-draft
-    /// count has arrived: roll back the rejected rows, trim the proposer and
-    /// commit the accepted SSM prefix.
-    pub(super) fn ep_worker_apply_verdict(
-        &self,
-        seq: &mut SequenceState,
-        tokens: &[u32],
-        num_accepted: usize,
-    ) -> Result<()> {
-        let k = tokens.len();
-        let committed = num_accepted + 1;
-        anyhow::ensure!(committed <= k, "EP verdict {num_accepted} exceeds K={k}");
-        let to_drop = k - committed;
-        if to_drop > 0 {
-            anyhow::ensure!(
-                seq.seq_len >= to_drop && seq.tokens.len() >= to_drop,
-                "EP generic verify rollback underflow: seq_len={}, tokens={}, drop={to_drop}",
-                seq.seq_len,
-                seq.tokens.len(),
-            );
-            seq.seq_len -= to_drop;
-            for _ in 0..to_drop {
-                seq.tokens.pop();
-            }
-        }
-        self.trim_proposer_state(seq, num_accepted, 0)?;
-        self.commit_accepted_prefix(seq, committed, k)?;
-        Ok(())
     }
 
     /// Worker-side handler for the batched-decode protocol (`0xFFFFFFE0`).
@@ -911,14 +590,7 @@ impl TransformerModel {
     /// payload from a buggy head fails before touching slot state.
     fn ep_worker_decode_batch(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let n = self.ep_broadcast_u32(0)? as usize;
-        if super::glm_independent::enabled(&self.config.model_type)? {
-            anyhow::ensure!(
-                (2..=8).contains(&n)
-                    && n <= slots.len()
-                    && n <= self.levers.max_decode_seqs as usize,
-                "independent E0 width exceeds actual worker slots"
-            );
-        }
+        self.ep_worker_check_independent_width(n, slots)?;
         let seq_ids = self.ep_broadcast_tokens(&vec![0u32; n])?;
         let tokens = self.ep_broadcast_tokens(&vec![0u32; n])?;
 
