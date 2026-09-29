@@ -42,6 +42,13 @@ impl atlas_core::scope::ModelResource<dyn crate::gpu::GpuBackend> for PagedKvCac
         {
             first_error = Some(e);
         }
+        if let Some(shard) = self.latent_shard.take()
+            && !shard.scratch.is_null()
+            && let Err(e) = gpu.free(shard.scratch)
+            && first_error.is_none()
+        {
+            first_error = Some(e);
+        }
         self.free_blocks.clear();
         self.block_ref_counts.clear();
         self.num_blocks = 0;
