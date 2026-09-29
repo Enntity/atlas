@@ -755,6 +755,7 @@ mod forward_block_layer_paged;
 #[cfg(test)]
 mod free_state_tests;
 mod from_weights;
+mod from_weights_kernels;
 #[cfg(test)]
 mod lifecycle_tests;
 mod markov;
@@ -764,10 +765,9 @@ mod precompute_ctx_kv;
 mod propose;
 mod small_m_gemm;
 
-/// Per-sequence anchor words: `[prev token, banned draft depth]` u32.
-const MARKOV_PREV_BYTES: usize = 8;
-/// Byte offset of the banned draft depth within `markov_prev_dev`.
-const MARKOV_BAN_DEPTH_OFFSET: usize = 4;
+mod context_window;
+mod markov_slots;
+use markov_slots::{MARKOV_BAN_DEPTH_OFFSET, MARKOV_PREV_BYTES};
 mod twins;
 pub use twins::{DflashTwins, LayerMxfp8};
 
@@ -776,12 +776,6 @@ impl BlockDiffusionDraftHead {
     /// in `extra_lanes`). `ATLAS_DFLASH_PROPOSE_LANES` overrides (default 1).
     pub fn lane_count(&self) -> usize {
         1 + self.extra_lanes.len()
-    }
-
-    /// `[batch_capacity]` banned draft depths, after the batch anchors in
-    /// `batch_markov_prev`.
-    fn batch_ban_depth(&self) -> DevicePtr {
-        self.batch_markov_prev.offset(self.batch_capacity * 4)
     }
 
     /// Resolve a lane's mutable propose resources: (stream, scratch,
@@ -877,10 +871,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // max_seq_len-sized accumulator would be 20 GiB per sequence on GLM.
         let bf16 = 2usize;
         let ctx_slot_bytes = self.target_layer_ids.len() * self.target_hidden_size * bf16;
-        let max_ctx_len = self
-            .window_size
-            .unwrap_or(self.max_seq_len)
-            .min(self.max_seq_len);
+        let max_ctx_len = self.ctx_window_len();
         let total = max_ctx_len * ctx_slot_bytes;
         let ctx_hidden_acc = gpu.alloc(total)?;
         // Initialize to zero so stale data doesn't leak between sequences.

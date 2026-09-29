@@ -11,9 +11,10 @@ use parking_lot::Mutex;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
+use super::from_weights_kernels::*;
 use super::{
     BlockDiffusionDraftHead, DflashKernels, DflashLane, DflashLayer, DflashQuantization,
-    DflashScratch, DsparkStartupExecution, LIGHTNING_TARGET_HIDDEN_SIZE,
+    DflashScratch, DsparkStartupExecution, LIGHTNING_TARGET_HIDDEN_SIZE, MARKOV_PREV_BYTES,
 };
 use crate::layers::ops;
 use crate::weight_loader::DflashWeights;
@@ -124,8 +125,7 @@ impl BlockDiffusionDraftHead {
         // `mtp_head.rs` plus the `extern "C" __global__` declarations under
         // `kernels/gb10/common/`.
         let paged_sink = super::paged_attn_modules::paged_sink_modules_for_head_dim(head_dim)?;
-        let dense_gemv_tc = ["dense_gemv_bf16_tc16", "dense_gemv_bf16_tc32"]
-            .map(|name| crate::layers::try_kernel(gpu, "dense_gemv_bf16_batchm", name));
+        let dense_gemv_tc = dense_gemv_tc_kernels(gpu);
         let kernels = DflashKernels {
             // DFlash drafter uses HF's vanilla RMSNorm convention
             // (`out = x * w / RMS(x)`), NOT Atlas's default offset-from-1
@@ -144,9 +144,7 @@ impl BlockDiffusionDraftHead {
             dense_gemv_batchm: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
             dense_gemv_tc16: dense_gemv_tc[0],
             dense_gemv_tc32: dense_gemv_tc[1],
-            small_m_gemv: super::small_m_gemm::small_m_gemv_enabled(
-                dense_gemv_tc.iter().all(|k| k.0 != 0),
-            ),
+            small_m_gemv: small_m_gemv(&dense_gemv_tc),
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             w4a16_gemm: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm"),
             dense_gemm_pipelined: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
@@ -191,14 +189,7 @@ impl BlockDiffusionDraftHead {
                 .kernel(paged_sink.indirect.0, paged_sink.indirect.1)?,
             prefill_attn_dflash_bf16_batched_sink: gpu
                 .kernel(paged_sink.batched.0, paged_sink.batched.1)?,
-            // The drafter checkpoint declares no SwiGLU limit, but a target's
-            // `moe_silu_mul` may be a clamping shadow (GLM-5.3 inherits
-            // DeepSeek-V4's gate/up <= 10; the DFlash2 drafter reaches 27/38).
-            // Targets that ship the never-shadowed `silu_mul_plain` use it.
-            silu_mul: match crate::layers::try_kernel(gpu, "silu_mul_plain", "silu_mul_plain") {
-                plain if plain.0 != 0 => plain,
-                _ => gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
-            },
+            silu_mul: silu_mul_kernel(gpu)?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
             argmax_batch: gpu.kernel("argmax", "argmax_bf16_batch")?,
@@ -272,8 +263,7 @@ impl BlockDiffusionDraftHead {
             w4a16_gemv_batch16: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch16")?,
             w4a16_gemv_batch32: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch32")?,
             mxfp8_quantize: crate::layers::try_kernel(gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
-            mxfp8_gemv: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
-                .map(|name| crate::layers::try_kernel(gpu, "mxfp8_gemv", name)),
+            mxfp8_gemv: mxfp8_gemv_kernels(gpu),
         };
 
         // Per-step scratch buffers. BF16 = 2 bytes/element.
@@ -317,6 +307,7 @@ impl BlockDiffusionDraftHead {
         // One scratch set per propose lane: the piecewise graphs bake these
         // pointers at capture, so each lane needs its own. γ rows only for
         // logits (see the per-field note below).
+        let selector_bytes = ops::dflash2_selector_scratch_bytes(g);
         let make_scratch = |gpu: &dyn GpuBackend| -> Result<DflashScratch> {
             let s = DflashScratch {
                 stream_buf: gpu.alloc(n_attn * hidden_size * bf16)?,
@@ -364,16 +355,15 @@ impl BlockDiffusionDraftHead {
                 // cw=4096 for rows nothing ever touches (γ rows ≈ 8.4 MB).
                 logits: gpu.alloc(g * vocab_size * bf16)?,
                 draft_tokens_dev: gpu.alloc(n_attn * 4)?,
-                markov_prev_dev: gpu.alloc(super::MARKOV_PREV_BYTES)?,
+                markov_prev_dev: gpu.alloc(MARKOV_PREV_BYTES)?,
                 markov_prev_host_pinned: std::sync::atomic::AtomicPtr::new(
-                    gpu.alloc_host_pinned(super::MARKOV_PREV_BYTES)?,
+                    gpu.alloc_host_pinned(MARKOV_PREV_BYTES)?,
                 ),
                 position_ids: gpu.alloc(n_attn * 4)?,
                 dflash2_conv_delta: gpu.alloc(n_attn * 4 * (hidden_size / 16).max(1) * bf16)?,
                 dflash2_conv_out: gpu.alloc(n_attn * hidden_size * bf16)?,
                 dflash2_projected_hidden: gpu.alloc(g * 256 * bf16)?,
-                dflash2_selector_scratch: gpu
-                    .alloc(crate::layers::ops::dflash2_selector_scratch_bytes(g))?,
+                dflash2_selector_scratch: gpu.alloc(selector_bytes)?,
             };
             // C1 diagnostic: zero ALL device buffers so any uninitialized
             // read sees deterministic zeros instead of per-lane garbage.
@@ -397,13 +387,10 @@ impl BlockDiffusionDraftHead {
                 (s.option_b_indirect_args_dev, 12),
                 (s.logits, g * vocab_size * bf16),
                 (s.draft_tokens_dev, n_attn * 4),
-                (s.markov_prev_dev, super::MARKOV_PREV_BYTES),
+                (s.markov_prev_dev, MARKOV_PREV_BYTES),
                 (s.position_ids, n_attn * 4),
                 // Also the selector's ticket, which must start at zero.
-                (
-                    s.dflash2_selector_scratch,
-                    crate::layers::ops::dflash2_selector_scratch_bytes(g),
-                ),
+                (s.dflash2_selector_scratch, selector_bytes),
             ] {
                 gpu.memset(p, 0, bytes)?;
             }
@@ -464,7 +451,7 @@ impl BlockDiffusionDraftHead {
             gpu.alloc(batch_capacity * ops::grammar_bitmask_words(vocab_size as u32) * 4)?;
         let batch_tokens = gpu.alloc(batch_rows * 4)?;
         // `[capacity]` anchors, then `[capacity]` banned draft depths.
-        let batch_markov_prev = gpu.alloc(batch_capacity * super::MARKOV_PREV_BYTES)?;
+        let batch_markov_prev = gpu.alloc(batch_capacity * MARKOV_PREV_BYTES)?;
         let batch_markov_embed_bytes = batch_capacity
             .checked_mul(weights.markov_rank)
             .and_then(|n| n.checked_mul(bf16))
@@ -494,16 +481,7 @@ impl BlockDiffusionDraftHead {
         } else {
             DevicePtr::NULL
         };
-        // The batched tail's per-sequence selector launches run in stream
-        // order, so they share one selector scratch (ticket starts at zero).
-        let batch_dflash2_selector_scratch = if weights.candidate_selector.is_some() {
-            let bytes = crate::layers::ops::dflash2_selector_scratch_bytes(gamma_val);
-            let p = gpu.alloc(bytes)?;
-            gpu.memset(p, 0, bytes)?;
-            p
-        } else {
-            DevicePtr::NULL
-        };
+        let batch_dflash2_selector_scratch = batch_selector_scratch(gpu, &weights, gamma_val)?;
         // DFlash2 grouped causal conv scratch — the conv is causal along the
         // row dim, so it runs per [sequence, gamma] slice, never across
         // sequence boundaries.
@@ -558,11 +536,7 @@ impl BlockDiffusionDraftHead {
         gpu.memset(batch_mlp_down, 0, batch_norm_bytes)?;
         gpu.memset(batch_logits, 0, batch_logits_bytes)?;
         gpu.memset(batch_tokens, 0, batch_rows * 4)?;
-        gpu.memset(
-            batch_markov_prev,
-            0,
-            batch_capacity * super::MARKOV_PREV_BYTES,
-        )?;
+        gpu.memset(batch_markov_prev, 0, batch_capacity * MARKOV_PREV_BYTES)?;
         if weights.markov_rank > 0 {
             gpu.memset(batch_markov_embed, 0, batch_markov_embed_bytes)?;
             gpu.memset(batch_markov_bias, 0, batch_markov_bias_bytes)?;
@@ -1066,21 +1040,5 @@ impl BlockDiffusionDraftHead {
     /// Lightning DSpark: `dflash_config.causal=true`. Qwen-DFlash: false.
     pub(super) fn attn_causal(&self) -> bool {
         self.query_causal
-    }
-
-    /// SWA window in tokens for the paged attention kernel. 0 = no window.
-    ///
-    /// The kernel masks `q_rope_pos - kv_slot >= window`, comparing the
-    /// query's ABSOLUTE position with a context-buffer SLOT index. A
-    /// bidirectional head keeps only the last `window` context slots
-    /// (`max_ctx_len`, slid by `commit_ctx`), so the buffer itself is the
-    /// window; masking again hides every context key once the sequence passes
-    /// `window` tokens (GLM C1-16K first-draft acceptance 0.000 before this).
-    /// Causal (Lightning DSpark) heads keep the kernel window.
-    pub(super) fn attn_sliding_window(&self) -> u32 {
-        if !self.query_causal {
-            return 0;
-        }
-        self.window_size.unwrap_or(0) as u32
     }
 }
