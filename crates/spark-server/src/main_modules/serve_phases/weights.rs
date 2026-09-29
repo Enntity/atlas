@@ -243,9 +243,17 @@ pub(crate) fn load_dflash_drafter(
     }
     let mut loader = spark_runtime::weights::SafetensorsLoader::new();
     loader.peak_memory_multiplier = None;
-    let drafter_store = loader
+    let mut drafter_store = loader
         .load(&drafter_dir, gpu, 0)
         .context("Failed to load DFlash drafter weights")?;
+    // Before the KV pool is sized, so the freed BF16 bytes become KV blocks.
+    if spark_model::weight_loader::dflash_preshrink::requested() {
+        spark_model::weight_loader::dflash_preshrink::preshrink(
+            &mut drafter_store,
+            drafter_config.num_hidden_layers,
+            gpu,
+        )?;
+    }
     tracing::info!(
         "DFlash drafter store: {} tensors, {} bytes",
         drafter_store.len(),
