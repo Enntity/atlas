@@ -230,7 +230,14 @@ pub fn apply_grammar_bitmask(
 pub const DFLASH2_SELECTOR_MAX_TOP_K: usize = 16;
 pub const DFLASH2_SELECTOR_MAX_RANK: usize = 256;
 
-/// DFlash2 on-device bilinear candidate selector.
+/// DFlash2 on-device bilinear candidate selector over one `gamma`-row block.
+///
+/// `anchor` is a device `u32` holding the block anchor (row 1's
+/// predecessor) and `ban_depth` a device `u32` (or null): rows
+/// `1..=*ban_depth` never pick one of `end_ids` (the min_tokens floor; unused
+/// slots `u32::MAX`). Both are read on device so a captured graph replays
+/// with the values the host wrote for this step.
+#[allow(clippy::too_many_arguments)]
 pub fn dflash2_candidate_selector(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -239,14 +246,16 @@ pub fn dflash2_candidate_selector(
     pred_codebook: DevicePtr,
     succ_codebook: DevicePtr,
     out_tokens: DevicePtr,
-    last_token: u32,
+    anchor: DevicePtr,
+    ban_depth: DevicePtr,
+    end_ids: [u32; 4],
     gamma: u32,
     vocab_size: u32,
     rank: u32,
     top_k: u32,
     stream: u64,
 ) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
+    let mut launch = KernelLaunch::new(gpu, kernel)
         .grid([1, 1, 1])
         .block([1024, 1, 1])
         .arg_ptr(logits)
@@ -254,12 +263,16 @@ pub fn dflash2_candidate_selector(
         .arg_ptr(pred_codebook)
         .arg_ptr(succ_codebook)
         .arg_ptr(out_tokens)
-        .arg_u32(last_token)
+        .arg_ptr(anchor)
+        .arg_ptr(ban_depth)
         .arg_u32(gamma)
         .arg_u32(vocab_size)
         .arg_u32(rank)
-        .arg_u32(top_k)
-        .launch(stream)
+        .arg_u32(top_k);
+    for id in end_ids {
+        launch = launch.arg_u32(id);
+    }
+    launch.launch(stream)
 }
 
 // ── MoE routing ──────────────────────────────────────────────────

@@ -36,6 +36,9 @@ impl BlockDiffusionDraftHead {
         // Live pos+1 grammar bitmask (host i32 words), or None. Applied to
         // logits rows 0 and 1 before the tail argmax/selector (#102).
         grammar_bitmask: Option<&[i32]>,
+        // Leading draft depths that may not be an end token (min_tokens
+        // floor, `EosBan::banned_draft_depth`); seeded beside the anchor.
+        ban_depth: u32,
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
 
@@ -665,6 +668,7 @@ impl BlockDiffusionDraftHead {
             }
             self.argmax_block_logits(
                 last_token,
+                ban_depth,
                 norm_noise_local,
                 gpu,
                 stream,
@@ -841,7 +845,7 @@ impl BlockDiffusionDraftHead {
 
         // Seed Markov prev from a pinned host word BEFORE any tail
         // capture/replay. The tail graph must not H2D a stack last_token.
-        self.seed_markov_prev(last_token, gpu, stream, scratch)?;
+        self.seed_markov_prev(last_token, ban_depth, gpu, stream, scratch)?;
 
         // Phase F.2: piecewise capture/replay path. Only enabled for
         // option_b (paged) — legacy path stays single-shot eager since

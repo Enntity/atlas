@@ -601,6 +601,11 @@ impl BlockDiffusionDraftHead {
                 lane_id,
                 defer_readback,
                 grammar_bitmask,
+                crate::traits::EosBan::banned_draft_depth(
+                    dstate.end_floor,
+                    position,
+                    self.gamma.saturating_sub(1),
+                ),
             )
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");

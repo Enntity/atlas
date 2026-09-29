@@ -16,6 +16,14 @@
 //    advances the chain via s_prev_token.
 // 4. All gamma draft tokens are written directly into device memory.
 //
+// The anchor (row 1's predecessor) and the banned depth are read from device
+// memory, not kernel arguments, so a CUDA graph that captured this launch
+// replays with the current step's values (the host writes both before the
+// captured tail). Rows 1..=*ban_depth never pick end0..end3: below a
+// request's min_tokens floor the verifier may not end the turn, so an end
+// token there would only truncate an otherwise acceptable draft chain.
+// Unused end slots carry 0xFFFFFFFF; a null ban_depth bans nothing.
+//
 // Candidate ordering is a TOTAL ORDER: unary value descending, then vocab
 // index ascending — the lower index wins ties, matching the engine's
 // first-index-wins argmax contract. Empty slots carry the sentinel
@@ -86,11 +94,16 @@ extern "C" __global__ void dflash2_candidate_selector(
     const __nv_bfloat16* __restrict__ pred_codebook,
     const __nv_bfloat16* __restrict__ succ_codebook,
     unsigned int* __restrict__ out_tokens,
-    unsigned int last_token,
+    const unsigned int* __restrict__ anchor,
+    const unsigned int* __restrict__ ban_depth,
     unsigned int gamma,
     unsigned int vocab_size,
     unsigned int rank,
-    unsigned int top_k
+    unsigned int top_k,
+    unsigned int end0,
+    unsigned int end1,
+    unsigned int end2,
+    unsigned int end3
 ) {
     __shared__ float s_warp_v[32][DF2_SEL_MAX_TOP_K];
     __shared__ unsigned int s_warp_i[32][DF2_SEL_MAX_TOP_K];
@@ -99,6 +112,7 @@ extern "C" __global__ void dflash2_candidate_selector(
     __shared__ float s_score[DF2_SEL_MAX_TOP_K];
     __shared__ float s_context[DF2_SEL_MAX_RANK];
     __shared__ unsigned int s_prev_token;
+    __shared__ unsigned int s_banned_to;
 
     const unsigned int tid = threadIdx.x;
     const unsigned int lane = tid % 32;
@@ -111,7 +125,8 @@ extern "C" __global__ void dflash2_candidate_selector(
     if (rank > DF2_SEL_MAX_RANK || rank == 0) return;
 
     if (tid == 0) {
-        s_prev_token = last_token;
+        s_prev_token = *anchor;
+        s_banned_to = ban_depth ? *ban_depth : 0u;
     }
     __syncthreads();
 
@@ -239,7 +254,9 @@ extern "C" __global__ void dflash2_candidate_selector(
                 dot += __shfl_down_sync(0xffffffff, dot, offset);
             }
             if (lane == 0) {
-                s_score[warp_id] = valid ? s_final_v[warp_id] + dot : -INFINITY;
+                const bool banned = row <= s_banned_to
+                    && (cand == end0 || cand == end1 || cand == end2 || cand == end3);
+                s_score[warp_id] = valid && !banned ? s_final_v[warp_id] + dot : -INFINITY;
             }
         }
         __syncthreads();

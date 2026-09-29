@@ -114,6 +114,9 @@ impl BlockDiffusionDraftHead {
         let seq_token_bytes = (gamma as usize)
             .checked_mul(4)
             .ok_or_else(|| anyhow::anyhow!("DFlash selector token stride overflow"))?;
+        // Anchors and min_tokens ban depths were uploaded beside each other
+        // in batch_markov_prev (`batch_ban_depth`).
+        let end_ids = crate::traits::EosBan::model_end_ids();
         for sequence in 0..batch_size as usize {
             ops::dflash2_candidate_selector(
                 ctx.gpu,
@@ -124,7 +127,9 @@ impl BlockDiffusionDraftHead {
                 selector.predecessor_codebook.weight,
                 selector.successor_codebook.weight,
                 self.batch_tokens.offset(sequence * seq_token_bytes),
-                last_tokens[sequence],
+                self.batch_markov_prev.offset(sequence * 4),
+                self.batch_ban_depth().offset(sequence * 4),
+                end_ids,
                 gamma,
                 vocab,
                 rank,
