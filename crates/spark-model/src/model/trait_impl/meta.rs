@@ -253,8 +253,6 @@ impl TransformerModel {
         // checkpoints — a strict superset of `zero_slot` (h+conv only). The
         // intervening layer_states construction only assigns pool pointers and
         // never writes the state, so the earlier `zero_slot` was redundant work.
-        let has_mtp = self.proposer.is_some() || self.self_speculative;
-
         // ATLAS_MTP_DRAFTER_PREFILL: a fresh sequence invalidates the
         // whole-prompt hidden capture — without this, a warm-restored prefill
         // (no chunks computed) would pair the NEW prompt's tokens with the
@@ -300,30 +298,8 @@ impl TransformerModel {
                     ple: None,
                 };
 
-                if has_mtp {
-                    // Use pool-based fixed addresses (stable across sequence
-                    // lifetimes → CUDA graph can replay without stale pointers).
-                    ssm_state.h_state_checkpoint =
-                        Some(self.ssm_pool.h_checkpoint(ssm_layer_idx, slot));
-                    ssm_state.conv_state_checkpoint =
-                        Some(self.ssm_pool.conv_checkpoint(ssm_layer_idx, slot));
-
-                    // Tiered pools: H count is per-SLOT (h_inter_count),
-                    // conv count is uniform. The vec lengths are the
-                    // capacity gates every verify arm checks before writing.
-                    // KDA records replace the H snapshots when allocated.
-                    ssm_state.kda_records = self.ssm_pool.kda_records(ssm_layer_idx, slot);
-                    for t in 0..self.ssm_pool.h_snapshot_count(slot) {
-                        ssm_state
-                            .h_state_intermediates
-                            .push(self.ssm_pool.h_intermediate(ssm_layer_idx, slot, t));
-                    }
-                    for t in 0..self.ssm_pool.num_intermediates {
-                        ssm_state
-                            .conv_state_intermediates
-                            .push(self.ssm_pool.conv_intermediate(ssm_layer_idx, slot, t));
-                    }
-                }
+                self.ssm_pool
+                    .attach_verify_rollback(ssm_layer_idx, slot, &mut ssm_state);
 
                 layer_states.push(Box::new(ssm_state));
                 ssm_layer_idx += 1;

@@ -68,6 +68,7 @@ mod ssm_snapshot_teardown;
 pub(crate) mod ssm_spill_gate;
 pub(crate) mod ssm_spill_staging;
 pub(crate) mod ssm_tier;
+mod ssm_verify_attach;
 pub(crate) mod token_overlay;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
