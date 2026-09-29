@@ -7,7 +7,9 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::{BlockDiffusionDraftHead, DflashQuantization};
 use crate::layers::ops;
-use crate::weight_map::{DenseWeight, Fp8DenseWeight, QuantizedWeight, quantize_to_nvfp4};
+use crate::weight_map::{
+    DenseWeight, Fp8DenseWeight, Mxfp8Weight, QuantizedWeight, quantize_to_nvfp4,
+};
 
 impl BlockDiffusionDraftHead {
     pub(super) fn try_install_nvfp4(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
@@ -111,12 +113,14 @@ impl BlockDiffusionDraftHead {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn drafter_gemm(
         &self,
         gpu: &dyn GpuBackend,
         w_bf16: &DenseWeight,
         w_fp8: &Option<Fp8DenseWeight>,
         w_nvfp4: &Option<QuantizedWeight>,
+        w_mx: Option<&Mxfp8Weight>,
         src: DevicePtr,
         dst: DevicePtr,
         n_out: u32,
@@ -128,6 +132,7 @@ impl BlockDiffusionDraftHead {
             w_bf16,
             w_fp8,
             w_nvfp4,
+            w_mx,
             src,
             dst,
             self.gamma as u32,
@@ -139,9 +144,11 @@ impl BlockDiffusionDraftHead {
 
     /// `drafter_gemm` with an explicit row count — the B×gamma seam calls it
     /// once per projection over all staged rows so every weight read is
-    /// shared instead of looping per sequence. The ≤4-row NVFP4 GEMV arm is
-    /// unchanged; wider NVFP4 batches keep the ≤16-row `w4a16_gemv_batchm`
-    /// waves in `run_staged_projection`.
+    /// shared instead of looping per sequence. Arms, first that applies:
+    /// NVFP4 twin on the tensor-core tiers (`ATLAS_DFLASH_NVFP4_TC`, any row
+    /// count in 32-row pieces); NVFP4 twin on `w4a16_gemv_batch4` (≤4 rows);
+    /// the Phase G FP8 mirror; the MXFP8 twin (`ATLAS_DFLASH_MXFP8`, ≤32
+    /// rows); the BF16 weight.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn drafter_gemm_rows(
         &self,
@@ -149,6 +156,7 @@ impl BlockDiffusionDraftHead {
         w_bf16: &DenseWeight,
         w_fp8: &Option<Fp8DenseWeight>,
         w_nvfp4: &Option<QuantizedWeight>,
+        w_mx: Option<&Mxfp8Weight>,
         src: DevicePtr,
         dst: DevicePtr,
         m: u32,
@@ -156,6 +164,12 @@ impl BlockDiffusionDraftHead {
         k_in: u32,
         stream: u64,
     ) -> Result<()> {
+        if self.twins.nvfp4_tc
+            && let Some(w) = w_nvfp4
+            && self.nvfp4_tc_rows(gpu, w, src, dst, m, n_out, k_in, stream)?
+        {
+            return Ok(());
+        }
         if matches!(self.quant, DflashQuantization::Nvfp4Weights)
             && m <= 4
             && let Some(w) = w_nvfp4
@@ -187,6 +201,11 @@ impl BlockDiffusionDraftHead {
                 k_in,
                 stream,
             );
+        }
+        if let Some(mx) = w_mx
+            && self.mxfp8_rows(gpu, mx, src, dst, m, n_out, k_in, stream)?
+        {
+            return Ok(());
         }
         self.drafter_dense_gemm(gpu, src, w_bf16, dst, m, n_out, k_in, stream)
     }

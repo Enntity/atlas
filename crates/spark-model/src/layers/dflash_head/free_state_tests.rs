@@ -143,6 +143,7 @@ fn zero_head() -> BlockDiffusionDraftHead {
         suppress_graphs: std::sync::atomic::AtomicBool::new(false),
         propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
         quant: super::DflashQuantization::Bf16,
+        twins: Default::default(),
         startup: super::DsparkStartupExecution::from_env_lenient(),
     }
 }
@@ -186,6 +187,8 @@ fn zero_kernels() -> DflashKernels {
         w4a16_gemv_batch8: zero,
         w4a16_gemv_batch16: zero,
         w4a16_gemv_batch32: zero,
+        mxfp8_quantize: zero,
+        mxfp8_gemv: [zero; 3],
         dflash2_conv: None,
         dflash2_candidate_selector: None,
     }

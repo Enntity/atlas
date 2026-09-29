@@ -132,6 +132,10 @@ pub struct DflashKernels {
     pub w4a16_gemv_batch8: KernelHandle,
     pub w4a16_gemv_batch16: KernelHandle,
     pub w4a16_gemv_batch32: KernelHandle,
+    /// MXFP8 twins (`ATLAS_DFLASH_MXFP8`): load-time quantizer and the
+    /// 8/16/32-row tensor-core GEMVs (0 on targets without them).
+    pub mxfp8_quantize: KernelHandle,
+    pub mxfp8_gemv: [KernelHandle; 3],
 }
 
 /// Per-step scratch buffers for the γ-block forward.
@@ -296,6 +300,8 @@ pub struct DflashLayer {
     pub down_proj_nvfp4: Option<crate::weight_map::QuantizedWeight>,
     pub attention_conv: Option<Dflash2Conv>,
     pub mlp_conv: Option<Dflash2Conv>,
+    /// MXFP8 twins of q/o/gate/up/down (`ATLAS_DFLASH_MXFP8=1`), else None.
+    pub mx: Option<LayerMxfp8>,
 }
 
 /// Per-sequence DFlash drafter state. One paged KV cache per drafter layer
@@ -684,6 +690,8 @@ pub struct BlockDiffusionDraftHead {
 
     // Quantization mode (BF16 only for Phase 1).
     pub quant: DflashQuantization,
+    /// Tensor-core twin levers (`twins.rs`).
+    pub twins: DflashTwins,
 
     /// Startup-static execution values, resolved once at construction.
     /// `propose`/`forward_block`/lane build read this instead of the
@@ -741,6 +749,8 @@ mod parity_report;
 mod precompute_ctx_kv;
 mod propose;
 mod small_m_gemm;
+mod twins;
+pub use twins::{DflashTwins, LayerMxfp8};
 
 impl BlockDiffusionDraftHead {
     /// Total propose lanes (lane 0 = default-stream scratch; the rest live
