@@ -11,7 +11,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use spark_model::layers::ops::{DFLASH2_SELECTOR_MAX_RANK, DFLASH2_SELECTOR_MAX_TOP_K};
+use spark_model::layers::ops::{
+    DFLASH2_SELECTOR_MAX_RANK, DFLASH2_SELECTOR_MAX_SPLITS, DFLASH2_SELECTOR_MAX_TOP_K,
+    DFLASH2_SELECTOR_THREADS,
+};
 
 const KERNEL_GB10: &str = "gb10/common/dflash2_candidate_selector.cu";
 const KERNEL_STRIX: &str = "strix-hip/common/dflash2_candidate_selector.cu";
@@ -59,6 +62,16 @@ fn caps_match_kernel_defines() {
             DFLASH2_SELECTOR_MAX_RANK,
             "DF2_SEL_MAX_RANK drifted from DFLASH2_SELECTOR_MAX_RANK in {rel}"
         );
+        assert_eq!(
+            kernel_define(&src, "DF2_SEL_MAX_SPLITS"),
+            DFLASH2_SELECTOR_MAX_SPLITS,
+            "DF2_SEL_MAX_SPLITS drifted from DFLASH2_SELECTOR_MAX_SPLITS in {rel}"
+        );
+        assert_eq!(
+            kernel_define(&src, "DF2_SEL_THREADS"),
+            DFLASH2_SELECTOR_THREADS as usize,
+            "DF2_SEL_THREADS drifted from DFLASH2_SELECTOR_THREADS in {rel}"
+        );
     }
 }
 
@@ -73,13 +86,14 @@ fn gb10_and_strix_hip_copies_are_byte_identical() {
 }
 
 /// Source-level arity pin: the extern "C" signature must take exactly
-/// fifteen parameters — the device anchor and ban-depth pointers after
-/// `out_tokens`, `unsigned int top_k` eleventh, then the four end ids —
+/// sixteen parameters — the device anchor and ban-depth pointers after
+/// `out_tokens`, `unsigned int top_k` eleventh, the four end ids, then the
+/// scratch pointer —
 /// matching the launcher's `.arg_*` calls in `layers/ops/sampling.rs`. (The
 /// PTX-side pin in `atlas-kernels/tests/kernel_arity.rs` covers compiled
 /// builds; this one also holds under `ATLAS_SKIP_BUILD`.)
 #[test]
-fn kernel_signature_has_fifteen_params_with_device_anchor() {
+fn kernel_signature_has_sixteen_params_with_device_anchor() {
     let src = kernel_src(KERNEL_GB10);
     let sig_start = src
         .find("dflash2_candidate_selector(")
@@ -106,8 +120,8 @@ fn kernel_signature_has_fifteen_params_with_device_anchor() {
         .collect();
     assert_eq!(
         params.len(),
-        15,
-        "dflash2_candidate_selector must take 15 parameters: {params:?}"
+        16,
+        "dflash2_candidate_selector must take 16 parameters: {params:?}"
     );
     assert_eq!(
         params[5], "const unsigned int* __restrict__ anchor",
@@ -119,6 +133,10 @@ fn kernel_signature_has_fifteen_params_with_device_anchor() {
     );
     assert_eq!(
         params[14], "unsigned int end3",
-        "last parameter must be `unsigned int end3`: {params:?}"
+        "fifteenth parameter must be `unsigned int end3`: {params:?}"
+    );
+    assert_eq!(
+        params[15], "unsigned int* __restrict__ scratch",
+        "last parameter must be the scratch pointer: {params:?}"
     );
 }

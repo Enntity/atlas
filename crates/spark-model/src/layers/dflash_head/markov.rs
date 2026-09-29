@@ -45,6 +45,7 @@ impl BlockDiffusionDraftHead {
                 hidden_buf,
                 scratch.logits,
                 scratch.dflash2_projected_hidden,
+                scratch.dflash2_selector_scratch,
                 scratch.draft_tokens_dev,
                 self.gamma,
                 gpu,

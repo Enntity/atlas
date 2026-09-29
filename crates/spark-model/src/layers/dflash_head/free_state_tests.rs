@@ -73,6 +73,7 @@ pub(super) fn zero_scratch() -> DflashScratch {
         dflash2_conv_delta: DevicePtr(0),
         dflash2_conv_out: DevicePtr(0),
         dflash2_projected_hidden: DevicePtr(0),
+        dflash2_selector_scratch: DevicePtr(0),
     }
 }
 
@@ -149,6 +150,7 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         batch_markov_embed: DevicePtr(0),
         batch_markov_bias: DevicePtr(0),
         batch_dflash2_projected: DevicePtr(0),
+        batch_dflash2_selector_scratch: DevicePtr(0),
         batch_conv_delta: DevicePtr(0),
         batch_conv_out: DevicePtr(0),
         extra_lanes: Vec::new(),
