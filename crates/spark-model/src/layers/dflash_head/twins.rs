@@ -15,6 +15,9 @@
 //!   values, lossless into BF16 MMA operands) of q/o/gate/up/down on
 //!   `mxfp8_gemv_tc{8,16,32}`. With `ATLAS_DFLASH_NVFP4_TC=1` the NVFP4 tiers
 //!   serve the layers instead and no MXFP8 layer twin is built.
+//! - `ATLAS_DFLASH_NVFP4_HEAD=1` / `ATLAS_DFLASH_MXFP8_HEAD=1`: a drafter-owned
+//!   NVFP4 (else MXFP8) twin of the shared BF16 lm_head — the drafter's
+//!   largest read (154880 x 4096 on GLM-5.3). The verifier keeps its head.
 //!
 //! Row blocks the tiers cannot take fall back to the BF16 weights.
 
@@ -31,6 +34,13 @@ pub struct DflashTwins {
     /// `ATLAS_DFLASH_NVFP4_TC=1`: layer projections take the NVFP4 twins on
     /// the tensor-core tiers at any row count (main: only up to 4 rows).
     pub nvfp4_tc: bool,
+    /// NVFP4 twin of the shared BF16 lm_head (`ATLAS_DFLASH_NVFP4_HEAD=1`),
+    /// half the MXFP8 bytes, on the tensor-core tiers in 32-row pieces.
+    /// Unlike a target NVFP4 head it is the drafter's own copy.
+    pub lm_head_q4: Option<QuantizedWeight>,
+    /// MXFP8 twin of the shared BF16 lm_head (`ATLAS_DFLASH_MXFP8_HEAD=1`,
+    /// superseded by the NVFP4 head), up to 32 rows.
+    pub lm_head_mx: Option<Mxfp8Weight>,
 }
 
 /// MXFP8 twins of a layer's five large projections (`ATLAS_DFLASH_MXFP8=1`);
@@ -67,12 +77,73 @@ impl BlockDiffusionDraftHead {
                  (ATLAS_NO_DFLASH_DRAFTER_NVFP4, drafter FP8, or missing quantizer)"
             );
         }
+        self.install_head_twin(gpu)?;
         tracing::info!(
-            "DFlash twins: NVFP4 tensor-core layers {}, MXFP8 layers {}",
+            "DFlash twins: NVFP4 tensor-core layers {}, MXFP8 layers {}, head NVFP4 {} / MXFP8 {}",
             self.twins.nvfp4_tc,
             self.layers.iter().filter(|l| l.mx.is_some()).count(),
+            self.twins.lm_head_q4.is_some(),
+            self.twins.lm_head_mx.is_some(),
         );
         Ok(())
+    }
+
+    /// Drafter-owned twin of a BF16 shared lm_head. A target NVFP4 head
+    /// (`lm_head_nvfp4`) already drafts from packed weights, so it gets none.
+    fn install_head_twin(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+        if self.lm_head_nvfp4.is_some() || self.lm_head_shared.0 == 0 {
+            return Ok(());
+        }
+        let head = DenseWeight {
+            weight: self.lm_head_shared,
+        };
+        let (vocab, h) = (self.vocab_size, self.hidden_size);
+        if env_on("ATLAS_DFLASH_NVFP4_HEAD") {
+            let stream = gpu.default_stream();
+            self.twins.lm_head_q4 = Some(crate::weight_map::quantize_to_nvfp4(
+                &head,
+                vocab,
+                h,
+                gpu,
+                gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
+                gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+                stream,
+            )?);
+            gpu.synchronize(stream)?;
+        } else if env_on("ATLAS_DFLASH_MXFP8_HEAD") {
+            self.twins.lm_head_mx = Some(self.quantize_mxfp8(gpu, &head, vocab, h)?);
+            gpu.synchronize(gpu.default_stream())?;
+        }
+        Ok(())
+    }
+
+    /// Drafter logits `out[rows, vocab] = input[rows, H] · lm_headᵀ` for a
+    /// BF16 shared head: the NVFP4 twin on the tensor-core tiers (32-row
+    /// pieces: the NVFP4 head read twice still beats one BF16 read), else the
+    /// MXFP8 twin (≤32 rows), else the BF16 head.
+    pub(super) fn project_head(
+        &self,
+        gpu: &dyn GpuBackend,
+        input: DevicePtr,
+        out: DevicePtr,
+        rows: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let (vocab, h) = (self.vocab_size as u32, self.hidden_size as u32);
+        if let Some(q4) = self.twins.lm_head_q4.as_ref()
+            && self.nvfp4_tc_rows(gpu, q4, input, out, rows, vocab, h, stream)?
+        {
+            return Ok(());
+        }
+        if let Some(mx) = self.twins.lm_head_mx.as_ref()
+            && self.mxfp8_rows(gpu, mx, input, out, rows, vocab, h, stream)?
+        {
+            return Ok(());
+        }
+        let head = DenseWeight {
+            weight: self.lm_head_shared,
+        };
+        self.drafter_dense_gemm(gpu, input, &head, out, rows, vocab, h, stream)
     }
 
     fn install_mxfp8_layers(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
