@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use crate::prefix_cache::{EvictedBlocks, PrefixCache, PrefixMatch};
 
 mod inner;
+mod nvme;
 mod snapshot;
 mod snapshot_insert;
 mod snapshot_stats;
@@ -260,13 +261,14 @@ impl PrefixCache for RadixTree {
     }
 
     fn evict(&self, num_blocks: usize) -> EvictedBlocks {
-        let (physical, disk) = self.inner.lock().evict(num_blocks);
+        let (physical, disk, spill) = self.inner.lock().evict(num_blocks);
         // Filter MAX sentinels out — the caller only needs disk_block_ids to
         // dec_disk_ref on, and MAX entries don't correspond to a live HSS ref.
         let disk_block_ids: Vec<u32> = disk.into_iter().filter(|&id| id != u32::MAX).collect();
         EvictedBlocks {
             physical,
             disk_block_ids,
+            spill,
         }
     }
 
@@ -284,6 +286,10 @@ impl PrefixCache for RadixTree {
 
     fn forget_snapshot_tier_key(&self, key: u64) -> bool {
         self.snapshot_index.lock().forget_tiered(key)
+    }
+
+    fn nvme(&self) -> Option<&dyn crate::prefix_cache::NvmePrefixTier> {
+        Some(self)
     }
 
     fn snapshot_count(&self) -> usize {

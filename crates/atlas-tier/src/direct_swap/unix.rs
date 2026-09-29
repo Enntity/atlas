@@ -150,6 +150,40 @@ impl SwapStore for DirectSwapFile {
         }
         Ok(())
     }
+
+    /// One `pread` for the whole run when `out` is O_DIRECT-aligned (the
+    /// caller's page-aligned staging); otherwise the per-record default path.
+    fn read_records(&self, first_slot: usize, out: &mut [u8]) -> Result<()> {
+        let rb = self.record_bytes;
+        if out.is_empty() || !out.len().is_multiple_of(rb) {
+            bail!(
+                "read_records: {} bytes is not a multiple of {rb}",
+                out.len()
+            );
+        }
+        if !is_aligned(out.as_ptr()) {
+            for (i, rec) in out.chunks_exact_mut(rb).enumerate() {
+                self.read_record(first_slot + i, rec)?;
+            }
+            return Ok(());
+        }
+        let n = unsafe {
+            libc::pread(
+                self.fd.as_raw_fd(),
+                out.as_mut_ptr() as *mut libc::c_void,
+                out.len(),
+                self.offset(first_slot),
+            )
+        };
+        if n != out.len() as isize {
+            bail!(
+                "pread records {first_slot}..+{} returned {n}, errno {}",
+                out.len() / rb,
+                errno()
+            );
+        }
+        Ok(())
+    }
 }
 
 fn errno() -> i32 {

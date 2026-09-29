@@ -27,6 +27,23 @@ pub trait SwapStore: Send {
     fn record_bytes(&self) -> usize;
     fn write_record(&mut self, disk_slot: usize, bytes: &[u8]) -> Result<()>;
     fn read_record(&self, disk_slot: usize, out: &mut [u8]) -> Result<()>;
+    /// Read the `out.len() / record_bytes()` CONSECUTIVE records starting at
+    /// `first_slot` into `out`, in slot order. Default: one `read_record` per
+    /// record; a store with a cheaper contiguous path (one large O_DIRECT
+    /// `pread`) overrides it. `out.len()` must be a record multiple.
+    fn read_records(&self, first_slot: usize, out: &mut [u8]) -> Result<()> {
+        let rb = self.record_bytes();
+        if rb == 0 || !out.len().is_multiple_of(rb) {
+            anyhow::bail!(
+                "read_records: {} bytes is not a multiple of {rb}",
+                out.len()
+            );
+        }
+        for (i, rec) in out.chunks_exact_mut(rb).enumerate() {
+            self.read_record(first_slot + i, rec)?;
+        }
+        Ok(())
+    }
     /// Optional: reclaim disk space for a freed slot (default no-op; a hole in
     /// a preallocated file is fine — the free-list reuses the index).
     fn discard_record(&mut self, _disk_slot: usize) {}
@@ -58,6 +75,9 @@ impl<T: SwapStore + ?Sized> SwapStore for Box<T> {
     }
     fn read_record(&self, disk_slot: usize, out: &mut [u8]) -> Result<()> {
         (**self).read_record(disk_slot, out)
+    }
+    fn read_records(&self, first_slot: usize, out: &mut [u8]) -> Result<()> {
+        (**self).read_records(first_slot, out)
     }
     fn discard_record(&mut self, disk_slot: usize) {
         (**self).discard_record(disk_slot)
