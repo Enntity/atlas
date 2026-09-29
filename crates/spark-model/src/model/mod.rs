@@ -44,6 +44,7 @@ mod dspark_pool_tests;
 mod final_norm;
 pub(crate) mod impl_a1;
 pub(crate) mod impl_a1_init;
+mod impl_a1_spec_init;
 pub(crate) mod impl_a2;
 mod impl_a2_ep_vision;
 mod impl_a2_ep_worker;
