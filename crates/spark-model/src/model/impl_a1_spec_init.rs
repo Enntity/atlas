@@ -70,7 +70,7 @@ pub(super) fn alloc_mtp_prefill_hidden(
     let mtp_prefill_hidden = if has_mtp
         && dflash_kgamma == 0
         && mtp_quant.supports_drafter_prefill()
-        && crate::layers::mtp_drafter_prefill_enabled(&levers)
+        && crate::layers::mtp_drafter_prefill_enabled(levers)
     {
         let bytes = mtp_arena_context
             .checked_mul(config.hidden_size)
@@ -87,7 +87,7 @@ pub(super) fn alloc_mtp_prefill_hidden(
     } else {
         if has_mtp
             && !mtp_quant.supports_drafter_prefill()
-            && crate::layers::mtp_drafter_prefill_enabled(&levers)
+            && crate::layers::mtp_drafter_prefill_enabled(levers)
         {
             tracing::info!(
                 "MTP drafter context: INACTIVE — the batched drafter prefill \
