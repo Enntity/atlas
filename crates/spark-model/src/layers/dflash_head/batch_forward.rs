@@ -56,11 +56,13 @@ impl BlockDiffusionDraftHead {
         if let Some(ref conv) = layer.attention_conv {
             self.staged_conv_prepare(conv, self.batch_norm, batch_size, hidden, ctx, stream)?;
         }
-        for (weight, fp8, nvfp4, output, width) in [
+        let mx = layer.mx.as_ref();
+        for (weight, fp8, nvfp4, mx, output, width) in [
             (
                 &layer.q_proj,
                 &layer.q_proj_fp8,
                 &layer.q_proj_nvfp4,
+                mx.map(|mx| &mx.q_proj),
                 self.batch_q,
                 q_dim,
             ),
@@ -68,6 +70,7 @@ impl BlockDiffusionDraftHead {
                 &layer.k_proj,
                 &layer.k_proj_fp8,
                 &layer.k_proj_nvfp4,
+                None,
                 self.batch_k,
                 kv_dim,
             ),
@@ -75,6 +78,7 @@ impl BlockDiffusionDraftHead {
                 &layer.v_proj,
                 &layer.v_proj_fp8,
                 &layer.v_proj_nvfp4,
+                None,
                 self.batch_v,
                 kv_dim,
             ),
@@ -85,6 +89,7 @@ impl BlockDiffusionDraftHead {
                 weight,
                 fp8,
                 nvfp4,
+                mx,
                 output,
                 width,
                 hidden,
@@ -194,6 +199,7 @@ impl BlockDiffusionDraftHead {
             &layer.o_proj,
             &layer.o_proj_fp8,
             &layer.o_proj_nvfp4,
+            mx.map(|mx| &mx.o_proj),
             self.batch_attn_proj,
             hidden,
             q_dim,
@@ -225,17 +231,19 @@ impl BlockDiffusionDraftHead {
         if let Some(ref conv) = layer.mlp_conv {
             self.staged_conv_prepare(conv, self.batch_norm, batch_size, hidden, ctx, stream)?;
         }
-        for (weight, fp8, nvfp4, output) in [
+        for (weight, fp8, nvfp4, mx, output) in [
             (
                 &layer.gate_proj,
                 &layer.gate_proj_fp8,
                 &layer.gate_proj_nvfp4,
+                mx.map(|mx| &mx.gate_proj),
                 self.batch_mlp_gate,
             ),
             (
                 &layer.up_proj,
                 &layer.up_proj_fp8,
                 &layer.up_proj_nvfp4,
+                mx.map(|mx| &mx.up_proj),
                 self.batch_mlp_up,
             ),
         ] {
@@ -245,6 +253,7 @@ impl BlockDiffusionDraftHead {
                 weight,
                 fp8,
                 nvfp4,
+                mx,
                 output,
                 intermediate,
                 hidden,
@@ -267,6 +276,7 @@ impl BlockDiffusionDraftHead {
             &layer.down_proj,
             &layer.down_proj_fp8,
             &layer.down_proj_nvfp4,
+            mx.map(|mx| &mx.down_proj),
             self.batch_mlp_down,
             hidden,
             intermediate,
