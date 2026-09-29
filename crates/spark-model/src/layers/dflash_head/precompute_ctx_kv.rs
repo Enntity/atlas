@@ -87,8 +87,12 @@ impl BlockDiffusionDraftHead {
         // Per-model latch (see `ModelStats::dumped`) rather than a static: an
         // operator who sets the flag and then swaps models must still get the
         // dump, instead of it being swallowed by the previous model's shot.
-        let dump =
-            self.startup.diagnostics.precompute_dump && ctx.stats.dumped.keyed("dflash_precompute");
+        // ATLAS_DFLASH_BLOCK_DUMP_AT_POS also defers this one-shot dump.
+        let dump = self.startup.diagnostics.precompute_dump
+            && slot_positions
+                .last()
+                .is_some_and(|&p| p as usize + 1 >= self.startup.diagnostics.block_dump_at_pos)
+            && ctx.stats.dumped.keyed("dflash_precompute");
         let dump_buf = |label: &str, ptr: DevicePtr, bytes: usize| -> Result<()> {
             if !dump {
                 return Ok(());
