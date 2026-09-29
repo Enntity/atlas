@@ -48,7 +48,13 @@ impl TransformerLayer for Qwen3AttentionLayer {
     }
 
     fn uses_local_mla_prefill(&self) -> bool {
-        self.mla.is_some()
+        // GLM-5 prefill (`prefill_attention_paged_glm_dense`) absorbs Q and
+        // reads the complete paged latent + index history, exactly as chunk 1+
+        // of any long prompt does, so a prefix-cache skip is just a later
+        // chunk start. The other MLA paths attend within the current chunk.
+        self.mla
+            .as_ref()
+            .is_some_and(|mla| mla.glm_indexer.is_none())
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
