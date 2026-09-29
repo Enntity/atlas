@@ -8,6 +8,7 @@ pub mod fp8_calibration;
 mod glm5_kda;
 pub mod glm_sp;
 pub mod moe;
+mod moe_grouped_decode;
 pub mod mtp_head;
 pub(crate) mod mtp_meta;
 pub mod mtp_multi;
@@ -67,6 +68,10 @@ pub use dflash_head::{
 };
 pub use glm5_kda::{Glm5KdaLayer, Glm5KdaWeights, Glm5Projection};
 pub use moe::MoeLayer;
+pub use moe_grouped_decode::{
+    moe_grouped_decode_decide, moe_grouped_decode_enabled, moe_grouped_decode_for,
+    moe_grouped_decode_forced, moe_grouped_decode_min_rows,
+};
 pub use mtp_head::{MtpHead, MtpQuantization, mtp_drafter_prefill_enabled};
 pub use nemotron_mamba2::NemotronMamba2Layer;
 pub use nemotron_moe::NemotronMoeLayer;
@@ -235,73 +240,6 @@ pub fn k64_n64_wins(m: u32, n: u32) -> bool {
     n.div_ceil(128) * m.div_ceil(64) <= K64_N64_MAX_WIDE_CTAS
 }
 
-/// Optional kernel lookup: `KernelHandle(0)` instead of an error.
-///
-/// `#[track_caller]` so the audit names the DISPATCH SITE — this helper stands
-/// between ~500 call sites and `GpuBackend::kernel`, and without it every
-/// optional lookup in the binary would be reported against this one line.
-///
-/// A zero handle is a SILENT slower path, so a lookup that lands here for a
-/// model that genuinely needs the kernel is a bug. Either gate the call on the
-/// model's config so it is never issued, or declare it in the target's
-/// MODEL.toml `[expected_absent]` with a reason; the boot gate
-/// (`kernel_audit::classify_failures`) fails closed on anything else.
-/// Minimum rows in flight for the grouped-GEMM MoE decode arm. SSOT for the
-/// SSM stack (`qwen3_ssm::trait_decode_multi_seq`) and the attention layers
-/// (`qwen3_attention::…::multi_seq::ffn`), which must agree — they are the
-/// same trade on the same weights.
-///
-/// The arm reads each routed expert ONCE instead of once per token, so it
-/// wins when there are enough tokens to amortise the expert sort/permute
-/// launch overhead, and loses when there are not. Both ends are measured:
-///
-/// | n | verdict | measurement |
-/// |---|---|---|
-/// | 4 | LOSS | 31 vs 56 tok/s on Holo — the fixed per-layer sort/permute dominates at small N |
-/// | >=16 | WIN | SSM-side alone C=32 172.7 -> 216.2 tok/s (+25%); #415's attention-side extension +7.9% at C=32 / +9.7% at C=64 on Qwen3.6-35B-A3B-NVFP4, paired gsm8k n=200 strict 0.960 vs 0.900 baseline, zero regressions |
-///
-/// 16 is the smallest width measured on the winning side. n=5..15 is
-/// UNMEASURED, not a known win — it sits on the losing side of this gate on
-/// purpose, because the one thing we know about the gap is that the loss at
-/// n=4 is large (-45%) and the win at n=16 is smaller (+25%).
-pub fn moe_grouped_decode_min_rows() -> usize {
-    16
-}
-
-/// Kill switch for the grouped-GEMM MoE decode arm. PRESENCE check per the
-/// house convention (`ATLAS_NO_MOE_GROUPED_DECODE=0` is NOT off), read once
-/// per process — this predicate sits in the decode path, and the `env::var`
-/// it replaces ran on every dispatch for MoE models.
-pub fn moe_grouped_decode_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("ATLAS_NO_MOE_GROUPED_DECODE").is_none())
-}
-
-/// Force the grouped arm BELOW `moe_grouped_decode_min_rows()`. Diagnostic
-/// only — it exists so the n=5..15 gap can be measured without a rebuild, and
-/// it is the same var #415's measurements used, kept working on purpose.
-/// Never a production setting: if forcing wins at a width, move the THRESHOLD.
-pub fn moe_grouped_decode_forced() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_MOE_GROUPED_DECODE").as_deref() == Ok("1"))
-}
-
-/// Whether the grouped-GEMM MoE decode arm should run for `n` rows —
-/// PURE, so both polarities are testable without touching process env or the
-/// `OnceLock`s below (which latch, and would make the tests order-dependent).
-pub fn moe_grouped_decode_decide(n: usize, enabled: bool, forced: bool) -> bool {
-    enabled && (n >= moe_grouped_decode_min_rows() || forced)
-}
-
-/// Whether the grouped-GEMM MoE decode arm should run for `n` rows.
-pub fn moe_grouped_decode_for(n: usize) -> bool {
-    moe_grouped_decode_decide(n, moe_grouped_decode_enabled(), moe_grouped_decode_forced())
-}
-
-#[cfg(test)]
-#[path = "moe_grouped_decode_tests.rs"]
-mod moe_grouped_decode_tests;
-
 /// [`try_kernel`] gated on a condition that decides whether the module can
 /// exist at all (e.g. `cfg!(atlas_hip)` for kernels that only live in
 /// `kernels/strix-hip/`). Skipping the lookup — rather than discarding its
@@ -343,6 +281,7 @@ pub enum FfnComponent {
 }
 
 mod ffn_c4;
+mod ffn_glm;
 
 impl FfnComponent {
     pub fn is_none(&self) -> bool {
@@ -409,88 +348,6 @@ impl FfnComponent {
         }
     }
 
-    /// Fixed four-row speculative-verifier FFN. Returns the actual output
-    /// buffer because GLM's MoE composition safely stages over its norm input,
-    /// while dense batchm writes the conventional `moe_output` scratch.
-    pub fn forward_k4(
-        &self,
-        input: DevicePtr,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<DevicePtr> {
-        match self {
-            Self::Moe(m) => m.forward_k4(input, ctx, stream),
-            Self::Dense(d) if d.can_forward_km(4) => {
-                d.forward_km(input, 4, ctx, stream)?;
-                Ok(ctx.buffers.moe_output())
-            }
-            Self::Dense(d) => {
-                d.forward_prefill(input, 4, ctx, stream)?;
-                Ok(ctx.buffers.moe_output())
-            }
-            Self::None => Ok(input),
-        }
-    }
-
-    /// Fixed five-row speculative-verifier FFN. GLM MoE layers use one M5
-    /// shared-expert pass plus fused K2/K3 routed dispatch.
-    pub fn forward_k5(
-        &self,
-        input: DevicePtr,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<DevicePtr> {
-        match self {
-            Self::Moe(m) => m.forward_k5(input, ctx, stream),
-            Self::Dense(d) if d.can_forward_km(5) => {
-                d.forward_km(input, 5, ctx, stream)?;
-                Ok(ctx.buffers.moe_output())
-            }
-            Self::Dense(d) => {
-                d.forward_prefill(input, 5, ctx, stream)?;
-                Ok(ctx.buffers.moe_output())
-            }
-            Self::None => Ok(input),
-        }
-    }
-
-    /// Fixed K=5 FFN for an mHC caller capable of fusing GLM's EP shared
-    /// expert blend into its post-step. `Some(gate)` means the returned MoE
-    /// output is routed-only and already globally reduced; the shared output
-    /// remains in `buffers.attn_output()`.
-    pub fn forward_k5_for_hc(
-        &self,
-        input: DevicePtr,
-        allow_deferred_shared_hc: bool,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<(DevicePtr, Option<DevicePtr>)> {
-        match self {
-            Self::Moe(m) => m.forward_k5_for_hc(input, allow_deferred_shared_hc, ctx, stream),
-            _ => Ok((self.forward_k5(input, ctx, stream)?, None)),
-        }
-    }
-
-    /// Execute the unfused shared-expert blend for the GLM K=5 exactness
-    /// oracle after [`Self::forward_k5_for_hc`] returned `Some(gate)`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn finish_k5_deferred_shared_blend(
-        &self,
-        routed: DevicePtr,
-        shared: DevicePtr,
-        input: DevicePtr,
-        gate_weight: DevicePtr,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        match self {
-            Self::Moe(m) => {
-                m.finish_k5_deferred_shared_blend(routed, shared, input, gate_weight, ctx, stream)
-            }
-            _ => anyhow::bail!("deferred K=5 shared blend requires a MoE FFN"),
-        }
-    }
-
     /// Whether the K=m (m<=8) batched-GEMV verify FFN is available (dense
     /// only — MoE / missing batch4/batch8 kernel / non-NVFP4 weights →
     /// false). Lets callers gate branch entry BEFORE computing the pre-FFN
@@ -532,31 +389,6 @@ impl FfnComponent {
                 let _ = (input, num_tokens);
                 Ok(())
             }
-        }
-    }
-
-    /// Sequence-parallel prefill FFN over a normed `[2 * sp.rows, H]` input
-    /// (all rows gathered). Returns this rank's `[sp.rows, H]` output rows:
-    /// the MoE runs every row and reduce-scatters (`layers::glm_sp`), the
-    /// replicated dense FFN runs only the local rows.
-    pub fn forward_prefill_sp(
-        &self,
-        normed: DevicePtr,
-        sp: glm_sp::SpRows,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<DevicePtr> {
-        let h = ctx.config.hidden_size;
-        match self {
-            Self::Moe(m) => {
-                m.forward_prefill(normed, 2 * sp.rows, ctx, stream)?;
-                Ok(sp.local(ctx.buffers.moe_output(), h))
-            }
-            Self::Dense(d) => {
-                d.forward_prefill(sp.local(normed, h), sp.rows, ctx, stream)?;
-                Ok(ctx.buffers.moe_output())
-            }
-            Self::None => anyhow::bail!("SP prefill FFN on a layer without an FFN"),
         }
     }
 
