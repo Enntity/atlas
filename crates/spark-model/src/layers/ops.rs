@@ -15,6 +15,8 @@
 mod activations;
 #[path = "ops/bf16_gemm_cutlass.rs"]
 mod bf16_gemm_cutlass;
+#[path = "ops/dense_gemv_multi.rs"]
+mod dense_gemv_multi;
 #[path = "ops/derived_reserve.rs"]
 mod derived_reserve;
 #[path = "ops/derived_weights.rs"]
@@ -56,6 +58,8 @@ pub mod gdn_flashinfer;
 mod gemm_dense;
 #[path = "ops/gemm_dense_int8.rs"]
 mod gemm_dense_int8;
+#[path = "ops/gemm_dense_router.rs"]
+mod gemm_dense_router;
 #[path = "ops/gemm_fp4.rs"]
 mod gemm_fp4;
 #[path = "ops/model_stats.rs"]
@@ -117,6 +121,8 @@ mod hyper_connection_lowrank_tests;
 mod kv_cache;
 #[path = "ops/kv_cache_fp8k.rs"]
 mod kv_cache_fp8k;
+#[path = "ops/kv_cache_glm.rs"]
+mod kv_cache_glm;
 #[path = "ops/kv_cache_turbok.rs"]
 mod kv_cache_turbok;
 #[path = "ops/lora_delta.rs"]
@@ -214,6 +220,8 @@ mod ssm_gdn_snap;
 mod ssm_gdn_wyn_table_tests;
 #[path = "ops/ssm_mamba.rs"]
 mod ssm_mamba;
+#[path = "ops/ssm_mamba_snap.rs"]
+mod ssm_mamba_snap;
 #[path = "ops/ssm_preproc.rs"]
 mod ssm_preproc;
 #[path = "ops/ssm_ssd.rs"]
@@ -224,6 +232,7 @@ mod wide_prefill;
 
 pub use activations::*;
 pub use bf16_gemm_cutlass::*;
+pub use dense_gemv_multi::*;
 pub use derived_reserve::{lazy_bf16_copy_bytes, lazy_bf16_reserve, lazy_bf16_reserve_enabled};
 pub use derived_weights::{Derivation, DerivedWeights};
 pub use dispatch_config::GemmDispatch;
@@ -239,6 +248,7 @@ pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
 pub use gemm_dense::*;
 pub use gemm_dense_int8::*;
+pub use gemm_dense_router::*;
 pub use gemm_fp4::*;
 pub use gemm_fp8_prefill::*;
 pub use gemm_quant::*;
@@ -256,6 +266,7 @@ pub use kda::*;
 pub use kda_indexed::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
+pub use kv_cache_glm::*;
 pub use kv_cache_turbok::*;
 pub use marlin_nvfp4::*;
 pub use marlin_nvfp4_pack::marlin_pack_nvfp4;
@@ -297,6 +308,7 @@ pub use ssm_gdn_b::*;
 pub use ssm_gdn_batched::*;
 pub use ssm_gdn_snap::*;
 pub use ssm_mamba::*;
+pub use ssm_mamba_snap::*;
 pub use ssm_preproc::*;
 pub use ssm_ssd::*;
 pub use wide_prefill::*;
