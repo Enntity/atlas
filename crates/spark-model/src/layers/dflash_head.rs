@@ -840,6 +840,7 @@ mod free_state_carry_tests;
 #[cfg(test)]
 mod free_state_tests;
 mod from_weights;
+mod from_weights_kernels;
 #[cfg(test)]
 mod lifecycle_tests;
 mod markov;
@@ -849,10 +850,9 @@ mod precompute_ctx_kv;
 mod propose;
 mod small_m_gemm;
 
-/// Per-sequence anchor words: `[prev token, banned draft depth]` u32.
-const MARKOV_PREV_BYTES: usize = 8;
-/// Byte offset of the banned draft depth within `markov_prev_dev`.
-const MARKOV_BAN_DEPTH_OFFSET: usize = 4;
+mod context_window;
+mod markov_slots;
+use markov_slots::{MARKOV_BAN_DEPTH_OFFSET, MARKOV_PREV_BYTES};
 mod twins;
 pub use twins::{DflashTwins, LayerMxfp8};
 
@@ -920,12 +920,6 @@ impl BlockDiffusionDraftHead {
                 bt.0
             );
         }
-    }
-
-    /// `[batch_capacity]` banned draft depths, after the batch anchors in
-    /// `batch_markov_prev`.
-    fn batch_ban_depth(&self) -> DevicePtr {
-        self.batch_markov_prev.offset(self.batch_capacity * 4)
     }
 
     /// Resolve a lane's mutable propose resources: (stream, scratch,
