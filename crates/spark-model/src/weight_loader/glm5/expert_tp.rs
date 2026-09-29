@@ -77,7 +77,7 @@ fn read_slice(
     );
     let (rank, world) = (config.ep_rank, config.ep_world_size);
     ensure!(
-        rows % world == 0 && row_bytes % world == 0,
+        rows.is_multiple_of(world) && row_bytes.is_multiple_of(world),
         "expert TP: {name} [{rows}, {row_bytes} bytes] does not split {world} ways"
     );
     match kind {
