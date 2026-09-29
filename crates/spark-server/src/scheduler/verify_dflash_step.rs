@@ -5,6 +5,8 @@
 use super::*;
 
 mod glm_owner;
+mod think_end;
+pub(super) use think_end::accept_with_forced_think_end;
 pub use glm_owner::{step_verify_glm_long_batched, step_verify_glm_long_with};
 
 /// Width-generic γ-token verify with accept-prefix.
@@ -151,7 +153,7 @@ pub(super) fn verify_dflash_tail(
     // drafter judge on the SAME (GOLD) basis. For non-DFlash callers (unreachable
     // today since step_verify_dflash is only dispatched at drafts.len()>=4 which
     // only DFlash produces), apply the full pre-sample pipeline as in K=2/3/4.
-    let verified = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
+    let mut verified = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
         model,
@@ -178,17 +180,14 @@ pub(super) fn verify_dflash_tail(
     // prediction for what should follow `tokens[i]`). drafts[i] was the
     // proposer's guess for the same slot. First mismatch terminates the
     // accepted prefix; verified[first_mismatch] becomes the bonus token.
-    let mut num_accepted = 0usize;
-    for i in 0..drafts.len() {
-        if i + 1 >= verified.len() {
-            break;
-        }
-        if drafts[i] == verified[i] {
-            num_accepted += 1;
-        } else {
-            break;
-        }
-    }
+    // An exhausted thinking budget may end the step early at `</think>`.
+    let num_accepted = accept_with_forced_think_end(
+        a,
+        verify_ctx.think_end_token,
+        verify_ctx.boundary_mask.as_deref(),
+        drafts,
+        &mut verified,
+    );
     if let Some(raw) = raw_trace {
         tracing::info!(
             "LIGHTNING VERIFY TOKEN TRACE slot={} last={} drafts={:?} raw={:?} processed={:?} accepted={}",
