@@ -554,15 +554,7 @@ impl Qwen3AttentionLayer {
         let n = sp.map_or(num_tokens, |sp| sp.rows) as u32;
         let hc = self.hc.as_ref().unwrap();
         let hc_mult = hc.hc_mult as u32;
-        // GLM carries its physical block index; upstream mixed models carry model indices.
-        let (is_first_layer, is_last_layer) = if ctx.config.model_type == "glm5_next" {
-            (
-                self.block_idx == 0,
-                self.block_idx + 1 == ctx.config.num_hidden_layers,
-            )
-        } else {
-            (hc.is_first_model_layer, hc.is_last_model_layer)
-        };
+        let (is_first_layer, is_last_layer) = self.hc_prefill_layer_bounds(hc, ctx);
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
@@ -606,25 +598,7 @@ impl Qwen3AttentionLayer {
         );
 
         // ── Attention sublayer ──
-        if ctx.config.model_type == "glm5_next" {
-            self.hc_pre_prefill(&hc.attn, hc, hidden, n, ctx, stream)?;
-        } else {
-            ops::hc_pre_site(
-                ctx.gpu,
-                self.hc_pre_k,
-                hc_streams,
-                &hc.attn,
-                hc,
-                hidden,
-                post,
-                comb,
-                ctx.buffers.hc_lowrank_scratch(),
-                n,
-                h as u32,
-                eps,
-                stream,
-            )?;
-        }
+        self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, ctx, stream)?;
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -689,14 +663,7 @@ impl Qwen3AttentionLayer {
                  got seq_len_start=0."
             );
         }
-        // GLM semantic-index MLA runs every chunk, the first included, through
-        // the paged sparse path: the dense cache-skip arm attends to every
-        // earlier row (not the top-k selection) and is quadratic in the chunk.
-        let glm_paged = ctx.attn_metadata.is_some_and(|m| !m.block_table.is_null())
-            && self
-                .mla
-                .as_ref()
-                .is_some_and(|mla| mla.glm_indexer.is_some());
+        let glm_paged = self.glm_paged_prefill(ctx);
         let attn_out = if seq_len_start == 0 && !glm_paged {
             self.prefill_attention_with_cache_skip(
                 state,
@@ -804,34 +771,13 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else if is_last_layer && ctx.config.model_type == "glm5_next" {
-                ops::hc_contract(
-                    ctx.gpu,
-                    self.hc_contract_k,
-                    hc_streams,
-                    hidden,
-                    n,
-                    h as u32,
-                    hc_mult,
-                    stream,
-                )?;
+                self.hc_contract_prefill(hc_streams, hidden, n, hc_mult, ctx, stream)?;
             }
             return Ok(());
         }
 
-        // GLM: this site's post fused with the FFN site's pre-mix.
-        let seam = ctx.config.model_type == "glm5_next"
-            && !diag_this
-            && super::super::hc_post_pre_prefill_fused(
-                &hc.ffn,
-                Some(local(attn_out)),
-                hidden,
-                n,
-                hc_mult,
-                hc.sinkhorn_iters as u32,
-                hc.hc_eps,
-                ctx,
-                stream,
-            )?;
+        let seam =
+            self.hc_post_pre_prefill_seam(hc, local(attn_out), hidden, n, diag_this, ctx, stream)?;
         if !seam {
             ops::hc_post_site(
                 ctx.gpu,
@@ -880,24 +826,8 @@ impl Qwen3AttentionLayer {
         // ── FFN sublayer ──
         if seam {
             // The fused seam already wrote the FFN input and post/comb.
-        } else if ctx.config.model_type == "glm5_next" {
-            self.hc_pre_prefill(&hc.ffn, hc, hidden, n, ctx, stream)?;
         } else {
-            ops::hc_pre_site(
-                ctx.gpu,
-                self.hc_pre_k,
-                hc_streams,
-                &hc.ffn,
-                hc,
-                hidden,
-                post,
-                comb,
-                ctx.buffers.hc_lowrank_scratch(),
-                n,
-                h as u32,
-                eps,
-                stream,
-            )?;
+            self.hc_pre_prefill_site(&hc.ffn, hc, hidden, n, ctx, stream)?;
         }
         if diag_this {
             super::diag_norm(
@@ -1027,16 +957,7 @@ impl Qwen3AttentionLayer {
                 );
             }
         } else if is_last_layer && ctx.config.model_type == "glm5_next" {
-            ops::hc_contract(
-                ctx.gpu,
-                self.hc_contract_k,
-                hc_streams,
-                hidden,
-                n,
-                h as u32,
-                hc_mult,
-                stream,
-            )?;
+            self.hc_contract_prefill(hc_streams, hidden, n, hc_mult, ctx, stream)?;
         } else if is_last_layer {
             tracing::warn!(
                 "V4-prefill L{}: hc_head SKIPPED (no head weights)",
