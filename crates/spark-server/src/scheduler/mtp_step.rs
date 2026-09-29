@@ -4,15 +4,12 @@
 
 use super::*;
 
-/// Mark an MTP failure for the normal retirement pass. Sending the error
-/// immediately would free the live owner while it is still present in the
-/// active set; leaving only `finished=true` would instead synthesize a
-/// successful `stop` response and cache the partial prefix. `finish_sequence`
-/// consumes this marker and uses the terminal error/free path exactly once.
-fn mark_engine_error(a: &mut ActiveSeq, error: impl Into<String>) {
-    a.engine_error = Some(error.into());
-    a.finished = true;
-}
+mod depth;
+mod glm_repair;
+mod owner_batch;
+use depth::{ladder_truncate, lone_dflash_width, single_depth_ladder};
+use glm_repair::{glm_repaired_narrow, mark_engine_error};
+use owner_batch::verify_owner_batch;
 
 /// MTP-aware step: bootstrap sequences without drafts, then verify via CUDA graph.
 /// Supports K=2 (num_drafts=1) and K=3 (num_drafts=2).
@@ -53,9 +50,7 @@ pub fn step_mtp(
         Some(max_nd) => num_drafts.min(max_nd),
         None => num_drafts,
     };
-    // Repair owns an explicit verdict on both ranks; legacy K2/K3 have no record hook.
-    let glm_repaired_narrow =
-        matches!(num_drafts, 1 | 2) && spark_model::speculative::glm_repair_policy::enabled();
+    let glm_repaired_narrow = glm_repaired_narrow(num_drafts);
     let mut bootstrap_idxs: Vec<usize> = Vec::new();
     let mut verify_idxs: Vec<usize> = Vec::new();
     for (i, a) in active.iter().enumerate() {
@@ -84,18 +79,7 @@ pub fn step_mtp(
     } else {
         crate::scheduler::adaptive_rung::drafts_for(active.len(), num_drafts)
     };
-    // At n=1, GLM can choose between the measured K=3 and K=5 kernels from
-    // this request's own acceptance history.  This composes after the global
-    // concurrency ladder and is a carried per-run lever rather than global
-    // process state (`ATLAS_MTP_SINGLE_DEPTH_ADAPT=1`).
-    let ladder_nd =
-        if active.len() == 1 && !dflash_verify_raw_argmax && sched.levers.mtp_single_depth_adapt {
-            active[0]
-                .mtp_acct
-                .depth_drafts(ladder_nd, sched.levers.mtp_single_depth_adapt)
-        } else {
-            ladder_nd
-        };
+    let ladder_nd = single_depth_ladder(active, sched, ladder_nd, dflash_verify_raw_argmax);
     // Tiered verify-pool capacity clamp (2026-08-16): the step's draft
     // count must respect the MINIMUM slot capacity across the active
     // sequences — a sequence in a K=2-sized slot must never receive K=4
@@ -598,104 +582,17 @@ pub fn step_mtp(
             serial_idxs.extend_from_slice(chunk);
         }
     }
-    // Owner-batched GLM verify: grammarless owners with the same draft width
-    // verify in ONE target traversal instead of one traversal per owner —
-    // two drafts on the repaired long-context K3 lane, the most common width
-    // on the DFlash lane. Everything else keeps the per-sequence path.
-    let adaptive_width = if dflash_verify_raw_argmax {
-        let owners: Vec<usize> = serial_idxs
-            .iter()
-            .copied()
-            .filter(|&i| active[i].grammar_state.is_none() && !active[i].pending_drafts.is_empty())
-            .collect();
-        // Widest width every owner holds that the batch's row budget admits.
-        let fits = (1..=owners
-            .iter()
-            .map(|&i| active[i].pending_drafts.len())
-            .min()
-            .unwrap_or(0))
-            .rev()
-            .find(|&w| model.can_batch_glm_long_verify_rows(owners.len(), w + 1));
-        let max = fits.unwrap_or(0);
-        (owners.len() >= 2)
-            .then(|| {
-                super::dflash_width::choose(
-                    owners.iter().map(|&i| &active[i].spec_adapt.survival),
-                    max,
-                )
-            })
-            .flatten()
-    } else {
-        None
-    };
-    let owner_drafts = if glm_repaired_narrow && !dflash_verify_raw_argmax && ladder_nd >= 2 {
-        Some(2)
-    } else if let Some(width) = adaptive_width {
-        // Cost-aware width: every owner holds at least `width` drafts.
-        Some(width)
-    } else if dflash_verify_raw_argmax {
-        // Owners with at least `w` drafts can verify together at width `w`;
-        // take the width that verifies the most rows.
-        let lens: Vec<usize> = serial_idxs
-            .iter()
-            .filter(|&&i| active[i].grammar_state.is_none())
-            .map(|&i| active[i].pending_drafts.len())
-            .filter(|&len| len > 0)
-            .collect();
-        let owners_at = |w: usize| lens.iter().filter(|&&len| len >= w).count();
-        lens.iter()
-            .copied()
-            .filter(|&w| {
-                owners_at(w) < 2 || model.can_batch_glm_long_verify_rows(owners_at(w), w + 1)
-            })
-            .max_by_key(|&w| (owners_at(w) * (w + 1), w))
-    } else {
-        None
-    };
-    if let Some(width) = owner_drafts {
-        // DFlash owners holding more drafts than the common width join at
-        // that width: the drafter's rollback keys on accepted rows only, and
-        // one shared traversal beats a second per-owner one.
-        let group: Vec<usize> = serial_idxs
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let len = active[i].pending_drafts.len();
-                active[i].grammar_state.is_none()
-                    && (len == width || (dflash_verify_raw_argmax && len > width))
-            })
-            .collect();
-        let min_group = std::env::var("ATLAS_GLM_LONG_BATCH_MIN")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2)
-            .max(1);
-        if group.len() >= min_group && model.can_batch_glm_long_verify_rows(group.len(), width + 1)
-        {
-            serial_idxs.retain(|i| !group.contains(i));
-            for &i in &group {
-                active[i].pending_drafts.truncate(width);
-                active[i].pending_draft_conf.truncate(width);
-            }
-            super::dflash_width::log_verify(group.len(), width);
-            let mut sorted = group.clone();
-            sorted.sort_unstable();
-            let mut batch: Vec<&mut ActiveSeq> = active
-                .iter_mut()
-                .enumerate()
-                .filter(|(i, _)| sorted.binary_search(i).is_ok())
-                .map(|(_, a)| a)
-                .collect();
-            step_verify_glm_long_batched(
-                model,
-                &mut batch,
-                sched,
-                num_drafts,
-                verify_ctx,
-                dflash_verify_raw_argmax,
-            );
-        }
-    }
+    verify_owner_batch(
+        model,
+        active,
+        sched,
+        &mut serial_idxs,
+        num_drafts,
+        ladder_nd,
+        glm_repaired_narrow,
+        verify_ctx,
+        dflash_verify_raw_argmax,
+    );
     for &idx in &serial_idxs {
         let a = &mut active[idx];
         let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
@@ -705,16 +602,7 @@ pub fn step_mtp(
         if drafts.is_empty() {
             continue;
         }
-        // A lone DFlash verify pays single-owner cost for each row it adds.
-        if dflash_verify_raw_argmax
-            && let Some(width) =
-                super::dflash_width::choose(std::iter::once(&a.spec_adapt.survival), drafts.len())
-        {
-            drafts.truncate(width);
-        }
-        if dflash_verify_raw_argmax {
-            super::dflash_width::log_verify(1, drafts.len());
-        }
+        lone_dflash_width(a, &mut drafts, dflash_verify_raw_argmax);
 
         // Spec-decode boundary awareness (arXiv:2512.15834): when a
         // grammar is active, validate the draft sequence against the
@@ -734,13 +622,7 @@ pub fn step_mtp(
                 continue;
             }
         }
-
-        // The n=1 path does not pass through the batched partition's depth
-        // truncation above.  Honor the same ladder decision here so a K5
-        // proposal can immediately step down to the cheaper K3 verifier.
-        if a.grammar_state.is_none() && drafts.len() > ladder_nd {
-            drafts.truncate(ladder_nd);
-        }
+        ladder_truncate(a, &mut drafts, ladder_nd);
 
         // DFlash/DSpark verify: route by proposer, not draft count.
         // `--dflash` sets dflash_verify_raw_argmax. The old `drafts.len()>=4`
