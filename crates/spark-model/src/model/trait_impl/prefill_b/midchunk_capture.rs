@@ -53,7 +53,13 @@ pub(in crate::model) struct MidCapturePlan {
     /// Split point in local (chunk) token coordinates (`tb - proc_start`).
     pub cap_local: usize,
     /// Reserved TAIL snapshot slot (== snapshot id used for registration).
-    pub snap_slot: usize,
+    /// `None` only for an in-pass checkpoint whose slot could not be
+    /// reserved: the pass still splits at `cap_local`, copying nothing.
+    pub snap_slot: Option<usize>,
+    /// Register the capture as the prefill checkpoint at `tb` (the in-pass
+    /// replacement for the tail split, `inpass_checkpoint`) instead of as
+    /// the session tail.
+    pub checkpoint: bool,
     /// Block-floored matched-prefix boundary the tail snapshot represents.
     pub tb: usize,
     /// Per-SSM-layer h_state destination (offset to `snap_slot`).
@@ -85,7 +91,7 @@ impl TransformerModel {
     /// Reserve a Marconi snapshot slot, reclaiming one from the cache on
     /// exhaustion. Returns `None` only when the pool is full and nothing is
     /// evictable — the caller then degrades gracefully (fewer/no captures).
-    fn reserve_snapshot_slot(
+    pub(super) fn reserve_snapshot_slot(
         &self,
         session_hash: u64,
         kv_cache: &mut PagedKvCache,
@@ -299,7 +305,8 @@ impl TransformerModel {
 
         Some(MidCapturePlan {
             cap_local,
-            snap_slot,
+            snap_slot: Some(snap_slot),
+            checkpoint: false,
             tb,
             h_dsts,
             conv_dsts,
@@ -328,9 +335,12 @@ impl TransformerModel {
         seq: &SequenceState,
         plan: &MidCapturePlan,
     ) {
+        let Some(snap_slot) = plan.snap_slot else {
+            return;
+        };
         for old in self.prefix_cache.insert_tail_snapshot(
             &tokens[..plan.tb],
-            plan.snap_slot,
+            snap_slot,
             seq.session_hash,
             seq.adapter_id,
         ) {
@@ -339,7 +349,7 @@ impl TransformerModel {
         tracing::info!(
             "midchunk tail SSM capture at token {} (snap {})",
             plan.tb,
-            plan.snap_slot
+            snap_slot
         );
 
         if let (Some(tb_early), Some(slot2)) = (plan.tb_early, plan.snap_slot_early) {

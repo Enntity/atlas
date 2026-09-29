@@ -9,6 +9,7 @@ mod forward_recurrent_owners;
 mod hc;
 mod indexed_core;
 mod init;
+mod inpass_capture;
 mod multi_seq;
 mod profile;
 mod projection;
@@ -253,6 +254,10 @@ impl TransformerLayer for Glm5KdaLayer {
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+
+    fn captures_ssm_state_in_pass(&self) -> bool {
+        true
     }
 
     fn decode(
