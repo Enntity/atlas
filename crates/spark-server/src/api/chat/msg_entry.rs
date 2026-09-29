@@ -16,7 +16,11 @@ use atlas_core::config::VisionConfig;
 use crate::ir::{ContentPart, ImageData, MediaKind, Message, Role};
 
 use super::super::compact::openai_error_response;
-use crate::tokenizer::{Glm5VisionKind, Glm5VisionPlaceholder};
+use crate::tokenizer::Glm5VisionPlaceholder;
+
+mod glm5_vision;
+#[cfg(test)]
+use glm5_vision::checked_glm5_video_timestamps;
 
 /// What the request path needs to decode a video: the operator's subprocess
 /// policy and the sampling rate. Bundled so the signature does not grow two
@@ -78,20 +82,6 @@ pub(super) struct BuildOut {
 struct MediaInput {
     kind: MediaKind,
     uri: String,
-}
-
-fn checked_glm5_video_timestamps(
-    timestamps: Vec<f32>,
-    frame_count: usize,
-) -> Result<Vec<f32>, String> {
-    if timestamps.len() != frame_count {
-        return Err(format!(
-            "GLM-5 video metadata has {} timestamps for {} temporal groups",
-            timestamps.len(),
-            frame_count
-        ));
-    }
-    Ok(timestamps)
 }
 
 /// Append every media part on `m` to `media` **in content order**, growing
@@ -477,27 +467,12 @@ pub(super) fn build_msg_entries(
             };
             image_pad_counts[idx] = item.pad_count(vcfg.spatial_merge_size);
             if vcfg.is_glm5_next {
-                let frame_count = item.t_len();
-                let frame_pad_count = image_pad_counts[idx] / frame_count.max(1);
-                let timestamps = if input.kind == MediaKind::Video {
-                    match checked_glm5_video_timestamps(video_timestamps, frame_count) {
-                        Ok(timestamps) => timestamps,
-                        Err(message) => {
-                            return Err(openai_error_response(StatusCode::BAD_REQUEST, message));
-                        }
-                    }
-                } else {
-                    Vec::new()
-                };
-                vision_placeholders.push(Glm5VisionPlaceholder {
-                    kind: match input.kind {
-                        MediaKind::Image => Glm5VisionKind::Image,
-                        MediaKind::Video => Glm5VisionKind::Video,
-                    },
-                    pad_count: image_pad_counts[idx],
-                    per_frame_pad_count: frame_pad_count,
-                    timestamps,
-                });
+                vision_placeholders.push(glm5_vision::placeholder(
+                    input.kind,
+                    &item,
+                    image_pad_counts[idx],
+                    video_timestamps,
+                )?);
             }
             if input.kind == MediaKind::Video {
                 // Logged at the media index, not a video ordinal: the index
