@@ -55,6 +55,10 @@ mod verify_fused;
 mod verify_layer_trace;
 
 impl Model for TransformerModel {
+    fn verify_logits_argmax_only(&self) -> bool {
+        self.glm_verify_logits_argmax_only()
+    }
+
     fn lightning_dspark_product_policy(
         &self,
     ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {

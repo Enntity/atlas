@@ -104,7 +104,7 @@ pub fn step_verify_k4(
     let (v0, v1, v2, v3) = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
-        model.is_lightning_dspark_product(),
+        model,
         a,
     ) {
         // DFlash drafter proposes on raw argmax; verify on the SAME (GOLD)
