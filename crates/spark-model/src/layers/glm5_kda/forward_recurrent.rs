@@ -37,6 +37,9 @@ impl Glm5KdaLayer {
 
     /// Convolution + recurrence of one sequence over rows `[0, tokens)` of
     /// already-packed `packed`/`g1`/`beta` (prefill or single-row decode).
+    /// A pass carrying an in-pass checkpoint runs each as two calls around
+    /// the cut (`inpass_capture`); every convolution precedes every
+    /// recurrence, as with one call.
     #[allow(clippy::too_many_arguments)]
     fn sequence_recurrent_rows(
         &self,
@@ -51,56 +54,77 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let m = tokens as u32;
         let p = self.heads * self.dim;
-        ops::conv1d_update_prefill(
-            ctx.gpu,
-            self.conv_prefill_k,
-            self.conv_prefill_tp_k,
-            state.conv_state,
-            packed,
-            &self.weights.conv,
-            DevicePtr::NULL,
-            convolved,
-            (3 * p) as u32,
-            self.conv_width as u32,
-            m,
-            (3 * p) as u32,
-            (3 * p) as u32,
-            stream,
-        )?;
-        if let Some(flash) = self
-            .flash_prefill
-            .as_ref()
-            .filter(|_| flash_prefill::eligible(tokens, decode, ctx.graph_capture))
-        {
-            // Convolution has finished reading packed. Its storage and the
-            // idle expert buffers can now be borrowed on this same stream.
-            flash.forward(
-                convolved,
-                g1,
-                beta,
-                self.weights.a_log.weight,
-                self.weights.dt_bias.weight,
-                state.h_state,
-                core_out,
-                tokens,
-                ctx,
+        let (packed_row, gate_row, beta_row) = (3 * p * 2, p * 2, self.heads * 2);
+        let segments = inpass_capture::segments(tokens, self.inpass_cut(tokens, decode, ctx));
+        for &(row0, rows) in &segments {
+            ops::conv1d_update_prefill(
+                ctx.gpu,
+                self.conv_prefill_k,
+                self.conv_prefill_tp_k,
+                state.conv_state,
+                packed.offset(row0 * packed_row),
+                &self.weights.conv,
+                DevicePtr::NULL,
+                convolved.offset(row0 * packed_row),
+                (3 * p) as u32,
+                self.conv_width as u32,
+                rows as u32,
+                (3 * p) as u32,
+                (3 * p) as u32,
                 stream,
-            )
-        } else {
-            self.run_recurrent(
-                convolved,
-                g1,
-                beta,
-                state.h_state,
-                core_out,
-                m,
-                decode,
-                ctx,
-                stream,
-            )
+            )?;
+            if row0 + rows < tokens {
+                self.inpass_copy(state, false, ctx, stream)?;
+            }
         }
+        // Each segment takes the recurrence its own length qualifies for, as
+        // each pass of the tail split would.
+        for &(row0, rows) in &segments {
+            let (convolved, g1, beta, core_out) = (
+                convolved.offset(row0 * packed_row),
+                g1.offset(row0 * gate_row),
+                beta.offset(row0 * beta_row),
+                core_out.offset(row0 * gate_row),
+            );
+            if let Some(flash) = self
+                .flash_prefill
+                .as_ref()
+                .filter(|_| flash_prefill::eligible(rows, decode, ctx.graph_capture))
+            {
+                // Every convolution has finished reading packed. Its storage
+                // and the idle expert buffers can now be borrowed on this
+                // same stream.
+                flash.forward(
+                    convolved,
+                    g1,
+                    beta,
+                    self.weights.a_log.weight,
+                    self.weights.dt_bias.weight,
+                    state.h_state,
+                    core_out,
+                    rows,
+                    ctx,
+                    stream,
+                )?;
+            } else {
+                self.run_recurrent(
+                    convolved,
+                    g1,
+                    beta,
+                    state.h_state,
+                    core_out,
+                    rows as u32,
+                    decode,
+                    ctx,
+                    stream,
+                )?;
+            }
+            if row0 + rows < tokens {
+                self.inpass_copy(state, true, ctx, stream)?;
+            }
+        }
+        Ok(())
     }
 
     /// Fused prefill chunk + verify owners: pack every row once, advance

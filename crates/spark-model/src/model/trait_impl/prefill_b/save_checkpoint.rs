@@ -147,6 +147,23 @@ impl TransformerModel {
             self.ssm_snapshots.set_aux(snap_id, aux);
         }
 
+        self.prefill_b_register_checkpoint(tokens, seq, kv_cache, end_token, snap_id)
+    }
+
+    /// Register snapshot `snap_id`, holding the state after `tokens[..end_token]`
+    /// (block-aligned, K/V fully written), as the prefill checkpoint at
+    /// `end_token`: radix nodes for its blocks plus the intermediate snapshot.
+    /// Frees the snapshot when it cannot be registered.
+    pub(in crate::model) fn prefill_b_register_checkpoint(
+        &self,
+        tokens: &[u32],
+        seq: &SequenceState,
+        kv_cache: &mut PagedKvCache,
+        end_token: usize,
+        snap_id: usize,
+    ) -> Result<()> {
+        let bs = kv_cache.block_size();
+        let end_block = end_token / bs;
         let boundary_tokens = &tokens[..end_token];
         // Phase 6.3 sliding-window: when HSS is engaged AND sliding has begun
         // (hss_window_start > 0), the front of the prefix is no longer
