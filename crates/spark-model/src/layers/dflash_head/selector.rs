@@ -102,6 +102,7 @@ impl Dflash2CandidateSelector {
         hidden_buf: DevicePtr,
         logits_buf: DevicePtr,
         projected_hidden_buf: DevicePtr,
+        selector_scratch: DevicePtr,
         draft_tokens_dev: DevicePtr,
         gamma: usize,
         gpu: &dyn GpuBackend,
@@ -141,6 +142,7 @@ impl Dflash2CandidateSelector {
                 self.vocab_size as u32,
                 r,
                 self.top_k as u32,
+                selector_scratch,
                 stream,
             );
         }

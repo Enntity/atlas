@@ -38,7 +38,8 @@ impl BlockDiffusionDraftHead {
                 )
             })?;
         anyhow::ensure!(
-            self.batch_dflash2_projected != DevicePtr::NULL,
+            self.batch_dflash2_projected != DevicePtr::NULL
+                && self.batch_dflash2_selector_scratch != DevicePtr::NULL,
             "DFlash batched selector scratch is null"
         );
         anyhow::ensure!(
@@ -134,6 +135,7 @@ impl BlockDiffusionDraftHead {
                 vocab,
                 rank,
                 selector.top_k as u32,
+                self.batch_dflash2_selector_scratch,
                 stream,
             )?;
         }

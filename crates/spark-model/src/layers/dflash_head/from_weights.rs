@@ -372,6 +372,8 @@ impl BlockDiffusionDraftHead {
                 dflash2_conv_delta: gpu.alloc(n_attn * 4 * (hidden_size / 16).max(1) * bf16)?,
                 dflash2_conv_out: gpu.alloc(n_attn * hidden_size * bf16)?,
                 dflash2_projected_hidden: gpu.alloc(g * 256 * bf16)?,
+                dflash2_selector_scratch: gpu
+                    .alloc(crate::layers::ops::dflash2_selector_scratch_bytes(g))?,
             };
             // C1 diagnostic: zero ALL device buffers so any uninitialized
             // read sees deterministic zeros instead of per-lane garbage.
@@ -397,6 +399,11 @@ impl BlockDiffusionDraftHead {
                 (s.draft_tokens_dev, n_attn * 4),
                 (s.markov_prev_dev, super::MARKOV_PREV_BYTES),
                 (s.position_ids, n_attn * 4),
+                // Also the selector's ticket, which must start at zero.
+                (
+                    s.dflash2_selector_scratch,
+                    crate::layers::ops::dflash2_selector_scratch_bytes(g),
+                ),
             ] {
                 gpu.memset(p, 0, bytes)?;
             }
@@ -484,6 +491,16 @@ impl BlockDiffusionDraftHead {
                 .and_then(|n| n.checked_mul(bf16))
                 .ok_or_else(|| anyhow::anyhow!("DFlash batch selector bytes overflow"))?;
             gpu.alloc(bytes)?
+        } else {
+            DevicePtr::NULL
+        };
+        // The batched tail's per-sequence selector launches run in stream
+        // order, so they share one selector scratch (ticket starts at zero).
+        let batch_dflash2_selector_scratch = if weights.candidate_selector.is_some() {
+            let bytes = crate::layers::ops::dflash2_selector_scratch_bytes(gamma_val);
+            let p = gpu.alloc(bytes)?;
+            gpu.memset(p, 0, bytes)?;
+            p
         } else {
             DevicePtr::NULL
         };
@@ -862,6 +879,7 @@ impl BlockDiffusionDraftHead {
             batch_markov_embed,
             batch_markov_bias,
             batch_dflash2_projected,
+            batch_dflash2_selector_scratch,
             batch_conv_delta,
             batch_conv_out,
             extra_lanes,
