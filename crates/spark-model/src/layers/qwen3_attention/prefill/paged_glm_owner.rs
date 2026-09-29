@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
-use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
+use spark_runtime::kv_cache::KvCacheDtype;
 
 use super::super::super::Qwen3AttentionLayer;
 use super::projection;
@@ -157,12 +157,13 @@ impl Qwen3AttentionLayer {
     }
 
     /// When `wanted` and the cache is `fp8_g128`, dequantize the owner's
-    /// tokens `[0, end)` into the BF16 view — unless they outgrow it, in
+    /// tokens `[0, end)` of `cache` (the latent pool, or a sharded owner's
+    /// assembled view) into the BF16 view — unless they outgrow it, in
     /// which case the caller reads the FP8 cache directly.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_owner_bf16_view(
         &self,
-        kv_cache: &PagedKvCache,
+        cache: DevicePtr,
         block_table: DevicePtr,
         end: usize,
         wanted: bool,
@@ -183,7 +184,7 @@ impl Qwen3AttentionLayer {
         ops::glm_latent_dequant_fp8g128(
             ctx.gpu,
             self.glm_latent_dequant_k,
-            kv_cache.k_pool_ptr(self.attn_layer_idx),
+            cache,
             block_table,
             latents,
             end as u32,
