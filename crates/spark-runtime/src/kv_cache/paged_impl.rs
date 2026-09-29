@@ -251,6 +251,14 @@ impl PagedKvCache {
     pub fn free_blocks(&mut self, block_table: &[u32]) {
         for &idx in block_table {
             self.free_block(idx);
+            // A departing sequence never reads these raw index tails again, and
+            // a block it shares with the prefix cache holds only finalized
+            // pools (slotted tails are used with prefix caching only when
+            // restores are block-aligned), so its lent tail returns to the pool
+            // now instead of when the cache finally evicts the block.
+            if let Some(tails) = self.tail_slots.as_mut() {
+                tails.release(idx);
+            }
         }
     }
 
