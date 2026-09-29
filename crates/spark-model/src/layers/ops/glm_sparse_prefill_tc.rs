@@ -252,11 +252,42 @@ pub fn try_glm_sparse_prefill_tc_split(
     {
         return dispatch(gpu, a, stream, tc, kv_reuse);
     }
-    validate_geometry(a)?;
-    validate_storage(a)?;
     let rh = a.rows as usize * a.heads as usize;
     let part_lse = scratch.offset(splits as usize * rh * a.head_dim as usize * 4);
     let out_lse = part_lse.offset(splits as usize * rh * 4);
+    launch_sparse_partials(gpu, a, splits, scratch, part_lse, stream)?;
+    decode_split::launch_merge(
+        gpu,
+        decode_split::merge_kernel(gpu)?,
+        scratch,
+        part_lse,
+        a.output,
+        out_lse,
+        a.rows,
+        a.rows * a.heads,
+        splits,
+        stream,
+    )?;
+    Ok(true)
+}
+
+/// The `*_split` kernel alone: `splits` normalized FP32 partial outputs
+/// `[splits, rows, heads, 512]` and their natural LSEs `[splits, rows, heads]`
+/// (`-inf` for a partition with no valid ID) for a caller-side LSE merge.
+pub(crate) fn launch_sparse_partials(
+    gpu: &dyn GpuBackend,
+    a: &GlmSparsePrefillTc<'_>,
+    splits: u32,
+    part_o: DevicePtr,
+    part_lse: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    validate_geometry(a)?;
+    validate_storage(a)?;
+    ensure!(
+        (1..=16).contains(&splits) && a.rows > 0 && a.identical_kv_latent,
+        "GLM sparse partials need 1..=16 splits, rows and identical K/V"
+    );
     let (module, _, shared_mem) = kernel_spec(true, a.dtype);
     let symbol = if a.dtype == KvCacheDtype::Fp8G128 {
         "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split"
@@ -281,22 +312,9 @@ pub fn try_glm_sparse_prefill_tc_split(
         .arg_u32(a.index_width)
         .arg_u32(a.block_size)
         .arg_f32(a.scale)
-        .arg_ptr(scratch)
+        .arg_ptr(part_o)
         .arg_ptr(part_lse)
-        .launch(stream)?;
-    decode_split::launch_merge(
-        gpu,
-        decode_split::merge_kernel(gpu)?,
-        scratch,
-        part_lse,
-        a.output,
-        out_lse,
-        a.rows,
-        a.rows * a.heads,
-        splits,
-        stream,
-    )?;
-    Ok(true)
+        .launch(stream)
 }
 
 /// Single source of truth for the independent repaired-decode opt-in.

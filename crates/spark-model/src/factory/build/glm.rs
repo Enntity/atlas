@@ -173,6 +173,64 @@ pub(super) fn cache_plan(
     Ok((sparse_index, tail_slots, glm_cache_plan))
 }
 
+/// `ATLAS_GLM_KV_SHARD=1`: `plan` with this rank storing only its blocks'
+/// latents (see `layers::glm_kv_shard`), once the topology admits it.
+pub(super) fn shard_plan(
+    plan: Option<GlmCachePlan>,
+    config: &ModelConfig,
+    kv_config: &KvCacheConfig,
+    comm: Option<&dyn spark_comm::CommBackend>,
+    max_seq_len: usize,
+    max_batch_tokens: usize,
+) -> Result<Option<GlmCachePlan>> {
+    use anyhow::{Context, ensure};
+    if !crate::layers::glm_kv_shard::requested()? {
+        return Ok(plan);
+    }
+    let plan = plan.context("ATLAS_GLM_KV_SHARD=1 shards the GLM-5 NoPE MLA latent cache only")?;
+    let comm = comm
+        .filter(|c| c.world_size() == 2)
+        .context("ATLAS_GLM_KV_SHARD=1 needs a two-rank communicator")?;
+    ensure!(
+        config.tp_world_size == 2 && config.num_attention_heads == 64,
+        "ATLAS_GLM_KV_SHARD=1 needs TP2 over 64 attention heads (32 per rank)"
+    );
+    ensure!(
+        kv_config.cache_blocks_per_seq.is_none(),
+        "ATLAS_GLM_KV_SHARD=1 does not support --high-speed-swap"
+    );
+    ensure!(
+        (0..kv_config.num_layers).all(|l| matches!(
+            kv_config.dtype_for_layer(l),
+            KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128
+        )),
+        "ATLAS_GLM_KV_SHARD=1 needs a BF16 or fp8_g128 latent cache on every layer"
+    );
+    // A cache write carries at most one chunk of rows (plus verify slack).
+    let spec = crate::layers::glm_kv_shard::spec(
+        comm.rank(),
+        kv_config,
+        max_seq_len,
+        max_batch_tokens + 64,
+    );
+    Ok(Some(plan.latent_sharded(kv_config, spec)))
+}
+
+/// The paged cache `plan` describes: latent-sharded, V aliasing K (GLM), or
+/// the generic layout.
+pub(super) fn new_kv_cache(
+    kv_config: KvCacheConfig,
+    num_blocks: usize,
+    gpu: &dyn GpuBackend,
+    plan: Option<GlmCachePlan>,
+) -> Result<spark_runtime::kv_cache::PagedKvCache> {
+    use spark_runtime::kv_cache::PagedKvCache;
+    match plan.and_then(GlmCachePlan::shard) {
+        Some(spec) => PagedKvCache::new_latent_sharded(kv_config, num_blocks, gpu, spec),
+        None => PagedKvCache::new_with_v_alias(kv_config, num_blocks, gpu, plan.is_some()),
+    }
+}
+
 pub(super) fn agree_kv_blocks(
     comm: Option<&dyn spark_comm::CommBackend>,
     gpu: &dyn GpuBackend,

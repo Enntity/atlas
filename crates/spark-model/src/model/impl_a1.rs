@@ -599,6 +599,8 @@ impl TransformerModel {
         // value is dead code and must not suppress CUDA graphs.
         let has_fp8_calibration = config.fp8_kv_calibration_tokens > 0
             && kv_cache.dtype() == spark_runtime::kv_cache::KvCacheDtype::Fp8;
+        // Sharded latents exchange with the peer inside attention (eager only).
+        let latent_shard = kv_cache.latent_shard().is_some();
         // Feature-2 overlay kernels: resolve before `gpu` is moved into Self.
         let overlay_kernels = crate::layers::ops::token_overlay::OverlayKernels::new(gpu.as_ref());
         Ok(Self {
@@ -668,6 +670,7 @@ impl TransformerModel {
             // naturally outside the captured region.
             suppress_graphs: std::sync::atomic::AtomicBool::new(
                 has_fp8_calibration
+                    || latent_shard
                     || std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true")
                     // PCND diagnostic: force eager decode (no CUDA-graph capture)
                     // so ATLAS_DEBUG_SYNC_KERNELS can synchronize per launch and

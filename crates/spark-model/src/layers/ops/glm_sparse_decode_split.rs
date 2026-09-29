@@ -137,7 +137,7 @@ fn dispatch(
     Ok(true)
 }
 
-pub(super) fn merge_kernel(gpu: &dyn GpuBackend) -> Result<KernelHandle> {
+pub(crate) fn merge_kernel(gpu: &dyn GpuBackend) -> Result<KernelHandle> {
     let merge = gpu.op_cache().kernel(
         gpu,
         "glm_sparse_decode_split_merge",
@@ -185,9 +185,42 @@ fn launch_split(
         .launch(stream)
 }
 
+/// `glm_sparse_decode_split_merge_f32` over `rows` x 32 heads: the merged
+/// partial stays FP32 (normalized output + LSE) for a further exact merge.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_merge_f32(
+    gpu: &dyn GpuBackend,
+    part: DevicePtr,
+    plse: DevicePtr,
+    out: DevicePtr,
+    lse: DevicePtr,
+    rows: u32,
+    splits: u32,
+    stream: u64,
+) -> Result<()> {
+    let k = gpu.op_cache().kernel(
+        gpu,
+        "glm_sparse_decode_split_merge",
+        "glm_sparse_decode_split_merge_f32",
+    )?;
+    ensure!(k.0 != 0, "GLM FP32 split merge kernel unavailable");
+    launch_merge(
+        gpu,
+        k,
+        part,
+        plse,
+        out,
+        lse,
+        rows,
+        rows * 32,
+        splits,
+        stream,
+    )
+}
+
 /// `glm_sparse_decode_split_merge` over `grid` = rows x 32 heads.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn launch_merge(
+pub(crate) fn launch_merge(
     gpu: &dyn GpuBackend,
     k: KernelHandle,
     part: DevicePtr,

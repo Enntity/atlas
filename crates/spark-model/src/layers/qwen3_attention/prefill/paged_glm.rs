@@ -24,6 +24,8 @@ mod projection;
 mod output;
 #[path = "paged_glm_owner.rs"]
 mod owner;
+#[path = "paged_glm_shard.rs"]
+pub(in crate::layers::qwen3_attention) mod shard;
 pub(in crate::layers::qwen3_attention) use owner::{GlmChunkOwner, glm_chunk_pieces};
 
 fn dense_selection_is_exact(sequence_end: usize, index_topk: usize) -> bool {
@@ -251,30 +253,6 @@ impl Qwen3AttentionLayer {
                     }),
                 )?)
             };
-            // The BF16 dense and native kernels read an fp8_g128 owner through
-            // a dequantized view; long owners and verify rows read FP8 directly.
-            let view = self.glm_owner_bf16_view(
-                kv_cache,
-                o.meta.block_table,
-                sequence_end,
-                use_dense || on >= 2048,
-                bs,
-                ctx,
-                stream,
-            )?;
-            ensure!(
-                !use_dense || self.kv_dtype == KvCacheDtype::Bf16 || view.is_some(),
-                "GLM dense prefill has no BF16 view of the fp8_g128 cache"
-            );
-            let (k_cache, v_cache, block_table, cache_dtype) = match view {
-                Some(v) => (v.latents, v.latents, v.identity_table, KvCacheDtype::Bf16),
-                None => (
-                    kv_cache.k_pool_ptr(self.attn_layer_idx),
-                    kv_cache.v_pool_ptr(self.attn_layer_idx),
-                    o.meta.block_table,
-                    self.kv_dtype,
-                ),
-            };
             let q_absorbed = match batched {
                 Some(b) => rows_of(b.q_absorbed, latent_row),
                 None => {
@@ -295,96 +273,159 @@ impl Qwen3AttentionLayer {
                     q_absorbed
                 }
             };
-            if let Some((indices, index_width)) = sparse_indices {
-                let mut profile = super::glm_index::profile_start(&octx, stream)?;
-                let sparse_args = ops::GlmSparsePrefillTc {
-                    config: ctx.config,
-                    dtype: cache_dtype,
-                    // mla_cache_assemble_batched above writes the same normalized
-                    // NoPE latent to both conventional paged cache sides.
-                    identical_kv_latent: true,
-                    query: q_absorbed,
-                    k_cache,
-                    v_cache,
-                    indices,
-                    output: attn_latent,
-                    block_table,
-                    rows: on,
-                    heads: nq,
-                    head_dim: kv_lora,
-                    index_width,
-                    block_size: bs,
-                    scale: self.effective_attn_scale(hd),
+            let sharded = kv_cache.latent_shard().is_some();
+            if sharded && on as usize <= crate::layers::glm_kv_shard::MERGE_MAX_ROWS {
+                // Few rows over sharded latents: each rank attends over the
+                // selected tokens it stores and the partials are LSE-merged.
+                let selected = match sparse_indices {
+                    Some((indices, width)) => {
+                        ensure!(
+                            width == crate::layers::glm_kv_shard::WIDTH,
+                            "GLM KV shard expects {} selected IDs, got {width}",
+                            crate::layers::glm_kv_shard::WIDTH
+                        );
+                        Some(indices)
+                    }
+                    None => None,
                 };
-                // Few-row owners (verify) split over the selected IDs; the MoE
-                // expert scratch is dead until this layer's FFN.
-                let accelerated = ops::try_glm_sparse_prefill_tc_split(
-                    ctx.gpu,
-                    &sparse_args,
-                    ctx.buffers.expert_gate_out(),
-                    ctx.buffers.sizes().expert_gate_out,
+                let rows = shard::ShardRows {
+                    query: q_absorbed,
+                    selected,
+                    causal_start: o.seq_len_start as u32,
+                    block_table: o.meta.block_table,
+                    rows: on,
+                    end: Some(sequence_end),
+                };
+                self.glm_shard_merge_attention(kv_cache, &octx, rows, attn_latent, stream)?;
+            } else {
+                // Sharded latents: assemble this owner's whole history (own
+                // blocks + the peer's) and read it through an identity table.
+                let (k_source, v_source, table_source) = if sharded {
+                    let (view, identity) = self.glm_shard_assemble_view(
+                        kv_cache,
+                        &octx,
+                        o.meta.block_table,
+                        sequence_end,
+                        stream,
+                    )?;
+                    (view, view, identity)
+                } else {
+                    (
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        o.meta.block_table,
+                    )
+                };
+                // The BF16 dense and native kernels read an fp8_g128 owner through
+                // a dequantized view; long owners and verify rows read FP8 directly.
+                let view = self.glm_owner_bf16_view(
+                    k_source,
+                    table_source,
+                    sequence_end,
+                    use_dense || on >= 2048,
+                    bs,
+                    ctx,
                     stream,
                 )?;
-                if !accelerated {
-                    ensure!(
-                        cache_dtype == KvCacheDtype::Bf16,
-                        "fp8_g128 GLM sparse attention requires ATLAS_GLM_SPARSE_PREFILL_TC=1"
-                    );
-                    ops::glm_sparse_mla_prefill(
-                        ctx.gpu,
-                        self.glm_sparse_attn_k,
-                        q_absorbed,
+                ensure!(
+                    !use_dense || self.kv_dtype == KvCacheDtype::Bf16 || view.is_some(),
+                    "GLM dense prefill has no BF16 view of the fp8_g128 cache"
+                );
+                let (k_cache, v_cache, block_table, cache_dtype) = match view {
+                    Some(v) => (v.latents, v.latents, v.identity_table, KvCacheDtype::Bf16),
+                    None => (k_source, v_source, table_source, self.kv_dtype),
+                };
+                if let Some((indices, index_width)) = sparse_indices {
+                    let mut profile = super::glm_index::profile_start(&octx, stream)?;
+                    let sparse_args = ops::GlmSparsePrefillTc {
+                        config: ctx.config,
+                        dtype: cache_dtype,
+                        // mla_cache_assemble_batched above writes the same normalized
+                        // NoPE latent to both conventional paged cache sides.
+                        identical_kv_latent: true,
+                        query: q_absorbed,
                         k_cache,
                         v_cache,
                         indices,
+                        output: attn_latent,
+                        block_table,
+                        rows: on,
+                        heads: nq,
+                        head_dim: kv_lora,
+                        index_width,
+                        block_size: bs,
+                        scale: self.effective_attn_scale(hd),
+                    };
+                    // Few-row owners (verify) split over the selected IDs; the MoE
+                    // expert scratch is dead until this layer's FFN.
+                    let accelerated = ops::try_glm_sparse_prefill_tc_split(
+                        ctx.gpu,
+                        &sparse_args,
+                        ctx.buffers.expert_gate_out(),
+                        ctx.buffers.sizes().expert_gate_out,
+                        stream,
+                    )?;
+                    if !accelerated {
+                        ensure!(
+                            cache_dtype == KvCacheDtype::Bf16,
+                            "fp8_g128 GLM sparse attention requires ATLAS_GLM_SPARSE_PREFILL_TC=1"
+                        );
+                        ops::glm_sparse_mla_prefill(
+                            ctx.gpu,
+                            self.glm_sparse_attn_k,
+                            q_absorbed,
+                            k_cache,
+                            v_cache,
+                            indices,
+                            attn_latent,
+                            block_table,
+                            on,
+                            nq,
+                            kv_lora,
+                            index_width,
+                            bs,
+                            self.glm_sparse_attn_heads_per_cta,
+                            self.effective_attn_scale(hd),
+                            stream,
+                        )?;
+                    }
+                    let sparse_attention_us =
+                        super::glm_index::profile_lap(&octx, stream, &mut profile)?;
+                    if profile.is_some() {
+                        tracing::info!(
+                            "ATLAS_GLM_INDEX_PROFILE phase=attention layer={} rows={} seq_end={} selected={} sparse_attention_us={}",
+                            self.attn_layer_idx,
+                            on,
+                            sequence_end,
+                            index_width,
+                            sparse_attention_us,
+                        );
+                    }
+                } else {
+                    ensure!(
+                        self.prefill_attn_paged_512_k.0 != 0,
+                        "GLM paged prefill kernel inferspark_prefill_paged_512 is unavailable"
+                    );
+                    ops::prefill_attention_paged_512(
+                        ctx.gpu,
+                        self.prefill_attn_paged_512_k,
+                        q_absorbed,
+                        k_cache,
+                        v_cache,
                         attn_latent,
                         block_table,
                         on,
+                        sequence_end as u32,
+                        o.seq_len_start as u32,
                         nq,
+                        1,
                         kv_lora,
-                        index_width,
                         bs,
-                        self.glm_sparse_attn_heads_per_cta,
+                        0,
                         self.effective_attn_scale(hd),
                         stream,
                     )?;
                 }
-                let sparse_attention_us =
-                    super::glm_index::profile_lap(&octx, stream, &mut profile)?;
-                if profile.is_some() {
-                    tracing::info!(
-                        "ATLAS_GLM_INDEX_PROFILE phase=attention layer={} rows={} seq_end={} selected={} sparse_attention_us={}",
-                        self.attn_layer_idx,
-                        on,
-                        sequence_end,
-                        index_width,
-                        sparse_attention_us,
-                    );
-                }
-            } else {
-                ensure!(
-                    self.prefill_attn_paged_512_k.0 != 0,
-                    "GLM paged prefill kernel inferspark_prefill_paged_512 is unavailable"
-                );
-                ops::prefill_attention_paged_512(
-                    ctx.gpu,
-                    self.prefill_attn_paged_512_k,
-                    q_absorbed,
-                    k_cache,
-                    v_cache,
-                    attn_latent,
-                    block_table,
-                    on,
-                    sequence_end as u32,
-                    o.seq_len_start as u32,
-                    nq,
-                    1,
-                    kv_lora,
-                    bs,
-                    0,
-                    self.effective_attn_scale(hd),
-                    stream,
-                )?;
             }
 
             // Convert the latent attention result back to each head's value
