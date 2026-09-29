@@ -469,10 +469,25 @@ impl BufferSizes {
         let (ffn_act_q8, ffn_act_a, ffn_act_scale) = if has_dense_ffn {
             let kmax = h.max(config.intermediate_size);
             let kpad = kmax.div_ceil(256) * 256;
+            // Hybrid MoE models (a few dense layers, e.g. GLM-5) size only what
+            // their dense prefill reads: the NVFP4 MMQ needs just its
+            // block_fp4_mmq form (144 B per 256 values), and the int8/FP4
+            // activation pair is read only by `ATLAS_FFN_MMQ` (Q4_K),
+            // `ATLAS_INT8_PREFILL` and `ATLAS_FP4_PREFILL`. On GLM-5 at 8K-row
+            // chunks this returns ~0.5 GB to the KV pool. Dense models keep
+            // the unconditional sizing.
+            let hybrid = config.num_experts > 0;
+            let env = |name| std::env::var_os(name).is_some();
+            let q4k = !hybrid || env("ATLAS_FFN_MMQ");
+            let requant = !hybrid || q4k || env("ATLAS_INT8_PREFILL") || env("ATLAS_FP4_PREFILL");
             (
-                m * kpad * 4 + (1 << 20), // q8_1_mmq: m*kpad*4 + 1MB (matches q8_1_scratch_bytes)
-                m * kmax,                 // int8 a_i8 [m,K] ≥ NVFP4 packed [m,K/2]
-                m * (kmax / 16) * 4,      // int8 a_scale [m,K/16]*4
+                if q4k {
+                    m * kpad * 4 + (1 << 20) // q8_1_mmq: m*kpad*4 + 1MB (matches q8_1_scratch_bytes)
+                } else {
+                    m * (kpad / 256) * 144 + (1 << 20) // block_fp4_mmq
+                },
+                if requant { m * kmax } else { 0 }, // int8 a_i8 [m,K] >= NVFP4 packed [m,K/2]
+                if requant { m * (kmax / 16) * 4 } else { 0 }, // int8 a_scale [m,K/16]*4
             )
         } else {
             (0, 0, 0)
