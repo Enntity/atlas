@@ -77,11 +77,12 @@ pub(in crate::layers::qwen3_attention) fn glm_chunk_pieces(
 }
 
 /// An `fp8_g128` owner's latents dequantized to BF16 in the arena scratch,
-/// addressed through an identity block table.
+/// addressed through an identity block table of `blocks` entries.
 #[derive(Clone, Copy)]
 pub(super) struct Bf16LatentView {
     pub(super) latents: DevicePtr,
     pub(super) identity_table: DevicePtr,
+    pub(super) blocks: usize,
 }
 
 impl Qwen3AttentionLayer {
@@ -192,6 +193,7 @@ impl Qwen3AttentionLayer {
         Ok(Some(Bf16LatentView {
             latents,
             identity_table,
+            blocks: capacity / 16,
         }))
     }
 }

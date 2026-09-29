@@ -316,15 +316,39 @@ impl Qwen3AttentionLayer {
                     block_size: bs,
                     scale: self.effective_attn_scale(hd),
                 };
+                let (physical_blocks, table_blocks, block_bytes) = match view {
+                    Some(v) => (v.blocks, v.blocks, 16 * 512 * 2),
+                    None => (
+                        kv_cache.num_blocks(),
+                        o.meta.max_blocks_per_seq as usize,
+                        kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
+                    ),
+                };
+                // SparkGLM-only: the out-of-tree NVIDIA sparse-MLA prefill,
+                // when loaded (`ATLAS_GLM_SPARSE_NATIVE=1`).
+                let native = cache_dtype == KvCacheDtype::Bf16
+                    && ops::try_glm_sparse_native(
+                        &octx,
+                        &sparse_args,
+                        o.seq_len_start,
+                        physical_blocks,
+                        table_blocks,
+                        block_bytes,
+                        // This caller is ordinary continued prefill. Repaired K3
+                        // verification has a separate multi-sequence attention path.
+                        false,
+                        stream,
+                    )?;
                 // Few-row owners (verify) split over the selected IDs; the MoE
                 // expert scratch is dead until this layer's FFN.
-                let accelerated = ops::try_glm_sparse_prefill_tc_split(
-                    ctx.gpu,
-                    &sparse_args,
-                    ctx.buffers.expert_gate_out(),
-                    ctx.buffers.sizes().expert_gate_out,
-                    stream,
-                )?;
+                let accelerated = native
+                    || ops::try_glm_sparse_prefill_tc_split(
+                        ctx.gpu,
+                        &sparse_args,
+                        ctx.buffers.expert_gate_out(),
+                        ctx.buffers.sizes().expert_gate_out,
+                        stream,
+                    )?;
                 if !accelerated {
                     ensure!(
                         cache_dtype == KvCacheDtype::Bf16,
