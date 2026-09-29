@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
@@ -319,23 +319,8 @@ impl TransformerModel {
         } else {
             DevicePtr::NULL
         };
-        // Owner-batched long-context verify stage (4 owners x 8 rows): ~13 MB,
-        // allocated before KV sizing so the pool accounts for it.
-        let glm_long_stage = if (has_mtp || crate::speculative::glm_repair_policy::dflash_enabled())
-            && config.model_type == "glm5_next"
-            && crate::layer::glm_long_owner::enabled()?
-        {
-            Some(crate::layer::glm_long_owner::GlmLongStage::alloc(
-                gpu.as_ref(),
-                crate::layer::glm_long_owner::RowBytes::new(
-                    config.hidden_size,
-                    config.hc_mult,
-                    config.vocab_size,
-                ),
-            )?)
-        } else {
-            None
-        };
+        let glm_long_stage =
+            super::impl_a1_spec_init::alloc_glm_long_stage(&config, has_mtp, gpu.as_ref())?;
         // Batched-verify WY pointer-table staging (fixed address for CUDA
         // graph stability; contents refreshed pre-graph every batched verify
         // step). One [h|Hi0..Hi14] x 32-entry slice per GDN layer — ~192 KB.
@@ -357,58 +342,16 @@ impl TransformerModel {
             DevicePtr::NULL
         };
 
-        // Prompt hidden capture buffer, [mtp_arena_context, hidden_size] BF16 —
-        // 335 MB at 32k/h=5120. Backs BOTH halves of the drafter-context
-        // feature (see `crate::model::drafter_context`); NULL here disables
-        // prefill AND carry, since the carry path reads this buffer.
-        //
-        // Three conditions, all necessary: MTP must be active, the feature must
-        // not be killed, and the head must be a precision the batched prefill
-        // can actually run at — an NVFP4/FP8 MTP head would allocate this and
-        // never write it.
-        // The repaired GLM long-context lane indexes a bounded 32K arena even
-        // when the native lane serves a larger context; the capture below and
-        // every stored capacity must quote that same arena. `arena_context`
-        // is the SSOT for the bound, so the private-cache quote
-        // (`PrivateStoragePlan`) cannot disagree with this allocation.
-        let mtp_arena_context = crate::speculative::glm_repair_policy::arena_context(
-            &config.model_type,
-            crate::speculative::glm_repair_policy::enabled()
-                && crate::speculative::glm_repair_policy::long_context_enabled(),
-            max_seq_len,
-        );
-        // A DFlash head never prefills from this buffer (its context comes
-        // from the multi-layer capture below), so it is not allocated.
-        let mtp_prefill_hidden = if has_mtp
-            && dflash_kgamma == 0
-            && mtp_quant.supports_drafter_prefill()
-            && crate::layers::mtp_drafter_prefill_enabled(&levers)
-        {
-            let bytes = mtp_arena_context
-                .checked_mul(config.hidden_size)
-                .and_then(|n| n.checked_mul(2))
-                .context("MTP drafter context capture reserve overflow")?;
-            tracing::info!(
-                "MTP drafter context: allocating {:.0} MB prompt-hidden capture \
-                 ({} x {} BF16)",
-                bytes as f64 / 1e6,
-                mtp_arena_context,
-                config.hidden_size,
-            );
-            gpu.alloc(bytes)?
-        } else {
-            if has_mtp
-                && !mtp_quant.supports_drafter_prefill()
-                && crate::layers::mtp_drafter_prefill_enabled(&levers)
-            {
-                tracing::info!(
-                    "MTP drafter context: INACTIVE — the batched drafter prefill \
-                     needs a BF16 MTP head (--mtp-quantization bf16); this head is \
-                     {mtp_quant:?}. No prompt-hidden capture allocated.",
-                );
-            }
-            DevicePtr::NULL
-        };
+        let (mtp_arena_context, mtp_prefill_hidden) =
+            super::impl_a1_spec_init::alloc_mtp_prefill_hidden(
+                &config,
+                max_seq_len,
+                has_mtp,
+                dflash_kgamma,
+                mtp_quant,
+                &levers,
+                gpu.as_ref(),
+            )?;
 
         // DFlash 5-layer hidden-state stack. Allocated only when a
         // BlockDiffusionDraftHead is the active proposer (`config.dflash_capture_layers`
