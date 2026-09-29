@@ -511,11 +511,12 @@ impl Model for TransformerModel {
         &self,
         prompt: &[u32],
         seq: &SequenceState,
+        chunk_start: usize,
         chunk_len: usize,
         owners: usize,
         rows: usize,
     ) -> bool {
-        self.glm_fused_chunk_supported(prompt, seq, chunk_len, owners, rows)
+        self.glm_fused_chunk_supported(prompt, seq, chunk_start, chunk_len, owners, rows)
     }
     fn prefill_chunk_with_glm_owner_rows(
         &self,

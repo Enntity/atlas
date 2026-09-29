@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Where `prefill_chunk_dispatch` splits a prompt's last chunk for the
-//! warm-turn tail checkpoint.
+//! warm-turn tail checkpoint. Shared by the dispatch and by the GLM fused
+//! chunk gate (`glm_fused_chunk::prefix`), whose verify owners ride the
+//! tail pass.
 
 use super::super::super::types::TransformerModel;
 

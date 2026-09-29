@@ -84,12 +84,10 @@ impl TransformerModel {
             "chunk_start({chunk_start}) + chunk_len({chunk_len}) > total({total})"
         );
 
-        // Tail-checkpoint split (see `tail_split`).
+        // Tail-checkpoint split (see `tail_split`). Verify owners riding this
+        // chunk ride the tail pass: the shape of an unsplit last fused chunk,
+        // after an ordinary pass and its prefill checkpoint.
         if let Some(cut) = self.prefill_tail_split(tokens, chunk_start, is_last_chunk) {
-            anyhow::ensure!(
-                passengers.is_none(),
-                "GLM fused chunk cannot take the tail-checkpoint split"
-            );
             self.prefill_chunk_dispatch(
                 tokens,
                 seq,
@@ -98,7 +96,15 @@ impl TransformerModel {
                 false,
                 stream,
             )?;
-            return self.prefill_chunk_dispatch(tokens, seq, cut, total - cut, true, stream);
+            return self.prefill_chunk_dispatch_with(
+                tokens,
+                seq,
+                cut,
+                total - cut,
+                true,
+                stream,
+                passengers,
+            );
         }
 
         // Guard: chunk_len must not exceed buffer arena capacity.
@@ -272,11 +278,16 @@ impl TransformerModel {
         // chunk's rows is refused upfront (`glm_fused_chunk_supported`).
         let passenger_run = match passengers.as_deref_mut() {
             Some(p) => {
+                let kv_floor = proc_range::layer_kv_write_floor(
+                    marconi_skip,
+                    seq.cached_prefix_tokens,
+                    effective_seq_len_start,
+                    proc_count,
+                    kv_write_start,
+                );
                 anyhow::ensure!(
-                    proc_start == chunk_start
-                        && proc_count == chunk_len
-                        && kv_write_start == 0
-                        && !marconi_skip,
+                    self.glm_fused_pass_ok(seq, chunk_start, chunk_len, proc_start, proc_count)
+                        && kv_floor == 0,
                     "GLM fused chunk needs the whole chunk computed"
                 );
                 let meta = super::super::glm_fused_chunk::ChunkMeta {

@@ -107,6 +107,15 @@ impl TransformerModel {
         }
     }
 
+    /// Whether any pass may plan a mid-chunk capture: the flag and the
+    /// snapshot pool are on, on a build whose SSM prefill writes the captured
+    /// h_state (`atlas_scale`; see [`Self::prepare_midchunk_capture`]).
+    pub(in crate::model) fn midchunk_capture_possible(&self) -> bool {
+        spark_runtime::ssm_tail_midchunk_enabled()
+            && self.ssm_snapshots.is_enabled()
+            && cfg!(atlas_scale)
+    }
+
     /// Decide + set up an in-pass mid-chunk tail capture for the prefill pass
     /// over local token range `[proc_start, proc_start + proc_count)`.
     ///
@@ -124,7 +133,7 @@ impl TransformerModel {
         proc_count: usize,
         stream: u64,
     ) -> Option<MidCapturePlan> {
-        if !spark_runtime::ssm_tail_midchunk_enabled() || !self.ssm_snapshots.is_enabled() {
+        if !self.midchunk_capture_possible() {
             return None;
         }
         // ONLY `atlas_scale` builds can actually fill this plan's `h_dsts`.
@@ -149,10 +158,7 @@ impl TransformerModel {
         // deepest valid anchor, which is sound. Verified equivalent: with the
         // capture off, output is bit-identical to a cold run. Lift this the
         // moment the NVIDIA arm captures h_state — the plan is correct, it is
-        // the writer that is missing.
-        if !cfg!(atlas_scale) {
-            return None;
-        }
+        // the writer that is missing. (Checked in `midchunk_capture_possible`.)
         // Reuse gate: capture costs a per-prefill kernel split + D2D copy and
         // is only ever consumable by a LATER request of the SAME session (the
         // snapshot lookup is session-gated). A session seen for the FIRST

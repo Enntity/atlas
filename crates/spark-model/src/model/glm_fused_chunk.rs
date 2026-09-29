@@ -32,6 +32,8 @@ use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
+pub(in crate::model) mod prefix;
+
 pub(super) const EP_CMD_GLM_FUSED_CHUNK: u32 = 0xFFFF_FFEB;
 
 /// Verify owners riding one prefill chunk.
@@ -80,13 +82,16 @@ fn owner_meta_bytes(rows: usize, max_blocks: usize) -> usize {
 }
 
 impl TransformerModel {
-    /// Whether a chunk of `chunk_len` rows of `prompt` may carry `owners`
-    /// owners of `rows` rows each. Decided from the configuration and the
-    /// request alone, so both ranks agree.
+    /// Whether the chunk `[chunk_start, chunk_start + chunk_len)` of `prompt`
+    /// may carry `owners` owners of `rows` rows each. Decided from the
+    /// configuration, the request and chunk 0's prefix decision, so both
+    /// ranks agree; refuses every prefill phase that would change the rows
+    /// of the pass the owners ride (`prefix`).
     pub(super) fn glm_fused_chunk_supported(
         &self,
         prompt: &[u32],
         seq: &SequenceState,
+        chunk_start: usize,
         chunk_len: usize,
         owners: usize,
         rows: usize,
@@ -95,7 +100,8 @@ impl TransformerModel {
             && self.can_batch_glm_long_verify_impl(owners, rows)
             && chunk_len >= 2
             && chunk_len + owners * rows <= self.buffers.max_batch_tokens()
-            && !self.prefix_cache.is_active()
+            && self.glm_fused_prefix_ok(prompt, seq, chunk_start, chunk_len)
+            && !self.midchunk_capture_possible()
             && seq.collect_prompt_logprobs.is_none()
             && !self.tokens_have_vision_pad(prompt)
     }
@@ -338,7 +344,7 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<(DevicePtr, Vec<u32>)> {
         ensure!(
-            self.glm_fused_chunk_supported(prompt, seq, chunk_len, owners.len(), rows)
+            self.glm_fused_chunk_supported(prompt, seq, chunk_start, chunk_len, owners.len(), rows)
                 && tokens.len() == owners.len() * rows
                 && chunk_start + chunk_len <= prompt.len(),
             "GLM fused chunk refused: {chunk_len} rows + {} owners x {rows} rows",
@@ -384,7 +390,7 @@ impl TransformerModel {
         owners: &mut [&mut SequenceState],
     ) -> Result<(DevicePtr, Vec<u32>)> {
         ensure!(
-            self.glm_fused_chunk_supported(prompt, seq, chunk_len, owners.len(), rows),
+            self.glm_fused_chunk_supported(prompt, seq, chunk_start, chunk_len, owners.len(), rows),
             "GLM fused chunk is not available"
         );
         let slots: Vec<u32> = owners.iter().map(|s| s.slot_idx as u32).collect();

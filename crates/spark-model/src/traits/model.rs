@@ -759,12 +759,14 @@ pub trait Model: Send + Sync {
         true
     }
 
-    /// Whether a prefill chunk of `chunk_len` rows of `prompt` may carry
-    /// `owners` DFlash verify owners of `rows` rows each after its own rows.
+    /// Whether the prefill chunk `[chunk_start, chunk_start + chunk_len)` of
+    /// `prompt` may carry `owners` DFlash verify owners of `rows` rows each
+    /// after its own rows.
     fn can_fuse_glm_prefill_verify(
         &self,
         _prompt: &[u32],
         _seq: &SequenceState,
+        _chunk_start: usize,
         _chunk_len: usize,
         _owners: usize,
         _rows: usize,

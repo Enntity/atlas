@@ -71,7 +71,14 @@ pub(super) fn try_fused_chunk(
     if !is_last {
         chunk_len -= chunk_len % 64;
     }
-    if !model.can_fuse_glm_prefill_verify(&p.prompt_tokens, &p.seq, chunk_len, group.len(), rows) {
+    if !model.can_fuse_glm_prefill_verify(
+        &p.prompt_tokens,
+        &p.seq,
+        p.chunk_offset,
+        chunk_len,
+        group.len(),
+        rows,
+    ) {
         return false;
     }
     for &i in &group {

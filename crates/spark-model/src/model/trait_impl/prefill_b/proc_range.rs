@@ -186,3 +186,46 @@ pub(in crate::model) fn layer_kv_write_floor(
         kv_write_start
     }
 }
+
+#[cfg(test)]
+mod floor_tests {
+    use super::layer_kv_write_floor;
+    use crate::model::glm_fused_chunk::prefix::ride_is_cold;
+
+    #[test]
+    fn the_floor_covers_the_cached_rows_of_a_warm_pass() {
+        assert_eq!(layer_kv_write_floor(false, 0, 8_192, 4_096, 0), 0);
+        assert_eq!(
+            layer_kv_write_floor(true, 44_992, 44_928, 1_072, 44_928),
+            64
+        );
+        assert_eq!(layer_kv_write_floor(true, 44_992, 40_960, 64, 44_928), 64);
+        assert_eq!(layer_kv_write_floor(true, 44_992, 45_888, 112, 44_928), 0);
+    }
+
+    /// A pass the fused gate admits (chunk 1+, inheriting chunk 0's decision
+    /// as `prefix_lookup` hands it on) computes every row and takes no floor,
+    /// which the passenger layer path relies on.
+    #[test]
+    fn an_admitted_pass_is_computed_whole_with_no_floor() {
+        let points = [0usize, 64, 4_032, 4_096, 4_160, 8_192, 12_288];
+        for start in [64usize, 4_096, 8_192] {
+            for len in [2usize, 64, 4_096] {
+                for &skip_to in &points {
+                    for &cached in points.iter().filter(|&&c| c >= skip_to) {
+                        if !ride_is_cold(start, start, skip_to, cached) {
+                            continue;
+                        }
+                        let marconi_skip = skip_to > 0;
+                        let kv_write_start = if marconi_skip { skip_to } else { 0 };
+                        // `prefill_b_proc_range` skips rows only past the start.
+                        assert!(!(marconi_skip && kv_write_start > start));
+                        let floor =
+                            layer_kv_write_floor(marconi_skip, cached, start, len, kv_write_start);
+                        assert_eq!(floor, 0, "start {start} skip {skip_to} cached {cached}");
+                    }
+                }
+            }
+        }
+    }
+}
