@@ -26,6 +26,8 @@ mod hc_prefill;
 pub(crate) mod helpers;
 mod init;
 mod init_arch_gates;
+mod init_glm;
+mod init_independent;
 mod init_kernel_dispatch;
 mod kernel_requirements;
 mod op_dump;
