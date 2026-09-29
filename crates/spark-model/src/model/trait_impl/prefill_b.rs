@@ -33,6 +33,7 @@ mod embed_chunk;
 mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;
+mod inpass_checkpoint;
 mod midchunk_capture;
 mod prefix_lookup;
 mod proc_range;
@@ -84,8 +85,14 @@ impl TransformerModel {
             "chunk_start({chunk_start}) + chunk_len({chunk_len}) > total({total})"
         );
 
-        // Tail-checkpoint split (see `tail_split`).
-        if let Some(cut) = self.prefill_tail_split(tokens, chunk_start, is_last_chunk) {
+        // Tail checkpoint: the split (see `tail_split`), or its in-pass
+        // capture (see `inpass_checkpoint`).
+        let tail = self.prefill_tail_checkpoint(tokens, chunk_start, is_last_chunk)?;
+        let inpass_cut = match tail {
+            Some(inpass_checkpoint::TailCheckpoint::InPass(cut)) => Some(cut),
+            _ => None,
+        };
+        if let Some(inpass_checkpoint::TailCheckpoint::Split(cut)) = tail {
             anyhow::ensure!(
                 passengers.is_none(),
                 "GLM fused chunk cannot take the tail-checkpoint split"
@@ -293,21 +300,26 @@ impl TransformerModel {
         // ── Mid-chunk tail SSM capture (opt-in): plan BEFORE the forward
         // pass so SSM layers split their h/conv kernels at `tb` in-pass.
         // `None` (flag off or pass doesn't span `tb`) => no split. ──
-        let midcap_plan = self.prepare_midchunk_capture(
-            tokens,
-            seq,
-            &mut kv_cache,
-            proc_start,
-            proc_count,
-            stream,
-        );
+        let midcap_plan = match inpass_cut {
+            Some(cut) => {
+                self.prepare_inpass_checkpoint(seq, &mut kv_cache, cut, proc_start, proc_count)
+            }
+            None => self.prepare_midchunk_capture(
+                tokens,
+                seq,
+                &mut kv_cache,
+                proc_start,
+                proc_count,
+                stream,
+            ),
+        };
         anyhow::ensure!(
             midcap_plan.is_none() || passenger_run.is_none(),
             "GLM fused chunk cannot split the SSM recurrence mid-chunk"
         );
 
         // ── Phase 4: forward through all layers ──
-        self.prefill_b_forward_layers(
+        let forward = self.prefill_b_forward_layers(
             seq,
             &mut kv_cache,
             chunk_start,
@@ -325,7 +337,11 @@ impl TransformerModel {
             midcap_plan.as_ref(),
             passengers.as_deref_mut().zip(passenger_run.as_ref()),
             stream,
-        )?;
+        );
+        if let (Err(_), Some(plan)) = (&forward, midcap_plan.as_ref().filter(|p| p.checkpoint)) {
+            self.finish_inpass_checkpoint(tokens, seq, &mut kv_cache, plan, false)?;
+        }
+        forward?;
         let t_fwd = tp.elapsed();
         // Measure the forward's true GPU execution: the launches are async, so
         // `t_fwd` is submission time only. A profile-only sync here isolates
@@ -364,8 +380,13 @@ impl TransformerModel {
 
         // Register the reserved slot as the session tail once the full pass has
         // captured the @tb state into it (no-op when no capture was planned).
-        if let Some(plan) = midcap_plan.as_ref() {
-            self.finalize_midchunk_capture(tokens, seq, plan);
+        // An in-pass checkpoint registers as the split's checkpoint would.
+        match midcap_plan.as_ref() {
+            Some(plan) if plan.checkpoint => {
+                self.finish_inpass_checkpoint(tokens, seq, &mut kv_cache, plan, true)?
+            }
+            Some(plan) => self.finalize_midchunk_capture(tokens, seq, plan),
+            None => {}
         }
 
         // ── Phase 5: update sequence state incrementally ──

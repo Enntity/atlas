@@ -235,6 +235,14 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// True when this recurrent layer's prefill honours an in-pass checkpoint
+    /// (`ForwardContext::midchunk_capture` as the GLM KDA layer reads it):
+    /// its recurrence splits at `cap_local` with the result unchanged and
+    /// copies its state@cut into the per-SSM-ordinal destinations.
+    fn captures_ssm_state_in_pass(&self) -> bool {
+        false
+    }
+
     /// Longest visible context at which this layer can serve a BATCHED
     /// (K-token) verify, if it is bounded at all.
     ///

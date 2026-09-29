@@ -199,7 +199,7 @@ impl TransformerModel {
         // of the contracted `hidden`, gathered below.
         let sp = self.glm_prefill_sp_rows(
             proc_count,
-            passengers.is_some() || use_decode_path || midcap.is_some(),
+            passengers.is_some() || use_decode_path || midcap.is_some_and(|p| !p.checkpoint),
             &ctx,
         );
         let sp_scope = sp.map(crate::layers::glm_sp::enter);
