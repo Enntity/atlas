@@ -453,16 +453,22 @@ pub struct PagedKvCache {
     tail_slots: Option<tail_slots::TailSlots>,
     /// Per-block refcount event history (`ATLAS_KV_TRACE=1`; inert otherwise).
     trace: block_trace::BlockTrace,
+    /// Token-sharded latent storage (`ATLAS_GLM_KV_SHARD=1`); `None` stores
+    /// every block's latents locally.
+    latent_shard: Option<LatentShard>,
 }
 
 mod block_trace;
 mod catalog;
+mod debug_impl;
+mod latent_shard;
 mod paged_impl;
 mod release;
 mod sparse_index;
 mod sparse_index_impl;
 mod tail_slots;
 mod zero_impl;
+pub use latent_shard::{LatentShard, LatentShardSpec, LatentViewPlan};
 pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
 pub use tail_slots::{NO_TAIL, TailSlotPlan};
 #[cfg(test)]

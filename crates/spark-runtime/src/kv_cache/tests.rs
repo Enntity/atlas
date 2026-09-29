@@ -8,6 +8,7 @@ use super::*;
 use crate::gpu::GpuBackend;
 use crate::gpu::mock::MockGpuBackend;
 
+mod latent_shard;
 mod sparse_index;
 mod zero_alias;
 
