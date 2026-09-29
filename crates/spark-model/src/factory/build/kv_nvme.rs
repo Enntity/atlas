@@ -84,6 +84,19 @@ pub(super) fn attach(
         std::env::var(DIR_VAR).ok().as_deref(),
         std::env::var(GB_VAR).ok().as_deref(),
     )?;
+    let ssm_tier = std::env::var_os("ATLAS_SSM_TIER").is_some();
+    attach_with(cfg, ssm_tier, kv_cache, prefix_cache, gpu, comm)
+}
+
+/// Env-free body of [`attach`].
+fn attach_with(
+    cfg: Option<NvmeKvConfig>,
+    ssm_tier: bool,
+    kv_cache: &mut PagedKvCache,
+    prefix_cache: &dyn PrefixCache,
+    gpu: &dyn GpuBackend,
+    comm: Option<&dyn spark_comm::CommBackend>,
+) -> Result<()> {
     let record = kv_cache.nvme_record_bytes();
     let slots = match &cfg {
         Some(c) => max_slots(c.budget_bytes, record)?,
@@ -93,7 +106,6 @@ pub(super) fn attach(
     if prefix_cache.is_active()
         && let Some(comm) = comm.filter(|c| c.world_size() > 1)
     {
-        let ssm_tier = std::env::var_os("ATLAS_SSM_TIER").is_some();
         let fp = rank_fingerprint(slots, record, ssm_tier);
         let all = super::glm::gather_u64(comm, gpu, fp)?;
         ensure!(
@@ -117,6 +129,20 @@ pub(super) fn attach(
         "atlas-kv-prefix.{}.r{rank}.swap",
         std::process::id()
     ));
+    // Records hold prompt-derived KV: owner-only, and never through a
+    // pre-planted file or symlink (remove_file drops a link, not its target;
+    // create_new refuses anything that reappears).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::remove_file(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
+    }
     let store = atlas_tier::DirectSwapFile::create(&path, record)?;
     #[cfg(unix)]
     std::fs::remove_file(&path)?; // anonymous from here on: freed at exit
@@ -176,5 +202,71 @@ mod tests {
             rank_fingerprint(0, 4096, false),
             rank_fingerprint(0, 4096, true)
         );
+    }
+
+    fn glm_kv(gpu: &spark_runtime::gpu::mock::MockGpuBackend) -> PagedKvCache {
+        use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, SparseIndexCacheConfig};
+        let cfg = KvCacheConfig {
+            block_size: 16,
+            num_kv_heads: 1,
+            head_dim: 512,
+            num_layers: 2,
+            dtype: KvCacheDtype::Fp8G128,
+            layer_dtypes: vec![],
+            layer_dims: vec![],
+            cache_blocks_per_seq: None,
+        };
+        let mut kv = PagedKvCache::new_with_v_alias(cfg, 4, gpu, true).unwrap();
+        kv.attach_sparse_index(SparseIndexCacheConfig::bf16(4, 128), gpu)
+            .unwrap();
+        kv
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("atlas-kv-nvme-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn attach_enables_tier_and_leaves_no_file_behind() {
+        use spark_runtime::prefix_cache::NvmePrefixTier;
+        let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+        let mut kv = glm_kv(&gpu);
+        let tree = spark_runtime::radix_tree::RadixTree::new();
+        let dir = scratch_dir("on");
+        let cfg = NvmeKvConfig {
+            dir: dir.clone(),
+            budget_bytes: 1 << 30,
+        };
+        attach_with(Some(cfg), false, &mut kv, &tree, &gpu, None).unwrap();
+        assert!(kv.nvme_attached());
+        assert!(tree.is_enabled());
+        assert_eq!(
+            tree.nvme_stats().max_slots as usize,
+            (1usize << 30) / kv.nvme_record_bytes()
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "record file unlinked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn off_is_a_no_op_and_prefix_caching_is_required() {
+        let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+        let mut kv = glm_kv(&gpu);
+        let tree = spark_runtime::radix_tree::RadixTree::new();
+        attach_with(None, true, &mut kv, &tree, &gpu, None).unwrap();
+        assert!(!kv.nvme_attached());
+        let none = spark_runtime::prefix_cache::NoPrefixCaching;
+        let cfg = NvmeKvConfig {
+            dir: scratch_dir("nopc"),
+            budget_bytes: 1 << 30,
+        };
+        assert!(attach_with(Some(cfg), false, &mut kv, &none, &gpu, None).is_err());
     }
 }
