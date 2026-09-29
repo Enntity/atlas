@@ -289,19 +289,23 @@ impl BlockDiffusionDraftHead {
         // py:386–391  `all_kv = all_kv_flat.view(n,L,2,nkv,hd)
         //                          .permute(2,1,0,3,4).contiguous()`
         //              `all_k = all_kv[0]`  → [L, n, nkv, hd] contiguous.
-        // Atlas: copy_d2d row-by-row to build the same [L, n, kv_dim] layout
-        // in mlp_intermediate (borrowed; not used until step 3j of the
-        // γ-block layer loop). Capacity: n_attn × inter × 2 >> L×n×kv_dim×2.
+        // Atlas: one pitched async copy per layer builds the same
+        // [L, n, kv_dim] layout in mlp_intermediate (borrowed; not used until
+        // step 3j of the γ-block layer loop). Capacity: n_attn × inter × 2 >>
+        // L×n×kv_dim×2. It reads the GEMM output from `scratch` — the lane
+        // scratch step 3 wrote — and never syncs the stream (a row-by-row
+        // blocking copy_d2d cost ~20k syncs after a 16K prefill).
         let all_k_stage = scratch.mlp_intermediate;
         for l in 0..l_total {
-            for row in 0..new_ctx_count {
-                let k_src = fused_src.offset(row * row_stride + l * 2 * kv_slab_bytes);
-                let k_dst = all_k_stage.offset((l * new_ctx_count + row) * kv_slab_bytes);
-                // #58: stream-ordered async — downstream k_norm/rope/
-                // reshape_and_cache run on this same stream, so the drain
-                // the sync copy_d2d paid bought nothing.
-                gpu.copy_d2d_async(k_src, k_dst, kv_slab_bytes, stream)?;
-            }
+            gpu.copy_d2d_2d_async(
+                fused_src.offset(l * 2 * kv_slab_bytes),
+                row_stride,
+                all_k_stage.offset(l * new_ctx_count * kv_slab_bytes),
+                kv_slab_bytes,
+                kv_slab_bytes,
+                new_ctx_count,
+                stream,
+            )?;
         }
 
         // ── Step 6: per-layer k_norm ──────────────────────────────────
@@ -365,15 +369,17 @@ impl BlockDiffusionDraftHead {
         for l in 0..l_total {
             let k_l = all_k_stage.offset(l * new_ctx_count * kv_slab_bytes);
 
-            // Compact V_l from the fused GEMM output.
-            for row in 0..new_ctx_count {
-                let v_src =
-                    fused_src.offset(row * row_stride + l * 2 * kv_slab_bytes + kv_slab_bytes);
-                let v_dst = v_stage.offset(row * kv_slab_bytes);
-                // #58: stream-ordered async — reshape_and_cache consumes
-                // v_stage on this same stream.
-                gpu.copy_d2d_async(v_src, v_dst, kv_slab_bytes, stream)?;
-            }
+            // Compact V_l from the fused GEMM output (same pitched copy).
+            gpu.copy_d2d_2d_async(
+                fused_src
+                    .offset(l * 2 * kv_slab_bytes + kv_slab_bytes),
+                row_stride,
+                v_stage,
+                kv_slab_bytes,
+                kv_slab_bytes,
+                new_ctx_count,
+                stream,
+            )?;
 
             if dump_opt.is_some() && l == 0 {
                 dump("layer0_v", v_stage, new_ctx_count * kv_slab_bytes)?;
