@@ -689,7 +689,7 @@ pub struct BlockDiffusionDraftHead {
     /// rotary_dim. Drafter uses full-rotation (rotary_dim = head_dim = 128).
     pub rotary_dim: usize,
 
-    /// RMSNorm epsilon (drafter inherits Qwen3 default 1e-6).
+    /// RMSNorm epsilon from the drafter config (Qwen3 default 1e-6).
     pub rms_norm_eps: f32,
 
     /// Max number of past target positions injected into the drafter's K/V
