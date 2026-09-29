@@ -54,19 +54,10 @@ impl BlockDiffusionDraftHead {
             .as_ref()
             .map(|c| c.mask_token_id)
             .unwrap_or(0);
-        let query_causal = weights
-            .config
-            .dflash_config
-            .as_ref()
-            .and_then(|c| c.causal)
-            .unwrap_or(false);
-        let window_size = window_size.or_else(|| {
-            weights
-                .config
-                .dflash_config
-                .as_ref()
-                .and_then(|c| c.swa_window_size)
-        });
+        // HF `is_causal` / sliding-window keys as well as `dflash_config`
+        // (GLM-5.3's DFlash2 declares its 2048 window only through them).
+        let query_causal = weights.config.query_causal();
+        let window_size = window_size.or_else(|| weights.config.sliding_window());
         // Resolved early: the drafter paged-KV pool must cover every ctx
         // slot the accumulator can retain. The accumulator cap follows
         // ctx_window — NOT the SWA window_size — because the paged-attention
@@ -102,7 +93,7 @@ impl BlockDiffusionDraftHead {
         let num_kv_heads = weights.config.num_key_value_heads;
         let head_dim = weights.config.head_dim;
         let vocab_size = target_vocab_size.min(weights.config.vocab_size);
-        let gamma_val = gamma.unwrap_or(weights.config.block_size);
+        let gamma_val = gamma.unwrap_or(weights.config.block_size());
 
         // Allocate the drafter's paged FP8 KV cache. One multi-layer cache,
         // sized for `max_seq_len + γ + 1` positions (prompt + γ drafts +
@@ -917,7 +908,7 @@ impl BlockDiffusionDraftHead {
             yarn_inv_freq,
             rope_theta,
             rotary_dim,
-            rms_norm_eps: 1e-6,
+            rms_norm_eps: weights.config.rms_norm_eps,
             ctx_window,
             // Phase F: per-subgraph graph state — empty until the first
             // capture pass lands. Layout: [pre_0, post_0, ..., tail].
