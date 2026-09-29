@@ -130,7 +130,7 @@ pub(super) fn step_verify_dflash_batched(
         let verified: Vec<u32> = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
             dflash_verify_raw_argmax,
             sched.levers.dflash_masked_verify,
-            model.is_lightning_dspark_product(),
+            model,
             a,
         ) {
             raw.to_vec()

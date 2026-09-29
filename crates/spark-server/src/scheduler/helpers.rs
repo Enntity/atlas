@@ -31,13 +31,34 @@ pub fn dflash_verify_uses_raw_argmax(
 /// branch so the emitted stream follows the request's sampling parameters.
 /// Verify positions are greedy argmax by design (`PositionKind::Verify`),
 /// so a nonzero request temperature does not itself disqualify the raw
-/// path — only transforms that can move the argmax do.
+/// path — only transforms that can move the argmax do. A model whose verify
+/// head writes only argmax ids (`verify_logits_argmax_only`) always takes
+/// the raw path: its logits buffer is partly stale.
 pub fn dflash_seq_uses_raw_argmax(
     raw_requested: bool,
     masked_requested: bool,
-    lightning_product: bool,
+    model: &dyn spark_model::traits::Model,
     a: &crate::scheduler::types::ActiveSeq,
 ) -> bool {
+    dflash_seq_raw_argmax_policy(
+        raw_requested,
+        masked_requested,
+        model.is_lightning_dspark_product(),
+        model.verify_logits_argmax_only(),
+        a,
+    )
+}
+
+fn dflash_seq_raw_argmax_policy(
+    raw_requested: bool,
+    masked_requested: bool,
+    lightning_product: bool,
+    argmax_only_head: bool,
+    a: &crate::scheduler::types::ActiveSeq,
+) -> bool {
+    if argmax_only_head {
+        return true;
+    }
     dflash_verify_uses_raw_argmax(raw_requested, masked_requested, lightning_product)
         && a.grammar_state.is_none()
         && !a.require_tool_call
@@ -71,27 +92,40 @@ mod dflash_verify_policy_tests {
 
     #[test]
     fn per_sequence_gate_stays_raw_only_for_neutral_greedy() {
-        use super::dflash_seq_uses_raw_argmax;
+        use super::dflash_seq_raw_argmax_policy as gate;
         let (mut a, _rx) = crate::scheduler::test_support::test_seq(vec![1, 2, 3], 10, None, 32);
         // Neutral penalties + no grammar + no tool-call EOS suppression:
         // the verify pick is provably the raw argmax — shortcut stays on.
-        assert!(dflash_seq_uses_raw_argmax(true, false, false, &a));
+        assert!(gate(true, false, false, false, &a));
         // The non-thinking preset ships presence_penalty=1.5 — a reduce-only
         // penalty that CAN flip the argmax against already-emitted tokens.
         a.presence_penalty = 1.5;
-        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
+        assert!(!gate(true, false, false, false, &a));
         a.presence_penalty = 0.0;
         a.repetition_penalty = 1.05;
-        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
+        assert!(!gate(true, false, false, false, &a));
         a.repetition_penalty = 1.0;
         a.dry_multiplier = 0.4;
-        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
+        assert!(!gate(true, false, false, false, &a));
         a.dry_multiplier = 0.0;
         a.require_tool_call = true;
-        assert!(!dflash_seq_uses_raw_argmax(true, false, false, &a));
+        assert!(!gate(true, false, false, false, &a));
         // Process-wide flag still dominates: raw off stays off per-seq.
         a.require_tool_call = false;
-        assert!(!dflash_seq_uses_raw_argmax(false, false, false, &a));
+        assert!(!gate(false, false, false, false, &a));
+    }
+
+    #[test]
+    fn argmax_only_verify_head_always_takes_the_raw_path() {
+        use super::dflash_seq_raw_argmax_policy as gate;
+        let (mut a, _rx) = crate::scheduler::test_support::test_seq(vec![1, 2, 3], 10, None, 32);
+        // A head that leaves the logits buffer partly stale (GLM's TP2 vocab
+        // split) cannot feed the pipeline, whatever the request asks for.
+        a.presence_penalty = 1.5;
+        a.require_tool_call = true;
+        assert!(gate(true, false, false, true, &a));
+        assert!(gate(false, true, false, true, &a));
+        assert!(!gate(true, false, false, false, &a));
     }
 }
 

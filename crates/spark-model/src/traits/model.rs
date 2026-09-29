@@ -140,6 +140,13 @@ pub trait Model: Send + Sync {
         self.lightning_dspark_product_policy().is_some()
     }
 
+    /// The speculative verify head writes only argmax ids, not the full
+    /// logits buffer (GLM's TP2 vocab-split head), so a verify pick cannot
+    /// go through the logits pipeline. Default: full logits.
+    fn verify_logits_argmax_only(&self) -> bool {
+        false
+    }
+
     /// Run beam search to completion for each request, returning each one's
     /// winning hypothesis token ids (EOS-terminated). Called from the prefill
     /// path for `num_beams > 1` requests, bypassing the token-by-token decode

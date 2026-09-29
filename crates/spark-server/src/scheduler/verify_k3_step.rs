@@ -185,7 +185,7 @@ pub fn step_verify_k3(
     let use_raw = crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
-        model.is_lightning_dspark_product(),
+        model,
         a,
     );
     let (v0, v1, v2) = if use_raw {

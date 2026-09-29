@@ -80,21 +80,14 @@ pub(crate) fn prepare_shard_mxfp8(
 }
 
 impl TransformerModel {
-    /// Project `normed` [rows, H] and write global argmax IDs to `out` [rows].
-    /// Rows whose bit is set in `ban_rows` never pick one of `ban.ids`.
-    /// Returns `Ok(false)` without launching when the split does not apply.
-    pub(super) fn glm_split_head_argmax(
-        &self,
-        normed: DevicePtr,
-        rows: usize,
-        out: DevicePtr,
-        ban: (u64, &EosBan),
-        stream: u64,
-    ) -> Result<bool> {
+    /// Why the split head would not serve a verify of `rows` rows, if it
+    /// would not. Every term is identical on both ranks, so both decline
+    /// together.
+    fn glm_split_head_decline(&self, rows: usize) -> Option<&'static str> {
         let Some(comm) = self.comm.as_ref() else {
-            return Ok(false);
+            return Some("no_comm");
         };
-        let decline = [
+        [
             (!enabled(), "disabled"),
             (self.config.model_type != "glm5_next", "model"),
             (comm.world_size() != 2, "world"),
@@ -107,8 +100,27 @@ impl TransformerModel {
             (rows == 0 || rows * 16 > PAIRS_BYTES, "rows"),
         ]
         .into_iter()
-        .find_map(|(hit, why)| hit.then_some(why));
-        if let Some(why) = decline {
+        .find_map(|(hit, why)| hit.then_some(why))
+    }
+
+    /// The split head serves GLM verifies, which then leave half of the
+    /// logits buffer stale: verify picks must stay on the raw argmax.
+    pub(crate) fn glm_verify_logits_argmax_only(&self) -> bool {
+        self.glm_split_head_decline(1).is_none()
+    }
+
+    /// Project `normed` [rows, H] and write global argmax IDs to `out` [rows].
+    /// Rows whose bit is set in `ban_rows` never pick one of `ban.ids`.
+    /// Returns `Ok(false)` without launching when the split does not apply.
+    pub(super) fn glm_split_head_argmax(
+        &self,
+        normed: DevicePtr,
+        rows: usize,
+        out: DevicePtr,
+        ban: (u64, &EosBan),
+        stream: u64,
+    ) -> Result<bool> {
+        if let Some(why) = self.glm_split_head_decline(rows) {
             static LOGGED: std::sync::Once = std::sync::Once::new();
             LOGGED.call_once(|| {
                 tracing::warn!(
@@ -118,6 +130,9 @@ impl TransformerModel {
             });
             return Ok(false);
         }
+        let Some(comm) = self.comm.as_ref() else {
+            return Ok(false);
+        };
         static KERNELS: OnceLock<(KernelHandle, KernelHandle)> = OnceLock::new();
         let (value_k, merge_k) = match KERNELS.get() {
             Some(k) => *k,

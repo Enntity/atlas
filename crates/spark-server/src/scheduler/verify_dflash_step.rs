@@ -155,7 +155,7 @@ pub(super) fn verify_dflash_tail(
     let verified = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
         dflash_verify_raw_argmax,
         sched.levers.dflash_masked_verify,
-        model.is_lightning_dspark_product(),
+        model,
         a,
     ) {
         verified_argmax
