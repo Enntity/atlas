@@ -430,7 +430,12 @@ impl BlockDiffusionDraftHead {
                          (cache slots not ready or staging skipped)"
                     )
                 })?;
-                let cap = self.draft_cap(num_drafts);
+                // Plus the optional tighter cap for owner-batched steps.
+                let cap = super::batch_plan::batched_draft_cap(
+                    self.draft_cap(num_drafts),
+                    super::batch_plan::multi_owner_draft_cap(),
+                    n,
+                );
                 for (i, tokens) in out.iter_mut().enumerate() {
                     tokens.truncate(cap);
                     let dstate = states[i]
