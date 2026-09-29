@@ -34,6 +34,8 @@ metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 gpu-examples = []
 
 [dependencies]
+# SparkGLM-only: dlopen of the out-of-tree FlashKDA and native sparse-MLA bridges.
+libloading = "0.8"
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
 atlas-tier = { workspace = true }
