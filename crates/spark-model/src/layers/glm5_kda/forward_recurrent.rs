@@ -69,17 +69,38 @@ impl Glm5KdaLayer {
             (3 * p) as u32,
             stream,
         )?;
-        self.run_recurrent(
-            convolved,
-            g1,
-            beta,
-            state.h_state,
-            core_out,
-            m,
-            decode,
-            ctx,
-            stream,
-        )
+        if let Some(flash) = self
+            .flash_prefill
+            .as_ref()
+            .filter(|_| flash_prefill::eligible(tokens, decode, ctx.graph_capture))
+        {
+            // Convolution has finished reading packed. Its storage and the
+            // idle expert buffers can now be borrowed on this same stream.
+            flash.forward(
+                convolved,
+                g1,
+                beta,
+                self.weights.a_log.weight,
+                self.weights.dt_bias.weight,
+                state.h_state,
+                core_out,
+                tokens,
+                ctx,
+                stream,
+            )
+        } else {
+            self.run_recurrent(
+                convolved,
+                g1,
+                beta,
+                state.h_state,
+                core_out,
+                m,
+                decode,
+                ctx,
+                stream,
+            )
+        }
     }
 
     /// Fused prefill chunk + verify owners: pack every row once, advance
