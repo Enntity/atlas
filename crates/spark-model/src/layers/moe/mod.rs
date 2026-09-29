@@ -181,6 +181,7 @@ pub(crate) use shared_fp8_cache::validate_shared_fp8_cache_factory_reserve;
 pub use shared_fp8_cache::{validate_shared_fp8_cache_graphs, validate_shared_fp8_cache_profile};
 pub(crate) use shared_fp8_origin::load_glm_shared_fp8_weight;
 mod init;
+mod init_optional;
 mod m5_projection_oracle;
 mod m5_projections;
 mod mmq_layout;
