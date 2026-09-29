@@ -10,6 +10,11 @@ pub fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
     f32::from_bits(((lo as u32) | ((hi as u32) << 8)) << 16)
 }
 
+mod dflash_seq_policy;
+mod watchdog_floor;
+use dflash_seq_policy::dflash_seq_raw_argmax_policy;
+pub use watchdog_floor::watchdog_floor_reached;
+
 /// Whether a verify path may bypass the canonical logits pipeline.
 /// Official Lightning DSpark is always masked: raw argmax can select forbidden
 /// structural tokens such as `</think>` on plain completions, violating AR
@@ -49,30 +54,6 @@ pub fn dflash_seq_uses_raw_argmax(
     )
 }
 
-fn dflash_seq_raw_argmax_policy(
-    raw_requested: bool,
-    masked_requested: bool,
-    lightning_product: bool,
-    argmax_only_head: bool,
-    a: &crate::scheduler::types::ActiveSeq,
-) -> bool {
-    if argmax_only_head {
-        return true;
-    }
-    dflash_verify_uses_raw_argmax(raw_requested, masked_requested, lightning_product)
-        && a.grammar_state.is_none()
-        && !a.require_tool_call
-        && crate::scheduler::fast_greedy::classify_penalties(
-            &crate::scheduler::sample_step::penalty_params_for(
-                a,
-                crate::scheduler::sample_step::PositionKind::Verify,
-                0.0,
-                None,
-                Vec::new(),
-            ),
-        ) == crate::scheduler::fast_greedy::PenaltyGate::Neutral
-}
-
 #[cfg(test)]
 mod dflash_verify_policy_tests {
     use super::dflash_verify_uses_raw_argmax;
@@ -88,44 +69,6 @@ mod dflash_verify_policy_tests {
         assert!(dflash_verify_uses_raw_argmax(true, false, false));
         assert!(!dflash_verify_uses_raw_argmax(true, true, false));
         assert!(!dflash_verify_uses_raw_argmax(false, false, false));
-    }
-
-    #[test]
-    fn per_sequence_gate_stays_raw_only_for_neutral_greedy() {
-        use super::dflash_seq_raw_argmax_policy as gate;
-        let (mut a, _rx) = crate::scheduler::test_support::test_seq(vec![1, 2, 3], 10, None, 32);
-        // Neutral penalties + no grammar + no tool-call EOS suppression:
-        // the verify pick is provably the raw argmax — shortcut stays on.
-        assert!(gate(true, false, false, false, &a));
-        // The non-thinking preset ships presence_penalty=1.5 — a reduce-only
-        // penalty that CAN flip the argmax against already-emitted tokens.
-        a.presence_penalty = 1.5;
-        assert!(!gate(true, false, false, false, &a));
-        a.presence_penalty = 0.0;
-        a.repetition_penalty = 1.05;
-        assert!(!gate(true, false, false, false, &a));
-        a.repetition_penalty = 1.0;
-        a.dry_multiplier = 0.4;
-        assert!(!gate(true, false, false, false, &a));
-        a.dry_multiplier = 0.0;
-        a.require_tool_call = true;
-        assert!(!gate(true, false, false, false, &a));
-        // Process-wide flag still dominates: raw off stays off per-seq.
-        a.require_tool_call = false;
-        assert!(!gate(false, false, false, false, &a));
-    }
-
-    #[test]
-    fn argmax_only_verify_head_always_takes_the_raw_path() {
-        use super::dflash_seq_raw_argmax_policy as gate;
-        let (mut a, _rx) = crate::scheduler::test_support::test_seq(vec![1, 2, 3], 10, None, 32);
-        // A head that leaves the logits buffer partly stale (GLM's TP2 vocab
-        // split) cannot feed the pipeline, whatever the request asks for.
-        a.presence_penalty = 1.5;
-        a.require_tool_call = true;
-        assert!(gate(true, false, false, true, &a));
-        assert!(gate(false, true, false, true, &a));
-        assert!(!gate(true, false, false, false, &a));
     }
 }
 
@@ -945,15 +888,6 @@ pub fn detect_token_loop(
     false
 }
 
-/// Request-local floor for semantic and token-pattern watchdogs. The
-/// scheduler's hard safety stops use their own budget, deadline, cancellation,
-/// and EOS checks; this predicate only keeps quality heuristics from cutting a
-/// response before an explicit `min_tokens` request floor.
-#[inline]
-pub fn watchdog_floor_reached(output_tokens: usize, min_tokens: usize) -> bool {
-    output_tokens >= min_tokens
-}
-
 /// vLLM-style anchored detector (port of
 /// `vllm/v1/core/sched/utils.py::_has_repeating_pattern`). For each
 /// position `n ∈ [1, pattern_len]` in the LAST `pattern_len` tokens,
@@ -1095,7 +1029,7 @@ mod inter_tool_prose_tests {
 mod content_loop_override_tests {
     use super::{
         CONTENT_LOOP_MIN_REPEATS, CONTENT_LOOP_PERIOD_MAX, CONTENT_LOOP_PERIOD_MIN, WatchdogParams,
-        detect_content_token_loop_with, resolve_content_loop_watchdog, watchdog_floor_reached,
+        detect_content_token_loop_with, resolve_content_loop_watchdog,
     };
     use crate::api::inference_types::RepetitionDetectionParams;
 
@@ -1147,13 +1081,6 @@ mod content_loop_override_tests {
         let p = WatchdogParams::from_behavior(&atlas_kernels::ModelBehavior::default(), None, None);
         assert_eq!(p.content_loop_min_repeats, None);
         assert!(p.content_loop_params(None).is_none());
-    }
-
-    #[test]
-    fn request_min_tokens_floor_is_inclusive_for_quality_watchdogs() {
-        assert!(!watchdog_floor_reached(281, 400));
-        assert!(watchdog_floor_reached(400, 400));
-        assert!(watchdog_floor_reached(0, 0));
     }
 
     #[test]
