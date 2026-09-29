@@ -4,36 +4,11 @@
 
 use super::*;
 
-/// Cooperative cancellation only marks retirement; lifecycle owns state cleanup.
-/// An already-issued forward cannot be undone here. Preserve finish-reason and
-/// hard-limit metadata rather than inventing a new cancellation reason.
-pub(super) fn retire_if_cancelled(a: &mut ActiveSeq) -> bool {
-    if a.cancel_flag
-        .as_ref()
-        .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
-    {
-        a.finished = true;
-        true
-    } else {
-        false
-    }
-}
+mod cancel;
+pub(super) use cancel::retire_if_cancelled;
 
 #[cfg(test)]
-#[path = "cancel_tests.rs"]
-mod cancellation_tests;
-
-#[cfg(test)]
-#[path = "emit_thinking_tests.rs"]
-mod thinking_tests;
-
-#[cfg(test)]
-#[path = "glm_tool_boundary_tests.rs"]
-mod glm_tool_boundary_tests;
-
-#[cfg(test)]
-#[path = "glm_native_eos_tests.rs"]
-mod glm_native_eos_tests;
+mod tests;
 
 /// Emit a token for an active sequence (stream + bookkeeping).
 ///

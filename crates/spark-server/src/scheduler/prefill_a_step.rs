@@ -4,6 +4,9 @@
 
 use super::*;
 
+mod vision_dispatch;
+use vision_dispatch::dispatch_chunk0_vision;
+
 /// Start a chunked prefill: process chunk 0, return result.
 pub fn start_chunked_prefill(
     sched: &crate::scheduler::sched_ctx::SchedCtx,
@@ -363,44 +366,12 @@ pub fn start_chunked_prefill(
             model.stream_wait_event(prefill_stream, prefill_event)?;
         }
 
-        // Co-dispatch: point this request's chunk-0 splice/MRoPE at its slice of
-        // the shared packed buf_out before the worker receives the same slice
-        // descriptor. Single-chunk-fit is guaranteed upstream for this path.
-        let vision_enabled = vision_slice.is_some() || !image_pixels.is_empty();
-        if let Some(s) = vision_slice {
-            model.set_vision_slice_base(
-                s.patch_row_offset,
-                s.grid_index_offset,
-                s.num_images,
-                s.patch_row_count,
-            );
-        } else {
-            model.set_vision_slice_base(0, 0, 0, 0);
-        }
-
+        dispatch_chunk0_vision(model, &seq, vision_slice, &image_pixels, req_disable_mtp)?;
         // EP: broadcast chunk 0 tokens to worker.
         // Send full prompt length + all tokens so worker can do
         // identical Marconi prefix-cache lookups (bug #33 fix).
         // Uses bulk broadcast (single NCCL op) instead of per-token broadcast
         // which caused NCCL timeouts on long prompts (6K+ tokens = 6K+ broadcasts).
-        model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
-        let (vision_row_base, vision_grid_base, vision_owned_images, vision_slice_rows) =
-            vision_slice.map_or((0, 0, 0, 0), |s| {
-                (
-                    s.patch_row_offset,
-                    s.grid_index_offset,
-                    s.num_images,
-                    s.patch_row_count,
-                )
-            });
-        model.ep_broadcast_vision_state_for_seq(
-            seq.slot_idx as u32,
-            vision_enabled,
-            vision_row_base,
-            vision_grid_base,
-            vision_owned_images,
-            vision_slice_rows,
-        )?;
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(chunk_len as u32)?;
         model.ep_broadcast_cmd(0)?; // chunk_start
