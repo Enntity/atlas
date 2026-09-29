@@ -6,17 +6,25 @@
 #include <cstddef>
 #include <cstdint>
 
+__device__ __forceinline__ void glm_split_merge_store(__nv_bfloat16* out, size_t i, float v) {
+    out[i] = __float2bfloat16_rn(v);
+}
+__device__ __forceinline__ void glm_split_merge_store(float* out, size_t i, float v) {
+    out[i] = v;
+}
+
 // Merge partitioned attention outputs: weighted combine of partial outputs by LSE.
 // part_o   : float[splits, rows, heads, dim] normalized partial attention outputs
 // part_lse : float[splits, rows, heads] natural-logsumexp (-INFINITY == empty partition)
-// out_bf16 : __nv_bfloat16[rows, heads, dim]
+// out      : OutT[rows, heads, dim] (BF16, or FP32 for a further exact merge)
 // out_lse  : float[rows, heads]
-extern "C" __global__ void glm_sparse_decode_split_merge(const float* __restrict__ part_o,
-                                             const float* __restrict__ part_lse,
-                                             __nv_bfloat16* __restrict__ out_bf16,
-                                             float* __restrict__ out_lse,
-                                             unsigned rows, unsigned heads,
-                                             unsigned dim, unsigned splits) {
+template <typename OutT>
+__device__ __forceinline__ void glm_split_merge_body(const float* __restrict__ part_o,
+                                                     const float* __restrict__ part_lse,
+                                                     OutT* __restrict__ out_bf16,
+                                                     float* __restrict__ out_lse,
+                                                     unsigned rows, unsigned heads,
+                                                     unsigned dim, unsigned splits) {
     // Init-only zero rows: uniform return before any pointer access.
     if (rows == 0) return;
     __shared__ float s_w[16];
@@ -82,7 +90,27 @@ extern "C" __global__ void glm_sparse_decode_split_merge(const float* __restrict
                 acc += s_w[s] * part_o[(size_t)s * stride_o + base_o + d];
             }
         }
-        out_bf16[(size_t)row * heads * dim + (size_t)head * dim + d] = __float2bfloat16_rn(acc);
+        glm_split_merge_store(out_bf16, (size_t)row * heads * dim + (size_t)head * dim + d, acc);
     }
+}
+
+extern "C" __global__ void glm_sparse_decode_split_merge(const float* __restrict__ part_o,
+                                             const float* __restrict__ part_lse,
+                                             __nv_bfloat16* __restrict__ out_bf16,
+                                             float* __restrict__ out_lse,
+                                             unsigned rows, unsigned heads,
+                                             unsigned dim, unsigned splits) {
+    glm_split_merge_body(part_o, part_lse, out_bf16, out_lse, rows, heads, dim, splits);
+}
+
+// FP32-output twin: the normalized merged partial and its LSE, for a second
+// exact LSE merge (ATLAS_GLM_KV_SHARD=1 combines both ranks' partials).
+extern "C" __global__ void glm_sparse_decode_split_merge_f32(const float* __restrict__ part_o,
+                                             const float* __restrict__ part_lse,
+                                             float* __restrict__ out_f32,
+                                             float* __restrict__ out_lse,
+                                             unsigned rows, unsigned heads,
+                                             unsigned dim, unsigned splits) {
+    glm_split_merge_body(part_o, part_lse, out_f32, out_lse, rows, heads, dim, splits);
 }
 
