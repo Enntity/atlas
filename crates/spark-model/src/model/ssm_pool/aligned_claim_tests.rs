@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Actual CPU free-list/guard transitions; no GPU pointers are dereferenced.
-use super::slot_guard_tests::bare_pool;
+use super::super::slot_guard_tests::bare_pool;
 
 #[test]
 fn specific_guard_selects_exact_index_for_either_free_list_order() {
