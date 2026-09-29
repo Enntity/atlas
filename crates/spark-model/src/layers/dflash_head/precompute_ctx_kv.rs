@@ -168,7 +168,7 @@ impl BlockDiffusionDraftHead {
         let l_total = self.num_layers;
 
         // Step 1: fc projection [n, L_t*h_t] → [n, h].
-        self.drafter_dense_gemm(gpu, src, &self.fc, fc_dst, n, h, target_hidden_dim, stream)?;
+        self.ctx_projection(gpu, 0, &self.fc, src, fc_dst, n, h, target_hidden_dim, stream)?;
         if let Some(d) = dump {
             d("fc_proj", fc_dst, n as usize * h as usize * bf16)?;
         }
@@ -190,8 +190,9 @@ impl BlockDiffusionDraftHead {
         // Step 3: fused KV GEMM → [n, L * 2 * kv_dim], row layout
         // [K_0 | V_0 | K_1 | V_1 | …].
         let fused_w = DenseWeight { weight: fused_kv };
-        self.drafter_dense_gemm(
+        self.ctx_projection(
             gpu,
+            1,
             fc_dst,
             &fused_w,
             fused_dst,

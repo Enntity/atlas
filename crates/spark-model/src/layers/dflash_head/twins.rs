@@ -18,6 +18,9 @@
 //! - `ATLAS_DFLASH_NVFP4_HEAD=1` / `ATLAS_DFLASH_MXFP8_HEAD=1`: a drafter-owned
 //!   NVFP4 (else MXFP8) twin of the shared BF16 lm_head — the drafter's
 //!   largest read (154880 x 4096 on GLM-5.3). The verifier keeps its head.
+//! - `ATLAS_DFLASH_CTX_NVFP4=1`: NVFP4 twins of `fc` and the fused K/V
+//!   weight for context precomputes of up to 32 rows (decode steps); wider
+//!   precomputes (prompt catch-up) keep BF16.
 //!
 //! Row blocks the tiers cannot take fall back to the BF16 weights.
 
@@ -41,6 +44,8 @@ pub struct DflashTwins {
     /// MXFP8 twin of the shared BF16 lm_head (`ATLAS_DFLASH_MXFP8_HEAD=1`,
     /// superseded by the NVFP4 head), up to 32 rows.
     pub lm_head_mx: Option<Mxfp8Weight>,
+    /// NVFP4 twins of `[fc, fused_kv_weight]` (`ATLAS_DFLASH_CTX_NVFP4=1`).
+    pub ctx_q4: Option<[QuantizedWeight; 2]>,
 }
 
 /// MXFP8 twins of a layer's five large projections (`ATLAS_DFLASH_MXFP8=1`);
@@ -78,14 +83,63 @@ impl BlockDiffusionDraftHead {
             );
         }
         self.install_head_twin(gpu)?;
+        if env_on("ATLAS_DFLASH_CTX_NVFP4") {
+            self.install_ctx_twins(gpu)?;
+        }
         tracing::info!(
-            "DFlash twins: NVFP4 tensor-core layers {}, MXFP8 layers {}, head NVFP4 {} / MXFP8 {}",
+            "DFlash twins: NVFP4 tensor-core layers {}, MXFP8 layers {}, head NVFP4 {} / MXFP8 {}, context NVFP4 {}",
             self.twins.nvfp4_tc,
             self.layers.iter().filter(|l| l.mx.is_some()).count(),
             self.twins.lm_head_q4.is_some(),
             self.twins.lm_head_mx.is_some(),
+            self.twins.ctx_q4.is_some(),
         );
         Ok(())
+    }
+
+    fn install_ctx_twins(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+        let Some(fused_kv) = self.fused_kv_weight else {
+            return Ok(());
+        };
+        let h = self.hidden_size;
+        let fc_in = self.target_layer_ids.len() * self.target_hidden_size;
+        let fused_n = self.num_layers * 2 * self.num_kv_heads * self.head_dim;
+        let absmax = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
+        let quant = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+        let stream = gpu.default_stream();
+        let q4 = |w: &DenseWeight, n, k| {
+            crate::weight_map::quantize_to_nvfp4(w, n, k, gpu, absmax, quant, stream)
+        };
+        self.twins.ctx_q4 = Some([
+            q4(&self.fc, h, fc_in)?,
+            q4(&DenseWeight { weight: fused_kv }, fused_n, h)?,
+        ]);
+        gpu.synchronize(stream)
+    }
+
+    /// Context projection `out[n, n_out] = input[n, k] · Wᵀ` for the twin at
+    /// `which` (0 = `fc`, 1 = fused K/V) of up to 32 rows on the tensor-core
+    /// tiers, else the BF16 `w`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ctx_projection(
+        &self,
+        gpu: &dyn GpuBackend,
+        which: usize,
+        w: &DenseWeight,
+        input: DevicePtr,
+        out: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if m <= 32
+            && let Some(q4) = self.twins.ctx_q4.as_ref()
+            && self.nvfp4_tc_rows(gpu, &q4[which], input, out, m, n, k, stream)?
+        {
+            return Ok(());
+        }
+        self.drafter_dense_gemm(gpu, input, w, out, m, n, k, stream)
     }
 
     /// Drafter-owned twin of a BF16 shared lm_head. A target NVFP4 head
