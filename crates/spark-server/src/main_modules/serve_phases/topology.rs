@@ -67,6 +67,11 @@ pub(crate) fn resolve_topology(
     config.tp_world_size = tp_size;
     config.ep_rank = ep_rank;
     config.ep_world_size = ep_size;
+    config.expert_tp = std::env::var("ATLAS_GLM_EXPERT_TP").as_deref() == Ok("1")
+        && config.model_type == "glm5_next"
+        && ep_size == 2
+        && tp_size == ep_size
+        && world_size == ep_size;
     if tp_size > 1 {
         // EXL3 packs each linear into 16x16 trellis tiles laid out
         // [in/16, out/16, ...]; a tile is atomic, so the tensor cannot be
@@ -144,7 +149,8 @@ pub(crate) fn resolve_topology(
     if world_size > 1 {
         let (start, end) = config.local_expert_range();
         tracing::info!(
-            "Parallelism: global rank {}/{} (tp_rank={}/{}, ep_rank={}/{}), local experts [{}, {})",
+            "Parallelism: global rank {}/{} (tp_rank={}/{}, ep_rank={}/{}), local experts [{}, {}), \
+             expert TP {}",
             args.rank,
             world_size,
             tp_rank,
@@ -153,6 +159,7 @@ pub(crate) fn resolve_topology(
             ep_size,
             start,
             end,
+            config.expert_tp,
         );
     }
     Ok(Topology {

@@ -73,7 +73,7 @@ impl MoeLayer {
     ) -> Result<()> {
         self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
-        let inter = config.moe_intermediate_size;
+        let inter = config.routed_inter_local();
         let shared_inter = config.shared_expert_intermediate_size;
 
         // Transpose per-expert routed weights for coalesced prefill GEMM reads.
@@ -219,7 +219,7 @@ impl MoeLayer {
     ) -> Result<()> {
         self.btile_storage.require_legacy()?;
         let h = config.hidden_size;
-        let inter = config.moe_intermediate_size;
+        let inter = config.routed_inter_local();
 
         // ── Layout state is DERIVED, never declared ──────────────────────
         // These two flags used to be read independently from env at

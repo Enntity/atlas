@@ -123,6 +123,8 @@ mod kv_cache_turbok;
 pub mod lora_delta;
 #[path = "ops/marlin_nvfp4.rs"]
 mod marlin_nvfp4;
+#[path = "ops/marlin_nvfp4_pack.rs"]
+mod marlin_nvfp4_pack;
 #[path = "ops/model_levers.rs"]
 mod model_levers;
 #[path = "ops/moe_atomic_c4.rs"]
@@ -256,6 +258,7 @@ pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
 pub use kv_cache_turbok::*;
 pub use marlin_nvfp4::*;
+pub use marlin_nvfp4_pack::marlin_pack_nvfp4;
 pub use model_levers::ModelLevers;
 pub use moe_atomic_c4::*;
 pub use moe_expert::*;

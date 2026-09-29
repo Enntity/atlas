@@ -97,7 +97,9 @@ pub fn kda_recurrent_verify_snap(
 
 /// `kda_recurrent_verify_snap` for up to four owners in one launch: owner
 /// `o` advances `states[o]` over its `tokens` rows at row `o * tokens`,
-/// writing its rollback slab `inters[o]`; bit-identical per owner.
+/// writing its rollback slab `inters[o]`; bit-identical per owner. With
+/// `kda_recurrent_bf16_verify_rec_owners` the states are only read and
+/// `inters[o]` receives the fold records [`kda_commit_records`] consumes.
 #[allow(clippy::too_many_arguments)]
 pub fn kda_recurrent_verify_snap_owners(
     gpu: &dyn GpuBackend,
@@ -140,6 +142,33 @@ pub fn kda_recurrent_verify_snap_owners(
         .arg_u32(heads)
         .arg_u32(dim)
         .arg_f32(lower_bound)
+        .launch(stream)
+}
+
+/// Floats per head in one row of KDA fold records (decay, key, correction).
+pub const KDA_RECORD_FLOATS: usize = 384;
+
+/// Advance `state` (FP32, `heads` x 128 x 128) over the first `rows` fold
+/// records `record_stride` floats apart: the accepted prefix of a records
+/// verify, bit-identical to the state that verify reached at that row.
+pub fn kda_commit_records(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    state: DevicePtr,
+    records: DevicePtr,
+    record_stride: usize,
+    rows: u32,
+    heads: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([heads, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(state)
+        .arg_ptr(records)
+        .arg_u64(record_stride as u64)
+        .arg_u32(rows)
+        .arg_u32(heads)
         .launch(stream)
 }
 

@@ -302,18 +302,65 @@ pub fn dense_gemv_batch5_dual(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
+    dense_gemv_dual(
+        gpu,
+        kernel,
+        [first_input, second_input],
+        [first_weight, second_weight],
+        [first_output, second_output],
+        None,
+        n,
+        k,
+        stream,
+    )
+}
+
+/// Two same-shape BF16 projections of `m` (<= 8) rows in one grid
+/// (`dense_gemv_bf16_batchm_dual`), each bit-identical to its batchm launch.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_batchm_dual(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    inputs: [DevicePtr; 2],
+    weights: [&DenseWeight; 2],
+    outputs: [DevicePtr; 2],
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        (1..=DENSE_GEMV_BATCHM_MAX_M).contains(&m),
+        "dense_gemv_batchm_dual takes 1..={DENSE_GEMV_BATCHM_MAX_M} rows, got {m}"
+    );
+    dense_gemv_dual(gpu, kernel, inputs, weights, outputs, Some(m), n, k, stream)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_gemv_dual(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    inputs: [DevicePtr; 2],
+    weights: [&DenseWeight; 2],
+    outputs: [DevicePtr; 2],
+    m: Option<u32>,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    let mut l = KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 2])
         .block([256, 1, 1])
-        .arg_ptr(first_input)
-        .arg_ptr(second_input)
-        .arg_ptr(first_weight.weight)
-        .arg_ptr(second_weight.weight)
-        .arg_ptr(first_output)
-        .arg_ptr(second_output)
-        .arg_u32(n)
-        .arg_u32(k)
-        .launch(stream)
+        .arg_ptr(inputs[0])
+        .arg_ptr(inputs[1])
+        .arg_ptr(weights[0].weight)
+        .arg_ptr(weights[1].weight)
+        .arg_ptr(outputs[0])
+        .arg_ptr(outputs[1]);
+    if let Some(m) = m {
+        l = l.arg_u32(m);
+    }
+    l.arg_u32(n).arg_u32(k).launch(stream)
 }
 
 /// Three same-input exact-M=5 BF16 projections; the first may have a smaller N.
@@ -333,21 +380,80 @@ pub fn dense_gemv_batch5_triple_n(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    dense_gemv_triple_n(
+        gpu,
+        kernel,
+        input,
+        [first_weight, second_weight, third_weight],
+        [first_output, second_output, third_output],
+        None,
+        [first_n, other_n],
+        k,
+        stream,
+    )
+}
+
+/// Three same-input BF16 projections of `m` (<= 8) rows in one grid
+/// (`dense_gemv_bf16_batchm_triple_n`); the first may have a smaller N.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_batchm_triple_n(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weights: [&DenseWeight; 3],
+    outputs: [DevicePtr; 3],
+    m: u32,
+    [first_n, other_n]: [u32; 2],
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        (1..=DENSE_GEMV_BATCHM_MAX_M).contains(&m),
+        "dense_gemv_batchm_triple_n takes 1..={DENSE_GEMV_BATCHM_MAX_M} rows, got {m}"
+    );
+    dense_gemv_triple_n(
+        gpu,
+        kernel,
+        input,
+        weights,
+        outputs,
+        Some(m),
+        [first_n, other_n],
+        k,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_gemv_triple_n(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weights: [&DenseWeight; 3],
+    outputs: [DevicePtr; 3],
+    m: Option<u32>,
+    [first_n, other_n]: [u32; 2],
+    k: u32,
+    stream: u64,
+) -> Result<()> {
     ensure!(
         first_n.is_multiple_of(4) && other_n.is_multiple_of(4),
-        "dense_gemv_batch5_triple_n requires output widths divisible by 4 (got {first_n} and {other_n})"
+        "dense GEMV triple requires output widths divisible by 4 (got {first_n} and {other_n})"
     );
-    KernelLaunch::new(gpu, kernel)
+    let mut l = KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(first_n.max(other_n), 4), 1, 3])
         .block([256, 1, 1])
         .arg_ptr(input)
-        .arg_ptr(first_weight.weight)
-        .arg_ptr(second_weight.weight)
-        .arg_ptr(third_weight.weight)
-        .arg_ptr(first_output)
-        .arg_ptr(second_output)
-        .arg_ptr(third_output)
-        .arg_u32(first_n)
+        .arg_ptr(weights[0].weight)
+        .arg_ptr(weights[1].weight)
+        .arg_ptr(weights[2].weight)
+        .arg_ptr(outputs[0])
+        .arg_ptr(outputs[1])
+        .arg_ptr(outputs[2]);
+    if let Some(m) = m {
+        l = l.arg_u32(m);
+    }
+    l.arg_u32(first_n)
         .arg_u32(other_n)
         .arg_u32(k)
         .launch(stream)

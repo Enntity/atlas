@@ -138,8 +138,31 @@ fn load_moe(
     let h = config.hidden_size;
     let inter = config.moe_intermediate_size;
     let mut experts = Vec::with_capacity(config.num_experts);
+    anyhow::ensure!(
+        !config.expert_tp || matches!(variant, Nvfp4Variant::Standard),
+        "expert TP slices ModelOpt NVFP4 experts only, got {variant:?}"
+    );
     for expert in 0..config.num_experts {
-        if config.is_local_expert(expert) {
+        if config.expert_tp {
+            let ep = format!("{p}.experts.{expert}");
+            let slice = |name: &str, n: usize, k: usize, kind: TpShardKind| {
+                super::expert_tp::load_expert_slice(
+                    store,
+                    &format!("{ep}.{name}"),
+                    n,
+                    k,
+                    kind,
+                    config,
+                    gpu,
+                )
+                .with_context(|| format!("GLM-5 expert {expert} {name} (expert TP)"))
+            };
+            experts.push(ExpertWeight {
+                gate_proj: slice("gate_proj", inter, h, TpShardKind::ColumnParallel)?,
+                up_proj: slice("up_proj", inter, h, TpShardKind::ColumnParallel)?,
+                down_proj: slice("down_proj", h, inter, TpShardKind::RowParallel)?,
+            });
+        } else if config.is_local_expert(expert) {
             let ep = format!("{p}.experts.{expert}");
             experts.push(ExpertWeight {
                 gate_proj: quantized_any(
@@ -181,7 +204,7 @@ fn load_moe(
     let (shared_gate, gate_origin) = crate::layers::moe::load_glm_shared_fp8_weight(
         store,
         &format!("{shared}.gate_proj"),
-        inter,
+        config.shared_expert_intermediate_size,
         h,
         gpu,
         variant,
@@ -191,7 +214,7 @@ fn load_moe(
     let (shared_up, up_origin) = crate::layers::moe::load_glm_shared_fp8_weight(
         store,
         &format!("{shared}.up_proj"),
-        inter,
+        config.shared_expert_intermediate_size,
         h,
         gpu,
         variant,
@@ -202,7 +225,7 @@ fn load_moe(
         store,
         &format!("{shared}.down_proj"),
         h,
-        inter,
+        config.shared_expert_intermediate_size,
         gpu,
         variant,
         qctx,
