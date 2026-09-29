@@ -37,24 +37,10 @@ use crate::{
     session_manager,
 };
 
-/// Return the PTX module that implements the checkpoint's vision tower.
-///
-/// Qwen-shaped towers use the historical `vision_encoder` module name. GLM-
-/// 5.3 has intentionally separate kernels and therefore ships
-/// `glm_vision_encoder`; accepting that name only for the corresponding
-/// parsed config keeps the startup guard fail-closed for every other model.
-fn required_vision_module(is_glm5_next: bool) -> &'static str {
-    if is_glm5_next {
-        "glm_vision_encoder"
-    } else {
-        "vision_encoder"
-    }
-}
-
-fn target_has_required_vision_module(is_glm5_next: bool, modules: &[(&str, &[u8])]) -> bool {
-    let required = required_vision_module(is_glm5_next);
-    modules.iter().any(|(name, _)| *name == required)
-}
+mod launch_guards;
+mod vision_module;
+use launch_guards::{ensure_glm_tool_boundary, resolve_validated_prefill};
+use vision_module::{required_vision_module, target_has_required_vision_module};
 
 /// Load a model and build everything derived from it.
 ///
@@ -442,17 +428,8 @@ pub(crate) fn load_model(
         Some(topology) => topology,
         None => serve_phases::resolve_topology(&args, &mut config)?,
     };
-    // Resolve once before weight loading, so the bounded shared-cache lane
-    // rejects unsupported chunks/adapters before allocating model weights.
-    let resolved_prefill = resolved_prefill
-        .unwrap_or_else(|| serve_phases::resolve_prefill_budget(&args, ssm_prefill_chunk));
-    spark_model::layers::moe::validate_shared_fp8_cache_profile(
-        &config,
-        resolved_prefill.prefill_budget,
-        !args.lora_adapter.is_empty()
-            || !args.lora_stageable.is_empty()
-            || !args.lora_stageable_disk.is_empty(),
-    )?;
+    let resolved_prefill =
+        resolve_validated_prefill(&args, &config, resolved_prefill, ssm_prefill_chunk)?;
     // FP8 KV calibration precedence (highest wins): an explicit
     // --fp8-kv-calibration-tokens ALWAYS wins — including 0, which
     // force-disables calibration on a model whose MODEL.toml enables it
@@ -817,12 +794,11 @@ pub(crate) fn load_model(
         supports_thinking,
     );
 
-    anyhow::ensure!(
-        config.model_type != "glm5_next"
-            || (tokenizer_limits.glm_tool_boundary.is_some()
-                && tokenizer_limits.glm_tool_boundary == tool_call_start_token),
-        "GLM tokenizer/tool format is missing or mismatches its native <tool_call> token"
-    );
+    ensure_glm_tool_boundary(
+        &config,
+        tokenizer_limits.glm_tool_boundary,
+        tool_call_start_token,
+    )?;
 
     // 7. Create scheduler channel + spawn scheduler
     spark_runtime::progress::phase(9, "scheduler");
