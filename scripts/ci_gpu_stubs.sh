@@ -59,6 +59,9 @@ int cuLaunchKernel(void *f, unsigned int gx, unsigned int gy, unsigned int gz,
     (void)f; (void)gx; (void)gy; (void)gz; (void)bx; (void)by; (void)bz;
     (void)sm; (void)s; (void)p; (void)e; return 100;
 }
+int cuLaunchKernelEx(const void *cfg, void *f, void **p, void **e) {
+    (void)cfg; (void)f; (void)p; (void)e; return 100;
+}
 /* Events */
 int cuEventCreate(void **a, unsigned int b) { (void)a; (void)b; return 100; }
 int cuEventDestroy_v2(void *a) { (void)a; return 100; }
