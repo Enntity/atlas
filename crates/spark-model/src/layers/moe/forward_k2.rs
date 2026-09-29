@@ -21,6 +21,9 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if ctx.config.expert_tp {
+            return self.forward_prefill(input, 2, ctx, stream);
+        }
         self.forward_k2_impl(input, ctx, stream, true, true, None)
     }
 
@@ -56,6 +59,10 @@ impl MoeLayer {
         reduce_ep: bool,
         routes: Option<PrecomputedRoutes>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !ctx.config.expert_tp,
+            "expert TP runs K=2 on the grouped path"
+        );
         self.btile_input_guard(input, 2, ctx, stream)?;
         if !include_shared {
             anyhow::ensure!(

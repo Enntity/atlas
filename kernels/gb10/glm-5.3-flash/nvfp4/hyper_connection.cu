@@ -17,6 +17,7 @@
 //
 // These kernels support hc_mult <= 4 (DeepSeek-V4 uses 4); mix_hc = (2+hc)*hc.
 
+#include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define HC_BLOCK 256
@@ -767,6 +768,7 @@ extern "C" __global__ void hc_post_bf16(
     const unsigned int hidden_size,
     const unsigned int hc_mult
 ) {
+    atlas_pdl_enter();
     hc_post_t<__nv_bfloat16>(block_out, residual, post, comb, out, hidden_size, hc_mult);
 }
 

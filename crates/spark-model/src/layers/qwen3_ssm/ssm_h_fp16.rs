@@ -287,6 +287,7 @@ mod prefill_narrowing_tests {
             h_state_checkpoint: None,
             conv_state_checkpoint: None,
             h_state_intermediates: Vec::new(),
+            kda_records: spark_runtime::gpu::DevicePtr::NULL,
             conv_state_intermediates: Vec::new(),
             h_is_f16,
             h_prefill_stage: stage,

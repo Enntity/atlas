@@ -64,6 +64,7 @@ impl ModelConfig {
             weight_prefix: String::new(),
             ep_rank: 0,
             ep_world_size: 1,
+            expert_tp: false,
             tp_rank: 0,
             tp_world_size: 1,
             hybrid_override_pattern: String::new(),

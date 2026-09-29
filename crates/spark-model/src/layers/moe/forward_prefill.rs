@@ -126,7 +126,7 @@ impl MoeLayer {
         }
 
         let h = ctx.config.hidden_size as u32;
-        let inter = ctx.config.moe_intermediate_size as u32;
+        let inter = ctx.config.routed_inter_local() as u32;
         let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
         let top_k = ctx.config.num_experts_per_tok as u32;

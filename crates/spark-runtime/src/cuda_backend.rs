@@ -16,6 +16,7 @@ use atlas_core::registry::AtlasRegistry;
 mod fault_probe;
 mod gpu_copy;
 mod gpu_impl;
+pub use gpu_impl::configure_pdl;
 mod gpu_impl_graph;
 mod host_staging;
 pub mod tensormap;

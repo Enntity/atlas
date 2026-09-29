@@ -165,6 +165,13 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(m);
+        if m <= 32
+            && tc.0 != 0
+            && let Some((_, q4)) = self.mla_q4.iter().find(|(w, _)| *w == weight.weight)
+        {
+            return ops::w4a16_gemv_batchm(ctx.gpu, tc, input, q4, output, m, n, k, stream);
+        }
         if m <= 32
             && let Some((_, mx)) = self.mla_mx.iter().find(|(w, _)| *w == weight.weight)
         {

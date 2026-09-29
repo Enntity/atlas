@@ -29,6 +29,10 @@ impl MoeLayer {
         reduce_ep: bool,
         routes: Option<PrecomputedRoutes>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !ctx.config.expert_tp,
+            "expert TP runs K=3 on the grouped path"
+        );
         self.btile_input_guard(input, 3, ctx, stream)?;
         if !include_shared {
             anyhow::ensure!(

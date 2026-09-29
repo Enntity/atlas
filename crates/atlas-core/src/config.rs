@@ -475,6 +475,12 @@ pub struct ModelConfig {
     pub ep_rank: usize,
     #[serde(skip)]
     pub ep_world_size: usize,
+    /// Expert TP (`ATLAS_GLM_EXPERT_TP=1`): every EP rank holds all routed
+    /// experts, sliced like Megatron TP (gate/up rows and down columns
+    /// `[r*I/ep, (r+1)*I/ep)`), so every rank reads the same bytes per step
+    /// and the existing all-reduce sums the partial outputs.
+    #[serde(skip)]
+    pub expert_tp: bool,
 
     // ── Tensor Parallelism (set at runtime, not from config.json) ──
     /// TP rank within the TP sub-communicator. 0 if `tp_world_size==1`.

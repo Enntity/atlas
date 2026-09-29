@@ -94,7 +94,15 @@ name = "gdn_cdh_vblock_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "marlin_vs_tc_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "moe_fp4_prefill_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "moe_verify_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
