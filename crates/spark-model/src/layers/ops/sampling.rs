@@ -229,6 +229,23 @@ pub fn apply_grammar_bitmask(
 /// them — pinned to the kernel defines by `tests/dflash2_selector_bounds.rs`.
 pub const DFLASH2_SELECTOR_MAX_TOP_K: usize = 16;
 pub const DFLASH2_SELECTOR_MAX_RANK: usize = 256;
+/// Mirrors `DF2_SEL_MAX_SPLITS` / `DF2_SEL_THREADS` in the same kernel.
+pub const DFLASH2_SELECTOR_MAX_SPLITS: usize = 16;
+pub const DFLASH2_SELECTOR_THREADS: u32 = 512;
+
+/// Vocab slices per row: about two blocks per SM on GB10 over the
+/// `gamma` rows.
+fn dflash2_selector_splits(gamma: u32) -> u32 {
+    (96 / gamma.max(1)).clamp(1, DFLASH2_SELECTOR_MAX_SPLITS as u32)
+}
+
+/// Bytes of `dflash2_candidate_selector` scratch for up to `gamma` rows:
+/// a u32 ticket (padded to 16 bytes) plus f32 values and u32 ids of every
+/// slice's top-`DFLASH2_SELECTOR_MAX_TOP_K`. It must start zeroed (the kernel
+/// leaves the ticket at zero), and launches sharing it must be stream-ordered.
+pub fn dflash2_selector_scratch_bytes(gamma: usize) -> usize {
+    16 + 2 * 4 * gamma * DFLASH2_SELECTOR_MAX_SPLITS * DFLASH2_SELECTOR_MAX_TOP_K
+}
 
 /// DFlash2 on-device bilinear candidate selector over one `gamma`-row block.
 ///
@@ -253,11 +270,12 @@ pub fn dflash2_candidate_selector(
     vocab_size: u32,
     rank: u32,
     top_k: u32,
+    scratch: DevicePtr,
     stream: u64,
 ) -> Result<()> {
     let mut launch = KernelLaunch::new(gpu, kernel)
-        .grid([1, 1, 1])
-        .block([1024, 1, 1])
+        .grid([dflash2_selector_splits(gamma), gamma, 1])
+        .block([DFLASH2_SELECTOR_THREADS, 1, 1])
         .arg_ptr(logits)
         .arg_ptr(projected_hidden)
         .arg_ptr(pred_codebook)
@@ -272,7 +290,7 @@ pub fn dflash2_candidate_selector(
     for id in end_ids {
         launch = launch.arg_u32(id);
     }
-    launch.launch(stream)
+    launch.arg_ptr(scratch).launch(stream)
 }
 
 /// Batched variant of [`dflash2_candidate_selector`] — one CTA per

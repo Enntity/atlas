@@ -252,6 +252,9 @@ pub struct DflashScratch {
     pub dflash2_conv_out: DevicePtr,
     /// DFlash2 scratch: projected hidden states `[γ, selector_rank]` BF16.
     pub dflash2_projected_hidden: DevicePtr,
+    /// DFlash2 candidate-selector slice lists + ticket
+    /// ([`crate::layers::ops::dflash2_selector_scratch_bytes`], zeroed at allocation).
+    pub dflash2_selector_scratch: DevicePtr,
 }
 
 /// Drafter-side weight precision. Defaults to BF16. **Phase G (2026-05-28)**
@@ -652,6 +655,9 @@ pub struct BlockDiffusionDraftHead {
     /// DFlash2 selector projected-hidden scratch, `[B*gamma, rank]` BF16.
     /// NULL when the head has no candidate selector (Lightning DSpark).
     pub batch_dflash2_projected: DevicePtr,
+    /// DFlash2 selector scratch for the batched tail's per-sequence launches.
+    /// NULL when the head has no candidate selector.
+    pub batch_dflash2_selector_scratch: DevicePtr,
     /// DFlash2 conv scratch: dynamic-delta rows `[B*gamma, 2*kernel_size*groups]`
     /// and conv output `[B*gamma, hidden]`. NULL when the drafter ships no conv.
     pub batch_conv_delta: DevicePtr,
