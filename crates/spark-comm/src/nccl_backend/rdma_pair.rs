@@ -160,10 +160,9 @@ impl RdmaPair {
             !rails.is_empty(),
             "RDMA pair: no rails (set ATLAS_RDMA_RAILS or NCCL_IB_HCA)"
         );
-        let gid_idx: u32 = std::env::var("ATLAS_RDMA_GID")
+        let gid_override: Option<u32> = std::env::var("ATLAS_RDMA_GID")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
+            .and_then(|v| v.parse().ok());
         let bytes = region_bytes(capacity);
         let mut host: *mut c_void = std::ptr::null_mut();
         cu(
@@ -183,8 +182,10 @@ impl RdmaPair {
         local.extend_from_slice(&(host as u64).to_le_bytes());
         let mut lkeys = Vec::with_capacity(rails.len());
         for name in &rails {
+            let gid_idx =
+                gid_override.map_or_else(|| atlas_rdma::gid::roce_v2_ipv4_index(name), Ok)?;
             let mut v = Verbs::create(name, gid_idx, psn)
-                .with_context(|| format!("RDMA pair rail {name}"))?;
+                .with_context(|| format!("RDMA pair rail {name} (gid index {gid_idx})"))?;
             // SAFETY: the region outlives the Verbs (freed in Drop after the
             // proxy, which owns the Verbs, has joined).
             let keys = unsafe { v.reg_mr_rw(host, bytes) }?;
