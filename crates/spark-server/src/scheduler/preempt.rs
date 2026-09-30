@@ -232,6 +232,7 @@ pub(super) fn spill_out_sequence(
         output_tokens: a.output_tokens,
         remaining: a.remaining,
         min_tokens: a.min_tokens,
+        eos_ban: a.seq.eos_ban,
         eos_tokens: a.eos_tokens,
         sink: a.sink,
         temperature: a.temperature,

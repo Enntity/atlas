@@ -2,8 +2,8 @@
 
 //! The min_tokens end-token ban must be armed on every way into decode, not
 //! only on the multi-chunk promotion: a prompt that prefills in one chunk,
-//! the single-shot prefill of an unchunked server and a preempted sequence's
-//! re-prefill decode the same request.
+//! the single-shot prefill of an unchunked server, a preempted sequence's
+//! re-prefill and a swapped-out sequence's restore decode the same request.
 
 use super::super::sched_ctx::SchedCtx;
 use super::super::test_support::{EOS, test_request};
@@ -133,5 +133,26 @@ fn a_preempt_resume_keeps_the_min_tokens_ban() {
     // The re-prefill restamps prompt_len to the whole history; the floor is
     // an absolute position and must survive it.
     assert_eq!(resumed.seq.prompt_len, resumed.seq.tokens.len());
+    assert_eq!(resumed.seq.eos_ban, ban);
+}
+
+#[test]
+fn a_swap_resume_keeps_the_min_tokens_ban() {
+    let model = PreemptStubModel::default();
+    let (mut a, _rx) = active_seq(3, 6);
+    let ban = EosBan::new(4, 64, EOS);
+    a.seq.eos_ban = ban;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("atlas_min_tokens_swap_test_{nanos}"));
+    let mut spill = KvSpillManager::new(dir, 1024 * 1024).unwrap();
+    let swapped = match spill_out_sequence(&model, a, &mut spill) {
+        Ok(swapped) => swapped,
+        Err((_active, error)) => panic!("swap out failed: {error:#}"),
+    };
+    // The restore allocates a fresh sequence: the ban travels with the image.
+    let resumed = resume_swapped_seq(None, None, &model, swapped, &mut spill).unwrap();
     assert_eq!(resumed.seq.eos_ban, ban);
 }
