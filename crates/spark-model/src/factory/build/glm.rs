@@ -12,6 +12,7 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, SparseIndexCacheConfi
 use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
+use crate::layers::glm_kv_shard as shard;
 use crate::layers::moe::SharedFp8Reserve;
 use crate::model::glm_cache_plan::{GlmCachePlan, GlmMlaShape};
 
@@ -184,7 +185,6 @@ pub(super) fn shard_plan(
     max_seq_len: usize,
     max_batch_tokens: usize,
 ) -> Result<Option<GlmCachePlan>> {
-    use crate::layers::glm_kv_shard as shard;
     use anyhow::{Context, ensure};
     // Junk tuning values, and tunings without the shard, fail the boot.
     let tuning = shard::MergeTuning::get()?;
@@ -263,7 +263,11 @@ pub(super) fn agree_kv_blocks(
     // with less headroom (e.g. no drafter, different co-tenants) must not
     // size a pool the others cannot back: all ranks take the minimum.
     if let Some(comm) = comm.filter(|c| c.world_size() > 1) {
-        let agreed = min_across_ranks(comm, gpu, num_kv_blocks)?;
+        // The same gather carries the latent-shard settings (0 unsharded).
+        let sharded = glm_cache_plan.and_then(GlmCachePlan::shard).is_some();
+        let ours = shard::blocks_word(num_kv_blocks, shard::settings_word(sharded)?);
+        let words = gather_across_ranks(comm, gpu, ours)?;
+        let agreed = shard::agreed_blocks(comm.rank(), ours, &words)?;
         if agreed < num_kv_blocks {
             tracing::info!(
                 "KV cache: rank {} fits {num_kv_blocks} blocks; all ranks agree on {agreed}",
@@ -278,23 +282,23 @@ pub(super) fn agree_kv_blocks(
     Ok(num_kv_blocks)
 }
 
-/// The minimum of `value` over all ranks (one 8-byte all-gather).
-fn min_across_ranks(
+/// Every rank's `value`, in rank order (one 8-byte all-gather).
+fn gather_across_ranks(
     comm: &dyn spark_comm::CommBackend,
     gpu: &dyn GpuBackend,
-    value: usize,
-) -> Result<usize> {
+    value: u64,
+) -> Result<Vec<u64>> {
     let world = comm.world_size();
     let buf = gpu.alloc(8 * (world + 1))?;
     let result = (|| {
-        gpu.copy_h2d(&(value as u64).to_le_bytes(), buf)?;
+        gpu.copy_h2d(&value.to_le_bytes(), buf)?;
         comm.all_gather(buf.0, buf.offset(8).0, 8)?;
         let mut all = vec![0u8; 8 * world];
         gpu.copy_d2h(buf.offset(8), &mut all)?;
-        all.chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().expect("8-byte rank value")) as usize)
-            .min()
-            .ok_or_else(|| anyhow::anyhow!("empty rank gather"))
+        Ok(all
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("8-byte rank value")))
+            .collect())
     })();
     gpu.free(buf)?;
     result

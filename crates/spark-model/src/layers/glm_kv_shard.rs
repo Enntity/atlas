@@ -130,6 +130,49 @@ impl MergeTuning {
     }
 }
 
+/// Where [`settings_word`] sits in the word the ranks gather for the pool
+/// size (`factory::build::glm::agree_kv_blocks`), above any block count.
+const SETTINGS_SHIFT: u32 = 56;
+
+/// `[shard, compact, overlap, check]` of a sharded rank, one bit each.
+fn settings_bits(tuning: MergeTuning, check: bool) -> u64 {
+    1 | (tuning.compact as u64) << 1 | (tuning.overlap as u64) << 2 | (check as u64) << 3
+}
+
+/// What both ranks must run alike: a rank sharding alone would exchange
+/// inside attention with a peer that does not, and the tunings change the
+/// merge form's exchanges. 0 when unsharded, so the pool-size gather then
+/// carries the bytes it always did.
+pub fn settings_word(sharded: bool) -> Result<u64> {
+    if !sharded {
+        return Ok(0);
+    }
+    Ok(settings_bits(MergeTuning::get()?, check_requested()))
+}
+
+/// A rank's word for the pool-size gather: `blocks` under its `settings`.
+pub fn blocks_word(blocks: usize, settings: u64) -> u64 {
+    blocks as u64 | settings << SETTINGS_SHIFT
+}
+
+/// The smallest pool in `gathered` (every rank's [`blocks_word`]), once every
+/// rank runs the settings of this rank's word `ours`.
+pub fn agreed_blocks(rank: usize, ours: u64, gathered: &[u64]) -> Result<usize> {
+    let bits = |w: u64| [0, 1, 2, 3].map(|i| w >> (SETTINGS_SHIFT + i) & 1);
+    ensure!(
+        gathered.iter().all(|&w| bits(w) == bits(ours)),
+        "ATLAS_GLM_KV_SHARD settings [shard, compact, overlap, check] differ across the pair: \
+         rank {rank} has {:?}, the ranks have {:?}",
+        bits(ours),
+        gathered.iter().map(|&w| bits(w)).collect::<Vec<_>>()
+    );
+    let blocks = |w: u64| (w & ((1 << SETTINGS_SHIFT) - 1)) as usize;
+    Ok(gathered
+        .iter()
+        .map(|&w| blocks(w))
+        .fold(blocks(ours), usize::min))
+}
+
 fn align(bytes: usize) -> usize {
     bytes.next_multiple_of(256)
 }

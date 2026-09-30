@@ -45,6 +45,46 @@ fn a_tuning_without_the_shard_fails_instead_of_being_ignored() {
     assert!(err.to_string().contains("ATLAS_GLM_KV_SHARD=1"), "{err}");
 }
 
+#[test]
+fn unsharded_ranks_gather_plain_block_counts_and_take_the_minimum() {
+    assert_eq!(settings_word(false).unwrap(), 0);
+    assert_eq!(blocks_word(177_000, 0), 177_000);
+    assert_eq!(
+        agreed_blocks(0, 177_000, &[177_000, 150_000]).unwrap(),
+        150_000
+    );
+    assert_eq!(
+        agreed_blocks(1, 150_000, &[177_000, 150_000]).unwrap(),
+        150_000
+    );
+}
+
+#[test]
+fn ranks_must_agree_on_the_shard_and_its_tunings() {
+    let plain = MergeTuning::default();
+    let compact = MergeTuning {
+        compact: true,
+        overlap: false,
+    };
+    let word = |blocks, tuning, check| blocks_word(blocks, settings_bits(tuning, check));
+    let (a, b) = (word(300_000, plain, false), word(280_000, plain, false));
+    assert_eq!(agreed_blocks(0, a, &[a, b]).unwrap(), 280_000);
+    // One rank sharded, one tuning or the check on one rank only: both fail.
+    for peer in [
+        blocks_word(280_000, 0),
+        word(280_000, compact, false),
+        word(280_000, plain, true),
+    ] {
+        for (rank, ours) in [(0, a), (1, peer)] {
+            let err = agreed_blocks(rank, ours, &[a, peer])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("ATLAS_GLM_KV_SHARD settings"), "{err}");
+            assert!(err.contains(&format!("rank {rank} has")), "{err}");
+        }
+    }
+}
+
 fn disjoint(regions: &[(usize, usize)]) -> bool {
     let mut sorted = regions.to_vec();
     sorted.sort_unstable();
