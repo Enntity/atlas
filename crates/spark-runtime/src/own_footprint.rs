@@ -9,17 +9,28 @@
 //! runs out (a GB10 then hangs). The counters here belong to this process
 //! alone, so nothing a co-tenant does can lower them.
 //!
-//! Measured on GB10 (driver 580.178, 2026-09-30):
+//! Measured on GB10 (driver 580.178, 2026-09-30, in a container; scripts and
+//! output in `docs/campaigns/kv-sizing-2026-09`):
 //!
 //! * `cuMemAlloc` is NOT in the process's RSS (`RssAnon` +0 for 1 GiB) and is
 //!   committed at allocation, before first touch. The driver's per-process
-//!   accounting (NVML `usedGpuMemory`) counts it exactly, including its 64 KiB
-//!   rounding, and answers unprivileged inside a container with the PID
-//!   translated to the container's namespace.
-//! * `cuMemAllocHost` (page-locked host memory) is in `RssShmem`, not in
-//!   `RssAnon` and not in the driver's figure.
+//!   accounting (NVML `usedGpuMemory`) counts what it really takes, rounding
+//!   included: requests up to 2 MiB are carved from 2 MiB chunks (300
+//!   requests of 1 MiB and one byte cost 600 MiB, 2000 of 100 KiB cost 200),
+//!   larger ones round up to 64 KiB. It answers unprivileged under the
+//!   in-container PID.
+//! * Page-locked host memory (`cuMemAllocHost`, and `cuMemHostAlloc` with
+//!   `PORTABLE|DEVICEMAP` as the RDMA pair region uses) is in `RssShmem`
+//!   only: not in `RssAnon`, not in the driver's figure, so not counted twice.
 //! * `RssFile` is page cache (the mmapped safetensors), which `MemAvailable`
 //!   still counts as available, so it is left out.
+//! * Managed memory (`cuMemAllocManaged`) moves NONE of these counters, even
+//!   touched on the device. Atlas uses it only as the out-of-memory fallback
+//!   for weights; there the tracked figure reads low.
+//! * At 4 and 8 GiB the driver's growth matched the drop in `MemAvailable`
+//!   within 0.5%. Not measured: the same at 100 GiB, and kernel-side memory
+//!   that is in neither counter. `MemAvailable` itself moved by hundreds of
+//!   MiB between samples on that (shared) host.
 //!
 //! So own = device (driver accounting, or the backend's allocation ledger
 //! where that is unavailable or lower) + host (`RssAnon` + `RssShmem`), each
@@ -33,8 +44,9 @@ pub enum DeviceSource {
     /// process, whoever made it.
     Driver,
     /// Requested bytes of the backend's live allocations. A lower bound: it
-    /// misses driver rounding and the workspaces that call `cuMemAlloc`
-    /// directly (CUTLASS, cuBLASLt, FlashInfer, NCCL).
+    /// misses driver rounding (up to 2 MiB per small allocation) and the
+    /// workspaces that call `cuMemAlloc` directly (CUTLASS, cuBLASLt,
+    /// FlashInfer, NCCL). It cannot rule out a release of that size.
     Ledger,
 }
 
@@ -85,6 +97,35 @@ pub fn since(base: Sample, now: Sample, ledger: usize) -> OwnFootprint {
         device,
         device_source,
         host: grown(base.host, now.host).unwrap_or(0),
+    }
+}
+
+/// The backend's live device allocations: base pointer to bytes requested.
+///
+/// The sum is the device floor [`since`] falls back to. Managed allocations
+/// are recorded with zero bytes: they can be paged out, so they are owned (for
+/// the teardown sweep) without being footprint the ledger can vouch for.
+#[derive(Debug, Default)]
+pub struct AllocLedger(std::collections::HashMap<u64, usize>);
+
+impl AllocLedger {
+    pub fn record(&mut self, ptr: u64, bytes: usize) {
+        self.0.insert(ptr, bytes);
+    }
+
+    /// Drop `ptr`, returning the bytes it was recorded with.
+    pub fn forget(&mut self, ptr: u64) -> Option<usize> {
+        self.0.remove(&ptr)
+    }
+
+    /// Requested bytes of everything still recorded.
+    pub fn bytes(&self) -> usize {
+        self.0.values().fold(0, |sum, &b| sum.saturating_add(b))
+    }
+
+    /// Empty the ledger, returning the pointers it held.
+    pub fn drain(&mut self) -> Vec<u64> {
+        self.0.drain().map(|(ptr, _)| ptr).collect()
     }
 }
 
@@ -172,5 +213,43 @@ mod tests {
         assert_eq!(parse_host_bytes("RssAnon:\t  1 kB\n"), None);
         assert_eq!(parse_host_bytes("RssAnon:\tx kB\nRssShmem:\t1 kB\n"), None);
         assert_eq!(parse_host_bytes(""), None);
+    }
+
+    #[test]
+    fn the_ledger_sums_requested_bytes_of_live_allocations_only() {
+        let mut ledger = AllocLedger::default();
+        assert_eq!(ledger.bytes(), 0);
+        ledger.record(0x1000, 3 * GIB);
+        ledger.record(0x2000, GIB + 1);
+        // Managed memory: owned for the sweep, zero footprint.
+        ledger.record(0x3000, 0);
+        assert_eq!(ledger.bytes(), 4 * GIB + 1);
+
+        assert_eq!(ledger.forget(0x1000), Some(3 * GIB));
+        assert_eq!(ledger.forget(0x1000), None, "a pointer is forgotten once");
+        assert_eq!(ledger.forget(0x9999), None, "never recorded");
+        assert_eq!(ledger.bytes(), GIB + 1);
+
+        // A free the driver refused puts the pointer back with its bytes, and
+        // one the ledger never knew comes back as zero rather than a guess.
+        for ptr in [0x2000, 0x9999] {
+            let bytes = ledger.forget(ptr);
+            ledger.record(ptr, bytes.unwrap_or(0));
+        }
+        assert_eq!(ledger.bytes(), GIB + 1);
+
+        let mut swept = ledger.drain();
+        swept.sort_unstable();
+        assert_eq!(swept, vec![0x2000, 0x3000, 0x9999]);
+        assert_eq!(ledger.bytes(), 0);
+        assert!(ledger.drain().is_empty());
+    }
+
+    #[test]
+    fn a_ledger_that_overflows_saturates() {
+        let mut ledger = AllocLedger::default();
+        ledger.record(1, usize::MAX);
+        ledger.record(2, 1);
+        assert_eq!(ledger.bytes(), usize::MAX);
     }
 }

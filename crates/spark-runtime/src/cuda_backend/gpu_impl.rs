@@ -119,6 +119,13 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn own_footprint(&self) -> Option<crate::own_footprint::OwnFootprint> {
+        // AMD unified memory (SCALE, HIP shim) runs this backend too, but what
+        // the counters mean there (device memory outside RSS, pinned host
+        // memory in RssShmem) was measured on the NVIDIA GB10 driver only.
+        // Until it is measured on AMD, sizing there uses free memory alone.
+        if cfg!(atlas_scale) {
+            return None;
+        }
         Some(AtlasCudaBackend::own_footprint(self))
     }
 

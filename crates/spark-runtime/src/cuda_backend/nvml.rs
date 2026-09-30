@@ -7,17 +7,20 @@
 //! failure below is `None`, and the caller falls back to the backend's
 //! allocation ledger (see [`crate::own_footprint`]).
 //!
-//! Checked on GB10 (driver 580.178): `usedGpuMemory` moves by exactly the
-//! bytes `cuMemAlloc` hands out, and inside a container the library reports
-//! only that container's processes, under their in-namespace PIDs — so
-//! `std::process::id()` is the right key in both places.
+//! Checked on GB10 (driver 580.178, `docs/campaigns/kv-sizing-2026-09`):
+//! `usedGpuMemory` moves by exactly what `cuMemAlloc` takes, driver rounding
+//! included, and inside a container the library lists that container's
+//! processes under their in-namespace PIDs (the probe ran as PID 1), so
+//! `std::process::id()` is the right key in both places. `docker run --gpus
+//! all` mounted the library there, including with
+//! `NVIDIA_DRIVER_CAPABILITIES=compute`.
 //!
 //! Unix only (`dlopen`); the parent module does not compile this elsewhere.
 
 use std::ffi::{CStr, c_void};
 
-/// `nvmlProcessInfo_t` as `nvmlDeviceGetComputeRunningProcesses_v2`/`_v3`
-/// lay it out (24 bytes; the unversioned symbol's 16-byte struct is not used).
+/// `nvmlProcessInfo_t` as `nvmlDeviceGetComputeRunningProcesses_v2` lays it
+/// out (24 bytes; the unversioned symbol's 16-byte struct is not used).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct ProcessInfo {
@@ -56,10 +59,13 @@ pub(super) fn process_device_bytes() -> Option<usize> {
     let shutdown: InitFn = unsafe { std::mem::transmute(sym(c"nvmlShutdown")?) };
     let count: CountFn = unsafe { std::mem::transmute(sym(c"nvmlDeviceGetCount_v2")?) };
     let handle: HandleFn = unsafe { std::mem::transmute(sym(c"nvmlDeviceGetHandleByIndex_v2")?) };
+    // `_v2` first: its 24-byte entry is the same on every driver that exports
+    // it, while `_v3` is reported to have carried a longer one on some 530 to
+    // 535 drivers. On 580 the two return the same figure.
     let processes: ProcessesFn = unsafe {
         std::mem::transmute(
-            sym(c"nvmlDeviceGetComputeRunningProcesses_v3")
-                .or_else(|| sym(c"nvmlDeviceGetComputeRunningProcesses_v2"))?,
+            sym(c"nvmlDeviceGetComputeRunningProcesses_v2")
+                .or_else(|| sym(c"nvmlDeviceGetComputeRunningProcesses_v3"))?,
         )
     };
     if unsafe { init() } != NVML_SUCCESS {
