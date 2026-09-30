@@ -118,6 +118,7 @@ impl TransformerModel {
         layer_idx: usize,
         chunk_start: usize,
         proc_count: usize,
+        row0_pos: usize,
         stream: u64,
     ) -> Result<()> {
         if self.dflash_capture_layers.is_empty() {
@@ -162,6 +163,12 @@ impl TransformerModel {
         // upper half, compacted at row 0) in the highway.
         let sp_row0 = crate::layers::glm_sp::current().map_or(0, |sp| sp.row0);
         first = first.max(chunk_start + sp_row0);
+        // `ATLAS_DFLASH_DEBUG_SLOT0=keep` (row 0 is prompt position `row0_pos`).
+        first += dstate.slot0.keep_skip(
+            seq.prompt_len <= max_ctx,
+            row0_pos + first - chunk_start,
+            first - window_start,
+        );
         // Non-legacy `ATLAS_DFLASH_FIRST_APPEND`: keep this pass's last row —
         // after the final chunk, the last prompt position — in the sequence's
         // own spare row, whatever the window below keeps.
@@ -196,6 +203,7 @@ impl TransformerModel {
         seq: &mut crate::traits::SequenceState,
         chunk_start: usize,
         proc_count: usize,
+        stream: u64,
     ) -> Result<()> {
         if self.dflash_capture_layers.is_empty() {
             return Ok(());
@@ -211,6 +219,7 @@ impl TransformerModel {
                 .downcast_mut::<crate::layers::DflashProposerState>()
         {
             dstate.seed_prefill_ctx(seq.tokens.len(), chunk_start + proc_count, seq.seq_len);
+            dstate.end_prefill_slot0(self.gpu.as_ref(), stream)?;
         }
         Ok(())
     }

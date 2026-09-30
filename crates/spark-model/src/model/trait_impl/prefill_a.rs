@@ -439,6 +439,7 @@ impl TransformerModel {
                 i,
                 layer_kv_write_start,
                 proc_count,
+                seq_len_start,
                 stream,
             )?;
 
@@ -520,7 +521,7 @@ impl TransformerModel {
 
         // DFlash: advance the seq's `ctx_len` to span all just-prefilled
         // positions so the next propose() can read them.
-        self.update_dflash_ctx_len_after_prefill(seq, layer_kv_write_start, proc_count)?;
+        self.update_dflash_ctx_len_after_prefill(seq, layer_kv_write_start, proc_count, stream)?;
 
         Ok(self.decode_logits_ptr())
     }

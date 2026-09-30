@@ -17,7 +17,7 @@ use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
 use super::{DflashBuildArgs, LoraBuildArgs, admit_lightning_dspark_product_build};
 use crate::layers::MtpQuantization;
 use crate::layers::dflash_head::{
-    DsparkStartupExecution, FirstAppend, LightningDsparkRuntimeToggles,
+    DebugSlot0, DsparkStartupExecution, FirstAppend, LightningDsparkRuntimeToggles,
 };
 use crate::model::TransformerModel;
 use crate::traits::Model;
@@ -839,6 +839,7 @@ pub fn build_model(
                 };
                 // Strict for every head: an unknown value fails the build.
                 startup.diagnostics.first_append = FirstAppend::for_head()?;
+                startup.diagnostics.debug_slot0 = DebugSlot0::for_head()?;
                 let head = crate::layers::BlockDiffusionDraftHead::from_weights(
                     weights,
                     target_embed_for_dflash,

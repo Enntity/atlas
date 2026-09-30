@@ -285,6 +285,7 @@ impl TransformerModel {
                 i,
                 layer_kv_write_start,
                 proc_count,
+                effective_seq_len_start,
                 stream,
             )?;
             // Riding owners' rows land in their stable hidden-save slots, as

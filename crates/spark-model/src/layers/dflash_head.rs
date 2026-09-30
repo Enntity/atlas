@@ -417,6 +417,8 @@ pub struct DflashProposerState {
     /// `max_ctx_len`, holding this sequence's latest own capture (its last
     /// prefilled position, then each single-sequence decode).
     pub own_row: Option<DevicePtr>,
+    /// `ATLAS_DFLASH_DEBUG_SLOT0` (debug only; inert unless set).
+    pub slot0: Slot0,
 }
 
 impl DflashProposerState {
@@ -766,6 +768,10 @@ mod row_contract_tests;
 pub use lifecycle::{
     CaptureDescriptor, CaptureStatus, DflashGraphIdentity, DsparkLifecycleError, SequenceGeneration,
 };
+mod debug_slot0;
+pub use debug_slot0::{DebugSlot0, Slot0};
+#[cfg(test)]
+mod debug_slot0_tests;
 mod first_append;
 pub use first_append::FirstAppend;
 pub(crate) use first_append::{keep_own_capture, note_own_capture, own_capture_row};
@@ -940,6 +946,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             own_capture: false,
             own_row_at: None,
             own_row: own.then(|| ctx_hidden_acc.offset(max_ctx_len * ctx_slot_bytes)),
+            slot0: Slot0 {
+                variant: self.startup.diagnostics.debug_slot0,
+                kept: None,
+            },
             // Propose lane: fixed for the seq lifetime (batch positions
             // reorder; captured graphs bake lane scratch pointers). Round-
             // robin keeps concurrent seqs spread across the lane streams.
@@ -1329,6 +1339,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         dstate.skip_next_decode_append = false;
         (dstate.first_append_at, dstate.own_row_at) = (None, None);
         dstate.own_capture = false;
+        dstate.slot0.kept = None;
         dstate.end_floor = 0;
         Ok(())
     }

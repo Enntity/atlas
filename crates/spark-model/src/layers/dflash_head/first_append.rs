@@ -55,12 +55,7 @@ impl FirstAppend {
     /// Startup only. Every rank checks it before loading any weights, so a
     /// typo costs no model load; the head then freezes it (`for_head`).
     pub fn from_env() -> Result<Self> {
-        let raw = match std::env::var(FIRST_APPEND_ENV) {
-            Ok(raw) => Some(raw),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => anyhow::bail!("{FIRST_APPEND_ENV}: {error}"),
-        };
-        Self::parse(raw.as_deref())
+        Self::parse(strict_env(FIRST_APPEND_ENV)?.as_deref())
     }
 
     /// Read at head construction and logged once.
@@ -70,6 +65,15 @@ impl FirstAppend {
             "DFlash first context append: {variant:?} ({FIRST_APPEND_ENV}=legacy|none|own|zero)"
         );
         Ok(variant)
+    }
+}
+
+/// The raw value of a strict startup switch: `None` when unset.
+pub(super) fn strict_env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => anyhow::bail!("{name}: {error}"),
     }
 }
 

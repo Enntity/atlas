@@ -240,6 +240,7 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
         own_capture: false,
         own_row_at: None,
         own_row: None,
+        slot0: Default::default(),
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(own, 40, 4, 4, 16).unwrap()),
     })
