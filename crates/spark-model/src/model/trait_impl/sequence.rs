@@ -157,6 +157,12 @@ impl TransformerModel {
         let slot_to_release = if slot_reused_by_compact { None } else { taken };
         if let Some(slot) = slot_to_release {
             let stream = self.gpu.default_stream();
+            // A verify step that finishes the sequence commits its accepted
+            // rows on the secondary stream and is freed straight away. Order
+            // the zero after that commit, or it can land on a released slot.
+            if let Err(e) = self.sync_secondary_dispatch() {
+                tracing::error!("free_sequence: sync_secondary before zero_slot({slot}): {e:#}");
+            }
             if let Err(e) = self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream) {
                 tracing::error!("free_sequence: ssm_pool.zero_slot({slot}): {e:#}");
             }

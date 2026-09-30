@@ -31,6 +31,10 @@ thread_local! {
     /// `#[test]` runs on its own, and `finish_sequence` is synchronous).
     pub(super) static CACHE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static FREE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `StubModel::commit_accepted_prefix` calls on this thread, as
+    /// `(seq.tokens.len(), num_accepted, k)`.
+    pub(super) static COMMITS: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Common-case shorthand: mid-context position (no seqlen ceiling), so
@@ -333,6 +337,10 @@ impl Model for StubModel {
     }
     fn detach_slot_for_reuse(&self, _s: &mut SequenceState) {}
     fn save_hidden_for_mtp(&self, _i: usize, _st: u64) -> Result<()> {
+        Ok(())
+    }
+    fn commit_accepted_prefix(&self, s: &mut SequenceState, n: usize, k: usize) -> Result<()> {
+        COMMITS.with(|c| c.borrow_mut().push((s.tokens.len(), n, k)));
         Ok(())
     }
 }
