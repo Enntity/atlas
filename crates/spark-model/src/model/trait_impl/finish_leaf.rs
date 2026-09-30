@@ -126,8 +126,10 @@
 //! # Rank env parity
 //!
 //! Both ranks must run with the same `ATLAS_GLM_PC_FINISH_LEAF`,
-//! `ATLAS_GLM_PC_FINISH_LEAF_BLOCKS` and the three variables above: the flag
-//! turns on the cache command (see "Rank env parity" in `pc_policy`).
+//! `ATLAS_GLM_PC_FINISH_LEAF_BLOCKS` and the three variables above. The flag
+//! itself adds no collective (a mismatch in it or in the span loses restores
+//! and logs an error on the worker, it does not hang), but
+//! `ATLAS_GLM_PC_EVICT` does (see "Rank env parity" in `pc_policy`).
 //!
 //! # Known limit
 //!
@@ -371,6 +373,19 @@ impl TransformerModel {
                 tracing::error!("finish-leaf: EP broadcast cache-sequence: {e:#}");
             }
         }
+    }
+
+    /// Worker: the head's cache command. The head sends it only with the
+    /// flag on, so a worker without it runs a different environment: nothing
+    /// hangs (the flag adds no collective), but no leaf can be restored.
+    pub(in crate::model) fn finish_leaf_cache_command(&self, seq: &SequenceState) {
+        if !enabled() {
+            tracing::error!(
+                "finish-leaf: cache command from the head, but ATLAS_GLM_PC_FINISH_LEAF is \
+                 off on this rank: the ranks' environments differ"
+            );
+        }
+        self.cache_sequence_dispatch(seq);
     }
 
     /// `cache_sequence` with the flag on, on either rank: cache the whole

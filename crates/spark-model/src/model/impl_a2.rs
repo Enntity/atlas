@@ -469,7 +469,9 @@ impl TransformerModel {
             super::vision_transport::EP_CMD_VISION_STATE => self.ep_worker_recv_vision_state()?,
             super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => self.glm_long_receive_tail(seq)?,
             0xFFFFFFF6 => self.ep_worker_set_native_fence(seq)?,
-            super::trait_impl::finish_leaf::EP_CMD_CACHE_SEQUENCE => self.cache_sequence(seq),
+            super::trait_impl::finish_leaf::EP_CMD_CACHE_SEQUENCE => {
+                self.finish_leaf_cache_command(seq)
+            }
             0xFFFFFFF0 => {
                 // Prefill chunk: receive chunk_len, chunk_start, full prompt length,
                 // then ALL prompt tokens via bulk broadcast (single NCCL op).
