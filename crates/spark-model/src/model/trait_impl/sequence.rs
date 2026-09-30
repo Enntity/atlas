@@ -64,9 +64,9 @@ impl TransformerModel {
                 // the next warm hit restores at this turn's END and replays
                 // ~nothing. Save logic + the secondary-stream ordering guard
                 // live in decode_checkpoint.rs (finish_leaf_snapshot).
-                // ATLAS_GLM_PC_FINISH_LEAF caches through finish_leaf.rs instead.
-                if super::finish_leaf::enabled() {
-                    return self.finish_leaf_cache(seq, bs);
+                // finish_leaf.rs caches a multi-rank world's sequence, or not at all.
+                if self.finish_cache_multi_rank(seq, bs) {
+                    return;
                 }
                 let finish_snap = self.finish_leaf_snapshot(seq);
                 let acquired = if let Some(snap_id) = finish_snap {
