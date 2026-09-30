@@ -510,7 +510,7 @@ pub fn build_model(
 
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
-    let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    let gib = kv_budget::gib;
     // Issue #71: lazy FP8→BF16 dequant copies allocate after this sizing;
     // see `ops::lazy_bf16_reserve` for what counts and what logs.
     let derived_reserve = crate::layers::ops::lazy_bf16_reserve(&store);
@@ -520,6 +520,7 @@ pub fn build_model(
         actual_free,
         gpu_memory_utilization,
         inference_reserve + derived_reserve,
+        hss_cache_blocks_per_seq.is_none(),
     );
     let (used_so_far, total_budget, kv_budget) = (budget.own, budget.total_budget, budget.bytes);
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
@@ -578,8 +579,7 @@ pub fn build_model(
                     "No memory left for KV cache: total GPU = {:.1} GB, \
                      --gpu-memory-utilization {:.0}% → budget {:.1} GB, \
                      but {:.1} GB already consumed + {:.1} GB inference reserve\
-                     {lazy_bf16_term} = {:.1} GB committed.  Raise \
-                     --gpu-memory-utilization or use a smaller model.",
+                     {lazy_bf16_term} = {:.1} GB committed.  {}",
                     total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                     gpu_memory_utilization * 100.0,
                     total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -587,6 +587,7 @@ pub fn build_model(
                     inference_reserve as f64 / (1024.0 * 1024.0 * 1024.0),
                     (used_so_far + inference_reserve + derived_reserve) as f64
                         / (1024.0 * 1024.0 * 1024.0),
+                    budget.no_room_advice(actual_free),
                 );
             }
             let n = match glm_cache_plan {
