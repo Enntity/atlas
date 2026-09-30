@@ -60,7 +60,7 @@ fn zero_scratch() -> DflashScratch {
     }
 }
 
-fn zero_head() -> BlockDiffusionDraftHead {
+pub(super) fn zero_head() -> BlockDiffusionDraftHead {
     BlockDiffusionDraftHead {
         num_layers: 0,
         hidden_size: 0,
@@ -236,6 +236,10 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
         ctx_committed: 12,
         ctx_positions: vec![1, 2, 3],
         end_floor: 0,
+        first_append_at: None,
+        own_capture: false,
+        own_row_at: None,
+        own_row: None,
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(own, 40, 4, 4, 16).unwrap()),
     })

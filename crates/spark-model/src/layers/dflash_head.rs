@@ -401,6 +401,22 @@ pub struct DflashProposerState {
     /// The request's min_tokens floor: drafts for positions below it skip
     /// end tokens (the verify head bans them there). 0 = no floor.
     pub end_floor: usize,
+    /// Sequence length at the end of prefill. The propose at exactly this
+    /// position is the first one: nothing of this sequence is in the
+    /// model-global capture yet (`first_append`). Consumed by any propose.
+    pub first_append_at: Option<usize>,
+    /// The caller's capture row holds this sequence's own verify rows, so
+    /// the next propose may append from it under a non-legacy `FirstAppend`.
+    /// Consumed by any propose.
+    pub own_capture: bool,
+    /// Sequence length after the single-sequence decode whose hidden stack
+    /// `own_row` holds: the propose at exactly this position appends it.
+    /// Consumed by any propose.
+    pub own_row_at: Option<usize>,
+    /// Non-legacy `FirstAppend`: the spare accumulator row past
+    /// `max_ctx_len`, holding this sequence's latest own capture (its last
+    /// prefilled position, then each single-sequence decode).
+    pub own_row: Option<DevicePtr>,
 }
 
 impl DflashProposerState {
@@ -436,6 +452,7 @@ impl DflashProposerState {
                 );
             } else {
                 self.ctx_hidden_acc = DevicePtr(0);
+                self.own_row = None;
             }
         }
         if let Some(bt) = self.block_table_dev.take() {
@@ -749,6 +766,13 @@ mod row_contract_tests;
 pub use lifecycle::{
     CaptureDescriptor, CaptureStatus, DflashGraphIdentity, DsparkLifecycleError, SequenceGeneration,
 };
+mod first_append;
+pub use first_append::FirstAppend;
+pub(crate) use first_append::{keep_own_capture, note_own_capture, own_capture_row};
+#[cfg(test)]
+mod first_append_own_tests;
+#[cfg(test)]
+mod first_append_tests;
 mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
@@ -872,7 +896,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let bf16 = 2usize;
         let ctx_slot_bytes = self.target_layer_ids.len() * self.target_hidden_size * bf16;
         let max_ctx_len = self.ctx_window_len();
-        let total = max_ctx_len * ctx_slot_bytes;
+        let own = self.startup.diagnostics.first_append != FirstAppend::Legacy;
+        let total = (max_ctx_len + own as usize) * ctx_slot_bytes;
         let ctx_hidden_acc = gpu.alloc(total)?;
         // Initialize to zero so stale data doesn't leak between sequences.
         // Transactional: a failed memset frees the accumulator instead of
@@ -911,6 +936,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_committed: 0,
             ctx_positions: Vec::new(),
             end_floor: 0,
+            first_append_at: None,
+            own_capture: false,
+            own_row_at: None,
+            own_row: own.then(|| ctx_hidden_acc.offset(max_ctx_len * ctx_slot_bytes)),
             // Propose lane: fixed for the seq lifetime (batch positions
             // reorder; captured graphs bake lane scratch pointers). Round-
             // robin keeps concurrent seqs spread across the lane streams.
@@ -1268,6 +1297,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 );
             } else {
                 dstate.ctx_hidden_acc = DevicePtr(0);
+                dstate.own_row = None;
             }
         }
         // Free the device-side block table (lazily allocated in propose.rs).
@@ -1297,6 +1327,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
         dstate.last_num_drafted = 0;
         dstate.last_num_accepted = 0;
         dstate.skip_next_decode_append = false;
+        (dstate.first_append_at, dstate.own_row_at) = (None, None);
+        dstate.own_capture = false;
         dstate.end_floor = 0;
         Ok(())
     }

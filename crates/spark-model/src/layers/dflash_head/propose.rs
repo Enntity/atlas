@@ -273,35 +273,10 @@ impl BlockDiffusionDraftHead {
         // hiddens to the accumulator poisons the ctx for subsequent
         // propose() calls. Setting this flag uses ONLY prefill captures
         // — clean ctx isolation for diagnosing real-traffic acceptance.
-        // EAGLE-fix: the K=2 accept path appends row 0 + row 1 in EAGLE order
-        // BEFORE calling propose and sets this one-shot flag, so propose must
-        // NOT also decode-append row 0 (would duplicate it). Consume the flag
-        // here. K=gamma/K=4 never set it -> their decode-append is unaffected.
-        let eagle_skip = dstate.skip_next_decode_append;
-        dstate.skip_next_decode_append = false;
-        let skip_decode_append = self.startup.diagnostics.no_decode_append;
-        if !skip_decode_append
-            && !eagle_skip
-            && let Some(latest_ctx) = target_hidden_stack
-            && dstate.ctx_len < dstate.max_ctx_len
-        {
-            let dst_offset = dstate.ctx_len * dstate.ctx_slot_bytes;
-            ctx.gpu.copy_d2d_async(
-                latest_ctx,
-                dstate.ctx_hidden_acc.offset(dst_offset),
-                dstate.ctx_slot_bytes,
-                _stream,
-            )?;
-            // Phase I (v2): stamp this slot's TRUE absolute position, fixed
-            // forever. The just-decoded token sits at `position - 1` (the
-            // full-rebuild formula assigns slot ctx_len the position
-            // (position - (ctx_len+1)) + ctx_len == position - 1). Keeping
-            // ctx_positions parallel to ctx_len lets precompute rope each
-            // slot by its own fixed position instead of a sliding base.
-            debug_assert_eq!(dstate.ctx_positions.len(), dstate.ctx_len);
-            dstate.ctx_positions.push(position.saturating_sub(1) as i32);
-            dstate.ctx_len += 1;
-        }
+        //
+        // ATLAS_DFLASH_FIRST_APPEND picks what the first propose after
+        // prefill appends (`first_append`).
+        self.append_decode_ctx(dstate, target_hidden_stack, position, ctx.gpu, _stream)?;
 
         // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator after the decode
         // append (exactly the slots the block forward attends) ──

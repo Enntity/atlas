@@ -16,7 +16,9 @@ use super::loader_for_config;
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
 use super::{DflashBuildArgs, LoraBuildArgs, admit_lightning_dspark_product_build};
 use crate::layers::MtpQuantization;
-use crate::layers::dflash_head::{DsparkStartupExecution, LightningDsparkRuntimeToggles};
+use crate::layers::dflash_head::{
+    DsparkStartupExecution, FirstAppend, LightningDsparkRuntimeToggles,
+};
 use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
@@ -829,12 +831,14 @@ pub fn build_model(
                 // the admitted Lightning product derives it from the
                 // validated policy toggles; generic DFlash keeps legacy
                 // lenient environment semantics, still parsed exactly once.
-                let startup = match lightning_dspark_policy.as_ref() {
+                let mut startup = match lightning_dspark_policy.as_ref() {
                     Some(policy) => {
                         DsparkStartupExecution::from_lightning(policy.runtime_toggles())
                     }
                     None => DsparkStartupExecution::from_env_lenient(),
                 };
+                // Strict for every head: an unknown value fails the build.
+                startup.diagnostics.first_append = FirstAppend::for_head()?;
                 let head = crate::layers::BlockDiffusionDraftHead::from_weights(
                     weights,
                     target_embed_for_dflash,
