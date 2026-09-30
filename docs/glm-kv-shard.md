@@ -7,6 +7,11 @@ setting; decode at long context slower (see "Decode cost of the merge
 form"), cold prefill TTFT 1-2% slower. Default off: with the flag unset
 every allocation, kernel and launch is the one the engine ran before.
 
+Those measurements are from the old base (0965f8d5). The port onto
+integ/next (1b1f8551, branch `integ/exp-kvshard`) passes the unit tests and
+builds, and has not run on the pair: see "On integ/next" for what changed
+around it and what the port relies on.
+
 ## Why
 
 GLM-5.3-Flash on a TP2 pair (two GB10, 128 GB unified memory each) stores
@@ -267,18 +272,72 @@ of any row), from 12 (four rows rank 1 owns nothing of, four it does), from
 for both ranks, and where a rank owns nothing the compact and uncompacted
 shards are bitwise equal.
 
-Flag-off identity of the edited kernels: the four pre-existing
-`*_tc_kv_pad{,_split}` entries compile to the same PTX as at f42b634f up to
-basic-block label numbers; `glm_sparse_decode_split_merge{,_f32}` compile
-differently (the partition accessors), so the unsharded split + merge and the
-unsplit kernel were run from both trees on the same inputs (rows 1/2/3/4/8,
-full / padded / holed selections, BF16 and fp8_g128, 81 MB of partials, LSEs
-and outputs) and compared: bitwise equal.
+Flag-off identity of the edited kernels: every GLM entry that exists on
+integ/next compiles to the same PTX there and here up to basic-block label
+numbers (release builds compared entry by entry), and
+`glm_sparse_decode_split_merge` up to the mangled names of its three shared
+variables as well: the extra partition is a template parameter, so without
+it the body is the original kernel access for access. On the old base the
+merge still took the extra partition as a run-time pointer and compiled
+differently; there the unsharded split + merge and the unsplit kernel were
+run from both trees on the same inputs (rows 1/2/3/4/8, full / padded /
+holed selections, BF16 and fp8_g128, 81 MB of partials, LSEs and outputs)
+and compared: bitwise equal.
 
 What is left with both tunings: ~30 us per layer of launches that have no
 unsharded counterpart (compaction, the FP32 merge, a second launch's fixed
 cost), and whatever part of the partial swap outlasts the own-head partitions
 it hides behind — roughly 0.4-0.7 ms per 8-row step.
+
+## On integ/next
+
+What integ/next added since the old base, and how the shard sits with it.
+None of it is measured on hardware yet.
+
+- **Index split (`ATLAS_GLM_INDEX_SPLIT`).** The split is over an owner's
+  query rows, scored against the pooled index keys, which stay replicated;
+  the ranks swap finished rows of logical token ids. Nothing in it depends
+  on which rank stores a latent, and both ranks end with the identical full
+  selection as before. It admits owners of 256+ rows, which are always
+  view-form owners; an overlap window (merge form, at most 64 rows) hands the
+  selection a communicator without exchange support, so a split cannot start
+  inside one.
+- **Pipelined sparse prefill (`ATLAS_GLM_SPARSE_PREFILL_PIPE`).** A
+  view-form owner hands the unchanged kernels its assembled history and the
+  identity table where they took the pool and the sequence's table
+  (`glm_owner_latents`). Under the pipe a sparse owner gets no BF16 view
+  unless the native library admits it, so the pipelined kernel reads the
+  assembled `fp8_g128` view directly; a BF16 view, when wanted, is
+  dequantized from the assembled view. The native bridge is refused for
+  sharded latents without a BF16 view. Merge-form owners never build a view
+  and always run the `*_kv_pad_split` kernels.
+- **KV write floor.** The floored cache write maps only the written rows'
+  slots (`joint.slot + floor`) to local slots. Rows below the floor sit in
+  blocks a prefix match adopted at their own logical index, whose latents
+  their owner wrote when the prefix was computed.
+- **Mirrored KV admission and retry.** Each rank reserves a chunk's blocks
+  by logical index and the ranks vote; a residue that runs dry on one rank
+  is an agreed `Exhausted`, rolled back on both (the blocks return to their
+  residue's list).
+- **Prefix sharing and policy.** Matches cover whole blocks, are cut to the
+  ranks' agreed length and are adopted positionally (`prefix_share`), so a
+  shared block keeps its residue. `ATLAS_GLM_PC_EVICT`, `..._BRANCH` and
+  `..._FINISH_LEAF` act on KDA snapshots, not on latents.
+- **Pool sizing.** `kv_budget` still yields a byte budget from the process's
+  own footprint; `GlmCachePlan::latent_sharded` turns it into blocks with the
+  halved latent and the fixed scratch. The scratch itself is allocated with
+  the pool, after sizing.
+- **Startup agreement.** integ/next has no general settings agreement, so
+  `[shard, compact, overlap, check]` ride the top byte of the word the ranks
+  already gather for the pool size (`agree_kv_blocks`): ranks that differ
+  fail at startup, each naming both values. Unsharded the word is the plain
+  block count. When the settings table of opt/startup-parity lands, these
+  four belong in it (`glm_kv_shard::{requested, MergeTuning::get,
+  check_requested}`) and the piggyback can go.
+- **Verify graphs (`ATLAS_GLM_VERIFY_GRAPH`)** are vetoed by the shard's
+  graph suppression on both ranks: verify stays eager.
+- **`ATLAS_GLM_DET_TRACE`** taps the selected ids of merge-form owners like
+  every other owner's (`sel`).
 
 ## Numerics
 
@@ -296,6 +355,11 @@ Supported (implemented): prefill chunks (incl. sequence-parallel prefill,
 pieces across the 2048 dense/sparse boundary), DFlash verify (single owner,
 owner-batched, fused prefill+verify), single-sequence eager decode, BF16 and
 fp8_g128 caches, prefix caching (positional sharing keeps each block's owner).
+
+Refused at startup: a rank whose `[shard, compact, overlap, check]` differ
+from its peer's, a tuning without the shard, `--high-speed-swap`, a world
+other than a TP2 pair with 32 heads per rank, a latent dtype other than BF16
+or `fp8_g128`.
 
 Not supported (fail closed with the `k_pool_ptr` panic or a boot error):
 multi-sequence batched decode (`decode_batch` / multi-seq MLA), the repaired
