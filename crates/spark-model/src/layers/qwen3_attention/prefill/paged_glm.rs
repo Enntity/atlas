@@ -277,26 +277,15 @@ impl Qwen3AttentionLayer {
             if sharded && on as usize <= crate::layers::glm_kv_shard::MERGE_MAX_ROWS {
                 // Few rows over sharded latents: each rank attends over the
                 // selected tokens it stores and the partials are LSE-merged.
-                let selected = match sparse_indices {
-                    Some((indices, width)) => {
-                        ensure!(
-                            width == crate::layers::glm_kv_shard::WIDTH,
-                            "GLM KV shard expects {} selected IDs, got {width}",
-                            crate::layers::glm_kv_shard::WIDTH
-                        );
-                        Some(indices)
-                    }
-                    None => None,
-                };
-                let rows = shard::ShardRows {
-                    query: q_absorbed,
-                    selected,
-                    causal_start: o.seq_len_start as u32,
-                    block_table: o.meta.block_table,
-                    rows: on,
-                    end: Some(sequence_end),
-                };
-                self.glm_shard_merge_attention(kv_cache, &octx, rows, attn_latent, stream)?;
+                self.glm_shard_merge_owner(
+                    kv_cache,
+                    &octx,
+                    o,
+                    q_absorbed,
+                    sparse_indices,
+                    attn_latent,
+                    stream,
+                )?;
             } else {
                 // Sharded latents: assemble this owner's whole history (own
                 // blocks + the peer's) and read it through an identity table.

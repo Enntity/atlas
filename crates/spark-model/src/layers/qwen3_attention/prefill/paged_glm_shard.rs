@@ -81,24 +81,30 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    /// `ATLAS_GLM_KV_SHARD_CHECK=1`: both ranks must hold the same table.
+    /// `ATLAS_GLM_KV_SHARD_CHECK=1`: this rank's table must place every
+    /// logical block on the rank its index names, and both ranks must see
+    /// the same number of blocks (their physical ids legitimately differ).
     fn glm_shard_check(
         &self,
+        s: &LatentShard,
         comm: &dyn CommBackend,
         gpu: &dyn GpuBackend,
         words: DevicePtr,
         table: &[u32],
         stream: u64,
     ) -> Result<()> {
-        let hash = shard::table_hash(table);
-        gpu.copy_h2d_async(&hash.to_le_bytes(), words, stream)?;
+        s.check_table(table)
+            .with_context(|| format!("attention layer {}", self.attn_layer_idx))?;
+        let blocks = table.len() as u64;
+        gpu.copy_h2d_async(&blocks.to_le_bytes(), words, stream)?;
         shard::pair_exchange(comm, words, words.offset(8), 8, stream)?;
         let mut peer = [0u8; 8];
         gpu.copy_d2h_on_stream(words.offset(8), &mut peer, stream)?;
+        let peer = u64::from_le_bytes(peer);
         ensure!(
-            u64::from_le_bytes(peer) == hash,
-            "GLM KV shard: the ranks disagree on a {}-block table at attention layer {}",
-            table.len(),
+            peer == blocks,
+            "GLM KV shard: rank {} attends {blocks} blocks, its peer {peer}, at attention layer {}",
+            s.spec.rank,
             self.attn_layer_idx
         );
         Ok(())
@@ -130,7 +136,8 @@ impl Qwen3AttentionLayer {
             && let Some(end) = a.end
         {
             let table = read_table(gpu, a.block_table, end.div_ceil(16), stream)?;
-            self.glm_shard_check(comm, gpu, s.scratch.offset(layout.check), &table, stream)?;
+            let words = s.scratch.offset(layout.check);
+            self.glm_shard_check(&s, comm, gpu, words, &table, stream)?;
         }
         let splits = shard::merge_splits(a.rows);
         let m = MergeLayout::new(a.rows, splits);
@@ -218,6 +225,37 @@ impl Qwen3AttentionLayer {
         )
     }
 
+    /// [`Self::glm_shard_merge_attention`] for one few-row prefill or verify
+    /// owner: `selected` is its `(IDs, width)` selection, `None` when the
+    /// whole causal history is selected.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn glm_shard_merge_owner(
+        &self,
+        kv_cache: &PagedKvCache,
+        ctx: &ForwardContext,
+        o: &super::GlmChunkOwner,
+        query: DevicePtr,
+        selected: Option<(DevicePtr, u32)>,
+        output: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        if let Some((_, width)) = selected {
+            ensure!(
+                width == WIDTH,
+                "GLM KV shard expects {WIDTH} selected IDs, got {width}"
+            );
+        }
+        let rows = ShardRows {
+            query,
+            selected: selected.map(|(ids, _)| ids),
+            causal_start: o.seq_len_start as u32,
+            block_table: o.meta.block_table,
+            rows: o.rows as u32,
+            end: Some(o.seq_len_start + o.rows),
+        };
+        self.glm_shard_merge_attention(kv_cache, ctx, rows, output, stream)
+    }
+
     /// View form: assemble the sequence's latents for logical tokens
     /// `[0, end)` — this rank's blocks copied locally, the peer's exchanged
     /// in pieces — and return `(view, identity table)` for the unchanged
@@ -241,9 +279,12 @@ impl Qwen3AttentionLayer {
         let gpu = ctx.gpu;
         let table = read_table(gpu, block_table, blocks, stream)?;
         if shard::check_requested() {
-            self.glm_shard_check(comm, gpu, s.scratch.offset(layout.check), &table, stream)?;
+            let words = s.scratch.offset(layout.check);
+            self.glm_shard_check(&s, comm, gpu, words, &table, stream)?;
         }
-        let plan = s.plan(&table);
+        // Validates the residue invariant: a violation would pair the wrong
+        // blocks across the ranks.
+        let plan = s.plan(&table)?;
         let at = |offset: usize| s.scratch.offset(offset);
         let (mine_slot, mine_dst, peer_dst) = (
             at(layout.mine_slot),

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Token-sharded GLM MLA latents over the TP pair (`ATLAS_GLM_KV_SHARD=1`).
 //!
-//! Each physical KV block's latents live on one rank
-//! (`spark_runtime::kv_cache::LatentShard`); the semantic-index keys stay
+//! Each KV block's latents live on one rank
+//! (`spark_runtime::kv_cache::LatentShard`): logical block `l` of every
+//! sequence on rank `l % 2`, which the allocator guarantees although the
+//! ranks' physical ids differ; the semantic-index keys stay
 //! replicated, so both ranks still select the same top-k tokens locally with
 //! no exchange. Attention then runs in one of two exact forms
 //! (docs/glm-kv-shard.md):
@@ -61,7 +63,8 @@ pub fn requested() -> Result<bool> {
 }
 
 /// `ATLAS_GLM_KV_SHARD_CHECK=1`: before each sharded attention, confirm
-/// both ranks hold the same block table (one host sync + exchange each).
+/// this rank's block table keeps the ownership invariant and both ranks
+/// attend the same number of blocks (one host sync + exchange each).
 pub fn check_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| flag("ATLAS_GLM_KV_SHARD_CHECK").unwrap_or(false))
@@ -265,16 +268,6 @@ pub fn pair_exchange(
     comm.send_to(send.0, bytes, peer, stream)?;
     comm.recv_from(recv.0, bytes, peer, stream)?;
     comm.group_end()
-}
-
-/// FNV-1a of a block table, the `ATLAS_GLM_KV_SHARD_CHECK` fingerprint.
-pub fn table_hash(table: &[u32]) -> u64 {
-    table
-        .iter()
-        .flat_map(|b| b.to_le_bytes())
-        .fold(0xcbf2_9ce4_8422_2325u64 ^ table.len() as u64, |h, byte| {
-            (h ^ byte as u64).wrapping_mul(0x0100_0000_01b3)
-        })
 }
 
 #[cfg(test)]

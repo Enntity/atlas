@@ -210,7 +210,9 @@ impl TransformerModel {
         // fill in upload_batch_metadata_*) would otherwise dequant random
         // bytes and inject garbage into attention scores.
         let mut kv_cache = kv_cache;
-        let dummy_kv_block = kv_cache.alloc_block()?;
+        // Padding tables name it at every logical index; draw it as logical
+        // block 0 (a latent-sharded cache refuses index-less allocation).
+        let dummy_kv_block = kv_cache.alloc_block_at(0)?;
         kv_cache.zero_block(dummy_kv_block, gpu.as_ref(), gpu.default_stream())?;
         gpu.synchronize(gpu.default_stream())?;
 

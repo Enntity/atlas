@@ -2,6 +2,8 @@
 // GLM token-sharded latent storage (ATLAS_GLM_KV_SHARD=1): the device half of
 // the ownership rule in crates/spark-runtime/src/kv_cache/latent_shard.rs —
 // physical block `b` is stored by rank `b % world` at local slot `b / world`.
+// The ranks' ids differ, but the allocator gives the block at logical index
+// `l` an id with `b % world == l % world`, so the ranks agree on owners.
 // Keep the two in step.
 #include <cuda_runtime.h>
 #include <cstddef>

@@ -73,13 +73,6 @@ fn scratch_layout_holds_views_pieces_and_the_widest_owner() {
     assert!(widest < 40 << 20, "{widest}");
 }
 
-#[test]
-fn table_hash_distinguishes_order_and_length() {
-    assert_ne!(table_hash(&[1, 2]), table_hash(&[2, 1]));
-    assert_ne!(table_hash(&[0]), table_hash(&[0, 0]));
-    assert_eq!(table_hash(&[5, 9, 3]), table_hash(&[5, 9, 3]));
-}
-
 /// One partition's normalized output and natural LSE (`-inf`, zeros when
 /// it selects nothing): the `*_split` kernel's contract.
 fn partial(q: &[f32], keys: &[Vec<f32>], ids: &[Option<usize>], scale: f32) -> (Vec<f32>, f32) {

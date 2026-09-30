@@ -14,21 +14,41 @@ BOTH ranks. The latent is 90% of the per-token KV bytes, so four concurrent
 
 ## Layout
 
-- **Ownership by physical block id.** Block `b` is stored by rank `b % 2` at
-  local slot `b / 2` of that rank's per-layer K pool (V aliases K). The rule
-  lives in `crates/spark-runtime/src/kv_cache/latent_shard.rs`
-  (`LatentShard`) and, for the device side, in
-  `kernels/gb10/glm-5.3-flash/nvfp4/glm_kv_shard.cu`.
-- **Everything else is unchanged and replicated:** the block allocator, block
-  tables, refcounts, the prefix cache (radix tree), eviction, the pooled
-  semantic-index keys, the lent index tails and all KDA state. Because block
-  ids are identical on both ranks, both ranks agree on who owns what with no
-  extra metadata, and prefix sharing / eviction need no change (a shared block
-  is shared by id, so its owner never changes).
-- **Why block ids rather than logical positions:** each rank allocates
-  exactly `ceil(N / 2)` slots and can never run out of its half, whatever the
-  allocator does. The allocator hands out ascending ids, so a sequence's
-  blocks alternate between ranks and the work splits ~50/50.
+- **Ownership by block-id residue, pinned to the logical index.** Block `b`
+  is stored by rank `b % 2` at local slot `b / 2` of that rank's per-layer K
+  pool (V aliases K). The rule lives in
+  `crates/spark-runtime/src/kv_cache/latent_shard.rs` (`LatentShard`) and,
+  for the device side, in `kernels/gb10/glm-5.3-flash/nvfp4/glm_kv_shard.cu`.
+- **The ranks' physical ids differ; their residues do not.** Each rank runs
+  its own allocator and frees in its own order (DFlash verify-row rollback,
+  prefix-cache inserts and sequence frees iterate rank-local state), so after
+  real traffic the same logical block has different ids on the two ranks
+  (seen on hardware: a 128-block table differed from its first entry). A
+  sharded pool therefore keeps one free list per id residue and draws the
+  block for logical index `l` from list `l % 2`
+  (`crates/spark-runtime/src/kv_cache/free_blocks.rs`,
+  `PagedKvCache::try_alloc_block_at`). Every table entry then satisfies
+  `b % 2 == l % 2`, so both ranks agree that logical block `l` is stored by
+  rank `l % 2`, whatever the ids are. The sequence allocators
+  (`block_mgmt::ensure_blocks_through_{prefill,decode}`) pass the index;
+  index-less `alloc_block` / `try_alloc_block` are refused under the shard.
+- **Prefix caching needs no change:** sharing is positional (a cached block
+  is only matched at its own logical index), so a shared block keeps its
+  residue and its owner.
+- **Why residues rather than a per-rank slot map:** slot `b / 2` needs no
+  map, no device table and no kernel change, and a rank can never be handed
+  more blocks than its `ceil(N / 2)` slots. The cost is that a residue can
+  run dry while the other still has blocks (many short sequences all at
+  logical 0, or a prefix tree with more even than odd blocks):
+  `num_free_blocks()` reports `2 x` the scarcer residue, which the
+  scheduler's admission and prefix-cache reclaim loops already act on, and
+  `block_mgmt::alloc_block_evicting` evicts from the prefix cache until the
+  residue has a block. A slot map with spare slots would absorb such
+  imbalance only by paying for the spare latents up front; the same bytes
+  buy a larger pool.
+- **Everything else is replicated:** block tables (in logical structure),
+  refcounts, the prefix cache, eviction, the pooled semantic-index keys, the
+  lent index tails and all KDA state.
 - **Writes:** `write_kv_cache_bf16_latent` maps each row's global slot to the
   owner's local slot (`glm_kv_shard_map_slots`, `-1` elsewhere; every GLM
   latent writer skips `-1`). Only the owner writes a row's latent.
@@ -149,7 +169,7 @@ same bytes as flag-off.
 Supported (implemented): prefill chunks (incl. sequence-parallel prefill,
 pieces across the 2048 dense/sparse boundary), DFlash verify (single owner,
 owner-batched, fused prefill+verify), single-sequence eager decode, BF16 and
-fp8_g128 caches, prefix caching (sharing by block id).
+fp8_g128 caches, prefix caching (positional sharing keeps each block's owner).
 
 Not supported (fail closed with the `k_pool_ptr` panic or a boot error):
 multi-sequence batched decode (`decode_batch` / multi-seq MLA), the repaired
@@ -172,9 +192,10 @@ several such sequences would hit the fail-closed panic.
      1.7x the flag-off boot at the same `--gpu-memory-utilization`;
    - `KV cache: N blocks x 11 layers = G GB total (V aliases K)` with G about
      half the flag-off value's latent part.
-   `..._CHECK=1` makes every sharded attention compare a hash of the block
-   table across ranks and fail if they differ (proves allocator agreement);
-   drop it for performance runs.
+   `..._CHECK=1` makes every sharded attention check on the host that each
+   table entry's residue matches its logical index and exchange the block
+   count with the peer (fails if they differ); drop it for performance runs.
+   The view form checks the residues on every call regardless.
 2. Greedy equality: the same prompts at temperature 0 with the flag off and
    on (short, 16K, 64K prompts; single sequence and 4 concurrent). Expect
    identical output for most prompts; where the text diverges, compare the
