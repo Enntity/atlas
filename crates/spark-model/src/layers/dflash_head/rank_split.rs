@@ -14,7 +14,7 @@
 //!
 //! Both ranks walk `Geometry::steps` of their own rank. The swaps are the
 //! same list in the same order with the same sizes on both
-//! ([`Geometry::swaps`]); only the local pieces between them differ. Pieces
+//! (`Geometry::swaps`); only the local pieces between them differ. Pieces
 //! are stream work with no host sync, so the head captures each run of pieces
 //! between two swaps as one CUDA graph and the worker enqueues its whole walk
 //! at once.
