@@ -102,9 +102,11 @@ Verdict: none of HSS is reused. The new tier refuses to run alongside it
 
 `--swap-space-gb` sequence preemption (`trait_impl/sequence/state_io.rs`)
 saves and restores K/V with `read_block`/`write_block` only. **It does not
-carry the GLM sparse-index cache**, so a GLM sequence restored from a
-preemption swap would have stale index keys. The fix could reuse the
-segment layout in `kv_cache/nvme_spill.rs`.
+carry the GLM sparse-index cache** (pooled keys, scales, raw tails — with
+slotted tails those also need re-lending), so a GLM sequence restored from a
+preemption swap would have stale index keys. A TODO in `state_io.rs` records
+this; until fixed, do not combine `--swap-space-gb` with GLM. The fix could
+reuse the segment layout in `kv_cache/nvme_spill.rs`.
 
 ## 2. What changed
 
@@ -137,9 +139,11 @@ segment layout in `kv_cache/nvme_spill.rs`.
 
 ## 3. Flags
 
-Set identical values on **every rank**. On a multi-rank world with prefix
-caching, startup all-gathers a fingerprint of these settings and refuses to
-start if they differ.
+Set identical values on **every rank**. On a multi-rank world, startup
+all-gathers a fingerprint of these settings and refuses to start if they
+differ. The exchange happens after each rank's own setup (env parse, disk
+budget, record file), and a rank whose setup failed sends a sentinel, so one
+misconfigured rank stops every rank instead of leaving its peers hung.
 
 | Variable | Meaning |
 |---|---|
@@ -186,7 +190,10 @@ export ATLAS_SSM_TIER_TIMING=1      # optional: per-spill timing lines
   gates of a pool that is still being filled. `glm_index_kpool_finalize`
   pools each 4-token group when its last token is written, and only full
   blocks (all 4 pools finalised) are spilled.
-  - If the tails workstream removes tails, nothing here changes.
+  - Slotted tails (prefix caching + `ATLAS_MARCONI_PREFILL_ONLY`) change
+    nothing in the record. A spilled block's lent tail returns with its last
+    KV ref (`return_evicted_block`), and a restored block is published
+    tail-less before the prefill reads it.
   - If the index moves to scaled FP8, the scales segment is picked up
     automatically.
 - **GLM-5.3 sizes per rank:**
@@ -209,7 +216,9 @@ export ATLAS_SSM_TIER_TIMING=1      # optional: per-spill timing lines
 2. The tree converts the LRU victims to on-disk nodes and returns
    `SpillOrder`s.
 3. `apply_evicted_blocks` then:
-   1. syncs the default stream;
+   1. syncs the whole device (`cuCtxSynchronize`) — a victim's last writes
+      can still be in flight on the prefill stream or another non-blocking
+      stream;
    2. queues 22 async D2H copies per block into pinned staging;
    3. syncs once;
    4. stamps the trailers and `pwrite`s each record;
@@ -290,10 +299,11 @@ of prefill.
   no-restore path together: a recompute, never a divergence.
   - With both tiers off this is a no-op, so there are no new collectives on
     the default path.
-- **Configuration:** at startup, a multi-rank world with prefix caching
-  all-gathers `(KV slots, record size, ATLAS_SSM_TIER set)` and aborts on a
-  mismatch, because the flags gate paired collectives. This single 8-byte
-  all-gather at startup is the one addition to the default path.
+- **Configuration:** at startup, every multi-rank world all-gathers
+  `(KV slots, record size, ATLAS_SSM_TIER set)` (or a failure sentinel) and
+  aborts on a mismatch or a failed rank, because the flags gate paired
+  collectives. This single 8-byte all-gather at startup is the one addition
+  to the default path.
 
 ## 6. Failure handling (never serve stale data)
 
