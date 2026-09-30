@@ -336,7 +336,10 @@ fn main() -> Result<()> {
                     let r = route(i);
                     ops::moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w(
                         g,
-                        k.gate_up_silu,
+                        ops::K128wKernel {
+                            grid: k.gate_up_silu,
+                            persist: KernelHandle(0),
+                        },
                         a_gu,
                         a_gu_s,
                         gate.table(),
@@ -349,7 +352,7 @@ fn main() -> Result<()> {
                         inter,
                         h,
                         r.prefix,
-                        bound,
+                        ops::K128wSchedule::Grid { bound },
                         stream,
                     )
                 },
@@ -366,7 +369,10 @@ fn main() -> Result<()> {
                     let [pp, sp, s2] = down.table();
                     ops::moe_w4a4_grouped_gemm_prequant_k128w(
                         g,
-                        k.k128w,
+                        ops::K128wKernel {
+                            grid: k.k128w,
+                            persist: KernelHandle(0),
+                        },
                         a_dn,
                         a_dn_s,
                         pp,
@@ -379,7 +385,7 @@ fn main() -> Result<()> {
                         h,
                         inter,
                         r.prefix,
-                        bound,
+                        ops::K128wSchedule::Grid { bound },
                         stream,
                     )
                 },

@@ -865,171 +865,178 @@ struct PqwGateUp {
     unsigned char* __restrict__ out_scale;    // [rows, N/16] E4M3
 };
 
-// GATE_UP: the 256 B columns are 128 gate columns and the same 128 up
-// columns, and the epilogue applies silu_mul_quant_nvfp4 in registers.
-template<bool GATE_UP>
-__device__ __forceinline__ void pqw_impl(
-    PQ2_ARGS,
-    const int* __restrict__ mtile_prefix,
-    const PqwGateUp up
+// One K128W tile is 64 rows x 256 B columns (GATE_UP: 128 gate columns and
+// the same 128 up columns, with silu_mul_quant_nvfp4 applied in registers),
+// computed by 256 threads in 8 warps of 32 rows x 64 columns. The pieces
+// below are shared by the one-tile-per-CTA grid (pqw_impl) and the
+// persistent grid (pqp_impl).
+#define PQW_NT 256
+#define PQW_NB (PQW_NT / 4 / 16)   // 16-column ldmatrix blocks per warp
+// [kp][n] and [group][n] shared tiles: 16-byte chunk c of row r at c ^ (r & 7).
+typedef unsigned char PqwA[M_TILE][PQ2_AP];
+typedef unsigned char PqwAs[M_TILE][PQ2_KS / GROUP_SIZE];
+typedef unsigned char PqwB[PQ2_KP][PQW_NT];
+typedef unsigned char PqwS[PQ2_KS / GROUP_SIZE][PQW_NT];
+typedef float PqwAcc[2][2 * PQW_NB][4];
+
+// The local expert owning global row tile `tile` of mtile_prefix.
+__device__ __forceinline__ unsigned int pqw_tile_expert(
+    int tile, const int* __restrict__ mtile_prefix, unsigned int num_experts
 ) {
-    constexpr int NT = 256, STAGES = 2;
-    constexpr int WN = NT / 4;       // columns per warp
-    constexpr int NB = WN / 16;      // 16-column ldmatrix blocks per warp
-    const int tile = blockIdx.y;
-    if (tile >= mtile_prefix[num_experts]) return;
     unsigned int lo = 0, hi = num_experts;
     while (hi - lo > 1) {
         const unsigned int mid = (lo + hi) >> 1;
         if (mtile_prefix[mid] <= tile) lo = mid; else hi = mid;
     }
-    const unsigned int expert_id = lo;
-    const int m_start = expert_offsets[expert_id];
-    const int M_expert = expert_offsets[expert_id + 1] - m_start;
-    const int cta_m_local = (tile - mtile_prefix[expert_id]) * M_TILE;
-    if (cta_m_local >= M_expert) return;
-    const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[expert_id];
-    const unsigned char* S_expert = (const unsigned char*)B_scale_ptrs[expert_id];
-    if (B_expert == 0) return;
-    const float scale2 = scale2_vals[expert_id];
-    const unsigned char* U_expert = GATE_UP ? (const unsigned char*)up.packed_ptrs[expert_id] : nullptr;
-    const unsigned char* US_expert = GATE_UP ? (const unsigned char*)up.scale_ptrs[expert_id] : nullptr;
-    const unsigned int cta_m = m_start + cta_m_local;
-    const unsigned int cta_n = blockIdx.x * (GATE_UP ? NT / 2 : NT);
+    return lo;
+}
 
-    const unsigned int t = threadIdx.x;
-    const unsigned int warp_id = t / 32, lane_id = t % 32;
-    const unsigned int warp_m_offset = (warp_id & 1) * 32;
-    const unsigned int warp_n_offset = (warp_id >> 1) * WN;
-    const unsigned int group_id = lane_id >> 2, tid = lane_id & 3;
-    // Tile 16-byte column chunk c: its source matrix and column, and this
-    // warp's nb-th chunk (GATE_UP: gate chunks 2wn, 2wn+1, then up's).
-    auto chunk_up = [](unsigned int c) { return GATE_UP && c >= NT / 32; };
-    auto chunk_col = [&](unsigned int c) { return cta_n + ((GATE_UP ? c % (NT / 32) : c) << 4); };
-    auto warp_chunk = [&](int nb) -> unsigned int {
-        return GATE_UP ? (nb >> 1) * (NT / 32) + (warp_id >> 1) * 2 + (nb & 1)
-                       : (warp_n_offset >> 4) + nb;
-    };
-
-    __shared__ __align__(16) unsigned char sA[STAGES][M_TILE][PQ2_AP];
-    __shared__ __align__(16) unsigned char sAs[STAGES][M_TILE][PQ2_KS / GROUP_SIZE];
-    // [kp][n] and [group][n], 16-byte chunk c of row r stored at c ^ (r & 7).
-    __shared__ __align__(16) unsigned char sB[STAGES][PQ2_KP][NT];
-    __shared__ __align__(16) unsigned char sS[STAGES][PQ2_KS / GROUP_SIZE][NT];
-    __shared__ int sTok[M_TILE];
-
+// Threads t < M_TILE: the source row of the tile's row t (its sorted token,
+// or the row itself).
+__device__ __forceinline__ void pqw_gather_rows(
+    int* sTok, unsigned int t, const int* __restrict__ sorted_token_ids,
+    unsigned int cta_m, int cta_m_local, int M_expert
+) {
     if (t < M_TILE) {
         const bool live = (cta_m_local + (int)t) < M_expert;
         sTok[t] = (sorted_token_ids && live) ? sorted_token_ids[cta_m + t] : (int)(cta_m + t);
     }
-    __syncthreads();
+}
 
-    const unsigned int M_eff = (unsigned int)M_expert;
-    auto issue = [&](int buf, unsigned int kb) {
-        {
-            const unsigned int row = t >> 2, col = (t & 3) << 4;
-            const bool valid = (cta_m_local + row) < M_eff;
-            const unsigned int a_row = (unsigned int)sTok[row];
-            moe_cp_async_pred_16(&sA[buf][row][col],
-                &A_packed[(unsigned long long)a_row * (K / 2) + kb / 2 + col], valid);
-        }
-        if (t < M_TILE) {
-            const bool valid = (cta_m_local + t) < M_eff;
-            const unsigned int a_row = (unsigned int)sTok[t];
-            moe_cp_async_pred_8(&sAs[buf][t][0],
-                &A_scale[(unsigned long long)a_row * (K / GROUP_SIZE) + kb / GROUP_SIZE], valid);
-        }
-        // B: 64 kp rows x NT bytes, NT/64 16-byte chunks per thread.
-        #pragma unroll
-        for (int r = 0; r < NT / 64; ++r) {
-            const unsigned int j = t + r * 256;
-            const unsigned int kp = j / (NT / 16), c = j % (NT / 16);
-            moe_cp_async_pred_16(&sB[buf][kp][(c ^ (kp & 7)) << 4],
-                &(chunk_up(c) ? U_expert : B_expert)[(unsigned long long)(kb / 2 + kp) * N + chunk_col(c)], true);
-        }
-        // B scales: 8 groups x NT bytes.
-        if (t < NT / 2) {
-            const unsigned int g = t / (NT / 16), c = t % (NT / 16);
-            moe_cp_async_pred_16(&sS[buf][g][(c ^ g) << 4],
-                &(chunk_up(c) ? US_expert : S_expert)[(unsigned long long)(kb / GROUP_SIZE + g) * N + chunk_col(c)], true);
-        }
-    };
-
-    float acc[2][2 * NB][4];
+__device__ __forceinline__ void pqw_zero_acc(PqwAcc& acc) {
     #pragma unroll
     for (int mi = 0; mi < 2; mi++)
         #pragma unroll
-        for (int i = 0; i < 2 * NB; i++) acc[mi][i][0] = acc[mi][i][1] = acc[mi][i][2] = acc[mi][i][3] = 0.0f;
+        for (int i = 0; i < 2 * PQW_NB; i++) acc[mi][i][0] = acc[mi][i][1] = acc[mi][i][2] = acc[mi][i][3] = 0.0f;
+}
 
+// Tile 16-byte column chunk c: whether it reads the up matrix, and its column.
+template<bool GATE_UP>
+__device__ __forceinline__ bool pqw_chunk_up(unsigned int c) { return GATE_UP && c >= PQW_NT / 32; }
+template<bool GATE_UP>
+__device__ __forceinline__ unsigned int pqw_chunk_col(unsigned int cta_n, unsigned int c) {
+    return cta_n + ((GATE_UP ? c % (PQW_NT / 32) : c) << 4);
+}
+
+// Thread t's cp.async loads of K stage kb into one set of shared tiles.
+template<bool GATE_UP>
+__device__ __forceinline__ void pqw_issue(
+    unsigned int t, PqwA& sA, PqwAs& sAs, PqwB& sB, PqwS& sS, const int* sTok,
+    const unsigned char* __restrict__ A_packed, const unsigned char* __restrict__ A_scale,
+    const unsigned char* B_expert, const unsigned char* S_expert,
+    const unsigned char* U_expert, const unsigned char* US_expert,
+    int cta_m_local, unsigned int M_eff, unsigned int cta_n, unsigned int N, unsigned int K, unsigned int kb
+) {
+    {
+        const unsigned int row = t >> 2, col = (t & 3) << 4;
+        const bool valid = (cta_m_local + row) < M_eff;
+        const unsigned int a_row = (unsigned int)sTok[row];
+        moe_cp_async_pred_16(&sA[row][col],
+            &A_packed[(unsigned long long)a_row * (K / 2) + kb / 2 + col], valid);
+    }
+    if (t < M_TILE) {
+        const bool valid = (cta_m_local + t) < M_eff;
+        const unsigned int a_row = (unsigned int)sTok[t];
+        moe_cp_async_pred_8(&sAs[t][0],
+            &A_scale[(unsigned long long)a_row * (K / GROUP_SIZE) + kb / GROUP_SIZE], valid);
+    }
+    // B: 64 kp rows x NT bytes, NT/64 16-byte chunks per thread.
+    #pragma unroll
+    for (int r = 0; r < PQW_NT / 64; ++r) {
+        const unsigned int j = t + r * 256;
+        const unsigned int kp = j / (PQW_NT / 16), c = j % (PQW_NT / 16);
+        moe_cp_async_pred_16(&sB[kp][(c ^ (kp & 7)) << 4],
+            &(pqw_chunk_up<GATE_UP>(c) ? U_expert : B_expert)[(unsigned long long)(kb / 2 + kp) * N + pqw_chunk_col<GATE_UP>(cta_n, c)], true);
+    }
+    // B scales: 8 groups x NT bytes.
+    if (t < PQW_NT / 2) {
+        const unsigned int g = t / (PQW_NT / 16), c = t % (PQW_NT / 16);
+        moe_cp_async_pred_16(&sS[g][(c ^ g) << 4],
+            &(pqw_chunk_up<GATE_UP>(c) ? US_expert : S_expert)[(unsigned long long)(kb / GROUP_SIZE + g) * N + pqw_chunk_col<GATE_UP>(cta_n, c)], true);
+    }
+}
+
+// Warp warp_id's MMAs of one K128 stage held in shared memory.
+template<bool GATE_UP>
+__device__ __forceinline__ void pqw_mma_stage(
+    PqwAcc& acc, const PqwA& sA, const PqwAs& sAs, const PqwB& sB, const PqwS& sS,
+    unsigned int warp_id, unsigned int lane_id
+) {
+    constexpr int NB = PQW_NB;
+    const unsigned int warp_m_offset = (warp_id & 1) * 32;
+    const unsigned int warp_n_offset = (warp_id >> 1) * (PQW_NT / 4);
+    // This warp's nb-th chunk (GATE_UP: gate chunks 2wn, 2wn+1, then up's).
+    auto warp_chunk = [&](int nb) -> unsigned int {
+        return GATE_UP ? (nb >> 1) * (PQW_NT / 32) + (warp_id >> 1) * 2 + (nb & 1)
+                       : (warp_n_offset >> 4) + nb;
+    };
     // Per-lane ldmatrix row: B (x2) rows kp = lane (matrix 0: k bytes 0-15 of
     // a k64 slice, matrix 1: bytes 16-31); scales (x1) rows g = lane & 7.
     const unsigned int kp_l = lane_id, g_l = lane_id & 7;
     const unsigned int sfa_m = (lane_id & 1) * 8 + (lane_id >> 2);
     const unsigned short tid_a = 0, bid_a = 0, bid_b = 0;
-
-    const unsigned int stages = K / PQ2_KS;
+    // B scales of this stage: quad thread s holds slice s's four for
+    // column group_id of each n8 subtile.
+    unsigned int sfb[2 * NB];
     #pragma unroll
-    for (int s0 = 0; s0 < STAGES - 1; ++s0) {
-        if (s0 < stages) issue(s0, s0 * PQ2_KS);
-        moe_cp_async_commit();
+    for (int nb = 0; nb < NB; ++nb) {
+        const unsigned int c = warp_chunk(nb);
+        unsigned int d[2];
+        pqw_ldsm_t1(d, __cvta_generic_to_shared(&sS[g_l][(c ^ g_l) << 4]));
+        sfb[nb * 2] = d[0];
+        sfb[nb * 2 + 1] = d[1];
     }
-    for (unsigned int st = 0; st < stages; ++st) {
-        const int buf = st % STAGES;
-        asm volatile("cp.async.wait_group %0;" :: "n"(STAGES - 2));
-        __syncthreads();   // stage `st` landed; every warp finished stage st-1
-        const unsigned int nxt = st + STAGES - 1;
-        if (nxt < stages) issue(nxt % STAGES, nxt * PQ2_KS);
-        moe_cp_async_commit();
-        // B scales of this stage: quad thread s holds slice s's four for
-        // column group_id of each n8 subtile.
-        unsigned int sfb[2 * NB];
+    #pragma unroll
+    for (int sl = 0; sl < 2; ++sl) {
+        const unsigned int ko = sl * 32;
+        const unsigned short tid_b = sl;
+        unsigned int a[2][4], sfa[2];
+        #pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+            const unsigned int j = lane_id >> 3, r = lane_id & 7;
+            const unsigned int addr = __cvta_generic_to_shared(
+                &sA[warp_m_offset + mi * 16 + r + (j & 1) * 8][ko + (j >> 1) * 16]);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                         : "=r"(a[mi][0]), "=r"(a[mi][1]), "=r"(a[mi][2]), "=r"(a[mi][3]) : "r"(addr));
+            sfa[mi] = *(const unsigned int*)&sAs[warp_m_offset + mi * 16 + sfa_m][sl * 4];
+        }
         #pragma unroll
         for (int nb = 0; nb < NB; ++nb) {
             const unsigned int c = warp_chunk(nb);
-            unsigned int d[2];
-            pqw_ldsm_t1(d, __cvta_generic_to_shared(&sS[buf][g_l][(c ^ g_l) << 4]));
-            sfb[nb * 2] = d[0];
-            sfb[nb * 2 + 1] = d[1];
-        }
-        #pragma unroll
-        for (int sl = 0; sl < 2; ++sl) {
-            const unsigned int ko = sl * 32;
-            const unsigned short tid_b = sl;
-            unsigned int a[2][4], sfa[2];
+            const unsigned int kp = ko + kp_l;
+            unsigned int b[4];
+            pqw_ldsm_t2(b, __cvta_generic_to_shared(&sB[kp][(c ^ (kp & 7)) << 4]));
             #pragma unroll
-            for (int mi = 0; mi < 2; ++mi) {
-                const unsigned int j = lane_id >> 3, r = lane_id & 7;
-                const unsigned int addr = __cvta_generic_to_shared(
-                    &sA[buf][warp_m_offset + mi * 16 + r + (j & 1) * 8][ko + (j >> 1) * 16]);
-                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                             : "=r"(a[mi][0]), "=r"(a[mi][1]), "=r"(a[mi][2]), "=r"(a[mi][3]) : "r"(addr));
-                sfa[mi] = *(const unsigned int*)&sAs[buf][warp_m_offset + mi * 16 + sfa_m][sl * 4];
-            }
-            #pragma unroll
-            for (int nb = 0; nb < NB; ++nb) {
-                const unsigned int c = warp_chunk(nb);
-                const unsigned int kp = ko + kp_l;
-                unsigned int b[4];
-                pqw_ldsm_t2(b, __cvta_generic_to_shared(&sB[buf][kp][(c ^ (kp & 7)) << 4]));
+            for (int h = 0; h < 2; ++h) {
+                const int nt = nb * 2 + h;
                 #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    const int nt = nb * 2 + h;
-                    #pragma unroll
-                    for (int mi = 0; mi < 2; ++mi) {
-                        asm volatile(
-                            "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"
-                            "{%14},{%15,%16},{%17},{%18,%19};"
-                            :"=f"(acc[mi][nt][0]),"=f"(acc[mi][nt][1]),"=f"(acc[mi][nt][2]),"=f"(acc[mi][nt][3])
-                            :"r"(a[mi][0]),"r"(a[mi][1]),"r"(a[mi][2]),"r"(a[mi][3]),"r"(b[h]),"r"(b[2 + h]),
-                             "f"(acc[mi][nt][0]),"f"(acc[mi][nt][1]),"f"(acc[mi][nt][2]),"f"(acc[mi][nt][3]),
-                             "r"(sfa[mi]),"h"(bid_a),"h"(tid_a),"r"(sfb[nt]),"h"(bid_b),"h"(tid_b));
-                    }
+                for (int mi = 0; mi < 2; ++mi) {
+                    asm volatile(
+                        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"
+                        "{%14},{%15,%16},{%17},{%18,%19};"
+                        :"=f"(acc[mi][nt][0]),"=f"(acc[mi][nt][1]),"=f"(acc[mi][nt][2]),"=f"(acc[mi][nt][3])
+                        :"r"(a[mi][0]),"r"(a[mi][1]),"r"(a[mi][2]),"r"(a[mi][3]),"r"(b[h]),"r"(b[2 + h]),
+                         "f"(acc[mi][nt][0]),"f"(acc[mi][nt][1]),"f"(acc[mi][nt][2]),"f"(acc[mi][nt][3]),
+                         "r"(sfa[mi]),"h"(bid_a),"h"(tid_a),"r"(sfb[nt]),"h"(bid_b),"h"(tid_b));
                 }
             }
         }
     }
+}
 
+// Warp warp_id's stores of a finished tile: BF16 C, or (GATE_UP) the packed
+// NVFP4 SiLU·mul outputs.
+template<bool GATE_UP>
+__device__ __forceinline__ void pqw_epilogue(
+    const PqwAcc& acc, unsigned int warp_id, unsigned int lane_id,
+    unsigned int expert_id, float scale2, unsigned int cta_m, int cta_m_local, int M_expert,
+    unsigned int cta_n, unsigned int N, __nv_bfloat16* __restrict__ C, const PqwGateUp& up
+) {
+    constexpr int NB = PQW_NB;
+    const unsigned int warp_m_offset = (warp_id & 1) * 32;
+    const unsigned int warp_n_offset = (warp_id >> 1) * (PQW_NT / 4);
+    const unsigned int group_id = lane_id >> 2, tid = lane_id & 3;
     if constexpr (GATE_UP) {
         // Gate subtile j pairs with up subtile j + 4 (same columns); each
         // 16-column group spans two subtiles, i.e. one quad of threads.
@@ -1090,6 +1097,68 @@ __device__ __forceinline__ void pqw_impl(
     }
 }
 
+template<bool GATE_UP>
+__device__ __forceinline__ void pqw_impl(
+    PQ2_ARGS,
+    const int* __restrict__ mtile_prefix,
+    const PqwGateUp up
+) {
+    constexpr int STAGES = 2;
+    const int tile = blockIdx.y;
+    if (tile >= mtile_prefix[num_experts]) return;
+    const unsigned int expert_id = pqw_tile_expert(tile, mtile_prefix, num_experts);
+    const int m_start = expert_offsets[expert_id];
+    const int M_expert = expert_offsets[expert_id + 1] - m_start;
+    const int cta_m_local = (tile - mtile_prefix[expert_id]) * M_TILE;
+    if (cta_m_local >= M_expert) return;
+    const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[expert_id];
+    const unsigned char* S_expert = (const unsigned char*)B_scale_ptrs[expert_id];
+    if (B_expert == 0) return;
+    const float scale2 = scale2_vals[expert_id];
+    const unsigned char* U_expert = GATE_UP ? (const unsigned char*)up.packed_ptrs[expert_id] : nullptr;
+    const unsigned char* US_expert = GATE_UP ? (const unsigned char*)up.scale_ptrs[expert_id] : nullptr;
+    const unsigned int cta_m = m_start + cta_m_local;
+    const unsigned int cta_n = blockIdx.x * (GATE_UP ? PQW_NT / 2 : PQW_NT);
+
+    const unsigned int t = threadIdx.x;
+    const unsigned int warp_id = t / 32, lane_id = t % 32;
+
+    __shared__ __align__(16) PqwA sA[STAGES];
+    __shared__ __align__(16) PqwAs sAs[STAGES];
+    __shared__ __align__(16) PqwB sB[STAGES];
+    __shared__ __align__(16) PqwS sS[STAGES];
+    __shared__ int sTok[M_TILE];
+
+    pqw_gather_rows(sTok, t, sorted_token_ids, cta_m, cta_m_local, M_expert);
+    __syncthreads();
+
+    const unsigned int M_eff = (unsigned int)M_expert;
+    auto issue = [&](int buf, unsigned int kb) {
+        pqw_issue<GATE_UP>(t, sA[buf], sAs[buf], sB[buf], sS[buf], sTok, A_packed, A_scale,
+            B_expert, S_expert, U_expert, US_expert, cta_m_local, M_eff, cta_n, N, K, kb);
+    };
+
+    PqwAcc acc;
+    pqw_zero_acc(acc);
+
+    const unsigned int stages = K / PQ2_KS;
+    #pragma unroll
+    for (int s0 = 0; s0 < STAGES - 1; ++s0) {
+        if (s0 < stages) issue(s0, s0 * PQ2_KS);
+        moe_cp_async_commit();
+    }
+    for (unsigned int st = 0; st < stages; ++st) {
+        const int buf = st % STAGES;
+        asm volatile("cp.async.wait_group %0;" :: "n"(STAGES - 2));
+        __syncthreads();   // stage `st` landed; every warp finished stage st-1
+        const unsigned int nxt = st + STAGES - 1;
+        if (nxt < stages) issue(nxt % STAGES, nxt * PQ2_KS);
+        moe_cp_async_commit();
+        pqw_mma_stage<GATE_UP>(acc, sA[buf], sAs[buf], sB[buf], sS[buf], warp_id, lane_id);
+    }
+    pqw_epilogue<GATE_UP>(acc, warp_id, lane_id, expert_id, scale2, cta_m, cta_m_local, M_expert,
+        cta_n, N, C, up);
+}
 
 extern "C" __global__ void __launch_bounds__(256, 2) moe_w4a4_grouped_gemm_prequant_t_k128w_compact(
     PQ2_ARGS,
@@ -1115,6 +1184,139 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_w4a4_grouped_gemm_prequ
     pqw_impl<true>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
         expert_offsets, sorted_token_ids, num_experts, N, K, mtile_prefix,
         PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale});
+}
+
+// ── Persistent K128W (ATLAS_GLM_MOE_PREFILL_PERSIST) ─────────────────────
+// The K128W tiles, loads, MMA sequence and epilogue above, so the output
+// bytes are identical; only the scheduling changes. Two CTAs per SM take
+// (row tile, N tile) work items w = n + N_tiles * row, in order, from the
+// zeroed counter `next_work`, which keeps the resident tiles as close
+// together as the K128W grid's in-order dispatch does (the row tiles of one
+// expert share its weights in L2; a static stride lets the CTAs drift apart
+// and re-read them from DRAM). Nothing launches past the live tiles (the
+// K128W grid launches the host's bound, most of it exiting at once), and
+// each CTA gathers its next tile's token rows and issues its first K stage
+// before the current tile's epilogue. Every tile below
+// mtile_prefix[num_experts] holds rows of a local expert. An item whose
+// weight table entry is null (the prefix came from another table) loads
+// and stores nothing, as the grid kernel's CTA returns, but still passes
+// the K loop's barriers with the CTA, its MMAs reading stale shared memory.
+template<bool GATE_UP>
+__device__ __forceinline__ void pqp_impl(
+    PQ2_ARGS,
+    const int* __restrict__ mtile_prefix,
+    int* __restrict__ next_work,
+    const PqwGateUp up
+) {
+    const unsigned int n_tiles = N / (GATE_UP ? PQW_NT / 2 : PQW_NT);
+    const unsigned int work = (unsigned int)mtile_prefix[num_experts] * n_tiles;
+    const unsigned int t = threadIdx.x;
+    const unsigned int warp_id = t / 32, lane_id = t % 32;
+
+    __shared__ __align__(16) PqwA sA[2];
+    __shared__ __align__(16) PqwAs sAs[2];
+    __shared__ __align__(16) PqwB sB[2];
+    __shared__ __align__(16) PqwS sS[2];
+    __shared__ int sTok[M_TILE];
+    __shared__ unsigned int sNext;
+
+    // One work item: its expert, rows, column tile and weight tables.
+    struct Tile {
+        unsigned int expert_id, cta_m, cta_n;
+        int M_expert, cta_m_local;
+        const unsigned char *B, *S, *U, *US;
+    };
+    auto decode = [&](unsigned int w) {
+        Tile d;
+        const int tl = (int)(w / n_tiles);
+        d.cta_n = (w % n_tiles) * (GATE_UP ? PQW_NT / 2 : PQW_NT);
+        d.expert_id = pqw_tile_expert(tl, mtile_prefix, num_experts);
+        const int m_start = expert_offsets[d.expert_id];
+        d.M_expert = expert_offsets[d.expert_id + 1] - m_start;
+        d.cta_m_local = (tl - mtile_prefix[d.expert_id]) * M_TILE;
+        d.cta_m = m_start + d.cta_m_local;
+        d.B = (const unsigned char*)B_packed_ptrs[d.expert_id];
+        d.S = (const unsigned char*)B_scale_ptrs[d.expert_id];
+        d.U = GATE_UP ? (const unsigned char*)up.packed_ptrs[d.expert_id] : nullptr;
+        d.US = GATE_UP ? (const unsigned char*)up.scale_ptrs[d.expert_id] : nullptr;
+        return d;
+    };
+    auto issue = [&](const Tile& d, int buf, unsigned int kb) {
+        if (d.B == 0) return;
+        pqw_issue<GATE_UP>(t, sA[buf], sAs[buf], sB[buf], sS[buf], sTok, A_packed, A_scale,
+            d.B, d.S, d.U, d.US, d.cta_m_local, (unsigned int)d.M_expert, d.cta_n, N, K, kb);
+    };
+    // Gather the item's token rows and issue its first K stage. Every
+    // thread's reads of sTok and sNext and of stage buffer 0 for the
+    // previous item precede the last __syncthreads of its K loop or this one.
+    auto start = [&](const Tile& d) {
+        pqw_gather_rows(sTok, t, sorted_token_ids, d.cta_m, d.cta_m_local, d.M_expert);
+        __syncthreads();
+        issue(d, 0, 0);
+        moe_cp_async_commit();
+    };
+
+    if (t == 0) sNext = atomicAdd(next_work, 1);
+    __syncthreads();
+    unsigned int w = sNext;
+    if (w >= work) return;
+    const unsigned int stages = K / PQ2_KS;
+    Tile cur = decode(w);
+    start(cur);
+    while (true) {
+        // Claim the next item now; the K loop's barriers publish it.
+        if (t == 0) sNext = atomicAdd(next_work, 1);
+        PqwAcc acc;
+        pqw_zero_acc(acc);
+        for (unsigned int st = 0; st < stages; ++st) {
+            const int buf = st % 2;
+            moe_cp_async_wait_all();
+            __syncthreads();   // stage `st` landed; every warp finished stage st-1
+            if (st + 1 < stages) issue(cur, buf ^ 1, (st + 1) * PQ2_KS);
+            moe_cp_async_commit();
+            pqw_mma_stage<GATE_UP>(acc, sA[buf], sAs[buf], sB[buf], sS[buf], warp_id, lane_id);
+        }
+        w = sNext;
+        const Tile done = cur;
+        const bool more = w < work;
+        if (more) {
+            cur = decode(w);
+            start(cur);
+        }
+        if (done.B != 0)
+            pqw_epilogue<GATE_UP>(acc, warp_id, lane_id, done.expert_id, scale2_vals[done.expert_id],
+                done.cta_m, done.cta_m_local, done.M_expert, done.cta_n, N, C, up);
+        if (!more) break;
+    }
+}
+
+// Grid (2 x SMs, 1, 1), 256 threads; arguments as
+// moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w plus the zeroed work
+// counter.
+extern "C" __global__ void __launch_bounds__(256, 2) moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w_persist(
+    PQ2_ARGS,
+    const int* __restrict__ mtile_prefix,
+    const unsigned long long* __restrict__ up_packed_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    unsigned char* __restrict__ out_packed,
+    unsigned char* __restrict__ out_scale,
+    int* __restrict__ next_work
+) {
+    pqp_impl<true>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
+        expert_offsets, sorted_token_ids, num_experts, N, K, mtile_prefix, next_work,
+        PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale});
+}
+
+// Grid (2 x SMs, 1, 1), 256 threads; arguments as
+// moe_w4a4_grouped_gemm_prequant_t_k128w_compact plus the zeroed work counter.
+extern "C" __global__ void __launch_bounds__(256, 2) moe_w4a4_grouped_gemm_prequant_t_k128w_compact_persist(
+    PQ2_ARGS,
+    const int* __restrict__ mtile_prefix,
+    int* __restrict__ next_work
+) {
+    pqp_impl<false>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
+        expert_offsets, sorted_token_ids, num_experts, N, K, mtile_prefix, next_work, PqwGateUp{});
 }
 
 // K-major-weight variant (checkpoint-native [N, K/2] + [N, K/16] scales):
