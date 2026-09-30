@@ -8,9 +8,12 @@
 //! (`spark_model::model::kv_admission`). The head then kills a larger
 //! in-flight sequence (its free is mirrored to the worker) and re-sends the
 //! whole chunk command; the worker, which kept waiting, runs it again. Only
-//! that agreed refusal is retried: any other error, including a "KV cache
-//! exhausted" raised once the forward has begun, may have mutated state on
-//! some rank, so it fails this request as before.
+//! that agreed exhaustion refusal is retried. An agreed refusal for any other
+//! reservation error fails just this request (every rank rolled back and the
+//! worker kept waiting, so the normal release reaches it), and any other
+//! error, including a "KV cache exhausted" raised once the forward has
+//! begun, may have mutated state on some rank, so it fails this request as
+//! before.
 //!
 //! The one progress a refused chunk can keep is a completed tail-checkpoint
 //! split half (`prefill_b.rs`: tokens appended, recurrent state advanced to
@@ -18,7 +21,7 @@
 //! there ([`resume_point`]) instead of running that half twice.
 
 use anyhow::Result;
-use spark_model::model::kv_admission::is_kv_admission_refused;
+use spark_model::model::kv_admission::kv_admission_refusal;
 use spark_model::traits::{Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
 
@@ -37,8 +40,8 @@ pub(super) fn resume_point(offset: usize, end: usize, seq_len: usize) -> Result<
 }
 
 /// Send (EP) and run the prompt chunk `[offset, end)`, killing the largest
-/// grammar-free active sequence after each agreed KV refusal. Falls through
-/// with the refusal when nothing can be evicted.
+/// grammar-free active sequence after each agreed KV exhaustion refusal.
+/// Falls through with the refusal when it is final or nothing can be evicted.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prefill_chunk_with_preemption(
     model: &dyn Model,
@@ -62,7 +65,7 @@ pub(super) fn prefill_chunk_with_preemption(
             is_last,
             stream,
         ) {
-            Err(e) if is_kv_admission_refused(&e) => {
+            Err(e) if kv_admission_refusal(&e).is_some_and(|r| r.retryable) => {
                 let Some(vi) = active
                     .iter()
                     .enumerate()

@@ -46,10 +46,12 @@ struct PreemptStubModel {
     total_blocks: usize,
     reclaimable: AtomicUsize,
     /// `prefill_chunk` records `(start, len)` and refuses (agreed) the first
-    /// `refuse_chunks` calls, completing a split half up to `split_cut` first.
+    /// `refuse_chunks` calls, completing a split half up to `split_cut` first;
+    /// `refusal_is_final` makes the refusal non-retryable.
     chunk_calls: Mutex<Vec<(usize, usize)>>,
     refuse_chunks: AtomicUsize,
     split_cut: usize,
+    refusal_is_final: bool,
     /// Every EP command word the head sends.
     wire: Mutex<Vec<u32>>,
 }
@@ -99,7 +101,8 @@ impl Model for PreemptStubModel {
         };
         s.tokens.extend_from_slice(&t[cs..stop]);
         s.seq_len = stop;
-        anyhow::ensure!(!refuse, KvAdmissionRefused { by_peer: true });
+        let (by_peer, retryable) = (true, !self.refusal_is_final);
+        anyhow::ensure!(!refuse, KvAdmissionRefused { by_peer, retryable });
         Ok(DevicePtr::NULL)
     }
     fn ep_broadcast_cmd(&self, word: u32) -> Result<()> {

@@ -7,11 +7,13 @@
 //! The head cannot decide alone: each rank evicts from its own prefix cache
 //! (rank-local, and it diverges — see the F83 note in `prefix_lookup`), so
 //! free-plus-evictable capacity differs per rank. Each rank therefore tries
-//! its own reservation and one min-vote decides for all. On refusal every
-//! rank undoes its reservation and returns [`KvAdmissionRefused`] from the
-//! same point, having mutated no sequence or GPU state for the chunk, so the
-//! head can free a victim and re-send the chunk while the worker simply
-//! waits for its next command (`spark-server` `prefill_preempt`).
+//! its own reservation and one min-vote over [`Admission`] decides for all.
+//! On refusal every rank undoes its reservation and returns
+//! [`KvAdmissionRefused`] from the same point, having mutated no sequence or
+//! GPU state for the chunk, so the worker simply waits for its next command
+//! while the head either frees a victim and re-sends the chunk (exhaustion)
+//! or fails just this request (any other reservation error), releasing the
+//! slot (`spark-server` `prefill_preempt`).
 
 use anyhow::Result;
 use spark_runtime::gpu::GpuBackend;
@@ -27,11 +29,14 @@ use crate::traits::SequenceState;
 mod tests;
 
 /// Every rank refused a prefill chunk's KV reservation before its forward
-/// pass and rolled it back; `by_peer` when this rank alone could have
-/// admitted it.
+/// pass and rolled it back; `by_peer` when a peer's outcome, worse than this
+/// rank's, decided it.
 #[derive(Debug)]
 pub struct KvAdmissionRefused {
     pub by_peer: bool,
+    /// Out of KV blocks, so freeing a victim can make a retry fit (any
+    /// other reservation failure would only repeat).
+    pub retryable: bool,
 }
 
 impl std::fmt::Display for KvAdmissionRefused {
@@ -41,25 +46,60 @@ impl std::fmt::Display for KvAdmissionRefused {
         } else {
             "this rank"
         };
-        write!(
-            f,
-            "KV cache exhausted: prefill chunk refused by {by} before its forward pass"
-        )
+        if self.retryable {
+            write!(
+                f,
+                "KV cache exhausted: prefill chunk refused by {by} before its forward pass"
+            )
+        } else {
+            write!(
+                f,
+                "prefill chunk KV reservation failed on {by} before its forward pass \
+                 (rolled back on every rank, not retried)"
+            )
+        }
     }
 }
 
 impl std::error::Error for KvAdmissionRefused {}
 
-/// Whether `e` is an agreed, rolled-back refusal (safe to retry the chunk).
-pub fn is_kv_admission_refused(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<KvAdmissionRefused>().is_some()
+/// The agreed, rolled-back refusal `e` carries, if any.
+pub fn kv_admission_refusal(e: &anyhow::Error) -> Option<&KvAdmissionRefused> {
+    e.downcast_ref()
+}
+
+/// One rank's reservation outcome, ordered so that the all-rank minimum is
+/// the verdict: the worst outcome on any rank decides for every rank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Admission {
+    Failed = 0,
+    Exhausted = 1,
+    Admitted = 2,
+}
+
+impl Admission {
+    fn of(local: &Result<()>) -> Self {
+        match local {
+            Ok(()) => Self::Admitted,
+            Err(e) if format!("{e:#}").contains("KV cache exhausted") => Self::Exhausted,
+            Err(_) => Self::Failed,
+        }
+    }
+
+    fn from_word(word: u32) -> Self {
+        match word {
+            0 => Self::Failed,
+            1 => Self::Exhausted,
+            _ => Self::Admitted,
+        }
+    }
 }
 
 /// EP worker: an agreed refusal is not fatal. The head re-sends the chunk
 /// after preempting, or releases the slot (`0xFFFFFFF1`); keep serving.
 pub(super) fn worker_step_outcome(step: Result<bool>) -> Result<bool> {
     match step {
-        Err(e) if is_kv_admission_refused(&e) => {
+        Err(e) if kv_admission_refusal(&e).is_some() => {
             tracing::warn!("EP worker: {e:#}; waiting for the head's retry or release");
             Ok(true)
         }
@@ -82,8 +122,9 @@ pub(super) fn check_worker_chunk_start(seq: &SequenceState, chunk_start: usize) 
 }
 
 /// Reserve `seq`'s blocks through `abs_block_idx`; `vote` turns this rank's
-/// success into the all-rank verdict. Transactional: unless every rank
-/// admits, this call's blocks (and HSS disk ids) are released again.
+/// outcome into the all-rank verdict. Transactional: unless every rank
+/// admits, this call's blocks (and HSS disk ids) are released again. A
+/// local error other than exhaustion stays in the refusal's chain.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn admit(
     seq: &mut SequenceState,
@@ -93,7 +134,7 @@ pub(crate) fn admit(
     gpu: &dyn GpuBackend,
     stream: u64,
     kv_poison: bool,
-    vote: impl FnOnce(bool) -> Result<bool>,
+    vote: impl FnOnce(Admission) -> Result<Admission>,
 ) -> Result<()> {
     let (blocks, disk_ids) = (seq.block_table.len(), seq.disk_block_ids.len());
     let local = ensure_blocks_through_prefill(
@@ -105,7 +146,9 @@ pub(crate) fn admit(
         stream,
         kv_poison,
     );
-    if vote(local.is_ok())? && local.is_ok() {
+    let mine = Admission::of(&local);
+    let agreed = vote(mine)?.min(mine);
+    if agreed == Admission::Admitted {
         return Ok(());
     }
     kv_cache.free_blocks(&seq.block_table.split_off(blocks));
@@ -120,13 +163,14 @@ pub(crate) fn admit(
             Ok(())
         });
     }
-    match local {
-        Err(e) if !format!("{e:#}").contains("KV cache exhausted") => Err(e),
-        local => Err(KvAdmissionRefused {
-            by_peer: local.is_ok(),
-        }
-        .into()),
-    }
+    let refused = KvAdmissionRefused {
+        by_peer: agreed < mine,
+        retryable: agreed == Admission::Exhausted,
+    };
+    Err(match local {
+        Err(e) if mine == Admission::Failed => e.context(refused),
+        _ => refused.into(),
+    })
 }
 
 impl TransformerModel {
@@ -149,11 +193,11 @@ impl TransformerModel {
             self.gpu.as_ref(),
             stream,
             self.levers.kv_poison,
-            |ok| {
+            |mine| {
                 if self.multi_rank_protocol_active() {
-                    Ok(self.ep_min_u32(ok as u32)? == 1)
+                    Ok(Admission::from_word(self.ep_min_u32(mine as u32)?))
                 } else {
-                    Ok(ok)
+                    Ok(mine)
                 }
             },
         )

@@ -5,7 +5,7 @@
 
 use super::super::prefill_preempt::{prefill_chunk_with_preemption, resume_point};
 use super::*;
-use spark_model::model::kv_admission::is_kv_admission_refused;
+use spark_model::model::kv_admission::kv_admission_refusal;
 
 const CHUNK: u32 = 0xFFFFFFF0;
 const RELEASE: u32 = 0xFFFFFFF1;
@@ -76,7 +76,7 @@ fn a_same_worded_error_that_is_not_the_agreed_refusal_is_not_retried() {
     let (_, mut seq) = prefilling();
     let mut active = vec![holding(0, 2)];
     let e = run(&model, &mut seq, &mut active).unwrap_err();
-    assert!(!is_kv_admission_refused(&e));
+    assert!(kv_admission_refusal(&e).is_none());
     assert_eq!(model.chunk_calls.lock().unwrap().len(), 1);
     assert!(model.freed_slots.lock().unwrap().is_empty());
     assert_eq!(active.len(), 1, "no victim for a non-retryable error");
@@ -90,9 +90,27 @@ fn a_refusal_with_nothing_to_evict_fails_after_one_attempt() {
     };
     let (_, mut seq) = prefilling();
     let e = run(&model, &mut seq, &mut Vec::new()).unwrap_err();
-    assert!(is_kv_admission_refused(&e));
+    assert!(kv_admission_refusal(&e).is_some_and(|r| r.retryable));
     assert_eq!(*model.wire.lock().unwrap(), vec![CHUNK, 24, 16, 40]);
     assert_eq!((seq.seq_len, seq.tokens.len()), (16, 16));
+}
+
+/// An agreed refusal for a reservation error other than exhaustion: every
+/// rank rolled back, but no victim can cure it, so only this request fails.
+#[test]
+fn a_final_agreed_refusal_fails_this_request_without_a_victim() {
+    let model = PreemptStubModel {
+        refuse_chunks: AtomicUsize::new(1),
+        refusal_is_final: true,
+        ..Default::default()
+    };
+    let (_, mut seq) = prefilling();
+    let mut active = vec![holding(0, 2), holding(1, 5)];
+    let e = run(&model, &mut seq, &mut active).unwrap_err();
+    assert!(kv_admission_refusal(&e).is_some_and(|r| !r.retryable));
+    assert_eq!(*model.wire.lock().unwrap(), vec![CHUNK, 24, 16, 40]);
+    assert!(model.freed_slots.lock().unwrap().is_empty());
+    assert_eq!(active.len(), 2, "no victim for a final refusal");
 }
 
 #[test]
