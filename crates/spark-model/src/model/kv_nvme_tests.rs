@@ -253,3 +253,72 @@ fn read_error_recomputes_and_forgets_the_record() {
     assert!(restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).is_none());
     assert_eq!(tree.nvme_stats().slots_used, 0);
 }
+
+/// Slotted index tails (prefix caching + ATLAS_MARCONI_PREFILL_ONLY): every
+/// tail a request was lent comes back — through spill and restore alike — and
+/// a restored block is published tail-less, never aliasing a live slot.
+#[test]
+fn slotted_tails_are_released_by_spill_and_absent_after_restore() {
+    use spark_runtime::kv_cache::{NO_TAIL, TailSlotPlan};
+    let gpu = MockGpuBackend::new();
+    let cfg = KvCacheConfig {
+        block_size: BS,
+        num_kv_heads: 1,
+        head_dim: 512,
+        num_layers: 2,
+        dtype: KvCacheDtype::Fp8G128,
+        layer_dtypes: vec![],
+        layer_dims: vec![],
+        cache_blocks_per_seq: None,
+    };
+    let mut kv = PagedKvCache::new_with_v_alias(cfg, POOL, &gpu, true).unwrap();
+    let plan = TailSlotPlan {
+        lag_blocks: 1,
+        sequences: 1,
+    }; // 3 slots
+    kv.attach_sparse_index_with_tail_slots(SparseIndexCacheConfig::bf16(4, 128), Some(plan), &gpu)
+        .unwrap();
+    let record = kv.nvme_record_bytes();
+    kv.attach_nvme_spill(Box::new(atlas_tier::MemSwapStore::new(record)), &gpu)
+        .unwrap();
+    let tree = tree_with_tier(64);
+    let tail_map = |kv: &PagedKvCache| {
+        let mut b = vec![0u8; POOL * 4];
+        gpu.copy_d2h(kv.sparse_index_tail_map_ptr(), &mut b)
+            .unwrap();
+        b.chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect::<Vec<u32>>()
+    };
+
+    // A request writes 3 blocks, each lent a tail, and caches them.
+    let t: Vec<u32> = (0..3 * BS as u32).collect();
+    let blocks: Vec<u32> = (0..3).map(|_| kv.try_alloc_block().unwrap()).collect();
+    kv.lend_tail_slots(&blocks, &gpu, 0).unwrap();
+    for (i, &b) in blocks.iter().enumerate() {
+        fill(&kv, &gpu, b, 0x60 + i as u8);
+        assert_ne!(tail_map(&kv)[b as usize], NO_TAIL);
+    }
+    let want: Vec<Vec<u8>> = blocks.iter().map(|&b| dump(&kv, &gpu, b)).collect();
+    let acquired = tree.insert(&t, &blocks, &[], BS, 0, 0);
+    cache_acquires_refs(&acquired, &mut kv);
+    tree.release(&t, BS, 0);
+    kv.free_blocks(&blocks);
+
+    pressure(&mut kv, &tree, &gpu);
+    assert_eq!(tree.nvme_stats().spills, 3);
+
+    let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
+    assert_eq!(r.restored, 3);
+    let m = tree.lookup(&t, BS, 0, 0);
+    let map = tail_map(&kv);
+    for (i, &b) in m.matched_blocks.iter().enumerate() {
+        assert_eq!(dump(&kv, &gpu, b), want[i], "block {i} bytes");
+        assert_eq!(map[b as usize], NO_TAIL, "restored block {i} owns no tail");
+    }
+    tree.release(&t, BS, 0);
+    // Every slot is free again: a new request can take the whole pool.
+    let fresh: Vec<u32> = (0..3).map(|_| kv.try_alloc_block().unwrap()).collect();
+    kv.lend_tail_slots(&fresh, &gpu, 0)
+        .expect("all tail slots returned");
+}

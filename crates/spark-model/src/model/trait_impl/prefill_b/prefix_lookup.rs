@@ -85,7 +85,16 @@ impl TransformerModel {
                 let local = prefix_match.matched_tokens as u32;
                 let agreed = self.ep_min_u32(local)? as usize;
                 if agreed < prefix_match.matched_tokens {
-                    self.prefix_cache.release(tokens, bs, seq.adapter_id);
+                    // Release exactly what the lookup acquired: the full-token
+                    // `release` would also dec nodes past the match (e.g. an
+                    // NVMe on-disk continuation, or a suffix another request
+                    // inserted meanwhile) that this lookup never inc'd.
+                    self.prefix_cache.release_matched(
+                        tokens,
+                        bs,
+                        prefix_match.matched_tokens,
+                        seq.adapter_id,
+                    );
                     if agreed > 0 {
                         prefix_match = self.prefix_cache.lookup(
                             &tokens[..agreed],

@@ -192,8 +192,18 @@ impl RadixTreeInner {
             };
             let access = self.nodes[id].last_access;
             let parent = self.nodes[id].parent;
-            let Some(slot) = self.alloc_slot(access) else {
-                if let Some(idx) = self.nvme.as_mut() {
+            // A ref-0 node has already lost the cache's baseline ref (an
+            // over-release): no lookup can reach it (`walk`/`nvme_path` need
+            // ref > 0) and its block's KV ref may be gone, so spilling it
+            // would only persist bytes nobody owns. Delete it as before.
+            let orphan = self.nodes[id].ref_count == 0;
+            let slot = if orphan {
+                None
+            } else {
+                self.alloc_slot(access)
+            };
+            let Some(slot) = slot else {
+                if !orphan && let Some(idx) = self.nvme.as_mut() {
                     idx.stats.cold_drops += 1;
                 }
                 phys.extend(self.drop_subtree(id));
@@ -412,8 +422,12 @@ impl RadixTreeInner {
                 break;
             };
             idx.stats.spill_failures += 1;
+            // Keyed on (slot, tag): the slot may already have been released
+            // and re-issued to another node's spill (a later epoch, new tag)
+            // by the time this failure is reported — never drop that node.
             let owner = idx.owner.get(o.slot as usize).copied().unwrap_or(NO_OWNER);
-            if owner != NO_OWNER && self.nodes[owner].nvme_slot == o.slot {
+            let same_spill = idx.tags.get(o.slot as usize) == Some(&o.tag);
+            if owner != NO_OWNER && same_spill && self.nodes[owner].nvme_slot == o.slot {
                 give_back.extend(self.drop_subtree(owner));
             }
         }

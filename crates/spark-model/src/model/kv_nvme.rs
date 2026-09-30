@@ -194,7 +194,17 @@ pub(crate) fn restore_prefix(
             None => break,
         }
     }
-    let (ok, failed) = kv_cache.nvme_read(&plan.disk[..blocks.len()], &blocks, gpu, stream);
+    let (mut ok, mut failed) = kv_cache.nvme_read(&plan.disk[..blocks.len()], &blocks, gpu, stream);
+    // Slotted index tails: a restored block is a shared cached block and must
+    // own NO tail (the index kernels then skip it). Its tail was released when
+    // it was last freed, but that release reaches the device map only with the
+    // next publish — do it now, on the stream the prefill will read on.
+    if ok > 0
+        && let Err(e) = kv_cache.lend_tail_slots(&[], gpu, stream)
+    {
+        tracing::warn!("NVMe prefix restore: tail-map publish failed ({e:#}) — recomputing");
+        (ok, failed) = (0, false);
+    }
     let give_back = tier.complete_restore(tokens, bs, adapter_id, &plan, &blocks[..ok], failed);
     // Allocated but not adopted (read failed / not reached): ref 1 → free.
     for &b in blocks[ok..].iter().chain(&give_back) {

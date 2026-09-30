@@ -204,6 +204,14 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(())
     }
 
+    fn synchronize_device(&self) -> Result<()> {
+        let status = unsafe { super::cuCtxSynchronize() };
+        if status != 0 {
+            bail!("cuCtxSynchronize failed: {}", cuda_error_text(status));
+        }
+        Ok(())
+    }
+
     fn default_stream(&self) -> u64 {
         self.default_stream
     }

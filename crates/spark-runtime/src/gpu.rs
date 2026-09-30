@@ -188,6 +188,13 @@ pub trait GpuBackend: Send + Sync {
     /// Synchronize a CUDA stream (blocks until all work completes).
     fn synchronize(&self, stream: u64) -> Result<()>;
 
+    /// Block until work on EVERY stream of this device context completes
+    /// (e.g. before host reads of memory other streams may still be writing).
+    /// Default: the default stream only — correct for single-stream backends.
+    fn synchronize_device(&self) -> Result<()> {
+        self.synchronize(self.default_stream())
+    }
+
     /// Get the default stream handle.
     fn default_stream(&self) -> u64;
 

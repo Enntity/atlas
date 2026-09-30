@@ -193,8 +193,9 @@ impl PagedKvCache {
 
     /// Write each order's block to its record. Must run BEFORE the blocks go
     /// back to the free list. Returns the orders that did NOT reach disk (the
-    /// tree must drop those nodes). Work in flight on `stream` is drained
-    /// first; cached blocks are complete and never rewritten.
+    /// tree must drop those nodes). Work in flight on EVERY stream is drained
+    /// first (a device-wide sync); cached blocks are complete and never
+    /// rewritten after that.
     pub fn nvme_write(
         &mut self,
         orders: &[SpillOrder],
@@ -268,7 +269,11 @@ fn write_batch(
     // SAFETY: the staging buffer is owned by `spill` and disjoint from
     // `spill.store` / `spill.segments`, which are borrowed alongside it.
     let staging = unsafe { std::slice::from_raw_parts_mut(spill.staging, spill.staging_bytes) };
-    gpu.synchronize(stream)?;
+    // Device-wide, not just `stream`: the victims' last writes may still be in
+    // flight on ANOTHER stream (the scheduler's prefill stream, MoE/secondary
+    // streams — all non-blocking), and a record gathered before they land
+    // would checksum and later restore torn KV. Paid once per staging batch.
+    gpu.synchronize_device()?;
     let mut enqueue = || -> Result<()> {
         for (i, o) in batch.iter().enumerate() {
             let mut off = i * record;

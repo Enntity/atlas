@@ -473,11 +473,14 @@ impl TransformerModel {
         if num_blocks == 0 || !self.prefix_cache.is_active() {
             return 0;
         }
+        // KV lock BEFORE `evict`, as every other eviction site does: with the
+        // NVMe tier, `evict` hands out record slots that must be written before
+        // anyone else can evict/restore against the same tree + pool.
+        let mut kv = self.kv_cache.lock();
         let evicted = self.prefix_cache.evict(num_blocks);
         if evicted.is_empty() {
             return 0;
         }
-        let mut kv = self.kv_cache.lock();
         let before = kv.num_free_blocks();
         self.apply_evicted(evicted, &mut kv);
         kv.num_free_blocks().saturating_sub(before)

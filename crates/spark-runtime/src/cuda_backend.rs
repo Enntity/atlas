@@ -40,6 +40,7 @@ unsafe extern "C" {
     ) -> i32;
     pub(super) fn cuMemcpyDtoDAsync_v2(dst: u64, src: u64, bytes: usize, stream: u64) -> i32;
     pub(super) fn cuStreamSynchronize(stream: u64) -> i32;
+    pub(super) fn cuCtxSynchronize() -> i32;
     pub(super) fn cuStreamQuery(stream: u64) -> i32;
     pub(super) fn cuMemHostGetDevicePointer_v2(
         dptr: *mut u64,

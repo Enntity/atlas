@@ -179,6 +179,37 @@ fn spill_failure_degrades_to_plain_eviction() {
 }
 
 #[test]
+fn stale_spill_failure_never_drops_the_slots_new_owner() {
+    let tree = spilled_tree(1);
+    let a = toks(0, 1);
+    let b = toks(5000, 1);
+    cache(&tree, &a, &[10]);
+    cache(&tree, &b, &[20]);
+    let first = tree.evict(1).spill[0]; // a -> slot 0
+    let second = tree.evict(1).spill[0]; // b displaces a in slot 0
+    assert_eq!((first.slot, second.slot), (0, 0));
+    assert_ne!(first.tag, second.tag);
+    // a's (late) failure report names slot 0 but a's tag: b must survive.
+    assert!(tree.spill_failed(&[first]).is_empty());
+    let plan = tree.plan_restore(&b, BS, 0);
+    assert_eq!(plan.disk.len(), 1, "b's record still owns the slot");
+    tree.complete_restore(&b, BS, 0, &plan, &[], false);
+}
+
+#[test]
+fn over_released_node_is_deleted_not_spilled() {
+    let tree = spilled_tree(8);
+    let t = toks(0, 1);
+    cache(&tree, &t, &[10]);
+    tree.release(&t, BS, 0); // over-release: the cache's own ref is gone
+    let ev = tree.evict(1);
+    assert_eq!(ev.physical, vec![10]);
+    assert!(ev.spill.is_empty(), "an unreachable node is never spilled");
+    let s = tree.nvme_stats();
+    assert_eq!((s.spills, s.slots_used, s.cold_drops), (0, 0, 0));
+}
+
+#[test]
 fn budget_drops_coldest_disk_leaves_first() {
     let tree = spilled_tree(2);
     let a = toks(0, 2); // older conversation

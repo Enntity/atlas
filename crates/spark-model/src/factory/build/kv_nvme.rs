@@ -70,10 +70,14 @@ fn rank_fingerprint(slots: u32, record_bytes: usize, ssm_tier: bool) -> u64 {
     )
 }
 
+/// Fingerprint a rank sends when its OWN setup failed: never equal to a real
+/// one, so every peer fails the check too instead of waiting on this rank.
+const FAILED_RANK: u64 = u64::MAX;
+
 /// Attach the tier to a freshly built KV cache (after the sparse index) and
-/// enable spill-on-evict in the prefix cache. On a multi-rank world with
-/// prefix caching this also verifies — collectively, on EVERY rank, tier on
-/// or off — that all ranks run the same spill-tier config.
+/// enable spill-on-evict in the prefix cache. On a multi-rank world this also
+/// verifies — collectively, on EVERY rank, tier on or off — that all ranks run
+/// the same spill-tier config and that none failed to set it up.
 pub(super) fn attach(
     kv_cache: &mut PagedKvCache,
     prefix_cache: &dyn PrefixCache,
@@ -83,40 +87,70 @@ pub(super) fn attach(
     let cfg = config_from(
         std::env::var(DIR_VAR).ok().as_deref(),
         std::env::var(GB_VAR).ok().as_deref(),
-    )?;
+    );
     let ssm_tier = std::env::var_os("ATLAS_SSM_TIER").is_some();
     attach_with(cfg, ssm_tier, kv_cache, prefix_cache, gpu, comm)
 }
 
-/// Env-free body of [`attach`].
+/// Env-free body of [`attach`]. Everything rank-local that can fail runs
+/// FIRST, then the ranks exchange fingerprints (a failed rank sends
+/// [`FAILED_RANK`]), and only then does any rank return an error — so one
+/// misconfigured rank (bad env, unwritable dir, full disk) fails every rank
+/// at startup instead of leaving its peers blocked in a later collective.
 fn attach_with(
-    cfg: Option<NvmeKvConfig>,
+    cfg: Result<Option<NvmeKvConfig>>,
     ssm_tier: bool,
     kv_cache: &mut PagedKvCache,
     prefix_cache: &dyn PrefixCache,
     gpu: &dyn GpuBackend,
     comm: Option<&dyn spark_comm::CommBackend>,
 ) -> Result<()> {
-    let record = kv_cache.nvme_record_bytes();
-    let slots = match &cfg {
-        Some(c) => max_slots(c.budget_bytes, record)?,
-        None => 0,
-    };
     let rank = comm.map_or(0, |c| c.rank());
-    if prefix_cache.is_active()
-        && let Some(comm) = comm.filter(|c| c.world_size() > 1)
-    {
-        let fp = rank_fingerprint(slots, record, ssm_tier);
+    let record = kv_cache.nvme_record_bytes();
+    let local = cfg.and_then(|cfg| setup_local(cfg, rank, record, kv_cache, prefix_cache, gpu));
+    // Every multi-rank world exchanges (one 8-byte all-gather at startup),
+    // prefix caching or not: the condition must not depend on anything that
+    // can differ per rank, or the collective itself would pair up wrongly.
+    if let Some(comm) = comm.filter(|c| c.world_size() > 1) {
+        let fp = match &local {
+            Ok(slots) => rank_fingerprint(*slots, record, ssm_tier),
+            Err(_) => FAILED_RANK,
+        };
         let all = super::glm::gather_u64(comm, gpu, fp)?;
-        ensure!(
-            all.iter().all(|&v| v == fp),
-            "spill-tier config differs across ranks (fingerprints {all:x?}); set identical \
-             {DIR_VAR}/{GB_VAR}/ATLAS_SSM_TIER on every rank"
-        );
+        return verify_ranks(local, fp, &all);
     }
+    local.map(|_| ())
+}
+
+/// After the fingerprint exchange: this rank's own error first, then any
+/// peer that failed, then any config mismatch.
+fn verify_ranks(local: Result<u32>, fp: u64, all: &[u64]) -> Result<()> {
+    local?;
+    if let Some(bad) = all.iter().position(|&v| v == FAILED_RANK) {
+        bail!("spill-tier setup failed on rank {bad} (see its log); every rank stops");
+    }
+    ensure!(
+        all.iter().all(|&v| v == fp),
+        "spill-tier config differs across ranks (fingerprints {all:x?}); set identical \
+         {DIR_VAR}/{GB_VAR}/ATLAS_SSM_TIER on every rank"
+    );
+    Ok(())
+}
+
+/// The rank-local part of [`attach_with`]: validate, create the record file,
+/// attach it and enable the tree side. Returns the slot budget (0 = off).
+fn setup_local(
+    cfg: Option<NvmeKvConfig>,
+    rank: usize,
+    record: usize,
+    kv_cache: &mut PagedKvCache,
+    prefix_cache: &dyn PrefixCache,
+    gpu: &dyn GpuBackend,
+) -> Result<u32> {
     let Some(cfg) = cfg else {
-        return Ok(());
+        return Ok(0);
     };
+    let slots = max_slots(cfg.budget_bytes, record)?;
     ensure!(
         prefix_cache.is_active(),
         "{DIR_VAR} requires --enable-prefix-caching (it spills evicted prefix-cache blocks)"
@@ -157,7 +191,7 @@ fn attach_with(
         cfg.budget_bytes as f64 / (1u64 << 30) as f64,
         slots as u64 * kv_cache.block_size() as u64,
     );
-    Ok(())
+    Ok(slots)
 }
 
 #[cfg(test)]
@@ -204,6 +238,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_failed_rank_fails_every_rank_after_the_exchange() {
+        let fp = rank_fingerprint(10, 4096, false);
+        assert!(verify_ranks(Ok(10), fp, &[fp, fp]).is_ok());
+        let own = verify_ranks(
+            Err(anyhow::anyhow!("bad env")),
+            FAILED_RANK,
+            &[FAILED_RANK, fp],
+        );
+        assert!(format!("{:#}", own.unwrap_err()).contains("bad env"));
+        let peer = verify_ranks(Ok(10), fp, &[fp, FAILED_RANK]).unwrap_err();
+        assert!(format!("{peer:#}").contains("rank 1"));
+        let other = rank_fingerprint(11, 4096, false);
+        assert!(verify_ranks(Ok(10), fp, &[fp, other]).is_err());
+        assert_ne!(fp, FAILED_RANK);
+    }
+
+    #[test]
+    fn config_errors_reach_the_exchange_instead_of_bailing_early() {
+        let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+        let mut kv = glm_kv(&gpu);
+        let tree = spark_runtime::radix_tree::RadixTree::new();
+        let bad = config_from(Some("/nvme"), None);
+        assert!(bad.is_err());
+        // Single rank: the error still surfaces (after the no-op exchange).
+        assert!(attach_with(bad, false, &mut kv, &tree, &gpu, None).is_err());
+        assert!(!kv.nvme_attached());
+    }
+
     fn glm_kv(gpu: &spark_runtime::gpu::mock::MockGpuBackend) -> PagedKvCache {
         use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, SparseIndexCacheConfig};
         let cfg = KvCacheConfig {
@@ -239,7 +302,7 @@ mod tests {
             dir: dir.clone(),
             budget_bytes: 1 << 30,
         };
-        attach_with(Some(cfg), false, &mut kv, &tree, &gpu, None).unwrap();
+        attach_with(Ok(Some(cfg)), false, &mut kv, &tree, &gpu, None).unwrap();
         assert!(kv.nvme_attached());
         assert!(tree.is_enabled());
         assert_eq!(
@@ -260,13 +323,13 @@ mod tests {
         let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
         let mut kv = glm_kv(&gpu);
         let tree = spark_runtime::radix_tree::RadixTree::new();
-        attach_with(None, true, &mut kv, &tree, &gpu, None).unwrap();
+        attach_with(Ok(None), true, &mut kv, &tree, &gpu, None).unwrap();
         assert!(!kv.nvme_attached());
         let none = spark_runtime::prefix_cache::NoPrefixCaching;
         let cfg = NvmeKvConfig {
             dir: scratch_dir("nopc"),
             budget_bytes: 1 << 30,
         };
-        assert!(attach_with(Some(cfg), false, &mut kv, &none, &gpu, None).is_err());
+        assert!(attach_with(Ok(Some(cfg)), false, &mut kv, &none, &gpu, None).is_err());
     }
 }
