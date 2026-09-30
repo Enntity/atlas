@@ -11,10 +11,10 @@ pub(super) struct OptionalKernels {
     pub(super) moe_w4a4_prequant_t_k64: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64_vecscale: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k128: KernelHandle,
-    pub(super) moe_w4a4_prequant_t_k128w: KernelHandle,
-    pub(super) moe_w4a4_prequant_gate_up_silu: KernelHandle,
-    /// Persistent CTAs of the K128W handles above when they are the
-    /// `_persist` twins, else 0.
+    pub(super) moe_w4a4_prequant_t_k128w: ops::K128wKernel,
+    pub(super) moe_w4a4_prequant_gate_up_silu: ops::K128wKernel,
+    /// Persistent CTAs of the K128W `_persist` twins above when resolved,
+    /// else 0.
     pub(super) k128w_persist_ctas: u32,
     pub(super) moe_mtile_prefix_k: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64_compact: KernelHandle,
@@ -305,51 +305,68 @@ impl OptionalKernels {
     }
 }
 
-/// The K128W down and fused gate/up kernels (gate/up only with `silu`), or
-/// with `persist` (`ATLAS_GLM_MOE_PREFILL_PERSIST=1`) their `_persist`
+/// The K128W down and fused gate/up kernels (gate/up only with `silu`),
+/// with `persist` (`ATLAS_GLM_MOE_PREFILL_PERSIST=1`) also their `_persist`
 /// twins, which write the same bytes, and the CTAs those launch: two per SM,
-/// their `__launch_bounds__` residency. Without the twins the grid kernels
-/// stay and the CTA count is 0.
+/// their `__launch_bounds__` residency. The grid kernels always load, since
+/// chunks below `K128W_PERSIST_MIN_ROWS` rows keep them; the CTA count is 0
+/// (grid only) unless every needed twin resolved.
 fn k128w_kernels(
     gpu: &dyn GpuBackend,
     k128w: bool,
     silu: bool,
     persist: bool,
-) -> (KernelHandle, KernelHandle, u32) {
-    const DOWN: &str = "moe_w4a4_grouped_gemm_prequant_t_k128w_compact";
-    const GATE_UP: &str = "moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w";
-    let none = KernelHandle(0);
-    if !k128w {
-        return (none, none, 0);
-    }
-    let resolve = |name: &str, suffix: &str| {
-        super::super::try_kernel(gpu, "moe_w4a16", &format!("{name}{suffix}"))
+) -> (ops::K128wKernel, ops::K128wKernel, u32) {
+    let pair = |name: &str, on: bool| ops::K128wKernel {
+        grid: super::super::try_kernel_gated(k128w && on, gpu, "moe_w4a16", name),
+        persist: super::super::try_kernel_gated(
+            k128w && on && persist,
+            gpu,
+            "moe_w4a16",
+            &format!("{name}_persist"),
+        ),
     };
-    if persist {
-        let down = resolve(DOWN, "_persist");
-        let gate_up = if silu {
-            resolve(GATE_UP, "_persist")
-        } else {
-            none
-        };
-        let ctas = 2 * gpu.sm_count().unwrap_or(0);
-        let ok = down.0 != 0 && (gate_up.0 != 0 || !silu) && ctas > 0;
-        if gpu.op_cache().once("moe:k128w_persist") {
-            if ok {
-                tracing::info!(
-                    "ATLAS_GLM_MOE_PREFILL_PERSIST: persistent K128W prefill, {ctas} CTAs from {} sorted rows",
-                    super::prequant_fp4::K128W_PERSIST_MIN_ROWS
-                );
-            } else {
-                tracing::warn!(
-                    "ATLAS_GLM_MOE_PREFILL_PERSIST=1 ignored: persistent K128W kernels unavailable"
-                );
-            }
-        }
+    let down = pair("moe_w4a4_grouped_gemm_prequant_t_k128w_compact", true);
+    let gate_up = pair("moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w", silu);
+    if !(k128w && persist) {
+        return (down, gate_up, 0);
+    }
+    let ctas = 2 * gpu.sm_count().unwrap_or(0);
+    let ok = down.persist.0 != 0 && (gate_up.persist.0 != 0 || !silu) && ctas > 0;
+    if gpu.op_cache().once("moe:k128w_persist") {
         if ok {
-            return (down, gate_up, ctas);
+            tracing::info!(
+                "ATLAS_GLM_MOE_PREFILL_PERSIST: persistent K128W prefill, {ctas} CTAs from {} sorted rows",
+                super::prequant_fp4::K128W_PERSIST_MIN_ROWS
+            );
+        } else {
+            tracing::warn!(
+                "ATLAS_GLM_MOE_PREFILL_PERSIST=1 ignored: persistent K128W kernels unavailable"
+            );
         }
     }
-    let gate_up = if silu { resolve(GATE_UP, "") } else { none };
-    (resolve(DOWN, ""), gate_up, 0)
+    (down, gate_up, if ok { ctas } else { 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::k128w_kernels;
+    use spark_runtime::gpu::mock::MockGpuBackend;
+
+    fn handles(k128w: bool, silu: bool, persist: bool) -> ([u64; 4], u32) {
+        let (down, gate_up, ctas) = k128w_kernels(&MockGpuBackend::new(), k128w, silu, persist);
+        let ids = [down.grid, down.persist, gate_up.grid, gate_up.persist].map(|h| h.0);
+        (ids.map(|h| u64::from(h != 0)), ctas)
+    }
+
+    #[test]
+    fn k128w_persist_adds_the_twins_and_keeps_the_grid_kernels() {
+        // Flag off: the base grid kernels only.
+        assert_eq!(handles(true, true, false), ([1, 0, 1, 0], 0));
+        // Flag on: both sets, two CTAs per SM (the mock's 48 SMs).
+        assert_eq!(handles(true, true, true), ([1, 1, 1, 1], 96));
+        assert_eq!(handles(true, false, true), ([1, 1, 0, 0], 96));
+        // K128W off: nothing, whatever the flag.
+        assert_eq!(handles(false, true, true), ([0, 0, 0, 0], 0));
+    }
 }

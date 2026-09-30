@@ -258,7 +258,7 @@ impl MoeLayer {
             }
         }
         if let Some(grid) = wide
-            && self.moe_w4a4_prequant_gate_up_silu.0 != 0
+            && self.moe_w4a4_prequant_gate_up_silu.grid.0 != 0
             && self.nvfp4_fused_silu_quant
             && self.silu_mul_quant_nvfp4_k.0 != 0
             && self.lora.is_none()
@@ -346,7 +346,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<MtileGrid>> {
-        if self.moe_w4a4_prequant_t_k128w.0 == 0 || self.moe_mtile_prefix_k.0 == 0 {
+        if self.moe_w4a4_prequant_t_k128w.grid.0 == 0 || self.moe_mtile_prefix_k.0 == 0 {
             return Ok(None);
         }
         // The persistent schedule's work counter follows the prefix.

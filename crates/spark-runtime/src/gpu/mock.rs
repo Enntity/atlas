@@ -48,6 +48,8 @@ pub struct MockLaunch {
     pub func: u64,
     pub grid: [u32; 3],
     pub block: [u32; 3],
+    /// Kernel parameter count (`kernelParams` entries).
+    pub args: usize,
 }
 
 impl Default for MockGpuBackend {
@@ -329,12 +331,13 @@ impl GpuBackend for MockGpuBackend {
         block: [u32; 3],
         _shared_mem: u32,
         _stream: u64,
-        _params: &mut [*mut std::ffi::c_void],
+        params: &mut [*mut std::ffi::c_void],
     ) -> Result<()> {
         self.launches.lock().push(MockLaunch {
             func: func.0,
             grid,
             block,
+            args: params.len(),
         });
         Ok(())
     }

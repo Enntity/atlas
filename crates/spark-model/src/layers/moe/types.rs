@@ -247,15 +247,16 @@ pub struct MoeLayer {
     /// 64x256-tile twin of `moe_w4a4_prequant_t_k128` launched over only the
     /// local experts' row tiles (`moe_mtile_prefix_k`), bitwise-identical
     /// outputs; null unless the K128 kernel is on and GLM
-    /// (`ATLAS_MOE_PREQUANT_K128W=0` disables).
-    pub(super) moe_w4a4_prequant_t_k128w: KernelHandle,
+    /// (`ATLAS_MOE_PREQUANT_K128W=0` disables); with its `_persist` twin
+    /// under `ATLAS_GLM_MOE_PREFILL_PERSIST=1`.
+    pub(super) moe_w4a4_prequant_t_k128w: ops::K128wKernel,
     pub(super) moe_mtile_prefix_k: KernelHandle,
     /// K128W gate and up in one launch with `silu_mul_quant_nvfp4` applied in
     /// its epilogue (same bytes); loaded with `moe_w4a4_prequant_t_k128w`
     /// unless `ATLAS_MOE_GATE_UP_SILU=0`.
-    pub(super) moe_w4a4_prequant_gate_up_silu: KernelHandle,
+    pub(super) moe_w4a4_prequant_gate_up_silu: ops::K128wKernel,
     /// CTAs of the persistent K128W twins when `ATLAS_GLM_MOE_PREFILL_PERSIST=1`
-    /// resolved them into the two handles above, else 0 (row-tile grid).
+    /// resolved every needed one above, else 0 (row-tile grid only).
     pub(super) k128w_persist_ctas: u32,
     /// Compact-worklist twins of the prequantized native-FP4 MoE kernel.
     /// Optional and used only for guarded K=5 gate/up verification.

@@ -109,6 +109,15 @@ pub fn moe_mtile_prefix(
         .launch(stream)
 }
 
+/// A K128W kernel: the row-tile `grid` kernel and its `_persist` twin
+/// (`KernelHandle(0)` unless ATLAS_GLM_MOE_PREFILL_PERSIST resolved it). The
+/// twin takes one more argument, so only the schedule picks between them.
+#[derive(Clone, Copy, Debug)]
+pub struct K128wKernel {
+    pub grid: KernelHandle,
+    pub persist: KernelHandle,
+}
+
 /// Which row tiles a K128W launch covers: a grid over `bound` >= the local
 /// experts' row tiles (`moe_mtile_prefix`), or `ctas` CTAs of the kernel's
 /// `_persist` twin claiming its work items from the `next_work` counter,
@@ -131,14 +140,19 @@ impl K128wSchedule {
     fn launch<'a>(
         self,
         gpu: &'a dyn GpuBackend,
-        kernel: KernelHandle,
+        kernel: K128wKernel,
         n_tiles: u32,
         stream: u64,
     ) -> Result<KernelLaunch<'a>> {
-        if let Self::Persistent { next_work, .. } = self {
-            gpu.memset_async(next_work, 0, 4, stream)?;
-        }
-        Ok(KernelLaunch::new(gpu, kernel)
+        let handle = match self {
+            Self::Grid { .. } => kernel.grid,
+            Self::Persistent { next_work, .. } => {
+                anyhow::ensure!(kernel.persist.0 != 0, "persistent K128W kernel not loaded");
+                gpu.memset_async(next_work, 0, 4, stream)?;
+                kernel.persist
+            }
+        };
+        Ok(KernelLaunch::new(gpu, handle)
             .grid(self.grid(n_tiles))
             .block([256, 1, 1]))
     }
@@ -158,7 +172,7 @@ impl K128wSchedule {
 #[allow(clippy::too_many_arguments)]
 pub fn moe_w4a4_grouped_gemm_prequant_k128w(
     gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
+    kernel: K128wKernel,
     a_packed: DevicePtr,
     a_scale: DevicePtr,
     b_packed_ptrs: DevicePtr,
@@ -200,7 +214,7 @@ pub fn moe_w4a4_grouped_gemm_prequant_k128w(
 #[allow(clippy::too_many_arguments)]
 pub fn moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w(
     gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
+    kernel: K128wKernel,
     a_packed: DevicePtr,
     a_scale: DevicePtr,
     [gate_packed, gate_scale, gate_scale2]: [DevicePtr; 3],
@@ -336,11 +350,21 @@ mod tests {
     use super::*;
     use spark_runtime::gpu::mock::MockGpuBackend;
 
-    fn launch_down(gpu: &MockGpuBackend, schedule: K128wSchedule) -> Result<()> {
+    /// Grid kernel 1, `_persist` twin 2.
+    const PAIR: K128wKernel = K128wKernel {
+        grid: KernelHandle(1),
+        persist: KernelHandle(2),
+    };
+
+    fn launch_down(
+        gpu: &MockGpuBackend,
+        kernel: K128wKernel,
+        schedule: K128wSchedule,
+    ) -> Result<()> {
         let p = DevicePtr(0x100);
         moe_w4a4_grouped_gemm_prequant_k128w(
             gpu,
-            KernelHandle(1),
+            kernel,
             p,
             p,
             p,
@@ -359,16 +383,18 @@ mod tests {
     }
 
     #[test]
-    fn k128w_grid_launch_covers_the_row_tile_bound() {
+    fn k128w_grid_launch_takes_the_grid_kernel_over_the_row_tile_bound() {
         let gpu = MockGpuBackend::new();
-        launch_down(&gpu, K128wSchedule::Grid { bound: 1312 }).unwrap();
+        launch_down(&gpu, PAIR, K128wSchedule::Grid { bound: 1312 }).unwrap();
         assert_eq!(gpu.memset_count(), 0);
         let launch = &gpu.launches_snapshot()[0];
+        assert_eq!(launch.func, 1);
+        assert_eq!(launch.args, 12);
         assert_eq!((launch.grid, launch.block), ([16, 1312, 1], [256, 1, 1]));
     }
 
     #[test]
-    fn k128w_persistent_launch_zeroes_its_counter_first() {
+    fn k128w_persistent_launch_takes_the_twin_and_zeroes_its_counter_first() {
         let gpu = MockGpuBackend::new();
         let next_work = gpu.alloc(4).unwrap();
         gpu.memset(next_work, 0xff, 4).unwrap();
@@ -376,10 +402,27 @@ mod tests {
             ctas: 96,
             next_work,
         };
-        launch_down(&gpu, schedule).unwrap();
+        launch_down(&gpu, PAIR, schedule).unwrap();
         assert_eq!(gpu.memset_count(), 1);
         assert_eq!(gpu.read_alloc(next_work).unwrap(), vec![0; 4]);
         let launch = &gpu.launches_snapshot()[0];
+        assert_eq!(launch.func, 2);
+        assert_eq!(launch.args, 13);
         assert_eq!((launch.grid, launch.block), ([96, 1, 1], [256, 1, 1]));
+    }
+
+    #[test]
+    fn k128w_persistent_schedule_without_the_twin_launches_nothing() {
+        let gpu = MockGpuBackend::new();
+        let grid_only = K128wKernel {
+            persist: KernelHandle(0),
+            ..PAIR
+        };
+        let schedule = K128wSchedule::Persistent {
+            ctas: 96,
+            next_work: DevicePtr(0x200),
+        };
+        assert!(launch_down(&gpu, grid_only, schedule).is_err());
+        assert_eq!((gpu.memset_count(), gpu.launch_count()), (0, 0));
     }
 }
