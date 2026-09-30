@@ -40,6 +40,8 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "w4a16_gemv_tc8",
     "w4a16_gemv_tc8_ld",
     "mxfp8_gemv_tc8",
+    "mxfp8_gemv_tc8_grouped",
+    "mxfp8_gemv_tc16_grouped",
     "dense_gemv_bf16_batchm",
     "dense_gemv_bf16_batchm_dual",
     "dense_gemv_bf16_batchm_dual_k128",

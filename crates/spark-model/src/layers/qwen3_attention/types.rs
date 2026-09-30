@@ -333,6 +333,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) dense_gemm_tc_k: KernelHandle,
     /// `mxfp8_gemv_tc8/16/32` (null when the module is absent).
     pub(super) mxfp8_gemv_k: [KernelHandle; 3],
+    /// `mxfp8_gemv_tc8/16_grouped`: per-head W_uk / W_uv twins.
+    pub(super) mxfp8_gemv_grouped_k: [KernelHandle; 2],
     pub(super) mxfp8_quantize_k: KernelHandle,
     pub(super) paged_decode_splitk_k: Option<KernelHandle>,
     pub(super) paged_decode_reduce_k: Option<KernelHandle>,

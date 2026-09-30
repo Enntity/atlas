@@ -47,16 +47,19 @@ impl Qwen3AttentionLayer {
     }
 
     /// Quantize BF16 projections `(weight, n, k)` to MXFP8 twins that
-    /// `mla_prefill_dense` uses for up to 32 rows. Runs at load, before KV
-    /// sizing, so the twins come out of the KV budget.
+    /// `mla_prefill_dense` (and `glm_head_gemm` for the per-head W_uk / W_uv)
+    /// use for verify-sized row counts. Runs at load, before KV sizing, so the
+    /// twins come out of the KV budget.
     pub fn install_mla_mxfp8(
         &mut self,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         weights: &[(DevicePtr, usize, usize)],
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.mxfp8_quantize_k.0 != 0 && self.mxfp8_gemv_k.iter().all(|k| k.0 != 0),
-            "ATLAS_GLM_MLA_MXFP8=1 but the mxfp8_gemv kernels are missing"
+            self.mxfp8_quantize_k.0 != 0
+                && self.mxfp8_gemv_k.iter().all(|k| k.0 != 0)
+                && self.mxfp8_gemv_grouped_k.iter().all(|k| k.0 != 0),
+            "GLM MXFP8 twins requested but the mxfp8_gemv kernels are missing"
         );
         let stream = gpu.default_stream();
         for &(weight, n, k) in weights {
