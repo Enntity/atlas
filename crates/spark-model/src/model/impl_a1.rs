@@ -727,6 +727,7 @@ impl TransformerModel {
             snapshot_event,
             comm,
             ep_cmd_buf,
+            warm: super::warm_turn::WarmTurn::from_env(),
             ep_protocol_v2: matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2")),
             self_speculative,
             last_mtp_hidden_idx: std::sync::atomic::AtomicUsize::new(0),
