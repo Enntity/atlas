@@ -108,6 +108,12 @@ pub fn select_tier(
 /// `w4a16_gemv_tc8/16/32` (DRAM-bound, not bit-identical to the scalar
 /// tiers). Resolved once, when a tier table is first built; [`tc_kernel`] and
 /// [`tc_rows`] are how callers and the launch op pick and recognize them.
+/// Both ranks must run the same value (`model::startup_parity`): the pair's
+/// shared-expert split (`moe::forward_pair_shared`) is taken only with them.
+pub(crate) fn tc_requested() -> bool {
+    std::env::var("ATLAS_W4A16_TC").as_deref() == Ok("1")
+}
+
 static TC: std::sync::OnceLock<[KernelHandle; 3]> = std::sync::OnceLock::new();
 const TC_ROWS: [u32; 3] = [8, 16, 32];
 
@@ -179,7 +185,7 @@ impl W4a16BatchmTiers {
         for (h, w) in handles.iter_mut().zip(W4A16_BATCHM_WIDTHS) {
             *h = super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_batch{w}"));
         }
-        if std::env::var("ATLAS_W4A16_TC").as_deref() == Ok("1") {
+        if tc_requested() {
             TC.get_or_init(|| {
                 TC_ROWS.map(|rows| {
                     super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}"))

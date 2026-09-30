@@ -245,8 +245,10 @@ impl TransformerModel {
 }
 
 /// `ATLAS_GLM_LONG_BATCH_SERIAL=kda|mla|all`: bisection aid that keeps the
-/// named layer kind on its single-owner verify inside the batched step.
-pub(super) fn serial_diagnostic(attention: bool) -> bool {
+/// named layer kind on its single-owner verify inside the batched step. Both
+/// ranks must run the same value (`startup_parity`): a serial layer issues
+/// its collectives an owner at a time.
+pub(in crate::model) fn serial_diagnostic(attention: bool) -> bool {
     static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let mode =
         MODE.get_or_init(|| std::env::var("ATLAS_GLM_LONG_BATCH_SERIAL").unwrap_or_default());
@@ -258,7 +260,10 @@ pub(super) fn serial_diagnostic(attention: bool) -> bool {
     }
 }
 
-pub(super) fn oracle_enabled() -> bool {
+/// `ATLAS_GLM_LONG_BATCH_ORACLE=1` ([`TransformerModel::glm_long_oracle`]).
+/// Both ranks must run the same value (`startup_parity`): the oracle adds
+/// every owner's serial verify, collectives included, to the step.
+pub(in crate::model) fn oracle_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_LONG_BATCH_ORACLE").as_deref() == Ok("1"))
 }

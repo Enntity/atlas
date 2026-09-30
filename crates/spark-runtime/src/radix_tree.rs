@@ -25,6 +25,7 @@ mod tests;
 
 use inner::RadixTreeInner;
 use snapshot::SsmSnapshotIndex;
+pub use snapshot::{snap_evict_alpha, snap_evict_legacy};
 pub use snapshot_chain::glm_pc_evict_enabled;
 
 /// FNV-1a-ish stable hash for the first `count` tokens — used to key SSM

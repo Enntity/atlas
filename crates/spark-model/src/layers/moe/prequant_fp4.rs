@@ -111,7 +111,7 @@ impl MoeLayer {
 
     pub(super) fn glm_c4_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
         crate::model::glm_c4::enabled(&ctx.config.model_type)
-            && std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() == Ok("1")
+            && super::forward_c4::c4_grouped_requested()
             && c4_grouped_shape(ctx.config, rows, ctx.levers.max_decode_seqs)
             && ctx.attn_metadata.is_some_and(|m| m.num_seqs == 4)
             && self.glm_grouped_resources(ctx)

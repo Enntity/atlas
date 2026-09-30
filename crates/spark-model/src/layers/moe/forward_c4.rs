@@ -98,6 +98,13 @@ pub(super) fn validate_independent_moe_arenas(
     Ok(())
 }
 
+/// `ATLAS_GLM_C4_GROUPED_MOE=1`: the grouped arm of [`MoeLayer::forward_c4`].
+/// Both ranks must run the same value (`model::startup_parity`): it issues
+/// one four-row EP reduce where the scalar control issues four.
+pub(crate) fn c4_grouped_requested() -> bool {
+    std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() == Ok("1")
+}
+
 impl MoeLayer {
     /// Four independent rows, never sequential-token verification. The caller
     /// validates short-context/non-speculative C4 policy before layer dispatch.
@@ -128,7 +135,7 @@ impl MoeLayer {
         );
         validate_c4_moe_arenas(ctx.config, ctx.buffers.sizes())?;
         let output = ctx.buffers.moe_output();
-        if std::env::var("ATLAS_GLM_C4_GROUPED_MOE").as_deref() == Ok("1") {
+        if c4_grouped_requested() {
             anyhow::ensure!(
                 self.glm_c4_grouped(ctx, 4),
                 "C4 grouped MoE requires prequant kernels, sparse EP reduction and exact-M4 shared GEMV"
