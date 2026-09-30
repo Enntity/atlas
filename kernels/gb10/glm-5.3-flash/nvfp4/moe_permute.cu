@@ -426,3 +426,105 @@ extern "C" __global__ void moe_unpermute_reduce_indexed_ep_vec8(
         *(uint4*)&output[token * hidden_size + c] = out;
     }
 }
+
+// moe_unpermute_reduce_indexed_ep_vec8 followed by moe_batched_blend, one
+// launch (ATLAS_GLM_DECODE_FUSE). The gate is the blend's dot: the row and the
+// gate weight are staged with 16-byte loads and summed per thread, per warp
+// and across warps in the blend's order. Each 8-column group then reduces its
+// local routes as the vec8 kernel does, rounds to BF16 (the value the blend
+// read back) and adds gate * shared. Same bytes as the pair.
+// Grid: (num_tokens, 1, 1)  Block: (256, 1, 1); hidden 4096, topk <= 8;
+// every row pointer and gate_weight 16-byte aligned.
+extern "C" __global__ void __launch_bounds__(256) moe_unpermute_blend_ep_vec8(
+    const __nv_bfloat16* __restrict__ expert_output,
+    __nv_bfloat16* __restrict__ output,
+    const int* __restrict__ token_to_perm,
+    const int* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    const __nv_bfloat16* __restrict__ shared_out,
+    const __nv_bfloat16* __restrict__ normed,
+    const __nv_bfloat16* __restrict__ gate_weight,   // nullable: gate 1.0
+    unsigned int num_tokens,
+    unsigned int topk,
+    unsigned int local_expert_start,
+    unsigned int local_expert_end
+) {
+    atlas_pdl_enter();
+    constexpr unsigned int MAX_TOPK = 8, H = 4096, BLOCK = 256;
+    const unsigned int token = blockIdx.x, tid = threadIdx.x;
+    if (token >= num_tokens || blockDim.x != BLOCK) return;
+    __shared__ __align__(16) __nv_bfloat16 s_normed[H];
+    __shared__ __align__(16) __nv_bfloat16 s_gate[H];
+    __shared__ float s_dot_partial[BLOCK / 32];
+
+    float local_dot = 0.0f;
+    if (gate_weight != 0) {
+        #pragma unroll
+        for (unsigned int i = tid * 8; i < H; i += BLOCK * 8) {
+            *(uint4*)&s_normed[i] = *(const uint4*)&normed[token * H + i];
+            *(uint4*)&s_gate[i] = *(const uint4*)&gate_weight[i];
+        }
+        __syncthreads();
+        for (unsigned int i = tid; i < H; i += BLOCK) {
+            float n = __bfloat162float(s_normed[i]);
+            float g = __bfloat162float(s_gate[i]);
+            local_dot += n * g;
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_dot += __shfl_down_sync(0xFFFFFFFF, local_dot, offset);
+    if (tid % 32 == 0) s_dot_partial[tid / 32] = local_dot;
+    __syncthreads();
+    if (tid == 0) {
+        float gate = 1.0f;
+        if (gate_weight != 0) {
+            float total = 0.0f;
+            for (unsigned int w = 0; w < BLOCK / 32; w++) total += s_dot_partial[w];
+            gate = 1.0f / (1.0f + __expf(-total));
+        }
+        s_dot_partial[0] = gate;
+    }
+    __syncthreads();
+    const float gate_scalar = s_dot_partial[0];
+
+    unsigned int rows[MAX_TOPK];
+    float weights[MAX_TOPK];
+    bool live[MAX_TOPK];
+    #pragma unroll
+    for (unsigned int k = 0; k < MAX_TOPK; k++) {
+        const unsigned int slot = token * topk + k;
+        const int expert = k < topk ? topk_ids[slot] : -1;
+        live[k] = k < topk && expert >= (int)local_expert_start && expert < (int)local_expert_end;
+        rows[k] = live[k] ? (unsigned int)token_to_perm[slot] : 0u;
+        weights[k] = live[k] ? topk_weights[slot] : 0.0f;
+    }
+    for (unsigned int c = tid * 8; c < H; c += BLOCK * 8) {
+        uint4 raw[MAX_TOPK];
+        #pragma unroll
+        for (unsigned int i = 0; i < MAX_TOPK; i++)
+            if (live[i]) raw[i] = *(const uint4*)&expert_output[rows[i] * H + c];
+        const uint4 sraw = *(const uint4*)&shared_out[token * H + c];
+        const __nv_bfloat16* sv = reinterpret_cast<const __nv_bfloat16*>(&sraw);
+        float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        #pragma unroll
+        for (unsigned int i = 0; i < MAX_TOPK; i++) {
+            if (!live[i]) continue;
+            const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&raw[i]);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float value = __bfloat162float(v[j]);
+                acc[j] += weights[i] * value;
+            }
+        }
+        uint4 out;
+        __nv_bfloat16* o = reinterpret_cast<__nv_bfloat16*>(&out);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float routed = __bfloat162float(__float2bfloat16(acc[j]));
+            const float s = __bfloat162float(sv[j]);
+            o[j] = __float2bfloat16(routed + gate_scalar * s);
+        }
+        *(uint4*)&output[token * H + c] = out;
+    }
+}

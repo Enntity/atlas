@@ -78,6 +78,8 @@ mod gemv_q2;
 mod gemv_q2_vec;
 #[path = "ops/gemv_sw.rs"]
 mod gemv_sw;
+#[path = "ops/glm_decode_fuse.rs"]
+pub mod glm_decode_fuse;
 #[path = "ops/glm_hc_prefill.rs"]
 mod glm_hc_prefill;
 #[path = "ops/glm_indexer.rs"]
