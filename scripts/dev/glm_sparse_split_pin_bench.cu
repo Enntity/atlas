@@ -4,7 +4,13 @@
 // + glm_sparse_decode_split_merge at the count the launch's rows pick today
 // (`sparse_split_count`) versus the pinned count of the widest verify block
 // (8 rows: 6 splits), for 1..8 rows of one sequence at `seq_start`, on an
-// fp8_g128 and a BF16 latent cache.
+// fp8_g128 and a BF16 latent cache. A third arm is the unsplit kernel (one CTA
+// per row): what ATLAS_GLM_SPARSE_VERIFY_SPLIT=0 runs for verify rows, and
+// what prefill pieces of 47 rows or more and fp8_g128 single-row decode run
+// today. Its bits do not depend on the row count either; "pinned!=whole"
+// counts how far a pinned verify row stays from that arithmetic. On fp8_g128
+// the pipelined unsplit kernel (ATLAS_GLM_SPARSE_PREFILL_PIPE=1, the
+// production prefill kernel) is timed and compared bit for bit as well.
 //
 // A launch of R rows verifies the first R of the same eight rows, so the
 // bench also counts, per R, the BF16 outputs of those rows that differ from
@@ -17,7 +23,8 @@
 //   nvcc -arch=sm_121a -O3 --fmad=false -I kernels/gb10/glm-5.3-flash/nvfp4 \
 //        scripts/dev/glm_sparse_split_pin_bench.cu -o split_pin_bench
 //   ./split_pin_bench [seq_start=131064] [iters=240] [reps=7] [alt_splits=12]
-// Device memory: ~0.3 GB at the defaults. Exit 2 if a pinned row moves.
+// Device memory: ~0.3 GB at the defaults. Exit 2 if a pinned or an unsplit
+// row moves with the row count, or the pipelined kernel differs from kv_pad.
 #include "glm_sparse_prefill_kv_reuse.cu"
 #include "glm_sparse_decode_split_merge.cu"
 #include <algorithm>
@@ -35,6 +42,8 @@
 typedef __nv_bfloat16 bf;
 static const unsigned HEADS = 32, DIM = 512, WIDTH = 2051, BS = 16, MAXR = 8, SMEM = 69376;
 static const unsigned PIN = 6, COPIES = 24;
+// `splits` values of run(): the unsplit kv_pad kernel and the pipelined one.
+static const unsigned WHOLE = 0, PIPED = 99;
 
 static float bf2f(unsigned short b) { unsigned int u = (unsigned int)b << 16; float f; memcpy(&f, &u, 4); return f; }
 static unsigned short f2bf(float f) { const bf b = __float2bfloat16(f); unsigned short u; memcpy(&u, &b, 2); return u; }
@@ -171,13 +180,28 @@ int main(int argc, char** argv) {
     typedef void (*Kern)(GLM_KV_PAD_ARGS, float*, float*);
     const Kern kern[2] = {glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split,
                           glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split};
+    typedef void (*Whole)(GLM_KV_PAD_ARGS);
+    const Whole whole[2] = {glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad,
+                            glm_sparse_mla_prefill_bf16_head32_tc_kv_pad};
+    const Whole piped = glm_sparse_mla_prefill_fp8g128_head32_tc_pipe;
     const void* cache[2] = {dfp8, db16};
     const char* name[2] = {"fp8_g128", "bf16"};
-    for (int dt = 0; dt < 2; dt++)
+    for (int dt = 0; dt < 2; dt++) {
         CK(cudaFuncSetAttribute(kern[dt], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+        CK(cudaFuncSetAttribute(whole[dt], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+    }
+    CK(cudaFuncSetAttribute(piped, cudaFuncAttributeMaxDynamicSharedMemorySize, GLM_PIPE_SMEM));
     auto run = [&](int dt, unsigned rows, unsigned splits, unsigned copy) {
+        const int* sel = (const int*)didx + (size_t)copy * MAXR * WIDTH;
+        if (splits == WHOLE || splits == PIPED) {
+            const bool pipe = splits == PIPED;
+            (pipe ? piped : whole[dt])<<<dim3(1, rows, 1), 256, pipe ? GLM_PIPE_SMEM : SMEM>>>(
+                (const bf*)dq, cache[dt], cache[dt], sel, (bf*)dout, (const unsigned*)dtable, rows,
+                HEADS, DIM, WIDTH, BS, 0.0625f);
+            return;
+        }
         kern[dt]<<<dim3(1, rows, splits), 256, SMEM>>>(
-            (const bf*)dq, cache[dt], cache[dt], (const int*)didx + (size_t)copy * MAXR * WIDTH,
+            (const bf*)dq, cache[dt], cache[dt], sel,
             nullptr, (const unsigned*)dtable, rows, HEADS, DIM, WIDTH, BS, 0.0625f,
             (float*)dpo, (float*)dpl);
         glm_sparse_decode_split_merge<<<rows * HEADS, 256>>>(
@@ -206,7 +230,7 @@ int main(int argc, char** argv) {
         return us[us.size() / 2];
     };
 
-    int moved = 0;
+    int moved = 0, whole_moved = 0, pipe_differs = 0;
     std::vector<float> keys((size_t)WIDTH * DIM);
     std::vector<double> ref(qn), logit(WIDTH);
     for (int dt = 0; dt < 2; dt++) {
@@ -253,33 +277,45 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < a.size(); i++) n += a[i] != b[i];
                 return n;
             };
-            const std::vector<unsigned short> wide[2] = {output(dt, MAXR, split_count(MAXR)),
-                                                        output(dt, MAXR, PIN)};
+            const std::vector<unsigned short> wide[3] = {output(dt, MAXR, split_count(MAXR)),
+                                                        output(dt, MAXR, PIN), output(dt, MAXR, WHOLE)};
             printf("%s %s queries, seq_start=%u, max |reference| %.3g\n", name[dt],
                    peak ? "peak" : "flat", seq_start, scale);
-            printf("rows  splits  err_today  err_pinned  today!=pinned   today!=8row  pinned!=8row\n");
+            printf("rows  splits  err_today  err_pinned  err_whole   today!=pinned   today!=8row  "
+                   "pinned!=8row  whole!=8row  pinned!=whole\n");
             for (unsigned rows = 1; rows <= MAXR; rows++) {
                 const unsigned today = split_count(rows);
-                const auto a = output(dt, rows, today), b = output(dt, rows, PIN);
-                const size_t vs8_pinned = differing(b, wide[1]);
+                const auto a = output(dt, rows, today), b = output(dt, rows, PIN), w = output(dt, rows, WHOLE);
+                const size_t vs8_pinned = differing(b, wide[1]), vs8_whole = differing(w, wide[2]);
                 moved += vs8_pinned != 0;
-                printf("%4u  %2u->%u   %.3e  %.3e   %6zu/%-6zu  %6zu       %6zu\n", rows, today, PIN,
-                       err(a), err(b), differing(a, b), a.size(), differing(a, wide[0]), vs8_pinned);
+                whole_moved += vs8_whole != 0;
+                if (dt == 0) pipe_differs += differing(output(dt, rows, PIPED), w) != 0;
+                printf("%4u  %2u->%u   %.3e  %.3e   %.3e  %6zu/%-6zu  %6zu       %6zu        %6zu       %6zu\n",
+                       rows, today, PIN, err(a), err(b), err(w), differing(a, b), a.size(),
+                       differing(a, wide[0]), vs8_pinned, vs8_whole, differing(b, w));
             }
         }
         // The kernels' work does not depend on the values: time on the
         // queries the loop left.
         printf("%s split + merge, median us per launch (%d iters x %d reps, %u selections)\n",
                name[dt], iters, reps, COPIES);
-        printf("rows  today        pinned %u     alt %u\n", PIN, alt);
+        printf("rows  today        pinned %u         unsplit%s     alt %u\n", PIN,
+               dt == 0 ? "           unsplit pipe" : "", alt);
         for (unsigned rows = 1; rows <= MAXR; rows++) {
             const unsigned today = split_count(rows);
             const double t = time_us(dt, rows, today), p = time_us(dt, rows, PIN);
-            printf("%4u  S%-2u %7.1f   %7.1f (%+5.1f)", rows, today, t, p, p - t);
+            const double w = time_us(dt, rows, WHOLE);
+            printf("%4u  S%-2u %7.1f   %7.1f (%+5.1f)   %7.1f (%+7.1f)", rows, today, t, p, p - t, w, w - t);
+            if (dt == 0) {
+                const double pp = time_us(dt, rows, PIPED);
+                printf("   %7.1f (%+7.1f)", pp, pp - t);
+            }
             if (alt > 0) printf("   %7.1f", time_us(dt, rows, alt));
             printf("\n");
         }
     }
     printf("pinned rows that differ from the 8-row launch: %d cases\n", moved);
-    return moved == 0 ? 0 : 2;
+    printf("unsplit rows that differ from the 8-row launch: %d cases\n", whole_moved);
+    printf("fp8_g128 pipelined outputs that differ from kv_pad: %d cases\n", pipe_differs);
+    return moved == 0 && whole_moved == 0 && pipe_differs == 0 ? 0 : 2;
 }
