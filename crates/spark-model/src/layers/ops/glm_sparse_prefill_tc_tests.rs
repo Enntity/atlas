@@ -235,3 +235,48 @@ fn the_pinned_split_count_does_not_move_with_the_verify_width() {
     assert!(!parse("glm5_next", SPLIT_PIN, None).unwrap());
     assert!(parse("glm5_next", SPLIT_PIN, Some("yes")).is_err());
 }
+
+#[test]
+fn the_pin_sets_the_split_grid_of_verify_owners_and_nothing_else() {
+    let c = config();
+    let scratch = DevicePtr(1 << 20);
+    let bytes = sparse_split_scratch_bytes(16, 8, 32, 512);
+    let launch = |rows: u32, scratch: DevicePtr, flags: SplitFlags| {
+        let gpu = MockGpuBackend::new();
+        let mut a = args(&c);
+        a.rows = rows;
+        assert!(dispatch_split(&gpu, &a, scratch, bytes, 7, flags).unwrap());
+        gpu.launches_snapshot()[0].grid
+    };
+    let off = SplitFlags {
+        on: true,
+        tc: true,
+        kv_reuse: true,
+        pipe: false,
+        pin: false,
+    };
+    let pin = SplitFlags { pin: true, ..off };
+    for rows in 1..=8 {
+        // Off: the launch's own count, as before the flag existed.
+        let own = sparse_split_count(rows, 32, 2051);
+        assert_eq!(launch(rows, scratch, off), [1, rows, own]);
+        // On: the widest verify block's count at every width.
+        assert_eq!(launch(rows, scratch, pin), [1, rows, 6]);
+    }
+    // A launch that does not split stays unsplit under the pin: the split
+    // switched off, no K=V kernel, or no scratch.
+    let unsplit = [
+        (scratch, SplitFlags { on: false, ..pin }),
+        (
+            scratch,
+            SplitFlags {
+                kv_reuse: false,
+                ..pin
+            },
+        ),
+        (DevicePtr::NULL, pin),
+    ];
+    for (scratch, flags) in unsplit {
+        assert_eq!(launch(3, scratch, flags), [1, 3, 1]);
+    }
+}
