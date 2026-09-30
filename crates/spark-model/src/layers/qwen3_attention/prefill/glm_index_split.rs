@@ -20,16 +20,19 @@
 //! are compared across the ranks at startup (`agree_index_split`).
 //!
 //! `ATLAS_GLM_INDEX_SPLIT_CHECK=1` also selects every row into scratch and
-//! fails the request on both ranks on any difference.
+//! fails the request on both ranks on any difference (`check`).
 
 use std::ops::Range;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use crate::layer::ForwardContext;
 use crate::layers::glm_sp;
+
+#[path = "glm_index_split_check.rs"]
+mod check;
 
 /// Owners below this many rows stay replicated (verify, short appends): the
 /// two exchanges' fixed cost outweighs the halved selection.
@@ -128,6 +131,19 @@ struct Swap {
     rows: usize,
 }
 
+/// One owner's selection buffers.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct OwnerRows {
+    /// The selected token-id rows, `row_bytes` each.
+    pub(super) selected: DevicePtr,
+    pub(super) row_bytes: usize,
+    /// Under the check, the replicated rows.
+    pub(super) scratch: DevicePtr,
+    /// Under the check, the `(pointer, bytes)` of the index queries and the
+    /// head weights every row was selected from.
+    pub(super) inputs: [(DevicePtr, usize); 2],
+}
+
 /// This rank's share of one owner's selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct IndexSplit {
@@ -218,66 +234,29 @@ impl IndexSplit {
         own
     }
 
-    /// Swap this rank's finished rows of `selected` for the peer's. Under the
-    /// check, then compare every row with the replicated rows in `scratch`.
+    /// Swap this rank's finished rows of `rows.selected` for the peer's.
+    /// Under the check, then compare every row with the replicated rows.
     pub(super) fn exchange(
         &self,
-        selected: DevicePtr,
-        scratch: DevicePtr,
-        row_bytes: usize,
+        rows: &OwnerRows,
         layer: usize,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
         for s in self.swaps {
             glm_sp::exchange_rows(
-                selected.offset(s.own * row_bytes),
-                selected.offset(s.peer * row_bytes),
+                rows.selected.offset(s.own * rows.row_bytes),
+                rows.selected.offset(s.peer * rows.row_bytes),
                 s.rows,
-                row_bytes,
+                rows.row_bytes,
                 false,
                 ctx,
                 stream,
             )?;
         }
         if self.check {
-            self.check(selected, scratch, row_bytes, layer, ctx, stream)?;
+            self.check(rows, layer, ctx, stream)?;
         }
-        Ok(())
-    }
-
-    /// Compare every row of `selected` with the replicated rows in `scratch`,
-    /// then swap the verdicts (first differing row + 1, or 0) through
-    /// `scratch` and fail on both ranks if either saw a difference, so the
-    /// pair stops at the same collective instead of one rank running on.
-    fn check(
-        &self,
-        selected: DevicePtr,
-        scratch: DevicePtr,
-        row_bytes: usize,
-        layer: usize,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        let (rows, bytes) = (self.rows, self.rows * row_bytes);
-        let (mut split, mut replicated) = (vec![0u8; bytes], vec![0u8; bytes]);
-        ctx.gpu.copy_d2h_on_stream(selected, &mut split, stream)?;
-        ctx.gpu
-            .copy_d2h_on_stream(scratch, &mut replicated, stream)?;
-        let here = first_mismatch(&split, &replicated, row_bytes);
-        let verdict = here.map_or(0, |row| row as u64 + 1).to_le_bytes();
-        let theirs = scratch.offset(verdict.len());
-        ctx.gpu.copy_h2d_async(&verdict, scratch, stream)?;
-        glm_sp::exchange_rows(scratch, theirs, 1, verdict.len(), false, ctx, stream)?;
-        let mut peer = [0u8; 8];
-        ctx.gpu.copy_d2h_on_stream(theirs, &mut peer, stream)?;
-        let peer = u64::from_le_bytes(peer).checked_sub(1);
-        if here.is_some() || peer.is_some() {
-            bail!(
-                "ATLAS_GLM_INDEX_SPLIT_CHECK: layer {layer}: the split selection of {rows} rows differs from the replicated selection (first differing row: here {here:?}, peer {peer:?})"
-            );
-        }
-        tracing::info!("ATLAS_GLM_INDEX_SPLIT_CHECK ok layer={layer} rows={rows}");
         Ok(())
     }
 }
@@ -313,12 +292,6 @@ pub(super) fn tiles(
             .step_by(tile_rows)
             .map(move |start| (start, tile_rows.min(range.end - start), *out))
     })
-}
-
-fn first_mismatch(a: &[u8], b: &[u8], row_bytes: usize) -> Option<usize> {
-    a.chunks(row_bytes)
-        .zip(b.chunks(row_bytes))
-        .position(|(x, y)| x != y)
 }
 
 #[cfg(test)]
