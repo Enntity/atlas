@@ -53,6 +53,11 @@ use spark_runtime::own_footprint::{DeviceSource, OwnFootprint};
 const GIB: usize = 1 << 30;
 /// Two own-footprint measures further apart than this are logged at WARN.
 pub(super) const DISAGREE_WARN_BYTES: usize = 512 << 20;
+/// How far the free-memory measure may exceed the tracked one before that is
+/// a WARN. The counters miss memory the process holds outside them (a quiet
+/// GB10 start measured 1.59 and 1.65 GiB on the two ranks), so a smaller gap
+/// is the normal state, not a co-tenant allocating during the load.
+pub(super) const UNTRACKED_WARN_BYTES: usize = 5 * GIB / 2;
 /// What the pool leaves free beyond the reserves, for growth after sizing.
 pub(super) const HEADROOM_BYTES: usize = 7 * GIB / 2;
 /// The same when the tracked figure is only the allocation ledger: then the
@@ -137,7 +142,7 @@ impl KvBudget {
         if tracked > self.basis_own.saturating_add(DISAGREE_WARN_BYTES) {
             Some(Disagreement::TrackedAbove(tracked - self.basis_own))
         } else if self.basis == Basis::Delta
-            && self.basis_own > tracked.saturating_add(DISAGREE_WARN_BYTES)
+            && self.basis_own > tracked.saturating_add(UNTRACKED_WARN_BYTES)
         {
             Some(Disagreement::TrackedBelow(self.basis_own - tracked))
         } else {
