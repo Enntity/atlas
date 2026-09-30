@@ -37,13 +37,13 @@ fn actual_tc_dispatch_uses_one_query_token_per_cta_and_is_opt_in() {
     let gpu = MockGpuBackend::new();
     let c = config();
     let mut a = args(&c);
-    assert!(!dispatch(&gpu, &a, 7, false, false).unwrap());
+    assert!(!dispatch(&gpu, &a, 7, false, false, false).unwrap());
     assert_eq!(gpu.launches_snapshot().len(), 0);
     a.rows = 1;
-    assert!(!dispatch(&gpu, &a, 7, true, false).unwrap());
+    assert!(!dispatch(&gpu, &a, 7, true, false, false).unwrap());
     assert_eq!(gpu.launches_snapshot().len(), 0);
     a.rows = 1024;
-    assert!(dispatch(&gpu, &a, 7, true, false).unwrap());
+    assert!(dispatch(&gpu, &a, 7, true, false, false).unwrap());
     let launch = &gpu.launches_snapshot()[0];
     assert_eq!(launch.grid, [1, 1024, 1]);
     assert_eq!(launch.block, [256, 1, 1]);
@@ -64,8 +64,8 @@ fn enabled_unsupported_shapes_fail_before_launch() {
             5 => a.scale = 0.125,
             _ => a.query = DevicePtr::NULL,
         }
-        assert!(dispatch(&gpu, &a, 0, true, false).is_err());
-        assert!(dispatch(&gpu, &a, 0, true, true).is_err());
+        assert!(dispatch(&gpu, &a, 0, true, false, false).is_err());
+        assert!(dispatch(&gpu, &a, 0, true, true, false).is_err());
     }
     assert!(gpu.launches_snapshot().is_empty());
     for name in [
@@ -85,20 +85,20 @@ fn kv_reuse_dispatch_requires_tc_and_identical_latent_writer() {
     let gpu = MockGpuBackend::new();
     let c = config();
     let mut a = args(&c);
-    assert!(dispatch(&gpu, &a, 7, false, true).is_err());
+    assert!(dispatch(&gpu, &a, 7, false, true, false).is_err());
     a.identical_kv_latent = false;
-    assert!(dispatch(&gpu, &a, 7, true, true).is_err());
+    assert!(dispatch(&gpu, &a, 7, true, true, false).is_err());
     assert!(gpu.launches_snapshot().is_empty());
     a.identical_kv_latent = true;
     a.rows = 1;
-    assert!(!dispatch(&gpu, &a, 7, true, true).unwrap());
+    assert!(!dispatch(&gpu, &a, 7, true, true, false).unwrap());
     a.rows = 2048;
-    assert!(dispatch(&gpu, &a, 7, true, true).unwrap());
+    assert!(dispatch(&gpu, &a, 7, true, true, false).unwrap());
     let launch = &gpu.launches_snapshot()[0];
     assert_eq!(launch.grid, [1, 2048, 1]);
     assert_eq!(launch.block, [256, 1, 1]);
     assert_eq!(
-        kernel_spec(true, KvCacheDtype::Bf16),
+        kernel_spec(true, KvCacheDtype::Bf16, false),
         (
             "glm_sparse_prefill_kv_reuse",
             "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad",
@@ -106,7 +106,7 @@ fn kv_reuse_dispatch_requires_tc_and_identical_latent_writer() {
         )
     );
     assert_eq!(
-        kernel_spec(false, KvCacheDtype::Bf16),
+        kernel_spec(false, KvCacheDtype::Bf16, false),
         (
             "glm_sparse_prefill_tc",
             "glm_sparse_mla_prefill_bf16_head32_tc",
@@ -123,12 +123,12 @@ fn fp8_g128_takes_single_rows_through_the_fp8_kv_pad_kernel_only() {
     a.dtype = KvCacheDtype::Fp8G128;
     a.rows = 1;
     // Without the K=V kernel there is no fp8_g128 reader.
-    assert!(dispatch(&gpu, &a, 7, true, false).is_err());
+    assert!(dispatch(&gpu, &a, 7, true, false, false).is_err());
     assert!(gpu.launches_snapshot().is_empty());
-    assert!(dispatch(&gpu, &a, 7, true, true).unwrap());
+    assert!(dispatch(&gpu, &a, 7, true, true, false).unwrap());
     assert_eq!(gpu.launches_snapshot()[0].grid, [1, 1, 1]);
     assert_eq!(
-        kernel_spec(true, KvCacheDtype::Fp8G128),
+        kernel_spec(true, KvCacheDtype::Fp8G128, false),
         (
             "glm_sparse_prefill_kv_reuse",
             "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad",
@@ -137,5 +137,40 @@ fn fp8_g128_takes_single_rows_through_the_fp8_kv_pad_kernel_only() {
     );
     a.dtype = KvCacheDtype::Fp8;
     a.rows = 8;
-    assert!(dispatch(&gpu, &a, 7, true, true).is_err());
+    assert!(dispatch(&gpu, &a, 7, true, true, false).is_err());
+}
+
+#[test]
+fn pipe_swaps_only_the_unsplit_fp8_kernel_and_requires_tc() {
+    let gpu = MockGpuBackend::new();
+    let c = config();
+    let mut a = args(&c);
+    a.dtype = KvCacheDtype::Fp8G128;
+    a.rows = 4096;
+    assert!(dispatch(&gpu, &a, 7, false, false, true).is_err());
+    assert!(dispatch(&gpu, &a, 7, true, true, true).unwrap());
+    assert_eq!(gpu.launches_snapshot()[0].grid, [1, 4096, 1]);
+    assert_eq!(gpu.launches_snapshot()[0].block, [256, 1, 1]);
+    assert_eq!(
+        kernel_spec(true, KvCacheDtype::Fp8G128, true),
+        (
+            "glm_sparse_prefill_kv_reuse",
+            "glm_sparse_mla_prefill_fp8g128_head32_tc_pipe",
+            80128,
+        )
+    );
+    // BF16 caches keep their kernels; the flag off keeps kv_pad.
+    for kv_reuse in [false, true] {
+        assert_eq!(
+            kernel_spec(kv_reuse, KvCacheDtype::Bf16, true),
+            kernel_spec(kv_reuse, KvCacheDtype::Bf16, false)
+        );
+    }
+    assert_eq!(
+        kernel_spec(true, KvCacheDtype::Fp8G128, false).1,
+        "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad"
+    );
+    assert!(parse("glm5_next", PIPE, Some("1")).unwrap());
+    assert!(!parse("glm5_next", PIPE, None).unwrap());
+    assert!(parse("glm5_next", PIPE, Some("yes")).is_err());
 }
