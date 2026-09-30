@@ -105,15 +105,17 @@ Verdict: none of HSS is reused. The new tier refuses to run alongside it
     in `ssm_tier/unified.rs`) — and the PID is 1 in every container, so two
     containers sharing a directory truncated each other's file. It is now
     unlinked once open, and same-tag leftovers are swept at startup.
-  - If the swap directory cannot be used, the snapshot tier silently falls
-    back to host RAM, bounded only by `ATLAS_SSM_TIER_DISK_GB`. With the KV
-    tier on, startup now refuses that configuration instead (§11).
-- Gap closed for the KV tier: with `ATLAS_KV_NVME_DIR` set (or with
-  `ATLAS_GLM_PC_EVICT` / `ATLAS_GLM_PC_BRANCH`), the ranks agree on the
-  Marconi restore depth (see §5). Without that, a fault-in that succeeded on
-  one rank and failed on the other made the ranks diverge on `skip_tokens`,
-  which leads to mismatched collectives and a deadlock. The snapshot tier on
-  its own, with none of those flags, is unchanged and still has the gap.
+  - If the swap directory cannot be used, the blob is not a 4 KiB multiple,
+    or `ATLAS_SSM_TIER_UNIFIED` is not set at all (the legacy store), the
+    spilled snapshots stay in host RAM — bounded by `ATLAS_SSM_TIER_DISK_GB`
+    at best, by nothing at worst. With the KV tier on, startup refuses every
+    one of those (§3, §11): the store reports where it keeps its spills
+    (`SpillHome`), from what it built rather than from the environment.
+- Gap closed: with a spill tier on — `ATLAS_KV_NVME_DIR` or `ATLAS_SSM_TIER`
+  itself — or with `ATLAS_GLM_PC_EVICT` / `ATLAS_GLM_PC_BRANCH`, the ranks
+  agree on the Marconi restore depth (see §5). Without that, a fault-in that
+  succeeded on one rank and failed on the other made the ranks diverge on
+  `skip_tokens`, which leads to mismatched collectives and a deadlock.
 
 ### Related finding, not fixed here
 
@@ -161,13 +163,14 @@ reuse the segment layout in `kv_cache/nvme_spill.rs`.
 
 Set identical values on **every rank**. On a multi-rank world the ranks
 already all-gather their KV block counts at startup; each rank's word now
-carries a fingerprint of these settings in its upper half (0 with the tier
-off, so the collective and its bytes are unchanged without the flags), and
-every rank refuses to start if the fingerprints differ. A rank whose tier
-environment does not parse sends a sentinel, so it stops every rank in that
-collective. What fails later on one rank only (directory, disk reservation,
-staging) stops that rank with an error naming the variable, and its peers
-through the EP peer lifeline (exit 74).
+carries a fingerprint of these settings in its upper half (0 with both spill
+tiers off, so the collective and its bytes are unchanged without the flags),
+and every rank refuses to start if the fingerprints differ. A rank whose tier
+environment does not parse, or that holds a combination the tier refuses
+(below), sends a sentinel, so it stops every rank in that collective. What
+fails later on one rank only (directory, disk reservation, staging) stops
+that rank with an error naming the variable, and its peers through the EP
+peer lifeline (exit 74).
 
 | Variable | Meaning |
 |---|---|
@@ -175,15 +178,25 @@ through the EP peer lifeline (exit 74).
 | `ATLAS_KV_NVME_GB=<GiB>` | **Required** alongside the dir (strict parse, > 0). Per-rank disk budget; the coldest on-disk blocks are dropped beyond it. |
 | `ATLAS_GLM_NVME_FAST=1` | The fast I/O path (§5): same records, moved in run-sized requests and pitched copies, written behind the evicting request. Also reserves the whole budget on disk at startup. Strict `1`/`0`; part of the rank fingerprint. |
 | `ATLAS_GLM_NVME_KEEP=1` | A restored block keeps its record, so evicting it again writes nothing (§5). Strict `1`/`0`; part of the rank fingerprint. |
+| `ATLAS_SSM_TIER=1` `ATLAS_SSM_TIER_UNIFIED=1` `ATLAS_SSM_TIER_SWAP_DIR=<dir>` `ATLAS_SSM_TIER_DISK_GB=<GiB>` `ATLAS_SSM_TIER_SLOTS=2` | Existing KDA snapshot tier (see §1). Where it keeps its spills (nowhere / an O_DIRECT file / a peer) is part of the rank fingerprint. |
 
-The two `ATLAS_GLM_NVME_*` switches only choose how the tier moves records.
-Without `ATLAS_KV_NVME_DIR` they are not read at all: the rank starts exactly
-as it does with them unset, whatever they hold, and logs one warning per
-switch that is set. (`ATLAS_KV_NVME_GB` without the directory stays an error.)
-| `ATLAS_SSM_TIER=1` `ATLAS_SSM_TIER_UNIFIED=1` `ATLAS_SSM_TIER_SWAP_DIR=<dir>` `ATLAS_SSM_TIER_DISK_GB=<GiB>` `ATLAS_SSM_TIER_SLOTS=2` | Existing KDA snapshot tier (see §1). |
+`ATLAS_KV_NVME_GB` and the two `ATLAS_GLM_NVME_*` switches only shape a tier
+that is on. Without `ATLAS_KV_NVME_DIR` they are not read at all: the rank
+starts exactly as it does with them unset, whatever they hold, and logs one
+warning per variable that is set.
 
-Setting `ATLAS_KV_NVME_DIR` without `--enable-prefix-caching`, or together
-with `--high-speed-swap`, is a startup error.
+Startup errors with `ATLAS_KV_NVME_DIR` set:
+
+- without `--enable-prefix-caching`, or together with `--high-speed-swap`;
+- **with `ATLAS_SSM_TIER` when the snapshot tier keeps its spills in host
+  RAM**: no `ATLAS_SSM_TIER_UNIFIED=1`, no usable `ATLAS_SSM_TIER_SWAP_DIR`,
+  or a blob that is not a 4 KiB multiple. The KV pool is sized around the
+  host memory the tiers take (§10), and 78 MB per spilled snapshot in RAM is
+  outside any such bound; the hosts hang when unified memory runs out. Every
+  rank stops (the sentinel above);
+- **on a multi-rank world with `ATLAS_EP_PEER_LIFELINE=0`**: a rank that fails
+  in its local setup after the agreement would leave its peer waiting in the
+  next collective.
 
 First hardware test (both nodes):
 
@@ -305,11 +318,23 @@ What keeps this safe:
 
 **Kept records (`ATLAS_GLM_NVME_KEEP=1`).** A restored block normally gives
 its slot back. With this flag it keeps it: the node is resident AND has a
-record. Cached full blocks are never rewritten, so that record stays valid
-for as long as the node lives, and evicting the block again is pure
-bookkeeping — no gather, no write (`clean_evictions` in the stats). Kept
-records count against the budget, so they are only kept while at most half of
-it is in use; an `insert` that recomputes a block still releases its slot.
+record, and evicting the block again is pure bookkeeping — no gather, no
+write (`clean_evictions` in the stats). Kept records count against the
+budget, so they are only kept while at most half of it is in use; an `insert`
+that recomputes a block still releases its slot.
+
+A cached full block is never appended to, but it can be **rewritten in
+place**: a prefill that resumes below its match (no usable snapshot, a
+snapshot below the match, or a full-prompt hit's last row) recomputes those
+rows into the shared blocks with equivalent, not bit-identical, values
+(`model/prefix_share.rs`). A record kept for such a block would then hold the
+older computation and come back on the next restore — different bytes from
+what the synchronous path returns, and possibly a different version on each
+rank. So the prefix lookup reports the rows it is about to recompute
+(`nvme_forget_rewritten` → `NvmePrefixTier::forget_kept`) and those blocks
+give their records up; their next eviction writes them again. The ordinary
+warm turn resumes exactly at its match (the restore stops at the anchor) and
+keeps every record.
 
 ### Restore (prefill_b, chunk 0, before `lookup`)
 
@@ -320,9 +345,19 @@ it is in use; an `insert` that recomputes a block still releases its slot.
    - pure attention: all of them;
    - hybrid (GLM): up to the deepest usable Marconi anchor, resident or
      spill-tiered (`snapshot_anchor_depth`, read-only), and nothing if there
-     is no anchor at least `marconi_min_tokens` deep. Without an anchor the
-     KV would be recomputed anyway, and KV past the anchor is replayed through
-     every layer regardless.
+     is none. Without an anchor the KV would be recomputed anyway, and KV
+     past the anchor is replayed through every layer regardless. "Usable"
+     mirrors what the lookup does with the anchor afterwards: at least
+     `marconi_min_tokens` deep, at least `ATLAS_SSM_FAULT_MIN_TOKENS` deep
+     when the snapshot tier is on, and not an anchor at the very end of the
+     prompt (the exact-hit bypass recomputes everything);
+   - a declined restore costs nothing: the pin is released, no block is
+     allocated and nothing is read (the fast path's read would first wait
+     for every queued write), and the run keeps its place in the disk LRU —
+     a plan only refreshes the resident part of the path, the on-disk part
+     when it is actually restored. A run nobody can use (a new conversation
+     over a spilled shared system prompt, arriving again and again) is
+     therefore still the budget's victim in its turn.
 3. It allocates blocks (possibly spilling other conversations), then reads
    runs of consecutive slots with one `pread` each. A chain spilled leaf-first
    gets consecutive slots in descending order, and the reader handles either
@@ -386,7 +421,8 @@ for run-sized writes. That is 0.02–0.11 s for the same prefill.
     entries. They are released and re-looked-up, exactly as in F83 today.
   - A restore issues no collectives, so its partial failure on one rank cannot
     deadlock.
-- **Marconi:** with the KV tier on, a multi-rank world runs the restore-depth
+- **Marconi:** with either spill tier on (the KV tier, or the snapshot tier
+  alone), a multi-rank world runs the restore-depth
   agreement of `prefill_b/pc_policy.rs` (`pc_agree_restore`, the one
   `ATLAS_GLM_PC_EVICT` / `ATLAS_GLM_PC_BRANCH` already turn on) once per
   chunk-0 lookup: one `ep_min_u32` over each rank's restorable depth (0 if
@@ -394,14 +430,16 @@ for run-sized writes. That is 0.02–0.11 s for the same prefill.
   the minimum depth if every rank holds an exact-prefix snapshot there.
   Otherwise all ranks take the no-restore path together: a recompute, never
   a divergence.
-  - With the tier and both policy flags off this is a no-op, so there are no
-    new collectives on the default path.
+  - With both tiers and both policy flags off this is a no-op, so there are
+    no new collectives on the default path.
 - **Configuration:** at startup, every multi-rank world's KV-block all-gather
-  carries `(KV slots, record size, ATLAS_SSM_TIER set, fast, keep)` as a
-  32-bit word (or a failure sentinel) beside the block count, and aborts on a
-  mismatch or a failed rank, because the tier gates paired collectives. No
-  collective is added: with the tier off the word is 0 and the gathered bytes
-  are the block count alone.
+  carries `(KV slots, record size, the snapshot tier's spill home, fast,
+  keep)` as a 32-bit word (or a failure sentinel) beside the block count, and
+  aborts on a mismatch or a failed rank, because the tiers gate paired
+  collectives. No collective is added: with both tiers off the word is 0 and
+  the gathered bytes are the block count alone. The snapshot tier on its own
+  sends a non-zero word too, so a rank without `ATLAS_SSM_TIER` cannot start
+  beside one with it.
 
 ## 6. Failure handling (never serve stale data)
 
@@ -410,6 +448,8 @@ for run-sized writes. That is 0.02–0.11 s for the same prefill.
 | Disk full / `pwrite` error at spill | The node is dropped and the block evicted as without the tier. Throttled warning. Later hits on that prefix recompute. On the fast path the drop happens at the next spill or restore; the record fails verification in between. |
 | Disk cannot hold the budget (fast path) | Startup error naming `ATLAS_KV_NVME_GB`: the whole budget is reserved (`fallocate`) before serving, so a spill cannot run out of disk later. Every rank stops. |
 | Directory on tmpfs / ramfs / overlayfs, or not writable | Startup error naming the variable (KV directory, and the snapshot tier's swap directory when it is configured) on that rank; its peers stop through the EP peer lifeline. |
+| Snapshot tier's spills in host RAM (legacy store, unusable swap directory, non-4 KiB blob) beside the KV tier | Startup error on that rank, sent as the failure sentinel: every rank stops in the KV-block all-gather. |
+| `ATLAS_EP_PEER_LIFELINE=0` on a multi-rank world with the KV tier | Startup error, every rank (the row above this pair depends on the lifeline). |
 | A worker thread panics (fast path) | Caught; the job is reported as failed (a write: those nodes are dropped; a read: the restore stops there). The serving thread never waits on a job that cannot finish. |
 | Staging ring with no free chunk and no write in flight (fast path; a leak) | The spill batch fails (plain eviction) with a warning; a restore attempts nothing and the prefix recomputes. No wait. |
 | A write failure reported after its node was restored (kept records) | Ignored for that node: it was restored from that record, which verified. The failure is still counted. |
@@ -434,7 +474,17 @@ for run-sized writes. That is 0.02–0.11 s for the same prefill.
   and every end-to-end number.
 - **Restore only runs in `prefill_b`** (chunked prefill), the multi-rank path.
   `prefill_a`/`prefill_c` and the single-rank batched reservation path stay
-  resident-only: correct, just no restore.
+  resident-only: correct, just no restore. On a single rank, requests that
+  arrive together are admitted through that batched path: a conversation
+  whose prefix is on disk is then admitted cold and recomputed, and the
+  batch pre-flight (`peek_matched_tokens`, resident-only) counts its blocks
+  as needed. The tier serves sequential arrivals there. A TP2/EP world always
+  declines the batched reservation and is not affected.
+- **A spill runs on the serving thread under a device-wide sync**, in batches
+  of 32 blocks, wherever a block allocation misses — inside a decode or
+  verify step too, and in the head's scheduler reclaim. The A/B gates the
+  decode rate and the longest stall of one stream while another request
+  evicts (§8), not every such path.
 - **Assumptions to watch on hardware:**
   - all ranks build through `build_model` (as `agree_kv_blocks` already
     requires);
@@ -493,26 +543,63 @@ for run-sized writes. That is 0.02–0.11 s for the same prefill.
 5. **Soak:** 2 h of mixed agentic traffic, checking that no free-block leak
    appears (`num_free_blocks` returns to baseline when idle), that RSS is
    bounded, and that there are no deadlocks.
-6. **A/B on the production profile** (one server start per arm, pool capped
-   with `ATLAS_KV_MAX_BLOCKS=7500` so 8 conversations of 25 K tokens evict
-   each other):
-   - `prod`: the production profile alone (the control; turns 1 and 2 only);
-   - `sync`: plus the flags from §3;
-   - `fast`: plus `ATLAS_GLM_NVME_FAST=1`;
-   - `fastkeep`: plus `ATLAS_GLM_NVME_FAST=1 ATLAS_GLM_NVME_KEEP=1`.
+6. **A/B on the production profile** (one server start per arm, each under
+   five minutes; environment on both ranks, on top of the production profile):
+   - `prod`: `ATLAS_KV_MAX_BLOCKS=7500` — the control: a pool that 8
+     conversations of 25 K tokens overflow, no tier;
+   - `warm`: nothing — the production profile itself. Nothing is evicted,
+     every warm turn resumes from resident blocks: the byte reference;
+   - `sync`: `ATLAS_KV_MAX_BLOCKS=7500` plus the flags from §3;
+   - `fast`: `sync` plus `ATLAS_GLM_NVME_FAST=1`;
+   - `fastkeep`: `sync` plus `ATLAS_GLM_NVME_FAST=1 ATLAS_GLM_NVME_KEEP=1`;
+   - `fault`: the `fast` environment, with 20 conversations of 10 K tokens —
+     more than the 16 snapshot slots, so warm turns must fault their anchor
+     back from the snapshot tier.
 
-   `sync` is judged against `prod` (does the tier work: exact answers, one
-   complete restore per warm request on both ranks, warm turns at most 0.35×
-   the control's, the evicting turn-1 prefills at most 10% slower, and each
-   rank's KV pool smaller than the control's by about the reserve line), the
-   fast arms against `sync` (below).
+   Four verdicts, all needed:
+   - `compare prod sync` — does the tier work: exact answers, one complete
+     restore per warm request on both ranks, warm turns at most 0.35× the
+     control's, the evicting turn-1 prefills at most 10% slower than the
+     others AND the median turn 1 at most 10% slower than the control's (a
+     cost on every prefill cancels in the first), each rank's KV pool smaller
+     than the control's by about the reserve line and the sizing line's own
+     reserve term larger by it, the snapshot tier's startup line naming an
+     O_DIRECT swap file on both ranks, a decoding stream keeping at least
+     0.8× the control's rate (and stalling at most 0.5 s longer) while
+     another request prefills and evicts, that request's TTFT within 1.15×,
+     `MemAvailable` falling by no more than the control's fall plus the
+     reserve plus 512 MiB, and the two containers differing in the tier
+     variables only;
+   - `compare sync fast`, `compare sync fastkeep` — the fast arms against
+     `sync` (below);
+   - `lossless warm <tier arm>` — every sequential output of the tier arm
+     (turns 1–3, 20 requests) is byte-identical to the resident arm's. Both
+     resume at the same snapshot anchor and run the same rows, so this is the
+     one check that sees a record that came back wrong in a way its checksum
+     cannot (the checksum is taken after the gather and verified before the
+     scatter). Turn 1, cold in both arms, is the control: if it already
+     differs the pair is not deterministic from start to start and the
+     verdict is INCONCLUSIVE, not NO-GO. A not-streamed turn 4 compares the
+     generated tokens' logprobs (within 0.05) when the server returns them;
+   - `faultin fault` — on both ranks: at least one `SSM tier fault-in:
+     restored spilled snapshot` line and the `disk tier ENGAGED` line, none
+     failed, no `no SSM snapshot`, no `pc rank-agree:` line, the same number
+     of fault-ins on both ranks, every warm turn matching its prompt and
+     starting within 0.5× its cold TTFT, `MemAvailable` within the reserve.
 
-   Each arm runs the same 23 salted requests (about 2.5 minutes): 8 cold
-   conversations, turn 2 of each (first restore), turn 3 of conversations
-   0–3 (second restore — with `fastkeep`, from records that survived a
-   restore and a write-free eviction), and turn 3 of conversations 4 and 5
-   sent together. Answers are planted text (three codes and ten ledger
-   entries per conversation), checked exactly.
+   The main plan is 27 salted requests (about 3 minutes; the control about 4):
+   8 cold conversations, turn 2 of each (first restore), turn 3 of
+   conversations 0–3 (second restore — with `fastkeep`, from records that
+   survived a restore and a write-free eviction), turn 3 of conversations 4
+   and 5 sent together, a long count decoded while a ninth cold conversation
+   prefills, and turn 4 of conversations 0–1 with logprobs (third restore).
+   Answers are planted text (three codes and ten ledger entries per
+   conversation), checked exactly.
+
+   Not covered by any arm: a restore that succeeds on one rank only (the
+   agreement path is only ever seen not to fire), the disk budget filling
+   (24 GiB is far more than five minutes of spills), and the single-rank
+   batched path.
 
    The restore line, on both ranks (one line in the log; the numbers are an
    illustration, not a measurement):
@@ -540,8 +627,8 @@ for run-sized writes. That is 0.02–0.11 s for the same prefill.
      thread since startup, and `spill path waited` the part of it spent
      waiting for the writer.
 
-   GO needs, against the `sync` arm and on **both** ranks: every answer
-   exact; every warm request matching its whole turn-1 prompt
+   GO for a fast arm needs, against the `sync` arm and on **both** ranks:
+   every answer exact; every warm request matching its whole turn-1 prompt
    (`cached_tokens`) and starting within 0.3× its own cold TTFT; exactly one
    complete restore per warm request, no failure, no F83 cap, no `no SSM
    snapshot`, no rank disagreement; restore time ≤ 95 µs per block and at
@@ -549,8 +636,9 @@ for run-sized writes. That is 0.02–0.11 s for the same prefill.
    twice `sync`'s; gather
    ≤ 80 µs per evicted block and the whole serving-thread spill cost at most
    a third of `sync`'s; the evicting turn-1 prefills no slower than `sync`'s;
-   turn-2 TTFT at least 0.25 s lower. With `fastkeep`, additionally at least
-   1,000 `evictions without a write` before the second restores.
+   turn-2 TTFT at least 0.25 s lower; and the decode-under-eviction, memory
+   and profile checks above, against `sync`. With `fastkeep`, additionally at
+   least 1,000 `evictions without a write` before the second restores.
 
 ## 9. Where the time went
 
@@ -768,7 +856,7 @@ is reused across restarts: the cache starts empty.
 | Directory missing | Created. If the mount itself is missing, the path resolves into the container's overlay and startup refuses it by name. |
 | Not writable, read-only mount, no `O_DIRECT` | Startup error naming the variable. Every rank stops. |
 | tmpfs / ramfs | Startup error: a "disk" tier there would spend the memory it exists to save. |
-| Snapshot swap directory unusable | Startup error when the KV tier is on. (On its own, the snapshot tier falls back to host-RAM records bounded only by `ATLAS_SSM_TIER_DISK_GB` — fatal on a GB10.) |
+| Snapshot swap directory unusable, `ATLAS_SSM_TIER_UNIFIED` missing, or `ATLAS_SSM_TIER_SWAP_DIR` missing | Startup error on every rank when the KV tier is on: the spilled snapshots would stay in host RAM. (On its own, the snapshot tier still falls back to host-RAM records, bounded by `ATLAS_SSM_TIER_DISK_GB` at best — fatal on a GB10.) |
 | Disk too small for `ATLAS_KV_NVME_GB` | Startup error from the reservation (fast path). |
 | Disk fills later | Cannot happen to the KV file (reserved). A snapshot that cannot be written is dropped; that prefix recomputes. |
 | Budget full | The coldest on-disk blocks are dropped; nothing fails. |
@@ -798,7 +886,20 @@ it, a block is written once for as long as its record is kept.
 - **One Marconi agreement.** The tier's own two-round agreement is replaced by
   `pc_agree_restore`, which `integ/next` already runs under the prefix-cache
   policy flags and which can also settle on a shallower common depth instead
-  of recomputing. It is gated on the KV tier, not on `ATLAS_SSM_TIER` alone.
+  of recomputing. As on the branch it runs with either spill tier on — the KV
+  tier or `ATLAS_SSM_TIER` alone — and the snapshot tier alone is part of the
+  startup word, so its ranks cannot differ.
+- **Nothing of the tier is read without `ATLAS_KV_NVME_DIR`.** On the branch
+  `ATLAS_KV_NVME_GB` without the directory was a startup error; it is a
+  warning now, like the two switches, so a start without the directory is
+  `integ/next`'s whatever else is set.
+- **Rank-local setup after the agreement.** The branch exchanged a failure
+  sentinel after each rank's local setup; here the setup runs after the one
+  collective and a rank that fails in it stops its peer through the EP peer
+  lifeline, which the tier therefore requires.
+- **The snapshot tier must be on disk.** The host reserve counts the snapshot
+  tier from what the store built (`SpillHome`), and a store that keeps its
+  spills in host RAM is refused beside the KV tier.
 - **KV admission.** A restore runs in the chunk-0 prefix lookup, before the
   chunk's KV reservation is voted on (`model/kv_admission.rs`). It is
   rank-local and best effort: a rank that cannot allocate restores less, the
@@ -813,7 +914,8 @@ it, a block is written once for as long as its record is kept.
 - **Rewritten shared blocks and kept records.** A prefill that recomputes or
   replays under its matched prefix rewrites those rows with equivalent, not
   bit-identical, values (`model/prefix_share.rs`). With
-  `ATLAS_GLM_NVME_KEEP=1` a block restored and then rewritten that way is
-  evicted without a write, so its record still holds the earlier computation.
-  Either is a valid KV for that token prefix; `ATLAS_GLM_PC_WRITE_FLOOR=1`
-  makes matched blocks write-once and removes the difference.
+  `ATLAS_GLM_NVME_KEEP=1` a block restored and then rewritten that way would
+  be evicted without a write, its record still holding the earlier
+  computation. The prefix lookup now releases the kept records of the blocks
+  it is about to recompute (§5), so what a restore returns is what the block
+  held, with or without KEEP.
