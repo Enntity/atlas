@@ -392,7 +392,7 @@ impl TransformerModel {
         for word in [chunk_len, chunk_start, prompt.len()] {
             self.ep_broadcast_u32(word as u32)?;
         }
-        self.ep_broadcast_tokens(prompt)?;
+        self.ep_broadcast_prompt_dispatch(seq.slot_idx as u32, prompt)?;
         self.ep_broadcast_u32(encode_width(owners.len(), rows))?;
         self.ep_broadcast_tokens(&slots)?;
         self.ep_broadcast_tokens(tokens)?;
@@ -419,7 +419,7 @@ impl TransformerModel {
         let chunk_len = self.ep_broadcast_u32(0)? as usize;
         let chunk_start = self.ep_broadcast_u32(0)? as usize;
         let full_len = self.ep_broadcast_u32(0)? as usize;
-        let prompt = self.ep_broadcast_tokens(&vec![0u32; full_len])?;
+        let prompt = self.ep_recv_prompt(full_len)?;
         let (n, rows) = decode_width(self.ep_broadcast_u32(0)?);
         ensure!(
             owner::width_supported(n, rows) && n < slots.len(),

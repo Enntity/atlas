@@ -387,7 +387,7 @@ impl TransformerModel {
     ///
     /// Command codes:
     /// - 0..0xFFFFFFEF: token ID → decode in the addressed slot
-    /// - 0xFFFFFFF0: prefill start → chunk_len, chunk_start, full_len, then full_len tokens
+    /// - 0xFFFFFFF0: prefill start → chunk_len, chunk_start, full_len, then the prompt
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
     /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB: GLM/vision extensions (`impl_a2_ep_worker`)
@@ -474,11 +474,12 @@ impl TransformerModel {
             }
             0xFFFFFFF0 => {
                 // Prefill chunk: receive chunk_len, chunk_start, full prompt length,
-                // then ALL prompt tokens via bulk broadcast (single NCCL op).
+                // then the prompt (`warm_turn`: ALL tokens in one bulk broadcast,
+                // or what the previous command's prompt did not hold).
                 let chunk_len = self.ep_broadcast_u32(0)? as usize;
                 let chunk_start = self.ep_broadcast_u32(0)? as usize;
                 let full_len = self.ep_broadcast_u32(0)? as usize;
-                let full_tokens = self.ep_broadcast_tokens(&vec![0u32; full_len])?;
+                let full_tokens = self.ep_recv_prompt(full_len)?;
                 // Compute is_last from chunk bounds — must match rank 0's
                 // value so Marconi skip branches are identical (bug #33).
                 let is_last = chunk_start + chunk_len >= full_len;

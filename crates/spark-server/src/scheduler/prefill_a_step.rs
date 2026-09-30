@@ -293,7 +293,7 @@ pub fn start_chunked_prefill(
             model.ep_broadcast_cmd(chunk_len as u32)?;
             model.ep_broadcast_cmd(0)?; // chunk_start
             model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
-            model.ep_broadcast_tokens(&prompt_tokens)?;
+            model.ep_broadcast_prompt(seq.slot_idx as u32, &prompt_tokens)?;
             Ok(())
         })() {
             let msg = format!("deferred prefill EP broadcast failed: {e:#}");
@@ -376,7 +376,7 @@ pub fn start_chunked_prefill(
         model.ep_broadcast_cmd(chunk_len as u32)?;
         model.ep_broadcast_cmd(0)?; // chunk_start
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
-        model.ep_broadcast_tokens(&prompt_tokens)?;
+        model.ep_broadcast_prompt(seq.slot_idx as u32, &prompt_tokens)?;
 
         let _pt0 = std::time::Instant::now();
         let chunk_res = model.prefill_chunk(

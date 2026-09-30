@@ -2,7 +2,8 @@
 
 //! A chunk the cache covers completely: which chunk that is, and on the real
 //! `prefill_chunk` that the switch changes nothing but the zero and embed of
-//! those chunks.
+//! those chunks. Then the worker's real chunk handler fed the prompt as a
+//! delta.
 
 // The real model and recording layer of `prefill_stream_tests`.
 #[allow(clippy::duplicate_mod)]
@@ -11,6 +12,7 @@ mod fixture;
 
 use super::fully_cached;
 use crate::layer::EmptyLayerState;
+use crate::model::warm_turn::prompt_hash;
 use crate::traits::{Model, SequenceState};
 use fixture::*;
 
@@ -177,4 +179,42 @@ fn actual_cold_chunks_all_zero_with_the_switch() {
     assert_eq!(off.3, [true, true, true]);
     assert_eq!(on, off);
     assert_eq!(off.0.len(), 3);
+}
+
+/// The worker's real 0xFFFFFFF0 handler, driven through `ep_worker_step` by
+/// the head's words. With the prompt delta the first chunk command carries
+/// the whole cold prompt after its announce words (slot, base slot, shared
+/// tokens, hash) and the second chunk of the same prompt carries no token;
+/// either way the worker reads every word and runs the same passes to the
+/// same sequence.
+#[test]
+fn actual_worker_chunks_run_the_same_from_the_prompt_delta() {
+    let tokens: Vec<u32> = (1..=24).collect();
+    let hash = prompt_hash(&tokens);
+    let run = |delta: bool| {
+        let mut f = Fixture::with_tail_split(2, 2, 1);
+        f.disable_capture();
+        f.model.warm.prompt_delta = delta;
+        let v2_slot: &[u32] = if f.model.ep_protocol_v2 { &[0] } else { &[] };
+        let prompt = |start: u32| match (delta, start) {
+            (false, _) => tokens.clone(),
+            (true, 0) => [&[0, 0, 0, hash][..], &tokens[..]].concat(),
+            (true, _) => vec![0, 0, 24, hash],
+        };
+        let mut slots = [Some(std::mem::replace(
+            &mut f.seq,
+            SequenceState::host_only(0),
+        ))];
+        for (len, start) in [(8, 0), (16, 8)] {
+            f.script(&[v2_slot, &[0xFFFF_FFF0, len, start, 24], &prompt(start)].concat());
+            assert!(f.model.ep_worker_step(&mut slots).unwrap());
+            assert_eq!(f.unread(), 0, "delta {delta}: command words left unread");
+        }
+        let s = slots[0].take().unwrap();
+        (f.events(), s.tokens, s.seq_len, s.block_table.len())
+    };
+    let (bulk, delta) = (run(false), run(true));
+    assert_eq!(bulk.0.len(), 3);
+    assert_eq!((&bulk.1, bulk.2, bulk.3), (&tokens, 24, 6));
+    assert_eq!(delta, bulk);
 }
