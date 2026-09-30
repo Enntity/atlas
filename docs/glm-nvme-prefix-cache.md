@@ -493,12 +493,19 @@ for run-sized writes. That is 0.02–0.11 s for the same prefill.
 5. **Soak:** 2 h of mixed agentic traffic, checking that no free-block leak
    appears (`num_free_blocks` returns to baseline when idle), that RSS is
    bounded, and that there are no deadlocks.
-6. **Fast path A/B** (one server start per arm, pool capped with
-   `ATLAS_KV_MAX_BLOCKS=7500` so 8 conversations of 25 K tokens evict each
-   other):
-   - `sync`: the flags from §3;
+6. **A/B on the production profile** (one server start per arm, pool capped
+   with `ATLAS_KV_MAX_BLOCKS=7500` so 8 conversations of 25 K tokens evict
+   each other):
+   - `prod`: the production profile alone (the control; turns 1 and 2 only);
+   - `sync`: plus the flags from §3;
    - `fast`: plus `ATLAS_GLM_NVME_FAST=1`;
    - `fastkeep`: plus `ATLAS_GLM_NVME_FAST=1 ATLAS_GLM_NVME_KEEP=1`.
+
+   `sync` is judged against `prod` (does the tier work: exact answers, one
+   complete restore per warm request on both ranks, warm turns at most 0.35×
+   the control's, the evicting turn-1 prefills at most 10% slower, and each
+   rank's KV pool smaller than the control's by about the reserve line), the
+   fast arms against `sync` (below).
 
    Each arm runs the same 23 salted requests (about 2.5 minutes): 8 cold
    conversations, turn 2 of each (first restore), turn 3 of conversations
