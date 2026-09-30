@@ -10,12 +10,10 @@ fn isolated(name: &str) -> bool {
     if std::env::var("ATLAS_PREFILL_STREAM_TEST_CHILD").as_deref() == Ok("1") {
         return false;
     }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            &format!("model::trait_impl::prefill_stream_tests::{name}"),
-            "--nocapture",
-        ])
+    // This module's path inside the test binary (it is mounted under `entry`).
+    let path = module_path!().split_once("::").unwrap().1;
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &format!("{path}::{name}"), "--nocapture"])
         .env("ATLAS_PREFILL_STREAM_TEST_CHILD", "1")
         .env("ATLAS_GLM_MTP_HIDDEN_TRACE", "0")
         .env_remove("ATLAS_NO_MTP_EAGER_DRAFTER")
@@ -24,9 +22,15 @@ fn isolated(name: &str) -> bool {
         .env_remove("ATLAS_DIAG_GEMMA4")
         .env_remove("ATLAS_NEMO_DUMP")
         .env_remove("ATLAS_SSM_SAVE_DUMP")
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "actual entry-point child failed: {name}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // A filter that matches nothing also exits 0: require the one test.
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "actual entry-point child failed: {name}\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     true
 }
 
