@@ -17,7 +17,13 @@
 //! all-reduces. Correctness always runs first: small-integer payloads whose
 //! BF16 sums are exact, checked after eager calls and after graph replays
 //! interleaved with eager calls; `--stress N` repeats that N times with a
-//! fresh payload per call. Exit 1 on any wrong value.
+//! fresh payload per call. A routing pass then drives every entry point the
+//! model uses (`all_reduce`, `all_reduce_async`, `exchange_async` add and
+//! copy, `peer_exchange_async`, and the capturable pair in one graph) back to
+//! back with one sync, at a one-shot size next to one above the capturable
+//! limit, so the channels interleave on the stream. Exit 1 on any wrong
+//! value, 2 on an error (without NCCL teardown: the peer may be gone), naming
+//! the one-shot fault if the channel stopped.
 //!
 //! Run (per rank):
 //!   comm_pair_bench --rank R --master 10.100.192.2 [--port 29610]
@@ -182,6 +188,64 @@ impl Bench<'_> {
         Ok(bad)
     }
 
+    /// Wrong bytes in `dst` against the peer's payload `seq`.
+    fn wrong_copy(&self, dst: DevicePtr, seq: u64, bytes: usize) -> Result<usize> {
+        let want = payload(1 - self.rank, seq, bytes / 2, false);
+        let got = self.fetch(dst, bytes)?;
+        Ok(got.iter().zip(&want).filter(|(x, y)| x != y).count())
+    }
+
+    /// Every entry point, back to back with one sync per round, per size:
+    /// buffers 0-2 are all-reduced, 3 is sent and lands in 4 and 5.
+    fn routing(&mut self, sizes: [usize; 2], rounds: usize) -> Result<usize> {
+        let (comm, st, mut bad) = (self.comm, self.stream, 0);
+        let mut sets = Vec::new();
+        for bytes in sizes {
+            let b: Vec<DevicePtr> = (0..6).map(|_| self.g.alloc(bytes)).collect::<Result<_>>()?;
+            sets.push((bytes, b));
+        }
+        let graph = if comm.capturable_all_reduce_max_bytes() >= sizes[0] {
+            let (bytes, b) = &sets[0];
+            self.g.begin_capture(st)?;
+            ensure!(comm.all_reduce_capturable(b[0].0, *bytes, st)?);
+            ensure!(comm.peer_exchange_capturable(b[3].0, b[5].0, *bytes, st)?);
+            Some(self.g.end_capture(st)?)
+        } else {
+            None
+        };
+        for _ in 0..rounds {
+            let mut seqs = Vec::new();
+            for (bytes, b) in &sets {
+                seqs.push(self.prepare(&b[..4], *bytes)?);
+            }
+            for (bytes, b) in &sets {
+                let bytes = *bytes;
+                comm.all_reduce(b[0].0, bytes)?;
+                comm.all_reduce_async(b[1].0, bytes, st)?;
+                if !comm.exchange_async(b[2].0, b[2].0, bytes, true, st)? {
+                    comm.all_reduce_async(b[2].0, bytes, st)?;
+                }
+                if !comm.exchange_async(b[3].0, b[4].0, bytes, false, st)? {
+                    comm.peer_exchange_async(b[3].0, b[4].0, bytes, st)?;
+                }
+                comm.peer_exchange_async(b[3].0, b[5].0, bytes, st)?;
+            }
+            for ((bytes, b), s) in sets.iter().zip(&seqs) {
+                bad += self.wrong(&b[..3], &s[..3], *bytes)?;
+                bad += self.wrong_copy(b[4], s[3], *bytes)?;
+                bad += self.wrong_copy(b[5], s[3], *bytes)?;
+            }
+            if let Some(h) = graph {
+                let (bytes, b) = &sets[0];
+                let s = self.prepare(&[b[0], b[3]], *bytes)?;
+                self.g.launch_graph(h, st)?;
+                bad += self.wrong(&b[..1], &s[..1], *bytes)?;
+                bad += self.wrong_copy(b[5], s[1], *bytes)?;
+            }
+        }
+        Ok(bad)
+    }
+
     fn peer_exchange_check(&mut self, bytes: usize) -> Result<usize> {
         let (send, recv) = (self.g.alloc(bytes)?, self.g.alloc(bytes)?);
         let mut bad = 0;
@@ -190,13 +254,7 @@ impl Bench<'_> {
             self.comm
                 .peer_exchange_async(send.0, recv.0, bytes, self.stream)?;
             self.g.synchronize(self.stream)?;
-            let want = payload(1 - self.rank, s, bytes / 2, false);
-            bad += self
-                .fetch(recv, bytes)?
-                .iter()
-                .zip(&want)
-                .filter(|(x, y)| x != y)
-                .count();
+            bad += self.wrong_copy(recv, s, bytes)?;
         }
         Ok(bad)
     }
@@ -257,9 +315,29 @@ fn main() -> Result<()> {
         env("ATLAS_RDMA_ONESHOT_STRIPE_MIN"),
         comm.capturable_all_reduce_max_bytes()
     );
+    // No NCCL teardown on either exit: after a fault the peer may be gone.
+    match run(&a, g, &comm, stream, max_rows * H * 2) {
+        Ok(bad) => std::process::exit(i32::from(bad != 0)),
+        Err(e) => {
+            let fault = comm.oneshot_poisoned();
+            eprintln!("rank {}: FAILED: {e:#}; one-shot fault: {fault:?}", a.rank);
+            std::process::exit(2)
+        }
+    }
+}
+
+/// Wrong bytes over every check; `large` is the biggest payload the backend
+/// was sized for.
+fn run(
+    a: &Args,
+    g: &dyn GpuBackend,
+    comm: &NcclBackend,
+    stream: u64,
+    large: usize,
+) -> Result<usize> {
     let mut b = Bench {
         g,
-        comm: &comm,
+        comm,
         stream,
         rank: a.rank,
         seq: 0,
@@ -303,11 +381,18 @@ fn main() -> Result<()> {
         "rank {} peer exchange {pe} B: synced p10/p50/p90 {p10:.1}/{p50:.1}/{p90:.1} us, wrong {wrong}",
         a.rank
     );
+    let small = a.rows[0] * H * 2;
+    let wrong = b.routing([small, large], 8 + a.stress / 16)?;
+    bad += wrong;
+    println!(
+        "rank {} routing ({small} B next to {large} B, every entry point): wrong {wrong}",
+        a.rank
+    );
     println!(
         "rank {}: {} ({bad} wrong bytes)",
         a.rank,
         if bad == 0 { "PASS" } else { "FAIL" }
     );
     b.barrier()?;
-    std::process::exit(i32::from(bad != 0));
+    Ok(bad)
 }

@@ -135,8 +135,9 @@ impl NcclBackend {
         let _ = handle;
     }
 
-    /// Why the one-shot kernel trapped (timeout or diverged ranks), if it did.
-    pub(super) fn oneshot_poisoned(&self) -> Option<String> {
+    /// Why the one-shot channel stopped (the peer never arrived, the ranks
+    /// diverged, or the host could no longer serve it), if it did.
+    pub fn oneshot_poisoned(&self) -> Option<String> {
         #[cfg(atlas_rdma_verbs)]
         if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
             return oneshot.poisoned();
