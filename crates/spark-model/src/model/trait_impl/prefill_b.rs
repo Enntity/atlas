@@ -126,7 +126,7 @@ impl TransformerModel {
         {
             let bs = self.kv_cache.lock().block_size();
             // One block below the last block boundary strictly under `total`.
-            let cut = ((total.saturating_sub(1) / bs) * bs).saturating_sub(bs);
+            let cut = pc_policy::tail_cut(total, bs);
             // UNCONDITIONAL. This used to additionally require
             // `ep_active || peek_matched_tokens(..) > 0`, i.e. it split only on a
             // WARM request (radix already populated) — which made the prompt take a

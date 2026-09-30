@@ -307,6 +307,12 @@ impl PrefixCache for RadixTree {
             .resident_at(tokens, depth, adapter_id)
     }
 
+    fn forks_at(&self, tokens: &[u32], depth: usize, block_size: usize, adapter_id: u64) -> bool {
+        self.inner
+            .lock()
+            .forks_at(tokens, depth, block_size, adapter_id)
+    }
+
     fn mark_branch_snapshot(&self, tokens: &[u32], adapter_id: u64) {
         let prefix_hash = hash_token_prefix(tokens, tokens.len(), adapter_id);
         self.snapshot_index.lock().mark_branch(prefix_hash);

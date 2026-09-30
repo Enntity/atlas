@@ -150,7 +150,8 @@ fn a_fast_session_cannot_evict_slower_sessions() {
 }
 
 /// TP2: the worker's sequences carry `session_hash = 0`, the head's carry the
-/// real hash. The same operation stream must yield the same victims on both.
+/// real hash. The same operation stream yields the same victims on both, so
+/// `session_hash` is no longer a source of divergence.
 #[test]
 fn victims_do_not_depend_on_session_hash() {
     let run = |policy: fn(&SsmSnapshotIndex) -> Option<usize>, head: bool| {
@@ -203,4 +204,45 @@ fn resident_at_matches_exact_depth_only() {
         None,
         "tails bleed past depth"
     );
+}
+
+/// Victim identity is NOT a cross-rank guarantee: a rank-local recency bump
+/// (the F83 re-lookup on the rank whose match was capped, or `resident_at` on
+/// the rank that restores shallower than it could) reorders that rank's LRU.
+/// Safety comes from the restore-depth agreement (`pc_policy::agree_restore`),
+/// which falls back to recompute when a rank lacks the agreed snapshot.
+#[test]
+fn a_rank_local_bump_can_change_the_victim() {
+    let mut a = SsmSnapshotIndex::new();
+    for s in 1..=3u32 {
+        save(&mut a, &convo(s, 30_000), s as usize, 7, 16, chain);
+    }
+    let mut b = SsmSnapshotIndex::new();
+    for s in 1..=3u32 {
+        save(&mut b, &convo(s, 30_000), s as usize, 7, 16, chain);
+    }
+    assert_eq!(b.resident_at(&convo(1, 30_016), 30_000, 0), Some(1));
+    let victim = |i: &SsmSnapshotIndex| i.entries[i.chain_victim(true).unwrap()].snapshot_id;
+    assert_eq!((victim(&a), victim(&b)), (1, 2));
+}
+
+/// Branch placement reads the KV radix: a request forks from the cached path
+/// at `depth` only when a different full block continues it there.
+#[test]
+fn forks_at_sees_only_a_diverging_full_block() {
+    use crate::prefix_cache::PrefixCache;
+    let tree = crate::radix_tree::RadixTree::new();
+    let s0 = convo(1, 4_096 + 64);
+    tree.insert(&s0, &(0..260u32).collect::<Vec<_>>(), &[], 16, 0, 0);
+    let s1 = convo(2, 4_096);
+    // Both share the first 2048 tokens (see `convo`); s0 continues differently.
+    assert!(tree.forks_at(&s1, 2_048, 16, 0));
+    // Along s0's own path nothing else branches off.
+    assert!(!tree.forks_at(&s0, 2_048, 16, 0));
+    assert!(!tree.forks_at(&s0, 4_096, 16, 0));
+    // Past the cached path, unaligned, out of range, other adapter: no fork.
+    assert!(!tree.forks_at(&s1, 2_064, 16, 0));
+    assert!(!tree.forks_at(&s1, 2_050, 16, 0));
+    assert!(!tree.forks_at(&s1, 4_096, 16, 0));
+    assert!(!tree.forks_at(&s1, 2_048, 16, 5));
 }

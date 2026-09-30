@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Placement arithmetic for the prefix-cache policy (`pc_policy`).
+//! The prefix-cache policy (`pc_policy`): placement arithmetic, and the
+//! two-rank restore-depth agreement.
 
-use super::{branch_checkpoint_at, branch_split_at, tail_cut};
+use super::{Agreed, agree_restore, branch_checkpoint_at, branch_split_at, tail_cut};
 
 const BS: usize = 16;
 
@@ -27,16 +28,29 @@ fn tail_cut_is_one_block_below_the_last_boundary() {
 }
 
 #[test]
-fn branch_checkpoint_only_without_any_restore() {
+fn branch_checkpoint_needs_min_tokens_above_the_restore() {
     // A new session sharing a 30K system prompt, nothing restorable.
     assert_eq!(
         branch_checkpoint_at(30_000, 0, 32_000, BS, 2048),
         Some(30_000)
     );
-    // A restore happened (the conversation's own tail, or an earlier
-    // branch point): the conversation continues, no extra pass.
+    // The conversation's own tail restored (0-31 tokens below the match):
+    // it continues, no extra pass.
     assert_eq!(branch_checkpoint_at(30_000, 29_968, 32_000, BS, 2048), None);
-    assert_eq!(branch_checkpoint_at(30_000, 20_000, 32_000, BS, 2048), None);
+    assert_eq!(branch_checkpoint_at(30_000, 27_968, 32_000, BS, 2048), None);
+    // Only a shallow snapshot (an older, shorter branch point) is below a
+    // deep shared prefix: plant the deeper one once.
+    assert_eq!(
+        branch_checkpoint_at(30_000, 8_000, 32_000, BS, 2048),
+        Some(30_000)
+    );
+    assert_eq!(
+        branch_checkpoint_at(30_000, 27_952, 32_000, BS, 2048),
+        Some(30_000)
+    );
+    // Restored at (or, defensively, past) the match: nothing to plant.
+    assert_eq!(branch_checkpoint_at(30_000, 30_000, 32_000, BS, 0), None);
+    assert_eq!(branch_checkpoint_at(30_000, 30_016, 32_000, BS, 0), None);
 }
 
 #[test]
@@ -82,4 +96,73 @@ fn a_split_chunk_does_not_split_again() {
     let a = branch_split_at(at, (start, len), false).unwrap();
     assert_eq!(branch_split_at(at, (start, a - start), false), None);
     assert_eq!(branch_split_at(at, (a, start + len - a), false), None);
+}
+
+/// Two ranks running [`agree_restore`] in lockstep over a real min-reduction
+/// (a channel pair; a missing peer call times out instead of hanging). Each
+/// rank has its local restorable depth and the depths at which it holds an
+/// exact-prefix snapshot (id = depth + rank). Returns each rank's result and
+/// reduction count.
+fn two_ranks(a: (usize, &[usize]), b: (usize, &[usize])) -> [((usize, Agreed), usize); 2] {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+    let (to_b, from_a) = channel::<u32>();
+    let (to_a, from_b) = channel::<u32>();
+    let run = |rank: usize,
+               (depth, held): (usize, &[usize]),
+               tx: std::sync::mpsc::Sender<u32>,
+               rx: std::sync::mpsc::Receiver<u32>| {
+        let held = held.to_vec();
+        std::thread::spawn(move || {
+            let mut calls = 0;
+            let min = |v: u32| -> anyhow::Result<u32> {
+                calls += 1;
+                tx.send(v)?;
+                Ok(v.min(rx.recv_timeout(Duration::from_secs(5))?))
+            };
+            let probe = |at: usize| held.contains(&at).then_some(at + rank);
+            let r = agree_restore(depth, min, probe).expect("no collective mismatch");
+            (r, calls)
+        })
+    };
+    let ta = run(0, a, to_b, from_b);
+    let tb = run(1, b, to_a, from_a);
+    [ta.join().unwrap(), tb.join().unwrap()]
+}
+
+#[test]
+fn equal_depths_restore_locally_on_both_ranks() {
+    let [a, b] = two_ranks((30_000, &[30_000]), (30_000, &[30_000]));
+    assert_eq!(a, ((30_000, Agreed::Local), 2));
+    assert_eq!(b, ((30_000, Agreed::Local), 2));
+}
+
+#[test]
+fn deeper_rank_restores_at_the_shallower_depth_when_it_holds_it() {
+    // Rank A kept a deeper tail; B's pool lost it and restores at 20K. A
+    // still holds an exact snapshot at 20K.
+    let [a, b] = two_ranks((30_000, &[20_000, 30_000]), (20_000, &[20_000]));
+    assert_eq!(a, ((20_000, Agreed::At(20_000)), 2));
+    assert_eq!(b, ((20_000, Agreed::Local), 2));
+}
+
+/// Eviction victims diverged: A evicted the 20K snapshot B restores from.
+/// Neither rank restores, and both issue the same reductions.
+#[test]
+fn diverged_victims_fall_back_to_recompute_everywhere() {
+    let [a, b] = two_ranks((30_000, &[30_000]), (20_000, &[20_000]));
+    assert_eq!(a, ((0, Agreed::None), 2));
+    assert_eq!(b, ((0, Agreed::None), 2));
+}
+
+#[test]
+fn a_rank_with_nothing_to_restore_forces_a_full_recompute() {
+    for (x, y) in [
+        ((30_000, &[30_000][..]), (0, &[][..])),
+        ((0, &[][..]), (0, &[][..])),
+    ] {
+        let [a, b] = two_ranks(x, y);
+        assert_eq!(a, ((0, Agreed::None), 1));
+        assert_eq!(b, ((0, Agreed::None), 1));
+    }
 }

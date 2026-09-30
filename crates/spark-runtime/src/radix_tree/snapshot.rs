@@ -315,18 +315,18 @@ impl SsmSnapshotIndex {
         // re-cut restored the old score.
         let escore = |e: &SnapshotEntry| e.last_access;
 
-        if super::snapshot_chain::glm_pc_evict_enabled() {
-            let entry = self.entries.swap_remove(self.chain_victim(true)?);
-            self.stats.evictions += 1;
-            self.evictions_since_lookup = self.evictions_since_lookup.saturating_add(1);
-            return Some(entry.snapshot_id);
-        }
-
         // SESSION-AWARE eviction (default ON; ATLAS_SNAP_EVICT_LEGACY=1 → old per-entry).
-        if std::env::var_os("ATLAS_SNAP_EVICT_LEGACY").is_none() {
-            let tail_protect = self.tail_lease_active();
+        // ATLAS_GLM_PC_EVICT=1 replaces the victim choice with the chain-aware
+        // one and takes precedence over ATLAS_SNAP_EVICT_LEGACY and the tail
+        // lease (`snapshot_chain`: a chain frontier is protected anyway).
+        let chain = super::snapshot_chain::glm_pc_evict_enabled();
+        if chain || std::env::var_os("ATLAS_SNAP_EVICT_LEGACY").is_none() {
             // Skip tiered entries (no HBM slot to free).
-            let victim_idx = self.session_aware_victim(tail_protect, true)?;
+            let victim_idx = if chain {
+                self.chain_victim(true)?
+            } else {
+                self.session_aware_victim(self.tail_lease_active(), true)?
+            };
             let entry = self.entries.swap_remove(victim_idx);
             self.stats.evictions += 1;
             self.evictions_since_lookup = self.evictions_since_lookup.saturating_add(1);

@@ -38,8 +38,18 @@
 //! sixteen, and an idle session loses its frontier only after every
 //! conversation's dead history is gone and it is the stalest frontier left.
 //!
-//! Every input (token prefixes, token counts, insert and lookup order) is the
-//! same on both ranks; `session_hash` is deliberately unused.
+//! `session_hash` is deliberately unused, so it no longer makes the ranks
+//! choose differently. Victim identity is still NOT guaranteed identical
+//! across ranks: a rank-local recency bump (the F83 re-lookup on a rank whose
+//! match was capped, a lookup win the other rank does not have, or
+//! [`SsmSnapshotIndex::resident_at`] on a rank restoring shallower than it
+//! could) reorders that rank's LRU. The TP2 safety mechanism is the
+//! restore-depth agreement in `spark-model` (`pc_policy`): every rank
+//! restores at one agreed depth or all recompute, whatever each pool holds.
+//!
+//! With the flag on this victim replaces both the session-aware one and
+//! `ATLAS_SNAP_EVICT_LEGACY`, and the tail lease is not consulted: tail
+//! entries are never linked, so they rank as protected frontiers anyway.
 //!
 //! Credit: the per-conversation retention and deepest-snapshot-wins ideas
 //! follow Reederey87's prefix-cache policy (Apache-2.0, ideas only, no code),
@@ -156,7 +166,8 @@ impl SsmSnapshotIndex {
 
     /// The resident, exact-prefix (non-tail) snapshot at exactly `depth`
     /// tokens of `tokens`. A hit counts as a use (recency bump), as a lookup
-    /// win does.
+    /// win does: the rank that restores here through the agreement then bumps
+    /// the same entry the shallower rank's lookup bumped.
     pub(super) fn resident_at(
         &mut self,
         tokens: &[u32],

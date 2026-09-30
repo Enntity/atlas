@@ -10,22 +10,43 @@
 //! turn of the SAME conversation. A NEW conversation that shares a long
 //! prefix with an earlier one (agentic clients: the same 20-60K-token system
 //! prompt and tool list in every session, subagent and side request) matches
-//! that prefix in the KV radix but finds no snapshot at or below the match,
+//! that prefix in the KV radix but finds no snapshot at or near the match,
 //! because every existing snapshot sits at some other conversation's tail. It
-//! then recomputes all of it: "Prefix cache hit: N tokens but no SSM snapshot
-//! — recomputing all KV".
+//! then recomputes all of it ("Prefix cache hit: N tokens but no SSM snapshot
+//! — recomputing all KV"), or replays from a much shallower snapshot.
 //!
-//! With the flag, such a prefill (radix match of at least
-//! `ATLAS_GLM_PC_BRANCH_MIN` tokens, default 2048, with no restorable
-//! snapshot at all) splits the chunk that spans the match point and saves a
-//! checkpoint exactly there. The match point is where the radix branches, so
-//! at least two requests share it. The next request with that prefix restores
-//! it and replays only its own suffix. This is Marconi's branch-point
-//! admission (MLSys'25, arXiv:2411.19379). The checkpoint is an ordinary
-//! block-aligned prefill checkpoint, so it stays valid under
-//! `ATLAS_MARCONI_PREFILL_ONLY`. The cost is one extra prefill pass the first
-//! time a prefix is shared. A conversation's own next turn restores its
-//! previous tail, so it never pays that pass.
+//! With the flag, a prefill whose radix match `matched` lies at least
+//! `ATLAS_GLM_PC_BRANCH_MIN` tokens (default 2048) above its restore depth,
+//! below the tail cut, and exactly where the cached KV path forks (another
+//! cached request continues past `matched` with a different block, on every
+//! rank) splits the chunk that spans `matched` and saves a checkpoint there.
+//! The next request with that prefix restores it and replays only its own
+//! suffix. This is Marconi's branch-point admission (MLSys'25,
+//! arXiv:2411.19379). The checkpoint is an ordinary block-aligned prefill
+//! checkpoint, so it stays valid under `ATLAS_MARCONI_PREFILL_ONLY`. The
+//! cost is one extra prefill pass, paid once per shared prefix by the first
+//! request that finds the fork. The fork test keeps the pass off a
+//! conversation's own next turn: its match ends where its own cached path
+//! ends, which is not a fork. (A reasoning turn whose re-rendered history
+//! drops the decoded thinking does fork there, but its own tail checkpoint
+//! sits within two blocks of the match, far under the minimum.)
+//!
+//! ## Accumulation order (lossless, but cache-dependent)
+//!
+//! The split is the same math and the same kernels, but NOT the same
+//! accumulation order as the unsplit pass. The request that plants the
+//! checkpoint runs `[start, at)` and `[at, end)` as two passes where a cold
+//! run of the same prompt runs one, so every row from `at` on sees different
+//! GEMM M-shapes, MoE groupings, attention tiling over the cached prefix, KDA
+//! pieces (`glm5_kda::flash_prefill` splits a pass into near-equal pieces by
+//! its row count) and SP row halves. Its output can differ bitwise from a
+//! cold run, and a near-tied greedy argmax can flip, exactly as for any
+//! Marconi intermediate restore (the requests that later restore at `at` run
+//! the same `[at, end)` shape). Base makes the chunk shape a pure function of
+//! (tokens, config) for this reason (`prefill_chunk_dispatch`, tail split);
+//! this flag deliberately trades that for the shared-prefix restore. No
+//! alignment of `at` can restore the unsplit shape, since the KDA piece
+//! layout depends on the pass length.
 //!
 //! # Restore-depth rank agreement
 //!
@@ -33,10 +54,22 @@
 //! is min-reduced across ranks (F83), and the Marconi restore depth sets each
 //! rank's processed row range, so ranks that restore at different depths run
 //! mismatched collectives. With either flag the ranks also agree on the
-//! restore depth: the minimum depth any rank can restore, taken only if every
-//! rank holds an exact-prefix snapshot at that depth, and otherwise a full
-//! recompute everywhere. That costs one 4-byte min-reduction per prefill, plus
-//! a second one when there is something to restore.
+//! restore depth ([`agree_restore`]): the minimum depth any rank can restore,
+//! taken only if every rank holds an exact-prefix snapshot at that depth, and
+//! otherwise a full recompute everywhere. That costs one 4-byte
+//! min-reduction per prefill, plus a second one when there is something to
+//! restore (and a third when a branch checkpoint is a candidate). This is the
+//! safety mechanism: the pools and eviction victims may diverge across ranks.
+//!
+//! # Rank env parity
+//!
+//! The flags are read per process. Both ranks MUST run with the same values
+//! of `ATLAS_GLM_PC_EVICT`, `ATLAS_GLM_PC_BRANCH` and
+//! `ATLAS_GLM_PC_BRANCH_MIN`; a rank with a different set issues different
+//! collectives and chunk shapes and the pair deadlocks. This follows the
+//! existing contract for `ATLAS_EP_PROTOCOL` (`ep_broadcast_seq_and_cmd`):
+//! checking it in the binary would need a collective that also runs with the
+//! flags off, so the launcher checks it instead.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -78,9 +111,9 @@ pub(super) fn tail_cut(total: usize, bs: usize) -> usize {
 }
 
 /// Where to save a branch checkpoint, if anywhere: at the radix match
-/// `matched` when nothing was restored (`skip_to == 0`), the shared prefix is
-/// at least `min` tokens long, and it lies below the tail cut (which already
-/// gets a checkpoint).
+/// `matched` when it lies at least `min` tokens above the restore depth
+/// `skip_to` (0 when nothing was restored) and below the tail cut (which
+/// already gets a checkpoint). The caller also requires a radix fork there.
 pub(super) fn branch_checkpoint_at(
     matched: usize,
     skip_to: usize,
@@ -88,8 +121,48 @@ pub(super) fn branch_checkpoint_at(
     bs: usize,
     min: usize,
 ) -> Option<usize> {
-    (skip_to == 0 && matched > 0 && matched >= min && matched < tail_cut(total, bs))
+    (matched > skip_to && matched - skip_to >= min && matched < tail_cut(total, bs))
         .then_some(matched)
+}
+
+/// Which snapshot a rank restores after [`agree_restore`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Agreed {
+    /// No rank restores.
+    None,
+    /// This rank's own lookup choice, at its own depth.
+    Local,
+    /// The exact-prefix snapshot with this id at the (shallower) agreed depth.
+    At(usize),
+}
+
+/// The cross-rank restore-depth agreement, over its inputs: this rank's
+/// restorable depth (`0` = none), a cross-rank min-reduction `min`, and
+/// `probe(depth)`, this rank's restorable exact-prefix snapshot at a
+/// shallower depth. Returns the agreed depth and what this rank restores;
+/// every rank gets the same depth, and `(0, Agreed::None)` on all ranks when
+/// any rank lacks the agreed snapshot. Issues one reduction, plus a second
+/// exactly when the agreed depth is non-zero, so the collective count is the
+/// same on every rank whatever the local inputs.
+pub(super) fn agree_restore(
+    depth: usize,
+    mut min: impl FnMut(u32) -> Result<u32>,
+    probe: impl FnOnce(usize) -> Option<usize>,
+) -> Result<(usize, Agreed)> {
+    let agreed = min(u32::try_from(depth)?)? as usize;
+    if agreed == 0 {
+        return Ok((0, Agreed::None));
+    }
+    let mine = if agreed == depth {
+        Some(Agreed::Local)
+    } else {
+        probe(agreed).map(Agreed::At)
+    };
+    let all = min(u32::from(mine.is_some()))? == 1;
+    Ok(match mine {
+        Some(r) if all => (agreed, r),
+        _ => (0, Agreed::None),
+    })
 }
 
 /// The split point for a chunk `[start, start + len)`: the planned branch
@@ -135,10 +208,9 @@ impl TransformerModel {
     }
 
     /// Agree on one restore `(snapshot, depth, is_tail)` across ranks (see
-    /// the module docs). Returns the local choice unchanged when agreement is
-    /// off or this is a single-rank world; `(None, 0, false)` means no rank
-    /// restores. Every rank issues the same collectives: one min-reduction,
-    /// plus a second exactly when the agreed depth is non-zero.
+    /// the module docs and [`agree_restore`]). Returns the local choice
+    /// unchanged when agreement is off or this is a single-rank world;
+    /// `(None, 0, false)` means no rank restores.
     pub(super) fn pc_agree_restore(
         &self,
         tokens: &[u32],
@@ -159,33 +231,33 @@ impl TransformerModel {
             (Some(id), tok) if restorable(id, tok, is_tail) => tok,
             _ => 0,
         };
-        let agreed = self.ep_min_u32(depth as u32)? as usize;
-        if agreed == 0 {
-            return Ok((None, 0, false));
-        }
-        let mine = if agreed == depth {
-            local.0.map(|id| (id, is_tail))
-        } else {
-            self.prefix_cache
-                .snapshot_at(tokens, agreed, seq.adapter_id)
-                .filter(|&id| restorable(id, agreed, false))
-                .map(|id| (id, false))
+        let (agreed, mine) = agree_restore(
+            depth,
+            |v| self.ep_min_u32(v),
+            |at| {
+                self.prefix_cache
+                    .snapshot_at(tokens, at, seq.adapter_id)
+                    .filter(|&id| restorable(id, at, false))
+            },
+        )?;
+        let out = match mine {
+            Agreed::None => (None, 0, false),
+            Agreed::Local => (local.0, agreed, is_tail),
+            Agreed::At(id) => (Some(id), agreed, false),
         };
-        let all = self.ep_min_u32(u32::from(mine.is_some()))? == 1;
-        if agreed != depth || !all {
+        if out.1 != depth {
             tracing::info!(
-                "pc rank-agree: local restore depth {depth}, agreed {agreed}, \
-                 every rank holds it: {all}"
+                "pc rank-agree: local restore depth {depth}, restoring at {}",
+                out.1
             );
         }
-        Ok(match mine {
-            Some((id, tail)) if all => (Some(id), agreed, tail),
-            _ => (None, 0, false),
-        })
+        Ok(out)
     }
 
     /// Plan this prefill's branch checkpoint (chunk 0, after the restore
-    /// decision). Inputs are rank-agreed, so every rank plans the same split.
+    /// decision). Every input but the fork test is rank-agreed, and the fork
+    /// test is min-reduced, so every rank plans the same split and issues the
+    /// same collectives.
     pub(super) fn pc_plan_branch(
         &self,
         tokens: &[u32],
@@ -193,7 +265,7 @@ impl TransformerModel {
         matched: usize,
         skip_to: usize,
         bs: usize,
-    ) {
+    ) -> Result<()> {
         seq.pc_branch_at = None;
         if !glm_pc_branch_enabled()
             || self.config.num_ssm_layers() == 0
@@ -201,16 +273,24 @@ impl TransformerModel {
             || !self.prefix_cache.is_active()
             || self.tokens_have_vision_pad(tokens)
         {
-            return;
+            return Ok(());
         }
         let min = glm_pc_branch_min_tokens();
-        seq.pc_branch_at = branch_checkpoint_at(matched, skip_to, tokens.len(), bs, min);
-        if let Some(at) = seq.pc_branch_at {
+        let Some(at) = branch_checkpoint_at(matched, skip_to, tokens.len(), bs, min) else {
+            return Ok(());
+        };
+        let mut fork = self.prefix_cache.forks_at(tokens, at, bs, seq.adapter_id);
+        if self.multi_rank_protocol_active() {
+            fork = self.ep_min_u32(u32::from(fork))? == 1;
+        }
+        if fork {
+            seq.pc_branch_at = Some(at);
             tracing::info!(
                 "pc branch checkpoint planned at token {at} ({matched}-token shared prefix, \
-                 no restorable snapshot)"
+                 restore depth {skip_to})"
             );
         }
+        Ok(())
     }
 
     /// Run `[start, start + len)` as two chunks split at the planned branch

@@ -366,7 +366,7 @@ impl TransformerModel {
             } else {
                 0
             };
-            self.pc_plan_branch(tokens, seq, matched, skip_tokens, bs);
+            self.pc_plan_branch(tokens, seq, matched, skip_tokens, bs)?;
             seq.marconi_skip_to = skip_tokens;
             seq.prefix_lookup_skip = skip;
             seq.prefix_lookup_applied = true;
