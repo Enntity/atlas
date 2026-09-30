@@ -35,7 +35,7 @@ pub(super) fn grow_prefill_window(
         // Ask the prefix cache to free a block via LRU eviction, as many times
         // as it takes (one eviction can free zero blocks — see
         // `alloc_block_evicting`).
-        let blk = alloc_block_evicting(kv_cache, prefix_cache, gpu)
+        let blk = alloc_block_evicting(kv_cache, prefix_cache, gpu, ws + bt_len)
             .ok_or_else(|| anyhow::anyhow!("KV cache exhausted: no free blocks"))?;
         fresh.push(blk);
         seq.block_table.push(blk);

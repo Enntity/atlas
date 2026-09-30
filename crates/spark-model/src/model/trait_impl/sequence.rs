@@ -478,8 +478,8 @@ impl TransformerModel {
         if evicted.is_empty() {
             return 0;
         }
-        let before = kv.num_free_blocks();
+        let before = kv.num_free_in_all();
         self.apply_evicted(evicted, &mut kv);
-        kv.num_free_blocks().saturating_sub(before)
+        kv.num_free_in_all().saturating_sub(before)
     }
 }
