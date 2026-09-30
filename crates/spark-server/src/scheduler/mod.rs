@@ -677,7 +677,12 @@ pub fn run(
         // the tick before its second chunk: decoders get their step, and
         // prompts that arrived during the first chunk are admitted at the
         // next boundary (two back-to-back 8K chunks held both ~6 s).
-        let head_just_started = model.is_ep() && prefill_queue_was_empty && !prefilling.is_empty();
+        // (ATLAS_GLM_WARM_CHUNK_RUN: not when that chunk computed nothing.)
+        let head_just_started = model.is_ep()
+            && prefill_queue_was_empty
+            && prefilling
+                .first()
+                .is_some_and(|p| !phase_continue_prefills::follows_first_chunk(p));
         let did_mixed_step = !head_just_started
             && continue_in_progress_prefills(
                 &*model,
