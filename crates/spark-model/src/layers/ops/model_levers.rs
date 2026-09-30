@@ -63,6 +63,9 @@ pub struct ModelLevers {
     pub holo_moe_gateup_fp4: bool,
     /// Collect per-layer MoE expert-union statistics. Diagnostic.
     pub moe_union_stats: bool,
+    /// `ATLAS_GLM_MOE_RANK_TIMING=1`: log each EP rank's per-layer MoE compute
+    /// and collective time per decode/verify step. Diagnostic.
+    pub moe_rank_timing: bool,
 
     // ── Attention ──
     /// Contiguous-attention path for the DFlash head.
@@ -158,6 +161,7 @@ impl ModelLevers {
             holo_moe_down_fp4: opt_in_truthy("ATLAS_HOLO_MOE_DOWN_FP4"),
             holo_moe_gateup_fp4: opt_in_truthy("ATLAS_HOLO_MOE_GATEUP_FP4"),
             moe_union_stats: opt_in("ATLAS_MOE_UNION_STATS"),
+            moe_rank_timing: opt_in("ATLAS_GLM_MOE_RANK_TIMING"),
             dflash_contig_attn: opt_in("ATLAS_DFLASH_CONTIG_ATTN"),
             // Product installation also arms these. The explicit model-load
             // diagnostic lets a no-spec control use identical target arithmetic.

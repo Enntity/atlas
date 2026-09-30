@@ -425,6 +425,12 @@ impl GpuBackend for AtlasCudaBackend {
     fn destroy_event(&self, event: u64) -> Result<()> {
         self.destroy_event_cu(event)
     }
+    fn create_timed_event(&self) -> Result<u64> {
+        self.create_timed_event_cu()
+    }
+    fn event_elapsed_us(&self, start: u64, end: u64) -> Result<Option<f32>> {
+        self.event_elapsed_us_cu(start, end)
+    }
     fn event_create(&self) -> Result<u64> {
         self.create_event_cu()
     }

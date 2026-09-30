@@ -466,6 +466,19 @@ pub trait GpuBackend: Send + Sync {
         Ok(())
     }
 
+    /// Create an event that keeps its timestamp, for [`Self::event_elapsed_us`]
+    /// ([`Self::create_event`] disables timing). 0 = unsupported.
+    fn create_timed_event(&self) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// GPU time in microseconds from `start` to `end`, two timed events that
+    /// were both recorded. `None` until both have completed, and always on a
+    /// backend without timed events.
+    fn event_elapsed_us(&self, _start: u64, _end: u64) -> Result<Option<f32>> {
+        Ok(None)
+    }
+
     /// Create a timing-disabled event. Returns an opaque handle (0 = unsupported).
     fn event_create(&self) -> Result<u64> {
         Ok(0)

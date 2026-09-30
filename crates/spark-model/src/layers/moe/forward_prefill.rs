@@ -162,6 +162,8 @@ impl MoeLayer {
             };
         }
 
+        let timing = super::rank_timing::begin(self, n, ctx, stream)?;
+
         // ── Shared expert ──
         // Shared expert only reads `input` and writes to separate buffers
         // (ssm_deinterleaved, ssm_qkvz, attn_output) — no data conflict
@@ -420,6 +422,7 @@ impl MoeLayer {
         }
 
         // EP all-reduce
+        super::rank_timing::before_collective(timing, ctx, stream)?;
         if let Some(comm) = ctx.comm
             && ctx.config.ep_world_size > 1
         {
@@ -436,6 +439,7 @@ impl MoeLayer {
             } else {
                 comm.all_reduce_async(output.0, num_tokens * h as usize * 2, stream)?;
             }
+            super::rank_timing::after_collective(timing, n, ctx, stream)?;
             if let Some(t0) = _t0 {
                 ctx.gpu.synchronize(stream)?;
                 tracing::info!(

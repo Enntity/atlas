@@ -26,6 +26,8 @@ pub struct ModelStats {
     /// calls sampled, and the running unique-expert / slot totals behind the
     /// periodic aggregate line.
     pub moe_union: MoeUnionStats,
+    /// Per-rank MoE timing probes (`ModelLevers::moe_rank_timing`).
+    pub moe_rank_timing: crate::layers::moe::MoeRankTiming,
     /// One-shot latches for the `ATLAS_*_DUMP` diagnostics. A latch is per
     /// model so a swap re-arms the dump instead of silently swallowing it.
     pub dumped: DumpLatches,

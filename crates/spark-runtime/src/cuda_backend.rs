@@ -105,6 +105,7 @@ unsafe extern "C" {
     pub(super) fn cuStreamWaitEvent(hStream: u64, hEvent: u64, flags: u32) -> i32;
     pub(super) fn cuEventSynchronize(hEvent: u64) -> i32;
     pub(super) fn cuEventDestroy_v2(hEvent: u64) -> i32;
+    pub(super) fn cuEventElapsedTime(pMilliseconds: *mut f32, hStart: u64, hEnd: u64) -> i32;
 }
 
 /// Production GPU backend wrapping AtlasRegistry + raw CUDA driver API.

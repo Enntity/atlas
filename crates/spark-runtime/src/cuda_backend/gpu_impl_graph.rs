@@ -17,10 +17,10 @@ use anyhow::{Result, bail};
 
 use super::{
     AtlasCudaBackend, cuCtxGetDevice, cuCtxSetCurrent, cuDeviceGetAttribute, cuEventCreate,
-    cuEventDestroy_v2, cuEventRecord, cuEventSynchronize, cuGraphDestroy, cuGraphExecDestroy,
-    cuGraphLaunch, cuMemAllocHost_v2, cuMemFreeHost, cuMemGetInfo_v2, cuMemsetD2D8Async,
-    cuMemsetD8Async, cuMemsetD32Async, cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture,
-    cuStreamSynchronize, cuStreamWaitEvent,
+    cuEventDestroy_v2, cuEventElapsedTime, cuEventRecord, cuEventSynchronize, cuGraphDestroy,
+    cuGraphExecDestroy, cuGraphLaunch, cuMemAllocHost_v2, cuMemFreeHost, cuMemGetInfo_v2,
+    cuMemsetD2D8Async, cuMemsetD8Async, cuMemsetD32Async, cuStreamBeginCapture, cuStreamCreate,
+    cuStreamEndCapture, cuStreamSynchronize, cuStreamWaitEvent,
 };
 use crate::gpu::{DevicePtr, GraphHandle};
 
@@ -228,13 +228,32 @@ impl AtlasCudaBackend {
     }
 
     pub(super) fn create_event_cu(&self) -> Result<u64> {
-        let mut event: u64 = 0;
         // CU_EVENT_DISABLE_TIMING = 0x02 (skip timing overhead)
-        let status = unsafe { cuEventCreate(&mut event, 0x02) };
+        self.create_event_flags_cu(0x02)
+    }
+
+    /// CU_EVENT_DEFAULT: the event keeps its timestamp.
+    pub(super) fn create_timed_event_cu(&self) -> Result<u64> {
+        self.create_event_flags_cu(0)
+    }
+
+    fn create_event_flags_cu(&self, flags: u32) -> Result<u64> {
+        let mut event: u64 = 0;
+        let status = unsafe { cuEventCreate(&mut event, flags) };
         if status != 0 {
             bail!("cuEventCreate failed: status {status}");
         }
         Ok(event)
+    }
+
+    pub(super) fn event_elapsed_us_cu(&self, start: u64, end: u64) -> Result<Option<f32>> {
+        let mut ms = 0f32;
+        match unsafe { cuEventElapsedTime(&mut ms, start, end) } {
+            0 => Ok(Some(ms * 1e3)),
+            // CUDA_ERROR_NOT_READY: one of the events has not completed yet.
+            600 => Ok(None),
+            status => bail!("cuEventElapsedTime failed: status {status}"),
+        }
     }
 
     pub(super) fn record_event_cu(&self, event: u64, stream: u64) -> Result<()> {
