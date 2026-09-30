@@ -689,6 +689,7 @@ impl TransformerModel {
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
             proposer,
+            draft_assist: None,
             lightning_dspark_identity: Default::default(),
             mtp_hidden_save,
             verify_hidden_stash,

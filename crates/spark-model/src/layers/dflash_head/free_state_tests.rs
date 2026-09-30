@@ -30,7 +30,7 @@ fn owner(slot: usize, generation: u64) -> SequenceGeneration {
 
 /// Zeroed `DflashScratch`: every device pointer null, no pinned host
 /// buffers. `free_state` never touches scratch.
-fn zero_scratch() -> DflashScratch {
+pub(super) fn zero_scratch() -> DflashScratch {
     DflashScratch {
         stream_buf: DevicePtr(0),
         norm_buf: DevicePtr(0),
@@ -147,6 +147,7 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         quant: super::DflashQuantization::Bf16,
         twins: Default::default(),
         startup: super::DsparkStartupExecution::from_env_lenient(),
+        rank_split: None,
     }
 }
 
