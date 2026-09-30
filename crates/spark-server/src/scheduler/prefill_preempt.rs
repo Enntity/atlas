@@ -103,6 +103,9 @@ fn send_and_run(
     stream: u64,
 ) -> Result<DevicePtr> {
     let start = resume_point(offset, end, seq.seq_len)?;
+    if start > offset {
+        tracing::info!("prefill chunk {offset}..{end} resumes at recorded progress {start}");
+    }
     let slot = seq.slot_idx as u32;
     // EP: the worker mirrors this exact command (bulk tokens, one NCCL op).
     model.ep_broadcast_disable_mtp_for_seq(slot, disable_mtp)?;
