@@ -323,7 +323,7 @@ pub(crate) fn ensure_blocks_through_decode(
                     alloc_count
                 );
             }
-            return Ok(());
+            return check_write_window_tails(seq, abs_block_idx, kv_cache);
         }
         // We need to extend block_table by at least one. If at cap, slide.
         if let Some(c) = cap
@@ -383,8 +383,10 @@ pub(crate) fn ensure_blocks_through_decode(
                 ));
             }
         };
-        fill_fresh_blocks(kv_cache, &[blk], gpu, stream, kv_poison)?;
+        // Owned before it is filled: a failed fill returns the block with the
+        // sequence instead of leaking it from the pool.
         seq.block_table.push(blk);
+        fill_fresh_blocks(kv_cache, &[blk], gpu, stream, kv_poison)?;
         alloc_count += 1;
         if cap.is_some() {
             let id = spark_storage::with_local(|hss| {
@@ -440,15 +442,33 @@ pub(crate) fn ensure_blocks_through_prefill(
     kv_poison: bool,
 ) -> Result<()> {
     kv_cache.release_lagging_tail_slots(&seq.block_table, abs_block_idx);
-    let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
-    // A chunk's fresh blocks are filled together after allocation.
+    // A chunk's fresh blocks are filled together, on EVERY exit: blocks pushed
+    // before a failed allocation stay in `block_table`, and the scheduler's
+    // preempt-and-retry re-enters with them in-window, where nothing would
+    // ever zero them or lend them index tails.
     let mut fresh = Vec::new();
+    let grown = grow_prefill_window(seq, abs_block_idx, kv_cache, prefix_cache, &mut fresh);
+    fill_fresh_blocks(kv_cache, &fresh, gpu, stream, kv_poison)?;
+    grown?;
+    check_write_window_tails(seq, abs_block_idx, kv_cache)
+}
+
+/// Grow `block_table` through `abs_block_idx` for a prefill chunk, recording
+/// every block it pushes in `fresh`.
+fn grow_prefill_window(
+    seq: &mut SequenceState,
+    abs_block_idx: usize,
+    kv_cache: &mut PagedKvCache,
+    prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
+    fresh: &mut Vec<u32>,
+) -> Result<()> {
+    let cap = kv_cache.config().cache_blocks_per_seq.map(|c| c as usize);
     loop {
         let ws = seq.hss_window_start();
         let bt_len = seq.block_table.len();
         let in_window = bt_len > 0 && abs_block_idx < ws + bt_len;
         if in_window {
-            return fill_fresh_blocks(kv_cache, &fresh, gpu, stream, kv_poison);
+            return Ok(());
         }
         // Issue #31: NEVER slide during prefill. block_table grows
         // monotonically until the chunk's full token range is in-window.
@@ -485,6 +505,34 @@ pub(crate) fn ensure_blocks_through_prefill(
     }
 }
 
+/// Host guard for slotted index tails, run before any step writes the window:
+/// the tail kernels silently skip a block without a slot (`NO_TAIL`), leaving
+/// its pooled keys from the block's previous owner. Every block this step can
+/// write — committed length through `abs_block_idx`, past the cached prefix —
+/// that the sequence owns alone must hold a tail. Shared blocks belong to the
+/// prefix cache, which never lends them one.
+fn check_write_window_tails(
+    seq: &SequenceState,
+    abs_block_idx: usize,
+    kv_cache: &PagedKvCache,
+) -> Result<()> {
+    let ws = seq.hss_window_start();
+    let first = (seq.seq_len / kv_cache.block_size())
+        .max(seq.cached_prefix_blocks)
+        .max(ws);
+    for abs in first..=abs_block_idx {
+        let block = seq.block_table[abs - ws];
+        if kv_cache.tail_slot_missing(block) && kv_cache.ref_count(block) == 1 {
+            bail!(
+                "block {block} (logical {abs}, seq_len {}) would be written with no index \
+                 tail: its pooled keys would never be finalized",
+                seq.seq_len
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Extract mutable references to a single layer's state across N sequences.
 ///
 /// The explicit lifetime `'a` ties the returned refs to the borrow of `all`,
@@ -501,6 +549,10 @@ pub(crate) fn extract_layer_refs<'a>(
     }
     refs
 }
+
+#[cfg(test)]
+#[path = "block_mgmt_tail_tests.rs"]
+mod tail_tests;
 
 #[cfg(test)]
 mod tests {
