@@ -82,6 +82,13 @@ impl Glm5KdaLayer {
             )?;
         }
         self.hc_pre(&self.hc.attn, hidden, m_hc, ctx, stream)?;
+        // ATLAS_GLM_DET_TRACE stages; `det_rows` are the seam (local) rows.
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        let (det_rows, row) = (
+            (sp.map_or(0, |sp| sp.row0), m_hc as usize),
+            h as usize * bf16,
+        );
+        det.tap("in", hidden, det_rows, row);
         let normed = ctx.buffers.norm_output();
         ops::rms_norm(
             ctx.gpu,
@@ -373,6 +380,7 @@ impl Glm5KdaLayer {
             )?;
         }
         profile::step(ctx, stream, &mut profile_timer, "o_proj")?;
+        det.tap("attn", normed, (0, tokens), row);
         let fused_tp_hc = capture_verify_intermediates
             && tokens == 5
             && !ctx.graph_capture
@@ -400,6 +408,9 @@ impl Glm5KdaLayer {
             comm.all_reduce_async(normed.0, tokens * self.hidden_size * 2, stream)?;
         }
         profile::step(ctx, stream, &mut profile_timer, "tp_reduce")?;
+        if !fused_tp_hc {
+            det.tap("attn_red", local(normed), det_rows, row);
+        }
         let mut seam = false;
         if fused_tp_hc {
             ops::hc_post_bf16_add(

@@ -599,6 +599,10 @@ impl Qwen3AttentionLayer {
 
         // ── Attention sublayer ──
         self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, ctx, stream)?;
+        // ATLAS_GLM_DET_TRACE stages; `det_rows` are the seam (local) rows.
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        let det_rows = (sp.map_or(0, |sp| sp.row0), n as usize);
+        det.tap("in", hidden, det_rows, h * 2);
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -693,6 +697,7 @@ impl Qwen3AttentionLayer {
             )?
         };
 
+        det.tap("attn", attn_out, (0, num_tokens), h * 2);
         if let Some(sp) = sp {
             sp.reduce_scatter(attn_out, h, ctx, stream)?;
         } else if ctx.config.tp_world_size > 1
@@ -701,6 +706,7 @@ impl Qwen3AttentionLayer {
             let bytes = num_tokens * h * 2;
             comm.all_reduce_async(attn_out.0, bytes, stream)?;
         }
+        det.tap("attn_red", local(attn_out), det_rows, h * 2);
 
         if batched_meta.is_some() && self.high_speed_swap_engaged(kv_cache) {
             anyhow::bail!(
