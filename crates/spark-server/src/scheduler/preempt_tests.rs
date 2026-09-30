@@ -19,12 +19,14 @@ use super::preempt::{
 use super::test_support::test_seq;
 use super::types::{ActiveSeq, ResponseSink};
 use anyhow::Result;
+use spark_model::model::kv_admission::KvAdmissionRefused;
 use spark_model::traits::{Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_spill::KvSpillManager;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod chunk_retry;
 mod victim_policy;
 
 /// Scripted stub: `decode_batch` fails with the KV-exhausted error for the
@@ -43,6 +45,13 @@ struct PreemptStubModel {
     free_blocks: AtomicUsize,
     total_blocks: usize,
     reclaimable: AtomicUsize,
+    /// `prefill_chunk` records `(start, len)` and refuses (agreed) the first
+    /// `refuse_chunks` calls, completing a split half up to `split_cut` first.
+    chunk_calls: Mutex<Vec<(usize, usize)>>,
+    refuse_chunks: AtomicUsize,
+    split_cut: usize,
+    /// Every EP command word the head sends.
+    wire: Mutex<Vec<u32>>,
 }
 
 impl PreemptStubModel {
@@ -68,14 +77,37 @@ impl Model for PreemptStubModel {
     }
     fn prefill_chunk(
         &self,
-        _t: &[u32],
-        _s: &mut SequenceState,
-        _cs: usize,
-        _cl: usize,
+        t: &[u32],
+        s: &mut SequenceState,
+        cs: usize,
+        cl: usize,
         _last: bool,
         _st: u64,
     ) -> Result<DevicePtr> {
-        anyhow::bail!("unused in preempt tests")
+        self.chunk_calls.lock().unwrap().push((cs, cl));
+        if let Some(msg) = self.hard_error {
+            anyhow::bail!("{msg}");
+        }
+        let refuse = (self.refuse_chunks)
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        let split = cs < self.split_cut && self.split_cut < cs + cl;
+        let stop = match (refuse, split) {
+            (false, _) => cs + cl,
+            (true, true) => self.split_cut,
+            (true, false) => cs,
+        };
+        s.tokens.extend_from_slice(&t[cs..stop]);
+        s.seq_len = stop;
+        anyhow::ensure!(!refuse, KvAdmissionRefused { by_peer: true });
+        Ok(DevicePtr::NULL)
+    }
+    fn ep_broadcast_cmd(&self, word: u32) -> Result<()> {
+        self.wire.lock().unwrap().push(word);
+        Ok(())
+    }
+    fn ep_broadcast_cmd_for_seq(&self, _seq: u32, cmd: u32) -> Result<()> {
+        self.ep_broadcast_cmd(cmd)
     }
     fn decode_batch(
         &self,

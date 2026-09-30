@@ -164,3 +164,80 @@ fn actual_disabled_capture_owner_keeps_target_path_without_primer() {
         assert_eq!(f.events(), vec![Event::Target(4, DEFAULT)]);
     }
 }
+
+/// Take every free KV block but `keep` (stand-ins for other sequences).
+fn hold_all_but(f: &Fixture, keep: usize) -> Vec<u32> {
+    let mut kv = f.model.kv_cache.lock();
+    (keep..kv.num_free_blocks())
+        .map(|_| kv.alloc_block().unwrap())
+        .collect()
+}
+
+#[test]
+fn actual_refused_chunk_runs_no_layer_and_its_retry_completes() {
+    if isolated("actual_refused_chunk_runs_no_layer_and_its_retry_completes") {
+        return;
+    }
+    use crate::model::kv_admission::is_kv_admission_refused;
+    let tokens: Vec<u32> = (1..=24).collect();
+    for (tp, ep, rank) in [(1, 1, 0), (2, 2, 0), (2, 2, 1), (2, 1, 1)] {
+        let mut f = Fixture::new(tp, ep, rank);
+        f.disable_capture();
+        // [0,8) and [8,16) fit the one free block; [16,24) needs a second.
+        let held = hold_all_but(&f, 1);
+        for start in [0, 8] {
+            f.model
+                .prefill_chunk(&tokens, &mut f.seq, start, 8, false, CALLER)
+                .unwrap();
+        }
+        let ran = f.events().len();
+        let e = f
+            .model
+            .prefill_chunk(&tokens, &mut f.seq, 16, 8, true, CALLER)
+            .unwrap_err();
+        assert!(
+            is_kv_admission_refused(&e),
+            "TP{tp}/EP{ep}/rank{rank}: {e:#}"
+        );
+        assert_eq!(f.events().len(), ran, "a layer ran for the refused chunk");
+        let s = &f.seq;
+        assert_eq!(
+            (s.seq_len, s.tokens.len(), s.block_table.len()),
+            (16, 16, 1)
+        );
+        // A preempted victim's block comes back; the same chunk now runs once.
+        f.model.kv_cache.lock().free_blocks(&held[..1]);
+        f.model
+            .prefill_chunk(&tokens, &mut f.seq, 16, 8, true, CALLER)
+            .unwrap();
+        assert_eq!(f.events().len(), ran + 1);
+        assert_eq!(f.seq.tokens, tokens);
+        assert_eq!((f.seq.seq_len, f.seq.block_table.len()), (24, 2));
+    }
+}
+
+#[test]
+fn actual_peer_refusal_is_agreed_and_rolled_back_before_any_layer() {
+    if isolated("actual_peer_refusal_is_agreed_and_rolled_back_before_any_layer") {
+        return;
+    }
+    use crate::model::kv_admission::is_kv_admission_refused;
+    for (tp, ep, rank) in [(2, 2, 0), (2, 2, 1), (2, 1, 0)] {
+        let mut f = Fixture::new(tp, ep, rank);
+        f.disable_capture();
+        let free = f.model.kv_cache.lock().num_free_blocks();
+        f.set_peer_word(0); // the peer could not reserve its blocks
+        let e = invoke(&mut f, Entry::Chunk).unwrap_err();
+        assert!(
+            is_kv_admission_refused(&e),
+            "TP{tp}/EP{ep}/rank{rank}: {e:#}"
+        );
+        assert!(f.events().is_empty(), "a layer ran for the refused chunk");
+        assert!(f.seq.block_table.is_empty() && f.seq.tokens.is_empty());
+        assert_eq!(f.model.kv_cache.lock().num_free_blocks(), free);
+        f.set_peer_word(u32::MAX);
+        invoke(&mut f, Entry::Chunk).unwrap();
+        assert_eq!(f.events(), vec![Event::Target(4, DEFAULT)]);
+        assert_eq!(f.seq.seq_len, 4);
+    }
+}
