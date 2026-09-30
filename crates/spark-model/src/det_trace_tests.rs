@@ -87,6 +87,8 @@ fn level_and_stage_list_parse() {
     assert_eq!(parse_level(Some("1")), 1);
     assert_eq!(parse_level(Some("2")), 2);
     assert!(stage_listed(None, "out"));
+    assert!(!stage_listed(None, "x_gated"));
+    assert!(stage_listed(Some("in,x_gated,attn"), "x_gated"));
     assert!(stage_listed(Some("in, out,final"), "out"));
     assert!(!stage_listed(Some("in,final"), "out"));
     assert!(!stage_listed(Some("moe_in"), "moe"));

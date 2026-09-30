@@ -240,6 +240,12 @@ impl MoeLayer {
         let gate_logits = ctx.buffers.gate_logits();
         self.prefill_gate_gemm(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
         super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+        det.tap(
+            "x_gate",
+            gate_logits,
+            (0, num_tokens),
+            num_experts as usize * 2,
+        );
         prof_step!("gate_gemm");
 
         // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing

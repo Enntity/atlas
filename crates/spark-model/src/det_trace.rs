@@ -30,7 +30,12 @@
 //! `ATLAS_GLM_DET_TRACE=1` also makes every request recompute its whole
 //! prompt (no prefix-cache reuse, as for prompt-logprob scoring), so a
 //! repeated prompt is traced in full; `=2` traces without that.
-//! `ATLAS_GLM_DET_TRACE_STAGES=a,b` keeps only the named stages.
+//! `ATLAS_GLM_DET_TRACE_STAGES=a,b` keeps only the named stages, and is the
+//! only way to get the `x_` stages that split a block further: KDA `x_qkv`
+//! (Q/K/V planes), `x_g` (gate planes), `x_gated` (recurrence + gated norm,
+//! the `o_proj` input); MLA `x_q_lat` (query latent) and per piece `x_q_abs`
+//! (absorbed queries), `x_attn_lat` (attention output before W_uv/`o_proj`);
+//! MoE `x_gate` (router logits).
 //!
 //! Every tap synchronizes the stream and copies the tensor to the host, so
 //! a traced prefill is several times slower and its stream timing differs.
@@ -177,9 +182,13 @@ pub fn on() -> bool {
     level() != 0
 }
 
-/// Whether `stage` passes an `ATLAS_GLM_DET_TRACE_STAGES` list (`None`: all).
+/// Whether `stage` passes an `ATLAS_GLM_DET_TRACE_STAGES` list. Without a
+/// list every stage passes except the `x_` ones, which must be named.
 fn stage_listed(list: Option<&str>, stage: &str) -> bool {
-    list.is_none_or(|l| l.split(',').any(|s| s.trim() == stage))
+    match list {
+        Some(list) => list.split(',').any(|s| s.trim() == stage),
+        None => !stage.starts_with("x_"),
+    }
 }
 
 fn stage_selected(stage: &str) -> bool {

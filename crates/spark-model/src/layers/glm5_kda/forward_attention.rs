@@ -121,6 +121,7 @@ impl Glm5KdaLayer {
             ctx,
             stream,
         )?;
+        det.tap("x_qkv", projected, (0, tokens), 3 * p * bf16);
         let beta = projected.offset(3 * plane_bytes);
         let fa = beta.offset(tokens * self.heads * bf16);
         let ga = fa.offset(tokens * self.dim * bf16);
@@ -336,6 +337,7 @@ impl Glm5KdaLayer {
             )?;
         }
         profile::step(ctx, stream, &mut profile_timer, "g_a_f_b_g_b")?;
+        det.tap("x_g", g1, (0, tokens), 2 * p * bf16);
 
         let core_out = recurrent(projected, g1, beta)?;
         profile::step(ctx, stream, &mut profile_timer, "pack_conv")?;
@@ -355,6 +357,7 @@ impl Glm5KdaLayer {
             stream,
         )?;
         profile::step(ctx, stream, &mut profile_timer, "gated_norm")?;
+        det.tap("x_gated", gated, (0, tokens), p * bf16);
         if capture_verify_intermediates {
             self.project_hot_verify(
                 gated,
