@@ -78,7 +78,7 @@ __device__ __forceinline__ float batchm_dot8(float a, const uint4 a_data, const 
 // AHEAD also issues every load of a K-step one step before its use (the next
 // weight vector from DRAM and the next ROWS activation vectors from L2 are in
 // flight while the lane multiplies the current ones). N = 288, K = 4096, M = 8
-// on GB10: 19.4 us rolled, 13.6 unrolled, 12.3 AHEAD
+// on GB10: 19.4 us rolled, 14.6 unrolled, 12.5 AHEAD
 // (scripts/dev/dense_gemv_batchm_rows_bench.cu). AHEAD doubles the registers
 // (2 CTAs per SM, not 5): only for grids of at most 96 CTAs. Both modes change
 // only WHEN a vector is loaded — each lane's product chain, the shuffle tree
