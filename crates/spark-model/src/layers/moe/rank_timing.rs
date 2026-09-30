@@ -12,8 +12,9 @@
 //! line per step; joining the two ranks' lines by `step` shows, per layer,
 //! which rank was slower and how long the other one waited.
 //!
-//! A step's events are read when the next step reaches its first MoE layer:
-//! the host has read that step's tokens by then, so they have completed.
+//! A step's events are read when the next step first reaches a layer that
+//! still holds a sample: the host has read that step's tokens by then, so
+//! they have completed.
 //! Layers inside a CUDA-graph capture are not timed (a replay runs no host
 //! code), so measure with `ATLAS_GLM_VERIFY_GRAPH` off. The events live as
 //! long as the process, like the layer's own stream events.
@@ -81,14 +82,16 @@ impl Probes {
         Ok(self.probes.len() - 1)
     }
 
-    /// Collect and clear every recorded sample; `elapsed(a, b)` is the GPU
-    /// time from event `a` to event `b` once both have completed.
-    fn take_step(&mut self, elapsed: impl Fn(u64, u64) -> Option<f32>) -> Option<Step> {
+    /// The finished step, when probe `i` still holds its sample (a new step
+    /// has come back round to it): every recorded sample, collected and
+    /// cleared. `elapsed(a, b)` is the GPU time from event `a` to event `b`
+    /// once both have completed.
+    fn take_step(&mut self, i: usize, elapsed: impl Fn(u64, u64) -> Option<f32>) -> Option<Step> {
         let us = |a, b| elapsed(a, b).map_or(-1, |t| t.round() as i32);
         let recorded = || self.probes.iter().filter(|p| p.rows != 0);
         let step = Step {
             step: self.steps,
-            rows: recorded().next()?.rows,
+            rows: Some(self.probes[i].rows).filter(|&rows| rows != 0)?,
             busy_us: recorded().map(|p| us(p.events[0], p.events[1])).collect(),
             coll_us: recorded().map(|p| us(p.events[1], p.events[2])).collect(),
         };
@@ -98,8 +101,8 @@ impl Probes {
     }
 }
 
-/// Start timing one MoE forward of `rows` rows: at the model's first MoE
-/// layer, log the step that just finished; then mark MoE entry. Returns the
+/// Start timing one MoE forward of `rows` rows: log the step that just
+/// finished if this layer closes it, then mark MoE entry. Returns the
 /// probe for [`before_collective`] / [`after_collective`], `None` when this
 /// forward is not timed.
 pub(super) fn begin(
@@ -122,9 +125,7 @@ pub(super) fn begin(
     let i = t.slot(std::ptr::from_ref(layer) as usize, || {
         Ok([timed()?, timed()?, timed()?])
     })?;
-    if i == 0
-        && let Some(step) = t.take_step(|a, b| gpu.event_elapsed_us(a, b).ok().flatten())
-    {
+    if let Some(step) = t.take_step(i, |a, b| gpu.event_elapsed_us(a, b).ok().flatten()) {
         tracing::info!("moe-rank-timing: rank={} {step}", ctx.config.ep_rank);
     }
     let entry = t.probes[i].events[0];
@@ -188,7 +189,11 @@ mod tests {
     #[test]
     fn a_step_collects_recorded_layers_in_order_then_clears() {
         let mut t = probes(&[1, 2, 3]);
-        assert_eq!(t.take_step(|_, _| Some(1.0)), None, "nothing recorded yet");
+        assert_eq!(
+            t.take_step(0, |_, _| Some(1.0)),
+            None,
+            "nothing recorded yet"
+        );
         t.probes[0].rows = 7;
         t.probes[2].rows = 7;
         // Layer 1 busy 812.4 us, collective 30.6 us; layer 3's collective
@@ -199,7 +204,12 @@ mod tests {
             (30, 31) => Some(640.0),
             _ => None,
         };
-        let step = t.take_step(elapsed).unwrap();
+        assert_eq!(
+            t.take_step(1, elapsed),
+            None,
+            "layer 2 holds no sample: same step"
+        );
+        let step = t.take_step(0, elapsed).unwrap();
         assert_eq!(
             step,
             Step {
@@ -213,9 +223,14 @@ mod tests {
             step.to_string(),
             "step=0 rows=7 busy_us=[812, 640] coll_us=[31, -1]"
         );
-        assert_eq!(t.take_step(elapsed), None, "samples are collected once");
+        assert_eq!(t.take_step(0, elapsed), None, "samples are collected once");
+        // Layer 1 stops being timed (captured into a graph): the first layer
+        // that still holds a sample closes the step.
         t.probes[1].rows = 4;
-        assert_eq!(t.take_step(|_, _| None).unwrap().step, 1);
+        t.probes[2].rows = 4;
+        assert_eq!(t.take_step(0, elapsed), None);
+        let step = t.take_step(1, |_, _| None).unwrap();
+        assert_eq!((step.step, step.rows, step.busy_us), (1, 4, vec![-1, -1]));
     }
 
     #[test]
@@ -226,8 +241,8 @@ mod tests {
             for t in [&mut r0, &mut r1] {
                 t.probes.iter_mut().for_each(|p| p.rows = 8);
             }
-            let s0 = r0.take_step(|_, _| Some(700.0)).unwrap();
-            let s1 = r1.take_step(|_, _| Some(950.0)).unwrap();
+            let s0 = r0.take_step(0, |_, _| Some(700.0)).unwrap();
+            let s1 = r1.take_step(0, |_, _| Some(950.0)).unwrap();
             assert_eq!((s0.step, s0.rows, s0.busy_us.len()), (step, 8, 2));
             assert_eq!((s1.step, s1.rows, s1.busy_us.len()), (s0.step, s0.rows, 2));
         }
