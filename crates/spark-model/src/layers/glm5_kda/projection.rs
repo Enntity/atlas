@@ -201,6 +201,14 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // ATLAS_GLM_DECODE_GEMV_BATCH: the same bodies behind a weight touch.
+        let tier = self.w4a16_gemv_batchm.kernel(m);
+        let nvfp4 = &weight.nvfp4;
+        if let Some(done) =
+            ops::w4a16_verify_touch(ctx.gpu, tier, input, nvfp4, output, m, n, k, stream)
+        {
+            return done;
+        }
         match m {
             2 => ops::w4a16_gemv_batch2(
                 ctx.gpu,

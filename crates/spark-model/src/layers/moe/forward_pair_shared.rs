@@ -132,28 +132,31 @@ impl MoeLayer {
             ctx.buffers.attn_output(),
         );
         let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(rows);
-        ops::w4a16_gemv_batchm(
-            ctx.gpu,
-            tc,
-            input,
-            &gate_up_rows(&shared.gate_proj),
-            gate_out,
-            rows,
-            half,
-            h,
-            stream,
-        )?;
-        ops::w4a16_gemv_batchm(
-            ctx.gpu,
-            tc,
-            input,
-            &gate_up_rows(&shared.up_proj),
-            up_out,
-            rows,
-            half,
-            h,
-            stream,
-        )?;
+        // ATLAS_GLM_DECODE_GEMV_BATCH: the tc8 bodies behind a weight touch
+        // that fills the PDL wait (`ops::gemv_touch`).
+        let touch = (rows <= 8)
+            .then(|| ops::gemv_touch(ctx.gpu, "w4a16_gemv_tc8_touch"))
+            .flatten();
+        for (weight, out) in [(&shared.gate_proj, gate_out), (&shared.up_proj, up_out)] {
+            let weight = gate_up_rows(weight);
+            match touch {
+                Some(touch) => touch.w4a16_tc8(
+                    ctx.gpu,
+                    input,
+                    &weight,
+                    out,
+                    rows,
+                    half,
+                    h,
+                    h / 2,
+                    h / 16,
+                    stream,
+                ),
+                None => {
+                    ops::w4a16_gemv_batchm(ctx.gpu, tc, input, &weight, out, rows, half, h, stream)
+                }
+            }?;
+        }
         ops::silu_mul(
             ctx.gpu,
             self.moe_act_mul,
@@ -163,6 +166,12 @@ impl MoeLayer {
             rows * half,
             stream,
         )?;
+        let (ld_half, ld_groups) = (inter / 2, inter / 16);
+        if let Some(touch) = touch {
+            return touch.w4a16_tc8(
+                ctx.gpu, gate_out, &down_cols, down_out, rows, h, half, ld_half, ld_groups, stream,
+            );
+        }
         ops::w4a16_gemv_tc_ld(
             ctx.gpu,
             crate::layers::w4a16_gemv_tiers::tc_ld_kernel(rows),
@@ -172,8 +181,8 @@ impl MoeLayer {
             rows,
             h,
             half,
-            inter / 2,
-            inter / 16,
+            ld_half,
+            ld_groups,
             stream,
         )
     }

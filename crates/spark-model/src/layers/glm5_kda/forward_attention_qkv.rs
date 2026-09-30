@@ -33,6 +33,7 @@ impl Glm5KdaLayer {
             ops::w4a16_gemv_batch5_qkv(
                 ctx.gpu,
                 self.w4a16_gemv_batch5_qkv_k,
+                ops::gemv_touch(ctx.gpu, "w4a16_gemv_batch5_qkv_touch"),
                 normed,
                 &self.weights.q_proj.nvfp4,
                 &self.weights.k_proj.nvfp4,

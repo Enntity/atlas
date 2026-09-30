@@ -185,6 +185,7 @@ impl W4a16BatchmTiers {
         for (h, w) in handles.iter_mut().zip(W4A16_BATCHM_WIDTHS) {
             *h = super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_batch{w}"));
         }
+        super::ops::gemv_touch_resolve(gpu);
         if tc_requested() {
             TC.get_or_init(|| {
                 TC_ROWS.map(|rows| {
