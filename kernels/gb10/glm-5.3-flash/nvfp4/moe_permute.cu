@@ -528,3 +528,77 @@ extern "C" __global__ void __launch_bounds__(256) moe_unpermute_blend_ep_vec8(
         *(uint4*)&output[token * H + c] = out;
     }
 }
+
+// moe_sort_by_expert with its prefix sum spread over the block
+// (ATLAS_GLM_DECODE_FUSE): one thread walked all expert counts and then stored
+// every offset. Here each thread sums up to four consecutive experts, a warp
+// then a block shuffle scan places those sums, and each thread writes its own
+// offsets. Integer sums, so expert_offsets are the same words; the histogram
+// and the scatter are the original's, so rows keep its contract (any order
+// within an expert group). Grid: (1, 1, 1)  Block: (256, 1, 1); at most 1024
+// experts.
+extern "C" __global__ void moe_sort_by_expert_scan(
+    const unsigned int* __restrict__ topk_ids,
+    int* __restrict__ sorted_token_ids,
+    int* __restrict__ sorted_expert_ids,
+    int* __restrict__ expert_offsets,
+    int* __restrict__ token_to_perm,
+    unsigned int total_expanded,
+    unsigned int num_experts,
+    unsigned int topk
+) {
+    atlas_pdl_enter();
+    __shared__ unsigned int counts[1024];
+    __shared__ unsigned int offsets[1025];
+    __shared__ unsigned int warp_sums[8];
+    const unsigned int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    if (blockDim.x != 256 || num_experts > 1024) return;
+
+    for (unsigned int i = tid; i < num_experts; i += blockDim.x)
+        counts[i] = 0;
+    __syncthreads();
+    for (unsigned int i = tid; i < total_expanded; i += blockDim.x)
+        atomicAdd(&counts[topk_ids[i]], 1);
+    __syncthreads();
+
+    const unsigned int per = (num_experts + 255) / 256;
+    const unsigned int e0 = min(tid * per, num_experts), e1 = min(e0 + per, num_experts);
+    unsigned int local = 0;
+    for (unsigned int e = e0; e < e1; e++) local += counts[e];
+    unsigned int incl = local;
+    #pragma unroll
+    for (unsigned int o = 1; o < 32; o <<= 1) {
+        const unsigned int up = __shfl_up_sync(0xFFFFFFFF, incl, o);
+        if (lane >= o) incl += up;
+    }
+    if (lane == 31) warp_sums[warp] = incl;
+    __syncthreads();
+    unsigned int base = 0;
+    for (unsigned int w = 0; w < warp; w++) base += warp_sums[w];
+    unsigned int running = base + incl - local;
+    for (unsigned int e = e0; e < e1; e++) {
+        offsets[e] = running;
+        expert_offsets[e] = (int)running;
+        running += counts[e];
+    }
+    if (e1 == num_experts && e0 < e1) {
+        offsets[num_experts] = running;
+        expert_offsets[num_experts] = (int)running;
+    }
+    if (num_experts == 0 && tid == 0) {
+        offsets[0] = 0;
+        expert_offsets[0] = 0;
+    }
+    __syncthreads();
+
+    for (unsigned int i = tid; i < num_experts; i += blockDim.x)
+        counts[i] = 0;
+    __syncthreads();
+    for (unsigned int i = tid; i < total_expanded; i += blockDim.x) {
+        unsigned int expert_id = topk_ids[i];
+        unsigned int pos = offsets[expert_id] + atomicAdd(&counts[expert_id], 1);
+        sorted_token_ids[pos] = (int)(i / topk);
+        sorted_expert_ids[pos] = (int)expert_id;
+        token_to_perm[i] = (int)pos;
+    }
+}

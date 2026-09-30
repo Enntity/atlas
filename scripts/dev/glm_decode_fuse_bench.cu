@@ -11,6 +11,9 @@
 //          (both then glm_hc_decode_finalize_bf16 -> rms_norm_vanilla)
 //   moe    moe_unpermute_reduce_indexed_ep_vec8 -> moe_batched_blend
 //      vs  moe_unpermute_blend_ep_vec8
+//   sort   moe_sort_by_expert vs moe_sort_by_expert_scan (after moe_topk_sigmoid_batched)
+//   norm   rms_norm_vanilla vs rms_norm_vanilla_regs (hidden 4096, 1536, 512;
+//          the odd 4095 at one row, the only odd shape either kernel can read)
 //
 // Every output byte (highway, partial sums, collapsed row, post, comb,
 // normed row, MoE output) must match, including rows holding zeros, -0.0,
@@ -20,16 +23,20 @@
 //
 //   nvcc -arch=sm_121a -O3 --fmad=false -std=c++17 -I kernels/gb10/glm-5.3-flash/nvfp4 \
 //        scripts/dev/glm_decode_fuse_bench.cu -o glm_decode_fuse_bench
-//   ./glm_decode_fuse_bench [copies=32] [groups=64] [reps=3] [fused=7]
+//   ./glm_decode_fuse_bench [copies=32] [groups=64] [reps=3] [fused=31]
 // Prints one "bitwise" line per chain and width, then PASS or FAIL (exit 1),
 // then the median GPU time per chain in microseconds: stream events around
 // every 8 chains, each batch queued behind a spin kernel so the GPU never
 // waits for the host. `fused` selects the fused groups of the new arm
-// (1 post, 2 partial, 4 MoE unpermute+blend). Device memory: ~60 MB.
+// (1 post, 2 partial, 4 MoE unpermute+blend, 8 MoE sort, 16 RMS norm). The
+// sort's rows within an expert group are unordered by contract (atomics), so
+// it compares expert_offsets bytes and checks both permutations route every
+// slot to its token and expert. Device memory: ~60 MB.
 #include "hyper_connection.cu"
 #include "glm_hc_prefill_vec.cu"
-#include "../../common/rms_norm_vanilla.cu"
 #include "moe_permute.cu"
+#include "glm_rms_norm_regs.cu"
+#include "../../common/moe_topk_sigmoid.cu"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -95,16 +102,29 @@ struct Arm {
     }
 };
 
+// MoE routing state of one arm (top-k then the sort).
+struct Route {
+    Dev<unsigned int> ids;
+    Dev<float> weights;
+    Dev<int> sorted_tok, sorted_exp, offsets, perm;
+    void alloc() {
+        ids.alloc(MAXT * 8); weights.alloc(MAXT * 8); sorted_tok.alloc(MAXT * 8); sorted_exp.alloc(MAXT * 8);
+        offsets.alloc(289); perm.alloc(MAXT * 8);
+    }
+};
+
 struct Inputs {
     Dev<unsigned short> block_out, peer, norm_w, expert_out, shared, gate_w;
     Dev<float> hc_fn, hc_scale, hc_base, topk_w;
     Dev<int> perm, ids;
+    Dev<unsigned short> logits, quant_in;
+    Dev<float> bias;
     int copies;
 };
 
 static const unsigned SINK = 20;
 static const float NORM_EPS = 1e-5f, HC_EPS = 1e-6f;
-static unsigned g_fused = 7;
+static unsigned g_fused = 31;
 
 // One mHC site: an optional post (`peer`: fold the other rank's block output
 // in), the next site's pre-mix partials, then finalize and the RMS norm.
@@ -155,6 +175,42 @@ static size_t diff(const Dev<T>& a, const Dev<T>& b, size_t count) {
     const std::vector<T> x = a.get(), y = b.get();
     return memcmp(x.data(), y.data(), count * sizeof(T)) == 0 ? 0 : 1 + std::mismatch(x.begin(), x.begin() + count, y.begin(),
         [](T p, T q) { return memcmp(&p, &q, sizeof(T)) == 0; }).first - x.begin();
+}
+
+static void route(const Inputs& in, Route& r, unsigned T, int copy, bool fused) {
+    const bool f = fused && (g_fused & 8);
+    const unsigned te = T * TOPK;
+    launch(moe_topk_sigmoid_batched, dim3(T), 256,
+           (const bf*)(in.logits.p + (size_t)(copy % 4) * MAXT * EXPERTS), (const float*)in.bias.p, r.ids.p,
+           r.weights.p, EXPERTS, TOPK, 1u, 2.5f);
+    launch(f ? moe_sort_by_expert_scan : moe_sort_by_expert, dim3(1), 256, (const unsigned*)r.ids.p, r.sorted_tok.p,
+           r.sorted_exp.p, r.offsets.p, r.perm.p, te, EXPERTS, TOPK);
+}
+
+// RMS norm of T rows of width `h` (block min(h, 1024)) into the arm's normed buffer.
+static void norm(const Inputs& in, Arm& a, unsigned T, unsigned h, int copy, bool fused) {
+    const bool f = fused && (g_fused & 16);
+    launch(f ? rms_norm_vanilla_regs : rms_norm_vanilla, dim3(T), std::min(h, 1024u),
+           (const bf*)(in.quant_in.p + (size_t)(copy % 4) * MAXT * H), (const bf*)(in.norm_w.p + (size_t)(copy % 32) * H),
+           (bf*)a.normed.p, h, NORM_EPS);
+}
+
+// Both sorts must route slot i of token i / topk to its expert through
+// token_to_perm, with the same expert_offsets.
+static bool route_same(const Route& a, const Route& b, unsigned T) {
+    const unsigned te = T * TOPK;
+    const auto ids = a.ids.get(), ids_b = b.ids.get();
+    bool ok = memcmp(ids.data(), ids_b.data(), te * 4) == 0
+        && diff(a.weights, b.weights, te) == 0 && diff(a.offsets, b.offsets, EXPERTS + 1) == 0;
+    for (const Route* r : {&a, &b}) {
+        const auto tok = r->sorted_tok.get(), exp = r->sorted_exp.get(), perm = r->perm.get(), off = r->offsets.get();
+        for (unsigned i = 0; i < te; i++) {
+            const int p = perm[i];
+            ok = ok && p >= 0 && p < (int)te && tok[p] == (int)(i / TOPK) && exp[p] == (int)ids[i]
+                && p >= off[ids[i]] && p < off[ids[i] + 1];
+        }
+    }
+    return ok;
 }
 
 // Hold the stream busy while a batch of chains is queued behind it, so the
@@ -244,6 +300,27 @@ int main(int argc, char** argv) {
     in.peer.put(h_peer); in.norm_w.put(h_norm); in.expert_out.put(h_expert);
     in.shared.put(h_shared); in.gate_w.put(h_gate); in.hc_fn.put(h_fn); in.hc_scale.put(h_scale);
     in.hc_base.put(h_base); in.topk_w.put(h_w); in.perm.put(h_perm); in.ids.put(h_ids);
+    // Router logits (4 sets): row 0 all ties, row 1 with NaNs, row 2 zeros.
+    std::vector<unsigned short> h_logits((size_t)4 * MAXT * EXPERTS), h_qin((size_t)4 * MAXT * H);
+    std::vector<float> h_bias(EXPERTS), zero_bias(EXPERTS, 0.f);
+    for (auto& x : h_logits) x = tobf(nd(rng) * 2.f);
+    for (auto& x : h_bias) x = nd(rng) * 0.05f;
+    for (unsigned e = 0; e < EXPERTS; e++) {
+        h_logits[e] = tobf(0.5f);
+        if (e % 3 == 0) h_logits[EXPERTS + e] = 0x7FC0;
+        h_logits[2 * EXPERTS + e] = e & 1 ? 0x8000 : 0;
+    }
+    // Quantizer input: rare large values, a row of +-0, a row with Inf.
+    for (auto& x : h_qin) x = tobf(nd(rng) * (ud(rng) < 0.01f ? 1000.f : 1.f));
+    for (unsigned d = 0; d < H; d++) {
+        h_qin[d] = d & 1 ? 0x8000 : 0;
+        if (d % 97 == 0) h_qin[H + d] = 0x7F80;
+    }
+    in.logits.alloc(h_logits.size()); in.logits.put(h_logits);
+    in.quant_in.alloc(h_qin.size()); in.quant_in.put(h_qin);
+    in.bias.alloc(EXPERTS); in.bias.put(h_bias);
+    Route rt[2];
+    for (auto& r : rt) r.alloc();
 
     Arm arm[2];
     for (auto& a : arm) a.alloc();
@@ -295,6 +372,34 @@ int main(int argc, char** argv) {
             printf("bitwise %-20s rows=%-2u %s: %s\n", "moe unpermute+blend", T, poison ? "inf/nan" : "finite ", bad ? "FAIL" : "same");
         }
     }
+    for (unsigned T : widths) {
+        for (int set = 0; set < 4; set++) {
+            // Set 0 has the bias, which breaks the all-ties row; set 1 runs it without.
+            in.bias.put(set == 1 ? zero_bias : h_bias);
+            route(in, rt[0], T, set, false);
+            route(in, rt[1], T, set, true);
+            CK(cudaDeviceSynchronize());
+            const bool same = route_same(rt[0], rt[1], T);
+            ok = ok && same;
+            printf("bitwise %-20s rows=%-2u set %d : %s\n", "moe topk+sort", T, set, same ? "same" : "FAIL");
+        }
+    }
+    in.bias.put(h_bias);
+    for (unsigned T : widths) {
+        for (unsigned h : {4096u, 1536u, 512u, 4095u}) {
+            if (h % 2 && T > 1) continue;  // odd rows are 4-byte loads off alignment in both kernels
+            for (auto& a : arm) CK(cudaMemset(a.normed.p, 0xAB, a.normed.n * 2));
+            for (int set = 0; set < 4; set++) {
+                norm(in, arm[0], T, h, set, false);
+                norm(in, arm[1], T, h, set, true);
+                CK(cudaDeviceSynchronize());
+                const bool same = diff(arm[0].normed, arm[1].normed, arm[0].normed.n) == 0;
+                ok = ok && same;
+                if (!same || set == 3)
+                    printf("bitwise %-20s rows=%-2u h=%-4u set %d: %s\n", "rms norm", T, h, set, same ? "same" : "FAIL");
+            }
+        }
+    }
     printf("%s\n", ok ? "PASS: every fused chain matches its unfused chain bit for bit" : "FAIL");
     if (!ok) return 1;
 
@@ -312,6 +417,12 @@ int main(int argc, char** argv) {
         const double a = time_us(groups, reps, sink.p, [&](int i) { moe_post(in, arm[0], T, i % copies, false); });
         const double b = time_us(groups, reps, sink.p, [&](int i) { moe_post(in, arm[1], T, i % copies, true); });
         printf("%-22s %4u %9.2f %9.2f %8.2f\n", "moe unpermute+blend", T, a, b, a - b);
+        const double c = time_us(groups, reps, sink.p, [&](int i) { route(in, rt[0], T, i, false); });
+        const double d = time_us(groups, reps, sink.p, [&](int i) { route(in, rt[1], T, i, true); });
+        printf("%-22s %4u %9.2f %9.2f %8.2f\n", "moe topk+sort", T, c, d, c - d);
+        const double e = time_us(groups, reps, sink.p, [&](int i) { norm(in, arm[0], T, H, i, false); });
+        const double f = time_us(groups, reps, sink.p, [&](int i) { norm(in, arm[1], T, H, i, true); });
+        printf("%-22s %4u %9.2f %9.2f %8.2f\n", "rms norm", T, e, f, e - f);
     }
     return 0;
 }

@@ -5,7 +5,7 @@
 //! loads or one launch fewer (`scripts/dev/glm_decode_fuse_bench.cu` checks
 //! every output bit against the chains they replace).
 //!
-//! `ATLAS_GLM_DECODE_FUSE_MASK` (default 7) selects groups for bisection:
+//! `ATLAS_GLM_DECODE_FUSE_MASK` (default 31) selects groups for bisection:
 //!
 //! * `1` HC post: `hc_post_bf16` / `hc_post_bf16_add_bf16` over 1..=32 rows
 //!   as `glm_hc_decode_post_bf16`. Every GLM BF16-highway post goes through
@@ -19,9 +19,15 @@
 //!   TP-split shared expert (`ATLAS_GLM_SHARED_TP_SPLIT=1`) as
 //!   `moe_unpermute_blend_ep_vec8`: the grouped routed FFN of verify blocks
 //!   and short prefill chunks. One-row decode runs another MoE path.
+//! * `8` MoE sort: `moe_sort_by_expert` as `moe_sort_by_expert_scan` (block
+//!   prefix sum), for every grouped routed FFN of the layer.
+//! * `16` RMS norm: `rms_norm_vanilla` as `rms_norm_vanilla_regs` for the GLM
+//!   KDA and MLA layers' norms (every width and path).
 //!
-//! A twin runs only where its kernel is shipped and its shape and alignment
-//! hold; otherwise the original launch is issued unchanged.
+//! Groups 8 and 16 swap a kernel handle at layer build (same arguments and
+//! grid); the others choose at launch. A twin runs only where its kernel is
+//! shipped and its shape and alignment hold; otherwise the original launch is
+//! issued unchanged.
 
 use anyhow::{Result, anyhow, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -31,7 +37,9 @@ use std::sync::OnceLock;
 pub const HC_POST: u32 = 1;
 pub const HC_PARTIAL: u32 = 2;
 pub const MOE_POST: u32 = 4;
-const ALL: u32 = HC_POST | HC_PARTIAL | MOE_POST;
+pub const MOE_SORT: u32 = 8;
+pub const RMS_NORM: u32 = 16;
+const ALL: u32 = HC_POST | HC_PARTIAL | MOE_POST | MOE_SORT | RMS_NORM;
 
 fn parse(fuse: Option<&str>, mask: Option<&str>) -> Result<u32> {
     let on = match fuse {
@@ -43,11 +51,11 @@ fn parse(fuse: Option<&str>, mask: Option<&str>) -> Result<u32> {
         None => ALL,
         Some(value) => {
             let groups: u32 = value.parse().map_err(|_| {
-                anyhow!("ATLAS_GLM_DECODE_FUSE_MASK must be a group mask in 0..=7, got {value:?}")
+                anyhow!("ATLAS_GLM_DECODE_FUSE_MASK must be a group mask in 0..=31, got {value:?}")
             })?;
             ensure!(
                 groups & !ALL == 0,
-                "ATLAS_GLM_DECODE_FUSE_MASK must be a group mask in 0..=7, got {value:?}"
+                "ATLAS_GLM_DECODE_FUSE_MASK must be a group mask in 0..=31, got {value:?}"
             );
             groups
         }
@@ -71,6 +79,34 @@ fn groups() -> Result<u32> {
         groups.map_err(|error| error.to_string())
     });
     groups.clone().map_err(|error| anyhow!(error))
+}
+
+/// `original` (module, kernel), or `twin` when fused `group` is on and the
+/// target ships it. A twin takes the original's arguments and launch shape
+/// and writes the same bytes.
+pub fn kernel_or_twin(
+    gpu: &dyn GpuBackend,
+    group: u32,
+    original: (&str, &str),
+    twin: (&str, &str),
+) -> Result<KernelHandle> {
+    kernel_or_twin_for(groups()?, gpu, group, original, twin)
+}
+
+fn kernel_or_twin_for(
+    groups: u32,
+    gpu: &dyn GpuBackend,
+    group: u32,
+    original: (&str, &str),
+    twin: (&str, &str),
+) -> Result<KernelHandle> {
+    if groups & group != 0
+        && let Ok(kernel) = gpu.kernel(twin.0, twin.1)
+        && kernel.0 != 0
+    {
+        return Ok(kernel);
+    }
+    gpu.kernel(original.0, original.1)
 }
 
 fn aligned16(ptrs: &[DevicePtr]) -> bool {

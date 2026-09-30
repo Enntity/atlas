@@ -703,7 +703,7 @@ extern "C" __global__ void __launch_bounds__(256) glm_hc_decode_post_bf16(
     }
     #pragma unroll
     for (unsigned int j = 0; j < 4; ++j) {
-        __nv_bfloat16 out[8];
+        __align__(16) __nv_bfloat16 out[8];
         #pragma unroll
         for (unsigned int e = 0; e < 8; ++e) {
             float acc = p[j] * (float)sum[e];

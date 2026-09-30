@@ -144,14 +144,49 @@ fn word(v: u32) -> Vec<u8> {
 #[test]
 fn flag_is_explicit_and_mask_selects_groups() {
     assert_eq!(parse(None, None).unwrap(), 0);
-    assert_eq!(parse(Some("0"), Some("7")).unwrap(), 0);
+    assert_eq!(parse(Some("0"), Some("31")).unwrap(), 0);
     assert_eq!(parse(Some("1"), None).unwrap(), ALL);
     assert_eq!(parse(Some("1"), Some("2")).unwrap(), HC_PARTIAL);
+    assert_eq!(parse(Some("1"), Some("24")).unwrap(), MOE_SORT | RMS_NORM);
     assert_eq!(parse(Some("1"), Some("0")).unwrap(), 0);
     assert!(parse(Some("true"), None).is_err());
-    assert!(parse(Some("1"), Some("8")).is_err());
+    assert!(parse(Some("1"), Some("32")).is_err());
     assert!(parse(Some("1"), Some("0x3")).is_err());
-    assert_eq!(ALL, 7);
+    assert_eq!(ALL, 31);
+}
+
+#[test]
+fn handle_twins_swap_only_when_their_group_is_on_and_shipped() {
+    let gpu = Capture::new(&[
+        ("moe", "moe_sort_by_expert"),
+        ("moe", "moe_sort_by_expert_scan"),
+        ("rms_norm_vanilla", "rms_norm_vanilla"),
+    ]);
+    let sort = |groups| {
+        let (original, twin) = (
+            ("moe", "moe_sort_by_expert"),
+            ("moe", "moe_sort_by_expert_scan"),
+        );
+        kernel_or_twin_for(groups, &gpu, MOE_SORT, original, twin)
+            .unwrap()
+            .0
+    };
+    assert_eq!(sort(0), 1);
+    assert_eq!(sort(ALL & !MOE_SORT), 1);
+    assert_eq!(sort(MOE_SORT), 2);
+    // The norm twin is not shipped here: the original, whatever the flag.
+    let norm = |groups| {
+        let original = ("rms_norm_vanilla", "rms_norm_vanilla");
+        let twin = ("glm_rms_norm_regs", "rms_norm_vanilla_regs");
+        kernel_or_twin_for(groups, &gpu, RMS_NORM, original, twin)
+            .unwrap()
+            .0
+    };
+    assert_eq!((norm(0), norm(ALL)), (3, 3));
+    // A missing original still fails the build, as before.
+    let missing = ("norm", "rms_norm");
+    assert!(kernel_or_twin_for(0, &gpu, RMS_NORM, missing, ("norm", "x")).is_err());
+    assert!(gpu.launches().is_empty());
 }
 
 #[test]

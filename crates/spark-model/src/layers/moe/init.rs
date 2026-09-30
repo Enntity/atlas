@@ -152,7 +152,12 @@ impl MoeLayer {
                 "moe_decode_atomic_c4",
                 "moe_decode_atomic_c4_finalize",
             ),
-            moe_sort_by_expert: gpu.kernel("moe", "moe_sort_by_expert")?,
+            moe_sort_by_expert: ops::glm_decode_fuse::kernel_or_twin(
+                gpu,
+                ops::glm_decode_fuse::MOE_SORT,
+                ("moe", "moe_sort_by_expert"),
+                ("moe", "moe_sort_by_expert_scan"),
+            )?,
             moe_sorted_gate_up: gpu.kernel("moe_sorted", "moe_sorted_gate_up")?,
             moe_sorted_silu_down: gpu.kernel("moe_sorted", "moe_sorted_silu_down")?,
             moe_grouped_gemm: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable")?,
