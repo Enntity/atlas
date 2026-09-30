@@ -82,6 +82,11 @@ fn validate_startup(
     Ok(())
 }
 
+/// Whether `ATLAS_GLM_SPARSE_NATIVE=1` selects the optional library.
+pub fn glm_sparse_native_enabled() -> Result<bool> {
+    loader::enabled()
+}
+
 fn qualified_context(seq: usize) -> usize {
     seq.min(plan::MAX_CONTEXT)
 }

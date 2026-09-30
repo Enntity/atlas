@@ -104,6 +104,13 @@ pub fn try_glm_sparse_prefill_tc(
     )
 }
 
+/// The pipelined kernel reads `fp8_g128` directly with the BF16 kv_pad
+/// kernel's exact output on the dequantized view, so without the native
+/// library (the view's other reader) a sparse owner skips the BF16 view.
+pub fn glm_sparse_prefill_pipe_replaces_view(model: &str) -> Result<bool> {
+    Ok(enabled(model, PIPE)? && !super::glm_sparse_native_enabled()?)
+}
+
 fn dispatch(
     gpu: &dyn GpuBackend,
     a: &GlmSparsePrefillTc<'_>,
