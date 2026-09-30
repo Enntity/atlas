@@ -7,13 +7,11 @@
 use anyhow::{Context, Result, ensure};
 use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
-use spark_runtime::kv_cache::{KvCacheDtype, LatentShard, PagedKvCache};
+use spark_runtime::kv_cache::{ExchangeLane, KvCacheDtype, LatentShard, PagedKvCache};
 
 use super::super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
-use crate::layers::glm_kv_shard::{
-    self as shard, HEADS, LATENT, MergeLayout, ScratchLayout, WIDTH,
-};
+use crate::layers::glm_kv_shard::{self as shard, LATENT, ScratchLayout, WIDTH};
 use crate::layers::ops;
 
 /// One merge-form owner: `rows` query rows of one sequence.
@@ -116,16 +114,18 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    /// Whether exchanges of this cache's merge-form owners overlap compute
-    /// (`ATLAS_GLM_KV_SHARD_OVERLAP=1` on a sharded cache, outside capture).
-    pub(super) fn glm_shard_overlaps(
+    /// Where exchanges of this cache's merge-form owners overlap compute:
+    /// the lane of a cache sharded under `ATLAS_GLM_KV_SHARD_OVERLAP=1`,
+    /// outside graph capture.
+    pub(super) fn glm_shard_lane(
         &self,
         kv_cache: &PagedKvCache,
         ctx: &ForwardContext,
-    ) -> Result<bool> {
-        Ok(kv_cache.latent_shard().is_some()
-            && !ctx.graph_capture
-            && shard::MergeTuning::get()?.overlap)
+    ) -> Option<ExchangeLane> {
+        kv_cache
+            .latent_shard()
+            .and_then(|s| s.lane)
+            .filter(|_| !ctx.graph_capture)
     }
 
     /// `[k, v, block table]` a view-form owner's kernels read: its assembled
@@ -152,8 +152,8 @@ impl Qwen3AttentionLayer {
 
     /// `ATLAS_GLM_KV_SHARD_OVERLAP=1`: swap a merge-form owner's absorbed
     /// `query` rows with the peer while `during` (its index update and
-    /// selection, which never use the pair for so few rows) runs. Returns
-    /// whether the peer's queries are in the merge scratch.
+    /// selection) runs on a context whose communicator refuses the pair.
+    /// Returns whether the peer's queries are in the merge scratch.
     pub(super) fn glm_shard_swap_queries_during<T>(
         &self,
         kv_cache: &PagedKvCache,
@@ -161,16 +161,22 @@ impl Qwen3AttentionLayer {
         rows: usize,
         query: DevicePtr,
         stream: u64,
-        during: impl FnOnce() -> Result<T>,
+        during: impl FnOnce(&ForwardContext) -> Result<T>,
     ) -> Result<(T, bool)> {
-        if rows > shard::MERGE_MAX_ROWS || !self.glm_shard_overlaps(kv_cache, ctx)? {
-            return Ok((during()?, false));
-        }
+        let lane = self.glm_shard_lane(kv_cache, ctx);
+        let Some(lane) = lane.filter(|_| rows <= shard::MERGE_MAX_ROWS) else {
+            return Ok((during(ctx)?, false));
+        };
         let (s, comm, layout) = pair(kv_cache, ctx)?;
-        let m = MergeLayout::new(rows as u32, shard::merge_splits(rows as u32));
-        let q_peer = s.scratch.offset(layout.work + m.q_peer);
-        let swap = (query, q_peer, rows * (HEADS * LATENT) as usize * 2);
-        let out = shard::overlapped_exchange(ctx.gpu, comm, s.lane, swap, stream, during)?;
+        let work = s.scratch.offset(layout.work);
+        let owner = (query, rows as u32);
+        let out = merge::swap_queries_during(ctx.gpu, comm, lane, work, owner, stream, |fenced| {
+            during(&ForwardContext {
+                comm: Some(fenced),
+                midchunk_capture: None, // as in every owner's context
+                ..*ctx
+            })
+        })?;
         Ok((out, true))
     }
 
@@ -204,7 +210,6 @@ impl Qwen3AttentionLayer {
             self.glm_shard_check(&s, comm, gpu, words, &table, stream)?;
         }
         let hd = self.mla.as_ref().map_or(0, |m| m.nope) as u32;
-        let tuning = shard::MergeTuning::get()?;
         merge::ShardMerge {
             gpu,
             comm,
@@ -215,10 +220,8 @@ impl Qwen3AttentionLayer {
             dtype: self.kv_dtype,
             pool: kv_cache.latent_pool_ptr(self.attn_layer_idx),
             scale: self.effective_attn_scale(hd),
-            tuning: shard::MergeTuning {
-                overlap: tuning.overlap && !ctx.graph_capture,
-                ..tuning
-            },
+            compact: shard::MergeTuning::get()?.compact,
+            lane: self.glm_shard_lane(kv_cache, ctx),
         }
         .run(a, output, stream)
     }

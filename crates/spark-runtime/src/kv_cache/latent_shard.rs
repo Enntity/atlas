@@ -34,6 +34,8 @@ pub struct LatentShardSpec {
     pub view_blocks: usize,
     /// Model scratch geometry: rows one cache write may carry.
     pub write_rows: usize,
+    /// Create an [`ExchangeLane`] (the model overlaps exchanges with compute).
+    pub lane: bool,
 }
 
 /// A side stream for pair exchanges that overlap compute, and the two
@@ -48,11 +50,28 @@ pub struct ExchangeLane {
 
 impl ExchangeLane {
     fn new(gpu: &dyn GpuBackend) -> Result<Self> {
-        Ok(Self {
+        let mut lane = Self {
             stream: gpu.create_stream()?,
-            begun: gpu.create_event()?,
-            landed: gpu.create_event()?,
-        })
+            ..Self::default()
+        };
+        let events = gpu.create_event().and_then(|begun| {
+            lane.begun = begun;
+            gpu.create_event()
+        });
+        match events {
+            Ok(landed) => Ok(Self { landed, ..lane }),
+            Err(error) => {
+                let _ = lane.destroy(gpu);
+                Err(error)
+            }
+        }
+    }
+
+    /// Destroy the events and the stream; the first failure, after trying all.
+    pub(super) fn destroy(self, gpu: &dyn GpuBackend) -> Result<()> {
+        let events = [self.begun, self.landed].map(|event| gpu.destroy_event(event));
+        let stream = gpu.destroy_stream(self.stream);
+        events.into_iter().chain([stream]).collect()
     }
 }
 
@@ -67,8 +86,9 @@ pub struct LatentShard {
     /// `u32[i] = i` for every local slot and view block: the block table of
     /// the local pool addressed by local token ids, and of assembled views.
     pub identity: DevicePtr,
-    /// Where the model may run its exchanges beside the compute stream.
-    pub lane: ExchangeLane,
+    /// Where the model runs exchanges beside the compute stream, when the
+    /// spec asked for it.
+    pub lane: Option<ExchangeLane>,
 }
 
 /// How one rank assembles a sequence's logical blocks `[0, n)`.
@@ -185,9 +205,16 @@ impl PagedKvCache {
             .flat_map(u32::to_le_bytes)
             .collect();
         let built = gpu.copy_h2d(&table, identity).and_then(|()| {
-            let lane = ExchangeLane::new(gpu)?;
-            let cache = Self::new_with_k_slots(config, num_blocks, local_blocks, gpu, true)?;
-            Ok((lane, cache))
+            let lane = spec.lane.then(|| ExchangeLane::new(gpu)).transpose()?;
+            match Self::new_with_k_slots(config, num_blocks, local_blocks, gpu, true) {
+                Ok(cache) => Ok((lane, cache)),
+                Err(error) => {
+                    if let Some(lane) = lane {
+                        let _ = lane.destroy(gpu);
+                    }
+                    Err(error)
+                }
+            }
         });
         let (lane, mut cache) = match built {
             Ok(built) => built,

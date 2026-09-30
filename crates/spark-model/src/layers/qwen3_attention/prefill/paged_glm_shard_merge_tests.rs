@@ -4,8 +4,9 @@
 //! recording GPU and pair.
 
 use super::*;
+use crate::layers::glm_kv_shard::MergeTuning;
 use crate::layers::ops::shard_test_gpu::{Op, ShardGpu, ShardPair, ptr};
-use spark_runtime::kv_cache::{ExchangeLane, LatentShardSpec};
+use spark_runtime::kv_cache::LatentShardSpec;
 
 const SCRATCH: u64 = 0x4000_0000;
 const WORK: usize = 0x10_0000;
@@ -29,14 +30,17 @@ fn config() -> ModelConfig {
     c
 }
 
-/// Run one owner of `rows` rows under `tuning`; the recorded trace.
-fn run(rows: u32, tuning: MergeTuning, queries_swapped: bool) -> ShardGpu {
-    let gpu = ShardGpu::default();
-    let config = config();
-    let merge = ShardMerge {
-        gpu: &gpu,
-        comm: &ShardPair { gpu: &gpu, rank: 1 },
-        config: &config,
+/// Rank 1's merge of one layer under `tuning`, recording on `gpu`.
+fn merge<'a>(
+    gpu: &'a ShardGpu,
+    pair: &'a ShardPair<'a>,
+    config: &'a ModelConfig,
+    tuning: MergeTuning,
+) -> ShardMerge<'a> {
+    ShardMerge {
+        gpu,
+        comm: pair,
+        config,
         shard: LatentShard {
             spec: LatentShardSpec {
                 rank: 1,
@@ -44,29 +48,46 @@ fn run(rows: u32, tuning: MergeTuning, queries_swapped: bool) -> ShardGpu {
                 scratch_bytes: 0,
                 view_blocks: 0,
                 write_rows: 0,
+                lane: tuning.overlap,
             },
             local_blocks: 0,
             scratch: DevicePtr(SCRATCH),
             identity: DevicePtr(0x300),
-            lane: LANE,
+            lane: tuning.overlap.then_some(LANE),
         },
         work: WORK,
         work_bytes: 64 << 20,
         dtype: KvCacheDtype::Fp8G128,
         pool: DevicePtr(0x400),
         scale: 0.0625,
-        tuning,
-    };
-    let a = ShardRows {
-        query: DevicePtr(QUERY),
+        compact: tuning.compact,
+        lane: tuning.overlap.then_some(LANE),
+    }
+}
+
+fn owner(query: u64, rows: u32, queries_swapped: bool) -> ShardRows {
+    ShardRows {
+        query: DevicePtr(query),
         selected: Some(DevicePtr(0x500)),
         causal_start: 0,
         block_table: DevicePtr(0x600),
         rows,
         end: None,
         queries_swapped,
-    };
-    merge.run(a, DevicePtr(OUTPUT), STREAM).unwrap();
+    }
+}
+
+/// Run one owner of `rows` rows under `tuning`; the recorded trace.
+fn run(rows: u32, tuning: MergeTuning, queries_swapped: bool) -> ShardGpu {
+    let gpu = ShardGpu::default();
+    let (pair, config) = (ShardPair { gpu: &gpu, rank: 1 }, config());
+    merge(&gpu, &pair, &config, tuning)
+        .run(
+            owner(QUERY, rows, queries_swapped),
+            DevicePtr(OUTPUT),
+            STREAM,
+        )
+        .unwrap();
     gpu
 }
 
@@ -212,4 +233,82 @@ fn queries_swapped_ahead_are_not_swapped_again() {
         );
         assert!(order[0].starts_with("glm_kv_shard_localize"), "{order:?}");
     }
+}
+
+/// The verify path under the overlap: each owner's queries fly beside its
+/// selection (a marker copy here), then its merge runs without a second swap.
+fn verify_owners(queries: &[u64]) -> ShardGpu {
+    let gpu = ShardGpu::default();
+    let (pair, config) = (ShardPair { gpu: &gpu, rank: 1 }, config());
+    let m = merge(&gpu, &pair, &config, tuning(true, true));
+    let work = DevicePtr(SCRATCH).offset(WORK);
+    for &query in queries {
+        let select = |fenced: &WindowComm| {
+            assert!(shard::pair_exchange(fenced, work, work, 8, STREAM).is_err());
+            gpu.copy_d2d_async(DevicePtr(1), DevicePtr(2), 1, STREAM)
+        };
+        let q = (DevicePtr(query), 8);
+        swap_queries_during(&gpu, &pair, LANE, work, q, STREAM, select).unwrap();
+        m.run(owner(query, 8, true), DevicePtr(OUTPUT), STREAM)
+            .unwrap();
+    }
+    gpu
+}
+
+#[test]
+fn verify_owners_swap_queries_beside_selection_one_owner_at_a_time() {
+    let one_owner = [
+        "record e21 s3",
+        "wait s7 e21",
+        &format!("exchange {Q_BYTES} s7"),
+        "record e22 s7",
+        "copy 1", // the selection
+        "wait s3 e22",
+        "glm_kv_shard_localize_compact",
+        COUNTED,
+        "glm_sparse_decode_split_merge_f32",
+        "record e21 s3",
+        "wait s7 e21",
+        &format!("exchange {P_BYTES} s7"),
+        "record e22 s7",
+        COUNTED,
+        "wait s3 e22",
+        "glm_sparse_decode_split_merge_extra",
+    ]
+    .map(String::from);
+    assert_eq!(verify_owners(&[QUERY]).order(), one_owner);
+    // Two owners share the lane and the scratch: the second owner's swap
+    // starts only after the first owner's merge was enqueued.
+    let gpu = verify_owners(&[QUERY, QUERY + 0x1000]);
+    assert_eq!(gpu.order(), [one_owner.clone(), one_owner].concat());
+    let ops = gpu.ops();
+    let q_peer = SCRATCH + (WORK + MergeLayout::new(8, shard::merge_splits(8)).q_peer) as u64;
+    let swaps: Vec<(u64, u64)> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Exchange {
+                send, recv, bytes, ..
+            } if *bytes == Q_BYTES => Some((*send, *recv)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(swaps, [(QUERY, q_peer), (QUERY + 0x1000, q_peer)]);
+    // Each merge reads the peer's queries where that swap landed them, then
+    // its own.
+    let queries: Vec<&Vec<u8>> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Launch { symbol, args, .. } if symbol == COUNTED => Some(&args[0]),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        queries,
+        [
+            &ptr(q_peer),
+            &ptr(QUERY),
+            &ptr(q_peer),
+            &ptr(QUERY + 0x1000)
+        ]
+    );
 }

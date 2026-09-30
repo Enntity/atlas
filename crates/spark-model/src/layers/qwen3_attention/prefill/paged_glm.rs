@@ -208,7 +208,7 @@ impl Qwen3AttentionLayer {
             q_latent,
             num_tokens,
             nq as usize,
-            self.glm_shard_overlaps(kv_cache, ctx)?,
+            self.glm_shard_lane(kv_cache, ctx).is_some(),
             ctx,
             stream,
         )?;
@@ -227,12 +227,12 @@ impl Qwen3AttentionLayer {
             let o_normed = normed.offset(o.row0 * h as usize * bf16);
             let o_latent = q_latent.offset(o.row0 * q_lora as usize * bf16);
             let rows_of = |base: DevicePtr, row_bytes: usize| base.offset(o.row0 * row_bytes);
-            let select = || {
+            let select = |octx: &ForwardContext| {
                 self.glm_index_prefill_cache_update(
                     o_normed,
                     on,
                     kv_cache,
-                    &octx,
+                    octx,
                     stream,
                     batched.map(|b| (rows_of(b.keys, b.key_row), rows_of(b.gates, b.key_row))),
                 )?;
@@ -247,7 +247,7 @@ impl Qwen3AttentionLayer {
                 });
                 let start = o.seq_len_start;
                 self.glm_index_prefill_select(
-                    o_latent, o_normed, on, start, kv_cache, &octx, stream, projected,
+                    o_latent, o_normed, on, start, kv_cache, octx, stream, projected,
                 )
                 .map(Some)
             };
@@ -260,7 +260,7 @@ impl Qwen3AttentionLayer {
                         kv_cache, &octx, o.rows, query, stream, select,
                     )?
                 }
-                None => (select()?, false),
+                None => (select(&octx)?, false),
             };
             let q_absorbed = match batched {
                 Some(b) => rows_of(b.q_absorbed, latent_row),

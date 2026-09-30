@@ -83,15 +83,28 @@ pub struct MergeTuning {
     /// `ATLAS_GLM_KV_SHARD_COMPACT=1`.
     pub compact: bool,
     /// `ATLAS_GLM_KV_SHARD_OVERLAP=1`; off under `..._CHECK=1`, whose own
-    /// exchange would run inside an overlap window.
+    /// exchange would run inside an overlap window. Decides at boot whether
+    /// the cache gets an [`ExchangeLane`], which is what the layers consult.
     pub overlap: bool,
 }
 
 impl MergeTuning {
-    fn parse(compact: Option<&str>, overlap: Option<&str>, check: bool) -> Result<Self> {
+    /// A tuning set without the shard (`sharded`) is a misconfiguration.
+    fn parse(
+        compact: Option<&str>,
+        overlap: Option<&str>,
+        check: bool,
+        sharded: bool,
+    ) -> Result<Self> {
+        let compact = parse("ATLAS_GLM_KV_SHARD_COMPACT", compact)?;
+        let overlap = parse("ATLAS_GLM_KV_SHARD_OVERLAP", overlap)?;
+        ensure!(
+            sharded || !(compact || overlap),
+            "ATLAS_GLM_KV_SHARD_COMPACT and ATLAS_GLM_KV_SHARD_OVERLAP tune ATLAS_GLM_KV_SHARD=1, which is not set"
+        );
         Ok(Self {
-            compact: parse("ATLAS_GLM_KV_SHARD_COMPACT", compact)?,
-            overlap: parse("ATLAS_GLM_KV_SHARD_OVERLAP", overlap)? && !check,
+            compact,
+            overlap: overlap && !check,
         })
     }
 
@@ -101,12 +114,16 @@ impl MergeTuning {
         TUNING
             .get_or_init(|| {
                 let var = |name: &str| std::env::var(name).ok();
-                Self::parse(
-                    var("ATLAS_GLM_KV_SHARD_COMPACT").as_deref(),
-                    var("ATLAS_GLM_KV_SHARD_OVERLAP").as_deref(),
-                    check_requested(),
-                )
-                .map_err(|e| format!("{e:#}"))
+                requested()
+                    .and_then(|sharded| {
+                        Self::parse(
+                            var("ATLAS_GLM_KV_SHARD_COMPACT").as_deref(),
+                            var("ATLAS_GLM_KV_SHARD_OVERLAP").as_deref(),
+                            check_requested(),
+                            sharded,
+                        )
+                    })
+                    .map_err(|e| format!("{e:#}"))
             })
             .clone()
             .map_err(anyhow::Error::msg)
@@ -296,6 +313,7 @@ pub fn spec(
         scratch_bytes: layout.total,
         view_blocks,
         write_rows,
+        lane: false,
     }
 }
 
@@ -323,27 +341,80 @@ pub fn pair_exchange(
     comm.group_end()
 }
 
+/// The communicator inside an [`overlapped_exchange`] window: the pair's
+/// rank and size, and an error from every operation that would use the pair.
+/// The pair orders its sends by stream order and counts landings in one
+/// place, so a second user beside the lane's exchange would corrupt or hang
+/// both ranks without an error of its own.
+pub struct WindowComm<'a>(&'a dyn spark_comm::CommBackend);
+
+impl WindowComm<'_> {
+    fn refuse<T>(&self, what: &str) -> Result<T> {
+        bail!(
+            "{what} inside a GLM KV shard overlap window on rank {}: the pair is carrying the lane's exchange",
+            self.0.rank()
+        )
+    }
+}
+
+impl spark_comm::CommBackend for WindowComm<'_> {
+    fn all_reduce(&self, _: u64, _: usize) -> Result<()> {
+        self.refuse("all-reduce")
+    }
+    fn all_gather(&self, _: u64, _: u64, _: usize) -> Result<()> {
+        self.refuse("all-gather")
+    }
+    fn reduce_scatter(&self, _: u64, _: u64, _: usize) -> Result<()> {
+        self.refuse("reduce-scatter")
+    }
+    fn broadcast(&self, _: u64, _: usize, _: usize) -> Result<()> {
+        self.refuse("broadcast")
+    }
+    fn barrier(&self) -> Result<()> {
+        self.refuse("barrier")
+    }
+    fn peer_exchange_async(&self, _: u64, _: u64, _: usize, _: u64) -> Result<()> {
+        self.refuse("peer exchange")
+    }
+    fn exchange_async(&self, _: u64, _: u64, _: usize, _: bool, _: u64) -> Result<bool> {
+        self.refuse("exchange")
+    }
+    fn send_to(&self, _: u64, _: usize, _: usize, _: u64) -> Result<()> {
+        self.refuse("send")
+    }
+    fn recv_from(&self, _: u64, _: usize, _: usize, _: u64) -> Result<()> {
+        self.refuse("receive")
+    }
+    fn rank(&self) -> usize {
+        self.0.rank()
+    }
+    fn world_size(&self) -> usize {
+        self.0.world_size()
+    }
+}
+
 /// [`pair_exchange`] on the shard's side stream, so the compute stream runs
 /// `during` while the payload is in flight, and waits for it to land after.
 ///
-/// `during` must not read `recv`, write `send`, or use the pair (no
-/// all-reduce, no exchange): the pair orders its sends by stream order, and
-/// only this fence orders the side stream against the compute stream. The
-/// wait is enqueued even when `during` fails. Both ranks run the same
-/// exchanges in the same order, so an overlap only moves where each waits.
+/// `during` must not read `recv` or write `send`, and cannot use the pair:
+/// only this fence orders the side stream against the compute stream, so
+/// the communicator it is handed (give it to whatever `during` calls)
+/// refuses every pair operation. The wait is enqueued even when `during`
+/// fails. Both ranks run the same exchanges in the same order, so an overlap
+/// only moves where each waits.
 pub fn overlapped_exchange<T>(
     gpu: &dyn GpuBackend,
     comm: &dyn spark_comm::CommBackend,
     lane: ExchangeLane,
     (send, recv, bytes): (DevicePtr, DevicePtr, usize),
     stream: u64,
-    during: impl FnOnce() -> Result<T>,
+    during: impl FnOnce(&WindowComm) -> Result<T>,
 ) -> Result<T> {
     gpu.record_event(lane.begun, stream)?;
     gpu.stream_wait_event(lane.stream, lane.begun)?;
     pair_exchange(comm, send, recv, bytes, lane.stream)?;
     gpu.record_event(lane.landed, lane.stream)?;
-    let out = during();
+    let out = during(&WindowComm(comm));
     gpu.stream_wait_event(stream, lane.landed)?;
     out
 }

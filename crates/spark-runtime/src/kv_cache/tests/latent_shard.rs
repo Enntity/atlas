@@ -25,6 +25,7 @@ fn spec(rank: usize) -> LatentShardSpec {
         scratch_bytes: 4096,
         view_blocks: 8,
         write_rows: 4,
+        lane: false,
     }
 }
 
@@ -34,7 +35,7 @@ fn shard(rank: usize) -> LatentShard {
         local_blocks: 0,
         scratch: DevicePtr::NULL,
         identity: DevicePtr::NULL,
-        lane: ExchangeLane::default(),
+        lane: None,
     }
 }
 
@@ -193,6 +194,23 @@ fn sharded_pool_allocates_half_the_latent_slots_plus_scratch() {
     assert_eq!(gpu.alloc_count() - before, 4);
     cache.release(&gpu).unwrap();
     assert_eq!(gpu.alloc_count(), before);
+}
+
+#[test]
+fn the_exchange_lane_lives_exactly_as_long_as_a_cache_that_asked_for_it() {
+    let gpu = MockGpuBackend::new();
+    let plain = PagedKvCache::new_latent_sharded(glm_config(), 7, &gpu, spec(0)).unwrap();
+    assert_eq!(plain.latent_shard().unwrap().lane, None);
+    assert_eq!(gpu.live_streams_and_events(), (0, 0));
+    let with_lane = LatentShardSpec {
+        lane: true,
+        ..spec(1)
+    };
+    let mut cache = PagedKvCache::new_latent_sharded(glm_config(), 7, &gpu, with_lane).unwrap();
+    assert!(cache.latent_shard().unwrap().lane.is_some());
+    assert_eq!(gpu.live_streams_and_events(), (1, 2));
+    cache.release(&gpu).unwrap();
+    assert_eq!(gpu.live_streams_and_events(), (0, 0));
 }
 
 #[test]

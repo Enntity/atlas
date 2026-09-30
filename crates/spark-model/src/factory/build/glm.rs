@@ -183,8 +183,11 @@ pub(super) fn shard_plan(
     max_seq_len: usize,
     max_batch_tokens: usize,
 ) -> Result<Option<GlmCachePlan>> {
+    use crate::layers::glm_kv_shard as shard;
     use anyhow::{Context, ensure};
-    if !crate::layers::glm_kv_shard::requested()? {
+    // Junk tuning values, and tunings without the shard, fail the boot.
+    let tuning = shard::MergeTuning::get()?;
+    if !shard::requested()? {
         return Ok(plan);
     }
     let plan = plan.context("ATLAS_GLM_KV_SHARD=1 shards the GLM-5 NoPE MLA latent cache only")?;
@@ -210,20 +213,17 @@ pub(super) fn shard_plan(
         )),
         "ATLAS_GLM_KV_SHARD=1 needs a BF16 or fp8_g128 latent cache on every layer"
     );
-    // Junk tuning values fail the boot, not the first request.
-    let tuning = crate::layers::glm_kv_shard::MergeTuning::get()?;
     tracing::info!(
-        "KV latent shard merge form: compact={} overlap={}",
+        "KV latent shard merge form: compact={} overlap={} check={}",
         tuning.compact,
-        tuning.overlap
+        tuning.overlap,
+        shard::check_requested()
     );
     // A cache write carries at most one chunk of rows (plus verify slack).
-    let spec = crate::layers::glm_kv_shard::spec(
-        comm.rank(),
-        kv_config,
-        max_seq_len,
-        max_batch_tokens + 64,
-    );
+    let spec = spark_runtime::kv_cache::LatentShardSpec {
+        lane: tuning.overlap,
+        ..shard::spec(comm.rank(), kv_config, max_seq_len, max_batch_tokens + 64)
+    };
     Ok(Some(plan.latent_sharded(kv_config, spec)))
 }
 

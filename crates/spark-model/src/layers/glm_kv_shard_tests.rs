@@ -18,7 +18,7 @@ fn flag_is_explicit() {
 
 #[test]
 fn merge_tuning_is_explicit_and_the_check_keeps_exchanges_inline() {
-    let t = |c, o, check| MergeTuning::parse(c, o, check).unwrap();
+    let t = |c, o, check| MergeTuning::parse(c, o, check, true).unwrap();
     assert_eq!(t(None, None, false), MergeTuning::default());
     assert_eq!(t(Some("0"), Some("0"), false), MergeTuning::default());
     let both = MergeTuning {
@@ -29,8 +29,20 @@ fn merge_tuning_is_explicit_and_the_check_keeps_exchanges_inline() {
     // The check's own exchange would fall inside an overlap window.
     assert!(!t(Some("1"), Some("1"), true).overlap);
     assert!(t(Some("1"), Some("1"), true).compact);
-    assert!(MergeTuning::parse(Some("yes"), None, false).is_err());
-    assert!(MergeTuning::parse(None, Some("2"), false).is_err());
+    assert!(MergeTuning::parse(Some("yes"), None, false, true).is_err());
+    assert!(MergeTuning::parse(None, Some("2"), false, true).is_err());
+}
+
+#[test]
+fn a_tuning_without_the_shard_fails_instead_of_being_ignored() {
+    let unsharded = |c, o| MergeTuning::parse(c, o, false, false);
+    assert_eq!(unsharded(None, Some("0")).unwrap(), MergeTuning::default());
+    for (c, o) in [(Some("1"), None), (None, Some("1")), (Some("junk"), None)] {
+        assert!(unsharded(c, o).is_err(), "{c:?} {o:?}");
+    }
+    // The check does not hide an overlap request.
+    let err = MergeTuning::parse(None, Some("1"), true, false).unwrap_err();
+    assert!(err.to_string().contains("ATLAS_GLM_KV_SHARD=1"), "{err}");
 }
 
 fn disjoint(regions: &[(usize, usize)]) -> bool {
@@ -361,7 +373,7 @@ fn an_overlapped_exchange_runs_on_the_lane_fenced_around_the_compute() {
     let gpu = ShardGpu::default();
     let pair = ShardPair { gpu: &gpu, rank: 0 };
     let payload = (DevicePtr(0x100), DevicePtr(0x200), 4096);
-    let during = || {
+    let during = |_: &WindowComm| {
         gpu.record_event(99, 3)?; // stands for the compute-stream launches
         Ok(5)
     };
@@ -390,9 +402,48 @@ fn a_failed_overlap_window_still_waits_for_the_exchange() {
     let gpu = ShardGpu::default();
     let pair = ShardPair { gpu: &gpu, rank: 1 };
     let payload = (DevicePtr(0x100), DevicePtr(0x200), 64);
-    let failed = overlapped_exchange(&gpu, &pair, LANE, payload, 3, || -> Result<()> {
+    let failed = overlapped_exchange(&gpu, &pair, LANE, payload, 3, |_| -> Result<()> {
         bail!("selection failed")
     });
     assert!(failed.is_err());
     assert_eq!(gpu.order().last().map(String::as_str), Some("wait s3 e22"));
+}
+
+#[test]
+fn the_pair_is_refused_inside_an_overlap_window() {
+    use spark_comm::CommBackend;
+    let gpu = ShardGpu::default();
+    let pair = ShardPair { gpu: &gpu, rank: 1 };
+    let payload = (DevicePtr(0x100), DevicePtr(0x200), 64);
+    let (a, b) = (DevicePtr(0x300), DevicePtr(0x400));
+    overlapped_exchange(&gpu, &pair, LANE, payload, 3, |fenced| {
+        assert_eq!((fenced.rank(), fenced.world_size()), (1, 2));
+        // What an index split would ask before exchanging its rows.
+        assert!(!fenced.supports_exchange_async(64));
+        let refused = [
+            pair_exchange(fenced, a, b, 64, 3),
+            fenced.all_reduce(a.0, 64),
+            fenced.all_reduce_async(a.0, 64, 3),
+            fenced.all_gather(a.0, b.0, 64),
+            fenced.reduce_scatter(a.0, b.0, 64),
+            fenced.broadcast(a.0, 64, 0),
+            fenced.barrier(),
+            fenced.peer_exchange_async(a.0, b.0, 64, 3),
+            fenced.send_to(a.0, 64, 0, 3),
+            fenced.recv_from(a.0, 64, 0, 3),
+        ];
+        for result in refused {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("overlap window on rank 1"), "{err}");
+        }
+        Ok(())
+    })
+    .unwrap();
+    // Nothing but the lane's own exchange reached the pair.
+    let exchanges = gpu
+        .order()
+        .iter()
+        .filter(|s| s.starts_with("exchange"))
+        .count();
+    assert_eq!(exchanges, 1);
 }

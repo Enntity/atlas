@@ -407,6 +407,9 @@ impl GpuBackend for AtlasCudaBackend {
     fn create_stream(&self) -> Result<u64> {
         self.create_stream_cu()
     }
+    fn destroy_stream(&self, stream: u64) -> Result<()> {
+        self.destroy_stream_cu(stream)
+    }
     fn bind_to_thread(&self) -> Result<()> {
         self.bind_to_thread_cu()
     }

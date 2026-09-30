@@ -8,11 +8,37 @@ use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
 use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
-use spark_runtime::kv_cache::{KvCacheDtype, LatentShard};
+use spark_runtime::kv_cache::{ExchangeLane, KvCacheDtype, LatentShard};
 
 use super::{ShardRows, owner_rank};
-use crate::layers::glm_kv_shard::{self as shard, HEADS, LATENT, MergeLayout, MergeTuning, WIDTH};
+use crate::layers::glm_kv_shard::{self as shard, HEADS, LATENT, MergeLayout, WIDTH, WindowComm};
 use crate::layers::ops;
+
+/// A payload the pair swaps: send from `.0`, land the peer's in `.1`.
+type Swap = (DevicePtr, DevicePtr, usize);
+
+/// The query swap of a merge-form owner of `rows` rows: this rank's heads'
+/// absorbed `query` out, the peer's into the merge scratch at `work`.
+fn query_swap(work: DevicePtr, query: DevicePtr, rows: u32) -> Swap {
+    let m = MergeLayout::new(rows, shard::merge_splits(rows));
+    let bytes = rows as usize * (HEADS * LATENT) as usize * 2;
+    (query, work.offset(m.q_peer), bytes)
+}
+
+/// Swap an owner's queries on `lane` while `during` runs; its merge
+/// ([`ShardMerge::run`]) then takes `queries_swapped`.
+pub(super) fn swap_queries_during<T>(
+    gpu: &dyn GpuBackend,
+    comm: &dyn CommBackend,
+    lane: ExchangeLane,
+    work: DevicePtr,
+    (query, rows): (DevicePtr, u32),
+    stream: u64,
+    during: impl FnOnce(&WindowComm) -> Result<T>,
+) -> Result<T> {
+    let swap = query_swap(work, query, rows);
+    shard::overlapped_exchange(gpu, comm, lane, swap, stream, during)
+}
 
 /// One layer's merge form on this rank.
 pub(super) struct ShardMerge<'a> {
@@ -27,8 +53,10 @@ pub(super) struct ShardMerge<'a> {
     /// This rank's latent pool of the layer.
     pub pool: DevicePtr,
     pub scale: f32,
-    /// `overlap` already excludes graph capture.
-    pub tuning: MergeTuning,
+    /// `ATLAS_GLM_KV_SHARD_COMPACT=1`.
+    pub compact: bool,
+    /// Where the exchanges overlap compute (never under graph capture).
+    pub lane: Option<ExchangeLane>,
 }
 
 impl ShardMerge<'_> {
@@ -36,7 +64,7 @@ impl ShardMerge<'_> {
     /// into `output` (`[rows, 32, 512]` BF16).
     pub(super) fn run(&self, a: ShardRows, output: DevicePtr, stream: u64) -> Result<()> {
         let (gpu, comm, s) = (self.gpu, self.comm, &self.shard);
-        let MergeTuning { compact, overlap } = self.tuning;
+        let (compact, lane) = (self.compact, self.lane);
         let splits = shard::merge_splits(a.rows);
         let m = MergeLayout::new(a.rows, splits);
         ensure!(
@@ -68,14 +96,16 @@ impl ShardMerge<'_> {
 
         // 1. Swap queries: the peer's heads attend over this rank's tokens too.
         // 2. Localize the selection (beside the swap when overlapping).
-        let queries = (a.query, at(m.q_peer), rows * (HEADS * LATENT) as usize * 2);
-        if a.queries_swapped {
-            localize()?;
-        } else if overlap {
-            shard::overlapped_exchange(gpu, comm, s.lane, queries, stream, localize)?;
-        } else {
-            shard::pair_exchange(comm, queries.0, queries.1, queries.2, stream)?;
-            localize()?;
+        let queries = query_swap(at(0), a.query, a.rows);
+        match lane {
+            _ if a.queries_swapped => localize()?,
+            Some(lane) => {
+                shard::overlapped_exchange(gpu, comm, lane, queries, stream, |_| localize())?
+            }
+            None => {
+                shard::pair_exchange(comm, queries.0, queries.1, queries.2, stream)?;
+                localize()?;
+            }
         }
         let tc = |query: DevicePtr| ops::GlmSparsePrefillTc {
             config: self.config,
@@ -96,7 +126,7 @@ impl ShardMerge<'_> {
         };
         // 3. The peer's heads over this rank's tokens: one FP32 partial + LSE.
         let send = at(m.send);
-        let peer_heads = tc(at(m.q_peer));
+        let peer_heads = tc(queries.1);
         if splits == 1 {
             let send_lse = send.offset(part);
             ops::launch_sparse_partials(gpu, &peer_heads, 1, counts, send, send_lse, stream)?;
@@ -108,16 +138,17 @@ impl ShardMerge<'_> {
         // 4. Swap the partials; this rank's heads' own partitions (beside the
         //    swap when overlapping) need nothing from the peer.
         let recv = at(m.recv);
-        let partials = (send, recv, MergeLayout::partial_bytes(a.rows));
+        let partials: Swap = (send, recv, MergeLayout::partial_bytes(a.rows));
         let (own_o, own_lse) = (at(m.own_o), at(m.own_lse));
         let own = || {
             ops::launch_sparse_partials(gpu, &tc(a.query), splits, counts, own_o, own_lse, stream)
         };
-        if overlap {
-            shard::overlapped_exchange(gpu, comm, s.lane, partials, stream, own)?;
-        } else {
-            shard::pair_exchange(comm, partials.0, partials.1, partials.2, stream)?;
-            own()?;
+        match lane {
+            Some(lane) => shard::overlapped_exchange(gpu, comm, lane, partials, stream, |_| own())?,
+            None => {
+                shard::pair_exchange(comm, partials.0, partials.1, partials.2, stream)?;
+                own()?;
+            }
         }
         // 5. One LSE merge to BF16 with the peer's partial as partition
         //    `splits`: where it landed (compact), else copied behind the own.

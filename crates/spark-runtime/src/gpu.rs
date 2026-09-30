@@ -427,6 +427,12 @@ pub trait GpuBackend: Send + Sync {
         Ok(0) // Default: return legacy stream
     }
 
+    /// Destroy a stream from [`Self::create_stream`] once its work is done
+    /// (stream 0, the legacy stream, is never destroyed).
+    fn destroy_stream(&self, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Bind the CUDA context to the current thread.
     ///
     /// Must be called on any thread that uses GPU operations (alloc, launch, etc.)
