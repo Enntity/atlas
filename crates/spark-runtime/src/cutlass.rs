@@ -32,20 +32,40 @@ pub fn rejected_before_launch(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RejectedBeforeLaunch>().is_some()
 }
 
-/// Wrapper statuses from this value up report a failed launch
-/// (`ATLAS_CUTLASS_LAUNCH_FAILED` in `cuda/atlas_stale_cuda_error.h`); lower
-/// non-zero statuses are rejections before any launch.
+/// Marks a wrapper error from the launch itself: the output may be partly
+/// written, so no caller may recompute it in another backend.
+#[derive(Debug)]
+pub struct LaunchFailed;
+
+impl std::fmt::Display for LaunchFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CUTLASS launch failed")
+    }
+}
+
+impl std::error::Error for LaunchFailed {}
+
+/// Whether `error` reports a failed CUTLASS launch.
+pub fn launch_failed(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LaunchFailed>().is_some()
+}
+
+/// The BF16 GEMM wrappers report a failed launch as this value plus the
+/// CUTLASS status (`ATLAS_CUTLASS_LAUNCH_FAILED` in
+/// `cuda/atlas_stale_cuda_error.h`); their lower non-zero statuses are
+/// rejections before any launch. The NVFP4 and pack wrappers keep their own
+/// codes and are never retried in another backend.
 pub const LAUNCH_FAILED: i32 = 1000;
 
-/// The error for a non-zero wrapper `status`, marked [`RejectedBeforeLaunch`]
-/// unless the launch itself failed.
+/// The error for a non-zero BF16 wrapper `status`: [`LaunchFailed`] when the
+/// launch itself failed, else [`RejectedBeforeLaunch`].
 #[cfg(any(atlas_cutlass, test))]
 pub(crate) fn status_error(status: i32, what: String) -> anyhow::Error {
     if status >= LAUNCH_FAILED {
-        anyhow::anyhow!(
+        anyhow::Error::new(LaunchFailed).context(format!(
             "{what}: launch failed, CUTLASS status {}",
             status - LAUNCH_FAILED
-        )
+        ))
     } else {
         anyhow::Error::new(RejectedBeforeLaunch).context(format!("{what}: status {status}"))
     }
@@ -283,7 +303,7 @@ pub(crate) fn drained(wrapper: &str, status: i32) -> i32 {
     static REPORTED: AtomicU64 = AtomicU64::new(0);
     let mut code = 0i32;
     let count = unsafe { atlas_cuda_stale_error_stats(&mut code) };
-    let seen = REPORTED.swap(count, Ordering::Relaxed);
+    let seen = REPORTED.fetch_max(count, Ordering::Relaxed);
     if count > seen {
         let thread = std::thread::current();
         let name = thread.name().unwrap_or("unnamed");
@@ -364,9 +384,19 @@ mod marker_tests {
         // The launch itself failed: never a reason to try another backend.
         for status in [LAUNCH_FAILED + 1, LAUNCH_FAILED + 7] {
             let error = status_error(status, "gemm".into());
-            assert!(!rejected_before_launch(&error));
+            assert!(!rejected_before_launch(&error) && launch_failed(&error));
             assert!(format!("{error:#}").contains("launch failed"));
         }
         assert!(!rejected_before_launch(&anyhow::anyhow!("unrelated")));
+        assert!(!launch_failed(&status_error(1, "gemm".into())));
+    }
+
+    /// Without CUTLASS built in nothing launches, so the caller's other
+    /// backend stays available.
+    #[cfg(not(atlas_cutlass))]
+    #[test]
+    fn a_build_without_cutlass_rejects_before_launch() {
+        let error = bf16_gemm_tuned(0, 0, 0, 256, 128, 128, 128, 128, 9, 0).unwrap_err();
+        assert!(rejected_before_launch(&error));
     }
 }

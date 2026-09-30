@@ -88,8 +88,9 @@ pub fn bf16_gemm(
 }
 
 /// Launches every row block. `Ok(false)` means the backend `rejected` the
-/// operands before launching anything, which depends only on the shape, so
-/// the caller may run the whole GEMM in another backend. Any other failure is
+/// operands before launching anything. That depends only on the shape and the
+/// operands' alignment, which every row block shares, so the first block
+/// decides and the caller may run the whole GEMM in another backend. Any other failure is
 /// returned: the cuBLASLt rerun rounds differently from the CUTLASS tiles, so
 /// recomputing after a failed launch made some calls of one shape differ from
 /// the rest.
