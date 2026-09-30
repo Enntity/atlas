@@ -92,14 +92,31 @@ pub trait NvmePrefixTier: Send + Sync {
     fn is_enabled(&self) -> bool;
 
     /// Keep a block's record when the block is restored (default: release
-    /// it). A cached full block is never rewritten, so the record stays valid
-    /// for as long as its node lives, and evicting the block again costs no
-    /// I/O at all. Kept records count against the budget, so they are only
-    /// kept while at most half of it is in use.
+    /// it), so evicting the block again costs no I/O at all. The record stays
+    /// valid only while nothing rewrites the block: a cached full block is
+    /// never APPENDED to, but a prefill that resumes below its match
+    /// recomputes the rows in between in place, with equivalent rather than
+    /// identical values — the caller must report that ([`Self::forget_kept`]).
+    /// Kept records count against the budget, so they are only kept while at
+    /// most half of it is in use.
     fn set_keep_restored(&self, keep: bool);
+
+    /// Blocks `blocks` (indices into `tokens`' cached full-block path) are
+    /// about to be rewritten in place: release the record any of them kept
+    /// from its restore, so its next eviction writes the block again. No-op
+    /// unless records are kept.
+    fn forget_kept(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        adapter_id: u64,
+        blocks: std::ops::Range<usize>,
+    );
 
     /// Find the on-disk run that continues the resident prefix of `tokens`
     /// (full blocks only) and pin the path. Empty plan ⇒ nothing to restore.
+    /// The run keeps its place in the disk LRU until it is restored: a plan
+    /// the caller declines must not keep records the budget could drop.
     fn plan_restore(&self, tokens: &[u32], block_size: usize, adapter_id: u64) -> RestorePlan;
 
     /// Finish a restore: `restored[i]` (a freshly allocated block holding

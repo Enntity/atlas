@@ -28,6 +28,18 @@ impl NvmePrefixTier for RadixTree {
         }
     }
 
+    fn forget_kept(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        adapter_id: u64,
+        blocks: std::ops::Range<usize>,
+    ) {
+        self.inner
+            .lock()
+            .nvme_forget_kept(tokens, block_size, adapter_id, blocks);
+    }
+
     fn plan_restore(&self, tokens: &[u32], block_size: usize, adapter_id: u64) -> RestorePlan {
         self.inner.lock().nvme_plan(tokens, block_size, adapter_id)
     }

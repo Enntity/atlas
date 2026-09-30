@@ -358,10 +358,15 @@ impl RadixTreeInner {
         if ids.len() == resident {
             return RestorePlan::default();
         }
+        // Pin the whole path; refresh the resident part only. The on-disk
+        // run is touched when it is restored (`nvme_complete`): a run the
+        // caller declines keeps its LRU place, so the budget can still drop it.
         let access = self.next_access();
-        for &id in &ids {
+        for (i, &id) in ids.iter().enumerate() {
             self.nodes[id].ref_count += 1;
-            self.touch(id, access);
+            if i < resident {
+                self.touch(id, access);
+            }
         }
         let disk = ids[resident..]
             .iter()
@@ -399,6 +404,7 @@ impl RadixTreeInner {
         // pin makes a mismatch impossible, but a mismatch must never place
         // bytes under the wrong node.
         let consistent = resident * bs == plan.resident_tokens;
+        let access = self.next_access();
         for (i, &block) in restored.iter().enumerate() {
             let ok = consistent
                 && run.get(i).is_some_and(|&id| {
@@ -410,6 +416,7 @@ impl RadixTreeInner {
                 give_back.extend_from_slice(&restored[i..]);
                 break;
             }
+            self.touch(run[i], access);
             adopted += 1;
         }
         if let Some(idx) = self.nvme.as_mut() {
@@ -427,6 +434,29 @@ impl RadixTreeInner {
         }
         self.dec_refs(tokens, bs, plan.pinned_tokens, adapter_id);
         give_back
+    }
+
+    /// See `NvmePrefixTier::forget_kept`. A kept record belongs to a RESIDENT
+    /// node, which is in no disk LRU: only the slot goes back.
+    pub(in crate::radix_tree) fn nvme_forget_kept(
+        &mut self,
+        tokens: &[u32],
+        bs: usize,
+        adapter_id: u64,
+        blocks: std::ops::Range<usize>,
+    ) {
+        if !self.nvme.as_ref().is_some_and(|idx| idx.keep_restored) {
+            return;
+        }
+        let (ids, resident) = self.nvme_path(tokens, bs, adapter_id);
+        for &id in ids[..resident].iter().take(blocks.end).skip(blocks.start) {
+            let slot = std::mem::replace(&mut self.nodes[id].nvme_slot, u32::MAX);
+            if slot != u32::MAX
+                && let Some(idx) = self.nvme.as_mut()
+            {
+                idx.release_slot(slot);
+            }
+        }
     }
 
     pub(in crate::radix_tree) fn nvme_spill_failed(&mut self, orders: &[SpillOrder]) -> Vec<u32> {

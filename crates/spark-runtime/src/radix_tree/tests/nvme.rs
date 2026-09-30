@@ -6,19 +6,19 @@
 use crate::prefix_cache::{NvmePrefixTier, PrefixCache, SpillOrder};
 use crate::radix_tree::RadixTree;
 
-const BS: usize = 16;
+pub(super) const BS: usize = 16;
 
-fn toks(base: u32, blocks: usize) -> Vec<u32> {
+pub(super) fn toks(base: u32, blocks: usize) -> Vec<u32> {
     (base..base + (blocks * BS) as u32).collect()
 }
 
 /// Cache a finished request: insert as a cache miss, then the sequence exits.
-fn cache(tree: &RadixTree, tokens: &[u32], blocks: &[u32]) {
+pub(super) fn cache(tree: &RadixTree, tokens: &[u32], blocks: &[u32]) {
     tree.insert(tokens, blocks, &[], BS, 0, 0);
     tree.release(tokens, BS, 0);
 }
 
-fn spilled_tree(max_slots: u32) -> RadixTree {
+pub(super) fn spilled_tree(max_slots: u32) -> RadixTree {
     let tree = RadixTree::new();
     assert!(tree.enable(max_slots));
     tree
@@ -241,24 +241,21 @@ fn budget_drops_coldest_disk_leaves_first() {
 fn colder_candidate_is_deleted_not_spilled() {
     let tree = spilled_tree(1);
     let old = toks(0, 1);
+    let held = toks(8000, 1);
     let new = toks(7000, 1);
     cache(&tree, &old, &[10]);
+    cache(&tree, &held, &[30]);
+    // A live sequence holds `held`: not evictable while the others go.
+    assert_eq!(tree.lookup(&held, BS, 0, 0).matched_blocks, vec![30]);
     cache(&tree, &new, &[20]);
-    // Touch `new` so it is hotter, spill it, then evict `old`.
-    let _ = tree.lookup(&new, BS, 0, 0);
-    tree.release(&new, BS, 0);
     // LRU picks `old` first: spilled into the only slot.
     assert_eq!(tree.evict(1).spill[0].block, 10);
     // `new` is hotter than `old`'s record: displaces it.
     assert_eq!(tree.evict(1).spill[0].block, 20);
     let s = tree.nvme_stats();
     assert_eq!((s.disk_drops, s.cold_drops), (1, 0));
-    // A block colder than the on-disk record: deleted outright.
-    let older = toks(8000, 1);
-    cache(&tree, &older, &[30]);
-    // Re-touch `new`'s disk node via a plan so its record is the hottest.
-    let plan = tree.plan_restore(&new, BS, 0);
-    tree.complete_restore(&new, BS, 0, &plan, &[], false);
+    // Released, `held` is colder than the on-disk record: deleted outright.
+    tree.release(&held, BS, 0);
     let ev = tree.evict(1);
     assert_eq!(ev.physical, vec![30]);
     assert!(ev.spill.is_empty());
@@ -310,14 +307,19 @@ fn host_bytes_per_disk_block_covers_a_node() {
     );
 }
 
-fn keeping_tree(max_slots: u32) -> RadixTree {
+pub(super) fn keeping_tree(max_slots: u32) -> RadixTree {
     let tree = spilled_tree(max_slots);
     tree.set_keep_restored(true);
     tree
 }
 
 /// Spill `blocks` of `t`, then restore the whole chain into `into`.
-fn spill_and_restore(tree: &RadixTree, t: &[u32], blocks: &[u32], into: &[u32]) -> Vec<SpillOrder> {
+pub(super) fn spill_and_restore(
+    tree: &RadixTree,
+    t: &[u32],
+    blocks: &[u32],
+    into: &[u32],
+) -> Vec<SpillOrder> {
     cache(tree, t, blocks);
     let ev = tree.evict(blocks.len());
     assert_eq!(ev.spill.len(), blocks.len());
