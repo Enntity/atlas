@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The min_tokens end-token ban must be armed on every way into decode, not
-//! only on the multi-chunk promotion.
+//! only on the multi-chunk promotion: a prompt that prefills in one chunk
+//! and a preempted sequence's re-prefill decode the same request.
 
 use super::super::sched_ctx::SchedCtx;
 use super::super::test_support::{EOS, test_request};
@@ -99,4 +100,17 @@ fn single_and_multi_chunk_prompts_get_the_same_ban() {
     );
     assert_eq!(multi.seq.eos_ban, single.seq.eos_ban);
     assert_eq!(drafter_floor(&multi.seq), single.seq.eos_ban.floor);
+}
+
+#[test]
+fn a_preempt_resume_keeps_the_min_tokens_ban() {
+    let model = PreemptStubModel::default();
+    let (mut a, _rx) = active_seq(3, 6);
+    let ban = EosBan::new(4, 64, EOS);
+    a.seq.eos_ban = ban;
+    let resumed = resume_preempted_seq(&model, preempt_requeue(&model, a)).expect("resumes");
+    // The re-prefill restamps prompt_len to the whole history; the floor is
+    // an absolute position and must survive it.
+    assert_eq!(resumed.seq.prompt_len, resumed.seq.tokens.len());
+    assert_eq!(resumed.seq.eos_ban, ban);
 }

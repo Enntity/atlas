@@ -367,7 +367,9 @@ pub(super) fn resume_preempted_seq(model: &dyn Model, p: PreemptedSeq) -> Result
     // as prefill stamped it, because it must describe what prefill actually
     // ref-bumped for `cache_sequence`'s prompt/generated split; restoring
     // the original prompt length would double-bump the pre-preemption
-    // output blocks at finish and pin them forever.
+    // output blocks at finish and pin them forever. The min_tokens floor is
+    // an absolute position, so it carries over to the new owner unchanged.
+    a.seq.eos_ban.arm(&mut seq);
     a.seq = seq;
     // The rollback ring's GPU snapshots died with the old slot; start empty
     // (identical to the disk-swap resume path).
