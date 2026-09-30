@@ -386,10 +386,12 @@ pub(super) struct ActiveSeq {
     pub pending_drafts: Vec<u32>,
     /// Top-1 LOG-probability the drafter reported for each entry of
     /// [`Self::pending_drafts`], in the same order (D-Cut's ranking key —
-    /// `mtp_dcut`). EMPTY whenever the drafts came from a path that cannot
-    /// measure confidence (per-sequence propose, N-gram/DFlash drafters), in
-    /// which case D-Cut leaves the sequence at full depth. Truncated in
-    /// lock-step with `pending_drafts` so index `j` always describes draft `j`.
+    /// `mtp_dcut`; the DFlash verify width's — `dflash_conf_width`). EMPTY
+    /// whenever the drafts came from a path that cannot measure confidence
+    /// (MTP per-sequence propose, N-gram; DFlash unless its selector reports
+    /// it), in which case both leave the sequence at full depth. Truncated in
+    /// lock-step with `pending_drafts` so index `j` always describes draft `j`;
+    /// read it through [`Self::draft_conf`].
     pub pending_draft_conf: Vec<f32>,
     /// Timestamp of the last token emission (for TBT deadline tracking).
     pub last_token_time: Instant,
@@ -420,6 +422,32 @@ pub(super) struct ActiveSeq {
 }
 
 impl ActiveSeq {
+    /// The confidences of [`Self::pending_drafts`], or none when they do not
+    /// describe them draft for draft (not measured, or stale).
+    pub(super) fn draft_conf(&self) -> &[f32] {
+        if self.pending_draft_conf.len() == self.pending_drafts.len() {
+            &self.pending_draft_conf
+        } else {
+            &[]
+        }
+    }
+
+    /// Take the pending drafts for verification with their confidences
+    /// ([`Self::draft_conf`]), leaving none pending.
+    pub(super) fn take_drafts(&mut self) -> (Vec<u32>, Vec<f32>) {
+        let conf = self.draft_conf().to_vec();
+        self.pending_draft_conf.clear();
+        (std::mem::take(&mut self.pending_drafts), conf)
+    }
+
+    /// Hold a per-sequence proposal for the next verify, with the
+    /// confidences its drafter reported for it (DFlash's selector,
+    /// `SequenceState::dflash_draft_conf`; none from any other drafter).
+    pub(super) fn set_proposed_drafts(&mut self, drafts: Vec<u32>) {
+        self.pending_draft_conf = self.seq.dflash_draft_conf().to_vec();
+        self.pending_drafts = drafts;
+    }
+
     /// Abort the sequence on an ENGINE error: records the cause so the wire
     /// finish reason is "error" (never "stop") and marks it finished.
     pub(super) fn abort_on_engine_error(&mut self, e: impl std::fmt::Display) {

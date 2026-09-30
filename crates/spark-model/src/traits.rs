@@ -348,6 +348,21 @@ impl SequenceState {
         Ok(self.expected_dspark_owner()?.slot())
     }
 
+    /// The drafter's confidence in each draft of this sequence's last
+    /// propose (log probability of the pick, draft order). Empty when the
+    /// drafter did not measure it. Read once, where the scheduler takes the
+    /// proposal: it holds the drafts' confidences from then on.
+    pub fn dflash_draft_conf(&self) -> &[f32] {
+        self.proposer_state
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .as_any()
+                    .downcast_ref::<crate::layers::DflashProposerState>()
+            })
+            .map_or(&[], |state| &state.last_draft_conf)
+    }
+
     /// SSM-pool slot index for this sequence, if it has GDN/SSM (linear-attn).
     /// layers. Used by the scheduler to order the decode batch by slot so the
     /// batched-recurrent SSM + CUDA-graph contiguity invariant holds
