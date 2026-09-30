@@ -9,7 +9,7 @@ use anyhow::Result;
 use spark_runtime::kv_cache::PagedKvCache;
 use spark_runtime::prefix_cache::PrefixMatch;
 
-use super::super::super::prefix_share::adopt_prefix_match;
+use super::super::super::prefix_share::{adopt_prefix_match, cap_prefix_match};
 use super::super::super::types::TransformerModel;
 use crate::traits::{PrefillSlice, SequenceState};
 
@@ -82,17 +82,15 @@ impl TransformerModel {
                 let local = prefix_match.matched_tokens as u32;
                 let agreed = self.ep_min_u32(local)? as usize;
                 if agreed < prefix_match.matched_tokens {
-                    self.prefix_cache.release(tokens, bs, seq.adapter_id);
-                    if agreed > 0 {
-                        prefix_match = self.prefix_cache.lookup_whole_blocks(
-                            &tokens[..agreed],
-                            bs,
-                            seq.session_hash,
-                            seq.adapter_id,
-                        );
-                    } else {
-                        prefix_match = spark_runtime::prefix_cache::PrefixMatch::empty();
-                    }
+                    prefix_match = cap_prefix_match(
+                        self.prefix_cache.as_ref(),
+                        tokens,
+                        bs,
+                        seq.session_hash,
+                        seq.adapter_id,
+                        prefix_match,
+                        agreed,
+                    );
                     tracing::info!(
                         "F83 EP-cache-sync: local_matched={local} agreed_matched={agreed} \
                          (cap to min across ranks)"
@@ -115,7 +113,7 @@ impl TransformerModel {
                 seq.prefix_ref_tokens.clear();
             }
             seq.prompt_len = total;
-            adopt_prefix_match(seq, &prefix_match, kv_cache);
+            adopt_prefix_match(seq, &prefix_match, kv_cache)?;
             // Issue #31: the prefix cache stores per-layer K/V on disk for every
             // matched block (that's the radix-tree invariant — blocks with a
             // non-MAX `disk_block_id` are fully offloaded across every attention

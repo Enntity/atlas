@@ -168,7 +168,7 @@ impl TransformerModel {
         let matched = prefix_match.matched_tokens;
         // Record the original prompt length for cache_sequence bookkeeping.
         seq.prompt_len = tokens.len();
-        adopt_prefix_match(seq, &prefix_match, &mut kv_cache);
+        adopt_prefix_match(seq, &prefix_match, &mut kv_cache)?;
 
         // Marconi: restore SSM snapshot if available (session-gated).
         // Phase 1b spill-tier fault-in (#6): fold a resident hit with a

@@ -7,8 +7,9 @@
 use super::*;
 
 /// `ATLAS_GLM_LONG_BATCH_ALIAS_CHECK`: every physical block one owner writes
-/// this step that another owner of the batch also holds, as
-/// `(block, (writer, its block index), (other owner, its block index))`.
+/// this step that is held a second time, by another owner of the batch or at
+/// another index of the writer's own table (a prefix adopted twice), as
+/// `(block, (writer, its block index), (holder, its block index))`.
 ///
 /// `owners` is each owner's `(seq_len, block_table)`. An owner writes rows
 /// `seq_len..seq_len + rows`, so only its blocks from `seq_len / block_size`
@@ -34,9 +35,10 @@ pub(super) fn write_window_aliases(
         for w_idx in owner.0 / block_size..used(owner) {
             let block = owner.1[w_idx];
             for &(o, idx) in &holders[&block] {
-                // Two writers of one block are reported once, by the first.
-                let reported = o < w && idx >= owners[o].0 / block_size;
-                if o != w && !reported {
+                // Two writing entries of one block are reported once, by the
+                // first.
+                let reported = (o, idx) < (w, w_idx) && idx >= owners[o].0 / block_size;
+                if (o, idx) != (w, w_idx) && !reported {
                     aliases.push((block, (w, w_idx), (o, idx)));
                 }
             }

@@ -104,18 +104,25 @@ fn live_donor_keeps_its_frontier_block() {
 }
 
 /// Retired donor: choices of a blocking `n > 1` request run one after another
-/// on one prompt. Choice 1 retired with its third block full of prompt tail
-/// plus generated tokens; choice 2's prompt ends inside that block.
+/// on one prompt. Choice 1 stopped six tokens past the prompt, inside the
+/// prompt's last block, and retired; choice 2's prompt ends inside that block.
 #[test]
-fn retired_donor_block_is_not_reused_by_a_shorter_prompt() {
+fn retired_donor_block_is_not_reused_by_the_next_choice() {
     let tree = RadixTree::new();
     let prompt = toks(0..PROMPT as u32);
     tree.insert(&prompt, &[10, 11, 12], &[], BS, 0, 0);
-    let finished = toks(0..(3 * BS + 9) as u32);
-    let acquired = tree.insert(&finished, &[10, 11, 12, 13], &[], BS, PROMPT, 0);
-    // Block 12 is whole and final now; block 13 is the retired frontier.
-    assert_eq!(acquired.blocks, vec![12]);
+    let finished = toks(0..(PROMPT + 6) as u32);
+    let acquired = tree.insert(&finished, &[10, 11, 12], &[], BS, PROMPT, 0);
     tree.release(&finished, BS, 0);
+    assert_eq!(assert_whole_blocks(&tree, &prompt), vec![10, 11]);
+    // Block 12 was still partly filled at retire, so it never entered the
+    // cache and went back to the pool with its sequence.
+    assert!(acquired.blocks.is_empty(), "{acquired:?}");
+    // A choice that ran past the block fills and publishes it; the next
+    // choice's prompt still ends inside it and stops before it.
+    let longer = toks(0..(3 * BS + 9) as u32);
+    let acquired = tree.insert(&longer, &[10, 11, 22, 23], &[], BS, PROMPT, 0);
+    assert_eq!(acquired.blocks, vec![22]);
     assert_eq!(assert_whole_blocks(&tree, &prompt), vec![10, 11]);
 }
 
@@ -133,29 +140,29 @@ fn strict_prefix_retry_stops_before_the_longer_prompts_block() {
     );
 }
 
-/// The four-request chain: A finishes, B re-sends A's prompt, A sends turn 2
-/// and turn 3. B never holds A's third block, so the node that A's turn 2
-/// finds already cached, and that turn 3 then matches, still holds a block
-/// only A wrote.
+/// The chain: B sends A's prompt while A is still decoding, and leaves. A
+/// retires, which caches its third block, then sends turn 2 and turn 3. B
+/// never held A's third block, so the node that A's turn 2 finds already
+/// cached, and that turn 3 then matches, holds a block only A wrote.
 #[test]
 fn chain_keeps_the_original_block_through_node_exists() {
     let tree = RadixTree::new();
     let prompt = toks(0..PROMPT as u32);
-    // A turn 1: prefill, decode, retire.
+    // A turn 1: prefilled and decoding.
     tree.insert(&prompt, &[10, 11, 12], &[], BS, 0, 0);
-    let a1 = toks(0..(3 * BS + 9) as u32);
-    tree.insert(&a1, &[10, 11, 12, 13], &[], BS, PROMPT, 0);
-    tree.release(&a1, BS, 0);
 
-    // B re-sends the prompt and generates the same tokens in its own blocks.
+    // B takes the two whole prompt blocks, not the block A is writing.
+    assert_eq!(assert_whole_blocks(&tree, &prompt), vec![10, 11]);
     let b = tree.lookup(&prompt, BS, 0, 0);
-    assert_eq!(b.matched_blocks, vec![10, 11]);
-    let b_table = [10, 11, 20, 21];
-    tree.insert(&prompt, &b_table[..3], &[], BS, b.matched_tokens, 0);
-    // Node exists for the third chunk: the cache keeps A's block 12 and
-    // takes no reference on B's block 20.
-    let acquired = tree.insert(&a1, &b_table, &[], BS, PROMPT, 0);
+    let b_table = [10, 11, 20];
+    let acquired = tree.insert(&prompt, &b_table, &[], BS, b.matched_tokens, 0);
     assert!(acquired.blocks.is_empty(), "{acquired:?}");
+    tree.release(&prompt, BS, 0);
+
+    // A retires 25 tokens past its prompt: block 12 is whole and cached now.
+    let a1 = toks(0..(3 * BS + 9) as u32);
+    let acquired = tree.insert(&a1, &[10, 11, 12, 13], &[], BS, PROMPT, 0);
+    assert_eq!(acquired.blocks, vec![12]);
     tree.release(&a1, BS, 0);
 
     // A turn 2 recomputes from the end of its first prompt's whole blocks
@@ -193,7 +200,7 @@ fn rank_min_relookup_lands_on_the_agreed_whole_blocks() {
     assert_eq!(local[0].matched_tokens, 3 * BS);
     assert_eq!(local[1].matched_tokens, 2 * BS);
     let agreed = local[0].matched_tokens.min(local[1].matched_tokens);
-    deep.release(&query, BS, 0);
+    deep.release_matched(&query, BS, local[0].matched_tokens, 0);
     let again = deep.lookup_whole_blocks(&query[..agreed], BS, 0, 0);
     assert_eq!(again.matched_tokens, agreed);
     assert_eq!(again.matched_blocks, local[1].matched_blocks);

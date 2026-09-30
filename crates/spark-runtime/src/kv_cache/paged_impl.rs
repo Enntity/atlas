@@ -229,10 +229,10 @@ impl PagedKvCache {
             self.free_block(idx);
             // A departing sequence never reads these raw index tails again. A
             // block that outlives it is one the prefix cache published: a
-            // whole block of committed tokens, whose pools are finalized. The
-            // blocks a sequence still appends to are ones it holds alone, so
-            // no other holder needs this tail, and it returns to the pool now
-            // instead of when the cache finally evicts the block.
+            // whole block of committed tokens, whose pools are finalized, and
+            // which no holder appends to (a snapshot replay over it needs no
+            // tail: the kernel skips the block). So the tail returns to the
+            // pool now instead of when the cache finally evicts the block.
             if let Some(tails) = self.tail_slots.as_mut() {
                 tails.release(idx);
             }

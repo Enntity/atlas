@@ -91,7 +91,7 @@ impl TransformerModel {
         seq.prompt_len = n;
 
         // Reuse cached blocks (inc_ref for shared ownership).
-        adopt_prefix_match(seq, &prefix_match, &mut kv_cache);
+        adopt_prefix_match(seq, &prefix_match, &mut kv_cache)?;
 
         // Allocate new blocks for the remaining (uncached) tokens.
         let blocks_needed = (n - 1) / bs + 1;

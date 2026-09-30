@@ -110,3 +110,20 @@ fn alias_check_reports_a_written_block_inside_another_owners_prefix() {
         vec![(9, (0, 2), (1, 2))]
     );
 }
+
+#[test]
+fn alias_check_reports_a_block_listed_twice_in_one_table() {
+    // A prefix adopted twice: block 8 sits at index 1 and again at index 2,
+    // where the owner's next rows land.
+    let twice = [7, 8, 8];
+    assert_eq!(
+        write_window_aliases(&[(37, &twice)], 3, 16),
+        vec![(8, (0, 2), (0, 1))]
+    );
+    // Both entries inside the write window are reported once.
+    let twice = [7, 8, 20, 20];
+    assert_eq!(
+        write_window_aliases(&[(46, &twice)], 3, 16),
+        vec![(20, (0, 2), (0, 3))]
+    );
+}

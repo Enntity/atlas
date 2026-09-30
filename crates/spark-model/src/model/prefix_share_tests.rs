@@ -2,24 +2,32 @@
 
 //! Sequences sharing one prefix cache, replayed on the host through the
 //! production lookup, adoption, block allocation, cache insert and release.
-//! Every KV row write checks that the writer holds the block alone, and every
-//! read checks that the row was computed for the reader's own token prefix.
+//! Every KV row write checks that the block holds an index tail, that no
+//! other sequence wrote it and that no other sequence holds it. Every read
+//! checks that the row was computed for the reader's own token prefix.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::adopt_prefix_match;
+use super::{adopt_prefix_match, cap_prefix_match};
 use crate::model::block_mgmt::{
-    cache_acquires_refs, ensure_blocks_through_decode, ensure_blocks_through_prefill,
+    apply_evicted_blocks, cache_acquires_refs, ensure_blocks_through_decode,
+    ensure_blocks_through_prefill,
 };
 use crate::traits::SequenceState;
 use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::kv_cache::{
     KvCacheConfig, KvCacheDtype, PagedKvCache, SparseIndexCacheConfig, TailSlotPlan,
 };
-use spark_runtime::prefix_cache::{PrefixCache, PrefixMatch};
+use spark_runtime::prefix_cache::{InsertAcquired, PrefixCache, PrefixMatch};
 use spark_runtime::radix_tree::RadixTree;
 
+#[path = "prefix_share_guard_tests.rs"]
+mod guard;
+#[path = "prefix_share_pair_tests.rs"]
+mod pair;
+
 const BS: usize = 16;
+const BLOCKS: usize = 96;
 /// A prompt that ends five tokens into its third block.
 const PROMPT: usize = 2 * BS + 5;
 
@@ -38,17 +46,22 @@ fn prefix_hash(tokens: &[u32]) -> u64 {
     })
 }
 
+/// One rank: its KV pool, its prefix cache and what every row holds.
 struct World {
     gpu: MockGpuBackend,
     kv: PagedKvCache,
     cache: RadixTree,
     /// `(block, row) -> prefix_hash` of the tokens the row was written for.
     rows: HashMap<(u32, usize), u64>,
+    /// The sequence that has written each block since it was allocated.
+    writers: HashMap<u32, usize>,
+    /// Blocks the prefix cache holds its reference on.
+    published: HashSet<u32>,
+    sequences: usize,
 }
 
 impl World {
-    /// A GLM-style cache with slotted index tails, so a tail stripped from a
-    /// block its sequence still writes fails the step.
+    /// A GLM-style cache with slotted index tails.
     fn new() -> Self {
         let gpu = MockGpuBackend::new();
         let config = KvCacheConfig {
@@ -61,7 +74,7 @@ impl World {
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         };
-        let mut kv = PagedKvCache::new(config, 96, &gpu).unwrap();
+        let mut kv = PagedKvCache::new(config, BLOCKS, &gpu).unwrap();
         let plan = TailSlotPlan {
             lag_blocks: 2,
             sequences: 4,
@@ -77,16 +90,27 @@ impl World {
             kv,
             cache: RadixTree::new(),
             rows: HashMap::new(),
+            writers: HashMap::new(),
+            published: HashSet::new(),
+            sequences: 0,
         }
     }
 
     /// Write the row for `fed[pos]` (computed over `fed[..=pos]`).
     fn write_row(&mut self, seq: &SequenceState, fed: &[u32], pos: usize) {
-        let block = seq.block_table[pos / BS];
+        let (block, me) = (seq.block_table[pos / BS], seq.slot_idx);
+        let at = format!("sequence {me} writes position {pos} into block {block}");
+        assert!(
+            !self.kv.tail_slot_missing(block),
+            "{at}, which holds no index tail"
+        );
+        let first = *self.writers.entry(block).or_insert(me);
+        assert_eq!(first, me, "{at}, which sequence {first} wrote");
+        let cache_ref = u32::from(self.published.contains(&block));
         assert_eq!(
-            self.kv.ref_count(block),
+            self.kv.ref_count(block) - cache_ref,
             1,
-            "position {pos} is written into block {block}, which has another holder"
+            "{at}, which another sequence holds"
         );
         self.rows
             .insert((block, pos % BS), prefix_hash(&fed[..=pos]));
@@ -99,18 +123,41 @@ impl World {
             assert_eq!(
                 self.rows.get(&(block, pos % BS)),
                 Some(&prefix_hash(&seq.tokens[..=pos])),
-                "row {pos} (block {block}) was not computed for this sequence's tokens"
+                "sequence {} reads row {pos} (block {block}), which was not computed for its \
+                 tokens",
+                seq.slot_idx
             );
+        }
+    }
+
+    /// The cache takes its references on the blocks an insert published.
+    fn publish(&mut self, acquired: InsertAcquired) {
+        cache_acquires_refs(&acquired, &mut self.kv);
+        self.published.extend(acquired.blocks);
+    }
+
+    /// Blocks `seq` allocated past its first `had` come from the pool: no
+    /// writer yet, and no longer the cache's if they were evicted from it.
+    fn allocated(&mut self, seq: &SequenceState, had: usize) {
+        for block in &seq.block_table[had..] {
+            self.writers.remove(block);
+            self.published.remove(block);
         }
     }
 
     /// Chunk-0 lookup through the end-of-prefill cache insert.
     fn prefill(&mut self, prompt: &[u32]) -> SequenceState {
-        let mut seq = SequenceState::host_only(0);
-        let m = self.cache.lookup_whole_blocks(prompt, BS, 0, 0);
-        adopt_prefix_match(&mut seq, &m, &mut self.kv);
+        let local = self.cache.lookup_whole_blocks(prompt, BS, 0, 0);
+        self.prefill_matched(prompt, local)
+    }
+
+    /// Adoption of `matched` through the end-of-prefill cache insert.
+    fn prefill_matched(&mut self, prompt: &[u32], matched: PrefixMatch) -> SequenceState {
+        let mut seq = SequenceState::host_only(self.sequences);
+        self.sequences += 1;
+        adopt_prefix_match(&mut seq, &matched, &mut self.kv).unwrap();
         seq.prompt_len = prompt.len();
-        let last = (prompt.len() - 1) / BS;
+        let (adopted, last) = (seq.block_table.len(), (prompt.len() - 1) / BS);
         ensure_blocks_through_prefill(
             &mut seq,
             last,
@@ -121,7 +168,8 @@ impl World {
             false,
         )
         .unwrap();
-        for pos in m.matched_tokens..prompt.len() {
+        self.allocated(&seq, adopted);
+        for pos in matched.matched_tokens..prompt.len() {
             self.write_row(&seq, prompt, pos);
         }
         seq.tokens = prompt.to_vec();
@@ -135,11 +183,12 @@ impl World {
             seq.cached_prefix_tokens,
             0,
         );
-        cache_acquires_refs(&acquired, &mut self.kv);
+        self.publish(acquired);
         seq
     }
 
     fn grow(&mut self, seq: &mut SequenceState, pos: usize) {
+        let had = seq.block_table.len();
         ensure_blocks_through_decode(
             seq,
             pos / BS,
@@ -150,6 +199,7 @@ impl World {
             false,
         )
         .unwrap();
+        self.allocated(seq, had);
     }
 
     fn decode(&mut self, seq: &mut SequenceState, tokens: &[u32]) {
@@ -177,18 +227,60 @@ impl World {
         seq.seq_len = base + accepted;
     }
 
-    /// `cache_sequence` then `free_sequence`.
-    fn retire(&mut self, seq: SequenceState) {
+    /// `free_sequence`: what a worker rank does with a finished sequence.
+    fn free(&mut self, seq: SequenceState) {
         self.read_rows(&seq);
+        self.cache.release(&seq.tokens, BS, 0);
+        self.kv.free_blocks(&seq.block_table);
+    }
+
+    /// `cache_sequence` then `free_sequence`: the head rank.
+    fn retire(&mut self, seq: SequenceState) {
         if seq.tokens.len() >= BS {
             let acquired =
                 self.cache
                     .insert(&seq.tokens, &seq.block_table, &[], BS, seq.prompt_len, 0);
-            cache_acquires_refs(&acquired, &mut self.kv);
+            self.publish(acquired);
         }
-        self.cache.release(&seq.tokens, BS, 0);
-        self.kv.free_blocks(&seq.block_table);
+        self.free(seq);
     }
+
+    /// With every sequence gone the whole cache is evictable and every block
+    /// returns to the pool: no reference was taken twice or left behind.
+    fn drain(&mut self) {
+        loop {
+            let evicted = self.cache.evict(BLOCKS);
+            if evicted.is_empty() {
+                break;
+            }
+            apply_evicted_blocks(evicted, &mut self.kv);
+        }
+        assert_eq!(self.cache.stats().0, 0, "cache nodes left unevictable");
+        assert_eq!(self.kv.num_free_blocks(), BLOCKS, "KV blocks leaked");
+    }
+}
+
+/// The block a sequence still appends to carries that sequence's reference
+/// only, from the end of prefill until the block is full and the sequence
+/// has retired.
+#[test]
+fn the_cache_takes_no_reference_on_a_block_its_sequence_still_writes() {
+    let mut w = World::new();
+    let mut seq = w.prefill(&toks(0..PROMPT as u32));
+    assert_eq!(w.kv.ref_count(seq.block_table[2]), 1);
+    assert_eq!(w.published.len(), 2);
+    w.decode(&mut seq, &toks(500..530));
+    assert_eq!(w.published.len(), 2);
+    let table = seq.block_table.clone();
+    w.retire(seq);
+    // Four whole blocks of committed tokens are cached; the fifth, partly
+    // filled, went back to the pool with its sequence.
+    assert_eq!(
+        [2, 3, 4].map(|b| w.kv.ref_count(table[b])),
+        [1, 1, 0],
+        "{table:?}"
+    );
+    w.drain();
 }
 
 /// Live donor: the same prompt arrives again while its first sequence is
@@ -200,14 +292,14 @@ fn live_donor_and_its_twin_write_their_own_blocks() {
         let mut w = World::new();
         let mut donor = w.prefill(&prompt);
         let mut twin = w.prefill(&prompt);
-        assert_eq!(twin.cached_prefix_tokens, 2 * BS);
-        assert_eq!(twin.block_table[..2], donor.block_table[..2]);
-        assert_ne!(twin.block_table[2], donor.block_table[2]);
-
         w.decode(&mut donor, &[500]);
         w.verify(&mut twin, &[600, 601, 602], 1);
         w.decode(&mut donor, &[501, 502]);
         w.verify(&mut twin, &toks(610..630), 14);
+        // The twin reused the two whole prompt blocks and nothing else.
+        assert_eq!(twin.cached_prefix_tokens, 2 * BS);
+        assert_eq!(twin.block_table[..2], donor.block_table[..2]);
+        assert_ne!(twin.block_table[2], donor.block_table[2]);
 
         let (leaver, mut stayer) = if twin_leaves_first {
             (twin, donor)
@@ -218,33 +310,44 @@ fn live_donor_and_its_twin_write_their_own_blocks() {
         // The stayer's frontier block kept its index tail and its rows.
         w.decode(&mut stayer, &toks(700..740));
         w.retire(stayer);
+        w.drain();
     }
 }
 
 /// Retired donor: the choices of a blocking `n > 1` request run one after
-/// another on one prompt, each after the previous one retired.
+/// another on one prompt, each after the previous one retired. A choice that
+/// stops inside the prompt's last block leaves that block partly filled.
 #[test]
 fn serial_choices_of_one_prompt_do_not_touch_each_other() {
     let prompt = toks(0..PROMPT as u32);
     let mut w = World::new();
     let mut first = w.prefill(&prompt);
-    let answer = toks(500..530);
+    let answer = toks(500..506);
     w.decode(&mut first, &answer);
     w.retire(first);
 
-    for choice in 1..4u32 {
+    // Choices of 5, 8, 17 and 20 tokens: inside the block and past it.
+    for choice in 1..5u32 {
         let mut seq = w.prefill(&prompt);
-        assert_eq!(seq.cached_prefix_tokens, 2 * BS, "choice {choice}");
         w.verify(&mut seq, &toks(choice * 1000..choice * 1000 + 8), 3);
-        w.decode(&mut seq, &toks(choice * 2000..choice * 2000 + 5 * choice));
+        w.decode(
+            &mut seq,
+            &toks(choice * 2000..choice * 2000 + 2 + 3 * (choice % 2)),
+        );
+        if choice > 2 {
+            w.decode(&mut seq, &toks(choice * 3000..choice * 3000 + 12));
+        }
+        assert_eq!(seq.cached_prefix_tokens, 2 * BS, "choice {choice}");
         w.retire(seq);
     }
 
     // The first choice's conversation continues and reads its own rows.
     let turn2 = join(&[&prompt, &answer, &toks(900..920)]);
     let mut seq = w.prefill(&turn2);
+    assert_eq!(seq.cached_prefix_tokens, 2 * BS);
     w.decode(&mut seq, &toks(950..960));
     w.retire(seq);
+    w.drain();
 }
 
 /// Strict-prefix retry: turn 1 is sent again after turn 2, a longer prompt
@@ -265,9 +368,9 @@ fn strict_prefix_retry_leaves_the_longer_prompt_intact() {
 
         let retry_now = |w: &mut World| {
             let mut retry = w.prefill(&turn1);
-            assert_eq!(retry.cached_prefix_tokens, 2 * BS);
             w.verify(&mut retry, &toks(7000..7008), 2);
             w.decode(&mut retry, &toks(7100..7140));
+            assert_eq!(retry.cached_prefix_tokens, 2 * BS);
             w.retire(retry);
         };
         if turn2_is_live {
@@ -281,44 +384,56 @@ fn strict_prefix_retry_leaves_the_longer_prompt_intact() {
 
         let turn3 = join(&[&turn2, &answer2, &toks(950..970)]);
         let mut seq = w.prefill(&turn3);
-        assert!(seq.cached_prefix_tokens >= turn2.len() / BS * BS);
+        assert_eq!(seq.cached_prefix_tokens, turn2.len() / BS * BS);
         w.decode(&mut seq, &toks(980..990));
         w.retire(seq);
+        w.drain();
     }
 }
 
-/// The four-request chain: A finishes, B re-sends A's prompt and generates
-/// the same answer, A sends turn 2 (whose insert finds the third chunk's
-/// node already cached) and turn 3 (which matches through that node).
+/// The chain: while A decodes, B sends A's prompt and runs one verify whose
+/// rejected drafts land on positions A already committed. B is cancelled,
+/// before or after A finishes. A's retire caches the third block. A's turn 2
+/// recomputes that span into a fresh block, but its insert finds the node and
+/// the cache keeps the block from turn 1. A's turn 3 matches through the
+/// node and reads it: every row must still be one A wrote.
 #[test]
-fn four_request_chain_reads_only_rows_written_for_it() {
+fn chain_through_a_cached_node_reads_only_rows_written_for_it() {
     let prompt = toks(0..PROMPT as u32);
     let answer = toks(500..520);
-    let mut w = World::new();
-    let mut a1 = w.prefill(&prompt);
-    w.decode(&mut a1, &answer);
-    let a1_third_block = a1.block_table[2];
-    w.retire(a1);
+    for b_leaves_first in [true, false] {
+        let mut w = World::new();
+        let mut a1 = w.prefill(&prompt);
+        w.decode(&mut a1, &answer[..4]);
 
-    let mut b = w.prefill(&prompt);
-    assert_ne!(b.block_table[2], a1_third_block);
-    // Rejected drafts are written too, then the accepted tokens over them.
-    w.verify(&mut b, &[500, 8001, 8002, 8003], 1);
-    w.decode(&mut b, &answer[1..]);
-    w.retire(b);
+        let mut b = w.prefill(&prompt);
+        w.verify(&mut b, &[answer[0], 8001, 8002, 8003], 1);
+        assert_ne!(b.block_table[2], a1.block_table[2]);
+        let mut b = Some(b);
+        if b_leaves_first {
+            w.retire(b.take().unwrap());
+        }
+        w.decode(&mut a1, &answer[4..]);
+        let a1_third_block = a1.block_table[2];
+        w.retire(a1);
+        b.into_iter().for_each(|b| w.retire(b));
 
-    let turn2 = join(&[&prompt, &answer, &toks(900..925)]);
-    let answer2 = toks(600..630);
-    let mut a2 = w.prefill(&turn2);
-    w.decode(&mut a2, &answer2);
-    w.retire(a2);
+        let turn2 = join(&[&prompt, &answer, &toks(900..925)]);
+        let answer2 = toks(600..630);
+        let mut a2 = w.prefill(&turn2);
+        assert_eq!(a2.cached_prefix_tokens, 2 * BS);
+        assert_ne!(a2.block_table[2], a1_third_block);
+        w.decode(&mut a2, &answer2);
+        w.retire(a2);
 
-    let turn3 = join(&[&turn2, &answer2, &toks(950..975)]);
-    let mut a3 = w.prefill(&turn3);
-    assert!(a3.cached_prefix_tokens >= turn2.len() / BS * BS);
-    assert_eq!(a3.block_table[2], a1_third_block);
-    w.decode(&mut a3, &toks(980..990));
-    w.retire(a3);
+        let turn3 = join(&[&turn2, &answer2, &toks(950..975)]);
+        let mut a3 = w.prefill(&turn3);
+        assert_eq!(a3.cached_prefix_tokens, turn2.len() / BS * BS);
+        assert_eq!(a3.block_table[2], a1_third_block);
+        w.decode(&mut a3, &toks(980..990));
+        w.retire(a3);
+        w.drain();
+    }
 }
 
 /// A prompt that ends on a block boundary is matched in full; the twins
@@ -337,17 +452,5 @@ fn block_aligned_prompts_share_every_prompt_block() {
     w.retire(donor);
     w.decode(&mut twin, &toks(700..720));
     w.retire(twin);
-}
-
-#[test]
-#[should_panic(expected = "whole blocks")]
-fn a_match_that_ends_inside_a_block_is_not_adopted() {
-    let mut w = World::new();
-    let block = w.kv.alloc_block().unwrap();
-    let inside = PrefixMatch {
-        matched_blocks: vec![block],
-        matched_tokens: 5,
-        ..PrefixMatch::empty()
-    };
-    adopt_prefix_match(&mut SequenceState::host_only(0), &inside, &mut w.kv);
+    w.drain();
 }
