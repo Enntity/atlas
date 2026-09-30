@@ -314,12 +314,27 @@ impl MoeLayer {
                         stream,
                     )?;
                 } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
-                    let compact = if compact_k5
+                    // Verify-decode batches: the M16 row-tile grid when
+                    // selected (ATLAS_GLM_MOE_DECODE_M16), else the compact
+                    // M64 worklist.
+                    let decode = compact_k5
                         || self.glm_c2_grouped(ctx, n)
                         || self.glm_c3_grouped(ctx, n)
                         || self.glm_c4_grouped(ctx, n)
-                        || self.independent_grouped(ctx, n)
-                    {
+                        || self.independent_grouped(ctx, n);
+                    if decode {
+                        wide = self.decode_m16_grid(
+                            expert_offsets,
+                            gp.packed_ptrs,
+                            n,
+                            total_expanded,
+                            [h, inter],
+                            num_experts,
+                            ctx,
+                            stream,
+                        )?;
+                    }
+                    let compact = if decode && wide.is_none() {
                         let total_tiles = ctx.buffers.moe_router_in_f32();
                         let worklist = total_tiles.offset(16);
                         let n_tiles = inter.div_ceil(128);
@@ -350,7 +365,7 @@ impl MoeLayer {
                     } else {
                         None
                     };
-                    if compact.is_none() {
+                    if !decode {
                         wide = self.mtile_grid(
                             expert_offsets,
                             gp.packed_ptrs,

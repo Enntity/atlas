@@ -265,6 +265,9 @@ pub struct MoeLayer {
     pub(super) moe_w4a4_prequant_t_k64_compact_gate_up: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64_vecscale_compact_gate_up: KernelHandle,
     pub(super) m16_gate_up: gate_up_m16::M16GateUp,
+    /// M16 twins of the K128W kernels for verify decode
+    /// (`ATLAS_GLM_MOE_DECODE_M16=1`), else null.
+    pub(super) decode_m16: decode_m16::DecodeM16,
     pub(super) m5_projections: m5_projections::M5Projections,
     pub(super) moe_nvfp4_mmq_gate_up_k: KernelHandle,
     pub(super) moe_nvfp4_mmq_down_k: KernelHandle,
