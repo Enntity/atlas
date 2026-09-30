@@ -396,7 +396,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF0: prefill start → chunk_len, chunk_start, full_len, then full_len tokens
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
-    /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB: GLM/vision extensions (`impl_a2_ep_worker`)
+    /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
     /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {

@@ -9,6 +9,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
+use super::rank_split_forward::HeadWalk;
 use super::{BlockDiffusionDraftHead, DflashGraphIdentity, DflashScratch, SequenceGeneration};
 use crate::layer::ForwardContext;
 
@@ -847,33 +848,72 @@ impl BlockDiffusionDraftHead {
         // capture/replay. The tail graph must not H2D a stack last_token.
         self.seed_markov_prev(last_token, ban_depth, gpu, stream, scratch)?;
 
+        // Graph identity: (block_table_ptr, ctx_accumulator_ptr, lane).
+        // Device addresses are REUSED across seq churn (a finished seq
+        // frees its block table + ctx accumulator; the next seq often
+        // lands on the same addresses), so keying by the block table
+        // alone lets a new seq replay a dead seq's captured graphs —
+        // baked with the dead seq's ctx accumulator and possibly a
+        // different lane's scratch (silent garbage drafts, accept 0).
+        // A triple-collision (same bt, same ctx acc, same lane) is a
+        // semantically correct replay: every baked pointer resolves to
+        // the new seq's live data. Anything else misses and recaptures.
+        let graph_identity = || {
+            DflashGraphIdentity::new(
+                graph_owner,
+                option_b_block_table.map(|p| p.0).unwrap_or(0),
+                ctx_buffer.map(|(p, _)| p.0).unwrap_or(0),
+                scratch.markov_prev_dev.0,
+                graph_lane,
+            )
+        };
+
+        // ATLAS_GLM_DRAFT_TP: the worker rank reads half of the MLP and head
+        // rows. The same layer loop and tail, as pieces with swaps between
+        // them (`rank_split`).
+        let rank_split = self
+            .rank_split_with(ctx.comm, grammar_bitmask.is_some())
+            .filter(|_| option_b_on && !defer_readback);
+
         // Phase F.2: piecewise capture/replay path. Only enabled for
         // option_b (paged) — legacy path stays single-shot eager since
         // it's not graph-ready and exists only for ablation.
-        if graph_eligible && option_b_on {
+        if let Some((split, comm)) = rank_split {
+            let args =
+                |layer_idx: usize| make_paged_args(layer_idx).expect("option_b args available");
+            let select = || {
+                self.argmax_block_logits(
+                    last_token,
+                    ban_depth,
+                    norm_noise_local,
+                    gpu,
+                    stream,
+                    scratch,
+                    markov_embed,
+                    markov_bias,
+                )
+            };
+            let walker = HeadWalk {
+                head: self,
+                split,
+                comm,
+                ctx,
+                scratch,
+                stream,
+                args: &args,
+                tail: &run_tail,
+                select: &select,
+            };
+            let graph_key = graph_eligible.then(graph_identity).transpose()?;
+            self.walk_split(&split.geometry.steps(0), &walker, graph_key)?;
+        } else if graph_eligible && option_b_on {
             // Subgraph slot layout: [pre_0, post_0, ..., pre_{N-1}, post_{N-1}, tail].
             // 2 × num_layers + 1 slots total.
             let num_layers = self.layers.len();
             let total_slots = num_layers * 2 + 1;
             let tail_slot = num_layers * 2;
 
-            // Graph identity: (block_table_ptr, ctx_accumulator_ptr, lane).
-            // Device addresses are REUSED across seq churn (a finished seq
-            // frees its block table + ctx accumulator; the next seq often
-            // lands on the same addresses), so keying by the block table
-            // alone lets a new seq replay a dead seq's captured graphs —
-            // baked with the dead seq's ctx accumulator and possibly a
-            // different lane's scratch (silent garbage drafts, accept 0).
-            // A triple-collision (same bt, same ctx acc, same lane) is a
-            // semantically correct replay: every baked pointer resolves to
-            // the new seq's live data. Anything else misses and recaptures.
-            let graph_key = DflashGraphIdentity::new(
-                graph_owner,
-                option_b_block_table.map(|p| p.0).unwrap_or(0),
-                ctx_buffer.map(|(p, _)| p.0).unwrap_or(0),
-                scratch.markov_prev_dev.0,
-                graph_lane,
-            )?;
+            let graph_key = graph_identity()?;
             let mut gmap = self.propose_graphs.lock();
             let cached_ready = gmap
                 .get(&graph_key)
