@@ -3,7 +3,9 @@
 //! The prefix-cache policy (`pc_policy`): placement arithmetic, and the
 //! two-rank restore-depth agreement.
 
-use super::{Agreed, agree_restore, branch_checkpoint_at, branch_split_at, tail_cut};
+use super::{
+    Agreed, agree_restore, branch_checkpoint_at, branch_split_at, layer_write_floor, tail_cut,
+};
 
 const BS: usize = 16;
 
@@ -165,4 +167,32 @@ fn a_rank_with_nothing_to_restore_forces_a_full_recompute() {
         assert_eq!(a, ((0, Agreed::None), 1));
         assert_eq!(b, ((0, Agreed::None), 1));
     }
+}
+
+/// `ATLAS_GLM_PC_WRITE_FLOOR`: a recompute-all prefix hit (base floor 0)
+/// floors each pass at the rows it spends under the radix match. Off, on any
+/// model but GLM, and for every Marconi replay and cold pass, the base floor
+/// is unchanged.
+#[test]
+fn write_floor_covers_the_matched_rows_of_a_recompute() {
+    let glm = |base, matched, start, rows| {
+        layer_write_floor(true, "glm5_next", base, matched, start, rows)
+    };
+    // Off, or another hybrid: whatever the base chose.
+    for (base, matched) in [(0, 0), (0, 4096), (32, 4096)] {
+        for (flag, model) in [(false, "glm5_next"), (true, "qwen3_next")] {
+            let floor = layer_write_floor(flag, model, base, matched, 0, 8192);
+            assert_eq!(floor, base, "{flag} {model}");
+        }
+    }
+    // Cold (no match): nothing to protect.
+    assert_eq!(glm(0, 0, 0, 4096), 0);
+    // A 20 000-token match recomputed in 8192-row chunks: the first two are
+    // wholly shared, the third is shared up to the match, later ones are new.
+    assert_eq!(glm(0, 20_000, 0, 8192), 8192);
+    assert_eq!(glm(0, 20_000, 8192, 8192), 8192);
+    assert_eq!(glm(0, 20_000, 16_384, 8192), 3616);
+    assert_eq!(glm(0, 20_000, 24_576, 100), 0);
+    // A Marconi replay already floors at the match: the flag adds nothing.
+    assert_eq!(glm(32, 4096, 4064, 500), 32);
 }
