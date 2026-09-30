@@ -98,6 +98,7 @@ impl Qwen3AttentionLayer {
             block_table: meta.block_table,
             rows: 1,
             end: pos.map(|p| p as usize + 1),
+            queries_swapped: false,
         };
         self.glm_shard_merge_attention(kv_cache, ctx, rows, attn_out, stream)
     }

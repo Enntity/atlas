@@ -18,12 +18,19 @@
 //!   whole latent history — its own blocks plus the peer's, exchanged — in a
 //!   scratch view the unchanged kernels read through an identity table.
 //!
+//! Two opt-in refinements of the merge form, both exact:
+//! `ATLAS_GLM_KV_SHARD_COMPACT=1` packs each row's owned IDs to the front so
+//! the attention kernels walk only the tokens this rank stores, and merges
+//! the peer's partial where it landed; `ATLAS_GLM_KV_SHARD_OVERLAP=1` runs
+//! the two exchanges on a side stream beside the compute they do not depend
+//! on ([`overlapped_exchange`]).
+//!
 //! This module holds the policy, the scratch layout both forms carve from
 //! the shard's one allocation, and the pair exchange.
 
 use anyhow::{Result, bail, ensure};
-use spark_runtime::gpu::DevicePtr;
-use spark_runtime::kv_cache::{KvCacheConfig, LatentShard, LatentShardSpec};
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::kv_cache::{ExchangeLane, KvCacheConfig, LatentShard, LatentShardSpec};
 
 /// Heads per rank (GLM-5.3: 64 heads over TP2) = one sparse-kernel launch.
 pub const HEADS: u32 = 32;
@@ -68,6 +75,42 @@ pub fn requested() -> Result<bool> {
 pub fn check_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| flag("ATLAS_GLM_KV_SHARD_CHECK").unwrap_or(false))
+}
+
+/// The merge form's opt-in refinements, read once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MergeTuning {
+    /// `ATLAS_GLM_KV_SHARD_COMPACT=1`.
+    pub compact: bool,
+    /// `ATLAS_GLM_KV_SHARD_OVERLAP=1`; off under `..._CHECK=1`, whose own
+    /// exchange would run inside an overlap window.
+    pub overlap: bool,
+}
+
+impl MergeTuning {
+    fn parse(compact: Option<&str>, overlap: Option<&str>, check: bool) -> Result<Self> {
+        Ok(Self {
+            compact: parse("ATLAS_GLM_KV_SHARD_COMPACT", compact)?,
+            overlap: parse("ATLAS_GLM_KV_SHARD_OVERLAP", overlap)? && !check,
+        })
+    }
+
+    pub fn get() -> Result<Self> {
+        static TUNING: std::sync::OnceLock<Result<MergeTuning, String>> =
+            std::sync::OnceLock::new();
+        TUNING
+            .get_or_init(|| {
+                let var = |name: &str| std::env::var(name).ok();
+                Self::parse(
+                    var("ATLAS_GLM_KV_SHARD_COMPACT").as_deref(),
+                    var("ATLAS_GLM_KV_SHARD_OVERLAP").as_deref(),
+                    check_requested(),
+                )
+                .map_err(|e| format!("{e:#}"))
+            })
+            .clone()
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 fn align(bytes: usize) -> usize {
@@ -146,6 +189,12 @@ impl MergeLayout {
     pub fn partial_bytes(rows: u32) -> usize {
         rows as usize * HEADS as usize * (LATENT as usize + 1) * 4
     }
+
+    /// Per-row owned-ID counts `u32[rows]` of the compact form, which merges
+    /// the peer's partial in place and so leaves the last own partition free.
+    pub fn counts(&self, rows: u32, splits: u32) -> usize {
+        self.own_o + splits as usize * rows as usize * (HEADS * LATENT) as usize * 4
+    }
 }
 
 /// The shard scratch carved by both attention forms and the cache write.
@@ -173,10 +222,14 @@ pub struct ScratchLayout {
 impl ScratchLayout {
     pub fn new(view_blocks: usize, write_rows: usize, block_bytes: usize) -> Self {
         let piece_bytes = PIECE_BLOCKS * block_bytes;
-        let merge = (1..=MERGE_MAX_ROWS as u32)
-            .map(|rows| MergeLayout::new(rows, merge_splits(rows)).total)
-            .max()
-            .unwrap_or(0);
+        // Every sharded attention and cache write asks for the layout.
+        static WIDEST_MERGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let merge = *WIDEST_MERGE.get_or_init(|| {
+            (1..=MERGE_MAX_ROWS as u32)
+                .map(|rows| MergeLayout::new(rows, merge_splits(rows)).total)
+                .max()
+                .unwrap_or(0)
+        });
         let mut at = 0usize;
         let mut take = |bytes: usize| {
             let offset = at;
@@ -268,6 +321,31 @@ pub fn pair_exchange(
     comm.send_to(send.0, bytes, peer, stream)?;
     comm.recv_from(recv.0, bytes, peer, stream)?;
     comm.group_end()
+}
+
+/// [`pair_exchange`] on the shard's side stream, so the compute stream runs
+/// `during` while the payload is in flight, and waits for it to land after.
+///
+/// `during` must not read `recv`, write `send`, or use the pair (no
+/// all-reduce, no exchange): the pair orders its sends by stream order, and
+/// only this fence orders the side stream against the compute stream. The
+/// wait is enqueued even when `during` fails. Both ranks run the same
+/// exchanges in the same order, so an overlap only moves where each waits.
+pub fn overlapped_exchange<T>(
+    gpu: &dyn GpuBackend,
+    comm: &dyn spark_comm::CommBackend,
+    lane: ExchangeLane,
+    (send, recv, bytes): (DevicePtr, DevicePtr, usize),
+    stream: u64,
+    during: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    gpu.record_event(lane.begun, stream)?;
+    gpu.stream_wait_event(lane.stream, lane.begun)?;
+    pair_exchange(comm, send, recv, bytes, lane.stream)?;
+    gpu.record_event(lane.landed, lane.stream)?;
+    let out = during();
+    gpu.stream_wait_event(stream, lane.landed)?;
+    out
 }
 
 #[cfg(test)]

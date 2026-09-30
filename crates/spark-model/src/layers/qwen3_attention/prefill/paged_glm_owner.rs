@@ -88,6 +88,8 @@ pub(super) struct Bf16LatentView {
 impl Qwen3AttentionLayer {
     /// Owner-batched projections for a verify batch (several owners, few
     /// rows), when the scratch holds every row; `None` projects per owner.
+    /// `solo` also batches a single owner, whose queries are then ready
+    /// before its selection (the same projections, in a different order).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_owner_projections(
         &self,
@@ -96,6 +98,7 @@ impl Qwen3AttentionLayer {
         q_latent: DevicePtr,
         rows: usize,
         nq: usize,
+        solo: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<GlmOwnerProjections>> {
@@ -114,7 +117,7 @@ impl Qwen3AttentionLayer {
         let latent_row = nq * kv_lora * 2;
         let sizes = ctx.buffers.sizes();
         if !on
-            || owners.len() < 2
+            || owners.len() < if solo { 1 } else { 2 }
             || rows > 64
             || sizes.ssm_qkvz < 2 * rows * key_row
             || sizes.ssm_deinterleaved < rows * (latent_row + query_row)

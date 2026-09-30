@@ -218,6 +218,35 @@ pub(crate) fn launch_merge_f32(
     )
 }
 
+/// `glm_sparse_decode_split_merge_extra` over `rows` x 32 heads: the BF16
+/// merge of `splits` partitions plus one more at `extra` (FP32 output then
+/// LSE, as [`launch_merge_f32`] writes them) as the last partition.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_merge_extra(
+    gpu: &dyn GpuBackend,
+    part: DevicePtr,
+    plse: DevicePtr,
+    out: DevicePtr,
+    lse: DevicePtr,
+    rows: u32,
+    splits: u32,
+    extra: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    let k = gpu.op_cache().kernel(
+        gpu,
+        "glm_sparse_decode_split_merge",
+        "glm_sparse_decode_split_merge_extra",
+    )?;
+    ensure!(
+        k.0 != 0 && splits < 16 && extra.0 != 0,
+        "GLM extra-partition split merge needs its kernel, a partial and at most 15 splits"
+    );
+    merge_launch(gpu, k, part, plse, out, lse, rows, rows * 32, splits)
+        .arg_ptr(extra)
+        .launch(stream)
+}
+
 /// `glm_sparse_decode_split_merge` over `grid` = rows x 32 heads.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_merge(
@@ -232,6 +261,22 @@ pub(crate) fn launch_merge(
     splits: u32,
     stream: u64,
 ) -> Result<()> {
+    merge_launch(gpu, k, part, plse, out, lse, rows, grid, splits).launch(stream)
+}
+
+/// The arguments every split-merge entry point shares.
+#[allow(clippy::too_many_arguments)]
+fn merge_launch<'a>(
+    gpu: &'a dyn GpuBackend,
+    k: KernelHandle,
+    part: DevicePtr,
+    plse: DevicePtr,
+    out: DevicePtr,
+    lse: DevicePtr,
+    rows: u32,
+    grid: u32,
+    splits: u32,
+) -> KernelLaunch<'a> {
     KernelLaunch::new(gpu, k)
         .grid([grid, 1, 1])
         .block([256, 1, 1])
@@ -243,7 +288,6 @@ pub(crate) fn launch_merge(
         .arg_u32(32)
         .arg_u32(512)
         .arg_u32(splits)
-        .launch(stream)
 }
 
 pub fn initialize_glm_sparse_decode_split(gpu: &dyn GpuBackend, c: &ModelConfig) -> Result<()> {

@@ -30,7 +30,13 @@ pub(in crate::layers::qwen3_attention) struct ShardRows {
     pub rows: u32,
     /// The last row's causal extent when the host knows it (table check).
     pub end: Option<usize>,
+    /// The peer's queries are already in the merge scratch
+    /// ([`Qwen3AttentionLayer::glm_shard_swap_queries_during`]).
+    pub queries_swapped: bool,
 }
+
+#[path = "paged_glm_shard_merge.rs"]
+mod merge;
 
 fn owner_rank(s: &LatentShard) -> ops::ShardRank {
     ops::ShardRank {
@@ -110,6 +116,64 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
+    /// Whether exchanges of this cache's merge-form owners overlap compute
+    /// (`ATLAS_GLM_KV_SHARD_OVERLAP=1` on a sharded cache, outside capture).
+    pub(super) fn glm_shard_overlaps(
+        &self,
+        kv_cache: &PagedKvCache,
+        ctx: &ForwardContext,
+    ) -> Result<bool> {
+        Ok(kv_cache.latent_shard().is_some()
+            && !ctx.graph_capture
+            && shard::MergeTuning::get()?.overlap)
+    }
+
+    /// `[k, v, block table]` a view-form owner's kernels read: its assembled
+    /// history under a shard, else the layer's pools and its own table.
+    pub(super) fn glm_owner_latents(
+        &self,
+        kv_cache: &PagedKvCache,
+        ctx: &ForwardContext,
+        o: &super::GlmChunkOwner,
+        end: usize,
+        stream: u64,
+    ) -> Result<[DevicePtr; 3]> {
+        if kv_cache.latent_shard().is_none() {
+            return Ok([
+                kv_cache.k_pool_ptr(self.attn_layer_idx),
+                kv_cache.v_pool_ptr(self.attn_layer_idx),
+                o.meta.block_table,
+            ]);
+        }
+        let (view, identity) =
+            self.glm_shard_assemble_view(kv_cache, ctx, o.meta.block_table, end, stream)?;
+        Ok([view, view, identity])
+    }
+
+    /// `ATLAS_GLM_KV_SHARD_OVERLAP=1`: swap a merge-form owner's absorbed
+    /// `query` rows with the peer while `during` (its index update and
+    /// selection, which never use the pair for so few rows) runs. Returns
+    /// whether the peer's queries are in the merge scratch.
+    pub(super) fn glm_shard_swap_queries_during<T>(
+        &self,
+        kv_cache: &PagedKvCache,
+        ctx: &ForwardContext,
+        rows: usize,
+        query: DevicePtr,
+        stream: u64,
+        during: impl FnOnce() -> Result<T>,
+    ) -> Result<(T, bool)> {
+        if rows > shard::MERGE_MAX_ROWS || !self.glm_shard_overlaps(kv_cache, ctx)? {
+            return Ok((during()?, false));
+        }
+        let (s, comm, layout) = pair(kv_cache, ctx)?;
+        let m = MergeLayout::new(rows as u32, shard::merge_splits(rows as u32));
+        let q_peer = s.scratch.offset(layout.work + m.q_peer);
+        let swap = (query, q_peer, rows * (HEADS * LATENT) as usize * 2);
+        let out = shard::overlapped_exchange(ctx.gpu, comm, s.lane, swap, stream, during)?;
+        Ok((out, true))
+    }
+
     /// Merge form: this rank's heads' attention over the selected tokens of
     /// BOTH ranks into `output` (`[rows, 32, 512]` BF16). Each rank attends
     /// every head over the tokens it stores; the peer's heads' partial is
@@ -139,90 +203,24 @@ impl Qwen3AttentionLayer {
             let words = s.scratch.offset(layout.check);
             self.glm_shard_check(&s, comm, gpu, words, &table, stream)?;
         }
-        let splits = shard::merge_splits(a.rows);
-        let m = MergeLayout::new(a.rows, splits);
-        ensure!(
-            layout.work + m.total <= layout.total,
-            "GLM KV shard merge scratch overflow"
-        );
-        let at = |offset: usize| s.scratch.offset(layout.work + offset);
-        let rows = a.rows as usize;
-        let part = rows * (HEADS * LATENT) as usize * 4;
-        let lse = rows * HEADS as usize * 4;
-
-        // 1. Swap queries: the peer's heads attend over this rank's tokens too.
-        let q_bytes = rows * (HEADS * LATENT) as usize * 2;
-        shard::pair_exchange(comm, a.query, at(m.q_peer), q_bytes, stream)?;
-        // 2. Selected IDs -> local token IDs; the peer's tokens become -1.
-        ops::glm_kv_shard_localize(
-            gpu,
-            a.selected,
-            at(m.ids),
-            a.block_table,
-            a.rows,
-            WIDTH,
-            16,
-            owner_rank(&s),
-            a.causal_start,
-            stream,
-        )?;
-        let pool = kv_cache.latent_pool_ptr(self.attn_layer_idx);
         let hd = self.mla.as_ref().map_or(0, |m| m.nope) as u32;
-        let tc = |query: DevicePtr| ops::GlmSparsePrefillTc {
-            config: ctx.config,
-            dtype: self.kv_dtype,
-            identical_kv_latent: true,
-            query,
-            k_cache: pool,
-            v_cache: pool,
-            indices: at(m.ids),
-            output,
-            block_table: s.identity,
-            rows: a.rows,
-            heads: HEADS,
-            head_dim: LATENT,
-            index_width: WIDTH,
-            block_size: 16,
-            scale: self.effective_attn_scale(hd),
-        };
-        // 3. The peer's heads over this rank's tokens: one FP32 partial + LSE.
-        let send = at(m.send);
-        if splits == 1 {
-            ops::launch_sparse_partials(
-                gpu,
-                &tc(at(m.q_peer)),
-                1,
-                send,
-                send.offset(part),
-                stream,
-            )?;
-        } else {
-            let peer_heads = tc(at(m.q_peer));
-            let (po, pl) = (at(m.peer_o), at(m.peer_lse));
-            ops::launch_sparse_partials(gpu, &peer_heads, splits, po, pl, stream)?;
-            ops::launch_merge_f32(gpu, po, pl, send, send.offset(part), a.rows, splits, stream)?;
-        }
-        let recv = at(m.recv);
-        shard::pair_exchange(comm, send, recv, MergeLayout::partial_bytes(a.rows), stream)?;
-        // 4. This rank's heads: its own partitions, then the peer's partial
-        //    as partition `splits`, in one LSE merge to BF16.
-        let (own_o, own_lse) = (at(m.own_o), at(m.own_lse));
-        ops::launch_sparse_partials(gpu, &tc(a.query), splits, own_o, own_lse, stream)?;
-        let tail = splits as usize;
-        gpu.copy_d2d_async(recv, own_o.offset(tail * part), part, stream)?;
-        gpu.copy_d2d_async(recv.offset(part), own_lse.offset(tail * lse), lse, stream)?;
-        ops::launch_merge(
+        let tuning = shard::MergeTuning::get()?;
+        merge::ShardMerge {
             gpu,
-            ops::merge_kernel(gpu)?,
-            own_o,
-            own_lse,
-            output,
-            at(m.out_lse),
-            a.rows,
-            a.rows * HEADS,
-            splits + 1,
-            stream,
-        )
+            comm,
+            config: ctx.config,
+            shard: s,
+            work: layout.work,
+            work_bytes: layout.total - layout.work,
+            dtype: self.kv_dtype,
+            pool: kv_cache.latent_pool_ptr(self.attn_layer_idx),
+            scale: self.effective_attn_scale(hd),
+            tuning: shard::MergeTuning {
+                overlap: tuning.overlap && !ctx.graph_capture,
+                ..tuning
+            },
+        }
+        .run(a, output, stream)
     }
 
     /// [`Self::glm_shard_merge_attention`] for one few-row prefill or verify
@@ -234,7 +232,7 @@ impl Qwen3AttentionLayer {
         kv_cache: &PagedKvCache,
         ctx: &ForwardContext,
         o: &super::GlmChunkOwner,
-        query: DevicePtr,
+        (query, queries_swapped): (DevicePtr, bool),
         selected: Option<(DevicePtr, u32)>,
         output: DevicePtr,
         stream: u64,
@@ -252,6 +250,7 @@ impl Qwen3AttentionLayer {
             block_table: o.meta.block_table,
             rows: o.rows as u32,
             end: Some(o.seq_len_start + o.rows),
+            queries_swapped,
         };
         self.glm_shard_merge_attention(kv_cache, ctx, rows, output, stream)
     }

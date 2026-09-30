@@ -16,6 +16,23 @@ fn flag_is_explicit() {
     }
 }
 
+#[test]
+fn merge_tuning_is_explicit_and_the_check_keeps_exchanges_inline() {
+    let t = |c, o, check| MergeTuning::parse(c, o, check).unwrap();
+    assert_eq!(t(None, None, false), MergeTuning::default());
+    assert_eq!(t(Some("0"), Some("0"), false), MergeTuning::default());
+    let both = MergeTuning {
+        compact: true,
+        overlap: true,
+    };
+    assert_eq!(t(Some("1"), Some("1"), false), both);
+    // The check's own exchange would fall inside an overlap window.
+    assert!(!t(Some("1"), Some("1"), true).overlap);
+    assert!(t(Some("1"), Some("1"), true).compact);
+    assert!(MergeTuning::parse(Some("yes"), None, false).is_err());
+    assert!(MergeTuning::parse(None, Some("2"), false).is_err());
+}
+
 fn disjoint(regions: &[(usize, usize)]) -> bool {
     let mut sorted = regions.to_vec();
     sorted.sort_unstable();
@@ -45,6 +62,11 @@ fn merge_layout_regions_are_aligned_and_disjoint() {
         assert!(disjoint(&regions), "rows {rows}");
         assert!(regions.iter().all(|&(o, _)| o % 256 == 0));
         assert!(regions.iter().all(|&(o, n)| o + n <= m.total));
+        // The compact form's row counts sit in the own partition the
+        // in-place merge leaves free, past the `splits` it fills.
+        let counts = m.counts(rows, splits);
+        assert_eq!(counts, m.own_o + s * part);
+        assert!(counts + r * 4 <= m.own_o + (s + 1) * part && counts.is_multiple_of(4));
     }
 }
 
@@ -202,4 +224,175 @@ fn a_rank_owning_nothing_contributes_nothing() {
     // Nothing selected at all: zeros, as the unsharded kernel writes.
     let none = sharded(&q, &keys, &[-1, -1], |_| 0, 0, 2, 0.5);
     assert!(none.iter().all(|&v| v == 0.0));
+}
+
+/// CPU mirror of `glm_kv_shard_localize_compact` for one row: 256 threads
+/// of `ceil(width / 256)` consecutive IDs, kept IDs packed by an exclusive
+/// scan of the threads' counts, dropped ones behind them. Returns the row
+/// and its count.
+fn compact_row(selected: &[i32], owner: impl Fn(usize) -> usize, rank: usize) -> (Vec<i32>, usize) {
+    let width = selected.len();
+    let chunk = width.div_ceil(256);
+    let kept: Vec<Vec<i32>> = (0..256)
+        .map(|t| {
+            let (begin, end) = ((t * chunk).min(width), ((t + 1) * chunk).min(width));
+            selected[begin..end]
+                .iter()
+                .copied()
+                .filter(|&id| id >= 0 && owner(id as usize) == rank)
+                .collect()
+        })
+        .collect();
+    let total: usize = kept.iter().map(Vec::len).sum();
+    let mut out = vec![i32::MIN; width];
+    let mut before = 0;
+    for (t, ids) in kept.iter().enumerate() {
+        let (begin, end) = ((t * chunk).min(width), ((t + 1) * chunk).min(width));
+        out[before..before + ids.len()].copy_from_slice(ids);
+        let dropped = begin - before;
+        let n = (end - begin) - ids.len();
+        out[total + dropped..total + dropped + n].fill(-1);
+        before += ids.len();
+    }
+    (out, total)
+}
+
+/// The counted split kernel's partition `z` of a row of `count` IDs over
+/// `splits`: whole 32-ID tiles, `ceil(tiles / splits)` each.
+fn counted_partition(count: usize, splits: usize, z: usize) -> std::ops::Range<usize> {
+    let per = count.div_ceil(32).div_ceil(splits);
+    let begin = (z * per * 32).min(count);
+    begin..(begin + per * 32).min(count)
+}
+
+#[test]
+fn compaction_is_a_stable_partition_with_its_count() {
+    let owner = |t: usize| (t / 16) % 2;
+    for width in [1usize, 31, 256, 257, 2051, 4096] {
+        let selected: Vec<i32> = (0..width as i32)
+            .map(|i| if i % 7 == 3 { -1 } else { (i * 37) % 5000 })
+            .collect();
+        for rank in 0..2 {
+            let (row, count) = compact_row(&selected, owner, rank);
+            let want: Vec<i32> = selected
+                .iter()
+                .copied()
+                .filter(|&t| t >= 0 && owner(t as usize) == rank)
+                .collect();
+            assert_eq!(count, want.len(), "width {width}");
+            assert_eq!(row[..count], want[..], "width {width}");
+            assert!(row[count..].iter().all(|&t| t == -1), "width {width}");
+        }
+    }
+}
+
+#[test]
+fn counted_partitions_tile_the_compact_prefix() {
+    for count in (0..=WIDTH as usize).step_by(7).chain([1, 32, 33, 2051]) {
+        for splits in 1..=MAX_SPLITS as usize {
+            let mut next = 0;
+            for z in 0..splits {
+                let range = counted_partition(count, splits, z);
+                assert_eq!(
+                    range.start,
+                    next.min(count),
+                    "count {count} splits {splits}"
+                );
+                next = range.end;
+            }
+            assert_eq!(next, count, "count {count} splits {splits}");
+        }
+    }
+}
+
+#[test]
+fn compact_owner_split_lse_merge_equals_full_softmax_attention() {
+    let (dim, tokens) = (64usize, 600usize);
+    let keys: Vec<Vec<f32>> = (0..tokens).map(|t| values(t as u64 + 11, dim)).collect();
+    let q = values(3, dim);
+    let scale = 0.0625;
+    let mut selected: Vec<i32> = (0..tokens as i32).rev().filter(|t| t % 5 != 2).collect();
+    selected.extend([-1, -1]);
+    let all: Vec<Option<usize>> = selected
+        .iter()
+        .map(|&t| (t >= 0).then_some(t as usize))
+        .collect();
+    let (want, _) = partial(&q, &keys, &all, scale);
+    // Parity blocks, and a lopsided shard (rank 1 stores only a few tokens).
+    let owners: [fn(usize) -> usize; 2] = [|t| (t / 16) % 2, |t| usize::from(t >= 560)];
+    for owner in owners {
+        for rank in 0..2 {
+            for splits in [1usize, 6, 15] {
+                // Each rank's compact row, split as the counted kernel does.
+                let parts_of = |r: usize| -> Vec<(Vec<f32>, f32)> {
+                    let (row, count) = compact_row(&selected, owner, r);
+                    (0..splits)
+                        .map(|z| {
+                            let ids: Vec<Option<usize>> = row[counted_partition(count, splits, z)]
+                                .iter()
+                                .map(|&t| Some(t as usize))
+                                .collect();
+                            partial(&q, &keys, &ids, scale)
+                        })
+                        .collect()
+                };
+                // The peer's partial is merged where it landed: last.
+                let mut own = parts_of(rank);
+                own.push(merge(&parts_of(1 - rank)));
+                let (got, _) = merge(&own);
+                for (g, w) in got.iter().zip(&want) {
+                    assert!((g - w).abs() <= 1e-5 * w.abs().max(1.0), "{g} vs {w}");
+                }
+            }
+        }
+    }
+}
+
+use crate::layers::ops::shard_test_gpu::{ShardGpu, ShardPair};
+
+const LANE: ExchangeLane = ExchangeLane {
+    stream: 7,
+    begun: 21,
+    landed: 22,
+};
+
+#[test]
+fn an_overlapped_exchange_runs_on_the_lane_fenced_around_the_compute() {
+    let gpu = ShardGpu::default();
+    let pair = ShardPair { gpu: &gpu, rank: 0 };
+    let payload = (DevicePtr(0x100), DevicePtr(0x200), 4096);
+    let during = || {
+        gpu.record_event(99, 3)?; // stands for the compute-stream launches
+        Ok(5)
+    };
+    assert_eq!(
+        overlapped_exchange(&gpu, &pair, LANE, payload, 3, during).unwrap(),
+        5
+    );
+    assert_eq!(
+        gpu.order(),
+        [
+            // The lane sees everything the compute stream produced so far...
+            "record e21 s3",
+            "wait s7 e21",
+            "exchange 4096 s7",
+            "record e22 s7",
+            // ...the compute continues meanwhile...
+            "record e99 s3",
+            // ...and meets the landed payload before it goes on.
+            "wait s3 e22",
+        ]
+    );
+}
+
+#[test]
+fn a_failed_overlap_window_still_waits_for_the_exchange() {
+    let gpu = ShardGpu::default();
+    let pair = ShardPair { gpu: &gpu, rank: 1 };
+    let payload = (DevicePtr(0x100), DevicePtr(0x200), 64);
+    let failed = overlapped_exchange(&gpu, &pair, LANE, payload, 3, || -> Result<()> {
+        bail!("selection failed")
+    });
+    assert!(failed.is_err());
+    assert_eq!(gpu.order().last().map(String::as_str), Some("wait s3 e22"));
 }

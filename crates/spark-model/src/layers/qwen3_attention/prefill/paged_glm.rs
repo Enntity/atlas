@@ -208,6 +208,7 @@ impl Qwen3AttentionLayer {
             q_latent,
             num_tokens,
             nq as usize,
+            self.glm_shard_overlaps(kv_cache, ctx)?,
             ctx,
             stream,
         )?;
@@ -226,32 +227,40 @@ impl Qwen3AttentionLayer {
             let o_normed = normed.offset(o.row0 * h as usize * bf16);
             let o_latent = q_latent.offset(o.row0 * q_lora as usize * bf16);
             let rows_of = |base: DevicePtr, row_bytes: usize| base.offset(o.row0 * row_bytes);
-            self.glm_index_prefill_cache_update(
-                o_normed,
-                on,
-                kv_cache,
-                &octx,
-                stream,
-                batched.map(|b| (rows_of(b.keys, b.key_row), rows_of(b.gates, b.key_row))),
-            )?;
-            let sparse_indices = if use_dense {
-                None
-            } else {
-                Some(self.glm_index_prefill_select(
-                    o_latent,
+            let select = || {
+                self.glm_index_prefill_cache_update(
                     o_normed,
                     on,
-                    o.seq_len_start,
                     kv_cache,
                     &octx,
                     stream,
-                    batched.map(|b| {
-                        (
-                            rows_of(b.index_query, b.query_row),
-                            rows_of(b.weights, b.weight_row),
-                        )
-                    }),
-                )?)
+                    batched.map(|b| (rows_of(b.keys, b.key_row), rows_of(b.gates, b.key_row))),
+                )?;
+                if use_dense {
+                    return Ok(None);
+                }
+                let projected = batched.map(|b| {
+                    (
+                        rows_of(b.index_query, b.query_row),
+                        rows_of(b.weights, b.weight_row),
+                    )
+                });
+                let start = o.seq_len_start;
+                self.glm_index_prefill_select(
+                    o_latent, o_normed, on, start, kv_cache, &octx, stream, projected,
+                )
+                .map(Some)
+            };
+            // Queries projected ahead of the selection (owner-batched) can be
+            // swapped with the peer of a sharded cache while it runs.
+            let (sparse_indices, queries_swapped) = match batched {
+                Some(b) => {
+                    let query = rows_of(b.q_absorbed, latent_row);
+                    self.glm_shard_swap_queries_during(
+                        kv_cache, &octx, o.rows, query, stream, select,
+                    )?
+                }
+                None => (select()?, false),
             };
             let q_absorbed = match batched {
                 Some(b) => rows_of(b.q_absorbed, latent_row),
@@ -281,7 +290,7 @@ impl Qwen3AttentionLayer {
                     kv_cache,
                     &octx,
                     o,
-                    q_absorbed,
+                    (q_absorbed, queries_swapped),
                     sparse_indices,
                     attn_latent,
                     stream,
@@ -289,22 +298,8 @@ impl Qwen3AttentionLayer {
             } else {
                 // Sharded latents: assemble this owner's whole history (own
                 // blocks + the peer's) and read it through an identity table.
-                let (k_source, v_source, table_source) = if sharded {
-                    let (view, identity) = self.glm_shard_assemble_view(
-                        kv_cache,
-                        &octx,
-                        o.meta.block_table,
-                        sequence_end,
-                        stream,
-                    )?;
-                    (view, view, identity)
-                } else {
-                    (
-                        kv_cache.k_pool_ptr(self.attn_layer_idx),
-                        kv_cache.v_pool_ptr(self.attn_layer_idx),
-                        o.meta.block_table,
-                    )
-                };
+                let [k_source, v_source, table_source] =
+                    self.glm_owner_latents(kv_cache, &octx, o, sequence_end, stream)?;
                 // The BF16 dense and native kernels read an fp8_g128 owner through
                 // a dequantized view; long owners and verify rows read FP8 directly.
                 let view = self.glm_owner_bf16_view(

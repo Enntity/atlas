@@ -210,6 +210,13 @@ pub(super) fn shard_plan(
         )),
         "ATLAS_GLM_KV_SHARD=1 needs a BF16 or fp8_g128 latent cache on every layer"
     );
+    // Junk tuning values fail the boot, not the first request.
+    let tuning = crate::layers::glm_kv_shard::MergeTuning::get()?;
+    tracing::info!(
+        "KV latent shard merge form: compact={} overlap={}",
+        tuning.compact,
+        tuning.overlap
+    );
     // A cache write carries at most one chunk of rows (plus verify slack).
     let spec = crate::layers::glm_kv_shard::spec(
         comm.rank(),

@@ -7,6 +7,9 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 const MODULE: &str = "glm_kv_shard";
+/// `glm_kv_shard_localize_compact` packs a row in one CTA: 256 threads of
+/// `GLM_KV_SHARD_COMPACT_CHUNK` (16) IDs.
+const COMPACT_MAX_WIDTH: u32 = 256 * 16;
 
 fn kernel(gpu: &dyn GpuBackend, symbol: &'static str) -> Result<KernelHandle> {
     let k = gpu.op_cache().kernel(gpu, MODULE, symbol)?;
@@ -50,12 +53,15 @@ pub fn glm_kv_shard_map_slots(
 /// Selected token IDs `[rows, width]` → this rank's local token IDs
 /// (addressed through the shard's identity table), `-1` where the peer owns
 /// the block. `selected == None` generates causal IDs: row `r` keeps tokens
-/// `[0, causal_start + r + 1)`.
+/// `[0, causal_start + r + 1)`. With `counts` (`u32[rows]`) each row's owned
+/// IDs are packed to its front in selected order and counted there
+/// (`ATLAS_GLM_KV_SHARD_COMPACT=1`); `out` must then not alias `selected`.
 #[allow(clippy::too_many_arguments)]
 pub fn glm_kv_shard_localize(
     gpu: &dyn GpuBackend,
     selected: Option<DevicePtr>,
     out: DevicePtr,
+    counts: Option<DevicePtr>,
     block_table: DevicePtr,
     rows: u32,
     width: u32,
@@ -68,11 +74,27 @@ pub fn glm_kv_shard_localize(
         rows > 0 && rows <= 65535 && width > 0,
         "GLM KV shard localize needs 1..=65535 rows"
     );
-    KernelLaunch::new(gpu, kernel(gpu, "glm_kv_shard_localize")?)
-        .grid([div_ceil(width, 256), rows, 1])
-        .block([256, 1, 1])
-        .arg_ptr(selected.unwrap_or(DevicePtr::NULL))
-        .arg_ptr(out)
+    let selected = selected.unwrap_or(DevicePtr::NULL);
+    let launch = match counts {
+        Some(counts) => {
+            ensure!(
+                width <= COMPACT_MAX_WIDTH && selected != out,
+                "GLM KV shard compaction takes up to {COMPACT_MAX_WIDTH} IDs out of place"
+            );
+            KernelLaunch::new(gpu, kernel(gpu, "glm_kv_shard_localize_compact")?)
+                .grid([rows, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(selected)
+                .arg_ptr(out)
+                .arg_ptr(counts)
+        }
+        None => KernelLaunch::new(gpu, kernel(gpu, "glm_kv_shard_localize")?)
+            .grid([div_ceil(width, 256), rows, 1])
+            .block([256, 1, 1])
+            .arg_ptr(selected)
+            .arg_ptr(out),
+    };
+    launch
         .arg_ptr(block_table)
         .arg_u32(rows)
         .arg_u32(width)
@@ -117,3 +139,11 @@ pub fn glm_kv_shard_copy_blocks(
         .arg_u32((block_bytes / 16) as u32)
         .launch(stream)
 }
+
+#[cfg(test)]
+#[path = "glm_kv_shard_test_gpu.rs"]
+pub(crate) mod shard_test_gpu;
+
+#[cfg(test)]
+#[path = "glm_kv_shard_tests.rs"]
+mod tests;
