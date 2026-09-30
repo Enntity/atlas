@@ -75,7 +75,9 @@ pub fn bf16_gemm(
         }
         // The cuBLASLt rerun below rounds differently from the CUTLASS tiles,
         // so a fallback that only sometimes fires makes prefill irreproducible.
-        tracing::warn!("bf16_gemm: CUTLASS rejected {m}x{n}x{k} config {cfg}; rerunning in cuBLASLt");
+        tracing::warn!(
+            "bf16_gemm: CUTLASS rejected {m}x{n}x{k} config {cfg}; rerunning in cuBLASLt"
+        );
     }
     spark_runtime::cublaslt::bf16_gemm_act_weight_t(act.0, weight, out.0, m, n, k, stream)
 }
