@@ -18,6 +18,7 @@ mod cache_skip_qkv;
 mod cache_skip_v4;
 mod glm_index;
 mod glm_index_split;
+pub use glm_index_split::agree_index_split;
 mod paged;
 mod paged_attn;
 mod paged_attn_batched;

@@ -49,6 +49,7 @@ pub use innerq_driver::InnerQDriver;
 // existing ones. These are only constructed under DeepSeek-V4 detection.
 pub use glm_sparse_graphs_policy::glm_multi_seq_sparse_graphs_enabled;
 pub(crate) use hc_prefill::{hc_post_pre_prefill_fused, hc_pre_prefill_mix};
+pub use prefill::agree_index_split;
 pub(crate) use types::HeadGateActivation;
 pub use types::Qwen3AttentionLayer;
 pub use types_weights::{

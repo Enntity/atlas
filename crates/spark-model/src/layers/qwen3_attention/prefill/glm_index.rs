@@ -331,7 +331,6 @@ impl Qwen3AttentionLayer {
             split.exchange(
                 selected,
                 scratch,
-                n as usize,
                 output_row_bytes,
                 self.attn_layer_idx,
                 ctx,

@@ -13,17 +13,20 @@
 //! A row's work grows with its causal extent, so the rows are cut into
 //! zigzag quarters: rank 0 selects Q0 and Q3, rank 1 selects Q1 and Q2
 //! (equal work), then the equal-sized pairs Q0<->Q1 and Q3<->Q2 are
-//! exchanged on the copy-engine pair. The projections and the index-cache
-//! update stay replicated. Every eligibility input is mirrored on both ranks,
-//! since one rank splitting alone would deadlock the pair.
+//! exchanged on the copy-engine pair. Both ranks select the 0-3 rows past
+//! the last whole quarter. The projections and the index-cache update stay
+//! replicated. Every eligibility input is mirrored on both ranks, since one
+//! rank splitting alone would deadlock the pair; the settings themselves
+//! are compared across the ranks at startup (`agree_index_split`).
 //!
 //! `ATLAS_GLM_INDEX_SPLIT_CHECK=1` also selects every row into scratch and
-//! fails the request on any difference.
+//! fails the request on both ranks on any difference.
 
 use std::ops::Range;
 
 use anyhow::{Result, bail, ensure};
-use spark_runtime::gpu::DevicePtr;
+use spark_comm::CommBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use crate::layer::ForwardContext;
 use crate::layers::glm_sp;
@@ -36,48 +39,84 @@ const MIN_ROWS: usize = 256;
 /// the halved selection starts to outweigh the row's exchange.
 const DEFAULT_MIN_CTX: usize = 4096;
 
-fn flag(name: &str) -> bool {
-    std::env::var(name).as_deref() == Ok("1")
+/// This process's split settings, when `ATLAS_GLM_INDEX_SPLIT=1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Settings {
+    /// History (`seq_len_start`) an owner needs to split,
+    /// `ATLAS_GLM_INDEX_SPLIT_MIN_CTX`.
+    min_ctx: usize,
+    /// `ATLAS_GLM_INDEX_SPLIT_CHECK=1`.
+    check: bool,
 }
 
-/// Whether `ATLAS_GLM_INDEX_SPLIT=1`.
-fn requested() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| flag("ATLAS_GLM_INDEX_SPLIT"))
+impl Settings {
+    /// What the ranks must agree on: `[on, min_ctx, check]`.
+    fn words(settings: Option<Self>) -> [u64; 3] {
+        settings.map_or([0; 3], |s| [1, s.min_ctx as u64, s.check as u64])
+    }
 }
 
-/// Whether `ATLAS_GLM_INDEX_SPLIT_CHECK=1`.
-fn check_requested() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| flag("ATLAS_GLM_INDEX_SPLIT_CHECK"))
+/// The settings `var` gives, or why its `ATLAS_GLM_INDEX_SPLIT_MIN_CTX` is
+/// junk (ignored while the split is off).
+fn parse_settings(var: impl Fn(&str) -> Option<String>) -> Result<Option<Settings>, String> {
+    let on = |name| var(name).as_deref() == Some("1");
+    if !on("ATLAS_GLM_INDEX_SPLIT") {
+        return Ok(None);
+    }
+    let min_ctx = match var("ATLAS_GLM_INDEX_SPLIT_MIN_CTX") {
+        None => DEFAULT_MIN_CTX,
+        Some(v) => v.parse().map_err(|_| {
+            format!("ATLAS_GLM_INDEX_SPLIT_MIN_CTX must be a token count, got {v:?}")
+        })?,
+    };
+    Ok(Some(Settings {
+        min_ctx,
+        check: on("ATLAS_GLM_INDEX_SPLIT_CHECK"),
+    }))
 }
 
-fn parse_min_ctx(value: Option<&str>) -> Result<usize, String> {
-    value.map_or(Ok(DEFAULT_MIN_CTX), |v| {
-        v.parse()
-            .map_err(|_| format!("ATLAS_GLM_INDEX_SPLIT_MIN_CTX must be a token count, got {v:?}"))
-    })
+/// This process's settings, read from its environment once.
+fn settings() -> Result<Option<Settings>> {
+    static S: std::sync::OnceLock<Result<Option<Settings>, String>> = std::sync::OnceLock::new();
+    S.get_or_init(|| parse_settings(|name| std::env::var(name).ok()))
+        .clone()
+        .map_err(anyhow::Error::msg)
 }
 
-/// History (`seq_len_start`) an owner needs to split,
-/// `ATLAS_GLM_INDEX_SPLIT_MIN_CTX`.
-fn min_ctx() -> Result<usize> {
-    static N: std::sync::OnceLock<Result<usize, String>> = std::sync::OnceLock::new();
-    N.get_or_init(|| {
-        parse_min_ctx(
-            std::env::var("ATLAS_GLM_INDEX_SPLIT_MIN_CTX")
-                .ok()
-                .as_deref(),
-        )
-    })
-    .clone()
-    .map_err(anyhow::Error::msg)
+/// Call on every rank right after a multi-rank communicator comes up. Fails
+/// on a junk `ATLAS_GLM_INDEX_SPLIT_MIN_CTX`, and on any rank whose split
+/// settings differ from rank 0's: a rank splitting alone would deadlock
+/// the pair at the first owner whose history falls between the two.
+pub fn agree_index_split(comm: &dyn CommBackend, gpu: &dyn GpuBackend) -> Result<()> {
+    agree(settings()?, comm, gpu)
 }
 
-/// Whether an owner of `rows` rows continuing at `seq_len_start` splits:
-/// equal quarters and enough history per row.
+fn agree(ours: Option<Settings>, comm: &dyn CommBackend, gpu: &dyn GpuBackend) -> Result<()> {
+    let ours = Settings::words(ours);
+    let bytes: Vec<u8> = ours.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut head = vec![0u8; bytes.len()];
+    let buf = gpu.alloc(bytes.len())?;
+    let sent = gpu
+        .copy_h2d(&bytes, buf)
+        .and_then(|()| comm.broadcast(buf.0, bytes.len(), 0))
+        .and_then(|()| gpu.copy_d2h(buf, &mut head));
+    gpu.free(buf)?;
+    sent?;
+    let head: Vec<u64> = head
+        .chunks(8)
+        .map(|w| u64::from_le_bytes(w.try_into().expect("8-byte words")))
+        .collect();
+    ensure!(
+        head == ours,
+        "ATLAS_GLM_INDEX_SPLIT settings [on, min_ctx, check] differ across the pair: rank {} has {ours:?}, rank 0 has {head:?}",
+        comm.rank()
+    );
+    Ok(())
+}
+
+/// Whether an owner of `rows` rows continuing at `seq_len_start` splits.
 fn admits(rows: usize, seq_len_start: usize, min_ctx: usize) -> bool {
-    rows >= MIN_ROWS && rows.is_multiple_of(4) && seq_len_start >= min_ctx
+    rows >= MIN_ROWS && seq_len_start >= min_ctx
 }
 
 /// One exchanged pair of quarters: this rank's selected rows at `own` go to
@@ -93,6 +132,7 @@ struct Swap {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct IndexSplit {
     swaps: [Swap; 2],
+    rows: usize,
     check: bool,
 }
 
@@ -106,10 +146,24 @@ impl IndexSplit {
         row_bytes: usize,
         ctx: &ForwardContext,
     ) -> Result<Option<Self>> {
-        let Some(comm) = ctx.comm.filter(|_| requested()) else {
+        let settings = if ctx.comm.is_some() {
+            settings()?
+        } else {
+            None
+        };
+        Self::plan_with(settings, rows, seq_len_start, row_bytes, ctx)
+    }
+
+    fn plan_with(
+        settings: Option<Settings>,
+        rows: usize,
+        seq_len_start: usize,
+        row_bytes: usize,
+        ctx: &ForwardContext,
+    ) -> Result<Option<Self>> {
+        let (Some(Settings { min_ctx, check }), Some(comm)) = (settings, ctx.comm) else {
             return Ok(None);
         };
-        let min_ctx = min_ctx()?;
         let eligible = !ctx.graph_capture
             && ctx.config.tp_world_size == 2
             && comm.world_size() == 2
@@ -118,7 +172,6 @@ impl IndexSplit {
         if !eligible {
             return Ok(None);
         }
-        let check = check_requested();
         ensure!(
             !check || ctx.buffers.sizes().expert_down_out >= 2 * rows * row_bytes,
             "ATLAS_GLM_INDEX_SPLIT_CHECK: no scratch for {rows} replicated rows"
@@ -132,11 +185,12 @@ impl IndexSplit {
         });
         Ok(Some(Self {
             swaps: Self::zigzag(rows, comm.rank()),
+            rows,
             check,
         }))
     }
 
-    /// Zigzag quarters of an owner's `rows` (a multiple of 4) for `rank`:
+    /// Zigzag quarters of an owner's first `4 * (rows / 4)` rows for `rank`:
     /// pair k is (rank 0's quarter, rank 1's quarter).
     fn zigzag(rows: usize, rank: usize) -> [Swap; 2] {
         let q = rows / 4;
@@ -146,19 +200,30 @@ impl IndexSplit {
         })
     }
 
-    /// The rows this rank selects.
-    fn own(&self) -> [Range<usize>; 2] {
-        self.swaps.map(|s| s.own..s.own + s.rows)
+    /// The rows this rank selects, merged into contiguous ranges: its two
+    /// quarters and the rows past the last whole quarter, which both ranks
+    /// select (rank 0's Q3 runs into them, rank 1's Q1 into its Q2).
+    fn own(&self) -> Vec<Range<usize>> {
+        let tail = 4 * self.swaps[0].rows..self.rows;
+        let mut ranges: Vec<_> = self.swaps.iter().map(|s| s.own..s.own + s.rows).collect();
+        ranges.push(tail);
+        ranges.sort_by_key(|r| r.start);
+        let mut own: Vec<Range<usize>> = Vec::new();
+        for r in ranges.into_iter().filter(|r| !r.is_empty()) {
+            match own.last_mut() {
+                Some(last) if last.end == r.start => last.end = r.end,
+                _ => own.push(r),
+            }
+        }
+        own
     }
 
     /// Swap this rank's finished rows of `selected` for the peer's. Under the
-    /// check, then compare all `rows` with the replicated rows in `scratch`.
-    #[allow(clippy::too_many_arguments)]
+    /// check, then compare every row with the replicated rows in `scratch`.
     pub(super) fn exchange(
         &self,
         selected: DevicePtr,
         scratch: DevicePtr,
-        rows: usize,
         row_bytes: usize,
         layer: usize,
         ctx: &ForwardContext,
@@ -175,17 +240,41 @@ impl IndexSplit {
                 stream,
             )?;
         }
-        if !self.check {
-            return Ok(());
+        if self.check {
+            self.check(selected, scratch, row_bytes, layer, ctx, stream)?;
         }
-        let bytes = rows * row_bytes;
+        Ok(())
+    }
+
+    /// Compare every row of `selected` with the replicated rows in `scratch`,
+    /// then swap the verdicts (first differing row + 1, or 0) through
+    /// `scratch` and fail on both ranks if either saw a difference, so the
+    /// pair stops at the same collective instead of one rank running on.
+    fn check(
+        &self,
+        selected: DevicePtr,
+        scratch: DevicePtr,
+        row_bytes: usize,
+        layer: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let (rows, bytes) = (self.rows, self.rows * row_bytes);
         let (mut split, mut replicated) = (vec![0u8; bytes], vec![0u8; bytes]);
         ctx.gpu.copy_d2h_on_stream(selected, &mut split, stream)?;
         ctx.gpu
             .copy_d2h_on_stream(scratch, &mut replicated, stream)?;
-        if let Some(row) = first_mismatch(&split, &replicated, row_bytes) {
+        let here = first_mismatch(&split, &replicated, row_bytes);
+        let verdict = here.map_or(0, |row| row as u64 + 1).to_le_bytes();
+        let theirs = scratch.offset(verdict.len());
+        ctx.gpu.copy_h2d_async(&verdict, scratch, stream)?;
+        glm_sp::exchange_rows(scratch, theirs, 1, verdict.len(), false, ctx, stream)?;
+        let mut peer = [0u8; 8];
+        ctx.gpu.copy_d2h_on_stream(theirs, &mut peer, stream)?;
+        let peer = u64::from_le_bytes(peer).checked_sub(1);
+        if here.is_some() || peer.is_some() {
             bail!(
-                "ATLAS_GLM_INDEX_SPLIT_CHECK: layer {layer} row {row} of {rows} differs from the replicated selection"
+                "ATLAS_GLM_INDEX_SPLIT_CHECK: layer {layer}: the split selection of {rows} rows differs from the replicated selection (first differing row: here {here:?}, peer {peer:?})"
             );
         }
         tracing::info!("ATLAS_GLM_INDEX_SPLIT_CHECK ok layer={layer} rows={rows}");
@@ -195,7 +284,7 @@ impl IndexSplit {
 
 /// The selection passes of an owner of `rows` rows, as row ranges and the
 /// output each lands in: every row into `selected` when replicated; split,
-/// this rank's quarters, then (check) every row again into `scratch`.
+/// this rank's rows, then (check) every row again into `scratch`.
 pub(super) fn passes(
     split: Option<IndexSplit>,
     rows: usize,
@@ -233,127 +322,5 @@ fn first_mismatch(a: &[u8], b: &[u8], row_bytes: usize) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Owner row counts the production pieces produce: the 8196-row first
-    /// chunk's 4096 and 2052 pieces, full 4096 pieces, warm appends.
-    const ROWS: [usize; 6] = [256, 512, 1024, 2052, 3000, 4096];
-
-    fn split(rows: usize, rank: usize, check: bool) -> IndexSplit {
-        IndexSplit {
-            swaps: IndexSplit::zigzag(rows, rank),
-            check,
-        }
-    }
-
-    #[test]
-    fn quarters_tile_the_owner_once_and_pair_symmetrically() {
-        for rows in ROWS.into_iter().filter(|r| r % 4 == 0) {
-            let (r0, r1) = (IndexSplit::zigzag(rows, 0), IndexSplit::zigzag(rows, 1));
-            let mut seen = vec![0u8; rows];
-            for s in r0.iter().chain(&r1) {
-                assert_eq!(s.rows, rows / 4);
-                seen[s.own..s.own + s.rows].iter_mut().for_each(|c| *c += 1);
-            }
-            assert!(seen.iter().all(|&c| c == 1), "rows {rows}");
-            // Pair k: what one rank sends lands where the other expects it,
-            // and both ranks exchange the same byte count in the same order.
-            for k in 0..2 {
-                assert_eq!((r0[k].own, r0[k].peer), (r1[k].peer, r1[k].own));
-                assert_eq!(r0[k].rows, r1[k].rows);
-            }
-        }
-        let q = 1024;
-        assert_eq!(
-            IndexSplit::zigzag(4 * q, 0),
-            [
-                Swap {
-                    own: 0,
-                    peer: q,
-                    rows: q
-                },
-                Swap {
-                    own: 3 * q,
-                    peer: 2 * q,
-                    rows: q
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn zigzag_balances_causal_work_exactly() {
-        // A row's logits and top-k scale with its causal extent.
-        for rows in ROWS.into_iter().filter(|r| r % 4 == 0) {
-            for start in [0, 2048, 6144, 8196, 100_000, 524_288] {
-                let work = |rank| -> usize {
-                    split(rows, rank, false)
-                        .own()
-                        .into_iter()
-                        .flatten()
-                        .map(|row| start + row + 1)
-                        .sum()
-                };
-                assert_eq!(work(0), work(1), "rows {rows} start {start}");
-            }
-        }
-    }
-
-    #[test]
-    fn admits_long_aligned_owners_only() {
-        let min = 4096;
-        // Later 8K-chunk pieces and the first chunk's 2052-row tail piece.
-        assert!(admits(4096, 8196, min));
-        assert!(admits(2052, 6144, min));
-        // A warm 512-row append at long context.
-        assert!(admits(512, 200_000, min));
-        // The first chunk's 4096-row piece has too little history.
-        assert!(!admits(4096, 2048, min));
-        // Unequal quarters, verify-sized owners and 4-row tails.
-        assert!(!admits(2050, 8196, min));
-        assert!(!admits(3001, 8196, min));
-        assert!(!admits(64, 100_000, min));
-        assert!(!admits(4, 16_388, min));
-        assert!(admits(4096, 0, 0));
-    }
-
-    #[test]
-    fn min_ctx_defaults_to_4096_and_rejects_junk() {
-        assert_eq!(parse_min_ctx(None), Ok(4096));
-        assert_eq!(parse_min_ctx(Some("16384")), Ok(16384));
-        assert_eq!(parse_min_ctx(Some("0")), Ok(0));
-        assert!(parse_min_ctx(Some("4k")).is_err());
-    }
-
-    #[test]
-    fn passes_cover_own_rows_and_the_check_recompute() {
-        let (sel, scratch) = (DevicePtr(0x1000), DevicePtr(0x9000));
-        assert_eq!(passes(None, 4096, sel, scratch), [(0..4096, sel)]);
-        assert_eq!(
-            passes(Some(split(4096, 0, false)), 4096, sel, scratch),
-            [(0..1024, sel), (3072..4096, sel)]
-        );
-        assert_eq!(
-            passes(Some(split(4096, 1, true)), 4096, sel, scratch),
-            [(1024..2048, sel), (2048..3072, sel), (0..4096, scratch)]
-        );
-    }
-
-    #[test]
-    fn tiles_bound_each_pass_like_the_replicated_loop() {
-        let (a, b) = (DevicePtr(0x10), DevicePtr(0x20));
-        let t: Vec<_> = tiles(&[(0..700, a)], 300).collect();
-        assert_eq!(t, [(0, 300, a), (300, 300, a), (600, 100, a)]);
-        let t: Vec<_> = tiles(&[(0..513, a), (1539..2052, a), (0..2052, b)], 2052).collect();
-        assert_eq!(t, [(0, 513, a), (1539, 513, a), (0, 2052, b)]);
-    }
-
-    #[test]
-    fn mismatch_reports_the_first_differing_row() {
-        let a = [1u8, 2, 3, 4, 5, 6];
-        assert_eq!(first_mismatch(&a, &a, 2), None);
-        assert_eq!(first_mismatch(&a, &[1, 2, 3, 4, 5, 7], 2), Some(2));
-        assert_eq!(first_mismatch(&a, &[1, 2, 0, 4, 0, 6], 2), Some(1));
-    }
-}
+#[path = "glm_index_split_tests.rs"]
+mod tests;
