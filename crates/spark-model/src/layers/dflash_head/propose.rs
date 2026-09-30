@@ -678,7 +678,7 @@ impl BlockDiffusionDraftHead {
         let mut used_lanes: Vec<usize> = Vec::with_capacity(lanes_n.min(n));
         let mut seen = vec![false; lanes_n];
         let mut lane_last_use: Vec<Option<usize>> = vec![None; lanes_n];
-        let mut out: Vec<Option<Vec<u32>>> = vec![None; n];
+        let mut out: Vec<Option<(Vec<u32>, Vec<f32>)>> = vec![None; n];
         let mut lane_scratch_list: Vec<&DflashScratch> = Vec::with_capacity(n);
         for i in 0..n {
             let lane = {
@@ -729,10 +729,12 @@ impl BlockDiffusionDraftHead {
                 out[i] = Some(self.read_deferred_drafts(ctx.gpu, lane_scratch_list[i], cap)?);
             }
         }
-        let out: Vec<Vec<u32>> = out.into_iter().map(|o| o.unwrap_or_default()).collect();
-        for (i, drafts) in out.iter().enumerate() {
+        let (out, confs): (Vec<Vec<u32>>, Vec<Vec<f32>>) =
+            out.into_iter().map(Option::unwrap_or_default).unzip();
+        for (i, (drafts, conf)) in out.iter().zip(confs).enumerate() {
             if let Some(dstate) = states[i].as_any_mut().downcast_mut::<DflashProposerState>() {
                 dstate.last_num_drafted = drafts.len();
+                dstate.last_draft_conf = conf;
             }
         }
         if self.startup.diagnostics.verify_trace {

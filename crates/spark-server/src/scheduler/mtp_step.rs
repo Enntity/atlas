@@ -153,17 +153,19 @@ pub fn step_mtp(
                     // run one decode_verify_batched over every ready seq.
                     // In-loop step_verify_dflash left only 1 seq with drafts
                     // (shared propose scratch / graph) and never hit Phase B.
+                    a.set_proposed_drafts(init);
                     if n_active >= 2 && !dspark_batch_verify_disabled() {
-                        a.pending_drafts = init;
                         late_dflash.push(idx);
                         continue;
                     }
+                    let (init, conf) = a.take_drafts();
                     if dflash_verify_raw_argmax || glm_repaired_narrow {
                         step_verify_dflash(
                             model,
                             a,
                             sched,
                             &init,
+                            &conf,
                             num_drafts,
                             verify_ctx,
                             dflash_verify_raw_argmax,
@@ -388,7 +390,7 @@ pub fn step_mtp(
             ) {
                 Ok(drafts) if !drafts.is_empty() => {
                     tracing::debug!("MTP bootstrap: tok={tok} → drafts={drafts:?}");
-                    a.pending_drafts = drafts;
+                    a.set_proposed_drafts(drafts);
                 }
                 Ok(_) => {
                     tracing::warn!("MTP propose returned empty");
@@ -595,14 +597,12 @@ pub fn step_mtp(
     );
     for &idx in &serial_idxs {
         let a = &mut active[idx];
-        let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
-        // Confidences describe the taken drafts; clearing here is the single
-        // place the two vectors are kept in lock-step for the serial path.
-        a.pending_draft_conf.clear();
+        // Confidences travel with the taken drafts and are cut with them.
+        let (mut drafts, mut conf) = a.take_drafts();
         if drafts.is_empty() {
             continue;
         }
-        lone_dflash_width(a, &mut drafts, dflash_verify_raw_argmax);
+        lone_dflash_width(a, &conf, &mut drafts, dflash_verify_raw_argmax);
 
         // Spec-decode boundary awareness (arXiv:2512.15834): when a
         // grammar is active, validate the draft sequence against the
@@ -623,6 +623,7 @@ pub fn step_mtp(
             }
         }
         ladder_truncate(a, &mut drafts, ladder_nd);
+        conf.truncate(drafts.len());
 
         // DFlash/DSpark verify: route by proposer, not draft count.
         // `--dflash` sets dflash_verify_raw_argmax. The old `drafts.len()>=4`
@@ -633,6 +634,7 @@ pub fn step_mtp(
                 a,
                 sched,
                 &drafts,
+                &conf,
                 num_drafts,
                 verify_ctx,
                 dflash_verify_raw_argmax,

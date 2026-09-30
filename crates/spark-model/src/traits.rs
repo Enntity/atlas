@@ -350,7 +350,8 @@ impl SequenceState {
 
     /// The drafter's confidence in each draft of this sequence's last
     /// propose (log probability of the pick, draft order). Empty when the
-    /// drafter did not measure it.
+    /// drafter did not measure it. Read once, where the scheduler takes the
+    /// proposal: it holds the drafts' confidences from then on.
     pub fn dflash_draft_conf(&self) -> &[f32] {
         self.proposer_state
             .as_ref()

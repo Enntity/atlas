@@ -7,13 +7,19 @@
 //! same rows whether or not the drafter was sure of this block: prose pays
 //! for rows that are rejected, and a sure run inside prose is cut short. The
 //! DFlash2 selector reports, per draft, the log-probability of its pick among
-//! the candidates it scored (`SequenceState::dflash_draft_conf`). A
-//! calibration table learned while serving turns that into the chance the
-//! target accepts the draft once it accepted the ones before it; the running
+//! the candidates it scored; it rides with the drafts in
+//! `ActiveSeq::pending_draft_conf` and is cut with them. A calibration table
+//! learned while serving turns that into the chance the target accepts the
+//! draft once it accepted the ones before it; the running
 //! product is the draft's survival. The step verifies the width that
 //! maximizes the owners' expected tokens less the price of its rows, a row
 //! being worth `ATLAS_DFLASH_CONF_TAU` tokens (default 0.3): for one owner
 //! that cuts the draft at the first position whose survival is below it.
+//! Rows are priced with today's step cost ([`step_ms`]); the throughput-
+//! optimal price per row is the tokens per millisecond the step achieves
+//! times the row's cost, 0.21..0.38 tokens across prose, code and four
+//! streams, over which the gain simulated from logged acceptance is flat
+//! within half a point, so one fixed price serves them all.
 //!
 //! Verification is exact at any width, so only the rows per step change.
 //! The drafter has already run; the cut rows are simply never launched.
@@ -29,7 +35,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use super::dflash_width::{MAX_DRAFTS, step_ms};
+use super::dflash_width::MAX_DRAFTS;
 
 /// Confidence bin edges (log-probability of the pick); bin `b` holds
 /// confidences in `[EDGES[b - 1], EDGES[b])`.
@@ -125,10 +131,34 @@ pub(crate) const DEFAULT_PARAMS: Params = Params {
     probe: 64,
 };
 
-/// Milliseconds one more row costs a lone owner (the measured table's
-/// 3..=8-row slope): the row `tau` prices.
+/// Step ms for `owners` owners verifying `rows` rows each, from the release
+/// engine's nsys step profile of 2026-09-30 (GLM-5.3 Flash TP2 GB10, prose,
+/// rank 0 step period by verify rows): one owner 44.4 ms + 5.68 ms a row
+/// (3..=8 rows; 5.3 ms of each row is MoE), four owners 109.8 ms + 3.2 ms an
+/// owner-row (16..=32 rows). Two and three owners interpolate; more than four
+/// keep four's per-row cost. A lone owner's 2-row verify takes the slower
+/// path the 2026-09-28 sweep measured (10.3 ms over its 3-row one); a batch
+/// past the 32-row verify budget never runs. Only differences between widths
+/// at one owner count decide a width.
+pub(super) fn step_ms(owners: usize, rows: usize) -> f32 {
+    const ROW_BUDGET: usize = 32;
+    const LONE_TWO_ROWS_MS: f32 = 10.3;
+    let owners = owners.max(1);
+    if owners * rows > ROW_BUDGET {
+        return f32::INFINITY;
+    }
+    if owners == 1 && rows == 2 {
+        return step_ms(1, 3) + LONE_TWO_ROWS_MS;
+    }
+    let t = (owners - 1) as f32 / 3.0;
+    let base = 44.4 + (109.8 - 44.4) * t;
+    let per_row = 5.68 + (3.2 - 5.68) * t.min(1.0);
+    base + per_row * (owners * rows) as f32
+}
+
+/// Milliseconds one more row costs a lone owner: the row `tau` prices.
 fn row_ms() -> f32 {
-    (step_ms(1, 8) - step_ms(1, 3)) / 5.0
+    step_ms(1, 4) - step_ms(1, 3)
 }
 
 /// The calibration and the verify counter behind the periodic full width.

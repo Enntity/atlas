@@ -54,13 +54,8 @@ pub fn step_verify_glm_long_with(
         return;
     }
     let sync_ms = t_step.elapsed().as_secs_f64() * 1000.0;
-    let drafts: Vec<Vec<u32>> = group
-        .iter_mut()
-        .map(|a| {
-            a.pending_draft_conf.clear();
-            std::mem::take(&mut a.pending_drafts)
-        })
-        .collect();
+    let (drafts, confs): (Vec<Vec<u32>>, Vec<Vec<f32>>) =
+        group.iter_mut().map(|a| a.take_drafts()).unzip();
     let rows = drafts[0].len() + 1;
     let tokens: Vec<Vec<u32>> = group
         .iter()
@@ -141,6 +136,7 @@ pub fn step_verify_glm_long_with(
             a,
             sched,
             &drafts[owner],
+            &confs[owner],
             num_drafts,
             verify_ctx,
             dflash_verify_raw_argmax,
@@ -228,7 +224,7 @@ fn propose_owner_batch(
                 if d.is_empty() {
                     fail(group[o], crate::scheduler::helpers::ProposalOutcome::Empty);
                 } else {
-                    group[o].pending_drafts = d;
+                    group[o].set_proposed_drafts(d);
                 }
             }
         }
@@ -255,7 +251,7 @@ fn propose_owner_batch(
                     )
                 });
                 match proposal {
-                    Ok(d) if !d.is_empty() => a.pending_drafts = d,
+                    Ok(d) if !d.is_empty() => a.set_proposed_drafts(d),
                     Ok(_) => fail(a, crate::scheduler::helpers::ProposalOutcome::Empty),
                     Err(e) => {
                         tracing::error!("run_mtp_propose_multi (owner {o}): {e:#}");

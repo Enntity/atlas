@@ -1103,13 +1103,14 @@ impl BlockDiffusionDraftHead {
     /// Synchronizes this lane's D2H event, applies the 1+N reorder, then
     /// truncates to `cap` — the same scheduler-K cap the immediate path
     /// applies (the deferred return otherwise hands verify γ drafts → a
-    /// γ+2-token window the intermediates pools were never sized for).
+    /// γ+2-token window the intermediates pools were never sized for). The
+    /// drafts' confidences come with them (`draft_conf`; empty when off).
     pub(super) fn read_deferred_drafts(
         &self,
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         scratch: &DflashScratch,
         cap: usize,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
         gpu.event_synchronize(scratch.draft_tokens_event)?;
         let pinned_ptr = scratch
             .draft_tokens_host_pinned
@@ -1125,6 +1126,7 @@ impl BlockDiffusionDraftHead {
             .map(|i| row_order[i])
             .take(cap)
             .collect();
-        Ok(drafts)
+        let conf = self.host_draft_conf(scratch, drafts.len());
+        Ok((drafts, conf))
     }
 }

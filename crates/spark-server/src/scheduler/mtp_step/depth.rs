@@ -25,15 +25,20 @@ pub(super) fn single_depth_ladder(
     }
 }
 
-/// Trim a serial DFlash verify to its cost-aware width and log the width.
+/// Trim a serial DFlash verify (drafts taken with their confidences `conf`)
+/// to its cost-aware width and log the width.
 pub(super) fn lone_dflash_width(
     a: &ActiveSeq,
+    conf: &[f32],
     drafts: &mut Vec<u32>,
     dflash_verify_raw_argmax: bool,
 ) {
     // A lone DFlash verify pays single-owner cost for each row it adds.
     if dflash_verify_raw_argmax
-        && let Some(width) = super::dflash_width::choose(std::iter::once(a), drafts.len())
+        && let Some(width) = super::dflash_width::choose(
+            std::iter::once((&a.spec_adapt.survival, conf)),
+            drafts.len(),
+        )
     {
         drafts.truncate(width);
     }

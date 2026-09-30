@@ -197,3 +197,56 @@ fn a_cut_position_cannot_stay_mislearned() {
     assert!(cal.rate(depth, b) > 0.75);
     assert!(cal.rate(depth, b) <= cal.rate(0, b));
 }
+
+#[test]
+fn rows_are_priced_at_todays_step_cost() {
+    // One owner: 5.68 ms a row from 3 to 8 rows; its 2-row verify is slower
+    // than its 3-row one, so a lone owner never verifies one draft.
+    assert!((row_ms() - 5.68).abs() < 1e-3);
+    assert!(((step_ms(1, 8) - step_ms(1, 3)) / 5.0 - row_ms()).abs() < 1e-3);
+    assert!(step_ms(1, 2) > step_ms(1, 3));
+    // Four owners: 3.2 ms an owner-row, linear (not the concave 2026-09-28
+    // table, which priced deep rows too cheaply).
+    assert!((step_ms(4, 5) - step_ms(4, 4) - 4.0 * 3.2).abs() < 1e-3);
+    assert!((step_ms(4, 8) - step_ms(4, 4) - 16.0 * 3.2).abs() < 1e-3);
+    // More owners cost more per step and less per owner-row, and never past
+    // the 32-row verify budget.
+    for n in 1..8 {
+        assert!(step_ms(n + 1, 3) > step_ms(n, 3));
+        assert!(step_ms(n + 1, 4) - step_ms(n + 1, 3) >= step_ms(n, 4) - step_ms(n, 3));
+    }
+    assert!(step_ms(8, 4).is_finite() && step_ms(8, 5).is_infinite());
+}
+
+/// Four prose streams whose drafter is unsure past its first drafts: the
+/// shared width stays within a 3-row pin (two drafts), where the stale
+/// table's cheap deep rows verified wider.
+#[test]
+fn four_unsure_prose_owners_stay_within_a_three_row_pin() {
+    let prose: &[f32] = &[-0.05, -0.3, -0.6, -0.9, -1.2, -1.6, -2.0];
+    let width = choose(&mut Policy::default(), &[prose; 4], 7, NO_PROBE).unwrap();
+    assert!(width <= 2, "four unsure owners verified {width} drafts");
+    // Alone, the same drafts pay for no more rows than together.
+    assert!(lone(prose) >= width);
+}
+
+#[test]
+fn confidences_travel_with_the_drafts() {
+    let (mut a, _rx) = crate::scheduler::test_support::test_seq(vec![1], 8, None, 4);
+    a.pending_drafts = vec![5, 6, 7];
+    a.pending_draft_conf = vec![-0.1, -0.2, -0.3];
+    assert_eq!(a.draft_conf(), [-0.1, -0.2, -0.3]);
+    // Stale (not draft for draft): not measured.
+    a.pending_draft_conf.truncate(2);
+    assert!(a.draft_conf().is_empty());
+    a.pending_draft_conf.push(-0.3);
+    // Taking the drafts takes their confidences and leaves neither pending.
+    assert_eq!(a.take_drafts(), (vec![5, 6, 7], vec![-0.1, -0.2, -0.3]));
+    assert!(a.pending_drafts.is_empty() && a.pending_draft_conf.is_empty());
+    // A drafter that reports no confidences leaves none, even over stale ones.
+    a.pending_draft_conf = vec![-0.5];
+    a.set_proposed_drafts(vec![8, 9]);
+    assert_eq!(a.pending_drafts, [8, 9]);
+    assert!(a.pending_draft_conf.is_empty());
+    assert_eq!(a.take_drafts(), (vec![8, 9], Vec::new()));
+}
