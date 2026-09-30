@@ -7,6 +7,7 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::{PagedKvCache, SparseIndexCacheDtype};
 
 use super::super::Qwen3AttentionLayer;
+use super::glm_index_split::{self, IndexSplit};
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
@@ -273,6 +274,11 @@ impl Qwen3AttentionLayer {
         let query_row_bytes = index_heads as usize * index_dim as usize * 2;
         let weights_row_bytes = index_heads as usize * 2;
         let output_row_bytes = output_width as usize * std::mem::size_of::<i32>();
+        // `ATLAS_GLM_INDEX_SPLIT=1`: this rank selects half the rows and swaps
+        // them with its peer after the tiles.
+        let split = IndexSplit::plan(n as usize, seq_len_start, output_row_bytes, ctx)?;
+        let scratch = selected.offset(n as usize * output_row_bytes);
+        let passes = glm_index_split::passes(split, n as usize, selected, scratch);
         // Projection launches above are intentionally included in this first
         // lap. They produce the semantic query and per-head weights consumed
         // by every history tile.
@@ -280,9 +286,8 @@ impl Qwen3AttentionLayer {
         let mut logits_us = 0u128;
         let mut topk_us = 0u128;
         let mut tiles = 0usize;
-        let mut row_start = 0usize;
-        while row_start < n as usize {
-            let rows = tile_rows.min(n as usize - row_start) as u32;
+        for (row_start, rows, out) in glm_index_split::tiles(&passes, tile_rows) {
+            let rows = rows as u32;
             ops::glm_index_logits(
                 ctx.gpu,
                 self.glm_index_logits_k,
@@ -310,7 +315,7 @@ impl Qwen3AttentionLayer {
                 ctx.gpu,
                 self.glm_index_topk_expand_k,
                 logits,
-                selected.offset(row_start * output_row_bytes),
+                out.offset(row_start * output_row_bytes),
                 rows,
                 (seq_len_start + row_start) as u32,
                 logits_stride,
@@ -321,20 +326,33 @@ impl Qwen3AttentionLayer {
             )?;
             topk_us += profile_lap(ctx, stream, &mut profile)?;
             tiles += 1;
-            row_start += rows as usize;
         }
+        if let Some(split) = split {
+            split.exchange(
+                selected,
+                scratch,
+                n as usize,
+                output_row_bytes,
+                self.attn_layer_idx,
+                ctx,
+                stream,
+            )?;
+        }
+        let exchange_us = profile_lap(ctx, stream, &mut profile)?;
         if profile.is_some() {
             tracing::info!(
-                "ATLAS_GLM_INDEX_PROFILE phase=select layer={} rows={} seq_end={} pools={} tile_rows={} tiles={} projection_us={} logits_us={} topk_us={}",
+                "ATLAS_GLM_INDEX_PROFILE phase=select layer={} rows={} seq_end={} pools={} tile_rows={} tiles={} split={} projection_us={} logits_us={} topk_us={} exchange_us={}",
                 self.attn_layer_idx,
                 n,
                 sequence_end,
                 logits_stride,
                 tile_rows,
                 tiles,
+                split.is_some(),
                 projection_us,
                 logits_us,
                 topk_us,
+                exchange_us,
             );
         }
         Ok((selected, output_width))
