@@ -8,10 +8,10 @@
 // All entry points have the glm_index_logits_bf16_row8 argument ABI. Launch:
 //   row8:        grid=(ceil(logits_stride/16), ceil(rows/8)), block=(256,1,1)
 //   row8_pool32: grid=(ceil(logits_stride/32), ceil(rows/8)), block=(256,1,1)
-//   mma_v2:      grid=(any x >= 1, ceil(rows/8)), block=(256,1,1)
+//   mma_v2:      grid=(any x >= 1, ceil(rows/4)), block=(128,1,1)
 // No scratch allocation or special shared-memory opt-in is needed. row8 and
 // row8_pool32 use 12,800 / 25,600 bytes of static shared memory; mma_v2 uses
-// 49,152 bytes of dynamic shared memory and 16-byte aligned cache blocks.
+// 32,768 bytes of dynamic shared memory and 16-byte aligned cache blocks.
 // Requirements: SM80+, 32-byte aligned query, heads=32, head_dim=128,
 // pool_size=4, cache_block_size a positive multiple of 4. Cache page/table and
 // output sizing follow the scalar scorer. Unsupported geometry does no work;
@@ -197,8 +197,10 @@ extern "C" __global__ void glm_index_logits_bf16_wmma_row8_pool32(
 // query resident in registers (m16n8k16 A fragments) across the CTA's whole
 // pool range. The CTA walks that range in 32-pool chunks whose keys are staged
 // by 16-byte cp.async (one block-table lookup per pool, double buffered,
-// XOR-swizzled) and shared by all eight rows. blockIdx.x selects a contiguous
-// run of chunks, so gridDim.x trades query reloads against parallelism.
+// XOR-swizzled) and shared by the CTA's four rows. blockIdx.x selects a
+// contiguous run of chunks, so gridDim.x trades query reloads against
+// parallelism. Four rows per CTA (three CTAs per SM) measured ~7% faster
+// than eight rows (two CTAs per SM, register-capped) on GB10.
 //
 // Exactness against row8_pool32: each (row, head, pool) dot is the same chain
 // of m16n8k16 BF16 MMAs (WMMA 16x16x16's lowering) over d = 0, 16, ..., 112,
@@ -211,7 +213,7 @@ extern "C" __global__ void glm_index_logits_bf16_wmma_row8_pool32(
 // masking are unchanged.
 namespace {
 
-constexpr unsigned int kIndexV2Warps = 8;
+constexpr unsigned int kIndexV2Warps = 4;
 constexpr unsigned int kIndexV2Pools = 32;
 
 __device__ __forceinline__ void index_v2_cp_async(
@@ -430,7 +432,7 @@ __device__ __forceinline__ void glm_index_logits_mma_v2_impl(
 
 } // namespace
 
-extern "C" __global__ void __launch_bounds__(kIndexV2Warps * 32, 2)
+extern "C" __global__ void __launch_bounds__(kIndexV2Warps * 32, 3)
 glm_index_logits_bf16_mma_v2(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ weights,

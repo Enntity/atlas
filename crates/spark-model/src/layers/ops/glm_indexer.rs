@@ -135,7 +135,7 @@ pub fn glm_index_fill_causal_dev(
         .launch(stream)
 }
 
-/// `pools_per_cta` of `glm_index_logits_bf16_mma_v2` (8-row tiles): each CTA
+/// `pools_per_cta` of `glm_index_logits_bf16_mma_v2` (4-row tiles): each CTA
 /// walks a contiguous run of 32-pool chunks whose length the launch picks.
 pub const GLM_INDEX_LOGITS_V2_POOLS: u32 = u32::MAX;
 
@@ -172,20 +172,19 @@ fn index_logits_launch(
         seq_len_start.checked_add(rows).is_some() && head_dim.checked_mul(index_heads).is_some(),
         "GLM semantic scorer sequence or head dimensions overflow u32"
     );
+    let v2 = pools_per_cta == GLM_INDEX_LOGITS_V2_POOLS;
     anyhow::ensure!(
         (pools_per_cta == 8 && matches!(rows_per_cta, 1 | 8))
-            || (matches!(pools_per_cta, 32 | GLM_INDEX_LOGITS_V2_POOLS)
-                && rows_per_cta == 8
+            || (((pools_per_cta, rows_per_cta) == (32, 8) || (v2 && rows_per_cta == 4))
                 && index_heads == 32
                 && head_dim == 128
                 && pool_size == 4
                 && query_address.is_multiple_of(32)),
         "unsupported GLM semantic scorer launch geometry or query alignment"
     );
-    let v2 = pools_per_cta == GLM_INDEX_LOGITS_V2_POOLS;
     let shared_mem = if v2 {
-        // Two 32-pool BF16 key stages plus eight 32x32 FP32 product tiles.
-        2 * 32 * 256 + 8 * 32 * 32 * 4
+        // Two 32-pool BF16 key stages plus four 32x32 FP32 product tiles.
+        2 * 32 * 256 + 4 * 32 * 32 * 4
     } else if rows_per_cta == 8 && pools_per_cta == 8 {
         head_dim
             .checked_mul(8 * std::mem::size_of::<u16>() as u32)
@@ -199,16 +198,16 @@ fn index_logits_launch(
     );
     let row_tiles = rows.div_ceil(rows_per_cta);
     let grid_x = if v2 {
-        // About eight waves of two CTAs on GB10's 48 SMs, but at least 16
+        // About eight waves of three CTAs on GB10's 48 SMs, but at least 16
         // chunks per CTA so its query rows are reloaded rarely.
         let chunks = logits_stride.div_ceil(32);
-        768u32.div_ceil(row_tiles).min(chunks / 16).max(1)
+        1152u32.div_ceil(row_tiles).min(chunks / 16).max(1)
     } else {
         logits_stride.div_ceil(pools_per_cta)
     };
     Ok(IndexLogitsLaunch {
         grid: [grid_x, row_tiles, 1],
-        block: [256, 1, 1],
+        block: [if v2 { 128 } else { 256 }, 1, 1],
         shared_mem,
     })
 }
@@ -393,7 +392,7 @@ mod tests {
     #[test]
     fn unsupported_tiles_are_rejected() {
         let v2 = GLM_INDEX_LOGITS_V2_POOLS;
-        for (rows, pools) in [(0, 8), (4, 8), (1, 32), (1, v2), (8, 0), (8, 16), (8, 64)] {
+        for (rows, pools) in [(0, 8), (4, 8), (1, 32), (8, v2), (8, 0), (8, 16), (8, 64)] {
             assert!(
                 geometry(rows, pools).is_err(),
                 "accepted tile {rows}x{pools}"
@@ -409,9 +408,9 @@ mod tests {
             (256, 32, 64, 4),
             (256, 32, 128, 2),
         ] {
-            for pools in [32, GLM_INDEX_LOGITS_V2_POOLS] {
+            for (rows, pools) in [(8, 32), (4, GLM_INDEX_LOGITS_V2_POOLS)] {
                 let launch =
-                    index_logits_launch(query, 9, 4096, 33, heads, dim, pool, 32, 8, pools);
+                    index_logits_launch(query, 9, 4096, 33, heads, dim, pool, 32, rows, pools);
                 assert!(launch.is_err());
             }
         }
@@ -424,27 +423,27 @@ mod tests {
 
     fn v2(rows: u32, stride: u32) -> [u32; 3] {
         let v2 = GLM_INDEX_LOGITS_V2_POOLS;
-        index_logits_launch(256, rows, 4096, stride, 32, 128, 4, 16, 8, v2)
+        index_logits_launch(256, rows, 4096, stride, 32, 128, 4, 16, 4, v2)
             .unwrap()
             .grid
     }
 
     #[test]
     fn v2_grid_width_trades_waves_against_query_reloads() {
-        // 512 row tiles already fill the waves: each CTA walks half the history.
-        assert_eq!(v2(4096, 15361), [2, 512, 1]);
+        // 1024 row tiles already fill the waves: each CTA walks half the history.
+        assert_eq!(v2(4096, 15361), [2, 1024, 1]);
         // Fewer rows split the history further, down to 16 chunks per CTA.
-        assert_eq!(v2(8, 16385), [32, 1, 1]);
-        assert_eq!(v2(512, 16500), [12, 64, 1]);
-        assert_eq!(v2(9, 33), [1, 2, 1]);
-        let launch = geometry(8, GLM_INDEX_LOGITS_V2_POOLS).unwrap();
-        assert_eq!((launch.block, launch.shared_mem), ([256, 1, 1], 49_152));
+        assert_eq!(v2(8, 16385), [32, 2, 1]);
+        assert_eq!(v2(512, 16500), [9, 128, 1]);
+        assert_eq!(v2(9, 33), [1, 3, 1]);
+        let launch = geometry(4, GLM_INDEX_LOGITS_V2_POOLS).unwrap();
+        assert_eq!((launch.block, launch.shared_mem), ([128, 1, 1], 32_768));
     }
 
     #[test]
     fn empty_dimensions_and_incomplete_cache_pools_are_rejected() {
         for (rows_per_cta, pools_per_cta) in
-            [(1, 8), (8, 8), (8, 32), (8, GLM_INDEX_LOGITS_V2_POOLS)]
+            [(1, 8), (8, 8), (8, 32), (4, GLM_INDEX_LOGITS_V2_POOLS)]
         {
             for (rows, stride, heads, dim, pool, block) in [
                 (0, 33, 32, 128, 4, 32),

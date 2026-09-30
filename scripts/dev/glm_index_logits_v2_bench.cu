@@ -9,7 +9,8 @@
 //
 //   nvcc -arch=sm_121f -O3 --fmad=false -I kernels/gb10/glm-5.3-flash/nvfp4 \
 //        scripts/dev/glm_index_logits_v2_bench.cu -o v2_bench
-//   ./v2_bench [iters=7] [mode=all|check|time|prof] [max_extent=135168]
+//   ./v2_bench [iters=7] [mode=all|check|small|time|quick|prof] [max_extent=135168]
+// (small: only the small bitwise cases, e.g. under compute-sanitizer racecheck)
 // Device memory: ~1.2 GB at the defaults. Exit: 0 bit-identical, 1 otherwise.
 //
 // A GPU time-sliced with other processes stretches long launches, so timing
@@ -32,7 +33,7 @@
     unsigned dim, unsigned pool, unsigned bs, unsigned long long bstride
 #define V2_PASS q, w, c, o, bt, rows, start, stride, heads, dim, pool, bs, bstride
 
-// Sweep variants beside the exported 8-warp, 32-pool configuration.
+// Sweep variants beside the exported 4-warp, 32-pool configuration.
 template <unsigned W, unsigned P, unsigned MinBlocks>
 __global__ void __launch_bounds__(W * 32, MinBlocks) v2_variant(V2_ARGS) {
     glm_index_logits_mma_v2_impl<W, P>(V2_PASS);
@@ -40,10 +41,10 @@ __global__ void __launch_bounds__(W * 32, MinBlocks) v2_variant(V2_ARGS) {
 
 typedef void (*Kern)(V2_ARGS);
 struct Variant { const char* name; Kern k; unsigned warps, pools, smem; };
+// Measured slower on GB10: 8 warps x 64 pools, 2 x 32, 4 x 64.
 static const Variant kVariants[] = {
-    {"v2_w8_p32 (export)", glm_index_logits_bf16_mma_v2, 8, 32, index_v2_smem_bytes<8, 32>()},
-    {"v2_w4_p32", v2_variant<4, 32, 3>, 4, 32, index_v2_smem_bytes<4, 32>()},
-    {"v2_w8_p64", v2_variant<8, 64, 1>, 8, 64, index_v2_smem_bytes<8, 64>()},
+    {"v2_w4_p32 (export)", glm_index_logits_bf16_mma_v2, 4, 32, index_v2_smem_bytes<4, 32>()},
+    {"v2_w8_p32", v2_variant<8, 32, 2>, 8, 32, index_v2_smem_bytes<8, 32>()},
 };
 
 static unsigned short f2bf(float f) {
@@ -100,7 +101,7 @@ static void launch(const Variant* v, unsigned gx, const Bufs& b, const Cache& c,
 static unsigned default_gx(const Variant& v, unsigned rows, unsigned stride) {
     const unsigned chunks = (stride + v.pools - 1) / v.pools;
     const unsigned row_blocks = (rows + v.warps - 1) / v.warps;
-    const unsigned want = std::max(1u, (48u * 2 * 8 + row_blocks - 1) / row_blocks);
+    const unsigned want = std::max(1u, (48u * 3 * 8 + row_blocks - 1) / row_blocks);
     return std::max(1u, std::min(want, chunks / 16));
 }
 
@@ -171,6 +172,7 @@ int main(int argc, char** argv) {
         size_t compared = 0;
         for (const auto& cs : cases) {
             const unsigned stride = (cs.start + cs.rows + 3) / 4;
+            if (mode == "small" && (size_t)cs.rows * stride > 2000000) continue;
             CK(cudaMemset(b.dout0, 0xFF, (size_t)cs.rows * stride * 4));
             launch(nullptr, 0, b, *cs.c, 0, cs.rows, cs.start, stride);
             CK(cudaGetLastError());
@@ -196,7 +198,7 @@ int main(int argc, char** argv) {
         }
         printf("bitwise: %zu differing of %zu compared logits\n", total_diff, compared);
     }
-    if (mode == "check") return total_diff == 0 ? 0 : 1;
+    if (mode == "check" || mode == "small") return total_diff == 0 ? 0 : 1;
 
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
@@ -226,6 +228,22 @@ int main(int argc, char** argv) {
             tiled += best_ms([&] { launch(v, tgx, b, c16, r0, n, start, stride); });
         }
     };
+    if (mode == "quick") {  // whole-piece minimums over v2 grid widths 1..4
+        for (unsigned extent : {16384u, 57344u, 131072u}) {
+            const unsigned rows = 4096, end = std::min(extent + rows, max_extent);
+            const unsigned start = end - rows, stride = (end + 3) / 4;
+            const double gflop = (double)rows * stride * 32 * 128 * 2 / 1e9;
+            const float o = best_ms([&] { launch(nullptr, 0, b, c16, 0, rows, start, stride); });
+            printf("extent=%u wmma %.3f ms %.1f TF/s\n", extent, o, gflop / o);
+            for (const auto& v : kVariants) {
+                for (unsigned gx : {1u, 2u, 3u, 4u}) {
+                    const float n = best_ms([&] { launch(&v, gx, b, c16, 0, rows, start, stride); });
+                    printf("    %-20s gx=%u %.3f ms %.1f TF/s (%.2fx)\n", v.name, gx, n, gflop / n, o / n);
+                }
+            }
+        }
+        return 0;
+    }
     // Extents 2K..131K (61,440 + 4096 is the scout's 57K reference call).
     const unsigned extents[] = {2048, 8192, 16384, 32768, 57344, 65536, 131072};
     for (unsigned extent : extents) {
