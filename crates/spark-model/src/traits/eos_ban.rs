@@ -42,6 +42,12 @@ impl EosBan {
     /// below the floor, and the drafter skips them there, so a banned end
     /// token never truncates an otherwise acceptable draft chain.
     pub fn arm(self, seq: &mut super::SequenceState) {
+        if self.floor > 0 {
+            let (floor, prompt) = (self.floor, seq.prompt_len);
+            tracing::info!(
+                "min_tokens: end tokens banned below position {floor} (prompt {prompt})"
+            );
+        }
         seq.eos_ban = self;
         if let Some(proposer) = seq.proposer_state.as_mut() {
             proposer.set_end_floor(self.floor);

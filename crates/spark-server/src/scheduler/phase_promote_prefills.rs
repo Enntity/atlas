@@ -149,12 +149,8 @@ pub(super) fn build_active_seq_from_prefill(
         glm_tool_boundary.filter(|_| p.tools_present),
     );
     let mut seq = p.seq;
-    let ban = spark_model::traits::EosBan::new(seq.prompt_len, p.min_tokens, &p.eos_tokens);
-    if ban.floor > 0 {
-        let (min, floor) = (p.min_tokens, ban.floor);
-        tracing::info!("min_tokens={min}: end tokens banned below position {floor}");
-    }
-    ban.arm(&mut seq);
+    // The min_tokens end-token ban, for every chunked prompt (one chunk or more).
+    spark_model::traits::EosBan::new(seq.prompt_len, p.min_tokens, &p.eos_tokens).arm(&mut seq);
     ActiveSeq {
         seq,
         session_hash: p.session_hash,
