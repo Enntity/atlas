@@ -143,3 +143,21 @@ fn the_check_finds_a_byte_past_the_prefix() {
     arena.zero_dirty_over(&gpu, 0, FLOOR, MIN).unwrap();
     assert!(all_zero(&arena, &gpu));
 }
+
+/// A chunk embeds all its rows into `hidden_states` while its pass notes
+/// only the rows it computes: that buffer is zeroed whole, and the check
+/// does not report what the embed left in it.
+#[test]
+fn the_embedded_buffer_is_zeroed_whole() {
+    let gpu = MockGpuBackend::new();
+    let arena = arena(&gpu);
+    arena.zero_all(&gpu, 0).unwrap();
+    let (hidden, bytes) = (arena.hidden_states(), arena.sizes().hidden_states);
+    assert!(bytes >= MIN, "large enough to be trimmed in this arena");
+    // A full chunk embedded, five rows computed.
+    gpu.memset(hidden, 0xAB, bytes).unwrap();
+    arena.note_rows(5);
+    assert!(stale(&arena, &gpu).is_empty());
+    arena.zero_dirty_over(&gpu, 0, FLOOR, MIN).unwrap();
+    assert!(all_zero(&arena, &gpu));
+}

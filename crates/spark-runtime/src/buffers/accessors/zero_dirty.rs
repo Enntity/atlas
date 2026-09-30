@@ -17,13 +17,18 @@
 //! verify steps, a row group of index logits over the context, per-expert
 //! padding.
 //!
+//! `hidden_states` is the exception: a chunk embeds all its rows there, not
+//! only the rows its pass computes and notes, so it is always zeroed whole.
+//!
 //! That is the same arena `zero_all` leaves only if no pass wrote past the
 //! share. Nothing in the kernels enforces it (the buffers are shared scratch
 //! and some layouts do not follow the row count), so the bound is measured,
 //! not derived: [`BufferArena::stale_past_dirty`] reads what `zero_dirty`
 //! would have left and reports any nonzero byte. A model runs that check
 //! with `zero_all` after it (so it serves as without the switch) to qualify a
-//! workload before it trims.
+//! workload before it trims. What a clean check qualifies is that workload at
+//! that arena size: which buffers are large enough to trim, and how far a
+//! pass reaches into them, both change with `max_batch_tokens`.
 
 use std::sync::atomic::Ordering;
 
@@ -102,9 +107,13 @@ impl BufferArena {
             .dirty_rows
             .load(Ordering::Relaxed)
             .saturating_add(floor_rows);
-        let capacity = self.max_batch_tokens;
+        let (capacity, embedded) = (self.max_batch_tokens, self.hidden_states);
         self.zeroed().into_iter().map(move |(name, ptr, bytes)| {
-            let prefix = dirty_prefix(bytes, rows, capacity, min_bytes);
+            let prefix = if ptr == embedded {
+                bytes
+            } else {
+                dirty_prefix(bytes, rows, capacity, min_bytes)
+            };
             (name, ptr, bytes, prefix)
         })
     }
