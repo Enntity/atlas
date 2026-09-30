@@ -20,10 +20,16 @@ fn enabled() -> bool {
 }
 
 /// `spark_runtime::cutlass::bf16_gemm_tuned` config for an `[n, k]` weight:
-/// narrow N takes 128x256 tiles (swizzle 8), K >= 8192 128x256 (swizzle 4),
-/// short K the unswizzled 128x128x32, everything else 128x128x64 (swizzle 8).
+/// N <= 512 or K <= 128 take 128x128x64 (swizzle 8: one launch reads A once
+/// for up to four N tiles), other narrow N 128x256 tiles (swizzle 8), K >= 8192
+/// 128x256 (swizzle 4), short K the unswizzled 128x128x32, everything else
+/// 128x128x64. Every config keeps warp K == CTA K (sequential k16 MMAs, no
+/// split-K): all are bit-identical to each other and to the pipelined dense
+/// GEMM (`examples/bf16_gemm_bench` counts differing outputs).
 fn config(n: u32, k: u32) -> u32 {
-    if n <= 1536 {
+    if n <= 512 || k <= 128 {
+        9
+    } else if n <= 1536 {
         5
     } else if k >= 8192 {
         4
@@ -135,10 +141,15 @@ mod tests {
     #[test]
     fn config_follows_measured_glm_shapes() {
         assert_eq!(config(1536, 4096), 5); // q_a
-        assert_eq!(config(576, 4096), 5); // kv_a
+        assert_eq!(config(576, 4096), 5); // kv_a with RoPE
+        assert_eq!(config(512, 4096), 9); // GLM kv_a
+        assert_eq!(config(288, 4096), 9); // GLM router
+        assert_eq!(config(128, 4096), 9); // index wk / kpool_gate
+        assert_eq!(config(32, 4096), 9); // index weights_proj
         assert_eq!(config(4096, 8192), 4); // o
         assert_eq!(config(8192, 1536), 0); // q_b
         assert_eq!(config(4096, 2048), 0); // shared down
+        assert_eq!(config(4096, 128), 9); // KDA f_b / g_b
         assert_eq!(config(2048, 4096), 9); // shared gate/up
     }
 }

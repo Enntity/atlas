@@ -362,6 +362,10 @@ impl Glm5KdaLayer {
                 k,
                 stream,
             )
+        } else if k <= 128 && ops::bf16_gemm_cutlass_rows(m) {
+            // f_b / g_b: CUTLASS 128x128x64, bit-identical to the pipelined
+            // kernel and ~10% faster on this store-bound shape.
+            ops::bf16_gemm(input, weight.weight.0, output, m, n, k, stream)
         } else {
             ops::dense_gemm_prefill(
                 ctx.gpu,
