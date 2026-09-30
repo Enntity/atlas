@@ -23,8 +23,25 @@ pub(in crate::layers::qwen3_attention) struct GlmChunkOwner {
     pub meta: crate::layer::AttnMetadataDev,
 }
 
+impl GlmChunkOwner {
+    /// Dense attention over the owner's whole causal history is exact: its
+    /// sequence ends within `index_topk`, so it selects nothing.
+    pub(super) fn dense_is_exact(&self, index_topk: usize) -> bool {
+        self.seq_len_start
+            .checked_add(self.rows)
+            .is_some_and(|end| super::dense_selection_is_exact(end, index_topk))
+    }
+}
+
+/// Whether any owner runs the semantic-index selection, the only reader of
+/// the index queries and weights.
+pub(super) fn any_owner_selects(owners: &[GlmChunkOwner], index_topk: usize) -> bool {
+    owners.iter().any(|o| !o.dense_is_exact(index_topk))
+}
+
 /// Row-wise projections of an owner-batched verify, one row per stacked row:
-/// owner rows start at `row0 * <row bytes>`.
+/// owner rows start at `row0 * <row bytes>`. `index_query` and `weights` are
+/// projected only when an owner selects ([`any_owner_selects`]).
 #[derive(Clone, Copy)]
 pub(super) struct GlmOwnerProjections {
     pub(super) keys: DevicePtr,
@@ -130,7 +147,10 @@ impl Qwen3AttentionLayer {
         let q_absorbed = ctx.buffers.ssm_deinterleaved();
         let index_query = q_absorbed.offset(rows * latent_row);
         let weights = ctx.buffers.ssm_gates();
-        self.glm_index_project_query(q_latent, normed, n, index_query, weights, ctx, stream)?;
+        // Short-context batches (every owner dense) skip wq_b and weights_proj.
+        if any_owner_selects(owners, c.index_topk) {
+            self.glm_index_project_query(q_latent, normed, n, index_query, weights, ctx, stream)?;
+        }
         let q_full = ctx.buffers.qkv_output();
         self.paged_glm_projection(
             q_latent,

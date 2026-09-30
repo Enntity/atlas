@@ -220,7 +220,7 @@ impl Qwen3AttentionLayer {
                 .seq_len_start
                 .checked_add(o.rows)
                 .ok_or_else(|| anyhow::anyhow!("GLM prefill sequence length overflow"))?;
-            let use_dense = dense_selection_is_exact(sequence_end, ctx.config.index_topk);
+            let use_dense = o.dense_is_exact(ctx.config.index_topk);
             let o_normed = normed.offset(o.row0 * h as usize * bf16);
             let o_latent = q_latent.offset(o.row0 * q_lora as usize * bf16);
             let rows_of = |base: DevicePtr, row_bytes: usize| base.offset(o.row0 * row_bytes);
