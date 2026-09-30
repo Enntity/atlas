@@ -75,7 +75,13 @@ impl Qwen3AttentionLayer {
             // the complete paged history. The generic MLA prefill below only
             // attends within the current contiguous chunk.
             if mla.glm_indexer.is_some() {
-                return self.prefill_attention_paged_glm_dense(kv_cache, ctx, &args, seq_len_start);
+                return self.prefill_attention_paged_glm_dense(
+                    kv_cache,
+                    ctx,
+                    &args,
+                    seq_len_start,
+                    kv_write_floor,
+                );
             }
             return self.prefill_attention_paged_mla(kv_cache, ctx, &args);
         }

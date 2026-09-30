@@ -23,6 +23,14 @@ pub(in crate::layers::qwen3_attention) struct GlmChunkOwner {
     pub meta: crate::layer::AttnMetadataDev,
 }
 
+impl GlmChunkOwner {
+    /// Leading rows of this owner below a KV write floor of `floor` stacked
+    /// rows: they keep their cached index tails and pooled keys.
+    pub(super) fn write_skip(&self, floor: usize) -> usize {
+        floor.saturating_sub(self.row0).min(self.rows)
+    }
+}
+
 /// Row-wise projections of an owner-batched verify, one row per stacked row:
 /// owner rows start at `row0 * <row bytes>`.
 #[derive(Clone, Copy)]

@@ -126,7 +126,7 @@ impl Qwen3AttentionLayer {
                 midchunk_capture: None,
                 ..*ctx
             };
-            self.glm_index_prefill_cache_update(normed, n, kv_cache, &index_ctx, stream, None)?;
+            self.glm_index_prefill_cache_update(normed, n, 0, kv_cache, &index_ctx, stream, None)?;
         }
         Ok(true)
     }

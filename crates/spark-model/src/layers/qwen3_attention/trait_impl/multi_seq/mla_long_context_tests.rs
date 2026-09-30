@@ -17,6 +17,8 @@ use gpu::TestGpu;
 mod query_dispatch_tests;
 #[path = "mla_split_context_tests.rs"]
 mod split_tests;
+#[path = "mla_write_floor_tests.rs"]
+mod write_floor_tests;
 fn fixture(run: impl FnOnce(&TestGpu, &atlas_core::config::ModelConfig, &Qwen3AttentionLayer)) {
     let gpu = TestGpu::default();
     let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
@@ -134,6 +136,7 @@ fn fixture(run: impl FnOnce(&TestGpu, &atlas_core::config::ModelConfig, &Qwen3At
     layer.dense_gemv_batchm_k = KernelHandle(807);
     layer.mla_batched_gemv_k = KernelHandle(808);
     layer.mla_cache_assemble_k = KernelHandle(820);
+    layer.reshape_cache_k = KernelHandle(821);
     layer.glm_index_layernorm_k = KernelHandle(800);
     layer.glm_index_tail_write_k = KernelHandle(801);
     layer.glm_index_kpool_finalize_k = KernelHandle(802);
