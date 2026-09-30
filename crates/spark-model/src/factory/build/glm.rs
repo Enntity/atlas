@@ -179,6 +179,16 @@ pub(super) fn agree_kv_blocks(
     mut num_kv_blocks: usize,
     glm_cache_plan: Option<GlmCachePlan>,
 ) -> Result<usize> {
+    // Test knob: cap the pool (e.g. to force prefix-cache eviction and the
+    // NVMe tier without starving the rest of the budget).
+    if let Some(cap) = std::env::var("ATLAS_KV_MAX_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&cap| cap > 0 && cap < num_kv_blocks)
+    {
+        tracing::info!("KV cache: ATLAS_KV_MAX_BLOCKS caps {num_kv_blocks} blocks at {cap}");
+        num_kv_blocks = cap;
+    }
     // Every rank mirrors the head's sequences into its own pool, so a rank
     // with less headroom (e.g. no drafter, different co-tenants) must not
     // size a pool the others cannot back: all ranks take the minimum.
