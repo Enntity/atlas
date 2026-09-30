@@ -11,10 +11,19 @@ use atlas_tier::{DirectSwapFile, Residency, SwapStore, VecSlotArena};
 /// A real-filesystem dir for O_DIRECT (tmpfs/overlay EINVALs on O_DIRECT —
 /// tolerated as a skip so containerized CI doesn't break).
 fn o_direct_file(record_bytes: usize, tag: &str) -> Option<(DirectSwapFile, std::path::PathBuf)> {
+    o_direct_file_with(record_bytes, tag, DirectSwapFile::create)
+}
+
+fn o_direct_file_with(
+    record_bytes: usize,
+    tag: &str,
+    create: fn(&Path, usize) -> anyhow::Result<DirectSwapFile>,
+) -> Option<(DirectSwapFile, std::path::PathBuf)> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/atlas-tier-tests");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("dsf-{tag}-{}.swap", std::process::id()));
-    match DirectSwapFile::create(&path, record_bytes) {
+    let _ = std::fs::remove_file(&path);
+    match create(&path, record_bytes) {
         Ok(f) => Some((f, path)),
         Err(e) => {
             // Opt-in enforcement: CI on a real disk sets this so a silent skip
@@ -34,6 +43,35 @@ fn o_direct_file(record_bytes: usize, tag: &str) -> Option<(DirectSwapFile, std:
 fn page_aligned(storage: &mut [u8], len: usize) -> &mut [u8] {
     let pad = (4096 - (storage.as_ptr() as usize & 0xfff)) & 0xfff;
     &mut storage[pad..pad + len]
+}
+
+/// `create_new`: the one open a tier holding private records needs — refuses
+/// an existing file or a planted symlink, owner-only, fully usable.
+#[test]
+fn create_new_is_exclusive_and_owner_only() {
+    let rb = 4096usize;
+    let Some((mut f, path)) = o_direct_file_with(rb, "new", DirectSwapFile::create_new) else {
+        return;
+    };
+    assert!(DirectSwapFile::create_new(&path, rb).is_err(), "exists");
+    assert!(DirectSwapFile::create_new(&path, 1000).is_err());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "no group/other access: {mode:o}");
+        let link = path.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(DirectSwapFile::create_new(&link, rb).is_err());
+        let _ = std::fs::remove_file(&link);
+    }
+    let rec = vec![0x5Au8; rb];
+    f.write_record(2, &rec).unwrap();
+    let mut out = vec![0u8; rb];
+    f.read_record(2, &mut out).unwrap();
+    assert_eq!(out, rec);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

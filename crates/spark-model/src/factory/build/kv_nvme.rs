@@ -277,8 +277,9 @@ fn setup_local(
         .join(format!("{FILE_PREFIX}{}.r{rank}.swap", std::process::id()));
     // Records hold prompt-derived KV: owner-only, and never through a
     // pre-planted file or symlink (remove_file drops a link, not its target;
-    // an exclusive create refuses anything that reappears).
-    #[cfg(unix)]
+    // an exclusive create refuses anything that reappears). ONE open per
+    // path: nothing re-opens the name after another process could have
+    // swept it.
     let _ = std::fs::remove_file(&path);
     if cfg.fast {
         let store = atlas_tier::SharedRecordFile::create(&path, record)?;
@@ -298,21 +299,11 @@ fn setup_local(
         }
         kv_cache.attach_nvme_fast(std::sync::Arc::new(store), gpu)?;
     } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
-        }
-        let store = atlas_tier::DirectSwapFile::create(&path, record)?;
+        let store = atlas_tier::DirectSwapFile::create_new(&path, record)?;
         kv_cache.attach_nvme_spill(Box::new(store), gpu)?;
     }
-    // Anonymous from here on: freed at exit. (Another rank's stale sweep may
-    // have unlinked it first — the descriptor is what matters.)
+    // Anonymous from here on: freed at exit. (Another process's stale sweep
+    // may have unlinked it first — the descriptor is what matters.)
     #[cfg(unix)]
     let _ = std::fs::remove_file(&path);
     ensure!(tier.enable(slots), "prefix cache NVMe tier already enabled");

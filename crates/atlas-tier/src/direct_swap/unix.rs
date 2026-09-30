@@ -50,12 +50,30 @@ pub struct DirectSwapFile {
 
 impl DirectSwapFile {
     pub fn create(path: &Path, record_bytes: usize) -> Result<Self> {
+        Self::open(
+            path,
+            record_bytes,
+            OpenOptions::new().create(true).truncate(true),
+        )
+    }
+
+    /// As [`Self::create`], but the file must not exist and is owner-only —
+    /// for records that hold private data: one exclusive open can never reuse
+    /// a pre-planted file or follow a symlink, and leaves no second open by
+    /// name for another process to race.
+    pub fn create_new(path: &Path, record_bytes: usize) -> Result<Self> {
+        Self::open(
+            path,
+            record_bytes,
+            OpenOptions::new().create_new(true).mode(0o600),
+        )
+    }
+
+    fn open(path: &Path, record_bytes: usize, how: &mut OpenOptions) -> Result<Self> {
         validate_record_bytes(record_bytes)?;
-        let f = OpenOptions::new()
+        let f = how
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
             .custom_flags(DIRECT_FLAGS)
             .open(path)
             .map_err(|e| anyhow::anyhow!("open O_DIRECT {}: {e}", path.display()))?;
