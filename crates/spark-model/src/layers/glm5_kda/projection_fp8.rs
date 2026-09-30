@@ -63,7 +63,19 @@ pub(super) fn try_project(
 /// 2048..~4K-row chunks where the heuristic picks split-K 2, at ~half the time.
 fn no_split_k() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_GLM_KDA_PREFILL_LT_FP8_SPLITK1").as_deref() == Ok("1"))
+    *ON.get_or_init(|| {
+        parse_no_split_k(
+            std::env::var("ATLAS_GLM_KDA_PREFILL_LT_FP8_SPLITK1")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Off unless exactly `1`: the pin is its own opt-in, not implied by the
+/// parent `ATLAS_GLM_KDA_PREFILL_LT_FP8` (whose dispatch `run` gates).
+fn parse_no_split_k(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -236,6 +248,13 @@ mod tests {
         }
         assert_eq!(gpu.launch_count(), 0);
         assert_eq!(gpu.alloc_count(), 0);
+    }
+    #[test]
+    fn kda_lt_fp8_split_k_pin_is_off_unless_set_to_one() {
+        for value in [None, Some(""), Some("0"), Some("true"), Some("2")] {
+            assert!(!parse_no_split_k(value), "{value:?}");
+        }
+        assert!(parse_no_split_k(Some("1")));
     }
     #[test]
     fn kda_lt_fp8_bounds_fail_before_casts_and_lt_error_propagates() {
