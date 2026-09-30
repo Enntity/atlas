@@ -230,7 +230,7 @@ fn actual_worker_behind_the_head_fails_on_the_announce_words() {
 #[test]
 fn the_trace_line_sums_a_requests_chunks_and_forgets_them() {
     let ms = Duration::from_millis;
-    let mut warm = WarmTurn::from_env();
+    let mut warm = WarmTurn::from_env().unwrap();
     warm.trace = true;
     let began = Instant::now();
     let shape = || RequestShape {
@@ -288,4 +288,35 @@ fn the_trace_line_sums_a_requests_chunks_and_forgets_them() {
     warm.trace = false;
     warm.charge_transfer(began - ms(2));
     assert_eq!(*warm.transfer.lock(), (Duration::ZERO, None));
+}
+
+#[test]
+fn zero_rows_is_off_trim_or_check_and_refuses_anything_else() {
+    use ZeroRows::*;
+    assert_eq!(ZeroRows::parse(None, None).unwrap(), Off);
+    assert_eq!(ZeroRows::parse(Some("0"), None).unwrap(), Off);
+    assert_eq!(ZeroRows::parse(Some("1"), None).unwrap(), Trim(2048));
+    assert_eq!(ZeroRows::parse(Some("check"), None).unwrap(), Check(2048));
+    assert_eq!(
+        ZeroRows::parse(Some("1"), Some("4096")).unwrap(),
+        Trim(4096)
+    );
+    assert_eq!(
+        ZeroRows::parse(Some("check"), Some("256")).unwrap(),
+        Check(256)
+    );
+    // A floor without the switch is only read.
+    assert_eq!(ZeroRows::parse(None, Some("512")).unwrap(), Off);
+    for bad in ["true", "2", "", "CHECK"] {
+        let e = ZeroRows::parse(Some(bad), None).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("ATLAS_GLM_ZERO_ROWS must"),
+            "{e:#}"
+        );
+    }
+    // A floor under a batched verify's rows could not cover a decode step.
+    for bad in ["255", "0", "rows", "-1"] {
+        let e = ZeroRows::parse(Some("1"), Some(bad)).unwrap_err();
+        assert!(format!("{e:#}").contains("_FLOOR must"), "{e:#}");
+    }
 }

@@ -289,6 +289,7 @@ impl TransformerModel {
                 return Ok(ptr);
             }
         };
+        self.buffers.note_rows(proc_count + passenger_rows);
         let t_proc = tp.elapsed();
         let _det = crate::det_trace::enter(self.config.ep_rank, seq.slot_idx, proc_start);
 

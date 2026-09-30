@@ -277,6 +277,7 @@ impl TransformerModel {
                 // forward overwrites the remaining scratch buffers before read.
                 if self.comm.is_some() {
                     self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+                    self.buffers.note_rows(usize::MAX); // rows unknown to `zero_dirty`
                 } else if chunk_start == 0 {
                     self.buffers
                         .zero_prefill_essentials(self.gpu.as_ref(), stream)?;

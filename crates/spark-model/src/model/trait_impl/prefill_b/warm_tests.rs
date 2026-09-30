@@ -3,7 +3,7 @@
 //! A chunk the cache covers completely: which chunk that is, and on the real
 //! `prefill_chunk` that the switch changes nothing but the zero and embed of
 //! those chunks. Then the worker's real chunk handler fed the prompt as a
-//! delta, and the trace switch.
+//! delta, the trace switch and the zero modes of `ATLAS_GLM_ZERO_ROWS`.
 
 // The real model and recording layer of `prefill_stream_tests`.
 #[allow(clippy::duplicate_mod)]
@@ -12,7 +12,7 @@ mod fixture;
 
 use super::fully_cached;
 use crate::layer::EmptyLayerState;
-use crate::model::warm_turn::prompt_hash;
+use crate::model::warm_turn::{ZeroRows, prompt_hash};
 use crate::traits::{Model, SequenceState};
 use fixture::*;
 
@@ -234,4 +234,26 @@ fn actual_trace_changes_no_pass() {
         (f.events(), seq.seq_len, seq.block_table.len(), zeroed)
     };
     assert_eq!(cold(true), cold(false));
+}
+
+/// `ATLAS_GLM_ZERO_ROWS` on the real chunk path. The fixture's buffers are
+/// all small, so a trimmed zero covers each of them whole and the check
+/// finds nothing: every mode zeroes every chunk and runs the same passes.
+/// (What a trimmed zero covers of a large buffer is the arena's own test.)
+#[test]
+fn actual_zero_rows_modes_zero_every_chunk_of_a_small_arena() {
+    let tokens: Vec<u32> = (1..=24).collect();
+    let cold = |mode: ZeroRows| {
+        let mut f = Fixture::with_tail_split(2, 2, 0);
+        f.disable_capture();
+        f.model.warm.zero_rows = mode;
+        let mut seq = std::mem::replace(&mut f.seq, SequenceState::host_only(0));
+        let zeroed = run_chunks(&f, &mut seq, &tokens);
+        (f.events(), seq.seq_len, seq.block_table.len(), zeroed)
+    };
+    let off = cold(ZeroRows::Off);
+    assert_eq!((off.0.len(), &off.3[..]), (3, &[true, true, true][..]));
+    for mode in [ZeroRows::Trim(256), ZeroRows::Check(256)] {
+        assert_eq!(cold(mode), off, "{mode:?}");
+    }
 }

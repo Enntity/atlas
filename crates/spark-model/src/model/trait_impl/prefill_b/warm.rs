@@ -24,14 +24,15 @@
 //! the zero changes nothing it reads or writes.
 //!
 //! A chunk that computes is unchanged: full zero, full embed, then the
-//! re-embed of its uncached rows (`proc_range`).
+//! re-embed of its uncached rows (`proc_range`). How much of the arena that
+//! zero covers is `ATLAS_GLM_ZERO_ROWS`'s (`warm_turn::ZeroRows`).
 
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use super::super::super::types::TransformerModel;
-use super::super::super::warm_turn::{PHASES, RequestShape};
+use super::super::super::warm_turn::{PHASES, RequestShape, ZeroRows};
 use crate::traits::SequenceState;
 
 /// Whether chunk `[start, start + len)` computes nothing: it is not the last
@@ -75,7 +76,7 @@ impl TransformerModel {
     ) -> Result<[Duration; 2]> {
         let t0 = Instant::now();
         if self.comm.is_some() {
-            self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+            self.warm_zero_arena(stream)?;
         } else if chunk_start == 0 {
             self.buffers
                 .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
@@ -86,6 +87,29 @@ impl TransformerModel {
         self.prefill_b_embed_chunk(tokens, chunk_start, chunk_len, stream)?;
         self.warm_trace_sync(stream)?;
         Ok([zero, t0.elapsed() - zero])
+    }
+
+    /// The multi-rank zero before a chunk: the whole arena, or with
+    /// `ATLAS_GLM_ZERO_ROWS` what may be dirty (`ZeroRows`).
+    fn warm_zero_arena(&self, stream: u64) -> Result<()> {
+        let (gpu, arena) = (self.gpu.as_ref(), &self.buffers);
+        match self.warm.zero_rows {
+            ZeroRows::Off => arena.zero_all(gpu, stream),
+            ZeroRows::Trim(floor) => arena.zero_dirty(gpu, stream, floor),
+            ZeroRows::Check(floor) => {
+                let stale = arena.stale_past_dirty(gpu, stream, floor)?;
+                for (name, at, kept) in &stale {
+                    tracing::error!(
+                        "ATLAS_GLM_ZERO_ROWS=check: {name} holds a nonzero byte at {at}, past \
+                         the {kept} bytes a trimmed zero covers (floor {floor} rows)"
+                    );
+                }
+                if stale.is_empty() {
+                    tracing::info!("ATLAS_GLM_ZERO_ROWS=check: clean (floor {floor} rows)");
+                }
+                arena.zero_all(gpu, stream)
+            }
+        }
     }
 
     /// `ATLAS_GLM_WARM_TRACE`: drain `stream`, so the span being timed holds

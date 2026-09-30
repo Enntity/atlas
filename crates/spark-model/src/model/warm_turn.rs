@@ -55,13 +55,14 @@
 //!
 //! # What is not removed, and why
 //!
-//! * The arena zero of a chunk that computes. The arena is shared scratch
-//!   with layouts that do not follow the row count (the index logits of a
-//!   row group over the whole context, the FlashKDA workspace, the MLA
-//!   absorbed query), and `decode_a` documents a path that read rows it had
-//!   not written. Zeroing "the rows this chunk uses" is therefore not the
-//!   zero every pass starts from today; it needs a measured bound on what a
-//!   pass dirties.
+//! * The arena zero of a chunk that computes, by default. The arena is
+//!   shared scratch with layouts that do not follow the row count (the index
+//!   logits of a row group over the whole context, the FlashKDA workspace,
+//!   the MLA absorbed query), and `decode_a` documents a path that read rows
+//!   it had not written. Zeroing "the rows this chunk uses" is therefore not
+//!   the zero every pass starts from today. [`ZeroRows`] zeroes what earlier
+//!   passes may have dirtied instead, behind `ATLAS_GLM_ZERO_ROWS`, with a
+//!   check mode that measures whether that bound holds on a workload.
 //! * The second pass of the tail split. One pass over `[restored, N)` runs
 //!   the same math with other GEMM shapes, MoE groups and KDA pieces
 //!   (`pc_policy`, "Accumulation order"), and the checkpoint at `cut` would
@@ -75,9 +76,9 @@
 //!
 //! `ATLAS_GLM_PROMPT_DELTA` changes the head's command words, so both ranks
 //! must run with the same value (the launcher's startup agreement must carry
-//! it: [`prompt_delta_requested`]). `ATLAS_GLM_WARM_SKIP_CACHED` adds no
-//! command and no collective: a rank without it only does the work the other
-//! skips.
+//! it: [`prompt_delta_requested`]). The other switches add no command and no
+//! collective; a rank without `ATLAS_GLM_WARM_SKIP_CACHED` or
+//! `ATLAS_GLM_ZERO_ROWS` only does the work the other skips.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -111,6 +112,8 @@ pub(in crate::model) struct WarmTurn {
     pub(in crate::model) skip_cached: bool,
     /// `ATLAS_GLM_WARM_TRACE=1`: the per-request line of [`Trace`].
     pub(in crate::model) trace: bool,
+    /// `ATLAS_GLM_ZERO_ROWS`: how a multi-rank chunk zeroes the arena.
+    pub(in crate::model) zero_rows: ZeroRows,
     /// The prompts of the prefill commands this rank sent or received.
     prompts: Mutex<PromptMirrors>,
     /// Prompt-transfer time not yet charged to a request, and when the
@@ -120,14 +123,60 @@ pub(in crate::model) struct WarmTurn {
 }
 
 impl WarmTurn {
-    pub(in crate::model) fn from_env() -> Self {
-        Self {
+    pub(in crate::model) fn from_env() -> Result<Self> {
+        let var = |name| std::env::var(name).ok();
+        Ok(Self {
             prompt_delta: prompt_delta_requested(),
             skip_cached: env_on("ATLAS_GLM_WARM_SKIP_CACHED"),
             trace: env_on("ATLAS_GLM_WARM_TRACE"),
+            zero_rows: ZeroRows::parse(
+                var("ATLAS_GLM_ZERO_ROWS").as_deref(),
+                var("ATLAS_GLM_ZERO_ROWS_FLOOR").as_deref(),
+            )?,
             prompts: Mutex::default(),
             transfer: Mutex::default(),
             traces: Mutex::default(),
+        })
+    }
+}
+
+/// How a multi-rank prefill chunk zeroes the buffer arena
+/// (`ATLAS_GLM_ZERO_ROWS`, default off; `spark_runtime::buffers`,
+/// `zero_dirty`). The payload is the floor in rows
+/// (`ATLAS_GLM_ZERO_ROWS_FLOOR`, default [`ZeroRows::FLOOR`]).
+///
+/// Not exact by construction: `Trim` leaves the arena `zero_all` leaves only
+/// while no pass writes past the rows it noted plus the floor. Run a
+/// workload under `Check` first; it serves exactly as `Off` does and logs an
+/// error for every byte `Trim` would have left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::model) enum ZeroRows {
+    /// Unset or `0`: the whole arena, as always.
+    Off,
+    /// `1`: what may be dirty.
+    Trim(usize),
+    /// `check`: the whole arena, after reading what `Trim` would leave.
+    Check(usize),
+}
+
+impl ZeroRows {
+    /// Rows a trimmed zero always covers: past a batched verify's 128 rows,
+    /// a row group of index logits over a 512K context and the routed
+    /// experts' 32-row padding (9,216 slots, 1,152 rows' worth).
+    pub(super) const FLOOR: usize = 2048;
+
+    pub(super) fn parse(mode: Option<&str>, floor: Option<&str>) -> Result<Self> {
+        let rows = match floor {
+            None => Self::FLOOR,
+            Some(v) => v.parse().ok().filter(|&rows| rows >= 256).ok_or_else(|| {
+                anyhow::anyhow!("ATLAS_GLM_ZERO_ROWS_FLOOR must be at least 256 rows, got {v:?}")
+            })?,
+        };
+        match mode {
+            None | Some("0") => Ok(Self::Off),
+            Some("1") => Ok(Self::Trim(rows)),
+            Some("check") => Ok(Self::Check(rows)),
+            Some(v) => anyhow::bail!("ATLAS_GLM_ZERO_ROWS must be 0, 1 or check, got {v:?}"),
         }
     }
 }
