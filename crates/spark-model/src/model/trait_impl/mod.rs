@@ -961,6 +961,10 @@ impl Model for TransformerModel {
     ) -> Result<()> {
         self.restore_sequence_state_dispatch(seq, num_blocks, reader)
     }
+    fn swap_resumable(&self) -> bool {
+        // The spill image holds no GLM semantic-index pools or tails.
+        self.kv_cache.lock().sparse_index_config().is_none()
+    }
     fn num_free_blocks(&self) -> usize {
         self.num_free_blocks_dispatch()
     }

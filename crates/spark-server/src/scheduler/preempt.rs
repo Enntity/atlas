@@ -168,6 +168,20 @@ pub(super) fn decode_batch_with_preemption(
     }
 }
 
+/// Whether to run the `--swap-space` pool. A model that cannot resume a
+/// swapped sequence gets none: admission then waits for blocks and decode
+/// preemption requeues for re-prefill.
+pub(super) fn spill_pool_enabled(model: &dyn Model, swap_space_gb: usize) -> bool {
+    if swap_space_gb > 0 && !model.swap_resumable() {
+        tracing::warn!(
+            "--swap-space-gb={swap_space_gb} ignored: this model cannot resume a swapped \
+             sequence, so preempted sequences re-prefill instead"
+        );
+        return false;
+    }
+    swap_space_gb > 0
+}
+
 /// Save a (already removed from `active`) sequence's KV+SSM image to the
 /// spill pool, free its GPU resources and build the [`SwappedSeq`].
 ///

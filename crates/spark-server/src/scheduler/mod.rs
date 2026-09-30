@@ -399,7 +399,8 @@ pub fn run(
     let mut prefilling: Vec<PrefillInProgress> = Vec::new();
     let mut swapped: Vec<SwappedSeq> = Vec::new();
     let mut preempted: Vec<PreemptedSeq> = Vec::new();
-    let mut spill_manager: Option<KvSpillManager> = if swap_space_gb > 0 {
+    let spill_pool = preempt::spill_pool_enabled(&*model, swap_space_gb);
+    let mut spill_manager: Option<KvSpillManager> = if spill_pool {
         let max_bytes = swap_space_gb as u64 * 1024 * 1024 * 1024;
         // Per-PROCESS directory. `KvSpillManager::new` wipes stale `swap_*` files
         // on construction, which is correct for a restart and correct across a
