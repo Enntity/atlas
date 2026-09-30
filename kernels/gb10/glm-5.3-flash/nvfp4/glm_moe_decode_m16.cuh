@@ -3,9 +3,10 @@
 // GLM verify-decode twins of the K128W kernels (ATLAS_GLM_MOE_DECODE_M16).
 // Included by moe_w4a16_grouped_gemm.cu after the K128W pieces it reuses.
 //
-// A DFlash verify step routes at most 16 rows, and top-k takes an expert at
-// most once per row, so every expert holds at most 16 sorted rows: one m16
-// MMA slab. The M64 kernels decode otherwise runs (compact k64 gate/up,
+// Top-k takes an expert at most once per row, so a verify-decode batch of at
+// most 16 rows (a DFlash verify block or owner batch of 2-8 rows, 3-row owner
+// batches of 6-12) leaves every expert at most 16 sorted rows: one m16 MMA
+// slab. The M64 kernels decode otherwise runs (compact k64 gate/up,
 // silu_mul_quant_nvfp4 + a D2D copy, dense K128 down) pad each tile to 64
 // rows, three MMAs in four on padding. They already read the routed experts'
 // weights at 96-100% of a read-only pass over the same bytes at 5-8 rows
@@ -26,8 +27,12 @@
 // fills with one N tile per M64 row tile ([0] the item count, items from
 // word 4 as (expert, m_tile << 6 | n_tile)), with bound >= that count.
 // Requires K % 128 == 0, N % 256 == 0 (gate/up: N % 128 == 0) and at most
-// PQD_M rows per expert; a CTA whose expert has more returns before any
-// store (the host only selects these kernels for <= 16 rows).
+// PQD_M rows per expert. The host only selects these kernels for <= 16 rows;
+// should an expert hold more anyway, its down CTAs store NaN over its rows
+// (and gate/up stores nothing), so a broken host guard cannot pass as stale
+// bytes. PQD_STAGES 4 is about 80 KB of static shared memory per CTA, above
+// the classic 48 KB: a module-load or launch failure on another driver would
+// point here.
 #pragma once
 
 #define PQD_M 16
@@ -201,10 +206,18 @@ __device__ __forceinline__ void pqd_impl(
     if (expert_id >= num_experts || worklist[5 + blockIdx.y * 2] != 0) return;
     const unsigned int cta_m = expert_offsets[expert_id];
     const int M_expert = expert_offsets[expert_id + 1] - (int)cta_m;
-    if (M_expert <= 0 || M_expert > PQD_M) return;
     const unsigned char* B_expert = (const unsigned char*)B_packed_ptrs[expert_id];
     const unsigned char* S_expert = (const unsigned char*)B_scale_ptrs[expert_id];
-    if (B_expert == 0) return;
+    if (M_expert <= 0 || B_expert == 0) return;
+    if (M_expert > PQD_M) {
+        // More rows than the one slab the host selects these kernels for.
+        if constexpr (!GATE_UP) {
+            const __nv_bfloat16 nan = __float2bfloat16(__int_as_float(0x7fc00000));
+            for (int r = 0; r < M_expert; ++r)
+                C[(unsigned long long)(cta_m + r) * N + blockIdx.x * PQW_NT + threadIdx.x] = nan;
+        }
+        return;
+    }
     const float scale2 = scale2_vals[expert_id];
     const unsigned char* U_expert = GATE_UP ? (const unsigned char*)up.packed_ptrs[expert_id] : nullptr;
     const unsigned char* US_expert = GATE_UP ? (const unsigned char*)up.scale_ptrs[expert_id] : nullptr;

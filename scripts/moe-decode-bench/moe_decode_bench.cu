@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Standalone GLM-5.3-Flash routed-MoE verify-decode microbenchmark (GB10,
-// one expert-TP rank: all 288 experts local at the rank's I/2 = 1024 slice).
+// one expert-TP rank: all 288 experts local at the rank's I/2 = 1024 slice;
+// -DMOE_DECODE_I=2048 -DMOE_DECODE_E=144 is an EP rank's experts at full I).
 //
 // One DFlash verify step's routed FFN for T rows (top-8 of 288 experts, U
 // distinct experts), launched as serving launches it:
@@ -13,7 +14,8 @@
 // over a ring of routings with disjoint expert sets, so every repetition reads
 // cold weights (as the 42 MoE layers of a real step do). Every variant is
 // gated byte for byte against production on every routing, and the down
-// kernels once more on inputs rewritten to signed E2M1 zeros.
+// kernels once more on inputs rewritten to signed E2M1 zeros. A workload with
+// more than 16 rows per expert (17:8) checks the M16 downs' NaN backstop.
 //
 // Build + run on a GB10 host, from this directory (-arch=sm_121a alone does
 // not enable the mxf4nvf4 MMA in ptxas; --fmad=false as KERNEL.toml):
@@ -38,9 +40,15 @@
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(2); } } while (0)
 
-static const unsigned E = 288, TOPK = 8, H = 4096, I = 1024;
+#ifndef MOE_DECODE_I
+#define MOE_DECODE_I 1024
+#endif
+#ifndef MOE_DECODE_E
+#define MOE_DECODE_E 288
+#endif
+static const unsigned E = MOE_DECODE_E, TOPK = 8, H = 4096, I = MOE_DECODE_I;
 static const unsigned NT_GU = I / 128, NT_DN = H / 128;   // N128 tiles of gate/up and down
-// Packed E2M1 + E4M3 block scales of one [1024 x 4096] / [4096 x 1024] slice.
+// Packed E2M1 + E4M3 block scales of one [I x 4096] / [4096 x I] slice.
 static const double PROJ_BYTES = (double)I * H / 2 + (double)I * H / 16;
 
 struct Lcg {
@@ -409,6 +417,30 @@ int main(int argc, char** argv) {
             }
             printf("  signed-zero stress, M16 downs vs dense K128: bf16 differing %zu of %zu\n", bad, cells);
             bad_total += bad != 0;
+        }
+
+        if (max_rows > 16) {
+            // Host-guard backstop: an expert with more than 16 rows gets NaN
+            // from the M16 downs, never stale bytes.
+            size_t stale = 0, cells = 0;
+            const std::function<void(const Route&)> downs[2] = {down_m16, down_m16z};
+            for (unsigned ri = 0; ri < ring; ++ri) {
+                const Route& rt = routes[ri];
+                const auto offs = down(rt.off, E + 1);
+                for (auto& f : downs) {
+                    CK(cudaMemcpy(q, refs[ri].q.data(), qb + sb, cudaMemcpyHostToDevice));
+                    CK(cudaMemset(c_down, 0x5a, (size_t)TE * H * 2));
+                    prefix16(rt); f(rt);
+                    CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+                    const auto got = down(c_down, (size_t)TE * H);
+                    for (unsigned e = 0; e < E; ++e)
+                        for (int row = offs[e]; row < offs[e + 1] && offs[e + 1] - offs[e] > 16; ++row)
+                            for (unsigned c = 0; c < H; ++c, ++cells)
+                                stale += !std::isnan(__bfloat162float(got[(size_t)row * H + c]));
+                }
+            }
+            printf("  over-full experts (> 16 rows), M16 downs: %zu of %zu cells not NaN\n", stale, cells);
+            bad_total += stale != 0 || cells == 0;
         }
 
         // Timing. Variants are interleaved within a repetition and each takes
