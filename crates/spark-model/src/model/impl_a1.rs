@@ -715,6 +715,7 @@ impl TransformerModel {
             verify_wy_cache: Mutex::new(None),
             verify_kgamma_graph: Mutex::new(std::collections::HashMap::new()),
             fused_graph: Mutex::new(std::collections::HashMap::new()),
+            verify_pieces: Default::default(),
             prefix_cache,
             secondary_stream,
             secondary_event,

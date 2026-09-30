@@ -63,6 +63,7 @@ impl TransformerModel {
                 true
             }
         });
+        self.verify_pieces.invalidate_slot(slot, self.gpu.as_ref());
         for g in dead {
             if g.0 != 0
                 && let Err(e) = self.gpu.destroy_graph(g)

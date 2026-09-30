@@ -375,6 +375,9 @@ pub struct TransformerModel {
     /// Replaces the separate `decode_graph` (M=1) + `verify{k}_graph` (M=k)
     /// on the DFlash path with a single M-row weight sweep.
     pub(super) fused_graph: Mutex<std::collections::HashMap<(usize, usize), GraphHandle>>,
+    /// Piecewise-captured KDA runs of the GLM DFlash verify
+    /// (`ATLAS_GLM_VERIFY_GRAPH=1`); see `model::verify_pieces`.
+    pub(super) verify_pieces: super::verify_pieces::VerifyPieces,
     /// Prefix cache for KV block reuse across requests.
     pub(super) prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache>,
     /// Secondary CUDA stream for pipelining checkpoint D2D with MTP propose.
