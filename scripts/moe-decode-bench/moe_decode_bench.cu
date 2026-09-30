@@ -10,19 +10,34 @@
 //   k128w       the prefill K128W kernels over the same rows
 //   m16         ATLAS_GLM_MOE_DECODE_M16: worklist -> M16 gate/up+SiLU -> M16 down
 //   m16+zskip   ... with ATLAS_GLM_MOE_DOWN_ZSKIP's down
-//   read-only   the same weight bytes read once and nothing else (roofline)
-// over a ring of routings with disjoint expert sets, so every repetition reads
-// cold weights (as the 42 MoE layers of a real step do). Every variant is
+//   m16s, m32s  ATLAS_GLM_MOE_DECODE_STREAM: the M16 kernels with streaming
+//               loads, over one row slab (<= 16 rows per expert) or two (<= 32)
+//   read-only   the same weight bytes read once and nothing else: "tables" in
+//               the kernels' grid of static per-expert slices, "chunked" in
+//               64 KB chunks taken in order by all SMs (the DRAM ceiling)
+// over a ring of at least three routings with rotating expert sets (disjoint
+// while three fit), so every repetition reads cold weights (as the 42 MoE
+// layers of a real step do). On ennspark03 (shared, fragmented memory) a
+// launch reading about 500 MB or more (gate/up at U > 104, or U 97-104 with
+// only two sets) ran at about half speed, cp.async and plain loads first,
+// streaming loads from U = 120; serving's K128W gate/up at 32 rows (2271 us,
+// U about 113) shows no such drop, so keep U <= 104 there. Every variant is
 // gated byte for byte against production on every routing, and the down
 // kernels once more on inputs rewritten to signed E2M1 zeros. A workload with
-// more than 16 rows per expert (17:8) checks the M16 downs' NaN backstop.
+// more than 16 (32) rows per expert, e.g. 17:8 (33:8), checks the downs' NaN
+// backstop.
 //
-// Build + run on a GB10 host, from this directory (-arch=sm_121a alone does
-// not enable the mxf4nvf4 MMA in ptxas; --fmad=false as KERNEL.toml):
-//   nvcc -O3 -std=c++17 --fmad=false -gencode arch=compute_121a,code=sm_121a \
-//     -o /tmp/moe_decode_bench moe_decode_bench.cu
-//   /tmp/moe_decode_bench [T:U ...]        (default 1:8 2:14 4:22 5:27 7:36 8:41)
-//   MOE_DECODE_REPS=n (default 42 per variant)
+// Build + run on a GB10 host from the worktree root, in the release builder
+// image (about 10 s to build; -arch=sm_121a alone does not enable the
+// mxf4nvf4 MMA in ptxas; --fmad=false as KERNEL.toml):
+//   docker run --rm --gpus all -v $PWD:/w -w /w/scripts/moe-decode-bench \
+//     atlas-release-builder:1.93.1 bash -c 'nvcc -O3 -std=c++17 --fmad=false \
+//     -gencode arch=compute_121a,code=sm_121a -o /tmp/mdb moe_decode_bench.cu \
+//     && MOE_DECODE_REPS=16 /tmp/mdb 3:18 5:27 8:41 16:77 32:96'
+// (under a minute in all). Arguments T:U (rows, distinct experts; default
+// 1:8 ... 8:41 16:80 24:12 32:8 32:96), MOE_DECODE_REPS=n (default 42 per
+// variant; 0 runs the byte gates only). Each workload ends with an ARM B/A
+// line: the stream flag's kernels over production's at those rows.
 // Exit: 0 ok, 1 a variant's bytes differ, 2 setup error.
 
 #include "../../kernels/gb10/glm-5.3-flash/nvfp4/moe_w4a16_grouped_gemm.cu"
@@ -35,6 +50,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
+#include <string>
 #include <vector>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
@@ -88,6 +105,33 @@ __global__ void roof_read(const unsigned long long* __restrict__ pp, const unsig
     if (x == 0x12345678u) out[0] = x;
 }
 
+// Ceiling: the same tables in 64 KiB chunks that the blocks take in order from
+// a zeroed counter, so every SM streams the same few tables at a time.
+// Grid (blocks), 1024 threads.
+__global__ void roof_chunked(const unsigned long long* __restrict__ pp, const unsigned long long* __restrict__ sp,
+                             const unsigned long long* __restrict__ pp2, const unsigned long long* __restrict__ sp2,
+                             const int* __restrict__ active, int experts, size_t packed16, size_t scale16,
+                             int* __restrict__ next, unsigned* out) {
+    __shared__ int s_chunk;
+    const int CH = 4096, pc = (int)(packed16 / CH), sc = (int)(scale16 / CH), per = (pp2 ? 2 : 1) * (pc + sc);
+    unsigned x = 0;
+    for (;;) {
+        if (threadIdx.x == 0) s_chunk = atomicAdd(next, 1);
+        __syncthreads();
+        const int c = s_chunk;
+        __syncthreads();
+        if (c >= experts * per) break;
+        const int e = active[c / per], proj = (c % per) / (pc + sc), r = (c % per) % (pc + sc);
+        const unsigned long long* tab = r < pc ? (proj ? pp2 : pp) : (proj ? sp2 : sp);
+        const uint4* q = (const uint4*)tab[e] + (size_t)(r < pc ? r : r - pc) * CH;
+        for (int i = threadIdx.x; i < CH; i += blockDim.x) {
+            const uint4 v = __ldcs(q + i);
+            x ^= v.x ^ v.y ^ v.z ^ v.w;
+        }
+    }
+    if (x == 0x12345678u) out[0] = x;
+}
+
 template <class T> static T* dev(size_t n) { T* p; CK(cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(T))); return p; }
 template <class T> static T* up(const std::vector<T>& h) { T* p = dev<T>(h.size()); CK(cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice)); return p; }
 template <class T> static std::vector<T> down(const T* p, size_t n) { std::vector<T> h(n); CK(cudaMemcpy(h.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost)); return h; }
@@ -101,15 +145,21 @@ struct ExpertTable {  // [K/2, N] packed + [K/16, N] scales + scale2 per expert
     float* s2;
 };
 
+// One packed and one scale slab per projection, carved per expert, as
+// serving's transpose_experts_gpu lays them out (separate allocations per
+// expert read up to 2x slower at 100+ experts on a fragmented host).
 static ExpertTable make_table(Lcg& r, unsigned n, unsigned k, float s2base) {
     std::vector<unsigned long long> pp(E), sp(E);
     std::vector<float> s2(E);
     std::vector<unsigned char> w((size_t)k / 2 * n), s((size_t)k / 16 * n);
+    unsigned char *wslab = dev<unsigned char>(E * w.size()), *sslab = dev<unsigned char>(E * s.size());
     for (unsigned e = 0; e < E; ++e) {
         fill_bytes(w, r, false);
         fill_bytes(s, r, true);
-        pp[e] = (unsigned long long)up(w);
-        sp[e] = (unsigned long long)up(s);
+        pp[e] = (unsigned long long)(wslab + e * w.size());
+        sp[e] = (unsigned long long)(sslab + e * s.size());
+        CK(cudaMemcpy((void*)pp[e], w.data(), w.size(), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy((void*)sp[e], s.data(), s.size(), cudaMemcpyHostToDevice));
         s2[e] = s2base * (1.0f + (e % 7) * 0.125f);
     }
     return {up(pp), up(sp), up(s2)};
@@ -185,16 +235,22 @@ int main(int argc, char** argv) {
         }
         loads.push_back({t, u});
     }
-    if (loads.empty()) loads = {{1, 8}, {2, 14}, {4, 22}, {5, 27}, {7, 36}, {8, 41}};
-    const int reps = getenv("MOE_DECODE_REPS") ? std::max(atoi(getenv("MOE_DECODE_REPS")), 4) : 42;
+    // Serving shapes, then two with full second row slabs (32 and up to 24
+    // rows per expert) and a four-stream step's 32 rows.
+    if (loads.empty()) loads = {{1, 8}, {2, 14}, {4, 22}, {5, 27}, {7, 36}, {8, 41}, {16, 80}, {24, 12}, {32, 8}, {32, 96}};
+    const int reps_env = getenv("MOE_DECODE_REPS") ? atoi(getenv("MOE_DECODE_REPS")) : 42;
+    const int reps = reps_env > 0 ? std::max(reps_env, 4) : 0;   // 0: the byte gates only
     int sms; CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
     Timer tm;
 
     {
         // Streaming-read rate: the best grid of a few, fast decile of 9 each
         // (a shared host perturbs it; the read-only variant below is the
-        // roofline the kernels are held to).
-        const size_t bytes = (size_t)1 << 29;
+        // roofline the kernels are held to). 256 MB: on ennspark03 (shared,
+        // fragmented) the same read of a buffer of 512 MB or more ran at
+        // 113-138 GB/s, of 64-384 MB at 200-250, and so did every variant
+        // whose launch read over about 500 MB (U > 104 gate/up).
+        const size_t bytes = (size_t)1 << 28;
         uint4* a = dev<uint4>(bytes / 16);
         CK(cudaMemset(a, 1, bytes));
         unsigned* u = dev<unsigned>(1);
@@ -217,21 +273,21 @@ int main(int argc, char** argv) {
     for (const auto& load : loads) {
         const unsigned T = load.first, U = load.second;
         const unsigned TE = T * TOPK;
-        // Ring of disjoint active sets (a 256 MB flush when only one fits).
+        // Ring of active sets, disjoint while three fit.
         std::vector<unsigned> perm(E);
         for (unsigned e = 0; e < E; ++e) perm[e] = e;
         for (unsigned e = E - 1; e > 0; --e) std::swap(perm[e], perm[r.next() % (e + 1)]);
-        const unsigned ring = std::max(E / U, 1u);
+        const unsigned ring = std::max(E / U, 3u);
         std::vector<Route> routes;
         for (unsigned i = 0; i < ring; ++i) {
-            std::vector<unsigned> active(perm.begin() + i * U, perm.begin() + (i + 1) * U);
+            std::vector<unsigned> active(U);
+            for (unsigned j = 0; j < U; ++j) active[j] = perm[(i * U + j) % E];
             std::sort(active.begin(), active.end());
             // Route order is random within the set, as a router's would be.
             for (unsigned e = U - 1; e > 0; --e) std::swap(active[e], active[r.next() % (e + 1)]);
             routes.push_back(make_route(r, T, active));
             if (routes.back().distinct != U) { fprintf(stderr, "route covers %u of %u\n", routes.back().distinct, U); return 2; }
         }
-        unsigned char* flush = ring < 2 ? dev<unsigned char>((size_t)256 << 20) : nullptr;
         unsigned max_rows = 0;
         for (auto& q : routes) max_rows = std::max(max_rows, q.max_rows);
         const unsigned max_m_tiles = (max_rows + 63) / 64;
@@ -319,8 +375,48 @@ int main(int argc, char** argv) {
                 {"worklist", prefix16, 0}, {"gate_up_silu m16", gate_up_m16, gu_bytes},
                 {"down m16 zskip", down_m16z, dn_bytes}, {"unpermute", unperm, 0}}});
         }
-        // Read-only roofline over the same weight bytes (timing only).
+        // Stream-loaded twins (ATLAS_GLM_MOE_DECODE_STREAM): one row slab (up to
+        // 16 rows per expert) or two (up to 32).
+        using Launch = std::function<void(const Route&)>;
+        auto gate_up_s = [&](bool m32) -> Launch {
+            return [&, m32](const Route& rt) {
+                (m32 ? glm_moe_decode_m32s_gate_up_silu_k128w : glm_moe_decode_m16s_gate_up_silu_k128w)
+                    <<<dim3(I / 128, bound16), 256>>>(d_a, d_as, gate.pp, gate.sp, gate.s2, nullptr, rt.off,
+                    rt.sorted, E, I, H, d_work16, upt.pp, upt.sp, upt.s2, q, q + qb);
+            };
+        };
+        auto down_s = [&](bool m32, bool zskip) -> Launch {
+            return [&, m32, zskip](const Route& rt) {
+                (m32 ? (zskip ? glm_moe_decode_m32s_k128w_zskip : glm_moe_decode_m32s_k128w)
+                     : (zskip ? glm_moe_decode_m16s_k128w_zskip : glm_moe_decode_m16s_k128w))
+                    <<<dim3(H / 256, bound16), 256>>>(q, q + qb, dn.pp, dn.sp, dn.s2, c_down, rt.off, nullptr,
+                    E, H, I, d_work16);
+            };
+        };
+        auto stream_variant = [&](const char* name, bool m32, bool zskip) {
+            variants.push_back({name, {
+                {"worklist", prefix16, 0}, {"gate_up_silu stream", gate_up_s(m32), gu_bytes},
+                {zskip ? "down stream zskip" : "down stream", down_s(m32, zskip), dn_bytes}, {"unpermute", unperm, 0}}});
+        };
+        if (max_rows <= 16) {
+            stream_variant("m16s", false, false);
+            stream_variant("m16s+zskip", false, true);
+        }
+        if (max_rows <= 32) {
+            stream_variant("m32s", true, false);
+            stream_variant("m32s+zskip", true, true);
+        }
+        // Read-only rooflines over the same weight bytes (timing only): the
+        // kernels' grid of static table slices, and the chunked ceiling.
         unsigned* d_roof = dev<unsigned>(1);
+        int* d_next = dev<int>(1);
+        auto chunked = [&](const ExpertTable& a, const ExpertTable* b) -> Launch {
+            return [&, b](const Route& rt) {
+                CK(cudaMemsetAsync(d_next, 0, 4));
+                roof_chunked<<<sms, 1024>>>(a.pp, a.sp, b ? b->pp : nullptr, b ? b->sp : nullptr, rt.active, U,
+                    (size_t)I * H / 2 / 16, (size_t)I * H / 16 / 16, d_next, d_roof);
+            };
+        };
         auto roof_gu = [&](const Route& rt) {
             roof_read<<<dim3(16, U), 256>>>(gate.pp, gate.sp, upt.pp, upt.sp, rt.active,
                 (size_t)I * H / 2 / 16, (size_t)I * H / 16 / 16, d_roof);
@@ -330,7 +426,8 @@ int main(int argc, char** argv) {
                 (size_t)I * H / 2 / 16, (size_t)I * H / 16 / 16, d_roof);
         };
         const size_t roofline = variants.size();
-        variants.push_back({"read-only", {{"gate+up tables", roof_gu, gu_bytes}, {"down tables", roof_dn, dn_bytes}}});
+        variants.push_back({"read-only", {{"gate+up tables", roof_gu, gu_bytes}, {"down tables", roof_dn, dn_bytes},
+            {"gate+up chunked", chunked(gate, &upt), gu_bytes}, {"down chunked", chunked(dn, nullptr), dn_bytes}}});
 
         // Production outputs per route, then every other variant against them.
         struct Ref { std::vector<__nv_bfloat16> c, o; std::vector<unsigned char> q; };
@@ -347,8 +444,8 @@ int main(int argc, char** argv) {
             ref.c = down(c_down, (size_t)TE * H); ref.o = down(out, (size_t)T * H);
             return ref;
         };
-        printf("\nT=%u rows, U=%u distinct experts, %u routed rows, ring %u%s, max rows/expert %u, %d reps\n",
-               T, U, TE, ring, flush ? " + flush" : "", max_rows, reps);
+        printf("\nT=%u rows, U=%u distinct experts, %u routed rows, ring %u, max rows/expert %u, %d reps\n",
+               T, U, TE, ring, max_rows, reps);
         std::vector<Ref> refs;
         for (auto& rt : routes) refs.push_back(run(variants[0], rt));
         {
@@ -390,7 +487,7 @@ int main(int argc, char** argv) {
             bad_total += (bad_q || bad_c || bad_o);
         }
 
-        if (max_rows <= 16) {
+        if (max_rows <= 32) {
             // Signed-zero stress of the down kernels: every third sorted row
             // all -0 codes, every third a mix of +0/-0 codes, the rest as
             // routed (so tiles skip none, some and all of their weight rows).
@@ -403,7 +500,9 @@ int main(int argc, char** argv) {
                     for (unsigned kp = 0; kp < I / 2 && row % 3 != 2; ++kp)
                         z[(size_t)row * (I / 2) + kp] = row % 3 == 0 ? 0x88 : mix[(kp + row) & 3];
                 std::vector<__nv_bfloat16> want;
-                const std::function<void(const Route&)> downs[3] = {down_proj, down_m16, down_m16z};
+                std::vector<Launch> downs = {down_proj, down_s(true, false), down_s(true, true)};
+                if (max_rows <= 16)
+                    downs.insert(downs.end(), {down_m16, down_m16z, down_s(false, false), down_s(false, true)});
                 for (auto& f : downs) {
                     CK(cudaMemcpy(q, z.data(), qb + sb, cudaMemcpyHostToDevice));
                     CK(cudaMemset(c_down, 0x5a, (size_t)TE * H * 2));
@@ -415,48 +514,48 @@ int main(int argc, char** argv) {
                     cells += got.size();
                 }
             }
-            printf("  signed-zero stress, M16 downs vs dense K128: bf16 differing %zu of %zu\n", bad, cells);
+            printf("  signed-zero stress, M16 and stream downs vs dense K128: bf16 differing %zu of %zu\n", bad, cells);
             bad_total += bad != 0;
         }
 
         if (max_rows > 16) {
-            // Host-guard backstop: an expert with more than 16 rows gets NaN
-            // from the M16 downs, never stale bytes.
+            // Host-guard backstop: an expert with more rows than a kernel's
+            // slabs gets NaN from its downs, never stale bytes.
             size_t stale = 0, cells = 0;
-            const std::function<void(const Route&)> downs[2] = {down_m16, down_m16z};
+            std::vector<std::pair<Launch, int>> downs = {{down_m16, 16}, {down_m16z, 16},
+                {down_s(false, false), 16}, {down_s(false, true), 16}};
+            if (max_rows > 32) downs.push_back({down_s(true, true), 32});
             for (unsigned ri = 0; ri < ring; ++ri) {
                 const Route& rt = routes[ri];
                 const auto offs = down(rt.off, E + 1);
-                for (auto& f : downs) {
+                for (auto& [f, slab] : downs) {
                     CK(cudaMemcpy(q, refs[ri].q.data(), qb + sb, cudaMemcpyHostToDevice));
                     CK(cudaMemset(c_down, 0x5a, (size_t)TE * H * 2));
                     prefix16(rt); f(rt);
                     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
                     const auto got = down(c_down, (size_t)TE * H);
                     for (unsigned e = 0; e < E; ++e)
-                        for (int row = offs[e]; row < offs[e + 1] && offs[e + 1] - offs[e] > 16; ++row)
+                        for (int row = offs[e]; row < offs[e + 1] && offs[e + 1] - offs[e] > slab; ++row)
                             for (unsigned c = 0; c < H; ++c, ++cells)
                                 stale += !std::isnan(__bfloat162float(got[(size_t)row * H + c]));
                 }
             }
-            printf("  over-full experts (> 16 rows), M16 downs: %zu of %zu cells not NaN\n", stale, cells);
+            printf("  over-full experts (> 16 or 32 rows), M16 and stream downs: %zu of %zu cells not NaN\n", stale, cells);
             bad_total += stale != 0 || cells == 0;
         }
 
         // Timing. Variants are interleaved within a repetition and each takes
         // the ring's next routing, so every timed launch reads cold weights.
-        auto cold = [&](int i) {
-            if (flush) CK(cudaMemsetAsync(flush, i, (size_t)256 << 20));
-            return &routes[i % ring];
-        };
+        auto cold = [&](int i) { return &routes[i % ring]; };
         std::vector<std::vector<float>> whole(variants.size());
+        std::map<std::string, float> med;   // "variant/stage index" -> median ms
         for (int i = 0; i < reps; ++i)
             for (size_t vi = 0; vi < variants.size(); ++vi) {
                 const Route* rt = cold(i * variants.size() + vi);
                 CK(cudaDeviceSynchronize());
                 whole[vi].push_back(tm.once([&] { for (auto& st : variants[vi].stages) st.f(*rt); }));
             }
-        for (size_t vi = 0; vi < variants.size(); ++vi) {
+        for (size_t vi = 0; reps > 0 && vi < variants.size(); ++vi) {
             auto& v = variants[vi];
             for (auto& st : v.stages) {
                 // Each stage timed alone; the stages before it run untimed.
@@ -471,6 +570,7 @@ int main(int argc, char** argv) {
                     t.push_back(tm.once([&] { st.f(*rt); }));
                 }
                 const float ms = median(t), lo = pct(t, 0.1f);
+                med[std::string(v.name) + "/" + std::to_string(&st - v.stages.data())] = ms;
                 if (st.bytes > 0)
                     printf("  %-12s %-22s %8.1f us (p10 %7.1f)  %6.1f MB  %6.1f GB/s\n", v.name, st.name, ms * 1e3,
                            lo * 1e3, st.bytes / 1e6, st.bytes / ms / 1e6);
@@ -484,10 +584,20 @@ int main(int argc, char** argv) {
             printf("  %-12s %-22s %8.1f us (p10 %7.1f)  paired vs production %+.1f%%\n", v.name, "LAYER", median(whole[vi]) * 1e3,
                    pct(whole[vi], 0.1f) * 1e3, 100.0 * (median(ratio) - 1.0));
         }
-        CK(cudaFree(d_prefix)); CK(cudaFree(d_roof)); CK(cudaFree(d_work16));
+        {
+            // The hardware arms' kernels at these rows: A is production
+            // (M16+zskip for a verify block of up to 8 rows, else K128W), B
+            // adds ATLAS_GLM_MOE_DECODE_STREAM (one slab up to 16 rows, two
+            // up to 32).
+            const std::string a = T <= 8 ? "m16+zskip" : "k128w", b = T <= 16 ? "m16s+zskip" : "m32s+zskip";
+            if (med.count(a + "/1") && med.count(b + "/1"))
+                printf("  ARM B/A      %s -> %s: gate_up x%.3f (%.1f us less), down x%.3f (%.1f us less)\n", a.c_str(),
+                       b.c_str(), med[b + "/1"] / med[a + "/1"], (med[a + "/1"] - med[b + "/1"]) * 1e3,
+                       med[b + "/2"] / med[a + "/2"], (med[a + "/2"] - med[b + "/2"]) * 1e3);
+        }
+        CK(cudaFree(d_prefix)); CK(cudaFree(d_roof)); CK(cudaFree(d_next)); CK(cudaFree(d_work16));
         for (auto& rt : routes) { CK(cudaFree(rt.off)); CK(cudaFree(rt.sorted)); CK(cudaFree(rt.t2p)); CK(cudaFree(rt.ids)); CK(cudaFree(rt.w)); CK(cudaFree(rt.work)); CK(cudaFree(rt.active)); }
         CK(cudaFree(d_a)); CK(cudaFree(d_as)); CK(cudaFree(c_gate)); CK(cudaFree(c_up)); CK(cudaFree(c_down)); CK(cudaFree(out));
-        if (flush) CK(cudaFree(flush));
     }
     return bad_total ? 1 : 0;
 }
