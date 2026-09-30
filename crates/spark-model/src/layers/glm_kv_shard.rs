@@ -47,6 +47,18 @@ pub const MAX_SPLITS: u32 = 15;
 pub const PIECE_BLOCKS: usize = 2048;
 /// Tokens past `max_seq_len` a view must still hold (verify rows).
 const VIEW_SLACK_TOKENS: usize = 64;
+/// Environment opt-ins whose attention was never ported to sharded latents
+/// (multi-sequence sparse decode, the repaired MTP, C4 and independent decode
+/// lanes, the long-verify serial diagnostic): a shard refuses them at startup.
+const UNSHARDED_LANES: [&str; 7] = [
+    "ATLAS_GLM_MULTI_SEQ_SPARSE",
+    "ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS",
+    "ATLAS_GLM_MTP_REPAIR",
+    "ATLAS_GLM_C4_DECODE",
+    "ATLAS_GLM_C4_SPARSE",
+    "ATLAS_GLM_INDEPENDENT_DECODE",
+    "ATLAS_GLM_LONG_BATCH_SERIAL",
+];
 
 fn parse(name: &str, value: Option<&str>) -> Result<bool> {
     match value {
@@ -64,20 +76,20 @@ fn flag(name: &str) -> Result<bool> {
     }
 }
 
+/// The first of the unported lanes `var` opts into (anything but unset,
+/// empty or `0`).
+pub fn unsharded_lane(var: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    UNSHARDED_LANES
+        .into_iter()
+        .find(|name| !matches!(var(name).as_deref(), None | Some("" | "0")))
+}
+
 /// `ATLAS_GLM_KV_SHARD=1`: store each block's latents on one rank.
 pub fn requested() -> Result<bool> {
     flag("ATLAS_GLM_KV_SHARD")
 }
 
-/// `ATLAS_GLM_KV_SHARD_CHECK=1`: before each sharded attention, confirm
-/// this rank's block table keeps the ownership invariant and both ranks
-/// attend the same number of blocks (one host sync + exchange each).
-pub fn check_requested() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| flag("ATLAS_GLM_KV_SHARD_CHECK").unwrap_or(false))
-}
-
-/// The merge form's opt-in refinements, read once.
+/// The merge form's opt-in refinements and the shard's self-check, read once.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MergeTuning {
     /// `ATLAS_GLM_KV_SHARD_COMPACT=1`.
@@ -86,25 +98,33 @@ pub struct MergeTuning {
     /// exchange would run inside an overlap window. Decides at boot whether
     /// the cache gets an [`ExchangeLane`], which is what the layers consult.
     pub overlap: bool,
+    /// `ATLAS_GLM_KV_SHARD_CHECK=1`: before each merge-form attention,
+    /// confirm this rank's block table keeps the ownership invariant and
+    /// both ranks attend the same number of blocks (one host sync + exchange
+    /// each; the view form does so regardless).
+    pub check: bool,
 }
 
 impl MergeTuning {
-    /// A tuning set without the shard (`sharded`) is a misconfiguration.
+    /// Any of them set without the shard (`sharded`) is a misconfiguration.
     fn parse(
         compact: Option<&str>,
         overlap: Option<&str>,
-        check: bool,
+        check: Option<&str>,
         sharded: bool,
     ) -> Result<Self> {
         let compact = parse("ATLAS_GLM_KV_SHARD_COMPACT", compact)?;
         let overlap = parse("ATLAS_GLM_KV_SHARD_OVERLAP", overlap)?;
+        let check = parse("ATLAS_GLM_KV_SHARD_CHECK", check)?;
         ensure!(
-            sharded || !(compact || overlap),
-            "ATLAS_GLM_KV_SHARD_COMPACT and ATLAS_GLM_KV_SHARD_OVERLAP tune ATLAS_GLM_KV_SHARD=1, which is not set"
+            sharded || !(compact || overlap || check),
+            "ATLAS_GLM_KV_SHARD_COMPACT, ATLAS_GLM_KV_SHARD_OVERLAP and ATLAS_GLM_KV_SHARD_CHECK \
+             tune ATLAS_GLM_KV_SHARD=1, which is not set"
         );
         Ok(Self {
             compact,
             overlap: overlap && !check,
+            check,
         })
     }
 
@@ -119,7 +139,7 @@ impl MergeTuning {
                         Self::parse(
                             var("ATLAS_GLM_KV_SHARD_COMPACT").as_deref(),
                             var("ATLAS_GLM_KV_SHARD_OVERLAP").as_deref(),
-                            check_requested(),
+                            var("ATLAS_GLM_KV_SHARD_CHECK").as_deref(),
                             sharded,
                         )
                     })
@@ -135,8 +155,8 @@ impl MergeTuning {
 const SETTINGS_SHIFT: u32 = 56;
 
 /// `[shard, compact, overlap, check]` of a sharded rank, one bit each.
-fn settings_bits(tuning: MergeTuning, check: bool) -> u64 {
-    1 | (tuning.compact as u64) << 1 | (tuning.overlap as u64) << 2 | (check as u64) << 3
+fn settings_bits(tuning: MergeTuning) -> u64 {
+    1 | (tuning.compact as u64) << 1 | (tuning.overlap as u64) << 2 | (tuning.check as u64) << 3
 }
 
 /// What both ranks must run alike: a rank sharding alone would exchange
@@ -147,7 +167,7 @@ pub fn settings_word(sharded: bool) -> Result<u64> {
     if !sharded {
         return Ok(0);
     }
-    Ok(settings_bits(MergeTuning::get()?, check_requested()))
+    Ok(settings_bits(MergeTuning::get()?))
 }
 
 /// A rank's word for the pool-size gather: `blocks` under its `settings`.

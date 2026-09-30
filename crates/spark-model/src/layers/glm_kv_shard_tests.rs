@@ -6,84 +6,8 @@
 
 use super::*;
 
-#[test]
-fn flag_is_explicit() {
-    assert!(!parse("F", None).unwrap());
-    assert!(!parse("F", Some("0")).unwrap());
-    assert!(parse("F", Some("1")).unwrap());
-    for bad in ["", "true", "2", " 1"] {
-        assert!(parse("F", Some(bad)).is_err());
-    }
-}
-
-#[test]
-fn merge_tuning_is_explicit_and_the_check_keeps_exchanges_inline() {
-    let t = |c, o, check| MergeTuning::parse(c, o, check, true).unwrap();
-    assert_eq!(t(None, None, false), MergeTuning::default());
-    assert_eq!(t(Some("0"), Some("0"), false), MergeTuning::default());
-    let both = MergeTuning {
-        compact: true,
-        overlap: true,
-    };
-    assert_eq!(t(Some("1"), Some("1"), false), both);
-    // The check's own exchange would fall inside an overlap window.
-    assert!(!t(Some("1"), Some("1"), true).overlap);
-    assert!(t(Some("1"), Some("1"), true).compact);
-    assert!(MergeTuning::parse(Some("yes"), None, false, true).is_err());
-    assert!(MergeTuning::parse(None, Some("2"), false, true).is_err());
-}
-
-#[test]
-fn a_tuning_without_the_shard_fails_instead_of_being_ignored() {
-    let unsharded = |c, o| MergeTuning::parse(c, o, false, false);
-    assert_eq!(unsharded(None, Some("0")).unwrap(), MergeTuning::default());
-    for (c, o) in [(Some("1"), None), (None, Some("1")), (Some("junk"), None)] {
-        assert!(unsharded(c, o).is_err(), "{c:?} {o:?}");
-    }
-    // The check does not hide an overlap request.
-    let err = MergeTuning::parse(None, Some("1"), true, false).unwrap_err();
-    assert!(err.to_string().contains("ATLAS_GLM_KV_SHARD=1"), "{err}");
-}
-
-#[test]
-fn unsharded_ranks_gather_plain_block_counts_and_take_the_minimum() {
-    assert_eq!(settings_word(false).unwrap(), 0);
-    assert_eq!(blocks_word(177_000, 0), 177_000);
-    assert_eq!(
-        agreed_blocks(0, 177_000, &[177_000, 150_000]).unwrap(),
-        150_000
-    );
-    assert_eq!(
-        agreed_blocks(1, 150_000, &[177_000, 150_000]).unwrap(),
-        150_000
-    );
-}
-
-#[test]
-fn ranks_must_agree_on_the_shard_and_its_tunings() {
-    let plain = MergeTuning::default();
-    let compact = MergeTuning {
-        compact: true,
-        overlap: false,
-    };
-    let word = |blocks, tuning, check| blocks_word(blocks, settings_bits(tuning, check));
-    let (a, b) = (word(300_000, plain, false), word(280_000, plain, false));
-    assert_eq!(agreed_blocks(0, a, &[a, b]).unwrap(), 280_000);
-    // One rank sharded, one tuning or the check on one rank only: both fail.
-    for peer in [
-        blocks_word(280_000, 0),
-        word(280_000, compact, false),
-        word(280_000, plain, true),
-    ] {
-        for (rank, ours) in [(0, a), (1, peer)] {
-            let err = agreed_blocks(rank, ours, &[a, peer])
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("ATLAS_GLM_KV_SHARD settings"), "{err}");
-            assert!(err.contains(&format!("rank {rank} has")), "{err}");
-        }
-    }
-}
+#[path = "glm_kv_shard_settings_tests.rs"]
+mod settings;
 
 fn disjoint(regions: &[(usize, usize)]) -> bool {
     let mut sorted = regions.to_vec();

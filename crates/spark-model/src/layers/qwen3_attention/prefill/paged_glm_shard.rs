@@ -204,7 +204,8 @@ impl Qwen3AttentionLayer {
             a.rows
         );
         let gpu = ctx.gpu;
-        if shard::check_requested()
+        let tuning = shard::MergeTuning::get()?;
+        if tuning.check
             && let Some(end) = a.end
         {
             let table = read_table(gpu, a.block_table, end.div_ceil(16), stream)?;
@@ -222,7 +223,7 @@ impl Qwen3AttentionLayer {
             dtype: self.kv_dtype,
             pool: kv_cache.latent_pool_ptr(self.attn_layer_idx),
             scale: self.effective_attn_scale(hd),
-            compact: shard::MergeTuning::get()?.compact,
+            compact: tuning.compact,
             lane: self.glm_shard_lane(kv_cache, ctx),
         }
         .run(a, output, stream)
@@ -285,7 +286,7 @@ impl Qwen3AttentionLayer {
         );
         let gpu = ctx.gpu;
         let table = read_table(gpu, block_table, blocks, stream)?;
-        if shard::check_requested() {
+        if shard::MergeTuning::get()?.check {
             let words = s.scratch.offset(layout.check);
             self.glm_shard_check(&s, comm, gpu, words, &table, stream)?;
         }

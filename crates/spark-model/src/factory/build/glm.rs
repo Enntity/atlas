@@ -186,7 +186,8 @@ pub(super) fn shard_plan(
     max_batch_tokens: usize,
 ) -> Result<Option<GlmCachePlan>> {
     use anyhow::{Context, ensure};
-    // Junk tuning values, and tunings without the shard, fail the boot.
+    // Junk shard settings, and tunings or the check without the shard, fail
+    // the boot.
     let tuning = shard::MergeTuning::get()?;
     if !shard::requested()? {
         return Ok(plan);
@@ -214,11 +215,21 @@ pub(super) fn shard_plan(
         )),
         "ATLAS_GLM_KV_SHARD=1 needs a BF16 or fp8_g128 latent cache on every layer"
     );
+    // Lanes that read latents by global block id and are chosen by the
+    // environment: refused here rather than mid-request (the pool accessors
+    // panic under a shard).
+    let lane = shard::unsharded_lane(|name| std::env::var(name).ok());
+    ensure!(
+        lane.is_none(),
+        "ATLAS_GLM_KV_SHARD=1 does not support {}: its attention reads latents by global \
+         block id, and this rank stores only its own blocks",
+        lane.unwrap_or_default()
+    );
     tracing::info!(
         "KV latent shard merge form: compact={} overlap={} check={}",
         tuning.compact,
         tuning.overlap,
-        shard::check_requested()
+        tuning.check
     );
     // A cache write carries at most one chunk of rows (plus verify slack).
     let spec = spark_runtime::kv_cache::LatentShardSpec {
@@ -303,3 +314,7 @@ fn gather_across_ranks(
     gpu.free(buf)?;
     result
 }
+
+#[cfg(test)]
+#[path = "glm_tests.rs"]
+mod tests;

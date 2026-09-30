@@ -97,7 +97,11 @@ const Q_BYTES: usize = 8 * 32 * 512 * 2;
 const P_BYTES: usize = 8 * 32 * 513 * 4;
 
 fn tuning(compact: bool, overlap: bool) -> MergeTuning {
-    MergeTuning { compact, overlap }
+    MergeTuning {
+        compact,
+        overlap,
+        check: false,
+    }
 }
 
 #[test]
