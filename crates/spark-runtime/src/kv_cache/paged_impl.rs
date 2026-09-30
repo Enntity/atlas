@@ -227,11 +227,12 @@ impl PagedKvCache {
     pub fn free_blocks(&mut self, block_table: &[u32]) {
         for &idx in block_table {
             self.free_block(idx);
-            // A departing sequence never reads these raw index tails again, and
-            // a block it shares with the prefix cache holds only finalized
-            // pools (slotted tails are used with prefix caching only when
-            // restores are block-aligned), so its lent tail returns to the pool
-            // now instead of when the cache finally evicts the block.
+            // A departing sequence never reads these raw index tails again. A
+            // block that outlives it is one the prefix cache published: a
+            // whole block of committed tokens, whose pools are finalized, and
+            // which no holder appends to (a snapshot replay over it needs no
+            // tail: the kernel skips the block). So the tail returns to the
+            // pool now instead of when the cache finally evicts the block.
             if let Some(tails) = self.tail_slots.as_mut() {
                 tails.release(idx);
             }
@@ -260,9 +261,7 @@ impl PagedKvCache {
         // entry and two subsequent `alloc_block`s hand the SAME physical block to
         // two sequences: they interleave writes into each other's KV, and when
         // both later free it the second `dec_ref` underflows. That is reachable
-        // whenever the cache returns a block it never took a ref on — notably a
-        // `partial_suffix` block, which `insert` stores but `cache_sequence`
-        // never `inc_ref`s, and which `evict` nevertheless hands back.
+        // whenever the cache returns a block it never took a ref on.
         if self.block_ref_counts[idx] == 0 {
             tracing::warn!(
                 "return_evicted_block({block_idx}) with 0 refs (from {}) — the prefix cache \
