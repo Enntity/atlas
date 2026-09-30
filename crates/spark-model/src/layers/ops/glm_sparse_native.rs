@@ -82,6 +82,26 @@ fn validate_startup(
     Ok(())
 }
 
+/// Whether the selected library takes this ordinary continued-prefill piece;
+/// rank-identical (rows, start and capture state only).
+pub fn glm_sparse_native_admits(
+    ctx: &ForwardContext<'_>,
+    rows: u32,
+    seq_start: usize,
+    capture_verify_intermediates: bool,
+    stream: u64,
+) -> Result<bool> {
+    Ok(loader::enabled()?
+        && plan::admit(
+            rows as usize,
+            seq_start,
+            ctx.graph_capture,
+            ctx.gpu.stream_is_capturing(stream),
+            capture_verify_intermediates,
+        )
+        .is_some())
+}
+
 fn qualified_context(seq: usize) -> usize {
     seq.min(plan::MAX_CONTEXT)
 }
@@ -142,18 +162,7 @@ pub fn try_glm_sparse_native(
     capture_verify_intermediates: bool,
     stream: u64,
 ) -> Result<bool> {
-    if !loader::enabled()? {
-        return Ok(false);
-    }
-    if plan::admit(
-        a.rows as usize,
-        seq_start,
-        ctx.graph_capture,
-        ctx.gpu.stream_is_capturing(stream),
-        capture_verify_intermediates,
-    )
-    .is_none()
-    {
+    if !glm_sparse_native_admits(ctx, a.rows, seq_start, capture_verify_intermediates, stream)? {
         return Ok(false);
     }
     validate_geometry(ctx.config)?;
