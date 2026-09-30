@@ -458,6 +458,11 @@ impl TransformerModel {
                     tracing::warn!("bf16_add_inplace kernel not found (send/recv disabled): {e}")
                 }
             }
+            // Graph-capturable RDMA collectives (ATLAS_RDMA_ONESHOT=1); a
+            // backend without them ignores the handle.
+            if let Ok(k) = gpu.kernel("rdma_oneshot", "rdma_oneshot_bf16") {
+                comm.set_oneshot_kernel(k.0);
+            }
         }
 
         // Allocate pinned host staging buffer for batched metadata H2D.

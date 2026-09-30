@@ -32,6 +32,8 @@ metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 # driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
 # CI runner). Build on a real GPU host with `--features gpu-examples`.
 gpu-examples = []
+# The NCCL/RDMA-pair CommBackend, for the two-rank `comm_pair_bench` example.
+nccl = ["cuda", "spark-comm/nccl"]
 
 [dependencies]
 # SparkGLM-only: dlopen of the out-of-tree FlashKDA and native sparse-MLA bridges.
@@ -122,6 +124,10 @@ required-features = ["cuda", "gpu-examples"]
 [[example]]
 name = "concurrency_probe"
 required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "comm_pair_bench"
+required-features = ["cuda", "gpu-examples", "nccl"]
 
 [[example]]
 name = "glm_topk_bench"

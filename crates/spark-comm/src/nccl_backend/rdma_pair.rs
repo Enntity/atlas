@@ -24,7 +24,13 @@
 //! Two slots per direction suffice. A rank only signals `seq + 2` after its
 //! add of `seq` (stream order), and the peer only sends `seq + 2` after its
 //! own add of `seq + 1`, which waited on our `seq + 1` flag, which we only
-//! post after our `seq` data completed.
+//! post after our `seq` data completed. `ATLAS_RDMA_PAIR_CHAIN=1` posts a
+//! single-rail segment's flag in the same post right behind its data (one
+//! completion instead of two), relying on same-QP WRITEs landing in order.
+//!
+//! `ATLAS_RDMA_ONESHOT=1` adds a graph-capturable channel for decode-sized
+//! payloads in its own part of the region ([`oneshot`]); larger payloads stay
+//! here. The proxy serves both channels from one loop.
 
 use anyhow::{Context, Result, ensure};
 use atlas_rdma::{Gid, Verbs};
@@ -36,14 +42,18 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+mod bootstrap;
+mod oneshot;
 mod proxy;
+use bootstrap::HEAD_WIRE;
+use oneshot::OneShot;
 use proxy::proxy_loop;
 
 unsafe extern "C" {
     fn cuMemHostAlloc(pp: *mut *mut c_void, bytesize: usize, flags: u32) -> i32;
     fn cuMemHostGetDevicePointer_v2(pdptr: *mut u64, p: *mut c_void, flags: u32) -> i32;
     fn cuMemFreeHost(p: *mut c_void) -> i32;
-    fn cuMemcpyAsync(dst: u64, src: u64, bytes: usize, stream: u64) -> i32;
+    pub(super) fn cuMemcpyAsync(dst: u64, src: u64, bytes: usize, stream: u64) -> i32;
     fn cuStreamWriteValue64_v2(stream: u64, addr: u64, value: u64, flags: u32) -> i32;
     fn cuStreamWaitValue64_v2(stream: u64, addr: u64, value: u64, flags: u32) -> i32;
     fn cuStreamIsCapturing(stream: u64, status: *mut i32) -> i32;
@@ -75,7 +85,8 @@ const ARRIVED: usize = 64;
 const FLAG_SRC: usize = 128;
 const FLAG_PAGE: usize = 4096;
 
-/// Per-rail identity exchanged at bootstrap (QPN, PSN, GID, region rkey).
+/// Bootstrap, after the [`bootstrap::head`], per rail: QPN, PSN, GID, region
+/// rkey.
 const RAIL_WIRE: usize = 4 + 4 + 16 + 4;
 
 struct Job {
@@ -110,6 +121,7 @@ pub(super) struct RdmaPair {
     jobs: Arc<Mutex<VecDeque<Job>>>,
     stop: Arc<AtomicBool>,
     proxy: Option<std::thread::JoinHandle<()>>,
+    oneshot: Option<OneShot>,
 }
 
 // SAFETY: `host` is a pinned allocation owned by this struct; the proxy thread
@@ -152,7 +164,7 @@ impl RdmaPair {
         capacity: usize,
     ) -> Result<Self> {
         ensure!(
-            capacity % 64 == 0 && capacity > 0,
+            capacity.is_multiple_of(64) && capacity > 0,
             "RDMA pair capacity must be 64-byte aligned"
         );
         let rails = rail_names(
@@ -166,7 +178,9 @@ impl RdmaPair {
         let gid_override: Option<u32> = std::env::var("ATLAS_RDMA_GID")
             .ok()
             .and_then(|v| v.parse().ok());
-        let bytes = region_bytes(capacity);
+        let os_cfg = oneshot::Config::from_env();
+        let os_base = region_bytes(capacity);
+        let bytes = os_base + os_cfg.map_or(0, |c| oneshot::region_bytes(c.max));
         let mut host: *mut c_void = std::ptr::null_mut();
         cu(
             unsafe { cuMemHostAlloc(&mut host, bytes, CU_MEMHOSTALLOC_PORTABLE_DEVICEMAP) },
@@ -181,8 +195,7 @@ impl RdmaPair {
 
         let psn = (0x5a5a00 + rank as u32 * 0x1111) & 0xff_ffff;
         let mut verbs = Vec::with_capacity(rails.len());
-        let mut local = Vec::with_capacity(8 + rails.len() * RAIL_WIRE);
-        local.extend_from_slice(&(host as u64).to_le_bytes());
+        let mut local = bootstrap::head(host as u64, capacity, oneshot::Config::wire(os_cfg));
         let mut lkeys = Vec::with_capacity(rails.len());
         for name in &rails {
             let gid_idx =
@@ -201,13 +214,10 @@ impl RdmaPair {
         }
 
         let mut stream = exchange_stream(rank, master_addr, port)?;
-        stream.write_all(&local)?;
-        let mut remote = vec![0u8; local.len()];
-        stream.read_exact(&mut remote)?;
-        let peer_base = u64::from_le_bytes(remote[..8].try_into()?);
+        let (remote, peer_base) = bootstrap::exchange(&mut stream, &local)?;
         let mut peer_rkeys = Vec::with_capacity(rails.len());
         for (r, v) in verbs.iter_mut().enumerate() {
-            let w = &remote[8 + r * RAIL_WIRE..8 + (r + 1) * RAIL_WIRE];
+            let w = &remote[HEAD_WIRE + r * RAIL_WIRE..HEAD_WIRE + (r + 1) * RAIL_WIRE];
             let qpn = u32::from_le_bytes(w[0..4].try_into()?);
             let rpsn = u32::from_le_bytes(w[4..8].try_into()?);
             let gid: Gid = w[8..24].try_into()?;
@@ -218,6 +228,18 @@ impl RdmaPair {
         stream.write_all(&[1])?;
         stream.read_exact(&mut [0u8])?;
 
+        let oneshot = os_cfg
+            .map(|c| {
+                OneShot::new(
+                    c,
+                    rails.len(),
+                    host as usize + os_base,
+                    dev + os_base as u64,
+                )
+            })
+            .transpose()?;
+        let channel = os_cfg
+            .map(|c| oneshot::Channel::new(c, host as usize + os_base, peer_base + os_base as u64));
         let jobs = Arc::new(Mutex::new(VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let proxy = {
@@ -230,13 +252,15 @@ impl RdmaPair {
                         base: peer_base,
                         rkeys: peer_rkeys,
                     };
-                    if let Err(e) = proxy_loop(verbs, &lkeys, &peer, host, capacity, &jobs, &stop) {
+                    if let Err(e) =
+                        proxy_loop(verbs, &lkeys, &peer, host, capacity, &jobs, &stop, channel)
+                    {
                         tracing::error!("RDMA pair proxy failed: {e:#}");
                     }
                 })?
         };
         tracing::info!(
-            "RDMA pair all-reduce ready: rank {rank}, rails {rails:?}, capacity {} MB",
+            "RDMA pair all-reduce ready: rank {rank}, rails {rails:?}, capacity {} MB, one-shot {os_cfg:?}",
             capacity >> 20
         );
         Ok(Self {
@@ -248,6 +272,7 @@ impl RdmaPair {
             jobs,
             stop,
             proxy: Some(proxy),
+            oneshot,
         })
     }
 
@@ -323,6 +348,11 @@ impl RdmaPair {
     /// Largest payload in bytes.
     pub(super) fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// The graph-capturable channel, when `ATLAS_RDMA_ONESHOT=1`.
+    pub(super) fn oneshot(&self) -> Option<&OneShot> {
+        self.oneshot.as_ref()
     }
 }
 
@@ -428,6 +458,6 @@ mod tests {
             assert_eq!(pair[1] - pair[0], cap);
         }
         assert_eq!(region_bytes(cap), flag_off(cap) + FLAG_PAGE);
-        assert!(FLAG_SRC + 16 <= FLAG_PAGE && ARRIVED % 8 == 0);
+        const { assert!(FLAG_SRC + 16 <= FLAG_PAGE && ARRIVED.is_multiple_of(8)) };
     }
 }
