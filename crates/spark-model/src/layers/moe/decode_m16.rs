@@ -29,7 +29,9 @@
 //! stream-loaded versions (glm_moe_decode_stream.cuh: streaming loads in place
 //! of cp.async, same bytes), and lets them take every prequant routed FFN of
 //! up to [`STREAM_MAX_ROWS`] rows, verify decode or not: batches of more than
-//! 16 rows (owner batches of two to four streams) run the two-slab kernels.
+//! 16 rows (owner batches of two to four streams) run the two-slab kernels,
+//! and so do prefill chunks of up to 32 tokens. A target without all of the
+//! stream kernels runs the M16 pair, as without this flag.
 
 use super::prequant_fp4::{CompactMoeWorklist, MtileGrid};
 use super::*;
@@ -44,9 +46,9 @@ pub(super) const STREAM_MAX_ROWS: u32 = 2 * MAX_ROWS;
 const NOTE_ROWS: u32 = crate::layer::glm_long_owner::MAX_ROWS as u32;
 
 /// The verify-decode tile selection: the M16 fused gate/up and down kernels
-/// (both null unless the flag is on and the target ships them), their
-/// two-slab stream pair (null unless ATLAS_GLM_MOE_DECODE_STREAM), and the
-/// K128W control.
+/// or, under ATLAS_GLM_MOE_DECODE_STREAM, their one-slab stream twins (both
+/// null unless the flag is on and the target ships them), the two-slab stream
+/// pair (null unless the stream twins are loaded), and the K128W control.
 #[derive(Clone, Copy)]
 pub(super) struct DecodeM16 {
     gate_up_silu: KernelHandle,
@@ -80,20 +82,22 @@ impl DecodeM16 {
                 kernel(on, &format!("glm_moe_decode_{family}_k128w{skip}")),
             ]
         };
-        let [gate_up_silu, down] = pair(on, if stream { "m16s" } else { "m16" });
+        // The stream twins all or none: a target lacking any of them runs
+        // the M16 pair, as without the flag.
+        let twins = [pair(on && stream, "m16s"), pair(on && stream, "m32s")];
+        let twins = twins.iter().flatten().all(|k| k.0 != 0).then_some(twins);
+        let [[gate_up_silu, down], wide] =
+            twins.unwrap_or_else(|| [pair(on, "m16"), [KernelHandle(0); 2]]);
         let mut this = Self {
             gate_up_silu,
             down,
-            wide: pair(on && stream, "m32s"),
+            wide,
             zskip,
             k128w: toggle("ATLAS_GLM_MOE_DECODE_K128W")? && glm,
         };
-        if !this.loaded() || this.wide.iter().any(|k| k.0 == 0) {
+        if !this.loaded() {
             // Both or neither: half a pair never launches.
-            this.wide = [KernelHandle(0); 2];
-            if !this.loaded() {
-                this.gate_up_silu = KernelHandle(0);
-            }
+            this.gate_up_silu = KernelHandle(0);
         }
         if (requested || zskip || stream) && gpu.op_cache().once("moe:decode_m16") {
             if this.loaded() {

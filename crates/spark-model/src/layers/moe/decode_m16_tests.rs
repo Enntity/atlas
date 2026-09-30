@@ -113,7 +113,9 @@ fn verify_ffn(
     let trace = gpu.trace();
     // The launches the flags swap, by kernel.
     let launches = |name: &str| -> Vec<([u32; 3], [u32; 3], Vec<Arg>)> {
-        let handle = gpu.kernel("moe_w4a16", name).unwrap().0;
+        let Ok(handle) = gpu.kernel("moe_w4a16", name).map(|k| k.0) else {
+            return vec![];
+        };
         trace
             .iter()
             .filter_map(|e| match e {
@@ -151,8 +153,11 @@ fn verify_ffn(
         .filter(|e| matches!(e, Event::Launch(h, ..) if *h == layer.silu_mul_quant_nvfp4_k.0))
         .count();
     // ATLAS_GLM_MOE_DECODE_STREAM (with the M16 flag) swaps in the stream
-    // twins, two slabs above 16 rows; ATLAS_GLM_MOE_DOWN_ZSKIP only the down.
-    let stream = env_on("ATLAS_GLM_MOE_DECODE_M16") && env_on("ATLAS_GLM_MOE_DECODE_STREAM");
+    // twins, two slabs above 16 rows, unless the target lacks one of them;
+    // ATLAS_GLM_MOE_DOWN_ZSKIP only the down.
+    let stream = env_on("ATLAS_GLM_MOE_DECODE_M16")
+        && env_on("ATLAS_GLM_MOE_DECODE_STREAM")
+        && gpu.missing.lock().unwrap().is_empty();
     let family = match (stream, rows as u32 <= MAX_ROWS) {
         (false, _) => "m16",
         (true, true) => "m16s",
@@ -252,6 +257,7 @@ fn verify_ffn(
 #[test]
 fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
     const SENTINEL: &str = "ATLAS_TEST_DECODE_M16";
+    const MISSING: &str = "ATLAS_TEST_DECODE_M16_MISSING";
     if std::env::var_os(SENTINEL).is_none() {
         let name = concat!(
             module_path!(),
@@ -261,9 +267,12 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
         // Off, on, on with the zero-row skip, the skip alone (ignored), the
         // K128W control, and both (the twins take every batch they fit);
         // then the stream twins, alone (ignored), with M16, with the skip
-        // and with the K128W control.
+        // and with the K128W control; then with M16 (and the skip) on a
+        // target that lacks a two-slab (or one-slab) stream kernel, which
+        // runs the M16 pair as without the stream flag.
         for mode in [
-            "0000", "1000", "1100", "0100", "0010", "1010", "0001", "1001", "1101", "1011",
+            "00000", "10000", "11000", "01000", "00100", "10100", "00010", "10010", "11010",
+            "10110", "10011", "11012",
         ] {
             let flag = |i: usize| &mode[i..=i];
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
@@ -273,6 +282,7 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
                 .env("ATLAS_GLM_MOE_DOWN_ZSKIP", flag(1))
                 .env("ATLAS_GLM_MOE_DECODE_K128W", flag(2))
                 .env("ATLAS_GLM_MOE_DECODE_STREAM", flag(3))
+                .env(MISSING, flag(4))
                 .env("ATLAS_GLM_INDEPENDENT_DECODE", "1")
                 .env("ATLAS_GLM_C3_GROUPED_MOE", "1")
                 .env("ATLAS_MOE_PREQUANT_K128", "1")
@@ -322,6 +332,15 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
             (1, false, true),
         ] {
             let gpu = Gpu::new();
+            let missing = match std::env::var(MISSING).as_deref() {
+                Ok("1") => Some("glm_moe_decode_m32s_gate_up_silu_k128w"),
+                Ok("2") => Some("glm_moe_decode_m16s_k128w_zskip"),
+                _ => None,
+            };
+            gpu.missing
+                .lock()
+                .unwrap()
+                .extend(missing.map(String::from));
             let trace = verify_ffn(&gpu, rank, vector, expert_tp, entry, rows);
             // Graph-safe either way: no allocation, free or host read.
             assert!(

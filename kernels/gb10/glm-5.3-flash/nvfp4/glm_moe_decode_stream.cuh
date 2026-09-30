@@ -15,8 +15,9 @@
 // K stage with streaming loads into registers, all issued before any store,
 // and store them where pqd_issue's cp.async would have left them (rows past
 // the expert's, and ZSKIP's dead weight rows, as zeros), then run
-// pqd_mma_stage on the stage that landed. Two stage buffers (40 KB, two
-// blocks per SM) in place of M16's four.
+// pqd_mma_stage on the stage that landed. Two stage buffers (40 KB) in place
+// of M16's four, and two blocks per SM, which __launch_bounds__ holds (one
+// block per SM, one stage in flight, is slower).
 //
 // Shared memory holds the same bytes before each MMA, and the MMAs and the
 // epilogue are the M16 functions, so the outputs are those of the M16
@@ -185,22 +186,22 @@ __device__ __forceinline__ void pqs_impl(
     expert_offsets, sorted_token_ids, num_experts, N, K, worklist
 #define PQS_UP PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale}
 
-extern "C" __global__ void __launch_bounds__(PQS_THREADS) glm_moe_decode_m16s_k128w(PQS_DOWN_ARGS) {
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m16s_k128w(PQS_DOWN_ARGS) {
     pqs_impl<false, false, 1>(PQS_TABLES, PqwGateUp{});
 }
-extern "C" __global__ void __launch_bounds__(PQS_THREADS) glm_moe_decode_m16s_k128w_zskip(PQS_DOWN_ARGS) {
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m16s_k128w_zskip(PQS_DOWN_ARGS) {
     pqs_impl<false, true, 1>(PQS_TABLES, PqwGateUp{});
 }
-extern "C" __global__ void __launch_bounds__(PQS_THREADS) glm_moe_decode_m16s_gate_up_silu_k128w(PQS_GATE_UP_ARGS) {
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m16s_gate_up_silu_k128w(PQS_GATE_UP_ARGS) {
     pqs_impl<true, false, 1>(PQS_TABLES, PQS_UP);
 }
-extern "C" __global__ void __launch_bounds__(PQS_THREADS) glm_moe_decode_m32s_k128w(PQS_DOWN_ARGS) {
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m32s_k128w(PQS_DOWN_ARGS) {
     pqs_impl<false, false, 2>(PQS_TABLES, PqwGateUp{});
 }
-extern "C" __global__ void __launch_bounds__(PQS_THREADS) glm_moe_decode_m32s_k128w_zskip(PQS_DOWN_ARGS) {
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m32s_k128w_zskip(PQS_DOWN_ARGS) {
     pqs_impl<false, true, 2>(PQS_TABLES, PqwGateUp{});
 }
-extern "C" __global__ void __launch_bounds__(PQS_THREADS) glm_moe_decode_m32s_gate_up_silu_k128w(PQS_GATE_UP_ARGS) {
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m32s_gate_up_silu_k128w(PQS_GATE_UP_ARGS) {
     pqs_impl<true, false, 2>(PQS_TABLES, PQS_UP);
 }
 
