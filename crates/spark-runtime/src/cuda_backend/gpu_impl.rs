@@ -66,7 +66,7 @@ impl GpuBackend for AtlasCudaBackend {
                 total as f64 / (1024.0 * 1024.0 * 1024.0),
             );
         }
-        self.record_alloc(DevicePtr(dptr));
+        self.record_alloc(DevicePtr(dptr), bytes);
         Ok(DevicePtr(dptr))
     }
 
@@ -80,7 +80,9 @@ impl GpuBackend for AtlasCudaBackend {
                  Check system swap space: swapon --show"
             );
         }
-        self.record_alloc(DevicePtr(dptr));
+        // Zero bytes: managed memory can sit in swap, so it is owned for the
+        // sweep but is not part of the footprint the ledger vouches for.
+        self.record_alloc(DevicePtr(dptr), 0);
         Ok(DevicePtr(dptr))
     }
 
@@ -92,7 +94,7 @@ impl GpuBackend for AtlasCudaBackend {
         // free would be double-freed at teardown. On a real failure, restore
         // ownership to the backend ledger so `sweep_unreleased` is the final
         // cleanup backstop even if the sequence-local state is dropped.
-        self.forget_alloc(ptr);
+        let bytes = self.forget_alloc(ptr);
         let status = unsafe { cuMemFree_v2(ptr.0) };
         // A context that is already being destroyed reports every free as
         // failing, and at process exit that is the normal case, not an error:
@@ -103,7 +105,7 @@ impl GpuBackend for AtlasCudaBackend {
         // clean exit — the exact species of false alarm this work set out to
         // remove.
         if status != 0 && !atlas_core::registry::is_teardown_noop(status) {
-            self.record_alloc(ptr);
+            self.record_alloc(ptr, bytes.unwrap_or(0));
             bail!(
                 "cuMemFree_v2 failed: status {status}, ptr {ptr}; \
                  pointer restored to backend cleanup ledger"
@@ -114,6 +116,10 @@ impl GpuBackend for AtlasCudaBackend {
 
     fn sweep_unreleased(&self) -> usize {
         AtlasCudaBackend::sweep_unreleased(self)
+    }
+
+    fn own_footprint(&self) -> Option<crate::own_footprint::OwnFootprint> {
+        Some(AtlasCudaBackend::own_footprint(self))
     }
 
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
