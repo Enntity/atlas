@@ -10,7 +10,7 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache, SparseI
 use spark_runtime::prefix_cache::{NvmePrefixTier, PrefixCache};
 use spark_runtime::radix_tree::RadixTree;
 
-use super::restore_prefix;
+use super::{RestoreOutcome, restore_prefix};
 use crate::model::block_mgmt::{alloc_block_evicting, cache_acquires_refs};
 use crate::model::prefix_share::cap_prefix_match;
 
@@ -210,18 +210,27 @@ fn a_rank_that_restored_more_is_capped_to_the_agreed_match() {
 
 #[test]
 fn restore_policy_can_decline_and_nothing_leaks() {
-    let gpu = MockGpuBackend::new();
-    let mut kv = glm_kv(&gpu, None);
-    let tree = tree_with_tier(64);
-    let t: Vec<u32> = (0..2 * BS as u32).collect();
-    cache_request(&mut kv, &tree, &gpu, &t);
-    pressure(&mut kv, &tree, &gpu);
-    let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |_| 0).unwrap();
-    assert_eq!((r.wanted, r.restored), (0, 0));
-    assert_eq!(kv.num_free_blocks(), POOL);
-    // Still on disk and restorable later (the pin was released).
-    let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
-    assert_eq!(r.restored, 2);
+    for path in [Path::Sync, Path::Fast] {
+        let gpu = MockGpuBackend::new();
+        let mut kv = glm_kv_on(&gpu, None, path);
+        let tree = tree_with_tier(64);
+        let t: Vec<u32> = (0..2 * BS as u32).collect();
+        cache_request(&mut kv, &tree, &gpu, &t);
+        pressure(&mut kv, &tree, &gpu);
+        let io = kv.nvme_io_stats();
+        let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |_| 0).unwrap();
+        // Declined: no block taken, no I/O of any kind — only the pin goes.
+        let declined = RestoreOutcome {
+            on_disk: 2,
+            ..RestoreOutcome::default()
+        };
+        assert_eq!(r, declined);
+        assert_eq!(kv.nvme_io_stats(), io);
+        assert_eq!(kv.num_free_blocks(), POOL);
+        // Still on disk and restorable later (the pin was released).
+        let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
+        assert_eq!(r.restored, 2);
+    }
 }
 
 /// Record store whose writes or reads fail on demand.
@@ -371,6 +380,42 @@ fn a_kept_record_is_not_rewritten_when_its_block_is_evicted_again() {
         }
         tree.release(&t, BS, 0);
         assert_eq!(kv.num_free_blocks(), POOL - 3);
+    }
+}
+
+/// `ATLAS_GLM_NVME_KEEP`: a block a prefill recomputed in place after its
+/// restore gives up its record (`nvme_forget_rewritten`), so the next restore
+/// returns what the block held — not the older record.
+#[test]
+fn a_rewritten_block_is_written_again_although_records_are_kept() {
+    let gpu = MockGpuBackend::new();
+    let mut kv = glm_kv_on(&gpu, None, Path::Fast);
+    let tree = tree_with_tier(64);
+    tree.set_keep_restored(true);
+    let t: Vec<u32> = (0..3 * BS as u32).collect();
+    let mut want = cache_request(&mut kv, &tree, &gpu, &t);
+    pressure(&mut kv, &tree, &gpu);
+    restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
+    // A prefill resumes at block 1 and recomputes blocks 1 and 2.
+    let m = tree.lookup(&t, BS, 0, 0);
+    for (i, &b) in m.matched_blocks.iter().enumerate().skip(1) {
+        fill(&kv, &gpu, b, 0x90 + i as u8);
+        want[i] = dump(&kv, &gpu, b);
+    }
+    tree.forget_kept(&t, BS, 0, 1..3);
+    tree.release(&t, BS, 0);
+    pressure(&mut kv, &tree, &gpu);
+    let s = tree.nvme_stats();
+    assert_eq!(
+        (s.spills, s.clean_evictions),
+        (5, 1),
+        "blocks 1-2 rewritten"
+    );
+    let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
+    assert_eq!((r.restored, r.failed), (3, false));
+    let m = tree.lookup(&t, BS, 0, 0);
+    for (i, &b) in m.matched_blocks.iter().enumerate() {
+        assert_eq!(dump(&kv, &gpu, b), want[i], "block {i} bytes");
     }
 }
 

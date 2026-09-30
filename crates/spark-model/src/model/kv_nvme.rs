@@ -6,6 +6,11 @@
 //! and issues no collective: the ranks then agree on the match (F83) and, with
 //! the tier on, on the Marconi restore depth (`prefill_b/pc_policy.rs`).
 //!
+//! Only the per-stream prefill (`prefill_b_prefix_lookup`) restores. The
+//! batched admission (`prefill_b_reserve_batched_prefix_matches`, single-rank
+//! worlds only) looks the tree up as it is: concurrent arrivals whose prefix
+//! is on disk are admitted cold and recompute it.
+//!
 //! Construction and env parsing live in `factory/build/kv_nvme.rs`.
 
 use anyhow::Result;
@@ -13,7 +18,7 @@ use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::PagedKvCache;
 use spark_runtime::prefix_cache::{NvmePrefixTier, PrefixCache, RestorePlan};
 
-use super::block_mgmt::{alloc_block_evicting, drop_failed_spills};
+use super::block_mgmt::alloc_block_evicting;
 use super::types::TransformerModel;
 use crate::traits::SequenceState;
 
@@ -33,6 +38,13 @@ impl TransformerModel {
     /// deepest anchor is replayed through every layer regardless. So restore
     /// exactly up to the deepest usable anchor (resident OR spill-tiered), and
     /// nothing when there is none.
+    ///
+    /// "Usable" mirrors the gates the lookup applies to that anchor
+    /// afterwards, so KV is not paged in only to be recomputed: the Marconi
+    /// minimum, the snapshot tier's fault-in minimum (`ssm_fault_in`; applied
+    /// to a resident anchor too — below it the restore saves next to nothing),
+    /// and the exact-hit bypass (an anchor AT the prompt's end is declined
+    /// unless `ATLAS_MARCONI_EXACT=1`; `pc_policy::marconi_restorable`).
     fn nvme_blocks_worth_restoring(
         &self,
         tier: &dyn NvmePrefixTier,
@@ -47,7 +59,16 @@ impl TransformerModel {
         }
         let limit = plan.resident_tokens + run * bs;
         let depth = tier.snapshot_anchor_depth(tokens, limit, seq.session_hash, seq.adapter_id);
-        if depth <= plan.resident_tokens || depth < crate::model::mtp_carry::marconi_min_tokens() {
+        let fault_min = match self.ssm_tier_store {
+            Some(_) => super::trait_impl::ssm_fault_in::fault_in_min_tokens(),
+            None => 0,
+        };
+        let exact_bypass =
+            depth == tokens.len() && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1");
+        if depth <= plan.resident_tokens
+            || depth < crate::model::mtp_carry::marconi_min_tokens().max(fault_min)
+            || exact_bypass
+        {
             return 0;
         }
         (depth - plan.resident_tokens).div_ceil(bs).min(run)
@@ -136,8 +157,51 @@ impl TransformerModel {
     }
 }
 
+impl TransformerModel {
+    /// A prefill that resumes at `skip_to` under a `matched`-token cached
+    /// prefix recomputes rows `[skip_to, matched)` into the shared blocks (a
+    /// full-prompt hit: its last row), with equivalent values, not the
+    /// recorded bytes (`prefix_share`). A record one of those blocks kept from
+    /// its restore (`ATLAS_GLM_NVME_KEEP`) is then stale: release it, so the
+    /// block's next eviction writes what the block holds, as without KEEP.
+    /// Same inputs on every rank (the match and the restore depth are
+    /// agreed). Nothing to do for a warm turn that resumes at its match.
+    pub(in crate::model) fn nvme_forget_rewritten(
+        &self,
+        tokens: &[u32],
+        adapter_id: u64,
+        skip_to: usize,
+        matched: usize,
+        bs: usize,
+    ) {
+        let blocks = skip_to.min(tokens.len().saturating_sub(1)) / bs..matched / bs;
+        if !blocks.is_empty()
+            && let Some(tier) = self.nvme_tier()
+        {
+            tier.forget_kept(tokens, bs, adapter_id, blocks);
+        }
+    }
+}
+
+/// Spill writes that did not reach the disk: the tree forgets those nodes (a
+/// plain eviction). The fast path reports a failure after the fact, so this
+/// also runs around a restore.
+pub(crate) fn drop_failed_spills(
+    failed: &[spark_runtime::prefix_cache::SpillOrder],
+    kv_cache: &mut PagedKvCache,
+    prefix_cache: &dyn PrefixCache,
+) {
+    if !failed.is_empty()
+        && let Some(tier) = prefix_cache.nvme()
+    {
+        for block in tier.spill_failed(failed) {
+            kv_cache.return_evicted_block(block);
+        }
+    }
+}
+
 /// What one [`restore_prefix`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RestoreOutcome {
     pub resident_tokens: usize,
     pub on_disk: usize,
@@ -186,6 +250,18 @@ pub(crate) fn restore_prefix(
         return None;
     }
     let wanted = want(&plan).min(plan.disk.len());
+    if wanted == 0 {
+        // Declined: only the pin to release. No block is allocated and
+        // nothing is read (on the fast path a read first waits for every
+        // queued write).
+        let unused = tier.complete_restore(tokens, bs, adapter_id, &plan, &[], false);
+        debug_assert!(unused.is_empty(), "a declined restore adopted nothing");
+        return Some(RestoreOutcome {
+            resident_tokens: plan.resident_tokens,
+            on_disk: plan.disk.len(),
+            ..RestoreOutcome::default()
+        });
+    }
     let io0 = kv_cache.nvme_io_stats();
     let t0 = std::time::Instant::now();
     let mut blocks = Vec::with_capacity(wanted);

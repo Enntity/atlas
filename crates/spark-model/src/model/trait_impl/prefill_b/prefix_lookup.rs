@@ -361,6 +361,9 @@ impl TransformerModel {
             } else {
                 0
             };
+            // ATLAS_GLM_NVME_KEEP: kept records of the blocks this pass
+            // recomputes in place are stale from here on (no-op otherwise).
+            self.nvme_forget_rewritten(tokens, seq.adapter_id, skip_tokens, matched, bs);
             self.pc_plan_branch(tokens, seq, matched, skip_tokens, bs)?;
             self.finish_leaf_restored(tokens, seq, skip_tokens, bs, stream)?;
             seq.marconi_skip_to = skip_tokens;
