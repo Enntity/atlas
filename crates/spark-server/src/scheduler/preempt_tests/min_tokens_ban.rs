@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! The min_tokens end-token ban must be armed on every way into decode, not
+//! only on the multi-chunk promotion.
+
+use super::super::sched_ctx::SchedCtx;
+use super::super::test_support::{EOS, test_request};
+use super::super::{StartPrefillResult, start_chunked_prefill};
+use super::*;
+use crate::api::InferenceRequest;
+use spark_model::speculative::ProposerState;
+use spark_model::traits::EosBan;
+
+const MIN_TOKENS: usize = 8;
+
+/// A drafter state that records the floor it was handed.
+struct FloorProbe(usize);
+
+impl ProposerState for FloorProbe {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn set_end_floor(&mut self, floor: usize) {
+        self.0 = floor;
+    }
+}
+
+fn drafter_floor(seq: &SequenceState) -> usize {
+    let state = seq.proposer_state.as_ref().expect("drafter state");
+    state.as_any().downcast_ref::<FloorProbe>().unwrap().0
+}
+
+/// Start the 3-token test prompt with a chunk budget of `budget` tokens.
+fn start(min_tokens: usize, budget: usize) -> StartPrefillResult {
+    let (response_tx, _rx) = tokio::sync::oneshot::channel();
+    let mut req = test_request!(Blocking, response_tx,);
+    if let InferenceRequest::Blocking { min_tokens: m, .. } = &mut req {
+        *m = min_tokens;
+    }
+    let model = PreemptStubModel::default();
+    let sched = SchedCtx::for_test();
+    start_chunked_prefill(
+        &sched, None, None, None, None, &model, req, EOS, budget, 0, 0, &mut None, 0, false, None,
+        None,
+    )
+    .expect("prefill starts")
+}
+
+#[test]
+fn a_single_chunk_prompt_arms_the_min_tokens_ban() {
+    let StartPrefillResult::Active(a) = start(MIN_TOKENS, 64) else {
+        panic!("a 3-token prompt within the chunk budget decodes at once");
+    };
+    assert_eq!(a.min_tokens, MIN_TOKENS);
+    assert_eq!(a.seq.prompt_len, 3);
+    assert_eq!(a.seq.eos_ban, EosBan::new(3, MIN_TOKENS, EOS));
+    // The first token sits at position 3, so the floor is 11: a first 8-row
+    // verify predicts 4..=11 and only its last row may end the turn.
+    assert_eq!(a.seq.eos_ban.row_mask(a.seq.seq_len, 8), 0x7F);
+}
+
+#[test]
+fn a_single_chunk_prompt_without_min_tokens_masks_no_row() {
+    let StartPrefillResult::Active(a) = start(0, 64) else {
+        panic!("a 3-token prompt within the chunk budget decodes at once");
+    };
+    assert_eq!(a.seq.eos_ban.floor, 0);
+    assert_eq!(a.seq.eos_ban.row_mask(a.seq.seq_len, 8), 0);
+}
+
+#[test]
+fn single_and_multi_chunk_prompts_get_the_same_ban() {
+    let StartPrefillResult::Active(single) = start(MIN_TOKENS, 64) else {
+        panic!("single chunk");
+    };
+    // A 2-token budget leaves the prompt in progress; it is promoted by the
+    // same constructor once its last chunk lands.
+    let StartPrefillResult::InProgress(mut p) = start(MIN_TOKENS, 2) else {
+        panic!("multi chunk");
+    };
+    p.seq.proposer_state = Some(Box::new(FloorProbe(0)));
+    let multi = super::super::phase_promote_prefills::build_active_seq_from_prefill(
+        p,
+        0,
+        false,
+        false,
+        0,
+        false,
+        std::time::Instant::now(),
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    assert_eq!(multi.seq.eos_ban, single.seq.eos_ban);
+    assert_eq!(drafter_floor(&multi.seq), single.seq.eos_ban.floor);
+}

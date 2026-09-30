@@ -27,6 +27,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod chunk_retry;
+mod min_tokens_ban;
 mod victim_policy;
 
 /// Scripted stub: `decode_batch` fails with the KV-exhausted error for the
@@ -100,7 +101,7 @@ impl Model for PreemptStubModel {
             (true, false) => cs,
         };
         s.tokens.extend_from_slice(&t[cs..stop]);
-        s.seq_len = stop;
+        (s.seq_len, s.prompt_len) = (stop, t.len());
         let (by_peer, retryable) = (true, !self.refusal_is_final);
         anyhow::ensure!(!refuse, KvAdmissionRefused { by_peer, retryable });
         Ok(DevicePtr::NULL)

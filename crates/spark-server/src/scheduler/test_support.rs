@@ -132,3 +132,52 @@ pub(super) fn test_owned_seq(
     };
     (a, rx)
 }
+
+/// A 3-token, 600-max-token request with neutral sampling; `$extra` supplies
+/// the variant's channel (and a streaming request's cancel flag).
+macro_rules! test_request {
+    ($variant:ident, $($extra:tt)*) => {
+        InferenceRequest::$variant {
+            prompt_tokens: std::sync::Arc::new(vec![1, 2, 3]),
+            session_hash: 0,
+            adapter_slot: -1,
+            src_lang_id: 0,
+            tgt_lang_id: 0,
+            num_beams: 1,
+            length_penalty: 1.0,
+            early_stopping: false,
+            image_pixels: vec![],
+            max_tokens: 600,
+            min_tokens: 0,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            top_n_sigma: 0.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            lz_penalty: 0.0,
+            logit_bias: vec![],
+            stop_tokens: vec![],
+            enable_thinking: false,
+            thinking_budget: None,
+            repetition_detection: None,
+            require_tool_call: false,
+            tools_present: true,
+            suppress_tool_call: false,
+            disable_mtp: false,
+            grammar_spec: None,
+            seed: Some(1),
+            top_logprobs: None,
+            prompt_logprobs: None,
+            echo: false,
+            timeout_at: None,
+            $($extra)*
+        }
+    };
+}
+pub(super) use test_request;
