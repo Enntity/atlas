@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The rolling leaf of one sequence: where a step saves it, what the save
-//! copies, who owns the snapshot slot, and when the leaf is stale.
-
-use std::sync::{Arc, OnceLock};
+//! The rolling leaf of one sequence: where a step saves it and what the save
+//! copies.
 
 use parking_lot::Mutex;
 use spark_runtime::gpu::DevicePtr;
-use spark_runtime::radix_tree::{prefix_hash_push, prefix_hash_seed};
 
 use super::super::super::ssm_batched_copy::StateCopy;
 use super::super::super::ssm_pool::SsmStatePool;
@@ -55,81 +52,29 @@ pub(in crate::model) fn leaf_save(
     })
 }
 
-/// The prefix hash of `tokens` continuing from `seed` (the FNV-1a fold the
-/// snapshot index keys on, with no adapter).
-pub(in crate::model) fn hash_tokens(seed: u64, tokens: &[u32]) -> u64 {
-    tokens.iter().fold(seed, |h, &t| prefix_hash_push(h, t))
-}
-
-/// A sequence's rolling leaf: snapshot slot `snap` holds its exact SSM state
-/// after its first `tokens` tokens, which hashed to `hash` when it was saved.
+/// A sequence's rolling leaf: snapshot slot `snap` was registered as the leaf
+/// for its first `tokens` tokens. The index owns the slot; the sequence only
+/// remembers where it put it, and asks for it back before it writes again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FinishLeaf {
     pub snap: usize,
     pub tokens: usize,
-    pub hash: u64,
 }
 
-impl FinishLeaf {
-    /// The leaf in slot `snap` for the first `at` tokens of `tokens`. `prev`
-    /// is the leaf the slot held before: its hash is extended when it lies
-    /// under `at`, so a rewind below it and a different regeneration show up
-    /// as a mismatch against the full hash taken at finish.
-    pub(in crate::model) fn advance(
-        prev: Option<Self>,
-        snap: usize,
-        tokens: &[u32],
-        at: usize,
-    ) -> Self {
-        let hash = match prev.filter(|l| l.tokens <= at) {
-            Some(l) => hash_tokens(l.hash, &tokens[l.tokens..at]),
-            None => hash_tokens(prefix_hash_seed(0), &tokens[..at]),
-        };
-        Self {
-            snap,
-            tokens: at,
-            hash,
-        }
-    }
-
-    /// Whether the leaf still describes a prefix of `tokens` covered by
-    /// `cached_blocks` cached blocks of `bs` tokens.
-    pub(in crate::model) fn valid(&self, tokens: &[u32], cached_blocks: usize, bs: usize) -> bool {
-        self.tokens <= tokens.len()
-            && self.tokens.is_multiple_of(bs)
-            && self.tokens / bs <= cached_blocks
-            && hash_tokens(prefix_hash_seed(0), &tokens[..self.tokens]) == self.hash
-    }
-}
-
-/// Holder of a sequence's [`FinishLeaf`]. The sequence owns the snapshot slot
-/// until `cache_sequence` registers it or `free_sequence` returns it; a
-/// sequence dropped without either (abort, unwind) hands the slot to the
-/// pool's orphan list instead of leaking it.
+/// Holder of a sequence's [`FinishLeaf`] (the hooks see the sequence by
+/// shared reference).
 #[derive(Default)]
-pub(crate) struct LeafCell {
-    leaf: Mutex<Option<FinishLeaf>>,
-    orphans: OnceLock<Arc<Mutex<Vec<usize>>>>,
-}
+pub(crate) struct LeafCell(Mutex<Option<FinishLeaf>>);
 
 impl LeafCell {
     pub(in crate::model) fn get(&self) -> Option<FinishLeaf> {
-        *self.leaf.lock()
+        *self.0.lock()
     }
     pub(in crate::model) fn take(&self) -> Option<FinishLeaf> {
-        self.leaf.lock().take()
+        self.0.lock().take()
     }
-    pub(in crate::model) fn set(&self, leaf: FinishLeaf, orphans: &Arc<Mutex<Vec<usize>>>) {
-        self.orphans.get_or_init(|| orphans.clone());
-        *self.leaf.lock() = Some(leaf);
-    }
-}
-
-impl Drop for LeafCell {
-    fn drop(&mut self) {
-        if let (Some(leaf), Some(orphans)) = (self.leaf.get_mut().take(), self.orphans.get()) {
-            orphans.lock().push(leaf.snap);
-        }
+    pub(in crate::model) fn set(&self, leaf: FinishLeaf) {
+        *self.0.lock() = Some(leaf);
     }
 }
 

@@ -321,6 +321,16 @@ pub trait PrefixCache: Send + Sync {
         Some(snapshot_id)
     }
 
+    /// Unregister the finish leaf at exactly `tokens` if it still holds
+    /// `snapshot_id`: the owning sequence moves its leaf to a later boundary
+    /// or gives it up. `true` hands the slot back to the caller; `false`
+    /// means it is no longer the caller's (evicted, promoted or replaced).
+    /// Default: `false`.
+    fn take_leaf_snapshot(&self, tokens: &[u32], snapshot_id: usize, adapter_id: u64) -> bool {
+        let _ = (tokens, snapshot_id, adapter_id);
+        false
+    }
+
     /// The turn the finish leaf at exactly `tokens` (if any) was saved for
     /// has restored it. `keep` turns it into an ordinary checkpoint (that
     /// turn saves none of its own); otherwise it becomes superseded history.

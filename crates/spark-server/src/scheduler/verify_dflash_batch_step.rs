@@ -437,9 +437,8 @@ pub(super) fn apply_dflash_accept(
         tracing::error!("commit_ctx (kgamma batched): {e:#}");
     }
 
-    // Committed before emission: an emit that finishes the sequence returns,
-    // and the state cached at finish must already hold the accepted rows
-    // (see `verify_dflash_tail`).
+    // Committed before emission (see `verify_dflash_tail`): an emit that
+    // finishes the sequence returns, and finish caches the committed state.
     let k_verify = drafts.len() + 1;
     let total_accepted = num_accepted + 1;
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {

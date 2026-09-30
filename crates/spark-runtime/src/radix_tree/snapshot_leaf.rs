@@ -17,6 +17,14 @@
 //!   the leaf dead history (`link_chain`): the turn it was saved for has run;
 //! * a checkpoint already registered at its prefix wins.
 //!
+//! A decoding sequence registers its leaf from the first save and moves it
+//! forward boundary by boundary ([`SsmSnapshotIndex::take_leaf`], then
+//! [`SsmSnapshotIndex::insert_leaf`] at the new one), so the slot is in the
+//! index the whole time and the rules above hold for it too: no slot is held
+//! outside the index. A leaf is unreachable until its turn finishes and
+//! caches the blocks under it, and is a valid state for its prefix whenever
+//! it is reached.
+//!
 //! The turn a leaf was saved for settles it when it restores it
 //! ([`SsmSnapshotIndex::settle_leaf`]). If that turn saves a checkpoint of
 //! its own, the leaf is dead history from then on, so the turn's own slot
@@ -55,6 +63,20 @@ impl SsmSnapshotIndex {
             ..Default::default()
         };
         displaced
+    }
+
+    /// Unregister the leaf at `prefix_hash` if it still holds `snapshot_id`,
+    /// handing the slot back to the caller. `false`: the leaf was evicted,
+    /// promoted or replaced since, and the slot is no longer the caller's.
+    pub(super) fn take_leaf(&mut self, prefix_hash: u64, snapshot_id: usize) -> bool {
+        let mine = |e: &super::snapshot::SnapshotEntry| {
+            e.prefix_hash == prefix_hash
+                && e.chain.leaf
+                && !e.tiered
+                && e.snapshot_id == snapshot_id
+        };
+        let at = self.entries.iter().position(mine);
+        at.map(|i| self.entries.swap_remove(i)).is_some()
     }
 
     /// The finish leaf registered for exactly `tokens`, if any, was restored

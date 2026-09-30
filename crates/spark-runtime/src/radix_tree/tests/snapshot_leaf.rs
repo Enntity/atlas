@@ -5,7 +5,7 @@
 //! index directly (the flags are process-wide `OnceLock`s).
 
 use super::*;
-use crate::radix_tree::snapshot::SnapshotEntry;
+use crate::radix_tree::snapshot::{SnapLoc, SnapshotEntry};
 
 const POOL: usize = 16;
 
@@ -143,61 +143,128 @@ fn the_restoring_turn_settles_its_leaf() {
     assert_eq!(evict(&mut idx), 1, "the old checkpoint is dead history now");
 }
 
-/// `turns` rounds of `convs` conversations taking turns on one 16-slot pool,
-/// each turn saving its prefill checkpoint and, with `leaves`, a finish leaf
-/// through the rolling-slot rules. Returns, per turn after the first round,
-/// whether the conversation still held (its checkpoint, its leaf).
-fn serve(convs: u32, turns: usize, leaves: bool) -> Vec<(bool, bool)> {
+#[test]
+fn a_rolling_leaf_moves_only_while_the_sequence_still_holds_it() {
     let mut idx = SsmSnapshotIndex::new();
-    let (mut next_id, mut held) = (0usize, Vec::new());
-    let mut last = vec![(usize::MAX, usize::MAX); convs as usize];
-    for turn in 0..turns {
-        for c in 0..convs {
-            let prompt = convo(c + 1, 30_000 + turn * 800);
-            let (cut, lf) = last[c as usize];
-            if turn > 0 {
-                held.push((resident(&idx, cut), resident(&idx, lf)));
-                // The restore bumps the winner, as a lookup does, and settles
-                // the leaf it took (this turn saves its own checkpoint).
-                let hit = idx.lookup_tiered(&prompt, prompt.len(), 0, 0).unwrap();
-                idx.settle_leaf(&prompt[..hit.token_count], 0, false);
-            }
-            // The prefill checkpoint: a free slot or the chain victim.
-            if idx.entries.len() == POOL {
-                evict(&mut idx);
-            }
-            next_id += 1;
-            checkpoint(&mut idx, &prompt[..prompt.len() - 32], next_id);
-            last[c as usize] = (next_id, usize::MAX);
-            // The rolling slot (held outside the index while the turn
-            // decodes), then the leaf 400 tokens into the output.
-            if leaves && (idx.entries.len() < POOL || idx.evict_for_leaf().is_some()) {
-                next_id += 1;
-                let out = convo(c + 1, 30_000 + turn * 800 + 400);
-                assert_eq!(leaf(&mut idx, &out, next_id), None);
-                last[c as usize].1 = next_id;
-            }
-            assert!(idx.entries.len() <= POOL);
-        }
-    }
-    held
+    let t = convo(1, 31_000);
+    checkpoint(&mut idx, &t[..30_000], 1);
+    leaf(&mut idx, &t[..30_080], 2);
+    // Not this slot, not this prefix: nothing to take.
+    assert!(!idx.take_leaf(hash(&t[..30_080]), 9));
+    assert!(!idx.take_leaf(hash(&t[..30_144]), 2));
+    // The sequence moves its leaf to the next boundary.
+    assert!(idx.take_leaf(hash(&t[..30_080]), 2));
+    assert!(!resident(&idx, 2));
+    leaf(&mut idx, &t[..30_144], 2);
+    // Another writer takes the slot: the sequence finds its leaf gone.
+    assert_eq!(idx.evict_for_leaf(), Some(2));
+    assert!(!idx.take_leaf(hash(&t[..30_144]), 2));
+    // Promoted by the turn that restored it: a checkpoint is not the
+    // sequence's to move. Settled as history: still its own.
+    leaf(&mut idx, &t[..30_144], 3);
+    idx.settle_leaf(&t[..30_144], 0, true);
+    assert!(!idx.take_leaf(hash(&t[..30_144]), 3) && resident(&idx, 3));
+    leaf(&mut idx, &t[..30_208], 4);
+    idx.settle_leaf(&t[..30_208], 0, false);
+    assert!(idx.take_leaf(hash(&t[..30_208]), 4));
+    // Never a checkpoint, whatever slot it names.
+    assert!(!idx.take_leaf(hash(&t[..30_000]), 1) && resident(&idx, 1));
 }
 
-/// The pool-pressure contract: with leaves on, every conversation keeps the
-/// checkpoint it keeps with leaves off, whatever the number of conversations.
-/// Leaves live in the slack. A checkpoint and a leaf per conversation fit the
-/// pool up to 8 conversations, and every leaf is then there for its turn.
-/// Beyond that a strict rotation is the worst case for the leaves (the least
-/// recently used one belongs to the conversation whose turn is next), and
-/// none survives; no checkpoint is lost for it.
+/// A label for a checkpoint: `(conversation, turn)`.
+type Label = (u32, usize);
+
+/// `turns` rounds of `convs` conversations on one 16-slot pool, `wave` of
+/// them decoding at a time. Each turn saves its prefill checkpoint and, with
+/// `leaves`, rolls a finish leaf over four boundaries through the rules a
+/// decoding sequence follows (take its own leaf back or find a slot that is
+/// free, dead or another leaf). Returns the protected checkpoints (frontiers
+/// and branch points) after every checkpoint save, and how many turns after
+/// the first round found the conversation's leaf.
+fn serve(convs: u32, turns: usize, leaves: bool, wave: usize) -> (Vec<Vec<Label>>, usize) {
+    let mut idx = SsmSnapshotIndex::new();
+    let (mut next_id, mut hits) = (0usize, 0usize);
+    let mut labels = std::collections::HashMap::new();
+    let mut protected = Vec::new();
+    let mut last_leaf = vec![usize::MAX; convs as usize];
+    let order: Vec<u32> = (0..convs).collect();
+    for turn in 0..turns {
+        for group in order.chunks(wave) {
+            let prompt = |c: u32| convo(c + 1, 4_000 + turn * 800);
+            for &c in group {
+                let tokens = prompt(c);
+                // The restore bumps the winner, as a lookup does, and settles
+                // the leaf it took (this turn saves a checkpoint). Nothing to
+                // restore: a cold turn (the first, or a lost conversation).
+                if let Some(hit) = idx.lookup_tiered(&tokens, tokens.len(), 0, 0) {
+                    hits += usize::from(hit.loc == SnapLoc::Hbm(last_leaf[c as usize]));
+                    idx.settle_leaf(&tokens[..hit.token_count], 0, false);
+                }
+                // The prefill checkpoint: a free slot or the chain victim.
+                if idx.entries.len() == POOL {
+                    evict(&mut idx);
+                }
+                next_id += 1;
+                labels.insert(next_id, (c, turn));
+                checkpoint(&mut idx, &tokens[..tokens.len() - 32], next_id);
+                let mut now: Vec<Label> = idx
+                    .entries
+                    .iter()
+                    .filter(|e| e.chain.class() > DEAD + 1)
+                    .map(|e| labels[&e.snapshot_id])
+                    .collect();
+                now.sort_unstable();
+                protected.push(now);
+            }
+            // The group decodes together: each crosses four save boundaries.
+            let mut held = vec![None; group.len()];
+            for roll in 1..=4 {
+                for (g, &c) in group.iter().enumerate().filter(|_| leaves) {
+                    let end = prompt(c).len() + 96 * roll;
+                    let out = convo(c + 1, end);
+                    let mine = held[g].filter(|&(at, id)| idx.take_leaf(hash(&out[..at]), id));
+                    let slot = match mine {
+                        Some((_, id)) => Some(id),
+                        None if idx.entries.len() < POOL => {
+                            next_id += 1;
+                            Some(next_id)
+                        }
+                        None => idx.evict_for_leaf(),
+                    };
+                    held[g] = slot.map(|id| (end, id));
+                    if let Some(id) = slot {
+                        assert_eq!(leaf(&mut idx, &out, id), None);
+                        last_leaf[c as usize] = id;
+                    }
+                    assert!(idx.entries.len() <= POOL);
+                }
+            }
+        }
+    }
+    (protected, hits)
+}
+
+/// The pool-pressure contract. With leaves on, the protected checkpoints are
+/// exactly the ones the pool holds with leaves off, after every checkpoint
+/// save, for any number of conversations and any number decoding at once:
+/// a leaf only ever sits in a slot that is otherwise free or dead history.
+///
+/// Leaves live in that slack. A checkpoint and a leaf per conversation fit
+/// the pool up to 8 conversations, and every leaf is then there for its
+/// turn. Beyond that a strict rotation is the worst case for the leaves (the
+/// least recently used one belongs to the conversation whose turn is next).
 #[test]
 fn leaves_never_cost_a_conversation_its_checkpoint() {
-    for convs in [3, 8, 9, 12, 15] {
-        let (on, off) = (serve(convs, 4, true), serve(convs, 4, false));
-        assert!(off.iter().all(|&(cut, _)| cut), "convs={convs}: base");
-        assert!(on.iter().all(|&(cut, _)| cut), "convs={convs}: with leaves");
-        let kept = on.iter().filter(|&&(_, lf)| lf).count();
-        let want = if convs <= 8 { on.len() } else { 0 };
-        assert_eq!(kept, want, "convs={convs}: leaves in reach of their turn");
+    for convs in [3, 8, 9, 12, 15, 20] {
+        for wave in [1, 4] {
+            let (on, hits) = serve(convs, 4, true, wave);
+            let (off, _) = serve(convs, 4, false, wave);
+            assert_eq!(on, off, "convs={convs} wave={wave}");
+            let warm_turns = 3 * convs as usize;
+            match convs {
+                3 | 8 => assert_eq!(hits, warm_turns, "convs={convs} wave={wave}"),
+                _ => assert!(hits < warm_turns, "convs={convs} wave={wave}: {hits}"),
+            }
+        }
     }
 }

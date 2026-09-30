@@ -1,23 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The rolling finish leaf: where it lands, what it copies, when it is
-//! dropped, and that two ranks place and restore it alike.
-
-use std::sync::Arc;
-
-use parking_lot::Mutex;
+//! The rolling finish leaf: where it lands, what it copies, who holds its
+//! slot, and that two ranks place and restore it alike.
 
 use super::super::super::ssm_batched_copy::run_ssm_state_copies;
 use super::super::super::ssm_pool::SsmStatePool;
 use super::super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::prefill_b::pc_policy::{Agreed, agree_restore, tail_cut};
-use super::rolling::{LeafSave, boundary_row, hash_tokens};
+use super::flag::resolve;
+use super::rolling::{LeafSave, boundary_row};
 use super::*;
 use crate::ssm_reserve::SsmRollbackMode;
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{GpuBackend, mock::MockGpuBackend};
 use spark_runtime::prefix_cache::PrefixCache;
-use spark_runtime::radix_tree::{RadixTree, prefix_hash_seed};
+use spark_runtime::radix_tree::RadixTree;
 
 const BS: usize = 16;
 
@@ -134,69 +131,31 @@ fn the_plan_needs_the_rolled_back_length() {
     assert_eq!(leaf_save(64, 5, 9, BS).unwrap().conv_row, Some(4));
 }
 
+/// The rolling slot is registered from its first save and moved boundary by
+/// boundary, so the index can hand it to a checkpoint that needs a slot at
+/// any time. The sequence asks for it back before each save.
 #[test]
-fn the_hash_chain_equals_the_full_hash() {
-    let tokens: Vec<u32> = (0..200).map(|i| i * 7 + 3).collect();
-    let first = FinishLeaf::advance(None, 3, &tokens, 48);
-    let chained = FinishLeaf::advance(Some(first), 3, &tokens, 160);
-    assert_eq!(chained, FinishLeaf::advance(None, 3, &tokens, 160));
-    assert_eq!(
-        chained.hash,
-        hash_tokens(prefix_hash_seed(0), &tokens[..160])
-    );
-    assert_ne!(
-        chained.hash,
-        FinishLeaf::advance(None, 3, &tokens, 144).hash
-    );
-    // A leaf above the new position (the turn was rewound) restarts the hash.
-    let rewound = FinishLeaf::advance(Some(chained), 3, &tokens, 96);
-    assert_eq!(rewound, FinishLeaf::advance(None, 3, &tokens, 96));
-    // A rewind below the leaf and a different regeneration break the chain.
+fn the_rolling_leaf_is_the_indexes_to_evict() {
+    let cache = RadixTree::new();
+    let tokens: Vec<u32> = (0..2_000).collect();
+    assert_eq!(cache.insert_leaf_snapshot(&tokens[..1_024], 5, 0, 0), None);
+    // The next boundary: the sequence still holds the slot and moves it.
+    assert!(cache.take_leaf_snapshot(&tokens[..1_024], 5, 0));
+    assert_eq!(cache.snapshot_count(), 0);
+    assert_eq!(cache.insert_leaf_snapshot(&tokens[..1_088], 5, 0, 0), None);
+    // At finish the turn reports the leaf it still has there.
+    assert_eq!(cache.snapshot_at(&tokens, 1_088, 0), Some(5));
+    // A checkpoint save takes the slot; the sequence finds its leaf gone
+    // and must not write the slot again.
+    assert_eq!(cache.evict_snapshot_lru(), Some(5));
+    assert!(!cache.take_leaf_snapshot(&tokens[..1_088], 5, 0));
+    assert_eq!(cache.snapshot_at(&tokens, 1_088, 0), None);
+    // A rewind that regenerated the text under the leaf: not this prefix.
+    assert_eq!(cache.insert_leaf_snapshot(&tokens[..1_088], 6, 0, 0), None);
     let mut other = tokens.clone();
-    other[40] = 9_999;
-    let stale = FinishLeaf::advance(Some(first), 3, &other, 160);
-    assert!(!stale.valid(&other, 12, BS) && chained.valid(&tokens, 12, BS));
-}
-
-#[test]
-fn a_leaf_is_registered_only_for_a_cached_prefix_it_still_describes() {
-    let tokens: Vec<u32> = (0..100).collect();
-    let leaf = |at: usize| FinishLeaf::advance(None, 3, &tokens, at);
-    assert!(leaf(96).valid(&tokens, 6, BS));
-    // The turn was rewound below the leaf and ended there.
-    assert!(!leaf(96).valid(&tokens[..90], 5, BS));
-    // Its blocks are not all in the block table.
-    assert!(!leaf(96).valid(&tokens, 5, BS));
-    // The sequence was rewound and regenerated differently under the leaf.
-    let mut other = tokens.clone();
-    other[70] = 9_999;
-    assert!(!leaf(96).valid(&other, 6, BS));
-    // Never off a block boundary.
-    assert!(!leaf(90).valid(&tokens, 6, BS));
-}
-
-#[test]
-fn a_dropped_sequence_hands_its_slot_to_the_orphan_list() {
-    let orphans = Arc::new(Mutex::new(Vec::new()));
-    let leaf = FinishLeaf {
-        snap: 5,
-        tokens: 96,
-        hash: 1,
-    };
-    // Registered or released (taken): nothing to reclaim.
-    let cell = LeafCell::default();
-    cell.set(leaf, &orphans);
-    assert_eq!(cell.get(), Some(leaf));
-    assert_eq!(cell.take(), Some(leaf));
-    drop(cell);
-    assert!(orphans.lock().is_empty());
-    // Dropped while still holding the slot.
-    let cell = LeafCell::default();
-    cell.set(leaf, &orphans);
-    drop(cell);
-    assert_eq!(*orphans.lock(), vec![5]);
-    // A sequence that never saved a leaf has no list and nothing to hand over.
-    drop(LeafCell::default());
+    other[1_000] = 9;
+    assert!(!cache.take_leaf_snapshot(&other[..1_088], 6, 0));
+    assert!(cache.take_leaf_snapshot(&tokens[..1_088], 6, 0));
 }
 
 fn tiny_config() -> ModelConfig {

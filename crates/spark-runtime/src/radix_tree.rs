@@ -45,7 +45,7 @@ pub(crate) fn hash_token_prefix(tokens: &[u32], count: usize, adapter_id: u64) -
 /// Hash of the empty prefix under `adapter_id` — the fold's starting value.
 /// Split out with [`prefix_hash_push`] so a caller can hash every prefix of
 /// one token run in a single pass (`snapshot_chain::link_chain`).
-pub fn prefix_hash_seed(adapter_id: u64) -> u64 {
+pub(crate) fn prefix_hash_seed(adapter_id: u64) -> u64 {
     let h: u64 = 0xcbf29ce484222325; // FNV-1a basis
     if adapter_id != 0 {
         prefix_hash_push(h, adapter_id)
@@ -55,7 +55,7 @@ pub fn prefix_hash_seed(adapter_id: u64) -> u64 {
 }
 
 /// Extend a prefix hash by one value (FNV-1a step).
-pub fn prefix_hash_push(h: u64, v: impl Into<u64>) -> u64 {
+pub(crate) fn prefix_hash_push(h: u64, v: impl Into<u64>) -> u64 {
     (h ^ v.into()).wrapping_mul(0x100000001b3)
 }
 
@@ -274,6 +274,13 @@ impl PrefixCache for RadixTree {
         self.snapshot_index
             .lock()
             .insert_leaf(prefix_hash, snapshot_id, session_hash, tokens.len())
+    }
+
+    fn take_leaf_snapshot(&self, tokens: &[u32], snapshot_id: usize, adapter_id: u64) -> bool {
+        let prefix_hash = hash_token_prefix(tokens, tokens.len(), adapter_id);
+        self.snapshot_index
+            .lock()
+            .take_leaf(prefix_hash, snapshot_id)
     }
 
     fn settle_leaf_snapshot(&self, tokens: &[u32], adapter_id: u64, keep: bool) {
