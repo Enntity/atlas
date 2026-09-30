@@ -28,8 +28,12 @@ fn off_unless_dir_is_set() {
     ] {
         assert_eq!(config_from(None, None, switches(fast, keep)).unwrap(), None);
     }
-    // … while an inert BUDGET stays an error, switches or not.
-    assert!(config_from(None, Some("40"), switches(Some("1"), None)).is_err());
+    // … and so is the budget: without the directory nothing of the tier is
+    // read, so a rank starts exactly as it does with all four unset.
+    for gb in ["40", "lots", "0"] {
+        let off = config_from(None, Some(gb), switches(Some("1"), None));
+        assert_eq!(off.unwrap(), None, "{gb}");
+    }
 }
 
 #[test]
@@ -39,10 +43,6 @@ fn budget_is_required_and_strict() {
     assert!(config_from(Some("/nvme"), Some("0"), switches(None, None)).is_err());
     assert!(config_from(Some("/nvme"), Some("-1"), switches(None, None)).is_err());
     assert!(config_from(Some("/nvme"), Some("inf"), switches(None, None)).is_err());
-    assert!(
-        config_from(None, Some("100"), switches(None, None)).is_err(),
-        "inert budget is an error"
-    );
     let c = config_from(Some("/nvme/kv"), Some("1.5"), switches(None, None))
         .unwrap()
         .unwrap();
@@ -68,80 +68,108 @@ fn slots_floor_the_budget() {
 const OFF: (bool, bool) = (false, false);
 const FAST: (bool, bool) = (true, false);
 const KEEP: (bool, bool) = (false, true);
+/// Snapshot-tier homes: on an O_DIRECT file, and on a peer.
+const DISK: Option<SpillHome> = Some(SpillHome::Disk { hot_slots: 2 });
+const PEER: Option<SpillHome> = Some(SpillHome::Peer);
 
 #[test]
 fn fingerprint_separates_every_field() {
-    let base = rank_fingerprint(10, 4096, false, OFF);
-    // A pair started with the fast path on one rank only must not start.
-    let fast = rank_fingerprint(10, 4096, false, FAST);
-    assert_ne!(base, fast);
-    assert_ne!(fast, rank_fingerprint(10, 4096, false, KEEP));
-    assert_ne!(fast, rank_fingerprint(10, 4096, true, OFF));
-    assert_ne!(fast, rank_fingerprint(10, 4096, false, (true, true)));
-    assert_ne!(base, rank_fingerprint(11, 4096, false, OFF));
-    assert_ne!(base, rank_fingerprint(10, 8192, false, OFF));
-    assert_ne!(base, rank_fingerprint(10, 4096, true, OFF));
-    assert_ne!(base, rank_fingerprint(10, 4096, false, KEEP));
-    assert_ne!(
-        rank_fingerprint(10, 4096, true, OFF),
-        rank_fingerprint(10, 4096, false, KEEP)
-    );
-    assert_ne!(
-        rank_fingerprint(0, 4096, false, OFF),
-        rank_fingerprint(0, 4096, true, OFF)
+    // (A pair started with the fast path on one rank only must not start.)
+    let mut all = vec![
+        rank_fingerprint(10, 4096, None, OFF),
+        rank_fingerprint(10, 4096, None, FAST),
+        rank_fingerprint(10, 4096, None, KEEP),
+        rank_fingerprint(10, 4096, None, (true, true)),
+        rank_fingerprint(10, 4096, DISK, OFF),
+        rank_fingerprint(10, 4096, PEER, OFF),
+        rank_fingerprint(10, 4096, DISK, KEEP),
+        rank_fingerprint(10, 4096, PEER, FAST),
+        rank_fingerprint(11, 4096, None, OFF),
+        rank_fingerprint(10, 8192, None, OFF),
+        rank_fingerprint(0, 4096, None, OFF),
+        rank_fingerprint(0, 4096, DISK, OFF),
+    ];
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), 12, "every field moves the word");
+    // The hot arena's size is rank-local (it only moves the host reserve).
+    assert_eq!(
+        rank_fingerprint(10, 4096, DISK, OFF),
+        rank_fingerprint(10, 4096, Some(SpillHome::Disk { hot_slots: 64 }), OFF)
     );
 }
 
 fn tier(gb: &str, fast: bool) -> NvmeKvConfig {
-    let fast = fast.then(|| "1".to_owned());
-    config_from(
-        Some("/nvme"),
-        Some(gb),
-        [(FAST_VAR, fast), (KEEP_VAR, None)],
-    )
-    .unwrap()
-    .unwrap()
+    let on = switches(fast.then_some("1"), None);
+    config_from(Some("/nvme"), Some(gb), on).unwrap().unwrap()
 }
 
 #[test]
-fn the_rank_word_is_zero_only_with_the_tier_off() {
-    // Off: the word the ranks already gather stays the bare block count,
-    // whatever the snapshot tier is set to.
-    assert_eq!(word_for(None, 106_496, false).unwrap(), TIER_OFF);
-    assert_eq!(word_for(None, 106_496, true).unwrap(), TIER_OFF);
-    let on = word_for(Some(&tier("24", false)), 106_496, true).unwrap();
-    assert!(on != TIER_OFF && on != FAILED_RANK);
-    assert_ne!(
-        on,
-        word_for(Some(&tier("24", true)), 106_496, true).unwrap()
-    );
-    assert_ne!(
-        on,
-        word_for(Some(&tier("25", false)), 106_496, true).unwrap()
-    );
-    assert_ne!(
-        on,
-        word_for(Some(&tier("24", false)), 106_496, false).unwrap()
-    );
+fn the_rank_word_is_zero_only_with_every_spill_tier_off() {
+    // Off: the word the ranks already gather stays the bare block count.
+    assert_eq!(word_for(None, 106_496, None, true).unwrap(), TIER_OFF);
+    assert_eq!(word_for(None, 106_496, None, false).unwrap(), TIER_OFF);
+    // The snapshot tier alone is a word too: its ranks run the restore
+    // agreement, so a rank without it must not start beside one with it.
+    // Nothing is refused there — that start is integ/next's.
+    let ssm_only = word_for(None, 106_496, DISK, false).unwrap();
+    assert!(ssm_only != TIER_OFF && ssm_only != FAILED_RANK);
+    assert_ne!(ssm_only, word_for(None, 106_496, PEER, true).unwrap());
+    let ram = Some(SpillHome::HostRam);
+    assert_ne!(word_for(None, 106_496, ram, true).unwrap(), TIER_OFF);
+    let on = word_for(Some(&tier("24", false)), 106_496, DISK, true).unwrap();
+    assert!(on != TIER_OFF && on != FAILED_RANK && on != ssm_only);
+    for other in [
+        word_for(Some(&tier("24", true)), 106_496, DISK, true),
+        word_for(Some(&tier("25", false)), 106_496, DISK, true),
+        word_for(Some(&tier("24", false)), 106_496, None, true),
+        word_for(Some(&tier("24", false)), 106_496, PEER, true),
+    ] {
+        assert_ne!(on, other.unwrap());
+    }
     // A budget below one record is this rank's error, sent as the sentinel.
-    assert!(word_for(Some(&tier("0.00001", false)), 106_496, true).is_err());
+    assert!(word_for(Some(&tier("0.00001", false)), 106_496, DISK, true).is_err());
     // No field combination lands on either reserved word.
     for slots in 0..4096 {
-        let fp = rank_fingerprint(slots, 106_496, slots % 2 == 0, FAST);
+        let home = [None, DISK, PEER, ram][slots as usize % 4];
+        let fp = rank_fingerprint(slots, 106_496, home, FAST);
         assert!(fp != TIER_OFF && fp != FAILED_RANK);
     }
 }
 
 #[test]
+fn the_kv_tier_refuses_a_host_ram_snapshot_tier_and_a_pair_without_lifeline() {
+    let cfg = tier("24", true);
+    // Spilled snapshots in host RAM are outside the reserve the pool is sized
+    // around (legacy store, no usable swap directory, non-4 KiB blob).
+    let e = word_for(Some(&cfg), 106_496, Some(SpillHome::HostRam), true).unwrap_err();
+    let text = format!("{e:#}");
+    assert!(text.contains("ATLAS_SSM_TIER_SWAP_DIR"), "{text}");
+    assert!(text.contains("host RAM"), "{text}");
+    // A rank that fails in its local attach stops its peer through the
+    // lifeline only.
+    let e = word_for(Some(&cfg), 106_496, DISK, false).unwrap_err();
+    assert!(format!("{e:#}").contains("ATLAS_EP_PEER_LIFELINE"), "{e:#}");
+    assert!(snapshots_off_host(Some(SpillHome::HostRam)).is_err());
+    assert!(snapshots_off_host(DISK).is_ok() && snapshots_off_host(None).is_ok());
+    // Either refusal reaches every rank as the failure sentinel.
+    let peer = rank_fingerprint(10, 4096, DISK, FAST);
+    let refused = word_for(Some(&cfg), 106_496, Some(SpillHome::HostRam), true);
+    assert!(verify_ranks(refused, &[FAILED_RANK, peer]).is_err());
+    let e = verify_ranks(Ok(peer), &[FAILED_RANK, peer]).unwrap_err();
+    assert!(format!("{e:#}").contains("rank 0"), "{e:#}");
+}
+
+#[test]
 fn a_failed_rank_fails_every_rank_after_the_exchange() {
-    let fp = rank_fingerprint(10, 4096, false, OFF);
+    let fp = rank_fingerprint(10, 4096, None, OFF);
     assert!(verify_ranks(Ok(fp), &[fp, fp]).is_ok());
     assert!(verify_ranks(Ok(TIER_OFF), &[TIER_OFF, TIER_OFF]).is_ok());
     let own = verify_ranks(Err(anyhow::anyhow!("bad env")), &[FAILED_RANK, fp]);
     assert!(format!("{:#}", own.unwrap_err()).contains("bad env"));
     let peer = verify_ranks(Ok(fp), &[fp, FAILED_RANK]).unwrap_err();
     assert!(format!("{peer:#}").contains("rank 1"));
-    let other = rank_fingerprint(11, 4096, false, OFF);
+    let other = rank_fingerprint(11, 4096, None, OFF);
     assert!(verify_ranks(Ok(fp), &[fp, other]).is_err());
     // The tier on one rank only: both ranks refuse, the one without it too.
     assert!(verify_ranks(Ok(fp), &[fp, TIER_OFF]).is_err());
@@ -214,7 +242,7 @@ fn the_tier_word_rides_the_kv_block_agreement() {
     // before the tier existed, and the ranks take the minimum.
     let (agreed, sent) = agree(Ok(TIER_OFF), 900);
     assert_eq!((agreed.unwrap(), sent), (900, 1000));
-    let fp = rank_fingerprint(10, 4096, true, FAST);
+    let fp = rank_fingerprint(10, 4096, DISK, FAST);
     let (agreed, sent) = agree(Ok(fp), on(1200, fp));
     assert_eq!((agreed.unwrap(), sent), (1000, on(1000, fp)));
     // The tier on one rank only stops BOTH ranks, in the same collective.
@@ -223,7 +251,7 @@ fn the_tier_word_rides_the_kv_block_agreement() {
     assert!(format!("{:#}", agreed.unwrap_err()).contains("differs across ranks"));
     assert!(agree(Ok(fp), 900).0.is_err());
     assert!(
-        agree(Ok(fp), on(900, rank_fingerprint(10, 4096, true, OFF)))
+        agree(Ok(fp), on(900, rank_fingerprint(10, 4096, DISK, OFF)))
             .0
             .is_err()
     );

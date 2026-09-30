@@ -26,7 +26,7 @@ pub(crate) use arena_store::{ArenaSnapshotStore, PagingSnapshotStore, RdmaSnapsh
 pub(crate) use capability::ensure_ssm_tier_capability;
 pub(crate) use fingerprint::ModelFingerprint;
 pub(crate) use selectors::{
-    build_decode_tier_store, build_tier_store, lazy_host_bytes, ssm_tier_enabled,
+    SpillHome, build_decode_tier_store, build_tier_store, ssm_tier_enabled,
 };
 pub(crate) use store::{BlobStoreStats, MemBlobStore, SnapshotBlobStore};
 pub(crate) use transport::{

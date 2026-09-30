@@ -53,9 +53,11 @@
 //! TP2 ranks keep their own snapshot pools and indexes. Only the radix match
 //! is min-reduced across ranks (F83), and the Marconi restore depth sets each
 //! rank's processed row range, so ranks that restore at different depths run
-//! mismatched collectives. With either flag, or with the NVMe prefix tier
-//! (`ATLAS_KV_NVME_DIR`: a KV restore or a snapshot fault-in can succeed on
-//! one rank only), the ranks also agree on the restore depth
+//! mismatched collectives. With either flag, or with a spill tier (the NVMe
+//! prefix tier `ATLAS_KV_NVME_DIR` or the snapshot tier `ATLAS_SSM_TIER`: a
+//! KV restore or a snapshot fault-in can succeed on one rank only; startup
+//! refuses ranks that differ in either, `factory/build/kv_nvme.rs`), the
+//! ranks also agree on the restore depth
 //! ([`agree_restore`]): the minimum depth any rank can restore,
 //! taken only if every rank holds an exact-prefix snapshot at that depth, and
 //! otherwise a full recompute everywhere. That costs one 4-byte
@@ -286,8 +288,8 @@ impl TransformerModel {
 
     /// Agree on one restore `(snapshot, depth, is_tail)` across ranks (see
     /// the module docs and [`agree_restore`]). Returns the local choice
-    /// unchanged when agreement is off (neither policy flag, no NVMe prefix
-    /// tier) or this is a single-rank world;
+    /// unchanged when agreement is off (neither policy flag, no spill tier)
+    /// or this is a single-rank world;
     /// `(None, 0, false)` means no rank restores.
     pub(super) fn pc_agree_restore(
         &self,
@@ -299,9 +301,8 @@ impl TransformerModel {
         local: (Option<usize>, usize),
     ) -> Result<(Option<usize>, usize, bool)> {
         let is_tail = prefix_match.ssm_snapshot_is_tail;
-        if !(pc_rank_agree_enabled() || self.nvme_tier().is_some())
-            || !self.multi_rank_protocol_active()
-        {
+        let spill_tier = || self.ssm_tier_store.is_some() || self.nvme_tier().is_some();
+        if !(pc_rank_agree_enabled() || spill_tier()) || !self.multi_rank_protocol_active() {
             return Ok((local.0, local.1, is_tail));
         }
         let restorable = |id: usize, tok: usize, tail: bool| {

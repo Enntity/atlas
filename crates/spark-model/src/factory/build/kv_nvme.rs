@@ -15,6 +15,13 @@
 //! returned when the process exits for ANY reason — nothing to clean up after
 //! a crash, and no stale file can ever be read by a later process. A file a
 //! process left behind by dying before that unlink is swept at the next start.
+//!
+//! Without `ATLAS_KV_NVME_DIR` none of the other three is read: a rank starts
+//! exactly as it does with them unset ([`attach`] warns about each).
+//!
+//! The tier refuses to start when `ATLAS_SSM_TIER` keeps spilled snapshots in
+//! host RAM ([`snapshots_off_host`]), and on a multi-rank world with
+//! `ATLAS_EP_PEER_LIFELINE=0` ([`word_for`]); every rank stops.
 
 use std::path::PathBuf;
 
@@ -22,6 +29,8 @@ use anyhow::{Result, bail, ensure};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::PagedKvCache;
 use spark_runtime::prefix_cache::PrefixCache;
+
+use crate::model::ssm_tier::SpillHome;
 
 pub(super) const DIR_VAR: &str = "ATLAS_KV_NVME_DIR";
 pub(super) const GB_VAR: &str = "ATLAS_KV_NVME_GB";
@@ -66,11 +75,8 @@ pub(super) fn config_from(
     let dir = dir.map(str::trim).filter(|s| !s.is_empty());
     let gb = gb.map(str::trim).filter(|s| !s.is_empty());
     let Some(dir) = dir else {
-        if let Some(gb) = gb {
-            bail!("{GB_VAR}={gb:?} is set but {DIR_VAR} is not — the budget would be inert");
-        }
-        // The two switches only choose HOW the tier moves records. Without
-        // the tier they are not read at all — whatever their value, a rank
+        // The budget and the two switches only shape a tier that is on.
+        // Without it they are not read at all — whatever their value, a rank
         // starts exactly as it does with them unset ([`attach`] says so).
         return Ok(None);
     };
@@ -138,28 +144,34 @@ pub(super) fn max_slots(budget_bytes: u64, record_bytes: usize) -> Result<u32> {
 }
 
 /// What every rank must agree on before serving: the KV tier's geometry and
-/// budget, the SSM tier switch (with the KV tier on, the restore-depth
-/// agreement in `prefill_b/pc_policy.rs` covers a snapshot fault-in that
-/// succeeds on one rank only, and the switch sets the host reserve), whether
-/// restored records are kept (it changes which blocks the budget drops, so the
-/// ranks' trees would drift apart), and the I/O path (it sets the staging
-/// reserve, and a write failure reaches the tree at a different time on each
-/// path — ranks on different paths are not one configuration). Never
-/// [`TIER_OFF`] or [`FAILED_RANK`].
+/// budget, where the SSM tier keeps its spills (with a spill tier on, the
+/// restore-depth agreement in `prefill_b/pc_policy.rs` covers a snapshot
+/// fault-in that succeeds on one rank only, and the home sets the host
+/// reserve), whether restored records are kept (it changes which blocks the
+/// budget drops, so the ranks' trees would drift apart), and the I/O path (it
+/// sets the staging reserve, and a write failure reaches the tree at a
+/// different time on each path — ranks on different paths are not one
+/// configuration). Never [`TIER_OFF`] or [`FAILED_RANK`].
 fn rank_fingerprint(
     slots: u32,
     record_bytes: usize,
-    ssm_tier: bool,
+    ssm_home: Option<SpillHome>,
     (fast, keep): (bool, bool),
 ) -> u32 {
+    let ssm = match ssm_home {
+        None => 0,
+        Some(SpillHome::HostRam) => 1,
+        Some(SpillHome::Disk { .. }) => 2,
+        Some(SpillHome::Peer) => 3,
+    };
     let h = atlas_tier::hash::mix64(
         atlas_tier::hash::mix64(slots as u64, record_bytes as u64),
-        ssm_tier as u64 + 1 + 2 * keep as u64 + 4 * fast as u64,
+        ssm + 1 + 4 * keep as u64 + 8 * fast as u64,
     );
     (h % (FAILED_RANK as u64 - 1)) as u32 + 1
 }
 
-/// The word of a rank with the KV tier off.
+/// The word of a rank with no spill tier.
 const TIER_OFF: u32 = 0;
 /// The word a rank sends when its OWN configuration is unusable: never equal
 /// to a real one, so every peer fails the check too instead of serving on.
@@ -167,22 +179,63 @@ pub(super) const FAILED_RANK: u32 = u32::MAX;
 
 /// This rank's spill-tier word for the startup agreement
 /// (`glm::agree_kv_blocks` carries it in the upper half of the word every rank
-/// already gathers, so the tier adds no collective): [`TIER_OFF`] without
-/// `ATLAS_KV_NVME_DIR` — whatever else the environment holds — and otherwise
-/// a fingerprint of everything in [`rank_fingerprint`]. `Err` when the tier's
-/// environment does not parse or its budget cannot hold one record.
-pub(super) fn rank_word(record_bytes: usize) -> Result<u32> {
-    let ssm_tier = std::env::var_os("ATLAS_SSM_TIER").is_some();
-    word_for(config_from_env()?.as_ref(), record_bytes, ssm_tier)
+/// already gathers, so the tiers add no collective): [`TIER_OFF`] with neither
+/// `ATLAS_KV_NVME_DIR` nor an SSM tier (`ssm_home`) — whatever else the
+/// environment holds — and otherwise a fingerprint of everything in
+/// [`rank_fingerprint`]. `Err` when the KV tier's environment does not parse,
+/// its budget cannot hold one record, or [`word_for`] refuses the combination.
+pub(super) fn rank_word(record_bytes: usize, ssm_home: Option<SpillHome>) -> Result<u32> {
+    let lifeline = std::env::var("ATLAS_EP_PEER_LIFELINE").as_deref() != Ok("0");
+    word_for(
+        config_from_env()?.as_ref(),
+        record_bytes,
+        ssm_home,
+        lifeline,
+    )
 }
 
-fn word_for(cfg: Option<&NvmeKvConfig>, record_bytes: usize, ssm_tier: bool) -> Result<u32> {
+fn word_for(
+    cfg: Option<&NvmeKvConfig>,
+    record_bytes: usize,
+    ssm_home: Option<SpillHome>,
+    lifeline: bool,
+) -> Result<u32> {
     let Some(cfg) = cfg else {
-        return Ok(TIER_OFF);
+        // The SSM tier alone: no KV record, but the ranks run the restore
+        // agreement together (`pc_agree_restore`) or not at all.
+        return Ok(ssm_home.map_or(TIER_OFF, |home| {
+            rank_fingerprint(0, 0, Some(home), (false, false))
+        }));
     };
+    snapshots_off_host(ssm_home)?;
+    // What can still fail after this exchange is rank-local ([`attach`]); the
+    // lifeline is what stops the peer of a rank that fails there.
+    ensure!(
+        lifeline,
+        "{DIR_VAR} requires the EP peer lifeline: unset ATLAS_EP_PEER_LIFELINE=0"
+    );
     let slots = max_slots(cfg.budget_bytes, record_bytes)?;
     let switches = (cfg.fast, cfg.keep);
-    Ok(rank_fingerprint(slots, record_bytes, ssm_tier, switches))
+    Ok(rank_fingerprint(slots, record_bytes, ssm_home, switches))
+}
+
+/// Hosts hang on unified-memory exhaustion: the KV pool is sized around what
+/// the tiers take from the host ([`host_reserve_bytes`]), and a snapshot store
+/// that keeps its spills in RAM (78 MB each on GLM-5.3) has no such bound —
+/// the legacy store, a unified store without a usable
+/// `ATLAS_SSM_TIER_SWAP_DIR`, or a blob that is not an O_DIRECT record. The
+/// KV tier does not start beside one: checked before the rank exchange
+/// ([`word_for`], so every rank stops) and at [`attach`] (a single rank has
+/// no exchange).
+fn snapshots_off_host(ssm_home: Option<SpillHome>) -> Result<()> {
+    ensure!(
+        ssm_home != Some(SpillHome::HostRam),
+        "{DIR_VAR} with ATLAS_SSM_TIER: this rank's snapshot tier keeps its spills in host RAM, \
+         which the KV pool is not sized around. Set ATLAS_SSM_TIER_UNIFIED=1 and \
+         ATLAS_SSM_TIER_SWAP_DIR=<a directory of the node's NVMe> (see this rank's \
+         'unified SSM tier' log line for why the swap file was not used), or unset ATLAS_SSM_TIER"
+    );
+    Ok(())
 }
 
 /// After the exchange: this rank's own error first, then any peer that
@@ -196,7 +249,7 @@ pub(super) fn verify_ranks(local: Result<u32>, all: &[u32]) -> Result<()> {
     ensure!(
         all.iter().all(|&v| v == word),
         "spill-tier config differs across ranks (words {all:x?}, {TIER_OFF} = off); set \
-         identical {DIR_VAR}/{GB_VAR}/{FAST_VAR}/{KEEP_VAR}/ATLAS_SSM_TIER on every rank"
+         identical {DIR_VAR}/{GB_VAR}/{FAST_VAR}/{KEEP_VAR} and ATLAS_SSM_TIER* on every rank"
     );
     Ok(())
 }
@@ -206,16 +259,19 @@ pub(super) fn verify_ranks(local: Result<u32>, all: &[u32]) -> Result<()> {
 /// off. The ranks have already agreed on the configuration
 /// ([`rank_word`]); what can still fail here is rank-local (directory, disk
 /// reservation, staging), and a rank that stops takes its peers with it
-/// through the EP peer lifeline.
+/// through the EP peer lifeline ([`word_for`] requires it).
 pub(super) fn attach(
     kv_cache: &mut PagedKvCache,
     prefix_cache: &dyn PrefixCache,
     gpu: &dyn GpuBackend,
     rank: usize,
+    ssm_home: Option<SpillHome>,
 ) -> Result<()> {
     let cfg = config_from_env()?;
-    if cfg.is_none() {
-        for var in [FAST_VAR, KEEP_VAR] {
+    if cfg.is_some() {
+        snapshots_off_host(ssm_home)?;
+    } else {
+        for var in [GB_VAR, FAST_VAR, KEEP_VAR] {
             if std::env::var(var).is_ok_and(|v| !matches!(v.trim(), "" | "0")) {
                 tracing::warn!(
                     "{var} is set but {DIR_VAR} is not: the NVMe prefix tier is off and {var} \

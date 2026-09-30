@@ -629,7 +629,7 @@ pub fn build_model(
         gpu.as_ref(),
         num_kv_blocks,
         glm_cache_plan,
-        kv_nvme::rank_word(nvme_record_bytes),
+        kv_nvme::rank_word(nvme_record_bytes, ssm_pools.tier_home),
     )?;
     let _max_kv_tokens = num_kv_blocks * kv_block_size;
     // Phase 6.1.f / 6.2.c — when --high-speed-swap is on with HBM-shrink, the
@@ -704,6 +704,7 @@ pub fn build_model(
         prefix_cache.as_ref(),
         gpu.as_ref(),
         comm.as_deref().map_or(0, |c| c.rank()),
+        ssm_pools.tier_home,
     )?;
 
     // ── Step 6: Assemble model ──
