@@ -292,6 +292,21 @@ impl MoeLayer {
             && !ctx.graph_capture
             && glm_router_prefill_cublas()
         {
+            // Opt-in `ATLAS_GLM_ROUTER_PREFILL_CUTLASS=1`: the CUTLASS tiles
+            // (`ops::bf16_gemm`, ~1.6x at 8K rows). Bit-identical where
+            // cuBLASLt runs without split-K (8K chunks); it picks split-K 3-4
+            // for 2K-4K-row chunks, whose logits then change in order only.
+            if glm_router_prefill_cutlass() {
+                return ops::bf16_gemm(
+                    router_in,
+                    self.weights.gate.weight.0,
+                    gate_logits,
+                    num_tokens,
+                    num_experts,
+                    hidden_size,
+                    stream,
+                );
+            }
             return spark_runtime::cublaslt::bf16_gemm_act_weight_t(
                 router_in.0,
                 self.weights.gate.weight.0,
@@ -408,4 +423,9 @@ impl MoeLayer {
 fn glm_router_prefill_cublas() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_ROUTER_PREFILL_CUBLAS").as_deref() == Ok("1"))
+}
+
+fn glm_router_prefill_cutlass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_ROUTER_PREFILL_CUTLASS").as_deref() == Ok("1"))
 }
