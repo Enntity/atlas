@@ -1261,14 +1261,6 @@ pub trait Model: Send + Sync {
         Ok(Vec::new()) // no-op for non-EP models
     }
 
-    /// EP: send the full prompt of the prefill command for slot `seq_id`
-    /// whose length word was just sent. The bulk broadcast by default; a
-    /// model may send only what its workers do not hold
-    /// (`ATLAS_GLM_PROMPT_DELTA`).
-    fn ep_broadcast_prompt(&self, _seq_id: u32, tokens: &[u32]) -> Result<()> {
-        self.ep_broadcast_tokens(tokens).map(drop)
-    }
-
     /// Trim the MTP proposer's KV cache after verification.
     ///
     /// Called on rejection to discard the rejected draft's MTP KV entry.

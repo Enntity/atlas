@@ -116,6 +116,6 @@ fn send_and_run(
     model.ep_broadcast_cmd((end - start) as u32)?;
     model.ep_broadcast_cmd(start as u32)?;
     model.ep_broadcast_cmd(prompt.len() as u32)?;
-    model.ep_broadcast_prompt(slot, prompt)?;
+    model.ep_broadcast_tokens(prompt)?;
     model.prefill_chunk(prompt, seq, start, end - start, is_last, stream)
 }

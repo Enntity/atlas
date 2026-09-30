@@ -271,7 +271,7 @@ pub fn prefill_request(
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?;
         model.ep_broadcast_cmd(0)?; // chunk_start = 0 (non-chunked)
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
-        model.ep_broadcast_prompt(seq.slot_idx as u32, &prompt_tokens)?;
+        model.ep_broadcast_tokens(&prompt_tokens)?;
 
         let logits = model.prefill(&prompt_tokens, &mut seq, 0)?;
         // #131: constrain the FIRST token with the grammar too (and advance

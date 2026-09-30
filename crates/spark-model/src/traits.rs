@@ -357,6 +357,16 @@ impl SequenceState {
         self.ssm_slot.as_ref().and_then(|g| g.idx())
     }
 
+    /// Whether the prefill chunk that ends at token `end` computes nothing:
+    /// the snapshot chunk 0's prefix lookup restored covers it
+    /// (`marconi_skip_to`, 0 when nothing was restored) and it is not the
+    /// last chunk, whose final row always runs for the logits. This is when
+    /// `prefill_b_proc_range` returns `EarlyReturn`.
+    #[inline]
+    pub fn prefill_chunk_cached(&self, end: usize, is_last: bool) -> bool {
+        !is_last && self.marconi_skip_to >= end
+    }
+
     /// Phase 6.3 sliding-window helper: the absolute logical block index
     /// of `block_table[0]`. Returns 0 when `--high-speed-swap` is off
     /// (`disk_block_ids` is empty then; `block_table` is the full history).

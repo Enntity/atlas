@@ -199,10 +199,9 @@ impl TransformerModel {
         // with ATLAS_GLM_WARM_SKIP_CACHED after the prefix lookup and only
         // for a chunk that computes.
         let lookup_first = self.warm_lookup_first();
-        let mut t_pre = [std::time::Duration::ZERO; 2];
-        if !lookup_first {
-            t_pre = self.prefill_b_zero_and_embed(tokens, chunk_start, chunk_len, stream)?;
-        }
+        let span = (chunk_start, chunk_len);
+        let mut t_pre =
+            self.prefill_b_zero_and_embed(!lookup_first, tokens, span.0, span.1, stream)?;
         let t_embed = tp.elapsed();
 
         let mut kv_cache = self.kv_cache.lock();
@@ -220,15 +219,13 @@ impl TransformerModel {
         self.warm_trace_sync(stream)?;
         let t_lookup = tp.elapsed() - t_embed;
         // ATLAS_GLM_PC_BRANCH: split at the planned branch checkpoint.
-        let span = (chunk_start, chunk_len);
         if let Some(at) = pc_policy::branch_split_at(seq.pc_branch_at, span, passengers.is_some()) {
             drop(kv_cache);
             return self.pc_branch_split(tokens, seq, span, at, is_last_chunk, stream);
         }
-        let cached = lookup_first
-            && warm::fully_cached(marconi_skip, kv_write_start, span.0, span.1, is_last_chunk);
-        if lookup_first && !cached {
-            t_pre = self.prefill_b_zero_and_embed(tokens, chunk_start, chunk_len, stream)?;
+        let cached = lookup_first && seq.prefill_chunk_cached(span.0 + span.1, is_last_chunk);
+        if lookup_first {
+            t_pre = self.prefill_b_zero_and_embed(!cached, tokens, span.0, span.1, stream)?;
         }
         let t_prefix = tp.elapsed();
 
@@ -285,7 +282,7 @@ impl TransformerModel {
                 seq.seq_len = chunk_start + chunk_len;
                 seq.last_decode_ckpt_block = seq.tokens.len() / bs;
                 let marks = [t_lookup, t_prefix, t_blocks, t_blocks, t_blocks];
-                self.warm_trace_chunk(seq, total, tp, 0, t_pre, marks, false, stream)?;
+                self.warm_trace_chunk(seq, total, tp, (span.0, 0), t_pre, marks, None, stream)?;
                 return Ok(ptr);
             }
         };
@@ -490,8 +487,8 @@ impl TransformerModel {
             )?;
             DevicePtr::NULL
         };
-        let last = is_last_chunk;
-        self.warm_trace_chunk(seq, total, tp, proc_count, t_pre, marks, last, stream)?;
+        let (chunk, logits) = ((span.0, proc_count), is_last_chunk.then_some(out));
+        self.warm_trace_chunk(seq, total, tp, chunk, t_pre, marks, logits, stream)?;
         Ok(out)
     }
 }

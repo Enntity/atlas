@@ -2,34 +2,34 @@
 
 //! A chunk the cache covers completely: which chunk that is, and on the real
 //! `prefill_chunk` that the switch changes nothing but the zero and embed of
-//! those chunks. Then the deep tail cut, the worker's real chunk handler fed
-//! the prompt as a delta, the trace switch and the zero modes of
-//! `ATLAS_GLM_ZERO_ROWS`.
+//! those chunks. Then the deep tail cut, the trace modes and the zero modes
+//! of `ATLAS_GLM_ZERO_ROWS`.
 
 // The real model and recording layer of `prefill_stream_tests`.
 #[allow(clippy::duplicate_mod)]
 #[path = "../prefill_stream_test_fixture.rs"]
 mod fixture;
 
-use super::fully_cached;
 use crate::layer::EmptyLayerState;
-use crate::model::warm_turn::{ZeroRows, prompt_hash};
+use crate::model::warm_turn::{TraceMode, ZeroRows};
 use crate::traits::{Model, SequenceState};
 use fixture::*;
 
 #[test]
-fn a_chunk_is_cached_when_a_skip_covers_all_of_it_and_it_is_not_the_last() {
-    // Chunk [8, 16) against restore depths around it.
+fn a_chunk_is_cached_when_the_restore_covers_all_of_it_and_it_is_not_the_last() {
+    let mut seq = SequenceState::host_only(0);
+    // Chunk [8, 16) against restore depths around it; 0 is "nothing
+    // restored", which a prefix hit without a snapshot also leaves.
     for (skip_to, want) in [(0, false), (8, false), (15, false), (16, true), (40, true)] {
-        assert_eq!(fully_cached(true, skip_to, 8, 8, false), want, "{skip_to}");
+        seq.marconi_skip_to = skip_to;
+        assert_eq!(seq.prefill_chunk_cached(16, false), want, "{skip_to}");
         // The last chunk always runs its final row.
-        assert!(!fully_cached(true, skip_to, 8, 8, true));
-        // A prefix hit without a restore recomputes from token 0.
-        assert!(!fully_cached(false, skip_to, 8, 8, false));
+        assert!(!seq.prefill_chunk_cached(16, true));
     }
     // Chunk 0.
-    assert!(fully_cached(true, 8, 0, 8, false));
-    assert!(!fully_cached(true, 7, 0, 8, false));
+    seq.marconi_skip_to = 8;
+    assert!(seq.prefill_chunk_cached(8, false));
+    assert!(!seq.prefill_chunk_cached(9, false));
 }
 
 /// Re-run `name` in a child process with the Marconi restore floor lifted
@@ -240,51 +240,13 @@ fn actual_deep_tail_cut_restores_one_block_deeper() {
     }
 }
 
-/// The worker's real 0xFFFFFFF0 handler, driven through `ep_worker_step` by
-/// the head's words. With the prompt delta the first chunk command carries
-/// the whole cold prompt after its announce words (slot, base slot, shared
-/// tokens, hash) and the second chunk of the same prompt carries no token;
-/// either way the worker reads every word and runs the same passes to the
-/// same sequence.
-#[test]
-fn actual_worker_chunks_run_the_same_from_the_prompt_delta() {
-    let tokens: Vec<u32> = (1..=24).collect();
-    let hash = prompt_hash(&tokens);
-    let run = |delta: bool| {
-        let mut f = Fixture::with_tail_split(2, 2, 1);
-        f.disable_capture();
-        f.model.warm.prompt_delta = delta;
-        let v2_slot: &[u32] = if f.model.ep_protocol_v2 { &[0] } else { &[] };
-        let prompt = |start: u32| match (delta, start) {
-            (false, _) => tokens.clone(),
-            (true, 0) => [&[0, 0, 0, hash][..], &tokens[..]].concat(),
-            (true, _) => vec![0, 0, 24, hash],
-        };
-        let mut slots = [Some(std::mem::replace(
-            &mut f.seq,
-            SequenceState::host_only(0),
-        ))];
-        for (len, start) in [(8, 0), (16, 8)] {
-            f.script(&[v2_slot, &[0xFFFF_FFF0, len, start, 24], &prompt(start)].concat());
-            assert!(f.model.ep_worker_step(&mut slots).unwrap());
-            assert_eq!(f.unread(), 0, "delta {delta}: command words left unread");
-        }
-        let s = slots[0].take().unwrap();
-        (f.events(), s.tokens, s.seq_len, s.block_table.len())
-    };
-    let (bulk, delta) = (run(false), run(true));
-    assert_eq!(bulk.0.len(), 3);
-    assert_eq!((&bulk.1, bulk.2, bulk.3), (&tokens, 24, 6));
-    assert_eq!(delta, bulk);
-}
-
-/// `ATLAS_GLM_WARM_TRACE` syncs the stream at every step of a chunk and logs
-/// the request's line after the last one: the passes, the sequence and the
-/// zeroed chunks are those of a run without it.
+/// `ATLAS_GLM_WARM_TRACE` logs the request's line after the last chunk (and
+/// with `1` syncs the stream at every step of a chunk): the passes, the
+/// sequence and the zeroed chunks are those of a run without it.
 #[test]
 fn actual_trace_changes_no_pass() {
     let tokens: Vec<u32> = (1..=24).collect();
-    let cold = |trace: bool| {
+    let cold = |trace: TraceMode| {
         let mut f = Fixture::with_tail_split(2, 2, 0);
         f.disable_capture();
         f.model.warm.trace = trace;
@@ -292,7 +254,45 @@ fn actual_trace_changes_no_pass() {
         let zeroed = run_chunks(&f, &mut seq, &tokens);
         (f.events(), seq.seq_len, seq.block_table.len(), zeroed)
     };
-    assert_eq!(cold(true), cold(false));
+    let off = cold(TraceMode::Off);
+    for mode in [TraceMode::Hash, TraceMode::Spans] {
+        assert_eq!(cold(mode), off, "{mode:?}");
+    }
+}
+
+/// The request's line carries the hash of the logits row its last chunk
+/// returned, read from the device: another row, another hash.
+#[test]
+fn actual_trace_line_fingerprints_the_logits_row() {
+    use crate::model::warm_turn::logits_hash;
+    let f = Fixture::with_tail_split(2, 2, 0);
+    let (gpu, logits) = (f.model.gpu.as_ref(), f.model.buffers.logits());
+    let width = f.model.config.vocab_size * 2;
+    let line = |fill: u8| {
+        gpu.memset(logits, fill, width).unwrap();
+        let (zero, now) = (std::time::Duration::ZERO, std::time::Instant::now());
+        f.model
+            .warm_trace_line(
+                &f.seq,
+                24,
+                now,
+                (0, 8),
+                [zero; 2],
+                [zero; 5],
+                Some(logits),
+                CALLER,
+            )
+            .unwrap()
+            .unwrap()
+    };
+    for fill in [0x11u8, 0x12] {
+        let want = format!(" logits={:016x}", logits_hash(&vec![fill; width]));
+        assert!(line(fill).ends_with(&want), "{fill:#x}");
+    }
+    assert_ne!(
+        logits_hash(&vec![0x11; width]),
+        logits_hash(&vec![0x12; width])
+    );
 }
 
 /// `ATLAS_GLM_ZERO_ROWS` on the real chunk path. The fixture's buffers are
