@@ -24,6 +24,7 @@ mod projection;
 mod output;
 #[path = "paged_glm_owner.rs"]
 mod owner;
+pub(crate) use owner::write_floor_legacy;
 pub(in crate::layers::qwen3_attention) use owner::{GlmChunkOwner, glm_chunk_pieces};
 
 fn dense_selection_is_exact(sequence_end: usize, index_topk: usize) -> bool {

@@ -677,7 +677,7 @@ impl TransformerModel {
                     // PCND diagnostic: force eager decode (no CUDA-graph capture)
                     // so ATLAS_DEBUG_SYNC_KERNELS can synchronize per launch and
                     // surface async faults at the culprit kernel. Default-off.
-                    || std::env::var("ATLAS_DEBUG_NO_GRAPH").as_deref() == Ok("1"),
+                    || super::graph_flags::debug_no_graph(),
             ),
             ssm_pool,
             ssm_snapshots,
@@ -727,7 +727,7 @@ impl TransformerModel {
             snapshot_event,
             comm,
             ep_cmd_buf,
-            ep_protocol_v2: matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2")),
+            ep_protocol_v2: super::ep_protocol_v2_requested(),
             self_speculative,
             last_mtp_hidden_idx: std::sync::atomic::AtomicUsize::new(0),
             vision_encoder,

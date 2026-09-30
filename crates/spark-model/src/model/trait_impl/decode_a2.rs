@@ -30,16 +30,6 @@ fn lmhead_batch_gemv_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_LMHEAD_BATCH_GEMV").ok().as_deref() != Some("0"))
 }
 
-/// Multi-seq decode CUDA graphs: **ON by default**, disabled by
-/// `ATLAS_NO_DECODE_GRAPHS_MULTISEQ=1`.
-///
-/// Strict `== "1"` on an `ATLAS_NO_*` name rather than a presence check —
-/// presence-checked flags here are ENABLED by `=0`. Read once per process.
-fn multiseq_graphs_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ATLAS_NO_DECODE_GRAPHS_MULTISEQ").as_deref() != Ok("1"))
-}
-
 impl TransformerModel {
     pub(super) fn decode_batch_dispatch(
         &self,
@@ -267,7 +257,7 @@ impl TransformerModel {
             && !ms_profile
             && !lora_eager
             && !layer_veto
-            && multiseq_graphs_enabled()
+            && crate::model::graph_flags::multiseq_graphs_enabled()
         {
             self.batch_decode_graph_key(&*seqs, padded_n)
         } else {

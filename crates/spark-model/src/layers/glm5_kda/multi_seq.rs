@@ -47,7 +47,7 @@ impl Glm5KdaLayer {
             crate::model::glm_independent::validate_runtime(
                 ctx.config,
                 ctx.comm.map_or(0, |c| c.world_size()),
-                std::env::var("ATLAS_EP_PROTOCOL").as_deref() == Ok("v2"),
+                crate::model::ep_protocol_v2_requested(),
                 true,
             )?;
             crate::model::glm_independent::validate_scratch(
@@ -59,7 +59,7 @@ impl Glm5KdaLayer {
             crate::model::glm_c4::validate_runtime(
                 ctx.config,
                 ctx.comm.map_or(0, |comm| comm.world_size()),
-                std::env::var("ATLAS_EP_PROTOCOL").as_deref() == Ok("v2"),
+                crate::model::ep_protocol_v2_requested(),
                 true,
             )?;
             ensure!(

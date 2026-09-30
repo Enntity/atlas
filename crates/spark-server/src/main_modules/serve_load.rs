@@ -557,13 +557,8 @@ pub(crate) fn load_model(
     // property present for fresh non-cached sequences too), not a Marconi
     // state-management defect — so no warning is emitted here.
     let prefix_cache = serve_phases::build_prefix_cache(&args, &config);
-    let comm = serve_phases::init_nccl_comm(
-        &args,
-        gpu.as_ref(),
-        world_size,
-        max_batch_tokens,
-        config.hidden_size,
-    )?;
+    let comm =
+        serve_phases::init_nccl_comm(&args, gpu.as_ref(), world_size, max_batch_tokens, &config)?;
     // Carried on the config rather than written into the environment: the old
     // `unsafe set_var` claimed "called before any threads are spawned", which
     // was false by this point (tokio pool, this blocking thread, the signal

@@ -215,18 +215,9 @@ fn min_across_ranks(
     gpu: &dyn GpuBackend,
     value: usize,
 ) -> Result<usize> {
-    let world = comm.world_size();
-    let buf = gpu.alloc(8 * (world + 1))?;
-    let result = (|| {
-        gpu.copy_h2d(&(value as u64).to_le_bytes(), buf)?;
-        comm.all_gather(buf.0, buf.offset(8).0, 8)?;
-        let mut all = vec![0u8; 8 * world];
-        gpu.copy_d2h(buf.offset(8), &mut all)?;
-        all.chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().expect("8-byte rank value")) as usize)
-            .min()
-            .ok_or_else(|| anyhow::anyhow!("empty rank gather"))
-    })();
-    gpu.free(buf)?;
-    result
+    crate::model::startup_parity::gather_words(comm, gpu, &[value as u64])?
+        .into_iter()
+        .min()
+        .map(|v| v as usize)
+        .ok_or_else(|| anyhow::anyhow!("empty rank gather"))
 }
