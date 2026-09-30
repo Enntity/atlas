@@ -6,6 +6,45 @@
 
 use super::*;
 
+/// `ATLAS_GLM_LONG_BATCH_ALIAS_CHECK`: every physical block one owner writes
+/// this step that another owner of the batch also holds, as
+/// `(block, (writer, its block index), (other owner, its block index))`.
+///
+/// `owners` is each owner's `(seq_len, block_table)`. An owner writes rows
+/// `seq_len..seq_len + rows`, so only its blocks from `seq_len / block_size`
+/// on are written. The blocks below that are read-only, and owners that
+/// matched one cached prefix share them by design: reporting those drowned
+/// the real aliases.
+pub(super) fn write_window_aliases(
+    owners: &[(usize, &[u32])],
+    rows: usize,
+    block_size: usize,
+) -> Vec<(u32, (usize, usize), (usize, usize))> {
+    let used = |&(seq_len, table): &(usize, &[u32])| {
+        (seq_len + rows).div_ceil(block_size).min(table.len())
+    };
+    let mut holders = std::collections::HashMap::<u32, Vec<(usize, usize)>>::new();
+    for (o, owner) in owners.iter().enumerate() {
+        for (idx, &block) in owner.1[..used(owner)].iter().enumerate() {
+            holders.entry(block).or_default().push((o, idx));
+        }
+    }
+    let mut aliases = Vec::new();
+    for (w, owner) in owners.iter().enumerate() {
+        for w_idx in owner.0 / block_size..used(owner) {
+            let block = owner.1[w_idx];
+            for &(o, idx) in &holders[&block] {
+                // Two writers of one block are reported once, by the first.
+                let reported = o < w && idx >= owners[o].0 / block_size;
+                if o != w && !reported {
+                    aliases.push((block, (w, w_idx), (o, idx)));
+                }
+            }
+        }
+    }
+    aliases
+}
+
 impl TransformerModel {
     /// Diagnostic (`ATLAS_GLM_LONG_BATCH_SERIAL`): run one layer through its
     /// ordinary single-owner verify, owner by owner, with each owner's hidden

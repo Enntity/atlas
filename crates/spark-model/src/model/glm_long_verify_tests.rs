@@ -76,3 +76,37 @@ fn owner_index_is_bounded_by_owners_and_width() {
         assert!(!owner_supported(0, rows));
     }
 }
+
+#[test]
+fn alias_check_ignores_the_shared_read_only_prefix() {
+    // Two owners matched the same two cached prompt blocks (7, 8) and decode
+    // at position 37 into their own third blocks.
+    let (a, b) = ([7, 8, 20], [7, 8, 30]);
+    assert!(write_window_aliases(&[(37, &a), (37, &b)], 3, 16).is_empty());
+    // A verify that crosses into a fresh block writes two blocks per owner.
+    let (a, b) = ([7, 8, 20, 21], [7, 8, 30, 31]);
+    assert!(write_window_aliases(&[(46, &a), (46, &b)], 3, 16).is_empty());
+    // An owner on a block boundary writes only the block it is about to open.
+    assert!(write_window_aliases(&[(32, &a[..3]), (32, &b[..3])], 3, 16).is_empty());
+}
+
+#[test]
+fn alias_check_reports_a_block_two_owners_can_write() {
+    // Both owners hold block 20 as the block their next rows land in.
+    let (a, b) = ([7, 8, 20], [7, 8, 20]);
+    assert_eq!(
+        write_window_aliases(&[(37, &a), (38, &b)], 3, 16),
+        vec![(20, (0, 2), (1, 2))]
+    );
+}
+
+#[test]
+fn alias_check_reports_a_written_block_inside_another_owners_prefix() {
+    // Owner 0 retries a short prompt and writes block 9, which owner 1 holds
+    // as a read-only prefix block of its longer prompt.
+    let (retry, long) = ([7, 8, 9], [7, 8, 9, 40, 41]);
+    assert_eq!(
+        write_window_aliases(&[(37, &retry), (70, &long)], 3, 16),
+        vec![(9, (0, 2), (1, 2))]
+    );
+}
