@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Multi-row BF16 dense GEMV: tensor-core tiers and fused dual/triple projections.
+//! Multi-row BF16 dense GEMV: tensor-core tiers and fused dual/triple projections
+//! (plus the prefill GEMM triple, which shares the triple argument list).
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -218,8 +219,67 @@ fn dense_gemv_triple_n(
         first_n.is_multiple_of(4) && other_n.is_multiple_of(4),
         "dense GEMV triple requires output widths divisible by 4 (got {first_n} and {other_n})"
     );
+    launch_triple_n(
+        gpu,
+        kernel,
+        [div_ceil(first_n.max(other_n), 4), 1, 3],
+        input,
+        weights,
+        outputs,
+        m,
+        [first_n, other_n],
+        k,
+        stream,
+    )
+}
+
+/// Prefill twin of [`dense_gemv_batchm_triple_n`] (`dense_gemm_bf16_pipelined_triple_n`):
+/// each plane runs the unchanged `dense_gemm_bf16_pipelined` body, so it is
+/// bit-identical to three [`super::dense_gemm_bf16_pipelined`] launches, while
+/// the planes' CTAs over one 128-row activation tile run back to back and
+/// share it in L2 instead of streaming the activation three times.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemm_pipelined_triple_n(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weights: [&DenseWeight; 3],
+    outputs: [DevicePtr; 3],
+    m: u32,
+    [first_n, other_n]: [u32; 2],
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    let tiles = |n| div_ceil(n, 128);
+    launch_triple_n(
+        gpu,
+        kernel,
+        [tiles(first_n) + 2 * tiles(other_n), div_ceil(m, 128), 1],
+        input,
+        weights,
+        outputs,
+        Some(m),
+        [first_n, other_n],
+        k,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_triple_n(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    grid: [u32; 3],
+    input: DevicePtr,
+    weights: [&DenseWeight; 3],
+    outputs: [DevicePtr; 3],
+    m: Option<u32>,
+    [first_n, other_n]: [u32; 2],
+    k: u32,
+    stream: u64,
+) -> Result<()> {
     let mut l = KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(first_n.max(other_n), 4), 1, 3])
+        .grid(grid)
         .block([256, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weights[0].weight)
@@ -235,4 +295,39 @@ fn dense_gemv_triple_n(
         .arg_u32(other_n)
         .arg_u32(k)
         .launch(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spark_runtime::gpu::mock::MockGpuBackend;
+
+    #[test]
+    fn prefill_triple_walks_plane_tiles_along_x_over_128_row_tiles() {
+        let gpu = MockGpuBackend::new();
+        let w = DenseWeight {
+            weight: DevicePtr(0x1000),
+        };
+        for (m, n, grid) in [
+            (8196, [32, 128], [3, 65, 1]),
+            (3692, [32, 128], [3, 29, 1]),
+            (2, [32, 128], [3, 1, 1]),
+            (256, [200, 300], [2 + 2 * 3, 2, 1]),
+        ] {
+            dense_gemm_pipelined_triple_n(
+                &gpu,
+                KernelHandle(7),
+                DevicePtr(0x2000),
+                [&w; 3],
+                [DevicePtr(0x3000); 3],
+                m,
+                n,
+                4096,
+                0,
+            )
+            .unwrap();
+            let launch = gpu.launches_snapshot().pop().unwrap();
+            assert_eq!((launch.grid, launch.block), (grid, [256, 1, 1]));
+        }
+    }
 }

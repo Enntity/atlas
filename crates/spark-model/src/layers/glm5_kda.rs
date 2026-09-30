@@ -119,6 +119,9 @@ pub struct Glm5KdaLayer {
     w4a16_gemm_t_m128_k: KernelHandle,
     dense_gemm_k: KernelHandle,
     dense_gemm_pipelined_k: KernelHandle,
+    /// `dense_gemm_bf16_pipelined_triple_n` (prefill beta | f_a | g_a), zero
+    /// when absent or `ATLAS_GLM_KDA_FUSED_SMALL_PREFILL=0`.
+    dense_gemm_pipelined_triple_n_k: KernelHandle,
     conv_prefill_k: KernelHandle,
     conv_prefill_tp_k: KernelHandle,
     conv_prefill_tp_snap_k: KernelHandle,

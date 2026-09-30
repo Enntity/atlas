@@ -121,6 +121,15 @@ impl Glm5KdaLayer {
                 "gemm",
                 "dense_gemm_bf16_pipelined",
             ),
+            // Bit-identical to three pipelined launches; `=0` restores them.
+            dense_gemm_pipelined_triple_n_k: if std::env::var("ATLAS_GLM_KDA_FUSED_SMALL_PREFILL")
+                .as_deref()
+                == Ok("0")
+            {
+                KernelHandle(0)
+            } else {
+                super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined_triple_n")
+            },
             conv_prefill_k: gpu.kernel("causal_conv1d", "causal_conv1d_update_prefill")?,
             conv_prefill_tp_k: super::super::try_kernel(
                 gpu,
