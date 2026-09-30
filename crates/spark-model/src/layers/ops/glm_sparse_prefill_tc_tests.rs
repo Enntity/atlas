@@ -203,3 +203,35 @@ fn pipe_warm_launch_is_one_zero_row_cta() {
     initialize_glm_sparse_prefill_pipe(&gpu, &ModelConfig::qwen3_next_80b_nvfp4()).unwrap();
     assert_eq!(gpu.launches_snapshot().len(), 1);
 }
+
+#[test]
+fn the_pinned_split_count_does_not_move_with_the_verify_width() {
+    // Unpinned, the count follows the launch's rows: one position gets
+    // different softmax partials at each DFlash verify width.
+    let launch = |rows| sparse_owner_splits(rows, 32, 2051, false);
+    assert_eq!(
+        (1..=8).map(launch).collect::<Vec<_>>(),
+        [13, 13, 13, 11, 9, 8, 13, 6]
+    );
+    for rows in 1..=128 {
+        assert_eq!(launch(rows), sparse_split_count(rows, 32, 2051));
+    }
+    // Pinned, every verify-sized owner takes the widest block's count, which
+    // fills the 48 SMs in one wave there and keeps that block's bits.
+    let pinned = |rows| sparse_owner_splits(rows, 32, 2051, true);
+    for rows in 1..=8 {
+        assert_eq!(pinned(rows), launch(8));
+        // The scratch a pinned owner needs never exceeds the widest block's.
+        assert!(
+            sparse_split_scratch_bytes(pinned(rows), rows, 32, 512)
+                <= sparse_split_scratch_bytes(launch(8), 8, 32, 512)
+        );
+    }
+    // Wider owners (prefill pieces) keep the count they have today.
+    for rows in 9..=128 {
+        assert_eq!(pinned(rows), launch(rows));
+    }
+    assert!(parse("glm5_next", SPLIT_PIN, Some("1")).unwrap());
+    assert!(!parse("glm5_next", SPLIT_PIN, None).unwrap());
+    assert!(parse("glm5_next", SPLIT_PIN, Some("yes")).is_err());
+}

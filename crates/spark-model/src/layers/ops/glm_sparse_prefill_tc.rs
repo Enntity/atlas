@@ -251,6 +251,22 @@ pub(crate) fn sparse_split_count(rows: u32, heads: u32, index_width: u32) -> u32
     (1..=16u32).min_by_key(|&s| (cost(s), s)).unwrap_or(1)
 }
 
+/// `ATLAS_GLM_SPARSE_VERIFY_SPLIT_PIN=1`: see [`sparse_owner_splits`].
+const SPLIT_PIN: &str = "ATLAS_GLM_SPARSE_VERIFY_SPLIT_PIN";
+
+/// Splits for an owner of `rows` rows. The split-merge is not associative, so
+/// a count that follows the launch gives one position different bits at each
+/// verify width, and the width follows the co-batched owners and the adaptive
+/// width. Pinned (like `split_ref_seqs` for decode), an owner no wider than a
+/// DFlash verify block takes the widest block's count: that block keeps its
+/// bits and its one wave of CTAs, narrower owners change. Wider owners
+/// (prefill pieces) are not pinned.
+pub(crate) fn sparse_owner_splits(rows: u32, heads: u32, index_width: u32, pin: bool) -> u32 {
+    let verify_rows = crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS as u32;
+    let ref_rows = if pin { rows.max(verify_rows) } else { rows };
+    sparse_split_count(ref_rows, heads, index_width)
+}
+
 /// Bytes of split scratch: FP32 partial outputs, their LSEs, merged LSEs.
 pub(crate) fn sparse_split_scratch_bytes(
     splits: u32,
@@ -266,7 +282,8 @@ pub(crate) fn sparse_split_scratch_bytes(
 /// over the selected IDs (`*_split` kernel + `glm_sparse_decode_split_merge`)
 /// when `sparse_split_count` > 1 and `scratch` fits, so the rows fill the GPU
 /// instead of one CTA each. Partial sums in a different order than the
-/// unsplit kernel. `ATLAS_GLM_SPARSE_VERIFY_SPLIT=0` disables.
+/// unsplit kernel. `ATLAS_GLM_SPARSE_VERIFY_SPLIT=0` disables;
+/// `ATLAS_GLM_SPARSE_VERIFY_SPLIT_PIN=1` pins the count of verify-sized owners.
 pub fn try_glm_sparse_prefill_tc_split(
     gpu: &dyn GpuBackend,
     a: &GlmSparsePrefillTc<'_>,
@@ -283,7 +300,21 @@ pub fn try_glm_sparse_prefill_tc_split(
         enabled(model, "ATLAS_GLM_SPARSE_PREFILL_KV_REUSE")?,
         enabled(model, PIPE)?,
     );
-    let splits = sparse_split_count(a.rows, a.heads, a.index_width);
+    let pin = enabled(model, SPLIT_PIN)? && on && tc && kv_reuse;
+    let splits = sparse_owner_splits(a.rows, a.heads, a.index_width, pin);
+    // One line per row count whose bits the pin changes.
+    let unpinned = sparse_split_count(a.rows, a.heads, a.index_width);
+    let changed = splits != unpinned;
+    if changed
+        && gpu
+            .op_cache()
+            .first_shape("glm:sparse_split_pin", a.rows, 0, 0)
+    {
+        tracing::info!(
+            "{SPLIT_PIN}=1: rows={} splits {unpinned} -> {splits}",
+            a.rows
+        );
+    }
     let need = sparse_split_scratch_bytes(splits, a.rows, a.heads, a.head_dim);
     if !on
         || !tc
