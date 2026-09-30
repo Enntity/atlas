@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The min_tokens end-token ban must be armed on every way into decode, not
-//! only on the multi-chunk promotion: a prompt that prefills in one chunk
-//! and a preempted sequence's re-prefill decode the same request.
+//! only on the multi-chunk promotion: a prompt that prefills in one chunk,
+//! the single-shot prefill of an unchunked server and a preempted sequence's
+//! re-prefill decode the same request.
 
 use super::super::sched_ctx::SchedCtx;
 use super::super::test_support::{EOS, test_request};
-use super::super::{StartPrefillResult, start_chunked_prefill};
+use super::super::{StartPrefillResult, prefill_request, start_chunked_prefill};
 use super::*;
 use crate::api::InferenceRequest;
 use spark_model::speculative::ProposerState;
@@ -34,13 +35,19 @@ fn drafter_floor(seq: &SequenceState) -> usize {
     state.as_any().downcast_ref::<FloorProbe>().unwrap().0
 }
 
-/// Start the 3-token test prompt with a chunk budget of `budget` tokens.
-fn start(min_tokens: usize, budget: usize) -> StartPrefillResult {
+/// The 3-token test prompt with `min_tokens` set.
+fn request(min_tokens: usize) -> InferenceRequest {
     let (response_tx, _rx) = tokio::sync::oneshot::channel();
     let mut req = test_request!(Blocking, response_tx,);
     if let InferenceRequest::Blocking { min_tokens: m, .. } = &mut req {
         *m = min_tokens;
     }
+    req
+}
+
+/// Start the test prompt with a chunk budget of `budget` tokens.
+fn start(min_tokens: usize, budget: usize) -> StartPrefillResult {
+    let req = request(min_tokens);
     let model = PreemptStubModel::default();
     let sched = SchedCtx::for_test();
     start_chunked_prefill(
@@ -99,7 +106,21 @@ fn single_and_multi_chunk_prompts_get_the_same_ban() {
         None,
     );
     assert_eq!(multi.seq.eos_ban, single.seq.eos_ban);
-    assert_eq!(drafter_floor(&multi.seq), single.seq.eos_ban.floor);
+    // ... and the drafter skips end tokens below the same floor.
+    assert_eq!(drafter_floor(&multi.seq), 3 + MIN_TOKENS);
+}
+
+#[test]
+fn the_single_shot_prefill_arms_the_min_tokens_ban() {
+    let model = PreemptStubModel::default();
+    let sched = SchedCtx::for_test();
+    let req = request(MIN_TOKENS);
+    let a = prefill_request(
+        &sched, None, None, None, None, &model, req, EOS, &mut None, 0, None,
+    )
+    .expect("prefill runs")
+    .expect("a 3-token prompt decodes");
+    assert_eq!(a.seq.eos_ban, EosBan::new(3, MIN_TOKENS, EOS));
 }
 
 #[test]
