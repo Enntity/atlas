@@ -182,8 +182,11 @@ unsharded `split kernel + merge`:
 | `..._CHECK=1` only | block-table read to the host + an 8-byte swap + its read-back: two stream syncs per layer, 22 per step, each draining the launch queue | not in the microbench; drop the flag for serving |
 
 So an 8-row step pays roughly 0.9 ms of extra kernel time and 1.2 ms parked
-on exchanges (plus the check's 22 syncs in the run above). Both tunings are
-exact and opt-in:
+on exchanges (plus the check's 22 syncs in the run above). Only the kernel
+time is measured; the exchange costs are estimates until a pair run with
+`ATLAS_GLM_VERIFY_PROFILE=1` reports the MLA time per step. Both tunings are
+exact, opt-in, and refused at boot without `ATLAS_GLM_KV_SHARD=1` (a tuning
+that silently did nothing would make an arm measure the wrong thing):
 
 - **`ATLAS_GLM_KV_SHARD_COMPACT=1`.** `glm_kv_shard_localize_compact` packs
   each row's owned IDs to the front (a stable partition, one CTA per row, no
@@ -192,20 +195,41 @@ exact and opt-in:
   ~33 tiles each instead of 65; `glm_sparse_decode_split_merge_extra` merges
   the peer's partial where the exchange landed it (no copies). The launch
   shapes stay `rows x splits` on both ranks; only how far a CTA walks depends
-  on the data. The partition boundaries move, so the FP32 summation order
-  differs from the uncompacted shard (as the shard's already differs from
-  flag-off); the math is the same softmax.
+  on the data. Same softmax, but the partition boundaries move: the attention
+  kernel rounds each probability to BF16 relative to the running max of its
+  partition, so those roundings and the FP32 summation order both differ from
+  the uncompacted shard (at most one BF16 ulp of the output in the
+  microbench, the same class as split vs unsplit). Greedy text can therefore
+  diverge between the shard and the compact shard, as it can between flag-off
+  and the shard.
 - **`ATLAS_GLM_KV_SHARD_OVERLAP=1`.** Both swaps run on a side stream
   (`ExchangeLane`, fenced by two events: `glm_kv_shard::overlapped_exchange`)
   beside compute that does not need them: the partial swap beside this rank's
   own heads' partitions, the query swap beside the owner's index update and
   selection. For the latter a single verify owner takes the owner-batched
   projections, so its queries exist before its selection (the same
-  projections in a different order). The window never uses the pair: the pair
-  orders sends by stream order, and few-row owners' selection is local (the
-  index split only splits owners of 256+ rows). Off under `..._CHECK=1` and
-  under graph capture. Both ranks issue the same exchanges in the same order,
-  so an overlap only moves where each rank waits.
+  projections in a different order). The window cannot use the pair, which
+  orders its sends by stream order and counts landings in one place: the
+  selection runs on a context whose communicator (`glm_kv_shard::WindowComm`)
+  refuses every pair operation and reports no exchange support, so a later
+  change that exchanges inside a window fails on both ranks with an error
+  instead of corrupting the pair, and an index split (opt/index-split, owners
+  of 256+ rows) stays replicated there on both ranks. Off under
+  `..._CHECK=1` and under graph capture. Both ranks issue the same exchanges
+  in the same order, so an overlap only moves where each rank waits. The
+  lane (one stream, two events) exists only under this flag and is destroyed
+  with the cache.
+
+  Two things about the overlap are not established. Its gain is an estimate
+  (at most the ~0.9 ms per 8-row step the exchanges park the compute stream
+  for today); it adds eight driver calls per layer and a cross-stream wake
+  whose latency nobody has measured, and at 1-2 rows the exchanges are only
+  10-20 us, so it can be a net loss there. And with `ATLAS_RDMA_ONESHOT=1`
+  (opt/oneshot-ar) payloads up to 1 MiB, which covers both shard payloads up
+  to 8 rows, travel through a kernel that busy-waits for the peer: on the
+  lane that kernel holds SMs during the very window the overlap is meant to
+  free. Judge the overlap by the MLA time per step with one-shot off, and
+  again with it on if the serving profile sets it.
 
 Kernel microbench (`scripts/dev/glm_kv_shard_bench.cu`, ennspark03, fp8_g128,
 one rank's launches per MLA layer, minimum of 40 batches of 50; the GPU is
@@ -225,7 +249,31 @@ All three pipelines match a double-precision CPU softmax attention over the
 same dequantized latents to 1.2-1.5e-4 before BF16 rounding (output rms
 0.021), and their BF16 outputs differ from each other by at most one BF16
 ulp. The in-place merge is bitwise equal to copying the partial and merging
-one more partition.
+one more partition. The bench checks both ranks' heads, the localized ids
+against the ownership rule, and the compacted ids against the uncompacted
+ones, and exits non-zero on a failure.
+
+The times above are minima caught while the shared GPU was otherwise idle;
+under contention every pipeline doubles (8 rows, 64K: 170 / 345 / 251 us) and
+the ratios hold: the shard costs 2.0x the unsharded kernels, the compact
+shard 1.4-1.5x.
+
+Its last argument takes the causal form instead (`causal` >= 0: no
+selection, the shard kernels generate the causal ids), which is what every
+sequence up to 2048 tokens runs — dense attention is exact there, so there is
+no selection to localize. Checked at 8 rows from token 0 (rank 1 owns nothing
+of any row), from 12 (four rows rank 1 owns nothing of, four it does), from
+1000 and 2040, at 1 row from 0 and at 64 rows from 500: ids and outputs pass
+for both ranks, and where a rank owns nothing the compact and uncompacted
+shards are bitwise equal.
+
+Flag-off identity of the edited kernels: the four pre-existing
+`*_tc_kv_pad{,_split}` entries compile to the same PTX as at f42b634f up to
+basic-block label numbers; `glm_sparse_decode_split_merge{,_f32}` compile
+differently (the partition accessors), so the unsharded split + merge and the
+unsplit kernel were run from both trees on the same inputs (rows 1/2/3/4/8,
+full / padded / holed selections, BF16 and fp8_g128, 81 MB of partials, LSEs
+and outputs) and compared: bitwise equal.
 
 What is left with both tunings: ~30 us per layer of launches that have no
 unsharded counterpart (compaction, the FP32 merge, a second launch's fixed
@@ -234,12 +282,13 @@ it hides behind — roughly 0.4-0.7 ms per 8-row step.
 
 ## Numerics
 
-Mathematically exact (no quantization or approximation is added), but not
-bitwise identical to flag-off: the merge form changes the FP32 summation
-order of the softmax partitions (as the existing split verify already does),
-and dense <= 2048 owners take the tensor-core split kernel over causal ids
-instead of the BF16 dense kernel. The view form runs the same kernels on the
-same bytes as flag-off.
+The same softmax (no quantization or approximation is added), but not
+bitwise identical to flag-off: the merge form moves the partition
+boundaries, which changes the kernel's per-partition BF16 probability
+rounding and the FP32 summation order (as the existing split verify already
+does; at most one BF16 ulp of the output measured), and dense <= 2048 owners
+take the tensor-core split kernel over causal ids instead of the BF16 dense
+kernel. The view form runs the same kernels on the same bytes as flag-off.
 
 ## Supported / not supported
 
@@ -268,7 +317,9 @@ several such sequences would hit the fail-closed panic.
    - `KV cache: ... -> N blocks x 16 tok/block = T max KV tokens` with T about
      1.7x the flag-off boot at the same `--gpu-memory-utilization`;
    - `KV cache: N blocks x 11 layers = G GB total (V aliases K)` with G about
-     half the flag-off value's latent part.
+     half the flag-off value's latent part;
+   - `KV latent shard merge form: compact=.. overlap=.. check=..` naming the
+     tunings in effect (a performance arm must show `check=false`).
    `..._CHECK=1` makes every sharded attention check on the host that each
    table entry's residue matches its logical index and exchange the block
    count with the peer (fails if they differ); drop it for performance runs.
