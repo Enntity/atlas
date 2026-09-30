@@ -81,6 +81,8 @@ pub enum KernelArg<'a> {
 
 pub use crate::gpu_args::pack_kernel_args;
 
+pub use crate::gpu_pitched::{HOST_PINNED_ALIGN, Pitched};
+
 /// GPU backend trait — SBIO IORouter for all CUDA operations.
 ///
 /// Implementations: `AtlasCudaBackend` (production), `MockGpuBackend` (tests).
@@ -320,6 +322,43 @@ pub trait GpuBackend: Send + Sync {
         Ok(())
     }
 
+    /// Pitched host-to-device copy from a source the CALLER keeps alive (as
+    /// [`GpuBackend::copy_h2d_async_retained`]): row `r` is `shape.width`
+    /// bytes from `src[r * host_pitch..]` to `dst + r * dev_pitch`. One
+    /// enqueue for the whole run — on GB10 a small async copy costs several
+    /// microseconds of copy-engine time whatever its size, so a scatter of N
+    /// blocks × M regions is M calls instead of N × M.
+    fn copy_h2d_pitched_async_retained(
+        &self,
+        src: &[u8],
+        dst: DevicePtr,
+        shape: Pitched,
+        stream: u64,
+    ) -> Result<()> {
+        for r in 0..shape.height {
+            let row = &src[r * shape.host_pitch..][..shape.width];
+            self.copy_h2d_async_retained(row, dst.offset(r * shape.dev_pitch), stream)?;
+        }
+        Ok(())
+    }
+
+    /// Pitched device-to-host copy, the mirror of
+    /// [`GpuBackend::copy_h2d_pitched_async_retained`]; same lifetime rule as
+    /// [`GpuBackend::copy_d2h_async`] (no read of `dst` before the next sync).
+    fn copy_d2h_pitched_async(
+        &self,
+        src: DevicePtr,
+        dst: &mut [u8],
+        shape: Pitched,
+        stream: u64,
+    ) -> Result<()> {
+        for r in 0..shape.height {
+            let row = &mut dst[r * shape.host_pitch..][..shape.width];
+            self.copy_d2h_async(src.offset(r * shape.dev_pitch), row, stream)?;
+        }
+        Ok(())
+    }
+
     /// Begin capturing CUDA operations on `stream` into a graph.
     ///
     /// All kernel launches and async copies on this stream between
@@ -523,7 +562,7 @@ pub trait GpuBackend: Send + Sync {
     /// on their own and their wrappers memset explicitly.
     fn alloc_host_pinned(&self, bytes: usize) -> Result<*mut u8> {
         // Default: regular heap allocation (mock backend, no pinning)
-        let layout = std::alloc::Layout::from_size_align(bytes, 64)
+        let layout = std::alloc::Layout::from_size_align(bytes, HOST_PINNED_ALIGN)
             .map_err(|e| anyhow::anyhow!("invalid layout: {e}"))?;
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
@@ -536,7 +575,7 @@ pub trait GpuBackend: Send + Sync {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn free_host_pinned(&self, ptr: *mut u8, bytes: usize) -> Result<()> {
         if !ptr.is_null() {
-            let layout = std::alloc::Layout::from_size_align(bytes, 64)
+            let layout = std::alloc::Layout::from_size_align(bytes, HOST_PINNED_ALIGN)
                 .map_err(|e| anyhow::anyhow!("invalid layout: {e}"))?;
             unsafe { std::alloc::dealloc(ptr, layout) };
         }

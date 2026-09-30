@@ -41,7 +41,81 @@ use super::{
     AtlasCudaBackend, cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2,
     cuStreamQuery, cuStreamSynchronize,
 };
-use crate::gpu::DevicePtr;
+use crate::gpu::{DevicePtr, Pitched};
+
+/// One pitched copy between PAGE-LOCKED host memory and the device, enqueued
+/// on `stream` with no synchronisation (`to_device` picks the direction).
+///
+/// `cudaMemcpy2DAsync` is a runtime (cudart) entry point, as in
+/// `copy_d2d_2d_async`; kinds 1 / 2 are `cudaMemcpyHostToDevice` /
+/// `cudaMemcpyDeviceToHost`. The caller guarantees `host` spans
+/// `shape.host_span()` bytes that stay valid until the next sync on `stream`.
+pub(super) fn host_pitched_async(
+    host: *mut c_void,
+    dev: DevicePtr,
+    shape: Pitched,
+    to_device: bool,
+    stream: u64,
+) -> Result<()> {
+    #[cfg(not(atlas_scale))]
+    {
+        unsafe extern "C" {
+            fn cudaMemcpy2DAsync(
+                dst: *mut c_void,
+                dpitch: usize,
+                src: *const c_void,
+                spitch: usize,
+                width: usize,
+                height: usize,
+                kind: i32,
+                stream: u64,
+            ) -> i32;
+        }
+        let d = dev.0 as *mut c_void;
+        let (dst, dpitch, src, spitch, kind) = if to_device {
+            (d, shape.dev_pitch, host, shape.host_pitch, 1)
+        } else {
+            (host, shape.host_pitch, d, shape.dev_pitch, 2)
+        };
+        let status = unsafe {
+            cudaMemcpy2DAsync(
+                dst,
+                dpitch,
+                src,
+                spitch,
+                shape.width,
+                shape.height,
+                kind,
+                stream,
+            )
+        };
+        if status != 0 {
+            bail!(
+                "cudaMemcpy2DAsync (host pitched, to_device={to_device}) failed: status {status}"
+            );
+        }
+        Ok(())
+    }
+    // strix/SCALE: no cudart runtime linked — one driver-API copy per row.
+    #[cfg(atlas_scale)]
+    {
+        for r in 0..shape.height {
+            let h = unsafe { (host as *mut u8).add(r * shape.host_pitch) } as *mut c_void;
+            let d = dev.0 + (r * shape.dev_pitch) as u64;
+            let status = unsafe {
+                if to_device {
+                    cuMemcpyHtoDAsync_v2(d, h, shape.width, stream)
+                } else {
+                    cuMemcpyDtoHAsync_v2(h, d, shape.width, stream)
+                }
+            };
+            if status != 0 {
+                bail!("host pitched copy row {r} failed: status {status}");
+            }
+        }
+        Ok(())
+    }
+}
 
 impl AtlasCudaBackend {
     pub(crate) fn copy_h2d_impl(&self, src: &[u8], dst: DevicePtr) -> Result<()> {

@@ -34,6 +34,9 @@ pub struct MockGpuBackend {
     /// backend regardless of `height`. Counted apart from `d2d` so a test can
     /// assert the SHAPE of the transfer, not just the bytes.
     d2d_2d: AtomicUsize,
+    /// Pitched host↔device copies — ONE enqueue each on the real backend,
+    /// whatever the row count.
+    host_pitched: AtomicUsize,
     /// `memset_async` calls — one eager launch each on the real backend.
     memsets: AtomicUsize,
     host_pinned_allocs: AtomicUsize,
@@ -68,6 +71,7 @@ impl MockGpuBackend {
             d2h_async: AtomicUsize::new(0),
             d2d: AtomicUsize::new(0),
             d2d_2d: AtomicUsize::new(0),
+            host_pitched: AtomicUsize::new(0),
             memsets: AtomicUsize::new(0),
             host_pinned_allocs: AtomicUsize::new(0),
             pending_free_failures: AtomicUsize::new(0),
@@ -125,6 +129,11 @@ impl MockGpuBackend {
     /// whatever the row count.
     pub fn d2d_2d_count(&self) -> usize {
         self.d2d_2d.load(Ordering::Relaxed)
+    }
+
+    /// Pitched host↔device copies so far (either direction).
+    pub fn host_pitched_count(&self) -> usize {
+        self.host_pitched.load(Ordering::Relaxed)
     }
 
     /// `memset_async` calls so far.
@@ -322,6 +331,41 @@ impl GpuBackend for MockGpuBackend {
         Ok(())
     }
 
+    fn copy_h2d_pitched_async_retained(
+        &self,
+        src: &[u8],
+        dst: DevicePtr,
+        shape: Pitched,
+        _stream: u64,
+    ) -> Result<()> {
+        // One tick per call, as `copy_d2d_2d_async`: the rows are emulation.
+        self.host_pitched.fetch_add(1, Ordering::Relaxed);
+        for r in 0..shape.height {
+            let row = &src[r * shape.host_pitch..][..shape.width];
+            self.copy_h2d(row, dst.offset(r * shape.dev_pitch))?;
+        }
+        Ok(())
+    }
+
+    fn copy_d2h_pitched_async(
+        &self,
+        src: DevicePtr,
+        dst: &mut [u8],
+        shape: Pitched,
+        _stream: u64,
+    ) -> Result<()> {
+        self.host_pitched.fetch_add(1, Ordering::Relaxed);
+        let allocs = self.allocs.lock();
+        for r in 0..shape.height {
+            let from = src.offset(r * shape.dev_pitch);
+            let (offset, alloc) = find_alloc(&allocs, from)
+                .ok_or_else(|| anyhow::anyhow!("pitched D2H: ptr {from} not allocated"))?;
+            dst[r * shape.host_pitch..][..shape.width]
+                .copy_from_slice(&alloc.data[offset..offset + shape.width]);
+        }
+        Ok(())
+    }
+
     fn launch(
         &self,
         func: KernelHandle,
@@ -371,7 +415,7 @@ impl GpuBackend for MockGpuBackend {
         // overridden solely to COUNT, so a test can prove a staging buffer is
         // allocated once and reused rather than per event.
         self.host_pinned_allocs.fetch_add(1, Ordering::Relaxed);
-        let layout = std::alloc::Layout::from_size_align(bytes, 64)
+        let layout = std::alloc::Layout::from_size_align(bytes, HOST_PINNED_ALIGN)
             .map_err(|e| anyhow::anyhow!("invalid layout: {e}"))?;
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
