@@ -33,13 +33,18 @@ pub(super) fn pdl_enabled() -> bool {
     })
 }
 
-/// Kernels whose every copy starts with `atlas_pdl_enter()`
+/// Kernels whose every copy starts with `atlas_pdl_enter()`, or with
+/// `atlas_pdl_enter_touch(..)`, which reads weights only before its wait
 /// (kernels/gb10/common/atlas_pdl.cuh). A kernel launched with PDL must not
 /// read its predecessor's output before that wait, so only these qualify.
 pub(super) const PDL_KERNELS: &[&str] = &[
     "w4a16_gemv_tc8",
     "w4a16_gemv_tc8_ld",
+    "w4a16_gemv_tc8_touch",
+    "w4a16_gemv_batch3_touch",
+    "w4a16_gemv_batch5_qkv_touch",
     "mxfp8_gemv_tc8",
+    "mxfp8_gemv_tc8_touch",
     "mxfp8_gemv_tc8_grouped",
     "mxfp8_gemv_tc16_grouped",
     "dense_gemv_bf16_batchm",

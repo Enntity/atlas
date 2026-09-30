@@ -859,6 +859,57 @@ extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch5_qk
     w4a16_gemv_batchm_impl<5>(A, B_packed, B_scale, scale2, out, M, N, K, N);
 }
 
+// PDL twins of `w4a16_gemv_batch2/3` and `w4a16_gemv_batch5_qkv` with the
+// pre-wait weight touch of atlas_pdl.cuh (ATLAS_GLM_DECODE_GEMV_BATCH): the
+// first `touch_ctas` CTAs (of plane 0) pull the first `touch_rows` rows of the
+// (first) weight into L2 while the kernel waits on its predecessor. The body
+// is the unchanged template, whose per-row FMA chain does not depend on
+// `MAX_M`, so rows are bit-identical to the twin's.
+extern "C" __global__ void w4a16_gemv_batch3_touch(
+    const __nv_bfloat16* __restrict__ A,          // [M, K], M = 2 or 3
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,                // [M, N]
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int touch_rows,
+    unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch({B_packed, K / 2u, K / 2u}, {B_scale, K / GROUP_SIZE, K / GROUP_SIZE},
+                          touch_rows, blockIdx.x, touch_ctas);
+    w4a16_gemv_batchm_impl<3>(A, B_packed, B_scale, scale2, C, M, N, K, N);
+}
+
+extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch5_qkv_touch(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ Bq_packed,
+    const unsigned char* __restrict__ Bq_scale,
+    const float q_scale2,
+    const unsigned char* __restrict__ Bk_packed,
+    const unsigned char* __restrict__ Bk_scale,
+    const float k_scale2,
+    const unsigned char* __restrict__ Bv_packed,
+    const unsigned char* __restrict__ Bv_scale,
+    const float v_scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int touch_rows,
+    unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch({Bq_packed, K / 2u, K / 2u}, {Bq_scale, K / GROUP_SIZE, K / GROUP_SIZE},
+                          touch_rows, blockIdx.x, blockIdx.z == 0u ? touch_ctas : 0u);
+    const unsigned int plane = blockIdx.z;
+    const unsigned char* B_packed = plane == 0u ? Bq_packed : (plane == 1u ? Bk_packed : Bv_packed);
+    const unsigned char* B_scale = plane == 0u ? Bq_scale : (plane == 1u ? Bk_scale : Bv_scale);
+    const float scale2 = plane == 0u ? q_scale2 : (plane == 1u ? k_scale2 : v_scale2);
+    __nv_bfloat16* out = C + (unsigned long long)plane * M * N;
+    w4a16_gemv_batchm_impl<5>(A, B_packed, B_scale, scale2, out, M, N, K, N);
+}
+
 // GLM shared-expert gate/up verifier projections. Grid Z chooses one of two
 // independent native-NVFP4 weights and output planes. Each plane executes the
 // exact-M=5 implementation unchanged, so this removes one launch without
@@ -1949,6 +2000,21 @@ w4a16_gemv_tc8_ld(
     unsigned int ld_half, unsigned int ld_groups
 ) {
     atlas_pdl_enter();
+    w4a16_gemv_tc8_impl(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
+}
+
+// `w4a16_gemv_tc8_ld` whose first `touch_ctas` CTAs pull the first
+// `touch_rows` weight rows (packed bytes and scales) into L2 while the kernel
+// waits on its PDL predecessor (atlas_pdl.cuh). Same body: bit-identical.
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc8_touch(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ld_half, unsigned int ld_groups, unsigned int touch_rows, unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch({B_packed, K / 2u, ld_half}, {B_scale, K / GROUP_SIZE, ld_groups},
+                          touch_rows, blockIdx.x, touch_ctas);
     w4a16_gemv_tc8_impl(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
 }
 

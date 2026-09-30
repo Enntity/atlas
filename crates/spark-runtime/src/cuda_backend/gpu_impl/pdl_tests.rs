@@ -26,9 +26,12 @@ fn is_name(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// Whether a function body (the text after its `{`) waits before anything else.
+/// Whether a function body (the text after its `{`) waits before anything
+/// else: `atlas_pdl_enter();`, or `atlas_pdl_enter_touch(..);`, the same
+/// entry with discarded weight loads ahead of its wait.
 fn waits_first(body: &str) -> bool {
-    body.trim_start().starts_with("atlas_pdl_enter();")
+    let body = body.trim_start();
+    body.starts_with("atlas_pdl_enter();") || body.starts_with("atlas_pdl_enter_touch(")
 }
 
 /// Whether `src` defines a function `name` whose body waits first.
@@ -109,6 +112,10 @@ extern "C" __global__ void late(const float* a) {
     atlas_pdl_enter();
 }
 extern "C" __global__ void other_name(const float* a) { rapper(a); }
+extern "C" __global__ void touching(const float* a, const unsigned char* w) {
+    atlas_pdl_enter_touch({w, 8u, 8u}, {w, 1u, 1u}, 4u, blockIdx.x, 2u);
+    body<1>(a);
+}
 "#,
     );
     assert_eq!(
@@ -119,6 +126,7 @@ extern "C" __global__ void other_name(const float* a) { rapper(a); }
             ("plain", false),
             ("late", false),
             ("other_name", false),
+            ("touching", true),
         ]
     );
 }

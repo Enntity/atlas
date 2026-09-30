@@ -210,6 +210,19 @@ extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8(
     mxfp8_gemv_tc_impl<1>(A, W, S, C, M, N, K, K, out_stride);
 }
 
+// `mxfp8_gemv_tc8` whose first `touch_ctas` CTAs pull the first `touch_rows`
+// weight rows (values and scales) into L2 while the kernel waits on its PDL
+// predecessor (atlas_pdl.cuh). Same body: bit-identical.
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8_touch(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,
+    unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch({W, K, K}, {S, K / MX_BLOCK, K / MX_BLOCK}, touch_rows, blockIdx.x,
+                          touch_ctas);
+    mxfp8_gemv_tc_impl<1>(A, W, S, C, M, N, K, K, out_stride);
+}
+
 extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc16(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
     const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
