@@ -42,8 +42,10 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+mod bootstrap;
 mod oneshot;
 mod proxy;
+use bootstrap::HEAD_WIRE;
 use oneshot::OneShot;
 use proxy::proxy_loop;
 
@@ -83,9 +85,8 @@ const ARRIVED: usize = 64;
 const FLAG_SRC: usize = 128;
 const FLAG_PAGE: usize = 4096;
 
-/// Bootstrap header (region base, one-shot settings), then per rail: QPN,
-/// PSN, GID, region rkey.
-const HEAD_WIRE: usize = 8 + 16;
+/// Bootstrap, after the [`bootstrap::head`], per rail: QPN, PSN, GID, region
+/// rkey.
 const RAIL_WIRE: usize = 4 + 4 + 16 + 4;
 
 struct Job {
@@ -194,9 +195,7 @@ impl RdmaPair {
 
         let psn = (0x5a5a00 + rank as u32 * 0x1111) & 0xff_ffff;
         let mut verbs = Vec::with_capacity(rails.len());
-        let mut local = Vec::with_capacity(HEAD_WIRE + rails.len() * RAIL_WIRE);
-        local.extend_from_slice(&(host as u64).to_le_bytes());
-        local.extend_from_slice(&oneshot::Config::wire(os_cfg));
+        let mut local = bootstrap::head(host as u64, capacity, oneshot::Config::wire(os_cfg));
         let mut lkeys = Vec::with_capacity(rails.len());
         for name in &rails {
             let gid_idx =
@@ -215,15 +214,7 @@ impl RdmaPair {
         }
 
         let mut stream = exchange_stream(rank, master_addr, port)?;
-        stream.write_all(&local)?;
-        let mut remote = vec![0u8; local.len()];
-        stream.read_exact(&mut remote)?;
-        let peer_base = u64::from_le_bytes(remote[..8].try_into()?);
-        ensure!(
-            remote[8..HEAD_WIRE] == local[8..HEAD_WIRE],
-            "RDMA pair: the peer's one-shot settings differ (ATLAS_RDMA_ONESHOT, \
-             ATLAS_RDMA_ONESHOT_MAX and ATLAS_RDMA_ONESHOT_STRIPE_MIN must match)"
-        );
+        let (remote, peer_base) = bootstrap::exchange(&mut stream, &local)?;
         let mut peer_rkeys = Vec::with_capacity(rails.len());
         for (r, v) in verbs.iter_mut().enumerate() {
             let w = &remote[HEAD_WIRE + r * RAIL_WIRE..HEAD_WIRE + (r + 1) * RAIL_WIRE];
