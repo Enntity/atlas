@@ -112,11 +112,15 @@ pub(crate) fn apply_evicted_blocks(
 /// Keep evicting until a block comes free or the cache has nothing left to give;
 /// every iteration removes at least one node from a finite tree, so it terminates.
 /// `None` means genuinely out of capacity — the caller reports exhaustion.
+///
+/// `logical` is the block's index in its sequence's table: a latent-sharded
+/// cache (`ATLAS_GLM_KV_SHARD=1`) draws an id whose residue matches it.
 pub(crate) fn alloc_block_evicting(
     kv_cache: &mut PagedKvCache,
     prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
+    logical: usize,
 ) -> Option<u32> {
-    if let Some(b) = kv_cache.try_alloc_block() {
+    if let Some(b) = kv_cache.try_alloc_block_at(logical) {
         return Some(b);
     }
     let mut evicted_nodes = 0usize;
@@ -133,7 +137,7 @@ pub(crate) fn alloc_block_evicting(
         }
         evicted_nodes += evicted.len();
         apply_evicted_blocks(evicted, kv_cache);
-        if let Some(b) = kv_cache.try_alloc_block() {
+        if let Some(b) = kv_cache.try_alloc_block_at(logical) {
             if evicted_nodes > 1 {
                 tracing::debug!(
                     "alloc: freed a block after evicting {evicted_nodes} prefix-cache node(s)"
@@ -364,7 +368,7 @@ pub(crate) fn ensure_blocks_through_decode(
         // "alloc failed in ensure_blocks_through_decode: abs=590 ...
         //  free_blocks=0". The prefill helper already had this; the
         // decode helper diverged.
-        let blk = match alloc_block_evicting(kv_cache, prefix_cache) {
+        let blk = match alloc_block_evicting(kv_cache, prefix_cache, ws + bt_len) {
             Some(b) => b,
             None => {
                 return Err(anyhow::anyhow!(

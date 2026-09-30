@@ -296,20 +296,55 @@ pub fn try_glm_sparse_prefill_tc_split(
     {
         return dispatch(gpu, a, stream, tc, kv_reuse, pipe);
     }
-    validate_geometry(a)?;
-    validate_storage(a)?;
     let rh = a.rows as usize * a.heads as usize;
     let part_lse = scratch.offset(splits as usize * rh * a.head_dim as usize * 4);
     let out_lse = part_lse.offset(splits as usize * rh * 4);
+    launch_sparse_partials(gpu, a, splits, None, scratch, part_lse, stream)?;
+    decode_split::launch_merge(
+        gpu,
+        decode_split::merge_kernel(gpu)?,
+        scratch,
+        part_lse,
+        a.output,
+        out_lse,
+        a.rows,
+        a.rows * a.heads,
+        splits,
+        stream,
+    )?;
+    Ok(true)
+}
+
+/// The `*_split` kernel alone: `splits` normalized FP32 partial outputs
+/// `[splits, rows, heads, 512]` and their natural LSEs `[splits, rows, heads]`
+/// (`-inf` for a partition with no valid ID) for a caller-side LSE merge.
+/// With `row_counts` (`u32[rows]`) row `r` selects only its first
+/// `row_counts[r]` IDs and the splits partition that prefix.
+pub(crate) fn launch_sparse_partials(
+    gpu: &dyn GpuBackend,
+    a: &GlmSparsePrefillTc<'_>,
+    splits: u32,
+    row_counts: Option<DevicePtr>,
+    part_o: DevicePtr,
+    part_lse: DevicePtr,
+    stream: u64,
+) -> Result<()> {
+    validate_geometry(a)?;
+    validate_storage(a)?;
+    ensure!(
+        (1..=16).contains(&splits) && a.rows > 0 && a.identical_kv_latent,
+        "GLM sparse partials need 1..=16 splits, rows and identical K/V"
+    );
     let (module, _, shared_mem) = kernel_spec(true, a.dtype, false);
-    let symbol = if a.dtype == KvCacheDtype::Fp8G128 {
-        "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split"
-    } else {
-        "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split"
+    let symbol = match (a.dtype == KvCacheDtype::Fp8G128, row_counts.is_some()) {
+        (true, false) => "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split",
+        (false, false) => "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split",
+        (true, true) => "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split_counted",
+        (false, true) => "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split_counted",
     };
     let kernel = gpu.op_cache().kernel(gpu, module, symbol)?;
     ensure!(kernel.0 != 0, "GLM sparse split kernel is unavailable");
-    KernelLaunch::new(gpu, kernel)
+    let launch = KernelLaunch::new(gpu, kernel)
         .grid([a.heads.div_ceil(32), a.rows, splits])
         .block([256, 1, 1])
         .shared_mem(shared_mem)
@@ -325,22 +360,13 @@ pub fn try_glm_sparse_prefill_tc_split(
         .arg_u32(a.index_width)
         .arg_u32(a.block_size)
         .arg_f32(a.scale)
-        .arg_ptr(scratch)
-        .arg_ptr(part_lse)
-        .launch(stream)?;
-    decode_split::launch_merge(
-        gpu,
-        decode_split::merge_kernel(gpu)?,
-        scratch,
-        part_lse,
-        a.output,
-        out_lse,
-        a.rows,
-        a.rows * a.heads,
-        splits,
-        stream,
-    )?;
-    Ok(true)
+        .arg_ptr(part_o)
+        .arg_ptr(part_lse);
+    match row_counts {
+        Some(counts) => launch.arg_ptr(counts),
+        None => launch,
+    }
+    .launch(stream)
 }
 
 /// Single source of truth for the independent repaired-decode opt-in.
