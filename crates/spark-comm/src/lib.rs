@@ -111,6 +111,44 @@ pub trait CommBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Graph-capturable BF16 sum all-reduce in place on `stream`: only device
+    /// work goes on the stream (no host sync, no per-call host state), into
+    /// persistent registered buffers, with a device-resident sequence the
+    /// kernel advances -- so a CUDA graph may capture it and replay it any
+    /// number of times, interleaved with eager collectives. Eager calls may
+    /// use it too. `Ok(false)` (nothing enqueued) when unavailable for this
+    /// size; the answer depends only on `bytes` and configuration, so both
+    /// ranks agree. Both ranks must issue capturable collectives in the same
+    /// order on one stream.
+    fn all_reduce_capturable(&self, _ptr: u64, _bytes: usize, _stream: u64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Graph-capturable [`Self::peer_exchange_async`]: `recv_ptr` receives the
+    /// peer's unmodified payload. Same contract as
+    /// [`Self::all_reduce_capturable`].
+    fn peer_exchange_capturable(
+        &self,
+        _send_ptr: u64,
+        _recv_ptr: u64,
+        _bytes: usize,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Largest payload [`Self::all_reduce_capturable`] and
+    /// [`Self::peer_exchange_capturable`] accept (0 when unavailable). Where
+    /// available, [`Self::exchange_async`] is capturable up to this size too.
+    fn capturable_all_reduce_max_bytes(&self) -> usize {
+        0
+    }
+
+    /// Provide the kernel handle for the capturable collectives
+    /// (`rdma_oneshot_bf16`); loaded by the model layer like
+    /// [`Self::set_add_kernel`].
+    fn set_oneshot_kernel(&self, _handle: u64) {}
+
     /// Whether [`Self::exchange_async`] can serve payloads up to `bytes`.
     fn supports_exchange_async(&self, _bytes: usize) -> bool {
         false
@@ -275,6 +313,22 @@ mod tests {
         comm.group_end().unwrap();
         assert!(comm.is_healthy());
         comm.attempt_reconnect().unwrap();
+    }
+
+    #[test]
+    fn capturable_collectives_default_to_unavailable() {
+        // The contract callers (graph capture policies) rely on: a backend
+        // without them enqueues nothing and reports no capacity.
+        let comm = SingleGpuBackend;
+        assert!(!comm.all_reduce_capturable(0x1000, 8192, 0).unwrap());
+        assert!(
+            !comm
+                .peer_exchange_capturable(0x1000, 0x2000, 8192, 0)
+                .unwrap()
+        );
+        assert_eq!(comm.capturable_all_reduce_max_bytes(), 0);
+        comm.set_oneshot_kernel(0x1234);
+        assert_eq!(comm.capturable_all_reduce_max_bytes(), 0);
     }
 
     #[test]
