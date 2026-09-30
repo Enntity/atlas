@@ -24,6 +24,12 @@
 //! `ATLAS_GLM_MOE_DECODE_K128W=1` is the control with no new kernel: verify
 //! decode batches the twins do not take run the prefill K128W grid (M64
 //! tiles, same bytes) in place of the compact worklist.
+//!
+//! `ATLAS_GLM_MOE_DECODE_STREAM=1` (with the M16 flag) launches the twins'
+//! stream-loaded versions (glm_moe_decode_stream.cuh: streaming loads in place
+//! of cp.async, same bytes), and lets them take every prequant routed FFN of
+//! up to [`STREAM_MAX_ROWS`] rows, verify decode or not: batches of more than
+//! 16 rows (owner batches of two to four streams) run the two-slab kernels.
 
 use super::prequant_fp4::{CompactMoeWorklist, MtileGrid};
 use super::*;
@@ -31,16 +37,21 @@ use super::*;
 /// Rows of a routed FFN batch the M16 tiles cover: one m16 MMA slab.
 pub(super) const MAX_ROWS: u32 = 16;
 
+/// Rows the two-slab stream twins cover.
+pub(super) const STREAM_MAX_ROWS: u32 = 2 * MAX_ROWS;
+
 /// Widest batch whose tile choice is logged: an owner-batched verify.
 const NOTE_ROWS: u32 = crate::layer::glm_long_owner::MAX_ROWS as u32;
 
 /// The verify-decode tile selection: the M16 fused gate/up and down kernels
-/// (both null unless the flag is on and the target ships them) and the K128W
-/// control.
+/// (both null unless the flag is on and the target ships them), their
+/// two-slab stream pair (null unless ATLAS_GLM_MOE_DECODE_STREAM), and the
+/// K128W control.
 #[derive(Clone, Copy)]
 pub(super) struct DecodeM16 {
     gate_up_silu: KernelHandle,
     down: KernelHandle,
+    wide: [KernelHandle; 2],
     zskip: bool,
     k128w: bool,
 }
@@ -57,33 +68,52 @@ impl DecodeM16 {
         };
         let requested = toggle("ATLAS_GLM_MOE_DECODE_M16")?;
         let zskip = toggle("ATLAS_GLM_MOE_DOWN_ZSKIP")?;
+        let stream = toggle("ATLAS_GLM_MOE_DECODE_STREAM")?;
         let glm = config.model_type == "glm5_next";
         let on = requested && glm;
-        let kernel = |name| super::super::try_kernel_gated(on, gpu, "moe_w4a16", name);
+        let kernel = |on, name: &str| super::super::try_kernel_gated(on, gpu, "moe_w4a16", name);
+        // A family's fused gate/up and (zero-skipping) down.
+        let pair = |on, family: &str| {
+            let skip = if zskip { "_zskip" } else { "" };
+            [
+                kernel(on, &format!("glm_moe_decode_{family}_gate_up_silu_k128w")),
+                kernel(on, &format!("glm_moe_decode_{family}_k128w{skip}")),
+            ]
+        };
+        let [gate_up_silu, down] = pair(on, if stream { "m16s" } else { "m16" });
         let mut this = Self {
-            gate_up_silu: kernel("glm_moe_decode_m16_gate_up_silu_k128w"),
-            down: kernel(if zskip {
-                "glm_moe_decode_m16_k128w_zskip"
-            } else {
-                "glm_moe_decode_m16_k128w"
-            }),
+            gate_up_silu,
+            down,
+            wide: pair(on && stream, "m32s"),
             zskip,
             k128w: toggle("ATLAS_GLM_MOE_DECODE_K128W")? && glm,
         };
-        if !this.loaded() {
+        if !this.loaded() || this.wide.iter().any(|k| k.0 == 0) {
             // Both or neither: half a pair never launches.
-            this.gate_up_silu = KernelHandle(0);
+            this.wide = [KernelHandle(0); 2];
+            if !this.loaded() {
+                this.gate_up_silu = KernelHandle(0);
+            }
         }
-        if (requested || zskip) && gpu.op_cache().once("moe:decode_m16") {
+        if (requested || zskip || stream) && gpu.op_cache().once("moe:decode_m16") {
             if this.loaded() {
                 tracing::info!(
                     "ATLAS_GLM_MOE_DECODE_M16: M16 routed gate/up+SiLU and down for verify decode (zero-row skip: {zskip})"
                 );
+                if stream && this.stream() {
+                    tracing::info!(
+                        "ATLAS_GLM_MOE_DECODE_STREAM: stream-loaded M16 twins for every routed FFN of up to {STREAM_MAX_ROWS} rows"
+                    );
+                } else if stream {
+                    tracing::warn!(
+                        "ATLAS_GLM_MOE_DECODE_STREAM=1 ignored: target lacks the stream kernels"
+                    );
+                }
             } else if on {
                 tracing::warn!("ATLAS_GLM_MOE_DECODE_M16=1 ignored: target lacks the M16 kernels");
             } else if !requested {
                 tracing::warn!(
-                    "ATLAS_GLM_MOE_DOWN_ZSKIP=1 ignored: it needs ATLAS_GLM_MOE_DECODE_M16=1"
+                    "ATLAS_GLM_MOE_DOWN_ZSKIP=1 / ATLAS_GLM_MOE_DECODE_STREAM=1 ignored: they need ATLAS_GLM_MOE_DECODE_M16=1"
                 );
             }
         }
@@ -92,6 +122,22 @@ impl DecodeM16 {
 
     fn loaded(&self) -> bool {
         self.gate_up_silu.0 != 0 && self.down.0 != 0
+    }
+
+    /// Whether the stream twins are loaded: then they take every batch they
+    /// fit, up to [`STREAM_MAX_ROWS`] rows.
+    fn stream(&self) -> bool {
+        self.wide[0].0 != 0
+    }
+
+    /// The fused gate/up and down kernels of a batch of `rows` rows: one slab
+    /// up to [`MAX_ROWS`], else the stream pair's two.
+    fn pair(&self, rows: u32) -> [KernelHandle; 2] {
+        if rows <= MAX_ROWS {
+            [self.gate_up_silu, self.down]
+        } else {
+            self.wide
+        }
     }
 
     /// Log, once per backend and row count, whether a routed FFN batch of
@@ -117,10 +163,11 @@ impl DecodeM16 {
     }
 }
 
-/// Whether `rows` routed rows of `[inter, h]` experts fit the M16 tiles: one
-/// slab of rows, K128 stages, and 128 gate/up and 256 down columns per tile.
-pub(super) fn m16_shape(rows: u32, h: u32, inter: u32) -> bool {
-    (1..=MAX_ROWS).contains(&rows) && inter.is_multiple_of(128) && h.is_multiple_of(256)
+/// Whether `rows` routed rows of `[inter, h]` experts fit M16 tiles of at
+/// most `max_rows` rows: K128 stages, and 128 gate/up and 256 down columns per
+/// tile.
+pub(super) fn m16_shape(rows: u32, max_rows: u32, h: u32, inter: u32) -> bool {
+    (1..=max_rows).contains(&rows) && inter.is_multiple_of(128) && h.is_multiple_of(256)
 }
 
 impl MoeLayer {
@@ -142,7 +189,8 @@ impl MoeLayer {
     /// The row tiles of one prequant routed FFN of `rows` rows. A verify
     /// decode batch (`decode`) takes the M16 grid when selected, else the
     /// K128W grid under `ATLAS_GLM_MOE_DECODE_K128W`, else the compact M64
-    /// worklist; any other batch the K128W grid when it is loaded.
+    /// worklist; any other batch the stream twins' grid when they are loaded
+    /// and fit, else the K128W grid when it is loaded.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prequant_tiles(
         &self,
@@ -166,23 +214,26 @@ impl MoeLayer {
                 stream,
             )
         };
-        if !decode {
-            self.decode_m16.note(ctx.gpu, rows, false);
-            return Ok((None, k128w()?));
-        }
-        let m16 = self.decode_m16_grid(
-            expert_offsets,
-            local_ptrs,
-            rows,
-            total_expanded,
-            [h, inter],
-            num_experts,
-            ctx,
-            stream,
-        )?;
+        let m16 = if decode || self.decode_m16.stream() {
+            self.decode_m16_grid(
+                expert_offsets,
+                local_ptrs,
+                rows,
+                total_expanded,
+                [h, inter],
+                num_experts,
+                ctx,
+                stream,
+            )?
+        } else {
+            None
+        };
         self.decode_m16.note(ctx.gpu, rows, m16.is_some());
         if m16.is_some() {
             return Ok((None, m16));
+        }
+        if !decode {
+            return Ok((None, k128w()?));
         }
         if self.decode_m16.k128w {
             let grid = k128w()?;
@@ -251,8 +302,13 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<Option<MtileGrid>> {
         let k = self.decode_m16;
+        let max_rows = if k.stream() {
+            STREAM_MAX_ROWS
+        } else {
+            MAX_ROWS
+        };
         if !k.loaded()
-            || !m16_shape(rows, h, inter)
+            || !m16_shape(rows, max_rows, h, inter)
             || self.moe_build_tile_worklist_k.0 == 0
             || !self.nvfp4_fused_silu_quant
             || self.silu_mul_quant_nvfp4_k.0 == 0
@@ -281,14 +337,15 @@ impl MoeLayer {
             grid,
             persist: KernelHandle(0),
         };
+        let [gate_up_silu, down] = k.pair(rows);
         Ok(Some(MtileGrid {
             prefix: total_tiles,
             schedule: ops::K128wSchedule::Grid {
                 bound: total_expanded.min(num_experts),
             },
             rows: total_expanded,
-            gate_up_silu: grid_only(k.gate_up_silu),
-            down: grid_only(k.down),
+            gate_up_silu: grid_only(gate_up_silu),
+            down: grid_only(down),
         }))
     }
 }

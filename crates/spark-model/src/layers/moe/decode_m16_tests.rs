@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! ATLAS_GLM_MOE_DECODE_M16 / _K128W dispatch through the actual verify FFN
-//! entries; the numerics are gated on hardware by scripts/moe-decode-bench.
+//! ATLAS_GLM_MOE_DECODE_M16 / _K128W / _STREAM dispatch through the actual
+//! verify FFN entries; the numerics are gated on hardware by
+//! scripts/moe-decode-bench.
 use super::*;
-use crate::layers::moe::decode_m16::{MAX_ROWS, m16_shape};
+use crate::layers::moe::decode_m16::{MAX_ROWS, STREAM_MAX_ROWS, m16_shape};
 
 #[test]
-fn m16_tiles_cover_one_row_slab_of_k128_aligned_experts() {
-    for rows in 1..=MAX_ROWS {
-        assert!(m16_shape(rows, 4096, 1024));
-        assert!(m16_shape(rows, 4096, 2048));
+fn m16_tiles_cover_their_row_slabs_of_k128_aligned_experts() {
+    for max_rows in [MAX_ROWS, STREAM_MAX_ROWS] {
+        for rows in 1..=max_rows {
+            assert!(m16_shape(rows, max_rows, 4096, 1024));
+            assert!(m16_shape(rows, max_rows, 4096, 2048));
+        }
+        // More rows than the slabs, or none: the M64 kernels keep the batch.
+        assert!(!m16_shape(0, max_rows, 4096, 1024));
+        assert!(!m16_shape(max_rows + 1, max_rows, 4096, 1024));
     }
-    // More rows than one m16 slab, or none: the M64 kernels keep the batch.
-    assert!(!m16_shape(0, 4096, 1024));
-    assert!(!m16_shape(MAX_ROWS + 1, 4096, 1024));
+    assert_eq!(STREAM_MAX_ROWS, 2 * MAX_ROWS);
     // Gate/up tiles are 128 columns wide, down tiles 256.
-    assert!(!m16_shape(8, 4096, 1000));
-    assert!(!m16_shape(8, 4096 + 128, 1024));
+    assert!(!m16_shape(8, MAX_ROWS, 4096, 1000));
+    assert!(!m16_shape(8, MAX_ROWS, 4096 + 128, 1024));
 }
 
 /// How a routed FFN batch reaches the MoE.
@@ -146,25 +150,44 @@ fn verify_ffn(
         .iter()
         .filter(|e| matches!(e, Event::Launch(h, ..) if *h == layer.silu_mul_quant_nvfp4_k.0))
         .count();
-    // ATLAS_GLM_MOE_DOWN_ZSKIP swaps only the down twin.
-    let (down_name, other_down) = if env_on("ATLAS_GLM_MOE_DOWN_ZSKIP") {
-        ("glm_moe_decode_m16_k128w_zskip", "glm_moe_decode_m16_k128w")
-    } else {
-        ("glm_moe_decode_m16_k128w", "glm_moe_decode_m16_k128w_zskip")
+    // ATLAS_GLM_MOE_DECODE_STREAM (with the M16 flag) swaps in the stream
+    // twins, two slabs above 16 rows; ATLAS_GLM_MOE_DOWN_ZSKIP only the down.
+    let stream = env_on("ATLAS_GLM_MOE_DECODE_M16") && env_on("ATLAS_GLM_MOE_DECODE_STREAM");
+    let family = match (stream, rows as u32 <= MAX_ROWS) {
+        (false, _) => "m16",
+        (true, true) => "m16s",
+        (true, false) => "m32s",
     };
-    let [gate_up, down] = ["glm_moe_decode_m16_gate_up_silu_k128w", down_name].map(launches);
+    let skip = if env_on("ATLAS_GLM_MOE_DOWN_ZSKIP") {
+        "_zskip"
+    } else {
+        ""
+    };
+    let gate_up_name = format!("glm_moe_decode_{family}_gate_up_silu_k128w");
+    let down_name = format!("glm_moe_decode_{family}_k128w{skip}");
+    let [gate_up, down] = [gate_up_name.as_str(), down_name.as_str()].map(launches);
+    // No other twin launches.
+    for other in ["m16", "m16s", "m32s"] {
+        for kernel in ["gate_up_silu_k128w", "k128w", "k128w_zskip"] {
+            let name = format!("glm_moe_decode_{other}_{kernel}");
+            if name != gate_up_name && name != down_name {
+                assert!(launches(&name).is_empty(), "{name}");
+            }
+        }
+    }
     let k128w = [
         "moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w",
         "moe_w4a4_grouped_gemm_prequant_t_k128w_compact",
     ]
     .map(launches);
-    assert!(launches(other_down).is_empty());
     let inter = config.routed_inter_local() as u32;
     let routed = rows as u32 * 8;
     // Gate/up tiles are 128 columns of the rank's width, down tiles 256 of H.
     let grids = |bound: u32| [[inter / 128, bound, 1], [16, bound, 1]];
     let decode = entry != Entry::Prefill;
-    if decode && env_on("ATLAS_GLM_MOE_DECODE_M16") {
+    // The stream twins take every batch they fit, verify decode or not.
+    let max_rows = if stream { STREAM_MAX_ROWS } else { MAX_ROWS };
+    if (decode || stream) && env_on("ATLAS_GLM_MOE_DECODE_M16") && rows as u32 <= max_rows {
         // One tile per routed expert, at most one expert per routed row.
         assert_eq!((gate_up.len(), down.len()), (1, 1));
         // One worklist item per routed local expert, its count at the base.
@@ -180,7 +203,7 @@ fn verify_ffn(
         let scales = up_out.offset((routed * inter / 2) as usize);
         assert_eq!(gate_up[0].2[15..], [Arg::Ptr(up_out), Arg::Ptr(scales)]);
         assert_eq!(down[0].2[..2], [Arg::Ptr(up_out), Arg::Ptr(scales)]);
-        assert!(position("glm_moe_decode_m16_gate_up_silu_k128w") < position(down_name));
+        assert!(position(&gate_up_name) < position(&down_name));
         // Nothing of the M64 paths runs.
         assert_eq!((silu, launches(compact).len()), (0, 0));
         assert_eq!((k128w[0].len(), k128w[1].len()), (0, 0));
@@ -236,8 +259,12 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
         );
         let name = name.split_once("::").unwrap().1;
         // Off, on, on with the zero-row skip, the skip alone (ignored), the
-        // K128W control, and both (the twins take every batch they fit).
-        for mode in ["000", "100", "110", "010", "001", "101"] {
+        // K128W control, and both (the twins take every batch they fit);
+        // then the stream twins, alone (ignored), with M16, with the skip
+        // and with the K128W control.
+        for mode in [
+            "0000", "1000", "1100", "0100", "0010", "1010", "0001", "1001", "1101", "1011",
+        ] {
             let flag = |i: usize| &mode[i..=i];
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args(["--exact", name, "--nocapture"])
@@ -245,6 +272,7 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
                 .env("ATLAS_GLM_MOE_DECODE_M16", flag(0))
                 .env("ATLAS_GLM_MOE_DOWN_ZSKIP", flag(1))
                 .env("ATLAS_GLM_MOE_DECODE_K128W", flag(2))
+                .env("ATLAS_GLM_MOE_DECODE_STREAM", flag(3))
                 .env("ATLAS_GLM_INDEPENDENT_DECODE", "1")
                 .env("ATLAS_GLM_C3_GROUPED_MOE", "1")
                 .env("ATLAS_MOE_PREQUANT_K128", "1")
@@ -277,11 +305,15 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
         }
         return;
     }
-    // One verify block of 2..=8 rows, 3-row blocks of four owners, and a
-    // 12-row prefill batch, which no decode flag touches.
-    let batches = (2..=8)
-        .map(|rows| (Entry::Independent, rows))
-        .chain([(Entry::Owner, 12), (Entry::Prefill, 12)]);
+    // One verify block of 2..=8 rows, 3-row blocks of four owners, and
+    // prefill batches of 12, 24 and 40 rows, which only the stream twins take
+    // (up to 32 rows).
+    let batches = (2..=8).map(|rows| (Entry::Independent, rows)).chain([
+        (Entry::Owner, 12),
+        (Entry::Prefill, 12),
+        (Entry::Prefill, 24),
+        (Entry::Prefill, 40),
+    ]);
     for (entry, rows) in batches {
         for (rank, vector, expert_tp) in [
             (0, false, false),
@@ -311,6 +343,7 @@ fn decode_flags_require_0_or_1() {
             "ATLAS_GLM_MOE_DECODE_M16",
             "ATLAS_GLM_MOE_DOWN_ZSKIP",
             "ATLAS_GLM_MOE_DECODE_K128W",
+            "ATLAS_GLM_MOE_DECODE_STREAM",
         ] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", name.split_once("::").unwrap().1])

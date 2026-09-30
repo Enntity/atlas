@@ -10,12 +10,17 @@
 //   k128w       the prefill K128W kernels over the same rows
 //   m16         ATLAS_GLM_MOE_DECODE_M16: worklist -> M16 gate/up+SiLU -> M16 down
 //   m16+zskip   ... with ATLAS_GLM_MOE_DOWN_ZSKIP's down
-//   read-only   the same weight bytes read once and nothing else (roofline)
+//   m16s, m32s  ATLAS_GLM_MOE_DECODE_STREAM: the M16 kernels with streaming
+//               loads, over one row slab (<= 16 rows per expert) or two (<= 32)
+//   read-only   the same weight bytes read once and nothing else: "tables" in
+//               the kernels' grid of static per-expert slices, "chunked" in
+//               64 KB chunks taken in order by all SMs (the DRAM ceiling)
 // over a ring of routings with disjoint expert sets, so every repetition reads
 // cold weights (as the 42 MoE layers of a real step do). Every variant is
 // gated byte for byte against production on every routing, and the down
 // kernels once more on inputs rewritten to signed E2M1 zeros. A workload with
-// more than 16 rows per expert (17:8) checks the M16 downs' NaN backstop.
+// more than 16 (32) rows per expert, e.g. 17:8 (33:8), checks the downs' NaN
+// backstop.
 //
 // Build + run on a GB10 host, from this directory (-arch=sm_121a alone does
 // not enable the mxf4nvf4 MMA in ptxas; --fmad=false as KERNEL.toml):
@@ -82,6 +87,33 @@ __global__ void roof_read(const unsigned long long* __restrict__ pp, const unsig
         const size_t lo = blockIdx.x * per, hi = lo + per < n ? lo + per : n;
         for (size_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
             const uint4 v = tab[j][i];
+            x ^= v.x ^ v.y ^ v.z ^ v.w;
+        }
+    }
+    if (x == 0x12345678u) out[0] = x;
+}
+
+// Ceiling: the same tables in 64 KiB chunks that the blocks take in order from
+// a zeroed counter, so every SM streams the same few tables at a time.
+// Grid (blocks), 1024 threads.
+__global__ void roof_chunked(const unsigned long long* __restrict__ pp, const unsigned long long* __restrict__ sp,
+                             const unsigned long long* __restrict__ pp2, const unsigned long long* __restrict__ sp2,
+                             const int* __restrict__ active, int experts, size_t packed16, size_t scale16,
+                             int* __restrict__ next, unsigned* out) {
+    __shared__ int s_chunk;
+    const int CH = 4096, pc = (int)(packed16 / CH), sc = (int)(scale16 / CH), per = (pp2 ? 2 : 1) * (pc + sc);
+    unsigned x = 0;
+    for (;;) {
+        if (threadIdx.x == 0) s_chunk = atomicAdd(next, 1);
+        __syncthreads();
+        const int c = s_chunk;
+        __syncthreads();
+        if (c >= experts * per) break;
+        const int e = active[c / per], proj = (c % per) / (pc + sc), r = (c % per) % (pc + sc);
+        const unsigned long long* tab = r < pc ? (proj ? pp2 : pp) : (proj ? sp2 : sp);
+        const uint4* q = (const uint4*)tab[e] + (size_t)(r < pc ? r : r - pc) * CH;
+        for (int i = threadIdx.x; i < CH; i += blockDim.x) {
+            const uint4 v = __ldcs(q + i);
             x ^= v.x ^ v.y ^ v.z ^ v.w;
         }
     }
@@ -319,8 +351,45 @@ int main(int argc, char** argv) {
                 {"worklist", prefix16, 0}, {"gate_up_silu m16", gate_up_m16, gu_bytes},
                 {"down m16 zskip", down_m16z, dn_bytes}, {"unpermute", unperm, 0}}});
         }
-        // Read-only roofline over the same weight bytes (timing only).
+        // Stream-loaded twins (ATLAS_GLM_MOE_DECODE_STREAM): one row slab (up to
+        // 16 rows per expert) or two (up to 32).
+        using Launch = std::function<void(const Route&)>;
+        auto gate_up_s = [&](bool m32) -> Launch {
+            return [&, m32](const Route& rt) {
+                (m32 ? glm_moe_decode_m32s_gate_up_silu_k128w : glm_moe_decode_m16s_gate_up_silu_k128w)
+                    <<<dim3(I / 128, bound16), 256>>>(d_a, d_as, gate.pp, gate.sp, gate.s2, nullptr, rt.off,
+                    rt.sorted, E, I, H, d_work16, upt.pp, upt.sp, upt.s2, q, q + qb);
+            };
+        };
+        auto down_s = [&](bool m32, bool zskip) -> Launch {
+            return [&, m32, zskip](const Route& rt) {
+                (m32 ? (zskip ? glm_moe_decode_m32s_k128w_zskip : glm_moe_decode_m32s_k128w)
+                     : (zskip ? glm_moe_decode_m16s_k128w_zskip : glm_moe_decode_m16s_k128w))
+                    <<<dim3(H / 256, bound16), 256>>>(q, q + qb, dn.pp, dn.sp, dn.s2, c_down, rt.off, nullptr,
+                    E, H, I, d_work16);
+            };
+        };
+        auto stream_variant = [&](const char* name, bool m32, bool zskip) {
+            variants.push_back({name, {
+                {"worklist", prefix16, 0}, {"gate_up_silu stream", gate_up_s(m32), gu_bytes},
+                {zskip ? "down stream zskip" : "down stream", down_s(m32, zskip), dn_bytes}, {"unpermute", unperm, 0}}});
+        };
+        if (max_rows <= 16) {
+            stream_variant("m16s", false, false);
+            stream_variant("m16s+zskip", false, true);
+        }
+        if (max_rows <= 32) stream_variant("m32s+zskip", true, true);
+        // Read-only rooflines over the same weight bytes (timing only): the
+        // kernels' grid of static table slices, and the chunked ceiling.
         unsigned* d_roof = dev<unsigned>(1);
+        int* d_next = dev<int>(1);
+        auto chunked = [&](const ExpertTable& a, const ExpertTable* b) -> Launch {
+            return [&, b](const Route& rt) {
+                CK(cudaMemsetAsync(d_next, 0, 4));
+                roof_chunked<<<sms, 1024>>>(a.pp, a.sp, b ? b->pp : nullptr, b ? b->sp : nullptr, rt.active, U,
+                    (size_t)I * H / 2 / 16, (size_t)I * H / 16 / 16, d_next, d_roof);
+            };
+        };
         auto roof_gu = [&](const Route& rt) {
             roof_read<<<dim3(16, U), 256>>>(gate.pp, gate.sp, upt.pp, upt.sp, rt.active,
                 (size_t)I * H / 2 / 16, (size_t)I * H / 16 / 16, d_roof);
@@ -330,7 +399,8 @@ int main(int argc, char** argv) {
                 (size_t)I * H / 2 / 16, (size_t)I * H / 16 / 16, d_roof);
         };
         const size_t roofline = variants.size();
-        variants.push_back({"read-only", {{"gate+up tables", roof_gu, gu_bytes}, {"down tables", roof_dn, dn_bytes}}});
+        variants.push_back({"read-only", {{"gate+up tables", roof_gu, gu_bytes}, {"down tables", roof_dn, dn_bytes},
+            {"gate+up chunked", chunked(gate, &upt), gu_bytes}, {"down chunked", chunked(dn, nullptr), dn_bytes}}});
 
         // Production outputs per route, then every other variant against them.
         struct Ref { std::vector<__nv_bfloat16> c, o; std::vector<unsigned char> q; };
@@ -390,7 +460,7 @@ int main(int argc, char** argv) {
             bad_total += (bad_q || bad_c || bad_o);
         }
 
-        if (max_rows <= 16) {
+        if (max_rows <= 32) {
             // Signed-zero stress of the down kernels: every third sorted row
             // all -0 codes, every third a mix of +0/-0 codes, the rest as
             // routed (so tiles skip none, some and all of their weight rows).
@@ -403,7 +473,9 @@ int main(int argc, char** argv) {
                     for (unsigned kp = 0; kp < I / 2 && row % 3 != 2; ++kp)
                         z[(size_t)row * (I / 2) + kp] = row % 3 == 0 ? 0x88 : mix[(kp + row) & 3];
                 std::vector<__nv_bfloat16> want;
-                const std::function<void(const Route&)> downs[3] = {down_proj, down_m16, down_m16z};
+                std::vector<Launch> downs = {down_proj, down_s(true, false), down_s(true, true)};
+                if (max_rows <= 16)
+                    downs.insert(downs.end(), {down_m16, down_m16z, down_s(false, false), down_s(false, true)});
                 for (auto& f : downs) {
                     CK(cudaMemcpy(q, z.data(), qb + sb, cudaMemcpyHostToDevice));
                     CK(cudaMemset(c_down, 0x5a, (size_t)TE * H * 2));
@@ -415,31 +487,33 @@ int main(int argc, char** argv) {
                     cells += got.size();
                 }
             }
-            printf("  signed-zero stress, M16 downs vs dense K128: bf16 differing %zu of %zu\n", bad, cells);
+            printf("  signed-zero stress, M16 and stream downs vs dense K128: bf16 differing %zu of %zu\n", bad, cells);
             bad_total += bad != 0;
         }
 
         if (max_rows > 16) {
-            // Host-guard backstop: an expert with more than 16 rows gets NaN
-            // from the M16 downs, never stale bytes.
+            // Host-guard backstop: an expert with more rows than a kernel's
+            // slabs gets NaN from its downs, never stale bytes.
             size_t stale = 0, cells = 0;
-            const std::function<void(const Route&)> downs[2] = {down_m16, down_m16z};
+            std::vector<std::pair<Launch, int>> downs = {{down_m16, 16}, {down_m16z, 16},
+                {down_s(false, false), 16}, {down_s(false, true), 16}};
+            if (max_rows > 32) downs.push_back({down_s(true, true), 32});
             for (unsigned ri = 0; ri < ring; ++ri) {
                 const Route& rt = routes[ri];
                 const auto offs = down(rt.off, E + 1);
-                for (auto& f : downs) {
+                for (auto& [f, slab] : downs) {
                     CK(cudaMemcpy(q, refs[ri].q.data(), qb + sb, cudaMemcpyHostToDevice));
                     CK(cudaMemset(c_down, 0x5a, (size_t)TE * H * 2));
                     prefix16(rt); f(rt);
                     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
                     const auto got = down(c_down, (size_t)TE * H);
                     for (unsigned e = 0; e < E; ++e)
-                        for (int row = offs[e]; row < offs[e + 1] && offs[e + 1] - offs[e] > 16; ++row)
+                        for (int row = offs[e]; row < offs[e + 1] && offs[e + 1] - offs[e] > slab; ++row)
                             for (unsigned c = 0; c < H; ++c, ++cells)
                                 stale += !std::isnan(__bfloat162float(got[(size_t)row * H + c]));
                 }
             }
-            printf("  over-full experts (> 16 rows), M16 downs: %zu of %zu cells not NaN\n", stale, cells);
+            printf("  over-full experts (> 16 or 32 rows), M16 and stream downs: %zu of %zu cells not NaN\n", stale, cells);
             bad_total += stale != 0 || cells == 0;
         }
 
@@ -484,7 +558,7 @@ int main(int argc, char** argv) {
             printf("  %-12s %-22s %8.1f us (p10 %7.1f)  paired vs production %+.1f%%\n", v.name, "LAYER", median(whole[vi]) * 1e3,
                    pct(whole[vi], 0.1f) * 1e3, 100.0 * (median(ratio) - 1.0));
         }
-        CK(cudaFree(d_prefix)); CK(cudaFree(d_roof)); CK(cudaFree(d_work16));
+        CK(cudaFree(d_prefix)); CK(cudaFree(d_roof)); CK(cudaFree(d_next)); CK(cudaFree(d_work16));
         for (auto& rt : routes) { CK(cudaFree(rt.off)); CK(cudaFree(rt.sorted)); CK(cudaFree(rt.t2p)); CK(cudaFree(rt.ids)); CK(cudaFree(rt.w)); CK(cudaFree(rt.work)); CK(cudaFree(rt.active)); }
         CK(cudaFree(d_a)); CK(cudaFree(d_as)); CK(cudaFree(c_gate)); CK(cudaFree(c_up)); CK(cudaFree(c_down)); CK(cudaFree(out));
         if (flush) CK(cudaFree(flush));
