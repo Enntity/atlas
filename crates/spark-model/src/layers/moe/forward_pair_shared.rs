@@ -132,28 +132,21 @@ impl MoeLayer {
             ctx.buffers.attn_output(),
         );
         let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(rows);
-        ops::w4a16_gemv_batchm(
-            ctx.gpu,
-            tc,
-            input,
-            &gate_up_rows(&shared.gate_proj),
-            gate_out,
-            rows,
-            half,
-            h,
-            stream,
-        )?;
-        ops::w4a16_gemv_batchm(
-            ctx.gpu,
-            tc,
-            input,
-            &gate_up_rows(&shared.up_proj),
-            up_out,
-            rows,
-            half,
-            h,
-            stream,
-        )?;
+        let (gate, up) = (
+            gate_up_rows(&shared.gate_proj),
+            gate_up_rows(&shared.up_proj),
+        );
+        let gate_up = [(&gate, gate_out), (&up, up_out)];
+        // ATLAS_GLM_DECODE_GEMV_BATCH: gate and up in one launch of the tc
+        // body, both touched during the PDL wait (`ops::gemv_touch`).
+        match ops::w4a16_pair_touch(ctx.gpu, tc, input, gate_up, rows, half, h, stream) {
+            Some(done) => done?,
+            None => {
+                for (weight, out) in gate_up {
+                    ops::w4a16_gemv_batchm(ctx.gpu, tc, input, weight, out, rows, half, h, stream)?;
+                }
+            }
+        }
         ops::silu_mul(
             ctx.gpu,
             self.moe_act_mul,
@@ -163,6 +156,15 @@ impl MoeLayer {
             rows * half,
             stream,
         )?;
+        let (ld_half, ld_groups) = (inter / 2, inter / 16);
+        let touch = crate::layers::w4a16_gemv_tiers::tc_rows(tc)
+            .and_then(ops::w4a16_tc_twin)
+            .and_then(ops::gemv_touch);
+        if let Some(touch) = touch {
+            return touch.w4a16_tc(
+                ctx.gpu, gate_out, &down_cols, down_out, rows, h, half, ld_half, ld_groups, stream,
+            );
+        }
         ops::w4a16_gemv_tc_ld(
             ctx.gpu,
             crate::layers::w4a16_gemv_tiers::tc_ld_kernel(rows),
@@ -172,8 +174,8 @@ impl MoeLayer {
             rows,
             h,
             half,
-            inter / 2,
-            inter / 16,
+            ld_half,
+            ld_groups,
             stream,
         )
     }

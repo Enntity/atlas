@@ -78,6 +78,8 @@ mod gemv_q2;
 mod gemv_q2_vec;
 #[path = "ops/gemv_sw.rs"]
 mod gemv_sw;
+#[path = "ops/gemv_touch.rs"]
+mod gemv_touch;
 #[path = "ops/glm_decode_fuse.rs"]
 pub mod glm_decode_fuse;
 #[path = "ops/glm_hc_prefill.rs"]
@@ -253,6 +255,10 @@ pub use gemm_quant::*;
 pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
+pub use gemv_touch::{
+    GemvTouch, Twin, gemv_touch, gemv_touch_resolve, mxfp8_tc_twin, w4a16_pair_touch,
+    w4a16_tc_twin, w4a16_verify_touch,
+};
 pub use glm_hc_prefill::*;
 pub use glm_indexer::*;
 pub use glm_indexer_dynamic::*;
