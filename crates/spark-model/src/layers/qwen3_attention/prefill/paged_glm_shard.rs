@@ -85,9 +85,11 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    /// `ATLAS_GLM_KV_SHARD_CHECK=1`: this rank's table must place every
-    /// logical block on the rank its index names, and both ranks must see
-    /// the same number of blocks (their physical ids legitimately differ).
+    /// This rank's table must place every logical block on the rank its index
+    /// names, and both ranks must see the same number of blocks (their
+    /// physical ids legitimately differ). The ranks swap verdicts before
+    /// either fails: a rank failing alone would leave its peer waiting in the
+    /// exchange that follows.
     fn glm_shard_check(
         &self,
         s: &LatentShard,
@@ -97,18 +99,26 @@ impl Qwen3AttentionLayer {
         table: &[u32],
         stream: u64,
     ) -> Result<()> {
-        s.check_table(table)
-            .with_context(|| format!("attention layer {}", self.attn_layer_idx))?;
-        let blocks = table.len() as u64;
-        gpu.copy_h2d_async(&blocks.to_le_bytes(), words, stream)?;
+        const BROKEN: u64 = 1 << 63;
+        let verdict = s.check_table(table);
+        let ours = table.len() as u64 | if verdict.is_err() { BROKEN } else { 0 };
+        gpu.copy_h2d_async(&ours.to_le_bytes(), words, stream)?;
         shard::pair_exchange(comm, words, words.offset(8), 8, stream)?;
         let mut peer = [0u8; 8];
         gpu.copy_d2h_on_stream(words.offset(8), &mut peer, stream)?;
         let peer = u64::from_le_bytes(peer);
+        verdict.with_context(|| format!("attention layer {}", self.attn_layer_idx))?;
         ensure!(
-            peer == blocks,
-            "GLM KV shard: rank {} attends {blocks} blocks, its peer {peer}, at attention layer {}",
+            peer == ours,
+            "GLM KV shard: rank {} attends {} blocks, its peer {}{}, at attention layer {}",
             s.spec.rank,
+            ours,
+            peer & !BROKEN,
+            if peer & BROKEN == 0 {
+                ""
+            } else {
+                " of a table that breaks the ownership rule"
+            },
             self.attn_layer_idx
         );
         Ok(())
@@ -128,8 +138,10 @@ impl Qwen3AttentionLayer {
             .filter(|_| !ctx.graph_capture)
     }
 
-    /// `[k, v, block table]` a view-form owner's kernels read: its assembled
-    /// history under a shard, else the layer's pools and its own table.
+    /// `[k, v, block table]` an owner's kernels read: the layer's pools and
+    /// the sequence's table, or under a shard its assembled history (the view
+    /// form). `None` for a sharded owner of few rows, which merges each
+    /// rank's attention over its own tokens ([`Self::glm_shard_merge_owner`]).
     pub(super) fn glm_owner_latents(
         &self,
         kv_cache: &PagedKvCache,
@@ -137,17 +149,20 @@ impl Qwen3AttentionLayer {
         o: &super::GlmChunkOwner,
         end: usize,
         stream: u64,
-    ) -> Result<[DevicePtr; 3]> {
+    ) -> Result<Option<[DevicePtr; 3]>> {
         if kv_cache.latent_shard().is_none() {
-            return Ok([
+            return Ok(Some([
                 kv_cache.k_pool_ptr(self.attn_layer_idx),
                 kv_cache.v_pool_ptr(self.attn_layer_idx),
                 o.meta.block_table,
-            ]);
+            ]));
+        }
+        if o.rows <= shard::MERGE_MAX_ROWS {
+            return Ok(None);
         }
         let (view, identity) =
             self.glm_shard_assemble_view(kv_cache, ctx, o.meta.block_table, end, stream)?;
-        Ok([view, view, identity])
+        Ok(Some([view, view, identity]))
     }
 
     /// `ATLAS_GLM_KV_SHARD_OVERLAP=1`: swap a merge-form owner's absorbed
@@ -286,12 +301,16 @@ impl Qwen3AttentionLayer {
         );
         let gpu = ctx.gpu;
         let table = read_table(gpu, block_table, blocks, stream)?;
-        if shard::MergeTuning::get()?.check {
-            let words = s.scratch.offset(layout.check);
-            self.glm_shard_check(&s, comm, gpu, words, &table, stream)?;
-        }
-        // Validates the residue invariant: a violation would pair the wrong
-        // blocks across the ranks.
+        // A table that breaks the ownership rule would pair the wrong blocks
+        // across the ranks: both fail here, before the first piece.
+        self.glm_shard_check(
+            &s,
+            comm,
+            gpu,
+            s.scratch.offset(layout.check),
+            &table,
+            stream,
+        )?;
         let plan = s.plan(&table)?;
         let at = |offset: usize| s.scratch.offset(offset);
         let (mine_slot, mine_dst, peer_dst) = (

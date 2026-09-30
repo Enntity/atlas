@@ -12,23 +12,36 @@ const LOCALIZE: u64 = 831;
 const COPY_BLOCKS: u64 = 832;
 const LATENT_WRITE: u64 = 821;
 const SPARSE_ATTN: u64 = 840;
+const PIPE_ATTN: u64 = 841;
 const RANK: usize = 1;
 const BLOCKS: usize = 512;
 
-/// This rank of a pair: the byte count of every exchange, in order.
-#[derive(Default)]
-struct Pair(Mutex<Vec<usize>>);
+/// This rank of a pair whose peer is in step (it sends what this rank
+/// sends), or answers the 8-byte verdict swap with `verdict`: the byte count
+/// of every exchange, in order.
+struct Pair<'a> {
+    gpu: &'a TestGpu,
+    verdict: Option<u64>,
+    exchanges: Mutex<Vec<usize>>,
+}
 
-impl spark_comm::CommBackend for Pair {
+impl spark_comm::CommBackend for Pair<'_> {
     fn rank(&self) -> usize {
         RANK
     }
     fn world_size(&self) -> usize {
         2
     }
-    fn exchange_async(&self, _: u64, _: u64, bytes: usize, add: bool, _: u64) -> Result<bool> {
+    fn supports_exchange_async(&self, _: usize) -> bool {
+        true
+    }
+    fn exchange_async(&self, send: u64, recv: u64, n: usize, add: bool, _: u64) -> Result<bool> {
         assert!(!add, "shard exchanges copy, never add");
-        self.0.lock().unwrap().push(bytes);
+        self.exchanges.lock().unwrap().push(n);
+        match self.verdict.filter(|_| n == 8) {
+            Some(word) => self.gpu.copy_h2d(&word.to_le_bytes(), DevicePtr(recv))?,
+            None => self.gpu.copy_d2d(DevicePtr(send), DevicePtr(recv), n)?,
+        }
         Ok(true)
     }
     fn all_reduce(&self, _: u64, _: usize) -> Result<()> {
@@ -88,11 +101,27 @@ fn word(v: u32) -> Vec<u8> {
 /// `rows` rows from `seq_len_start` through the paged prefill of rank
 /// [`RANK`] on a sharded `dtype` cache, the first `floor` rows unwritten.
 fn pass(dtype: KvCacheDtype, seq_len_start: usize, rows: usize, floor: usize) -> Pass {
+    let (result, pass) = pass_with(dtype, seq_len_start, rows, floor, None, None);
+    result.unwrap();
+    pass
+}
+
+/// [`pass`] and its result, with logical block `misplaced` of this rank's
+/// table on the wrong residue and the peer answering the verdict swap with
+/// `verdict`.
+fn pass_with(
+    dtype: KvCacheDtype,
+    seq_len_start: usize,
+    rows: usize,
+    floor: usize,
+    misplaced: Option<usize>,
+    verdict: Option<u64>,
+) -> (Result<()>, Pass) {
     let mut out = None;
     fixture_with(dtype, |gpu, config, layer| {
         layer.glm_sparse_attn_k = KernelHandle(SPARSE_ATTN);
         let layer = &*layer;
-        let mut arena = BufferArena::new(config, 256, 32768, 16, 1, gpu).unwrap();
+        let mut arena = BufferArena::new(config, rows.max(256), 32768, 16, 1, gpu).unwrap();
         if dtype == KvCacheDtype::Fp8G128 {
             arena.attach_glm_latent_scratch(4096, gpu).unwrap();
         }
@@ -114,10 +143,19 @@ fn pass(dtype: KvCacheDtype, seq_len_start: usize, rows: usize, floor: usize) ->
             seq_slot: DevicePtr::NULL,
             moe_row_adapter: DevicePtr::NULL,
         };
-        // Logical block `l` is physical block `l`: every residue matches.
-        let table: Vec<u8> = (0..BLOCKS as u32).flat_map(u32::to_le_bytes).collect();
+        // Logical block `l` is physical block `l`: every residue matches,
+        // but for the misplaced one.
+        let block = |l: u32| l + u32::from(misplaced == Some(l as usize));
+        let table: Vec<u8> = (0..BLOCKS as u32)
+            .map(block)
+            .flat_map(u32::to_le_bytes)
+            .collect();
         gpu.copy_h2d(&table, meta.block_table).unwrap();
-        let pair = Pair::default();
+        let pair = Pair {
+            gpu,
+            verdict,
+            exchanges: Mutex::default(),
+        };
         let ctx = ForwardContext {
             buffers: &arena,
             gpu,
@@ -148,38 +186,37 @@ fn pass(dtype: KvCacheDtype, seq_len_start: usize, rows: usize, floor: usize) ->
             layer_dims: vec![],
             cache_blocks_per_seq: None,
         };
-        let spec = shard::spec(RANK, &kv_config, BLOCKS * 16 - 64, 256);
+        let spec = shard::spec(RANK, &kv_config, BLOCKS * 16 - 64, 256.max(rows));
         let mut cache = PagedKvCache::new_latent_sharded(kv_config, BLOCKS, gpu, spec).unwrap();
         cache
             .attach_sparse_index(SparseIndexCacheConfig::bf16(4, 128), gpu)
             .unwrap();
         let before = gpu.1.lock().unwrap().len();
-        layer
-            .prefill_attention_paged(
-                &mut crate::layer::EmptyLayerState,
-                arena.norm_output(),
-                rows,
-                seq_len_start,
-                &mut cache,
-                &Vec::new(),
-                &mut Vec::new(),
-                &mut Vec::new(),
-                None,
-                floor,
-                &ctx,
-                0,
-            )
-            .unwrap();
+        let result = layer.prefill_attention_paged(
+            &mut crate::layer::EmptyLayerState,
+            arena.norm_output(),
+            rows,
+            seq_len_start,
+            &mut cache,
+            &Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            None,
+            floor,
+            &ctx,
+            0,
+        );
         let shard = cache.latent_shard().unwrap();
-        out = Some(Pass {
+        let pass = Pass {
             launches: gpu.1.lock().unwrap()[before..].to_vec(),
-            exchanges: pair.0.lock().unwrap().clone(),
+            exchanges: pair.exchanges.lock().unwrap().clone(),
             shard,
             layout: ScratchLayout::of(&shard, cache.config()).unwrap(),
             pool: cache.latent_pool_ptr(0),
             slot: meta.slot,
             block_table: meta.block_table,
-        });
+        };
+        out = Some((result.map(|_| ()), pass));
     });
     out.unwrap()
 }
@@ -244,7 +281,11 @@ fn a_chunk_reads_its_history_assembled_from_both_ranks() {
     // which this rank stores the 132 odd ones.
     let p = pass(KvCacheDtype::Bf16, 4096, 128, 0);
     let block = 16 * 512 * 2;
-    assert_eq!(p.exchanges, [132 * block], "one round of the peer's blocks");
+    assert_eq!(
+        p.exchanges,
+        [8, 132 * block],
+        "the table verdicts, then one round of the peer's blocks"
+    );
     let view = p.scratch(p.layout.view);
     let copies = p.of(COPY_BLOCKS);
     let blocks: Vec<_> = copies.iter().map(|a| a[4].clone()).collect();
@@ -258,4 +299,90 @@ fn a_chunk_reads_its_history_assembled_from_both_ranks() {
     assert_eq!(attn[1..3], [view.clone(), view]);
     assert_eq!(attn[5], ptr(p.shard.identity));
     assert!(p.of(LOCALIZE).is_empty(), "the view form localizes nothing");
+}
+
+#[test]
+fn a_table_off_its_residues_fails_on_both_ranks_after_the_verdict_swap() {
+    // This rank's table is broken: it still swaps its verdict, so the peer
+    // fails too instead of waiting for blocks that never come.
+    let (result, p) = pass_with(KvCacheDtype::Bf16, 4096, 128, 0, Some(7), None);
+    let err = format!("{:#}", result.unwrap_err());
+    assert!(err.contains("logical block 7"), "{err}");
+    assert_eq!(p.exchanges, [8], "the verdict, and no block after it");
+    assert!(p.of(COPY_BLOCKS).is_empty());
+    // The peer's table is broken, or it attends another number of blocks:
+    // this rank's sound table does not carry it past the swap.
+    for (verdict, why) in [
+        (264 | 1 << 63, "breaks the ownership rule"),
+        (263, "its peer 263"),
+    ] {
+        let (result, p) = pass_with(KvCacheDtype::Bf16, 4096, 128, 0, None, Some(verdict));
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("attends 264 blocks") && err.contains(why),
+            "{err}"
+        );
+        assert_eq!(p.exchanges, [8]);
+        assert!(p.of(COPY_BLOCKS).is_empty());
+    }
+}
+
+/// The production flags the view form has to work under, in a child process
+/// (they are read from the environment): an `fp8_g128` owner wide enough for
+/// the index split, through the pipelined sparse kernel.
+#[test]
+fn an_fp8_chunk_under_the_pipe_and_the_index_split_reads_the_assembled_view() {
+    const CHILD: &str = "ATLAS_TEST_SHARD_PIPE";
+    if std::env::var_os(CHILD).is_none() {
+        let name = concat!(
+            module_path!(),
+            "::an_fp8_chunk_under_the_pipe_and_the_index_split_reads_the_assembled_view"
+        );
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", name.split_once("::").unwrap().1, "--nocapture"]);
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("ATLAS_") {
+                cmd.env_remove(k);
+            }
+        }
+        for flag in [
+            CHILD,
+            "ATLAS_GLM_KV_SHARD",
+            "ATLAS_GLM_SPARSE_PREFILL_TC",
+            "ATLAS_GLM_SPARSE_PREFILL_KV_REUSE",
+            "ATLAS_GLM_SPARSE_PREFILL_PIPE",
+            "ATLAS_GLM_INDEX_SPLIT",
+        ] {
+            cmd.env(flag, "1");
+        }
+        let out = cmd.output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("running 1 test"));
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    // 288 rows from token 4096: 274 blocks, 137 of them the peer's. One CTA
+    // per row is already the cheapest split, so the rows take the pipe.
+    let p = pass(KvCacheDtype::Fp8G128, 4096, 288, 0);
+    let (quarter, block) = (72 * 2051 * 4, 16 * 528);
+    assert_eq!(
+        p.exchanges,
+        [quarter, quarter, 8, 137 * block],
+        "the split selection's two quarters, the table verdicts, the peer's blocks"
+    );
+    let view = p.scratch(p.layout.view);
+    let [attn] = p.of(PIPE_ATTN)[..] else {
+        panic!(
+            "one pipelined launch, got {:?}",
+            p.launches.iter().map(|l| l.0).collect::<Vec<_>>()
+        );
+    };
+    assert_eq!(attn[1..3], [view.clone(), view], "fp8_g128 read in place");
+    assert_eq!(attn[5], ptr(p.shard.identity));
+    assert_eq!(attn[6], word(288));
+    assert!(p.of(LOCALIZE).is_empty() && p.of(SPARSE_ATTN).is_empty());
 }

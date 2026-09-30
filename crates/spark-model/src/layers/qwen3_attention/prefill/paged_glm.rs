@@ -282,12 +282,9 @@ impl Qwen3AttentionLayer {
             // Sharded latents (`ATLAS_GLM_KV_SHARD=1`): few rows merge each rank's
             // attention over its own tokens; larger owners read an assembled view.
             let sharded = kv_cache.latent_shard().is_some();
-            let merge_form = sharded && o.rows <= crate::layers::glm_kv_shard::MERGE_MAX_ROWS;
-            let [k_source, v_source, table_source] = if merge_form {
-                [DevicePtr::NULL; 3]
-            } else {
-                self.glm_owner_latents(kv_cache, &octx, o, sequence_end, stream)?
-            };
+            let latents = self.glm_owner_latents(kv_cache, &octx, o, sequence_end, stream)?;
+            let merge_form = latents.is_none();
+            let [k_source, v_source, table_source] = latents.unwrap_or([DevicePtr::NULL; 3]);
             let view = self.glm_owner_bf16_view(
                 k_source,
                 table_source,
@@ -327,12 +324,11 @@ impl Qwen3AttentionLayer {
             };
             det.tap("x_q_abs", q_absorbed, (o.row0, o.rows), latent_row);
             if merge_form {
-                let query = (q_absorbed, queries_swapped);
                 self.glm_shard_merge_owner(
                     kv_cache,
                     &octx,
                     o,
-                    query,
+                    (q_absorbed, queries_swapped),
                     sparse_indices,
                     attn_latent,
                     stream,
