@@ -254,6 +254,9 @@ pub struct MoeLayer {
     /// its epilogue (same bytes); loaded with `moe_w4a4_prequant_t_k128w`
     /// unless `ATLAS_MOE_GATE_UP_SILU=0`.
     pub(super) moe_w4a4_prequant_gate_up_silu: KernelHandle,
+    /// CTAs of the persistent K128W twins when `ATLAS_GLM_MOE_PREFILL_PERSIST=1`
+    /// resolved them into the two handles above, else 0 (row-tile grid).
+    pub(super) k128w_persist_ctas: u32,
     /// Compact-worklist twins of the prequantized native-FP4 MoE kernel.
     /// Optional and used only for guarded K=5 gate/up verification.
     pub(super) moe_w4a4_prequant_t_k64_compact: KernelHandle,

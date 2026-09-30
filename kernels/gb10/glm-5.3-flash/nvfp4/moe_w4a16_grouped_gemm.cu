@@ -867,8 +867,9 @@ struct PqwGateUp {
 
 // One K128W tile is 64 rows x 256 B columns (GATE_UP: 128 gate columns and
 // the same 128 up columns, with silu_mul_quant_nvfp4 applied in registers),
-// computed by 256 threads in 8 warps of 32 rows x 64 columns, in the pieces
-// below.
+// computed by 256 threads in 8 warps of 32 rows x 64 columns. The pieces
+// below are shared by the one-tile-per-CTA grid (pqw_impl) and the
+// persistent grid (pqp_impl).
 #define PQW_NT 256
 #define PQW_NB (PQW_NT / 4 / 16)   // 16-column ldmatrix blocks per warp
 // [kp][n] and [group][n] shared tiles: 16-byte chunk c of row r at c ^ (r & 7).
@@ -1170,6 +1171,140 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_w4a4_grouped_gemm_prequ
     pqw_impl<true>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
         expert_offsets, sorted_token_ids, num_experts, N, K, mtile_prefix,
         PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale});
+}
+
+// ── Persistent K128W (ATLAS_GLM_MOE_PREFILL_PERSIST) ─────────────────────
+// The K128W tiles, loads, MMA sequence and epilogue above, so the output
+// bytes are identical; only the scheduling changes. Two CTAs per SM take
+// (row tile, N tile) work items w = n + N_tiles * row, in order, from the
+// zeroed counter `next_work`, which keeps the resident tiles as close
+// together as the K128W grid's in-order dispatch does (the row tiles of one
+// expert share its weights in L2; a static stride lets the CTAs drift apart
+// and re-read them from DRAM). Nothing launches past the live tiles (the
+// K128W grid launches the host's bound, most of it exiting at once), and
+// each CTA gathers its next tile's token rows and issues its first K stage
+// before the current tile's epilogue. Every tile below
+// mtile_prefix[num_experts] holds rows of a local expert.
+template<bool GATE_UP>
+__device__ __forceinline__ void pqp_impl(
+    PQ2_ARGS,
+    const int* __restrict__ mtile_prefix,
+    int* __restrict__ next_work,
+    const PqwGateUp up
+) {
+    const unsigned int n_tiles = N / (GATE_UP ? PQW_NT / 2 : PQW_NT);
+    const unsigned int work = (unsigned int)mtile_prefix[num_experts] * n_tiles;
+    const unsigned int t = threadIdx.x;
+    const unsigned int warp_id = t / 32, lane_id = t % 32;
+
+    __shared__ __align__(16) PqwA sA[2];
+    __shared__ __align__(16) PqwAs sAs[2];
+    __shared__ __align__(16) PqwB sB[2];
+    __shared__ __align__(16) PqwS sS[2];
+    __shared__ int sTok[M_TILE];
+    __shared__ unsigned int sNext;
+
+    // One work item: its expert, rows, column tile and weight tables.
+    struct Tile {
+        unsigned int expert_id, cta_m, cta_n;
+        int M_expert, cta_m_local;
+        const unsigned char *B, *S, *U, *US;
+    };
+    auto decode = [&](unsigned int w) {
+        Tile d;
+        const int tl = (int)(w / n_tiles);
+        d.cta_n = (w % n_tiles) * (GATE_UP ? PQW_NT / 2 : PQW_NT);
+        d.expert_id = pqw_tile_expert(tl, mtile_prefix, num_experts);
+        const int m_start = expert_offsets[d.expert_id];
+        d.M_expert = expert_offsets[d.expert_id + 1] - m_start;
+        d.cta_m_local = (tl - mtile_prefix[d.expert_id]) * M_TILE;
+        d.cta_m = m_start + d.cta_m_local;
+        d.B = (const unsigned char*)B_packed_ptrs[d.expert_id];
+        d.S = (const unsigned char*)B_scale_ptrs[d.expert_id];
+        d.U = GATE_UP ? (const unsigned char*)up.packed_ptrs[d.expert_id] : nullptr;
+        d.US = GATE_UP ? (const unsigned char*)up.scale_ptrs[d.expert_id] : nullptr;
+        return d;
+    };
+    auto issue = [&](const Tile& d, int buf, unsigned int kb) {
+        pqw_issue<GATE_UP>(t, sA[buf], sAs[buf], sB[buf], sS[buf], sTok, A_packed, A_scale,
+            d.B, d.S, d.U, d.US, d.cta_m_local, (unsigned int)d.M_expert, d.cta_n, N, K, kb);
+    };
+    // Gather the item's token rows and issue its first K stage. Every
+    // thread's reads of sTok and sNext and of stage buffer 0 for the
+    // previous item precede the last __syncthreads of its K loop or this one.
+    auto start = [&](const Tile& d) {
+        if (t < M_TILE) {
+            const bool live = (d.cta_m_local + (int)t) < d.M_expert;
+            sTok[t] = (sorted_token_ids && live) ? sorted_token_ids[d.cta_m + t] : (int)(d.cta_m + t);
+        }
+        __syncthreads();
+        issue(d, 0, 0);
+        moe_cp_async_commit();
+    };
+
+    if (t == 0) sNext = atomicAdd(next_work, 1);
+    __syncthreads();
+    unsigned int w = sNext;
+    if (w >= work) return;
+    const unsigned int stages = K / PQ2_KS;
+    Tile cur = decode(w);
+    start(cur);
+    while (true) {
+        // Claim the next item now; the K loop's barriers publish it.
+        if (t == 0) sNext = atomicAdd(next_work, 1);
+        PqwAcc acc;
+        #pragma unroll
+        for (int mi = 0; mi < 2; mi++)
+            #pragma unroll
+            for (int i = 0; i < 2 * PQW_NB; i++) acc[mi][i][0] = acc[mi][i][1] = acc[mi][i][2] = acc[mi][i][3] = 0.0f;
+        for (unsigned int st = 0; st < stages; ++st) {
+            const int buf = st % 2;
+            moe_cp_async_wait_all();
+            __syncthreads();   // stage `st` landed; every warp finished stage st-1
+            if (st + 1 < stages) issue(cur, buf ^ 1, (st + 1) * PQ2_KS);
+            moe_cp_async_commit();
+            pqw_mma_stage<GATE_UP>(acc, sA[buf], sAs[buf], sB[buf], sS[buf], warp_id, lane_id);
+        }
+        w = sNext;
+        const Tile done = cur;
+        const bool more = w < work;
+        if (more) {
+            cur = decode(w);
+            start(cur);
+        }
+        pqw_epilogue<GATE_UP>(acc, warp_id, lane_id, done.expert_id, scale2_vals[done.expert_id], done.cta_m,
+            done.cta_m_local, done.M_expert, done.cta_n, N, C, up);
+        if (!more) break;
+    }
+}
+
+// Grid (2 x SMs, 1, 1), 256 threads; arguments as
+// moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w plus the zeroed work
+// counter.
+extern "C" __global__ void __launch_bounds__(256, 2) moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w_persist(
+    PQ2_ARGS,
+    const int* __restrict__ mtile_prefix,
+    const unsigned long long* __restrict__ up_packed_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    unsigned char* __restrict__ out_packed,
+    unsigned char* __restrict__ out_scale,
+    int* __restrict__ next_work
+) {
+    pqp_impl<true>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
+        expert_offsets, sorted_token_ids, num_experts, N, K, mtile_prefix, next_work,
+        PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale});
+}
+
+// Grid (2 x SMs, 1, 1), 256 threads; arguments as
+// moe_w4a4_grouped_gemm_prequant_t_k128w_compact plus the zeroed work counter.
+extern "C" __global__ void __launch_bounds__(256, 2) moe_w4a4_grouped_gemm_prequant_t_k128w_compact_persist(
+    PQ2_ARGS,
+    const int* __restrict__ mtile_prefix,
+    int* __restrict__ next_work
+) {
+    pqp_impl<false>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
+        expert_offsets, sorted_token_ids, num_experts, N, K, mtile_prefix, next_work, PqwGateUp{});
 }
 
 // K-major-weight variant (checkpoint-native [N, K/2] + [N, K/16] scales):

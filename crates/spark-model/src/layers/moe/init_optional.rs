@@ -13,6 +13,9 @@ pub(super) struct OptionalKernels {
     pub(super) moe_w4a4_prequant_t_k128: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k128w: KernelHandle,
     pub(super) moe_w4a4_prequant_gate_up_silu: KernelHandle,
+    /// Persistent CTAs of the K128W handles above when they are the
+    /// `_persist` twins, else 0.
+    pub(super) k128w_persist_ctas: u32,
     pub(super) moe_mtile_prefix_k: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64_compact: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64_vecscale_compact: KernelHandle,
@@ -56,6 +59,12 @@ impl OptionalKernels {
         let k128w = config.model_type == "glm5_next"
             && std::env::var("ATLAS_MOE_PREQUANT_K128").as_deref() == Ok("1")
             && std::env::var("ATLAS_MOE_PREQUANT_K128W").as_deref() != Ok("0");
+        let (t_k128w, gate_up_silu, k128w_persist_ctas) = k128w_kernels(
+            gpu,
+            k128w,
+            std::env::var("ATLAS_MOE_GATE_UP_SILU").as_deref() != Ok("0"),
+            std::env::var("ATLAS_GLM_MOE_PREFILL_PERSIST").as_deref() == Ok("1"),
+        );
         Self {
             moe_grouped_gemm_t_k64_m32: super::super::try_kernel(
                 gpu,
@@ -79,26 +88,9 @@ impl OptionalKernels {
             } else {
                 KernelHandle(0)
             },
-            moe_w4a4_prequant_t_k128w: if k128w {
-                super::super::try_kernel(
-                    gpu,
-                    "moe_w4a16",
-                    "moe_w4a4_grouped_gemm_prequant_t_k128w_compact",
-                )
-            } else {
-                KernelHandle(0)
-            },
-            moe_w4a4_prequant_gate_up_silu: if k128w
-                && std::env::var("ATLAS_MOE_GATE_UP_SILU").as_deref() != Ok("0")
-            {
-                super::super::try_kernel(
-                    gpu,
-                    "moe_w4a16",
-                    "moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w",
-                )
-            } else {
-                KernelHandle(0)
-            },
+            moe_w4a4_prequant_t_k128w: t_k128w,
+            moe_w4a4_prequant_gate_up_silu: gate_up_silu,
+            k128w_persist_ctas,
             moe_mtile_prefix_k: if k128w {
                 super::super::try_kernel(gpu, "moe_w4a16", "moe_mtile_prefix")
             } else {
@@ -311,4 +303,53 @@ impl OptionalKernels {
             ),
         }
     }
+}
+
+/// The K128W down and fused gate/up kernels (gate/up only with `silu`), or
+/// with `persist` (`ATLAS_GLM_MOE_PREFILL_PERSIST=1`) their `_persist`
+/// twins, which write the same bytes, and the CTAs those launch: two per SM,
+/// their `__launch_bounds__` residency. Without the twins the grid kernels
+/// stay and the CTA count is 0.
+fn k128w_kernels(
+    gpu: &dyn GpuBackend,
+    k128w: bool,
+    silu: bool,
+    persist: bool,
+) -> (KernelHandle, KernelHandle, u32) {
+    const DOWN: &str = "moe_w4a4_grouped_gemm_prequant_t_k128w_compact";
+    const GATE_UP: &str = "moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w";
+    let none = KernelHandle(0);
+    if !k128w {
+        return (none, none, 0);
+    }
+    let resolve = |name: &str, suffix: &str| {
+        super::super::try_kernel(gpu, "moe_w4a16", &format!("{name}{suffix}"))
+    };
+    if persist {
+        let down = resolve(DOWN, "_persist");
+        let gate_up = if silu {
+            resolve(GATE_UP, "_persist")
+        } else {
+            none
+        };
+        let ctas = 2 * gpu.sm_count().unwrap_or(0);
+        let ok = down.0 != 0 && (gate_up.0 != 0 || !silu) && ctas > 0;
+        if gpu.op_cache().once("moe:k128w_persist") {
+            if ok {
+                tracing::info!(
+                    "ATLAS_GLM_MOE_PREFILL_PERSIST: persistent K128W prefill, {ctas} CTAs from {} sorted rows",
+                    super::prequant_fp4::K128W_PERSIST_MIN_ROWS
+                );
+            } else {
+                tracing::warn!(
+                    "ATLAS_GLM_MOE_PREFILL_PERSIST=1 ignored: persistent K128W kernels unavailable"
+                );
+            }
+        }
+        if ok {
+            return (down, gate_up, ctas);
+        }
+    }
+    let gate_up = if silu { resolve(GATE_UP, "") } else { none };
+    (resolve(DOWN, ""), gate_up, 0)
 }

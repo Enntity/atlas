@@ -174,6 +174,7 @@ impl MoeLayer {
             moe_w4a4_prequant_t_k128: optional.moe_w4a4_prequant_t_k128,
             moe_w4a4_prequant_t_k128w: optional.moe_w4a4_prequant_t_k128w,
             moe_w4a4_prequant_gate_up_silu: optional.moe_w4a4_prequant_gate_up_silu,
+            k128w_persist_ctas: optional.k128w_persist_ctas,
             moe_mtile_prefix_k: optional.moe_mtile_prefix_k,
             moe_w4a4_prequant_t_k64_compact: optional.moe_w4a4_prequant_t_k64_compact,
             moe_w4a4_prequant_t_k64_vecscale_compact: optional

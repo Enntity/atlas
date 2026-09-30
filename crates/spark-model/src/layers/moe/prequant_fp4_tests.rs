@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::{c3_grouped_shape, c4_grouped_shape, compact_gate_up_worklist_bytes};
+use super::{c3_grouped_shape, c4_grouped_shape, compact_gate_up_worklist_bytes, k128w_schedule};
+use crate::layers::ops::K128wSchedule;
 use atlas_core::config::ModelConfig;
+use spark_runtime::gpu::DevicePtr;
 
 fn glm_config() -> ModelConfig {
     ModelConfig {
@@ -85,4 +87,29 @@ fn c4_shape_does_not_broaden_c3_or_other_models() {
         mutate(&mut config);
         assert!(!c4_grouped_shape(&config, 4, 4));
     }
+}
+
+#[test]
+fn k128w_schedule_is_persistent_only_when_enabled_for_serving_chunks() {
+    let counter = DevicePtr(0x4000);
+    // Off (no persistent kernels): the row-tile grid bound at every size.
+    assert_eq!(
+        k128w_schedule(0, 65536, 288, counter),
+        K128wSchedule::Grid { bound: 1024 + 288 }
+    );
+    // On: 8K-token chunks (65536 rows) and up take the persistent CTAs.
+    for rows in [65536, 131072] {
+        assert_eq!(
+            k128w_schedule(96, rows, 288, counter),
+            K128wSchedule::Persistent {
+                ctas: 96,
+                next_work: counter
+            }
+        );
+    }
+    // On, but a 4K-token chunk stays on the grid, where it measured faster.
+    assert_eq!(
+        k128w_schedule(96, 32768, 288, counter),
+        K128wSchedule::Grid { bound: 512 + 288 }
+    );
 }

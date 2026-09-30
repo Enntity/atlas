@@ -349,7 +349,7 @@ fn main() -> Result<()> {
                         inter,
                         h,
                         r.prefix,
-                        bound,
+                        ops::K128wSchedule::Grid { bound },
                         stream,
                     )
                 },
@@ -379,7 +379,7 @@ fn main() -> Result<()> {
                         h,
                         inter,
                         r.prefix,
-                        bound,
+                        ops::K128wSchedule::Grid { bound },
                         stream,
                     )
                 },
