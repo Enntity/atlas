@@ -305,6 +305,37 @@ pub trait PrefixCache: Send + Sync {
         adapter_id: u64,
     ) -> Option<usize>;
 
+    /// Register a finish leaf (`ATLAS_GLM_PC_FINISH_LEAF`) for exactly
+    /// `tokens` in the index only: a snapshot evicted before any chain
+    /// frontier and never linked into a chain. Returns a snapshot id for the
+    /// caller to free: the leaf it replaces, or `snapshot_id` itself when it
+    /// was not stored (a checkpoint already serves the prefix; the default).
+    fn insert_leaf_snapshot(
+        &self,
+        tokens: &[u32],
+        snapshot_id: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> Option<usize> {
+        let _ = (tokens, session_hash, adapter_id);
+        Some(snapshot_id)
+    }
+
+    /// The turn the finish leaf at exactly `tokens` (if any) was saved for
+    /// has restored it. `keep` turns it into an ordinary checkpoint (that
+    /// turn saves none of its own); otherwise it becomes superseded history.
+    /// Default: no-op.
+    fn settle_leaf_snapshot(&self, tokens: &[u32], adapter_id: u64, keep: bool) {
+        let _ = (tokens, adapter_id, keep);
+    }
+
+    /// Evict one snapshot to make room for a finish leaf, returning its id:
+    /// superseded history or another leaf, never a chain frontier or a branch
+    /// point. Default: `None`.
+    fn evict_snapshot_for_leaf(&self) -> Option<usize> {
+        None
+    }
+
     /// Release ref_counts on blocks that were acquired via `lookup`.
     ///
     /// Called when a sequence finishes. Decrements ref_count on cache

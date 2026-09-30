@@ -16,6 +16,7 @@ mod inner;
 mod snapshot;
 mod snapshot_chain;
 mod snapshot_insert;
+mod snapshot_leaf;
 mod snapshot_stats;
 mod snapshot_tier;
 
@@ -44,7 +45,7 @@ pub(crate) fn hash_token_prefix(tokens: &[u32], count: usize, adapter_id: u64) -
 /// Hash of the empty prefix under `adapter_id` — the fold's starting value.
 /// Split out with [`prefix_hash_push`] so a caller can hash every prefix of
 /// one token run in a single pass (`snapshot_chain::link_chain`).
-pub(crate) fn prefix_hash_seed(adapter_id: u64) -> u64 {
+pub fn prefix_hash_seed(adapter_id: u64) -> u64 {
     let h: u64 = 0xcbf29ce484222325; // FNV-1a basis
     if adapter_id != 0 {
         prefix_hash_push(h, adapter_id)
@@ -54,8 +55,14 @@ pub(crate) fn prefix_hash_seed(adapter_id: u64) -> u64 {
 }
 
 /// Extend a prefix hash by one value (FNV-1a step).
-pub(crate) fn prefix_hash_push(h: u64, v: impl Into<u64>) -> u64 {
+pub fn prefix_hash_push(h: u64, v: impl Into<u64>) -> u64 {
     (h ^ v.into()).wrapping_mul(0x100000001b3)
+}
+
+/// Whether a lookup may match part of a block (`ATLAS_PREFIX_SUBBLOCK`, on
+/// unless `0`). See `RadixTreeInner::walk` for what a partial match reuses.
+pub fn prefix_subblock_enabled() -> bool {
+    std::env::var("ATLAS_PREFIX_SUBBLOCK").as_deref() != Ok("0")
 }
 
 /// Thread-safe radix tree prefix cache.
@@ -254,6 +261,29 @@ impl PrefixCache for RadixTree {
         let displaced = idx.insert(prefix_hash, snapshot_id, session_hash, tokens.len());
         idx.link_chain_if_enabled(tokens, adapter_id, prefix_hash);
         displaced
+    }
+
+    fn insert_leaf_snapshot(
+        &self,
+        tokens: &[u32],
+        snapshot_id: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> Option<usize> {
+        let prefix_hash = hash_token_prefix(tokens, tokens.len(), adapter_id);
+        self.snapshot_index
+            .lock()
+            .insert_leaf(prefix_hash, snapshot_id, session_hash, tokens.len())
+    }
+
+    fn settle_leaf_snapshot(&self, tokens: &[u32], adapter_id: u64, keep: bool) {
+        self.snapshot_index
+            .lock()
+            .settle_leaf(tokens, adapter_id, keep);
+    }
+
+    fn evict_snapshot_for_leaf(&self) -> Option<usize> {
+        self.snapshot_index.lock().evict_for_leaf()
     }
 
     fn release(&self, tokens: &[u32], block_size: usize, adapter_id: u64) {
