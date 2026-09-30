@@ -283,11 +283,13 @@ pub fn w4a16_gemv_tc_ld(
         .launch(stream)
 }
 
-/// Exact-M=5 native-NVFP4 Q/K/V projections in one three-plane launch.
+/// Exact-M=5 native-NVFP4 Q/K/V projections in one three-plane launch;
+/// `touch` swaps in the PDL touch twin (`w4a16_gemv_batch5_qkv_touch`).
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16_gemv_batch5_qkv(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
+    touch: Option<GemvTouch>,
     input: DevicePtr,
     q: &QuantizedWeight,
     k_weight: &QuantizedWeight,
@@ -299,7 +301,7 @@ pub fn w4a16_gemv_batch5_qkv(
     stream: u64,
 ) -> Result<()> {
     debug_assert_eq!(m, 5);
-    KernelLaunch::new(gpu, kernel)
+    let launch = KernelLaunch::new(gpu, touch.map_or(kernel, |t| t.kernel))
         .grid([div_ceil(n, 4), 1, 3])
         .block([256, 1, 1])
         .arg_ptr(input)
@@ -315,8 +317,11 @@ pub fn w4a16_gemv_batch5_qkv(
         .arg_ptr(output)
         .arg_u32(m)
         .arg_u32(n)
-        .arg_u32(k)
-        .launch(stream)
+        .arg_u32(k);
+    match touch.map(|t| t.batch5_qkv_args(n, k)) {
+        Some((rows, ctas)) => launch.arg_u32(rows).arg_u32(ctas).launch(stream),
+        None => launch.launch(stream),
+    }
 }
 
 /// Exact-M=5 pair of same-shape native-NVFP4 projections in one launch.

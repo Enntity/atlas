@@ -155,6 +155,9 @@ impl TransformerModel {
             return Ok(tokens.to_vec());
         }
         let comm = self.comm.as_ref().unwrap();
+        if self.ep_cmd_words_on_host(n) {
+            return self.ep_cmd_words(tokens);
+        }
         let byte_len = n * 4;
         let stream = self.gpu.default_stream();
         let _transfer = self.warm.transfer_span(); // ATLAS_GLM_WARM_TRACE
@@ -356,6 +359,9 @@ impl TransformerModel {
     /// Other ranks receive the value and return it.
     pub(super) fn ep_broadcast_u32(&self, val: u32) -> Result<u32> {
         let comm = self.comm.as_ref().expect("ep_broadcast_u32 without comm");
+        if self.ep_cmd_words_on_host(1) {
+            return Ok(self.ep_cmd_words(&[val])?[0]);
+        }
         let stream = self.gpu.default_stream();
         if comm.rank() == 0 {
             // Sender: H2D + broadcast. Stream ordering ensures completion
@@ -390,7 +396,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF0: prefill start → chunk_len, chunk_start, full_len, then full_len tokens
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
-    /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB: GLM/vision extensions (`impl_a2_ep_worker`)
+    /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
     /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {

@@ -64,6 +64,8 @@ impl Glm5KdaLayer {
         let triple_fits = super::super::ops::dense_gemv_triple_fits(heads as u32, dim as u32);
         let triple =
             |func| super::super::try_kernel_gated(triple_fits, gpu, "dense_gemv_bf16_batchm", func);
+        // ATLAS_GLM_DECODE_GEMV_BATCH: the GEMV touch twins live in this target only.
+        super::super::ops::gemv_touch_resolve(gpu);
         let layer = Self {
             input_norm,
             post_attn_norm,
@@ -80,7 +82,12 @@ impl Glm5KdaLayer {
             lower_bound: config.kda_gate_lower_bound,
             h_state_bytes: heads * dim * dim * 4,
             conv_state_bytes: 3 * heads * dim * config.linear_conv_kernel_dim * 4,
-            rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
+            rms_norm_k: crate::layers::ops::glm_decode_fuse::twin(
+                gpu,
+                crate::layers::ops::glm_decode_fuse::RMS_NORM,
+                gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
+                ("glm_rms_norm_regs", "rms_norm_vanilla_regs"),
+            )?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemv_batchm_k: gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")?,
             dense_gemv_batch5_k: super::super::try_kernel(

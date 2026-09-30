@@ -324,14 +324,19 @@ impl BlockDiffusionDraftHead {
             }
         }
 
+        // One selector record per sequence: gamma tokens, then its draft
+        // confidences when the head reports them (`draft_conf`).
+        let record_bytes = self.draft_record_bytes();
+        let mut records = Vec::new();
         let native = if native_staged
             && (native_authoritative || self.startup.diagnostics.batch_parity || generic_auth)
         {
             ctx.gpu.synchronize(stream)?;
-            let mut raw = vec![0u8; batch_inputs.total_rows() * 4];
-            ctx.gpu.copy_d2h(self.batch_tokens, &mut raw)?;
-            let row_tokens: Vec<u32> = raw
-                .chunks_exact(4)
+            records.resize(n * record_bytes, 0u8);
+            ctx.gpu.copy_d2h(self.batch_tokens, &mut records)?;
+            let row_tokens: Vec<u32> = records
+                .chunks_exact(record_bytes)
+                .flat_map(|record| record.chunks_exact(4).take(self.gamma))
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect();
             Some(batch_inputs.reorder_sampled_rows(&row_tokens)?)
@@ -415,6 +420,13 @@ impl BlockDiffusionDraftHead {
                         .downcast_mut::<DflashProposerState>()
                         .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
                     dstate.last_num_drafted = tokens.len();
+                    dstate.last_draft_conf = records
+                        .chunks_exact(record_bytes)
+                        .nth(i)
+                        .map(|record| {
+                            super::draft_conf::draft_conf(record, self.gamma, tokens.len())
+                        })
+                        .unwrap_or_default();
                 }
                 return Ok(Some(out));
             }

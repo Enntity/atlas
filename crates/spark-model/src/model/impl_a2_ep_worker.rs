@@ -10,6 +10,7 @@
 //! - 0xFFFFFFF7: synchronize vision metadata and BF16 encoder rows
 //! - 0xFFFFFFE1: distributed GLM MTP propose → token, position, drafts, hidden row
 //! - 0xFFFFFFEB: prefill chunk carrying DFlash verify owners (`glm_fused_chunk`)
+//! - 0xFFFFFFEC: serve this rank's half of a split DFlash propose (`draft_assist`)
 
 use anyhow::Result;
 
@@ -43,6 +44,9 @@ impl TransformerModel {
             .comm
             .as_ref()
             .expect("ep_receive_idle_word without comm");
+        if self.ep_cmd_words_on_host(1) {
+            return Ok(self.ep_cmd_words(&[0])?[0]);
+        }
         let stream = self.gpu.default_stream();
         comm.receive_idle_command_word(self.ep_cmd_buf.0)?;
         self.gpu.synchronize(stream)?;
@@ -131,6 +135,9 @@ impl TransformerModel {
         }
         if cmd == super::glm_fused_chunk::EP_CMD_GLM_FUSED_CHUNK {
             return self.glm_fused_receive(seq_id, slots).map(Some);
+        }
+        if cmd == super::draft_assist::EP_CMD_DRAFT_ASSIST {
+            return self.draft_assist_serve().map(Some);
         }
         Ok(None)
     }

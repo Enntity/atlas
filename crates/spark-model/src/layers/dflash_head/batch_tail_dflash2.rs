@@ -112,9 +112,7 @@ impl BlockDiffusionDraftHead {
             .checked_mul(vocab as usize)
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("DFlash selector logits stride overflow"))?;
-        let seq_token_bytes = (gamma as usize)
-            .checked_mul(4)
-            .ok_or_else(|| anyhow::anyhow!("DFlash selector token stride overflow"))?;
+        let seq_token_bytes = self.draft_record_bytes();
         // Anchors and min_tokens ban depths were uploaded beside each other
         // in batch_markov_prev (`batch_ban_depth`).
         let end_ids = crate::traits::EosBan::model_end_ids();

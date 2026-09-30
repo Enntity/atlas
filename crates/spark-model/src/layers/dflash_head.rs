@@ -28,6 +28,7 @@ use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 pub mod conv;
+mod draft_conf;
 mod paged_attn_modules;
 pub mod product_policy;
 pub mod selector;
@@ -324,6 +325,10 @@ pub struct DflashProposerState {
     /// this to know how many KV positions to roll back when the accept
     /// prefix is shorter than γ.
     pub last_num_drafted: usize,
+    /// The selector's confidence in each draft of the last `propose()` (the
+    /// log of the pick's probability among its scored candidates), in draft
+    /// order. Empty when not measured (`draft_conf`).
+    pub last_draft_conf: Vec<f32>,
     /// Whether the prompt-time `precompute_and_store_context_kv` has been
     /// called. The first `propose()` after model build needs to run prefill
     /// over the full prompt's captured hiddens; subsequent steps incrementally
@@ -729,6 +734,10 @@ pub struct BlockDiffusionDraftHead {
     /// process environment. Product heads derive it from the validated
     /// Lightning policy; generic heads keep legacy lenient semantics.
     pub startup: DsparkStartupExecution,
+
+    /// `ATLAS_GLM_DRAFT_TP`: the worker rank reads half of the MLP and head
+    /// rows of a single-sequence propose (`rank_split`). `None` = off.
+    pub rank_split: Option<rank_split::RankSplit>,
 }
 
 mod contract;
@@ -787,6 +796,8 @@ mod nvfp4;
 mod parity_report;
 mod precompute_ctx_kv;
 mod propose;
+pub mod rank_split;
+mod rank_split_forward;
 mod small_m_gemm;
 
 mod context_window;
@@ -918,6 +929,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             block_table: Vec::with_capacity(64),
             seq_len: 0,
             last_num_drafted: 0,
+            last_draft_conf: Vec::new(),
             prefill_done: false,
             ctx_hidden_acc,
             ctx_len: 0,
@@ -965,7 +977,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
         grammar_bitmask: Option<&[i32]>,
         target_hidden_stack: Option<spark_runtime::gpu::DevicePtr>,
     ) -> Result<Vec<u32>> {
-        self.propose_drafts(
+        // ATLAS_GLM_DRAFT_TP: the model announced this propose to the worker,
+        // which walks every swap. However the propose ends, issue them all.
+        let split = self.rank_split_with(ctx.comm, grammar_bitmask.is_some());
+        if let Some((split, _)) = split {
+            split.begin();
+        }
+        let drafts = self.propose_drafts(
             last_token,
             target_hidden,
             position,
@@ -977,7 +995,15 @@ impl DraftProposer for BlockDiffusionDraftHead {
             draft_embed_target,
             grammar_bitmask,
             target_hidden_stack,
-        )
+        );
+        match split.map(|(split, comm)| split.finish(comm, stream)) {
+            Some(Err(drain)) if drafts.is_ok() => Err(drain),
+            _ => drafts,
+        }
+    }
+
+    fn rank_split_ready(&self, comm: &dyn spark_comm::CommBackend, grammar: bool) -> bool {
+        self.rank_split_with(Some(comm), grammar).is_some()
     }
 
     fn propose_batch(

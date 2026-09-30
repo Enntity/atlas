@@ -25,6 +25,7 @@
 
 pub(crate) mod block_mgmt;
 mod block_table_upload;
+mod draft_assist;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
 pub mod glm_c4;
@@ -48,6 +49,7 @@ pub(crate) mod impl_a1;
 pub(crate) mod impl_a1_init;
 mod impl_a1_spec_init;
 pub(crate) mod impl_a2;
+mod impl_a2_cmd_words;
 mod impl_a2_ep_vision;
 mod impl_a2_ep_worker;
 mod impl_a2_seq_lens;

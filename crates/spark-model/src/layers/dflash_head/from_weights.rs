@@ -32,7 +32,7 @@ impl BlockDiffusionDraftHead {
         gpu: &dyn GpuBackend,
         max_seq_len: usize,
         max_batch_size: usize,
-        startup: DsparkStartupExecution,
+        mut startup: DsparkStartupExecution,
     ) -> Result<Self> {
         let embed_tokens_shared = weights
             .embed_tokens
@@ -125,6 +125,11 @@ impl BlockDiffusionDraftHead {
         // `mtp_head.rs` plus the `extern "C" __global__` declarations under
         // `kernels/gb10/common/`.
         let paged_sink = super::paged_attn_modules::paged_sink_modules_for_head_dim(head_dim)?;
+        let (selector_kernel, draft_conf) = super::draft_conf::selector_kernel(
+            gpu,
+            startup.diagnostics.draft_conf && weights.candidate_selector.is_some(),
+        );
+        startup.diagnostics.draft_conf = draft_conf;
         let dense_gemv_tc = dense_gemv_tc_kernels(gpu);
         let kernels = DflashKernels {
             // DFlash drafter uses HF's vanilla RMSNorm convention
@@ -151,9 +156,7 @@ impl BlockDiffusionDraftHead {
             dflash2_conv: gpu
                 .kernel("dflash2_conv", "dflash2_grouped_dynamic_causal_conv")
                 .ok(),
-            dflash2_candidate_selector: gpu
-                .kernel("dflash2_candidate_selector", "dflash2_candidate_selector")
-                .ok(),
+            dflash2_candidate_selector: selector_kernel,
             // Qwen3.6-DFlash uses yarn RoPE — confirmed in the drafter
             // `config.json:rope_scaling.rope_type="yarn"`. Atlas's yarn
             // kernel is `rope::rope_forward_yarn`.
@@ -308,6 +311,10 @@ impl BlockDiffusionDraftHead {
         // pointers at capture, so each lane needs its own. γ rows only for
         // logits (see the per-field note below).
         let selector_bytes = ops::dflash2_selector_scratch_bytes(g);
+        let draft_record_bytes =
+            super::draft_conf::record_bytes(gamma_val, startup.diagnostics.draft_conf);
+        // The selector writes one record at the front of the token buffer.
+        let draft_tokens_bytes = (n_attn * 4).max(draft_record_bytes);
         let make_scratch = |gpu: &dyn GpuBackend| -> Result<DflashScratch> {
             let s = DflashScratch {
                 stream_buf: gpu.alloc(n_attn * hidden_size * bf16)?,
@@ -346,7 +353,7 @@ impl BlockDiffusionDraftHead {
                 // so target-model verify work issued on the same stream can
                 // proceed in parallel.
                 draft_tokens_host_pinned: std::sync::atomic::AtomicPtr::new(
-                    gpu.alloc_host_pinned(gamma_val * 4)?,
+                    gpu.alloc_host_pinned(draft_record_bytes)?,
                 ),
                 draft_tokens_event: gpu.create_event()?,
                 // γ rows only — NOT n_attn. The lm_head GEMM writes M=γ rows,
@@ -354,7 +361,7 @@ impl BlockDiffusionDraftHead {
                 // by ctx offset. Sizing at n_attn×vocab would cost 2.04 GB at
                 // cw=4096 for rows nothing ever touches (γ rows ≈ 8.4 MB).
                 logits: gpu.alloc(g * vocab_size * bf16)?,
-                draft_tokens_dev: gpu.alloc(n_attn * 4)?,
+                draft_tokens_dev: gpu.alloc(draft_tokens_bytes)?,
                 markov_prev_dev: gpu.alloc(MARKOV_PREV_BYTES)?,
                 markov_prev_host_pinned: std::sync::atomic::AtomicPtr::new(
                     gpu.alloc_host_pinned(MARKOV_PREV_BYTES)?,
@@ -386,7 +393,7 @@ impl BlockDiffusionDraftHead {
                 (s.slot_mapping_dev, ctx_window * 8),
                 (s.option_b_indirect_args_dev, 12),
                 (s.logits, g * vocab_size * bf16),
-                (s.draft_tokens_dev, n_attn * 4),
+                (s.draft_tokens_dev, draft_tokens_bytes),
                 (s.markov_prev_dev, MARKOV_PREV_BYTES),
                 (s.position_ids, n_attn * 4),
                 // Also the selector's ticket, which must start at zero.
@@ -449,7 +456,7 @@ impl BlockDiffusionDraftHead {
         // applied to each seq's logits rows 0/1 in the staged tail (#102).
         let batch_grammar_bitmask =
             gpu.alloc(batch_capacity * ops::grammar_bitmask_words(vocab_size as u32) * 4)?;
-        let batch_tokens = gpu.alloc(batch_rows * 4)?;
+        let batch_tokens = gpu.alloc(batch_capacity * draft_record_bytes)?;
         // `[capacity]` anchors, then `[capacity]` banned draft depths.
         let batch_markov_prev = gpu.alloc(batch_capacity * MARKOV_PREV_BYTES)?;
         let batch_markov_embed_bytes = batch_capacity
@@ -535,7 +542,7 @@ impl BlockDiffusionDraftHead {
         gpu.memset(batch_mlp_up, 0, batch_mlp_bytes)?;
         gpu.memset(batch_mlp_down, 0, batch_norm_bytes)?;
         gpu.memset(batch_logits, 0, batch_logits_bytes)?;
-        gpu.memset(batch_tokens, 0, batch_rows * 4)?;
+        gpu.memset(batch_tokens, 0, batch_capacity * draft_record_bytes)?;
         gpu.memset(batch_markov_prev, 0, batch_capacity * MARKOV_PREV_BYTES)?;
         if weights.markov_rank > 0 {
             gpu.memset(batch_markov_embed, 0, batch_markov_embed_bytes)?;
@@ -874,6 +881,7 @@ impl BlockDiffusionDraftHead {
             quant: DflashQuantization::Bf16,
             twins: Default::default(),
             startup,
+            rank_split: None,
         };
 
         tracing::info!(

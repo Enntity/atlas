@@ -145,6 +145,40 @@ impl NcclBackend {
         None
     }
 
+    /// The RDMA pair's host command ring, when `ATLAS_GLM_CMD_RDMA=1` (see
+    /// `rdma_pair::cmd_ring`): the words a message may carry, else 0.
+    pub(super) fn cmd_ring_max_words(&self) -> usize {
+        #[cfg(atlas_rdma_verbs)]
+        if self.rdma.as_ref().and_then(|r| r.cmd()).is_some() {
+            return rdma_pair::cmd_ring::MAX_WORDS;
+        }
+        0
+    }
+
+    /// Send `words` to the peer over the command ring.
+    pub(super) fn cmd_ring_send(&self, words: &[u32]) -> Result<()> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(ring) = self.rdma.as_ref().and_then(|r| r.cmd()) {
+            return ring.send(words);
+        }
+        anyhow::bail!(
+            "no command ring for {} command words (ATLAS_GLM_CMD_RDMA)",
+            words.len()
+        )
+    }
+
+    /// Receive the peer's next `words.len()` words from the command ring.
+    pub(super) fn cmd_ring_recv(&self, words: &mut [u32]) -> Result<()> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(ring) = self.rdma.as_ref().and_then(|r| r.cmd()) {
+            return ring.recv(words);
+        }
+        anyhow::bail!(
+            "no command ring for {} command words (ATLAS_GLM_CMD_RDMA)",
+            words.len()
+        )
+    }
+
     /// Connections to this rank's peers from the initial bootstrap; watch them
     /// to learn when a peer process exits.
     pub fn peer_lifeline(&self) -> &PeerLifeline {
@@ -182,6 +216,12 @@ impl NcclBackend {
                 recv_capacity.next_multiple_of(64),
             )?)
         } else {
+            if rdma_pair::cmd_ring::requested() {
+                tracing::warn!(
+                    "ATLAS_GLM_CMD_RDMA=1 needs the RDMA pair (two ranks, ATLAS_RDMA_ALLREDUCE=1): \
+                     command words stay on NCCL broadcasts"
+                );
+            }
             None
         };
         Ok(rdma)
