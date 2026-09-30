@@ -5,6 +5,10 @@
 #include <cuda_runtime_api.h>
 #include <cstdint>
 
+// The template declaration and the SmemLayoutMG sum below restate NVIDIA's
+// sparse_mla_sm120 sources in FlashInfer (csrc/sparse_mla_sm120_prefill.cu,
+// include/flashinfer/attention/sparse_mla_sm120/; BSD-3-Clause, notice in
+// NATIVE-BRIDGE-NOTICE.txt) so the shim can name the compiled kernel.
 // These types/templates are GLOBAL in the NVIDIA headers, not inside the
 // dispatcher's flashinfer::sparse_mla_sm120 namespace. A complete cold-parameter
 // definition is unnecessary: this shim takes an address and never calls it.

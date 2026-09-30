@@ -30,6 +30,13 @@
 //! with PDL, so the GLM KDA layer resolves them ([`gemv_touch_resolve`]) and
 //! only under `ATLAS_PDL=1` on a PDL target; everywhere else [`gemv_touch`]
 //! returns None and every site launches its original kernel.
+//!
+//! Prior art (docs/glm-prior-art.md): TensorFold's L2 weight touch
+//! (<https://github.com/jayleaton/glm53-tensorfold-spark> patches 0040 and
+//! 0440, the latter prefetching before `griddepcontrol.wait`; Apache-2.0) and
+//! knapcio's `GLM_L2_PREFETCH`; compare mmastrac's arx L2 prefetch during
+//! all-reduce waits. Our twins are discarded byte loads from the kernel's own
+//! CTAs, not a side kernel or `cp.async.bulk.prefetch`. No code copied.
 
 use std::sync::OnceLock;
 

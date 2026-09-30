@@ -6,8 +6,11 @@
 #include <climits>
 #include <cmath>
 #include <cstddef>
-// Declaration matches reference/sparse_mla_sm120_prefill.cu:397-404 verbatim
-// in types and parameter order; bf16 there is the global __nv_bfloat16 alias.
+// Declaration matches sparse_mla_prefill_dispatch in NVIDIA's
+// csrc/sparse_mla_sm120_prefill.cu (FlashInfer; lines 397-404 of the snapshot it
+// was checked against; BSD-3-Clause, NATIVE-BRIDGE-NOTICE.txt; the SparkGLM
+// installer compiles it from FlashInfer 8eccd0c1) verbatim in types and
+// parameter order; bf16 there is the global __nv_bfloat16 alias.
 namespace flashinfer::sparse_mla_sm120 {
 bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page_block_size,
     int topk_extra, int extra_page_block_size, const __nv_bfloat16* Q,

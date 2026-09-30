@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Opt-in, allocation-free bridge to the separately pinned FlashKDA library.
+//! Opt-in, allocation-free bridge to the separately pinned FlashKDA library
+//! (MoonshotAI FlashKDA, <https://github.com/MoonshotAI/FlashKDA> @ 1ce47ea3,
+//! MIT; loaded at run time, not part of this tree).
 use anyhow::{Context, Result, bail, ensure};
 use libloading::Library;
 use spark_runtime::gpu::DevicePtr;

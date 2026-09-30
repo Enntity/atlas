@@ -28,15 +28,15 @@
       "experiment_relative_path": "parity-20260911/sparse-native/native-bridge.cpp",
       "copied_relative_path": "scripts/dev/glm_sparse_native/native-bridge.cpp",
       "experiment_sha256": "8ed4da92415b32a88b605bde22625e47ad3877d6b5e1a4d8295bf7757b31d749",
-      "copied_sha256": "8ed4da92415b32a88b605bde22625e47ad3877d6b5e1a4d8295bf7757b31d749",
-      "change": "none"
+      "copied_sha256": "5f6ee86ff340ee2ae31b6777cc2946bf80f3c6ff65e56441f8f46b2a3246b229",
+      "change": "Origin comment naming the NVIDIA/FlashInfer source (BSD-3-Clause) added; code unchanged"
     },
     {
       "experiment_relative_path": "parity-20260911/sparse-native/native-init.cpp",
       "copied_relative_path": "scripts/dev/glm_sparse_native/native-init.cpp",
       "experiment_sha256": "fdd42e88f39e866dad63109ebbd46f200a596ecf7cba54f3f17eb92bab41eb85",
-      "copied_sha256": "fdd42e88f39e866dad63109ebbd46f200a596ecf7cba54f3f17eb92bab41eb85",
-      "change": "none"
+      "copied_sha256": "44a856bf71361de3da2f0dd15c1fa009e0b5a0de4838f2b6d39c523889c65a32",
+      "change": "Origin comment naming the NVIDIA/FlashInfer source (BSD-3-Clause) added; code unchanged"
     },
     {
       "experiment_relative_path": "parity-20260911/sparse-native/native-prep.cu",
@@ -109,5 +109,5 @@
       "change": "none"
     }
   ],
-  "readme_sha256": "d7d4034595b4c6bd7fd6add26f1470d78657798fea01f9a29d87331516f19437"
+  "readme_sha256": "733c8fc0ab3ab6a646b41a1a4634eab0ce907b8d39ed023aa63eaa4399a80bd7"
 }

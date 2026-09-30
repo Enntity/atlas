@@ -6,6 +6,15 @@
 //! per SSM layer of `(mtp_slots + 1) × num_intermediates` rows of
 //! `kda_record_row_bytes`; replaces the H snapshot pools, which are then
 //! not allocated. Empty otherwise.
+//!
+//! Prior art: fold-record rollback is vLLM's RecoverSSM
+//! (<https://github.com/vllm-project/vllm/pull/51855>, ZJY0516 with
+//! benchislett), which grew out of ReplaySSM
+//! (<https://github.com/vllm-project/vllm/pull/48018>, Johnny-Liou, Dao AI
+//! Lab, NVIDIA), as RiNGSiDE ships it for GLM-5.3 (othexmr, `--use-replayssm`);
+//! Apache-2.0. Our record layout and CUDA kernels (`kda.cu`,
+//! `kda_recurrent_bf16_verify_rec_owners`, `kda_commit_records`) extend the
+//! snapshot-verify kernel; see docs/glm-prior-art.md.
 
 use anyhow::Result;
 use atlas_core::config::ModelConfig;

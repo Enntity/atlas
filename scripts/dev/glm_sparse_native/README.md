@@ -6,9 +6,11 @@ performance result. It contains no weights, compiled objects/libraries, raw mode
 responses, host configuration, or private deployment locators.
 
 `SOURCE_MAP.json` maps every copied source to its experiment-relative path and
-SHA256. Eleven files are byte-identical; the two Python checkers gained
-an SPDX comment, and merge/split copies had an extra trailing blank line removed. No CUDA math, launch geometry, wrapper ABI, or test logic was
-changed during this copy. DeepSeek supplied supervised mechanical prep/split/
+SHA256. Nine files are byte-identical; the two Python checkers gained
+an SPDX comment, merge/split copies had an extra trailing blank line removed,
+and `native-bridge.cpp`/`native-init.cpp` later gained origin comments only.
+No CUDA math, launch geometry, wrapper ABI, or test logic was changed during
+this copy. DeepSeek supplied supervised mechanical prep/split/
 merge drafts; reviewed corrections and wrappers were independently checked.
 Raw assignment receipts remain in the private experiment archive, outside this
 source checkpoint.
@@ -28,6 +30,9 @@ September4. The available copied NVIDIA source snapshot is newer; exact source
 identity for the retained object has not been established. Do not claim that
 this directory rebuilds that object from source. Preserve the verified object
 in the private artifact store to resume; it is intentionally not committed here.
+SparkGLM's installer (`install/build-native.sh`) instead rebuilds the object from
+source at FlashInfer `8eccd0c1`; the retained object's revision is still
+unresolved.
 The enum header is the exact copied NVIDIA declaration needed for the host ABI.
 
 ## Build and mounting
@@ -138,3 +143,7 @@ disclaimer required with redistribution of the linked object. The enum header's
 original first-line copyright intentionally differs from the repository's
 AGPL-first-line convention; preserve the third-party notice if a generic header
 checker flags it. No repository-wide license-check exception was changed here.
+The NVIDIA sparse-MLA SM120 prefill source this links against is BSD-3-Clause
+(Copyright 2026 NVIDIA CORPORATION & AFFILIATES) inside Apache-2.0 FlashInfer
+(https://github.com/flashinfer-ai/flashinfer). Licenses of the built image:
+see Enntity/sparkglm `docs/LICENSING.md`.
