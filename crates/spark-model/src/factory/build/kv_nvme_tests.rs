@@ -19,11 +19,17 @@ fn off_unless_dir_is_set() {
         config_from(Some(" "), None, switches(None, None)).unwrap(),
         None
     );
-    // The switches alone are inert, not an error: arms share a profile.
-    assert_eq!(
-        config_from(None, None, switches(Some("1"), Some("1"))).unwrap(),
-        None
-    );
+    // The switches alone are inert, not an error (arms share a profile) —
+    // and with the tier off they are not read at all, whatever they hold.
+    for (fast, keep) in [
+        (Some("1"), Some("1")),
+        (Some("true"), None),
+        (None, Some("x")),
+    ] {
+        assert_eq!(config_from(None, None, switches(fast, keep)).unwrap(), None);
+    }
+    // … while an inert BUDGET stays an error, switches or not.
+    assert!(config_from(None, Some("40"), switches(Some("1"), None)).is_err());
 }
 
 #[test]
@@ -58,26 +64,37 @@ fn slots_floor_the_budget() {
     assert!(max_slots(4095, 4096).is_err());
 }
 
+/// `(fast, keep)` for [`rank_fingerprint`].
+const OFF: (bool, bool) = (false, false);
+const FAST: (bool, bool) = (true, false);
+const KEEP: (bool, bool) = (false, true);
+
 #[test]
 fn fingerprint_separates_every_field() {
-    let base = rank_fingerprint(10, 4096, false, false);
-    assert_ne!(base, rank_fingerprint(11, 4096, false, false));
-    assert_ne!(base, rank_fingerprint(10, 8192, false, false));
-    assert_ne!(base, rank_fingerprint(10, 4096, true, false));
-    assert_ne!(base, rank_fingerprint(10, 4096, false, true));
+    let base = rank_fingerprint(10, 4096, false, OFF);
+    // A pair started with the fast path on one rank only must not start.
+    let fast = rank_fingerprint(10, 4096, false, FAST);
+    assert_ne!(base, fast);
+    assert_ne!(fast, rank_fingerprint(10, 4096, false, KEEP));
+    assert_ne!(fast, rank_fingerprint(10, 4096, true, OFF));
+    assert_ne!(fast, rank_fingerprint(10, 4096, false, (true, true)));
+    assert_ne!(base, rank_fingerprint(11, 4096, false, OFF));
+    assert_ne!(base, rank_fingerprint(10, 8192, false, OFF));
+    assert_ne!(base, rank_fingerprint(10, 4096, true, OFF));
+    assert_ne!(base, rank_fingerprint(10, 4096, false, KEEP));
     assert_ne!(
-        rank_fingerprint(10, 4096, true, false),
-        rank_fingerprint(10, 4096, false, true)
+        rank_fingerprint(10, 4096, true, OFF),
+        rank_fingerprint(10, 4096, false, KEEP)
     );
     assert_ne!(
-        rank_fingerprint(0, 4096, false, false),
-        rank_fingerprint(0, 4096, true, false)
+        rank_fingerprint(0, 4096, false, OFF),
+        rank_fingerprint(0, 4096, true, OFF)
     );
 }
 
 #[test]
 fn a_failed_rank_fails_every_rank_after_the_exchange() {
-    let fp = rank_fingerprint(10, 4096, false, false);
+    let fp = rank_fingerprint(10, 4096, false, OFF);
     assert!(verify_ranks(Ok(10), fp, &[fp, fp]).is_ok());
     let own = verify_ranks(
         Err(anyhow::anyhow!("bad env")),
@@ -87,7 +104,7 @@ fn a_failed_rank_fails_every_rank_after_the_exchange() {
     assert!(format!("{:#}", own.unwrap_err()).contains("bad env"));
     let peer = verify_ranks(Ok(10), fp, &[fp, FAILED_RANK]).unwrap_err();
     assert!(format!("{peer:#}").contains("rank 1"));
-    let other = rank_fingerprint(11, 4096, false, false);
+    let other = rank_fingerprint(11, 4096, false, OFF);
     assert!(verify_ranks(Ok(10), fp, &[fp, other]).is_err());
     assert_ne!(fp, FAILED_RANK);
 }

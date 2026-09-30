@@ -65,13 +65,16 @@ pub(super) fn config_from(
 ) -> Result<Option<NvmeKvConfig>> {
     let dir = dir.map(str::trim).filter(|s| !s.is_empty());
     let gb = gb.map(str::trim).filter(|s| !s.is_empty());
-    let (fast, keep) = (switch(&fast)?, switch(&keep)?);
     let Some(dir) = dir else {
         if let Some(gb) = gb {
             bail!("{GB_VAR}={gb:?} is set but {DIR_VAR} is not — the budget would be inert");
         }
+        // The two switches only choose HOW the tier moves records. Without
+        // the tier they are not read at all — whatever their value, a rank
+        // starts exactly as it does with them unset ([`attach`] says so).
         return Ok(None);
     };
+    let (fast, keep) = (switch(&fast)?, switch(&keep)?);
     let Some(gb) = gb else {
         bail!("{DIR_VAR} is set: {GB_VAR}=<GiB> (per-rank disk budget) is required");
     };
@@ -137,12 +140,19 @@ pub(super) fn max_slots(budget_bytes: u64, record_bytes: usize) -> Result<u32> {
 /// What every rank must agree on before serving: the KV tier's geometry and
 /// budget plus the SSM tier switch (both gate the rank-agreement collectives
 /// in `model/kv_nvme.rs`, so a mismatch would pair them wrongly → deadlock),
-/// and whether restored records are kept (it changes which blocks the budget
-/// drops, so the ranks' trees would drift apart).
-fn rank_fingerprint(slots: u32, record_bytes: usize, ssm_tier: bool, keep: bool) -> u64 {
+/// whether restored records are kept (it changes which blocks the budget
+/// drops, so the ranks' trees would drift apart), and the I/O path (it sets
+/// the staging reserve, and a write failure reaches the tree at a different
+/// time on each path — ranks on different paths are not one configuration).
+fn rank_fingerprint(
+    slots: u32,
+    record_bytes: usize,
+    ssm_tier: bool,
+    (fast, keep): (bool, bool),
+) -> u64 {
     atlas_tier::hash::mix64(
         atlas_tier::hash::mix64(slots as u64, record_bytes as u64),
-        ssm_tier as u64 + 1 + 2 * keep as u64,
+        ssm_tier as u64 + 1 + 2 * keep as u64 + 4 * fast as u64,
     )
 }
 
@@ -161,6 +171,16 @@ pub(super) fn attach(
     comm: Option<&dyn spark_comm::CommBackend>,
 ) -> Result<()> {
     let cfg = config_from_env();
+    if matches!(cfg, Ok(None)) {
+        for var in [FAST_VAR, KEEP_VAR] {
+            if std::env::var(var).is_ok_and(|v| !matches!(v.trim(), "" | "0")) {
+                tracing::warn!(
+                    "{var} is set but {DIR_VAR} is not: the NVMe prefix tier is off and {var} \
+                     has no effect"
+                );
+            }
+        }
+    }
     let ssm_tier = std::env::var_os("ATLAS_SSM_TIER").is_some();
     attach_with(cfg, ssm_tier, kv_cache, prefix_cache, gpu, comm)
 }
@@ -180,14 +200,17 @@ fn attach_with(
 ) -> Result<()> {
     let rank = comm.map_or(0, |c| c.rank());
     let record = kv_cache.nvme_record_bytes();
-    let keep = matches!(&cfg, Ok(Some(c)) if c.keep);
+    let switches = match &cfg {
+        Ok(Some(c)) => (c.fast, c.keep),
+        _ => (false, false),
+    };
     let local = cfg.and_then(|cfg| setup_local(cfg, rank, record, kv_cache, prefix_cache, gpu));
     // Every multi-rank world exchanges (one 8-byte all-gather at startup),
     // prefix caching or not: the condition must not depend on anything that
     // can differ per rank, or the collective itself would pair up wrongly.
     if let Some(comm) = comm.filter(|c| c.world_size() > 1) {
         let fp = match &local {
-            Ok(slots) => rank_fingerprint(*slots, record, ssm_tier, keep),
+            Ok(slots) => rank_fingerprint(*slots, record, ssm_tier, switches),
             Err(_) => FAILED_RANK,
         };
         let all = super::glm::gather_u64(comm, gpu, fp)?;
@@ -206,7 +229,7 @@ fn verify_ranks(local: Result<u32>, fp: u64, all: &[u64]) -> Result<()> {
     ensure!(
         all.iter().all(|&v| v == fp),
         "spill-tier config differs across ranks (fingerprints {all:x?}); set identical \
-         {DIR_VAR}/{GB_VAR}/ATLAS_SSM_TIER on every rank"
+         {DIR_VAR}/{GB_VAR}/{FAST_VAR}/{KEEP_VAR}/ATLAS_SSM_TIER on every rank"
     );
     Ok(())
 }
