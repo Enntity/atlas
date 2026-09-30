@@ -379,6 +379,31 @@ pub trait PrefixCache: Send + Sync {
         false
     }
 
+    /// The resident, exact-prefix (non-tail) snapshot registered at exactly
+    /// `depth` tokens of `tokens`, without touching the radix tree. Used when
+    /// ranks must agree on one restore depth (`ATLAS_GLM_PC_EVICT` /
+    /// `ATLAS_GLM_PC_BRANCH`). Default: `None`.
+    fn snapshot_at(&self, tokens: &[u32], depth: usize, adapter_id: u64) -> Option<usize> {
+        let _ = (tokens, depth, adapter_id);
+        None
+    }
+
+    /// Whether the cached block path through `tokens[..depth]` (block-aligned)
+    /// continues with a block other than this request's next one: another
+    /// request diverged from it exactly at `depth`. Rank-local; used to place
+    /// branch-point checkpoints (`ATLAS_GLM_PC_BRANCH`). Default: `false`.
+    fn forks_at(&self, tokens: &[u32], depth: usize, block_size: usize, adapter_id: u64) -> bool {
+        let _ = (tokens, depth, block_size, adapter_id);
+        false
+    }
+
+    /// Mark the snapshot registered for exactly `tokens` as a branch point
+    /// (a prefix shared by diverging requests), which chain-aware eviction
+    /// never treats as superseded. Default: no-op.
+    fn mark_branch_snapshot(&self, tokens: &[u32], adapter_id: u64) {
+        let _ = (tokens, adapter_id);
+    }
+
     /// Number of SSM snapshots currently stored in the snapshot index.
     fn snapshot_count(&self) -> usize;
 

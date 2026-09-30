@@ -233,6 +233,38 @@ impl RadixTreeInner {
         (matched_blocks, matched_disk, matched_tokens)
     }
 
+    /// Whether the live cached path through the block-aligned prefix
+    /// `tokens[..depth]` continues with a full block other than
+    /// `tokens[depth..depth + block_size]`, i.e. another request diverged
+    /// from this one exactly there. Read-only (no refs, no recency).
+    pub(super) fn forks_at(
+        &self,
+        tokens: &[u32],
+        depth: usize,
+        block_size: usize,
+        adapter_id: u64,
+    ) -> bool {
+        let (Some(mut current), Some(ours)) = (
+            self.root_for_read(adapter_id),
+            tokens.get(depth..depth + block_size),
+        ) else {
+            return false;
+        };
+        if block_size == 0 || !depth.is_multiple_of(block_size) {
+            return false;
+        }
+        for chunk in tokens[..depth].chunks_exact(block_size) {
+            match self.nodes[current].children.get(chunk) {
+                Some(&child) if self.nodes[child].ref_count > 0 => current = child,
+                _ => return false,
+            }
+        }
+        self.nodes[current]
+            .children
+            .iter()
+            .any(|(key, &child)| key.as_slice() != ours && self.nodes[child].ref_count > 0)
+    }
+
     /// Increment ref_count on all nodes along the matched path.
     pub(super) fn inc_refs(
         &mut self,
