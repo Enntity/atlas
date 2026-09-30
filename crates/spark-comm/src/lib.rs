@@ -60,6 +60,28 @@ pub trait CommBackend: Send + Sync {
         self.broadcast(ptr, 4, 0)
     }
 
+    /// Words one [`Self::send_command_words`] / [`Self::recv_command_words`]
+    /// call may carry between the two ranks' hosts, or 0 when the backend has
+    /// no host command channel. It depends only on configuration the ranks
+    /// agree on at startup, so both take the same path for a given count.
+    fn command_words_max(&self) -> usize {
+        0
+    }
+
+    /// Send command words to the other rank's host, in order behind every
+    /// earlier call and on no stream: the peer reads them with
+    /// [`Self::recv_command_words`] without a device kernel, a stream sync or
+    /// a copy back. At most [`Self::command_words_max`] words, at least one.
+    fn send_command_words(&self, _words: &[u32]) -> Result<()> {
+        anyhow::bail!("command words are not supported by this CommBackend")
+    }
+
+    /// Receive the peer's next `words.len()` command words, waiting for them
+    /// (a worker waits here for its next command, however long that takes).
+    fn recv_command_words(&self, _words: &mut [u32]) -> Result<()> {
+        anyhow::bail!("command words are not supported by this CommBackend")
+    }
+
     /// Barrier: block until all ranks reach this point.
     fn barrier(&self) -> Result<()>;
 
@@ -333,6 +355,17 @@ mod tests {
         assert_eq!(comm.capturable_all_reduce_max_bytes(), 0);
         comm.set_oneshot_kernel(0x1234);
         assert_eq!(comm.capturable_all_reduce_max_bytes(), 0);
+    }
+
+    #[test]
+    fn command_words_default_to_unavailable() {
+        // The contract the model's command path relies on: a backend without
+        // a host command channel reports no capacity and moves nothing, so
+        // every word stays on the broadcast path.
+        let comm = SingleGpuBackend;
+        assert_eq!(comm.command_words_max(), 0);
+        assert!(comm.send_command_words(&[1]).is_err());
+        assert!(comm.recv_command_words(&mut [0]).is_err());
     }
 
     #[test]
