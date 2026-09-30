@@ -366,8 +366,7 @@ impl TransformerModel {
             p.ids.len(),
             p.total()
         );
-        // As after an ordinary chunk (`prefill_chunk_entry`).
-        crate::layers::qwen3_attention::check_index_split_rows(self.gpu.as_ref(), stream)?;
+        self.check_index_split_rows(stream)?;
         Ok((logits, p.ids))
     }
 

@@ -273,7 +273,7 @@ pub fn prefill_request(
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
         model.ep_broadcast_tokens(&prompt_tokens)?;
 
-        let logits = model.prefill(&prompt_tokens, &mut seq, 0)?;
+        let logits = prefill_preempt::or_end_pair(model.prefill(&prompt_tokens, &mut seq, 0))?;
         // #131: constrain the FIRST token with the grammar too (and advance
         // the matcher). The plain decode loop only masks/accepts tokens 2..N,
         // so without this a leading prose token escapes before the grammar's

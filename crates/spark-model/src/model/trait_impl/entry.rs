@@ -29,6 +29,12 @@ impl TransformerModel {
         *self.vision_slice_rows.lock() = slice_rows;
     }
 
+    /// `ATLAS_GLM_INDEX_SPLIT`: where a prefill command ends on this rank,
+    /// fail it if the peer's selected rows had to be clamped.
+    pub(in crate::model) fn check_index_split_rows(&self, stream: u64) -> Result<()> {
+        crate::layers::qwen3_attention::check_index_split_rows(self.gpu.as_ref(), stream)
+    }
+
     pub(super) fn prefill_entry(
         &self,
         tokens: &[u32],
@@ -41,6 +47,7 @@ impl TransformerModel {
         (|| {
             let logits = self.prefill_dispatch(tokens, seq, stream)?;
             self.try_eager_drafter_prefill(seq, true, stream)?;
+            self.check_index_split_rows(stream)?;
             Ok(logits)
         })()
     }
@@ -73,8 +80,7 @@ impl TransformerModel {
                 stream,
             )?;
             self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
-            // `ATLAS_GLM_INDEX_SPLIT`: the peer's selected rows were in range.
-            crate::layers::qwen3_attention::check_index_split_rows(self.gpu.as_ref(), stream)?;
+            self.check_index_split_rows(stream)?;
             Ok(logits)
         })()
     }
@@ -96,6 +102,7 @@ impl TransformerModel {
         (|| {
             let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
             self.try_eager_drafter_prefill(seq, true, stream)?;
+            self.check_index_split_rows(stream)?;
             Ok(logits)
         })()
     }

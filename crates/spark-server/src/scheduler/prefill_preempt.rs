@@ -19,8 +19,16 @@
 //! split half (`prefill_b.rs`: tokens appended, recurrent state advanced to
 //! the cut). `seq.seq_len` records it on both ranks, so every attempt starts
 //! there ([`resume_point`]) instead of running that half twice.
+//!
+//! One chunk error is not a request failure at all ([`or_end_pair`]): a peer
+//! whose index-split rows were out of range is desynchronized, and this rank
+//! has cached blocks computed from the guarded selection. The worker exits on
+//! any step error; the head stops here too, as for a decode step error
+//! (`preempt::decode_batch_with_preemption`), before any other request can
+//! look that cache up.
 
 use anyhow::Result;
+use spark_model::layers::qwen3_attention::index_split_peer_fault;
 use spark_model::model::kv_admission::kv_admission_refusal;
 use spark_model::traits::{Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
@@ -37,6 +45,26 @@ pub(super) fn resume_point(offset: usize, end: usize, seq_len: usize) -> Result<
         "prefill progress {seq_len} lies outside chunk {offset}..{end}"
     );
     Ok(seq_len)
+}
+
+/// Whether a chunk error leaves the pair unable to continue: the typed peer
+/// fault, never an error that merely reads like it.
+pub(super) fn ends_the_pair(e: &anyhow::Error) -> bool {
+    index_split_peer_fault(e).is_some()
+}
+
+/// A chunk's result as the model returned it, unless its error ends the
+/// pair: then this rank stops right here. Nothing may run first, since the
+/// next prefix lookup could reuse the chunk's blocks; the peer's lifeline
+/// takes it down with us and a supervisor restarts the pair.
+pub(super) fn or_end_pair<T>(chunk: Result<T>) -> Result<T> {
+    if let Err(e) = &chunk
+        && ends_the_pair(e)
+    {
+        eprintln!("EP head: {e:#}; terminating (the peer exits with us)");
+        crate::ep_peer_lifeline::terminate();
+    }
+    chunk
 }
 
 /// Send (EP) and run the prompt chunk `[offset, end)`, killing the largest
@@ -117,5 +145,5 @@ fn send_and_run(
     model.ep_broadcast_cmd(start as u32)?;
     model.ep_broadcast_cmd(prompt.len() as u32)?;
     model.ep_broadcast_tokens(prompt)?;
-    model.prefill_chunk(prompt, seq, start, end - start, is_last, stream)
+    or_end_pair(model.prefill_chunk(prompt, seq, start, end - start, is_last, stream))
 }

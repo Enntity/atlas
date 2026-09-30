@@ -304,12 +304,12 @@ pub(super) fn continue_in_progress_prefills(
                 p.prompt_tokens.len(),
                 max_prefill_tokens,
             );
-            match model.prefill_twophase(
+            match super::prefill_preempt::or_end_pair(model.prefill_twophase(
                 &p.prompt_tokens,
                 &mut p.seq,
                 max_prefill_tokens,
                 prefill_stream,
-            ) {
+            )) {
                 Ok(logits) => {
                     p.chunk_offset = p.prompt_tokens.len();
                     let _ = model.record_event(prefill_event, prefill_stream);

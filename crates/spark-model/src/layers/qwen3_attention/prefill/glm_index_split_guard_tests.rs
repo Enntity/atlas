@@ -224,7 +224,11 @@ fn clamped_ids_fail_the_chunk_naming_the_peer_and_the_next_chunk_starts_clean() 
         // As the kernel leaves the count after clamping three ids.
         let count = counter(ctx.gpu).unwrap();
         gpu.copy_h2d(&3u32.to_le_bytes(), count).unwrap();
-        let msg = format!("{:#}", check_index_split_rows(ctx.gpu, 7).unwrap_err());
+        let e = check_index_split_rows(ctx.gpu, 7).unwrap_err();
+        // Typed, so the head can tell it from an ordinary chunk failure.
+        let e = e.context("prefill_chunk failed");
+        assert_eq!(index_split_peer_fault(&e).map(|f| f.clamped), Some(3));
+        let msg = format!("{e:#}");
         assert!(
             msg.contains(
                 "the peer's index-split rows held 3 out-of-range token ids (a desynchronized peer)"

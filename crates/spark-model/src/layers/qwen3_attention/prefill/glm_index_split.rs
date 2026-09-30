@@ -38,7 +38,7 @@ use crate::layers::glm_sp;
 mod check;
 #[path = "glm_index_split_guard.rs"]
 mod guard;
-pub use guard::check_index_split_rows;
+pub use guard::{IndexSplitPeerFault, check_index_split_rows, index_split_peer_fault};
 
 /// Owners below this many rows stay replicated (verify, short appends): the
 /// two exchanges' fixed cost outweighs the halved selection.

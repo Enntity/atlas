@@ -351,7 +351,7 @@ pub(super) fn resume_preempted_seq(model: &dyn Model, p: PreemptedSeq) -> Result
         model.ep_broadcast_cmd(0)?;
         model.ep_broadcast_cmd(tokens.len() as u32)?;
         model.ep_broadcast_tokens(&tokens)?;
-        model.prefill(&tokens, &mut seq, 0)?;
+        super::prefill_preempt::or_end_pair(model.prefill(&tokens, &mut seq, 0))?;
         Ok(())
     })();
     if let Err(e) = prefill_result {

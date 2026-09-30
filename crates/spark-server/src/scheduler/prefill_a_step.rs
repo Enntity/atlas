@@ -379,14 +379,14 @@ pub fn start_chunked_prefill(
         model.ep_broadcast_tokens(&prompt_tokens)?;
 
         let _pt0 = std::time::Instant::now();
-        let chunk_res = model.prefill_chunk(
+        let chunk_res = super::prefill_preempt::or_end_pair(model.prefill_chunk(
             &prompt_tokens,
             &mut seq,
             0,
             chunk_len,
             is_last,
             prefill_stream,
-        );
+        ));
         if std::env::var("ATLAS_VISION_TIMING").is_ok() {
             let _ = model.synchronize(prefill_stream);
             tracing::info!(

@@ -18,7 +18,9 @@ mod cache_skip_qkv;
 mod cache_skip_v4;
 mod glm_index;
 mod glm_index_split;
-pub use glm_index_split::{agree_index_split, check_index_split_rows};
+pub use glm_index_split::{
+    IndexSplitPeerFault, agree_index_split, check_index_split_rows, index_split_peer_fault,
+};
 mod paged;
 mod paged_attn;
 mod paged_attn_batched;

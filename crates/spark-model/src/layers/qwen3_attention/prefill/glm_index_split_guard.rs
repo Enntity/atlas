@@ -18,9 +18,17 @@
 //! is a tighter bound, but memory safety does not need it.
 //!
 //! The guard never waits for the device. [`check_index_split_rows`] reads the
-//! count where the chunk's command ends and fails the chunk on this rank:
-//! every collective of the command is on the stream by then, so a rank that
-//! fails alone leaves its peer nothing to wait for.
+//! count where the chunk's command ends and fails the chunk on this rank with
+//! an [`IndexSplitPeerFault`]: every collective of the command is on the
+//! stream by then, so a rank that fails alone leaves its peer nothing to wait
+//! for. The fault ends the pair: the worker exits on any step error, and the
+//! head's scheduler stops the rank on this one before another request can
+//! reuse what the chunk cached.
+//!
+//! "Rows were guarded since the last check" is a thread-local flag. The
+//! exchange runs inside the chunk's layer loop, which the command's entry
+//! point calls synchronously, and the check is in that same entry point: one
+//! call stack, so one thread.
 
 use std::cell::Cell;
 
@@ -38,6 +46,30 @@ thread_local! {
     /// Whether the chunk this thread is running has guarded rows since the
     /// last check.
     static PENDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The peer's index-split rows held `clamped` out-of-range token ids, so the
+/// ranks are desynchronized and the pair cannot continue.
+#[derive(Debug)]
+pub struct IndexSplitPeerFault {
+    pub clamped: u32,
+}
+
+impl std::fmt::Display for IndexSplitPeerFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ATLAS_GLM_INDEX_SPLIT: the peer's index-split rows held {} out-of-range token ids (a desynchronized peer); each was clamped to unselected, so nothing was read out of range",
+            self.clamped
+        )
+    }
+}
+
+impl std::error::Error for IndexSplitPeerFault {}
+
+/// The peer fault `e` carries, if any.
+pub fn index_split_peer_fault(e: &anyhow::Error) -> Option<&IndexSplitPeerFault> {
+    e.downcast_ref()
 }
 
 /// The backend's count of clamped ids (a `u32`).
@@ -79,7 +111,8 @@ pub(super) fn clamp(
 }
 
 /// Call on every rank where a prefill chunk's command ends, once all of its
-/// work is on `stream`: fails the chunk if the guard clamped an id in it.
+/// work is on `stream`: fails the chunk with an [`IndexSplitPeerFault`] if
+/// the guard clamped an id in it.
 /// A chunk that exchanged no rows reads nothing. One that did waits for
 /// `stream` here instead of at the next command's broadcast or the first
 /// token's sampling, which is the next thing either rank does.
@@ -90,10 +123,7 @@ pub fn check_index_split_rows(gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
     let mut clamped = [0u8; 4];
     gpu.copy_d2h_on_stream(counter(gpu)?, &mut clamped, stream)?;
     let clamped = u32::from_le_bytes(clamped);
-    ensure!(
-        clamped == 0,
-        "ATLAS_GLM_INDEX_SPLIT: the peer's index-split rows held {clamped} out-of-range token ids (a desynchronized peer); each was clamped to unselected, so nothing was read out of range"
-    );
+    ensure!(clamped == 0, IndexSplitPeerFault { clamped });
     Ok(())
 }
 

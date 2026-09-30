@@ -3,8 +3,9 @@
 //! `prefill_chunk_with_preemption`: the head's side of the agreed KV-refusal
 //! retry, driven against the scripted stub, asserted on the EP wire.
 
-use super::super::prefill_preempt::{prefill_chunk_with_preemption, resume_point};
+use super::super::prefill_preempt::{ends_the_pair, prefill_chunk_with_preemption, resume_point};
 use super::*;
+use spark_model::layers::qwen3_attention::IndexSplitPeerFault;
 use spark_model::model::kv_admission::kv_admission_refusal;
 
 const CHUNK: u32 = 0xFFFFFFF0;
@@ -121,4 +122,36 @@ fn progress_outside_the_chunk_sends_nothing() {
     assert!(run(&model, &mut seq, &mut Vec::new()).is_err());
     assert!(model.wire.lock().unwrap().is_empty());
     assert!(model.chunk_calls.lock().unwrap().is_empty());
+}
+
+/// The peer's index-split rows were out of range: the one chunk error that
+/// ends the pair, recognised by its type through any context.
+#[test]
+fn only_the_typed_peer_fault_ends_the_pair() {
+    let fault = || anyhow::Error::new(IndexSplitPeerFault { clamped: 3 });
+    assert!(ends_the_pair(&fault()));
+    assert!(ends_the_pair(&fault().context("prefill_chunk failed")));
+    // The same words without the type, and every error that fails only its
+    // request: an agreed refusal, an ordinary chunk error.
+    assert!(!ends_the_pair(&anyhow::anyhow!("{}", fault())));
+    let refusal = |retryable| KvAdmissionRefused {
+        by_peer: true,
+        retryable,
+    };
+    assert!(!ends_the_pair(&anyhow::Error::new(refusal(true))));
+    assert!(!ends_the_pair(&anyhow::Error::new(refusal(false))));
+    assert!(!ends_the_pair(&anyhow::anyhow!("KV cache exhausted")));
+}
+
+/// An ordinary chunk error still reaches the caller, which fails the request.
+#[test]
+fn an_ordinary_chunk_error_does_not_end_the_pair() {
+    let model = PreemptStubModel {
+        hard_error: Some("Prefill chunk layer 3 failed"),
+        ..Default::default()
+    };
+    let (_, mut seq) = prefilling();
+    let e = run(&model, &mut seq, &mut Vec::new()).unwrap_err();
+    assert!(!ends_the_pair(&e));
+    assert_eq!(*model.wire.lock().unwrap(), vec![CHUNK, 24, 16, 40]);
 }

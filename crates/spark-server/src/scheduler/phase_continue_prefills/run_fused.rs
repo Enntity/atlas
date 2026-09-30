@@ -101,7 +101,7 @@ pub(super) fn try_fused_chunk(
         verify_ctx,
         spec.dflash_verify_raw_argmax,
         &mut |rows, tokens, seqs| {
-            let (logits, ids) = model.prefill_chunk_with_glm_owner_rows(
+            let chunk = model.prefill_chunk_with_glm_owner_rows(
                 &p.prompt_tokens,
                 &mut p.seq,
                 p.chunk_offset,
@@ -109,7 +109,8 @@ pub(super) fn try_fused_chunk(
                 rows,
                 tokens,
                 seqs,
-            )?;
+            );
+            let (logits, ids) = super::super::prefill_preempt::or_end_pair(chunk)?;
             chunk_ran = true;
             p.chunk_offset += chunk_len;
             if let Err(e) = super::super::prefill_normalization::continuation(model, &p.seq, stream)
