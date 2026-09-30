@@ -2,7 +2,8 @@
 //! KDA Lt FP8 projection (`cublaslt::fp8_gemm_act_weight_t_tensorwise`,
 //! N = K = 4096) per chunk row count: cuBLASLt's default heuristic vs the
 //! split-K 1 pin (`no_split_k`, `ATLAS_GLM_KDA_PREFILL_LT_FP8_SPLITK1=1`).
-//! Cold-L2 ms per call and `=N` differing BF16 outputs (0 where the default
+//! Cold-L2 ms per call (median of CUDA-event-bracketed reps, each after its
+//! own 64 MiB memset) and `=N` differing BF16 outputs (0 where the default
 //! already runs without split-K).
 //!
 //! Run:
@@ -10,13 +11,16 @@
 //!   ATLAS_TARGET_QUANT=nvfp4 cargo run -p spark-model --release \
 //!     --features cuda,gpu-examples --example fp8_lt_splitk_bench
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use spark_runtime::cublaslt::fp8_gemm_act_weight_t_tensorwise as lt;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
-use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
-const FLUSH: usize = 64 << 20;
-const REPS: u32 = 10;
+#[allow(dead_code)]
+#[path = "moe_verify_bench/timing.rs"]
+mod timing;
+
+const FLUSH_BYTES: usize = 64 << 20;
 
 fn main() -> Result<()> {
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
@@ -38,27 +42,17 @@ fn main() -> Result<()> {
         g.alloc(max_m as usize * n as usize * 2)?,
         g.alloc(max_m as usize * n as usize * 2)?,
     );
-    let flush = g.alloc(FLUSH)?;
+    let timer = timing::Timer {
+        stream: 0,
+        scratch: g.alloc(FLUSH_BYTES)?,
+        reps: 15,
+    };
     let (a_bytes, w_bytes) = bytes.split_at(max_m as usize * k as usize);
     g.copy_h2d(a_bytes, act)?;
     g.copy_h2d(w_bytes, weight)?;
-    let wall = |f: &dyn Fn() -> Result<()>, op: bool| -> Result<f64> {
-        let t0 = std::time::Instant::now();
-        for _ in 0..REPS {
-            g.memset_async(flush, 0, FLUSH, 0)?;
-            if op {
-                f()?;
-            }
-        }
-        g.synchronize(0)?;
-        Ok(t0.elapsed().as_secs_f64() / f64::from(REPS))
-    };
-    let time = |f: &dyn Fn() -> Result<()>| -> Result<f64> {
-        f()?;
-        g.synchronize(0)?;
-        Ok((wall(f, true)? - wall(f, false)?).max(1e-9))
-    };
-    let read = |p: spark_runtime::gpu::DevicePtr, count: usize| -> Result<Vec<u8>> {
+    let time =
+        |f: &dyn Fn() -> Result<()>| -> Result<f64> { Ok(timer.time(g, true, &|_| f())? * 1e-6) };
+    let read = |p: DevicePtr, count: usize| -> Result<Vec<u8>> {
         let mut b = vec![0u8; count * 2];
         g.copy_d2h(p, &mut b)?;
         Ok(b)

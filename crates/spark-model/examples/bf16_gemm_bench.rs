@@ -4,22 +4,27 @@
 //! `spark_runtime::cutlass::bf16_gemm_tuned` vs `dense_gemm_bf16_pipelined`
 //! (KDA's small projections, and their beta|f_a|g_a triple), plus the
 //! head-batched MLA absorb / V-up GEMMs (cuBLASLt vs CUTLASS batched).
-//! Timings are cold-L2: each call follows a 64 MiB memset, whose own time is
-//! subtracted. `=N` counts BF16 outputs that differ from the reference
-//! (cuBLASLt for CUTLASS, cfg9 for the pipelined kernel, three pipelined
-//! launches for the triple); 0 means bit-identical.
+//! Timings are cold-L2: every rep follows its own 64 MiB memset and is
+//! bracketed by CUDA events; the median is reported. `=N` counts BF16 outputs
+//! that differ from the reference (cuBLASLt for CUTLASS, cfg9 for the
+//! pipelined kernel, three pipelined launches for the triple); 0 means
+//! bit-identical.
 //!
 //! Run:
 //!   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=glm-5.3-flash \
 //!   ATLAS_TARGET_QUANT=nvfp4 cargo run -p spark-model --release \
 //!     --features cuda,gpu-examples --example bf16_gemm_bench
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use half::bf16;
 use spark_model::layers::ops;
 use spark_model::weight_map::DenseWeight;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+
+#[allow(dead_code)]
+#[path = "moe_verify_bench/timing.rs"]
+mod timing;
 
 /// Rows (`BF16_BENCH_M` overrides, e.g. 8196 for an 8K prefill chunk).
 fn rows() -> u32 {
@@ -41,8 +46,7 @@ const SHAPES: [(&str, u32, u32); 10] = [
     ("shared g [2048 x 4096]", 2048, 4096),
     ("shared d [4096 x 2048]", 4096, 2048),
 ];
-const FLUSH: usize = 64 << 20;
-const REPS: u32 = 10;
+const FLUSH_BYTES: usize = 64 << 20;
 
 fn main() -> Result<()> {
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
@@ -62,24 +66,14 @@ fn main() -> Result<()> {
             .collect();
         g.copy_h2d(&bytes, p)
     };
-    let flush = g.alloc(FLUSH)?;
-    let wall = |f: &dyn Fn() -> Result<()>, op: bool| -> Result<f64> {
-        let t0 = std::time::Instant::now();
-        for _ in 0..REPS {
-            g.memset_async(flush, 0, FLUSH, 0)?;
-            if op {
-                f()?;
-            }
-        }
-        g.synchronize(0)?;
-        Ok(t0.elapsed().as_secs_f64() / f64::from(REPS))
+    let timer = timing::Timer {
+        stream: 0,
+        scratch: g.alloc(FLUSH_BYTES)?,
+        reps: 15,
     };
     // Cold-L2 seconds per call.
-    let time = |f: &dyn Fn() -> Result<()>| -> Result<f64> {
-        f()?;
-        g.synchronize(0)?;
-        Ok((wall(f, true)? - wall(f, false)?).max(1e-9))
-    };
+    let time =
+        |f: &dyn Fn() -> Result<()>| -> Result<f64> { Ok(timer.time(g, true, &|_| f())? * 1e-6) };
     let bits = |p: DevicePtr, count: usize| -> Result<Vec<u16>> {
         let mut b = vec![0u8; count * 2];
         g.copy_d2h(p, &mut b)?;
@@ -117,7 +111,8 @@ fn main() -> Result<()> {
             }
         }
         if n <= 128 || k == 128 {
-            // KDA's pipelined kernel against CUTLASS cfg9 (left in c2).
+            // KDA's pipelined kernel (into c) against CUTLASS cfg9 (into c2).
+            spark_runtime::cutlass::bf16_gemm_tuned(a.0, w.0, c2.0, M, n, k, k, n, 9, 0)?;
             let weight = DenseWeight { weight: w };
             let run = || ops::dense_gemm_bf16_pipelined(g, pipelined, a, &weight, c, M, n, k, 0);
             let t = time(&run)?;
