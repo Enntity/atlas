@@ -6,6 +6,44 @@ fn sparse_ep_reduce_enabled(ep_world_size: usize, has_comm: bool, has_kernel: bo
     ep_world_size > 1 && has_comm && has_kernel
 }
 
+/// Whether `ATLAS_GLM_MOE_UNPERMUTE_VEC=1` may take the 16-byte-access EP
+/// reduce: its threads own 8 columns and it holds at most 8 routes a token.
+fn unpermute_vec_eligible(flag: bool, hidden_size: usize, top_k: usize) -> bool {
+    flag && hidden_size.is_multiple_of(8) && top_k <= 8
+}
+
+/// The EP unpermute-reduce kernel: `moe_unpermute_reduce_indexed_ep`, or its
+/// `_vec8` twin (same launch, same bytes) where eligible and shipped.
+pub(super) fn unpermute_ep_kernel(
+    gpu: &dyn GpuBackend,
+    config: &atlas_core::config::ModelConfig,
+) -> Result<KernelHandle> {
+    let max_top_k = config
+        .num_experts_per_toks
+        .iter()
+        .fold(config.num_experts_per_tok, |a, &b| a.max(b));
+    if unpermute_vec_eligible(
+        std::env::var("ATLAS_GLM_MOE_UNPERMUTE_VEC").as_deref() == Ok("1"),
+        config.hidden_size,
+        max_top_k,
+    ) {
+        let vec = super::super::try_kernel(gpu, "moe", "moe_unpermute_reduce_indexed_ep_vec8");
+        if gpu.op_cache().once("moe:unpermute_vec8") {
+            if vec.0 != 0 {
+                tracing::info!("ATLAS_GLM_MOE_UNPERMUTE_VEC: 16-byte EP unpermute-reduce");
+            } else {
+                tracing::warn!(
+                    "ATLAS_GLM_MOE_UNPERMUTE_VEC=1 ignored: target lacks the vec8 reduce"
+                );
+            }
+        }
+        if vec.0 != 0 {
+            return Ok(vec);
+        }
+    }
+    gpu.kernel("moe", "moe_unpermute_reduce_indexed_ep")
+}
+
 impl MoeLayer {
     fn use_sparse_ep_reduce(&self, ctx: &ForwardContext) -> bool {
         sparse_ep_reduce_enabled(
@@ -93,7 +131,7 @@ impl MoeLayer {
 
 #[cfg(test)]
 mod tests {
-    use super::sparse_ep_reduce_enabled;
+    use super::{sparse_ep_reduce_enabled, unpermute_vec_eligible};
 
     #[test]
     fn sparse_reduce_requires_real_ep_communication_and_kernel() {
@@ -101,5 +139,13 @@ mod tests {
         assert!(!sparse_ep_reduce_enabled(1, true, true));
         assert!(!sparse_ep_reduce_enabled(2, false, true));
         assert!(!sparse_ep_reduce_enabled(2, true, false));
+    }
+
+    #[test]
+    fn vec_reduce_needs_flag_8_column_rows_and_at_most_8_routes() {
+        assert!(unpermute_vec_eligible(true, 4096, 8));
+        assert!(!unpermute_vec_eligible(false, 4096, 8));
+        assert!(!unpermute_vec_eligible(true, 4100, 8));
+        assert!(!unpermute_vec_eligible(true, 4096, 9));
     }
 }

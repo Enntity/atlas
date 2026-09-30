@@ -57,6 +57,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "silu_mul_quant_nvfp4",
     "moe_w4a4_grouped_gemm_prequant_t_k128",
     "moe_unpermute_reduce_indexed_ep",
+    "moe_unpermute_reduce_indexed_ep_vec8",
     "moe_batched_blend",
     "moe_silu_mul",
     "kda_pack_qkv",
