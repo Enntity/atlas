@@ -32,15 +32,23 @@ pub(super) fn lone_dflash_width(
     dflash_verify_raw_argmax: bool,
 ) {
     // A lone DFlash verify pays single-owner cost for each row it adds.
-    if dflash_verify_raw_argmax
-        && let Some(width) =
-            super::dflash_width::choose(std::iter::once(&a.spec_adapt.survival), drafts.len())
-    {
+    if !dflash_verify_raw_argmax {
+        return;
+    }
+    let owner = super::dflash_width::VerifyOwner {
+        survival: &a.spec_adapt.survival,
+        last_token: a.last_token,
+        drafts,
+    };
+    let width = super::dflash_width::choose(&[owner], drafts.len());
+    if let Some(width) = width {
         drafts.truncate(width);
     }
-    if dflash_verify_raw_argmax {
-        super::dflash_width::log_verify(1, drafts.len());
-    }
+    super::dflash_width::log_verify(
+        1,
+        drafts.len(),
+        std::iter::once((a.last_token, drafts.as_slice())),
+    );
 }
 
 /// Cap a grammarless serial verify at the step's ladder depth.

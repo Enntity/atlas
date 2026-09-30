@@ -78,6 +78,7 @@ mod test_support;
 #[cfg(test)]
 mod think_skip_tests;
 mod types;
+mod verify_cost;
 mod verify_dflash_batch_step;
 mod verify_dflash_step;
 mod verify_k2_step;

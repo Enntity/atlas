@@ -37,13 +37,16 @@ pub(super) fn verify_owner_batch(
             .rev()
             .find(|&w| model.can_batch_glm_long_verify_rows(owners.len(), w + 1));
         let max = fits.unwrap_or(0);
-        (owners.len() >= 2)
-            .then(|| {
-                super::dflash_width::choose(
-                    owners.iter().map(|&i| &active[i].spec_adapt.survival),
-                    max,
-                )
+        let owners: Vec<super::dflash_width::VerifyOwner<'_>> = owners
+            .iter()
+            .map(|&i| super::dflash_width::VerifyOwner {
+                survival: &active[i].spec_adapt.survival,
+                last_token: active[i].last_token,
+                drafts: &active[i].pending_drafts,
             })
+            .collect();
+        (owners.len() >= 2)
+            .then(|| super::dflash_width::choose(&owners, max))
             .flatten()
     } else {
         None
@@ -97,7 +100,13 @@ pub(super) fn verify_owner_batch(
                 active[i].pending_drafts.truncate(width);
                 active[i].pending_draft_conf.truncate(width);
             }
-            super::dflash_width::log_verify(group.len(), width);
+            super::dflash_width::log_verify(
+                group.len(),
+                width,
+                group
+                    .iter()
+                    .map(|&i| (active[i].last_token, active[i].pending_drafts.as_slice())),
+            );
             let mut sorted = group.clone();
             sorted.sort_unstable();
             let mut batch: Vec<&mut ActiveSeq> = active

@@ -13,6 +13,8 @@
 //! uniform), so the batch trades their curves against each other.
 //!
 //! `ATLAS_DFLASH_FIXED_WIDTH=w` pins the width instead (cost sweeps).
+//! `ATLAS_GLM_VERIFY_COST_MODEL=1` prices steps with the expert-aware model
+//! in [`super::verify_cost`] instead of the measured prose table.
 
 use std::sync::OnceLock;
 
@@ -139,11 +141,20 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_DFLASH_ADAPTIVE_WIDTH").as_deref() == Ok("1"))
 }
 
-/// `ATLAS_DFLASH_WIDTH_LOG=1`: one line per verify (cost sweeps).
-pub(crate) fn log_verify(owners: usize, drafts: usize) {
+/// `ATLAS_DFLASH_WIDTH_LOG=1`: one line per verify (cost sweeps), with the
+/// step's token shape when the cost model or its sweep is on.
+pub(crate) fn log_verify<'a>(
+    owners: usize,
+    drafts: usize,
+    tokens: impl Iterator<Item = (u32, &'a [u32])>,
+) {
     static ON: OnceLock<bool> = OnceLock::new();
     if *ON.get_or_init(|| std::env::var("ATLAS_DFLASH_WIDTH_LOG").as_deref() == Ok("1")) {
-        tracing::info!("DFLASH VERIFY owners={owners} rows={}", drafts + 1);
+        tracing::info!(
+            "DFLASH VERIFY owners={owners} rows={}{}",
+            drafts + 1,
+            super::verify_cost::log_suffix(tokens, drafts)
+        );
     }
 }
 
@@ -157,26 +168,51 @@ fn fixed() -> Option<usize> {
     })
 }
 
-/// Width (drafts per owner, 1..=`max`) for owners with these survival
-/// curves verifying together; `None` leaves the caller's policy in place.
-pub(crate) fn choose<'a>(
-    owners: impl ExactSizeIterator<Item = &'a DraftSurvival> + Clone,
-    max: usize,
-) -> Option<usize> {
+/// One sequence of a verify: its acceptance curve and the tokens its rows
+/// would carry (`last_token`, then the pending drafts).
+pub(crate) struct VerifyOwner<'a> {
+    pub(crate) survival: &'a DraftSurvival,
+    pub(crate) last_token: u32,
+    pub(crate) drafts: &'a [u32],
+}
+
+impl VerifyOwner<'_> {
+    pub(crate) fn tokens<'a>(
+        owners: &'a [VerifyOwner<'_>],
+    ) -> impl Iterator<Item = (u32, &'a [u32])> {
+        owners.iter().map(|o| (o.last_token, o.drafts))
+    }
+}
+
+/// Width (drafts per owner, 1..=`max`) for these owners verifying together;
+/// `None` leaves the caller's policy in place.
+pub(crate) fn choose(owners: &[VerifyOwner<'_>], max: usize) -> Option<usize> {
     let max = max.min(MAX_DRAFTS);
     if max == 0 {
         return None;
     }
+    if let Some(w) = super::verify_cost::sweep_width(max) {
+        return Some(w);
+    }
     if let Some(w) = fixed() {
         return Some(w.min(max));
     }
-    enabled().then(|| best(owners, max))
+    enabled().then(|| {
+        if super::verify_cost::enabled() {
+            let c = super::verify_cost::coeffs();
+            best(owners, max, |w| {
+                c.step_ms(&super::verify_cost::shape(VerifyOwner::tokens(owners), w))
+            })
+        } else {
+            best(owners, max, |w| step_ms(owners.len(), w + 1))
+        }
+    })
 }
 
-/// The width maximizing the owners' expected tokens per step millisecond.
-fn best<'a>(owners: impl ExactSizeIterator<Item = &'a DraftSurvival> + Clone, max: usize) -> usize {
-    let n = owners.len();
-    let rate = |w: usize| owners.clone().map(|s| s.expected(w)).sum::<f32>() / step_ms(n, w + 1);
+/// The width maximizing the owners' expected tokens per step millisecond
+/// under `cost(width)`.
+fn best(owners: &[VerifyOwner<'_>], max: usize, cost: impl Fn(usize) -> f32) -> usize {
+    let rate = |w: usize| owners.iter().map(|o| o.survival.expected(w)).sum::<f32>() / cost(w);
     (1..=max)
         .max_by(|&a, &b| rate(a).total_cmp(&rate(b)))
         .unwrap_or(1)
