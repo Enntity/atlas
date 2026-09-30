@@ -44,7 +44,8 @@ impl Qwen3AttentionLayer {
             .attn_metadata
             .expect("GLM paged prefill requires metadata");
         let owners = glm_chunk_pieces(meta, seq_len_start, args.num_tokens, ctx.config.index_topk);
-        self.glm_chunk_attention(&owners, kv_cache, ctx, args, kv_write_floor)
+        let floor = owner::honoured_write_floor(kv_write_floor);
+        self.glm_chunk_attention(&owners, kv_cache, ctx, args, floor)
     }
 
     /// GLM MLA over the causal chunks of one or more sequences whose rows are
