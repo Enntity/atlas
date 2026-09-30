@@ -275,3 +275,174 @@ fn k128_dual_handle_belongs_to_its_backend() {
     without.lookup_failure.store(1, Ordering::Relaxed);
     assert_eq!(k128_dual_launch(&without), (7, [4096 / 4, 1, 2]));
 }
+
+/// Non-verify prefill rows run beta | f_a | g_a as the one-grid triple, in
+/// plane order; `ATLAS_GLM_KDA_FUSED_SMALL_PREFILL=0` (re-run in a child
+/// process) restores the three pipelined launches.
+#[test]
+fn kda_prefill_small_projections_fuse_unless_killed() {
+    const KILL: &str = "ATLAS_GLM_KDA_FUSED_SMALL_PREFILL";
+    let killed = std::env::var(KILL).as_deref() == Ok("0");
+    if !killed {
+        let name = concat!(
+            module_path!(),
+            "::kda_prefill_small_projections_fuse_unless_killed"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name.split_once("::").unwrap().1, "--nocapture"])
+            .env(KILL, "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    with_kda(0, |gpu, config, layer| {
+        const M: usize = 300;
+        let arena = BufferArena::new(config, M, 2048, 16, 1, gpu).unwrap();
+        let resources = ContextResources::new();
+        let ctx = resources.view(&arena, config, gpu);
+        let mut state = layer.alloc_state(gpu).unwrap();
+        let mut cache = PagedKvCache::new(
+            KvCacheConfig {
+                block_size: 16,
+                num_kv_heads: 1,
+                head_dim: 512,
+                num_layers: 1,
+                dtype: KvCacheDtype::Bf16,
+                layer_dtypes: vec![],
+                layer_dims: vec![],
+                cache_blocks_per_seq: None,
+            },
+            8,
+            gpu,
+        )
+        .unwrap();
+        // The fixture allocates b, f_a, f_b, g_a, g_b back to back.
+        let allocs: Vec<_> = gpu
+            .trace()
+            .iter()
+            .filter_map(|e| match e {
+                Event::Alloc(p, bytes) => Some((*p, *bytes)),
+                _ => None,
+            })
+            .collect();
+        let b = allocs
+            .iter()
+            .position(|&(_, bytes)| bytes == 32 * 4096 * 2)
+            .unwrap();
+        let [b, f_a, g_a] = [b, b + 1, b + 3].map(|i| Arg::Ptr(allocs[i].0));
+        let kernel = |name| gpu.kernel("gemm", name).unwrap().0;
+        let triple = kernel("dense_gemm_bf16_pipelined_triple_n");
+        let pipelined = kernel("dense_gemm_bf16_pipelined");
+        let hidden = arena.hidden_states();
+        let (mut blocks, mut disk, mut offloaded) = (vec![], vec![], vec![]);
+        gpu.clear();
+        layer
+            .prefill(
+                hidden,
+                hidden,
+                M,
+                state.as_mut(),
+                &mut cache,
+                0,
+                &mut blocks,
+                &mut disk,
+                &mut offloaded,
+                0,
+                &ctx,
+                91,
+            )
+            .unwrap();
+        let trace = gpu.trace();
+        let launches = |kernel| -> Vec<_> {
+            trace
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Launch(k, grid, _, _, _, args) if *k == kernel => Some((*grid, args)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let u32_arg = |v: u32| Arg::Bytes(v.to_ne_bytes().to_vec());
+        let normed = Arg::Ptr(arena.norm_output());
+        let beta = arena.qkv_output().offset(3 * M * 4096 * 2);
+        let fa = beta.offset(M * 32 * 2);
+        let planes = [beta, fa, fa.offset(M * 128 * 2)].map(Arg::Ptr);
+        let (fused, split) = (launches(triple), launches(pipelined));
+        // (weight, output, N, K) of each pipelined launch, in launch order.
+        let split: Vec<_> = split
+            .iter()
+            .map(|(_, a)| (&a[1], &a[2], &a[4], &a[5]))
+            .collect();
+        let small = [
+            (&b, &planes[0], 32),
+            (&f_a, &planes[1], 128),
+            (&g_a, &planes[2], 128),
+        ];
+        if killed {
+            assert!(fused.is_empty());
+            assert_eq!(split.len(), 5);
+            for ((weight, plane, n), got) in small.into_iter().zip(&split) {
+                assert_eq!(*got, (weight, plane, &u32_arg(n), &u32_arg(4096)));
+            }
+        } else {
+            assert_eq!(fused.len(), 1);
+            let (grid, args) = &fused[0];
+            assert_eq!(*grid, [3, 3, 1]);
+            let mut want = vec![normed, b.clone(), f_a.clone(), g_a.clone()];
+            want.extend(planes.iter().cloned());
+            want.extend([M as u32, 32, 128, 4096].map(u32_arg));
+            assert_eq!(**args, want);
+            assert_eq!(split.len(), 2);
+        }
+        // f_b / g_b (K = 128) follow on the pipelined kernel (CUTLASS is off here).
+        for got in &split[split.len() - 2..] {
+            assert_eq!((got.2, got.3), (&u32_arg(4096), &u32_arg(128)));
+        }
+        // Verify rows and single-token decode never take the prefill triple.
+        let ssm = state.as_any_mut().downcast_mut::<SsmLayerState>().unwrap();
+        ssm.h_state_intermediates = (0..4).map(|_| gpu.alloc(2097152).unwrap()).collect();
+        ssm.conv_state_intermediates = (0..5).map(|_| gpu.alloc(196608).unwrap()).collect();
+        gpu.clear();
+        layer
+            .decode_batched(
+                hidden,
+                hidden,
+                5,
+                state.as_mut(),
+                &mut cache,
+                0,
+                &mut blocks,
+                &mut disk,
+                &mut offloaded,
+                &ctx,
+                91,
+            )
+            .unwrap();
+        layer
+            .decode(
+                hidden,
+                hidden,
+                state.as_mut(),
+                &mut cache,
+                0,
+                &mut blocks,
+                &mut disk,
+                &mut offloaded,
+                &ctx,
+                91,
+            )
+            .unwrap();
+        let trace = gpu.trace();
+        assert!(trace.iter().any(|e| matches!(e, Event::Launch(..))));
+        assert!(
+            !trace
+                .iter()
+                .any(|e| matches!(e, Event::Launch(k, ..) if *k == triple))
+        );
+    });
+}
