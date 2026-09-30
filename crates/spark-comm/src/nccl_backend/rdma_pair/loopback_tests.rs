@@ -6,8 +6,9 @@
 //! over localhost, each rail's two QPs meeting inside the HCA. It exercises
 //! the real proxy loop (one-shot ops interleaved with legacy exchanges), the
 //! NIC reading copy-engine-staged data, chained flags under
-//! `ATLAS_RDMA_PAIR_CHAIN=1`, and CUDA-graph replays; every result must match
-//! `bf16_add_inplace` (add) or the peer's payload (copy) bit for bit.
+//! `ATLAS_RDMA_PAIR_CHAIN=1`, CUDA-graph replays, and back-to-back eager ops
+//! with one rank held up; every result must match `bf16_add_inplace` (add) or
+//! the peer's payload (copy) bit for bit.
 //!
 //!   ATLAS_ONESHOT_CUBIN_DIR=<cubins> ATLAS_RDMA_ONESHOT=1 \
 //!   ATLAS_RDMA_RAILS=rocep1s0f0[,roceP2p1s0f0] [ATLAS_RDMA_PAIR_CHAIN=1] \
@@ -116,15 +117,13 @@ fn sync(streams: [u64; 2]) {
     }
 }
 
-#[test]
-#[ignore = "needs a GPU, an RDMA device and ATLAS_ONESHOT_CUBIN_DIR"]
-fn nic_loopback_two_ranks() {
-    let Some(g) = gpu() else {
-        return;
-    };
+/// Both ranks' pairs on this GPU, connected through the NIC, or `None` (test
+/// skipped) without cubins or `ATLAS_RDMA_ONESHOT=1`.
+fn ranks() -> Option<(Gpu, Vec<RdmaPair>)> {
+    let g = gpu()?;
     if std::env::var("ATLAS_RDMA_ONESHOT").as_deref() != Ok("1") {
         eprintln!("ATLAS_RDMA_ONESHOT unset: skipped");
-        return;
+        return None;
     }
     let (ctx, port) = (g.ctx, 20_000 + (std::process::id() % 20_000) as u16);
     let pairs: Vec<RdmaPair> = std::thread::scope(|s| {
@@ -143,6 +142,15 @@ fn nic_loopback_two_ranks() {
             .expect("one-shot channel")
             .set_kernel(g.oneshot);
     }
+    Some((g, pairs))
+}
+
+#[test]
+#[ignore = "needs a GPU, an RDMA device and ATLAS_ONESHOT_CUBIN_DIR"]
+fn nic_loopback_two_ranks() {
+    let Some((g, pairs)) = ranks() else {
+        return;
+    };
     let streams = [g.stream, new_stream()];
     let steps = [
         Step::new(131_072, Kind::Add, 0),
@@ -212,6 +220,28 @@ fn nic_loopback_two_ranks() {
         }
         wrong += eager(&steps[replay % steps.len()], &mut k);
     }
+    // Back-to-back eager rounds, one sync each: before every step one rank's
+    // stream is held up by a long add (the rank alternates, the length
+    // varies), so the other runs ahead. The early rank waits in its kernel,
+    // the late one for `S` to drain, and receive slots are reused with no
+    // host sync in between.
+    let drag = alloc(8 << 20);
+    for round in 0..rounds {
+        let base = k;
+        for (i, step) in steps.iter().enumerate() {
+            step.prepare(&g, base + 1 + i as u64);
+        }
+        for (i, step) in steps.iter().enumerate() {
+            let n = (4 << 20) >> ((i + round) % 8);
+            launch_add(&g, streams[(i + round) % 2], drag, drag, n);
+            step.issue(&g, &pairs, streams);
+        }
+        sync(streams);
+        k += steps.len() as u64;
+        for (i, step) in steps.iter().enumerate() {
+            wrong += step.check(&g, base + 1 + i as u64);
+        }
+    }
     // Back-to-back timing (both ranks share this GPU and HCA).
     let mut timing = String::new();
     for (bytes, kind) in [
@@ -243,6 +273,33 @@ fn nic_loopback_two_ranks() {
     );
     assert_eq!(wrong, 0);
     assert!(poison.iter().all(Option::is_none));
+}
+
+/// The peer goes away (its QPs are destroyed), as when its process is killed:
+/// our send fails, the proxy stops the channel, and the waiting kernel traps
+/// on the poison well inside its time limit instead of hanging.
+#[test]
+#[ignore = "kills the CUDA context: run alone (GPU, RDMA device, ATLAS_ONESHOT_CUBIN_DIR)"]
+fn nic_loopback_peer_loss_traps() {
+    let Some((g, mut pairs)) = ranks() else {
+        return;
+    };
+    let streams = [g.stream, new_stream()];
+    let step = Step::new(65_536, Kind::Add, 0);
+    step.prepare(&g, 1);
+    step.issue(&g, &pairs, streams);
+    sync(streams);
+    assert_eq!(step.check(&g, 1), 0);
+    drop(pairs.pop());
+    let (t0, os) = (Instant::now(), pairs[0].oneshot().unwrap());
+    let (buf, bytes) = (step.dst[0], step.bytes);
+    assert!(os.enqueue(buf, buf, bytes, true, g.stream).unwrap());
+    let status = unsafe { cuStreamSynchronize(g.stream) };
+    let (took, why) = (t0.elapsed(), os.poisoned());
+    println!("peer loss: stream status {status} after {took:?}; poison: {why:?}");
+    assert_ne!(status, 0, "the kernel must trap");
+    assert!(why.expect("poison word set").contains("RDMA proxy failed"));
+    assert!(took.as_secs() < 15);
 }
 
 /// Microbench (stand-in peer, no NIC): per-op cost of the local path when
