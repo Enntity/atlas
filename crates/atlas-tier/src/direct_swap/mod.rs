@@ -70,6 +70,8 @@ pub fn unsuitable_swap_fs(dir: &std::path::Path) -> Option<&'static str> {
         if unsafe { libc::statfs(path.as_ptr(), &mut fs) } != 0 {
             return None;
         }
+        // `f_type` is `i64` on glibc 64-bit and another width elsewhere.
+        #[allow(clippy::unnecessary_cast)]
         fs_kind(fs.f_type as i64)
     }
     #[cfg(not(target_os = "linux"))]
