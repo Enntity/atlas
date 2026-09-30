@@ -15,6 +15,7 @@ pub(super) struct GlmIndexSelection {
     pub(super) glm_sparse_attn_heads_per_cta: u32,
     pub(super) glm_sparse_attn_fn: &'static str,
     pub(super) glm_index_logits_rows_per_cta: u32,
+    pub(super) glm_index_logits_pools_per_cta: u32,
     pub(super) glm_index_wmma: bool,
     pub(super) glm_sparse_graphs: bool,
     pub(super) glm_index_logits_fn: &'static str,
@@ -44,25 +45,34 @@ impl GlmIndexSelection {
             } else {
                 8
             };
-        let glm_index_wmma = probes.glm_kpool_indexer
+        let env_on = |name| std::env::var(name).ok().as_deref() == Some("1");
+        let wmma_shape = probes.glm_kpool_indexer
             && config.index_n_heads == 32
             && config.index_head_dim == 128
             && config.index_kpool == 4
-            && glm_index_logits_rows_per_cta == 8
-            && std::env::var("ATLAS_GLM_INDEX_WMMA").ok().as_deref() == Some("1");
+            && glm_index_logits_rows_per_cta == 8;
+        // Bit-identical to the WMMA scorer (same module and contract), faster.
+        let glm_index_logits_v2 = wmma_shape && env_on("ATLAS_GLM_INDEX_LOGITS_V2");
+        let glm_index_wmma = wmma_shape && (env_on("ATLAS_GLM_INDEX_WMMA") || glm_index_logits_v2);
         let glm_sparse_graphs = probes.glm_kpool_indexer
             && super::glm_multi_seq_sparse_graphs_enabled(&config.model_type)?;
-        let glm_index_logits_fn = if glm_index_wmma {
-            "glm_index_logits_bf16_wmma_row8_pool32"
+        let (glm_index_logits_fn, glm_index_logits_pools_per_cta) = if glm_index_logits_v2 {
+            (
+                "glm_index_logits_bf16_mma_v2",
+                crate::layers::ops::GLM_INDEX_LOGITS_V2_POOLS,
+            )
+        } else if glm_index_wmma {
+            ("glm_index_logits_bf16_wmma_row8_pool32", 32)
         } else if glm_index_logits_rows_per_cta == 1 {
-            "glm_index_logits_bf16"
+            ("glm_index_logits_bf16", 8)
         } else {
-            "glm_index_logits_bf16_row8"
+            ("glm_index_logits_bf16_row8", 8)
         };
         Ok(Self {
             glm_sparse_attn_heads_per_cta,
             glm_sparse_attn_fn,
             glm_index_logits_rows_per_cta,
+            glm_index_logits_pools_per_cta,
             glm_index_wmma,
             glm_sparse_graphs,
             glm_index_logits_fn,
