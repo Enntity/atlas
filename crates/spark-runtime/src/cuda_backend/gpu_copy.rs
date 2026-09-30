@@ -41,7 +41,7 @@ use super::{
     AtlasCudaBackend, cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2,
     cuStreamQuery, cuStreamSynchronize,
 };
-use crate::gpu::{DevicePtr, Pitched};
+use crate::gpu::{DevicePtr, HostPitched, Pitched};
 
 /// One pitched copy between PAGE-LOCKED host memory and the device, enqueued
 /// on `stream` with no synchronisation (`to_device` picks the direction).
@@ -50,7 +50,7 @@ use crate::gpu::{DevicePtr, Pitched};
 /// `copy_d2d_2d_async`; kinds 1 / 2 are `cudaMemcpyHostToDevice` /
 /// `cudaMemcpyDeviceToHost`. The caller guarantees `host` spans
 /// `shape.host_span()` bytes that stay valid until the next sync on `stream`.
-pub(super) fn host_pitched_async(
+fn host_pitched_async(
     host: *mut c_void,
     dev: DevicePtr,
     shape: Pitched,
@@ -114,6 +114,18 @@ pub(super) fn host_pitched_async(
             }
         }
         Ok(())
+    }
+}
+
+impl HostPitched for AtlasCudaBackend {
+    fn h2d_retained(&self, src: &[u8], dst: DevicePtr, shape: Pitched, stream: u64) -> Result<()> {
+        anyhow::ensure!(src.len() >= shape.host_span(), "pitched H2D: short source");
+        host_pitched_async(src.as_ptr() as *mut c_void, dst, shape, true, stream)
+    }
+
+    fn d2h(&self, src: DevicePtr, dst: &mut [u8], shape: Pitched, stream: u64) -> Result<()> {
+        anyhow::ensure!(dst.len() >= shape.host_span(), "pitched D2H: short dest");
+        host_pitched_async(dst.as_mut_ptr() as *mut c_void, src, shape, false, stream)
     }
 }
 

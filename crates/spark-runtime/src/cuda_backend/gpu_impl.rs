@@ -40,12 +40,11 @@ use super::{
     AtlasCudaBackend, cuMemAlloc_v2, cuMemAllocManaged, cuMemFree_v2, cuMemGetInfo_v2,
     cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuStreamSynchronize,
 };
-use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle, Pitched};
+use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, HostPitched, KernelHandle};
 
 // The host-side copy helpers live beside this file — see its module doc for
 // why they could not stay (a trait `impl` cannot be split, so only the code
 // OUTSIDE the block can move, and the PR's merge with main needed it).
-use super::gpu_copy::host_pitched_async;
 use super::host_staging::{d2h_trace_tick, h2d_enqueue, warn_pinned_transient_source};
 
 mod pdl;
@@ -290,26 +289,8 @@ impl GpuBackend for AtlasCudaBackend {
         h2d_enqueue(src, dst, stream)
     }
 
-    fn copy_h2d_pitched_async_retained(
-        &self,
-        src: &[u8],
-        dst: DevicePtr,
-        shape: Pitched,
-        stream: u64,
-    ) -> Result<()> {
-        anyhow::ensure!(src.len() >= shape.host_span(), "pitched H2D: short source");
-        host_pitched_async(src.as_ptr() as *mut c_void, dst, shape, true, stream)
-    }
-
-    fn copy_d2h_pitched_async(
-        &self,
-        src: DevicePtr,
-        dst: &mut [u8],
-        shape: Pitched,
-        stream: u64,
-    ) -> Result<()> {
-        anyhow::ensure!(dst.len() >= shape.host_span(), "pitched D2H: short dest");
-        host_pitched_async(dst.as_mut_ptr() as *mut c_void, src, shape, false, stream)
+    fn host_pitched(&self) -> Option<&dyn HostPitched> {
+        Some(self)
     }
 
     fn copy_d2d_async(

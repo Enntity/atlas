@@ -32,7 +32,7 @@ use anyhow::Result;
 
 use super::nvme_io::{IoPool, Outcome, Work};
 use super::nvme_spill::NvmeSpill;
-use crate::gpu::{GpuBackend, Pitched};
+use crate::gpu::{GpuBackend, Pitched, copy_d2h_pitched_async, copy_h2d_pitched_async_retained};
 use crate::prefix_cache::{DiskRef, SpillOrder};
 
 /// Records per staging chunk (one worker job).
@@ -183,9 +183,9 @@ fn copy_blocks(
             let host = &mut stage[start * record + off..][..shape.host_span()];
             let dev = seg.base.offset(blocks[start] as usize * seg.stride);
             if to_device {
-                gpu.copy_h2d_pitched_async_retained(host, dev, shape, stream)?;
+                copy_h2d_pitched_async_retained(gpu, host, dev, shape, stream)?;
             } else {
-                gpu.copy_d2h_pitched_async(dev, host, shape, stream)?;
+                copy_d2h_pitched_async(gpu, dev, host, shape, stream)?;
             }
         }
     }

@@ -81,7 +81,10 @@ pub enum KernelArg<'a> {
 
 pub use crate::gpu_args::pack_kernel_args;
 
-pub use crate::gpu_pitched::{HOST_PINNED_ALIGN, Pitched};
+pub use crate::gpu_pitched::{
+    HOST_PINNED_ALIGN, HostPitched, Pitched, copy_d2h_pitched_async,
+    copy_h2d_pitched_async_retained,
+};
 
 /// GPU backend trait — SBIO IORouter for all CUDA operations.
 ///
@@ -322,41 +325,10 @@ pub trait GpuBackend: Send + Sync {
         Ok(())
     }
 
-    /// Pitched host-to-device copy from a source the CALLER keeps alive (as
-    /// [`GpuBackend::copy_h2d_async_retained`]): row `r` is `shape.width`
-    /// bytes from `src[r * host_pitch..]` to `dst + r * dev_pitch`. One
-    /// enqueue for the whole run — on GB10 a small async copy costs several
-    /// microseconds of copy-engine time whatever its size, so a scatter of N
-    /// blocks × M regions is M calls instead of N × M.
-    fn copy_h2d_pitched_async_retained(
-        &self,
-        src: &[u8],
-        dst: DevicePtr,
-        shape: Pitched,
-        stream: u64,
-    ) -> Result<()> {
-        for r in 0..shape.height {
-            let row = &src[r * shape.host_pitch..][..shape.width];
-            self.copy_h2d_async_retained(row, dst.offset(r * shape.dev_pitch), stream)?;
-        }
-        Ok(())
-    }
-
-    /// Pitched device-to-host copy, the mirror of
-    /// [`GpuBackend::copy_h2d_pitched_async_retained`]; same lifetime rule as
-    /// [`GpuBackend::copy_d2h_async`] (no read of `dst` before the next sync).
-    fn copy_d2h_pitched_async(
-        &self,
-        src: DevicePtr,
-        dst: &mut [u8],
-        shape: Pitched,
-        stream: u64,
-    ) -> Result<()> {
-        for r in 0..shape.height {
-            let row = &mut dst[r * shape.host_pitch..][..shape.width];
-            self.copy_d2h_async(src.offset(r * shape.dev_pitch), row, stream)?;
-        }
-        Ok(())
+    /// This backend's native pitched host↔device copies, if it has them
+    /// (see [`copy_h2d_pitched_async_retained`]; `None` = a copy per row).
+    fn host_pitched(&self) -> Option<&dyn HostPitched> {
+        None
     }
 
     /// Begin capturing CUDA operations on `stream` into a graph.
