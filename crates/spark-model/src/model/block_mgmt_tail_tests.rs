@@ -21,6 +21,14 @@ const PLAN: TailSlotPlan = TailSlotPlan {
 /// A one-layer GLM-style cache whose pooled keys all hold a previous owner's
 /// bytes; `plan: None` keeps one tail per block.
 fn cache_with_stale_index(gpu: &MockGpuBackend, plan: Option<TailSlotPlan>) -> PagedKvCache {
+    stale_index_cache(gpu, plan, None)
+}
+
+fn stale_index_cache(
+    gpu: &MockGpuBackend,
+    plan: Option<TailSlotPlan>,
+    cache_blocks_per_seq: Option<u32>,
+) -> PagedKvCache {
     let config = KvCacheConfig {
         block_size: 16,
         num_kv_heads: 1,
@@ -29,7 +37,7 @@ fn cache_with_stale_index(gpu: &MockGpuBackend, plan: Option<TailSlotPlan>) -> P
         dtype: KvCacheDtype::Bf16,
         layer_dtypes: vec![],
         layer_dims: vec![],
-        cache_blocks_per_seq: None,
+        cache_blocks_per_seq,
     };
     let mut cache = PagedKvCache::new(config, BLOCKS, gpu).unwrap();
     cache
@@ -95,6 +103,23 @@ fn prefill_exhaustion_publishes_the_blocks_it_pushed() {
     held[..2].iter().for_each(|&b| cache.free_block(b));
     prefill(&mut seq, 4, &mut cache, &gpu).unwrap();
     assert_eq!(seq.block_table.len(), 5);
+    assert_published(&cache, &gpu, &seq.block_table);
+}
+
+#[test]
+fn prefill_disk_id_failure_publishes_the_block_it_pushed() {
+    let gpu = MockGpuBackend::new();
+    // HSS is engaged (a per-sequence cap) but no orchestrator is installed:
+    // the disk-id step fails after the block is already in `block_table`.
+    let mut cache = stale_index_cache(&gpu, Some(PLAN), Some(4));
+    let mut seq = SequenceState::host_only(0);
+
+    let err = prefill(&mut seq, 0, &mut cache, &gpu).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("orchestrator not installed"),
+        "{err:#}"
+    );
+    assert_eq!(seq.block_table.len(), 1);
     assert_published(&cache, &gpu, &seq.block_table);
 }
 

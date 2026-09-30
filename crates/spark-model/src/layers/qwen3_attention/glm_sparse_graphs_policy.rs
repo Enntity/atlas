@@ -69,9 +69,23 @@ mod tests {
             .attach_sparse_index(SparseIndexCacheConfig::bf16(4, 128), &gpu)
             .unwrap();
         assert!(glm_c1_decode_graph_vetoed(&cache));
-        // The C1 decode gate consults the veto (a captured selector would
-        // replay the capture step's positions forever).
+        // The C1 decode gate ANDs the veto into the one immutable `use_graphs`
+        // it computes (a captured selector would replay the capture step's
+        // positions forever).
         let decode = include_str!("../../model/trait_impl/decode_a.rs");
-        assert!(decode.contains("glm_c1_decode_graph_vetoed(&kv_cache)"));
+        let lets: Vec<_> = decode.match_indices("let use_graphs =").collect();
+        assert_eq!(lets.len(), 1, "decode_a.rs must bind use_graphs once");
+        assert!(!decode.contains("mut use_graphs"));
+        let stmt = &decode[lets[0].0..];
+        let stmt = &stmt[..stmt.find(';').unwrap()];
+        let veto = stmt
+            .find("&& !crate::layers::qwen3_attention::glm_c1_decode_graph_vetoed(&kv_cache)")
+            .expect("the veto must be a conjunct of use_graphs");
+        let head = &stmt[..veto];
+        assert_eq!(
+            head.matches('(').count(),
+            head.matches(')').count(),
+            "the veto must be a top-level conjunct"
+        );
     }
 }
