@@ -151,6 +151,7 @@ impl TransformerModel {
         let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
         let max_ctx = dstate.max_ctx_len;
+        let own_row = dstate.own_row;
         // The accumulator holds the LAST `max_ctx` prompt positions (the
         // drafter's context window), not the first: slot 0 is position
         // `window_start`. Earlier rows of this chunk are dropped.
@@ -161,6 +162,20 @@ impl TransformerModel {
         // upper half, compacted at row 0) in the highway.
         let sp_row0 = crate::layers::glm_sp::current().map_or(0, |sp| sp.row0);
         first = first.max(chunk_start + sp_row0);
+        // `ATLAS_DFLASH_FIRST_APPEND=own`: keep this pass's last row — after
+        // the final chunk, the last prompt position — in the sequence's own
+        // spare row, whatever the window below keeps.
+        if let Some(own_row) = own_row
+            && proc_count > sp_row0
+        {
+            self.dflash_capture_rows(
+                proc_count - 1 - sp_row0,
+                1,
+                own_row.offset(slot_idx * h * bf16),
+                n_capture * h * bf16,
+                stream,
+            )?;
+        }
         if first >= end {
             return Ok(());
         }
@@ -206,6 +221,7 @@ impl TransformerModel {
             dstate.ctx_positions = (window_start..window_start + new_len)
                 .map(|i| i as i32)
                 .collect();
+            dstate.first_append_at = Some(seq.seq_len);
         }
         Ok(())
     }

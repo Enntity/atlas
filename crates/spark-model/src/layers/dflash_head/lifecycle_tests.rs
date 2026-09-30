@@ -178,6 +178,9 @@ fn owner_failure_reclaim_frees_state_resources_without_leaking() {
         ctx_committed: 12,
         ctx_positions: vec![1, 2, 3],
         end_floor: 0,
+        first_append_at: None,
+        own_capture: false,
+        own_row: None,
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(owner_now, 40, 4, 4, 16).unwrap()),
     };
