@@ -73,6 +73,8 @@ impl TransformerModel {
                 stream,
             )?;
             self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
+            // `ATLAS_GLM_INDEX_SPLIT`: the peer's selected rows were in range.
+            crate::layers::qwen3_attention::check_index_split_rows(self.gpu.as_ref(), stream)?;
             Ok(logits)
         })()
     }

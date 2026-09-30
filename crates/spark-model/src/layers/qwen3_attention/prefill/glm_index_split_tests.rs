@@ -341,6 +341,7 @@ fn exchange_swaps_the_zigzag_pairs_in_the_same_order_on_both_ranks() {
             let owner = OwnerRows {
                 selected: sel,
                 row_bytes: rb,
+                end: 8196 + rows,
                 scratch: sel.offset(rows * rb),
                 inputs: [(sel, 0); 2],
             };

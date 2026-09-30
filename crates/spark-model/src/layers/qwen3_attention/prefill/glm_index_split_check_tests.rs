@@ -66,6 +66,7 @@ fn check(
         let owner = OwnerRows {
             selected,
             row_bytes: RB,
+            end: 8196 + ROWS,
             scratch,
             inputs: [(query, 7), (weights, 7)],
         };

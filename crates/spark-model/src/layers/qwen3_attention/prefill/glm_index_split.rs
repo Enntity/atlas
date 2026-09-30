@@ -19,6 +19,9 @@
 //! rank splitting alone would deadlock the pair; the settings themselves
 //! are compared across the ranks at startup (`agree_index_split`).
 //!
+//! The attention kernels trust a selected id as a block-table index, so the
+//! rows a rank receives are range-guarded on the device (`guard`).
+//!
 //! `ATLAS_GLM_INDEX_SPLIT_CHECK=1` also selects every row into scratch and
 //! fails the request on both ranks on any difference (`check`).
 
@@ -33,6 +36,9 @@ use crate::layers::glm_sp;
 
 #[path = "glm_index_split_check.rs"]
 mod check;
+#[path = "glm_index_split_guard.rs"]
+mod guard;
+pub use guard::check_index_split_rows;
 
 /// Owners below this many rows stay replicated (verify, short appends): the
 /// two exchanges' fixed cost outweighs the halved selection.
@@ -137,6 +143,9 @@ pub(super) struct OwnerRows {
     /// The selected token-id rows, `row_bytes` each.
     pub(super) selected: DevicePtr,
     pub(super) row_bytes: usize,
+    /// One past the owner's last token position: every selected id is below
+    /// it.
+    pub(super) end: usize,
     /// Under the check, the replicated rows.
     pub(super) scratch: DevicePtr,
     /// Under the check, the `(pointer, bytes)` of the index queries and the
@@ -234,8 +243,9 @@ impl IndexSplit {
         own
     }
 
-    /// Swap this rank's finished rows of `rows.selected` for the peer's.
-    /// Under the check, then compare every row with the replicated rows.
+    /// Swap this rank's finished rows of `rows.selected` for the peer's,
+    /// range-guarding what arrives. Under the check, then compare every row
+    /// with the replicated rows.
     pub(super) fn exchange(
         &self,
         rows: &OwnerRows,
@@ -243,16 +253,19 @@ impl IndexSplit {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let row_ids = rows.row_bytes / std::mem::size_of::<i32>();
         for s in self.swaps {
+            let received = rows.selected.offset(s.peer * rows.row_bytes);
             glm_sp::exchange_rows(
                 rows.selected.offset(s.own * rows.row_bytes),
-                rows.selected.offset(s.peer * rows.row_bytes),
+                received,
                 s.rows,
                 rows.row_bytes,
                 false,
                 ctx,
                 stream,
             )?;
+            guard::clamp(received, s.rows * row_ids, rows.end, ctx, stream)?;
         }
         if self.check {
             self.check(rows, layer, ctx, stream)?;

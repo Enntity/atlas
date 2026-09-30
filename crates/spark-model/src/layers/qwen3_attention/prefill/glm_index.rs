@@ -370,6 +370,7 @@ impl Qwen3AttentionLayer {
             let owner = OwnerRows {
                 selected,
                 row_bytes: output_row_bytes,
+                end: sequence_end,
                 scratch,
                 inputs: [
                     (index_query, n as usize * query_row_bytes),

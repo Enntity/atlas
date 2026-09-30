@@ -51,7 +51,7 @@ pub use glm_sparse_graphs_policy::{
     glm_c1_decode_graph_vetoed, glm_multi_seq_sparse_graphs_enabled,
 };
 pub(crate) use hc_prefill::{hc_post_pre_prefill_fused, hc_pre_prefill_mix};
-pub use prefill::agree_index_split;
+pub use prefill::{agree_index_split, check_index_split_rows};
 pub(crate) use types::HeadGateActivation;
 pub use types::Qwen3AttentionLayer;
 pub use types_weights::{

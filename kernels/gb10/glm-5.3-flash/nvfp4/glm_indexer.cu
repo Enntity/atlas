@@ -535,6 +535,28 @@ extern "C" __global__ void glm_index_topk_expand_dynamic(
         topk_tokens, pool_size, output_width);
 }
 
+// Range guard for selected token IDs received from the other rank
+// (ATLAS_GLM_INDEX_SPLIT): the sparse attention kernels below index the block
+// table with a selected ID unchecked. Every ID outside [-1, limit) becomes -1
+// (no selection) and is counted in `violations`; an in-range ID is never
+// written, so valid rows keep every byte. Any grid and block: grid-stride.
+extern "C" __global__ void glm_index_clamp_ids(
+    int* __restrict__ ids,
+    unsigned int count,
+    int limit,
+    unsigned int* __restrict__ violations) {
+    const unsigned int stride = gridDim.x * blockDim.x;
+    unsigned int clamped = 0;
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += stride) {
+        const int id = ids[i];
+        if (id < -1 || id >= limit) {
+            ids[i] = -1;
+            ++clamped;
+        }
+    }
+    if (clamped) atomicAdd(violations, clamped);
+}
+
 // Tiled sparse absorbed MLA. One CTA owns one (query, head); its eight warps
 // score eight selected tokens concurrently, then all 256 lanes update two of
 // the 512 output dimensions. This preserves the online-softmax recurrence of
