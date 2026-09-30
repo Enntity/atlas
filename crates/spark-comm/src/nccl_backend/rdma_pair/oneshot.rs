@@ -49,6 +49,9 @@ unsafe extern "C" {
 const CU_STREAM_WAIT_VALUE_EQ: u32 = 0x1;
 /// Payload sizes ride in the low 24 bits of a flag word.
 const MAX_LIMIT: usize = (1 << 24) - 64;
+/// The capture contract promises at least this much (8 decode rows x 5 x
+/// 4096 BF16 on the k5 route is 320 KiB).
+const MIN_MAX: usize = 512 << 10;
 const MAX_RAILS: usize = 8;
 const THREADS: usize = 256;
 /// Kernel state in device memory (see `rdma_oneshot.cu`).
@@ -70,7 +73,8 @@ const POISON_MISMATCH: u64 = 1 << 63;
 /// ranks at bootstrap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Config {
-    /// Largest one-shot payload in bytes (`ATLAS_RDMA_ONESHOT_MAX`, 1 MiB).
+    /// Largest one-shot payload in bytes (`ATLAS_RDMA_ONESHOT_MAX`, 1 MiB,
+    /// at least 512 KiB).
     pub(super) max: usize,
     /// Payloads from this size stripe over every rail
     /// (`ATLAS_RDMA_ONESHOT_STRIPE_MIN`, default the legacy split size).
@@ -99,7 +103,7 @@ impl Config {
         };
         Some(Self {
             max: num("ATLAS_RDMA_ONESHOT_MAX", 1 << 20)
-                .clamp(4096, MAX_LIMIT)
+                .clamp(MIN_MAX, MAX_LIMIT)
                 .next_multiple_of(64),
             stripe_min: num("ATLAS_RDMA_ONESHOT_STRIPE_MIN", SPLIT_MIN),
             timeout_ns: num("ATLAS_RDMA_ONESHOT_TIMEOUT_MS", 30_000) as u64 * 1_000_000,

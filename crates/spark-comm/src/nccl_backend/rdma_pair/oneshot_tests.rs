@@ -25,19 +25,24 @@ fn off_unless_requested_and_defaults_cover_decode_payloads() {
     assert!(!c.stage_fence);
     let c = cfg(&[
         ("ATLAS_RDMA_ONESHOT", "1"),
-        ("ATLAS_RDMA_ONESHOT_MAX", "100000"),
+        ("ATLAS_RDMA_ONESHOT_MAX", "600000"),
         ("ATLAS_RDMA_ONESHOT_STRIPE_MIN", "16384"),
         ("ATLAS_RDMA_ONESHOT_TIMEOUT_MS", "0"),
         ("ATLAS_RDMA_ONESHOT_STAGE_FENCE", "1"),
     ])
     .unwrap();
-    assert_eq!((c.max, c.stripe_min, c.timeout_ns), (100_032, 16384, 0));
+    assert_eq!((c.max, c.stripe_min, c.timeout_ns), (600_000, 16384, 0));
     assert!(c.stage_fence);
     let big = cfg(&[
         ("ATLAS_RDMA_ONESHOT", "1"),
         ("ATLAS_RDMA_ONESHOT_MAX", "999999999"),
     ]);
     assert_eq!(big.unwrap().max, MAX_LIMIT);
+    let small = cfg(&[
+        ("ATLAS_RDMA_ONESHOT", "1"),
+        ("ATLAS_RDMA_ONESHOT_MAX", "4096"),
+    ]);
+    assert_eq!(small.unwrap().max, MIN_MAX);
 }
 
 #[test]
