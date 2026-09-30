@@ -108,8 +108,15 @@ fn verify_ffn(gpu: &Gpu, rank: usize, vector: bool, rows: usize) -> Vec<Event> {
         .iter()
         .filter(|e| matches!(e, Event::Launch(h, ..) if *h == layer.silu_mul_quant_nvfp4_k.0))
         .count();
-    let down_name = "glm_moe_decode_m16_k128w";
+    // ATLAS_GLM_MOE_DOWN_ZSKIP swaps only the down twin.
+    let zskip = std::env::var("ATLAS_GLM_MOE_DOWN_ZSKIP").as_deref() == Ok("1");
+    let (down_name, other_down) = if zskip {
+        ("glm_moe_decode_m16_k128w_zskip", "glm_moe_decode_m16_k128w")
+    } else {
+        ("glm_moe_decode_m16_k128w", "glm_moe_decode_m16_k128w_zskip")
+    };
     let [gate_up, down] = ["glm_moe_decode_m16_gate_up_silu_k128w", down_name].map(launches);
+    assert!(launches(other_down).is_empty());
     if std::env::var("ATLAS_GLM_MOE_DECODE_M16").as_deref() == Ok("1") {
         // One tile per routed expert, at most one expert per routed row.
         let (routed, bound) = (rows as u32 * 8, rows as u32 * 8);
@@ -164,11 +171,14 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
             "::verify_ffn_launches_the_m16_twins_only_with_the_flag"
         );
         let name = name.split_once("::").unwrap().1;
-        for mode in ["0", "1"] {
+        // Off, on, on with the zero-row skip, and the skip alone (ignored).
+        for (m16, zskip) in [("0", "0"), ("1", "0"), ("1", "1"), ("0", "1")] {
+            let mode = format!("{m16}{zskip}");
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args(["--exact", name, "--nocapture"])
-                .env(SENTINEL, mode)
-                .env("ATLAS_GLM_MOE_DECODE_M16", mode)
+                .env(SENTINEL, &mode)
+                .env("ATLAS_GLM_MOE_DECODE_M16", m16)
+                .env("ATLAS_GLM_MOE_DOWN_ZSKIP", zskip)
                 .env("ATLAS_GLM_INDEPENDENT_DECODE", "1")
                 .env("ATLAS_EP_PROTOCOL", "v2");
             for flag in [

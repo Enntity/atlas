@@ -9,6 +9,10 @@
 //! decode launches otherwise pad every tile to 64 rows; the twins compute
 //! the same MMAs per output element over 16-row tiles with the SiLU in the
 //! gate/up epilogue, so the bytes are identical (`moe_decode_bench`).
+//!
+//! `ATLAS_GLM_MOE_DOWN_ZSKIP=1` (with the flag above) launches the down twin
+//! that does not load weight rows whose activations are E2M1 zeros in every
+//! row of the tile: those MMA terms are exact zeros, so again the same bytes.
 
 use super::prequant_fp4::MtileGrid;
 use super::*;
@@ -28,22 +32,31 @@ impl DecodeM16 {
     pub(super) fn new(gpu: &dyn GpuBackend, config: &atlas_core::config::ModelConfig) -> Self {
         let requested = std::env::var("ATLAS_GLM_MOE_DECODE_M16").as_deref() == Ok("1");
         let on = requested && config.model_type == "glm5_next";
+        let zskip = std::env::var("ATLAS_GLM_MOE_DOWN_ZSKIP").as_deref() == Ok("1");
         let kernel = |name| super::super::try_kernel_gated(on, gpu, "moe_w4a16", name);
         let mut this = Self {
             gate_up_silu: kernel("glm_moe_decode_m16_gate_up_silu_k128w"),
-            down: kernel("glm_moe_decode_m16_k128w"),
+            down: kernel(if zskip {
+                "glm_moe_decode_m16_k128w_zskip"
+            } else {
+                "glm_moe_decode_m16_k128w"
+            }),
         };
         if !this.loaded() {
             // Both or neither: half a pair never launches.
             this.gate_up_silu = KernelHandle(0);
         }
-        if requested && gpu.op_cache().once("moe:decode_m16") {
+        if (requested || zskip) && gpu.op_cache().once("moe:decode_m16") {
             if this.loaded() {
                 tracing::info!(
-                    "ATLAS_GLM_MOE_DECODE_M16: M16 routed gate/up+SiLU and down for verify decode"
+                    "ATLAS_GLM_MOE_DECODE_M16: M16 routed gate/up+SiLU and down for verify decode (zero-row skip: {zskip})"
                 );
             } else if on {
                 tracing::warn!("ATLAS_GLM_MOE_DECODE_M16=1 ignored: target lacks the M16 kernels");
+            } else if !requested {
+                tracing::warn!(
+                    "ATLAS_GLM_MOE_DOWN_ZSKIP=1 ignored: it needs ATLAS_GLM_MOE_DECODE_M16=1"
+                );
             }
         }
         this

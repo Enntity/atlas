@@ -58,6 +58,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "moe_w4a4_grouped_gemm_prequant_t_k128",
     "glm_moe_decode_m16_gate_up_silu_k128w",
     "glm_moe_decode_m16_k128w",
+    "glm_moe_decode_m16_k128w_zskip",
     "moe_unpermute_reduce_indexed_ep",
     "moe_unpermute_reduce_indexed_ep_vec8",
     "moe_batched_blend",

@@ -34,6 +34,7 @@
 #ifndef PQD_STAGES
 #define PQD_STAGES 4
 #endif
+#define PQD_ZSKIP_KP 1024   // packed K bytes a ZSKIP tile can mask (K <= 2048)
 
 typedef unsigned char PqdA[PQD_M][PQ2_AP];
 typedef unsigned char PqdAs[PQD_M][PQ2_KS / GROUP_SIZE];
@@ -53,7 +54,8 @@ __device__ __forceinline__ void pqd_issue(
     const unsigned char* __restrict__ A_packed, const unsigned char* __restrict__ A_scale,
     const unsigned char* B_expert, const unsigned char* S_expert,
     const unsigned char* U_expert, const unsigned char* US_expert,
-    unsigned int M_eff, unsigned int cta_n, unsigned int N, unsigned int K, unsigned int kb
+    unsigned int M_eff, unsigned int cta_n, unsigned int N, unsigned int K, unsigned int kb,
+    const unsigned char* live
 ) {
     if (t < PQD_M * 4) {
         const unsigned int row = t >> 2, col = (t & 3) << 4;
@@ -68,7 +70,8 @@ __device__ __forceinline__ void pqd_issue(
         const unsigned int j = t + r * 256;
         const unsigned int kp = j / (PQW_NT / 16), c = j % (PQW_NT / 16);
         moe_cp_async_pred_16(&sB[kp][(c ^ (kp & 7)) << 4],
-            &(pqw_chunk_up<GATE_UP>(c) ? U_expert : B_expert)[(unsigned long long)(kb / 2 + kp) * N + pqw_chunk_col<GATE_UP>(cta_n, c)], true);
+            &(pqw_chunk_up<GATE_UP>(c) ? U_expert : B_expert)[(unsigned long long)(kb / 2 + kp) * N + pqw_chunk_col<GATE_UP>(cta_n, c)],
+            !live || live[kb / 2 + kp]);
     }
     if (t < PQW_NT / 2) {
         const unsigned int g = t / (PQW_NT / 16), c = t % (PQW_NT / 16);
@@ -185,7 +188,7 @@ __device__ __forceinline__ void pqd_epilogue(
     }
 }
 
-template<bool GATE_UP>
+template<bool GATE_UP, bool ZSKIP>
 __device__ __forceinline__ void pqd_impl(
     PQ2_ARGS,
     const unsigned int* __restrict__ worklist,
@@ -220,9 +223,27 @@ __device__ __forceinline__ void pqd_impl(
         sTok[t] = (sorted_token_ids && (int)t < M_expert) ? sorted_token_ids[cta_m + t] : (int)(cta_m + t);
     __syncthreads();
 
+    // ZSKIP: weight rows [kp] whose two activations are E2M1 zeros (codes 0
+    // and 8, +0 and -0) in every row of the tile are not loaded; their shared
+    // bytes are zero-filled. Each such term of an MMA is 0 * w before and
+    // 0 * 0 after, an exact zero either way, and the accumulators start at
+    // +0, so they are unchanged (moe_decode_bench's signed-zero stress).
+    __shared__ unsigned char sLive[ZSKIP ? PQD_ZSKIP_KP : 1];
+    const bool zskip = ZSKIP && K / 2 <= PQD_ZSKIP_KP;
+    if (zskip) {
+        for (unsigned int kp = t; kp < K / 2; kp += blockDim.x) {
+            unsigned int any = 0;
+            for (int r = 0; r < M_expert; ++r)
+                any |= A_packed[(unsigned long long)(unsigned int)sTok[r] * (K / 2) + kp] & 0x77u;
+            sLive[kp] = any != 0;
+        }
+        __syncthreads();
+    }
+
     auto issue = [&](int buf, unsigned int kb) {
         pqd_issue<GATE_UP>(t, sA[buf], sAs[buf], sB[buf], sS[buf], sTok, A_packed, A_scale,
-            B_expert, S_expert, U_expert, US_expert, (unsigned int)M_expert, cta_n, N, K, kb);
+            B_expert, S_expert, U_expert, US_expert, (unsigned int)M_expert, cta_n, N, K, kb,
+            zskip ? sLive : nullptr);
     };
 
     PqdAcc acc;
@@ -253,7 +274,18 @@ extern "C" __global__ void __launch_bounds__(256) glm_moe_decode_m16_k128w(
     PQ2_ARGS,
     const unsigned int* __restrict__ worklist
 ) {
-    pqd_impl<false>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
+    pqd_impl<false, false>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
+        expert_offsets, sorted_token_ids, num_experts, N, K, worklist, PqwGateUp{});
+}
+
+// The same projection, not loading weight rows that only multiply E2M1
+// zeros (ATLAS_GLM_MOE_DOWN_ZSKIP): for the down projection, whose NVFP4
+// SiLU·mul input has many. Same bytes.
+extern "C" __global__ void __launch_bounds__(256) glm_moe_decode_m16_k128w_zskip(
+    PQ2_ARGS,
+    const unsigned int* __restrict__ worklist
+) {
+    pqd_impl<false, true>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
         expert_offsets, sorted_token_ids, num_experts, N, K, worklist, PqwGateUp{});
 }
 
@@ -268,7 +300,7 @@ extern "C" __global__ void __launch_bounds__(256) glm_moe_decode_m16_gate_up_sil
     unsigned char* __restrict__ out_packed,
     unsigned char* __restrict__ out_scale
 ) {
-    pqd_impl<true>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
+    pqd_impl<true, false>(A_packed, A_scale, B_packed_ptrs, B_scale_ptrs, scale2_vals, C,
         expert_offsets, sorted_token_ids, num_experts, N, K, worklist,
         PqwGateUp{up_packed_ptrs, up_scale_ptrs, up_scale2_vals, out_packed, out_scale});
 }
