@@ -9,8 +9,12 @@
 //! last verify row (zeros after boot; under concurrent traffic, whichever
 //! sequence wrote last), so drafts — and with them accept counts and verify
 //! widths — depend on request history. `Legacy` keeps that, byte for byte.
-//! The other variants read the global row only when this sequence's own
-//! decode or verify wrote it, and differ in what the first propose appends.
+//!
+//! The other variants differ in what the first propose appends, and none of
+//! them trusts the shared row: a single-sequence decode copies its capture
+//! into the sequence's own row at once (`keep_own_capture`) and the propose
+//! appends from there. The shared row is read only right after this
+//! sequence's own verify, which a commit suppresses under unified ctx.
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -48,14 +52,20 @@ impl FirstAppend {
         })
     }
 
-    /// Read once at head construction and logged once.
+    /// Startup only. Every rank checks it before loading any weights, so a
+    /// typo costs no model load; the head then freezes it (`for_head`).
     pub fn from_env() -> Result<Self> {
         let raw = match std::env::var(FIRST_APPEND_ENV) {
             Ok(raw) => Some(raw),
             Err(std::env::VarError::NotPresent) => None,
             Err(error) => anyhow::bail!("{FIRST_APPEND_ENV}: {error}"),
         };
-        let variant = Self::parse(raw.as_deref())?;
+        Self::parse(raw.as_deref())
+    }
+
+    /// Read at head construction and logged once.
+    pub fn for_head() -> Result<Self> {
+        let variant = Self::from_env()?;
         tracing::info!(
             "DFlash first context append: {variant:?} ({FIRST_APPEND_ENV}=legacy|none|own|zero)"
         );
@@ -70,40 +80,97 @@ pub(super) enum AppendSource {
     Zero,
 }
 
+/// What this sequence itself ran last before a propose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Preceding {
+    /// Its prefill: this is the first propose.
+    Prefill,
+    /// Its single-sequence decode: the token is in its own row.
+    Decode,
+    /// Its verify: the caller's row is its own verify capture.
+    Verify,
+    /// Nothing the append may use (e.g. decode steps that captured nothing).
+    Other,
+}
+
 /// Pure source decision for the propose-side append; `None` = no append.
 ///
 /// `suppressed`: a commit already appended this capture (or the debug switch
-/// is set). `stack`: the caller's model-global capture row. `first`: this is
-/// the propose right after prefill. `own_capture`: `stack` was written by
-/// this sequence's own latest decode or verify.
+/// is set). `stack`: the caller's model-global capture row. `own_row`: this
+/// sequence's own row (non-legacy variants only).
 pub(super) fn decode_append_source(
     variant: FirstAppend,
     suppressed: bool,
     stack: Option<DevicePtr>,
     room: bool,
-    first: bool,
-    own_capture: bool,
+    preceding: Preceding,
     own_row: Option<DevicePtr>,
 ) -> Option<AppendSource> {
     let stack = stack.filter(|_| !suppressed && room)?;
-    match variant {
-        FirstAppend::Legacy => Some(AppendSource::Row(stack)),
-        _ if own_capture => Some(AppendSource::Row(stack)),
-        FirstAppend::Own if first => own_row.map(AppendSource::Row),
-        FirstAppend::Zero if first => Some(AppendSource::Zero),
+    match (variant, preceding) {
+        (FirstAppend::Legacy, _) | (_, Preceding::Verify) => Some(AppendSource::Row(stack)),
+        (_, Preceding::Decode) | (FirstAppend::Own, Preceding::Prefill) => {
+            own_row.map(AppendSource::Row)
+        }
+        (FirstAppend::Zero, Preceding::Prefill) => Some(AppendSource::Zero),
         _ => None,
     }
 }
 
-/// The model-global capture row now holds this sequence's own latest token
-/// (single-sequence decode), so its next propose may append it. No-op for
-/// other proposers.
-pub(crate) fn note_own_capture(state: &mut Option<Box<dyn ProposerState>>) {
-    if let Some(dstate) = state
-        .as_mut()
-        .and_then(|s| s.as_any_mut().downcast_mut::<DflashProposerState>())
-    {
+/// The row of a prefill pass holding its last position: `proc_count` rows,
+/// of which this rank holds those from `sp_row0` on, compacted at row 0.
+pub(crate) fn own_capture_row(proc_count: usize, sp_row0: usize) -> Option<usize> {
+    proc_count.checked_sub(sp_row0 + 1)
+}
+
+/// The caller's capture row now holds this sequence's own verify rows, so
+/// its next propose may append from it. No-op for other proposers.
+pub(crate) fn note_own_capture(state: &mut dyn ProposerState) {
+    if let Some(dstate) = state.as_any_mut().downcast_mut::<DflashProposerState>() {
         dstate.own_capture = true;
+    }
+}
+
+/// A single-sequence decode just left its token's hidden stack in the
+/// model-global capture row (`stack`). A sequence with a row of its own
+/// (non-legacy variants) copies it there before anything else can overwrite
+/// it, for the propose at `seq_len`. No-op for other proposers.
+pub(crate) fn keep_own_capture(
+    state: Option<&mut (dyn ProposerState + 'static)>,
+    stack: Option<DevicePtr>,
+    seq_len: usize,
+    gpu: &dyn GpuBackend,
+) -> Result<()> {
+    let Some(dstate) = state.and_then(|s| s.as_any_mut().downcast_mut::<DflashProposerState>())
+    else {
+        return Ok(());
+    };
+    // Whatever verify capture the row held is gone.
+    dstate.own_capture = false;
+    if let (Some(stack), Some(own_row)) = (stack, dstate.own_row) {
+        // The model's default stream: the one the decode captured on.
+        gpu.copy_d2d_async(stack, own_row, dstate.ctx_slot_bytes, gpu.default_stream())?;
+        dstate.own_row_at = Some(seq_len);
+    }
+    Ok(())
+}
+
+impl DflashProposerState {
+    /// Context bookkeeping at the end of a prefill whose last pass ended at
+    /// position `end` of a `prompt_len`-token prompt: the accumulator holds
+    /// the window's last positions, and the propose at `seq_len` is the first.
+    pub(crate) fn seed_prefill_ctx(&mut self, prompt_len: usize, end: usize, seq_len: usize) {
+        let window_start = prompt_len.max(end).saturating_sub(self.max_ctx_len);
+        let new_len = end.saturating_sub(window_start).min(self.max_ctx_len);
+        self.ctx_len = new_len;
+        // Phase I (v2): seed per-slot fixed positions for the prompt
+        // captures. Slot i holds prompt position window_start + i (the
+        // tail window kept by try_dflash_prefill_capture_layer). Keep
+        // parallel to ctx_len. Re-seed idempotently across prefill chunks.
+        self.ctx_positions = (window_start..window_start + new_len)
+            .map(|i| i as i32)
+            .collect();
+        self.first_append_at = Some(seq_len);
     }
 }
 
@@ -121,15 +188,21 @@ impl BlockDiffusionDraftHead {
         // EAGLE-fix: a commit that already appended this capture (in EAGLE
         // order) sets the one-shot flag so it is not appended twice.
         let eagle_skip = std::mem::take(&mut dstate.skip_next_decode_append);
-        let first = dstate.first_append_at.take() == Some(position);
-        let own_capture = std::mem::take(&mut dstate.own_capture);
+        let verify = std::mem::take(&mut dstate.own_capture);
+        let decode = dstate.own_row_at.take() == Some(position);
+        let prefill = dstate.first_append_at.take() == Some(position);
+        let preceding = match (verify, decode, prefill) {
+            (true, ..) => Preceding::Verify,
+            (_, true, _) => Preceding::Decode,
+            (_, _, true) => Preceding::Prefill,
+            _ => Preceding::Other,
+        };
         let Some(source) = decode_append_source(
             self.startup.diagnostics.first_append,
             self.startup.diagnostics.no_decode_append || eagle_skip,
             target_hidden_stack,
             dstate.ctx_len < dstate.max_ctx_len,
-            first,
-            own_capture,
+            preceding,
             dstate.own_row,
         ) else {
             return Ok(());

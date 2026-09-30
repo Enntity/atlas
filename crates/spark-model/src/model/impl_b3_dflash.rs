@@ -162,14 +162,14 @@ impl TransformerModel {
         // upper half, compacted at row 0) in the highway.
         let sp_row0 = crate::layers::glm_sp::current().map_or(0, |sp| sp.row0);
         first = first.max(chunk_start + sp_row0);
-        // `ATLAS_DFLASH_FIRST_APPEND=own`: keep this pass's last row — after
-        // the final chunk, the last prompt position — in the sequence's own
-        // spare row, whatever the window below keeps.
+        // Non-legacy `ATLAS_DFLASH_FIRST_APPEND`: keep this pass's last row —
+        // after the final chunk, the last prompt position — in the sequence's
+        // own spare row, whatever the window below keeps.
         if let Some(own_row) = own_row
-            && proc_count > sp_row0
+            && let Some(row) = crate::layers::dflash_head::own_capture_row(proc_count, sp_row0)
         {
             self.dflash_capture_rows(
-                proc_count - 1 - sp_row0,
+                row,
                 1,
                 own_row.offset(slot_idx * h * bf16),
                 n_capture * h * bf16,
@@ -210,18 +210,7 @@ impl TransformerModel {
                 .as_any_mut()
                 .downcast_mut::<crate::layers::DflashProposerState>()
         {
-            let end = chunk_start + proc_count;
-            let window_start = seq.tokens.len().max(end).saturating_sub(dstate.max_ctx_len);
-            let new_len = end.saturating_sub(window_start).min(dstate.max_ctx_len);
-            dstate.ctx_len = new_len;
-            // Phase I (v2): seed per-slot fixed positions for the prompt
-            // captures. Slot i holds prompt position window_start + i (the
-            // tail window kept by try_dflash_prefill_capture_layer). Keep
-            // parallel to ctx_len. Re-seed idempotently across prefill chunks.
-            dstate.ctx_positions = (window_start..window_start + new_len)
-                .map(|i| i as i32)
-                .collect();
-            dstate.first_append_at = Some(seq.seq_len);
+            dstate.seed_prefill_ctx(seq.tokens.len(), chunk_start + proc_count, seq.seq_len);
         }
         Ok(())
     }

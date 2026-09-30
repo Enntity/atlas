@@ -913,7 +913,7 @@ pub fn build_model(
                     None => DsparkStartupExecution::from_env_lenient(),
                 };
                 // Strict for every head: an unknown value fails the build.
-                startup.diagnostics.first_append = FirstAppend::from_env()?;
+                startup.diagnostics.first_append = FirstAppend::for_head()?;
                 let head = crate::layers::BlockDiffusionDraftHead::from_weights(
                     weights,
                     target_embed_for_dflash,

@@ -50,7 +50,7 @@ pub struct DsparkDiagnostics {
     /// `ATLAS_DFLASH_OPTION_B_DIAG=1`.
     pub option_b_diag: bool,
     /// `ATLAS_DFLASH_FIRST_APPEND=legacy|none|own|zero`. Strict, unlike the
-    /// probes above: the factory resolves it with `FirstAppend::from_env`.
+    /// probes above: the factory resolves it with `FirstAppend::for_head`.
     pub first_append: super::FirstAppend,
 }
 

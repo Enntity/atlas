@@ -700,6 +700,8 @@ impl TransformerModel {
                     .validate_access(expected)?;
             }
             proposer.after_verify(num_accepted, Some(expected), state.as_mut(), stream)?;
+            // The verify left this sequence's own rows in the capture buffer.
+            crate::layers::dflash_head::note_own_capture(state.as_mut());
         }
         Ok(())
     }

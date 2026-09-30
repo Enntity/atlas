@@ -152,8 +152,14 @@ impl Model for TransformerModel {
         self.stamp_overlay_route(seq.adapter_slot);
         self.stamp_decode_moe_single(seq.adapter_slot);
         let logits = self.decode_dispatch(token, seq, _stream)?;
-        // The decode left this token's hidden stack in the DFlash capture row.
-        crate::layers::dflash_head::note_own_capture(&mut seq.proposer_state);
+        // The decode left this token's hidden stack in the shared DFlash
+        // capture row; a sequence with a row of its own keeps it there.
+        crate::layers::dflash_head::keep_own_capture(
+            seq.proposer_state.as_deref_mut(),
+            self.dflash_hidden_save,
+            seq.seq_len,
+            self.gpu.as_ref(),
+        )?;
         self.finish_leaf_after_decode(seq);
         Ok(logits)
     }
