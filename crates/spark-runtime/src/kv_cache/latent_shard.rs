@@ -36,6 +36,26 @@ pub struct LatentShardSpec {
     pub write_rows: usize,
 }
 
+/// A side stream for pair exchanges that overlap compute, and the two
+/// events that fence it against the compute stream (`begun` is recorded on
+/// the compute stream, `landed` on the side stream).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExchangeLane {
+    pub stream: u64,
+    pub begun: u64,
+    pub landed: u64,
+}
+
+impl ExchangeLane {
+    fn new(gpu: &dyn GpuBackend) -> Result<Self> {
+        Ok(Self {
+            stream: gpu.create_stream()?,
+            begun: gpu.create_event()?,
+            landed: gpu.create_event()?,
+        })
+    }
+}
+
 /// A constructed latent shard (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LatentShard {
@@ -47,6 +67,8 @@ pub struct LatentShard {
     /// `u32[i] = i` for every local slot and view block: the block table of
     /// the local pool addressed by local token ids, and of assembled views.
     pub identity: DevicePtr,
+    /// Where the model may run its exchanges beside the compute stream.
+    pub lane: ExchangeLane,
 }
 
 /// How one rank assembles a sequence's logical blocks `[0, n)`.
@@ -162,11 +184,13 @@ impl PagedKvCache {
         let table: Vec<u8> = (0..LatentShard::identity_entries(num_blocks, &spec) as u32)
             .flat_map(u32::to_le_bytes)
             .collect();
-        let built = gpu
-            .copy_h2d(&table, identity)
-            .and_then(|()| Self::new_with_k_slots(config, num_blocks, local_blocks, gpu, true));
-        let mut cache = match built {
-            Ok(cache) => cache,
+        let built = gpu.copy_h2d(&table, identity).and_then(|()| {
+            let lane = ExchangeLane::new(gpu)?;
+            let cache = Self::new_with_k_slots(config, num_blocks, local_blocks, gpu, true)?;
+            Ok((lane, cache))
+        });
+        let (lane, mut cache) = match built {
+            Ok(built) => built,
             Err(error) => {
                 let _ = gpu.free(scratch);
                 return Err(error);
@@ -185,6 +209,7 @@ impl PagedKvCache {
             local_blocks,
             scratch,
             identity,
+            lane,
         });
         Ok(cache)
     }

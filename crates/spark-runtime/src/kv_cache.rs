@@ -469,7 +469,7 @@ mod sparse_index;
 mod sparse_index_impl;
 mod tail_slots;
 mod zero_impl;
-pub use latent_shard::{LatentShard, LatentShardSpec, LatentViewPlan};
+pub use latent_shard::{ExchangeLane, LatentShard, LatentShardSpec, LatentViewPlan};
 pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
 pub use tail_slots::{NO_TAIL, TailSlotPlan};
 #[cfg(test)]

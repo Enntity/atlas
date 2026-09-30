@@ -34,6 +34,7 @@ fn shard(rank: usize) -> LatentShard {
         local_blocks: 0,
         scratch: DevicePtr::NULL,
         identity: DevicePtr::NULL,
+        lane: ExchangeLane::default(),
     }
 }
 
