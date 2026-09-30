@@ -195,7 +195,10 @@ def fit(samples):
     y = [s[4] for s in samples]
     best = None
     for a in grid:
-        for b in [0.0] + [g for g in grid if g <= a]:
+        # No repeated rows (the prose table): b is unidentified; price a
+        # repeat like a new token so the tokens stay inert (b = a).
+        has_repeats = any(s[3] for s in samples)
+        for b in [0.0] + [g for g in grid if g <= a] if has_repeats else [a]:
             x = [features(s, a, b) for s in samples]
             c = nnls(x, y)
             sse = sum((sum(ci * xi for ci, xi in zip(c, r)) - v) ** 2 for r, v in zip(x, y))
