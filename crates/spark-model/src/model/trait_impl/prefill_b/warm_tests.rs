@@ -11,7 +11,7 @@
 mod fixture;
 
 use crate::layer::EmptyLayerState;
-use crate::model::warm_turn::{TraceMode, ZeroRows};
+use crate::model::warm_turn::{TraceMode, WarmTurn, ZeroRows};
 use crate::traits::{Model, SequenceState};
 use fixture::*;
 
@@ -238,6 +238,19 @@ fn actual_deep_tail_cut_restores_one_block_deeper() {
             "{ctx}"
         );
     }
+}
+
+/// Only GLM-5's template makes the deep cut restorable: another model
+/// refuses to load with the switch.
+#[test]
+fn actual_deep_tail_cut_is_refused_off_glm5() {
+    let name = "actual_deep_tail_cut_is_refused_off_glm5";
+    if in_child(name, &[("ATLAS_GLM_TAIL_CUT_DEEP", "1")]) {
+        return;
+    }
+    assert!(WarmTurn::from_env("glm5_next").is_ok());
+    let e = WarmTurn::from_env("qwen3_next").err().unwrap();
+    assert!(format!("{e:#}").contains("requires glm5_next"), "{e:#}");
 }
 
 /// `ATLAS_GLM_WARM_TRACE` logs the request's line after the last chunk (and

@@ -1,15 +1,91 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The warm-turn switches: the trace line and its logits hash, and what each
-//! environment value parses to.
+//! The warm-turn switches: the deep tail cut, the trace line and its logits
+//! hash, and what each environment value parses to.
 
 use super::*;
 
+const BS: usize = 16;
+
 /// A `WarmTurn` with every switch off but the trace `mode`.
 fn tracing(mode: TraceMode) -> WarmTurn {
-    let mut warm = WarmTurn::from_env().unwrap();
+    let mut warm = WarmTurn::from_env("glm5_next").unwrap();
     warm.trace = mode;
     warm
+}
+
+/// The base cut is what it was before the switch existed: one block below
+/// the last block boundary strictly under the prompt end (`pc_policy`'s own
+/// test pins `tail_cut`, which runs this with the switch off).
+#[test]
+fn the_base_tail_cut_is_unchanged() {
+    for n in 0..2_000usize {
+        let base = ((n.saturating_sub(1) / BS) * BS).saturating_sub(BS);
+        assert_eq!(tail_cut_at(n, BS, false), base, "n={n}");
+    }
+}
+
+/// The deep cut is the last block boundary strictly under the prompt end
+/// (`ssm_tail_boundary`): one block above the base cut, 2 to 16 rows under
+/// the end. It is at or below the match of a next turn whose history
+/// reproduces this prompt (`floor(n/16)*16`), and above the match of one
+/// that does not reproduce a suffix that crosses the boundary.
+#[test]
+fn the_deep_tail_cut_is_the_last_boundary_under_the_end() {
+    assert_eq!(tail_cut_at(40_000, BS, true), 39_984);
+    assert_eq!(tail_cut_at(40_002, BS, true), 40_000);
+    assert_eq!(tail_cut_at(40_016, BS, true), 40_000);
+    for n in 34..2_000 {
+        let (deep, base) = (tail_cut_at(n, BS, true), tail_cut_at(n, BS, false));
+        if n % BS == 1 {
+            continue;
+        }
+        assert_eq!(Some(deep), spark_runtime::ssm_tail_boundary(n, BS), "n={n}");
+        assert_eq!(deep, base + BS, "n={n}");
+        assert!(n - deep >= 2 && n - deep <= BS);
+        // A next turn that reproduces all `n` tokens matches this far.
+        assert!(deep <= n / BS * BS);
+        // One that diverges `suffix` tokens before the end matches less when
+        // the suffix crosses the boundary; the base cut is still under it.
+        for suffix in 1..=BS {
+            let matched = (n - suffix) / BS * BS;
+            assert_eq!(deep > matched, suffix > n - deep, "n={n} suffix={suffix}");
+            assert!(base <= matched);
+        }
+    }
+}
+
+/// Two prompts keep the base cut under the switch: one that ends one row
+/// past a boundary (a one-row final pass would take the decode path), and
+/// one the base cut does not split (32 tokens or fewer: no second pass and no
+/// checkpoint at token 16 appear that base does not have).
+#[test]
+fn the_deep_tail_cut_keeps_the_base_cut_where_it_would_add_a_pass_or_a_one_row_pass() {
+    for n in (0..=33).chain([49, 40_001]) {
+        let base = tail_cut_at(n, BS, false);
+        assert_eq!(tail_cut_at(n, BS, true), base, "n={n}");
+        if n <= 32 {
+            assert_eq!(base, 0, "n={n}: one pass");
+        } else {
+            assert_eq!(n - base, BS + 1, "n={n}: a 17-row final pass");
+        }
+    }
+    assert_eq!(tail_cut_at(34, BS, true), 32);
+}
+
+/// Only GLM-5's template makes the deep cut restorable; this process runs
+/// without the switch, which any model accepts.
+#[test]
+fn the_switches_load_for_any_model_while_the_deep_cut_is_off() {
+    assert!(!tail_cut_deep());
+    for model in ["glm5_next", "qwen3_next"] {
+        let warm = WarmTurn::from_env(model).unwrap();
+        assert!(!warm.skip_cached);
+        assert_eq!(
+            (warm.trace, warm.zero_rows),
+            (TraceMode::Off, ZeroRows::Off)
+        );
+    }
 }
 
 #[test]

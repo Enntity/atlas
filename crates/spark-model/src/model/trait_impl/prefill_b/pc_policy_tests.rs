@@ -5,7 +5,6 @@
 
 use super::{
     Agreed, agree_restore, branch_checkpoint_at, branch_split_at, layer_write_floor, tail_cut,
-    tail_cut_at,
 };
 
 const BS: usize = 16;
@@ -27,43 +26,6 @@ fn tail_cut_is_one_block_below_the_last_boundary() {
         let floor = (n - 1) / BS * BS;
         assert_eq!(tail_cut(n, BS), floor - BS, "n={n}");
         assert!(n - tail_cut(n, BS) > BS && n - tail_cut(n, BS) <= 2 * BS);
-    }
-}
-
-/// The deep cut is the last block boundary strictly under the prompt end:
-/// one block above the base cut, 2 to 16 rows under the end (a prompt one
-/// row past a boundary keeps the base cut rather than end in a one-row
-/// pass). It is at or below the match of a next turn whose history
-/// reproduces this prompt (`floor(n/16)*16`), and above the match of one
-/// that does not reproduce a suffix that crosses the boundary.
-#[test]
-fn the_deep_tail_cut_is_the_last_boundary_under_the_end() {
-    assert_eq!(tail_cut_at(40_000, BS, true), 39_984);
-    assert_eq!(tail_cut_at(40_002, BS, true), 40_000);
-    assert_eq!(tail_cut_at(40_016, BS, true), 40_000);
-    // One row past a boundary: the base cut, a 17-row final pass.
-    assert_eq!(tail_cut_at(40_001, BS, true), 39_984);
-    assert_eq!(tail_cut_at(16, BS, true), 0);
-    assert_eq!(tail_cut_at(0, BS, true), 0);
-    for n in 17..2_000 {
-        let (deep, base) = (tail_cut_at(n, BS, true), tail_cut_at(n, BS, false));
-        assert_eq!(base, tail_cut(n, BS), "the switch is off in this process");
-        assert!(deep.is_multiple_of(BS));
-        if n % BS == 1 {
-            assert_eq!((deep, n - deep), (base, BS + 1), "n={n}");
-            continue;
-        }
-        assert_eq!(deep, base + BS, "n={n}");
-        assert!(n - deep >= 2 && n - deep <= BS);
-        // A next turn that reproduces all `n` tokens matches this far.
-        assert!(deep <= n / BS * BS);
-        // One that diverges `suffix` tokens before the end matches less when
-        // the suffix crosses the boundary; the base cut is still under it.
-        for suffix in 1..=BS {
-            let matched = (n - suffix) / BS * BS;
-            assert_eq!(deep > matched, suffix > n - deep, "n={n} suffix={suffix}");
-            assert!(base <= matched);
-        }
     }
 }
 

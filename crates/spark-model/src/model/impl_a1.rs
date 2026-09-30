@@ -606,6 +606,7 @@ impl TransformerModel {
             && kv_cache.dtype() == spark_runtime::kv_cache::KvCacheDtype::Fp8;
         // Feature-2 overlay kernels: resolve before `gpu` is moved into Self.
         let overlay_kernels = crate::layers::ops::token_overlay::OverlayKernels::new(gpu.as_ref());
+        let warm = super::warm_turn::WarmTurn::from_env(&config.model_type)?;
         Ok(Self {
             // Installed by the factory after construction: the layers read
             // from the store during `new`, so it cannot be moved in here.
@@ -722,12 +723,12 @@ impl TransformerModel {
             fused_graph: Mutex::new(std::collections::HashMap::new()),
             verify_pieces: Default::default(),
             prefix_cache,
+            warm,
             secondary_stream,
             secondary_event,
             snapshot_event,
             comm,
             ep_cmd_buf,
-            warm: super::warm_turn::WarmTurn::from_env()?,
             ep_protocol_v2: matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2")),
             self_speculative,
             last_mtp_hidden_idx: std::sync::atomic::AtomicUsize::new(0),

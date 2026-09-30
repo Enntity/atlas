@@ -55,7 +55,7 @@
 //!    restore depth is `cut` already has an empty first half, which
 //!    `ATLAS_GLM_WARM_SKIP_CACHED` makes free. The cut sits 17 to 32 rows
 //!    under `N`, and the next turn replays them [a fixed number of rows,
-//!    each priced as `new`]; `ATLAS_GLM_TAIL_CUT_DEEP` (`pc_policy::tail_cut_at`)
+//!    each priced as `new`]; `ATLAS_GLM_TAIL_CUT_DEEP` ([`tail_cut_at`])
 //!    moves it one block up. That changes pass shapes, so it is its own
 //!    switch.
 //! 9. Final norm and LM head on the last row [fixed: one sweep of the head],
@@ -103,14 +103,15 @@
 //! arena either way; but a decode step of another sequence that runs between
 //! two chunks finds what the last chunk left, so ranks with different values
 //! hand that step different leftovers. All three must be the same on every
-//! rank (`pc_policy::tail_cut_deep`, [`skip_cached_requested`], [`ZeroRows::from_env`]
+//! rank ([`tail_cut_deep`], [`skip_cached_requested`], [`ZeroRows::from_env`]
 //! are what a startup agreement reads). `ATLAS_GLM_WARM_TRACE` and the
 //! scheduler's `ATLAS_GLM_WARM_CHUNK_RUN` are local to a rank.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use parking_lot::Mutex;
 
 #[cfg(test)]
@@ -124,6 +125,59 @@ fn env_on(name: &str) -> bool {
 /// `ATLAS_GLM_WARM_SKIP_CACHED=1`: see "Rank parity" above.
 pub(in crate::model) fn skip_cached_requested() -> bool {
     env_on("ATLAS_GLM_WARM_SKIP_CACHED")
+}
+
+/// `ATLAS_GLM_TAIL_CUT_DEEP=1`: see [`tail_cut_at`] and "Rank parity" above.
+/// Read once; a model other than GLM-5 refuses it at load.
+pub(in crate::model) fn tail_cut_deep() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_on("ATLAS_GLM_TAIL_CUT_DEEP"))
+}
+
+/// The tail-split cut for a `total`-token prompt
+/// (`prefill_chunk_dispatch_with`): where the last chunk is split and the
+/// checkpoint the conversation's next turn restores is saved.
+///
+/// Base: one block below `spark_runtime::ssm_tail_boundary`, the last block
+/// boundary strictly under `total`. That is at or below the next turn's
+/// match even when the template's generation-only suffix is not reproduced in
+/// the re-rendered history and crosses the boundary; the next turn then
+/// replays the 17 to 32 rows from there to this prompt's end, plus what is
+/// new.
+///
+/// `deep` (`ATLAS_GLM_TAIL_CUT_DEEP=1`, default off, GLM-5 only): that
+/// boundary itself, so 2 to 16 rows, 16 fewer on a warm turn, and a final
+/// pass of this prompt of 2 to 16 rows instead of 18 to 32. It is where
+/// `ATLAS_SSM_TAIL_CKPT` put its checkpoint, which stayed off because the
+/// extra pass to land it cost what the replay it saved was worth; here that
+/// pass exists already (the base cut's) and only moves. The next turn can
+/// restore at the deep cut only when its match reaches this prompt's last
+/// whole block, that is when its history reproduces this prompt to its end.
+/// GLM-5's template does (`<|assistant|><think>` is rendered again, whatever
+/// follows); a template that does not, or a turn that edits the last
+/// message, leaves the checkpoint above the match, and the turn falls back
+/// to the one before and replays that whole turn.
+///
+/// Two prompts keep the base cut: one that ends one row past a boundary (its
+/// final pass would be a single row, which takes the decode path of
+/// `forward_layers`; that path serves a prefill today only when a chunk
+/// boundary leaves a one-row last chunk), and one of 32 tokens or fewer (the
+/// base cut does not split it, and a checkpoint at 16 is under the restore
+/// floor).
+///
+/// Same kernels and math, other pass shapes: like any change of where a
+/// pass starts, the result can differ bitwise from the base cut's (see
+/// `pc_policy`, "Accumulation order"), on cold prefills too. A warm turn
+/// also hands the DFlash drafter 16 fewer context rows, since its context is
+/// filled from the rows a prefill processes; what that costs in acceptance
+/// is measured, not derived.
+pub(in crate::model) fn tail_cut_at(total: usize, bs: usize, deep: bool) -> usize {
+    let tail = spark_runtime::ssm_tail_boundary(total, bs).unwrap_or(0);
+    if deep && tail > bs && total - tail > 1 {
+        tail
+    } else {
+        tail.saturating_sub(bs)
+    }
 }
 
 /// The warm-turn switches and the state they keep, one per model.
@@ -141,7 +195,13 @@ pub(in crate::model) struct WarmTurn {
 }
 
 impl WarmTurn {
-    pub(in crate::model) fn from_env() -> Result<Self> {
+    /// The switches of a `model_type` model, from the environment.
+    pub(in crate::model) fn from_env(model_type: &str) -> Result<Self> {
+        ensure!(
+            !tail_cut_deep() || model_type == "glm5_next",
+            "ATLAS_GLM_TAIL_CUT_DEEP requires glm5_next (got {model_type}): the deep cut is \
+             restorable only under a template that re-renders its generation prompt"
+        );
         Ok(Self {
             skip_cached: skip_cached_requested(),
             trace: TraceMode::parse(std::env::var("ATLAS_GLM_WARM_TRACE").ok().as_deref())?,
