@@ -199,9 +199,11 @@ fn index_logits_launch(
     let row_tiles = rows.div_ceil(rows_per_cta);
     let grid_x = if v2 {
         // About eight waves of three CTAs on GB10's 48 SMs, but at least 16
-        // chunks per CTA so its query rows are reloaded rarely.
+        // chunks per CTA (so query rows are reloaded rarely) unless that
+        // leaves less than one wave.
         let chunks = logits_stride.div_ceil(32);
-        1152u32.div_ceil(row_tiles).min(chunks / 16).max(1)
+        let floor = (chunks / 16).max(144u32.div_ceil(row_tiles));
+        1152u32.div_ceil(row_tiles).min(floor).min(chunks).max(1)
     } else {
         logits_stride.div_ceil(pools_per_cta)
     };
@@ -432,10 +434,12 @@ mod tests {
     fn v2_grid_width_trades_waves_against_query_reloads() {
         // 1024 row tiles already fill the waves: each CTA walks half the history.
         assert_eq!(v2(4096, 15361), [2, 1024, 1]);
-        // Fewer rows split the history further, down to 16 chunks per CTA.
-        assert_eq!(v2(8, 16385), [32, 2, 1]);
+        // Fewer rows split the history further, down to 16 chunks per CTA,
+        // or fewer when that would leave less than one wave.
         assert_eq!(v2(512, 16500), [9, 128, 1]);
-        assert_eq!(v2(9, 33), [1, 3, 1]);
+        assert_eq!(v2(64, 16400), [32, 16, 1]);
+        assert_eq!(v2(8, 16385), [72, 2, 1]);
+        assert_eq!(v2(9, 33), [2, 3, 1]);
         let launch = geometry(4, GLM_INDEX_LOGITS_V2_POOLS).unwrap();
         assert_eq!((launch.block, launch.shared_mem), ([128, 1, 1], 32_768));
     }

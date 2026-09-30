@@ -101,8 +101,9 @@ static void launch(const Variant* v, unsigned gx, const Bufs& b, const Cache& c,
 static unsigned default_gx(const Variant& v, unsigned rows, unsigned stride) {
     const unsigned chunks = (stride + v.pools - 1) / v.pools;
     const unsigned row_blocks = (rows + v.warps - 1) / v.warps;
-    const unsigned want = std::max(1u, (48u * 3 * 8 + row_blocks - 1) / row_blocks);
-    return std::max(1u, std::min(want, chunks / 16));
+    const unsigned want = (48u * 3 * 8 + row_blocks - 1) / row_blocks;
+    const unsigned floor = std::max(chunks / 16, (48u * 3 + row_blocks - 1) / row_blocks);
+    return std::max(1u, std::min({want, floor, chunks}));
 }
 
 static size_t compare(const Bufs& b, unsigned rows, unsigned stride, std::vector<unsigned>& h0,
@@ -265,9 +266,10 @@ int main(int argc, char** argv) {
             }
         }
     }
-    // Small row counts at a 64K extent (decode-like rows and short appends).
-    for (unsigned rows : {8u, 64u, 512u}) {
-        const unsigned start = 65536, stride = (start + rows + 3) / 4;
+    // Small launches (verify rows, short appends, piece tails).
+    for (const auto& rs : {std::pair{1u, 4096u}, {13u, 4096u}, {8u, 65536u}, {64u, 65536u},
+                           {512u, 65536u}}) {
+        const unsigned rows = rs.first, start = rs.second, stride = (start + rows + 3) / 4;
         const double gflop = (double)rows * stride * 32 * 128 * 2 / 1e9;
         const float old_ms = best_ms([&] { launch(nullptr, 0, b, c16, 0, rows, start, stride); });
         const Variant& v = kVariants[0];
