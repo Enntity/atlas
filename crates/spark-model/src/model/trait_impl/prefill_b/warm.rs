@@ -31,6 +31,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::super::super::types::TransformerModel;
+use super::super::super::warm_turn::{PHASES, RequestShape};
+use crate::traits::SequenceState;
 
 /// Whether chunk `[start, start + len)` computes nothing: it is not the last
 /// chunk (whose final row always runs, for the logits) and a snapshot or
@@ -78,10 +80,68 @@ impl TransformerModel {
             self.buffers
                 .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
         }
+        self.warm_trace_sync(stream)?;
         let zero = t0.elapsed();
         // ── Phase 1+1b: embed chunk + vision pad overlay ──
         self.prefill_b_embed_chunk(tokens, chunk_start, chunk_len, stream)?;
+        self.warm_trace_sync(stream)?;
         Ok([zero, t0.elapsed() - zero])
+    }
+
+    /// `ATLAS_GLM_WARM_TRACE`: drain `stream`, so the span being timed holds
+    /// the device time of its own launches. Nothing with the switch off.
+    pub(super) fn warm_trace_sync(&self, stream: u64) -> Result<()> {
+        if self.warm.trace {
+            self.gpu.synchronize(stream)?;
+        }
+        Ok(())
+    }
+
+    /// `ATLAS_GLM_WARM_TRACE`: add a chunk that began at `began` and computed
+    /// `rows` rows to its request's trace, and log the request's line after
+    /// the last chunk. `pre` is the zero and embed spans; `marks` are the
+    /// lookup span and the times since `began` at which the lookup (with a
+    /// late zero and embed), the block reservation, the metadata and the
+    /// forward were done. What follows the forward is the finish.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn warm_trace_chunk(
+        &self,
+        seq: &SequenceState,
+        prompt: usize,
+        began: Instant,
+        rows: usize,
+        pre: [Duration; 2],
+        marks: [Duration; 5],
+        is_last: bool,
+        stream: u64,
+    ) -> Result<()> {
+        if !self.warm.trace {
+            return Ok(());
+        }
+        self.gpu.synchronize(stream)?;
+        let [lookup, looked, reserved, meta, forward] = marks;
+        let spans: [Duration; PHASES.len() - 1] = [
+            pre[0],
+            pre[1],
+            lookup,
+            reserved.saturating_sub(looked),
+            meta.saturating_sub(reserved),
+            forward.saturating_sub(meta),
+            began.elapsed().saturating_sub(forward),
+        ];
+        let shape = is_last.then(|| RequestShape {
+            rank: self.comm.as_ref().map_or(0, |c| c.rank()),
+            prompt,
+            matched: seq.cached_prefix_tokens,
+            restored: seq.marconi_skip_to,
+        });
+        if let Some(line) = self
+            .warm
+            .note_chunk(seq.slot_idx, began, rows, spans, shape)
+        {
+            tracing::info!("{line}");
+        }
+        Ok(())
     }
 }
 

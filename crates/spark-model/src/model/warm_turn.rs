@@ -48,9 +48,10 @@
 //!    the radix insert of the prompt [cached blocks, host], then the
 //!    scheduler reads the logits and samples [fixed].
 //!
-//! `ATLAS_PROFILE_PREFILL` logs each chunk's host submit time and the
-//! scheduler's `Done:` line the TTFT. Nothing sums a request, or times its
-//! prompt transfer, lookup and finish.
+//! `ATLAS_GLM_WARM_TRACE=1` logs one line per request and rank with these
+//! steps' time ([`Trace`]). `ATLAS_PROFILE_PREFILL` (per chunk, host submit
+//! time) and the scheduler's `Done: ... TTFT=` line were there before; the
+//! per-request sum, the prompt transfer, the lookup and the finish were not.
 //!
 //! # What is not removed, and why
 //!
@@ -78,7 +79,9 @@
 //! command and no collective: a rank without it only does the work the other
 //! skips.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 use parking_lot::Mutex;
@@ -106,8 +109,14 @@ pub(in crate::model) struct WarmTurn {
     /// `ATLAS_GLM_WARM_SKIP_CACHED=1`: a chunk that computes nothing does not
     /// zero the arena or embed (`prefill_b::warm`).
     pub(in crate::model) skip_cached: bool,
+    /// `ATLAS_GLM_WARM_TRACE=1`: the per-request line of [`Trace`].
+    pub(in crate::model) trace: bool,
     /// The prompts of the prefill commands this rank sent or received.
     prompts: Mutex<PromptMirrors>,
+    /// Prompt-transfer time not yet charged to a request, and when the
+    /// first of those transfers began.
+    transfer: Mutex<(Duration, Option<Instant>)>,
+    traces: Mutex<HashMap<usize, Trace>>,
 }
 
 impl WarmTurn {
@@ -115,7 +124,10 @@ impl WarmTurn {
         Self {
             prompt_delta: prompt_delta_requested(),
             skip_cached: env_on("ATLAS_GLM_WARM_SKIP_CACHED"),
+            trace: env_on("ATLAS_GLM_WARM_TRACE"),
             prompts: Mutex::default(),
+            transfer: Mutex::default(),
+            traces: Mutex::default(),
         }
     }
 }
@@ -250,6 +262,7 @@ impl TransformerModel {
         if self.comm.is_none() {
             return Ok(());
         }
+        let t0 = Instant::now();
         if self.warm.prompt_delta {
             let mut mirrors = self.warm.prompts.lock();
             let (words, from) = mirrors.advance(seq_id as usize, tokens);
@@ -260,12 +273,14 @@ impl TransformerModel {
         } else {
             self.ep_broadcast_tokens(tokens)?;
         }
+        self.warm.charge_transfer(t0);
         Ok(())
     }
 
     /// Worker: the `full_len`-token prompt of a prefill command.
     pub(in crate::model) fn ep_recv_prompt(&self, full_len: usize) -> Result<Arc<Vec<u32>>> {
-        if self.warm.prompt_delta {
+        let t0 = Instant::now();
+        let prompt = if self.warm.prompt_delta {
             let words = self.ep_broadcast_tokens(&[0u32; ANNOUNCE_WORDS])?;
             let words: [u32; ANNOUNCE_WORDS] = words[..].try_into()?;
             let mut mirrors = self.warm.prompts.lock();
@@ -273,9 +288,98 @@ impl TransformerModel {
                 0 => Vec::new(),
                 n => self.ep_broadcast_tokens(&vec![0u32; n])?,
             };
-            mirrors.rebuild(words, &suffix)
+            mirrors.rebuild(words, &suffix)?
         } else {
-            Ok(Arc::new(self.ep_broadcast_tokens(&vec![0u32; full_len])?))
+            Arc::new(self.ep_broadcast_tokens(&vec![0u32; full_len])?)
+        };
+        self.warm.charge_transfer(t0);
+        Ok(prompt)
+    }
+}
+
+/// One request's prefill on one rank, for the `ATLAS_GLM_WARM_TRACE` line.
+/// Times are host wall clock; with the switch on the chunk syncs its stream
+/// at each boundary, so a span holds the device time of its own work.
+#[derive(Default)]
+pub(in crate::model) struct Trace {
+    started: Option<Instant>,
+    chunks: usize,
+    cached_chunks: usize,
+    rows: usize,
+    spans: [Duration; PHASES.len()],
+}
+
+/// The spans of one chunk, in [`Trace`] order after the prompt transfer.
+pub(in crate::model) const PHASES: [&str; 8] = [
+    "transfer", "zero", "embed", "lookup", "blocks", "meta", "forward", "finish",
+];
+
+impl WarmTurn {
+    fn charge_transfer(&self, since: Instant) {
+        if self.trace {
+            let mut pending = self.transfer.lock();
+            pending.0 += since.elapsed();
+            pending.1.get_or_insert(since);
         }
+    }
+
+    /// Add one chunk of `slot`'s request: `rows` computed rows (0 for a
+    /// cached chunk) and its spans (`PHASES[1..]`), `began` when the chunk
+    /// started. Returns the request's line when `last`; its `wall` runs from
+    /// the request's first prompt transfer (or first chunk) to now.
+    pub(in crate::model) fn note_chunk(
+        &self,
+        slot: usize,
+        began: Instant,
+        rows: usize,
+        spans: [Duration; PHASES.len() - 1],
+        last: Option<RequestShape>,
+    ) -> Option<String> {
+        let mut traces = self.traces.lock();
+        let t = traces.entry(slot).or_default();
+        let (transfer, sent) = std::mem::take(&mut *self.transfer.lock());
+        t.started.get_or_insert(sent.unwrap_or(began));
+        t.chunks += 1;
+        t.cached_chunks += usize::from(rows == 0);
+        t.rows += rows;
+        t.spans[0] += transfer;
+        for (sum, span) in t.spans[1..].iter_mut().zip(spans) {
+            *sum += span;
+        }
+        let shape = last?;
+        let t = traces.remove(&slot)?;
+        Some(t.line(slot, &shape))
+    }
+}
+
+/// What the request's line says about the prompt.
+pub(in crate::model) struct RequestShape {
+    pub rank: usize,
+    pub prompt: usize,
+    pub matched: usize,
+    pub restored: usize,
+}
+
+impl Trace {
+    fn line(&self, slot: usize, s: &RequestShape) -> String {
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let spans: Vec<String> = PHASES
+            .iter()
+            .zip(self.spans)
+            .map(|(name, d)| format!("{name}={:.1}", ms(d)))
+            .collect();
+        format!(
+            "warm-turn rank={} slot={slot} tokens={} matched={} restored={} chunks={} \
+             cached_chunks={} rows={} ms: {} wall={:.1}",
+            s.rank,
+            s.prompt,
+            s.matched,
+            s.restored,
+            self.chunks,
+            self.cached_chunks,
+            self.rows,
+            spans.join(" "),
+            self.started.map_or(0.0, |t| ms(t.elapsed())),
+        )
     }
 }

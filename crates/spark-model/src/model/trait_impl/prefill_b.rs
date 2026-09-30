@@ -217,6 +217,7 @@ impl TransformerModel {
             stream,
             None,
         )?;
+        self.warm_trace_sync(stream)?;
         let t_lookup = tp.elapsed() - t_embed;
         // ATLAS_GLM_PC_BRANCH: split at the planned branch checkpoint.
         let span = (chunk_start, chunk_len);
@@ -283,6 +284,8 @@ impl TransformerModel {
                     .extend_from_slice(&tokens[chunk_start..chunk_start + chunk_len]);
                 seq.seq_len = chunk_start + chunk_len;
                 seq.last_decode_ckpt_block = seq.tokens.len() / bs;
+                let marks = [t_lookup, t_prefix, t_blocks, t_blocks, t_blocks];
+                self.warm_trace_chunk(seq, total, tp, 0, t_pre, marks, false, stream)?;
                 return Ok(ptr);
             }
         };
@@ -396,6 +399,8 @@ impl TransformerModel {
             stream,
         )?;
         let t_fwd = tp.elapsed();
+        self.warm_trace_sync(stream)?;
+        let marks = [t_lookup, t_prefix, t_blocks, t_meta, tp.elapsed()];
         // Measure the forward's true GPU execution: the launches are async, so
         // `t_fwd` is submission time only. A profile-only sync here isolates
         // real GPU duration from the memset/H2D drain attributed to `embed`.
@@ -461,7 +466,7 @@ impl TransformerModel {
             stream,
         )?;
 
-        if is_last_chunk {
+        let out = if is_last_chunk {
             // ── Phase 6+7+8: final norm, lm_head, prefix-cache + snapshot save ──
             self.prefill_b_finalize_last(
                 tokens,
@@ -471,7 +476,7 @@ impl TransformerModel {
                 chunk_len,
                 proc_count,
                 stream,
-            )
+            )?
         } else {
             // ── Phase 9: intermediate Marconi checkpoint ──
             self.prefill_b_save_checkpoint(
@@ -482,7 +487,10 @@ impl TransformerModel {
                 chunk_len,
                 stream,
             )?;
-            Ok(DevicePtr::NULL)
-        }
+            DevicePtr::NULL
+        };
+        let last = is_last_chunk;
+        self.warm_trace_chunk(seq, total, tp, proc_count, t_pre, marks, last, stream)?;
+        Ok(out)
     }
 }

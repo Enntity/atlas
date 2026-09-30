@@ -3,7 +3,7 @@
 //! A chunk the cache covers completely: which chunk that is, and on the real
 //! `prefill_chunk` that the switch changes nothing but the zero and embed of
 //! those chunks. Then the worker's real chunk handler fed the prompt as a
-//! delta.
+//! delta, and the trace switch.
 
 // The real model and recording layer of `prefill_stream_tests`.
 #[allow(clippy::duplicate_mod)]
@@ -217,4 +217,21 @@ fn actual_worker_chunks_run_the_same_from_the_prompt_delta() {
     assert_eq!(bulk.0.len(), 3);
     assert_eq!((&bulk.1, bulk.2, bulk.3), (&tokens, 24, 6));
     assert_eq!(delta, bulk);
+}
+
+/// `ATLAS_GLM_WARM_TRACE` syncs the stream at every step of a chunk and logs
+/// the request's line after the last one: the passes, the sequence and the
+/// zeroed chunks are those of a run without it.
+#[test]
+fn actual_trace_changes_no_pass() {
+    let tokens: Vec<u32> = (1..=24).collect();
+    let cold = |trace: bool| {
+        let mut f = Fixture::with_tail_split(2, 2, 0);
+        f.disable_capture();
+        f.model.warm.trace = trace;
+        let mut seq = std::mem::replace(&mut f.seq, SequenceState::host_only(0));
+        let zeroed = run_chunks(&f, &mut seq, &tokens);
+        (f.events(), seq.seq_len, seq.block_table.len(), zeroed)
+    };
+    assert_eq!(cold(true), cold(false));
 }

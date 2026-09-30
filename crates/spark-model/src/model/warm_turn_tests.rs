@@ -2,7 +2,7 @@
 
 //! The prompt delta: what the head sends, what the worker rebuilds from it,
 //! that the wire is unchanged with the switch off, and that a rank out of
-//! step fails instead of prefilling another prompt.
+//! step fails instead of prefilling another prompt. Then the trace line.
 
 // The real model and byte transport of `idle_command_tests`.
 #[allow(clippy::duplicate_mod)]
@@ -225,4 +225,67 @@ fn actual_worker_behind_the_head_fails_on_the_announce_words() {
     let e = worker.model.ep_recv_prompt(32).unwrap_err();
     assert!(format!("{e:#}").contains("out of step"), "{e:#}");
     assert!(worker.record.words.lock().is_empty());
+}
+
+#[test]
+fn the_trace_line_sums_a_requests_chunks_and_forgets_them() {
+    let ms = Duration::from_millis;
+    let mut warm = WarmTurn::from_env();
+    warm.trace = true;
+    let began = Instant::now();
+    let shape = || RequestShape {
+        rank: 1,
+        prompt: 40,
+        matched: 32,
+        restored: 16,
+    };
+    warm.charge_transfer(began - ms(2));
+    // Two cached chunks: no rows, a lookup and a block vote.
+    let cached = [ms(0), ms(0), ms(3), ms(1), ms(0), ms(0), ms(0)];
+    assert_eq!(warm.note_chunk(7, began, 0, cached, None), None);
+    assert_eq!(warm.note_chunk(7, began, 0, cached, None), None);
+    // Another slot's chunk in between stays out of this request's line.
+    assert_eq!(warm.note_chunk(2, began, 99, [ms(50); 7], None), None);
+    let pass = [ms(17), ms(2), ms(0), ms(1), ms(1), ms(100), ms(5)];
+    assert_eq!(warm.note_chunk(7, began, 8, pass, None), None);
+    let line = warm.note_chunk(7, began, 16, pass, Some(shape())).unwrap();
+    assert!(
+        line.starts_with(
+            "warm-turn rank=1 slot=7 tokens=40 matched=32 restored=16 chunks=4 \
+             cached_chunks=2 rows=24 ms: transfer="
+        ),
+        "{line}"
+    );
+    for span in [
+        "zero=34.0",
+        "embed=4.0",
+        "lookup=6.0",
+        "blocks=4.0",
+        "meta=2.0",
+        "forward=200.0",
+        "finish=10.0",
+    ] {
+        assert!(line.contains(span), "{span}: {line}");
+    }
+    // The transfer was charged to the first chunk noted after it (about
+    // 2 ms), and the wall clock starts with it.
+    let ms_of = |key: &str| -> f64 {
+        let at = line.find(key).unwrap() + key.len();
+        line[at..].split(' ').next().unwrap().parse().unwrap()
+    };
+    assert!((2.0..50.0).contains(&ms_of("transfer=")), "{line}");
+    assert!(ms_of("wall=") >= ms_of("transfer="), "{line}");
+    // The request is gone; the other slot's chunk is still pending.
+    let next = warm.note_chunk(7, began, 1, pass, Some(shape())).unwrap();
+    assert!(next.contains("chunks=1 cached_chunks=0 rows=1 "), "{next}");
+    let other = warm.note_chunk(2, began, 1, pass, Some(shape())).unwrap();
+    assert!(
+        other.contains("chunks=2 cached_chunks=0 rows=100 "),
+        "{other}"
+    );
+
+    // With the switch off no transfer time is kept.
+    warm.trace = false;
+    warm.charge_transfer(began - ms(2));
+    assert_eq!(*warm.transfer.lock(), (Duration::ZERO, None));
 }
