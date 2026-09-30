@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! ATLAS_GLM_MOE_DECODE_M16 dispatch through the actual verify FFN entry;
-//! the numerics are gated on hardware by scripts/moe-decode-bench.
+//! ATLAS_GLM_MOE_DECODE_M16 / _K128W dispatch through the actual verify FFN
+//! entries; the numerics are gated on hardware by scripts/moe-decode-bench.
 use super::*;
 use crate::layers::moe::decode_m16::{MAX_ROWS, m16_shape};
 
@@ -18,10 +18,35 @@ fn m16_tiles_cover_one_row_slab_of_k128_aligned_experts() {
     assert!(!m16_shape(8, 4096 + 128, 1024));
 }
 
-/// One verify FFN of `rows` rows through `forward_independent`; the launches
-/// as `(handle, grid, block, args)` and the arena.
-fn verify_ffn(gpu: &Gpu, rank: usize, vector: bool, rows: usize) -> Vec<Event> {
-    let (_store, config, mut layer) = resident_tests::setup(gpu, rank);
+/// How a routed FFN batch reaches the MoE.
+#[derive(Clone, Copy, PartialEq)]
+enum Entry {
+    /// One verify block through `forward_independent`.
+    Independent,
+    /// 3-row verify blocks of several owners through the C3 grouped
+    /// `forward_prefill`.
+    Owner,
+    /// A plain `forward_prefill` batch: not verify decode.
+    Prefill,
+}
+
+fn env_on(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
+}
+
+/// One FFN of `rows` rows through `entry`, with every expert local at half
+/// the width (`expert_tp`, the served topology) or this rank's half of the
+/// experts at full width; checks the launches the flags swap and returns the
+/// trace.
+fn verify_ffn(
+    gpu: &Gpu,
+    rank: usize,
+    vector: bool,
+    expert_tp: bool,
+    entry: Entry,
+    rows: usize,
+) -> Vec<Event> {
+    let (_store, config, mut layer) = resident_tests::setup_with(gpu, rank, expert_tp);
     layer
         .transpose_for_prefill_unified_keep_shared(gpu, &config)
         .unwrap();
@@ -59,17 +84,30 @@ fn verify_ffn(gpu: &Gpu, rank: usize, vector: bool, rows: usize) -> Vec<Event> {
     let pool =
         crate::layer::ssm_batch::SsmPoolView::new(&h, &conv, 2097152, 2097152, 196608, 8).unwrap();
     let slots = [7, 0, 6, 1, 5, 2, 4, 3];
-    ctx.ssm_batch = Some(
-        crate::layer::ssm_batch::SsmBatchView::new(pool, metadata.offset(256), &slots[..rows])
-            .unwrap(),
-    );
+    if entry == Entry::Independent {
+        ctx.ssm_batch = Some(
+            crate::layer::ssm_batch::SsmBatchView::new(pool, metadata.offset(256), &slots[..rows])
+                .unwrap(),
+        );
+    }
     let (up_out, scratch) = (arena.expert_up_out(), arena.moe_router_in_f32());
     gpu.clear();
-    layer
-        .forward_independent(arena.norm_output(), rows, &ctx, 91)
-        .unwrap();
+    match entry {
+        Entry::Independent => {
+            layer
+                .forward_independent(arena.norm_output(), rows, &ctx, 91)
+                .unwrap();
+        }
+        Entry::Owner => crate::layers::moe::with_owner_rows(rows as u32, || {
+            layer.forward_prefill(arena.norm_output(), rows, &ctx, 91)
+        })
+        .unwrap(),
+        Entry::Prefill => layer
+            .forward_prefill(arena.norm_output(), rows, &ctx, 91)
+            .unwrap(),
+    }
     let trace = gpu.trace();
-    // The launches the flag swaps, by kernel.
+    // The launches the flags swap, by kernel.
     let launches = |name: &str| -> Vec<([u32; 3], [u32; 3], Vec<Arg>)> {
         let handle = gpu.kernel("moe_w4a16", name).unwrap().0;
         trace
@@ -109,34 +147,43 @@ fn verify_ffn(gpu: &Gpu, rank: usize, vector: bool, rows: usize) -> Vec<Event> {
         .filter(|e| matches!(e, Event::Launch(h, ..) if *h == layer.silu_mul_quant_nvfp4_k.0))
         .count();
     // ATLAS_GLM_MOE_DOWN_ZSKIP swaps only the down twin.
-    let zskip = std::env::var("ATLAS_GLM_MOE_DOWN_ZSKIP").as_deref() == Ok("1");
-    let (down_name, other_down) = if zskip {
+    let (down_name, other_down) = if env_on("ATLAS_GLM_MOE_DOWN_ZSKIP") {
         ("glm_moe_decode_m16_k128w_zskip", "glm_moe_decode_m16_k128w")
     } else {
         ("glm_moe_decode_m16_k128w", "glm_moe_decode_m16_k128w_zskip")
     };
     let [gate_up, down] = ["glm_moe_decode_m16_gate_up_silu_k128w", down_name].map(launches);
+    let k128w = [
+        "moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w",
+        "moe_w4a4_grouped_gemm_prequant_t_k128w_compact",
+    ]
+    .map(launches);
     assert!(launches(other_down).is_empty());
-    if std::env::var("ATLAS_GLM_MOE_DECODE_M16").as_deref() == Ok("1") {
+    let inter = config.routed_inter_local() as u32;
+    let routed = rows as u32 * 8;
+    // Gate/up tiles are 128 columns of the rank's width, down tiles 256 of H.
+    let grids = |bound: u32| [[inter / 128, bound, 1], [16, bound, 1]];
+    let decode = entry != Entry::Prefill;
+    if decode && env_on("ATLAS_GLM_MOE_DECODE_M16") {
         // One tile per routed expert, at most one expert per routed row.
-        let (routed, bound) = (rows as u32 * 8, rows as u32 * 8);
         assert_eq!((gate_up.len(), down.len()), (1, 1));
         // One worklist item per routed local expert, its count at the base.
         assert_eq!(builder, n_tiles(1));
-        assert_eq!((gate_up[0].0, gate_up[0].1), ([16, bound, 1], [256, 1, 1]));
-        assert_eq!((down[0].0, down[0].1), ([16, bound, 1], [256, 1, 1]));
+        assert_eq!([gate_up[0].0, down[0].0], grids(routed.min(288)));
+        assert_eq!([gate_up[0].1, down[0].1], [[256, 1, 1]; 2]);
         // The K128W argument lists: 17 fused gate/up, 12 down, the worklist
         // scratch where they take the prefix.
         assert_eq!((gate_up[0].2.len(), down[0].2.len()), (17, 12));
         assert_eq!(gate_up[0].2[11], Arg::Ptr(scratch));
         assert_eq!(down[0].2[11], Arg::Ptr(scratch));
         // Gate/up leaves the NVFP4 SiLU product where the down reads it.
-        let scales = up_out.offset(routed as usize * 2048 / 2);
+        let scales = up_out.offset((routed * inter / 2) as usize);
         assert_eq!(gate_up[0].2[15..], [Arg::Ptr(up_out), Arg::Ptr(scales)]);
         assert_eq!(down[0].2[..2], [Arg::Ptr(up_out), Arg::Ptr(scales)]);
         assert!(position("glm_moe_decode_m16_gate_up_silu_k128w") < position(down_name));
-        // Nothing of the M64 compact path runs.
+        // Nothing of the M64 paths runs.
         assert_eq!((silu, launches(compact).len()), (0, 0));
+        assert_eq!((k128w[0].len(), k128w[1].len()), (0, 0));
         for dense in [
             "moe_w4a4_grouped_gemm_prequant_t_k128",
             "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale",
@@ -145,20 +192,37 @@ fn verify_ffn(gpu: &Gpu, rank: usize, vector: bool, rows: usize) -> Vec<Event> {
             assert!(launches(dense).is_empty(), "{dense}");
         }
     } else {
-        // Flag off: the base launches, none of the twins.
+        // No twin outside verify decode or without the flag.
         assert_eq!((gate_up.len(), down.len()), (0, 0));
-        assert_eq!(builder, n_tiles(16));
-        assert_eq!((silu, launches(compact).len()), (1, 1));
+        if !decode || env_on("ATLAS_GLM_MOE_DECODE_K128W") {
+            // The prefill K128W pair over the M64 row-tile prefix.
+            assert_eq!(builder, vec![]);
+            assert_eq!((k128w[0].len(), k128w[1].len()), (1, 1));
+            assert_eq!(
+                [k128w[0][0].0, k128w[1][0].0],
+                grids(routed.div_ceil(64) + 288)
+            );
+            assert_eq!(launches("moe_mtile_prefix").len(), 1);
+            assert_eq!((silu, launches(compact).len()), (0, 0));
+        } else {
+            // The base launches.
+            assert_eq!(builder, n_tiles(inter / 128));
+            assert_eq!((silu, launches(compact).len()), (1, 1));
+            assert_eq!((k128w[0].len(), k128w[1].len()), (0, 0));
+            assert_eq!(launches("moe_w4a4_grouped_gemm_prequant_t_k128").len(), 1);
+        }
     }
-    assert_eq!(
-        comm.reductions
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|r| r.0)
-            .collect::<Vec<_>>(),
-        vec![rows * 8192]
-    );
+    if entry == Entry::Independent {
+        assert_eq!(
+            comm.reductions
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.0)
+                .collect::<Vec<_>>(),
+            vec![rows * 8192]
+        );
+    }
     trace
 }
 
@@ -171,29 +235,36 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
             "::verify_ffn_launches_the_m16_twins_only_with_the_flag"
         );
         let name = name.split_once("::").unwrap().1;
-        // Off, on, on with the zero-row skip, and the skip alone (ignored).
-        for (m16, zskip) in [("0", "0"), ("1", "0"), ("1", "1"), ("0", "1")] {
-            let mode = format!("{m16}{zskip}");
+        // Off, on, on with the zero-row skip, the skip alone (ignored), the
+        // K128W control, and both (the twins take every batch they fit).
+        for mode in ["000", "100", "110", "010", "001", "101"] {
+            let flag = |i: usize| &mode[i..=i];
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args(["--exact", name, "--nocapture"])
-                .env(SENTINEL, &mode)
-                .env("ATLAS_GLM_MOE_DECODE_M16", m16)
-                .env("ATLAS_GLM_MOE_DOWN_ZSKIP", zskip)
+                .env(SENTINEL, mode)
+                .env("ATLAS_GLM_MOE_DECODE_M16", flag(0))
+                .env("ATLAS_GLM_MOE_DOWN_ZSKIP", flag(1))
+                .env("ATLAS_GLM_MOE_DECODE_K128W", flag(2))
                 .env("ATLAS_GLM_INDEPENDENT_DECODE", "1")
+                .env("ATLAS_GLM_C3_GROUPED_MOE", "1")
+                .env("ATLAS_MOE_PREQUANT_K128", "1")
+                // Batches of 9 rows or more otherwise read the expert offsets
+                // back for exact M64 tiles; the recording backend serves none.
+                .env("ATLAS_MOE_PREFILL_EXACT_TILES", "0")
                 .env("ATLAS_EP_PROTOCOL", "v2");
-            for flag in [
+            for off in [
                 "ATLAS_NVFP4_PREQUANT_MOE",
                 "ATLAS_NVFP4_FUSED_SILU_QUANT",
                 "ATLAS_GLM_MOE_GATE_UP_M16",
                 "ATLAS_GLM_MOE_GATE_UP_M16_VERIFY",
                 "ATLAS_GLM_C2_COMPACT_MOE",
                 "ATLAS_GLM_C4_GROUPED_MOE",
-                "ATLAS_GLM_C3_GROUPED_MOE",
                 "ATLAS_GLM_K5_COMPACT_MOE",
                 "ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP",
                 "ATLAS_GLM_K5_HC_CUBLAS",
+                "ATLAS_GLM_MOE_PREFILL_PERSIST",
             ] {
-                cmd.env(flag, "0");
+                cmd.env(off, "0");
             }
             let output = cmd.output().unwrap();
             assert!(
@@ -206,18 +277,56 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
         }
         return;
     }
-    for rank in 0..2 {
-        for vector in [false, true] {
-            for rows in 2..=8 {
-                let gpu = Gpu::new();
-                let trace = verify_ffn(&gpu, rank, vector, rows);
-                // Graph-safe either way: no allocation, free or host read.
-                assert!(
-                    !trace
-                        .iter()
-                        .any(|e| matches!(e, Event::Alloc(..) | Event::Free(..) | Event::Read(..)))
-                );
-            }
+    // One verify block of 2..=8 rows, 3-row blocks of four owners, and a
+    // 12-row prefill batch, which no decode flag touches.
+    let batches = (2..=8)
+        .map(|rows| (Entry::Independent, rows))
+        .chain([(Entry::Owner, 12), (Entry::Prefill, 12)]);
+    for (entry, rows) in batches {
+        for (rank, vector, expert_tp) in [
+            (0, false, false),
+            (1, true, false),
+            (0, true, true),
+            (1, false, true),
+        ] {
+            let gpu = Gpu::new();
+            let trace = verify_ffn(&gpu, rank, vector, expert_tp, entry, rows);
+            // Graph-safe either way: no allocation, free or host read.
+            assert!(
+                !trace
+                    .iter()
+                    .any(|e| matches!(e, Event::Alloc(..) | Event::Free(..) | Event::Read(..))),
+                "{rows} rows"
+            );
         }
     }
+}
+
+#[test]
+fn decode_flags_require_0_or_1() {
+    const SENTINEL: &str = "ATLAS_TEST_DECODE_M16_TOGGLE";
+    let Some(flag) = std::env::var_os(SENTINEL) else {
+        let name = concat!(module_path!(), "::decode_flags_require_0_or_1");
+        for flag in [
+            "ATLAS_GLM_MOE_DECODE_M16",
+            "ATLAS_GLM_MOE_DOWN_ZSKIP",
+            "ATLAS_GLM_MOE_DECODE_K128W",
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name.split_once("::").unwrap().1])
+                .env(SENTINEL, flag)
+                .env(flag, "true")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{flag}");
+        }
+        return;
+    };
+    let gpu = Gpu::new();
+    let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
+    config.model_type = "glm5_next".into();
+    let error = crate::layers::moe::decode_m16::DecodeM16::new(&gpu, &config)
+        .err()
+        .expect("a toggle other than 0 or 1 must fail the load");
+    assert!(error.to_string().contains(flag.to_str().unwrap()));
 }

@@ -1,38 +1,64 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! M16 twins of the K128W routed-expert kernels for GLM verify decode
-//! (`ATLAS_GLM_MOE_DECODE_M16=1`, default off).
+//! Row tiles of the prequant routed FFN for GLM verify decode, and the M16
+//! twins of the K128W kernels (`ATLAS_GLM_MOE_DECODE_M16=1`, default off).
 //!
-//! A verify step routes at most [`MAX_ROWS`] rows, and top-k picks an expert
-//! at most once per row, so no expert holds more than one m16 MMA slab. The
-//! compact k64 gate/up, `silu_mul_quant_nvfp4` and dense K128 down that
-//! decode launches otherwise pad every tile to 64 rows; the twins compute
-//! the same MMAs per output element over 16-row tiles with the SiLU in the
-//! gate/up epilogue, so the bytes are identical (`moe_decode_bench`).
+//! Top-k picks an expert at most once per row, so a batch of at most
+//! [`MAX_ROWS`] rows leaves no expert more than one m16 MMA slab. The compact
+//! k64 gate/up, `silu_mul_quant_nvfp4` and dense K128 down that verify decode
+//! launches otherwise pad every tile to 64 rows; the twins compute the same
+//! MMAs per output element over 16-row tiles with the SiLU in the gate/up
+//! epilogue, so the bytes are identical (`scripts/moe-decode-bench`).
+//!
+//! Coverage is the verify-decode batches only ([`MoeLayer::verify_decode_batch`]):
+//! one DFlash verify block or an owner-batched verify of 2..=8 rows in total
+//! (`independent_grouped`), owner-batched 3-row blocks (6, 9 or 12 rows, C3
+//! grouped), and the C2/C4/K5 shapes. One-row decode does not reach the
+//! grouped FFN, and an owner-batched verify of more than 8 rows at another
+//! width is a plain `forward_prefill` batch, which keeps the K128W grid.
 //!
 //! `ATLAS_GLM_MOE_DOWN_ZSKIP=1` (with the flag above) launches the down twin
 //! that does not load weight rows whose activations are E2M1 zeros in every
 //! row of the tile: those MMA terms are exact zeros, so again the same bytes.
+//!
+//! `ATLAS_GLM_MOE_DECODE_K128W=1` is the control with no new kernel: verify
+//! decode batches the twins do not take run the prefill K128W grid (M64
+//! tiles, same bytes) in place of the compact worklist.
 
-use super::prequant_fp4::MtileGrid;
+use super::prequant_fp4::{CompactMoeWorklist, MtileGrid};
 use super::*;
 
 /// Rows of a routed FFN batch the M16 tiles cover: one m16 MMA slab.
 pub(super) const MAX_ROWS: u32 = 16;
 
-/// The M16 fused gate/up and down kernels; both null unless the flag is on
-/// and the target ships them.
+/// Widest batch whose tile choice is logged: an owner-batched verify.
+const NOTE_ROWS: u32 = crate::layer::glm_long_owner::MAX_ROWS as u32;
+
+/// The verify-decode tile selection: the M16 fused gate/up and down kernels
+/// (both null unless the flag is on and the target ships them) and the K128W
+/// control.
 #[derive(Clone, Copy)]
 pub(super) struct DecodeM16 {
     gate_up_silu: KernelHandle,
     down: KernelHandle,
+    zskip: bool,
+    k128w: bool,
 }
 
 impl DecodeM16 {
-    pub(super) fn new(gpu: &dyn GpuBackend, config: &atlas_core::config::ModelConfig) -> Self {
-        let requested = std::env::var("ATLAS_GLM_MOE_DECODE_M16").as_deref() == Ok("1");
-        let on = requested && config.model_type == "glm5_next";
-        let zskip = std::env::var("ATLAS_GLM_MOE_DOWN_ZSKIP").as_deref() == Ok("1");
+    pub(super) fn new(
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<Self> {
+        let toggle = |name: &str| match std::env::var(name).as_deref() {
+            Err(_) | Ok("0") => Ok(false),
+            Ok("1") => Ok(true),
+            Ok(value) => anyhow::bail!("{name} requires 0 or 1, got {value:?}"),
+        };
+        let requested = toggle("ATLAS_GLM_MOE_DECODE_M16")?;
+        let zskip = toggle("ATLAS_GLM_MOE_DOWN_ZSKIP")?;
+        let glm = config.model_type == "glm5_next";
+        let on = requested && glm;
         let kernel = |name| super::super::try_kernel_gated(on, gpu, "moe_w4a16", name);
         let mut this = Self {
             gate_up_silu: kernel("glm_moe_decode_m16_gate_up_silu_k128w"),
@@ -41,6 +67,8 @@ impl DecodeM16 {
             } else {
                 "glm_moe_decode_m16_k128w"
             }),
+            zskip,
+            k128w: toggle("ATLAS_GLM_MOE_DECODE_K128W")? && glm,
         };
         if !this.loaded() {
             // Both or neither: half a pair never launches.
@@ -59,11 +87,33 @@ impl DecodeM16 {
                 );
             }
         }
-        this
+        Ok(this)
     }
 
     fn loaded(&self) -> bool {
         self.gate_up_silu.0 != 0 && self.down.0 != 0
+    }
+
+    /// Log, once per backend and row count, whether a routed FFN batch of
+    /// `rows` rows ran the twins: a rank's proof that the flag engaged, and
+    /// the batches it does not cover.
+    fn note(&self, gpu: &dyn GpuBackend, rows: u32, engaged: bool) {
+        if !self.loaded() || rows > NOTE_ROWS {
+            return;
+        }
+        if gpu
+            .op_cache()
+            .first_shape("moe:decode_m16", rows, engaged as u32, 0)
+        {
+            if engaged {
+                tracing::info!(
+                    "ATLAS_GLM_MOE_DECODE_M16 engaged: rows={rows} zskip={}",
+                    self.zskip
+                );
+            } else {
+                tracing::info!("ATLAS_GLM_MOE_DECODE_M16 not used: rows={rows}");
+            }
+        }
     }
 }
 
@@ -74,6 +124,114 @@ pub(super) fn m16_shape(rows: u32, h: u32, inter: u32) -> bool {
 }
 
 impl MoeLayer {
+    /// Whether a routed FFN of `rows` rows is a verify-decode batch: the K5
+    /// compact shape or one of the exact grouped decode entries.
+    pub(super) fn verify_decode_batch(
+        &self,
+        compact_k5: bool,
+        ctx: &ForwardContext,
+        rows: u32,
+    ) -> bool {
+        compact_k5
+            || self.glm_c2_grouped(ctx, rows)
+            || self.glm_c3_grouped(ctx, rows)
+            || self.glm_c4_grouped(ctx, rows)
+            || self.independent_grouped(ctx, rows)
+    }
+
+    /// The row tiles of one prequant routed FFN of `rows` rows. A verify
+    /// decode batch (`decode`) takes the M16 grid when selected, else the
+    /// K128W grid under `ATLAS_GLM_MOE_DECODE_K128W`, else the compact M64
+    /// worklist; any other batch the K128W grid when it is loaded.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prequant_tiles(
+        &self,
+        decode: bool,
+        expert_offsets: DevicePtr,
+        local_ptrs: DevicePtr,
+        [rows, top_k]: [u32; 2],
+        [h, inter]: [u32; 2],
+        num_experts: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<(Option<CompactMoeWorklist>, Option<MtileGrid>)> {
+        let total_expanded = rows * top_k;
+        let k128w = || {
+            self.mtile_grid(
+                expert_offsets,
+                local_ptrs,
+                total_expanded,
+                num_experts,
+                ctx,
+                stream,
+            )
+        };
+        if !decode {
+            self.decode_m16.note(ctx.gpu, rows, false);
+            return Ok((None, k128w()?));
+        }
+        let m16 = self.decode_m16_grid(
+            expert_offsets,
+            local_ptrs,
+            rows,
+            total_expanded,
+            [h, inter],
+            num_experts,
+            ctx,
+            stream,
+        )?;
+        self.decode_m16.note(ctx.gpu, rows, m16.is_some());
+        if m16.is_some() {
+            return Ok((None, m16));
+        }
+        if self.decode_m16.k128w {
+            let grid = k128w()?;
+            if ctx
+                .gpu
+                .op_cache()
+                .first_shape("moe:decode_k128w", rows, grid.is_some() as u32, 0)
+            {
+                tracing::info!(
+                    "ATLAS_GLM_MOE_DECODE_K128W {}: rows={rows}",
+                    if grid.is_some() {
+                        "engaged"
+                    } else {
+                        "not used (K128W kernels not loaded)"
+                    }
+                );
+            }
+            if grid.is_some() {
+                return Ok((None, grid));
+            }
+        }
+        let total_tiles = ctx.buffers.moe_router_in_f32();
+        let worklist = total_tiles.offset(16);
+        let n_tiles = inter.div_ceil(128);
+        anyhow::ensure!(
+            ctx.buffers.sizes().moe_router_in_f32
+                >= super::prequant_fp4::compact_gate_up_worklist_bytes(rows, top_k, inter),
+            "compact native-FP4 gate/up worklist exceeds router scratch"
+        );
+        ops::moe_build_tile_worklist(
+            ctx.gpu,
+            self.moe_build_tile_worklist_k,
+            expert_offsets,
+            local_ptrs,
+            worklist,
+            total_tiles,
+            num_experts,
+            n_tiles,
+            64,
+            stream,
+        )?;
+        let compact = CompactMoeWorklist {
+            worklist,
+            total_tiles,
+            max_tiles: total_expanded * n_tiles,
+        };
+        Ok((Some(compact), None))
+    }
+
     /// The row-tile grid of the M16 kernels over a verify batch of `rows`
     /// rows (`total_expanded` sorted rows), when they are loaded and the
     /// fused SiLU quantization they apply is the one serving would run. Its
@@ -81,7 +239,7 @@ impl MoeLayer {
     /// local expert, which the twins index by grid row. The grid bound is
     /// host-static: there are at most `total_expanded` routed experts.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn decode_m16_grid(
+    fn decode_m16_grid(
         &self,
         expert_offsets: DevicePtr,
         local_ptrs: DevicePtr,
