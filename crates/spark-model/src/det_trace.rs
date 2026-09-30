@@ -40,6 +40,9 @@
 //! Every tap synchronizes the stream and copies the tensor to the host, so
 //! a traced prefill is several times slower and its stream timing differs.
 //! Unset, the taps return on one cached flag and nothing else changes.
+//!
+//! `ATLAS_GLM_DET_TRACE_DECODE` traces speculative decode instead, without
+//! touching prefill or the prefix cache: see [`decode`].
 
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
@@ -142,8 +145,11 @@ pub fn hash_bytes(bytes: &[u8]) -> u64 {
 pub struct At {
     pub rank: usize,
     pub request: u64,
+    /// Sequence position of the chunk's (decode: the step's) first row.
     pub chunk_start: usize,
     pub layer: usize,
+    /// The decode step ordinal ([`decode`]); `None` in a prefill chunk.
+    pub step: Option<u32>,
 }
 
 /// The trace line for `rows` rows (`bytes` bytes) of `stage` from chunk row
@@ -156,13 +162,19 @@ pub fn format_line(
     hash: Option<u64>,
 ) -> String {
     let hash = hash.map_or_else(|| "ERR".to_owned(), |h| format!("{h:016x}"));
+    let (rank, request, start) = (at.rank, at.request, at.chunk_start);
+    let place = match at.step {
+        None => format!("DET r={rank} q={request} c={start}"),
+        Some(step) => format!("DETD r={rank} q={request} t={step} p={start}"),
+    };
     format!(
-        "DET r={} q={} c={} L={} s={stage} r0={row0} n={rows} b={bytes} h={hash}",
-        at.rank, at.request, at.chunk_start, at.layer
+        "{place} L={} s={stage} r0={row0} n={rows} b={bytes} h={hash}",
+        at.layer
     )
 }
 
-/// `ATLAS_GLM_DET_TRACE`: 0 off, 1 trace and recompute every prompt, 2 trace.
+/// `ATLAS_GLM_DET_TRACE`: 0 off, 1 trace and recompute every prompt, 2 trace
+/// (`ATLAS_GLM_DET_TRACE_DECODE`: 1 trace, 2 trace with captured runs eager).
 fn parse_level(value: Option<&str>) -> u8 {
     match value {
         Some("1") => 1,
@@ -171,15 +183,34 @@ fn parse_level(value: Option<&str>) -> u8 {
     }
 }
 
-fn level() -> u8 {
-    static LEVEL: OnceLock<u8> = OnceLock::new();
-    *LEVEL.get_or_init(|| parse_level(std::env::var("ATLAS_GLM_DET_TRACE").ok().as_deref()))
+/// The levels of `ATLAS_GLM_DET_TRACE` and `ATLAS_GLM_DET_TRACE_DECODE`.
+#[derive(Clone, Copy)]
+struct Levels {
+    prefill: u8,
+    decode: u8,
 }
 
-/// Whether the tracer is enabled.
+#[inline]
+fn levels() -> Levels {
+    static LEVELS: OnceLock<Levels> = OnceLock::new();
+    let level = |name| parse_level(std::env::var(name).ok().as_deref());
+    *LEVELS.get_or_init(|| Levels {
+        prefill: level("ATLAS_GLM_DET_TRACE"),
+        decode: level("ATLAS_GLM_DET_TRACE_DECODE"),
+    })
+}
+
+/// Whether the prefill tracer is enabled.
 #[inline]
 pub fn on() -> bool {
-    level() != 0
+    levels().prefill != 0
+}
+
+/// Whether either tracer is enabled.
+#[inline]
+fn any_on() -> bool {
+    let levels = levels();
+    levels.prefill | levels.decode != 0
 }
 
 /// Whether `stage` passes an `ATLAS_GLM_DET_TRACE_STAGES` list. Without a
@@ -191,10 +222,11 @@ fn stage_listed(list: Option<&str>, stage: &str) -> bool {
     }
 }
 
-fn stage_selected(stage: &str) -> bool {
+/// The `ATLAS_GLM_DET_TRACE_STAGES` list, if set.
+fn stage_list() -> Option<&'static str> {
     static LIST: OnceLock<Option<String>> = OnceLock::new();
-    let list = LIST.get_or_init(|| std::env::var("ATLAS_GLM_DET_TRACE_STAGES").ok());
-    stage_listed(list.as_deref(), stage)
+    LIST.get_or_init(|| std::env::var("ATLAS_GLM_DET_TRACE_STAGES").ok())
+        .as_deref()
 }
 
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(0);
@@ -224,20 +256,22 @@ pub(crate) fn take_lines() -> Vec<String> {
 /// once per request on every rank): number it. Returns whether the request
 /// must skip prefix-cache reuse and recompute its whole prompt.
 pub fn begin_request(slot: usize) -> bool {
-    if !on() {
+    if !any_on() {
         return false;
     }
     let request = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed) + 1;
     SLOT_REQUEST[slot % SLOTS].store(request, Ordering::Relaxed);
-    level() == 1
+    decode::begin_request(slot);
+    levels().prefill == 1
 }
 
-/// Ends the traced chunk when dropped.
-pub struct Scope(());
+/// Ends the traced chunk (or decode scope) when dropped, back to the scope
+/// it replaced.
+pub struct Scope(Option<At>);
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        CURRENT.with(|c| c.set(None));
+        CURRENT.with(|c| c.set(self.0));
     }
 }
 
@@ -255,23 +289,27 @@ pub fn enter(rank: usize, slot: usize, chunk_start: usize) -> Option<Scope> {
             request,
             chunk_start,
             layer: 0,
+            step: None,
         }))
     });
-    Some(Scope(()))
+    Some(Scope(None))
 }
 
 /// The following taps belong to `layer` (the layer count after the last).
 pub fn set_layer(layer: usize) {
-    if on() {
+    if any_on() {
         CURRENT.with(|c| c.set(c.get().map(|at| At { layer, ..at })));
     }
 }
 
+/// The scope a tap of `stage` logs to, if it is traced and selected.
 fn current(stage: &str) -> Option<At> {
-    if !on() || !stage_selected(stage) {
+    if !any_on() {
         return None;
     }
-    CURRENT.with(Cell::get)
+    CURRENT
+        .with(Cell::get)
+        .filter(|at| decode::selected(at, stage_list(), stage))
 }
 
 fn device_hash(
@@ -281,19 +319,32 @@ fn device_hash(
     bytes: usize,
     segment: usize,
 ) -> Option<u64> {
+    spans_hash(gpu, stream, &[(ptr, bytes)], segment)
+}
+
+/// One hash over the device spans in order, read after `stream` in staged
+/// copies of at most `segment` bytes.
+fn spans_hash(
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    spans: &[(DevicePtr, usize)],
+    segment: usize,
+) -> Option<u64> {
     gpu.synchronize(stream).ok()?;
     STAGING.with(|staging| {
         let mut staging = staging.borrow_mut();
         let mut hasher = Hasher::new();
-        let mut done = 0;
-        while done < bytes {
-            let n = (bytes - done).min(segment);
-            if staging.len() < n {
-                staging.resize(n, 0);
+        for &(ptr, bytes) in spans {
+            let mut done = 0;
+            while done < bytes {
+                let n = (bytes - done).min(segment);
+                if staging.len() < n {
+                    staging.resize(n, 0);
+                }
+                gpu.copy_d2h(ptr.offset(done), &mut staging[..n]).ok()?;
+                hasher.update(&staging[..n]);
+                done += n;
             }
-            gpu.copy_d2h(ptr.offset(done), &mut staging[..n]).ok()?;
-            hasher.update(&staging[..n]);
-            done += n;
         }
         Some(hasher.finish())
     })
@@ -329,13 +380,17 @@ pub fn on_stream(gpu: &dyn GpuBackend, stream: u64) -> Taps<'_> {
 impl Taps<'_> {
     /// Hash `rows.1` rows of `row_bytes` bytes at `ptr` (chunk rows from
     /// `rows.0`) as `stage` of the current chunk and layer. Does nothing
-    /// outside a traced chunk, so the verify and decode callers of shared
-    /// layer code are silent, and nothing for an empty span.
+    /// outside a traced chunk or decode scope, so the untraced callers of
+    /// shared layer code are silent, and nothing for an empty span.
     pub fn tap(&self, stage: &str, ptr: DevicePtr, rows: (usize, usize), row_bytes: usize) {
         if rows.1 * row_bytes == 0 {
             return;
         }
         if let Some(at) = current(stage) {
+            // A decode-scope tap inside a CUDA-graph capture would break it.
+            if at.step.is_some() && self.gpu.stream_is_capturing(self.stream) {
+                return;
+            }
             emit(device_line(
                 at,
                 self.gpu,
@@ -355,6 +410,8 @@ pub fn tap_hashed(stage: &str, rows: (usize, usize), bytes: usize, hash: u64) {
         emit(format_line(at, stage, rows, bytes, Some(hash)));
     }
 }
+
+pub mod decode;
 
 #[cfg(test)]
 #[path = "det_trace_tests.rs"]

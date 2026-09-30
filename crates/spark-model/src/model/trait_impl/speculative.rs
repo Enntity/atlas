@@ -628,6 +628,12 @@ impl TransformerModel {
                 .map(|&i| self.verify_hidden_stash.offset(i * h * 2))
                 .collect(),
         };
+        // ATLAS_GLM_DET_TRACE_DECODE: the drafter's inputs, then its drafts.
+        let det = self.det_propose_batch_enter(seqs, tokens, positions, num_drafts, &hiddens);
+        let _det_scope = match det.as_slice() {
+            [(_, Some(at))] => Some(crate::det_trace::decode::enter(*at)),
+            _ => None,
+        };
         let mut states: Vec<&mut dyn crate::speculative::ProposerState> = Vec::new();
         let mut expected_owners = Vec::with_capacity(seqs.len());
         for seq in seqs.iter_mut() {
@@ -654,7 +660,7 @@ impl TransformerModel {
                 None => return Ok(None),
             }
         }
-        proposer.propose_batch(
+        let drafts = proposer.propose_batch(
             tokens,
             &hiddens,
             positions,
@@ -665,7 +671,11 @@ impl TransformerModel {
             stream,
             out_conf,
             grammar_bitmasks,
-        )
+        )?;
+        if let Some(drafts) = &drafts {
+            self.det_propose_batch_done(&det, &states, drafts);
+        }
+        Ok(drafts)
     }
 
     pub(super) fn read_deferred_draft_token_dispatch(&self) -> Result<u32> {

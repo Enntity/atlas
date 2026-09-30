@@ -25,6 +25,7 @@
 
 pub(crate) mod block_mgmt;
 mod block_table_upload;
+mod det_decode;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
 pub mod glm_c4;

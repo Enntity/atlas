@@ -52,6 +52,12 @@ impl Glm5KdaLayer {
             self.ffn.forward_prefill(normed, tokens, ctx, stream)?;
             ctx.buffers.moe_output()
         };
+        if capture_verify_intermediates {
+            // ATLAS_GLM_DET_TRACE_DECODE: the verify rows' FFN output, before
+            // a deferred shared-expert blend (the prefill MoE taps its own).
+            let (rows, row) = ((0, tokens), self.hidden_size * 2);
+            crate::det_trace::on_stream(ctx.gpu, stream).tap("ffn", ffn_out, rows, row);
+        }
         self.forward_ffn_post(phase, ffn_out, deferred_shared_gate, ctx, stream)
     }
 

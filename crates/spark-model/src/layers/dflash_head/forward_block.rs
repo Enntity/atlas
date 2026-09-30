@@ -1077,6 +1077,9 @@ impl BlockDiffusionDraftHead {
             .chain(std::iter::once(0))
             .map(|i| row_order[i])
             .collect();
+        // ATLAS_GLM_DET_TRACE_DECODE: the logits the drafts were picked from.
+        let (rows, row) = ((0, self.gamma), self.vocab_size * 2);
+        crate::det_trace::on_stream(gpu, stream).tap("d_logit", scratch.logits, rows, row);
         // ATLAS_DFLASH_DEBUG_DUMP_FULL=1 (one-shot): log all γ drafts so
         // we can compare against the PyTorch reference run on the same
         // captured target_hidden. Static guard mirrors the input dump.

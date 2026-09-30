@@ -60,6 +60,8 @@ impl TransformerModel {
         for t in 0..k {
             self.embed(tokens[t], hidden.offset(t * h * fp32), stream)?;
         }
+        // ATLAS_GLM_DET_TRACE_DECODE: this step's taps, until the return.
+        let _det = self.det_verify_enter(tokens, seq, stream);
 
         // 1b. Allocate KV blocks for all K positions
         let bs = kv_cache.block_size();
@@ -124,6 +126,7 @@ impl TransformerModel {
             && !hss_engaged
             && !force_eager
             && !super::verify_layer_trace::enabled()
+            && !crate::det_trace::decode::eager()
             && !lora_eager
             && !layer_veto;
         // The optional M16 oracle must never perform D2H inside capture.
@@ -209,6 +212,7 @@ impl TransformerModel {
             None
         };
 
+        let det_mute = use_graphs.then(crate::det_trace::decode::mute);
         let cache_key = (seq.slot_idx, k);
         let cached_for_slot = graph_cache
             .as_ref()
@@ -260,6 +264,7 @@ impl TransformerModel {
             );
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                crate::det_trace::set_layer(layer_idx);
                 if pieces && self.kgamma_kda_run(layer_idx, k, seq, &mut kv_cache, &ctx, stream)? {
                     continue;
                 }
@@ -349,6 +354,7 @@ impl TransformerModel {
                     )?;
                 }
                 self.trace_lightning_hidden_rows("k4", seq.seq_len, layer_idx, hidden, k, stream)?;
+                self.det_verify_layer_out(k, stream);
                 self.kgamma_dflash_capture(layer_idx, k, stream)?;
                 if let Some(started) = layer_started {
                     self.gpu.synchronize(stream)?;
@@ -446,6 +452,8 @@ impl TransformerModel {
             ]));
         }
 
+        drop(det_mute);
+        self.det_verify_done(&out, stream);
         self.check_glm_k5_bf16_head(k, &out, stream)?;
 
         // See decode_verify_graphed for rationale on `seq_len += k` fix.

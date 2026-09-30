@@ -50,6 +50,7 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         // Use backend's own stream (non-default, required for CUDA graph capture).
         let stream = self.gpu.default_stream();
+        crate::det_trace::decode::serial(self.config.ep_rank, seq.slot_idx, seq.seq_len, token);
         // ATLAS_SSM_H_FP16: narrow this sequence's SSM h-state to FP16 exactly
         // once, HERE — outside the CUDA-graph region. No-op without the flag.
         self.ssm_h_to_f16_dispatch(seq)?;

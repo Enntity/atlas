@@ -108,6 +108,10 @@ impl TransformerModel {
         // short append on a WARM one. See `ensure_drafter_context`.
         self.ensure_drafter_context(proposer, seq, &ctx, stream)?;
         let expected_owner = seq.expected_dspark_owner()?;
+        // ATLAS_GLM_DET_TRACE_DECODE: the drafter's inputs, then its drafts.
+        let stack = self.dflash_hidden_save;
+        let det = self.det_propose_enter(seq, token, position, num_drafts, stack);
+        let (_det_scope, slot) = (det.map(crate::det_trace::decode::enter), seq.slot_idx);
         let prop_state = seq
             .proposer_state
             .as_mut()
@@ -248,6 +252,9 @@ impl TransformerModel {
             grammar_bitmask,
             self.dflash_hidden_save,
         )?;
+        if let Some(at) = det {
+            self.det_propose_done(at, slot, prop_state.as_ref(), &drafts);
+        }
         // Confidence clamp (ATLAS_MTP_DRAFT_CONF, staged off by default):
         // when the drafter's chain confidence is below tau, discard the
         // drafts — the next step decodes serially instead of paying a

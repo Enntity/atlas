@@ -330,6 +330,10 @@ impl BlockDiffusionDraftHead {
             ctx.gpu.synchronize(stream)?;
             let mut raw = vec![0u8; batch_inputs.total_rows() * 4];
             ctx.gpu.copy_d2h(self.batch_tokens, &mut raw)?;
+            // ATLAS_GLM_DET_TRACE_DECODE: the logits the drafts were picked from.
+            let det = crate::det_trace::on_stream(ctx.gpu, stream);
+            let (rows, row) = ((0, batch_inputs.total_rows()), self.vocab_size * 2);
+            det.tap("d_logit", self.batch_logits, rows, row);
             let row_tokens: Vec<u32> = raw
                 .chunks_exact(4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))

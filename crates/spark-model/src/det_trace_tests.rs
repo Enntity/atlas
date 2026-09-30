@@ -8,6 +8,7 @@ const AT: At = At {
     request: 7,
     chunk_start: 8192,
     layer: 12,
+    step: None,
 };
 
 fn pattern(len: usize) -> Vec<u8> {

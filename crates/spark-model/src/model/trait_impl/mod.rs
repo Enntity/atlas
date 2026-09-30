@@ -998,7 +998,9 @@ impl Model for TransformerModel {
         num_accepted: usize,
         k: usize,
     ) -> Result<()> {
-        self.commit_accepted_prefix_dispatch(seq, num_accepted, k)
+        self.commit_accepted_prefix_dispatch(seq, num_accepted, k)?;
+        self.det_committed(seq, num_accepted, k);
+        Ok(())
     }
     fn ep_worker_step(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         self.ep_worker_step_dispatch(slots)

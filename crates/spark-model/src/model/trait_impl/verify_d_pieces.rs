@@ -25,6 +25,7 @@ pub(super) fn admitted(requested: bool, model_type: &str, tp: usize, eager_only:
 pub(super) fn diagnostics_sync() -> bool {
     tracing::level_filters::LevelFilter::current() >= tracing::Level::DEBUG
         || std::env::var("ATLAS_DFLASH_CAPTURE_TRACE").as_deref() == Ok("1")
+        || crate::det_trace::decode::eager()
 }
 
 impl TransformerModel {
@@ -59,6 +60,8 @@ impl TransformerModel {
             .ok_or_else(|| anyhow::anyhow!("piecewise verify graph needs the TP communicator"))?;
         let (hidden, residual) = (self.buffers.hidden_states(), self.buffers.residual());
         let key = (seq.slot_idx, k, layer_idx);
+        // Captured or replayed: no determinism-trace taps inside the run.
+        let _det_mute = crate::det_trace::decode::mute();
         self.verify_pieces
             .run(key, self.gpu.as_ref(), comm, stream, |comm| {
                 // The verify context carries no mid-chunk capture (the one

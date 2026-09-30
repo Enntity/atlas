@@ -447,6 +447,7 @@ impl TransformerModel {
 
         // DFlash: advance ctx_len after the LAST chunk of chunked prefill.
         self.update_dflash_ctx_len_after_prefill(seq, chunk_start, chunk_len)?;
+        self.det_decode_pre(seq, tokens.len(), stream);
 
         Ok(logits_ptr)
     }
