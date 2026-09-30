@@ -12,7 +12,7 @@ use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::PagedKvCache;
 use spark_runtime::prefix_cache::{NvmePrefixTier, PrefixCache, RestorePlan};
 
-use super::prefix_blocks::alloc_block_evicting;
+use super::prefix_blocks::{alloc_block_evicting, drop_failed_spills};
 use super::types::TransformerModel;
 use crate::traits::SequenceState;
 
@@ -86,9 +86,13 @@ impl TransformerModel {
             return;
         }
         let s = tier.nvme_stats();
+        let io = kv_cache.nvme_io_stats();
+        let read_ms = r.read_micros as f64 / 1e3;
         tracing::info!(
             "NVMe prefix restore: {}/{} blocks ({} tokens after {} resident) in {:.1} ms{}; \
-             tier {}/{} slots, {} spills, {} restores, {} failures",
+             tier {}/{} slots, {} spills, {} restores, {} failures; evict {:.1} ms + read {:.1} ms \
+             ({:.0} MB/s); spill path ({}): {} blocks in {:.1} ms on the serving thread, \
+             {} evictions without a write",
             r.restored,
             r.wanted,
             r.restored * bs,
@@ -106,6 +110,13 @@ impl TransformerModel {
             s.spills,
             s.restores,
             s.spill_failures + s.restore_failures,
+            r.evict_micros as f64 / 1e3,
+            read_ms,
+            (r.restored * kv_cache.nvme_record_bytes()) as f64 / 1e3 / read_ms.max(1e-3),
+            if io.fast { "fast" } else { "sync" },
+            io.spilled_blocks,
+            io.spill_micros as f64 / 1e3,
+            s.clean_evictions,
         );
     }
 
@@ -158,6 +169,11 @@ pub(crate) struct RestoreOutcome {
     pub allocated: usize,
     pub restored: usize,
     pub failed: bool,
+    /// Allocating the target blocks — which, on a full pool, is spilling that
+    /// many victims.
+    pub evict_micros: u64,
+    /// Reading, verifying and scattering the records.
+    pub read_micros: u64,
 }
 
 /// The restore cycle: plan (pins the path) → allocate up to `want(plan)`
@@ -181,12 +197,17 @@ pub(crate) fn restore_prefix(
     if !kv_cache.nvme_attached() {
         return None;
     }
+    // Fast path: a write-behind failure since the last eviction. Forget those
+    // nodes before planning over them (a record still in flight is caught by
+    // its tag instead).
+    drop_failed_spills(&kv_cache.nvme_take_failed(), kv_cache, prefix_cache);
     let bs = kv_cache.block_size();
     let plan = tier.plan_restore(tokens, bs, adapter_id);
     if plan.disk.is_empty() {
         return None;
     }
     let wanted = want(&plan).min(plan.disk.len());
+    let t0 = std::time::Instant::now();
     let mut blocks = Vec::with_capacity(wanted);
     while blocks.len() < wanted {
         match alloc_block_evicting(kv_cache, prefix_cache, gpu) {
@@ -194,7 +215,11 @@ pub(crate) fn restore_prefix(
             None => break,
         }
     }
-    let (mut ok, mut failed) = kv_cache.nvme_read(&plan.disk[..blocks.len()], &blocks, gpu, stream);
+    let evict_micros = t0.elapsed().as_micros() as u64;
+    // The fast path pairs the run with the blocks in ascending order.
+    let (mut ok, mut failed) =
+        kv_cache.nvme_read(&plan.disk[..blocks.len()], &mut blocks, gpu, stream);
+    let read_micros = t0.elapsed().as_micros() as u64 - evict_micros;
     // Slotted index tails: a restored block is a shared cached block and must
     // own NO tail (the index kernels then skip it). Its tail was released when
     // it was last freed, but that release reaches the device map only with the
@@ -210,6 +235,8 @@ pub(crate) fn restore_prefix(
     for &b in blocks[ok..].iter().chain(&give_back) {
         kv_cache.return_evicted_block(b);
     }
+    // Spills queued by this restore's own evictions (the read waited for them).
+    drop_failed_spills(&kv_cache.nvme_take_failed(), kv_cache, prefix_cache);
     Some(RestoreOutcome {
         resident_tokens: plan.resident_tokens,
         on_disk: plan.disk.len(),
@@ -221,6 +248,8 @@ pub(crate) fn restore_prefix(
                 .filter(|b| blocks[..ok].contains(b))
                 .count(),
         failed,
+        evict_micros,
+        read_micros,
     })
 }
 

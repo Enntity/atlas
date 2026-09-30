@@ -17,12 +17,20 @@
 //! The trailer binds the record to the node that spilled it (the tree's tag)
 //! and to its bytes (checksum); any mismatch fails the restore — the caller
 //! then recomputes, so a torn, stale or misdirected record is never served.
+//!
+//! This file holds the record format and the synchronous path (one `pwrite`
+//! per record, one small copy per region per block). `ATLAS_GLM_NVME_FAST=1`
+//! moves the SAME records through `nvme_fast.rs` instead.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail, ensure};
+use atlas_tier::ConcurrentSwapStore;
 
 use super::PagedKvCache;
+use super::nvme_fast::{self, FastIo};
+use super::nvme_sync::{read_batch, write_batch};
 use crate::gpu::{DevicePtr, GpuBackend};
 use crate::prefix_cache::{DiskRef, SpillOrder};
 
@@ -37,18 +45,32 @@ const STAGING_RECORDS: usize = 32;
 
 /// One per-block device region: block `b` lives at `base + b·stride`.
 #[derive(Clone, Copy, Debug)]
-struct Segment {
-    base: DevicePtr,
-    stride: usize,
+pub(super) struct Segment {
+    pub(super) base: DevicePtr,
+    pub(super) stride: usize,
 }
 
 pub(super) struct NvmeSpill {
-    store: Box<dyn atlas_tier::SwapStore>,
-    segments: Vec<Segment>,
-    payload: usize,
-    record: usize,
-    staging: *mut u8,
-    staging_bytes: usize,
+    pub(super) store: Arc<dyn ConcurrentSwapStore>,
+    pub(super) segments: Vec<Segment>,
+    pub(super) payload: usize,
+    pub(super) record: usize,
+    pub(super) staging: *mut u8,
+    pub(super) staging_bytes: usize,
+    /// `ATLAS_GLM_NVME_FAST`: write-behind / pipelined I/O over the staging
+    /// ring. `None` = the synchronous path below.
+    fast: Option<FastIo>,
+    io: NvmeIoStats,
+}
+
+/// What the spill path has cost the SERVING thread so far (the time inside
+/// `nvme_write`: all of a spill on the synchronous path, only the gather —
+/// and any wait on a full staging ring — on the fast path).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NvmeIoStats {
+    pub fast: bool,
+    pub spilled_blocks: u64,
+    pub spill_micros: u64,
 }
 
 // SAFETY: `staging` is a uniquely owned host allocation; the cache (and so
@@ -84,7 +106,7 @@ fn checksum(bytes: &[u8]) -> u64 {
     h
 }
 
-fn stamp(rec: &mut [u8], payload: usize, tag: u64) {
+pub(super) fn stamp(rec: &mut [u8], payload: usize, tag: u64) {
     let sum = checksum(&rec[..payload]);
     let t = rec.len() - TRAILER;
     rec[t..t + 8].copy_from_slice(&MAGIC.to_le_bytes());
@@ -92,7 +114,7 @@ fn stamp(rec: &mut [u8], payload: usize, tag: u64) {
     rec[t + 16..].copy_from_slice(&sum.to_le_bytes());
 }
 
-fn verify(rec: &[u8], payload: usize, tag: u64) -> bool {
+pub(super) fn verify(rec: &[u8], payload: usize, tag: u64) -> bool {
     let t = rec.len() - TRAILER;
     let word = |o: usize| u64::from_le_bytes(rec[t + o..t + o + 8].try_into().expect("8 bytes"));
     word(0) == MAGIC && word(8) == tag && word(16) == checksum(&rec[..payload])
@@ -111,8 +133,22 @@ pub(super) fn verify_for_test(rec: &[u8], payload: usize, tag: u64) -> bool {
     verify(rec, payload, tag)
 }
 
+/// A spill write failed: count it and log at 1, 2, 4, 8, … (a full or failing
+/// disk fails EVERY spill).
+pub(super) fn note_write_failure(slot: u32, e: &anyhow::Error) {
+    let n = WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            "NVMe KV spill: write of slot {slot} failed ({e:#}) — {n} failed spills so far; \
+             those blocks are evicted as without the tier (recompute on reuse)"
+        );
+    }
+}
+
 impl NvmeSpill {
     pub(super) fn free_staging(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
+        // Joins the workers (after their queued jobs) before staging goes away.
+        self.fast = None;
         let ptr = std::mem::replace(&mut self.staging, std::ptr::null_mut());
         gpu.free_host_pinned(ptr, self.staging_bytes)
     }
@@ -142,11 +178,63 @@ impl PagedKvCache {
         (payload + TRAILER).next_multiple_of(RECORD_ALIGN)
     }
 
-    /// Attach the spill store (records of [`Self::nvme_record_bytes`]).
+    /// [`Self::nvme_record_bytes`] for a cache that is not built yet: KV
+    /// sizing needs the tier's host-memory reserve before the pool exists.
+    pub fn nvme_record_bytes_for(
+        config: &super::KvCacheConfig,
+        v_aliases_k: bool,
+        index: Option<super::SparseIndexCacheConfig>,
+    ) -> usize {
+        let bs = config.block_size;
+        let index = index.map_or(0, |i| i.values_block_bytes(bs) + i.scales_block_bytes(bs));
+        let payload: usize = (0..config.num_layers)
+            .map(|l| {
+                let v = if v_aliases_k {
+                    0
+                } else {
+                    config.v_block_bytes_for_layer(l)
+                };
+                config.k_block_bytes_for_layer(l) + v + index
+            })
+            .sum();
+        (payload + TRAILER).next_multiple_of(RECORD_ALIGN)
+    }
+
+    /// Pinned staging the tier allocates for a record of `record` bytes.
+    pub fn nvme_staging_bytes(record: usize, fast: bool) -> usize {
+        let records = if fast {
+            nvme_fast::RING_CHUNKS * nvme_fast::CHUNK_RECORDS
+        } else {
+            STAGING_RECORDS
+        };
+        record * records
+    }
+
+    /// Attach the spill store (records of [`Self::nvme_record_bytes`]) on the
+    /// synchronous path.
     pub fn attach_nvme_spill(
         &mut self,
         store: Box<dyn atlas_tier::SwapStore>,
         gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        self.attach_nvme(Arc::new(Mutex::new(store)), gpu, false)
+    }
+
+    /// Attach a store that takes concurrent requests, on the fast path
+    /// (`nvme_fast.rs`: pitched copies, run-sized I/O, write-behind).
+    pub fn attach_nvme_fast(
+        &mut self,
+        store: Arc<dyn ConcurrentSwapStore>,
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        self.attach_nvme(store, gpu, true)
+    }
+
+    fn attach_nvme(
+        &mut self,
+        store: Arc<dyn ConcurrentSwapStore>,
+        gpu: &dyn GpuBackend,
+        fast: bool,
     ) -> Result<()> {
         ensure!(self.nvme.is_none(), "NVMe spill store already attached");
         ensure!(
@@ -163,17 +251,52 @@ impl PagedKvCache {
                 store.record_bytes()
             );
         }
-        let staging_bytes = record * STAGING_RECORDS;
+        let staging_bytes = Self::nvme_staging_bytes(record, fast);
         let staging = gpu.alloc_host_pinned(staging_bytes)?;
-        self.nvme = Some(NvmeSpill {
+        if !(staging as usize).is_multiple_of(RECORD_ALIGN) {
+            // Correct either way — the store bounces — but every record then
+            // pays an extra copy, and the synchronous path loses its ranged reads.
+            tracing::warn!(
+                "NVMe spill tier: pinned staging is not 4 KiB-aligned; O_DIRECT I/O will bounce"
+            );
+        }
+        let mut spill = NvmeSpill {
             store,
             segments,
             payload,
             record,
             staging,
             staging_bytes,
-        });
+            fast: None,
+            io: NvmeIoStats {
+                fast,
+                ..NvmeIoStats::default()
+            },
+        };
+        if fast {
+            match FastIo::new(&spill) {
+                Ok(io) => spill.fast = Some(io),
+                Err(e) => {
+                    spill.free_staging(gpu)?;
+                    return Err(e.context("NVMe spill tier: starting the I/O workers"));
+                }
+            }
+        }
+        self.nvme = Some(spill);
         Ok(())
+    }
+
+    pub fn nvme_io_stats(&self) -> NvmeIoStats {
+        self.nvme
+            .as_ref()
+            .map_or_else(NvmeIoStats::default, |s| s.io)
+    }
+
+    /// Spill writes that failed since the last report (fast path: a write
+    /// fails after `nvme_write` returned). The tree must drop those nodes.
+    pub fn nvme_take_failed(&mut self) -> Vec<SpillOrder> {
+        let fast = self.nvme.as_mut().and_then(|s| s.fast.as_mut());
+        fast.map_or_else(Vec::new, FastIo::take_failed)
     }
 
     pub fn nvme_attached(&self) -> bool {
@@ -205,14 +328,22 @@ impl PagedKvCache {
         let Some(mut spill) = self.nvme.take() else {
             return orders.to_vec();
         };
+        let t0 = std::time::Instant::now();
         let mut failed = Vec::new();
-        for batch in orders.chunks(STAGING_RECORDS) {
-            if let Err(e) = write_batch(&mut spill, batch, gpu, stream, &mut failed) {
-                // Nothing of this batch reached disk (writes follow the gather).
-                tracing::warn!("NVMe KV spill: gather failed ({e:#}); dropping batch");
-                failed.extend_from_slice(batch);
+        if let Some(mut fast) = spill.fast.take() {
+            failed = nvme_fast::write(&spill, &mut fast, orders, gpu, stream);
+            spill.fast = Some(fast);
+        } else {
+            for batch in orders.chunks(STAGING_RECORDS) {
+                if let Err(e) = write_batch(&mut spill, batch, gpu, stream, &mut failed) {
+                    // Nothing of this batch reached disk (writes follow the gather).
+                    tracing::warn!("NVMe KV spill: gather failed ({e:#}); dropping batch");
+                    failed.extend_from_slice(batch);
+                }
             }
         }
+        spill.io.spilled_blocks += orders.len() as u64;
+        spill.io.spill_micros += t0.elapsed().as_micros() as u64;
         self.nvme = Some(spill);
         failed
     }
@@ -220,17 +351,24 @@ impl PagedKvCache {
     /// Read `disk[i]` into freshly allocated `blocks[i]` (in order), verifying
     /// every trailer. Returns how many leading blocks hold verified bytes and
     /// whether the next one FAILED (I/O error or bad record) — as opposed to
-    /// simply not being attempted. Scatter completes before returning.
+    /// simply not being attempted. Scatter completes before returning. The
+    /// fast path re-orders `blocks` (ascending) before pairing them up.
     pub fn nvme_read(
         &mut self,
         disk: &[DiskRef],
-        blocks: &[u32],
+        blocks: &mut [u32],
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> (usize, bool) {
         let Some(mut spill) = self.nvme.take() else {
             return (0, false);
         };
+        if let Some(mut fast) = spill.fast.take() {
+            let r = nvme_fast::read(&spill, &mut fast, disk, blocks, gpu, stream);
+            spill.fast = Some(fast);
+            self.nvme = Some(spill);
+            return r;
+        }
         let n = disk.len().min(blocks.len());
         let mut done = 0;
         let mut failed = false;
@@ -258,58 +396,7 @@ impl PagedKvCache {
     }
 }
 
-fn write_batch(
-    spill: &mut NvmeSpill,
-    batch: &[SpillOrder],
-    gpu: &dyn GpuBackend,
-    stream: u64,
-    failed: &mut Vec<SpillOrder>,
-) -> Result<()> {
-    let (record, payload) = (spill.record, spill.payload);
-    // SAFETY: the staging buffer is owned by `spill` and disjoint from
-    // `spill.store` / `spill.segments`, which are borrowed alongside it.
-    let staging = unsafe { std::slice::from_raw_parts_mut(spill.staging, spill.staging_bytes) };
-    // Device-wide, not just `stream`: the victims' last writes may still be in
-    // flight on ANOTHER stream (the scheduler's prefill stream, MoE/secondary
-    // streams — all non-blocking), and a record gathered before they land
-    // would checksum and later restore torn KV. Paid once per staging batch.
-    gpu.synchronize_device()?;
-    let mut enqueue = || -> Result<()> {
-        for (i, o) in batch.iter().enumerate() {
-            let mut off = i * record;
-            for s in &spill.segments {
-                let src = s.base.offset(o.block as usize * s.stride);
-                gpu.copy_d2h_async(src, &mut staging[off..off + s.stride], stream)?;
-                off += s.stride;
-            }
-        }
-        Ok(())
-    };
-    let enq = enqueue();
-    // Drain even after a failed enqueue: earlier chunks still DMA into staging.
-    gpu.synchronize(stream)?;
-    enq?;
-    for (i, o) in batch.iter().enumerate() {
-        let rec = &mut staging[i * record..(i + 1) * record];
-        rec[payload..].fill(0);
-        stamp(rec, payload, o.tag);
-        if let Err(e) = spill.store.write_record(o.slot as usize, rec) {
-            // A full / failing disk fails EVERY spill: log at 1, 2, 4, 8, …
-            let n = WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-            if n.is_power_of_two() {
-                tracing::warn!(
-                    "NVMe KV spill: write of slot {} failed ({e:#}) — {n} failed spills so far; \
-                     those blocks are evicted as without the tier (recompute on reuse)",
-                    o.slot
-                );
-            }
-            failed.push(*o);
-        }
-    }
-    Ok(())
-}
-
-/// Staging position of each of `slots` after [`read_runs`]: maximal runs of
+/// Staging position of each of `slots` after the synchronous path's `read_runs`: maximal runs of
 /// consecutive slots (either direction — a chain spills leaf-first, so its
 /// path order is usually DEScending) are read with one `read_records` each and
 /// land in slot order within the run's window. Pure, for testing.
@@ -331,68 +418,4 @@ pub(super) fn run_layout(slots: &[u32]) -> Vec<(usize, usize, u32)> {
         i = j + 1;
     }
     runs
-}
-
-/// Read `disk` into staging; returns each entry's staging record index for
-/// the leading entries that were read (stops at the first unreadable one).
-fn read_runs(spill: &NvmeSpill, disk: &[DiskRef], staging: &mut [u8]) -> Vec<usize> {
-    let record = spill.record;
-    let slots: Vec<u32> = disk.iter().map(|d| d.slot).collect();
-    let mut pos = Vec::with_capacity(disk.len());
-    for (start, len, first) in run_layout(&slots) {
-        let window = &mut staging[start * record..(start + len) * record];
-        if len > 1 && spill.store.read_records(first as usize, window).is_ok() {
-            pos.extend((start..start + len).map(|k| start + (slots[k] - first) as usize));
-            continue;
-        }
-        // Single record, or the ranged read failed: find the exact failure.
-        for k in start..start + len {
-            let rec = &mut staging[k * record..(k + 1) * record];
-            if let Err(e) = spill.store.read_record(slots[k] as usize, rec) {
-                tracing::warn!("NVMe KV restore: read of slot {} failed ({e:#})", slots[k]);
-                return pos;
-            }
-            pos.push(k);
-        }
-    }
-    pos
-}
-
-fn read_batch(
-    spill: &mut NvmeSpill,
-    disk: &[DiskRef],
-    blocks: &[u32],
-    gpu: &dyn GpuBackend,
-    stream: u64,
-) -> Result<usize> {
-    let (record, payload) = (spill.record, spill.payload);
-    // SAFETY: as in `write_batch`.
-    let staging = unsafe { std::slice::from_raw_parts_mut(spill.staging, spill.staging_bytes) };
-    let pos = read_runs(spill, disk, staging);
-    let mut ok = 0;
-    for (d, &p) in disk.iter().zip(&pos) {
-        if !verify(&staging[p * record..(p + 1) * record], payload, d.tag) {
-            tracing::warn!(
-                "NVMe KV restore: slot {} failed verification (tag/checksum) — recomputing",
-                d.slot
-            );
-            break;
-        }
-        ok += 1;
-    }
-    let enqueue = || -> Result<()> {
-        for (&b, &p) in blocks[..ok].iter().zip(&pos) {
-            let mut off = p * record;
-            for s in &spill.segments {
-                let dst = s.base.offset(b as usize * s.stride);
-                gpu.copy_h2d_async_retained(&staging[off..off + s.stride], dst, stream)?;
-                off += s.stride;
-            }
-        }
-        Ok(())
-    };
-    let enq = enqueue();
-    gpu.synchronize(stream)?;
-    enq?;
-    Ok(ok)
 }

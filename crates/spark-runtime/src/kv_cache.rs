@@ -460,7 +460,11 @@ pub struct PagedKvCache {
 mod block_trace;
 mod catalog;
 mod debug_impl;
+mod nvme_fast;
+mod nvme_io;
 mod nvme_spill;
+mod nvme_sync;
+pub use nvme_spill::NvmeIoStats;
 mod paged_impl;
 mod release;
 mod sparse_index;

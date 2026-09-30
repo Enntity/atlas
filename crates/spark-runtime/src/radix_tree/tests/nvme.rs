@@ -290,3 +290,128 @@ fn snapshot_anchor_depth_is_read_only() {
     assert_eq!(tree.snapshot_anchor_depth(&toks(900, 3), 3 * BS, 0, 0), 0);
     assert_eq!(tree.snapshot_count(), 1);
 }
+
+/// The sizing constant must cover what one on-disk block really costs.
+#[test]
+fn host_bytes_per_disk_block_covers_a_node() {
+    use crate::prefix_cache::NVME_HOST_BYTES_PER_BLOCK;
+    let node = std::mem::size_of::<crate::radix_tree::inner::RadixNode>();
+    // The node at the arena Vec's average 1.5× slack; `parent_key` (16 × 4 B
+    // + allocator header); the parent's one-entry `children` table (4 buckets
+    // of 32 B + control bytes) and its key; owner + tag + disk-LRU entry.
+    let estimate = node * 3 / 2 + 80 + 160 + 80 + 60;
+    assert!(
+        estimate <= NVME_HOST_BYTES_PER_BLOCK,
+        "{estimate} B per on-disk block (node = {node} B): raise NVME_HOST_BYTES_PER_BLOCK"
+    );
+    assert!(
+        estimate * 4 >= NVME_HOST_BYTES_PER_BLOCK * 3,
+        "{estimate} B per on-disk block: the reserve is over 33% too generous"
+    );
+}
+
+fn keeping_tree(max_slots: u32) -> RadixTree {
+    let tree = spilled_tree(max_slots);
+    tree.set_keep_restored(true);
+    tree
+}
+
+/// Spill `blocks` of `t`, then restore the whole chain into `into`.
+fn spill_and_restore(tree: &RadixTree, t: &[u32], blocks: &[u32], into: &[u32]) -> Vec<SpillOrder> {
+    cache(tree, t, blocks);
+    let ev = tree.evict(blocks.len());
+    assert_eq!(ev.spill.len(), blocks.len());
+    let plan = tree.plan_restore(t, BS, 0);
+    assert!(
+        tree.complete_restore(t, BS, 0, &plan, into, false)
+            .is_empty()
+    );
+    ev.spill
+}
+
+#[test]
+fn a_kept_record_makes_the_next_eviction_free() {
+    let tree = keeping_tree(16);
+    let t = toks(0, 3);
+    let spill = spill_and_restore(&tree, &t, &[10, 20, 30], &[100, 101, 102]);
+    // Resident again, and the records stay.
+    assert_eq!(
+        tree.lookup(&t, BS, 0, 0).matched_blocks,
+        vec![100, 101, 102]
+    );
+    tree.release(&t, BS, 0);
+    assert_eq!(tree.nvme_stats().slots_used, 3);
+    // Evicting the chain again writes nothing and frees the blocks at once.
+    let again = tree.evict(3);
+    assert_eq!(again.physical, vec![102, 101, 100]);
+    assert!(again.spill.is_empty());
+    let s = tree.nvme_stats();
+    assert_eq!((s.spills, s.clean_evictions, s.slots_used), (3, 3, 3));
+    assert!(tree.lookup(&t, BS, 0, 0).is_empty());
+    // … and the SAME records (slot and tag) restore it.
+    let plan = tree.plan_restore(&t, BS, 0);
+    for (d, b) in plan.disk.iter().zip([10, 20, 30]) {
+        let o = spill.iter().find(|o| o.block == b).unwrap();
+        assert_eq!((d.slot, d.tag), (o.slot, o.tag));
+    }
+    assert!(
+        tree.complete_restore(&t, BS, 0, &plan, &[7, 8, 9], false)
+            .is_empty()
+    );
+    assert_eq!(tree.lookup(&t, BS, 0, 0).matched_blocks, vec![7, 8, 9]);
+}
+
+#[test]
+fn records_are_kept_only_while_half_the_budget_is_free() {
+    // 3 of 4 slots in use: the first restored node gives its slot back, which
+    // brings the tier to half full — the other two keep theirs.
+    let tree = keeping_tree(4);
+    let t = toks(0, 3);
+    spill_and_restore(&tree, &t, &[10, 20, 30], &[100, 101, 102]);
+    assert_eq!(tree.nvme_stats().slots_used, 2);
+    let again = tree.evict(3);
+    assert_eq!(again.physical, vec![102, 101, 100]);
+    assert_eq!(
+        again.spill.len(),
+        1,
+        "only the node without a record is written"
+    );
+    assert_eq!(again.spill[0].block, 100);
+    assert_eq!(tree.nvme_stats().clean_evictions, 2);
+}
+
+#[test]
+fn a_kept_record_survives_a_re_insert_and_goes_with_its_node() {
+    let tree = keeping_tree(16);
+    let t = toks(0, 2);
+    spill_and_restore(&tree, &t, &[10, 20], &[100, 101]);
+    // Another request over the same prefix: the nodes keep block and record.
+    let acq = tree.insert(&t, &[55, 56], &[], BS, 0, 0);
+    assert!(acq.blocks.is_empty());
+    tree.release(&t, BS, 0);
+    assert_eq!(tree.lookup(&t, BS, 0, 0).matched_blocks, vec![100, 101]);
+    tree.release(&t, BS, 0);
+    assert_eq!(tree.nvme_stats().slots_used, 2);
+    // An over-released (unreachable) node is deleted: its record goes too.
+    tree.release(&t, BS, 0);
+    let ev = tree.evict(2);
+    assert_eq!(ev.physical, vec![101, 100]);
+    assert!(ev.spill.is_empty());
+    let s = tree.nvme_stats();
+    assert_eq!((s.slots_used, s.clean_evictions), (0, 0));
+    assert!(tree.plan_restore(&t, BS, 0).disk.is_empty());
+}
+
+#[test]
+fn a_kept_record_below_the_resident_prefix_is_not_planned() {
+    // Only the leaf is evicted (clean); the plan is the leaf alone, after two
+    // resident — and still record-carrying — ancestors.
+    let tree = keeping_tree(16);
+    let t = toks(0, 3);
+    spill_and_restore(&tree, &t, &[10, 20, 30], &[100, 101, 102]);
+    assert!(tree.evict(1).spill.is_empty());
+    let plan = tree.plan_restore(&t, BS, 0);
+    assert_eq!((plan.resident_tokens, plan.disk.len()), (2 * BS, 1));
+    tree.complete_restore(&t, BS, 0, &plan, &[77], false);
+    assert_eq!(tree.lookup(&t, BS, 0, 0).matched_blocks, vec![100, 101, 77]);
+}

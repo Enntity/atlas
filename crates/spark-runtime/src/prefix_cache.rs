@@ -16,7 +16,9 @@ mod no_caching;
 pub mod nvme;
 mod tier_evict;
 pub use no_caching::NoPrefixCaching;
-pub use nvme::{DiskRef, NvmePrefixTier, NvmeStats, RestorePlan, SpillOrder};
+pub use nvme::{
+    DiskRef, NVME_HOST_BYTES_PER_BLOCK, NvmePrefixTier, NvmeStats, RestorePlan, SpillOrder,
+};
 pub use tier_evict::TierEvict;
 
 // The three counters that lived here are fields of the single run mailbox,

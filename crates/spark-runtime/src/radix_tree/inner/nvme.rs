@@ -35,6 +35,9 @@ pub(in crate::radix_tree) struct NvmeIndex {
     /// Cached spill candidates `(node, last_access)`, oldest first; each is
     /// re-validated when popped (the access stamp doubles as a generation).
     victims: VecDeque<(NodeId, u64)>,
+    /// A restored node keeps its record (it is then RESIDENT with a slot, and
+    /// evicting it again needs no write). See `set_keep_restored`.
+    pub(in crate::radix_tree) keep_restored: bool,
     pub(in crate::radix_tree) stats: NvmeStats,
 }
 
@@ -49,6 +52,7 @@ impl NvmeIndex {
             lru: BTreeSet::new(),
             epoch: 0,
             victims: VecDeque::new(),
+            keep_restored: false,
             stats: NvmeStats {
                 max_slots,
                 ..NvmeStats::default()
@@ -91,8 +95,9 @@ impl RadixTreeInner {
         self.nvme.is_some()
     }
 
+    /// On disk ONLY. A resident node may also hold a slot (a kept record).
     fn is_on_disk(&self, id: NodeId) -> bool {
-        self.nodes[id].nvme_slot != u32::MAX
+        self.nodes[id].nvme_slot != u32::MAX && self.nodes[id].block_idx == u32::MAX
     }
 
     fn has_resident_child(&self, id: NodeId) -> bool {
@@ -197,6 +202,18 @@ impl RadixTreeInner {
             // ref > 0) and its block's KV ref may be gone, so spilling it
             // would only persist bytes nobody owns. Delete it as before.
             let orphan = self.nodes[id].ref_count == 0;
+            if !orphan && self.nodes[id].nvme_slot != u32::MAX {
+                // The record it was restored from is still there: no write.
+                let node = &mut self.nodes[id];
+                phys.extend(node.partial_suffix.take().map(|p| p.1));
+                phys.push(std::mem::replace(&mut node.block_idx, u32::MAX));
+                if let Some(idx) = self.nvme.as_mut() {
+                    idx.lru.insert((access, Reverse(id)));
+                    idx.stats.clean_evictions += 1;
+                }
+                self.requeue_parent(parent);
+                continue;
+            }
             let slot = if orphan {
                 None
             } else {
@@ -271,18 +288,23 @@ impl RadixTreeInner {
         blocks
     }
 
-    /// On-disk node → resident at `block` (slot released). `false` if the
-    /// node was not on disk.
-    pub(super) fn nvme_rehome(&mut self, id: NodeId, block: u32) -> bool {
+    /// On-disk node → resident at `block`; `false` if the node was not on
+    /// disk. The slot is released unless `block` holds the record's own bytes
+    /// (`restored`) and the tier keeps restored records.
+    pub(super) fn nvme_rehome(&mut self, id: NodeId, block: u32, restored: bool) -> bool {
         if !self.is_on_disk(id) {
             return false;
         }
         let node = &mut self.nodes[id];
-        let slot = std::mem::replace(&mut node.nvme_slot, u32::MAX);
         node.block_idx = block;
-        let access = node.last_access;
-        if let Some(idx) = self.nvme.as_mut() {
-            idx.lru.remove(&(access, Reverse(id)));
+        let (access, slot) = (node.last_access, node.nvme_slot);
+        let Some(idx) = self.nvme.as_mut() else {
+            return true;
+        };
+        idx.lru.remove(&(access, Reverse(id)));
+        let half_free = u64::from(idx.stats.slots_used) * 2 <= u64::from(idx.max_slots);
+        if !(restored && idx.keep_restored && half_free) {
+            self.nodes[id].nvme_slot = u32::MAX;
             idx.release_slot(slot);
         }
         true
@@ -317,7 +339,7 @@ impl RadixTreeInner {
             if n.context_hash != expected || n.ref_count == 0 {
                 break;
             }
-            let on_disk = n.nvme_slot != u32::MAX;
+            let on_disk = n.block_idx == u32::MAX;
             if !on_disk && ids.len() > resident {
                 break; // invariant: nothing resident below disk
             }
@@ -392,7 +414,7 @@ impl RadixTreeInner {
                         .get(i)
                         .is_some_and(|d| self.nodes[id].nvme_slot == d.slot)
                 });
-            if !ok || !self.nvme_rehome(run[i], block) {
+            if !ok || !self.nvme_rehome(run[i], block, true) {
                 give_back.extend_from_slice(&restored[i..]);
                 break;
             }

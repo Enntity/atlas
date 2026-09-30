@@ -33,8 +33,9 @@ impl TransformerModel {
 /// empty and this becomes a thin loop over the physical blocks.
 ///
 /// NVMe spill tier: the blocks named in `evicted.spill` are written to disk
-/// FIRST — before any of them can reach the free list and be overwritten. A
-/// write that fails degrades to a plain eviction (the tree drops that node).
+/// FIRST — before any of them can reach the free list and be overwritten (on
+/// the fast path: gathered into staging that a queued write owns). A write
+/// that fails degrades to a plain eviction (the tree drops that node).
 pub(crate) fn apply_evicted_blocks(
     evicted: spark_runtime::prefix_cache::EvictedBlocks,
     kv_cache: &mut PagedKvCache,
@@ -43,13 +44,7 @@ pub(crate) fn apply_evicted_blocks(
 ) {
     if !evicted.spill.is_empty() {
         let failed = kv_cache.nvme_write(&evicted.spill, gpu, gpu.default_stream());
-        if !failed.is_empty()
-            && let Some(tier) = prefix_cache.nvme()
-        {
-            for block in tier.spill_failed(&failed) {
-                kv_cache.return_evicted_block(block);
-            }
-        }
+        drop_failed_spills(&failed, kv_cache, prefix_cache);
     }
     let free_before = kv_cache.num_free_blocks();
     let n_evicted = evicted.physical.len();
@@ -84,6 +79,23 @@ pub(crate) fn apply_evicted_blocks(
         // Errors here are advisory — orchestrator absent shouldn't block
         // the cache eviction path. Log and continue.
         tracing::debug!("apply_evicted_blocks: spark_storage::with_local closure: {e:#}");
+    }
+}
+
+/// Spill writes that did not reach the disk: the tree forgets those nodes (a
+/// plain eviction). The fast path reports a failure after the fact, so this
+/// also runs around a restore.
+pub(crate) fn drop_failed_spills(
+    failed: &[spark_runtime::prefix_cache::SpillOrder],
+    kv_cache: &mut PagedKvCache,
+    prefix_cache: &dyn PrefixCache,
+) {
+    if !failed.is_empty()
+        && let Some(tier) = prefix_cache.nvme()
+    {
+        for block in tier.spill_failed(failed) {
+            kv_cache.return_evicted_block(block);
+        }
     }
 }
 

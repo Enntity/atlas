@@ -57,8 +57,36 @@ fn nobody_eligible_is_agreement_on_zero() {
 const BS: usize = 16;
 const POOL: usize = 6;
 
-/// GLM-5.3 geometry (FP8-G128 latent, V aliases K, pooled BF16 index).
+/// Which I/O path the tier runs on (`ATLAS_GLM_NVME_FAST`).
+#[derive(Clone, Copy)]
+enum Path {
+    Sync,
+    Fast,
+}
+
+fn attach(
+    kv: &mut PagedKvCache,
+    gpu: &MockGpuBackend,
+    store: Box<dyn atlas_tier::SwapStore>,
+    path: Path,
+) {
+    match path {
+        Path::Sync => kv.attach_nvme_spill(store, gpu),
+        Path::Fast => kv.attach_nvme_fast(std::sync::Arc::new(std::sync::Mutex::new(store)), gpu),
+    }
+    .unwrap();
+}
+
 fn glm_kv(gpu: &MockGpuBackend, store: Option<Box<dyn atlas_tier::SwapStore>>) -> PagedKvCache {
+    glm_kv_on(gpu, store, Path::Sync)
+}
+
+/// GLM-5.3 geometry (FP8-G128 latent, V aliases K, pooled BF16 index).
+fn glm_kv_on(
+    gpu: &MockGpuBackend,
+    store: Option<Box<dyn atlas_tier::SwapStore>>,
+    path: Path,
+) -> PagedKvCache {
     let cfg = KvCacheConfig {
         block_size: BS,
         num_kv_heads: 1,
@@ -74,7 +102,7 @@ fn glm_kv(gpu: &MockGpuBackend, store: Option<Box<dyn atlas_tier::SwapStore>>) -
         .unwrap();
     let store =
         store.unwrap_or_else(|| Box::new(atlas_tier::MemSwapStore::new(kv.nvme_record_bytes())));
-    kv.attach_nvme_spill(store, gpu).unwrap();
+    attach(&mut kv, gpu, store, path);
     kv
 }
 
@@ -144,8 +172,17 @@ fn tree_with_tier(slots: u32) -> RadixTree {
 
 #[test]
 fn evicted_prefix_restores_byte_identical() {
+    evicted_prefix_restores(Path::Sync);
+}
+
+#[test]
+fn evicted_prefix_restores_byte_identical_on_the_fast_path() {
+    evicted_prefix_restores(Path::Fast);
+}
+
+fn evicted_prefix_restores(path: Path) {
     let gpu = MockGpuBackend::new();
-    let mut kv = glm_kv(&gpu, None);
+    let mut kv = glm_kv_on(&gpu, None, path);
     let tree = tree_with_tier(64);
     let t: Vec<u32> = (0..3 * BS as u32).collect();
     let want = cache_request(&mut kv, &tree, &gpu, &t);
@@ -254,11 +291,94 @@ fn read_error_recomputes_and_forgets_the_record() {
     assert_eq!(tree.nvme_stats().slots_used, 0);
 }
 
+/// Write-behind: the failure surfaces after the evictions returned, and the
+/// tree still ends up exactly where a plain eviction leaves it.
+#[test]
+fn disk_full_on_the_fast_path_degrades_to_plain_eviction() {
+    let gpu = MockGpuBackend::new();
+    let store = flaky(record_bytes(), true, false);
+    let mut kv = glm_kv_on(&gpu, Some(store), Path::Fast);
+    let tree = tree_with_tier(64);
+    let t: Vec<u32> = (0..2 * BS as u32).collect();
+    cache_request(&mut kv, &tree, &gpu, &t);
+    pressure(&mut kv, &tree, &gpu);
+    // Either the failures were already in (nothing to plan) or the records
+    // fail verification; never a restore.
+    let first = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len());
+    assert!(first.is_none_or(|r| r.restored == 0));
+    assert!(restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).is_none());
+    assert!(tree.lookup(&t, BS, 0, 0).is_empty());
+    assert_eq!(tree.nvme_stats().slots_used, 0);
+    assert_eq!(kv.num_free_blocks(), POOL);
+}
+
+#[test]
+fn restore_reports_where_its_time_went() {
+    let gpu = MockGpuBackend::new();
+    let mut kv = glm_kv_on(&gpu, None, Path::Fast);
+    let tree = tree_with_tier(64);
+    let t: Vec<u32> = (0..3 * BS as u32).collect();
+    cache_request(&mut kv, &tree, &gpu, &t);
+    pressure(&mut kv, &tree, &gpu);
+    let io = kv.nvme_io_stats();
+    assert!(io.fast);
+    assert_eq!(io.spilled_blocks, 3);
+    let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
+    assert_eq!(r.restored, 3);
+    // The restored run sits on ascending blocks, in path order.
+    let m = tree.lookup(&t, BS, 0, 0);
+    assert!(m.matched_blocks.is_sorted(), "{:?}", m.matched_blocks);
+    tree.release(&t, BS, 0);
+}
+
+/// `ATLAS_GLM_NVME_KEEP`: a restored conversation that is evicted again costs
+/// no write, and comes back from the record it already had.
+#[test]
+fn a_kept_record_is_not_rewritten_when_its_block_is_evicted_again() {
+    for path in [Path::Sync, Path::Fast] {
+        let gpu = MockGpuBackend::new();
+        let mut kv = glm_kv_on(&gpu, None, path);
+        let tree = tree_with_tier(64);
+        tree.set_keep_restored(true);
+        let t: Vec<u32> = (0..3 * BS as u32).collect();
+        let want = cache_request(&mut kv, &tree, &gpu, &t);
+        pressure(&mut kv, &tree, &gpu);
+        let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
+        assert_eq!(r.restored, 3);
+        assert_eq!(kv.nvme_io_stats().spilled_blocks, 3);
+
+        pressure(&mut kv, &tree, &gpu);
+        assert!(tree.lookup(&t, BS, 0, 0).is_empty(), "evicted again");
+        assert_eq!(kv.nvme_io_stats().spilled_blocks, 3, "nothing written");
+        let s = tree.nvme_stats();
+        assert_eq!((s.spills, s.clean_evictions), (3, 3));
+
+        let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
+        assert_eq!((r.restored, r.failed), (3, false));
+        let m = tree.lookup(&t, BS, 0, 0);
+        for (i, &b) in m.matched_blocks.iter().enumerate() {
+            assert_eq!(dump(&kv, &gpu, b), want[i], "block {i} bytes");
+            assert_eq!(kv.ref_count(b), 1);
+        }
+        tree.release(&t, BS, 0);
+        assert_eq!(kv.num_free_blocks(), POOL - 3);
+    }
+}
+
 /// Slotted index tails (prefix caching + ATLAS_MARCONI_PREFILL_ONLY): every
 /// tail a request was lent comes back — through spill and restore alike — and
 /// a restored block is published tail-less, never aliasing a live slot.
 #[test]
 fn slotted_tails_are_released_by_spill_and_absent_after_restore() {
+    slotted_tails(Path::Sync);
+}
+
+#[test]
+fn slotted_tails_survive_the_fast_path() {
+    slotted_tails(Path::Fast);
+}
+
+fn slotted_tails(path: Path) {
     use spark_runtime::kv_cache::{NO_TAIL, TailSlotPlan};
     let gpu = MockGpuBackend::new();
     let cfg = KvCacheConfig {
@@ -279,8 +399,8 @@ fn slotted_tails_are_released_by_spill_and_absent_after_restore() {
     kv.attach_sparse_index_with_tail_slots(SparseIndexCacheConfig::bf16(4, 128), Some(plan), &gpu)
         .unwrap();
     let record = kv.nvme_record_bytes();
-    kv.attach_nvme_spill(Box::new(atlas_tier::MemSwapStore::new(record)), &gpu)
-        .unwrap();
+    let store = Box::new(atlas_tier::MemSwapStore::new(record));
+    attach(&mut kv, &gpu, store, path);
     let tree = tree_with_tier(64);
     let tail_map = |kv: &PagedKvCache| {
         let mut b = vec![0u8; POOL * 4];

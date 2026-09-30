@@ -22,6 +22,12 @@ impl NvmePrefixTier for RadixTree {
         self.inner.lock().nvme_on()
     }
 
+    fn set_keep_restored(&self, keep: bool) {
+        if let Some(idx) = self.inner.lock().nvme.as_mut() {
+            idx.keep_restored = keep;
+        }
+    }
+
     fn plan_restore(&self, tokens: &[u32], block_size: usize, adapter_id: u64) -> RestorePlan {
         self.inner.lock().nvme_plan(tokens, block_size, adapter_id)
     }

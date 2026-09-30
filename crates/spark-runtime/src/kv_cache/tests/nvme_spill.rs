@@ -8,7 +8,7 @@ use crate::prefix_cache::{DiskRef, SpillOrder};
 
 /// GLM-5.3 shape: one 512-wide FP8-G128 latent head, V aliasing K, a BF16
 /// four-token pooled index of width 128 with per-block raw tails.
-fn glm_cache(gpu: &MockGpuBackend, blocks: usize) -> PagedKvCache {
+pub(super) fn glm_cache(gpu: &MockGpuBackend, blocks: usize) -> PagedKvCache {
     let cfg = KvCacheConfig {
         block_size: 16,
         num_kv_heads: 1,
@@ -39,7 +39,7 @@ fn regions(c: &PagedKvCache, block: u32) -> Vec<(DevicePtr, usize)> {
         .collect()
 }
 
-fn fill(c: &PagedKvCache, gpu: &MockGpuBackend, block: u32, seed: u8) {
+pub(super) fn fill(c: &PagedKvCache, gpu: &MockGpuBackend, block: u32, seed: u8) {
     for (i, (ptr, len)) in regions(c, block).into_iter().enumerate() {
         let bytes: Vec<u8> = (0..len)
             .map(|j| seed.wrapping_add((i * 31 + j) as u8))
@@ -48,7 +48,7 @@ fn fill(c: &PagedKvCache, gpu: &MockGpuBackend, block: u32, seed: u8) {
     }
 }
 
-fn dump(c: &PagedKvCache, gpu: &MockGpuBackend, block: u32) -> Vec<u8> {
+pub(super) fn dump(c: &PagedKvCache, gpu: &MockGpuBackend, block: u32) -> Vec<u8> {
     let mut out = Vec::new();
     for (ptr, len) in regions(c, block) {
         let mut b = vec![0u8; len];
@@ -96,7 +96,7 @@ fn spill_and_restore_round_trip_into_other_blocks() {
     assert!(c.nvme_write(&orders, &gpu, 0).is_empty());
     fill(&c, &gpu, 1, 0);
     let disk = [DiskRef { slot: 5, tag: 0xA }, DiskRef { slot: 0, tag: 0xB }];
-    assert_eq!(c.nvme_read(&disk, &[6, 3], &gpu, 0), (2, false));
+    assert_eq!(c.nvme_read(&disk, &mut [6, 3], &gpu, 0), (2, false));
     assert_eq!(dump(&c, &gpu, 6), want1);
     assert_eq!(dump(&c, &gpu, 3), want2);
 }
@@ -116,11 +116,11 @@ fn wrong_tag_or_missing_record_fails_without_scattering() {
     let before = dump(&c, &gpu, 4);
     // Stale record (tag from another spill): verified prefix = 0, failed.
     let stale = [DiskRef { slot: 0, tag: 43 }];
-    assert_eq!(c.nvme_read(&stale, &[4], &gpu, 0), (0, true));
+    assert_eq!(c.nvme_read(&stale, &mut [4], &gpu, 0), (0, true));
     assert_eq!(dump(&c, &gpu, 4), before, "nothing scattered");
     // A good record followed by a never-written one: 1 restored, then failed.
     let run = [DiskRef { slot: 0, tag: 42 }, DiskRef { slot: 9, tag: 1 }];
-    assert_eq!(c.nvme_read(&run, &[4, 5], &gpu, 0), (1, true));
+    assert_eq!(c.nvme_read(&run, &mut [4, 5], &gpu, 0), (1, true));
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn unattached_cache_refuses_everything() {
     };
     assert_eq!(c.nvme_write(&[o], &gpu, 0), vec![o]);
     assert_eq!(
-        c.nvme_read(&[DiskRef { slot: 0, tag: 1 }], &[2], &gpu, 0),
+        c.nvme_read(&[DiskRef { slot: 0, tag: 1 }], &mut [2], &gpu, 0),
         (0, false)
     );
 }
@@ -244,7 +244,7 @@ fn descending_chain_restores_with_one_ranged_read() {
         DiskRef { slot: 1, tag: 2 },
         DiskRef { slot: 0, tag: 3 },
     ];
-    assert_eq!(c.nvme_read(&disk, &[5, 6, 7], &gpu, 0), (3, false));
+    assert_eq!(c.nvme_read(&disk, &mut [5, 6, 7], &gpu, 0), (3, false));
     assert_eq!(ranged.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(dump(&c, &gpu, 5), want[0]);
     assert_eq!(dump(&c, &gpu, 6), want[1]);

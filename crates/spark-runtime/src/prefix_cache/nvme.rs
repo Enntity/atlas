@@ -16,6 +16,15 @@
 //! run top-down starting right below the resident prefix; `insert` re-homes an
 //! on-disk node onto the inserting sequence's block top-down.
 
+/// Host RAM the tree keeps per ON-DISK block, for sizing: a disk budget of N
+/// records can grow the process by about `N ×` this. Per node (16-token
+/// blocks, 64-bit): the `RadixNode` itself (152 B, in a `Vec` that doubles —
+/// 1.5× on average), its `parent_key` (64 B + allocator header), its entry in
+/// the parent's `children` map (a 4-bucket table of 32 B buckets, plus the
+/// 64 B key), and the slot index (owner + tag + disk-LRU entry, ~60 B).
+/// `host_bytes_per_disk_block_covers_a_node` pins the inline part.
+pub const NVME_HOST_BYTES_PER_BLOCK: usize = 640;
+
 /// One eviction-time write the caller MUST perform before returning `block`
 /// to the free list: copy the block's bytes to record `slot`, stamped `tag`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +76,9 @@ pub struct NvmeStats {
     /// Evicted blocks deleted instead of spilled because they were colder than
     /// every droppable on-disk block (budget full).
     pub cold_drops: u64,
+    /// Evictions that needed no write: the block still had the record it was
+    /// restored from ([`NvmePrefixTier::set_keep_restored`]).
+    pub clean_evictions: u64,
 }
 
 /// The tree side of the NVMe tier. Every method is a no-op / empty result
@@ -78,6 +90,13 @@ pub trait NvmePrefixTier: Send + Sync {
     fn enable(&self, max_slots: u32) -> bool;
 
     fn is_enabled(&self) -> bool;
+
+    /// Keep a block's record when the block is restored (default: release
+    /// it). A cached full block is never rewritten, so the record stays valid
+    /// for as long as its node lives, and evicting the block again costs no
+    /// I/O at all. Kept records count against the budget, so they are only
+    /// kept while at most half of it is in use.
+    fn set_keep_restored(&self, keep: bool);
 
     /// Find the on-disk run that continues the resident prefix of `tokens`
     /// (full blocks only) and pin the path. Empty plan ⇒ nothing to restore.

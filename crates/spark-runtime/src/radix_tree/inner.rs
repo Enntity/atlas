@@ -19,7 +19,8 @@ pub(super) struct RadixNode {
     /// Physical KV cache block index stored at this node. `u32::MAX` on a
     /// non-root node means the block is ON DISK at `nvme_slot` (spill tier).
     block_idx: u32,
-    /// NVMe spill-tier record slot; `u32::MAX` unless the node is on disk.
+    /// NVMe spill-tier record slot; `u32::MAX` when the node has no record.
+    /// A resident node may have one too (a record kept across its restore).
     nvme_slot: u32,
     /// `--high-speed-swap` disk-block ID (Phase 6.1.e). `u32::MAX` when HSS
     /// is not in use. The cache holds a refcount on this disk_id (bumped
@@ -364,7 +365,7 @@ impl RadixTreeInner {
             if let Some(&child) = self.nodes[current].children.get(chunk) {
                 // A node spilled to NVMe takes this sequence's freshly computed
                 // block instead (before its LRU key changes below).
-                if self.nvme_rehome(child, block_table[i]) {
+                if self.nvme_rehome(child, block_table[i], false) {
                     newly_owned_blocks.push(block_table[i]);
                 }
                 // Node exists — update access time, context_hash, and ensure
