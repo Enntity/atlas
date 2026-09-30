@@ -38,12 +38,7 @@ pub(super) fn verify_owner_batch(
             .find(|&w| model.can_batch_glm_long_verify_rows(owners.len(), w + 1));
         let max = fits.unwrap_or(0);
         (owners.len() >= 2)
-            .then(|| {
-                super::dflash_width::choose(
-                    owners.iter().map(|&i| &active[i].spec_adapt.survival),
-                    max,
-                )
-            })
+            .then(|| super::dflash_width::choose(owners.iter().map(|&i| &active[i]), max))
             .flatten()
     } else {
         None

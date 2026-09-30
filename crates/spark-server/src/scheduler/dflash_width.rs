@@ -13,6 +13,8 @@
 //! uniform), so the batch trades their curves against each other.
 //!
 //! `ATLAS_DFLASH_FIXED_WIDTH=w` pins the width instead (cost sweeps).
+//! `ATLAS_DFLASH_CONF_WIDTH=1` sizes it from the drafter's confidence in
+//! this step's drafts where that is measured (`dflash_conf_width`).
 
 use std::sync::OnceLock;
 
@@ -116,7 +118,7 @@ impl DraftSurvival {
 /// each: median scheduler step interval (verify + re-propose) on GLM-5.3
 /// Flash TP2 GB10, prose, 2026-09-28 (`ATLAS_DFLASH_FIXED_WIDTH` sweeps; 5..=8
 /// owners on the eight-sequence profile).
-fn step_ms(owners: usize, rows: usize) -> f32 {
+pub(super) fn step_ms(owners: usize, rows: usize) -> f32 {
     // Rows 2..=8, owners 1..=8. A lone owner's 2-row verify takes a slower
     // path than 3 rows. Owners x rows past the 32-row verify budget never
     // run (infinite cost).
@@ -157,10 +159,10 @@ fn fixed() -> Option<usize> {
     })
 }
 
-/// Width (drafts per owner, 1..=`max`) for owners with these survival
-/// curves verifying together; `None` leaves the caller's policy in place.
+/// Width (drafts per owner, 1..=`max`) for owners verifying together, each
+/// holding at least `max` drafts; `None` leaves the caller's policy in place.
 pub(crate) fn choose<'a>(
-    owners: impl ExactSizeIterator<Item = &'a DraftSurvival> + Clone,
+    owners: impl ExactSizeIterator<Item = &'a super::ActiveSeq> + Clone,
     max: usize,
 ) -> Option<usize> {
     let max = max.min(MAX_DRAFTS);
@@ -170,7 +172,11 @@ pub(crate) fn choose<'a>(
     if let Some(w) = fixed() {
         return Some(w.min(max));
     }
-    enabled().then(|| best(owners, max))
+    let confidences = owners.clone().map(|a| a.seq.dflash_draft_conf());
+    if let Some(w) = super::dflash_conf_width::choose(confidences, max) {
+        return Some(w);
+    }
+    enabled().then(|| best(owners.map(|a| &a.spec_adapt.survival), max))
 }
 
 /// The width maximizing the owners' expected tokens per step millisecond.

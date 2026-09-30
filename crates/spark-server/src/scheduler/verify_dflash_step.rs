@@ -252,6 +252,11 @@ pub(super) fn verify_dflash_tail(
     // accept window; may suspend this seq's speculation (see adaptive_spec).
     crate::scheduler::adaptive_spec::record_verify(a, num_accepted, sched);
     a.spec_adapt.survival.record(drafts.len(), num_accepted);
+    crate::scheduler::dflash_conf_width::record(
+        a.seq.dflash_draft_conf(),
+        drafts.len(),
+        num_accepted,
+    );
 
     // Roll back the over-extended `seq_len` and `seq.tokens`. The verify
     // advanced both by `tokens.len() = γ+1` (all γ drafts + the prefix

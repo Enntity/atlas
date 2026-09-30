@@ -33,8 +33,7 @@ pub(super) fn lone_dflash_width(
 ) {
     // A lone DFlash verify pays single-owner cost for each row it adds.
     if dflash_verify_raw_argmax
-        && let Some(width) =
-            super::dflash_width::choose(std::iter::once(&a.spec_adapt.survival), drafts.len())
+        && let Some(width) = super::dflash_width::choose(std::iter::once(a), drafts.len())
     {
         drafts.truncate(width);
     }
