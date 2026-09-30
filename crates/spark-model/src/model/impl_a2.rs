@@ -157,6 +157,7 @@ impl TransformerModel {
         let comm = self.comm.as_ref().unwrap();
         let byte_len = n * 4;
         let stream = self.gpu.default_stream();
+        let _transfer = self.warm.transfer_span(); // ATLAS_GLM_WARM_TRACE
 
         // Use scratch buffer as device staging. This is safe because
         // ep_broadcast_tokens is called BEFORE prefill_chunk, which overwrites
