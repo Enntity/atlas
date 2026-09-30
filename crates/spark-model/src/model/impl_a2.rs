@@ -462,7 +462,7 @@ impl TransformerModel {
     /// (seq_id, cmd) preamble + slot lookup + shutdown + alloc are already
     /// handled by the caller; this routine assumes `seq` is the right
     /// slot's allocated `SequenceState`.
-    fn ep_worker_dispatch_cmd(&self, cmd: u32, seq: &mut SequenceState) -> Result<bool> {
+    pub(super) fn ep_worker_dispatch_cmd(&self, cmd: u32, seq: &mut SequenceState) -> Result<bool> {
         let stream = self.gpu.default_stream();
 
         match cmd {

@@ -24,9 +24,12 @@ pub(in crate::model) fn enabled() -> bool {
         resolve(
             std::env::var("ATLAS_GLM_PC_FINISH_LEAF").as_deref() == Ok("1"),
             &[
+                // The radix walk's own read (`RadixTreeInner::walk`). opt/audit-fixes
+                // exports it as `radix_tree::subblock_matching()`: use that once
+                // it lands (adding the helper here too merges as a duplicate).
                 (
                     "ATLAS_PREFIX_SUBBLOCK=0",
-                    !spark_runtime::radix_tree::prefix_subblock_enabled(),
+                    std::env::var("ATLAS_PREFIX_SUBBLOCK").as_deref() == Ok("0"),
                 ),
                 (
                     "ATLAS_MARCONI_PREFILL_ONLY=1",

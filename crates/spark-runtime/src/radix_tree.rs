@@ -59,12 +59,6 @@ pub(crate) fn prefix_hash_push(h: u64, v: impl Into<u64>) -> u64 {
     (h ^ v.into()).wrapping_mul(0x100000001b3)
 }
 
-/// Whether a lookup may match part of a block (`ATLAS_PREFIX_SUBBLOCK`, on
-/// unless `0`). See `RadixTreeInner::walk` for what a partial match reuses.
-pub fn prefix_subblock_enabled() -> bool {
-    std::env::var("ATLAS_PREFIX_SUBBLOCK").as_deref() != Ok("0")
-}
-
 /// Thread-safe radix tree prefix cache.
 ///
 /// SSM snapshots are stored in a separate `SsmSnapshotIndex`, decoupled from
