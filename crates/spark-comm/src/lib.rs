@@ -119,7 +119,11 @@ pub trait CommBackend: Send + Sync {
     /// use it too. `Ok(false)` (nothing enqueued) when unavailable for this
     /// size; the answer depends only on `bytes` and configuration, so both
     /// ranks agree. Both ranks must issue capturable collectives in the same
-    /// order on one stream.
+    /// order and one at a time on the GPU: the sequence is shared by every
+    /// stream, so calls on different streams (decode on the default stream,
+    /// prefill on the scheduler's prefill stream) must be serialized by the
+    /// caller with events or syncs, as for [`Self::all_reduce_async`] over
+    /// the RDMA pair.
     fn all_reduce_capturable(&self, _ptr: u64, _bytes: usize, _stream: u64) -> Result<bool> {
         Ok(false)
     }

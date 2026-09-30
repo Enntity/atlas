@@ -116,4 +116,55 @@ fn flag_words_order_by_sequence_and_carry_the_size() {
     assert_eq!(flag_word(1, MAX_LIMIT) & 0xff_ffff, MAX_LIMIT as u64);
     assert!(describe_poison(POISON_MISMATCH | 9).contains("op 9"));
     assert!(describe_poison(POISON_TIMEOUT | 3).contains("never arrived"));
+    assert!(describe_poison(POISON_DESYNC | 5).contains("op 5: the peer's flag is more than one"));
+    assert!(describe_poison(POISON_PROXY | 2).contains("op 2: the RDMA proxy failed"));
+    assert!(describe_poison(POISON_LAUNCH).contains("launch failed"));
+}
+
+/// A zeroed stand-in for a pinned region of `bytes`, and its address.
+fn region(bytes: usize) -> (Vec<u64>, usize) {
+    let mut mem = vec![0u64; bytes / 8];
+    let host = mem.as_mut_ptr() as usize;
+    (mem, host)
+}
+
+#[test]
+fn a_failed_proxy_poisons_the_channel_and_releases_the_stage_wait() {
+    use super::super::{Peer, proxy::proxy_loop, region_bytes as legacy_bytes};
+    let c = cfg(&[("ATLAS_RDMA_ONESHOT", "1")]).unwrap();
+    let ((_os, host), (_legacy, legacy)) = (region(region_bytes(c.max)), region(legacy_bytes(64)));
+    let ctrl = host + ctrl_off(c.max);
+    let stage = unsafe { &*((ctrl + STAGE) as *const AtomicU32) };
+    // An ineligible staged size makes the proxy give up before it uses a rail.
+    stage.store(3, Ordering::Release);
+    let peer = Peer {
+        base: 0,
+        rkeys: Vec::new(),
+    };
+    let (jobs, stop) = Default::default();
+    let ch = Channel::new(c, host, 0);
+    let end = proxy_loop(Vec::new(), &[], &peer, legacy, 64, &jobs, &stop, Some(ch));
+    assert!(end.unwrap_err().to_string().contains("not eligible"));
+    // Nothing would clear `stage` again: the proxy leaves it clear, so the
+    // stream reaches the kernel, and poisoned, so that kernel traps.
+    assert_eq!(stage.load(Ordering::Acquire), 0);
+    let why = poison_at(ctrl).expect("poisoned");
+    assert!(why.contains("op 1: the RDMA proxy failed"), "{why}");
+}
+
+#[test]
+fn host_poison_keeps_the_kernels_reason() {
+    let c = cfg(&[("ATLAS_RDMA_ONESHOT", "1")]).unwrap();
+    let (_os, host) = region(region_bytes(c.max));
+    let ctrl = host + ctrl_off(c.max);
+    assert_eq!(poison_at(ctrl), None);
+    poison_host(ctrl, POISON_LAUNCH);
+    assert!(poison_at(ctrl).unwrap().contains("launch failed"));
+    unsafe { ((ctrl + POISON) as *mut u64).write(POISON_TIMEOUT | 4) };
+    poison_host(ctrl, POISON_PROXY | 9);
+    assert!(
+        poison_at(ctrl)
+            .unwrap()
+            .contains("op 4: the peer never arrived")
+    );
 }

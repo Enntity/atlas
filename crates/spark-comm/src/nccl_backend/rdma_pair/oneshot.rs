@@ -29,9 +29,20 @@
 //!
 //! A late rank never waits for its own send: the peer's data has landed and
 //! its kernel exits; only its next stage waits for `S` to drain. Both ranks
-//! must issue the same one-shot ops in the same order on one stream. A size
-//! mismatch at a sequence number, or a peer that never arrives within
-//! `ATLAS_RDMA_ONESHOT_TIMEOUT_MS`, poisons the region and traps.
+//! must issue the same one-shot ops in the same order, and one at a time on
+//! the GPU: the sequence and `S` are shared by every stream, so ops on
+//! different streams (decode on the default stream, prefill on the
+//! scheduler's prefill stream) must be serialized by the caller with events
+//! or syncs, as they are for the legacy channel.
+//!
+//! Nothing hangs on a fault; the poison word names it and the kernel traps.
+//! The kernel poisons on a size mismatch at a sequence number, a flag more
+//! than one op ahead (the peer cannot stage `seq + 2` before our flag
+//! `seq + 1`), or a peer that never arrives within
+//! `ATLAS_RDMA_ONESHOT_TIMEOUT_MS`. The host poisons when it can no longer
+//! serve: the proxy failed (it then clears `stage`, so a stream blocked in
+//! step 1 reaches a kernel), or a launch failed after a fenced `stage` was
+//! published. Every kernel checks the word at launch and while it waits.
 
 use super::{SPLIT_MIN, cu, cuMemcpyAsync};
 use crate::nccl_backend::{cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2};
@@ -66,6 +77,11 @@ const POISON: usize = 64;
 const FLAGS: usize = 128;
 const FLAG_SRC: usize = FLAGS + 64 * MAX_RAILS;
 const CTRL_PAGE: usize = 4096;
+/// Poison reasons (high bits) over the op's sequence number; the kernel
+/// writes the top three, the host the others.
+const POISON_LAUNCH: u64 = 1 << 59;
+const POISON_PROXY: u64 = 1 << 60;
+const POISON_DESYNC: u64 = 1 << 61;
 const POISON_TIMEOUT: u64 = 1 << 62;
 const POISON_MISMATCH: u64 = 1 << 63;
 
@@ -158,11 +174,31 @@ fn flag_word(seq: u64, bytes: usize) -> u64 {
 }
 
 fn describe_poison(word: u64) -> String {
-    let seq = word & (POISON_TIMEOUT - 1);
-    match word & (POISON_TIMEOUT | POISON_MISMATCH) {
-        POISON_MISMATCH => format!("op {seq}: the peer sent a different size (ranks diverged)"),
-        _ => format!("op {seq}: the peer never arrived (ATLAS_RDMA_ONESHOT_TIMEOUT_MS)"),
-    }
+    let why = match word & !(POISON_LAUNCH - 1) {
+        POISON_MISMATCH => "the peer sent a different size (ranks diverged)",
+        POISON_DESYNC => "the peer's flag is more than one op ahead (sequences diverged)",
+        POISON_PROXY => "the RDMA proxy failed (see its error)",
+        POISON_LAUNCH => "a kernel launch failed after its stage was published",
+        POISON_TIMEOUT => "the peer never arrived (ATLAS_RDMA_ONESHOT_TIMEOUT_MS)",
+        _ => "unknown fault",
+    };
+    format!("op {}: {why}", word & (POISON_LAUNCH - 1))
+}
+
+/// Why the channel with control page `ctrl` (host address) stopped, if it did.
+fn poison_at(ctrl: usize) -> Option<String> {
+    // SAFETY: the control page lives in the pinned region for the pair's
+    // lifetime; the kernel writes this word only before trapping.
+    let word = unsafe { ((ctrl + POISON) as *const u64).read_volatile() };
+    (word != 0).then(|| describe_poison(word))
+}
+
+/// Stop the channel from the host: every later kernel traps at launch. An
+/// earlier reason is kept.
+fn poison_host(ctrl: usize, word: u64) {
+    // SAFETY: as in `poison_at`.
+    let poison = unsafe { &*((ctrl + POISON) as *const AtomicU64) };
+    let _ = poison.compare_exchange(0, word, Ordering::AcqRel, Ordering::Relaxed);
 }
 
 /// Enqueue side, owned by the backend.
@@ -217,13 +253,9 @@ impl OneShot {
         }
     }
 
-    /// Why the kernel trapped, if it did.
+    /// Why the channel stopped (the kernel trapped or will), if it did.
     pub(in crate::nccl_backend) fn poisoned(&self) -> Option<String> {
-        let at = self.host + ctrl_off(self.cfg.max) + POISON;
-        // SAFETY: the control page lives in the pinned region for the pair's
-        // lifetime; the kernel writes this word only before trapping.
-        let word = unsafe { (at as *const u64).read_volatile() };
-        (word != 0).then(|| describe_poison(word))
+        poison_at(self.host + ctrl_off(self.cfg.max))
     }
 
     /// Send `src[..bytes]` to the peer and land its payload in `dst` (added
@@ -301,6 +333,12 @@ impl OneShot {
                 std::ptr::null_mut(),
             )
         };
+        if status != 0 && self.cfg.stage_fence {
+            // `stage` is already on the stream: the proxy will serve an op no
+            // kernel consumes, and its count would stay ahead of the device
+            // sequence (stale receive slots). Stop the channel instead.
+            poison_host(self.host + ctrl_off(self.cfg.max), POISON_LAUNCH);
+        }
         cu(status, "cuLaunchKernel(rdma_oneshot_bf16)")?;
         Ok(true)
     }
@@ -329,6 +367,16 @@ impl Channel {
             peer,
             served: 0,
         }
+    }
+
+    /// The proxy is going away and nothing will clear `stage` again: poison
+    /// the channel, then release a stream blocked in the stage wait so it
+    /// reaches a kernel, which traps on the poison.
+    pub(super) fn fail(&self) {
+        let ctrl = self.host + ctrl_off(self.cfg.max);
+        poison_host(ctrl, POISON_PROXY | (self.served + 1));
+        // SAFETY: as in `serve`.
+        unsafe { &*((ctrl + STAGE) as *const AtomicU32) }.store(0, Ordering::Release);
     }
 
     /// Send the staged op, if any: data then flag per rail, chained in one

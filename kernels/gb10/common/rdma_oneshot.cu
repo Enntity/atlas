@@ -19,8 +19,13 @@
 // cost ~4 us at 16 blocks) and republishes seq in device memory (`state[2]`)
 // for the other blocks, which still check the host flags every 256 polls so
 // no block depends on another's residency. A peer that never arrives trips a
-// %globaltimer limit. Either fault writes the poison word (reason | seq) for
-// the host health check, then traps.
+// %globaltimer limit, and a flag more than one op ahead means the sequences
+// diverged (the peer stages seq + 2 only after its kernel seq + 1, which
+// waited for our flag seq + 1). Each fault writes the poison word
+// (reason | seq) for the host health check, then traps. The host writes the
+// same word when it can no longer send for this rank (its RDMA proxy failed,
+// or a launch failed after a fenced stage): block 0 traps on it at launch and
+// while it waits, rather than complete ops the peer never sees.
 //
 // Not on the PDL list: it must start after its stream predecessors, and its
 // successors must not read dst before it completes.
@@ -28,6 +33,7 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
+#define ONESHOT_POISON_DESYNC (1ull << 61)
 #define ONESHOT_POISON_TIMEOUT (1ull << 62)
 #define ONESHOT_POISON_MISMATCH (1ull << 63)
 #define ONESHOT_FLAG_STRIDE 8 // u64 words: one 64-byte line per rail
@@ -73,7 +79,8 @@ __device__ __forceinline__ void oneshot_poison(uint64_t* poison, uint64_t word) 
     __trap();
 }
 
-// Whether every rail's flag has reached `seq` (poisons on a size mismatch).
+// Whether every rail's flag has reached `seq` (poisons on a size mismatch or
+// a flag from beyond the next op).
 __device__ __forceinline__ bool oneshot_arrived(
     const uint64_t* flags, uint32_t rails, uint64_t seq, uint32_t bytes, uint64_t* poison) {
     for (uint32_t r = 0; r < rails; ++r) {
@@ -83,6 +90,9 @@ __device__ __forceinline__ bool oneshot_arrived(
         }
         if ((f >> 24) == seq && (f & 0xffffff) != bytes) {
             oneshot_poison(poison, ONESHOT_POISON_MISMATCH | seq);
+        }
+        if ((f >> 24) > seq + 1) {
+            oneshot_poison(poison, ONESHOT_POISON_DESYNC | seq);
         }
     }
     return true;
@@ -109,6 +119,10 @@ extern "C" __global__ void rdma_oneshot_bf16(
             // order), so the proxy may read it once it sees the size.
             asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(stage), "r"(bytes) : "memory");
         }
+        // After the publish, which starts our send.
+        if (blockIdx.x == 0 && oneshot_ld_acquire(poison) != 0) {
+            __trap();
+        }
         const uint64_t t0 = oneshot_now();
         for (uint32_t spin = 0;; ++spin) {
             const bool own = blockIdx.x == 0 || spin % 256 == 255;
@@ -116,8 +130,13 @@ extern "C" __global__ void rdma_oneshot_bf16(
                     : oneshot_ld_acquire_gpu(go) >= seq) {
                 break;
             }
-            if (timeout_ns != 0 && spin % 64 == 63 && oneshot_now() - t0 > timeout_ns) {
-                oneshot_poison(poison, ONESHOT_POISON_TIMEOUT | seq);
+            if (spin % 64 == 63) {
+                if (blockIdx.x == 0 && oneshot_ld_acquire(poison) != 0) {
+                    __trap();
+                }
+                if (timeout_ns != 0 && oneshot_now() - t0 > timeout_ns) {
+                    oneshot_poison(poison, ONESHOT_POISON_TIMEOUT | seq);
+                }
             }
         }
         if (blockIdx.x == 0 && gridDim.x > 1) {

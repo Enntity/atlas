@@ -15,9 +15,12 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Run the proxy until `stop`. If it fails, no one-shot send would ever
+/// drain, so it stops that channel ([`Channel::fail`]) rather than leave
+/// streams waiting on it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn proxy_loop(
-    mut rails: Vec<Verbs>,
+    rails: Vec<Verbs>,
     lkeys: &[u32],
     peer: &Peer,
     host: usize,
@@ -25,6 +28,24 @@ pub(super) fn proxy_loop(
     jobs: &Mutex<VecDeque<Job>>,
     stop: &AtomicBool,
     mut oneshot: Option<Channel>,
+) -> Result<()> {
+    let end = serve(rails, lkeys, peer, host, capacity, jobs, stop, &mut oneshot);
+    if let (Err(_), Some(ch)) = (&end, &oneshot) {
+        ch.fail();
+    }
+    end
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve(
+    mut rails: Vec<Verbs>,
+    lkeys: &[u32],
+    peer: &Peer,
+    host: usize,
+    capacity: usize,
+    jobs: &Mutex<VecDeque<Job>>,
+    stop: &AtomicBool,
+    oneshot: &mut Option<Channel>,
 ) -> Result<()> {
     // SAFETY: the flag page lives in the pinned region for the pair's lifetime;
     // `ready` is written by the GPU (stream memop) and read only here.
