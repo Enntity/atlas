@@ -28,10 +28,13 @@ pub(super) fn promote_completed_prefills(
     max_seq_len: usize,
     glm_tool_boundary: Option<u32>,
 ) {
-    // Process in reverse order so swap_remove indices stay valid.
+    // Process in reverse order so the remaining indices stay valid. `remove`,
+    // not `swap_remove`: `prefilling` is the service order (the continue phase
+    // advances its head), and a swap would move the newest prefill ahead of
+    // every older one each time the head completes.
     completed_indices.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
     for (idx, maybe_token) in completed_indices {
-        let mut p = prefilling.swap_remove(idx);
+        let mut p = prefilling.remove(idx);
         let Some(first) = maybe_token else {
             // Every producer uses None to mark a failed forward/sampling
             // operation.  Complete the request before releasing its owner;
@@ -252,17 +255,18 @@ pub(super) fn build_active_seq_from_prefill(
     }
 }
 
+/// A 4-token prefill in progress with `max_tokens` as its only distinguishing
+/// field, and the receiver its request completes on.
 #[cfg(test)]
-#[test]
-fn failed_prefill_notifies_request_before_releasing_owner() {
-    let (a, mut response_rx) = super::test_support::test_seq(vec![], 8, None, 4);
+fn test_prefill(max_tokens: usize) -> (PrefillInProgress, super::test_support::RespRx) {
+    let (a, response_rx) = super::test_support::test_seq(vec![], max_tokens, None, 4);
     let now = Instant::now();
     let p = super::prefill_a_step_params::build_prefill_in_progress(
         std::sync::Arc::new(vec![7; 4]),
         0,
         a.seq,
         4,
-        8,
+        max_tokens,
         0,
         super::test_support::EOS.to_vec(),
         a.sink,
@@ -294,6 +298,13 @@ fn failed_prefill_notifies_request_before_releasing_owner() {
         None,
         None,
     );
+    (p, response_rx)
+}
+
+#[cfg(test)]
+#[test]
+fn failed_prefill_notifies_request_before_releasing_owner() {
+    let (p, mut response_rx) = test_prefill(8);
     let mut prefilling = vec![p];
     let mut active = Vec::new();
 
@@ -319,4 +330,30 @@ fn failed_prefill_notifies_request_before_releasing_owner() {
     }
     assert!(prefilling.is_empty());
     assert!(active.is_empty());
+}
+
+/// The continue phase advances `prefilling[0]`, so the order is the service
+/// order: a finished head must not let the newest prefill overtake older ones.
+#[cfg(test)]
+#[test]
+fn finished_prefill_keeps_the_others_in_arrival_order() {
+    let (mut prefilling, _receivers): (Vec<_>, Vec<_>) =
+        [8, 9, 10].map(test_prefill).into_iter().unzip();
+    let mut active = Vec::new();
+
+    promote_completed_prefills(
+        &super::lifecycle_tests::StubModel::default(),
+        &mut prefilling,
+        vec![(0, None)],
+        &mut active,
+        None,
+        None,
+        None,
+        None,
+        64,
+        None,
+    );
+
+    let order: Vec<usize> = prefilling.iter().map(|p| p.max_tokens).collect();
+    assert_eq!(order, [9, 10]);
 }
