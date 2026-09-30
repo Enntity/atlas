@@ -110,6 +110,10 @@ pub(crate) struct SsmSnapshotPool {
     /// `vec![0u8; 66_846_720]` per event was part of the measured ~400 ms
     /// spill. Freed from `TransformerModel::drop` via `free_staging`.
     pub(super) spill_staging: super::ssm_spill_staging::SpillStaging,
+    /// Marconi slots whose owning sequence was dropped while it still held
+    /// them as a rolling finish leaf (`trait_impl::finish_leaf`); freed at
+    /// the next rolling reserve. Always empty with the flag off.
+    pub(super) orphans: Arc<Mutex<Vec<usize>>>,
 }
 
 impl SsmSnapshotPool {
@@ -154,6 +158,7 @@ impl SsmSnapshotPool {
                 h_f16_to_f32_k: KernelHandle(0),
                 h_f32_to_f16_k: KernelHandle(0),
                 spill_staging: Default::default(),
+                orphans: Default::default(),
             });
         }
 
@@ -215,6 +220,7 @@ impl SsmSnapshotPool {
             h_f16_to_f32_k: crate::layers::try_kernel(gpu, "ssm_h_dtype", "ssm_h_state_f16_to_f32"),
             h_f32_to_f16_k: crate::layers::try_kernel(gpu, "ssm_h_dtype", "ssm_h_state_f32_to_f16"),
             spill_staging: Default::default(),
+            orphans: Default::default(),
         })
     }
 
