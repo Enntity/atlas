@@ -70,6 +70,58 @@ extern "C" __global__ void glm_kv_shard_localize(
     out[i] = local;
 }
 
+// ATLAS_GLM_KV_SHARD_COMPACT=1: glm_kv_shard_localize with each row's owned
+// ids packed to the front in their selected order (a stable partition; the
+// rest of the row is -1) and their number in `counts[row]`, so the split
+// attention kernels walk only the tokens this rank stores instead of a row
+// that is half -1. One CTA of 256 threads per row; thread `t` owns the
+// `ceil(width / 256)` consecutive ids from `t * ceil(width / 256)`.
+// `out` must not alias `in`. Grid: rows, block 256; width <= 256 * 16.
+#define GLM_KV_SHARD_COMPACT_CHUNK 16u
+extern "C" __global__ void glm_kv_shard_localize_compact(
+    const int* __restrict__ in,
+    int* __restrict__ out,
+    unsigned int* __restrict__ counts,
+    const unsigned int* __restrict__ block_table,
+    unsigned int rows,
+    unsigned int width,
+    unsigned int block_size,
+    unsigned int rank,
+    unsigned int world,
+    unsigned int causal_start) {
+    __shared__ unsigned int s_kept[256];
+    const unsigned int r = blockIdx.x;
+    const unsigned int t = threadIdx.x;
+    const unsigned int chunk = (width + 255u) / 256u;
+    if (r >= rows || blockDim.x != 256u || chunk > GLM_KV_SHARD_COMPACT_CHUNK) return;
+    const unsigned int begin = min(t * chunk, width);
+    const unsigned int end = min(begin + chunk, width);
+    const size_t row = (size_t)r * width;
+    int local[GLM_KV_SHARD_COMPACT_CHUNK];
+    unsigned int kept = 0;
+    for (unsigned int c = begin; c < end; ++c) {
+        const int token = in != nullptr ? in[row + c] : (c < causal_start + r + 1u ? (int)c : -1);
+        if (token < 0) continue;
+        const unsigned int id = (unsigned int)token;
+        const unsigned int block = block_table[id / block_size];
+        if (block % world == rank) {
+            local[kept++] = (int)((block / world) * block_size + id % block_size);
+        }
+    }
+    s_kept[t] = kept;
+    __syncthreads();
+    unsigned int before = 0, total = 0;
+    for (unsigned int i = 0; i < 256u; ++i) {
+        if (i == t) before = total;
+        total += s_kept[i];
+    }
+    for (unsigned int k = 0; k < kept; ++k) out[row + before + k] = local[k];
+    // The ids this thread dropped land after every kept id, in order.
+    const unsigned int dropped = begin - before;
+    for (unsigned int k = 0; k < (end - begin) - kept; ++k) out[row + total + dropped + k] = -1;
+    if (t == 0) counts[r] = total;
+}
+
 // Block gather/scatter: dst block `dst_idx[i]` (or `i` when null) receives
 // src block `src_idx[i]` (or `i` when null), for i < n. A block is
 // `block_vecs` 16-byte vectors. Grid: n (never 0), block 256.
