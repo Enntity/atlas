@@ -43,7 +43,7 @@ fn config(n: u32, k: u32) -> u32 {
 
 /// Row-major `out[m, n] = act[m, k] @ weight[n, k]^T`, BF16 in/out with FP32
 /// accumulation: CUTLASS for large M when `ATLAS_BF16_GEMM_CUTLASS=1`, else
-/// (or if CUTLASS rejects the operands) cuBLASLt.
+/// (or if CUTLASS rejects the operands before launching anything) cuBLASLt.
 pub fn bf16_gemm(
     act: DevicePtr,
     weight: u64,
@@ -55,31 +55,57 @@ pub fn bf16_gemm(
 ) -> Result<()> {
     if enabled() && m >= MIN_ROWS {
         let cfg = config(n, k);
-        let ok = row_blocks(m, k, cfg).all(|(row, rows)| {
-            spark_runtime::cutlass::bf16_gemm_tuned(
-                act.0 + u64::from(row) * u64::from(k) * 2,
-                weight,
-                out.0 + u64::from(row) * u64::from(n) * 2,
-                rows,
-                n,
-                k,
-                k,
-                n,
-                cfg,
-                stream,
-            )
-            .is_ok()
-        });
-        if ok {
+        let launched = run_blocks(
+            row_blocks(m, k, cfg),
+            |row, rows| {
+                spark_runtime::cutlass::bf16_gemm_tuned(
+                    act.0 + u64::from(row) * u64::from(k) * 2,
+                    weight,
+                    out.0 + u64::from(row) * u64::from(n) * 2,
+                    rows,
+                    n,
+                    k,
+                    k,
+                    n,
+                    cfg,
+                    stream,
+                )
+            },
+            spark_runtime::cutlass::rejected_before_launch,
+        )?;
+        if launched {
             return Ok(());
         }
-        // The cuBLASLt rerun below rounds differently from the CUTLASS tiles,
-        // so a fallback that only sometimes fires makes prefill irreproducible.
-        tracing::warn!(
-            "bf16_gemm: CUTLASS rejected {m}x{n}x{k} config {cfg}; rerunning in cuBLASLt"
-        );
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            tracing::warn!(
+                "bf16_gemm: CUTLASS rejected {m}x{n}x{k} config {cfg}; such shapes run in \
+                 cuBLASLt (reported once)"
+            )
+        });
     }
     spark_runtime::cublaslt::bf16_gemm_act_weight_t(act.0, weight, out.0, m, n, k, stream)
+}
+
+/// Launches every row block. `Ok(false)` means the backend `rejected` the
+/// operands before launching anything, which depends only on the shape, so
+/// the caller may run the whole GEMM in another backend. Any other failure is
+/// returned: the cuBLASLt rerun rounds differently from the CUTLASS tiles, so
+/// recomputing after a failed launch made some calls of one shape differ from
+/// the rest.
+fn run_blocks(
+    blocks: impl Iterator<Item = (u32, u32)>,
+    mut launch: impl FnMut(u32, u32) -> Result<()>,
+    rejected: impl Fn(&anyhow::Error) -> bool,
+) -> Result<bool> {
+    for (row, rows) in blocks {
+        match launch(row, rows) {
+            Ok(()) => {}
+            Err(error) if rejected(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
 }
 
 /// Activation bytes the unswizzled raster (config 0) keeps L2-resident while
@@ -141,7 +167,51 @@ pub fn fp8_e4m3_to_bf16(
 
 #[cfg(test)]
 mod tests {
-    use super::{bf16_gemm_matches_pipelined as matches_pipelined, config, row_blocks};
+    use super::{bf16_gemm_matches_pipelined as matches_pipelined, config, row_blocks, run_blocks};
+    use spark_runtime::cutlass::{RejectedBeforeLaunch, rejected_before_launch};
+
+    /// Launches `blocks` with the n-th call answering `outcome(n)`; returns
+    /// the verdict and how many blocks were launched.
+    fn launch_all(
+        blocks: u32,
+        outcome: impl Fn(u32) -> anyhow::Result<()>,
+    ) -> (anyhow::Result<bool>, u32) {
+        let mut calls = 0;
+        let verdict = run_blocks(
+            (0..blocks).map(|i| (i * 128, 128)),
+            |row, _| {
+                calls += 1;
+                outcome(row / 128)
+            },
+            rejected_before_launch,
+        );
+        (verdict, calls)
+    }
+
+    #[test]
+    fn only_a_rejection_before_launch_allows_another_backend() {
+        let rejected = || Err(anyhow::Error::new(RejectedBeforeLaunch).context("status 1"));
+        // Every block launched.
+        let (verdict, calls) = launch_all(3, |_| Ok(()));
+        assert!(verdict.unwrap());
+        assert_eq!(calls, 3);
+        // Rejected operands: nothing more is launched and the caller may fall back.
+        let (verdict, calls) = launch_all(3, |_| rejected());
+        assert!(!verdict.unwrap());
+        assert_eq!(calls, 1);
+        // A failed launch is an error on any block, never a silent rerun
+        // (a rerun in cuBLASLt rounds differently from the CUTLASS tiles).
+        for failing in 0..3 {
+            let (verdict, calls) = launch_all(3, |block| {
+                if block == failing {
+                    anyhow::bail!("launch failed, CUTLASS status 7")
+                }
+                Ok(())
+            });
+            assert!(verdict.unwrap_err().to_string().contains("launch failed"));
+            assert_eq!(calls, failing + 1);
+        }
+    }
 
     #[test]
     fn unswizzled_calls_split_into_l2_resident_row_blocks() {

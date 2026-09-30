@@ -10,6 +10,47 @@
 #[cfg(atlas_cutlass)]
 use anyhow::{Result, bail};
 
+/// Marks a wrapper error raised before any kernel launch: CUTLASS rejected the
+/// operands (or is not built in), the output is untouched, and the caller may
+/// use another backend. An error without this marker comes from the launch
+/// itself and must propagate: recomputing in another backend rounds
+/// differently, so a fallback that fires on some calls only makes the output
+/// irreproducible.
+#[derive(Debug)]
+pub struct RejectedBeforeLaunch;
+
+impl std::fmt::Display for RejectedBeforeLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CUTLASS rejected the operands before launching")
+    }
+}
+
+impl std::error::Error for RejectedBeforeLaunch {}
+
+/// Whether `error` comes from a wrapper that launched nothing.
+pub fn rejected_before_launch(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RejectedBeforeLaunch>().is_some()
+}
+
+/// Wrapper statuses from this value up report a failed launch
+/// (`ATLAS_CUTLASS_LAUNCH_FAILED` in `cuda/atlas_stale_cuda_error.h`); lower
+/// non-zero statuses are rejections before any launch.
+pub const LAUNCH_FAILED: i32 = 1000;
+
+/// The error for a non-zero wrapper `status`, marked [`RejectedBeforeLaunch`]
+/// unless the launch itself failed.
+#[cfg(any(atlas_cutlass, test))]
+pub(crate) fn status_error(status: i32, what: String) -> anyhow::Error {
+    if status >= LAUNCH_FAILED {
+        anyhow::anyhow!(
+            "{what}: launch failed, CUTLASS status {}",
+            status - LAUNCH_FAILED
+        )
+    } else {
+        anyhow::Error::new(RejectedBeforeLaunch).context(format!("{what}: status {status}"))
+    }
+}
+
 #[cfg(atlas_cutlass)]
 use std::ffi::c_void;
 #[cfg(atlas_cutlass)]
@@ -228,6 +269,37 @@ unsafe extern "C" {
         returned_count: *mut i32,
     ) -> i32;
     pub(crate) fn cuMemAlloc_v2(dptr: *mut u64, bytesize: usize) -> i32;
+    fn atlas_cuda_stale_error_stats(last_code: *mut i32) -> u64;
+}
+
+/// `status` of the `wrapper` call just made, after reporting any stale sticky
+/// CUDA runtime error its entry drained. Such an error was left unchecked by
+/// an earlier runtime call on this thread; before the wrappers drained it,
+/// CUTLASS read it back as its own launch failure. Warns once with the code
+/// (it names the class of call that leaves it), then logs at debug level.
+#[cfg(atlas_cutlass)]
+pub(crate) fn drained(wrapper: &str, status: i32) -> i32 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+    let mut code = 0i32;
+    let count = unsafe { atlas_cuda_stale_error_stats(&mut code) };
+    let seen = REPORTED.swap(count, Ordering::Relaxed);
+    if count > seen {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("unnamed");
+        if seen == 0 {
+            tracing::warn!(
+                "stale CUDA runtime error {code} drained before CUTLASS {wrapper} on thread \
+                 {name}: an earlier runtime call left it unchecked (reported once)"
+            );
+        } else {
+            tracing::debug!(
+                "stale CUDA runtime error {code} drained before CUTLASS {wrapper} on thread \
+                 {name} ({count} so far)"
+            );
+        }
+    }
+    status
 }
 
 #[cfg(atlas_cutlass)]
@@ -277,4 +349,24 @@ pub(crate) fn ctx() -> Result<&'static Ctx> {
     }
     let _ = CTX.set(Ctx { workspace, ws_size });
     Ok(CTX.get().unwrap())
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    #[test]
+    fn only_pre_launch_statuses_are_marked_rejected() {
+        // can_implement / workspace / config rejections: nothing was launched.
+        for status in [-5, -2, 1, 7, LAUNCH_FAILED - 1] {
+            assert!(rejected_before_launch(&status_error(status, "gemm".into())));
+        }
+        // The launch itself failed: never a reason to try another backend.
+        for status in [LAUNCH_FAILED + 1, LAUNCH_FAILED + 7] {
+            let error = status_error(status, "gemm".into());
+            assert!(!rejected_before_launch(&error));
+            assert!(format!("{error:#}").contains("launch failed"));
+        }
+        assert!(!rejected_before_launch(&anyhow::anyhow!("unrelated")));
+    }
 }
