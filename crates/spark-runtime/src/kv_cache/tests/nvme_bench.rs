@@ -207,7 +207,9 @@ fn nvme_disk_bench() {
     let dir = std::env::var_os("ATLAS_NVME_BENCH_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/nvme-bench")
+            // <target>/<profile>/deps/<test binary>: honours CARGO_TARGET_DIR.
+            let exe = std::env::current_exe().unwrap();
+            exe.ancestors().nth(3).unwrap().join("nvme-bench")
         });
     std::fs::create_dir_all(&dir).unwrap();
     let convs: usize = std::env::var("ATLAS_NVME_BENCH_CONVS")

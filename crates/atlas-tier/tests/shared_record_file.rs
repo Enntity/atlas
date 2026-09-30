@@ -12,11 +12,18 @@ use atlas_tier::{ConcurrentSwapStore, MemSwapStore, SharedRecordFile};
 
 const RB: usize = 4096;
 
+/// Scratch space under the cargo target directory (`CARGO_TARGET_DIR` and
+/// `build.target-dir` honoured).
+fn scratch() -> std::path::PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("atlas-tier-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 /// A real-filesystem file (tmpfs/overlay refuse O_DIRECT — tolerated as a skip
 /// unless `ATLAS_TIER_REQUIRE_O_DIRECT` is set, as in `direct_swap.rs`).
 fn record_file(tag: &str) -> Option<(SharedRecordFile, std::path::PathBuf)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/atlas-tier-tests");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch();
     let path = dir.join(format!("srf-{tag}-{}.swap", std::process::id()));
     let _ = std::fs::remove_file(&path);
     match SharedRecordFile::create(&path, RB) {
@@ -205,9 +212,7 @@ fn memory_backed_and_overlay_filesystems_are_named() {
 
 #[test]
 fn stale_sweep_takes_only_matching_swap_files() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/atlas-tier-tests")
-        .join(format!("sweep-{}", std::process::id()));
+    let dir = scratch().join(format!("sweep-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for name in ["kv.1.r0.swap", "kv.77.r1.swap", "kv.notes", "ssm.1.swap"] {
         std::fs::write(dir.join(name), b"x").unwrap();

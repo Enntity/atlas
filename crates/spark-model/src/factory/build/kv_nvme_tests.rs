@@ -139,25 +139,41 @@ fn glm_kv(gpu: &spark_runtime::gpu::mock::MockGpuBackend) -> PagedKvCache {
     kv
 }
 
-/// A scratch directory under the workspace `target/` (a container's `/tmp`
-/// is an overlay or tmpfs, which the tier refuses by design).
+/// A scratch directory under the cargo target directory this test binary was
+/// built into — `<target>/<profile>/deps/<binary>`, so `CARGO_TARGET_DIR` and
+/// `build.target-dir` are honoured (a container's `/tmp` is an overlay or
+/// tmpfs, which the tier refuses by design).
 fn scratch_dir(tag: &str) -> PathBuf {
-    let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/atlas-kv-nvme-tests")
+    let exe = std::env::current_exe().unwrap();
+    let d = exe
+        .ancestors()
+        .nth(3)
+        .expect("test binary under <target>/<profile>/deps")
+        .join("atlas-kv-nvme-tests")
         .join(format!("{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     d
 }
 
-/// `None` (and a note) when even the build tree sits on a filesystem the
-/// tier refuses — nothing to test there.
+/// `None` when even the build tree sits on a filesystem the tier refuses —
+/// nothing to test there. Never silently: the skip is printed, and a run
+/// that must cover the record file sets `ATLAS_TIER_REQUIRE_O_DIRECT` (as
+/// `atlas-tier`'s own tests do), which turns the skip into a failure.
 fn disk_scratch_dir(tag: &str) -> Option<PathBuf> {
     let d = scratch_dir(tag);
     std::fs::create_dir_all(&d).unwrap();
     match atlas_tier::unsuitable_swap_fs(&d) {
         None => Some(d),
         Some(kind) => {
-            eprintln!("skipping: the build tree is on {kind}");
+            assert!(
+                std::env::var_os("ATLAS_TIER_REQUIRE_O_DIRECT").is_none(),
+                "ATLAS_TIER_REQUIRE_O_DIRECT set but {} is on {kind}",
+                d.display()
+            );
+            eprintln!(
+                "SKIPPED {tag}: the build tree ({}) is on {kind}",
+                d.display()
+            );
             None
         }
     }
