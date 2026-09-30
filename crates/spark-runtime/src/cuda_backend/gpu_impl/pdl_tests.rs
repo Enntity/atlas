@@ -66,14 +66,16 @@ fn kernels(src: &str) -> Vec<(&str, bool)> {
         .collect()
 }
 
-/// The `.cu` files a quant dir serves: `common/` overlaid by file name
+/// The kernel sources a quant dir serves: `common/` overlaid by file name
 /// (atlas-kernels `collect_cu_files`).
 fn served_sources(common: &Path, quant: &Path) -> Vec<PathBuf> {
     let mut files = BTreeMap::new();
     for dir in [common, quant] {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
-            if path.extension().is_some_and(|e| e == "cu") {
+            // `.cuh` too: a kernel may be defined in a header its `.cu` includes
+            // (the GLM M16 MoE decode kernels are).
+            if path.extension().is_some_and(|e| e == "cu" || e == "cuh") {
                 files.insert(path.file_name().unwrap().to_owned(), path);
             }
         }
