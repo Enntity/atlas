@@ -148,6 +148,14 @@ pub(super) fn layer_write_floor(
 }
 
 impl TransformerModel {
+    /// Whether a recompute-all prefix hit of this model keeps its matched
+    /// rows as cached (`ATLAS_GLM_PC_WRITE_FLOOR`, GLM only): what
+    /// [`layer_write_floor`] gives a one-row pass under a one-row match.
+    pub(in crate::model) fn pc_write_floor_keeps_matched(&self) -> bool {
+        let flag = glm_pc_write_floor_enabled();
+        layer_write_floor(flag, &self.config.model_type, 0, 1, 0, 1) == 1
+    }
+
     /// [`layer_write_floor`] of one pass of this model, logged when the flag
     /// raised it.
     pub(super) fn pc_write_floor(

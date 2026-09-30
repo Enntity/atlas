@@ -14,12 +14,12 @@ use super::{RestoreOutcome, restore_prefix};
 use crate::model::block_mgmt::{alloc_block_evicting, cache_acquires_refs};
 use crate::model::prefix_share::cap_prefix_match;
 
-const BS: usize = 16;
-const POOL: usize = 6;
+pub(super) const BS: usize = 16;
+pub(super) const POOL: usize = 6;
 
 /// Which I/O path the tier runs on (`ATLAS_GLM_NVME_FAST`).
 #[derive(Clone, Copy)]
-enum Path {
+pub(super) enum Path {
     Sync,
     Fast,
 }
@@ -42,7 +42,7 @@ fn glm_kv(gpu: &MockGpuBackend, store: Option<Box<dyn atlas_tier::SwapStore>>) -
 }
 
 /// GLM-5.3 geometry (FP8-G128 latent, V aliases K, pooled BF16 index).
-fn glm_kv_on(
+pub(super) fn glm_kv_on(
     gpu: &MockGpuBackend,
     store: Option<Box<dyn atlas_tier::SwapStore>>,
     path: Path,
@@ -78,14 +78,14 @@ fn regions(kv: &PagedKvCache, b: u32) -> Vec<(spark_runtime::gpu::DevicePtr, usi
         .collect()
 }
 
-fn fill(kv: &PagedKvCache, gpu: &MockGpuBackend, b: u32, seed: u8) {
+pub(super) fn fill(kv: &PagedKvCache, gpu: &MockGpuBackend, b: u32, seed: u8) {
     for (i, (p, n)) in regions(kv, b).into_iter().enumerate() {
         let v: Vec<u8> = (0..n).map(|j| seed ^ (i * 7 + j) as u8).collect();
         gpu.copy_h2d(&v, p).unwrap();
     }
 }
 
-fn dump(kv: &PagedKvCache, gpu: &MockGpuBackend, b: u32) -> Vec<u8> {
+pub(super) fn dump(kv: &PagedKvCache, gpu: &MockGpuBackend, b: u32) -> Vec<u8> {
     let mut out = Vec::new();
     for (p, n) in regions(kv, b) {
         let mut v = vec![0u8; n];
@@ -96,7 +96,7 @@ fn dump(kv: &PagedKvCache, gpu: &MockGpuBackend, b: u32) -> Vec<u8> {
 }
 
 /// A finished request cached `n` blocks of `tokens`: returns their bytes.
-fn cache_request(
+pub(super) fn cache_request(
     kv: &mut PagedKvCache,
     tree: &RadixTree,
     gpu: &MockGpuBackend,
@@ -115,7 +115,7 @@ fn cache_request(
 }
 
 /// Another workload takes every block (forcing the cache out), then frees them.
-fn pressure(kv: &mut PagedKvCache, tree: &RadixTree, gpu: &MockGpuBackend) {
+pub(super) fn pressure(kv: &mut PagedKvCache, tree: &RadixTree, gpu: &MockGpuBackend) {
     let mut held = Vec::new();
     while let Some(b) = alloc_block_evicting(kv, tree, gpu) {
         held.push(b);
@@ -124,7 +124,7 @@ fn pressure(kv: &mut PagedKvCache, tree: &RadixTree, gpu: &MockGpuBackend) {
     kv.free_blocks(&held);
 }
 
-fn tree_with_tier(slots: u32) -> RadixTree {
+pub(super) fn tree_with_tier(slots: u32) -> RadixTree {
     let tree = RadixTree::new();
     assert!(tree.enable(slots));
     tree
@@ -347,76 +347,6 @@ fn restore_reports_where_its_time_went() {
     let m = tree.lookup(&t, BS, 0, 0);
     assert!(m.matched_blocks.is_sorted(), "{:?}", m.matched_blocks);
     tree.release(&t, BS, 0);
-}
-
-/// `ATLAS_GLM_NVME_KEEP`: a restored conversation that is evicted again costs
-/// no write, and comes back from the record it already had.
-#[test]
-fn a_kept_record_is_not_rewritten_when_its_block_is_evicted_again() {
-    for path in [Path::Sync, Path::Fast] {
-        let gpu = MockGpuBackend::new();
-        let mut kv = glm_kv_on(&gpu, None, path);
-        let tree = tree_with_tier(64);
-        tree.set_keep_restored(true);
-        let t: Vec<u32> = (0..3 * BS as u32).collect();
-        let want = cache_request(&mut kv, &tree, &gpu, &t);
-        pressure(&mut kv, &tree, &gpu);
-        let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
-        assert_eq!(r.restored, 3);
-        assert_eq!(kv.nvme_io_stats().spilled_blocks, 3);
-
-        pressure(&mut kv, &tree, &gpu);
-        assert!(tree.lookup(&t, BS, 0, 0).is_empty(), "evicted again");
-        assert_eq!(kv.nvme_io_stats().spilled_blocks, 3, "nothing written");
-        let s = tree.nvme_stats();
-        assert_eq!((s.spills, s.clean_evictions), (3, 3));
-
-        let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
-        assert_eq!((r.restored, r.failed), (3, false));
-        let m = tree.lookup(&t, BS, 0, 0);
-        for (i, &b) in m.matched_blocks.iter().enumerate() {
-            assert_eq!(dump(&kv, &gpu, b), want[i], "block {i} bytes");
-            assert_eq!(kv.ref_count(b), 1);
-        }
-        tree.release(&t, BS, 0);
-        assert_eq!(kv.num_free_blocks(), POOL - 3);
-    }
-}
-
-/// `ATLAS_GLM_NVME_KEEP`: a block a prefill recomputed in place after its
-/// restore gives up its record (`nvme_forget_rewritten`), so the next restore
-/// returns what the block held — not the older record.
-#[test]
-fn a_rewritten_block_is_written_again_although_records_are_kept() {
-    let gpu = MockGpuBackend::new();
-    let mut kv = glm_kv_on(&gpu, None, Path::Fast);
-    let tree = tree_with_tier(64);
-    tree.set_keep_restored(true);
-    let t: Vec<u32> = (0..3 * BS as u32).collect();
-    let mut want = cache_request(&mut kv, &tree, &gpu, &t);
-    pressure(&mut kv, &tree, &gpu);
-    restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
-    // A prefill resumes at block 1 and recomputes blocks 1 and 2.
-    let m = tree.lookup(&t, BS, 0, 0);
-    for (i, &b) in m.matched_blocks.iter().enumerate().skip(1) {
-        fill(&kv, &gpu, b, 0x90 + i as u8);
-        want[i] = dump(&kv, &gpu, b);
-    }
-    tree.forget_kept(&t, BS, 0, 1..3);
-    tree.release(&t, BS, 0);
-    pressure(&mut kv, &tree, &gpu);
-    let s = tree.nvme_stats();
-    assert_eq!(
-        (s.spills, s.clean_evictions),
-        (5, 1),
-        "blocks 1-2 rewritten"
-    );
-    let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
-    assert_eq!((r.restored, r.failed), (3, false));
-    let m = tree.lookup(&t, BS, 0, 0);
-    for (i, &b) in m.matched_blocks.iter().enumerate() {
-        assert_eq!(dump(&kv, &gpu, b), want[i], "block {i} bytes");
-    }
 }
 
 /// Slotted index tails (prefix caching + ATLAS_MARCONI_PREFILL_ONLY): every

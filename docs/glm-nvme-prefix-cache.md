@@ -324,33 +324,46 @@ budget, so they are only kept while at most half of it is in use; an `insert`
 that recomputes a block still releases its slot.
 
 A cached full block is never appended to, but it can be **rewritten in
-place**: a prefill that resumes below its match (no usable snapshot, a
-snapshot below the match, or a full-prompt hit's last row) recomputes those
-rows into the shared blocks with equivalent, not bit-identical, values
-(`model/prefix_share.rs`). A record kept for such a block would then hold the
-older computation and come back on the next restore — different bytes from
-what the synchronous path returns, and possibly a different version on each
-rank. So the prefix lookup reports the rows it is about to recompute
-(`nvme_forget_rewritten` → `NvmePrefixTier::forget_kept`) and those blocks
-give their records up; their next eviction writes them again. The ordinary
-warm turn resumes exactly at its match (the restore stops at the anchor) and
-keeps every record.
+place**: a prefill with no usable snapshot recomputes its whole matched
+prefix into the shared blocks, a full-prompt hit its last row, and a replay
+the rows between its snapshot and its match wherever the KV write floor is
+not honoured (`ATLAS_GLM_KV_WRITE_FLOOR_LEGACY=1`) — with equivalent, not
+bit-identical, values (`model/prefix_share.rs`). A record kept for such a
+block would then hold the older computation and come back on the next
+restore — different bytes from what the synchronous path returns, and
+possibly a different version on each rank. So the prefix lookup reports the
+blocks between its resume point and its match (`nvme_forget_rewritten` →
+`NvmePrefixTier::forget_kept`) and those give their records up; their next
+eviction writes them again. It does not try to tell a replay that left the
+rows alone from one that rewrote them: on an ordinary warm turn that is the
+couple of blocks between the anchor and the match, written once more, while
+everything below the anchor keeps its record.
 
 ### Restore (prefill_b, chunk 0, before `lookup`)
 
 1. `plan_restore` walks the prompt's verified full blocks, finds the on-disk
    run below the resident prefix, and **pins** the whole path (one extra
    radix ref), so evictions caused by the restore cannot take it.
-2. It decides how many blocks to restore:
-   - pure attention: all of them;
-   - hybrid (GLM): up to the deepest usable Marconi anchor, resident or
-     spill-tiered (`snapshot_anchor_depth`, read-only), and nothing if there
-     is none. Without an anchor the KV would be recomputed anyway, and KV
-     past the anchor is replayed through every layer regardless. "Usable"
-     mirrors what the lookup does with the anchor afterwards: at least
-     `marconi_min_tokens` deep, at least `ATLAS_SSM_FAULT_MIN_TOKENS` deep
-     when the snapshot tier is on, and not an anchor at the very end of the
-     prompt (the exact-hit bypass recomputes everything);
+2. It decides whether to restore — the whole run, or nothing. The rule: the
+   prefill must find exactly what it would have found had nothing been
+   evicted, and must not page in what it is about to overwrite.
+   - pure attention: the whole run;
+   - hybrid (GLM), with a usable Marconi anchor, resident or spill-tiered
+     (`snapshot_anchor_depth`, read-only): the whole run, **past the anchor
+     too**. The pass replays `[anchor, matched)` under the KV write floor,
+     which GLM honours since `integ/next`: those rows are read from the
+     cache, not rewritten. A restore that stopped at the anchor (as on the
+     old base, where the replay rewrote them anyway) would make the pass
+     recompute rows that a resident cache serves as cached, in another chunk
+     shape, and its output could differ bitwise from the same turn without
+     an eviction. "Usable" mirrors what the lookup does with the anchor
+     afterwards: at least `marconi_min_tokens` deep, at least
+     `ATLAS_SSM_FAULT_MIN_TOKENS` deep when the snapshot tier is on, and not
+     an anchor at the very end of the prompt (the exact-hit bypass recomputes
+     everything);
+   - hybrid, without one: nothing. That pass recomputes the prompt and
+     rewrites every matched row — unless `ATLAS_GLM_PC_WRITE_FLOOR=1` keeps
+     them as cached, in which case the whole run comes back as well;
    - a declined restore costs nothing: the pin is released, no block is
      allocated and nothing is read (the fast path's read would first wait
      for every queued write), and the run keeps its place in the disk LRU —
@@ -573,10 +586,11 @@ for run-sized writes. That is 0.02–0.11 s for the same prefill.
    - `compare sync fast`, `compare sync fastkeep` — the fast arms against
      `sync` (below);
    - `lossless warm <tier arm>` — every sequential output of the tier arm
-     (turns 1–3, 20 requests) is byte-identical to the resident arm's. Both
-     resume at the same snapshot anchor and run the same rows, so this is the
-     one check that sees a record that came back wrong in a way its checksum
-     cannot (the checksum is taken after the gather and verified before the
+     (turns 1–3, 20 requests) is byte-identical to the resident arm's. A
+     restore brings the whole evicted run back, so the tier arm's prefill
+     finds what the resident arm's finds — same match, same anchor, same
+     cached rows — and this is the one check that sees a record that came
+     back wrong in a way its checksum cannot (the checksum is taken after the gather and verified before the
      scatter). Turn 1, cold in both arms, is the control: if it already
      differs the pair is not deterministic from start to start and the
      verdict is INCONCLUSIVE, not NO-GO. A not-streamed turn 4 compares the
@@ -900,6 +914,13 @@ it, a block is written once for as long as its record is kept.
 - **The snapshot tier must be on disk.** The host reserve counts the snapshot
   tier from what the store built (`SpillHome`), and a store that keeps its
   spills in host RAM is refused beside the KV tier.
+- **Restore depth and the KV write floor.** On the old base a GLM replay
+  rewrote `[anchor, matched)`, so the branch restored up to the anchor and no
+  further. `integ/next` honours the KV write floor in the GLM paged prefill
+  (those rows are read from the cache), so the port restores the whole
+  on-disk run whenever the prefill will read its cached prefix (§5). Without
+  this a turn after an eviction would recompute rows that the same turn
+  without an eviction reads, and the two could differ bitwise.
 - **KV admission.** A restore runs in the chunk-0 prefix lookup, before the
   chunk's KV reservation is voted on (`model/kv_admission.rs`). It is
   rank-local and best effort: a rank that cannot allocate restores less, the

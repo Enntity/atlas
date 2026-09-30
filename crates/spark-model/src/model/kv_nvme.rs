@@ -29,22 +29,34 @@ impl TransformerModel {
         self.prefix_cache.nvme().filter(|t| t.is_enabled())
     }
 
-    /// How many blocks of `plan.disk` are worth reading back.
+    /// How many blocks of `plan.disk` to read back: all of them, or none.
     ///
-    /// Pure attention: all of them (every restored block is a skipped prefill
-    /// block). Hybrid SSM (GLM-5.3's KDA layers): a prefill can only resume
-    /// from an SSM snapshot anchor — without one the matched KV is recomputed
-    /// anyway ("Prefix cache hit … but no SSM snapshot"), and KV past the
-    /// deepest anchor is replayed through every layer regardless. So restore
-    /// exactly up to the deepest usable anchor (resident OR spill-tiered), and
-    /// nothing when there is none.
+    /// The rule: after a restore the prefill must find exactly what it would
+    /// have found had nothing been evicted, and must not page in what it is
+    /// about to overwrite.
     ///
-    /// "Usable" mirrors the gates the lookup applies to that anchor
-    /// afterwards, so KV is not paged in only to be recomputed: the Marconi
-    /// minimum, the snapshot tier's fault-in minimum (`ssm_fault_in`; applied
-    /// to a resident anchor too — below it the restore saves next to nothing),
-    /// and the exact-hit bypass (an anchor AT the prompt's end is declined
-    /// unless `ATLAS_MARCONI_EXACT=1`; `pc_policy::marconi_restorable`).
+    /// Pure attention: all (every restored block is a skipped prefill block).
+    /// Hybrid SSM (GLM-5.3's KDA layers): a prefill resumes from an SSM
+    /// snapshot anchor.
+    ///
+    /// * With a usable anchor (resident OR spill-tiered) the pass replays
+    ///   `[anchor, matched)` under the KV write floor: those rows are READ
+    ///   from the cache, not rewritten (`prefill_b/forward_layers.rs`; GLM
+    ///   honours the floor since `integ/next`). So the whole run comes back,
+    ///   past the anchor too — stopping at the anchor would make the pass
+    ///   recompute rows a resident cache serves as cached, and its output
+    ///   could differ bitwise from the run that was never evicted.
+    /// * Without one the pass recomputes the prompt and rewrites every
+    ///   matched row ("Prefix cache hit … but no SSM snapshot"): nothing is
+    ///   read back — unless `ATLAS_GLM_PC_WRITE_FLOOR` keeps the matched rows
+    ///   of that pass as cached, too.
+    ///
+    /// "Usable" mirrors the gates the lookup applies to the anchor afterwards:
+    /// the Marconi minimum, the snapshot tier's fault-in minimum
+    /// (`ssm_fault_in`; applied to a resident anchor too — a prefix that short
+    /// is not worth a restore), and the exact-hit bypass (an anchor AT the
+    /// prompt's end is declined unless `ATLAS_MARCONI_EXACT=1`;
+    /// `pc_policy::marconi_restorable`).
     fn nvme_blocks_worth_restoring(
         &self,
         tier: &dyn NvmePrefixTier,
@@ -63,15 +75,17 @@ impl TransformerModel {
             Some(_) => super::trait_impl::ssm_fault_in::fault_in_min_tokens(),
             None => 0,
         };
-        let exact_bypass =
-            depth == tokens.len() && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1");
-        if depth <= plan.resident_tokens
-            || depth < crate::model::mtp_carry::marconi_min_tokens().max(fault_min)
-            || exact_bypass
-        {
-            return 0;
+        if restore_reads_cached_rows(
+            depth,
+            tokens.len(),
+            crate::model::mtp_carry::marconi_min_tokens().max(fault_min),
+            std::env::var("ATLAS_MARCONI_EXACT").as_deref() == Ok("1"),
+            self.pc_write_floor_keeps_matched(),
+        ) {
+            run
+        } else {
+            0
         }
-        (depth - plan.resident_tokens).div_ceil(bs).min(run)
     }
 
     /// Page the on-disk continuation of `tokens`' cached prefix back into
@@ -103,7 +117,7 @@ impl TransformerModel {
         if r.wanted == 0 {
             tracing::debug!(
                 "NVMe prefix restore skipped: {} on-disk blocks past {} resident tokens but no \
-                 usable SSM anchor — recompute",
+                 usable SSM anchor — the prefill rewrites its whole prefix",
                 r.on_disk,
                 r.resident_tokens,
             );
@@ -159,13 +173,19 @@ impl TransformerModel {
 
 impl TransformerModel {
     /// A prefill that resumes at `skip_to` under a `matched`-token cached
-    /// prefix recomputes rows `[skip_to, matched)` into the shared blocks (a
-    /// full-prompt hit: its last row), with equivalent values, not the
+    /// prefix may recompute rows `[skip_to, matched)` into the shared blocks
+    /// (a full-prompt hit: its last row), with equivalent values, not the
     /// recorded bytes (`prefix_share`). A record one of those blocks kept from
-    /// its restore (`ATLAS_GLM_NVME_KEEP`) is then stale: release it, so the
-    /// block's next eviction writes what the block holds, as without KEEP.
-    /// Same inputs on every rank (the match and the restore depth are
-    /// agreed). Nothing to do for a warm turn that resumes at its match.
+    /// its restore (`ATLAS_GLM_NVME_KEEP`) would then be stale: release it, so
+    /// the block's next eviction writes what the block holds, as without KEEP.
+    ///
+    /// Deliberately not exact: a replay under the KV write floor leaves those
+    /// rows as cached, and which passes honour the floor is the layers'
+    /// business (`ATLAS_GLM_KV_WRITE_FLOOR_LEGACY`, the recompute-all pass).
+    /// Giving up a record that was still good costs one write of that block —
+    /// the few blocks between a turn's anchor and its match, not the prefix
+    /// below the anchor, which no pass touches.
+    /// Same inputs on every rank (the match and the restore depth are agreed).
     pub(in crate::model) fn nvme_forget_rewritten(
         &self,
         tokens: &[u32],
@@ -198,6 +218,23 @@ pub(crate) fn drop_failed_spills(
             kv_cache.return_evicted_block(block);
         }
     }
+}
+
+/// Whether the prefill that follows will READ its cached prefix rather than
+/// rewrite all of it (see `nvme_blocks_worth_restoring`): it restores the
+/// snapshot anchor at `anchor` tokens (0 = none; at least `min_anchor` deep,
+/// and not the exact-hit anchor at the prompt's end, which is bypassed
+/// without `exact`), or the write floor keeps the matched rows of a
+/// recompute (`floor_keeps_matched`).
+fn restore_reads_cached_rows(
+    anchor: usize,
+    total: usize,
+    min_anchor: usize,
+    exact: bool,
+    floor_keeps_matched: bool,
+) -> bool {
+    let usable = anchor > 0 && anchor >= min_anchor && (anchor < total || exact);
+    usable || floor_keeps_matched
 }
 
 /// What one [`restore_prefix`] did.
@@ -312,6 +349,9 @@ pub(crate) fn restore_prefix(
     })
 }
 
+#[cfg(test)]
+#[path = "kv_nvme_keep_tests.rs"]
+mod keep_tests;
 #[cfg(test)]
 #[path = "kv_nvme_tests.rs"]
 mod tests;
