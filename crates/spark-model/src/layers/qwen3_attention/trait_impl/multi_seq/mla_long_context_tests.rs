@@ -20,6 +20,15 @@ mod split_tests;
 #[path = "mla_write_floor_tests.rs"]
 mod write_floor_tests;
 fn fixture(run: impl FnOnce(&TestGpu, &atlas_core::config::ModelConfig, &Qwen3AttentionLayer)) {
+    fixture_with(KvCacheDtype::Bf16, |gpu, config, layer| {
+        run(gpu, config, layer)
+    })
+}
+/// [`fixture`] on a `kv_dtype` cache, with the layer open to edits.
+fn fixture_with(
+    kv_dtype: KvCacheDtype,
+    run: impl FnOnce(&TestGpu, &atlas_core::config::ModelConfig, &mut Qwen3AttentionLayer),
+) {
     let gpu = TestGpu::default();
     let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
     config.model_type = "glm5_next".into();
@@ -76,7 +85,7 @@ fn fixture(run: impl FnOnce(&TestGpu, &atlas_core::config::ModelConfig, &Qwen3At
         None,
         None,
         &gpu,
-        KvCacheDtype::Bf16,
+        kv_dtype,
         0,
         &config,
     )
@@ -143,7 +152,7 @@ fn fixture(run: impl FnOnce(&TestGpu, &atlas_core::config::ModelConfig, &Qwen3At
     layer.glm_index_logits_decode_k = KernelHandle(812);
     layer.glm_index_topk_expand_k = KernelHandle(803);
     layer.glm_sparse_attn_decode_k = KernelHandle(804);
-    run(&gpu, &config, &layer);
+    run(&gpu, &config, &mut layer);
 }
 
 #[path = "mla_causal_dispatch_tests.rs"]

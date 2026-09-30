@@ -31,6 +31,27 @@ impl GlmChunkOwner {
     }
 }
 
+/// `floor` capped to the `rows` stacked rows of `owners`. It must leave every
+/// index pool whole: skip nothing, or everything, or end where a pool does.
+/// A floor inside a pool would finalize that pool's key from cached and new
+/// raw tails mixed. Host-side, from rank-identical inputs.
+pub(super) fn checked_write_floor(
+    owners: &[GlmChunkOwner],
+    floor: usize,
+    rows: usize,
+    tokens_per_pool: usize,
+) -> Result<usize> {
+    let floor = floor.min(rows);
+    let start = owners[0].seq_len_start;
+    anyhow::ensure!(
+        floor == 0
+            || floor == rows
+            || (tokens_per_pool > 0 && (start + floor).is_multiple_of(tokens_per_pool)),
+        "GLM KV write floor {floor} of {rows} rows from token {start} splits an index pool"
+    );
+    Ok(floor)
+}
+
 /// Row-wise projections of an owner-batched verify, one row per stacked row:
 /// owner rows start at `row0 * <row bytes>`.
 #[derive(Clone, Copy)]

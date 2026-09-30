@@ -179,7 +179,8 @@ impl Qwen3AttentionLayer {
         let joint = ctx
             .attn_metadata
             .expect("GLM paged prefill requires metadata");
-        let wf = kv_write_floor.min(num_tokens);
+        let wf =
+            owner::checked_write_floor(owners, kv_write_floor, num_tokens, ctx.config.index_kpool)?;
         if wf < num_tokens {
             let skip = wf * kv_lora as usize * bf16;
             self.write_kv_cache(
