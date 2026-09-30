@@ -9,9 +9,10 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelArg, KernelHandle, mock::MockGpuBackend};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
+use std::collections::VecDeque;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 pub(super) const DEFAULT: u64 = 7;
@@ -31,10 +32,14 @@ struct Recorder {
     capture: AtomicU64,
     target_failure: AtomicBool,
     capture_failure: AtomicBool,
+    /// What the peer rank sends for each word it roots (min-votes read it)
+    /// once `script` (words it sends first, in order) runs out.
+    peer_word: AtomicU32,
+    script: Mutex<VecDeque<u32>>,
 }
 
 struct Gpu {
-    inner: MockGpuBackend,
+    inner: Arc<MockGpuBackend>,
     record: Arc<Recorder>,
 }
 impl GpuBackend for Gpu {
@@ -235,7 +240,7 @@ impl DraftProposer for Proposer {
     }
 }
 
-struct Rank(usize);
+struct Rank(usize, Arc<MockGpuBackend>, Arc<Recorder>);
 impl spark_comm::CommBackend for Rank {
     fn all_reduce(&self, _: u64, _: usize) -> Result<()> {
         Ok(())
@@ -246,8 +251,16 @@ impl spark_comm::CommBackend for Rank {
     fn reduce_scatter(&self, _: u64, _: u64, _: usize) -> Result<()> {
         Ok(())
     }
-    fn broadcast(&self, _: u64, _: usize, _: usize) -> Result<()> {
-        Ok(())
+    fn broadcast(&self, ptr: u64, bytes: usize, root: usize) -> Result<()> {
+        if root == self.0 {
+            return Ok(());
+        }
+        let peer = self.2.peer_word.load(Ordering::Relaxed);
+        let mut script = self.2.script.lock();
+        let words: Vec<u8> = (0..bytes / 4)
+            .flat_map(|_| script.pop_front().unwrap_or(peer).to_le_bytes())
+            .collect();
+        self.1.copy_h2d(&words, DevicePtr(ptr))
     }
     fn barrier(&self) -> Result<()> {
         Ok(())
@@ -273,9 +286,20 @@ pub(super) struct Fixture {
 }
 impl Fixture {
     pub fn new(tp: usize, ep: usize, rank: usize) -> Self {
+        Self::build(tp, ep, rank, false)
+    }
+    /// A model whose final prompt chunk takes the real tail-checkpoint split:
+    /// one SSM layer, Marconi slots, a live prefix cache and 4-token blocks
+    /// (so both halves of a 24-token prompt fit the 8-token arena).
+    pub fn with_tail_split(tp: usize, ep: usize, rank: usize) -> Self {
+        Self::build(tp, ep, rank, true)
+    }
+    fn build(tp: usize, ep: usize, rank: usize, split: bool) -> Self {
         let record = Arc::new(Recorder::default());
+        record.peer_word.store(u32::MAX, Ordering::Relaxed); // agrees with any min
+        let inner = Arc::new(MockGpuBackend::new());
         let gpu = Box::new(Gpu {
-            inner: MockGpuBackend::new(),
+            inner: inner.clone(),
             record: record.clone(),
         });
         let mut cfg = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
@@ -305,12 +329,24 @@ impl Fixture {
         cfg.tp_rank = rank;
         cfg.ep_rank = if ep > 1 { rank } else { 0 };
         cfg.adapter_max_rank = 0;
-        let buffers =
-            spark_runtime::buffers::BufferArena::new(&cfg, CAPACITY, 32, 16, 1, gpu.as_ref())
-                .unwrap();
+        let (block_size, kv_blocks) = if split { (4, 8) } else { (16, 4) };
+        if split {
+            cfg.layer_types = vec![atlas_core::config::LayerType::LinearAttention];
+            (cfg.linear_num_key_heads, cfg.linear_num_value_heads) = (1, 1);
+            (cfg.linear_key_head_dim, cfg.linear_value_head_dim) = (16, 16);
+        }
+        let buffers = spark_runtime::buffers::BufferArena::new(
+            &cfg,
+            CAPACITY,
+            32,
+            block_size,
+            1,
+            gpu.as_ref(),
+        )
+        .unwrap();
         let kv = PagedKvCache::new(
             KvCacheConfig {
-                block_size: 16,
+                block_size,
                 num_kv_heads: 1,
                 head_dim: 512,
                 num_layers: 1,
@@ -319,15 +355,16 @@ impl Fixture {
                 layer_dims: vec![],
                 cache_blocks_per_seq: None,
             },
-            4,
+            kv_blocks,
             gpu.as_ref(),
         )
         .unwrap();
         let dense = DenseWeight {
             weight: gpu.alloc(8 * ROW_BYTES).unwrap(),
         };
-        let comm =
-            (tp > 1 || ep > 1).then(|| Arc::new(Rank(rank)) as Arc<dyn spark_comm::CommBackend>);
+        let comm = (tp > 1 || ep > 1).then(|| {
+            Arc::new(Rank(rank, inner, record.clone())) as Arc<dyn spark_comm::CommBackend>
+        });
         let ssm_pools = crate::model::ssm_pools::SsmPools::new(
             &cfg,
             1,
@@ -357,7 +394,11 @@ impl Fixture {
             1,
             crate::layers::MtpQuantization::Bf16,
             false,
-            Box::new(spark_runtime::prefix_cache::NoPrefixCaching),
+            if split {
+                Box::new(spark_runtime::radix_tree::RadixTree::new())
+            } else {
+                Box::new(spark_runtime::prefix_cache::NoPrefixCaching)
+            },
             8,
             comm,
             false,
@@ -393,6 +434,18 @@ impl Fixture {
         } else {
             self.record.target_failure.store(true, Ordering::Relaxed);
         }
+    }
+    /// The word the peer rank sends from now on (`0` fails every min-vote).
+    pub fn set_peer_word(&self, word: u32) {
+        self.record.peer_word.store(word, Ordering::Relaxed);
+    }
+    /// Words the peer sends next, ahead of `peer_word` (e.g. head commands).
+    pub fn script(&self, words: &[u32]) {
+        self.record.script.lock().extend(words);
+    }
+    /// Scripted words this rank has not read yet.
+    pub fn unread(&self) -> usize {
+        self.record.script.lock().len()
     }
     pub fn disable_capture(&mut self) {
         self.model.mtp_prefill_hidden = DevicePtr::NULL;

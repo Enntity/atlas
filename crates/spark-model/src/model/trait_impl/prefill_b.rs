@@ -234,19 +234,10 @@ impl TransformerModel {
             );
         }
 
-        // Allocate blocks needed through end of this chunk.
+        // Allocate blocks needed through end of this chunk: agreed by every
+        // rank and rolled back on refusal, so a refused chunk is retryable.
         let bs = kv_cache.block_size();
-        let end_pos = chunk_start + chunk_len;
-        let blocks_needed = (end_pos - 1) / bs + 1;
-        super::super::block_mgmt::ensure_blocks_through_prefill(
-            seq,
-            blocks_needed - 1,
-            &mut kv_cache,
-            self.prefix_cache.as_ref(),
-            self.gpu.as_ref(),
-            stream,
-            self.levers.kv_poison,
-        )?;
+        self.reserve_prefill_blocks(seq, chunk_start + chunk_len, &mut kv_cache, stream)?;
         let t_blocks = tp.elapsed();
 
         // ── Phase 2b: compute effective processing range (may early-return) ──
