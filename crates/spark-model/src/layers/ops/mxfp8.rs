@@ -97,6 +97,15 @@ pub fn mxfp8_gemv_grouped(
         (1..=MXFP8_GROUPED_MAX_M).contains(&m) && (k as usize).is_multiple_of(MXFP8_BLOCK),
         "mxfp8_gemv_grouped: m={m} k={k} unsupported"
     );
+    // Rows are read as 16-byte vectors and must not overlap across tokens.
+    let (gk, gn) = (u64::from(g) * u64::from(k), u64::from(g) * u64::from(n));
+    ensure!(
+        g > 0
+            && u64::from(a_stride) >= gk
+            && u64::from(c_stride) >= gn
+            && a_stride.is_multiple_of(8),
+        "mxfp8_gemv_grouped: g={g} n={n} k={k} a_stride={a_stride} c_stride={c_stride}"
+    );
     KernelLaunch::new(gpu, tiers[usize::from(m > 8)])
         .grid([div_ceil(n, 16), 1, g])
         .block([256, 1, 1])

@@ -198,6 +198,7 @@ pub(super) fn load_mla_layer(
         [glm_indexer.wq_b.weight, w_uk_t.weight, w_uv.weight],
         ["ATLAS_GLM_INDEX_MXFP8", "ATLAS_GLM_MLA_KVB_MXFP8"]
             .map(|flag| std::env::var(flag).as_deref() == Ok("1")),
+        force_dimension_overrides,
     );
     let mla = MlaWeights {
         wq_a,
@@ -289,7 +290,7 @@ pub(super) fn load_mla_layer(
     {
         layer.install_mla_mxfp8(gpu, &mx)?;
     }
-    if !force_dimension_overrides && !opt_in_twins.is_empty() {
+    if !opt_in_twins.is_empty() {
         layer.install_mla_mxfp8(gpu, &opt_in_twins)?;
     }
     if let Some(hc) = hc {

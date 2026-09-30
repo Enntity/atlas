@@ -56,9 +56,7 @@ impl Qwen3AttentionLayer {
         weights: &[(DevicePtr, usize, usize)],
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.mxfp8_quantize_k.0 != 0
-                && self.mxfp8_gemv_k.iter().all(|k| k.0 != 0)
-                && self.mxfp8_gemv_grouped_k.iter().all(|k| k.0 != 0),
+            self.mxfp8_quantize_k.0 != 0 && self.mxfp8_gemv_k.iter().all(|k| k.0 != 0),
             "GLM MXFP8 twins requested but the mxfp8_gemv kernels are missing"
         );
         let stream = gpu.default_stream();
@@ -75,8 +73,8 @@ impl Qwen3AttentionLayer {
                 k,
                 stream,
             )?;
-            self.mla_mx
-                .push((weight, crate::weight_map::Mxfp8Weight { data, scales }));
+            let mx = crate::weight_map::Mxfp8Weight { data, scales };
+            self.mla_mx.push((weight, [n, k], mx));
         }
         gpu.synchronize(stream)
     }
