@@ -3,8 +3,9 @@
 // the pre-wait weight touch (ATLAS_GLM_DECODE_GEMV_BATCH=1):
 //   w4a16_gemv_tc{8,16,32} / _ld      vs  w4a16_gemv_tc{8,16,32}_touch
 //   mxfp8_gemv_tc{8,16,32}            vs  mxfp8_gemv_tc{8,16,32}_touch
-//   w4a16_gemv_batch2 / _batch3       vs  w4a16_gemv_batch3_touch
+//   w4a16_gemv_batch2 / _batch3       vs  w4a16_gemv_batch2_touch / _batch3_touch
 //   w4a16_gemv_batch5_qkv             vs  w4a16_gemv_batch5_qkv_touch
+//   shared gate + up tc{8,16,32}      vs  w4a16_gemv_tc{8,16,32}_pair_touch (one launch)
 //
 // 1. Bitwise: every output of every projection shape of a KDA layer (q/k/v/o
 //    4096x4096, shared gate/up 1024x4096, the K-slice shared down 4096x1024)
@@ -14,13 +15,20 @@
 // 2. Roofline: each shape alone, back to back, cold weights: us and GB/s.
 // 3. Layer time: one emulated layer = its GEMVs in production order and launch
 //    mode, each group behind a latency-bound `spin` standing in for the small
-//    kernels it waits on (windows from the 2026-09-30 nsys profile: 45 us
-//    before KDA q, 28 before o, 31 before the shared gate, 50 before MLA q_a)
-//    and a plain launch where production restarts the chain after a
-//    collective. Weights cycle over `layers` distinct copies (L2 is 24 MiB),
-//    so every read comes from DRAM as in decode. "saved" = base - touch per
-//    layer; the last column scales it to a step (34 KDA + 11 MLA layers).
-//    Pass a 5th argument for a per-segment table (which kernels to touch).
+//    kernels it waits on, and a plain launch where production restarts the
+//    chain after a collective. Windows are the median pre-wait windows of the
+//    2026-09-30 nsys profiles (rank 0, c1): up to 5 rows the prose ones (45 us
+//    before KDA q, 28 before o, 31 before the shared gate, 50 before MLA q_a),
+//    from 6 rows the code ones (8 rows: 30 / 37 / 31 / 30). The spin makes no
+//    DRAM traffic; in production the o window overlaps the KDA recurrence,
+//    which streams ~1 MB of state, so the o saving here is an upper bound.
+//    Weights cycle over `layers` distinct copies (L2 is 24 MiB), so every read
+//    comes from DRAM as in decode. Arms per layer: base (production
+//    launches), pdl (the twins with touch_rows = 0: TOUCH_MB=0), touch (the
+//    flag: shared gate/up as one pair launch) and, for KDA, "unmerged" (the
+//    flag with gate and up as two twins). "saved" = base - arm; the last
+//    columns scale it to a step (34 KDA + 11 MLA layers). Pass a 5th
+//    argument for a per-segment table.
 //
 //   nvcc -arch=sm_121a -O3 --fmad=false -I kernels/gb10/glm-5.3-flash/nvfp4 \
 //        scripts/dev/glm_decode_gemv_touch_bench.cu -o gemv_touch_bench
@@ -94,6 +102,7 @@ struct Proj { u8 *w, *s; unsigned int n, k, ldw, lds; bool mx; double mb; };
 static unsigned int g_touch_ctas = 32;
 static unsigned long long g_touch_bytes = 12ull << 20;
 static const float SCALE2 = 0.37f;
+static bool g_pair = true;  // layer emulation: gate/up as one pair launch
 
 static unsigned int touch_rows(const Proj& p) {
     const unsigned long long row = p.mx ? p.k + p.k / 32 : p.k / 2 + p.k / 16;
@@ -131,10 +140,23 @@ static void tc(const Proj& p, bool touch, const bf* a, bf* c, unsigned int m) {
 // mode 0: production (plain launch); 1: PDL twin, no touch; 2: PDL twin + touch.
 static void scalar23(const Proj& p, int mode, const bf* a, bf* c, unsigned int m) {
     const dim3 grid((p.n + 3) / 4);
+    const unsigned int rows = mode == 2 ? touch_rows(p) : 0u;
     if (mode == 0 && m == 2) launch(false, w4a16_gemv_batch2, grid, 256u, a, (const u8*)p.w, (const u8*)p.s, SCALE2, c, p.n, p.k);
     else if (mode == 0) launch(false, w4a16_gemv_batch3, grid, 256u, a, (const u8*)p.w, (const u8*)p.s, SCALE2, c, p.n, p.k);
-    else launch(true, w4a16_gemv_batch3_touch, grid, 256u, a, (const u8*)p.w, (const u8*)p.s, SCALE2, c, m, p.n, p.k,
-                touch_rows(p), mode == 2 ? std::min(grid.x, g_touch_ctas) : 0u);
+    else launch(true, m == 2 ? w4a16_gemv_batch2_touch : w4a16_gemv_batch3_touch, grid, 256u, a, (const u8*)p.w,
+                (const u8*)p.s, SCALE2, c, m, p.n, p.k, rows, std::min(grid.x, g_touch_ctas));
+}
+
+// p[0] and p[1] (same shape, whole weights) of one input in one pair launch;
+// plane i writes c + i*m*n.
+static void pair(const Proj* p, const bf* a, bf* c, unsigned int m) {
+    typedef void (*Pr)(const bf*, const u8*, const u8*, float, bf*, const u8*, const u8*, float, bf*,
+                       unsigned, unsigned, unsigned, unsigned, unsigned);
+    const Pr kern[3] = {w4a16_gemv_tc8_pair_touch, w4a16_gemv_tc16_pair_touch, w4a16_gemv_tc32_pair_touch};
+    const unsigned int grid = (p[0].n + 15) / 16;
+    launch(true, kern[m <= 8 ? 0 : (m <= 16 ? 1 : 2)], dim3(grid, 1, 2), 256u, a, (const u8*)p[0].w,
+           (const u8*)p[0].s, SCALE2, c, (const u8*)p[1].w, (const u8*)p[1].s, SCALE2, c + (size_t)m * p[0].n,
+           m, p[0].n, p[0].k, touch_rows(p[0]), std::min(grid, g_touch_ctas));
 }
 
 // The five-row fused Q/K/V (ATLAS_GLM_K5_FUSED_QKV=1): production is a plain launch.
@@ -223,6 +245,13 @@ int main(int argc, char** argv) {
             for (int fam = 0; fam < 2; fam++)
                 for (const Proj& p : fam ? mla[m % mla_layers] : kda[m % layers])
                     compare((size_t)m * p.n, [&](int v) { tc(p, v == 1, dA, dC[v], m); });
+            {
+                const Proj* p = &kda[m % layers][GATE];
+                compare((size_t)2 * m * p->n, [&](int v) {
+                    if (v) pair(p, dA, dC[v], m);
+                    else for (unsigned int i = 0; i < 2; i++) tc(p[i], false, dA, dC[v] + (size_t)i * m * p->n, m);
+                });
+            }
             const Proj& q = kda[m % layers][Q];
             if (m == 2 || m == 3)
                 for (int mode = 1; mode <= 2; mode++)
@@ -333,13 +362,26 @@ int main(int argc, char** argv) {
                 printf("  (plain nop) [45us] batch3 q k v  mode=%d (0 base, 1 q touch + PDL k v, 2 all touch) : %6.1f\n", mode, t);
             }
         }
+        g_touch_ctas = saved_ctas;
+        for (int merged = 0; merged < 2; merged++) {
+            const float t = time_us(layers, [&](int l) { barrier(); sp(31);
+                if (merged) pair(&kda[l][GATE], dA, dC[0], m);
+                else { tc(kda[l][GATE], true, dA, dC[0], m); tc(kda[l][UP], true, dA, dC[0], m); } });
+            printf("  (plain nop) [31us] gate up at M=8, both touched: %s %6.1f\n",
+                   merged ? "one pair launch" : "two tc8 twins  ", t);
+        }
         return 0;
     }
+    // Pre-wait windows (us) by row count: prose medians up to 5 rows, code
+    // (8-row) medians above.
+    struct Win { unsigned int q, o, gate, qa; };
+    auto win = [](unsigned int m) { return m <= 5 ? Win{45, 28, 31, 50} : Win{30, 37, 31, 30}; };
     // One KDA layer's GEMVs, production launches (touch = false) or the flag's.
     auto kda_layer = [&](int l, unsigned int m, bool touch) {
         const std::vector<Proj>& p = kda[l];
+        const Win w = win(m);
         barrier();
-        sp(45);  // hc_post, HC partial, finalize, norm
+        sp(w.q);  // hc_post, HC partial, finalize, norm
         if (m == 5) {
             qkv5(&p[Q], touch, dA, dC[0]);
         } else {
@@ -348,13 +390,17 @@ int main(int argc, char** argv) {
                 else tc(p[i], touch, dA, dC[0], m);
             }
         }
-        sp(28);  // (beta/f/g projections), pack, conv, recurrent, gated norm
+        sp(w.o);  // (beta/f/g projections), pack, conv, recurrent, gated norm
         if (m <= 3) scalar23(p[O], touch ? 2 : 0, dA, dC[0], m);
         else tc(p[O], touch, dA, dC[0], m);
         barrier();
-        sp(31);  // HC partial, finalize, norm
-        tc(p[GATE], touch, dA, dC[0], m);
-        tc(p[UP], touch, dA, dC[0], m);
+        sp(w.gate);  // HC partial, finalize, norm
+        if (touch && g_pair) {
+            pair(&p[GATE], dA, dC[0], m);
+        } else {
+            tc(p[GATE], touch, dA, dC[0], m);
+            tc(p[UP], touch, dA, dC[0], m);
+        }
         sp(1);  // silu
         tc(p[DOWN], touch, dA, dC[0], m);
     };
@@ -363,7 +409,7 @@ int main(int argc, char** argv) {
     auto mla_layer = [&](int l, unsigned int m, bool touch) {
         const std::vector<Proj>& p = mla[l];
         barrier();
-        sp(50);
+        sp(win(m).qa);
         touch = touch && m <= 16;  // the flag leaves 17..32-row MLA q_a/kv_a alone
         tc(p[QA], touch, dA, dC[0], m);
         sp(2);  // q_a norm
@@ -375,14 +421,22 @@ int main(int argc, char** argv) {
     };
     printf("us per emulated layer (lower decile, %d reps); touch %llu MiB by %u CTAs\n",
            reps, g_touch_bytes >> 20, g_touch_ctas);
-    for (unsigned int m : {3u, 5u, 8u, 16u, 32u}) {
-        const float kb = time_us(layers, [&](int l) { kda_layer(l, m, false); });
-        const float kt = time_us(layers, [&](int l) { kda_layer(l, m, true); });
-        const float mb = time_us(mla_layers, [&](int l) { mla_layer(l, m, false); });
-        const float mt = time_us(mla_layers, [&](int l) { mla_layer(l, m, true); });
-        printf("M=%u  KDA base %6.1f touch %6.1f saved %5.1f | MLA base %6.1f touch %6.1f saved %5.1f"
-               " | per step (34 KDA + 11 MLA) %4.2f ms\n",
-               m, kb, kt, kb - kt, mb, mt, mb - mt, (34.f * (kb - kt) + 11.f * (mb - mt)) / 1e3f);
+    const unsigned long long touch_bytes = g_touch_bytes;
+    for (unsigned int m : {2u, 3u, 5u, 8u, 16u, 32u}) {
+        float k[4], a[3];  // base, pdl (touch_rows = 0), touch, KDA touch with gate/up unmerged
+        for (int arm = 0; arm < 4; arm++) {
+            g_touch_bytes = arm == 1 ? 0ull : touch_bytes;
+            g_pair = arm != 3;
+            k[arm] = time_us(layers, [&](int l) { kda_layer(l, m, arm > 0); });
+            if (arm < 3) a[arm] = time_us(mla_layers, [&](int l) { mla_layer(l, m, arm > 0); });
+        }
+        g_touch_bytes = touch_bytes;
+        g_pair = true;
+        const float step_pdl = (34.f * (k[0] - k[1]) + 11.f * (a[0] - a[1])) / 1e3f;
+        const float step_touch = (34.f * (k[0] - k[2]) + 11.f * (a[0] - a[2])) / 1e3f;
+        printf("M=%2u  KDA base %6.1f pdl %6.1f touch %6.1f (unmerged %6.1f) | MLA base %6.1f pdl %6.1f touch %6.1f"
+               " | saved per step (34 KDA + 11 MLA): pdl %5.2f ms, touch %5.2f ms\n",
+               m, k[0], k[1], k[2], k[3], a[0], a[1], a[2], step_pdl, step_touch);
     }
     return diff == 0 ? 0 : 2;
 }

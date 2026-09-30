@@ -65,7 +65,7 @@ impl Qwen3AttentionLayer {
                     .mla
                     .as_ref()
                     .is_some_and(|mla| [mla.wq_a.weight, mla.wkv_a.weight].contains(&weight.weight))
-                && let Some(touch) = ops::gemv_touch(ctx.gpu, ops::mxfp8_tc_twin(m))
+                && let Some(touch) = ops::gemv_touch(ops::mxfp8_tc_twin(m))
             {
                 return touch.mxfp8_tc(
                     ctx.gpu, input, mx.data, mx.scales, output, m, n, k, n, stream,

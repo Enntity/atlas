@@ -26,12 +26,38 @@ fn is_name(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// Whether `signature` declares `name` as a `const unsigned char*
+/// __restrict__` parameter: the form of every weight and scale argument.
+fn weight_param(signature: &str, name: &str) -> bool {
+    let params = signature.split_whitespace().collect::<Vec<_>>().join(" ");
+    let decl = format!("const unsigned char* __restrict__ {name}");
+    !name.is_empty()
+        && name.chars().all(is_name)
+        && params
+            .match_indices(&decl)
+            .any(|(at, _)| !params[at + decl.len()..].starts_with(is_name))
+}
+
 /// Whether a function body (the text after its `{`) waits before anything
-/// else: `atlas_pdl_enter();`, or `atlas_pdl_enter_touch(..);`, the same
-/// entry with discarded weight loads ahead of its wait.
-fn waits_first(body: &str) -> bool {
+/// else: `atlas_pdl_enter();`, or `atlas_pdl_enter_touch({w, ..}, {s, ..}, ..);`
+/// (`_pair`: one pair per plane), the same entry with discarded loads ahead
+/// of its wait, which is safe only while every touched region is a weight
+/// parameter of `signature` (a predecessor may still be writing anything else).
+fn waits_first(signature: &str, body: &str) -> bool {
     let body = body.trim_start();
-    body.starts_with("atlas_pdl_enter();") || body.starts_with("atlas_pdl_enter_touch(")
+    let touch = body
+        .strip_prefix("atlas_pdl_enter_touch(")
+        .or_else(|| body.strip_prefix("atlas_pdl_enter_touch_pair("));
+    if let Some(args) = touch {
+        let call = args.split(");").next().unwrap_or("");
+        let regions: Vec<&str> = call
+            .split('{')
+            .skip(1)
+            .map(|region| region.split(',').next().unwrap_or("").trim())
+            .collect();
+        return regions.len() >= 2 && regions.iter().all(|r| weight_param(signature, r));
+    }
+    body.starts_with("atlas_pdl_enter();")
 }
 
 /// Whether `src` defines a function `name` whose body waits first.
@@ -41,9 +67,9 @@ fn defines_waiting(src: &str, name: &str) -> bool {
             let rest = src[at + name.len()..].trim_start();
             !src[..at].ends_with(is_name)
                 && rest.starts_with('(')
-                && rest
-                    .split_once('{')
-                    .is_some_and(|(signature, body)| !signature.contains(';') && waits_first(body))
+                && rest.split_once('{').is_some_and(|(signature, body)| {
+                    !signature.contains(';') && waits_first(signature, body)
+                })
         })
 }
 
@@ -64,7 +90,10 @@ fn kernels(src: &str) -> Vec<(&str, bool)> {
             let name = &head[head.rfind(|c| !is_name(c)).map_or(0, |i| i + 1)..];
             let body = body.trim_start();
             let callee = &body[..body.find(|c| !is_name(c)).unwrap_or(body.len())];
-            Some((name, waits_first(body) || defines_waiting(src, callee)))
+            Some((
+                name,
+                waits_first(signature, body) || defines_waiting(src, callee),
+            ))
         })
         .collect()
 }
@@ -112,9 +141,28 @@ extern "C" __global__ void late(const float* a) {
     atlas_pdl_enter();
 }
 extern "C" __global__ void other_name(const float* a) { rapper(a); }
-extern "C" __global__ void touching(const float* a, const unsigned char* w) {
-    atlas_pdl_enter_touch({w, 8u, 8u}, {w, 1u, 1u}, 4u, blockIdx.x, 2u);
+extern "C" __global__ void touching(const float* a, const unsigned char* __restrict__ w,
+                                    const unsigned char* __restrict__ ws) {
+    atlas_pdl_enter_touch({w, 8u, 8u}, {ws, 1u, 1u}, 4u, blockIdx.x, 2u);
     body<1>(a);
+}
+extern "C" __global__ void touches_input(const unsigned char* __restrict__ w,
+                                         const float* __restrict__ a) {
+    atlas_pdl_enter_touch({w, 8u, 8u}, {a, 1u, 1u}, 4u, blockIdx.x, 2u);
+}
+extern "C" __global__ void touches_mutable(unsigned char* w, const unsigned char* __restrict__ s) {
+    atlas_pdl_enter_touch({w, 8u, 8u}, {s, 1u, 1u}, 4u, blockIdx.x, 2u);
+}
+extern "C" __global__ void touches_prefix(const unsigned char* __restrict__ w_all) {
+    atlas_pdl_enter_touch({w, 8u, 8u}, {w_all, 1u, 1u}, 4u, blockIdx.x, 2u);
+}
+extern "C" __global__ void pair(const unsigned char* __restrict__ w0,
+                                const unsigned char* __restrict__ w1) {
+    atlas_pdl_enter_touch_pair({w0, 8u, 8u}, {w0, 1u, 1u}, {w1, 8u, 8u}, {w1, 1u, 1u}, 4u, 0u, 2u);
+    if (w0) { body<1>(w1); }
+}
+extern "C" __global__ void pair_input(const unsigned char* __restrict__ w0, const float* a) {
+    atlas_pdl_enter_touch_pair({w0, 8u, 8u}, {w0, 1u, 1u}, {a, 8u, 8u}, {w0, 1u, 1u}, 4u, 0u, 2u);
 }
 "#,
     );
@@ -127,6 +175,11 @@ extern "C" __global__ void touching(const float* a, const unsigned char* w) {
             ("late", false),
             ("other_name", false),
             ("touching", true),
+            ("touches_input", false),
+            ("touches_mutable", false),
+            ("touches_prefix", false),
+            ("pair", true),
+            ("pair_input", false),
         ]
     );
 }

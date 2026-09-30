@@ -26,7 +26,7 @@
 // A: BF16 [M, K] (row stride K). C rows at C + m*out_stride. K % 32 == 0.
 // Grid: (ceil(N/16),1,G) Block: (256,1,1); G = 1 for the plain tiers.
 
-#include "../../common/atlas_pdl.cuh"
+#include "atlas_pdl_touch.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -212,7 +212,7 @@ extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8(
 
 // `mxfp8_gemv_tc8` whose first `touch_ctas` CTAs pull the first `touch_rows`
 // weight rows (values and scales) into L2 while the kernel waits on its PDL
-// predecessor (atlas_pdl.cuh). Same body: bit-identical.
+// predecessor (atlas_pdl_touch.cuh). Same body: bit-identical.
 extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8_touch(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
     const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
