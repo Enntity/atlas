@@ -186,6 +186,12 @@ impl Qwen3AttentionLayer {
             stream,
             ctx.graph_capture,
         )?;
+        // ATLAS_GLM_DET_TRACE: the latents written to the cache; below, each
+        // piece's selected token ids (`x_` stages: see `det_trace`).
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        let lat = |width: u32| width as usize * bf16;
+        det.tap("kv_lat", k_entries, (0, num_tokens), lat(kv_lora));
+        det.tap("x_q_lat", q_latent, (0, num_tokens), lat(q_lora));
 
         // Per owner: semantic index, q_b + absorb, attention.
         let attn_latent = ctx.buffers.attn_output();
@@ -299,7 +305,9 @@ impl Qwen3AttentionLayer {
                     q_absorbed
                 }
             };
+            det.tap("x_q_abs", q_absorbed, (o.row0, o.rows), latent_row);
             if let Some((indices, index_width)) = sparse_indices {
+                det.tap("sel", indices, (o.row0, o.rows), index_width as usize * 4);
                 let mut profile = super::glm_index::profile_start(&octx, stream)?;
                 let sparse_args = ops::GlmSparsePrefillTc {
                     config: ctx.config,
@@ -415,6 +423,7 @@ impl Qwen3AttentionLayer {
                 )?;
             }
 
+            det.tap("x_attn_lat", attn_latent, (o.row0, o.rows), latent_row);
             // Convert the latent attention result back to each head's value
             // width, then apply the row-parallel output projection.
             if per_owner {
