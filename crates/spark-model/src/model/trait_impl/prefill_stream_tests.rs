@@ -13,7 +13,9 @@ fn isolated(name: &str) -> bool {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            &format!("model::trait_impl::prefill_stream_tests::{name}"),
+            // `--exact` wants the path below the crate (a stale literal here
+            // made every child run zero tests).
+            &format!("{}::{name}", module_path!().split_once("::").unwrap().1),
             "--nocapture",
         ])
         .env("ATLAS_PREFILL_STREAM_TEST_CHILD", "1")
