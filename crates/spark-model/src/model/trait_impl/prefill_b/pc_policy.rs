@@ -99,12 +99,11 @@ pub(in crate::model) fn glm_pc_branch_min_tokens() -> usize {
 }
 
 /// Whether ranks must agree on the Marconi restore depth: on with either
-/// prefix-cache policy flag, because both make later decisions depend on it,
-/// and with `ATLAS_GLM_PC_FINISH_LEAF`, whose leaf a rank can fail to save.
+/// prefix-cache policy flag, because both make later decisions depend on it.
+/// (`ATLAS_GLM_PC_FINISH_LEAF`, whose leaf a rank can lose, needs
+/// `ATLAS_GLM_PC_EVICT` and so always runs with the agreement.)
 pub(in crate::model) fn pc_rank_agree_enabled() -> bool {
-    spark_runtime::radix_tree::glm_pc_evict_enabled()
-        || glm_pc_branch_enabled()
-        || super::super::finish_leaf::enabled()
+    spark_runtime::radix_tree::glm_pc_evict_enabled() || glm_pc_branch_enabled()
 }
 
 /// The tail-split cut for a `total`-token prompt: one block below the last

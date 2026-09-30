@@ -9,7 +9,7 @@
 //! The next turn of the conversation restores it and re-prefills everything
 //! after it: the gap to the prompt end, all of the previous turn's output and
 //! the new message. With this flag the sequence also keeps the state it had
-//! at the last block boundary its decode crossed, registers it when the turn
+//! at the last save boundary its decode crossed, registers it when the turn
 //! finishes, and the next turn restores there instead.
 //!
 //! # Why the older leaves were wrong
@@ -19,7 +19,7 @@
 //! prompt-end and decode-cadence snapshots (`ATLAS_MARCONI_PREFILL_ONLY`),
 //! because restores gave wrong answers. What the code shows:
 //!
-//! 1. *Position.* A DFlash step that finished the sequence returned before
+//! 1. *Position.* A verify step that finished the sequence returned before
 //!    its commit (fixed separately), so the head's state was not the state
 //!    at `seq.tokens.len()`: with KDA records the h state had none of the
 //!    step's rows, the conv state had all `k` rows including the rejected
@@ -63,9 +63,42 @@
 //! worker to cache its mirror of the sequence too ([`EP_CMD_CACHE_SEQUENCE`]),
 //! and both register the slot at the boundary. A restore goes through the
 //! usual gate plus the restore-depth rank agreement (`pc_policy`), so a rank
-//! that lost its copy makes both ranks fall back together. The leaf only
-//! pairs with a whole-block KV match: the flag is ignored unless sub-block
-//! matching is off (`ATLAS_PREFIX_SUBBLOCK=0`).
+//! that lost its copy makes both ranks fall back together.
+//!
+//! # The snapshot pool
+//!
+//! A leaf serves one turn of one conversation, and only if that turn's prompt
+//! reproduces the output up to the boundary (not a reasoning turn whose
+//! history drops the thinking, nor a client that re-renders the output). So
+//! it is a second-class entry (`spark_runtime::radix_tree`, `snapshot_leaf`):
+//!
+//! * A rolling slot comes from the free list, from superseded history or
+//!   from another leaf. It never evicts a conversation's frontier checkpoint
+//!   or a branch point; when none of the three is available the turn takes
+//!   no leaf.
+//! * A registered leaf is evicted before any frontier or branch point and
+//!   does not supersede the prefill checkpoint under it, which stays the
+//!   conversation's protected restore point.
+//! * The turn that restores a leaf settles it
+//!   ([`TransformerModel::finish_leaf_restored`]). Normally it saves a tail
+//!   checkpoint of its own and the leaf becomes superseded history, which
+//!   that save and the turn's own rolling slot then reuse. A turn that
+//!   restores at or above its tail cut saves no checkpoint (its new message
+//!   is shorter than the tail gap), and the leaf is promoted to one.
+//!
+//! What remains outside the index is one slot per sequence that is decoding
+//! and has crossed a boundary (at most `--max-batch-size`), held until its
+//! turn finishes.
+//!
+//! # Preconditions
+//!
+//! The flag is ignored with a warning unless all of these hold:
+//!
+//! * `ATLAS_PREFIX_SUBBLOCK=0`: the leaf only pairs with a whole-block match.
+//! * `ATLAS_MARCONI_PREFILL_ONLY=1`: the legacy leaves above stay off.
+//! * `ATLAS_GLM_PC_EVICT=1`: the rules above are classes of the chain-aware
+//!   victim, which also makes both ranks choose victims the same way (it
+//!   does not use `session_hash`, which only the head knows).
 //!
 //! # Numerics
 //!
@@ -81,63 +114,89 @@
 //! One D2D copy of the sequence's SSM state per rank (74 MiB; about 3 ms in
 //! `scripts/finish-leaf-bench`, a preliminary standalone reading on a shared
 //! GB10) each time decode crosses a save boundary
-//! (`ATLAS_GLM_PC_FINISH_LEAF_BLOCKS` blocks apart, default 1), on the stream
-//! that advanced the state: the secondary stream for a verify commit, where
-//! it overlaps the head's next propose. The DFlash drafter's context on the
-//! next turn shrinks with the re-prefill it replaces (it is filled from the
-//! rows a prefill processes); a wider span keeps more of it.
+//! (`ATLAS_GLM_PC_FINISH_LEAF_BLOCKS` blocks apart, default 4), on the stream
+//! that advanced the state. For a verify commit that is the secondary
+//! stream, where the copy overlaps the head's next propose. A plain decode
+//! step saves on the default stream ahead of its logits read, so there the
+//! copy is not hidden. Every request pays it, including the ones whose leaf
+//! is never restored. The DFlash drafter's context on the next turn shrinks
+//! with the re-prefill it replaces (it is filled from the rows a prefill
+//! processes); a wider span keeps more of it.
 //!
 //! # Rank env parity
 //!
 //! Both ranks must run with the same `ATLAS_GLM_PC_FINISH_LEAF`,
-//! `ATLAS_GLM_PC_FINISH_LEAF_BLOCKS` and `ATLAS_PREFIX_SUBBLOCK`: the flag
-//! turns on the restore-depth agreement collectives and the cache command
-//! (see "Rank env parity" in `pc_policy`).
+//! `ATLAS_GLM_PC_FINISH_LEAF_BLOCKS` and the three variables above: the flag
+//! turns on the cache command (see "Rank env parity" in `pc_policy`).
+//!
+//! # Known limit
+//!
+//! A preempted sequence is cached through the same command and resumes
+//! through `Model::prefill`, which takes no rank agreement (as in base, where
+//! the worker resumes through the chunk path). Keep the flag off where
+//! preemption can run (`--swap-space` above 0) until resume takes the chunk
+//! path.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use anyhow::Result;
-use parking_lot::Mutex;
-use spark_runtime::gpu::DevicePtr;
 
-use super::super::ssm_batched_copy::{StateCopy, run_ssm_state_copies};
-use super::super::ssm_pool::SsmStatePool;
-use super::super::ssm_snapshot::SsmSnapshotPool;
+use super::super::ssm_batched_copy::run_ssm_state_copies;
 use super::super::types::TransformerModel;
+use super::prefill_b::pc_policy::tail_cut;
 use crate::traits::SequenceState;
+
+mod rolling;
+pub(crate) use rolling::LeafCell;
+use rolling::{FinishLeaf, leaf_copies, leaf_save, owned_from};
 
 /// Head to worker: cache your mirror of this slot's sequence (then the usual
 /// free follows). Sent only with the flag on.
 pub(in crate::model) const EP_CMD_CACHE_SEQUENCE: u32 = 0xFFFF_FFF8;
 
-/// The flag needs whole-block prefix matching, so that a restore of the leaf
-/// never pairs with a partial block.
-fn resolve(flag: Option<&str>, subblock: Option<&str>) -> bool {
-    let on = flag == Some("1");
-    if on && subblock != Some("0") {
+/// The flag with its preconditions `(what it needs, whether it holds)`.
+fn resolve(flag: bool, needs: &[(&str, bool)]) -> bool {
+    let missing: Vec<&str> = needs.iter().filter(|n| !n.1).map(|n| n.0).collect();
+    if flag && !missing.is_empty() {
         tracing::warn!(
-            "ATLAS_GLM_PC_FINISH_LEAF=1 ignored: it needs whole-block prefix matching \
-             (ATLAS_PREFIX_SUBBLOCK=0)"
+            "ATLAS_GLM_PC_FINISH_LEAF=1 ignored: it also needs {}",
+            missing.join(", ")
         );
     }
-    on && subblock == Some("0")
+    flag && missing.is_empty()
 }
 
-/// `ATLAS_GLM_PC_FINISH_LEAF=1` with `ATLAS_PREFIX_SUBBLOCK=0`. Read once.
+/// `ATLAS_GLM_PC_FINISH_LEAF=1` with its preconditions. Read once.
 pub(in crate::model) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let var = |k| std::env::var(k).ok();
         resolve(
-            var("ATLAS_GLM_PC_FINISH_LEAF").as_deref(),
-            var("ATLAS_PREFIX_SUBBLOCK").as_deref(),
+            std::env::var("ATLAS_GLM_PC_FINISH_LEAF").as_deref() == Ok("1"),
+            &[
+                (
+                    "ATLAS_PREFIX_SUBBLOCK=0",
+                    !spark_runtime::radix_tree::prefix_subblock_enabled(),
+                ),
+                (
+                    "ATLAS_MARCONI_PREFILL_ONLY=1",
+                    crate::model::mtp_carry::marconi_prefill_only(),
+                ),
+                (
+                    "ATLAS_GLM_PC_EVICT=1",
+                    spark_runtime::radix_tree::glm_pc_evict_enabled(),
+                ),
+            ],
         )
     })
 }
 
-/// Blocks between rolling saves (`ATLAS_GLM_PC_FINISH_LEAF_BLOCKS`, default 1:
-/// every block boundary). `n` makes the end-of-turn leaf land on the last
-/// boundary that is a multiple of `n` blocks, for `1/n` of the copies.
+/// Blocks between rolling saves when `ATLAS_GLM_PC_FINISH_LEAF_BLOCKS` is
+/// unset. The leaf lands on the last boundary that is a multiple of `n`
+/// blocks, so `n` trades copies (`1/n` of them) and reach (a next prompt that
+/// stops `u` tokens short of the end misses the leaf about `u / (16 n)` of
+/// the time) against up to `16 (n - 1)` more replayed tokens.
+const DEFAULT_SPAN_BLOCKS: usize = 4;
+
 fn span_blocks() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
@@ -145,130 +204,8 @@ fn span_blocks() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(1)
+            .unwrap_or(DEFAULT_SPAN_BLOCKS)
     })
-}
-
-/// How many of the `rows` rows a step adds on top of `pre` tokens reach the
-/// last `span`-token boundary inside the step: `Some(r)`, `1 <= r <= rows`,
-/// when `pre + r` is that boundary, `None` when the step crosses none.
-pub(super) fn boundary_row(pre: usize, rows: usize, span: usize) -> Option<usize> {
-    let at = (pre + rows).checked_div(span)? * span;
-    (at > pre).then(|| at - pre)
-}
-
-/// FNV-1a over `tokens`, continuing from `seed`.
-fn hash_tokens(seed: u64, tokens: &[u32]) -> u64 {
-    tokens
-        .iter()
-        .fold(seed, |h, &t| (h ^ u64::from(t)).wrapping_mul(0x100000001b3))
-}
-const HASH_SEED: u64 = 0xcbf29ce484222325;
-
-/// A sequence's rolling leaf: snapshot slot `snap` holds its exact SSM state
-/// after its first `tokens` tokens, which hashed to `hash` when it was saved.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FinishLeaf {
-    pub snap: usize,
-    pub tokens: usize,
-    pub hash: u64,
-}
-
-/// Holder of a sequence's [`FinishLeaf`]. The sequence owns the snapshot slot
-/// until `cache_sequence` registers it or `free_sequence` returns it; a
-/// sequence dropped without either (abort, unwind) hands the slot to the
-/// pool's orphan list instead of leaking it.
-#[derive(Default)]
-pub(crate) struct LeafCell {
-    leaf: Mutex<Option<FinishLeaf>>,
-    orphans: OnceLock<Arc<Mutex<Vec<usize>>>>,
-}
-
-impl LeafCell {
-    pub(super) fn get(&self) -> Option<FinishLeaf> {
-        *self.leaf.lock()
-    }
-    pub(super) fn take(&self) -> Option<FinishLeaf> {
-        self.leaf.lock().take()
-    }
-    pub(super) fn set(&self, leaf: FinishLeaf, orphans: &Arc<Mutex<Vec<usize>>>) {
-        self.orphans.get_or_init(|| orphans.clone());
-        *self.leaf.lock() = Some(leaf);
-    }
-}
-
-impl Drop for LeafCell {
-    fn drop(&mut self) {
-        if let (Some(leaf), Some(orphans)) = (self.leaf.get_mut().take(), self.orphans.get()) {
-            orphans.lock().push(leaf.snap);
-        }
-    }
-}
-
-/// The copies that save SSM-pool slot `ssm_slot` into snapshot slot `snap`:
-/// the live h state, and the conv state from the verify snapshot after row
-/// `conv_row` (`None`: the live conv state).
-pub(super) fn leaf_copies(
-    pool: &SsmStatePool,
-    snaps: &SsmSnapshotPool,
-    ssm_slot: usize,
-    snap: usize,
-    conv_row: Option<usize>,
-) -> (Vec<StateCopy>, Vec<StateCopy>) {
-    let plan = |src: &dyn Fn(usize) -> DevicePtr, dst: &dyn Fn(usize) -> DevicePtr, bytes| {
-        (0..snaps.num_ssm_layers())
-            .map(|i| StateCopy {
-                src: src(i),
-                dst: dst(i),
-                bytes,
-            })
-            .collect::<Vec<_>>()
-    };
-    let conv_src = |i| match conv_row {
-        Some(row) => pool.conv_intermediate(i, ssm_slot, row),
-        None => pool.conv_state(i, ssm_slot),
-    };
-    (
-        plan(
-            &|i| pool.h_state(i, ssm_slot),
-            &|i| snaps.tail_h_dst(i, snap),
-            snaps.h_bytes(),
-        ),
-        plan(
-            &conv_src,
-            &|i| snaps.tail_conv_dst(i, snap),
-            snaps.conv_bytes(),
-        ),
-    )
-}
-
-/// Whether `leaf` still describes a prefix of `tokens` covered by
-/// `cached_blocks` cached blocks of `bs` tokens.
-pub(super) fn leaf_valid(
-    leaf: FinishLeaf,
-    tokens: &[u32],
-    cached_blocks: usize,
-    bs: usize,
-) -> bool {
-    leaf.tokens <= tokens.len()
-        && leaf.tokens.is_multiple_of(bs)
-        && leaf.tokens / bs <= cached_blocks
-        && hash_tokens(HASH_SEED, &tokens[..leaf.tokens]) == leaf.hash
-}
-
-/// The `matched_tokens` a finishing sequence passes to the radix insert: the
-/// tokens whose nodes its prefill already inserted and ref-bumped.
-///
-/// That is the prompt's WHOLE blocks. Base passes `prompt_len` itself, which
-/// also counts the block the prompt end falls inside: that node is created
-/// here, so it gets the cache's reference only, the sequence's `release`
-/// takes it to zero, and a zero-ref node stops every later walk. With a
-/// prompt that does not end on a block boundary, no block of the generated
-/// output was ever matched by the next turn. Left as is with the flag off:
-/// there the worker rank caches nothing, so matching those blocks on the head
-/// alone would only keep them recent in its LRU at the expense of useful ones.
-pub(super) fn owned_from(prompt_len: usize, bs: usize) -> usize {
-    prompt_len / bs * bs
 }
 
 impl TransformerModel {
@@ -284,25 +221,25 @@ impl TransformerModel {
             && seq.hss_window_start() == 0
             && seq.seq_len == seq.tokens.len()
             && !self.seq_ssm_h_is_f16(seq);
-        ok.then(|| self.kv_cache.lock().block_size() * span_blocks())
+        ok.then(|| {
+            self.kv_cache
+                .lock()
+                .block_size()
+                .saturating_mul(span_blocks())
+        })
     }
 
-    /// A free snapshot slot for a rolling leaf, evicting one if needed.
+    /// A snapshot slot for a rolling leaf: free, or taken from superseded
+    /// history or another leaf. Never from a frontier (see "The snapshot
+    /// pool" above).
     fn finish_leaf_reserve(&self, session_hash: u64) -> Option<usize> {
         let snaps = &self.ssm_snapshots;
         for orphan in std::mem::take(&mut *snaps.orphans.lock()) {
             snaps.free(orphan);
         }
         snaps.reserve_tail_slot(session_hash).or_else(|| {
-            snaps
-                .reclaim_from_cache(
-                    self.prefix_cache.as_ref(),
-                    &mut self.kv_cache.lock(),
-                    self.ssm_tier_store.as_deref(),
-                    self.gpu.as_ref(),
-                )
-                .then(|| snaps.reserve_tail_slot(session_hash))
-                .flatten()
+            snaps.free(self.prefix_cache.evict_snapshot_for_leaf()?);
+            snaps.reserve_tail_slot(session_hash)
         })
     }
 
@@ -334,23 +271,18 @@ impl TransformerModel {
             snap,
             conv_row,
         );
-        let saved = run_ssm_state_copies(self.gpu.as_ref(), &h, &conv, stream)
+        // The slot may have been another entry's a moment ago, with a restore
+        // from it still in flight on the prefill stream: order this save
+        // after every snapshot copy recorded so far, and record it in turn.
+        let saved = self
+            .wait_snapshot_saves_dispatch(stream)
+            .and_then(|()| run_ssm_state_copies(self.gpu.as_ref(), &h, &conv, stream))
             .and_then(|()| self.record_snapshot_save_dispatch(stream));
         if let Err(e) = saved {
             tracing::warn!("finish-leaf save at token {at}: {e:#}");
             return self.finish_leaf_return(snap);
         }
-        // Extend the previous leaf's hash: a rewind below it shows up as a
-        // mismatch against the full hash taken at finish.
-        let hash = match held.filter(|l| l.tokens <= at) {
-            Some(l) => hash_tokens(l.hash, &seq.tokens[l.tokens..at]),
-            None => hash_tokens(HASH_SEED, &seq.tokens[..at]),
-        };
-        let leaf = FinishLeaf {
-            snap,
-            tokens: at,
-            hash,
-        };
+        let leaf = FinishLeaf::advance(held, snap, &seq.tokens, at);
         seq.finish_leaf.set(leaf, &self.ssm_snapshots.orphans);
         tracing::debug!(
             "finish-leaf save: slot {} token {at} snapshot {snap}",
@@ -359,8 +291,9 @@ impl TransformerModel {
     }
 
     /// KDA records commit of the first `rows` rows of a `k`-row verify
-    /// (`seq.tokens` already rolled back to the accepted prefix), saving the
-    /// rolling leaf where the step crosses a save boundary.
+    /// (`seq.tokens` already rolled back to the accepted prefix, see
+    /// [`leaf_save`]), saving the rolling leaf where the step crosses a save
+    /// boundary: fold to the boundary, save, fold on.
     pub(super) fn commit_kda_records_with_leaf(
         &self,
         seq: &mut SequenceState,
@@ -369,39 +302,59 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<()> {
         let rewind = rows < k;
-        let end = seq.tokens.len();
-        let split = self
+        let save = self
             .finish_leaf_span(seq)
-            .and_then(|span| boundary_row(end.checked_sub(rows)?, rows, span));
-        match split {
-            None => self.commit_kda_records(seq, 0..rows, rewind, stream),
-            Some(r) if r == rows => {
-                self.commit_kda_records(seq, 0..rows, rewind, stream)?;
-                self.finish_leaf_save(seq, end, None, stream);
-                Ok(())
-            }
-            Some(r) => {
-                // Fold to the boundary, save (conv from the verify's snapshot
-                // after row r - 1; the live conv holds all k rows), fold on.
-                self.commit_kda_records(seq, 0..r, false, stream)?;
-                self.finish_leaf_save(seq, end - (rows - r), Some(r - 1), stream);
-                self.commit_kda_records(seq, r..rows, rewind, stream)
-            }
+            .and_then(|span| leaf_save(seq.tokens.len(), rows, k, span));
+        let Some(save) = save else {
+            return self.commit_kda_records(seq, 0..rows, rewind, stream);
+        };
+        let r = save.rows;
+        self.commit_kda_records(seq, 0..r, rewind && r == rows, stream)?;
+        self.finish_leaf_save(seq, save.at, save.conv_row, stream);
+        if r < rows {
+            self.commit_kda_records(seq, r..rows, rewind, stream)?;
         }
+        Ok(())
     }
 
     /// A plain decode step advanced `seq` in place: save the rolling leaf
     /// when it now sits on a save boundary.
     pub(in crate::model) fn finish_leaf_after_decode(&self, seq: &SequenceState) {
-        let at = seq.tokens.len();
-        if !enabled() || at == 0 || seq.finish_leaf.get().is_some_and(|l| l.tokens == at) {
+        let end = seq.tokens.len();
+        if !enabled() || seq.finish_leaf.get().is_some_and(|l| l.tokens == end) {
             return;
         }
         if let Some(span) = self.finish_leaf_span(seq)
-            && boundary_row(at - 1, 1, span).is_some()
+            && let Some(save) = leaf_save(end, 1, 1, span)
         {
-            self.finish_leaf_save(seq, at, None, self.gpu.default_stream());
+            self.finish_leaf_save(seq, save.at, save.conv_row, self.gpu.default_stream());
         }
+    }
+
+    /// A prefill of `tokens` restored at `restored` tokens on `stream`:
+    /// settle the leaf it restored from, if it is one. When the prompt runs
+    /// at most two blocks past the restore, that is at or above the tail cut
+    /// and the prefill saves no checkpoint of its own, so the leaf becomes
+    /// the conversation's checkpoint. Otherwise the leaf is dead history once
+    /// the new checkpoint is saved, and says so now so that save can take its
+    /// slot. Both ranks run this from the agreed restore depth.
+    pub(super) fn finish_leaf_restored(
+        &self,
+        tokens: &[u32],
+        seq: &SequenceState,
+        restored: usize,
+        bs: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if !enabled() || restored == 0 {
+            return Ok(());
+        }
+        let keep = restored >= tail_cut(tokens.len(), bs);
+        self.prefix_cache
+            .settle_leaf_snapshot(&tokens[..restored], seq.adapter_id, keep);
+        // A rolling save on another stream may take the slot this restore
+        // reads (see `finish_leaf_save`): let it wait for the restore.
+        self.record_snapshot_save_dispatch(stream)
     }
 
     /// Head: have the worker cache its mirror of `seq` (it holds the same
@@ -436,30 +389,32 @@ impl TransformerModel {
         let Some(leaf) = seq.finish_leaf.take() else {
             return;
         };
-        let blocks = leaf.tokens / bs;
-        if !leaf_valid(leaf, &seq.tokens, seq.block_table.len(), bs) {
+        if !leaf.valid(&seq.tokens, seq.block_table.len(), bs) {
             tracing::info!("finish-leaf: stale leaf at token {} dropped", leaf.tokens);
             return self.finish_leaf_return(leaf.snap);
         }
-        let displaced = self.prefix_cache.insert_intermediate_snapshot(
+        let displaced = self.prefix_cache.insert_leaf_snapshot(
             &seq.tokens[..leaf.tokens],
-            &seq.block_table[..blocks],
-            seq.disk_block_ids.get(..blocks).unwrap_or(&[]),
-            bs,
             leaf.snap,
             seq.session_hash,
-            leaf.tokens,
             seq.adapter_id,
         );
-        if let Some(old) = displaced {
-            self.ssm_snapshots.free(old);
+        if displaced == Some(leaf.snap) {
+            tracing::info!(
+                "finish-leaf: token {} already has a checkpoint",
+                leaf.tokens
+            );
+        } else {
+            tracing::info!(
+                "finish-leaf: snapshot {} registered at token {} of {}",
+                leaf.snap,
+                leaf.tokens,
+                seq.tokens.len()
+            );
         }
-        tracing::info!(
-            "finish-leaf: snapshot {} registered at token {} of {}",
-            leaf.snap,
-            leaf.tokens,
-            seq.tokens.len()
-        );
+        if let Some(old) = displaced {
+            self.finish_leaf_return(old);
+        }
     }
 
     /// Return a rolling leaf that was never registered.
@@ -469,16 +424,15 @@ impl TransformerModel {
         }
     }
 
-    /// Hand an unregistered rolling slot back to the pool. Its last save may
-    /// still be in flight on the secondary stream, and the next owner of the
-    /// slot saves on another stream, so drain first (off the hot path: only
-    /// an aborted, failed or stale leaf comes here).
+    /// Hand a snapshot slot that is in no index back to the pool. Its last
+    /// save may still be in flight on either stream, and the next owner of
+    /// the slot may save on the other one, so drain both first (off the hot
+    /// path: only an aborted, failed, stale or displaced leaf comes here).
     fn finish_leaf_return(&self, snap: usize) {
-        let drained = self
-            .sync_secondary_dispatch()
-            .and_then(|()| self.gpu.synchronize(self.gpu.default_stream()));
-        if let Err(e) = drained {
-            tracing::warn!("finish-leaf: drain before returning snapshot {snap}: {e:#}");
+        for stream in [self.secondary_stream, self.gpu.default_stream()] {
+            if let Err(e) = self.gpu.synchronize(stream) {
+                tracing::warn!("finish-leaf: drain before returning snapshot {snap}: {e:#}");
+            }
         }
         self.ssm_snapshots.free(snap);
     }

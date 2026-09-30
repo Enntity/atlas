@@ -3,26 +3,37 @@
 //! The rolling finish leaf: where it lands, what it copies, when it is
 //! dropped, and that two ranks place and restore it alike.
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
 use super::super::super::ssm_batched_copy::run_ssm_state_copies;
 use super::super::super::ssm_pool::SsmStatePool;
 use super::super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::prefill_b::pc_policy::{Agreed, agree_restore, tail_cut};
+use super::rolling::{LeafSave, boundary_row, hash_tokens};
 use super::*;
 use crate::ssm_reserve::SsmRollbackMode;
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{GpuBackend, mock::MockGpuBackend};
 use spark_runtime::prefix_cache::PrefixCache;
-use spark_runtime::radix_tree::RadixTree;
+use spark_runtime::radix_tree::{RadixTree, prefix_hash_seed};
 
 const BS: usize = 16;
 
 #[test]
-fn the_flag_needs_whole_block_matching() {
-    assert!(resolve(Some("1"), Some("0")));
-    assert!(!resolve(Some("1"), None));
-    assert!(!resolve(Some("1"), Some("1")));
-    assert!(!resolve(None, Some("0")));
-    assert!(!resolve(Some("0"), Some("0")));
+fn the_flag_needs_every_precondition() {
+    let needs = |a, b, c| [("SUBBLOCK=0", a), ("PREFILL_ONLY=1", b), ("PC_EVICT=1", c)];
+    assert!(resolve(true, &needs(true, true, true)));
+    for one_missing in [
+        needs(false, true, true),
+        needs(true, false, true),
+        needs(true, true, false),
+    ] {
+        assert!(!resolve(true, &one_missing));
+    }
+    assert!(!resolve(false, &needs(true, true, true)));
+    assert!(!resolve(false, &needs(false, false, false)));
 }
 
 #[test]
@@ -59,16 +70,23 @@ fn steps(seed: u64, n: usize) -> Vec<(usize, bool)> {
         .collect()
 }
 
-/// The leaf position a sequence of `len` tokens holds after `steps`, saving
-/// wherever [`boundary_row`] says (both the commit and the plain-decode hook
-/// reduce to it).
+/// The leaf position a sequence of `len` tokens holds after `steps`, through
+/// the plan both hooks execute ([`leaf_save`]): a commit of `rows` of the 9
+/// verified rows with the sequence already rolled back, or a plain decode.
 fn run(mut len: usize, steps: &[(usize, bool)], span: usize) -> (usize, Option<usize>) {
     let mut leaf = None;
-    for &(rows, _) in steps {
-        if let Some(r) = boundary_row(len, rows, span) {
-            leaf = Some(len + r);
-        }
+    for &(rows, plain) in steps {
+        let (pre, k) = (len, if plain { 1 } else { 9 });
         len += rows;
+        if let Some(save) = leaf_save(len, rows, k, span) {
+            assert!(save.at.is_multiple_of(span) && save.at > pre && save.at <= len);
+            assert_eq!(save.at - pre, save.rows);
+            // The boundary's conv state: the verify's snapshot after that
+            // row (rows 0..k - 1 have one), or the live state after row k.
+            let conv = (save.rows < k).then(|| save.rows - 1);
+            assert_eq!(save.conv_row, conv, "rows={rows} k={k}");
+            leaf = Some(save.at);
+        }
     }
     (len, leaf)
 }
@@ -91,34 +109,70 @@ fn the_leaf_ends_on_the_last_boundary_at_or_below_the_end() {
     }
 }
 
+/// `leaf_save` takes the length after the rejected rows were rolled back. A
+/// 9-row verify from 60 that accepts 5 rows ends at 65 and crosses 64 at its
+/// row 4. Planned before the rollback (69), the same commit would label the
+/// state after row 4 as token 68.
+#[test]
+fn the_plan_needs_the_rolled_back_length() {
+    let save = |end| leaf_save(end, 5, 9, 4);
+    assert_eq!(
+        save(65),
+        Some(LeafSave {
+            rows: 4,
+            at: 64,
+            conv_row: Some(3)
+        })
+    );
+    assert_eq!(save(69).map(|s| (s.rows, s.at)), Some((4, 68)));
+    // No step to plan for: fewer tokens than rows.
+    assert_eq!(leaf_save(3, 5, 9, 4), None);
+    // A full accept that ends on the boundary saves the live conv state.
+    assert_eq!(leaf_save(64, 9, 9, BS).unwrap().conv_row, None);
+    assert_eq!(leaf_save(64, 1, 1, BS).unwrap().conv_row, None);
+    // A partial accept that ends there reads the snapshot the rewind reads.
+    assert_eq!(leaf_save(64, 5, 9, BS).unwrap().conv_row, Some(4));
+}
+
 #[test]
 fn the_hash_chain_equals_the_full_hash() {
     let tokens: Vec<u32> = (0..200).map(|i| i * 7 + 3).collect();
-    let full = hash_tokens(HASH_SEED, &tokens[..160]);
-    let chained = hash_tokens(hash_tokens(HASH_SEED, &tokens[..48]), &tokens[48..160]);
-    assert_eq!(full, chained);
-    assert_ne!(full, hash_tokens(HASH_SEED, &tokens[..144]));
+    let first = FinishLeaf::advance(None, 3, &tokens, 48);
+    let chained = FinishLeaf::advance(Some(first), 3, &tokens, 160);
+    assert_eq!(chained, FinishLeaf::advance(None, 3, &tokens, 160));
+    assert_eq!(
+        chained.hash,
+        hash_tokens(prefix_hash_seed(0), &tokens[..160])
+    );
+    assert_ne!(
+        chained.hash,
+        FinishLeaf::advance(None, 3, &tokens, 144).hash
+    );
+    // A leaf above the new position (the turn was rewound) restarts the hash.
+    let rewound = FinishLeaf::advance(Some(chained), 3, &tokens, 96);
+    assert_eq!(rewound, FinishLeaf::advance(None, 3, &tokens, 96));
+    // A rewind below the leaf and a different regeneration break the chain.
+    let mut other = tokens.clone();
+    other[40] = 9_999;
+    let stale = FinishLeaf::advance(Some(first), 3, &other, 160);
+    assert!(!stale.valid(&other, 12, BS) && chained.valid(&tokens, 12, BS));
 }
 
 #[test]
 fn a_leaf_is_registered_only_for_a_cached_prefix_it_still_describes() {
     let tokens: Vec<u32> = (0..100).collect();
-    let leaf = |at: usize| FinishLeaf {
-        snap: 3,
-        tokens: at,
-        hash: hash_tokens(HASH_SEED, &tokens[..at]),
-    };
-    assert!(leaf_valid(leaf(96), &tokens, 6, BS));
+    let leaf = |at: usize| FinishLeaf::advance(None, 3, &tokens, at);
+    assert!(leaf(96).valid(&tokens, 6, BS));
     // The turn was rewound below the leaf and ended there.
-    assert!(!leaf_valid(leaf(96), &tokens[..90], 5, BS));
+    assert!(!leaf(96).valid(&tokens[..90], 5, BS));
     // Its blocks are not all in the block table.
-    assert!(!leaf_valid(leaf(96), &tokens, 5, BS));
+    assert!(!leaf(96).valid(&tokens, 5, BS));
     // The sequence was rewound and regenerated differently under the leaf.
     let mut other = tokens.clone();
     other[70] = 9_999;
-    assert!(!leaf_valid(leaf(96), &other, 6, BS));
+    assert!(!leaf(96).valid(&other, 6, BS));
     // Never off a block boundary.
-    assert!(!leaf_valid(leaf(90), &tokens, 6, BS));
+    assert!(!leaf(90).valid(&tokens, 6, BS));
 }
 
 #[test]
@@ -252,16 +306,7 @@ impl Rank {
             0,
         );
         if let Some(at) = leaf {
-            let none = cache.insert_intermediate_snapshot(
-                &tokens[..at],
-                &blocks[..at / BS],
-                &[],
-                BS,
-                at + rank,
-                0,
-                at,
-                0,
-            );
+            let none = cache.insert_leaf_snapshot(&tokens[..at], at + rank, 0, 0);
             assert_eq!(none, None);
         }
         cache.release(tokens, BS, 0);
@@ -385,4 +430,29 @@ fn a_match_below_the_leaf_does_not_restore_it() {
     let ranks = [0, 1].map(|r| Rank::turn(r, &tokens, prompt, Some(at)));
     assert_eq!(ranks[0].lookup(&next), (1_296, cut));
     assert_eq!(agreed(&ranks, &next), [(cut, Agreed::Local); 2]);
+}
+
+/// The turn that restores a leaf settles it. A prompt that runs at most two
+/// blocks past the leaf has its tail cut at or under it, so the prefill saves
+/// no checkpoint and the leaf becomes the conversation's checkpoint (no
+/// leaf's rolling slot may take it; the old checkpoint is history). A longer
+/// prompt saves its own, and the leaf is the first slot to go.
+#[test]
+fn the_restoring_turn_keeps_or_retires_its_leaf() {
+    let (prompt, end) = (1_000, 1_500);
+    let (at, cut) = (end / BS * BS, tail_cut(prompt, BS));
+    for extra in 1..=80 {
+        assert_eq!(at >= tail_cut(at + extra, BS), extra <= 2 * BS, "{extra}");
+    }
+    let tokens: Vec<u32> = (0..end as u32).collect();
+    for keep in [true, false] {
+        let rank = Rank::turn(0, &tokens, prompt, Some(at));
+        assert_eq!(rank.cache.evict_snapshot_for_leaf(), Some(at));
+        let rank = Rank::turn(0, &tokens, prompt, Some(at));
+        rank.cache.settle_leaf_snapshot(&tokens[..at], 0, keep);
+        let first = if keep { cut } else { at };
+        assert_eq!(rank.cache.evict_snapshot_for_leaf(), Some(first));
+        // What is left is the conversation's frontier.
+        assert_eq!(rank.cache.evict_snapshot_for_leaf(), None);
+    }
 }
