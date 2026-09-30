@@ -119,6 +119,11 @@ pub struct Glm5KdaLayer {
     w4a16_gemm_t_m128_k: KernelHandle,
     dense_gemm_k: KernelHandle,
     dense_gemm_pipelined_k: KernelHandle,
+    /// `dense_gemm_bf16_pipelined_triple_n` (prefill beta | f_a | g_a). On by
+    /// default, unlike the opt-in `ATLAS_GLM_K5_FUSED_*` verify flags: zero
+    /// only when the kernel is absent or `ATLAS_GLM_KDA_FUSED_SMALL_PREFILL`
+    /// is exactly `0` (a kill switch, as `ATLAS_KDA_VERIFY_OWNERS`).
+    dense_gemm_pipelined_triple_n_k: KernelHandle,
     conv_prefill_k: KernelHandle,
     conv_prefill_tp_k: KernelHandle,
     conv_prefill_tp_snap_k: KernelHandle,

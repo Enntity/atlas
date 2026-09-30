@@ -172,6 +172,28 @@ impl Glm5KdaLayer {
                 stream,
             )?;
             profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
+        } else if !capture_verify_intermediates
+            && m > 1
+            && self.dense_gemm_pipelined_k.0 != 0
+            && self.dense_gemm_pipelined_triple_n_k.0 != 0
+        {
+            // The three pipelined launches `project_dense` would make, in one grid.
+            ops::dense_gemm_pipelined_triple_n(
+                ctx.gpu,
+                self.dense_gemm_pipelined_triple_n_k,
+                normed,
+                [
+                    &self.weights.b_proj,
+                    &self.weights.f_a_proj,
+                    &self.weights.g_a_proj,
+                ],
+                [beta, fa, ga],
+                m,
+                [self.heads as u32, self.dim as u32],
+                h,
+                stream,
+            )?;
+            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
         } else {
             if capture_verify_intermediates {
                 self.project_dense_verify(

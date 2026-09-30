@@ -20,10 +20,17 @@ fn enabled() -> bool {
 }
 
 /// `spark_runtime::cutlass::bf16_gemm_tuned` config for an `[n, k]` weight:
-/// narrow N takes 128x256 tiles (swizzle 8), K >= 8192 128x256 (swizzle 4),
-/// short K the unswizzled 128x128x32, everything else 128x128x64 (swizzle 8).
+/// N <= 512 or K <= 128 take 128x128x64 (swizzle 8: one launch reads A once
+/// for up to four N tiles), other narrow N 128x256 tiles (swizzle 8), K >= 8192
+/// 128x256 (swizzle 4), short K the unswizzled 128x128x32, everything else
+/// 128x128x64. Every config keeps warp K == CTA K (sequential k16 MMAs, no
+/// split-K), so for [`bf16_gemm_matches_pipelined`] K all are bit-identical
+/// to each other and to the pipelined dense GEMM (`examples/bf16_gemm_bench`
+/// counts differing outputs); any other K keeps the picks it always had.
 fn config(n: u32, k: u32) -> u32 {
-    if n <= 1536 {
+    if bf16_gemm_matches_pipelined(k) && (n <= 512 || k <= 128) {
+        9
+    } else if n <= 1536 {
         5
     } else if k >= 8192 {
         4
@@ -93,6 +100,15 @@ pub fn bf16_gemm_cutlass_rows(m: u32) -> bool {
     enabled() && m >= MIN_ROWS
 }
 
+/// Whether the CUTLASS configs and `dense_gemm_bf16_pipelined` accumulate a
+/// `k`-wide row in the same k16 MMA steps. CUTLASS tiles a K residue first
+/// (per config K tile, 32 or 64) and the pipelined kernel zero-fills it last,
+/// so only whole k16 steps group alike: measured 0 differing outputs at K
+/// 16..4096 with K % 16 == 0, and differences at K 40, 72, 104, 120, 4040.
+pub fn bf16_gemm_matches_pipelined(k: u32) -> bool {
+    k.is_multiple_of(16)
+}
+
 /// Exact E4M3 -> BF16 widening of `count` values (`count % 8 == 0`).
 pub fn fp8_e4m3_to_bf16(
     gpu: &dyn GpuBackend,
@@ -120,7 +136,7 @@ pub fn fp8_e4m3_to_bf16(
 
 #[cfg(test)]
 mod tests {
-    use super::{config, row_blocks};
+    use super::{bf16_gemm_matches_pipelined as matches_pipelined, config, row_blocks};
 
     #[test]
     fn unswizzled_calls_split_into_l2_resident_row_blocks() {
@@ -135,10 +151,27 @@ mod tests {
     #[test]
     fn config_follows_measured_glm_shapes() {
         assert_eq!(config(1536, 4096), 5); // q_a
-        assert_eq!(config(576, 4096), 5); // kv_a
+        assert_eq!(config(576, 4096), 5); // kv_a with RoPE
+        assert_eq!(config(512, 4096), 9); // GLM kv_a
+        assert_eq!(config(288, 4096), 9); // GLM router
+        assert_eq!(config(128, 4096), 9); // index wk / kpool_gate
+        assert_eq!(config(32, 4096), 9); // index weights_proj
         assert_eq!(config(4096, 8192), 4); // o
         assert_eq!(config(8192, 1536), 0); // q_b
         assert_eq!(config(4096, 2048), 0); // shared down
+        assert_eq!(config(4096, 128), 9); // KDA f_b / g_b
         assert_eq!(config(2048, 4096), 9); // shared gate/up
+    }
+
+    #[test]
+    fn narrow_picks_need_whole_k16_steps_to_stay_bit_identical() {
+        // K % 16 == 0 (K % 64 != 0 included): 128x128x64 where measured faster.
+        assert_eq!(config(128, 4000), 9);
+        assert_eq!(config(4096, 112), 9);
+        // A K residue is tiled first, per config K tile: keep the prior picks.
+        assert_eq!(config(128, 4040), 5);
+        assert_eq!(config(4096, 104), 0);
+        assert!(matches_pipelined(128) && matches_pipelined(4096));
+        assert!(!matches_pipelined(104) && !matches_pipelined(120));
     }
 }

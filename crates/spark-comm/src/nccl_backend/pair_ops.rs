@@ -96,6 +96,55 @@ impl NcclBackend {
         Ok(false)
     }
 
+    /// One-shot exchange over the RDMA pair (`rdma_pair::oneshot`): on
+    /// `stream`, graph-capturable, sharing one device sequence between eager
+    /// calls and replays. `false` (nothing enqueued) when `ATLAS_RDMA_ONESHOT`
+    /// is off, the kernel is missing or the size is ineligible.
+    pub(super) fn try_oneshot(
+        &self,
+        src: u64,
+        dst: u64,
+        bytes: usize,
+        add: bool,
+        stream: u64,
+    ) -> Result<bool> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
+            return oneshot.enqueue(src, dst, bytes, add, stream);
+        }
+        let _ = (src, dst, bytes, add, stream);
+        Ok(false)
+    }
+
+    /// Largest one-shot payload (0 when the channel is unavailable).
+    pub(super) fn oneshot_max_bytes(&self) -> usize {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
+            return oneshot.max_bytes();
+        }
+        0
+    }
+
+    /// Provide `rdma_oneshot_bf16` to the one-shot channel, if it is up.
+    pub(super) fn set_oneshot_kernel_handle(&self, handle: u64) {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
+            oneshot.set_kernel(handle);
+            tracing::info!("RDMA one-shot kernel set (graph-capturable collectives enabled)");
+        }
+        let _ = handle;
+    }
+
+    /// Why the one-shot channel stopped (the peer never arrived, the ranks
+    /// diverged, or the host could no longer serve it), if it did.
+    pub fn oneshot_poisoned(&self) -> Option<String> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
+            return oneshot.poisoned();
+        }
+        None
+    }
+
     /// Connections to this rank's peers from the initial bootstrap; watch them
     /// to learn when a peer process exits.
     pub fn peer_lifeline(&self) -> &PeerLifeline {

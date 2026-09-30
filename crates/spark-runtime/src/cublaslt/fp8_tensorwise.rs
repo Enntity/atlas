@@ -38,9 +38,31 @@ struct Heuristic {
     reserved: [i32; 4],
 }
 
+// CUDA 13 cublasLt.h: CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK and the
+// cublasLtReductionScheme_t values NONE and MASK (every scheme, the default).
+const PREF_REDUCTION_SCHEME_MASK: u32 = 3;
+const SCHEME_NONE: u32 = 0;
+const SCHEME_ALL: u32 = 7;
+
+/// `heuristic(mask)` for the split-K 1 pin, else (or when the pinned query
+/// finds no algorithm) for cuBLASLt's own choice. `None` leaves the
+/// preference's reduction mask untouched, exactly as without the pin.
+fn pinned_or_default<T>(
+    no_split_k: bool,
+    mut heuristic: impl FnMut(Option<u32>) -> Result<T>,
+) -> Result<T> {
+    if no_split_k && let Ok(algo) = heuristic(Some(SCHEME_NONE)) {
+        return Ok(algo);
+    }
+    heuristic(no_split_k.then_some(SCHEME_ALL))
+}
+
 /// Row-major `out[M,N] = act[M,K] * weight[N,K]^T`. Both operands are already
 /// E4M3 with tensor scales exactly one. Calls serialize on the existing model
 /// forward stream and share the existing process CUDA64MiB workspace.
+/// `no_split_k` masks the heuristic to reduction scheme NONE (split-K 1): at
+/// N=K=4096 it otherwise picks split-K 2 for M 2048..~4K, ~2x slower on GB10.
+/// A shape with no split-K 1 algorithm runs cuBLASLt's own choice instead.
 #[allow(clippy::too_many_arguments)]
 pub fn fp8_gemm_act_weight_t_tensorwise(
     act: u64,
@@ -49,6 +71,7 @@ pub fn fp8_gemm_act_weight_t_tensorwise(
     m: u32,
     n: u32,
     k: u32,
+    no_split_k: bool,
     stream: u64,
 ) -> Result<()> {
     ensure!(
@@ -171,28 +194,42 @@ pub fn fp8_gemm_act_weight_t_tensorwise(
                 "FP8 tensorwise alignment",
             )?;
         }
-        let mut result = Heuristic::default();
-        let mut returned = 0;
         let [la, lb, lc] = h.layouts;
-        chk(
-            cublasLtMatmulAlgoGetHeuristic(
-                context.handle,
-                h.desc,
-                la,
-                lb,
-                lc,
-                lc,
-                h.pref,
-                1,
-                (&mut result as *mut Heuristic).cast(),
-                &mut returned,
-            ),
-            "FP8 tensorwise heuristic",
-        )?;
-        ensure!(
-            returned == 1 && result.state == 0 && result.workspace <= context.ws_size,
-            "cuBLASLt no FP8 tensorwise algorithm M={m} N={n} K={k}"
-        );
+        let result = pinned_or_default(no_split_k, |mask| {
+            if let Some(mask) = mask {
+                chk(
+                    cublasLtMatmulPreferenceSetAttribute(
+                        h.pref,
+                        PREF_REDUCTION_SCHEME_MASK,
+                        (&mask as *const u32).cast(),
+                        size_of::<u32>(),
+                    ),
+                    "FP8 tensorwise reduction scheme",
+                )?;
+            }
+            let mut result = Heuristic::default();
+            let mut returned = 0;
+            chk(
+                cublasLtMatmulAlgoGetHeuristic(
+                    context.handle,
+                    h.desc,
+                    la,
+                    lb,
+                    lc,
+                    lc,
+                    h.pref,
+                    1,
+                    (&mut result as *mut Heuristic).cast(),
+                    &mut returned,
+                ),
+                "FP8 tensorwise heuristic",
+            )?;
+            ensure!(
+                returned == 1 && result.state == 0 && result.workspace <= context.ws_size,
+                "cuBLASLt no FP8 tensorwise algorithm M={m} N={n} K={k}"
+            );
+            Ok(result)
+        })?;
         let alpha = 1f32;
         let beta = 0f32;
         chk(
@@ -218,4 +255,37 @@ pub fn fp8_gemm_act_weight_t_tensorwise(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `pinned_or_default` over a fake heuristic: the masks it was asked for.
+    fn masks(no_split_k: bool, answers: &[bool]) -> (Vec<Option<u32>>, Result<usize>) {
+        let mut asked = Vec::new();
+        let result = pinned_or_default(no_split_k, |mask| {
+            asked.push(mask);
+            ensure!(answers[asked.len() - 1], "no algorithm");
+            Ok(asked.len())
+        });
+        (asked, result)
+    }
+
+    #[test]
+    fn default_heuristic_leaves_the_reduction_mask_untouched() {
+        let (asked, result) = masks(false, &[true]);
+        assert_eq!((asked, result.unwrap()), (vec![None], 1));
+        assert!(masks(false, &[false]).1.is_err());
+    }
+
+    #[test]
+    fn split_k_pin_falls_back_to_every_scheme_when_it_finds_no_algorithm() {
+        let (asked, result) = masks(true, &[true]);
+        assert_eq!((asked, result.unwrap()), (vec![Some(SCHEME_NONE)], 1));
+        let (asked, result) = masks(true, &[false, true]);
+        assert_eq!(asked, [Some(SCHEME_NONE), Some(SCHEME_ALL)]);
+        assert_eq!(result.unwrap(), 2);
+        assert!(masks(true, &[false, false]).1.is_err());
+    }
 }
