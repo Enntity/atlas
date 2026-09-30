@@ -19,8 +19,9 @@
 //!   TP-split shared expert (`ATLAS_GLM_SHARED_TP_SPLIT=1`) as
 //!   `moe_unpermute_blend_ep_vec8`: the grouped routed FFN of verify blocks
 //!   and short prefill chunks. One-row decode runs another MoE path.
-//! * `8` MoE sort: `moe_sort_by_expert` as `moe_sort_by_expert_scan` (block
-//!   prefix sum), for every grouped routed FFN of the layer.
+//! * `8` MoE sort: `moe_sort_by_expert` and `moe_build_tile_worklist` as their
+//!   `_scan` twins (shuffle prefix sums), for every routed FFN of the layer
+//!   that launches them.
 //! * `16` RMS norm: `rms_norm_vanilla` as `rms_norm_vanilla_regs` for the GLM
 //!   KDA and MLA layers' norms (every width and path).
 //!
@@ -81,32 +82,33 @@ fn groups() -> Result<u32> {
     groups.clone().map_err(|error| anyhow!(error))
 }
 
-/// `original` (module, kernel), or `twin` when fused `group` is on and the
-/// target ships it. A twin takes the original's arguments and launch shape
+/// `original`, or the `twin` (module, kernel) when fused `group` is on and
+/// both are shipped. A twin takes the original's arguments and launch shape
 /// and writes the same bytes.
-pub fn kernel_or_twin(
+pub fn twin(
     gpu: &dyn GpuBackend,
     group: u32,
-    original: (&str, &str),
+    original: KernelHandle,
     twin: (&str, &str),
 ) -> Result<KernelHandle> {
-    kernel_or_twin_for(groups()?, gpu, group, original, twin)
+    Ok(twin_for(groups()?, gpu, group, original, twin))
 }
 
-fn kernel_or_twin_for(
+fn twin_for(
     groups: u32,
     gpu: &dyn GpuBackend,
     group: u32,
-    original: (&str, &str),
-    twin: (&str, &str),
-) -> Result<KernelHandle> {
+    original: KernelHandle,
+    (module, name): (&str, &str),
+) -> KernelHandle {
     if groups & group != 0
-        && let Ok(kernel) = gpu.kernel(twin.0, twin.1)
+        && original.0 != 0
+        && let Ok(kernel) = gpu.kernel(module, name)
         && kernel.0 != 0
     {
-        return Ok(kernel);
+        return kernel;
     }
-    gpu.kernel(original.0, original.1)
+    original
 }
 
 fn aligned16(ptrs: &[DevicePtr]) -> bool {

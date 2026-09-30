@@ -157,35 +157,16 @@ fn flag_is_explicit_and_mask_selects_groups() {
 
 #[test]
 fn handle_twins_swap_only_when_their_group_is_on_and_shipped() {
-    let gpu = Capture::new(&[
-        ("moe", "moe_sort_by_expert"),
-        ("moe", "moe_sort_by_expert_scan"),
-        ("rms_norm_vanilla", "rms_norm_vanilla"),
-    ]);
-    let sort = |groups| {
-        let (original, twin) = (
-            ("moe", "moe_sort_by_expert"),
-            ("moe", "moe_sort_by_expert_scan"),
-        );
-        kernel_or_twin_for(groups, &gpu, MOE_SORT, original, twin)
-            .unwrap()
-            .0
-    };
-    assert_eq!(sort(0), 1);
-    assert_eq!(sort(ALL & !MOE_SORT), 1);
-    assert_eq!(sort(MOE_SORT), 2);
-    // The norm twin is not shipped here: the original, whatever the flag.
-    let norm = |groups| {
-        let original = ("rms_norm_vanilla", "rms_norm_vanilla");
-        let twin = ("glm_rms_norm_regs", "rms_norm_vanilla_regs");
-        kernel_or_twin_for(groups, &gpu, RMS_NORM, original, twin)
-            .unwrap()
-            .0
-    };
-    assert_eq!((norm(0), norm(ALL)), (3, 3));
-    // A missing original still fails the build, as before.
-    let missing = ("norm", "rms_norm");
-    assert!(kernel_or_twin_for(0, &gpu, RMS_NORM, missing, ("norm", "x")).is_err());
+    let gpu = Capture::new(&[("moe", "moe_sort_by_expert_scan")]);
+    let sort = KernelHandle(42);
+    let scan = ("moe", "moe_sort_by_expert_scan");
+    assert_eq!(twin_for(0, &gpu, MOE_SORT, sort, scan).0, 42);
+    assert_eq!(twin_for(ALL & !MOE_SORT, &gpu, MOE_SORT, sort, scan).0, 42);
+    assert_eq!(twin_for(MOE_SORT, &gpu, MOE_SORT, sort, scan).0, 1);
+    // An absent original stays absent; an unshipped twin keeps the original.
+    assert_eq!(twin_for(ALL, &gpu, MOE_SORT, KernelHandle(0), scan).0, 0);
+    let regs = ("glm_rms_norm_regs", "rms_norm_vanilla_regs");
+    assert_eq!(twin_for(ALL, &gpu, RMS_NORM, KernelHandle(7), regs).0, 7);
     assert!(gpu.launches().is_empty());
 }
 

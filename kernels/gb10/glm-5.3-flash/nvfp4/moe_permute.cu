@@ -602,3 +602,67 @@ extern "C" __global__ void moe_sort_by_expert_scan(
         token_to_perm[i] = (int)pos;
     }
 }
+
+// moe_build_tile_worklist with the chunked Hillis-Steele scan replaced by the
+// shuffle scan of moe_sort_by_expert_scan (ATLAS_GLM_DECODE_FUSE): each thread
+// owns up to four consecutive experts, so one scan places every expert where
+// the original walked 256-expert chunks of eight barrier pairs each. Integer
+// sums and the same expert/m/n emission order, so the work-list and
+// total_tiles are the same words. Grid: (1, 1, 1)  Block: (256, 1, 1); at most
+// 1024 experts.
+extern "C" __global__ void moe_build_tile_worklist_scan(
+    const int* __restrict__ expert_offsets,
+    const unsigned long long* __restrict__ B_weight_ptrs,
+    unsigned int* __restrict__ worklist,
+    int* __restrict__ total_tiles,
+    unsigned int num_experts,
+    unsigned int n_tiles,
+    unsigned int m_tile
+) {
+    atlas_pdl_enter();
+    __shared__ unsigned int warp_sums[8];
+    const unsigned int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    if (blockDim.x != 256 || num_experts > 1024) return;
+    const unsigned int per = (num_experts + 255) / 256;
+    const unsigned int e0 = min(tid * per, num_experts), e1 = min(e0 + per, num_experts);
+    unsigned int mt[4] = {0u, 0u, 0u, 0u};
+    unsigned int local = 0;
+    #pragma unroll
+    for (unsigned int k = 0; k < 4; k++) {
+        const unsigned int e = e0 + k;
+        if (e < e1) {
+            const int M_e = expert_offsets[e + 1] - expert_offsets[e];
+            if (M_e > 0 && B_weight_ptrs[e] != 0)   // mirror grouped-GEMM early-exit guards
+                mt[k] = ((unsigned int)M_e + m_tile - 1) / m_tile;
+            local += mt[k] * n_tiles;
+        }
+    }
+    unsigned int incl = local;
+    #pragma unroll
+    for (unsigned int o = 1; o < 32; o <<= 1) {
+        const unsigned int up = __shfl_up_sync(0xFFFFFFFF, incl, o);
+        if (lane >= o) incl += up;
+    }
+    if (lane == 31) warp_sums[warp] = incl;
+    __syncthreads();
+    unsigned int w = 0;
+    for (unsigned int v = 0; v < warp; v++) w += warp_sums[v];
+    w += incl - local;
+    #pragma unroll
+    for (unsigned int k = 0; k < 4; k++) {
+        const unsigned int e = e0 + k;
+        for (unsigned int m = 0; m < mt[k]; m++) {
+            for (unsigned int nt = 0; nt < n_tiles; nt++) {
+                assert(m < (1u << 26) && nt < 64u);
+                worklist[w * 2 + 0] = e;
+                worklist[w * 2 + 1] = (m << 6) | nt;
+                w++;
+            }
+        }
+    }
+    if (tid == 255) {
+        unsigned int total = 0;
+        for (unsigned int v = 0; v < 8; v++) total += warp_sums[v];
+        total_tiles[0] = (int)total;
+    }
+}

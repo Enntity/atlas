@@ -64,6 +64,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "moe_sort_by_expert",
     "moe_sort_by_expert_scan",
     "moe_build_tile_worklist",
+    "moe_build_tile_worklist_scan",
     "quantize_bf16_to_nvfp4",
     "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact_gate_up",
     "silu_mul_quant_nvfp4",

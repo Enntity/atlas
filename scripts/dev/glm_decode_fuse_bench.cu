@@ -11,7 +11,8 @@
 //          (both then glm_hc_decode_finalize_bf16 -> rms_norm_vanilla)
 //   moe    moe_unpermute_reduce_indexed_ep_vec8 -> moe_batched_blend
 //      vs  moe_unpermute_blend_ep_vec8
-//   sort   moe_sort_by_expert vs moe_sort_by_expert_scan (after moe_topk_sigmoid_batched)
+//   sort   moe_sort_by_expert -> moe_build_tile_worklist (after moe_topk_sigmoid_batched)
+//      vs  moe_sort_by_expert_scan -> moe_build_tile_worklist_scan
 //   norm   rms_norm_vanilla vs rms_norm_vanilla_regs (hidden 4096, 1536, 512;
 //          the odd 4095 at one row, the only odd shape either kernel can read)
 //
@@ -106,10 +107,11 @@ struct Arm {
 struct Route {
     Dev<unsigned int> ids;
     Dev<float> weights;
-    Dev<int> sorted_tok, sorted_exp, offsets, perm;
+    Dev<int> sorted_tok, sorted_exp, offsets, perm, total;
+    Dev<unsigned int> worklist;
     void alloc() {
         ids.alloc(MAXT * 8); weights.alloc(MAXT * 8); sorted_tok.alloc(MAXT * 8); sorted_exp.alloc(MAXT * 8);
-        offsets.alloc(289); perm.alloc(MAXT * 8);
+        offsets.alloc(289); perm.alloc(MAXT * 8); total.alloc(1); worklist.alloc(2 * MAXT * 8 * 4);
     }
 };
 
@@ -119,6 +121,7 @@ struct Inputs {
     Dev<int> perm, ids;
     Dev<unsigned short> logits, quant_in;
     Dev<float> bias;
+    Dev<unsigned long long> expert_ptrs;
     int copies;
 };
 
@@ -185,6 +188,9 @@ static void route(const Inputs& in, Route& r, unsigned T, int copy, bool fused) 
            r.weights.p, EXPERTS, TOPK, 1u, 2.5f);
     launch(f ? moe_sort_by_expert_scan : moe_sort_by_expert, dim3(1), 256, (const unsigned*)r.ids.p, r.sorted_tok.p,
            r.sorted_exp.p, r.offsets.p, r.perm.p, te, EXPERTS, TOPK);
+    // Serving's M16 grid (one N tile, M64) with every third expert remote.
+    launch(f ? moe_build_tile_worklist_scan : moe_build_tile_worklist, dim3(1), 256, (const int*)r.offsets.p,
+           (const unsigned long long*)in.expert_ptrs.p, r.worklist.p, r.total.p, EXPERTS, 1u + (copy % 2) * 3, 64u);
 }
 
 // RMS norm of T rows of width `h` (block min(h, 1024)) into the arm's normed buffer.
@@ -201,7 +207,10 @@ static bool route_same(const Route& a, const Route& b, unsigned T) {
     const unsigned te = T * TOPK;
     const auto ids = a.ids.get(), ids_b = b.ids.get();
     bool ok = memcmp(ids.data(), ids_b.data(), te * 4) == 0
-        && diff(a.weights, b.weights, te) == 0 && diff(a.offsets, b.offsets, EXPERTS + 1) == 0;
+        && diff(a.weights, b.weights, te) == 0 && diff(a.offsets, b.offsets, EXPERTS + 1) == 0
+        && diff(a.total, b.total, 1) == 0;
+    const int tiles = a.total.get()[0];
+    ok = ok && tiles >= 0 && tiles <= (int)a.worklist.n / 2 && diff(a.worklist, b.worklist, 2 * (size_t)tiles) == 0;
     for (const Route* r : {&a, &b}) {
         const auto tok = r->sorted_tok.get(), exp = r->sorted_exp.get(), perm = r->perm.get(), off = r->offsets.get();
         for (unsigned i = 0; i < te; i++) {
@@ -319,6 +328,9 @@ int main(int argc, char** argv) {
     in.logits.alloc(h_logits.size()); in.logits.put(h_logits);
     in.quant_in.alloc(h_qin.size()); in.quant_in.put(h_qin);
     in.bias.alloc(EXPERTS); in.bias.put(h_bias);
+    std::vector<unsigned long long> h_ptrs(EXPERTS);
+    for (unsigned e = 0; e < EXPERTS; e++) h_ptrs[e] = e % 3 == 2 ? 0 : 0x10000ull * (e + 1);
+    in.expert_ptrs.alloc(EXPERTS); in.expert_ptrs.put(h_ptrs);
     Route rt[2];
     for (auto& r : rt) r.alloc();
 
@@ -381,7 +393,7 @@ int main(int argc, char** argv) {
             CK(cudaDeviceSynchronize());
             const bool same = route_same(rt[0], rt[1], T);
             ok = ok && same;
-            printf("bitwise %-20s rows=%-2u set %d : %s\n", "moe topk+sort", T, set, same ? "same" : "FAIL");
+            printf("bitwise %-20s rows=%-2u set %d : %s\n", "moe sort+worklist", T, set, same ? "same" : "FAIL");
         }
     }
     in.bias.put(h_bias);
@@ -419,7 +431,7 @@ int main(int argc, char** argv) {
         printf("%-22s %4u %9.2f %9.2f %8.2f\n", "moe unpermute+blend", T, a, b, a - b);
         const double c = time_us(groups, reps, sink.p, [&](int i) { route(in, rt[0], T, i, false); });
         const double d = time_us(groups, reps, sink.p, [&](int i) { route(in, rt[1], T, i, true); });
-        printf("%-22s %4u %9.2f %9.2f %8.2f\n", "moe topk+sort", T, c, d, c - d);
+        printf("%-22s %4u %9.2f %9.2f %8.2f\n", "moe sort+worklist", T, c, d, c - d);
         const double e = time_us(groups, reps, sink.p, [&](int i) { norm(in, arm[0], T, H, i, false); });
         const double f = time_us(groups, reps, sink.p, [&](int i) { norm(in, arm[1], T, H, i, true); });
         printf("%-22s %4u %9.2f %9.2f %8.2f\n", "rms norm", T, e, f, e - f);
