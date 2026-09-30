@@ -5,9 +5,21 @@
 // The ranks' ids differ, but the allocator gives the block at logical index
 // `l` an id with `b % world == l % world`, so the ranks agree on owners.
 // Keep the two in step.
+//
+// The shard's attention entry points live here too, instantiated from the
+// bodies of the unsharded kernels' files, so that the modules a server loads
+// without the shard hold exactly the entry points they always did and this
+// one is loaded by the first sharded attention. GLM_KV_SHARD_MODULE drops
+// those files' own entry points; scripts/dev/glm_kv_shard_bench.cu, which
+// launches both kinds, includes them whole before this file.
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#ifndef GLM_KV_SHARD_BODIES_INCLUDED
+#define GLM_KV_SHARD_MODULE
+#include "glm_sparse_prefill_kv_reuse.cu"
+#include "glm_sparse_decode_split_merge.cu"
+#endif
 
 // Cache-write slot remap: global slot -> this rank's local slot, or -1 when
 // another rank owns the block (every GLM latent writer skips slot < 0).
@@ -139,4 +151,50 @@ extern "C" __global__ void glm_kv_shard_copy_blocks(
     for (unsigned int v = threadIdx.x; v < block_vecs; v += blockDim.x) {
         dst[d + v] = src[s + v];
     }
+}
+
+// Counted split variants (ATLAS_GLM_KV_SHARD_COMPACT=1): as `*_split`, over
+// each row's first `row_counts[row]` selected IDs.
+extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split_counted(
+    GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse,
+    const unsigned int* __restrict__ row_counts) {
+    (void)V_cache;
+    glm_kv_pad_body<false, true>(GLM_KV_PAD_FORWARD, part_o, part_lse, row_counts);
+}
+
+extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split_counted(
+    GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse,
+    const unsigned int* __restrict__ row_counts) {
+    (void)V_cache;
+    glm_kv_pad_body<true, true>(GLM_KV_PAD_FORWARD, part_o, part_lse, row_counts);
+}
+
+// FP32-output twin: the normalized merged partial and its LSE, for a second
+// exact LSE merge (ATLAS_GLM_KV_SHARD=1 combines both ranks' partials).
+extern "C" __global__ void glm_sparse_decode_split_merge_f32(const float* __restrict__ part_o,
+                                             const float* __restrict__ part_lse,
+                                             float* __restrict__ out_f32,
+                                             float* __restrict__ out_lse,
+                                             unsigned rows, unsigned heads,
+                                             unsigned dim, unsigned splits) {
+    if (rows == 0) return;
+    GLM_SPLIT_MERGE_SHARED;
+    glm_split_merge_body<float, false>(s_w, s_nempty, s_bad, part_o, part_lse, out_f32, out_lse,
+                                       rows, heads, dim, splits, nullptr);
+}
+
+// The BF16 merge over `splits` local partitions plus one more, `extra`
+// (FP32 output then LSE, the layout `_f32` writes), as partition `splits`:
+// ATLAS_GLM_KV_SHARD_COMPACT=1 merges the peer's partial where it landed.
+extern "C" __global__ void glm_sparse_decode_split_merge_extra(const float* __restrict__ part_o,
+                                             const float* __restrict__ part_lse,
+                                             __nv_bfloat16* __restrict__ out_bf16,
+                                             float* __restrict__ out_lse,
+                                             unsigned rows, unsigned heads,
+                                             unsigned dim, unsigned splits,
+                                             const float* __restrict__ extra) {
+    if (rows == 0) return;
+    GLM_SPLIT_MERGE_SHARED;
+    glm_split_merge_body<__nv_bfloat16, true>(s_w, s_nempty, s_bad, part_o, part_lse, out_bf16,
+                                              out_lse, rows, heads, dim, splits, extra);
 }

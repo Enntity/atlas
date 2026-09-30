@@ -342,6 +342,8 @@ pub(crate) fn launch_sparse_partials(
         (true, true) => "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split_counted",
         (false, true) => "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split_counted",
     };
+    // The counted entry points are the shard's (`glm_kv_shard.cu`).
+    let module = row_counts.map_or(module, |_| super::glm_kv_shard::MODULE);
     let kernel = gpu.op_cache().kernel(gpu, module, symbol)?;
     ensure!(kernel.0 != 0, "GLM sparse split kernel is unavailable");
     let launch = KernelLaunch::new(gpu, kernel)

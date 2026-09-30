@@ -424,6 +424,9 @@ __device__ __forceinline__ void glm_kv_pad_body(
     Q, K_cache, token_indices, O, block_table, rows, num_heads, head_dim, index_width, \
     cache_block_size, inv_sqrt_d
 
+// glm_kv_shard.cu includes this file for the body above and instantiates its
+// own entry points (the counted split); the ones below stay in this module.
+#ifndef GLM_KV_SHARD_MODULE
 extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad(GLM_KV_PAD_ARGS) {
     (void)V_cache;
     glm_kv_pad_body<false, false>(GLM_KV_PAD_FORWARD, nullptr, nullptr);
@@ -432,22 +435,6 @@ extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad(GLM_KV_P
 extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad(GLM_KV_PAD_ARGS) {
     (void)V_cache;
     glm_kv_pad_body<true, false>(GLM_KV_PAD_FORWARD, nullptr, nullptr);
-}
-
-// Counted split variants (ATLAS_GLM_KV_SHARD_COMPACT=1): as `*_split`, over
-// each row's first `row_counts[row]` selected IDs.
-extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split_counted(
-    GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse,
-    const unsigned int* __restrict__ row_counts) {
-    (void)V_cache;
-    glm_kv_pad_body<false, true>(GLM_KV_PAD_FORWARD, part_o, part_lse, row_counts);
-}
-
-extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split_counted(
-    GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse,
-    const unsigned int* __restrict__ row_counts) {
-    (void)V_cache;
-    glm_kv_pad_body<true, true>(GLM_KV_PAD_FORWARD, part_o, part_lse, row_counts);
 }
 
 // Split variants: grid (ceil(heads/32), rows, splits); O is unused.
@@ -465,3 +452,4 @@ extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split
 
 // Opt-in pipelined fp8_g128 variant (ATLAS_GLM_SPARSE_PREFILL_PIPE=1), bit-identical to the above.
 #include "glm_sparse_prefill_pipe.cuh"
+#endif  // GLM_KV_SHARD_MODULE

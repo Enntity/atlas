@@ -38,11 +38,17 @@ pub(crate) enum Op {
 #[derive(Default)]
 pub(crate) struct ShardGpu {
     inner: MockGpuBackend,
-    symbols: Mutex<Vec<String>>,
+    /// `(module, symbol)` of every kernel lookup; a handle is its index + 1.
+    symbols: Mutex<Vec<(String, String)>>,
     pub(crate) ops: Mutex<Vec<Op>>,
 }
 
 impl ShardGpu {
+    /// The module each looked-up symbol was asked of.
+    pub(crate) fn modules(&self) -> Vec<(String, String)> {
+        self.symbols.lock().unwrap().clone()
+    }
+
     pub(crate) fn ops(&self) -> Vec<Op> {
         self.ops.lock().unwrap().clone()
     }
@@ -104,9 +110,9 @@ impl GpuBackend for ShardGpu {
     fn default_stream(&self) -> u64 {
         0
     }
-    fn kernel(&self, _: &str, symbol: &str) -> Result<KernelHandle> {
+    fn kernel(&self, module: &str, symbol: &str) -> Result<KernelHandle> {
         let mut symbols = self.symbols.lock().unwrap();
-        symbols.push(symbol.to_owned());
+        symbols.push((module.to_owned(), symbol.to_owned()));
         Ok(KernelHandle(symbols.len() as u64))
     }
     fn op_cache(&self) -> &spark_runtime::op_cache::OpCache {
@@ -133,7 +139,9 @@ impl GpuBackend for ShardGpu {
         args: &[KernelArg<'_>],
     ) -> Result<()> {
         assert_eq!(block, [256, 1, 1]);
-        let symbol = self.symbols.lock().unwrap()[kernel.0 as usize - 1].clone();
+        let symbol = self.symbols.lock().unwrap()[kernel.0 as usize - 1]
+            .1
+            .clone();
         self.ops.lock().unwrap().push(Op::Launch {
             symbol,
             grid,

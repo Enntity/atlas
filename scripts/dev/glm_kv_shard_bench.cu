@@ -38,6 +38,7 @@
 // history twice (full + two halves), ~70 MB per 64K tokens.
 #include "glm_sparse_prefill_kv_reuse.cu"
 #include "glm_sparse_decode_split_merge.cu"
+#define GLM_KV_SHARD_BODIES_INCLUDED  // the unsharded entry points too
 #include "glm_kv_shard.cu"
 #include <algorithm>
 #include <chrono>

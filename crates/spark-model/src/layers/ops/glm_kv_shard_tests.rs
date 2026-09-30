@@ -2,7 +2,9 @@
 //! Launch ABI of the GLM KV shard kernels and of the counted / extra-partition
 //! attention entry points `ATLAS_GLM_KV_SHARD_COMPACT=1` uses.
 use super::*;
-use crate::layers::ops::{GlmSparsePrefillTc, launch_merge_extra, launch_sparse_partials};
+use crate::layers::ops::{
+    GlmSparsePrefillTc, launch_merge_extra, launch_merge_f32, launch_sparse_partials, merge_kernel,
+};
 use spark_runtime::kv_cache::KvCacheDtype;
 
 use shard_test_gpu::{Op, ShardGpu, ptr, word};
@@ -146,6 +148,60 @@ fn counted_partials_append_the_row_counts_to_the_split_abi() {
         assert_eq!(counted_args[..14], plain_args[..]);
         assert_eq!(counted_args[14..], [ptr(COUNTS)]);
     }
+}
+
+#[test]
+fn only_the_shards_entry_points_come_from_the_shard_module() {
+    // An unsharded server launches the plain split and the BF16 merge: their
+    // modules must stay the ones it always loaded, with nothing added.
+    let (c, gpu) = (config(), ShardGpu::default());
+    let p = |v: u64| DevicePtr(v);
+    let a = GlmSparsePrefillTc {
+        config: &c,
+        dtype: KvCacheDtype::Fp8G128,
+        identical_kv_latent: true,
+        query: p(0x100),
+        k_cache: p(0x200),
+        v_cache: p(0x200),
+        indices: p(0x300),
+        output: p(0x400),
+        block_table: p(0x500),
+        rows: 8,
+        heads: 32,
+        head_dim: 512,
+        index_width: 2051,
+        block_size: 16,
+        scale: 0.0625,
+    };
+    launch_sparse_partials(&gpu, &a, 6, None, p(0x600), p(0x700), 19).unwrap();
+    merge_kernel(&gpu).unwrap();
+    launch_sparse_partials(&gpu, &a, 6, Some(p(COUNTS)), p(0x600), p(0x700), 19).unwrap();
+    launch_merge_f32(&gpu, p(0x10), p(0x20), p(0x30), p(0x40), 8, 6, 19).unwrap();
+    launch_merge_extra(&gpu, p(0x10), p(0x20), p(0x30), p(0x40), 8, 6, p(0x50), 19).unwrap();
+    let modules = gpu.modules();
+    let modules: Vec<(&str, &str)> = modules
+        .iter()
+        .map(|(module, symbol)| (module.as_str(), symbol.as_str()))
+        .collect();
+    assert_eq!(
+        modules,
+        [
+            (
+                "glm_sparse_prefill_kv_reuse",
+                "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split"
+            ),
+            (
+                "glm_sparse_decode_split_merge",
+                "glm_sparse_decode_split_merge"
+            ),
+            (
+                MODULE,
+                "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split_counted"
+            ),
+            (MODULE, "glm_sparse_decode_split_merge_f32"),
+            (MODULE, "glm_sparse_decode_split_merge_extra"),
+        ]
+    );
 }
 
 #[test]

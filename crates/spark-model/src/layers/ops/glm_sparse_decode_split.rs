@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Fixed-S8 repaired K3 attention. Reuses dead per-pass expert scratch.
+use super::super::glm_kv_shard::MODULE as SHARD_MODULE;
 use super::*;
 use spark_runtime::gpu::KernelHandle;
 
@@ -198,11 +199,9 @@ pub(crate) fn launch_merge_f32(
     splits: u32,
     stream: u64,
 ) -> Result<()> {
-    let k = gpu.op_cache().kernel(
-        gpu,
-        "glm_sparse_decode_split_merge",
-        "glm_sparse_decode_split_merge_f32",
-    )?;
+    let k = gpu
+        .op_cache()
+        .kernel(gpu, SHARD_MODULE, "glm_sparse_decode_split_merge_f32")?;
     ensure!(k.0 != 0, "GLM FP32 split merge kernel unavailable");
     launch_merge(
         gpu,
@@ -233,11 +232,9 @@ pub(crate) fn launch_merge_extra(
     extra: DevicePtr,
     stream: u64,
 ) -> Result<()> {
-    let k = gpu.op_cache().kernel(
-        gpu,
-        "glm_sparse_decode_split_merge",
-        "glm_sparse_decode_split_merge_extra",
-    )?;
+    let k = gpu
+        .op_cache()
+        .kernel(gpu, SHARD_MODULE, "glm_sparse_decode_split_merge_extra")?;
     ensure!(
         k.0 != 0 && splits < 16 && extra.0 != 0,
         "GLM extra-partition split merge needs its kernel, a partial and at most 15 splits"

@@ -68,8 +68,12 @@ impl GpuBackend for TestGpu {
             return Ok(KernelHandle(match symbol {
                 "glm_kv_shard_map_slots" => 830,
                 "glm_kv_shard_localize" => 831,
-                _ => 832,
+                "glm_kv_shard_copy_blocks" => 832,
+                _ => 833,
             }));
+        }
+        if symbol == "glm_sparse_mla_prefill_fp8g128_head32_tc_pipe" {
+            return Ok(KernelHandle(841));
         }
         if module == "glm_sparse_prefill_kv_reuse"
             && symbol == "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad"

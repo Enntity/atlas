@@ -22,20 +22,21 @@ __device__ __forceinline__ void glm_split_merge_store(float* out, size_t i, floa
 //            float[rows, heads, dim] then float[rows, heads] LSEs. Compile-time,
 //            so that without it the body is the kernel it was factored from,
 //            access for access.
+// The entry point declares the shared state (GLM_SPLIT_MERGE_SHARED) and hands
+// it in, so its symbols are named after the entry point as they always were.
+#define GLM_SPLIT_MERGE_SHARED \
+    __shared__ float s_w[16]; \
+    __shared__ unsigned s_nempty; \
+    __shared__ float s_bad   /* nonfinite LSE flag */
 template <typename OutT, bool EXTRA>
-__device__ __forceinline__ void glm_split_merge_body(const float* __restrict__ part_o,
+__device__ __forceinline__ void glm_split_merge_body(float* s_w, unsigned& s_nempty, float& s_bad,
+                                                     const float* __restrict__ part_o,
                                                      const float* __restrict__ part_lse,
                                                      OutT* __restrict__ out_bf16,
                                                      float* __restrict__ out_lse,
                                                      unsigned rows, unsigned heads,
                                                      unsigned dim, unsigned local_splits,
                                                      const float* __restrict__ extra) {
-    // Init-only zero rows: uniform return before any pointer access.
-    if (rows == 0) return;
-    __shared__ float s_w[16];
-    __shared__ unsigned s_nempty;
-    __shared__ float s_bad;   // nonfinite LSE flag
-
     unsigned rh = blockIdx.x;                 // flattened row*heads + head
     unsigned row = rh / heads, head = rh % heads;
     size_t base_o = (size_t)row * heads * dim + (size_t)head * dim;
@@ -113,38 +114,19 @@ __device__ __forceinline__ void glm_split_merge_body(const float* __restrict__ p
     }
 }
 
+// glm_kv_shard.cu includes this file for the body above and instantiates the
+// FP32 and extra-partition merges; this module keeps the one it always had.
+#ifndef GLM_KV_SHARD_MODULE
 extern "C" __global__ void glm_sparse_decode_split_merge(const float* __restrict__ part_o,
                                              const float* __restrict__ part_lse,
                                              __nv_bfloat16* __restrict__ out_bf16,
                                              float* __restrict__ out_lse,
                                              unsigned rows, unsigned heads,
                                              unsigned dim, unsigned splits) {
-    glm_split_merge_body<__nv_bfloat16, false>(part_o, part_lse, out_bf16, out_lse,
-                                               rows, heads, dim, splits, nullptr);
+    // Init-only zero rows: uniform return before any pointer access.
+    if (rows == 0) return;
+    GLM_SPLIT_MERGE_SHARED;
+    glm_split_merge_body<__nv_bfloat16, false>(s_w, s_nempty, s_bad, part_o, part_lse, out_bf16,
+                                               out_lse, rows, heads, dim, splits, nullptr);
 }
-
-// FP32-output twin: the normalized merged partial and its LSE, for a second
-// exact LSE merge (ATLAS_GLM_KV_SHARD=1 combines both ranks' partials).
-extern "C" __global__ void glm_sparse_decode_split_merge_f32(const float* __restrict__ part_o,
-                                             const float* __restrict__ part_lse,
-                                             float* __restrict__ out_f32,
-                                             float* __restrict__ out_lse,
-                                             unsigned rows, unsigned heads,
-                                             unsigned dim, unsigned splits) {
-    glm_split_merge_body<float, false>(part_o, part_lse, out_f32, out_lse,
-                                       rows, heads, dim, splits, nullptr);
-}
-
-// The BF16 merge over `splits` local partitions plus one more, `extra`
-// (FP32 output then LSE, the layout `_f32` writes), as partition `splits`:
-// ATLAS_GLM_KV_SHARD_COMPACT=1 merges the peer's partial where it landed.
-extern "C" __global__ void glm_sparse_decode_split_merge_extra(const float* __restrict__ part_o,
-                                             const float* __restrict__ part_lse,
-                                             __nv_bfloat16* __restrict__ out_bf16,
-                                             float* __restrict__ out_lse,
-                                             unsigned rows, unsigned heads,
-                                             unsigned dim, unsigned splits,
-                                             const float* __restrict__ extra) {
-    glm_split_merge_body<__nv_bfloat16, true>(part_o, part_lse, out_bf16, out_lse,
-                                              rows, heads, dim, splits, extra);
-}
+#endif  // GLM_KV_SHARD_MODULE

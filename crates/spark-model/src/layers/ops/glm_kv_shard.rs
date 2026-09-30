@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Launchers for `glm_kv_shard.cu` (`ATLAS_GLM_KV_SHARD=1`): the device half
-//! of `spark_runtime::kv_cache::LatentShard`'s block-ownership rule.
+//! of `spark_runtime::kv_cache::LatentShard`'s block-ownership rule. The
+//! module's attention entry points (counted split, FP32 and extra-partition
+//! merges) are launched beside their unsharded twins in
+//! `glm_sparse_prefill_tc.rs` and `glm_sparse_decode_split.rs`.
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
-const MODULE: &str = "glm_kv_shard";
+/// The module of every kernel only a sharded cache launches: loaded by the
+/// first of them, so an unsharded server's modules are the ones it always
+/// loaded.
+pub(super) const MODULE: &str = "glm_kv_shard";
 /// `glm_kv_shard_localize_compact` packs a row in one CTA: 256 threads of
 /// `GLM_KV_SHARD_COMPACT_CHUNK` (16) IDs.
 const COMPACT_MAX_WIDTH: u32 = 256 * 16;
