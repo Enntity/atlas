@@ -364,6 +364,7 @@ int main(int argc, char** argv) {
         const std::vector<Proj>& p = mla[l];
         barrier();
         sp(50);
+        touch = touch && m <= 16;  // the flag leaves 17..32-row MLA q_a/kv_a alone
         tc(p[QA], touch, dA, dC[0], m);
         sp(2);  // q_a norm
         tc(p[KVA], touch, dA, dC[0], m);
