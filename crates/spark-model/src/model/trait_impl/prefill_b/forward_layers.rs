@@ -176,8 +176,7 @@ impl TransformerModel {
         let mut layer_times: Vec<u128> = Vec::new();
         // `ATLAS_GLM_PC_WRITE_FLOOR`: a recompute-all prefix hit keeps the
         // matched blocks too. The DFlash capture below takes the base value.
-        let layer_write_floor = super::pc_policy::layer_write_floor(
-            super::pc_policy::glm_pc_write_floor_enabled() && self.config.model_type == "glm5_next",
+        let layer_write_floor = self.pc_write_floor(
             layer_kv_write_start,
             seq.cached_prefix_tokens,
             effective_seq_len_start,
