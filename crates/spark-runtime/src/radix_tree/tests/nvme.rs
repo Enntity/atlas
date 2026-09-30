@@ -415,3 +415,30 @@ fn a_kept_record_below_the_resident_prefix_is_not_planned() {
     tree.complete_restore(&t, BS, 0, &plan, &[77], false);
     assert_eq!(tree.lookup(&t, BS, 0, 0).matched_blocks, vec![100, 101, 77]);
 }
+
+#[test]
+fn a_late_failure_report_never_drops_a_node_restored_from_that_record() {
+    // A multi-record run is reported failed as a whole although its leading
+    // records may be intact. If one of those was read back (it verified) and
+    // kept before the report arrives, the node is resident with the record.
+    let tree = keeping_tree(16);
+    let t = toks(0, 3);
+    let spill = spill_and_restore(&tree, &t, &[10, 20, 30], &[100, 101, 102]);
+    assert!(tree.spill_failed(&spill).is_empty(), "nothing handed back");
+    assert_eq!(
+        tree.lookup(&t, BS, 0, 0).matched_blocks,
+        vec![100, 101, 102],
+        "the restored chain is still served"
+    );
+    tree.release(&t, BS, 0);
+    let s = tree.nvme_stats();
+    assert_eq!((s.spill_failures, s.slots_used), (3, 3));
+    // Once evicted again (no write: the record is kept), the node is on disk
+    // ONLY — the same report then does drop it.
+    assert!(tree.evict(1).spill.is_empty());
+    let leaf = spill.iter().find(|o| o.block == 30).unwrap();
+    assert!(tree.spill_failed(&[*leaf]).is_empty());
+    assert_eq!(tree.nvme_stats().slots_used, 2);
+    assert_eq!(tree.plan_restore(&t, BS, 0).disk.len(), 0);
+    assert_eq!(tree.lookup(&t, BS, 0, 0).matched_blocks, vec![100, 101]);
+}

@@ -449,7 +449,14 @@ impl RadixTreeInner {
             // by the time this failure is reported — never drop that node.
             let owner = idx.owner.get(o.slot as usize).copied().unwrap_or(NO_OWNER);
             let same_spill = idx.tags.get(o.slot as usize) == Some(&o.tag);
-            if owner != NO_OWNER && same_spill && self.nodes[owner].nvme_slot == o.slot {
+            // On disk ONLY: a RESIDENT owner was restored from this very
+            // record since (kept records), which proves it verified — a run
+            // is reported failed as a whole, its leading records may be fine.
+            if owner != NO_OWNER
+                && same_spill
+                && self.nodes[owner].nvme_slot == o.slot
+                && self.is_on_disk(owner)
+            {
                 give_back.extend(self.drop_subtree(owner));
             }
         }
