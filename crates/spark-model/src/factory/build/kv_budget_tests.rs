@@ -399,15 +399,28 @@ fn nothing_left_is_zero_not_a_wraparound() {
 }
 
 #[test]
-fn measures_within_half_a_gib_do_not_disagree() {
-    for tracked in [102.2 - 0.4, 102.2 + 0.4] {
+fn measures_disagree_only_past_their_thresholds() {
+    // Tracked above the free-memory measure: half a GiB is the line.
+    assert_eq!(
+        size(&start(117.1, 14.9, driver(102.2 + 0.4))).disagreement(),
+        None
+    );
+    assert!(
+        size(&start(117.1, 14.9, driver(102.2 + 0.6)))
+            .disagreement()
+            .is_some()
+    );
+    // Tracked below it: the counters miss about 1.6 GiB on a quiet start, so
+    // only a gap past 2.5 GiB says something else allocated during the load.
+    for tracked in [102.2 - 0.6, 102.2 - 1.65, 102.2 - 2.4] {
         let got = size(&start(117.1, 14.9, driver(tracked)));
         assert_eq!(got.disagreement(), None, "{tracked}");
     }
-    for tracked in [102.2 - 0.6, 102.2 + 0.6] {
-        let got = size(&start(117.1, 14.9, driver(tracked)));
-        assert!(got.disagreement().is_some(), "{tracked}");
-    }
+    let got = size(&start(117.1, 14.9, driver(102.2 - 2.6)));
+    assert!(matches!(
+        got.disagreement(),
+        Some(Disagreement::TrackedBelow(_))
+    ));
     // Raw used includes co-tenants by design; a smaller tracked figure there
     // says nothing about either measure.
     let mut input = start(117.1, 14.9, driver(90.0));

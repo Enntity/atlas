@@ -78,10 +78,16 @@ fn an_over_large_manual_override_is_not_blamed_on_a_release() {
 
 #[test]
 fn only_driver_accounting_can_say_something_else_took_memory() {
-    // The delta is 1.5 GiB over tracked. By the driver that is news.
-    let by_driver = warns(&start(117.5, 15.8, driver(100.2)));
+    // The delta is 3 GiB over tracked: more than the counters miss on a
+    // quiet start. By the driver that is news.
+    let by_driver = warns(&start(119.0, 15.8, driver(100.2)));
     assert_eq!(by_driver.len(), 1, "{by_driver:?}");
-    assert!(by_driver[0].contains("1.50 GB was taken by something else"));
+    assert!(by_driver[0].contains("3.00 GB was taken by something else"));
+    // The 1.5 GiB a quiet start shows is not.
+    assert_eq!(
+        warns(&start(117.5, 15.8, driver(100.2))),
+        Vec::<String>::new()
+    );
 
     // By the ledger it is expected on every start: one WARN says the check
     // is weak, and nothing claims a co-tenant took memory.
