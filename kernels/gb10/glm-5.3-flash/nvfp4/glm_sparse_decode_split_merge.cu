@@ -18,16 +18,18 @@ __device__ __forceinline__ void glm_split_merge_store(float* out, size_t i, floa
 // part_lse : float[splits, rows, heads] natural-logsumexp (-INFINITY == empty partition)
 // out      : OutT[rows, heads, dim] (BF16, or FP32 for a further exact merge)
 // out_lse  : float[rows, heads]
-// extra    : null, or one more partition (index `splits`) held elsewhere:
-//            float[rows, heads, dim] then float[rows, heads] LSEs
-template <typename OutT>
+// EXTRA    : one more partition (index `local_splits`) held at `extra`:
+//            float[rows, heads, dim] then float[rows, heads] LSEs. Compile-time,
+//            so that without it the body is the kernel it was factored from,
+//            access for access.
+template <typename OutT, bool EXTRA>
 __device__ __forceinline__ void glm_split_merge_body(const float* __restrict__ part_o,
                                                      const float* __restrict__ part_lse,
                                                      OutT* __restrict__ out_bf16,
                                                      float* __restrict__ out_lse,
                                                      unsigned rows, unsigned heads,
                                                      unsigned dim, unsigned local_splits,
-                                                     const float* __restrict__ extra = nullptr) {
+                                                     const float* __restrict__ extra) {
     // Init-only zero rows: uniform return before any pointer access.
     if (rows == 0) return;
     __shared__ float s_w[16];
@@ -38,14 +40,19 @@ __device__ __forceinline__ void glm_split_merge_body(const float* __restrict__ p
     unsigned row = rh / heads, head = rh % heads;
     size_t base_o = (size_t)row * heads * dim + (size_t)head * dim;
     size_t stride_o = (size_t)rows * heads * dim;
-    const unsigned splits = local_splits + (extra != nullptr ? 1u : 0u);
-    // Partition `s`'s LSE and output base for this (row, head).
+    const unsigned splits = local_splits + (EXTRA ? 1u : 0u);
+    // Partition `s`'s LSE and element `d` of its output for this (row, head).
     auto lse_of = [&](unsigned s) {
-        return s < local_splits ? part_lse[(size_t)s * rows * heads + rh]
-                                : extra[stride_o + rh];
+        if constexpr (EXTRA) {
+            if (s >= local_splits) return extra[stride_o + rh];
+        }
+        return part_lse[(size_t)s * rows * heads + rh];
     };
-    auto o_of = [&](unsigned s) {
-        return s < local_splits ? part_o + (size_t)s * stride_o + base_o : extra + base_o;
+    auto o_of = [&](unsigned s, unsigned d) {
+        if constexpr (EXTRA) {
+            if (s >= local_splits) return extra[base_o + d];
+        }
+        return part_o[(size_t)s * stride_o + base_o + d];
     };
 
     if (threadIdx.x == 0) {
@@ -93,13 +100,13 @@ __device__ __forceinline__ void glm_split_merge_body(const float* __restrict__ p
             // weight is 1.0; copy active partition's normalized FP32 output
             unsigned s = 0;
             while (s < splits && lse_of(s) == -INFINITY) ++s;
-            acc = o_of(s)[d];
+            acc = o_of(s, d);
         } else {
             acc = 0.0f;
             for (unsigned s = 0; s < splits; ++s) {
                 if (s_w[s] == 0.0f && lse_of(s) == -INFINITY)
                     continue;
-                acc += s_w[s] * o_of(s)[d];
+                acc += s_w[s] * o_of(s, d);
             }
         }
         glm_split_merge_store(out_bf16, (size_t)row * heads * dim + (size_t)head * dim + d, acc);
@@ -112,7 +119,8 @@ extern "C" __global__ void glm_sparse_decode_split_merge(const float* __restrict
                                              float* __restrict__ out_lse,
                                              unsigned rows, unsigned heads,
                                              unsigned dim, unsigned splits) {
-    glm_split_merge_body(part_o, part_lse, out_bf16, out_lse, rows, heads, dim, splits);
+    glm_split_merge_body<__nv_bfloat16, false>(part_o, part_lse, out_bf16, out_lse,
+                                               rows, heads, dim, splits, nullptr);
 }
 
 // FP32-output twin: the normalized merged partial and its LSE, for a second
@@ -123,7 +131,8 @@ extern "C" __global__ void glm_sparse_decode_split_merge_f32(const float* __rest
                                              float* __restrict__ out_lse,
                                              unsigned rows, unsigned heads,
                                              unsigned dim, unsigned splits) {
-    glm_split_merge_body(part_o, part_lse, out_f32, out_lse, rows, heads, dim, splits);
+    glm_split_merge_body<float, false>(part_o, part_lse, out_f32, out_lse,
+                                       rows, heads, dim, splits, nullptr);
 }
 
 // The BF16 merge over `splits` local partitions plus one more, `extra`
@@ -136,5 +145,6 @@ extern "C" __global__ void glm_sparse_decode_split_merge_extra(const float* __re
                                              unsigned rows, unsigned heads,
                                              unsigned dim, unsigned splits,
                                              const float* __restrict__ extra) {
-    glm_split_merge_body(part_o, part_lse, out_bf16, out_lse, rows, heads, dim, splits, extra);
+    glm_split_merge_body<__nv_bfloat16, true>(part_o, part_lse, out_bf16, out_lse,
+                                              rows, heads, dim, splits, extra);
 }
