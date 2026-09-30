@@ -106,7 +106,8 @@ impl Config {
                 .clamp(MIN_MAX, MAX_LIMIT)
                 .next_multiple_of(64),
             stripe_min: num("ATLAS_RDMA_ONESHOT_STRIPE_MIN", SPLIT_MIN),
-            timeout_ns: num("ATLAS_RDMA_ONESHOT_TIMEOUT_MS", 30_000) as u64 * 1_000_000,
+            timeout_ns: (num("ATLAS_RDMA_ONESHOT_TIMEOUT_MS", 30_000) as u64)
+                .saturating_mul(1_000_000),
             stage_fence: var("ATLAS_RDMA_ONESHOT_STAGE_FENCE").as_deref() == Some("1"),
         })
     }
