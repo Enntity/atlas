@@ -253,7 +253,9 @@ pub use gemm_quant::*;
 pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
-pub use gemv_touch::{GemvTouch, gemv_touch, gemv_touch_resolve, w4a16_verify_touch};
+pub use gemv_touch::{
+    GemvTouch, gemv_touch, gemv_touch_resolve, mxfp8_tc_twin, w4a16_tc_twin, w4a16_verify_touch,
+};
 pub use glm_hc_prefill::*;
 pub use glm_indexer::*;
 pub use glm_indexer_dynamic::*;

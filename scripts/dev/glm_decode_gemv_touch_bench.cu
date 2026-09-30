@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Standalone A/B of the GLM verify-step NVFP4 / MXFP8 GEMVs with and without
 // the pre-wait weight touch (ATLAS_GLM_DECODE_GEMV_BATCH=1):
-//   w4a16_gemv_tc8 / _tc8_ld          vs  w4a16_gemv_tc8_touch
-//   mxfp8_gemv_tc8                    vs  mxfp8_gemv_tc8_touch
+//   w4a16_gemv_tc{8,16,32} / _ld      vs  w4a16_gemv_tc{8,16,32}_touch
+//   mxfp8_gemv_tc{8,16,32}            vs  mxfp8_gemv_tc{8,16,32}_touch
 //   w4a16_gemv_batch2 / _batch3       vs  w4a16_gemv_batch3_touch
 //   w4a16_gemv_batch5_qkv             vs  w4a16_gemv_batch5_qkv_touch
 //
 // 1. Bitwise: every output of every projection shape of a KDA layer (q/k/v/o
 //    4096x4096, shared gate/up 1024x4096, the K-slice shared down 4096x1024)
 //    and of an MLA layer (q_a 1536x4096, kv_a 512x4096, q_b 8192x1536,
-//    o 4096x8192), rows M = 1..8, three touch geometries. Must print
+//    o 4096x8192), rows M = 1..32 (tc8/16/32 tiers), three touch geometries. Must print
 //    "bitwise: 0 of N outputs differ".
 // 2. Roofline: each shape alone, back to back, cold weights: us and GB/s.
 // 3. Layer time: one emulated layer = its GEMVs in production order and launch
@@ -100,20 +100,31 @@ static unsigned int touch_rows(const Proj& p) {
     return (unsigned int)std::min<unsigned long long>(p.n, g_touch_bytes / row);
 }
 
-// The tensor-core tier (production at 4..8 rows; the shared expert and MLA at every row count).
+// The tensor-core tier for `m` rows (tc8 / tc16 / tc32; production takes it
+// at 4..32 rows for KDA, at every row count for the shared expert and MLA).
+// Production launches tc8 with PDL and tc16 / tc32 without; the twins all use it.
 static void tc(const Proj& p, bool touch, const bf* a, bf* c, unsigned int m) {
     const unsigned int grid = (p.n + 15) / 16;
     const unsigned int ctas = std::min(grid, g_touch_ctas);
+    const int tier = m <= 8 ? 0 : (m <= 16 ? 1 : 2);
     if (p.mx) {
-        if (touch) launch(true, mxfp8_gemv_tc8_touch, dim3(grid), 256u, a, (const u8*)p.w, (const u8*)p.s, c, m, p.n, p.k, p.n, touch_rows(p), ctas);
-        else launch(true, mxfp8_gemv_tc8, dim3(grid), 256u, a, (const u8*)p.w, (const u8*)p.s, c, m, p.n, p.k, p.n);
-    } else if (touch) {
-        launch(true, w4a16_gemv_tc8_touch, dim3(grid), 256u, a, (const u8*)p.w, (const u8*)p.s, SCALE2, c, m, p.n, p.k, p.ldw, p.lds, touch_rows(p), ctas);
-    } else if (p.ldw == p.k / 2) {
-        launch(true, w4a16_gemv_tc8, dim3(grid), 256u, a, (const u8*)p.w, (const u8*)p.s, SCALE2, c, m, p.n, p.k);
-    } else {
-        launch(true, w4a16_gemv_tc8_ld, dim3(grid), 256u, a, (const u8*)p.w, (const u8*)p.s, SCALE2, c, m, p.n, p.k, p.ldw, p.lds);
+        typedef void (*Mx)(const bf*, const u8*, const u8*, bf*, unsigned, unsigned, unsigned, unsigned);
+        typedef void (*MxT)(const bf*, const u8*, const u8*, bf*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned);
+        const Mx base[3] = {mxfp8_gemv_tc8, mxfp8_gemv_tc16, mxfp8_gemv_tc32};
+        const MxT twin[3] = {mxfp8_gemv_tc8_touch, mxfp8_gemv_tc16_touch, mxfp8_gemv_tc32_touch};
+        if (touch) launch(true, twin[tier], dim3(grid), 256u, a, (const u8*)p.w, (const u8*)p.s, c, m, p.n, p.k, p.n, touch_rows(p), ctas);
+        else launch(tier == 0, base[tier], dim3(grid), 256u, a, (const u8*)p.w, (const u8*)p.s, c, m, p.n, p.k, p.n);
+        return;
     }
+    typedef void (*W4)(const bf*, const u8*, const u8*, float, bf*, unsigned, unsigned, unsigned);
+    typedef void (*W4Ld)(const bf*, const u8*, const u8*, float, bf*, unsigned, unsigned, unsigned, unsigned, unsigned);
+    typedef void (*W4T)(const bf*, const u8*, const u8*, float, bf*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned);
+    const W4 base[3] = {w4a16_gemv_tc8, w4a16_gemv_tc16, w4a16_gemv_tc32};
+    const W4Ld base_ld[3] = {w4a16_gemv_tc8_ld, w4a16_gemv_tc16_ld, w4a16_gemv_tc32_ld};
+    const W4T twin[3] = {w4a16_gemv_tc8_touch, w4a16_gemv_tc16_touch, w4a16_gemv_tc32_touch};
+    if (touch) launch(true, twin[tier], dim3(grid), 256u, a, (const u8*)p.w, (const u8*)p.s, SCALE2, c, m, p.n, p.k, p.ldw, p.lds, touch_rows(p), ctas);
+    else if (p.ldw == p.k / 2) launch(tier == 0, base[tier], dim3(grid), 256u, a, (const u8*)p.w, (const u8*)p.s, SCALE2, c, m, p.n, p.k);
+    else launch(tier == 0, base_ld[tier], dim3(grid), 256u, a, (const u8*)p.w, (const u8*)p.s, SCALE2, c, m, p.n, p.k, p.ldw, p.lds);
 }
 
 // The scalar tier production uses for a KDA projection at 2 or 3 rows.
@@ -156,7 +167,7 @@ int main(int argc, char** argv) {
     const int reps = argc > 2 ? atoi(argv[2]) : 9;
     if (argc > 3) g_touch_bytes = (unsigned long long)atoi(argv[3]) << 20;
     if (argc > 4) g_touch_ctas = (unsigned int)atoi(argv[4]);
-    const unsigned int H = 4096, KMAX = 8192, NMAX = 3 * 4096, MAXM = 8;
+    const unsigned int H = 4096, KMAX = 8192, NMAX = 3 * 4096, MAXM = 32;
 
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -208,7 +219,7 @@ int main(int argc, char** argv) {
     const unsigned int geo_ctas[3] = {saved_ctas, 7, 100000};
     for (int geo = 0; geo < 3; geo++) {
         g_touch_bytes = geo_bytes[geo]; g_touch_ctas = geo_ctas[geo];
-        for (unsigned int m = 1; m <= MAXM; m++) {
+        for (unsigned int m : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 12u, 16u, 17u, 25u, 32u}) {
             for (int fam = 0; fam < 2; fam++)
                 for (const Proj& p : fam ? mla[m % mla_layers] : kda[m % layers])
                     compare((size_t)m * p.n, [&](int v) { tc(p, v == 1, dA, dC[v], m); });
@@ -363,7 +374,7 @@ int main(int argc, char** argv) {
     };
     printf("us per emulated layer (lower decile, %d reps); touch %llu MiB by %u CTAs\n",
            reps, g_touch_bytes >> 20, g_touch_ctas);
-    for (unsigned int m : {3u, 5u, 8u}) {
+    for (unsigned int m : {3u, 5u, 8u, 16u, 32u}) {
         const float kb = time_us(layers, [&](int l) { kda_layer(l, m, false); });
         const float kt = time_us(layers, [&](int l) { kda_layer(l, m, true); });
         const float mb = time_us(mla_layers, [&](int l) { mla_layer(l, m, false); });

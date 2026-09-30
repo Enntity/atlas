@@ -62,7 +62,7 @@ fn tc8_twin_passes_the_strided_abi_with_the_touch_geometry() {
     // Shared down: this rank's 1024-column slice of a 2048-wide weight.
     let gpu = recording::Gpu::new();
     TOUCH
-        .w4a16_tc8(
+        .w4a16_tc(
             &gpu,
             DevicePtr(0x100),
             &weight(0x200),
@@ -94,7 +94,7 @@ fn tc8_twin_rejects_rows_and_strides_the_kernel_cannot_serve() {
     let gpu = recording::Gpu::new();
     let w = weight(0x200);
     let call = |m, k, ld_half, ld_groups| {
-        TOUCH.w4a16_tc8(
+        TOUCH.w4a16_tc(
             &gpu,
             DevicePtr(0x100),
             &w,
@@ -107,12 +107,36 @@ fn tc8_twin_rejects_rows_and_strides_the_kernel_cannot_serve() {
             0,
         )
     };
-    assert!(call(9, 4096, 2048, 256).is_err());
+    assert!(call(33, 4096, 2048, 256).is_err());
     assert!(call(0, 4096, 2048, 256).is_err());
     assert!(call(8, 4104, 2052, 256).is_err());
     assert!(call(8, 4096, 2047, 256).is_err());
     assert!(call(8, 4096, 2048, 255).is_err());
     assert!(gpu.trace().is_empty());
+}
+
+#[test]
+fn twins_follow_the_tier_row_counts() {
+    assert_eq!(w4a16_tc_twin(8), Some("w4a16_gemv_tc8_touch"));
+    assert_eq!(w4a16_tc_twin(16), Some("w4a16_gemv_tc16_touch"));
+    assert_eq!(w4a16_tc_twin(32), Some("w4a16_gemv_tc32_touch"));
+    assert_eq!(w4a16_tc_twin(5), None);
+    for (m, twin) in [
+        (1, "tc8"),
+        (8, "tc8"),
+        (9, "tc16"),
+        (16, "tc16"),
+        (17, "tc32"),
+        (32, "tc32"),
+    ] {
+        assert_eq!(mxfp8_tc_twin(m), format!("mxfp8_gemv_{twin}_touch"));
+    }
+    // Every twin a site can name is one the resolver looks up.
+    let names: Vec<_> = TWINS.iter().map(|&(_, f)| f).collect();
+    for rows in [8, 16, 32] {
+        assert!(names.contains(&w4a16_tc_twin(rows).unwrap()));
+        assert!(names.contains(&mxfp8_tc_twin(rows)));
+    }
 }
 
 #[test]
@@ -161,7 +185,7 @@ fn mxfp8_twin_passes_the_abi_with_the_touch_geometry() {
     // MLA kv_a: 512 x 4096, a 32-CTA grid.
     let gpu = recording::Gpu::new();
     TOUCH
-        .mxfp8_tc8(
+        .mxfp8_tc(
             &gpu,
             DevicePtr(0x100),
             DevicePtr(0x200),

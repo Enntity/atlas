@@ -2187,4 +2187,30 @@ w4a16_gemv_tc32_ld(
 ) {
     w4a16_gemv_tcn_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
 }
+
+// Touch twins of the 16/32-row tiers (see `w4a16_gemv_tc8_touch`); like the
+// tc8 twin they take explicit row strides and are launched with PDL.
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc16_touch(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ld_half, unsigned int ld_groups, unsigned int touch_rows, unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch({B_packed, K / 2u, ld_half}, {B_scale, K / GROUP_SIZE, ld_groups},
+                          touch_rows, blockIdx.x, touch_ctas);
+    w4a16_gemv_tcn_impl<2>(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
+}
+
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc32_touch(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ld_half, unsigned int ld_groups, unsigned int touch_rows, unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch({B_packed, K / 2u, ld_half}, {B_scale, K / GROUP_SIZE, ld_groups},
+                          touch_rows, blockIdx.x, touch_ctas);
+    w4a16_gemv_tcn_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
+}
 #endif

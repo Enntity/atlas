@@ -58,14 +58,13 @@ impl Qwen3AttentionLayer {
         {
             // ATLAS_GLM_DECODE_GEMV_BATCH: q_a and kv_a wait on the HC / norm
             // chain with the bus idle; their twin touches the weight meanwhile.
-            if m <= 8
-                && self
-                    .mla
-                    .as_ref()
-                    .is_some_and(|mla| [mla.wq_a.weight, mla.wkv_a.weight].contains(&weight.weight))
-                && let Some(touch) = ops::gemv_touch(ctx.gpu, "mxfp8_gemv_tc8_touch")
+            if self
+                .mla
+                .as_ref()
+                .is_some_and(|mla| [mla.wq_a.weight, mla.wkv_a.weight].contains(&weight.weight))
+                && let Some(touch) = ops::gemv_touch(ctx.gpu, ops::mxfp8_tc_twin(m))
             {
-                return touch.mxfp8_tc8(
+                return touch.mxfp8_tc(
                     ctx.gpu, input, mx.data, mx.scales, output, m, n, k, n, stream,
                 );
             }

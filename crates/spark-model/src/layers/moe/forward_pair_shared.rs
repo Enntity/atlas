@@ -134,13 +134,13 @@ impl MoeLayer {
         let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(rows);
         // ATLAS_GLM_DECODE_GEMV_BATCH: the tc8 bodies behind a weight touch
         // that fills the PDL wait (`ops::gemv_touch`).
-        let touch = (rows <= 8)
-            .then(|| ops::gemv_touch(ctx.gpu, "w4a16_gemv_tc8_touch"))
-            .flatten();
+        let touch = crate::layers::w4a16_gemv_tiers::tc_rows(tc)
+            .and_then(ops::w4a16_tc_twin)
+            .and_then(|twin| ops::gemv_touch(ctx.gpu, twin));
         for (weight, out) in [(&shared.gate_proj, gate_out), (&shared.up_proj, up_out)] {
             let weight = gate_up_rows(weight);
             match touch {
-                Some(touch) => touch.w4a16_tc8(
+                Some(touch) => touch.w4a16_tc(
                     ctx.gpu,
                     input,
                     &weight,
@@ -168,7 +168,7 @@ impl MoeLayer {
         )?;
         let (ld_half, ld_groups) = (inter / 2, inter / 16);
         if let Some(touch) = touch {
-            return touch.w4a16_tc8(
+            return touch.w4a16_tc(
                 ctx.gpu, gate_out, &down_cols, down_out, rows, h, half, ld_half, ld_groups, stream,
             );
         }

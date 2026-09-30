@@ -24,12 +24,35 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use crate::weight_map::QuantizedWeight;
 
 /// `(module, function)` of every touch twin.
-const TWINS: [(&str, &str); 4] = [
+const TWINS: [(&str, &str); 8] = [
     ("w4a16_gemv", "w4a16_gemv_tc8_touch"),
+    ("w4a16_gemv", "w4a16_gemv_tc16_touch"),
+    ("w4a16_gemv", "w4a16_gemv_tc32_touch"),
     ("w4a16_gemv", "w4a16_gemv_batch3_touch"),
     ("w4a16_gemv", "w4a16_gemv_batch5_qkv_touch"),
     ("mxfp8_gemv", "mxfp8_gemv_tc8_touch"),
+    ("mxfp8_gemv", "mxfp8_gemv_tc16_touch"),
+    ("mxfp8_gemv", "mxfp8_gemv_tc32_touch"),
 ];
+
+/// The touch twin of the NVFP4 tensor-core tier of `rows` (8, 16 or 32) rows.
+pub fn w4a16_tc_twin(rows: u32) -> Option<&'static str> {
+    match rows {
+        8 => Some("w4a16_gemv_tc8_touch"),
+        16 => Some("w4a16_gemv_tc16_touch"),
+        32 => Some("w4a16_gemv_tc32_touch"),
+        _ => None,
+    }
+}
+
+/// The touch twin of the MXFP8 tier serving `m` (1..=32) rows.
+pub fn mxfp8_tc_twin(m: u32) -> &'static str {
+    match m {
+        0..=8 => "mxfp8_gemv_tc8_touch",
+        9..=16 => "mxfp8_gemv_tc16_touch",
+        _ => "mxfp8_gemv_tc32_touch",
+    }
+}
 
 /// Read once: the flag, and the touch geometry `(bytes, ctas)`.
 ///
@@ -98,11 +121,12 @@ impl GemvTouch {
         (rows, self.ctas.min(grid_x))
     }
 
-    /// `w4a16_gemv_tc8` / `w4a16_gemv_tc8_ld` through their touch twin
-    /// (`w4a16_gemv_tc8_touch`): `weight` rows are `ld_half` packed bytes and
-    /// `ld_groups` scale bytes apart (`k / 2` and `k / 16` for a whole weight).
+    /// A `w4a16_gemv_tc{8,16,32}` (or `_ld`) launch through its touch twin
+    /// ([`w4a16_tc_twin`], at least `m` rows): `weight` rows are `ld_half`
+    /// packed bytes and `ld_groups` scale bytes apart (`k / 2` and `k / 16`
+    /// for a whole weight).
     #[allow(clippy::too_many_arguments)]
-    pub fn w4a16_tc8(
+    pub fn w4a16_tc(
         &self,
         gpu: &dyn GpuBackend,
         input: DevicePtr,
@@ -116,7 +140,10 @@ impl GemvTouch {
         stream: u64,
     ) -> Result<()> {
         ensure!(
-            (1..=8).contains(&m) && k.is_multiple_of(16) && ld_half >= k / 2 && ld_groups >= k / 16,
+            (1..=32).contains(&m)
+                && k.is_multiple_of(16)
+                && ld_half >= k / 2
+                && ld_groups >= k / 16,
             "w4a16 tensor-core touch GEMV: m={m} k={k} ld={ld_half}/{ld_groups}"
         );
         let grid = div_ceil(n, 16);
@@ -175,9 +202,10 @@ impl GemvTouch {
             .launch(stream)
     }
 
-    /// `mxfp8_gemv_tc8` through its touch twin (`mxfp8_gemv_tc8_touch`).
+    /// A `mxfp8_gemv_tc{8,16,32}` launch through its touch twin
+    /// ([`mxfp8_tc_twin`] of `m`).
     #[allow(clippy::too_many_arguments)]
-    pub fn mxfp8_tc8(
+    pub fn mxfp8_tc(
         &self,
         gpu: &dyn GpuBackend,
         input: DevicePtr,
@@ -191,7 +219,7 @@ impl GemvTouch {
         stream: u64,
     ) -> Result<()> {
         ensure!(
-            (1..=8).contains(&m) && k.is_multiple_of(32),
+            (1..=32).contains(&m) && k.is_multiple_of(32),
             "mxfp8 touch GEMV: m={m} k={k} unsupported"
         );
         let grid = div_ceil(n, 16);
@@ -219,9 +247,9 @@ impl GemvTouch {
     }
 }
 
-/// The touch twin of the NVFP4 verify tier for `m` (2..=8) rows, launched in
-/// its place: `w4a16_gemv_batch2/3` below four rows, else `tier` when it is
-/// `w4a16_gemv_tc8`. None when there is no twin to take (flag off, another
+/// The touch twin of the NVFP4 verify tier for `m` (2..=32) rows, launched
+/// in its place: `w4a16_gemv_batch2/3` below four rows, else `tier` when it is
+/// a tensor-core tier. None when there is no twin to take (flag off, another
 /// tier, a target without it): the caller launches the tier itself.
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16_verify_touch(
@@ -239,11 +267,9 @@ pub fn w4a16_verify_touch(
         let touch = gemv_touch(gpu, "w4a16_gemv_batch3_touch")?;
         return Some(touch.w4a16_batch3(gpu, input, weight, output, m, n, k, stream));
     }
-    if crate::layers::w4a16_gemv_tiers::tc_rows(tier) != Some(8) {
-        return None;
-    }
-    let touch = gemv_touch(gpu, "w4a16_gemv_tc8_touch")?;
-    Some(touch.w4a16_tc8(gpu, input, weight, output, m, n, k, k / 2, k / 16, stream))
+    let rows = crate::layers::w4a16_gemv_tiers::tc_rows(tier)?;
+    let touch = gemv_touch(gpu, w4a16_tc_twin(rows)?)?;
+    Some(touch.w4a16_tc(gpu, input, weight, output, m, n, k, k / 2, k / 16, stream))
 }
 
 #[cfg(test)]
