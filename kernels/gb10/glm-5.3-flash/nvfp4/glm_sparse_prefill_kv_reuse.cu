@@ -434,19 +434,6 @@ extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad(GLM_K
     glm_kv_pad_body<true, false>(GLM_KV_PAD_FORWARD, nullptr, nullptr);
 }
 
-// Split variants: grid (ceil(heads/32), rows, splits); O is unused.
-extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split(
-    GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse) {
-    (void)V_cache;
-    glm_kv_pad_body<false, true>(GLM_KV_PAD_FORWARD, part_o, part_lse);
-}
-
-extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split(
-    GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse) {
-    (void)V_cache;
-    glm_kv_pad_body<true, true>(GLM_KV_PAD_FORWARD, part_o, part_lse);
-}
-
 // Counted split variants (ATLAS_GLM_KV_SHARD_COMPACT=1): as `*_split`, over
 // each row's first `row_counts[row]` selected IDs.
 extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split_counted(
@@ -461,4 +448,17 @@ extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split
     const unsigned int* __restrict__ row_counts) {
     (void)V_cache;
     glm_kv_pad_body<true, true>(GLM_KV_PAD_FORWARD, part_o, part_lse, row_counts);
+}
+
+// Split variants: grid (ceil(heads/32), rows, splits); O is unused.
+extern "C" __global__ void glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split(
+    GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse) {
+    (void)V_cache;
+    glm_kv_pad_body<false, true>(GLM_KV_PAD_FORWARD, part_o, part_lse);
+}
+
+extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split(
+    GLM_KV_PAD_ARGS, float* __restrict__ part_o, float* __restrict__ part_lse) {
+    (void)V_cache;
+    glm_kv_pad_body<true, true>(GLM_KV_PAD_FORWARD, part_o, part_lse);
 }
