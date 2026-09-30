@@ -2,10 +2,11 @@
 // Standalone check of the ATLAS_GLM_INDEX_SPLIT row split: the production
 // prefill selector (glm_index_logits_bf16_wmma_row8_pool32, or the scalar
 // row8 scorer, then glm_index_topk_expand) over every row of one piece,
-// versus each TP rank selecting only its zigzag quarters (rank 0: Q0+Q3,
-// rank 1: Q1+Q2) and the quarters merged as the pair exchange would. Reports
-// the bitwise logits / token-id comparison and ms per rank. Random BF16
-// pooled keys in a shuffled 16-token block table, random queries/weights.
+// versus each TP rank selecting only its rows as the Rust split does (rank 0:
+// Q0 and Q3 through the 0-3 tail rows; rank 1: Q1+Q2 then the tail rows) and
+// then receiving the peer's quarters as the pair exchange would. Reports the
+// bitwise logits / token-id comparison (both ranks) and ms per rank. Random
+// BF16 pooled keys in a shuffled 16-token block table, random queries/weights.
 //
 //   nvcc -arch=sm_121a -O3 -I kernels/gb10/glm-5.3-flash/nvfp4 \
 //        scripts/dev/glm_index_split_bench.cu -o split_bench
@@ -68,7 +69,6 @@ int main(int argc, char** argv) {
     const unsigned seq_start = argc > 2 ? atoi(argv[2]) : 57344;
     const int iters = argc > 3 ? atoi(argv[3]) : 5;
     const bool wmma = argc > 4 ? atoi(argv[4]) != 0 : true;
-    if (rows % 4) { fprintf(stderr, "rows must be a multiple of 4\n"); return 1; }
     const unsigned bs = 16, tokens = seq_start + rows, stride = (tokens + 3) / 4;
     const unsigned blocks = (tokens + bs - 1) / bs;
     const unsigned long long block_bytes = (bs / 4) * 128 * 2;
@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
 
     void *d_cache, *d_q, *d_w, *d_table;
     float *d_logits_rep, *d_logits_split;
-    int *d_rep, *d_rank[2], *d_merged;
+    int *d_rep, *d_rank[2];
     const size_t out_n = (size_t)rows * 2051, logit_n = (size_t)rows * stride;
     CK(cudaMalloc(&d_cache, cache.size() * 2));
     CK(cudaMalloc(&d_q, q.size() * 2));
@@ -99,7 +99,6 @@ int main(int argc, char** argv) {
     CK(cudaMalloc(&d_rep, out_n * 4));
     CK(cudaMalloc(&d_rank[0], out_n * 4));
     CK(cudaMalloc(&d_rank[1], out_n * 4));
-    CK(cudaMalloc(&d_merged, out_n * 4));
     CK(cudaMemcpy(d_cache, cache.data(), cache.size() * 2, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_q, q.data(), q.size() * 2, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_w, w.data(), w.size() * 2, cudaMemcpyHostToDevice));
@@ -110,20 +109,29 @@ int main(int argc, char** argv) {
     const Piece p{(const __nv_bfloat16*)d_q, (const __nv_bfloat16*)d_w, (const __nv_bfloat16*)d_cache,
                   (const unsigned*)d_table, seq_start, stride, bs, block_bytes, wmma};
     const unsigned qr = rows / 4;
-    // Rank r's quarters, in the order it selects and exchanges them.
-    const unsigned own[2][2] = {{0, 3 * qr}, {qr, 2 * qr}};
-
-    // Correctness: replicated vs the two ranks' quarters merged.
-    select_rows(p, 0, rows, d_logits_rep, d_rep);
-    for (int r = 0; r < 2; r++)
-        for (int k = 0; k < 2; k++) select_rows(p, own[r][k], qr, d_logits_split, d_rank[r]);
-    for (int r = 0; r < 2; r++)
+    // Rank r's passes as (first row, rows), as glm_index_split::passes gives.
+    const unsigned pass[2][2][2] = {{{0, qr}, {3 * qr, rows - 3 * qr}}, {{qr, 2 * qr}, {4 * qr, rows - 4 * qr}}};
+    auto select_rank = [&](int r) {
         for (int k = 0; k < 2; k++)
-            CK(cudaMemcpy(d_merged + (size_t)own[r][k] * 2051, d_rank[r] + (size_t)own[r][k] * 2051,
-                          (size_t)qr * 2051 * 4, cudaMemcpyDeviceToDevice));
+            if (pass[r][k][1]) select_rows(p, pass[r][k][0], pass[r][k][1], d_logits_split, d_rank[r]);
+    };
+    auto receive = [&](int r, unsigned row0, unsigned n) {
+        CK(cudaMemcpy(d_rank[r] + (size_t)row0 * 2051, d_rank[1 - r] + (size_t)row0 * 2051,
+                      (size_t)n * 2051 * 4, cudaMemcpyDeviceToDevice));
+    };
+
+    // Correctness: replicated vs each rank's rows plus the peer's quarters.
+    select_rows(p, 0, rows, d_logits_rep, d_rep);
+    select_rank(0);
+    select_rank(1);
+    receive(0, qr, 2 * qr);  // Q1 + Q2 from rank 1
+    receive(1, 0, qr);       // Q0 from rank 0
+    receive(1, 3 * qr, qr);  // Q3 from rank 0
     CK(cudaDeviceSynchronize());
     const long long dl = first_diff(d_logits_rep, d_logits_split, logit_n);
-    const long long di = first_diff(d_rep, d_merged, out_n);
+    const long long di0 = first_diff(d_rep, d_rank[0], out_n);
+    const long long di1 = first_diff(d_rep, d_rank[1], out_n);
+    const long long di = di0 >= 0 ? di0 : di1;
 
     // Timing: every row (replicated) vs each rank's half.
     cudaEvent_t e0, e1;
@@ -142,12 +150,11 @@ int main(int argc, char** argv) {
     const float t_rep = time([&] { select_rows(p, 0, rows, d_logits_rep, d_rep); });
     float t_rank[2];
     for (int r = 0; r < 2; r++)
-        t_rank[r] = time([&] {
-            for (int k = 0; k < 2; k++) select_rows(p, own[r][k], qr, d_logits_split, d_rank[r]);
-        });
-    printf("rows=%u seq_start=%u pools=%u scorer=%s\n", rows, seq_start, stride, wmma ? "wmma_row8_pool32" : "row8");
+        t_rank[r] = time([&] { select_rank(r); });
+    printf("rows=%u tail=%u seq_start=%u pools=%u scorer=%s\n", rows, rows - 4 * qr, seq_start, stride,
+           wmma ? "wmma_row8_pool32" : "row8");
     printf("logits bitwise: %s (first diff %lld)\n", dl < 0 ? "IDENTICAL" : "DIFFER", dl);
-    printf("token ids bitwise: %s (first diff %lld)\n", di < 0 ? "IDENTICAL" : "DIFFER", di);
+    printf("token ids bitwise: %s (first diff rank0 %lld rank1 %lld)\n", di < 0 ? "IDENTICAL" : "DIFFER", di0, di1);
     printf("ms/piece: replicated %.3f  rank0 %.3f  rank1 %.3f  (max rank / replicated %.3f)\n", t_rep,
            t_rank[0], t_rank[1], std::max(t_rank[0], t_rank[1]) / t_rep);
     return dl < 0 && di < 0 ? 0 : 2;
