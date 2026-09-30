@@ -50,7 +50,10 @@ BOTH ranks. The latent is 90% of the per-token KV bytes, so four concurrent
   `num_free_blocks()` reports `2 x` the scarcer residue, which the
   scheduler's admission and prefix-cache reclaim loops already act on, and
   `block_mgmt::alloc_block_evicting` evicts from the prefix cache until the
-  residue has a block. A slot map with spare slots would absorb such
+  residue has a block. A reclaim measures its progress by every freed block
+  (`num_free_in_all()`): an eviction that frees only the richer
+  residue is progress, and a loop that stopped at "nothing gained" would
+  give up with evictable blocks left. A slot map with spare slots would absorb such
   imbalance only by paying for the spare latents up front; the same bytes
   buy a larger pool.
 - **Everything else is replicated:** block tables (in logical structure),
@@ -88,6 +91,10 @@ verify, fused prefill+verify), plus the single-row eager decode
    PEER's heads over this rank's tokens, merge its partitions to one FP32
    partial + natural LSE (`glm_sparse_decode_split_merge_f32`, new), and
    exchange that partial (`rows x 32 x 513 x 4` bytes) with the peer.
+   Every entry point only a shard launches (this merge, the extra-partition
+   merge and the counted split of the compact tuning) is compiled into the
+   `glm_kv_shard` module from the unsharded kernels' bodies, so the modules
+   an unsharded server loads are unchanged.
 4. Run the split kernel for this rank's own heads over its tokens, append the
    peer's partial as the last partition, and merge everything in one exact LSE
    merge (the existing `glm_sparse_decode_split_merge`) into the head-sharded
@@ -111,9 +118,13 @@ reads only its half of the selected tokens, for twice the heads.
 
 The chunk's queries select most of the history, so each rank assembles the
 sequence's whole latent history `[0, end)` in a scratch view: it reads the
-block table to the host (one sync per layer), copies its own blocks into
-their logical positions, and exchanges the rest with the peer in 2,048-block
-pieces (packed in logical order, so both sides agree on the order). The
+block table to the host (one sync per layer), checks that every entry sits on
+its logical index's residue, swaps that verdict and its block count with the
+peer (8 bytes; a rank whose table is broken, or whose peer's is, fails after
+the swap, so both ranks fail instead of one leaving the other in the next
+exchange), copies its own blocks into their logical positions, and exchanges
+the rest with the peer in 2,048-block pieces (packed in logical order, so
+both sides agree on the order). The
 unchanged kernels (TC sparse prefill, the BF16 dequantized view, the dense
 <= 2048 path) then read the view through an identity block table. The
 chunk's new rows are written (owner-only) before the view is assembled, so
@@ -154,7 +165,8 @@ without), so the shard alone closes most, not all, of the gap: another
   partial exchange (22 per step). (Measured since: see "Decode cost of the
   merge form" below — the extra split launch is not free, because a masked
   key costs the same tensor-core work as a stored one.)
-- **Prefill (view form):** per layer per chunk one host sync, a local copy of
+- **Prefill (view form):** per layer per chunk one host sync, the 8-byte
+  verdict swap and its read-back (a second sync), a local copy of
   the own half of the history, and an exchange of the peer's half
   (at 256K history ~69 MB each way per layer, ~31 ms per 8K chunk over 11
   layers at ~25 GB/s, ~3% of a chunk; ~6% at 512K). Follow-up: prefetch layer
@@ -272,17 +284,25 @@ of any row), from 12 (four rows rank 1 owns nothing of, four it does), from
 for both ranks, and where a rank owns nothing the compact and uncompacted
 shards are bitwise equal.
 
-Flag-off identity of the edited kernels: every GLM entry that exists on
-integ/next compiles to the same PTX there and here up to basic-block label
-numbers (release builds compared entry by entry), and
-`glm_sparse_decode_split_merge` up to the mangled names of its three shared
-variables as well: the extra partition is a template parameter, so without
-it the body is the original kernel access for access. On the old base the
-merge still took the extra partition as a run-time pointer and compiled
-differently; there the unsharded split + merge and the unsplit kernel were
-run from both trees on the same inputs (rows 1/2/3/4/8, full / padded /
-holed selections, BF16 and fp8_g128, 81 MB of partials, LSEs and outputs)
-and compared: bitwise equal.
+Flag-off identity of the kernels: the release build of this tree was
+compared with a release build of a tree whose kernel sources are
+integ/next's (1b1f8551; every regular file under `kernels/` and
+`crates/atlas-kernels/` hashes equal). All 229 PTX modules integ/next builds
+for this target are byte-identical files here, the two edited ones
+(`glm_sparse_prefill_kv_reuse`, `glm_sparse_decode_split_merge`) included,
+and their 694 entry points are unchanged. The port adds one module,
+`glm_kv_shard`, with eight entry points (the four `glm_kv_shard_*`, the two
+`*_kv_pad_split_counted`, `glm_sparse_decode_split_merge_f32` and `_extra`),
+which no unsharded server looks up and so never loads. Two things make the
+edited files compile to what they did: the counted split's row counts and the
+merge's extra partition are compile-time dead in the old entry points (a
+defaulted null argument and a template parameter), and the merge's shared
+variables are declared by each entry point rather than by the shared body, so
+they keep the names they had. On the old base the merge still took the extra
+partition as a run-time pointer and compiled differently; there the unsharded
+split + merge and the unsplit kernel were run from both trees on the same
+inputs (rows 1/2/3/4/8, full / padded / holed selections, BF16 and fp8_g128,
+81 MB of partials, LSEs and outputs) and compared: bitwise equal.
 
 What is left with both tunings: ~30 us per layer of launches that have no
 unsharded counterpart (compaction, the FP32 merge, a second launch's fixed
@@ -332,8 +352,17 @@ None of it is measured on hardware yet.
   already gather for the pool size (`agree_kv_blocks`): ranks that differ
   fail at startup, each naming both values. Unsharded the word is the plain
   block count. When the settings table of opt/startup-parity lands, these
-  four belong in it (`glm_kv_shard::{requested, MergeTuning::get,
-  check_requested}`) and the piggyback can go.
+  four belong in it (`glm_kv_shard::{requested, MergeTuning::get}`) and the
+  piggyback can go.
+- **Startup refusals.** A shard refuses, by name, the environment opt-ins
+  whose attention still reads latents by global block id
+  (`glm_kv_shard::unsharded_lane`): `ATLAS_GLM_MULTI_SEQ_SPARSE`,
+  `ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS`, `ATLAS_GLM_MTP_REPAIR`,
+  `ATLAS_GLM_C4_DECODE`, `ATLAS_GLM_C4_SPARSE`,
+  `ATLAS_GLM_INDEPENDENT_DECODE` and `ATLAS_GLM_LONG_BATCH_SERIAL`. The
+  production profile sets the first six to 0 and not the last. Any of the
+  four shard variables with a value other than 0 or 1 fails the boot, as does
+  a tuning or the check without the shard.
 - **Verify graphs (`ATLAS_GLM_VERIFY_GRAPH`)** are vetoed by the shard's
   graph suppression on both ranks: verify stays eager.
 - **`ATLAS_GLM_DET_TRACE`** taps the selected ids of merge-form owners like
@@ -357,18 +386,20 @@ owner-batched, fused prefill+verify), single-sequence eager decode, BF16 and
 fp8_g128 caches, prefix caching (positional sharing keeps each block's owner).
 
 Refused at startup: a rank whose `[shard, compact, overlap, check]` differ
-from its peer's, a tuning without the shard, `--high-speed-swap`, a world
+from its peer's, a shard variable that is not 0 or 1, a tuning or the check
+without the shard, the environment lanes listed under "Startup refusals"
+(multi-sequence sparse decode, the repaired MTP, C4 and independent decode
+lanes, the long-verify serial diagnostic), `--high-speed-swap`, a world
 other than a TP2 pair with 32 heads per rank, a latent dtype other than BF16
 or `fp8_g128`.
 
-Not supported (fail closed with the `k_pool_ptr` panic or a boot error):
-multi-sequence batched decode (`decode_batch` / multi-seq MLA), the repaired
-MTP K3/C2/C4/independent lanes, `ATLAS_GLM_MULTI_SEQ_SPARSE`, the long-verify
-serial diagnostic, sequence save/restore, `--high-speed-swap`, and any world
-size other than a TP2 pair with 32 heads per rank. In the DFlash lane plain
-decode is reached only for sequences whose speculation is suspended; those go
-through the supported single-sequence decode, but a batched bootstrap of
-several such sequences would hit the fail-closed panic.
+Not supported and not selected by a variable a shard could refuse (the
+production profile sets `ATLAS_GLM_MLA_MULTI_SEQ=1`), so still failing closed
+mid-request with the `k_pool_ptr` panic or an error: multi-sequence batched
+decode (`decode_batch` / multi-seq MLA) and sequence save/restore. In the
+DFlash lane plain decode is reached only for sequences whose speculation is
+suspended; those go through the supported single-sequence decode, but a
+batched bootstrap of several such sequences would hit the fail-closed panic.
 
 ## Hardware validation plan
 
@@ -384,10 +415,11 @@ several such sequences would hit the fail-closed panic.
      half the flag-off value's latent part;
    - `KV latent shard merge form: compact=.. overlap=.. check=..` naming the
      tunings in effect (a performance arm must show `check=false`).
-   `..._CHECK=1` makes every sharded attention check on the host that each
-   table entry's residue matches its logical index and exchange the block
-   count with the peer (fails if they differ); drop it for performance runs.
-   The view form checks the residues on every call regardless.
+   `..._CHECK=1` makes every merge-form attention check on the host that
+   each table entry's residue matches its logical index and swap that verdict
+   and the block count with the peer (both ranks fail if either is wrong);
+   drop it for performance runs. The view form does this on every call
+   regardless.
 2. Greedy equality: the same prompts at temperature 0 with the flag off and
    on (short, 16K, 64K prompts; single sequence and 4 concurrent). Expect
    identical output for most prompts; where the text diverges, compare the
