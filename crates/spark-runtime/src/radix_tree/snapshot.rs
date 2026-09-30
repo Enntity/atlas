@@ -45,6 +45,9 @@ pub(super) struct SnapshotEntry {
     /// but leased alongside the tail. At most one per session (swept together
     /// with the tail by `insert_tail`).
     pub(super) is_tail_sibling: bool,
+    /// Conversation-chain bookkeeping for chain-aware eviction
+    /// (`ATLAS_GLM_PC_EVICT`); left at its default when the flag is off.
+    pub(super) chain: super::snapshot_chain::ChainMeta,
 }
 
 /// Where a matched snapshot's state currently lives (Phase 1b).
@@ -311,6 +314,13 @@ impl SsmSnapshotIndex {
         // 12.7k-token SSM replay, 40s TTFT tail). Re-landed after #317's
         // re-cut restored the old score.
         let escore = |e: &SnapshotEntry| e.last_access;
+
+        if super::snapshot_chain::glm_pc_evict_enabled() {
+            let entry = self.entries.swap_remove(self.chain_victim(true)?);
+            self.stats.evictions += 1;
+            self.evictions_since_lookup = self.evictions_since_lookup.saturating_add(1);
+            return Some(entry.snapshot_id);
+        }
 
         // SESSION-AWARE eviction (default ON; ATLAS_SNAP_EVICT_LEGACY=1 → old per-entry).
         if std::env::var_os("ATLAS_SNAP_EVICT_LEGACY").is_none() {

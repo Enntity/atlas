@@ -86,6 +86,7 @@ impl SsmSnapshotIndex {
             tiered: false,
             is_tail: false,
             is_tail_sibling: false,
+            chain: Default::default(),
         });
         None
     }
@@ -143,6 +144,7 @@ impl SsmSnapshotIndex {
             tiered: false,
             is_tail: true,
             is_tail_sibling: false,
+            chain: Default::default(),
         });
         displaced
     }
@@ -183,6 +185,7 @@ impl SsmSnapshotIndex {
             tiered: false,
             is_tail: false,
             is_tail_sibling: true,
+            chain: Default::default(),
         });
         None
     }
