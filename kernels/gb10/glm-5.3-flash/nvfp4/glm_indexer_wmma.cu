@@ -14,8 +14,9 @@
 // 32,768 bytes of dynamic shared memory and 16-byte aligned cache blocks.
 // Requirements: SM80+, 32-byte aligned query, heads=32, head_dim=128,
 // pool_size=4, cache_block_size a positive multiple of 4. Cache page/table and
-// output sizing follow the scalar scorer. Unsupported geometry does no work;
-// the caller must validate these requirements before selecting this kernel.
+// output sizing follow the scalar scorer. Unsupported geometry (for mma_v2 also
+// too little dynamic shared memory) does no work; the caller must validate
+// these requirements before selecting this kernel.
 
 #include <cuda_bf16.h>
 #include <math.h>
@@ -213,6 +214,8 @@ extern "C" __global__ void glm_index_logits_bf16_wmma_row8_pool32(
 // masking are unchanged.
 namespace {
 
+// Mirrored by GLM_INDEX_LOGITS_V2_ROWS and V2_CHUNK_POOLS in
+// crates/spark-model/src/layers/ops/glm_indexer.rs, whose tests check these.
 constexpr unsigned int kIndexV2Warps = 4;
 constexpr unsigned int kIndexV2Pools = 32;
 
@@ -266,8 +269,11 @@ __device__ __forceinline__ void glm_index_logits_mma_v2_impl(
     static_assert(Pools % 32 == 0 && segs > 0 && Pools * 16 % threads == 0 &&
                   16 % segs == 0, "unsupported key staging geometry");
     extern __shared__ __align__(128) unsigned char index_v2_smem[];
+    unsigned int dynamic_smem;
+    asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dynamic_smem));
 
     if (blockDim.x != threads || blockDim.y != 1 || blockDim.z != 1 ||
+        dynamic_smem < index_v2_smem_bytes<Warps, Pools>() ||
         index_heads != 32 || head_dim != 128 || pool_size != 4 ||
         cache_block_size == 0 || cache_block_size % 4 != 0) return;
 

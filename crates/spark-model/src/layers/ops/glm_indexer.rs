@@ -135,9 +135,13 @@ pub fn glm_index_fill_causal_dev(
         .launch(stream)
 }
 
-/// `pools_per_cta` of `glm_index_logits_bf16_mma_v2` (4-row tiles): each CTA
-/// walks a contiguous run of 32-pool chunks whose length the launch picks.
+/// `pools_per_cta` of `glm_index_logits_bf16_mma_v2`: each CTA walks a
+/// contiguous run of 32-pool chunks whose length the launch picks.
 pub const GLM_INDEX_LOGITS_V2_POOLS: u32 = u32::MAX;
+/// v2's rows per CTA, one per warp: `kIndexV2Warps` in glm_indexer_wmma.cu.
+pub const GLM_INDEX_LOGITS_V2_ROWS: u32 = 4;
+/// v2's pools per staged key chunk: `kIndexV2Pools` in glm_indexer_wmma.cu.
+const V2_CHUNK_POOLS: u32 = 32;
 
 #[derive(Clone, Copy, Debug)]
 struct IndexLogitsLaunch {
@@ -175,7 +179,8 @@ fn index_logits_launch(
     let v2 = pools_per_cta == GLM_INDEX_LOGITS_V2_POOLS;
     anyhow::ensure!(
         (pools_per_cta == 8 && matches!(rows_per_cta, 1 | 8))
-            || (((pools_per_cta, rows_per_cta) == (32, 8) || (v2 && rows_per_cta == 4))
+            || (((pools_per_cta, rows_per_cta) == (32, 8)
+                || (v2 && rows_per_cta == GLM_INDEX_LOGITS_V2_ROWS))
                 && index_heads == 32
                 && head_dim == 128
                 && pool_size == 4
@@ -183,8 +188,9 @@ fn index_logits_launch(
         "unsupported GLM semantic scorer launch geometry or query alignment"
     );
     let shared_mem = if v2 {
-        // Two 32-pool BF16 key stages plus four 32x32 FP32 product tiles.
-        2 * 32 * 256 + 4 * 32 * 32 * 4
+        // index_v2_smem_bytes: two BF16 key stages plus one 32-pool x 32-head
+        // FP32 product tile per warp.
+        2 * V2_CHUNK_POOLS * 256 + GLM_INDEX_LOGITS_V2_ROWS * 32 * 32 * 4
     } else if rows_per_cta == 8 && pools_per_cta == 8 {
         head_dim
             .checked_mul(8 * std::mem::size_of::<u16>() as u32)
@@ -197,19 +203,24 @@ fn index_logits_launch(
         "GLM semantic scorer exceeds default shared memory limit"
     );
     let row_tiles = rows.div_ceil(rows_per_cta);
+    let threads = if v2 {
+        GLM_INDEX_LOGITS_V2_ROWS * 32
+    } else {
+        256
+    };
     let grid_x = if v2 {
         // About eight waves of three CTAs on GB10's 48 SMs, but at least 16
         // chunks per CTA (so query rows are reloaded rarely) unless that
         // leaves less than one wave.
-        let chunks = logits_stride.div_ceil(32);
-        let floor = (chunks / 16).max(144u32.div_ceil(row_tiles));
-        1152u32.div_ceil(row_tiles).min(floor).min(chunks).max(1)
+        let chunks = logits_stride.div_ceil(V2_CHUNK_POOLS);
+        let cap = (chunks / 16).max(144u32.div_ceil(row_tiles));
+        1152u32.div_ceil(row_tiles).min(cap).min(chunks).max(1)
     } else {
         logits_stride.div_ceil(pools_per_cta)
     };
     Ok(IndexLogitsLaunch {
         grid: [grid_x, row_tiles, 1],
-        block: [if v2 { 128 } else { 256 }, 1, 1],
+        block: [threads, 1, 1],
         shared_mem,
     })
 }
@@ -423,27 +434,6 @@ mod tests {
         }
     }
 
-    fn v2(rows: u32, stride: u32) -> [u32; 3] {
-        let v2 = GLM_INDEX_LOGITS_V2_POOLS;
-        index_logits_launch(256, rows, 4096, stride, 32, 128, 4, 16, 4, v2)
-            .unwrap()
-            .grid
-    }
-
-    #[test]
-    fn v2_grid_width_trades_waves_against_query_reloads() {
-        // 1024 row tiles already fill the waves: each CTA walks half the history.
-        assert_eq!(v2(4096, 15361), [2, 1024, 1]);
-        // Fewer rows split the history further, down to 16 chunks per CTA,
-        // or fewer when that would leave less than one wave.
-        assert_eq!(v2(512, 16500), [9, 128, 1]);
-        assert_eq!(v2(64, 16400), [32, 16, 1]);
-        assert_eq!(v2(8, 16385), [72, 2, 1]);
-        assert_eq!(v2(9, 33), [2, 3, 1]);
-        let launch = geometry(4, GLM_INDEX_LOGITS_V2_POOLS).unwrap();
-        assert_eq!((launch.block, launch.shared_mem), ([128, 1, 1], 32_768));
-    }
-
     #[test]
     fn empty_dimensions_and_incomplete_cache_pools_are_rejected() {
         for (rows_per_cta, pools_per_cta) in
@@ -486,3 +476,7 @@ mod tests {
         assert!(index_logits_launch(256, 9, 4096, 33, 1, u32::MAX, 4, 32, 8, 8).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "glm_indexer_v2_tests.rs"]
+mod v2_tests;

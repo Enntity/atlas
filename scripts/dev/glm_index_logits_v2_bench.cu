@@ -102,8 +102,8 @@ static unsigned default_gx(const Variant& v, unsigned rows, unsigned stride) {
     const unsigned chunks = (stride + v.pools - 1) / v.pools;
     const unsigned row_blocks = (rows + v.warps - 1) / v.warps;
     const unsigned want = (48u * 3 * 8 + row_blocks - 1) / row_blocks;
-    const unsigned floor = std::max(chunks / 16, (48u * 3 + row_blocks - 1) / row_blocks);
-    return std::max(1u, std::min({want, floor, chunks}));
+    const unsigned cap = std::max(chunks / 16, (48u * 3 + row_blocks - 1) / row_blocks);
+    return std::max(1u, std::min({want, cap, chunks}));
 }
 
 static size_t compare(const Bufs& b, unsigned rows, unsigned stride, std::vector<unsigned>& h0,
@@ -196,6 +196,25 @@ int main(int argc, char** argv) {
             }
             printf("case rows=%u start=%u stride=%u bs=%u checked\n", cs.rows, cs.start, stride,
                    cs.c->bs);
+        }
+        // Unsupported geometry does no work (the output keeps its sentinel):
+        // a 2-warp block, or 16 bytes too little dynamic shared memory.
+        Variant bad_block = kVariants[0], bad_smem = kVariants[0];
+        bad_block.warps = 2;
+        bad_smem.smem -= 16;
+        for (const Variant* v : {&bad_block, &bad_smem}) {
+            const unsigned rows = 9, start = 2047, stride = (start + rows + 3) / 4;
+            const size_t n = (size_t)rows * stride;
+            CK(cudaMemset(b.dout1, 0xEE, n * 4));
+            launch(v, 1, b, c16, 0, rows, start, stride);
+            CK(cudaGetLastError());
+            CK(cudaDeviceSynchronize());
+            h1.resize(n);
+            CK(cudaMemcpy(h1.data(), b.dout1, n * 4, cudaMemcpyDeviceToHost));
+            const size_t written = n - std::count(h1.begin(), h1.end(), 0xEEEEEEEEu);
+            total_diff += written;
+            printf("unsupported %s: %zu logits written (want 0)\n",
+                   v == &bad_block ? "block" : "smem", written);
         }
         printf("bitwise: %zu differing of %zu compared logits\n", total_diff, compared);
     }
