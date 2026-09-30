@@ -40,18 +40,33 @@ pub(super) fn any_owner_selects(owners: &[GlmChunkOwner], index_topk: usize) -> 
 }
 
 /// Row-wise projections of an owner-batched verify, one row per stacked row:
-/// owner rows start at `row0 * <row bytes>`. `index_query` and `weights` are
-/// projected only when an owner selects ([`any_owner_selects`]).
+/// owner rows start at `row0 * <row bytes>`. `index` (queries, weights) is
+/// `None` when no owner selects ([`any_owner_selects`]): nothing projected
+/// them this layer.
 #[derive(Clone, Copy)]
 pub(super) struct GlmOwnerProjections {
     pub(super) keys: DevicePtr,
     pub(super) gates: DevicePtr,
-    pub(super) index_query: DevicePtr,
-    pub(super) weights: DevicePtr,
+    pub(super) index: Option<(DevicePtr, DevicePtr)>,
     pub(super) q_absorbed: DevicePtr,
     pub(super) key_row: usize,
     pub(super) query_row: usize,
     pub(super) weight_row: usize,
+}
+
+impl GlmOwnerProjections {
+    /// The index queries and weights of the owner at `row0`. Fails closed when
+    /// the batch skipped them: the selector's own projection would land in
+    /// the scratch that holds this batch's absorbed queries.
+    pub(super) fn index_rows(&self, row0: usize) -> Result<(DevicePtr, DevicePtr)> {
+        let (query, weights) = self.index.ok_or_else(|| {
+            anyhow::anyhow!("GLM owner batch skipped the index queries of a selecting owner")
+        })?;
+        Ok((
+            query.offset(row0 * self.query_row),
+            weights.offset(row0 * self.weight_row),
+        ))
+    }
 }
 
 /// One sequence's prefill chunk of `rows` rows from `seq_len_start` as chunk
@@ -145,12 +160,15 @@ impl Qwen3AttentionLayer {
         let gates = keys.offset(rows * key_row);
         self.glm_index_project_keys(normed, n, keys, gates, ctx, stream)?;
         let q_absorbed = ctx.buffers.ssm_deinterleaved();
-        let index_query = q_absorbed.offset(rows * latent_row);
-        let weights = ctx.buffers.ssm_gates();
         // Short-context batches (every owner dense) skip wq_b and weights_proj.
-        if any_owner_selects(owners, c.index_topk) {
-            self.glm_index_project_query(q_latent, normed, n, index_query, weights, ctx, stream)?;
-        }
+        let index = if any_owner_selects(owners, c.index_topk) {
+            let query = q_absorbed.offset(rows * latent_row);
+            let weights = ctx.buffers.ssm_gates();
+            self.glm_index_project_query(q_latent, normed, n, query, weights, ctx, stream)?;
+            Some((query, weights))
+        } else {
+            None
+        };
         let q_full = ctx.buffers.qkv_output();
         self.paged_glm_projection(
             q_latent,
@@ -167,8 +185,7 @@ impl Qwen3AttentionLayer {
         Ok(Some(GlmOwnerProjections {
             keys,
             gates,
-            index_query,
-            weights,
+            index,
             q_absorbed,
             key_row,
             query_row,

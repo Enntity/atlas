@@ -243,12 +243,7 @@ impl Qwen3AttentionLayer {
                     kv_cache,
                     &octx,
                     stream,
-                    batched.map(|b| {
-                        (
-                            rows_of(b.index_query, b.query_row),
-                            rows_of(b.weights, b.weight_row),
-                        )
-                    }),
+                    batched.map(|b| b.index_rows(o.row0)).transpose()?,
                 )?)
             };
             // The BF16 dense and native kernels read an fp8_g128 owner through

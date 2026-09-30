@@ -3,7 +3,7 @@
 //! Unit tests for `paged_glm` dense-selection exactness.
 
 use super::dense_selection_is_exact;
-use super::owner::{GlmChunkOwner, any_owner_selects};
+use super::owner::{GlmChunkOwner, GlmOwnerProjections, any_owner_selects};
 use crate::layer::AttnMetadataDev;
 use spark_runtime::gpu::DevicePtr;
 
@@ -57,4 +57,24 @@ fn owner_batch_needs_index_queries_only_when_an_owner_selects() {
         2048
     ));
     assert!(any_owner_selects(&short, 0));
+}
+
+/// A batch that skipped the index projections hands a selecting owner an
+/// error, never the unwritten scratch.
+#[test]
+fn owner_batch_without_index_queries_refuses_a_selecting_owner() {
+    let mut batch = GlmOwnerProjections {
+        keys: DevicePtr::NULL,
+        gates: DevicePtr::NULL,
+        index: None,
+        q_absorbed: DevicePtr::NULL,
+        key_row: 256,
+        query_row: 8192,
+        weight_row: 64,
+    };
+    assert!(batch.index_rows(8).is_err());
+    batch.index = Some((DevicePtr(0x10_0000), DevicePtr(0x20_0000)));
+    let (query, weights) = batch.index_rows(8).unwrap();
+    assert_eq!(query.0, 0x10_0000 + 8 * 8192);
+    assert_eq!(weights.0, 0x20_0000 + 8 * 64);
 }
