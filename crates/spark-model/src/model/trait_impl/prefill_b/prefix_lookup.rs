@@ -9,7 +9,7 @@ use anyhow::Result;
 use spark_runtime::kv_cache::PagedKvCache;
 use spark_runtime::prefix_cache::PrefixMatch;
 
-use super::super::super::block_mgmt::reuse_prefix_match_disk_ids;
+use super::super::super::prefix_share::adopt_prefix_match;
 use super::super::super::types::TransformerModel;
 use crate::traits::{PrefillSlice, SequenceState};
 
@@ -53,7 +53,7 @@ impl TransformerModel {
                 prefix_match
             } else {
                 self.prefix_cache
-                    .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
+                    .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
             };
             // F83 (2026-04-30): on EP>1, head and worker have
             // independent local prefix caches whose match counts can
@@ -84,7 +84,7 @@ impl TransformerModel {
                 if agreed < prefix_match.matched_tokens {
                     self.prefix_cache.release(tokens, bs, seq.adapter_id);
                     if agreed > 0 {
-                        prefix_match = self.prefix_cache.lookup(
+                        prefix_match = self.prefix_cache.lookup_whole_blocks(
                             &tokens[..agreed],
                             bs,
                             seq.session_hash,
@@ -104,8 +104,6 @@ impl TransformerModel {
                 }
             }
             let matched = prefix_match.matched_tokens;
-            seq.cached_prefix_tokens = matched;
-            seq.cached_prefix_blocks = prefix_match.matched_blocks.len();
             // Stash the matched prefix so `free_sequence` can release the radix
             // refs the lookup just bumped even if this prefill fails to allocate
             // its suffix before `seq.tokens` is populated (else those nodes leak
@@ -117,14 +115,7 @@ impl TransformerModel {
                 seq.prefix_ref_tokens.clear();
             }
             seq.prompt_len = total;
-            for &block_idx in &prefix_match.matched_blocks {
-                kv_cache.inc_ref(block_idx);
-                seq.block_table.push(block_idx);
-            }
-            reuse_prefix_match_disk_ids(
-                &prefix_match.matched_disk_block_ids,
-                &mut seq.disk_block_ids,
-            );
+            adopt_prefix_match(seq, &prefix_match, kv_cache);
             // Issue #31: the prefix cache stores per-layer K/V on disk for every
             // matched block (that's the radix-tree invariant — blocks with a
             // non-MAX `disk_block_id` are fully offloaded across every attention
@@ -416,7 +407,7 @@ impl TransformerModel {
                 self.release_batched_prefix_reservations(streams, &matches, block_size);
                 return None;
             }
-            matches.push(self.prefix_cache.lookup(
+            matches.push(self.prefix_cache.lookup_whole_blocks(
                 slice.prompt_tokens,
                 block_size,
                 seq.session_hash,

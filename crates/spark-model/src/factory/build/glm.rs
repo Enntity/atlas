@@ -124,22 +124,6 @@ pub(super) fn cache_shape(
     Ok(glm_cache_shape)
 }
 
-/// Prefix caching keeps slotted index tails lag-bounded only when every resume
-/// lands on a whole cached block, which holds finalized pools: Marconi restores
-/// SSM state at block boundaries (`ATLAS_MARCONI_PREFILL_ONLY=1`) and no
-/// sub-block match (`ATLAS_PREFIX_SUBBLOCK=0`) shares the partial frontier
-/// block a live donor still writes.
-pub(super) fn prefix_resumes_whole_blocks() -> bool {
-    whole_block_resumes(
-        crate::model::mtp_carry::marconi_prefill_only(),
-        spark_runtime::radix_tree::subblock_matching(),
-    )
-}
-
-fn whole_block_resumes(marconi_prefill_only: bool, subblock_matching: bool) -> bool {
-    marconi_prefill_only && !subblock_matching
-}
-
 /// Returns `(sparse_index, tail_slots, glm_cache_plan)`. `lag_bounded` is
 /// speculative decode without HSS whose prefix-cache resumes, if any, land on
 /// whole blocks.
@@ -235,20 +219,4 @@ fn min_across_ranks(
     })();
     gpu.free(buf)?;
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::whole_block_resumes;
-
-    #[test]
-    fn prefix_resumes_are_whole_block_only_without_sub_block_matches() {
-        assert!(whole_block_resumes(true, false));
-        // A sub-block match shares the partial frontier block a live donor
-        // still writes, and a departing sharer strips its lent tail.
-        assert!(!whole_block_resumes(true, true));
-        // Without Marconi prefill-only, an SSM restore can land mid-block.
-        assert!(!whole_block_resumes(false, false));
-        assert!(!whole_block_resumes(false, true));
-    }
 }
