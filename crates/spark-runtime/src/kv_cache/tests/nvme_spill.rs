@@ -128,17 +128,17 @@ fn checksum_catches_payload_corruption() {
     let payload = vec![5u8; 1000];
     let mut rec = vec![0u8; 4096];
     rec[..1000].copy_from_slice(&payload);
-    super::super::nvme_spill::stamp_for_test(&mut rec, 1000, 77);
-    assert!(super::super::nvme_spill::verify_for_test(&rec, 1000, 77));
+    super::super::nvme_spill::stamp(&mut rec, 1000, 77);
+    assert!(super::super::nvme_spill::verify(&rec, 1000, 77));
     rec[500] ^= 1;
-    assert!(!super::super::nvme_spill::verify_for_test(&rec, 1000, 77));
+    assert!(!super::super::nvme_spill::verify(&rec, 1000, 77));
     rec[500] ^= 1;
     // The unaligned tail (1000 = 31·32 + 8) is covered too.
     rec[996] ^= 0x80;
-    assert!(!super::super::nvme_spill::verify_for_test(&rec, 1000, 77));
+    assert!(!super::super::nvme_spill::verify(&rec, 1000, 77));
     rec[996] ^= 0x80;
     assert!(
-        !super::super::nvme_spill::verify_for_test(&rec, 1000, 78),
+        !super::super::nvme_spill::verify(&rec, 1000, 78),
         "tag bound"
     );
 }
@@ -170,7 +170,7 @@ fn store_with_wrong_record_size_is_rejected() {
 
 #[test]
 fn consecutive_slots_group_into_runs_in_either_direction() {
-    use super::super::nvme_spill::run_layout_for_test as runs;
+    use super::super::nvme_spill::run_layout as runs;
     // A leaf-first spilled chain restores in DEScending slot order.
     assert_eq!(
         runs(&[9, 8, 7, 3, 4, 20]),

@@ -143,8 +143,10 @@ fn a_leaf_first_chain_moves_as_runs_and_restores_in_path_order() {
     for (i, &b) in blocks.iter().enumerate() {
         assert_eq!(dump(&c, &gpu, b), want[i], "path block {i}");
     }
-    assert!(c.nvme_io_stats().fast);
-    assert_eq!(c.nvme_io_stats().spilled_blocks, 12);
+    let io = c.nvme_io_stats();
+    assert!(io.fast);
+    assert_eq!((io.spilled_blocks, io.gather_runs), (12, 1));
+    assert_eq!((io.restored_blocks, io.scatter_runs), (12, 1));
 }
 
 #[test]
@@ -174,8 +176,14 @@ fn both_paths_write_the_same_records() {
         fill(&sync, &gpu, b, 0x30 + b as u8);
     }
     let orders: Vec<SpillOrder> = plan.iter().map(|&(b, s)| order(b, s)).collect();
+    let (pitched, plain) = (gpu.host_pitched_count(), gpu.d2h_async_count());
     assert!(fast.nvme_write(&orders, &gpu, 0).is_empty());
     assert!(settle(&mut fast, &gpu).is_empty());
+    // A run of one block is the synchronous path's plain copies (4 regions
+    // per block), never a one-row pitched copy.
+    assert_eq!(gpu.host_pitched_count(), pitched);
+    assert_eq!(gpu.d2h_async_count() - plain, 3 * 4);
+    assert_eq!(fast.nvme_io_stats().gather_runs, 3);
     let written = store.recs.lock().unwrap().clone();
     assert!(sync.nvme_write(&orders, &gpu, 0).is_empty());
     assert_eq!(
@@ -187,6 +195,12 @@ fn both_paths_write_the_same_records() {
     let refs: Vec<DiskRef> = plan.iter().map(|&(_, s)| disk(s)).collect();
     assert_eq!(sync.nvme_read(&refs, &mut [0, 1, 2], &gpu, 0), (3, false));
     assert_eq!(fast.nvme_read(&refs, &mut [0, 1, 2], &gpu, 0), (3, false));
+    // Blocks 0..3 are one run on the fast path, three on the synchronous one.
+    let (f, s) = (fast.nvme_io_stats(), sync.nvme_io_stats());
+    assert_eq!((f.restored_blocks, f.scatter_runs), (3, 1));
+    assert_eq!((s.restored_blocks, s.scatter_runs), (3, 3));
+    assert_eq!((s.spilled_blocks, s.gather_runs), (3, 3));
+    assert_eq!((s.spill_wait_micros, s.flush_micros), (0, 0));
     for (i, &(b, _)) in plan.iter().enumerate() {
         assert_eq!(dump(&sync, &gpu, i as u32), dump(&sync, &gpu, b));
         assert_eq!(dump(&fast, &gpu, i as u32), dump(&fast, &gpu, b));
@@ -215,6 +229,10 @@ fn a_spill_returns_before_its_write_and_a_restore_waits_for_it() {
     assert_eq!(c.nvme_read(&[disk(0)], &mut [5], &gpu, 0), (1, false));
     opener.join().unwrap();
     assert_eq!(dump(&c, &gpu, 5), want, "the bytes gathered at spill time");
+    // That wait is accounted to the restore's flush, not to the spill path.
+    let io = c.nvme_io_stats();
+    assert!(io.flush_micros >= 40_000, "{io:?}");
+    assert_eq!(io.spill_wait_micros, 0);
 }
 
 #[test]
@@ -293,6 +311,29 @@ fn a_slot_reissued_while_its_write_is_queued_keeps_the_later_record() {
     assert_eq!(c.nvme_read(&[got], &mut [7], &gpu, 0), (1, false));
     assert_eq!(dump(&c, &gpu, 7), dump(&c, &gpu, 3));
     assert!(c.nvme_take_failed().is_empty());
+    // The spill path's wait for the writer is reported as such.
+    let io = c.nvme_io_stats();
+    assert!(io.spill_wait_micros >= 40_000, "{io:?}");
+    assert!(io.spill_micros >= io.spill_wait_micros);
+}
+
+#[test]
+fn a_leaked_staging_ring_fails_the_batch_instead_of_hanging() {
+    let gpu = MockGpuBackend::new();
+    let (mut c, store) = fast_cache(&gpu, 8);
+    fill(&c, &gpu, 1, 0x11);
+    // No free chunk and no write in flight: nothing will ever free one.
+    let ring = std::mem::take(&mut c.nvme.as_mut().unwrap().fast.as_mut().unwrap().free);
+    let orders = [order(1, 0), order(2, 1)];
+    assert_eq!(c.nvme_write(&orders, &gpu, 0), orders.to_vec());
+    assert_eq!(store.writes.load(Ordering::Relaxed), 0);
+    // A restore attempts nothing (the records stay planned for a recompute).
+    assert_eq!(c.nvme_read(&[disk(0)], &mut [5], &gpu, 0), (0, false));
+    // With the ring back the tier works again.
+    c.nvme.as_mut().unwrap().fast.as_mut().unwrap().free = ring;
+    assert!(c.nvme_write(&orders[..1], &gpu, 0).is_empty());
+    assert_eq!(c.nvme_read(&[disk(0)], &mut [5], &gpu, 0), (1, false));
+    assert_eq!(dump(&c, &gpu, 5), dump(&c, &gpu, 1));
 }
 
 #[test]

@@ -87,12 +87,18 @@ impl TransformerModel {
         }
         let s = tier.nvme_stats();
         let io = kv_cache.nvme_io_stats();
-        let read_ms = r.read_micros as f64 / 1e3;
+        let ms = |micros: u64| micros as f64 / 1e3;
+        let read_ms = ms(r.read_micros);
+        // Blocks per device copy run: how contiguous the pool was (1.0 = a
+        // copy per region per block, as on the synchronous path).
+        let per_run = |blocks: u64, runs: u64| blocks as f64 / runs.max(1) as f64;
         tracing::info!(
             "NVMe prefix restore: {}/{} blocks ({} tokens after {} resident) in {:.1} ms{}; \
              tier {}/{} slots, {} spills, {} restores, {} failures; evict {:.1} ms + read {:.1} ms \
              ({:.0} MB/s); spill path ({}): {} blocks in {:.1} ms on the serving thread, \
-             {} evictions without a write",
+             {} evictions without a write; this restore: writer wait {:.1} ms in evict, flush \
+             {:.1} ms before read, {:.1} blocks/scatter run, {} spilled at {:.1} blocks/gather run; \
+             spill path waited {:.1} ms for the writer",
             r.restored,
             r.wanted,
             r.restored * bs,
@@ -110,13 +116,19 @@ impl TransformerModel {
             s.spills,
             s.restores,
             s.spill_failures + s.restore_failures,
-            r.evict_micros as f64 / 1e3,
+            ms(r.evict_micros),
             read_ms,
             (r.restored * kv_cache.nvme_record_bytes()) as f64 / 1e3 / read_ms.max(1e-3),
             if io.fast { "fast" } else { "sync" },
             io.spilled_blocks,
-            io.spill_micros as f64 / 1e3,
+            ms(io.spill_micros),
             s.clean_evictions,
+            ms(r.io.spill_wait_micros),
+            ms(r.io.flush_micros),
+            per_run(r.io.restored_blocks, r.io.scatter_runs),
+            r.io.spilled_blocks,
+            per_run(r.io.spilled_blocks, r.io.gather_runs),
+            ms(io.spill_wait_micros),
         );
     }
 
@@ -170,10 +182,13 @@ pub(crate) struct RestoreOutcome {
     pub restored: usize,
     pub failed: bool,
     /// Allocating the target blocks — which, on a full pool, is spilling that
-    /// many victims.
+    /// many victims (the gather, plus `io.spill_wait_micros` for the writer).
     pub evict_micros: u64,
-    /// Reading, verifying and scattering the records.
+    /// Reading, verifying and scattering the records — NOT the wait for the
+    /// victims' queued writes before the first read (`io.flush_micros`).
     pub read_micros: u64,
+    /// What this restore added to the cache's I/O counters.
+    pub io: spark_runtime::kv_cache::NvmeIoStats,
 }
 
 /// The restore cycle: plan (pins the path) → allocate up to `want(plan)`
@@ -207,6 +222,7 @@ pub(crate) fn restore_prefix(
         return None;
     }
     let wanted = want(&plan).min(plan.disk.len());
+    let io0 = kv_cache.nvme_io_stats();
     let t0 = std::time::Instant::now();
     let mut blocks = Vec::with_capacity(wanted);
     while blocks.len() < wanted {
@@ -219,7 +235,9 @@ pub(crate) fn restore_prefix(
     // The fast path pairs the run with the blocks in ascending order.
     let (mut ok, mut failed) =
         kv_cache.nvme_read(&plan.disk[..blocks.len()], &mut blocks, gpu, stream);
-    let read_micros = t0.elapsed().as_micros() as u64 - evict_micros;
+    let io = kv_cache.nvme_io_stats().since(io0);
+    let read_micros =
+        (t0.elapsed().as_micros() as u64 - evict_micros).saturating_sub(io.flush_micros);
     // Slotted index tails: a restored block is a shared cached block and must
     // own NO tail (the index kernels then skip it). Its tail was released when
     // it was last freed, but that release reaches the device map only with the
@@ -250,6 +268,7 @@ pub(crate) fn restore_prefix(
         failed,
         evict_micros,
         read_micros,
+        io,
     })
 }
 

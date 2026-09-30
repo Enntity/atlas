@@ -31,7 +31,7 @@ use std::collections::{HashSet, VecDeque};
 use anyhow::Result;
 
 use super::nvme_io::{IoPool, Outcome, Work};
-use super::nvme_spill::NvmeSpill;
+use super::nvme_spill::{NvmeIoStats, NvmeSpill};
 use crate::gpu::{GpuBackend, Pitched, copy_d2h_pitched_async, copy_h2d_pitched_async_retained};
 use crate::prefix_cache::{DiskRef, SpillOrder};
 
@@ -49,13 +49,15 @@ const ROUND_CHUNKS: usize = 2;
 pub(super) struct FastIo {
     pool: IoPool,
     /// Chunks no job owns.
-    free: Vec<usize>,
+    pub(super) free: Vec<usize>,
     /// Queued writes: `(chunk, slots)`.
     writing: Vec<(usize, Vec<u32>)>,
     /// Failed writes not yet reported to the tree.
     failed: Vec<SpillOrder>,
     /// Offset of each segment inside a record.
     seg_off: Vec<usize>,
+    /// Microseconds the serving thread has spent waiting for the writer.
+    waited: u64,
 }
 
 impl FastIo {
@@ -88,6 +90,7 @@ impl FastIo {
             writing: Vec::new(),
             failed: Vec::new(),
             seg_off,
+            waited: 0,
         })
     }
 
@@ -96,21 +99,29 @@ impl FastIo {
         if self.writing.is_empty() {
             return;
         }
+        let t0 = block.then(std::time::Instant::now);
         for (chunk, failed) in self.pool.take_writes(block) {
             self.free.push(chunk);
             self.writing.retain(|(c, _)| *c != chunk);
             self.failed.extend(failed);
         }
+        self.waited += t0.map_or(0, |t| t.elapsed().as_micros() as u64);
     }
 
     /// A chunk nobody owns — waits for the writer when the ring is full,
-    /// which is what bounds the write-behind.
-    fn chunk(&mut self) -> usize {
+    /// which is what bounds the write-behind. An error when there is neither
+    /// a free chunk nor a write to wait for (a leaked chunk): the caller
+    /// fails its batch — waiting would hang the serving thread, and with it
+    /// the peer rank's next collective.
+    fn chunk(&mut self) -> Result<usize> {
         loop {
             if let Some(c) = self.free.pop() {
-                return c;
+                return Ok(c);
             }
-            debug_assert!(!self.writing.is_empty(), "staging ring leaked a chunk");
+            anyhow::ensure!(
+                !self.writing.is_empty(),
+                "staging ring has no free chunk and no write in flight"
+            );
             self.reap(true);
         }
     }
@@ -148,7 +159,10 @@ pub(super) fn block_runs(blocks: &[u32]) -> Vec<(usize, usize)> {
 }
 
 /// Enqueue the copies between `blocks` (record `i` of `chunk` ↔ `blocks[i]`)
-/// and staging: one pitched copy per segment per run of consecutive blocks.
+/// and staging: one pitched copy per segment per run of consecutive blocks —
+/// and for a run of ONE block the plain copies of the synchronous path (a
+/// one-row pitched copy buys nothing, so a fully fragmented pool costs what
+/// it costs there). Returns the number of runs.
 fn copy_blocks(
     spill: &NvmeSpill,
     seg_off: &[usize],
@@ -156,7 +170,7 @@ fn copy_blocks(
     blocks: &[u32],
     (gpu, stream): (&dyn GpuBackend, u64),
     to_device: bool,
-) -> Result<()> {
+) -> Result<usize> {
     let record = spill.record;
     anyhow::ensure!(
         chunk < RING_CHUNKS && blocks.len() <= CHUNK_RECORDS,
@@ -172,7 +186,8 @@ fn copy_blocks(
             blocks.len() * record,
         )
     };
-    for (start, len) in block_runs(blocks) {
+    let runs = block_runs(blocks);
+    for &(start, len) in &runs {
         for (seg, &off) in spill.segments.iter().zip(seg_off) {
             let shape = Pitched {
                 host_pitch: record,
@@ -182,25 +197,27 @@ fn copy_blocks(
             };
             let host = &mut stage[start * record + off..][..shape.host_span()];
             let dev = seg.base.offset(blocks[start] as usize * seg.stride);
-            if to_device {
-                copy_h2d_pitched_async_retained(gpu, host, dev, shape, stream)?;
-            } else {
-                copy_d2h_pitched_async(gpu, dev, host, shape, stream)?;
+            match (to_device, len) {
+                (true, 1) => gpu.copy_h2d_async_retained(host, dev, stream)?,
+                (false, 1) => gpu.copy_d2h_async(dev, host, stream)?,
+                (true, _) => copy_h2d_pitched_async_retained(gpu, host, dev, shape, stream)?,
+                (false, _) => copy_d2h_pitched_async(gpu, dev, host, shape, stream)?,
             }
         }
     }
-    Ok(())
+    Ok(runs.len())
 }
 
 /// Write-behind spill; same contract as the synchronous `nvme_write` except
 /// that a failed WRITE is reported by a later call (see the module doc).
 pub(super) fn write(
     spill: &NvmeSpill,
-    fast: &mut FastIo,
+    (fast, io): (&mut FastIo, &mut NvmeIoStats),
     orders: &[SpillOrder],
     gpu: &dyn GpuBackend,
     stream: u64,
 ) -> Vec<SpillOrder> {
+    let waited = fast.waited;
     let mut failed = fast.take_failed();
     // The last order per slot is the live one: a slot the budget re-issued
     // inside this batch belongs to a node that is already gone.
@@ -225,21 +242,24 @@ pub(super) fn write(
         if round.iter().any(|o| fast.is_writing(o.slot)) {
             fast.flush();
         }
-        let groups: Vec<(usize, &[SpillOrder])> = round
-            .chunks(CHUNK_RECORDS)
-            .map(|g| (fast.chunk(), g))
-            .collect();
-        let gathered = groups.iter().try_for_each(|(chunk, g)| {
+        let mut groups: Vec<(usize, &[SpillOrder])> = Vec::new();
+        let gathered = round.chunks(CHUNK_RECORDS).try_fold(0, |runs, g| {
+            let chunk = fast.chunk()?;
+            groups.push((chunk, g));
             let blocks: Vec<u32> = g.iter().map(|o| o.block).collect();
-            copy_blocks(spill, &fast.seg_off, *chunk, &blocks, (gpu, stream), false)
+            copy_blocks(spill, &fast.seg_off, chunk, &blocks, (gpu, stream), false)
+                .map(|n| runs + n)
         });
         // Drain even after a failed enqueue: earlier copies still DMA into
         // staging.
-        if let Err(e) = gpu.synchronize(stream).and(gathered) {
-            tracing::warn!("NVMe KV spill: gather failed ({e:#}); dropping batch");
-            failed.extend_from_slice(round);
-            fast.free.extend(groups.iter().map(|(chunk, _)| *chunk));
-            continue;
+        match gpu.synchronize(stream).and(gathered) {
+            Ok(runs) => io.gather_runs += runs as u64,
+            Err(e) => {
+                tracing::warn!("NVMe KV spill: gather failed ({e:#}); dropping batch");
+                failed.extend_from_slice(round);
+                fast.free.extend(groups.iter().map(|(chunk, _)| *chunk));
+                continue;
+            }
         }
         for (chunk, g) in groups {
             fast.writing
@@ -247,6 +267,7 @@ pub(super) fn write(
             fast.pool.submit(chunk, Work::Write(g.to_vec()));
         }
     }
+    io.spill_wait_micros += fast.waited - waited;
     failed
 }
 
@@ -255,13 +276,15 @@ pub(super) fn write(
 /// blocks and scatters in pitched runs.
 pub(super) fn read(
     spill: &NvmeSpill,
-    fast: &mut FastIo,
+    (fast, io): (&mut FastIo, &mut NvmeIoStats),
     disk: &[DiskRef],
     blocks: &mut [u32],
     gpu: &dyn GpuBackend,
     stream: u64,
 ) -> (usize, bool) {
+    let waited = fast.waited;
     fast.flush();
+    io.flush_micros += fast.waited - waited;
     let n = disk.len().min(blocks.len());
     blocks[..n].sort_unstable();
     let mut in_flight: VecDeque<(usize, usize, usize)> = VecDeque::new();
@@ -289,7 +312,8 @@ pub(super) fn read(
             let run = &blocks[first..first + ok];
             let scattered = copy_blocks(spill, &fast.seg_off, chunk, run, (gpu, stream), true);
             match gpu.synchronize(stream).and(scattered) {
-                Ok(()) => {
+                Ok(runs) => {
+                    io.scatter_runs += runs as u64;
                     done += ok;
                     failed = ok < end - first;
                 }

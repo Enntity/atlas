@@ -59,18 +59,48 @@ pub(super) struct NvmeSpill {
     pub(super) staging_bytes: usize,
     /// `ATLAS_GLM_NVME_FAST`: write-behind / pipelined I/O over the staging
     /// ring. `None` = the synchronous path below.
-    fast: Option<FastIo>,
+    pub(super) fast: Option<FastIo>,
     io: NvmeIoStats,
 }
 
-/// What the spill path has cost the SERVING thread so far (the time inside
-/// `nvme_write`: all of a spill on the synchronous path, only the gather —
-/// and any wait on a full staging ring — on the fast path).
+/// What the tier's I/O has cost the SERVING thread so far, and how
+/// contiguous the blocks it moved were. `spill_micros` is the time inside
+/// `nvme_write`: all of a spill on the synchronous path; on the fast path the
+/// gather plus `spill_wait_micros`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NvmeIoStats {
     pub fast: bool,
     pub spilled_blocks: u64,
     pub spill_micros: u64,
+    /// Of `spill_micros`, waiting for the write-behind: a full staging ring
+    /// (the spill is then throttled to the disk's write speed) or a re-issued
+    /// slot whose earlier write is still queued. Fast path only.
+    pub spill_wait_micros: u64,
+    /// Restores waiting for queued writes before their first read. Fast path
+    /// only.
+    pub flush_micros: u64,
+    pub restored_blocks: u64,
+    /// Device copy runs so far: one per run of consecutive blocks on the
+    /// fast path, one per block on the synchronous path. Blocks ÷ runs says
+    /// how contiguous the pool was.
+    pub gather_runs: u64,
+    pub scatter_runs: u64,
+}
+
+impl NvmeIoStats {
+    /// What was added since `earlier` (an older reading of the same cache).
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            fast: self.fast,
+            spilled_blocks: self.spilled_blocks - earlier.spilled_blocks,
+            spill_micros: self.spill_micros - earlier.spill_micros,
+            spill_wait_micros: self.spill_wait_micros - earlier.spill_wait_micros,
+            flush_micros: self.flush_micros - earlier.flush_micros,
+            restored_blocks: self.restored_blocks - earlier.restored_blocks,
+            gather_runs: self.gather_runs - earlier.gather_runs,
+            scatter_runs: self.scatter_runs - earlier.scatter_runs,
+        }
+    }
 }
 
 // SAFETY: `staging` is a uniquely owned host allocation; the cache (and so
@@ -118,19 +148,6 @@ pub(super) fn verify(rec: &[u8], payload: usize, tag: u64) -> bool {
     let t = rec.len() - TRAILER;
     let word = |o: usize| u64::from_le_bytes(rec[t + o..t + o + 8].try_into().expect("8 bytes"));
     word(0) == MAGIC && word(8) == tag && word(16) == checksum(&rec[..payload])
-}
-
-#[cfg(test)]
-pub(super) fn stamp_for_test(rec: &mut [u8], payload: usize, tag: u64) {
-    stamp(rec, payload, tag)
-}
-
-#[cfg(test)]
-pub(super) use run_layout as run_layout_for_test;
-
-#[cfg(test)]
-pub(super) fn verify_for_test(rec: &[u8], payload: usize, tag: u64) -> bool {
-    verify(rec, payload, tag)
 }
 
 /// A spill write failed: count it and log at 1, 2, 4, 8, … (a full or failing
@@ -330,10 +347,12 @@ impl PagedKvCache {
         };
         let t0 = std::time::Instant::now();
         let mut failed = Vec::new();
+        let mut io = spill.io;
         if let Some(mut fast) = spill.fast.take() {
-            failed = nvme_fast::write(&spill, &mut fast, orders, gpu, stream);
+            failed = nvme_fast::write(&spill, (&mut fast, &mut io), orders, gpu, stream);
             spill.fast = Some(fast);
         } else {
+            io.gather_runs += orders.len() as u64;
             for batch in orders.chunks(STAGING_RECORDS) {
                 if let Err(e) = write_batch(&mut spill, batch, gpu, stream, &mut failed) {
                     // Nothing of this batch reached disk (writes follow the gather).
@@ -342,8 +361,9 @@ impl PagedKvCache {
                 }
             }
         }
-        spill.io.spilled_blocks += orders.len() as u64;
-        spill.io.spill_micros += t0.elapsed().as_micros() as u64;
+        io.spilled_blocks += orders.len() as u64;
+        io.spill_micros += t0.elapsed().as_micros() as u64;
+        spill.io = io;
         self.nvme = Some(spill);
         failed
     }
@@ -363,9 +383,12 @@ impl PagedKvCache {
         let Some(mut spill) = self.nvme.take() else {
             return (0, false);
         };
+        let mut io = spill.io;
         if let Some(mut fast) = spill.fast.take() {
-            let r = nvme_fast::read(&spill, &mut fast, disk, blocks, gpu, stream);
+            let r = nvme_fast::read(&spill, (&mut fast, &mut io), disk, blocks, gpu, stream);
+            io.restored_blocks += r.0 as u64;
             spill.fast = Some(fast);
+            spill.io = io;
             self.nvme = Some(spill);
             return r;
         }
@@ -391,6 +414,8 @@ impl PagedKvCache {
                 }
             }
         }
+        spill.io.restored_blocks += done as u64;
+        spill.io.scatter_runs += done as u64;
         self.nvme = Some(spill);
         (done, failed)
     }

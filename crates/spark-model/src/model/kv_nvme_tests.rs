@@ -325,6 +325,14 @@ fn restore_reports_where_its_time_went() {
     assert_eq!(io.spilled_blocks, 3);
     let r = restore_prefix(&tree, &mut kv, &gpu, &t, 0, 0, |p| p.disk.len()).unwrap();
     assert_eq!(r.restored, 3);
+    // Its share of the cache's counters: three blocks scattered as one run,
+    // the evictions it caused, and the waits for the writer kept apart from
+    // the gather (evict) and from the read.
+    assert_eq!((r.io.restored_blocks, r.io.scatter_runs), (3, 1));
+    assert_eq!(r.io.spilled_blocks, kv.nvme_io_stats().spilled_blocks - 3);
+    assert!(r.io.gather_runs <= r.io.spilled_blocks);
+    assert!(r.io.spill_wait_micros <= r.evict_micros);
+    assert_eq!(kv.nvme_io_stats().since(io).restored_blocks, 3);
     // The restored run sits on ascending blocks, in path order.
     let m = tree.lookup(&t, BS, 0, 0);
     assert!(m.matched_blocks.is_sorted(), "{:?}", m.matched_blocks);
