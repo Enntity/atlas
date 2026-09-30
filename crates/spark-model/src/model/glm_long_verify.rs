@@ -20,6 +20,7 @@
 
 use super::TransformerModel;
 use super::block_mgmt::ensure_blocks_through_decode;
+use super::block_table_upload::upload_block_table_rows;
 use crate::layer::glm_long_owner::{
     self as owner, GlmLongOwner, GlmLongStage, K3_ROWS, MAX_OWNERS, MAX_ROWS,
 };
@@ -154,19 +155,14 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<AttnMetadataDev> {
         let k = rows.len();
-        let mb = self.max_blocks_per_seq as usize;
         let positions: Vec<u32> = rows.iter().map(|&(p, _)| p as u32).collect();
         let seq_lens: Vec<i32> = rows.iter().map(|&(p, _)| p as i32 + 1).collect();
         let mut slots = Vec::with_capacity(k);
-        let mut table = vec![0i32; k * mb];
-        for (row, &(pos, seq)) in rows.iter().enumerate() {
+        for &(pos, seq) in rows {
             let block = seq
                 .physical_block_for(pos / block_size)
                 .context("GLM long owner verify block missing")?;
             slots.push(block as i64 * block_size as i64 + (pos % block_size) as i64);
-            for (j, &b) in seq.block_table.iter().enumerate().take(mb) {
-                table[row * mb + j] = b as i32;
-            }
         }
         fn bytes<T>(v: &[T]) -> &[u8] {
             // SAFETY: POD integer vectors; the byte view covers exactly `len`.
@@ -177,8 +173,13 @@ impl TransformerModel {
             .copy_h2d_async(bytes(&slots), base.offset(META_SLOTS), stream)?;
         self.gpu
             .copy_h2d_async(bytes(&seq_lens), base.offset(META_SEQ_LENS), stream)?;
-        self.gpu
-            .copy_h2d_async(bytes(&table), base.offset(META_BLOCK_TABLE), stream)?;
+        upload_block_table_rows(
+            self.gpu.as_ref(),
+            base.offset(META_BLOCK_TABLE),
+            self.max_blocks_per_seq as usize,
+            rows.iter().map(|&(_, seq)| &seq.block_table[..]),
+            stream,
+        )?;
         let seq_slot = self.upload_seq_slot_uniform(
             rows[0].1.adapter_slot,
             k,

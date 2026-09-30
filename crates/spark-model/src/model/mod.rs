@@ -24,6 +24,7 @@
 #![allow(unused_imports, dead_code)]
 
 pub(crate) mod block_mgmt;
+mod block_table_upload;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
 pub mod glm_c4;
