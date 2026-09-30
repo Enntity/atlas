@@ -567,7 +567,11 @@ impl TransformerModel {
             }
             0xFFFFFFF5 => self.ep_worker_generic_verify(seq, stream)?,
             token => {
-                // Regular decode
+                // Regular decode. A verify commit may still be in flight on
+                // the secondary stream: the head orders its decode after it
+                // (`sync_secondary` in the scheduler), which no wire command
+                // carries, so the worker orders its own.
+                self.sync_secondary()?;
                 self.decode(token, seq, stream)?;
             }
         }
@@ -637,6 +641,7 @@ impl TransformerModel {
         }
 
         let stream = self.gpu.default_stream();
+        self.sync_secondary()?; // as for the single-token decode above
         self.decode_batch_compute_main(&tokens, &mut refs, stream)?;
         Ok(true)
     }
