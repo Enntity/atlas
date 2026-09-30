@@ -55,6 +55,9 @@ impl TransformerModel {
             } else if let Some(prefix_match) = reserved_match {
                 prefix_match
             } else {
+                // NVMe spill tier: page the on-disk continuation back in so
+                // the resident-only lookup below sees it (no-op when off).
+                self.nvme_restore_prefix(tokens, seq, kv_cache, stream);
                 self.prefix_cache
                     .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
             };

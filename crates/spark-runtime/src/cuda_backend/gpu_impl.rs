@@ -40,7 +40,7 @@ use super::{
     AtlasCudaBackend, cuMemAlloc_v2, cuMemAllocManaged, cuMemFree_v2, cuMemGetInfo_v2,
     cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuStreamSynchronize,
 };
-use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, HostPitched, KernelHandle};
 
 // The host-side copy helpers live beside this file — see its module doc for
 // why they could not stay (a trait `impl` cannot be split, so only the code
@@ -217,6 +217,14 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(())
     }
 
+    fn synchronize_device(&self) -> Result<()> {
+        let status = unsafe { super::cuCtxSynchronize() };
+        if status != 0 {
+            bail!("cuCtxSynchronize failed: {}", cuda_error_text(status));
+        }
+        Ok(())
+    }
+
     fn default_stream(&self) -> u64 {
         self.default_stream
     }
@@ -292,6 +300,10 @@ impl GpuBackend for AtlasCudaBackend {
         // no implicit ordering is added — that is the whole reason this variant
         // exists (a 60-chunk pinned scatter must not pay 60 stream drains).
         h2d_enqueue(src, dst, stream)
+    }
+
+    fn host_pitched(&self) -> Option<&dyn HostPitched> {
+        Some(self)
     }
 
     fn copy_d2d_async(

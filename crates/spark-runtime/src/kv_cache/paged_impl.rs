@@ -95,6 +95,7 @@ impl PagedKvCache {
             sparse_index_config: None,
             tail_slots: None,
             trace: BlockTrace::new(num_blocks),
+            nvme: None,
         })
     }
 

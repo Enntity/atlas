@@ -23,6 +23,7 @@ use crate::weight_loader::load_dflash_weights;
 
 mod glm;
 mod kv_budget;
+mod kv_nvme;
 mod kv_summary;
 
 pub fn build_model(
@@ -514,6 +515,12 @@ pub fn build_model(
     // Issue #71: lazy FP8→BF16 dequant copies allocate after this sizing;
     // see `ops::lazy_bf16_reserve` for what counts and what logs.
     let derived_reserve = crate::layers::ops::lazy_bf16_reserve(&store);
+    // NVMe spill tiers (default off → 0): their staging, the index of a full
+    // disk budget and the SSM tier's arena are all committed after this point.
+    let nvme_record_bytes =
+        PagedKvCache::nvme_record_bytes_for(&kv_config, glm_cache_plan.is_some(), sparse_index);
+    let inference_reserve = inference_reserve
+        + kv_nvme::host_reserve_bytes(nvme_record_bytes, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
         total_mem,
@@ -617,8 +624,13 @@ pub fn build_model(
             n
         }
     };
-    num_kv_blocks =
-        glm::agree_kv_blocks(comm.as_deref(), gpu.as_ref(), num_kv_blocks, glm_cache_plan)?;
+    num_kv_blocks = glm::agree_kv_blocks(
+        comm.as_deref(),
+        gpu.as_ref(),
+        num_kv_blocks,
+        glm_cache_plan,
+        kv_nvme::rank_word(nvme_record_bytes),
+    )?;
     let _max_kv_tokens = num_kv_blocks * kv_block_size;
     // Phase 6.1.f / 6.2.c — when --high-speed-swap is on with HBM-shrink, the
     // production KV cache only has to fit the per-seq HBM window, not the full
@@ -687,6 +699,12 @@ pub fn build_model(
     if let Some(index) = sparse_index {
         kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
     }
+    kv_nvme::attach(
+        &mut kv_cache,
+        prefix_cache.as_ref(),
+        gpu.as_ref(),
+        comm.as_deref().map_or(0, |c| c.rank()),
+    )?;
 
     // ── Step 6: Assemble model ──
     // Capture pointers for any post-construction sharing (DFlash drafter

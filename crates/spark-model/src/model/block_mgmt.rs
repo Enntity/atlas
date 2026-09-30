@@ -55,10 +55,21 @@ fn fill_fresh_blocks(
 /// orchestrator. Physical blocks return to the free list; disk-block IDs get
 /// `dec_disk_ref`'d (Phase 6.1.e). When HSS isn't engaged the disk vec is
 /// empty and this becomes a thin loop over the physical blocks.
+///
+/// NVMe spill tier: the blocks named in `evicted.spill` are written to disk
+/// FIRST — before any of them can reach the free list and be overwritten (on
+/// the fast path: gathered into staging that a queued write owns). A write
+/// that fails degrades to a plain eviction (the tree drops that node).
 pub(crate) fn apply_evicted_blocks(
     evicted: spark_runtime::prefix_cache::EvictedBlocks,
     kv_cache: &mut PagedKvCache,
+    prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
+    gpu: &dyn GpuBackend,
 ) {
+    if !evicted.spill.is_empty() {
+        let failed = kv_cache.nvme_write(&evicted.spill, gpu, gpu.default_stream());
+        drop_failed_spills(&failed, kv_cache, prefix_cache);
+    }
     let free_before = kv_cache.num_free_blocks();
     let n_evicted = evicted.physical.len();
     for block in &evicted.physical {
@@ -95,6 +106,39 @@ pub(crate) fn apply_evicted_blocks(
     }
 }
 
+/// Spill writes that did not reach the disk: the tree forgets those nodes (a
+/// plain eviction). The fast path reports a failure after the fact, so this
+/// also runs around a restore.
+pub(crate) fn drop_failed_spills(
+    failed: &[spark_runtime::prefix_cache::SpillOrder],
+    kv_cache: &mut PagedKvCache,
+    prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
+) {
+    if !failed.is_empty()
+        && let Some(tier) = prefix_cache.nvme()
+    {
+        for block in tier.spill_failed(failed) {
+            kv_cache.return_evicted_block(block);
+        }
+    }
+}
+
+impl TransformerModel {
+    /// [`apply_evicted_blocks`] against this model's prefix cache and GPU.
+    pub(crate) fn apply_evicted(
+        &self,
+        evicted: spark_runtime::prefix_cache::EvictedBlocks,
+        kv_cache: &mut PagedKvCache,
+    ) {
+        apply_evicted_blocks(
+            evicted,
+            kv_cache,
+            self.prefix_cache.as_ref(),
+            self.gpu.as_ref(),
+        );
+    }
+}
+
 /// Allocate one block, evicting from the prefix cache as many times as it takes.
 ///
 /// Evicting a radix node returns only the CACHE's reference to its block, so if a
@@ -115,13 +159,14 @@ pub(crate) fn apply_evicted_blocks(
 pub(crate) fn alloc_block_evicting(
     kv_cache: &mut PagedKvCache,
     prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
+    gpu: &dyn GpuBackend,
 ) -> Option<u32> {
     if let Some(b) = kv_cache.try_alloc_block() {
         return Some(b);
     }
     let mut evicted_nodes = 0usize;
     loop {
-        let evicted = prefix_cache.evict(1);
+        let evicted = prefix_cache.evict(kv_cache.evict_batch());
         if evicted.is_empty() {
             if evicted_nodes > 0 {
                 tracing::debug!(
@@ -132,7 +177,7 @@ pub(crate) fn alloc_block_evicting(
             return None;
         }
         evicted_nodes += evicted.len();
-        apply_evicted_blocks(evicted, kv_cache);
+        apply_evicted_blocks(evicted, kv_cache, prefix_cache, gpu);
         if let Some(b) = kv_cache.try_alloc_block() {
             if evicted_nodes > 1 {
                 tracing::debug!(
@@ -364,7 +409,7 @@ pub(crate) fn ensure_blocks_through_decode(
         // "alloc failed in ensure_blocks_through_decode: abs=590 ...
         //  free_blocks=0". The prefill helper already had this; the
         // decode helper diverged.
-        let blk = match alloc_block_evicting(kv_cache, prefix_cache) {
+        let blk = match alloc_block_evicting(kv_cache, prefix_cache, gpu) {
             Some(b) => b,
             None => {
                 return Err(anyhow::anyhow!(
@@ -445,7 +490,7 @@ pub(crate) fn ensure_blocks_through_prefill(
     // preempt-and-retry re-enters with them in-window, where nothing would
     // ever zero them or lend them index tails.
     let mut fresh = Vec::new();
-    let grown = grow_prefill_window(seq, abs_block_idx, kv_cache, prefix_cache, &mut fresh);
+    let grown = grow_prefill_window(seq, abs_block_idx, kv_cache, prefix_cache, gpu, &mut fresh);
     fill_fresh_blocks(kv_cache, &fresh, gpu, stream, kv_poison)?;
     grown?;
     check_write_window_tails(seq, abs_block_idx, kv_cache)

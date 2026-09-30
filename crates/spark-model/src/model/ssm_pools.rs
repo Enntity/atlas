@@ -34,6 +34,15 @@ pub struct SsmPools {
 }
 
 impl SsmPools {
+    /// Host bytes the snapshot spill tier takes after KV sizing (0 without a
+    /// tier) — see `ssm_tier::lazy_host_bytes`.
+    pub(crate) fn tier_lazy_host_bytes(&self) -> usize {
+        match self.tier_store {
+            Some(_) => super::ssm_tier::lazy_host_bytes(self.snapshots.spill_blob_bytes()),
+            None => 0,
+        }
+    }
+
     /// Build the pools. Must run before the KV-cache budget snapshot in
     /// `factory::build_model` — see the module doc.
     pub(crate) fn new(

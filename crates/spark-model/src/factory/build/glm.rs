@@ -179,6 +179,7 @@ pub(super) fn agree_kv_blocks(
     gpu: &dyn GpuBackend,
     mut num_kv_blocks: usize,
     glm_cache_plan: Option<GlmCachePlan>,
+    spill_tier: Result<u32>,
 ) -> Result<usize> {
     // Test knob: cap the pool (e.g. to force prefix-cache eviction and the
     // NVMe tier without starving the rest of the budget).
@@ -194,7 +195,7 @@ pub(super) fn agree_kv_blocks(
     // with less headroom (e.g. no drafter, different co-tenants) must not
     // size a pool the others cannot back: all ranks take the minimum.
     if let Some(comm) = comm.filter(|c| c.world_size() > 1) {
-        let agreed = min_across_ranks(comm, gpu, num_kv_blocks)?;
+        let agreed = min_across_ranks(comm, gpu, num_kv_blocks, spill_tier)?;
         if agreed < num_kv_blocks {
             tracing::info!(
                 "KV cache: rank {} fits {num_kv_blocks} blocks; all ranks agree on {agreed}",
@@ -210,23 +211,37 @@ pub(super) fn agree_kv_blocks(
 }
 
 /// The minimum of `value` over all ranks (one 8-byte all-gather).
+///
+/// The upper half of each rank's word is its spill-tier word
+/// (`kv_nvme::rank_word`), which every rank must share: the agreement the
+/// tier needs rides the collective the ranks already issue here. With the
+/// tier off that half is 0 and the word is the bare block count, as before
+/// (block ids are `u32`, so a count never reaches the upper half).
 fn min_across_ranks(
     comm: &dyn spark_comm::CommBackend,
     gpu: &dyn GpuBackend,
     value: usize,
+    spill_tier: Result<u32>,
 ) -> Result<usize> {
+    let tier = *spill_tier.as_ref().unwrap_or(&super::kv_nvme::FAILED_RANK);
     let world = comm.world_size();
     let buf = gpu.alloc(8 * (world + 1))?;
     let result = (|| {
-        gpu.copy_h2d(&(value as u64).to_le_bytes(), buf)?;
+        gpu.copy_h2d(&(value as u64 | u64::from(tier) << 32).to_le_bytes(), buf)?;
         comm.all_gather(buf.0, buf.offset(8).0, 8)?;
         let mut all = vec![0u8; 8 * world];
         gpu.copy_d2h(buf.offset(8), &mut all)?;
-        all.chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().expect("8-byte rank value")) as usize)
-            .min()
-            .ok_or_else(|| anyhow::anyhow!("empty rank gather"))
+        anyhow::Ok(all)
     })();
     gpu.free(buf)?;
-    result
+    let (tiers, values): (Vec<u32>, Vec<usize>) = result?
+        .chunks_exact(8)
+        .map(|b| u64::from_le_bytes(b.try_into().expect("8-byte rank value")))
+        .map(|w| ((w >> 32) as u32, (w & u64::from(u32::MAX)) as usize))
+        .unzip();
+    super::kv_nvme::verify_ranks(spill_tier, &tiers)?;
+    values
+        .into_iter()
+        .min()
+        .ok_or_else(|| anyhow::anyhow!("empty rank gather"))
 }

@@ -21,6 +21,20 @@ pub(crate) fn ssm_tier_enabled() -> bool {
     std::env::var_os("ATLAS_SSM_TIER").is_some()
 }
 
+/// Host RAM the snapshot tier commits only AFTER construction, for KV sizing
+/// (`SsmPools::tier_lazy_host_bytes`): the pinned spill/fault-in staging blob
+/// (allocated on the first spill) and, for the unified host-RAM arm, the hot
+/// arena — a zeroed `Vec` the kernel backs page by page as slots fill.
+pub(crate) fn lazy_host_bytes(blob_bytes: usize) -> usize {
+    let remote_arena = std::env::var("ATLAS_SSM_RDMA_TIER").is_ok_and(|s| !s.is_empty());
+    let arena = if ssm_tier_unified() && !remote_arena {
+        unified_hot_slots()
+    } else {
+        0
+    };
+    (arena + 1) * blob_bytes
+}
+
 /// Build the SSM spill-tier store (called only when `ssm_tier_enabled()`).
 /// `ATLAS_SSM_RDMA_TIER=host:port` selects the RDMA arena
 /// ([`RdmaSnapshotStore`] over a peer blade, `ATLAS_SSM_RDMA_ARENA_SLOTS` slots,
