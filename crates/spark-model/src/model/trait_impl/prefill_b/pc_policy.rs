@@ -98,6 +98,38 @@ pub(in crate::model) fn glm_pc_branch_min_tokens() -> usize {
     })
 }
 
+/// `ATLAS_GLM_PC_WRITE_FLOOR=1`: see [`layer_write_floor`]. Read once. Both
+/// ranks must run the same value (each rank then reads the same cache rows).
+pub(in crate::model) fn glm_pc_write_floor_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_PC_WRITE_FLOOR").as_deref() == Ok("1"))
+}
+
+/// The KV write floor a prefill pass over rows `[start, start + rows)` hands
+/// its layers. `replay_floor` is the base value: the rows a Marconi replay
+/// spends under the radix match `matched`, and 0 for a prefix hit with
+/// nothing to restore, which recomputes from token 0 and rewrites every
+/// matched block under the sequences that share it. With the flag (`on`)
+/// that pass floors its writes at the match as well: the matched blocks are
+/// fully written (`kv_valid_tokens` caps what the radix holds), so its
+/// attention reads them instead. Same kernels and math for every row; rows
+/// under the match then attend to the cached K/V rather than this pass's
+/// own recompute of it, so its output can differ bitwise from the flag-off
+/// run, as a Marconi replay's does from a cold one.
+pub(super) fn layer_write_floor(
+    on: bool,
+    replay_floor: usize,
+    matched: usize,
+    start: usize,
+    rows: usize,
+) -> usize {
+    if on {
+        replay_floor.max(matched.saturating_sub(start).min(rows))
+    } else {
+        replay_floor
+    }
+}
+
 /// Whether ranks must agree on the Marconi restore depth: on with either
 /// prefix-cache policy flag, because both make later decisions depend on it.
 pub(in crate::model) fn pc_rank_agree_enabled() -> bool {

@@ -174,6 +174,15 @@ impl TransformerModel {
             None
         };
         let mut layer_times: Vec<u128> = Vec::new();
+        // `ATLAS_GLM_PC_WRITE_FLOOR`: a recompute-all prefix hit keeps the
+        // matched blocks too. The DFlash capture below takes the base value.
+        let layer_write_floor = super::pc_policy::layer_write_floor(
+            super::pc_policy::glm_pc_write_floor_enabled() && self.config.model_type == "glm5_next",
+            layer_kv_write_start,
+            seq.cached_prefix_tokens,
+            effective_seq_len_start,
+            proc_count,
+        );
         // HOST-TIME instrumentation (ATLAS_PREFILL_HOST_TIMING=1). Distinct
         // from `profile_now`: that path synchronizes per layer, which
         // serialises host and device and hides the host-side cost this is
@@ -253,7 +262,7 @@ impl TransformerModel {
                         &mut seq.block_table,
                         &mut seq.disk_block_ids,
                         &mut seq.disk_last_offloaded_per_layer,
-                        layer_kv_write_start,
+                        layer_write_floor,
                         &ctx,
                         stream,
                     )
