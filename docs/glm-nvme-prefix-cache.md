@@ -165,8 +165,13 @@ misconfigured rank stops every rank instead of leaving its peers hung.
 |---|---|
 | `ATLAS_KV_NVME_DIR=<dir>` | Enables the KV tier. Must be on the real NVMe filesystem, not tmpfs/overlay (O_DIRECT). |
 | `ATLAS_KV_NVME_GB=<GiB>` | **Required** alongside the dir (strict parse, > 0). Per-rank disk budget; the coldest on-disk blocks are dropped beyond it. |
-| `ATLAS_GLM_NVME_FAST=1` | The fast I/O path (§5): same records, moved in run-sized requests and pitched copies, written behind the evicting request. Also reserves the whole budget on disk at startup. Strict `1`/`0`. |
+| `ATLAS_GLM_NVME_FAST=1` | The fast I/O path (§5): same records, moved in run-sized requests and pitched copies, written behind the evicting request. Also reserves the whole budget on disk at startup. Strict `1`/`0`; part of the rank fingerprint. |
 | `ATLAS_GLM_NVME_KEEP=1` | A restored block keeps its record, so evicting it again writes nothing (§5). Strict `1`/`0`; part of the rank fingerprint. |
+
+The two `ATLAS_GLM_NVME_*` switches only choose how the tier moves records.
+Without `ATLAS_KV_NVME_DIR` they are not read at all: the rank starts exactly
+as it does with them unset, whatever they hold, and logs one warning per
+switch that is set. (`ATLAS_KV_NVME_GB` without the directory stays an error.)
 | `ATLAS_SSM_TIER=1` `ATLAS_SSM_TIER_UNIFIED=1` `ATLAS_SSM_TIER_SWAP_DIR=<dir>` `ATLAS_SSM_TIER_DISK_GB=<GiB>` `ATLAS_SSM_TIER_SLOTS=2` | Existing KDA snapshot tier (see §1). |
 
 Setting `ATLAS_KV_NVME_DIR` without `--enable-prefix-caching`, or together
@@ -261,8 +266,19 @@ becomes:
 
 A worker pads and checksums the chunk's records and writes each run of
 consecutive slots with one request (`pwritev` when the run is back to front —
-a chain spilled leaf first has ascending slots and descending blocks). The
-evicting thread only waits when all 8 chunks are in flight.
+a chain spilled leaf first has ascending slots and descending blocks). A run
+of ONE block (a fragmented pool) is moved with the synchronous path's plain
+copies, one per region: a one-row pitched copy costs the same (36 µs per
+block gathered, 73 µs scattered, either way — §9), so fragmentation degrades
+the GPU side to the synchronous path's cost and no further.
+
+The evicting thread waits when all 8 chunks are in flight. In a burst — a
+25 K-token prefill or restore evicting 1,582 blocks — the ring fills after the
+first 128, and from there the spill is throttled to the disk's write speed.
+That wait is timed separately (`spill_wait_micros`) and logged. If the ring
+ever has neither a free chunk nor a write to wait for (a leaked chunk; not
+reachable today), the batch fails like a gather failure — those blocks are
+evicted as without the tier — instead of spinning on the serving thread.
 
 What keeps this safe:
 
@@ -273,7 +289,11 @@ What keeps this safe:
   slot inside a batch; the earlier node is already gone);
 - a write that fails is reported on the next spill or restore. Until then
   its node points at a record with the wrong tag, which fails verification —
-  a recompute, never stale bytes.
+  a recompute, never stale bytes;
+- a failed RUN is reported as a whole, although its leading records may be
+  on disk intact. A report for a node that is resident again is ignored: with
+  kept records that node was restored from the very record in question,
+  which therefore verified.
 
 **Kept records (`ATLAS_GLM_NVME_KEEP=1`).** A restored block normally gives
 its slot back. With this flag it keeps it: the node is resident AND has a
@@ -329,10 +349,12 @@ about 220–250 µs for the record's own `pwrite`, 26 µs per checksum, and
 The fast-path columns are projections from §9 (the disk pipeline at
 10–48 µs/block across runs of the microbench, GPU scatter at 8–25 µs/block
 in the isolated probes, the two overlapped; the low end needs a quiet
-host). The log line reports both parts
-(`evict … ms + read … ms (… MB/s)`), which is what the pair run has to
-confirm. With `ATLAS_GLM_NVME_KEEP=1`, victims that were themselves restored
-cost nothing, and the last column collapses toward the one before it.
+host, and both assume consecutive blocks and slots — the restore line's
+blocks-per-run figures say how true that was). The log line reports the
+parts (`evict … ms + read … ms (… MB/s)`, the writer waits inside `evict`,
+and the flush before the read), which is what the pair run has to confirm.
+With `ATLAS_GLM_NVME_KEEP=1`, victims that were themselves restored cost
+nothing, and the last column collapses toward the one before it.
 
 Add to either path the KDA snapshot fault-in (one 78 MB blob) and the replay
 from the anchor, which are existing behaviour: on the pair they are the
@@ -342,9 +364,11 @@ remaining ~1.0 s of the 1.53–1.86 s turn-2 start.
 evicted block on the serving thread in the pipeline microbench, before any
 GPU copy cost — 0.4–0.5 s of an 11 s, 25 K-token prefill, which is
 consistent with the turn-1 TTFT rise of up to 5% seen on the pair. Fast
-path, projected: only the gather stays on the serving thread (one device
-sync and 22 pitched copies per 32-block batch, about 10–30 µs per block in
-the isolated probes), 0.02–0.05 s for the same prefill.
+path, projected: the gather (one device sync and 22 pitched copies per
+32-block batch, about 10–30 µs per block in the isolated probes) plus, once
+the 8-chunk ring is full, the wait for the writer — up to about 41 µs per
+block at the 2.6 GB/s measured for 8 concurrent single-record writers, less
+for run-sized writes. That is 0.02–0.11 s for the same prefill.
 
 ### Rank-agreement guarantees
 
@@ -376,6 +400,8 @@ the isolated probes), 0.02–0.05 s for the same prefill.
 | Disk cannot hold the budget (fast path) | Startup error naming `ATLAS_KV_NVME_GB`: the whole budget is reserved (`fallocate`) before serving, so a spill cannot run out of disk later. Every rank stops. |
 | Directory on tmpfs / ramfs / overlayfs, or not writable | Startup error naming the variable (KV directory, and the snapshot tier's swap directory when it is configured). Every rank stops. |
 | A worker thread panics (fast path) | Caught; the job is reported as failed (a write: those nodes are dropped; a read: the restore stops there). The serving thread never waits on a job that cannot finish. |
+| Staging ring with no free chunk and no write in flight (fast path; a leak) | The spill batch fails (plain eviction) with a warning; a restore attempts nothing and the prefix recomputes. No wait. |
+| A write failure reported after its node was restored (kept records) | Ignored for that node: it was restored from that record, which verified. The failure is still counted. |
 | Budget full | The coldest droppable on-disk leaf is dropped (LRU). If the eviction candidate is colder than every on-disk block, the candidate itself is deleted instead. |
 | `pread` error / short read at restore | The verified prefix is kept. The failing record's node and its on-disk subtree are dropped. The rest is recomputed. |
 | Wrong tag, bad magic, or checksum mismatch | Treated the same as a read error. The bytes are never scattered into a block the tree adopts. |
@@ -388,9 +414,13 @@ the isolated probes), 0.02–0.05 s for the same prefill.
 - **The fast path and kept records have not served a request.** Verified so
   far: unit tests on both I/O paths (byte-identical records either way), the
   Linux `O_DIRECT` / `preadv` / `pwritev` / `fallocate` arms and the real
-  pipeline on a GB10's NVMe, and the copy shapes on a GB10 GPU in isolation.
-  Not verified: `cudaMemcpy2DAsync` between the pinned ring and the KV pools
-  inside the server, and every end-to-end number.
+  pipeline on a GB10's NVMe, and the copy shapes on a GB10 GPU in isolation —
+  including that `cudaMemcpy2DAsync` with the record as host pitch is
+  byte-exact in both directions for runs of 1 to 511 blocks (§9).
+  Not verified: those copies between the pinned ring and the KV pools inside
+  the server, the ring under a real eviction burst, a fragmented pool (the
+  A/B below runs on a fresh server, where blocks and slots are consecutive),
+  and every end-to-end number.
 - **Restore only runs in `prefill_b`** (chunked prefill), the multi-rank path.
   `prefill_a`/`prefill_c` and the single-rank batched reservation path stay
   resident-only: correct, just no restore.
@@ -452,34 +482,56 @@ the isolated probes), 0.02–0.05 s for the same prefill.
    appears (`num_free_blocks` returns to baseline when idle), that RSS is
    bounded, and that there are no deadlocks.
 6. **Fast path A/B** (one server start per arm, pool capped with
-   `ATLAS_KV_MAX_BLOCKS=7500` so 8 conversations of ~25 K tokens evict each
+   `ATLAS_KV_MAX_BLOCKS=7500` so 8 conversations of 25 K tokens evict each
    other):
    - `sync`: the flags from §3;
    - `fast`: plus `ATLAS_GLM_NVME_FAST=1`;
    - `fastkeep`: plus `ATLAS_GLM_NVME_FAST=1 ATLAS_GLM_NVME_KEEP=1`.
 
-   Compare, on both ranks, the restore line:
+   Each arm runs the same 23 salted requests (about 2.5 minutes): 8 cold
+   conversations, turn 2 of each (first restore), turn 3 of conversations
+   0–3 (second restore — with `fastkeep`, from records that survived a
+   restore and a write-free eviction), and turn 3 of conversations 4 and 5
+   sent together. Answers are planted text (three codes and ten ledger
+   entries per conversation), checked exactly.
+
+   The restore line, on both ranks (one line in the log; the numbers are an
+   illustration, not a measurement):
 
    ```text
-   NVMe prefix restore: 1582/1582 blocks (25312 tokens after 0 resident) in 71.3 ms;
+   NVMe prefix restore: 1582/1582 blocks (25312 tokens after 0 resident) in 96.4 ms;
      tier 5204/403298 slots, 17871 spills, 12659 restores, 0 failures;
-     evict 38.0 ms + read 33.3 ms (5059 MB/s);
-     spill path (fast): 17871 blocks in 402.7 ms on the serving thread,
-     0 evictions without a write
+     evict 52.0 ms + read 33.3 ms (5059 MB/s);
+     spill path (fast): 17871 blocks in 702.7 ms on the serving thread,
+     0 evictions without a write;
+     this restore: writer wait 31.0 ms in evict, flush 9.8 ms before read,
+     31.6 blocks/scatter run, 1582 spilled at 30.4 blocks/gather run;
+     spill path waited 310.2 ms for the writer
    ```
 
-   (one line in the log; the numbers above are an illustration, not a
-   measurement). `in X ms` is the whole restore; `evict` is allocating the
-   target blocks, which on a full pool is spilling that many victims; `read`
-   is read + verify + scatter and carries the MB/s; `spill path` is the
-   cumulative time `nvme_write` has cost the serving thread since startup —
-   divide by its block count for µs per evicted block. Expect, against the
-   `sync` arm: answers byte-identical; `in X ms` down from 534–824 ms to
-   under 150 ms; read at 2 GB/s or better; serving-thread spill cost down
-   from ~250–350 µs to under 80 µs per block; turn-1 TTFT back to the
-   tier-off figure. With `fastkeep`, the later restores evict conversations
-   that were themselves restored: `evictions without a write` rises and
-   `evict` falls toward zero.
+   - `in X ms` is the whole restore;
+   - `evict` is allocating the target blocks, which on a full pool is
+     spilling that many victims: the gather plus `writer wait`;
+   - `flush` is the wait for those victims' queued writes before the first
+     read;
+   - `read` is read + verify + scatter only, and carries the MB/s;
+   - `blocks/… run` is how contiguous the blocks were (1.0 = one copy per
+     region per block, the synchronous path's cost);
+   - `spill path` is the cumulative time `nvme_write` has cost the serving
+     thread since startup, and `spill path waited` the part of it spent
+     waiting for the writer.
+
+   GO needs, against the `sync` arm and on **both** ranks: every answer
+   exact; every warm request matching its whole turn-1 prompt
+   (`cached_tokens`) and starting within 0.3× its own cold TTFT; exactly one
+   complete restore per warm request, no failure, no F83 cap, no `no SSM
+   snapshot`, no rank disagreement; restore time ≤ 95 µs per block and at
+   most a third of `sync`'s; read + verify + scatter ≥ 1.5 GB/s and at least
+   twice `sync`'s; gather
+   ≤ 80 µs per evicted block and the whole serving-thread spill cost at most
+   a third of `sync`'s; the evicting turn-1 prefills no slower than `sync`'s;
+   turn-2 TTFT at least 0.25 s lower. With `fastkeep`, additionally at least
+   1,000 `evictions without a write` before the second restores.
 
 ## 9. Where the time went
 
@@ -581,6 +633,23 @@ Run it on an NVMe-backed checkout with
 It does not measure the GPU copies, and the mock's host `memcpy` stands in
 for them on both paths. On the pair, the restore line is the judge.
 
+**Pitched copies on the GPU** (isolated probe on the same GB10, record layout
+of GLM-5.3, three runs):
+
+- *Byte-exact.* Runs of 1, 2, 3, 16, 31, 32, 128 and 511 consecutive blocks
+  were gathered with one pitched copy per region into record-pitched staging,
+  scattered to other blocks the same way and read back with plain copies:
+  154 MB compared per run of the probe, 0 bytes wrong, the record padding and
+  the neighbouring blocks untouched.
+- *A run of one block.* 512 scattered blocks, 22 copies each: 36 µs per
+  block gathered and 73 µs scattered, the same whether each copy is a
+  one-row pitched copy or a plain async copy (best of 7 identical to 0.1 ms
+  in all three runs). The fast path uses the plain copy there. A fully
+  fragmented pool therefore costs the fast path what it costs the
+  synchronous one on the GPU side — about 110 µs per block restored and
+  evicted — and the blocks-per-run figures in the restore line say how far
+  from that a given restore was.
+
 ## 10. Memory the tier takes (per rank)
 
 GB10 memory is one pool: host RAM, pinned host memory and device memory all
@@ -626,6 +695,15 @@ mode 0700, owned by the container user. It must be a real disk filesystem
 that it can create an `O_DIRECT` file there. Atlas creates the `kv` and `ssm`
 subdirectories itself. The two ranks do not share storage; each node uses
 its own disk.
+
+**One server per directory.** Every process opens its record file once,
+exclusively and owner-only, and the startup sweep only unlinks names (a live
+owner keeps its descriptor), so a second process in the same KV directory
+cannot read or clobber another's records. It is still not a supported
+layout: each process reserves its own `ATLAS_KV_NVME_GB`, and the snapshot
+tier's file name carries the PID only — PID 1 in every container — so two
+servers started at the same instant in one `ATLAS_SSM_TIER_SWAP_DIR` could
+open the same file.
 
 **Profile environment, identical on both ranks** (startup all-gathers a
 fingerprint and refuses to start on a mismatch):
