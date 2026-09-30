@@ -483,6 +483,14 @@ pub fn build_model(
         kv_block_size,
         max_batch_size,
     )?;
+    let glm_cache_plan = glm::shard_plan(
+        glm_cache_plan,
+        &config,
+        &kv_config,
+        comm.as_deref(),
+        max_seq_len,
+        max_batch_tokens,
+    )?;
 
     if hss_cache_blocks_per_seq.is_some() {
         kv_summary::log_hss_kv_summary(&kv_config);
@@ -692,12 +700,7 @@ pub fn build_model(
             );
         }
     }
-    let mut kv_cache = PagedKvCache::new_with_v_alias(
-        kv_config,
-        num_kv_blocks,
-        gpu.as_ref(),
-        glm_cache_plan.is_some(),
-    )?;
+    let mut kv_cache = glm::new_kv_cache(kv_config, num_kv_blocks, gpu.as_ref(), glm_cache_plan)?;
     if let Some(index) = sparse_index {
         kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
     }

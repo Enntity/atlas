@@ -44,6 +44,10 @@ pub struct MockGpuBackend {
     pending_free_failures: AtomicUsize,
     /// `destroy_graph` call counter (see [`Self::destroy_graph_count`]).
     destroyed_graphs: AtomicUsize,
+    /// Streams and events created and not yet destroyed (see
+    /// [`Self::live_streams_and_events`]).
+    live_streams: AtomicUsize,
+    live_events: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -78,7 +82,18 @@ impl MockGpuBackend {
             host_pinned_allocs: AtomicUsize::new(0),
             pending_free_failures: AtomicUsize::new(0),
             destroyed_graphs: AtomicUsize::new(0),
+            live_streams: AtomicUsize::new(0),
+            live_events: AtomicUsize::new(0),
         }
+    }
+
+    /// `(streams, events)` created and not yet destroyed: the leak check of
+    /// whatever owns them.
+    pub fn live_streams_and_events(&self) -> (usize, usize) {
+        (
+            self.live_streams.load(Ordering::Relaxed),
+            self.live_events.load(Ordering::Relaxed),
+        )
     }
 
     /// Queue one `free` failure: the next `free` call returns an error and
@@ -413,6 +428,26 @@ impl GpuBackend for MockGpuBackend {
 
     fn destroy_graph(&self, _graph: GraphHandle) -> Result<()> {
         self.destroyed_graphs.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn create_stream(&self) -> Result<u64> {
+        self.live_streams.fetch_add(1, Ordering::Relaxed);
+        Ok(0)
+    }
+
+    fn destroy_stream(&self, _stream: u64) -> Result<()> {
+        self.live_streams.fetch_sub(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn create_event(&self) -> Result<u64> {
+        self.live_events.fetch_add(1, Ordering::Relaxed);
+        Ok(0)
+    }
+
+    fn destroy_event(&self, _event: u64) -> Result<()> {
+        self.live_events.fetch_sub(1, Ordering::Relaxed);
         Ok(())
     }
 }
