@@ -49,6 +49,56 @@ pub trait SwapStore: Send {
     fn discard_record(&mut self, _disk_slot: usize) {}
 }
 
+/// A record store whose I/O is positional and may be issued from several
+/// threads at once (`&self`) — what a worker pool needs for queue depth > 1.
+///
+/// A *run* is the `buf.len() / record_bytes()` CONSECUTIVE slots starting at
+/// `low_slot`. With `reversed` the buffer holds them highest slot first: a
+/// chain spilled leaf-first restores root-first, and one vectored request
+/// moves the whole run without reordering the caller's staging.
+pub trait ConcurrentSwapStore: Send + Sync {
+    fn record_bytes(&self) -> usize;
+    fn read_run(&self, low_slot: usize, reversed: bool, out: &mut [u8]) -> Result<()>;
+    fn write_run(&self, low_slot: usize, reversed: bool, bytes: &[u8]) -> Result<()>;
+}
+
+/// Any [`SwapStore`] behind a mutex: correct, one request at a time.
+impl<S: SwapStore> ConcurrentSwapStore for std::sync::Mutex<S> {
+    fn record_bytes(&self) -> usize {
+        self.lock().map_or(0, |s| s.record_bytes())
+    }
+
+    fn read_run(&self, low_slot: usize, reversed: bool, out: &mut [u8]) -> Result<()> {
+        let s = self.lock().map_err(|_| anyhow::anyhow!("store poisoned"))?;
+        if !reversed {
+            return s.read_records(low_slot, out);
+        }
+        let rb = run_records(s.record_bytes(), out.len())?.0;
+        for (i, rec) in out.chunks_exact_mut(rb).rev().enumerate() {
+            s.read_record(low_slot + i, rec)?;
+        }
+        Ok(())
+    }
+
+    fn write_run(&self, low_slot: usize, reversed: bool, bytes: &[u8]) -> Result<()> {
+        let mut s = self.lock().map_err(|_| anyhow::anyhow!("store poisoned"))?;
+        let (rb, n) = run_records(s.record_bytes(), bytes.len())?;
+        for (i, rec) in bytes.chunks_exact(rb).enumerate() {
+            let slot = if reversed { n - 1 - i } else { i };
+            s.write_record(low_slot + slot, rec)?;
+        }
+        Ok(())
+    }
+}
+
+/// `(record_bytes, records)` of a run buffer; rejects a ragged or empty one.
+pub(crate) fn run_records(record_bytes: usize, len: usize) -> Result<(usize, usize)> {
+    if record_bytes == 0 || len == 0 || !len.is_multiple_of(record_bytes) {
+        anyhow::bail!("record run: {len} bytes is not a positive multiple of {record_bytes}");
+    }
+    Ok((record_bytes, len / record_bytes))
+}
+
 // Boxed trait objects compose (lets a consumer pick arena/swap impls at
 // runtime: `Residency<Box<dyn SlotArena>, Box<dyn SwapStore>>`).
 impl<T: SlotArena + ?Sized> SlotArena for Box<T> {
