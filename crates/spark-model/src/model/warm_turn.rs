@@ -43,7 +43,12 @@
 //!    at `cut` [fixed: one state copy, and the radix insert over the cached
 //!    blocks], then `[cut, N)`. Each pass pays step 4 again. A turn whose
 //!    restore depth is `cut` already has an empty first half, which
-//!    `ATLAS_GLM_WARM_SKIP_CACHED` makes free.
+//!    `ATLAS_GLM_WARM_SKIP_CACHED` makes free. The cut sits 17 to 32 rows
+//!    under `N`, and the next turn replays them [a fixed number of rows,
+//!    each priced as `new`]; `ATLAS_GLM_TAIL_CUT_DEEP`
+//!    (`pc_policy::tail_cut_at`) moves it one block up, where GLM-5's
+//!    template always lets the next turn restore. That changes pass shapes,
+//!    so it is its own switch.
 //! 8. Final norm and LM head on the last row [fixed: one sweep of the head],
 //!    the radix insert of the prompt [cached blocks, host], then the
 //!    scheduler reads the logits and samples [fixed].
@@ -74,11 +79,13 @@
 //!
 //! # Rank parity
 //!
-//! `ATLAS_GLM_PROMPT_DELTA` changes the head's command words, so both ranks
-//! must run with the same value (the launcher's startup agreement must carry
-//! it: [`prompt_delta_requested`]). The other switches add no command and no
-//! collective; a rank without `ATLAS_GLM_WARM_SKIP_CACHED` or
-//! `ATLAS_GLM_ZERO_ROWS` only does the work the other skips.
+//! `ATLAS_GLM_PROMPT_DELTA` changes the head's command words and
+//! `ATLAS_GLM_TAIL_CUT_DEEP` the rows of every rank's passes, so both ranks
+//! must run with the same values (the launcher's startup agreement must
+//! carry them: [`prompt_delta_requested`], `pc_policy::tail_cut_deep`). The
+//! other switches add no command and no collective; a rank without
+//! `ATLAS_GLM_WARM_SKIP_CACHED` or `ATLAS_GLM_ZERO_ROWS` only does the work
+//! the other skips.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -2,8 +2,9 @@
 
 //! A chunk the cache covers completely: which chunk that is, and on the real
 //! `prefill_chunk` that the switch changes nothing but the zero and embed of
-//! those chunks. Then the worker's real chunk handler fed the prompt as a
-//! delta, the trace switch and the zero modes of `ATLAS_GLM_ZERO_ROWS`.
+//! those chunks. Then the deep tail cut, the worker's real chunk handler fed
+//! the prompt as a delta, the trace switch and the zero modes of
+//! `ATLAS_GLM_ZERO_ROWS`.
 
 // The real model and recording layer of `prefill_stream_tests`.
 #[allow(clippy::duplicate_mod)]
@@ -31,9 +32,10 @@ fn a_chunk_is_cached_when_a_skip_covers_all_of_it_and_it_is_not_the_last() {
     assert!(!fully_cached(true, 7, 0, 8, false));
 }
 
-/// Re-run `name` in a child process with the Marconi restore floor lifted:
-/// the fixture's prompts are tens of tokens. `true` in the parent.
-fn in_child(name: &str) -> bool {
+/// Re-run `name` in a child process with the Marconi restore floor lifted
+/// (the fixture's prompts are tens of tokens) and `env` set. `true` in the
+/// parent.
+fn in_child(name: &str, env: &[(&str, &str)]) -> bool {
     const CHILD: &str = "ATLAS_WARM_TEST_CHILD";
     if std::env::var(CHILD).as_deref() == Ok("1") {
         return false;
@@ -49,6 +51,8 @@ fn in_child(name: &str) -> bool {
         .env_remove("ATLAS_NO_TAIL_SPLIT")
         .env_remove("ATLAS_MARCONI_EXACT")
         .env_remove("ATLAS_SSM_SAVE_DUMP")
+        .env_remove("ATLAS_GLM_TAIL_CUT_DEEP")
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -90,6 +94,16 @@ fn run_chunks(f: &Fixture, seq: &mut SequenceState, tokens: &[u32]) -> Vec<bool>
         .collect()
 }
 
+/// A fresh sequence for the conversation's next turn, as the fixture builds
+/// its own (it takes over `first`'s proposer state).
+fn next_sequence(first: &mut SequenceState) -> SequenceState {
+    let mut seq = SequenceState::host_only(0);
+    seq.layer_states = vec![Box::new(EmptyLayerState)];
+    seq.disk_last_offloaded_per_layer = vec![0];
+    seq.proposer_state = first.proposer_state.take();
+    seq
+}
+
 /// What a turn leaves: the layer passes, the sequence, the zeroed chunks.
 type Turn = (Vec<Event>, (usize, usize, usize, usize, usize), Vec<bool>);
 
@@ -113,10 +127,7 @@ fn warm_turn(tp: usize, ep: usize, rank: usize, on: bool) -> Turn {
     let cold = f.events().len();
     assert_eq!(cold, 3, "three passes of 8 rows");
 
-    let mut seq = SequenceState::host_only(0);
-    seq.layer_states = vec![Box::new(EmptyLayerState)];
-    seq.disk_last_offloaded_per_layer = vec![0];
-    seq.proposer_state = first.proposer_state.take();
+    let mut seq = next_sequence(&mut first);
     let zeroed = run_chunks(&f, &mut seq, &tokens);
     assert_eq!(seq.tokens, tokens);
     let state = (
@@ -136,7 +147,10 @@ fn warm_turn(tp: usize, ep: usize, rank: usize, on: bool) -> Turn {
 /// zeroes once per request, is unchanged.
 #[test]
 fn actual_cached_chunks_skip_the_zero_and_nothing_else_changes() {
-    if in_child("actual_cached_chunks_skip_the_zero_and_nothing_else_changes") {
+    if in_child(
+        "actual_cached_chunks_skip_the_zero_and_nothing_else_changes",
+        &[],
+    ) {
         return;
     }
     for (tp, ep, rank) in [(2, 2, 0), (2, 2, 1), (2, 1, 0), (2, 1, 1), (1, 1, 0)] {
@@ -179,6 +193,51 @@ fn actual_cold_chunks_all_zero_with_the_switch() {
     assert_eq!(off.3, [true, true, true]);
     assert_eq!(on, off);
     assert_eq!(off.0.len(), 3);
+}
+
+/// `ATLAS_GLM_TAIL_CUT_DEEP` on the real chunk path: a cold 24-token turn
+/// splits its last chunk at 20, the last block boundary under its end, and
+/// saves its checkpoint there instead of at 16. The next turn restores at 20
+/// and replays 4 rows where the base cut replays 8 (the test above).
+#[test]
+fn actual_deep_tail_cut_restores_one_block_deeper() {
+    let name = "actual_deep_tail_cut_restores_one_block_deeper";
+    if in_child(name, &[("ATLAS_GLM_TAIL_CUT_DEEP", "1")]) {
+        return;
+    }
+    let tokens: Vec<u32> = (1..=28).collect();
+    for (tp, ep, rank) in [(2, 2, 0), (2, 2, 1), (2, 1, 1), (1, 1, 0)] {
+        let ctx = format!("TP{tp}/EP{ep}/rank{rank}");
+        let mut f = Fixture::with_tail_split(tp, ep, rank);
+        f.disable_capture();
+        let mut first = std::mem::replace(&mut f.seq, SequenceState::host_only(0));
+        run_chunks(&f, &mut first, &tokens[..24]);
+        let cold = f.events();
+        assert!(
+            matches!(
+                cold[..],
+                [
+                    Event::Target(8, _),
+                    Event::Target(8, _),
+                    Event::Target(4, _),
+                    Event::Target(4, _)
+                ]
+            ),
+            "{ctx}: {cold:?}"
+        );
+        let mut seq = next_sequence(&mut first);
+        run_chunks(&f, &mut seq, &tokens);
+        let warm = &f.events()[cold.len()..];
+        assert!(
+            matches!(warm, [Event::Target(4, _), Event::Target(4, _)]),
+            "{ctx}: {warm:?}"
+        );
+        assert_eq!(
+            (seq.cached_prefix_tokens, seq.marconi_skip_to, seq.seq_len),
+            (24, 20, 28),
+            "{ctx}"
+        );
+    }
 }
 
 /// The worker's real 0xFFFFFFF0 handler, driven through `ep_worker_step` by

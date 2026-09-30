@@ -179,10 +179,53 @@ pub(in crate::model) fn pc_rank_agree_enabled() -> bool {
     spark_runtime::radix_tree::glm_pc_evict_enabled() || glm_pc_branch_enabled()
 }
 
-/// The tail-split cut for a `total`-token prompt: one block below the last
-/// block boundary strictly under `total` (`prefill_chunk_dispatch_with`).
+/// `ATLAS_GLM_TAIL_CUT_DEEP=1`: see [`tail_cut_at`]. Read once. The cut
+/// shapes every rank's passes, so both ranks must run with the same value
+/// (see "Rank env parity" above).
+pub(in crate::model) fn tail_cut_deep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_TAIL_CUT_DEEP").as_deref() == Ok("1"))
+}
+
+/// The tail-split cut for a `total`-token prompt
+/// (`prefill_chunk_dispatch_with`): where the last chunk is split and the
+/// checkpoint the conversation's next turn restores is saved.
+///
+/// Base: one block below the last block boundary strictly under `total`.
+/// That is at or below the next turn's match even when the template's
+/// generation-only suffix is not reproduced in the re-rendered history and
+/// crosses the boundary; the next turn then replays the 17 to 32 rows from
+/// there to this prompt's end, plus what is new.
+///
+/// `deep` (`ATLAS_GLM_TAIL_CUT_DEEP=1`, default off): the last boundary
+/// itself, so 2 to 16 rows, 16 fewer on a warm turn, and a final pass of
+/// this prompt of 2 to 16 rows instead of 18 to 32. A prompt that ends one
+/// row past a boundary keeps the base cut: its final pass would be a single
+/// row, which takes the decode path (`forward_layers`) that no prefill of
+/// this model takes today. The next turn can restore at the deep cut only
+/// when its match reaches this prompt's last whole block, that is when its
+/// history reproduces this prompt to its end. GLM-5's template does
+/// (`<|assistant|><think>` is rendered again, whatever follows); a template
+/// that does not leaves the checkpoint above the match, and the turn falls
+/// back to the one before and replays that whole turn.
+///
+/// Same kernels and math, other pass shapes: like any change of where a
+/// pass starts, the result can differ bitwise from the base cut's (see
+/// "Accumulation order" above), on cold prefills too. A warm turn also
+/// leaves the DFlash drafter 16 fewer context rows, since its context is
+/// filled from the rows a prefill processes.
+pub(in crate::model) fn tail_cut_at(total: usize, bs: usize, deep: bool) -> usize {
+    let tail = (total.saturating_sub(1) / bs) * bs;
+    if deep && total - tail > 1 {
+        tail
+    } else {
+        tail.saturating_sub(bs)
+    }
+}
+
+/// [`tail_cut_at`] under this process's `ATLAS_GLM_TAIL_CUT_DEEP`.
 pub(in crate::model) fn tail_cut(total: usize, bs: usize) -> usize {
-    ((total.saturating_sub(1) / bs) * bs).saturating_sub(bs)
+    tail_cut_at(total, bs, tail_cut_deep())
 }
 
 /// Where to save a branch checkpoint, if anywhere: at the radix match
