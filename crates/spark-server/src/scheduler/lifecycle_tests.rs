@@ -31,6 +31,23 @@ thread_local! {
     /// `#[test]` runs on its own, and `finish_sequence` is synchronous).
     pub(super) static CACHE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static FREE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `StubModel::commit_accepted_prefix` calls on this thread, as
+    /// `(seq.tokens.len(), num_accepted, k)`.
+    pub(super) static COMMITS: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The picks `StubModel`'s verify entry points return on this thread
+    /// (empty: they fail, as before).
+    pub(super) static VERIFY_PICKS: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A scripted verify: like the real one, the verified rows join the sequence.
+fn scripted_verify<const K: usize>(t: &[u32], s: &mut SequenceState) -> Result<[u32; K]> {
+    let picks = VERIFY_PICKS.with(|p| p.borrow().clone());
+    anyhow::ensure!(picks.len() == t.len(), "unused in lifecycle tests");
+    s.tokens.extend_from_slice(t);
+    s.seq_len += t.len();
+    Ok(std::array::from_fn(|i| picks[i]))
 }
 
 /// Common-case shorthand: mid-context position (no seqlen ceiling), so
@@ -237,27 +254,27 @@ impl Model for StubModel {
     }
     fn decode_verify_graphed(
         &self,
-        _t: &[u32; 2],
-        _s: &mut SequenceState,
+        t: &[u32; 2],
+        s: &mut SequenceState,
         _st: u64,
     ) -> Result<[u32; 2]> {
-        anyhow::bail!("unused in lifecycle tests")
+        scripted_verify(t, s)
     }
     fn decode_verify_graphed_k3(
         &self,
-        _t: &[u32; 3],
-        _s: &mut SequenceState,
+        t: &[u32; 3],
+        s: &mut SequenceState,
         _st: u64,
     ) -> Result<[u32; 3]> {
-        anyhow::bail!("unused in lifecycle tests")
+        scripted_verify(t, s)
     }
     fn decode_verify_graphed_k4(
         &self,
-        _t: &[u32; 4],
-        _s: &mut SequenceState,
+        t: &[u32; 4],
+        s: &mut SequenceState,
         _st: u64,
     ) -> Result<[u32; 4]> {
-        anyhow::bail!("unused in lifecycle tests")
+        scripted_verify(t, s)
     }
     fn run_mtp_propose(
         &self,
@@ -333,6 +350,10 @@ impl Model for StubModel {
     }
     fn detach_slot_for_reuse(&self, _s: &mut SequenceState) {}
     fn save_hidden_for_mtp(&self, _i: usize, _st: u64) -> Result<()> {
+        Ok(())
+    }
+    fn commit_accepted_prefix(&self, s: &mut SequenceState, n: usize, k: usize) -> Result<()> {
+        COMMITS.with(|c| c.borrow_mut().push((s.tokens.len(), n, k)));
         Ok(())
     }
 }

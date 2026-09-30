@@ -280,7 +280,7 @@ impl TransformerModel {
                 "commit_accepted_prefix: num_accepted == 0 (k={k}) with KDA records"
             );
             let stream = self.secondary_stream;
-            self.commit_kda_records(seq, num_accepted, num_accepted < k, stream)?;
+            self.commit_kda_records_with_leaf(seq, num_accepted, k, stream)?;
             self.gpu.record_event(self.secondary_event, stream)?;
             return Ok(());
         }
@@ -361,14 +361,14 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// KDA records commit (`--ssm-rollback-mode records`): fold the first
-    /// `rows` fold records of every SSM layer into its h_state and, when
-    /// `rewind_conv`, restore conv_state from its snapshot after row
-    /// `rows - 1`. Enqueued on `stream`.
+    /// KDA records commit (`--ssm-rollback-mode records`): fold fold-records
+    /// `rows` of every SSM layer into its h_state (which must already hold
+    /// rows `0..rows.start`) and, when `rewind_conv`, restore conv_state from
+    /// its snapshot after row `rows.end - 1`. Enqueued on `stream`.
     pub(super) fn commit_kda_records(
         &self,
         seq: &mut SequenceState,
-        rows: usize,
+        rows: std::ops::Range<usize>,
         rewind_conv: bool,
         stream: u64,
     ) -> Result<()> {
@@ -387,16 +387,18 @@ impl TransformerModel {
                 .downcast_mut::<SsmLayerState>()
                 .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
             anyhow::ensure!(
-                !ssm.kda_records.is_null() && rows <= self.ssm_pool.num_intermediates,
-                "KDA records commit: layer {i} has no records for {rows} rows"
+                !ssm.kda_records.is_null() && rows.end <= self.ssm_pool.num_intermediates,
+                "KDA records commit: layer {i} has no records for {} rows",
+                rows.end
             );
             ops::kda_commit_records(
                 self.gpu.as_ref(),
                 kernel,
                 ssm.h_state,
-                ssm.kda_records,
+                ssm.kda_records
+                    .offset(rows.start * self.ssm_pool.kda_record_row_bytes),
                 heads * ops::KDA_RECORD_FLOATS,
-                rows as u32,
+                rows.len() as u32,
                 heads as u32,
                 stream,
             )?;
@@ -404,7 +406,7 @@ impl TransformerModel {
                 conv_plan.push(StateCopy {
                     src: self
                         .ssm_pool
-                        .conv_intermediate(ssm_layer_idx, seq.slot_idx, rows - 1),
+                        .conv_intermediate(ssm_layer_idx, seq.slot_idx, rows.end - 1),
                     dst: ssm.conv_state,
                     bytes: conv_bytes,
                 });

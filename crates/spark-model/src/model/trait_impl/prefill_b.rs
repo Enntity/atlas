@@ -34,7 +34,7 @@ mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;
 mod midchunk_capture;
-mod pc_policy;
+pub(super) mod pc_policy;
 mod prefix_lookup;
 mod proc_range;
 mod prompt_logprobs;

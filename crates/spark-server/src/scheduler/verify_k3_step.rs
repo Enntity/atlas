@@ -314,6 +314,15 @@ pub fn step_verify_k3(
     );
 
     if num_accepted == 2 {
+        // Item #2 (STree-style in-place K=3 verify commit). Full accept: a
+        // no-op unless KDA records fold the rows in, so it precedes the emits
+        // (an emit that finishes the sequence returns; `verify_dflash_tail`).
+        if let Err(e) = model.commit_accepted_prefix(&mut a.seq, 3, 3) {
+            // SSM state is no longer trustworthy — terminate, do not continue.
+            tracing::error!("commit_accepted_prefix (K=3 accept-3): {e:#}");
+            a.abort_on_engine_error(&e);
+            return;
+        }
         emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
         if !a.finished {
             emit_token(a, drafts[1], verify_lps.get(1).cloned(), sched);
@@ -326,15 +335,6 @@ pub fn step_verify_k3(
         }
         a.last_token = v2;
 
-        // Item #2 (STree-style in-place K=3 verify commit). Full accept
-        // (num_accepted=k=3): the verify kernel already wrote the canonical
-        // h_state, so the commit is a no-op.
-        if let Err(e) = model.commit_accepted_prefix(&mut a.seq, 3, 3) {
-            // SSM state is no longer trustworthy — terminate, do not continue.
-            tracing::error!("commit_accepted_prefix (K=3 accept-3): {e:#}");
-            a.abort_on_engine_error(&e);
-            return;
-        }
         // Same row, the other input shape: a drafter reading the PRE-mixer
         // stream highway needs row 2 staged into row 0, or it proposes from
         // the first verify row instead of the accepted one.
