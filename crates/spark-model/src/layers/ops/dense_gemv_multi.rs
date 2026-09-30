@@ -96,15 +96,16 @@ pub fn dense_gemv_batch5_dual(
 
 /// `dense_gemv_bf16_batchm_dual_k128`, the bit-identical K = 128 tier of the
 /// dual (16 outputs per CTA), or a zero handle when the target lacks it.
-fn dual_k128_kernel(gpu: &dyn GpuBackend) -> KernelHandle {
-    static K128: std::sync::OnceLock<KernelHandle> = std::sync::OnceLock::new();
-    *K128.get_or_init(|| {
-        crate::layers::try_kernel(
+/// Memoized on the backend (the handle dies with its registry);
+/// `Glm5KdaLayer::new` resolves it first, before the boot audit seals.
+pub fn dense_gemv_dual_k128_kernel(gpu: &dyn GpuBackend) -> KernelHandle {
+    gpu.op_cache()
+        .kernel(
             gpu,
             "dense_gemv_bf16_batchm",
             "dense_gemv_bf16_batchm_dual_k128",
         )
-    })
+        .unwrap_or(KernelHandle(0))
 }
 
 /// Two same-shape BF16 projections of `m` (<= 8) rows in one grid
@@ -127,7 +128,7 @@ pub fn dense_gemv_batchm_dual(
         "dense_gemv_batchm_dual takes 1..={DENSE_GEMV_BATCHM_MAX_M} rows, got {m}"
     );
     let k128 = (k == 128)
-        .then(|| dual_k128_kernel(gpu))
+        .then(|| dense_gemv_dual_k128_kernel(gpu))
         .filter(|h| h.0 != 0);
     let (kernel, outs_per_cta) = k128.map_or((kernel, 4), |h| (h, 16));
     dense_gemv_dual(

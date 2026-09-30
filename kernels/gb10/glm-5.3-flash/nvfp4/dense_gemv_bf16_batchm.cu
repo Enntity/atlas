@@ -295,16 +295,15 @@ extern "C" __global__ void dense_gemv_bf16_batchm_triple_n(
         plane == 0u ? N0 : N12, smem);
 }
 
-// K = 128 tier of dense_gemv_bf16_batchm_dual (GLM KDA gate f_b/g_b). At
-// K = 128 only 16 of an output's 64 lanes hold a k-slot; the other 48 feed
-// exact zeros through the shuffle tree, a barrier and the cross-warp add, so
-// the generic dual takes 12-26 us for N = 4096, M = 2..8 on GB10 against an
-// 8.5 us weight-read floor (this tier: 9.5-10.8 us; scripts/dev/
-// dense_gemv_dual_k128_bench.cu). Here a 16-lane group owns one output: each lane
-// runs the generic single-slot product chain unchanged, the group reduces with
-// the generic tree minus its offset-16 level (which only added +0.0), and the
-// final "+ 0.0f" stands in for the generic's add of the empty second warp.
-// Adding +0.0 can only turn -0.0 into +0.0, so the outputs are bit-identical.
+// K = 128 tier of dense_gemv_bf16_batchm_dual (GLM KDA f_b/g_b). At K = 128
+// the generic dual feeds 48 of an output's 64 lanes exact zeros through the
+// shuffle tree, a barrier and the cross-warp add: 12-26 us at N = 4096,
+// M = 2..8 on GB10, vs 9.5-10.8 us here and an 8.5 us weight-read floor
+// (scripts/dev/dense_gemv_dual_k128_bench.cu). A 16-lane group owns one
+// output: each lane runs the generic single-slot product chain unchanged, the
+// group reduces with the generic tree minus its offset-16 level (which only
+// added +0.0), and "+ 0.0f" stands in for the add of the empty second warp.
+// +0.0 only turns -0.0 into +0.0, so the outputs are bit-identical.
 // Grid: (ceil(N / 16), 1, 2)   Block: (256, 1, 1)   K must be 128.
 #define DUAL_K128_LANES 16
 
