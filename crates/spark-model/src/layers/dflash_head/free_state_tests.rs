@@ -223,6 +223,7 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
         block_table: Vec::new(),
         seq_len: 12,
         last_num_drafted: 3,
+        last_draft_conf: Vec::new(),
         prefill_done: true,
         ctx_hidden_acc: gpu.alloc(4096).unwrap(),
         ctx_len: 12,

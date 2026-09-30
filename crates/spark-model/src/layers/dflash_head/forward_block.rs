@@ -1023,8 +1023,9 @@ impl BlockDiffusionDraftHead {
             .draft_tokens_host_pinned
             .load(std::sync::atomic::Ordering::Relaxed);
         // `draft_tokens_host_pinned` is written exactly once, in
-        // `from_weights.rs` (`alloc_host_pinned(gamma_val * 4)`), and the same
-        // `gamma_val` is stored as `self.gamma` — but the two live in different
+        // `from_weights.rs` (`alloc_host_pinned(draft_record_bytes)`: `gamma_val`
+        // words, twice that with draft confidences), and the same `gamma_val`
+        // is stored as `self.gamma` — but the two live in different
         // files, so pin the equality here rather than trust it silently. A failed
         // `alloc_host_pinned` propagates as an Err at construction, so a null here
         // would mean the field was never initialised.
@@ -1034,10 +1035,11 @@ impl BlockDiffusionDraftHead {
             self.gamma
         );
         // SAFETY: `pinned_ptr` is the page-locked allocation made by
-        // `alloc_host_pinned(gamma_val * 4)` in `DFlashHead::from_weights`, and
+        // `alloc_host_pinned(draft_record_bytes)` in `DFlashHead::from_weights`, and
         // `self.gamma == gamma_val` (both set from the same local in that
-        // constructor; `gamma` is a plain `usize` field never reassigned), so
-        // `self.gamma * 4` is exactly the allocation size — not one byte past it.
+        // constructor; `gamma` is a plain `usize` field never reassigned) with
+        // the same startup `draft_conf`, so `self.draft_record_bytes()` is
+        // exactly the allocation size — not one byte past it.
         // Non-null is checked immediately above; `cuMemAllocHost` returns
         // 64-byte-aligned memory, which trivially satisfies `u8`'s alignment of 1.
         //
@@ -1051,7 +1053,7 @@ impl BlockDiffusionDraftHead {
         // before the next propose). `copy_d2h_on_stream` drains `stream` before
         // returning, so no DMA is in flight against it when we read below.
         let host_buf: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(pinned_ptr, self.gamma * 4) };
+            unsafe { std::slice::from_raw_parts_mut(pinned_ptr, self.draft_record_bytes()) };
         if defer_readback {
             // Multi-lane mode: enqueue the async D2H into the pinned buffer
             // and record the event WITHOUT blocking the host thread. The
@@ -1067,6 +1069,7 @@ impl BlockDiffusionDraftHead {
         gpu.event_synchronize(scratch.draft_tokens_event)?;
         let row_order: Vec<u32> = host_buf
             .chunks_exact(4)
+            .take(self.gamma)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         // 1+N block layout (vLLM `_prepare_dflash_inputs_kernel` sample_off=1):

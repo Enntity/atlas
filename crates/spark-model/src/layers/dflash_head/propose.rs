@@ -114,6 +114,7 @@ impl BlockDiffusionDraftHead {
             .as_any_mut()
             .downcast_mut::<DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        dstate.last_draft_conf.clear();
         let owner = self.validate_dflash_owner(dstate, expected_owner)?;
         let lifecycle = dstate
             .lifecycle
@@ -622,6 +623,7 @@ impl BlockDiffusionDraftHead {
         // on Lightning (Hello → '!' was drafted then dropped).
         let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
         dstate.last_num_drafted = drafts.len();
+        dstate.last_draft_conf = self.host_draft_conf(scratch, drafts.len());
         Ok(drafts)
     }
 
