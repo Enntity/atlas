@@ -55,9 +55,16 @@ fn capture(g: &Gpu, enqueue: impl Fn()) -> u64 {
 }
 
 struct Gpu {
+    ctx: u64,
     stream: u64,
     oneshot: u64,
     add: u64,
+}
+
+fn new_stream() -> u64 {
+    let mut stream = 0u64;
+    ck!(cuStreamCreate(&mut stream, 1));
+    stream
 }
 
 /// The CUDA context and kernels, or `None` (test skipped) without a cubin dir.
@@ -75,10 +82,9 @@ fn gpu() -> Option<Gpu> {
     ck!(cuInit(0));
     ck!(cuDevicePrimaryCtxRetain(&mut ctx, 0));
     ck!(cuCtxSetCurrent(ctx));
-    let mut stream = 0u64;
-    ck!(cuStreamCreate(&mut stream, 1));
     Some(Gpu {
-        stream,
+        ctx,
+        stream: new_stream(),
         oneshot: load("rdma_oneshot.cubin", "rdma_oneshot_bf16"),
         add: load("bf16_add.cubin", "bf16_add_inplace"),
     })
@@ -276,7 +282,7 @@ impl Op {
             let [r, p] = self.want;
             upload(g, r, &local_payload(seq, n));
             upload(g, p, &peer_payload(seq, n));
-            launch_add(g, r, p, n);
+            launch_add(g, g.stream, r, p, n);
             download(g, r, n)
         } else {
             peer_payload(seq, n)
@@ -285,7 +291,7 @@ impl Op {
     }
 }
 
-fn launch_add(g: &Gpu, dst: u64, src: u64, n: usize) {
+fn launch_add(g: &Gpu, stream: u64, dst: u64, src: u64, n: usize) {
     let (mut d, mut s, mut c) = (dst, src, n as i32);
     let mut params: [*mut c_void; 3] = [
         (&raw mut d).cast(),
@@ -293,22 +299,20 @@ fn launch_add(g: &Gpu, dst: u64, src: u64, n: usize) {
         (&raw mut c).cast(),
     ];
     let blocks = (n as u32).div_ceil(256);
-    let status = unsafe {
-        cuLaunchKernel(
-            g.add,
-            blocks,
-            1,
-            1,
-            256,
-            1,
-            1,
-            0,
-            g.stream,
-            params.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
-    };
-    cu(status, "bf16_add_inplace").unwrap();
+    let null = std::ptr::null_mut();
+    ck!(cuLaunchKernel(
+        g.add,
+        blocks,
+        1,
+        1,
+        256,
+        1,
+        1,
+        0,
+        stream,
+        params.as_mut_ptr(),
+        null
+    ));
 }
 
 fn test_cfg(stripe_min: usize) -> Config {
@@ -409,53 +413,6 @@ fn oneshot_loopback_eager_and_graph_striped() {
     run_protocol(2, 4096);
 }
 
-/// Microbench (stand-in peer, no NIC): per-op cost of the local path when
-/// the peer's data is already there, eager and replayed, next to the legacy
-/// local work (stage copy + `bf16_add_inplace`, no memops).
-#[test]
-#[ignore = "needs a GPU and ATLAS_ONESHOT_CUBIN_DIR"]
-fn oneshot_loopback_timing() {
-    let Some(g) = gpu() else {
-        return;
-    };
-    let sync = || ck!(cuStreamSynchronize(g.stream));
-    for bytes in [8192usize, 32_768, 65_536, 327_680] {
-        let os = channel(&g, test_cfg(SPLIT_MIN), 1);
-        let stop = Arc::new(AtomicBool::new(false));
-        let peer = spawn_peer(&os, Peer::Early(bytes), stop.clone());
-        let (buf, scratch) = (alloc(bytes), alloc(bytes));
-        let n = 2000;
-        let time = |f: &dyn Fn()| {
-            f();
-            sync();
-            let t0 = Instant::now();
-            for _ in 0..n {
-                f();
-            }
-            sync();
-            t0.elapsed().as_secs_f64() * 1e6 / n as f64
-        };
-        let eager = time(&|| assert!(os.enqueue(buf, buf, bytes, true, g.stream).unwrap()));
-        let exec = capture(&g, || {
-            for _ in 0..87 {
-                assert!(os.enqueue(buf, buf, bytes, true, g.stream).unwrap());
-            }
-        });
-        let replay = time(&|| ck!(cuGraphLaunch(exec, g.stream))) / 87.0;
-        let legacy = time(&|| {
-            ck!(cuMemcpyAsync(scratch, buf, bytes, g.stream));
-            launch_add(&g, buf, scratch, bytes / 2);
-        });
-        stop.store(true, Ordering::Release);
-        peer.join().unwrap();
-        println!(
-            "one-shot {bytes:>7} B, peer already arrived: eager {eager:.2} us/op, graph {replay:.2} us/op; \
-             copy+add (no memops) {legacy:.2} us/op"
-        );
-        assert!(os.poisoned().is_none());
-    }
-}
-
 /// `ATLAS_ONESHOT_FAULT=timeout`: no peer, so the kernel must give up after
 /// its limit; `=mismatch`: the peer flags a different size. Either way the
 /// poison word names the op and the stream reports the trap.
@@ -496,3 +453,6 @@ fn oneshot_trap_poisons_instead_of_hanging() {
         assert!(why.contains("different size"));
     }
 }
+
+#[path = "loopback_tests.rs"]
+mod loopback;
