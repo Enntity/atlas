@@ -560,6 +560,8 @@ impl Qwen3AttentionLayer {
             dense_gemm_tc_k: super::super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc"),
             mxfp8_gemv_k: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
                 .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
+            mxfp8_gemv_grouped_k: ["mxfp8_gemv_tc8_grouped", "mxfp8_gemv_tc16_grouped"]
+                .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
             mxfp8_quantize_k: super::super::try_kernel(gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
             paged_decode_splitk_k: match kv_dtype {
                 KvCacheDtype::Nvfp4 => {

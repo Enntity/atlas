@@ -181,6 +181,9 @@ impl Glm5KdaLayer {
             ),
             hc_contract_k: gpu.kernel("hyper_connection", &hc_name("hc_contract"))?,
         };
+        // Eager (boot-audited) lookup of the K = 128 dual tier, which
+        // `ops::dense_gemv_batchm_dual` then reads from the backend's op cache.
+        super::super::ops::dense_gemv_dual_k128_kernel(gpu);
         if crate::model::glm_independent::enabled(&config.model_type)? {
             let handles = std::array::from_fn(|i| match i + 2 {
                 2 => layer.w4a16_gemv_batch2_k.0,
