@@ -42,6 +42,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "mxfp8_gemv_tc8",
     "dense_gemv_bf16_batchm",
     "dense_gemv_bf16_batchm_dual",
+    "dense_gemv_bf16_batchm_dual_k128",
     "dense_gemv_bf16_batchm_triple_n",
     "rms_norm_vanilla",
     "bf16_add_inplace",

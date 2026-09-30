@@ -89,12 +89,27 @@ pub fn dense_gemv_batch5_dual(
         None,
         n,
         k,
+        4,
         stream,
     )
 }
 
+/// `dense_gemv_bf16_batchm_dual_k128`, the bit-identical K = 128 tier of the
+/// dual (16 outputs per CTA), or a zero handle when the target lacks it.
+fn dual_k128_kernel(gpu: &dyn GpuBackend) -> KernelHandle {
+    static K128: std::sync::OnceLock<KernelHandle> = std::sync::OnceLock::new();
+    *K128.get_or_init(|| {
+        crate::layers::try_kernel(
+            gpu,
+            "dense_gemv_bf16_batchm",
+            "dense_gemv_bf16_batchm_dual_k128",
+        )
+    })
+}
+
 /// Two same-shape BF16 projections of `m` (<= 8) rows in one grid
-/// (`dense_gemv_bf16_batchm_dual`), each bit-identical to its batchm launch.
+/// (`dense_gemv_bf16_batchm_dual`, or its K = 128 tier), each bit-identical
+/// to its batchm launch.
 #[allow(clippy::too_many_arguments)]
 pub fn dense_gemv_batchm_dual(
     gpu: &dyn GpuBackend,
@@ -111,7 +126,22 @@ pub fn dense_gemv_batchm_dual(
         (1..=DENSE_GEMV_BATCHM_MAX_M).contains(&m),
         "dense_gemv_batchm_dual takes 1..={DENSE_GEMV_BATCHM_MAX_M} rows, got {m}"
     );
-    dense_gemv_dual(gpu, kernel, inputs, weights, outputs, Some(m), n, k, stream)
+    let k128 = (k == 128)
+        .then(|| dual_k128_kernel(gpu))
+        .filter(|h| h.0 != 0);
+    let (kernel, outs_per_cta) = k128.map_or((kernel, 4), |h| (h, 16));
+    dense_gemv_dual(
+        gpu,
+        kernel,
+        inputs,
+        weights,
+        outputs,
+        Some(m),
+        n,
+        k,
+        outs_per_cta,
+        stream,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -124,10 +154,11 @@ fn dense_gemv_dual(
     m: Option<u32>,
     n: u32,
     k: u32,
+    outs_per_cta: u32,
     stream: u64,
 ) -> Result<()> {
     let mut l = KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 4), 1, 2])
+        .grid([div_ceil(n, outs_per_cta), 1, 2])
         .block([256, 1, 1])
         .arg_ptr(inputs[0])
         .arg_ptr(inputs[1])
@@ -236,3 +267,7 @@ fn dense_gemv_triple_n(
         .arg_u32(k)
         .launch(stream)
 }
+
+#[cfg(test)]
+#[path = "dense_gemv_multi_tests.rs"]
+mod tests;

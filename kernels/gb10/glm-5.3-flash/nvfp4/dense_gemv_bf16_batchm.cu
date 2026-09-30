@@ -295,6 +295,75 @@ extern "C" __global__ void dense_gemv_bf16_batchm_triple_n(
         plane == 0u ? N0 : N12, smem);
 }
 
+// K = 128 tier of dense_gemv_bf16_batchm_dual (GLM KDA gate f_b/g_b). At
+// K = 128 only 16 of an output's 64 lanes hold a k-slot; the other 48 feed
+// exact zeros through the shuffle tree, a barrier and the cross-warp add, so
+// the generic dual takes 12-26 us for N = 4096, M = 2..8 on GB10 against an
+// 8.5 us weight-read floor (this tier: 9.5-10.8 us; scripts/dev/
+// dense_gemv_dual_k128_bench.cu). Here a 16-lane group owns one output: each lane
+// runs the generic single-slot product chain unchanged, the group reduces with
+// the generic tree minus its offset-16 level (which only added +0.0), and the
+// final "+ 0.0f" stands in for the generic's add of the empty second warp.
+// Adding +0.0 can only turn -0.0 into +0.0, so the outputs are bit-identical.
+// Grid: (ceil(N / 16), 1, 2)   Block: (256, 1, 1)   K must be 128.
+#define DUAL_K128_LANES 16
+
+extern "C" __global__ void __launch_bounds__(BLOCK_SIZE) dense_gemv_bf16_batchm_dual_k128(
+    const __nv_bfloat16* __restrict__ A0,
+    const __nv_bfloat16* __restrict__ A1,
+    const __nv_bfloat16* __restrict__ B0,
+    const __nv_bfloat16* __restrict__ B1,
+    __nv_bfloat16* __restrict__ C0,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int M,
+    unsigned int N,
+    unsigned int   // K == DUAL_K128_LANES * VEC_SIZE
+) {
+    atlas_pdl_enter();
+    const unsigned int K = DUAL_K128_LANES * VEC_SIZE;
+    const bool second = blockIdx.z != 0u;
+    const __nv_bfloat16* A = second ? A1 : A0;
+    __nv_bfloat16* C = second ? C1 : C0;
+    const unsigned int lane = threadIdx.x % DUAL_K128_LANES;
+    const unsigned int n = blockIdx.x * (BLOCK_SIZE / DUAL_K128_LANES) + threadIdx.x / DUAL_K128_LANES;
+    const bool live = n < N;  // no early return: the whole warp shuffles
+    const unsigned int m = (M > MAX_M) ? MAX_M : M;
+
+    uint4 b_data = make_uint4(0u, 0u, 0u, 0u);
+    if (live) b_data = ((const uint4*)((second ? B1 : B0) + (unsigned long long)n * K))[lane];
+    const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
+    float bf[8];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        __nv_bfloat16 b_lo, b_hi;
+        *(unsigned short*)&b_lo = (unsigned short)(b_raw[i] & 0xFFFF);
+        *(unsigned short*)&b_hi = (unsigned short)(b_raw[i] >> 16);
+        bf[2 * i] = __bfloat162float(b_lo);
+        bf[2 * i + 1] = __bfloat162float(b_hi);
+    }
+
+    #pragma unroll
+    for (unsigned int t = 0; t < MAX_M; t++) {
+        if (t >= m) break;
+        const uint4 a_data = ((const uint4*)(A + (unsigned long long)t * K))[lane];
+        const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+        float a = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            __nv_bfloat16 a_lo, a_hi;
+            *(unsigned short*)&a_lo = (unsigned short)(a_raw[i] & 0xFFFF);
+            *(unsigned short*)&a_hi = (unsigned short)(a_raw[i] >> 16);
+            a += __bfloat162float(a_lo) * bf[2 * i];
+            a += __bfloat162float(a_hi) * bf[2 * i + 1];
+        }
+        #pragma unroll
+        for (int offset = DUAL_K128_LANES / 2; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xFFFFFFFF, a, offset, DUAL_K128_LANES);
+        }
+        if (live && lane == 0) C[(unsigned long long)t * N + n] = __float2bfloat16(a + 0.0f);
+    }
+}
+
 // ============================================================
 // BF16 GEMV on tensor cores for 9..32 rows (batched verify / drafter blocks).
 // ============================================================
