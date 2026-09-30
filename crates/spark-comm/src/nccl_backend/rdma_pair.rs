@@ -38,14 +38,13 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 mod bootstrap;
 mod oneshot;
 mod proxy;
-use bootstrap::HEAD_WIRE;
 use oneshot::OneShot;
 use proxy::proxy_loop;
 
@@ -85,8 +84,9 @@ const ARRIVED: usize = 64;
 const FLAG_SRC: usize = 128;
 const FLAG_PAGE: usize = 4096;
 
-/// Bootstrap, after the [`bootstrap::head`], per rail: QPN, PSN, GID, region
-/// rkey.
+/// Bootstrap identity: the region base, then per rail QPN, PSN, GID and
+/// region rkey.
+const BASE_WIRE: usize = 8;
 const RAIL_WIRE: usize = 4 + 4 + 16 + 4;
 
 struct Job {
@@ -155,13 +155,16 @@ impl RdmaPair {
     }
 
     /// Bring up one RC QP per rail (`ATLAS_RDMA_RAILS`, else the NCCL HCA
-    /// list) against the peer, exchanging identities over TCP on `port`
-    /// (rank 0 listens). `capacity` is the largest payload in bytes.
+    /// list) against the peer, exchanging identities over TCP on `port` of
+    /// `head_addr`, rank 0's address on the link between the ranks (rank 0
+    /// listens there and, given `worker`, admits only that address; see
+    /// [`bootstrap`]). `capacity` is the largest payload in bytes.
     pub(super) fn connect(
         rank: usize,
-        master_addr: &str,
+        head_addr: IpAddr,
         port: u16,
         capacity: usize,
+        worker: Option<IpAddr>,
     ) -> Result<Self> {
         ensure!(
             capacity.is_multiple_of(64) && capacity > 0,
@@ -195,7 +198,7 @@ impl RdmaPair {
 
         let psn = (0x5a5a00 + rank as u32 * 0x1111) & 0xff_ffff;
         let mut verbs = Vec::with_capacity(rails.len());
-        let mut local = bootstrap::head(host as u64, capacity, oneshot::Config::wire(os_cfg));
+        let mut local = (host as u64).to_le_bytes().to_vec();
         let mut lkeys = Vec::with_capacity(rails.len());
         for name in &rails {
             let gid_idx =
@@ -213,11 +216,22 @@ impl RdmaPair {
             verbs.push(v);
         }
 
-        let mut stream = exchange_stream(rank, master_addr, port)?;
-        let (remote, peer_base) = bootstrap::exchange(&mut stream, &local)?;
+        let head = bootstrap::Head {
+            rank,
+            rails: rails.len(),
+            chain: proxy::chain_requested(),
+            segments: segment_count(),
+            capacity,
+            oneshot: oneshot::Config::wire(os_cfg),
+        };
+        let at = SocketAddr::new(head_addr, port);
+        let (mut stream, remote) = bootstrap::open(&head, &local, at, worker)?;
+        let peer_base = u64::from_le_bytes(remote[..BASE_WIRE].try_into()?);
         let mut peer_rkeys = Vec::with_capacity(rails.len());
-        for (r, v) in verbs.iter_mut().enumerate() {
-            let w = &remote[HEAD_WIRE + r * RAIL_WIRE..HEAD_WIRE + (r + 1) * RAIL_WIRE];
+        for (v, w) in verbs
+            .iter_mut()
+            .zip(remote[BASE_WIRE..].chunks_exact(RAIL_WIRE))
+        {
             let qpn = u32::from_le_bytes(w[0..4].try_into()?);
             let rpsn = u32::from_le_bytes(w[4..8].try_into()?);
             let gid: Gid = w[8..24].try_into()?;
@@ -225,8 +239,10 @@ impl RdmaPair {
             v.connect(qpn, rpsn, &gid)?;
         }
         // Barrier: both ends are RTS before either posts a WRITE.
-        stream.write_all(&[1])?;
-        stream.read_exact(&mut [0u8])?;
+        stream.write_all(&[1]).map_err(bootstrap::io("barrier"))?;
+        stream
+            .read_exact(&mut [0u8])
+            .map_err(bootstrap::io("barrier"))?;
 
         let oneshot = os_cfg
             .map(|c| {
@@ -389,30 +405,6 @@ fn rail_names(rails: Option<String>, nccl: Option<String>) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect()
-}
-
-fn exchange_stream(rank: usize, master_addr: &str, port: u16) -> Result<TcpStream> {
-    let stream = if rank == 0 {
-        let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
-            .with_context(|| format!("RDMA pair: bind 0.0.0.0:{port}"))?;
-        listener.accept()?.0
-    } else {
-        let target = format!("{master_addr}:{port}");
-        let mut attempt = 0;
-        loop {
-            match TcpStream::connect(&target) {
-                Ok(s) => break s,
-                Err(e) if attempt < 120 => {
-                    attempt += 1;
-                    tracing::debug!("RDMA pair connect {target}: {e}; retrying");
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-                Err(e) => return Err(e).with_context(|| format!("RDMA pair: connect {target}")),
-            }
-        }
-    };
-    stream.set_nodelay(true)?;
-    Ok(stream)
 }
 
 #[cfg(test)]

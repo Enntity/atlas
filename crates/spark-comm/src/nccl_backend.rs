@@ -71,6 +71,11 @@ unsafe extern "C" {
 
 #[cfg(atlas_rdma_verbs)]
 mod rdma_pair;
+// The pair's TCP bootstrap needs no verbs: a build without them still runs
+// its tests.
+#[cfg(all(test, not(atlas_rdma_verbs)))]
+#[path = "nccl_backend/rdma_pair/bootstrap.rs"]
+mod rdma_pair_bootstrap;
 mod recv_buffer;
 use recv_buffer::ensure_payload_fits;
 pub use recv_buffer::{ALL_REDUCE_DTYPE_BYTES, required_recv_bytes};
@@ -198,7 +203,7 @@ impl NcclBackend {
         }
 
         #[cfg(atlas_rdma_verbs)]
-        let rdma = Self::connect_rdma(rank, world_size, master_addr, master_port, recv_capacity)?;
+        let rdma = Self::connect_rdma(rank, world_size, &peers, master_port, recv_capacity)?;
 
         Ok(Self {
             comm: Mutex::new(comm),
