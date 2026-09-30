@@ -121,7 +121,8 @@ impl Glm5KdaLayer {
                 "gemm",
                 "dense_gemm_bf16_pipelined",
             ),
-            // Bit-identical to three pipelined launches; `=0` restores them.
+            // Bit-identical to three pipelined launches, so on unless the
+            // kill switch is exactly `0` (any other value leaves it on).
             dense_gemm_pipelined_triple_n_k: if std::env::var("ATLAS_GLM_KDA_FUSED_SMALL_PREFILL")
                 .as_deref()
                 == Ok("0")
