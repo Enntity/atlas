@@ -5,8 +5,10 @@
 //   wq_b  (ATLAS_GLM_INDEX_MXFP8):    1 head  x [N=4096, K=1536]
 // Baseline: cuBLASLt strided-batched BF16 with the descriptors of
 // spark_runtime::cublaslt::bf16_grouped_gemm_act_weight_t (built once, not
-// per call). Candidate under PDL: mxfp8_gemv_tc{8,16}_grouped for the heads,
-// the plain mxfp8_gemv_tc{8,16,32} for wq_b (as mla_prefill_dense runs it).
+// per call). Candidate: mxfp8_gemv_tc{8,16}_grouped for the heads, the plain
+// mxfp8_gemv_tc{8,16,32} for wq_b (as mla_prefill_dense runs it), timed
+// without and with PDL. "saved" uses the non-PDL column: back-to-back PDL
+// launches of one kernel overlap each other, which cuBLAS cannot.
 // Checks that every grouped output bit equals per-head plain launches, and
 // reports the MXFP8 relative L2 error against BF16. Weights cycle through
 // `copies` sets so they stream from DRAM as in decode.
@@ -97,11 +99,11 @@ int main(int argc, char** argv) {
         const unsigned long long blocks = wel * copies / MX_BLOCK;
         mxfp8_quantize_bf16<<<(unsigned)((blocks + 255) / 256), 256>>>(dw, dq, ds, blocks);
         CK(cudaDeviceSynchronize());
-        auto grouped = [&](int copy, unsigned M, bf* out) {
+        auto grouped = [&](int copy, unsigned M, bf* out, bool pdl = true) {
             cudaLaunchConfig_t cfg = {};
             cfg.gridDim = dim3((N + 15) / 16, 1, G); cfg.blockDim = dim3(MX_WARPS * MX_WARP); cfg.stream = st;
             cudaLaunchAttribute at; at.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-            at.val.programmaticStreamSerializationAllowed = 1; cfg.attrs = &at; cfg.numAttrs = 1;
+            at.val.programmaticStreamSerializationAllowed = 1; cfg.attrs = &at; cfg.numAttrs = pdl;
             const unsigned char* q = dq + copy * wel;
             const unsigned char* s = ds + copy * wel / MX_BLOCK;
             if (G == 1) CK(cudaLaunchKernelEx(&cfg, kPlain[tier(M)], (const bf*)da, q, s, out, M, N, K, ldc));
@@ -141,14 +143,17 @@ int main(int argc, char** argv) {
                sh.name, G, N, K, diff, sqrt(num / den));
         failures += diff != 0;
 
-        printf("  us/call (median of %d reps x %d, %d weight sets)  cuBLAS-BF16  MXFP8  saved\n", reps, iters, copies);
+        printf("  us/call (median of %d reps x %d, %d weight sets)  cuBLAS-BF16  MXFP8  MXFP8+PDL  saved\n",
+               reps, iters, copies);
         for (unsigned M : {1u, 2u, 4u, 5u, 8u, 16u, 32u}) {
             if (G > 1 && M > 16) break;
-            std::vector<float> t[2];
+            std::vector<float> t[3];
             lt.plan(M, G, N, K, lda, ldc);
             for (int r = 0; r < reps; r++)
-                for (int v = 0; v < 2; v++) {
-                    auto one = [&](int it) { if (v) grouped(it % copies, M, dc[0]); else cublas(it % copies, dc[2]); };
+                for (int v = 0; v < 3; v++) {
+                    auto one = [&](int it) {
+                        if (v) grouped(it % copies, M, dc[0], v == 2); else cublas(it % copies, dc[2]);
+                    };
                     for (int w = 0; w < 5; w++) one(w);
                     CK(cudaEventRecord(e0, st));
                     for (int it = 0; it < iters; it++) one(it);
@@ -157,8 +162,8 @@ int main(int argc, char** argv) {
                 }
             lt.done();
             for (auto& v : t) std::sort(v.begin(), v.end());
-            const float b = t[0][reps / 2], m = t[1][reps / 2];
-            printf("  M=%-2u %8.2f %8.2f %7.2f\n", M, b, m, b - m);
+            const float b = t[0][reps / 2], m = t[1][reps / 2], p = t[2][reps / 2];
+            printf("  M=%-2u %8.2f %8.2f %8.2f %7.2f\n", M, b, m, p, b - m);
         }
         cudaFree(dw); cudaFree(da); cudaFree(dah); cudaFree(dq); cudaFree(ds);
         for (auto c : dc) cudaFree(c);
