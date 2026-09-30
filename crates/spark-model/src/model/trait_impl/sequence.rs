@@ -490,8 +490,8 @@ impl TransformerModel {
             return 0;
         }
         let mut kv = self.kv_cache.lock();
-        let before = kv.num_free_blocks();
+        let before = kv.num_free_in_all();
         super::super::block_mgmt::apply_evicted_blocks(evicted, &mut kv);
-        kv.num_free_blocks().saturating_sub(before)
+        kv.num_free_in_all().saturating_sub(before)
     }
 }

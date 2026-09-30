@@ -122,4 +122,12 @@ impl PagedKvCache {
     pub fn num_free_blocks(&self) -> usize {
         self.free_blocks.allocatable()
     }
+
+    /// Every free block, whatever its residue: what measures the progress of
+    /// a reclaim, since an eviction that frees only the richer residue of a
+    /// latent shard leaves [`Self::num_free_blocks`] where it was. The same
+    /// count unsharded.
+    pub fn num_free_in_all(&self) -> usize {
+        self.free_blocks.total()
+    }
 }

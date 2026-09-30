@@ -144,9 +144,16 @@ fn free_count_is_what_any_logical_mix_can_draw() {
         err.contains("logical block 4") && err.contains("4 free"),
         "{err}"
     );
-    assert_eq!(cache.alloc_block_at(1).unwrap() % 2, 1);
+    let odd = cache.alloc_block_at(1).unwrap();
+    assert_eq!(odd % 2, 1);
     cache.free_block(even[0]);
     assert_eq!(cache.num_free_blocks(), 2);
+    // A block freed into the richer residue draws nothing more, and still
+    // counts as reclaimed.
+    let in_all = cache.num_free_in_all();
+    cache.free_block(odd);
+    assert_eq!(cache.num_free_blocks(), 2);
+    assert_eq!(cache.num_free_in_all(), in_all + 1);
 }
 
 #[test]
@@ -157,6 +164,7 @@ fn unsharded_allocation_ignores_the_logical_index() {
     assert_eq!(cache.alloc_block().unwrap(), 1);
     assert_eq!(cache.try_alloc_block(), Some(2));
     assert_eq!(cache.num_free_blocks(), 1);
+    assert_eq!(cache.num_free_in_all(), 1);
 }
 
 #[test]

@@ -59,7 +59,7 @@ pub(crate) fn apply_evicted_blocks(
     evicted: spark_runtime::prefix_cache::EvictedBlocks,
     kv_cache: &mut PagedKvCache,
 ) {
-    let free_before = kv_cache.num_free_blocks();
+    let free_before = kv_cache.num_free_in_all();
     let n_evicted = evicted.physical.len();
     for block in &evicted.physical {
         kv_cache.return_evicted_block(*block);
@@ -71,7 +71,7 @@ pub(crate) fn apply_evicted_blocks(
     // eviction can release" them, which was true only while the cache's ref
     // could land on a block no node referenced; that mismatch is fixed, so the
     // shortfall now just measures how much of the LRU tail is still in use.)
-    let gained = kv_cache.num_free_blocks().saturating_sub(free_before);
+    let gained = kv_cache.num_free_in_all().saturating_sub(free_before);
     if gained < n_evicted {
         tracing::debug!(
             "prefix-cache evict reclaimed {gained}/{n_evicted} blocks (free={}): \
