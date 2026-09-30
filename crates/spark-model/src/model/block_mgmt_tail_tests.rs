@@ -183,14 +183,27 @@ fn write_window_leaves_prefix_cache_blocks_alone() {
     prefill(&mut seq, 2, &mut cache, &gpu).unwrap();
     assert_published(&cache, &gpu, &seq.block_table[2..]);
 
-    // A frontier block the cache also holds (the live prompt was inserted)
-    // whose tail a departing sharer released: a prefix-sharing defect for
-    // the cache to police, never a reason for this guard to fail the step.
-    let frontier = seq.block_table[2];
+    // The live prompt's partial frontier block, which the radix cache also
+    // holds (its partial slot), keeps the tail it was lent.
+    cache.inc_ref(seq.block_table[2]);
+    seq.seq_len = 2 * 16 + 5;
+    decode(&mut seq, 2, &mut cache, &gpu).unwrap();
+}
+
+#[test]
+fn write_window_verdict_ignores_reference_counts() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = cache_with_stale_index(&gpu, Some(PLAN));
+    let mut seq = SequenceState::host_only(0);
+    prefill(&mut seq, 0, &mut cache, &gpu).unwrap();
+    // A frontier block that lost its tail while another holder kept a
+    // reference. Reference counts follow each rank's own radix cache, so a
+    // verdict keyed on them could fail one rank of a pair and hang the other.
+    let frontier = seq.block_table[0];
     cache.inc_ref(frontier);
     cache.inc_ref(frontier);
     cache.free_blocks(&[frontier]);
-    assert!(cache.tail_slot_missing(frontier));
-    seq.seq_len = 2 * 16;
-    decode(&mut seq, 2, &mut cache, &gpu).unwrap();
+    assert!(cache.tail_slot_missing(frontier) && cache.ref_count(frontier) == 2);
+    let err = decode(&mut seq, 0, &mut cache, &gpu).unwrap_err();
+    assert!(format!("{err:#}").contains("no index tail"), "{err:#}");
 }

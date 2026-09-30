@@ -60,9 +60,12 @@ pub(super) fn grow_prefill_window(
 /// Host guard for slotted index tails, run before any step writes the window:
 /// the tail kernels silently skip a block without a slot (`NO_TAIL`), leaving
 /// its pooled keys from the block's previous owner. Every block this step can
-/// write — committed length through `abs_block_idx`, past the cached prefix —
-/// that the sequence owns alone must hold a tail. Shared blocks belong to the
-/// prefix cache, which never lends them one.
+/// write — committed length through `abs_block_idx`, past the matched prefix,
+/// whose finalized pools no step rewrites — must hold a tail. Slotted tails
+/// never meet a sub-block match (`glm::prefix_resumes_whole_blocks`), so no
+/// block in that window is shared with another sequence. The verdict reads no
+/// reference counts: they follow each rank's own radix cache, and a check that
+/// failed one rank of a pair would hang the other instead of failing both.
 pub(super) fn check_write_window_tails(
     seq: &SequenceState,
     abs_block_idx: usize,
@@ -74,7 +77,7 @@ pub(super) fn check_write_window_tails(
         .max(ws);
     for abs in first..=abs_block_idx {
         let block = seq.block_table[abs - ws];
-        if kv_cache.tail_slot_missing(block) && kv_cache.ref_count(block) == 1 {
+        if kv_cache.tail_slot_missing(block) {
             bail!(
                 "block {block} (logical {abs}, seq_len {}) would be written with no index \
                  tail: its pooled keys would never be finalized",
