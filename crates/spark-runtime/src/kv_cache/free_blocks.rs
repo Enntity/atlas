@@ -64,29 +64,40 @@ impl FreeBlocks {
 }
 
 impl PagedKvCache {
+    /// Take the block for logical index `logical` off its free list.
+    #[track_caller]
+    fn take_block(&mut self, logical: usize, event: &'static str) -> Option<u32> {
+        let idx = self.free_blocks.pop(logical)?;
+        self.block_ref_counts[idx as usize] = 1;
+        if self.trace.is_on() {
+            self.trace
+                .record(idx as usize, event, 1, std::panic::Location::caller());
+        }
+        Some(idx)
+    }
+
     /// Allocate a free block for logical block `logical` of its sequence
     /// (under a latent shard the id's residue matches `logical`'s, see the
     /// module docs). `None` when exhausted.
     #[track_caller]
     pub fn try_alloc_block_at(&mut self, logical: usize) -> Option<u32> {
-        let idx = self.free_blocks.pop(logical)?;
-        self.block_ref_counts[idx as usize] = 1;
-        if self.trace.is_on() {
-            self.trace
-                .record(idx as usize, "alloc", 1, std::panic::Location::caller());
-        }
-        Some(idx)
+        self.take_block(logical, "try_alloc")
     }
 
     /// [`Self::try_alloc_block_at`], failing when exhausted.
     #[track_caller]
     pub fn alloc_block_at(&mut self, logical: usize) -> Result<u32> {
-        self.try_alloc_block_at(logical).ok_or_else(|| {
-            anyhow!(
-                "KV cache exhausted: no free blocks for logical block {logical} ({} free in all)",
-                self.free_blocks.total()
-            )
-        })
+        let Some(idx) = self.take_block(logical, "alloc") else {
+            // A shard's residue can run dry while the other still has blocks.
+            return Err(match self.latent_shard {
+                None => anyhow!("KV cache exhausted: no free blocks"),
+                Some(_) => anyhow!(
+                    "KV cache exhausted: no free blocks for logical block {logical} ({} free in all)",
+                    self.free_blocks.total()
+                ),
+            });
+        };
+        Ok(idx)
     }
 
     /// Allocate a free block. Returns block index. Refused under a latent
