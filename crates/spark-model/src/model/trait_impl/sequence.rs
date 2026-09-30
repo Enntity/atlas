@@ -359,6 +359,7 @@ impl TransformerModel {
         }
 
         let stream = self.gpu.default_stream();
+        self.sync_secondary_dispatch()?; // a verify commit may still be folding into old_slot
         self.ssm_pool
             .copy_slot(old_slot, new_slot, self.gpu.as_ref(), stream)?;
 
