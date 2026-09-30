@@ -253,9 +253,10 @@ impl Qwen3AttentionLayer {
             };
             // The BF16 dense and native kernels read an fp8_g128 owner through
             // a dequantized view; long owners and verify rows read FP8 directly,
-            // as do all sparse owners under the pipelined kernel without native.
-            let sparse_view =
-                on >= 2048 && !ops::glm_sparse_prefill_pipe_replaces_view(&ctx.config.model_type)?;
+            // as do, under the pipelined kernel, sparse pieces native declines.
+            let sparse_view = ops::glm_sparse_owner_needs_view(&ctx.config.model_type, on, || {
+                ops::glm_sparse_native_admits(&octx, on, o.seq_len_start, false, stream)
+            })?;
             let view = self.glm_owner_bf16_view(
                 kv_cache,
                 o.meta.block_table,

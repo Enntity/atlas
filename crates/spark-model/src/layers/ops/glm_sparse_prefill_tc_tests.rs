@@ -174,3 +174,32 @@ fn pipe_swaps_only_the_unsplit_fp8_kernel_and_requires_tc() {
     assert!(!parse("glm5_next", PIPE, None).unwrap());
     assert!(parse("glm5_next", PIPE, Some("yes")).is_err());
 }
+
+#[test]
+fn pipe_keeps_the_bf16_view_only_for_pieces_native_admits() {
+    let never = || -> Result<bool> { panic!("native admission queried") };
+    // Flag off (base) and short owners never ask native: same as `rows >= 2048`.
+    for rows in [1, 2047, 2048, 4096] {
+        assert_eq!(needs_view(rows, false, never).unwrap(), rows >= 2048);
+        assert!(!needs_view(rows.min(2047), true, never).unwrap());
+    }
+    // Under the pipe the view survives only for native's own pieces.
+    assert!(needs_view(4096, true, || Ok(true)).unwrap());
+    assert!(!needs_view(4096, true, || Ok(false)).unwrap());
+    assert!(needs_view(4096, true, || anyhow::bail!("x")).is_err());
+    // Other models never read the flag: base behavior.
+    assert!(glm_sparse_owner_needs_view("qwen3_next", 4096, never).unwrap());
+}
+
+#[test]
+fn pipe_warm_launch_is_one_zero_row_cta() {
+    let gpu = MockGpuBackend::new();
+    warm(&gpu, &config(), KvCacheDtype::Fp8G128, true).unwrap();
+    let launches = gpu.launches_snapshot();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0].grid, [1, 1, 1]);
+    assert_eq!(launches[0].block, [256, 1, 1]);
+    // Non-GLM models never read the flag's kernels.
+    initialize_glm_sparse_prefill_pipe(&gpu, &ModelConfig::qwen3_next_80b_nvfp4()).unwrap();
+    assert_eq!(gpu.launches_snapshot().len(), 1);
+}

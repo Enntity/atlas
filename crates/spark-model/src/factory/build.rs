@@ -91,6 +91,7 @@ pub fn build_model(
         kv_dtype,
         &layer_dtypes,
     )?;
+    crate::layers::ops::initialize_glm_sparse_prefill_pipe(gpu.as_ref(), &config)?;
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
     // `NllbGpuModel`, which reads its weights from the standard `store` — this

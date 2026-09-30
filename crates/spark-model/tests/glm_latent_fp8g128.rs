@@ -140,7 +140,10 @@ fn kv_pad(
 fn fp8_kv_pad_and_pipe_are_bit_identical_to_bf16_kv_pad_on_the_dequantized_view() -> Result<()> {
     let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let stream = gpu.default_stream();
-    let (tokens, blocks, rows) = (2600usize, 163usize, 3usize);
+    // Rows 0-2 select a full 2048; rows 3-6 are early-context rows at
+    // positions 0/5/37/1001, mostly -1 with whole invalid tiles.
+    let early = [0usize, 5, 37, 1001];
+    let (tokens, blocks, rows) = (2600usize, 163usize, 3 + early.len());
     let bf16 = |v: f32| ((bf16_round(v).to_bits() >> 16) as u16).to_le_bytes();
     let hash = |a: usize, b: usize| ((a * 2654435761 + b * 40503) % 10007) as f32 / 10007.0 - 0.5;
     let latents: Vec<u8> = (0..tokens)
@@ -158,18 +161,26 @@ fn fp8_kv_pad_and_pipe_are_bit_identical_to_bf16_kv_pad_on_the_dequantized_view(
     let queries: Vec<u8> = (0..rows * 32 * 512)
         .flat_map(|i| bf16(hash(i, 7) * 0.25))
         .collect();
-    // Each row selects 2048 distinct tokens (stride-coprime walk) and three -1 pads.
+    // Full rows select 2048 distinct tokens (stride-coprime walk) and three -1
+    // pads; an early row at p selects its whole pools, -1 pads, then the tail.
+    let select = |r: usize, j: usize| -> i32 {
+        if r < 3 {
+            return if j < 2048 {
+                ((j * 1031 + r * 17) % tokens) as i32
+            } else {
+                -1
+            };
+        }
+        let p = early[r - 3];
+        let pooled = (p + 1) / 4 * 4;
+        match j {
+            j if j < pooled => j as i32,
+            j if j >= 2048 && pooled + j - 2048 <= p => (pooled + j - 2048) as i32,
+            _ => -1,
+        }
+    };
     let indices: Vec<u8> = (0..rows)
-        .flat_map(|r| {
-            (0..2051).flat_map(move |j| {
-                let id = if j < 2048 {
-                    ((j * 1031 + r * 17) % tokens) as i32
-                } else {
-                    -1
-                };
-                id.to_le_bytes()
-            })
-        })
+        .flat_map(|r| (0..2051).flat_map(move |j| select(r, j).to_le_bytes()))
         .collect();
     let key = upload(&gpu, &latents)?;
     let slot = upload(&gpu, &slots)?;
