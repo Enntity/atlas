@@ -9,7 +9,12 @@ graph.
 
 C1 decode (prose, 512 tokens in 15.9 s, production profile): the verify path
 launches no CUDA graphs. Each verify step issues about 1,600 kernel launches
-at about 15 µs of host time each, and the GPU is idle for 13% of wall time.
+at about 15 µs of host time each. The host does not bound the step: the RDMA
+all-reduce is stream-ordered (write value, proxy job, wait value) and the
+layer loop has no host sync outside diagnostics, so the host (~24 ms per
+step) runs ahead of the GPU (~70-114 ms busy). The 2026-09-26 C1 nsys profile
+puts 15.4 ms of GPU idle in a 129.5 ms step: ~7.5 ms is MoE-combine waits from
+EP imbalance (no graph removes those) and ~4 ms is launch gaps.
 The layer stack is `kkkM` repeated eleven times followed by one `k`, where
 `k` is a KDA (linear attention) layer and `M` is a sparse-MLA layer: 34 KDA
 layers and 11 MLA layers, each followed by the MoE block.
@@ -84,10 +89,17 @@ production DFlash lane off it:
   SSM pool and depend only on the slot, hence the slot in the key. No
   per-step scalars enter a KDA run: KDA ignores `seq_len`, and the MoE block
   reads only row-local device data.
-- **Invalidation.** On sequence free (`invalidate_slot_graphs`), the slot's
-  runs are destroyed, consistent with `verify_kgamma_graph`. On a LoRA
-  rotation, every run is destroyed; the flag also refuses to run with LoRA
-  loaded.
+- **Retention.** Runs survive `free_sequence`: nothing they bake belongs to
+  the sequence (the per-sequence `gpu.alloc` buffers `invalidate_slot_graphs`
+  exists for, the PLE carry and the QSA indexer keys, are never touched by a
+  GLM KDA run), so the next request on the slot replays with no warm-up or
+  capture step. The slot pool is a LIFO stack, so back-to-back C1 requests
+  land on the same slot. Compaction needs nothing either: a survivor moved to
+  slot `n` uses slot-`n` keys, whose graphs bake slot-`n` addresses. A LoRA
+  rotation destroys every run; the flag also refuses to run with LoRA loaded.
+- **Diagnostics.** Rank-local switches that sync inside a KDA run keep the
+  step eager (`ATLAS_DFLASH_CAPTURE_TRACE=1`, or any `tracing` DEBUG filter,
+  which arms the MoE readbacks). Serve with `RUST_LOG` at info or below.
 
 ### Memory cost
 
@@ -100,22 +112,28 @@ The cost was measured on ennspark03 with `vgbench.cu`: 14-kernel pieces,
 
 A key has about 80 graphs. C1 at every width 2..=8 is about 7 x 84 = 588
 graphs, or roughly **100 to 150 MiB**. `ATLAS_GLM_VERIFY_GRAPH_MAX_GRAPHS`
-(default 600) caps the cache. A warm key over the budget stays eager until
-invalidation frees room, so C1 fits and a C4 overflow degrades to eager
-instead of growing.
+(default 600) caps the cache, which is held until a LoRA clear. A warm key
+over the budget stays eager, so one slot's widths fit and other slots degrade
+to eager instead of growing.
+
+This memory is **not** part of KV-pool sizing: it comes out of the headroom
+`--gpu-memory-utilization` leaves. At production's 0.93, rank 0's worst-case
+free memory is about 1.9 GB and memguard trips at 1 GiB, so the default
+budget uses about 15% of that margin. Check it at 0.93 (the hardware plan
+forces it) before raising the budget.
 
 ### Expected gain
 
-The microbench (same shape, C++ launches at about 2 µs each) gives eager
-2.9 ms, piecewise 1.66 ms and one-graph floor 1.24 ms per step. That is a
-host-side saving of about 1 µs per captured launch. In Atlas each launch
-costs about 15 µs of Rust host time, and about 1,200 of the roughly 1,600
-launches per step sit in KDA runs, so each step issues about 18 ms less host
-work. The GPU is idle for 13% of wall time; about 34/45 of that idle time
-falls in KDA runs, which caps the recoverable share. Replays also cut
-inter-kernel gaps (about 1 µs x 1,200). Estimate: **+4 to 10% C1 decode
-tok/s**. C4 uses the owner-batched verify (`decode_glm_long_owners`), which
-this change does not touch, so C4 should not move.
+Only launch gaps inside KDA runs can shrink. About 1,200 of the ~1,600
+launches per step sit in KDA runs, so they hold about 3 ms of the ~4 ms of
+launch gaps. Replays remove most of that but add a graph launch per piece
+and keep the eager collectives between pieces. Estimate: **about +1.5 to 3%
+C1 decode tok/s**, the size of run-to-run noise, so the hardware plan gates
+on the ranges of 5 repeats per arm. The microbench (same shape, C++ launches
+at about 2 µs each: eager 2.9 ms, piecewise 1.66 ms, one-graph floor 1.24 ms
+per step) bounds the host saving, not the wall time. C4 uses the
+owner-batched verify (`decode_glm_long_owners`), which this change does not
+touch, so C4 should not move.
 
 ## Remaining work, towards one graph per step
 
@@ -140,14 +158,16 @@ this change does not touch, so C4 should not move.
    existing `verify_kgamma_graph` whole-step capture, keyed `(slot, k)`.
 6. **C >= 2 (owner-batched verify).** Wrap the owner stage loop in the same
    `VerifyPieces::run`, keyed by the owner slot vector and rows.
-7. **Memory.** Retain graphs across requests (all baked pointers are slot
-   functions) instead of re-capturing per request. Share one topology across
-   slots with `cuGraphExecUpdate` or pointer indirection, which cuts the
-   per-slot multiplier.
+7. **Memory.** Share one topology across slots with `cuGraphExecUpdate` or
+   pointer indirection, which cuts the per-slot multiplier.
 
 ## Hardware check (at most 20 minutes)
 
-See the workstream handover. In short: C1 and C4 decode tok/s with the flag
-on and off; greedy byte-equality on 3 prompts; the memory delta from the
-`piecewise verify graph ... graphs cached` log line and `free -m`; and the
-count of `refused` lines (must be 0).
+See the workstream handover (`verify-graph-hwtest.sh`, `vg-probe.py`). Per
+arm, same binary, flag off then on, production memory utilization 0.93: a
+cold short-request cell (16 x 64 tokens, first after start, so it carries
+every capture), greedy byte-equality, C1 5 x 384 forced tokens (min, median,
+max), C2 2 x 384, C4 4 x 384; accepted tokens per verify step and capture
+milliseconds per cell from the rank-0 log; MemAvailable minimum per host;
+refused/panic counts and ERROR lines new in the on arm. Production is
+restored by an EXIT trap, then checked for leftovers.

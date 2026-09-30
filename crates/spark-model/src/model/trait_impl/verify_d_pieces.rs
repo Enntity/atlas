@@ -17,11 +17,20 @@ pub(super) fn admitted(requested: bool, model_type: &str, tp: usize, eager_only:
     requested && model_type == "glm5_next" && tp == 2 && !eager_only
 }
 
+/// Rank-local diagnostics that sync or read back inside a KDA run, which
+/// would refuse every key: the DFlash capture trace and the MoE's
+/// `tracing` DEBUG readbacks (they key on `ctx.graph_capture`, which pieces
+/// leave false). Rank-local is safe: collectives are never captured, so a
+/// rank that stays eager still issues the same collective calls.
+pub(super) fn diagnostics_sync() -> bool {
+    tracing::level_filters::LevelFilter::current() >= tracing::Level::DEBUG
+        || std::env::var("ATLAS_DFLASH_CAPTURE_TRACE").as_deref() == Ok("1")
+}
+
 impl TransformerModel {
     /// Run the maximal run of KDA layers starting at `layer_idx` through the
     /// piecewise graph cache. `Ok(true)` when `layer_idx` belongs to a run
     /// (handled now, or already handled with its run's first layer).
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn kgamma_kda_run(
         &self,
         layer_idx: usize,

@@ -255,7 +255,8 @@ impl TransformerModel {
                     || force_eager
                     || layer_veto
                     || verify_profile
-                    || super::verify_layer_trace::enabled(),
+                    || super::verify_layer_trace::enabled()
+                    || pieces::diagnostics_sync(),
             );
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {

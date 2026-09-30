@@ -269,7 +269,9 @@ pub(crate) struct VerifyPieces {
     map: Mutex<HashMap<PieceKey, Entry>>,
     /// Graph count past which new keys stay eager. A ~14-kernel piece costs
     /// ~0.17-0.25 MiB of unified memory (host RSS ~0.1 MiB of it) on GB10;
-    /// C1 at every verify width 2..=8 is 7 x 84 = 588 graphs.
+    /// C1 at every verify width 2..=8 is 7 x 84 = 588 graphs. Held until a
+    /// LoRA clear and outside KV-pool sizing: the default 600 is ~100-150
+    /// MiB of the headroom `--gpu-memory-utilization` leaves.
     budget: usize,
 }
 
@@ -296,7 +298,7 @@ impl VerifyPieces {
     /// the second, replayed after that. `body` receives the communicator its
     /// layers must use. A failed capture pass executes nothing, so the key is
     /// refused and `body` runs eagerly instead. A warm key over the graph
-    /// budget runs eagerly until invalidation frees room.
+    /// budget runs eagerly until [`Self::clear`] frees room.
     pub(crate) fn run(
         &self,
         key: PieceKey,
@@ -357,26 +359,15 @@ impl VerifyPieces {
         replayed
     }
 
-    /// Drop every run captured for `slot` (its sequence was freed).
-    pub(crate) fn invalidate_slot(&self, slot: usize, gpu: &dyn GpuBackend) {
-        self.retain(gpu, |key| key.0 != slot);
-    }
-
-    /// Drop every captured run.
+    /// Drop every captured run (LoRA rotation). Freeing a sequence keeps its
+    /// slot's runs: everything they bake is a function of the slot alone, so
+    /// a later request on the slot replays without a warm-up or capture step.
     pub(crate) fn clear(&self, gpu: &dyn GpuBackend) {
-        self.retain(gpu, |_| false);
-    }
-
-    fn retain(&self, gpu: &dyn GpuBackend, keep: impl Fn(&PieceKey) -> bool) {
-        self.map.lock().retain(|key, entry| {
-            if keep(key) {
-                return true;
-            }
+        for (_, entry) in self.map.lock().drain() {
             if let Entry::Captured(steps) = entry {
-                destroy(steps, gpu);
+                destroy(&steps, gpu);
             }
-            false
-        });
+        }
     }
 }
 

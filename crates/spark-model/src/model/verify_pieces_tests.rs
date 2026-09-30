@@ -148,7 +148,7 @@ fn body_error_propagates_without_capture() {
 }
 
 #[test]
-fn invalidating_a_slot_restarts_only_that_slot() {
+fn slots_replay_independently_until_cleared() {
     let (gpu, comm, pieces) = (
         MockGpuBackend::new(),
         Log::default(),
@@ -167,19 +167,19 @@ fn invalidating_a_slot_restarts_only_that_slot() {
         step(0);
         step(1);
     }
-    assert_eq!(bodies.get(), 4);
-    pieces.invalidate_slot(0, &gpu);
-    step(1);
-    assert_eq!(bodies.get(), 4, "slot 1 still replays");
+    assert_eq!(bodies.get(), 4, "each slot: warm-up, capture, replay");
+    // A later request on either slot (no free-time invalidation) replays.
     step(0);
-    assert_eq!(bodies.get(), 5, "slot 0 warms up again");
+    step(1);
+    assert_eq!(bodies.get(), 4);
     pieces.clear(&gpu);
     step(1);
-    assert_eq!(bodies.get(), 6);
+    assert_eq!(bodies.get(), 5, "a clear restarts from the warm-up");
+    assert_eq!(comm.take().len(), 9 * EAGER.len());
 }
 
 #[test]
-fn over_budget_keys_stay_eager_until_room_frees() {
+fn over_budget_keys_stay_eager_until_cleared() {
     let (gpu, comm) = (MockGpuBackend::new(), Log::default());
     let pieces = VerifyPieces::with_budget(4); // one captured `layer` run: 4 graphs
     let bodies = std::cell::Cell::new(0);
@@ -201,7 +201,7 @@ fn over_budget_keys_stay_eager_until_room_frees() {
         "rows=2 captured; rows=3 over budget, eager"
     );
     assert_eq!(comm.take().len(), 6 * EAGER.len());
-    pieces.invalidate_slot(0, &gpu);
+    pieces.clear(&gpu);
     step(3);
     step(3);
     step(3);
