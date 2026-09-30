@@ -161,6 +161,7 @@ use super::super::types::TransformerModel;
 use super::prefill_b::pc_policy::tail_cut;
 use crate::traits::SequenceState;
 
+mod cache;
 mod flag;
 mod rolling;
 pub(in crate::model) use flag::enabled;
@@ -171,35 +172,6 @@ use rolling::{FinishLeaf, leaf_copies, leaf_save, owned_from};
 /// Head to worker: cache your mirror of this slot's sequence (then the usual
 /// free follows). Sent only with the flag on.
 pub(in crate::model) const EP_CMD_CACHE_SEQUENCE: u32 = 0xFFFF_FFF8;
-
-/// What `cache_sequence` does with a finished sequence's blocks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum FinishCache {
-    /// Every rank caches its mirror (the flag).
-    Mirrored,
-    /// This rank caches it: a single-rank world.
-    Local,
-    /// No rank does.
-    Skip,
-}
-
-/// `cache_sequence` runs on the head only. In a multi-rank world without the
-/// flag its insert used to give the head alone a node for every block of the
-/// output. The agreed match of the next turn cannot use them (the worker
-/// holds none), so the blocks sat in the head's pool until evicted. And when
-/// the next turn's history reproduced the output (a tool turn, or a client
-/// that sends the reasoning back), that turn's prefill insert found those
-/// nodes and kept their blocks, so from the turn after that the head
-/// attended the rows decode had written while the worker attended its own
-/// prefill of the same positions. A multi-rank world therefore caches a
-/// finished sequence on every rank or on none.
-pub(super) fn finish_cache(multi_rank: bool, leaf: bool) -> FinishCache {
-    match (leaf, multi_rank) {
-        (true, _) => FinishCache::Mirrored,
-        (false, true) => FinishCache::Skip,
-        (false, false) => FinishCache::Local,
-    }
-}
 
 impl TransformerModel {
     /// The save span in tokens when `seq` can carry a rolling leaf now.
@@ -411,17 +383,6 @@ impl TransformerModel {
         self.cache_sequence_dispatch(seq);
     }
 
-    /// `cache_sequence` on the head: carry out [`finish_cache`]. `false`
-    /// leaves the insert to the caller (a single-rank world).
-    pub(super) fn finish_cache_multi_rank(&self, seq: &SequenceState, bs: usize) -> bool {
-        match finish_cache(self.multi_rank_protocol_active(), enabled()) {
-            FinishCache::Mirrored => self.finish_leaf_cache(seq, bs),
-            FinishCache::Skip => {}
-            FinishCache::Local => return false,
-        }
-        true
-    }
-
     /// `cache_sequence` with the flag on, on either rank: cache the whole
     /// blocks of `seq.tokens`, which brings the rolling leaf into reach of
     /// the next turn, and leave the leaf to the index.
@@ -465,9 +426,6 @@ impl TransformerModel {
     }
 }
 
-#[cfg(test)]
-#[path = "finish_cache_tests.rs"]
-mod cache_tests;
 #[cfg(test)]
 #[path = "finish_leaf_tests.rs"]
 mod tests;
