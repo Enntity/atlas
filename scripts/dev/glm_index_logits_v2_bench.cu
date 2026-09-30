@@ -10,7 +10,8 @@
 //   nvcc -arch=sm_121f -O3 --fmad=false -I kernels/gb10/glm-5.3-flash/nvfp4 \
 //        scripts/dev/glm_index_logits_v2_bench.cu -o v2_bench
 //   ./v2_bench [iters=7] [mode=all|check|small|time|quick|prof] [max_extent=135168]
-// (small: only the small bitwise cases, e.g. under compute-sanitizer racecheck)
+// (small: only the small bitwise cases, e.g. under compute-sanitizer racecheck;
+// max_extent >= 4096 tokens bounds the key cache, and cases past it are skipped)
 // Device memory: ~1.2 GB at the defaults. Exit: 0 bit-identical, 1 otherwise.
 //
 // A GPU time-sliced with other processes stretches long launches, so timing
@@ -54,7 +55,7 @@ static unsigned short f2bf(float f) {
     return u;
 }
 
-struct Cache { unsigned bs; unsigned long long stride; void *dcache, *dtable; };
+struct Cache { unsigned bs, tokens; unsigned long long stride; void *dcache, *dtable; };
 
 // Pooled keys for `tokens` positions laid out as the runtime does: block b of
 // the logical sequence lives at physical block table[b], bs/4 pools of 256 B.
@@ -67,7 +68,7 @@ static Cache make_cache(unsigned bs, unsigned tokens, std::mt19937& rng) {
     const unsigned long long stride = (unsigned long long)(bs / 4) * 256;
     std::vector<unsigned short> cache((size_t)blocks * stride / 2);
     for (auto& x : cache) x = f2bf(nd(rng));
-    Cache c{bs, stride, nullptr, nullptr};
+    Cache c{bs, tokens, stride, nullptr, nullptr};
     CK(cudaMalloc(&c.dcache, cache.size() * 2));
     CK(cudaMalloc(&c.dtable, table.size() * 4));
     CK(cudaMemcpy(c.dcache, cache.data(), cache.size() * 2, cudaMemcpyHostToDevice));
@@ -123,6 +124,10 @@ int main(int argc, char** argv) {
     const std::string mode = argc > 2 ? argv[2] : "all";
     const unsigned max_extent = argc > 3 ? atoi(argv[3]) : 135168;
     const unsigned max_rows = 4096;
+    if (max_extent < max_rows) {
+        fprintf(stderr, "max_extent must be at least %u tokens\n", max_rows);
+        return 2;
+    }
     std::mt19937 rng(20260929);
     std::normal_distribution<float> nd(0.f, 1.f);
 
@@ -150,9 +155,17 @@ int main(int argc, char** argv) {
     CK(cudaMemcpy(b.dw, w.data(), w.size() * 2, cudaMemcpyHostToDevice));
     const Cache c16 = make_cache(16, max_extent, rng);
     const Cache c64 = make_cache(64, 40000, rng);
+    // Rows [start, start + rows) stay inside the cache, table and outputs.
+    auto fits = [&](unsigned rows, unsigned start, const Cache& c) {
+        return (size_t)start + rows <= std::min(c.tokens, max_extent);
+    };
 
     if (mode == "prof") {  // one launch of each kernel on the 57K reference piece, for ncu
         const unsigned rows = 4096, start = 57344, stride = (start + rows + 3) / 4;
+        if (!fits(rows, start, c16)) {
+            fprintf(stderr, "prof needs max_extent >= %u\n", start + rows);
+            return 2;
+        }
         launch(nullptr, 0, b, c16, 0, rows, start, stride);
         launch(&kVariants[0], default_gx(kVariants[0], rows, stride), b, c16, 0, rows, start, stride);
         CK(cudaDeviceSynchronize());
@@ -172,6 +185,10 @@ int main(int argc, char** argv) {
         std::vector<unsigned> h0, h1;
         size_t compared = 0;
         for (const auto& cs : cases) {
+            if (!fits(cs.rows, cs.start, *cs.c)) {
+                printf("case rows=%u start=%u skipped: past max_extent\n", cs.rows, cs.start);
+                continue;
+            }
             const unsigned stride = (cs.start + cs.rows + 3) / 4;
             if (mode == "small" && (size_t)cs.rows * stride > 2000000) continue;
             CK(cudaMemset(b.dout0, 0xFF, (size_t)cs.rows * stride * 4));
@@ -289,6 +306,7 @@ int main(int argc, char** argv) {
     for (const auto& rs : {std::pair{1u, 4096u}, {13u, 4096u}, {8u, 65536u}, {64u, 65536u},
                            {512u, 65536u}}) {
         const unsigned rows = rs.first, start = rs.second, stride = (start + rows + 3) / 4;
+        if (!fits(rows, start, c16)) continue;
         const double gflop = (double)rows * stride * 32 * 128 * 2 / 1e9;
         const float old_ms = best_ms([&] { launch(nullptr, 0, b, c16, 0, rows, start, stride); });
         const Variant& v = kVariants[0];
