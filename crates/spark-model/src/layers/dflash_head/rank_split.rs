@@ -12,7 +12,7 @@
 //! the input, so every value is the one the unsplit launch writes and the
 //! drafts are bit-identical.
 //!
-//! Both ranks walk [`Geometry::steps`] of their own rank. The swaps are the
+//! Both ranks walk `Geometry::steps` of their own rank. The swaps are the
 //! same list in the same order with the same sizes on both
 //! ([`Geometry::swaps`]); only the local pieces between them differ. Pieces
 //! are stream work with no host sync, so the head captures each run of pieces
