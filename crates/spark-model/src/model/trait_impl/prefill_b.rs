@@ -34,6 +34,7 @@ mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;
 mod midchunk_capture;
+mod pc_policy;
 mod prefix_lookup;
 mod proc_range;
 mod prompt_logprobs;
@@ -224,6 +225,12 @@ impl TransformerModel {
             None,
         )?;
         let t_prefix = tp.elapsed();
+        // ATLAS_GLM_PC_BRANCH: split at the planned branch checkpoint.
+        let span = (chunk_start, chunk_len);
+        if let Some(at) = pc_policy::branch_split_at(seq.pc_branch_at, span, passengers.is_some()) {
+            drop(kv_cache);
+            return self.pc_branch_split(tokens, seq, span, at, is_last_chunk, stream);
+        }
 
         if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
             self.ssm_pool.debug_state_checksum(

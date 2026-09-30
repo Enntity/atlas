@@ -155,6 +155,16 @@ impl TransformerModel {
             // faulted-back spilled anchor; see `ssm_fault_in::eff_ssm_snapshot`.
             let (eff_snapshot, eff_snapshot_tokens) =
                 self.eff_ssm_snapshot(&prefix_match, seq.session_hash, stream);
+            // Multi-rank + ATLAS_GLM_PC_EVICT/BRANCH: every rank restores at
+            // one agreed depth or none does (`pc_policy`). Otherwise unchanged.
+            let (eff_snapshot, eff_snapshot_tokens, eff_is_tail) = self.pc_agree_restore(
+                tokens,
+                seq,
+                &prefix_match,
+                matched,
+                total,
+                (eff_snapshot, eff_snapshot_tokens),
+            )?;
 
             let mut skip = if let Some(snap_id) = eff_snapshot {
                 let snap_tok = eff_snapshot_tokens;
@@ -163,9 +173,6 @@ impl TransformerModel {
                 // produce the first token's logits, so fall through to the
                 // no-snapshot full-recompute path. Only affects identical
                 // retried prompts; multi-turn warm hits have matched < total.
-                let exact_without_hidden = snap_tok == matched
-                    && matched == total
-                    && !self.ssm_snapshots.has_hidden(snap_id);
                 // The bypass must be decided HERE, not after the restore below.
                 // It used to be checked ~80 lines further down, where it set
                 // `skip = false` to force a full recompute — but by then
@@ -185,9 +192,6 @@ impl TransformerModel {
                 // SHARED with the prefix cache. `ctx.gdn_exact_replay`'s own doc
                 // in layer.rs describes this same poisoning for the GDN path.
                 // `ATLAS_MARCONI_EXACT=1` re-enables it for A/B.
-                let bypass_exact = snap_tok == matched
-                    && matched == total
-                    && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1");
                 // Session gate applies ONLY to TAIL snapshots (their state
                 // bleeds past the exact prefix). Exact / is_tail_sibling
                 // snapshots are content-addressed by the verified token prefix
@@ -196,20 +200,11 @@ impl TransformerModel {
                 // turn anchor and forced recompute-all. See lookup_tiered.
                 // Below `marconi_min_tokens()` the snapshot restore costs more in lost
                 // drafter acceptance than the skipped prefill saves — see the helper.
-                if snap_tok >= crate::model::mtp_carry::marconi_min_tokens()
-                    && snap_tok > 0
-                    && matched <= total
-                    && !exact_without_hidden
-                    && !bypass_exact
-                    && (!prefix_match.ssm_snapshot_is_tail
-                        || self
-                            .ssm_snapshots
-                            .session_matches(snap_id, seq.session_hash))
-                    // Aux-carrying models (PLE/QSA) decline aux-less slots —
-                    // e.g. mid-chunk tail captures — rather than restore a
-                    // stale lexical state. See prefill_a.
-                    && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
-                {
+                // Aux-carrying models (PLE/QSA) decline aux-less slots —
+                // e.g. mid-chunk tail captures — rather than restore a
+                // stale lexical state. See prefill_a. The whole gate is
+                // `pc_policy::marconi_restorable`.
+                if self.marconi_restorable(snap_id, snap_tok, eff_is_tail, matched, total, seq) {
                     // Cross-stream ordering: the snapshot we are about to read
                     // was SAVED on the default stream (decode_marconi_checkpoint
                     // / finish_leaf_snapshot / prefill_save_snapshot), but this
@@ -371,6 +366,7 @@ impl TransformerModel {
             } else {
                 0
             };
+            self.pc_plan_branch(tokens, seq, matched, skip_tokens, bs);
             seq.marconi_skip_to = skip_tokens;
             seq.prefix_lookup_skip = skip;
             seq.prefix_lookup_applied = true;
