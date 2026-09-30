@@ -1,9 +1,11 @@
 # GLM-5.3-Flash token-sharded MLA latents (`ATLAS_GLM_KV_SHARD=1`)
 
-Status: implemented behind an opt-in flag, compiled and unit-tested on a
-GPU-less host only. **Not yet validated on hardware** (see the last section).
-Default off: with the flag unset every allocation, kernel and launch is the
-one the engine ran before.
+Status: implemented behind an opt-in flag. On the pair (2026-09-29, first
+pass of the plan in the last section): retrieval correct at 16K/64K/128K,
+prefix caching correct, pool 1.63M -> 2.84M tokens at the same memory
+setting; decode at long context slower (see "Decode cost of the merge
+form"), cold prefill TTFT 1-2% slower. Default off: with the flag unset
+every allocation, kernel and launch is the one the engine ran before.
 
 ## Why
 
@@ -144,7 +146,9 @@ without), so the shard alone closes most, not all, of the gap: another
   split launch (same bytes read), one FP32 merge and two small copies. Expect
   roughly +1.5-3.5 ms per verify step (1-3% of today's 110-250 ms steps).
   Follow-up: batch all owners of a layer into one query exchange and one
-  partial exchange (22 per step).
+  partial exchange (22 per step). (Measured since: see "Decode cost of the
+  merge form" below — the extra split launch is not free, because a masked
+  key costs the same tensor-core work as a stored one.)
 - **Prefill (view form):** per layer per chunk one host sync, a local copy of
   the own half of the history, and an exchange of the peer's half
   (at 256K history ~69 MB each way per layer, ~31 ms per 8K chunk over 11
@@ -154,6 +158,79 @@ without), so the shard alone closes most, not all, of the gap: another
 - **CUDA graphs are suppressed** when the cache is sharded (the exchanges and
   the view's host sync are eager). The DFlash verify lane is already eager;
   plain decode loses graphs.
+
+## Decode cost of the merge form, and its two tunings
+
+Measured on the pair (2026-09-29, single stream, greedy text identical to the
+flag-off run): decode 142.8 -> 124.5 tok/s at 61K tokens and 132.3 -> 125.9
+at 125K. Two caveats on those numbers: that profile also set
+`ATLAS_GLM_KV_SHARD_CHECK=1`, and each is one request of ~65 generated tokens
+(about half a second of decode), so the 61K-vs-125K difference is within the
+noise of one sample. Nothing in the merge form grows with the context: the
+kernel microbench below costs the same at 16K, 64K and 128K, so the relative
+cost can only shrink as the step itself gets longer.
+
+Per verify step and per MLA layer (11 of them), the merge form adds to the
+unsharded `split kernel + merge`:
+
+| extra work | where | cost at 8 rows |
+|---|---|---|
+| a second split launch over a row that is half `-1` | each launch still walks all 65 key tiles of the 2051-wide row; a masked key costs the same QK/PV tensor-core work as a stored one | the attention kernel time doubles: +83 us (microbench) |
+| query swap, 32 KiB/row each way | two copy-engine staging copies (13 us measured) + the RDMA write (~19 us at 14 GB/s) + flag round trip, with the compute stream parked on it | ~40 us (estimated) |
+| partial swap, 64 KiB/row each way | same (25 us of copies, ~38 us on the wire) | ~70 us (estimated) |
+| localize, FP32 merge of the peer's heads, two device copies of the landed partial, one more merge partition | small launches | inside the +83 us |
+| `..._CHECK=1` only | block-table read to the host + an 8-byte swap + its read-back: two stream syncs per layer, 22 per step, each draining the launch queue | not in the microbench; drop the flag for serving |
+
+So an 8-row step pays roughly 0.9 ms of extra kernel time and 1.2 ms parked
+on exchanges (plus the check's 22 syncs in the run above). Both tunings are
+exact and opt-in:
+
+- **`ATLAS_GLM_KV_SHARD_COMPACT=1`.** `glm_kv_shard_localize_compact` packs
+  each row's owned IDs to the front (a stable partition, one CTA per row, no
+  host sync) and writes their number per row; the `*_split_counted` kernels
+  partition that prefix instead of the whole row, so the two launches walk
+  ~33 tiles each instead of 65; `glm_sparse_decode_split_merge_extra` merges
+  the peer's partial where the exchange landed it (no copies). The launch
+  shapes stay `rows x splits` on both ranks; only how far a CTA walks depends
+  on the data. The partition boundaries move, so the FP32 summation order
+  differs from the uncompacted shard (as the shard's already differs from
+  flag-off); the math is the same softmax.
+- **`ATLAS_GLM_KV_SHARD_OVERLAP=1`.** Both swaps run on a side stream
+  (`ExchangeLane`, fenced by two events: `glm_kv_shard::overlapped_exchange`)
+  beside compute that does not need them: the partial swap beside this rank's
+  own heads' partitions, the query swap beside the owner's index update and
+  selection. For the latter a single verify owner takes the owner-batched
+  projections, so its queries exist before its selection (the same
+  projections in a different order). The window never uses the pair: the pair
+  orders sends by stream order, and few-row owners' selection is local (the
+  index split only splits owners of 256+ rows). Off under `..._CHECK=1` and
+  under graph capture. Both ranks issue the same exchanges in the same order,
+  so an overlap only moves where each rank waits.
+
+Kernel microbench (`scripts/dev/glm_kv_shard_bench.cu`, ennspark03, fp8_g128,
+one rank's launches per MLA layer, minimum of 40 batches of 50; the GPU is
+shared, so compare within a row):
+
+| rows | context | unsharded | shard | shard + compact |
+|---|---|---|---|---|
+| 8 | 16K | 84.1 us | 165.1 (+81.0) | 119.1 (+35.0) |
+| 8 | 64K | 85.5 us | 170.5 (+85.0) | 120.1 (+34.6) |
+| 8 | 128K | 86.4 us | 173.1 (+86.7) | 119.9 (+33.6) |
+| 8 | 64K, this rank stores 70% of the selection | 85.5 us | 177.9 (+92.4) | 142.1 (+56.6) |
+| 4 | 64K | 59.3 us | 114.0 (+54.7) | 85.3 (+26.0) |
+| 2 | 64K | 53.1 us | 104.5 (+51.4) | 83.2 (+30.2) |
+| 1 | 64K | 50.0 us | 102.1 (+52.1) | 81.3 (+31.4) |
+
+All three pipelines match a double-precision CPU softmax attention over the
+same dequantized latents to 1.2-1.5e-4 before BF16 rounding (output rms
+0.021), and their BF16 outputs differ from each other by at most one BF16
+ulp. The in-place merge is bitwise equal to copying the partial and merging
+one more partition.
+
+What is left with both tunings: ~30 us per layer of launches that have no
+unsharded counterpart (compaction, the FP32 merge, a second launch's fixed
+cost), and whatever part of the partial swap outlasts the own-head partitions
+it hides behind — roughly 0.4-0.7 ms per 8-row step.
 
 ## Numerics
 
