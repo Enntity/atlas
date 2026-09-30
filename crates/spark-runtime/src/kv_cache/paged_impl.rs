@@ -7,6 +7,7 @@
 use anyhow::{Result, bail};
 
 use super::block_trace::BlockTrace;
+use super::free_blocks::FreeBlocks;
 use super::{KvCacheConfig, KvCacheDtype, LayerPool, PagedKvCache};
 use crate::gpu::{DevicePtr, GpuBackend};
 
@@ -70,7 +71,7 @@ impl PagedKvCache {
             });
         }
 
-        let free_blocks: Vec<u32> = (0..num_blocks as u32).rev().collect();
+        let free_blocks = FreeBlocks::new(num_blocks, 1);
         let block_ref_counts = vec![0u32; num_blocks];
 
         let has_mixed = !config.layer_dtypes.is_empty()
@@ -111,21 +112,6 @@ impl PagedKvCache {
         })
     }
 
-    /// Allocate a free block. Returns block index.
-    #[track_caller]
-    pub fn alloc_block(&mut self) -> Result<u32> {
-        let idx = self
-            .free_blocks
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("KV cache exhausted: no free blocks"))?;
-        self.block_ref_counts[idx as usize] = 1;
-        if self.trace.is_on() {
-            self.trace
-                .record(idx as usize, "alloc", 1, std::panic::Location::caller());
-        }
-        Ok(idx)
-    }
-
     /// DIAGNOSTIC (ATLAS_KV_POISON): fill a freshly-allocated block with 0xFF
     /// (a NaN bit-pattern in both bf16 `0xFFFF` and fp8-e4m3 `0xFF`) instead of
     /// zero. Any KV region that decode/attention reads but prefill never wrote
@@ -161,18 +147,6 @@ impl PagedKvCache {
             )?;
         }
         Ok(())
-    }
-
-    /// Try to allocate a free block without failing. Returns None if exhausted.
-    #[track_caller]
-    pub fn try_alloc_block(&mut self) -> Option<u32> {
-        let idx = self.free_blocks.pop()?;
-        self.block_ref_counts[idx as usize] = 1;
-        if self.trace.is_on() {
-            self.trace
-                .record(idx as usize, "try_alloc", 1, std::panic::Location::caller());
-        }
-        Some(idx)
     }
 
     /// Increment reference count on a block (for prefix cache sharing).
@@ -301,7 +275,7 @@ impl PagedKvCache {
                 .record(idx, "evict_return", after, std::panic::Location::caller());
         }
         if self.block_ref_counts[idx] == 0 {
-            self.free_blocks.push(idx as u32);
+            self.free_blocks.push(block_idx);
             self.release_tail_slot_if_freed(block_idx);
         }
     }
@@ -309,11 +283,6 @@ impl PagedKvCache {
     /// Current reference count for a block.
     pub fn ref_count(&self, block_idx: u32) -> u32 {
         self.block_ref_counts[block_idx as usize]
-    }
-
-    /// Number of free blocks.
-    pub fn num_free_blocks(&self) -> usize {
-        self.free_blocks.len()
     }
 
     /// Get K cache pointer for a layer and block.
@@ -338,7 +307,7 @@ impl PagedKvCache {
 
     /// Get the full K cache pool pointer for a layer (for paged decode kernel).
     /// Panics under a latent shard, whose pool holds only this rank's blocks
-    /// (see [`Self::latent_local_pool_ptr`]).
+    /// (see [`Self::latent_pool_ptr`]).
     #[track_caller]
     pub fn k_pool_ptr(&self, layer_idx: usize) -> DevicePtr {
         self.assert_unsharded("k_pool_ptr");

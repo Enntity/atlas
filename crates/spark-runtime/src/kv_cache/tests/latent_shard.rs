@@ -71,15 +71,99 @@ fn owned_run_matches_a_per_block_filter() {
 
 #[test]
 fn plan_partitions_logical_blocks_in_order() {
-    let table = [5u32, 2, 7, 8, 3];
-    let p0 = shard(0).plan(&table);
-    assert_eq!(p0.mine_logical, vec![1, 3]);
-    assert_eq!(p0.mine_slot, vec![1, 4]);
-    assert_eq!(p0.peer_logical, vec![0, 2, 4]);
-    let p1 = shard(1).plan(&table);
+    let table = [4u32, 7, 2, 9, 0];
+    let p0 = shard(0).plan(&table).unwrap();
+    assert_eq!(p0.mine_logical, vec![0, 2, 4]);
+    assert_eq!(p0.mine_slot, vec![2, 1, 0]);
+    assert_eq!(p0.peer_logical, vec![1, 3]);
+    let p1 = shard(1).plan(&table).unwrap();
     assert_eq!(p1.mine_logical, p0.peer_logical);
-    assert_eq!(p1.mine_slot, vec![2, 3, 1]);
+    assert_eq!(p1.mine_slot, vec![3, 4]);
     assert_eq!(p1.peer_logical, p0.mine_logical);
+}
+
+#[test]
+fn a_block_off_its_logical_residue_is_rejected() {
+    // Logical block 1 holds an even block: the ranks would disagree.
+    for rank in 0..2 {
+        let err = shard(rank).plan(&[4, 6, 2]).unwrap_err().to_string();
+        assert!(err.contains("logical block 1"), "{err}");
+    }
+    assert!(shard(0).check_table(&[]).is_ok());
+}
+
+/// One rank's pool driven through a shared script, freeing in its own order.
+fn run_rank(rank: usize, reverse_frees: bool) -> Vec<Vec<u32>> {
+    let gpu = MockGpuBackend::new();
+    let mut cache = PagedKvCache::new_latent_sharded(glm_config(), 24, &gpu, spec(rank)).unwrap();
+    let alloc = |cache: &mut PagedKvCache, n: usize| -> Vec<u32> {
+        (0..n).map(|l| cache.alloc_block_at(l).unwrap()).collect()
+    };
+    let a = alloc(&mut cache, 5);
+    let b = alloc(&mut cache, 3);
+    let mut order = a.clone();
+    if reverse_frees {
+        order.reverse();
+    }
+    cache.free_blocks(&order);
+    let c = alloc(&mut cache, 7);
+    cache.free_block(b[1]);
+    let mut d = alloc(&mut cache, 2);
+    // A sequence extended one block at a time after a prefix of two.
+    d.extend((2..6).map(|l| cache.alloc_block_at(l).unwrap()));
+    vec![b, c, d]
+}
+
+#[test]
+fn ranks_freeing_in_different_orders_agree_on_every_owner() {
+    let (r0, r1) = (run_rank(0, false), run_rank(1, true));
+    assert_ne!(r0, r1, "the script must make the ranks' ids diverge");
+    for (t0, t1) in r0.iter().zip(&r1) {
+        assert_eq!(t0.len(), t1.len());
+        let (p0, p1) = (shard(0).plan(t0).unwrap(), shard(1).plan(t1).unwrap());
+        assert_eq!(p0.mine_logical, p1.peer_logical);
+        assert_eq!(p0.peer_logical, p1.mine_logical);
+    }
+}
+
+#[test]
+fn free_count_is_what_any_logical_mix_can_draw() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = PagedKvCache::new_latent_sharded(glm_config(), 9, &gpu, spec(0)).unwrap();
+    // Residue 0 holds 5 blocks, residue 1 holds 4.
+    assert_eq!(cache.num_free_blocks(), 8);
+    let even: Vec<u32> = (0..4).map(|_| cache.alloc_block_at(2).unwrap()).collect();
+    assert!(even.iter().all(|b| b % 2 == 0));
+    assert_eq!(cache.num_free_blocks(), 2);
+    cache.alloc_block_at(0).unwrap();
+    assert_eq!(cache.num_free_blocks(), 0);
+    let err = cache.alloc_block_at(4).unwrap_err().to_string();
+    assert!(
+        err.contains("logical block 4") && err.contains("4 free"),
+        "{err}"
+    );
+    assert_eq!(cache.alloc_block_at(1).unwrap() % 2, 1);
+    cache.free_block(even[0]);
+    assert_eq!(cache.num_free_blocks(), 2);
+}
+
+#[test]
+fn unsharded_allocation_ignores_the_logical_index() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = PagedKvCache::new(glm_config(), 4, &gpu).unwrap();
+    assert_eq!(cache.alloc_block_at(1).unwrap(), 0);
+    assert_eq!(cache.alloc_block().unwrap(), 1);
+    assert_eq!(cache.try_alloc_block(), Some(2));
+    assert_eq!(cache.num_free_blocks(), 1);
+}
+
+#[test]
+fn allocation_without_a_logical_index_is_refused_when_sharded() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = PagedKvCache::new_latent_sharded(glm_config(), 4, &gpu, spec(0)).unwrap();
+    assert!(cache.alloc_block().is_err());
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.try_alloc_block()));
+    assert!(caught.is_err());
 }
 
 #[test]

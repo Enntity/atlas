@@ -443,7 +443,7 @@ impl LayerPool {
 pub struct PagedKvCache {
     layers: Vec<LayerPool>,
     num_blocks: usize,
-    free_blocks: Vec<u32>,
+    free_blocks: free_blocks::FreeBlocks,
     /// Per-block reference count. Enables shared blocks (prefix caching).
     /// Default: 1 on alloc, freed when decremented to 0.
     block_ref_counts: Vec<u32>,
@@ -461,6 +461,7 @@ pub struct PagedKvCache {
 mod block_trace;
 mod catalog;
 mod debug_impl;
+mod free_blocks;
 mod latent_shard;
 mod paged_impl;
 mod release;

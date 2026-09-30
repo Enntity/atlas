@@ -5,14 +5,18 @@
 //!
 //! Every physical block's latents live on exactly ONE rank: block `b` is
 //! owned by rank `b % world` and sits at local slot `b / world` of that
-//! rank's per-layer K pool (V aliases K). The allocator, the block tables,
-//! the prefix cache and every other per-block pool (semantic index, tails)
-//! are unchanged and identical on both ranks, so only the latent bytes
-//! shrink. `kernels/gb10/glm-5.3-flash/nvfp4/glm_kv_shard.cu` implements the
-//! same ownership rule on device; keep the two in step.
+//! rank's per-layer K pool (V aliases K). The ranks' physical ids differ
+//! (each allocates and frees in its own order), but the allocator draws the
+//! block for logical index `l` with `b % world == l % world`
+//! (`free_blocks.rs`), so both ranks agree that logical block `l` is stored
+//! by rank `l % world`. Every other per-block pool (semantic index, tails)
+//! is kept in full on both ranks, so only the latent bytes shrink.
+//! `kernels/gb10/glm-5.3-flash/nvfp4/glm_kv_shard.cu` implements the same
+//! ownership rule on device; keep the two in step.
 
 use anyhow::{Result, ensure};
 
+use super::free_blocks::FreeBlocks;
 use super::{KvCacheConfig, PagedKvCache};
 use crate::gpu::{DevicePtr, GpuBackend};
 
@@ -96,9 +100,32 @@ impl LatentShard {
         (owned0 / world, (end - owned0).div_ceil(world))
     }
 
+    /// Check that every entry of a sequence's block table (logical order)
+    /// is owned by the rank its logical index names: the invariant that lets
+    /// the ranks' differing tables agree on ownership.
+    pub fn check_table(&self, table: &[u32]) -> Result<()> {
+        let world = self.spec.world;
+        match table
+            .iter()
+            .enumerate()
+            .find(|&(logical, &block)| self.owner(block) != logical % world)
+        {
+            None => Ok(()),
+            Some((logical, block)) => anyhow::bail!(
+                "latent shard: logical block {logical} of a {}-block table is physical \
+                 block {block}, owned by rank {} instead of {} (allocated without its \
+                 logical index?)",
+                table.len(),
+                self.owner(*block),
+                logical % world
+            ),
+        }
+    }
+
     /// Split a sequence's block table (logical order) into this rank's
-    /// blocks and the peer's.
-    pub fn plan(&self, table: &[u32]) -> LatentViewPlan {
+    /// blocks and the peer's, after [`Self::check_table`].
+    pub fn plan(&self, table: &[u32]) -> Result<LatentViewPlan> {
+        self.check_table(table)?;
         let mut plan = LatentViewPlan::default();
         for (logical, &block) in table.iter().enumerate() {
             match self.local_slot(block) {
@@ -109,7 +136,7 @@ impl LatentShard {
                 None => plan.peer_logical.push(logical as u32),
             }
         }
-        plan
+        Ok(plan)
     }
 }
 
@@ -152,6 +179,7 @@ impl PagedKvCache {
             spec.world,
             spec.scratch_bytes as f64 / (1024.0 * 1024.0)
         );
+        cache.free_blocks = FreeBlocks::new(num_blocks, spec.world);
         cache.latent_shard = Some(LatentShard {
             spec,
             local_blocks,
