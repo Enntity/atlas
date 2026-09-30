@@ -44,9 +44,26 @@ pub(super) fn try_project(
         cast,
         stream,
         |a, w, o, m, n, k, s| {
-            spark_runtime::cublaslt::fp8_gemm_act_weight_t_tensorwise(a, w, o, m, n, k, s)
+            spark_runtime::cublaslt::fp8_gemm_act_weight_t_tensorwise(
+                a,
+                w,
+                o,
+                m,
+                n,
+                k,
+                no_split_k(),
+                s,
+            )
         },
     )
+}
+
+/// Opt-in `ATLAS_GLM_KDA_PREFILL_LT_FP8_SPLITK1=1` (lossy path only): pin
+/// the Lt FP8 projection to split-K 1. Changes the summation order of the
+/// 2048..~4K-row chunks where the heuristic picks split-K 2, at ~half the time.
+fn no_split_k() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_KDA_PREFILL_LT_FP8_SPLITK1").as_deref() == Ok("1"))
 }
 
 #[allow(clippy::too_many_arguments)]

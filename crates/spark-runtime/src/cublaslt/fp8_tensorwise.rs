@@ -41,6 +41,8 @@ struct Heuristic {
 /// Row-major `out[M,N] = act[M,K] * weight[N,K]^T`. Both operands are already
 /// E4M3 with tensor scales exactly one. Calls serialize on the existing model
 /// forward stream and share the existing process CUDA64MiB workspace.
+/// `no_split_k` masks the heuristic to reduction scheme NONE (split-K 1): at
+/// N=K=4096 it otherwise picks split-K 2 for M 2048..~4K, ~2x slower on GB10.
 #[allow(clippy::too_many_arguments)]
 pub fn fp8_gemm_act_weight_t_tensorwise(
     act: u64,
@@ -49,6 +51,7 @@ pub fn fp8_gemm_act_weight_t_tensorwise(
     m: u32,
     n: u32,
     k: u32,
+    no_split_k: bool,
     stream: u64,
 ) -> Result<()> {
     ensure!(
@@ -169,6 +172,19 @@ pub fn fp8_gemm_act_weight_t_tensorwise(
                     size_of::<u32>(),
                 ),
                 "FP8 tensorwise alignment",
+            )?;
+        }
+        if no_split_k {
+            // PREF_REDUCTION_SCHEME_MASK = CUBLASLT_REDUCTION_SCHEME_NONE.
+            let none = 0u32;
+            chk(
+                cublasLtMatmulPreferenceSetAttribute(
+                    h.pref,
+                    3,
+                    (&none as *const u32).cast(),
+                    size_of::<u32>(),
+                ),
+                "FP8 tensorwise reduction scheme",
             )?;
         }
         let mut result = Heuristic::default();
