@@ -891,6 +891,25 @@ __device__ __forceinline__ unsigned int pqw_tile_expert(
     return lo;
 }
 
+// Threads t < M_TILE: the source row of the tile's row t (its sorted token,
+// or the row itself).
+__device__ __forceinline__ void pqw_gather_rows(
+    int* sTok, unsigned int t, const int* __restrict__ sorted_token_ids,
+    unsigned int cta_m, int cta_m_local, int M_expert
+) {
+    if (t < M_TILE) {
+        const bool live = (cta_m_local + (int)t) < M_expert;
+        sTok[t] = (sorted_token_ids && live) ? sorted_token_ids[cta_m + t] : (int)(cta_m + t);
+    }
+}
+
+__device__ __forceinline__ void pqw_zero_acc(PqwAcc& acc) {
+    #pragma unroll
+    for (int mi = 0; mi < 2; mi++)
+        #pragma unroll
+        for (int i = 0; i < 2 * PQW_NB; i++) acc[mi][i][0] = acc[mi][i][1] = acc[mi][i][2] = acc[mi][i][3] = 0.0f;
+}
+
 // Tile 16-byte column chunk c: whether it reads the up matrix, and its column.
 template<bool GATE_UP>
 __device__ __forceinline__ bool pqw_chunk_up(unsigned int c) { return GATE_UP && c >= PQW_NT / 32; }
@@ -1110,10 +1129,7 @@ __device__ __forceinline__ void pqw_impl(
     __shared__ __align__(16) PqwS sS[STAGES];
     __shared__ int sTok[M_TILE];
 
-    if (t < M_TILE) {
-        const bool live = (cta_m_local + (int)t) < M_expert;
-        sTok[t] = (sorted_token_ids && live) ? sorted_token_ids[cta_m + t] : (int)(cta_m + t);
-    }
+    pqw_gather_rows(sTok, t, sorted_token_ids, cta_m, cta_m_local, M_expert);
     __syncthreads();
 
     const unsigned int M_eff = (unsigned int)M_expert;
@@ -1123,10 +1139,7 @@ __device__ __forceinline__ void pqw_impl(
     };
 
     PqwAcc acc;
-    #pragma unroll
-    for (int mi = 0; mi < 2; mi++)
-        #pragma unroll
-        for (int i = 0; i < 2 * PQW_NB; i++) acc[mi][i][0] = acc[mi][i][1] = acc[mi][i][2] = acc[mi][i][3] = 0.0f;
+    pqw_zero_acc(acc);
 
     const unsigned int stages = K / PQ2_KS;
     #pragma unroll
@@ -1184,7 +1197,10 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_w4a4_grouped_gemm_prequ
 // K128W grid launches the host's bound, most of it exiting at once), and
 // each CTA gathers its next tile's token rows and issues its first K stage
 // before the current tile's epilogue. Every tile below
-// mtile_prefix[num_experts] holds rows of a local expert.
+// mtile_prefix[num_experts] holds rows of a local expert. An item whose
+// weight table entry is null (the prefix came from another table) loads
+// and stores nothing, as the grid kernel's CTA returns, but still passes
+// the K loop's barriers with the CTA, its MMAs reading stale shared memory.
 template<bool GATE_UP>
 __device__ __forceinline__ void pqp_impl(
     PQ2_ARGS,
@@ -1226,6 +1242,7 @@ __device__ __forceinline__ void pqp_impl(
         return d;
     };
     auto issue = [&](const Tile& d, int buf, unsigned int kb) {
+        if (d.B == 0) return;
         pqw_issue<GATE_UP>(t, sA[buf], sAs[buf], sB[buf], sS[buf], sTok, A_packed, A_scale,
             d.B, d.S, d.U, d.US, d.cta_m_local, (unsigned int)d.M_expert, d.cta_n, N, K, kb);
     };
@@ -1233,10 +1250,7 @@ __device__ __forceinline__ void pqp_impl(
     // thread's reads of sTok and sNext and of stage buffer 0 for the
     // previous item precede the last __syncthreads of its K loop or this one.
     auto start = [&](const Tile& d) {
-        if (t < M_TILE) {
-            const bool live = (d.cta_m_local + (int)t) < d.M_expert;
-            sTok[t] = (sorted_token_ids && live) ? sorted_token_ids[d.cta_m + t] : (int)(d.cta_m + t);
-        }
+        pqw_gather_rows(sTok, t, sorted_token_ids, d.cta_m, d.cta_m_local, d.M_expert);
         __syncthreads();
         issue(d, 0, 0);
         moe_cp_async_commit();
@@ -1253,10 +1267,7 @@ __device__ __forceinline__ void pqp_impl(
         // Claim the next item now; the K loop's barriers publish it.
         if (t == 0) sNext = atomicAdd(next_work, 1);
         PqwAcc acc;
-        #pragma unroll
-        for (int mi = 0; mi < 2; mi++)
-            #pragma unroll
-            for (int i = 0; i < 2 * PQW_NB; i++) acc[mi][i][0] = acc[mi][i][1] = acc[mi][i][2] = acc[mi][i][3] = 0.0f;
+        pqw_zero_acc(acc);
         for (unsigned int st = 0; st < stages; ++st) {
             const int buf = st % 2;
             moe_cp_async_wait_all();
@@ -1272,8 +1283,9 @@ __device__ __forceinline__ void pqp_impl(
             cur = decode(w);
             start(cur);
         }
-        pqw_epilogue<GATE_UP>(acc, warp_id, lane_id, done.expert_id, scale2_vals[done.expert_id], done.cta_m,
-            done.cta_m_local, done.M_expert, done.cta_n, N, C, up);
+        if (done.B != 0)
+            pqw_epilogue<GATE_UP>(acc, warp_id, lane_id, done.expert_id, scale2_vals[done.expert_id],
+                done.cta_m, done.cta_m_local, done.M_expert, done.cta_n, N, C, up);
         if (!more) break;
     }
 }

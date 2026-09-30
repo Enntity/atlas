@@ -382,28 +382,28 @@ extern "C" __global__ void moe_unpermute_reduce_indexed_ep_vec8(
     constexpr unsigned int MAX_TOPK = 8;
     const unsigned int token = blockIdx.x;
     if (token >= num_tokens) return;
-    // The token's local routes in slot order.
+    // The token's routes in slot order, each live if local. Every index is
+    // a compile-time slot, so the arrays stay in registers.
     unsigned int rows[MAX_TOPK];
     float weights[MAX_TOPK];
-    unsigned int n = 0;
-    for (unsigned int k = 0; k < topk && k < MAX_TOPK; k++) {
+    bool live[MAX_TOPK];
+    #pragma unroll
+    for (unsigned int k = 0; k < MAX_TOPK; k++) {
         const unsigned int slot = token * topk + k;
-        const int expert = topk_ids[slot];
-        if (expert >= (int)local_expert_start && expert < (int)local_expert_end) {
-            rows[n] = (unsigned int)token_to_perm[slot];
-            weights[n] = topk_weights[slot];
-            n++;
-        }
+        const int expert = k < topk ? topk_ids[slot] : -1;
+        live[k] = k < topk && expert >= (int)local_expert_start && expert < (int)local_expert_end;
+        rows[k] = live[k] ? (unsigned int)token_to_perm[slot] : 0u;
+        weights[k] = live[k] ? topk_weights[slot] : 0.0f;
     }
     for (unsigned int c = threadIdx.x * 8; c < hidden_size; c += blockDim.x * 8) {
         uint4 raw[MAX_TOPK];
         #pragma unroll
         for (unsigned int i = 0; i < MAX_TOPK; i++)
-            if (i < n) raw[i] = *(const uint4*)&expert_output[rows[i] * hidden_size + c];
+            if (live[i]) raw[i] = *(const uint4*)&expert_output[rows[i] * hidden_size + c];
         float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         #pragma unroll
         for (unsigned int i = 0; i < MAX_TOPK; i++) {
-            if (i >= n) break;
+            if (!live[i]) continue;
             const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&raw[i]);
             #pragma unroll
             for (int j = 0; j < 8; j++) {
