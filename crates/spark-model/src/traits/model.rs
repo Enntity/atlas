@@ -1351,6 +1351,12 @@ pub trait Model: Send + Sync {
         bail!("swap not supported by this model")
     }
 
+    /// Whether the two calls above round-trip everything a resumed sequence
+    /// reads. Otherwise the scheduler runs no `--swap-space` pool.
+    fn swap_resumable(&self) -> bool {
+        false
+    }
+
     /// Whether `tokens` contains a vision pad token for this model — i.e.
     /// the KV at those positions came from image/video EMBEDDINGS that a
     /// plain token re-prefill cannot reproduce. Decode-time preemption uses

@@ -232,3 +232,49 @@ pub(super) fn actual_kda_rows() {
         });
     }
 }
+
+const K128_DUAL: (&str, &str) = ("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm_dual_k128");
+
+#[test]
+fn kda_constructor_resolves_the_k128_dual_before_the_boot_seal() {
+    with_kda(0, |gpu, _, _| {
+        let lookup = Event::Lookup(K128_DUAL.0.into(), K128_DUAL.1.into());
+        assert!(gpu.trace().contains(&lookup));
+    });
+}
+
+/// `(func, grid)` of the f_b/g_b dual at K = 128 on `gpu`.
+fn k128_dual_launch(gpu: &Gpu) -> (u64, [u32; 3]) {
+    let w = [0x100, 0x200].map(|p| DenseWeight {
+        weight: DevicePtr(p),
+    });
+    let io = |p| [DevicePtr(p), DevicePtr(p + 0x100)];
+    ops::dense_gemv_batchm_dual(
+        gpu,
+        spark_runtime::gpu::KernelHandle(7),
+        io(0x300),
+        [&w[0], &w[1]],
+        io(0x500),
+        8,
+        4096,
+        128,
+        0,
+    )
+    .unwrap();
+    match gpu.trace().last() {
+        Some(Event::Launch(k, grid, ..)) => (*k, *grid),
+        e => panic!("expected the dual launch, got {e:?}"),
+    }
+}
+
+#[test]
+fn k128_dual_handle_belongs_to_its_backend() {
+    let (func, grid) = k128_dual_launch(&Gpu::new());
+    assert_ne!(func, 7);
+    assert_eq!(grid, [4096 / 16, 1, 2]);
+    // A second backend (another model's registry) that lacks the tier must
+    // not launch the first backend's handle: it keeps the generic dual.
+    let without = Gpu::new();
+    without.lookup_failure.store(1, Ordering::Relaxed);
+    assert_eq!(k128_dual_launch(&without), (7, [4096 / 4, 1, 2]));
+}

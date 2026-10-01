@@ -119,6 +119,7 @@ impl Qwen3AttentionLayer {
             glm_sparse_attn_heads_per_cta,
             glm_sparse_attn_fn,
             glm_index_logits_rows_per_cta,
+            glm_index_logits_pools_per_cta,
             glm_index_wmma,
             glm_sparse_graphs,
             glm_index_logits_fn,
@@ -537,7 +538,7 @@ impl Qwen3AttentionLayer {
                 glm_index_logits_fn,
             ),
             glm_index_logits_rows_per_cta,
-            glm_index_logits_pools_per_cta: if glm_index_wmma { 32 } else { 8 },
+            glm_index_logits_pools_per_cta,
             glm_index_logits_decode_k: gate(glm, gpu, "glm_indexer", "glm_index_logits_bf16"),
             glm_index_topk_expand_k: gate(glm, gpu, "glm_indexer", "glm_index_topk_expand"),
             glm_sparse_attn_k: gate(glm, gpu, "glm_indexer", glm_sparse_attn_fn),
@@ -580,6 +581,8 @@ impl Qwen3AttentionLayer {
             ),
             dense_gemm_tc_k: super::super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc"),
             mxfp8_gemv_k: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
+                .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
+            mxfp8_gemv_grouped_k: ["mxfp8_gemv_tc8_grouped", "mxfp8_gemv_tc16_grouped"]
                 .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
             mxfp8_quantize_k: super::super::try_kernel(gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
             paged_decode_splitk_k: match kv_dtype {

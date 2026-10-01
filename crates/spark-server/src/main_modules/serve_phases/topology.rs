@@ -220,6 +220,10 @@ pub(crate) fn init_nccl_comm(
     .context("Failed to initialize NCCL")?;
     tracing::info!("NCCL initialized: rank {}", backend.rank());
     crate::ep_peer_lifeline::watch(&backend).context("Failed to arm the EP peer lifeline")?;
+    // Before any other collective: a rank splitting the GLM index selection
+    // alone would deadlock the pair at a prompt-dependent prefill.
+    spark_model::layers::qwen3_attention::agree_index_split(&backend, gpu)
+        .context("GLM index split settings")?;
     Ok(Some(
         std::sync::Arc::new(backend) as std::sync::Arc<dyn spark_comm::CommBackend>
     ))
