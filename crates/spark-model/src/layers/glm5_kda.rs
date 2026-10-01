@@ -2,6 +2,7 @@
 
 //! GLM-5 KDA recurrent block for the conservative GB10 bring-up path.
 mod forward_attention;
+mod forward_attention_entry;
 mod forward_attention_qkv;
 mod forward_ffn;
 mod forward_recurrent;
