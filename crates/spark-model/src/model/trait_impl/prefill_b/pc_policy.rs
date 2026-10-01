@@ -188,7 +188,8 @@ pub(in crate::model) fn tail_split_disabled() -> bool {
 /// The tail-split cut for a `total`-token prompt: one block below the last
 /// block boundary strictly under `total` (`prefill_chunk_dispatch_with`).
 pub(in crate::model) fn tail_cut(total: usize, bs: usize) -> usize {
-    ((total.saturating_sub(1) / bs) * bs).saturating_sub(bs)
+    // Or, with ATLAS_GLM_TAIL_CUT_DEEP, that boundary itself.
+    crate::model::warm_turn::tail_cut_at(total, bs, crate::model::warm_turn::tail_cut_deep())
 }
 
 /// Where to save a branch checkpoint, if anywhere: at the radix match

@@ -106,6 +106,7 @@ impl TransformerModel {
         } else {
             self.buffers.zero_all(self.gpu.as_ref(), stream)?;
         }
+        self.buffers.note_rows(usize::MAX); // rows unknown to `zero_dirty`
 
         let mut kv_cache = self.kv_cache.lock();
 
