@@ -476,9 +476,11 @@ pub fn build_model(
         &config,
         &kv_config,
         glm_cache_shape,
-        // Slotted index tails need every resume to be lag-bounded.
+        // Slotted index tails need every resume to be lag-bounded. A prefix
+        // match covers whole cached blocks, which hold only finalized pools
+        // (`model::prefix_share`), provided SSM restores are block-aligned too.
         use_speculative
-            && (!prefix_cache.is_active() || glm::prefix_resumes_whole_blocks())
+            && (!prefix_cache.is_active() || crate::model::mtp_carry::marconi_prefill_only())
             && hss_cache_blocks_per_seq.is_none(),
         max_batch_tokens,
         kv_block_size,

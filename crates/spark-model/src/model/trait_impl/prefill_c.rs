@@ -21,6 +21,7 @@ use super::super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
+use super::super::prefix_share::adopt_prefix_match;
 use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::types::{PinnedMetaStaging, TransformerModel};
@@ -162,21 +163,12 @@ impl TransformerModel {
             spark_runtime::prefix_cache::PrefixMatch::empty()
         } else {
             self.prefix_cache
-                .lookup(tokens, bs, seq.session_hash, seq.adapter_id)
+                .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
         };
         let matched = prefix_match.matched_tokens;
-        seq.cached_prefix_tokens = matched;
-        seq.cached_prefix_blocks = prefix_match.matched_blocks.len();
         // Record the original prompt length for cache_sequence bookkeeping.
         seq.prompt_len = tokens.len();
-        for &block_idx in &prefix_match.matched_blocks {
-            kv_cache.inc_ref(block_idx);
-            seq.block_table.push(block_idx);
-        }
-        reuse_prefix_match_disk_ids(
-            &prefix_match.matched_disk_block_ids,
-            &mut seq.disk_block_ids,
-        );
+        adopt_prefix_match(seq, &prefix_match, &mut kv_cache)?;
 
         // Marconi: restore SSM snapshot if available (session-gated).
         // Phase 1b spill-tier fault-in (#6): fold a resident hit with a

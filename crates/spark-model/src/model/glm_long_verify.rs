@@ -31,7 +31,7 @@ use spark_runtime::gpu::DevicePtr;
 
 mod diag;
 mod ep;
-use diag::{oracle_enabled, serial_diagnostic};
+use diag::{oracle_enabled, serial_diagnostic, write_window_aliases};
 pub(super) const EP_CMD_GLM_LONG_VERIFY: u32 = 0xFFFF_FFE9;
 pub(super) const EP_CMD_GLM_LONG_TAIL: u32 = 0xFFFF_FFEA;
 
@@ -270,19 +270,17 @@ impl TransformerModel {
             }
         }
         if std::env::var("ATLAS_GLM_LONG_BATCH_ALIAS_CHECK").as_deref() == Ok("1") {
-            let mut owner_of = std::collections::HashMap::new();
-            for (o, seq) in seqs.iter().enumerate() {
-                let used = (seq.seq_len + rows).div_ceil(bs);
-                for (idx, &block) in seq.block_table.iter().take(used).enumerate() {
-                    if let Some((prev, prev_idx)) = owner_of.insert(block, (o, idx)) {
-                        tracing::error!(
-                            "GLM long owner KV alias: physical block {block} is owner {prev} slot {} \
-                             block {prev_idx} and owner {o} slot {} block {idx}",
-                            seqs[prev].slot_idx,
-                            seq.slot_idx
-                        );
-                    }
-                }
+            let owners: Vec<_> = seqs
+                .iter()
+                .map(|s| (s.seq_len, &s.block_table[..]))
+                .collect();
+            for (block, (w, w_idx), (o, idx)) in write_window_aliases(&owners, rows, bs) {
+                tracing::error!(
+                    "GLM long owner KV alias: physical block {block} is written by owner {w} \
+                     slot {} block {w_idx} and held by owner {o} slot {} block {idx}",
+                    seqs[w].slot_idx,
+                    seqs[o].slot_idx
+                );
             }
         }
         let scratch = self.buffers.scratch();
