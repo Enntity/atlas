@@ -49,6 +49,9 @@ pub struct DsparkDiagnostics {
     pub precompute_dump: bool,
     /// `ATLAS_DFLASH_OPTION_B_DIAG=1`.
     pub option_b_diag: bool,
+    /// `ATLAS_DFLASH_FIRST_APPEND=legacy|none|own|zero`. Strict, unlike the
+    /// probes above: the factory resolves it with `FirstAppend::for_head`.
+    pub first_append: super::FirstAppend,
 }
 
 impl Default for DsparkDiagnostics {
@@ -73,6 +76,7 @@ impl Default for DsparkDiagnostics {
             batch_parity: false,
             precompute_dump: false,
             option_b_diag: false,
+            first_append: super::FirstAppend::Legacy,
         }
     }
 }
@@ -112,6 +116,7 @@ impl DsparkDiagnostics {
             batch_parity: one("ATLAS_DFLASH_BATCH_PARITY"),
             precompute_dump: one("ATLAS_DFLASH_PRECOMPUTE_DUMP"),
             option_b_diag: one("ATLAS_DFLASH_OPTION_B_DIAG"),
+            first_append: super::FirstAppend::Legacy,
         }
     }
 }

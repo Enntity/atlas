@@ -92,6 +92,11 @@ pub(crate) fn load_model(
     tui_handles_tx: Option<std::sync::mpsc::Sender<crate::tui::RunHandles>>,
     carried: Carried,
 ) -> Result<Option<Prepared>> {
+    // A mistyped drafter switch fails every rank here, before any weight load
+    // (the head that freezes the value is built last, on the head rank only).
+    if args.dflash {
+        spark_model::layers::dflash_head::FirstAppend::from_env()?;
+    }
     // 0. Resolve model directory from HF ID or path
     spark_runtime::progress::phase(1, "model resolve");
     let model_dir = serve_phases::resolve_model_dir(&args)?;
