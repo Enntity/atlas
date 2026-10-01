@@ -4,7 +4,8 @@
 //! all chunks run back-to-back (TTFT minimisation). When active is
 //! nonempty, exactly one chunk runs per scheduler iteration to bound
 //! TPOT — except when mixed_forward fuses a prefill chunk + decode in a
-//! single pass.
+//! single pass, and with `ATLAS_GLM_WARM_CHUNK_RUN` after a chunk that
+//! computed nothing (`cached_run`).
 //!
 //! Returns `did_mixed_step` so the caller can skip the standalone decode
 //! call (mixed forward already processed decode logits).
@@ -21,6 +22,8 @@
 //!  - `prefill_waves`       — pure wave planner for `run_batched_prefill`
 //!                            (VARLEN budget capping + geometry grouping).
 
+#[path = "phase_continue_prefills/cached_run.rs"]
+mod cached_run;
 #[path = "phase_continue_prefills/prefill_waves.rs"]
 mod prefill_waves;
 #[path = "phase_continue_prefills/run_batched_mixed.rs"]
@@ -45,6 +48,7 @@ use run_batched_mixed::run_batched_mixed_step;
 use run_batched_prefill::run_batched_prefill_step;
 use run_standard::run_standard_chunk_loop;
 
+pub(super) use cached_run::follows_first_chunk;
 pub(super) use run_fused::SpecStep;
 
 /// Shared per-chunk InnerQ poll used by every prefill path (standard /
@@ -349,31 +353,37 @@ pub(super) fn continue_in_progress_prefills(
 
         // Standard chunked prefill (also used as fallback if two-phase fails)
         if p.chunk_offset < p.prompt_tokens.len() {
-            run_standard_chunk_loop(
-                model,
-                p,
-                idx,
-                active,
-                max_prefill_tokens,
-                slice_budget,
-                prefill_stream,
-                prefill_event,
-                use_mtp,
-                use_self_speculative,
-                use_ngram_speculative,
-                think_end_token,
-                think_start_token,
-                code_fence_token,
-                tool_call_start_token,
-                tool_call_end_token,
-                adaptive_sampling,
-                sched,
-                &mut completed_indices,
-                &mut did_mixed_step,
-                max_batch_tokens,
-                spec,
-                rode,
-            );
+            cached_run::run(|| {
+                run_standard_chunk_loop(
+                    model,
+                    p,
+                    idx,
+                    active,
+                    max_prefill_tokens,
+                    slice_budget,
+                    prefill_stream,
+                    prefill_event,
+                    use_mtp,
+                    use_self_speculative,
+                    use_ngram_speculative,
+                    think_end_token,
+                    think_start_token,
+                    code_fence_token,
+                    tool_call_start_token,
+                    tool_call_end_token,
+                    adaptive_sampling,
+                    sched,
+                    &mut completed_indices,
+                    &mut did_mixed_step,
+                    max_batch_tokens,
+                    spec,
+                    rode,
+                );
+                // A chunk that failed, finished the prompt or carried a
+                // decode step ends the tick like one that computed.
+                let plain = completed_indices.is_empty() && !did_mixed_step && rode.is_empty();
+                plain && cached_run::chunk_was_cached(p)
+            });
         }
     }
 

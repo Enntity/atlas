@@ -42,6 +42,7 @@ mod save_checkpoint;
 mod stage_batched;
 mod upload_meta;
 mod upload_paged;
+mod warm;
 
 impl TransformerModel {
     pub(super) fn prefill_chunk_dispatch(
@@ -194,25 +195,16 @@ impl TransformerModel {
             stream
         };
 
-        // EP=2: zero ALL buffers on every chunk (NCCL defense-in-depth).
-        // EP=1, first chunk (chunk_start==0): zero only buffers whose stale
-        // contents can affect prefill; the remaining scratch buffers are
-        // overwritten before read by embedding + layer forward.
-        // EP=1, subsequent chunks: skip zeroing — buffers are overwritten by embedding
-        // + layer forward before read. Saves 7 memsets × (chunks-1) per prefill.
-        if self.comm.is_some() {
-            self.buffers.zero_all(self.gpu.as_ref(), stream)?;
-        } else if chunk_start == 0 {
-            self.buffers
-                .zero_prefill_essentials(self.gpu.as_ref(), stream)?;
-        }
-        let t_zero = tp.elapsed();
+        // Zero the arena and embed the chunk (phases 1+1b, `warm`): here, or
+        // with ATLAS_GLM_WARM_SKIP_CACHED after the prefix lookup and only
+        // for a chunk that computes.
+        let lookup_first = self.warm_lookup_first();
+        let span = (chunk_start, chunk_len);
+        let mut t_pre =
+            self.prefill_b_zero_and_embed(!lookup_first, tokens, span.0, span.1, stream)?;
+        let t_embed = tp.elapsed();
 
         let mut kv_cache = self.kv_cache.lock();
-
-        // ── Phase 1+1b: embed chunk + vision pad overlay ──
-        self.prefill_b_embed_chunk(tokens, chunk_start, chunk_len, stream)?;
-        let t_embed = tp.elapsed();
 
         // ── Phase 2: prefix-cache lookup + EP sync + Marconi snapshot restore ──
         let (kv_write_start, marconi_skip) = self.prefill_b_prefix_lookup(
@@ -224,13 +216,18 @@ impl TransformerModel {
             stream,
             None,
         )?;
-        let t_prefix = tp.elapsed();
+        self.warm_trace_sync(stream)?;
+        let t_lookup = tp.elapsed() - t_embed;
         // ATLAS_GLM_PC_BRANCH: split at the planned branch checkpoint.
-        let span = (chunk_start, chunk_len);
         if let Some(at) = pc_policy::branch_split_at(seq.pc_branch_at, span, passengers.is_some()) {
             drop(kv_cache);
             return self.pc_branch_split(tokens, seq, span, at, is_last_chunk, stream);
         }
+        let cached = lookup_first && seq.prefill_chunk_cached(span.0 + span.1, is_last_chunk);
+        if lookup_first {
+            t_pre = self.prefill_b_zero_and_embed(!cached, tokens, span.0, span.1, stream)?;
+        }
+        let t_prefix = tp.elapsed();
 
         if std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok() {
             self.ssm_pool.debug_state_checksum(
@@ -264,7 +261,10 @@ impl TransformerModel {
                 proc_start,
                 proc_count,
                 effective_seq_len_start,
-            } => (proc_start, proc_count, effective_seq_len_start),
+            } => {
+                anyhow::ensure!(!cached, "a chunk left unzeroed as cached must not compute");
+                (proc_start, proc_count, effective_seq_len_start)
+            }
             proc_range::ProcRange::EarlyReturn(ptr) => {
                 // #155 ROOT CAUSE (warm-turn phantom snapshots): fully-cached
                 // chunks skipped compute but ALSO skipped the Phase-5 token
@@ -281,9 +281,12 @@ impl TransformerModel {
                     .extend_from_slice(&tokens[chunk_start..chunk_start + chunk_len]);
                 seq.seq_len = chunk_start + chunk_len;
                 seq.last_decode_ckpt_block = seq.tokens.len() / bs;
+                let marks = [t_lookup, t_prefix, t_blocks, t_blocks, t_blocks];
+                self.warm_trace_chunk(seq, total, tp, (span.0, 0), t_pre, marks, None, stream)?;
                 return Ok(ptr);
             }
         };
+        self.buffers.note_rows(proc_count + passenger_rows);
         let t_proc = tp.elapsed();
         let _det = crate::det_trace::enter(self.config.ep_rank, seq.slot_idx, proc_start);
 
@@ -394,6 +397,8 @@ impl TransformerModel {
             stream,
         )?;
         let t_fwd = tp.elapsed();
+        self.warm_trace_sync(stream)?;
+        let marks = [t_lookup, t_prefix, t_blocks, t_meta, tp.elapsed()];
         // Measure the forward's true GPU execution: the launches are async, so
         // `t_fwd` is submission time only. A profile-only sync here isolates
         // real GPU duration from the memset/H2D drain attributed to `embed`.
@@ -414,9 +419,9 @@ impl TransformerModel {
                 chunk_start,
                 chunk_start + chunk_len,
                 chunk_len,
-                t_zero,
-                t_embed.saturating_sub(t_zero),
-                t_prefix.saturating_sub(t_embed),
+                t_pre[0],
+                t_pre[1],
+                t_lookup,
                 t_blocks.saturating_sub(t_prefix),
                 t_proc.saturating_sub(t_blocks),
                 t_meta.saturating_sub(t_proc),
@@ -459,7 +464,7 @@ impl TransformerModel {
             stream,
         )?;
 
-        if is_last_chunk {
+        let out = if is_last_chunk {
             // ── Phase 6+7+8: final norm, lm_head, prefix-cache + snapshot save ──
             self.prefill_b_finalize_last(
                 tokens,
@@ -469,7 +474,7 @@ impl TransformerModel {
                 chunk_len,
                 proc_count,
                 stream,
-            )
+            )?
         } else {
             // ── Phase 9: intermediate Marconi checkpoint ──
             self.prefill_b_save_checkpoint(
@@ -480,7 +485,10 @@ impl TransformerModel {
                 chunk_len,
                 stream,
             )?;
-            Ok(DevicePtr::NULL)
-        }
+            DevicePtr::NULL
+        };
+        let (chunk, logits) = ((span.0, proc_count), is_last_chunk.then_some(out));
+        self.warm_trace_chunk(seq, total, tp, chunk, t_pre, marks, logits, stream)?;
+        Ok(out)
     }
 }

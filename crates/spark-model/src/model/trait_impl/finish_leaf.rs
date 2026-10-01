@@ -162,6 +162,7 @@ use super::super::types::TransformerModel;
 use super::prefill_b::pc_policy::tail_cut;
 use crate::traits::SequenceState;
 
+mod cache;
 mod flag;
 mod rolling;
 pub(in crate::model) use flag::{enabled, span_blocks};
@@ -385,7 +386,7 @@ impl TransformerModel {
     /// `cache_sequence` with the flag on, on either rank: cache the whole
     /// blocks of `seq.tokens`, which brings the rolling leaf into reach of
     /// the next turn, and leave the leaf to the index.
-    pub(super) fn finish_leaf_cache(&self, seq: &SequenceState, bs: usize) {
+    fn finish_leaf_cache(&self, seq: &SequenceState, bs: usize) {
         let acquired = self.prefix_cache.insert(
             &seq.tokens,
             &seq.block_table,

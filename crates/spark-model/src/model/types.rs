@@ -400,6 +400,8 @@ pub struct TransformerModel {
     pub(super) comm: Option<std::sync::Arc<dyn spark_comm::CommBackend>>,
     /// Small GPU buffer for EP token broadcast (4 bytes).
     pub(super) ep_cmd_buf: DevicePtr,
+    /// Warm-turn switches and their state (`model::warm_turn`).
+    pub(super) warm: super::warm_turn::WarmTurn,
     /// EP wire-protocol version. When true, the seq_id-preamble protocol
     /// extension from atlas#99 is active — every command broadcast is
     /// preceded by a `seq_id` broadcast so the worker can dispatch

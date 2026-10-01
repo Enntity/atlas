@@ -74,6 +74,7 @@ impl TransformerModel {
         // token counts. The EP=2 CUDA 700 was from the 4MB recv buffer overflow
         // (fixed in 1ae4883); zero_all kept everywhere as defense-in-depth.
         self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+        self.buffers.note_rows(usize::MAX); // rows unknown to `zero_dirty`
 
         let mut kv_cache = self.kv_cache.lock();
 
