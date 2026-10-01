@@ -17,6 +17,7 @@ fn actual_independent_width_entry() {
             .env("ATLAS_NVFP4_FUSED_SILU_QUANT", "0")
             .env("ATLAS_GLM_MOE_GATE_UP_M16", "0")
             .env("ATLAS_GLM_MOE_GATE_UP_M16_VERIFY", "0")
+            .env("ATLAS_GLM_MOE_DECODE_M16", "0")
             .env("ATLAS_GLM_C2_COMPACT_MOE", "0")
             .env("ATLAS_GLM_C4_GROUPED_MOE", "0")
             .env("ATLAS_GLM_C3_GROUPED_MOE", "0")
