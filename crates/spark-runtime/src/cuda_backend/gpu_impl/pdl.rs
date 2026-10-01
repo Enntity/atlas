@@ -24,8 +24,8 @@ pub fn configure_pdl(target_model: &str) {
 }
 
 /// `ATLAS_PDL=1` on a PDL-ready target: launch the kernels below with
-/// programmatic dependent launch.
-pub(super) fn pdl_enabled() -> bool {
+/// programmatic dependent launch. Read once, after [`configure_pdl`].
+pub fn pdl_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("ATLAS_PDL").as_deref() == Ok("1")
@@ -34,12 +34,27 @@ pub(super) fn pdl_enabled() -> bool {
 }
 
 /// Kernels whose every copy starts with `atlas_pdl_enter()`
-/// (kernels/gb10/common/atlas_pdl.cuh). A kernel launched with PDL must not
-/// read its predecessor's output before that wait, so only these qualify.
+/// (kernels/gb10/common/atlas_pdl.cuh), or with `atlas_pdl_enter_touch(..)`,
+/// which before its wait reads only two of the kernel's immutable weight
+/// parameters (kernels/gb10/glm-5.3-flash/nvfp4/atlas_pdl_touch.cuh). A kernel
+/// launched with PDL must not read its predecessor's output before that wait,
+/// so only these qualify.
 pub(super) const PDL_KERNELS: &[&str] = &[
     "w4a16_gemv_tc8",
     "w4a16_gemv_tc8_ld",
+    "w4a16_gemv_tc8_touch",
+    "w4a16_gemv_tc16_touch",
+    "w4a16_gemv_tc32_touch",
+    "w4a16_gemv_batch2_touch",
+    "w4a16_gemv_batch3_touch",
+    "w4a16_gemv_batch5_qkv_touch",
+    "w4a16_gemv_tc8_pair_touch",
+    "w4a16_gemv_tc16_pair_touch",
+    "w4a16_gemv_tc32_pair_touch",
     "mxfp8_gemv_tc8",
+    "mxfp8_gemv_tc8_touch",
+    "mxfp8_gemv_tc16_touch",
+    "mxfp8_gemv_tc32_touch",
     "mxfp8_gemv_tc8_grouped",
     "mxfp8_gemv_tc16_grouped",
     "dense_gemv_bf16_batchm",
