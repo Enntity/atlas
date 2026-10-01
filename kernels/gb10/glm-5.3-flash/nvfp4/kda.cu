@@ -366,6 +366,9 @@ extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_snap
 
 // Records variant: `inter*` are each owner's record rows (`inter_stride`
 // floats apart, KDA_RECORD_FLOATS per head) and the states are only read.
+// Verify-then-commit records are vLLM's RecoverSSM (vllm-project/vllm#51855,
+// from ReplaySSM #48018; Apache-2.0) as RiNGSiDE runs it for GLM-5.3; see
+// docs/glm-prior-art.md.
 extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_rec_owners(
     KDA_VERIFY_OWNERS_ARGS
 ) {

@@ -7,6 +7,9 @@
 // then receiving the peer's quarters as the pair exchange would. Reports the
 // bitwise logits / token-id comparison (both ranks) and ms per rank. Random
 // BF16 pooled keys in a shuffled 16-token block table, random queries/weights.
+// The row split follows RiNGSiDE's GLM53_INDEXER_ROW_SPLIT (othexmr,
+// github.com/othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE; idea
+// only); the zigzag Q0+Q3/Q1+Q2 split and the row-subset proof are ours.
 //
 //   nvcc -arch=sm_121a -O3 -I kernels/gb10/glm-5.3-flash/nvfp4 \
 //        scripts/dev/glm_index_split_bench.cu -o split_bench

@@ -43,6 +43,19 @@
 //! serve: the proxy failed (it then clears `stage`, so a stream blocked in
 //! step 1 reaches a kernel), or a launch failed after a fenced `stage` was
 //! published. Every kernel checks the word at launch and while it waits.
+//!
+//! Prior art (ideas only, no code; docs/glm-prior-art.md): the protocol
+//! follows b12x RoCEnante (<https://github.com/local-inference-lab/b12x>,
+//! `b12x/comm/roce/`, `docs/rocenante.md`; RoCEnante by Jason Cook,
+//! local-inference-lab/b12x#295; Apache-2.0): pinned parity slots, a host
+//! proxy that WRITEs each stripe then a seq flag on the same QP, a
+//! device-resident sequence for graph replay, and poison on timeout, for the
+//! hazard in <https://github.com/local-inference-lab/b12x/issues/313> (which
+//! reached us through jayleaton/glm53-tensorfold-spark `docs/SFXNZ-AUDIT.md`).
+//! The kernel's block structure (block 0 polls the host flags and republishes
+//! seq in device memory; the last block out stores seq) follows mmastrac's
+//! arx one-shot all-reduce (<https://github.com/mmastrac/glm-5.3-flash-4x-gx10>,
+//! `experimental/arx/arx_vllm.cu`, PR #4; unlicensed, so idea only).
 
 use super::{SPLIT_MIN, cu, cuMemcpyAsync};
 use crate::nccl_backend::{cuLaunchKernel, cuMemAlloc_v2, cuMemFree_v2};

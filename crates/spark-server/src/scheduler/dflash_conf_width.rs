@@ -32,20 +32,35 @@
 //!
 //! `ATLAS_DFLASH_CONF_LOG=1` logs each verify's confidences beside its
 //! outcome (with or without the width rule) for offline fitting.
+//!
+//! Prior art: the design follows knapcio's draft-shape truncation
+//! `GLM_DRAFT_TRUNC` (knapcio, <https://github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4>,
+//! `overlay/glm_draft_trunc.py` @ 982e258): the selector's log max softmax
+//! per draft, a table of acceptance per draft position and confidence bin,
+//! expected tokens as the sum of running survival products, and one uniform
+//! width maximizing expected tokens less a per-row price. Ideas, no code.
+//! Ours: the online decayed calibration pooled over depths, the fixed `TAU`
+//! price, and the periodic full-width probe. `EDGES` and `PRIOR` come from
+//! that repository's measured table (MIT): see their doc comments and
+//! docs/glm-prior-art.md.
 
 use std::sync::{Mutex, OnceLock};
 
 use super::dflash_width::MAX_DRAFTS;
 
 /// Confidence bin edges (log-probability of the pick); bin `b` holds
-/// confidences in `[EDGES[b - 1], EDGES[b])`.
+/// confidences in `[EDGES[b - 1], EDGES[b])`. These are the upper ten edges
+/// (`edges[7..]`) of knapcio's `overlay/glm_bav_table_seg.json`
+/// (<https://github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4> @ d80f4fd;
+/// Copyright (c) 2026 knapcio, MIT; notice in docs/glm-prior-art.md).
 const EDGES: [f32; 10] = [
     -1.5, -1.0, -0.7, -0.5, -0.35, -0.22, -0.12, -0.06, -0.03, -0.01,
 ];
 const BINS: usize = EDGES.len() + 1;
 /// Acceptance per bin before any verify: a drafter's top-1 probability
-/// overstates acceptance (the published calibration of this drafter reads
-/// 0.96 only above p = 0.99), so the prior is that curve, rounded. Serving
+/// overstates acceptance (knapcio's calibration of this drafter, the same
+/// table as `EDGES`, reads 0.96 only above p = 0.99), so the prior is a
+/// rounded reading of that table's first-position row (`g[0][7..]`). Serving
 /// replaces it within a few hundred verifies.
 const PRIOR: [f32; BINS] = [
     0.12, 0.16, 0.25, 0.35, 0.42, 0.48, 0.55, 0.62, 0.68, 0.76, 0.95,

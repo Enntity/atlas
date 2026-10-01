@@ -17,6 +17,13 @@
 //
 // GLM-local (not in common/atlas_pdl.cuh) so the include closure of every
 // other gb10 target stays unchanged.
+//
+// Prior art (docs/glm-prior-art.md): TensorFold's L2 weight touch
+// (github.com/jayleaton/glm53-tensorfold-spark patches 0040, and 0440 where
+// each CTA prefetches its weights before griddepcontrol.wait; Apache-2.0) and
+// knapcio's GLM_L2_PREFETCH; compare mmastrac's arx L2 prefetch during
+// all-reduce waits. Ours are discarded byte loads from the kernel's own CTAs,
+// not a side kernel or cp.async.bulk.prefetch. No code copied.
 #include "../../common/atlas_pdl.cuh"
 
 struct AtlasTouch {

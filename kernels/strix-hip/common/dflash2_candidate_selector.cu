@@ -48,6 +48,9 @@
 // as an f32, the confidence of row r's pick: the log of its softmax
 // probability over the row's scored candidates (0 for the anchor row; NaN
 // when every candidate was banned). The picks themselves are unchanged.
+// The signal is knapcio's GLM_DRAFT_TRUNC confidence (log max softmax of the
+// selector scores; github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4
+// overlay/glm_draft_trunc.py; idea only, see docs/glm-prior-art.md).
 
 #define DF2_SEL_MAX_TOP_K 16
 #define DF2_SEL_MAX_RANK 256
