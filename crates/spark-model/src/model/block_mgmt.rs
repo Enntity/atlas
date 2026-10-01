@@ -70,7 +70,7 @@ pub(crate) fn apply_evicted_blocks(
         let failed = kv_cache.nvme_write(&evicted.spill, gpu, gpu.default_stream());
         super::kv_nvme::drop_failed_spills(&failed, kv_cache, prefix_cache);
     }
-    let free_before = kv_cache.num_free_blocks();
+    let free_before = kv_cache.num_free_in_all();
     let n_evicted = evicted.physical.len();
     for block in &evicted.physical {
         kv_cache.return_evicted_block(*block);
@@ -82,7 +82,7 @@ pub(crate) fn apply_evicted_blocks(
     // eviction can release" them, which was true only while the cache's ref
     // could land on a block no node referenced; that mismatch is fixed, so the
     // shortfall now just measures how much of the LRU tail is still in use.)
-    let gained = kv_cache.num_free_blocks().saturating_sub(free_before);
+    let gained = kv_cache.num_free_in_all().saturating_sub(free_before);
     if gained < n_evicted {
         tracing::debug!(
             "prefix-cache evict reclaimed {gained}/{n_evicted} blocks (free={}): \
@@ -139,12 +139,16 @@ impl TransformerModel {
 /// Keep evicting until a block comes free or the cache has nothing left to give;
 /// every iteration removes at least one node from a finite tree, so it terminates.
 /// `None` means genuinely out of capacity — the caller reports exhaustion.
+///
+/// `logical` is the block's index in its sequence's table: a latent-sharded
+/// cache (`ATLAS_GLM_KV_SHARD=1`) draws an id whose residue matches it.
 pub(crate) fn alloc_block_evicting(
     kv_cache: &mut PagedKvCache,
     prefix_cache: &dyn spark_runtime::prefix_cache::PrefixCache,
     gpu: &dyn GpuBackend,
+    logical: usize,
 ) -> Option<u32> {
-    if let Some(b) = kv_cache.try_alloc_block() {
+    if let Some(b) = kv_cache.try_alloc_block_at(logical) {
         return Some(b);
     }
     let mut evicted_nodes = 0usize;
@@ -161,7 +165,7 @@ pub(crate) fn alloc_block_evicting(
         }
         evicted_nodes += evicted.len();
         apply_evicted_blocks(evicted, kv_cache, prefix_cache, gpu);
-        if let Some(b) = kv_cache.try_alloc_block() {
+        if let Some(b) = kv_cache.try_alloc_block_at(logical) {
             if evicted_nodes > 1 {
                 tracing::debug!(
                     "alloc: freed a block after evicting {evicted_nodes} prefix-cache node(s)"
@@ -392,7 +396,7 @@ pub(crate) fn ensure_blocks_through_decode(
         // "alloc failed in ensure_blocks_through_decode: abs=590 ...
         //  free_blocks=0". The prefill helper already had this; the
         // decode helper diverged.
-        let blk = match alloc_block_evicting(kv_cache, prefix_cache, gpu) {
+        let blk = match alloc_block_evicting(kv_cache, prefix_cache, gpu, ws + bt_len) {
             Some(b) => b,
             None => {
                 return Err(anyhow::anyhow!(

@@ -24,6 +24,8 @@ mod projection;
 mod output;
 #[path = "paged_glm_owner.rs"]
 mod owner;
+#[path = "paged_glm_shard.rs"]
+pub(in crate::layers::qwen3_attention) mod shard;
 pub(crate) use owner::write_floor_legacy;
 pub(in crate::layers::qwen3_attention) use owner::{GlmChunkOwner, glm_chunk_pieces};
 
@@ -228,6 +230,7 @@ impl Qwen3AttentionLayer {
             q_latent,
             num_tokens,
             nq as usize,
+            self.glm_shard_lane(kv_cache, ctx).is_some(),
             ctx,
             stream,
         )?;
@@ -246,56 +249,58 @@ impl Qwen3AttentionLayer {
             let o_normed = normed.offset(o.row0 * h as usize * bf16);
             let o_latent = q_latent.offset(o.row0 * q_lora as usize * bf16);
             let rows_of = |base: DevicePtr, row_bytes: usize| base.offset(o.row0 * row_bytes);
-            self.glm_index_prefill_cache_update(
-                o_normed,
-                on,
-                o.write_skip(wf),
-                kv_cache,
-                &octx,
-                stream,
-                batched.map(|b| (rows_of(b.keys, b.key_row), rows_of(b.gates, b.key_row))),
-            )?;
-            let sparse_indices = if use_dense {
-                None
-            } else {
-                Some(self.glm_index_prefill_select(
-                    o_latent,
+            let select = |octx: &ForwardContext| {
+                self.glm_index_prefill_cache_update(
                     o_normed,
                     on,
-                    o.seq_len_start,
+                    o.write_skip(wf),
                     kv_cache,
-                    &octx,
+                    octx,
                     stream,
-                    batched.map(|b| b.index_rows(o.row0)).transpose()?,
-                )?)
+                    batched.map(|b| (rows_of(b.keys, b.key_row), rows_of(b.gates, b.key_row))),
+                )?;
+                if use_dense {
+                    return Ok(None);
+                }
+                let projected = batched.map(|b| b.index_rows(o.row0)).transpose()?;
+                let start = o.seq_len_start;
+                self.glm_index_prefill_select(
+                    o_latent, o_normed, on, start, kv_cache, octx, stream, projected,
+                )
+                .map(Some)
             };
+            // Queries projected ahead of the selection (owner-batched) can be
+            // swapped with the peer of a sharded cache while it runs.
+            let ready = batched.map(|b| rows_of(b.q_absorbed, latent_row));
+            let (sparse_indices, queries_swapped) =
+                self.glm_shard_swap_queries_during(kv_cache, &octx, o.rows, ready, stream, select)?;
             // The BF16 dense and native kernels read an fp8_g128 owner through
             // a dequantized view; long owners and verify rows read FP8 directly,
             // as do, under the pipelined kernel, sparse pieces native declines.
             let sparse_view = ops::glm_sparse_owner_needs_view(&ctx.config.model_type, on, || {
                 Ok(false) // no out-of-tree native kernel in this tree
             })?;
+            // Sharded latents (`ATLAS_GLM_KV_SHARD=1`): few rows merge each rank's
+            // attention over its own tokens; larger owners read an assembled view.
+            let latents = self.glm_owner_latents(kv_cache, &octx, o, sequence_end, stream)?;
+            let merge_form = latents.is_none();
+            let [k_source, v_source, table_source] = latents.unwrap_or([DevicePtr::NULL; 3]);
             let view = self.glm_owner_bf16_view(
-                kv_cache,
-                o.meta.block_table,
+                k_source,
+                table_source,
                 sequence_end,
-                use_dense || sparse_view,
+                !merge_form && (use_dense || sparse_view),
                 bs,
                 ctx,
                 stream,
             )?;
             ensure!(
-                !use_dense || self.kv_dtype == KvCacheDtype::Bf16 || view.is_some(),
+                merge_form || !use_dense || self.kv_dtype == KvCacheDtype::Bf16 || view.is_some(),
                 "GLM dense prefill has no BF16 view of the fp8_g128 cache"
             );
             let (k_cache, v_cache, block_table, cache_dtype) = match view {
                 Some(v) => (v.latents, v.latents, v.identity_table, KvCacheDtype::Bf16),
-                None => (
-                    kv_cache.k_pool_ptr(self.attn_layer_idx),
-                    kv_cache.v_pool_ptr(self.attn_layer_idx),
-                    o.meta.block_table,
-                    self.kv_dtype,
-                ),
+                None => (k_source, v_source, table_source, self.kv_dtype),
             };
             let q_absorbed = match batched {
                 Some(b) => rows_of(b.q_absorbed, latent_row),
@@ -318,7 +323,17 @@ impl Qwen3AttentionLayer {
                 }
             };
             det.tap("x_q_abs", q_absorbed, (o.row0, o.rows), latent_row);
-            if let Some((indices, index_width)) = sparse_indices {
+            if merge_form {
+                self.glm_shard_merge_owner(
+                    kv_cache,
+                    &octx,
+                    o,
+                    (q_absorbed, queries_swapped),
+                    sparse_indices,
+                    attn_latent,
+                    stream,
+                )?;
+            } else if let Some((indices, index_width)) = sparse_indices {
                 det.tap("sel", indices, (o.row0, o.rows), index_width as usize * 4);
                 let mut profile = super::glm_index::profile_start(&octx, stream)?;
                 let sparse_args = ops::GlmSparsePrefillTc {
