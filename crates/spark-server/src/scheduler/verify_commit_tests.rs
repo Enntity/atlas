@@ -50,6 +50,7 @@ fn tail(a: &mut ActiveSeq, drafts: &[u32], argmax: &[u32]) -> Option<usize> {
         a,
         &sched,
         drafts,
+        &[],
         drafts.len(),
         &ctx,
         true,

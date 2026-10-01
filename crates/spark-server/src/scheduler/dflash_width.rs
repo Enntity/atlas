@@ -13,6 +13,8 @@
 //! uniform), so the batch trades their curves against each other.
 //!
 //! `ATLAS_DFLASH_FIXED_WIDTH=w` pins the width instead (cost sweeps).
+//! `ATLAS_DFLASH_CONF_WIDTH=1` sizes it from the drafter's confidence in
+//! this step's drafts where that is measured (`dflash_conf_width`).
 
 use std::sync::OnceLock;
 
@@ -20,17 +22,20 @@ use std::sync::OnceLock;
 pub(crate) const MAX_DRAFTS: usize = 7;
 /// Estimator tuning: per-step decay (0.98 ≈ the last fifty verifies; code sits near the
 /// single-owner break-even, so a noisy estimate there narrows wrongly), the
-/// prior conditional acceptance and its weight in pseudo-steps, and an
+/// prior conditional acceptance and its weight in pseudo-steps, an
 /// optimism bonus `ucb / sqrt(1 + verified)` that re-probes positions a
 /// narrow width stopped observing (acceptance is bursty: a code block
-/// accepts deep drafts that a prose-trained estimate would never try).
-/// `ATLAS_DFLASH_WIDTH_PARAMS=decay,prior_h,prior_w,ucb` overrides them.
-#[derive(Clone, Copy, Debug)]
+/// accepts deep drafts that a prose-trained estimate would never try), and
+/// the floor on the conditional acceptance of positions past a full accept.
+/// `ATLAS_DFLASH_WIDTH_PARAMS=decay,prior_h,prior_w,ucb[,burst_h]` overrides
+/// them (`burst_h` 0 turns the floor off).
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Params {
     decay: f32,
     prior_h: f32,
     prior_w: f32,
     ucb: f32,
+    burst_h: f32,
 }
 
 const DEFAULT_PARAMS: Params = Params {
@@ -38,25 +43,35 @@ const DEFAULT_PARAMS: Params = Params {
     prior_h: 0.85,
     prior_w: 3.0,
     ucb: 0.2,
+    burst_h: 0.9,
 };
+
+fn parse_params(spec: Option<&str>) -> Params {
+    let v: Vec<f32> = spec
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    match v[..] {
+        [decay, prior_h, prior_w, ucb] => Params {
+            decay,
+            prior_h,
+            prior_w,
+            ucb,
+            ..DEFAULT_PARAMS
+        },
+        [decay, prior_h, prior_w, ucb, burst_h] => Params {
+            decay,
+            prior_h,
+            prior_w,
+            ucb,
+            burst_h,
+        },
+        _ => DEFAULT_PARAMS,
+    }
+}
 
 fn params() -> Params {
     static P: OnceLock<Params> = OnceLock::new();
-    *P.get_or_init(|| {
-        let v: Vec<f32> = std::env::var("ATLAS_DFLASH_WIDTH_PARAMS")
-            .ok()
-            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
-            .unwrap_or_default();
-        match v[..] {
-            [decay, prior_h, prior_w, ucb] => Params {
-                decay,
-                prior_h,
-                prior_w,
-                ucb,
-            },
-            _ => DEFAULT_PARAMS,
-        }
-    })
+    *P.get_or_init(|| parse_params(std::env::var("ATLAS_DFLASH_WIDTH_PARAMS").ok().as_deref()))
 }
 
 /// Decayed conditional acceptance per draft position.
@@ -68,9 +83,6 @@ pub(crate) struct DraftSurvival {
     /// cap: a burst in progress, so the positions it never tried are hot.
     burst: Option<usize>,
 }
-
-/// Floor on the conditional acceptance of positions past a full accept.
-const BURST_H: f32 = 0.9;
 
 impl DraftSurvival {
     /// One verify of `drafted` drafts that accepted the first `accepted`.
@@ -102,7 +114,7 @@ impl DraftSurvival {
         for j in 0..width.min(MAX_DRAFTS) {
             let hot = self.burst.is_some_and(|d| j >= d);
             survive *= if hot {
-                self.hazard(j).max(BURST_H)
+                self.hazard(j).max(params().burst_h)
             } else {
                 self.hazard(j)
             };
@@ -157,10 +169,12 @@ fn fixed() -> Option<usize> {
     })
 }
 
-/// Width (drafts per owner, 1..=`max`) for owners with these survival
-/// curves verifying together; `None` leaves the caller's policy in place.
+/// Width (drafts per owner, 1..=`max`) for owners verifying together, each
+/// holding at least `max` drafts: its acceptance history and the drafter's
+/// confidence in its drafts (`ActiveSeq::draft_conf`). `None` leaves the
+/// caller's policy in place.
 pub(crate) fn choose<'a>(
-    owners: impl ExactSizeIterator<Item = &'a DraftSurvival> + Clone,
+    owners: impl ExactSizeIterator<Item = (&'a DraftSurvival, &'a [f32])> + Clone,
     max: usize,
 ) -> Option<usize> {
     let max = max.min(MAX_DRAFTS);
@@ -170,7 +184,10 @@ pub(crate) fn choose<'a>(
     if let Some(w) = fixed() {
         return Some(w.min(max));
     }
-    enabled().then(|| best(owners, max))
+    if let Some(w) = super::dflash_conf_width::choose(owners.clone().map(|(_, conf)| conf), max) {
+        return Some(w);
+    }
+    enabled().then(|| best(owners.map(|(survival, _)| survival), max))
 }
 
 /// The width maximizing the owners' expected tokens per step millisecond.

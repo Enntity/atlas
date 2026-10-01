@@ -9,7 +9,9 @@ mod think_end;
 pub use glm_owner::{step_verify_glm_long_batched, step_verify_glm_long_with};
 pub(super) use think_end::accept_with_forced_think_end;
 
-/// Width-generic γ-token verify with accept-prefix.
+/// Width-generic γ-token verify with accept-prefix. `draft_conf` is the
+/// drafter's confidence in `drafts` (`ActiveSeq::take_drafts`; empty when
+/// not measured).
 ///
 /// Routes `[last_token, drafts...]` through Atlas's width-generic target
 /// verifier and finds the first index where draft ≠ verified argmax. Tokens
@@ -20,11 +22,13 @@ pub(super) use think_end::accept_with_forced_think_end;
 ///   * Per-position logprobs extraction.
 ///   * Sliding-window state rollback for sliding-attention layers
 ///     (Gemma-4-style; not used by Qwen3.6 targets).
+#[allow(clippy::too_many_arguments)]
 pub fn step_verify_dflash(
     model: &dyn Model,
     a: &mut ActiveSeq,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     drafts: &[u32],
+    draft_conf: &[f32],
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
@@ -34,6 +38,7 @@ pub fn step_verify_dflash(
         a,
         sched,
         drafts,
+        draft_conf,
         num_drafts,
         verify_ctx,
         dflash_verify_raw_argmax,
@@ -46,6 +51,7 @@ fn step_verify_dflash_inner(
     a: &mut ActiveSeq,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     drafts: &[u32],
+    draft_conf: &[f32],
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
@@ -113,6 +119,7 @@ fn step_verify_dflash_inner(
         a,
         sched,
         drafts,
+        draft_conf,
         num_drafts,
         verify_ctx,
         dflash_verify_raw_argmax,
@@ -133,6 +140,7 @@ pub(super) fn verify_dflash_tail(
     a: &mut ActiveSeq,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     drafts: &[u32],
+    draft_conf: &[f32],
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
@@ -252,6 +260,7 @@ pub(super) fn verify_dflash_tail(
     // accept window; may suspend this seq's speculation (see adaptive_spec).
     crate::scheduler::adaptive_spec::record_verify(a, num_accepted, sched);
     a.spec_adapt.survival.record(drafts.len(), num_accepted);
+    crate::scheduler::dflash_conf_width::record(draft_conf, drafts.len(), num_accepted);
 
     // Roll back the over-extended `seq_len` and `seq.tokens`. The verify
     // advanced both by `tokens.len() = γ+1` (all γ drafts + the prefix
@@ -432,7 +441,7 @@ pub(super) fn verify_dflash_tail(
                 )
             };
         match proposal {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
+            Ok(d) if !d.is_empty() => a.set_proposed_drafts(d),
             Ok(_) => {
                 // Lightning product fail-closed boundary: an empty
                 // re-propose is an admission violation, not a silent

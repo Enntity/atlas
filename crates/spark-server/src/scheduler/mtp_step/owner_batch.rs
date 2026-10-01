@@ -40,7 +40,9 @@ pub(super) fn verify_owner_batch(
         (owners.len() >= 2)
             .then(|| {
                 super::dflash_width::choose(
-                    owners.iter().map(|&i| &active[i].spec_adapt.survival),
+                    owners
+                        .iter()
+                        .map(|&i| (&active[i].spec_adapt.survival, active[i].draft_conf())),
                     max,
                 )
             })

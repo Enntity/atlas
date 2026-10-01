@@ -23,6 +23,7 @@ mod decode_logits_content;
 mod decode_logits_seq;
 mod decode_logits_step;
 mod decode_step;
+mod dflash_conf_width;
 mod dflash_width;
 #[cfg(test)]
 mod dspark_fail_closed_tests;

@@ -28,6 +28,7 @@ use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 pub mod conv;
+mod draft_conf;
 mod paged_attn_modules;
 pub mod product_policy;
 pub mod selector;
@@ -324,6 +325,10 @@ pub struct DflashProposerState {
     /// this to know how many KV positions to roll back when the accept
     /// prefix is shorter than γ.
     pub last_num_drafted: usize,
+    /// The selector's confidence in each draft of the last `propose()` (the
+    /// log of the pick's probability among its scored candidates), in draft
+    /// order. Empty when not measured (`draft_conf`).
+    pub last_draft_conf: Vec<f32>,
     /// Whether the prompt-time `precompute_and_store_context_kv` has been
     /// called. The first `propose()` after model build needs to run prefill
     /// over the full prompt's captured hiddens; subsequent steps incrementally
@@ -924,6 +929,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             block_table: Vec::with_capacity(64),
             seq_len: 0,
             last_num_drafted: 0,
+            last_draft_conf: Vec::new(),
             prefill_done: false,
             ctx_hidden_acc,
             ctx_len: 0,
