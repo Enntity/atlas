@@ -21,6 +21,14 @@ pub fn dflash_prefill_verify() -> bool {
     std::env::var("ATLAS_GLM_DFLASH_PREFILL_VERIFY").as_deref() != Ok("0")
 }
 
+/// `ATLAS_GLM_MTP_DISTRIBUTED=1`: the appended MTP body's experts are loaded
+/// on both ranks instead of rank 0 alone (split-vocabulary MTP). Every rank
+/// must run the same value (`model::startup_parity`): the worker would not
+/// hold the body the head runs across the pair.
+pub fn mtp_distributed() -> bool {
+    std::env::var("ATLAS_GLM_MTP_DISTRIBUTED").ok().as_deref() == Some("1")
+}
+
 /// A retained long-context GLM verify owner is active: repaired MTP or DFlash.
 pub fn long_lane_enabled() -> bool {
     enabled() || dflash_enabled()

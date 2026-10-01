@@ -52,12 +52,23 @@ pub use glm_sparse_graphs_policy::{
 };
 pub(crate) use hc_prefill::{hc_post_pre_prefill_fused, hc_pre_prefill_mix};
 pub(crate) use prefill::{index_split_words, write_floor_legacy};
+pub(crate) use trait_impl::{
+    grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
+};
 pub(crate) use types::HeadGateActivation;
 pub use types::Qwen3AttentionLayer;
 pub use types_weights::{
     CompressorWeights, GlmIndexerWeights, HcHeadWeights, HcLowRank, HcSiteWeights, HcWeights,
     MlaWeights,
 };
+
+/// `ATLAS_GLM_MLA_MULTI_SEQ=1`: GLM MLA layers decode a batch of sequences
+/// together. Both ranks must run the same value (`model::startup_parity`): a
+/// rank without it runs the per-sequence path, or refuses a C4 batch its peer
+/// has already started.
+pub(crate) fn glm_mla_multi_seq_enabled() -> bool {
+    std::env::var("ATLAS_GLM_MLA_MULTI_SEQ").ok().as_deref() == Some("1")
+}
 
 /// Opt-in eager semantic indexing for independent GLM C2/C3 decode rows.
 /// The model and server share this gate so admission and graph policy agree.

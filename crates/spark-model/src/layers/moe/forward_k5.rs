@@ -5,6 +5,21 @@
 
 use super::*;
 
+/// `ATLAS_GLM_K5_GROUPED_MOE=1`: the five verify rows take the grouped
+/// prefill MoE.
+pub(crate) fn k5_grouped_moe_requested() -> bool {
+    std::env::var("ATLAS_GLM_K5_GROUPED_MOE").as_deref() == Ok("1")
+}
+
+/// `ATLAS_GLM_K5_FUSED_MOE_HC=1`: on that grouped pass the shared expert is
+/// blended whole in the mHC post-step, after the EP reduce, instead of split
+/// across the pair before it (`forward_pair_shared`). Both ranks must run the
+/// same two values (`model::startup_parity`), or the reduce sums one rank's
+/// half beside the other's whole.
+pub(crate) fn k5_fused_moe_hc_requested() -> bool {
+    std::env::var("ATLAS_GLM_K5_FUSED_MOE_HC").as_deref() == Ok("1")
+}
+
 impl MoeLayer {
     /// Materialize the established shared-expert blend after
     /// [`Self::forward_k5_for_hc`] deferred it. Used only by the one-shot exactness
@@ -50,9 +65,9 @@ impl MoeLayer {
     ) -> Result<(DevicePtr, Option<DevicePtr>)> {
         self.btile_input_guard(input, 5, ctx, stream)?;
         let defer = allow_deferred_shared_hc
-            && std::env::var("ATLAS_GLM_K5_FUSED_MOE_HC").as_deref() == Ok("1")
+            && k5_fused_moe_hc_requested()
             && self.use_btile_or_t_prefill()
-            && std::env::var("ATLAS_GLM_K5_GROUPED_MOE").as_deref() == Ok("1")
+            && k5_grouped_moe_requested()
             && ctx.config.model_type == "glm5_next"
             && ctx.config.ep_world_size == 2
             && ctx.comm.is_some()
@@ -82,9 +97,7 @@ impl MoeLayer {
         // to E4M3 on chip for FP8 MMA; unlike NVFP4 MMQ, it does not quantize and
         // stage the verifier activations in FP4. This preserves acceptance while
         // amortizing routed weights across the verifier batch.
-        if self.use_btile_or_t_prefill()
-            && std::env::var("ATLAS_GLM_K5_GROUPED_MOE").as_deref() == Ok("1")
-        {
+        if self.use_btile_or_t_prefill() && k5_grouped_moe_requested() {
             self.forward_prefill(input, 5, ctx, stream)?;
             return Ok(ctx.buffers.moe_output());
         }

@@ -246,7 +246,7 @@ impl TransformerModel {
         // DEFAULT-ON since 2026-07-27; disable with
         // ATLAS_NO_DECODE_GRAPHS_MULTISEQ=1. Measurements + the rewrite this
         // retired: `decode_graph_key.rs`.
-        let ms_profile = std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1");
+        let ms_profile = crate::model::graph_flags::ms_profile();
         // ATLAS_MS_PROFILE forces eager (graphs off) so per-phase syncs are legal.
         // ATLAS_LORA_EAGER: same LoRA graph-vs-eager debugging hatch as decode_a.
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;

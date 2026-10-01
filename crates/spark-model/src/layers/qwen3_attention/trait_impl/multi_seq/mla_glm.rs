@@ -18,12 +18,10 @@ use super::mla_gemv::MlaDims;
 use crate::layer::AttnMetadataDev;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::types::MlaWeights;
-use crate::layers::qwen3_attention::{Qwen3AttentionLayer, glm_multi_seq_sparse_enabled};
+use crate::layers::qwen3_attention::{
+    Qwen3AttentionLayer, glm_mla_multi_seq_enabled as enabled, glm_multi_seq_sparse_enabled,
+};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
-
-fn enabled() -> bool {
-    std::env::var("ATLAS_GLM_MLA_MULTI_SEQ").ok().as_deref() == Some("1")
-}
 
 fn batch4_kernel(
     rows: usize,

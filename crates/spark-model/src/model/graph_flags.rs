@@ -57,3 +57,30 @@ pub(crate) fn glm_mtp1_verify_graph() -> bool {
 pub(crate) fn debug_no_graph() -> bool {
     std::env::var("ATLAS_DEBUG_NO_GRAPH").as_deref() == Ok("1")
 }
+
+// Diagnostics that run a step eager which would otherwise be captured.
+
+/// `ATLAS_SSM_SAVE_DUMP` (presence): a request's first decode step.
+pub(crate) fn ssm_save_dump() -> bool {
+    std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok()
+}
+
+/// `ATLAS_LIGHTNING_VERIFY_LAYER_TRACE=1`: single-sequence decode and verify.
+pub(crate) fn verify_layer_trace() -> bool {
+    std::env::var("ATLAS_LIGHTNING_VERIFY_LAYER_TRACE").as_deref() == Ok("1")
+}
+
+/// `ATLAS_MS_PROFILE=1`: multi-sequence decode.
+pub(crate) fn ms_profile() -> bool {
+    std::env::var("ATLAS_MS_PROFILE").ok().as_deref() == Some("1")
+}
+
+/// `ATLAS_DFLASH_DEBUG_NO_GRAPH=1`: the K=γ verify.
+pub(crate) fn dflash_debug_no_graph() -> bool {
+    std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1")
+}
+
+/// `ATLAS_K2_DIAG=1`: the repaired GLM C1 K=2 verify.
+pub(crate) fn k2_diag() -> bool {
+    std::env::var("ATLAS_K2_DIAG").as_deref() == Ok("1")
+}
