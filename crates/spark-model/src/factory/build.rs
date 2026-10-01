@@ -846,7 +846,7 @@ pub fn build_model(
                 };
                 // Strict for every head: an unknown value fails the build.
                 startup.diagnostics.first_append = FirstAppend::for_head()?;
-                let head = crate::layers::BlockDiffusionDraftHead::from_weights(
+                let mut head = crate::layers::BlockDiffusionDraftHead::from_weights(
                     weights,
                     target_embed_for_dflash,
                     target_lm_head_for_dflash,
@@ -860,20 +860,43 @@ pub fn build_model(
                     max_batch_size,
                     startup,
                 )?;
-                match lightning_dspark_policy {
-                    Some(policy) => {
-                        model.set_lightning_dspark_proposer(std::sync::Arc::new(head), policy)?
-                    }
-                    None => model.set_dflash_proposer(std::sync::Arc::new(head)),
+                // ATLAS_GLM_DRAFT_TP: on the TP2 pair both ranks hold the
+                // drafter and swap halves of a propose; the worker's copy
+                // serves its half and proposes nothing.
+                let (rank, pair) = {
+                    let c = model.config_ref();
+                    (c.ep_rank, c.tp_world_size == 2 && c.ep_world_size == 2)
+                };
+                let split = crate::layers::dflash_head::rank_split::requested()?
+                    .filter(|_| pair && !lightning_dspark_admitted);
+                if let Some(parts) = split {
+                    head.enable_rank_split(parts, model.gpu_backend())?;
                 }
-                tracing::info!(
-                    "{} drafter installed as the active proposer",
-                    if lightning_dspark_admitted {
-                        "Lightning DSpark"
-                    } else {
-                        "DFlash"
+                if rank != 0 {
+                    anyhow::ensure!(
+                        split.is_some(),
+                        "rank {rank} loaded a drafter it cannot use: ATLAS_GLM_DRAFT_TP \
+                         needs the generic DFlash drafter on the TP2 pair"
+                    );
+                    model.set_draft_assist(std::sync::Arc::new(head));
+                    tracing::info!(
+                        "DFlash drafter installed on rank {rank} to serve split proposes"
+                    );
+                } else {
+                    match lightning_dspark_policy {
+                        Some(policy) => model
+                            .set_lightning_dspark_proposer(std::sync::Arc::new(head), policy)?,
+                        None => model.set_dflash_proposer(std::sync::Arc::new(head)),
                     }
-                );
+                    tracing::info!(
+                        "{} drafter installed as the active proposer",
+                        if lightning_dspark_admitted {
+                            "Lightning DSpark"
+                        } else {
+                            "DFlash"
+                        }
+                    );
+                }
             }
             None if lightning_dspark_admitted => {
                 anyhow::bail!(

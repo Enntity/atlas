@@ -235,6 +235,16 @@ impl TransformerModel {
                 }
             }
         }
+        // ATLAS_GLM_DRAFT_TP: a propose that swaps halves with the worker
+        // carries the communicator, and is announced right before it runs.
+        let split_comm = self.draft_split_comm(proposer, grammar_bitmask.is_some());
+        if split_comm.is_some() {
+            self.announce_draft_split()?;
+        }
+        let ctx = ForwardContext {
+            comm: split_comm,
+            ..ctx
+        };
         let drafts = proposer.propose(
             token,
             self.mtp_hidden_save,

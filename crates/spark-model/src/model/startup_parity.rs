@@ -56,6 +56,7 @@ use super::trait_impl::finish_leaf;
 use super::trait_impl::prefill_b::pc_policy as pc;
 use super::{glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry, verify_pieces};
 use crate::layer::glm_long_owner;
+use crate::layers::dflash_head::rank_split;
 use crate::layers::qwen3_attention::{
     glm_mla_multi_seq_enabled, glm_multi_seq_sparse_enabled, glm_multi_seq_sparse_graphs_enabled,
     grouped_routed_decode_enabled, grouped_routed_decode_min, index_split_words,
@@ -258,6 +259,10 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // The MTP body a rank loads.
     ("ATLAS_GLM_MTP_DISTRIBUTED", || {
         Ok(glm_repair_policy::mtp_distributed() as u64)
+    }),
+    // The drafter a worker loads and the swaps of a rank-split propose.
+    ("ATLAS_GLM_DRAFT_TP", || {
+        Ok(rank_split::Parts::word(rank_split::requested()?))
     }),
     // Whether a step runs as a CUDA graph: a capturing forward takes other
     // collective paths than an eager one (`graph_flags`).

@@ -874,6 +874,7 @@ impl BlockDiffusionDraftHead {
             quant: DflashQuantization::Bf16,
             twins: Default::default(),
             startup,
+            rank_split: None,
         };
 
         tracing::info!(
