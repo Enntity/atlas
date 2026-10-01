@@ -53,12 +53,16 @@ pub(super) fn glm_grouped_shape(config: &atlas_core::config::ModelConfig) -> boo
 }
 
 /// Row tiles of the K128W kernels over `rows` sorted rows: the device prefix
-/// of the local experts' M64 tiles and the schedule covering them.
+/// of the local experts' M64 tiles, the schedule covering them, and the
+/// fused gate/up and down kernels to launch over it (the K128W pair, or
+/// their M16 decode twins, whose `prefix` is the compact worklist scratch).
 #[derive(Clone, Copy)]
 pub(super) struct MtileGrid {
     pub prefix: DevicePtr,
     pub schedule: ops::K128wSchedule,
     pub rows: u32,
+    pub gate_up_silu: ops::K128wKernel,
+    pub down: ops::K128wKernel,
 }
 
 /// Sorted rows below which the persistent K128W schedule stays off: at 2K-4K
@@ -258,7 +262,7 @@ impl MoeLayer {
             }
         }
         if let Some(grid) = wide
-            && self.moe_w4a4_prequant_gate_up_silu.grid.0 != 0
+            && grid.gate_up_silu.grid.0 != 0
             && self.nvfp4_fused_silu_quant
             && self.silu_mul_quant_nvfp4_k.0 != 0
             && self.lora.is_none()
@@ -267,7 +271,7 @@ impl MoeLayer {
         {
             ops::moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w(
                 ctx.gpu,
-                self.moe_w4a4_prequant_gate_up_silu,
+                grid.gate_up_silu,
                 a_packed,
                 a_scale,
                 [gate.packed_ptrs, gate.scale_ptrs, gate.scale2_vals],
@@ -377,6 +381,8 @@ impl MoeLayer {
             prefix,
             schedule,
             rows: total_expanded,
+            gate_up_silu: self.moe_w4a4_prequant_gate_up_silu,
+            down: self.moe_w4a4_prequant_t_k128w,
         }))
     }
 
@@ -406,7 +412,7 @@ impl MoeLayer {
         {
             return ops::moe_w4a4_grouped_gemm_prequant_k128w(
                 ctx.gpu,
-                self.moe_w4a4_prequant_t_k128w,
+                grid.down,
                 a_packed,
                 a_scale,
                 weight.packed_ptrs,

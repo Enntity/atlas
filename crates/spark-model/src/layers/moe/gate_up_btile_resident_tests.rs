@@ -60,6 +60,15 @@ pub(super) fn setup(
     gpu: &Gpu,
     rank: usize,
 ) -> (WeightStore, atlas_core::config::ModelConfig, MoeLayer) {
+    setup_with(gpu, rank, false)
+}
+/// [`setup`], or with `expert_tp` every expert local at the rank's slice of
+/// the routed intermediate width.
+pub(super) fn setup_with(
+    gpu: &Gpu,
+    rank: usize,
+    expert_tp: bool,
+) -> (WeightStore, atlas_core::config::ModelConfig, MoeLayer) {
     let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
     config.model_type = "glm5_next".into();
     config.hidden_size = 4096;
@@ -74,6 +83,8 @@ pub(super) fn setup(
     config.ep_rank = rank;
     config.adapter_max_rank = 0;
     config.scoring_func = "sigmoid".into();
+    config.expert_tp = expert_tp;
+    let inter = config.routed_inter_local();
     let mut map = HashMap::new();
     let mut weights = MoeWeights::empty(288);
     let lp = config.layer_prefix(0);
@@ -87,14 +98,14 @@ pub(super) fn setup(
                 gpu,
                 &mut map,
                 format!("{lp}.mlp.experts.{e}.gate_proj"),
-                2048,
+                inter,
                 4096,
             ),
             up_proj: projection(
                 gpu,
                 &mut map,
                 format!("{lp}.mlp.experts.{e}.up_proj"),
-                2048,
+                inter,
                 4096,
             ),
             down_proj: projection(
@@ -102,7 +113,7 @@ pub(super) fn setup(
                 &mut map,
                 format!("{lp}.mlp.experts.{e}.down_proj"),
                 4096,
-                2048,
+                inter,
             ),
         };
     }

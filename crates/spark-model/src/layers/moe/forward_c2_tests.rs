@@ -17,6 +17,8 @@ use spark_runtime::{
 };
 use std::sync::{Mutex, atomic::Ordering};
 
+#[path = "decode_m16_tests.rs"]
+mod decode_m16;
 #[path = "forward_independent_tests.rs"]
 mod independent;
 
@@ -85,6 +87,7 @@ fn actual_c2_compact_entry_and_literal_off_control() {
                 "ATLAS_HOST_TRANSPOSE",
                 "ATLAS_GLM_MOE_GATE_UP_M16",
                 "ATLAS_GLM_MOE_GATE_UP_M16_VERIFY",
+                "ATLAS_GLM_MOE_DECODE_M16",
                 "ATLAS_MOE_SHARED_REDUCE_OVERLAP",
                 "ATLAS_HOLO_MOE_GROUPED_CUTLASS",
                 "ATLAS_HOLO_MOE_GROUPED_DOWN",

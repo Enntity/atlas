@@ -235,11 +235,7 @@ impl MoeLayer {
                     expert_offsets,
                     sorted_token_ids,
                     num_tokens,
-                    compact_k5
-                        || self.glm_c2_grouped(ctx, n)
-                        || self.glm_c3_grouped(ctx, n)
-                        || self.glm_c4_grouped(ctx, n)
-                        || self.independent_grouped(ctx, n),
+                    self.verify_decode_batch(compact_k5, ctx, n),
                     ctx,
                     stream,
                 )?;
@@ -314,52 +310,20 @@ impl MoeLayer {
                         stream,
                     )?;
                 } else if self.nvfp4_prequant_moe && self.moe_w4a4_prequant_t_k64.0 != 0 {
-                    let compact = if compact_k5
-                        || self.glm_c2_grouped(ctx, n)
-                        || self.glm_c3_grouped(ctx, n)
-                        || self.glm_c4_grouped(ctx, n)
-                        || self.independent_grouped(ctx, n)
-                    {
-                        let total_tiles = ctx.buffers.moe_router_in_f32();
-                        let worklist = total_tiles.offset(16);
-                        let n_tiles = inter.div_ceil(128);
-                        anyhow::ensure!(
-                            ctx.buffers.sizes().moe_router_in_f32
-                                >= super::prequant_fp4::compact_gate_up_worklist_bytes(
-                                    n, top_k, inter
-                                ),
-                            "compact native-FP4 gate/up worklist exceeds router scratch"
-                        );
-                        ops::moe_build_tile_worklist(
-                            ctx.gpu,
-                            self.moe_build_tile_worklist_k,
-                            expert_offsets,
-                            gp.packed_ptrs,
-                            worklist,
-                            total_tiles,
-                            num_experts,
-                            n_tiles,
-                            64,
-                            stream,
-                        )?;
-                        Some(super::prequant_fp4::CompactMoeWorklist {
-                            worklist,
-                            total_tiles,
-                            max_tiles: total_expanded * n_tiles,
-                        })
-                    } else {
-                        None
-                    };
-                    if compact.is_none() {
-                        wide = self.mtile_grid(
-                            expert_offsets,
-                            gp.packed_ptrs,
-                            total_expanded,
-                            num_experts,
-                            ctx,
-                            stream,
-                        )?;
-                    }
+                    // Verify-decode batches take the M16 row tiles when
+                    // selected (ATLAS_GLM_MOE_DECODE_M16), else the compact
+                    // M64 worklist; any other batch the K128W grid.
+                    let compact;
+                    (compact, wide) = self.prequant_tiles(
+                        self.verify_decode_batch(compact_k5, ctx, n),
+                        expert_offsets,
+                        gp.packed_ptrs,
+                        [n, top_k],
+                        [h, inter],
+                        num_experts,
+                        ctx,
+                        stream,
+                    )?;
                     silu_done = self.prequant_fp4_gate_up(
                         expert_input,
                         gp,
