@@ -15,7 +15,9 @@
 //! communicator comes up, and fails on any difference, naming the setting and
 //! both values. The gather is itself a collective: it runs whatever the
 //! settings are, and its size is the length of [`SETTINGS`] plus the
-//! caller's, which no setting changes.
+//! caller's, which no setting changes. Only a build changes it, so a gather
+//! of one word, the table's id, goes first and fails ranks on different
+//! builds before their settings gathers could mispair.
 //!
 //! # What belongs in the table
 //!
@@ -186,10 +188,30 @@ pub fn agree(comm: &dyn CommBackend, gpu: &dyn GpuBackend, caller: &[Setting]) -
     agree_on(&settings(caller)?, comm, gpu)
 }
 
+/// Names a table: FNV-1a over its setting names, in order.
+fn table_id(settings: &[Setting]) -> u64 {
+    settings
+        .iter()
+        .flat_map(|s| s.0.bytes().chain([0]))
+        .fold(0xcbf2_9ce4_8422_2325, |id, b| {
+            (id ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+}
+
 fn agree_on(ours: &[Setting], comm: &dyn CommBackend, gpu: &dyn GpuBackend) -> Result<()> {
+    let me = comm.rank();
+    // The table is part of the build and the second gather is as long as the
+    // table, so first compare the tables, in a gather of one word.
+    let table = table_id(ours);
+    ensure!(
+        gather_words(comm, gpu, &[table])?
+            .iter()
+            .all(|&t| t == table),
+        "rank {me} compares other settings at startup than its peers: \
+         the ranks run different builds"
+    );
     let values: Vec<u64> = ours.iter().map(|s| s.1).collect();
     let all = gather_words(comm, gpu, &values)?;
-    let me = comm.rank();
     let differ: Vec<String> = all
         .chunks(ours.len())
         .enumerate()

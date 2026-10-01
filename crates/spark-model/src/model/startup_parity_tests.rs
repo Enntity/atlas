@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Unit tests for the startup agreement, against a communicator whose
-//! all-gather lands the other ranks' words around this rank's own.
+//! all-gathers land the other ranks' words around this rank's own.
 
 use std::sync::Mutex;
 
@@ -11,26 +11,38 @@ use spark_runtime::gpu::mock::MockGpuBackend;
 
 use super::*;
 
-/// Rank `rank` of a world whose other ranks hold `words` (its own entry is
-/// ignored). Records the per-rank byte count of every gather; `down` fails
-/// it.
+/// Rank `rank` of a world. `rounds[i]` is what every rank holds at the i-th
+/// gather (this rank's own entry is ignored). Records the per-rank byte count
+/// of every gather; `down` fails them.
 struct World<'a> {
     gpu: &'a MockGpuBackend,
     rank: usize,
-    words: Vec<Vec<u64>>,
+    rounds: Vec<Vec<Vec<u64>>>,
     gathers: Mutex<Vec<usize>>,
     down: bool,
 }
 
 impl<'a> World<'a> {
-    fn new(gpu: &'a MockGpuBackend, rank: usize, words: Vec<Vec<u64>>) -> Self {
+    fn new(gpu: &'a MockGpuBackend, rank: usize, rounds: Vec<Vec<Vec<u64>>>) -> Self {
         Self {
             gpu,
             rank,
-            words,
+            rounds,
             gathers: Mutex::default(),
             down: false,
         }
+    }
+
+    /// The agreement's two gathers when every rank runs the table of `ours`
+    /// and the ranks hold `values`.
+    fn agreeing(
+        gpu: &'a MockGpuBackend,
+        rank: usize,
+        ours: &[Setting],
+        values: Vec<Vec<u64>>,
+    ) -> Self {
+        let tables = vec![vec![table_id(ours)]; values.len()];
+        Self::new(gpu, rank, vec![tables, values])
     }
 }
 
@@ -39,14 +51,18 @@ impl CommBackend for World<'_> {
         self.rank
     }
     fn world_size(&self) -> usize {
-        self.words.len()
+        self.rounds[0].len()
     }
     fn all_gather(&self, send: u64, recv: u64, bytes: usize) -> Result<()> {
         anyhow::ensure!(!self.down, "the peer is gone");
-        self.gathers.lock().unwrap().push(bytes);
+        let round = {
+            let mut gathers = self.gathers.lock().unwrap();
+            gathers.push(bytes);
+            &self.rounds[gathers.len() - 1]
+        };
         let mut own = vec![0u8; bytes];
         self.gpu.copy_d2h(DevicePtr(send), &mut own)?;
-        for (rank, words) in self.words.iter().enumerate() {
+        for (rank, words) in round.iter().enumerate() {
             let theirs: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             let chunk = if rank == self.rank { &own } else { &theirs };
             assert_eq!(chunk.len(), bytes, "rank {rank} gathers another size");
@@ -84,7 +100,7 @@ fn values(settings: &[Setting]) -> Vec<u64> {
 /// `agree_on(ours)` as rank `rank` of a pair whose peer holds `peer`.
 fn pair(rank: usize, ours: &[Setting], peer: Vec<u64>) -> Result<()> {
     let gpu = MockGpuBackend::new();
-    let world = World::new(&gpu, rank, vec![peer.clone(), peer]);
+    let world = World::agreeing(&gpu, rank, ours, vec![peer.clone(), peer]);
     let agreed = agree_on(ours, &world, &gpu);
     assert_eq!(gpu.alloc_count(), 0, "the gather buffer is freed");
     agreed
@@ -130,7 +146,8 @@ fn every_difference_is_listed() {
 fn every_rank_of_a_wider_world_is_compared() {
     let gpu = MockGpuBackend::new();
     let ours = [("A", 1), ("B", 2)];
-    let world = World::new(&gpu, 1, vec![vec![1, 2], vec![], vec![1, 2], vec![9, 2]]);
+    let values = vec![vec![1, 2], vec![], vec![1, 2], vec![9, 2]];
+    let world = World::agreeing(&gpu, 1, &ours, values);
     let why = agree_on(&ours, &world, &gpu).unwrap_err().to_string();
     assert!(why.contains("A: rank 1 has 1, rank 3 has 9"), "{why}");
     assert_eq!(why.matches(" has ").count(), 2, "{why}");
@@ -145,15 +162,40 @@ fn the_gather_has_one_size_whatever_the_settings_are() {
     for value in [0, 1, u64::MAX] {
         let ours: Vec<Setting> = names.iter().map(|s| (s.0, value)).collect();
         let gpu = MockGpuBackend::new();
-        let world = World::new(&gpu, 0, vec![vec![value; words]; 2]);
+        let world = World::agreeing(&gpu, 0, &ours, vec![vec![value; words]; 2]);
         agree_on(&ours, &world, &gpu).unwrap();
-        assert_eq!(*world.gathers.lock().unwrap(), [8 * words]);
+        assert_eq!(*world.gathers.lock().unwrap(), [8, 8 * words]);
     }
     // The table itself: this process's own flags through `agree`.
     let gpu = MockGpuBackend::new();
-    let world = World::new(&gpu, 1, vec![values(&names); 2]);
+    let world = World::agreeing(&gpu, 1, &names, vec![values(&names); 2]);
     agree(&world, &gpu, &CALLER).unwrap();
-    assert_eq!(*world.gathers.lock().unwrap(), [8 * words]);
+    assert_eq!(*world.gathers.lock().unwrap(), [8, 8 * words]);
+}
+
+#[test]
+fn a_rank_with_another_table_fails_before_the_settings_are_gathered() {
+    // Another build: a setting more, less, renamed or moved.
+    let ours = [("A", 1), ("B", 2)];
+    for theirs in [
+        &[("A", 1), ("B", 2), ("C", 3)][..],
+        &[("A", 1)],
+        &[("A", 1), ("b", 2)],
+        &[("B", 2), ("A", 1)],
+        &[("AB", 1), ("", 2)],
+    ] {
+        assert_ne!(table_id(&ours), table_id(theirs));
+        for rank in 0..2 {
+            let gpu = MockGpuBackend::new();
+            let tables = vec![vec![table_id(theirs)]; 2];
+            let world = World::new(&gpu, rank, vec![tables]);
+            let why = agree_on(&ours, &world, &gpu).unwrap_err().to_string();
+            assert!(why.contains("different builds"), "{why}");
+            assert_eq!(*world.gathers.lock().unwrap(), [8]);
+        }
+    }
+    // The values are not part of it.
+    assert_eq!(table_id(&ours), table_id(&[("A", 7), ("B", 0)]));
 }
 
 #[test]
@@ -195,7 +237,7 @@ fn a_setting_under_a_switch_that_is_off_reads_zero() {
 #[test]
 fn gather_words_returns_every_rank_in_order_and_frees_on_failure() {
     let gpu = MockGpuBackend::new();
-    let world = World::new(&gpu, 1, vec![vec![3, 4], vec![], vec![7, 8]]);
+    let world = World::new(&gpu, 1, vec![vec![vec![3, 4], vec![], vec![7, 8]]]);
     assert_eq!(
         gather_words(&world, &gpu, &[5, 6]).unwrap(),
         [3, 4, 5, 6, 7, 8]
@@ -204,7 +246,7 @@ fn gather_words_returns_every_rank_in_order_and_frees_on_failure() {
 
     let down = World {
         down: true,
-        ..World::new(&gpu, 0, vec![vec![]; 2])
+        ..World::new(&gpu, 0, vec![vec![vec![]; 2]])
     };
     assert!(gather_words(&down, &gpu, &[1]).is_err());
     assert_eq!(gpu.alloc_count(), 0);
