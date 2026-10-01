@@ -36,6 +36,7 @@ pub(crate) mod glm_k3_head;
 mod glm_long_verify;
 mod glm_prefill_sp;
 mod glm_vocab_split;
+pub(crate) mod graph_flags;
 pub(crate) use glm_vocab_split::prepare_shard_mxfp8 as prepare_glm_head_mxfp8;
 pub(crate) mod dspark_generation;
 #[cfg(test)]
@@ -77,6 +78,7 @@ pub(crate) mod ssm_spill_gate;
 pub(crate) mod ssm_spill_staging;
 pub(crate) mod ssm_tier;
 mod ssm_verify_attach;
+pub mod startup_parity;
 pub(crate) mod token_overlay;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
@@ -88,3 +90,10 @@ pub(crate) mod vision_transport;
 pub mod nllb;
 
 pub use types::TransformerModel;
+
+/// `ATLAS_EP_PROTOCOL=v2`: the head sends a slot id ahead of every worker
+/// command (`impl_a2`). Every rank must run the same value
+/// ([`startup_parity`]): the worker would read the slot id as the command.
+pub fn ep_protocol_v2_requested() -> bool {
+    matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"))
+}

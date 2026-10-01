@@ -66,6 +66,7 @@ pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
 pub use dflash_head::{
     BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,
 };
+pub(crate) use glm5_kda::verify_fused_tp_hc_enabled;
 pub use glm5_kda::{Glm5KdaLayer, Glm5KdaWeights, Glm5Projection};
 pub use moe::MoeLayer;
 pub use moe_grouped_decode::{

@@ -68,7 +68,9 @@ fn verify_fused_dense_triple_enabled() -> bool {
 
 /// Exact K=5-only seam: exchange the remote row-parallel KDA O projection and
 /// combine it inside mHC post-mixing. The launcher retains a fallback switch.
-fn verify_fused_tp_hc_enabled() -> bool {
+/// Both ranks must run the same value (`model::startup_parity`): the exchange
+/// stands in for the TP all-reduce.
+pub(crate) fn verify_fused_tp_hc_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_K5_FUSED_TP_HC").ok().as_deref() == Some("1"))
 }

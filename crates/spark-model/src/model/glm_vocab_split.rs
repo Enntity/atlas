@@ -23,7 +23,9 @@ use crate::weight_map::DenseWeight;
 const PAIRS_OFFSET: usize = 16384;
 const PAIRS_BYTES: usize = 1024;
 
-fn enabled() -> bool {
+/// `ATLAS_GLM_VERIFY_VOCAB_SPLIT=1`. Read once. Both ranks must run the same
+/// value (`startup_parity`): each scores half the vocabulary and swaps pairs.
+pub(super) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_VERIFY_VOCAB_SPLIT").as_deref() == Ok("1"))
 }

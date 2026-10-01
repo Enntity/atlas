@@ -154,6 +154,7 @@ mod forward_k3;
 mod forward_k4;
 mod forward_k5;
 mod forward_pair_shared;
+pub(crate) use forward_pair_shared::{shared_reduce_overlap_requested, shared_tp_split_requested};
 mod forward_pair_verify;
 mod forward_phase;
 mod forward_prefill;

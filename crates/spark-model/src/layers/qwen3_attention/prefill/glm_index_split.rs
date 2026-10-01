@@ -17,7 +17,7 @@
 //! the last whole quarter. The projections and the index-cache update stay
 //! replicated. Every eligibility input is mirrored on both ranks, since one
 //! rank splitting alone would deadlock the pair; the settings themselves
-//! are compared across the ranks at startup (`agree_index_split`).
+//! are compared across the ranks at startup (`model::startup_parity`).
 //!
 //! `ATLAS_GLM_INDEX_SPLIT_CHECK=1` also selects every row into scratch and
 //! fails the request on both ranks on any difference (`check`).
@@ -25,8 +25,7 @@
 use std::ops::Range;
 
 use anyhow::{Result, ensure};
-use spark_comm::CommBackend;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::DevicePtr;
 
 use crate::layer::ForwardContext;
 use crate::layers::glm_sp;
@@ -86,35 +85,12 @@ fn settings() -> Result<Option<Settings>> {
         .map_err(anyhow::Error::msg)
 }
 
-/// Call on every rank right after a multi-rank communicator comes up. Fails
-/// on a junk `ATLAS_GLM_INDEX_SPLIT_MIN_CTX`, and on any rank whose split
-/// settings differ from rank 0's: a rank splitting alone would deadlock
-/// the pair at the first owner whose history falls between the two.
-pub fn agree_index_split(comm: &dyn CommBackend, gpu: &dyn GpuBackend) -> Result<()> {
-    agree(settings()?, comm, gpu)
-}
-
-fn agree(ours: Option<Settings>, comm: &dyn CommBackend, gpu: &dyn GpuBackend) -> Result<()> {
-    let ours = Settings::words(ours);
-    let bytes: Vec<u8> = ours.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let mut head = vec![0u8; bytes.len()];
-    let buf = gpu.alloc(bytes.len())?;
-    let sent = gpu
-        .copy_h2d(&bytes, buf)
-        .and_then(|()| comm.broadcast(buf.0, bytes.len(), 0))
-        .and_then(|()| gpu.copy_d2h(buf, &mut head));
-    gpu.free(buf)?;
-    sent?;
-    let head: Vec<u64> = head
-        .chunks(8)
-        .map(|w| u64::from_le_bytes(w.try_into().expect("8-byte words")))
-        .collect();
-    ensure!(
-        head == ours,
-        "ATLAS_GLM_INDEX_SPLIT settings [on, min_ctx, check] differ across the pair: rank {} has {ours:?}, rank 0 has {head:?}",
-        comm.rank()
-    );
-    Ok(())
+/// What the ranks agree on at startup (`model::startup_parity`): this
+/// process's `[on, min_ctx, check]`. Fails on a junk
+/// `ATLAS_GLM_INDEX_SPLIT_MIN_CTX`. A rank splitting alone would deadlock the
+/// pair at the first owner whose history falls between the two.
+pub(crate) fn index_split_words() -> Result<[u64; 3]> {
+    settings().map(Settings::words)
 }
 
 /// Whether an owner of `rows` rows continuing at `seq_len_start` splits.
