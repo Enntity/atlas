@@ -15,6 +15,12 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Whether `ATLAS_RDMA_PAIR_CHAIN=1`; checked equal on both ranks at
+/// bootstrap.
+pub(super) fn chain_requested() -> bool {
+    std::env::var("ATLAS_RDMA_PAIR_CHAIN").as_deref() == Ok("1")
+}
+
 /// Run the proxy until `stop`. If it fails, no one-shot send would ever
 /// drain, so it stops that channel ([`Channel::fail`]) rather than leave
 /// streams waiting on it.
@@ -50,7 +56,7 @@ fn serve(
     // SAFETY: the flag page lives in the pinned region for the pair's lifetime;
     // `ready` is written by the GPU (stream memop) and read only here.
     let ready = unsafe { &*((host + flag_off(capacity) + READY) as *const AtomicU64) };
-    let chain = std::env::var("ATLAS_RDMA_PAIR_CHAIN").as_deref() == Ok("1");
+    let chain = chain_requested();
     let mut idle = Idle::from_env(oneshot.is_some());
     let mut stats = Stats::from_env();
     // The head legacy job, its next segment, and when that segment became due.
