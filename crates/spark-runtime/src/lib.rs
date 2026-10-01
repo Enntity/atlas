@@ -28,6 +28,7 @@ pub mod flashinfer;
 pub mod gpu;
 #[path = "gpu_args.rs"]
 mod gpu_args;
+mod gpu_pitched;
 pub mod kernel_args;
 pub mod kernel_audit;
 pub mod kv_cache;

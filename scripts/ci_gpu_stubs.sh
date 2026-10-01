@@ -30,6 +30,7 @@ int cuCtxDestroy_v2(void *a) { (void)a; return 100; }
 int cuCtxGetCurrent(void **a) { (void)a; return 100; }
 int cuCtxSetCurrent(void *a) { (void)a; return 100; }
 int cuCtxGetDevice(int *a) { (void)a; return 100; }
+int cuCtxSynchronize(void) { return 100; }
 int cuDeviceGetAttribute(int *a, unsigned int b, int c) { (void)a; (void)b; (void)c; return 100; }
 /* Errors */
 int cuGetErrorName(int code, const char **out) { (void)code; (void)out; return 100; }
