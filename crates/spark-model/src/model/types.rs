@@ -231,6 +231,10 @@ pub struct TransformerModel {
     pub(super) suppress_graphs: std::sync::atomic::AtomicBool,
     /// MTP draft proposer (built from mtp_weights at init).
     pub(super) proposer: Option<Arc<dyn DraftProposer>>,
+    /// `ATLAS_GLM_DRAFT_TP`: the worker rank's copy of the DFlash drafter,
+    /// which serves its half of a split propose (`draft_assist`). `None` on
+    /// the head and when the split is off.
+    pub(super) draft_assist: Option<Arc<crate::layers::BlockDiffusionDraftHead>>,
     /// Immutable typed identity for the admitted official Lightning product.
     /// `None` for generic DFlash, MTP, and non-speculative models.
     pub(super) lightning_dspark_identity: LightningDsparkIdentityLatch,

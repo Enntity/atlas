@@ -729,6 +729,10 @@ pub struct BlockDiffusionDraftHead {
     /// process environment. Product heads derive it from the validated
     /// Lightning policy; generic heads keep legacy lenient semantics.
     pub startup: DsparkStartupExecution,
+
+    /// `ATLAS_GLM_DRAFT_TP`: the worker rank reads half of the MLP and head
+    /// rows of a single-sequence propose (`rank_split`). `None` = off.
+    pub rank_split: Option<rank_split::RankSplit>,
 }
 
 mod contract;
@@ -787,6 +791,8 @@ mod nvfp4;
 mod parity_report;
 mod precompute_ctx_kv;
 mod propose;
+pub mod rank_split;
+mod rank_split_forward;
 mod small_m_gemm;
 
 mod context_window;
@@ -965,7 +971,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
         grammar_bitmask: Option<&[i32]>,
         target_hidden_stack: Option<spark_runtime::gpu::DevicePtr>,
     ) -> Result<Vec<u32>> {
-        self.propose_drafts(
+        // ATLAS_GLM_DRAFT_TP: the model announced this propose to the worker,
+        // which walks every swap. However the propose ends, issue them all.
+        let split = self.rank_split_with(ctx.comm, grammar_bitmask.is_some());
+        if let Some((split, _)) = split {
+            split.begin();
+        }
+        let drafts = self.propose_drafts(
             last_token,
             target_hidden,
             position,
@@ -977,7 +989,15 @@ impl DraftProposer for BlockDiffusionDraftHead {
             draft_embed_target,
             grammar_bitmask,
             target_hidden_stack,
-        )
+        );
+        match split.map(|(split, comm)| split.finish(comm, stream)) {
+            Some(Err(drain)) if drafts.is_ok() => Err(drain),
+            _ => drafts,
+        }
+    }
+
+    fn rank_split_ready(&self, comm: &dyn spark_comm::CommBackend, grammar: bool) -> bool {
+        self.rank_split_with(Some(comm), grammar).is_some()
     }
 
     fn propose_batch(
