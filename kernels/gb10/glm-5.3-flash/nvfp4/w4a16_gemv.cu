@@ -21,7 +21,7 @@
 // 4 outputs per block, 64 threads (2 warps) per output. Cross-warp smem reduction.
 // Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
 
-#include "../../common/atlas_pdl.cuh"
+#include "atlas_pdl_touch.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -851,6 +851,75 @@ extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch5_qk
     unsigned int N,
     unsigned int K
 ) {
+    const unsigned int plane = blockIdx.z;
+    const unsigned char* B_packed = plane == 0u ? Bq_packed : (plane == 1u ? Bk_packed : Bv_packed);
+    const unsigned char* B_scale = plane == 0u ? Bq_scale : (plane == 1u ? Bk_scale : Bv_scale);
+    const float scale2 = plane == 0u ? q_scale2 : (plane == 1u ? k_scale2 : v_scale2);
+    __nv_bfloat16* out = C + (unsigned long long)plane * M * N;
+    w4a16_gemv_batchm_impl<5>(A, B_packed, B_scale, scale2, out, M, N, K, N);
+}
+
+// PDL twins of `w4a16_gemv_batch2/3` and `w4a16_gemv_batch5_qkv` with the
+// pre-wait weight touch of atlas_pdl_touch.cuh (ATLAS_GLM_DECODE_GEMV_BATCH): the
+// first `touch_ctas` CTAs (of plane 0) pull the first `touch_rows` rows of the
+// (first) weight into L2 while the kernel waits on its predecessor. Each body
+// is the template instance of the kernel it replaces (the batch2 twin keeps
+// batch2's 40-register MAX_M=2 build), so rows are bit-identical to it. `M` is
+// in the batch2/3 twins' ABI only to share one launcher; it must be 2 / 3.
+extern "C" __global__ void w4a16_gemv_batch2_touch(
+    const __nv_bfloat16* __restrict__ A,          // [2, K]
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,                // [2, N]
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int touch_rows,
+    unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch({B_packed, K / 2u, K / 2u}, {B_scale, K / GROUP_SIZE, K / GROUP_SIZE},
+                          touch_rows, blockIdx.x, touch_ctas);
+    w4a16_gemv_batchm_impl<2>(A, B_packed, B_scale, scale2, C, 2u, N, K, N);
+}
+
+extern "C" __global__ void w4a16_gemv_batch3_touch(
+    const __nv_bfloat16* __restrict__ A,          // [3, K]
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,                // [3, N]
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int touch_rows,
+    unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch({B_packed, K / 2u, K / 2u}, {B_scale, K / GROUP_SIZE, K / GROUP_SIZE},
+                          touch_rows, blockIdx.x, touch_ctas);
+    w4a16_gemv_batchm_impl<3>(A, B_packed, B_scale, scale2, C, 3u, N, K, N);
+}
+
+extern "C" __global__ __launch_bounds__(BLOCK_SIZE, 5) void w4a16_gemv_batch5_qkv_touch(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ Bq_packed,
+    const unsigned char* __restrict__ Bq_scale,
+    const float q_scale2,
+    const unsigned char* __restrict__ Bk_packed,
+    const unsigned char* __restrict__ Bk_scale,
+    const float k_scale2,
+    const unsigned char* __restrict__ Bv_packed,
+    const unsigned char* __restrict__ Bv_scale,
+    const float v_scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int touch_rows,
+    unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch({Bq_packed, K / 2u, K / 2u}, {Bq_scale, K / GROUP_SIZE, K / GROUP_SIZE},
+                          touch_rows, blockIdx.x, blockIdx.z == 0u ? touch_ctas : 0u);
     const unsigned int plane = blockIdx.z;
     const unsigned char* B_packed = plane == 0u ? Bq_packed : (plane == 1u ? Bk_packed : Bv_packed);
     const unsigned char* B_scale = plane == 0u ? Bq_scale : (plane == 1u ? Bk_scale : Bv_scale);
@@ -1952,6 +2021,21 @@ w4a16_gemv_tc8_ld(
     w4a16_gemv_tc8_impl(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
 }
 
+// `w4a16_gemv_tc8_ld` whose first `touch_ctas` CTAs pull the first
+// `touch_rows` weight rows (packed bytes and scales) into L2 while the kernel
+// waits on its PDL predecessor (atlas_pdl_touch.cuh). Same body: bit-identical.
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc8_touch(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ld_half, unsigned int ld_groups, unsigned int touch_rows, unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch({B_packed, K / 2u, ld_half}, {B_scale, K / GROUP_SIZE, ld_groups},
+                          touch_rows, blockIdx.x, touch_ctas);
+    w4a16_gemv_tc8_impl(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
+}
+
 // ── Wider tensor-core tiers (9..32 rows): owner-batched verify blocks ──
 // Same mapping as w4a16_gemv_tc8 with NT 8-row activation tiles sharing each
 // dequantized weight fragment, so the weight is read once for up to NT*8 rows.
@@ -2120,5 +2204,87 @@ w4a16_gemv_tc32_ld(
     unsigned int ld_half, unsigned int ld_groups
 ) {
     w4a16_gemv_tcn_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
+}
+
+// Touch twins of the 16/32-row tiers (see `w4a16_gemv_tc8_touch`); like the
+// tc8 twin they take explicit row strides and are launched with PDL.
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc16_touch(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ld_half, unsigned int ld_groups, unsigned int touch_rows, unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch({B_packed, K / 2u, ld_half}, {B_scale, K / GROUP_SIZE, ld_groups},
+                          touch_rows, blockIdx.x, touch_ctas);
+    w4a16_gemv_tcn_impl<2>(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
+}
+
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE)
+w4a16_gemv_tc32_touch(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale, const float scale2,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ld_half, unsigned int ld_groups, unsigned int touch_rows, unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch({B_packed, K / 2u, ld_half}, {B_scale, K / GROUP_SIZE, ld_groups},
+                          touch_rows, blockIdx.x, touch_ctas);
+    w4a16_gemv_tcn_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K, ld_half, ld_groups);
+}
+
+// Two projections of one input `A` (the shared expert's gate and up: same N
+// and K, whole weights) in ONE launch, grid z = plane, each plane the
+// unchanged tc{8,16,32} body of its touch twin: bit-identical, and the up
+// plane's CTAs run beside the gate plane's instead of waiting for the whole
+// gate launch to complete (64 CTAs each at N = 1024: neither fills the GPU).
+// Each plane touches its weight during the PDL wait (atlas_pdl_touch.cuh).
+template <int NT>
+__device__ __forceinline__ void w4a16_gemv_tc_pair(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B0, const unsigned char* __restrict__ S0, const float scale0,
+    __nv_bfloat16* __restrict__ C0,
+    const unsigned char* __restrict__ B1, const unsigned char* __restrict__ S1, const float scale1,
+    __nv_bfloat16* __restrict__ C1,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas
+) {
+    atlas_pdl_enter_touch_pair({B0, K / 2u, K / 2u}, {S0, K / GROUP_SIZE, K / GROUP_SIZE},
+                               {B1, K / 2u, K / 2u}, {S1, K / GROUP_SIZE, K / GROUP_SIZE},
+                               touch_rows, blockIdx.x, touch_ctas);
+    const bool one = blockIdx.z != 0u;
+    const unsigned char* B = one ? B1 : B0;
+    const unsigned char* S = one ? S1 : S0;
+    const float scale = one ? scale1 : scale0;
+    __nv_bfloat16* C = one ? C1 : C0;
+    if constexpr (NT == 1)
+        w4a16_gemv_tc8_impl(A, B, S, scale, C, M, N, K, K / 2u, K / GROUP_SIZE);
+    else
+        w4a16_gemv_tcn_impl<NT>(A, B, S, scale, C, M, N, K, K / 2u, K / GROUP_SIZE);
+}
+
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE) w4a16_gemv_tc8_pair_touch(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B0,
+    const unsigned char* __restrict__ S0, const float scale0, __nv_bfloat16* __restrict__ C0,
+    const unsigned char* __restrict__ B1, const unsigned char* __restrict__ S1, const float scale1,
+    __nv_bfloat16* __restrict__ C1, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int touch_rows, unsigned int touch_ctas) {
+    w4a16_gemv_tc_pair<1>(A, B0, S0, scale0, C0, B1, S1, scale1, C1, M, N, K, touch_rows, touch_ctas);
+}
+
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE) w4a16_gemv_tc16_pair_touch(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B0,
+    const unsigned char* __restrict__ S0, const float scale0, __nv_bfloat16* __restrict__ C0,
+    const unsigned char* __restrict__ B1, const unsigned char* __restrict__ S1, const float scale1,
+    __nv_bfloat16* __restrict__ C1, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int touch_rows, unsigned int touch_ctas) {
+    w4a16_gemv_tc_pair<2>(A, B0, S0, scale0, C0, B1, S1, scale1, C1, M, N, K, touch_rows, touch_ctas);
+}
+
+extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE) w4a16_gemv_tc32_pair_touch(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ B0,
+    const unsigned char* __restrict__ S0, const float scale0, __nv_bfloat16* __restrict__ C0,
+    const unsigned char* __restrict__ B1, const unsigned char* __restrict__ S1, const float scale1,
+    __nv_bfloat16* __restrict__ C1, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int touch_rows, unsigned int touch_ctas) {
+    w4a16_gemv_tc_pair<4>(A, B0, S0, scale0, C0, B1, S1, scale1, C1, M, N, K, touch_rows, touch_ctas);
 }
 #endif

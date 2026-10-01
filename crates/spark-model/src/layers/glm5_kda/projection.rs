@@ -123,7 +123,20 @@ impl Glm5KdaLayer {
             && tc.0 != 0
         {
             // One tensor-core pass reads the weight once for all owner rows.
-            ops::w4a16_gemv_batchm(ctx.gpu, tc, input, &weight.nvfp4, output, m, n, k, stream)
+            ops::w4a16_verify_touch(ctx.gpu, tc, input, &weight.nvfp4, output, m, n, k, stream)
+                .unwrap_or_else(|| {
+                    ops::w4a16_gemv_batchm(
+                        ctx.gpu,
+                        tc,
+                        input,
+                        &weight.nvfp4,
+                        output,
+                        m,
+                        n,
+                        k,
+                        stream,
+                    )
+                })
         } else if m > 8 {
             // Owner-batched verify: the batch-M GEMV tiers stream the weight
             // at near-peak bandwidth where the M64-tile prefill GEMM mostly
@@ -201,6 +214,14 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // ATLAS_GLM_DECODE_GEMV_BATCH: the same bodies behind a weight touch.
+        let tier = self.w4a16_gemv_batchm.kernel(m);
+        let nvfp4 = &weight.nvfp4;
+        if let Some(done) =
+            ops::w4a16_verify_touch(ctx.gpu, tier, input, nvfp4, output, m, n, k, stream)
+        {
+            return done;
+        }
         match m {
             2 => ops::w4a16_gemv_batch2(
                 ctx.gpu,
