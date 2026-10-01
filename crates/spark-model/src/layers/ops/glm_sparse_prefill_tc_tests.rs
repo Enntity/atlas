@@ -203,3 +203,80 @@ fn pipe_warm_launch_is_one_zero_row_cta() {
     initialize_glm_sparse_prefill_pipe(&gpu, &ModelConfig::qwen3_next_80b_nvfp4()).unwrap();
     assert_eq!(gpu.launches_snapshot().len(), 1);
 }
+
+#[test]
+fn the_pinned_split_count_does_not_move_with_the_verify_width() {
+    // Unpinned, the count follows the launch's rows: one position gets
+    // different softmax partials at each DFlash verify width.
+    let launch = |rows| sparse_owner_splits(rows, 32, 2051, false);
+    assert_eq!(
+        (1..=8).map(launch).collect::<Vec<_>>(),
+        [13, 13, 13, 11, 9, 8, 13, 6]
+    );
+    for rows in 1..=128 {
+        assert_eq!(launch(rows), sparse_split_count(rows, 32, 2051));
+    }
+    // Pinned, every verify-sized owner takes the widest block's count, which
+    // fills the 48 SMs in one wave there and keeps that block's bits.
+    let pinned = |rows| sparse_owner_splits(rows, 32, 2051, true);
+    for rows in 1..=8 {
+        assert_eq!(pinned(rows), launch(8));
+        // The scratch a pinned owner needs never exceeds the widest block's.
+        assert!(
+            sparse_split_scratch_bytes(pinned(rows), rows, 32, 512)
+                <= sparse_split_scratch_bytes(launch(8), 8, 32, 512)
+        );
+    }
+    // Wider owners (prefill pieces) keep the count they have today.
+    for rows in 9..=128 {
+        assert_eq!(pinned(rows), launch(rows));
+    }
+    assert!(parse("glm5_next", SPLIT_PIN, Some("1")).unwrap());
+    assert!(!parse("glm5_next", SPLIT_PIN, None).unwrap());
+    assert!(parse("glm5_next", SPLIT_PIN, Some("yes")).is_err());
+}
+
+#[test]
+fn the_pin_sets_the_split_grid_of_verify_owners_and_nothing_else() {
+    let c = config();
+    let scratch = DevicePtr(1 << 20);
+    let bytes = sparse_split_scratch_bytes(16, 8, 32, 512);
+    let launch = |rows: u32, scratch: DevicePtr, flags: SplitFlags| {
+        let gpu = MockGpuBackend::new();
+        let mut a = args(&c);
+        a.rows = rows;
+        assert!(dispatch_split(&gpu, &a, scratch, bytes, 7, flags).unwrap());
+        gpu.launches_snapshot()[0].grid
+    };
+    let off = SplitFlags {
+        on: true,
+        tc: true,
+        kv_reuse: true,
+        pipe: false,
+        pin: false,
+    };
+    let pin = SplitFlags { pin: true, ..off };
+    for rows in 1..=8 {
+        // Off: the launch's own count, as before the flag existed.
+        let own = sparse_split_count(rows, 32, 2051);
+        assert_eq!(launch(rows, scratch, off), [1, rows, own]);
+        // On: the widest verify block's count at every width.
+        assert_eq!(launch(rows, scratch, pin), [1, rows, 6]);
+    }
+    // A launch that does not split stays unsplit under the pin: the split
+    // switched off, no K=V kernel, or no scratch.
+    let unsplit = [
+        (scratch, SplitFlags { on: false, ..pin }),
+        (
+            scratch,
+            SplitFlags {
+                kv_reuse: false,
+                ..pin
+            },
+        ),
+        (DevicePtr::NULL, pin),
+    ];
+    for (scratch, flags) in unsplit {
+        assert_eq!(launch(3, scratch, flags), [1, 3, 1]);
+    }
+}

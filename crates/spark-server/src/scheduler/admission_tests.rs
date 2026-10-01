@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
+use crate::scheduler::test_support::test_request;
 
 // The forensic C=128 ladder shape (2026-08-15, Qwen3.8-27B/GB10):
 // pool 102k tokens, per-request demand ~1226 tokens (prompt ~202 +
@@ -134,56 +135,11 @@ fn watermark_zero_reserves_prompt_only_legacy() {
     assert_eq!(n, 128);
     assert!(!forced);
 }
-macro_rules! oversized_request {
-    ($variant:ident, $($extra:tt)*) => {
-        InferenceRequest::$variant {
-            prompt_tokens: std::sync::Arc::new(vec![1, 2, 3]),
-            session_hash: 0,
-            adapter_slot: -1,
-            src_lang_id: 0,
-            tgt_lang_id: 0,
-            num_beams: 1,
-            length_penalty: 1.0,
-            early_stopping: false,
-            image_pixels: vec![],
-            max_tokens: 600,
-            min_tokens: 0,
-            temperature: 0.0,
-            top_k: 0,
-            top_p: 1.0,
-            top_n_sigma: 0.0,
-            min_p: 0.0,
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            dry_multiplier: 0.0,
-            dry_base: 1.75,
-            dry_allowed_length: 2,
-            lz_penalty: 0.0,
-            logit_bias: vec![],
-            stop_tokens: vec![],
-            enable_thinking: false,
-            thinking_budget: None,
-            repetition_detection: None,
-            require_tool_call: false,
-            tools_present: true,
-            suppress_tool_call: false,
-            disable_mtp: false,
-            grammar_spec: None,
-            seed: Some(1),
-            top_logprobs: None,
-            prompt_logprobs: None,
-            echo: false,
-            timeout_at: None,
-            $($extra)*
-        }
-    };
-}
 
 #[test]
 fn ep_oversized_blocking_request_gets_error_before_allocation() {
     let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
-    let request = oversized_request!(Blocking, response_tx,);
+    let request = test_request!(Blocking, response_tx,);
     assert!(reject_oversized(vec![request], 16, 262144, 262144, 16).is_empty());
     let error = response_rx
         .try_recv()
@@ -196,7 +152,7 @@ fn ep_oversized_blocking_request_gets_error_before_allocation() {
 #[test]
 fn ep_oversized_stream_gets_error_before_allocation() {
     let (token_tx, mut token_rx) = tokio::sync::mpsc::channel(4);
-    let request = oversized_request!(Streaming, token_tx,
+    let request = test_request!(Streaming, token_tx,
         cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),);
     assert!(reject_oversized(vec![request], 16, 262144, 262144, 16).is_empty());
     match token_rx.try_recv().unwrap() {
@@ -211,7 +167,7 @@ fn ep_oversized_stream_gets_error_before_allocation() {
 #[test]
 fn ep_zero_capacity_rejects_even_a_single_request() {
     let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
-    let request = oversized_request!(Blocking, response_tx,);
+    let request = test_request!(Blocking, response_tx,);
     assert!(reject_oversized(vec![request], 0, 262144, 262144, 16).is_empty());
     assert!(response_rx.try_recv().unwrap().is_err());
 }

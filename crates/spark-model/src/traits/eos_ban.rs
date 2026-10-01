@@ -38,6 +38,22 @@ impl EosBan {
         }
     }
 
+    /// Install this ban on `seq`: the greedy verify heads mask end tokens
+    /// below the floor, and the drafter skips them there, so a banned end
+    /// token never truncates an otherwise acceptable draft chain.
+    pub fn arm(self, seq: &mut super::SequenceState) {
+        if self.floor > 0 {
+            let (floor, prompt) = (self.floor, seq.prompt_len);
+            tracing::info!(
+                "min_tokens: end tokens banned below position {floor} (prompt {prompt})"
+            );
+        }
+        seq.eos_ban = self;
+        if let Some(proposer) = seq.proposer_state.as_mut() {
+            proposer.set_end_floor(self.floor);
+        }
+    }
+
     /// Install the model's end tokens on every rank. A TP2 vocabulary-split
     /// head bans them in each rank's half, and only the head rank carries the
     /// per-request `EosBan`: without this the worker's half (which holds GLM's

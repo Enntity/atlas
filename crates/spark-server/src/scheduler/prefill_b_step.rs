@@ -463,6 +463,8 @@ pub fn prefill_request(
         return Ok(None);
     }
 
+    // The min_tokens end-token ban, as on the chunked paths.
+    spark_model::traits::EosBan::new(seq.prompt_len, req_min_tokens, eos_tokens).arm(&mut seq);
     Ok(Some(ActiveSeq {
         seq,
         session_hash: req_session_hash,
