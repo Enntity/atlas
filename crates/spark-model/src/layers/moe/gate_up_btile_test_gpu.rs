@@ -35,6 +35,8 @@ pub(super) struct Gpu {
     pub fail: AtomicUsize,
     pub lookup_failure: AtomicUsize,
     pub lookup_zero: AtomicBool,
+    /// Kernel names the target lacks.
+    pub missing: Mutex<Vec<String>>,
     lookups: AtomicUsize,
 }
 impl Gpu {
@@ -49,6 +51,7 @@ impl Gpu {
             fail: AtomicUsize::new(usize::MAX),
             lookup_failure: AtomicUsize::new(usize::MAX),
             lookup_zero: AtomicBool::new(false),
+            missing: Mutex::new(Vec::new()),
             lookups: AtomicUsize::new(0),
         }
     }
@@ -186,6 +189,10 @@ impl GpuBackend for Gpu {
             }
             bail!("injected lookup");
         }
+        ensure!(
+            !self.missing.lock().unwrap().iter().any(|name| name == n),
+            "no kernel {n}"
+        );
         let id = m
             .bytes()
             .chain(n.bytes())
