@@ -7,7 +7,7 @@
 //! The head cannot decide alone: each rank evicts from its own prefix cache
 //! (rank-local, and it diverges — see the F83 note in `prefix_lookup`), so
 //! free-plus-evictable capacity differs per rank. Each rank therefore tries
-//! its own reservation and one min-vote over [`Admission`] decides for all.
+//! its own reservation and one min-vote over `Admission` decides for all.
 //! On refusal every rank undoes its reservation and returns
 //! [`KvAdmissionRefused`] from the same point, having mutated no sequence or
 //! GPU state for the chunk, so the worker simply waits for its next command
