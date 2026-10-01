@@ -52,14 +52,42 @@ pub(super) fn glm_grouped_shape(config: &atlas_core::config::ModelConfig) -> boo
         && config.scoring_func == "sigmoid"
 }
 
-/// Row-tile grid of the K128W kernel over `rows` sorted rows: the device
-/// prefix of the local experts' M64 tiles and a host upper bound on their
-/// count.
+/// Row tiles of the K128W kernels over `rows` sorted rows: the device prefix
+/// of the local experts' M64 tiles and the schedule covering them.
 #[derive(Clone, Copy)]
 pub(super) struct MtileGrid {
     pub prefix: DevicePtr,
-    pub bound: u32,
+    pub schedule: ops::K128wSchedule,
     pub rows: u32,
+}
+
+/// Sorted rows below which the persistent K128W schedule stays off: at 2K-4K
+/// token chunks (16-32K rows) the grid kernels already stream the weights at
+/// the DRAM rate and the persistent twins measured 2-7% slower on GB10; from
+/// 8K tokens (65536 rows, the serving chunk) they measured 6-9% faster on
+/// gate/up (moe_prefill_bench).
+pub(super) const K128W_PERSIST_MIN_ROWS: u32 = 65536;
+
+/// The K128W schedule over `rows` sorted rows: `persist_ctas` persistent CTAs
+/// claiming work from `next_work` when enabled (nonzero) and the chunk is
+/// large enough, else the grid over every sorted row in M64 tiles plus one
+/// partial tile per expert.
+pub(super) fn k128w_schedule(
+    persist_ctas: u32,
+    rows: u32,
+    num_experts: u32,
+    next_work: DevicePtr,
+) -> ops::K128wSchedule {
+    if persist_ctas > 0 && rows >= K128W_PERSIST_MIN_ROWS {
+        ops::K128wSchedule::Persistent {
+            ctas: persist_ctas,
+            next_work,
+        }
+    } else {
+        ops::K128wSchedule::Grid {
+            bound: rows.div_ceil(64) + num_experts,
+        }
+    }
 }
 
 pub(super) fn compact_gate_up_worklist_bytes(rows: u32, top_k: u32, inter: u32) -> usize {
@@ -230,7 +258,7 @@ impl MoeLayer {
             }
         }
         if let Some(grid) = wide
-            && self.moe_w4a4_prequant_gate_up_silu.0 != 0
+            && self.moe_w4a4_prequant_gate_up_silu.grid.0 != 0
             && self.nvfp4_fused_silu_quant
             && self.silu_mul_quant_nvfp4_k.0 != 0
             && self.lora.is_none()
@@ -252,7 +280,7 @@ impl MoeLayer {
                 inter,
                 h,
                 grid.prefix,
-                grid.bound,
+                grid.schedule,
                 stream,
             )?;
             return Ok(true);
@@ -318,15 +346,24 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<MtileGrid>> {
-        if self.moe_w4a4_prequant_t_k128w.0 == 0 || self.moe_mtile_prefix_k.0 == 0 {
+        if self.moe_w4a4_prequant_t_k128w.grid.0 == 0 || self.moe_mtile_prefix_k.0 == 0 {
             return Ok(None);
         }
+        // The persistent schedule's work counter follows the prefix.
+        let prefix = ctx.buffers.moe_router_in_f32();
+        let next_work = prefix.offset((num_experts as usize + 1) * 4);
+        let schedule = k128w_schedule(
+            self.k128w_persist_ctas,
+            total_expanded,
+            num_experts,
+            next_work,
+        );
+        let persistent = matches!(schedule, ops::K128wSchedule::Persistent { .. });
+        let words = num_experts as usize + 1 + usize::from(persistent);
         anyhow::ensure!(
-            num_experts <= 1024
-                && ctx.buffers.sizes().moe_router_in_f32 >= (num_experts as usize + 1) * 4,
+            num_experts <= 1024 && ctx.buffers.sizes().moe_router_in_f32 >= words * 4,
             "K128W row-tile prefix exceeds router scratch"
         );
-        let prefix = ctx.buffers.moe_router_in_f32();
         ops::moe_mtile_prefix(
             ctx.gpu,
             self.moe_mtile_prefix_k,
@@ -336,10 +373,9 @@ impl MoeLayer {
             num_experts,
             stream,
         )?;
-        // Every sorted row in M64 tiles plus one partial tile per expert.
         Ok(Some(MtileGrid {
             prefix,
-            bound: total_expanded.div_ceil(64) + num_experts,
+            schedule,
             rows: total_expanded,
         }))
     }
@@ -383,7 +419,7 @@ impl MoeLayer {
                 n,
                 k,
                 grid.prefix,
-                grid.bound,
+                grid.schedule,
                 stream,
             );
         }
