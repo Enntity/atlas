@@ -51,8 +51,24 @@ fn enabled(model: &str, name: &str) -> Result<bool> {
     }
 }
 
-fn kernel_spec(kv_reuse: bool, dtype: KvCacheDtype) -> (&'static str, &'static str, u32) {
-    if dtype == KvCacheDtype::Fp8G128 {
+/// Opt-in pipelined `fp8_g128` prefill kernel, bit-identical to the kv_pad one.
+const PIPE: &str = "ATLAS_GLM_SPARSE_PREFILL_PIPE";
+/// The pipe kernel's selected-slot capacity (`GLM_PIPE_SLOTS`); it also
+/// requires 16-token cache blocks and returns without writing otherwise.
+const PIPE_SLOTS: u32 = 2080;
+
+fn kernel_spec(
+    kv_reuse: bool,
+    dtype: KvCacheDtype,
+    pipe: bool,
+) -> (&'static str, &'static str, u32) {
+    if dtype == KvCacheDtype::Fp8G128 && pipe {
+        (
+            "glm_sparse_prefill_kv_reuse",
+            "glm_sparse_mla_prefill_fp8g128_head32_tc_pipe",
+            80128,
+        )
+    } else if dtype == KvCacheDtype::Fp8G128 {
         (
             "glm_sparse_prefill_kv_reuse",
             "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad",
@@ -87,7 +103,24 @@ pub fn try_glm_sparse_prefill_tc(
         stream,
         enabled(model, "ATLAS_GLM_SPARSE_PREFILL_TC")?,
         enabled(model, "ATLAS_GLM_SPARSE_PREFILL_KV_REUSE")?,
+        enabled(model, PIPE)?,
     )
+}
+
+/// Whether a sparse owner of `rows` reads an `fp8_g128` cache through the
+/// BF16 view. The native library reads only the view; every other 2048+-row
+/// piece runs BF16 kv_pad on it, which the pipelined kernel reproduces bit for
+/// bit from the FP8 cache, so under the pipe only native pieces need it.
+pub fn glm_sparse_owner_needs_view(
+    model: &str,
+    rows: u32,
+    native_admits: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    needs_view(rows, enabled(model, PIPE)?, native_admits)
+}
+
+fn needs_view(rows: u32, pipe: bool, native_admits: impl FnOnce() -> Result<bool>) -> Result<bool> {
+    Ok(rows >= 2048 && (!pipe || native_admits()?))
 }
 
 fn dispatch(
@@ -96,10 +129,15 @@ fn dispatch(
     stream: u64,
     enabled: bool,
     kv_reuse: bool,
+    pipe: bool,
 ) -> Result<bool> {
     ensure!(
         !kv_reuse || enabled,
         "ATLAS_GLM_SPARSE_PREFILL_KV_REUSE=1 requires ATLAS_GLM_SPARSE_PREFILL_TC=1"
+    );
+    ensure!(
+        !pipe || enabled,
+        "{PIPE}=1 requires ATLAS_GLM_SPARSE_PREFILL_TC=1"
     );
     // An `fp8_g128` cache has no other sparse reader, so it takes single rows
     // too and needs the K=V (kv_reuse) kernel.
@@ -117,11 +155,15 @@ fn dispatch(
     );
     validate_geometry(a)?;
     ensure!(
+        !pipe || (a.index_width <= PIPE_SLOTS && a.block_size == 16),
+        "{PIPE}=1 requires at most {PIPE_SLOTS} selected slots and block16"
+    );
+    ensure!(
         (if fp8 { 1 } else { 2 }..=65535).contains(&a.rows),
         "GLM sparse TC prefill requires up to 65535 rows"
     );
     validate_storage(a)?;
-    launch(gpu, a, stream, kv_reuse, a.rows)?;
+    launch(gpu, a, stream, kv_reuse, pipe, a.rows)?;
     Ok(true)
 }
 
@@ -174,9 +216,10 @@ fn launch(
     a: &GlmSparsePrefillTc<'_>,
     stream: u64,
     kv_reuse: bool,
+    pipe: bool,
     grid_rows: u32,
 ) -> Result<()> {
-    let (module, symbol, shared_mem) = kernel_spec(kv_reuse, a.dtype);
+    let (module, symbol, shared_mem) = kernel_spec(kv_reuse, a.dtype, pipe);
     let kernel = gpu.kernel(module, symbol)?;
     ensure!(kernel.0 != 0, "GLM sparse TC prefill kernel is unavailable");
     KernelLaunch::new(gpu, kernel)
@@ -235,9 +278,10 @@ pub fn try_glm_sparse_prefill_tc_split(
     let on =
         *ON.get_or_init(|| std::env::var("ATLAS_GLM_SPARSE_VERIFY_SPLIT").as_deref() != Ok("0"));
     let model = &a.config.model_type;
-    let (tc, kv_reuse) = (
+    let (tc, kv_reuse, pipe) = (
         enabled(model, "ATLAS_GLM_SPARSE_PREFILL_TC")?,
         enabled(model, "ATLAS_GLM_SPARSE_PREFILL_KV_REUSE")?,
+        enabled(model, PIPE)?,
     );
     let splits = sparse_split_count(a.rows, a.heads, a.index_width);
     let need = sparse_split_scratch_bytes(splits, a.rows, a.heads, a.head_dim);
@@ -250,14 +294,14 @@ pub fn try_glm_sparse_prefill_tc_split(
         || !scratch.0.is_multiple_of(16)
         || scratch_bytes < need
     {
-        return dispatch(gpu, a, stream, tc, kv_reuse);
+        return dispatch(gpu, a, stream, tc, kv_reuse, pipe);
     }
     validate_geometry(a)?;
     validate_storage(a)?;
     let rh = a.rows as usize * a.heads as usize;
     let part_lse = scratch.offset(splits as usize * rh * a.head_dim as usize * 4);
     let out_lse = part_lse.offset(splits as usize * rh * 4);
-    let (module, _, shared_mem) = kernel_spec(true, a.dtype);
+    let (module, _, shared_mem) = kernel_spec(true, a.dtype, false);
     let symbol = if a.dtype == KvCacheDtype::Fp8G128 {
         "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split"
     } else {
@@ -343,7 +387,7 @@ fn dispatch_decode(
                 .all(|p| p.0.is_multiple_of(4)),
         "GLM sparse TC decode requires aligned vector loads and stores"
     );
-    launch(gpu, a, stream, true, 1)?;
+    launch(gpu, a, stream, true, false, 1)?;
     Ok(true)
 }
 
@@ -357,14 +401,38 @@ pub fn initialize_glm_sparse_decode_tc(gpu: &dyn GpuBackend, config: &ModelConfi
     )
 }
 
+/// Validate the pipe's flag combination and warm its kernel before serving, so
+/// its first launch (lazy load, 80 KB shared-memory opt-in) never falls inside
+/// a CUDA-graph capture (verify rows reach it when the split does not apply).
+pub fn initialize_glm_sparse_prefill_pipe(
+    gpu: &dyn GpuBackend,
+    config: &ModelConfig,
+) -> Result<()> {
+    let model = &config.model_type;
+    if !enabled(model, PIPE)? {
+        return Ok(());
+    }
+    ensure!(
+        enabled(model, "ATLAS_GLM_SPARSE_PREFILL_TC")?,
+        "{PIPE}=1 requires ATLAS_GLM_SPARSE_PREFILL_TC=1"
+    );
+    warm(gpu, config, KvCacheDtype::Fp8G128, true)?;
+    tracing::info!("{PIPE}=1: pipelined fp8_g128 sparse prefill warmed before KV sizing");
+    Ok(())
+}
+
 fn initialize_decode(gpu: &dyn GpuBackend, config: &ModelConfig, enabled: bool) -> Result<()> {
     if !enabled {
         return Ok(());
     }
+    warm(gpu, config, KvCacheDtype::Bf16, false)
+}
+
+fn warm(gpu: &dyn GpuBackend, config: &ModelConfig, dtype: KvCacheDtype, pipe: bool) -> Result<()> {
     validate_config(config)?;
     let empty = GlmSparsePrefillTc {
         config,
-        dtype: KvCacheDtype::Bf16,
+        dtype,
         identical_kv_latent: true,
         query: DevicePtr::NULL,
         k_cache: DevicePtr::NULL,
@@ -383,7 +451,7 @@ fn initialize_decode(gpu: &dyn GpuBackend, config: &ModelConfig, enabled: bool) 
     // Init-only zero rows: the kernel uniformly returns at token_row >= rows,
     // before pointer arithmetic, global reads/writes, or barriers. One CTA still
     // forces the real code/shared-memory launch path. Data dispatch rejects 0.
-    launch(gpu, &empty, stream, true, 1)?;
+    launch(gpu, &empty, stream, true, pipe, 1)?;
     gpu.synchronize(stream)
 }
 
