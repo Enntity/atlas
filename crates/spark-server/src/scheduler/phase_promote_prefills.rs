@@ -152,13 +152,8 @@ pub(super) fn build_active_seq_from_prefill(
         glm_tool_boundary.filter(|_| p.tools_present),
     );
     let mut seq = p.seq;
-    // Greedy verify heads mask end tokens below the min_tokens floor.
-    seq.eos_ban = spark_model::traits::EosBan::new(seq.prompt_len, p.min_tokens, &p.eos_tokens);
-    // ... and the drafter skips them there, so a banned end token never
-    // truncates an otherwise acceptable draft chain.
-    if let Some(proposer) = seq.proposer_state.as_mut() {
-        proposer.set_end_floor(seq.eos_ban.floor);
-    }
+    // The min_tokens end-token ban, for every chunked prompt (one chunk or more).
+    spark_model::traits::EosBan::new(seq.prompt_len, p.min_tokens, &p.eos_tokens).arm(&mut seq);
     ActiveSeq {
         seq,
         session_hash: p.session_hash,

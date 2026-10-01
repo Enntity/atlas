@@ -485,6 +485,8 @@ pub(super) struct SwappedSeq {
     pub output_tokens: Vec<u32>,
     pub remaining: usize,
     pub min_tokens: usize,
+    /// The min_tokens end-token ban; the restored sequence is a fresh one.
+    pub eos_ban: spark_model::traits::EosBan,
     pub eos_tokens: Vec<u32>,
     pub sink: ResponseSink,
     pub temperature: f32,
