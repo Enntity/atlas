@@ -82,6 +82,9 @@ impl MoeLayer {
         )
     }
 
+    /// The unpermute-reduce into `output`; with `blend_input` (the normed MoE
+    /// input) it may also apply the shared-expert blend of `attn_output` in
+    /// the same launch (`ATLAS_GLM_DECODE_FUSE`), and returns whether it did.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn unpermute_ep_prefill(
         &self,
@@ -93,12 +96,30 @@ impl MoeLayer {
         hidden: u32,
         tokens: u32,
         topk: u32,
+        blend_input: Option<DevicePtr>,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if self.use_sparse_ep_reduce(ctx) {
             let (local_start, local_end) = ctx.config.local_expert_range();
-            return ops::moe_unpermute_reduce_indexed_ep(
+            let (local_start, local_end) = (local_start as u32, local_end as u32);
+            if let Some(normed) = blend_input {
+                let ptrs = [
+                    expert_output,
+                    output,
+                    token_to_perm,
+                    topk_ids,
+                    topk_weights,
+                    ctx.buffers.attn_output(),
+                    normed,
+                    self.weights.shared_expert_gate.weight,
+                ];
+                let dims = [hidden, tokens, topk, local_start, local_end];
+                if ops::glm_decode_fuse::moe_unpermute_blend(ctx.gpu, ptrs, dims, stream)? {
+                    return Ok(true);
+                }
+            }
+            ops::moe_unpermute_reduce_indexed_ep(
                 ctx.gpu,
                 self.moe_unpermute_reduce_ep,
                 expert_output,
@@ -109,10 +130,11 @@ impl MoeLayer {
                 hidden,
                 tokens,
                 topk,
-                local_start as u32,
-                local_end as u32,
+                local_start,
+                local_end,
                 stream,
-            );
+            )?;
+            return Ok(false);
         }
         ops::moe_unpermute_reduce_indexed(
             ctx.gpu,
@@ -125,7 +147,8 @@ impl MoeLayer {
             tokens,
             topk,
             stream,
-        )
+        )?;
+        Ok(false)
     }
 }
 
