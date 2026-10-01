@@ -21,6 +21,8 @@ mod graph_policy;
 mod meta;
 #[path = "verify_d_oracle.rs"]
 mod oracle;
+#[path = "verify_d_pieces.rs"]
+mod pieces;
 
 impl TransformerModel {
     pub(super) fn decode_verify_graphed_kgamma_dispatch(
@@ -237,8 +239,30 @@ impl TransformerModel {
             let mut t_attn = 0u128;
             let mut t_moe = 0u128;
             let mut t_lin = 0u128;
+            // ATLAS_GLM_VERIFY_GRAPH: KDA runs replay piecewise graphs; the
+            // sparse-MLA layers and the head stay eager (host seq_len/ban).
+            let pieces = pieces::admitted(
+                crate::model::verify_pieces::requested(),
+                &self.config.model_type,
+                self.config.tp_world_size,
+                use_graphs
+                    || self.comm.is_none()
+                    || self.lora.is_some()
+                    || self
+                        .suppress_graphs
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    || hss_engaged
+                    || force_eager
+                    || layer_veto
+                    || verify_profile
+                    || super::verify_layer_trace::enabled()
+                    || pieces::diagnostics_sync(),
+            );
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if pieces && self.kgamma_kda_run(layer_idx, k, seq, &mut kv_cache, &ctx, stream)? {
+                    continue;
+                }
                 let layer_type = self.config.layer_type(layer_idx);
                 let layer_started = if verify_profile {
                     self.gpu.synchronize(stream)?;
@@ -325,37 +349,7 @@ impl TransformerModel {
                     )?;
                 }
                 self.trace_lightning_hidden_rows("k4", seq.seq_len, layer_idx, hidden, k, stream)?;
-                // DFlash intermediate hidden capture: snapshot each capture
-                // layer's output at position k-1 (last verify token) into
-                // dflash_hidden_save[slot] while hidden_states still holds
-                // this layer's activation — mirrors verify_b.rs for K=2.
-                // Must be inside the graph capture region so the per-layer
-                // intermediate (not the final-layer-only post-loop value) is
-                // recorded. Under ATLAS_DFLASH_EAGLE_FIX=1 OR
-                // ATLAS_DFLASH_UNIFIED_CTX=1, capture ALL k verify rows so
-                // the scheduler can append rows 0..=num_accepted to ctx
-                // after the accept walk (EAGLE order). UNIFIED_CTX requires
-                // the same full capture: commit_ctx copies scratch rows
-                // 0..=num_accepted — with only the k-1 capture, row 0 holds
-                // the WRONG token's hidden and rows 1.. are stale garbage
-                // (2026-07-09 accept-collapse root cause: EAGLE_FIX=0 under
-                // UNIFIED=1 starved this capture and poisoned drafter ctx).
-                // Always capture every verify row. commit_ctx copies
-                // 0..=num_accepted; capturing only k-1 poisons the next
-                // propose (2026-07-09 accept-collapse). Opt out with
-                // ATLAS_DFLASH_CAPTURE_LAST_ONLY=1 for ablation.
-                // Ablation only: product Lightning serves never arm this
-                // (the admitted policy freezes the diagnostic surface).
-                let capture_last_only = self.lightning_dspark_identity.policy().is_none()
-                    && std::env::var("ATLAS_DFLASH_CAPTURE_LAST_ONLY")
-                        .ok()
-                        .as_deref()
-                        == Some("1");
-                if capture_last_only {
-                    self.try_dflash_capture(layer_idx, k - 1, stream)?;
-                } else {
-                    self.try_dflash_capture_all(layer_idx, k, stream)?;
-                }
+                self.kgamma_dflash_capture(layer_idx, k, stream)?;
                 if let Some(started) = layer_started {
                     self.gpu.synchronize(stream)?;
                     let elapsed = started.elapsed().as_micros();
