@@ -357,3 +357,64 @@ extern "C" __global__ void moe_build_tile_worklist(
     }
     if (tid == 0) total_tiles[0] = (int)s_base;
 }
+
+// moe_unpermute_reduce_indexed_ep with 16-byte accesses
+// (ATLAS_GLM_MOE_UNPERMUTE_VEC): each thread owns 8 consecutive columns and
+// issues one 16-byte load per local route before accumulating, where the
+// scalar kernel walks its 16 columns one 2-byte load chain at a time (latency
+// bound at decode row counts). Every element sums the same products in the
+// same slot order, so the output bytes are identical.
+// Grid: (num_tokens, 1, 1)  Block: (256, 1, 1); hidden_size % 8 == 0,
+// topk <= 8.
+extern "C" __global__ void moe_unpermute_reduce_indexed_ep_vec8(
+    const __nv_bfloat16* __restrict__ expert_output,
+    __nv_bfloat16* __restrict__ output,
+    const int* __restrict__ token_to_perm,
+    const int* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    unsigned int hidden_size,
+    unsigned int num_tokens,
+    unsigned int topk,
+    unsigned int local_expert_start,
+    unsigned int local_expert_end
+) {
+    atlas_pdl_enter();
+    constexpr unsigned int MAX_TOPK = 8;
+    const unsigned int token = blockIdx.x;
+    if (token >= num_tokens) return;
+    // The token's routes in slot order, each live if local. Every index is
+    // a compile-time slot, so the arrays stay in registers.
+    unsigned int rows[MAX_TOPK];
+    float weights[MAX_TOPK];
+    bool live[MAX_TOPK];
+    #pragma unroll
+    for (unsigned int k = 0; k < MAX_TOPK; k++) {
+        const unsigned int slot = token * topk + k;
+        const int expert = k < topk ? topk_ids[slot] : -1;
+        live[k] = k < topk && expert >= (int)local_expert_start && expert < (int)local_expert_end;
+        rows[k] = live[k] ? (unsigned int)token_to_perm[slot] : 0u;
+        weights[k] = live[k] ? topk_weights[slot] : 0.0f;
+    }
+    for (unsigned int c = threadIdx.x * 8; c < hidden_size; c += blockDim.x * 8) {
+        uint4 raw[MAX_TOPK];
+        #pragma unroll
+        for (unsigned int i = 0; i < MAX_TOPK; i++)
+            if (live[i]) raw[i] = *(const uint4*)&expert_output[rows[i] * hidden_size + c];
+        float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        #pragma unroll
+        for (unsigned int i = 0; i < MAX_TOPK; i++) {
+            if (!live[i]) continue;
+            const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&raw[i]);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float value = __bfloat162float(v[j]);
+                acc[j] += weights[i] * value;
+            }
+        }
+        uint4 out;
+        __nv_bfloat16* o = reinterpret_cast<__nv_bfloat16*>(&out);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) o[j] = __float2bfloat16(acc[j]);
+        *(uint4*)&output[token * hidden_size + c] = out;
+    }
+}
