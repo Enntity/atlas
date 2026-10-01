@@ -29,6 +29,14 @@ impl GlmChunkOwner {
     pub(super) fn write_skip(&self, floor: usize) -> usize {
         floor.saturating_sub(self.row0).min(self.rows)
     }
+
+    /// Dense attention over the owner's whole causal history is exact: its
+    /// sequence ends within `index_topk`, so it selects nothing.
+    pub(super) fn dense_is_exact(&self, index_topk: usize) -> bool {
+        self.seq_len_start
+            .checked_add(self.rows)
+            .is_some_and(|end| super::dense_selection_is_exact(end, index_topk))
+    }
 }
 
 /// The KV write floor the single-sequence paged prefill applies: `floor`,
@@ -73,18 +81,40 @@ pub(super) fn checked_write_floor(
     Ok(floor)
 }
 
+/// Whether any owner runs the semantic-index selection, the only reader of
+/// the index queries and weights.
+pub(super) fn any_owner_selects(owners: &[GlmChunkOwner], index_topk: usize) -> bool {
+    owners.iter().any(|o| !o.dense_is_exact(index_topk))
+}
+
 /// Row-wise projections of an owner-batched verify, one row per stacked row:
-/// owner rows start at `row0 * <row bytes>`.
+/// owner rows start at `row0 * <row bytes>`. `index` (queries, weights) is
+/// `None` when no owner selects ([`any_owner_selects`]): nothing projected
+/// them this layer.
 #[derive(Clone, Copy)]
 pub(super) struct GlmOwnerProjections {
     pub(super) keys: DevicePtr,
     pub(super) gates: DevicePtr,
-    pub(super) index_query: DevicePtr,
-    pub(super) weights: DevicePtr,
+    pub(super) index: Option<(DevicePtr, DevicePtr)>,
     pub(super) q_absorbed: DevicePtr,
     pub(super) key_row: usize,
     pub(super) query_row: usize,
     pub(super) weight_row: usize,
+}
+
+impl GlmOwnerProjections {
+    /// The index queries and weights of the owner at `row0`. Fails closed when
+    /// the batch skipped them: the selector's own projection would land in
+    /// the scratch that holds this batch's absorbed queries.
+    pub(super) fn index_rows(&self, row0: usize) -> Result<(DevicePtr, DevicePtr)> {
+        let (query, weights) = self.index.ok_or_else(|| {
+            anyhow::anyhow!("GLM owner batch skipped the index queries of a selecting owner")
+        })?;
+        Ok((
+            query.offset(row0 * self.query_row),
+            weights.offset(row0 * self.weight_row),
+        ))
+    }
 }
 
 /// One sequence's prefill chunk of `rows` rows from `seq_len_start` as chunk
@@ -177,9 +207,15 @@ impl Qwen3AttentionLayer {
         let gates = keys.offset(rows * key_row);
         self.glm_index_project_keys(normed, n, keys, gates, ctx, stream)?;
         let q_absorbed = ctx.buffers.ssm_deinterleaved();
-        let index_query = q_absorbed.offset(rows * latent_row);
-        let weights = ctx.buffers.ssm_gates();
-        self.glm_index_project_query(q_latent, normed, n, index_query, weights, ctx, stream)?;
+        // Short-context batches (every owner dense) skip wq_b and weights_proj.
+        let index = if any_owner_selects(owners, c.index_topk) {
+            let query = q_absorbed.offset(rows * latent_row);
+            let weights = ctx.buffers.ssm_gates();
+            self.glm_index_project_query(q_latent, normed, n, query, weights, ctx, stream)?;
+            Some((query, weights))
+        } else {
+            None
+        };
         let q_full = ctx.buffers.qkv_output();
         self.paged_glm_projection(
             q_latent,
@@ -196,8 +232,7 @@ impl Qwen3AttentionLayer {
         Ok(Some(GlmOwnerProjections {
             keys,
             gates,
-            index_query,
-            weights,
+            index,
             q_absorbed,
             key_row,
             query_row,

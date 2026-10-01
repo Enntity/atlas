@@ -59,6 +59,11 @@ impl Glm5KdaLayer {
             KernelHandle(0)
         };
         let hc_name = |base: &str| super::super::ops::hc_kernel_name(&config.model_type, base);
+        // The fused verify triples are load-ahead kernels; a b / f_a / g_a
+        // grid too wide for them keeps the bit-identical separate launches.
+        let triple_fits = super::super::ops::dense_gemv_triple_fits(heads as u32, dim as u32);
+        let triple =
+            |func| super::super::try_kernel_gated(triple_fits, gpu, "dense_gemv_bf16_batchm", func);
         let layer = Self {
             input_norm,
             post_attn_norm,
@@ -88,21 +93,13 @@ impl Glm5KdaLayer {
                 "dense_gemv_bf16_batchm",
                 "dense_gemv_bf16_batch5_dual",
             ),
-            dense_gemv_batch5_triple_n_k: super::super::try_kernel(
-                gpu,
-                "dense_gemv_bf16_batchm",
-                "dense_gemv_bf16_batch5_triple_n",
-            ),
+            dense_gemv_batch5_triple_n_k: triple("dense_gemv_bf16_batch5_triple_n"),
             dense_gemv_batchm_dual_k: super::super::try_kernel(
                 gpu,
                 "dense_gemv_bf16_batchm",
                 "dense_gemv_bf16_batchm_dual",
             ),
-            dense_gemv_batchm_triple_n_k: super::super::try_kernel(
-                gpu,
-                "dense_gemv_bf16_batchm",
-                "dense_gemv_bf16_batchm_triple_n",
-            ),
+            dense_gemv_batchm_triple_n_k: triple("dense_gemv_bf16_batchm_triple_n"),
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,

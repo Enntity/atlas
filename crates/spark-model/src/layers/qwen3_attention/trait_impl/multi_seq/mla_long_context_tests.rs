@@ -13,6 +13,8 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, SparseIndexCacheConfi
 #[path = "mla_long_context_test_gpu.rs"]
 mod gpu;
 use gpu::TestGpu;
+#[path = "mla_owner_batch_tests.rs"]
+mod owner_batch_tests;
 #[path = "mla_query_dispatch_tests.rs"]
 mod query_dispatch_tests;
 #[path = "mla_split_context_tests.rs"]

@@ -14,6 +14,17 @@ use super::DENSE_GEMV_BATCHM_MAX_M;
 /// Widest row count [`dense_gemv_bf16_tc`] serves (`dense_gemv_bf16_tc32`).
 pub const DENSE_GEMV_TC_MAX_M: u32 = 32;
 
+/// Most CTAs a load-ahead dense GEMV grid may span (`AHEAD` in GLM's
+/// `dense_gemv_bf16_batchm.cu`): that body's registers leave two CTAs per SM
+/// (96 on GB10), and a wider grid runs slower than the plain tiers.
+pub const DENSE_GEMV_AHEAD_MAX_CTAS: u32 = 96;
+
+/// Whether the fused verify triples' three-plane grid fits the load-ahead
+/// body they run; a wider shape takes one plain launch per projection.
+pub fn dense_gemv_triple_fits(first_n: u32, other_n: u32) -> bool {
+    div_ceil(first_n.max(other_n), 4) <= DENSE_GEMV_AHEAD_MAX_CTAS / 3
+}
+
 /// `dense_gemv_bf16_tc16` / `_tc32` for `m` rows (9..=32) when the tensor-core
 /// verify tiers are enabled (`ATLAS_W4A16_TC=1`), else a zero handle.
 pub fn dense_tc_kernel(gpu: &dyn GpuBackend, m: u32) -> KernelHandle {
@@ -175,6 +186,7 @@ fn dense_gemv_dual(
 }
 
 /// Three same-input exact-M=5 BF16 projections; the first may have a smaller N.
+/// A load-ahead grid: the widths must satisfy [`dense_gemv_triple_fits`].
 #[allow(clippy::too_many_arguments)]
 pub fn dense_gemv_batch5_triple_n(
     gpu: &dyn GpuBackend,
@@ -206,6 +218,7 @@ pub fn dense_gemv_batch5_triple_n(
 
 /// Three same-input BF16 projections of `m` (<= 8) rows in one grid
 /// (`dense_gemv_bf16_batchm_triple_n`); the first may have a smaller N.
+/// A load-ahead grid: the widths must satisfy [`dense_gemv_triple_fits`].
 #[allow(clippy::too_many_arguments)]
 pub fn dense_gemv_batchm_triple_n(
     gpu: &dyn GpuBackend,
@@ -250,6 +263,11 @@ fn dense_gemv_triple_n(
     ensure!(
         first_n.is_multiple_of(4) && other_n.is_multiple_of(4),
         "dense GEMV triple requires output widths divisible by 4 (got {first_n} and {other_n})"
+    );
+    ensure!(
+        dense_gemv_triple_fits(first_n, other_n),
+        "dense GEMV triple is a load-ahead grid of at most {DENSE_GEMV_AHEAD_MAX_CTAS} CTAs \
+         (got widths {first_n} and {other_n}); launch the projections separately"
     );
     launch_triple_n(
         gpu,

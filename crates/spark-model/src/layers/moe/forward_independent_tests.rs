@@ -180,3 +180,38 @@ fn actual_independent_width_entry() {
     }
     kda::actual_kda_rows();
 }
+
+/// The GLM router (288 experts: a 72-CTA grid) resolves the load-ahead batchm
+/// tier. A GLM kernel set without it, a grid too wide for it, or another
+/// model family (whose kernel set is never asked for the GLM symbol) keeps
+/// the generic kernel.
+#[test]
+fn glm_router_resolves_the_load_ahead_batchm_tier() {
+    use crate::layers::moe::init_optional::router_gemv_batchm;
+    const MODULE: &str = "dense_gemv_bf16_batchm";
+    const AHEAD: &str = "dense_gemv_bf16_batchm_ahead";
+    let gpu = Gpu::new();
+    let (_store, mut config, layer) = resident_tests::setup(&gpu, 0);
+    let ahead = gpu.kernel(MODULE, AHEAD).unwrap().0;
+    let generic = gpu.kernel(MODULE, MODULE).unwrap().0;
+    assert_ne!(ahead, generic);
+    assert_eq!(layer.dense_gemv_batchm.0, ahead);
+
+    gpu.clear();
+    gpu.lookup_zero.store(true, Ordering::Relaxed);
+    gpu.lookup_failure.store(1, Ordering::Relaxed);
+    assert_eq!(router_gemv_batchm(&gpu, &config).0, generic);
+    gpu.lookup_failure.store(usize::MAX, Ordering::Relaxed);
+
+    let only_generic = [Event::Lookup(MODULE.into(), MODULE.into())];
+    config.num_experts = 388;
+    gpu.clear();
+    assert_eq!(router_gemv_batchm(&gpu, &config).0, generic);
+    assert_eq!(gpu.trace(), only_generic);
+
+    config.num_experts = 288;
+    config.model_type = "qwen3_next".into();
+    gpu.clear();
+    assert_eq!(router_gemv_batchm(&gpu, &config).0, generic);
+    assert_eq!(gpu.trace(), only_generic);
+}

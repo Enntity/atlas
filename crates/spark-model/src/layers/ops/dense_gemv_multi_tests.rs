@@ -69,3 +69,38 @@ fn prefill_triple_walks_plane_tiles_along_x_over_128_row_tiles() {
         assert_eq!((launch.grid, launch.block), (grid, [256, 1, 1]));
     }
 }
+
+/// The fused verify triples run the load-ahead body (two CTAs per SM). The KDA
+/// b / f_a / g_a grid of 96 CTAs is the widest they take; a wider one is
+/// refused before launch instead of running slower than three plain launches.
+#[test]
+fn verify_triples_refuse_a_grid_wider_than_the_load_ahead_limit() {
+    let gpu = MockGpuBackend::new();
+    let w = DenseWeight {
+        weight: DevicePtr(0x1000),
+    };
+    let (x, y) = (DevicePtr(0x2000), DevicePtr(0x3000));
+    let batchm =
+        |n| dense_gemv_batchm_triple_n(&gpu, KernelHandle(7), x, [&w; 3], [y; 3], 8, n, 4096, 0);
+    let batch5 = |[first, other]: [u32; 2]| {
+        let k = KernelHandle(9);
+        dense_gemv_batch5_triple_n(&gpu, k, x, &w, &w, &w, y, y, y, first, other, 4096, 0)
+    };
+    for n in [[32, 128], [128, 128], [4, 4]] {
+        assert!(dense_gemv_triple_fits(n[0], n[1]));
+        batchm(n).unwrap();
+        batch5(n).unwrap();
+        let grid = gpu.launches_snapshot().pop().unwrap().grid;
+        assert_eq!(grid, [n[0].max(n[1]) / 4, 1, 3]);
+        assert!(grid[0] * grid[2] <= DENSE_GEMV_AHEAD_MAX_CTAS);
+    }
+    let launched = gpu.launch_count();
+    for n in [[32, 132], [132, 32], [8192, 8192]] {
+        assert!(!dense_gemv_triple_fits(n[0], n[1]));
+        for refused in [batchm(n), batch5(n)] {
+            let error = refused.unwrap_err().to_string();
+            assert!(error.contains("96 CTAs"), "{error}");
+        }
+    }
+    assert_eq!(gpu.launch_count(), launched);
+}

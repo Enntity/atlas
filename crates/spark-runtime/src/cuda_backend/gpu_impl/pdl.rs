@@ -43,6 +43,10 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "mxfp8_gemv_tc8_grouped",
     "mxfp8_gemv_tc16_grouped",
     "dense_gemv_bf16_batchm",
+    "dense_gemv_bf16_batchm_ahead",
+    "dense_gemv_bf16_batch5",
+    "dense_gemv_bf16_batch5_dual",
+    "dense_gemv_bf16_batch5_triple_n",
     "dense_gemv_bf16_batchm_dual",
     "dense_gemv_bf16_batchm_dual_k128",
     "dense_gemv_bf16_batchm_triple_n",
@@ -72,3 +76,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "kda_commit_records",
     "kda_sigmoid_gated_rms_norm",
 ];
+
+#[cfg(test)]
+#[path = "pdl_tests.rs"]
+mod tests;

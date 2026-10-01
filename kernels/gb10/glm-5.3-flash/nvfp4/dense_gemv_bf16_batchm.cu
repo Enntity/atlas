@@ -21,17 +21,6 @@
 // straight into per-token strided layouts (e.g. the multi-seq qkv buffer,
 // whose rows are `per_seq_qkv` apart, not `N` apart).
 //
-// WHY THIS EXISTS: at decode, Laguna's q/k/v/o and shared-expert projections
-// are BF16 (the checkpoint ships them unquantized and they stay that way), and
-// the BF16 path had no batched tier — only the quantized paths did
-// (w4a16_gemv_batch2/3/4, w8a16_gemv_batch2/4). So every sequence in a decode
-// batch re-read the whole weight matrix, making 54% of the decode step scale
-// linearly with concurrency.
-//
-// A tile-based GEMM is the wrong tool here: at M<=4 an M64-tile GEMM is ~94%
-// padding, and was measured 3.6x SLOWER than the batched GEMV on this exact
-// workload (see the note in multi_seq/qkv.rs::wide_verify_gemm).
-//
 // Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
 
 #include "../../common/atlas_pdl.cuh"
@@ -43,12 +32,62 @@
 #define VEC_SIZE 8   // BF16 values per vectorized load (uint4 = 16 bytes)
 #define MAX_M 8      // compile-time cap on the generic entry point
 
+// Vector kv (8 BF16) of one weight row and of each of the ROWS activation rows.
 template <int ROWS>
+struct BatchmVecs { uint4 b, a[ROWS]; };
+
+template <int ROWS>
+__device__ __forceinline__ void batchm_load(BatchmVecs<ROWS>& v, const uint4* __restrict__ B_vec,
+    const __nv_bfloat16* __restrict__ A, unsigned int K, unsigned int kv) {
+    v.b = B_vec[kv];
+    #pragma unroll
+    for (int t = 0; t < ROWS; t++) v.a[t] = ((const uint4*)(A + (unsigned long long)t * K))[kv];
+}
+
+// The 8 BF16 weights of a vector as floats, in k order (lo then hi per word).
+__device__ __forceinline__ void batchm_unpack(const uint4 b_data, float* bf) {
+    const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        __nv_bfloat16 b_lo, b_hi;
+        *(unsigned short*)&b_lo = (unsigned short)(b_raw[i] & 0xFFFF);
+        *(unsigned short*)&b_hi = (unsigned short)(b_raw[i] >> 16);
+        bf[2 * i] = __bfloat162float(b_lo);
+        bf[2 * i + 1] = __bfloat162float(b_hi);
+    }
+}
+
+// a + the 8 products of one activation vector with its weights, added one at
+// a time in k order — the add order of dense_gemv_bf16: lo then hi, per slot.
+__device__ __forceinline__ float batchm_dot8(float a, const uint4 a_data, const float* bf) {
+    const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        __nv_bfloat16 a_lo, a_hi;
+        *(unsigned short*)&a_lo = (unsigned short)(a_raw[i] & 0xFFFF);
+        *(unsigned short*)&a_hi = (unsigned short)(a_raw[i] >> 16);
+        a += __bfloat162float(a_lo) * bf[2 * i];
+        a += __bfloat162float(a_hi) * bf[2 * i + 1];
+    }
+    return a;
+}
+
+// Exactly ROWS rows, ROWS compile-time: a runtime row count kept the row loop
+// rolled, so each activation row's load waited for the previous row's adds and
+// the M-proportional part was 40-55% of the router / KDA triple at M = 8.
+// AHEAD also issues every load of a K-step one step before its use (the next
+// weight vector from DRAM and the next ROWS activation vectors from L2 are in
+// flight while the lane multiplies the current ones). N = 288, K = 4096, M = 8
+// on GB10: 19.4 us rolled, 14.6 unrolled, 12.5 AHEAD
+// (scripts/dev/dense_gemv_batchm_rows_bench.cu). AHEAD doubles the registers
+// (2 CTAs per SM, not 5): only for grids of at most 96 CTAs. Both modes change
+// only WHEN a vector is loaded — each lane's product chain, the shuffle tree
+// and the cross-warp add are unchanged — so every output is bit-identical.
+template <int ROWS, bool AHEAD>
 __device__ __forceinline__ void dense_gemv_bf16_batchm_impl(
-    const __nv_bfloat16* __restrict__ A,  // [M, K]
+    const __nv_bfloat16* __restrict__ A,  // [ROWS, K]
     const __nv_bfloat16* __restrict__ B,  // [N, K]
     __nv_bfloat16* __restrict__ C,        // rows at C + t*out_stride
-    unsigned int M,
     unsigned int N,
     unsigned int K,
     unsigned int out_stride,               // BF16 elements between output rows
@@ -61,8 +100,6 @@ __device__ __forceinline__ void dense_gemv_bf16_batchm_impl(
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
     if (n >= N) return;
 
-    const unsigned int m = (M > ROWS) ? ROWS : M;
-
     float acc[ROWS];
     #pragma unroll
     for (int t = 0; t < ROWS; t++) acc[t] = 0.0f;
@@ -70,106 +107,56 @@ __device__ __forceinline__ void dense_gemv_bf16_batchm_impl(
     const unsigned int K_VEC = K / VEC_SIZE;
     const uint4* B_vec = (const uint4*)(B + (unsigned long long)n * K);
 
-#if defined(__HIP_PLATFORM_AMD__)
-    // v_dot2_f32_bf16 path: both operands are already packed bf16x2 in the
-    // loaded words — no unpacking at all. Each fdot2 does the two products
-    // and the accumulate in one instruction; at M>=4 the scalar unpack+FMA
-    // chain was issue-bound, not bandwidth-bound. Products are bit-exact
-    // bf16*bf16->f32 (identical to the float path's); only the intra-8
-    // summation grouping differs (2-term dots vs serial adds).
-    // Inline asm, NOT __builtin_amdgcn_fdot2: the builtin resolves its bf16x2
-    // operands to llvm.amdgcn.fdot2(<2 x half>) — v_dot2_f32_F16 — silently
-    // miscompiling bf16 pairs as fp16.
-    // NOTE: an earlier variant software-pipelined the A-row loads into
-    // a_cur/a_next[MAX_M] register arrays — the static MAX_M=8 arrays spilled
-    // to local memory and REGRESSED qkvz 1.24ms -> 3.07ms. Do not prefetch
-    // into per-row arrays here; the loads stay per-iteration.
-    for (unsigned int kv = lane; kv < K_VEC; kv += threads_per_out) {
-        uint4 b_data = B_vec[kv];
-        const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
-
-        for (unsigned int t = 0; t < m; t++) {
-            const uint4* At_vec = (const uint4*)(A + (unsigned long long)t * K);
-            uint4 a_data = At_vec[kv];
-            const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
-            float a = acc[t];
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                asm volatile("v_dot2_f32_bf16 %0, %1, %2, %0"
-                             : "+v"(a) : "v"(a_raw[i]), "v"(b_raw[i]));
-            }
-            acc[t] = a;
-        }
-    }
-#else
-    for (unsigned int kv = lane; kv < K_VEC; kv += threads_per_out) {
+    BatchmVecs<ROWS> cur, nxt;  // AHEAD only
+    unsigned int kv = lane;
+    if (AHEAD && kv < K_VEC) batchm_load<ROWS>(cur, B_vec, A, K, kv);
+    for (; kv < K_VEC; kv += threads_per_out) {
+        const bool more = AHEAD && kv + threads_per_out < K_VEC;
+        if (more) batchm_load<ROWS>(nxt, B_vec, A, K, kv + threads_per_out);
         // ONE weight load feeds every row — this is the whole point.
-        uint4 b_data = B_vec[kv];
-        const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
-
         float bf[8];
+        batchm_unpack(AHEAD ? cur.b : B_vec[kv], bf);
         #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            __nv_bfloat16 b_lo, b_hi;
-            *(unsigned short*)&b_lo = (unsigned short)(b_raw[i] & 0xFFFF);
-            *(unsigned short*)&b_hi = (unsigned short)(b_raw[i] >> 16);
-            bf[2 * i] = __bfloat162float(b_lo);
-            bf[2 * i + 1] = __bfloat162float(b_hi);
-        }
-
-        for (unsigned int t = 0; t < m; t++) {
+        for (int t = 0; t < ROWS; t++) {
             const uint4* At_vec = (const uint4*)(A + (unsigned long long)t * K);
-            uint4 a_data = At_vec[kv];
-            const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
-            float a = acc[t];
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                __nv_bfloat16 a_lo, a_hi;
-                *(unsigned short*)&a_lo = (unsigned short)(a_raw[i] & 0xFFFF);
-                *(unsigned short*)&a_hi = (unsigned short)(a_raw[i] >> 16);
-                // Same add order as dense_gemv_bf16: lo then hi, per vector slot.
-                a += __bfloat162float(a_lo) * bf[2 * i];
-                a += __bfloat162float(a_hi) * bf[2 * i + 1];
-            }
-            acc[t] = a;
+            acc[t] = batchm_dot8(acc[t], AHEAD ? cur.a[t] : At_vec[kv], bf);
         }
+        if (more) cur = nxt;
     }
-#endif
 
     // Scalar tail for K not divisible by VEC_SIZE (never hits for model dims).
-    {
-        const unsigned int tail_start = K_VEC * VEC_SIZE;
-        const __nv_bfloat16* B_row = B + (unsigned long long)n * K;
-        for (unsigned int k = tail_start + lane; k < K; k += threads_per_out) {
-            const float bfv = __bfloat162float(B_row[k]);
-            for (unsigned int t = 0; t < m; t++) {
-                acc[t] += __bfloat162float(A[(unsigned long long)t * K + k]) * bfv;
-            }
+    const unsigned int tail_start = K_VEC * VEC_SIZE;
+    const __nv_bfloat16* B_row = B + (unsigned long long)n * K;
+    for (unsigned int k = tail_start + lane; k < K; k += threads_per_out) {
+        const float bfv = __bfloat162float(B_row[k]);
+        #pragma unroll
+        for (int t = 0; t < ROWS; t++) {
+            acc[t] += __bfloat162float(A[(unsigned long long)t * K + k]) * bfv;
         }
     }
 
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
-
-    for (unsigned int t = 0; t < m; t++) {
-        float a = acc[t];
+    #pragma unroll
+    for (int t = 0; t < ROWS; t++) {
         #pragma unroll
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-            a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+            acc[t] += __shfl_down_sync(0xFFFFFFFF, acc[t], offset);
         }
-        acc[t] = a;
     }
 
     // 2 warps per output: cross-warp reduce via shared memory, per row.
     if (warp_lane == 0) {
         const unsigned int smem_idx = local_out * 2 + (lane / WARP_SIZE);
-        for (unsigned int t = 0; t < m; t++) {
+        #pragma unroll
+        for (int t = 0; t < ROWS; t++) {
             smem[t * (N_PER_BLOCK * 2) + smem_idx] = acc[t];
         }
     }
     __syncthreads();
 
     if (lane == 0) {
-        for (unsigned int t = 0; t < m; t++) {
+        #pragma unroll
+        for (int t = 0; t < ROWS; t++) {
             const unsigned int base = t * (N_PER_BLOCK * 2) + local_out * 2;
             const float r = smem[base] + smem[base + 1];
             C[(unsigned long long)t * out_stride + n] = __float2bfloat16(r);
@@ -177,7 +164,26 @@ __device__ __forceinline__ void dense_gemv_bf16_batchm_impl(
     }
 }
 
-extern "C" __global__ void dense_gemv_bf16_batchm(
+// Runtime M (<= MAX_M, clamped above) onto its exact-row tier.
+#define BATCHM_TIER(R) \
+    case R: dense_gemv_bf16_batchm_impl<R, AHEAD>(A, B, C, N, K, out_stride, smem); break;
+
+template <bool AHEAD>
+__device__ __forceinline__ void dense_gemv_bf16_batchm_rows(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int out_stride, float* __restrict__ smem
+) {
+    switch (M) {
+        case 0: break;
+        BATCHM_TIER(1) BATCHM_TIER(2) BATCHM_TIER(3) BATCHM_TIER(4)
+        BATCHM_TIER(5) BATCHM_TIER(6) BATCHM_TIER(7)
+        default: dense_gemv_bf16_batchm_impl<MAX_M, AHEAD>(A, B, C, N, K, out_stride, smem);
+    }
+}
+
+// The launch bound keeps the eight tiers within the registers of 5 CTAs per SM.
+extern "C" __global__ void __launch_bounds__(BLOCK_SIZE, 5) dense_gemv_bf16_batchm(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
     __nv_bfloat16* __restrict__ C,
@@ -188,12 +194,23 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
 ) {
     atlas_pdl_enter();
     __shared__ float smem[MAX_M * N_PER_BLOCK * 2];
-    dense_gemv_bf16_batchm_impl<MAX_M>(A, B, C, M, N, K, out_stride, smem);
+    dense_gemv_bf16_batchm_rows<false>(A, B, C, M, N, K, out_stride, smem);
 }
 
-// Exact five-row verifier tier. Keeping ROWS compile-time constant avoids the
-// generic M<=8 kernel's three unused accumulator lanes and lets ptxas keep the
-// hot accumulator array register-resident for GLM's K=5 verification batch.
+// Load-ahead tier of dense_gemv_bf16_batchm for small grids (GLM MoE router,
+// N = 288): same arguments, grid and outputs.
+extern "C" __global__ void dense_gemv_bf16_batchm_ahead(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int out_stride
+) {
+    atlas_pdl_enter();
+    __shared__ float smem[MAX_M * N_PER_BLOCK * 2];
+    dense_gemv_bf16_batchm_rows<true>(A, B, C, M, N, K, out_stride, smem);
+}
+
+// Five-row entry points kept for their callers; each is the M = 5 tier of its
+// batchm twin below.
 extern "C" __global__ void dense_gemv_bf16_batch5(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B,
@@ -203,8 +220,9 @@ extern "C" __global__ void dense_gemv_bf16_batch5(
     unsigned int K,
     unsigned int out_stride
 ) {
+    atlas_pdl_enter();
     __shared__ float smem[5 * N_PER_BLOCK * 2];
-    dense_gemv_bf16_batchm_impl<5>(A, B, C, 5, N, K, out_stride, smem);
+    dense_gemv_bf16_batchm_impl<5, false>(A, B, C, N, K, out_stride, smem);
 }
 
 // Two independent exact-five-row BF16 projections with the same [N,K]
@@ -220,18 +238,17 @@ extern "C" __global__ void dense_gemv_bf16_batch5_dual(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     __shared__ float smem[5 * N_PER_BLOCK * 2];
     const bool second = blockIdx.z != 0u;
-    const __nv_bfloat16* A = second ? A1 : A0;
-    const __nv_bfloat16* B = second ? B1 : B0;
-    __nv_bfloat16* C = second ? C1 : C0;
-    dense_gemv_bf16_batchm_impl<5>(A, B, C, 5, N, K, N, smem);
+    dense_gemv_bf16_batchm_impl<5, false>(second ? A1 : A0, second ? B1 : B0, second ? C1 : C0,
+        N, K, N, smem);
 }
 
 // Three exact-five-row BF16 projections sharing one input and K dimension.
 // Plane zero may use a smaller output width (GLM beta); planes one and two
 // cover the equal-width f_a/g_a pair. CTAs beyond a plane's N return inside
-// the unchanged projection body.
+// the projection body. Load-ahead, like its runtime-M twin: a KDA-sized grid.
 extern "C" __global__ void dense_gemv_bf16_batch5_triple_n(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ B0,
@@ -244,18 +261,19 @@ extern "C" __global__ void dense_gemv_bf16_batch5_triple_n(
     unsigned int N12,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     __shared__ float smem[5 * N_PER_BLOCK * 2];
     const unsigned int plane = blockIdx.z;
     const __nv_bfloat16* B = plane == 0u ? B0 : (plane == 1u ? B1 : B2);
     __nv_bfloat16* C = plane == 0u ? C0 : (plane == 1u ? C1 : C2);
     const unsigned int N = plane == 0u ? N0 : N12;
-    dense_gemv_bf16_batchm_impl<5>(A, B, C, 5, N, K, N, smem);
+    dense_gemv_bf16_batchm_impl<5, true>(A, B, C, N, K, N, smem);
 }
 
-// Generic-M (<= MAX_M) twins of the two fused five-row tiers above: each
-// plane runs the unchanged dense_gemv_bf16_batchm body, so it is bit-identical
-// to its own batchm launch; fusing only puts the planes in one grid.
-extern "C" __global__ void dense_gemv_bf16_batchm_dual(
+// Runtime-M (<= MAX_M) twins of the two fused five-row tiers above: each
+// plane runs the dense_gemv_bf16_batchm body, so it is bit-identical to its
+// own batchm launch; fusing only puts the planes in one grid.
+extern "C" __global__ void __launch_bounds__(BLOCK_SIZE, 5) dense_gemv_bf16_batchm_dual(
     const __nv_bfloat16* __restrict__ A0,
     const __nv_bfloat16* __restrict__ A1,
     const __nv_bfloat16* __restrict__ B0,
@@ -269,7 +287,7 @@ extern "C" __global__ void dense_gemv_bf16_batchm_dual(
     atlas_pdl_enter();
     __shared__ float smem[MAX_M * N_PER_BLOCK * 2];
     const bool second = blockIdx.z != 0u;
-    dense_gemv_bf16_batchm_impl<MAX_M>(second ? A1 : A0, second ? B1 : B0, second ? C1 : C0,
+    dense_gemv_bf16_batchm_rows<false>(second ? A1 : A0, second ? B1 : B0, second ? C1 : C0,
         M, N, K, N, smem);
 }
 
@@ -291,13 +309,13 @@ extern "C" __global__ void dense_gemv_bf16_batchm_triple_n(
     const unsigned int plane = blockIdx.z;
     const __nv_bfloat16* B = plane == 0u ? B0 : (plane == 1u ? B1 : B2);
     __nv_bfloat16* C = plane == 0u ? C0 : (plane == 1u ? C1 : C2);
-    dense_gemv_bf16_batchm_impl<MAX_M>(A, B, C, M, plane == 0u ? N0 : N12, K,
+    dense_gemv_bf16_batchm_rows<true>(A, B, C, M, plane == 0u ? N0 : N12, K,
         plane == 0u ? N0 : N12, smem);
 }
 
 // K = 128 tier of dense_gemv_bf16_batchm_dual (GLM KDA f_b/g_b). At K = 128
 // the generic dual feeds 48 of an output's 64 lanes exact zeros through the
-// shuffle tree, a barrier and the cross-warp add: 12-26 us at N = 4096,
+// shuffle tree, a barrier and the cross-warp add: 12-22 us at N = 4096,
 // M = 2..8 on GB10, vs 9.5-10.8 us here and an 8.5 us weight-read floor
 // (scripts/dev/dense_gemv_dual_k128_bench.cu). A 16-lane group owns one
 // output: each lane runs the generic single-slot product chain unchanged, the
@@ -330,31 +348,13 @@ extern "C" __global__ void __launch_bounds__(BLOCK_SIZE) dense_gemv_bf16_batchm_
 
     uint4 b_data = make_uint4(0u, 0u, 0u, 0u);
     if (live) b_data = ((const uint4*)((second ? B1 : B0) + (unsigned long long)n * K))[lane];
-    const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
     float bf[8];
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        __nv_bfloat16 b_lo, b_hi;
-        *(unsigned short*)&b_lo = (unsigned short)(b_raw[i] & 0xFFFF);
-        *(unsigned short*)&b_hi = (unsigned short)(b_raw[i] >> 16);
-        bf[2 * i] = __bfloat162float(b_lo);
-        bf[2 * i + 1] = __bfloat162float(b_hi);
-    }
+    batchm_unpack(b_data, bf);
 
     #pragma unroll
     for (unsigned int t = 0; t < MAX_M; t++) {
         if (t >= m) break;
-        const uint4 a_data = ((const uint4*)(A + (unsigned long long)t * K))[lane];
-        const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
-        float a = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            __nv_bfloat16 a_lo, a_hi;
-            *(unsigned short*)&a_lo = (unsigned short)(a_raw[i] & 0xFFFF);
-            *(unsigned short*)&a_hi = (unsigned short)(a_raw[i] >> 16);
-            a += __bfloat162float(a_lo) * bf[2 * i];
-            a += __bfloat162float(a_hi) * bf[2 * i + 1];
-        }
+        float a = batchm_dot8(0.0f, ((const uint4*)(A + (unsigned long long)t * K))[lane], bf);
         #pragma unroll
         for (int offset = DUAL_K128_LANES / 2; offset > 0; offset >>= 1) {
             a += __shfl_down_sync(0xFFFFFFFF, a, offset, DUAL_K128_LANES);
