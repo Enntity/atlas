@@ -172,6 +172,9 @@ pub struct SequenceState {
     /// The `skip` half of the chunk-0 lookup's return value, replayed verbatim
     /// when `prefix_lookup_applied` short-circuits a retry.
     pub prefix_lookup_skip: bool,
+    /// Token position of this prefill's planned branch-point SSM checkpoint
+    /// (`ATLAS_GLM_PC_BRANCH`; set by the chunk-0 prefix lookup).
+    pub pc_branch_at: Option<usize>,
     /// Contiguous prefix length (in tokens, from position 0) whose paged KV is
     /// guaranteed fully written for THIS sequence — either reused from a valid
     /// prefix-cache match or written by a real prefill pass this turn. Updated
@@ -304,6 +307,7 @@ impl SequenceState {
             prefix_ref_tokens: Vec::new(),
             prefix_lookup_applied: false,
             prefix_lookup_skip: false,
+            pc_branch_at: None,
             kv_valid_tokens: 0,
             last_decode_ckpt_block: 0,
             prompt_len: 0,
