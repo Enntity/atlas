@@ -229,8 +229,11 @@ pub(crate) fn load_dflash_drafter(
         spark_model::weight_loader::dflash_loader::parse_dflash_config(&drafter_config_json)?;
     // Only the head proposes. A worker keeps the drafter's config (its target
     // capture layers shape the verify rows and SSM pools) but no weights, so
-    // no proposer is built there and its memory goes to the KV pool.
-    if args.rank != 0 {
+    // no proposer is built there and its memory goes to the KV pool. Under
+    // ATLAS_GLM_DRAFT_TP the worker reads half of each propose, from the
+    // same weights.
+    let worker_shares = spark_model::layers::dflash_head::rank_split::requested()?.is_some();
+    if args.rank != 0 && !worker_shares {
         tracing::info!(
             "DFlash: rank {} keeps the drafter config only; the head proposes",
             args.rank

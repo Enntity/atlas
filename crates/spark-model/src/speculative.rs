@@ -300,6 +300,14 @@ pub trait DraftProposer: Send + Sync {
         None
     }
 
+    /// Whether a single-sequence [`Self::propose`] handed `comm` (with a
+    /// grammar mask or not) swaps work with the peer rank
+    /// (`ATLAS_GLM_DRAFT_TP`). The model announces such a propose to the
+    /// worker before it calls it.
+    fn rank_split_ready(&self, _comm: &dyn spark_comm::CommBackend, _grammar: bool) -> bool {
+        false
+    }
+
     /// Chain confidence of the most recent `propose` (min top-1 softmax prob
     /// across its drafts), when the proposer computes it (`draft_conf_tau` >
     /// 0). `None` = not computed; callers must not gate on it then.
