@@ -44,9 +44,12 @@ impl TransformerModel {
             // position — a cache/Marconi skip would leave gaps. Force the
             // full-recompute path (documented perf cost, scoring calls only).
             let reserved = reserved_match.is_some();
+            // ATLAS_GLM_DET_TRACE=1 traces every request as a full recompute.
+            let det_recompute = crate::det_trace::begin_request(seq.slot_idx);
             let mut prefix_match = if self.tokens_have_vision_pad(tokens)
                 || seq.collect_prompt_logprobs.is_some()
                 || self.mla_prefill_needs_full_recompute()
+                || (det_recompute && !reserved)
             {
                 PrefixMatch::empty()
             } else if let Some(prefix_match) = reserved_match {

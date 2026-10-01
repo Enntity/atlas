@@ -203,6 +203,14 @@ impl TransformerModel {
             self.lm_head_batched(normed, 1, dst, stream)?;
             dst
         };
+        if !self.use_fp32_logits {
+            // ATLAS_GLM_DET_TRACE: the last prompt position's BF16 logits.
+            let (det, row) = (
+                crate::det_trace::on_stream(self.gpu.as_ref(), stream),
+                (proc_count - 1, 1),
+            );
+            det.tap("logits", logits_ptr, row, self.config.vocab_size * 2);
+        }
 
         // Per-layer divergence dump: full logits vector + top-10 token IDs.
         if let Ok(dir) = std::env::var("ATLAS_NEMO_DUMP")

@@ -257,6 +257,10 @@ impl MoeLayer {
 
         // ── Routed expert path on default stream ──
 
+        // ATLAS_GLM_DET_TRACE stages before routing (the rest are in forward_prefill_finish).
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        let (row, route) = (h as usize * 2, top_k as usize * 4);
+        det.tap("moe_in", input, (0, num_tokens), row);
         // Gemma-4 router pre-norm (no-op for other models).
         let router_in = self.router_input(input, n, h, ctx, stream)?;
         super::dump::dump_gate_input(ctx.gpu, stream, router_in, n, h)?;
@@ -264,6 +268,12 @@ impl MoeLayer {
         let gate_logits = ctx.buffers.gate_logits();
         self.prefill_gate_gemm(router_in, gate_logits, n, num_experts, h, ctx, stream)?;
         super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+        det.tap(
+            "x_gate",
+            gate_logits,
+            (0, num_tokens),
+            num_experts as usize * 2,
+        );
         prof_step!("gate_gemm");
 
         // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
@@ -289,6 +299,8 @@ impl MoeLayer {
             stream,
         )?;
         super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, n, top_k)?;
+        det.tap("rt_ids", indices_dev, (0, num_tokens), route);
+        det.tap("rt_w", weights_dev, (0, num_tokens), route);
         prof_step!("topk");
 
         // 3. Sort tokens by expert → L2-optimized ordering.

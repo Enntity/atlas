@@ -7,15 +7,24 @@ use crate::traits::Model;
 use fixture::*;
 
 fn isolated(name: &str) -> bool {
+    isolated_with(name, None)
+}
+
+/// Re-run `name` in a child process with `ATLAS_GLM_DET_TRACE` set to `det`.
+fn isolated_with(name: &str, det: Option<&str>) -> bool {
     if std::env::var("ATLAS_PREFILL_STREAM_TEST_CHILD").as_deref() == Ok("1") {
         return false;
     }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            &format!("model::trait_impl::prefill_stream_tests::{name}"),
-            "--nocapture",
-        ])
+    // This module's path inside the test binary (it is mounted under `entry`).
+    let path = module_path!().split_once("::").unwrap().1;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    match det {
+        Some(level) => child.env("ATLAS_GLM_DET_TRACE", level),
+        None => child.env_remove("ATLAS_GLM_DET_TRACE"),
+    };
+    let output = child
+        .env_remove("ATLAS_GLM_DET_TRACE_STAGES")
+        .args(["--exact", &format!("{path}::{name}"), "--nocapture"])
         .env("ATLAS_PREFILL_STREAM_TEST_CHILD", "1")
         .env("ATLAS_GLM_MTP_HIDDEN_TRACE", "0")
         .env_remove("ATLAS_NO_MTP_EAGER_DRAFTER")
@@ -24,9 +33,15 @@ fn isolated(name: &str) -> bool {
         .env_remove("ATLAS_DIAG_GEMMA4")
         .env_remove("ATLAS_NEMO_DUMP")
         .env_remove("ATLAS_SSM_SAVE_DUMP")
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "actual entry-point child failed: {name}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // A filter that matches nothing also exits 0: require the one test.
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "actual entry-point child failed: {name}\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     true
 }
 
@@ -161,4 +176,66 @@ fn actual_disabled_capture_owner_keeps_target_path_without_primer() {
         invoke(&mut f, entry).unwrap();
         assert_eq!(f.events(), vec![Event::Target(4, DEFAULT)]);
     }
+}
+
+#[test]
+fn det_trace_numbers_requests_and_labels_each_chunk_and_layer() {
+    let name = "det_trace_numbers_requests_and_labels_each_chunk_and_layer";
+    if isolated_with(name, Some("1")) {
+        return;
+    }
+    let tokens = [1, 2, 3, 4];
+    let mut hashes = Vec::new();
+    for request in 1..=2 {
+        // Rank 1 of the pair; every request is numbered once, at chunk 0.
+        let mut f = Fixture::new(2, 2, 1);
+        f.model
+            .prefill_chunk(&tokens, &mut f.seq, 0, 2, false, CALLER)
+            .unwrap();
+        f.model
+            .prefill_chunk(&tokens, &mut f.seq, 2, 2, true, CALLER)
+            .unwrap();
+        // Each line is its key, then the hash.
+        let (keys, hash): (Vec<String>, Vec<String>) = crate::det_trace::take_lines()
+            .iter()
+            .map(|line| line.rsplit_once(" h=").unwrap())
+            .map(|(key, hash)| (key.to_owned(), hash.to_owned()))
+            .unzip();
+        hashes.push(hash);
+        assert_eq!(
+            keys,
+            [
+                format!("DET r=1 q={request} c=0 L=0 s=emb r0=0 n=2 b=16384"),
+                format!("DET r=1 q={request} c=0 L=1 s=final r0=0 n=2 b=16384"),
+                format!("DET r=1 q={request} c=2 L=0 s=emb r0=0 n=2 b=16384"),
+                format!("DET r=1 q={request} c=2 L=1 s=final r0=0 n=2 b=16384"),
+                format!("DET r=1 q={request} c=2 L=1 s=logits r0=1 n=1 b=16"),
+            ]
+        );
+        // The events the untraced entry point produces, unchanged.
+        assert_eq!(
+            f.events(),
+            vec![
+                Event::Target(2, DEFAULT),
+                Event::Capture(2, DEFAULT),
+                Event::Target(2, DEFAULT),
+                Event::Capture(2, DEFAULT),
+                Event::Primer(3, DEFAULT),
+            ]
+        );
+    }
+    // Same bytes, same hashes; every hash is a value, not an error.
+    assert_eq!(hashes[0], hashes[1]);
+    assert!(hashes[0].iter().all(|h| h.len() == 16));
+}
+
+#[test]
+fn det_trace_is_silent_when_unset() {
+    if isolated("det_trace_is_silent_when_unset") {
+        return;
+    }
+    let mut f = Fixture::new(2, 2, 0);
+    invoke(&mut f, Entry::Chunk).unwrap();
+    assert!(crate::det_trace::take_lines().is_empty());
+    assert!(!crate::det_trace::on());
 }

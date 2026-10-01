@@ -294,6 +294,7 @@ impl TransformerModel {
             }
         };
         let t_proc = tp.elapsed();
+        let _det = crate::det_trace::enter(self.config.ep_rank, seq.slot_idx, proc_start);
 
         // PLE: warm the row cache ahead of the layer-1 gather — the ids are
         // a pure function of `tokens`, so the worker streams rows for every
