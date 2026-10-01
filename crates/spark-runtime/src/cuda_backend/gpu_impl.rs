@@ -48,8 +48,8 @@ use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, HostPitched, KernelHandle};
 use super::host_staging::{d2h_trace_tick, h2d_enqueue, warn_pinned_transient_source};
 
 mod pdl;
-pub use pdl::configure_pdl;
-use pdl::{PDL_KERNELS, pdl_enabled};
+use pdl::PDL_KERNELS;
+pub use pdl::{configure_pdl, pdl_enabled};
 
 impl GpuBackend for AtlasCudaBackend {
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
