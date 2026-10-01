@@ -83,6 +83,18 @@ pub fn build_model(
             dflash: dflash_args.is_some() && lora_args.is_none(),
         },
     )?;
+    // SparkGLM-only: explicit native sparse-MLA module initialization precedes
+    // layers, arena, and the KV free-memory snapshot; requested
+    // load/ABI/configuration failures abort.
+    crate::layers::ops::initialize_glm_sparse_native(
+        &config,
+        max_batch_tokens,
+        max_seq_len,
+        kv_block_size,
+        max_batch_size,
+        kv_dtype,
+        &layer_dtypes,
+    )?;
     crate::layers::ops::initialize_glm_sparse_prefill_pipe(gpu.as_ref(), &config)?;
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated

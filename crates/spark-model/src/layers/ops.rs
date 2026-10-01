@@ -94,6 +94,8 @@ mod glm_indexer_dynamic;
 mod glm_kv_shard;
 #[path = "ops/glm_router_bn4.rs"]
 mod glm_router_bn4;
+#[path = "ops/glm_sparse_native.rs"]
+mod glm_sparse_native;
 #[path = "ops/glm_sparse_prefill_tc.rs"]
 mod glm_sparse_prefill_tc;
 pub use glm_router_bn4::glm_router_bn4;
@@ -269,6 +271,7 @@ pub use glm_hc_prefill::*;
 pub use glm_indexer::*;
 pub use glm_indexer_dynamic::*;
 pub use glm_kv_shard::*;
+pub use glm_sparse_native::*;
 pub use glm_sparse_prefill_tc::*;
 pub use hyper_connection::*;
 pub use hyper_connection_dispatch::*;
