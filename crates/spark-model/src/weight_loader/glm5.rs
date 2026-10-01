@@ -6,6 +6,7 @@ mod components;
 mod dense;
 mod expert_tp;
 mod layers;
+mod mla_twins;
 pub(crate) mod retirement;
 mod tp;
 mod vision;
