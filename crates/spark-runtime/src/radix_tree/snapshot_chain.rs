@@ -55,9 +55,14 @@
 //! linked, evicted after dead history and before any frontier or branch, and
 //! dead history themselves once a deeper checkpoint joins their path.
 //!
-//! Credit: the per-conversation retention and deepest-snapshot-wins ideas
-//! follow Reederey87's prefix-cache policy (Apache-2.0, ideas only, no code),
-//! and branch points follow Marconi (MLSys'25, arXiv:2411.19379).
+//! Credit: placing the deepest reusable state where a lookup can reach it,
+//! and a depth-first, reuse-protected victim order, follow Reederey87's
+//! prefix-cache overlays (Artem Matskevych,
+//! <https://github.com/Reederey87/glm53-flash-exl3-2x-dgx-spark>,
+//! `overlay/patch_apc_tail_boundary.py`, `overlay/cache_tail_evict.py`,
+//! `overlay/patch_cache_hot_protect.py`; Apache-2.0, ideas only, no code),
+//! and branch points follow Marconi (MLSys'25, arXiv:2411.19379). The
+//! chain / superseded / one-protected-slot-per-session policy is ours.
 
 use std::sync::OnceLock;
 

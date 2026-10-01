@@ -22,6 +22,12 @@
 //! `ATLAS_GLM_DRAFT_TP=1` splits every part; `mlp` or `head` (comma separated)
 //! selects parts for an A/B. Both ranks must run the same value
 //! (`model::startup_parity`).
+//!
+//! Prior art: splitting the drafter across both ranks follows MiaAI-Lab's
+//! `DFLASH_DRAFT_TP=2` (<https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks>
+//! `.env.example`, `start.sh`; vLLM `draft_tensor_parallel_size`). Idea only,
+//! no code. The output-row share on 16-row CTA boundaries, swapped over the
+//! RDMA pair with bit-identical drafts, is ours (docs/glm-prior-art.md).
 
 use anyhow::{Result, bail, ensure};
 use spark_runtime::gpu::{GpuBackend, GraphHandle};
