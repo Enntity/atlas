@@ -7,7 +7,7 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::{PagedKvCache, SparseIndexCacheDtype};
 
 use super::super::Qwen3AttentionLayer;
-use super::glm_index_split::{self, IndexSplit};
+use super::glm_index_split::{self, IndexSplit, OwnerRows};
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
@@ -353,14 +353,16 @@ impl Qwen3AttentionLayer {
             tiles += 1;
         }
         if let Some(split) = split {
-            split.exchange(
+            let owner = OwnerRows {
                 selected,
+                row_bytes: output_row_bytes,
                 scratch,
-                output_row_bytes,
-                self.attn_layer_idx,
-                ctx,
-                stream,
-            )?;
+                inputs: [
+                    (index_query, n as usize * query_row_bytes),
+                    (weights, n as usize * weights_row_bytes),
+                ],
+            };
+            split.exchange(&owner, self.attn_layer_idx, ctx, stream)?;
         }
         let exchange_us = profile_lap(ctx, stream, &mut profile)?;
         if profile.is_some() {
