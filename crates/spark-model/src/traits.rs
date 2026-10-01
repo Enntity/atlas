@@ -175,6 +175,8 @@ pub struct SequenceState {
     /// Token position of this prefill's planned branch-point SSM checkpoint
     /// (`ATLAS_GLM_PC_BRANCH`; set by the chunk-0 prefix lookup).
     pub pc_branch_at: Option<usize>,
+    /// Rolling end-of-turn SSM snapshot (`ATLAS_GLM_PC_FINISH_LEAF`).
+    pub(crate) finish_leaf: crate::model::trait_impl::finish_leaf::LeafCell,
     /// Contiguous prefix length (in tokens, from position 0) whose paged KV is
     /// guaranteed fully written for THIS sequence — either reused from a valid
     /// prefix-cache match or written by a real prefill pass this turn. Updated
@@ -308,6 +310,7 @@ impl SequenceState {
             prefix_lookup_applied: false,
             prefix_lookup_skip: false,
             pc_branch_at: None,
+            finish_leaf: Default::default(),
             kv_valid_tokens: 0,
             last_decode_ckpt_block: 0,
             prompt_len: 0,

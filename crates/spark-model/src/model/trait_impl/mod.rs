@@ -30,6 +30,7 @@ mod decode_graph_key;
 pub(super) mod drafter_prefill;
 mod entry;
 mod ep_misc;
+pub(crate) mod finish_leaf;
 mod graph_borrow;
 mod lm_head_batched;
 mod lm_head_dp4a;
@@ -150,7 +151,9 @@ impl Model for TransformerModel {
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
         self.stamp_overlay_route(seq.adapter_slot);
         self.stamp_decode_moe_single(seq.adapter_slot);
-        self.decode_dispatch(token, seq, _stream)
+        let logits = self.decode_dispatch(token, seq, _stream)?;
+        self.finish_leaf_after_decode(seq);
+        Ok(logits)
     }
     fn decode_batch(
         &self,
@@ -169,6 +172,8 @@ impl Model for TransformerModel {
             // refused concurrent request would otherwise brick the server). The
             // batched path captures on the default stream (decode_a2).
             self.gpu.abort_capture_if_active(self.gpu.default_stream());
+        } else {
+            seqs.iter().for_each(|s| self.finish_leaf_after_decode(s));
         }
         r
     }

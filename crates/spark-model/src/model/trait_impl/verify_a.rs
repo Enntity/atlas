@@ -329,7 +329,7 @@ impl TransformerModel {
         if self.ssm_pool.kda_record_row_bytes != 0 {
             let stream = self.gpu.default_stream();
             if num_accepted > 0 {
-                return self.commit_kda_records(seq, num_accepted, true, stream);
+                return self.commit_kda_records(seq, 0..num_accepted, true, stream);
             }
             let conv_bytes = self.config.ssm_conv_state_bytes();
             let mut conv_plan = Vec::new();
