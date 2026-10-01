@@ -162,27 +162,24 @@ impl NcclBackend {
 
     /// The RDMA pair for a 2-rank world when `ATLAS_RDMA_ALLREDUCE=1`. Its
     /// bootstrap stays on the link of the NCCL bootstrap connection
-    /// (`peers`): rank 0 listens on the address the worker reached it at and
-    /// admits only the worker's address. Rank 0's own `--master-addr` is not
-    /// consulted: it never was, and may be a hostname or left at its default.
+    /// (`peers`; see `bootstrap::Link::of`).
     #[cfg(atlas_rdma_verbs)]
     pub(super) fn connect_rdma(
         rank: usize,
         world_size: usize,
         peers: &[std::net::TcpStream],
+        master_addr: &str,
         master_port: u16,
         recv_capacity: usize,
     ) -> Result<Option<rdma_pair::RdmaPair>> {
         // Port +1 is the reconnect bootstrap; +2 carries the RDMA identities.
         let rdma = if world_size == 2 && rdma_pair::RdmaPair::requested() {
-            let (own, peer) = (peers[0].local_addr()?.ip(), peers[0].peer_addr()?.ip());
-            let (head, worker) = if rank == 0 { (own, peer) } else { (peer, own) };
+            let port = master_port.wrapping_add(2);
+            let link = rdma_pair::bootstrap::Link::of(rank, &peers[0], port, master_addr)?;
             Some(rdma_pair::RdmaPair::connect(
                 rank,
-                head,
-                master_port.wrapping_add(2),
+                &link,
                 recv_capacity.next_multiple_of(64),
-                Some(worker),
             )?)
         } else {
             None

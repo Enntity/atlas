@@ -131,8 +131,12 @@ fn ranks() -> Option<(Gpu, Vec<RdmaPair>)> {
             .map(|rank| {
                 s.spawn(move || {
                     ck!(cuCtxSetCurrent(ctx));
-                    let head = std::net::Ipv4Addr::LOCALHOST.into();
-                    RdmaPair::connect(rank, head, port, 4 << 20, None).unwrap()
+                    let link = crate::nccl_backend::rdma_pair::bootstrap::Link {
+                        at: (std::net::Ipv4Addr::LOCALHOST, port).into(),
+                        worker: None,
+                        lifeline: None,
+                    };
+                    RdmaPair::connect(rank, &link, 4 << 20).unwrap()
                 })
             })
             .collect();
