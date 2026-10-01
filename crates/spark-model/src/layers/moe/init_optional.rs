@@ -54,6 +54,28 @@ pub(super) struct OptionalKernels {
     pub(super) moe_gate_topk_fused_k: KernelHandle,
 }
 
+/// The batched router-logits GEMV (`dense_gemv_bf16_batchm` arguments and
+/// grid), or 0. GLM's 288-expert router takes the bit-identical load-ahead
+/// tier when the target ships it and its grid of `num_experts / 4` CTAs fits
+/// that tier; no other target is asked for that symbol.
+pub(super) fn router_gemv_batchm(
+    gpu: &dyn GpuBackend,
+    config: &atlas_core::config::ModelConfig,
+) -> KernelHandle {
+    let module = "dense_gemv_bf16_batchm";
+    let ahead = super::super::try_kernel_gated(
+        config.model_type == "glm5_next"
+            && config.num_experts.div_ceil(4) <= ops::DENSE_GEMV_AHEAD_MAX_CTAS as usize,
+        gpu,
+        module,
+        "dense_gemv_bf16_batchm_ahead",
+    );
+    if ahead.0 != 0 {
+        return ahead;
+    }
+    super::super::try_kernel(gpu, module, "dense_gemv_bf16_batchm")
+}
+
 impl OptionalKernels {
     pub(super) fn resolve(gpu: &dyn GpuBackend, config: &atlas_core::config::ModelConfig) -> Self {
         let k128w = config.model_type == "glm5_next"
