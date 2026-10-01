@@ -10,6 +10,18 @@ pub(super) fn parse_toggle(value: Option<&str>) -> Result<bool> {
     }
 }
 
+/// `ATLAS_GLM_C2_COMPACT_MOE=1`: a two-sequence decode runs this MoE once
+/// over both rows, so one EP reduce instead of one a row. Both ranks must run
+/// the same value (`model::startup_parity`).
+pub(crate) fn c2_compact_requested() -> Result<bool> {
+    let toggle = match std::env::var("ATLAS_GLM_C2_COMPACT_MOE") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    parse_toggle(toggle.as_deref())
+}
+
 impl MoeLayer {
     pub(crate) fn c2_compact_enabled(&self) -> bool {
         self.c2_compact_moe

@@ -28,9 +28,13 @@ use crate::layers::qwen3_attention::HcWeights;
 use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use crate::weight_map::DenseWeight;
 
+pub(crate) use multi_seq::enabled as kda_multi_seq_enabled;
 pub use projection::{Glm5KdaWeights, Glm5Projection};
 
-fn verify_batched_ffn_enabled() -> bool {
+/// `ATLAS_GLM_KDA_BATCHED_FFN=1`: one FFN pass over a verify block's or a
+/// decode batch's rows, so one EP reduce of every row instead of one a row.
+/// Both ranks must run the same value (`model::startup_parity`).
+pub(crate) fn kda_batched_ffn_enabled() -> bool {
     std::env::var("ATLAS_GLM_KDA_BATCHED_FFN").ok().as_deref() == Some("1")
 }
 

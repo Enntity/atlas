@@ -51,8 +51,7 @@ pub(crate) fn load_weight_store(
 ) -> Result<spark_runtime::weights::WeightStore> {
     use spark_runtime::weights::WeightLoader;
     let mult = quant_multiplier(config);
-    let glm_mtp_distributed =
-        std::env::var("ATLAS_GLM_MTP_DISTRIBUTED").ok().as_deref() == Some("1");
+    let glm_mtp_distributed = spark_model::speculative::glm_repair_policy::mtp_distributed();
     let unused_mtp_prefix = unused_glm_mtp_prefix(config, args.speculative);
     if glm_mtp_distributed {
         anyhow::ensure!(

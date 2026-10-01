@@ -151,12 +151,18 @@ fn tail_lease_ttl() -> u32 {
 /// clamped to [0, 8] so a runaway env value cannot make depth
 /// recency-insensitive (a depth-pinned analog of the 07-10 hit-pinning).
 /// Default flip requires its own measured A/B: ATLAS_SNAP_EVICT_ALPHA.
-fn snap_evict_alpha() -> f64 {
+pub fn snap_evict_alpha() -> f64 {
     std::env::var("ATLAS_SNAP_EVICT_ALPHA")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .map(|a| a.clamp(0.0, 8.0))
         .unwrap_or(0.0)
+}
+
+/// `ATLAS_SNAP_EVICT_LEGACY` (presence): the old per-entry victim choice
+/// instead of the session-aware one.
+pub fn snap_evict_legacy() -> bool {
+    std::env::var_os("ATLAS_SNAP_EVICT_LEGACY").is_some()
 }
 
 impl SsmSnapshotIndex {
@@ -320,7 +326,7 @@ impl SsmSnapshotIndex {
         // one and takes precedence over ATLAS_SNAP_EVICT_LEGACY and the tail
         // lease (`snapshot_chain`: a chain frontier is protected anyway).
         let chain = super::snapshot_chain::glm_pc_evict_enabled();
-        if chain || std::env::var_os("ATLAS_SNAP_EVICT_LEGACY").is_none() {
+        if chain || !snap_evict_legacy() {
             // Skip tiered entries (no HBM slot to free).
             let victim_idx = if chain {
                 self.chain_victim(true)?

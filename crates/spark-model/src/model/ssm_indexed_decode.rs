@@ -75,7 +75,7 @@ pub(crate) fn prepare_runtime<'a>(
             &model.config,
             model.comm.as_ref().map_or(0, |c| c.world_size()),
             model.proposer.is_none() && !model.self_speculative,
-            std::env::var("ATLAS_GLM_KDA_MULTI_SEQ").as_deref() == Ok("1"),
+            crate::layers::kda_multi_seq_enabled(),
             rows,
             padded_rows,
         )

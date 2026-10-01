@@ -46,13 +46,7 @@ impl TransformerModel {
         {
             return;
         }
-        // Block-count between decode checkpoints. Env-tunable (no rebuild) so
-        // the cadence/drift tradeoff can be swept; default 4 blocks = 64 tok.
-        let interval = std::env::var("ATLAS_DECODE_CKPT_BLOCKS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(4);
+        let interval = crate::model::mtp_carry::decode_ckpt_blocks();
         let mut kv = self.kv_cache.lock();
         let bs = kv.block_size();
         // Derive the block count from tokens.len() (what we slice + cache),

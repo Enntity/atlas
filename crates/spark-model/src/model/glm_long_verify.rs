@@ -32,7 +32,8 @@ use spark_runtime::gpu::DevicePtr;
 
 mod diag;
 mod ep;
-use diag::{oracle_enabled, serial_diagnostic, write_window_aliases};
+use diag::write_window_aliases;
+pub(super) use diag::{oracle_enabled, serial_diagnostic};
 pub(super) const EP_CMD_GLM_LONG_VERIFY: u32 = 0xFFFF_FFE9;
 pub(super) const EP_CMD_GLM_LONG_TAIL: u32 = 0xFFFF_FFEA;
 

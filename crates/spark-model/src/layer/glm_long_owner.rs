@@ -259,7 +259,7 @@ fn rows_ffn(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum FfnMode {
+pub(crate) enum FfnMode {
     /// Default: at K3 routed MoE jointly through the exact C3 grouped
     /// arithmetic and dense FFN layers per owner; other widths jointly (see
     /// [`ffn_per_owner`]).
@@ -272,8 +272,10 @@ enum FfnMode {
     Prefill,
 }
 
-/// `ATLAS_GLM_LONG_BATCH_FFN=grouped|owner|prefill`.
-fn ffn_mode() -> FfnMode {
+/// `ATLAS_GLM_LONG_BATCH_FFN=grouped|owner|prefill`. Both ranks must run the
+/// same mode (`model::startup_parity`): `owner` issues one EP reduce an owner
+/// where the others issue one for every row.
+pub(crate) fn ffn_mode() -> FfnMode {
     static MODE: std::sync::OnceLock<FfnMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("ATLAS_GLM_LONG_BATCH_FFN").as_deref() {

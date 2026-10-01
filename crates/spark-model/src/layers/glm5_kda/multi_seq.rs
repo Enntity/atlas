@@ -15,12 +15,11 @@ use super::Glm5KdaLayer;
 use crate::layer::{ForwardContext, LayerState, SsmLayerState};
 use crate::layers::ops;
 
-pub(super) fn enabled() -> bool {
+/// `ATLAS_GLM_KDA_MULTI_SEQ=1`: a 2- or 3-sequence decode step runs this
+/// layer once over every row (one TP reduce of all rows) instead of once a
+/// sequence. Both ranks must run the same value (`model::startup_parity`).
+pub(crate) fn enabled() -> bool {
     std::env::var("ATLAS_GLM_KDA_MULTI_SEQ").ok().as_deref() == Some("1")
-}
-
-fn batched_ffn_enabled() -> bool {
-    std::env::var("ATLAS_GLM_KDA_BATCHED_FFN").ok().as_deref() == Some("1")
 }
 
 impl Glm5KdaLayer {
@@ -345,7 +344,7 @@ impl Glm5KdaLayer {
         } else if n == 4 {
             let output = self.ffn.forward_c4(normed, ctx, stream)?;
             self.hc_post(output, m, ctx, stream)?;
-        } else if batched_ffn_enabled() && n == 3 {
+        } else if super::kda_batched_ffn_enabled() && n == 3 {
             self.ffn.forward_k3(normed, ctx, stream)?;
             self.hc_post(ctx.buffers.moe_output(), m, ctx, stream)?;
         } else {

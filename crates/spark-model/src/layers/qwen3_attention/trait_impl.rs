@@ -13,6 +13,9 @@ use crate::layers::FfnComponent;
 mod decode_inner;
 mod diag;
 mod multi_seq;
+pub(crate) use multi_seq::{
+    grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
+};
 mod prefill_inner;
 mod prefill_inner_glm;
 pub(super) use diag::diag_norm;
