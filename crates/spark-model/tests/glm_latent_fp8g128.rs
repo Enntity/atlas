@@ -109,7 +109,7 @@ fn writer_packs_values_then_scales_per_block_within_e4m3_rounding() -> Result<()
 
 fn kv_pad(
     gpu: &dyn GpuBackend,
-    symbol: &str,
+    (symbol, shared_mem): (&str, u32),
     [q, cache, indices, out, table]: [DevicePtr; 5],
     rows: u32,
 ) -> Result<()> {
@@ -119,7 +119,7 @@ fn kv_pad(
     )
     .grid([1, rows, 1])
     .block([256, 1, 1])
-    .shared_mem(69376)
+    .shared_mem(shared_mem)
     .arg_ptr(q)
     .arg_ptr(cache)
     .arg_ptr(cache)
@@ -137,10 +137,13 @@ fn kv_pad(
 
 #[test]
 #[ignore = "requires an available GB10 GPU and compiled kernels; no model weights"]
-fn fp8_kv_pad_is_bit_identical_to_bf16_kv_pad_on_the_dequantized_view() -> Result<()> {
+fn fp8_kv_pad_and_pipe_are_bit_identical_to_bf16_kv_pad_on_the_dequantized_view() -> Result<()> {
     let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let stream = gpu.default_stream();
-    let (tokens, blocks, rows) = (2600usize, 163usize, 3usize);
+    // Rows 0-2 select a full 2048; rows 3-6 are early-context rows at
+    // positions 0/5/37/1001, mostly -1 with whole invalid tiles.
+    let early = [0usize, 5, 37, 1001];
+    let (tokens, blocks, rows) = (2600usize, 163usize, 3 + early.len());
     let bf16 = |v: f32| ((bf16_round(v).to_bits() >> 16) as u16).to_le_bytes();
     let hash = |a: usize, b: usize| ((a * 2654435761 + b * 40503) % 10007) as f32 / 10007.0 - 0.5;
     let latents: Vec<u8> = (0..tokens)
@@ -158,18 +161,26 @@ fn fp8_kv_pad_is_bit_identical_to_bf16_kv_pad_on_the_dequantized_view() -> Resul
     let queries: Vec<u8> = (0..rows * 32 * 512)
         .flat_map(|i| bf16(hash(i, 7) * 0.25))
         .collect();
-    // Each row selects 2048 distinct tokens (stride-coprime walk) and three -1 pads.
+    // Full rows select 2048 distinct tokens (stride-coprime walk) and three -1
+    // pads; an early row at p selects its whole pools, -1 pads, then the tail.
+    let select = |r: usize, j: usize| -> i32 {
+        if r < 3 {
+            return if j < 2048 {
+                ((j * 1031 + r * 17) % tokens) as i32
+            } else {
+                -1
+            };
+        }
+        let p = early[r - 3];
+        let pooled = (p + 1) / 4 * 4;
+        match j {
+            j if j < pooled => j as i32,
+            j if j >= 2048 && pooled + j - 2048 <= p => (pooled + j - 2048) as i32,
+            _ => -1,
+        }
+    };
     let indices: Vec<u8> = (0..rows)
-        .flat_map(|r| {
-            (0..2051).flat_map(move |j| {
-                let id = if j < 2048 {
-                    ((j * 1031 + r * 17) % tokens) as i32
-                } else {
-                    -1
-                };
-                id.to_le_bytes()
-            })
-        })
+        .flat_map(|r| (0..2051).flat_map(move |j| select(r, j).to_le_bytes()))
         .collect();
     let key = upload(&gpu, &latents)?;
     let slot = upload(&gpu, &slots)?;
@@ -186,6 +197,7 @@ fn fp8_kv_pad_is_bit_identical_to_bf16_kv_pad_on_the_dequantized_view() -> Resul
     )?;
     let out_bf16 = gpu.alloc(rows * 32 * 1024)?;
     let out_fp8 = gpu.alloc(rows * 32 * 1024)?;
+    let out_pipe = gpu.alloc(rows * 32 * 1024)?;
     ops::glm_latent_cache_write_fp8g128(
         &gpu,
         gpu.kernel("reshape_and_cache", "glm_latent_cache_write_fp8g128")?,
@@ -209,19 +221,28 @@ fn fp8_kv_pad_is_bit_identical_to_bf16_kv_pad_on_the_dequantized_view() -> Resul
     )?;
     kv_pad(
         &gpu,
-        "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad",
+        ("glm_sparse_mla_prefill_bf16_head32_tc_kv_pad", 69376),
         [q, view, ids, out_bf16, identity],
         rows as u32,
     )?;
     kv_pad(
         &gpu,
-        "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad",
+        ("glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad", 69376),
         [q, cache, ids, out_fp8, table],
+        rows as u32,
+    )?;
+    kv_pad(
+        &gpu,
+        ("glm_sparse_mla_prefill_fp8g128_head32_tc_pipe", 80128),
+        [q, cache, ids, out_pipe, table],
         rows as u32,
     )?;
     let (mut a, mut b) = (vec![0u8; rows * 32 * 1024], vec![0u8; rows * 32 * 1024]);
     gpu.copy_d2h_on_stream(out_bf16, &mut a, stream)?;
     gpu.copy_d2h_on_stream(out_fp8, &mut b, stream)?;
+    let mut c = vec![0u8; rows * 32 * 1024];
+    gpu.copy_d2h_on_stream(out_pipe, &mut c, stream)?;
+    ensure!(b == c, "fp8 pipe differs from fp8 kv_pad");
     ensure!(a.iter().any(|&x| x != 0), "attention output is all zero");
     ensure!(
         a == b,
@@ -239,7 +260,7 @@ fn fp8_kv_pad_is_bit_identical_to_bf16_kv_pad_on_the_dequantized_view() -> Resul
         );
     }
     for p in [
-        key, slot, table, q, ids, cache, view, identity, out_bf16, out_fp8,
+        key, slot, table, q, ids, cache, view, identity, out_bf16, out_fp8, out_pipe,
     ] {
         gpu.free(p)?;
     }
