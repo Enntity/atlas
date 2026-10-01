@@ -13,6 +13,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
+
+#include "atlas_stale_cuda_error.h"
 #include <vector>
 
 #include "cute/tensor.hpp"
@@ -297,6 +299,7 @@ extern "C" int atlas_cutlass_pack_weight_sfb(
     int k,
     int src_n_major,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   if (n <= 0 || k <= 0 || (k % 16) != 0) {
     return -1;
@@ -622,6 +625,7 @@ extern "C" int atlas_cutlass_nvfp4_grouped_gate_up_fused(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   if (n <= 0 || k <= 0 || (k % 16) != 0 || num_experts <= 0) {
     return -1;
@@ -686,6 +690,7 @@ extern "C" int atlas_cutlass_nvfp4_grouped_down(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   if (n <= 0 || k <= 0 || (k % 16) != 0 || num_experts <= 0) {
     return -1;

@@ -2,6 +2,8 @@
 
 #include <cuda_runtime_api.h>
 
+#include "atlas_stale_cuda_error.h"
+
 #include <cublasLt.h>
 
 #include "cutlass/bfloat16.h"
@@ -60,8 +62,7 @@ int atlas_cutlass_bf16_gemm_act_weight_t_impl(
   if (status != cutlass::Status::kSuccess) {
     return static_cast<int>(status);
   }
-  status = gemm(stream);
-  return static_cast<int>(status);
+  return atlas_launch_status(static_cast<int>(gemm(stream)));
 }
 
 extern "C" int atlas_cutlass_bf16_gemm_act_weight_t(
@@ -74,6 +75,7 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<128, 128, 32, 64, 64, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
 }
@@ -88,6 +90,7 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t_128x256(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<128, 256, 32, 64, 64, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
 }
@@ -102,6 +105,7 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t_256x128(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<256, 128, 32, 64, 64, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
 }
@@ -116,6 +120,7 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t_64x128(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<64, 128, 32, 32, 64, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
 }
@@ -130,6 +135,7 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t_128x64(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<128, 64, 32, 64, 32, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
 }
@@ -144,6 +150,7 @@ extern "C" int atlas_cutlass_bf16_gemm_act_weight_t_64x64(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_gemm_act_weight_t_impl<64, 64, 32, 32, 32, 32>(
       act, weight, out, m, n, k, workspace, workspace_size, stream);
 }
@@ -204,7 +211,7 @@ int atlas_cutlass_bf16_grouped_impl(
   if (status != cutlass::Status::kSuccess) {
     return static_cast<int>(status);
   }
-  return static_cast<int>(gemm(stream));
+  return atlas_launch_status(static_cast<int>(gemm(stream)));
 }
 
 extern "C" int atlas_cutlass_bf16_grouped_gemm_act_weight_t(
@@ -218,6 +225,7 @@ extern "C" int atlas_cutlass_bf16_grouped_gemm_act_weight_t(
     int a_stride,
     int c_stride,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   return atlas_cutlass_bf16_grouped_impl<128, 128, 32, 64, 64, 32, 3>(
       act, weight, out, m, g, n, k, a_stride, c_stride, stream);
 }
@@ -269,7 +277,7 @@ int atlas_cutlass_bf16_tuned_impl(
   if (status != cutlass::Status::kSuccess) {
     return static_cast<int>(status);
   }
-  return static_cast<int>(gemm(stream));
+  return atlas_launch_status(static_cast<int>(gemm(stream)));
 }
 
 extern "C" int atlas_cutlass_bf16_gemm_tuned(
@@ -283,6 +291,7 @@ extern "C" int atlas_cutlass_bf16_gemm_tuned(
     int ldc,
     int config,
     cudaStream_t stream) {
+  atlas_drain_stale_cuda_error();
   switch (config) {
     case 0:
       return atlas_cutlass_bf16_tuned_impl<128, 128, 32, 64, 64, 32, 4, 1>(
@@ -438,4 +447,13 @@ extern "C" int atlas_cublaslt_bf16_gemm_act_weight_t_algo(
       stream);
   cleanup();
   return static_cast<int>(st);
+}
+
+// Stale sticky errors the wrappers drained: the count so far and the most
+// recent code (see atlas_stale_cuda_error.h).
+extern "C" unsigned long long atlas_cuda_stale_error_stats(int* last_code) {
+  if (last_code != nullptr) {
+    *last_code = atlas_stale_cuda_error_last.load(std::memory_order_relaxed);
+  }
+  return atlas_stale_cuda_error_count.load(std::memory_order_relaxed);
 }
