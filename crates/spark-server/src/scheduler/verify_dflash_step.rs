@@ -294,6 +294,27 @@ pub(super) fn verify_dflash_tail(
         }
     }
 
+    // Item #2 (STree-style in-place verify commit). h_state is canonical:
+    //  - num_accepted == k_verify (full accept): no-op (h_state already correct)
+    //  - 0 < num_accepted < k_verify (partial): intermediate[total_accepted-1] → h_state
+    // No checkpoint write needed — the next start_checkpoint_async syncs.
+    //
+    // k_verify = drafts.len() + 1 (the prefix bonus position is also verified).
+    //
+    // Committed BEFORE emission: an emit below can finish the sequence and
+    // return, and `finish_sequence` then caches `seq.tokens` with the live
+    // recurrent state. The worker rank has already committed these rows (it
+    // acts on the verdict word above), so a head that returned first kept a
+    // state that matched neither `seq.tokens` nor the other rank.
+    let k_verify = drafts.len() + 1;
+    let total_accepted = num_accepted + 1; // bonus is always "accepted"
+    if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
+        tracing::error!("commit_accepted_prefix (dflash): {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
+        a.finished = true;
+        return None;
+    }
+
     // Emit accepted drafts.
     for i in 0..num_accepted {
         emit_token(a, drafts[i], verify_lps.get(i).cloned(), sched);
@@ -337,21 +358,6 @@ pub(super) fn verify_dflash_tail(
         100.0 * (num_accepted as f64) / (drafts.len() as f64),
         a.seq.seq_len,
     );
-
-    // Item #2 (STree-style in-place verify commit). h_state is canonical:
-    //  - num_accepted == k_verify (full accept): no-op (h_state already correct)
-    //  - 0 < num_accepted < k_verify (partial): intermediate[total_accepted-1] → h_state
-    // No checkpoint write needed — the next start_checkpoint_async syncs.
-    //
-    // k_verify = drafts.len() + 1 (the prefix bonus position is also verified).
-    let k_verify = drafts.len() + 1;
-    let total_accepted = num_accepted + 1; // bonus is always "accepted"
-    if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
-        tracing::error!("commit_accepted_prefix (dflash): {e:#}");
-        a.engine_error = Some(format!("{e:#}"));
-        a.finished = true;
-        return None;
-    }
 
     // DFlash hidden is captured per-layer inside the verify graph
     // (verify_d.rs try_dflash_capture at position k-1), mirroring verify_b.rs.

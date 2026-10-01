@@ -90,6 +90,9 @@ impl TransformerModel {
             );
         }
 
+        // ATLAS_GLM_PC_FINISH_LEAF: the slot may have been a finish leaf a
+        // moment ago, with its copy still in flight on another stream.
+        self.finish_leaf_wait_copies(stream)?;
         let snap_result = match self.ssm_snapshots.save(
             seq.slot_idx,
             seq.session_hash,
@@ -136,6 +139,7 @@ impl TransformerModel {
         let Some(snap_id) = snap_result else {
             return Ok(());
         };
+        self.finish_leaf_record_copy(stream)?;
         // Aux (PLE n-gram history/conv + QSA indexer keys) rides the
         // checkpoint. This boundary is a completed pass end, so the lexical
         // state is position-correct at `end_token` by construction. Without

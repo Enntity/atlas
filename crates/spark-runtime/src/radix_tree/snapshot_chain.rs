@@ -51,6 +51,10 @@
 //! `ATLAS_SNAP_EVICT_LEGACY`, and the tail lease is not consulted: tail
 //! entries are never linked, so they rank as protected frontiers anyway.
 //!
+//! Finish leaves (`snapshot_leaf`) are a third class between the two: never
+//! linked, evicted after dead history and before any frontier or branch, and
+//! dead history themselves once a deeper checkpoint joins their path.
+//!
 //! Credit: the per-conversation retention and deepest-snapshot-wins ideas
 //! follow Reederey87's prefix-cache policy (Apache-2.0, ideas only, no code),
 //! and branch points follow Marconi (MLSys'25, arXiv:2411.19379).
@@ -78,7 +82,24 @@ pub(super) struct ChainMeta {
     pub superseded: bool,
     /// Continuations diverge at or after this snapshot.
     pub branch: bool,
+    /// A finish leaf (`snapshot_leaf`): never linked, never a parent.
+    pub leaf: bool,
 }
+
+impl ChainMeta {
+    /// Eviction class, lowest first: [`DEAD`] history (superseded, not a
+    /// branch point), finish leaves, then chain frontiers and branch points.
+    pub(super) fn class(&self) -> u8 {
+        match (self.superseded && !self.branch, self.leaf) {
+            (true, _) => DEAD,
+            (false, true) => DEAD + 1,
+            (false, false) => DEAD + 2,
+        }
+    }
+}
+
+/// The eviction class of superseded history.
+pub(super) const DEAD: u8 = 0;
 
 impl SsmSnapshotIndex {
     /// [`Self::link_chain`] when `ATLAS_GLM_PC_EVICT=1`, else nothing.
@@ -111,7 +132,14 @@ impl SsmSnapshotIndex {
                 .iter()
                 .fold(h, |h, &t| prefix_hash_push(h, t));
             at = depth;
-            if h == self.entries[i].prefix_hash {
+            if h != self.entries[i].prefix_hash {
+                continue;
+            }
+            if self.entries[i].chain.leaf {
+                // A finish leaf is no parent (it would shadow the checkpoint
+                // below it); under a deeper checkpoint it has served its turn.
+                self.entries[i].chain.superseded = true;
+            } else {
                 parent = Some(i); // sorted ascending: the last hit is the deepest
             }
         }
@@ -149,18 +177,16 @@ impl SsmSnapshotIndex {
         }
     }
 
-    /// Chain-aware victim: superseded non-branch entries first, then
-    /// frontiers and branch points; least recently used within each class.
-    /// `last_access` values are unique, so the choice is total.
+    /// Chain-aware victim: superseded non-branch entries first, then finish
+    /// leaves, then frontiers and branch points ([`ChainMeta::class`]); least
+    /// recently used within each class. `last_access` values are unique, so
+    /// the choice is total.
     pub(super) fn chain_victim(&self, skip_tiered: bool) -> Option<usize> {
         self.entries
             .iter()
             .enumerate()
             .filter(|(_, e)| !(skip_tiered && e.tiered))
-            .min_by_key(|(_, e)| {
-                let protected = !e.chain.superseded || e.chain.branch;
-                (protected, e.last_access)
-            })
+            .min_by_key(|(_, e)| (e.chain.class(), e.last_access))
             .map(|(i, _)| i)
     }
 

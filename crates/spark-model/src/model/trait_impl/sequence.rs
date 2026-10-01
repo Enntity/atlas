@@ -34,6 +34,7 @@ mod sequence_graphs;
 
 impl TransformerModel {
     pub(super) fn cache_sequence_dispatch(&self, seq: &SequenceState) {
+        self.finish_leaf_mirror_cache(seq);
         let bs = self.kv_cache.lock().block_size();
         // Only cache if the sequence has block-aligned content worth caching.
         // Sequences shorter than one block have no reusable KV blocks.
@@ -63,6 +64,10 @@ impl TransformerModel {
                 // the next warm hit restores at this turn's END and replays
                 // ~nothing. Save logic + the secondary-stream ordering guard
                 // live in decode_checkpoint.rs (finish_leaf_snapshot).
+                // ATLAS_GLM_PC_FINISH_LEAF caches through finish_leaf.rs instead.
+                if super::finish_leaf::enabled() {
+                    return self.finish_leaf_cache(seq, bs);
+                }
                 let finish_snap = self.finish_leaf_snapshot(seq);
                 let acquired = if let Some(snap_id) = finish_snap {
                     let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
@@ -152,11 +157,17 @@ impl TransformerModel {
             self.invalidate_slot_graphs(seq.slot_idx);
         }
 
+        self.finish_leaf_release(seq);
         let slot_reused_by_compact = seq.slot_idx >= self.ssm_pool.max_slots;
         let taken = seq.ssm_slot.as_mut().and_then(|g| g.take());
         let slot_to_release = if slot_reused_by_compact { None } else { taken };
         if let Some(slot) = slot_to_release {
             let stream = self.gpu.default_stream();
+            // A verify step that finishes the sequence commits on the secondary
+            // stream and is freed straight away: order the zero after it.
+            if let Err(e) = self.sync_secondary_dispatch() {
+                tracing::error!("free_sequence: sync_secondary before zero_slot({slot}): {e:#}");
+            }
             if let Err(e) = self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream) {
                 tracing::error!("free_sequence: ssm_pool.zero_slot({slot}): {e:#}");
             }
@@ -374,6 +385,7 @@ impl TransformerModel {
             return Ok(false);
         }
         let stream = self.gpu.default_stream();
+        self.sync_secondary_dispatch()?; // a verify commit may still be folding into old_slot
         self.ssm_pool
             .copy_slot(old_slot, new_slot, self.gpu.as_ref(), stream)
             .inspect_err(|_| self.ssm_pool.release_slot(new_slot))?; // un-claim

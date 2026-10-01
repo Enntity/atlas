@@ -437,6 +437,17 @@ pub(super) fn apply_dflash_accept(
         tracing::error!("commit_ctx (kgamma batched): {e:#}");
     }
 
+    // Committed before emission (see `verify_dflash_tail`): an emit that
+    // finishes the sequence returns, and finish caches the committed state.
+    let k_verify = drafts.len() + 1;
+    let total_accepted = num_accepted + 1;
+    if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
+        tracing::error!("commit_accepted_prefix (dflash batched): {e:#}");
+        a.engine_error = Some(format!("{e:#}"));
+        a.finished = true;
+        return;
+    }
+
     for i in 0..num_accepted {
         emit_token(a, drafts[i], None, sched);
         if a.finished {
@@ -464,14 +475,6 @@ pub(super) fn apply_dflash_accept(
         ])
         .inc();
 
-    let k_verify = drafts.len() + 1;
-    let total_accepted = num_accepted + 1;
-    if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
-        tracing::error!("commit_accepted_prefix (dflash batched): {e:#}");
-        a.engine_error = Some(format!("{e:#}"));
-        a.finished = true;
-        return;
-    }
     let bonus_token_idx = total_accepted.saturating_sub(1);
     if let Err(e) = model.save_hidden_for_mtp(bonus_token_idx, 0) {
         tracing::error!("save_hidden_for_mtp (dflash batched): {e:#}");

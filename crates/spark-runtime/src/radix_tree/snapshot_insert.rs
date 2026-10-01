@@ -70,6 +70,11 @@ impl SsmSnapshotIndex {
                 // insert_tail's supersede sweep maintains.
                 entry.is_tail = false;
                 entry.is_tail_sibling = false;
+                // Nor a finish leaf: a checkpoint saved over one takes its
+                // place, unlinked (`snapshot_leaf`).
+                if entry.chain.leaf {
+                    entry.chain = Default::default();
+                }
                 self.access_counter += 1;
                 entry.last_access = self.access_counter;
                 return old;

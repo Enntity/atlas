@@ -26,9 +26,20 @@ pub(super) enum Event {
     Capture(usize, u64),
     Primer(usize, u64),
 }
+/// Stream-ordering calls, kept apart from [`Event`] (whose lists the prefill
+/// tests compare exactly): `Wait(stream, event)`, a host sync of a stream,
+/// and a layer decode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Order {
+    Wait(u64, u64),
+    Sync(u64),
+    Decode,
+}
 #[derive(Default)]
 struct Recorder {
     events: Mutex<Vec<Event>>,
+    order: Mutex<Vec<Order>>,
+    created_events: AtomicU64,
     capture: AtomicU64,
     target_failure: AtomicBool,
     capture_failure: AtomicBool,
@@ -62,7 +73,15 @@ impl GpuBackend for Gpu {
         self.inner.copy_d2d(a, b, n)
     }
     fn synchronize(&self, s: u64) -> Result<()> {
+        self.record.order.lock().push(Order::Sync(s));
         self.inner.synchronize(s)
+    }
+    fn create_event(&self) -> Result<u64> {
+        Ok(self.record.created_events.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+    fn stream_wait_event(&self, stream: u64, event: u64) -> Result<()> {
+        self.record.order.lock().push(Order::Wait(stream, event));
+        Ok(())
     }
     fn default_stream(&self) -> u64 {
         DEFAULT
@@ -147,6 +166,7 @@ impl TransformerLayer for Layer {
         _: &ForwardContext,
         _: u64,
     ) -> Result<()> {
+        self.0.order.lock().push(Order::Decode);
         anyhow::bail!("stream fixture requires multi-token prefill")
     }
     fn prefill(
@@ -427,6 +447,10 @@ impl Fixture {
     }
     pub fn events(&self) -> Vec<Event> {
         self.record.events.lock().clone()
+    }
+    /// The [`Order`] calls since the previous call.
+    pub fn order(&self) -> Vec<Order> {
+        std::mem::take(&mut *self.record.order.lock())
     }
     pub fn fail(&self, capture: bool) {
         if capture {
