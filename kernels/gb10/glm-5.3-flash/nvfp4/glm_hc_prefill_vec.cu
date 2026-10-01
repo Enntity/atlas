@@ -658,3 +658,181 @@ extern "C" __global__ void __launch_bounds__(256) glm_hc_decode_finalize_bf16(
     glm_hc_decode_finalize_t<__nv_bfloat16>(streams, partial, hc_scale, hc_base, y_out, post_out, comb_out,
                                   tokens, sinkhorn_iters, norm_eps, hc_eps);
 }
+
+// ── Fused decode tier (ATLAS_GLM_DECODE_FUSE, BF16 highway) ────────────────
+// Twins of the verify-width kernels above with the same arithmetic per element
+// in the same order, so every output byte is identical
+// (scripts/dev/glm_decode_fuse_bench.cu). At these widths the originals are
+// bound by dependent global loads, not by arithmetic.
+
+// hc_post_t / hc_post_bf16_add_t for T <= 32 rows with 16-byte accesses: each
+// thread owns 8 consecutive columns of one row (the per-token kernels walk 16
+// columns a thread, five dependent 2-byte loads each, on T CTAs). `peer` is
+// the other rank's block output, added with hc_post_bf16_add's `__hadd`, or
+// null. Grid (2 * tokens), block 256; all row pointers 16-byte aligned.
+extern "C" __global__ void __launch_bounds__(256) glm_hc_decode_post_bf16(
+    const __nv_bfloat16* __restrict__ block_out, const __nv_bfloat16* __restrict__ peer,
+    __nv_bfloat16* __restrict__ streams, const float* __restrict__ post,
+    const float* __restrict__ comb, const unsigned int tokens
+) {
+    atlas_pdl_enter();
+    constexpr unsigned int H = 4096;
+    const unsigned int t = blockIdx.x / 2;
+    if (t >= tokens || blockDim.x != 256) return;
+    const unsigned int d = ((blockIdx.x & 1) * 256 + threadIdx.x) * 8;
+    __nv_bfloat16* x = streams + (size_t)t * 4 * H;
+    float p[4], c[16];
+    #pragma unroll
+    for (unsigned int j = 0; j < 4; ++j) p[j] = post[(size_t)t * 4 + j];
+    #pragma unroll
+    for (unsigned int j = 0; j < 16; ++j) c[j] = comb[(size_t)t * 16 + j];
+    uint4 raw[5];
+    raw[4] = *(const uint4*)&block_out[(size_t)t * H + d];
+    #pragma unroll
+    for (unsigned int i = 0; i < 4; ++i) raw[i] = *(const uint4*)&x[i * H + d];
+    const __nv_bfloat16* o = reinterpret_cast<const __nv_bfloat16*>(&raw[4]);
+    __nv_bfloat16 sum[8];
+    if (peer != nullptr) {
+        const uint4 praw = *(const uint4*)&peer[(size_t)t * H + d];
+        const __nv_bfloat16* pv = reinterpret_cast<const __nv_bfloat16*>(&praw);
+        #pragma unroll
+        for (unsigned int e = 0; e < 8; ++e) sum[e] = __hadd(o[e], pv[e]);
+    } else {
+        #pragma unroll
+        for (unsigned int e = 0; e < 8; ++e) sum[e] = o[e];
+    }
+    #pragma unroll
+    for (unsigned int j = 0; j < 4; ++j) {
+        __align__(16) __nv_bfloat16 out[8];
+        #pragma unroll
+        for (unsigned int e = 0; e < 8; ++e) {
+            float acc = p[j] * (float)sum[e];
+            #pragma unroll
+            for (unsigned int i = 0; i < 4; ++i)
+                acc += c[i * 4 + j] * (float)reinterpret_cast<const __nv_bfloat16*>(&raw[i])[e];
+            out[e] = (__nv_bfloat16)acc;
+        }
+        *(uint4*)&x[j * H + d] = *reinterpret_cast<const uint4*>(out);
+    }
+}
+
+// glm_hc_decode_partial_t for a BF16 highway, a row group at a time: the hc_fn
+// slice is staged with 16-byte loads (12 a thread, not 48), the group's
+// highway slice, block output, post and comb with one to four, and the 25
+// sums of all rows are reduced level by level from registers instead of one
+// dependent shuffle chain and two barriers per row. Same grid, same partial
+// layout; hc_fn must be 16-byte aligned.
+template <bool POST>
+__device__ __forceinline__ void glm_hc_decode_partial_rows_t(
+    const __nv_bfloat16* __restrict__ block_out, // [T, 4096] (POST only)
+    __nv_bfloat16* __restrict__ streams,         // [T, 4, 4096]
+    const float* __restrict__ post,              // [T, 4]   (POST only)
+    const float* __restrict__ comb,              // [T, 4, 4] (POST only)
+    const float* __restrict__ hc_fn,             // [24, 16384] of the next site
+    float* __restrict__ partial,
+    const unsigned int tokens
+) {
+    constexpr unsigned int H = 4096, K = 4 * H, M = 24, TG = GLM_HCD_TG, C = GLM_HCD_COLS;
+    __shared__ __align__(16) float s_fn[M][4][C];
+    __shared__ float s_x[TG][4][C];
+    __shared__ float s_pc[TG][20];               // post[4], comb[16]
+    __shared__ __align__(4) __nv_bfloat16 s_out[TG][C];
+    __shared__ float s_red[TG][4][M + 1];
+    const unsigned int tid = threadIdx.x, st = tid >> 5, lane = tid & 31;
+    const unsigned int d0 = blockIdx.x * C;
+    const unsigned int t0 = blockIdx.y * TG;
+    const unsigned int rows = min(tokens, t0 + TG) - t0;
+    #pragma unroll
+    for (unsigned int i = tid; i < M * 4 * (C / 4); i += 128) {
+        const unsigned int m = i / C, r = i % C, s4 = r / (C / 4), c = (r % (C / 4)) * 4;
+        *(float4*)&s_fn[m][s4][c] = __ldg((const float4*)(hc_fn + (size_t)m * K + s4 * H + d0 + c));
+    }
+    // Rows past the batch read the last row (never stored, never reported).
+    #pragma unroll
+    for (unsigned int i = tid; i < TG * 4 * (C / 2); i += 128) {
+        const unsigned int j = i / (2 * C), r = i % (2 * C), s4 = r / (C / 2), c = (r % (C / 2)) * 2;
+        const unsigned int t = min(t0 + j, tokens - 1);
+        const float2 x = hc_ld2(streams + (size_t)t * K + s4 * H + d0 + c);
+        s_x[j][s4][c] = x.x;
+        s_x[j][s4][c + 1] = x.y;
+    }
+    if constexpr (POST) {
+        if (tid < TG * 20) {
+            const unsigned int j = tid / 20, e = tid % 20, t = min(t0 + j, tokens - 1);
+            s_pc[j][e] = e < 4 ? post[(size_t)t * 4 + e] : comb[(size_t)t * 16 + e - 4];
+        }
+        {
+            const unsigned int j = tid / (C / 2), c = (tid % (C / 2)) * 2, t = min(t0 + j, tokens - 1);
+            *(unsigned*)&s_out[j][c] = *(const unsigned*)&block_out[(size_t)t * H + d0 + c];
+        }
+    }
+    __syncthreads();
+    float v[TG][2];
+    #pragma unroll
+    for (unsigned int j = 0; j < TG; ++j) {
+        #pragma unroll
+        for (unsigned int e = 0; e < 2; ++e) {
+            const unsigned int c = lane + e * 32;
+            if constexpr (POST) {
+                float acc = s_pc[j][st] * __bfloat162float(s_out[j][c]);
+                #pragma unroll
+                for (unsigned int i = 0; i < 4; ++i) acc += s_pc[j][4 + i * 4 + st] * s_x[j][i][c];
+                const __nv_bfloat16 stored = (__nv_bfloat16)acc;
+                if (j < rows) streams[(size_t)(t0 + j) * K + st * H + d0 + c] = stored;
+                v[j][e] = (float)stored;
+            } else {
+                v[j][e] = s_x[j][st][c];
+            }
+        }
+    }
+    float ss[TG], a[TG][M];
+    #pragma unroll
+    for (unsigned int j = 0; j < TG; ++j) ss[j] = v[j][0] * v[j][0] + v[j][1] * v[j][1];
+    #pragma unroll
+    for (unsigned int m = 0; m < M; ++m) {
+        const float f0 = s_fn[m][st][lane], f1 = s_fn[m][st][lane + 32];
+        #pragma unroll
+        for (unsigned int j = 0; j < TG; ++j) a[j][m] = f0 * v[j][0] + f1 * v[j][1];
+    }
+    #pragma unroll
+    for (unsigned int o = 16; o > 0; o >>= 1) {
+        #pragma unroll
+        for (unsigned int j = 0; j < TG; ++j) {
+            ss[j] += __shfl_xor_sync(0xffffffffu, ss[j], o);
+            #pragma unroll
+            for (unsigned int m = 0; m < M; ++m) a[j][m] += __shfl_xor_sync(0xffffffffu, a[j][m], o);
+        }
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (unsigned int j = 0; j < TG; ++j) {
+            s_red[j][st][M] = ss[j];
+            #pragma unroll
+            for (unsigned int m = 0; m < M; ++m) s_red[j][st][m] = a[j][m];
+        }
+    }
+    __syncthreads();
+    for (unsigned int i = tid; i < rows * (M + 1); i += 128) {
+        const unsigned int j = i / (M + 1), m = i % (M + 1);
+        partial[((size_t)blockIdx.x * tokens + t0 + j) * (M + 1) + m] =
+            s_red[j][0][m] + s_red[j][1][m] + s_red[j][2][m] + s_red[j][3][m];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_post_partial_rows_bf16(
+    const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams,
+    const float* __restrict__ post, const float* __restrict__ comb,
+    const float* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens
+) {
+    atlas_pdl_enter();
+    glm_hc_decode_partial_rows_t<true>(block_out, streams, post, comb, hc_fn, partial, tokens);
+}
+
+extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_partial_rows_bf16(
+    const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams,
+    const float* __restrict__ post, const float* __restrict__ comb,
+    const float* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens
+) {
+    atlas_pdl_enter();
+    glm_hc_decode_partial_rows_t<false>(block_out, streams, post, comb, hc_fn, partial, tokens);
+}

@@ -197,25 +197,23 @@ pub(crate) fn hc_post_pre_prefill_fused(
         ctx.buffers.hc_comb(),
     );
     if decode {
-        let partial = if block_out.is_some() {
-            "glm_hc_decode_post_partial"
-        } else {
-            "glm_hc_decode_partial"
-        };
-        KernelLaunch::new(
+        let partial = ops::glm_decode_fuse::hc_decode_partial(
             ctx.gpu,
-            ctx.gpu.kernel("glm_hc_prefill_vec", &name(partial))?,
-        )
-        .grid([64, tokens.div_ceil(4), 1])
-        .block([128, 1, 1])
-        .arg_ptr(block_out.unwrap_or(DevicePtr::NULL))
-        .arg_ptr(streams)
-        .arg_ptr(post)
-        .arg_ptr(comb)
-        .arg_ptr(next.hc_fn)
-        .arg_ptr(raw_mix)
-        .arg_u32(tokens)
-        .launch(stream)?;
+            &ctx.config.model_type,
+            block_out.is_some(),
+            next.hc_fn,
+        )?;
+        KernelLaunch::new(ctx.gpu, partial)
+            .grid([64, tokens.div_ceil(4), 1])
+            .block([128, 1, 1])
+            .arg_ptr(block_out.unwrap_or(DevicePtr::NULL))
+            .arg_ptr(streams)
+            .arg_ptr(post)
+            .arg_ptr(comb)
+            .arg_ptr(next.hc_fn)
+            .arg_ptr(raw_mix)
+            .arg_u32(tokens)
+            .launch(stream)?;
         KernelLaunch::new(
             ctx.gpu,
             ctx.gpu

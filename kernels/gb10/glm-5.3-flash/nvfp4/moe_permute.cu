@@ -426,3 +426,243 @@ extern "C" __global__ void moe_unpermute_reduce_indexed_ep_vec8(
         *(uint4*)&output[token * hidden_size + c] = out;
     }
 }
+
+// moe_unpermute_reduce_indexed_ep_vec8 followed by moe_batched_blend, one
+// launch (ATLAS_GLM_DECODE_FUSE). The gate is the blend's dot: the row and the
+// gate weight are staged with 16-byte loads and summed per thread, per warp
+// and across warps in the blend's order. Each 8-column group then reduces its
+// local routes as the vec8 kernel does, rounds to BF16 (the value the blend
+// read back) and adds gate * shared. Same bytes as the pair.
+// Grid: (num_tokens, 1, 1)  Block: (256, 1, 1); hidden 4096, topk <= 8;
+// every row pointer and gate_weight 16-byte aligned.
+extern "C" __global__ void __launch_bounds__(256) moe_unpermute_blend_ep_vec8(
+    const __nv_bfloat16* __restrict__ expert_output,
+    __nv_bfloat16* __restrict__ output,
+    const int* __restrict__ token_to_perm,
+    const int* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    const __nv_bfloat16* __restrict__ shared_out,
+    const __nv_bfloat16* __restrict__ normed,
+    const __nv_bfloat16* __restrict__ gate_weight,   // nullable: gate 1.0
+    unsigned int num_tokens,
+    unsigned int topk,
+    unsigned int local_expert_start,
+    unsigned int local_expert_end
+) {
+    atlas_pdl_enter();
+    constexpr unsigned int MAX_TOPK = 8, H = 4096, BLOCK = 256;
+    const unsigned int token = blockIdx.x, tid = threadIdx.x;
+    if (token >= num_tokens || blockDim.x != BLOCK) return;
+    __shared__ __align__(16) __nv_bfloat16 s_normed[H];
+    __shared__ __align__(16) __nv_bfloat16 s_gate[H];
+    __shared__ float s_dot_partial[BLOCK / 32];
+
+    float local_dot = 0.0f;
+    if (gate_weight != 0) {
+        #pragma unroll
+        for (unsigned int i = tid * 8; i < H; i += BLOCK * 8) {
+            *(uint4*)&s_normed[i] = *(const uint4*)&normed[token * H + i];
+            *(uint4*)&s_gate[i] = *(const uint4*)&gate_weight[i];
+        }
+        __syncthreads();
+        for (unsigned int i = tid; i < H; i += BLOCK) {
+            float n = __bfloat162float(s_normed[i]);
+            float g = __bfloat162float(s_gate[i]);
+            local_dot += n * g;
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_dot += __shfl_down_sync(0xFFFFFFFF, local_dot, offset);
+    if (tid % 32 == 0) s_dot_partial[tid / 32] = local_dot;
+    __syncthreads();
+    if (tid == 0) {
+        float gate = 1.0f;
+        if (gate_weight != 0) {
+            float total = 0.0f;
+            for (unsigned int w = 0; w < BLOCK / 32; w++) total += s_dot_partial[w];
+            gate = 1.0f / (1.0f + __expf(-total));
+        }
+        s_dot_partial[0] = gate;
+    }
+    __syncthreads();
+    const float gate_scalar = s_dot_partial[0];
+
+    unsigned int rows[MAX_TOPK];
+    float weights[MAX_TOPK];
+    bool live[MAX_TOPK];
+    #pragma unroll
+    for (unsigned int k = 0; k < MAX_TOPK; k++) {
+        const unsigned int slot = token * topk + k;
+        const int expert = k < topk ? topk_ids[slot] : -1;
+        live[k] = k < topk && expert >= (int)local_expert_start && expert < (int)local_expert_end;
+        rows[k] = live[k] ? (unsigned int)token_to_perm[slot] : 0u;
+        weights[k] = live[k] ? topk_weights[slot] : 0.0f;
+    }
+    for (unsigned int c = tid * 8; c < H; c += BLOCK * 8) {
+        uint4 raw[MAX_TOPK];
+        #pragma unroll
+        for (unsigned int i = 0; i < MAX_TOPK; i++)
+            if (live[i]) raw[i] = *(const uint4*)&expert_output[rows[i] * H + c];
+        const uint4 sraw = *(const uint4*)&shared_out[token * H + c];
+        const __nv_bfloat16* sv = reinterpret_cast<const __nv_bfloat16*>(&sraw);
+        float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        #pragma unroll
+        for (unsigned int i = 0; i < MAX_TOPK; i++) {
+            if (!live[i]) continue;
+            const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&raw[i]);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float value = __bfloat162float(v[j]);
+                acc[j] += weights[i] * value;
+            }
+        }
+        uint4 out;
+        __nv_bfloat16* o = reinterpret_cast<__nv_bfloat16*>(&out);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float routed = __bfloat162float(__float2bfloat16(acc[j]));
+            const float s = __bfloat162float(sv[j]);
+            o[j] = __float2bfloat16(routed + gate_scalar * s);
+        }
+        *(uint4*)&output[token * H + c] = out;
+    }
+}
+
+// moe_sort_by_expert with its prefix sum spread over the block
+// (ATLAS_GLM_DECODE_FUSE): one thread walked all expert counts and then stored
+// every offset. Here each thread sums up to four consecutive experts, a warp
+// then a block shuffle scan places those sums, and each thread writes its own
+// offsets. Integer sums, so expert_offsets are the same words; the histogram
+// and the scatter are the original's, so rows keep its contract (any order
+// within an expert group). Grid: (1, 1, 1)  Block: (256, 1, 1); at most 1024
+// experts.
+extern "C" __global__ void moe_sort_by_expert_scan(
+    const unsigned int* __restrict__ topk_ids,
+    int* __restrict__ sorted_token_ids,
+    int* __restrict__ sorted_expert_ids,
+    int* __restrict__ expert_offsets,
+    int* __restrict__ token_to_perm,
+    unsigned int total_expanded,
+    unsigned int num_experts,
+    unsigned int topk
+) {
+    atlas_pdl_enter();
+    __shared__ unsigned int counts[1024];
+    __shared__ unsigned int offsets[1025];
+    __shared__ unsigned int warp_sums[8];
+    const unsigned int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    if (blockDim.x != 256 || num_experts > 1024) return;
+
+    for (unsigned int i = tid; i < num_experts; i += blockDim.x)
+        counts[i] = 0;
+    __syncthreads();
+    for (unsigned int i = tid; i < total_expanded; i += blockDim.x)
+        atomicAdd(&counts[topk_ids[i]], 1);
+    __syncthreads();
+
+    const unsigned int per = (num_experts + 255) / 256;
+    const unsigned int e0 = min(tid * per, num_experts), e1 = min(e0 + per, num_experts);
+    unsigned int local = 0;
+    for (unsigned int e = e0; e < e1; e++) local += counts[e];
+    unsigned int incl = local;
+    #pragma unroll
+    for (unsigned int o = 1; o < 32; o <<= 1) {
+        const unsigned int up = __shfl_up_sync(0xFFFFFFFF, incl, o);
+        if (lane >= o) incl += up;
+    }
+    if (lane == 31) warp_sums[warp] = incl;
+    __syncthreads();
+    unsigned int base = 0;
+    for (unsigned int w = 0; w < warp; w++) base += warp_sums[w];
+    unsigned int running = base + incl - local;
+    for (unsigned int e = e0; e < e1; e++) {
+        offsets[e] = running;
+        expert_offsets[e] = (int)running;
+        running += counts[e];
+    }
+    if (e1 == num_experts && e0 < e1) {
+        offsets[num_experts] = running;
+        expert_offsets[num_experts] = (int)running;
+    }
+    if (num_experts == 0 && tid == 0) {
+        offsets[0] = 0;
+        expert_offsets[0] = 0;
+    }
+    __syncthreads();
+
+    for (unsigned int i = tid; i < num_experts; i += blockDim.x)
+        counts[i] = 0;
+    __syncthreads();
+    for (unsigned int i = tid; i < total_expanded; i += blockDim.x) {
+        unsigned int expert_id = topk_ids[i];
+        unsigned int pos = offsets[expert_id] + atomicAdd(&counts[expert_id], 1);
+        sorted_token_ids[pos] = (int)(i / topk);
+        sorted_expert_ids[pos] = (int)expert_id;
+        token_to_perm[i] = (int)pos;
+    }
+}
+
+// moe_build_tile_worklist with the chunked Hillis-Steele scan replaced by the
+// shuffle scan of moe_sort_by_expert_scan (ATLAS_GLM_DECODE_FUSE): each thread
+// owns up to four consecutive experts, so one scan places every expert where
+// the original walked 256-expert chunks of eight barrier pairs each. Integer
+// sums and the same expert/m/n emission order, so the work-list and
+// total_tiles are the same words. Grid: (1, 1, 1)  Block: (256, 1, 1); at most
+// 1024 experts.
+extern "C" __global__ void moe_build_tile_worklist_scan(
+    const int* __restrict__ expert_offsets,
+    const unsigned long long* __restrict__ B_weight_ptrs,
+    unsigned int* __restrict__ worklist,
+    int* __restrict__ total_tiles,
+    unsigned int num_experts,
+    unsigned int n_tiles,
+    unsigned int m_tile
+) {
+    atlas_pdl_enter();
+    __shared__ unsigned int warp_sums[8];
+    const unsigned int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    if (blockDim.x != 256 || num_experts > 1024) return;
+    const unsigned int per = (num_experts + 255) / 256;
+    const unsigned int e0 = min(tid * per, num_experts), e1 = min(e0 + per, num_experts);
+    unsigned int mt[4] = {0u, 0u, 0u, 0u};
+    unsigned int local = 0;
+    #pragma unroll
+    for (unsigned int k = 0; k < 4; k++) {
+        const unsigned int e = e0 + k;
+        if (e < e1) {
+            const int M_e = expert_offsets[e + 1] - expert_offsets[e];
+            if (M_e > 0 && B_weight_ptrs[e] != 0)   // mirror grouped-GEMM early-exit guards
+                mt[k] = ((unsigned int)M_e + m_tile - 1) / m_tile;
+            local += mt[k] * n_tiles;
+        }
+    }
+    unsigned int incl = local;
+    #pragma unroll
+    for (unsigned int o = 1; o < 32; o <<= 1) {
+        const unsigned int up = __shfl_up_sync(0xFFFFFFFF, incl, o);
+        if (lane >= o) incl += up;
+    }
+    if (lane == 31) warp_sums[warp] = incl;
+    __syncthreads();
+    unsigned int w = 0;
+    for (unsigned int v = 0; v < warp; v++) w += warp_sums[v];
+    w += incl - local;
+    #pragma unroll
+    for (unsigned int k = 0; k < 4; k++) {
+        const unsigned int e = e0 + k;
+        for (unsigned int m = 0; m < mt[k]; m++) {
+            for (unsigned int nt = 0; nt < n_tiles; nt++) {
+                assert(m < (1u << 26) && nt < 64u);
+                worklist[w * 2 + 0] = e;
+                worklist[w * 2 + 1] = (m << 6) | nt;
+                w++;
+            }
+        }
+    }
+    if (tid == 255) {
+        unsigned int total = 0;
+        for (unsigned int v = 0; v < 8; v++) total += warp_sums[v];
+        total_tiles[0] = (int)total;
+    }
+}

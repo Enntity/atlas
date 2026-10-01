@@ -350,6 +350,16 @@ pub fn hc_post(
     hc_mult: u32,
     stream: u64,
 ) -> Result<()> {
+    let ptrs = [block_out, DevicePtr::NULL, residual, post, comb, out];
+    if super::glm_decode_fuse::hc_post(
+        gpu,
+        kernel,
+        ptrs,
+        [num_tokens, hidden_size, hc_mult],
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([num_tokens, 1, 1])
         .block([256, 1, 1])
@@ -382,6 +392,16 @@ pub fn hc_post_bf16_add(
     hc_mult: u32,
     stream: u64,
 ) -> Result<()> {
+    let ptrs = [local_block_out, peer_block_out, residual, post, comb, out];
+    if super::glm_decode_fuse::hc_post(
+        gpu,
+        kernel,
+        ptrs,
+        [num_tokens, hidden_size, hc_mult],
+        stream,
+    )? {
+        return Ok(());
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([num_tokens, 1, 1])
         .block([256, 1, 1])
