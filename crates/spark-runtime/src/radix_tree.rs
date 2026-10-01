@@ -16,6 +16,7 @@ mod inner;
 mod snapshot;
 mod snapshot_chain;
 mod snapshot_insert;
+mod snapshot_leaf;
 mod snapshot_stats;
 mod snapshot_tier;
 
@@ -254,6 +255,36 @@ impl PrefixCache for RadixTree {
         let displaced = idx.insert(prefix_hash, snapshot_id, session_hash, tokens.len());
         idx.link_chain_if_enabled(tokens, adapter_id, prefix_hash);
         displaced
+    }
+
+    fn insert_leaf_snapshot(
+        &self,
+        tokens: &[u32],
+        snapshot_id: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> Option<usize> {
+        let prefix_hash = hash_token_prefix(tokens, tokens.len(), adapter_id);
+        self.snapshot_index
+            .lock()
+            .insert_leaf(prefix_hash, snapshot_id, session_hash, tokens.len())
+    }
+
+    fn take_leaf_snapshot(&self, tokens: &[u32], snapshot_id: usize, adapter_id: u64) -> bool {
+        let prefix_hash = hash_token_prefix(tokens, tokens.len(), adapter_id);
+        self.snapshot_index
+            .lock()
+            .take_leaf(prefix_hash, snapshot_id)
+    }
+
+    fn settle_leaf_snapshot(&self, tokens: &[u32], adapter_id: u64, keep: bool) {
+        self.snapshot_index
+            .lock()
+            .settle_leaf(tokens, adapter_id, keep);
+    }
+
+    fn evict_snapshot_for_leaf(&self) -> Option<usize> {
+        self.snapshot_index.lock().evict_for_leaf()
     }
 
     fn release(&self, tokens: &[u32], block_size: usize, adapter_id: u64) {

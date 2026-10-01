@@ -173,13 +173,15 @@ impl TransformerModel {
 
 /// Whether ranks must agree on the Marconi restore depth: on with either
 /// prefix-cache policy flag, because both make later decisions depend on it.
+/// (`ATLAS_GLM_PC_FINISH_LEAF`, whose leaf a rank can lose, needs
+/// `ATLAS_GLM_PC_EVICT` and so always runs with the agreement.)
 pub(in crate::model) fn pc_rank_agree_enabled() -> bool {
     spark_runtime::radix_tree::glm_pc_evict_enabled() || glm_pc_branch_enabled()
 }
 
 /// The tail-split cut for a `total`-token prompt: one block below the last
 /// block boundary strictly under `total` (`prefill_chunk_dispatch_with`).
-pub(super) fn tail_cut(total: usize, bs: usize) -> usize {
+pub(in crate::model) fn tail_cut(total: usize, bs: usize) -> usize {
     ((total.saturating_sub(1) / bs) * bs).saturating_sub(bs)
 }
 
@@ -200,7 +202,7 @@ pub(super) fn branch_checkpoint_at(
 
 /// Which snapshot a rank restores after [`agree_restore`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Agreed {
+pub(in crate::model) enum Agreed {
     /// No rank restores.
     None,
     /// This rank's own lookup choice, at its own depth.
@@ -217,7 +219,7 @@ pub(super) enum Agreed {
 /// any rank lacks the agreed snapshot. Issues one reduction, plus a second
 /// exactly when the agreed depth is non-zero, so the collective count is the
 /// same on every rank whatever the local inputs.
-pub(super) fn agree_restore(
+pub(in crate::model) fn agree_restore(
     depth: usize,
     mut min: impl FnMut(u32) -> Result<u32>,
     probe: impl FnOnce(usize) -> Option<usize>,

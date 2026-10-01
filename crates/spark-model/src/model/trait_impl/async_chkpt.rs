@@ -280,7 +280,7 @@ impl TransformerModel {
                 "commit_accepted_prefix: num_accepted == 0 (k={k}) with KDA records"
             );
             let stream = self.secondary_stream;
-            self.commit_kda_records(seq, num_accepted, num_accepted < k, stream)?;
+            self.commit_kda_records_with_leaf(seq, num_accepted, k, stream)?;
             self.gpu.record_event(self.secondary_event, stream)?;
             return Ok(());
         }

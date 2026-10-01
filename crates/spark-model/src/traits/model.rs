@@ -1318,6 +1318,11 @@ pub trait Model: Send + Sync {
     /// index-select of `h_state_intermediates[num_accepted-1]`. No-op
     /// default for backends without the dual-buffer SSM state.
     /// Runs on `secondary_stream`; pair with `sync_secondary`.
+    ///
+    /// Call it with `seq.tokens` / `seq_len` already rolled back to the
+    /// accepted prefix, and before emitting the accepted tokens: an emit can
+    /// finish the sequence, and with KDA records every accept (full accepts
+    /// too) folds rows into the state that finish then caches.
     fn commit_accepted_prefix(
         &self,
         _seq: &mut SequenceState,
