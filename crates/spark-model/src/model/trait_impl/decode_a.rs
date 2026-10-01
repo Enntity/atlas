@@ -214,7 +214,7 @@ impl TransformerModel {
         // probes can sync (illegal under graph capture). Subsequent steps
         // still capture/replay normally.
         let dump_step0 =
-            seq.seq_len == seq.prompt_len && std::env::var("ATLAS_SSM_SAVE_DUMP").is_ok();
+            seq.seq_len == seq.prompt_len && crate::model::graph_flags::ssm_save_dump();
         // EXPERIMENT (ATLAS_EP_GRAPHS=1): allow CUDA-graph capture under EP. The
         // EP all-reduce queues ncclSend/Recv + local-add on the compute (capture)
         // stream; NCCL ≥2.9 supports graph capture, so this MAY capture cleanly

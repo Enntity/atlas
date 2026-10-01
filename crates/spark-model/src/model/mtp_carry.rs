@@ -111,6 +111,18 @@ pub fn marconi_prefill_only() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_MARCONI_PREFILL_ONLY").as_deref() == Ok("1"))
 }
 
+/// Block-count between decode checkpoints (`ATLAS_DECODE_CKPT_BLOCKS`).
+/// Env-tunable (no rebuild) so the cadence/drift tradeoff can be swept;
+/// default 4 blocks = 64 tok. Every rank must run the same value
+/// (`startup_parity`): it decides the snapshots a rank has to restore from.
+pub fn decode_ckpt_blocks() -> usize {
+    std::env::var("ATLAS_DECODE_CKPT_BLOCKS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(4)
+}
+
 /// `ATLAS_MARCONI_EXACT=1`: restore an exact-leaf snapshot (one at the radix
 /// match that is also the whole prompt) instead of recomputing the prompt.
 pub fn marconi_exact() -> bool {

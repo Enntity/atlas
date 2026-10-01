@@ -92,7 +92,7 @@ impl TransformerModel {
         let force_eager = if self.lightning_dspark_identity.policy().is_some() {
             false
         } else {
-            std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1")
+            crate::model::graph_flags::dflash_debug_no_graph()
         };
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && self.levers.lora_eager;
@@ -111,7 +111,7 @@ impl TransformerModel {
                 self.levers.max_decode_seqs,
                 k,
                 crate::speculative::glm_repair_policy::enabled(),
-                std::env::var("ATLAS_K2_DIAG").as_deref() == Ok("1"),
+                crate::model::graph_flags::k2_diag(),
             );
         let use_graphs = (self.comm.is_none() || glm_tp_graphs)
             && !self

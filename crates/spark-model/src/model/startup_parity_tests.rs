@@ -101,9 +101,26 @@ fn values(settings: &[Setting]) -> Vec<u64> {
 fn pair(rank: usize, ours: &[Setting], peer: Vec<u64>) -> Result<()> {
     let gpu = MockGpuBackend::new();
     let world = World::agreeing(&gpu, rank, ours, vec![peer.clone(), peer]);
-    let agreed = agree_on(ours, &world, &gpu);
+    let agreed = agree_on(Ok(ours.to_vec()), false, &world, &gpu);
     assert_eq!(gpu.alloc_count(), 0, "the gather buffer is freed");
     agreed
+}
+
+/// The gathers of `agree_on` as rank `rank` of a pair: the peer gathers
+/// `peer_table`, then (if the agreement gets that far) `peer`.
+fn gathers(
+    rank: usize,
+    ours: Result<Vec<Setting>>,
+    warn: bool,
+    peer_table: u64,
+    peer: Vec<u64>,
+) -> (Result<()>, Vec<usize>) {
+    let gpu = MockGpuBackend::new();
+    let rounds = vec![vec![vec![peer_table]; 2], vec![peer; 2]];
+    let world = World::new(&gpu, rank, rounds);
+    let agreed = agree_on(ours, warn, &world, &gpu);
+    assert_eq!(gpu.alloc_count(), 0, "the gather buffer is freed");
+    (agreed, world.gathers.into_inner().unwrap())
 }
 
 #[test]
@@ -148,7 +165,9 @@ fn every_rank_of_a_wider_world_is_compared() {
     let ours = [("A", 1), ("B", 2)];
     let values = vec![vec![1, 2], vec![], vec![1, 2], vec![9, 2]];
     let world = World::agreeing(&gpu, 1, &ours, values);
-    let why = agree_on(&ours, &world, &gpu).unwrap_err().to_string();
+    let why = agree_on(Ok(ours.to_vec()), false, &world, &gpu)
+        .unwrap_err()
+        .to_string();
     assert!(why.contains("A: rank 1 has 1, rank 3 has 9"), "{why}");
     assert_eq!(why.matches(" has ").count(), 2, "{why}");
 }
@@ -163,7 +182,7 @@ fn the_gather_has_one_size_whatever_the_settings_are() {
         let ours: Vec<Setting> = names.iter().map(|s| (s.0, value)).collect();
         let gpu = MockGpuBackend::new();
         let world = World::agreeing(&gpu, 0, &ours, vec![vec![value; words]; 2]);
-        agree_on(&ours, &world, &gpu).unwrap();
+        agree_on(Ok(ours), false, &world, &gpu).unwrap();
         assert_eq!(*world.gathers.lock().unwrap(), [8, 8 * words]);
     }
     // The table itself: this process's own flags through `agree`.
@@ -189,13 +208,71 @@ fn a_rank_with_another_table_fails_before_the_settings_are_gathered() {
             let gpu = MockGpuBackend::new();
             let tables = vec![vec![table_id(theirs)]; 2];
             let world = World::new(&gpu, rank, vec![tables]);
-            let why = agree_on(&ours, &world, &gpu).unwrap_err().to_string();
+            // `ATLAS_STARTUP_PARITY=warn` does not let these ranks go on:
+            // their settings gathers would mispair.
+            let why = agree_on(Ok(ours.to_vec()), true, &world, &gpu)
+                .unwrap_err()
+                .to_string();
             assert!(why.contains("different builds"), "{why}");
             assert_eq!(*world.gathers.lock().unwrap(), [8]);
         }
     }
     // The values are not part of it.
     assert_eq!(table_id(&ours), table_id(&[("A", 7), ("B", 0)]));
+    assert_ne!(table_id(&[]), REFUSED);
+}
+
+#[test]
+fn a_rank_whose_parser_refuses_a_setting_still_gathers_and_both_ranks_fail() {
+    let ours = [("A", 1), ("B", 2)];
+    let table = table_id(&ours);
+    for (rank, peer) in [(0, 1), (1, 0)] {
+        // The rank with the refused value: its one-word gather, then its
+        // parser's message.
+        let refusal = || Err(anyhow::anyhow!("ATLAS_X must be 0 or 1"));
+        let (agreed, sizes) = gathers(rank, refusal(), false, table, vec![1, 2]);
+        let why = format!("{:#}", agreed.unwrap_err());
+        assert!(
+            why.contains(&format!("rank {rank} refuses one of its settings"))
+                && why.contains("ATLAS_X must be 0 or 1"),
+            "{why}"
+        );
+        assert_eq!(sizes, [8]);
+        // Its peer: the same one gather, and the refusing rank named.
+        let (agreed, sizes) = gathers(peer, Ok(ours.to_vec()), false, REFUSED, vec![]);
+        let why = agreed.unwrap_err().to_string();
+        assert!(
+            why.contains(&format!("rank {rank} refuses one of its settings")),
+            "{why}"
+        );
+        assert_eq!(sizes, [8]);
+        // Both refusing: each reports its own.
+        let (agreed, sizes) = gathers(rank, refusal(), false, REFUSED, vec![]);
+        assert!(format!("{:#}", agreed.unwrap_err()).contains("ATLAS_X must be 0 or 1"));
+        assert_eq!(sizes, [8]);
+    }
+}
+
+#[test]
+fn warn_only_logs_and_boots_with_the_same_gathers() {
+    let ours = [("A", 1), ("B", 2)];
+    let table = table_id(&ours);
+    // A difference: both gathers, as when failing.
+    let differs = |warn| gathers(1, Ok(ours.to_vec()), warn, table, vec![1, 5]);
+    let (strict, strict_sizes) = differs(false);
+    assert!(strict.is_err());
+    let (warned, sizes) = differs(true);
+    warned.unwrap();
+    assert_eq!(sizes, [8, 16]);
+    assert_eq!(sizes, strict_sizes);
+    // A refusal, this rank's or its peer's: the one gather.
+    let refused = Err(anyhow::anyhow!("junk"));
+    let (warned, sizes) = gathers(0, refused, true, table, vec![]);
+    warned.unwrap();
+    assert_eq!(sizes, [8]);
+    let (warned, sizes) = gathers(0, Ok(ours.to_vec()), true, REFUSED, vec![]);
+    warned.unwrap();
+    assert_eq!(sizes, [8]);
 }
 
 #[test]
@@ -215,6 +292,14 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_GLM_PC_FINISH_LEAF_BLOCKS",
         "ATLAS_GLM_PC_WRITE_FLOOR",
         "ATLAS_GLM_KV_WRITE_FLOOR_LEGACY",
+        "ATLAS_GLM_KDA_MULTI_SEQ",
+        "ATLAS_GLM_MLA_MULTI_SEQ",
+        "ATLAS_GLM_KDA_BATCHED_FFN",
+        "ATLAS_GLM_C4_DECODE",
+        "ATLAS_GLM_LONG_BATCH_FFN",
+        "ATLAS_GLM_LONG_BATCH_SERIAL",
+        "ATLAS_GLM_MTP_DISTRIBUTED",
+        "ATLAS_STARTUP_PARITY=warn",
     ] {
         assert_eq!(
             names.iter().filter(|&&n| n == required).count(),

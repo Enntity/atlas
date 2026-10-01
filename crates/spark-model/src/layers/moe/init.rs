@@ -30,12 +30,7 @@ impl MoeLayer {
         // Sanity-check the routing config: top-k that exceeds the
         // expert count would index OOB in the topk kernel and produce
         // silent NaN routing. Catch the misconfiguration at load time.
-        let c2_toggle = match std::env::var("ATLAS_GLM_C2_COMPACT_MOE") {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(error.into()),
-        };
-        let c2_compact_moe = super::forward_c2::parse_toggle(c2_toggle.as_deref())?;
+        let c2_compact_moe = super::forward_c2::c2_compact_requested()?;
         anyhow::ensure!(
             config.num_experts_per_tok <= num_experts && num_experts > 0,
             "MoE config invalid: num_experts_per_tok={} must be in 1..={}",
