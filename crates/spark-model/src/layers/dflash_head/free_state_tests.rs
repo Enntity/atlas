@@ -268,6 +268,10 @@ pub(super) fn live_state(
         ctx_committed: 300,
         ctx_positions: (0..300).collect(),
         end_floor: 0,
+        first_append_at: None,
+        own_capture: false,
+        own_row_at: None,
+        own_row: None,
         lane_id: 0,
         lifecycle: Some(CaptureDescriptor::bind(own, 40, 4, 4, 16).unwrap()),
     })
