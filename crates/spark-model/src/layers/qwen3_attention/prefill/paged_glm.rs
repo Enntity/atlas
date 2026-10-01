@@ -196,10 +196,11 @@ impl Qwen3AttentionLayer {
             // a dequantized view; long owners and verify rows read FP8 directly,
             // as do, under the pipelined kernel, sparse pieces native declines.
             let sparse_view = ops::glm_sparse_owner_needs_view(&ctx.config.model_type, on, || {
-                Ok(false) // no out-of-tree native kernel in this tree
+                ops::glm_sparse_native_admits(&octx, on, o.seq_len_start, false, stream)
             })?;
             // Few rows merge per-rank attention under a shard (`ATLAS_GLM_KV_SHARD=1`),
             // the canonical form's bits unsharded; larger sharded owners read a view.
+            let sharded = kv_cache.latent_shard().is_some();
             let latents = self.glm_owner_latents(kv_cache, &octx, o, sequence_end, stream)?;
             let merge_form = latents.is_none();
             let canonical = self.glm_canonical_rank(kv_cache, ctx, nq, o.rows)?;
@@ -278,15 +279,41 @@ impl Qwen3AttentionLayer {
                     block_size: bs,
                     scale: self.effective_attn_scale(hd),
                 };
+                let (physical_blocks, table_blocks, block_bytes) = match view {
+                    Some(v) => (v.blocks, v.blocks, 16 * 512 * 2),
+                    None => (
+                        kv_cache.num_blocks(),
+                        o.meta.max_blocks_per_seq as usize,
+                        kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx),
+                    ),
+                };
+                // SparkGLM-only: the out-of-tree NVIDIA sparse-MLA prefill,
+                // when loaded (`ATLAS_GLM_SPARSE_NATIVE=1`). Sharded latents
+                // without a BF16 view have no geometry the bridge understands.
+                let native = cache_dtype == KvCacheDtype::Bf16
+                    && (view.is_some() || !sharded)
+                    && ops::try_glm_sparse_native(
+                        &octx,
+                        &sparse_args,
+                        o.seq_len_start,
+                        physical_blocks,
+                        table_blocks,
+                        block_bytes,
+                        // This caller is ordinary continued prefill. Repaired K3
+                        // verification has a separate multi-sequence attention path.
+                        false,
+                        stream,
+                    )?;
                 // Few-row owners (verify) split over the selected IDs; the MoE
                 // expert scratch is dead until this layer's FFN.
-                let accelerated = ops::try_glm_sparse_prefill_tc_split(
-                    ctx.gpu,
-                    &sparse_args,
-                    ctx.buffers.expert_gate_out(),
-                    ctx.buffers.sizes().expert_gate_out,
-                    stream,
-                )?;
+                let accelerated = native
+                    || ops::try_glm_sparse_prefill_tc_split(
+                        ctx.gpu,
+                        &sparse_args,
+                        ctx.buffers.expert_gate_out(),
+                        ctx.buffers.sizes().expert_gate_out,
+                        stream,
+                    )?;
                 if !accelerated {
                     ensure!(
                         cache_dtype == KvCacheDtype::Bf16,
