@@ -294,6 +294,18 @@ impl CommBackend for NcclBackend {
         self.broadcast_classified(ptr, 4, 0, Classification::IdleCommand)
     }
 
+    fn command_words_max(&self) -> usize {
+        self.cmd_ring_max_words()
+    }
+
+    fn send_command_words(&self, words: &[u32]) -> Result<()> {
+        self.cmd_ring_send(words)
+    }
+
+    fn recv_command_words(&self, words: &mut [u32]) -> Result<()> {
+        self.cmd_ring_recv(words)
+    }
+
     fn barrier(&self) -> Result<()> {
         let comm = *self.comm.lock();
         let result = unsafe {

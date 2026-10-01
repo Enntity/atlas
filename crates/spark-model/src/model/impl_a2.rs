@@ -155,6 +155,9 @@ impl TransformerModel {
             return Ok(tokens.to_vec());
         }
         let comm = self.comm.as_ref().unwrap();
+        if self.ep_cmd_words_on_host(n) {
+            return self.ep_cmd_words(tokens);
+        }
         let byte_len = n * 4;
         let stream = self.gpu.default_stream();
         let _transfer = self.warm.transfer_span(); // ATLAS_GLM_WARM_TRACE
@@ -356,6 +359,9 @@ impl TransformerModel {
     /// Other ranks receive the value and return it.
     pub(super) fn ep_broadcast_u32(&self, val: u32) -> Result<u32> {
         let comm = self.comm.as_ref().expect("ep_broadcast_u32 without comm");
+        if self.ep_cmd_words_on_host(1) {
+            return Ok(self.ep_cmd_words(&[val])?[0]);
+        }
         let stream = self.gpu.default_stream();
         if comm.rank() == 0 {
             // Sender: H2D + broadcast. Stream ordering ensures completion

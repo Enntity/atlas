@@ -143,7 +143,17 @@ fn a_failed_proxy_poisons_the_channel_and_releases_the_stage_wait() {
     };
     let (jobs, stop) = Default::default();
     let ch = Channel::new(c, host, 0);
-    let end = proxy_loop(Vec::new(), &[], &peer, legacy, 64, &jobs, &stop, Some(ch));
+    let end = proxy_loop(
+        Vec::new(),
+        &[],
+        &peer,
+        legacy,
+        64,
+        &jobs,
+        &stop,
+        Some(ch),
+        None,
+    );
     assert!(end.unwrap_err().to_string().contains("not eligible"));
     // Nothing would clear `stage` again: the proxy leaves it clear, so the
     // stream reaches the kernel, and poisoned, so that kernel traps.
