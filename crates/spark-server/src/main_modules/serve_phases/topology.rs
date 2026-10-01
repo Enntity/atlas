@@ -67,6 +67,8 @@ pub(crate) fn resolve_topology(
     config.tp_world_size = tp_size;
     config.ep_rank = ep_rank;
     config.ep_world_size = ep_size;
+    // Every rank must resolve the same value (`rank_settings`): with it each
+    // rank holds a slice of every routed expert, without it half of them.
     config.expert_tp = std::env::var("ATLAS_GLM_EXPERT_TP").as_deref() == Ok("1")
         && config.model_type == "glm5_next"
         && ep_size == 2
@@ -158,6 +160,30 @@ pub(crate) fn resolve_topology(
     })
 }
 
+/// The settings this crate resolves that every rank must share, for
+/// `spark_model::model::startup_parity`: a mismatch changes the rows of a
+/// prefill pass, the exchanges it may take, or what a rank computes.
+#[cfg(feature = "nccl")]
+fn rank_settings(
+    args: &cli::ServeArgs,
+    config: &ModelConfig,
+    max_batch_tokens: usize,
+) -> [spark_model::model::startup_parity::Setting; 6] {
+    [
+        ("ATLAS_GLM_EXPERT_TP", config.expert_tp as u64),
+        // The arena and pair capacity: `--max-prefill-tokens`,
+        // `--max-batch-size`, `ATLAS_MAX_BATCH_TOKENS`.
+        ("max batch tokens", max_batch_tokens as u64),
+        ("--block-size", args.block_size as u64),
+        ("--enable-prefix-caching", args.enable_prefix_caching as u64),
+        ("--ssm-cache-slots", args.ssm_cache_slots as u64),
+        (
+            "--ssm-checkpoint-interval",
+            args.ssm_checkpoint_interval as u64,
+        ),
+    ]
+}
+
 /// `max_batch_tokens` and `hidden_size` size the 2-rank all-reduce receive
 /// buffer. Together they bound the largest payload any caller can hand a
 /// collective: prefill MoE, prefill attention and prefill SSM all reduce a
@@ -171,9 +197,10 @@ pub(crate) fn init_nccl_comm(
     gpu: &dyn spark_runtime::gpu::GpuBackend,
     world_size: usize,
     max_batch_tokens: usize,
-    hidden_size: usize,
+    config: &ModelConfig,
 ) -> Result<Option<std::sync::Arc<dyn spark_comm::CommBackend>>> {
     use spark_comm::CommBackend;
+    let hidden_size = config.hidden_size;
     if world_size <= 1 {
         return Ok(None);
     }
@@ -207,10 +234,11 @@ pub(crate) fn init_nccl_comm(
     .context("Failed to initialize NCCL")?;
     tracing::info!("NCCL initialized: rank {}", backend.rank());
     crate::ep_peer_lifeline::watch(&backend).context("Failed to arm the EP peer lifeline")?;
-    // Before any other collective: a rank splitting the GLM index selection
-    // alone would deadlock the pair at a prompt-dependent prefill.
-    spark_model::layers::qwen3_attention::agree_index_split(&backend, gpu)
-        .context("GLM index split settings")?;
+    // Before any other collective: a rank running another value of one of
+    // these would deadlock or mispair the ranks at a prompt-dependent step.
+    let settings = rank_settings(args, config, max_batch_tokens);
+    spark_model::model::startup_parity::agree(&backend, gpu, &settings)
+        .context("Startup settings agreement")?;
     Ok(Some(
         std::sync::Arc::new(backend) as std::sync::Arc<dyn spark_comm::CommBackend>
     ))
@@ -227,7 +255,7 @@ pub(crate) fn init_nccl_comm(
     _gpu: &dyn spark_runtime::gpu::GpuBackend,
     world_size: usize,
     _max_batch_tokens: usize,
-    _hidden_size: usize,
+    _config: &ModelConfig,
 ) -> Result<Option<std::sync::Arc<dyn spark_comm::CommBackend>>> {
     if world_size > 1 {
         anyhow::bail!(
@@ -250,7 +278,7 @@ pub(crate) fn init_nccl_comm(
     _gpu: &dyn spark_runtime::gpu::GpuBackend,
     world_size: usize,
     _max_batch_tokens: usize,
-    _hidden_size: usize,
+    _config: &ModelConfig,
 ) -> Result<Option<std::sync::Arc<dyn spark_comm::CommBackend>>> {
     if world_size > 1 {
         anyhow::bail!(

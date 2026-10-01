@@ -15,6 +15,12 @@ pub fn dflash_enabled() -> bool {
     std::env::var("ATLAS_GLM_DFLASH").as_deref() == Ok("1")
 }
 
+/// The DFlash lane verifies a block through the multi-row prefill path;
+/// `ATLAS_GLM_DFLASH_PREFILL_VERIFY=0` reverts to one decode chain per row.
+pub fn dflash_prefill_verify() -> bool {
+    std::env::var("ATLAS_GLM_DFLASH_PREFILL_VERIFY").as_deref() != Ok("0")
+}
+
 /// A retained long-context GLM verify owner is active: repaired MTP or DFlash.
 pub fn long_lane_enabled() -> bool {
     enabled() || dflash_enabled()

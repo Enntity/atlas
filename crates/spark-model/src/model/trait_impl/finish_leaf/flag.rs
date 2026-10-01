@@ -52,7 +52,7 @@ pub(in crate::model) fn enabled() -> bool {
 const DEFAULT_SPAN_BLOCKS: usize = 4;
 
 /// The save span in blocks (`ATLAS_GLM_PC_FINISH_LEAF_BLOCKS`). Read once.
-pub(super) fn span_blocks() -> usize {
+pub(in crate::model) fn span_blocks() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("ATLAS_GLM_PC_FINISH_LEAF_BLOCKS")

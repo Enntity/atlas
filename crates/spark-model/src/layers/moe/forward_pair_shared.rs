@@ -2,6 +2,21 @@
 //! Explicit shared width within the joint routed FFN; legacy K5 is separate.
 use super::*;
 
+/// `ATLAS_GLM_SHARED_TP_SPLIT=1`. Read once. Both ranks must run the same
+/// value (`model::startup_parity`): a rank splitting alone adds its half to
+/// the peer's whole shared output.
+pub(crate) fn shared_tp_split_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_SHARED_TP_SPLIT").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_MOE_SHARED_REDUCE_OVERLAP=1`: run the shared expert on the prefill
+/// stream while the EP all-reduce is in flight. A chunk that overlaps does
+/// not take the TP split, so this must match across the ranks too.
+pub(crate) fn shared_reduce_overlap_requested() -> bool {
+    std::env::var("ATLAS_MOE_SHARED_REDUCE_OVERLAP").as_deref() == Ok("1")
+}
+
 impl MoeLayer {
     #[allow(clippy::too_many_arguments)]
     /// Shared expert for an owner-batched verify of `rows` (9..=32) rows:
@@ -71,12 +86,10 @@ impl MoeLayer {
     /// (`ATLAS_GLM_SHARED_TP_SPLIT=1`, EP2, NVFP4 shared weights with scalar
     /// scale2, strided tensor-core tiers for `rows`).
     pub(super) fn shared_split_ready(&self, ctx: &ForwardContext, rows: u32) -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on =
-            *ON.get_or_init(|| std::env::var("ATLAS_GLM_SHARED_TP_SPLIT").as_deref() == Ok("1"));
         let shared = &self.weights.shared_expert;
         let inter = ctx.config.shared_expert_intermediate_size;
-        on && ctx.config.ep_world_size == 2
+        shared_tp_split_requested()
+            && ctx.config.ep_world_size == 2
             && ctx.comm.is_some_and(|c| c.world_size() == 2)
             && inter.is_multiple_of(32)
             && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4

@@ -289,7 +289,7 @@ impl TransformerModel {
             if skip
                 && prefix_match.ssm_snapshot_tokens == matched
                 && matched == total
-                && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1")
+                && !crate::model::mtp_carry::marconi_exact()
             {
                 skip = false;
                 seq.marconi_exact_snap = None;
