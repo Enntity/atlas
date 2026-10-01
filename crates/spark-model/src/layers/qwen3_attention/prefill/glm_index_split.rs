@@ -21,6 +21,14 @@
 //!
 //! `ATLAS_GLM_INDEX_SPLIT_CHECK=1` also selects every row into scratch and
 //! fails the request on both ranks on any difference (`check`).
+//!
+//! Prior art: splitting the prefill indexer's rows across ranks (with a
+//! re-select-every-row check) follows RiNGSiDE's `GLM53_INDEXER_ROW_SPLIT`
+//! (othexmr, <https://github.com/othexmr/GLM-5.3-Flash-NVFP4-2x-4x-DGX-Sparks-RiNGSiDE>
+//! `src/tp4/glm53_indexer_rowsplit.py`; Apache-2.0), itself after rhys101's
+//! SG18 prefill TP split and knapcio's DeepSeek-V4.1 TP4 adaptation. Ideas
+//! only, no code. The zigzag quarters and the pair swap are ours
+//! (docs/glm-prior-art.md).
 
 use std::ops::Range;
 

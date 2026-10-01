@@ -19,6 +19,10 @@ the full MLA latent cache and the full sparse-index cache for every token on
 BOTH ranks. The latent is 90% of the per-token KV bytes, so four concurrent
 512K-token contexts do not fit. The latent only has to exist once per pair.
 
+Related work (not the source of this design): vLLM's decode context
+parallelism (`decode_context_parallel_size`, Apache-2.0) also shards the KV
+cache by token across ranks. See [glm-prior-art.md](glm-prior-art.md).
+
 ## Layout
 
 - **Ownership by block-id residue, pinned to the logical index.** Block `b`

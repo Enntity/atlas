@@ -254,6 +254,9 @@ int rs_post_write(struct rs_conn *c, void *local_addr, uint32_t lkey,
 // Without relaxed ordering on the MRs, the responder places same-QP WRITEs in
 // order, so the peer does not observe the flag before the data (a practical
 // NIC property, not an IB-spec guarantee: callers keep it opt-in).
+// Same chaining as b12x RoCEnante's proxy (data WR -> signaled flag WR;
+// github.com/local-inference-lab/b12x b12x/comm/roce/_roce_proxy.c,
+// Apache-2.0; idea only, no code).
 int rs_post_write_flag(struct rs_conn *c, void *local_addr, uint32_t lkey,
                        uint64_t remote_addr, uint32_t rkey, uint32_t len,
                        void *flag_addr, uint64_t flag_remote, uint64_t wr_id) {

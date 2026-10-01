@@ -29,6 +29,17 @@
 //
 // Not on the PDL list: it must start after its stream predecessors, and its
 // successors must not read dst before it completes.
+//
+// Prior art (ideas only, no code; docs/glm-prior-art.md): the protocol --
+// pinned parity receive slots, a host proxy that WRITEs each stripe then a
+// seq flag on the same QP, poison on timeout -- follows b12x RoCEnante
+// (github.com/local-inference-lab/b12x, b12x/comm/roce/ and docs/rocenante.md;
+// Jason Cook, local-inference-lab/b12x#295; Apache-2.0), with the graph-replay
+// wedge hazard of local-inference-lab/b12x#313. The device-resident sequence,
+// block-0 flag polling with a device go word, and last-block-out seq store
+// follow mmastrac's arx one-shot all-reduce (github.com/mmastrac/
+// glm-5.3-flash-4x-gx10, experimental/arx/arx_vllm.cu, PR #4; that directory
+// carries no license, so nothing of it is reproduced here).
 
 #include <cuda_bf16.h>
 #include <stdint.h>

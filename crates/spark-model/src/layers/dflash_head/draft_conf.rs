@@ -9,6 +9,11 @@
 //! They ride the draft readback the propose already does, and the scheduler
 //! sizes the verify from them (`dflash_conf_width`). Off, the head launches
 //! the production selector and reads `gamma` words, as before.
+//!
+//! Prior art: the signal is the per-draft "log max softmax" of the selector's
+//! scores that knapcio's `GLM_DRAFT_TRUNC` truncates on
+//! (<https://github.com/knapcio/GLM-5.3-Flash-4x-DGX-Spark-TP4>,
+//! `overlay/glm_draft_trunc.py`; ideas, no code; docs/glm-prior-art.md).
 
 use spark_runtime::gpu::{GpuBackend, KernelHandle};
 
