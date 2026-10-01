@@ -303,6 +303,7 @@ impl TransformerModel {
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("sequence proposer state disappeared"))?;
             proposer.after_verify(num_accepted, expected_owner, prop_state.as_mut(), stream)?;
+            crate::layers::dflash_head::note_own_capture(prop_state.as_mut());
 
             if let Some(last) = output_tokens.last()
                 && params.stop_token_ids.contains(last)
