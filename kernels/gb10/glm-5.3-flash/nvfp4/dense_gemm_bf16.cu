@@ -5,6 +5,36 @@
 // with its namesake.
 #include "../../common/dense_gemm_bf16.cu"
 
+// KDA prefill beta | f_a | g_a: three weights over one activation in one grid.
+// blockIdx.x walks the planes' N tiles (plane 0 has N0 columns, planes 1-2
+// N12), so the CTAs of one A row tile launch back to back and share it in L2
+// instead of three launches each streaming A from DRAM. Every plane runs the
+// unchanged dense_gemm_bf16_pipelined body: bit-identical to its own launch.
+// Grid: (ceil(N0/DM_N_TILE) + 2*ceil(N12/DM_N_TILE), ceil(M/DM_M_TILE), 1)
+// Block: (256, 1, 1).
+extern "C" __global__ void dense_gemm_bf16_pipelined_triple_n(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B0,
+    const __nv_bfloat16* __restrict__ B1,
+    const __nv_bfloat16* __restrict__ B2,
+    __nv_bfloat16* __restrict__ C0,
+    __nv_bfloat16* __restrict__ C1,
+    __nv_bfloat16* __restrict__ C2,
+    unsigned int M,
+    unsigned int N0,
+    unsigned int N12,
+    unsigned int K
+) {
+    const unsigned int t0 = (N0 + DM_N_TILE - 1) / DM_N_TILE;
+    const unsigned int t12 = (N12 + DM_N_TILE - 1) / DM_N_TILE;
+    const unsigned int x = blockIdx.x;
+    const unsigned int plane = x < t0 ? 0u : (x < t0 + t12 ? 1u : 2u);
+    const unsigned int tile = plane == 0u ? x : x - t0 - (plane - 1u) * t12;
+    dense_gemm_bf16_pipelined_tile(A, plane == 0u ? B0 : (plane == 1u ? B1 : B2),
+        plane == 0u ? C0 : (plane == 1u ? C1 : C2), M, plane == 0u ? N0 : N12, K,
+        blockIdx.y * DM_M_TILE, tile * DM_N_TILE);
+}
+
 // Exact-M=5 router GEMM for GLM speculative verification.
 //
 // The generic order-preserving router tile has 16 row lanes, so eleven lanes

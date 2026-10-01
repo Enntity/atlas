@@ -478,6 +478,7 @@ impl TransformerModel {
                 // Compute is_last from chunk bounds — must match rank 0's
                 // value so Marconi skip branches are identical (bug #33).
                 let is_last = chunk_start + chunk_len >= full_len;
+                super::kv_admission::check_worker_chunk_start(seq, chunk_start)?;
                 let _ =
                     self.prefill_chunk(&full_tokens, seq, chunk_start, chunk_len, is_last, stream)?;
                 // Normalize SSM states after every chunk — must mirror the head's

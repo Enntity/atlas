@@ -60,6 +60,7 @@ pub(crate) mod impl_b3_dflash;
 pub(crate) mod impl_lora;
 pub(crate) mod impl_lora_swap;
 mod impl_ngram;
+pub mod kv_admission;
 pub(crate) mod mtp_carry;
 pub(crate) mod pinned_pack;
 pub(crate) mod ssm_batched_copy;
