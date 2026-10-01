@@ -29,6 +29,10 @@ extern "C" __global__ void glm_index_layernorm_bf16(
         __syncthreads();
     }
     const float mean = reduce[0] / (float)dim;
+    // Every thread must hold the mean before thread 0 reuses reduce[0] for
+    // its squared sum: without this barrier a warp scheduled late reads the
+    // squared sum as the row sum and normalizes its lanes with a wrong mean.
+    __syncthreads();
     float sq = 0.0f;
     for (unsigned int d = threadIdx.x; d < dim; d += blockDim.x) {
         const float centered = __bfloat162float(x[d]) - mean;
