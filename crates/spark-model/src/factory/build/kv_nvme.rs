@@ -48,7 +48,7 @@ pub(super) struct NvmeKvConfig {
 }
 
 /// The tier's configuration from the environment.
-fn config_from_env() -> Result<Option<NvmeKvConfig>> {
+pub(super) fn config_from_env() -> Result<Option<NvmeKvConfig>> {
     let var = |name| std::env::var(name).ok();
     config_from(
         var(DIR_VAR).as_deref(),

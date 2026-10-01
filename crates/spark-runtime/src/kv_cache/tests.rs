@@ -8,6 +8,7 @@ use super::*;
 use crate::gpu::GpuBackend;
 use crate::gpu::mock::MockGpuBackend;
 
+mod latent_shard;
 mod nvme_bench;
 mod nvme_fast;
 mod nvme_spill;

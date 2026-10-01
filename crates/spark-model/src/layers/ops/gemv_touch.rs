@@ -39,7 +39,7 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use crate::weight_map::QuantizedWeight;
 
-/// A touch twin: an index into [`TWINS`].
+/// A touch twin: an index into `TWINS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Twin {
     W4Tc8,
@@ -229,7 +229,7 @@ impl GemvTouch {
 
     /// Two `w4a16_gemv_tc{8,16,32}` projections of one `input` (whole
     /// weights of `n` rows by `k`) in one launch through the pair twin
-    /// ([`w4a16_pair_twin`], at least `m` rows), grid z = plane: each
+    /// (`w4a16_pair_twin`, at least `m` rows), grid z = plane: each
     /// `(weight, output)` gets the tier's unchanged body and touches its
     /// weight during the PDL wait.
     #[allow(clippy::too_many_arguments)]

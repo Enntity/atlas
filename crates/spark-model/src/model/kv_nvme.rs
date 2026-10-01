@@ -302,8 +302,11 @@ pub(crate) fn restore_prefix(
     let io0 = kv_cache.nvme_io_stats();
     let t0 = std::time::Instant::now();
     let mut blocks = Vec::with_capacity(wanted);
+    // Each block's index in the sequence (the tier is refused beside a latent
+    // shard, whose allocator draws by it: `factory::build::glm::shard_plan`).
+    let first = plan.resident_tokens / bs;
     while blocks.len() < wanted {
-        match alloc_block_evicting(kv_cache, prefix_cache, gpu) {
+        match alloc_block_evicting(kv_cache, prefix_cache, gpu, first + blocks.len()) {
             Some(b) => blocks.push(b),
             None => break,
         }
