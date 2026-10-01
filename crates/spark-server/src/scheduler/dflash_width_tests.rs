@@ -69,3 +69,15 @@ fn eight_owners_stay_within_the_row_budget() {
     // 8 owners x 4 rows is the widest batch the 32-row budget admits.
     assert_eq!(best(eight.into_iter(), 7), 3);
 }
+
+#[test]
+fn width_params_parse_with_an_optional_burst_floor() {
+    assert_eq!(parse_params(None), DEFAULT_PARAMS);
+    assert_eq!(parse_params(Some("garbage")), DEFAULT_PARAMS);
+    // Four values keep the production burst floor.
+    let four = parse_params(Some("0.98, 0.6, 3, 0.2"));
+    assert_eq!((four.prior_h, four.burst_h), (0.6, DEFAULT_PARAMS.burst_h));
+    // A fifth sets it; 0 turns it off.
+    let five = parse_params(Some("0.98,0.6,3,0.2,0"));
+    assert_eq!((five.prior_h, five.burst_h), (0.6, 0.0));
+}
