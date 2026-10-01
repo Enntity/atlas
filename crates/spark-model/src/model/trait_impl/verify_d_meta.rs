@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 
+use super::super::super::block_table_upload::upload_block_table_rows;
 use super::super::super::types::TransformerModel;
 use crate::layer::AttnMetadataDev;
 use crate::traits::SequenceState;
@@ -61,23 +62,14 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(sl_bytes, meta_base.offset(512), stream)?;
 
-        let mb = max_blocks as usize;
-        let needed = k * mb;
-        let mut bt_buf = vec![0i32; needed];
-        for row in 0..k {
-            for (j, &block) in seq.block_table.iter().enumerate().take(mb) {
-                bt_buf[row * mb + j] = block as i32;
-            }
-        }
-        // SAFETY: `bt_buf` is `vec![0i32; needed]` on the line above, so its
-        // LEN is `needed` and `needed * 4 == size_of_val(&bt_buf[..])` — the
-        // read stops at `len`, never in the `Vec`'s spare capacity. The
-        // zero-init at construction covers the tail the `for row in 0..k`
-        // fill leaves untouched when `block_table.len() < mb`.
-        let bt_bytes =
-            unsafe { std::slice::from_raw_parts(bt_buf.as_ptr() as *const u8, needed * 4) };
-        self.gpu
-            .copy_h2d_async(bt_bytes, meta_base.offset(768), stream)?;
+        // Every row carries the sequence's table, zero-padded to `max_blocks`.
+        upload_block_table_rows(
+            self.gpu.as_ref(),
+            meta_base.offset(768),
+            max_blocks as usize,
+            std::iter::repeat_n(&seq.block_table[..], k),
+            stream,
+        )?;
 
         // Upload uniform LoRA slots before capture; +128 gap holds K<=32.
         debug_assert!(k <= 32, "γ verify seq_slot +128 gap holds K ≤ 32");
