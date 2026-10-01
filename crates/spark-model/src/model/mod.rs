@@ -77,6 +77,7 @@ mod ssm_verify_attach;
 pub(crate) mod token_overlay;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
+pub(crate) mod verify_pieces;
 pub(crate) mod vision_transport;
 
 // Served NLLB-200 / M2M-100 encoder-decoder model (CUDA/GB10 serving path).
