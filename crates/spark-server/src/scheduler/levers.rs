@@ -36,6 +36,9 @@ pub struct SchedLevers {
     /// Run the full sample pipeline during MTP verify. Ships ON;
     /// `ATLAS_NO_MTP_VERIFY_SAMPLE=1` opts out.
     pub mtp_verify_sample: bool,
+    /// `ATLAS_PREFILL_SRPT=1`: a new multi-chunk prefill joins the queue by
+    /// tokens left (shortest first) instead of by arrival.
+    pub prefill_srpt: bool,
 
     // ── DFlash speculation ──
     pub dflash_masked_verify: bool,
@@ -141,6 +144,7 @@ impl SchedLevers {
             force_temp_zero: opt_in("ATLAS_FORCE_TEMP_ZERO"),
             mtp_minp: on_unless("ATLAS_NO_MTP_MINP"),
             mtp_verify_sample: on_unless("ATLAS_NO_MTP_VERIFY_SAMPLE"),
+            prefill_srpt: opt_in("ATLAS_PREFILL_SRPT"),
 
             dflash_masked_verify: opt_in("ATLAS_DFLASH_MASKED_VERIFY"),
             dflash_seam_serial: opt_in("ATLAS_DFLASH_SEAM_SERIAL"),
@@ -189,6 +193,7 @@ impl SchedLevers {
             force_temp_zero: false,
             mtp_minp: true,
             mtp_verify_sample: true,
+            prefill_srpt: false,
             dflash_masked_verify: false,
             dflash_seam_serial: false,
             dflash_adaptive: false,

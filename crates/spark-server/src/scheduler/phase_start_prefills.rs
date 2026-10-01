@@ -11,6 +11,7 @@ use crate::api::InferenceRequest;
 use crate::grammar::GrammarEngine;
 
 mod initial_budget;
+mod queue_order;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_new_requests(
@@ -292,7 +293,16 @@ pub(super) fn start_new_requests(
                         p.chunk_offset,
                         p.prompt_tokens.len(),
                     );
-                    prefilling.push(p);
+                    let queued: Vec<_> = prefilling
+                        .iter()
+                        .map(|q| {
+                            let left = q.prompt_tokens.len() - q.chunk_offset;
+                            (left, q.request_start.elapsed())
+                        })
+                        .collect();
+                    let left = p.prompt_tokens.len() - p.chunk_offset;
+                    let at = queue_order::position(&queued, left, sched.levers.prefill_srpt);
+                    prefilling.insert(at, p);
                 }
                 Ok(StartPrefillResult::Finished) => {} // EOS on first token
                 Err(e) => {
