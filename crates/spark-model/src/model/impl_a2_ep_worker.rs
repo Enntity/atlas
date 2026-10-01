@@ -43,6 +43,9 @@ impl TransformerModel {
             .comm
             .as_ref()
             .expect("ep_receive_idle_word without comm");
+        if self.ep_cmd_words_on_host(1) {
+            return Ok(self.ep_cmd_words(&[0])?[0]);
+        }
         let stream = self.gpu.default_stream();
         comm.receive_idle_command_word(self.ep_cmd_buf.0)?;
         self.gpu.synchronize(stream)?;

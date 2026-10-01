@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The RDMA pair proxy thread. One event loop serves both channels -- the
-//! one-shot `stage` word and the head legacy job -- without blocking on
-//! either: the host queues legacy jobs milliseconds ahead of the GPU, so a
-//! one-shot op can precede the head job on the stream.
+//! The RDMA pair proxy thread. One event loop serves every channel -- the
+//! one-shot `stage` word, the host command ring and the head legacy job --
+//! without blocking on any: the host queues legacy jobs milliseconds ahead of
+//! the GPU, so a one-shot op or a command word can precede the head job.
 
+use super::cmd_ring::{CmdProxy, Wire};
 use super::oneshot::{Channel, stripes};
 use super::{ARRIVED, FLAG_SRC, Job, Peer, READY, SPLIT_MIN, flag_off, recv_off, send_off};
 use anyhow::Result;
@@ -21,9 +22,46 @@ pub(super) fn chain_requested() -> bool {
     std::env::var("ATLAS_RDMA_PAIR_CHAIN").as_deref() == Ok("1")
 }
 
+/// The command ring's proxy half with the addresses of this rank's command
+/// region and the peer's.
+pub(super) struct CmdLink {
+    pub(super) proxy: CmdProxy,
+    pub(super) local: usize,
+    pub(super) peer: u64,
+}
+
+/// The command ring's WRITEs: rail 0, each reaped before the next.
+struct CmdWire<'a> {
+    rail: &'a mut Verbs,
+    lkey: u32,
+    rkey: u32,
+    local: usize,
+    peer: u64,
+}
+
+impl Wire for CmdWire<'_> {
+    fn write(&mut self, src: usize, dst: usize, len: usize) -> Result<()> {
+        // SAFETY: both spans lie in the command regions, inside the
+        // registered pinned regions; the ring leaves the local span
+        // unmodified until this WRITE is reaped just below.
+        unsafe {
+            self.rail.post_write(
+                (self.local + src) as *mut c_void,
+                self.lkey,
+                self.peer + dst as u64,
+                self.rkey,
+                u32::try_from(len)?,
+                0,
+            )
+        }?;
+        self.rail.poll().map(drop)
+    }
+}
+
 /// Run the proxy until `stop`. If it fails, no one-shot send would ever
 /// drain, so it stops that channel ([`Channel::fail`]) rather than leave
-/// streams waiting on it.
+/// streams waiting on it. However it ends, no command word moves again, so
+/// the ring's waiters are failed ([`CmdProxy::close`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn proxy_loop(
     rails: Vec<Verbs>,
@@ -34,10 +72,24 @@ pub(super) fn proxy_loop(
     jobs: &Mutex<VecDeque<Job>>,
     stop: &AtomicBool,
     mut oneshot: Option<Channel>,
+    mut cmd: Option<CmdLink>,
 ) -> Result<()> {
-    let end = serve(rails, lkeys, peer, host, capacity, jobs, stop, &mut oneshot);
+    let end = serve(
+        rails,
+        lkeys,
+        peer,
+        host,
+        capacity,
+        jobs,
+        stop,
+        &mut oneshot,
+        &mut cmd,
+    );
     if let (Err(_), Some(ch)) = (&end, &oneshot) {
         ch.fail();
+    }
+    if let Some(cmd) = &cmd {
+        cmd.proxy.close();
     }
     end
 }
@@ -52,12 +104,13 @@ fn serve(
     jobs: &Mutex<VecDeque<Job>>,
     stop: &AtomicBool,
     oneshot: &mut Option<Channel>,
+    cmd: &mut Option<CmdLink>,
 ) -> Result<()> {
     // SAFETY: the flag page lives in the pinned region for the pair's lifetime;
     // `ready` is written by the GPU (stream memop) and read only here.
     let ready = unsafe { &*((host + flag_off(capacity) + READY) as *const AtomicU64) };
     let chain = chain_requested();
-    let mut idle = Idle::from_env(oneshot.is_some());
+    let mut idle = Idle::from_env(oneshot.is_some(), cmd.is_some());
     let mut stats = Stats::from_env();
     // The head legacy job, its next segment, and when that segment became due.
     let mut head: Option<(Job, usize, Instant)> = None;
@@ -67,6 +120,19 @@ fn serve(
         {
             idle.reset();
             continue;
+        }
+        if let Some(cmd) = cmd.as_mut() {
+            let mut wire = CmdWire {
+                rail: &mut rails[0],
+                lkey: lkeys[0],
+                rkey: peer.rkeys[0],
+                local: cmd.local,
+                peer: cmd.peer,
+            };
+            if cmd.proxy.serve(&mut wire)? {
+                idle.reset();
+                continue;
+            }
         }
         if head.is_none() {
             head = jobs.lock().pop_front().map(|job| (job, 0, Instant::now()));
@@ -179,7 +245,10 @@ fn send_segment(
 /// spin `ATLAS_RDMA_PAIR_SPIN_US` (10,000 with one-shot) after the last work,
 /// then nap `ATLAS_RDMA_PAIR_NAP_US` (20) with 1 us timer slack -- a graph
 /// replay gives the proxy no host-side notice, so the first stage after a
-/// pause waits at most about one nap.
+/// pause waits at most about one nap. With the command ring alone the spin
+/// is 50,000 us and the naps stay the legacy ones: the head's next step
+/// words come a drafter pass (6-16 ms) after its last collective and must
+/// not meet a napping proxy, while a nap between requests costs nothing.
 struct Idle {
     spin: Option<Duration>,
     nap: Duration,
@@ -188,14 +257,13 @@ struct Idle {
 }
 
 impl Idle {
-    fn from_env(oneshot: bool) -> Self {
+    fn from_env(oneshot: bool, cmd: bool) -> Self {
         let us = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok());
-        let spin = us("ATLAS_RDMA_PAIR_SPIN_US")
-            .or(oneshot.then_some(10_000))
-            .map(Duration::from_micros);
-        let nap = us("ATLAS_RDMA_PAIR_NAP_US").unwrap_or(if spin.is_some() { 20 } else { 50 });
+        let fine = us("ATLAS_RDMA_PAIR_SPIN_US").or(oneshot.then_some(10_000));
+        let spin = fine.or(cmd.then_some(50_000)).map(Duration::from_micros);
+        let nap = us("ATLAS_RDMA_PAIR_NAP_US").unwrap_or(if fine.is_some() { 20 } else { 50 });
         #[cfg(target_os = "linux")]
-        if spin.is_some() {
+        if fine.is_some() {
             // SAFETY: plain prctl on the calling (proxy) thread.
             unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 1000u64) };
         }

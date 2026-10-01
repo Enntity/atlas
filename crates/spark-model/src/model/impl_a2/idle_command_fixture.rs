@@ -18,6 +18,9 @@ pub(super) enum Event {
     D2h(u64, usize),
     H2d(u64, Vec<u8>),
     Alloc,
+    /// Words sent on, and the count received from, the host command channel.
+    HostSend(Vec<u32>),
+    HostRecv(usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Failure {
@@ -25,6 +28,7 @@ pub(super) enum Failure {
     Timed,
     Sync,
     D2h,
+    Host,
 }
 #[derive(Default)]
 pub(super) struct Record {
@@ -32,6 +36,8 @@ pub(super) struct Record {
     pub words: Mutex<VecDeque<u32>>,
     pub failure: Mutex<Option<Failure>>,
     pub timed_failure_at: Mutex<Option<usize>>,
+    /// The host command channel's message size; 0 (the default) is no channel.
+    pub host_words_max: Mutex<usize>,
 }
 impl Record {
     fn fail(&self, at: Failure) -> Result<()> {
@@ -174,6 +180,24 @@ impl CommBackend for Comm {
         self.record.events.lock().push(Event::Idle(ptr));
         self.record.fail(Failure::Idle)?;
         self.transport(ptr, 4)
+    }
+    fn command_words_max(&self) -> usize {
+        *self.record.host_words_max.lock()
+    }
+    fn send_command_words(&self, words: &[u32]) -> Result<()> {
+        let mut events = self.record.events.lock();
+        events.push(Event::HostSend(words.to_vec()));
+        self.record.fail(Failure::Host)
+    }
+    fn recv_command_words(&self, words: &mut [u32]) -> Result<()> {
+        let mut events = self.record.events.lock();
+        events.push(Event::HostRecv(words.len()));
+        self.record.fail(Failure::Host)?;
+        let mut values = self.record.words.lock();
+        for word in words {
+            *word = values.pop_front().expect("fixture incoming word");
+        }
+        Ok(())
     }
     fn rank(&self) -> usize {
         self.rank

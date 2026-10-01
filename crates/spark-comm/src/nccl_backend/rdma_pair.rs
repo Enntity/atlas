@@ -30,7 +30,8 @@
 //!
 //! `ATLAS_RDMA_ONESHOT=1` adds a graph-capturable channel for decode-sized
 //! payloads in its own part of the region ([`oneshot`]); larger payloads stay
-//! here. The proxy serves both channels from one loop.
+//! here. `ATLAS_GLM_CMD_RDMA=1` adds the host command ring ([`cmd_ring`]),
+//! last in the region. The proxy serves every channel from one loop.
 
 use anyhow::{Context, Result, ensure};
 use atlas_rdma::{Gid, Verbs};
@@ -42,10 +43,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(super) mod bootstrap;
+pub(super) mod cmd_ring;
 mod oneshot;
 mod proxy;
+use cmd_ring::CmdRing;
 use oneshot::OneShot;
-use proxy::proxy_loop;
+use proxy::{CmdLink, proxy_loop};
 
 unsafe extern "C" {
     fn cuMemHostAlloc(pp: *mut *mut c_void, bytesize: usize, flags: u32) -> i32;
@@ -121,6 +124,7 @@ pub(super) struct RdmaPair {
     stop: Arc<AtomicBool>,
     proxy: Option<std::thread::JoinHandle<()>>,
     oneshot: Option<OneShot>,
+    cmd: Option<CmdRing>,
 }
 
 // SAFETY: `host` is a pinned allocation owned by this struct; the proxy thread
@@ -174,7 +178,9 @@ impl RdmaPair {
             .and_then(|v| v.parse().ok());
         let os_cfg = oneshot::Config::from_env();
         let os_base = region_bytes(capacity);
-        let bytes = os_base + os_cfg.map_or(0, |c| oneshot::region_bytes(c.max));
+        let cmd_on = cmd_ring::requested();
+        let cmd_base = os_base + os_cfg.map_or(0, |c| oneshot::region_bytes(c.max));
+        let bytes = cmd_base + if cmd_on { cmd_ring::REGION_BYTES } else { 0 };
         let mut host: *mut c_void = std::ptr::null_mut();
         cu(
             unsafe { cuMemHostAlloc(&mut host, bytes, CU_MEMHOSTALLOC_PORTABLE_DEVICEMAP) },
@@ -214,6 +220,7 @@ impl RdmaPair {
             segments: segment_count(),
             capacity,
             oneshot: oneshot::Config::wire(os_cfg),
+            cmd: cmd_ring::wire(cmd_on),
         };
         let (mut stream, remote) = bootstrap::open(&head, &local, link)?;
         let peer_base = u64::from_le_bytes(remote[..BASE_WIRE].try_into()?);
@@ -246,6 +253,17 @@ impl RdmaPair {
             .transpose()?;
         let channel = os_cfg
             .map(|c| oneshot::Channel::new(c, host as usize + os_base, peer_base + os_base as u64));
+        let (cmd, cmd_link) = if cmd_on {
+            let (ring, proxy) = cmd_ring::channel(host as usize + cmd_base);
+            let link = CmdLink {
+                proxy,
+                local: host as usize + cmd_base,
+                peer: peer_base + cmd_base as u64,
+            };
+            (Some(ring), Some(link))
+        } else {
+            (None, None)
+        };
         let jobs = Arc::new(Mutex::new(VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let proxy = {
@@ -258,9 +276,9 @@ impl RdmaPair {
                         base: peer_base,
                         rkeys: peer_rkeys,
                     };
-                    if let Err(e) =
-                        proxy_loop(verbs, &lkeys, &peer, host, capacity, &jobs, &stop, channel)
-                    {
+                    if let Err(e) = proxy_loop(
+                        verbs, &lkeys, &peer, host, capacity, &jobs, &stop, channel, cmd_link,
+                    ) {
                         tracing::error!("RDMA pair proxy failed: {e:#}");
                     }
                 })?
@@ -269,6 +287,12 @@ impl RdmaPair {
             "RDMA pair all-reduce ready: rank {rank}, rails {rails:?}, capacity {} MB, one-shot {os_cfg:?}",
             capacity >> 20
         );
+        if cmd_on {
+            tracing::info!(
+                "ATLAS_GLM_CMD_RDMA: command words ride the RDMA pair (ring of {} words)",
+                cmd_ring::RING_WORDS
+            );
+        }
         Ok(Self {
             host: host as *mut u8,
             dev,
@@ -279,6 +303,7 @@ impl RdmaPair {
             stop,
             proxy: Some(proxy),
             oneshot,
+            cmd,
         })
     }
 
@@ -360,6 +385,11 @@ impl RdmaPair {
     pub(super) fn oneshot(&self) -> Option<&OneShot> {
         self.oneshot.as_ref()
     }
+
+    /// The host command ring, when `ATLAS_GLM_CMD_RDMA=1`.
+    pub(super) fn cmd(&self) -> Option<&CmdRing> {
+        self.cmd.as_ref()
+    }
 }
 
 /// Stream-ordered copy (e.g. a landed receive segment into its destination).
@@ -396,6 +426,9 @@ fn rail_names(rails: Option<String>, nccl: Option<String>) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+
+#[cfg(test)]
+mod cmd_ring_nic_tests;
 
 #[cfg(test)]
 mod tests {

@@ -25,10 +25,18 @@
 //! value, 2 on an error (without NCCL teardown: the peer may be gone), naming
 //! the one-shot fault if the channel stopped.
 //!
+//! `--cmd-steps N` adds the start of N verify steps as the engine issues it:
+//! rank 0 pauses `--cmd-pause-us` (its drafter pass, rank 1 waiting), sends
+//! slot, command, width and tokens, and both ranks run the step's first
+//! all-reduce. Rank 0 reports first word to landed collective: what the head
+//! waits when the worker learns of the step late. The words take the host
+//! command channel under `ATLAS_GLM_CMD_RDMA=1`, else a broadcast each.
+//!
 //! Run (per rank):
 //!   comm_pair_bench --rank R --master 10.100.192.2 [--port 29610]
 //!     [--rows 1,2,4,5,7,8,16,32] [--iters 2000] [--calls-per-graph 87]
 //!     [--skew-us 0] [--stress 0] [--peer-exchange-bytes 128]
+//!     [--cmd-steps 0] [--cmd-pause-us 7000]
 //! Build: ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=glm-5.3-flash
 //!   ATLAS_TARGET_QUANT=nvfp4 cargo build --release -p spark-model
 //!   --features cuda,gpu-examples,nccl --example comm_pair_bench
@@ -52,6 +60,8 @@ struct Args {
     skew_us: u64,
     stress: usize,
     peer_exchange_bytes: usize,
+    cmd_steps: usize,
+    cmd_pause_us: u64,
 }
 
 fn parse() -> Result<Args> {
@@ -65,6 +75,8 @@ fn parse() -> Result<Args> {
         skew_us: 0,
         stress: 0,
         peer_exchange_bytes: 128,
+        cmd_steps: 0,
+        cmd_pause_us: 7000,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -79,6 +91,8 @@ fn parse() -> Result<Args> {
             "--skew-us" => a.skew_us = v.parse()?,
             "--stress" => a.stress = v.parse()?,
             "--peer-exchange-bytes" => a.peer_exchange_bytes = v.parse()?,
+            "--cmd-steps" => a.cmd_steps = v.parse()?,
+            "--cmd-pause-us" => a.cmd_pause_us = v.parse()?,
             _ => bail!("unknown flag {flag}"),
         }
     }
@@ -281,6 +295,75 @@ impl Bench<'_> {
         Ok([t[iters / 10], t[iters / 2], t[iters * 9 / 10]])
     }
 
+    /// One command message the way the engine moves it (`ep_broadcast_u32`,
+    /// `ep_broadcast_tokens`, the worker's idle first word): rank 0 sends
+    /// `words`, rank 1 receives as many. Returns the message on both.
+    fn command(&self, buf: DevicePtr, words: &[u32], idle: bool) -> Result<Vec<u32>> {
+        let (g, comm, n) = (self.g, self.comm, words.len());
+        if n <= comm.command_words_max() {
+            let mut got = words.to_vec();
+            if self.rank == 0 {
+                g.synchronize(self.stream)?;
+                comm.send_command_words(words)?;
+            } else {
+                comm.recv_command_words(&mut got)?;
+                g.synchronize(self.stream)?;
+            }
+            return Ok(got);
+        }
+        let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        if self.rank == 0 {
+            g.copy_h2d(&bytes, buf)?;
+            comm.broadcast(buf.0, 4 * n, 0)?;
+            return Ok(words.to_vec());
+        }
+        if idle {
+            comm.receive_idle_command_word(buf.0)?;
+        } else {
+            comm.broadcast(buf.0, 4 * n, 0)?;
+        }
+        g.synchronize(self.stream)?;
+        g.copy_d2h(buf, &mut bytes)?;
+        let word = |b: &[u8]| u32::from_le_bytes(b.try_into().unwrap());
+        Ok(bytes.chunks_exact(4).map(word).collect())
+    }
+
+    /// `steps` verify-step starts (see the module doc): us from rank 0's
+    /// first word to its first collective landing (p10/p50/p90), and the
+    /// wrong words rank 1 read.
+    fn command_steps(
+        &mut self,
+        steps: usize,
+        pause_us: u64,
+        bytes: usize,
+    ) -> Result<([f64; 3], usize)> {
+        let (cmd, ar) = (self.g.alloc(64)?, self.g.alloc(bytes)?);
+        let (mut t, mut bad) = (Vec::with_capacity(steps), 0);
+        self.barrier()?;
+        for step in 0..steps as u32 {
+            let k = 2 + step % 7;
+            let tokens: Vec<u32> = (0..k).map(|i| step * 31 + i).collect();
+            if self.rank == 0 {
+                let until = Instant::now() + Duration::from_micros(pause_us);
+                while Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+            let t0 = Instant::now();
+            let mut got = Vec::new();
+            for (i, word) in [step % 4, 0xffff_fff5, k].into_iter().enumerate() {
+                got.extend(self.command(cmd, &[word], i == 0)?);
+            }
+            got.extend(self.command(cmd, &tokens, false)?);
+            self.comm.all_reduce_async(ar.0, bytes, self.stream)?;
+            self.g.synchronize(self.stream)?;
+            t.push(t0.elapsed().as_secs_f64() * 1e6);
+            bad += usize::from(got[..3] != [step % 4, 0xffff_fff5, k] || got[3..] != tokens[..]);
+        }
+        t.sort_by(f64::total_cmp);
+        Ok(([t[steps / 10], t[steps / 2], t[steps * 9 / 10]], bad))
+    }
+
     /// Mean us per call of `calls` back-to-back calls of `op`.
     fn throughput(&self, iters: usize, calls: usize, op: &dyn Fn() -> Result<()>) -> Result<f64> {
         self.barrier()?;
@@ -388,6 +471,21 @@ fn run(
         "rank {} routing ({small} B next to {large} B, every entry point): wrong {wrong}",
         a.rank
     );
+    if a.cmd_steps > 0 {
+        let (pause, words) = (a.cmd_pause_us, comm.command_words_max());
+        let ([p10, p50, p90], wrong) = b.command_steps(a.cmd_steps, pause, small)?;
+        bad += wrong;
+        println!(
+            "rank {} step words ({}) + first collective after a {pause} us pause: \
+             p10/p50/p90 {p10:.1}/{p50:.1}/{p90:.1} us, wrong {wrong}",
+            a.rank,
+            if words > 0 {
+                "host channel"
+            } else {
+                "broadcasts"
+            }
+        );
+    }
     println!(
         "rank {}: {} ({bad} wrong bytes)",
         a.rank,

@@ -76,6 +76,11 @@ mod rdma_pair;
 #[cfg(all(test, not(atlas_rdma_verbs)))]
 #[path = "nccl_backend/rdma_pair/bootstrap.rs"]
 mod rdma_pair_bootstrap;
+// Nor does the command ring: its wire is a trait.
+#[cfg(all(test, not(atlas_rdma_verbs)))]
+#[allow(dead_code)] // the switch and the bootstrap word are read by the pair
+#[path = "nccl_backend/rdma_pair/cmd_ring.rs"]
+mod rdma_pair_cmd_ring;
 mod recv_buffer;
 use recv_buffer::ensure_payload_fits;
 pub use recv_buffer::{ALL_REDUCE_DTYPE_BYTES, required_recv_bytes};
