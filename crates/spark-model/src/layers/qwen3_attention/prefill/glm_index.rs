@@ -170,6 +170,10 @@ impl Qwen3AttentionLayer {
             }
         };
         let projection_us = profile_lap(ctx, stream, &mut profile)?;
+        // ATLAS_GLM_DET_TRACE opt-in stages: this piece's raw keys and gates.
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        det.tap("x_ikeys", keys, (0, rows as usize), spec.head_dim * 2);
+        det.tap("x_igates", gates, (0, rows as usize), spec.head_dim * 2);
         let meta = ctx
             .attn_metadata
             .expect("GLM index cache update requires slot metadata");
@@ -283,6 +287,21 @@ impl Qwen3AttentionLayer {
         // lap. They produce the semantic query and per-head weights consumed
         // by every history tile.
         let projection_us = profile_lap(ctx, stream, &mut profile)?;
+        // ATLAS_GLM_DET_TRACE opt-in stages: queries, head weights, then each
+        // tile's pool logits (row keys are absolute sequence positions).
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        det.tap(
+            "x_iq",
+            index_query,
+            (seq_len_start, n as usize),
+            query_row_bytes,
+        );
+        det.tap(
+            "x_iw",
+            weights,
+            (seq_len_start, n as usize),
+            weights_row_bytes,
+        );
         let mut logits_us = 0u128;
         let mut topk_us = 0u128;
         let mut tiles = 0usize;
@@ -311,6 +330,12 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
             logits_us += profile_lap(ctx, stream, &mut profile)?;
+            det.tap(
+                "x_ilog",
+                logits,
+                (seq_len_start + row_start, rows as usize),
+                logits_stride as usize * std::mem::size_of::<f32>(),
+            );
             ops::glm_index_topk_expand(
                 ctx.gpu,
                 self.glm_index_topk_expand_k,
