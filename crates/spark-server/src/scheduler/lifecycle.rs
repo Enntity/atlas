@@ -372,6 +372,8 @@ pub fn resume_swapped_seq(
     // remainder of the decode. Stores the freshly resolved index (release keys
     // off it, so the acquire/release stay balanced regardless of any rotate).
     seq.acquired_adapter_slot = model.acquire_adapter_slot(s.adapter_slot);
+    // The fresh sequence carries no min_tokens ban, and its drafter no floor.
+    s.eos_ban.arm(&mut seq);
 
     Ok(ActiveSeq {
         seq,
