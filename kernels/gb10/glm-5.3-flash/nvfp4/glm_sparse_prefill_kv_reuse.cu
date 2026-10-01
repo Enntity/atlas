@@ -440,3 +440,6 @@ extern "C" __global__ void glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split
     (void)V_cache;
     glm_kv_pad_body<true, true>(GLM_KV_PAD_FORWARD, part_o, part_lse);
 }
+
+// Opt-in pipelined fp8_g128 variant (ATLAS_GLM_SPARSE_PREFILL_PIPE=1), bit-identical to the above.
+#include "glm_sparse_prefill_pipe.cuh"
