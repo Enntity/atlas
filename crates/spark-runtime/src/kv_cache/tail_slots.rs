@@ -122,6 +122,14 @@ impl PagedKvCache {
         self.tail_slots.as_ref().map_or(DevicePtr::NULL, |t| t.map)
     }
 
+    /// Tails are slotted and `block` holds none: the index kernels would
+    /// skip its rows (`NO_TAIL`) and never finalize its pooled keys.
+    pub fn tail_slot_missing(&self, block: u32) -> bool {
+        self.tail_slots
+            .as_ref()
+            .is_some_and(|t| t.host[block as usize] == NO_TAIL)
+    }
+
     /// Lend each freshly allocated block a tail slot (when slotted) and
     /// publish the map, with any pending releases, before any kernel on
     /// `stream` can write the blocks.

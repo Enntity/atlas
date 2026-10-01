@@ -20,10 +20,12 @@ __device__ __forceinline__ bool glm_argmax_other_better(
 // Local shard argmax for distributed vocabulary projection. The reduction is
 // byte-for-byte the same as `argmax_bf16`; thread zero additionally preserves
 // the winning BF16 value as FP32 beside its shard-local index. Two ranks can
-// exchange this 8-byte pair instead of all BF16 logits. A tied valid maximum
-// selects rank one (higher vocabulary IDs); two untouched -1e30f sentinels
-// select index zero, preserving the full-row all-invalid fallback. No BF16
-// value equals that FP32 sentinel, so the host can distinguish those cases.
+// exchange this 8-byte pair instead of all BF16 logits. Merged like
+// `argmax_pair_merge_ban`, a tied valid maximum keeps rank zero's pair (the
+// lower vocabulary IDs, as a single-GPU argmax would pick), and two untouched
+// -1e30f sentinels select index zero, preserving the full-row all-invalid
+// fallback. No BF16 value equals that FP32 sentinel, so the host can
+// distinguish those cases.
 extern "C" __global__ void argmax_bf16_value(
     const __nv_bfloat16* __restrict__ logits,
     unsigned int* __restrict__ out_value_index,

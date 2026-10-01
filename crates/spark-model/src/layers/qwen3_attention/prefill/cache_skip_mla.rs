@@ -54,7 +54,7 @@ impl Qwen3AttentionLayer {
             return ops::w4a16_gemv_batchm(ctx.gpu, tc, input, q4, output, m, n, k, stream);
         }
         if m <= 32
-            && let Some((_, mx)) = self.mla_mx.iter().find(|(w, _)| *w == weight.weight)
+            && let Some((.., mx)) = self.mla_mx.iter().find(|(w, ..)| *w == weight.weight)
         {
             let kernel = self.mxfp8_gemv_k[match m {
                 0..=8 => 0,

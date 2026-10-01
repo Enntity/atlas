@@ -51,10 +51,11 @@ impl SpRows {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.exchange(
+        exchange_rows(
             ptr.offset(self.peer0 * width * 2),
             self.local(ptr, width),
-            width,
+            self.rows,
+            width * 2,
             true,
             ctx,
             stream,
@@ -69,33 +70,38 @@ impl SpRows {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.exchange(
+        exchange_rows(
             self.local(ptr, width),
             ptr.offset(self.peer0 * width * 2),
-            width,
+            self.rows,
+            width * 2,
             false,
             ctx,
             stream,
         )
     }
+}
 
-    fn exchange(
-        self,
-        send: DevicePtr,
-        dst: DevicePtr,
-        width: usize,
-        add: bool,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        let comm = ctx.comm.expect("GLM SP prefill without a communicator");
-        ensure!(
-            comm.exchange_async(send.0, dst.0, self.rows * width * 2, add, stream)?,
-            "GLM SP prefill exchange refused ({} rows x {width})",
-            self.rows
-        );
-        Ok(())
-    }
+/// Two-rank copy-engine exchange of `rows` rows of `row_bytes`: send from
+/// `send` and land the peer's equally sized rows in `dst`, added in place
+/// (BF16) when `add`, else copied. Both ranks must call it in the same order
+/// with the same size, after checking `CommBackend::supports_exchange_async`
+/// from mirrored inputs, so a refusal is an error.
+pub fn exchange_rows(
+    send: DevicePtr,
+    dst: DevicePtr,
+    rows: usize,
+    row_bytes: usize,
+    add: bool,
+    ctx: &ForwardContext,
+    stream: u64,
+) -> Result<()> {
+    let comm = ctx.comm.expect("GLM pair exchange without a communicator");
+    ensure!(
+        comm.exchange_async(send.0, dst.0, rows * row_bytes, add, stream)?,
+        "GLM pair exchange refused ({rows} rows x {row_bytes} bytes)"
+    );
+    Ok(())
 }
 
 thread_local! {

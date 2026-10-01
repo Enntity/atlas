@@ -26,6 +26,12 @@ use inner::RadixTreeInner;
 use snapshot::SsmSnapshotIndex;
 pub use snapshot_chain::glm_pc_evict_enabled;
 
+/// Sub-block matching (on unless `ATLAS_PREFIX_SUBBLOCK=0`): a lookup may end
+/// mid-block by reusing a partial block cached for a longer key.
+pub fn subblock_matching() -> bool {
+    std::env::var("ATLAS_PREFIX_SUBBLOCK").as_deref() != Ok("0")
+}
+
 /// FNV-1a-ish stable hash for the first `count` tokens — used to key SSM
 /// snapshots independently of the radix tree (allows the same prefix hash to be
 /// reproduced across requests).

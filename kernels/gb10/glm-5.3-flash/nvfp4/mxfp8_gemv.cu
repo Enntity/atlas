@@ -17,8 +17,14 @@
 //     chunk. MMA step j (0..3) feeds k-slots {2c,2c+1} <- values 4j+{0,1} and
 //     {2c+8,2c+9} <- 4j+{2,3} of the lane's run in both A and B.
 //
+//   mxfp8_gemv_tc{8,16}_grouped: the same per head h = blockIdx.z for
+//     per-head weights (GLM absorbed W_uk / W_uv): A[:, h*K..] (row stride
+//     lda) times head h of W [G, N, K] / S [G, N, K/32] into C[:, h*N..].
+//     No 32-row tier: at K = 256 half its K-split warps idle and it lost to
+//     BF16 cuBLAS (scripts/dev/mxfp8_grouped_bench.cu).
+//
 // A: BF16 [M, K] (row stride K). C rows at C + m*out_stride. K % 32 == 0.
-// Grid: (ceil(N/16),1,1) Block: (256,1,1).
+// Grid: (ceil(N/16),1,G) Block: (256,1,1); G = 1 for the plain tiers.
 
 #include "../../common/atlas_pdl.cuh"
 #include <cuda_bf16.h>
@@ -66,7 +72,8 @@ template <int NT>
 __device__ __forceinline__ void mx_load(
     MxChunk<NT>& t, const unsigned char* w0p, const unsigned char* w1p,
     const unsigned char* s0p, const unsigned char* s1p, const __nv_bfloat16* A,
-    unsigned int g, unsigned int M, unsigned int K, unsigned int kb, bool v0, bool v1
+    unsigned int g, unsigned int M, unsigned int K, unsigned int lda, unsigned int kb,
+    bool v0, bool v1
 ) {
     const uint4 z = make_uint4(0u, 0u, 0u, 0u);
     t.w0 = z; t.w1 = z; t.s0 = 0u; t.s1 = 0u;
@@ -79,7 +86,7 @@ __device__ __forceinline__ void mx_load(
     for (int i = 0; i < NT; i++) {
         const unsigned int row = 8u * i + g;
         if (row < M) {
-            const uint4* xp = (const uint4*)(A + (unsigned long long)row * K + kb);
+            const uint4* xp = (const uint4*)(A + (unsigned long long)row * lda + kb);
             t.x[i][0] = xp[0];
             t.x[i][1] = xp[1];
         }
@@ -102,6 +109,7 @@ __device__ __forceinline__ void mxfp8_gemv_tc_impl(
     unsigned int M,
     unsigned int N,
     unsigned int K,
+    unsigned int lda,
     unsigned int out_stride
 ) {
     // E4M3 byte -> BF16 bits (exact).
@@ -131,11 +139,12 @@ __device__ __forceinline__ void mxfp8_gemv_tc_impl(
     const unsigned int chunks = (K + 63u) / 64u;
     MxChunk<NT> cur, nxt;
     unsigned int ch = warp;
-    if (ch < chunks) mx_load<NT>(cur, w0p, w1p, s0p, s1p, A, g, M, K, ch * 64u + 16u * c, v0, v1);
+    if (ch < chunks)
+        mx_load<NT>(cur, w0p, w1p, s0p, s1p, A, g, M, K, lda, ch * 64u + 16u * c, v0, v1);
     for (; ch < chunks; ch += MX_WARPS) {
         const unsigned int next = ch + MX_WARPS;
         if (next < chunks)
-            mx_load<NT>(nxt, w0p, w1p, s0p, s1p, A, g, M, K, next * 64u + 16u * c, v0, v1);
+            mx_load<NT>(nxt, w0p, w1p, s0p, s1p, A, g, M, K, lda, next * 64u + 16u * c, v0, v1);
         const __nv_bfloat162 sc0 = mx_scale(cur.s0), sc1 = mx_scale(cur.s1);
         const unsigned int wb0[4] = {cur.w0.x, cur.w0.y, cur.w0.z, cur.w0.w};
         const unsigned int wb1[4] = {cur.w1.x, cur.w1.y, cur.w1.z, cur.w1.w};
@@ -198,19 +207,43 @@ extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8(
     const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride) {
     atlas_pdl_enter();
-    mxfp8_gemv_tc_impl<1>(A, W, S, C, M, N, K, out_stride);
+    mxfp8_gemv_tc_impl<1>(A, W, S, C, M, N, K, K, out_stride);
 }
 
 extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc16(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
     const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride) {
-    mxfp8_gemv_tc_impl<2>(A, W, S, C, M, N, K, out_stride);
+    mxfp8_gemv_tc_impl<2>(A, W, S, C, M, N, K, K, out_stride);
 }
 
 extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc32(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
     const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride) {
-    mxfp8_gemv_tc_impl<4>(A, W, S, C, M, N, K, out_stride);
+    mxfp8_gemv_tc_impl<4>(A, W, S, C, M, N, K, K, out_stride);
+}
+
+template <int NT>
+__device__ __forceinline__ void mxfp8_gemv_tc_grouped(
+    const __nv_bfloat16* A, const unsigned char* W, const unsigned char* S, __nv_bfloat16* C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int lda, unsigned int out_stride) {
+    atlas_pdl_enter();
+    const unsigned long long h = blockIdx.z, nk = (unsigned long long)N * K;
+    mxfp8_gemv_tc_impl<NT>(A + h * K, W + h * nk, S + h * (nk / MX_BLOCK), C + h * N,
+                           M, N, K, lda, out_stride);
+}
+
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8_grouped(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C, unsigned int M,
+    unsigned int N, unsigned int K, unsigned int lda, unsigned int out_stride) {
+    mxfp8_gemv_tc_grouped<1>(A, W, S, C, M, N, K, lda, out_stride);
+}
+
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc16_grouped(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C, unsigned int M,
+    unsigned int N, unsigned int K, unsigned int lda, unsigned int out_stride) {
+    mxfp8_gemv_tc_grouped<2>(A, W, S, C, M, N, K, lda, out_stride);
 }

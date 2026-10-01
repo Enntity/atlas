@@ -131,6 +131,29 @@ fn slotted_tails_return_on_free_and_refuse_exhaustion() {
 }
 
 #[test]
+fn tail_slot_missing_only_for_unlent_slotted_blocks() {
+    let gpu = MockGpuBackend::new();
+    let index = SparseIndexCacheConfig::bf16(4, 128);
+    let mut per_block = PagedKvCache::new(test_config(), 8, &gpu).unwrap();
+    per_block.attach_sparse_index(index, &gpu).unwrap();
+    let block = per_block.alloc_block().unwrap();
+    assert!(!per_block.tail_slot_missing(block));
+
+    let mut cache = PagedKvCache::new(test_config(), 8, &gpu).unwrap();
+    let plan = TailSlotPlan {
+        lag_blocks: 1,
+        sequences: 1,
+    };
+    cache
+        .attach_sparse_index_with_tail_slots(index, Some(plan), &gpu)
+        .unwrap();
+    let block = cache.alloc_block().unwrap();
+    assert!(cache.tail_slot_missing(block));
+    cache.lend_tail_slots(&[block], &gpu, 0).unwrap();
+    assert!(!cache.tail_slot_missing(block));
+}
+
+#[test]
 fn slotted_tails_are_not_zeroed_by_block() {
     let gpu = MockGpuBackend::new();
     let mut cache = PagedKvCache::new(test_config(), 64, &gpu).unwrap();

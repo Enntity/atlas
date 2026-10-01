@@ -68,3 +68,59 @@ pub fn mxfp8_gemv(
         .arg_u32(out_stride)
         .launch(stream)
 }
+
+/// Widest row count [`mxfp8_gemv_grouped`] serves.
+pub const MXFP8_GROUPED_MAX_M: u32 = 16;
+
+/// Head-grouped [`mxfp8_gemv`] for per-head weights: for each of `g` heads,
+/// `C[:, h*n..][m, n] = A[:, h*k..][m, k] · dequant(W_h)[n, k]ᵀ`, with all
+/// heads' `data` / `scales` contiguous (`[g, n, k]` / `[g, n, k/32]`) and
+/// token-row strides `a_stride` / `c_stride`. `tiers` holds
+/// `mxfp8_gemv_tc{8,16}_grouped`.
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp8_gemv_grouped(
+    gpu: &dyn GpuBackend,
+    tiers: &[KernelHandle; 2],
+    input: DevicePtr,
+    data: DevicePtr,
+    scales: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    g: u32,
+    k: u32,
+    n: u32,
+    a_stride: u32,
+    c_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        (1..=MXFP8_GROUPED_MAX_M).contains(&m) && (k as usize).is_multiple_of(MXFP8_BLOCK),
+        "mxfp8_gemv_grouped: m={m} k={k} unsupported"
+    );
+    // Rows are read as 16-byte vectors and must not overlap across tokens.
+    let (gk, gn) = (u64::from(g) * u64::from(k), u64::from(g) * u64::from(n));
+    ensure!(
+        g > 0
+            && u64::from(a_stride) >= gk
+            && u64::from(c_stride) >= gn
+            && a_stride.is_multiple_of(8),
+        "mxfp8_gemv_grouped: g={g} n={n} k={k} a_stride={a_stride} c_stride={c_stride}"
+    );
+    KernelLaunch::new(gpu, tiers[usize::from(m > 8)])
+        .grid([div_ceil(n, 16), 1, g])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(data)
+        .arg_ptr(scales)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(a_stride)
+        .arg_u32(c_stride)
+        .launch(stream)
+}
+
+#[cfg(test)]
+#[path = "mxfp8_tests.rs"]
+mod tests;

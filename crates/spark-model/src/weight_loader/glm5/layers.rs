@@ -193,6 +193,13 @@ pub(super) fn load_mla_layer(
         k_norm_weight: dense_auto(store, &format!("{indexer_prefix}.k_norm.weight"), gpu)?,
         k_norm_bias: dense_auto(store, &format!("{indexer_prefix}.k_norm.bias"), gpu)?,
     };
+    let opt_in_twins = super::mla_twins::opt_in_mxfp8_twins(
+        config,
+        [glm_indexer.wq_b.weight, w_uk_t.weight, w_uv.weight],
+        ["ATLAS_GLM_INDEX_MXFP8", "ATLAS_GLM_MLA_KVB_MXFP8"]
+            .map(|flag| std::env::var(flag).as_deref() == Ok("1")),
+        force_dimension_overrides,
+    );
     let mla = MlaWeights {
         wq_a,
         wq_a_nvfp4: None,
@@ -282,6 +289,9 @@ pub(super) fn load_mla_layer(
         && std::env::var("ATLAS_GLM_MLA_MXFP8").as_deref() == Ok("1")
     {
         layer.install_mla_mxfp8(gpu, &mx)?;
+    }
+    if !opt_in_twins.is_empty() {
+        layer.install_mla_mxfp8(gpu, &opt_in_twins)?;
     }
     if let Some(hc) = hc {
         layer.set_hc_weights(hc);

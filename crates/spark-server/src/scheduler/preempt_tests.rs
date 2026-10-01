@@ -14,7 +14,7 @@
 use super::lifecycle::resume_swapped_seq;
 use super::preempt::{
     PREEMPT_IMMUNITY_TOKENS, decode_batch_with_preemption, preempt_requeue, resume_preempted_seq,
-    resume_preempted_seqs, spill_out_sequence,
+    resume_preempted_seqs, spill_out_sequence, spill_pool_enabled,
 };
 use super::test_support::test_seq;
 use super::types::{ActiveSeq, ResponseSink};
@@ -210,6 +210,9 @@ impl Model for PreemptStubModel {
         _reader: &mut dyn std::io::Read,
     ) -> Result<()> {
         Ok(())
+    }
+    fn swap_resumable(&self) -> bool {
+        true
     }
     fn free_sequence(&self, s: &mut SequenceState) -> Result<()> {
         self.freed_slots.lock().unwrap().push(s.slot_idx);
@@ -461,4 +464,22 @@ fn resume_loop_errors_out_a_sequence_that_can_never_fit() {
     assert!(preempted.is_empty() && active.is_empty());
     // The client is told, not left hanging forever.
     assert!(rx.try_recv().expect("error delivered").is_err());
+}
+
+#[test]
+fn spill_pool_runs_only_for_models_that_resume_a_swap() {
+    let resumable = PreemptStubModel::default();
+    assert!(spill_pool_enabled(&resumable, 3));
+    assert!(!spill_pool_enabled(&resumable, 0));
+    // The trait default, which TransformerModel also reports for a GLM
+    // semantic-index cache: its spill image carries no index pools or tails,
+    // so a swapped-in sequence would select over another owner's keys.
+    // Admission then waits for blocks and decode preemption requeues.
+    let cannot = super::cancel_test_model::TestModel {
+        tokens: vec![],
+        host_logits: false,
+        cancel_after_sampling: None,
+        cancel_after_row_commit: None,
+    };
+    assert!(!spill_pool_enabled(&cannot, 3));
 }

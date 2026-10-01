@@ -264,11 +264,9 @@ impl TransformerModel {
         // dropping ~12% on the every-64th eager step.
         let seq64_boundary = seq.seq_len.is_multiple_of(64);
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
-            // C3/C2 can drain to C1. Its selector also embeds host positions;
-            // keep the final row eager throughout the opt-in sparse session.
-            && !crate::layers::qwen3_attention::glm_multi_seq_sparse_enabled(
-                &self.config.model_type,
-            )
+            // The GLM C1 selector embeds host positions, whether a serial step
+            // or C3/C2 draining to C1 in the opt-in sparse session reaches it.
+            && !crate::layers::qwen3_attention::glm_c1_decode_graph_vetoed(&kv_cache)
             && !self.profile
             && !self
                 .suppress_graphs
