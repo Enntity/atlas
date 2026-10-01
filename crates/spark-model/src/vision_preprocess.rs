@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use atlas_core::config::VisionConfig;
-use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, Rgb, RgbImage};
+use image::{DynamicImage, ImageDecoder, ImageReader, Limits, Rgb, RgbImage};
 
 mod glm_sizing;
 use glm_sizing::glm_pixel_budget;
@@ -95,12 +95,22 @@ pub(crate) fn decode_data_uri_bytes(data_uri: &str) -> Result<(String, Vec<u8>)>
     Ok((mime, bytes))
 }
 
+/// The image formats `decode_image` reads (the `image` crate features enabled
+/// in this crate's Cargo.toml), as the client is told when it sends another.
+const SUPPORTED_IMAGE_FORMATS: &str = "send JPEG, PNG, GIF, WebP, BMP, TIFF or ICO";
+
 /// Decode a base64 data URI or raw base64 string into a `DynamicImage`.
 fn decode_image(data_uri: &str) -> Result<DynamicImage> {
     let (_mime, bytes) = decode_data_uri_bytes(data_uri)?;
 
-    // Probe format from magic bytes.
-    let fmt = image::guess_format(&bytes).unwrap_or(ImageFormat::Jpeg);
+    // Probe format from magic bytes. Anything we cannot read is refused by
+    // name, so the client learns what to send instead of seeing a decoder
+    // error about a JPEG it never sent.
+    let fmt = image::guess_format(&bytes)
+        .map_err(|_| anyhow::anyhow!("unrecognized image format; {SUPPORTED_IMAGE_FORMATS}"))?;
+    if !fmt.reading_enabled() {
+        bail!("{fmt:?} images are not supported; {SUPPORTED_IMAGE_FORMATS}");
+    }
     // Decode through `ImageReader` rather than `load_from_memory_with_format`
     // so the limits are ours. (The free function is not unlimited — it applies
     // `Limits::default()`, i.e. 512 MiB alloc — but it sets NO dimension cap,
@@ -349,6 +359,9 @@ pub fn image_pad_count(grid_h: usize, grid_w: usize, spatial_merge_size: usize) 
     (grid_h / sms) * (grid_w / sms)
 }
 
+#[cfg(test)]
+#[path = "vision_preprocess_format_tests.rs"]
+mod format_tests;
 #[cfg(test)]
 #[path = "vision_preprocess_tests.rs"]
 mod tests;
