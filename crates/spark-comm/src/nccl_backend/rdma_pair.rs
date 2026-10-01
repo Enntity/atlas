@@ -38,11 +38,10 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-mod bootstrap;
+pub(super) mod bootstrap;
 mod oneshot;
 mod proxy;
 use oneshot::OneShot;
@@ -155,17 +154,9 @@ impl RdmaPair {
     }
 
     /// Bring up one RC QP per rail (`ATLAS_RDMA_RAILS`, else the NCCL HCA
-    /// list) against the peer, exchanging identities over TCP on `port` of
-    /// `head_addr`, rank 0's address on the link between the ranks (rank 0
-    /// listens there and, given `worker`, admits only that address; see
-    /// [`bootstrap`]). `capacity` is the largest payload in bytes.
-    pub(super) fn connect(
-        rank: usize,
-        head_addr: IpAddr,
-        port: u16,
-        capacity: usize,
-        worker: Option<IpAddr>,
-    ) -> Result<Self> {
+    /// list) against the peer, exchanging identities over TCP on `link`
+    /// (see [`bootstrap`]). `capacity` is the largest payload in bytes.
+    pub(super) fn connect(rank: usize, link: &bootstrap::Link, capacity: usize) -> Result<Self> {
         ensure!(
             capacity.is_multiple_of(64) && capacity > 0,
             "RDMA pair capacity must be 64-byte aligned"
@@ -224,8 +215,7 @@ impl RdmaPair {
             capacity,
             oneshot: oneshot::Config::wire(os_cfg),
         };
-        let at = SocketAddr::new(head_addr, port);
-        let (mut stream, remote) = bootstrap::open(&head, &local, at, worker)?;
+        let (mut stream, remote) = bootstrap::open(&head, &local, link)?;
         let peer_base = u64::from_le_bytes(remote[..BASE_WIRE].try_into()?);
         let mut peer_rkeys = Vec::with_capacity(rails.len());
         for (v, w) in verbs

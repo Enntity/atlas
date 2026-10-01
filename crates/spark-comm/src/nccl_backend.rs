@@ -203,7 +203,14 @@ impl NcclBackend {
         }
 
         #[cfg(atlas_rdma_verbs)]
-        let rdma = Self::connect_rdma(rank, world_size, &peers, master_port, recv_capacity)?;
+        let rdma = Self::connect_rdma(
+            rank,
+            world_size,
+            &peers,
+            master_addr,
+            master_port,
+            recv_capacity,
+        )?;
 
         Ok(Self {
             comm: Mutex::new(comm),
