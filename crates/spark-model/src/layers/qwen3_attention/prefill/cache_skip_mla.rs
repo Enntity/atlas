@@ -156,7 +156,7 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
         if mla.glm_indexer.is_some() {
-            self.glm_index_prefill_cache_update(normed, n, kv_cache, ctx, stream, None)?;
+            self.glm_index_prefill_cache_update(normed, n, 0, kv_cache, ctx, stream, None)?;
         }
         let qg_out = ctx.buffers.qkv_output();
         self.mla_prefill_dense(q_latent, &mla.wq_b, qg_out, n, nq * hd, q_lora, ctx, stream)?;

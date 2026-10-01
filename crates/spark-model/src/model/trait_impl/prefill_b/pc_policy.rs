@@ -70,6 +70,12 @@
 //! existing contract for `ATLAS_EP_PROTOCOL` (`ep_broadcast_seq_and_cmd`):
 //! checking it in the binary would need a collective that also runs with the
 //! flags off, so the launcher checks it instead.
+//!
+//! The launcher must check `ATLAS_GLM_PC_WRITE_FLOOR` and
+//! `ATLAS_GLM_KV_WRITE_FLOOR_LEGACY` the same way. A mismatch there does not
+//! deadlock (the cache writes they skip are not collectives), but one rank
+//! then attends the cached rows of a shared block and the other its own
+//! recompute of them, which is a silent TP numerics fault.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -96,6 +102,73 @@ pub(in crate::model) fn glm_pc_branch_min_tokens() -> usize {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2048)
     })
+}
+
+/// `ATLAS_GLM_PC_WRITE_FLOOR=1`: see [`layer_write_floor`]. Read once; see
+/// "Rank env parity" above.
+pub(in crate::model) fn glm_pc_write_floor_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_PC_WRITE_FLOOR").as_deref() == Ok("1"))
+}
+
+/// The KV write floor a prefill pass over rows `[start, start + rows)` hands
+/// its layers. `replay_floor` is the base value: the rows a Marconi replay
+/// spends under the radix match `matched`, and 0 for a prefix hit with
+/// nothing to restore, which recomputes from token 0 and rewrites every
+/// matched block under the sequences that share it. With the flag (`flag`,
+/// GLM only) that pass floors its writes at the match as well: the matched
+/// blocks are fully written (`kv_valid_tokens` caps what the radix holds),
+/// so its attention reads them instead. Same kernels and math for every row;
+/// rows under the match then attend to the cached K/V rather than this
+/// pass's own recompute of it, so its output can differ bitwise from the
+/// flag-off run, as a Marconi replay's does from a cold one.
+///
+/// The flag makes matched blocks write-once, so it relies on nothing having
+/// poisoned them: run it with `ATLAS_PREFIX_SUBBLOCK=0` and without
+/// `ATLAS_MARCONI_EXACT=1` (the production profile). Flag off, a recompute
+/// overwrites such a block; flag on, every later request reads it until it
+/// is evicted.
+pub(super) fn layer_write_floor(
+    flag: bool,
+    model_type: &str,
+    replay_floor: usize,
+    matched: usize,
+    start: usize,
+    rows: usize,
+) -> usize {
+    if flag && model_type == "glm5_next" {
+        replay_floor.max(matched.saturating_sub(start).min(rows))
+    } else {
+        replay_floor
+    }
+}
+
+impl TransformerModel {
+    /// [`layer_write_floor`] of one pass of this model, logged when the flag
+    /// raised it.
+    pub(super) fn pc_write_floor(
+        &self,
+        replay_floor: usize,
+        matched: usize,
+        start: usize,
+        rows: usize,
+    ) -> usize {
+        let floor = layer_write_floor(
+            glm_pc_write_floor_enabled(),
+            &self.config.model_type,
+            replay_floor,
+            matched,
+            start,
+            rows,
+        );
+        if floor > replay_floor {
+            tracing::info!(
+                "ATLAS_GLM_PC_WRITE_FLOOR: pass at token {start} keeps {floor} of {rows} rows \
+                 as cached (match {matched})"
+            );
+        }
+        floor
+    }
 }
 
 /// Whether ranks must agree on the Marconi restore depth: on with either
