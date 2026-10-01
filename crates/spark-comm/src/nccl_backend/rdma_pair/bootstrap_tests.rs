@@ -38,6 +38,7 @@ fn head(rank: usize) -> Head {
         segments: 4,
         capacity: 1 << 20,
         oneshot: [1 << 20, 1 << 20],
+        cmd: 1024,
     }
 }
 
@@ -79,7 +80,7 @@ fn matching_ranks_swap_identities() {
 #[test]
 fn each_differing_field_is_named_on_both_sides() {
     type Edit = fn(&mut Head);
-    let cases: [(Edit, &str, &str); 6] = [
+    let cases: [(Edit, &str, &str); 7] = [
         (
             |h| h.rails = 1,
             "rail count: here 2, peer 1 - check ATLAS_RDMA_RAILS on both nodes",
@@ -110,6 +111,11 @@ fn each_differing_field_is_named_on_both_sides() {
             "one-shot stripe min: here 1048576, peer 0 - check ATLAS_RDMA_ONESHOT_STRIPE_MIN",
             "one-shot stripe min: here 0, peer 1048576",
         ),
+        (
+            |h| h.cmd = 0,
+            "command ring: here 1024, peer 0 - check ATLAS_GLM_CMD_RDMA",
+            "command ring: here 0, peer 1024",
+        ),
     ];
     for (edit, here, there) in cases {
         for rank in 0..2 {
@@ -130,7 +136,7 @@ fn each_differing_field_is_named_on_both_sides() {
 fn a_bad_or_reflected_head_gets_no_identity() {
     // Not this format (a scanner, the previous build): rank 0 says nothing,
     // the worker has sent its head only.
-    for junk in [b"GET / HTTP/1.1\r\n".repeat(8), b"ATLPAIR2".repeat(16)] {
+    for junk in [b"GET / HTTP/1.1\r\n".repeat(8), b"ATLPAIR3".repeat(16)] {
         let (got, sent) = run(&head(0), junk.clone());
         assert!(why(got).contains("different build"));
         assert!(sent.is_empty());
