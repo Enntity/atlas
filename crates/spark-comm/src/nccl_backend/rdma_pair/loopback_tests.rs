@@ -131,7 +131,8 @@ fn ranks() -> Option<(Gpu, Vec<RdmaPair>)> {
             .map(|rank| {
                 s.spawn(move || {
                     ck!(cuCtxSetCurrent(ctx));
-                    RdmaPair::connect(rank, "127.0.0.1", port, 4 << 20).unwrap()
+                    let head = std::net::Ipv4Addr::LOCALHOST.into();
+                    RdmaPair::connect(rank, head, port, 4 << 20, None).unwrap()
                 })
             })
             .collect();

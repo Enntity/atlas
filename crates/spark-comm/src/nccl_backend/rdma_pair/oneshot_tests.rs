@@ -59,7 +59,7 @@ fn eligibility_depends_only_on_size() {
 #[test]
 fn wire_distinguishes_configs() {
     let c = cfg(&[("ATLAS_RDMA_ONESHOT", "1")]);
-    assert_eq!(Config::wire(None), [0; 16]);
+    assert_eq!(Config::wire(None), [0; 2]);
     assert_ne!(Config::wire(c), Config::wire(None));
     let d = cfg(&[
         ("ATLAS_RDMA_ONESHOT", "1"),
