@@ -14,12 +14,12 @@
 //! So every rank gathers every rank's values once, right after the
 //! communicator comes up, and fails on any difference, naming the setting and
 //! both values. The gather is itself a collective: it runs whatever the
-//! settings are, and its size is the length of [`SETTINGS`] plus the
+//! settings are, and its size is the length of `SETTINGS` plus the
 //! caller's, which no setting changes. Only a build changes it, so a gather
 //! of one word, the table's id, goes first and fails ranks on different
 //! builds before their settings gathers could mispair. A rank whose parser
 //! refuses a value has no settings to gather: it takes part in that first
-//! gather with [`REFUSED`], which ends the agreement there on every rank.
+//! gather with `REFUSED`, which ends the agreement there on every rank.
 //!
 //! `ATLAS_STARTUP_PARITY=warn` logs a disagreement or a refusal and boots
 //! anyway; the gathers are the same, and ranks on different builds still
@@ -33,7 +33,7 @@
 //! or a cache both ranks must fill alike. Its value comes from the parser the
 //! feature itself reads, never from a second reading of the variable. A
 //! setting that only matters under a switch reads 0 while that switch is off
-//! ([`while_on`]), so stale leftovers do not fail a boot.
+//! (`while_on`), so stale leftovers do not fail a boot.
 //!
 //! Not here: what the ranks already reconcile (`ATLAS_KV_MAX_BLOCKS` takes
 //! the pair's minimum; the RDMA pair compares its capacity and one-shot
