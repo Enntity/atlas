@@ -490,6 +490,14 @@ pub fn build_model(
         kv_block_size,
         max_batch_size,
     )?;
+    let glm_cache_plan = glm::shard_plan(
+        glm_cache_plan,
+        &config,
+        &kv_config,
+        comm.as_deref(),
+        max_seq_len,
+        max_batch_tokens,
+    )?;
 
     if hss_cache_blocks_per_seq.is_some() {
         kv_summary::log_hss_kv_summary(&kv_config);
@@ -818,12 +826,7 @@ pub fn build_model(
     // reports as free (Windows gfx1151: a 102 MB KV pool alloc failed with
     // 12 GB "free"), release the balloon and retry: the pre-balloon behavior.
     let mut balloon = balloon;
-    let mut kv_cache = match PagedKvCache::new_with_v_alias(
-        kv_config.clone(),
-        num_kv_blocks,
-        gpu.as_ref(),
-        glm_cache_plan.is_some(),
-    ) {
+    let mut kv_cache = match glm::new_kv_cache(kv_config.clone(), num_kv_blocks, gpu.as_ref(), glm_cache_plan) {
         Ok(kv) => kv,
         Err(e) if balloon.is_some() => {
             tracing::warn!(
@@ -833,12 +836,7 @@ pub fn build_model(
             if let Some(ptr) = balloon.take() {
                 gpu.free(ptr)?;
             }
-            PagedKvCache::new_with_v_alias(
-                kv_config,
-                num_kv_blocks,
-                gpu.as_ref(),
-                glm_cache_plan.is_some(),
-            )?
+            glm::new_kv_cache(kv_config, num_kv_blocks, gpu.as_ref(), glm_cache_plan)?
         }
         Err(e) => return Err(e),
     };

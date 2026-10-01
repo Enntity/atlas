@@ -117,7 +117,7 @@ pub(super) fn cache_request(
 /// Another workload takes every block (forcing the cache out), then frees them.
 pub(super) fn pressure(kv: &mut PagedKvCache, tree: &RadixTree, gpu: &MockGpuBackend) {
     let mut held = Vec::new();
-    while let Some(b) = alloc_block_evicting(kv, tree, gpu) {
+    while let Some(b) = alloc_block_evicting(kv, tree, gpu, held.len()) {
         held.push(b);
     }
     assert_eq!(held.len(), POOL, "the whole pool is reclaimable");
