@@ -36,6 +36,7 @@ pub mod kv_spill;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 pub mod op_cache;
+pub mod own_footprint;
 pub mod pinned_hosts;
 pub mod prefix_cache;
 pub mod progress;
