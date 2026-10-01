@@ -220,7 +220,7 @@ impl TransformerModel {
         // stream; NCCL ≥2.9 supports graph capture, so this MAY capture cleanly
         // and remove per-kernel launch overhead. Env-gated so it can be toggled
         // off at deploy time (instant revert) if capture crashes / replay hangs.
-        let ep_graphs = std::env::var("ATLAS_EP_GRAPHS").is_ok_and(|v| v == "1" || v == "true");
+        let ep_graphs = crate::model::graph_flags::ep_graphs();
         // GDN HeadParallel TP decode graphs (ATLAS_GDN_DECODE_GRAPH=1, default
         // OFF): capture the whole single-token decode forward — ~130 kernels
         // plus the per-layer TP all-reduces (48 GDN SSM out_proj + 16
@@ -236,8 +236,7 @@ impl TransformerModel {
         // so replay is shape/pointer-static. This removes the per-token host
         // launch cost that dominates 2-node GDN HeadParallel decode. Capture
         // failure falls back to eager execution (graphs then stay disabled).
-        let gdn_graphs =
-            std::env::var("ATLAS_GDN_DECODE_GRAPH").is_ok_and(|v| v == "1" || v == "true");
+        let gdn_graphs = crate::model::graph_flags::gdn_decode_graph();
         // LoRA debugging hatch (ATLAS_LORA_EAGER=1): force eager decode when an
         // adapter is active so graph-vs-eager delta parity can be compared.
         // Default (unset) keeps graphs ON — the LoRA delta launches are
@@ -250,8 +249,8 @@ impl TransformerModel {
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
         // Diagnostic: force eager single-seq decode (graph-vs-eager A/B,
         // and to localize 716s inside captured graphs with LAUNCH_BLOCKING).
-        let no_decode_graphs = std::env::var("ATLAS_NO_DECODE_GRAPHS").is_ok_and(|v| v == "1")
-            || super::verify_layer_trace::enabled();
+        let no_decode_graphs =
+            crate::model::graph_flags::no_decode_graphs() || super::verify_layer_trace::enabled();
         // G1 (2026-08-15): capturing the n=1 decode graph on a step whose
         // seq_len is an exact multiple of 64 (SSD_L) produces a graph whose
         // FIRST replay faults with 716/700 (misaligned address). Empirically

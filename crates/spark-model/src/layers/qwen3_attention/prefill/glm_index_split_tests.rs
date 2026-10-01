@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Unit tests for the `glm_index_split` plan, exchange and startup
-//! agreement, against a recording pair communicator over the mock GPU (the
-//! check's are in `glm_index_split_check_tests.rs`).
+//! Unit tests for the `glm_index_split` plan, exchange and startup words,
+//! against a recording pair communicator over the mock GPU (the check's are
+//! in `glm_index_split_check_tests.rs`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use anyhow::bail;
+use spark_comm::CommBackend;
 use spark_runtime::buffers::BufferArena;
+use spark_runtime::gpu::GpuBackend;
 use spark_runtime::gpu::mock::MockGpuBackend;
 
 use super::*;
@@ -36,7 +38,7 @@ pub(super) fn split(rows: usize, rank: usize, check: bool) -> IndexSplit {
 type Call = (u64, u64, bool, Vec<u8>);
 
 /// A two-rank copy-engine pair: records each exchange and lands the next
-/// queued peer payload in its `dst`; broadcasts land rank 0's `head`.
+/// queued peer payload in its `dst`.
 pub(super) struct Pair<'a> {
     gpu: &'a MockGpuBackend,
     rank: usize,
@@ -44,7 +46,6 @@ pub(super) struct Pair<'a> {
     capacity: usize,
     calls: Mutex<Vec<Call>>,
     pub(super) peer: Mutex<VecDeque<Vec<u8>>>,
-    head: Vec<u8>,
 }
 
 impl<'a> Pair<'a> {
@@ -56,7 +57,6 @@ impl<'a> Pair<'a> {
             capacity: 1 << 20,
             calls: Mutex::default(),
             peer: Mutex::default(),
-            head: vec![],
         }
     }
 
@@ -84,13 +84,8 @@ impl CommBackend for Pair<'_> {
     fn supports_exchange_async(&self, bytes: usize) -> bool {
         bytes <= self.capacity
     }
-    fn broadcast(&self, ptr: u64, bytes: usize, root: usize) -> Result<()> {
-        assert_eq!(root, 0);
-        if self.rank != 0 {
-            assert_eq!(bytes, self.head.len());
-            self.gpu.copy_h2d(&self.head, DevicePtr(ptr))?;
-        }
-        Ok(())
+    fn broadcast(&self, _: u64, _: usize, _: usize) -> Result<()> {
+        bail!("unexpected broadcast")
     }
     fn all_reduce(&self, _: u64, _: usize) -> Result<()> {
         bail!("unexpected all-reduce")
@@ -363,35 +358,14 @@ fn exchange_swaps_the_zigzag_pairs_in_the_same_order_on_both_ranks() {
 }
 
 #[test]
-fn startup_fails_unless_the_ranks_agree() {
-    let gpu = MockGpuBackend::new();
-    let bytes = |s| {
-        Settings::words(s)
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect()
+fn startup_words_are_three_whatever_the_settings() {
+    assert_eq!(Settings::words(None), [0; 3]);
+    assert_eq!(Settings::words(Some(ON)), [1, 4096, 0]);
+    let checked = Settings {
+        min_ctx: 0,
+        check: true,
     };
-    let run = |rank, ours, head| {
-        let pair = Pair {
-            head: bytes(head),
-            ..Pair::new(&gpu, rank)
-        };
-        agree(ours, &pair, &gpu)
-    };
-    let other = Some(Settings {
-        min_ctx: 8192,
-        ..ON
-    });
-    run(1, None, None).unwrap();
-    run(1, Some(ON), Some(ON)).unwrap();
-    // Rank 0 is the reference; the other ranks fail on any difference.
-    run(0, other, Some(ON)).unwrap();
-    assert!(run(1, other, Some(ON)).is_err());
-    assert!(run(1, Some(ON), None).is_err());
-    assert!(run(1, None, Some(ON)).is_err());
-    let checked = Some(Settings { check: true, ..ON });
-    assert!(run(1, checked, Some(ON)).is_err());
-    assert_eq!(gpu.alloc_count(), 0, "the agreement buffer is freed");
+    assert_eq!(Settings::words(Some(checked)), [1, 0, 1]);
 }
 
 #[test]

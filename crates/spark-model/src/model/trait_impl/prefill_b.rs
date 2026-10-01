@@ -34,7 +34,7 @@ mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;
 mod midchunk_capture;
-pub(super) mod pc_policy;
+pub(in crate::model) mod pc_policy;
 mod prefix_lookup;
 mod proc_range;
 mod prompt_logprobs;
@@ -152,7 +152,7 @@ impl TransformerModel {
             // That is the OTHER way to satisfy the invariant — always one pass — and
             // it keeps the single-pass numerics, at the cost of the warm-turn tail
             // checkpoint this split exists to create.
-            let split_disabled = std::env::var("ATLAS_NO_TAIL_SPLIT").as_deref() == Ok("1");
+            let split_disabled = pc_policy::tail_split_disabled();
             if !split_disabled && cut > chunk_start && cut < total {
                 anyhow::ensure!(
                     passengers.is_none(),

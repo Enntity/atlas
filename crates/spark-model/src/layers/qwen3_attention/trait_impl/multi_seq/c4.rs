@@ -12,7 +12,7 @@ impl Qwen3AttentionLayer {
             crate::model::glm_independent::validate_runtime(
                 ctx.config,
                 ctx.comm.map_or(0, |comm| comm.world_size()),
-                std::env::var("ATLAS_EP_PROTOCOL").as_deref() == Ok("v2"),
+                crate::model::ep_protocol_v2_requested(),
                 true,
             )?;
             crate::model::glm_independent::validate_positions(
@@ -40,7 +40,7 @@ impl Qwen3AttentionLayer {
         glm_c4::validate_runtime(
             ctx.config,
             ctx.comm.map_or(0, |comm| comm.world_size()),
-            std::env::var("ATLAS_EP_PROTOCOL").as_deref() == Ok("v2"),
+            crate::model::ep_protocol_v2_requested(),
             true,
         )?;
         glm_c4::validate_positions(c.seq_lens.iter().copied(), 4)?;

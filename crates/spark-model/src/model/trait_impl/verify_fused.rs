@@ -209,13 +209,9 @@ impl TransformerModel {
         // opt-in: other distributed models retain the established eager
         // default, and operators have an instant fallback if a driver/NCCL
         // combination rejects multi-stream capture.
-        static GLM_TP_VERIFY_GRAPH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let glm_tp_graphs = self.config.model_type == "glm5_next"
             && self.config.tp_world_size == 2
-            && *GLM_TP_VERIFY_GRAPH.get_or_init(|| {
-                std::env::var("ATLAS_GLM_TP_VERIFY_GRAPH")
-                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            });
+            && crate::model::graph_flags::glm_tp_verify_graph();
         let use_graphs = (self.comm.is_none() || glm_tp_graphs)
             && !self
                 .suppress_graphs

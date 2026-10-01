@@ -227,7 +227,7 @@ impl MoeLayer {
             && num_tokens > 64
             && !ctx.graph_capture
             && !ctx.profile
-            && std::env::var("ATLAS_MOE_SHARED_REDUCE_OVERLAP").as_deref() == Ok("1");
+            && forward_pair_shared::shared_reduce_overlap_requested();
 
         // `ATLAS_GLM_SHARED_TP_SPLIT=1`: with rows replicated on both ranks
         // (decode / verify), each rank computes half the shared expert's

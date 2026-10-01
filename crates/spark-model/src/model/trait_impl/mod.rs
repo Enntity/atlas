@@ -37,7 +37,7 @@ mod lm_head_dp4a;
 mod meta;
 mod meta_argmax;
 mod prefill_a;
-mod prefill_b;
+pub(in crate::model) mod prefill_b;
 mod prefill_c;
 mod prefill_d;
 mod sequence;

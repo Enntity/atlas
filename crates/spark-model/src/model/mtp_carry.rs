@@ -111,6 +111,12 @@ pub fn marconi_prefill_only() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_MARCONI_PREFILL_ONLY").as_deref() == Ok("1"))
 }
 
+/// `ATLAS_MARCONI_EXACT=1`: restore an exact-leaf snapshot (one at the radix
+/// match that is also the whole prompt) instead of recomputing the prompt.
+pub fn marconi_exact() -> bool {
+    std::env::var("ATLAS_MARCONI_EXACT").as_deref() == Ok("1")
+}
+
 pub fn mtp_carry_drafter_enabled(levers: &crate::layers::ops::ModelLevers) -> bool {
     // Force-off in multi-seq MTP mode: the carry slot is single-sequence by
     // design (one slot, `active.len() == 1` assumption). See

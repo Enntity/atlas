@@ -113,7 +113,7 @@ pub fn mtp_state_slots(max_batch_size: usize) -> usize {
 /// uniform-K sizing everywhere (pool, preflight, scheduler clamp).
 pub fn mtp_pool_full_width() -> bool {
     std::env::var_os("ATLAS_MTP_POOL_FULL_WIDTH").is_some()
-        || matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"))
+        || crate::model::ep_protocol_v2_requested()
 }
 
 /// Pure core of [`mtp_state_slots`] (env-free, unit-testable).

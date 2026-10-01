@@ -142,7 +142,8 @@
 //! `ATLAS_GLM_PC_FINISH_LEAF_BLOCKS` and the three variables above. The flag
 //! itself adds no collective (a mismatch in it or in the span loses restores
 //! and logs an error on the worker, it does not hang), but
-//! `ATLAS_GLM_PC_EVICT` does (see "Rank env parity" in `pc_policy`).
+//! `ATLAS_GLM_PC_EVICT` does (see "Rank env parity" in `pc_policy`). The
+//! ranks compare all of them at startup (`model::startup_parity`).
 //!
 //! # Known limits
 //!
@@ -163,8 +164,7 @@ use crate::traits::SequenceState;
 
 mod flag;
 mod rolling;
-pub(in crate::model) use flag::enabled;
-use flag::span_blocks;
+pub(in crate::model) use flag::{enabled, span_blocks};
 pub(crate) use rolling::LeafCell;
 use rolling::{FinishLeaf, leaf_copies, leaf_save, owned_from};
 

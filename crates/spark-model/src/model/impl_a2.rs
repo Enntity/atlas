@@ -261,10 +261,9 @@ impl TransformerModel {
     /// byte-identical to the legacy single-sequence protocol — head and
     /// worker built before this change continue to interoperate.
     ///
-    /// Both ranks must agree on `v2` at startup (e.g. via the same env
-    /// var). Disagreement causes the worker to misread the next u32 as a
-    /// command code and is the kind of misconfiguration we want to fail
-    /// loudly in development — there's no graceful fallback.
+    /// Both ranks must agree on `v2`: disagreement makes the worker misread
+    /// the next u32 as a command code. `startup_parity` compares it across
+    /// the ranks at startup.
     /// True when the head↔worker command protocol must be live: a
     /// multi-rank NCCL world exists — EP **or** pure TP. Under
     /// `--tp-size 2 --ep-size 1` (GDN HeadParallel 2-node) rank>0 still

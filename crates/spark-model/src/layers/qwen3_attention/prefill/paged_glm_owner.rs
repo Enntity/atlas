@@ -39,16 +39,12 @@ impl GlmChunkOwner {
     }
 }
 
-/// The KV write floor the single-sequence paged prefill applies: `floor`,
-/// or 0 under `ATLAS_GLM_KV_WRITE_FLOOR_LEGACY=1`, which rewrites every
-/// replayed row as the path did before it honoured the floor. Diagnostic,
-/// for a same-binary A/B (like `ATLAS_NO_TAIL_SPLIT`); it also switches
-/// `ATLAS_GLM_PC_WRITE_FLOOR` off. Read once, and logged at first use. Both
-/// ranks must run the same value, or each attends different rows of the
-/// cache.
-pub(super) fn honoured_write_floor(floor: usize) -> usize {
+/// `ATLAS_GLM_KV_WRITE_FLOOR_LEGACY=1`. Read once, and logged then. Both
+/// ranks must run the same value (`model::startup_parity`), or each attends
+/// different rows of the cache.
+pub(crate) fn write_floor_legacy() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let legacy = *LEGACY.get_or_init(|| {
+    *LEGACY.get_or_init(|| {
         let on = std::env::var("ATLAS_GLM_KV_WRITE_FLOOR_LEGACY").as_deref() == Ok("1");
         if on {
             tracing::warn!(
@@ -56,8 +52,16 @@ pub(super) fn honoured_write_floor(floor: usize) -> usize {
             );
         }
         on
-    });
-    if legacy { 0 } else { floor }
+    })
+}
+
+/// The KV write floor the single-sequence paged prefill applies: `floor`,
+/// or 0 under `ATLAS_GLM_KV_WRITE_FLOOR_LEGACY=1`, which rewrites every
+/// replayed row as the path did before it honoured the floor. Diagnostic,
+/// for a same-binary A/B (like `ATLAS_NO_TAIL_SPLIT`); it also switches
+/// `ATLAS_GLM_PC_WRITE_FLOOR` off.
+pub(super) fn honoured_write_floor(floor: usize) -> usize {
+    if write_floor_legacy() { 0 } else { floor }
 }
 
 /// `floor` capped to the `rows` stacked rows of `owners`. It must leave every

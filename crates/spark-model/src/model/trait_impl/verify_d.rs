@@ -99,16 +99,12 @@ impl TransformerModel {
         // Host-maintained per-layer state must not freeze during graph replay.
         let layer_veto = self.layers.iter().any(|l| l.decode_graph_unsupported());
         // Preserve K5 opt-in; repaired C1 K2 has a separate default-off gate.
-        static GLM_TP_VERIFY_GRAPH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let glm_tp_graphs = (self.config.model_type == "glm5_next"
             && k == 5
             && self.config.tp_world_size == 2
-            && *GLM_TP_VERIFY_GRAPH.get_or_init(|| {
-                std::env::var("ATLAS_GLM_TP_VERIFY_GRAPH")
-                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            }))
+            && crate::model::graph_flags::glm_tp_verify_graph())
             || graph_policy::mtp1_graph_allowed(
-                std::env::var("ATLAS_GLM_MTP1_VERIFY_GRAPH").as_deref() == Ok("1"),
+                crate::model::graph_flags::glm_mtp1_verify_graph(),
                 &self.config.model_type,
                 self.config.tp_world_size,
                 self.config.ep_world_size,
@@ -179,7 +175,7 @@ impl TransformerModel {
         // the verify path that snapshots per-row recurrent state.
         let glm_prefill_ctx = (self.config.model_type == "glm5_next"
             && crate::speculative::glm_repair_policy::dflash_enabled()
-            && std::env::var("ATLAS_GLM_DFLASH_PREFILL_VERIFY").as_deref() != Ok("0")
+            && crate::speculative::glm_repair_policy::dflash_prefill_verify()
             && !hss_engaged
             && !use_graphs
             && k >= 2)

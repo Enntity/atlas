@@ -103,7 +103,7 @@ pub(crate) fn preflight_reserve(
             "GLM-5 requires --max-seq-len <= {} and a non-zero --max-prefill-tokens for bounded chunked prefill",
             config.max_position_embeddings,
         );
-        let ep_v2 = matches!(std::env::var("ATLAS_EP_PROTOCOL").as_deref(), Ok("v2"));
+        let ep_v2 = spark_model::model::ep_protocol_v2_requested();
         anyhow::ensure!(
             !long_context || args.max_batch_size == 1 || ep_v2,
             "GLM concurrent long-context verification requires ATLAS_EP_PROTOCOL=v2 for owner slot identity"

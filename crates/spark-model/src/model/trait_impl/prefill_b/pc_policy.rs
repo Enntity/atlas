@@ -66,16 +66,16 @@
 //! The flags are read per process. Both ranks MUST run with the same values
 //! of `ATLAS_GLM_PC_EVICT`, `ATLAS_GLM_PC_BRANCH` and
 //! `ATLAS_GLM_PC_BRANCH_MIN`; a rank with a different set issues different
-//! collectives and chunk shapes and the pair deadlocks. This follows the
-//! existing contract for `ATLAS_EP_PROTOCOL` (`ep_broadcast_seq_and_cmd`):
-//! checking it in the binary would need a collective that also runs with the
-//! flags off, so the launcher checks it instead.
+//! collectives and chunk shapes and the pair deadlocks, or pairs a
+//! restore-depth reduction with the peer's KV-admission vote. The ranks
+//! compare them at startup (`model::startup_parity`), with
+//! `ATLAS_EP_PROTOCOL` and the rest of that table.
 //!
-//! The launcher must check `ATLAS_GLM_PC_WRITE_FLOOR` and
-//! `ATLAS_GLM_KV_WRITE_FLOOR_LEGACY` the same way. A mismatch there does not
-//! deadlock (the cache writes they skip are not collectives), but one rank
-//! then attends the cached rows of a shared block and the other its own
-//! recompute of them, which is a silent TP numerics fault.
+//! So are `ATLAS_GLM_PC_WRITE_FLOOR` and `ATLAS_GLM_KV_WRITE_FLOOR_LEGACY`.
+//! A mismatch there does not deadlock (the cache writes they skip are not
+//! collectives), but one rank then attends the cached rows of a shared block
+//! and the other its own recompute of them, which is a silent TP numerics
+//! fault.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -179,6 +179,12 @@ pub(in crate::model) fn pc_rank_agree_enabled() -> bool {
     spark_runtime::radix_tree::glm_pc_evict_enabled() || glm_pc_branch_enabled()
 }
 
+/// `ATLAS_NO_TAIL_SPLIT=1`: a last chunk runs as one pass, without the
+/// tail-checkpoint split (`prefill_chunk_dispatch_with`).
+pub(in crate::model) fn tail_split_disabled() -> bool {
+    std::env::var("ATLAS_NO_TAIL_SPLIT").as_deref() == Ok("1")
+}
+
 /// The tail-split cut for a `total`-token prompt: one block below the last
 /// block boundary strictly under `total` (`prefill_chunk_dispatch_with`).
 pub(in crate::model) fn tail_cut(total: usize, bs: usize) -> usize {
@@ -267,9 +273,8 @@ impl TransformerModel {
     ) -> bool {
         let exact_without_hidden =
             snap_tok == matched && matched == total && !self.ssm_snapshots.has_hidden(snap_id);
-        let bypass_exact = snap_tok == matched
-            && matched == total
-            && std::env::var("ATLAS_MARCONI_EXACT").as_deref() != Ok("1");
+        let bypass_exact =
+            snap_tok == matched && matched == total && !crate::model::mtp_carry::marconi_exact();
         snap_tok >= crate::model::mtp_carry::marconi_min_tokens()
             && snap_tok > 0
             && matched <= total
