@@ -122,11 +122,17 @@ impl Qwen3AttentionLayer {
 
     /// `projected`: this chunk's keys and gates already produced by
     /// `glm_index_project_keys` (owner-batched verify), else projected here.
+    ///
+    /// The first `write_skip` rows sit below the KV write floor (positions in
+    /// shared prefix-cache blocks): their raw tails and pooled keys stay as
+    /// cached. The floor ends on a cached block boundary or covers every row,
+    /// so no pool finalized here mixes skipped and written rows.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn glm_index_prefill_cache_update(
         &self,
         normed: spark_runtime::gpu::DevicePtr,
         n: u32,
+        write_skip: usize,
         kv_cache: &PagedKvCache,
         ctx: &ForwardContext,
         stream: u64,
@@ -156,9 +162,13 @@ impl Qwen3AttentionLayer {
             "GLM semantic-index kernels are unavailable"
         );
 
+        let skip = write_skip.min(n as usize);
+        let rows = n - skip as u32;
+        if rows == 0 {
+            return Ok(());
+        }
         let mut profile = profile_start(ctx, stream)?;
 
-        let rows = n;
         let dim = spec.head_dim as u32;
         let (keys, gates) = match projected {
             Some(p) => p,
@@ -177,14 +187,18 @@ impl Qwen3AttentionLayer {
         let meta = ctx
             .attn_metadata
             .expect("GLM index cache update requires slot metadata");
+        // Keys and gates are projected for every row; only `[skip, n)` lands.
+        let skip_bytes = skip * spec.head_dim * 2;
+        // slot_mapping entries are int64 (8 bytes each)
+        let slots = meta.slot.offset(skip * 8);
         ops::glm_index_tail_write(
             ctx.gpu,
             self.glm_index_tail_write_k,
-            keys,
-            gates,
+            keys.offset(skip_bytes),
+            gates.offset(skip_bytes),
             kv_cache.sparse_index_tail_pool_ptr(self.attn_layer_idx),
             kv_cache.sparse_index_tail_map_ptr(),
-            meta.slot,
+            slots,
             rows,
             kv_cache.block_size() as u32,
             spec.tokens_per_pool as u32,
@@ -199,7 +213,7 @@ impl Qwen3AttentionLayer {
             kv_cache.sparse_index_tail_map_ptr(),
             indexer.kpool_ape.weight,
             kv_cache.sparse_index_pool_ptr(self.attn_layer_idx),
-            meta.slot,
+            slots,
             rows,
             kv_cache.block_size() as u32,
             spec.tokens_per_pool as u32,

@@ -38,12 +38,14 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         args: &MlaPrefillArgs,
         seq_len_start: usize,
+        kv_write_floor: usize,
     ) -> Result<DevicePtr> {
         let meta = ctx
             .attn_metadata
             .expect("GLM paged prefill requires metadata");
         let owners = glm_chunk_pieces(meta, seq_len_start, args.num_tokens, ctx.config.index_topk);
-        self.glm_chunk_attention(&owners, kv_cache, ctx, args)
+        let floor = owner::honoured_write_floor(kv_write_floor);
+        self.glm_chunk_attention(&owners, kv_cache, ctx, args, floor)
     }
 
     /// GLM MLA over the causal chunks of one or more sequences whose rows are
@@ -53,12 +55,19 @@ impl Qwen3AttentionLayer {
     /// attention run per owner in the pinned native-sparse operand buffers.
     /// With several owners each owner's attention rows are parked in the
     /// (idle until the LM head) logits arena until the joint W_uv.
+    ///
+    /// The first `kv_write_floor` stacked rows replay positions whose latents
+    /// and index keys already sit in shared prefix-cache blocks (Marconi warm
+    /// hit, see `prefill_attention_paged` section 7). They are projected and
+    /// attended like any row but written nowhere: every reader below takes
+    /// those positions from the cache, as the sequences sharing them do.
     pub(super) fn glm_chunk_attention(
         &self,
         owners: &[GlmChunkOwner],
         kv_cache: &mut PagedKvCache,
         ctx: &ForwardContext,
         args: &MlaPrefillArgs,
+        kv_write_floor: usize,
     ) -> Result<DevicePtr> {
         let MlaPrefillArgs {
             normed,
@@ -171,21 +180,27 @@ impl Qwen3AttentionLayer {
         let joint = ctx
             .attn_metadata
             .expect("GLM paged prefill requires metadata");
-        self.write_kv_cache(
-            ctx.gpu,
-            k_entries,
-            v_entries,
-            kv_cache,
-            joint.slot,
-            n,
-            1,
-            kv_lora,
-            bs,
-            kv_lora,
-            kv_lora,
-            stream,
-            ctx.graph_capture,
-        )?;
+        let wf =
+            owner::checked_write_floor(owners, kv_write_floor, num_tokens, ctx.config.index_kpool)?;
+        if wf < num_tokens {
+            let skip = wf * kv_lora as usize * bf16;
+            self.write_kv_cache(
+                ctx.gpu,
+                k_entries.offset(skip),
+                v_entries.offset(skip),
+                kv_cache,
+                // slot_mapping entries are int64 (8 bytes each)
+                joint.slot.offset(wf * 8),
+                n - wf as u32,
+                1,
+                kv_lora,
+                bs,
+                kv_lora,
+                kv_lora,
+                stream,
+                ctx.graph_capture,
+            )?;
+        }
         // ATLAS_GLM_DET_TRACE: the latents written to the cache; below, each
         // piece's selected token ids (`x_` stages: see `det_trace`).
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
@@ -233,6 +248,7 @@ impl Qwen3AttentionLayer {
             self.glm_index_prefill_cache_update(
                 o_normed,
                 on,
+                o.write_skip(wf),
                 kv_cache,
                 &octx,
                 stream,
