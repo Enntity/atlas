@@ -134,13 +134,9 @@ impl Config {
         bytes > 0 && bytes <= self.max && bytes.is_multiple_of(2)
     }
 
-    /// Bootstrap form: both ranks must send the same bytes.
-    pub(super) fn wire(cfg: Option<Self>) -> [u8; 16] {
-        let (max, stripe) = cfg.map_or((0, 0), |c| (c.max as u64, c.stripe_min as u64));
-        let mut w = [0u8; 16];
-        w[..8].copy_from_slice(&max.to_le_bytes());
-        w[8..].copy_from_slice(&stripe.to_le_bytes());
-        w
+    /// Bootstrap form, `max` and `stripe_min`: both ranks must send the same.
+    pub(super) fn wire(cfg: Option<Self>) -> [u64; 2] {
+        cfg.map_or([0; 2], |c| [c.max as u64, c.stripe_min as u64])
     }
 }
 
