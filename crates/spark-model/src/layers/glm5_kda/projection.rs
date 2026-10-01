@@ -74,6 +74,30 @@ impl ProjectionPath {
     }
 }
 
+/// Kernel family for one prefill/decode dense (BF16) KDA projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DensePath {
+    Gemv,
+    /// `ops::bf16_gemm` (CUTLASS 128x128x64): f_b / g_b, K = 128.
+    Cutlass,
+    /// `dense_gemm_bf16_pipelined` (or its scalar fallback).
+    Pipelined,
+}
+
+impl DensePath {
+    /// `cutlass_rows` is [`ops::bf16_gemm_cutlass_rows`] for `m`. CUTLASS only
+    /// replaces the pipelined kernel where the two are bit-identical.
+    pub(super) fn for_forward(m: u32, k: u32, cutlass_rows: bool) -> Self {
+        if m == 1 {
+            Self::Gemv
+        } else if cutlass_rows && k <= 128 && ops::bf16_gemm_matches_pipelined(k) {
+            Self::Cutlass
+        } else {
+            Self::Pipelined
+        }
+    }
+}
+
 impl Glm5KdaLayer {
     /// Project a short speculative-verification batch with the decode kernels
     /// that amortize one weight read across the candidate rows.  Atlas only
@@ -351,8 +375,8 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if m == 1 {
-            ops::dense_gemv(
+        match DensePath::for_forward(m, k, ops::bf16_gemm_cutlass_rows(m)) {
+            DensePath::Gemv => ops::dense_gemv(
                 ctx.gpu,
                 self.dense_gemv_k,
                 input,
@@ -361,9 +385,10 @@ impl Glm5KdaLayer {
                 n,
                 k,
                 stream,
-            )
-        } else {
-            ops::dense_gemm_prefill(
+            ),
+            // ~10% faster than the pipelined kernel on this store-bound shape.
+            DensePath::Cutlass => ops::bf16_gemm(input, weight.weight.0, output, m, n, k, stream),
+            DensePath::Pipelined => ops::dense_gemm_prefill(
                 ctx.gpu,
                 self.dense_gemm_k,
                 self.dense_gemm_pipelined_k,
@@ -374,7 +399,7 @@ impl Glm5KdaLayer {
                 n,
                 k,
                 stream,
-            )
+            ),
         }
     }
 }
@@ -401,6 +426,28 @@ mod tests {
             ProjectionPath::for_forward(false, false, 1000),
             ProjectionPath::PrefillBase
         );
+    }
+
+    #[test]
+    fn glm_kda_dense_takes_cutlass_only_for_short_k_in_whole_k16_steps() {
+        // f_b / g_b (K = dim = 128) on CUTLASS rows.
+        assert_eq!(DensePath::for_forward(8196, 128, true), DensePath::Cutlass);
+        assert_eq!(DensePath::for_forward(300, 64, true), DensePath::Cutlass);
+        // CUTLASS off or short rows (`bf16_gemm_cutlass_rows` false).
+        assert_eq!(
+            DensePath::for_forward(8196, 128, false),
+            DensePath::Pipelined
+        );
+        // beta / f_a / g_a (K = hidden) stay on the pipelined kernel.
+        assert_eq!(
+            DensePath::for_forward(8196, 4096, true),
+            DensePath::Pipelined
+        );
+        // A K residue groups differently in CUTLASS: not bit-identical.
+        for k in [40, 104, 120] {
+            assert_eq!(DensePath::for_forward(8196, k, true), DensePath::Pipelined);
+        }
+        assert_eq!(DensePath::for_forward(1, 128, true), DensePath::Gemv);
     }
 }
 

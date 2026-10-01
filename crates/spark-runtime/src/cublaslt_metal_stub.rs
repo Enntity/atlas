@@ -112,6 +112,7 @@ pub fn fp8_gemm_act_weight_t_tensorwise(
     _m: u32,
     _n: u32,
     _k: u32,
+    _no_split_k: bool,
     _stream: u64,
 ) -> anyhow::Result<()> {
     anyhow::bail!("cuBLASLt tensorwise FP8 requires CUDA")
