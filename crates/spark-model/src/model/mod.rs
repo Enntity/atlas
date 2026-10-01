@@ -62,6 +62,7 @@ mod impl_ngram;
 pub mod kv_admission;
 pub(crate) mod mtp_carry;
 pub(crate) mod pinned_pack;
+pub(crate) mod prefix_share;
 pub(crate) mod ssm_batched_copy;
 pub(crate) mod ssm_indexed_decode;
 pub(crate) mod ssm_pool;

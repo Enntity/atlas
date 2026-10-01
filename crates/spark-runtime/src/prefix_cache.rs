@@ -83,10 +83,6 @@ pub struct InsertAcquired {
     /// Physical KV blocks stored in radix nodes CREATED by this insert; the
     /// caller `inc_ref`s each exactly once.
     pub blocks: Vec<u32>,
-    /// Physical KV blocks this insert stopped storing — a `partial_suffix` slot
-    /// that was overwritten or dropped. The caller `dec_ref`s each exactly once,
-    /// releasing the reference taken when that slot was first filled.
-    pub released_blocks: Vec<u32>,
 }
 
 impl EvictedBlocks {
@@ -192,6 +188,27 @@ pub trait PrefixCache: Send + Sync {
         session_hash: u64,
         adapter_id: u64,
     ) -> PrefixMatch;
+
+    /// [`Self::lookup`] over the whole blocks of `tokens` only, which is how a
+    /// sequence acquires its cached prefix.
+    ///
+    /// No two sequences may hold a writable reference to one KV block, and a
+    /// sequence writes the block holding its next position: a decode step
+    /// appends a row there and a speculative verify writes several, rejected
+    /// drafts included. A match that ended inside a cached block would hand
+    /// that block to a sequence that then overwrites the rest of it under its
+    /// other holders. The tokens past the last whole block are therefore never
+    /// offered for matching, whatever the implementation would do with them.
+    fn lookup_whole_blocks(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        session_hash: u64,
+        adapter_id: u64,
+    ) -> PrefixMatch {
+        let whole = tokens.len() - tokens.len() % block_size;
+        self.lookup(&tokens[..whole], block_size, session_hash, adapter_id)
+    }
 
     /// Read-only longest-prefix probe: number of tokens (block-aligned)
     /// `lookup` would match, WITHOUT taking refs, touching LRU state, or
