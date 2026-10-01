@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Unit tests for the `glm_index_split` plan, exchange, check and startup
-//! agreement, against a recording pair communicator over the mock GPU.
+//! Unit tests for the `glm_index_split` plan, exchange and startup
+//! agreement, against a recording pair communicator over the mock GPU (the
+//! check's are in `glm_index_split_check_tests.rs`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -23,7 +24,7 @@ const ON: Settings = Settings {
     check: false,
 };
 
-fn split(rows: usize, rank: usize, check: bool) -> IndexSplit {
+pub(super) fn split(rows: usize, rank: usize, check: bool) -> IndexSplit {
     IndexSplit {
         swaps: IndexSplit::zigzag(rows, rank),
         rows,
@@ -36,18 +37,18 @@ type Call = (u64, u64, bool, Vec<u8>);
 
 /// A two-rank copy-engine pair: records each exchange and lands the next
 /// queued peer payload in its `dst`; broadcasts land rank 0's `head`.
-struct Pair<'a> {
+pub(super) struct Pair<'a> {
     gpu: &'a MockGpuBackend,
     rank: usize,
     world: usize,
     capacity: usize,
     calls: Mutex<Vec<Call>>,
-    peer: Mutex<VecDeque<Vec<u8>>>,
+    pub(super) peer: Mutex<VecDeque<Vec<u8>>>,
     head: Vec<u8>,
 }
 
 impl<'a> Pair<'a> {
-    fn new(gpu: &'a MockGpuBackend, rank: usize) -> Self {
+    pub(super) fn new(gpu: &'a MockGpuBackend, rank: usize) -> Self {
         Self {
             gpu,
             rank,
@@ -59,7 +60,7 @@ impl<'a> Pair<'a> {
         }
     }
 
-    fn calls(&self) -> Vec<Call> {
+    pub(super) fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -112,7 +113,7 @@ impl CommBackend for Pair<'_> {
 }
 
 /// Run `f` with a TP2 forward context over `comm` (none when `None`).
-fn with_ctx<R>(
+pub(super) fn with_ctx<R>(
     gpu: &MockGpuBackend,
     comm: Option<&Pair>,
     capture: bool,
@@ -337,8 +338,14 @@ fn exchange_swaps_the_zigzag_pairs_in_the_same_order_on_both_ranks() {
         with_ctx(&gpu, Some(&pair), false, 2, |ctx| {
             let sel = ctx.buffers.expert_down_out();
             let at = |row: usize| sel.offset(row * rb).0;
+            let owner = OwnerRows {
+                selected: sel,
+                row_bytes: rb,
+                scratch: sel.offset(rows * rb),
+                inputs: [(sel, 0); 2],
+            };
             split(rows, rank, false)
-                .exchange(sel, sel.offset(rows * rb), rb, 0, ctx, 7)
+                .exchange(&owner, 0, ctx, 7)
                 .unwrap();
             let got: Vec<_> = pair
                 .calls()
@@ -353,56 +360,6 @@ fn exchange_swaps_the_zigzag_pairs_in_the_same_order_on_both_ranks() {
             assert_eq!(got, want.map(|(s, d)| (s, d, false, q * rb)), "rank {rank}");
         });
     }
-}
-
-/// Run the check on an owner of 258 rows of 16 bytes whose split and
-/// replicated selections differ at `local` (if any), with the peer
-/// reporting `peer_word`; returns the result and the verdict sent.
-fn check(local: Option<usize>, peer_word: u64) -> (Result<()>, Vec<u8>) {
-    let (rows, rb) = (258, 16);
-    let gpu = MockGpuBackend::new();
-    let pair = Pair::new(&gpu, 1);
-    // The two quarter swaps land nothing new; the verdict swap lands the peer's.
-    pair.peer
-        .lock()
-        .unwrap()
-        .extend([vec![], vec![], peer_word.to_le_bytes().to_vec()]);
-    let result = with_ctx(&gpu, Some(&pair), false, 2, |ctx| {
-        let sel = ctx.buffers.expert_down_out();
-        let scratch = sel.offset(rows * rb);
-        let mut replicated: Vec<u8> = (0..rows * rb).map(|i| i as u8).collect();
-        gpu.copy_h2d(&replicated, sel).unwrap();
-        if let Some(row) = local {
-            replicated[row * rb] ^= 1;
-        }
-        gpu.copy_h2d(&replicated, scratch).unwrap();
-        split(rows, 1, true).exchange(sel, scratch, rb, 3, ctx, 7)
-    });
-    let calls = pair.calls();
-    assert_eq!(calls.len(), 3);
-    let (send, dst, add, sent) = calls[2].clone();
-    assert_eq!((dst - send, add), (8, false));
-    (result, sent)
-}
-
-#[test]
-fn check_fails_on_both_ranks_when_either_rank_differs() {
-    let (ok, sent) = check(None, 0);
-    ok.unwrap();
-    assert_eq!(sent, 0u64.to_le_bytes());
-    // A difference here fails here and tells the peer (row + 1).
-    let (err, sent) = check(Some(5), 0);
-    let msg = format!("{:#}", err.unwrap_err());
-    assert!(
-        msg.contains("differs from the replicated selection"),
-        "{msg}"
-    );
-    assert_eq!(sent, 6u64.to_le_bytes());
-    // A difference only the peer saw fails here too.
-    let (err, sent) = check(None, 8);
-    let msg = format!("{:#}", err.unwrap_err());
-    assert!(msg.contains("peer Some(7)"), "{msg}");
-    assert_eq!(sent, 0u64.to_le_bytes());
 }
 
 #[test]
@@ -458,12 +415,4 @@ fn passes_cover_own_rows_and_the_check_recompute() {
         passes(Some(split(2050, 1, true)), 2050, sel, scratch),
         [(512..1536, sel), (2048..2050, sel), (0..2050, scratch)]
     );
-}
-
-#[test]
-fn mismatch_reports_the_first_differing_row() {
-    let a = [1u8, 2, 3, 4, 5, 6];
-    assert_eq!(first_mismatch(&a, &a, 2), None);
-    assert_eq!(first_mismatch(&a, &[1, 2, 3, 4, 5, 7], 2), Some(2));
-    assert_eq!(first_mismatch(&a, &[1, 2, 0, 4, 0, 6], 2), Some(1));
 }
