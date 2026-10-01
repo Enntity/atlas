@@ -42,6 +42,12 @@
 // blockDim.x.
 // scratch: u32 ticket (zero before the first launch; the kernel leaves it
 // zero), then f32 vals and u32 ids, each [gamma, splits, DF2_SEL_MAX_TOP_K].
+//
+// DF2_SEL_CONF (defined by a twin that includes this file under another
+// entry name): out_tokens is [2 * gamma] words and word gamma + r receives,
+// as an f32, the confidence of row r's pick: the log of its softmax
+// probability over the row's scored candidates (0 for the anchor row; NaN
+// when every candidate was banned). The picks themselves are unchanged.
 
 #define DF2_SEL_MAX_TOP_K 16
 #define DF2_SEL_MAX_RANK 256
@@ -258,6 +264,9 @@ extern "C" __global__ void dflash2_candidate_selector(
             // Anchor row: top-1 unary argmax (first-index-wins by the order above).
             if (tid == 0) {
                 out_tokens[0] = s_list_i[0];
+#ifdef DF2_SEL_CONF
+                reinterpret_cast<float*>(out_tokens)[gamma] = 0.0f;
+#endif
             }
             __syncthreads();
             continue;
@@ -307,6 +316,13 @@ extern "C" __global__ void dflash2_candidate_selector(
             }
             out_tokens[r] = best;
             s_prev_token = best;
+#ifdef DF2_SEL_CONF
+            float mass = 0.0f;
+            for (unsigned int c = 0; c < top_k; c++) {
+                mass += expf(s_score[c] - best_score);
+            }
+            reinterpret_cast<float*>(out_tokens)[gamma + r] = -logf(mass);
+#endif
         }
         __syncthreads();
     }
