@@ -20,6 +20,9 @@ use std::sync::atomic::Ordering;
 
 impl CommBackend for NcclBackend {
     fn all_reduce(&self, ptr: u64, bytes: usize) -> Result<()> {
+        if self.try_oneshot(ptr, ptr, bytes, true, self.legacy_stream)? {
+            return Ok(());
+        }
         if self.world_size == 2 && self.add_kernel.load(Ordering::Relaxed) != 0 {
             if self.try_rdma_all_reduce(ptr, bytes, self.legacy_stream)? {
                 return Ok(());
@@ -47,6 +50,9 @@ impl CommBackend for NcclBackend {
     }
 
     fn all_reduce_async(&self, ptr: u64, bytes: usize, compute_stream: u64) -> Result<()> {
+        if self.try_oneshot(ptr, ptr, bytes, true, compute_stream)? {
+            return Ok(());
+        }
         if self.world_size == 2 && self.add_kernel.load(Ordering::Relaxed) != 0 {
             // The RDMA pair waits on the compute stream itself: no comm-stream
             // event hop.
@@ -116,6 +122,9 @@ impl CommBackend for NcclBackend {
             bytes.is_multiple_of(ALL_REDUCE_DTYPE_BYTES),
             "peer_exchange_async BF16 payload must be a whole number of elements ({bytes} bytes)"
         );
+        if self.try_oneshot(send_ptr, recv_ptr, bytes, false, compute_stream)? {
+            return Ok(());
+        }
 
         // Preserve the all_reduce_async ordering contract: the send observes
         // all producer kernels on `compute_stream`, and subsequent compute on
@@ -172,7 +181,32 @@ impl CommBackend for NcclBackend {
         add: bool,
         compute_stream: u64,
     ) -> Result<bool> {
+        if self.try_oneshot(send, dst, bytes, add, compute_stream)? {
+            return Ok(true);
+        }
         self.try_rdma_exchange(send, dst, bytes, add, compute_stream)
+    }
+
+    fn all_reduce_capturable(&self, ptr: u64, bytes: usize, stream: u64) -> Result<bool> {
+        self.try_oneshot(ptr, ptr, bytes, true, stream)
+    }
+
+    fn peer_exchange_capturable(
+        &self,
+        send_ptr: u64,
+        recv_ptr: u64,
+        bytes: usize,
+        stream: u64,
+    ) -> Result<bool> {
+        self.try_oneshot(send_ptr, recv_ptr, bytes, false, stream)
+    }
+
+    fn capturable_all_reduce_max_bytes(&self) -> usize {
+        self.oneshot_max_bytes()
+    }
+
+    fn set_oneshot_kernel(&self, handle: u64) {
+        self.set_oneshot_kernel_handle(handle);
     }
 
     fn supports_exchange_async(&self, bytes: usize) -> bool {
@@ -320,6 +354,11 @@ impl CommBackend for NcclBackend {
 
     fn is_healthy(&self) -> bool {
         if self.unhealthy.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Some(why) = self.oneshot_poisoned() {
+            tracing::error!("RDMA one-shot collective trapped at {why} — marking unhealthy");
+            self.unhealthy.store(true, Ordering::Release);
             return false;
         }
         // Actively probe the communicator for async errors.
