@@ -23,7 +23,7 @@ pub fn bf16_gemm_act_weight_t(
     #[cfg(atlas_cutlass)]
     {
         let ctx = ctx()?;
-        let status = unsafe {
+        let status = drained("bf16_gemm_act_weight_t", unsafe {
             atlas_cutlass_bf16_gemm_act_weight_t(
                 act as *const c_void,
                 weight as *const c_void,
@@ -35,7 +35,7 @@ pub fn bf16_gemm_act_weight_t(
                 ctx.ws_size,
                 stream as *mut c_void,
             )
-        };
+        });
         if status != 0 {
             bail!("CUTLASS bf16 GEMM failed: status {status} for {m}x{n}x{k}");
         }
@@ -67,7 +67,7 @@ pub fn bf16_gemm_tuned(
 ) -> Result<()> {
     #[cfg(atlas_cutlass)]
     {
-        let status = unsafe {
+        let status = drained("bf16_gemm_tuned", unsafe {
             atlas_cutlass_bf16_gemm_tuned(
                 act as *const c_void,
                 weight as *const c_void,
@@ -80,18 +80,20 @@ pub fn bf16_gemm_tuned(
                 config as i32,
                 stream as *mut c_void,
             )
-        };
+        });
         if status != 0 {
-            bail!(
-                "CUTLASS tuned bf16 GEMM failed: status {status} for {m}x{n}x{k} config {config}"
-            );
+            return Err(super::status_error(
+                status,
+                format!("CUTLASS tuned bf16 GEMM {m}x{n}x{k} config {config}"),
+            ));
         }
         Ok(())
     }
     #[cfg(not(atlas_cutlass))]
     {
         let _ = (act, weight, out, m, n, k, lda, ldc, config, stream);
-        bail!("CUTLASS support was not built; set CUTLASS_HOME when building")
+        Err(anyhow::Error::new(super::RejectedBeforeLaunch)
+            .context("CUTLASS support was not built; set CUTLASS_HOME when building"))
     }
 }
 
@@ -113,7 +115,7 @@ pub fn bf16_grouped_gemm_act_weight_t(
 ) -> Result<()> {
     #[cfg(atlas_cutlass)]
     {
-        let status = unsafe {
+        let status = drained("bf16_grouped_gemm_act_weight_t", unsafe {
             atlas_cutlass_bf16_grouped_gemm_act_weight_t(
                 act as *const c_void,
                 weight as *const c_void,
@@ -126,7 +128,7 @@ pub fn bf16_grouped_gemm_act_weight_t(
                 c_stride as i32,
                 stream as *mut c_void,
             )
-        };
+        });
         if status != 0 {
             bail!("CUTLASS grouped bf16 GEMM failed: status {status} for {m}x{g}x{n}x{k}");
         }
@@ -161,7 +163,7 @@ pub fn nvfp4_gemm_bf16_act_weight_t(
     #[cfg(atlas_cutlass)]
     {
         let ctx = ctx()?;
-        let status = unsafe {
+        let status = drained("nvfp4_gemm_bf16_act_weight_t", unsafe {
             atlas_cutlass_nvfp4_gemm_bf16_act_weight_t(
                 act as *const c_void,
                 weight_packed_t as *const c_void,
@@ -175,7 +177,7 @@ pub fn nvfp4_gemm_bf16_act_weight_t(
                 ctx.ws_size,
                 stream as *mut c_void,
             )
-        };
+        });
         if status != 0 {
             bail!("CUTLASS nvfp4 GEMM failed: status {status} for {m}x{n}x{k}");
         }
