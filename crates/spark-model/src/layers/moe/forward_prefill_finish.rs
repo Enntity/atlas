@@ -67,7 +67,7 @@ impl MoeLayer {
 
         // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
         let output = ctx.buffers.moe_output();
-        self.unpermute_ep_prefill(
+        let blended = self.unpermute_ep_prefill(
             expert_down_out,
             output,
             token_to_perm,
@@ -76,6 +76,7 @@ impl MoeLayer {
             h,
             n,
             top_k,
+            split.then_some(input),
             ctx,
             stream,
         )?;
@@ -133,7 +134,7 @@ impl MoeLayer {
 
         // `ATLAS_GLM_SHARED_TP_SPLIT=1`: each rank already blended its partial
         // shared-expert columns before this point (see forward_prefill).
-        if split {
+        if split && !blended {
             ops::moe_batched_blend(
                 ctx.gpu,
                 self.moe_batched_blend,
