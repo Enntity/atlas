@@ -2,7 +2,8 @@
 use super::*;
 use spark_runtime::gpu::mock::MockGpuBackend;
 
-#[allow(dead_code)]
+// The MoE tests load the same recording backend under their own module.
+#[allow(dead_code, clippy::duplicate_mod)]
 #[path = "../moe/gate_up_btile_test_gpu.rs"]
 mod recording;
 

@@ -22,6 +22,7 @@ use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
 mod glm;
+mod kv_budget;
 mod kv_summary;
 
 pub fn build_model(
@@ -490,18 +491,9 @@ pub fn build_model(
     if hss_cache_blocks_per_seq.is_some() {
         kv_summary::log_hss_kv_summary(&kv_config);
     }
-    // ── gpu_memory_utilization as fraction of TOTAL GPU memory ──
+    // ── KV budget: what is left of total × gpu_memory_utilization ──
+    // (contract, own-footprint measures and headroom floor: `kv_budget`).
     //
-    // User-facing contract (matches vLLM / sparkrun convention):
-    //   total_memory × gpu_memory_utilization = hard ceiling on everything
-    //   this process consumes (weights + buffers + KV cache + reserves).
-    //
-    // KV cache gets whatever remains inside that ceiling after deducting
-    // prior allocations (model weights, buffer arena, CUDA context/driver)
-    // and the inference reserve (SSM state pools, CUDA headroom).  A safety
-    // clamp ensures we never exceed what the device can physically provide
-    // right now (handles external memory pressure on shared-memory /
-    // unified-memory systems like GB10).
     // Prime one DFlash ctx accumulator NOW — before the residual KV-pool
     // sizing below consumes every remaining byte of the device map. The acc
     // is ~`ctx_window` rows of target hiddens (600+ MB at ctx_window≥12K);
@@ -639,86 +631,19 @@ pub fn build_model(
 
     let total_mem = gpu.total_memory()?;
     let actual_free = gpu.free_memory()?;
-    let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
-    let mut used_so_far = total_mem.saturating_sub(actual_free);
-    // GB10 is shared (ComfyUI/voxel/etc.). Raw `used_so_far` counts those
-    // co-tenants against our --gpu-memory-utilization budget, so a low util
-    // needlessly starves the KV pool (vs vLLM, whose util is self-relative).
-    //
-    // We want the KV pool sized against Atlas's OWN footprint (weights +
-    // buffers), excluding co-tenants. Two ways to find that footprint:
-    //
-    //   1. AUTO (default, preferred): free-at-context-init minus free-now =
-    //      exactly what THIS process allocated since startup. Co-tenants that
-    //      were already resident at init are in the baseline, so they cancel
-    //      out — and it self-corrects as co-tenants come and go (no stale
-    //      constant). Requires `set_baseline_free_bytes` to have run (it does
-    //      under the real server; absent under the mock backend → we skip it).
-    //
-    //   2. MANUAL override: ATLAS_KV_EXTERNAL_RESERVE_GB=<co-tenant GB> still
-    //      wins when explicitly set (>0), for operators who want to RESERVE
-    //      headroom for co-tenants that will arrive LATER (the auto measure
-    //      only sees current state).
-    //
-    // The `.min(actual_free - reserve)` clamp below still guarantees a physical
-    // fit regardless of which path set `used_so_far`.
-    let manual_reserve_gb = std::env::var("ATLAS_KV_EXTERNAL_RESERVE_GB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|&gb| gb > 0.0);
-    if let Some(gb) = manual_reserve_gb {
-        let ext = (gb * 1024.0 * 1024.0 * 1024.0) as usize;
-        let discounted = used_so_far.saturating_sub(ext);
-        tracing::info!(
-            "ATLAS_KV_EXTERNAL_RESERVE_GB={gb} (manual override): discounting \
-             external/co-tenant memory from KV budget — used_so_far {:.1} GB → \
-             Atlas-own {:.1} GB",
-            gib(used_so_far),
-            gib(discounted),
-        );
-        used_so_far = discounted;
-    } else if let Some(baseline) = spark_runtime::gpu::baseline_free_bytes() {
-        // AUTO: bytes this process consumed since context init.
-        let atlas_own = baseline.saturating_sub(actual_free);
-        // Sanity-gate: baseline must be ≥ free-now, atlas_own positive and no
-        // larger than total used (co-tenants can't be negative). If a co-tenant
-        // *freed* memory during our load, baseline > free-now still holds and
-        // atlas_own just slightly overcounts (conservative — fine). If the
-        // numbers are implausible, fall back to raw used_so_far.
-        if atlas_own > 0 && atlas_own <= used_so_far {
-            tracing::info!(
-                "KV budget self-relative (auto): baseline-free {:.1} GB − free-now \
-                 {:.1} GB = Atlas-own {:.1} GB; co-tenants {:.1} GB excluded \
-                 (set ATLAS_KV_EXTERNAL_RESERVE_GB to override)",
-                gib(baseline),
-                gib(actual_free),
-                gib(atlas_own),
-                gib(used_so_far - atlas_own),
-            );
-            used_so_far = atlas_own;
-        } else {
-            tracing::warn!(
-                "KV budget auto-measure implausible (baseline {:.1} GB, free-now \
-                 {:.1} GB, used {:.1} GB) — using raw used_so_far",
-                gib(baseline),
-                gib(actual_free),
-                gib(used_so_far),
-            );
-        }
-    }
+    let gib = kv_budget::gib;
     // Issue #71: lazy FP8→BF16 dequant copies allocate after this sizing;
     // see `ops::lazy_bf16_reserve` for what counts and what logs.
     let derived_reserve = crate::layers::ops::lazy_bf16_reserve(&store);
-    let total_budget = (total_mem as f64 * gpu_memory_utilization) as usize;
-    let kv_budget = total_budget
-        .saturating_sub(used_so_far)
-        .saturating_sub(reserve_net)
-        .saturating_sub(derived_reserve)
-        .min(
-            actual_free
-                .saturating_sub(reserve_net)
-                .saturating_sub(derived_reserve),
-        );
+    let budget = kv_budget::measure(
+        gpu.as_ref(),
+        total_mem,
+        actual_free,
+        gpu_memory_utilization,
+        reserve_net + derived_reserve,
+        hss_cache_blocks_per_seq.is_none(),
+    );
+    let (used_so_far, total_budget, kv_budget) = (budget.own, budget.total_budget, budget.bytes);
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
@@ -775,8 +700,7 @@ pub fn build_model(
                     "No memory left for KV cache: total GPU = {:.1} GB, \
                      --gpu-memory-utilization {:.0}% → budget {:.1} GB, \
                      but {:.1} GB already consumed + {:.1} GB inference reserve (net of balloon)\
-                     {lazy_bf16_term} = {:.1} GB committed.  Raise \
-                     --gpu-memory-utilization or use a smaller model.",
+                     {lazy_bf16_term} = {:.1} GB committed.  {}",
                     total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                     gpu_memory_utilization * 100.0,
                     total_budget as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -784,6 +708,7 @@ pub fn build_model(
                     reserve_net as f64 / (1024.0 * 1024.0 * 1024.0),
                     (used_so_far + reserve_net + derived_reserve) as f64
                         / (1024.0 * 1024.0 * 1024.0),
+                    budget.no_room_advice(actual_free),
                 );
             }
             let n = match glm_cache_plan {
