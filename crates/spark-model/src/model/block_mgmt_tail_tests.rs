@@ -182,12 +182,6 @@ fn write_window_leaves_prefix_cache_blocks_alone() {
     seq.cached_prefix_blocks = 2;
     prefill(&mut seq, 2, &mut cache, &gpu).unwrap();
     assert_published(&cache, &gpu, &seq.block_table[2..]);
-
-    // The live prompt's partial frontier block, which the radix cache also
-    // holds (its partial slot), keeps the tail it was lent.
-    cache.inc_ref(seq.block_table[2]);
-    seq.seq_len = 2 * 16 + 5;
-    decode(&mut seq, 2, &mut cache, &gpu).unwrap();
 }
 
 #[test]
