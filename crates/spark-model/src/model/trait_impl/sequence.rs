@@ -64,9 +64,9 @@ impl TransformerModel {
                 // the next warm hit restores at this turn's END and replays
                 // ~nothing. Save logic + the secondary-stream ordering guard
                 // live in decode_checkpoint.rs (finish_leaf_snapshot).
-                // ATLAS_GLM_PC_FINISH_LEAF caches through finish_leaf.rs instead.
-                if super::finish_leaf::enabled() {
-                    return self.finish_leaf_cache(seq, bs);
+                // finish_leaf.rs caches a multi-rank world's sequence, or not at all.
+                if self.finish_cache_multi_rank(seq, bs) {
+                    return;
                 }
                 let finish_snap = self.finish_leaf_snapshot(seq);
                 let acquired = if let Some(snap_id) = finish_snap {
@@ -190,23 +190,8 @@ impl TransformerModel {
 
         // Release prefix cache refs before freeing blocks.
         // (i.e., blocks not shared with the prefix cache).
-        //
-        // Normally `seq.tokens` (prompt + generated) fully covers the matched
-        // prefix, so releasing over it undoes the lookup's radix inc_refs. But a
-        // prefill that matched a prefix then FAILED to allocate its suffix never
-        // populated `seq.tokens` (that happens in a later finalize phase), so
-        // `release(&seq.tokens)` would be a no-op and the matched radix nodes
-        // would stay pinned forever → the pool wedges. When `seq.tokens` is too
-        // short to cover the matched prefix, release over the stashed prefix
-        // tokens instead. Exactly one of the two covers the matched nodes, so
-        // they are released once (never double-released).
-        let release_tokens = if seq.tokens.len() >= seq.cached_prefix_tokens {
-            &seq.tokens
-        } else {
-            &seq.prefix_ref_tokens
-        };
         self.prefix_cache.release(
-            release_tokens,
+            self.radix_held_tokens(seq),
             self.kv_cache.lock().block_size(),
             seq.adapter_id,
         );

@@ -144,6 +144,9 @@ pub struct BufferArena {
     glm_latent_tokens: usize,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
+    /// Rows a pass may have written since the arena was last all zero
+    /// (`accessors`, `zero_dirty`); `usize::MAX` when unknown.
+    dirty_rows: std::sync::atomic::AtomicUsize,
     /// Derived batched-decode metadata layout (rows = max(32, serve
     /// max_batch_size)); byte-identical to the legacy fixed 32-row gaps for
     /// every bs <= 32. SSOT consumed by `upload_batch_metadata_fixed`/`_at`.
@@ -324,6 +327,7 @@ impl BufferArena {
             glm_identity_table: DevicePtr::NULL,
             glm_latent_tokens: 0,
             max_batch_tokens,
+            dirty_rows: std::sync::atomic::AtomicUsize::new(usize::MAX),
             decode_meta,
             sizes,
         })
@@ -332,3 +336,5 @@ impl BufferArena {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod zero_dirty_tests;
