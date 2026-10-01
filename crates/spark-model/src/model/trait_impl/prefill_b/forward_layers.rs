@@ -203,7 +203,14 @@ impl TransformerModel {
             &ctx,
         );
         let sp_scope = sp.map(crate::layers::glm_sp::enter);
+        // ATLAS_GLM_DET_TRACE: the embeddings, each layer's highway rows, the result.
+        let det = crate::det_trace::on_stream(self.gpu.as_ref(), stream);
+        det.tap("emb", hidden, (0, proc_count), h * 2);
+        let det_out = sp.map_or((0, proc_count), |sp| (sp.row0, sp.rows));
+        let hc_elem = crate::layers::ops::hc_elem_bytes(&self.config.model_type);
+        let hc_row = self.config.hc_mult * h * hc_elem;
         for (i, layer) in self.layers.iter().enumerate() {
+            crate::det_trace::set_layer(i);
             let t_pf = host_timing.then(std::time::Instant::now);
             let lt0 = if profile_now {
                 self.gpu.synchronize(stream)?;
@@ -262,6 +269,7 @@ impl TransformerModel {
             if let Some(t) = t_pf {
                 t_in_prefill += t.elapsed();
             }
+            det.tap("out", ctx.buffers.hc_streams(), det_out, hc_row);
             let t_df = host_timing.then(std::time::Instant::now);
             // DFlash chunked-prefill capture. `effective_seq_len_start` (==
             // proc_start) is the ABSOLUTE position of this chunk's first
@@ -404,6 +412,8 @@ impl TransformerModel {
         if let Some(sp) = sp {
             sp.all_gather(hidden, self.config.hidden_size, &ctx, stream)?;
         }
+        crate::det_trace::set_layer(self.layers.len());
+        det.tap("final", hidden, (0, proc_count), h * 2);
         if let Some(t) = t_loop {
             let wall = t.elapsed();
             let ffn_us = crate::layers::qwen3_attention::take_ffn_host_us();

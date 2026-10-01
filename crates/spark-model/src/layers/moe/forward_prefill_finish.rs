@@ -147,6 +147,11 @@ impl MoeLayer {
             )?;
         }
 
+        // ATLAS_GLM_DET_TRACE stages (`det_rows`: the rows the reduce leaves here).
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        let det_rows = sp.map_or((0, num_tokens), |sp| (sp.row0, sp.rows));
+        let row = h as usize * 2;
+        det.tap("moe_local", output, (0, num_tokens), row);
         // EP all-reduce
         if let Some(comm) = ctx.comm
             && ctx.config.ep_world_size > 1
@@ -172,16 +177,19 @@ impl MoeLayer {
                     t0.elapsed().as_micros(),
                 );
             }
+            let reduced = sp.map_or(output, |sp| sp.local(output, h as usize));
+            det.tap("moe_red", reduced, det_rows, row);
             // Add shared expert ONCE after all-reduce (prevents EP doubling)
             if has_shared && !defer_shared_hc && !split {
                 let shared_down_out = ctx.buffers.attn_output();
                 if use_overlap || overlap_shared_reduce {
                     ctx.gpu.stream_wait_event(stream, self.event_b)?;
                 }
+                det.tap("moe_sh", shared_down_out, det_rows, row);
                 ops::moe_batched_blend(
                     ctx.gpu,
                     self.moe_batched_blend,
-                    sp.map_or(output, |sp| sp.local(output, h as usize)),
+                    reduced,
                     shared_down_out,
                     shared_in,
                     self.weights.shared_expert_gate.weight,
@@ -189,6 +197,7 @@ impl MoeLayer {
                     shared_n,
                     stream,
                 )?;
+                det.tap("moe", reduced, det_rows, row);
             }
         }
 
