@@ -379,6 +379,31 @@ pub(super) fn resume_preempted_seq(model: &dyn Model, p: PreemptedSeq) -> Result
     Ok(a)
 }
 
+/// Swapped sequences released their GPU ownership when spilled. Remove dead
+/// buffered callers and their spill files before restoring any GPU state.
+pub(super) fn discard_disconnected_swapped(
+    swapped: &mut Vec<SwappedSeq>,
+    spill: &mut KvSpillManager,
+) {
+    swapped.retain(|s| {
+        if !s.sink.receiver_closed() {
+            return true;
+        }
+        if let Err(e) = spill.remove_file(s.swap_id) {
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return false;
+            }
+            tracing::warn!("discard disconnected spill: {e:#}");
+            // Retain ownership so a later sweep can retry cleanup. The
+            // swap-in selector excludes closed sinks even on cleanup failure.
+            return true;
+        }
+        false
+    });
+}
+
 /// Resume requeued victims while KV blocks and batch slots allow.
 ///
 /// Cheapest-first (fewest blocks to re-prefill). Gated on the history
@@ -392,6 +417,9 @@ pub(super) fn resume_preempted_seqs(
     max_batch_size: usize,
     block_size: usize,
 ) {
+    // GPU ownership was released at preemption. Drop disconnected callers
+    // before reclaiming cache blocks or rebuilding their entire history.
+    preempted.retain(|p| !p.a.sink.receiver_closed());
     while !preempted.is_empty() && active.len() < max_batch_size {
         let Some((idx, needed)) = preempted
             .iter()

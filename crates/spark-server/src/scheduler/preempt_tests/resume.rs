@@ -4,6 +4,77 @@
 
 use super::*;
 
+#[test]
+fn buffered_disconnect_drops_parked_history_without_reprefill() {
+    let model = PreemptStubModel {
+        total_blocks: 100,
+        free_blocks: AtomicUsize::new(100),
+        ..Default::default()
+    };
+    let (a, rx) = active_seq(3, 6);
+    let mut parked = vec![preempt_requeue(&model, a)];
+    drop(rx);
+    let mut active = vec![];
+    resume_preempted_seqs(&model, &mut active, &mut parked, 8, 16);
+    assert!(parked.is_empty());
+    assert!(active.is_empty());
+    assert!(model.prefilled.lock().unwrap().is_empty());
+    assert_eq!(*model.freed_slots.lock().unwrap(), vec![3]);
+}
+
+#[test]
+fn buffered_disconnect_removes_spill_without_restoration() {
+    let model = PreemptStubModel::default();
+    let (a, rx) = active_seq(3, 6);
+    let dir = tempfile::tempdir().unwrap();
+    let mut spill = KvSpillManager::new(dir.path().to_path_buf(), 1024 * 1024).unwrap();
+    let saved = match spill_out_sequence(&model, a, &mut spill) {
+        Ok(saved) => saved,
+        Err((_active, error)) => panic!("spill failed: {error:#}"),
+    };
+    let swap_id = saved.swap_id;
+    assert!(spill.open_file(swap_id).is_ok());
+    drop(rx);
+    let mut parked = vec![saved];
+    super::super::preempt::discard_disconnected_swapped(&mut parked, &mut spill);
+    assert!(parked.is_empty());
+    assert!(spill.open_file(swap_id).is_err());
+    assert_eq!(*model.freed_slots.lock().unwrap(), vec![3]);
+}
+
+#[test]
+fn buffered_disconnect_keeps_failed_spill_cleanup_for_retry() {
+    let model = PreemptStubModel::default();
+    let (a, rx) = active_seq(3, 6);
+    let dir = tempfile::tempdir().unwrap();
+    let mut spill = KvSpillManager::new(dir.path().to_path_buf(), 1024 * 1024).unwrap();
+    let saved = match spill_out_sequence(&model, a, &mut spill) {
+        Ok(saved) => saved,
+        Err((_active, error)) => panic!("spill failed: {error:#}"),
+    };
+    let file = std::fs::read_dir(dir.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let bytes = std::fs::read(&file).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap(); // remove_file must fail on a directory.
+    drop(rx);
+    let mut parked = vec![saved];
+    super::super::preempt::discard_disconnected_swapped(&mut parked, &mut spill);
+    assert_eq!(parked.len(), 1, "retain cleanup ownership on I/O failure");
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::write(&file, bytes).unwrap();
+    super::super::preempt::discard_disconnected_swapped(&mut parked, &mut spill);
+    assert!(
+        parked.is_empty(),
+        "retry cleanup when the file is removable"
+    );
+    assert_eq!(*model.freed_slots.lock().unwrap(), vec![3]);
+}
+
 // ── requeue → resume round trip ──────────────────────────────────────────
 
 #[test]

@@ -34,6 +34,18 @@ pub(super) fn start_new_requests(
     active: &mut Vec<ActiveSeq>,
     prefilling: &mut Vec<PrefillInProgress>,
 ) {
+    // Buffered disconnect: `stream: false` callers that aborted the HTTP
+    // request have no receiver left, so admitting them would burn GPU
+    // prefill/decode for an unobservable response. Drop them before any
+    // model work (including the vision/beam co-dispatch pre-passes below).
+    // Streaming cancellation stays on `cancel_flag` and is untouched.
+    let new_reqs: Vec<InferenceRequest> = new_reqs
+        .into_iter()
+        .filter(|req| !req.caller_gone())
+        .collect();
+    if new_reqs.is_empty() {
+        return;
+    }
     // Co-dispatch (ATLAS_PREFILL_CODISPATCH=1): when >=2 non-vision requests are
     // co-admitted this tick with no active decode to starve, DEFER their chunk-0
     // prefill so they batch into one forward via run_batched_prefill_step (which

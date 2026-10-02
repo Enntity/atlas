@@ -274,3 +274,78 @@ fn non_spec_without_cancel_still_enforces_token_and_context_limits() {
         );
     }
 }
+
+/// `stream:false` caller aborted before any result: the oneshot receiver is
+/// dropped while the sender lives on in `ResponseSink::Blocking`. Retirement
+/// must mark the sequence finished without committing more tokens.
+#[test]
+fn buffered_disconnect_retires_dead_receiver_at_emit() {
+    let (mut a, rx) = test_seq(vec![10], 20, None, 12);
+    a.finished = false;
+    drop(rx);
+    assert!(a.sink.receiver_closed(), "dropped oneshot must read closed");
+    emit_token(&mut a, 101, None, &SchedCtx::for_test());
+    assert!(a.finished, "dead buffered sequence must retire");
+    assert_eq!(a.output_tokens, vec![10], "no token committed after drop");
+    assert!(
+        retire_if_cancelled(&mut a),
+        "retire is idempotent for dead rx"
+    );
+}
+
+/// Negative control: a live buffered receiver is not treated as cancelled, so
+/// normal emission still happens.
+#[test]
+fn buffered_live_receiver_still_emits() {
+    let (mut a, rx) = test_seq(vec![10], 20, None, 12);
+    a.finished = false;
+    assert!(!a.sink.receiver_closed());
+    emit_token(&mut a, 101, None, &SchedCtx::for_test());
+    assert_eq!(a.output_tokens, vec![10, 101]);
+    assert!(!a.finished);
+    // Blocking results are delivered by lifecycle finalization, not emission.
+    // Keep the real receiver alive throughout this negative control.
+    let _live_receiver = rx;
+}
+
+/// Decode path must observe buffered disconnect too, so a dead caller is
+/// retired before logits commit rather than decoding to `max_tokens`.
+#[test]
+fn buffered_disconnect_retires_at_decode_boundary() {
+    let (mut a, rx) = test_seq(vec![10], 20, None, 12);
+    a.finished = false;
+    a.min_tokens = 0;
+    drop(rx);
+    let mut rows = vec![a];
+    decode(
+        &TestModel {
+            tokens: vec![101],
+            host_logits: false,
+            cancel_after_sampling: None,
+            cancel_after_row_commit: None,
+        },
+        &mut rows,
+        &SchedCtx::for_test(),
+    );
+    assert!(rows[0].finished, "dead buffered row must retire at decode");
+    assert_eq!(rows[0].output_tokens, vec![10]);
+}
+
+/// Streaming cancellation semantics must be unchanged: a closed stream
+/// receiver alone does not retire (the streaming batch sender may still have
+/// queued events), while the cooperative `cancel_flag` still does.
+#[test]
+fn streaming_cancel_semantics_unchanged_for_blocking_helper() {
+    let (mut a, mut rx) = row();
+    a.cancel_flag = None;
+    // Fake a "closed-looking" streaming sink by dropping the receiver, then
+    // confirm the sink helper never treats Streaming as closed.
+    let (tx, dropped) = tokio::sync::mpsc::channel(8);
+    drop(dropped);
+    a.sink = ResponseSink::Streaming(tx);
+    assert!(!a.sink.receiver_closed());
+    assert!(!retire_if_cancelled(&mut a));
+    a.cancel_flag = Some(Arc::new(AtomicBool::new(true)));
+    assert!(retire_if_cancelled(&mut a));
+    let _ = rx.try_recv();
+}
