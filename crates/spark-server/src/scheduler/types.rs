@@ -51,6 +51,22 @@ pub(super) enum ResponseSink {
     Streaming(tokio::sync::mpsc::Sender<StreamEvent>),
 }
 
+impl ResponseSink {
+    /// True when the caller can no longer observe a result, so further model
+    /// work for this sequence is wasted. Streaming cancellation is signalled
+    /// cooperatively via `ActiveSeq::cancel_flag`; this covers buffered
+    /// (`stream: false`) callers that aborted the HTTP request and dropped the
+    /// oneshot receiver before the first token was emitted.
+    pub(super) fn receiver_closed(&self) -> bool {
+        match self {
+            // `None` means the sender was already taken by lifecycle teardown;
+            // that path owns cleanup, so do not treat it as live.
+            ResponseSink::Blocking(Some(tx)) => tx.is_closed(),
+            ResponseSink::Blocking(None) | ResponseSink::Streaming(_) => false,
+        }
+    }
+}
+
 /// An in-progress chunked prefill (prompt being processed in chunks).
 pub(super) struct PrefillInProgress {
     /// Arc-wrapped so the original request, the per-prefill scheduler

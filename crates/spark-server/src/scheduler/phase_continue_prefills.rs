@@ -51,6 +51,37 @@ use run_standard::run_standard_chunk_loop;
 pub(super) use cached_run::follows_first_chunk;
 pub(super) use run_fused::SpecStep;
 
+/// Drop in-progress prefills whose buffered (`stream: false`) caller
+/// disconnected, freeing their slot/KV/EP state through the normal lifecycle
+/// before any further chunk forward. Returns the number retired. Any chunk
+/// forward already issued this tick cannot be undone — this only prevents the
+/// *next* chunk of model work. Streaming cancellation is untouched: it is
+/// signalled via `cancel_flag` and handled at the emit/decode boundaries.
+pub(super) fn retire_disconnected_prefills(
+    model: &dyn Model,
+    prefilling: &mut Vec<PrefillInProgress>,
+) -> usize {
+    let mut retired = 0;
+    let mut i = 0;
+    while i < prefilling.len() {
+        if prefilling[i].sink.receiver_closed() {
+            let mut p = prefilling.remove(i);
+            if let Err(e) = model.free_sequence(&mut p.seq) {
+                tracing::error!("phase_continue_prefills: free_sequence (disconnected): {e:#}");
+            }
+            if let Err(e) = model.ep_broadcast_cmd_for_seq(p.seq.slot_idx as u32, 0xFFFFFFF1) {
+                tracing::error!(
+                    "phase_continue_prefills: ep_broadcast free+realloc (disconnected): {e:#}"
+                );
+            }
+            retired += 1;
+            continue;
+        }
+        i += 1;
+    }
+    retired
+}
+
 /// Shared per-chunk InnerQ poll used by every prefill path (standard /
 /// batched-prefill / batched-mixed). `maybe_finalize` is idempotent post
 /// activation, and a no-op when `TURBO_INNERQ` was not set at startup —
@@ -106,6 +137,12 @@ pub(super) fn continue_in_progress_prefills(
     // active (those step_* paths require active.len()==1 and mixing would
     // double-decode). Computed early because the always-mixed gate below
     // needs it too. (Also reused by the Q12 mixed-batch gate further down.)
+    // Buffered disconnect: retire dead prefills before any further chunk
+    // forward or batched dispatch so we do not schedule GPU work whose result
+    // nobody can observe.
+    if retire_disconnected_prefills(model, prefilling) > 0 {
+        return did_mixed_step;
+    }
     let single_active_with_spec =
         active.len() == 1 && (use_mtp || use_self_speculative || use_ngram_speculative);
 
@@ -354,6 +391,11 @@ pub(super) fn continue_in_progress_prefills(
         // Standard chunked prefill (also used as fallback if two-phase fails)
         if p.chunk_offset < p.prompt_tokens.len() {
             cached_run::run(|| {
+                // Cached chunks can repeat within one tick. Recheck before
+                // every chunk, then let the next sweep free this prefill.
+                if p.sink.receiver_closed() {
+                    return false;
+                }
                 run_standard_chunk_loop(
                     model,
                     p,
@@ -403,3 +445,7 @@ pub(super) fn continue_in_progress_prefills(
 
     did_mixed_step
 }
+
+#[cfg(test)]
+#[path = "disconnect_prefill_tests.rs"]
+mod disconnect_prefill_tests;
