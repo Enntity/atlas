@@ -11,6 +11,7 @@ pub(in crate::scheduler) fn retire_if_cancelled(a: &mut ActiveSeq) -> bool {
     if a.cancel_flag
         .as_ref()
         .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
+        || a.sink.receiver_closed()
     {
         a.finished = true;
         true

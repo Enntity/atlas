@@ -55,6 +55,17 @@ impl InferenceRequest {
         }
     }
 
+    /// Buffered (`stream: false`) caller dropped its response receiver, so any
+    /// further model work for this request is unobservable. Streaming requests
+    /// always report `false` here — they are cancelled cooperatively through
+    /// `cancel_flag`, which the scheduler checks at its step boundaries.
+    pub fn caller_gone(&self) -> bool {
+        match self {
+            InferenceRequest::Blocking { response_tx, .. } => response_tx.is_closed(),
+            InferenceRequest::Streaming { .. } => false,
+        }
+    }
+
     /// Preprocessed image data, consumed by the scheduler before prefill.
     pub fn take_image_pixels(&mut self) -> Vec<spark_model::VisionItem> {
         match self {

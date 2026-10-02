@@ -1200,6 +1200,7 @@ pub fn run(
         // ── Swap-in: resume swapped sequences when blocks free up ──
         let t_loop = std::time::Instant::now();
         if let Some(ref mut spill) = spill_manager {
+            preempt::discard_disconnected_swapped(&mut swapped, spill);
             let mut resumed_any = true;
             while resumed_any && !swapped.is_empty() && active.len() < max_batch_size {
                 resumed_any = false;
@@ -1211,7 +1212,11 @@ pub fn run(
                 // BEFORE restoring, so it has to ask. Without this a swapped-out
                 // sequence waits forever on capacity that is reclaimable but not
                 // free — the scheduler goes idle with clients still connected.
-                if let Some(smallest) = swapped.iter().map(|s| s.num_blocks).min()
+                if let Some(smallest) = swapped
+                    .iter()
+                    .filter(|s| !s.sink.receiver_closed())
+                    .map(|s| s.num_blocks)
+                    .min()
                     && smallest > free
                 {
                     // Evicting N radix nodes frees FEWER than N blocks whenever a
@@ -1239,7 +1244,10 @@ pub fn run(
                         );
                     }
                 }
-                if let Some(idx) = swapped.iter().position(|s| s.num_blocks <= free) {
+                if let Some(idx) = swapped
+                    .iter()
+                    .position(|s| !s.sink.receiver_closed() && s.num_blocks <= free)
+                {
                     let s = swapped.remove(idx);
                     match resume_swapped_seq(think_end_token, think_start_token, &*model, s, spill)
                     {
