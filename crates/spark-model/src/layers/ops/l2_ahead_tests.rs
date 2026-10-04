@@ -163,9 +163,15 @@ fn fork_launches_the_budgeted_regions_on_the_side_stream() {
         ]);
     }
     args.push(u32_arg(1));
+    // The side stream waits on an event recorded on the main stream, then
+    // launches; the main stream never waits on the side stream.
     assert_eq!(
         gpu.trace(),
-        vec![Event::Launch(91, [32, 1, 1], [256, 1, 1], 0, 0x5150, args)]
+        vec![
+            Event::Record(LANE_FIXTURE.event, 0x99),
+            Event::Wait(LANE_FIXTURE.stream, LANE_FIXTURE.event),
+            Event::Launch(91, [32, 1, 1], [256, 1, 1], 0, 0x5150, args),
+        ]
     );
 }
 
