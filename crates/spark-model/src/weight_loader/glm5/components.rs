@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
-use spark_runtime::weights::WeightStore;
+use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use crate::layers::dense_ffn::DenseFfnWeights;
 use crate::layers::qwen3_attention::{HcSiteWeights, HcWeights};
@@ -33,8 +33,16 @@ pub(super) fn load_hc(
                 gpu,
             )
         };
+        // The checkpoint's BF16 `fn` itself (`load_hc_f32` widens it exactly
+        // into `hc_fn`): a store pointer, nothing allocated.
+        let fn_bf16 = store
+            .get(&format!("{lp}.hc_{site}_fn"))
+            .ok()
+            .filter(|t| t.dtype == WeightDtype::BF16 && t.num_elements() == mix * hc_dim)
+            .map_or(DevicePtr::NULL, |t| t.ptr);
         Ok(HcSiteWeights {
             hc_fn: load("fn", mix * hc_dim)?,
+            hc_fn_bf16: fn_bf16,
             hc_base: load("base", mix)?,
             hc_scale: load("scale", 3)?,
             lowrank: None,

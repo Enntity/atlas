@@ -197,11 +197,12 @@ pub(crate) fn hc_post_pre_prefill_fused(
         ctx.buffers.hc_comb(),
     );
     if decode {
-        let partial = ops::glm_decode_fuse::hc_decode_partial(
+        let (partial, hc_fn) = ops::glm_decode_fuse::hc_decode_partial(
             ctx.gpu,
             &ctx.config.model_type,
             block_out.is_some(),
             next.hc_fn,
+            next.hc_fn_bf16,
         )?;
         KernelLaunch::new(ctx.gpu, partial)
             .grid([64, tokens.div_ceil(4), 1])
@@ -210,14 +211,13 @@ pub(crate) fn hc_post_pre_prefill_fused(
             .arg_ptr(streams)
             .arg_ptr(post)
             .arg_ptr(comb)
-            .arg_ptr(next.hc_fn)
+            .arg_ptr(hc_fn)
             .arg_ptr(raw_mix)
             .arg_u32(tokens)
             .launch(stream)?;
         KernelLaunch::new(
             ctx.gpu,
-            ctx.gpu
-                .kernel("glm_hc_prefill_vec", &name("glm_hc_decode_finalize"))?,
+            ops::glm_decode_fuse::hc_decode_finalize(ctx.gpu, &ctx.config.model_type)?,
         )
         .grid([tokens, 1, 1])
         .block([256, 1, 1])

@@ -297,12 +297,14 @@ fn active_row_without_ple_carry_is_refused() {
     layer.set_hc_weights(crate::layers::qwen3_attention::HcWeights {
         attn: crate::layers::qwen3_attention::HcSiteWeights {
             hc_fn: DevicePtr::NULL,
+            hc_fn_bf16: DevicePtr::NULL,
             hc_base: DevicePtr::NULL,
             hc_scale: DevicePtr::NULL,
             lowrank: None,
         },
         ffn: crate::layers::qwen3_attention::HcSiteWeights {
             hc_fn: DevicePtr::NULL,
+            hc_fn_bf16: DevicePtr::NULL,
             hc_base: DevicePtr::NULL,
             hc_scale: DevicePtr::NULL,
             lowrank: None,
