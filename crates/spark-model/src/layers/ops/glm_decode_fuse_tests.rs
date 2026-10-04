@@ -131,6 +131,9 @@ const GLM: &[(&str, &str)] = &[
     ("glm_hc_prefill_vec", "glm_hc_decode_partial_rows_bf16"),
     ("glm_hc_prefill_vec", "glm_hc_decode_post_partial_rows_bf16"),
     ("moe", "moe_unpermute_blend_ep_vec8"),
+    ("glm_hc_prefill_vec", "glm_hc_decode_partial_ilp_bf16"),
+    ("glm_hc_prefill_vec", "glm_hc_decode_post_partial_ilp_bf16"),
+    ("glm_hc_prefill_vec", "glm_hc_decode_finalize_ilp_bf16"),
 ];
 
 fn ptr(p: u64) -> Vec<u8> {
@@ -299,4 +302,62 @@ fn moe_twin_takes_the_split_blend_with_its_bytes_and_shape_guards() {
     let mut want: Vec<_> = ungated.iter().map(|p| ptr(p.0)).collect();
     want.extend([5, 8, 0, 288].map(word));
     assert_eq!(args[..], want[..]);
+}
+
+#[test]
+fn seam_ilp_mask_is_explicit() {
+    assert_eq!(parse_seam_ilp(None).unwrap(), 0);
+    assert_eq!(parse_seam_ilp(Some("0")).unwrap(), 0);
+    assert_eq!(parse_seam_ilp(Some("1")).unwrap(), SEAM_ILP_PARTIAL);
+    assert_eq!(parse_seam_ilp(Some("2")).unwrap(), SEAM_ILP_FINALIZE);
+    assert_eq!(parse_seam_ilp(Some("3")).unwrap(), 3);
+    for bad in ["4", "-1", "on", "0x1", ""] {
+        assert!(parse_seam_ilp(Some(bad)).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn seam_ilp_twins_need_their_bit_a_bf16_highway_and_the_bf16_weight() {
+    let gpu = Capture::new(GLM);
+    let fn16 = DevicePtr(0x7002);
+    let handle = |name| Some(gpu.handle("glm_hc_prefill_vec", name));
+    for (post, name) in [
+        (false, "glm_hc_decode_partial_ilp_bf16"),
+        (true, "glm_hc_decode_post_partial_ilp_bf16"),
+    ] {
+        let twin = |mask, bf16, w| seam_partial_twin(mask, &gpu, bf16, post, w).map(|k| k.0);
+        assert_eq!(twin(SEAM_ILP_PARTIAL, true, fn16), handle(name));
+        assert_eq!(twin(SEAM_ILP_FINALIZE, true, fn16), None);
+        assert_eq!(twin(3, false, fn16), None);
+        assert_eq!(twin(3, true, DevicePtr::NULL), None);
+    }
+    let finalize = |mask, bf16| seam_finalize_twin(mask, &gpu, bf16).map(|k| k.0);
+    assert_eq!(
+        finalize(SEAM_ILP_FINALIZE, true),
+        handle("glm_hc_decode_finalize_ilp_bf16")
+    );
+    assert_eq!(finalize(SEAM_ILP_PARTIAL, true), None);
+    assert_eq!(finalize(3, false), None);
+    // A target without the twins keeps its kernels.
+    let old = Capture::new(&GLM[..7]);
+    assert!(seam_partial_twin(3, &old, true, true, fn16).is_none());
+    assert!(seam_finalize_twin(3, &old, true).is_none());
+    assert!(gpu.launches().is_empty());
+}
+
+#[test]
+fn flag_off_seam_keeps_its_kernels_and_fp32_weight() {
+    let gpu = Capture::new(&[
+        ("glm_hc_prefill_vec", "glm_hc_decode_partial"),
+        ("glm_hc_prefill_vec", "glm_hc_decode_post_partial"),
+        ("glm_hc_prefill_vec", "glm_hc_decode_finalize"),
+        ("glm_hc_prefill_vec", "glm_hc_decode_post_partial_ilp_bf16"),
+        ("glm_hc_prefill_vec", "glm_hc_decode_finalize_ilp_bf16"),
+    ]);
+    let (fn32, fn16) = (DevicePtr(0x7000), DevicePtr(0x9000));
+    for (post, k) in [(false, 1), (true, 2)] {
+        let (kernel, weight) = hc_decode_partial(&gpu, "glm5_next", post, fn32, fn16).unwrap();
+        assert_eq!((kernel.0, weight), (k, fn32));
+    }
+    assert_eq!(hc_decode_finalize(&gpu, "glm5_next").unwrap().0, 3);
 }

@@ -58,6 +58,7 @@ fn with_kda_ffn(
     };
     let site = || HcSiteWeights {
         hc_fn: gpu.alloc(24 * 4 * 4096 * 4).unwrap(),
+        hc_fn_bf16: DevicePtr::NULL,
         hc_base: gpu.alloc(24 * 4).unwrap(),
         hc_scale: gpu.alloc(12).unwrap(),
         lowrank: None,

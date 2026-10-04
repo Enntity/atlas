@@ -205,6 +205,11 @@ pub struct HcSiteWeights {
     /// Mix projection `fn`: `[mix_hc, hc_mult*hidden]` f32, where
     /// `mix_hc = (2 + hc_mult) * hc_mult`.
     pub hc_fn: DevicePtr,
+    /// The checkpoint's own `fn` when it is stored as BF16 (then `hc_fn` is
+    /// its exact widening): read by the decode seam's BF16-weight partial
+    /// (`ATLAS_GLM_HC_SEAM_ILP`). A weight-store pointer, never allocated
+    /// here; NULL otherwise.
+    pub hc_fn_bf16: DevicePtr,
     /// Mix bias `base`: `[mix_hc]` f32.
     pub hc_base: DevicePtr,
     /// Mix scale: `[3]` f32 (pre / post / comb scalars).
