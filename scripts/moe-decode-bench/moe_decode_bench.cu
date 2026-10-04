@@ -12,6 +12,9 @@
 //   m16+zskip   ... with ATLAS_GLM_MOE_DOWN_ZSKIP's down
 //   m16s, m32s  ATLAS_GLM_MOE_DECODE_STREAM: the M16 kernels with streaming
 //               loads, over one row slab (<= 16 rows per expert) or two (<= 32)
+//   m16s+l2pf   ATLAS_GLM_MOE_DECODE_L2PF=1: the stream twins (zskip down)
+//   m32s+l2pf   that ask each stage's whole rows into L2 a few stages ahead
+//               (glm_moe_decode_stream.cuh; =2 is their gate/up only)
 //   read-only   the same weight bytes read once and nothing else: "tables" in
 //               the kernels' grid of static per-expert slices, "chunked" in
 //               64 KB chunks taken in order by all SMs (the DRAM ceiling)
@@ -34,10 +37,12 @@
 //     atlas-release-builder:1.93.1 bash -c 'nvcc -O3 -std=c++17 --fmad=false \
 //     -gencode arch=compute_121a,code=sm_121a -o /tmp/mdb moe_decode_bench.cu \
 //     && MOE_DECODE_REPS=16 /tmp/mdb 3:18 5:27 8:41 16:77 32:96'
-// (under a minute in all). Arguments T:U (rows, distinct experts; default
+// (under a minute in all; -DPQS_PF_DIST=n sets the prefetch distance in
+// stages, default 2). Arguments T:U (rows, distinct experts; default
 // 1:8 ... 8:41 16:80 24:12 32:8 32:96), MOE_DECODE_REPS=n (default 42 per
 // variant; 0 runs the byte gates only). Each workload ends with an ARM B/A
-// line: the stream flag's kernels over production's at those rows.
+// line: the stream flag's kernels over production's at those rows, and an
+// ARM C/B line: the L2 prefetch twins over the stream ones.
 // Exit: 0 ok, 1 a variant's bytes differ, 2 setup error.
 
 #include "../../kernels/gb10/glm-5.3-flash/nvfp4/moe_w4a16_grouped_gemm.cu"
@@ -378,33 +383,41 @@ int main(int argc, char** argv) {
         // Stream-loaded twins (ATLAS_GLM_MOE_DECODE_STREAM): one row slab (up to
         // 16 rows per expert) or two (up to 32).
         using Launch = std::function<void(const Route&)>;
-        auto gate_up_s = [&](bool m32) -> Launch {
-            return [&, m32](const Route& rt) {
-                (m32 ? glm_moe_decode_m32s_gate_up_silu_k128w : glm_moe_decode_m16s_gate_up_silu_k128w)
+        // pf: the L2 prefetch twins (ATLAS_GLM_MOE_DECODE_L2PF).
+        auto gate_up_s = [&](bool m32, bool pf = false) -> Launch {
+            return [&, m32, pf](const Route& rt) {
+                (m32 ? (pf ? glm_moe_decode_m32s_gate_up_silu_k128w_l2pf : glm_moe_decode_m32s_gate_up_silu_k128w)
+                     : (pf ? glm_moe_decode_m16s_gate_up_silu_k128w_l2pf : glm_moe_decode_m16s_gate_up_silu_k128w))
                     <<<dim3(I / 128, bound16), 256>>>(d_a, d_as, gate.pp, gate.sp, gate.s2, nullptr, rt.off,
                     rt.sorted, E, I, H, d_work16, upt.pp, upt.sp, upt.s2, q, q + qb);
             };
         };
-        auto down_s = [&](bool m32, bool zskip) -> Launch {
-            return [&, m32, zskip](const Route& rt) {
-                (m32 ? (zskip ? glm_moe_decode_m32s_k128w_zskip : glm_moe_decode_m32s_k128w)
-                     : (zskip ? glm_moe_decode_m16s_k128w_zskip : glm_moe_decode_m16s_k128w))
-                    <<<dim3(H / 256, bound16), 256>>>(q, q + qb, dn.pp, dn.sp, dn.s2, c_down, rt.off, nullptr,
-                    E, H, I, d_work16);
+        auto down_s = [&](bool m32, bool zskip, bool pf = false) -> Launch {
+            return [&, m32, zskip, pf](const Route& rt) {
+                decltype(&glm_moe_decode_m16s_k128w) const k[2][2][2] = {   // [m32][zskip][pf]
+                    {{glm_moe_decode_m16s_k128w, glm_moe_decode_m16s_k128w_l2pf},
+                     {glm_moe_decode_m16s_k128w_zskip, glm_moe_decode_m16s_k128w_zskip_l2pf}},
+                    {{glm_moe_decode_m32s_k128w, glm_moe_decode_m32s_k128w_l2pf},
+                     {glm_moe_decode_m32s_k128w_zskip, glm_moe_decode_m32s_k128w_zskip_l2pf}}};
+                k[m32][zskip][pf]<<<dim3(H / 256, bound16), 256>>>(q, q + qb, dn.pp, dn.sp, dn.s2, c_down, rt.off,
+                    nullptr, E, H, I, d_work16);
             };
         };
-        auto stream_variant = [&](const char* name, bool m32, bool zskip) {
+        auto stream_variant = [&](const char* name, bool m32, bool zskip, bool pf = false) {
             variants.push_back({name, {
-                {"worklist", prefix16, 0}, {"gate_up_silu stream", gate_up_s(m32), gu_bytes},
-                {zskip ? "down stream zskip" : "down stream", down_s(m32, zskip), dn_bytes}, {"unpermute", unperm, 0}}});
+                {"worklist", prefix16, 0}, {pf ? "gate_up_silu stream pf" : "gate_up_silu stream", gate_up_s(m32, pf), gu_bytes},
+                {zskip ? (pf ? "down stream zskip pf" : "down stream zskip") : "down stream", down_s(m32, zskip, pf),
+                 dn_bytes}, {"unpermute", unperm, 0}}});
         };
         if (max_rows <= 16) {
             stream_variant("m16s", false, false);
             stream_variant("m16s+zskip", false, true);
+            stream_variant("m16s+l2pf", false, true, true);
         }
         if (max_rows <= 32) {
             stream_variant("m32s", true, false);
             stream_variant("m32s+zskip", true, true);
+            stream_variant("m32s+l2pf", true, true, true);
         }
         // Read-only rooflines over the same weight bytes (timing only): the
         // kernels' grid of static table slices, and the chunked ceiling.
@@ -500,9 +513,11 @@ int main(int argc, char** argv) {
                     for (unsigned kp = 0; kp < I / 2 && row % 3 != 2; ++kp)
                         z[(size_t)row * (I / 2) + kp] = row % 3 == 0 ? 0x88 : mix[(kp + row) & 3];
                 std::vector<__nv_bfloat16> want;
-                std::vector<Launch> downs = {down_proj, down_s(true, false), down_s(true, true)};
+                std::vector<Launch> downs = {down_proj, down_s(true, false), down_s(true, true),
+                                             down_s(true, false, true), down_s(true, true, true)};
                 if (max_rows <= 16)
-                    downs.insert(downs.end(), {down_m16, down_m16z, down_s(false, false), down_s(false, true)});
+                    downs.insert(downs.end(), {down_m16, down_m16z, down_s(false, false), down_s(false, true),
+                                               down_s(false, false, true), down_s(false, true, true)});
                 for (auto& f : downs) {
                     CK(cudaMemcpy(q, z.data(), qb + sb, cudaMemcpyHostToDevice));
                     CK(cudaMemset(c_down, 0x5a, (size_t)TE * H * 2));
@@ -523,8 +538,11 @@ int main(int argc, char** argv) {
             // slabs gets NaN from its downs, never stale bytes.
             size_t stale = 0, cells = 0;
             std::vector<std::pair<Launch, int>> downs = {{down_m16, 16}, {down_m16z, 16},
-                {down_s(false, false), 16}, {down_s(false, true), 16}};
-            if (max_rows > 32) downs.push_back({down_s(true, true), 32});
+                {down_s(false, false), 16}, {down_s(false, true), 16}, {down_s(false, true, true), 16}};
+            if (max_rows > 32) {
+                downs.push_back({down_s(true, true), 32});
+                downs.push_back({down_s(true, true, true), 32});
+            }
             for (unsigned ri = 0; ri < ring; ++ri) {
                 const Route& rt = routes[ri];
                 const auto offs = down(rt.off, E + 1);
@@ -594,6 +612,12 @@ int main(int argc, char** argv) {
                 printf("  ARM B/A      %s -> %s: gate_up x%.3f (%.1f us less), down x%.3f (%.1f us less)\n", a.c_str(),
                        b.c_str(), med[b + "/1"] / med[a + "/1"], (med[a + "/1"] - med[b + "/1"]) * 1e3,
                        med[b + "/2"] / med[a + "/2"], (med[a + "/2"] - med[b + "/2"]) * 1e3);
+            // C adds ATLAS_GLM_MOE_DECODE_L2PF=1 to B (=2: its gate/up only).
+            const std::string c = T <= 16 ? "m16s+l2pf" : "m32s+l2pf";
+            if (med.count(b + "/1") && med.count(c + "/1"))
+                printf("  ARM C/B      %s -> %s: gate_up x%.3f (%.1f us less), down x%.3f (%.1f us less)\n",
+                       b.c_str(), c.c_str(), med[c + "/1"] / med[b + "/1"], (med[b + "/1"] - med[c + "/1"]) * 1e3,
+                       med[c + "/2"] / med[b + "/2"], (med[b + "/2"] - med[c + "/2"]) * 1e3);
         }
         CK(cudaFree(d_prefix)); CK(cudaFree(d_roof)); CK(cudaFree(d_next)); CK(cudaFree(d_work16));
         for (auto& rt : routes) { CK(cudaFree(rt.off)); CK(cudaFree(rt.sorted)); CK(cudaFree(rt.t2p)); CK(cudaFree(rt.ids)); CK(cudaFree(rt.w)); CK(cudaFree(rt.work)); CK(cudaFree(rt.active)); }
