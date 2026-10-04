@@ -68,7 +68,6 @@ pub fn prefill_request(
     let req_top_logprobs = req.top_logprobs();
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
-    let mut grammar_state = compile_grammar_state(grammar_engine, &grammar_spec, eos_tokens);
     let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req {
         InferenceRequest::Streaming {
             prompt_tokens,
@@ -102,6 +101,17 @@ pub fn prefill_request(
             None,
         ),
     };
+
+    // After the sink exists: a strict grammar that cannot be armed is reported
+    // to the client. Strict grammars start after `</think>` (see
+    // `GrammarState::masks_first_token`).
+    let mut grammar_state = compile_grammar_state(
+        grammar_engine,
+        &grammar_spec,
+        eos_tokens,
+        req_enable_thinking && think_end_token.is_some(),
+        &mut sink,
+    )?;
 
     let request_start = Instant::now();
     tracing::info!(

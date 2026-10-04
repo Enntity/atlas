@@ -458,10 +458,14 @@ pub fn process_decode_logits(
         // once thinking is finished, because thinking tokens are
         // stripped from the API output and should not consume grammar
         // slots (matches the bitmask-skip in the sampler above).
+        // A strict (response_format) grammar fails loud on a refusal.
         if !a.inside_thinking
             && let Some(ref mut gs) = a.grammar_state
+            && !gs.accept_token(tok)
+            && gs.is_strict()
         {
-            gs.accept_token(tok);
+            crate::scheduler::emit_step::fail_strict_grammar(a, tok);
+            continue;
         }
 
         // §C-1 (DS4F hard-limit lane, 2026-07-21): thinking tokens draw down

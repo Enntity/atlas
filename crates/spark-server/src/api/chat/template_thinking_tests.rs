@@ -8,10 +8,9 @@ use tokenizers::{AddedToken, Tokenizer, models::wordlevel::WordLevel};
 const START: u32 = 1;
 const END: u32 = 2;
 
-#[test]
-fn rendered_glm_generation_tail_reconciles_requested_thinking() {
-    // A tiny tokenizer preserves the real template's special-token boundary;
-    // rendering and encoding run through the same public path as the API.
+/// A tiny tokenizer that preserves the real GLM template's special-token
+/// boundary; rendering and encoding run through the same public path as the API.
+fn glm_tokenizer() -> (tempfile::TempDir, ChatTokenizer) {
     let dir = tempfile::tempdir().unwrap();
     let model = WordLevel::builder()
         .vocab([("[UNK]".to_owned(), 0)].into_iter().collect())
@@ -43,6 +42,12 @@ fn rendered_glm_generation_tail_reconciles_requested_thinking() {
         false,
     )
     .unwrap();
+    (dir, tokenizer)
+}
+
+#[test]
+fn rendered_glm_generation_tail_reconciles_requested_thinking() {
+    let (_dir, tokenizer) = glm_tokenizer();
     assert_eq!(tokenizer.encode("<think></think>").unwrap(), [START, END]);
     let messages = [json!({"role":"user","content":"Use get_weather for Oslo."})];
     let tools = [json!({"type":"function","function":{
@@ -106,5 +111,38 @@ fn unrelated_or_missing_prompt_markers_preserve_policy() {
     assert_eq!(
         reconcile_prompt_thinking(&[9, START], Some(START), None, false, None, 128),
         (true, Some(128))
+    );
+}
+
+#[test]
+fn response_format_with_thinking_off_renders_a_closed_think_block() {
+    // The rem-appraisal request shape: system + user, no tools, thinking off.
+    let (_dir, tokenizer) = glm_tokenizer();
+    let messages = [
+        json!({"role":"system","content":"Appraise the memories. Reply in JSON."}),
+        json!({"role":"user","content":"Hi"}),
+    ];
+    let render = |thinking: bool, structured: bool| {
+        tokenizer
+            .apply_chat_template_openai_with_effort(
+                &messages, None, thinking, false, None, None, structured,
+            )
+            .unwrap()
+    };
+    // response_format + thinking off: closed tail, never template-forced on.
+    let structured = render(false, true);
+    assert!(structured.ends_with(&[3, START, END]));
+    assert_eq!(
+        reconcile_prompt_thinking(&structured, Some(START), Some(END), false, None, 128),
+        (false, None)
+    );
+    // Without response_format the low-effort open think is unchanged.
+    assert!(render(false, false).ends_with(&[3, START]));
+    // Thinking on keeps its reasoning; the grammar starts after `</think>`.
+    let thinking = render(true, true);
+    assert!(thinking.ends_with(&[3, START]));
+    assert_eq!(
+        reconcile_prompt_thinking(&thinking, Some(START), Some(END), true, Some(32), 128),
+        (true, Some(32))
     );
 }

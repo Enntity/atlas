@@ -957,12 +957,8 @@ pub fn run(
                     // serial-decodes the spec-entry window. EVERY active
                     // sequence must be eligible, not just active[0].
                     active.iter().all(|a| {
-                        mtp_gate::spec_dispatch_eligible(
-                            a.inside_thinking,
-                            a.post_think_emitted,
-                            a.output_tokens.len() as u32,
-                            a.suppress_tool_call,
-                            a.disable_mtp,
+                        mtp_gate::seq_spec_eligible(
+                            a,
                             dflash_spec_think,
                             dflash_resume_guard,
                             dflash_verify_raw_argmax,
