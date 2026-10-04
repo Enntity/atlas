@@ -605,8 +605,9 @@ pub(super) fn strict_refusal(tok: u32, at: usize) -> String {
 ///
 /// Returns `Ok(Some(GrammarState))` if compilation succeeds, `Ok(None)` when
 /// no grammar was requested or a tool grammar failed (logging a warning so the
-/// request falls back to legacy tool_call suppression). Called once per
-/// request during prefill.
+/// request falls back to legacy tool_call suppression), except a tool grammar
+/// too large to compile, which is refused like a strict one. Called once per
+/// request during prefill; a panic inside compilation is caught and reported.
 ///
 /// A `response_format` grammar is marked strict (`opens_in_thinking`: the
 /// prompt leaves the model inside `<think>`), and failing to arm one is
@@ -625,7 +626,11 @@ pub fn compile_grammar_state(
     };
     let strict = spec.is_response_format();
     let compiled = match engine.as_mut() {
-        Some(engine) => compile_spec(engine, spec, eos_tokens),
+        // Backstop: nothing a client sends may unwind the scheduler thread.
+        Some(engine) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compile_spec(engine, spec, eos_tokens)
+        }))
+        .unwrap_or_else(|p| Err(format!("grammar compilation panicked: {}", panic_text(&p)))),
         None if strict => Err("this model has no grammar engine".to_string()),
         None => Ok(None),
     };
@@ -633,9 +638,15 @@ pub fn compile_grammar_state(
         Ok(state) if strict => Ok(state.map(|s| s.strict_output(opens_in_thinking))),
         Ok(state) => Ok(state),
         // A request the server cannot serve as asked: HTTP 400 for a blocking
-        // client, not a retryable 500.
-        Err(e) if strict => {
-            let msg = format!("response_format cannot be enforced: {e}");
+        // client, not a retryable 500. A tool grammar too large to compile is
+        // one too: serving it unconstrained would hide the cause.
+        Err(e) if strict || e.contains(GRAMMAR_TOO_LARGE) => {
+            let what = if strict {
+                "response_format"
+            } else {
+                "the tool grammar"
+            };
+            let msg = format!("{what} cannot be enforced: {e}");
             tracing::warn!("{msg}");
             send_invalid_request_to_sink(sink, &msg);
             anyhow::bail!(msg)
@@ -645,6 +656,16 @@ pub fn compile_grammar_state(
             Ok(None)
         }
     }
+}
+
+/// How `xgrammar::CompileError::TooLarge` reads once stringified.
+const GRAMMAR_TOO_LARGE: &str = "grammar too large";
+
+fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
+    p.downcast_ref::<&str>()
+        .copied()
+        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string payload")
 }
 
 /// `Ok(None)` only when a tool parser opts out of constrained decoding.

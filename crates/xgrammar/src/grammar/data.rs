@@ -112,6 +112,42 @@ impl GrammarData {
             .clone()
     }
 
+    /// Approximate heap footprint in bytes: rules, expressions, the shared
+    /// FSM (counted once), every rule's view of it, the FSM hashes and state
+    /// maps, and the pruning table once built.
+    pub fn memory_size(&self) -> usize {
+        use std::mem::size_of;
+        let rules: usize = self
+            .rules
+            .iter()
+            .map(|r| size_of::<Rule>() + r.name.len())
+            .sum();
+        let exprs = (self.expr_data.len() + self.expr_indptr.len()) * size_of::<i32>();
+        let views: usize = self
+            .per_rule_fsms
+            .iter()
+            .map(|v| {
+                size_of::<Option<CompactFsmWithStartEnd>>()
+                    + v.as_ref().map_or(0, |v| v.ends().len())
+            })
+            .sum();
+        let hashes = self.per_rule_fsm_hashes.len() * size_of::<Option<u64>>();
+        let state_maps: usize = self
+            .per_rule_fsm_new_state_ids
+            .iter()
+            .map(|m| size_of::<Vec<(i32, i32)>>() + m.len() * size_of::<(i32, i32)>())
+            .sum();
+        let pruning = self.productivity.get().map_or(0, |p| p.memory_size());
+        rules
+            + exprs
+            + self.allow_empty_rule_ids.len() * size_of::<i32>()
+            + self.complete_fsm.memory_size()
+            + views
+            + hashes
+            + state_maps
+            + pruning
+    }
+
     /// An empty grammar with no root.
     pub fn new() -> Self {
         Self {

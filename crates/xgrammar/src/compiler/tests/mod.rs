@@ -20,6 +20,7 @@ use crate::tokenizer::{TokenizerInfo, VocabType};
 
 mod compile_tests;
 mod decompose_tests;
+mod golden_tests;
 mod mask_tests;
 mod scale_tests;
 mod tier2_tests;

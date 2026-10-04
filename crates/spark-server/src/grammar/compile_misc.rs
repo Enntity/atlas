@@ -8,8 +8,10 @@ use super::engine::{GrammarEngine, GrammarError};
 
 /// Largest JSON schema text compiled for response_format.
 pub(crate) const MAX_SCHEMA_TEXT_BYTES: usize = 1 << 20;
-/// Largest compiled response_format grammar structure (masks excluded: they
-/// fill lazily and are bounded by the compiler cache). A strict object of 96
+/// Largest compiled response_format grammar structure. Masks are excluded:
+/// they fill lazily as the grammar is used, and the compiler cache counts
+/// them only when it next measures (on insert), so one live grammar's masks
+/// grow with the parser states its requests visit. A strict object of 96
 /// required object-valued properties compiles to a few MiB.
 pub(crate) const MAX_SCHEMA_GRAMMAR_BYTES: usize = 64 << 20;
 
@@ -58,10 +60,10 @@ impl GrammarEngine {
 
     /// Compile a grammar that enforces a JSON schema.
     ///
-    /// Refuses a schema over [`MAX_SCHEMA_TEXT_BYTES`] before compiling and
-    /// a grammar over `max_schema_grammar_bytes` after: response_format
-    /// reports either as an invalid request (HTTP 400). Compilation is
-    /// linear in the schema; the limits bound what one request can pin.
+    /// Refuses a schema over [`MAX_SCHEMA_TEXT_BYTES`] before compiling; the
+    /// compiler refuses (and never caches) one whose grammar is over
+    /// [`MAX_SCHEMA_GRAMMAR_BYTES`] or over the FSM encoding limits.
+    /// response_format reports either as an invalid request (HTTP 400).
     pub fn compile_json_schema(&mut self, schema: &str) -> Result<CompiledGrammar, GrammarError> {
         if schema.len() > MAX_SCHEMA_TEXT_BYTES {
             return Err(GrammarError::Compilation(format!(
@@ -69,8 +71,7 @@ impl GrammarEngine {
                 schema.len()
             )));
         }
-        let compiled = self
-            .compiler
+        self.compiler
             .compile_json_schema(
                 schema,
                 true,                 // any_whitespace
@@ -79,16 +80,7 @@ impl GrammarEngine {
                 true,                 // strict_mode
                 Some(Self::MAX_JSON_SCHEMA_WHITESPACE),
             )
-            .map_err(GrammarError::Compilation)?;
-        let bytes = compiled.grammar_memory_size_bytes();
-        if bytes > self.max_schema_grammar_bytes {
-            return Err(GrammarError::Compilation(format!(
-                "the schema compiles to a {} MiB grammar, over the {} MiB limit",
-                bytes >> 20,
-                self.max_schema_grammar_bytes >> 20
-            )));
-        }
-        Ok(compiled)
+            .map_err(GrammarError::Compilation)
     }
 
     /// Compile the built-in JSON grammar (any valid JSON).

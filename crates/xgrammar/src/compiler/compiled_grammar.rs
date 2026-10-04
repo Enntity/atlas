@@ -97,9 +97,7 @@ impl CompiledGrammarImpl {
 
     /// The grammar term of [`Self::memory_size`].
     pub fn grammar_memory_size(&self) -> usize {
-        self.grammar.complete_fsm.memory_size()
-            + self.grammar.num_exprs() as usize * 4
-            + self.grammar.num_rules() as usize * 32
+        self.grammar.memory_size()
     }
 
     /// Build the cross-grammar [`RuleMaskKey`] for a canonical parser
