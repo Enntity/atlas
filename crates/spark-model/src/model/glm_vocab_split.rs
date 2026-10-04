@@ -280,7 +280,7 @@ impl TransformerModel {
                     !self.gpu.stream_is_capturing(stream),
                     "masked verify cannot be graph-captured"
                 );
-                Some((k, masks, self.verify_mask_words()))
+                Some((k, masks, self.config.vocab_size.div_ceil(32)))
             }
             None => None,
         };
@@ -314,9 +314,10 @@ impl TransformerModel {
 }
 
 /// Launch the per-row shard argmax: `argmax_bf16_value_ban`, or under row
-/// masks `argmax_bf16_value_ban_allow` with this rank's slice of each row's
-/// mask (`(kernel, masks, words per row)`). The rank's first vocabulary row
-/// `start` must sit on a mask word boundary.
+/// masks `argmax_bf16_value_ban_allow` (`(kernel, masks, words per row)`):
+/// each row's full-vocabulary mask, read from bit `start` on, so the rank's
+/// first vocabulary row may fall anywhere in a mask word (GLM-5.3 splits
+/// at 77,428).
 #[allow(clippy::too_many_arguments)]
 fn launch_shard_argmax(
     gpu: &dyn GpuBackend,
@@ -338,13 +339,10 @@ fn launch_shard_argmax(
         .arg_u32(shard as u32)
         .arg_u32(vocab as u32);
     if let Some((_, masks, words)) = allow {
-        ensure!(
-            start % 32 == 0,
-            "vocab shard start {start} splits a mask word"
-        );
         launch = launch
-            .arg_ptr(masks.offset(start / 32 * 4))
-            .arg_u32(words as u32);
+            .arg_ptr(masks)
+            .arg_u32(words as u32)
+            .arg_u32(start as u32);
     }
     for id in ban_ids {
         launch = launch.arg_u32(id);

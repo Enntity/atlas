@@ -28,6 +28,7 @@ fn model() -> TestModel {
         host_logits: true,
         cancel_after_sampling: None,
         cancel_after_row_commit: None,
+        verify: None,
     }
 }
 

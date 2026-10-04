@@ -669,7 +669,6 @@ impl TransformerModel {
         }
         attempt("kv cache", self.kv_cache.lock().release(gpu));
         attempt("buffer arena", self.buffers.release(gpu));
-        attempt("verify row masks", self.verify_row_masks.release(gpu));
         // Weights LAST: the layers hold pointers into them, so they must not be
         // freed until everything that reads them is gone.
         if let Some(mut store) = self.weight_store.take() {

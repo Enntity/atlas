@@ -400,6 +400,7 @@ fn spill_pool_runs_only_for_models_that_resume_a_swap() {
         host_logits: false,
         cancel_after_sampling: None,
         cancel_after_row_commit: None,
+        verify: None,
     };
     assert!(!spill_pool_enabled(&cannot, 3));
 }

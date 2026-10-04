@@ -69,8 +69,9 @@ extern "C" __global__ void argmax_bf16_value(
 // (0xFFFFFFFF = unused). out[r] = {best bits, best index, unbanned bits,
 // unbanned index}, same comparator as argmax_bf16_value.
 //
-// ALLOW: only indices whose bit is set in `allow` (this row's grammar bitmask,
-// shard-local bit i at word i/32) compete, the masked argmax of a strict
+// ALLOW: only indices whose bit is set in `allow` (this row's full-vocabulary
+// grammar bitmask; shard-local index i is vocabulary bit allow_bit0 + i, so a
+// shard may start inside a 32-bit word) compete, the masked argmax of a strict
 // structured-output row (vLLM #14702 applies the same per-row bitmask before
 // its sampler). A row with no allowed index keeps both -1e30f sentinels.
 template <bool ALLOW>
@@ -79,6 +80,7 @@ __device__ __forceinline__ void glm_value_ban_row(
     unsigned int* __restrict__ o,
     unsigned int n,
     const unsigned int* __restrict__ allow,
+    unsigned int allow_bit0,
     unsigned int ban0,
     unsigned int ban1,
     unsigned int ban2,
@@ -90,8 +92,11 @@ __device__ __forceinline__ void glm_value_ban_row(
     float best = -1e30f, free_best = -1e30f;
     unsigned int best_idx = 0, free_idx = 0;
     for (unsigned int i = tid; i < n; i += blockDim.x) {
-        if (ALLOW && !((allow[i >> 5] >> (i & 31)) & 1u)) {
-            continue;
+        if (ALLOW) {
+            const unsigned int b = allow_bit0 + i;
+            if (!((allow[b >> 5] >> (b & 31)) & 1u)) {
+                continue;
+            }
         }
         const float v = __bfloat162float(row[i]);
         if (glm_argmax_other_better(v, i, best, best_idx)) {
@@ -144,12 +149,13 @@ extern "C" __global__ void argmax_bf16_value_ban(
     __shared__ float s_val[2][1024];
     __shared__ unsigned int s_idx[2][1024];
     glm_value_ban_row<false>(
-        logits + (size_t)blockIdx.x * row_stride, out + 4 * blockIdx.x, n, nullptr,
+        logits + (size_t)blockIdx.x * row_stride, out + 4 * blockIdx.x, n, nullptr, 0,
         ban0, ban1, ban2, ban3, s_val, s_idx);
 }
 
-// argmax_bf16_value_ban under a per-row bitmask: row r is masked by
-// allow[r * allow_stride ..] (32-bit words, the rank's shard starting at bit 0).
+// argmax_bf16_value_ban under a per-row bitmask: row r is masked by the
+// full-vocabulary mask at allow[r * allow_stride ..] (32-bit words); this
+// rank's shard starts at vocabulary bit allow_bit0 (any offset).
 // Grid: (rows, 1, 1)  Block: (1024, 1, 1)
 extern "C" __global__ void argmax_bf16_value_ban_allow(
     const __nv_bfloat16* __restrict__ logits,
@@ -158,6 +164,7 @@ extern "C" __global__ void argmax_bf16_value_ban_allow(
     unsigned int row_stride,
     const unsigned int* __restrict__ allow,
     unsigned int allow_stride,
+    unsigned int allow_bit0,
     unsigned int ban0,
     unsigned int ban1,
     unsigned int ban2,
@@ -167,7 +174,8 @@ extern "C" __global__ void argmax_bf16_value_ban_allow(
     __shared__ unsigned int s_idx[2][1024];
     glm_value_ban_row<true>(
         logits + (size_t)blockIdx.x * row_stride, out + 4 * blockIdx.x, n,
-        allow + (size_t)blockIdx.x * allow_stride, ban0, ban1, ban2, ban3, s_val, s_idx);
+        allow + (size_t)blockIdx.x * allow_stride, allow_bit0, ban0, ban1, ban2, ban3,
+        s_val, s_idx);
 }
 
 // Merge per-row TP2 shard quads from argmax_bf16_value_ban into global token
