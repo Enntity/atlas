@@ -9,15 +9,21 @@ use spark_comm::CommBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::super::{BlockDiffusionDraftHead, DflashScratch};
-use super::{Geometry, Graphs, Parts, Piece, SplitOps, Swap, half, walk};
+use super::super::BlockDiffusionDraftHead;
+use super::{Frame, Geometry, Graphs, Parts, Piece, SplitOps, Swap, half, walk};
 use crate::layers::ops;
 use crate::weight_map::QuantizedWeight;
 
 /// A head's split state: the plan, the half buffers and how far the current
 /// propose got.
 pub struct RankSplit {
+    /// The single-sequence plan (`gamma` rows).
     pub(crate) geometry: Geometry,
+    /// Rows the half buffers hold: `gamma`, or the batch capacity times
+    /// `gamma` with `ATLAS_GLM_DRAFT_TP_BATCH`.
+    pub(crate) capacity: usize,
+    /// Rows of the current propose.
+    rows: AtomicUsize,
     /// This rank's half of gate (then of the gated activation) and of up.
     pub(super) gate: DevicePtr,
     up: DevicePtr,
@@ -36,25 +42,29 @@ pub struct RankSplit {
 }
 
 impl RankSplit {
-    /// Allocate the half buffers for `geometry`.
-    pub(crate) fn new(geometry: Geometry, gpu: &dyn GpuBackend) -> Result<Self> {
+    /// Allocate the half buffers for `geometry` at `capacity` rows (at
+    /// least `gamma`).
+    pub(crate) fn new(geometry: Geometry, capacity: usize, gpu: &dyn GpuBackend) -> Result<Self> {
         geometry.validate()?;
+        let full = geometry.with_rows(capacity.max(geometry.gamma));
         let alloc = |swap: Swap, on: bool| -> Result<DevicePtr> {
             if on {
-                gpu.alloc(geometry.bytes(swap))
+                gpu.alloc(full.bytes(swap))
             } else {
                 Ok(DevicePtr::NULL)
             }
         };
         let (mlp, head) = (geometry.parts.mlp, geometry.parts.head);
-        let sink_bytes = geometry
+        let sink_bytes = full
             .swaps()
             .iter()
-            .map(|&s| geometry.bytes(s))
+            .map(|&s| full.bytes(s))
             .max()
             .context("a split has swaps")?;
         Ok(Self {
             geometry,
+            capacity: full.gamma,
+            rows: AtomicUsize::new(geometry.gamma),
             gate: alloc(Swap::Activation(0), mlp)?,
             up: alloc(Swap::Activation(0), mlp)?,
             activation_peer: alloc(Swap::Activation(0), mlp)?,
@@ -67,28 +77,42 @@ impl RankSplit {
         })
     }
 
-    /// The largest swap, which the pair exchange must be able to carry.
-    pub(crate) fn max_bytes(&self) -> usize {
-        let g = &self.geometry;
+    /// The largest swap of a propose of `rows` rows, which the pair
+    /// exchange must be able to carry.
+    pub(crate) fn max_bytes_at(&self, rows: usize) -> usize {
+        let g = self.geometry.with_rows(rows);
         g.swaps().iter().map(|&s| g.bytes(s)).max().unwrap_or(0)
     }
 
-    /// A propose begins: no swap issued yet.
-    pub(crate) fn begin(&self) {
+    /// The largest single-sequence swap.
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes_at(self.geometry.gamma)
+    }
+
+    /// A propose of `rows` rows (at most [`Self::capacity`]) begins: no swap
+    /// issued yet.
+    pub(crate) fn begin(&self, rows: usize) -> Result<()> {
+        ensure!(
+            (1..=self.capacity).contains(&rows),
+            "rank-split propose of {rows} rows (capacity {})",
+            self.capacity
+        );
+        self.rows.store(rows, Ordering::Relaxed);
         self.issued.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The plan of the current propose: its rows and the shared shapes.
+    pub(crate) fn plan(&self) -> Geometry {
+        self.geometry.with_rows(self.rows.load(Ordering::Relaxed))
     }
 
     /// What `rank` sends and where the peer's payload lands.
-    pub(super) fn ends(
-        &self,
-        swap: Swap,
-        rank: usize,
-        scratch: &DflashScratch,
-    ) -> (DevicePtr, DevicePtr) {
+    pub(super) fn ends(&self, swap: Swap, rank: usize, frame: &Frame) -> (DevicePtr, DevicePtr) {
         match swap {
-            // One way, head to worker. The rows are in `norm_buf` on both.
-            Swap::Input(_) | Swap::Hidden if rank == 0 => (scratch.norm_buf, self.sink),
-            Swap::Input(_) | Swap::Hidden => (self.sink, scratch.norm_buf),
+            // One way, head to worker. The rows are in `frame.norm` on both.
+            Swap::Input(_) | Swap::Hidden if rank == 0 => (frame.norm, self.sink),
+            Swap::Input(_) | Swap::Hidden => (self.sink, frame.norm),
             Swap::Activation(_) => (self.gate, self.activation_peer),
             Swap::Output(_) => (self.down, self.down_peer),
             Swap::Logits => (self.logits, self.logits_peer),
@@ -103,15 +127,15 @@ impl RankSplit {
         rank: usize,
         gpu: &dyn GpuBackend,
         comm: &dyn CommBackend,
-        scratch: &DflashScratch,
+        frame: &Frame,
         stream: u64,
     ) -> Result<()> {
-        let (send, dst) = self.ends(swap, rank, scratch);
+        let (send, dst) = self.ends(swap, rank, frame);
         self.exchange(swap, send, dst, comm, stream)?;
-        let g = &self.geometry;
+        let g = &self.plan();
         match swap {
             Swap::Activation(_) => self.join(
-                scratch.mlp_intermediate,
+                frame.inter,
                 g.inter,
                 (self.gate, self.activation_peer),
                 rank,
@@ -119,7 +143,7 @@ impl RankSplit {
                 stream,
             ),
             Swap::Output(_) if rank == 0 => self.join(
-                scratch.stream_acc,
+                frame.acc,
                 g.hidden,
                 (self.down, self.down_peer),
                 rank,
@@ -127,7 +151,7 @@ impl RankSplit {
                 stream,
             ),
             Swap::Logits if rank == 0 => self.join(
-                scratch.logits,
+                frame.logits,
                 g.vocab,
                 (self.logits, self.logits_peer),
                 rank,
@@ -146,7 +170,7 @@ impl RankSplit {
         comm: &dyn CommBackend,
         stream: u64,
     ) -> Result<()> {
-        let bytes = self.geometry.bytes(swap);
+        let bytes = self.plan().bytes(swap);
         ensure!(
             comm.exchange_async(send.0, dst.0, bytes, false, stream)?,
             "rank-split propose: pair exchange refused {swap:?} ({bytes} bytes)"
@@ -174,7 +198,7 @@ impl RankSplit {
                 dst.offset(first * 2),
                 n * 2,
                 rows * 2,
-                self.geometry.gamma,
+                self.plan().gamma,
                 stream,
             )?;
         }
@@ -184,7 +208,7 @@ impl RankSplit {
     /// A propose ends, however it ended: issue every swap it did not reach,
     /// so the peer, which walks them all, is never left waiting in one.
     pub(crate) fn finish(&self, comm: &dyn CommBackend, stream: u64) -> Result<()> {
-        let swaps = self.geometry.swaps();
+        let swaps = self.plan().swaps();
         let issued = self.issued.load(Ordering::Relaxed);
         for &swap in swaps.iter().skip(issued) {
             self.exchange(swap, self.sink, self.sink, comm, stream)?;
@@ -210,9 +234,15 @@ pub(super) fn row_range(w: &QuantizedWeight, first: usize, k: usize) -> Quantize
 }
 
 impl BlockDiffusionDraftHead {
-    /// Turn the rank split on for this head (either rank). Refuses a head
+    /// Turn the rank split on for this head (either rank), for batched
+    /// proposes too with `batch` (`ATLAS_GLM_DRAFT_TP_BATCH`). Refuses a head
     /// the split cannot serve: it must not run unsplit on one rank only.
-    pub fn enable_rank_split(&mut self, parts: Parts, gpu: &dyn GpuBackend) -> Result<()> {
+    pub fn enable_rank_split(
+        &mut self,
+        parts: Parts,
+        batch: bool,
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
         let tier = crate::layers::w4a16_gemv_tiers::tc_kernel(self.gamma as u32);
         let layers_ok = self.twins.nvfp4_tc
             && self.layers.iter().all(|l| {
@@ -242,17 +272,20 @@ impl BlockDiffusionDraftHead {
             layers: self.layers.len(),
             parts,
         };
+        // A batched propose runs B×gamma rows through the batch buffers.
+        let capacity = if batch {
+            self.gamma * self.batch_capacity
+        } else {
+            self.gamma
+        };
+        let split = RankSplit::new(geometry, capacity, gpu)?;
         tracing::info!(
-            "DFlash rank split: {parts:?}, {} swaps per propose, largest {} bytes",
+            "DFlash rank split: {parts:?}, {} swaps per propose, largest {} bytes; up to {capacity} rows (largest swap {} bytes)",
             geometry.swaps().len(),
-            geometry
-                .swaps()
-                .iter()
-                .map(|&s| geometry.bytes(s))
-                .max()
-                .unwrap_or(0)
+            split.max_bytes(),
+            split.max_bytes_at(capacity)
         );
-        self.rank_split = Some(RankSplit::new(geometry, gpu)?);
+        self.rank_split = Some(split);
         Ok(())
     }
 
@@ -272,8 +305,8 @@ impl BlockDiffusionDraftHead {
         .then_some((split, comm))
     }
 
-    /// `out[gamma, rows] = input[gamma, k] · W[first.., ..]ᵀ` for this rank's
-    /// half of an `[n, k]` twin.
+    /// `out[m, rows] = input[m, k] · W[first.., ..]ᵀ` for this rank's half of
+    /// an `[n, k]` twin, `m` the propose's rows.
     #[allow(clippy::too_many_arguments)]
     fn split_gemv(
         &self,
@@ -281,8 +314,7 @@ impl BlockDiffusionDraftHead {
         w: Option<&QuantizedWeight>,
         input: DevicePtr,
         out: DevicePtr,
-        n: usize,
-        k: usize,
+        [m, n, k]: [usize; 3],
         rank: usize,
         stream: u64,
     ) -> Result<()> {
@@ -294,7 +326,7 @@ impl BlockDiffusionDraftHead {
                 &row_range(w, first, k),
                 input,
                 out,
-                self.gamma as u32,
+                m as u32,
                 rows as u32,
                 k as u32,
                 stream,
@@ -311,10 +343,10 @@ impl BlockDiffusionDraftHead {
         piece: Piece,
         rank: usize,
         gpu: &dyn GpuBackend,
-        scratch: &DflashScratch,
+        frame: &Frame,
         stream: u64,
     ) -> Result<()> {
-        let g = &split.geometry;
+        let g = &split.plan();
         match piece {
             Piece::GateUp(l) => {
                 let layer = &self.layers[l];
@@ -325,10 +357,9 @@ impl BlockDiffusionDraftHead {
                     self.split_gemv(
                         gpu,
                         w.as_ref(),
-                        scratch.norm_buf,
+                        frame.norm,
                         out,
-                        g.inter,
-                        g.hidden,
+                        [g.gamma, g.inter, g.hidden],
                         rank,
                         stream,
                     )?;
@@ -346,20 +377,18 @@ impl BlockDiffusionDraftHead {
             Piece::Down(l) => self.split_gemv(
                 gpu,
                 self.layers[l].down_proj_nvfp4.as_ref(),
-                scratch.mlp_intermediate,
+                frame.inter,
                 split.down,
-                g.hidden,
-                g.inter,
+                [g.gamma, g.hidden, g.inter],
                 rank,
                 stream,
             ),
             Piece::Vocab => self.split_gemv(
                 gpu,
                 self.twins.lm_head_q4.as_ref(),
-                scratch.norm_buf,
+                frame.norm,
                 split.logits,
-                g.vocab,
-                g.hidden,
+                [g.gamma, g.vocab, g.hidden],
                 rank,
                 stream,
             ),
@@ -368,12 +397,14 @@ impl BlockDiffusionDraftHead {
     }
 
     /// Worker side of a split propose: enqueue this rank's whole walk on
-    /// `stream`. No host sync: the swaps order it against the head.
+    /// `stream`. No host sync: the swaps order it against the head. `rows`
+    /// is a batched propose's B×gamma (`None`: a single sequence's gamma).
     pub fn rank_split_serve(
         &self,
         gpu: &dyn GpuBackend,
         comm: &dyn CommBackend,
         stream: u64,
+        rows: Option<usize>,
     ) -> Result<()> {
         let split = self
             .rank_split
@@ -383,14 +414,19 @@ impl BlockDiffusionDraftHead {
             comm.rank() == 1 && comm.world_size() == 2,
             "rank-split propose serves on rank 1 of 2"
         );
+        let frame = match rows {
+            Some(_) => self.batch_frame(),
+            None => Frame::serial(&self.scratch),
+        };
+        split.begin(rows.unwrap_or(self.gamma))?;
         let worker = Worker {
             head: self,
             split,
+            frame,
             gpu,
             comm,
             stream,
         };
-        split.begin();
         let walked = walk(
             &split.geometry.steps(1),
             Graphs::Eager,
@@ -407,6 +443,7 @@ impl BlockDiffusionDraftHead {
 struct Worker<'a> {
     head: &'a BlockDiffusionDraftHead,
     split: &'a RankSplit,
+    frame: Frame,
     gpu: &'a dyn GpuBackend,
     comm: &'a dyn CommBackend,
     stream: u64,
@@ -414,13 +451,11 @@ struct Worker<'a> {
 
 impl SplitOps for Worker<'_> {
     fn piece(&self, piece: Piece) -> Result<()> {
-        let scratch = &self.head.scratch;
         self.head
-            .split_piece(self.split, piece, 1, self.gpu, scratch, self.stream)
+            .split_piece(self.split, piece, 1, self.gpu, &self.frame, self.stream)
     }
     fn swap(&self, swap: Swap) -> Result<()> {
-        let scratch = &self.head.scratch;
         self.split
-            .swap(swap, 1, self.gpu, self.comm, scratch, self.stream)
+            .swap(swap, 1, self.gpu, self.comm, &self.frame, self.stream)
     }
 }

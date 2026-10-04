@@ -23,6 +23,14 @@
 //! selects parts for an A/B. Both ranks must run the same value
 //! (`model::startup_parity`).
 //!
+//! `ATLAS_GLM_DRAFT_TP_BATCH=1` (with the switch above, default off) splits
+//! the batched B×gamma propose of an owner-batched step the same way
+//! (`rank_split_batch`): the plan's rows are B×gamma, the halves are the
+//! same tensor-core GEMV over a row range at the same row count the unsplit
+//! batched launch uses, and the swaps carry the batch buffers. Without it the
+//! worker idles through every batched propose (about 10 ms each in a C4
+//! prose nsys profile, 2026-10-03).
+//!
 //! Prior art: splitting the drafter across both ranks follows MiaAI-Lab's
 //! `DFLASH_DRAFT_TP=2` (<https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks>
 //! `.env.example`, `start.sh`; vLLM `draft_tensor_parallel_size`). Idea only,
@@ -30,7 +38,7 @@
 //! RDMA pair with bit-identical drafts, is ours (docs/glm-prior-art.md).
 
 use anyhow::{Result, bail, ensure};
-use spark_runtime::gpu::{GpuBackend, GraphHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle};
 
 #[path = "rank_split_exec.rs"]
 mod exec;
@@ -83,6 +91,51 @@ impl Parts {
 /// `ATLAS_GLM_DRAFT_TP`, from the profile both ranks share.
 pub fn requested() -> Result<Option<Parts>> {
     Parts::parse(std::env::var("ATLAS_GLM_DRAFT_TP").ok().as_deref())
+}
+
+/// `ATLAS_GLM_DRAFT_TP_BATCH`: `1` splits batched proposes too; unset, empty
+/// or `0` = off; anything else is refused.
+pub(crate) fn parse_batch(value: Option<&str>) -> Result<bool> {
+    match value.map(str::trim) {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => bail!("ATLAS_GLM_DRAFT_TP_BATCH must be 0 or 1, got '{other}'"),
+    }
+}
+
+/// `ATLAS_GLM_DRAFT_TP_BATCH`, from the profile both ranks share.
+pub fn batch_requested() -> Result<bool> {
+    parse_batch(std::env::var("ATLAS_GLM_DRAFT_TP_BATCH").ok().as_deref())
+}
+
+/// The value both ranks must agree on: [`Parts::word`], plus bit 2 for the
+/// batched split (so the word is unchanged with it off).
+pub(crate) fn parity_word(parts: Option<Parts>, batch: bool) -> u64 {
+    Parts::word(parts) | (batch as u64) << 2
+}
+
+/// Where a propose's whole rows live on a rank: the MLP input and final-norm
+/// rows (`norm`), the gated activation (`inter`), the down projection the
+/// head's residual adds (`acc`) and the logits (`logits`). A single-sequence
+/// propose uses the block scratch ([`Frame::serial`]), a batched one the
+/// head's B×gamma buffers (`BlockDiffusionDraftHead::batch_frame`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Frame {
+    pub norm: DevicePtr,
+    pub inter: DevicePtr,
+    pub acc: DevicePtr,
+    pub logits: DevicePtr,
+}
+
+impl Frame {
+    pub(crate) fn serial(scratch: &super::DflashScratch) -> Self {
+        Self {
+            norm: scratch.norm_buf,
+            inter: scratch.mlp_intermediate,
+            acc: scratch.stream_acc,
+            logits: scratch.logits,
+        }
+    }
 }
 
 /// One exchange of the walk. The payload is `[gamma, width]` BF16.
@@ -155,6 +208,15 @@ pub(crate) fn half(n: usize, rank: usize) -> (usize, usize) {
 }
 
 impl Geometry {
+    /// This plan for a propose of `rows` rows (`gamma` is the rows of a
+    /// propose: a batched one runs B×gamma).
+    pub(crate) fn with_rows(&self, rows: usize) -> Self {
+        Self {
+            gamma: rows,
+            ..*self
+        }
+    }
+
     /// Every row range is non-empty and starts on a 16-byte boundary of the
     /// packed twin (its K is a multiple of 32).
     pub(crate) fn validate(&self) -> Result<()> {

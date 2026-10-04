@@ -327,13 +327,18 @@ struct Rank {
 
 impl Rank {
     fn new(g: Geometry) -> Self {
+        Self::with_capacity(g, g.gamma)
+    }
+
+    /// A rank whose split holds `capacity` rows.
+    fn with_capacity(g: Geometry, capacity: usize) -> Self {
         let gpu = MockGpuBackend::new();
         let mut scratch = zero_scratch();
         scratch.norm_buf = gpu.alloc(g.gamma * g.hidden * 2).unwrap();
         scratch.mlp_intermediate = gpu.alloc(g.gamma * g.inter * 2).unwrap();
         scratch.stream_acc = gpu.alloc(g.gamma * g.hidden * 2).unwrap();
         scratch.logits = gpu.alloc(g.gamma * g.vocab * 2).unwrap();
-        let split = RankSplit::new(g, &gpu).unwrap();
+        let split = RankSplit::new(g, capacity, &gpu).unwrap();
         Self {
             gpu,
             scratch,
@@ -378,15 +383,15 @@ fn swapped_halves_land_where_the_unsplit_launch_writes_whole_rows() {
     // Run `swap` on both ranks, each landing what the other sent.
     let run = |swap: Swap| {
         let bytes = g.bytes(swap);
-        let sent0 = r0.read(r0.split.ends(swap, 0, &r0.scratch).0, bytes);
-        let sent1 = r1.read(r1.split.ends(swap, 1, &r1.scratch).0, bytes);
+        let sent0 = r0.read(r0.split.ends(swap, 0, &Frame::serial(&r0.scratch)).0, bytes);
+        let sent1 = r1.read(r1.split.ends(swap, 1, &Frame::serial(&r1.scratch)).0, bytes);
         p0.peer.borrow_mut().push_back(sent1.clone());
         p1.peer.borrow_mut().push_back(sent0.clone());
         r0.split
-            .swap(swap, 0, &r0.gpu, &p0, &r0.scratch, 0)
+            .swap(swap, 0, &r0.gpu, &p0, &Frame::serial(&r0.scratch), 0)
             .unwrap();
         r1.split
-            .swap(swap, 1, &r1.gpu, &p1, &r1.scratch, 0)
+            .swap(swap, 1, &r1.gpu, &p1, &Frame::serial(&r1.scratch), 0)
             .unwrap();
         (sent0, sent1)
     };
@@ -453,10 +458,10 @@ fn a_propose_that_stops_early_still_issues_every_swap() {
     let sizes: Vec<usize> = g.swaps().iter().map(|&s| g.bytes(s)).collect();
 
     // Stopped after two swaps: the rest are drained, sized as planned.
-    rank.split.begin();
+    rank.split.begin(g.gamma).unwrap();
     for &swap in &g.swaps()[..2] {
         rank.split
-            .swap(swap, 0, &rank.gpu, &pair, &rank.scratch, 0)
+            .swap(swap, 0, &rank.gpu, &pair, &Frame::serial(&rank.scratch), 0)
             .unwrap();
     }
     rank.split.finish(&pair, 0).unwrap();
@@ -466,8 +471,11 @@ fn a_propose_that_stops_early_still_issues_every_swap() {
     // starts from zero.
     rank.split.finish(&pair, 0).unwrap();
     assert_eq!(pair.sizes.borrow().len(), sizes.len());
-    rank.split.begin();
+    rank.split.begin(g.gamma).unwrap();
     rank.split.finish(&pair, 0).unwrap();
     assert_eq!(pair.sizes.borrow().len(), 2 * sizes.len());
     assert!(rank.split.max_bytes() >= *sizes.iter().max().unwrap());
 }
+
+#[path = "rank_split_batch_tests.rs"]
+mod batch;

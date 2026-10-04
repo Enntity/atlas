@@ -9,7 +9,7 @@ use spark_comm::CommBackend;
 use spark_runtime::gpu::GraphHandle;
 
 use super::forward_block_layer_paged::PagedLayerArgs;
-use super::rank_split::{Graphs, Piece, RankSplit, SplitOps, Step, Swap, run_count, walk};
+use super::rank_split::{Frame, Graphs, Piece, RankSplit, SplitOps, Step, Swap, run_count, walk};
 use super::{BlockDiffusionDraftHead, DflashGraphIdentity, DflashScratch};
 use crate::layer::ForwardContext;
 use crate::layers::ops;
@@ -67,14 +67,21 @@ impl SplitOps for HeadWalk<'_> {
             ),
             Piece::Select => (self.select)(),
             Piece::GateUp(_) | Piece::Down(_) | Piece::Vocab => {
-                head.split_piece(self.split, piece, 0, ctx.gpu, scratch, self.stream)
+                let frame = Frame::serial(scratch);
+                head.split_piece(self.split, piece, 0, ctx.gpu, &frame, self.stream)
             }
         }
     }
 
     fn swap(&self, swap: Swap) -> Result<()> {
-        self.split
-            .swap(swap, 0, self.ctx.gpu, self.comm, self.scratch, self.stream)
+        self.split.swap(
+            swap,
+            0,
+            self.ctx.gpu,
+            self.comm,
+            &Frame::serial(self.scratch),
+            self.stream,
+        )
     }
 }
 

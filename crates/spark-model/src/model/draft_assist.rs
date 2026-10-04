@@ -9,11 +9,14 @@
 //! Wire protocol, v2-addressed:
 //!
 //! ```text
-//! EC  (seq_id 0)  -> the worker enqueues its walk of the propose's swaps
+//! EC  (seq_id 0)     -> the worker enqueues its walk of the propose's swaps
+//! EC  (seq_id rows)  -> the same for a batched propose of `rows` = B×gamma
+//!                       rows (`ATLAS_GLM_DRAFT_TP_BATCH`, v2 only)
 //! ```
 //!
 //! The command carries no payload: both ranks plan the swaps from the same
-//! drafter shapes and the same agreed switch (`startup_parity`). The head
+//! drafter shapes, the same agreed switches (`startup_parity`) and, for a
+//! batched propose, the rows in the preamble slot word. The head
 //! sends it only outside any other command, so the worker is at its command
 //! loop; the worker enqueues and returns there, its next command ordered
 //! behind the walk on the same stream.
@@ -52,8 +55,27 @@ impl TransformerModel {
         self.ep_broadcast_seq_and_cmd(0, EP_CMD_DRAFT_ASSIST, self.ep_protocol_v2)
     }
 
-    /// Worker side of EC.
-    pub(super) fn draft_assist_serve(&self) -> Result<bool> {
+    /// Head: the communicator and rows a batched propose of `n` sequences
+    /// swaps over, when it will split. The rows ride the v2 preamble.
+    pub(super) fn draft_split_batch(
+        &self,
+        proposer: &dyn DraftProposer,
+        n: usize,
+        grammar: bool,
+    ) -> Option<(&dyn CommBackend, usize)> {
+        let comm = self.comm_ref()?;
+        let rows = (self.multi_rank_protocol_active() && self.ep_protocol_v2)
+            .then(|| proposer.rank_split_batch_rows(comm, n, grammar))??;
+        Some((comm, rows))
+    }
+
+    /// Head: announce the batched split propose of `rows` rows about to run.
+    pub(super) fn announce_draft_split_rows(&self, rows: usize) -> Result<()> {
+        self.ep_broadcast_seq_and_cmd(u32::try_from(rows)?, EP_CMD_DRAFT_ASSIST, true)
+    }
+
+    /// Worker side of EC: `seq_id` is a batched propose's rows, or 0.
+    pub(super) fn draft_assist_serve(&self, seq_id: u32) -> Result<bool> {
         let head = self
             .draft_assist
             .as_ref()
@@ -61,7 +83,8 @@ impl TransformerModel {
         let comm = self
             .comm_ref()
             .context("rank-split propose without a communicator")?;
-        head.rank_split_serve(self.gpu.as_ref(), comm, self.gpu.default_stream())?;
+        let rows = (seq_id != 0).then_some(seq_id as usize);
+        head.rank_split_serve(self.gpu.as_ref(), comm, self.gpu.default_stream(), rows)?;
         Ok(true)
     }
 }

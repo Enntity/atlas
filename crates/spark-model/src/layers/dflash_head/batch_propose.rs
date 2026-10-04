@@ -36,6 +36,7 @@ impl BlockDiffusionDraftHead {
         ctx: &crate::layer::ForwardContext,
         stream: u64,
         grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
+        batch_split: Option<(&super::rank_split::RankSplit, &dyn spark_comm::CommBackend)>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
         let n = last_tokens.len();
 
@@ -236,17 +237,37 @@ impl BlockDiffusionDraftHead {
                     Some(self.batch_attention_args),
                 )
             };
-            for layer_idx in 0..self.layers.len() {
-                self.run_batched_layer_stage(
-                    layer_idx,
-                    batch_rows,
-                    batch_size,
-                    max_kv_len,
-                    serial_tables,
-                    serial_args,
-                    ctx,
-                    stream,
-                )?;
+            // ATLAS_GLM_DRAFT_TP_BATCH: the same layers and tail base, the
+            // MLP and head halves swapped with the worker (no parity oracle).
+            let walked = match batch_split {
+                Some((split, comm)) => {
+                    let a = super::batch_forward::BatchLayerArgs {
+                        batch_rows,
+                        batch_size,
+                        max_kv_len,
+                        serial_block_tables: serial_tables,
+                        serial_attention_args: serial_args,
+                        ctx,
+                        stream,
+                    };
+                    self.walk_batch_split(split, comm, a)?;
+                    true
+                }
+                None => false,
+            };
+            if !walked {
+                for layer_idx in 0..self.layers.len() {
+                    self.run_batched_layer_stage(
+                        layer_idx,
+                        batch_rows,
+                        batch_size,
+                        max_kv_len,
+                        serial_tables,
+                        serial_args,
+                        ctx,
+                        stream,
+                    )?;
+                }
             }
             if let Some(expected) = parity_hidden_oracle.as_ref() {
                 ctx.gpu.synchronize(stream)?;
@@ -280,7 +301,9 @@ impl BlockDiffusionDraftHead {
                     );
                 }
             }
-            self.run_batched_tail_base(batch_rows, ctx, stream)?;
+            if !walked {
+                self.run_batched_tail_base(batch_rows, ctx, stream)?;
+            }
             // #102: grammar-mask each masked seq's logits rows 0/1 (anchor +
             // draft 0 — both predict pos+1). The pre-pass writes -inf in
             // place; the selector/Markov arms below stay unchanged.
