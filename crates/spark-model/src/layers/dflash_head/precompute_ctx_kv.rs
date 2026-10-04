@@ -205,7 +205,15 @@ impl BlockDiffusionDraftHead {
                 .take(l_total * new_ctx_count)
                 .flat_map(|p: i32| p.to_le_bytes())
                 .collect();
-            gpu.copy_h2d(&repeated_bytes, scratch.norm_buf)?;
+            // ATLAS_DFLASH_CTX_ASYNC_POS=1: in stream order, without draining
+            // the stream first, so the host enqueues the rest of the append
+            // while steps 1-3 run instead of after them. Same bytes, same
+            // launches, same order on the stream.
+            if self.twins.ctx_async_positions {
+                gpu.copy_h2d_async(&repeated_bytes, scratch.norm_buf, stream)?;
+            } else {
+                gpu.copy_h2d(&repeated_bytes, scratch.norm_buf)?;
+            }
         }
 
         // ── Step 5: compact all L layers' K → all_k_stage ────────────
