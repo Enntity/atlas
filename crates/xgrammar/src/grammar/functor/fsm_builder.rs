@@ -64,6 +64,16 @@ impl GrammarFsmBuilder {
             })
             .collect();
 
+        // Rule-local analyses (pruning, reachability) rely on every edge
+        // staying within its rule's own nodes.
+        debug_assert!(final_per_rule.iter().flatten().all(|v| {
+            (v.base()..v.base() + v.num_states()).all(|n| {
+                v.fsm()
+                    .edges(n)
+                    .iter()
+                    .all(|e| (v.base()..v.base() + v.num_states()).contains(&(e.target as usize)))
+            })
+        }));
         grammar.complete_fsm = compact_complete;
         grammar.per_rule_fsms = final_per_rule;
         // The pruning table is derived from the FSMs just replaced.

@@ -83,6 +83,14 @@ impl ProductivityTable {
         Self { productive }
     }
 
+    /// Approximate heap footprint in bytes.
+    pub(crate) fn memory_size(&self) -> usize {
+        self.productive
+            .iter()
+            .map(|(_, bits)| std::mem::size_of::<(usize, BitVec)>() + bits.len().div_ceil(8))
+            .sum()
+    }
+
     /// True if FSM node `node` of rule `rule_id` can reach an end node —
     /// i.e. the rule can still complete from there. Out-of-range rule or
     /// node ids (including nodes outside the rule's FSM) return `true`
@@ -106,6 +114,19 @@ impl ProductivityTable {
     /// the rule. FSM-less states (`rule_id == -1`) are never dead here:
     /// their productivity is not tracked, so they are kept conservatively.
     pub(crate) fn is_state_dead(&self, state: &ParserState) -> bool {
+        debug_assert!(
+            state.rule_id == -1
+                || self
+                    .productive
+                    .get(state.rule_id as usize)
+                    .is_none_or(|(base, bits)| {
+                        bits.is_empty()
+                            || (state.element_id as usize)
+                                .checked_sub(*base)
+                                .is_some_and(|i| i < bits.len())
+                    }),
+            "state {state:?} outside its rule's FSM nodes"
+        );
         state.rule_id != -1 && !self.is_node_productive(state.rule_id, state.element_id)
     }
 
