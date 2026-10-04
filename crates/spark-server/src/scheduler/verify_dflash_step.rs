@@ -5,6 +5,7 @@
 use super::*;
 
 mod glm_owner;
+mod stats;
 mod think_end;
 pub use glm_owner::{step_verify_glm_long_batched, step_verify_glm_long_with};
 pub(super) use think_end::accept_with_forced_think_end;
@@ -81,6 +82,10 @@ fn step_verify_dflash_inner(
     // F5 is width-generic: K, then K tokens, followed after verification by
     // the accepted-draft count. Fixed K=2/3/4 retain their established wire
     // commands, except repaired GLM K2/K3 which needs the explicit verdict hook.
+    // Strict masks are validated and uploaded before anything is sent.
+    if let Err(e) = super::strict_spec::upload(model, &strict) {
+        return a.abort_on_engine_error(format_args!("strict verify: {e:#}"));
+    }
     if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, 0xFFFFFFF5) {
         tracing::error!("EP broadcast generic verify cmd: {e:#}");
         a.finished = true;
@@ -97,7 +102,7 @@ fn step_verify_dflash_inner(
         a.finished = true;
         return;
     }
-    if let Err(e) = super::strict_spec::stage(model, &strict, tokens.len()) {
+    if let Err(e) = super::strict_spec::send(model, &strict) {
         return a.abort_on_engine_error(format_args!("strict verify: {e:#}"));
     }
 
@@ -139,6 +144,7 @@ fn step_verify_dflash_inner(
         step_timing,
         verify_ms,
         false,
+        strict.as_ref().is_none_or(|s| !s.dead),
     );
 }
 
@@ -160,6 +166,9 @@ pub(super) fn verify_dflash_tail(
     step_timing: bool,
     verify_ms: f64,
     defer_propose: bool,
+    // False for a strict verify carrying only a dead draft (`strict_spec`):
+    // it says nothing about the drafter.
+    record_stats: bool,
 ) -> Option<usize> {
     let raw_trace = if std::env::var("ATLAS_LIGHTNING_VERIFY_TOKEN_TRACE").as_deref() == Ok("1") {
         Some(verified_argmax.clone())
@@ -253,25 +262,16 @@ pub(super) fn verify_dflash_tail(
         a.finished = true;
         return None;
     }
-    crate::scheduler::mtp_accept_debug::record(
-        1,
-        drafts.len(),
-        drafts.first() == verified.first(),
-        num_accepted,
-    );
-    if !dflash_verify_raw_argmax {
-        a.mtp_acct.record_depth_verify(
-            drafts.len(),
+    if record_stats {
+        stats::record(
+            a,
+            sched,
+            (drafts, draft_conf),
+            &verified,
             num_accepted,
-            sched.levers.mtp_single_depth_adapt,
+            dflash_verify_raw_argmax,
         );
     }
-
-    // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling
-    // accept window; may suspend this seq's speculation (see adaptive_spec).
-    crate::scheduler::adaptive_spec::record_verify(a, num_accepted, sched);
-    a.spec_adapt.survival.record(drafts.len(), num_accepted);
-    crate::scheduler::dflash_conf_width::record(draft_conf, drafts.len(), num_accepted);
 
     // Roll back the over-extended `seq_len` and `seq.tokens`. The verify
     // advanced both by `tokens.len() = γ+1` (all γ drafts + the prefix

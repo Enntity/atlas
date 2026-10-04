@@ -54,6 +54,7 @@ fn dead_blocking_prefill_retires_and_live_one_survives() {
         host_logits: false,
         cancel_after_sampling: None,
         cancel_after_row_commit: None,
+        verify: None,
     };
     let (dead_tx, dead_rx) = tokio::sync::oneshot::channel();
     drop(dead_rx);
@@ -75,6 +76,7 @@ fn streaming_prefill_is_never_retired_by_disconnect_sweep() {
         host_logits: false,
         cancel_after_sampling: None,
         cancel_after_row_commit: None,
+        verify: None,
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut prefilling = vec![prefill(ResponseSink::Streaming(tx))];

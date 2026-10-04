@@ -14,7 +14,6 @@ const ALLOW: KernelHandle = KernelHandle(9);
 /// GLM-5.3: 154,880 tokens, two shards of 77,440 (2,420 mask words each).
 const VOCAB: usize = 154_880;
 const SHARD: usize = VOCAB / 2;
-const WORDS: usize = VOCAB / 32;
 const BAN: [u32; 4] = [11, 12, u32::MAX, u32::MAX];
 
 fn ptr(p: u64) -> Arg {
@@ -59,42 +58,40 @@ fn an_unmasked_verify_launches_the_shard_argmax_as_before() {
 }
 
 #[test]
-fn a_masked_verify_hands_each_rank_its_slice_of_every_row_mask() {
-    for rank in [0, 1] {
-        let masks = DevicePtr(0x9000);
-        let slice = 0x9000 + (rank * SHARD / 32 * 4) as u64;
+fn a_masked_verify_reads_each_rows_mask_from_the_ranks_first_vocabulary_bit() {
+    // GLM-5.3's real split (154,856 tokens, 77,428 per rank) starts rank 1
+    // inside a mask word: the kernel gets the row's mask and the bit offset.
+    for (vocab, rank) in [(VOCAB, 0), (VOCAB, 1), (154_856, 0), (154_856, 1)] {
+        let (shard, words) = (vocab / 2, vocab.div_ceil(32));
+        let gpu = recording::Gpu::new();
+        launch_shard_argmax(
+            &gpu,
+            VALUE,
+            Some((ALLOW, DevicePtr(0x9000), words)),
+            DevicePtr(0x1000),
+            DevicePtr(0x2000),
+            9,
+            (rank * shard, shard, vocab),
+            BAN,
+            3,
+        )
+        .unwrap();
         let abi = [
             ptr(0x1000),
             ptr(0x2000),
-            u32a(SHARD as u32),
-            u32a(VOCAB as u32),
+            u32a(shard as u32),
+            u32a(vocab as u32),
+            ptr(0x9000),
+            u32a(words as u32),
+            u32a((rank * shard) as u32),
         ]
         .into_iter()
-        .chain([ptr(slice), u32a(WORDS as u32)])
         .chain(BAN.map(u32a))
         .collect();
         assert_eq!(
-            launch(rank, Some((ALLOW, masks, WORDS))),
+            gpu.trace(),
             [Event::Launch(9, [9, 1, 1], [1024, 1, 1], 0, 3, abi)],
-            "rank {rank}"
+            "vocab {vocab} rank {rank}"
         );
     }
-}
-
-#[test]
-fn a_shard_that_splits_a_mask_word_is_refused() {
-    let gpu = recording::Gpu::new();
-    let err = launch_shard_argmax(
-        &gpu,
-        VALUE,
-        Some((ALLOW, DevicePtr(0x9000), WORDS)),
-        DevicePtr(0x1000),
-        DevicePtr(0x2000),
-        2,
-        (SHARD + 16, SHARD, VOCAB),
-        BAN,
-        0,
-    );
-    assert!(err.is_err());
-    assert!(gpu.trace().is_empty(), "nothing launched");
 }

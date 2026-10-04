@@ -71,6 +71,8 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             glm_latent_bf16,
             glm_identity_table,
             glm_latent_tokens: _,
+            verify_masks,
+            verify_masks_bytes: _,
         } = self;
         // Every pointer, then NULL it: `release` must be idempotent because a
         // `Drop` backstop may call it again, and `free` already no-ops on NULL.
@@ -118,6 +120,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
             *q2_act_q8,
             *glm_latent_bf16,
             *glm_identity_table,
+            *verify_masks,
         ];
         let mut first_error = None;
         for ptr in owned {
@@ -170,6 +173,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for BufferArena {
         *q2_act_q8 = DevicePtr::NULL;
         *glm_latent_bf16 = DevicePtr::NULL;
         *glm_identity_table = DevicePtr::NULL;
+        *verify_masks = DevicePtr::NULL;
         match first_error {
             Some(e) => Err(e),
             None => Ok(()),

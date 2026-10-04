@@ -48,6 +48,9 @@ pub(super) fn enabled(
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct StrictVerify {
     pub drafts: Vec<u32>,
+    /// The only draft is a dead one row 0 refuses: the step emits its
+    /// masked bonus alone and says nothing about the drafter.
+    pub dead: bool,
     /// `(drafts.len() + 1) * ceil(vocab / 32)` words, row-major.
     pub masks: Vec<u32>,
 }
@@ -90,14 +93,24 @@ pub(super) fn width_word(rows: usize, strict: &Option<StrictVerify>) -> u32 {
     rows as u32 | flag
 }
 
-/// Send the row masks after the verify tokens, on every rank.
-pub(super) fn stage(
+/// Validate and upload the row masks, before any verify command is sent.
+pub(super) fn upload(
     model: &dyn spark_model::traits::Model,
     strict: &Option<StrictVerify>,
-    rows: usize,
 ) -> Result<()> {
     match strict {
-        Some(s) => model.stage_verify_row_masks(rows, &s.masks),
+        Some(s) => model.prepare_verify_row_masks(s.drafts.len() + 1, &s.masks),
+        None => Ok(()),
+    }
+}
+
+/// Broadcast the uploaded masks to every rank, after the verify tokens.
+pub(super) fn send(
+    model: &dyn spark_model::traits::Model,
+    strict: &Option<StrictVerify>,
+) -> Result<()> {
+    match strict {
+        Some(s) => model.send_verify_row_masks(s.drafts.len() + 1),
         None => Ok(()),
     }
 }
@@ -123,6 +136,7 @@ pub(super) fn row_masks(
     let mut thinking = inside_thinking;
     let mut kept: Vec<u32> = Vec::with_capacity(drafts.len());
     let mut masks: Vec<u32> = Vec::with_capacity((drafts.len() + 1) * words);
+    let mut dead = false;
     let walk = loop {
         let r = kept.len();
         let row_at = masks.len();
@@ -137,9 +151,10 @@ pub(super) fn row_masks(
                 break Ok(());
             }
             match (0..vocab as u32).find(|&t| !allowed(row, t, vocab)) {
-                Some(dead) => {
-                    kept.push(dead);
+                Some(dead_token) => {
+                    kept.push(dead_token);
                     masks.extend_from_within(row_at..);
+                    dead = true;
                     break Ok(());
                 }
                 None => d = 0,
@@ -161,6 +176,7 @@ pub(super) fn row_masks(
     walk?;
     Ok(StrictVerify {
         drafts: kept,
+        dead,
         masks,
     })
 }

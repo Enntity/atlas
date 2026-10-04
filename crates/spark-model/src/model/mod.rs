@@ -39,6 +39,7 @@ mod glm_prefill_sp;
 mod glm_verify_masks;
 mod glm_vocab_split;
 pub use glm_verify_masks::MASKED_VERIFY;
+pub(crate) use glm_verify_masks::prepare as prepare_glm_verify_masks;
 pub(crate) mod graph_flags;
 pub(crate) use glm_vocab_split::prepare_shard_mxfp8 as prepare_glm_head_mxfp8;
 pub(crate) mod dspark_generation;

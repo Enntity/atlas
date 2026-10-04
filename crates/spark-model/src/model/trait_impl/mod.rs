@@ -1075,8 +1075,11 @@ impl Model for TransformerModel {
     fn ep_broadcast_tokens(&self, tokens: &[u32]) -> Result<Vec<u32>> {
         self.ep_broadcast_tokens_dispatch(tokens)
     }
-    fn stage_verify_row_masks(&self, rows: usize, masks: &[u32]) -> Result<()> {
-        self.stage_row_masks(rows, Some(masks))
+    fn prepare_verify_row_masks(&self, rows: usize, masks: &[u32]) -> Result<()> {
+        self.upload_row_masks(rows, masks)
+    }
+    fn send_verify_row_masks(&self, rows: usize) -> Result<()> {
+        self.send_row_masks(rows)
     }
     fn default_stream(&self) -> u64 {
         self.default_stream_dispatch()

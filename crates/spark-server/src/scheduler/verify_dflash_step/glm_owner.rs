@@ -145,6 +145,7 @@ pub fn step_verify_glm_long_with(
             step_timing,
             verify_ms,
             dflash_verify_raw_argmax,
+            true,
         ) {
             deferred.push((owner, next));
         }
