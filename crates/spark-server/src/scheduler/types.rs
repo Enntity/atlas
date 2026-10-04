@@ -464,6 +464,19 @@ impl ActiveSeq {
         self.pending_drafts = drafts;
     }
 
+    /// A `response_format` grammar is engaged. Such a sequence never
+    /// speculates: every emitted token must be sampled from logits masked at
+    /// its own position, which the verify paths cannot guarantee (the GLM TP2
+    /// vocab-split verify head returns raw argmax ids only —
+    /// `Model::verify_logits_argmax_only` — and rows after a `</think>` inside
+    /// an accepted span are picked as if still thinking). Serial decode masks
+    /// every token through the logits pipeline.
+    pub(super) fn strict_grammar(&self) -> bool {
+        self.grammar_state
+            .as_ref()
+            .is_some_and(GrammarState::is_strict)
+    }
+
     /// Abort the sequence on an ENGINE error: records the cause so the wire
     /// finish reason is "error" (never "stop") and marks it finished.
     pub(super) fn abort_on_engine_error(&mut self, e: impl std::fmt::Display) {

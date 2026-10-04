@@ -609,7 +609,9 @@ pub fn sample_first_token(
     grammar_state: Option<&mut GrammarState>,
     levers: &crate::scheduler::logit_processors::SamplingLevers,
 ) -> Result<u32> {
-    let Some(gs) = grammar_state else {
+    // A strict grammar whose response opens inside `<think>` starts after
+    // `</think>`: this token is reasoning (GrammarState::masks_first_token).
+    let Some(gs) = grammar_state.filter(|gs| gs.masks_first_token()) else {
         return sample_token(
             model,
             logits,

@@ -38,6 +38,9 @@ pub(super) fn render_template(
     reasoning_effort: Option<crate::ir::ReasoningEffort>,
     preserve_thinking: Option<bool>,
     tools_active: bool,
+    // `response_format` set: thinking off renders a closed think block
+    // (`RenderFlags::empty_think_off`), so no template-forced thinking.
+    structured_output: bool,
 ) -> Result<TemplateOut, Response> {
     // Use closed thinking when client doesn't explicitly enable it.
     let template_thinking = enable_thinking;
@@ -80,6 +83,7 @@ pub(super) fn render_template(
                 state.behavior.disable_tool_steering,
                 reasoning_effort.map(crate::ir::ReasoningEffort::as_str),
                 preserve_thinking,
+                structured_output,
             )
             .map(|t| t.len())
             .unwrap_or(0);
@@ -99,6 +103,7 @@ pub(super) fn render_template(
         state.behavior.disable_tool_steering,
         reasoning_effort.map(crate::ir::ReasoningEffort::as_str),
         preserve_thinking,
+        structured_output,
     ) {
         Ok(t) => t,
         Err(e) => {

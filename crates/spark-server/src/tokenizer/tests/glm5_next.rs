@@ -9,12 +9,7 @@ fn render(
     tools: Option<&[serde_json::Value]>,
     enable_thinking: bool,
 ) -> String {
-    let raw = include_str!("../../../../../jinja-templates/openai/glm5_next.jinja");
-    let converted = crate::tokenizer::jinja_helpers::convert_python_jinja_to_minijinja(raw);
-    let env = crate::tokenizer::jinja_helpers::build_jinja_env(&converted)
-        .expect("GLM-5.3 OpenAI template compiles");
-    crate::tokenizer::chat_render::render_chat(
-        &env,
+    render_flags(
         messages,
         tools,
         crate::tokenizer::chat_render::RenderFlags {
@@ -22,7 +17,19 @@ fn render(
             ..Default::default()
         },
     )
-    .expect("GLM-5.3 OpenAI template renders")
+}
+
+fn render_flags(
+    messages: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    flags: crate::tokenizer::chat_render::RenderFlags<'_>,
+) -> String {
+    let raw = include_str!("../../../../../jinja-templates/openai/glm5_next.jinja");
+    let converted = crate::tokenizer::jinja_helpers::convert_python_jinja_to_minijinja(raw);
+    let env = crate::tokenizer::jinja_helpers::build_jinja_env(&converted)
+        .expect("GLM-5.3 OpenAI template compiles");
+    crate::tokenizer::chat_render::render_chat(&env, messages, tools, flags)
+        .expect("GLM-5.3 OpenAI template renders")
 }
 
 #[test]
@@ -67,6 +74,25 @@ fn glm5_without_tools_opens_think_even_when_thinking_is_off() {
     let on = render(&messages, None, true);
     assert!(on.ends_with("<|assistant|><think>"));
     assert!(on.contains("Reasoning Effort: Max"));
+}
+
+#[test]
+fn glm5_response_format_thinking_off_renders_the_empty_think_block() {
+    // response_format requests set `empty_think_off`: thinking off then leaves
+    // no reasoning and the grammar owns the first token. Thinking on is as-is.
+    let messages = [json!({"role": "user", "content": "Name one bridge."})];
+    let flags = |enable_thinking| crate::tokenizer::chat_render::RenderFlags {
+        enable_thinking,
+        empty_think_off: true,
+        ..Default::default()
+    };
+    let off = render_flags(&messages, None, flags(false));
+    assert!(off.ends_with("<|assistant|><think></think>"), "{off}");
+    assert!(!off.contains("Reasoning Effort: Low"));
+    assert_eq!(
+        render_flags(&messages, None, flags(true)),
+        render(&messages, None, true)
+    );
 }
 
 #[test]

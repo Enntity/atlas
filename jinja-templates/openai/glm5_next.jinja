@@ -5,8 +5,8 @@
 {%- set thinking_enabled = true -%}
 {%- endif -%}
 {#- Thinking off (without tools) renders GLM's own low-effort reasoning: an
-    empty think block is out of distribution. ATLAS_GLM_EMPTY_THINK_OFF=1
-    (glm_empty_think_off) restores the empty block. -#}
+    empty think block is out of distribution. ATLAS_GLM_EMPTY_THINK_OFF=1 and
+    response_format requests (glm_empty_think_off) restore the empty block. -#}
 {%- set low_think = not thinking_enabled and not tools and not (glm_empty_think_off is defined and glm_empty_think_off) -%}
 {%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else ('low' if low_think else 'max') -%}
 {%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
