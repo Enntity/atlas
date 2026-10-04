@@ -463,6 +463,7 @@ pub fn step_mtp(
             if a.grammar_state.is_none() && a.pending_drafts.len() >= ladder_nd {
                 if a.pending_drafts.len() > ladder_nd {
                     a.pending_drafts.truncate(ladder_nd);
+                    crate::scheduler::copy_drafts::cut_conf(a);
                 }
                 batchable_idxs.push(idx);
             } else {
