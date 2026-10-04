@@ -113,6 +113,8 @@ impl TransformerModel {
 
     /// Project `normed` [rows, H] and write global argmax IDs to `out` [rows].
     /// Rows whose bit is set in `ban_rows` never pick one of `ban.ids`.
+    /// With `allow` (row-major full-vocabulary bitmasks, one per row, from
+    /// `glm_verify_masks`), row r picks the best token its mask allows.
     /// Returns `Ok(false)` without launching when the split does not apply.
     pub(super) fn glm_split_head_argmax(
         &self,
@@ -120,6 +122,7 @@ impl TransformerModel {
         rows: usize,
         out: DevicePtr,
         ban: (u64, &EosBan),
+        allow: Option<DevicePtr>,
         stream: u64,
     ) -> Result<bool> {
         if let Some(why) = self.glm_split_head_decline(rows) {
@@ -261,17 +264,38 @@ impl TransformerModel {
                 .filter(|&i| i < shard)
                 .map_or(u32::MAX, |i| i as u32)
         };
-        let mut launch = KernelLaunch::new(self.gpu.as_ref(), value_k)
-            .grid([rows as u32, 1, 1])
-            .block([1024, 1, 1])
-            .arg_ptr(logits.offset(start * 2))
-            .arg_ptr(local)
-            .arg_u32(shard as u32)
-            .arg_u32(vocab as u32);
-        for id in ban.head_ids() {
-            launch = launch.arg_u32(local_id(id));
-        }
-        launch.launch(stream)?;
+        let allow = match allow {
+            Some(masks) => {
+                static ALLOW_K: OnceLock<KernelHandle> = OnceLock::new();
+                let k = *ALLOW_K.get_or_init(|| {
+                    self.gpu
+                        .kernel("argmax", "argmax_bf16_value_ban_allow")
+                        .unwrap_or(KernelHandle(0))
+                });
+                ensure!(
+                    k.0 != 0,
+                    "masked verify: argmax_bf16_value_ban_allow missing"
+                );
+                ensure!(
+                    !self.gpu.stream_is_capturing(stream),
+                    "masked verify cannot be graph-captured"
+                );
+                Some((k, masks, self.verify_mask_words()))
+            }
+            None => None,
+        };
+        let ban_ids = ban.head_ids().map(local_id);
+        launch_shard_argmax(
+            self.gpu.as_ref(),
+            value_k,
+            allow,
+            logits.offset(start * 2),
+            local,
+            rows,
+            (start, shard, vocab),
+            ban_ids,
+            stream,
+        )?;
         comm.peer_exchange_async(local.0, peer.0, rows * 16, stream)?;
         KernelLaunch::new(self.gpu.as_ref(), merge_k)
             .grid([1, 1, 1])
@@ -288,3 +312,46 @@ impl TransformerModel {
         Ok(true)
     }
 }
+
+/// Launch the per-row shard argmax: `argmax_bf16_value_ban`, or under row
+/// masks `argmax_bf16_value_ban_allow` with this rank's slice of each row's
+/// mask (`(kernel, masks, words per row)`). The rank's first vocabulary row
+/// `start` must sit on a mask word boundary.
+#[allow(clippy::too_many_arguments)]
+fn launch_shard_argmax(
+    gpu: &dyn GpuBackend,
+    value_k: KernelHandle,
+    allow: Option<(KernelHandle, DevicePtr, usize)>,
+    shard_logits: DevicePtr,
+    local: DevicePtr,
+    rows: usize,
+    (start, shard, vocab): (usize, usize, usize),
+    ban_ids: impl IntoIterator<Item = u32>,
+    stream: u64,
+) -> Result<()> {
+    let kernel = allow.map_or(value_k, |(k, _, _)| k);
+    let mut launch = KernelLaunch::new(gpu, kernel)
+        .grid([rows as u32, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(shard_logits)
+        .arg_ptr(local)
+        .arg_u32(shard as u32)
+        .arg_u32(vocab as u32);
+    if let Some((_, masks, words)) = allow {
+        ensure!(
+            start % 32 == 0,
+            "vocab shard start {start} splits a mask word"
+        );
+        launch = launch
+            .arg_ptr(masks.offset(start / 32 * 4))
+            .arg_u32(words as u32);
+    }
+    for id in ban_ids {
+        launch = launch.arg_u32(id);
+    }
+    launch.launch(stream)
+}
+
+#[cfg(test)]
+#[path = "glm_vocab_split_tests.rs"]
+mod tests;

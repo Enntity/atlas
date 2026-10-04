@@ -611,8 +611,11 @@ impl Model for TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<Vec<u32>> {
+        // Taken first, so staged row masks never outlive the verify they
+        // were staged for (`glm_verify_masks`).
+        let allow = self.take_verify_row_masks(tokens.len())?;
         self.ssm_pool.require_verify_rollback_supported()?;
-        self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream)
+        self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)
     }
     fn decode_and_verify_fused(
         &self,
@@ -1047,6 +1050,9 @@ impl Model for TransformerModel {
     }
     fn ep_broadcast_tokens(&self, tokens: &[u32]) -> Result<Vec<u32>> {
         self.ep_broadcast_tokens_dispatch(tokens)
+    }
+    fn stage_verify_row_masks(&self, rows: usize, masks: &[u32]) -> Result<()> {
+        self.stage_row_masks(rows, Some(masks))
     }
     fn default_stream(&self) -> u64 {
         self.default_stream_dispatch()
