@@ -65,6 +65,13 @@ fn step_verify_dflash_inner(
         return;
     }
 
+    // Strict structured output (`strict_spec`): admitted drafts, row masks.
+    let strict = match super::strict_spec::prepare(a, drafts, model.vocab_size()) {
+        Ok(s) => s,
+        Err(e) => return a.abort_on_engine_error(format_args!("strict verify: {e:#}")),
+    };
+    let (drafts, draft_conf) = super::strict_spec::verified_drafts(&strict, drafts, draft_conf);
+
     // tokens = [last_verified, draft_0, draft_1, ..., draft_{γ-1}]
     let mut tokens = Vec::with_capacity(drafts.len() + 1);
     tokens.push(a.last_token);
@@ -79,7 +86,8 @@ fn step_verify_dflash_inner(
         a.finished = true;
         return;
     }
-    if let Err(e) = model.ep_broadcast_cmd(tokens.len() as u32) {
+    let width = super::strict_spec::width_word(tokens.len(), &strict);
+    if let Err(e) = model.ep_broadcast_cmd(width) {
         tracing::error!("EP broadcast generic verify width: {e:#}");
         a.finished = true;
         return;
@@ -88,6 +96,9 @@ fn step_verify_dflash_inner(
         tracing::error!("EP broadcast generic verify tokens: {e:#}");
         a.finished = true;
         return;
+    }
+    if let Err(e) = super::strict_spec::stage(model, &strict, tokens.len()) {
+        return a.abort_on_engine_error(format_args!("strict verify: {e:#}"));
     }
 
     // STEP-TIMING (ATLAS_DFLASH_STEP_TIMING=1): split the ~0.88s/step into
