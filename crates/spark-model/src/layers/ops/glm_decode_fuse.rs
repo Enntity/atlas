@@ -29,6 +29,16 @@
 //! grid); the others choose at launch. A twin runs only where its kernel is
 //! shipped and its shape and alignment hold; otherwise the original launch is
 //! issued unchanged.
+//!
+//! `ATLAS_GLM_HC_SEAM_ILP` (default 0, a mask like the groups above) swaps the
+//! decode seam's kernels for load-batched twins with the same bytes
+//! (`scripts/dev/glm_hc_seam_ilp_bench.cu`), independent of the fused tier:
+//!
+//! * `1` partial: `glm_hc_decode_{post_,}partial_ilp_bf16`, reading the next
+//!   site's mix weights as the checkpoint's BF16 tensor
+//!   ([`HcSiteWeights::hc_fn_bf16`](crate::layers::qwen3_attention::HcSiteWeights)),
+//!   half the bytes of the FP32 copy. Sites without one keep their kernel.
+//! * `2` finalize: `glm_hc_decode_finalize_ilp_bf16`.
 
 use anyhow::{Result, anyhow, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -175,28 +185,109 @@ fn hc_post_for(
     Ok(true)
 }
 
-/// The decode seam's partial kernel (`post`: with the finishing site's post):
-/// the `_rows_bf16` twin when the HC partial group is on, the highway is BF16
-/// and `hc_fn` is 16-byte aligned, else the established kernel.
+pub const SEAM_ILP_PARTIAL: u32 = 1;
+pub const SEAM_ILP_FINALIZE: u32 = 2;
+
+fn parse_seam_ilp(value: Option<&str>) -> Result<u32> {
+    match value {
+        None => Ok(0),
+        Some(v) => v
+            .parse::<u32>()
+            .ok()
+            .filter(|mask| mask & !(SEAM_ILP_PARTIAL | SEAM_ILP_FINALIZE) == 0)
+            .ok_or_else(|| anyhow!("ATLAS_GLM_HC_SEAM_ILP must be a mask in 0..=3, got {v:?}")),
+    }
+}
+
+/// The `ATLAS_GLM_HC_SEAM_ILP` twins that are on, read once.
+fn seam_ilp() -> Result<u32> {
+    static MASK: OnceLock<std::result::Result<u32, String>> = OnceLock::new();
+    let mask = MASK.get_or_init(|| {
+        let mask = parse_seam_ilp(std::env::var("ATLAS_GLM_HC_SEAM_ILP").ok().as_deref());
+        if let Ok(mask @ 1..) = mask {
+            tracing::info!("ATLAS_GLM_HC_SEAM_ILP: decode seam twins {mask:#x}");
+        }
+        mask.map_err(|error| error.to_string())
+    });
+    mask.clone().map_err(|error| anyhow!(error))
+}
+
+/// A shipped `glm_hc_prefill_vec` kernel `name`.
+fn shipped(gpu: &dyn GpuBackend, name: &'static str) -> Option<KernelHandle> {
+    gpu.op_cache()
+        .kernel(gpu, "glm_hc_prefill_vec", name)
+        .ok()
+        .filter(|kernel| kernel.0 != 0)
+}
+
+/// The decode seam's partial kernel (`post`: with the finishing site's post)
+/// and the mix weight it reads: the BF16-weight ILP twin when that is on, the
+/// highway is BF16 and the site has its BF16 `fn`; else the `_rows_bf16` twin
+/// when the HC partial group is on, the highway is BF16 and `hc_fn` is 16-byte
+/// aligned; else the established kernel with `hc_fn`.
 pub fn hc_decode_partial(
     gpu: &dyn GpuBackend,
     model_type: &str,
     post: bool,
     hc_fn: DevicePtr,
-) -> Result<KernelHandle> {
+    hc_fn_bf16: DevicePtr,
+) -> Result<(KernelHandle, DevicePtr)> {
     let bf16 = super::hc_bf16_for(model_type);
+    if let Some(twin) = seam_partial_twin(seam_ilp()?, gpu, bf16, post, hc_fn_bf16) {
+        return Ok((twin, hc_fn_bf16));
+    }
     if let Some(twin) = partial_twin(groups()?, gpu, bf16, post, hc_fn) {
-        return Ok(twin);
+        return Ok((twin, hc_fn));
     }
     let base = if post {
         "glm_hc_decode_post_partial"
     } else {
         "glm_hc_decode_partial"
     };
-    gpu.kernel(
+    let kernel = gpu.kernel(
         "glm_hc_prefill_vec",
         &super::hc_kernel_name(model_type, base),
+    )?;
+    Ok((kernel, hc_fn))
+}
+
+/// The decode seam's finalize kernel: the ILP twin when that is on and the
+/// highway is BF16, else the established kernel.
+pub fn hc_decode_finalize(gpu: &dyn GpuBackend, model_type: &str) -> Result<KernelHandle> {
+    if let Some(twin) = seam_finalize_twin(seam_ilp()?, gpu, super::hc_bf16_for(model_type)) {
+        return Ok(twin);
+    }
+    gpu.kernel(
+        "glm_hc_prefill_vec",
+        &super::hc_kernel_name(model_type, "glm_hc_decode_finalize"),
     )
+}
+
+fn seam_partial_twin(
+    mask: u32,
+    gpu: &dyn GpuBackend,
+    bf16_highway: bool,
+    post: bool,
+    hc_fn_bf16: DevicePtr,
+) -> Option<KernelHandle> {
+    if mask & SEAM_ILP_PARTIAL == 0 || !bf16_highway || hc_fn_bf16.is_null() {
+        return None;
+    }
+    shipped(
+        gpu,
+        if post {
+            "glm_hc_decode_post_partial_ilp_bf16"
+        } else {
+            "glm_hc_decode_partial_ilp_bf16"
+        },
+    )
+}
+
+fn seam_finalize_twin(mask: u32, gpu: &dyn GpuBackend, bf16_highway: bool) -> Option<KernelHandle> {
+    if mask & SEAM_ILP_FINALIZE == 0 || !bf16_highway {
+        return None;
+    }
+    shipped(gpu, "glm_hc_decode_finalize_ilp_bf16")
 }
 
 fn partial_twin(
@@ -209,15 +300,14 @@ fn partial_twin(
     if groups & HC_PARTIAL == 0 || !bf16_highway || !aligned16(&[hc_fn]) {
         return None;
     }
-    let twin = if post {
-        "glm_hc_decode_post_partial_rows_bf16"
-    } else {
-        "glm_hc_decode_partial_rows_bf16"
-    };
-    gpu.op_cache()
-        .kernel(gpu, "glm_hc_prefill_vec", twin)
-        .ok()
-        .filter(|kernel| kernel.0 != 0)
+    shipped(
+        gpu,
+        if post {
+            "glm_hc_decode_post_partial_rows_bf16"
+        } else {
+            "glm_hc_decode_partial_rows_bf16"
+        },
+    )
 }
 
 /// The EP unpermute-reduce followed by `moe_batched_blend(output, shared,

@@ -620,6 +620,7 @@ fn load_hc_site(
     .with_context(|| format!("DeepSeek-V4 HC {site} scale ({layer_prefix})"))?;
     Ok(HcSiteWeights {
         hc_fn,
+        hc_fn_bf16: DevicePtr::NULL,
         hc_base,
         hc_scale,
         // DeepSeek-V4 keeps the Sinkhorn mixer; None selects it.
