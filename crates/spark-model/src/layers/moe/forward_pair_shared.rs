@@ -100,22 +100,17 @@ impl MoeLayer {
             && crate::layers::w4a16_gemv_tiers::tc_ld_kernel(rows).0 != 0
     }
 
-    /// This rank's half of the shared expert: intermediate columns
-    /// `[rank * inter/2, +inter/2)` — gate/up rows (a pointer offset) and the
-    /// matching K-slice of down (strided tier). `attn_output` then holds this
-    /// rank's partial of the shared output; the EP all-reduce sums the two.
-    pub(super) fn run_shared_split(
+    /// This rank's half of the shared expert, intermediate columns
+    /// `[rank * inter/2, +inter/2)`: gate and up rows (a pointer offset) and
+    /// the matching K-slice of down (read through the strided tier).
+    fn shared_split_weights(
         &self,
-        input: DevicePtr,
-        rows: u32,
         h: u32,
         inter: u32,
         ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
+    ) -> [QuantizedWeight; 3] {
         let shared = &self.weights.shared_expert;
-        let half = inter / 2;
-        let col0 = (ctx.config.ep_rank as u32 * half) as usize;
+        let col0 = (ctx.config.ep_rank as u32 * (inter / 2)) as usize;
         let gate_up_rows = |w: &QuantizedWeight| QuantizedWeight {
             weight: w.weight.offset(col0 * h as usize / 2),
             weight_scale: w.weight_scale.offset(col0 * h as usize / 16),
@@ -126,16 +121,69 @@ impl MoeLayer {
             weight_scale: shared.down_proj.weight_scale.offset(col0 / 16),
             ..shared.down_proj
         };
+        [
+            gate_up_rows(&shared.gate_proj),
+            gate_up_rows(&shared.up_proj),
+            down_cols,
+        ]
+    }
+
+    /// `ATLAS_GLM_L2_AHEAD`: what the FFN of a verify of `rows` rows reads
+    /// first: the NVFP4 shared expert's gate, up and down (this rank's half
+    /// when it runs TP-split), then the BF16 router.
+    pub(crate) fn l2_ahead_lead(&self, rows: u32, ctx: &ForwardContext) -> Vec<ops::L2Region> {
+        let (h, inter) = (
+            ctx.config.hidden_size as u32,
+            ctx.config.shared_expert_intermediate_size as u32,
+        );
+        let shared = &self.weights.shared_expert;
+        let mut lead = Vec::new();
+        if inter > 0
+            && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && [&shared.gate_proj, &shared.up_proj, &shared.down_proj]
+                .iter()
+                .all(|w| !w.is_null())
+        {
+            let ([gate, up, down], n) = if self.shared_split_ready(ctx, rows) {
+                (self.shared_split_weights(h, inter, ctx), inter / 2)
+            } else {
+                ([shared.gate_proj, shared.up_proj, shared.down_proj], inter)
+            };
+            for w in [&gate, &up] {
+                lead.extend(ops::L2Region::nvfp4(w, n, h, h / 2, h / 16));
+            }
+            lead.extend(ops::L2Region::nvfp4(&down, h, n, inter / 2, inter / 16));
+        }
+        if self.gate_fp8.is_none()
+            && self.gate_nvfp4.is_none()
+            && !self.weights.gate.weight.is_null()
+        {
+            let router = self.router_logits_n as usize * h as usize * 2;
+            lead.push(ops::L2Region::whole(self.weights.gate.weight, router));
+        }
+        lead
+    }
+
+    /// This rank's half of the shared expert ([`Self::shared_split_weights`]).
+    /// `attn_output` then holds this rank's partial of the shared output; the
+    /// EP all-reduce sums the two.
+    pub(super) fn run_shared_split(
+        &self,
+        input: DevicePtr,
+        rows: u32,
+        h: u32,
+        inter: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let half = inter / 2;
+        let [gate, up, down_cols] = self.shared_split_weights(h, inter, ctx);
         let (gate_out, up_out, down_out) = (
             ctx.buffers.ssm_deinterleaved(),
             ctx.buffers.ssm_qkvz(),
             ctx.buffers.attn_output(),
         );
         let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(rows);
-        let (gate, up) = (
-            gate_up_rows(&shared.gate_proj),
-            gate_up_rows(&shared.up_proj),
-        );
         let gate_up = [(&gate, gate_out), (&up, up_out)];
         // ATLAS_GLM_DECODE_GEMV_BATCH: gate and up in one launch of the tc
         // body, both touched during the PDL wait (`ops::gemv_touch`).

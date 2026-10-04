@@ -50,6 +50,20 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.prefill_glm_passengers_mla(num_tokens, seq_len_start, passengers, cache, ctx, stream)
     }
 
+    /// Attention: the sparse-MLA q_a, kv_a and q_b (none elsewhere).
+    fn l2_ahead_lead(
+        &self,
+        ffn: bool,
+        rows: u32,
+        ctx: &ForwardContext,
+    ) -> Vec<crate::layers::ops::L2Region> {
+        if ffn {
+            return self.ffn.l2_ahead_lead(rows, ctx);
+        }
+        // A malformed projection switch fails the forward itself.
+        self.glm_l2_ahead_lead(rows, ctx).unwrap_or_default()
+    }
+
     fn uses_local_mla_prefill(&self) -> bool {
         // GLM-5 prefill (`prefill_attention_paged_glm_dense`) absorbs Q and
         // reads the complete paged latent + index history, exactly as chunk 1+

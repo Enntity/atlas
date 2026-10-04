@@ -49,7 +49,30 @@ impl Qwen3AttentionLayer {
             [rows, nq, hd, kv_lora, nq * hd, nq * kv_lora],
             ctx,
             stream,
-        )
+        )?;
+        // ATLAS_GLM_L2_AHEAD (`o`): W_uv and o, read after the attention core.
+        if rows <= 32 && ops::l2_ahead_enabled(ops::L2Site::Output) {
+            let v_dim = mla.v_dim as u32;
+            let tiers = &self.mxfp8_gemv_grouped_k;
+            let mut reads = match glm_head_twin(
+                &self.mla_mx,
+                tiers,
+                mla.w_uv.weight,
+                [rows, nq, kv_lora, v_dim],
+            ) {
+                Some(mx) => {
+                    ops::L2Region::mxfp8(mx, (nq * v_dim) as usize, kv_lora as usize).to_vec()
+                }
+                None => vec![ops::L2Region::whole(
+                    mla.w_uv.weight,
+                    (nq * v_dim * kv_lora) as usize * 2,
+                )],
+            };
+            let h = ctx.config.hidden_size as u32;
+            reads.extend(self.paged_glm_reads(&mla.wo, [rows, h, nq * v_dim], ctx)?);
+            ops::l2_ahead_prefetch(ctx.gpu, stream, ops::L2Site::Output, &reads)?;
+        }
+        Ok(())
     }
 
     /// Per-head MLA GEMM `c[:, h*n..] = a[:, h*k..] · weight_hᵀ` over `g`

@@ -199,6 +199,18 @@ impl Glm5KdaLayer {
 }
 
 impl TransformerLayer for Glm5KdaLayer {
+    /// Attention: the Q and K projections the verify GEMVs read first.
+    fn l2_ahead_lead(&self, ffn: bool, rows: u32, ctx: &ForwardContext) -> Vec<ops::L2Region> {
+        if ffn {
+            return self.ffn.l2_ahead_lead(rows, ctx);
+        }
+        let (n, k) = ((self.heads * self.dim) as u32, self.hidden_size as u32);
+        [&self.weights.q_proj, &self.weights.k_proj]
+            .into_iter()
+            .flat_map(|p| ops::L2Region::nvfp4(&p.nvfp4, n, k, k / 2, k / 16))
+            .collect()
+    }
+
     fn decode_glm_long_owners(
         &self,
         owners: &mut [crate::layer::glm_long_owner::GlmLongOwner<'_>],

@@ -86,6 +86,19 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// `ATLAS_GLM_L2_AHEAD`: the weights a verify of `rows` rows reads first
+    /// in this layer's FFN (`ffn`) or attention, in read order, for the side
+    /// stream to prefetch at the all-reduce before them (`layers::ops::l2_ahead`).
+    /// Default: none.
+    fn l2_ahead_lead(
+        &self,
+        _ffn: bool,
+        _rows: u32,
+        _ctx: &ForwardContext<'_>,
+    ) -> Vec<crate::layers::ops::L2Region> {
+        Vec::new()
+    }
+
     /// `&mut dyn Any` downcast hook for post-construction weight overlays (e.g.
     /// the LoRA install walk). Default `None`; overlay-capable layers override.
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
