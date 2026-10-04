@@ -70,6 +70,13 @@ pub enum GrammarSpec {
     JsonSchema { schema: String },
 }
 
+impl GrammarSpec {
+    /// A `response_format` grammar, whose output must conform.
+    pub fn is_response_format(&self) -> bool {
+        matches!(self, Self::JsonObject | Self::JsonSchema { .. })
+    }
+}
+
 /// Request submitted to the scheduler.
 pub enum InferenceRequest {
     /// Blocking: waits for full response.

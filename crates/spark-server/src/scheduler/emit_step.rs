@@ -183,11 +183,14 @@ pub(super) fn emit_token_at_position(
     // sequence is inside `<think>`…`</think>` so the matcher only
     // sees the final-output token stream.
     let mut disengage_grammar = false;
+    let mut strict_violation = false;
     if !a.inside_thinking
         && let Some(ref mut gs) = a.grammar_state
     {
         let advanced = gs.accept_token(tok);
-        if !advanced {
+        if !advanced && gs.is_strict() {
+            strict_violation = true;
+        } else if !advanced {
             // Grammar/model disagreement (BUG#2 class: e.g. a merged BPE token
             // like `><` or a `</X` content run the qwen3_coder value rule
             // forbids, often surfaced via an under-masked MTP draft). The token
@@ -207,6 +210,10 @@ pub(super) fn emit_token_at_position(
             );
             disengage_grammar = true;
         }
+    }
+    if strict_violation {
+        fail_strict_grammar(a, tok);
+        return;
     }
     if disengage_grammar {
         // Drop the matcher: subsequent decode steps see `grammar_state == None`
@@ -570,17 +577,64 @@ pub(crate) fn emit_grammar_close(a: &mut ActiveSeq) {
 // for documentation by
 // `grammar.rs::tests::test_minimax_xml_grammar_masks_trigger_breaking_multibyte_token`.
 
+/// A `response_format` grammar refused an emitted token. Its output must
+/// conform, so end the response with an error (wire finish reason "error",
+/// blocking HTTP 500) rather than disengage and return unconstrained text as
+/// if it were valid. Tool grammars disengage instead (see `emit_token`). The
+/// refused token is neither emitted nor recorded.
+pub(super) fn fail_strict_grammar(a: &mut ActiveSeq, tok: u32) {
+    let at = a.output_tokens.len();
+    tracing::error!(
+        tok,
+        output_len = at,
+        "response_format grammar refused an emitted token; ending the response with an error"
+    );
+    a.abort_on_engine_error(format_args!(
+        "structured output: token {tok} at output position {at} violates the response_format grammar"
+    ));
+}
+
 /// Compile a grammar state from a grammar specification + engine.
 ///
-/// Returns `Some(GrammarState)` if compilation succeeds, `None` otherwise
-/// (logging a warning on failure so the request falls back to legacy tool_call
-/// suppression). Called once per request during prefill.
+/// Returns `Ok(Some(GrammarState))` if compilation succeeds, `Ok(None)` when
+/// no grammar was requested or a tool grammar failed (logging a warning so the
+/// request falls back to legacy tool_call suppression). Called once per
+/// request during prefill.
+///
+/// A `response_format` grammar is marked strict (`opens_in_thinking`: the
+/// prompt leaves the model inside `<think>`), and failing to arm one is
+/// reported to the client on `sink` and returned as `Err`: its output must
+/// never come back unconstrained as if it were valid.
 pub fn compile_grammar_state(
     engine: &mut Option<GrammarEngine>,
     grammar_spec: &Option<GrammarSpec>,
     eos_tokens: &[u32],
+    opens_in_thinking: bool,
+    sink: &mut ResponseSink,
+) -> Result<Option<GrammarState>> {
+    let Some(spec) = grammar_spec.as_ref() else {
+        return Ok(None);
+    };
+    let state = compile_spec(engine, spec, eos_tokens);
+    if !spec.is_response_format() {
+        return Ok(state);
+    }
+    match state {
+        Some(state) => Ok(Some(state.strict_output(opens_in_thinking))),
+        None => {
+            let msg =
+                "response_format grammar could not be armed; refusing to decode unconstrained";
+            send_error_to_sink(sink, msg);
+            anyhow::bail!(msg)
+        }
+    }
+}
+
+fn compile_spec(
+    engine: &mut Option<GrammarEngine>,
+    spec: &GrammarSpec,
+    eos_tokens: &[u32],
 ) -> Option<GrammarState> {
-    let spec = grammar_spec.as_ref()?;
     let engine = engine.as_mut()?;
 
     // F69 (2026-04-29): symmetric dispatch via the trait. The parser
