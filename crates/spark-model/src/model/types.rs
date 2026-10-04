@@ -417,6 +417,8 @@ pub struct TransformerModel {
     pub(super) self_speculative: bool,
     /// Last token index passed to save_hidden_for_mtp (for EP broadcast to rank 1).
     pub(super) last_mtp_hidden_idx: std::sync::atomic::AtomicUsize,
+    /// Row masks of a strict structured-output verify (`glm_verify_masks`).
+    pub(super) verify_row_masks: super::glm_verify_masks::VerifyRowMasks,
     /// Optional vision encoder for VL models (Qwen3-VL).
     pub(super) vision_encoder: Option<crate::layers::VisionEncoder>,
     /// Number of patches encoded by the last prepare_vision_embed() call.
@@ -667,6 +669,7 @@ impl TransformerModel {
         }
         attempt("kv cache", self.kv_cache.lock().release(gpu));
         attempt("buffer arena", self.buffers.release(gpu));
+        attempt("verify row masks", self.verify_row_masks.release(gpu));
         // Weights LAST: the layers hold pointers into them, so they must not be
         // freed until everything that reads them is gone.
         if let Some(mut store) = self.weight_store.take() {

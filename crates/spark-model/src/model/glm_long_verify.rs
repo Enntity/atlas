@@ -415,7 +415,7 @@ impl TransformerModel {
             stream,
         )?;
         let argmax = self.buffers.scratch();
-        if !self.glm_split_head_argmax(normed, total, argmax, (ban_rows, &ban), stream)? {
+        if !self.glm_split_head_argmax(normed, total, argmax, (ban_rows, &ban), None, stream)? {
             self.lm_head_batched(normed, total as u32, self.buffers.logits(), stream)?;
             let vocab = self.config.vocab_size;
             for r in 0..total {

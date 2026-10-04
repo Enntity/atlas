@@ -47,6 +47,10 @@ pub struct SchedLevers {
     pub dflash_serial_append: bool,
     pub dflash_unified_ctx: bool,
     pub dflash_spec_think: bool,
+    /// `ATLAS_GLM_STRICT_SPEC=1`: strict structured-output sequences keep
+    /// DFlash speculation, every verify row grammar-masked at its own position
+    /// (`scheduler::strict_spec`). Off: they decode serially.
+    pub glm_strict_spec: bool,
     /// Mean accepted drafts below which adaptive speculation suspends.
     pub dflash_adaptive_min: f32,
     /// Serially-decoded tokens between adaptive re-probes.
@@ -154,6 +158,7 @@ impl SchedLevers {
             // The policy applies to every MTP proposer. Keep the old DFlash
             // spelling as a compatibility alias for existing deployments.
             dflash_spec_think: opt_in("ATLAS_MTP_SPEC_THINK") || opt_in("ATLAS_DFLASH_SPEC_THINK"),
+            glm_strict_spec: opt_in("ATLAS_GLM_STRICT_SPEC"),
             dflash_adaptive_min: num("ATLAS_DFLASH_ADAPTIVE_MIN", 2.0),
             dflash_adaptive_reprobe: num("ATLAS_DFLASH_ADAPTIVE_REPROBE", 256),
             dflash_resume_guard: num("ATLAS_DFLASH_RESUME_GUARD", 0),
@@ -200,6 +205,7 @@ impl SchedLevers {
             dflash_serial_append: false,
             dflash_unified_ctx: false,
             dflash_spec_think: false,
+            glm_strict_spec: false,
             dflash_adaptive_min: 2.0,
             dflash_adaptive_reprobe: 256,
             dflash_resume_guard: 0,

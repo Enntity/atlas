@@ -30,6 +30,9 @@ impl TransformerModel {
         tokens: &[u32],
         seq: &mut SequenceState,
         _stream: u64,
+        // Strict structured-output row masks staged for this verify
+        // (`glm_verify_masks`): eager only, and the split head must serve.
+        allow: Option<spark_runtime::gpu::DevicePtr>,
     ) -> Result<Vec<u32>> {
         let k = tokens.len();
         if k == 0 {
@@ -40,6 +43,7 @@ impl TransformerModel {
         if self.lightning_dspark_identity.policy().is_some()
             && std::env::var("ATLAS_LIGHTNING_VERIFY_SERIAL_M1").as_deref() == Ok("1")
         {
+            anyhow::ensure!(allow.is_none(), "masked verify on the serial-M1 lane");
             return self.decode_verify_serial_m1_dispatch(tokens, seq, _stream);
         }
         let stream = self.gpu.default_stream();
@@ -114,6 +118,7 @@ impl TransformerModel {
                 crate::model::graph_flags::k2_diag(),
             );
         let use_graphs = (self.comm.is_none() || glm_tp_graphs)
+            && allow.is_none()
             && !self
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -393,7 +398,18 @@ impl TransformerModel {
             // LM head + argmax for K tokens, inside the graph (fixed scratch
             // addresses — graph-safe).
             let argmax_out = self.buffers.scratch();
-            if !self.glm_split_head_argmax(normed, k, argmax_out, (ban_rows, &ban), stream)? {
+            if !self.glm_split_head_argmax(
+                normed,
+                k,
+                argmax_out,
+                (ban_rows, &ban),
+                allow,
+                stream,
+            )? {
+                anyhow::ensure!(
+                    allow.is_none(),
+                    "masked verify needs the GLM vocab-split head, which declined"
+                );
                 self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
                 let vocab = self.config.vocab_size;
                 for t in 0..k {

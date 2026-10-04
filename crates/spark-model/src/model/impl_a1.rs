@@ -738,6 +738,7 @@ impl TransformerModel {
             ep_protocol_v2: super::ep_protocol_v2_requested(),
             self_speculative,
             last_mtp_hidden_idx: std::sync::atomic::AtomicUsize::new(0),
+            verify_row_masks: Default::default(),
             vision_encoder,
             vision_embed_patches: Mutex::new(0),
             vision_image_grids: Mutex::new(Vec::new()),

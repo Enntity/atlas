@@ -134,7 +134,9 @@ pub fn step_mtp(
             && !sched.levers.dflash_seam_serial
             && crate::scheduler::adaptive_spec::spec_allowed(a, sched)
         {
-            let eff = if a.grammar_state.is_some() {
+            // A strict grammar here speculates at full width: its verify
+            // masks every row and trims the drafts (`strict_spec`).
+            let eff = if a.grammar_state.is_some() && !a.strict_grammar() {
                 1
             } else {
                 num_drafts
@@ -613,7 +615,8 @@ pub fn step_mtp(
         // `accept_token` silently fails — desync'ing the grammar
         // from the output stream. Truncating here downgrades K=4 →
         // K=3 → K=2 cleanly.
-        if let Some(ref mut gs) = a.grammar_state {
+        // Strict grammars trim at the verify, thinking-aware (`strict_spec`).
+        if let Some(gs) = a.grammar_state.as_mut().filter(|gs| !gs.is_strict()) {
             let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
             if kept < drafts.len() {
                 drafts.truncate(kept);

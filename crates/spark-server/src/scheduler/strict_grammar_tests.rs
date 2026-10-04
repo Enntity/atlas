@@ -14,17 +14,12 @@ use crate::scheduler::{
 #[path = "strict_grammar_tests/decode.rs"]
 mod decode;
 
-/// One token per ASCII byte, then `<eos>`, padded to the test model's vocab.
-const EOS: u32 = 128;
-const VOCAB: usize = 2048;
+const EOS: u32 = crate::scheduler::test_support::GRAMMAR_EOS;
 const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,
     "properties":{"bridge":{"type":"string"}},"required":["bridge"]}"#;
 
 fn engine() -> Option<GrammarEngine> {
-    let mut vocab: Vec<String> = (0u8..128).map(|b| (b as char).to_string()).collect();
-    vocab.push("<eos>".into());
-    vocab.extend((vocab.len()..VOCAB).map(|i| format!("<pad{i}>")));
-    Some(GrammarEngine::new(&vocab, &[EOS as i32]).unwrap())
+    Some(crate::scheduler::test_support::grammar_engine())
 }
 
 fn compile(spec: GrammarSpec, opens_in_thinking: bool) -> Option<GrammarState> {
@@ -157,7 +152,7 @@ fn a_strict_grammar_never_dispatches_speculation() {
                 a.inside_thinking = inside_thinking;
                 a.post_think_emitted = 100;
                 let eligible = |a: &crate::scheduler::types::ActiveSeq| {
-                    mtp_gate::seq_spec_eligible(a, spec_think, 0, raw)
+                    mtp_gate::seq_spec_eligible(a, spec_think, 0, raw, false)
                 };
                 let baseline = eligible(&a);
                 a.grammar_state = Some(lenient());
@@ -170,6 +165,12 @@ fn a_strict_grammar_never_dispatches_speculation() {
                 assert!(
                     !eligible(&a),
                     "think={inside_thinking} spec_think={spec_think} raw={raw}"
+                );
+                // ATLAS_GLM_STRICT_SPEC: the masked verify serves it like any
+                // other sequence, so it no longer holds the batch serial.
+                assert_eq!(
+                    mtp_gate::seq_spec_eligible(&a, spec_think, 0, raw, true),
+                    baseline
                 );
             }
         }
