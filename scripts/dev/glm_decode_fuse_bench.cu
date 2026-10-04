@@ -23,6 +23,8 @@
 //   64     glm_hc_decode_{post_,}partial_rows_bf16
 //      vs  glm_hc_decode_{post_,}partial_rows_touch_bf16 (step-fuse group 2;
 //          with group 2 above)
+//   128    kda_commit_records once per layer (34 layers, 32 heads)
+//      vs  one kda_commit_records_layers launch (step-fuse group 4)
 //
 // Every output byte (highway, partial sums, collapsed row, post, comb,
 // normed row, MoE output) must match, including rows holding zeros, -0.0,
@@ -32,27 +34,30 @@
 //
 //   nvcc -arch=sm_121a -O3 --fmad=false -std=c++17 -I kernels/gb10/glm-5.3-flash/nvfp4 \
 //        scripts/dev/glm_decode_fuse_bench.cu -o glm_decode_fuse_bench
-//   ./glm_decode_fuse_bench [copies=32] [groups=64] [reps=3] [fused=127]
+//   ./glm_decode_fuse_bench [copies=32] [groups=64] [reps=3] [fused=255]
 // Prints one "bitwise" line per chain and width, then PASS or FAIL (exit 1),
 // then the median GPU time per chain in microseconds: stream events around
 // every 8 chains, each batch queued behind a spin kernel so the GPU never
 // waits for the host. `fused` selects the fused groups of the new arm
-// (1 post, 2 partial, 4 MoE unpermute+blend, 8 MoE sort, 16 RMS norm; 32 and
-// 64 the step-fuse groups above): fused=31 against fused=127 times the
+// (1 post, 2 partial, 4 MoE unpermute+blend, 8 MoE sort, 16 RMS norm; 32, 64
+// and 128 the step-fuse groups above): fused=31 against fused=255 times the
 // step-fuse tier on top of the decode tier. The
 // sort's rows within an expert group are unordered by contract (atomics), so
 // it compares expert_offsets bytes and checks both permutations route every
-// slot to its token and expert. Device memory: ~60 MB.
+// slot to its token and expert. Device memory: ~210 MB (the commit check
+// holds two copies of 34 layers of FP32 KDA state).
 #include "hyper_connection.cu"
 #include "glm_hc_prefill_vec.cu"
 #include "moe_permute.cu"
 #include "glm_rms_norm_regs.cu"
+#include "kda.cu"
 #include "../../common/moe_topk_sigmoid.cu"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -137,7 +142,7 @@ struct Inputs {
 
 static const unsigned SINK = 20;
 static const float NORM_EPS = 1e-5f, HC_EPS = 1e-6f;
-static unsigned g_fused = 127;
+static unsigned g_fused = 255;
 
 // One mHC site: an optional post (`peer`: fold the other rank's block output
 // in), the next site's pre-mix partials, then finalize and the RMS norm.
@@ -224,6 +229,31 @@ static void norm(const Inputs& in, Arm& a, unsigned T, unsigned h, int copy, boo
     launch(f ? rms_norm_vanilla_regs : rms_norm_vanilla, dim3(T), std::min(h, 1024u),
            (const bf*)(in.quant_in.p + (size_t)(copy % 4) * MAXT * H), (const bf*)(in.norm_w.p + (size_t)(copy % 32) * H),
            (bf*)a.normed.p, h, NORM_EPS);
+}
+
+// KDA commit of every layer: two state arms, one set of fold records
+// ([layer][row][head][384]), folded from row `start` for `rows` rows.
+static const unsigned KDA_LAYERS = 34, KDA_HEADS = 32, KDA_ROWS = 8;
+static const size_t KDA_STATE = (size_t)KDA_HEADS * 128 * 128, KDA_REC = (size_t)KDA_ROWS * KDA_HEADS * KDA_RECORD_FLOATS;
+struct Commit {
+    Dev<float> state[2], records;
+};
+static void commit(Commit& c, int arm, unsigned rows, unsigned start, bool fused) {
+    const unsigned long long stride = KDA_HEADS * KDA_RECORD_FLOATS;
+    float* state = c.state[arm].p;
+    const float* rec = c.records.p + start * stride;
+    if (fused && (g_fused & 128)) {
+        KdaCommitLayers t = {};
+        for (unsigned l = 0; l < KDA_LAYERS; l++) {
+            t.state[l] = state + l * KDA_STATE;
+            t.records[l] = rec + l * KDA_REC;
+        }
+        launch(kda_commit_records_layers, dim3(KDA_HEADS, KDA_LAYERS), 128, t, stride, rows, KDA_HEADS);
+        return;
+    }
+    for (unsigned l = 0; l < KDA_LAYERS; l++)
+        launch(kda_commit_records, dim3(KDA_HEADS), 128, state + l * KDA_STATE, rec + l * KDA_REC, stride, rows,
+               KDA_HEADS);
 }
 
 // Both sorts must route slot i of token i / topk to its expert through
@@ -422,6 +452,30 @@ int main(int argc, char** argv) {
         }
     }
     in.bias.put(h_bias);
+    Commit cm;
+    std::vector<float> h_state((size_t)KDA_LAYERS * KDA_STATE), h_rec((size_t)KDA_LAYERS * KDA_REC);
+    for (auto& x : h_state) x = nd(rng) * 0.5f;
+    for (size_t i = 0; i < h_rec.size(); i++) {
+        const size_t e = i % KDA_RECORD_FLOATS;   // decay, normalized key, correction
+        h_rec[i] = e < 128 ? 0.5f + 0.5f * ud(rng) : e < 256 ? nd(rng) * 0.09f : nd(rng);
+    }
+    h_state[12345] = std::numeric_limits<float>::quiet_NaN();
+    h_rec[(size_t)7 * KDA_REC + 300] = std::numeric_limits<float>::infinity();
+    for (auto& d : cm.state) d.alloc(h_state.size());
+    cm.records.alloc(h_rec.size());
+    cm.records.put(h_rec);
+    for (unsigned rows : {1u, 2u, 3u, 5u, 8u}) {
+        for (unsigned start : {0u, 1u}) {
+            if (start + rows > KDA_ROWS) continue;
+            for (auto& d : cm.state) d.put(h_state);
+            commit(cm, 0, rows, start, false);
+            commit(cm, 1, rows, start, true);
+            CK(cudaDeviceSynchronize());
+            const bool same = diff(cm.state[0], cm.state[1], h_state.size()) == 0;
+            ok = ok && same;
+            printf("bitwise %-20s rows=%-2u from %u : %s\n", "kda commit", rows, start, same ? "same" : "FAIL");
+        }
+    }
     for (unsigned T : widths) {
         for (unsigned h : {4096u, 1536u, 512u, 4095u}) {
             if (h % 2 && T > 1) continue;  // odd rows are 4-byte loads off alignment in both kernels
@@ -460,6 +514,12 @@ int main(int argc, char** argv) {
         const double e = time_us(groups, reps, sink.p, [&](int i) { norm(in, arm[0], T, H, i, false); });
         const double f = time_us(groups, reps, sink.p, [&](int i) { norm(in, arm[1], T, H, i, true); });
         printf("%-22s %4u %9.2f %9.2f %8.2f\n", "rms norm", T, e, f, e - f);
+    }
+    // The commit folds the accepted rows of a verify (`rows` here) into all 34 states.
+    for (unsigned rows : {2u, 3u, 6u}) {
+        const double a = time_us(groups / 8 + 1, reps, sink.p, [&](int) { commit(cm, 0, rows, 0, false); });
+        const double b = time_us(groups / 8 + 1, reps, sink.p, [&](int) { commit(cm, 1, rows, 0, true); });
+        printf("%-22s %4u %9.2f %9.2f %8.2f\n", "kda commit (34 layers)", rows, a, b, a - b);
     }
     return 0;
 }

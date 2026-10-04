@@ -44,12 +44,16 @@ const OUT: DevicePtr = DevicePtr(0x8000);
 fn flag_is_explicit_and_mask_selects_groups() {
     let parse = |fuse, mask| parse_groups(NAME, ALL, fuse, mask);
     assert_eq!(parse(None, None).unwrap(), 0);
-    assert_eq!(parse(Some("0"), Some("3")).unwrap(), 0);
-    assert_eq!(parse(Some("1"), None).unwrap(), HC_NORM | HC_TOUCH);
+    assert_eq!(parse(Some("0"), Some("7")).unwrap(), 0);
+    assert_eq!(
+        parse(Some("1"), None).unwrap(),
+        HC_NORM | HC_TOUCH | KDA_COMMIT
+    );
     assert_eq!(parse(Some("1"), Some("2")).unwrap(), HC_TOUCH);
+    assert_eq!(parse(Some("1"), Some("5")).unwrap(), HC_NORM | KDA_COMMIT);
     assert!(parse(Some("yes"), None).is_err());
-    assert!(parse(Some("1"), Some("4")).is_err());
-    assert_eq!(ALL, 3);
+    assert!(parse(Some("1"), Some("8")).is_err());
+    assert_eq!(ALL, 7);
 }
 
 #[test]
@@ -178,5 +182,60 @@ fn a_fused_norm_refuses_other_rows() {
     assert!(norm.run(&gpu, PTRS[4], 3, 4096, 7).is_err());
     assert!(norm.run(&gpu, PTRS[0], 4, 4096, 7).is_err());
     norm.run(&gpu, PTRS[4], 4, 4096, 7).unwrap();
+    assert_eq!(gpu.launches().len(), 1);
+}
+
+#[test]
+fn kda_commit_group_selects_the_all_layer_kernel_when_shipped() {
+    let shipped = [
+        ("kda", "kda_commit_records"),
+        ("kda", "kda_commit_records_layers"),
+    ];
+    let gpu = Capture::new(&shipped);
+    let layers = gpu.handle("kda", "kda_commit_records_layers");
+    assert_eq!(
+        kda_commit_layers_for(KDA_COMMIT, &gpu).map(|k| k.0),
+        Some(layers)
+    );
+    assert_eq!(
+        kda_commit_layers_for(HC_NORM | HC_TOUCH, &gpu).map(|k| k.0),
+        None
+    );
+    let old = Capture::new(&shipped[..1]);
+    assert_eq!(kda_commit_layers_for(ALL, &old).map(|k| k.0), None);
+}
+
+#[test]
+fn all_layer_commit_passes_every_layer_in_one_table() {
+    use super::super::{KDA_COMMIT_MAX_LAYERS, kda_commit_records_layers};
+    let gpu = Capture::new(&[("kda", "kda_commit_records_layers")]);
+    let kernel = KernelHandle(gpu.handle("kda", "kda_commit_records_layers"));
+    let states: Vec<DevicePtr> = (0..34).map(|l| DevicePtr(0x10_0000 * (l + 1))).collect();
+    let records: Vec<DevicePtr> = (0..34)
+        .map(|l| DevicePtr(0x7000_0000 + 0x100 * l))
+        .collect();
+    kda_commit_records_layers(&gpu, kernel, &states, &records, 32 * 384, 3, 32, 7).unwrap();
+    let launches = gpu.launches();
+    assert_eq!(launches.len(), 1);
+    let (k, grid, block, args) = &launches[0];
+    assert_eq!((*k, *grid, *block), (kernel.0, [32, 34, 1], [128, 1, 1]));
+    let table = &args[0];
+    assert_eq!(table.len(), 2 * KDA_COMMIT_MAX_LAYERS * 8);
+    let word_at = |i: usize| u64::from_le_bytes(table[i * 8..i * 8 + 8].try_into().unwrap());
+    for l in 0..KDA_COMMIT_MAX_LAYERS {
+        let (state, record) = (word_at(l), word_at(KDA_COMMIT_MAX_LAYERS + l));
+        if l < 34 {
+            assert_eq!((state, record), (states[l].0, records[l].0));
+        } else {
+            assert_eq!((state, record), (0, 0));
+        }
+    }
+    let rest: Vec<Vec<u8>> = vec![(32u64 * 384).to_ne_bytes().to_vec(), word(3), word(32)];
+    assert_eq!(args[1..], rest[..]);
+    // Mismatched or oversized tables are refused before any launch.
+    assert!(kda_commit_records_layers(&gpu, kernel, &states, &records[1..], 1, 1, 32, 7).is_err());
+    let many = vec![DevicePtr(0x1000); KDA_COMMIT_MAX_LAYERS + 1];
+    assert!(kda_commit_records_layers(&gpu, kernel, &many, &many, 1, 1, 32, 7).is_err());
+    assert!(kda_commit_records_layers(&gpu, kernel, &[], &[], 1, 1, 32, 7).is_err());
     assert_eq!(gpu.launches().len(), 1);
 }

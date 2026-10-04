@@ -172,6 +172,48 @@ pub fn kda_commit_records(
         .launch(stream)
 }
 
+/// Layers one [`kda_commit_records_layers`] launch covers
+/// (`KDA_COMMIT_MAX_LAYERS` in kda.cu).
+pub const KDA_COMMIT_MAX_LAYERS: usize = 48;
+
+/// [`kda_commit_records`] for up to [`KDA_COMMIT_MAX_LAYERS`] layers in one
+/// launch: layer `l` advances `states[l]` over `records[l]` (offset to the
+/// first row to fold), bit-identical per layer. The pointers ride in a
+/// by-value table. Grid (heads, layers), block 128.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_commit_records_layers(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    states: &[DevicePtr],
+    records: &[DevicePtr],
+    record_stride: usize,
+    rows: u32,
+    heads: u32,
+    stream: u64,
+) -> Result<()> {
+    let layers = states.len();
+    anyhow::ensure!(
+        (1..=KDA_COMMIT_MAX_LAYERS).contains(&layers) && records.len() == layers,
+        "KDA commit takes 1..={KDA_COMMIT_MAX_LAYERS} layers of states and records, got {layers} and {}",
+        records.len()
+    );
+    let mut table = [0u8; 2 * KDA_COMMIT_MAX_LAYERS * 8];
+    let (state_half, record_half) = table.split_at_mut(KDA_COMMIT_MAX_LAYERS * 8);
+    for (half, ptrs) in [(state_half, states), (record_half, records)] {
+        for (slot, ptr) in half.chunks_exact_mut(8).zip(ptrs) {
+            slot.copy_from_slice(&ptr.0.to_le_bytes());
+        }
+    }
+    KernelLaunch::new(gpu, kernel)
+        .grid([heads, layers as u32, 1])
+        .block([128, 1, 1])
+        .arg_bytes(&table)
+        .arg_u64(record_stride as u64)
+        .arg_u32(rows)
+        .arg_u32(heads)
+        .launch(stream)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn kda_recurrent_regresident(
     gpu: &dyn GpuBackend,

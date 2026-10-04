@@ -375,8 +375,12 @@ impl TransformerModel {
         use crate::layer::SsmLayerState;
         let kernel = self.gpu.kernel("kda", "kda_commit_records")?;
         let heads = self.ssm_pool.h_bytes / (128 * 128 * 4);
+        let record_stride = heads * ops::KDA_RECORD_FLOATS;
         let conv_bytes = self.config.ssm_conv_state_bytes();
         let mut conv_plan = Vec::new();
+        // ATLAS_GLM_STEP_FUSE: every layer's commit in one launch.
+        let all_layers = ops::glm_step_fuse::kda_commit_layers(self.gpu.as_ref())?;
+        let (mut states, mut records) = (Vec::new(), Vec::new());
         let mut ssm_layer_idx = 0usize;
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) != LayerType::LinearAttention {
@@ -391,17 +395,24 @@ impl TransformerModel {
                 "KDA records commit: layer {i} has no records for {} rows",
                 rows.end
             );
-            ops::kda_commit_records(
-                self.gpu.as_ref(),
-                kernel,
-                ssm.h_state,
-                ssm.kda_records
-                    .offset(rows.start * self.ssm_pool.kda_record_row_bytes),
-                heads * ops::KDA_RECORD_FLOATS,
-                rows.len() as u32,
-                heads as u32,
-                stream,
-            )?;
+            let layer_records = ssm
+                .kda_records
+                .offset(rows.start * self.ssm_pool.kda_record_row_bytes);
+            if all_layers.is_some() {
+                states.push(ssm.h_state);
+                records.push(layer_records);
+            } else {
+                ops::kda_commit_records(
+                    self.gpu.as_ref(),
+                    kernel,
+                    ssm.h_state,
+                    layer_records,
+                    record_stride,
+                    rows.len() as u32,
+                    heads as u32,
+                    stream,
+                )?;
+            }
             if rewind_conv {
                 conv_plan.push(StateCopy {
                     src: self
@@ -412,6 +423,23 @@ impl TransformerModel {
                 });
             }
             ssm_layer_idx += 1;
+        }
+        if let Some(all_layers) = all_layers {
+            for (states, records) in states
+                .chunks(ops::KDA_COMMIT_MAX_LAYERS)
+                .zip(records.chunks(ops::KDA_COMMIT_MAX_LAYERS))
+            {
+                ops::kda_commit_records_layers(
+                    self.gpu.as_ref(),
+                    all_layers,
+                    states,
+                    records,
+                    record_stride,
+                    rows.len() as u32,
+                    heads as u32,
+                    stream,
+                )?;
+            }
         }
         run_ssm_state_copies(self.gpu.as_ref(), &[], &conv_plan, stream)
     }

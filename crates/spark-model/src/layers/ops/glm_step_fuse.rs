@@ -11,7 +11,7 @@
 //! loads, its barriers. Each mHC seam (two a layer) is a partial kernel over
 //! 64 CTAs, a finalizer over one CTA a row, then the caller's RMS norm.
 //!
-//! `ATLAS_GLM_STEP_FUSE_MASK` (default 3) selects groups for bisection:
+//! `ATLAS_GLM_STEP_FUSE_MASK` (default 7) selects groups for bisection:
 //!
 //! * `1` HC norm: the decode seam's finalizer (`glm_hc_decode_finalize_bf16`)
 //!   and the RMS norm its caller runs next over the same rows
@@ -27,6 +27,14 @@
 //!   next site's 1.5 MiB `hc_fn` into L2 before their PDL wait, as the
 //!   `ATLAS_GLM_DECODE_GEMV_BATCH` twins do with GEMV weights
 //!   ([`super::gemv_touch`]). Loads only, discarded: the body is the twin's.
+//! * `4` KDA commit: a sequence's `kda_commit_records` (one launch per KDA
+//!   layer, 34 a step, after the verify) as one `kda_commit_records_layers`
+//!   launch with the layers' state and record pointers in a by-value table.
+//!   Each launch covered 32 SMs with one CTA a head and waited for the one
+//!   before it; the commits (136 MiB of FP32 state read and written a step)
+//!   ended about 1.1 ms after the verify's argmax at C1 and 4.5 ms at C4,
+//!   and the next step started right after them. Every CTA runs the
+//!   single-layer body.
 //!
 //! A twin runs only where the target ships it and its shapes hold; otherwise
 //! the original launches are issued unchanged.
@@ -49,7 +57,8 @@ use crate::weight_map::DenseWeight;
 
 pub const HC_NORM: u32 = 1;
 pub const HC_TOUCH: u32 = 2;
-const ALL: u32 = HC_NORM | HC_TOUCH;
+pub const KDA_COMMIT: u32 = 4;
+const ALL: u32 = HC_NORM | HC_TOUCH | KDA_COMMIT;
 const NAME: &str = "ATLAS_GLM_STEP_FUSE";
 const MODULE: &str = "glm_hc_prefill_vec";
 
@@ -91,6 +100,24 @@ const TOUCH: [(&str, &str); 2] = [
         "glm_hc_decode_post_partial_rows_touch_bf16",
     ),
 ];
+
+/// `kda_commit_records_layers` when the KDA commit group is on and the target
+/// ships it: the caller then commits every layer of a sequence in one launch
+/// ([`super::kda_commit_records_layers`]); else None.
+pub fn kda_commit_layers(gpu: &dyn GpuBackend) -> Result<Option<KernelHandle>> {
+    Ok(kda_commit_layers_for(groups()?, gpu))
+}
+
+fn kda_commit_layers_for(groups: u32, gpu: &dyn GpuBackend) -> Option<KernelHandle> {
+    (groups & KDA_COMMIT != 0)
+        .then(|| {
+            gpu.op_cache()
+                .kernel(gpu, "kda", "kda_commit_records_layers")
+                .ok()
+        })
+        .flatten()
+        .filter(|k| k.0 != 0)
+}
 
 /// The RMS norm a seam's caller runs next over the seam's output rows
 /// (`input`, which the seam's finalizer writes), into `out`.
