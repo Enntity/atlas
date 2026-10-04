@@ -194,7 +194,7 @@ template <typename F>
 static double time_us(int groups, int reps, unsigned int* sink, F&& one) {
     const int per = 8;
     static std::vector<cudaEvent_t> ev;
-    while ((int)ev.size() < 2 * groups) { cudaEvent_t e; CK(cudaEventCreate(&e)); ev.push_back(e); }
+    while ((int)ev.size() < 2 * groups) { cudaEvent_t evt; CK(cudaEventCreate(&evt)); ev.push_back(evt); }
     std::vector<float> us;
     for (int r = 0; r < reps; r++) {
         CK(cudaDeviceSynchronize());
