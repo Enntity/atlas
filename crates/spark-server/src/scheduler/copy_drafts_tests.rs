@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use super::super::lifecycle_tests::{COMMITS, StubModel};
+use super::super::sched_ctx::SchedCtx;
 use super::*;
 
 /// The defaults with copy drafts on.
@@ -12,9 +14,17 @@ fn ctx(tokens: &[u32]) -> Context<'_> {
     Context { history, pending }
 }
 
+/// The `k` drafts `index` copies over `tokens` (pending token last).
+fn copy(index: &mut Index, tokens: &[u32], k: usize, reply_match: usize) -> Vec<u32> {
+    let ctx = ctx(tokens);
+    index
+        .find(ctx, k, reply_match)
+        .map_or_else(Vec::new, |at| copy_after(ctx, at, k))
+}
+
 /// Proposal of a fresh index over `tokens` (pending token last).
 fn propose(n: usize, prompt: usize, tokens: &[u32], k: usize, reply_match: usize) -> Vec<u32> {
-    Index::new(n, prompt).propose(ctx(tokens), k, reply_match)
+    copy(&mut Index::new(n, prompt), tokens, k, reply_match)
 }
 
 #[test]
@@ -101,7 +111,7 @@ fn the_incremental_index_agrees_with_a_fresh_one() {
     let mut index = Index::new(3, 100);
     let mut copies = 0;
     for len in 4..=tokens.len() {
-        let grown = index.propose(ctx(&tokens[..len]), 4, 0);
+        let grown = copy(&mut index, &tokens[..len], 4, 0);
         assert_eq!(grown, propose(3, 100, &tokens[..len], 4, 0), "len {len}");
         copies += usize::from(!grown.is_empty());
     }
@@ -110,9 +120,8 @@ fn the_incremental_index_agrees_with_a_fresh_one() {
     // A rewritten context (a rollback, then other tokens) is re-indexed.
     let mut other = tokens[..300].to_vec();
     other.extend(tokens[..300].iter().map(|t| t + 5));
-    let rewritten = ctx(&other);
     assert_eq!(
-        index.propose(rewritten, 4, 0),
+        copy(&mut index, &other, 4, 0),
         propose(3, 100, &other, 4, 0)
     );
 }
@@ -124,33 +133,37 @@ fn a_long_prompt_is_indexed_over_several_steps() {
     tokens.extend([100, 101, 102]);
     let mut index = Index::new(3, tokens.len() - 3);
     // The first step indexes the budget, which already holds the span.
-    assert_eq!(index.propose(ctx(&tokens), 2, 0), [103, 104]);
+    assert_eq!(copy(&mut index, &tokens, 2, 0), [103, 104]);
     assert_eq!(index.indexed, INDEX_BUDGET + 2);
-    // The next one finishes the prompt.
+    // The next one finishes the prompt; the links grow by doubling at most.
     tokens.push(103);
-    assert_eq!(index.propose(ctx(&tokens), 2, 0), [104, 105]);
+    assert_eq!(copy(&mut index, &tokens, 2, 0), [104, 105]);
     assert_eq!(index.indexed, tokens.len() - 1);
+    assert!(index.prev.capacity() <= 2 * (INDEX_BUDGET + 2));
+    assert!(index.prev.capacity() <= MAX_INDEXED);
 }
 
 #[test]
 fn a_copy_replaces_only_a_block_that_differs() {
     let (mut drafts, mut conf) = (vec![1, 2, 3, 4], vec![-0.1, -0.2, -0.3, -0.4]);
     // No copy, or one the block already starts with: the block stands.
-    assert!(!merge(&[], &mut drafts, &mut conf));
-    assert!(!merge(&[1, 2], &mut drafts, &mut conf));
-    assert!(!merge(&[1, 2, 3, 4], &mut drafts, &mut conf));
+    assert!(!merge(&[], COPY_CONF, &mut drafts, &mut conf));
+    assert!(!merge(&[1, 2], COPY_CONF, &mut drafts, &mut conf));
+    assert!(!merge(&[1, 2, 3, 4], COPY_CONF, &mut drafts, &mut conf));
     assert_eq!(
         (drafts.as_slice(), conf.len()),
         ([1, 2, 3, 4].as_slice(), 4)
     );
     // A copy that parts from it replaces it, confidences and all.
-    assert!(merge(&[1, 2, 9, 9], &mut drafts, &mut conf));
+    assert!(merge(&[1, 2, 9, 9], COPY_CONF, &mut drafts, &mut conf));
     assert_eq!(drafts, [1, 2, 9, 9]);
     assert_eq!(conf, [COPY_CONF; 4]);
-    // So does a shorter one (a narrowed copy after a miss).
+    // So does a shorter one (a narrowed copy after a miss), and a block the
+    // drafter did not measure (`ATLAS_DFLASH_CONF_WIDTH` off) is measured
+    // once copied.
     let mut unmeasured = Vec::new();
-    assert!(merge(&[5], &mut drafts, &mut unmeasured));
-    assert_eq!((drafts, unmeasured), (vec![5], vec![COPY_CONF]));
+    assert!(merge(&[5], COPY_REPLY_CONF, &mut drafts, &mut unmeasured));
+    assert_eq!((drafts, unmeasured), (vec![5], vec![COPY_REPLY_CONF]));
 }
 
 /// A request over prompt `prompt` that has emitted `reply` (its last token
@@ -187,7 +200,31 @@ fn an_offer_never_lengthens_the_block_and_counts_its_rounds() {
     // DFlash2's own rounds are not copy rounds.
     settle(&mut a.spec_adapt.copy, &[-0.5; 2], 2, 0);
     let c = &a.spec_adapt.copy;
-    assert_eq!((c.rounds, c.drafted, c.accepted, c.missed), (1, 2, 1, true));
+    assert_eq!(
+        (c.rounds, c.drafted, c.accepted, c.missed),
+        ([1, 0], [2, 0], [1, 0], true)
+    );
+}
+
+#[test]
+fn copies_of_the_reply_carry_their_own_confidence_and_count_apart() {
+    let s = Settings {
+        match_len: 3,
+        ..on()
+    };
+    // `5 6 7` occurs only in the reply.
+    let prompt = [10, 11, 12];
+    let mut a = seq(&prompt, &[5, 6, 7, 8, 9, 5, 6, 7], &[40, 41]);
+    offer_with(&mut a, &s);
+    assert_eq!(a.pending_drafts, [8, 9]);
+    assert_eq!(a.draft_conf(), [COPY_REPLY_CONF; 2]);
+    let (_, conf) = a.take_drafts();
+    settle(&mut a.spec_adapt.copy, &conf, 2, 2);
+    let c = &a.spec_adapt.copy;
+    assert_eq!(
+        (c.rounds, c.drafted, c.accepted, c.missed),
+        ([0, 1], [0, 2], [0, 2], false)
+    );
 }
 
 #[test]
@@ -217,4 +254,155 @@ fn draftless_requests_get_no_copy() {
     offer_with(&mut a, &s);
     assert!(a.pending_drafts.is_empty());
     assert!(a.spec_adapt.copy.index.is_none());
+}
+
+#[test]
+fn offer_is_a_no_op_with_copy_drafts_off() {
+    if settings().is_some() {
+        // This test process asked for copy drafts.
+        return;
+    }
+    let prompt = [10, 11, 12, 13, 14, 15];
+    let mut a = seq(&prompt, &[12, 13, 14], &[40, 41]);
+    offer(&mut a);
+    assert_eq!(a.pending_drafts, [40, 41]);
+    assert_eq!(a.draft_conf(), [-0.5; 2]);
+    assert!(a.spec_adapt.copy.index.is_none());
+}
+
+#[test]
+fn a_cut_keeps_a_copys_confidences_and_leaves_the_drafters_as_before() {
+    let s = Settings {
+        match_len: 3,
+        ..on()
+    };
+    let prompt = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+    let mut a = seq(&prompt, &[12, 13, 14], &[40, 41, 42]);
+    offer_with(&mut a, &s);
+    // The batched partition's ladder cut.
+    a.pending_drafts.truncate(2);
+    cut_conf(&mut a);
+    assert_eq!(a.draft_conf(), [COPY_CONF; 2]);
+    // DFlash2's block: its confidences go stale, as with copies off.
+    let mut a = seq(&prompt, &[1, 2, 3], &[40, 41, 42]);
+    offer_with(&mut a, &s);
+    a.pending_drafts.truncate(2);
+    cut_conf(&mut a);
+    assert!(a.draft_conf().is_empty());
+}
+
+#[test]
+fn a_preempted_request_keeps_its_index_and_counts() {
+    let s = Settings {
+        match_len: 3,
+        ..on()
+    };
+    let prompt = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+    let mut a = seq(&prompt, &[12, 13, 14], &[40, 41]);
+    offer_with(&mut a, &s);
+    settle(&mut a.spec_adapt.copy, &[COPY_CONF; 2], 2, 1);
+    let mut a = super::super::preempt::preempt_requeue(&StubModel::default(), a).a;
+    let c = &a.spec_adapt.copy;
+    assert!(c.index.is_some());
+    assert_eq!((c.rounds, c.accepted, c.missed), ([1, 0], [1, 0], true));
+    // Resumed at the same context, the re-proposed block is offered again.
+    a.pending_drafts = vec![40, 41];
+    offer_with(&mut a, &s);
+    assert_eq!(a.pending_drafts, [15, 16]);
+}
+
+/// The per-sequence verify tail books a copy round: the copy is offered over
+/// DFlash2's (unmeasured) block, taken with its confidences, verified by
+/// `verify_dflash_tail` and settled there.
+#[test]
+fn a_copy_round_settles_through_the_verify_tail() {
+    let s = Settings {
+        match_len: 3,
+        ..on()
+    };
+    let prompt = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+    let mut a = seq(&prompt, &[12, 13, 14], &[40, 41, 42, 43]);
+    a.pending_draft_conf.clear();
+    (a.finished, a.min_tokens) = (false, 0);
+    offer_with(&mut a, &s);
+    let (drafts, conf) = a.take_drafts();
+    assert_eq!(drafts, [15, 16, 17, 18]);
+    assert_eq!(conf, [COPY_CONF; 4]);
+    // As `decode_verify_dflash` leaves it: the whole block joined the sequence.
+    let pre = a.seq.tokens.len();
+    let tokens: Vec<u32> = std::iter::once(a.last_token)
+        .chain(drafts.clone())
+        .collect();
+    a.seq.tokens.extend_from_slice(&tokens);
+    a.seq.seq_len = a.seq.tokens.len();
+    // The target keeps two copies and picks 7 where the third was.
+    let sched = SchedCtx::for_test();
+    let ctx = sched.verify_logits_ctx(None, None, None, None);
+    let next = super::super::verify_dflash_step::verify_dflash_tail(
+        &StubModel::default(),
+        &mut a,
+        &sched,
+        &drafts,
+        &conf,
+        drafts.len(),
+        &ctx,
+        true,
+        &tokens,
+        vec![15, 16, 7, 9, 9],
+        false,
+        0.0,
+        true,
+    );
+    assert_eq!(next, Some(4));
+    assert_eq!(a.output_tokens, [12, 13, 14, 15, 16, 7]);
+    assert_eq!(a.last_token, 7);
+    let commits = COMMITS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    assert_eq!(commits, [(pre + 3, 3, 5)]);
+    let c = &a.spec_adapt.copy;
+    assert_eq!(
+        (c.rounds, c.drafted, c.accepted, c.missed),
+        ([1, 0], [4, 0], [2, 0], true)
+    );
+}
+
+/// The index's host time on the step's critical path, over a 512K context
+/// of all-distinct grams (its most memory, too): `cargo test --release
+/// copy_drafts_timing -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing; run with --release"]
+fn copy_drafts_timing() {
+    use std::time::Instant;
+    let mut x = 1u32;
+    let mut tokens: Vec<u32> = (0..MAX_INDEXED - 4096)
+        .map(|_| {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (x >> 8) % 150_000
+        })
+        .collect();
+    let mut index = Index::new(8, tokens.len());
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+    let (t, mut worst, mut steps) = (Instant::now(), 0.0f64, 0);
+    while index.indexed + 1 < tokens.len() {
+        let step = Instant::now();
+        index.find(ctx(&tokens), 7, 0);
+        (worst, steps) = (worst.max(ms(step)), steps + 1);
+    }
+    eprintln!(
+        "prompt: {steps} steps, {:.2} ms, worst step {worst:.3} ms",
+        ms(t)
+    );
+    let t = Instant::now();
+    for _ in 0..1000 {
+        tokens.extend_from_slice(&[x % 150_000, (x >> 3) % 150_000, (x >> 6) % 150_000]);
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        index.find(ctx(&tokens), 7, 0);
+    }
+    eprintln!("decode: {:.4} ms a step", ms(t) / 1000.0);
+    let table = index.head.capacity() * 8 / 7;
+    eprintln!(
+        "memory: links {:.2} MiB, gram table {} grams in about {:.2} MiB",
+        index.prev.capacity() as f64 * 4.0 / (1 << 20) as f64,
+        index.head.len(),
+        table.next_power_of_two() as f64 * 9.0 / (1 << 20) as f64
+    );
 }
