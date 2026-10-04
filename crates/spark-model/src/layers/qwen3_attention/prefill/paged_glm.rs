@@ -20,6 +20,8 @@ use crate::layers::ops;
 #[path = "paged_glm_projection.rs"]
 mod projection;
 
+#[path = "paged_glm_fork.rs"]
+mod fork;
 #[path = "paged_glm_output.rs"]
 mod output;
 #[path = "paged_glm_owner.rs"]
@@ -249,6 +251,7 @@ impl Qwen3AttentionLayer {
             let o_normed = normed.offset(o.row0 * h as usize * bf16);
             let o_latent = q_latent.offset(o.row0 * q_lora as usize * bf16);
             let rows_of = |base: DevicePtr, row_bytes: usize| base.offset(o.row0 * row_bytes);
+            let index = self.glm_index_fork(&octx, kv_cache, o, batched.is_some(), stream)?;
             let select = |octx: &ForwardContext| {
                 self.glm_index_prefill_cache_update(
                     o_normed,
@@ -256,7 +259,7 @@ impl Qwen3AttentionLayer {
                     o.write_skip(wf),
                     kv_cache,
                     octx,
-                    stream,
+                    index.map_or(stream, |lane| lane.side),
                     batched.map(|b| (rows_of(b.keys, b.key_row), rows_of(b.gates, b.key_row))),
                 )?;
                 if use_dense {
@@ -319,6 +322,7 @@ impl Qwen3AttentionLayer {
                         accelerated,
                     )?;
                     let q_absorbed = ctx.buffers.ssm_deinterleaved();
+                    index.map(|lane| lane.join(ctx.gpu, stream)).transpose()?;
                     self.glm_absorb_queries(q_full, q_absorbed, on, nq, ctx, stream)?;
                     q_absorbed
                 }

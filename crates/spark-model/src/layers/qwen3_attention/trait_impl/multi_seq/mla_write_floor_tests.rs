@@ -22,16 +22,30 @@ type Write = (u64, Vec<Vec<u8>>, Vec<u8>, u32);
 /// The writes of one pass, then its scratch and slot bases.
 type Pass = (Vec<Write>, [DevicePtr; 2]);
 
-/// Cache writes of one `prefill_attention_paged` call over `rows` rows from
-/// `seq_len_start` on a `dtype` cache, in launch order. `edit` runs on the
-/// layer first.
-fn try_writes(
+/// What a [`paged_run`] inspection sees: the recording GPU, the arena, the
+/// cache, the metadata and how many typed / all launches and stream log
+/// entries preceded the call.
+pub(super) struct PagedRun<'a> {
+    pub gpu: &'a TestGpu,
+    pub arena: &'a BufferArena,
+    pub cache: &'a PagedKvCache,
+    pub meta: AttnMetadataDev,
+    pub typed_before: usize,
+    pub launch_before: usize,
+    pub log_before: usize,
+}
+
+/// One `prefill_attention_paged` call over `rows` rows from `seq_len_start`
+/// on a `dtype` cache with a KV write `floor`; `edit` runs on the layer
+/// first, `inspect` on what the call recorded.
+pub(super) fn paged_run<T>(
     dtype: KvCacheDtype,
     seq_len_start: usize,
     rows: usize,
     floor: usize,
     edit: impl FnOnce(&mut Qwen3AttentionLayer),
-) -> Result<Pass> {
+    inspect: impl FnOnce(PagedRun<'_>) -> T,
+) -> Result<T> {
     let mut out = None;
     fixture_with(dtype, |gpu, config, layer| {
         edit(layer);
@@ -97,6 +111,7 @@ fn try_writes(
             .attach_sparse_index(SparseIndexCacheConfig::bf16(4, 128), gpu)
             .unwrap();
         let (typed_before, launch_before) = (gpu.1.lock().unwrap().len(), gpu.launch_count());
+        let log_before = gpu.2.lock().unwrap().len();
         let ran = layer.prefill_attention_paged(
             &mut crate::layer::EmptyLayerState,
             arena.norm_output(),
@@ -111,10 +126,39 @@ fn try_writes(
             &ctx,
             0,
         );
-        if let Err(e) = ran {
-            out = Some(Err(e));
-            return;
-        }
+        out = Some(ran.map(|_| {
+            inspect(PagedRun {
+                gpu,
+                arena: &arena,
+                cache: &cache,
+                meta,
+                typed_before,
+                launch_before,
+                log_before,
+            })
+        }));
+    });
+    out.unwrap()
+}
+
+/// Cache writes of one [`paged_run`], in launch order.
+fn try_writes(
+    dtype: KvCacheDtype,
+    seq_len_start: usize,
+    rows: usize,
+    floor: usize,
+    edit: impl FnOnce(&mut Qwen3AttentionLayer),
+) -> Result<Pass> {
+    paged_run(dtype, seq_len_start, rows, floor, edit, |run| {
+        let PagedRun {
+            gpu,
+            arena,
+            cache,
+            meta,
+            typed_before,
+            launch_before,
+            ..
+        } = run;
         let is_write = |k: u64| [LATENT_WRITE, TAIL_WRITE, POOL_FINALIZE].contains(&k);
         let grids: Vec<u32> = gpu.launches_snapshot()[launch_before..]
             .iter()
@@ -149,9 +193,8 @@ fn try_writes(
                 (*k, sources, a[4].clone(), rows)
             })
             .collect();
-        out = Some(Ok((found, [arena.ssm_qkvz(), meta.slot])));
-    });
-    out.unwrap()
+        (found, [arena.ssm_qkvz(), meta.slot])
+    })
 }
 
 fn writes(dtype: KvCacheDtype, seq_len_start: usize, rows: usize, floor: usize) -> Pass {

@@ -7,6 +7,7 @@ pub mod ep_dispatch;
 pub mod fp8_calibration;
 mod glm5_kda;
 pub mod glm_kv_shard;
+pub(crate) mod glm_layer_fork;
 pub mod glm_sp;
 pub mod moe;
 mod moe_grouped_decode;

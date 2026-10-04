@@ -24,6 +24,9 @@ pub(super) enum Event {
     Free(DevicePtr),
     Memset(DevicePtr, usize),
     Launch(u64, [u32; 3], [u32; 3], u32, u64, Vec<Arg>),
+    /// `record_event(event, stream)` / `stream_wait_event(stream, event)`.
+    Record(u64, u64),
+    Wait(u64, u64),
 }
 pub(super) struct Gpu {
     cache: spark_runtime::op_cache::OpCache,
@@ -201,6 +204,12 @@ impl GpuBackend for Gpu {
     }
     fn synchronize(&self, s: u64) -> Result<()> {
         self.record(Event::Sync(s))
+    }
+    fn record_event(&self, e: u64, s: u64) -> Result<()> {
+        self.record(Event::Record(e, s))
+    }
+    fn stream_wait_event(&self, s: u64, e: u64) -> Result<()> {
+        self.record(Event::Wait(s, e))
     }
     fn default_stream(&self) -> u64 {
         0

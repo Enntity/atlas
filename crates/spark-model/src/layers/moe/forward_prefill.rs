@@ -210,9 +210,11 @@ impl MoeLayer {
             && !overlap_shared_reduce
             && !defer_shared_hc
             && self.shared_split_ready(ctx, n);
-        if split {
+        // ATLAS_GLM_LAYER_FORK: the split shared expert forks after the router.
+        let fork = self.shared_fork(split, ctx, stream);
+        if split && fork.is_none() {
             self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
-        } else if has_shared && !overlap_shared_reduce {
+        } else if has_shared && !overlap_shared_reduce && !split {
             self.run_shared_expert_prefill(
                 shared_in,
                 shared_n,
@@ -252,6 +254,10 @@ impl MoeLayer {
         // logits BEFORE top-k (reproduces PEFT `mlp.gate`). No-op unless a router
         // delta is installed (ATLAS_LORA_EXPERTS=1).
         self.apply_router_lora_prefill(router_in, gate_logits, n, ctx, stream)?;
+        if let Some(lane) = fork {
+            let side = lane.fork(ctx.gpu, stream)?;
+            self.run_shared_split(input, n, h, shared_inter, ctx, side)?;
+        }
 
         // 2. Batched topK dispatch. DeepSeek-V3 / MiniMax-M2 use sigmoid
         //    + correction bias (detected via `correction_bias_dev`);
@@ -358,6 +364,7 @@ impl MoeLayer {
 
         // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
         let output = ctx.buffers.moe_output();
+        fork.map(|lane| lane.join(ctx.gpu, stream)).transpose()?;
         let blended = self.unpermute_ep_prefill(
             expert_down_out,
             output,
