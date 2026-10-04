@@ -77,7 +77,8 @@ pub use conversations::{
     get_conversation_item, list_conversation_items, update_conversation,
 };
 pub use inference_types::{
-    GrammarSpec, InferenceRequest, InferenceResponse, StreamEvent, TokenLogprobs,
+    GrammarSpec, InferenceRequest, InferenceResponse, InvalidRequestError, StreamEvent,
+    TokenLogprobs,
 };
 pub use lora_control::{load_lora_into_slot, set_active_lora};
 #[allow(unused_imports)]
