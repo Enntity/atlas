@@ -340,6 +340,7 @@ pub(super) fn emit_token_at_position(
         // = no-op; Qwen3.6-35B-A3B-FP8 sets 1536 in MODEL.toml.
         if !sched.levers.disable_watchdogs
             && a.grammar_state.is_some()
+            && !a.strict_grammar()
             && a.content_tokens > sched.watchdog.max_post_think_content_tokens
         {
             tracing::warn!(
@@ -357,6 +358,7 @@ pub(super) fn emit_token_at_position(
         if !sched.levers.disable_watchdogs
             && sched.levers.loop_watchdog()
             && !a.inside_tool_body
+            && !a.strict_grammar()
             && watchdog_floor_reached(a.output_tokens.len(), a.min_tokens)
             && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
             && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
@@ -583,15 +585,20 @@ pub(crate) fn emit_grammar_close(a: &mut ActiveSeq) {
 /// if it were valid. Tool grammars disengage instead (see `emit_token`). The
 /// refused token is neither emitted nor recorded.
 pub(super) fn fail_strict_grammar(a: &mut ActiveSeq, tok: u32) {
-    let at = a.output_tokens.len();
+    let msg = strict_refusal(tok, a.output_tokens.len());
+    a.abort_on_engine_error(msg);
+}
+
+/// Logged and returned for every strict-grammar refusal (first token included).
+pub(super) fn strict_refusal(tok: u32, at: usize) -> String {
     tracing::error!(
         tok,
         output_len = at,
         "response_format grammar refused an emitted token; ending the response with an error"
     );
-    a.abort_on_engine_error(format_args!(
+    format!(
         "structured output: token {tok} at output position {at} violates the response_format grammar"
-    ));
+    )
 }
 
 /// Compile a grammar state from a grammar specification + engine.
@@ -603,8 +610,9 @@ pub(super) fn fail_strict_grammar(a: &mut ActiveSeq, tok: u32) {
 ///
 /// A `response_format` grammar is marked strict (`opens_in_thinking`: the
 /// prompt leaves the model inside `<think>`), and failing to arm one is
-/// reported to the client on `sink` and returned as `Err`: its output must
-/// never come back unconstrained as if it were valid.
+/// reported to the client on `sink` as an invalid request (HTTP 400 when
+/// blocking) and returned as `Err`: its output must never come back
+/// unconstrained as if it were valid.
 pub fn compile_grammar_state(
     engine: &mut Option<GrammarEngine>,
     grammar_spec: &Option<GrammarSpec>,
@@ -615,28 +623,36 @@ pub fn compile_grammar_state(
     let Some(spec) = grammar_spec.as_ref() else {
         return Ok(None);
     };
-    let state = compile_spec(engine, spec, eos_tokens);
-    if !spec.is_response_format() {
-        return Ok(state);
-    }
-    match state {
-        Some(state) => Ok(Some(state.strict_output(opens_in_thinking))),
-        None => {
-            let msg =
-                "response_format grammar could not be armed; refusing to decode unconstrained";
-            send_error_to_sink(sink, msg);
+    let strict = spec.is_response_format();
+    let compiled = match engine.as_mut() {
+        Some(engine) => compile_spec(engine, spec, eos_tokens),
+        None if strict => Err("this model has no grammar engine".to_string()),
+        None => Ok(None),
+    };
+    match compiled {
+        Ok(state) if strict => Ok(state.map(|s| s.strict_output(opens_in_thinking))),
+        Ok(state) => Ok(state),
+        // A request the server cannot serve as asked: HTTP 400 for a blocking
+        // client, not a retryable 500.
+        Err(e) if strict => {
+            let msg = format!("response_format cannot be enforced: {e}");
+            tracing::warn!("{msg}");
+            send_invalid_request_to_sink(sink, &msg);
             anyhow::bail!(msg)
+        }
+        Err(e) => {
+            tracing::warn!("{e}");
+            Ok(None)
         }
     }
 }
 
+/// `Ok(None)` only when a tool parser opts out of constrained decoding.
 fn compile_spec(
-    engine: &mut Option<GrammarEngine>,
+    engine: &mut GrammarEngine,
     spec: &GrammarSpec,
     eos_tokens: &[u32],
-) -> Option<GrammarState> {
-    let engine = engine.as_mut()?;
-
+) -> Result<Option<GrammarState>, String> {
     // F69 (2026-04-29): symmetric dispatch via the trait. The parser
     // is the single source of truth for both runtime parsing and
     // grammar compilation; no string match keyed on `parser_name`.
@@ -654,7 +670,7 @@ fn compile_spec(
                     "Grammar: parser '{}' opted out of constrained decoding for this request",
                     parser.name(),
                 );
-                return None;
+                return Ok(None);
             }
         },
         GrammarSpec::JsonObject => engine.compile_json_grammar(),
@@ -669,28 +685,14 @@ fn compile_spec(
         GrammarSpec::JsonSchema { .. } => "response_format=json_schema".to_string(),
     };
 
-    match compiled {
-        Ok(grammar) => {
-            let vocab_size = engine.vocab_size();
-            match GrammarState::new(&grammar, vocab_size) {
-                Ok(state) => {
-                    tracing::info!("Grammar constrained decoding active: {label}");
-                    // Exempt the model's stop/EOS tokens from grammar refusal
-                    // so a legitimate end-of-turn token cannot desync the NPDA
-                    // and truncate the response (see GrammarState::accept_token).
-                    Some(state.with_stop_tokens(eos_tokens))
-                }
-                Err(e) => {
-                    tracing::warn!("Grammar state creation failed: {e}");
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Grammar compilation failed: {e}");
-            None
-        }
-    }
+    let grammar = compiled.map_err(|e| format!("Grammar compilation failed: {e}"))?;
+    let state = GrammarState::new(&grammar, engine.vocab_size())
+        .map_err(|e| format!("Grammar state creation failed: {e}"))?;
+    tracing::info!("Grammar constrained decoding active: {label}");
+    // Exempt the model's stop/EOS tokens from grammar refusal so a legitimate
+    // end-of-turn token cannot desync the NPDA and truncate the response
+    // (see GrammarState::accept_token).
+    Ok(Some(state.with_stop_tokens(eos_tokens)))
 }
 
 /// Result of starting a chunked prefill.

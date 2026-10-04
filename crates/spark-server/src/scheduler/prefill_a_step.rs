@@ -197,7 +197,7 @@ pub fn start_chunked_prefill(
         let last = hyp.last().copied().unwrap_or(0);
         let use_legacy_tool_call =
             req_require_tool_call && grammar_state.is_none() && tool_call_start_token.is_some();
-        let tool_request = grammar_state.is_some() || use_legacy_tool_call;
+        let tool_request = tool_request_for(grammar_state.as_ref(), use_legacy_tool_call);
         let now = Instant::now();
         let cached_prompt_tok = seq.cached_prefix_tokens as u32;
         let mut a = ActiveSeq {

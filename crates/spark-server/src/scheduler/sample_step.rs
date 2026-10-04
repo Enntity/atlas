@@ -657,11 +657,14 @@ pub fn sample_first_token(
         &[],
         levers,
     )?;
-    // Advance the matcher past the first token (the emit_step accept_token
-    // only runs for tokens 2..N). A grammar-disallowed first token here would
-    // indicate the mask was not applied — keep going rather than abort; the
-    // emit_step disengage path handles any later desync gracefully.
-    gs.accept_token(tok);
+    // Advance the matcher past the first token (emit_step and the decode loop
+    // accept tokens 2..N). The mask makes a refusal impossible unless it was
+    // bypassed: a strict (response_format) grammar then fails the request like
+    // every other strict refusal; a tool grammar keeps going and the emit-path
+    // disengage handles any later desync.
+    if !gs.accept_token(tok) && gs.is_strict() {
+        anyhow::bail!(crate::scheduler::emit_step::strict_refusal(tok, 0));
+    }
     Ok(tok)
 }
 

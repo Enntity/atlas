@@ -181,8 +181,15 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         let response = match rx.await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
+                // A request the scheduler cannot serve as asked is the
+                // client's to fix: 400, which SDKs do not retry.
+                let status = if e.is::<super::InvalidRequestError>() {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
                 return super::chat::ChatOutcome::Http(openai_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    status,
                     format!("Inference error: {e}"),
                 ));
             }

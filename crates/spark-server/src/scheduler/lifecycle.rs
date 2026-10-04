@@ -275,6 +275,20 @@ pub fn send_error(model: &dyn Model, a: &mut ActiveSeq, msg: &str) {
 /// an ActiveSeq. Without this the sender is silently dropped, producing
 /// a misleading "Inference cancelled" error on the client side.
 pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
+    send_sink_error(sink, msg, anyhow::anyhow!("{msg}"));
+}
+
+/// [`send_error_to_sink`] for a request the server cannot serve as asked
+/// (a blocking client gets HTTP 400 via [`crate::api::InvalidRequestError`]).
+pub fn send_invalid_request_to_sink(sink: &mut ResponseSink, msg: &str) {
+    send_sink_error(
+        sink,
+        msg,
+        crate::api::InvalidRequestError(msg.to_string()).into(),
+    );
+}
+
+fn send_sink_error(sink: &mut ResponseSink, msg: &str, err: anyhow::Error) {
     match sink {
         ResponseSink::Streaming(tx) => {
             super::mod_helpers::spawn_terminal_send(
@@ -285,7 +299,7 @@ pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
         }
         ResponseSink::Blocking(tx) => {
             if let Some(tx) = tx.take()
-                && tx.send(Err(anyhow::anyhow!("{msg}"))).is_err()
+                && tx.send(Err(err)).is_err()
             {
                 tracing::warn!("send_error_to_sink: blocking Error send failed (receiver dropped)");
             }
