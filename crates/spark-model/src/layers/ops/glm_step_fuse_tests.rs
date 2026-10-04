@@ -182,6 +182,13 @@ fn a_fused_norm_refuses_other_rows() {
     assert!(norm.run(&gpu, PTRS[4], 3, 4096, 7).is_err());
     assert!(norm.run(&gpu, PTRS[0], 4, 4096, 7).is_err());
     norm.run(&gpu, PTRS[4], 4, 4096, 7).unwrap();
+    // A second seam handed the same norm is an error, not a silent skip.
+    assert!(
+        hc_finalize_norm_for(ALL, &gpu, &norm, true, PTRS, [4, 4096, 20], [1e-5, 1e-6], 7).is_err()
+    );
+    assert!(
+        hc_finalize_norm_for(0, &gpu, &norm, true, PTRS, [4, 4096, 20], [1e-5, 1e-6], 7).is_err()
+    );
     assert_eq!(gpu.launches().len(), 1);
 }
 
@@ -238,4 +245,20 @@ fn all_layer_commit_passes_every_layer_in_one_table() {
     assert!(kda_commit_records_layers(&gpu, kernel, &many, &many, 1, 1, 32, 7).is_err());
     assert!(kda_commit_records_layers(&gpu, kernel, &[], &[], 1, 1, 32, 7).is_err());
     assert_eq!(gpu.launches().len(), 1);
+}
+
+/// The table's layout is fixed by `KDA_COMMIT_MAX_LAYERS` on both sides: a
+/// change to one alone would put the records half at the wrong offset.
+#[test]
+fn kda_commit_table_size_matches_the_kernel_source() {
+    use super::super::KDA_COMMIT_MAX_LAYERS;
+    let cu = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../kernels/gb10/glm-5.3-flash/nvfp4/kda.cu");
+    let src = std::fs::read_to_string(cu).unwrap();
+    let defines: Vec<&str> = src
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("#define KDA_COMMIT_MAX_LAYERS"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(defines, [KDA_COMMIT_MAX_LAYERS.to_string()]);
 }

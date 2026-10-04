@@ -431,7 +431,10 @@ extern "C" __global__ void __launch_bounds__(128) kda_commit_records(
 // body, so every state is bit-identical. The per-layer launches each
 // covered 32 SMs with one CTA and ran one after another behind their PDL
 // waits; here every layer's heads fill the GPU at once. Unused entries are
-// null and never read. Grid: (heads, layers); block 128.
+// null and never read. Grid: (heads, layers); block 128. Prior art
+// (docs/glm-prior-art.md): TensorFold's kda.py `replay_layers` replays every
+// KDA layer in one launch (ashhart/TensorFold v0.6.0, Apache-2.0).
+// KDA_COMMIT_MAX_LAYERS must match kda.rs (a unit test checks it).
 #define KDA_COMMIT_MAX_LAYERS 48
 struct KdaCommitLayers {
     float* state[KDA_COMMIT_MAX_LAYERS];

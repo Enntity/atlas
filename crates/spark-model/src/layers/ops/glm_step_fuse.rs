@@ -19,9 +19,14 @@
 //!   `glm_hc_decode_finalize_norm_bf16` launch of 1024 threads a row: the
 //!   norm is the `_regs` row body over the collapsed row, kept in shared
 //!   memory, and the 25 sums are staged by all threads before the same
-//!   ordered adds. One launch fewer at every seam (90 a 45-layer step). The
-//!   caller hands its norm in as a [`SeamNorm`] and issues it with
-//!   [`SeamNorm::run`], which launches nothing when the seam wrote it.
+//!   ordered adds. One launch fewer at every decode seam: 90 a 45-layer step
+//!   where every layer takes one (single-sequence verify, the DFlash
+//!   owner-batched MLA chunks, every KDA layer). The MLA multi-sequence
+//!   path (`ms_hc_pre_site`: batched decode and the non-DFlash owner batch)
+//!   collapses with the split `hc_pre` kernels instead and keeps its own
+//!   norm launch. The caller hands its norm in as a [`SeamNorm`] (one seam
+//!   each) and issues it with [`SeamNorm::run`], which launches nothing when
+//!   the seam wrote it.
 //! * `2` HC touch: the seam's `_rows_bf16` partial twins
 //!   (`ATLAS_GLM_DECODE_FUSE` group 2) as `_rows_touch_bf16`, which pull the
 //!   next site's 1.5 MiB `hc_fn` into L2 before their PDL wait, as the
@@ -43,7 +48,12 @@
 //! TensorFold's L2 weight touch (<https://github.com/jayleaton/glm53-tensorfold-spark>
 //! patch 0440; Apache-2.0), as in [`super::gemv_touch`]; MiaAI-Lab's
 //! `TF_GLM_L2PF` (patch 0046) likewise reads a seam's next weights into L2
-//! while the previous site's partials are gathered. No code copied.
+//! while the previous site's partials are gathered. The finalizer that also
+//! writes the normed row is the shape of TensorFold's own GLM `hc_pre`, whose
+//! `_hc_finish` takes the block's norm weight (<https://github.com/ashhart/TensorFold>
+//! v0.6.0 `glm5_next/cuda/glue.py`; Apache-2.0), and the all-layer commit
+//! that of its `kda.py` `replay_layers`, every KDA layer in one launch. No
+//! code copied.
 
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -218,12 +228,16 @@ fn hc_finalize_norm_for(
     [norm_eps, hc_eps]: [f32; 2],
     stream: u64,
 ) -> Result<bool> {
+    // A second seam would leave `norm` holding the first seam's rows.
+    ensure!(
+        norm.fused.get().is_none(),
+        "{NAME}: a SeamNorm serves one seam"
+    );
     if groups & HC_NORM == 0
         || !bf16_highway
         || hidden_size != 4096
         || !(1..=32).contains(&rows)
         || norm.out == hidden
-        || norm.fused.get().is_some()
     {
         return Ok(false);
     }

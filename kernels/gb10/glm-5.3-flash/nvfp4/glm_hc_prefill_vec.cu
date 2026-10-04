@@ -895,7 +895,9 @@ extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_partial_rows_tou
 // shared memory, with that kernel's block shape. `y_out` still receives the
 // row. hc_scale and hc_base, which the gates and Sinkhorn read first, are
 // touched into L2 before the PDL wait; the norm weight, read last, is
-// prefetched into L2 right after it. Grid (T), block 1024.
+// prefetched into L2 right after it. Grid (T), block 1024. Prior art
+// (docs/glm-prior-art.md): TensorFold's GLM hc_pre finalizer `_hc_finish`
+// also takes the block norm weight (ashhart/TensorFold v0.6.0, Apache-2.0).
 extern "C" __global__ void __launch_bounds__(1024) glm_hc_decode_finalize_norm_bf16(
     const __nv_bfloat16* __restrict__ streams, const float* __restrict__ partial,
     const unsigned char* __restrict__ hc_scale, const unsigned char* __restrict__ hc_base,
