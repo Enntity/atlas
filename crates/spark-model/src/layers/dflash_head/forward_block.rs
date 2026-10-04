@@ -149,6 +149,7 @@ impl BlockDiffusionDraftHead {
                 stream,
                 dump_commit,
                 scratch,
+                None,
             )?;
         }
 
@@ -905,7 +906,7 @@ impl BlockDiffusionDraftHead {
                 select: &select,
             };
             let graph_key = graph_eligible.then(graph_identity).transpose()?;
-            self.walk_split(&split.geometry.steps(0), &walker, graph_key)?;
+            self.walk_split(&split.geometry.layer_steps(0), &walker, graph_key)?;
         } else if graph_eligible && option_b_on {
             // Subgraph slot layout: [pre_0, post_0, ..., pre_{N-1}, post_{N-1}, tail].
             // 2 × num_layers + 1 slots total.

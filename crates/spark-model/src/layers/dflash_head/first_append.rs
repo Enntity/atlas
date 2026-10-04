@@ -175,6 +175,36 @@ impl DflashProposerState {
 }
 
 impl BlockDiffusionDraftHead {
+    /// What the propose-side append of `dstate` at `position` appends from
+    /// `target_hidden_stack`, read without consuming the one-shot markers.
+    pub(super) fn decode_append_planned(
+        &self,
+        dstate: &DflashProposerState,
+        target_hidden_stack: Option<DevicePtr>,
+        position: usize,
+    ) -> Option<AppendSource> {
+        // EAGLE-fix: a commit that already appended this capture (in EAGLE
+        // order) sets the one-shot flag so it is not appended twice.
+        let eagle_skip = dstate.skip_next_decode_append;
+        let verify = dstate.own_capture;
+        let decode = dstate.own_row_at == Some(position);
+        let prefill = dstate.first_append_at == Some(position);
+        let preceding = match (verify, decode, prefill) {
+            (true, ..) => Preceding::Verify,
+            (_, true, _) => Preceding::Decode,
+            (_, _, true) => Preceding::Prefill,
+            _ => Preceding::Other,
+        };
+        decode_append_source(
+            self.startup.diagnostics.first_append,
+            self.startup.diagnostics.no_decode_append || eagle_skip,
+            target_hidden_stack,
+            dstate.ctx_len < dstate.max_ctx_len,
+            preceding,
+            dstate.own_row,
+        )
+    }
+
     /// The propose-side context append: at most one slot at `ctx_len`. The
     /// state's one-shot markers are consumed whether or not it appends.
     pub(super) fn append_decode_ctx(
@@ -185,26 +215,12 @@ impl BlockDiffusionDraftHead {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        // EAGLE-fix: a commit that already appended this capture (in EAGLE
-        // order) sets the one-shot flag so it is not appended twice.
-        let eagle_skip = std::mem::take(&mut dstate.skip_next_decode_append);
-        let verify = std::mem::take(&mut dstate.own_capture);
-        let decode = dstate.own_row_at.take() == Some(position);
-        let prefill = dstate.first_append_at.take() == Some(position);
-        let preceding = match (verify, decode, prefill) {
-            (true, ..) => Preceding::Verify,
-            (_, true, _) => Preceding::Decode,
-            (_, _, true) => Preceding::Prefill,
-            _ => Preceding::Other,
-        };
-        let Some(source) = decode_append_source(
-            self.startup.diagnostics.first_append,
-            self.startup.diagnostics.no_decode_append || eagle_skip,
-            target_hidden_stack,
-            dstate.ctx_len < dstate.max_ctx_len,
-            preceding,
-            dstate.own_row,
-        ) else {
+        let source = self.decode_append_planned(dstate, target_hidden_stack, position);
+        dstate.skip_next_decode_append = false;
+        dstate.own_capture = false;
+        dstate.own_row_at = None;
+        dstate.first_append_at = None;
+        let Some(source) = source else {
             return Ok(());
         };
         let slot = dstate

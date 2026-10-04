@@ -90,6 +90,36 @@ impl BlockDiffusionDraftHead {
         Ok(())
     }
 
+    /// The context slots a propose projects: `(first, count)` of the
+    /// `ctx_len` populated slots past the paged cache's `ctx_committed`
+    /// (all of them under `ATLAS_DFLASH_DEBUG_FULL_PRECOMPUTE=1`).
+    pub(super) fn ctx_tail(&self, ctx_len: usize, ctx_committed: usize) -> (usize, usize) {
+        // Clamp watermark defensively: a rewind should have reset it, but
+        // never start past ctx_len.
+        let committed = if self.startup.diagnostics.full_precompute {
+            0
+        } else {
+            ctx_committed.min(ctx_len)
+        };
+        (committed, ctx_len - committed)
+    }
+
+    /// The context rows the next propose of `dstate` at `position` appends
+    /// (`ctx_tail` after its `append_decode_ctx` from `stack`), read without
+    /// touching the state.
+    pub(super) fn pending_ctx_rows(
+        &self,
+        dstate: &DflashProposerState,
+        stack: Option<DevicePtr>,
+        position: usize,
+    ) -> usize {
+        let appended = self
+            .decode_append_planned(dstate, stack, position)
+            .is_some();
+        self.ctx_tail(dstate.ctx_len + appended as usize, dstate.ctx_committed)
+            .1
+    }
+
     pub(super) fn propose_drafts_on_lane(
         &self,
         scratch: &DflashScratch,
@@ -392,15 +422,10 @@ impl BlockDiffusionDraftHead {
             //
             // Escape hatch: ATLAS_DFLASH_DEBUG_FULL_PRECOMPUTE=1 forces a
             // full recompute (committed=0) for A/B accept-rate parity.
-            let force_full = self.startup.diagnostics.full_precompute;
-            // Clamp watermark defensively: a rewind should have reset it,
-            // but never start past ctx_len.
-            let committed = if force_full {
-                0
-            } else {
-                dstate.ctx_committed.min(dstate.ctx_len)
-            };
-            let new_count = dstate.ctx_len - committed;
+            let (committed, new_count) = self.ctx_tail(dstate.ctx_len, dstate.ctx_committed);
+            // ATLAS_GLM_DRAFT_TP_CTX: a split propose takes its announced
+            // turn at every append, even an empty one.
+            let mut split_turn = self.ctx_split_turn(ctx.comm, new_count, _stream)?;
             if dstate.ctx_len > 0 && new_count > 0 {
                 // Ctx-holes follow-up (2026-07-08): the precompute scratch
                 // (fc_proj / fused_kv_out / slot_mapping_dev) is sized for
@@ -450,6 +475,8 @@ impl BlockDiffusionDraftHead {
                         _stream,
                         true, // commit: always write to paged cache on production path
                         scratch,
+                        // One pass: a split append fits the scratch window.
+                        split_turn.take(),
                     )?;
                     chunk_start += chunk_count;
                 }
