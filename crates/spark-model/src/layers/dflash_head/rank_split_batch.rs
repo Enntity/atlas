@@ -11,7 +11,7 @@
 //! those), so every value is the one the unsplit launch writes. Eager: the
 //! batched propose captures no graphs.
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use spark_comm::CommBackend;
 
 use super::BlockDiffusionDraftHead;
@@ -58,6 +58,7 @@ impl BlockDiffusionDraftHead {
             inter: self.batch_mlp_gate,
             acc: self.batch_mlp_down,
             logits: self.batch_logits,
+            ..Frame::serial(&self.scratch)
         }
     }
 
@@ -84,7 +85,7 @@ impl BlockDiffusionDraftHead {
             a,
         };
         walk(
-            &split.geometry.steps(0),
+            &split.geometry.layer_steps(0),
             Graphs::Eager,
             a.ctx.gpu,
             a.stream,
@@ -120,6 +121,9 @@ impl SplitOps for BatchWalk<'_> {
             Piece::GateUp(_) | Piece::Down(_) | Piece::Vocab => {
                 head.split_piece(self.split, piece, 0, a.ctx.gpu, &self.frame, a.stream)
             }
+            Piece::CtxFc(_) | Piece::CtxNorm(_) | Piece::CtxKv(_) => {
+                bail!("rank-split propose: {piece:?} walks with its context append")
+            }
         }
     }
 
@@ -149,7 +153,7 @@ impl<'a> BatchSplitGuard<'a> {
         stream: u64,
     ) -> Result<Self> {
         if let Some((split, _, rows)) = split {
-            split.begin(rows)?;
+            split.begin_announced(rows)?;
         }
         Ok(Self {
             split: split.map(|(split, comm, _)| (split, comm)),

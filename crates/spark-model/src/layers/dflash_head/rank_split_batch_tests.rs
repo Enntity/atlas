@@ -16,8 +16,8 @@ fn the_batch_switch_is_0_or_1_and_sets_its_own_parity_bit() {
     }
     // Off, both ranks compare the split's own word; on, a word of its own.
     for parts in [None, Some(MLP), Some(HEAD), Some(ALL)] {
-        assert_eq!(parity_word(parts, false), Parts::word(parts));
-        assert_ne!(parity_word(parts, true), Parts::word(parts));
+        assert_eq!(parity_word(parts, false, false), Parts::word(parts));
+        assert_ne!(parity_word(parts, true, false), Parts::word(parts));
     }
 }
 
@@ -29,6 +29,7 @@ fn frame(rank: &Rank, g: Geometry, rows: usize) -> Frame {
         inter: alloc(g.inter),
         acc: alloc(g.hidden),
         logits: alloc(g.vocab),
+        ..Frame::serial(&rank.scratch)
     }
 }
 
@@ -46,10 +47,13 @@ fn a_batched_propose_swaps_its_rows_through_the_batch_frame() {
     let rows = 2 * g.gamma;
     let b = g.with_rows(rows);
     for rank in [&r0, &r1] {
-        rank.split.begin(rows).unwrap();
+        rank.split.begin(rows, CtxRows::default()).unwrap();
         assert_eq!(rank.split.plan(), b);
-        assert!(rank.split.begin(capacity + 1).is_err(), "over capacity");
-        rank.split.begin(rows).unwrap();
+        assert!(
+            rank.split.begin(capacity + 1, CtxRows::default()).is_err(),
+            "over capacity"
+        );
+        rank.split.begin(rows, CtxRows::default()).unwrap();
     }
     let hidden = rows * g.hidden * 2;
     for (i, &swap) in b.swaps().iter().enumerate() {
@@ -82,6 +86,9 @@ fn a_batched_propose_swaps_its_rows_through_the_batch_frame() {
                 let whole = joined(rows, g.vocab, &sent0, &sent1);
                 assert_eq!(r0.read(f0.logits, whole.len()), whole);
             }
+            Swap::CtxInput(_) | Swap::CtxHidden(_) | Swap::CtxKv(_) => {
+                unreachable!("no context append was announced")
+            }
         }
     }
     // Same sizes, same order, both ranks: the plan at B×gamma rows.
@@ -92,9 +99,9 @@ fn a_batched_propose_swaps_its_rows_through_the_batch_frame() {
 
     // A batched propose that stops early drains the rest at its own rows,
     // and the next single-sequence propose plans gamma rows again.
-    r0.split.begin(rows).unwrap();
+    r0.split.begin(rows, CtxRows::default()).unwrap();
     r0.split.finish(&p0, 0).unwrap();
     assert_eq!(p0.sizes.borrow()[sizes.len()..], sizes[..]);
-    r0.split.begin(g.gamma).unwrap();
+    r0.split.begin(g.gamma, CtxRows::default()).unwrap();
     assert_eq!(r0.split.plan(), g);
 }

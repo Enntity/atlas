@@ -337,3 +337,37 @@ fn alloc_state_reserves_the_own_row_for_non_legacy_only() {
         );
     }
 }
+
+/// `ATLAS_GLM_DRAFT_TP_CTX` announces a propose's context rows before it
+/// runs: read from the untouched state, they are the rows the append leaves
+/// past the committed watermark, whatever the markers and the room.
+#[test]
+fn the_pending_rows_are_what_the_propose_appends_past_the_watermark() {
+    for variant in ALL {
+        for bits in 0u8..32 {
+            let gpu = MockGpuBackend::new();
+            let head = head(variant);
+            let mut state = after_prefill(&head, &gpu);
+            let global = global_row(&gpu);
+            let d = dstate(&mut state);
+            let [skip, verify, decode, full, committed] =
+                [0, 1, 2, 3, 4].map(|b| bits >> b & 1 != 0);
+            d.skip_next_decode_append = skip;
+            d.own_capture = verify;
+            d.own_row_at = decode.then_some(PROMPT);
+            if full {
+                d.ctx_len = WINDOW;
+                d.ctx_positions = (0..WINDOW as i32).collect();
+            }
+            d.ctx_committed = if committed { 1 } else { 0 };
+            let pending = head.pending_ctx_rows(d, Some(global), PROMPT);
+            head.append_decode_ctx(d, Some(global), PROMPT, &gpu, 0)
+                .unwrap();
+            assert_eq!(
+                pending,
+                d.ctx_len - d.ctx_committed,
+                "{variant:?} bits={bits:05b}"
+            );
+        }
+    }
+}

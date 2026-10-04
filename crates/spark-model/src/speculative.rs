@@ -321,6 +321,23 @@ pub trait DraftProposer: Send + Sync {
         None
     }
 
+    /// `ATLAS_GLM_DRAFT_TP_CTX`: the context rows the split propose about to
+    /// be announced over `comm` appends split, packed for the announce
+    /// (`rank_split::announce_word`; 0 = none). `seqs` holds each sequence's
+    /// state, capture row and position as the propose will receive them.
+    /// The proposer keeps the rows for that propose.
+    fn rank_split_ctx(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _seqs: &[(
+            &dyn ProposerState,
+            Option<spark_runtime::gpu::DevicePtr>,
+            usize,
+        )],
+    ) -> u32 {
+        0
+    }
+
     /// Chain confidence of the most recent `propose` (min top-1 softmax prob
     /// across its drafts), when the proposer computes it (`draft_conf_tau` >
     /// 0). `None` = not computed; callers must not gate on it then.

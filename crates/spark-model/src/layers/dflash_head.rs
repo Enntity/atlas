@@ -870,8 +870,9 @@ impl BlockDiffusionDraftHead {
 }
 
 impl BlockDiffusionDraftHead {
-    /// `propose_batch` behind its rank-split drain guard: nothing in it splits,
-    /// it runs without the communicator.
+    /// `propose_batch` behind its rank-split drain guard: it runs without the
+    /// communicator; only the staged forward and the prepares' context
+    /// appends split, over `batch_split`.
     #[allow(clippy::too_many_arguments)]
     fn propose_batch_staged(
         &self,
@@ -996,6 +997,13 @@ impl BlockDiffusionDraftHead {
             // so a mid-loop failure under generic authoritative falls back
             // to forward_prepared for the prepared prefix and serial
             // propose for the rest instead of erroring to the scheduler.
+            // ATLAS_GLM_DRAFT_TP_CTX: each prepare's context append takes its
+            // announced turn over the batch split's communicator.
+            let prepare_ctx = &crate::layer::ForwardContext {
+                comm: batch_split.map(|(_, comm)| comm),
+                midchunk_capture: None,
+                ..*ctx
+            };
             let mut prepared = 0usize;
             for i in 0..n {
                 if let Err(e) = self.prepare_drafts_state(
@@ -1005,7 +1013,7 @@ impl BlockDiffusionDraftHead {
                     num_drafts,
                     states[i],
                     expected_owners[i],
-                    ctx,
+                    prepare_ctx,
                     stream,
                     target_hiddens[i],
                 ) {
@@ -1193,7 +1201,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // which walks every swap. However the propose ends, issue them all.
         let split = self.rank_split_with(ctx.comm, grammar_bitmask.is_some());
         if let Some((split, _)) = split {
-            split.begin(self.gamma)?;
+            split.begin_announced(self.gamma)?;
         }
         let drafts = self.propose_drafts(
             last_token,
@@ -1228,6 +1236,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
             .map(|(_, _, rows)| rows)
     }
 
+    fn rank_split_ctx(
+        &self,
+        comm: &dyn spark_comm::CommBackend,
+        seqs: &[rank_split::CtxSeq<'_>],
+    ) -> u32 {
+        self.split_ctx_rows(comm, seqs)
+    }
+
     fn propose_batch(
         &self,
         last_tokens: &[u32],
@@ -1243,8 +1259,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
     ) -> Result<Option<Vec<Vec<u32>>>> {
         // ATLAS_GLM_DRAFT_TP_BATCH: the model announced this batched propose
         // to the worker, which walks every swap; however it ends, the guard
-        // issues them all. Nothing else in it splits: the rest runs without
-        // the communicator.
+        // issues them all. Only the staged forward and the context appends
+        // (`ATLAS_GLM_DRAFT_TP_CTX`) split; the rest runs without the
+        // communicator.
         let grammar = grammar_bitmasks.is_some_and(|m| m.iter().any(Option::is_some));
         let split = self.rank_split_batch_with(ctx.comm, last_tokens.len(), grammar);
         let drain = rank_split_batch::BatchSplitGuard::begin(split, stream)?;

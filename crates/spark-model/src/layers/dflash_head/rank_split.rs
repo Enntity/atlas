@@ -31,6 +31,13 @@
 //! worker idles through every batched propose (about 10 ms each in a C4
 //! prose nsys profile, 2026-10-03).
 //!
+//! `ATLAS_GLM_DRAFT_TP_CTX=1` (with the switch above, default off) splits a
+//! split propose's context append too (`rank_split_ctx`): the `fc` and fused
+//! K/V projections of the context rows the propose appends, the largest
+//! drafter reads the head still ran alone (about 0.5 ms a propose in a C1
+//! prose nsys profile, 2026-10-03). The head announces those rows with the
+//! propose and walks them as the first swaps of the plan.
+//!
 //! Prior art: splitting the drafter across both ranks follows MiaAI-Lab's
 //! `DFLASH_DRAFT_TP=2` (<https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks>
 //! `.env.example`, `start.sh`; vLLM `draft_tensor_parallel_size`). Idea only,
@@ -43,6 +50,13 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle};
 #[path = "rank_split_exec.rs"]
 mod exec;
 pub use exec::RankSplit;
+pub(crate) use exec::{CtxSeq, CtxTurn};
+
+#[path = "rank_split_ctx.rs"]
+mod ctx;
+pub(crate) use ctx::CtxRows;
+use ctx::ctx_steps;
+pub use ctx::{announce_word, ctx_requested};
 
 /// What the worker shares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,9 +123,10 @@ pub fn batch_requested() -> Result<bool> {
 }
 
 /// The value both ranks must agree on: [`Parts::word`], plus bit 2 for the
-/// batched split (so the word is unchanged with it off).
-pub(crate) fn parity_word(parts: Option<Parts>, batch: bool) -> u64 {
-    Parts::word(parts) | (batch as u64) << 2
+/// batched split and bit 3 for the context split (so the word is unchanged
+/// with them off).
+pub(crate) fn parity_word(parts: Option<Parts>, batch: bool, ctx: bool) -> u64 {
+    Parts::word(parts) | (batch as u64) << 2 | (ctx as u64) << 3
 }
 
 /// Where a propose's whole rows live on a rank: the MLP input and final-norm
@@ -125,6 +140,12 @@ pub(crate) struct Frame {
     pub inter: DevicePtr,
     pub acc: DevicePtr,
     pub logits: DevicePtr,
+    /// A context append's input rows (the head's accumulator rows, the
+    /// worker's landing buffer), its `fc` output (normed in place) and its
+    /// fused K/V output (`ATLAS_GLM_DRAFT_TP_CTX`).
+    pub ctx_in: DevicePtr,
+    pub ctx_fc: DevicePtr,
+    pub ctx_kv: DevicePtr,
 }
 
 impl Frame {
@@ -134,6 +155,9 @@ impl Frame {
             inter: scratch.mlp_intermediate,
             acc: scratch.stream_acc,
             logits: scratch.logits,
+            ctx_in: DevicePtr::NULL,
+            ctx_fc: scratch.fc_proj,
+            ctx_kv: scratch.fused_kv_out,
         }
     }
 }
@@ -151,6 +175,12 @@ pub(crate) enum Swap {
     Hidden,
     /// Each rank's half of the vocabulary logits; the head keeps both.
     Logits,
+    /// Context append `i`'s input rows, head to worker.
+    CtxInput(usize),
+    /// Each rank's half of its `fc` rows; both keep both.
+    CtxHidden(usize),
+    /// Each rank's half of its fused K/V rows; the head keeps both.
+    CtxKv(usize),
 }
 
 /// Stream work between two swaps.
@@ -176,6 +206,12 @@ pub(crate) enum Piece {
     Vocab,
     /// Draft selection over the joined logits (head only).
     Select,
+    /// This rank's half of context append `i`'s `fc` projection.
+    CtxFc(usize),
+    /// `hidden_norm` over the joined `fc` rows (both ranks).
+    CtxNorm(usize),
+    /// This rank's half of context append `i`'s fused K/V projection.
+    CtxKv(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,6 +229,12 @@ pub(crate) struct Geometry {
     pub vocab: usize,
     pub layers: usize,
     pub parts: Parts,
+    /// `fc` input width and fused K/V output rows of a context append; zero
+    /// without `ATLAS_GLM_DRAFT_TP_CTX`.
+    pub ctx_in: usize,
+    pub ctx_kv: usize,
+    /// The context rows of the current propose's appends.
+    pub ctx: CtxRows,
 }
 
 /// Output rows a tensor-core GEMV CTA owns. A half starts on a CTA boundary,
@@ -233,6 +275,11 @@ impl Geometry {
             "ATLAS_GLM_DRAFT_TP: drafter vocabulary too small to split ({})",
             self.vocab
         );
+        ensure!(
+            (self.ctx_in, self.ctx_kv) == (0, 0)
+                || self.ctx_in > 0 && self.ctx_in.is_multiple_of(32) && self.ctx_kv >= 2 * CTA_ROWS,
+            "ATLAS_GLM_DRAFT_TP_CTX: context projections the shares cannot serve ({self:?})"
+        );
         Ok(())
     }
 
@@ -244,17 +291,36 @@ impl Geometry {
             Swap::Activation(_) => half(self.inter, 1).1,
             Swap::Output(_) => half(self.hidden, 1).1,
             Swap::Logits => half(self.vocab, 1).1,
+            Swap::CtxInput(_) => self.ctx_in,
+            Swap::CtxHidden(_) => half(self.hidden, 1).1,
+            Swap::CtxKv(_) => half(self.ctx_kv, 1).1,
+        }
+    }
+
+    /// The rows a swap carries: a context append's own, else the propose's.
+    pub(crate) fn rows(&self, swap: Swap) -> usize {
+        match swap {
+            Swap::CtxInput(i) | Swap::CtxHidden(i) | Swap::CtxKv(i) => self.ctx.get(i),
+            _ => self.gamma,
         }
     }
 
     /// Bytes each rank sends and receives in `swap`.
     pub(crate) fn bytes(&self, swap: Swap) -> usize {
-        self.gamma * self.width(swap) * 2
+        self.rows(swap) * self.width(swap) * 2
     }
 
-    /// Rank `rank`'s walk. Rank 0 runs the whole propose forward; rank 1
-    /// only its halves.
+    /// Rank `rank`'s whole walk: the context appends (`ctx_steps`), then
+    /// the layers and tail (`layer_steps`).
     pub(crate) fn steps(&self, rank: usize) -> Vec<Step> {
+        let mut steps: Vec<Step> = self.ctx.appends().flat_map(ctx_steps).collect();
+        steps.extend(self.layer_steps(rank));
+        steps
+    }
+
+    /// Rank `rank`'s walk of the layers and tail. Rank 0 runs the whole
+    /// propose forward; rank 1 only its halves.
+    pub(crate) fn layer_steps(&self, rank: usize) -> Vec<Step> {
         use Piece::*;
         let head = rank == 0;
         let mut steps = Vec::new();
