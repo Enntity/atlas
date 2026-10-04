@@ -346,7 +346,7 @@ impl BlockDiffusionDraftHead {
                 }
             }
             if self.candidate_selector.is_some() {
-                self.run_batched_dflash2_tail(batch_size, last_tokens, ctx, stream)?;
+                self.run_batched_dflash2_tail(batch_size, last_tokens, &ban_depths, ctx, stream)?;
             } else {
                 self.run_batched_markov(batch_size, ctx, stream)?;
             }
