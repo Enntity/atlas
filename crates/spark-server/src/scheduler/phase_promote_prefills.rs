@@ -142,7 +142,7 @@ pub(super) fn build_active_seq_from_prefill(
     let temperature = p.temperature;
     // F4: sticky tool-request flag — grammar attached OR legacy tool path.
     // Computed before `p.grammar_state` is moved into the struct below.
-    let tool_request = p.grammar_state.is_some() || use_legacy_tool_call;
+    let tool_request = tool_request_for(p.grammar_state.as_ref(), use_legacy_tool_call);
     let native_tool_open = p.max_tokens > 0 && p.tools_present && glm_tool_boundary == Some(first);
     let thinking = first_token_thinking::FirstTokenThinking::resolve_with_tool_boundary(
         p.enable_thinking,
