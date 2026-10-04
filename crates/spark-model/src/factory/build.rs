@@ -25,6 +25,7 @@ use crate::weight_loader::load_dflash_weights;
 
 mod glm;
 mod kv_budget;
+mod kv_carveout;
 mod kv_nvme;
 mod kv_summary;
 
@@ -634,10 +635,24 @@ pub fn build_model(
             n
         }
     };
+    // The carveout adds blocks beyond the budget (not to a fixed HSS window or
+    // a latent shard, whose ranks hold different latents).
+    let kv_shape = kv_carveout::KvShape {
+        config: &kv_config,
+        v_aliases_k: glm_cache_plan.is_some(),
+        index: sparse_index,
+        tail_slots,
+    };
+    let (blocks, kv_placement) =
+        if hss_cache_blocks_per_seq.is_none() && glm_cache_plan.and_then(|p| p.shard()).is_none() {
+            kv_carveout::extend(gpu.as_ref(), kv_shape, num_kv_blocks)
+        } else {
+            (num_kv_blocks, Default::default())
+        };
     num_kv_blocks = glm::agree_kv_blocks(
         comm.as_deref(),
         gpu.as_ref(),
-        num_kv_blocks,
+        blocks,
         glm_cache_plan,
         kv_nvme::rank_word(nvme_record_bytes, ssm_pools.tier_home),
     )?;
@@ -700,7 +715,13 @@ pub fn build_model(
             );
         }
     }
-    let mut kv_cache = glm::new_kv_cache(kv_config, num_kv_blocks, gpu.as_ref(), glm_cache_plan)?;
+    let mut kv_cache = glm::new_kv_cache(
+        kv_config,
+        num_kv_blocks,
+        gpu.as_ref(),
+        glm_cache_plan,
+        kv_placement,
+    )?;
     if let Some(index) = sparse_index {
         kv_cache.attach_sparse_index_with_tail_slots(index, tail_slots, gpu.as_ref())?;
     }
