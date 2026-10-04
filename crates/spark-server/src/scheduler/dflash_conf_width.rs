@@ -56,14 +56,21 @@ use super::dflash_width::MAX_DRAFTS;
 const EDGES: [f32; 10] = [
     -1.5, -1.0, -0.7, -0.5, -0.35, -0.22, -0.12, -0.06, -0.03, -0.01,
 ];
-const BINS: usize = EDGES.len() + 1;
+/// The confidence a draft copied from the context carries
+/// (`copy_drafts`): above any log-probability, so copies bin apart in
+/// [`COPY_BIN`] and are priced by their own measured acceptance.
+pub(crate) const COPY_CONF: f32 = 1.0;
+const COPY_BIN: usize = EDGES.len() + 1;
+const BINS: usize = EDGES.len() + 2;
 /// Acceptance per bin before any verify: a drafter's top-1 probability
 /// overstates acceptance (knapcio's calibration of this drafter, the same
 /// table as `EDGES`, reads 0.96 only above p = 0.99), so the prior is a
 /// rounded reading of that table's first-position row (`g[0][7..]`). Serving
-/// replaces it within a few hundred verifies.
+/// replaces it within a few hundred verifies. The copy bin's prior is the
+/// share of copied drafts MiaAI-Lab's TensorFold recipe measured kept when
+/// copied from the prompt (74%, patch 0032; see `copy_drafts`).
 const PRIOR: [f32; BINS] = [
-    0.12, 0.16, 0.25, 0.35, 0.42, 0.48, 0.55, 0.62, 0.68, 0.76, 0.95,
+    0.12, 0.16, 0.25, 0.35, 0.42, 0.48, 0.55, 0.62, 0.68, 0.76, 0.95, 0.74,
 ];
 /// Pseudo-observations behind the prior in a bin's all-depth rate, and
 /// behind that rate in one depth's cell.
@@ -73,6 +80,9 @@ const POOL_WEIGHT: f32 = 8.0;
 const DECAY: f32 = 0.995;
 
 fn bin(conf: f32) -> usize {
+    if conf >= COPY_CONF {
+        return COPY_BIN;
+    }
     EDGES.iter().filter(|&&edge| conf >= edge).count()
 }
 

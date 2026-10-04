@@ -1,0 +1,330 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Prompt-lookup ("copy") drafts beside DFlash2 (`ATLAS_DFLASH_COPY_DRAFTS=1`).
+//!
+//! A reply that quotes or edits its prompt, or repeats itself, is cheap to
+//! draft: when the context's last `match` tokens (the pending token
+//! included) occurred earlier in the prompt or the reply, the tokens that
+//! followed that occurrence are verified in place of DFlash2's block.
+//! Copies only propose: every row still verifies against the target's own
+//! pick, so an accepted copy is the token the target chose there.
+//!
+//! - **Index.** Each request keeps an incremental n-gram index of its
+//!   context on the host: the newest end of every `match`-gram, and per
+//!   position a link to the previous end of the same gram. A step indexes
+//!   only what it committed, and a long prompt [`INDEX_BUDGET`] positions a
+//!   step (about a millisecond); a rewritten context (rollback) is
+//!   re-indexed. About 13–22 bytes a context token, freed with the
+//!   request, never more than [`MAX_INDEXED`] positions.
+//! - **Proposal.** The latest earlier occurrence with `k` tokens after it,
+//!   else the latest one continued over its own copy (a repeat whose period
+//!   is shorter than `k`). Candidates are checked token by token, so a hash
+//!   collision only costs a candidate, and the walk is capped at
+//!   [`MAX_HOPS`].
+//! - **Merge.** A copy that differs from DFlash2's block replaces it; one
+//!   DFlash2 already agrees with leaves it alone. `k` never exceeds the
+//!   drafts DFlash2 proposed, so a verify stays within the widths DFlash2
+//!   uses (and the M16/M32 verify kernels it runs on). Copies carry
+//!   [`COPY_CONF`] for confidences, so `ATLAS_DFLASH_CONF_WIDTH` prices
+//!   them by the copies' own measured acceptance and never by DFlash2's.
+//!
+//! Knobs (read once): `ATLAS_DFLASH_COPY_MATCH` (default 8, 2..=64) tokens
+//! that must match; `ATLAS_DFLASH_COPY_MAX` (default and at most
+//! [`MAX_DRAFTS`]) drafts a copy; `ATLAS_DFLASH_COPY_REPLY_MATCH` (0 = off,
+//! else more than the match, up to 64) tokens an occurrence inside the
+//! reply must match (code replies repeat short boilerplate whose
+//! continuations differ); `ATLAS_DFLASH_COPY_MISS_MAX` (0 = off) drafts a
+//! copy after a copy that was not kept whole, until one is.
+//!
+//! Each request's `Done:` line is followed by a `COPY DRAFTS` line with its
+//! copy rounds, drafts and accepted drafts.
+//!
+//! Prior art: the policy (match length, latest occurrence with a full
+//! continuation, copy over the drafter's block, the reply-match and
+//! narrow-after-miss refinements) follows MiaAI-Lab's TensorFold recipe
+//! (<https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks>,
+//! `patches/0007-glm-copy-drafts.patch` and
+//! `patches/0032-glm-code-copy-drafts.patch`, Apache-2.0; patches of
+//! TensorFold by ashhart). Ideas, no code; see docs/glm-prior-art.md.
+//! Ours: the incremental index, the overlap continuation, the calibrated
+//! copy bin in the confidence width and the merge with DFlash2's block.
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use super::ActiveSeq;
+use super::dflash_conf_width::COPY_CONF;
+use super::dflash_width::MAX_DRAFTS;
+
+/// Positions indexed at most (the context limit is far below).
+const MAX_INDEXED: usize = 1 << 20;
+/// Positions one offer indexes at most, so a long prompt is indexed over
+/// its first steps instead of stalling one.
+const INDEX_BUDGET: usize = 1 << 15;
+/// Earlier occurrences a proposal checks at most.
+const MAX_HOPS: usize = 32;
+const NONE: u32 = u32::MAX;
+
+/// The copy-draft knobs; `None` from [`settings`] with copy drafts off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Settings {
+    match_len: usize,
+    max: usize,
+    reply_match: usize,
+    miss_max: usize,
+}
+
+impl Settings {
+    /// Parse the knobs from `var` (an environment lookup); out-of-range
+    /// values take their defaults.
+    fn parse(var: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        if var("ATLAS_DFLASH_COPY_DRAFTS").as_deref() != Some("1") {
+            return None;
+        }
+        let num = |name: &str, default: usize, ok: &dyn Fn(usize) -> bool| {
+            var(name)
+                .and_then(|v| v.trim().parse().ok())
+                .filter(|&v| ok(v))
+                .unwrap_or(default)
+        };
+        let match_len = num("ATLAS_DFLASH_COPY_MATCH", 8, &|v| (2..=64).contains(&v));
+        let max = num("ATLAS_DFLASH_COPY_MAX", MAX_DRAFTS, &|v| {
+            (1..=MAX_DRAFTS).contains(&v)
+        });
+        Some(Self {
+            match_len,
+            max,
+            reply_match: num("ATLAS_DFLASH_COPY_REPLY_MATCH", 0, &|v| {
+                v > match_len && v <= 64
+            }),
+            miss_max: num("ATLAS_DFLASH_COPY_MISS_MAX", 0, &|v| v <= max),
+        })
+    }
+}
+
+fn settings() -> Option<&'static Settings> {
+    static S: OnceLock<Option<Settings>> = OnceLock::new();
+    S.get_or_init(|| Settings::parse(|name| std::env::var(name).ok()))
+        .as_ref()
+}
+
+/// A request's context: the committed tokens, then the pending one.
+#[derive(Clone, Copy)]
+struct Context<'a> {
+    history: &'a [u32],
+    pending: u32,
+}
+
+impl Context<'_> {
+    fn len(&self) -> usize {
+        self.history.len() + 1
+    }
+
+    fn at(&self, i: usize) -> u32 {
+        self.history.get(i).copied().unwrap_or(self.pending)
+    }
+
+    /// Key of the `n` tokens ending at `end`.
+    fn key(&self, end: usize, n: usize) -> u32 {
+        let h = crate::ngram::hash_tokens((end + 1 - n..=end).map(|i| self.at(i)));
+        (h ^ (h >> 32)) as u32
+    }
+
+    /// Whether the `n` tokens ending at `a` equal those ending at `b`.
+    fn same(&self, a: usize, b: usize, n: usize) -> bool {
+        a + 1 >= n && b + 1 >= n && (0..n).all(|i| self.at(a - i) == self.at(b - i))
+    }
+}
+
+/// One request's n-gram index: the newest end of each gram, and per end
+/// the previous end of the same gram.
+#[derive(Debug, Default)]
+struct Index {
+    n: usize,
+    /// Context positions before this are the prompt.
+    prompt: usize,
+    head: HashMap<u32, u32>,
+    prev: Vec<u32>,
+    /// Grams ending before this position are indexed.
+    indexed: usize,
+    /// Key of the gram ending at `indexed - 1` (detects a rewrite).
+    check: u32,
+}
+
+impl Index {
+    fn new(n: usize, prompt: usize) -> Self {
+        Self {
+            n: n.max(1),
+            prompt,
+            ..Self::default()
+        }
+    }
+
+    /// Index the grams that have a token after it (end before the last
+    /// position), [`INDEX_BUDGET`] at most, from scratch when the indexed
+    /// part was rewritten.
+    fn sync(&mut self, ctx: Context) {
+        let n = self.n;
+        let last = ctx.len() - 1;
+        if self.indexed > 0 && (self.indexed > last || ctx.key(self.indexed - 1, n) != self.check) {
+            *self = Self::new(n, self.prompt);
+        }
+        let end = last
+            .min(MAX_INDEXED)
+            .min(self.indexed.max(n - 1) + INDEX_BUDGET);
+        if end < n {
+            return;
+        }
+        if self.prev.len() < end {
+            self.prev.resize(end, NONE);
+        }
+        for e in self.indexed.max(n - 1)..end {
+            let key = ctx.key(e, n);
+            self.prev[e] = self.head.insert(key, e as u32).unwrap_or(NONE);
+            self.check = key;
+        }
+        self.indexed = self.indexed.max(end);
+    }
+
+    /// Whether the occurrence ending at `e` matches the context's tail,
+    /// with `reply_match` tokens when it starts inside the reply.
+    fn matches(&self, ctx: Context, e: usize, reply_match: usize) -> bool {
+        let tail = ctx.len() - 1;
+        let n = if reply_match > self.n && e + 1 >= self.prompt + self.n {
+            reply_match
+        } else {
+            self.n
+        };
+        ctx.same(e, tail, n)
+    }
+
+    /// Up to `k` drafts copied after an earlier occurrence of the context's
+    /// last `n` tokens (module doc); none when it never occurred.
+    fn propose(&mut self, ctx: Context, k: usize, reply_match: usize) -> Vec<u32> {
+        let len = ctx.len();
+        if k == 0 || len <= self.n {
+            return Vec::new();
+        }
+        self.sync(ctx);
+        let mut e = self
+            .head
+            .get(&ctx.key(len - 1, self.n))
+            .copied()
+            .unwrap_or(NONE);
+        let mut latest = None;
+        for _ in 0..MAX_HOPS {
+            if e == NONE {
+                break;
+            }
+            let at = e as usize;
+            if self.matches(ctx, at, reply_match) {
+                if at + k < len {
+                    return copy_after(ctx, at, k);
+                }
+                latest.get_or_insert(at);
+            }
+            e = self.prev[at];
+        }
+        latest.map_or_else(Vec::new, |at| copy_after(ctx, at, k))
+    }
+}
+
+/// The `k` tokens after position `e`, continuing over the copy itself past
+/// the context's end.
+fn copy_after(ctx: Context, e: usize, k: usize) -> Vec<u32> {
+    let len = ctx.len();
+    let mut out = Vec::with_capacity(k);
+    for p in e + 1..e + 1 + k {
+        let token = if p < len { ctx.at(p) } else { out[p - len] };
+        out.push(token);
+    }
+    out
+}
+
+/// Put `copy` in place of DFlash2's `drafts` (with confidences `conf`)
+/// unless it is empty or DFlash2's block already starts with it. Returns
+/// whether it did.
+fn merge(copy: &[u32], drafts: &mut Vec<u32>, conf: &mut Vec<f32>) -> bool {
+    if copy.is_empty() || drafts.starts_with(copy) {
+        return false;
+    }
+    drafts.clear();
+    drafts.extend_from_slice(copy);
+    conf.clear();
+    conf.resize(copy.len(), COPY_CONF);
+    true
+}
+
+/// A request's copy-draft state, embedded in its `AdaptState`.
+#[derive(Debug, Default)]
+pub(crate) struct CopyState {
+    index: Option<Index>,
+    /// Context length of the last offer (one offer a round).
+    offered: usize,
+    /// The last settled copy round kept fewer than all of its drafts.
+    missed: bool,
+    rounds: u64,
+    drafted: u64,
+    accepted: u64,
+}
+
+/// Offer a copy in place of `a`'s pending DFlash2 drafts (no-op with copy
+/// drafts off).
+pub(super) fn offer(a: &mut ActiveSeq) {
+    if let Some(s) = settings() {
+        offer_with(a, s);
+    }
+}
+
+fn offer_with(a: &mut ActiveSeq, s: &Settings) {
+    if a.grammar_state.is_some() || a.pending_drafts.is_empty() {
+        return;
+    }
+    let ctx = Context {
+        history: &a.seq.tokens,
+        pending: a.last_token,
+    };
+    let state = &mut a.spec_adapt.copy;
+    if state.offered == ctx.len() {
+        return;
+    }
+    state.offered = ctx.len();
+    let mut k = s.max.min(a.pending_drafts.len());
+    if state.missed && s.miss_max > 0 {
+        k = k.min(s.miss_max);
+    }
+    let prompt = ctx.len().saturating_sub(a.output_tokens.len());
+    let copy = state
+        .index
+        .get_or_insert_with(|| Index::new(s.match_len, prompt))
+        .propose(ctx, k, s.reply_match);
+    merge(&copy, &mut a.pending_drafts, &mut a.pending_draft_conf);
+}
+
+/// Book a verify of `drafted` drafts with confidences `conf` that accepted
+/// `accepted`; only copy rounds count.
+pub(super) fn settle(state: &mut CopyState, conf: &[f32], drafted: usize, accepted: usize) {
+    if conf.first() != Some(&COPY_CONF) {
+        return;
+    }
+    state.missed = accepted < drafted;
+    state.rounds += 1;
+    state.drafted += drafted as u64;
+    state.accepted += accepted as u64;
+}
+
+/// The request's copy line after its `Done:` line (copy rounds only).
+pub(super) fn log_done(state: &CopyState) {
+    if state.rounds > 0 {
+        tracing::info!(
+            "COPY DRAFTS rounds={} drafted={} accepted={}",
+            state.rounds,
+            state.drafted,
+            state.accepted
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "copy_drafts_tests.rs"]
+mod tests;
