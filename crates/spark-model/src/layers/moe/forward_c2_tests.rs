@@ -21,6 +21,8 @@ use std::sync::{Mutex, atomic::Ordering};
 mod decode_m16;
 #[path = "forward_independent_tests.rs"]
 mod independent;
+#[path = "shared_fork_tests.rs"]
+mod shared_fork;
 
 struct Comm<'a> {
     gpu: &'a Gpu,

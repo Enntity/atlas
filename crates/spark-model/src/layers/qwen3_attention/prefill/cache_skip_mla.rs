@@ -110,6 +110,23 @@ impl Qwen3AttentionLayer {
         }
     }
 
+    /// Whether [`Self::mla_prefill_dense`] runs `weight` at `m` rows on one
+    /// of its own kernels (its NVFP4 / MXFP8 tiers, or with cuBLAS off its
+    /// dense GEMMs) and not through `ops::bf16_gemm`, whose cuBLASLt
+    /// workspace is process-global (`ATLAS_GLM_LAYER_FORK` overlaps only
+    /// kernels that leave it alone).
+    pub(super) fn mla_dense_is_custom(
+        &self,
+        weight: &DenseWeight,
+        m: u32,
+        ctx: &ForwardContext,
+    ) -> bool {
+        let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(m);
+        (m <= 32 && tc.0 != 0 && self.mla_q4.iter().any(|(w, _)| *w == weight.weight))
+            || (m <= 32 && self.mla_mx.iter().any(|(w, ..)| *w == weight.weight))
+            || !use_cublas_mla_prefill(ctx.dispatch.cublas_gemm, m)
+    }
+
     /// Run the cache-skip MLA prefill chain. Always returns the output
     /// pointer — caller short-circuits with `return Ok(out)`.
     pub(super) fn prefill_attention_cache_skip_mla(

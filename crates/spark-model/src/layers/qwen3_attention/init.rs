@@ -348,6 +348,7 @@ impl Qwen3AttentionLayer {
             } else {
                 KernelHandle(0)
             },
+            index_fork: crate::layers::glm_layer_fork::index_lane(gpu, glm)?,
             glm_index_fill_causal_dev_k: if kv_dtype == KvCacheDtype::Fp8G128 {
                 gpu.kernel("glm_indexer", "glm_index_fill_causal_dev")?
             } else {

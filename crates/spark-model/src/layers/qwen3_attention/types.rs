@@ -247,6 +247,8 @@ pub struct Qwen3AttentionLayer {
     /// `fp8_g128` GLM latents -> BF16 view for the BF16 prefill kernels.
     /// Null unless the cache is `fp8_g128`.
     pub(super) glm_latent_dequant_k: KernelHandle,
+    /// `ATLAS_GLM_LAYER_FORK=index|1`: the side stream of the semantic index.
+    pub(super) index_fork: Option<crate::layers::glm_layer_fork::ForkLane>,
     /// Device-length causal index fill for dense fp8_g128 single-row decode.
     pub(super) glm_index_fill_causal_dev_k: KernelHandle,
     /// Fused k_norm + RoPE + paged BF16 cache write — eliminates two

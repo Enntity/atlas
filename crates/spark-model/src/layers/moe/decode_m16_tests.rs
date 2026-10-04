@@ -24,7 +24,7 @@ fn m16_tiles_cover_their_row_slabs_of_k128_aligned_experts() {
 
 /// How a routed FFN batch reaches the MoE.
 #[derive(Clone, Copy, PartialEq)]
-enum Entry {
+pub(super) enum Entry {
     /// One verify block through `forward_independent`.
     Independent,
     /// 3-row verify blocks of several owners through the C3 grouped
@@ -42,7 +42,7 @@ fn env_on(name: &str) -> bool {
 /// the width (`expert_tp`, the served topology) or this rank's half of the
 /// experts at full width; checks the launches the flags swap and returns the
 /// trace.
-fn verify_ffn(
+pub(super) fn verify_ffn(
     gpu: &Gpu,
     rank: usize,
     vector: bool,
@@ -368,7 +368,7 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
 
 /// The test binary re-run as `name` alone with `sentinel` set to `mode` and
 /// the routing every FFN test pins.
-fn ffn_child(name: &str, sentinel: &str, mode: &str) -> std::process::Command {
+pub(super) fn ffn_child(name: &str, sentinel: &str, mode: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", name, "--nocapture"])
         .env(sentinel, mode)

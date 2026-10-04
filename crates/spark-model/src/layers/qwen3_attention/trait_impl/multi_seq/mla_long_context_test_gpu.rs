@@ -6,6 +6,10 @@ use super::*;
 pub(super) struct TestGpu(
     pub(super) MockGpuBackend,
     pub(super) std::sync::Mutex<Vec<(u64, Vec<Vec<u8>>)>>,
+    /// Streams in call order: `L<stream>` per typed launch (parallel to `.1`),
+    /// `U<stream> <kernel>` per untyped one, `R<stream> <event>` /
+    /// `W<stream> <event>` per fence.
+    pub(super) std::sync::Mutex<Vec<String>>,
 );
 impl std::ops::Deref for TestGpu {
     type Target = MockGpuBackend;
@@ -92,6 +96,7 @@ impl GpuBackend for TestGpu {
         stream: u64,
         args: &[spark_runtime::gpu::KernelArg<'_>],
     ) -> Result<()> {
+        self.2.lock().unwrap().push(format!("L{stream}"));
         self.1.lock().unwrap().push((
             kernel.0,
             args.iter()
@@ -104,6 +109,14 @@ impl GpuBackend for TestGpu {
         self.0
             .launch_typed(kernel, grid, block, shared, stream, args)
     }
+    fn record_event(&self, event: u64, stream: u64) -> Result<()> {
+        self.2.lock().unwrap().push(format!("R{stream} {event}"));
+        Ok(())
+    }
+    fn stream_wait_event(&self, stream: u64, event: u64) -> Result<()> {
+        self.2.lock().unwrap().push(format!("W{stream} {event}"));
+        Ok(())
+    }
     fn launch(
         &self,
         kernel: KernelHandle,
@@ -113,6 +126,10 @@ impl GpuBackend for TestGpu {
         stream: u64,
         args: &mut [*mut std::ffi::c_void],
     ) -> Result<()> {
+        self.2
+            .lock()
+            .unwrap()
+            .push(format!("U{stream} {}", kernel.0));
         self.0.launch(kernel, grid, block, shared, stream, args)
     }
 }
