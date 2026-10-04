@@ -6,6 +6,8 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod carveout;
+
 #[derive(Debug)]
 pub struct MockAlloc {
     pub bytes: usize,
@@ -48,6 +50,8 @@ pub struct MockGpuBackend {
     /// [`Self::live_streams_and_events`]).
     live_streams: AtomicUsize,
     live_events: AtomicUsize,
+    /// Lendable carveout ([`Self::with_carveout`]); `None` = no carveout.
+    carveout: Mutex<Option<super::carveout::CarveoutArena>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +88,7 @@ impl MockGpuBackend {
             destroyed_graphs: AtomicUsize::new(0),
             live_streams: AtomicUsize::new(0),
             live_events: AtomicUsize::new(0),
+            carveout: Mutex::new(None),
         }
     }
 
@@ -263,8 +268,17 @@ impl GpuBackend for MockGpuBackend {
         {
             anyhow::bail!("mock free failed (injected): ptr {ptr}");
         }
+        self.carveout_release(ptr);
         self.allocs.lock().remove(&ptr.0);
         Ok(())
+    }
+
+    fn carveout_capacity(&self) -> usize {
+        self.carveout_bytes()
+    }
+
+    fn alloc_carveout(&self, bytes: usize) -> Result<DevicePtr> {
+        self.carveout_alloc(bytes)
     }
 
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
