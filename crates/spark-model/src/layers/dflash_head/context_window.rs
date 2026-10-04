@@ -6,14 +6,6 @@
 use super::BlockDiffusionDraftHead;
 
 impl BlockDiffusionDraftHead {
-    /// Rows of the per-sequence context accumulator: the drafter window,
-    /// capped at `max_seq_len`.
-    pub(super) fn ctx_window_len(&self) -> usize {
-        self.window_size
-            .unwrap_or(self.max_seq_len)
-            .min(self.max_seq_len)
-    }
-
     /// SWA window in tokens for the paged attention kernel. 0 = no window.
     ///
     /// The kernel masks `q_rope_pos - kv_slot >= window`, comparing the

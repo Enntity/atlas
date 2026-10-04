@@ -114,7 +114,16 @@ impl MoeLayer {
                 }
             })
             .collect();
-        let down_t = self.transpose_experts_gpu(gpu, &down_src, h, inter, routed_group)?;
+        // Owned checkpoint transforms keep their release callback; the normal
+        // unified path retains upstream's in-place allocation ownership.
+        let inplace = !keep_originals && release.is_none();
+        let mut scratch = super::inplace_transpose::TransposeScratch::new();
+        let down_t = if inplace {
+            self.transpose_experts_inplace(gpu, &down_src, h, inter, routed_group, &mut scratch)?
+        } else {
+            self.transpose_experts_gpu(gpu, &down_src, h, inter, routed_group)?
+        };
+        scratch.release(gpu)?;
         self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
         if !self.weights.shared_expert.down_proj.is_null() && shared_inter > 0 {
             self.shared_down_t = Some(self.weights.shared_expert.down_proj.transpose_for_gemm(
@@ -131,7 +140,7 @@ impl MoeLayer {
                     if let Some(release) = release.as_mut() {
                         release(index, false, expert.down_proj.weight)?;
                         release(index, true, expert.down_proj.weight_scale)?;
-                    } else {
+                    } else if !inplace {
                         gpu.free(expert.down_proj.weight)?;
                         gpu.free(expert.down_proj.weight_scale)?;
                     }

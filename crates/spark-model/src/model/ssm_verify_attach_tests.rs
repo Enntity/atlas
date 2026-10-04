@@ -13,6 +13,7 @@ fn pool(has_mtp: bool) -> SsmStatePool {
         3,
         false,
         crate::ssm_reserve::SsmRollbackMode::Snapshot,
+        false,
         &MockGpuBackend::new(),
     )
     .unwrap()
@@ -27,6 +28,9 @@ fn fresh() -> SsmLayerState {
         h_state_intermediates: Vec::new(),
         conv_state_intermediates: Vec::new(),
         kda_records: DevicePtr::NULL,
+        gdn_commit_qkv: DevicePtr(0),
+        gdn_commit_gb: DevicePtr(0),
+        gdn_commit_pending: false,
         h_is_f16: false,
         h_prefill_stage: None,
         ple: None,

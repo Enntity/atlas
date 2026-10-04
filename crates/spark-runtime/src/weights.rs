@@ -306,11 +306,6 @@ impl WeightStore {
         self.reclaimed.lock().map(|s| s.len()).unwrap_or(0)
     }
 
-    /// Take a weight out of the store; the caller then owns (and frees) it.
-    pub fn remove(&mut self, name: &str) -> Option<WeightTensor> {
-        self.weights.remove(name)
-    }
-
     /// Check if a weight exists.
     pub fn contains(&self, name: &str) -> bool {
         self.weights.contains_key(name)
@@ -484,10 +479,10 @@ mod exl3_dtype_tests;
 #[cfg(test)]
 mod packed_q2_tests;
 mod prefix_detect;
+mod skip;
 #[cfg(test)]
 #[path = "weights/store_edit_tests.rs"]
 mod store_edit_tests;
-mod skip;
 pub use prefix_detect::auto_detect_weight_prefix;
 
 /// Release every weight tensor.

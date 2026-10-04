@@ -24,7 +24,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
 
-use super::{BlockDiffusionDraftHead, DflashScratch, small_m_gemm};
+use super::{BlockDiffusionDraftHead, DflashScratch};
 use crate::layer::ForwardContext;
 use crate::layers::ops::{self, DENSE_GEMV_BATCHM_MAX_M};
 
@@ -117,7 +117,7 @@ impl BlockDiffusionDraftHead {
         let ctx_slot_bytes = (target_hidden_dim as usize) * 2;
         let row_stride = self.num_layers * 2 * (kv_dim as usize) * 2;
         let small_m_gemv_active =
-            small_m_gemm::small_m_gemv_enabled() && self.kernels.dense_gemv_batchm.0 != 0;
+            self.kernels.small_m_gemv && self.kernels.dense_gemv_batchm.0 != 0;
         let counts: Vec<usize> = pending.iter().map(|c| c.count).collect();
         let offsets = plan_ctx_chunks(&counts, small_m_gemv_active, self.batch_ctx_rows);
 
@@ -145,6 +145,19 @@ impl BlockDiffusionDraftHead {
                 true,
                 scratch,
             )
+        };
+
+        // Keep per-sequence numerical dispatch when GLM's optional twins or
+        // tensor-core tiers (or cuBLASLt's row threshold) depend on chunk size.
+        let offsets = if self.twins.ctx_q4.is_some()
+            || self.drafter_cublas
+            || (self.kernels.small_m_gemv
+                && self.kernels.dense_gemv_tc16.0 != 0
+                && self.kernels.dense_gemv_tc32.0 != 0)
+        {
+            None
+        } else {
+            offsets
         };
 
         let Some(offsets) = offsets else {
