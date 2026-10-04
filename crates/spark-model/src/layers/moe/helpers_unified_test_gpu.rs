@@ -16,6 +16,7 @@ pub(super) enum Event {
     Alloc(DevicePtr, usize),
     H2d(DevicePtr, Vec<u8>),
     D2h(DevicePtr, usize),
+    D2d(DevicePtr, DevicePtr, usize),
     Free(DevicePtr),
     Sync(u64),
     Launch(u64, [u32; 3], [u32; 3], u32, u64, Vec<Arg>),
@@ -123,8 +124,20 @@ impl GpuBackend for RecordingGpu {
         b.copy_from_slice(&self.read(p, b.len()));
         Ok(())
     }
-    fn copy_d2d(&self, _: DevicePtr, _: DevicePtr, _: usize) -> Result<()> {
-        bail!("unexpected D2D")
+    fn copy_d2d(&self, src: DevicePtr, dst: DevicePtr, n: usize) -> Result<()> {
+        Self::record(&mut self.state.lock().unwrap(), Event::D2d(src, dst, n))?;
+        let bytes = self.read(src, n);
+        let mut s = self.state.lock().unwrap();
+        let (&base, _) = s
+            .bytes
+            .range(..=dst.0)
+            .next_back()
+            .expect("D2D destination");
+        let offset = (dst.0 - base) as usize;
+        let dest = s.bytes.get_mut(&base).unwrap();
+        ensure!(offset + n <= dest.len(), "D2D destination bounds");
+        dest[offset..offset + n].copy_from_slice(&bytes);
+        Ok(())
     }
     fn launch(
         &self,

@@ -216,19 +216,17 @@ fn every_legacy_io_failure_stops_at_exact_prefix_and_preserves_nulling_order() {
                 {
                     for (p, w) in projections(current).iter().enumerate() {
                         let src = projections(&originals[e])[p];
-                        let paired_free_succeeded =
-                            good[..at - 1].contains(&Event::Free(src.weight_scale));
-                        assert_eq!(
-                            w.weight,
-                            if paired_free_succeeded {
-                                DevicePtr::NULL
-                            } else {
-                                src.weight
-                            }
-                        );
+                        let nulled = if e < 4 && mode < 2 {
+                            // Routed allocations are reused. Native fields are
+                            // invalidated after the shared phase succeeds.
+                            publication[if p < 2 { 4 } else { 5 }] + 1 < at
+                        } else {
+                            good[..at - 1].contains(&Event::Free(src.weight_scale))
+                        };
+                        assert_eq!(w.weight, if nulled { DevicePtr::NULL } else { src.weight });
                         assert_eq!(
                             w.weight_scale,
-                            if paired_free_succeeded {
+                            if nulled {
                                 DevicePtr::NULL
                             } else {
                                 src.weight_scale

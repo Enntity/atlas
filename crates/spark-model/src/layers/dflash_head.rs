@@ -824,6 +824,8 @@ mod batch_plan;
 mod batch_projection;
 mod batch_propose;
 mod batch_tail_dflash2;
+#[cfg(test)]
+mod batch_tail_dflash2_tests;
 mod batched_ctx;
 mod carry;
 mod lifecycle;
