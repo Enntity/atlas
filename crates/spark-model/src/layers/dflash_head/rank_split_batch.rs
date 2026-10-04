@@ -156,6 +156,15 @@ impl<'a> BatchSplitGuard<'a> {
             stream,
         })
     }
+
+    /// Issues the swaps the propose did not reach and returns a failed drain,
+    /// which a drop can only log.
+    pub(super) fn finish(mut self) -> Result<()> {
+        match self.split.take() {
+            Some((split, comm)) => split.finish(comm, self.stream),
+            None => Ok(()),
+        }
+    }
 }
 
 impl Drop for BatchSplitGuard<'_> {
