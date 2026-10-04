@@ -133,6 +133,26 @@ pub(super) fn test_owned_seq(
     (a, rx)
 }
 
+/// Grammar fixtures share one vocabulary: a token per ASCII byte, `<eos>`,
+/// `<think>`, `</think>`, padded to the 2048-token test model's vocabulary.
+pub(super) const GRAMMAR_VOCAB: usize = 2048;
+pub(super) const GRAMMAR_EOS: u32 = 128;
+pub(super) const THINK_START: u32 = 1000;
+pub(super) const THINK_END: u32 = 1001;
+
+pub(super) fn grammar_engine() -> crate::grammar::GrammarEngine {
+    let vocab: Vec<String> = (0..GRAMMAR_VOCAB as u32)
+        .map(|t| match t {
+            0..128 => (t as u8 as char).to_string(),
+            GRAMMAR_EOS => "<eos>".into(),
+            THINK_START => "<think>".into(),
+            THINK_END => "</think>".into(),
+            _ => format!("<pad{t}>"),
+        })
+        .collect();
+    crate::grammar::GrammarEngine::new(&vocab, &[GRAMMAR_EOS as i32]).unwrap()
+}
+
 /// A 3-token, 600-max-token request with neutral sampling; `$extra` supplies
 /// the variant's channel (and a streaming request's cancel flag).
 macro_rules! test_request {

@@ -901,6 +901,15 @@ pub trait Model: Send + Sync {
     /// argmax. Variable-length γ (vs fixed K=2/3/4) because it's a drafter
     /// config field. CUDA-graph capture keyed by `(slot_idx, tokens.len())`.
     /// Default routes to `decode_verify_graphed_kgamma`.
+    /// Stage per-row grammar bitmasks for the next K-row DFlash verify on
+    /// every rank (`ATLAS_GLM_STRICT_SPEC`): `rows * ceil(vocab / 32)` words,
+    /// row r the matcher state that verify row r is picked under. Sent after
+    /// the verify tokens and before `decode_verify_dflash`. A model that
+    /// cannot mask its verify refuses, so strict output is never unmasked.
+    fn stage_verify_row_masks(&self, _rows: usize, _masks: &[u32]) -> Result<()> {
+        bail!("this model cannot grammar-mask a speculative verify")
+    }
+
     fn decode_verify_dflash(
         &self,
         tokens: &[u32],
