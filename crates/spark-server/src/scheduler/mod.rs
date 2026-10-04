@@ -74,6 +74,7 @@ mod spec_capacity;
 pub mod spec_stats;
 mod spec_step;
 mod ssm_decode_ring;
+mod strict_spec;
 mod teardown;
 #[cfg(test)]
 mod test_support;
@@ -777,6 +778,12 @@ pub fn run(
             // serial-in-think unless this lever is on. Resume guard still
             // serial-decodes the spec-entry window.
             let dflash_spec_think = sched.levers.dflash_spec_think;
+            // ATLAS_GLM_STRICT_SPEC=1: strict structured-output sequences
+            // speculate too, on the DFlash lane whose verify the GLM split head
+            // grammar-masks row by row (`strict_spec`). Anywhere else they stay
+            // serial.
+            let strict_spec =
+                strict_spec::enabled(&sched.levers, &*model, dflash_verify_raw_argmax);
             // Spec dispatch additionally requires every active sequence's
             // SSM slot to be covered by the MTP verify state pools
             // (intermediates + checkpoints), which are sized to
@@ -960,6 +967,7 @@ pub fn run(
                             dflash_spec_think,
                             dflash_resume_guard,
                             dflash_verify_raw_argmax,
+                            strict_spec,
                         )
                     })
                 )

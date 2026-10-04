@@ -197,7 +197,10 @@ pub use ngram::step_ngram;
 /// `emit_token`, while the MTP propose call borrows the model immutably —
 /// cloning sidesteps the lifetime overlap.
 pub fn mtp_grammar_mask_for(a: &mut ActiveSeq) -> Option<Vec<i32>> {
-    if a.inside_thinking {
+    // A strict grammar speculating (`strict_spec`) drafts unmasked: a drafter
+    // mask would cost the propose its graph and its rank split, and the
+    // verify trims any draft the grammar refuses.
+    if a.inside_thinking || a.strict_grammar() {
         return None;
     }
     let gs = a.grammar_state.as_mut()?;
