@@ -2288,3 +2288,6 @@ extern "C" __global__ void __launch_bounds__(W4A16_TC_WARPS * WARP_SIZE) w4a16_g
     w4a16_gemv_tc_pair<4>(A, B0, S0, scale0, C0, B1, S1, scale1, C1, M, N, K, touch_rows, touch_ctas);
 }
 #endif
+
+// ATLAS_GLM_L2_AHEAD: the side-stream weight prefetch (l2_ahead.rs).
+#include "glm_l2_ahead.cuh"

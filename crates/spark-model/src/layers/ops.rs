@@ -131,6 +131,8 @@ mod kv_cache_fp8k;
 mod kv_cache_glm;
 #[path = "ops/kv_cache_turbok.rs"]
 mod kv_cache_turbok;
+#[path = "ops/l2_ahead.rs"]
+mod l2_ahead;
 #[path = "ops/lora_delta.rs"]
 pub mod lora_delta;
 #[path = "ops/marlin_nvfp4.rs"]
@@ -276,6 +278,10 @@ pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
 pub use kv_cache_glm::*;
 pub use kv_cache_turbok::*;
+pub use l2_ahead::{
+    L2_REGIONS, L2Region, L2Site, l2_ahead_enabled, l2_ahead_prefetch, l2_ahead_resolve,
+    l2_budgeted,
+};
 pub use marlin_nvfp4::*;
 pub use marlin_nvfp4_pack::marlin_pack_nvfp4;
 pub use model_levers::ModelLevers;

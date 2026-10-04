@@ -26,6 +26,64 @@ pub(super) fn enabled(model: &str) -> Result<bool> {
 }
 
 impl Qwen3AttentionLayer {
+    /// `ATLAS_GLM_L2_AHEAD`: what [`Self::paged_glm_projection`] reads of
+    /// `weight` (`n` rows by `k`) for `m` rows, as `mla_prefill_dense` picks
+    /// it: the NVFP4 or MXFP8 twin, else the BF16 weight.
+    pub(crate) fn paged_glm_reads(
+        &self,
+        weight: &DenseWeight,
+        [m, n, k]: [u32; 3],
+        ctx: &ForwardContext,
+    ) -> Result<Vec<ops::L2Region>> {
+        if enabled(&ctx.config.model_type)? && m <= 32 {
+            let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(m).0 != 0;
+            if let Some((_, q4)) = self.mla_q4.iter().find(|(w, _)| tc && *w == weight.weight) {
+                return Ok(ops::L2Region::nvfp4(q4, n, k, k / 2, k / 16).to_vec());
+            }
+            if let Some((.., mx)) = self.mla_mx.iter().find(|(w, ..)| *w == weight.weight) {
+                return Ok(ops::L2Region::mxfp8(mx, n as usize, k as usize).to_vec());
+            }
+        }
+        Ok(vec![ops::L2Region::whole(
+            weight.weight,
+            n as usize * k as usize * 2,
+        )])
+    }
+
+    /// `ATLAS_GLM_L2_AHEAD`: the sparse-MLA projections a verify of `rows`
+    /// rows reads first: q_a, kv_a, then q_b (`l2_ahead_lead`).
+    pub(crate) fn glm_l2_ahead_lead(
+        &self,
+        rows: u32,
+        ctx: &ForwardContext,
+    ) -> Result<Vec<ops::L2Region>> {
+        let Some(mla) = self.mla.as_ref().filter(|m| m.glm_indexer.is_some()) else {
+            return Ok(Vec::new());
+        };
+        let h = ctx.config.hidden_size as u32;
+        let (q_lora, kv_lora) = (mla.q_lora_rank as u32, mla.kv_lora_rank as u32);
+        let mut lead = self.paged_glm_reads(&mla.wq_a, [rows, q_lora, h], ctx)?;
+        lead.extend(self.paged_glm_reads(&mla.wkv_a, [rows, kv_lora, h], ctx)?);
+        lead.extend(self.glm_q_b_reads(rows, ctx)?);
+        Ok(lead)
+    }
+
+    /// What q_b reads for `rows` rows.
+    pub(crate) fn glm_q_b_reads(
+        &self,
+        rows: u32,
+        ctx: &ForwardContext,
+    ) -> Result<Vec<ops::L2Region>> {
+        let Some(mla) = self.mla.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let nq = self
+            .num_q_heads_override
+            .unwrap_or(ctx.config.num_attention_heads) as u32;
+        let n = nq * mla.nope as u32;
+        self.paged_glm_reads(&mla.wq_b, [rows, n, mla.q_lora_rank as u32], ctx)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn paged_glm_projection(
         &self,

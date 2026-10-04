@@ -10,6 +10,7 @@ use atlas_core::config::LayerType;
 use std::time::Instant;
 
 use super::super::block_mgmt::ensure_blocks_through_decode;
+use super::super::l2_ahead_comm::L2AheadComm;
 use super::super::types::TransformerModel;
 use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};
 use crate::layers::ops;
@@ -145,6 +146,16 @@ impl TransformerModel {
             )?;
         }
 
+        // ATLAS_GLM_L2_AHEAD (sites a, f): an eager step's layers talk through
+        // a communicator that forks the next weights' L2 prefetch before each
+        // all-reduce (`model::l2_ahead_comm`).
+        let gpu = self.gpu.as_ref();
+        let l2_fire =
+            |site, regions: &[ops::L2Region], s| ops::l2_ahead_prefetch(gpu, s, site, regions);
+        let l2_ahead = self
+            .comm_ref()
+            .filter(|_| !use_graphs && !crate::model::verify_pieces::requested())
+            .and_then(|comm| L2AheadComm::new(comm, &l2_fire));
         let ctx = ForwardContext {
             ssm_batch: None,
             buffers: &self.buffers,
@@ -156,7 +167,10 @@ impl TransformerModel {
             stats: &self.stats,
             attn_metadata: Some(metadata),
             profile: verify_profile,
-            comm: self.comm_ref(),
+            comm: match &l2_ahead {
+                Some(l2) => Some(l2 as &dyn spark_comm::CommBackend),
+                None => self.comm_ref(),
+            },
             graph_capture: use_graphs,
             gdn_exact_replay: false,
             token_ids: None,
@@ -258,6 +272,13 @@ impl TransformerModel {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 if pieces && self.kgamma_kda_run(layer_idx, k, seq, &mut kv_cache, &ctx, stream)? {
                     continue;
+                }
+                if let Some(l2) = &l2_ahead {
+                    let lead = |l: &dyn crate::layer::TransformerLayer, ffn| {
+                        l.l2_ahead_lead(ffn, k as u32, &ctx)
+                    };
+                    let next = self.layers.get(layer_idx + 1).map(|n| lead(&**n, false));
+                    l2.begin_layer(lead(&**layer, true), next.unwrap_or_default());
                 }
                 let layer_type = self.config.layer_type(layer_idx);
                 let layer_started = if verify_profile {

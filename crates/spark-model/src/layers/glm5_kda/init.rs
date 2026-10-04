@@ -66,6 +66,8 @@ impl Glm5KdaLayer {
             |func| super::super::try_kernel_gated(triple_fits, gpu, "dense_gemv_bf16_batchm", func);
         // ATLAS_GLM_DECODE_GEMV_BATCH: the GEMV touch twins live in this target only.
         super::super::ops::gemv_touch_resolve(gpu);
+        // ATLAS_GLM_L2_AHEAD: the side-stream prefetch kernel lives here too.
+        super::super::ops::l2_ahead_resolve(gpu);
         let layer = Self {
             input_norm,
             post_attn_norm,

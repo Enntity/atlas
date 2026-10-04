@@ -51,6 +51,23 @@ impl MoeLayer {
         )
     }
 
+    /// Whether [`Self::forward_k5_for_hc`] defers the shared expert: it then
+    /// runs whole after the routed experts, its blend left to the mHC post.
+    pub(crate) fn k5_defers_shared(
+        &self,
+        allow_deferred_shared_hc: bool,
+        ctx: &ForwardContext,
+    ) -> bool {
+        allow_deferred_shared_hc
+            && k5_fused_moe_hc_requested()
+            && self.use_btile_or_t_prefill()
+            && k5_grouped_moe_requested()
+            && ctx.config.model_type == "glm5_next"
+            && ctx.config.ep_world_size == 2
+            && ctx.comm.is_some()
+            && ctx.config.shared_expert_intermediate_size > 0
+    }
+
     /// K=5 variant for a caller that can consume the shared-expert blend
     /// directly inside its hyperconnection post kernel. The returned optional
     /// pointer is the shared gate weight; `Some` means `moe_output` contains
@@ -64,15 +81,7 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<(DevicePtr, Option<DevicePtr>)> {
         self.btile_input_guard(input, 5, ctx, stream)?;
-        let defer = allow_deferred_shared_hc
-            && k5_fused_moe_hc_requested()
-            && self.use_btile_or_t_prefill()
-            && k5_grouped_moe_requested()
-            && ctx.config.model_type == "glm5_next"
-            && ctx.config.ep_world_size == 2
-            && ctx.comm.is_some()
-            && ctx.config.shared_expert_intermediate_size > 0;
-        if defer {
+        if self.k5_defers_shared(allow_deferred_shared_hc, ctx) {
             self.forward_prefill_impl(input, 5, ctx, stream, true)?;
             return Ok((
                 ctx.buffers.moe_output(),
