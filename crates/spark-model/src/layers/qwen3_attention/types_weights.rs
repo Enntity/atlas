@@ -208,7 +208,9 @@ pub struct HcSiteWeights {
     /// The checkpoint's own `fn` when it is stored as BF16 (then `hc_fn` is
     /// its exact widening): read by the decode seam's BF16-weight partial
     /// (`ATLAS_GLM_HC_SEAM_ILP`). A weight-store pointer, never allocated
-    /// here; NULL otherwise.
+    /// here: valid while the store keeps that checkpoint tensor (for the
+    /// model's life today; a loader that retires consumed checkpoint tensors
+    /// must keep it or set this NULL). NULL otherwise.
     pub hc_fn_bf16: DevicePtr,
     /// Mix bias `base`: `[mix_hc]` f32.
     pub hc_base: DevicePtr,
