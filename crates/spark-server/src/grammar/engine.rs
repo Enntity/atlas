@@ -24,9 +24,6 @@ use super::extract_ordered_vocab;
 pub struct GrammarEngine {
     pub(super) compiler: GrammarCompiler,
     vocab_size: usize,
-    /// Largest compiled response_format grammar accepted
-    /// ([`super::compile_misc::MAX_SCHEMA_GRAMMAR_BYTES`]); settable in tests.
-    pub(crate) max_schema_grammar_bytes: usize,
 }
 
 // SAFETY: GrammarEngine is initialized on the main thread and moved to the
@@ -145,7 +142,7 @@ impl GrammarEngine {
 
     fn from_tokenizer_info(tokenizer_info: TokenizerInfo) -> Result<Self, GrammarError> {
         let vocab_size = tokenizer_info.vocab_size();
-        // Single compilation thread, cache enabled, no memory limit.
+        // Single compilation thread, cache enabled and bounded.
         // ★ NOT -1 (unlimited). `CacheKey::Schema` is keyed by the full tool
         // schema, so agentic traffic mints a distinct compiled grammar per
         // request; unbounded, that grew host RSS ~100 MB/min under BFCL and is
@@ -153,12 +150,13 @@ impl GrammarEngine {
         // above any realistic hot set (tens of schemas) while bounding the
         // tail. `-1` remains available as an explicit opt-in for callers that
         // genuinely want every grammar pinned.
-        let compiler = GrammarCompiler::new(&tokenizer_info, 1, true, GRAMMAR_CACHE_BUDGET_BYTES)
-            .map_err(GrammarError::Compilation)?;
+        let mut compiler =
+            GrammarCompiler::new(&tokenizer_info, 1, true, GRAMMAR_CACHE_BUDGET_BYTES)
+                .map_err(GrammarError::Compilation)?;
+        compiler.set_max_schema_grammar_bytes(super::compile_misc::MAX_SCHEMA_GRAMMAR_BYTES);
         Ok(Self {
             compiler,
             vocab_size,
-            max_schema_grammar_bytes: super::compile_misc::MAX_SCHEMA_GRAMMAR_BYTES,
         })
     }
 
