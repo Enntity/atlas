@@ -654,6 +654,18 @@ impl TransformerModel {
                 None => return Ok(None),
             }
         }
+        // ATLAS_GLM_DRAFT_TP_BATCH: a batched propose that swaps halves with
+        // the worker carries the communicator, and is announced with its rows
+        // right before it runs.
+        let grammar = grammar_bitmasks.is_some_and(|m| m.iter().any(Option::is_some));
+        let split = self.draft_split_batch(proposer, tokens.len(), grammar);
+        if let Some((_, rows)) = split {
+            self.announce_draft_split_rows(rows)?;
+        }
+        let ctx = ForwardContext {
+            comm: split.map(|(comm, _)| comm),
+            ..ctx
+        };
         proposer.propose_batch(
             tokens,
             &hiddens,
