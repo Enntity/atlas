@@ -157,7 +157,12 @@ fn verify_ffn(
     // ATLAS_GLM_MOE_DOWN_ZSKIP only the down.
     let stream = env_on("ATLAS_GLM_MOE_DECODE_M16")
         && env_on("ATLAS_GLM_MOE_DECODE_STREAM")
-        && gpu.missing.lock().unwrap().is_empty();
+        && !gpu
+            .missing
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|name| !name.ends_with("_l2pf"));
     let family = match (stream, rows as u32 <= MAX_ROWS) {
         (false, _) => "m16",
         (true, true) => "m16s",
@@ -168,12 +173,37 @@ fn verify_ffn(
     } else {
         ""
     };
-    let gate_up_name = format!("glm_moe_decode_{family}_gate_up_silu_k128w");
-    let down_name = format!("glm_moe_decode_{family}_k128w{skip}");
+    // ATLAS_GLM_MOE_DECODE_L2PF (with the stream twins) swaps in their
+    // prefetching twins (=2: the gate/up only), unless the target lacks one.
+    let l2pf = std::env::var("ATLAS_GLM_MOE_DECODE_L2PF").ok();
+    let prefetch = stream
+        && matches!(l2pf.as_deref(), Some("1" | "2"))
+        && !gpu
+            .missing
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|name| name.ends_with("_l2pf"));
+    let suffix = |on: bool| if on { "_l2pf" } else { "" };
+    let gate_up_name = format!(
+        "glm_moe_decode_{family}_gate_up_silu_k128w{}",
+        suffix(prefetch)
+    );
+    let down_name = format!(
+        "glm_moe_decode_{family}_k128w{skip}{}",
+        suffix(prefetch && l2pf.as_deref() == Some("1"))
+    );
     let [gate_up, down] = [gate_up_name.as_str(), down_name.as_str()].map(launches);
     // No other twin launches.
     for other in ["m16", "m16s", "m32s"] {
-        for kernel in ["gate_up_silu_k128w", "k128w", "k128w_zskip"] {
+        for kernel in [
+            "gate_up_silu_k128w",
+            "k128w",
+            "k128w_zskip",
+            "gate_up_silu_k128w_l2pf",
+            "k128w_l2pf",
+            "k128w_zskip_l2pf",
+        ] {
             let name = format!("glm_moe_decode_{other}_{kernel}");
             if name != gate_up_name && name != down_name {
                 assert!(launches(&name).is_empty(), "{name}");
@@ -269,10 +299,15 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
         // then the stream twins, alone (ignored), with M16, with the skip
         // and with the K128W control; then with M16 (and the skip) on a
         // target that lacks a two-slab (or one-slab) stream kernel, which
-        // runs the M16 pair as without the stream flag.
+        // runs the M16 pair as without the stream flag; then the L2 prefetch
+        // twins (1, and 2: gate/up only) with the stream twins, with and
+        // without the skip, without the stream twins (ignored), alone
+        // (ignored), and on a target lacking a prefetching down, which keeps
+        // the stream twins.
         for mode in [
-            "00000", "10000", "11000", "01000", "00100", "10100", "00010", "10010", "11010",
-            "10110", "10011", "11012",
+            "000000", "100000", "110000", "010000", "001000", "101000", "000100", "100100",
+            "110100", "101100", "100110", "110120", "100101", "110101", "110102", "100102",
+            "100001", "000001", "110131",
         ] {
             let flag = |i: usize| &mode[i..=i];
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
@@ -283,6 +318,7 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
                 .env("ATLAS_GLM_MOE_DECODE_K128W", flag(2))
                 .env("ATLAS_GLM_MOE_DECODE_STREAM", flag(3))
                 .env(MISSING, flag(4))
+                .env("ATLAS_GLM_MOE_DECODE_L2PF", flag(5))
                 .env("ATLAS_GLM_INDEPENDENT_DECODE", "1")
                 .env("ATLAS_GLM_C3_GROUPED_MOE", "1")
                 .env("ATLAS_MOE_PREQUANT_K128", "1")
@@ -335,6 +371,7 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
             let missing = match std::env::var(MISSING).as_deref() {
                 Ok("1") => Some("glm_moe_decode_m32s_gate_up_silu_k128w"),
                 Ok("2") => Some("glm_moe_decode_m16s_k128w_zskip"),
+                Ok("3") => Some("glm_moe_decode_m32s_k128w_zskip_l2pf"),
                 _ => None,
             };
             gpu.missing
@@ -363,6 +400,7 @@ fn decode_flags_require_0_or_1() {
             "ATLAS_GLM_MOE_DOWN_ZSKIP",
             "ATLAS_GLM_MOE_DECODE_K128W",
             "ATLAS_GLM_MOE_DECODE_STREAM",
+            "ATLAS_GLM_MOE_DECODE_L2PF",
         ] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", name.split_once("::").unwrap().1])
