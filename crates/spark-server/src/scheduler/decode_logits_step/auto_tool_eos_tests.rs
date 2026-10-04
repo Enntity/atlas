@@ -59,6 +59,7 @@ fn auto_tools_plain_eos_is_not_held_by_sticky_request() {
             host_logits: true,
             cancel_after_sampling: None,
             cancel_after_row_commit: None,
+            verify: None,
         },
         &mut rows,
         DevicePtr::NULL,

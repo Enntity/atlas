@@ -458,7 +458,10 @@ impl TransformerModel {
             ]));
         }
 
-        self.check_glm_k5_bf16_head(k, &out, stream)?;
+        // The diagnostic compares against an unmasked head; masked rows differ.
+        if allow.is_none() {
+            self.check_glm_k5_bf16_head(k, &out, stream)?;
+        }
 
         // See decode_verify_graphed for rationale on `seq_len += k` fix.
         for &t in tokens {

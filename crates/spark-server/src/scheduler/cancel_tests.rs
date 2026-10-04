@@ -56,6 +56,7 @@ fn non_spec_preset_cancel_retires_without_committing_sampled_token() {
             host_logits: false,
             cancel_after_sampling: None,
             cancel_after_row_commit: None,
+            verify: None,
         },
         &mut rows,
         &SchedCtx::for_test(),
@@ -86,6 +87,7 @@ fn non_spec_cancel_after_sampling_is_rechecked_before_commit() {
             host_logits: false,
             cancel_after_sampling: Some(flag),
             cancel_after_row_commit: None,
+            verify: None,
         },
         &mut rows,
         &SchedCtx::for_test(),
@@ -109,6 +111,7 @@ fn non_spec_midbatch_cancel_preserves_other_rows_and_original_mapping() {
             host_logits: false,
             cancel_after_sampling: None,
             cancel_after_row_commit: Some(flag),
+            verify: None,
         },
         &mut rows,
         &SchedCtx::for_test(),
@@ -179,6 +182,7 @@ fn cancelled_host_sampling_preserves_request_adaptive_state_serial_and_parallel(
         host_logits: true,
         cancel_after_sampling: None,
         cancel_after_row_commit: None,
+        verify: None,
     };
     for n in [1, 3] {
         let mut rows = Vec::new();
@@ -254,6 +258,7 @@ fn non_spec_without_cancel_still_enforces_token_and_context_limits() {
                 host_logits: false,
                 cancel_after_sampling: None,
                 cancel_after_row_commit: None,
+                verify: None,
             },
             &mut rows,
             &sched,
@@ -323,6 +328,7 @@ fn buffered_disconnect_retires_at_decode_boundary() {
             host_logits: false,
             cancel_after_sampling: None,
             cancel_after_row_commit: None,
+            verify: None,
         },
         &mut rows,
         &SchedCtx::for_test(),

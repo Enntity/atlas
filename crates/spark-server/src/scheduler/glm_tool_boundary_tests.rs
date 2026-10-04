@@ -44,6 +44,7 @@ fn exercise_emit(decode: bool, tools: bool, boundary: Option<u32>, suppress: boo
                 host_logits: true,
                 cancel_after_sampling: None,
                 cancel_after_row_commit: None,
+                verify: None,
             },
             &mut rows,
             DevicePtr::NULL,

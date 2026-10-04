@@ -49,7 +49,9 @@ pub struct SchedLevers {
     pub dflash_spec_think: bool,
     /// `ATLAS_GLM_STRICT_SPEC=1`: strict structured-output sequences keep
     /// DFlash speculation, every verify row grammar-masked at its own position
-    /// (`scheduler::strict_spec`). Off: they decode serially.
+    /// (`scheduler::strict_spec`). Off: they decode serially. As for any
+    /// DFlash verify, the verified positions are greedy: the request's
+    /// temperature, top_p/top_k/min_p and penalties do not apply there.
     pub glm_strict_spec: bool,
     /// Mean accepted drafts below which adaptive speculation suspends.
     pub dflash_adaptive_min: f32,

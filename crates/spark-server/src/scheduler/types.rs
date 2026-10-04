@@ -471,13 +471,13 @@ impl ActiveSeq {
         self.pending_drafts = drafts;
     }
 
-    /// A `response_format` grammar is engaged. Such a sequence never
-    /// speculates: every emitted token must be sampled from logits masked at
-    /// its own position, which the verify paths cannot guarantee (the GLM TP2
-    /// vocab-split verify head returns raw argmax ids only —
-    /// `Model::verify_logits_argmax_only` — and rows after a `</think>` inside
-    /// an accepted span are picked as if still thinking). Serial decode masks
-    /// every token through the logits pipeline.
+    /// A `response_format` grammar is engaged. Unless ATLAS_GLM_STRICT_SPEC
+    /// masks its verify row by row (`strict_spec`), such a sequence decodes
+    /// serially: every emitted token must be sampled from logits masked at
+    /// its own position, which the unmasked verify paths cannot guarantee
+    /// (the GLM TP2 vocab-split verify head returns raw argmax ids only —
+    /// `Model::verify_logits_argmax_only` — and rows after a `</think>`
+    /// inside an accepted span are picked as if still thinking).
     ///
     /// Its output is also exempt from the tool-turn content guards (the
     /// post-think content cap and the content-loop watchdog): the grammar
