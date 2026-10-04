@@ -72,7 +72,7 @@ fn repeated_large_schemas_stay_within_the_cache_bound() {
 #[test]
 fn a_schema_past_the_limits_is_refused() {
     let mut engine = engine();
-    engine.max_schema_grammar_bytes = 64 << 10;
+    engine.compiler.set_max_schema_grammar_bytes(64 << 10);
     let err = engine
         .compile_json_schema(&keyed_object(96, "m"))
         .unwrap_err();
@@ -83,4 +83,30 @@ fn a_schema_past_the_limits_is_refused() {
     );
     let err = engine.compile_json_schema(&huge).unwrap_err();
     assert!(err.to_string().contains("limit"), "{err}");
+}
+
+/// ~40 KB of schema whose `[^"]{min,max}` strings expand past the 32,768
+/// rules an FSM edge can name: refused, never a wrapped id or a panic.
+pub(crate) fn too_many_rules_schema() -> String {
+    let props: Vec<String> = (0..760)
+        .map(|i| {
+            let min = i % 64;
+            format!(
+                "\"p{i}\":{{\"type\":\"string\",\"minLength\":{min},\"maxLength\":{}}}",
+                min + 50 + i % 13
+            )
+        })
+        .collect();
+    format!(
+        "{{\"type\":\"object\",\"properties\":{{{}}}}}",
+        props.join(",")
+    )
+}
+
+#[test]
+fn a_schema_past_the_fsm_encoding_is_refused() {
+    let err = engine()
+        .compile_json_schema(&too_many_rules_schema())
+        .unwrap_err();
+    assert!(err.to_string().contains("grammar too large"), "{err}");
 }
