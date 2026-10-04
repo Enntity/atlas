@@ -24,9 +24,28 @@ fn lone(conf: &[f32]) -> usize {
 fn bins_cover_the_confidence_range_in_order() {
     assert_eq!(bin(f32::NEG_INFINITY), 0);
     assert_eq!(bin(-1.5), 1);
-    assert_eq!(bin(-0.02), BINS - 2);
-    assert_eq!(bin(0.0), BINS - 1);
-    assert!(PRIOR.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(bin(-0.02), COPY_BIN - 2);
+    assert_eq!(bin(0.0), COPY_BIN - 1);
+    assert!(PRIOR[..COPY_BIN].windows(2).all(|w| w[0] < w[1]));
+    // A copied draft bins apart from every drafter confidence.
+    assert_eq!(bin(COPY_CONF), COPY_BIN);
+    assert_eq!(COPY_BIN, BINS - 1);
+}
+
+#[test]
+fn copied_drafts_are_measured_and_calibrate_only_their_own_bin() {
+    let mut policy = Policy::default();
+    // A lone owner holding copies verifies them under the copy prior.
+    let copies = [COPY_CONF; 7];
+    assert!(choose(&mut policy, &[&copies[..]], 7, NO_PROBE).is_some());
+    let sure_before = policy.calibration.survival(&[SURE; 7]);
+    for _ in 0..50 {
+        policy.calibration.record(&copies, 7, 0);
+    }
+    // Rejected copies lower the copies' survival, not the drafter's.
+    assert_eq!(policy.calibration.survival(&[SURE; 7]), sure_before);
+    assert!(policy.calibration.survival(&copies)[0] < PRIOR[COPY_BIN] / 2.0);
+    assert_eq!(choose(&mut policy, &[&copies[..]], 7, NO_PROBE), Some(2));
 }
 
 #[test]
@@ -162,7 +181,7 @@ fn min_tokens_bans_fall_back_and_recalibrate() {
 fn record_observes_only_reached_positions() {
     let mut cal = Calibration::default();
     let conf = [SURE; 7];
-    let top = BINS - 1;
+    let top = bin(SURE);
     // Three drafts verified, the first accepted: position 0 accepted,
     // position 1 rejected, position 2 never reached, 3.. never verified.
     cal.record(&conf, 3, 1);
