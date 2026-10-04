@@ -317,6 +317,7 @@ impl MoeLayer {
                 self.release_unified_shared_gate_up(gpu, config, &mut freed)?;
             }
         }
+        scratch.release(gpu)?;
         self.transpose_unified_down_phase(
             gpu,
             config,

@@ -172,7 +172,17 @@ impl BlockDiffusionDraftHead {
         let l_total = self.num_layers;
 
         // Step 1: fc projection [n, L_t*h_t] → [n, h].
-        self.ctx_projection(gpu, 0, &self.fc, src, fc_dst, n, h, target_hidden_dim, stream)?;
+        self.ctx_projection(
+            gpu,
+            0,
+            &self.fc,
+            src,
+            fc_dst,
+            n,
+            h,
+            target_hidden_dim,
+            stream,
+        )?;
         if let Some(d) = dump {
             d("fc_proj", fc_dst, n as usize * h as usize * bf16)?;
         }
@@ -197,8 +207,8 @@ impl BlockDiffusionDraftHead {
         self.ctx_projection(
             gpu,
             1,
-            fc_dst,
             &fused_w,
+            fc_dst,
             fused_dst,
             n,
             (l_total as u32) * 2 * kv_dim,
@@ -376,8 +386,7 @@ impl BlockDiffusionDraftHead {
 
             // Compact V_l from the fused GEMM output (same pitched copy).
             gpu.copy_d2d_2d_async(
-                fused_src
-                    .offset(l * 2 * kv_slab_bytes + kv_slab_bytes),
+                fused_src.offset(l * 2 * kv_slab_bytes + kv_slab_bytes),
                 row_stride,
                 v_stage,
                 kv_slab_bytes,

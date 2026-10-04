@@ -14,7 +14,8 @@ use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use super::from_weights_kernels::*;
 use super::{
     BlockDiffusionDraftHead, CTX_ACC_POOL, DflashKernels, DflashLane, DflashLayer,
-    DflashQuantization, DflashScratch, DsparkStartupExecution, LIGHTNING_TARGET_HIDDEN_SIZE, MARKOV_PREV_BYTES,
+    DflashQuantization, DflashScratch, DsparkStartupExecution, LIGHTNING_TARGET_HIDDEN_SIZE,
+    MARKOV_PREV_BYTES,
 };
 use crate::layers::ops;
 use crate::weight_loader::DflashWeights;

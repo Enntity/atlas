@@ -371,7 +371,7 @@ impl MoeLayer {
             top_k,
             num_tokens,
             has_shared,
-            use_overlap,
+            false,
             sp,
             split,
             overlap_shared_reduce,
@@ -383,3 +383,5 @@ impl MoeLayer {
         )?;
 
         Ok(())
+    }
+}

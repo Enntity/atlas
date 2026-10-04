@@ -155,8 +155,8 @@ impl Model for TestModel {
     fn free_sequence(&self, _: &mut SequenceState) -> Result<()> {
         Ok(())
     }
-    fn compact_sequence(&self, _: &mut SequenceState, _: usize) -> Result<()> {
-        Ok(())
+    fn compact_sequence(&self, _: &mut SequenceState, _: usize) -> Result<bool> {
+        Ok(true)
     }
     fn detach_slot_for_reuse(&self, _: &mut SequenceState) {}
     fn save_hidden_for_mtp(&self, _: usize, _: u64) -> Result<()> {

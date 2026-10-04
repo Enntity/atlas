@@ -6,8 +6,8 @@ use super::*;
 
 mod glm_owner;
 mod think_end;
-pub(super) use think_end::accept_with_forced_think_end;
 pub use glm_owner::{step_verify_glm_long_batched, step_verify_glm_long_with};
+pub(super) use think_end::accept_with_forced_think_end;
 
 /// Width-generic γ-token verify with accept-prefix.
 ///
