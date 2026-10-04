@@ -50,6 +50,7 @@ fn run(decode: bool, glm: bool, eos: bool, min_tokens: usize, required_tool: boo
                 host_logits: true,
                 cancel_after_sampling: None,
                 cancel_after_row_commit: None,
+                verify: None,
             },
             &mut rows,
             DevicePtr::NULL,

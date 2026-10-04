@@ -16,6 +16,7 @@ mod release;
 mod sizes;
 mod sizes_q12;
 mod sizes_q2;
+mod verify_masks;
 pub use decode_meta::{DECODE_META_MAX_ROWS, DECODE_META_MIN_ROWS, DecodeMetaLayout};
 pub use sizes::{
     BufferSizes, HC_SCRATCH_ALIGN, HcPreScratchLayout, QSA_SELECT_SCRATCH_ROWS,
@@ -142,6 +143,12 @@ pub struct BufferArena {
     glm_identity_table: DevicePtr,
     /// Token capacity of `glm_latent_bf16` (not an allocation).
     glm_latent_tokens: usize,
+    /// Per-row grammar masks of a strict structured-output verify on the GLM
+    /// TP2 split head. NULL unless attached
+    /// (see [`BufferArena::attach_verify_masks`]).
+    verify_masks: DevicePtr,
+    /// Bytes of `verify_masks` (not an allocation).
+    verify_masks_bytes: usize,
     /// Maximum batch tokens this arena was sized for.
     max_batch_tokens: usize,
     /// Rows a pass may have written since the arena was last all zero
@@ -326,6 +333,8 @@ impl BufferArena {
             glm_latent_bf16: DevicePtr::NULL,
             glm_identity_table: DevicePtr::NULL,
             glm_latent_tokens: 0,
+            verify_masks: DevicePtr::NULL,
+            verify_masks_bytes: 0,
             max_batch_tokens,
             dirty_rows: std::sync::atomic::AtomicUsize::new(usize::MAX),
             decode_meta,

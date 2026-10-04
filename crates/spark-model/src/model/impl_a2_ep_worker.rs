@@ -75,6 +75,8 @@ impl TransformerModel {
         // Width-generic verify, used by four-draft MTP (K=5) and
         // DFlash. Keep this protocol separate from the fixed-width
         // commands so existing ranks remain byte-for-byte unchanged.
+        // Nothing staged before anything that can fail (`glm_verify_masks`).
+        self.verify_row_masks.reset();
         let (k, masked) = super::glm_verify_masks::split_verify_width(self.ep_broadcast_u32(0)?);
         anyhow::ensure!(
             (2..=32).contains(&k),
@@ -83,7 +85,7 @@ impl TransformerModel {
         let tokens = self.ep_broadcast_tokens(&vec![0u32; k])?;
         if masked {
             // Strict structured output: the head's per-row grammar masks.
-            self.stage_row_masks(k, None)?;
+            self.send_row_masks(k)?;
         }
         self.sync_secondary()?;
         self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;

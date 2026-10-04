@@ -14,6 +14,24 @@ pub(super) struct TestModel {
     pub host_logits: bool,
     pub cancel_after_sampling: Option<Arc<AtomicBool>>,
     pub cancel_after_row_commit: Option<Arc<AtomicBool>>,
+    /// A scripted DFlash verify on an argmax-only head (`strict_spec` tests);
+    /// `None` keeps every verify entry point rejected as before.
+    pub verify: Option<Arc<VerifyScript>>,
+}
+
+/// Picks one scripted verify returns, and the wire calls the step made.
+#[derive(Default)]
+pub(super) struct VerifyScript {
+    pub picks: Vec<u32>,
+    pub log: std::sync::Mutex<Vec<String>>,
+}
+
+impl TestModel {
+    fn log(&self, entry: String) {
+        if let Some(v) = &self.verify {
+            v.log.lock().unwrap().push(entry);
+        }
+    }
 }
 
 impl Model for TestModel {
@@ -161,5 +179,44 @@ impl Model for TestModel {
     fn detach_slot_for_reuse(&self, _: &mut SequenceState) {}
     fn save_hidden_for_mtp(&self, _: usize, _: u64) -> Result<()> {
         Ok(())
+    }
+    fn verify_logits_argmax_only(&self) -> bool {
+        self.verify.is_some()
+    }
+    fn ep_broadcast_cmd_for_seq(&self, _: u32, cmd: u32) -> Result<()> {
+        self.log(format!("seq_cmd {cmd:#x}"));
+        Ok(())
+    }
+    fn ep_broadcast_cmd(&self, cmd: u32) -> Result<()> {
+        self.log(format!("cmd {cmd:#x}"));
+        Ok(())
+    }
+    fn ep_broadcast_tokens(&self, tokens: &[u32]) -> Result<Vec<u32>> {
+        self.log(format!("tokens {tokens:?}"));
+        Ok(Vec::new())
+    }
+    fn prepare_verify_row_masks(&self, rows: usize, masks: &[u32]) -> Result<()> {
+        anyhow::ensure!(self.verify.is_some(), "no masked verify");
+        self.log(format!("upload {rows} rows {} words", masks.len()));
+        Ok(())
+    }
+    fn send_verify_row_masks(&self, rows: usize) -> Result<()> {
+        anyhow::ensure!(self.verify.is_some(), "no masked verify");
+        self.log(format!("send {rows}"));
+        Ok(())
+    }
+    fn decode_verify_dflash(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        s: u64,
+    ) -> Result<Vec<u32>> {
+        let Some(v) = &self.verify else {
+            return self.decode_verify_graphed_kgamma(tokens, seq, s);
+        };
+        self.log(format!("verify {tokens:?}"));
+        seq.tokens.extend_from_slice(tokens);
+        seq.seq_len += tokens.len();
+        Ok(v.picks[..tokens.len()].to_vec())
     }
 }

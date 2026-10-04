@@ -101,6 +101,7 @@ pub(super) fn init_arena_consumers(
     // and the actual-free KV snapshot; the optional helper reuses dead scratch.
     super::super::glm_hc_prewarm::initialize(config, gpu, buffers, max_batch_tokens)?;
     crate::model::prepare_glm_head_mxfp8(config, gpu, lm_head, bf16_head)?;
+    crate::model::prepare_glm_verify_masks(config, gpu, buffers)?;
     crate::layers::moe::bind_resident_btile_arenas(config, store, gpu, layers, buffers)?;
     Ok(())
 }

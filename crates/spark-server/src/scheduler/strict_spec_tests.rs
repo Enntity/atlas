@@ -170,3 +170,120 @@ fn only_strict_sequences_mask_their_verify() {
     assert_eq!(v.as_ref().map(|v| v.drafts.clone()), Some(drafts));
     assert_eq!(width_word(3, &v), 3 | spark_model::model::MASKED_VERIFY);
 }
+
+#[test]
+fn a_stop_token_draft_holds_the_state_and_a_finished_matcher_constrains_nothing() {
+    use crate::scheduler::test_support::GRAMMAR_EOS as EOS;
+    let answer = bytes(r#"{"bridge":"x"}"#);
+    let mut gs = strict().with_stop_tokens(&[EOS]);
+    let mut drafts = answer.clone();
+    drafts.extend([EOS, b'a' as u32]);
+    let v = row_masks(&mut gs, false, TAGS, &drafts, VOCAB).unwrap();
+    // The answer is complete, so the stop token is legal; nothing follows it.
+    assert_eq!(v.drafts.len(), answer.len() + 1);
+    let r = rows(&v);
+    assert!(allowed(r[answer.len()], EOS));
+    assert_eq!(
+        r[answer.len() + 1],
+        r[answer.len()],
+        "a stop token does not advance"
+    );
+    assert_eq!(gs.num_history_steps(), 0);
+    // A matcher that consumed its stop token constrains nothing: rows allow
+    // everything but the think tags, and drafts are not trimmed.
+    let mut done = strict();
+    for &t in &answer {
+        assert!(done.accept_token(t));
+    }
+    assert!(done.accept_token(EOS) && done.is_terminated());
+    let v = row_masks(&mut done, false, TAGS, &bytes("ab"), VOCAB).unwrap();
+    assert_eq!(v.drafts, bytes("ab"));
+    assert!(
+        rows(&v)
+            .iter()
+            .all(|r| allowed(r, b'a' as u32) && !allowed(r, THINK_END))
+    );
+}
+
+mod step {
+    use super::*;
+    use crate::scheduler::cancel_test_model::{TestModel, VerifyScript};
+    use crate::scheduler::sched_ctx::SchedCtx;
+    use crate::scheduler::verify_dflash_step::step_verify_dflash;
+    use spark_model::model::MASKED_VERIFY;
+    use std::sync::Arc;
+
+    const LAST: u32 = b'\n' as u32;
+
+    fn run(drafts: &[u32], picks: &str) -> (crate::scheduler::types::ActiveSeq, Vec<String>) {
+        let script = Arc::new(VerifyScript {
+            picks: bytes(picks),
+            ..Default::default()
+        });
+        let model = TestModel {
+            tokens: vec![],
+            host_logits: false,
+            cancel_after_sampling: None,
+            cancel_after_row_commit: None,
+            verify: Some(script.clone()),
+        };
+        let (mut a, _rx) = test_seq(vec![], 50, None, 8);
+        a.finished = false;
+        a.think_ended = true;
+        a.last_token = LAST;
+        a.tool_call_end_token = None;
+        a.grammar_state = Some(strict());
+        let sched = SchedCtx::for_test();
+        let ctx = sched.verify_logits_ctx(Some(THINK_END), Some(THINK_START), None, None);
+        step_verify_dflash(
+            &model,
+            &mut a,
+            &sched,
+            drafts,
+            &[],
+            drafts.len(),
+            &ctx,
+            true,
+        );
+        let log = script.log.lock().unwrap().clone();
+        (a, log)
+    }
+
+    #[test]
+    fn a_strict_verify_trims_masks_and_keeps_the_wire_order() {
+        // `{"b` is legal, `Z` is not: three drafts verify in four rows.
+        let (a, log) = run(&bytes(r#"{"bZ"#), r#"{"br"#);
+        let rows = 4;
+        assert_eq!(
+            log[..6],
+            [
+                format!("upload {rows} rows {} words", rows * WORDS),
+                "seq_cmd 0xfffffff5".to_string(),
+                format!("cmd {:#x}", rows as u32 | MASKED_VERIFY),
+                format!("tokens {:?}", [LAST, b'{' as u32, b'"' as u32, b'b' as u32]),
+                format!("send {rows}"),
+                format!("verify {:?}", [LAST, b'{' as u32, b'"' as u32, b'b' as u32]),
+            ],
+            "masks are uploaded before the command and sent after the tokens"
+        );
+        assert_eq!(log[6], "cmd 0x3", "three drafts accepted");
+        assert!(a.engine_error.is_none() && !a.finished);
+        assert_eq!(
+            a.output_tokens,
+            bytes(r#"{"br"#),
+            "accepted drafts, then the bonus"
+        );
+        // The matcher advanced exactly by what was emitted.
+        let mut gs = a.grammar_state.unwrap();
+        assert!(gs.accept_token(b'i' as u32) && !gs.accept_token(b'Z' as u32));
+    }
+
+    #[test]
+    fn a_dead_draft_verify_emits_its_bonus_and_feeds_no_drafter_stats() {
+        let before = format!("{:?}", test_seq(vec![], 1, None, 1).0.spec_adapt.survival);
+        let (a, log) = run(&bytes("Z"), "{{");
+        assert_eq!(log[2], format!("cmd {:#x}", 2 | MASKED_VERIFY), "width 2");
+        assert_eq!(a.output_tokens, bytes("{"));
+        assert_eq!(format!("{:?}", a.spec_adapt.survival), before);
+    }
+}
