@@ -92,9 +92,26 @@ pub struct GrammarData {
     /// Per-rule `(original_state_id, new_state_id)` mapping produced
     /// alongside the hash by `GrammarFSMHasher`.
     pub per_rule_fsm_new_state_ids: Vec<Vec<(i32, i32)>>,
+    /// The Earley dead-state pruning table ([`Self::productivity`]),
+    /// built on first use. `GrammarFsmBuilder` resets it with the FSMs.
+    pub(crate) productivity: std::sync::OnceLock<std::sync::Arc<crate::earley::ProductivityTable>>,
 }
 
 impl GrammarData {
+    /// The per-rule FSM productivity table for Earley dead-state pruning,
+    /// built once per grammar and shared by every parser over it.
+    ///
+    /// A parser is built for every adaptive token mask the matcher computes,
+    /// and building the table walks every rule's FSM, so rebuilding it per
+    /// parser made each mask cost O(grammar): a strict object of N required
+    /// properties (one rule chain per property) decoded in O(N) per token,
+    /// ~130 ms/token at N = 32 on a 248K vocabulary.
+    pub(crate) fn productivity(&self) -> std::sync::Arc<crate::earley::ProductivityTable> {
+        self.productivity
+            .get_or_init(|| std::sync::Arc::new(crate::earley::ProductivityTable::build(self)))
+            .clone()
+    }
+
     /// An empty grammar with no root.
     pub fn new() -> Self {
         Self {
