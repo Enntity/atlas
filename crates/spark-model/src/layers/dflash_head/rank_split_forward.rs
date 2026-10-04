@@ -66,6 +66,9 @@ impl SplitOps for HeadWalk<'_> {
                 self.stream,
             ),
             Piece::Select => (self.select)(),
+            Piece::CtxFc(_) | Piece::CtxNorm(_) | Piece::CtxKv(_) => {
+                anyhow::bail!("rank-split propose: {piece:?} walks with its context append")
+            }
             Piece::GateUp(_) | Piece::Down(_) | Piece::Vocab => {
                 let frame = Frame::serial(scratch);
                 head.split_piece(self.split, piece, 0, ctx.gpu, &frame, self.stream)

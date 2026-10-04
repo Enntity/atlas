@@ -276,11 +276,13 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
         Ok(glm_repair_policy::mtp_distributed() as u64)
     }),
     // The drafter a worker loads and the swaps of a rank-split propose,
-    // batched ones included (ATLAS_GLM_DRAFT_TP_BATCH, bit 2).
+    // batched ones included (ATLAS_GLM_DRAFT_TP_BATCH, bit 2), and how the
+    // worker reads its announce (ATLAS_GLM_DRAFT_TP_CTX, bit 3).
     ("ATLAS_GLM_DRAFT_TP", || {
         Ok(rank_split::parity_word(
             rank_split::requested()?,
             rank_split::batch_requested()?,
+            rank_split::ctx_requested()?,
         ))
     }),
     // Whether a step runs as a CUDA graph: a capturing forward takes other
