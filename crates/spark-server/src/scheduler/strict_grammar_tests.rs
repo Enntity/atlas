@@ -176,3 +176,26 @@ fn a_strict_grammar_never_dispatches_speculation() {
         }
     }
 }
+
+#[test]
+fn a_schema_too_large_to_compile_is_a_400_not_a_crash() {
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let mut sink = ResponseSink::Blocking(Some(tx));
+    let schema = crate::grammar::tests::schema_limits::too_many_rules_schema();
+    let err = compile_grammar_state(
+        &mut engine(),
+        &Some(GrammarSpec::JsonSchema { schema }),
+        &[EOS],
+        false,
+        &mut sink,
+    )
+    .err()
+    .expect("refused");
+    assert!(format!("{err:#}").contains("grammar too large"), "{err:#}");
+    let sent = rx
+        .try_recv()
+        .expect("client is told")
+        .err()
+        .expect("an error");
+    assert!(sent.is::<crate::api::InvalidRequestError>());
+}
