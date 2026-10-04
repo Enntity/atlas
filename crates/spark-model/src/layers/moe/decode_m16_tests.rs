@@ -310,10 +310,8 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
             "100001", "000001", "110131",
         ] {
             let flag = |i: usize| &mode[i..=i];
-            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-            cmd.args(["--exact", name, "--nocapture"])
-                .env(SENTINEL, mode)
-                .env("ATLAS_GLM_MOE_DECODE_M16", flag(0))
+            let mut cmd = ffn_child(name, SENTINEL, mode);
+            cmd.env("ATLAS_GLM_MOE_DECODE_M16", flag(0))
                 .env("ATLAS_GLM_MOE_DOWN_ZSKIP", flag(1))
                 .env("ATLAS_GLM_MOE_DECODE_K128W", flag(2))
                 .env("ATLAS_GLM_MOE_DECODE_STREAM", flag(3))
@@ -324,30 +322,8 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
                 .env("ATLAS_MOE_PREQUANT_K128", "1")
                 // Batches of 9 rows or more otherwise read the expert offsets
                 // back for exact M64 tiles; the recording backend serves none.
-                .env("ATLAS_MOE_PREFILL_EXACT_TILES", "0")
-                .env("ATLAS_EP_PROTOCOL", "v2");
-            for off in [
-                "ATLAS_NVFP4_PREQUANT_MOE",
-                "ATLAS_NVFP4_FUSED_SILU_QUANT",
-                "ATLAS_GLM_MOE_GATE_UP_M16",
-                "ATLAS_GLM_MOE_GATE_UP_M16_VERIFY",
-                "ATLAS_GLM_C2_COMPACT_MOE",
-                "ATLAS_GLM_C4_GROUPED_MOE",
-                "ATLAS_GLM_K5_COMPACT_MOE",
-                "ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP",
-                "ATLAS_GLM_K5_HC_CUBLAS",
-                "ATLAS_GLM_MOE_PREFILL_PERSIST",
-            ] {
-                cmd.env(off, "0");
-            }
-            let output = cmd.output().unwrap();
-            assert!(
-                output.status.success(),
-                "mode{mode}\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                .env("ATLAS_MOE_PREFILL_EXACT_TILES", "0");
+            assert_child_passed(mode, cmd);
         }
         return;
     }
@@ -390,6 +366,94 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
     }
 }
 
+/// The test binary re-run as `name` alone with `sentinel` set to `mode` and
+/// the routing every FFN test pins.
+fn ffn_child(name: &str, sentinel: &str, mode: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", name, "--nocapture"])
+        .env(sentinel, mode)
+        .env("ATLAS_GLM_INDEPENDENT_DECODE", "1")
+        .env("ATLAS_GLM_C3_GROUPED_MOE", "1")
+        .env("ATLAS_MOE_PREQUANT_K128", "1")
+        .env("ATLAS_EP_PROTOCOL", "v2");
+    for off in [
+        "ATLAS_NVFP4_PREQUANT_MOE",
+        "ATLAS_NVFP4_FUSED_SILU_QUANT",
+        "ATLAS_GLM_MOE_GATE_UP_M16",
+        "ATLAS_GLM_MOE_GATE_UP_M16_VERIFY",
+        "ATLAS_GLM_C2_COMPACT_MOE",
+        "ATLAS_GLM_C4_GROUPED_MOE",
+        "ATLAS_GLM_K5_COMPACT_MOE",
+        "ATLAS_GLM_K5_FUSED_COMPACT_GATE_UP",
+        "ATLAS_GLM_K5_HC_CUBLAS",
+        "ATLAS_GLM_MOE_PREFILL_PERSIST",
+    ] {
+        cmd.env(off, "0");
+    }
+    cmd
+}
+
+fn assert_child_passed(mode: &str, mut cmd: std::process::Command) {
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "mode{mode}\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+/// ATLAS_GLM_MOE_STREAM_NOSYNC: with the exact M64 tile count at its NVFP4
+/// default, a batch the stream twins take launches exactly what it launches
+/// without the count (`verify_ffn`'s checks) and reads nothing back; without
+/// the switch it still reads the expert offsets (the recording backend fails
+/// that read), and batches the twins do not take read them either way.
+#[test]
+fn stream_batches_read_no_expert_offsets_with_nosync() {
+    const SENTINEL: &str = "ATLAS_TEST_STREAM_NOSYNC";
+    let Ok(nosync) = std::env::var(SENTINEL) else {
+        let name = concat!(
+            module_path!(),
+            "::stream_batches_read_no_expert_offsets_with_nosync"
+        );
+        let name = name.split_once("::").unwrap().1;
+        for nosync in ["0", "1"] {
+            let mut cmd = ffn_child(name, SENTINEL, nosync);
+            cmd.env("ATLAS_GLM_MOE_DECODE_M16", "1")
+                .env("ATLAS_GLM_MOE_DOWN_ZSKIP", "1")
+                .env("ATLAS_GLM_MOE_DECODE_STREAM", "1")
+                .env("ATLAS_GLM_MOE_STREAM_NOSYNC", nosync)
+                .env_remove("ATLAS_MOE_PREFILL_EXACT_TILES");
+            assert_child_passed(nosync, cmd);
+        }
+        return;
+    };
+    let reads = |entry, rows| {
+        std::panic::catch_unwind(|| {
+            let gpu = Gpu::new();
+            let trace = verify_ffn(&gpu, 0, false, true, entry, rows);
+            trace
+                .iter()
+                .filter(|e| matches!(e, Event::Read(..)))
+                .count()
+        })
+    };
+    // Batches of 9 to 32 rows: the owner-batched verify of two to four streams.
+    for (entry, rows) in [
+        (Entry::Owner, 12),
+        (Entry::Prefill, 12),
+        (Entry::Prefill, 24),
+    ] {
+        match nosync.as_str() {
+            "1" => assert_eq!(reads(entry, rows).ok(), Some(0), "{rows} rows"),
+            _ => assert!(reads(entry, rows).is_err(), "{rows} rows read nothing"),
+        }
+    }
+    // Wider than the twins: the M64 grid needs the count.
+    assert!(reads(Entry::Prefill, 40).is_err());
+}
+
 #[test]
 fn decode_flags_require_0_or_1() {
     const SENTINEL: &str = "ATLAS_TEST_DECODE_M16_TOGGLE";
@@ -401,6 +465,7 @@ fn decode_flags_require_0_or_1() {
             "ATLAS_GLM_MOE_DECODE_K128W",
             "ATLAS_GLM_MOE_DECODE_STREAM",
             "ATLAS_GLM_MOE_DECODE_L2PF",
+            "ATLAS_GLM_MOE_STREAM_NOSYNC",
         ] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", name.split_once("::").unwrap().1])

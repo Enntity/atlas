@@ -40,6 +40,15 @@
 //! strips (glm_moe_decode_stream.cuh); `=2` takes the prefetching gate/up
 //! only. Prefetches only, so the same bytes. A target lacking any of the
 //! `_l2pf` twins keeps the stream kernels.
+//!
+//! `ATLAS_GLM_MOE_STREAM_NOSYNC=1` (with the stream twins) skips the exact
+//! M64 tile count (`ATLAS_MOE_PREFILL_EXACT_TILES`, default on for NVFP4) for
+//! the batches the stream twins take ([`MoeLayer::offsets_unread`]). That
+//! count is a host copy of the expert offsets, which drains the stream in
+//! every MoE layer of a batch of 9 to 32 rows (owner-batched verify of two to
+//! four streams), and only sizes the M64 grids, which those batches never
+//! launch: the twins' grid bound is fixed on the host. The same kernels run
+//! with the same arguments, so the bytes are the same.
 
 use super::prequant_fp4::{CompactMoeWorklist, MtileGrid};
 use super::*;
@@ -64,6 +73,8 @@ pub(super) struct DecodeM16 {
     wide: [KernelHandle; 2],
     zskip: bool,
     k128w: bool,
+    /// `ATLAS_GLM_MOE_STREAM_NOSYNC`.
+    nosync: bool,
 }
 
 impl DecodeM16 {
@@ -125,10 +136,22 @@ impl DecodeM16 {
             wide,
             zskip,
             k128w: toggle("ATLAS_GLM_MOE_DECODE_K128W")? && glm,
+            nosync: toggle("ATLAS_GLM_MOE_STREAM_NOSYNC")? && glm,
         };
         if !this.loaded() {
             // Both or neither: half a pair never launches.
             this.gate_up_silu = KernelHandle(0);
+        }
+        if this.nosync && gpu.op_cache().once("moe:stream_nosync") {
+            if this.stream() {
+                tracing::info!(
+                    "ATLAS_GLM_MOE_STREAM_NOSYNC: no expert-offset read for the stream twins' batches"
+                );
+            } else {
+                tracing::warn!(
+                    "ATLAS_GLM_MOE_STREAM_NOSYNC=1 ignored: it needs the stream twins (ATLAS_GLM_MOE_DECODE_M16=1 ATLAS_GLM_MOE_DECODE_STREAM=1)"
+                );
+            }
         }
         if (requested || zskip || stream || l2pf.is_some()) && gpu.op_cache().once("moe:decode_m16")
         {
@@ -231,6 +254,40 @@ impl MoeLayer {
             || self.glm_c3_grouped(ctx, rows)
             || self.glm_c4_grouped(ctx, rows)
             || self.independent_grouped(ctx, rows)
+    }
+
+    /// `ATLAS_GLM_MOE_STREAM_NOSYNC`: whether a routed FFN of `rows` rows
+    /// runs the stream twins on the prequant path whatever its kind, so
+    /// nothing reads a host copy of its expert offsets. This mirrors the
+    /// dispatch of `run_routed_grouped_gemm`: no MMQ layout, no CUTLASS
+    /// grouped GEMM, the transposed NVFP4 tables and the prequant kernel,
+    /// then [`Self::prequant_tiles`] taking [`Self::decode_m16_grid`], whose
+    /// gate/up and down both launch over its grid.
+    pub(super) fn offsets_unread(&self, rows: u32, h: u32, inter: u32) -> bool {
+        self.decode_m16.nosync
+            && self.decode_m16.stream()
+            && self.m16_grid_fits(rows, STREAM_MAX_ROWS, h, inter)
+            && !self.nvfp4_mmq_layout
+            && !(super::forward_prefill_routed::grouped_cutlass_gate_up_enabled()
+                && self.cutlass_grouped_host.is_some())
+            && self.gate_ptrs_t.is_some()
+            && self.up_ptrs_t.is_some()
+            && self.down_ptrs_t.is_some()
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && self.nvfp4_prequant_moe
+            && self.moe_w4a4_prequant_t_k64.0 != 0
+    }
+
+    /// Whether the M16 kernels can take `rows` routed rows (at most
+    /// `max_rows`): loaded, the shape tiled, the worklist builder present and
+    /// the fused SiLU quantization the one serving would run.
+    fn m16_grid_fits(&self, rows: u32, max_rows: u32, h: u32, inter: u32) -> bool {
+        self.decode_m16.loaded()
+            && m16_shape(rows, max_rows, h, inter)
+            && self.moe_build_tile_worklist_k.0 != 0
+            && self.nvfp4_fused_silu_quant
+            && self.silu_mul_quant_nvfp4_k.0 != 0
+            && self.lora.is_none()
     }
 
     /// The row tiles of one prequant routed FFN of `rows` rows. A verify
@@ -354,13 +411,7 @@ impl MoeLayer {
         } else {
             MAX_ROWS
         };
-        if !k.loaded()
-            || !m16_shape(rows, max_rows, h, inter)
-            || self.moe_build_tile_worklist_k.0 == 0
-            || !self.nvfp4_fused_silu_quant
-            || self.silu_mul_quant_nvfp4_k.0 == 0
-            || self.lora.is_some()
-        {
+        if !self.m16_grid_fits(rows, max_rows, h, inter) {
             return Ok(None);
         }
         let total_tiles = ctx.buffers.moe_router_in_f32();

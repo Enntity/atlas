@@ -768,6 +768,7 @@ mod batch_inputs_tests;
 mod batch_plan;
 mod batch_projection;
 mod batch_propose;
+mod batch_tail;
 mod batch_tail_dflash2;
 mod lifecycle;
 #[cfg(test)]
@@ -797,6 +798,7 @@ mod parity_report;
 mod precompute_ctx_kv;
 mod propose;
 pub mod rank_split;
+mod rank_split_batch;
 mod rank_split_forward;
 mod small_m_gemm;
 
@@ -981,7 +983,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // which walks every swap. However the propose ends, issue them all.
         let split = self.rank_split_with(ctx.comm, grammar_bitmask.is_some());
         if let Some((split, _)) = split {
-            split.begin();
+            split.begin(self.gamma)?;
         }
         let drafts = self.propose_drafts(
             last_token,
@@ -1006,6 +1008,16 @@ impl DraftProposer for BlockDiffusionDraftHead {
         self.rank_split_with(Some(comm), grammar).is_some()
     }
 
+    fn rank_split_batch_rows(
+        &self,
+        comm: &dyn spark_comm::CommBackend,
+        n: usize,
+        grammar: bool,
+    ) -> Option<usize> {
+        self.rank_split_batch_with(Some(comm), n, grammar)
+            .map(|(_, _, rows)| rows)
+    }
+
     fn propose_batch(
         &self,
         last_tokens: &[u32],
@@ -1019,6 +1031,19 @@ impl DraftProposer for BlockDiffusionDraftHead {
         _out_conf: Option<&mut Vec<Vec<f32>>>,
         grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
+        // ATLAS_GLM_DRAFT_TP_BATCH: the model announced this batched propose
+        // to the worker, which walks every swap; however it ends, the guard
+        // issues them all. Nothing else in it splits: the rest runs without
+        // the communicator.
+        let grammar = grammar_bitmasks.is_some_and(|m| m.iter().any(Option::is_some));
+        let split = self.rank_split_batch_with(ctx.comm, last_tokens.len(), grammar);
+        let _drain = rank_split_batch::BatchSplitGuard::begin(split, stream)?;
+        let batch_split = split.map(|(split, comm, _)| (split, comm));
+        let ctx = &crate::layer::ForwardContext {
+            comm: None,
+            midchunk_capture: None,
+            ..*ctx
+        };
         let n = last_tokens.len();
         let mask_of =
             |i: usize| -> Option<&[i32]> { grammar_bitmasks.and_then(|ms| ms.get(i)?.as_deref()) };
@@ -1177,6 +1202,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx,
             stream,
             grammar_bitmasks,
+            batch_split,
         );
         match staged {
             Err(e) if generic_auth => {
