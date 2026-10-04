@@ -886,7 +886,8 @@ pub fn build_model(
                     .filter(|_| pair && !lightning_dspark_admitted);
                 if let Some(parts) = split {
                     let batch = crate::layers::dflash_head::rank_split::batch_requested()?;
-                    head.enable_rank_split(parts, batch, model.gpu_backend())?;
+                    let ctx = crate::layers::dflash_head::rank_split::ctx_requested()?;
+                    head.enable_rank_split(parts, batch, ctx, model.gpu_backend())?;
                 }
                 if rank != 0 {
                     anyhow::ensure!(

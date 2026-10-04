@@ -12,11 +12,14 @@
 //! EC  (seq_id 0)     -> the worker enqueues its walk of the propose's swaps
 //! EC  (seq_id rows)  -> the same for a batched propose of `rows` = B×gamma
 //!                       rows (`ATLAS_GLM_DRAFT_TP_BATCH`, v2 only)
+//! EC  (seq_id rows | ctx << 12)
+//!                    -> either, with the rows of its context appends
+//!                       (`ATLAS_GLM_DRAFT_TP_CTX`, v2 only; `announce_word`)
 //! ```
 //!
 //! The command carries no payload: both ranks plan the swaps from the same
 //! drafter shapes, the same agreed switches (`startup_parity`) and, for a
-//! batched propose, the rows in the preamble slot word. The head
+//! batched propose or split context appends, the preamble slot word. The head
 //! sends it only outside any other command, so the worker is at its command
 //! loop; the worker enqueues and returns there, its next command ordered
 //! behind the walk on the same stream.
@@ -28,6 +31,7 @@ use spark_comm::CommBackend;
 
 use super::types::TransformerModel;
 use crate::layers::BlockDiffusionDraftHead;
+use crate::layers::dflash_head::rank_split::announce_word;
 use crate::speculative::DraftProposer;
 
 pub(super) const EP_CMD_DRAFT_ASSIST: u32 = 0xFFFF_FFEC;
@@ -50,9 +54,11 @@ impl TransformerModel {
             .then_some(comm)
     }
 
-    /// Head: announce the split propose about to run.
-    pub(super) fn announce_draft_split(&self) -> Result<()> {
-        self.ep_broadcast_seq_and_cmd(0, EP_CMD_DRAFT_ASSIST, self.ep_protocol_v2)
+    /// Head: announce the split propose about to run, with its packed
+    /// context rows (`DraftProposer::rank_split_ctx`; 0 without v2).
+    pub(super) fn announce_draft_split(&self, ctx: u32) -> Result<()> {
+        let word = announce_word(0, ctx)?;
+        self.ep_broadcast_seq_and_cmd(word, EP_CMD_DRAFT_ASSIST, self.ep_protocol_v2)
     }
 
     /// Head: the communicator and rows a batched propose of `n` sequences
@@ -69,12 +75,13 @@ impl TransformerModel {
         Some((comm, rows))
     }
 
-    /// Head: announce the batched split propose of `rows` rows about to run.
-    pub(super) fn announce_draft_split_rows(&self, rows: usize) -> Result<()> {
-        self.ep_broadcast_seq_and_cmd(u32::try_from(rows)?, EP_CMD_DRAFT_ASSIST, true)
+    /// Head: announce the batched split propose of `rows` rows about to run,
+    /// with its packed context rows.
+    pub(super) fn announce_draft_split_rows(&self, rows: usize, ctx: u32) -> Result<()> {
+        self.ep_broadcast_seq_and_cmd(announce_word(rows, ctx)?, EP_CMD_DRAFT_ASSIST, true)
     }
 
-    /// Worker side of EC: `seq_id` is a batched propose's rows, or 0.
+    /// Worker side of EC: `seq_id` is the announce word (`announce_word`).
     pub(super) fn draft_assist_serve(&self, seq_id: u32) -> Result<bool> {
         let head = self
             .draft_assist
@@ -83,8 +90,7 @@ impl TransformerModel {
         let comm = self
             .comm_ref()
             .context("rank-split propose without a communicator")?;
-        let rows = (seq_id != 0).then_some(seq_id as usize);
-        head.rank_split_serve(self.gpu.as_ref(), comm, self.gpu.default_stream(), rows)?;
+        head.rank_split_serve(self.gpu.as_ref(), comm, self.gpu.default_stream(), seq_id)?;
         Ok(true)
     }
 }

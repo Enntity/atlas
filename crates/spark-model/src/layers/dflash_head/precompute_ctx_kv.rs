@@ -30,6 +30,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
+use super::rank_split::CtxTurn;
 use super::{BlockDiffusionDraftHead, DflashScratch};
 use crate::layer::ForwardContext;
 use crate::weight_map::DenseWeight;
@@ -52,6 +53,8 @@ impl BlockDiffusionDraftHead {
     /// `slot_mapping_dev`: device pointer to an `i32[new_ctx_count]`
     ///   array of paged-cache slot indices.
     /// `commit`: when `true`, write the computed K/V into the paged cache.
+    /// `split`: `ATLAS_GLM_DRAFT_TP_CTX` — steps 1–3 run split with the
+    /// worker as this announced append (`rank_split_ctx`), same values.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn precompute_ctx_kv(
         &self,
@@ -64,6 +67,7 @@ impl BlockDiffusionDraftHead {
         stream: u64,
         commit: bool,
         scratch: &DflashScratch,
+        split: Option<CtxTurn<'_>>,
     ) -> Result<()> {
         use crate::layers::ops;
 
@@ -115,67 +119,71 @@ impl BlockDiffusionDraftHead {
             Ok(())
         };
 
-        // ── Step 1: batched fc projection ────────────────────────────
-        // py:175  `target_hidden = self.hidden_norm(self.fc(target_hidden))`
-        //   first half: fc maps [n, L_t*h_t] → [n, h].
-        // ≤32-row (decode) precomputes read the NVFP4 twins when
-        // ATLAS_DFLASH_CTX_NVFP4 built them (`twins.rs`).
         let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
-        self.ctx_projection(
-            gpu,
-            0,
-            &self.fc,
-            src,
-            scratch.fc_proj,
-            n,
-            h,
-            target_hidden_dim as u32,
-            stream,
-        )?;
-        dump_buf(
-            "fc_proj",
-            scratch.fc_proj,
-            new_ctx_count * self.hidden_size * bf16,
-        )?;
+        if let Some(turn) = split {
+            self.walk_ctx_split(turn, src, gpu, scratch, stream)?;
+        } else {
+            // ── Step 1: batched fc projection ────────────────────────────
+            // py:175  `target_hidden = self.hidden_norm(self.fc(target_hidden))`
+            //   first half: fc maps [n, L_t*h_t] → [n, h].
+            // ≤32-row (decode) precomputes read the NVFP4 twins when
+            // ATLAS_DFLASH_CTX_NVFP4 built them (`twins.rs`).
+            self.ctx_projection(
+                gpu,
+                0,
+                &self.fc,
+                src,
+                scratch.fc_proj,
+                n,
+                h,
+                target_hidden_dim as u32,
+                stream,
+            )?;
+            dump_buf(
+                "fc_proj",
+                scratch.fc_proj,
+                new_ctx_count * self.hidden_size * bf16,
+            )?;
 
-        // ── Step 2: hidden_norm RMS in-place ─────────────────────────
-        // py:375–380  `ops.rms_norm(normed_context_states, context_states,
-        //               self._hidden_norm_weight, self._rms_norm_eps)`
-        ops::rms_norm(
-            gpu,
-            self.kernels.rms_norm,
-            scratch.fc_proj,
-            &self.hidden_norm,
-            scratch.fc_proj,
-            n,
-            h,
-            self.rms_norm_eps,
-            stream,
-        )?;
-        dump_buf(
-            "fc_proj_normed",
-            scratch.fc_proj,
-            new_ctx_count * self.hidden_size * bf16,
-        )?;
+            // ── Step 2: hidden_norm RMS in-place ─────────────────────────
+            // py:375–380  `ops.rms_norm(normed_context_states, context_states,
+            //               self._hidden_norm_weight, self._rms_norm_eps)`
+            ops::rms_norm(
+                gpu,
+                self.kernels.rms_norm,
+                scratch.fc_proj,
+                &self.hidden_norm,
+                scratch.fc_proj,
+                n,
+                h,
+                self.rms_norm_eps,
+                stream,
+            )?;
+            dump_buf(
+                "fc_proj_normed",
+                scratch.fc_proj,
+                new_ctx_count * self.hidden_size * bf16,
+            )?;
 
-        // ── Step 3: fused KV GEMM across all layers ──────────────────
-        // py:381–392  `all_kv_flat = F.linear(normed_context_states,
-        //                self._fused_kv_weight, self._fused_kv_bias)`
-        // [n, h] × [h, L * 2 * kv_dim] → [n, L * 2 * kv_dim].
-        // Layout per row: [K_0 | V_0 | K_1 | V_1 | … | K_{L-1} | V_{L-1}].
-        let fused_w = DenseWeight { weight: fused_kv };
-        let fused_n_cols = (l_total as u32) * 2 * kv_dim;
-        self.ctx_projection(
-            gpu,
-            1,
-            &fused_w,
-            scratch.fc_proj,
-            scratch.fused_kv_out,
-            n,
-            fused_n_cols,
-            h,
-            stream,
-        )?;
+            // ── Step 3: fused KV GEMM across all layers ──────────────────
+            // py:381–392  `all_kv_flat = F.linear(normed_context_states,
+            //                self._fused_kv_weight, self._fused_kv_bias)`
+            // [n, h] × [h, L * 2 * kv_dim] → [n, L * 2 * kv_dim].
+            // Layout per row: [K_0 | V_0 | K_1 | V_1 | … | K_{L-1} | V_{L-1}].
+            let fused_w = DenseWeight { weight: fused_kv };
+            let fused_n_cols = (l_total as u32) * 2 * kv_dim;
+            self.ctx_projection(
+                gpu,
+                1,
+                &fused_w,
+                scratch.fc_proj,
+                scratch.fused_kv_out,
+                n,
+                fused_n_cols,
+                h,
+                stream,
+            )?;
+        }
         dump_buf(
             "fused_kv_out",
             scratch.fused_kv_out,
