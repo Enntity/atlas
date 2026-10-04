@@ -59,6 +59,7 @@ fn tail(a: &mut ActiveSeq, drafts: &[u32], argmax: &[u32]) -> Option<usize> {
         false,
         0.0,
         true,
+        true,
     )
 }
 
