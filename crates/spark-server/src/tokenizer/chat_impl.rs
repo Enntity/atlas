@@ -269,6 +269,7 @@ impl ChatTokenizer {
                 reasoning_effort,
                 preserve_thinking,
                 allow_continue_final: true,
+                empty_think_off: false,
             },
         )?;
 
@@ -303,9 +304,12 @@ impl ChatTokenizer {
             disable_tool_steering,
             None,
             None,
+            false,
         )
     }
 
+    /// `empty_think_off`: see [`super::chat_render::RenderFlags::empty_think_off`]
+    /// (OpenAI-variant templates only).
     pub fn apply_chat_template_openai_with_effort(
         &self,
         messages: &[serde_json::Value],
@@ -314,6 +318,7 @@ impl ChatTokenizer {
         disable_tool_steering: bool,
         reasoning_effort: Option<&str>,
         preserve_thinking: Option<bool>,
+        empty_think_off: bool,
     ) -> Result<Vec<u32>> {
         if self.chat_encoding == ChatEncoding::DeepseekV4 {
             return self.apply_chat_template_jinja_with_effort(
@@ -339,6 +344,7 @@ impl ChatTokenizer {
                     reasoning_effort,
                     preserve_thinking,
                     allow_continue_final: false,
+                    empty_think_off,
                 },
             )
             .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;

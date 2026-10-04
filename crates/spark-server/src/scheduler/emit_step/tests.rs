@@ -19,3 +19,7 @@ mod glm_tool_boundary_tests;
 #[cfg(test)]
 #[path = "../glm_native_eos_tests.rs"]
 mod glm_native_eos_tests;
+
+#[cfg(test)]
+#[path = "../strict_grammar_tests.rs"]
+mod strict_grammar_tests;
