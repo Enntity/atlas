@@ -4,32 +4,33 @@ use spark_runtime::gpu::{KernelArg, mock::MockGpuBackend};
 use std::{ffi::c_void, sync::Mutex};
 
 /// A launch as the backend saw it: kernel, grid, block, argument bytes.
-type Launch = (u64, [u32; 3], [u32; 3], Vec<Vec<u8>>);
+pub(in crate::layers::ops) type Launch = (u64, [u32; 3], [u32; 3], Vec<Vec<u8>>);
 
 /// Resolves the kernels in `shipped` (module, name) to 1-based handles in
-/// that order and records every typed launch.
-struct Capture {
+/// that order and records every typed launch (stream 7, no dynamic shared
+/// memory). Shared with the step-fuse tests.
+pub(in crate::layers::ops) struct Capture {
     inner: MockGpuBackend,
     shipped: Vec<(&'static str, &'static str)>,
     launches: Mutex<Vec<Launch>>,
 }
 
 impl Capture {
-    fn new(shipped: &[(&'static str, &'static str)]) -> Self {
+    pub(in crate::layers::ops) fn new(shipped: &[(&'static str, &'static str)]) -> Self {
         Self {
             inner: MockGpuBackend::new(),
             shipped: shipped.to_vec(),
             launches: Mutex::default(),
         }
     }
-    fn handle(&self, module: &str, name: &str) -> u64 {
+    pub(in crate::layers::ops) fn handle(&self, module: &str, name: &str) -> u64 {
         1 + self
             .shipped
             .iter()
             .position(|&(m, n)| m == module && n == name)
             .unwrap() as u64
     }
-    fn launches(&self) -> Vec<Launch> {
+    pub(in crate::layers::ops) fn launches(&self) -> Vec<Launch> {
         self.launches.lock().unwrap().clone()
     }
 }
@@ -133,16 +134,17 @@ const GLM: &[(&str, &str)] = &[
     ("moe", "moe_unpermute_blend_ep_vec8"),
 ];
 
-fn ptr(p: u64) -> Vec<u8> {
+pub(in crate::layers::ops) fn ptr(p: u64) -> Vec<u8> {
     p.to_ne_bytes().to_vec()
 }
 
-fn word(v: u32) -> Vec<u8> {
+pub(in crate::layers::ops) fn word(v: u32) -> Vec<u8> {
     v.to_ne_bytes().to_vec()
 }
 
 #[test]
 fn flag_is_explicit_and_mask_selects_groups() {
+    let parse = |fuse, mask| parse_groups("ATLAS_GLM_DECODE_FUSE", ALL, fuse, mask);
     assert_eq!(parse(None, None).unwrap(), 0);
     assert_eq!(parse(Some("0"), Some("31")).unwrap(), 0);
     assert_eq!(parse(Some("1"), None).unwrap(), ALL);

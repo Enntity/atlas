@@ -213,18 +213,12 @@ impl Qwen3AttentionLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let b = ctx.buffers;
         let (hidden, normed) = (b.hidden_states(), b.norm_output());
-        self.hc_pre_prefill(&hc.attn, hc, hidden, n, ctx, stream)?;
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            hidden,
-            &self.input_norm,
-            normed,
-            n,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        // The norms after both seams (ATLAS_GLM_STEP_FUSE may fold them in).
+        let seam_norm =
+            |weight| ops::glm_step_fuse::SeamNorm::new(self.rms_norm_w_k, weight, normed, eps);
+        let attn_norm = seam_norm(&self.input_norm);
+        self.hc_pre_prefill(&hc.attn, hc, hidden, Some(&attn_norm), n, ctx, stream)?;
+        attn_norm.run(ctx.gpu, hidden, n, h as u32, stream)?;
         let coeffs = stash.map(|stage| {
             [
                 (b.hc_post(), stage.post, stage.rows.post),
@@ -246,10 +240,12 @@ impl Qwen3AttentionLayer {
         }
         let streams = b.hc_streams();
         let (post, comb) = (b.hc_post(), b.hc_comb());
+        let ffn_norm = seam_norm(&self.post_attn_norm);
         let seam = crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
             &hc.ffn,
             Some(attn_out),
             hidden,
+            Some(&ffn_norm),
             n,
             hc.hc_mult as u32,
             hc.sinkhorn_iters as u32,
@@ -271,19 +267,9 @@ impl Qwen3AttentionLayer {
                 h as u32,
                 stream,
             )?;
-            self.hc_pre_prefill(&hc.ffn, hc, hidden, n, ctx, stream)?;
+            self.hc_pre_prefill(&hc.ffn, hc, hidden, Some(&ffn_norm), n, ctx, stream)?;
         }
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            hidden,
-            &self.post_attn_norm,
-            normed,
-            n,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        ffn_norm.run(ctx.gpu, hidden, n, h as u32, stream)?;
         let ffn_out = ffn()?;
         ops::hc_post_site(
             ctx.gpu,

@@ -3,6 +3,8 @@
 // Same RMS reduction, raw mix and arithmetic as hc_pre_from_raw_mix, with
 // only the independent 4x4 Sinkhorn cells distributed across 16 lanes.
 #include "../../common/atlas_pdl.cuh"
+#include "atlas_pdl_touch.cuh"
+#include "glm_rms_norm_regs.cuh"
 #include <cuda_bf16.h>
 
 #ifndef HC_BLOCK
@@ -27,8 +29,10 @@ __device__ __forceinline__ float glm_hc_vec_block_reduce(float* red, unsigned ti
 }
 
 // Everything after the RMS scale: split, Sinkhorn and the vector collapse.
-// `s_rsqrt` and `s_mix` must be populated and visible (after a barrier).
-template <typename HT>
+// `s_rsqrt` and `s_mix` must be populated and visible (after a barrier). `NT`
+// threads collapse the row, four columns a thread and chunk, so every element
+// keeps its expression; `COPY` also stores the row into `y_copy` (shared).
+template <typename HT, unsigned int NT = HC_BLOCK, bool COPY = false>
 __device__ __forceinline__ void glm_hc_vec_finalize(
     const HT* __restrict__ x,
     const float s_rsqrt,
@@ -42,7 +46,8 @@ __device__ __forceinline__ void glm_hc_vec_finalize(
     const unsigned int t,
     const unsigned int tid,
     const unsigned int sinkhorn_iters,
-    const float hc_eps
+    const float hc_eps,
+    __nv_bfloat16* __restrict__ y_copy = nullptr
 ) {
     constexpr unsigned int H = 4096;
 
@@ -98,8 +103,8 @@ __device__ __forceinline__ void glm_hc_vec_finalize(
     __syncthreads();
 
     #pragma unroll
-    for (unsigned int chunk = 0; chunk < 4; ++chunk) {
-        const unsigned int d = tid * 4 + chunk * HC_BLOCK * 4;
+    for (unsigned int chunk = 0; chunk < H / (NT * 4); ++chunk) {
+        const unsigned int d = tid * 4 + chunk * NT * 4;
         float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
         #pragma unroll
         for (unsigned int i = 0; i < 4; ++i) {
@@ -112,6 +117,7 @@ __device__ __forceinline__ void glm_hc_vec_finalize(
         const unsigned hi = (unsigned)__bfloat16_as_ushort(__float2bfloat16(acc.z))
             | ((unsigned)__bfloat16_as_ushort(__float2bfloat16(acc.w)) << 16);
         *(uint2*)&y_out[(size_t)t * H + d] = make_uint2(lo, hi);
+        if constexpr (COPY) *(uint2*)&y_copy[d] = make_uint2(lo, hi);
     }
 }
 
@@ -458,6 +464,18 @@ __device__ __forceinline__ void glm_hc_decode_partial_t(
     }
 }
 
+// One of the 25 sums of a row from its GLM_HCD_SPLIT partials `p[c * stride]`,
+// added in split order: mix dot `m` (< 24) into `s_mix`, or (m == 24) the sum
+// of squares as the RMS scale.
+__device__ __forceinline__ void glm_hcd_sum(const float* p, const size_t stride, const unsigned int m,
+                                            const float norm_eps, float* s_mix, float* s_rsqrt) {
+    float acc = 0.f;
+    for (unsigned int c = 0; c < GLM_HCD_SPLIT; ++c)
+        acc += p[c * stride];
+    if (m < 24) s_mix[m] = acc;
+    else *s_rsqrt = rsqrtf(acc / (float)(4 * 4096) + norm_eps);
+}
+
 // Sum the GLM_HCD_SPLIT partials of row blockIdx.x, then the shared finalizer
 // (split, Sinkhorn, collapse). Grid (T), block 256.
 template <typename HT>
@@ -478,13 +496,8 @@ __device__ __forceinline__ void glm_hc_decode_finalize_t(
     __shared__ float s_rsqrt;
     __shared__ float s_mix[HC_MAX_MIX];
     __shared__ float s_pre[HC_MAX_MULT];
-    if (tid <= 24) {
-        float acc = 0.f;
-        for (unsigned int c = 0; c < GLM_HCD_SPLIT; ++c)
-            acc += partial[((size_t)c * tokens + t) * 25 + tid];
-        if (tid < 24) s_mix[tid] = acc;
-        else s_rsqrt = rsqrtf(acc / (float)(4 * 4096) + norm_eps);
-    }
+    if (tid <= 24)
+        glm_hcd_sum(partial + (size_t)t * 25 + tid, (size_t)tokens * 25, tid, norm_eps, s_mix, &s_rsqrt);
     __syncthreads();
     glm_hc_vec_finalize(streams + (size_t)t * 4 * 4096, s_rsqrt, s_mix, s_pre, hc_scale, hc_base,
                         y_out, post_out, comb_out, t, tid, sinkhorn_iters, hc_eps);
@@ -835,4 +848,85 @@ extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_partial_rows_bf1
 ) {
     atlas_pdl_enter();
     glm_hc_decode_partial_rows_t<false>(block_out, streams, post, comb, hc_fn, partial, tokens);
+}
+
+// ── Step-fuse tier (ATLAS_GLM_STEP_FUSE, BF16 highway) ──────────────────────
+// Twins that write every byte the launches they replace write
+// (scripts/dev/glm_decode_fuse_bench.cu, groups 32 and 64).
+
+// glm_hc_decode_partial_rows_t with the next site's hc_fn [24, 16384] pulled
+// into L2 before the PDL wait (atlas_pdl_touch.cuh): a seam's partial kernel
+// is resident while the all-reduce add or the hc_post in front of it runs,
+// and then stages 1.5 MiB of mix weights a site from DRAM. The first
+// GLM_HCD_SPLIT CTAs touch it; the body is the rows twin's. Prior art
+// (docs/glm-prior-art.md): TensorFold's L2 weight touch before
+// griddepcontrol.wait (jayleaton/glm53-tensorfold-spark patch 0440) and
+// MiaAI-Lab's TF_GLM_L2PF (patch 0046), both Apache-2.0; no code copied.
+#define GLM_HCD_FN_ROW_BYTES (4u * 4096u * 4u)
+extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_post_partial_rows_touch_bf16(
+    const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams,
+    const float* __restrict__ post, const float* __restrict__ comb,
+    const unsigned char* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens
+) {
+    atlas_pdl_enter_touch({hc_fn, GLM_HCD_FN_ROW_BYTES, GLM_HCD_FN_ROW_BYTES}, {hc_fn, 0u, 0u}, 24u,
+                          blockIdx.y == 0u ? blockIdx.x : GLM_HCD_SPLIT, GLM_HCD_SPLIT);
+    glm_hc_decode_partial_rows_t<true>(block_out, streams, post, comb,
+                                       reinterpret_cast<const float*>(hc_fn), partial, tokens);
+}
+
+extern "C" __global__ void __launch_bounds__(128) glm_hc_decode_partial_rows_touch_bf16(
+    const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams,
+    const float* __restrict__ post, const float* __restrict__ comb,
+    const unsigned char* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens
+) {
+    atlas_pdl_enter_touch({hc_fn, GLM_HCD_FN_ROW_BYTES, GLM_HCD_FN_ROW_BYTES}, {hc_fn, 0u, 0u}, 24u,
+                          blockIdx.y == 0u ? blockIdx.x : GLM_HCD_SPLIT, GLM_HCD_SPLIT);
+    glm_hc_decode_partial_rows_t<false>(block_out, streams, post, comb,
+                                        reinterpret_cast<const float*>(hc_fn), partial, tokens);
+}
+
+// glm_hc_decode_finalize_bf16, then rms_norm_vanilla(_regs) of the row it
+// collapsed, as one launch: the seam's caller norms that row next in every
+// GLM layer (input and post-attention norms, hidden 4096). The 25 sums add the
+// same partials in the same order (staged into shared memory by all threads
+// first, not read one dependent load at a time), the collapse is the shared
+// finalizer's with 1024 threads a row (each element keeps its expression), and
+// the norm is rms_norm_vanilla_regs' row body over the collapsed row, kept in
+// shared memory, with that kernel's block shape. `y_out` still receives the
+// row. hc_scale and hc_base, which the gates and Sinkhorn read first, are
+// touched into L2 before the PDL wait; the norm weight, read last, is
+// prefetched into L2 right after it. Grid (T), block 1024. Prior art
+// (docs/glm-prior-art.md): TensorFold's GLM hc_pre finalizer `_hc_finish`
+// also takes the block norm weight (ashhart/TensorFold v0.6.0, Apache-2.0).
+extern "C" __global__ void __launch_bounds__(1024) glm_hc_decode_finalize_norm_bf16(
+    const __nv_bfloat16* __restrict__ streams, const float* __restrict__ partial,
+    const unsigned char* __restrict__ hc_scale, const unsigned char* __restrict__ hc_base,
+    __nv_bfloat16* __restrict__ y_out, float* __restrict__ post_out, float* __restrict__ comb_out,
+    const unsigned int tokens, const unsigned int sinkhorn_iters, const float norm_eps, const float hc_eps,
+    const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ norm_out, const float rms_eps
+) {
+    atlas_pdl_enter_touch({hc_scale, 3u * 4u, 3u * 4u}, {hc_base, HC_MAX_MIX * 4u, HC_MAX_MIX * 4u},
+                          1u, blockIdx.x, 1u);
+    constexpr unsigned int H = 4096, NT = 1024, SUMS = 25;
+    const unsigned int t = blockIdx.x, tid = threadIdx.x;
+    if (blockDim.x != NT) return;
+#if defined(__CUDA_ARCH__)
+    if (tid < H * 2 / 128)
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(norm_weight + tid * 64));
+#endif
+    __shared__ float s_part[GLM_HCD_SPLIT * SUMS];
+    __shared__ __align__(16) __nv_bfloat16 s_y[H];
+    __shared__ float s_rsqrt;
+    __shared__ float s_mix[HC_MAX_MIX];
+    __shared__ float s_pre[HC_MAX_MULT];
+    for (unsigned int i = tid; i < GLM_HCD_SPLIT * SUMS; i += NT)
+        s_part[i] = partial[((size_t)(i / SUMS) * tokens + t) * SUMS + i % SUMS];
+    __syncthreads();
+    if (tid < SUMS) glm_hcd_sum(s_part + tid, SUMS, tid, norm_eps, s_mix, &s_rsqrt);
+    __syncthreads();
+    glm_hc_vec_finalize<__nv_bfloat16, NT, true>(
+        streams + (size_t)t * 4 * H, s_rsqrt, s_mix, s_pre, reinterpret_cast<const float*>(hc_scale),
+        reinterpret_cast<const float*>(hc_base), y_out, post_out, comb_out, t, tid, sinkhorn_iters, hc_eps, s_y);
+    __syncthreads();
+    rms_norm_vanilla_regs_row(s_y, norm_weight, norm_out + (size_t)t * H, H, rms_eps);
 }

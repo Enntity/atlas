@@ -43,7 +43,13 @@ impl Glm5KdaLayer {
                 stream,
             )?;
         }
-        self.hc_pre(&self.hc.attn, hidden, m_hc, ctx, stream)?;
+        let normed = ctx.buffers.norm_output();
+        // The norms after both seams (ATLAS_GLM_STEP_FUSE may fold them in).
+        let eps = ctx.config.rms_norm_eps as f32;
+        let seam_norm =
+            |weight| ops::glm_step_fuse::SeamNorm::new(self.rms_norm_k, weight, local(normed), eps);
+        let attn_norm = seam_norm(&self.input_norm);
+        self.hc_pre(&self.hc.attn, hidden, Some(&attn_norm), m_hc, ctx, stream)?;
         // ATLAS_GLM_DET_TRACE stages; `det_rows` are the seam (local) rows.
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let (det_rows, row) = (
@@ -51,18 +57,7 @@ impl Glm5KdaLayer {
             h as usize * bf16,
         );
         det.tap("in", hidden, det_rows, row);
-        let normed = ctx.buffers.norm_output();
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            hidden,
-            &self.input_norm,
-            local(normed),
-            m_hc,
-            h,
-            ctx.config.rms_norm_eps as f32,
-            stream,
-        )?;
+        attn_norm.run(ctx.gpu, hidden, m_hc, h, stream)?;
         if let Some(sp) = sp {
             sp.all_gather(normed, self.hidden_size, ctx, stream)?;
         }
@@ -398,6 +393,7 @@ impl Glm5KdaLayer {
         if !fused_tp_hc {
             det.tap("attn_red", local(normed), det_rows, row);
         }
+        let ffn_norm = seam_norm(&self.post_attn_norm);
         let mut seam = false;
         if fused_tp_hc {
             ops::hc_post_bf16_add(
@@ -419,6 +415,7 @@ impl Glm5KdaLayer {
                 &self.hc.ffn,
                 Some(local(normed)),
                 hidden,
+                Some(&ffn_norm),
                 m_hc,
                 self.hc.hc_mult as u32,
                 self.hc.sinkhorn_iters as u32,
@@ -433,19 +430,9 @@ impl Glm5KdaLayer {
         profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
 
         if !seam {
-            self.hc_pre(&self.hc.ffn, hidden, m_hc, ctx, stream)?;
+            self.hc_pre(&self.hc.ffn, hidden, Some(&ffn_norm), m_hc, ctx, stream)?;
         }
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            hidden,
-            &self.post_attn_norm,
-            local(normed),
-            m_hc,
-            h,
-            ctx.config.rms_norm_eps as f32,
-            stream,
-        )?;
+        ffn_norm.run(ctx.gpu, hidden, m_hc, h, stream)?;
         // The routed MoE needs every row; a dense FFN runs only the local ones.
         if let Some(sp) = sp.filter(|_| matches!(self.ffn, crate::layers::FfnComponent::Moe(_))) {
             sp.all_gather(normed, self.hidden_size, ctx, stream)?;

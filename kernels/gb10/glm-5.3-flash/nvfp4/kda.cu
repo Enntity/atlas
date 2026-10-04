@@ -381,15 +381,14 @@ extern "C" __global__ void __launch_bounds__(128) kda_recurrent_bf16_verify_rec_
 // Advance each head's live state over the first `rows` records written by
 // kda_recurrent_bf16_verify_rec_owners (the accepted prefix of a verify):
 // the same kda_fold per element, so the result is bit-identical to the
-// state the verify reached at row `rows - 1`. Grid: heads; block 128.
-extern "C" __global__ void __launch_bounds__(128) kda_commit_records(
+// state the verify reached at row `rows - 1`. Head blockIdx.x; block 128.
+__device__ __forceinline__ void kda_commit_records_head(
     float* __restrict__ state,
     const float* __restrict__ records,
     unsigned long long record_stride,
     unsigned int rows,
     unsigned int heads
 ) {
-    atlas_pdl_enter();
     const unsigned int head = blockIdx.x;
     const unsigned int vrow = threadIdx.x;
     if (head >= heads || blockDim.x != 128) return;
@@ -412,6 +411,44 @@ extern "C" __global__ void __launch_bounds__(128) kda_commit_records(
     }
     #pragma unroll
     for (unsigned int k = 0; k < 128; ++k) H[(unsigned long long)k * 128 + vrow] = h[k];
+}
+
+// Grid: heads; block 128.
+extern "C" __global__ void __launch_bounds__(128) kda_commit_records(
+    float* __restrict__ state,
+    const float* __restrict__ records,
+    unsigned long long record_stride,
+    unsigned int rows,
+    unsigned int heads
+) {
+    atlas_pdl_enter();
+    kda_commit_records_head(state, records, record_stride, rows, heads);
+}
+
+// kda_commit_records of every KDA layer of one sequence in one launch
+// (ATLAS_GLM_STEP_FUSE): layer blockIdx.y advances state[y] over records[y]
+// (already offset to the first row to fold), each CTA the single-layer
+// body, so every state is bit-identical. The per-layer launches each
+// covered 32 SMs with one CTA and ran one after another behind their PDL
+// waits; here every layer's heads fill the GPU at once. Unused entries are
+// null and never read. Grid: (heads, layers); block 128. Prior art
+// (docs/glm-prior-art.md): TensorFold's kda.py `replay_layers` replays every
+// KDA layer in one launch (ashhart/TensorFold v0.6.0, Apache-2.0).
+// KDA_COMMIT_MAX_LAYERS must match kda.rs (a unit test checks it).
+#define KDA_COMMIT_MAX_LAYERS 48
+struct KdaCommitLayers {
+    float* state[KDA_COMMIT_MAX_LAYERS];
+    const float* records[KDA_COMMIT_MAX_LAYERS];
+};
+extern "C" __global__ void __launch_bounds__(128) kda_commit_records_layers(
+    const __grid_constant__ KdaCommitLayers table,
+    unsigned long long record_stride,
+    unsigned int rows,
+    unsigned int heads
+) {
+    atlas_pdl_enter();
+    if (blockIdx.y >= KDA_COMMIT_MAX_LAYERS) return;
+    kda_commit_records_head(table.state[blockIdx.y], table.records[blockIdx.y], record_stride, rows, heads);
 }
 
 // Precompute normalized Q/K and row decay once per token/head. The recurrence

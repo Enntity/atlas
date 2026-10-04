@@ -13,6 +13,8 @@ use crate::layers::ops;
 impl Qwen3AttentionLayer {
     /// `hc_pre_site` for the multi-sequence path, taking the exact split
     /// `hc_pre` for short Sinkhorn batches (see `ops::try_hc_pre_split`).
+    /// Not a decode seam, so `ATLAS_GLM_STEP_FUSE` group 1 leaves its norm
+    /// to the caller (see `ops::glm_step_fuse`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn ms_hc_pre_site(
         &self,

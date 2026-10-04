@@ -598,7 +598,16 @@ impl Qwen3AttentionLayer {
         );
 
         // ── Attention sublayer ──
-        self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, ctx, stream)?;
+        // The block input norms after both seams (ATLAS_GLM_STEP_FUSE may
+        // fold them into the seams' finalizers).
+        let block_norm = ops::HcVariant::of(hc).applies_block_input_norm();
+        let normed = ctx.buffers.norm_output();
+        let seam_norm = |weight| {
+            ops::glm_step_fuse::SeamNorm::new(self.rms_norm_w_k, weight, local(normed), eps)
+        };
+        let (attn_norm, ffn_norm) = (seam_norm(&self.input_norm), seam_norm(&self.post_attn_norm));
+        let norm_of = |norm| block_norm.then_some(norm);
+        self.hc_pre_prefill_site(&hc.attn, hc, hidden, norm_of(&attn_norm), n, ctx, stream)?;
         // ATLAS_GLM_DET_TRACE stages; `det_rows` are the seam (local) rows.
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let det_rows = (sp.map_or(0, |sp| sp.row0), n as usize);
@@ -627,19 +636,8 @@ impl Qwen3AttentionLayer {
             );
         }
 
-        let normed = ctx.buffers.norm_output();
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                hidden,
-                &self.input_norm,
-                local(normed),
-                n,
-                h as u32,
-                eps,
-                stream,
-            )?;
+        if block_norm {
+            attn_norm.run(ctx.gpu, hidden, n, h as u32, stream)?;
             if let Some(sp) = sp {
                 sp.all_gather(normed, h, ctx, stream)?;
             }
@@ -782,8 +780,16 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
-        let seam =
-            self.hc_post_pre_prefill_seam(hc, local(attn_out), hidden, n, diag_this, ctx, stream)?;
+        let seam = self.hc_post_pre_prefill_seam(
+            hc,
+            local(attn_out),
+            hidden,
+            norm_of(&ffn_norm),
+            n,
+            diag_this,
+            ctx,
+            stream,
+        )?;
         if !seam {
             ops::hc_post_site(
                 ctx.gpu,
@@ -833,7 +839,7 @@ impl Qwen3AttentionLayer {
         if seam {
             // The fused seam already wrote the FFN input and post/comb.
         } else {
-            self.hc_pre_prefill_site(&hc.ffn, hc, hidden, n, ctx, stream)?;
+            self.hc_pre_prefill_site(&hc.ffn, hc, hidden, norm_of(&ffn_norm), n, ctx, stream)?;
         }
         if diag_this {
             super::diag_norm(
@@ -860,18 +866,8 @@ impl Qwen3AttentionLayer {
         }
 
         let normed2 = ctx.buffers.norm_output();
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                hidden,
-                &self.post_attn_norm,
-                local(normed2),
-                n,
-                h as u32,
-                eps,
-                stream,
-            )?;
+        if block_norm {
+            ffn_norm.run(ctx.gpu, hidden, n, h as u32, stream)?;
             if let Some(sp) = sp {
                 sp.all_gather(normed2, h, ctx, stream)?;
             }

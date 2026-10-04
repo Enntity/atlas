@@ -119,16 +119,28 @@ impl<'a> KernelLaunch<'a> {
     /// parameter buffer, so the bytes must land in `ceil(128/8) = 16`
     /// CONSECUTIVE slots contributing ONE param entry. See
     /// `gpu::pack_kernel_args`, and `a_128_byte_arg_is_not_truncated`.
-    pub fn arg_tensormap(mut self, map: &[u8; 128]) -> Self {
+    pub fn arg_tensormap(self, map: &[u8; 128]) -> Self {
+        self.arg_bytes(map)
+    }
+
+    /// Add a by-value struct of `bytes.len()` bytes (a kernel parameter
+    /// declared as a struct, e.g. `const __grid_constant__ T`): its bytes
+    /// land in `ceil(len/8)` CONSECUTIVE slots contributing ONE param entry,
+    /// zero-padded to the slot. The kernel's parameter space bounds the
+    /// size (4 KiB on every target); past 64 KiB this panics.
+    pub fn arg_bytes(mut self, bytes: &[u8]) -> Self {
         let slot = self.storage.len() as u32;
-        for c in map.chunks(8) {
+        for c in bytes.chunks(8) {
             let mut w = [0u8; 8];
-            w.copy_from_slice(c);
+            w[..c.len()].copy_from_slice(c);
             self.storage.push(u64::from_le_bytes(w));
+        }
+        if bytes.is_empty() {
+            self.storage.push(0);
         }
         self.kinds.push(ArgKind {
             is_buffer: false,
-            byte_len: 128,
+            byte_len: u16::try_from(bytes.len()).expect("by-value kernel argument over 64 KiB"),
             slot,
         });
         self
@@ -344,6 +356,27 @@ mod tests {
             "the arg after the map must not be shifted"
         );
         assert_eq!(b.storage[b.kinds[2].slot as usize] as u32, 7);
+        assert!(b.launch(0).is_ok());
+    }
+
+    /// A struct that is not a multiple of 8 bytes keeps its bytes, padded
+    /// within its last slot, and the next arg starts after it.
+    #[test]
+    fn a_struct_arg_keeps_every_byte_and_its_neighbours() {
+        let gpu = MockGpuBackend::new();
+        let kernel = gpu.kernel("test", "table_kernel").unwrap();
+        let table: Vec<u8> = (0..772u16).map(|i| (i % 253) as u8).collect();
+        let b = KernelLaunch::new(&gpu, kernel).arg_bytes(&table).arg_u32(5);
+        assert_eq!(b.kinds.len(), 2);
+        assert_eq!((b.kinds[0].slot, b.kinds[0].byte_len), (0, 772));
+        assert_eq!(b.kinds[1].slot, 97, "772 bytes take 97 slots");
+        let bytes: Vec<u8> = b.storage[..97]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        assert_eq!(bytes[..772], table[..]);
+        assert!(bytes[772..].iter().all(|&x| x == 0));
+        assert_eq!(b.storage[97] as u32, 5);
         assert!(b.launch(0).is_ok());
     }
 

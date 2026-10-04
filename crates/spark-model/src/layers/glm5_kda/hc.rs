@@ -21,10 +21,13 @@ fn fast_prefill(tokens: u32) -> bool {
 }
 
 impl Glm5KdaLayer {
+    /// The site's pre-mix into `hidden`. `norm` is the RMS norm the caller
+    /// runs next over `hidden` (see `hc_post_pre_prefill_fused`).
     pub(super) fn hc_pre(
         &self,
         site: &HcSiteWeights,
         hidden: DevicePtr,
+        norm: Option<&ops::glm_step_fuse::SeamNorm>,
         tokens: u32,
         ctx: &ForwardContext,
         stream: u64,
@@ -34,6 +37,7 @@ impl Glm5KdaLayer {
                 site,
                 None,
                 hidden,
+                norm,
                 tokens,
                 self.hc.hc_mult as u32,
                 self.hc.sinkhorn_iters as u32,

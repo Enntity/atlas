@@ -156,12 +156,16 @@ fn finalize_ss(
 ///   site at 8 verify rows).
 ///
 /// Returns false (nothing launched) when neither applies; callers then run
-/// `hc_post` + `hc_pre` separately.
+/// `hc_post` + `hc_pre` separately. `norm` is the RMS norm the caller runs
+/// next over `hidden`, which the decode finalizer may apply in the same
+/// launch (`ATLAS_GLM_STEP_FUSE`); callers issue it through
+/// [`ops::glm_step_fuse::SeamNorm::run`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hc_post_pre_prefill_fused(
     next: &HcSiteWeights,
     block_out: Option<DevicePtr>,
     hidden: DevicePtr,
+    norm: Option<&ops::glm_step_fuse::SeamNorm>,
     tokens: u32,
     hc_mult: u32,
     sinkhorn_iters: u32,
@@ -197,11 +201,14 @@ pub(crate) fn hc_post_pre_prefill_fused(
         ctx.buffers.hc_comb(),
     );
     if decode {
-        let partial = ops::glm_decode_fuse::hc_decode_partial(
+        let partial = ops::glm_step_fuse::hc_partial(
             ctx.gpu,
-            &ctx.config.model_type,
-            block_out.is_some(),
-            next.hc_fn,
+            ops::glm_decode_fuse::hc_decode_partial(
+                ctx.gpu,
+                &ctx.config.model_type,
+                block_out.is_some(),
+                next.hc_fn,
+            )?,
         )?;
         KernelLaunch::new(ctx.gpu, partial)
             .grid([64, tokens.div_ceil(4), 1])
@@ -214,6 +221,25 @@ pub(crate) fn hc_post_pre_prefill_fused(
             .arg_ptr(raw_mix)
             .arg_u32(tokens)
             .launch(stream)?;
+        if ops::glm_step_fuse::hc_finalize_norm(
+            ctx.gpu,
+            norm,
+            ops::hc_bf16_for(&ctx.config.model_type),
+            [
+                streams,
+                raw_mix,
+                next.hc_scale,
+                next.hc_base,
+                hidden,
+                post,
+                comb,
+            ],
+            [tokens, ctx.config.hidden_size as u32, sinkhorn_iters],
+            [ctx.config.rms_norm_eps as f32, hc_eps],
+            stream,
+        )? {
+            return Ok(true);
+        }
         KernelLaunch::new(
             ctx.gpu,
             ctx.gpu
@@ -256,12 +282,14 @@ pub(crate) fn hc_post_pre_prefill_fused(
 }
 
 impl Qwen3AttentionLayer {
+    /// The site's pre-mix into `hidden`; `norm` as in [`hc_post_pre_prefill_fused`].
     #[allow(clippy::too_many_arguments)]
     pub(super) fn hc_pre_prefill(
         &self,
         site: &HcSiteWeights,
         hc: &HcWeights,
         hidden: DevicePtr,
+        norm: Option<&ops::glm_step_fuse::SeamNorm>,
         tokens: u32,
         ctx: &ForwardContext,
         stream: u64,
@@ -274,6 +302,7 @@ impl Qwen3AttentionLayer {
                 site,
                 None,
                 hidden,
+                norm,
                 tokens,
                 hc_mult,
                 hc.sinkhorn_iters as u32,

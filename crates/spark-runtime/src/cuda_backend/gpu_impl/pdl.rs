@@ -74,6 +74,9 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "glm_hc_decode_post_bf16",
     "glm_hc_decode_partial_rows_bf16",
     "glm_hc_decode_post_partial_rows_bf16",
+    "glm_hc_decode_partial_rows_touch_bf16",
+    "glm_hc_decode_post_partial_rows_touch_bf16",
+    "glm_hc_decode_finalize_norm_bf16",
     "hc_post_bf16",
     "moe_topk_sigmoid_batched",
     "moe_sort_by_expert",
@@ -108,6 +111,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "causal_conv1d_update_prefill_tp_snap",
     "kda_recurrent_bf16_verify_rec_owners",
     "kda_commit_records",
+    "kda_commit_records_layers",
     "kda_sigmoid_gated_rms_norm",
 ];
 
