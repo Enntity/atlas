@@ -25,13 +25,14 @@
 //                nothing, so it can be slow or ignored, never wrong.
 //
 // Prior art (docs/glm-prior-art.md): jayleaton's L2 prefetch
-// (github.com/jayleaton/glm53-tensorfold-spark patches/0460, Apache-2.0), as
-// carried in Mia's TensorFold recipe patch 0046-glm-l2-prefetch (Apache-2.0):
-// a small kernel on a side stream, forked at the all-gathers and after the
-// attention projections, that prefetches the next weights (bulk, per-line
-// evict_last or touch). Ours is written for Atlas's launches: regions of
-// strided rows, the per-sector variants, and the sites in l2_ahead.rs. No
-// code copied.
+// (github.com/jayleaton/glm53-tensorfold-spark patches/0460, Apache-2.0): a
+// small kernel on a side stream, forked at a layer's attention and FFN
+// all-gathers and after its attention projections, that prefetches the next
+// weights (bulk, per-line or touch); MiaAI-Lab's TensorFold recipe patch
+// 0046-glm-l2-prefetch (Apache-2.0) adds the next layer's weights at the FFN
+// site and the output site after the query absorb (kv_b's value half, then
+// o), which l2_ahead.rs's sites f and o follow. Ours: regions of strided
+// rows and the per-sector variants. No code copied.
 #include "atlas_pdl_touch.cuh"
 
 #define L2A_LINES 0u

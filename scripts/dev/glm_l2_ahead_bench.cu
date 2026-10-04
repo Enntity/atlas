@@ -161,7 +161,11 @@ static void persist_begin(int mode) {
     if (mode != M_PERSIST) return;
     cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, 0));
     g_persist = std::min<u64>(prop.persistingL2CacheMaxSize, prop.accessPolicyMaxWindowSize);
-    if (g_persist) CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, prop.persistingL2CacheMaxSize));
+    // A device that refuses a persisting carve-out runs the arm as plain touch.
+    if (g_persist && cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, prop.persistingL2CacheMaxSize) != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_persist = 0;
+    }
 }
 static void persist_end(int mode) {
     if (mode != M_PERSIST || !g_persist) return;

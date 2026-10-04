@@ -58,7 +58,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         ctx: &ForwardContext,
     ) -> Vec<crate::layers::ops::L2Region> {
         if ffn {
-            return self.ffn.l2_ahead_lead(rows, ctx);
+            return self.ffn.l2_ahead_lead(rows, false, ctx);
         }
         // A malformed projection switch fails the forward itself.
         self.glm_l2_ahead_lead(rows, ctx).unwrap_or_default()

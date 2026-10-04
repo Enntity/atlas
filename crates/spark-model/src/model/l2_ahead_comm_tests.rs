@@ -32,6 +32,9 @@ impl CommBackend for Calls {
     fn barrier(&self) -> Result<()> {
         self.push(("barrier", 0, 0, 0))
     }
+    fn peer_exchange_async(&self, send: u64, _: u64, bytes: usize, stream: u64) -> Result<()> {
+        self.push(("peer_exchange_async", send, bytes, stream))
+    }
     fn exchange_async(
         &self,
         send: u64,
@@ -73,11 +76,8 @@ fn regions(base: u64) -> Vec<L2Region> {
 
 type Fired = Mutex<Vec<(L2Site, Vec<L2Region>, u64)>>;
 
-fn recorder(fired: &Fired) -> impl Fn(L2Site, &[L2Region], u64) -> Result<()> + Sync + '_ {
-    move |site, r: &[L2Region], stream| {
-        fired.lock().push((site, r.to_vec(), stream));
-        Ok(())
-    }
+fn recorder(fired: &Fired) -> impl Fn(L2Site, &[L2Region], u64) + Sync + '_ {
+    move |site, r: &[L2Region], stream| fired.lock().push((site, r.to_vec(), stream))
 }
 
 #[test]
@@ -113,6 +113,36 @@ fn a_sync_all_reduce_counts_without_forking() {
     comm.all_reduce(0xa0, 24).unwrap();
     comm.all_reduce_async(0xb0, 24, 3).unwrap();
     assert_eq!(*fired.lock(), vec![(L2Site::Ffn, regions(0x2000), 3)]);
+}
+
+#[test]
+fn a_peer_exchange_is_a_reduce() {
+    // The K=5 KDA attention reduce (`ATLAS_GLM_K5_FUSED_TP_HC`) is a peer
+    // exchange, then the FFN all-reduces; the vocab-split exchange after the
+    // last layer's two reduces takes nothing.
+    let (inner, fired) = (Calls::default(), Fired::default());
+    let fire = recorder(&fired);
+    let comm = L2AheadComm::with(&inner, &fire);
+    comm.begin_layer(regions(0x1000), regions(0x2000));
+    comm.peer_exchange_async(0xa0, 0xa8, 24, 5).unwrap();
+    comm.all_reduce_async(0xb0, 24, 5).unwrap();
+    comm.peer_exchange_async(0xc0, 0xc8, 16, 5).unwrap();
+    assert_eq!(
+        *fired.lock(),
+        vec![
+            (L2Site::Attn, regions(0x1000), 5),
+            (L2Site::Ffn, regions(0x2000), 5),
+        ]
+    );
+    let served: Vec<_> = inner.0.lock().iter().map(|c| (c.0, c.1)).collect();
+    assert_eq!(
+        served,
+        vec![
+            ("peer_exchange_async", 0xa0),
+            ("all_reduce_async", 0xb0),
+            ("peer_exchange_async", 0xc0),
+        ]
+    );
 }
 
 #[test]

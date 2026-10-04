@@ -189,3 +189,20 @@ fn fork_skips_unlisted_sites_captures_and_empty_budgets() {
     fork(&gpu, &LANE_FIXTURE, qo, 0x99, L2Site::Output, &regions).unwrap();
     assert!(gpu.trace().is_empty());
 }
+
+#[test]
+fn a_failed_fork_turns_the_lane_off_without_an_error() {
+    let (gpu, failed) = (recording::Gpu::new(), AtomicBool::new(false));
+    let regions = [region(0x1000, 32, 32, 1)];
+    let s = on("touch");
+    gpu.fail.store(1, Ordering::Relaxed);
+    best_effort(&failed, || {
+        fork(&gpu, &LANE_FIXTURE, s, 0x99, L2Site::Attn, &regions)
+    });
+    assert!(failed.load(Ordering::Relaxed));
+    gpu.clear();
+    best_effort(&failed, || {
+        fork(&gpu, &LANE_FIXTURE, s, 0x99, L2Site::Attn, &regions)
+    });
+    assert!(gpu.trace().is_empty());
+}

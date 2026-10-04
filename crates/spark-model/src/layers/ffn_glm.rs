@@ -9,10 +9,16 @@ use spark_runtime::gpu::DevicePtr;
 
 impl FfnComponent {
     /// `ATLAS_GLM_L2_AHEAD`: what a verify of `rows` rows reads first (MoE
-    /// only; a dense FFN asks for nothing).
-    pub fn l2_ahead_lead(&self, rows: u32, ctx: &ForwardContext) -> Vec<super::ops::L2Region> {
+    /// only; a dense FFN asks for nothing). `k5_hc`: a K=5 verify takes
+    /// [`Self::forward_k5_for_hc`] with deferral allowed.
+    pub fn l2_ahead_lead(
+        &self,
+        rows: u32,
+        k5_hc: bool,
+        ctx: &ForwardContext,
+    ) -> Vec<super::ops::L2Region> {
         match self {
-            Self::Moe(m) => m.l2_ahead_lead(rows, ctx),
+            Self::Moe(m) => m.l2_ahead_lead(rows, k5_hc, ctx),
             Self::Dense(_) | Self::None => Vec::new(),
         }
     }

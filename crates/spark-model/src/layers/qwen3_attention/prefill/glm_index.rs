@@ -166,7 +166,7 @@ impl Qwen3AttentionLayer {
         // chain, with DRAM idle until then; the side stream asks for it now.
         if projected.is_none() && n <= 32 && ops::l2_ahead_enabled(ops::L2Site::Index) {
             let q_b = self.glm_q_b_reads(n, ctx)?;
-            ops::l2_ahead_prefetch(ctx.gpu, stream, ops::L2Site::Index, &q_b)?;
+            ops::l2_ahead_prefetch(ctx.gpu, stream, ops::L2Site::Index, &q_b);
         }
         let skip = write_skip.min(n as usize);
         let rows = n - skip as u32;

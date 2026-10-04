@@ -130,8 +130,17 @@ impl MoeLayer {
 
     /// `ATLAS_GLM_L2_AHEAD`: what the FFN of a verify of `rows` rows reads
     /// first: the NVFP4 shared expert's gate, up and down (this rank's half
-    /// when it runs TP-split), then the BF16 router.
-    pub(crate) fn l2_ahead_lead(&self, rows: u32, ctx: &ForwardContext) -> Vec<ops::L2Region> {
+    /// when it runs TP-split), then the BF16 router. A K=5 pass that defers
+    /// the shared expert behind the routed experts (`k5_hc`, the caller's
+    /// `forward_k5_for_hc` argument) asks for the router only. The paths that
+    /// read the whole shared expert where this names the half (fixed K=2..5
+    /// passes) only find less of it in L2.
+    pub(crate) fn l2_ahead_lead(
+        &self,
+        rows: u32,
+        k5_hc: bool,
+        ctx: &ForwardContext,
+    ) -> Vec<ops::L2Region> {
         let (h, inter) = (
             ctx.config.hidden_size as u32,
             ctx.config.shared_expert_intermediate_size as u32,
@@ -139,6 +148,7 @@ impl MoeLayer {
         let shared = &self.weights.shared_expert;
         let mut lead = Vec::new();
         if inter > 0
+            && !(rows == 5 && self.k5_defers_shared(k5_hc, ctx))
             && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
             && [&shared.gate_proj, &shared.up_proj, &shared.down_proj]
                 .iter()

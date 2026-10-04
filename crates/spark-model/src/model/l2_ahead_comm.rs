@@ -2,12 +2,14 @@
 
 //! `ATLAS_GLM_L2_AHEAD` sites `a` and `f` (`layers::ops::l2_ahead`): the
 //! communicator an eager K-gamma verify hands its layers. Every call goes to
-//! the real communicator unchanged; before a layer's first all-reduce (its
+//! the real communicator unchanged; before a layer's first TP reduce (its
 //! attention's) it forks the prefetch of the layer's FFN leading weights,
 //! before its second (the FFN's) the next layer's leading attention weights.
-//! A layer with one all-reduce (a replicated FFN) only takes the first; a
-//! third takes nothing. Wrong guesses only cost time: a prefetch reads, and
-//! the main stream never waits on it.
+//! A reduce is an all-reduce, or a peer exchange whose sum the caller forms
+//! (the K=5 KDA attention under `ATLAS_GLM_K5_FUSED_TP_HC`). A layer with one
+//! reduce (a replicated FFN) only takes the first; a third takes nothing, as
+//! does the vocab-split exchange after the last layer. Wrong guesses only
+//! cost time: a prefetch reads, and the main stream never waits on it.
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -15,17 +17,17 @@ use spark_comm::CommBackend;
 
 use crate::layers::ops::{L2Region, L2Site};
 
-/// Forks one prefetch: `(site, regions, compute stream)`.
-pub(crate) type Fire<'a> = dyn Fn(L2Site, &[L2Region], u64) -> Result<()> + Sync + 'a;
+/// Forks one prefetch, best effort: `(site, regions, compute stream)`.
+pub(crate) type Fire<'a> = dyn Fn(L2Site, &[L2Region], u64) + Sync + 'a;
 
-/// The sites in a layer's all-reduce order.
+/// The sites in a layer's reduce order.
 const SITES: [L2Site; 2] = [L2Site::Attn, L2Site::Ffn];
 
 pub(crate) struct L2AheadComm<'a> {
     inner: &'a dyn CommBackend,
     fire: &'a Fire<'a>,
-    /// The current layer's prefetches in [`SITES`] order, and its all-reduces
-    /// so far.
+    /// The current layer's prefetches in [`SITES`] order, and its reduces so
+    /// far.
     layer: Mutex<([Vec<L2Region>; 2], usize)>,
 }
 
@@ -52,7 +54,7 @@ impl<'a> L2AheadComm<'a> {
         *self.layer.lock() = ([ffn, next_attention], 0);
     }
 
-    fn before_all_reduce(&self, stream: u64) -> Result<()> {
+    fn before_reduce(&self, stream: u64) {
         let (k, regions) = {
             let mut layer = self.layer.lock();
             let k = layer.1;
@@ -62,10 +64,9 @@ impl<'a> L2AheadComm<'a> {
                 layer.0.get_mut(k).map(std::mem::take).unwrap_or_default(),
             )
         };
-        if regions.is_empty() {
-            return Ok(());
+        if !regions.is_empty() {
+            (self.fire)(SITES[k], &regions, stream);
         }
-        (self.fire)(SITES[k], &regions, stream)
     }
 }
 
@@ -76,7 +77,7 @@ impl CommBackend for L2AheadComm<'_> {
         self.inner.all_reduce(ptr, bytes)
     }
     fn all_reduce_async(&self, ptr: u64, bytes: usize, stream: u64) -> Result<()> {
-        self.before_all_reduce(stream)?;
+        self.before_reduce(stream);
         self.inner.all_reduce_async(ptr, bytes, stream)
     }
     fn all_gather(&self, send: u64, recv: u64, bytes: usize) -> Result<()> {
@@ -104,6 +105,7 @@ impl CommBackend for L2AheadComm<'_> {
         self.inner.barrier()
     }
     fn peer_exchange_async(&self, send: u64, recv: u64, bytes: usize, stream: u64) -> Result<()> {
+        self.before_reduce(stream);
         self.inner.peer_exchange_async(send, recv, bytes, stream)
     }
     fn supports_peer_exchange_async(&self) -> bool {

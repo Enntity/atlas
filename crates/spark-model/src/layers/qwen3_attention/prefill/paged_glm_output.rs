@@ -70,7 +70,7 @@ impl Qwen3AttentionLayer {
             };
             let h = ctx.config.hidden_size as u32;
             reads.extend(self.paged_glm_reads(&mla.wo, [rows, h, nq * v_dim], ctx)?);
-            ops::l2_ahead_prefetch(ctx.gpu, stream, ops::L2Site::Output, &reads)?;
+            ops::l2_ahead_prefetch(ctx.gpu, stream, ops::L2Site::Output, &reads);
         }
         Ok(())
     }

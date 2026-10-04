@@ -39,13 +39,18 @@
 //!
 //! Prior art (docs/glm-prior-art.md): jayleaton's L2 prefetch
 //! (<https://github.com/jayleaton/glm53-tensorfold-spark> patches/0460,
-//! Apache-2.0), carried in Mia's TensorFold recipe as patch
-//! `0046-glm-l2-prefetch` (Apache-2.0): a side-stream prefetch kernel forked at
-//! the all-gathers and after the attention projections, with a byte budget a
-//! site. Ours fires at Atlas's all-reduces through a communicator wrapper and
-//! inside the sparse-MLA chain; no code copied.
+//! Apache-2.0): a side-stream prefetch kernel forked at a layer's attention and
+//! FFN all-gathers and after its attention projections, with a byte budget a
+//! site; the FFN's shared expert and router at the attention collective (our
+//! `a`). MiaAI-Lab's TensorFold recipe patch `0046-glm-l2-prefetch`
+//! (Apache-2.0) adds the next layer's weights at the FFN collective (our `f`)
+//! and the output site after the query absorb, kv_b's value half then o (our
+//! `o`). Ours: firing from a communicator wrapper around the TP reduces,
+//! strided TP-split regions, the per-sector modes and site `q`; no code
+//! copied.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -236,6 +241,9 @@ struct Lane {
 
 static LANE: OnceLock<Option<Lane>> = OnceLock::new();
 
+/// Set by the first failed fork: the lane stays off from then on.
+static LANE_FAILED: AtomicBool = AtomicBool::new(false);
+
 /// Resolve the kernel and create the side stream and event once, from the GLM
 /// KDA layer constructor (the kernel lives only in the GLM-5.3-Flash target).
 /// Off: no lookup and nothing created.
@@ -277,23 +285,34 @@ pub fn l2_ahead_resolve(gpu: &dyn GpuBackend) {
     });
 }
 
-/// Whether `site` prefetches (flag on, site listed, kernel resolved).
+/// Whether `site` prefetches (flag on, site listed, kernel resolved, no fork
+/// failed).
 pub fn l2_ahead_enabled(site: L2Site) -> bool {
-    settings().is_some_and(|s| s.sites[site as usize]) && LANE.get().is_some_and(Option::is_some)
+    settings().is_some_and(|s| s.sites[site as usize])
+        && LANE.get().is_some_and(Option::is_some)
+        && !LANE_FAILED.load(Ordering::Relaxed)
 }
 
 /// Fork the side stream from `stream` here and ask for the leading budget of
 /// `regions` (in the order the main stream reads them). A no-op when `site` is
-/// off or `stream` is being captured.
-pub fn l2_ahead_prefetch(
-    gpu: &dyn GpuBackend,
-    stream: u64,
-    site: L2Site,
-    regions: &[L2Region],
-) -> Result<()> {
-    match (settings(), LANE.get()) {
-        (Some(s), Some(Some(lane))) => fork(gpu, lane, s, stream, site, regions),
-        _ => Ok(()),
+/// off or `stream` is being captured. Best effort: the callers sit just before
+/// a collective, so a failed fork logs once and turns the lane off rather than
+/// failing this rank's forward while its peer waits in the collective.
+pub fn l2_ahead_prefetch(gpu: &dyn GpuBackend, stream: u64, site: L2Site, regions: &[L2Region]) {
+    if let (Some(s), Some(Some(lane))) = (settings(), LANE.get()) {
+        best_effort(&LANE_FAILED, || fork(gpu, lane, s, stream, site, regions));
+    }
+}
+
+/// Runs `fork` unless `failed`; its first error is logged and sets `failed`.
+fn best_effort(failed: &AtomicBool, fork: impl FnOnce() -> Result<()>) {
+    if failed.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Err(e) = fork()
+        && !failed.swap(true, Ordering::Relaxed)
+    {
+        tracing::error!("ATLAS_GLM_L2_AHEAD: {e:#}; L2 prefetch off");
     }
 }
 
