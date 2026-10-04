@@ -137,7 +137,7 @@ impl TransformerModel {
             return self.glm_fused_receive(seq_id, slots).map(Some);
         }
         if cmd == super::draft_assist::EP_CMD_DRAFT_ASSIST {
-            return self.draft_assist_serve().map(Some);
+            return self.draft_assist_serve(seq_id).map(Some);
         }
         Ok(None)
     }
