@@ -308,6 +308,19 @@ pub trait DraftProposer: Send + Sync {
         false
     }
 
+    /// The rows a [`Self::propose_batch`] of `n` sequences handed `comm`
+    /// (with a grammar mask or not) swaps halves with the peer rank over
+    /// (`ATLAS_GLM_DRAFT_TP_BATCH`), if it does. The model announces such a
+    /// propose to the worker, with these rows, before it calls it.
+    fn rank_split_batch_rows(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _n: usize,
+        _grammar: bool,
+    ) -> Option<usize> {
+        None
+    }
+
     /// Chain confidence of the most recent `propose` (min top-1 softmax prob
     /// across its drafts), when the proposer computes it (`draft_conf_tau` >
     /// 0). `None` = not computed; callers must not gate on it then.
