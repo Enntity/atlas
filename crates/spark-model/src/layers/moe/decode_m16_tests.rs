@@ -323,7 +323,7 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
                 // Batches of 9 rows or more otherwise read the expert offsets
                 // back for exact M64 tiles; the recording backend serves none.
                 .env("ATLAS_MOE_PREFILL_EXACT_TILES", "0");
-            assert_child_passed(&mode, cmd);
+            assert_child_passed(mode, cmd);
         }
         return;
     }
@@ -440,7 +440,11 @@ fn stream_batches_read_no_expert_offsets_with_nosync() {
         })
     };
     // Batches of 9 to 32 rows: the owner-batched verify of two to four streams.
-    for (entry, rows) in [(Entry::Owner, 12), (Entry::Prefill, 12), (Entry::Prefill, 24)] {
+    for (entry, rows) in [
+        (Entry::Owner, 12),
+        (Entry::Prefill, 12),
+        (Entry::Prefill, 24),
+    ] {
         match nosync.as_str() {
             "1" => assert_eq!(reads(entry, rows).ok(), Some(0), "{rows} rows"),
             _ => assert!(reads(entry, rows).is_err(), "{rows} rows read nothing"),
