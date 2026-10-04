@@ -238,8 +238,12 @@ impl TransformerModel {
         // ATLAS_GLM_DRAFT_TP: a propose that swaps halves with the worker
         // carries the communicator, and is announced right before it runs.
         let split_comm = self.draft_split_comm(proposer, grammar_bitmask.is_some());
-        if split_comm.is_some() {
-            self.announce_draft_split()?;
+        if let Some(comm) = split_comm {
+            // ATLAS_GLM_DRAFT_TP_CTX: its context rows ride the v2 preamble.
+            let seq = [(&**prop_state, self.dflash_hidden_save, position)];
+            let seqs = if self.ep_protocol_v2 { &seq[..] } else { &[] };
+            let ctx_rows = proposer.rank_split_ctx(comm, seqs);
+            self.announce_draft_split(ctx_rows)?;
         }
         let ctx = ForwardContext {
             comm: split_comm,

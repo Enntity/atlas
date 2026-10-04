@@ -27,6 +27,9 @@ fn geometry(parts: Parts) -> Geometry {
         vocab: 98,
         layers: 2,
         parts,
+        ctx_in: 0,
+        ctx_kv: 0,
+        ctx: CtxRows::default(),
     }
 }
 
@@ -458,7 +461,7 @@ fn a_propose_that_stops_early_still_issues_every_swap() {
     let sizes: Vec<usize> = g.swaps().iter().map(|&s| g.bytes(s)).collect();
 
     // Stopped after two swaps: the rest are drained, sized as planned.
-    rank.split.begin(g.gamma).unwrap();
+    rank.split.begin(g.gamma, CtxRows::default()).unwrap();
     for &swap in &g.swaps()[..2] {
         rank.split
             .swap(swap, 0, &rank.gpu, &pair, &Frame::serial(&rank.scratch), 0)
@@ -471,7 +474,7 @@ fn a_propose_that_stops_early_still_issues_every_swap() {
     // starts from zero.
     rank.split.finish(&pair, 0).unwrap();
     assert_eq!(pair.sizes.borrow().len(), sizes.len());
-    rank.split.begin(g.gamma).unwrap();
+    rank.split.begin(g.gamma, CtxRows::default()).unwrap();
     rank.split.finish(&pair, 0).unwrap();
     assert_eq!(pair.sizes.borrow().len(), 2 * sizes.len());
     assert!(rank.split.max_bytes() >= *sizes.iter().max().unwrap());
@@ -479,3 +482,6 @@ fn a_propose_that_stops_early_still_issues_every_swap() {
 
 #[path = "rank_split_batch_tests.rs"]
 mod batch;
+
+#[path = "rank_split_ctx_tests.rs"]
+mod ctx;

@@ -659,8 +659,16 @@ impl TransformerModel {
         // right before it runs.
         let grammar = grammar_bitmasks.is_some_and(|m| m.iter().any(Option::is_some));
         let split = self.draft_split_batch(proposer, tokens.len(), grammar);
-        if let Some((_, rows)) = split {
-            self.announce_draft_split_rows(rows)?;
+        if let Some((comm, rows)) = split {
+            // ATLAS_GLM_DRAFT_TP_CTX: with the rows ride its context rows.
+            let seqs: Vec<_> = states
+                .iter()
+                .zip(&hiddens)
+                .zip(positions)
+                .map(|((state, &stack), &position)| (&**state, Some(stack), position))
+                .collect();
+            let ctx_rows = proposer.rank_split_ctx(comm, &seqs);
+            self.announce_draft_split_rows(rows, ctx_rows)?;
         }
         let ctx = ForwardContext {
             comm: split.map(|(comm, _)| comm),
