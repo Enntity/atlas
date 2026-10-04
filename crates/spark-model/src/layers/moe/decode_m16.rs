@@ -32,6 +32,14 @@
 //! 16 rows (owner batches of two to four streams) run the two-slab kernels,
 //! and so do prefill chunks of up to 32 tokens. A target without all of the
 //! stream kernels runs the M16 pair, as without this flag.
+//!
+//! `ATLAS_GLM_MOE_DECODE_L2PF=1` (with the stream twins) launches their
+//! `_l2pf` twins, whose CTAs also ask each K stage's whole table rows into L2
+//! a few stages ahead, every CTA of an expert its share of the rows, so DRAM
+//! serves the expert's stages as contiguous runs instead of 128- and 256-byte
+//! strips (glm_moe_decode_stream.cuh); `=2` takes the prefetching gate/up
+//! only. Prefetches only, so the same bytes. A target lacking any of the
+//! `_l2pf` twins keeps the stream kernels.
 
 use super::prequant_fp4::{CompactMoeWorklist, MtileGrid};
 use super::*;
@@ -71,23 +79,46 @@ impl DecodeM16 {
         let requested = toggle("ATLAS_GLM_MOE_DECODE_M16")?;
         let zskip = toggle("ATLAS_GLM_MOE_DOWN_ZSKIP")?;
         let stream = toggle("ATLAS_GLM_MOE_DECODE_STREAM")?;
+        // Some(whether the downs prefetch too).
+        let l2pf = match std::env::var("ATLAS_GLM_MOE_DECODE_L2PF").as_deref() {
+            Err(_) | Ok("0") => None,
+            Ok("1") => Some(true),
+            Ok("2") => Some(false),
+            Ok(value) => {
+                anyhow::bail!("ATLAS_GLM_MOE_DECODE_L2PF requires 0, 1 or 2, got {value:?}")
+            }
+        };
         let glm = config.model_type == "glm5_next";
         let on = requested && glm;
         let kernel = |on, name: &str| super::super::try_kernel_gated(on, gpu, "moe_w4a16", name);
         // A family's fused gate/up and (zero-skipping) down.
-        let pair = |on, family: &str| {
+        let pair = |on, family: &str, suffix: &str| {
             let skip = if zskip { "_zskip" } else { "" };
             [
-                kernel(on, &format!("glm_moe_decode_{family}_gate_up_silu_k128w")),
-                kernel(on, &format!("glm_moe_decode_{family}_k128w{skip}")),
+                kernel(
+                    on,
+                    &format!("glm_moe_decode_{family}_gate_up_silu_k128w{suffix}"),
+                ),
+                kernel(on, &format!("glm_moe_decode_{family}_k128w{skip}{suffix}")),
             ]
         };
-        // The stream twins all or none: a target lacking any of them runs
-        // the M16 pair, as without the flag.
-        let twins = [pair(on && stream, "m16s"), pair(on && stream, "m32s")];
-        let twins = twins.iter().flatten().all(|k| k.0 != 0).then_some(twins);
-        let [[gate_up_silu, down], wide] =
-            twins.unwrap_or_else(|| [pair(on, "m16"), [KernelHandle(0); 2]]);
+        // A set of twins of both slabs, all or none: a target lacking any of
+        // the stream twins runs the M16 pair, as without the flag, and one
+        // lacking any of their prefetching twins the stream twins.
+        let twins = |on, suffix| {
+            let twins = [pair(on, "m16s", suffix), pair(on, "m32s", suffix)];
+            twins.iter().flatten().all(|k| k.0 != 0).then_some(twins)
+        };
+        let streams = twins(on && stream, "");
+        let prefetch = twins(streams.is_some() && l2pf.is_some(), "_l2pf");
+        let [[mut gate_up_silu, mut down], mut wide] =
+            streams.unwrap_or_else(|| [pair(on, "m16", ""), [KernelHandle(0); 2]]);
+        if let Some([[gate_up16, down16], [gate_up32, down32]]) = prefetch {
+            [gate_up_silu, wide[0]] = [gate_up16, gate_up32];
+            if l2pf == Some(true) {
+                [down, wide[1]] = [down16, down32];
+            }
+        }
         let mut this = Self {
             gate_up_silu,
             down,
@@ -99,7 +130,8 @@ impl DecodeM16 {
             // Both or neither: half a pair never launches.
             this.gate_up_silu = KernelHandle(0);
         }
-        if (requested || zskip || stream) && gpu.op_cache().once("moe:decode_m16") {
+        if (requested || zskip || stream || l2pf.is_some()) && gpu.op_cache().once("moe:decode_m16")
+        {
             if this.loaded() {
                 tracing::info!(
                     "ATLAS_GLM_MOE_DECODE_M16: M16 routed gate/up+SiLU and down for verify decode (zero-row skip: {zskip})"
@@ -113,11 +145,22 @@ impl DecodeM16 {
                         "ATLAS_GLM_MOE_DECODE_STREAM=1 ignored: target lacks the stream kernels"
                     );
                 }
+                if let Some(downs) = l2pf {
+                    if prefetch.is_some() {
+                        tracing::info!(
+                            "ATLAS_GLM_MOE_DECODE_L2PF: stream twins with the L2 row prefetch (gate/up, downs: {downs})"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "ATLAS_GLM_MOE_DECODE_L2PF ignored: needs the stream twins and the target's _l2pf twins"
+                        );
+                    }
+                }
             } else if on {
                 tracing::warn!("ATLAS_GLM_MOE_DECODE_M16=1 ignored: target lacks the M16 kernels");
             } else if !requested {
                 tracing::warn!(
-                    "ATLAS_GLM_MOE_DOWN_ZSKIP=1 / ATLAS_GLM_MOE_DECODE_STREAM=1 ignored: they need ATLAS_GLM_MOE_DECODE_M16=1"
+                    "ATLAS_GLM_MOE_DOWN_ZSKIP / _DECODE_STREAM / _DECODE_L2PF ignored: they need ATLAS_GLM_MOE_DECODE_M16=1"
                 );
             }
         }

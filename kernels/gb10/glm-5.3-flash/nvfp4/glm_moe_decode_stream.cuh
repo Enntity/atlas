@@ -29,12 +29,48 @@
 // its own pqd_mma_stage over the same weight tile.
 //
 // Grid and arguments as the M16 kernels; block (PQS_THREADS, 1, 1).
+//
+// L2 prefetch (ATLAS_GLM_MOE_DECODE_L2PF, the *_l2pf twins). A CTA's tile
+// is 128 columns of the gate table and the same of the up table (down: 256
+// columns), so each K stage it reads 64 rows x 128 B of each at an N byte
+// stride (1 KB at the rank's I/2 = 1024; down 256 B of 4 KB): its own reads
+// never touch a whole row. The m16s gate/up reads its tables at about
+// 225 GB/s on ennspark03 (4 rows, 22 experts: 104 MB in 459-465 us) where a
+// pass over the same bytes in 64 KB chunks reaches 244-250 (commit a74552a4's
+// moe_decode_bench runs); in serving (2026-10-03 nsys) both kernels run at
+// about 210-220 GB/s if the expert counts are the bench's. The grid's
+// gridDim.x CTAs of an expert together read every column of the stage's
+// rows, which are one contiguous block of the table (64 N bytes, and 8 N of
+// scales). So each CTA also asks for its 1/gridDim.x of that block by rows,
+// whole rows, PQS_PF_DIST stages ahead of the stage it loads
+// (prefetch.global.L2 per 128-byte line; ZSKIP's dead rows are not asked
+// for): DRAM then serves an expert's stage as a few contiguous runs, and the
+// CTAs' strided streaming loads find the bytes in L2. Only immutable weights are read, after the
+// PDL wait, and no prefetch writes anything: every load, store, MMA and the
+// epilogue are m16s's, so the outputs are the stream kernels' bit for bit.
+// A CTA that lags its expert's siblings finds its slice in L2 already, and
+// its own prefetch of rows they have read hits L2 while the lines live, so
+// each byte still crosses DRAM about once.
+//
+// Prior art (docs/glm-prior-art.md): pulling the weights the next kernels
+// read into L2 is jayleaton's L2 prefetch
+// (github.com/jayleaton/glm53-tensorfold-spark patches/0460, Apache-2.0), as
+// carried in Mia's TensorFold recipe patch 0046-glm-l2-prefetch (Apache-2.0),
+// which prefetches dense weights from a side stream during the all-gathers;
+// TensorFold 0047's weight loads issued a step ahead are the same family.
+// Ours runs inside the routed expert kernels, once the experts are known, and
+// splits each stage's rows among an expert's CTAs. No code copied.
 #pragma once
 
 #define PQS_THREADS 256
 // 16-byte pieces of a stage per thread: 1024 weight, 128 scale and up to 128
 // activation pieces.
 #define PQS_PIECES 5
+// Stages ahead of the one being loaded that the L2 prefetch asks for (a stage
+// is about 7 us of a CTA's time at two CTAs per SM and DRAM speed).
+#ifndef PQS_PF_DIST
+#define PQS_PF_DIST 2
+#endif
 
 // Thread t's pieces of K stage kb: the shared bytes of pqd_issue.
 template<bool GATE_UP, int MI>
@@ -87,7 +123,35 @@ __device__ __forceinline__ void pqs_load(
             : 0ull;
 }
 
-template<bool GATE_UP, bool ZSKIP, int MI>
+// This CTA's share of K stage kb of the expert's weight and scale tables,
+// asked into L2: of the stage's PQ2_KP packed rows and PQ2_KS / GROUP_SIZE
+// scale rows, the ones in this CTA's 1/gridDim.x by blockIdx.x, each whole
+// (every column of the grid), less the dead weight rows of `live`.
+// Consecutive threads take consecutive lines of a row.
+template<bool GATE_UP>
+__device__ __forceinline__ void pqs_prefetch(
+    unsigned int t, const unsigned char* B_expert, const unsigned char* S_expert,
+    const unsigned char* U_expert, const unsigned char* US_expert,
+    unsigned int N, unsigned int kb, const unsigned char* live
+) {
+    constexpr unsigned int TABLES = GATE_UP ? 2 : 1;
+    constexpr unsigned int GROUPS = PQ2_KS / GROUP_SIZE;
+    const unsigned int ctas = gridDim.x, lines = N / 128;
+    const unsigned int rows = (PQ2_KP + ctas - 1) / ctas, groups = (GROUPS + ctas - 1) / ctas;
+    const unsigned int nw = TABLES * rows * lines, total = nw + TABLES * groups * lines;
+    for (unsigned int i = t; i < total; i += PQS_THREADS) {
+        const bool w = i < nw;
+        const unsigned int k = w ? i : i - nw, span = w ? rows : groups;
+        const unsigned int tab = k / (span * lines), r = blockIdx.x * span + k / lines % span;
+        if (r >= (w ? PQ2_KP : GROUPS) || (w && live && !live[kb / 2 + r])) continue;
+        const unsigned char* base = w ? (tab ? U_expert : B_expert) : (tab ? US_expert : S_expert);
+        const unsigned char* p = base + (unsigned long long)(w ? kb / 2 + r : kb / GROUP_SIZE + r) * N
+            + (k % lines) * 128;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+    }
+}
+
+template<bool GATE_UP, bool ZSKIP, int MI, bool PF = false>
 __device__ __forceinline__ void pqs_impl(
     PQ2_ARGS,
     const unsigned int* __restrict__ worklist,
@@ -156,12 +220,22 @@ __device__ __forceinline__ void pqs_impl(
         for (int i = 0; i < 4; i++) acc[mi][i][0] = acc[mi][i][1] = acc[mi][i][2] = acc[mi][i][3] = 0.0f;
 
     const unsigned int stages = K / PQ2_KS;
+    // L2 prefetch of stage s (PF): asked for PQS_PF_DIST stages before it is
+    // loaded, the first ones before stage 0's loads.
+    auto prefetch = [&](unsigned int s) {
+        if constexpr (PF)
+            if (s < stages)
+                pqs_prefetch<GATE_UP>(t, B_expert, S_expert, U_expert, US_expert, N, s * PQ2_KS,
+                    zskip ? sLive : nullptr);
+    };
+    for (unsigned int s = 0; s <= PQS_PF_DIST; ++s) prefetch(s);
     load(0, 0);
     __syncthreads();
     for (unsigned int st = 0; st < stages; ++st) {
         const int buf = st & 1;
         // Stage st is in buffer buf; the other one's MMAs ended before the
         // last barrier.
+        prefetch(st + 1 + PQS_PF_DIST);
         if (st + 1 < stages) load(buf ^ 1, (st + 1) * PQ2_KS);
         #pragma unroll
         for (int mi = 0; mi < MI; mi++)
@@ -203,6 +277,26 @@ extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m32s
 }
 extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m32s_gate_up_silu_k128w(PQS_GATE_UP_ARGS) {
     pqs_impl<true, false, 2>(PQS_TABLES, PQS_UP);
+}
+// The same six with the L2 prefetch of each stage's rows
+// (ATLAS_GLM_MOE_DECODE_L2PF).
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m16s_k128w_l2pf(PQS_DOWN_ARGS) {
+    pqs_impl<false, false, 1, true>(PQS_TABLES, PqwGateUp{});
+}
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m16s_k128w_zskip_l2pf(PQS_DOWN_ARGS) {
+    pqs_impl<false, true, 1, true>(PQS_TABLES, PqwGateUp{});
+}
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m16s_gate_up_silu_k128w_l2pf(PQS_GATE_UP_ARGS) {
+    pqs_impl<true, false, 1, true>(PQS_TABLES, PQS_UP);
+}
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m32s_k128w_l2pf(PQS_DOWN_ARGS) {
+    pqs_impl<false, false, 2, true>(PQS_TABLES, PqwGateUp{});
+}
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m32s_k128w_zskip_l2pf(PQS_DOWN_ARGS) {
+    pqs_impl<false, true, 2, true>(PQS_TABLES, PqwGateUp{});
+}
+extern "C" __global__ void __launch_bounds__(PQS_THREADS, 2) glm_moe_decode_m32s_gate_up_silu_k128w_l2pf(PQS_GATE_UP_ARGS) {
+    pqs_impl<true, false, 2, true>(PQS_TABLES, PQS_UP);
 }
 
 #undef PQS_DOWN_ARGS
