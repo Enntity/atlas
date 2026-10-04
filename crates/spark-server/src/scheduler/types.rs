@@ -174,6 +174,13 @@ pub(super) const GUARD_STOP_CONTENT_LOOP: &str = "content_loop_watchdog";
 /// It is an early, smarter `max_tokens` — report it as one (`"length"`).
 pub(super) const GUARD_STOP_POST_THINK_CAP: &str = "post_think_content_cap";
 
+/// `ActiveSeq::tool_request` at prefill: a tool grammar or the legacy
+/// tool-call path. A strict (`response_format`) grammar is not a tool request:
+/// its JSON answer is not inter-tool prose and must not be budget-cut.
+pub(super) fn tool_request_for(grammar: Option<&GrammarState>, legacy_tool_call: bool) -> bool {
+    grammar.is_some_and(|g| !g.is_strict()) || legacy_tool_call
+}
+
 /// An in-flight sequence participating in batched decode.
 pub(super) struct ActiveSeq {
     pub seq: SequenceState,
@@ -471,6 +478,10 @@ impl ActiveSeq {
     /// `Model::verify_logits_argmax_only` — and rows after a `</think>` inside
     /// an accepted span are picked as if still thinking). Serial decode masks
     /// every token through the logits pipeline.
+    ///
+    /// Its output is also exempt from the tool-turn content guards (the
+    /// post-think content cap and the content-loop watchdog): the grammar
+    /// bounds a JSON answer, and repeated JSON items are not a degenerate loop.
     pub(super) fn strict_grammar(&self) -> bool {
         self.grammar_state
             .as_ref()

@@ -11,14 +11,19 @@ use crate::scheduler::{
     mtp_gate, sched_ctx::SchedCtx, test_support::test_seq, types::ResponseSink,
 };
 
-/// One token per ASCII byte, then `<eos>`.
+#[path = "strict_grammar_tests/decode.rs"]
+mod decode;
+
+/// One token per ASCII byte, then `<eos>`, padded to the test model's vocab.
 const EOS: u32 = 128;
+const VOCAB: usize = 2048;
 const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,
     "properties":{"bridge":{"type":"string"}},"required":["bridge"]}"#;
 
 fn engine() -> Option<GrammarEngine> {
     let mut vocab: Vec<String> = (0u8..128).map(|b| (b as char).to_string()).collect();
     vocab.push("<eos>".into());
+    vocab.extend((vocab.len()..VOCAB).map(|i| format!("<pad{i}>")));
     Some(GrammarEngine::new(&vocab, &[EOS as i32]).unwrap())
 }
 
@@ -88,9 +93,10 @@ fn an_unarmable_response_format_is_reported_not_decoded_unconstrained() {
     .expect("an unarmable response_format is an error");
     assert!(format!("{err:#}").contains("response_format"));
     let sent = rx.try_recv().expect("client is told");
+    let sent = sent.err().expect("an error, not a completion");
     assert!(
-        sent.is_err(),
-        "the client receives an error, not a completion"
+        sent.is::<crate::api::InvalidRequestError>(),
+        "a blocking client gets HTTP 400, which SDKs do not retry"
     );
     // No grammar requested: nothing to arm, nothing reported.
     let mut sink = ResponseSink::Blocking(None);
