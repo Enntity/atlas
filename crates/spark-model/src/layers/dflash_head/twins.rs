@@ -22,6 +22,13 @@
 //!   weight for context precomputes of up to 32 rows (decode steps); wider
 //!   precomputes (prompt catch-up) keep BF16.
 //!
+//! One context-precompute lever changes no value at all:
+//! `ATLAS_DFLASH_CTX_ASYNC_POS=1` uploads the precompute's RoPE positions in
+//! stream order instead of after a drain of the stream (`precompute_ctx_kv`
+//! step 4). Without it the host waits for the `fc` and K/V projections and
+//! then launches the ~17 small ops of the append's tail one by one while the
+//! GPU idles (a ~0.4 ms gap a C1 propose in the 2026-10-03 nsys profiles).
+//!
 //! Row blocks the tiers cannot take fall back to the BF16 weights.
 
 use anyhow::Result;
@@ -46,6 +53,9 @@ pub struct DflashTwins {
     pub lm_head_mx: Option<Mxfp8Weight>,
     /// NVFP4 twins of `[fc, fused_kv_weight]` (`ATLAS_DFLASH_CTX_NVFP4=1`).
     pub ctx_q4: Option<[QuantizedWeight; 2]>,
+    /// `ATLAS_DFLASH_CTX_ASYNC_POS=1`: the context precompute's position
+    /// upload does not drain the stream.
+    pub ctx_async_positions: bool,
 }
 
 /// MXFP8 twins of a layer's five large projections (`ATLAS_DFLASH_MXFP8=1`);
@@ -86,13 +96,15 @@ impl BlockDiffusionDraftHead {
         if env_on("ATLAS_DFLASH_CTX_NVFP4") {
             self.install_ctx_twins(gpu)?;
         }
+        self.twins.ctx_async_positions = env_on("ATLAS_DFLASH_CTX_ASYNC_POS");
         tracing::info!(
-            "DFlash twins: NVFP4 tensor-core layers {}, MXFP8 layers {}, head NVFP4 {} / MXFP8 {}, context NVFP4 {}",
+            "DFlash twins: NVFP4 tensor-core layers {}, MXFP8 layers {}, head NVFP4 {} / MXFP8 {}, context NVFP4 {}, async context positions {}",
             self.twins.nvfp4_tc,
             self.layers.iter().filter(|l| l.mx.is_some()).count(),
             self.twins.lm_head_q4.is_some(),
             self.twins.lm_head_mx.is_some(),
             self.twins.ctx_q4.is_some(),
+            self.twins.ctx_async_positions,
         );
         Ok(())
     }
