@@ -182,7 +182,7 @@ struct Mx { u8 *w, *s; unsigned int n, k; };   // MXFP8 [n, k]
 static u8* dev(u64 n, unsigned int kind, unsigned int seed) {
     u8* p; CK(cudaMalloc(&p, n)); fill<<<1024, 256>>>(p, n, kind, seed); return p;
 }
-static Nv nv(unsigned int n, unsigned int k, unsigned int seed) {
+static Nv nvt(unsigned int n, unsigned int k, unsigned int seed) {
     return {dev((u64)n * k / 2, 0, seed), dev((u64)n * k / 16, 1, seed + 7), n, k};
 }
 static Mx mx(unsigned int n, unsigned int k, unsigned int seed) {
@@ -236,8 +236,8 @@ int main(int argc, char** argv) {
     std::vector<Mla> mla(MLA_LAYERS);
     for (int l = 0; l < KDA_LAYERS; l++) {
         const unsigned int b = 100u * l;
-        kda[l] = {nv(H, H, b), nv(H, H, b + 1), nv(H, H, b + 2), nv(2 * HALF, H, b + 3), nv(2 * HALF, H, b + 4),
-                  nv(H, 2 * HALF, b + 5), dev(ROUTER, 4, b + 6)};
+        kda[l] = {nvt(H, H, b), nvt(H, H, b + 1), nvt(H, H, b + 2), nvt(2 * HALF, H, b + 3), nvt(2 * HALF, H, b + 4),
+                  nvt(H, 2 * HALF, b + 5), dev(ROUTER, 4, b + 6)};
     }
     for (int l = 0; l < MLA_LAYERS; l++) {
         const unsigned int b = 5000u + 100u * l;
