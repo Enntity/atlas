@@ -16,6 +16,14 @@
 //   norm   rms_norm_vanilla vs rms_norm_vanilla_regs (hidden 4096, 1536, 512;
 //          the odd 4095 at one row, the only odd shape either kernel can read)
 //
+// and the step-fuse tier (ATLAS_GLM_STEP_FUSE) inside the hc chains:
+//
+//   32     glm_hc_decode_finalize_bf16 -> rms_norm_vanilla
+//      vs  glm_hc_decode_finalize_norm_bf16 (step-fuse group 1)
+//   64     glm_hc_decode_{post_,}partial_rows_bf16
+//      vs  glm_hc_decode_{post_,}partial_rows_touch_bf16 (step-fuse group 2;
+//          with group 2 above)
+//
 // Every output byte (highway, partial sums, collapsed row, post, comb,
 // normed row, MoE output) must match, including rows holding zeros, -0.0,
 // large values, Inf and NaN. It then times each chain as serving launches it
@@ -24,12 +32,14 @@
 //
 //   nvcc -arch=sm_121a -O3 --fmad=false -std=c++17 -I kernels/gb10/glm-5.3-flash/nvfp4 \
 //        scripts/dev/glm_decode_fuse_bench.cu -o glm_decode_fuse_bench
-//   ./glm_decode_fuse_bench [copies=32] [groups=64] [reps=3] [fused=31]
+//   ./glm_decode_fuse_bench [copies=32] [groups=64] [reps=3] [fused=127]
 // Prints one "bitwise" line per chain and width, then PASS or FAIL (exit 1),
 // then the median GPU time per chain in microseconds: stream events around
 // every 8 chains, each batch queued behind a spin kernel so the GPU never
 // waits for the host. `fused` selects the fused groups of the new arm
-// (1 post, 2 partial, 4 MoE unpermute+blend, 8 MoE sort, 16 RMS norm). The
+// (1 post, 2 partial, 4 MoE unpermute+blend, 8 MoE sort, 16 RMS norm; 32 and
+// 64 the step-fuse groups above): fused=31 against fused=127 times the
+// step-fuse tier on top of the decode tier. The
 // sort's rows within an expert group are unordered by contract (atomics), so
 // it compares expert_offsets bytes and checks both permutations route every
 // slot to its token and expert. Device memory: ~60 MB.
@@ -127,7 +137,7 @@ struct Inputs {
 
 static const unsigned SINK = 20;
 static const float NORM_EPS = 1e-5f, HC_EPS = 1e-6f;
-static unsigned g_fused = 31;
+static unsigned g_fused = 127;
 
 // One mHC site: an optional post (`peer`: fold the other rank's block output
 // in), the next site's pre-mix partials, then finalize and the RMS norm.
@@ -135,8 +145,13 @@ static void hc_site(const Inputs& in, Arm& a, unsigned T, int copy, bool post, b
     const float* fn = in.hc_fn.p + (size_t)copy * MIX * HC * H;
     bf* st = (bf*)a.streams.p;
     const bool fpost = fused && (g_fused & 1), fpartial = fused && (g_fused & 2);
+    const bool ftouch = fpartial && (g_fused & 64), fnorm = fused && (g_fused & 32);
+    const unsigned char* fn_bytes = (const unsigned char*)fn;
     const dim3 pgrid(SPLIT, (T + 3) / 4);
-    if (seam) {
+    if (seam && ftouch) {
+        launch(glm_hc_decode_post_partial_rows_touch_bf16, pgrid, 128, (const bf*)in.block_out.p, st,
+               (const float*)a.post.p, (const float*)a.comb.p, fn_bytes, a.partial.p, T);
+    } else if (seam) {
         launch(fpartial ? glm_hc_decode_post_partial_rows_bf16 : glm_hc_decode_post_partial_bf16, pgrid, 128,
                (const bf*)in.block_out.p, st, (const float*)a.post.p, (const float*)a.comb.p, fn, a.partial.p, T);
     } else {
@@ -149,14 +164,24 @@ static void hc_site(const Inputs& in, Arm& a, unsigned T, int copy, bool post, b
         else if (post)
             launch(hc_post_bf16, dim3(T), 256, (const bf*)in.block_out.p, (const bf*)st,
                    (const float*)a.post.p, (const float*)a.comb.p, st, H, HC);
-        launch(fpartial ? glm_hc_decode_partial_rows_bf16 : glm_hc_decode_partial_bf16, pgrid, 128, (const bf*)nullptr,
-               st, (const float*)a.post.p, (const float*)a.comb.p, fn, a.partial.p, T);
+        if (ftouch)
+            launch(glm_hc_decode_partial_rows_touch_bf16, pgrid, 128, (const bf*)nullptr, st,
+                   (const float*)a.post.p, (const float*)a.comb.p, fn_bytes, a.partial.p, T);
+        else
+            launch(fpartial ? glm_hc_decode_partial_rows_bf16 : glm_hc_decode_partial_bf16, pgrid, 128,
+                   (const bf*)nullptr, st, (const float*)a.post.p, (const float*)a.comb.p, fn, a.partial.p, T);
+    }
+    const unsigned short* norm_w = in.norm_w.p + (size_t)copy * H;
+    if (fnorm) {
+        launch(glm_hc_decode_finalize_norm_bf16, dim3(T), 1024, (const bf*)st, (const float*)a.partial.p,
+               (const unsigned char*)in.hc_scale.p, (const unsigned char*)in.hc_base.p, (bf*)a.hidden.p, a.post.p,
+               a.comb.p, T, SINK, NORM_EPS, HC_EPS, (const bf*)norm_w, (bf*)a.normed.p, NORM_EPS);
+        return;
     }
     launch(glm_hc_decode_finalize_bf16, dim3(T), 256, (const bf*)st, (const float*)a.partial.p,
            (const float*)in.hc_scale.p, (const float*)in.hc_base.p, (bf*)a.hidden.p, a.post.p, a.comb.p,
            T, SINK, NORM_EPS, HC_EPS);
-    launch(rms_norm_vanilla, dim3(T), 1024, (const bf*)a.hidden.p, (const bf*)(in.norm_w.p + (size_t)copy * H),
-           (bf*)a.normed.p, H, NORM_EPS);
+    launch(rms_norm_vanilla, dim3(T), 1024, (const bf*)a.hidden.p, (const bf*)norm_w, (bf*)a.normed.p, H, NORM_EPS);
 }
 
 static void moe_post(const Inputs& in, Arm& a, unsigned T, int copy, bool fused) {

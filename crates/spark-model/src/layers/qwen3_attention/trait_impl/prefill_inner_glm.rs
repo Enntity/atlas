@@ -10,6 +10,7 @@ use spark_runtime::gpu::DevicePtr;
 use super::super::{HcSiteWeights, HcWeights, Qwen3AttentionLayer};
 use crate::layer::ForwardContext;
 use crate::layers::ops;
+use crate::layers::ops::glm_step_fuse::SeamNorm;
 
 impl Qwen3AttentionLayer {
     /// `(is_first_layer, is_last_layer)` of the HC highway.
@@ -30,12 +31,15 @@ impl Qwen3AttentionLayer {
     }
 
     /// One HC pre site of the prefill (GLM's own prefill mix, else the
-    /// generic site).
+    /// generic site). `norm`: the RMS norm the caller runs next over
+    /// `hidden` (see `hc_post_pre_prefill_fused`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn hc_pre_prefill_site(
         &self,
         site: &HcSiteWeights,
         hc: &HcWeights,
         hidden: DevicePtr,
+        norm: Option<&SeamNorm>,
         n: u32,
         ctx: &ForwardContext,
         stream: u64,
@@ -46,7 +50,7 @@ impl Qwen3AttentionLayer {
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
         if ctx.config.model_type == "glm5_next" {
-            self.hc_pre_prefill(site, hc, hidden, n, ctx, stream)?;
+            self.hc_pre_prefill(site, hc, hidden, norm, n, ctx, stream)?;
         } else {
             ops::hc_pre_site(
                 ctx.gpu,
@@ -75,6 +79,7 @@ impl Qwen3AttentionLayer {
         hc: &HcWeights,
         attn_out: DevicePtr,
         hidden: DevicePtr,
+        norm: Option<&SeamNorm>,
         n: u32,
         diag_this: bool,
         ctx: &ForwardContext,
@@ -88,6 +93,7 @@ impl Qwen3AttentionLayer {
                 &hc.ffn,
                 Some(attn_out),
                 hidden,
+                norm,
                 n,
                 hc_mult,
                 hc.sinkhorn_iters as u32,

@@ -42,21 +42,28 @@ pub const MOE_SORT: u32 = 8;
 pub const RMS_NORM: u32 = 16;
 const ALL: u32 = HC_POST | HC_PARTIAL | MOE_POST | MOE_SORT | RMS_NORM;
 
-fn parse(fuse: Option<&str>, mask: Option<&str>) -> Result<u32> {
+/// The groups a fused tier switches on: `name` must be unset, `0` or `1`;
+/// `{name}_MASK` (default `all`) selects groups within `all` for bisection.
+pub(super) fn parse_groups(
+    name: &str,
+    all: u32,
+    fuse: Option<&str>,
+    mask: Option<&str>,
+) -> Result<u32> {
     let on = match fuse {
         None | Some("0") => false,
         Some("1") => true,
-        Some(value) => bail!("ATLAS_GLM_DECODE_FUSE must be 0 or 1, got {value:?}"),
+        Some(value) => bail!("{name} must be 0 or 1, got {value:?}"),
     };
     let groups = match mask {
-        None => ALL,
+        None => all,
         Some(value) => {
             let groups: u32 = value.parse().map_err(|_| {
-                anyhow!("ATLAS_GLM_DECODE_FUSE_MASK must be a group mask in 0..=31, got {value:?}")
+                anyhow!("{name}_MASK must be a group mask in 0..={all}, got {value:?}")
             })?;
             ensure!(
-                groups & !ALL == 0,
-                "ATLAS_GLM_DECODE_FUSE_MASK must be a group mask in 0..=31, got {value:?}"
+                groups & !all == 0,
+                "{name}_MASK must be a group mask in 0..={all}, got {value:?}"
             );
             groups
         }
@@ -68,14 +75,22 @@ fn parse(fuse: Option<&str>, mask: Option<&str>) -> Result<u32> {
 /// value fails every launch that asks.
 fn groups() -> Result<u32> {
     static GROUPS: OnceLock<std::result::Result<u32, String>> = OnceLock::new();
-    let groups = GROUPS.get_or_init(|| {
-        let var = |name| std::env::var(name).ok();
-        let groups = parse(
-            var("ATLAS_GLM_DECODE_FUSE").as_deref(),
-            var("ATLAS_GLM_DECODE_FUSE_MASK").as_deref(),
-        );
+    env_groups(&GROUPS, "ATLAS_GLM_DECODE_FUSE", ALL, "fused decode groups")
+}
+
+/// [`parse_groups`] of the environment, read once into `cell` and logged
+/// (`what`) when any group is on.
+pub(super) fn env_groups(
+    cell: &OnceLock<std::result::Result<u32, String>>,
+    name: &str,
+    all: u32,
+    what: &str,
+) -> Result<u32> {
+    let groups = cell.get_or_init(|| {
+        let var = |suffix: &str| std::env::var(format!("{name}{suffix}")).ok();
+        let groups = parse_groups(name, all, var("").as_deref(), var("_MASK").as_deref());
         if let Ok(groups @ 1..) = groups {
-            tracing::info!("ATLAS_GLM_DECODE_FUSE: fused decode groups {groups:#x}");
+            tracing::info!("{name}: {what} {groups:#x}");
         }
         groups.map_err(|error| error.to_string())
     });
@@ -287,4 +302,4 @@ fn moe_unpermute_blend_for(
 
 #[cfg(test)]
 #[path = "glm_decode_fuse_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -114,20 +114,14 @@ impl Glm5KdaLayer {
                 stream,
             )?;
         }
-        self.hc_pre(&self.hc.attn, hidden, m, ctx, stream)?;
-
         let normed = ctx.buffers.norm_output();
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            hidden,
-            &self.input_norm,
-            normed,
-            m,
-            h_u32,
-            ctx.config.rms_norm_eps as f32,
-            stream,
-        )?;
+        // The norms after both seams (ATLAS_GLM_STEP_FUSE may fold them in).
+        let eps = ctx.config.rms_norm_eps as f32;
+        let seam_norm =
+            |weight| ops::glm_step_fuse::SeamNorm::new(self.rms_norm_k, weight, normed, eps);
+        let attn_norm = seam_norm(&self.input_norm);
+        self.hc_pre(&self.hc.attn, hidden, Some(&attn_norm), m, ctx, stream)?;
+        attn_norm.run(ctx.gpu, hidden, m, h_u32, stream)?;
 
         // Q/K/V/O are the dominant KDA weight streams. The batch2/3 GEMV
         // kernels preserve each row's scalar accumulation order while reading
@@ -319,18 +313,9 @@ impl Glm5KdaLayer {
         // Keep mixer and FFN batching independently switchable for diagnosis.
         // Atlas's K=3 FFN path emits a contiguous [N,H] result, so mHC can
         // consume the entire batch once.
-        self.hc_pre(&self.hc.ffn, hidden, m, ctx, stream)?;
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            hidden,
-            &self.post_attn_norm,
-            normed,
-            m,
-            h_u32,
-            ctx.config.rms_norm_eps as f32,
-            stream,
-        )?;
+        let ffn_norm = seam_norm(&self.post_attn_norm);
+        self.hc_pre(&self.hc.ffn, hidden, Some(&ffn_norm), m, ctx, stream)?;
+        ffn_norm.run(ctx.gpu, hidden, m, h_u32, stream)?;
         let compact_c2 = if independent || crate::model::glm_independent::ffn_rows_selected(ctx, n)?
         {
             Some(self.ffn.forward_independent(normed, n, ctx, stream)?)

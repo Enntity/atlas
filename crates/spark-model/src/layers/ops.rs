@@ -96,6 +96,8 @@ mod glm_router_bn4;
 mod glm_sparse_native;
 #[path = "ops/glm_sparse_prefill_tc.rs"]
 mod glm_sparse_prefill_tc;
+#[path = "ops/glm_step_fuse.rs"]
+pub mod glm_step_fuse;
 pub use glm_router_bn4::glm_router_bn4;
 #[path = "ops/hyper_connection.rs"]
 mod hyper_connection;
