@@ -608,7 +608,7 @@ pub fn build_model(
     // disk budget and the SSM tier's arena are all committed after this point.
     let nvme_record_bytes =
         PagedKvCache::nvme_record_bytes_for(&kv_config, glm_cache_plan.is_some(), sparse_index);
-    let inference_reserve = inference_reserve
+    let reserve_net = reserve_net
         + kv_nvme::host_reserve_bytes(nvme_record_bytes, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
@@ -784,7 +784,12 @@ pub fn build_model(
     // reports as free (Windows gfx1151: a 102 MB KV pool alloc failed with
     // 12 GB "free"), release the balloon and retry: the pre-balloon behavior.
     let mut balloon = balloon;
-    let mut kv_cache = match glm::new_kv_cache(kv_config.clone(), num_kv_blocks, gpu.as_ref(), glm_cache_plan) {
+    let mut kv_cache = match glm::new_kv_cache(
+        kv_config.clone(),
+        num_kv_blocks,
+        gpu.as_ref(),
+        glm_cache_plan,
+    ) {
         Ok(kv) => kv,
         Err(e) if balloon.is_some() => {
             tracing::warn!(

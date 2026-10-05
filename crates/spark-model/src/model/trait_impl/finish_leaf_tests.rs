@@ -184,6 +184,7 @@ fn the_save_pairs_live_h_with_the_boundary_conv() {
         3,
         false,
         SsmRollbackMode::Snapshot,
+        false,
         &gpu,
     )
     .unwrap();
