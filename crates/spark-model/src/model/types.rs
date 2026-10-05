@@ -382,6 +382,9 @@ pub struct TransformerModel {
     /// Piecewise-captured KDA runs of the GLM DFlash verify
     /// (`ATLAS_GLM_VERIFY_GRAPH=1`); see `model::verify_pieces`.
     pub(super) verify_pieces: super::verify_pieces::VerifyPieces,
+    /// Piecewise-captured GDN runs of the qwen4_exp decode and verify
+    /// (`ATLAS_QWEN4EXP_DECODE_GRAPH=1`); see `model::decode_pieces`.
+    pub(super) decode_pieces: super::verify_pieces::Pieces<super::decode_pieces::DecodePieceKey>,
     /// Prefix cache for KV block reuse across requests.
     pub(super) prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache>,
     /// Secondary CUDA stream for pipelining checkpoint D2D with MTP propose.
