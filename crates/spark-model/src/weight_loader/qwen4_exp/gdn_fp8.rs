@@ -25,8 +25,7 @@
 //!
 //! `=1` keeps the BF16 copies for prefill (cuBLASLt runs those GEMMs ~2.3x
 //! faster than `w8a16_gemm_pipelined` does FP8) and costs 1 byte a weight on
-//! top: +28.9 MB a layer per TP2 rank, all of it paid back by reclaiming the
-//! full BF16 `out_proj` source the TP2 shard leaves behind in the store.
+//! top: +28.9 MB a layer per TP2 rank.
 //! `=full` frees the BF16 copies (-57.7 MB a layer at TP1, where there is no
 //! headroom for `=1`) and prefill reads the FP8 copy too.
 
@@ -155,11 +154,6 @@ pub(super) fn build(
         ffn,
     )?;
     let out_key = format!("{lp}.linear_attn.out_proj.weight");
-    if dims.tp_size > 1 {
-        // The rank's row-parallel slice is a copy; nothing reads the full
-        // [h, value_dim] BF16 source after sharding.
-        store.reclaim(gpu, &out_key)?;
-    }
     let quantize_k = gpu.kernel(
         "quantize_bf16_to_fp8_blockscaled",
         "quantize_bf16_to_fp8_blockscaled",
