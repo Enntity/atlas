@@ -439,12 +439,10 @@ impl Model for TransformerModel {
         self.generate_speculative_dispatch(prompt_tokens, params, num_drafts)
     }
     fn verify_context_limit(&self) -> Option<usize> {
-        // A parallel serve reaches the batched attention path before
-        // `decode_a2`'s active-QSA gate; the layer guard refuses it, so the
-        // model must not advertise it.
-        if self.comm.is_some() {
-            return self.verify_context_limit_multi_seq();
-        }
+        // Also under a parallel comm: a single sequence's verify window is
+        // served per row on every rank (the QSA selection is replicated
+        // compute, the per-row attention uses the rank's own heads), and
+        // `decode_a2` sends concurrent decode with an active row per-seq.
         self.layers
             .iter()
             .filter_map(|l| l.verify_context_limit())

@@ -70,10 +70,6 @@ pub(super) struct RowsFacts {
     /// Every row belongs to ONE sequence (a verify window). Rows of different
     /// sequences are concurrent decode, which `decode_a2` routes per-sequence.
     pub single_owner: bool,
-    /// Expert/tensor-parallel comm present: `decode_a2` returns into the
-    /// batched path BEFORE its active-QSA gate there, so this guard is the
-    /// only thing between an EP serve and an unaudited path.
-    pub comm: bool,
     /// `--high-speed-swap` engaged: the gather reads the HBM pool.
     pub high_speed_swap: bool,
 }
@@ -91,8 +87,6 @@ impl RowsFacts {
             Some("the KV cache is not plain BF16")
         } else if !self.single_owner {
             Some("the rows span several sequences")
-        } else if self.comm {
-            Some("a parallel comm is present")
         } else if self.high_speed_swap {
             Some("--high-speed-swap is engaged")
         } else {
@@ -143,7 +137,7 @@ pub(super) fn plan_qsa_rows(
     num_seqs: usize,
     row_owner: Option<&[usize]>,
     kv_cache: &PagedKvCache,
-    ctx: &ForwardContext,
+    _ctx: &ForwardContext,
 ) -> Result<bool> {
     let Some(qsa) = layer.qsa.as_ref() else {
         return Ok(false);
@@ -169,7 +163,6 @@ pub(super) fn plan_qsa_rows(
         mla: layer.mla.is_some(),
         bf16_kv: matches!(k, KvCacheDtype::Bf16) && matches!(v, KvCacheDtype::Bf16),
         single_owner,
-        comm: ctx.comm.is_some(),
         high_speed_swap: layer.high_speed_swap_engaged(kv_cache),
     };
     plan_rows(first_active, qsa.inert_bound(), &facts)
@@ -185,7 +178,6 @@ mod tests {
         mla: false,
         bf16_kv: true,
         single_owner: true,
-        comm: false,
         high_speed_swap: false,
     };
 
@@ -197,7 +189,6 @@ mod tests {
             mla: true,
             bf16_kv: false,
             single_owner: false,
-            comm: true,
             high_speed_swap: true,
         };
         assert!(!plan_rows(None, 2051, &nothing).unwrap());
@@ -208,7 +199,7 @@ mod tests {
     fn an_active_row_is_served_only_by_the_exact_allow_list() {
         assert!(plan_rows(Some((1, 2051)), 2051, &SERVABLE).unwrap());
         // Flip each fact alone: every single one must refuse, with its reason.
-        let cases: [(RowsFacts, &str); 7] = [
+        let cases: [(RowsFacts, &str); 6] = [
             (
                 RowsFacts {
                     switch_on: false,
@@ -243,13 +234,6 @@ mod tests {
                     ..SERVABLE
                 },
                 "several sequences",
-            ),
-            (
-                RowsFacts {
-                    comm: true,
-                    ..SERVABLE
-                },
-                "comm",
             ),
             (
                 RowsFacts {
