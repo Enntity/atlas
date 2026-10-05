@@ -267,7 +267,16 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // qwen4_exp piecewise graphs (`model::decode_pieces`), as in
+            // verify_b.
+            let pieces = self.decode_pieces_admitted(use_graphs, &kv_cache, &ctx);
+
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if pieces
+                    && self.verify_gdn_piece_run(layer_idx, k, seq, &mut kv_cache, &ctx, stream)?
+                {
+                    continue;
+                }
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {

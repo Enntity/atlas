@@ -57,6 +57,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::types::TransformerModel;
 use super::verify_pieces::Pieces;
 use crate::layer::ForwardContext;
+use crate::traits::SequenceState;
 
 /// `ATLAS_QWEN4EXP_DECODE_GRAPH=1`; read once, from the profile both ranks
 /// share (`startup_parity`).
@@ -229,6 +230,90 @@ impl TransformerModel {
                 (layer_idx..end).try_for_each(|li| layer(li, &ctx))
             })?;
         Ok(true)
+    }
+
+    /// [`Self::gdn_piece_run`] for the single-row decode
+    /// (`decode_forward_body`): each layer runs `decode` and the DFlash
+    /// capture of row 0, as the eager loop does. A sequence without an SSM
+    /// pool slot runs eagerly.
+    pub(super) fn decode_gdn_piece_run(
+        &self,
+        layer_idx: usize,
+        seq: &mut SequenceState,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let Some(slot) = seq.ssm_slot_idx() else {
+            return Ok(false);
+        };
+        let (hidden, residual) = (self.buffers.hidden_states(), self.buffers.residual());
+        self.gdn_piece_run(
+            layer_idx,
+            PieceStep::Decode,
+            &[slot as u32],
+            1,
+            ctx,
+            stream,
+            |li, ctx| {
+                self.layers[li].decode(
+                    hidden,
+                    residual,
+                    seq.layer_states[li].as_mut(),
+                    kv_cache,
+                    seq.seq_len,
+                    &mut seq.block_table,
+                    &mut seq.disk_block_ids,
+                    &mut seq.disk_last_offloaded_per_layer,
+                    ctx,
+                    stream,
+                )?;
+                self.try_dflash_capture(li, 0, stream)
+            },
+        )
+    }
+
+    /// [`Self::gdn_piece_run`] for a K-row MTP verify of one sequence
+    /// (`verify_b` K=2, `verify_c` K=3): each layer runs `decode_batched`
+    /// and the DFlash capture of the last row, as the eager loops do. A
+    /// sequence without an SSM pool slot runs eagerly.
+    pub(super) fn verify_gdn_piece_run(
+        &self,
+        layer_idx: usize,
+        k: usize,
+        seq: &mut SequenceState,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let Some(slot) = seq.ssm_slot_idx() else {
+            return Ok(false);
+        };
+        let (hidden, residual) = (self.buffers.hidden_states(), self.buffers.residual());
+        self.gdn_piece_run(
+            layer_idx,
+            PieceStep::Verify,
+            &[slot as u32],
+            k,
+            ctx,
+            stream,
+            |li, ctx| {
+                self.layers[li].decode_batched(
+                    hidden,
+                    residual,
+                    k,
+                    seq.layer_states[li].as_mut(),
+                    kv_cache,
+                    seq.seq_len,
+                    &mut seq.block_table,
+                    &mut seq.disk_block_ids,
+                    &mut seq.disk_last_offloaded_per_layer,
+                    ctx,
+                    stream,
+                )?;
+                self.try_dflash_capture(li, k - 1, stream)
+            },
+        )
     }
 }
 

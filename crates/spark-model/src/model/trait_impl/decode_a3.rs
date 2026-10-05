@@ -12,7 +12,6 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::PagedKvCache;
 
-use super::super::decode_pieces::PieceStep;
 use super::super::types::TransformerModel;
 use crate::layer::{ForwardContext, TransformerLayer};
 use crate::layers::ops;
@@ -41,36 +40,9 @@ impl TransformerModel {
     ) -> Result<()> {
         // qwen4_exp piecewise graphs (`model::decode_pieces`): runs of GDN
         // layers replay captured; QSA attention and PLE stay eager below.
-        let slot = seq.ssm_slot_idx().map(|s| s as u32);
-        let pieces = slot.is_some()
-            && !probe_layers
-            && self.decode_pieces_admitted(use_graphs, kv_cache, ctx);
+        let pieces = !probe_layers && self.decode_pieces_admitted(use_graphs, kv_cache, ctx);
         for (i, layer) in self.layers.iter().enumerate() {
-            if pieces
-                && self.gdn_piece_run(
-                    i,
-                    PieceStep::Decode,
-                    slot.as_slice(),
-                    1,
-                    ctx,
-                    stream,
-                    |li, ctx| {
-                        self.layers[li].decode(
-                            hidden,
-                            residual,
-                            seq.layer_states[li].as_mut(),
-                            kv_cache,
-                            seq.seq_len,
-                            &mut seq.block_table,
-                            &mut seq.disk_block_ids,
-                            &mut seq.disk_last_offloaded_per_layer,
-                            ctx,
-                            stream,
-                        )?;
-                        self.try_dflash_capture(li, 0, stream)
-                    },
-                )?
-            {
+            if pieces && self.decode_gdn_piece_run(i, seq, kv_cache, ctx, stream)? {
                 continue;
             }
             layer.decode(
