@@ -16,7 +16,7 @@ use crate::layers::{FfnComponent, Qwen3AttentionLayer};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
     AttentionWeights, DenseWeight, Nvfp4Variant, dense_auto, free_loader_source, load_kv_scales,
-    quantize_to_nvfp4, quantized_auto,
+    quantize_to_nvfp4, quantize_to_nvfp4_scaled_by, quantized_auto,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -146,8 +146,17 @@ pub(crate) fn build_full_attention_nvfp4(
                     }
                 }
                 let __t_q0 = std::time::Instant::now();
-                let q = quantize_to_nvfp4(
-                    &sharded, local_n, local_k, gpu, absmax_k, quantize_k, stream,
+                // The full matrix sets the global scale, so a TP shard holds
+                // exactly the NVFP4 bytes of the matching TP=1 rows.
+                let q = quantize_to_nvfp4_scaled_by(
+                    &sharded,
+                    local_n,
+                    local_k,
+                    (src.weight, full_n * full_k),
+                    gpu,
+                    absmax_k,
+                    quantize_k,
+                    stream,
                 )?;
                 if std::env::var("ATLAS_LOAD_TIMING").is_ok() {
                     tracing::info!(
