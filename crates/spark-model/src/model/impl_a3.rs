@@ -228,29 +228,21 @@ impl TransformerModel {
                     stream,
                 )?;
             } else {
-                // Dense fallback: 2× GEMV. Stays BF16 even when
-                // use_fp32_logits is on — the FP32 path is decode-only
-                // (single-token `lm_head`); batched-decode/prefill keeps
-                // BF16 because the bug it fixes only manifests at decode
+                // Dense fallback: 2× GEMV — two full passes over the head,
+                // or one byte-identical batch-M pass under
+                // `ATLAS_QWEN4EXP_LMHEAD_BATCHM=1` (qwen4_exp). Stays BF16
+                // even when use_fp32_logits is on — the FP32 path is
+                // decode-only (single-token `lm_head`); batched-decode/prefill
+                // keeps BF16 because the bug it fixes only manifests at decode
                 // step 1 (first-token argmax tiebreak).
-                ops::dense_gemv(
-                    self.gpu.as_ref(),
-                    self.dense_gemv_kernel,
+                self.head_project(
+                    super::qwen4exp_lmhead_split::HeadArith::Gemv,
                     hidden,
-                    &self.lm_head_weight,
+                    0,
+                    v as usize,
+                    2,
                     logits,
-                    v,
-                    h,
-                    stream,
-                )?;
-                ops::dense_gemv(
-                    self.gpu.as_ref(),
-                    self.dense_gemv_kernel,
-                    hidden.offset(h as usize * 2),
-                    &self.lm_head_weight,
-                    logits.offset(v as usize * 2),
-                    v,
-                    h,
+                    v as usize,
                     stream,
                 )?;
             }

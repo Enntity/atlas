@@ -350,7 +350,7 @@ impl TransformerModel {
             self.final_norm_rows(hidden, normed, k as u32, stream)?;
 
             // LM head for 3 tokens
-            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+            self.lm_head_batched_tp(normed, k, stream)?;
 
             // Argmax inside graph
             let vocab = self.config.vocab_size;

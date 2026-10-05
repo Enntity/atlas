@@ -385,6 +385,9 @@ pub struct TransformerModel {
     /// Piecewise-captured GDN runs of the qwen4_exp decode and verify
     /// (`ATLAS_QWEN4EXP_DECODE_GRAPH=1`); see `model::decode_pieces`.
     pub(super) decode_pieces: super::verify_pieces::Pieces<super::decode_pieces::DecodePieceKey>,
+    /// Staging of the qwen4_exp TP2 vocabulary-split LM head
+    /// (`ATLAS_QWEN4EXP_LMHEAD_SPLIT=1`); see `model::qwen4exp_lmhead_split`.
+    pub(super) lmhead_split: Option<super::qwen4exp_lmhead_split::HeadSplit>,
     /// Prefix cache for KV block reuse across requests.
     pub(super) prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache>,
     /// Secondary CUDA stream for pipelining checkpoint D2D with MTP propose.

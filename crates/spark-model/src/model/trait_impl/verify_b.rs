@@ -410,8 +410,9 @@ impl TransformerModel {
             let normed = self.buffers.norm_output();
             self.final_norm_rows(hidden, normed, k as u32, stream)?;
 
-            // LM head for 2 tokens (GEMM: weights loaded once)
-            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+            // LM head for 2 tokens (NVFP4: one batch-2 GEMV pass; BF16: a
+            // GEMV a row, or one batch-M pass, `head_project`)
+            self.lm_head_batched_tp(normed, k, stream)?;
 
             // Argmax inside graph (fixed scratch addresses — graph-safe)
             let vocab = self.config.vocab_size;

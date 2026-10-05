@@ -405,7 +405,7 @@ impl TransformerModel {
             }
 
             // LM head for 4 tokens
-            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+            self.lm_head_batched_tp(normed, k, stream)?;
 
             if k4_diag && let Err(e) = self.gpu.synchronize(stream) {
                 anyhow::bail!("K4_DIAG: CUDA error after lm_head_batched: {e:#}");

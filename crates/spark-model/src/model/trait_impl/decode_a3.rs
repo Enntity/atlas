@@ -106,8 +106,9 @@ impl TransformerModel {
         let normed = self.buffers.norm_output();
         self.final_norm_rows(hidden, normed, 1, stream)?;
 
-        // LM head reads from normed directly (no D2D copy needed)
-        self.lm_head(normed, stream)?;
+        // LM head reads from normed directly (no D2D copy needed); split
+        // over the pair under `ATLAS_QWEN4EXP_LMHEAD_SPLIT=1`.
+        self.lm_head_tp(normed, stream)?;
         Ok(())
     }
 }

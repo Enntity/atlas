@@ -617,7 +617,7 @@ impl TransformerModel {
             // The returned pointer is discarded here: this path reports its
             // logits through `self.decode_logits_ptr()` at the end of the
             // function, which reads the same buffer.
-            self.lm_head_project_batched(normed, padded_n, h, bf16, stream)?;
+            self.lm_head_project_batched_tp(normed, padded_n, h, bf16, stream)?;
             if let Some(t0) = lmhead_t0 {
                 self.gpu.synchronize(stream).ok();
                 let head_us = t0.elapsed().as_micros();
