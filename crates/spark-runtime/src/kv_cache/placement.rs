@@ -39,11 +39,12 @@ pub struct KvPlacement {
 
 /// Which buffers may move to the carveout (`ATLAS_KV_CARVEOUT_ORDER`).
 ///
-/// Prefill reads run slower from the carveout than from `cuMemAlloc`
-/// memory, in proportion to how much a buffer is read. The sparse index
-/// buffers are the hottest: the indexer scores every earlier key for every
-/// query, so each index layer there cost about 1% of a 64K cold prefill on
-/// the pair. The latent (`K`/`V`) pools are read only at the selected rows.
+/// The GPU does not cache the carveout in L2 (`cuda_backend::display_carveout`),
+/// so a buffer there costs in proportion to how often its data is re-read.
+/// The sparse index buffers are the worst case: the indexer scores every
+/// earlier key for every query, so each index layer there cost about 1% of a
+/// 64K cold prefill on the pair. The latent (`K`/`V`) pools are read only at
+/// the selected rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CarveoutOrder {
     /// Any buffer, largest first (the original order; for comparison).
