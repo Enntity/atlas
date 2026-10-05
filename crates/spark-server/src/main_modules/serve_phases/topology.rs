@@ -100,6 +100,15 @@ pub(crate) fn resolve_topology(
             );
         }
         drop(loader);
+        // The qwen4_exp MTP head is built on rank 0 from the TP-local config,
+        // which would give it rank 0's attention heads only. Refuse until it
+        // is built from a TP=1 view of the config.
+        if config.model_type == "qwen4_exp" && (args.speculative || args.dflash) {
+            anyhow::bail!(
+                "qwen4_exp: speculative decoding is not supported with --tp-size {tp_size} yet; \
+                 drop --speculative"
+            );
+        }
         if !config.num_attention_heads.is_multiple_of(tp_size) {
             anyhow::bail!(
                 "TP requires num_attention_heads ({}) divisible by tp_size ({})",
