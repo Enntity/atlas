@@ -24,7 +24,6 @@
 #![allow(unused_imports, dead_code)]
 
 pub(crate) mod block_mgmt;
-pub(crate) mod dflash_ctx_window;
 mod block_table_upload;
 mod draft_assist;
 pub(crate) mod drafter_context;
