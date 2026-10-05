@@ -54,7 +54,9 @@ use spark_runtime::radix_tree::{glm_pc_evict_enabled, snap_evict_alpha, snap_evi
 use super::glm_long_verify::{oracle_enabled, serial_diagnostic};
 use super::trait_impl::finish_leaf;
 use super::trait_impl::prefill_b::pc_policy as pc;
-use super::{glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry, verify_pieces};
+use super::{
+    decode_pieces, glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry, verify_pieces,
+};
 use crate::layer::glm_long_owner;
 use crate::layers::dflash_head::rank_split;
 use crate::layers::qwen3_attention::{
@@ -314,6 +316,14 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     }),
     ("ATLAS_GLM_VERIFY_GRAPH", || {
         Ok(verify_pieces::requested() as u64)
+    }),
+    // Rank-safe either way (`decode_pieces` docs), carried like the GLM
+    // pieces so both ranks run one graph plan.
+    ("ATLAS_QWEN4EXP_DECODE_GRAPH", || {
+        Ok(decode_pieces::requested() as u64)
+    }),
+    ("ATLAS_QWEN4EXP_DECODE_GRAPH_COLLECTIVES", || {
+        Ok((decode_pieces::requested() && decode_pieces::collectives_requested()) as u64)
     }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)

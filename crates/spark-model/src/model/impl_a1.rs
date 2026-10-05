@@ -728,6 +728,7 @@ impl TransformerModel {
             verify_kgamma_graph: Mutex::new(std::collections::HashMap::new()),
             fused_graph: Mutex::new(std::collections::HashMap::new()),
             verify_pieces: Default::default(),
+            decode_pieces: super::decode_pieces::new_cache(),
             prefix_cache,
             warm,
             secondary_stream,

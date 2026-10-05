@@ -15,6 +15,7 @@ use atlas_core::config::LayerType;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::super::block_mgmt::{ensure_blocks_through_decode, extract_layer_refs};
+use super::super::decode_pieces::PieceStep;
 use super::super::types::TransformerModel;
 use crate::layer::{ForwardContext, LayerState, SsmLayerState};
 use crate::layers::ops;
@@ -519,10 +520,45 @@ impl TransformerModel {
 
             dump_hidden("post_embed", stream)?;
 
+            // qwen4_exp piecewise graphs (`model::decode_pieces`), keyed by
+            // the same SSM slot vector (dummy-padded) a whole-batch graph is.
+            let piece_slots = if self.decode_pieces_admitted(use_graphs, &kv_cache, &ctx) {
+                self.batch_decode_graph_key(&*seqs, padded_n)
+            } else {
+                None
+            };
+
             // Layer loop for padded_n sequences
             let mut ssm_us: u128 = 0;
             let mut attn_us: u128 = 0;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if let Some(slots) = piece_slots.as_deref()
+                    && self.gdn_piece_run(
+                        layer_idx,
+                        PieceStep::Batch,
+                        slots,
+                        padded_n,
+                        &ctx,
+                        stream,
+                        |li, ctx| {
+                            let mut refs = extract_layer_refs(&mut all_layer_states, li);
+                            self.layers[li].decode_multi_seq(
+                                hidden,
+                                residual,
+                                padded_n,
+                                n,
+                                &mut refs,
+                                &mut kv_cache,
+                                &seq_lens,
+                                &block_tables,
+                                ctx,
+                                stream,
+                            )
+                        },
+                    )?
+                {
+                    continue;
+                }
                 let mut layer_state_refs = extract_layer_refs(&mut all_layer_states, layer_idx);
                 let t0 = if ms_profile {
                     self.gpu.synchronize(stream).ok();
