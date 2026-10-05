@@ -62,6 +62,12 @@ pub struct Qwen3SsmLayer {
     // FP8 E4M3 checkpoint weights for native FP8 serving (w8a16_gemv LUT kernel)
     qkvz_fp8w: Option<Fp8Weight>,
     out_proj_fp8w: Option<Fp8Weight>,
+    /// The `*_fp8w` copies serve DECODE only: the prefill GEMMs keep reading
+    /// the BF16 `ssm.in_proj_qkvz` / `out_proj_dense` they were derived from,
+    /// and the batched decode out_proj reads FP8 ahead of that BF16 copy.
+    /// Set by `quantize_dense_gdn_to_fp8` (`ATLAS_QWEN4EXP_FP8_GDN=1`); false
+    /// everywhere else, where the dispatch is unchanged.
+    fp8w_decode_only: bool,
     // Transposed [K,N] copies of the block-scaled FP8 weights for the coalesced
     // `w8a16_gemm_t` prefill path — populated by `transpose_fp8_for_prefill`
     // for native-FP8 GDN checkpoints. The non-transposed `*_fp8w` copies stay

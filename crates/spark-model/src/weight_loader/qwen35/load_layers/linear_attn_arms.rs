@@ -219,6 +219,35 @@ pub(crate) fn build_linear_attention_dense_bf16(
     post_attn_norm: DenseWeight,
     ffn: FfnComponent,
 ) -> Result<Box<dyn TransformerLayer>> {
+    Ok(Box::new(dense_bf16_layer(
+        layer_idx,
+        store,
+        lp,
+        gpu,
+        variant,
+        config,
+        h,
+        input_norm,
+        post_attn_norm,
+        ffn,
+    )?))
+}
+
+/// The BF16 GDN build as its concrete layer, for callers that add to it
+/// before boxing (`qwen4_exp`'s FP8 decode copy).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dense_bf16_layer(
+    layer_idx: usize,
+    store: &WeightStore,
+    lp: &str,
+    gpu: &dyn GpuBackend,
+    variant: Nvfp4Variant,
+    config: &ModelConfig,
+    h: usize,
+    input_norm: DenseWeight,
+    post_attn_norm: DenseWeight,
+    ffn: FfnComponent,
+) -> Result<Qwen3SsmLayer> {
     // GDN HeadParallel: `config` already holds per-rank-LOCAL linear head
     // counts (topology.rs divided them by tp_size). `TpGdnDims::from_config`
     // multiplies back up to the full pre-shard sizes the on-disk weights use;
@@ -346,7 +375,7 @@ pub(crate) fn build_linear_attention_dense_bf16(
         layer.set_fp8_decode_weights(Some(qkvz_fp8), Some(out_fp8));
         tracing::info!("Layer {layer_idx}: SSM FP8 decode overlay installed (BF16 prefill kept)");
     }
-    Ok(Box::new(layer))
+    Ok(layer)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -303,6 +303,8 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_GLM_LONG_BATCH_FFN",
         "ATLAS_GLM_LONG_BATCH_SERIAL",
         "ATLAS_GLM_MTP_DISTRIBUTED",
+        "ATLAS_QWEN4EXP_FP8_GDN",
+        "ATLAS_QWEN4EXP_BF16_GDN",
         "ATLAS_STARTUP_PARITY=warn",
     ] {
         assert_eq!(
