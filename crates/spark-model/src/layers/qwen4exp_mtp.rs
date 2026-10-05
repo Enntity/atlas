@@ -128,11 +128,13 @@ impl Qwen4ExpMtpHead {
         module: Qwen4ExpMtpModule,
         embed_tokens: DenseWeight,
         lm_head: DenseWeight,
-        config: &atlas_core::config::ModelConfig,
         gpu: &dyn GpuBackend,
         mtp_vocab_size: u32,
         max_seq_len: usize,
     ) -> Result<Self> {
+        // The config the body was built with (the TP=1 view), so the cache
+        // holds every KV head the unsharded body writes.
+        let config = &module.config;
         let h = config.hidden_size;
         let hc = config.hc_mult.max(1);
 

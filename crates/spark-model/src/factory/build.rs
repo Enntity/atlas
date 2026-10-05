@@ -907,7 +907,6 @@ pub fn build_model(
             q4e_module,
             q4e_mtp_embed,
             q4e_mtp_lm_head,
-            model.config_ref(),
             model.gpu_backend(),
             mtp_vocab_size,
             max_seq_len,

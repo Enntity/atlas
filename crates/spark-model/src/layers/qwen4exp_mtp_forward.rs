@@ -150,15 +150,17 @@ impl Qwen4ExpMtpHead {
             ssm_batch: None,
             buffers: ctx.buffers,
             gpu: ctx.gpu,
-            config: ctx.config,
+            // The body's own config, never the trunk's: under TP the trunk's
+            // is this rank's head share, the body holds every head.
+            config: &self.module.config,
             dispatch: ctx.dispatch,
             derived: ctx.derived,
             levers: ctx.levers,
             stats: ctx.stats,
             attn_metadata: Some(mtp_meta),
             profile: ctx.profile,
-            // Rank 0 only: the body holds ALL experts locally, so its MoE must
-            // not issue an EP all-reduce no other rank will join.
+            // Rank 0 only: the body holds ALL heads and experts locally, so
+            // it must not issue a TP or EP all-reduce no other rank will join.
             comm: None,
             // Host-built metadata + the H2D uploads above are illegal under
             // graph capture.
