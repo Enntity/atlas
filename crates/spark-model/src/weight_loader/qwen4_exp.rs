@@ -78,11 +78,13 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense};
 // per-layer attach helpers.
 mod attach;
 mod ffn;
+mod gdn_fp8;
 mod hc;
 mod mtp;
 mod ple;
 mod probe;
 
+pub(crate) use gdn_fp8::GdnProjections;
 pub use mtp::{Qwen4ExpMtpModule, load_qwen4exp_mtp_module};
 pub use probe::audit_namespace;
 
@@ -246,15 +248,12 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // And it is not only a memory lever: ONLY the routed experts are
         // quantized in this checkpoint. The GDN projections ship BF16, so
         // requantizing them was a lossy round trip we chose, on 36 of 48
-        // layers. `=0` opts back into it for A/B.
-        let bf16_gdn = std::env::var("ATLAS_QWEN4EXP_BF16_GDN").as_deref() != Ok("0");
+        // layers. `=0` opts back into it for A/B. `ATLAS_QWEN4EXP_FP8_GDN` is
+        // the FP8 middle option (`gdn_fp8`).
+        let gdn = GdnProjections::from_env()?;
         tracing::info!(
             "GDN projections: {} on the {} linear-attention layers",
-            if bf16_gdn {
-                "BF16 as shipped (no runtime NVFP4 requantization)"
-            } else {
-                "requantized to NVFP4 (ATLAS_QWEN4EXP_BF16_GDN=0)"
-            },
+            gdn.describe(),
             config
                 .layer_types
                 .iter()
@@ -290,7 +289,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             let post_attn_norm = ones_norm(h, gpu)?;
 
             let layer = match config.layer_types[i] {
-                LayerType::LinearAttention if bf16_gdn => {
+                LayerType::LinearAttention if gdn == GdnProjections::Bf16 => {
                     // Keep the GDN projections BF16 instead of requantizing
                     // them to NVFP4 at load.
                     //
@@ -309,6 +308,15 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                         input_norm, post_attn_norm, ffn,
                     )
                     .with_context(|| format!("qwen4_exp: GDN layer {i} (BF16)"))?
+                }
+                LayerType::LinearAttention
+                    if matches!(gdn, GdnProjections::Fp8Decode | GdnProjections::Fp8Full) =>
+                {
+                    gdn_fp8::build(
+                        i, store, &lp, gpu, variant, config, input_norm, post_attn_norm, ffn,
+                        gdn == GdnProjections::Fp8Decode,
+                    )
+                    .with_context(|| format!("qwen4_exp: GDN layer {i} (FP8)"))?
                 }
                 LayerType::LinearAttention => {
                     crate::weight_loader::qwen35::load_layers::linear_attn_arms::build_linear_attention_nvfp4(

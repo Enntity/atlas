@@ -66,6 +66,7 @@ use crate::layers::qwen3_attention::{
 };
 use crate::layers::{self, glm_kv_shard, glm_sp, moe, ops, qwen3_ssm, w4a16_gemv_tiers};
 use crate::speculative::glm_repair_policy;
+use crate::weight_loader::qwen4_exp::GdnProjections;
 
 /// One agreed setting: its name and a rank's value.
 pub type Setting = (&'static str, u64);
@@ -278,6 +279,14 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // partial accept, on that rank alone.
     ("ATLAS_PLE_VERIFY_SNAPSHOTS", || {
         Ok(layers::ple::verify_snapshots_enabled() as u64)
+    }),
+    // The GDN projection weights each rank loads (qwen4_exp): ranks on two
+    // formats sum two different models' partial out_proj in one all-reduce.
+    ("ATLAS_QWEN4EXP_FP8_GDN", || {
+        Ok(GdnProjections::from_env()?.fp8_word())
+    }),
+    ("ATLAS_QWEN4EXP_BF16_GDN", || {
+        Ok((GdnProjections::from_env()? == GdnProjections::Nvfp4) as u64)
     }),
     // The MTP body a rank loads.
     ("ATLAS_GLM_MTP_DISTRIBUTED", || {

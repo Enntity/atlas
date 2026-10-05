@@ -1034,7 +1034,12 @@ impl Qwen3SsmLayer {
 
         // ── 9. Output projection → [K, H] ──
         let out_proj_buf = ctx.buffers.moe_output(); // [K, H] BF16
-        if let Some(ref dense_out) = self.out_proj_dense {
+        // A decode-only FP8 copy (`ATLAS_QWEN4EXP_FP8_GDN=1`) wins over the
+        // BF16 one it was quantized from — kept for prefill — so verify reads
+        // the weights single-token decode reads, at half the bytes.
+        if let Some(ref dense_out) = self.out_proj_dense
+            && !self.fp8w_decode_only
+        {
             if num_tokens <= 8
                 && ctx.levers.gdn_fp8_decode
                 && self.dense_gemv_fp8w_batchm_k.0 != 0

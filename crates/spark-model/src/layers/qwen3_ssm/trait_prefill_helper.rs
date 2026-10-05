@@ -97,6 +97,7 @@ impl Qwen3SsmLayer {
                 stream,
             )
         } else if ctx.dispatch.cutlass_nvfp4_ssm_out
+            && !self.fp8w_decode_only
             && let Some(ref fp8w) = self.out_proj_fp8w
         {
             ops::log_cutlass_nvfp4_route(ctx.gpu, "ssm_out_fp8pack", k, h as u32, value_dim as u32);
