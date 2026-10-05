@@ -370,14 +370,32 @@ fn skip_mtp(config: &ModelConfig, args: &cli::ServeArgs) -> bool {
     // qwen4_exp now BUILDS an MTP head, but only under `--speculative`
     // (`weight_loader/qwen4_exp/mtp.rs`). Without the flag the `mtp.*` upload is
     // 5.21 GB of BF16 held resident for nothing, which on a 119.6 GB unified box
-    // comes straight out of the KV cache. With the flag it is the drafter.
-    matches!(config.model_type.as_str(), "qwen4_exp") && !args.speculative
+    // comes straight out of the KV cache. With the flag it is the drafter, on
+    // rank 0 only (`factory::build`): every other rank skips it as well.
+    matches!(config.model_type.as_str(), "qwen4_exp") && (!args.speculative || config.ep_rank != 0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::quant_multiplier;
+    use super::{quant_multiplier, skip_mtp};
     use atlas_core::config::ModelConfig;
+    use clap::Parser as _;
+
+    /// qwen4_exp's `mtp.*` (5.21 GB) is uploaded only where it drafts: rank 0
+    /// under `--speculative`.
+    #[test]
+    fn qwen4_exp_mtp_is_uploaded_on_the_drafting_rank_only() {
+        let args = |more: &[&str]| {
+            let argv = ["spark", "some/model"].iter().chain(more);
+            crate::cli::ServeArgs::parse_from(argv)
+        };
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "qwen4_exp".to_string();
+        assert!(skip_mtp(&config, &args(&[])));
+        assert!(!skip_mtp(&config, &args(&["--speculative"])));
+        config.ep_rank = 1;
+        assert!(skip_mtp(&config, &args(&["--speculative"])));
+    }
 
     #[test]
     fn qwen4_exp_uses_measured_load_peak() {
