@@ -499,82 +499,40 @@ impl TransformerModel {
                     tracing::warn!("Worker SSM state normalization failed: {e:#}");
                 }
             }
+            // Verify K=2/3/4: receive K tokens, run the verify, receive the
+            // number of accepted drafts, then commit exactly as the head
+            // does (`commit_accepted_prefix`, via `ep_worker_apply_verdict`).
+            // A rollback of the worker's own making would skip what the
+            // commit also rewinds: the per-layer verify aux (qwen4_exp's PLE
+            // carry and QSA ingest watermark, replicated on every rank) and a
+            // deferred GDN commit, and the ranks would part ways.
             0xFFFFFFF2 => {
-                // Verify K=2: receive 2 tokens, run verify, receive accept/reject
                 let t0 = self.ep_broadcast_u32(0)?;
                 let t1 = self.ep_broadcast_u32(0)?;
                 self.sync_secondary()?;
                 self.decode_verify_graphed(&[t0, t1], seq, stream)?;
-                let accepted = self.ep_broadcast_u32(0)?;
-                if accepted == 1 {
-                    self.start_checkpoint_async(seq)?;
-                    self.trim_proposer_state(seq, 1, 0)?;
-                } else {
-                    seq.seq_len -= 1;
-                    seq.tokens.pop();
-                    self.trim_proposer_state(seq, 0, 0)?;
-                    self.start_rollback_and_checkpoint_async(seq, 1)?;
-                }
+                // The head sends accept (1) or reject (0) of its one draft.
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                self.ep_worker_apply_verdict(seq, &[t0, t1], num_accepted)?;
             }
             0xFFFFFFF3 => {
-                // Verify K=3: receive 3 tokens, run verify, receive num_accepted (0/1/2)
                 let t0 = self.ep_broadcast_u32(0)?;
                 let t1 = self.ep_broadcast_u32(0)?;
                 let t2 = self.ep_broadcast_u32(0)?;
                 self.sync_secondary()?;
                 self.decode_verify_graphed_k3(&[t0, t1, t2], seq, stream)?;
-                let num_accepted = self.ep_broadcast_u32(0)?;
-                self.trim_proposer_state(seq, num_accepted as usize, 0)?;
-                match num_accepted {
-                    2 => {
-                        self.start_checkpoint_async(seq)?;
-                    }
-                    1 => {
-                        seq.seq_len -= 1;
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 2)?;
-                    }
-                    _ => {
-                        seq.seq_len -= 2;
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 1)?;
-                    }
-                }
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                self.ep_worker_apply_verdict(seq, &[t0, t1, t2], num_accepted)?;
             }
             0xFFFFFFF4 => {
-                // Verify K=4: receive 4 tokens, run verify, receive num_accepted (0/1/2/3)
                 let t0 = self.ep_broadcast_u32(0)?;
                 let t1 = self.ep_broadcast_u32(0)?;
                 let t2 = self.ep_broadcast_u32(0)?;
                 let t3 = self.ep_broadcast_u32(0)?;
                 self.sync_secondary()?;
                 self.decode_verify_graphed_k4(&[t0, t1, t2, t3], seq, stream)?;
-                let num_accepted = self.ep_broadcast_u32(0)?;
-                self.trim_proposer_state(seq, num_accepted as usize, 0)?;
-                match num_accepted {
-                    3 => {
-                        self.start_checkpoint_async(seq)?;
-                    }
-                    2 => {
-                        seq.seq_len -= 1;
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 3)?;
-                    }
-                    1 => {
-                        seq.seq_len -= 2;
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 2)?;
-                    }
-                    _ => {
-                        seq.seq_len -= 3;
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        seq.tokens.pop();
-                        self.start_rollback_and_checkpoint_async(seq, 1)?;
-                    }
-                }
+                let num_accepted = self.ep_broadcast_u32(0)? as usize;
+                self.ep_worker_apply_verdict(seq, &[t0, t1, t2, t3], num_accepted)?;
             }
             0xFFFFFFF5 => self.ep_worker_generic_verify(seq, stream)?,
             token => {
