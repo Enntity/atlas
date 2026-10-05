@@ -271,6 +271,12 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_W4A16_TC", || {
         Ok(w4a16_gemv_tiers::tc_requested() as u64)
     }),
+    // Whether a verify can roll back the PLE carry every rank replicates
+    // (qwen4_exp): without its snapshots `commit_accepted_prefix` refuses a
+    // partial accept, on that rank alone.
+    ("ATLAS_PLE_VERIFY_SNAPSHOTS", || {
+        Ok(layers::ple::verify_snapshots_enabled() as u64)
+    }),
     // The MTP body a rank loads.
     ("ATLAS_GLM_MTP_DISTRIBUTED", || {
         Ok(glm_repair_policy::mtp_distributed() as u64)

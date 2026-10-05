@@ -192,7 +192,13 @@ fn rank_settings(
     expert_tp: bool,
     prefill_budget: usize,
     max_batch_tokens: usize,
-) -> [spark_model::model::startup_parity::Setting; 12] {
+) -> [spark_model::model::startup_parity::Setting; 14] {
+    // Off the speculative lanes no pool is sized by the draft depth.
+    let num_drafts = if args.speculative || args.self_speculative || args.ngram_speculative {
+        args.num_drafts.unwrap_or(0)
+    } else {
+        0
+    };
     [
         ("ATLAS_GLM_EXPERT_TP", expert_tp as u64),
         // The arena and pair capacity, and what it is resolved from: equal
@@ -220,10 +226,36 @@ fn rank_settings(
             "--speculative or --dflash",
             (args.speculative || args.dflash) as u64,
         ),
+        // The verify width the SSM pools keep rollback state for (`SsmPools`:
+        // `num_drafts + 1` intermediates a slot), and which slots carry it
+        // with how many drafts each, as the pool is built from the MTP ladder
+        // environment. The head clamps a step's drafts to its own pool, so a
+        // worker with a narrower one rolls back from state it never kept.
+        ("--num-drafts", num_drafts as u64),
+        (
+            "MTP verify pool (ATLAS_MTP_MAX_SEQS, _K_LADDER, _POOL_FULL_WIDTH)",
+            mtp_verify_pool_word(args.max_batch_size, num_drafts),
+        ),
         // Both keep a step out of a CUDA graph.
         ("--high-speed-swap", args.high_speed_swap as u64),
         ("--profile", args.profile as u64),
     ]
+}
+
+/// One word for the MTP verify-state pool's geometry (`ssm_reserve`): the
+/// slots that carry rollback state and each slot's draft capacity. 0 off the
+/// speculative lanes.
+#[cfg(feature = "nccl")]
+fn mtp_verify_pool_word(max_batch_size: usize, num_drafts: usize) -> u64 {
+    use spark_model::ssm_reserve::{mtp_state_slots, verify_slot_drafts};
+    if num_drafts == 0 {
+        return 0;
+    }
+    let slots = mtp_state_slots(max_batch_size);
+    (0..slots).fold(slots as u64, |word, slot| {
+        word.wrapping_mul(31)
+            .wrapping_add(verify_slot_drafts(slot, num_drafts) as u64)
+    })
 }
 
 /// `max_batch_tokens` and `hidden_size` size the 2-rank all-reduce receive
@@ -379,6 +411,22 @@ mod tests {
             ),
             ["prefill chunk (--max-prefill-tokens)", "--max-batch-size"]
         );
+    }
+
+    #[test]
+    fn a_worker_with_another_draft_depth_is_named() {
+        assert_eq!(
+            differing(
+                (&["--speculative", "--num-drafts=2"], 8192, 8196),
+                (&["--speculative", "--num-drafts=1"], 8192, 8196)
+            ),
+            [
+                "--num-drafts",
+                "MTP verify pool (ATLAS_MTP_MAX_SEQS, _K_LADDER, _POOL_FULL_WIDTH)"
+            ]
+        );
+        // Off the speculative lanes the depth sizes nothing.
+        assert!(differing((&["--num-drafts=2"], 8192, 8196), (&[], 8192, 8196)).is_empty());
     }
 
     #[test]
