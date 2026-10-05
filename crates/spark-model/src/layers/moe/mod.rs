@@ -205,5 +205,6 @@ mod prequant_fp4_c3;
 mod prequant_fp4_down;
 pub(crate) use prequant_fp4::with_owner_rows;
 mod ptr_table_build;
+mod qwen4exp_fast;
 mod union_stats;
 pub(crate) use ptr_table_build::*;
