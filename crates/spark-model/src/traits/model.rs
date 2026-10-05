@@ -616,6 +616,16 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// True when every row of a single-sequence verify (K = 2..=num_drafts+1,
+    /// within `verify_max_drafts`) is bitwise the serial decode step at its
+    /// position, so a T=0 speculative run commits exactly the tokens and
+    /// logits a non-speculative one does. Default false: batch-K verify
+    /// kernels round differently from the single-row ones. qwen4_exp under
+    /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1` (`model/qwen4exp_exact_verify.rs`).
+    fn verify_bit_exact(&self) -> bool {
+        false
+    }
+
     /// Check if speculative decoding is available (MTP or self-speculative).
     fn has_proposer(&self) -> bool;
 

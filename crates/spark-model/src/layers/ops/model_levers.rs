@@ -81,6 +81,11 @@ pub struct ModelLevers {
     /// Official Lightning product: use the scalar W8A16 input projection per
     /// verify row. The existing batch4 kernel is not byte-identical at K=4.
     pub lightning_mamba_scalar_in_proj: bool,
+    /// qwen4_exp: every K-row verify row runs the kernels serial decode runs,
+    /// bit for bit (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`; design in
+    /// `model/qwen4exp_exact_verify.rs`). Not from the environment directly:
+    /// `TransformerModel::new` sets it for a qwen4_exp model only.
+    pub qwen4exp_exact_verify: bool,
 
     // ── LoRA ──
     /// Apply LoRA eagerly at load instead of at each forward.
@@ -172,6 +177,8 @@ impl ModelLevers {
             // diagnostic lets a no-spec control use identical target arithmetic.
             lightning_mamba_exact_recurrence: lightning_lossless_target,
             lightning_mamba_scalar_in_proj: lightning_lossless_target,
+            // Model-specific: `TransformerModel::new` sets it.
+            qwen4exp_exact_verify: false,
             lora_eager: opt_in_truthy("ATLAS_LORA_EAGER"),
             lora_rotate: opt_in_truthy("ATLAS_LORA_ROTATE"),
             k4_diag: opt_in("ATLAS_K4_DIAG"),

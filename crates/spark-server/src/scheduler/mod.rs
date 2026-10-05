@@ -778,8 +778,14 @@ pub fn run(
             // inside `<think>`. Standard MTP already verifies during think.
             // DFlash raw-argmax does not run ForcedThinkEnd, so it stays
             // serial-in-think unless this lever is on. Resume guard still
-            // serial-decodes the spec-entry window.
-            let dflash_spec_think = sched.levers.dflash_spec_think;
+            // serial-decodes the spec-entry window. A bit-exact verify
+            // (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`) counts as the opt-in for a
+            // single sequence: speculating there is lossless.
+            let dflash_spec_think = mtp_gate::spec_think_for(
+                sched.levers.dflash_spec_think,
+                model.verify_bit_exact(),
+                active.len(),
+            );
             // ATLAS_GLM_STRICT_SPEC=1: strict structured-output sequences
             // speculate too, on the DFlash lane whose verify the GLM split head
             // grammar-masks row by row (`strict_spec`). Anywhere else they stay

@@ -324,6 +324,35 @@ impl Qwen3SsmLayer {
         let generic_arm = std::env::var("ATLAS_HC_GENERIC_MOE_ARM").as_deref() != Ok("0");
         stage!("hc_pre_ffn");
 
+        // ATLAS_QWEN4EXP_EXACT_VERIFY: each row through the MoE serial decode
+        // runs (`ffn.forward`, as the attention layers' verify already does in
+        // `multi_seq/hc_generic.rs`), and its own hc_post. `forward_k2/k3` is
+        // a different function of the row: its batched top-k breaks exact
+        // logit ties the other way, and on the originals expert layout its
+        // gate_up/down kernels split K across lanes differently and do not
+        // clamp gate/up to +-10 as the single-row kernels do. `forward` lands
+        // every row in `moe_output` row 0, so the post runs per row too.
+        if ctx.levers.qwen4exp_exact_verify && (2..=3).contains(&num_tokens) {
+            for i in 0..num_tokens {
+                let moe_out = self.ffn.forward(normed2.offset(i * h * 2), ctx, stream)?;
+                ops::hc_post_site(
+                    ctx.gpu,
+                    self.hc_post_k,
+                    hc,
+                    moe_out,
+                    streams.offset(i * hc.hc_mult * h * 4),
+                    post.offset(i * hc.hc_mult * 4),
+                    comb.offset(i * hc.hc_mult * hc.hc_mult * 4),
+                    streams.offset(i * hc.hc_mult * h * 4),
+                    1,
+                    h as u32,
+                    stream,
+                )?;
+            }
+            stage!("moe+hc_post_ffn (per row)");
+            return Ok(());
+        }
+
         if num_tokens == 3 {
             self.ffn.forward_k3(normed2, ctx, stream)?;
         } else if num_tokens == 2 {

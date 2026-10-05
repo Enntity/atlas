@@ -960,7 +960,7 @@ impl Qwen3SsmLayer {
         // ── 8. Gated RMS norm per token (Z gate at [Q|K|V] offset) ──
         let normed_out_buf = conv_out_buf;
         let z_offset = key_dim * 2 + value_dim; // == conv_dim
-        if super::verify_exact_enabled() {
+        if super::verify_exact_for(ctx.levers) {
             // Issue #435 exact arm (phase 5-7 above): the norm is already
             // applied inside the per-token chain — the SAME fused/unfused arm
             // sequential decode uses — and the normed rows are already in

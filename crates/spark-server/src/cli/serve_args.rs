@@ -324,6 +324,12 @@ pub struct ServeArgs {
     /// extended to the rest of the forward. That, not this flag alone, is
     /// what end-to-end spec-on == spec-off would require.
     ///
+    /// Done for qwen4_exp (Qwen3.8-Flash-Next) at K=2/3, one sequence:
+    /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1` turns this chain on for that model and
+    /// moves its remaining row-count-dependent ops (attention K/V, the GDN
+    /// layers' MoE) to serial decode's arithmetic
+    /// (`spark-model/src/model/qwen4exp_exact_verify.rs`).
+    ///
     /// The default verify pass runs the WY-chunkwise / fused BF16-conv arms:
     /// fast, but their BF16-output conv (h-state relL2 ~8.6e-4 per K=4
     /// window, committed into persistent SSM state) plus a ~3.4e-8 chunkwise

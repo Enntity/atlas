@@ -72,6 +72,7 @@ mod kv_nvme;
 pub(crate) mod mtp_carry;
 pub(crate) mod pinned_pack;
 pub(crate) mod prefix_share;
+pub(crate) mod qwen4exp_exact_verify;
 pub(crate) mod qwen4exp_lmhead_split;
 pub(crate) mod ssm_batched_copy;
 pub(crate) mod ssm_indexed_decode;

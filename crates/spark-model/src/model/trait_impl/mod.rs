@@ -30,6 +30,7 @@ mod decode_graph_key;
 pub(super) mod drafter_prefill;
 mod entry;
 mod ep_misc;
+mod exact_verify_check;
 pub(crate) mod finish_leaf;
 mod graph_borrow;
 mod lm_head_batched;
@@ -459,6 +460,9 @@ impl Model for TransformerModel {
             .iter()
             .filter_map(|l| l.verify_max_drafts())
             .min()
+    }
+    fn verify_bit_exact(&self) -> bool {
+        self.levers.qwen4exp_exact_verify
     }
     fn has_proposer(&self) -> bool {
         self.has_proposer_dispatch()
