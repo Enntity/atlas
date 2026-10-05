@@ -24,7 +24,6 @@ use super::super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
-use super::super::decode_pieces::PieceStep;
 use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::types::{PinnedMetaStaging, TransformerModel};
@@ -318,36 +317,12 @@ impl TransformerModel {
             }
 
             // qwen4_exp piecewise graphs (`model::decode_pieces`): the GDN
-            // runs of the K=2 verify replay captured, keyed by the slot.
-            let slot = seq.ssm_slot_idx().map(|s| s as u32);
-            let pieces = slot.is_some() && self.decode_pieces_admitted(use_graphs, &kv_cache, &ctx);
+            // runs of the verify replay captured, keyed by the SSM slot.
+            let pieces = self.decode_pieces_admitted(use_graphs, &kv_cache, &ctx);
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 if pieces
-                    && self.gdn_piece_run(
-                        layer_idx,
-                        PieceStep::Verify,
-                        slot.as_slice(),
-                        k,
-                        &ctx,
-                        stream,
-                        |li, ctx| {
-                            self.layers[li].decode_batched(
-                                hidden,
-                                residual,
-                                k,
-                                seq.layer_states[li].as_mut(),
-                                &mut kv_cache,
-                                seq.seq_len,
-                                &mut seq.block_table,
-                                &mut seq.disk_block_ids,
-                                &mut seq.disk_last_offloaded_per_layer,
-                                ctx,
-                                stream,
-                            )?;
-                            self.try_dflash_capture(li, k - 1, stream)
-                        },
-                    )?
+                    && self.verify_gdn_piece_run(layer_idx, k, seq, &mut kv_cache, &ctx, stream)?
                 {
                     continue;
                 }
