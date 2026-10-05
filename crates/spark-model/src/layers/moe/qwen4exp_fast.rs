@@ -5,10 +5,10 @@
 //!
 //! It takes the transposed-table (`_t`) launches of single-row decode
 //! (`dispatch_unified_t_decode`), the K=2 and K=3 verify/batch kernels
-//! (`_batch2_t`, `_batch3_t`), and `forward_batched`'s per-row loop for up to
-//! four rows: TP1's unified layout serves all of them, TP2's hybrid layout
-//! reaches only the last. Every replaced launch writes the same bytes, so the
-//! callers' LoRA hooks, blends and EP reductions are untouched.
+//! (`_batch2_t`, `_batch3_t`), and `forward_batched`'s per-row loop, four
+//! rows a launch: TP1's unified layout serves all of them, TP2's hybrid
+//! layout reaches only the last. Every replaced launch writes the same
+//! bytes, so the callers' LoRA hooks, blends and EP reductions are untouched.
 
 use super::*;
 
@@ -115,12 +115,12 @@ impl MoeLayer {
     }
 
     /// `forward_batched`'s transposed-table rows in one gate/up and one down
-    /// launch instead of a pair per row; `gate` is its router output. Routing (each row's own top-k, into
-    /// adjacent index/weight slots), each row's blend and each row's EP
-    /// all-reduce are the loop's calls in the loop's order, so `moe_output`
-    /// and the collectives are unchanged. Returns `false`, having launched
-    /// nothing, wherever the loop would take another branch or hook.
-    #[allow(clippy::too_many_arguments)]
+    /// launch per chunk of up to four rows instead of a pair per row; `gate`
+    /// is its router output. Routing (each row's own top-k, into adjacent
+    /// index/weight slots), each row's blend and each row's EP all-reduce are
+    /// the loop's calls in the loop's order, so `moe_output` and the
+    /// collectives are unchanged. Returns `false`, having launched nothing,
+    /// wherever the loop would take another branch or hook.
     pub(super) fn forward_batched_qwen4exp_fast(
         &self,
         input: DevicePtr,
@@ -131,7 +131,7 @@ impl MoeLayer {
     ) -> Result<bool> {
         if !(self.qwen4exp_fast_t()
             && self.use_t_layout_for_prefill()
-            && (1..=ops::QWEN4EXP_MOE_MAX_ROWS).contains(&num_tokens)
+            && num_tokens > 0
             && self.lora.is_none()
             && ctx
                 .attn_metadata
@@ -184,59 +184,64 @@ impl MoeLayer {
         let expert_up_out = ctx.buffers.expert_up_out();
         let expert_down_out = ctx.buffers.expert_down_out();
         // The loop's shared scratch (see the aliasing note in forward.rs),
-        // here `num_tokens` rows deep, as the K=2/K=3 paths use it.
+        // here a chunk's rows deep, as the K=2/K=3 paths use it.
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
         let shared_out = ctx.buffers.attn_output();
-        self.qwen4exp_fast_gate_up(
-            ctx,
-            input,
-            expert_gate_out,
-            expert_up_out,
-            indices,
-            self.shared_gate_t.as_ref().unwrap_or(&null_qw),
-            shared_gate_scratch,
-            self.shared_up_t.as_ref().unwrap_or(&null_qw),
-            shared_up_scratch,
-            num_tokens,
-            stream,
-        )?;
-        self.qwen4exp_fast_silu_down(
-            ctx,
-            expert_gate_out,
-            expert_up_out,
-            expert_down_out,
-            indices,
-            shared_gate_scratch,
-            shared_up_scratch,
-            self.shared_down_t.as_ref().unwrap_or(&null_qw),
-            shared_out,
-            num_tokens,
-            stream,
-        )?;
-        for t in 0..num_tokens {
-            let output_t = ctx.buffers.moe_output().offset(t * h * bf16);
-            ops::moe_weighted_sum_blend(
-                ctx.gpu,
-                self.moe_weighted_sum_blend,
-                output_t,
-                expert_down_out.offset(t * top_k * h * bf16),
-                weights.offset(t * top_k * 4),
-                shared_out.offset(t * h * bf16),
-                input.offset(t * h * bf16),
-                self.weights.shared_expert_gate.weight,
-                h as u32,
-                top_k as u32,
-                h as u32,
+        for first in (0..num_tokens).step_by(ops::QWEN4EXP_MOE_MAX_ROWS) {
+            let rows = (num_tokens - first).min(ops::QWEN4EXP_MOE_MAX_ROWS);
+            let chunk_indices = indices.offset(first * top_k * 4);
+            self.qwen4exp_fast_gate_up(
+                ctx,
+                input.offset(first * h * bf16),
+                expert_gate_out,
+                expert_up_out,
+                chunk_indices,
+                self.shared_gate_t.as_ref().unwrap_or(&null_qw),
+                shared_gate_scratch,
+                self.shared_up_t.as_ref().unwrap_or(&null_qw),
+                shared_up_scratch,
+                rows,
                 stream,
             )?;
-            if let Some(comm) = ctx.comm
-                && ctx.config.ep_world_size > 1
-            {
-                if ctx.graph_capture {
-                    comm.all_reduce(output_t.0, h * 2)?;
-                } else {
-                    comm.all_reduce_async(output_t.0, h * 2, stream)?;
+            self.qwen4exp_fast_silu_down(
+                ctx,
+                expert_gate_out,
+                expert_up_out,
+                expert_down_out,
+                chunk_indices,
+                shared_gate_scratch,
+                shared_up_scratch,
+                self.shared_down_t.as_ref().unwrap_or(&null_qw),
+                shared_out,
+                rows,
+                stream,
+            )?;
+            for t in 0..rows {
+                let row = first + t;
+                let output_t = ctx.buffers.moe_output().offset(row * h * bf16);
+                ops::moe_weighted_sum_blend(
+                    ctx.gpu,
+                    self.moe_weighted_sum_blend,
+                    output_t,
+                    expert_down_out.offset(t * top_k * h * bf16),
+                    weights.offset(row * top_k * 4),
+                    shared_out.offset(t * h * bf16),
+                    input.offset(row * h * bf16),
+                    self.weights.shared_expert_gate.weight,
+                    h as u32,
+                    top_k as u32,
+                    h as u32,
+                    stream,
+                )?;
+                if let Some(comm) = ctx.comm
+                    && ctx.config.ep_world_size > 1
+                {
+                    if ctx.graph_capture {
+                        comm.all_reduce(output_t.0, h * 2)?;
+                    } else {
+                        comm.all_reduce_async(output_t.0, h * 2, stream)?;
+                    }
                 }
             }
         }

@@ -112,27 +112,42 @@ fn run(layer: &MoeLayer, rows: usize, input: DevicePtr, ctx: &crate::layer::Forw
     .unwrap();
 }
 
-/// The fast pair's two launches for `rows` rows: grids, block, shared memory,
-/// the buffers they write, and the trailing `rows` argument.
-fn assert_fast_pair(calls: &[Launch], f: ops::Qwen4ExpMoeFast, arena: &BufferArena, rows: usize) {
+/// The fast pairs for `rows` rows, one per chunk of up to four: grids,
+/// block, shared memory, the rows and routing slots each chunk reads, the
+/// buffers it writes, and its trailing `rows` argument. Returns the trace
+/// positions of each chunk's (gate/up, down) launches.
+fn assert_fast_pairs(
+    calls: &[Launch],
+    f: ops::Qwen4ExpMoeFast,
+    arena: &BufferArena,
+    rows: usize,
+) -> Vec<(usize, usize)> {
     let gate_up: Vec<_> = calls.iter().filter(|c| c.0 == f.gate_up.0).collect();
     let down: Vec<_> = calls.iter().filter(|c| c.0 == f.silu_down.0).collect();
-    assert_eq!((gate_up.len(), down.len()), (1, 1), "rows={rows}");
-    let (_, grid, block, smem, args, _) = gate_up[0];
-    assert_eq!(*grid, [2, (rows * K + 1) as u32, 2]);
-    assert_eq!((*block, *smem), ([160, 1, 1], (rows * H * 4) as u32));
-    assert_eq!(args[0], Arg::Ptr(arena.norm_output()));
-    assert_eq!(args[4], Arg::Ptr(arena.expert_gate_out()));
-    assert_eq!(args[8], Arg::Ptr(arena.expert_up_out()));
-    assert_eq!(args[9], Arg::Ptr(arena.scratch()));
-    assert_eq!(args[18..], [word(I), word(H), word(K), word(rows)]);
-    let (_, grid, block, smem, args, _) = down[0];
-    assert_eq!(*grid, [8, (rows * K + 1) as u32, 1]);
-    assert_eq!((*block, *smem), ([160, 1, 1], (rows * I * 4) as u32));
-    assert_eq!(args[5], Arg::Ptr(arena.expert_down_out()));
-    assert_eq!(args[6], Arg::Ptr(arena.scratch()));
-    assert_eq!(args[13..], [word(H), word(I), word(K), word(rows)]);
-    assert!(gate_up[0].5 < down[0].5);
+    let chunks = rows.div_ceil(4);
+    assert_eq!((gate_up.len(), down.len()), (chunks, chunks), "rows={rows}");
+    (0..chunks)
+        .map(|c| {
+            let n = (rows - 4 * c).min(4);
+            let slots = arena.scratch().offset(4 * c * K * 4);
+            let (_, grid, block, smem, args, at_gate_up) = gate_up[c];
+            assert_eq!(*grid, [2, (n * K + 1) as u32, 2]);
+            assert_eq!((*block, *smem), ([160, 1, 1], (n * H * 4) as u32));
+            assert_eq!(args[0], Arg::Ptr(arena.norm_output().offset(4 * c * H * 2)));
+            assert_eq!(args[4], Arg::Ptr(arena.expert_gate_out()));
+            assert_eq!(args[8], Arg::Ptr(arena.expert_up_out()));
+            assert_eq!(args[9], Arg::Ptr(slots));
+            assert_eq!(args[18..], [word(I), word(H), word(K), word(n)]);
+            let (_, grid, block, smem, args, at_down) = down[c];
+            assert_eq!(*grid, [8, (n * K + 1) as u32, 1]);
+            assert_eq!((*block, *smem), ([160, 1, 1], (n * I * 4) as u32));
+            assert_eq!(args[5], Arg::Ptr(arena.expert_down_out()));
+            assert_eq!(args[6], Arg::Ptr(slots));
+            assert_eq!(args[13..], [word(H), word(I), word(K), word(n)]);
+            assert!(at_gate_up < at_down);
+            (*at_gate_up, *at_down)
+        })
+        .collect()
 }
 
 #[test]
@@ -175,7 +190,7 @@ fn qwen4exp_moe_fast_takes_every_unified_row_count_in_one_pair() {
             calls.iter().all(|c| !replaced.contains(&c.0)),
             "rows={rows}"
         );
-        assert_fast_pair(&calls, f, &arena, rows);
+        assert_eq!(assert_fast_pairs(&calls, f, &arena, rows).len(), 1);
     }
 }
 
@@ -222,8 +237,9 @@ impl CommBackend for Comm<'_> {
 }
 
 /// TP2's hybrid layout keeps single-row decode on the originals and hands
-/// only `forward_batched` to the fast pair, whose routing, blends and EP
-/// reductions stay per row, in the loop's order.
+/// only `forward_batched` to the fast pair, four rows a chunk, whose routing,
+/// blends and EP reductions stay per row, in the loop's order, and whose next
+/// chunk reuses the expert buffers only after the previous chunk's blends.
 #[test]
 fn qwen4exp_moe_fast_hybrid_batched_rows_keep_per_row_routing_blends_and_reductions() {
     let gpu = Gpu::new();
@@ -232,7 +248,7 @@ fn qwen4exp_moe_fast_hybrid_batched_rows_keep_per_row_routing_blends_and_reducti
     assert!(!layer.use_t_layout_for_decode() && layer.use_t_layout_for_prefill());
     let f = fast(&gpu);
     layer.qwen4exp_moe_fast = f;
-    let arena = BufferArena::new(&config, 4, 2048, 16, 4, &gpu).unwrap();
+    let arena = BufferArena::new(&config, 8, 2048, 16, 8, &gpu).unwrap();
     let resources = ContextResources::new();
     let comm = Comm {
         gpu: &gpu,
@@ -257,14 +273,14 @@ fn qwen4exp_moe_fast_hybrid_batched_rows_keep_per_row_routing_blends_and_reducti
         1
     );
 
-    for rows in 1..=4 {
+    for rows in 1..=6 {
         comm.reductions.lock().unwrap().clear();
         gpu.clear();
         layer
             .forward_batched(arena.norm_output(), rows, &ctx, 7)
             .unwrap();
         let calls = launches(&gpu);
-        assert_fast_pair(&calls, f, &arena, rows);
+        let pairs = assert_fast_pairs(&calls, f, &arena, rows);
         let scratch = arena.scratch();
         let topk: Vec<_> = calls.iter().filter(|c| c.0 == layer.moe_topk.0).collect();
         let blend: Vec<_> = calls
@@ -277,22 +293,31 @@ fn qwen4exp_moe_fast_hybrid_batched_rows_keep_per_row_routing_blends_and_reducti
             (rows, rows, rows)
         );
         let weights = scratch.offset(rows * K * 4);
-        for t in 0..rows {
-            assert_eq!(topk[t].4[1], Arg::Ptr(scratch.offset(t * K * 4)));
-            assert_eq!(topk[t].4[2], Arg::Ptr(weights.offset(t * K * 4)));
-            let b = &blend[t].4;
-            assert_eq!(b[0], Arg::Ptr(arena.moe_output().offset(t * H * 2)));
+        for r in 0..rows {
+            let (c, t) = (r / 4, r % 4);
+            assert!(topk[r].5 < pairs[0].0, "every row routes first");
+            assert_eq!(topk[r].4[1], Arg::Ptr(scratch.offset(r * K * 4)));
+            assert_eq!(topk[r].4[2], Arg::Ptr(weights.offset(r * K * 4)));
+            let b = &blend[r].4;
+            assert_eq!(b[0], Arg::Ptr(arena.moe_output().offset(r * H * 2)));
             assert_eq!(
                 b[1],
                 Arg::Ptr(arena.expert_down_out().offset(t * K * H * 2))
             );
-            assert_eq!(b[2], Arg::Ptr(weights.offset(t * K * 4)));
+            assert_eq!(b[2], Arg::Ptr(weights.offset(r * K * 4)));
             assert_eq!(b[3], Arg::Ptr(arena.attn_output().offset(t * H * 2)));
-            assert_eq!(b[4], Arg::Ptr(arena.norm_output().offset(t * H * 2)));
-            // Row t reduces after its blend and before the next one.
-            assert_eq!(reductions[t].0, H * 2);
-            assert!(reductions[t].1 > blend[t].5);
-            assert!(t + 1 == rows || reductions[t].1 <= blend[t + 1].5);
+            assert_eq!(b[4], Arg::Ptr(arena.norm_output().offset(r * H * 2)));
+            assert!(
+                blend[r].5 > pairs[c].1,
+                "row {r} blends after its chunk's down"
+            );
+            if let Some(next) = pairs.get(c + 1) {
+                assert!(blend[r].5 < next.0, "chunk {c} is blended before reuse");
+            }
+            // Row r reduces after its blend and before the next one.
+            assert_eq!(reductions[r].0, H * 2);
+            assert!(reductions[r].1 > blend[r].5);
+            assert!(r + 1 == rows || reductions[r].1 <= blend[r + 1].5);
         }
     }
 }
