@@ -48,8 +48,8 @@ const HC_DECODE_MAX_T: u32 = 8;
 /// `ATLAS_QWEN4EXP_NO_HC_GEMM=1`: revert the large-T collapse to the fused
 /// FP32 kernel (deploy-time kill switch; the GEMM path rounds `normed` to
 /// BF16 before the projections).
-use super::hyper_connection_lowrank_gemm::{gemm_raw, hc_gemm};
-use super::hyper_connection_lowrank_split::hc_pre_split;
+use super::hyper_connection_lowrank_gemm::{gemm_raw, hc_fast, hc_gemm};
+use super::hyper_connection_lowrank_split::{HC_V_POST_BLOCK, hc_pre_split, hc_vec_aligned};
 
 fn hc_gemm_disabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -257,6 +257,23 @@ pub fn hc_post_lowrank(
     hc_mult: u32,
     stream: u64,
 ) -> Result<()> {
+    // ATLAS_QWEN4EXP_HC_FAST: four d per thread over (T, H/4/block) blocks
+    // instead of one block per token. Elementwise, so bit-identical.
+    if hc_fast() && hidden_size.is_multiple_of(4) && hc_vec_aligned(&[block_out, residual, out]) {
+        let k_vec = crate::layers::try_kernel(gpu, "hyper_connection", "hc_post_vec");
+        if k_vec.0 != 0 {
+            return KernelLaunch::new(gpu, k_vec)
+                .grid([num_tokens, (hidden_size / 4).div_ceil(HC_V_POST_BLOCK), 1])
+                .block([HC_V_POST_BLOCK, 1, 1])
+                .arg_ptr(block_out)
+                .arg_ptr(residual)
+                .arg_ptr(inj)
+                .arg_ptr(out)
+                .arg_u32(hidden_size)
+                .arg_u32(hc_mult)
+                .launch(stream);
+        }
+    }
     KernelLaunch::new(gpu, kernel)
         .grid([num_tokens, 1, 1])
         .block([256, 1, 1])
