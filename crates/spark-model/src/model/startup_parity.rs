@@ -55,7 +55,8 @@ use super::glm_long_verify::{oracle_enabled, serial_diagnostic};
 use super::trait_impl::finish_leaf;
 use super::trait_impl::prefill_b::pc_policy as pc;
 use super::{
-    decode_pieces, glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry, verify_pieces,
+    decode_pieces, glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry,
+    qwen4exp_lmhead_split, verify_pieces,
 };
 use crate::layer::glm_long_owner;
 use crate::layers::dflash_head::rank_split;
@@ -333,6 +334,11 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     }),
     ("ATLAS_QWEN4EXP_DECODE_GRAPH_COLLECTIVES", || {
         Ok((decode_pieces::requested() && decode_pieces::collectives_requested()) as u64)
+    }),
+    // The share of the qwen4_exp LM head a rank projects, and the exchange
+    // of the halves every decode/verify step adds.
+    ("ATLAS_QWEN4EXP_LMHEAD_SPLIT", || {
+        Ok(qwen4exp_lmhead_split::enabled() as u64)
     }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)

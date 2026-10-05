@@ -323,6 +323,13 @@ impl TransformerModel {
         };
         let glm_long_stage =
             super::impl_a1_spec_init::alloc_glm_long_stage(&config, has_mtp, gpu.as_ref())?;
+        let lmhead_split = super::qwen4exp_lmhead_split::HeadSplit::alloc(
+            &config.model_type,
+            config.vocab_size,
+            comm.as_deref(),
+            max_batch_size,
+            gpu.as_ref(),
+        )?;
         // Batched-verify WY pointer-table staging (fixed address for CUDA
         // graph stability; contents refreshed pre-graph every batched verify
         // step). One [h|Hi0..Hi14] x 32-entry slice per GDN layer — ~192 KB.
@@ -700,6 +707,7 @@ impl TransformerModel {
             verify_hidden_stash,
             verify_stream_stash,
             glm_long_stage,
+            lmhead_split,
             mtp_catchup_ring,
             mtp_catchup_meta: parking_lot::Mutex::new((0, 0)),
             mtp_prefill_hidden,
