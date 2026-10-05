@@ -318,8 +318,10 @@ pub fn build_model(
 
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
-    // this loudly so the user knows the flag was inert.
+    // this loudly so the user knows the flag was inert. Rank 0 only: the
+    // other ranks never draft and load no rank-0-only module.
     if use_speculative
+        && config.ep_rank == 0
         && dflash_args.is_none()
         && mtp_weights.is_empty()
         && v4_mtp_module.is_none()
