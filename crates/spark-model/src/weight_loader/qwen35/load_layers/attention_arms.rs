@@ -15,8 +15,8 @@ use crate::layer::TransformerLayer;
 use crate::layers::{FfnComponent, Qwen3AttentionLayer};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, Nvfp4Variant, dense_auto, load_kv_scales, quantize_to_nvfp4,
-    quantized_auto,
+    AttentionWeights, DenseWeight, Nvfp4Variant, dense_auto, free_loader_source, load_kv_scales,
+    quantize_to_nvfp4, quantized_auto,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -157,8 +157,14 @@ pub(crate) fn build_full_attention_nvfp4(
                         __t0.elapsed().as_millis(),
                     );
                 }
+                // Under TP the dense copy handed to the layer must be this
+                // rank's shard: the dense arms (`--attn-proj-dtype bf16`, the
+                // prefill fallbacks, `o_dense_bf16`) size their GEMMs with the
+                // TP-local head count, so the full-width source would make
+                // rank 1 compute rank 0's heads. TP=1 keeps the source as is.
                 if sharded_ptr != src.weight {
-                    gpu.free(sharded_ptr)?;
+                    free_loader_source(store, gpu, &format!("{p}.{name}.weight"), src)?;
+                    return Ok((sharded, q));
                 }
                 Ok((src, q))
             };

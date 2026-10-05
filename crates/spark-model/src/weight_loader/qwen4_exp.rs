@@ -95,9 +95,12 @@ pub struct Qwen4ExpWeightLoader;
 
 impl ModelWeightLoader for Qwen4ExpWeightLoader {
     fn supports_tp(&self) -> bool {
-        // Not attempted. mHC would need the stream buffer sharded alongside
-        // every projection, and the PLE row cache is a single-device arena.
-        false
+        // Two ranks in the overlapping TP=EP=2 shape only (checked in
+        // `load_layers`): GDN and attention are head-parallel through the
+        // qwen35 arms, routed experts are split by EP, and mHC, PLE, the QSA
+        // indexer, embed and lm_head are replicated, so every rank keeps the
+        // full hyper-connection streams and its own PLE row cache.
+        true
     }
 
     fn load_layers(
@@ -107,6 +110,14 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         gpu: &dyn GpuBackend,
         layer_kv_dtypes: &[KvCacheDtype],
     ) -> Result<Vec<Box<dyn TransformerLayer>>> {
+        anyhow::ensure!(
+            config.tp_world_size <= 1
+                || (config.tp_world_size == 2 && config.ep_world_size == 2 && !config.expert_tp),
+            "qwen4_exp: TP is supported as --tp-size 2 --ep-size 2 only (got tp={} ep={} expert_tp={})",
+            config.tp_world_size,
+            config.ep_world_size,
+            config.expert_tp,
+        );
         let report = audit_namespace(store, config);
         report.log();
         report.ensure_loadable()?;
