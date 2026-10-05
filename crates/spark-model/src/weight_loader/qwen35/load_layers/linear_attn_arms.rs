@@ -333,6 +333,11 @@ pub(crate) fn dense_bf16_layer(
     // axis read past the [vd] buffer → cuMemcpyDtoDAsync INVALID_VALUE at load.)
     let norm_ptr = ssm35.norm.weight;
     let (out_proj_ptr, _, _) = shard_gdn_out_proj_row_parallel(ssm35.out_proj.weight, &dims, gpu)?;
+    if tp_size > 1 {
+        // The rank's row-parallel slice is a copy; nothing reads the full
+        // [h, value_dim] BF16 source again (31.5 MB/layer on qwen4_exp).
+        free_loader_source(store, gpu, &format!("{la}.out_proj.weight"), ssm35.out_proj)?;
+    }
 
     let ssm = SsmWeights {
         in_proj_qkvz: qkvz_dense,
@@ -457,6 +462,15 @@ pub(crate) fn build_linear_attention_nvfp4(
     // out_proj is row-parallel: slice its input (value_dim) to local, then
     // quantize the LOCAL [h, local_value_dim] weight.
     let (out_proj_ptr, _, _) = shard_gdn_out_proj_row_parallel(ssm35.out_proj.weight, &dims, gpu)?;
+    if tp_size > 1 {
+        // Everything below reads the local slice, not the full source.
+        free_loader_source(
+            store,
+            gpu,
+            &format!("{lp}.linear_attn.out_proj.weight"),
+            ssm35.out_proj,
+        )?;
+    }
     let out_proj_local = DenseWeight {
         weight: out_proj_ptr,
     };
