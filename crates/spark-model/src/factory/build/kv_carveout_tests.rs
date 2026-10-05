@@ -56,9 +56,17 @@ fn sparkglm_gains_about_a_fifth_more_blocks_at_no_system_memory_cost() {
     let shape = sparkglm(&cfg);
     let budgeted = 95_535;
     let (n, placement) = plan(shape, budgeted, GB10);
-    // 2046 MiB over ~104 KB per block is ~20.6K blocks; whole-buffer
-    // placement may strand at most one index pool's worth.
-    assert!(n >= budgeted + 19_000, "{n}");
+    // Only latent pools move (`CarveoutOrder::Latent`): two 8448 B/block
+    // pools fit, so the pool grows until the rest of its ~104 KB per block
+    // fills the budgeted system bytes, ~18.5K blocks (+19%).
+    let buffers = shape.buffers(n);
+    assert!(
+        buffers
+            .iter()
+            .filter(|&&(buffer, _)| placement.contains(buffer))
+            .all(|&(buffer, _)| matches!(buffer, KvBuffer::K(_) | KvBuffer::V(_)))
+    );
+    assert!(n >= budgeted + 18_000, "{n}");
     assert!(n <= budgeted + GB10 / 104_192 + 1, "{n}");
     assert!(
         system_bytes(shape, n, &placement)
