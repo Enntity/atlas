@@ -505,48 +505,6 @@ pub fn build_model(
     // ── KV budget: what is left of total × gpu_memory_utilization ──
     // (contract, own-footprint measures and headroom floor: `kv_budget`).
     //
-    // Prime one DFlash ctx accumulator NOW — before the residual KV-pool
-    // sizing below consumes every remaining byte of the device map. The acc
-    // is ~`ctx_window` rows of target hiddens (600+ MB at ctx_window≥12K);
-    // allocating it lazily at request time lands AFTER the KV pool claim
-    // and hits the fragmentation wall with GBs nominally free. One buffer
-    // covers the first request; a warm turn's acc returns through carry
-    // adoption, and any further demand falls to the lazy path. Failure only
-    // forfeits the optimization — the request-time path still allocates.
-    // AMD APUs only (atlas_scale), like both balloons below: on GB10 the
-    // lazy path never hit that wall, and every byte held here comes out of
-    // the KV pool (27B DFlash2 at util 0.80: 43.9k -> 9.9k KV tokens).
-    if cfg!(atlas_scale)
-        && let Some(ref args) = dflash_args
-        && let Some(ref sub) = args.drafter_config.dflash_config
-    {
-        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4096);
-        let ctx_capacity = ctx_window.min(max_seq_len);
-        if ctx_capacity > 0 && !sub.target_layer_ids.is_empty() {
-            let acc_bytes = ctx_capacity
-                .saturating_mul(sub.target_layer_ids.len())
-                .saturating_mul(config.hidden_size)
-                .saturating_mul(2);
-            match gpu.alloc(acc_bytes) {
-                Ok(ptr) => {
-                    crate::layers::dflash_head::CTX_ACC_POOL.lock().push(ptr);
-                    tracing::info!(
-                        "DFlash ctx acc pool: primed {acc_bytes} B before KV residual sizing"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "DFlash ctx acc pool prime: alloc of {acc_bytes} B failed ({e}); \
-                         request-time path will allocate on demand"
-                    );
-                }
-            }
-        }
-    }
-
     // SSM state/snapshot pools MUST be allocated before the
     // `gpu.free_memory()` snapshot below: whatever is live at that point
     // lands in `used_so_far` and shrinks the KV budget automatically

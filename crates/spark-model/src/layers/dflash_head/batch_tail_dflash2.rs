@@ -20,7 +20,6 @@ impl BlockDiffusionDraftHead {
         &self,
         batch_size: u32,
         last_tokens: &[u32],
-        ban_depths: &[u32],
         ctx: &crate::layer::ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -49,10 +48,6 @@ impl BlockDiffusionDraftHead {
             last_tokens.len(),
             batch_size
         );
-        anyhow::ensure!(
-            ban_depths.len() == batch_size as usize,
-            "DFlash batched selector ban depths do not match batch"
-        );
         let gamma =
             u32::try_from(self.gamma).map_err(|_| anyhow::anyhow!("DFlash gamma exceeds u32"))?;
         let hidden = u32::try_from(self.hidden_size)
@@ -71,8 +66,8 @@ impl BlockDiffusionDraftHead {
         // when γ ≤ DENSE_GEMV_BATCHM_MAX_M; a single B·γ launch instead hits
         // `dense_gemm_bf16_pipelined` (MMA-tiled, different accumulation
         // order) — the measured draft-token divergence in job 316. The
-        // pipelined GEMM is row-M-invariant. GEMV/TC tiers and cuBLAS thresholds
-        // need the per-sequence mirror to preserve the serial dispatch.
+        // pipelined GEMM is row-M-invariant, so only the GEMV arm needs the
+        // per-sequence mirror; the weight re-read is a [rank, H] table.
         let seq_hidden_bytes = (gamma as usize)
             .checked_mul(hidden as usize)
             .and_then(|n| n.checked_mul(2))
@@ -85,11 +80,7 @@ impl BlockDiffusionDraftHead {
             self.kernels.small_m_gemv,
             self.kernels.dense_gemv_batchm.0 != 0,
             gamma,
-        ) || self.drafter_cublas
-            || (self.kernels.small_m_gemv
-                && self.kernels.dense_gemv_tc16.0 != 0
-                && self.kernels.dense_gemv_tc32.0 != 0)
-        {
+        ) {
             for sequence in 0..batch_size as usize {
                 self.drafter_dense_gemm(
                     ctx.gpu,
@@ -116,29 +107,7 @@ impl BlockDiffusionDraftHead {
             )?;
         }
 
-        // (b) The upstream batched ABI has no EOS-ban arguments. Keep its
-        // single launch only when every sequence is outside min_tokens;
-        // otherwise use the ban-aware streaming selector for each sequence.
-        if self.kernels.dflash2_candidate_selector_batched.0 != 0
-            && ban_depths.iter().all(|&depth| depth == 0)
-        {
-            return ops::dflash2_candidate_selector_batched(
-                ctx.gpu,
-                self.kernels.dflash2_candidate_selector_batched,
-                self.batch_logits,
-                self.batch_dflash2_projected,
-                selector.predecessor_codebook.weight,
-                selector.successor_codebook.weight,
-                self.batch_tokens,
-                self.batch_markov_prev,
-                batch_size,
-                gamma,
-                vocab,
-                rank,
-                selector.top_k as u32,
-                stream,
-            );
-        }
+        // (b) One selector launch per sequence on that sequence's slices.
         let seq_logits_bytes = (gamma as usize)
             .checked_mul(vocab as usize)
             .and_then(|n| n.checked_mul(2))

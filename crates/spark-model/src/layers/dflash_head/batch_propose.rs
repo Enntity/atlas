@@ -322,39 +322,11 @@ impl BlockDiffusionDraftHead {
                         );
                         continue;
                     }
-                    // #58: stage in the head's pinned mask region (slot =
-                    // sequence) and ship retained-async — a sync copy_h2d
-                    // here was one stream drain per masked sequence.
-                    let base = self
-                        .batch_grammar_masks_host_pinned
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(mask.as_ptr() as *const u8, words * 4)
+                    };
                     let mask_dev = self.batch_grammar_bitmask.offset(sequence * words * 4);
-                    let pinned_bytes = words * 4;
-                    if !base.is_null()
-                        && sequence * pinned_bytes + pinned_bytes
-                            <= self.batch_grammar_masks_pinned_bytes
-                    {
-                        // SAFETY: slot `sequence` of the page-locked mask
-                        // region is exclusively this sequence's for the
-                        // whole call; the batch-token readback completes
-                        // the retained copies before the slot is reused.
-                        let staging = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                base.add(sequence * pinned_bytes),
-                                pinned_bytes,
-                            )
-                        };
-                        let src: &[u8] = unsafe {
-                            std::slice::from_raw_parts(mask.as_ptr() as *const u8, pinned_bytes)
-                        };
-                        staging.copy_from_slice(src);
-                        ctx.gpu.copy_h2d_async_retained(staging, mask_dev, stream)?;
-                    } else {
-                        let bytes: &[u8] = unsafe {
-                            std::slice::from_raw_parts(mask.as_ptr() as *const u8, pinned_bytes)
-                        };
-                        ctx.gpu.copy_h2d(bytes, mask_dev)?;
-                    }
+                    ctx.gpu.copy_h2d(bytes, mask_dev)?;
                     for row in 0..2usize.min(self.gamma) {
                         crate::layers::ops::apply_grammar_bitmask(
                             ctx.gpu,
@@ -369,7 +341,7 @@ impl BlockDiffusionDraftHead {
                 }
             }
             if self.candidate_selector.is_some() {
-                self.run_batched_dflash2_tail(batch_size, last_tokens, &ban_depths, ctx, stream)?;
+                self.run_batched_dflash2_tail(batch_size, last_tokens, ctx, stream)?;
             } else {
                 self.run_batched_markov(batch_size, ctx, stream)?;
             }
