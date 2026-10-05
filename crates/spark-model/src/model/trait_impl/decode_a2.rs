@@ -79,12 +79,6 @@ impl TransformerModel {
         // forward_batched.rs:269) remain at shape `h * elem` per call —
         // batching the comm shape would need new MoE kernel work and is
         // deliberately out of scope here.
-        if self.comm.is_some() {
-            let seq_ids: Vec<u32> = seqs.iter().map(|s| s.slot_idx as u32).collect();
-            self.ep_broadcast_decode_batch_dispatch(&seq_ids, tokens)?;
-            return self.decode_batch_compute_main(tokens, seqs, stream);
-        }
-
         // MLA models: as of issue #84 the batched `decode_multi_seq` path
         // HAS a genuine MLA branch (`ms_mla_decode` in
         // `qwen3_attention/trait_impl/multi_seq/mla.rs`) — the batched
@@ -127,6 +121,16 @@ impl TransformerModel {
         };
         let hc_perseq = self.config.hc_mult > 0
             && (qsa_active || std::env::var("ATLAS_HC_PERSEQ_DECODE").as_deref() == Ok("1"));
+        // Parallel comm: the batched forward has no per-row QSA hook under EP
+        // (`multi_seq/guard.rs` refuses an active row with comm present), so a
+        // highway batch with an ACTIVE selection takes the per-seq loop below,
+        // where each `decode()` drives the worker through the single-sequence
+        // EP command exactly as C1 decode does. Everything else stays batched.
+        if self.comm.is_some() && !hc_perseq {
+            let seq_ids: Vec<u32> = seqs.iter().map(|s| s.slot_idx as u32).collect();
+            self.ep_broadcast_decode_batch_dispatch(&seq_ids, tokens)?;
+            return self.decode_batch_compute_main(tokens, seqs, stream);
+        }
         if mla_perseq_fallback || hc_perseq {
             use std::sync::atomic::Ordering;
             let logits = self.decode_logits_ptr();
@@ -148,6 +152,9 @@ impl TransformerModel {
             let result = (|| -> Result<()> {
                 let mut staged = vec![0u8; n * row_bytes];
                 for i in 0..n {
+                    // Under EP each sequence is one single-sequence step on
+                    // both ranks (a no-op without a parallel comm).
+                    self.ep_broadcast_cmd_for_seq(seqs[i].slot_idx as u32, tokens[i])?;
                     self.decode(tokens[i], seqs[i], stream)?;
                     // `decode()` wrote this sequence's logits to row 0.
                     // Pull them to the host before the next `decode()`'s
