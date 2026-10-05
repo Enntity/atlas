@@ -470,17 +470,8 @@ impl Qwen3AttentionLayer {
         let kv_bytes = kv_dim as usize * bf16;
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(3 * kv_bytes);
-        ops::w4a16_gemv_dual_batch3(
-            fwd.gpu,
-            self.w4a16_gemv_dual_batch3_k,
-            normed,
-            k_nvfp4,
-            k_scratch,
-            v_nvfp4,
-            v_scratch,
-            kv_dim,
-            h as u32,
-            stream,
+        self.ms_kv_batch3(
+            fwd, normed, k_nvfp4, k_scratch, v_nvfp4, v_scratch, kv_dim, h, stream,
         )?;
 
         for i in 0..3usize {
@@ -503,6 +494,102 @@ impl Qwen3AttentionLayer {
         // delta in `ms_phase_qkv`).
         let _ = (nq, eps);
         Ok(())
+    }
+
+    /// The K and V projections of a 2-row NVFP4 step, one weight pass each.
+    ///
+    /// `w4a16_gemv_dual_batch2` reads both weights in one launch, but it is
+    /// not the arithmetic serial decode's `w4a16_gemv_dual` runs (K split
+    /// across lanes differently, scale applied per element instead of per
+    /// block): ~1 output in 1000 differs by a BF16 ULP, and that K/V is
+    /// written to the cache serial decode reads afterwards. Under
+    /// `ATLAS_QWEN4EXP_EXACT_VERIFY` each projection takes
+    /// `w4a16_gemv_batch2` instead, whose rows are byte-identical to
+    /// `w4a16_gemv`, i.e. to `w4a16_gemv_dual` per projection
+    /// (`scripts/dev/qwen4exp_exact_verify_bench.cu`; +5 us a layer on GB10).
+    #[allow(clippy::too_many_arguments)]
+    fn ms_kv_batch2(
+        &self,
+        fwd: &crate::layer::ForwardContext<'_>,
+        normed: spark_runtime::gpu::DevicePtr,
+        k_nvfp4: &crate::weight_map::QuantizedWeight,
+        k_out: spark_runtime::gpu::DevicePtr,
+        v_nvfp4: &crate::weight_map::QuantizedWeight,
+        v_out: spark_runtime::gpu::DevicePtr,
+        kv_dim: u32,
+        h: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if fwd.levers.qwen4exp_exact_verify {
+            for (w, out) in [(k_nvfp4, k_out), (v_nvfp4, v_out)] {
+                ops::w4a16_gemv_batch2(
+                    fwd.gpu,
+                    self.w4a16_gemv_batch2_k,
+                    normed,
+                    w,
+                    out,
+                    kv_dim,
+                    h as u32,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+        ops::w4a16_gemv_dual_batch2(
+            fwd.gpu,
+            self.w4a16_gemv_dual_batch2_k,
+            normed,
+            k_nvfp4,
+            k_out,
+            v_nvfp4,
+            v_out,
+            kv_dim,
+            h as u32,
+            stream,
+        )
+    }
+
+    /// [`Self::ms_kv_batch2`] at 3 rows.
+    #[allow(clippy::too_many_arguments)]
+    fn ms_kv_batch3(
+        &self,
+        fwd: &crate::layer::ForwardContext<'_>,
+        normed: spark_runtime::gpu::DevicePtr,
+        k_nvfp4: &crate::weight_map::QuantizedWeight,
+        k_out: spark_runtime::gpu::DevicePtr,
+        v_nvfp4: &crate::weight_map::QuantizedWeight,
+        v_out: spark_runtime::gpu::DevicePtr,
+        kv_dim: u32,
+        h: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if fwd.levers.qwen4exp_exact_verify {
+            for (w, out) in [(k_nvfp4, k_out), (v_nvfp4, v_out)] {
+                ops::w4a16_gemv_batch3(
+                    fwd.gpu,
+                    self.w4a16_gemv_batch3_k,
+                    normed,
+                    w,
+                    out,
+                    kv_dim,
+                    h as u32,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+        ops::w4a16_gemv_dual_batch3(
+            fwd.gpu,
+            self.w4a16_gemv_dual_batch3_k,
+            normed,
+            k_nvfp4,
+            k_out,
+            v_nvfp4,
+            v_out,
+            kv_dim,
+            h as u32,
+            stream,
+        )
     }
 
     /// n=2 NVFP4 batched path.
@@ -560,17 +647,8 @@ impl Qwen3AttentionLayer {
         let kv_bytes = kv_dim as usize * bf16;
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(2 * kv_bytes);
-        ops::w4a16_gemv_dual_batch2(
-            fwd.gpu,
-            self.w4a16_gemv_dual_batch2_k,
-            normed,
-            k_nvfp4,
-            k_scratch,
-            v_nvfp4,
-            v_scratch,
-            kv_dim,
-            h as u32,
-            stream,
+        self.ms_kv_batch2(
+            fwd, normed, k_nvfp4, k_scratch, v_nvfp4, v_scratch, kv_dim, h, stream,
         )?;
 
         for i in 0..2usize {

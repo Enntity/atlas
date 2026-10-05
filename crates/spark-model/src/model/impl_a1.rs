@@ -167,6 +167,7 @@ impl TransformerModel {
         // tasks/determinism_investigation.md).
         let mut levers = ops::ModelLevers::from_env();
         levers.max_decode_seqs = (max_batch_size as u32).max(1);
+        levers.qwen4exp_exact_verify = super::qwen4exp_exact_verify::lever(&config.model_type)?;
 
         tracing::info!(
             "TransformerModel: {} layers, vocab={}, hidden={}{}{}",

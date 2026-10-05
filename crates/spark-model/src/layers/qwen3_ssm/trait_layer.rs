@@ -25,7 +25,7 @@ impl TransformerLayer for Qwen3SsmLayer {
         // (verify-exact bypasses the arm entirely; wyN has no FP16-h-state
         // twin). The intermediates-layout requirement is per-SEQUENCE and
         // checked by the caller (`SsmLayerState::h_inter_pool_layout`).
-        !super::verify_exact_enabled()
+        !super::verify_exact_for(levers)
             && !super::ssm_h_fp16_enabled()
             && self.wyn_kernel(num_tokens, levers.gdn_wyn).is_some()
             && Self::gdn_defer_active(

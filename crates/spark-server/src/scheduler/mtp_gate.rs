@@ -149,7 +149,8 @@ pub fn spec_dispatch_eligible(
     // numerics floor can flip a low-margin token mid-reasoning), and the
     // agentic-webserver gate measured the damage as deterministic 8-9/10
     // trajectory failures (2026-08-16 bisect: main+this-hunk fails, main
-    // without it passes 10/10).
+    // without it passes 10/10). A bit-exact verify removes the reason: the
+    // caller passes it in as `spec_think` (`spec_think_for`).
     if inside_thinking && !spec_think {
         return false;
     }
@@ -161,6 +162,18 @@ pub fn spec_dispatch_eligible(
     } else {
         post_think_emitted >= resume_guard
     }
+}
+
+/// The `spec_think` a step dispatches with: the `ATLAS_MTP_SPEC_THINK` /
+/// `ATLAS_DFLASH_SPEC_THINK` opt-in, or a model whose single-sequence verify
+/// is bitwise serial decode (`Model::verify_bit_exact`, qwen4_exp under
+/// `ATLAS_QWEN4EXP_EXACT_VERIFY=1`). The reason speculation stays out of
+/// `<think>` is that batch-K verify is not byte-lossless at T=0; an exact
+/// verify removes it. Only for ONE active sequence: a concurrent batch
+/// verifies through the multi-sequence path, which the exact switch does
+/// not cover, and its serial counterpart is batched decode besides.
+pub fn spec_think_for(opt_in: bool, verify_bit_exact: bool, active: usize) -> bool {
+    opt_in || (verify_bit_exact && active == 1)
 }
 
 /// [`spec_dispatch_eligible`] for one active sequence. A strict
