@@ -111,3 +111,27 @@ fn bytes_per_token_is_the_pooled_share() {
     // hd 8, ratio 4: a 16 B pooled row per 4 tokens.
     assert_eq!(indexer(&gpu, 256).bytes_per_token(), 4);
 }
+
+/// With reuse, a released buffer comes back for the next request of the
+/// same size and only of the same size; without it, nothing is kept.
+#[test]
+fn released_carry_buffers_are_reused_by_size() {
+    let gpu = MockGpuBackend::new();
+    let a = carry_alloc_via(&gpu, 4096, true).unwrap();
+    carry_free_via(&gpu, a, 4096, true).unwrap();
+    let other = carry_alloc_via(&gpu, 8192, true).unwrap();
+    assert_ne!(other, a, "a different size never takes a spare");
+    assert_eq!(
+        carry_alloc_via(&gpu, 4096, true).unwrap(),
+        a,
+        "same size reuses"
+    );
+    carry_free_via(&gpu, a, 4096, false).unwrap();
+    assert!(
+        SPARE.with(|s| s.borrow().is_empty()),
+        "off: freed, not kept"
+    );
+    carry_free_via(&gpu, other, 8192, true).unwrap();
+    assert_eq!(SPARE.with(|s| s.borrow().len()), 1);
+    SPARE.with(|s| s.borrow_mut().clear());
+}
