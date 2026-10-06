@@ -11,7 +11,6 @@ use crate::layers::ops;
 
 use super::{PleLayer, PleSeqState};
 use crate::layers::ngram_embed::NgramTable;
-use crate::layers::ple::ids::ple_ngram_ids;
 
 impl PleLayer {
     /// Marconi aux blob: `[hist_len u32][history u32s][conv f32 bytes]`.
@@ -121,20 +120,8 @@ impl PleLayer {
         if st.history.len() != self.dims.context_len() {
             self.reset(st, gpu, stream)?;
         }
-        // Keep what the history was BEFORE this window, and the window's own
-        // ids: `rollback_verify` rebuilds the history for whatever prefix the
-        // target ends up accepting. History is a fixed-width window, so it
-        // cannot simply be truncated back.
-        st.history_ckpt = st.history.clone();
-        st.verify_tokens = tokens.to_vec();
-        let mut window = st.history.clone();
-        window.extend_from_slice(tokens);
-        let all = ple_ngram_ids(&self.dims, &window);
-        let rows = &all[all.len() - tokens.len()..];
-        let flat: Vec<u64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        let flat = self.stage_window(st, tokens);
         let va = self.gather_host(&flat, gpu, stream)?;
-        let keep = self.dims.context_len();
-        st.history = window[window.len() - keep..].to_vec();
         st.prestaged_va = Some(va);
         st.prestaged_n = tokens.len();
         st.last_staged_va = va;
