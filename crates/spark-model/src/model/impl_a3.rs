@@ -213,6 +213,22 @@ impl TransformerModel {
                     )?;
                 }
             }
+        } else if self.levers.qwen4exp_exact_verify
+            && num_tokens > 2
+            && self.lm_head_nvfp4.is_none()
+        {
+            // qwen4_exp exact verify: serial decode's `dense_gemv_bf16` per
+            // row (one `_batchm` pass), not the scalar tile GEMM below.
+            self.head_project(
+                super::qwen4exp_lmhead_split::HeadArith::Gemv,
+                hidden,
+                0,
+                v as usize,
+                num_tokens as usize,
+                logits,
+                v as usize,
+                stream,
+            )?;
         } else if num_tokens == 2 {
             // Double-GEMV: reads weights once, computes 2 outputs.
             // GEMM M=2 with 64×64 tiles wastes 97% of M-dimension → ~3× slower.

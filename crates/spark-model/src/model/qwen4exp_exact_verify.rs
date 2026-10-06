@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Bit-exact K=2/3 MTP verify for qwen4_exp (Qwen3.8-Flash-Next)
+//! Bit-exact K=2/3/4 MTP verify for qwen4_exp (Qwen3.8-Flash-Next)
 //! (`ATLAS_QWEN4EXP_EXACT_VERIFY=1`, default off; both ranks must agree,
 //! `startup_parity`).
 //!
 //! With the switch, row `i` of a single-sequence verify (`verify_b.rs` K=2,
-//! `verify_c.rs` K=3) computes exactly the bits the serial decode step at
-//! that position computes: same kernels, same accumulation order, same
-//! inputs. A T=0 generation with `--speculative --num-drafts 1|2` then
+//! `verify_c.rs` K=3, `verify_c2.rs` K=4) computes exactly the bits the serial
+//! decode step at that position computes: same kernels, same accumulation
+//! order, same inputs. A T=0 generation with `--speculative --num-drafts
+//! 1|2|3` (K=3/4 need `ATLAS_QWEN4EXP_MTP_DEPTH`, `qwen4exp_mtp_depth.rs`) then
 //! commits the tokens, and the logits bytes, a non-speculative run commits,
 //! so speculation is lossless and the scheduler lets it run inside
 //! `<think>` (`Model::verify_bit_exact`, `mtp_gate::spec_think_for`).
@@ -24,15 +25,15 @@
 //! | GDN (FP8 opt-in) | `w8a16_gemv` | `w8a16_gemv_batch4` | equal |
 //! | GDN ba + gates | `dense_gemv_ba_gates` | `dense_gemm_ba_gates_prefill` | equal |
 //! | GDN conv, recurrence, gated norm | FP32 conv, `decode_f32`, `_f32_input` norm | BF16 conv, `wy2`, BF16 norm | **differ** -> the exact chain |
-//! | attention Q+gate | `w4a16_gemv_qg` | `w4a16_gemv_qg_batch2/3` | equal |
-//! | attention K/V | `w4a16_gemv_dual` | `w4a16_gemv_dual_batch2/3` | **differ** -> `w4a16_gemv_batch2/3` per projection |
+//! | attention Q+gate | `w4a16_gemv_qg` | `w4a16_gemv_qg_batch2/3`; 4 rows `w4a16_gemv_batch4_os` | 2/3 equal; 4 **differ** -> `w4a16_gemv_qg_batch4` |
+//! | attention K/V | `w4a16_gemv_dual` | `w4a16_gemv_dual_batch2/3`; 4 rows `_batch4_os` | **differ** (2/3) -> `w4a16_gemv_batch2/3/4` per projection |
 //! | q/k norm, rope, KV write, gate | per row | strided, per row | equal |
 //! | QSA select / attention | bs=1 | per row (`qsa_rows.rs`), BF16 paged decode has no split-K | equal |
-//! | attention o_proj | `w4a16_gemv_sw` | `w4a16_gemv_batch2/3` | equal |
+//! | attention o_proj | `w4a16_gemv_sw` | `w4a16_gemv_batch2/3`; 4 rows DP4A / TC tier when opted in | equal -> scalar `w4a16_gemv_batch4` |
 //! | MoE, attention layers | `ffn.forward` | per row `ffn.forward` | equal |
 //! | MoE, GDN layers | `ffn.forward` | `forward_k2/k3` | **differ** (top-k ties, originals-layout kernels, no +-10 clamp) -> per row `ffn.forward` |
 //! | TP all-reduces | `[1,h]` | `[K,h]` | equal (one commutative BF16 add) |
-//! | LM head | `dense_gemv_bf16` | per row, or `_batchm` | equal |
+//! | LM head (BF16) | `dense_gemv_bf16` | 2 rows per row or `_batchm`; 3/4 rows scalar `dense_gemm_bf16` | 3/4 **differ** (1 output in ~12k) -> `dense_gemv_bf16_batchm` rows |
 //!
 //! The three differing ops move to the serial arithmetic under the switch
 //! ([`ModelLevers::qwen4exp_exact_verify`](crate::layers::ops::ModelLevers)):
@@ -42,8 +43,11 @@
 //! row through `ffn.forward` (`trait_decode_batched_hc.rs`). Per-kernel row
 //! parity and cost: `scripts/dev/qwen4exp_exact_verify_bench.cu`.
 //!
+//! The 4-row arms: `multi_seq/qkv_exact4.rs` (Q/K/V), `attn/o_proj.rs`
+//! (scalar batch4 o_proj), `HeadArith::batched` + `lm_head_batched` (head).
+//!
 //! `ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK=1` (diagnostic, default off; both ranks)
-//! proves it on a live model: before each K=2/3 verify, the K tokens run
+//! proves it on a live model: before each K=2/3/4 verify, the K tokens run
 //! through serial decode on the live state, their logits and final hidden
 //! rows are kept, the state is put back (GDN h/conv copied back, PLE carry
 //! restored from its aux blob, QSA ingest rewound as a reject does), and the
@@ -91,7 +95,7 @@ fn lever_from(requested: bool, model_type: &str, h_f16: bool) -> Result<bool> {
         );
     }
     tracing::info!(
-        "qwen4_exp exact verify ON (ATLAS_QWEN4EXP_EXACT_VERIFY=1): K=2/3 verify rows \
+        "qwen4_exp exact verify ON (ATLAS_QWEN4EXP_EXACT_VERIFY=1): K=2/3/4 verify rows \
          run serial decode's arithmetic; speculation may run inside <think>"
     );
     Ok(true)

@@ -1,22 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Per-row bit parity and cost of the qwen4_exp (Qwen3.8-Flash-Next) K=2/3
+// Per-row bit parity and cost of the qwen4_exp (Qwen3.8-Flash-Next) K=2/3/4
 // verify kernels against the single-row kernels serial decode runs
 // (ATLAS_QWEN4EXP_EXACT_VERIFY, `model/qwen4exp_exact_verify.rs`).
 //
 // Row i of a batched launch over M rows must equal, byte for byte, a
 // single-row launch on row i alone. Real shapes, synthetic data (random
 // inputs at three scales, NVFP4/FP8 codes and scales drawn over their
-// finite ranges), M = 2 and 3:
+// finite ranges), M = 2, 3 and 4:
 //
 //   BF16 GEMV      dense_gemv_bf16  vs  _batch2 / _batchm        (GDN qkvz/out_proj, LM head)
 //   FP8 GEMV       w8a16_gemv       vs  w8a16_gemv_batch4         (ATLAS_QWEN4EXP_FP8_GDN)
-//   NVFP4 GEMV     w4a16_gemv[_sw]  vs  w4a16_gemv_batch2 / 3     (router, attention o_proj)
-//   NVFP4 Q+gate   w4a16_gemv_qg    vs  w4a16_gemv_qg_batch2 / 3  (attention Q)
+//   NVFP4 GEMV     w4a16_gemv[_sw]  vs  w4a16_gemv_batch2 / 3 / 4 (router, attention o_proj)
+//   NVFP4 Q+gate   w4a16_gemv_qg    vs  w4a16_gemv_qg_batch2/3/4  (attention Q)
 //   NVFP4 K/V      w4a16_gemv_dual  vs  w4a16_gemv_dual_batch2/3  (attention K/V: the default
-//                                       verify arm) and vs w4a16_gemv_batch2/3 per projection
-//   BF16 tile GEMM dense_gemm_bf16_pipelined M=1 vs M=2/3     (PLE key/value projections)
+//                                       verify arm) and vs w4a16_gemv_batch2/3/4 per projection
+//   BF16 tile GEMM dense_gemm_bf16_pipelined M=1 vs M=2/3/4   (PLE key/value projections)
 //   mHC collapse   hc_pre_stage/down/finish_x4, hc_post (default) and the
-//                  _vec kernels (ATLAS_QWEN4EXP_HC_FAST): T=2/3 vs T=1 per row
+//                  _vec kernels (ATLAS_QWEN4EXP_HC_FAST): T=2/3/4 vs T=1 per row
+//   BF16 LM head   dense_gemv_bf16 vs dense_gemm_bf16 M=3/4 (the default K=3/4 head;
+//                  informational — the exact verify projects `_batchm` rows)
 //
 // Then the cost of what the exact switch changes, GPU time per launch over a
 // ring of weight copies (>= 4x the 24 MiB L2, so weights stream from DRAM as
@@ -43,6 +45,14 @@
 // K/V at K=2: 2 x dual 14.5 us | dual_batch2 7.9 | 2 x batch2 12.9 (TP2),
 // 20.7 | 10.0 | 16.0 (TP1). GDN recurrence at K=2: exact 50.6 us vs wy2
 // 28.2 (TP2, 1.5 MB h a layer), 141.1 vs 50.8 (TP1).
+//
+// M=4 added 2026-10-05 (ennspark03): PASS, incl. w4a16_gemv_qg_batch4 vs
+// w4a16_gemv_qg and w4a16_gemv_batch4 vs w4a16_gemv_dual per projection.
+// The default BF16 LM head at 3/4 rows (scalar dense_gemm_bf16) differs from
+// dense_gemv_bf16 in 1 of 12288 / 16384 outputs, so the exact verify now
+// projects `_batchm` rows at K=3 too. Draft head (one dense_gemv_bf16 over
+// [n, 2560]): 5210.7 us at the full 248320 vocab, 1360.8 at 65536, 988.3
+// at 47149, 686.8 at 32768 (~244 GB/s each).
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -179,22 +189,22 @@ static void bf16_gemv(unsigned N, unsigned K, const char* tag) {
     CUfunction fm = load("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm");
     auto* B = dput(rand_bf16((size_t)N * K, 0.05f));
     for (float sc : SCALES) {
-        auto* A = dput(rand_bf16(3 * (size_t)K, sc));
-        auto* C1 = (unsigned short*)dzero(3 * (size_t)N * 2);
-        auto* C2 = (unsigned short*)dzero(3 * (size_t)N * 2);
-        for (unsigned r = 0; r < 3; r++) {
+        auto* A = dput(rand_bf16(4 * (size_t)K, sc));
+        auto* C1 = (unsigned short*)dzero(4 * (size_t)N * 2);
+        auto* C2 = (unsigned short*)dzero(4 * (size_t)N * 2);
+        for (unsigned r = 0; r < 4; r++) {
             void* a = A + (size_t)r * K;
             void* c = C1 + (size_t)r * N;
             launch(f1, dim3((N + 3) / 4), dim3(256), {&a, &B, &c, &N, &K});
         }
-        auto ref = dget(C1, 3 * (size_t)N * 2);
+        auto ref = dget(C1, 4 * (size_t)N * 2);
         char name[128];
         unsigned stride = N;
         launch(f2, dim3((N + 3) / 4), dim3(256), {&A, &B, &C2, &N, &K, &stride});
         snprintf(name, sizeof name, "%s bf16 batch2 x%g", tag, sc);
         report(name, std::vector<unsigned char>(ref.begin(), ref.begin() + 2 * N * 2),
                dget(C2, 2 * (size_t)N * 2), 2);
-        for (unsigned M = 2; M <= 3; M++) {
+        for (unsigned M = 2; M <= 4; M++) {
             launch(fm, dim3((N + 3) / 4), dim3(256), {&A, &B, &C2, &M, &N, &K, &stride});
             snprintf(name, sizeof name, "%s bf16 batchm M=%u x%g", tag, M, sc);
             report(name, std::vector<unsigned char>(ref.begin(), ref.begin() + M * N * 2),
@@ -214,16 +224,16 @@ static void fp8_gemv(unsigned N, unsigned K, const char* tag) {
     for (auto& x : s) x = 0.002f + 0.01f * (float)(g_rng() % 1000) / 1000.f;
     auto* S = dput(s);
     for (float sc : SCALES) {
-        auto* A = dput(rand_bf16(3 * (size_t)K, sc));
-        auto* C1 = (unsigned short*)dzero(3 * (size_t)N * 2);
-        auto* C2 = (unsigned short*)dzero(3 * (size_t)N * 2);
-        for (unsigned r = 0; r < 3; r++) {
+        auto* A = dput(rand_bf16(4 * (size_t)K, sc));
+        auto* C1 = (unsigned short*)dzero(4 * (size_t)N * 2);
+        auto* C2 = (unsigned short*)dzero(4 * (size_t)N * 2);
+        for (unsigned r = 0; r < 4; r++) {
             void* a = A + (size_t)r * K;
             void* c = C1 + (size_t)r * N;
             launch(f1, dim3((N + 3) / 4), dim3(256), {&a, &B, &S, &c, &N, &K});
         }
-        auto ref = dget(C1, 3 * (size_t)N * 2);
-        for (unsigned M = 2; M <= 3; M++) {
+        auto ref = dget(C1, 4 * (size_t)N * 2);
+        for (unsigned M = 2; M <= 4; M++) {
             launch(f4, dim3((N + 3) / 4), dim3(256), {&A, &B, &S, &C2, &M, &N, &K});
             char name[128];
             snprintf(name, sizeof name, "%s fp8 w8a16_gemv_batch4 M=%u x%g", tag, M, sc);
@@ -249,20 +259,22 @@ static Fp4 rand_fp4(unsigned N, unsigned K) {
 static void fp4_gemv(unsigned N, unsigned K, unsigned nh, unsigned hd, const char* tag) {
     CUfunction g1 = load("w4a16_gemv", "w4a16_gemv");
     CUfunction gsw = load("w4a16_gemv", "w4a16_gemv_sw");
-    CUfunction gb[2] = {load("w4a16_gemv", "w4a16_gemv_batch2"), load("w4a16_gemv", "w4a16_gemv_batch3")};
+    CUfunction gb[3] = {load("w4a16_gemv", "w4a16_gemv_batch2"), load("w4a16_gemv", "w4a16_gemv_batch3"),
+                        load("w4a16_gemv", "w4a16_gemv_batch4")};
     CUfunction q1 = load("w4a16_gemv", "w4a16_gemv_qg");
-    CUfunction qb[2] = {load("w4a16_gemv", "w4a16_gemv_qg_batch2"), load("w4a16_gemv", "w4a16_gemv_qg_batch3")};
+    CUfunction qb[3] = {load("w4a16_gemv", "w4a16_gemv_qg_batch2"), load("w4a16_gemv", "w4a16_gemv_qg_batch3"),
+                        load("w4a16_gemv", "w4a16_gemv_qg_batch4")};
     Fp4 W = rand_fp4(N, K);
     // The Q+gate kernels deinterleave [nh x (Q|gate) x hd] rows; only shapes
     // that are such a projection run them.
     const bool qg = nh * hd * 2 == N;
     for (float sc : SCALES) {
-        auto* A = dput(rand_bf16(3 * (size_t)K, sc));
-        auto* R = (unsigned short*)dzero(3 * (size_t)N * 2);
-        auto* Rs = (unsigned short*)dzero(3 * (size_t)N * 2);
-        auto* Rq = (unsigned short*)dzero(3 * (size_t)N * 2);
-        auto* O = (unsigned short*)dzero(3 * (size_t)N * 2);
-        for (unsigned r = 0; r < 3; r++) {
+        auto* A = dput(rand_bf16(4 * (size_t)K, sc));
+        auto* R = (unsigned short*)dzero(4 * (size_t)N * 2);
+        auto* Rs = (unsigned short*)dzero(4 * (size_t)N * 2);
+        auto* Rq = (unsigned short*)dzero(4 * (size_t)N * 2);
+        auto* O = (unsigned short*)dzero(4 * (size_t)N * 2);
+        for (unsigned r = 0; r < 4; r++) {
             void* a = A + (size_t)r * K;
             void* c = R + (size_t)r * N;
             void* cs = Rs + (size_t)r * N;
@@ -271,13 +283,16 @@ static void fp4_gemv(unsigned N, unsigned K, unsigned nh, unsigned hd, const cha
             launch(gsw, dim3((N + 7) / 8), dim3(256), {&a, &W.w, &W.s, &W.s2, &cs, &N, &K});
             if (qg) launch(q1, dim3((N + 3) / 4), dim3(256), {&a, &W.w, &W.s, &W.s2, &cq, &N, &K, &nh, &hd});
         }
-        auto ref = dget(R, 3 * (size_t)N * 2);
-        auto refq = dget(Rq, 3 * (size_t)N * 2);
+        auto ref = dget(R, 4 * (size_t)N * 2);
+        auto refq = dget(Rq, 4 * (size_t)N * 2);
         char name[128];
         snprintf(name, sizeof name, "%s nvfp4 w4a16_gemv_sw vs w4a16_gemv x%g", tag, sc);
-        report(name, ref, dget(Rs, 3 * (size_t)N * 2), 2);
-        for (unsigned M = 2; M <= 3; M++) {
-            launch(gb[M - 2], dim3((N + 3) / 4), dim3(256), {&A, &W.w, &W.s, &W.s2, &O, &N, &K});
+        report(name, ref, dget(Rs, 4 * (size_t)N * 2), 2);
+        for (unsigned M = 2; M <= 4; M++) {
+            if (M == 4)  // batch4 takes M (the M<=4 template entry point)
+                launch(gb[2], dim3((N + 3) / 4), dim3(256), {&A, &W.w, &W.s, &W.s2, &O, &M, &N, &K});
+            else
+                launch(gb[M - 2], dim3((N + 3) / 4), dim3(256), {&A, &W.w, &W.s, &W.s2, &O, &N, &K});
             snprintf(name, sizeof name, "%s nvfp4 w4a16_gemv_batch%u x%g", tag, M, sc);
             report(name, std::vector<unsigned char>(ref.begin(), ref.begin() + M * N * 2),
                    dget(O, (size_t)M * N * 2), 2);
@@ -296,35 +311,42 @@ static void fp4_gemv(unsigned N, unsigned K, unsigned nh, unsigned hd, const cha
 static void fp4_dual(unsigned N, unsigned K, const char* tag) {
     CUfunction d1 = load("w4a16_gemv_fused", "w4a16_gemv_dual");
     CUfunction db[2] = {load("w4a16_gemv", "w4a16_gemv_dual_batch2"), load("w4a16_gemv", "w4a16_gemv_dual_batch3")};
-    CUfunction gb[2] = {load("w4a16_gemv", "w4a16_gemv_batch2"), load("w4a16_gemv", "w4a16_gemv_batch3")};
+    CUfunction gb[3] = {load("w4a16_gemv", "w4a16_gemv_batch2"), load("w4a16_gemv", "w4a16_gemv_batch3"),
+                        load("w4a16_gemv", "w4a16_gemv_batch4")};
     Fp4 Wk = rand_fp4(N, K), Wv = rand_fp4(N, K);
     for (float sc : SCALES) {
-        auto* A = dput(rand_bf16(3 * (size_t)K, sc));
-        auto* Rk = (unsigned short*)dzero(3 * (size_t)N * 2);
-        auto* Rv = (unsigned short*)dzero(3 * (size_t)N * 2);
-        auto* Ok = (unsigned short*)dzero(3 * (size_t)N * 2);
-        auto* Ov = (unsigned short*)dzero(3 * (size_t)N * 2);
-        for (unsigned r = 0; r < 3; r++) {
+        auto* A = dput(rand_bf16(4 * (size_t)K, sc));
+        auto* Rk = (unsigned short*)dzero(4 * (size_t)N * 2);
+        auto* Rv = (unsigned short*)dzero(4 * (size_t)N * 2);
+        auto* Ok = (unsigned short*)dzero(4 * (size_t)N * 2);
+        auto* Ov = (unsigned short*)dzero(4 * (size_t)N * 2);
+        for (unsigned r = 0; r < 4; r++) {
             void* a = A + (size_t)r * K;
             void* ck = Rk + (size_t)r * N;
             void* cv = Rv + (size_t)r * N;
             launch(d1, dim3((N + 3) / 4, 1, 2), dim3(256),
                    {&a, &Wk.w, &Wk.s, &Wk.s2, &ck, &Wv.w, &Wv.s, &Wv.s2, &cv, &N, &K});
         }
-        auto rk = dget(Rk, 3 * (size_t)N * 2), rv = dget(Rv, 3 * (size_t)N * 2);
+        auto rk = dget(Rk, 4 * (size_t)N * 2), rv = dget(Rv, 4 * (size_t)N * 2);
         char name[128];
-        for (unsigned M = 2; M <= 3; M++) {
+        for (unsigned M = 2; M <= 4; M++) {
             size_t b = (size_t)M * N * 2;
-            launch(db[M - 2], dim3((N + 3) / 4, 1, 2), dim3(256),
-                   {&A, &Wk.w, &Wk.s, &Wk.s2, &Ok, &Wv.w, &Wv.s, &Wv.s2, &Ov, &N, &K});
-            snprintf(name, sizeof name, "%s K/V w4a16_gemv_dual_batch%u (default verify) x%g", tag, M, sc);
-            auto ok = dget(Ok, b), ov = dget(Ov, b);
-            ok.insert(ok.end(), ov.begin(), ov.end());
             std::vector<unsigned char> r(rk.begin(), rk.begin() + b);
             r.insert(r.end(), rv.begin(), rv.begin() + b);
-            report(name, r, ok, 2, false);
-            launch(gb[M - 2], dim3((N + 3) / 4), dim3(256), {&A, &Wk.w, &Wk.s, &Wk.s2, &Ok, &N, &K});
-            launch(gb[M - 2], dim3((N + 3) / 4), dim3(256), {&A, &Wv.w, &Wv.s, &Wv.s2, &Ov, &N, &K});
+            std::vector<unsigned char> ok, ov;
+            if (M <= 3) {  // no dual_batch4: the default K=4 arm is the batch4 template
+                launch(db[M - 2], dim3((N + 3) / 4, 1, 2), dim3(256),
+                       {&A, &Wk.w, &Wk.s, &Wk.s2, &Ok, &Wv.w, &Wv.s, &Wv.s2, &Ov, &N, &K});
+                snprintf(name, sizeof name, "%s K/V w4a16_gemv_dual_batch%u (default verify) x%g", tag, M, sc);
+                ok = dget(Ok, b); ov = dget(Ov, b);
+                ok.insert(ok.end(), ov.begin(), ov.end());
+                report(name, r, ok, 2, false);
+                launch(gb[M - 2], dim3((N + 3) / 4), dim3(256), {&A, &Wk.w, &Wk.s, &Wk.s2, &Ok, &N, &K});
+                launch(gb[M - 2], dim3((N + 3) / 4), dim3(256), {&A, &Wv.w, &Wv.s, &Wv.s2, &Ov, &N, &K});
+            } else {
+                launch(gb[2], dim3((N + 3) / 4), dim3(256), {&A, &Wk.w, &Wk.s, &Wk.s2, &Ok, &M, &N, &K});
+                launch(gb[2], dim3((N + 3) / 4), dim3(256), {&A, &Wv.w, &Wv.s, &Wv.s2, &Ov, &M, &N, &K});
+            }
             snprintf(name, sizeof name, "%s K/V 2 x w4a16_gemv_batch%u x%g", tag, M, sc);
             ok = dget(Ok, b); ov = dget(Ov, b);
             ok.insert(ok.end(), ov.begin(), ov.end());
@@ -376,17 +398,17 @@ static void bf16_gemm(unsigned N, unsigned K, const char* tag) {
     const unsigned T = 128, TH = 256;
     auto* B = dput(rand_bf16((size_t)N * K, 0.05f));
     for (float sc : SCALES) {
-        auto* A = dput(rand_bf16(3 * (size_t)K, sc));
-        auto* R = (unsigned short*)dzero(3 * (size_t)N * 2);
-        auto* O = (unsigned short*)dzero(3 * (size_t)N * 2);
+        auto* A = dput(rand_bf16(4 * (size_t)K, sc));
+        auto* R = (unsigned short*)dzero(4 * (size_t)N * 2);
+        auto* O = (unsigned short*)dzero(4 * (size_t)N * 2);
         unsigned one = 1;
-        for (unsigned r = 0; r < 3; r++) {
+        for (unsigned r = 0; r < 4; r++) {
             void* a = A + (size_t)r * K;
             void* c = R + (size_t)r * N;
             launch(g, dim3((N + T - 1) / T, 1), dim3(TH), {&a, &B, &c, &one, &N, &K});
         }
-        auto ref = dget(R, 3 * (size_t)N * 2);
-        for (unsigned M = 2; M <= 3; M++) {
+        auto ref = dget(R, 4 * (size_t)N * 2);
+        for (unsigned M = 2; M <= 4; M++) {
             launch(g, dim3((N + T - 1) / T, (M + T - 1) / T), dim3(TH), {&A, &B, &O, &M, &N, &K});
             char name[128];
             snprintf(name, sizeof name, "%s dense_gemm_bf16_pipelined M=%u x%g", tag, M, sc);
@@ -446,11 +468,11 @@ static void hc_rows() {
     void* inject_w = dput(rand_bf16((size_t)HC * HCD, 0.02f));
     for (int vec = 0; vec < 2; vec++) {
         for (float sc : SCALES) {
-            float* streams = dput(rand_f32(3 * (size_t)HCD, sc));
-            void* bo = dput(rand_bf16(3 * (size_t)H, sc));
+            float* streams = dput(rand_f32(4 * (size_t)HCD, sc));
+            void* bo = dput(rand_bf16(4 * (size_t)H, sc));
             std::vector<HcOut> one;
-            for (unsigned r = 0; r < 3; r++) one.push_back(hc_chain(vec, 1, r, streams, norm_w, down_w, up_w, inject_w, bo));
-            for (unsigned T = 2; T <= 3; T++) {
+            for (unsigned r = 0; r < 4; r++) one.push_back(hc_chain(vec, 1, r, streams, norm_w, down_w, up_w, inject_w, bo));
+            for (unsigned T = 2; T <= 4; T++) {
                 HcOut b = hc_chain(vec, T, 0, streams, norm_w, down_w, up_w, inject_w, bo);
                 auto cat = [&](std::vector<unsigned char> HcOut::*f) {
                     std::vector<unsigned char> v;
@@ -469,6 +491,51 @@ static void hc_rows() {
         }
     }
     cudaFree(norm_w); cudaFree(down_w); cudaFree(up_w); cudaFree(inject_w);
+}
+
+// ── BF16 LM head: serial dense_gemv_bf16 rows vs the default K=3/4 head ──
+// `lm_head_batched` on a BF16 head runs the scalar tile GEMM at 3+ rows; the
+// exact verify projects `dense_gemv_bf16_batchm` rows instead (checked in
+// bf16_gemv). Informational: how far the default head is from serial.
+static void head_gemm(unsigned N, unsigned K) {
+    CUfunction f1 = load("dense_gemv_bf16", "dense_gemv_bf16");
+    CUfunction g = load("dense_gemm_bf16", "dense_gemm_bf16");
+    auto* B = dput(rand_bf16((size_t)N * K, 0.05f));
+    auto* A = dput(rand_bf16(4 * (size_t)K, 1.0f));
+    auto* R = (unsigned short*)dzero(4 * (size_t)N * 2);
+    auto* O = (unsigned short*)dzero(4 * (size_t)N * 2);
+    for (unsigned r = 0; r < 4; r++) {
+        void* a = A + (size_t)r * K;
+        void* c = R + (size_t)r * N;
+        launch(f1, dim3((N + 3) / 4), dim3(256), {&a, &B, &c, &N, &K});
+    }
+    auto ref = dget(R, 4 * (size_t)N * 2);
+    for (unsigned M = 3; M <= 4; M++) {
+        launch(g, dim3((N + 15) / 16, (M + 15) / 16), dim3(16, 16), {&A, &B, &O, &M, &N, &K});
+        char name[128];
+        snprintf(name, sizeof name, "lm head dense_gemm_bf16 M=%u vs dense_gemv_bf16 (default)", M);
+        report(name, std::vector<unsigned char>(ref.begin(), ref.begin() + M * N * 2),
+               dget(O, (size_t)M * N * 2), 2, false);
+    }
+    cudaFree(A); cudaFree(B); cudaFree(R); cudaFree(O);
+}
+
+// ── Draft head cost: full-vocab vs reduced-vocab BF16 GEMV (one draft) ──
+// The MTP drafter's argmax head (`ATLAS_QWEN4EXP_DRAFT_VOCAB`): one
+// dense_gemv_bf16 over [n, 2560] per draft. Weights stream from DRAM (the
+// head is far larger than L2), so the cost is ~bytes / bandwidth.
+static void draft_head_cost(unsigned K) {
+    CUfunction f1 = load("dense_gemv_bf16", "dense_gemv_bf16");
+    const unsigned full = 248320;
+    auto* B = dput(rand_bf16((size_t)full * K, 0.05f));
+    auto* A = dput(rand_bf16(K, 1.0f));
+    auto* C = (unsigned short*)dzero((size_t)full * 2);
+    for (unsigned n : {248320u, 65536u, 47149u, 32768u}) {
+        double us = time_us([&](int) { launch(f1, dim3((n + 3) / 4), dim3(256), {&A, &B, &C, &n, &K}); });
+        printf("  cost draft head dense_gemv_bf16 [%u x %u]: %.1f us (%.1f GB/s)\n", n, K, us,
+               (double)n * K * 2 / us / 1e3);
+    }
+    cudaFree(A); cudaFree(B); cudaFree(C);
 }
 
 // ── GDN recurrence cost at K=2: exact (2 x decode_f32 + h snapshot) vs wy2 ──
@@ -547,9 +614,11 @@ int main(int argc, char** argv) {
     bf16_gemm(2560, 2560, "PLE value");
     bf16_gemm(10240, 2560, "PLE key");
     hc_rows();
+    head_gemm(4096, 2560);
     printf("%s (%d mismatching comparison%s)\n\nCost:\n", g_fail ? "FAIL" : "PASS", g_fail, g_fail == 1 ? "" : "s");
     // K/V cost is printed inside fp4_dual; GDN here.
     gdn_cost(8, 24, "TP2");
     gdn_cost(16, 48, "TP1");
+    draft_head_cost(2560);
     return g_fail ? 1 : 0;
 }

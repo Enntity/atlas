@@ -40,6 +40,10 @@ impl TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 4]> {
         let stream = self.gpu.default_stream();
+        // ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK: serial reference rows first,
+        // before the KV lock below (`exact_verify_check.rs`), as at K=2/3.
+        let serial_rows = self.exact_verify_serial_rows(&tokens[..], seq)?;
+        let seq_len_in = seq.seq_len;
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let fp32 = 2usize;
@@ -441,6 +445,10 @@ impl TransformerModel {
                     self.gpu.launch_graph(graph, stream)?;
                 }
             }
+        }
+
+        if let Some(rows) = serial_rows {
+            self.exact_verify_compare(rows, seq_len_in)?;
         }
 
         // ── Phase 3: Post-graph (D2H copy only) ──

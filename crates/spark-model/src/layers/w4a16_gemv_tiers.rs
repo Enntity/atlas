@@ -213,6 +213,14 @@ impl W4a16BatchmTiers {
         if (2..=8).contains(&m) && tc.0 != 0 {
             return tc;
         }
+        self.scalar_kernel(m)
+    }
+
+    /// [`Self::kernel`] without the tensor-core override: always a scalar
+    /// template tier, whose row `r` is byte-identical to `w4a16_gemv` on row
+    /// `r`. The qwen4_exp exact verify (`ATLAS_QWEN4EXP_EXACT_VERIFY`) takes
+    /// this one, so `ATLAS_W4A16_TC=1` cannot break its per-row parity.
+    pub fn scalar_kernel(&self, m: u32) -> KernelHandle {
         select_tier(m, self.present(), exact_m_tiers_enabled())
             .map_or(KernelHandle(0), |i| self.handles[i])
     }

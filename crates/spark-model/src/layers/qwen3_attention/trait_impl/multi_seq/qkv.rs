@@ -60,7 +60,10 @@ impl Qwen3AttentionLayer {
             ..
         } = *c;
 
-        if n == 3
+        if self.ms_qkv_exact4(c)? {
+            // qwen4_exp exact K=4 verify: serial decode's arithmetic per row
+            // (`qkv_exact4.rs`).
+        } else if n == 3
             && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
@@ -210,7 +213,7 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    fn q_lora_active(&self) -> bool {
+    pub(super) fn q_lora_active(&self) -> bool {
         self.lora.as_ref().and_then(|lw| lw.q.as_ref()).is_some()
     }
 
@@ -1058,7 +1061,7 @@ impl Qwen3AttentionLayer {
 
     /// Sequential per-token Q projection (handles gated and ungated).
     #[allow(clippy::too_many_arguments)]
-    fn ms_qkv_seq_q(
+    pub(super) fn ms_qkv_seq_q(
         &self,
         fwd: &crate::layer::ForwardContext<'_>,
         normed_i: spark_runtime::gpu::DevicePtr,
@@ -1203,7 +1206,7 @@ impl Qwen3AttentionLayer {
 
     /// Sequential per-token K + V projections.
     #[allow(clippy::too_many_arguments)]
-    fn ms_qkv_seq_kv(
+    pub(super) fn ms_qkv_seq_kv(
         &self,
         fwd: &crate::layer::ForwardContext<'_>,
         normed_i: spark_runtime::gpu::DevicePtr,

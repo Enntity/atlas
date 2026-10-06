@@ -57,10 +57,28 @@ fn chunks_follow_the_one_shot_cap() {
 fn shard_arithmetic_matches_the_unsplit_ladder() {
     // `lm_head_batched` on a BF16 head: two GEMVs at 2 rows, the scalar
     // GEMM otherwise (1 row included).
-    assert_eq!(HeadArith::batched(2), HeadArith::Gemv);
+    assert_eq!(HeadArith::batched(2, false), HeadArith::Gemv);
     for rows in [1, 3, 4, 8, 16] {
-        assert_eq!(HeadArith::batched(rows), HeadArith::Gemm, "rows {rows}");
+        assert_eq!(
+            HeadArith::batched(rows, false),
+            HeadArith::Gemm,
+            "rows {rows}"
+        );
     }
+}
+
+#[test]
+fn exact_verify_projects_every_verify_width_as_gemv_rows() {
+    // ATLAS_QWEN4EXP_EXACT_VERIFY: serial decode's head is `dense_gemv_bf16`;
+    // the scalar tile GEMM accumulates K sequentially and rounds differently.
+    for rows in [2, 3, 4] {
+        assert_eq!(
+            HeadArith::batched(rows, true),
+            HeadArith::Gemv,
+            "rows {rows}"
+        );
+    }
+    assert_eq!(HeadArith::batched(1, true), HeadArith::Gemm);
 }
 
 #[test]
