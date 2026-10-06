@@ -15,10 +15,10 @@ flags=(--ptx -arch=sm_121f -O3 --fmad=false -DTQ_PLUS_SIGNS --expt-relaxed-const
 mode=${1:-check}
 pids=()
 if [[ $mode == small-* ]]; then
-  for stem in moe_topk moe_expert_gemv ssm_preprocess causal_conv1d rms_norm; do
+  for stem in moe_topk moe_expert_gemv ssm_preprocess causal_conv1d rms_norm moe_permute; do
     "$nvcc" "${flags[@]}" "kernels/gb10/common/$stem.cu" -o "$out/$stem.ptx" & pids+=($!)
   done
-  for stem in gated_delta_rule qwen4exp_decode_fuse; do
+  for stem in gated_delta_rule qwen4exp_decode_fuse hyper_connection; do
     "$nvcc" "${flags[@]}" "kernels/gb10/qwen3.8-flash-next/nvfp4/$stem.cu" -o "$out/$stem.ptx" & pids+=($!)
   done
   "$nvcc" -O3 -std=c++17 -arch=sm_121a scripts/dev/qwen4exp_batch_small_bench.cu -lcuda \

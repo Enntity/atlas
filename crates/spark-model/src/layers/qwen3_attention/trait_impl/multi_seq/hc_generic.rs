@@ -27,14 +27,17 @@ impl Qwen3AttentionLayer {
         // ATLAS_QWEN4EXP_BATCH_FAST: the live rows through `forward`'s own
         // kernels with the EP all-reduce batched, then ONE elementwise post.
         // The host ids are the live rows (`decode_a2` pads past them).
+        // Under BATCH_SMALL its EP blend may take the post too (`posted`).
         let exact_rows = if ctx.levers.qwen4exp_batch_fast {
             let active = ctx.host_token_ids.map_or(n, |t| t.len().min(n));
+            let fold =
+                ops::qwen4exp_decode_fuse::MoeHcPost::for_rows(ctx.levers, hc, hc_streams, post);
             self.ffn
-                .forward_rows_padded(c.normed, n, active, ctx, stream)?
+                .forward_rows_padded(c.normed, n, active, fold, ctx, stream)?
         } else {
             None
         };
-        if let Some(moe_out) = exact_rows {
+        if let Some((moe_out, false)) = exact_rows {
             ops::hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,

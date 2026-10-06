@@ -90,7 +90,7 @@ fn module_of(name: &str) -> &'static str {
     }
 }
 
-fn aligned(ptrs: &[DevicePtr], to: u64) -> bool {
+pub(super) fn aligned(ptrs: &[DevicePtr], to: u64) -> bool {
     ptrs.iter().all(|p| p.0.is_multiple_of(to))
 }
 
@@ -113,7 +113,7 @@ pub struct GdnDecode {
 
 /// Geometry the fused kernel is written for: 128-wide heads, three value
 /// heads per key head (one thread-block cluster per key head), a 4-tap conv.
-const GDN_D: u32 = 128;
+pub(super) const GDN_D: u32 = 128;
 const GDN_REPEAT: u32 = 3;
 const GDN_DCONV: u32 = 4;
 
@@ -174,215 +174,20 @@ pub fn gdn_decode(
 }
 
 /// The geometry `qdf_gdn_block` is written for (both launch forms).
-fn gdn_geometry_fits(nk: u32, nv: u32, kd: u32, vd: u32, d_conv: u32, ba_k: u32) -> bool {
-    kd == GDN_D
-        && vd == GDN_D
-        && nk != 0
-        && nv == GDN_REPEAT * nk
-        && d_conv == GDN_DCONV
-        && ba_k.is_multiple_of(8)
-}
-
-/// Sequences one `qwen4exp_gdn_decode_fused_rows` launch takes
-/// (`QDF_ROWS_MAX`: the by-value state table's length).
-pub const GDN_ROWS_MAX: usize = 8;
-
-/// A batched decode step's GDN buffers between the projections: row `r` is
-/// sequence `r`'s token, against `states[r]` (recurrence, conv window).
-pub struct GdnDecodeRows<'a> {
-    pub states: &'a [(DevicePtr, DevicePtr)],
-    /// `[rows, qkvz_stride]` BF16: `[Q | K | V | Z]` per row.
-    pub qkvz: DevicePtr,
-    pub qkvz_stride: u32,
-    pub conv_w: DevicePtr,
-    /// `[rows, ba_k]` BF16: the mixer input rows.
-    pub ba_in: DevicePtr,
-    pub ba_w: DevicePtr,
-    pub a_log: DevicePtr,
-    pub dt_bias: DevicePtr,
-    /// `[rows, 2 * nv]` FP32: gate then beta per row.
-    pub gates: DevicePtr,
-    pub norm_w: DevicePtr,
-    /// `[rows, nv * 128]` BF16.
-    pub out: DevicePtr,
-}
-
-/// `ATLAS_QWEN4EXP_BATCH_SMALL`: the GDN step of every row of a batched
-/// decode (one token per sequence) as `qwen4exp_gdn_decode_fused_rows`
-/// launches of up to [`GDN_ROWS_MAX`] sequences, in place of four launches
-/// per sequence. Each row's bytes are the four kernels' (the fused step's
-/// contract), whether or not the decode-fuse tier is on. Returns whether it
-/// launched; on `false` nothing was launched. The caller checks the lever and
-/// that its per-sequence arm is the four-kernel FP32 one.
-#[allow(clippy::too_many_arguments)]
-pub fn gdn_decode_rows(
-    gpu: &dyn GpuBackend,
-    b: &GdnDecodeRows<'_>,
+pub(super) fn gdn_geometry_fits(
     nk: u32,
     nv: u32,
     kd: u32,
     vd: u32,
     d_conv: u32,
     ba_k: u32,
-    l2_eps: f32,
-    eps: f32,
-    stream: u64,
-) -> Result<bool> {
-    static K: OnceLock<KernelHandle> = OnceLock::new();
-    let k = *K.get_or_init(|| {
-        crate::layers::try_kernel(
-            gpu,
-            "qwen4exp_decode_fuse",
-            "qwen4exp_gdn_decode_fused_rows",
-        )
-    });
-    let conv_dim = 2 * nk * kd + nv * vd;
-    let fits = k.0 != 0
-        && !b.states.is_empty()
-        && gdn_geometry_fits(nk, nv, kd, vd, d_conv, ba_k)
-        && b.states.iter().all(|&(_, conv)| conv.0.is_multiple_of(16))
-        && aligned(&[b.ba_in, b.ba_w], 16)
-        && b.qkvz_stride.is_multiple_of(4)
-        && aligned(&[b.qkvz.offset(conv_dim as usize * 2), b.norm_w, b.out], 8);
-    if !fits {
-        return Ok(false);
-    }
-    let (bf16, fp32) = (2usize, 4usize);
-    for (chunk, states) in b.states.chunks(GDN_ROWS_MAX).enumerate() {
-        let first = chunk * GDN_ROWS_MAX;
-        // QdfRowStates: h[8], then conv[8]; unused slots stay null.
-        let mut table = [0u64; 2 * GDN_ROWS_MAX];
-        for (i, &(h, conv)) in states.iter().enumerate() {
-            table[i] = h.0;
-            table[GDN_ROWS_MAX + i] = conv.0;
-        }
-        KernelLaunch::new(gpu, k)
-            .grid([nv, states.len() as u32, 1])
-            .block([GDN_D, 1, 1])
-            .arg_words(&table)
-            .arg_ptr(b.qkvz.offset(first * b.qkvz_stride as usize * bf16))
-            .arg_ptr(b.conv_w)
-            .arg_ptr(b.ba_in.offset(first * ba_k as usize * bf16))
-            .arg_ptr(b.ba_w)
-            .arg_ptr(b.a_log)
-            .arg_ptr(b.dt_bias)
-            .arg_ptr(b.gates.offset(first * 2 * nv as usize * fp32))
-            .arg_ptr(b.norm_w)
-            .arg_ptr(b.out.offset(first * (nv * vd) as usize * bf16))
-            .arg_u32(nk)
-            .arg_u32(nv)
-            .arg_u32(ba_k)
-            .arg_u32(kd)
-            .arg_u32(b.qkvz_stride)
-            .arg_f32(l2_eps)
-            .arg_f32(eps)
-            .launch(stream)?;
-    }
-    Ok(true)
-}
-
-/// Tokens a sequence may bring to `qwen4exp_gdn_verify_fused_rows`
-/// (`QDF_VERIFY_KMAX`).
-pub const GDN_VERIFY_KMAX: usize = 4;
-
-/// One sequence of a verify step: its recurrence and conv state, the rollback
-/// slots for tokens `0..k-1` (`h_snap[t]` / `conv_snap[t]` after token `t`),
-/// and its rows `row0..row0 + k` of the step.
-#[derive(Clone, Copy)]
-pub struct GdnVerifySeq {
-    pub h: DevicePtr,
-    pub conv: DevicePtr,
-    pub h_snap: [DevicePtr; GDN_VERIFY_KMAX - 1],
-    pub conv_snap: [DevicePtr; GDN_VERIFY_KMAX - 1],
-    pub row0: u32,
-    pub k: u32,
-}
-
-/// A verify step's GDN buffers between the projections, rows as in
-/// [`GdnDecodeRows`]; `gates` holds the step's gate rows (the exact arm's
-/// input), `out` receives the normed rows.
-pub struct GdnVerifyRows<'a> {
-    pub seqs: &'a [GdnVerifySeq],
-    pub qkvz: DevicePtr,
-    pub qkvz_stride: u32,
-    pub conv_w: DevicePtr,
-    pub gates: DevicePtr,
-    pub norm_w: DevicePtr,
-    pub out: DevicePtr,
-}
-
-/// `ATLAS_QWEN4EXP_BATCH_SMALL`: the exact MTP verify's per-token GDN chain
-/// (conv, conv rollback copy, recurrence, gated norm, H rollback copy, for
-/// each token of each sequence) as `qwen4exp_gdn_verify_fused_rows` launches
-/// of up to [`GDN_ROWS_MAX`] sequences, every byte the chain writes. Returns
-/// whether it launched; on `false` nothing was launched. The caller checks the
-/// lever and that the exact arm is the four-kernel FP32 one.
-#[allow(clippy::too_many_arguments)]
-pub fn gdn_verify_rows(
-    gpu: &dyn GpuBackend,
-    b: &GdnVerifyRows<'_>,
-    nk: u32,
-    nv: u32,
-    kd: u32,
-    vd: u32,
-    d_conv: u32,
-    l2_eps: f32,
-    eps: f32,
-    stream: u64,
-) -> Result<bool> {
-    static K: OnceLock<KernelHandle> = OnceLock::new();
-    let k = *K.get_or_init(|| {
-        crate::layers::try_kernel(
-            gpu,
-            "qwen4exp_decode_fuse",
-            "qwen4exp_gdn_verify_fused_rows",
-        )
-    });
-    let conv_dim = 2 * nk * kd + nv * vd;
-    let fits = k.0 != 0
-        && !b.seqs.is_empty()
-        && gdn_geometry_fits(nk, nv, kd, vd, d_conv, 8)
-        && b.seqs.iter().all(|q| {
-            (1..=GDN_VERIFY_KMAX as u32).contains(&q.k)
-                && aligned(&[q.conv], 16)
-                && aligned(&q.conv_snap[..q.k as usize - 1], 16)
-        })
-        && b.qkvz_stride.is_multiple_of(4)
-        && aligned(&[b.qkvz.offset(conv_dim as usize * 2), b.norm_w, b.out], 8);
-    if !fits {
-        return Ok(false);
-    }
-    // QdfVerifySeq: h, conv, h_snap[3], conv_snap[3], then row0 | k << 32.
-    const WORDS: usize = 3 + 2 * (GDN_VERIFY_KMAX - 1);
-    for seqs in b.seqs.chunks(GDN_ROWS_MAX) {
-        let mut table = [0u64; WORDS * GDN_ROWS_MAX];
-        for (q, w) in seqs.iter().zip(table.chunks_mut(WORDS)) {
-            w[0] = q.h.0;
-            w[1] = q.conv.0;
-            for t in 0..GDN_VERIFY_KMAX - 1 {
-                w[2 + t] = q.h_snap[t].0;
-                w[2 + GDN_VERIFY_KMAX - 1 + t] = q.conv_snap[t].0;
-            }
-            w[WORDS - 1] = u64::from(q.row0) | u64::from(q.k) << 32;
-        }
-        KernelLaunch::new(gpu, k)
-            .grid([nv, seqs.len() as u32, 1])
-            .block([GDN_D, 1, 1])
-            .arg_words(&table)
-            .arg_ptr(b.qkvz)
-            .arg_ptr(b.conv_w)
-            .arg_ptr(b.gates)
-            .arg_ptr(b.norm_w)
-            .arg_ptr(b.out)
-            .arg_u32(nk)
-            .arg_u32(nv)
-            .arg_u32(kd)
-            .arg_u32(b.qkvz_stride)
-            .arg_f32(l2_eps)
-            .arg_f32(eps)
-            .launch(stream)?;
-    }
-    Ok(true)
+) -> bool {
+    kd == GDN_D
+        && vd == GDN_D
+        && nk != 0
+        && nv == GDN_REPEAT * nk
+        && d_conv == GDN_DCONV
+        && ba_k.is_multiple_of(8)
 }
 
 /// Must match `HC_V_STAGE_SPLIT` and `QHC_MAX_MULT` in hyper_connection.cu.
@@ -461,6 +266,25 @@ pub struct MoeHcPost {
     pub streams: DevicePtr,
     pub inj: DevicePtr,
     pub hc_mult: u32,
+}
+
+impl MoeHcPost {
+    /// The post a batched step's MoE may run over its rows
+    /// (`ATLAS_QWEN4EXP_BATCH_SMALL`, a low-rank layer): the highway rows and
+    /// the injection rows `hc_pre` left in `inj`.
+    pub fn for_rows(
+        levers: &super::ModelLevers,
+        hc: &crate::layers::qwen3_attention::HcWeights,
+        streams: DevicePtr,
+        inj: DevicePtr,
+    ) -> Option<Self> {
+        (levers.qwen4exp_batch_small && super::HcVariant::of(hc) == super::HcVariant::LowRank)
+            .then_some(Self {
+                streams,
+                inj,
+                hc_mult: hc.hc_mult as u32,
+            })
+    }
 }
 
 const BLEND_BLOCK: u32 = 256;

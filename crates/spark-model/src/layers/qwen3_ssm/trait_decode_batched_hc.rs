@@ -337,22 +337,27 @@ impl Qwen3SsmLayer {
         // ATLAS_QWEN4EXP_BATCH_FAST: the same per-row `forward` arithmetic at
         // any row count (single- or multi-sequence verify), with the EP
         // all-reduce batched over the rows and ONE elementwise post.
+        let fold = ops::qwen4exp_decode_fuse::MoeHcPost::for_rows(ctx.levers, hc, streams, post);
         if ctx.levers.qwen4exp_batch_fast
-            && let Some(moe_out) = self.ffn.forward_rows(normed2, num_tokens, ctx, stream)?
+            && let Some((moe_out, posted)) = self
+                .ffn
+                .forward_rows(normed2, num_tokens, fold, ctx, stream)?
         {
-            ops::hc_post_site(
-                ctx.gpu,
-                self.hc_post_k,
-                hc,
-                moe_out,
-                streams,
-                post,
-                comb,
-                streams,
-                n,
-                h as u32,
-                stream,
-            )?;
+            if !posted {
+                ops::hc_post_site(
+                    ctx.gpu,
+                    self.hc_post_k,
+                    hc,
+                    moe_out,
+                    streams,
+                    post,
+                    comb,
+                    streams,
+                    n,
+                    h as u32,
+                    stream,
+                )?;
+            }
             stage!("moe+hc_post_ffn (rows)");
             return Ok(());
         }

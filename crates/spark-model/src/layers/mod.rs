@@ -359,16 +359,18 @@ impl FfnComponent {
     /// [`Self::forward`] on that row, with the MoE's per-row collectives
     /// batched (`MoeLayer::forward_rows`). `None` where that does not hold
     /// (a dense FFN, or a MoE whose decode takes a grouped prefill arm): the
-    /// caller keeps its per-row `forward` loop.
+    /// caller keeps its per-row `forward` loop. The flag: `hc_post` ran
+    /// (`MoeLayer::forward_rows`); if not, the caller runs the post.
     pub fn forward_rows(
         &self,
         input: DevicePtr,
         rows: usize,
+        hc_post: Option<ops::qwen4exp_decode_fuse::MoeHcPost>,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<Option<DevicePtr>> {
+    ) -> Result<Option<(DevicePtr, bool)>> {
         match self {
-            Self::Moe(m) => m.forward_rows(input, rows, ctx, stream),
+            Self::Moe(m) => m.forward_rows(input, rows, hc_post, ctx, stream),
             _ => Ok(None),
         }
     }
@@ -377,20 +379,22 @@ impl FfnComponent {
     /// padded batch, with the padding rows' outputs zeroed: a padding row
     /// (zero hidden, dummy state, discarded logits) then injects nothing
     /// into its highway, where `forward` on its zero input also produced
-    /// zero but cost a full row of expert reads.
+    /// zero but cost a full row of expert reads (`hc_post` only unpadded).
     pub fn forward_rows_padded(
         &self,
         input: DevicePtr,
         rows: usize,
         active: usize,
+        hc_post: Option<ops::qwen4exp_decode_fuse::MoeHcPost>,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<Option<DevicePtr>> {
+    ) -> Result<Option<(DevicePtr, bool)>> {
         let active = active.min(rows);
         if active == 0 {
             return Ok(None);
         }
-        let Some(out) = self.forward_rows(input, active, ctx, stream)? else {
+        let hc_post = hc_post.filter(|_| active == rows);
+        let Some((out, posted)) = self.forward_rows(input, active, hc_post, ctx, stream)? else {
             return Ok(None);
         };
         if active < rows {
@@ -398,7 +402,7 @@ impl FfnComponent {
             ctx.gpu
                 .memset_async(out.offset(active * row), 0, (rows - active) * row, stream)?;
         }
-        Ok(Some(out))
+        Ok(Some((out, posted)))
     }
 
     pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
