@@ -298,6 +298,94 @@ impl Gather<'_> {
     }
 }
 
+/// `ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE=1`.
+pub fn rs_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+/// Compute a `[total, width]` BF16 partial with `rows(first, count, stream)`
+/// (row-local: any row range, any order, same bytes) and reduce-scatter it,
+/// with the window this rank sends computed FIRST and sent in slab-sized
+/// pieces on the side stream while the rest of the rows are computed
+/// (`ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE=1`). The peer's partial of this rank's
+/// rows lands in the stage and is added after the join with the pair's own
+/// add kernel (`bf16_add_inplace`, `own + peer`), so every byte is the one
+/// `SpRows::reduce_scatter` leaves. `Ok(false)`: not taken, nothing computed.
+pub fn compute_and_reduce_scatter(
+    sp: SpRows,
+    buf: DevicePtr,
+    width: usize,
+    ctx: &ForwardContext<'_>,
+    stream: u64,
+    mut rows: impl FnMut(usize, usize, u64) -> Result<()>,
+) -> Result<bool> {
+    let Some(comm) = ctx.comm else {
+        return Ok(false);
+    };
+    let row = width * 2;
+    let plan = super::glm_sp_uneven::plan(sp, true);
+    if !rs_requested()
+        || ctx.config.model_type != "qwen4_exp"
+        || ctx.graph_capture
+        || !comm.supports_exchange_async(plan.m.min(PIECE) * row)
+    {
+        return Ok(false);
+    }
+    let gpu = ctx.gpu;
+    let side = side(gpu)?;
+    // The side stream starts after the main stream's previous exchange.
+    gpu.record_event(side.to_side, stream)?;
+    gpu.stream_wait_event(side.stream, side.to_side)?;
+    let stage = stage(gpu, plan.m * row, stream, side.stream)?;
+    let total = sp.total();
+    for w0 in (0..plan.m).step_by(PIECE) {
+        let n = PIECE.min(plan.m - w0);
+        rows(plan.send0 + w0, n, stream)?;
+        gpu.record_event(side.to_side, stream)?;
+        gpu.stream_wait_event(side.stream, side.to_side)?;
+        ensure!(
+            comm.exchange_async(
+                buf.offset((plan.send0 + w0) * row).0,
+                stage.offset(w0 * row).0,
+                n * row,
+                false,
+                side.stream,
+            )?,
+            "qwen4exp SP pipe: pair exchange refused ({n} rows)"
+        );
+    }
+    // The rows outside the window, while it is on the wire.
+    if plan.send0 > 0 {
+        rows(0, plan.send0, stream)?;
+    }
+    if plan.send0 + plan.m < total {
+        rows(plan.send0 + plan.m, total - plan.send0 - plan.m, stream)?;
+    }
+    gpu.record_event(side.to_main, side.stream)?;
+    gpu.stream_wait_event(stream, side.to_main)?;
+    let n = (plan.recv_n * width) as u32;
+    spark_runtime::kernel_args::KernelLaunch::new(gpu, gpu.kernel("bf16_add", "bf16_add_inplace")?)
+        .grid([n.div_ceil(256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(buf.offset(plan.recv0 * row))
+        .arg_ptr(stage.offset(plan.skip * row))
+        .arg_u32(n)
+        .launch(stream)?;
+    Ok(true)
+}
+
+/// The landing stage's address (tests: the mock GPU runs no add kernel).
+#[cfg(test)]
+pub(crate) fn stage_ptr() -> DevicePtr {
+    DevicePtr(STAGE.with(Cell::get).0)
+}
+
 fn side(gpu: &dyn GpuBackend) -> Result<Side> {
     if let Some(s) = SIDE.with(Cell::get) {
         return Ok(s);
