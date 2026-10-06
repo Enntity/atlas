@@ -7,6 +7,8 @@
 //! |------------------------------------------|----------------------------------------|--------|
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=1`      | TP2 QSA attention on tensor cores      | = TP1 tc2, != `_g` |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_LEAN=1`      | TP1 tc2 -> its lean twin (2 CTAs/SM)   | = tc2  |
+//! | `ATLAS_QWEN4EXP_PREFILL_HC=1`            | mHC collapse: seam, down, up+mix fused | = default (`qwen4exp_prefill_hc`) |
+//! | `ATLAS_QWEN4EXP_PREFILL_HC_CHECK=<n>`    | cross-check the first n mHC slabs      | diagnostic |
 //!
 //! "= X" means byte-identical outputs to kernel X on the same inputs, checked
 //! by the `scripts/dev/qwen4exp_*_bench.cu` harnesses on a GB10.
@@ -68,7 +70,7 @@ pub fn try_qsa_prefill_attn_lean(
     tc2_in_force: bool,
     stream: u64,
 ) -> Result<bool> {
-    let shape_ok = s.hd == 256 && s.nkv != 0 && s.nq % s.nkv == 0 && s.nq / s.nkv <= 16;
+    let shape_ok = s.hd == 256 && s.nkv != 0 && s.nq.is_multiple_of(s.nkv) && s.nq / s.nkv <= 16;
     let (module, entry, row_pairs) = if s.nkv == 1 && qsa_tc2r_requested() {
         ("qsa_attn_tc2r", "qsa_prefill_attn_tc2r", true)
     } else if s.nkv == 2 && tc2_in_force && qsa_lean_requested() {

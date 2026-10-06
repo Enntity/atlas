@@ -110,6 +110,8 @@ mod kda_indexed;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
 #[path = "ops/hyper_connection_lowrank_gemm.rs"]
 mod hyper_connection_lowrank_gemm;
+#[path = "ops/hyper_connection_lowrank_prefill.rs"]
+mod hyper_connection_lowrank_prefill;
 #[path = "ops/hyper_connection_lowrank_split.rs"]
 mod hyper_connection_lowrank_split;
 // GPU parity test, so it needs the cuda backend to compile at all. Gated on
@@ -202,6 +204,8 @@ mod qwen4exp_moe;
 mod qwen4exp_moe_rows;
 #[path = "ops/qwen4exp_prefill.rs"]
 pub mod qwen4exp_prefill;
+#[path = "ops/qwen4exp_prefill_hc.rs"]
+pub mod qwen4exp_prefill_hc;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
 #[cfg(test)]
 #[path = "ops/grammar_bitmask_tests.rs"]

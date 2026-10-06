@@ -893,6 +893,108 @@ extern "C" __global__ void hc_pre_stage_bf16(
     }
 }
 
+// ── hc_post + hc_pre_stage_bf16 in one pass (ATLAS_QWEN4EXP_PREFILL_HC_SEAM)
+//
+// Inside a prefill layer the sublayer's `hc_post` is followed at once by the
+// next site's `hc_pre_stage_bf16` over the same token rows: the post writes
+// the 40 KB/token FP32 highway and the stage reads all of it straight back
+// for its per-stream RMS and `normed`. At 16K tokens that read is 657 MB per
+// seam, 96 seams a prefill. This kernel keeps the post values in registers
+// and never reads them back.
+//
+// BIT-IDENTICAL (--fmad=false): every highway float is `hc_post`'s
+// `r + x * inj`; per stream, thread `tid` accumulates `v * v` over
+// d = tid, tid + 1024, ... in that order exactly as `hc_pre_stage_bf16` does
+// at block 1024 (streams interleaved, which no accumulator can see), then the
+// same 16/8/4/2/1 shuffle-down tree and the same in-order sum of the 32 warp
+// partials; `normed` is `(v * rms) * (1 + w)` rounded to BF16 as there.
+//
+// In place on the highway: each element is read and then written by one
+// thread. Grid: (T, 1, 1), Block: (1024, 1, 1). Host checks: H <= 4 * 1024,
+// hc <= QHC_MAX_MULT.
+#define QHC_PS_DPT 4u
+
+extern "C" __global__ void __launch_bounds__(QHC_WBLOCK, 1) hc_post_stage_bf16(
+    const __nv_bfloat16* __restrict__ block_out, // [T, H]
+    float* streams,                              // [T, hc, H]: residual in, post out
+    const float* __restrict__ inj,               // [T, hc]
+    const __nv_bfloat16* __restrict__ hc_norm_w, // [hc*H]
+    __nv_bfloat16* __restrict__ normed_out,      // [T, hc*H] BF16
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const float eps
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = hc * H;
+    const __nv_bfloat16* xb = block_out + (size_t)t * H;
+    float* x = streams + (size_t)t * hc_dim;
+    __nv_bfloat16* out = normed_out + (size_t)t * hc_dim;
+
+    __shared__ float smem_rms[QHC_MAX_MULT];
+    __shared__ float smem_red[QHC_MAX_MULT][QHC_WBLOCK / 32];
+
+    float wv[QHC_MAX_MULT];
+    #pragma unroll
+    for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) wv[s2] = s2 < hc ? inj[(size_t)t * hc + s2] : 0.0f;
+
+    float v[QHC_PS_DPT][QHC_MAX_MULT];
+    float acc[QHC_MAX_MULT];
+    #pragma unroll
+    for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) acc[s2] = 0.0f;
+    #pragma unroll
+    for (unsigned int k = 0; k < QHC_PS_DPT; ++k) {
+        const unsigned int d = tid + k * QHC_WBLOCK;
+        if (d < H) {
+            const float xd = (float)xb[d];
+            #pragma unroll
+            for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) {
+                if (s2 < hc) {
+                    const float val = x[(size_t)s2 * H + d] + xd * wv[s2];
+                    x[(size_t)s2 * H + d] = val;
+                    v[k][s2] = val;
+                    acc[s2] += val * val;
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) {
+        if (s2 < hc) {
+            float a = acc[s2];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                a += __shfl_down_sync(0xFFFFFFFFu, a, off);
+            }
+            if (lane == 0) smem_red[s2][warp] = a;
+        }
+    }
+    __syncthreads();
+    if (tid < hc) {
+        float tot = 0.0f;
+        for (unsigned int w2 = 0; w2 < QHC_WBLOCK / 32; ++w2) tot += smem_red[tid][w2];
+        smem_rms[tid] = rsqrtf(tot / (float)H + eps);
+    }
+    __syncthreads();
+    #pragma unroll
+    for (unsigned int k = 0; k < QHC_PS_DPT; ++k) {
+        const unsigned int d = tid + k * QHC_WBLOCK;
+        if (d < H) {
+            #pragma unroll
+            for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) {
+                if (s2 < hc) {
+                    const unsigned int i = s2 * H + d;
+                    out[i] = __float2bfloat16(
+                        v[k][s2] * smem_rms[s2] * (1.0f + (float)hc_norm_w[i]));
+                }
+            }
+        }
+    }
+}
+
 // low = silu(low_pre * inv_hc), elementwise in place over n = T*rank.
 extern "C" __global__ void hc_silu_scale(
     __nv_bfloat16* __restrict__ low,
@@ -937,6 +1039,206 @@ extern "C" __global__ void hc_pre_mix(
     if (inj_pre != nullptr && tid < hc) {
         inj_out[(size_t)t * hc + tid] =
             2.0f * qhc_sigmoid((float)inj_pre[(size_t)t * hc + tid] * inv_hc);
+    }
+}
+
+// ── up projection + hc_pre_mix in one kernel (ATLAS_QWEN4EXP_PREFILL_HC) ──
+//
+// The prefill collapse wrote `up_pre = low x up_w` ([T, hc*H] BF16, 42 MB per
+// 2048-token slab) through cuBLASLt, then `hc_pre_mix` read it back with
+// `normed` to form `y`. This kernel keeps each `up_pre` tile in registers and
+// folds it into `y` in its epilogue: one 42 MB write and one 42 MB read fewer
+// per slab, and one launch. GB10, 2048 rows: cuBLASLt 0.29 ms + mix 0.45 ms
+// -> 0.45 ms.
+//
+// A CTA owns HUM_BM token rows x HUM_BD hidden columns `d` -- for ALL four
+// streams, so the stream mean for a `d` lives in one thread: its N tile is the
+// four column groups `s*H + d0 .. s*H + d0 + HUM_BD`; 8 warps x 16 rows, each
+// warp 16 m16n8 n-tiles (four per stream). The epilogue's `normed` words are
+// loaded before the main loop so their DRAM traffic overlaps the MMAs.
+//
+// BIT-IDENTICAL to cuBLASLt + hc_pre_mix:
+//  * every `up_pre` value is the FP32 `mma.sync.m16n8k16` chain over k = 0,
+//    16, ..., rank-16 in order, rounded to BF16 -- equal to cuBLASLt's output
+//    bit for bit whenever its heuristic picks a non-split-K kernel, as it does
+//    for K = 320 at every slab size served (`scripts/dev/
+//    qwen4exp_hc_prefill_bench.cu` compares the whole chain byte for byte);
+//  * `y` is hc_pre_mix's expression, streams folded s = 0..3 in order;
+//  * `inj` is hc_pre_mix's expression over the same `inj_pre`.
+//
+// `up_w` comes in TRANSPOSED, `[hc*H, rank]` (the caller stages it once per
+// call with hc_transpose_bf16, 0.04 ms), so the B tile is K-contiguous and
+// each fragment pair is one 32-bit shared load, as in
+// dense_gemm_bf16_pipelined. (Reading the stored [rank, hc*H] layout and
+// packing pairs from 16-bit loads measured 0.51 ms.)
+//
+// Grid: (H / HUM_BD, ceil(T / HUM_BM), 1), Block: (256, 1, 1). Host checks:
+// hc == 4, H % HUM_BD == 0, rank % HUM_BK == 0, 16-byte aligned operands.
+#define HUM_BM 128
+#ifndef HUM_BD
+#define HUM_BD 32
+#endif
+#ifndef HUM_MINB
+#define HUM_MINB 2
+#endif
+#define HUM_HC 4
+#define HUM_BN (HUM_HC * HUM_BD)          // 128 columns of up_pre per CTA
+#define HUM_BK 32
+#define HUM_STAGES 2
+#define HUM_STRIDE (HUM_BK + 8)           // 16-byte rows, conflict-free u32 reads
+#define HUM_NT (HUM_BN / 8)               // 16 n-tiles per warp
+
+__device__ __forceinline__ void hum_cp16(void* smem_ptr, const void* gmem_ptr) {
+    const unsigned int sp = (unsigned int)__cvta_generic_to_shared(smem_ptr);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sp), "l"(gmem_ptr));
+}
+
+extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
+    const __nv_bfloat16* __restrict__ low,     // [T, rank] silu'd low-rank vector
+    const __nv_bfloat16* __restrict__ up_wt,   // [hc*H, rank] transposed up_w
+    const __nv_bfloat16* __restrict__ normed,  // [T, hc*H]
+    const __nv_bfloat16* __restrict__ inj_pre, // [T, hc] or null
+    __nv_bfloat16* __restrict__ y_out,         // [T, H]
+    float* __restrict__ inj_out,               // [T, hc]
+    const unsigned int T,
+    const unsigned int hidden_size,
+    const unsigned int rank,
+    const float inv_hc
+) {
+    __shared__ __align__(16) __nv_bfloat16 smem_A[HUM_STAGES][HUM_BM][HUM_STRIDE];
+    __shared__ __align__(16) __nv_bfloat16 smem_B[HUM_STAGES][HUM_BN][HUM_STRIDE];
+
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = HUM_HC * H;
+    const unsigned int d0 = blockIdx.x * HUM_BD;
+    const unsigned int m0 = blockIdx.y * HUM_BM;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int g = lane >> 2;
+    const unsigned int t4 = lane & 3u;
+
+    float acc[HUM_NT][4];
+    #pragma unroll
+    for (int i = 0; i < HUM_NT; ++i) { acc[i][0] = 0.0f; acc[i][1] = 0.0f; acc[i][2] = 0.0f; acc[i][3] = 0.0f; }
+
+    // The epilogue's `normed` words, issued now (`ld.global.nc` in asm
+    // volatile, so the compiler cannot sink them to their use).
+    unsigned int nwr[2][HUM_BD / 8][HUM_HC];
+    #pragma unroll
+    for (unsigned int half = 0; half < 2; ++half) {
+        const unsigned int row = m0 + warp * 16 + g + half * 8;
+        const __nv_bfloat16* nrow = normed + (size_t)(row < T ? row : 0) * hc_dim;
+        #pragma unroll
+        for (unsigned int q = 0; q < HUM_BD / 8; ++q) {
+            #pragma unroll
+            for (unsigned int s = 0; s < HUM_HC; ++s) {
+                asm volatile("ld.global.nc.u32 %0, [%1];"
+                             : "=r"(nwr[half][q][s])
+                             : "l"(nrow + s * H + d0 + q * 8 + t4 * 2));
+            }
+        }
+    }
+
+    const unsigned int n_steps = rank / HUM_BK;
+    auto prefetch = [&](unsigned int step, unsigned int stage) {
+        const unsigned int k0 = step * HUM_BK;
+        // A: BM rows x BK, 16-byte chunks along k.
+        #pragma unroll
+        for (unsigned int c = threadIdx.x; c < HUM_BM * HUM_BK / 8; c += 256) {
+            const unsigned int row = c / (HUM_BK / 8);
+            const unsigned int col = (c % (HUM_BK / 8)) * 8;
+            __nv_bfloat16* dst = &smem_A[stage][row][col];
+            if (m0 + row < T) {
+                hum_cp16(dst, low + (size_t)(m0 + row) * rank + k0 + col);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        // B: (4 streams x BD) n-rows x BK, 16-byte chunks along k.
+        #pragma unroll
+        for (unsigned int c = threadIdx.x; c < HUM_BN * HUM_BK / 8; c += 256) {
+            const unsigned int nrow = c / (HUM_BK / 8);
+            const unsigned int kc = (c % (HUM_BK / 8)) * 8;
+            const unsigned int s = nrow / HUM_BD;
+            const unsigned int dn = nrow % HUM_BD;
+            hum_cp16(&smem_B[stage][nrow][kc], up_wt + (size_t)(s * H + d0 + dn) * rank + k0 + kc);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+
+    #pragma unroll
+    for (unsigned int p = 0; p < HUM_STAGES - 1; ++p) {
+        if (p < n_steps) prefetch(p, p);
+    }
+    for (unsigned int step = 0; step < n_steps; ++step) {
+        const unsigned int cur = step % HUM_STAGES;
+        const unsigned int ahead = step + HUM_STAGES - 1;
+        if (ahead < n_steps) prefetch(ahead, ahead % HUM_STAGES);
+        // Wait until `step`'s group has landed.
+        if (ahead < n_steps) {
+            asm volatile("cp.async.wait_group %0;\n" ::"n"(HUM_STAGES - 1));
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::);
+        }
+        __syncthreads();
+        const unsigned short* sA = reinterpret_cast<const unsigned short*>(&smem_A[cur][0][0]);
+        const unsigned short* sB = reinterpret_cast<const unsigned short*>(&smem_B[cur][0][0]);
+        #pragma unroll
+        for (unsigned int ks = 0; ks < HUM_BK / 16; ++ks) {
+            const unsigned int kk = ks * 16 + t4 * 2;
+            const unsigned int r0 = warp * 16 + g, r1 = r0 + 8;
+            const unsigned int a0 = *reinterpret_cast<const unsigned int*>(&sA[r0 * HUM_STRIDE + kk]);
+            const unsigned int a1 = *reinterpret_cast<const unsigned int*>(&sA[r1 * HUM_STRIDE + kk]);
+            const unsigned int a2 = *reinterpret_cast<const unsigned int*>(&sA[r0 * HUM_STRIDE + kk + 8]);
+            const unsigned int a3 = *reinterpret_cast<const unsigned int*>(&sA[r1 * HUM_STRIDE + kk + 8]);
+            #pragma unroll
+            for (int nt = 0; nt < HUM_NT; ++nt) {
+                const unsigned int n = nt * 8 + g;
+                const unsigned int b0 = *reinterpret_cast<const unsigned int*>(&sB[n * HUM_STRIDE + kk]);
+                const unsigned int b1 = *reinterpret_cast<const unsigned int*>(&sB[n * HUM_STRIDE + kk + 8]);
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+                    : "=f"(acc[nt][0]), "=f"(acc[nt][1]), "=f"(acc[nt][2]), "=f"(acc[nt][3])
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+                      "f"(acc[nt][0]), "f"(acc[nt][1]), "f"(acc[nt][2]), "f"(acc[nt][3]));
+            }
+        }
+        __syncthreads();
+    }
+
+    // ── epilogue: y = mean_s sigmoid(bf16(up)) * normed, s = 0..3 in order ──
+    #pragma unroll
+    for (unsigned int half = 0; half < 2; ++half) {
+        const unsigned int row = m0 + warp * 16 + g + half * 8;
+        if (row >= T) continue;
+        #pragma unroll
+        for (unsigned int q = 0; q < HUM_BD / 8; ++q) {
+            const unsigned int d = d0 + q * 8 + t4 * 2;
+            float mixed0 = 0.0f, mixed1 = 0.0f;
+            #pragma unroll
+            for (unsigned int s = 0; s < HUM_HC; ++s) {
+                const unsigned int nt = s * (HUM_BD / 8) + q;
+                const float u0 = __bfloat162float(__float2bfloat16(acc[nt][half * 2 + 0]));
+                const float u1 = __bfloat162float(__float2bfloat16(acc[nt][half * 2 + 1]));
+                const unsigned int nw = nwr[half][q][s];
+                mixed0 += qhc_sigmoid(u0) * (float)__ushort_as_bfloat16((unsigned short)(nw & 0xFFFFu));
+                mixed1 += qhc_sigmoid(u1) * (float)__ushort_as_bfloat16((unsigned short)(nw >> 16));
+            }
+            const unsigned int packed =
+                  (unsigned int)__bfloat16_as_ushort(__float2bfloat16(mixed0 * inv_hc))
+                | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(mixed1 * inv_hc)) << 16);
+            *reinterpret_cast<unsigned int*>(y_out + (size_t)row * H + d) = packed;
+        }
+    }
+    if (inj_pre != nullptr && blockIdx.x == 0) {
+        for (unsigned int i = threadIdx.x; i < HUM_BM * HUM_HC; i += 256) {
+            const unsigned int row = m0 + i / HUM_HC;
+            if (row < T) {
+                const size_t j = (size_t)row * HUM_HC + i % HUM_HC;
+                inj_out[j] = 2.0f * qhc_sigmoid((float)inj_pre[j] * inv_hc);
+            }
+        }
     }
 }
 

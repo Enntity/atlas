@@ -341,6 +341,11 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_LMHEAD_SPLIT", || {
         Ok(qwen4exp_lmhead_split::enabled() as u64)
     }),
+    // The qwen4_exp TP2 QSA prefill attention arm: each rank's heads, so a
+    // split pair would serve neither arm's numerics.
+    ("ATLAS_QWEN4EXP_PREFILL_QSA_TC2R", || {
+        Ok(ops::qwen4exp_prefill::qsa_tc2r_requested() as u64)
+    }),
     // The qwen4_exp verify lane (per-row MoE all-reduces in the GDN layers'
     // verify) and the check's serial steps (their collectives).
     ("ATLAS_QWEN4EXP_EXACT_VERIFY", || {
