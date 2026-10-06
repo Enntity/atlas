@@ -217,7 +217,7 @@ pub fn step_verify_k3(
     };
     if !dflash_verify_raw_argmax {
         a.mtp_acct
-            .record_depth_verify(2, num_accepted, sched.levers.mtp_single_depth_adapt);
+            .record_depth_verify(2, num_accepted, num_drafts, sched.levers.depth());
     }
 
     // Shadow top-k target line (ATLAS_MTP_SHADOW_TOPK): joins offline with
@@ -355,8 +355,7 @@ pub fn step_verify_k3(
             a.seq.seq_len,
             crate::scheduler::spec_step::effective_drafts_under_grammar(
                 a,
-                a.mtp_acct
-                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
             ),
             &mut a.seq,
             0,
@@ -415,8 +414,7 @@ pub fn step_verify_k3(
             a.seq.seq_len,
             crate::scheduler::spec_step::effective_drafts_under_grammar(
                 a,
-                a.mtp_acct
-                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
             ),
             &mut a.seq,
             0,
@@ -473,8 +471,7 @@ pub fn step_verify_k3(
             a.seq.seq_len,
             crate::scheduler::spec_step::effective_drafts_under_grammar(
                 a,
-                a.mtp_acct
-                    .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt),
+                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
             ),
             &mut a.seq,
             0,

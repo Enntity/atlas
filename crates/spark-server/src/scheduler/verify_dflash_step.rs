@@ -409,8 +409,13 @@ pub(super) fn verify_dflash_tail(
         let next_num_drafts = if dflash_verify_raw_argmax {
             num_drafts
         } else {
-            a.mtp_acct
-                .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt)
+            a.mtp_acct.depth_drafts(
+                num_drafts,
+                crate::scheduler::mtp_deep_depth::DepthLevers {
+                    deep: false,
+                    ..sched.levers.depth()
+                },
+            )
         };
         // Owner-batched callers propose every owner in one drafter pass.
         if defer_propose && _mtp_grammar_mask.is_none() {

@@ -367,6 +367,12 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_MTP_DEPTH", || {
         Ok(qwen4exp_mtp_depth::requested() as u64)
     }),
+    // The dynamic MTP depth sizes every <= 8-wide slot's verify pools for
+    // `--num-drafts` (`speculative::deep_depth`): a worker without it would
+    // refuse the head's deep windows.
+    ("ATLAS_MTP_DYNAMIC_DEPTH", || {
+        Ok(crate::speculative::deep_depth::enabled() as u64)
+    }),
     // The qwen4_exp exact batching lane: the batched MoE all-reduce shape,
     // the batched QSA-active step (instead of per-sequence decode), the
     // batched multi-sequence verify under TP, and the check's serial steps.

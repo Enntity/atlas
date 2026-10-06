@@ -156,8 +156,7 @@ pub(super) fn k4_apply_verdict(
         // Single sequence: the per-request depth controller picks the next
         // depth (`ATLAS_MTP_SINGLE_DEPTH_ADAPT`); batched rows keep the step's.
         let next_drafts = if matches!(hidden, K4Hidden::VerifyRow) {
-            a.mtp_acct
-                .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt)
+            a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth())
         } else {
             num_drafts
         };

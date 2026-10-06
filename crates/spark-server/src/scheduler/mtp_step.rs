@@ -9,7 +9,7 @@ mod depth;
 mod glm_repair;
 mod one_forward;
 mod owner_batch;
-use depth::{ladder_truncate, lone_dflash_width, single_depth_ladder};
+use depth::{deep_ladder, ladder_truncate, lone_dflash_width, single_depth_ladder};
 use glm_repair::glm_repaired_narrow;
 use owner_batch::verify_owner_batch;
 
@@ -82,6 +82,17 @@ pub fn step_mtp(
         crate::scheduler::adaptive_rung::drafts_for(active.len(), num_drafts)
     };
     let ladder_nd = single_depth_ladder(active, sched, ladder_nd, dflash_verify_raw_argmax);
+    // ATLAS_MTP_DYNAMIC_DEPTH: each request steers its own ceiling up to
+    // `num_drafts` (`mtp_deep_depth`); the step drafts to the deepest and
+    // `plan_verify` trims every sequence to its own and the row budget.
+    let deep = !dflash_verify_raw_argmax
+        && !glm_repaired_narrow
+        && super::mtp_deep_depth::deep_step(sched.levers.depth(), num_drafts, active.len());
+    let ladder_nd = if deep {
+        deep_ladder(active, sched, num_drafts)
+    } else {
+        ladder_nd
+    };
     // Tiered verify-pool capacity clamp (2026-08-16): the step's draft
     // count must respect the MINIMUM slot capacity across the active
     // sequences — a sequence in a K=2-sized slot must never receive K=4
@@ -108,6 +119,7 @@ pub fn step_mtp(
             &verify_idxs,
             &bootstrap_idxs,
             ladder_nd,
+            deep.then_some(num_drafts),
             false,
         )
     });
@@ -180,6 +192,7 @@ pub fn step_mtp(
             &verify_idxs,
             &[],
             ladder_nd,
+            deep.then_some(num_drafts),
             dflash_verify_raw_argmax,
         )
     });
@@ -206,7 +219,10 @@ pub fn step_mtp(
     for (lo, hi) in mtp_dcut::chunk_ranges(&ks) {
         let chunk = &batchable_idxs[lo..hi];
         let chunk_ks = &ks[lo..hi];
-        if chunk.len() >= 2 && model.can_batch_verify(chunk_ks) {
+        // A lone chunk batches only where the model verifies one sequence's
+        // window wider than its own verify serves (`can_batch_verify`:
+        // qwen4_exp's exact lane past 4 rows).
+        if model.can_batch_verify(chunk_ks) {
             // Collect disjoint &mut refs — the iterator walk requires ASCENDING
             // indices, so sort a copy of the chunk before walking and restore
             // the batch order (with each sequence's k) immediately after.
@@ -273,7 +289,9 @@ pub fn step_mtp(
                     dflash_verify_raw_argmax,
                 );
             } else {
-                step_verify_k4_batched(model, &mut batch, sched, &sorted_ks, ladder_nd, verify_ctx);
+                step_verify_k4_batched(
+                    model, &mut batch, sched, &sorted_ks, ladder_nd, num_drafts, verify_ctx,
+                );
             }
         } else {
             // Model can't batch this width (or a lone leftover): fall back
@@ -321,6 +339,14 @@ pub fn step_mtp(
             }
         }
         ladder_truncate(a, &mut drafts, ladder_nd);
+        // A window only the batched verify serves (qwen4_exp's exact lane
+        // past 4 rows) that lands here (grammar) takes the 4-row verify.
+        if !dflash_verify_raw_argmax
+            && drafts.len() > 3
+            && model.can_batch_verify(&[drafts.len() + 1])
+        {
+            drafts.truncate(3);
+        }
         conf.truncate(drafts.len());
 
         // DFlash/DSpark verify: route by proposer, not draft count.

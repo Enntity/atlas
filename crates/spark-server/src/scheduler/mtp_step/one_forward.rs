@@ -52,6 +52,12 @@ pub(super) struct VerifyPlan {
 /// Plan the batched verify over `verify_idxs` (sequences holding drafts)
 /// plus, where admissible, `bootstrap_idxs` (sequences holding none) as
 /// decode rows. Truncates drafts to the planned depth.
+///
+/// `deep_ceiling` (`ATLAS_MTP_DYNAMIC_DEPTH`, `mtp_deep_depth`): each
+/// sequence verifies at most its own ceiling under it, the batch at most
+/// `deep_depth::row_budget` rows, and a LONE sequence holding more drafts
+/// than its own verify serves rides the batched verify as a batch of one
+/// where the model admits it (qwen4_exp's exact lane, 5..8 rows).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_verify(
     model: &dyn Model,
@@ -60,6 +66,7 @@ pub(super) fn plan_verify(
     verify_idxs: &[usize],
     bootstrap_idxs: &[usize],
     ladder_nd: usize,
+    deep_ceiling: Option<usize>,
     dflash_verify_raw_argmax: bool,
 ) -> VerifyPlan {
     let mut plan = VerifyPlan {
@@ -111,6 +118,23 @@ pub(super) fn plan_verify(
             .collect();
         plan.batch.extend_from_slice(&plan.decode_rows);
     }
+    if let Some(ceiling) = deep_ceiling {
+        deep_truncate(sched, active, &plan.batch, ceiling, ladder_nd);
+    }
+    if let [lone] = plan.batch[..]
+        && deep_ceiling.is_some()
+        && !plan.decode_rows.contains(&lone)
+        && model.can_batch_verify(&[active[lone].pending_drafts.len() + 1])
+    {
+        // A lone deep window: its own drafts, no D-Cut (the confidence stop
+        // and the depth controller already chose them).
+        plan.ks = vec![active[lone].pending_drafts.len() + 1];
+        active[lone]
+            .pending_draft_conf
+            .truncate(active[lone].pending_drafts.len());
+        plan.decode_rows.clear();
+        return plan;
+    }
     if plan.batch.len() < 2 {
         // A lone sequence verifies on the per-sequence path, as before.
         plan.serial.extend(
@@ -157,6 +181,36 @@ pub(super) fn plan_verify(
         plan.decode_rows.clear();
     }
     plan
+}
+
+/// Cut each member's drafts to its own dynamic ceiling (at most the step's
+/// `ladder_nd`), then the batch to the deep row budget, deepest first.
+fn deep_truncate(
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    active: &mut [ActiveSeq],
+    members: &[usize],
+    ceiling: usize,
+    ladder_nd: usize,
+) {
+    use crate::scheduler::mtp_deep_depth::fit_row_budget;
+    let mut caps: Vec<usize> = members
+        .iter()
+        .map(|&i| {
+            let a = &active[i];
+            let own = a.mtp_acct.depth_drafts(ceiling, sched.levers.depth());
+            a.pending_drafts.len().min(own).min(ladder_nd)
+        })
+        .collect();
+    let budget = spark_model::speculative::deep_depth::row_budget(
+        members.len(),
+        ceiling + 1,
+        crate::scheduler::mtp_dcut::VERIFY_ROW_BUDGET,
+    );
+    fit_row_budget(&mut caps, budget);
+    for (&i, &c) in members.iter().zip(&caps) {
+        active[i].pending_drafts.truncate(c);
+        active[i].pending_draft_conf.truncate(c);
+    }
 }
 
 #[cfg(test)]
