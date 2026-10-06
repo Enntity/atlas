@@ -470,7 +470,11 @@ qwen4exp_gdn_decode_fused_rows(
 // has loaded the old ones.
 //
 // Grid: (num_v_heads, sequences, 1) with clusters of QDF_REPEAT; block QDF_D.
-#define QDF_VERIFY_KMAX 4
+// 8 = the exact lane's deepest verify window (7 drafts, verify_rows.rs). The
+// token loop runs to the sequence's own k, so a k <= 4 sequence executes the
+// same instructions it did under KMAX 4; only the by-value table grows
+// (8 x 136 B).
+#define QDF_VERIFY_KMAX 8
 
 struct QdfVerifySeq {
     float* h;                                // [nv, 128, 128] FP32

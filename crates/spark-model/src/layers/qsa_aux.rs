@@ -239,7 +239,9 @@ mod tests {
         let gpu = MockGpuBackend::new();
         let qsa = indexer(&gpu);
         for base in 100..108 {
-            for rows in 1..=4 {
+            // Up to the exact lane's 8-row window (7 drafts): a rejection
+            // may un-pool two blocks.
+            for rows in 1..=8 {
                 for accepted in 0..=rows {
                     let after_verify = base + rows;
                     let mut st = state(&gpu, after_verify, after_verify / 4);
