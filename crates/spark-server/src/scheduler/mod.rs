@@ -785,6 +785,7 @@ pub fn run(
             let dflash_spec_think = mtp_gate::spec_think_for(
                 sched.levers.dflash_spec_think,
                 model.verify_bit_exact(),
+                model.batch_verify_bit_exact(),
                 active.len(),
             );
             // ATLAS_GLM_STRICT_SPEC=1: strict structured-output sequences

@@ -176,11 +176,16 @@ pub fn spec_dispatch_eligible(
 /// is bitwise serial decode (`Model::verify_bit_exact`, qwen4_exp under
 /// `ATLAS_QWEN4EXP_EXACT_VERIFY=1`). The reason speculation stays out of
 /// `<think>` is that batch-K verify is not byte-lossless at T=0; an exact
-/// verify removes it. Only for ONE active sequence: a concurrent batch
-/// verifies through the multi-sequence path, which the exact switch does
-/// not cover, and its serial counterpart is batched decode besides.
-pub fn spec_think_for(opt_in: bool, verify_bit_exact: bool, active: usize) -> bool {
-    opt_in || (verify_bit_exact && active == 1)
+/// verify removes it. A concurrent batch verifies through the multi-sequence
+/// path, so it needs that path exact as well (`Model::batch_verify_bit_exact`,
+/// the qwen4_exp exact-batching lane); otherwise only ONE active sequence.
+pub fn spec_think_for(
+    opt_in: bool,
+    verify_bit_exact: bool,
+    batch_verify_bit_exact: bool,
+    active: usize,
+) -> bool {
+    opt_in || (verify_bit_exact && (active == 1 || batch_verify_bit_exact))
 }
 
 /// [`spec_dispatch_eligible`] for one active sequence. A strict

@@ -350,18 +350,21 @@ fn standard_mtp_spec_think_opts_in() {
 
 #[test]
 fn bit_exact_verify_counts_as_the_think_opt_in_for_one_sequence() {
-    assert!(spec_think_for(true, false, 4));
-    assert!(spec_think_for(false, true, 1));
-    // A concurrent batch verifies through the multi-sequence path.
-    assert!(!spec_think_for(false, true, 2));
-    assert!(!spec_think_for(false, false, 1));
+    assert!(spec_think_for(true, false, false, 4));
+    assert!(spec_think_for(false, true, false, 1));
+    // A concurrent batch verifies through the multi-sequence path: only an
+    // exact one lets it speculate inside `<think>`.
+    assert!(!spec_think_for(false, true, false, 2));
+    assert!(spec_think_for(false, true, true, 4));
+    assert!(!spec_think_for(false, false, true, 4));
+    assert!(!spec_think_for(false, false, false, 1));
     assert!(spec_dispatch_eligible(
         true,
         0,
         50,
         false,
         false,
-        spec_think_for(false, true, 1),
+        spec_think_for(false, true, false, 1),
         0,
         false
     ));

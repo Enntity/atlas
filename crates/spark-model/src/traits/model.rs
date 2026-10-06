@@ -626,6 +626,15 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// True when the batched multi-sequence verify is bitwise serial decode
+    /// too, row by row, so a concurrent batch may speculate wherever a single
+    /// sequence may (inside `<think>` included). Default false. qwen4_exp
+    /// under `ATLAS_QWEN4EXP_EXACT_VERIFY=1` plus `ATLAS_QWEN4EXP_BATCH_FAST=1`
+    /// (`model/qwen4exp_batch_fast.rs`).
+    fn batch_verify_bit_exact(&self) -> bool {
+        false
+    }
+
     /// Check if speculative decoding is available (MTP or self-speculative).
     fn has_proposer(&self) -> bool;
 
