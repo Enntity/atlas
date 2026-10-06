@@ -155,16 +155,11 @@ impl Qwen4ExpMtpHead {
             .iter()
             .filter(|t| matches!(t, atlas_core::config::LayerType::FullAttention))
             .count();
-        let kv_config = KvCacheConfig {
-            block_size: 16,
-            num_kv_heads: config.num_key_value_heads,
-            head_dim: config.head_dim,
-            num_layers: target_attn_layers + 1,
-            dtype: KvCacheDtype::Bf16,
-            layer_dtypes: vec![],
-            layer_dims: vec![],
-            cache_blocks_per_seq: None,
-        };
+        let kv_config = drafter_kv_config(
+            target_attn_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+        );
         let num_blocks = max_seq_len / kv_config.block_size + 1;
         let kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
 
@@ -238,8 +233,57 @@ impl Qwen4ExpMtpHead {
     }
 }
 
+/// The drafter's KV geometry: `slot` placeholder layer slots, then the one
+/// layer it writes. The placeholders exist only so the body's
+/// `attn_idx = slot` lands on a real pool; they are never read or written,
+/// so they get the smallest geometry the allocator accepts (one 1-wide head,
+/// 32 B per block) instead of a full layer each. Full layers there cost
+/// 12/13 of the pool: 6.5 GB at --max-seq-len 262144 where 0.5 GB is used.
+fn drafter_kv_config(slot: usize, num_kv_heads: usize, head_dim: usize) -> KvCacheConfig {
+    let mut layer_dims = vec![(1, 1); slot];
+    layer_dims.push((num_kv_heads, head_dim));
+    KvCacheConfig {
+        block_size: 16,
+        num_kv_heads,
+        head_dim,
+        num_layers: slot + 1,
+        dtype: KvCacheDtype::Bf16,
+        layer_dtypes: vec![],
+        layer_dims,
+        cache_blocks_per_seq: None,
+    }
+}
+
 #[path = "qwen4exp_mtp_forward.rs"]
 mod qwen4exp_mtp_forward;
+
+#[cfg(test)]
+mod drafter_kv_tests {
+    use super::*;
+    use spark_runtime::gpu::mock::MockGpuBackend;
+
+    /// The written slot keeps a full layer's strides; the twelve slots in
+    /// front of it cost next to nothing.
+    #[test]
+    fn only_the_written_slot_is_a_full_layer() {
+        let cfg = drafter_kv_config(12, 2, 256);
+        let full = 16 * 2 * 256 * 2;
+        assert_eq!(cfg.k_block_bytes_for_layer(12), full);
+        assert_eq!(cfg.v_block_bytes_for_layer(12), full);
+        assert_eq!(cfg.cache_stride_elements(), 16 * 2 * 256);
+        assert_eq!(cfg.block_bytes_kv_all_layers(), 2 * full + 12 * 2 * 32);
+
+        let gpu = MockGpuBackend::new();
+        let blocks = 64;
+        let kv = PagedKvCache::new(cfg, blocks, &gpu).unwrap();
+        assert_eq!(kv.k_block_stride_bytes_for_layer(12), full);
+        assert_eq!(kv.v_block_stride_bytes_for_layer(12), full);
+        assert_eq!(kv.dtype_for_layer(12), KvCacheDtype::Bf16);
+        let k12 = gpu.read_alloc(kv.k_pool_ptr(12)).unwrap();
+        assert_eq!(k12.len(), blocks * full);
+        assert_eq!(gpu.read_alloc(kv.k_pool_ptr(0)).unwrap().len(), blocks * 32);
+    }
+}
 
 impl DraftProposer for Qwen4ExpMtpHead {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
