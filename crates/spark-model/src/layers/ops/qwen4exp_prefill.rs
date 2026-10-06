@@ -7,6 +7,7 @@
 //! |------------------------------------------|----------------------------------------|--------|
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=1`      | TP2 QSA attention on tensor cores      | = TP1 tc2, != `_g` |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_LEAN=1`      | TP1 tc2 -> its lean twin (2 CTAs/SM)   | = tc2  |
+//! | `ATLAS_QWEN4EXP_PREFILL_QSA_GP=1`        | `_g` QSA attention, rescheduled        | = `_g` |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_SCORE=1`     | QSA block scorer, 16-byte loads, 2 rows a thread | = `qsa_score_rows_exact` |
 //! | `ATLAS_QWEN4EXP_PREFILL_GDN=1`           | GDN spine over 2 CTAs a head (TP2); wide `chunk_fwd_o` | = `..._pipe`, = `chunk_fwd_o` |
 //! | `ATLAS_QWEN4EXP_PREFILL_HC=1`            | mHC collapse: seam, down, up+mix fused | = default (`qwen4exp_prefill_hc`) |
@@ -111,6 +112,87 @@ pub fn try_qsa_prefill_attn_lean(
         l = l.arg_u32(s.rows);
     }
     l.launch(stream)?;
+    Ok(true)
+}
+
+/// `ATLAS_QWEN4EXP_PREFILL_QSA_GP=1`.
+pub fn qsa_gp_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_QSA_GP"))
+}
+
+/// `QSA_GP_DEPTH` in `qsa_attn_gp.cu`: keys in flight a warp.
+const QSA_GP_DEPTH: u32 = 4;
+
+/// Dynamic shared memory of `qsa_prefill_attn_gp`: the key loop's K/V ring
+/// and slot table, or `_g`'s merge buffer that aliases them, whichever is
+/// larger.
+pub fn qsa_prefill_attn_gp_smem(topk: u32, ratio: u32, hd: u32) -> u32 {
+    let warps = 8;
+    let ring = warps * QSA_GP_DEPTH * 2 * 256 * 2;
+    let slots = (topk * ratio + ratio) * 4;
+    let merge = (warps * super::QSA_PA_G * hd + 2 * warps * super::QSA_PA_G) * 4;
+    (ring + slots).max(merge)
+}
+
+/// Run a slab that `qsa_prefill_attn_g` would serve on its exact twin
+/// `qsa_prefill_attn_gp` (`qsa_attn_gp.cu`): the same arithmetic in the same
+/// order, with the K/V addresses resolved once a row, a 4-deep cp.async ring,
+/// the four heads' butterflies merged into one and two keys a step -- every
+/// output byte equal to `_g`'s (`scripts/dev/qwen4exp_qsa_gp_bench.cu`; GB10,
+/// 2048 rows at position 14000, 12 q / 1 kv heads: 21.1 -> 9.1 ms).
+/// `Ok(false)` launched nothing: the caller runs `_g`.
+pub fn try_qsa_prefill_attn_gp(gpu: &dyn GpuBackend, s: &QsaAttnSlab, stream: u64) -> Result<bool> {
+    if !qsa_gp_requested() || !launch_qsa_prefill_attn_gp(gpu, s, stream)? {
+        return Ok(false);
+    }
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("QSA prefill attention: gp (exact twin of grouped)");
+    }
+    Ok(true)
+}
+
+/// [`try_qsa_prefill_attn_gp`] without the switch: launch when the kernel
+/// serves the slab's geometry, else `Ok(false)`.
+pub fn launch_qsa_prefill_attn_gp(
+    gpu: &dyn GpuBackend,
+    s: &QsaAttnSlab,
+    stream: u64,
+) -> Result<bool> {
+    let smem = qsa_prefill_attn_gp_smem(s.topk, s.ratio, s.hd);
+    let serves = s.hd == 256
+        && super::qsa_prefill_attn_grouped_ok(s.nq, s.nkv, s.hd)
+        && smem <= 96 * 1024
+        && s.k_cache.0.is_multiple_of(16)
+        && s.v_cache.0.is_multiple_of(16)
+        && s.rows != 0;
+    if !serves {
+        return Ok(false);
+    }
+    let k = crate::layers::try_kernel(gpu, "qsa_attn_gp", "qsa_prefill_attn_gp");
+    if k.0 == 0 {
+        return Ok(false);
+    }
+    KernelLaunch::new(gpu, k)
+        .grid([s.rows, s.nq / super::QSA_PA_G, 1])
+        .block([256, 1, 1])
+        .shared_mem(smem)
+        .arg_ptr(s.q)
+        .arg_ptr(s.k_cache)
+        .arg_ptr(s.v_cache)
+        .arg_ptr(s.block_table)
+        .arg_ptr(s.lists)
+        .arg_ptr(s.attn_out)
+        .arg_u32(s.first_pos)
+        .arg_u32(s.topk)
+        .arg_u32(s.ratio)
+        .arg_u32(s.block_size)
+        .arg_u32(s.nq)
+        .arg_u32(s.nkv)
+        .arg_u32(s.hd)
+        .arg_f32(s.inv_sqrt_d)
+        .launch(stream)?;
     Ok(true)
 }
 
