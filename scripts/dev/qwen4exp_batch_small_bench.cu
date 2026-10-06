@@ -25,6 +25,9 @@
 //                 decode_f32, gated_rms_norm_f32_input_sigmoid, H -> rollback
 //                 slot (slots for tokens 0..k-2); 1..12 sequences, k = 2..4
 //                 and ragged 1..4; normed rows, final states and every slot.
+//   mHC / MoE     the decode-fuse seam hc_post_stage_vec and EP tail
+//                 moe_blend_hc_post at T = 1..8 rows vs hc_post_vec +
+//                 hc_pre_stage_vec and moe_batched_blend + hc_post_vec.
 //
 // R = 1..8, 16, 32 (16 and 32 as 8-row launches for the GDN step, as the
 // runtime chunks them). Then GPU time per layer at R rows, the old launches
@@ -663,6 +666,161 @@ static void verify_time(const GdnShape& s) {
     }
 }
 
+// ══ mHC seam and the EP blend + post over T rows ═════════════════════════
+// The decode-fuse tier's seam (hc_post_stage_vec) and MoE tail
+// (moe_blend_hc_post) at T = 1..8 rows against the kernels the batched step
+// runs: hc_post_vec + hc_pre_stage_vec, moe_batched_blend + hc_post_vec.
+static const u32 HC = 4, HC_SPLIT = 8, POST_BLOCK = 64, BLEND_BLOCK = 256;
+struct HcKernels { CUfunction post, stage, post_stage, blend, blend_post; };
+static HcKernels hc_kernels() {
+    return {mod("hyper_connection").fn("hc_post_vec"), mod("hyper_connection").fn("hc_pre_stage_vec"),
+            mod("hyper_connection").fn("hc_post_stage_vec"), mod("moe_permute").fn("moe_batched_blend"),
+            mod("qwen4exp_decode_fuse").fn("moe_blend_hc_post")};
+}
+static void hc_post(const HcKernels& k, bf* block, float* streams, float* inj, u32 T) {
+    u32 h = H, hc = HC;
+    Args a; a.add(block).add(streams).add(inj).add(streams).add(h).add(hc);
+    launch(k.post, dim3(T, (H / 4 + POST_BLOCK - 1) / POST_BLOCK), dim3(POST_BLOCK), 0, a, g_s);
+}
+static void seam_old(const HcKernels& k, bf* block, float* streams, float* inj, bf* norm_w, float* normed, u32 T) {
+    hc_post(k, block, streams, inj, T);
+    u32 h = H, hc = HC; float eps = 1e-6f;
+    Args a; a.add(streams).add(norm_w).add(normed).add(h).add(hc).add(eps);
+    launch(k.stage, dim3(T, HC_SPLIT), dim3(1024), 0, a, g_s);
+}
+static void seam_new(const HcKernels& k, bf* block, float* streams, float* inj, bf* norm_w, float* normed, u32 T) {
+    u32 h = H, hc = HC; float eps = 1e-6f;
+    Args a; a.add(block).add(streams).add(inj).add(norm_w).add(normed).add(h).add(hc).add(eps);
+    launch(k.post_stage, dim3(T, HC_SPLIT), dim3(1024), 0, a, g_s);
+}
+static void tail_old(const HcKernels& k, bf* out, bf* shared, bf* x, bf* gw, float* streams, float* inj, u32 T) {
+    u32 h = H;
+    Args a; a.add(out).add(shared).add(x).add(gw).add(h).add(T);
+    launch(k.blend, dim3(T), dim3(BLEND_BLOCK), 0, a, g_s);
+    hc_post(k, out, streams, inj, T);
+}
+static void tail_new(const HcKernels& k, bf* out, bf* shared, bf* x, bf* gw, float* streams, float* inj, u32 T) {
+    u32 h = H, hc = HC;
+    Args a; a.add(out).add(shared).add(x).add(gw).add(streams).add(inj).add(h).add(hc);
+    launch(k.blend_post, dim3(T, (H + 4 * BLEND_BLOCK - 1) / (4 * BLEND_BLOCK)), dim3(BLEND_BLOCK), 0, a, g_s);
+}
+
+static void hc_rows_check() {
+    const HcKernels k = hc_kernels();
+    int bad = 0;
+    for (u32 T = 1; T <= 8; T++) {
+        for (int rep = 0; rep < 4; rep++) {
+            auto sv = rf((size_t)T * HC * H, 1.0f), iv = rf((size_t)T * HC, 1.0f);
+            auto bv = rbf((size_t)T * H, 1.0f), nw = rbf((size_t)HC * H, 1.0f);
+            auto ov = rbf((size_t)T * H, 1.0f), shv = rbf((size_t)T * H, 1.0f), gv = rbf(H, 0.05f);
+            Buf<float> s1, s2, n1, n2, inj; Buf<bf> blk, w, o1, o2, sh, gw;
+            for (auto* b : {&s1, &s2}) { b->alloc(sv.size()); b->put(sv); }
+            for (auto* b : {&n1, &n2}) { b->alloc((size_t)T * HC * H); b->fill(0x7F); }
+            inj.alloc(iv.size()); inj.put(iv);
+            blk.alloc(bv.size()); blk.put(bv);
+            w.alloc(nw.size()); w.put(nw);
+            for (auto* b : {&o1, &o2}) { b->alloc(ov.size()); b->put(ov); }
+            sh.alloc(shv.size()); sh.put(shv);
+            gw.alloc(gv.size()); gw.put(gv);
+            char what[96];
+            seam_old(k, blk.p, s1.p, inj.p, w.p, n1.p, T);
+            seam_new(k, blk.p, s2.p, inj.p, w.p, n2.p, T);
+            CK(cudaDeviceSynchronize());
+            snprintf(what, sizeof what, "hc_post_stage_vec T=%u streams", T);
+            bad += !same(what, s1, s2, s1.n);
+            snprintf(what, sizeof what, "hc_post_stage_vec T=%u staged rows", T);
+            bad += !same(what, n1, n2, n1.n);
+            for (bf* g : {gw.p, (bf*)nullptr}) {
+                s1.put(sv); s2.put(sv); o1.put(ov); o2.put(ov);
+                tail_old(k, o1.p, sh.p, blk.p, g, s1.p, inj.p, T);
+                tail_new(k, o2.p, sh.p, blk.p, g, s2.p, inj.p, T);
+                CK(cudaDeviceSynchronize());
+                snprintf(what, sizeof what, "moe_blend_hc_post T=%u gate=%d output", T, g != nullptr);
+                bad += !same(what, o1, o2, o1.n);
+                snprintf(what, sizeof what, "moe_blend_hc_post T=%u gate=%d streams", T, g != nullptr);
+                bad += !same(what, s1, s2, s1.n);
+            }
+            for (auto* b : {&s1, &s2, &n1, &n2, &inj}) b->free_();
+            for (auto* b : {&blk, &w, &o1, &o2, &sh, &gw}) b->free_();
+        }
+    }
+    printf("  %s hc_post_stage_vec and moe_blend_hc_post at T = 1..8 rows: highway, staged rows and "
+           "MoE output bytes equal to hc_post_vec + hc_pre_stage_vec / moe_batched_blend + hc_post_vec\n",
+           bad ? "BAD" : "ok ");
+}
+
+static void hc_rows_time() {
+    const HcKernels k = hc_kernels();
+    std::vector<Buf<float>> streams(LAYERS), normed(LAYERS), inj(LAYERS);
+    Buf<bf> blk, w, out, sh, gw;
+    for (int l = 0; l < LAYERS; l++) {
+        streams[l].alloc((size_t)8 * HC * H); streams[l].put(rf(streams[l].n, 1.0f));
+        normed[l].alloc((size_t)8 * HC * H);
+        inj[l].alloc(8 * HC); inj[l].put(rf(inj[l].n, 1.0f));
+    }
+    blk.alloc((size_t)8 * H); blk.put(rbf(blk.n, 1.0f));
+    w.alloc((size_t)HC * H); w.put(rbf(w.n, 1.0f));
+    out.alloc((size_t)8 * H); out.put(rbf(out.n, 1.0f));
+    sh.alloc((size_t)8 * H); sh.put(rbf(sh.n, 1.0f));
+    gw.alloc(H); gw.put(rbf(H, 0.05f));
+    printf("\n  mHC seam / EP MoE tail, us per layer in a graph: two launches -> one\n");
+    printf("  %5s  %-22s  %-22s\n", "rows", "seam (post + stage)", "tail (blend + post)");
+    for (u32 T : {1u, 2u, 4u, 8u}) {
+        const double a = graph_us([&](int l) { seam_old(k, blk.p, streams[l].p, inj[l].p, w.p, normed[l].p, T); }, LAYERS);
+        const double b = graph_us([&](int l) { seam_new(k, blk.p, streams[l].p, inj[l].p, w.p, normed[l].p, T); }, LAYERS);
+        const double c = graph_us([&](int l) { tail_old(k, out.p, sh.p, blk.p, gw.p, streams[l].p, inj[l].p, T); }, LAYERS);
+        const double d = graph_us([&](int l) { tail_new(k, out.p, sh.p, blk.p, gw.p, streams[l].p, inj[l].p, T); }, LAYERS);
+        printf("  %5u  %7.1f -> %6.1f (%3.1fx)   %7.1f -> %6.1f (%3.1fx)\n", T, a, b, a / b, c, d, c / d);
+    }
+}
+
+// The recurrence alone, R sequences: R launches of gated_delta_rule_decode_f32
+// (one per sequence, as the batched decode's loop) against one launch of the
+// strided multi-sequence twin gated_delta_rule_decode_f32_strided (the
+// non-exact-lane batched recurrent arm; contiguous state slots), to answer
+// why that twin measured slower than the loop. Answer (ptxas -v, sm_121a):
+// both spill H_reg (255 registers, ~1.4 KB of spill a thread, ~176 KB a
+// block). A launch per sequence keeps 24 blocks resident (~4 MB of spill,
+// cache-resident); the strided grid keeps up to two blocks an SM resident
+// (~17 MB of spill beside the streamed state), which plausibly spills to
+// DRAM: 172 -> 293 us at R = 8, TP2. The fused step spills ~0.3 KB a thread,
+// and its rows grid runs as fast as, or faster than, a launch per sequence
+// (150 -> 145 us).
+static void rec_time(const GdnShape& s) {
+    CUfunction rec = mod("gated_delta_rule").fn("gated_delta_rule_decode_f32");
+    CUfunction strided = mod("gated_delta_rule").fn("gated_delta_rule_decode_f32_strided");
+    const u32 R = 8, cd = conv_dim(s), key_dim = s.nk * D, vdim = s.nv * D;
+    std::vector<Buf<float>> h(LAYERS);
+    for (auto& b : h) { b.alloc((size_t)R * s.nv * D * D); b.put(rf(b.n, 0.05f)); }
+    Buf<float> conv, gates, out;
+    conv.alloc((size_t)R * cd); conv.put(rf(conv.n, 0.1f));
+    gates.alloc((size_t)R * 2 * s.nv); gates.put(gate_rows(gates.n));
+    out.alloc((size_t)R * vdim);
+    printf("\n  recurrence only %s, us per layer in a graph: R x decode_f32 vs 1 x decode_f32_strided\n", s.name);
+    for (u32 rows : {1u, 2u, 4u, 8u}) {
+        const double a = graph_us([&](int l) {
+            for (u32 r = 0; r < rows; r++) {
+                u32 one = 1, d = D;
+                float* c = conv.p + (size_t)r * cd;
+                float* g = gates.p + (size_t)r * 2 * s.nv;
+                Args x;
+                x.add(h[l].p + (size_t)r * s.nv * D * D).add(c).add(c + key_dim).add(c + 2 * key_dim).add(g)
+                    .add(g + s.nv).add(out.p + (size_t)r * vdim).add(one).add(s.nk).add(s.nv).add(d).add(d);
+                launch(rec, dim3(s.nv), dim3(128), 0, x, g_s);
+            }
+        }, LAYERS);
+        const double b = graph_us([&](int l) {
+            u32 d = D, qks = cd, vs = cd, gbs = 2 * s.nv, os = vdim;
+            Args x;
+            x.add(h[l].p).add(conv.p).add(conv.p + key_dim).add(conv.p + 2 * key_dim).add(gates.p)
+                .add(gates.p + s.nv).add(out.p).add(rows).add(s.nk).add(s.nv).add(d).add(d).add(qks).add(vs)
+                .add(gbs).add(os);
+            launch(strided, dim3(s.nv, rows), dim3(128), 0, x, g_s);
+        }, LAYERS);
+        printf("  %5u  %7.1f -> %7.1f\n", rows, a, b);
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc > 1) g_dir = argv[1];
     const std::string mode = argc > 2 ? argv[2] : "check";
@@ -678,6 +836,7 @@ int main(int argc, char** argv) {
         gdn_check(tp1, steps);
         verify_check(tp2, steps);
         verify_check(tp1, steps);
+        hc_rows_check();
         printf("%s\n", g_fail ? "FAIL" : "PASS");
         return g_fail ? 1 : 0;
     }
@@ -685,5 +844,7 @@ int main(int argc, char** argv) {
     gdn_time(tp2);
     gdn_time(tp1);
     verify_time(tp2);
+    hc_rows_time();
+    rec_time(tp2);
     return 0;
 }

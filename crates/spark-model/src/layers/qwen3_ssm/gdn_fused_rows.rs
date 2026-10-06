@@ -20,7 +20,7 @@
 
 use super::trait_decode_batched::GdnStates;
 use super::*;
-use crate::layers::ops::qwen4exp_decode_fuse::{
+use crate::layers::ops::qwen4exp_gdn_rows::{
     GDN_VERIFY_KMAX, GdnDecodeRows, GdnVerifyRows, GdnVerifySeq, gdn_decode_rows, gdn_verify_rows,
 };
 

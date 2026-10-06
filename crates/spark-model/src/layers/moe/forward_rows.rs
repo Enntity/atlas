@@ -84,14 +84,19 @@ impl MoeLayer {
     /// `rows` rows of `input` (`[rows, h]` BF16) -> `moe_output` rows
     /// `[0, rows)`, each byte-identical to `forward` on that row alone.
     /// `Ok(None)`, nothing launched, where `forward` would take a grouped
-    /// prefill arm instead: the caller keeps its per-row loop.
+    /// prefill arm instead: the caller keeps its per-row loop. The flag is
+    /// whether the layer's mHC post ran too: under EP with
+    /// `ATLAS_QWEN4EXP_BATCH_SMALL`, `hc_post` fuses it with the rows'
+    /// shared-expert blend (`moe_blend_hc_post`, T = rows), as the
+    /// single-token decode-fuse tier does at T = 1.
     pub fn forward_rows(
         &self,
         input: DevicePtr,
         rows: usize,
+        hc_post: Option<ops::qwen4exp_decode_fuse::MoeHcPost>,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<Option<DevicePtr>> {
+    ) -> Result<Option<(DevicePtr, bool)>> {
         if rows == 0
             || !self.forward_rows_eligible(ctx)
             || ctx.levers.batch_bisect(ops::BISECT_MOE_FORWARD)
@@ -130,8 +135,9 @@ impl MoeLayer {
                 )?;
             }
         }
-        self.forward_ep_reduce(output, shared_out, input, rows, None, ctx, stream)?;
-        Ok(Some(output))
+        let posted =
+            self.forward_ep_reduce(output, shared_out, input, rows, hc_post, ctx, stream)?;
+        Ok(Some((output, posted)))
     }
 
     /// The row pair (module docs): `forward_row_local`'s originals arm for

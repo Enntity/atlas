@@ -811,7 +811,8 @@ impl MoeLayer {
     /// The EP tail of [`Self::forward`] over `rows` rows: ONE all-reduce of the
     /// `[rows, h]` partial outputs, then the shared expert added once per row
     /// (`moe_batched_blend`, one block per row; with `hc_post`, a single row's
-    /// blend may run fused with the layer's mHC post). Each element is the
+    /// blend, or under `ATLAS_QWEN4EXP_BATCH_SMALL` the rows' blends, may run
+    /// fused with the layer's mHC post). Each element is the
     /// same commutative two-rank BF16 sum and the same per-row blend as `rows`
     /// single-row tails, so a batched reduce is bit-identical to per-row ones.
     /// Returns whether the post ran. No-op without EP.
@@ -858,7 +859,10 @@ impl MoeLayer {
                 } else {
                     // Gated shared expert (e.g., Qwen3.5): apply sigmoid gate,
                     // fused with the layer's mHC post when it can be.
-                    posted = match hc_post.filter(|_| rows == 1) {
+                    // Several rows only under ATLAS_QWEN4EXP_BATCH_SMALL (a
+                    // block row per token, each the single-row arithmetic).
+                    let rows_ok = rows == 1 || ctx.levers.qwen4exp_batch_small;
+                    posted = match hc_post.filter(|_| rows_ok) {
                         Some(post) => ops::qwen4exp_decode_fuse::moe_blend_hc_post(
                             ctx.gpu,
                             post,
@@ -867,7 +871,7 @@ impl MoeLayer {
                             input,
                             self.weights.shared_expert_gate.weight,
                             h,
-                            1,
+                            rows as u32,
                             stream,
                         )?,
                         None => false,
