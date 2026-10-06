@@ -55,6 +55,7 @@
 mod argmax;
 mod fast_masked;
 mod scratch;
+pub(in crate::scheduler) use scratch::HostRows;
 mod selection;
 mod selection_io;
 

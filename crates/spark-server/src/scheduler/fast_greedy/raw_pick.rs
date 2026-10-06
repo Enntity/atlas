@@ -78,7 +78,10 @@ pub(in crate::scheduler) fn pick_row(
     }
     let vocab = model.vocab_size();
     let fp32 = model.decode_logits_fp32();
-    let mut row = vec![0u8; vocab * if fp32 { 4 } else { 2 }];
+    let mut row = crate::scheduler::verify_pipeline_helper::HostRows::take(
+        &ctx.scratch.host_bytes,
+        vocab * if fp32 { 4 } else { 2 },
+    );
     model.copy_logits_to_host(logits, &mut row)?;
     Ok(
         crate::scheduler::verify_pipeline_helper::verify_pick_with_pipeline(
