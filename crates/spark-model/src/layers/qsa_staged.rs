@@ -121,15 +121,15 @@ impl QsaIndexer {
             st.ingested
         );
         anyhow::ensure!(
-            pos < self.max_tokens && !self.is_active_at(pos),
-            "QSA staged commit at pos {pos}: only inert rows stage (bound {}, capacity {})",
+            !self.is_active_at(pos),
+            "QSA staged commit at pos {pos}: only inert rows stage (bound {})",
             self.inert_bound(),
-            self.max_tokens
         );
         anyhow::ensure!(
             row < self.max_staged_rows(),
             "QSA staged commit: row {row} past the staging rows"
         );
+        self.reserve(st, pos + 1, gpu, stream)?;
         let hd = self.hd as usize;
         gpu.copy_d2d_async(
             self.staged_key(row),

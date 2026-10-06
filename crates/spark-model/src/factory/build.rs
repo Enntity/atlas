@@ -621,6 +621,10 @@ pub fn build_model(
         hss_cache_blocks_per_seq.is_none(),
     );
     let (used_so_far, total_budget, kv_budget) = (budget.own, budget.total_budget, budget.bytes);
+    // Per-sequence state that grows with a sequence's tokens outside the pool
+    // (the QSA indexer carry): charged per pool token, so the pool and the
+    // state riding with its tokens fit the budget together.
+    let aux_bytes_per_token: usize = layers.iter().map(|l| l.aux_bytes_per_token()).sum();
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
@@ -690,7 +694,7 @@ pub fn build_model(
             }
             let n = match glm_cache_plan {
                 Some(plan) => plan.num_blocks_for_budget(kv_budget),
-                None => PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?,
+                None => kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?,
             };
             let max_kv_tokens = n * kv_block_size;
             let lazy_bf16_term = if derived_reserve > 0 {
@@ -698,9 +702,18 @@ pub fn build_model(
             } else {
                 String::new()
             };
+            let aux_term = if aux_bytes_per_token > 0 {
+                format!(
+                    " (incl. {:.1} GB for {aux_bytes_per_token} B/token of per-sequence \
+                     indexer state)",
+                    gib(max_kv_tokens * aux_bytes_per_token),
+                )
+            } else {
+                String::new()
+            };
             tracing::info!(
                 "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
-                 {:.1} GB pre-KV + {:.1} GB reserve{lazy_bf16_term} → {:.1} GB for KV \
+                 {:.1} GB pre-KV + {:.1} GB reserve{lazy_bf16_term} → {:.1} GB for KV{aux_term} \
                  → {} blocks × {} tok/block = {} max KV tokens",
                 total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
                 gpu_memory_utilization * 100.0,
