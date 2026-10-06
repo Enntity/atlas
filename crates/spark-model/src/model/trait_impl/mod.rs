@@ -479,6 +479,9 @@ impl Model for TransformerModel {
     fn verify_bit_exact(&self) -> bool {
         self.levers.qwen4exp_exact_verify
     }
+    fn batch_verify_bit_exact(&self) -> bool {
+        self.levers.qwen4exp_exact_verify && self.levers.qwen4exp_batch_fast
+    }
     fn has_proposer(&self) -> bool {
         self.has_proposer_dispatch()
     }
