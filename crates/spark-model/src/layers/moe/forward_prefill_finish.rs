@@ -70,9 +70,17 @@ impl MoeLayer {
         // ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE: under SP, the unpermute of the
         // rows the peer needs first, their reduce-scatter on the wire while
         // the rest unpermute (`layers::qwen4exp_sp_pipe`).
+        // With `_SP_SHARED`, the shared expert runs on the wire too (it was
+        // deferred by `forward_prefill`, `defer_shared_to_rs`).
+        let defer_shared =
+            !split && self.defer_shared_to_rs(sp, has_shared, overlap_shared_reduce, h, ctx);
+        let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
+        let run_shared = |s: u64| {
+            self.run_shared_expert_prefill(shared_in, shared_n, h, shared_inter, s, s, false, ctx)
+        };
         let rs_done = match sp {
-            Some(sp) if !split && !overlap_shared_reduce && !use_overlap && self.lora.is_none() => {
-                self.q38_unpermute_reduce_scatter(
+            Some(sp) if !split && !overlap_shared_reduce && !use_overlap => self
+                .q38_unpermute_reduce_scatter(
                     sp,
                     [
                         expert_down_out,
@@ -84,10 +92,13 @@ impl MoeLayer {
                     [h, top_k],
                     ctx,
                     stream,
-                )?
-            }
+                    |s| if defer_shared { run_shared(s) } else { Ok(()) },
+                )?,
             _ => false,
         };
+        if defer_shared && !rs_done {
+            run_shared(stream)?;
+        }
         let blended = !rs_done
             && self.unpermute_ep_prefill(
                 expert_down_out,

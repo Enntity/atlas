@@ -309,6 +309,18 @@ pub fn rs_requested() -> bool {
     })
 }
 
+/// Whether [`compute_and_reduce_scatter`] runs for this split (the switch,
+/// qwen4_exp, no graph capture, and a pair that takes a piece).
+pub fn rs_available(sp: SpRows, width: usize, ctx: &ForwardContext<'_>) -> bool {
+    let plan = super::glm_sp_uneven::plan(sp, true);
+    rs_requested()
+        && ctx.config.model_type == "qwen4_exp"
+        && !ctx.graph_capture
+        && ctx
+            .comm
+            .is_some_and(|c| c.supports_exchange_async(plan.m.min(PIECE) * width * 2))
+}
+
 /// Compute a `[total, width]` BF16 partial with `rows(first, count, stream)`
 /// (row-local: any row range, any order, same bytes) and reduce-scatter it,
 /// with the window this rank sends computed FIRST and sent in slab-sized
@@ -316,7 +328,9 @@ pub fn rs_requested() -> bool {
 /// (`ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE=1`). The peer's partial of this rank's
 /// rows lands in the stage and is added after the join with the pair's own
 /// add kernel (`bf16_add_inplace`, `own + peer`), so every byte is the one
-/// `SpRows::reduce_scatter` leaves. `Ok(false)`: not taken, nothing computed.
+/// `SpRows::reduce_scatter` leaves. `on_wire(stream)` runs after the rows,
+/// before the join: main-stream work independent of the exchange.
+/// `Ok(false)`: not taken, nothing computed or run.
 pub fn compute_and_reduce_scatter(
     sp: SpRows,
     buf: DevicePtr,
@@ -324,19 +338,14 @@ pub fn compute_and_reduce_scatter(
     ctx: &ForwardContext<'_>,
     stream: u64,
     mut rows: impl FnMut(usize, usize, u64) -> Result<()>,
+    on_wire: impl FnOnce(u64) -> Result<()>,
 ) -> Result<bool> {
-    let Some(comm) = ctx.comm else {
-        return Ok(false);
-    };
-    let row = width * 2;
-    let plan = super::glm_sp_uneven::plan(sp, true);
-    if !rs_requested()
-        || ctx.config.model_type != "qwen4_exp"
-        || ctx.graph_capture
-        || !comm.supports_exchange_async(plan.m.min(PIECE) * row)
-    {
+    if !rs_available(sp, width, ctx) {
         return Ok(false);
     }
+    let comm = ctx.comm.expect("rs_available checked it");
+    let row = width * 2;
+    let plan = super::glm_sp_uneven::plan(sp, true);
     let gpu = ctx.gpu;
     let side = side(gpu)?;
     // The side stream starts after the main stream's previous exchange.
@@ -367,6 +376,8 @@ pub fn compute_and_reduce_scatter(
     if plan.send0 + plan.m < total {
         rows(plan.send0 + plan.m, total - plan.send0 - plan.m, stream)?;
     }
+    // Independent main-stream work that overlaps the wire too.
+    on_wire(stream)?;
     gpu.record_event(side.to_main, side.stream)?;
     gpu.stream_wait_event(stream, side.to_main)?;
     let n = (plan.recv_n * width) as u32;
