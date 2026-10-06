@@ -225,7 +225,7 @@ impl TransformerModel {
         }
         // ATLAS_QWEN4EXP_BATCH_FAST_CHECK: serial reference rows first, before
         // the KV lock below (`batch_fast_check.rs`).
-        let serial_check = self.batch_fast_serial_rows(tokens, seqs)?;
+        let serial_check = self.batch_fast_serial_rows(tokens, None, seqs)?;
         if std::env::var("ATLAS_DECODE_BATCH_LOG").ok().as_deref() == Some("1") {
             let slots: Vec<i64> = seqs
                 .iter()

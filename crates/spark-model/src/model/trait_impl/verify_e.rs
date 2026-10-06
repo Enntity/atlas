@@ -172,6 +172,10 @@ impl TransformerModel {
             super::verify_e2::VERIFY_ROW_CAP
         );
 
+        // ATLAS_QWEN4EXP_BATCH_FAST_CHECK: serial reference rows first, before
+        // the KV lock below (`batch_fast_check.rs`).
+        let serial_check = self.batch_fast_serial_rows(tokens, Some(ks), seqs)?;
+
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
 
@@ -839,6 +843,9 @@ impl TransformerModel {
                 seq.tokens.push(t);
             }
             seq.seq_len += ks[i];
+        }
+        if let Some(rows) = serial_check {
+            self.batch_fast_compare(rows, self.buffers.logits())?;
         }
 
         Ok(out)
