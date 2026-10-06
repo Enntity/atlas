@@ -17,18 +17,18 @@
 //! | op | serial | batched (switch on) | per row |
 //! |---|---|---|---|
 //! | embed, PLE, mHC pre/post/head | per row / T=1 | per row / T=n (`hc_pre_split`, `_vec`; past 8 rows in 8-row split chunks, not the GEMM collapse) | equal |
-//! | GDN qkvz, out_proj (BF16) | `dense_gemv_bf16` | `dense_gemv_bf16_batchm` (<= 8 rows a launch) instead of cuBLASLt | equal |
+//! | GDN qkvz, out_proj (BF16) | `dense_gemv_bf16` | `dense_gemv_bf16_batchm` (<= 8 rows a launch; 9..32 `qwen4exp_bf16_rows16/32`, `ops::Qwen4ExpWideRows`) instead of cuBLASLt | equal |
 //! | GDN qkvz, out_proj (FP8 opt-in) | `w8a16_gemv` | `w8a16_gemv_batch4/16` | equal |
 //! | GDN ba+gates, conv, recurrence, norm | per row | the per-sequence loop (the strided batched recurrence is skipped) | equal |
-//! | attention Q+gate | `w4a16_gemv_qg` (one accumulator, scale folded in) | `qg_batch2/3/4` in <= 4-row chunks — never the scalar template the default 4+-row arm runs | equal |
-//! | attention K/V | `w4a16_gemv_dual` | `w4a16_gemv_batch2..8` per projection (as exact verify), <= 8 rows a launch | equal |
+//! | attention Q+gate | `w4a16_gemv_qg` (one accumulator, scale folded in) | `qg_batch2/3/4` in <= 4-row chunks, past 8 rows `qwen4exp_qg_rows16/32` — never the scalar template the default 4+-row arm runs | equal |
+//! | attention K/V | `w4a16_gemv_dual` | `w4a16_gemv_batch2..8` per projection (as exact verify), <= 8 rows a launch, past 8 rows `batch16` | equal |
 //! | QSA select / attention | bs=1 | per row (`qsa_rows.rs`), also for rows of several sequences | equal |
 //! | attention o_proj | `w4a16_gemv_sw` | `w4a16_gemv_batch2..8` | equal |
-//! | MoE router + top-k | `w4a16_gemv_sw`, `moe_topk_softmax` | per row | equal |
+//! | MoE router + top-k | `w4a16_gemv_sw`, `moe_topk_softmax` | router `w4a16_gemv_batchN` (row pair; `batch16` past 8 rows), top-k per row | equal |
 //! | MoE experts | `moe_expert_{gate_up,silu_down}_shared` | the same kernels per row, or their row-gridded twins (`qwen4exp_moe_rows.cu`) | equal |
 //! | MoE EP all-reduce + shared blend | `[1,h]` then `moe_batched_blend` T=1 | ONE `[n,h]` all-reduce, `moe_batched_blend` T=n | equal (one commutative BF16 add; the blend is a block per row) |
 //! | TP all-reduces | `[1,h]` | `[n,h]` | equal |
-//! | LM head (BF16, optionally vocab-split) | `dense_gemv_bf16` | `dense_gemv_bf16_batchm` (<= 8 rows a launch) instead of `dense_gemm_bf16` | equal |
+//! | LM head (BF16, optionally vocab-split) | `dense_gemv_bf16` | `dense_gemv_bf16_batchm` (<= 8 rows a launch; 9..32 `qwen4exp_bf16_rows16/32`) instead of `dense_gemm_bf16` | equal |
 //!
 //! The switch also keeps a batch with an ACTIVE QSA selection (a sequence
 //! past the 2051-token inert bound) on the batched step, served row by row

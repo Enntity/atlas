@@ -162,37 +162,24 @@ impl MoeLayer {
         let gate_logits = ctx.buffers.gate_logits();
         let router_n = self.router_logits_n;
         if let Some(ref nvfp4) = self.gate_nvfp4 {
-            // The widest resolved exact tier (batch8, else batch4).
-            let chunk = if self.w4a16_batchm.width(8).is_some() {
-                8
-            } else {
-                4
-            };
-            for first in (0..rows).step_by(chunk) {
-                let m = (rows - first).min(chunk) as u32;
-                ops::w4a16_gemv_batchm(
-                    ctx.gpu,
-                    self.w4a16_batchm.kernel(m),
-                    input.offset(first * h * bf16),
-                    nvfp4,
-                    gate_logits.offset(first * router_n as usize * bf16),
-                    m,
-                    router_n,
-                    h as u32,
-                    stream,
-                )?;
-            }
+            // The widest exact tier a launch (batch16 past 8 rows).
+            self.wide_rows.w4a16_rows(
+                ctx.gpu,
+                &self.w4a16_batchm,
+                input,
+                nvfp4,
+                gate_logits,
+                (rows as u32, router_n, h as u32),
+                stream,
+            )?;
         } else {
-            ops::dense_gemv_batchm_chunked(
+            self.wide_rows.dense_rows(
                 ctx.gpu,
                 self.dense_gemv_batchm,
                 input,
                 &self.weights.gate,
                 gate_logits,
-                rows as u32,
-                router_n,
-                h as u32,
-                router_n,
+                (rows as u32, router_n, h as u32, router_n),
                 stream,
             )?;
         }
