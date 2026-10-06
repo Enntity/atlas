@@ -126,12 +126,33 @@ struct Q38Smem {
     float lut[16];
 };
 
+// The n-tiles (of 16, 8 columns each) warp column `wn` (0..3) owns in the
+// W2 layout: two of the first half (gate) and the same two of the second
+// (up), so SiLU(gate) * up pairs inside one thread.
+__device__ __forceinline__ unsigned int q38w_nt(unsigned int wn, unsigned int j) {
+    return (j < 2u ? 0u : 8u) + 2u * wn + (j & 1u);
+}
+
 // One 128-row x 128-column x K tile over E4M3 A ([*, K] bytes, row `tok[r]`).
 // Columns 0..63 come from (B0, S0, s2[0]) at column offset n0, 64..127 from
 // (B1, S1, s2[1]) at n1 (the gate and up halves; for the down projection both
 // halves are one matrix at n0 and n0 + 64). `N` is each weight's column count
 // (row stride of the packed / scale planes). On return acc[nt] holds n-tile
 // nt (0..7 the first half, 8..15 the second) for this warp's 16 rows.
+//
+// W2 (ATLAS_QWEN4EXP_PREFILL_MOE_W2): the same products on a 2 x 4 warp grid
+// -- warp (wm, wn) = (warp & 1, warp >> 1) owns rows wm*64 .. +63 (four
+// m16 tiles) and n-tiles q38w_nt(wn, 0..3) -- and acc[mt * 4 + j] holds
+// m-tile mt, n-tile q38w_nt(wn, j). Each warp then reads a quarter of the B
+// tile and half the A tile per k32 instead of all of B (8 warps x 4 KB a
+// step was the shared-memory pipe's load), and the dequant stores its 16
+// bytes of a column as one 16-byte write instead of eight 2-byte ones (a
+// 4-way bank conflict at the 48-byte row pitch) -- both were shared-memory
+// pipe traffic, which bound the kernel (ncu: MIO throttle the top stall;
+// forming the E2M1 values with PRMT instead of the shared LUT measured
+// slower). Every accumulator still
+// takes the same k32 MMAs in increasing k on the same operands.
+template <bool W2>
 __device__ __forceinline__ void q38_tile(
     Q38Smem& sm,
     float (&acc)[16][4],
@@ -199,12 +220,24 @@ __device__ __forceinline__ void q38_tile(
             __nv_fp8_e4m3 f;
             *(unsigned char*)&f = sm.bs[rb][grp][col];
             const float sv = (float)f * s2;
-            #pragma unroll
-            for (unsigned int j = 0; j < 8; ++j) {
-                const unsigned int kp = grp * 8 + j;
-                const unsigned char packed = sm.bp[rb][kp][col];
-                *(unsigned short*)&sm.f8[fb][col][kp * 2] =
-                    q38_e4m3x2(sm.lut[packed & 0xF] * sv, sm.lut[packed >> 4] * sv);
+            if constexpr (W2) {
+                unsigned int w[4];
+                #pragma unroll
+                for (unsigned int j = 0; j < 8; j += 2) {
+                    const unsigned char p0 = sm.bp[rb][grp * 8 + j][col];
+                    const unsigned char p1 = sm.bp[rb][grp * 8 + j + 1][col];
+                    w[j / 2] = (unsigned int)q38_e4m3x2(sm.lut[p0 & 0xF] * sv, sm.lut[p0 >> 4] * sv)
+                             | ((unsigned int)q38_e4m3x2(sm.lut[p1 & 0xF] * sv, sm.lut[p1 >> 4] * sv) << 16);
+                }
+                *reinterpret_cast<uint4*>(&sm.f8[fb][col][grp * 16]) = make_uint4(w[0], w[1], w[2], w[3]);
+            } else {
+                #pragma unroll
+                for (unsigned int j = 0; j < 8; ++j) {
+                    const unsigned int kp = grp * 8 + j;
+                    const unsigned char packed = sm.bp[rb][kp][col];
+                    *(unsigned short*)&sm.f8[fb][col][kp * 2] =
+                        q38_e4m3x2(sm.lut[packed & 0xF] * sv, sm.lut[packed >> 4] * sv);
+                }
             }
         }
     };
@@ -223,28 +256,60 @@ __device__ __forceinline__ void q38_tile(
     const unsigned int r0 = warp * 16 + g, r1 = r0 + 8;
     for (unsigned int s = 0; s < steps; ++s) {
         const unsigned int rb = s % Q38_STAGES, fb = s & 1u;
-        #pragma unroll
-        for (unsigned int kk = 0; kk < Q38_BK; kk += 32) {
-            const unsigned int a0 = *(const unsigned int*)&sm.a[rb][r0][kk + 4 * t4];
-            const unsigned int a1 = *(const unsigned int*)&sm.a[rb][r1][kk + 4 * t4];
-            const unsigned int a2 = *(const unsigned int*)&sm.a[rb][r0][kk + 16 + 4 * t4];
-            const unsigned int a3 = *(const unsigned int*)&sm.a[rb][r1][kk + 16 + 4 * t4];
+        if constexpr (W2) {
+            const unsigned int wm = warp & 1u, wn = warp >> 1;
             #pragma unroll
-            for (int nt = 0; nt < 16; ++nt) {
-                const unsigned int nc = nt * 8 + g;
-                const unsigned int b0 = *(const unsigned int*)&sm.f8[fb][nc][kk + 4 * t4];
-                const unsigned int b1 = *(const unsigned int*)&sm.f8[fb][nc][kk + 16 + 4 * t4];
-#ifdef Q38_PROBE_NO_MMA
-                // MEASUREMENT PROBE ONLY -- WRONG OUTPUT. Fragments still loaded.
-                acc[nt][0] += __uint_as_float(a0 ^ a1 ^ a2 ^ a3 ^ b0 ^ b1);
-#else
-                asm volatile(
-                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
-                    : "=f"(acc[nt][0]), "=f"(acc[nt][1]), "=f"(acc[nt][2]), "=f"(acc[nt][3])
-                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
-                      "f"(acc[nt][0]), "f"(acc[nt][1]), "f"(acc[nt][2]), "f"(acc[nt][3]));
-#endif
+            for (unsigned int kk = 0; kk < Q38_BK; kk += 32) {
+                unsigned int b[4][2];
+                #pragma unroll
+                for (unsigned int j = 0; j < 4; ++j) {
+                    const unsigned int nc = q38w_nt(wn, j) * 8 + g;
+                    b[j][0] = *(const unsigned int*)&sm.f8[fb][nc][kk + 4 * t4];
+                    b[j][1] = *(const unsigned int*)&sm.f8[fb][nc][kk + 16 + 4 * t4];
+                }
+                #pragma unroll
+                for (unsigned int mt = 0; mt < 4; ++mt) {
+                    const unsigned int ra = wm * 64 + mt * 16 + g, rc = ra + 8;
+                    const unsigned int a0 = *(const unsigned int*)&sm.a[rb][ra][kk + 4 * t4];
+                    const unsigned int a1 = *(const unsigned int*)&sm.a[rb][rc][kk + 4 * t4];
+                    const unsigned int a2 = *(const unsigned int*)&sm.a[rb][ra][kk + 16 + 4 * t4];
+                    const unsigned int a3 = *(const unsigned int*)&sm.a[rb][rc][kk + 16 + 4 * t4];
+                    #pragma unroll
+                    for (unsigned int j = 0; j < 4; ++j) {
+                        float (&c)[4] = acc[mt * 4 + j];
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                            : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b[j][0]), "r"(b[j][1]),
+                              "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+                    }
+                }
+            }
+        } else {
+            #pragma unroll
+            for (unsigned int kk = 0; kk < Q38_BK; kk += 32) {
+                const unsigned int a0 = *(const unsigned int*)&sm.a[rb][r0][kk + 4 * t4];
+                const unsigned int a1 = *(const unsigned int*)&sm.a[rb][r1][kk + 4 * t4];
+                const unsigned int a2 = *(const unsigned int*)&sm.a[rb][r0][kk + 16 + 4 * t4];
+                const unsigned int a3 = *(const unsigned int*)&sm.a[rb][r1][kk + 16 + 4 * t4];
+                #pragma unroll
+                for (int nt = 0; nt < 16; ++nt) {
+                    const unsigned int nc = nt * 8 + g;
+                    const unsigned int b0 = *(const unsigned int*)&sm.f8[fb][nc][kk + 4 * t4];
+                    const unsigned int b1 = *(const unsigned int*)&sm.f8[fb][nc][kk + 16 + 4 * t4];
+    #ifdef Q38_PROBE_NO_MMA
+                    // MEASUREMENT PROBE ONLY -- WRONG OUTPUT. Fragments still loaded.
+                    acc[nt][0] += __uint_as_float(a0 ^ a1 ^ a2 ^ a3 ^ b0 ^ b1);
+    #else
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                        : "=f"(acc[nt][0]), "=f"(acc[nt][1]), "=f"(acc[nt][2]), "=f"(acc[nt][3])
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+                          "f"(acc[nt][0]), "f"(acc[nt][1]), "f"(acc[nt][2]), "f"(acc[nt][3]));
+    #endif
+                }
             }
         }
         if (s + 1 < steps) {
@@ -276,6 +341,7 @@ __device__ __forceinline__ void q38_rows(Q38Smem& sm, const int* __restrict__ so
 // act8[row, n] = e4m3(bf16(silu(bf16(A x gate)) * bf16(A x up))) for rows
 // [m_start, m_start + M) of one weight set; A8 rows through
 // `sorted_token_ids` (identity when null). CTAs stride the 128-row tiles.
+template <bool W2>
 __device__ __forceinline__ void q38_gate_up_silu_rows(
     Q38Smem& sm,
     const unsigned char* __restrict__ A8,
@@ -297,19 +363,34 @@ __device__ __forceinline__ void q38_gate_up_silu_rows(
         q38_rows(sm, sorted_token_ids, m_start, cta_m_local, M_eff);
         __syncthreads();
         float acc[16][4];
-        q38_tile(sm, acc, A8, K, cta_m_local, M_eff, Bg, Sg, n0, Bu, Su, n0, N);
+        q38_tile<W2>(sm, acc, A8, K, cta_m_local, M_eff, Bg, Sg, n0, Bu, Su, n0, N);
+        // (m-tile, gate n-tile, its acc index) per epilogue item; the up
+        // value of n-tile nt is 8 n-tiles on (W2: two acc entries on).
         #pragma unroll
-        for (int nt = 0; nt < 8; ++nt) {
+        for (int item = 0; item < 8; ++item) {
+            unsigned int mrow, nt, ai, au;
+            if constexpr (W2) {
+                const unsigned int mt = (unsigned int)item >> 1, j = (unsigned int)item & 1u;
+                mrow = (warp & 1u) * 64 + mt * 16;
+                nt = q38w_nt(warp >> 1, j);
+                ai = mt * 4 + j;
+                au = ai + 2;
+            } else {
+                mrow = warp * 16;
+                nt = (unsigned int)item;
+                ai = nt;
+                au = nt + 8;
+            }
             const unsigned int c0 = n0 + nt * 8 + t4 * 2;
             #pragma unroll
             for (unsigned int half = 0; half < 2; ++half) {
-                const unsigned int lr = warp * 16 + g + half * 8;
+                const unsigned int lr = mrow + g + half * 8;
                 if (cta_m_local + lr >= M_eff) continue;
                 float o[2];
                 #pragma unroll
                 for (unsigned int j = 0; j < 2; ++j) {
-                    const float gv = __bfloat162float(__float2bfloat16(acc[nt][half * 2 + j]));
-                    const float uv = __bfloat162float(__float2bfloat16(acc[nt + 8][half * 2 + j]));
+                    const float gv = __bfloat162float(__float2bfloat16(acc[ai][half * 2 + j]));
+                    const float uv = __bfloat162float(__float2bfloat16(acc[au][half * 2 + j]));
                     const float sig = 1.0f / (1.0f + __expf(-gv));
                     o[j] = __bfloat162float(__float2bfloat16(gv * sig * uv));
                 }
@@ -323,6 +404,7 @@ __device__ __forceinline__ void q38_gate_up_silu_rows(
 // ── down ──
 // C[row, n] = bf16(act x down) for rows [m_start, m_start + M) of one weight
 // set (act8 not gathered). CTAs stride the 128-row tiles.
+template <bool W2>
 __device__ __forceinline__ void q38_down_rows(
     Q38Smem& sm,
     const unsigned char* __restrict__ act8,
@@ -342,18 +424,20 @@ __device__ __forceinline__ void q38_down_rows(
         q38_rows(sm, nullptr, m_start, cta_m_local, M_eff);
         __syncthreads();
         float acc[16][4];
-        q38_tile(sm, acc, act8, K, cta_m_local, M_eff, B, S, n0, B, S, n0 + 64, N);
+        q38_tile<W2>(sm, acc, act8, K, cta_m_local, M_eff, B, S, n0, B, S, n0 + 64, N);
         #pragma unroll
-        for (int nt = 0; nt < 16; ++nt) {
+        for (int ai = 0; ai < 16; ++ai) {
+            const unsigned int mrow = W2 ? (warp & 1u) * 64 + ((unsigned int)ai >> 2) * 16 : warp * 16;
+            const unsigned int nt = W2 ? q38w_nt(warp >> 1, (unsigned int)ai & 3u) : (unsigned int)ai;
             const unsigned int c0 = n0 + nt * 8 + t4 * 2;
             #pragma unroll
             for (unsigned int half = 0; half < 2; ++half) {
-                const unsigned int lr = warp * 16 + g + half * 8;
+                const unsigned int lr = mrow + g + half * 8;
                 if (cta_m_local + lr >= M_eff) continue;
                 const unsigned int row = m_start + cta_m_local + lr;
                 *(unsigned int*)&C[(size_t)row * N + c0] =
-                      (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[nt][half * 2]))
-                    | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[nt][half * 2 + 1])) << 16);
+                      (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[ai][half * 2]))
+                    | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[ai][half * 2 + 1])) << 16);
             }
         }
     }
@@ -362,94 +446,108 @@ __device__ __forceinline__ void q38_down_rows(
 // Grouped (routed experts): weights by expert pointer tables, rows by
 // expert_offsets; a null table is a remote (EP) expert and is skipped, as in
 // the default kernels. Grid: (N / 64, m-tiles (strided), num_experts).
-extern "C" __global__ void __launch_bounds__(256, Q38_MINB) moe_q38_gate_up_silu(
-    const unsigned char* __restrict__ A8,                // [tokens, K] E4M3
-    const unsigned long long* __restrict__ gate_packed_ptrs,
-    const unsigned long long* __restrict__ gate_scale_ptrs,
-    const float* __restrict__ gate_scale2_vals,
-    const unsigned long long* __restrict__ up_packed_ptrs,
-    const unsigned long long* __restrict__ up_scale_ptrs,
-    const float* __restrict__ up_scale2_vals,
-    unsigned char* __restrict__ act8,                    // [rows, N] E4M3
-    const int* __restrict__ expert_offsets,
-    const int* __restrict__ sorted_token_ids,
-    unsigned int num_experts,
-    unsigned int N,
-    unsigned int K
-) {
-    __shared__ __align__(16) Q38Smem sm;
-    const unsigned int e = blockIdx.z;
-    if (e >= num_experts) return;
-    const int m_start = expert_offsets[e];
-    const int M_expert = expert_offsets[e + 1] - m_start;
-    if (M_expert <= 0) return;
-    const unsigned char* Bg = (const unsigned char*)gate_packed_ptrs[e];
-    const unsigned char* Bu = (const unsigned char*)up_packed_ptrs[e];
-    if (Bg == nullptr || Bu == nullptr) return;
-    q38_gate_up_silu_rows(sm, A8, Bg, (const unsigned char*)gate_scale_ptrs[e], gate_scale2_vals[e],
-                          Bu, (const unsigned char*)up_scale_ptrs[e], up_scale2_vals[e], act8,
-                          sorted_token_ids, (unsigned int)m_start, (unsigned int)M_expert, N, K);
+// Each entry has a `moe_q38w_*` twin on the W2 warp layout (q38_tile).
+#define Q38_GATE_UP_ENTRY(NAME, W2)                                                            \
+extern "C" __global__ void __launch_bounds__(256, Q38_MINB) NAME(                             \
+    const unsigned char* __restrict__ A8,                /* [tokens, K] E4M3 */               \
+    const unsigned long long* __restrict__ gate_packed_ptrs,                                  \
+    const unsigned long long* __restrict__ gate_scale_ptrs,                                   \
+    const float* __restrict__ gate_scale2_vals,                                               \
+    const unsigned long long* __restrict__ up_packed_ptrs,                                    \
+    const unsigned long long* __restrict__ up_scale_ptrs,                                     \
+    const float* __restrict__ up_scale2_vals,                                                 \
+    unsigned char* __restrict__ act8,                    /* [rows, N] E4M3 */                 \
+    const int* __restrict__ expert_offsets,                                                   \
+    const int* __restrict__ sorted_token_ids,                                                 \
+    unsigned int num_experts,                                                                 \
+    unsigned int N,                                                                           \
+    unsigned int K                                                                            \
+) {                                                                                           \
+    __shared__ __align__(16) Q38Smem sm;                                                      \
+    const unsigned int e = blockIdx.z;                                                        \
+    if (e >= num_experts) return;                                                             \
+    const int m_start = expert_offsets[e];                                                    \
+    const int M_expert = expert_offsets[e + 1] - m_start;                                     \
+    if (M_expert <= 0) return;                                                                \
+    const unsigned char* Bg = (const unsigned char*)gate_packed_ptrs[e];                      \
+    const unsigned char* Bu = (const unsigned char*)up_packed_ptrs[e];                        \
+    if (Bg == nullptr || Bu == nullptr) return;                                               \
+    q38_gate_up_silu_rows<W2>(sm, A8, Bg, (const unsigned char*)gate_scale_ptrs[e],           \
+                              gate_scale2_vals[e], Bu, (const unsigned char*)up_scale_ptrs[e],\
+                              up_scale2_vals[e], act8, sorted_token_ids,                      \
+                              (unsigned int)m_start, (unsigned int)M_expert, N, K);           \
 }
+Q38_GATE_UP_ENTRY(moe_q38_gate_up_silu, false)
+Q38_GATE_UP_ENTRY(moe_q38w_gate_up_silu, true)
 
 // Grid: (N / 128, m-tiles (strided), num_experts).
-extern "C" __global__ void __launch_bounds__(256, Q38_MINB) moe_q38_down(
-    const unsigned char* __restrict__ act8,              // [rows, K] E4M3
-    const unsigned long long* __restrict__ B_packed_ptrs,
-    const unsigned long long* __restrict__ B_scale_ptrs,
-    const float* __restrict__ scale2_vals,
-    __nv_bfloat16* __restrict__ C,                       // [rows, N]
-    const int* __restrict__ expert_offsets,
-    unsigned int num_experts,
-    unsigned int N,
-    unsigned int K
-) {
-    __shared__ __align__(16) Q38Smem sm;
-    const unsigned int e = blockIdx.z;
-    if (e >= num_experts) return;
-    const int m_start = expert_offsets[e];
-    const int M_expert = expert_offsets[e + 1] - m_start;
-    if (M_expert <= 0) return;
-    const unsigned char* B = (const unsigned char*)B_packed_ptrs[e];
-    if (B == nullptr) return;
-    q38_down_rows(sm, act8, B, (const unsigned char*)B_scale_ptrs[e], scale2_vals[e], C,
-                  (unsigned int)m_start, (unsigned int)M_expert, N, K);
+#define Q38_DOWN_ENTRY(NAME, W2)                                                               \
+extern "C" __global__ void __launch_bounds__(256, Q38_MINB) NAME(                             \
+    const unsigned char* __restrict__ act8,              /* [rows, K] E4M3 */                 \
+    const unsigned long long* __restrict__ B_packed_ptrs,                                     \
+    const unsigned long long* __restrict__ B_scale_ptrs,                                      \
+    const float* __restrict__ scale2_vals,                                                    \
+    __nv_bfloat16* __restrict__ C,                       /* [rows, N] */                      \
+    const int* __restrict__ expert_offsets,                                                   \
+    unsigned int num_experts,                                                                 \
+    unsigned int N,                                                                           \
+    unsigned int K                                                                            \
+) {                                                                                           \
+    __shared__ __align__(16) Q38Smem sm;                                                      \
+    const unsigned int e = blockIdx.z;                                                        \
+    if (e >= num_experts) return;                                                             \
+    const int m_start = expert_offsets[e];                                                    \
+    const int M_expert = expert_offsets[e + 1] - m_start;                                     \
+    if (M_expert <= 0) return;                                                                \
+    const unsigned char* B = (const unsigned char*)B_packed_ptrs[e];                          \
+    if (B == nullptr) return;                                                                 \
+    q38_down_rows<W2>(sm, act8, B, (const unsigned char*)B_scale_ptrs[e], scale2_vals[e], C,  \
+                      (unsigned int)m_start, (unsigned int)M_expert, N, K);                   \
 }
+Q38_DOWN_ENTRY(moe_q38_down, false)
+Q38_DOWN_ENTRY(moe_q38w_down, true)
 
 // Dense (the shared expert, `w4a16_gemm_t` x 3 + `moe_silu_mul` in the
 // default): one weight set over rows [0, M), scalar scale2.
 // Grid: (N / 64, ceil(M / 128)).
-extern "C" __global__ void __launch_bounds__(256, Q38_MINB) moe_q38_dense_gate_up_silu(
-    const unsigned char* __restrict__ A8,                // [M, K] E4M3
-    const unsigned char* __restrict__ gate_packed,       // [K/2, N]
-    const unsigned char* __restrict__ gate_scale,        // [K/16, N]
-    const float gate_scale2,
-    const unsigned char* __restrict__ up_packed,
-    const unsigned char* __restrict__ up_scale,
-    const float up_scale2,
-    unsigned char* __restrict__ act8,                    // [M, N] E4M3
-    unsigned int M,
-    unsigned int N,
-    unsigned int K
-) {
-    __shared__ __align__(16) Q38Smem sm;
-    q38_gate_up_silu_rows(sm, A8, gate_packed, gate_scale, gate_scale2, up_packed, up_scale,
-                          up_scale2, act8, nullptr, 0u, M, N, K);
+#define Q38_DENSE_GATE_UP_ENTRY(NAME, W2)                                                      \
+extern "C" __global__ void __launch_bounds__(256, Q38_MINB) NAME(                             \
+    const unsigned char* __restrict__ A8,                /* [M, K] E4M3 */                    \
+    const unsigned char* __restrict__ gate_packed,       /* [K/2, N] */                       \
+    const unsigned char* __restrict__ gate_scale,        /* [K/16, N] */                      \
+    const float gate_scale2,                                                                  \
+    const unsigned char* __restrict__ up_packed,                                              \
+    const unsigned char* __restrict__ up_scale,                                               \
+    const float up_scale2,                                                                    \
+    unsigned char* __restrict__ act8,                    /* [M, N] E4M3 */                    \
+    unsigned int M,                                                                           \
+    unsigned int N,                                                                           \
+    unsigned int K                                                                            \
+) {                                                                                           \
+    __shared__ __align__(16) Q38Smem sm;                                                      \
+    q38_gate_up_silu_rows<W2>(sm, A8, gate_packed, gate_scale, gate_scale2, up_packed,        \
+                              up_scale, up_scale2, act8, nullptr, 0u, M, N, K);               \
 }
+Q38_DENSE_GATE_UP_ENTRY(moe_q38_dense_gate_up_silu, false)
+Q38_DENSE_GATE_UP_ENTRY(moe_q38w_dense_gate_up_silu, true)
 
 // Grid: (N / 128, ceil(M / 128)).
-extern "C" __global__ void __launch_bounds__(256, Q38_MINB) moe_q38_dense_down(
-    const unsigned char* __restrict__ act8,              // [M, K] E4M3
-    const unsigned char* __restrict__ B_packed,          // [K/2, N]
-    const unsigned char* __restrict__ B_scale,           // [K/16, N]
-    const float scale2,
-    __nv_bfloat16* __restrict__ C,                       // [M, N]
-    unsigned int M,
-    unsigned int N,
-    unsigned int K
-) {
-    __shared__ __align__(16) Q38Smem sm;
-    q38_down_rows(sm, act8, B_packed, B_scale, scale2, C, 0u, M, N, K);
+#define Q38_DENSE_DOWN_ENTRY(NAME, W2)                                                         \
+extern "C" __global__ void __launch_bounds__(256, Q38_MINB) NAME(                             \
+    const unsigned char* __restrict__ act8,              /* [M, K] E4M3 */                    \
+    const unsigned char* __restrict__ B_packed,          /* [K/2, N] */                       \
+    const unsigned char* __restrict__ B_scale,           /* [K/16, N] */                      \
+    const float scale2,                                                                       \
+    __nv_bfloat16* __restrict__ C,                       /* [M, N] */                         \
+    unsigned int M,                                                                           \
+    unsigned int N,                                                                           \
+    unsigned int K                                                                            \
+) {                                                                                           \
+    __shared__ __align__(16) Q38Smem sm;                                                      \
+    q38_down_rows<W2>(sm, act8, B_packed, B_scale, scale2, C, 0u, M, N, K);                   \
 }
+Q38_DENSE_DOWN_ENTRY(moe_q38_dense_down, false)
+Q38_DENSE_DOWN_ENTRY(moe_q38w_dense_down, true)
 
 // ── router weight -> BF16 ──
 // The router GEMM ran `w4a16_gemm` (w4a16_gemm.cu: 64x64 tiles, K step 16,
