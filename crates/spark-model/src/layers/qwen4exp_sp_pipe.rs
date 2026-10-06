@@ -34,9 +34,9 @@ use std::cell::{Cell, RefCell};
 use super::glm_sp::SpRows;
 use crate::layer::ForwardContext;
 
-#[path = "qwen4exp_sp_offer.rs"]
-mod offer;
-pub use offer::{RsOffer, rs_offered, rs_took};
+#[path = "qwen4exp_sp_side.rs"]
+mod side_ops;
+pub use side_ops::{RsOffer, SideExchanges, rs_offered, rs_took};
 
 /// `ATLAS_QWEN4EXP_PREFILL_SP_PIPE=1`.
 pub fn requested() -> bool {
@@ -152,16 +152,43 @@ pub fn collapse_and_gather(
     stream: u64,
     collapse: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    let rows_width = [rows, width];
+    collapse_and_gather_then(
+        sp,
+        buf,
+        copy_from,
+        rows_width,
+        ctx,
+        stream,
+        collapse,
+        |_| Ok(()),
+    )
+}
+
+/// [`collapse_and_gather`] with `local(stream)` run once this rank's rows
+/// are in `buf` and before the peer's are waited for (pipelined: while the
+/// last piece is on the wire).
+#[allow(clippy::too_many_arguments)]
+pub fn collapse_and_gather_then(
+    sp: Option<SpRows>,
+    buf: DevicePtr,
+    copy_from: Option<DevicePtr>,
+    [rows, width]: [usize; 2],
+    ctx: &ForwardContext<'_>,
+    stream: u64,
+    collapse: impl FnOnce() -> Result<()>,
+    local: impl FnOnce(u64) -> Result<()>,
+) -> Result<()> {
     if let Some(g) = begin(sp, buf, copy_from, width, ctx, stream)? {
         g.during(collapse)?;
-        return g.finish(stream);
+        return g.finish_after(stream, local);
     }
     collapse()?;
     if let Some(src) = copy_from {
-        let local = sp.map_or(buf, |sp| sp.local(buf, width));
-        ctx.gpu
-            .copy_d2d_async(src, local, rows * width * 2, stream)?;
+        let at = sp.map_or(buf, |sp| sp.local(buf, width));
+        ctx.gpu.copy_d2d_async(src, at, rows * width * 2, stream)?;
     }
+    local(stream)?;
     match sp {
         Some(sp) => sp.all_gather(buf, width, ctx, stream),
         None => Ok(()),
@@ -291,12 +318,24 @@ impl Gather<'_> {
     /// Every local row is set on `stream`: send what is left, copy the
     /// peer's region out of the stage, and make `stream` wait for it all.
     pub fn finish(self, stream: u64) -> Result<()> {
+        self.finish_after(stream, |_| Ok(()))
+    }
+
+    /// [`Gather::finish`], running `before_join(stream)` once every piece is
+    /// out and before `stream` waits for them: main-stream work on this
+    /// rank's rows that overlaps the last piece's wire.
+    pub fn finish_after(
+        self,
+        stream: u64,
+        before_join: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<()> {
         let rows = self.pieces.borrow().rows;
         self.progress(rows, stream)?;
         let gpu = self.ctx.gpu;
         if let Some((src, dst, bytes)) = self.copy_out {
             gpu.copy_d2d_async(src, dst, bytes, self.side.stream)?;
         }
+        before_join(stream)?;
         gpu.record_event(self.side.to_main, self.side.stream)?;
         gpu.stream_wait_event(stream, self.side.to_main)
     }
@@ -399,48 +438,6 @@ pub fn compute_and_reduce_scatter(
 #[cfg(test)]
 pub(crate) fn stage_ptr() -> DevicePtr {
     DevicePtr(STAGE.with(Cell::get).0)
-}
-
-/// Pair exchanges on the side stream, each issued after everything the main
-/// stream enqueued before it ([`SideExchanges::send`]); [`SideExchanges::join`]
-/// makes the main stream wait for them. Both ranks must send the same sizes
-/// in the same order.
-pub struct SideExchanges<'a> {
-    ctx: &'a ForwardContext<'a>,
-    side: Side,
-}
-
-impl<'a> SideExchanges<'a> {
-    /// `None` without a communicator.
-    pub fn new(ctx: &'a ForwardContext<'a>) -> Result<Option<Self>> {
-        if ctx.comm.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(Self {
-            ctx,
-            side: side(ctx.gpu)?,
-        }))
-    }
-
-    /// Swap `bytes` at `send` for the peer's, landing at `dst` (a copy).
-    pub fn send(&self, send: DevicePtr, dst: DevicePtr, bytes: usize, stream: u64) -> Result<()> {
-        let gpu = self.ctx.gpu;
-        gpu.record_event(self.side.to_side, stream)?;
-        gpu.stream_wait_event(self.side.stream, self.side.to_side)?;
-        let comm = self.ctx.comm.expect("checked in new");
-        ensure!(
-            comm.exchange_async(send.0, dst.0, bytes, false, self.side.stream)?,
-            "qwen4exp side exchange refused ({bytes} bytes)"
-        );
-        Ok(())
-    }
-
-    /// Make `stream` wait for every exchange sent.
-    pub fn join(self, stream: u64) -> Result<()> {
-        let gpu = self.ctx.gpu;
-        gpu.record_event(self.side.to_main, self.side.stream)?;
-        gpu.stream_wait_event(stream, self.side.to_main)
-    }
 }
 
 fn side(gpu: &dyn GpuBackend) -> Result<Side> {

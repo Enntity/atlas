@@ -168,6 +168,7 @@ mod forward_prefill_phase;
 mod forward_prefill_q38;
 mod forward_prefill_q38_rs;
 mod forward_prefill_route;
+pub(crate) mod forward_prefill_route_sp;
 mod forward_prefill_routed;
 mod forward_prefill_router;
 mod forward_rows;
