@@ -456,6 +456,11 @@ impl Model for TransformerModel {
             .min()
     }
     fn verify_max_drafts(&self) -> Option<usize> {
+        // ATLAS_QWEN4EXP_MTP_DEPTH replaces the GDN layers' default ceiling
+        // (`model/qwen4exp_mtp_depth.rs`).
+        if let Some(depth) = self.levers.qwen4exp_mtp_depth {
+            return Some(depth);
+        }
         self.layers
             .iter()
             .filter_map(|l| l.verify_max_drafts())

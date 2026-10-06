@@ -56,7 +56,7 @@ use super::trait_impl::finish_leaf;
 use super::trait_impl::prefill_b::pc_policy as pc;
 use super::{
     decode_pieces, glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry,
-    qwen4exp_exact_verify, qwen4exp_lmhead_split, verify_pieces,
+    qwen4exp_exact_verify, qwen4exp_lmhead_split, qwen4exp_mtp_depth, verify_pieces,
 };
 use crate::layer::glm_long_owner;
 use crate::layers::dflash_head::rank_split;
@@ -347,6 +347,11 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     }),
     ("ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK", || {
         Ok(qwen4exp_exact_verify::check_requested() as u64)
+    }),
+    // The qwen4_exp verify width ceiling: the K the head dispatches and the
+    // worker mirrors.
+    ("ATLAS_QWEN4EXP_MTP_DEPTH", || {
+        Ok(qwen4exp_mtp_depth::requested() as u64)
     }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)

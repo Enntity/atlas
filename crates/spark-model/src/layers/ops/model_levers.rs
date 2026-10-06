@@ -86,6 +86,10 @@ pub struct ModelLevers {
     /// `model/qwen4exp_exact_verify.rs`). Not from the environment directly:
     /// `TransformerModel::new` sets it for a qwen4_exp model only.
     pub qwen4exp_exact_verify: bool,
+    /// qwen4_exp: the MTP verify ceiling in drafts (`ATLAS_QWEN4EXP_MTP_DEPTH`,
+    /// `model/qwen4exp_mtp_depth.rs`), overriding the GDN layers' default 1.
+    /// Set by `TransformerModel::new` for a qwen4_exp model only.
+    pub qwen4exp_mtp_depth: Option<usize>,
 
     // ── LoRA ──
     /// Apply LoRA eagerly at load instead of at each forward.
@@ -179,6 +183,7 @@ impl ModelLevers {
             lightning_mamba_scalar_in_proj: lightning_lossless_target,
             // Model-specific: `TransformerModel::new` sets it.
             qwen4exp_exact_verify: false,
+            qwen4exp_mtp_depth: None,
             lora_eager: opt_in_truthy("ATLAS_LORA_EAGER"),
             lora_rotate: opt_in_truthy("ATLAS_LORA_ROTATE"),
             k4_diag: opt_in("ATLAS_K4_DIAG"),
