@@ -113,11 +113,11 @@ impl QsaIndexer {
                 "QSA: raw-key window growth inside a graph capture"
             );
             let cap = (keep + n).next_multiple_of(RAW_WINDOW).max(RAW_WINDOW);
-            let a = gpu.alloc(cap * row)?;
-            let b = match gpu.alloc(cap * row) {
+            let a = super::qsa_free::carry_alloc(gpu, cap * row)?;
+            let b = match super::qsa_free::carry_alloc(gpu, cap * row) {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = gpu.free(a);
+                    let _ = super::qsa_free::carry_free(gpu, a, cap * row);
                     return Err(e);
                 }
             };
@@ -147,9 +147,10 @@ impl QsaIndexer {
 
     /// Release both window buffers; the window is empty afterwards.
     pub(super) fn free_raw(&self, st: &mut QsaSeqState, gpu: &dyn GpuBackend) -> Result<()> {
+        let bytes = st.raw.cap * self.hd as usize * 2;
         for p in &mut st.raw.bufs {
             if p.0 != 0 {
-                gpu.free(*p)?;
+                super::qsa_free::carry_free(gpu, *p, bytes)?;
                 *p = DevicePtr(0);
             }
         }
