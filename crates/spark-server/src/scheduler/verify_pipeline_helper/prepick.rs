@@ -48,9 +48,11 @@ pub(super) struct Prepicked {
 /// Whether F2 can compute on some row of this span: inside `<think>`, armed
 /// by the watchdog config, not already forcing the end, and within K picks of
 /// the 400-token gate. A superset of the stage's own condition at every row;
-/// a hint the stage does not consume is simply dropped.
+/// a hint the stage does not consume is simply dropped. Not under a
+/// min_tokens end-token ban: F2 reads the masked row there (`min_tokens_ban`).
 pub(super) fn f2_may_run(a: &ActiveSeq, ctx: &LogitsContext, k: usize) -> bool {
-    !ctx.sampling.disable_watchdogs
+    crate::scheduler::min_tokens_ban::banned_ids(a).is_none()
+        && !ctx.sampling.disable_watchdogs
         && ctx.watchdog.confidence_early_stop
         && a.inside_thinking
         && !a.force_end_thinking

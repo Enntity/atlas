@@ -161,14 +161,28 @@ pub fn process_decode_logits(
     let fast_tokens: Option<Vec<(u32, Option<crate::api::TokenLogprobs>)>> =
         if active.iter().all(|a| a.temperature == 0.0) && !any_grammar && !needs_host_logits {
             match model.argmax_batch(logits, n, 0) {
-                Ok(t) => {
+                Ok(mut t) => {
+                    // The min_tokens end-token ban: each row's masked argmax
+                    // (a failed row read sends the batch to the host).
+                    let vocab = model.vocab_size();
+                    let served = active.iter().enumerate().all(|(i, a)| {
+                        let row = logits.offset(i * vocab * 2);
+                        crate::scheduler::min_tokens_ban::fix_raw_picks(
+                            model,
+                            a,
+                            &mut t[i..=i],
+                            row,
+                            false,
+                        )
+                        .unwrap_or(false)
+                    });
                     // An argmax on an id the pipeline masks (rare: the model
                     // seldom re-opens <think> mid-response) is redone on the
                     // host, so the emitted token is exactly the pipeline's.
-                    let hit_mask = t
-                        .iter()
-                        .zip(active.iter())
-                        .any(|(&tok, a)| crate::scheduler::fast_greedy::raw_pick_masked(a, tok));
+                    let hit_mask = !served
+                        || t.iter().zip(active.iter()).any(|(&tok, a)| {
+                            crate::scheduler::fast_greedy::raw_pick_masked(a, tok)
+                        });
                     if hit_mask {
                         THINK_MASK_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         None

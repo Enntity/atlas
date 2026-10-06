@@ -62,22 +62,26 @@ pub(in crate::scheduler) fn pick_row(
 ) -> anyhow::Result<u32> {
     crate::scheduler::emit_step::PickEffects::clear(a);
     let greedy = a.temperature == 0.0 || ctx.sampling.force_temp_zero;
+    let fp32 = model.decode_logits_fp32();
     if greedy && raw_argmax_is_pick(a) {
-        let top1 = match gpu_argmax {
+        let mut top1 = [match gpu_argmax {
             Some(t) => t,
             None => model.argmax_on_device(logits, 0)?,
-        };
+        }];
+        // The min_tokens end-token ban: the masked row's argmax.
+        let served =
+            crate::scheduler::min_tokens_ban::fix_raw_picks(model, a, &mut top1, logits, fp32)?;
+        let [top1] = top1;
         // A terminated matcher masks nothing (`GrammarBitmaskApply`).
         let allowed = a
             .grammar_state
             .as_mut()
             .is_none_or(|gs| !gs.fill_bitmask() || gs.is_token_allowed(top1));
-        if allowed && !raw_pick_masked(a, top1) {
+        if served && allowed && !raw_pick_masked(a, top1) {
             return Ok(top1);
         }
     }
     let vocab = model.vocab_size();
-    let fp32 = model.decode_logits_fp32();
     let mut row = crate::scheduler::verify_pipeline_helper::HostRows::take(
         &ctx.scratch.host_bytes,
         vocab * if fp32 { 4 } else { 2 },

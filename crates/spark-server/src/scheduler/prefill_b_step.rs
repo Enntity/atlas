@@ -292,7 +292,7 @@ pub fn prefill_request(
             top_k,
             top_p,
             min_p,
-            eos_tokens,
+            &crate::scheduler::min_tokens_ban::first_token_suppress(eos_tokens, req_min_tokens),
             grammar_state.as_mut(),
             &sched.levers.sampling(),
         )
@@ -467,7 +467,8 @@ pub fn prefill_request(
     }
 
     // The min_tokens end-token ban, as on the chunked paths.
-    spark_model::traits::EosBan::new(seq.prompt_len, req_min_tokens, eos_tokens).arm(&mut seq);
+    spark_model::traits::EosBan::for_request(seq.prompt_len, req_min_tokens, eos_tokens)
+        .arm(&mut seq);
     Ok(Some(ActiveSeq {
         seq,
         session_hash: req_session_hash,

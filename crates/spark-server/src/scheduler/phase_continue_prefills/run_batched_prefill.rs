@@ -215,7 +215,10 @@ pub(super) fn run_batched_prefill_step(
                 p.top_k,
                 p.top_p,
                 p.min_p,
-                &p.eos_tokens,
+                &crate::scheduler::min_tokens_ban::first_token_suppress(
+                    &p.eos_tokens,
+                    p.min_tokens,
+                ),
                 p.grammar_state.as_mut(),
                 &sched.levers.sampling(),
             ) {

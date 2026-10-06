@@ -761,6 +761,7 @@ pub(crate) fn load_model(
     // request's min_tokens floor.
     let mut eos_tokens = serve_phases::load_eos_tokens(&model_dir, &config);
     spark_model::traits::EosBan::install_model_end_tokens(&eos_tokens);
+    spark_model::traits::EosBan::install_target_ban(&config.model_type);
 
     // EP worker: rank > 0 enters command loop, returns when head exits.
     let mut model_opt = Some(model);

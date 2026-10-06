@@ -67,6 +67,29 @@ pub(super) fn fast(
     if k == 0 {
         return Ok(Some(Vec::new()));
     }
+    // The min_tokens end-token ban (`min_tokens_ban`): the arms below read
+    // each row's masked argmax. A span straddling the floor with a banned raw
+    // argmax goes to the host pipeline, which counts the floor row by row.
+    let fixed: Vec<u32>;
+    let argmax_ids = if crate::scheduler::min_tokens_ban::banned_ids(a).is_some() {
+        let mut picks = argmax_ids.to_vec();
+        let rows = model
+            .logits_buffer_ptr()
+            .offset(row_base * model.vocab_size() * 2);
+        let served =
+            crate::scheduler::min_tokens_ban::fix_raw_picks(model, a, &mut picks, rows, false)
+                .or_else(|e| match policy {
+                    CopyFailurePolicy::Propagate => Err(e),
+                    CopyFailurePolicy::LegacyFallback => Ok(false),
+                })?;
+        if !served {
+            return Ok(None);
+        }
+        fixed = picks;
+        &fixed[..]
+    } else {
+        argmax_ids
+    };
     // Both GPU-argmax arms below see the span's starting state only, so they
     // also stand down where the pipeline would act outside `<think>`: the
     // one-shot tool-call pin, and any argmax the post-close / tool-loop masks

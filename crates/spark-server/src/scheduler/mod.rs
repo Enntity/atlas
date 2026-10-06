@@ -41,6 +41,7 @@ mod lifecycle_tests;
 mod logit_dump;
 mod logit_processors;
 mod logprobs;
+mod min_tokens_ban;
 mod mod_helpers;
 pub use mod_helpers::capture_runtime_handle;
 pub mod dumps;

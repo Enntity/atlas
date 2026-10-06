@@ -496,7 +496,7 @@ pub fn start_chunked_prefill(
             top_k,
             top_p,
             min_p,
-            eos_tokens,
+            &crate::scheduler::min_tokens_ban::first_token_suppress(eos_tokens, req_min_tokens),
             p.grammar_state.as_mut(),
             &sched.levers.sampling(),
         ) {
