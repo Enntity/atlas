@@ -52,6 +52,52 @@ impl Qwen3SsmLayer {
         Ok(())
     }
 
+    /// The out_proj and the SP reduce-scatter of a qwen4_exp chunk, pipelined
+    /// (`ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE`): the GEMM by row ranges, the
+    /// window the peer needs first. Taken only on the dense BF16 arm, whose
+    /// rows are independent (the tile kernel, or under the k-chain pin a
+    /// cuBLASLt k-chain kernel with the same bytes per row at every row
+    /// count), so every byte is the unsplit GEMM + reduce-scatter's.
+    /// `Ok(false)`: not taken, nothing launched.
+    pub(super) fn out_proj_reduce_scatter_piped(
+        &self,
+        ctx: &ForwardContext,
+        normed_out_buf: DevicePtr,
+        out_proj_buf: DevicePtr,
+        [num_tokens, value_dim]: [usize; 2],
+        stream: u64,
+    ) -> Result<bool> {
+        let h = ctx.config.hidden_size;
+        let fp8_rowwise = std::env::var("ATLAS_FP8_ROWWISE").as_deref() == Ok("1")
+            && self.out_proj_fp8w_rowwise.is_some();
+        let Some(sp) = crate::layers::glm_sp::current().filter(|sp| sp.total() == num_tokens)
+        else {
+            return Ok(false);
+        };
+        if fp8_rowwise || ctx.dispatch.cutlass_nvfp4_ssm_out || self.out_proj_dense.is_none() {
+            return Ok(false);
+        }
+        crate::layers::qwen4exp_sp_pipe::compute_and_reduce_scatter(
+            sp,
+            out_proj_buf,
+            h,
+            ctx,
+            stream,
+            |r0, n, s| {
+                self.prefill_out_proj_dispatch(
+                    ctx,
+                    normed_out_buf.offset(r0 * value_dim * 2),
+                    out_proj_buf.offset(r0 * h * 2),
+                    n as u32,
+                    h,
+                    value_dim,
+                    s,
+                )
+            },
+            |_| Ok(()),
+        )
+    }
+
     pub(super) fn prefill_out_proj_dispatch(
         &self,
         ctx: &ForwardContext,
