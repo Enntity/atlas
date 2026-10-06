@@ -270,8 +270,15 @@ impl MoeLayer {
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let row = h as usize * 2;
         det.tap("moe_in", input, (0, num_tokens), row);
-        // 1-3. Router GEMM, top-k, sort by expert (route_fuse.rs).
-        let routes = self.route_and_sort(input, [n, h, inter], det, ctx, stream)?;
+        let scratch = ctx.buffers.scratch();
+        let indices_dev = scratch;
+        let weights_dev = scratch.offset(total_expanded as usize * 4);
+        // ATLAS_QWEN4EXP_PREFILL_SP_ROUTE: this rank's rows were routed at the
+        // gather site; gather the peer's (`forward_prefill_route_sp`).
+        let routes = [indices_dev, weights_dev];
+        let sp_routed = self.take_local_routes(input, num_tokens, routes, ctx, stream)?;
+        // 1-3. Router GEMM, top-k, sort by expert (route_fuse.rs). The SP path
+        // routed at the gather site, so it sorts the gathered routes only.
         let super::route_fuse::Routes {
             indices: indices_dev,
             weights: weights_dev,
@@ -279,7 +286,11 @@ impl MoeLayer {
             expert_offsets,
             token_to_perm,
             prerouted,
-        } = routes;
+        } = if sp_routed {
+            self.sort_sp_routes(input, [n, h, inter], det, ctx, stream)?
+        } else {
+            self.route_and_sort(input, [n, h, inter], det, ctx, stream)?
+        };
         prof_step!("route");
 
         // 3.5. Pre-expert norm: norm the input for expert dispatch (Gemma-4 26B).

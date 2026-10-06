@@ -166,16 +166,13 @@ impl MoeLayer {
             .arg_u32(n_out)
             .arg_u32(h)
             .launch(stream)?;
-        KernelLaunch::new(gpu, k_gemm)
-            .grid([n_out.div_ceil(128), n.div_ceil(128), 1])
-            .block([256, 1, 1])
-            .arg_ptr(router_in)
-            .arg_ptr(w_bf16)
-            .arg_ptr(logits)
-            .arg_u32(n)
-            .arg_u32(n_out)
-            .arg_u32(h)
-            .launch(stream)?;
+        super::forward_prefill_route_sp::q38_router_gemm(
+            gpu,
+            k_gemm,
+            [router_in, w_bf16, logits],
+            [n, n_out, h],
+            stream,
+        )?;
         Ok(true)
     }
 
