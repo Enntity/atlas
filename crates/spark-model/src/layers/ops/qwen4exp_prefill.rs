@@ -7,7 +7,9 @@
 //! |------------------------------------------|----------------------------------------|--------|
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=1`      | TP2 QSA attention on tensor cores      | = TP1 tc2, != `_g` |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_LEAN=1`      | TP1 tc2 -> its lean twin (2 CTAs/SM)   | = tc2  |
+//! | `ATLAS_QWEN4EXP_PREFILL_QSA_SCORE=1`     | QSA block scorer, 16-byte loads, 2 rows a thread | = `qsa_score_rows_exact` |
 //! | `ATLAS_QWEN4EXP_PREFILL_HC=1`            | mHC collapse: seam, down, up+mix fused | = default (`qwen4exp_prefill_hc`) |
+//! | `ATLAS_QWEN4EXP_PREFILL_MOE=1`           | router, shared and routed experts, unpermute | = default (`moe::forward_prefill_q38`) |
 //! | `ATLAS_QWEN4EXP_PREFILL_HC_CHECK=<n>`    | cross-check the first n mHC slabs      | diagnostic |
 //!
 //! "= X" means byte-identical outputs to kernel X on the same inputs, checked
@@ -108,5 +110,69 @@ pub fn try_qsa_prefill_attn_lean(
         l = l.arg_u32(s.rows);
     }
     l.launch(stream)?;
+    Ok(true)
+}
+
+/// `ATLAS_QWEN4EXP_PREFILL_QSA_SCORE=1`.
+pub fn qsa_score_v4_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_QSA_SCORE"))
+}
+
+/// Rows a `qsa_score_rows_exact_v4` thread scores (`QSA_V4_RPT`).
+const QSA_V4_RPT: u32 = 2;
+
+/// The QSA prefill block scores on `qsa_score_rows_exact_v4`: the exact
+/// scorer's products, tree and folds on the same values, staged with 16-byte
+/// shared loads and two rows a thread -- every score byte identical
+/// (`scripts/dev/qwen4exp_qsa_score_bench.cu`; GB10, 2048 rows at position
+/// 14000: 6.28 -> 3.06 ms). `ptrs` = [q, block_keys, scores]; `dims` =
+/// [rows, n_blocks_max, first_pos, score_stride, ratio, n_heads, hd].
+/// `Ok(false)` launched nothing.
+pub fn try_qsa_score_v4(
+    gpu: &dyn GpuBackend,
+    ptrs: [DevicePtr; 3],
+    dims: [u32; 7],
+    stream: u64,
+) -> Result<bool> {
+    let [
+        rows,
+        n_blocks_max,
+        first_pos,
+        score_stride,
+        ratio,
+        n_heads,
+        hd,
+    ] = dims;
+    let [q, block_keys, scores] = ptrs;
+    let (bm, bn) = (super::QSA_SE_BM * QSA_V4_RPT, super::QSA_SE_BN);
+    let smem = (bm * n_heads * hd + bn * (hd + 4)) * 4;
+    if !qsa_score_v4_requested()
+        || !hd.is_multiple_of(32)
+        || smem > 96 * 1024
+        || !q.0.is_multiple_of(16)
+        || rows == 0
+    {
+        return Ok(false);
+    }
+    let k = crate::layers::try_kernel(gpu, "qsa_indexer", "qsa_score_rows_exact_v4");
+    if k.0 == 0 {
+        return Ok(false);
+    }
+    KernelLaunch::new(gpu, k)
+        .grid([rows.div_ceil(bm), n_blocks_max.div_ceil(bn), 1])
+        .block([super::QSA_SE_BM * bn, 1, 1])
+        .shared_mem(smem)
+        .arg_ptr(q)
+        .arg_ptr(block_keys)
+        .arg_ptr(scores)
+        .arg_u32(first_pos)
+        .arg_u32(score_stride)
+        .arg_u32(ratio)
+        .arg_u32(n_heads)
+        .arg_u32(hd)
+        .arg_u32(rows)
+        .arg_u32(n_blocks_max)
+        .launch(stream)?;
     Ok(true)
 }
