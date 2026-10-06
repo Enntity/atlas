@@ -217,6 +217,26 @@ impl MoeLayer {
         // kernels write every row that can be referenced by unpermute_reduce.
         // Skipping the memset removes ~138 MB/layer of scratch clears on Holo.
         self.prepare_ep_prefill_outputs(total_expanded, inter, h, ctx, stream)?;
+        // ATLAS_QWEN4EXP_PREFILL_MOE: the whole chain below on the q38
+        // kernels, byte for byte (`forward_prefill_q38.rs`).
+        if max_m_tiles > 0
+            && self.try_q38_routed_prefill(
+                expert_input,
+                expert_offsets,
+                sorted_token_ids,
+                n,
+                h,
+                inter,
+                num_experts,
+                grid_m_strided * 64,
+                total_expanded,
+                ctx,
+                stream,
+            )?
+        {
+            prof_step!("grouped_q38");
+            return Ok(());
+        }
         // Host expert_offsets from the CUTLASS gate_up, reused by down to skip
         // a second D2H + host-blocking synchronize.
         let mut cutlass_eoff: Option<Vec<i32>> = None;
@@ -741,6 +761,7 @@ impl MoeLayer {
             }
         }
         prof_step!("grouped_silu_down");
+        super::forward_prefill_q38::finish_q38_check(ctx, total_expanded, h, stream)?;
 
         Ok(())
     }
