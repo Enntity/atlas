@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! `qwen4_exp` (Qwen3.8-Flash-Next) PREFILL switches and the launches behind
-//! them. Every switch is default OFF and read once per process.
+//! them. Every switch is read once per process and default OFF, except
+//! `_QSA_TC2R`: the TP2 default (`=0` falls back to `_g` / `_GP`).
 //!
 //! | switch                                   | what                                   | exact? |
 //! |------------------------------------------|----------------------------------------|--------|
-//! | `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=1`      | TP2 QSA attention on tensor cores      | = TP1 tc2, != `_g` |
+//! | `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=0`      | TP2 QSA attention off tensor cores     | TC2R = TP1 tc2, != `_g` |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_LEAN=1`      | TP1 tc2 -> its lean twin (2 CTAs/SM)   | = tc2  |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_GP=1`        | `_g` QSA attention, rescheduled        | = `_g` |
 //! | `ATLAS_QWEN4EXP_PREFILL_BA_ROWS=1`       | GDN BA GEMM + gates, 2 tokens a CTA    | = `dense_gemm_ba_gates_prefill` |
@@ -27,10 +28,18 @@ fn flag(name: &str) -> bool {
     matches!(std::env::var(name).as_deref(), Ok("1") | Ok("true"))
 }
 
-/// `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=1`.
+/// The TP2 QSA prefill attention on tensor cores (`qsa_prefill_attn_tc2r`,
+/// one kv head a rank): on unless `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=0`, which
+/// keeps `_g` (or `_gp` under `_QSA_GP`). Its numerics are TP1 tc2's, not
+/// `_g`'s; the TP2 default since 2026-10-06.
 pub fn qsa_tc2r_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_QSA_TC2R"))
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("ATLAS_QWEN4EXP_PREFILL_QSA_TC2R").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
 }
 
 /// `ATLAS_QWEN4EXP_PREFILL_QSA_LEAN=1`.
