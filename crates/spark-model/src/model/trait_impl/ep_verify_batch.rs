@@ -92,8 +92,9 @@ impl TransformerModel {
         slots: &mut [Option<SequenceState>],
     ) -> Result<bool> {
         let n = self.ep_broadcast_u32(0)? as usize;
+        // One sequence: a lone window past its own 4-row verify (`verify_rows.rs`).
         ensure!(
-            (2..=slots.len()).contains(&n),
+            (1..=slots.len()).contains(&n),
             "EP batched verify: {n} sequences for {} slots",
             slots.len()
         );
