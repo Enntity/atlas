@@ -19,10 +19,12 @@
 //!   layout, 2+ rows): the router for every row in one weight pass
 //!   (`w4a16_gemv_batchN`, rows byte-identical to the single-row GEMV), each
 //!   row's own top-k, then ONE expert-sorted gate/up and ONE silu/down
-//!   (`ops::Qwen4ExpMoeRows`): each CTA is the single-row kernel's CTA for one
-//!   `(row, slot)`, ordered so every expert the rows share — and the shared
-//!   expert — streams from DRAM once. Each row's blend is the single-row
-//!   blend.
+//!   (`ops::Qwen4ExpMoeRows`): a gate/up CTA is the single-row kernel's CTA
+//!   for one `(row, slot)`, ordered so every expert the rows share — and the
+//!   shared expert — streams from DRAM once; a silu/down CTA stages one tile
+//!   of an expert once for every row that picked it, each output the
+//!   single-row kernel's operation sequence. Each row's blend is the
+//!   single-row blend.
 //! * **Per-row local** (anything else): each row's local part is
 //!   [`MoeLayer::forward_row_local`], the same calls on the same buffers.
 //!
@@ -53,6 +55,11 @@ impl MoeLayer {
             && rows >= 2
             && rows * top_k * 3 * 4 <= 32 * 1024
             && rows * top_k <= ops::QWEN4EXP_MOE_ROWS_MAX_SLOTS
+            && ctx.config.moe_intermediate_size == ops::QWEN4EXP_MOE_ROWS_SD_INTER as usize
+            && ctx
+                .config
+                .hidden_size
+                .is_multiple_of(ops::QWEN4EXP_MOE_ROWS_SD_TILE as usize)
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
             && !self.nvfp4_mmq_layout
