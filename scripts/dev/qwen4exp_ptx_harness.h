@@ -29,13 +29,18 @@
 
 struct PtxModule {
     CUmodule mod = nullptr;
-    void load(const std::string& path) {
+    // False when the file is missing or the driver refuses the PTX (a tile
+    // sweep point over the shared-memory cap, say).
+    bool try_load(const std::string& path) {
         std::ifstream f(path);
-        if (!f) { fprintf(stderr, "cannot open %s\n", path.c_str()); exit(1); }
+        if (!f) return false;
         std::stringstream ss;
         ss << f.rdbuf();
         std::string src = ss.str();
-        CU(cuModuleLoadData(&mod, src.c_str()));
+        return cuModuleLoadData(&mod, src.c_str()) == CUDA_SUCCESS;
+    }
+    void load(const std::string& path) {
+        if (!try_load(path)) { fprintf(stderr, "cannot load %s\n", path.c_str()); exit(1); }
     }
     CUfunction fn(const char* name, unsigned dyn_smem = 0) const {
         CUfunction f;

@@ -210,19 +210,38 @@ impl Qwen3SsmLayer {
             num_tokens * h,
             stream,
         );
-        ops::hc_post_site(
+        // ATLAS_QWEN4EXP_PREFILL_HC: this post fused into the MoE site's
+        // collapse below (same highway and `hidden` bytes, one highway read
+        // fewer); `seam` says it ran, so the separate post and pre do not.
+        let seam = ops::qwen4exp_prefill_hc::hc_post_pre_seam(
             ctx.gpu,
-            self.hc_post_k,
             hc,
+            &hc.ffn,
             out_proj_buf,
             streams,
+            hidden,
             post,
-            comb,
-            streams,
+            ctx.buffers.hc_lowrank_scratch(),
             n,
             h as u32,
+            eps,
             stream,
         )?;
+        if !seam {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                out_proj_buf,
+                streams,
+                post,
+                comb,
+                streams,
+                n,
+                h as u32,
+                stream,
+            )?;
+        }
 
         stage!("hc_post_attn");
         // Tapped BEFORE the MoE on purpose: reproducing this point in the
@@ -241,21 +260,23 @@ impl Qwen3SsmLayer {
         // `prefill_block` returned `ctx.buffers.moe_output()`, which the FFN
         // is about to overwrite — safe only because the `hc_post` above has
         // already consumed it into the highway. Keep that order.
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            streams,
-            &hc.ffn,
-            hc,
-            hidden,
-            post,
-            comb,
-            ctx.buffers.hc_lowrank_scratch(),
-            n,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if !seam {
+            ops::hc_pre_site(
+                ctx.gpu,
+                self.hc_pre_k,
+                streams,
+                &hc.ffn,
+                hc,
+                hidden,
+                post,
+                comb,
+                ctx.buffers.hc_lowrank_scratch(),
+                n,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
         stage!("hc_pre_ffn");
         self.ffn.forward_prefill(hidden, num_tokens, ctx, stream)?;
         stage!("moe");
