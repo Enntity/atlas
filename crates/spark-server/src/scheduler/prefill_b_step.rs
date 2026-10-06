@@ -21,18 +21,10 @@ pub fn prefill_request(
     // `resolve_beam_hyp`); None ⇒ run the per-request search.
     precomputed_beam_hyp: Option<Vec<u32>>,
 ) -> Result<Option<ActiveSeq>> {
-    // Merge user-supplied stop tokens with model EOS tokens.
-    let stop_tokens = req.take_stop_tokens();
-    let eos_tokens = if stop_tokens.is_empty() {
-        eos_tokens.to_vec()
-    } else {
-        let mut merged = eos_tokens.to_vec();
-        merged.extend(stop_tokens);
-        merged.sort_unstable();
-        merged.dedup();
-        merged
-    };
-    let eos_tokens = &eos_tokens;
+    // This request's end tokens: model EOS + user stop tokens (no model EOS
+    // under `ignore_eos`).
+    let model_eos = eos_tokens;
+    let eos_tokens = &req.take_end_tokens(model_eos);
 
     let top_k = req.top_k();
     let top_p = req.top_p();
@@ -108,7 +100,8 @@ pub fn prefill_request(
     let mut grammar_state = compile_grammar_state(
         grammar_engine,
         &grammar_spec,
-        eos_tokens,
+        // The model's EOS passes through the matcher even under `ignore_eos`.
+        &[model_eos, eos_tokens].concat(),
         req_enable_thinking && think_end_token.is_some(),
         &mut sink,
     )?;

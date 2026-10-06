@@ -19,11 +19,11 @@ use spark_runtime::gpu::DevicePtr;
 use std::time::Instant;
 
 /// The fixture model's sampled winner; registered as the end token here.
-const END: u32 = 101;
+pub(super) const END: u32 = 101;
 
 /// A live, uncancelled sequence (the response receiver is leaked: a dropped
 /// one reads as a client disconnect and finishes the sequence).
-fn seq(output: usize, min_tokens: usize) -> ActiveSeq {
+pub(super) fn seq(output: usize, min_tokens: usize) -> ActiveSeq {
     let (mut a, rx) = test_seq((0..output as u32).map(|i| 1000 + i).collect(), 64, None, 40);
     std::mem::forget(rx);
     a.finished = false;
@@ -38,7 +38,7 @@ fn seq(output: usize, min_tokens: usize) -> ActiveSeq {
 }
 
 /// One end token through serial decode or through the MTP emission.
-fn step(a: ActiveSeq, serial: bool, sched: &SchedCtx) -> ActiveSeq {
+pub(super) fn step(a: ActiveSeq, serial: bool, sched: &SchedCtx) -> ActiveSeq {
     let mut rows = vec![a];
     if serial {
         process_decode_logits(
