@@ -53,7 +53,10 @@
 //! (`emit_step::SpanShadow`): position `i` sees what serial decode would.
 
 mod argmax;
+mod batch;
+pub(in crate::scheduler) use batch::{applies as pick_batch_applies, verify_pick_batch};
 mod fast_masked;
+mod prepick;
 mod scratch;
 pub(in crate::scheduler) use scratch::HostRows;
 mod selection;
@@ -99,10 +102,27 @@ pub fn verify_pick_with_pipeline(
     //    overwritten before any read.
     let t_dequant = std::time::Instant::now();
     let mut f32_logits = scratch::DEQUANT_SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
-    f32_logits.clear();
-    f32_logits.reserve(vocab_size);
+    dequant_into(logits_bytes, is_fp32, vocab_size, &mut f32_logits);
+    ctx.timing.record(Phase::Dequant, t_dequant);
+    // Hand the allocation back on EVERY exit below (forced-token short circuit,
+    // temp>0 sample, argmax), or the next call allocates from scratch again and
+    // the reuse is silently lost.
+    let mut f32_logits = scratch::ScratchGuard(f32_logits);
+    pick_dequantized(&mut f32_logits, vocab_size, a, ctx)
+}
+
+/// Step 1 of [`verify_pick_with_pipeline`]: one row's logits as F32, exactly
+/// (BF16 -> F32 is a shift). `out` is cleared and refilled.
+pub(super) fn dequant_into(
+    logits_bytes: &[u8],
+    is_fp32: bool,
+    vocab_size: usize,
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.reserve(vocab_size);
     if is_fp32 {
-        f32_logits.extend((0..vocab_size).map(|j| {
+        out.extend((0..vocab_size).map(|j| {
             let off = j * 4;
             f32::from_le_bytes([
                 logits_bytes[off],
@@ -112,18 +132,23 @@ pub fn verify_pick_with_pipeline(
             ])
         }));
     } else {
-        f32_logits.extend((0..vocab_size).map(|j| {
+        out.extend((0..vocab_size).map(|j| {
             let lo = logits_bytes[j * 2];
             let hi = logits_bytes[j * 2 + 1];
             bf16_to_f32(lo, hi)
         }));
     }
-    ctx.timing.record(Phase::Dequant, t_dequant);
-    // Hand the allocation back on EVERY exit below (forced-token short circuit,
-    // temp>0 sample, argmax), or the next call allocates from scratch again and
-    // the reuse is silently lost.
-    let mut f32_logits = scratch::ScratchGuard(f32_logits);
+}
 
+/// Steps 2-4 of [`verify_pick_with_pipeline`] on an already-dequantized row,
+/// which the pipeline then masks and penalises in place.
+pub(super) fn pick_dequantized(
+    f32_logits: &mut [f32],
+    vocab_size: usize,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+) -> u32 {
+    use crate::scheduler::mtp_timing::Phase;
     // 2. Build this position's penalty/bias params (Verify kind: greedy,
     //    seed-free, the request's bias — the builder still appends the A4
     //    floor and the rep/presence/freq/LZ/DRY gates from `a`). Cloned before
@@ -146,7 +171,7 @@ pub fn verify_pick_with_pipeline(
     //    `verify_pick_all_with_pipeline` owns `accept_token` / `rollback`.
     let t_proc = std::time::Instant::now();
     if let Some(tok) = crate::scheduler::logit_processors::process_position_logits(
-        &mut f32_logits,
+        f32_logits,
         a,
         ctx,
         &penalties,
@@ -214,7 +239,7 @@ pub fn verify_pick_with_pipeline(
     // 4. Argmax over the (now-masked-and-penalised) vector. Matches the
     //    sampler's argmax branch behaviour.
     let t_argmax = std::time::Instant::now();
-    let best_id = argmax::argmax_first_wins(&f32_logits);
+    let best_id = argmax::argmax_first_wins(f32_logits);
     ctx.timing.record(Phase::Argmax, t_argmax);
     best_id
 }

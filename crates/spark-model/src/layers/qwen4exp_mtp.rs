@@ -125,6 +125,8 @@ pub struct Qwen4ExpMtpHead {
     // Kernel handles.
     rms_norm_k: KernelHandle,
     rms_norm_f32_k: KernelHandle,
+    /// `ATLAS_QWEN4EXP_MTP_GROUPED_NORM=1`: `rms_norm_f32_grouped`, else 0.
+    rms_norm_f32_grouped_k: KernelHandle,
     f32_residual_add_k: KernelHandle,
     dense_gemv_k: KernelHandle,
     hc_expand_k: KernelHandle,
@@ -220,6 +222,12 @@ impl Qwen4ExpMtpHead {
             // `1 + w` and silently shift every drafted logit.
             rms_norm_k: gpu.kernel("norm", "rms_norm")?,
             rms_norm_f32_k: gpu.kernel("norm", "rms_norm_f32")?,
+            rms_norm_f32_grouped_k: super::try_kernel_gated(
+                std::env::var("ATLAS_QWEN4EXP_MTP_GROUPED_NORM").as_deref() == Ok("1"),
+                gpu,
+                "norm",
+                "rms_norm_f32_grouped",
+            ),
             f32_residual_add_k: gpu.kernel("norm", "f32_residual_add")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             hc_expand_k: gpu.kernel("hyper_connection", "hc_expand")?,
