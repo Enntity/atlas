@@ -148,7 +148,10 @@ impl TransformerModel {
         // warm multi-turn matches land on, so an aux-carrying model would
         // recompute every warm prefill from zero.
         let mut aux = self.ssm_snapshots.take_aux(snap_id);
-        self.collect_aux_states_into(seq, stream, &mut aux)?;
+        // ATLAS_QWEN4EXP_CKPT_AUX_SHARE: the mid-chunk finalize read these.
+        if !super::qwen4exp_ckpt::take_pass_aux(seq.slot_idx, seq.seq_len, &mut aux) {
+            self.collect_aux_states_into(seq, stream, &mut aux)?;
+        }
         if !aux.is_empty() {
             self.ssm_snapshots.set_aux(snap_id, aux);
         }

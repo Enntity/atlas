@@ -46,7 +46,7 @@ impl PleLayer {
         }
         let off = buf.len();
         buf.resize(off + conv_bytes, 0);
-        gpu.copy_d2h_on_stream(st.conv, &mut buf[off..], stream)?;
+        crate::layers::aux_d2h::copy(gpu, st.conv, &mut buf[off..], stream)?;
         Ok(())
     }
 

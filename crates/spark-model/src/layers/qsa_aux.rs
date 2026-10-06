@@ -51,10 +51,16 @@ impl QsaIndexer {
         let off = buf.len();
         buf.resize(off + pooled_bytes + tail_bytes, 0);
         if pooled_bytes > 0 {
-            gpu.copy_d2h_on_stream(st.block_keys, &mut buf[off..off + pooled_bytes], stream)?;
+            crate::layers::aux_d2h::copy(
+                gpu,
+                st.block_keys,
+                &mut buf[off..off + pooled_bytes],
+                stream,
+            )?;
         }
         if tail_bytes > 0 {
-            gpu.copy_d2h_on_stream(
+            crate::layers::aux_d2h::copy(
+                gpu,
                 self.raw_slot(st, tail_start),
                 &mut buf[off + pooled_bytes..],
                 stream,

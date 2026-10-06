@@ -467,9 +467,8 @@ impl TransformerModel {
             stream,
         )?;
 
-        if let Some(plan) = midcap_plan.as_ref().filter(|p| p.ckpt) {
-            self.finalize_qwen4exp_ckpt(tokens, seq, &mut kv_cache, plan, stream)?;
-        }
+        let _pass_aux =
+            self.qwen4exp_ckpt_saves(tokens, seq, &mut kv_cache, &midcap_plan, stream)?;
         let out = if is_last_chunk {
             // ── Phase 6+7+8: final norm, lm_head, prefix-cache + snapshot save ──
             self.prefill_b_finalize_last(
