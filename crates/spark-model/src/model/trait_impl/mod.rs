@@ -39,6 +39,7 @@ mod lm_head_batched;
 mod lm_head_dp4a;
 mod meta;
 mod meta_argmax;
+mod mtp_stream_rows;
 mod prefill_a;
 pub(in crate::model) mod prefill_b;
 mod prefill_c;
