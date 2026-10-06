@@ -257,7 +257,7 @@ pub(super) fn select(
     let elem_bytes = 2usize;
     let total = k * vocab * elem_bytes;
     let t_d2h = std::time::Instant::now();
-    let mut buf = vec![0u8; total];
+    let mut buf = super::HostRows::take(&ctx.scratch.host_bytes, total);
     if let Err(error) = model.copy_logits_to_host(
         model
             .logits_buffer_ptr()
