@@ -90,26 +90,78 @@ fn kchain(algo: *const c_void) -> bool {
         && attr(algo, CONFIG_REDUCTION_SCHEME) == Some(0)
 }
 
-/// Heuristic results to ask for.
-pub(super) fn requested_count(pin: bool) -> i32 {
-    if pin { CANDIDATES as i32 } else { 1 }
+/// How `gemm_bf16_pick` chooses among the heuristic's results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Pick {
+    /// The first result (the default).
+    First,
+    /// The pin: a preferred-tile k-chain kernel when the first result is one.
+    Pin,
+    /// A k-chain kernel, preferring the fast tiles, or nothing -- to replace
+    /// a k-chain GEMM of another library ([`bf16_gemm_act_weight_t_kchain`]).
+    Force,
 }
 
-/// Byte offset in `results` of the algorithm to run: the pick when `pin`,
-/// else the heuristic's first result.
-pub(super) fn offset(pin: bool, results: &[u8], returned: i32) -> usize {
-    if pin {
-        pick(results, returned.max(0) as usize) * RESULT_BYTES
-    } else {
-        0
+impl Pick {
+    /// Heuristic results to ask for.
+    pub(super) fn requested(self) -> i32 {
+        match self {
+            Pick::First => 1,
+            Pick::Pin | Pick::Force => CANDIDATES as i32,
+        }
+    }
+
+    /// Byte offset in `results` of the algorithm to run; `None` (Force only)
+    /// when no k-chain kernel was offered.
+    pub(super) fn offset(self, results: &[u8], returned: i32) -> Option<usize> {
+        let found = (returned.max(0) as usize).min(results.len() / RESULT_BYTES);
+        let at = |i: usize| results[i * RESULT_BYTES..].as_ptr() as *const c_void;
+        let i = match self {
+            Pick::First => 0,
+            Pick::Pin => pick(results, found),
+            Pick::Force => FORCE_TILES.iter().find_map(|&tile| {
+                (0..found).find(|&i| kchain(at(i)) && attr(at(i), CONFIG_TILE_ID) == Some(tile))
+            })?,
+        };
+        Some(i * RESULT_BYTES)
     }
 }
 
-/// Index of the result to run among `found` heuristic results packed at
-/// `RESULT_BYTES` in `results`.
+/// Force's tile preference: 256x128, 128x256, 128x64, 64x256, 64x64.
+const FORCE_TILES: [i32; 5] = [24, 23, 18, 19, 15];
+
+/// `out[M,N] = act[M,K] @ weight[N,K]^T` (BF16) on a cuBLASLt k-chain kernel,
+/// under `ATLAS_LT_KCHAIN_PIN` -- byte-identical to any other in-order
+/// m16n8k16 k-chain over the same operands, such as the Atlas tile kernel
+/// `dense_gemm_bf16_pipelined`. `Ok(false)`: off, unavailable, or no k-chain
+/// kernel offered for the shape; nothing was launched.
+pub fn bf16_gemm_act_weight_t_kchain(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> anyhow::Result<bool> {
+    if !requested() || super::version() < 130000 || !super::available() {
+        return Ok(false);
+    }
+    super::gemm_bf16::gemm_bf16_pick(
+        act,
+        weight,
+        out,
+        [m, n, k],
+        super::CUBLAS_OP_T,
+        Pick::Force,
+        stream,
+    )
+}
+
+/// The pin's index among `found` heuristic results packed at `RESULT_BYTES`
+/// in `results`.
 fn pick(results: &[u8], found: usize) -> usize {
     let at = |i: usize| results[i * RESULT_BYTES..].as_ptr() as *const c_void;
-    let found = found.min(results.len() / RESULT_BYTES);
     if found == 0 || !kchain(at(0)) {
         return 0;
     }
