@@ -56,7 +56,9 @@ impl TransformerModel {
     /// is armed. Everything outside falls back to the per-seq loop.
     pub(super) fn can_batch_verify_dispatch(&self, ks: &[usize]) -> bool {
         let n = ks.len();
-        (2..=crate::layer::VERIFY_WY_TABLE_SEQS).contains(&n)
+        // One sequence only on the exact lane past its own 4-row verify
+        // (`verify_batch_ks_ok`).
+        (1..=crate::layer::VERIFY_WY_TABLE_SEQS).contains(&n)
             && self.verify_batch_ks_ok(ks)
             && ks.iter().sum::<usize>() <= super::verify_e2::VERIFY_ROW_CAP
             && (self.comm.is_none() || self.batched_verify_under_comm())
@@ -79,7 +81,9 @@ impl TransformerModel {
     /// MTP mode (no DFlash hidden-save): the audited ladder range 2..=4, and
     /// the SSM intermediates pools are sized for the configured max K. On
     /// qwen4_exp's exact lane a draftless sequence may also ride as one
-    /// DECODE ROW (`verify_rows.rs`: why that row is serial decode's).
+    /// DECODE ROW, a sequence may verify up to 8 rows, and a lone sequence
+    /// past its own 4-row verify rides as a batch of one (`verify_rows.rs`:
+    /// why every such row is serial decode's).
     ///
     /// DFlash mode (`dflash_hidden_save` armed): the verify rows are uniform
     /// γ+1 (γ=8 ⇒ k=8, outside the ladder range) and the batch additionally
@@ -92,21 +96,22 @@ impl TransformerModel {
         if self.dflash_hidden_save.is_some() {
             ks.iter()
                 .all(|&k| (2..=self.dflash_hidden_save_rows).contains(&k))
-                && ks.len() <= self.dflash_hidden_save_nseq
+                && (2..=self.dflash_hidden_save_nseq).contains(&ks.len())
         } else {
-            super::verify_rows::mtp_verify_rows_ok(ks, self.verify_decode_rows())
+            super::verify_rows::mtp_verify_rows_ok(ks, self.verify_exact_lane())
         }
     }
 
-    /// Whether the batched MTP verify carries decode rows (`ks[i] == 1`):
-    /// the qwen4_exp exact lane only (`verify_rows.rs`).
-    fn verify_decode_rows(&self) -> bool {
+    /// The qwen4_exp exact lane (`verify_rows.rs`): the batched MTP verify
+    /// carries decode rows (`ks[i] == 1`), windows of up to 8 rows, and a
+    /// lone sequence past its own 4-row verify.
+    fn verify_exact_lane(&self) -> bool {
         self.levers.qwen4exp_batch_fast && self.levers.qwen4exp_exact_verify
     }
 
     /// Batched K-row verify for `n = seqs.len()` sequences (R = Σ ks rows,
     /// each `ks[i]` = that sequence's drafts+1 — 2..=4 under the MTP ladder,
-    /// 1 for a decode row on the exact lane, γ+1 under DFlash, ragged since
+    /// 1..=8 on the exact lane (1 = a decode row), γ+1 under DFlash, ragged since
     /// D-Cut).
     ///
     /// Row `off_i + j` is sequence i's token j (its slice of `tokens` is
@@ -165,7 +170,7 @@ impl TransformerModel {
         };
         let k_max = ks.iter().copied().max().unwrap_or(0);
         ensure!(
-            n >= 2 && ks.len() == n && self.verify_batch_ks_ok(ks) && tokens.len() == r_total,
+            n >= 1 && ks.len() == n && self.verify_batch_ks_ok(ks) && tokens.len() == r_total,
             "batched verify: n={n} ks={ks:?} tokens={}",
             tokens.len()
         );

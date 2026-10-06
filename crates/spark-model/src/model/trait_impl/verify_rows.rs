@@ -23,13 +23,52 @@
 //!
 //! Every other lane keeps 2..=4: their WY verify kernels start at K=2, and
 //! their verify rows are not decode's arithmetic.
+//!
+//! The same argument carries the lane past 4 rows a sequence, up to
+//! [`EXACT_LANE_MAX_ROWS`] (7 drafts, `qwen4exp_mtp_depth.rs`). Per op,
+//! nothing a row computes depends on how many rows its window holds:
+//!
+//! * projections, LM head, MoE, mHC: the lane's per-row arithmetic is a
+//!   function of the step's TOTAL row count only through which byte-identical
+//!   tier carries the rows (`ops::Qwen4ExpWideRows`, <= 32 rows a launch);
+//!   the per-sequence split is invisible to them;
+//! * GDN: the exact chain is the per-token loop of serial decode
+//!   (`decode_batched_conv_gdn_exact`, its strided multi-sequence twin, or
+//!   `qwen4exp_gdn_verify_fused_rows` up to `GDN_VERIFY_KMAX` = 8 tokens), token
+//!   `t` reading only the state token `t - 1` left; one rollback slot per
+//!   token, `K - 1` H snapshots (the pools are sized from `--num-drafts`);
+//! * attention: per row (`qsa_rows.rs`, paged decode with no split-K), row
+//!   `t` reading the KV the rows before it wrote — causal, as in decode; the
+//!   QSA raw-key window keeps `REWIND_MARGIN` (512) rows for a rewind;
+//! * PLE: one conv-carry snapshot per row, `VERIFY_SNAP_SLOTS` = 9 covers
+//!   the 8 rows plus the pre-window carry.
+//!
+//! A LONE sequence verifies its 2..=4 rows on its own single-sequence path
+//! (`verify_b/c/c2`, graphed); past [`SINGLE_SEQ_MAX_ROWS`] it rides the
+//! batched verify as a batch of one, the only verify serving 5..8 rows.
+
+/// Rows a sequence may verify on the qwen4_exp exact lane (7 drafts).
+pub(in crate::model) const EXACT_LANE_MAX_ROWS: usize = 8;
+/// Rows the single-sequence verifies cover; a lone sequence verifies a wider
+/// window on the batched verify.
+pub(in crate::model) const SINGLE_SEQ_MAX_ROWS: usize = 4;
 
 /// Whether a batched MTP verify (not DFlash) admits `ks`: every count in
-/// 2..=4, or 1..=4 with `decode_rows`; a batch of decode rows only is a
-/// batched decode (`decode_batch`), never a verify.
-pub(in crate::model) fn mtp_verify_rows_ok(ks: &[usize], decode_rows: bool) -> bool {
-    let min = if decode_rows { 1 } else { 2 };
-    ks.iter().all(|k| (min..=4).contains(k)) && ks.iter().any(|&k| k >= 2)
+/// 2..=4, or on the exact lane (`exact_lane`) 1..=8; a batch of decode rows
+/// only is a batched decode (`decode_batch`), never a verify. A batch of ONE
+/// sequence is admitted only on the lane and only past the single-sequence
+/// verify's 4 rows.
+pub(in crate::model) fn mtp_verify_rows_ok(ks: &[usize], exact_lane: bool) -> bool {
+    let (min, max) = if exact_lane {
+        (1, EXACT_LANE_MAX_ROWS)
+    } else {
+        (2, SINGLE_SEQ_MAX_ROWS)
+    };
+    let width_ok = match ks {
+        [k] => exact_lane && *k > SINGLE_SEQ_MAX_ROWS,
+        _ => true,
+    };
+    width_ok && ks.iter().all(|k| (min..=max).contains(k)) && ks.iter().any(|&k| k >= 2)
 }
 
 /// Whether the worker trims its drafter after a verified window of `k`
@@ -48,8 +87,34 @@ mod tests {
         assert!(mtp_verify_rows_ok(&[4, 3, 2], false));
         assert!(!mtp_verify_rows_ok(&[4, 1], false));
         assert!(mtp_verify_rows_ok(&[4, 2, 1], true));
-        assert!(!mtp_verify_rows_ok(&[5, 1], true), "the ladder caps at 4");
+        assert!(
+            !mtp_verify_rows_ok(&[5, 1], false),
+            "off the lane the ladder caps at 4"
+        );
         assert!(!mtp_verify_rows_ok(&[0, 2], true));
+    }
+
+    #[test]
+    fn the_exact_lane_verifies_up_to_eight_rows_a_sequence() {
+        assert!(mtp_verify_rows_ok(&[8, 5, 1], true));
+        assert!(mtp_verify_rows_ok(&[8; 16], true));
+        assert!(!mtp_verify_rows_ok(&[9, 2], true));
+        assert!(!mtp_verify_rows_ok(&[8, 2], false));
+    }
+
+    #[test]
+    fn a_lone_sequence_batches_only_past_its_own_verify() {
+        for k in 5..=8 {
+            assert!(mtp_verify_rows_ok(&[k], true), "k={k}");
+            assert!(!mtp_verify_rows_ok(&[k], false), "k={k}");
+        }
+        for k in 1..=4 {
+            assert!(
+                !mtp_verify_rows_ok(&[k], true),
+                "k={k}: verify_b/c/c2 serve it"
+            );
+        }
+        assert!(!mtp_verify_rows_ok(&[9], true));
     }
 
     #[test]

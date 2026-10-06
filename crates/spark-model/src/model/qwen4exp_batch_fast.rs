@@ -64,7 +64,7 @@
 //! | `moe_topk_softmax` | `moe_topk_softmax_rows`, a block per row, the single-row lower-index tie-break (not `moe_topk_softmax_batched`'s) |
 //! | `moe_weighted_sum_blend` | `moe_weighted_sum_blend_rows`, blockIdx.y the row |
 //! | GDN `dense_gemv_ba_gates`, `causal_conv1d_update_l2norm_f32`, `gated_delta_rule_decode_f32`, `gated_rms_norm_f32_input_sigmoid` per sequence | `qwen4exp_gdn_decode_fused_rows`, up to 8 sequences a launch, each on its own state: the exact fused step of `ATLAS_QWEN4EXP_DECODE_FUSE` |
-//! | exact MTP verify (`ATLAS_QWEN4EXP_EXACT_VERIFY`), per sequence and token: conv, conv rollback copy, recurrence, gated norm, H rollback copy | `qwen4exp_gdn_verify_fused_rows`, up to 8 sequences of up to 4 tokens a launch, H and the conv windows in registers across the tokens (single-sequence verify too) |
+//! | exact MTP verify (`ATLAS_QWEN4EXP_EXACT_VERIFY`), per sequence and token: conv, conv rollback copy, recurrence, gated norm, H rollback copy | `qwen4exp_gdn_verify_fused_rows`, up to 8 sequences of up to 8 tokens a launch, H and the conv windows in registers across the tokens (single-sequence verify too) |
 //!
 //! An 8-row decode step drops from 8 x (48 + 48 + 36 x 4) = 1,920 of these
 //! launches to 48 + 48 + 36 = 132 (240 a row to 16.5); an 8-sequence K=2
