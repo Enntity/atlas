@@ -332,7 +332,7 @@ impl Qwen3SsmLayer {
         // gate_up/down kernels split K across lanes differently and do not
         // clamp gate/up to +-10 as the single-row kernels do. `forward` lands
         // every row in `moe_output` row 0, so the post runs per row too.
-        if ctx.levers.qwen4exp_exact_verify && (2..=3).contains(&num_tokens) {
+        if ctx.levers.qwen4exp_exact_verify && (2..=4).contains(&num_tokens) {
             for i in 0..num_tokens {
                 let moe_out = self.ffn.forward(normed2.offset(i * h * 2), ctx, stream)?;
                 ops::hc_post_site(

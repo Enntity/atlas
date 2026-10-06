@@ -235,6 +235,25 @@ impl Qwen3AttentionLayer {
                 nq * hd,
                 stream,
             )?;
+        } else if n == 4
+            && fwd.levers.qwen4exp_exact_verify
+            && !self.attn.o_proj.is_null()
+            && self.w4a16_batchm.scalar_kernel(4).0 != 0
+        {
+            // qwen4_exp exact K=4 verify: the scalar batch4 template, whose
+            // rows equal serial decode's `w4a16_gemv[_sw]`. The wide arm below
+            // may take DP4A or the tensor-core tier, which do not.
+            ops::w4a16_gemv_batchm(
+                fwd.gpu,
+                self.w4a16_batchm.scalar_kernel(4),
+                attn_out,
+                &self.attn.o_proj,
+                o_out,
+                4,
+                h as u32,
+                nq * hd,
+                stream,
+            )?;
         } else if !self.attn.o_proj.is_null() {
             // WIDE-VERIFY BATCHED O-PROJ (DFlash γ=16, n>3). One GEMM reads
             // the o_proj weight ONCE for all n rows instead of the per-row

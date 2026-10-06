@@ -31,6 +31,7 @@ mod mla_independent;
 mod nemotron_serial;
 mod qkv;
 mod qkv_dp4a;
+mod qkv_exact4;
 mod qkv_fp8;
 mod qsa_rows;
 #[cfg(test)]

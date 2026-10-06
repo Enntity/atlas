@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK=1`: run a K=2/3 verify's tokens
+//! `ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK=1`: run a K=2/3/4 verify's tokens
 //! through serial decode first, put the state back, and compare the verify's
 //! rows with the serial ones byte for byte (design and how to read it:
 //! `model/qwen4exp_exact_verify.rs`).
@@ -23,7 +23,7 @@ use crate::traits::SequenceState;
 
 const BF16: usize = 2;
 /// Widest verify the check serves (`verify_c`).
-const MAX_ROWS: usize = 3;
+const MAX_ROWS: usize = 4;
 /// Summary period, in checked verify steps.
 const SUMMARY_EVERY: u64 = 64;
 
@@ -92,7 +92,7 @@ impl TransformerModel {
                     }
                     let p = self.gpu.alloc(need)?;
                     tracing::warn!(
-                        "EXACT_VERIFY_CHECK armed: {:.1} MiB scratch, every K=2/3 verify \
+                        "EXACT_VERIFY_CHECK armed: {:.1} MiB scratch, every K=2/3/4 verify \
                          is preceded by K serial decode steps (diagnostic, slow)",
                         need as f64 / 1048576.0
                     );

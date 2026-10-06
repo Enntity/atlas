@@ -100,9 +100,15 @@ pub(crate) enum HeadArith {
 impl HeadArith {
     /// What `lm_head_batched` runs for `rows` on a BF16 head without
     /// overlays: two GEMVs at 2 rows, else `glm_k3_head::project`, which is
-    /// `dense_gemm` off GLM (`impl_a3.rs`).
-    pub(crate) fn batched(rows: usize) -> Self {
-        if rows == 2 { Self::Gemv } else { Self::Gemm }
+    /// `dense_gemm` off GLM (`impl_a3.rs`). Under the qwen4_exp exact verify
+    /// (`exact`) every verify width projects GEMV rows: serial decode's head
+    /// is `dense_gemv_bf16`, and the scalar tile GEMM sums K sequentially.
+    pub(crate) fn batched(rows: usize, exact: bool) -> Self {
+        if rows == 2 || (exact && rows > 1) {
+            Self::Gemv
+        } else {
+            Self::Gemm
+        }
     }
 }
 
@@ -291,7 +297,7 @@ impl TransformerModel {
                     && rows32 <= ops::DENSE_GEMV_BATCHM_MAX_M
                     && self.dense_gemv_batchm_kernel.0 != 0
                     && self.config.model_type == "qwen4_exp"
-                    && batchm_requested() =>
+                    && (batchm_requested() || self.levers.qwen4exp_exact_verify) =>
             {
                 ops::dense_gemv_batchm(
                     gpu,
@@ -470,7 +476,8 @@ impl TransformerModel {
         rows: usize,
         stream: u64,
     ) -> Result<()> {
-        if !self.qwen4exp_split_head(normed, rows, HeadArith::batched(rows), stream)? {
+        let arith = HeadArith::batched(rows, self.levers.qwen4exp_exact_verify);
+        if !self.qwen4exp_split_head(normed, rows, arith, stream)? {
             self.lm_head_batched(normed, rows as u32, self.buffers.logits(), stream)?;
         }
         Ok(())
