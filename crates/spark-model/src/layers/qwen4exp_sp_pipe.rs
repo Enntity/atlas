@@ -34,6 +34,10 @@ use std::cell::{Cell, RefCell};
 use super::glm_sp::SpRows;
 use crate::layer::ForwardContext;
 
+#[path = "qwen4exp_sp_offer.rs"]
+mod offer;
+pub use offer::{RsOffer, rs_offered, rs_took};
+
 /// `ATLAS_QWEN4EXP_PREFILL_SP_PIPE=1`.
 pub fn requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

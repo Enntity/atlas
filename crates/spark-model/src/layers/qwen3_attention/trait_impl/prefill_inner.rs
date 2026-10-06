@@ -703,6 +703,8 @@ impl Qwen3AttentionLayer {
             );
         }
         let glm_paged = self.glm_paged_prefill(ctx);
+        // ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE: the o_proj may reduce-scatter.
+        let rs_offer = sp.map(|_| crate::layers::qwen4exp_sp_pipe::RsOffer::new());
         let attn_out = if seq_len_start == 0 && !glm_paged {
             self.prefill_attention_with_cache_skip(
                 state,
@@ -734,7 +736,9 @@ impl Qwen3AttentionLayer {
 
         det.tap("attn", attn_out, (0, num_tokens), h * 2);
         if let Some(sp) = sp {
-            sp.reduce_scatter(attn_out, h, ctx, stream)?;
+            if !rs_offer.is_some_and(|o| o.taken()) {
+                sp.reduce_scatter(attn_out, h, ctx, stream)?;
+            }
         } else if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {

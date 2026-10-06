@@ -42,3 +42,19 @@ fn pieces_wait_for_their_rows_and_cover_the_window() {
         assert_eq!(p.sent, p.count());
     }
 }
+
+/// An offer is visible only while the caller holds it, and says whether the
+/// site took it.
+#[test]
+fn a_reduce_scatter_offer_lives_with_its_caller() {
+    use super::{RsOffer, rs_offered, rs_took};
+    assert!(!rs_offered(), "no caller, no offer");
+    let offer = RsOffer::new();
+    assert!(rs_offered() && !offer.taken());
+    rs_took();
+    assert!(offer.taken() && !rs_offered(), "taken once");
+    drop(offer);
+    assert!(!rs_offered());
+    let untaken = RsOffer::new();
+    assert!(!untaken.taken());
+}
