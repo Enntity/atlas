@@ -21,10 +21,10 @@
 //! `QsaSelection` is valid only until the next `decode_select` on this layer.
 //!
 //! CUDA graphs: the ingest counter is host state and launch parameters depend
-//! on the position, so a layer carrying an indexer vetoes decode-graph capture
-//! entirely. Top-k runs on the device by default (`qsa_select_topk_radix`,
-//! O(complete), identical selection to the host `rank_cmp`) up to
-//! `QSA_SELECT_MAX_BLOCKS`; `ATLAS_QSA_DEVICE_TOPK=0` restores the host sort.
+//! on the position, so an indexer vetoes decode-graph capture, except for an
+//! inert step whose ingest is staged (`qsa_staged.rs`). Top-k runs on the
+//! device by default (`qsa_select_topk_radix`, identical selection to the host
+//! `rank_cmp`) to `QSA_SELECT_MAX_BLOCKS`; `ATLAS_QSA_DEVICE_TOPK=0`: host sort.
 
 use anyhow::{Context, Result};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -37,9 +37,11 @@ mod qsa_aux;
 mod qsa_decode_select;
 #[path = "qsa_free.rs"]
 mod qsa_free;
-
 #[path = "qsa_select.rs"]
 mod qsa_select;
+#[path = "qsa_staged.rs"]
+mod qsa_staged;
+pub use qsa_staged::{StagedIngest, staged_ingest};
 #[path = "qsa_select_stages.rs"]
 mod qsa_select_stages;
 #[cfg(all(test, feature = "cuda"))]
@@ -238,8 +240,6 @@ impl QsaIndexer {
     }
 
     /// The largest visible prefix whose selection is provably all-visible.
-    /// One sequence's indexer carry: counters + raw/pooled key buffers
-    /// (per-seq CONTENT; launch scratch stays layer-owned — steps serialize).
     pub fn inert_bound(&self) -> usize {
         (self.budget + self.ratio - 1) as usize
     }

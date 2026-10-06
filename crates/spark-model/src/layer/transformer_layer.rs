@@ -211,6 +211,29 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// True when [`Self::decode_graph_unsupported`] is an indexer whose only
+    /// step-dependent work, inside its inert bound, is the ingest a staged
+    /// run splits off (`layers/qsa_staged.rs`): the qwen4_exp piecewise
+    /// graphs may then capture this layer on a step whose rows are all
+    /// inert (`ATLAS_QWEN4EXP_DECODE_GRAPH_WIDE=1`).
+    fn qsa_inert_capturable(&self) -> bool {
+        false
+    }
+
+    /// Finish the staged ingest of `row` at position `pos` into `state` (the
+    /// row's owner) after a staged run. Only layers that
+    /// [`Self::qsa_inert_capturable`] stage anything.
+    fn qsa_commit_staged(
+        &self,
+        _state: &mut dyn LayerState,
+        _row: usize,
+        _pos: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("qsa_commit_staged on a layer without an indexer")
+    }
+
     /// Marconi aux state: host-serialized per-layer SEQUENCE state that must
     /// travel with an SSM snapshot for a prefix-cache hit to be complete —
     /// PLE's n-gram history + conv state, QSA's ingested indexer keys.

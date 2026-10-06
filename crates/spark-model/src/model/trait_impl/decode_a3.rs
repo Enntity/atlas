@@ -39,10 +39,12 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<()> {
         // qwen4_exp piecewise graphs (`model::decode_pieces`): runs of GDN
-        // layers replay captured; QSA attention and PLE stay eager below.
+        // layers replay captured; QSA attention and PLE stay eager below,
+        // unless the step is wide (attention captured, its ingest staged).
         let pieces = !probe_layers && self.decode_pieces_admitted(use_graphs, kv_cache, ctx);
+        let wide = self.decode_piece_wide(pieces, seq, 1);
         for (i, layer) in self.layers.iter().enumerate() {
-            if pieces && self.decode_gdn_piece_run(i, seq, kv_cache, ctx, stream)? {
+            if pieces && self.decode_piece_run(i, wide, seq, kv_cache, ctx, stream)? {
                 continue;
             }
             layer.decode(
@@ -81,6 +83,9 @@ impl TransformerModel {
             // activation. Cheap d2d when the layer index matches; otherwise a
             // hashmap-free position() probe over a 5-element vec.
             self.try_dflash_capture(i, 0, stream)?;
+        }
+        if wide {
+            self.qsa_commit_staged_seq(seq, 1, stream)?;
         }
         // MLA absorbed attention: defensive sync before final norm in eager
         // mode. Skipped under graph capture because cuStreamSynchronize is

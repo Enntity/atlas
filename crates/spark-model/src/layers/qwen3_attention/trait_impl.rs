@@ -94,6 +94,29 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.qsa.is_some()
     }
 
+    /// Inert-step capture (`layers/qsa_staged.rs`): the mHC highway layer
+    /// with plain BF16 KV whose decode reads only device metadata, the
+    /// indexer's ingest staged. No MLA, adapters or host KV tier.
+    fn qsa_inert_capturable(&self) -> bool {
+        self.qsa_rows_static_ok() && self.lora.is_none()
+    }
+
+    fn qsa_commit_staged(
+        &self,
+        state: &mut dyn LayerState,
+        row: usize,
+        pos: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let qsa = self
+            .qsa
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("qsa_commit_staged without an indexer"))?;
+        let st = super::helpers::qsa_seq_state(qsa, state, gpu)?;
+        qsa.commit_staged_row(st, row, pos, gpu, stream)
+    }
+
     fn has_aux_state(&self) -> bool {
         self.qsa.is_some()
     }
@@ -306,7 +329,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
-        _active_seqs: usize,
+        active_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
@@ -318,6 +341,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
             hidden,
             residual,
             num_seqs,
+            active_seqs,
             states,
             None,
             kv_cache,
@@ -344,6 +368,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.decode_multi_seq_inner(
             hidden,
             residual,
+            num_rows,
             num_rows,
             seq_states,
             Some(row_owner),
