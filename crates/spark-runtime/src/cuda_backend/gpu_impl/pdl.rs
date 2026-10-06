@@ -159,7 +159,9 @@ pub(super) const QWEN4EXP_PDL_KERNELS: &[&str] = &[
     // mHC (ATLAS_QWEN4EXP_HC_FAST) and the fused seam.
     "hc_pre_stage_vec",
     "hc_pre_down_vec",
+    "hc_pre_down_vec8",
     "hc_pre_finish_vec",
+    "hc_pre_finish_vec8",
     "hc_post_vec",
     "hc_post_stage_vec",
     // GDN mixer: projections, the four small kernels and their fused twin.

@@ -1,20 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Standalone bitwise check and A/B timing of the Qwen3.8-Flash-Next decode
 // mHC collapse (ATLAS_QWEN4EXP_HC_FAST) against the kernels it replaces, on
-// the real site shape (hidden 2560, hc 4, rank 320) at T = 1..4 rows:
+// the real site shape (hidden 2560, hc 4, rank 320) at T = 1..8 rows (T > 4:
+// multi-sequence batches, ATLAS_QWEN4EXP_BATCH_FAST):
 //
 //   stage   hc_pre_stage       (T) x 1024     vs hc_pre_stage_vec  (T, S) x 1024
 //   down    hc_pre_down        (T, 48/T) x 1024, 40 KB shared
-//                                             vs hc_pre_down_vec  (+ the hc injection rows)
+//                                             vs hc_pre_down_vec  (+ the hc injection rows;
+//                                                hc_pre_down_vec8 at T = 5..8)
 //   finish  hc_pre_finish_x4   (T, H/32) x 128 (+ injection in block 0)
-//                                             vs hc_pre_finish_vec
+//                                             vs hc_pre_finish_vec (hc_pre_finish_vec8 at T = 5..8)
 //   post    hc_post            (T) x 256      vs hc_post_vec
-//   mt      hc_pre_down_mt + hc_pre_finish_x4_mt (ATLAS_HC_MT), for reference
+//   mt      hc_pre_down_mt + hc_pre_finish_x4_mt (ATLAS_HC_MT, T <= 4), for reference
 //
 // Every output byte (normed, low, inj, y, post) must match between the
 // default chain, the MT chain and the vectorized chain, with and without the
 // injection rows (hc_pre vs hc_head), over random inputs at three scales that
-// include zero and -0.0 entries. It then times each kernel and each whole
+// include zero and -0.0 entries; and every row of a T = 2..8 vectorized
+// launch must equal the T = 1 vectorized kernels run on that row alone. It
+// then times each kernel and each whole
 // site (stage, down, finish, post) as serving launches them, cycling `copies`
 // weight sets (13.1 MB a site, so 8 copies are 4x the 24 MiB L2 and every
 // launch streams from DRAM, as serving's 96 distinct sites do).
@@ -31,6 +35,10 @@
 // never waits for the host (so the numbers include the back-to-back launch
 // gap). `sweep` bit-checks and times every templated down / finish shape
 // (values per thread x unroll x block). Device memory: ~110 MB at 8 copies.
+//
+// Measured 2026-10-05 (ennspark03, atlas-release-builder:1.93.1, CUDA 13.0),
+// us per site (stage + down + finish + post), old -> vec: T=1 124 -> 78,
+// T=4 123 -> 85, T=5 137 -> 90, T=6 137 -> 94, T=8 132 -> 105; PASS.
 #include "hyper_connection.cu"
 #include <algorithm>
 #include <cstdio>
@@ -44,7 +52,7 @@
     fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1); } } while (0)
 
 typedef __nv_bfloat16 bf;
-static const unsigned H = 2560, HC = 4, RANK = 320, HCD = HC * H, MAXT = 4;
+static const unsigned H = 2560, HC = 4, RANK = 320, HCD = HC * H, MAXT = 8, MT_MAXT = 4;
 static const float EPS = 1e-6f;
 
 static unsigned g_down_block = 128, g_fin_block = 128, g_stage_split = 8, g_post_block = 64;
@@ -99,28 +107,35 @@ struct Inputs {
 typedef void (*DownK)(const float*, const bf*, const bf*, float*, float*, unsigned, unsigned, unsigned, unsigned);
 typedef void (*FinK)(const float*, const float*, const bf*, bf*, unsigned, unsigned, unsigned);
 
-template <unsigned CPT, unsigned U, unsigned DN>
+// One sweep shape covers T = 1..8: the T <= 4 template (hc_pre_*_vec) or the
+// 5..8 one (hc_pre_*_vec8), as the dispatcher picks.
+template <unsigned CPT, unsigned U, unsigned DN, unsigned DN8>
 __global__ void bench_down(const float* normed, const bf* down_w, const bf* inject_w, float* low,
                            float* inj, unsigned hs, unsigned hc, unsigned rank, unsigned nt) {
-    qhc_down_vec_t<CPT, U, DN>(normed, down_w, inject_w, low, inj, hs, hc, rank, nt);
+    if (nt <= 4) qhc_down_vec_t<CPT, U, DN>(normed, down_w, inject_w, low, inj, hs, hc, rank, nt);
+    else qhc_down_vec_t8<CPT, U, DN8>(normed, down_w, inject_w, low, inj, hs, hc, rank, nt);
 }
-template <unsigned DPT, unsigned U>
+template <unsigned DPT, unsigned U, unsigned U8>
 __global__ void bench_fin(const float* normed, const float* low, const bf* up_w, bf* y,
                           unsigned hs, unsigned rank, unsigned nt) {
-    qhc_finish_vec_t<DPT, U>(normed, low, up_w, y, hs, rank, nt);
+    if (nt <= 4) qhc_finish_vec_t<DPT, U>(normed, low, up_w, y, hs, rank, nt);
+    else qhc_finish_vec_t8<DPT, U8>(normed, low, up_w, y, hs, rank, nt);
 }
 
-// Down: chains per thread, weight ring depth, normed ring depth.
+// Down: chains per thread, weight ring depth, normed ring depth at T <= 4
+// and at T = 5..8.
 struct DownCfg { const char* name; DownK k; unsigned cpt; };
 struct FinCfg { const char* name; FinK k; unsigned dpt; };
 static const DownCfg DOWN_CFGS[] = {
-    {"c2 u32 n8", bench_down<2, 32, 8>, 2},  {"c2 u32 n4", bench_down<2, 32, 4>, 2},
-    {"c2 u32 n16", bench_down<2, 32, 16>, 2}, {"c2 u16 n8", bench_down<2, 16, 8>, 2},
-    {"c4 u16 n8", bench_down<4, 16, 8>, 4},  {"c4 u32 n8", bench_down<4, 32, 8>, 4},
+    {"c2 u32 n16/2", bench_down<2, 32, 16, 2>, 2}, {"c2 u32 n16/4", bench_down<2, 32, 16, 4>, 2},
+    {"c2 u32 n16/8", bench_down<2, 32, 16, 8>, 2}, {"c2 u16 n8/4", bench_down<2, 16, 8, 4>, 2},
+    {"c4 u16 n8/2", bench_down<4, 16, 8, 2>, 4},   {"c4 u16 n8/4", bench_down<4, 16, 8, 4>, 4},
 };
+// Finish: values per thread, ring depth at T <= 4 and at T = 5..8.
 static const FinCfg FIN_CFGS[] = {
-    {"dpt8 u16", bench_fin<8, 16>, 8}, {"dpt4 u32", bench_fin<4, 32>, 4},
-    {"dpt2 u32", bench_fin<2, 32>, 2}, {"dpt2 u64", bench_fin<2, 64>, 2},
+    {"dpt4 u32/16", bench_fin<4, 32, 16>, 4}, {"dpt4 u32/32", bench_fin<4, 32, 32>, 4},
+    {"dpt4 u32/8", bench_fin<4, 32, 8>, 4},   {"dpt8 u16/16", bench_fin<8, 16, 16>, 8},
+    {"dpt2 u32/32", bench_fin<2, 32, 32>, 2},
 };
 
 static void launch_down(DownK k, unsigned cpt, unsigned block, const Weights& w, Arm& a, unsigned T, int c,
@@ -161,10 +176,11 @@ static void vec_stage(const Inputs& in, const Weights& w, Arm& a, unsigned T, in
     hc_pre_stage_vec<<<dim3(T, g_stage_split), 1024>>>(in.streams.p, w.norm(c), a.normed.p, H, HC, EPS);
 }
 static void vec_down(const Weights& w, Arm& a, unsigned T, int c, bool inject) {
-    launch_down(hc_pre_down_vec, HC_V_DOWN_CPT, g_down_block, w, a, T, c, inject);
+    launch_down(T <= 4 ? hc_pre_down_vec : hc_pre_down_vec8, HC_V_DOWN_CPT, g_down_block, w, a, T, c,
+                inject);
 }
 static void vec_finish(const Weights& w, Arm& a, unsigned T, int c) {
-    launch_fin(hc_pre_finish_vec, HC_V_FIN_DPT, g_fin_block, w, a, T, c);
+    launch_fin(T <= 4 ? hc_pre_finish_vec : hc_pre_finish_vec8, HC_V_FIN_DPT, g_fin_block, w, a, T, c);
 }
 static void vec_post(const Inputs& in, Arm& a, unsigned T) {
     hc_post_vec<<<dim3(T, (H / 4 + g_post_block - 1) / g_post_block), g_post_block>>>(
@@ -281,9 +297,10 @@ int main(int argc, char** argv) {
     if (argc > 6) g_fin_block = (unsigned)atoi(argv[6]);
     if (argc > 7) g_stage_split = (unsigned)atoi(argv[7]);
     if (argc > 8) g_post_block = (unsigned)atoi(argv[8]);
-    printf("copies %d  down cpt %u u %u dn %u block %u  fin dpt %u u %u block %u  stage_split %u  post_block %u\n",
-           copies, HC_V_DOWN_CPT, HC_V_DOWN_UNROLL, HC_V_DOWN_DN, g_down_block, HC_V_FIN_DPT, HC_V_FIN_UNROLL,
-           g_fin_block, g_stage_split, g_post_block);
+    printf("copies %d  down cpt %u u %u dn %u/%u block %u  fin dpt %u u %u/%u block %u  stage_split %u  "
+           "post_block %u\n", copies, HC_V_DOWN_CPT, HC_V_DOWN_UNROLL, HC_V_DOWN_DN, HC_V_DOWN_DN8,
+           g_down_block, HC_V_FIN_DPT, HC_V_FIN_UNROLL, HC_V_FIN_UNROLL8, g_fin_block, g_stage_split,
+           g_post_block);
 
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -324,7 +341,9 @@ int main(int argc, char** argv) {
         // Bit-check every shape against the default chain, then time it.
         bool ok = true;
         const unsigned blocks[2] = {64, 128};
-        printf("\n%-16s %5s | %8s %8s %8s %8s   (us per launch, T = 1..4)\n", "down", "block", "T=1", "T=2", "T=3", "T=4");
+        printf("\n%-16s %5s |", "down", "block");
+        for (unsigned T = 1; T <= MAXT; T++) printf("   T=%u   ", T);
+        printf("  (us per launch)\n");
         for (const DownCfg& cfg : DOWN_CFGS) {
             for (unsigned b : blocks) {
                 for (int trial = 0; trial < 3; trial++) {
@@ -352,7 +371,9 @@ int main(int argc, char** argv) {
                 printf("\n");
             }
         }
-        printf("\n%-16s %5s | %8s %8s %8s %8s\n", "finish", "block", "T=1", "T=2", "T=3", "T=4");
+        printf("\n%-16s %5s |", "finish", "block");
+        for (unsigned T = 1; T <= MAXT; T++) printf("   T=%u   ", T);
+        printf("\n");
         for (const FinCfg& cfg : FIN_CFGS) {
             for (unsigned b : blocks) {
                 for (int trial = 0; trial < 3; trial++) {
@@ -398,12 +419,12 @@ int main(int argc, char** argv) {
                 const int c = trial % copies;
                 for (int ch = 0; ch < 3; ch++) {
                     arm[ch].poison();
-                    site(in, w, arm[ch], T, c, (Chain)ch, inject);
+                    if (ch != MT || T <= MT_MAXT) site(in, w, arm[ch], T, c, (Chain)ch, inject);
                 }
                 old_post(in, arm[0], T);
                 vec_post(in, arm[2], T);
                 CK(cudaDeviceSynchronize());
-                for (int ch = 1; ch < 3; ch++) {
+                for (int ch = T <= MT_MAXT ? 1 : 2; ch < 3; ch++) {
                     char what[64];
                     snprintf(what, sizeof what, "normed  %s", names[ch]);
                     ok &= same(what, T, arm[0].normed, arm[ch].normed, HCD);
@@ -417,6 +438,39 @@ int main(int argc, char** argv) {
                     ok &= same(what, T, arm[0].y, arm[ch].y, H);
                 }
                 ok &= same("post    vec", T, arm[0].post_out, arm[2].post_out, HCD);
+            }
+        }
+    }
+    // Row t of a T-row vec launch against the T = 1 vec kernels on row t
+    // alone (what single-sequence decode runs), every output byte.
+    for (int trial = 0; trial < 3; trial++) {
+        make_inputs(in, rng, SCALES[trial]);
+        for (unsigned T = 2; T <= MAXT; T++) {
+            for (int inject = 1; inject >= 0; inject--) {
+                arm[2].poison();
+                site(in, w, arm[2], T, trial, VEC, inject);
+                const auto nT = arm[2].normed.get();
+                const auto lT = arm[2].low.get();
+                const auto iT = arm[2].inj.get();
+                const auto yT = arm[2].y.get();
+                size_t bad = 0;
+                for (unsigned t = 0; t < T; t++) {
+                    Inputs one = in;
+                    one.streams.p = in.streams.p + (size_t)t * HCD;
+                    arm[1].poison();
+                    site(one, w, arm[1], 1, trial, VEC, inject);
+                    const auto n1 = arm[1].normed.get();
+                    const auto l1 = arm[1].low.get();
+                    const auto i1 = arm[1].inj.get();
+                    const auto y1 = arm[1].y.get();
+                    bad += memcmp(&nT[(size_t)t * HCD], &n1[0], HCD * 4) != 0;
+                    bad += memcmp(&lT[(size_t)t * RANK], &l1[0], RANK * 4) != 0;
+                    if (inject) bad += memcmp(&iT[(size_t)t * HC], &i1[0], HC * 4) != 0;
+                    bad += memcmp(&yT[(size_t)t * H], &y1[0], H * 2) != 0;
+                }
+                printf("  bitwise rows of T=%u vs T=1 per row (%s)  %s\n", T, inject ? "hc_pre" : "hc_head",
+                       bad ? "MISMATCH" : "ok");
+                ok &= bad == 0;
             }
         }
     }
@@ -440,7 +494,7 @@ int main(int argc, char** argv) {
         const double f1 = time_us(groups, reps, sink, [&](int i) { vec_finish(w, v, T, i); });
         const double p1 = time_us(groups, reps, sink, [&](int) { vec_post(in, v, T); });
         const double c0 = time_us(groups, reps, sink, [&](int i) { site(in, w, o, T, i, OLD, true); old_post(in, o, T); });
-        const double cm = time_us(groups, reps, sink, [&](int i) { site(in, w, arm[1], T, i, MT, true); old_post(in, arm[1], T); });
+        const double cm = T > MT_MAXT ? 0.0 : time_us(groups, reps, sink, [&](int i) { site(in, w, arm[1], T, i, MT, true); old_post(in, arm[1], T); });
         const double c1 = time_us(groups, reps, sink, [&](int i) { site(in, w, v, T, i, VEC, true); vec_post(in, v, T); });
         printf("%-3u %8.1f %8.1f %8.1f %8.1f | %8.1f %8.1f %8.1f %8.1f | %8.1f %8.1f %8.1f %7.2fx\n",
                T, s0, d0, f0, p0, s1, d1, f1, p1, c0, cm, c1, c0 / c1);

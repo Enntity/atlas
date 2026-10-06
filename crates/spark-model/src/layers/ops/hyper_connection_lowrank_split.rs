@@ -14,8 +14,11 @@ use super::qwen4exp_decode_fuse::{HcPostFold, hc_post_stage};
 use crate::layers::qwen3_attention::HcLowRank;
 
 // Shape of the vectorized kernels; each must match its HC_V_* define in
-// kernels/gb10/qwen3.8-flash-next/nvfp4/hyper_connection.cu.
-const HC_V_MAX: u32 = 4;
+// kernels/gb10/qwen3.8-flash-next/nvfp4/hyper_connection.cu. T <= 4 runs
+// `hc_pre_{down,finish}_vec`, T = 5..HC_V_MAX their `_vec8` twins (the same
+// per-output operations; shorter rings for the larger token count).
+const HC_V_MAX: u32 = 8;
+const HC_V_TWIN_MIN: u32 = 5;
 const HC_V_DOWN_CPT: u32 = 2; // chains per thread
 const HC_V_DOWN_UNROLL: u32 = 32;
 const HC_V_FIN_DPT: u32 = 4; // output dims per thread
@@ -71,9 +74,26 @@ fn hc_pre_vec(
     if !fits {
         return Ok(false);
     }
+    let twin = num_tokens >= HC_V_TWIN_MIN;
     let k_stage = crate::layers::try_kernel(gpu, "hyper_connection", "hc_pre_stage_vec");
-    let k_down = crate::layers::try_kernel(gpu, "hyper_connection", "hc_pre_down_vec");
-    let k_fin = crate::layers::try_kernel(gpu, "hyper_connection", "hc_pre_finish_vec");
+    let k_down = crate::layers::try_kernel(
+        gpu,
+        "hyper_connection",
+        if twin {
+            "hc_pre_down_vec8"
+        } else {
+            "hc_pre_down_vec"
+        },
+    );
+    let k_fin = crate::layers::try_kernel(
+        gpu,
+        "hyper_connection",
+        if twin {
+            "hc_pre_finish_vec8"
+        } else {
+            "hc_pre_finish_vec"
+        },
+    );
     if k_stage.0 == 0 || k_down.0 == 0 || k_fin.0 == 0 {
         return Ok(false);
     }

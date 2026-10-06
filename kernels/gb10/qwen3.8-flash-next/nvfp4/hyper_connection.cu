@@ -1522,17 +1522,21 @@ extern "C" __global__ void hc_pre_finish_x4_mt(
 // (ennspark03 GB10, weights cycled through 8 copies so every launch streams
 // from DRAM; us per launch incl. the ~2.2 us back-to-back launch gap):
 //
-//                T=1: old -> vec      T=4: old -> vec
-//     stage       8.3 ->  6.0          8.4 ->  6.1
-//     down       40.7 -> 32.3         40.2 -> 34.4
-//     finish     60.6 -> 33.3         60.3 -> 38.9
-//     post        8.1 ->  4.3          8.2 ->  4.2
-//     site      121.4 -> 75.5        119.6 -> 83.1
+//                T=1: old -> vec      T=4: old -> vec      T=8: old -> vec8
+//     stage       8.3 ->  6.0          8.4 ->  6.1          8.9 ->  8.3
+//     down       40.7 -> 32.3         40.2 -> 34.4         52.7 -> 41.7
+//     finish     60.6 -> 33.3         60.3 -> 38.9         58.9 -> 50.8
+//     post        8.1 ->  4.3          8.2 ->  4.2          8.3 ->  4.2
+//     site      121.4 -> 75.5        119.6 -> 83.1        131.4 -> 105.2
 //
 // against 28.5 us for a bare 6.55 MB streaming read in the same harness.
+// (T = 5..8 is the multi-sequence batch, the `_vec8` twins below: at 8
+// tokens the finish thread's 32 chains make each ring step long enough that
+// its 16-row lookahead no longer covers DRAM latency; it stays the slower
+// half.)
 
 #ifndef HC_V_MAX
-#define HC_V_MAX 4u
+#define HC_V_MAX 8u
 #endif
 #ifndef HC_V_DOWN_CPT
 #define HC_V_DOWN_CPT 2u
@@ -1716,7 +1720,6 @@ __device__ __forceinline__ void qhc_down_vec(
 #ifndef HC_V_DOWN_DN
 #define HC_V_DOWN_DN 16u
 #endif
-
 template <unsigned int CPT, unsigned int U, unsigned int DN>
 __device__ __forceinline__ void qhc_down_vec_t(
     const float* normed, const __nv_bfloat16* down_w, const __nv_bfloat16* inject_w,
@@ -1732,6 +1735,26 @@ __device__ __forceinline__ void qhc_down_vec_t(
     }
 }
 
+// T = 5..8 (multi-sequence batches, ATLAS_QWEN4EXP_BATCH_FAST): the same
+// walk for 5..8 tokens, so every weight element is still read once for all
+// of them. Separate entry points, so the T <= 4 kernels keep their own
+// register allocation, and a shorter `normed` ring (the 8 tokens' slots would
+// otherwise cost 256 registers) -- pure scheduling, as above.
+template <unsigned int CPT, unsigned int U, unsigned int DN>
+__device__ __forceinline__ void qhc_down_vec_t8(
+    const float* normed, const __nv_bfloat16* down_w, const __nv_bfloat16* inject_w,
+    float* low_out, float* inj_out, unsigned int hidden_size, unsigned int hc,
+    unsigned int rank, unsigned int num_tokens
+) {
+    const unsigned int hc_dim = hc * hidden_size;
+    switch (num_tokens) {
+    case 5: qhc_down_vec<CPT, U, DN, 5>(normed, down_w, inject_w, low_out, inj_out, hc_dim, hc, rank); break;
+    case 6: qhc_down_vec<CPT, U, DN, 6>(normed, down_w, inject_w, low_out, inj_out, hc_dim, hc, rank); break;
+    case 7: qhc_down_vec<CPT, U, DN, 7>(normed, down_w, inject_w, low_out, inj_out, hc_dim, hc, rank); break;
+    default: qhc_down_vec<CPT, U, DN, 8>(normed, down_w, inject_w, low_out, inj_out, hc_dim, hc, rank); break;
+    }
+}
+
 // Grid: (ceil((rank + hc) * 32 / HC_V_DOWN_CPT / block), 1, 1), block a
 // multiple of 32. `inject_w == nullptr` (the model-level head) drops the
 // injection rows.
@@ -1744,10 +1767,31 @@ extern "C" __global__ void hc_pre_down_vec(
     const unsigned int hidden_size,
     const unsigned int hc,
     const unsigned int rank,
-    const unsigned int num_tokens              // 1..HC_V_MAX (host checks)
+    const unsigned int num_tokens              // 1..4 (host checks; 5..8: the _vec8 twin)
 ) {
     atlas_pdl_enter();
     qhc_down_vec_t<HC_V_DOWN_CPT, HC_V_DOWN_UNROLL, HC_V_DOWN_DN>(
+        normed, down_w, inject_w, low_out, inj_out, hidden_size, hc, rank, num_tokens);
+}
+
+#ifndef HC_V_DOWN_DN8
+#define HC_V_DOWN_DN8 4u
+#endif
+
+// `hc_pre_down_vec` for num_tokens 5..HC_V_MAX (host checks); same grid.
+extern "C" __global__ void hc_pre_down_vec8(
+    const float* __restrict__ normed,          // [T, hc*H]
+    const __nv_bfloat16* __restrict__ down_w,  // [rank, hc*H]
+    const __nv_bfloat16* __restrict__ inject_w,// [hc, hc*H] or null
+    float* __restrict__ low_out,               // [T, rank]
+    float* __restrict__ inj_out,               // [T, hc]
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const unsigned int rank,
+    const unsigned int num_tokens              // 5..HC_V_MAX (host checks)
+) {
+    atlas_pdl_enter();
+    qhc_down_vec_t8<HC_V_DOWN_CPT, HC_V_DOWN_UNROLL, HC_V_DOWN_DN8>(
         normed, down_w, inject_w, low_out, inj_out, hidden_size, hc, rank, num_tokens);
 }
 
@@ -1867,6 +1911,23 @@ __device__ __forceinline__ void qhc_finish_vec_t(
     }
 }
 
+// T = 5..8: as `qhc_down_vec_t8`. (Splitting a (stream, d group)'s tokens
+// over 2 or 4 lanes, which share the up_w loads, measured 5-25% slower at
+// T = 5..8: twice the load instructions for the same bytes.)
+template <unsigned int DPT, unsigned int U>
+__device__ __forceinline__ void qhc_finish_vec_t8(
+    const float* normed, const float* low, const __nv_bfloat16* up_w,
+    __nv_bfloat16* y_out, unsigned int hidden_size, unsigned int rank,
+    unsigned int num_tokens
+) {
+    switch (num_tokens) {
+    case 5: qhc_finish_vec<DPT, U, 5>(normed, low, up_w, y_out, hidden_size, rank); break;
+    case 6: qhc_finish_vec<DPT, U, 6>(normed, low, up_w, y_out, hidden_size, rank); break;
+    case 7: qhc_finish_vec<DPT, U, 7>(normed, low, up_w, y_out, hidden_size, rank); break;
+    default: qhc_finish_vec<DPT, U, 8>(normed, low, up_w, y_out, hidden_size, rank); break;
+    }
+}
+
 // Grid: (ceil(4 * H / HC_V_FIN_DPT / block), 1, 1), block a multiple of 32.
 // Dynamic shared: num_tokens * rank floats.
 extern "C" __global__ void hc_pre_finish_vec(
@@ -1876,10 +1937,31 @@ extern "C" __global__ void hc_pre_finish_vec(
     __nv_bfloat16* __restrict__ y_out,         // [T, H]
     const unsigned int hidden_size,
     const unsigned int rank,
-    const unsigned int num_tokens              // 1..HC_V_MAX (host checks)
+    const unsigned int num_tokens              // 1..4 (host checks; 5..8: the _vec8 twin)
 ) {
     atlas_pdl_enter();
     qhc_finish_vec_t<HC_V_FIN_DPT, HC_V_FIN_UNROLL>(
+        normed, low, up_w, y_out, hidden_size, rank, num_tokens);
+}
+
+// A 16-row ring at T = 5..8 (the bench's pick: 48.5 vs 52 us at T = 8).
+#ifndef HC_V_FIN_UNROLL8
+#define HC_V_FIN_UNROLL8 16u
+#endif
+
+// `hc_pre_finish_vec` for num_tokens 5..HC_V_MAX (host checks); same grid
+// and dynamic shared (num_tokens * rank floats).
+extern "C" __global__ void hc_pre_finish_vec8(
+    const float* __restrict__ normed,          // [T, 4*H]
+    const float* __restrict__ low,             // [T, rank]
+    const __nv_bfloat16* __restrict__ up_w,    // [rank, 4*H]
+    __nv_bfloat16* __restrict__ y_out,         // [T, H]
+    const unsigned int hidden_size,
+    const unsigned int rank,
+    const unsigned int num_tokens              // 5..HC_V_MAX (host checks)
+) {
+    atlas_pdl_enter();
+    qhc_finish_vec_t8<HC_V_FIN_DPT, HC_V_FIN_UNROLL8>(
         normed, low, up_w, y_out, hidden_size, rank, num_tokens);
 }
 
