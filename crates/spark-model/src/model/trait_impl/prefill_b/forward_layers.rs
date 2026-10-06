@@ -205,7 +205,8 @@ impl TransformerModel {
         // Sequence-parallel chunk: each rank runs the row-local work over half
         // the rows (`layers::glm_sp`); the last layer leaves this rank's rows
         // of the contracted `hidden`, gathered below.
-        let sp_excluded = passengers.is_some() || use_decode_path || midcap.is_some();
+        let sp_excluded =
+            passengers.is_some() || use_decode_path || midcap.is_some_and(|p| !p.ckpt);
         let mut sp = self.glm_prefill_sp_rows(proc_count, sp_excluded, &ctx);
         let mut sp_scope = sp.map(crate::layers::glm_sp::enter);
         // qwen4_exp (`ATLAS_QWEN4EXP_PREFILL_SP`): the split starts at

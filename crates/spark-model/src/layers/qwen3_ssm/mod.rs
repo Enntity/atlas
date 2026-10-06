@@ -417,6 +417,7 @@ pub struct Qwen3SsmLayer {
 // Kernel-selection helpers moved to `kernel_select.rs` (≤500 LoC split).
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod ckpt_capture;
 mod debug;
 mod exact_rows;
 mod fla_dispatch;
