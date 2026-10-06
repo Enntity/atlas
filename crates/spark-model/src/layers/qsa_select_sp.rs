@@ -26,6 +26,7 @@ use super::qsa_select::SlabBufs;
 use super::{QsaIndexer, QsaSeqState};
 use crate::layer::ForwardContext;
 use crate::layers::qwen4exp_sp_pipe::SideExchanges;
+use spark_runtime::buffers::QSA_SELECT_SCRATCH_ROWS as QSA_SLAB;
 
 /// `ATLAS_QWEN4EXP_PREFILL_QSA_SPLIT=1`.
 pub fn requested() -> bool {
@@ -88,7 +89,8 @@ impl QsaIndexer {
         };
         let rank = ctx.comm.expect("checked").rank();
         let ns = slabs.len();
-        let base = slots(gpu, (ns + 1) * slot, stream)?;
+        let most = crate::layers::qwen4exp_sp_pipe::prealloc_rows(ctx).div_ceil(QSA_SLAB) + 2;
+        let base = slots(gpu, (ns + 1).max(most) * slot, stream)?;
         let at = |i: usize| base.offset(i * slot);
         let (own, pairs) = split_plan(ns, rank);
         // Each pair's swap goes out as soon as this rank's half of it is set.

@@ -76,7 +76,8 @@ impl MoeLayer {
         }
         let top_k = ctx.config.num_experts_per_tok;
         let route = top_k * 4;
-        let buf = routes(ctx.gpu, 2 * sp.total() * route, stream)?;
+        let most = crate::layers::qwen4exp_sp_pipe::prealloc_rows(ctx).max(sp.total());
+        let buf = routes(ctx.gpu, 2 * most * route, stream)?;
         let weights = buf.offset(sp.total() * route);
         self.prefill_topk(
             logits,

@@ -36,7 +36,7 @@ use crate::layer::ForwardContext;
 
 #[path = "qwen4exp_sp_side.rs"]
 mod side_ops;
-pub use side_ops::{RsOffer, SideExchanges, rs_offered, rs_took};
+pub use side_ops::{RsOffer, SideExchanges, prealloc_rows, rs_offered, rs_took};
 
 /// `ATLAS_QWEN4EXP_PREFILL_SP_PIPE=1`.
 pub fn requested() -> bool {
@@ -225,7 +225,12 @@ pub(super) fn begin_split<'a>(
     let (land, copy_out) = if plan.recv_n == plan.m {
         (dst, None)
     } else {
-        let stage = stage(gpu, plan.m * row, stream, side.stream)?;
+        let stage = stage(
+            gpu,
+            (plan.m * row).max(prealloc_rows(ctx) * row),
+            stream,
+            side.stream,
+        )?;
         let src = stage.offset(plan.skip * row);
         (stage, Some((src, dst, plan.recv_n * row)))
     };
@@ -394,7 +399,12 @@ pub fn compute_and_reduce_scatter(
     // The side stream starts after the main stream's previous exchange.
     gpu.record_event(side.to_side, stream)?;
     gpu.stream_wait_event(side.stream, side.to_side)?;
-    let stage = stage(gpu, plan.m * row, stream, side.stream)?;
+    let stage = stage(
+        gpu,
+        (plan.m * row).max(prealloc_rows(ctx) * row),
+        stream,
+        side.stream,
+    )?;
     let total = sp.total();
     for w0 in (0..plan.m).step_by(PIECE) {
         let n = PIECE.min(plan.m - w0);
