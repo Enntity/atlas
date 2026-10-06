@@ -1295,6 +1295,22 @@ pub trait Model: Send + Sync {
         super::model_defaults::ep_broadcast_disable_mtp_for_seq(self, seq_id, disabled)
     }
 
+    /// In-flight shared-prefix checkpoints (`ATLAS_GLM_PC_INFLIGHT=1`): the
+    /// smallest shared prefix, in tokens, worth planting a checkpoint for in
+    /// a prefill other requests wait on. `None` (the default) turns the
+    /// scheduler's shared-prefix admission off.
+    fn pc_inflight_min_tokens(&self) -> Option<usize> {
+        None
+    }
+
+    /// Ask `seq`'s prefill to save an SSM checkpoint at token `at` for the
+    /// requests that share its prefix, on every rank: the head sends the
+    /// worker the same request through the command stream, so call it only
+    /// between the sequence's model commands.
+    fn pc_plant(&self, seq: &mut SequenceState, at: usize) -> Result<()> {
+        super::model_defaults::pc_plant(self, seq, at)
+    }
+
     /// Returns true if this model's EP comm path is using the v2 protocol
     /// (slot-aware seq_id preamble). Default false — pre-PR behaviour.
     fn ep_protocol_v2(&self) -> bool {

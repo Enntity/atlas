@@ -70,6 +70,7 @@ mod repetition;
 mod rollback;
 mod sample_step;
 pub mod sched_ctx;
+mod shared_prefix;
 #[cfg(test)]
 mod slot_compaction_tests;
 pub mod snapshot;
@@ -360,6 +361,7 @@ pub fn run(
     // context ceiling, i.e. reserve each request's own max_tokens; see
     // `admission` module docs and ATLAS_KV_ADMIT_WATERMARK).
     let admit_watermark = admission::resolve_admit_watermark(sched.limits.max_seq_len);
+    let mut prefix_admit = shared_prefix::SharedPrefix::default();
 
     let pending = Arc::new((
         Mutex::new(PendingQueue {
@@ -489,6 +491,17 @@ pub fn run(
             admit_watermark,
             sched.limits.max_seq_len,
             block_size,
+        );
+        // ── Shared-prefix admission: hold requests that share a long prefix
+        // with a prefill in flight until it plants a checkpoint there
+        // (`ATLAS_GLM_PC_INFLIGHT`; a no-op otherwise). ──
+        let (new_reqs, pc_plants) = shared_prefix::admit(
+            &*model,
+            &pending,
+            new_reqs,
+            &mut prefilling,
+            chunked,
+            &mut prefix_admit,
         );
         sched.timing.record(mtp_timing::Phase::LoopDrain, t_loop);
 
@@ -650,6 +663,7 @@ pub fn run(
             &*model,
             &sched,
             new_reqs,
+            pc_plants,
             chunked,
             always_mixed,
             max_prefill_tokens,

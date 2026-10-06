@@ -399,6 +399,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
     /// - 0xFFFFFFE6: batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`)
     /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
+    /// - 0xFFFFFFED: plant a prefix checkpoint → position (`prefill_b::pc_inflight`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         let (seq_id, cmd) = self.ep_recv_seq_and_cmd(self.ep_protocol_v2)?;
@@ -480,6 +481,7 @@ impl TransformerModel {
             super::vision_transport::EP_CMD_VISION_STATE => self.ep_worker_recv_vision_state()?,
             super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => self.glm_long_receive_tail(seq)?,
             0xFFFFFFF6 => self.ep_worker_set_native_fence(seq)?,
+            crate::traits::EP_CMD_PC_PLANT => self.pc_plant_receive(seq)?,
             super::trait_impl::finish_leaf::EP_CMD_CACHE_SEQUENCE => {
                 self.finish_leaf_cache_command(seq)
             }
