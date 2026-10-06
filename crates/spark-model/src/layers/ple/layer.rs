@@ -337,7 +337,7 @@ impl PleLayer {
             self.inject(
                 st,
                 highway.offset(base * c * 4),
-                0,
+                (0, Some(base)),
                 n,
                 num_tokens,
                 gpu,
@@ -373,6 +373,8 @@ pub struct PleWeights {
 // Child module (not sibling): the aux fns read PleLayer private
 // fields, and only a CHILD module sees them. Same #[path] trick
 // qsa.rs uses for its tests.
+#[path = "ckpt.rs"]
+mod ckpt;
 #[path = "verify.rs"]
 mod verify;
 

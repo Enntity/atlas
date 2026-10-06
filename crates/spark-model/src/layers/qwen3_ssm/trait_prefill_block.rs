@@ -150,14 +150,7 @@ impl Qwen3SsmLayer {
         let ba_size = ctx.config.ssm_ba_size(); // 64
         let gates_buf = ctx.buffers.ssm_gates();
         let gate_stride = nv * 2; // FP32 elements per token
-        ops::dense_gemm_ba_gates_prefill(
-            ctx.gpu,
-            self.ba_gates_prefill_k,
-            normed,
-            &self.ssm.in_proj_ba,
-            self.ssm.a_log.weight,
-            self.ssm.dt_bias.weight,
-            gates_buf,
+        let dims = [
             k,
             ba_size as u32,
             h as u32,
@@ -165,8 +158,34 @@ impl Qwen3SsmLayer {
             gate_stride as u32,
             nv as u32,
             vpg as u32,
-            stream,
-        )?;
+        ];
+        let ptrs = [
+            normed,
+            self.ssm.in_proj_ba.weight,
+            self.ssm.a_log.weight,
+            self.ssm.dt_bias.weight,
+            gates_buf,
+        ];
+        // ATLAS_QWEN4EXP_PREFILL_BA_ROWS: the same bytes, two tokens a CTA.
+        if !ops::qwen4exp_prefill::try_ba_gates_rows(ctx.gpu, ptrs, dims, stream)? {
+            ops::dense_gemm_ba_gates_prefill(
+                ctx.gpu,
+                self.ba_gates_prefill_k,
+                normed,
+                &self.ssm.in_proj_ba,
+                self.ssm.a_log.weight,
+                self.ssm.dt_bias.weight,
+                gates_buf,
+                k,
+                ba_size as u32,
+                h as u32,
+                h as u32,
+                gate_stride as u32,
+                nv as u32,
+                vpg as u32,
+                stream,
+            )?;
+        }
         // Bisect tap: the gates as the recurrence will read them,
         // [g(nv), beta(nv)] FP32 per token. Everything upstream of the
         // recurrence except these is already verified, so this is the last
@@ -406,10 +425,29 @@ impl Qwen3SsmLayer {
 
         // ── 10. Output projection GEMM: [N, 4096] × [4096, 2048] → [N, 2048] ──
         let out_proj_buf = ctx.buffers.moe_output();
-        self.prefill_out_proj_dispatch(ctx, normed_out_buf, out_proj_buf, k, h, value_dim, stream)?;
-        // GDN HeadParallel: reduce the row-parallel partial out_proj across TP
-        // ranks (num_tokens × h BF16) before the residual add. No-op at tp=1.
-        self.ssm_tp_all_reduce(out_proj_buf, num_tokens, ctx, stream)?;
+        // ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE: under SP, out_proj by row
+        // ranges, the peer's window first, its reduce-scatter on the wire
+        // while the rest is projected (`layers::qwen4exp_sp_pipe`).
+        if !self.out_proj_reduce_scatter_piped(
+            ctx,
+            normed_out_buf,
+            out_proj_buf,
+            [num_tokens, value_dim],
+            stream,
+        )? {
+            self.prefill_out_proj_dispatch(
+                ctx,
+                normed_out_buf,
+                out_proj_buf,
+                k,
+                h,
+                value_dim,
+                stream,
+            )?;
+            // GDN HeadParallel: reduce the row-parallel partial out_proj across TP
+            // ranks (num_tokens × h BF16) before the residual add. No-op at tp=1.
+            self.ssm_tp_all_reduce(out_proj_buf, num_tokens, ctx, stream)?;
+        }
         // ATLAS_GDN_DUMP hook: SSM out_proj output — drift attribution.
         super::debug::maybe_dump_gdn_buf(
             ctx.gpu,

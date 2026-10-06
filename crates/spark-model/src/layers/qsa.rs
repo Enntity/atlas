@@ -39,6 +39,8 @@ mod qsa_decode_select;
 mod qsa_free;
 #[path = "qsa_select.rs"]
 mod qsa_select;
+#[path = "qsa_select_sp.rs"]
+pub mod qsa_select_sp;
 #[path = "qsa_staged.rs"]
 mod qsa_staged;
 pub use qsa_staged::{StagedIngest, staged_ingest};

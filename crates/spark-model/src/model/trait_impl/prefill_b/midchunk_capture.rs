@@ -79,13 +79,16 @@ pub(in crate::model) struct MidCapturePlan {
     pub h_dsts_early: Vec<DevicePtr>,
     /// Per-SSM-layer conv_state destination for the `tb - bs` slot.
     pub conv_dsts_early: Vec<DevicePtr>,
+    /// A qwen4_exp in-pass checkpoint (`qwen4exp_ckpt`): registered by its
+    /// own finalize, and compatible with the sequence-parallel split.
+    pub ckpt: bool,
 }
 
 impl TransformerModel {
     /// Reserve a Marconi snapshot slot, reclaiming one from the cache on
     /// exhaustion. Returns `None` only when the pool is full and nothing is
     /// evictable — the caller then degrades gracefully (fewer/no captures).
-    fn reserve_snapshot_slot(
+    pub(super) fn reserve_snapshot_slot(
         &self,
         session_hash: u64,
         kv_cache: &mut PagedKvCache,
@@ -328,6 +331,7 @@ impl TransformerModel {
             tb_early,
             h_dsts_early,
             conv_dsts_early,
+            ckpt: false,
         })
     }
 

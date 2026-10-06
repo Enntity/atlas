@@ -98,7 +98,9 @@ impl PleLayer {
 
     /// Gate, conv and highway add for `n` rows of ONE sequence: projections at
     /// scratch row `srow`, highway rows at `hspan`. `width` is the sequence's
-    /// whole forward width.
+    /// whole forward width. `at = (srow, base)`: `base` is the span's first
+    /// forward row when a prefill checkpoint pass may capture the conv carry
+    /// inside it (`conv_span`), `None` on the batched verify/decode rows.
     ///
     /// The conv carry is the one piece of PLE state a speculative verify has
     /// to be able to rewind, so at verify widths the launch is split per row
@@ -112,7 +114,7 @@ impl PleLayer {
         &self,
         st: &mut PleSeqState,
         hspan: DevicePtr,
-        srow: usize,
+        (srow, base): (usize, Option<usize>),
         n: usize,
         width: usize,
         gpu: &dyn GpuBackend,
@@ -167,7 +169,10 @@ impl PleLayer {
             }
             st.verify_snap_rows = width;
         } else {
-            conv(n, 0)?;
+            match base {
+                Some(base) => self.conv_span(st, srow, base, n, gpu, stream)?,
+                None => conv(n, 0)?,
+            }
             st.verify_snap_rows = 0;
         }
         ops::ple_add_highway(gpu, self.add_k, out, hspan, (n * c) as u32, stream)
@@ -241,7 +246,7 @@ impl PleLayer {
             self.inject(
                 s.st,
                 highway.offset(s.row0 * c * 4),
-                srow,
+                (srow, None),
                 n,
                 n,
                 gpu,

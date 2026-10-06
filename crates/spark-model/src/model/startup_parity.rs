@@ -359,6 +359,27 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_SP", || {
         Ok(super::qwen4exp_prefill_sp::requested() as u64)
     }),
+    // Its slab-pipelined exchanges (gathers; `_RS_PIPE`: the MoE reduce-scatter)
+    // move the same rows in pieces: a piecewise rank never pairs a whole one.
+    // `_MIDCHUNK_CKPT` runs a prompt's last chunk as one pass, not two;
+    // `_QSA_SPLIT` / `_SP_ROUTE` swap QSA block lists / MoE routes.
+    (
+        "ATLAS_QWEN4EXP_PREFILL_SP_PIPE/_RS_PIPE/_MIDCHUNK_CKPT/_QSA_SPLIT/_SP_ROUTE",
+        || {
+            use crate::layers::moe::forward_prefill_route_sp as r;
+            use crate::layers::{
+                qsa::qsa_select_sp as q, qwen4exp_ckpt as c, qwen4exp_sp_pipe as p,
+            };
+            let bits = [
+                p::requested(),
+                p::rs_requested(),
+                c::requested(),
+                q::requested(),
+                r::requested(),
+            ];
+            Ok(bits.iter().enumerate().map(|(i, &b)| (b as u64) << i).sum())
+        },
+    ),
     // The qwen4_exp verify lane (per-row MoE all-reduces in the GDN layers'
     // verify) and the check's serial steps (their collectives).
     ("ATLAS_QWEN4EXP_EXACT_VERIFY", || {
