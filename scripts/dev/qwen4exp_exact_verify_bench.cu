@@ -15,7 +15,7 @@
 //   NVFP4 K/V      w4a16_gemv_dual  vs  w4a16_gemv_dual_batch2/3  (attention K/V: the default
 //                                       verify arm) and vs w4a16_gemv_batch2/3/4 per projection
 //   BF16 tile GEMM dense_gemm_bf16_pipelined M=1 vs M=2/3/4   (PLE key/value projections)
-//   mHC collapse   hc_pre_stage/down/finish_x4, hc_post (default) and the
+//   mHC collapse   hc_pre_stage/down/finish_x4, hc_post (default, T=2..8) and the
 //                  _vec kernels (ATLAS_QWEN4EXP_HC_FAST): T=2/3/4 vs T=1 per row
 //   BF16 LM head   dense_gemv_bf16 vs dense_gemm_bf16 M=3/4 (the default K=3/4 head;
 //                  informational — the exact verify projects `_batchm` rows)
@@ -468,11 +468,15 @@ static void hc_rows() {
     void* inject_w = dput(rand_bf16((size_t)HC * HCD, 0.02f));
     for (int vec = 0; vec < 2; vec++) {
         for (float sc : SCALES) {
-            float* streams = dput(rand_f32(4 * (size_t)HCD, sc));
-            void* bo = dput(rand_bf16(4 * (size_t)H, sc));
+            // T up to 8: ATLAS_QWEN4EXP_BATCH_FAST runs batches of up to 8 rows
+            // (and wider ones in 8-row chunks) on the split path; the _vec
+            // kernels serve T <= 4.
+            const unsigned tmax = vec ? 4 : 8;
+            float* streams = dput(rand_f32(tmax * (size_t)HCD, sc));
+            void* bo = dput(rand_bf16(tmax * (size_t)H, sc));
             std::vector<HcOut> one;
-            for (unsigned r = 0; r < 4; r++) one.push_back(hc_chain(vec, 1, r, streams, norm_w, down_w, up_w, inject_w, bo));
-            for (unsigned T = 2; T <= 4; T++) {
+            for (unsigned r = 0; r < tmax; r++) one.push_back(hc_chain(vec, 1, r, streams, norm_w, down_w, up_w, inject_w, bo));
+            for (unsigned T = 2; T <= tmax; T++) {
                 HcOut b = hc_chain(vec, T, 0, streams, norm_w, down_w, up_w, inject_w, bo);
                 auto cat = [&](std::vector<unsigned char> HcOut::*f) {
                     std::vector<unsigned char> v;

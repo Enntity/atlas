@@ -199,7 +199,7 @@ impl Qwen3SsmLayer {
 
         stage!("gdn_block");
 
-        ops::hc_pre_site(
+        ops::hc_pre_site_rows(
             ctx.gpu,
             self.hc_pre_k,
             streams,
@@ -212,6 +212,7 @@ impl Qwen3SsmLayer {
             n,
             h as u32,
             eps,
+            ctx.levers.qwen4exp_batch_fast,
             stream,
         )?;
         stage!("hc_pre_attn");
@@ -276,7 +277,7 @@ impl Qwen3SsmLayer {
 
         // ── MoE sublayer ──
         let normed2 = ctx.buffers.norm_output();
-        ops::hc_pre_site(
+        ops::hc_pre_site_rows(
             ctx.gpu,
             self.hc_pre_k,
             streams,
@@ -289,6 +290,7 @@ impl Qwen3SsmLayer {
             n,
             h as u32,
             eps,
+            ctx.levers.qwen4exp_batch_fast,
             stream,
         )?;
 

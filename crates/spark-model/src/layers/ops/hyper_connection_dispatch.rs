@@ -125,6 +125,78 @@ pub fn hc_pre_site(
     }
 }
 
+/// Rows the decode-shaped (split) low-rank collapse serves in one launch
+/// (`hyper_connection_lowrank::HC_DECODE_MAX_T`); wider batches take the
+/// GEMM formulation, which rounds `normed` to BF16 — another function of the
+/// row than the decode's.
+pub const HC_SPLIT_MAX_ROWS: u32 = 8;
+
+/// [`hc_pre_site`] for a multi-row decode or verify step. With `exact_rows`
+/// (`ATLAS_QWEN4EXP_BATCH_FAST`) a low-rank collapse of more than
+/// [`HC_SPLIT_MAX_ROWS`] rows runs as split-path chunks of at most that many
+/// rows, each row then the single-row decode collapse's bytes (the split
+/// kernels' per-row arithmetic does not depend on the row count). Anything
+/// else is `hc_pre_site` unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_pre_site_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    streams: DevicePtr,
+    site: &HcSiteWeights,
+    hc: &HcWeights,
+    y_out: DevicePtr,
+    post_out: DevicePtr,
+    comb_out: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    norm_eps: f32,
+    exact_rows: bool,
+    stream: u64,
+) -> Result<()> {
+    if !(exact_rows
+        && site.lowrank.is_some()
+        && num_tokens > HC_SPLIT_MAX_ROWS
+        && !scratch.is_null())
+    {
+        return hc_pre_site(
+            gpu,
+            kernel,
+            streams,
+            site,
+            hc,
+            y_out,
+            post_out,
+            comb_out,
+            scratch,
+            num_tokens,
+            hidden_size,
+            norm_eps,
+            stream,
+        );
+    }
+    let (m, h) = (hc.hc_mult, hidden_size as usize);
+    for t0 in (0..num_tokens).step_by(HC_SPLIT_MAX_ROWS as usize) {
+        let t = t0 as usize;
+        hc_pre_site(
+            gpu,
+            kernel,
+            streams.offset(t * m * h * 4),
+            site,
+            hc,
+            y_out.offset(t * h * 2),
+            post_out.offset(t * m * 4),
+            comb_out.offset(t * m * m * 4),
+            scratch,
+            (num_tokens - t0).min(HC_SPLIT_MAX_ROWS),
+            hidden_size,
+            norm_eps,
+            stream,
+        )?;
+    }
+    Ok(())
+}
+
 /// Inject the block output back into every stream. `out` may alias
 /// `residual`.
 ///
@@ -259,6 +331,47 @@ pub fn hc_post_pre_site(
         norm_eps,
         stream,
     )
+}
+
+/// [`hc_head_site`] for a multi-row step, chunked like [`hc_pre_site_rows`].
+#[allow(clippy::too_many_arguments)]
+pub fn hc_head_site_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    streams: DevicePtr,
+    head: &HcHeadWeights,
+    hc: &HcWeights,
+    y_out: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    norm_eps: f32,
+    exact_rows: bool,
+    stream: u64,
+) -> Result<()> {
+    let chunk = if exact_rows && head.lowrank.is_some() && !scratch.is_null() {
+        HC_SPLIT_MAX_ROWS
+    } else {
+        num_tokens.max(1)
+    };
+    let (m, h) = (hc.hc_mult, hidden_size as usize);
+    for t0 in (0..num_tokens).step_by(chunk as usize) {
+        let t = t0 as usize;
+        hc_head_site(
+            gpu,
+            kernel,
+            streams.offset(t * m * h * 4),
+            head,
+            hc,
+            y_out.offset(t * h * 2),
+            scratch,
+            (num_tokens - t0).min(chunk),
+            hidden_size,
+            norm_eps,
+            stream,
+        )?;
+    }
+    Ok(())
 }
 
 /// The model-level final collapse before the LM head.

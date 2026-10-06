@@ -343,7 +343,7 @@ impl Qwen3AttentionLayer {
         // Standalone attention (no FFN)
         if self.ffn.is_none() {
             if is_last_layer && let Some(ref head) = hc.head {
-                ops::hc_head_site(
+                ops::hc_head_site_rows(
                     ctx.gpu,
                     self.hc_head_k,
                     hc_streams,
@@ -354,6 +354,7 @@ impl Qwen3AttentionLayer {
                     n as u32,
                     h as u32,
                     eps,
+                    ctx.levers.qwen4exp_batch_fast,
                     stream,
                 )?;
                 if diag_this {
