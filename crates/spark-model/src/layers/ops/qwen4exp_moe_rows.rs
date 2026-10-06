@@ -42,13 +42,17 @@ const SD_RC: u32 = 2;
 /// (QU_INTER; the kernel traps on any other).
 pub const QWEN4EXP_MOE_ROWS_SD_INTER: u32 = 640;
 
-/// The three kernel handles, all 0 unless the exact batching lane is on for a
-/// qwen4_exp model and the target ships the module.
+/// The kernel handles, all 0 unless the exact batching lane is on for a
+/// qwen4_exp model and the target ships the module; `topk`/`blend` (the
+/// common modules' multi-row twins of `moe_topk_softmax` and
+/// `moe_weighted_sum_blend`) only under `ATLAS_QWEN4EXP_BATCH_SMALL=1` too.
 #[derive(Clone, Copy, Debug)]
 pub struct Qwen4ExpMoeRows {
     pub plan: KernelHandle,
     pub gate_up: KernelHandle,
     pub silu_down: KernelHandle,
+    pub topk: KernelHandle,
+    pub blend: KernelHandle,
 }
 
 impl Qwen4ExpMoeRows {
@@ -56,6 +60,8 @@ impl Qwen4ExpMoeRows {
         plan: KernelHandle(0),
         gate_up: KernelHandle(0),
         silu_down: KernelHandle(0),
+        topk: KernelHandle(0),
+        blend: KernelHandle(0),
     };
 
     pub fn resolve(gpu: &dyn GpuBackend, config: &ModelConfig) -> Self {
@@ -67,15 +73,97 @@ impl Qwen4ExpMoeRows {
             return Self::OFF;
         }
         let m = "qwen4exp_moe_rows";
+        let small = crate::model::qwen4exp_batch_fast::small_requested();
         Self {
             plan: try_kernel(gpu, m, "qwen4exp_moe_rows_plan"),
             gate_up: try_kernel(gpu, m, "qwen4exp_moe_rows_gate_up"),
             silu_down: try_kernel(gpu, m, "qwen4exp_moe_rows_silu_down"),
+            topk: if small {
+                try_kernel(gpu, "moe_topk", "moe_topk_softmax_rows")
+            } else {
+                KernelHandle(0)
+            },
+            blend: if small {
+                try_kernel(gpu, "moe_expert_gemv", "moe_weighted_sum_blend_rows")
+            } else {
+                KernelHandle(0)
+            },
         }
     }
 
     pub fn ready(&self) -> bool {
         self.plan.0 != 0 && self.gate_up.0 != 0 && self.silu_down.0 != 0
+    }
+
+    /// `moe_topk_softmax` on each of `rows` router rows (`logits_stride`
+    /// BF16 apart) in one launch, `expert_indices`/`expert_weights`
+    /// `[rows, top_k]`, each row the single-row kernel's bytes. `Ok(false)`,
+    /// nothing launched, without the kernel: the caller loops.
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        gate_logits: DevicePtr,
+        expert_indices: DevicePtr,
+        expert_weights: DevicePtr,
+        (num_experts, top_k, rows, logits_stride): (u32, u32, u32, u32),
+        normalize: bool,
+        stream: u64,
+    ) -> Result<bool> {
+        if self.topk.0 == 0 {
+            return Ok(false);
+        }
+        KernelLaunch::new(gpu, self.topk)
+            .grid([rows, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(gate_logits)
+            .arg_ptr(expert_indices)
+            .arg_ptr(expert_weights)
+            .arg_u32(num_experts)
+            .arg_u32(top_k)
+            .arg_u32(normalize as u32)
+            .arg_u32(logits_stride)
+            .launch(stream)?;
+        Ok(true)
+    }
+
+    /// `moe_weighted_sum_blend` on each of `rows` rows in one launch: row
+    /// `r` blends `expert_out` rows `[r * top_k, (r + 1) * top_k)` with
+    /// `expert_weights` row `r` into `output` row `r`, gated by `input` row
+    /// `r`, against the shared row at `shared_out + r * shared_stride`
+    /// elements (0: one row for all; null reads +0.0). `Ok(false)`, nothing
+    /// launched, without the kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blend_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        output: DevicePtr,
+        expert_out: DevicePtr,
+        expert_weights: DevicePtr,
+        (shared_out, shared_stride): (DevicePtr, u32),
+        input: DevicePtr,
+        gate_weight: DevicePtr,
+        (hidden, top_k, rows): (u32, u32, u32),
+        stream: u64,
+    ) -> Result<bool> {
+        if self.blend.0 == 0 {
+            return Ok(false);
+        }
+        KernelLaunch::new(gpu, self.blend)
+            .grid([div_ceil(hidden, 256), rows, 1])
+            .block([256, 1, 1])
+            .arg_ptr(output)
+            .arg_ptr(expert_out)
+            .arg_ptr(expert_weights)
+            .arg_ptr(shared_out)
+            .arg_ptr(input)
+            .arg_ptr(gate_weight)
+            .arg_u32(hidden)
+            .arg_u32(top_k)
+            .arg_u32(hidden)
+            .arg_u32(shared_stride)
+            .launch(stream)?;
+        Ok(true)
     }
 
     /// `order[rank] = q` for the `slots` entries of `expert_indices`, ranked

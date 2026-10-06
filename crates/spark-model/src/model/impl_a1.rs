@@ -172,6 +172,7 @@ impl TransformerModel {
             super::qwen4exp_mtp_depth::lever(&config.model_type, levers.qwen4exp_exact_verify)?;
         levers.qwen4exp_batch_fast = super::qwen4exp_batch_fast::lever(&config.model_type)?;
         if levers.qwen4exp_batch_fast {
+            levers.qwen4exp_batch_small = super::qwen4exp_batch_fast::small_lever();
             levers.qwen4exp_batch_bisect = super::qwen4exp_batch_fast::bisect_requested();
             if levers.qwen4exp_batch_bisect != 0 {
                 tracing::warn!(

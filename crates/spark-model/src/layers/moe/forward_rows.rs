@@ -24,7 +24,9 @@
 //!   shared expert — streams from DRAM once; a silu/down CTA stages one tile
 //!   of an expert once for every row that picked it, each output the
 //!   single-row kernel's operation sequence. Each row's blend is the
-//!   single-row blend.
+//!   single-row blend. Under `ATLAS_QWEN4EXP_BATCH_SMALL` the rows' top-k
+//!   and blends are one launch each (`moe_topk_softmax_rows`,
+//!   `moe_weighted_sum_blend_rows`: a block per row of the single-row body).
 //! * **Per-row local** (anything else): each row's local part is
 //!   [`MoeLayer::forward_row_local`], the same calls on the same buffers.
 //!
@@ -195,7 +197,20 @@ impl MoeLayer {
         let indices = scratch;
         let weights = scratch.offset(slots * 4);
         let order = scratch.offset(2 * slots * 4);
-        for r in 0..rows {
+        let k = &self.qwen4exp_moe_rows;
+        // ATLAS_QWEN4EXP_BATCH_SMALL: every row's top-k in one launch, each
+        // the single-row kernel's bytes; else one launch a row.
+        let topk_once = ctx.levers.qwen4exp_batch_small
+            && k.topk_rows(
+                ctx.gpu,
+                gate_logits,
+                indices,
+                weights,
+                (num_experts as u32, top_k as u32, rows as u32, router_n),
+                ctx.config.norm_topk_prob,
+                stream,
+            )?;
+        for r in (0..rows).filter(|_| !topk_once) {
             ops::moe_topk_softmax(
                 ctx.gpu,
                 self.moe_topk,
@@ -208,7 +223,6 @@ impl MoeLayer {
                 stream,
             )?;
         }
-        let k = &self.qwen4exp_moe_rows;
         k.plan(ctx.gpu, indices, order, slots, stream)?;
 
         let expert_gate_out = ctx.buffers.expert_gate_out();
@@ -259,7 +273,25 @@ impl MoeLayer {
         } else {
             DevicePtr::NULL
         };
-        for r in 0..rows {
+        // ATLAS_QWEN4EXP_BATCH_SMALL: the rows' blends in one launch (the EP
+        // zero row shared at stride 0).
+        let blend_once = ctx.levers.qwen4exp_batch_small
+            && k.blend_rows(
+                ctx.gpu,
+                output,
+                expert_down_out,
+                weights,
+                if is_ep {
+                    (zero_row, 0)
+                } else {
+                    (shared_out, h32)
+                },
+                input,
+                self.weights.shared_expert_gate.weight,
+                (h32, top_k32, rows32),
+                stream,
+            )?;
+        for r in (0..rows).filter(|_| !blend_once) {
             ops::moe_weighted_sum_blend(
                 ctx.gpu,
                 self.moe_weighted_sum_blend,

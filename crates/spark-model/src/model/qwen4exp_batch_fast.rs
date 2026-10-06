@@ -54,6 +54,21 @@
 //! Q/K/V and o_proj per row, 32 attention core per row, 64 LM head per row
 //! (`ops::BISECT_*`).
 //!
+//! `ATLAS_QWEN4EXP_BATCH_SMALL=1` (default off; needs the lane) takes the
+//! small kernels the table above still runs once per row into one launch
+//! each, every row the bytes of its single-row launch
+//! (`scripts/dev/qwen4exp_batch_small_bench.cu`):
+//!
+//! | per row (lane) | one launch (BATCH_SMALL) |
+//! |---|---|
+//! | `moe_topk_softmax` | `moe_topk_softmax_rows`, a block per row, the single-row lower-index tie-break (not `moe_topk_softmax_batched`'s) |
+//! | `moe_weighted_sum_blend` | `moe_weighted_sum_blend_rows`, blockIdx.y the row |
+//! | GDN `dense_gemv_ba_gates`, `causal_conv1d_update_l2norm_f32`, `gated_delta_rule_decode_f32`, `gated_rms_norm_f32_input_sigmoid` per sequence | `qwen4exp_gdn_decode_fused_rows`, up to 8 sequences a launch, each on its own state: the exact fused step of `ATLAS_QWEN4EXP_DECODE_FUSE` |
+//!
+//! An 8-row decode step drops from 8 x (48 + 48 + 36 x 4) = 1,920 of these
+//! launches to 48 + 48 + 36 = 132 (240 a row to 16.5). It changes no
+//! collective, so the ranks need not agree on it (no startup-parity entry).
+//!
 //! Refused beside `ATLAS_W4A16_TC=1`: the tensor-core GEMV tiers it selects
 //! are not the scalar GEMV's arithmetic.
 
@@ -89,6 +104,24 @@ fn parse_mask(v: Option<&str>) -> u32 {
                 .map_or_else(|| v.parse().ok(), |h| u32::from_str_radix(h, 16).ok())
         })
         .unwrap_or(0)
+}
+
+/// `ATLAS_QWEN4EXP_BATCH_SMALL=1`, read once.
+pub(crate) fn small_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_BATCH_SMALL").as_deref() == Ok("1"))
+}
+
+/// The model's `qwen4exp_batch_small` lever, asked once the lane is on.
+pub(crate) fn small_lever() -> bool {
+    let on = small_requested();
+    if on {
+        tracing::info!(
+            "qwen4_exp exact small-kernel batching ON (ATLAS_QWEN4EXP_BATCH_SMALL=1): MoE \
+             top-k, MoE blend and the GDN step one launch over the rows"
+        );
+    }
+    on
 }
 
 /// `ATLAS_QWEN4EXP_BATCH_FAST_CHECK=1`, read once.
