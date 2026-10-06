@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The QSA carry grows on demand and keeps every live byte.
+//! The pooled-key carry grows on demand and keeps every live byte.
 
 use super::*;
 use spark_runtime::gpu::mock::MockGpuBackend;
 
-const HD: usize = 8;
+pub(in crate::layers::qsa) const HD: usize = 8;
 
-fn indexer(gpu: &MockGpuBackend, max_seq_len: usize) -> QsaIndexer {
+pub(in crate::layers::qsa) fn indexer(gpu: &MockGpuBackend, max_seq_len: usize) -> QsaIndexer {
     QsaIndexer::new(
         DevicePtr::NULL,
         DevicePtr::NULL,
@@ -28,7 +28,7 @@ fn indexer(gpu: &MockGpuBackend, max_seq_len: usize) -> QsaIndexer {
     .unwrap()
 }
 
-fn bytes(n: usize, seed: u32) -> Vec<u8> {
+pub(in crate::layers::qsa) fn bytes(n: usize, seed: u32) -> Vec<u8> {
     (0..n as u32)
         .map(|v| ((v * 7 + seed) % 251) as u8)
         .collect()
@@ -50,32 +50,30 @@ fn a_fresh_carry_holds_nothing_until_reserved() {
 }
 
 #[test]
-fn growth_keeps_the_ingested_keys_and_pooled_blocks() {
+fn growth_keeps_the_pooled_blocks() {
     let gpu = MockGpuBackend::new();
     let qsa = indexer(&gpu, 1 << 16);
     let mut st = qsa.new_seq_state(&gpu).unwrap();
     qsa.reserve(&mut st, 4096, &gpu, 0).unwrap();
-    let (ingested, pooled) = (4000usize, 1000usize);
-    let raw = bytes(ingested * HD * 2, 3);
+    let pooled = 1000usize;
     let block = bytes(pooled * HD * 2, 5);
-    gpu.copy_h2d(&raw, st.raw_keys).unwrap();
     gpu.copy_h2d(&block, st.block_keys).unwrap();
-    (st.ingested, st.pooled) = (ingested, pooled);
+    (st.ingested, st.pooled) = (4000, pooled);
 
-    let old = (st.raw_keys, st.block_keys);
+    let old = st.block_keys;
     qsa.reserve(&mut st, 4097, &gpu, 0).unwrap();
     assert_eq!(st.cap, 8192, "at least half again, granule-aligned");
-    assert_ne!((st.raw_keys, st.block_keys), old, "moved");
-    assert!(
-        gpu.read_alloc(old.0).is_none() && gpu.read_alloc(old.1).is_none(),
-        "old freed"
-    );
-    assert_eq!(&gpu.read_alloc(st.raw_keys).unwrap()[..raw.len()], &raw[..]);
+    assert_ne!(st.block_keys, old, "moved");
+    assert!(gpu.read_alloc(old).is_none(), "old freed");
     assert_eq!(
         &gpu.read_alloc(st.block_keys).unwrap()[..block.len()],
         &block[..]
     );
-    assert_eq!((st.ingested, st.pooled), (ingested, pooled));
+    assert_eq!(
+        gpu.read_alloc(st.block_keys).unwrap().len(),
+        8192 / 4 * HD * 2
+    );
+    assert_eq!((st.ingested, st.pooled), (4000, pooled));
 }
 
 #[test]
@@ -93,22 +91,23 @@ fn growth_stops_at_the_served_capacity() {
 }
 
 #[test]
-fn free_releases_and_is_idempotent() {
+fn free_releases_everything_and_is_idempotent() {
     let gpu = MockGpuBackend::new();
     let qsa = indexer(&gpu, 1 << 16);
     let mut st = qsa.new_seq_state(&gpu).unwrap();
     qsa.free_seq_state(&mut st, &gpu).unwrap(); // nothing allocated yet
     qsa.reserve(&mut st, 10, &gpu, 0).unwrap();
-    let raw = st.raw_keys;
+    qsa.raw_room(&mut st, 10, &gpu, 0).unwrap();
+    let held = [st.block_keys, st.raw.bufs[0], st.raw.bufs[1]];
     qsa.free_seq_state(&mut st, &gpu).unwrap();
-    assert!(gpu.read_alloc(raw).is_none());
-    assert_eq!(st.cap, 0);
+    assert!(held.iter().all(|&p| gpu.read_alloc(p).is_none()));
+    assert_eq!((st.cap, st.raw.cap), (0, 0));
     qsa.free_seq_state(&mut st, &gpu).unwrap();
 }
 
 #[test]
-fn bytes_per_token_is_a_raw_key_plus_a_pooled_share() {
+fn bytes_per_token_is_the_pooled_share() {
     let gpu = MockGpuBackend::new();
-    // hd 8, ratio 4: 16 B raw + 4 B pooled.
-    assert_eq!(indexer(&gpu, 256).bytes_per_token(), 20);
+    // hd 8, ratio 4: a 16 B pooled row per 4 tokens.
+    assert_eq!(indexer(&gpu, 256).bytes_per_token(), 4);
 }

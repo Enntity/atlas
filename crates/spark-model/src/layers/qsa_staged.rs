@@ -130,13 +130,9 @@ impl QsaIndexer {
             "QSA staged commit: row {row} past the staging rows"
         );
         self.reserve(st, pos + 1, gpu, stream)?;
+        self.raw_room(st, 1, gpu, stream)?;
         let hd = self.hd as usize;
-        gpu.copy_d2d_async(
-            self.staged_key(row),
-            st.raw_keys.offset(pos * hd * 2),
-            hd * 2,
-            stream,
-        )?;
+        gpu.copy_d2d_async(self.staged_key(row), self.raw_slot(st, pos), hd * 2, stream)?;
         st.ingested = pos + 1;
         self.pool_new_blocks(st, gpu, stream)
     }
