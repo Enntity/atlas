@@ -65,9 +65,11 @@ pub struct QsaSeqState {
     pooled: usize,
     /// Identity block table upload done (needs block_size, known lazily).
     table_len: usize,
-    /// [max_tokens, hd] BF16 — this sequence's raw indexer keys.
+    /// Token capacity of the buffers below; grown on demand (`qsa_free.rs`).
+    cap: usize,
+    /// [cap, hd] BF16 — this sequence's raw indexer keys.
     raw_keys: DevicePtr,
-    /// [max_tokens/ratio, hd] BF16 — this sequence's pooled block keys.
+    /// [cap/ratio, hd] BF16 — this sequence's pooled block keys.
     block_keys: DevicePtr,
 }
 
@@ -181,12 +183,10 @@ impl QsaIndexer {
             Some(n) => n,
             None => max_seq_len,
         };
-        let per_seq_bytes = max_tokens * hd * 2 + max_tokens / ratio * hd * 2;
         tracing::info!(
-            "QSA: indexer capacity {} tokens (max_seq_len={}, per-seq {} B)",
-            max_tokens,
-            max_seq_len,
-            per_seq_bytes
+            "QSA: indexer capacity {max_tokens} tokens (max_seq_len={max_seq_len}); \
+             per-seq keys grow on demand, {} B/token",
+            hd * 2 + (hd * 2).div_ceil(ratio)
         );
         let block_topk = budget / ratio;
         let qk_width = (n_heads + 1) * hd;
@@ -281,13 +281,7 @@ impl QsaIndexer {
              re-ingest cached prefixes.",
             st.ingested
         );
-        anyhow::ensure!(
-            seq_start + num_tokens <= self.max_tokens,
-            "QSA: {} tokens exceeds the indexer capacity {} — it derives \
-             from --max-seq-len (ATLAS_QSA_MAX_TOKENS overrides)",
-            seq_start + num_tokens,
-            self.max_tokens
-        );
+        self.reserve(st, seq_start + num_tokens, gpu, stream)?;
 
         let hd = self.hd as usize;
         let qkw = self.qk_width();
@@ -371,12 +365,7 @@ impl QsaIndexer {
              cache lost sync (prefix-cache skip or a rewound sequence)",
             st.ingested
         );
-        anyhow::ensure!(
-            pos < self.max_tokens,
-            "QSA: pos {pos} >= indexer capacity {} — it derives from \
-             --max-seq-len (ATLAS_QSA_MAX_TOKENS overrides)",
-            self.max_tokens
-        );
+        self.reserve(st, pos + 1, gpu, stream)?;
 
         let hd = self.hd as usize;
         let qkw = self.qk_width();

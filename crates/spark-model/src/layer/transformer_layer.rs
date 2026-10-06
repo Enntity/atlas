@@ -279,6 +279,28 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// Device bytes per token of per-sequence state this layer keeps OUTSIDE
+    /// the paged KV pool and grows with the sequence (the QSA indexer carry).
+    /// The KV budget charges it per pool token, so the pool is sized for the
+    /// state that rides along with its tokens.
+    fn aux_bytes_per_token(&self) -> usize {
+        0
+    }
+
+    /// Grow that state to hold positions `0..tokens`. Called with the block
+    /// reservation, before the forward pass, so running out of memory here is
+    /// an agreed, retryable refusal on every rank (`kv_admission`) instead of
+    /// a mid-forward error on one.
+    fn reserve_aux(
+        &self,
+        _state: &mut dyn LayerState,
+        _tokens: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Longest visible context at which this layer can serve a BATCHED
     /// (K-token) verify, if it is bounded at all.
     ///

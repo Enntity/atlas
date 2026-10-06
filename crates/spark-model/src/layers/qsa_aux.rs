@@ -64,7 +64,7 @@ impl QsaIndexer {
             blob.len() == 16 + ingested * hd * 2,
             "QSA aux blob size mismatch"
         );
-        anyhow::ensure!(ingested <= self.max_tokens, "QSA aux exceeds key cache");
+        self.reserve(st, ingested, gpu, stream)?;
         if ingested > 0 {
             gpu.copy_h2d_async(&blob[16..], st.raw_keys, stream)?;
         }
@@ -161,6 +161,7 @@ mod tests {
             ingested,
             pooled: 0,
             table_len: 0,
+            cap: 256,
             raw_keys: gpu.alloc(256 * 8 * 2).unwrap(),
             block_keys: gpu.alloc(64 * 8 * 2).unwrap(),
         };
@@ -209,6 +210,7 @@ mod tests {
             ingested,
             pooled,
             table_len: 0,
+            cap: 256,
             raw_keys: gpu.alloc(256 * 8 * 2).unwrap(),
             block_keys: gpu.alloc(64 * 8 * 2).unwrap(),
         }

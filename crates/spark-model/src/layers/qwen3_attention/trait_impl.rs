@@ -121,6 +121,26 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.qsa.is_some()
     }
 
+    fn aux_bytes_per_token(&self) -> usize {
+        self.qsa.as_ref().map_or(0, |q| q.bytes_per_token())
+    }
+
+    fn reserve_aux(
+        &self,
+        state: &mut dyn LayerState,
+        tokens: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let Some(qsa) = self.qsa.as_ref() else {
+            return Ok(());
+        };
+        let st = super::helpers::qsa_seq_state(qsa, state, gpu)?;
+        // Callers reserve whole KV blocks; the last one may reach past the
+        // served context, which no position ever will.
+        qsa.reserve(st, tokens.min(qsa.capacity()), gpu, stream)
+    }
+
     /// `None` when the batched path can serve an ACTIVE selection per row
     /// (`multi_seq/qsa_rows.rs`) — the same static allow-list the pre-mutation
     /// guard applies, so the scheduler and the layer cannot disagree.
