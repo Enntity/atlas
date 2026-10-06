@@ -3,7 +3,7 @@
 # Build the PTX the qwen4_exp exact-batching bench JIT-loads (production flags,
 # as crates/atlas-kernels compiles the qwen3.8-flash-next target), build the
 # bench, run it.
-#   scripts/dev/qwen4exp_batch_exact_bench.sh check|time
+#   scripts/dev/qwen4exp_batch_exact_bench.sh check|time|sweep
 # Run from the repository root on a GB10. See qwen4exp_batch_exact_bench.cu.
 set -euo pipefail
 out=${QB_BENCH_DIR:-/tmp/qb-exact-bench}
@@ -15,7 +15,9 @@ for stem in moe_shared_expert_fused dense_gemv_bf16 dense_gemv_bf16_batchm moe_p
   "$nvcc" "${flags[@]}" "kernels/gb10/common/$stem.cu" -o "$out/$stem.ptx" & pids+=($!)
 done
 for stem in qwen4exp_moe_rows; do
-  "$nvcc" "${flags[@]}" "kernels/gb10/qwen3.8-flash-next/nvfp4/$stem.cu" -o "$out/$stem.ptx" & pids+=($!)
+  # QU_SWEEP adds the unit kernels' sweep shapes; the production entry points
+  # are compiled exactly as without it.
+  "$nvcc" "${flags[@]}" -DQU_SWEEP "kernels/gb10/qwen3.8-flash-next/nvfp4/$stem.cu" -o "$out/$stem.ptx" & pids+=($!)
 done
 "$nvcc" -O3 -std=c++17 -arch=sm_121a scripts/dev/qwen4exp_batch_exact_bench.cu -lcuda \
   -o "$out/qwen4exp_batch_exact_bench" & pids+=($!)

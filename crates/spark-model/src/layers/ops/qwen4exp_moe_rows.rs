@@ -4,13 +4,17 @@
 //! for the originals-layout MoE decode kernels
 //! (`kernels/gb10/qwen3.8-flash-next/nvfp4/qwen4exp_moe_rows.cu`).
 //!
-//! One plan launch sorts the rows' `(row, slot)` entries by expert, then ONE
-//! gate/up and ONE silu/down launch run, per entry, the CTA body of
-//! `moe_expert_{gate_up,silu_down}_shared` — so every output byte is what
-//! one launch per row of those kernels writes — in an order that puts every
-//! row's pick of one expert, and every row's shared expert, back to back:
-//! the union of the rows' experts streams from DRAM once.
-//! `scripts/dev/qwen4exp_batch_exact_bench.cu` checks every output byte.
+//! One plan launch sorts the rows' `(row, slot)` entries by expert and marks
+//! the units (up to `QU_RMAX` entries of one expert), then ONE gate/up and
+//! ONE silu/down launch. gate/up runs, per entry, the CTA body of
+//! `moe_expert_gate_up_shared` in an order that puts every row's pick of one
+//! expert, and every row's shared expert, back to back (the union of the
+//! rows' experts streams from DRAM once). silu/down runs one CTA per
+//! 64-output tile of a unit: the tile's weights are copied to shared once
+//! and serve every row of the unit, each output the single-row kernel's
+//! operation sequence. Every output byte is what one launch per row of
+//! `moe_expert_{gate_up,silu_down}_shared` writes;
+//! `scripts/dev/qwen4exp_batch_exact_bench.cu` checks each one.
 
 use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
@@ -20,9 +24,23 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use crate::layers::try_kernel;
 use crate::weight_map::QuantizedWeight;
 
-/// Entries one plan launch sorts (its block is 128 threads; any count works,
-/// this only bounds the per-thread rank loop).
+/// Entries one plan launch sorts (QU_SLOTS_MAX: the plan stages them in
+/// shared memory).
 pub const QWEN4EXP_MOE_ROWS_MAX_SLOTS: usize = 1024;
+
+// The silu/down unit shape; each must match its define in
+// kernels/gb10/qwen3.8-flash-next/nvfp4/qwen4exp_moe_rows.cu.
+/// Entries of one expert a unit serves (QU_RMAX).
+const QU_RMAX: u32 = 8;
+/// Output rows per silu/down CTA (QU_SD_TILE).
+pub const QWEN4EXP_MOE_ROWS_SD_TILE: u32 = 64;
+/// silu/down warps per CTA (QU_SD_WARPS).
+const SD_WARPS: u32 = 8;
+/// Unit rows per activation chunk (QU_SD_RC).
+const SD_RC: u32 = 2;
+/// The only intermediate width the silu/down unit kernel is built for
+/// (QU_INTER; the kernel traps on any other).
+pub const QWEN4EXP_MOE_ROWS_SD_INTER: u32 = 640;
 
 /// The three kernel handles, all 0 unless the exact batching lane is on for a
 /// qwen4_exp model and the target ships the module.
@@ -76,7 +94,7 @@ impl Qwen4ExpMoeRows {
         );
         KernelLaunch::new(gpu, self.plan)
             .grid([1, 1, 1])
-            .block([128, 1, 1])
+            .block([256, 1, 1])
             .arg_ptr(expert_indices)
             .arg_ptr(order)
             .arg_u32(slots as u32)
@@ -135,7 +153,8 @@ impl Qwen4ExpMoeRows {
 
     /// `moe_expert_silu_down_shared` for `rows` rows in one launch: `output`
     /// `[rows * top_k, n]`, `sh_down_out` `[rows, n]`, reading the gate/up
-    /// rows [`Self::gate_up`] wrote.
+    /// rows [`Self::gate_up`] wrote. Needs `n` a multiple of
+    /// [`QWEN4EXP_MOE_ROWS_SD_TILE`] and `k == QWEN4EXP_MOE_ROWS_SD_INTER`.
     #[allow(clippy::too_many_arguments)]
     pub fn silu_down(
         &self,
@@ -153,10 +172,20 @@ impl Qwen4ExpMoeRows {
         (n, k, top_k, rows): (u32, u32, u32, u32),
         stream: u64,
     ) -> Result<()> {
+        ensure!(
+            n.is_multiple_of(QWEN4EXP_MOE_ROWS_SD_TILE) && k == QWEN4EXP_MOE_ROWS_SD_INTER,
+            "qwen4exp MoE rows silu/down: n {n}, k {k}"
+        );
+        // A grid row per QU_RMAX rows of the shared expert, then one per entry
+        // (the plan's unit heads; the others exit).
         KernelLaunch::new(gpu, self.silu_down)
-            .grid([div_ceil(n, 8), rows * top_k + rows, 1])
-            .block([128, 1, 1])
-            .shared_mem(k * 4)
+            .grid([
+                n / QWEN4EXP_MOE_ROWS_SD_TILE,
+                div_ceil(rows, QU_RMAX) + rows * top_k,
+                1,
+            ])
+            .block([SD_WARPS * 32, 1, 1])
+            .shared_mem(QWEN4EXP_MOE_ROWS_SD_TILE * (k / 2 + k / 16) + SD_RC * k * 4)
             .arg_ptr(gate_out)
             .arg_ptr(up_out)
             .arg_ptr(down_ptrs.0)

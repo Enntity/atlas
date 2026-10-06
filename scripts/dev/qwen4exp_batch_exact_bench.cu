@@ -7,31 +7,36 @@
 //
 //   MoE rows pair   qwen4exp_moe_rows_{plan,gate_up,silu_down} over R rows
 //                   vs R launches each of moe_expert_{gate_up,silu_down}_shared
-//                   (R = 1..8; independent and overlapping routes; TP1 tables
-//                   and EP2-style half-NULL tables; every output byte, routed
-//                   and shared)
+//                   (R = 1..8, 12, 16; independent, overlapping and identical
+//                   routes; TP1 tables and EP2-style half-NULL tables; every
+//                   output byte, routed and shared; `sweep` adds the silu/down
+//                   unit kernel's other shapes, QU_SWEEP)
 //   BF16 GEMV       dense_gemv_bf16_batchm M = 2..8 vs dense_gemv_bf16 per row
 //                   (GDN qkvz/out_proj shards, LM-head vocab shard)
 //   MoE router      w4a16_gemv_batch4 / batch8 M = 2..8 vs w4a16_gemv_sw per row
 //   FP8 GDN proj    w8a16_gemv_batch4 / batch16 M = 2..8 vs w8a16_gemv per row
 //   shared blend    moe_batched_blend T = R vs T = 1 per row
 //
-// Then GPU time per MoE layer, R rows, per-row pair loop vs one rows pair,
-// routes drawn over a 512-expert pool (2.76 MB an expert, ~1.4 GB: every
-// launch streams from DRAM as serving does), launch gaps included.
+// Then GPU time per launch and per MoE layer, R rows, per-row pair loop vs one
+// rows pair, routes drawn over a 512-expert pool (2.76 MB an expert, ~1.4 GB:
+// every launch streams from DRAM as serving does), launch gaps included, with
+// GB/s of the unique expert bytes each projection must read.
 //
-// Build/run: scripts/dev/qwen4exp_batch_exact_bench.sh [check|time] (repo root, GB10).
+// Build/run: scripts/dev/qwen4exp_batch_exact_bench.sh [check|time|sweep]
+// (repo root, GB10, inside atlas-release-builder:1.93.1 for the runtime's
+// CUDA 13.0).
 //
-// Measured 2026-10-05 on GB10 (ennspark03): PASS (R = 1..8, TP1 and EP2
-// tables, all routed and shared outputs; batchm M = 2..8; blend T = 2..8).
-// us per MoE layer, per-row loop -> rows pair (overlap = half of each row's
-// picks drawn from earlier rows, as a verify window's rows do):
-//            TP1 indep        TP1 overlap      EP2 indep       EP2 overlap
-//   R=2   303 -> 289 1.05x  295 -> 249 1.18x  158 -> 157 1.01x  142 -> 137 1.04x
-//   R=4   612 -> 584 1.05x  573 -> 441 1.30x  320 -> 304 1.05x  288 -> 243 1.18x
-//   R=8  1212 ->1114 1.09x 1155 -> 809 1.43x  673 -> 624 1.08x  568 -> 448 1.27x
-// A one-CTA-per-expert form (one accumulator pair per row) measured
-// 0.50-0.85x of the loop and was dropped (see qwen4exp_moe_rows.cu).
+// Measured 2026-10-05 on GB10 (ennspark03): PASS. EP2 tables, us per launch
+// (overlap = half of each row's picks drawn from earlier rows, as a verify
+// window's rows do), the (row, slot) silu/down of c44a7cbc -> the unit
+// silu/down (qwen4exp_moe_rows.cu), and the MoE layer vs the per-row loop:
+//                 silu/down            layer: per-row loop -> rows pair
+//   R=4 indep   136 ->  93 (209 GB/s)     342 -> 283  1.21x  (was 1.04x)
+//   R=4 overlap 124 ->  78               288 -> 213  1.35x  (was 1.15x)
+//   R=8 indep   275 -> 174 (201 GB/s)     650 -> 513  1.27x  (was 1.08x)
+//   R=8 overlap 236 -> 130               580 -> 362  1.60x  (was 1.27x)
+// gate/up is unchanged at 200-249 GB/s (DRAM-bound; see qwen4exp_moe_rows.cu).
+// TP1 R=8: loop 1221 -> 960 indep, 1158 -> 631 overlap.
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -49,7 +54,7 @@
     cuGetErrorString(r, &s); fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, s ? s : "?"); exit(1); } } while (0)
 
 typedef unsigned long long u64;
-static const unsigned H = 2560, I = 640, TOPK = 10, NE = 512, MAXR = 8;
+static const unsigned H = 2560, I = 640, TOPK = 10, NE = 512, MAXR = 8, MOE_MAXR = 16;
 static std::string g_dir = ".";
 static int g_fail = 0;
 static std::mt19937 g_rng(4321);
@@ -158,15 +163,21 @@ static Tables make_tables(const std::vector<Proj>& gate, const std::vector<Proj>
     return {dput(gp), dput(gs), dput(upk), dput(us), dput(dp), dput(ds), dput(g2), dput(u2), dput(d2)};
 }
 
-// R rows of top-10 distinct experts; `overlap` reuses earlier rows' picks.
-static std::vector<unsigned> routes(unsigned rows, bool overlap) {
+// R rows of top-10 distinct experts; `overlap` 1 reuses earlier rows' picks
+// half the time, 2 gives every row row 0's picks (shuffled): one unit per
+// expert holds all R rows.
+static std::vector<unsigned> routes(unsigned rows, int overlap) {
     std::vector<unsigned> ids;
     std::uniform_int_distribution<unsigned> d(0, NE - 1);
     for (unsigned r = 0; r < rows; r++) {
         std::vector<unsigned> row;
+        if (overlap == 2 && r > 0) {
+            row.assign(ids.begin(), ids.begin() + TOPK);
+            std::shuffle(row.begin(), row.end(), g_rng);
+        }
         while (row.size() < TOPK) {
             unsigned e = d(g_rng);
-            if (overlap && r > 0 && (g_rng() % 2)) e = ids[(g_rng() % r) * TOPK + g_rng() % TOPK];
+            if (overlap == 1 && r > 0 && (g_rng() % 2)) e = ids[(g_rng() % r) * TOPK + g_rng() % TOPK];
             bool dup = false;
             for (unsigned x : row) dup |= (x == e);
             if (!dup) row.push_back(e);
@@ -204,35 +215,77 @@ static void per_row_pair(CUfunction gu, CUfunction sd, const Tables& t, const Pr
     }
 }
 
+// The rows pair: plan, gate/up over (row, slot) CTAs, silu/down over unit
+// tiles of `sd_tile` outputs (`sd_block` threads, RC rows a chunk) -- the
+// production shape, or a QU_SWEEP shape of the down kernel.
+struct RowsImpl {
+    const char* name;
+    CUfunction plan, gu, sd;
+    unsigned sd_tile, sd_block, sd_rc;
+};
 static void* g_order = nullptr;
-static void rows_pair(CUfunction plan, CUfunction gu, CUfunction sd, const Tables& t,
-                      const Proj& sg, const Proj& su, const Proj& sdn, MoeBufs b, unsigned rows) {
-    unsigned n_i = I, k_h = H, n_h = H, k_i = I, topk = TOPK, R = rows, slots = rows * TOPK;
-    float s2g = sg.s2, s2u = su.s2, s2d = sdn.s2;
+static void rows_plan(const RowsImpl& m, MoeBufs b, unsigned rows) {
+    unsigned slots = rows * TOPK;
     if (!g_order) g_order = dzero(4096);
-    launch(plan, dim3(1), dim3(128), {(void*)&b.ids, &g_order, &slots});
-    launch(gu, dim3((I + 7) / 8, rows * TOPK + rows, 2), dim3(128),
+    launch(m.plan, dim3(1), dim3(256), {(void*)&b.ids, &g_order, &slots});
+}
+static void rows_gate_up(const RowsImpl& m, const Tables& t, const Proj& sg, const Proj& su,
+                         MoeBufs b, unsigned rows) {
+    unsigned n_i = I, k_h = H, topk = TOPK, R = rows;
+    float s2g = sg.s2, s2u = su.s2;
+    launch(m.gu, dim3(I / 8, rows * TOPK + rows, 2), dim3(128),
            {&b.A, (void*)&t.gp, (void*)&t.gs, (void*)&t.g2, (void*)&b.gate, (void*)&t.upk,
             (void*)&t.us, (void*)&t.u2, (void*)&b.up, (void*)&b.ids, &g_order, (void*)&sg.packed,
             (void*)&sg.scale, &s2g, (void*)&b.shg, (void*)&su.packed, (void*)&su.scale, &s2u,
             (void*)&b.shu, &n_i, &k_h, &topk, &R});
-    launch(sd, dim3((H + 7) / 8, rows * TOPK + rows, 1), dim3(128),
+}
+static void rows_silu_down(const RowsImpl& m, const Tables& t, const Proj& sdn, MoeBufs b,
+                           unsigned rows) {
+    unsigned n_h = H, k_i = I, topk = TOPK, R = rows;
+    float s2d = sdn.s2;
+    // Units: one per 8 rows of the shared expert, then at most one per entry.
+    launch(m.sd, dim3(H / m.sd_tile, (rows + 7) / 8 + rows * TOPK, 1), dim3(m.sd_block),
            {(void*)&b.gate, (void*)&b.up, (void*)&t.dp, (void*)&t.ds, (void*)&t.d2,
             (void*)&b.down, (void*)&b.ids, &g_order, (void*)&b.shg, (void*)&b.shu,
             (void*)&sdn.packed, (void*)&sdn.scale, &s2d, (void*)&b.shd, &n_h, &k_i, &topk, &R},
-           I * 4);
+           m.sd_tile * (I / 2 + I / 16) + m.sd_rc * I * 4);
+}
+static void rows_pair(const RowsImpl& m, const Tables& t, const Proj& sg, const Proj& su,
+                      const Proj& sdn, MoeBufs b, unsigned rows) {
+    rows_plan(m, b, rows);
+    rows_gate_up(m, t, sg, su, b, rows);
+    rows_silu_down(m, t, sdn, b, rows);
+}
+
+// The production pair (QU_SD_TILE / QU_SD_WARPS / QU_SD_RC defaults), then
+// the down kernel's QU_SWEEP shapes: tile, warps, rows per chunk.
+static std::vector<RowsImpl> rows_impls(bool sweep) {
+    const char* M = "qwen4exp_moe_rows";
+    CUfunction plan = load(M, "qwen4exp_moe_rows_plan"), gu = load(M, "qwen4exp_moe_rows_gate_up");
+    std::vector<RowsImpl> v;
+    v.push_back({"rows", plan, gu, load(M, "qwen4exp_moe_rows_silu_down"), 64, 256, 2});
+    if (!sweep) return v;
+    static const unsigned SD_SHAPES[][3] = {{16, 4, 2}, {32, 4, 2}, {64, 4, 2},
+                                            {32, 8, 1}, {32, 8, 4}, {32, 8, 2}};
+    for (auto& sh : SD_SHAPES) {
+        char fn[64], nm[64];
+        snprintf(fn, sizeof fn, "qu_sweep_silu_down_t%u_w%u_r%u", sh[0], sh[1], sh[2]);
+        snprintf(nm, sizeof nm, "down %u.%u.%u", sh[0], sh[1], sh[2]);
+        v.push_back({strdup(nm), plan, gu, load(M, fn), sh[0], sh[1] * 32, sh[2]});
+    }
+    return v;
 }
 
 static MoeBufs alloc_bufs() {
     MoeBufs b;
-    b.A = dzero((size_t)MAXR * H * 2);
-    b.gate = dzero((size_t)MAXR * TOPK * I * 2);
-    b.up = dzero((size_t)MAXR * TOPK * I * 2);
-    b.shg = dzero((size_t)MAXR * I * 2);
-    b.shu = dzero((size_t)MAXR * I * 2);
-    b.down = dzero((size_t)MAXR * TOPK * H * 2);
-    b.shd = dzero((size_t)MAXR * H * 2);
-    b.ids = dzero((size_t)MAXR * TOPK * 4);
+    b.A = dzero((size_t)MOE_MAXR * H * 2);
+    b.gate = dzero((size_t)MOE_MAXR * TOPK * I * 2);
+    b.up = dzero((size_t)MOE_MAXR * TOPK * I * 2);
+    b.shg = dzero((size_t)MOE_MAXR * I * 2);
+    b.shu = dzero((size_t)MOE_MAXR * I * 2);
+    b.down = dzero((size_t)MOE_MAXR * TOPK * H * 2);
+    b.shd = dzero((size_t)MOE_MAXR * H * 2);
+    b.ids = dzero((size_t)MOE_MAXR * TOPK * 4);
     return b;
 }
 
@@ -240,45 +293,52 @@ static void moe_check(const Tables& t, const Proj& sg, const Proj& su, const Pro
                       const char* tag) {
     CUfunction gu1 = load("moe_shared_expert_fused", "moe_expert_gate_up_shared");
     CUfunction sd1 = load("moe_shared_expert_fused", "moe_expert_silu_down_shared");
-    CUfunction plR = load("qwen4exp_moe_rows", "qwen4exp_moe_rows_plan");
-    CUfunction guR = load("qwen4exp_moe_rows", "qwen4exp_moe_rows_gate_up");
-    CUfunction sdR = load("qwen4exp_moe_rows", "qwen4exp_moe_rows_silu_down");
+    const std::vector<RowsImpl> impls = rows_impls(true);
     MoeBufs ref = alloc_bufs(), got = alloc_bufs();
-    for (unsigned rows = 1; rows <= MAXR; rows++) {
-        for (int overlap = 0; overlap < 2; overlap++) {
+    std::vector<int> bad(impls.size(), 0);
+    static const char* ROUTES[3] = {"indep", "overlap", "same"};
+    for (unsigned rows = 1; rows <= MOE_MAXR; rows += rows < 8 ? 1 : 4) {
+        for (int overlap = 0; overlap < 3; overlap++) {
             for (float scale : {0.02f, 1.0f, 30.0f}) {
                 auto a = rand_bf16((size_t)rows * H, scale);
                 auto ids = routes(rows, overlap);
-                for (MoeBufs* b : {&ref, &got}) {
-                    CK(cudaMemcpy(b->A, a.data(), a.size() * 2, cudaMemcpyHostToDevice));
-                    CK(cudaMemcpy(b->ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
-                    CK(cudaMemset(b->gate, 0x55, (size_t)MAXR * TOPK * I * 2));
-                    CK(cudaMemset(b->down, 0x55, (size_t)MAXR * TOPK * H * 2));
-                }
+                CK(cudaMemcpy(ref.A, a.data(), a.size() * 2, cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(ref.ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
+                CK(cudaMemset(ref.gate, 0x55, (size_t)MOE_MAXR * TOPK * I * 2));
+                CK(cudaMemset(ref.down, 0x55, (size_t)MOE_MAXR * TOPK * H * 2));
                 per_row_pair(gu1, sd1, t, sg, su, sdn, ref, rows);
-                rows_pair(plR, guR, sdR, t, sg, su, sdn, got, rows);
-                char what[160];
-                const size_t rk = (size_t)rows * TOPK;
-                struct { const char* n; void* r; void* g; size_t bytes; } outs[] = {
-                    {"gate_out", ref.gate, got.gate, rk * I * 2},
-                    {"up_out", ref.up, got.up, rk * I * 2},
-                    {"shared gate", ref.shg, got.shg, (size_t)rows * I * 2},
-                    {"shared up", ref.shu, got.shu, (size_t)rows * I * 2},
-                    {"down", ref.down, got.down, rk * H * 2},
-                    {"shared down", ref.shd, got.shd, (size_t)rows * H * 2},
-                };
-                bool ok = true;
-                for (auto& o : outs) {
-                    snprintf(what, sizeof what, "%s rows R=%u %s x%g %s", tag, rows,
-                             overlap ? "overlap" : "indep", scale, o.n);
-                    ok &= same(what, dget(o.r, o.bytes), dget(o.g, o.bytes));
+                for (const RowsImpl& m : impls) {
+                    CK(cudaMemcpy(got.A, a.data(), a.size() * 2, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(got.ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
+                    CK(cudaMemset(got.gate, 0x55, (size_t)MOE_MAXR * TOPK * I * 2));
+                    CK(cudaMemset(got.up, 0x55, (size_t)MOE_MAXR * TOPK * I * 2));
+                    CK(cudaMemset(got.down, 0x55, (size_t)MOE_MAXR * TOPK * H * 2));
+                    CK(cudaMemset(got.shg, 0x55, (size_t)MOE_MAXR * I * 2));
+                    CK(cudaMemset(got.shu, 0x55, (size_t)MOE_MAXR * I * 2));
+                    CK(cudaMemset(got.shd, 0x55, (size_t)MOE_MAXR * H * 2));
+                    rows_pair(m, t, sg, su, sdn, got, rows);
+                    char what[160];
+                    const size_t rk = (size_t)rows * TOPK;
+                    struct { const char* n; void* r; void* g; size_t bytes; } outs[] = {
+                        {"gate_out", ref.gate, got.gate, rk * I * 2},
+                        {"up_out", ref.up, got.up, rk * I * 2},
+                        {"shared gate", ref.shg, got.shg, (size_t)rows * I * 2},
+                        {"shared up", ref.shu, got.shu, (size_t)rows * I * 2},
+                        {"down", ref.down, got.down, rk * H * 2},
+                        {"shared down", ref.shd, got.shd, (size_t)rows * H * 2},
+                    };
+                    for (auto& o : outs) {
+                        snprintf(what, sizeof what, "%s %s R=%u %s x%g %s", tag, m.name, rows,
+                                 ROUTES[overlap], scale, o.n);
+                        bad[&m - &impls[0]] += !same(what, dget(o.r, o.bytes), dget(o.g, o.bytes));
+                    }
                 }
-                if (ok && scale == 1.0f)
-                    printf("  ok  %s rows pair R=%u %s (all routed + shared outputs)\n", tag,
-                           rows, overlap ? "overlap" : "indep");
             }
         }
     }
+    for (size_t i = 0; i < impls.size(); i++)
+        printf("  %s  %s %-24s R = 1..8, 12, 16; indep / overlap / same routes; 3 scales; "
+               "every routed + shared output byte\n", bad[i] ? "BAD" : "ok ", tag, impls[i].name);
 }
 
 static void gemv_check() {
@@ -402,40 +462,70 @@ static void blend_check() {
     }
 }
 
-static void moe_time(const Tables& t, const Proj& sg, const Proj& su, const Proj& sdn) {
+static void moe_time(const Tables& t, const Proj& sg, const Proj& su, const Proj& sdn, bool ep2,
+                     bool sweep) {
     CUfunction gu1 = load("moe_shared_expert_fused", "moe_expert_gate_up_shared");
     CUfunction sd1 = load("moe_shared_expert_fused", "moe_expert_silu_down_shared");
-    CUfunction plR = load("qwen4exp_moe_rows", "qwen4exp_moe_rows_plan");
-    CUfunction guR = load("qwen4exp_moe_rows", "qwen4exp_moe_rows_gate_up");
-    CUfunction sdR = load("qwen4exp_moe_rows", "qwen4exp_moe_rows_silu_down");
+    const std::vector<RowsImpl> impls = rows_impls(sweep);
     MoeBufs b = alloc_bufs();
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
     CK(cudaEventCreate(&e1));
     const int iters = 100;
-    printf("\n  us per MoE layer (gate_up + silu_down), routes over a %u-expert pool:\n", NE);
-    printf("  rows  routes    per-row loop   rows pair   speedup\n");
+    // Unique expert bytes a launch must read (each local expert picked, + shared).
+    const double gu_bytes = 2.0 * (I * H / 2 + I * H / 16), sd_bytes = H * I / 2 + H * I / 16;
+    printf("\n  %s: us per launch, routes over a %u-expert pool (GB/s of unique expert bytes)\n",
+           ep2 ? "EP2 tables" : "TP1 tables", NE);
+    printf("  rows  routes   %-22s %6s  %-17s  %-17s  %7s\n", "", "plan", "gate_up (GB/s)", "silu_down (GB/s)", "layer");
     for (unsigned rows : {1u, 2u, 4u, 6u, 8u}) {
         for (int overlap = 0; overlap < 2; overlap++) {
-            std::vector<std::vector<unsigned>> plans;
-            for (int i = 0; i < iters; i++) plans.push_back(routes(rows, overlap));
             std::vector<unsigned*> dev;
-            for (auto& p : plans) dev.push_back(dput(p));
-            float ms[2];
-            for (int which = 0; which < 2; which++) {
+            double uniq = 0;
+            for (int i = 0; i < iters; i++) {
+                auto p = routes(rows, overlap);
+                std::vector<unsigned> local;
+                for (unsigned e : p) if (!(ep2 && e % 2 == 1)) local.push_back(e);
+                std::sort(local.begin(), local.end());
+                uniq += std::unique(local.begin(), local.end()) - local.begin() + 1;
+                dev.push_back(dput(p));
+            }
+            uniq /= iters;
+            auto timed = [&](auto&& body) {
+                float ms;
                 CK(cudaDeviceSynchronize());
                 CK(cudaEventRecord(e0));
-                for (int i = 0; i < iters; i++) {
-                    b.ids = dev[i];
-                    if (which == 0) per_row_pair(gu1, sd1, t, sg, su, sdn, b, rows);
-                    else rows_pair(plR, guR, sdR, t, sg, su, sdn, b, rows);
-                }
+                for (int i = 0; i < iters; i++) body(i);
                 CK(cudaEventRecord(e1));
                 CK(cudaEventSynchronize(e1));
-                CK(cudaEventElapsedTime(&ms[which], e0, e1));
+                CK(cudaEventElapsedTime(&ms, e0, e1));
+                return ms * 1000.0 / iters;
+            };
+            const double loop = timed([&](int i) {
+                b.ids = dev[i];
+                per_row_pair(gu1, sd1, t, sg, su, sdn, b, rows);
+            });
+            printf("  %4u  %-7s  %-22s %6s  %-17s  %-17s  %7.1f  (%.1f unique experts)\n", rows,
+                   overlap ? "overlap" : "indep", "per-row loop", "", "", "", loop, uniq);
+            for (const RowsImpl& m : impls) {
+                // Each route set's plan into its own order buffer, so the
+                // projections can be timed alone.
+                std::vector<void*> orders;
+                for (int i = 0; i < iters; i++) {
+                    g_order = dzero(4096);
+                    b.ids = dev[i];
+                    rows_plan(m, b, rows);
+                    orders.push_back(g_order);
+                }
+                const double pl = timed([&](int i) { b.ids = dev[i]; g_order = orders[i]; rows_plan(m, b, rows); });
+                const double gu = timed([&](int i) { b.ids = dev[i]; g_order = orders[i]; rows_gate_up(m, t, sg, su, b, rows); });
+                const double sd = timed([&](int i) { b.ids = dev[i]; g_order = orders[i]; rows_silu_down(m, t, sdn, b, rows); });
+                const double all = timed([&](int i) { b.ids = dev[i]; g_order = orders[i]; rows_pair(m, t, sg, su, sdn, b, rows); });
+                printf("  %4u  %-7s  %-22s %6.1f  %7.1f (%5.0f)  %7.1f (%5.0f)  %7.1f  %.2fx\n", rows,
+                       overlap ? "overlap" : "indep", m.name, pl, gu, uniq * gu_bytes / gu / 1e3, sd,
+                       uniq * sd_bytes / sd / 1e3, all, loop / all);
+                for (void* o : orders) CK(cudaFree(o));
+                g_order = nullptr;
             }
-            printf("  %4u  %-8s  %10.1f  %10.1f   %.2fx\n", rows, overlap ? "overlap" : "indep",
-                   ms[0] * 1000 / iters, ms[1] * 1000 / iters, ms[0] / ms[1]);
             for (auto* p : dev) CK(cudaFree(p));
         }
     }
@@ -499,7 +589,7 @@ int main(int argc, char** argv) {
     CU(cuInit(0));
     CK(cudaFree(0));
     // A pool of distinct experts (DRAM-resident: ~1.4 GB) plus the shared one.
-    const unsigned pool = mode == "time" ? NE : 32;
+    const unsigned pool = mode == "check" ? 32 : NE;
     std::vector<Proj> gate, up, down;
     for (unsigned e = 0; e < pool; e++) {
         gate.push_back(make_proj(I, H));
@@ -519,8 +609,10 @@ int main(int argc, char** argv) {
         printf("%s\n", g_fail ? "FAIL" : "PASS");
         return g_fail ? 1 : 0;
     }
-    moe_time(tp1, sg, su, sdn);
-    moe_time(ep2, sg, su, sdn);
+    const bool sweep = mode == "sweep";
+    moe_time(ep2, sg, su, sdn, true, sweep);
+    if (sweep) return 0;
+    moe_time(tp1, sg, su, sdn, false, false);
     gemv_time();
     return 0;
 }
