@@ -11,6 +11,7 @@
 //
 // Single block, 256 threads. Supports up to 512 experts (2 loads per thread).
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 
 #define BLOCK_SIZE 256
@@ -35,6 +36,7 @@ extern "C" __global__ void moe_topk_softmax(
     unsigned int top_k,
     unsigned int normalize  // 1 = normalize softmax weights to sum to 1
 ) {
+    atlas_pdl_enter();
     __shared__ float s_vals[MAX_EXPERTS];
     __shared__ float s_top_vals[MAX_TOP_K];
     __shared__ unsigned int s_top_idxs[MAX_TOP_K];

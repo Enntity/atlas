@@ -48,7 +48,7 @@ use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, HostPitched, KernelHandle};
 use super::host_staging::{d2h_trace_tick, h2d_enqueue, warn_pinned_transient_source};
 
 mod pdl;
-use pdl::PDL_KERNELS;
+use pdl::pdl_kernel;
 pub use pdl::{configure_pdl, pdl_enabled};
 
 impl GpuBackend for AtlasCudaBackend {
@@ -257,7 +257,7 @@ impl GpuBackend for AtlasCudaBackend {
         match registry.raw_function_cached(&cache, module, func_name) {
             Ok(raw) => {
                 crate::kernel_audit::record(module, func_name, true, site);
-                if pdl_enabled() && PDL_KERNELS.contains(&func_name) {
+                if pdl_kernel(func_name) {
                     atlas_core::registry::mark_pdl(raw);
                 }
                 Ok(KernelHandle(raw.0 as u64))

@@ -423,6 +423,7 @@ mod init_fp8;
 mod init_q2;
 mod kernel_select;
 mod lora;
+mod ssm_decode_tail;
 mod ssm_forward;
 pub(crate) mod ssm_h_fp16;
 mod trait_decode;

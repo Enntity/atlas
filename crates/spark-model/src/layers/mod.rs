@@ -336,6 +336,23 @@ impl FfnComponent {
         }
     }
 
+    /// [`Self::forward`] for a single-token mHC decode layer: the MoE may run
+    /// the layer's low-rank `hc_post` itself (`hc_post`, fused with its last
+    /// kernel under `ATLAS_QWEN4EXP_DECODE_FUSE`). Returns the output and
+    /// whether the post ran; when it did not, the caller still runs it.
+    pub fn forward_hc_post(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        hc_post: Option<ops::qwen4exp_decode_fuse::MoeHcPost>,
+        stream: u64,
+    ) -> Result<(DevicePtr, bool)> {
+        match self {
+            Self::Moe(m) => m.forward_hc_post(input, ctx, hc_post, stream),
+            _ => Ok((self.forward(input, ctx, stream)?, false)),
+        }
+    }
+
     pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_k2(input, ctx, stream),

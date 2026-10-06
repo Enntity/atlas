@@ -31,6 +31,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::hyper_connection as sinkhorn;
 use super::hyper_connection_lowrank as lowrank;
+use super::hyper_connection_lowrank_split::hc_pre_split;
+use super::qwen4exp_decode_fuse::{HcPostFold, hc_post_stage_fits};
 use crate::layers::qwen3_attention::{HcHeadWeights, HcSiteWeights, HcWeights};
 
 /// Which family a site's weights select.
@@ -172,6 +174,91 @@ pub fn hc_post_site(
             stream,
         ),
     }
+}
+
+/// A decode layer's seam: [`hc_post_site`] of the sublayer that produced
+/// `block_out` (in place on `streams`), then [`hc_pre_site`] of `site`.
+///
+/// Under `ATLAS_QWEN4EXP_DECODE_FUSE` (mHC seam group) a low-rank site at a
+/// decode width runs the post inside its stage (`hc_post_stage_vec`): the
+/// same highway and `normed` bytes, one launch fewer. Otherwise the two
+/// calls run as they always have.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_post_pre_site(
+    gpu: &dyn GpuBackend,
+    post_kernel: KernelHandle,
+    pre_kernel: KernelHandle,
+    hc: &HcWeights,
+    block_out: DevicePtr,
+    streams: DevicePtr,
+    site: &HcSiteWeights,
+    y_out: DevicePtr,
+    post: DevicePtr,
+    comb: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    norm_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    if let Some(w) = &site.lowrank
+        && HcVariant::of(hc) == HcVariant::LowRank
+        && num_tokens <= lowrank::HC_DECODE_MAX_T
+        && !scratch.is_null()
+        && !w.inject_w.is_null()
+    {
+        let fold = HcPostFold {
+            block_out,
+            inj: post,
+        };
+        // `normed` sits at the start of the split path's scratch.
+        let hc_mult = hc.hc_mult as u32;
+        if hc_post_stage_fits(gpu, fold, streams, w.norm_w, scratch, hidden_size, hc_mult)? {
+            return hc_pre_split(
+                gpu,
+                streams,
+                w,
+                y_out,
+                post,
+                scratch,
+                num_tokens,
+                hidden_size,
+                hc_mult,
+                norm_eps,
+                /* inject */ true,
+                Some(fold),
+                stream,
+            );
+        }
+    }
+    hc_post_site(
+        gpu,
+        post_kernel,
+        hc,
+        block_out,
+        streams,
+        post,
+        comb,
+        streams,
+        num_tokens,
+        hidden_size,
+        stream,
+    )?;
+    hc_pre_site(
+        gpu,
+        pre_kernel,
+        streams,
+        site,
+        hc,
+        y_out,
+        post,
+        comb,
+        scratch,
+        num_tokens,
+        hidden_size,
+        norm_eps,
+        stream,
+    )
 }
 
 /// The model-level final collapse before the LM head.

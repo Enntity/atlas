@@ -38,7 +38,9 @@
 //
 // Grid: (T,1,1)   Block: (256,1,1)
 
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
+#include "../../common/atlas_pdl.cuh"
 
 #define QHC_BLOCK 256
 #define QHC_MAX_MULT 8
@@ -1442,6 +1444,7 @@ extern "C" __global__ void hc_pre_down_vec(
     const unsigned int rank,
     const unsigned int num_tokens              // 1..HC_V_MAX (host checks)
 ) {
+    atlas_pdl_enter();
     qhc_down_vec_t<HC_V_DOWN_CPT, HC_V_DOWN_UNROLL, HC_V_DOWN_DN>(
         normed, down_w, inject_w, low_out, inj_out, hidden_size, hc, rank, num_tokens);
 }
@@ -1573,6 +1576,7 @@ extern "C" __global__ void hc_pre_finish_vec(
     const unsigned int rank,
     const unsigned int num_tokens              // 1..HC_V_MAX (host checks)
 ) {
+    atlas_pdl_enter();
     qhc_finish_vec_t<HC_V_FIN_DPT, HC_V_FIN_UNROLL>(
         normed, low, up_w, y_out, hidden_size, rank, num_tokens);
 }
@@ -1589,6 +1593,7 @@ extern "C" __global__ void hc_pre_stage_vec(
     const unsigned int hc,
     const float eps
 ) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.x;
     const unsigned int tid = threadIdx.x;
     const unsigned int lane = tid & 31u;
@@ -1663,6 +1668,7 @@ extern "C" __global__ void hc_post_vec(
     const unsigned int hidden_size,
     const unsigned int hc_mult
 ) {
+    atlas_pdl_enter();
     const unsigned int t = blockIdx.x;
     const unsigned int H = hidden_size;
     const unsigned int hc = hc_mult;
@@ -1685,5 +1691,114 @@ extern "C" __global__ void hc_post_vec(
         v.z = r.z + x2 * wv;
         v.w = r.w + x3 * wv;
         *reinterpret_cast<float4*>(o + (size_t)s * H + d) = v;
+    }
+}
+
+// ── hc_post_vec + hc_pre_stage_vec in one launch (ATLAS_QWEN4EXP_DECODE_FUSE)
+//
+// Inside a decode layer the mixer's `hc_post` is followed at once by the MoE
+// site's `hc_pre_stage` on the same token row: the post writes the highway
+// and the stage reads it back for its per-stream RMS and `normed`. This
+// kernel does both. Each block of a token's (1, S) cluster recomputes the
+// post value of every element (`r + x * inj`, `hc_post_vec`'s expression) in
+// `hc_pre_stage_vec`'s d order for the RMS, then, after a cluster barrier
+// (no block of the token still reads the old highway), writes its 1/S slice
+// of both the highway and `normed` from the same recomputed values. Every
+// float is the one the two kernels produce: bit-identical (--fmad=false).
+//
+// In place only (the decode highway is post's `residual` and `out`).
+// Grid: (T, HC_V_STAGE_SPLIT), clusters of (1, HC_V_STAGE_SPLIT), block 1024.
+// Host checks: hc <= QHC_MAX_MULT, H % 4 == 0, hc*H % (4*S) == 0, 16-byte
+// aligned highway, normed and norm weight, 8-byte aligned block_out.
+#ifndef HC_V_STAGE_SPLIT
+#define HC_V_STAGE_SPLIT 8u
+#endif
+
+extern "C" __global__ void __cluster_dims__(1, HC_V_STAGE_SPLIT, 1) __launch_bounds__(QHC_WBLOCK, 1)
+hc_post_stage_vec(
+    const __nv_bfloat16* __restrict__ block_out, // [T, H]
+    float* streams,                              // [T, hc, H]: residual in, post out
+    const float* __restrict__ inj,               // [T, hc]
+    const __nv_bfloat16* __restrict__ hc_norm_w, // [hc*H]
+    float* __restrict__ normed_out,              // [T, hc*H]
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const float eps
+) {
+    atlas_pdl_enter();
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5;
+    const unsigned int H = hidden_size;
+    const unsigned int hc_dim = hc * H;
+    const __nv_bfloat16* xb = block_out + (size_t)t * H;
+    float* x = streams + (size_t)t * hc_dim;
+    const float* w = inj + (size_t)t * hc;
+    float* out = normed_out + (size_t)t * hc_dim;
+
+    __shared__ float smem_rms[QHC_MAX_MULT];
+    __shared__ float smem_red[QHC_MAX_MULT][QHC_WBLOCK / 32];
+
+    float wv[QHC_MAX_MULT];
+    #pragma unroll
+    for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) wv[s2] = s2 < hc ? w[s2] : 0.0f;
+
+    float acc[QHC_MAX_MULT];
+    #pragma unroll
+    for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) acc[s2] = 0.0f;
+    for (unsigned int d = tid; d < H; d += QHC_WBLOCK) {
+        const float xd = (float)xb[d];
+        #pragma unroll
+        for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) {
+            if (s2 < hc) {
+                const float v = x[(size_t)s2 * H + d] + xd * wv[s2];
+                acc[s2] += v * v;
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) {
+        if (s2 < hc) {
+            float a = acc[s2];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                a += __shfl_down_sync(0xFFFFFFFFu, a, off);
+            }
+            if (lane == 0) smem_red[s2][warp] = a;
+        }
+    }
+    __syncthreads();
+    if (tid < hc) {
+        float tot = 0.0f;
+        for (unsigned int w2 = 0; w2 < QHC_WBLOCK / 32; ++w2) tot += smem_red[tid][w2];
+        smem_rms[tid] = rsqrtf(tot / (float)H + eps);
+    }
+    // The old highway row has been read by every block of this token.
+    cooperative_groups::this_cluster().sync();
+
+    const unsigned int span = hc_dim / gridDim.y;
+    const unsigned int c0 = blockIdx.y * span;
+    const unsigned int c1 = blockIdx.y + 1 == gridDim.y ? hc_dim : c0 + span;
+    for (unsigned int i = c0 + 4u * tid; i < c1; i += 4u * QHC_WBLOCK) {
+        const unsigned int s = i / H;
+        const unsigned int d = i - s * H;
+        const float4 r = *reinterpret_cast<const float4*>(x + i);
+        const uint2 xv = *reinterpret_cast<const uint2*>(xb + d);
+        const float ws = w[s];
+        float4 v;
+        v.x = r.x + qhc_bf_lo(xv.x) * ws;
+        v.y = r.y + qhc_bf_hi(xv.x) * ws;
+        v.z = r.z + qhc_bf_lo(xv.y) * ws;
+        v.w = r.w + qhc_bf_hi(xv.y) * ws;
+        *reinterpret_cast<float4*>(x + i) = v;
+        const uint2 nw = *reinterpret_cast<const uint2*>(hc_norm_w + i);
+        const float rms = smem_rms[s];
+        float4 o;
+        o.x = v.x * rms * (1.0f + qhc_bf_lo(nw.x));
+        o.y = v.y * rms * (1.0f + qhc_bf_hi(nw.x));
+        o.z = v.z * rms * (1.0f + qhc_bf_lo(nw.y));
+        o.w = v.w * rms * (1.0f + qhc_bf_hi(nw.y));
+        *reinterpret_cast<float4*>(out + i) = o;
     }
 }

@@ -194,6 +194,8 @@ mod qsa_rows;
 #[path = "ops/quant_dispatch.rs"]
 mod quant_dispatch;
 pub mod qwen4exp;
+#[path = "ops/qwen4exp_decode_fuse.rs"]
+pub mod qwen4exp_decode_fuse;
 #[path = "ops/qwen4exp_moe.rs"]
 mod qwen4exp_moe;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.

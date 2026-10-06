@@ -10,6 +10,7 @@ use spark_runtime::kernel_args::KernelLaunch;
 use super::hyper_connection_lowrank_gemm::{
     hc_fast, hc_finish_block, hc_finish_x4, hc_token_fused,
 };
+use super::qwen4exp_decode_fuse::{HcPostFold, hc_post_stage};
 use crate::layers::qwen3_attention::HcLowRank;
 
 // Shape of the vectorized kernels; each must match its HC_V_* define in
@@ -52,6 +53,7 @@ fn hc_pre_vec(
     hidden_size: u32,
     hc_mult: u32,
     norm_eps: f32,
+    fold: Option<HcPostFold>,
     stream: u64,
 ) -> Result<bool> {
     let hc_dim = hc_mult * hidden_size;
@@ -78,16 +80,31 @@ fn hc_pre_vec(
 
     // The stage kernel's RMS is `hc_pre_stage`'s 1024-thread reduction; it is
     // only bit-identical at that width.
-    KernelLaunch::new(gpu, k_stage)
-        .grid([num_tokens, HC_V_STAGE_SPLIT, 1])
-        .block([1024, 1, 1])
-        .arg_ptr(streams)
-        .arg_ptr(w.norm_w)
-        .arg_ptr(normed)
-        .arg_u32(hidden_size)
-        .arg_u32(hc_mult)
-        .arg_f32(norm_eps)
-        .launch(stream)?;
+    if let Some(fold) = fold {
+        hc_post_stage(
+            gpu,
+            fold,
+            streams,
+            w.norm_w,
+            normed,
+            num_tokens,
+            hidden_size,
+            hc_mult,
+            norm_eps,
+            stream,
+        )?;
+    } else {
+        KernelLaunch::new(gpu, k_stage)
+            .grid([num_tokens, HC_V_STAGE_SPLIT, 1])
+            .block([1024, 1, 1])
+            .arg_ptr(streams)
+            .arg_ptr(w.norm_w)
+            .arg_ptr(normed)
+            .arg_u32(hidden_size)
+            .arg_u32(hc_mult)
+            .arg_f32(norm_eps)
+            .launch(stream)?;
+    }
 
     // `inj_out` NULL is the model-level head: no injection rows.
     let rows = rank + if inj_out.is_null() { 0 } else { hc_mult };
@@ -141,6 +158,7 @@ pub(super) fn hc_pre_split(
     hc_mult: u32,
     norm_eps: f32,
     inject: bool,
+    fold: Option<HcPostFold>,
     stream: u64,
 ) -> Result<()> {
     let hc_dim = hc_mult * hidden_size;
@@ -161,6 +179,7 @@ pub(super) fn hc_pre_split(
             hidden_size,
             hc_mult,
             norm_eps,
+            fold,
             stream,
         )?
     {
@@ -182,16 +201,32 @@ pub(super) fn hc_pre_split(
     let k_down_tiled = gpu.kernel("hyper_connection", "hc_pre_down_tiled")?;
     let k_fin = gpu.kernel("hyper_connection", "hc_pre_finish")?;
 
-    KernelLaunch::new(gpu, k_stage)
-        .grid([num_tokens, 1, 1])
-        .block([1024, 1, 1])
-        .arg_ptr(streams)
-        .arg_ptr(w.norm_w)
-        .arg_ptr(normed)
-        .arg_u32(hidden_size)
-        .arg_u32(hc_mult)
-        .arg_f32(norm_eps)
-        .launch(stream)?;
+    if let Some(fold) = fold {
+        // `normed` is bit-identical to `hc_pre_stage`'s (as `hc_pre_stage_vec`'s is).
+        hc_post_stage(
+            gpu,
+            fold,
+            streams,
+            w.norm_w,
+            normed,
+            num_tokens,
+            hidden_size,
+            hc_mult,
+            norm_eps,
+            stream,
+        )?;
+    } else {
+        KernelLaunch::new(gpu, k_stage)
+            .grid([num_tokens, 1, 1])
+            .block([1024, 1, 1])
+            .arg_ptr(streams)
+            .arg_ptr(w.norm_w)
+            .arg_ptr(normed)
+            .arg_u32(hidden_size)
+            .arg_u32(hc_mult)
+            .arg_f32(norm_eps)
+            .launch(stream)?;
+    }
 
     // Token-fused stages 2+3 for decode and the K=2 MTP verify. The per-token
     // kernels below stream each 6.55 MB weight once PER TOKEN with ~8 rows of
