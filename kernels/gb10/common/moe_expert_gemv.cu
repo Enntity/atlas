@@ -19,6 +19,7 @@
 // Block: (128, 1, 1)
 // blockIdx.y = expert slot (0..top_k-1)
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -206,6 +207,7 @@ extern "C" __global__ void moe_weighted_sum_blend(
     unsigned int top_k,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / WARP_SIZE;
     const unsigned int lane = tid % WARP_SIZE;
@@ -275,6 +277,9 @@ extern "C" __global__ void moe_weighted_sum_blend(
     for (unsigned int e = 0; e < top_k; e++) {
         acc += expert_weights[e] * __bfloat162float(expert_out[(unsigned long long)e * hidden + j]);
     }
-    acc += sigmoid_val * __bfloat162float(shared_out[j]);
+    // Null `shared_out` reads as a zero row (the EP blend adds the shared expert
+    // after the all-reduce): bf16 +0 converts to +0.0f, so the bytes match a
+    // zeroed buffer, without the memset.
+    acc += sigmoid_val * (shared_out != 0 ? __bfloat162float(shared_out[j]) : 0.0f);
     output[j] = __float2bfloat16(acc);
 }

@@ -75,12 +75,26 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        Ok(self.forward_hc_post(input, ctx, None, stream)?.0)
+    }
+
+    /// [`Self::forward`], and with `hc_post` the layer's low-rank mHC post
+    /// when the EP shared-expert blend can run fused with it
+    /// (`ATLAS_QWEN4EXP_DECODE_FUSE`, MoE group). Returns the output and
+    /// whether the post ran.
+    pub fn forward_hc_post(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        hc_post: Option<ops::qwen4exp_decode_fuse::MoeHcPost>,
+        stream: u64,
+    ) -> Result<(DevicePtr, bool)> {
         self.btile_input_guard(input, 1, ctx, stream)?;
         // Expert TP slices the routed width, which the fused routed+shared
         // decode kernels assume equals the shared expert's; take the grouped path.
         if self.routed_scales_released || ctx.config.expert_tp {
             self.forward_prefill(input, 1, ctx, stream)?;
-            return Ok(ctx.buffers.moe_output());
+            return Ok((ctx.buffers.moe_output(), false));
         }
         // SOLID Incr-4: a genuine single-token decode (num_seqs == 1) folds the
         // routed expert down_proj LoRA delta below (before the wsum blend). The
@@ -126,7 +140,7 @@ impl MoeLayer {
                 );
             }
             self.forward_prefill(input, 1, ctx, stream)?;
-            return Ok(ctx.buffers.moe_output());
+            return Ok((ctx.buffers.moe_output(), false));
         }
 
         // GeGLU models: fused kernels now have GELU activation (model-specific override).
@@ -711,13 +725,20 @@ impl MoeLayer {
         // times. Solution: pass NULL shared_out for EP, all-reduce the routed sum,
         // then add shared_out once after all-reduce.
         let output = ctx.buffers.moe_output();
+        let mut posted = false;
         let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
         let shared_for_blend = if is_ep && !shared_out.is_null() {
             // EP: exclude shared expert from blend (will add after all-reduce).
-            // Zero a temp buffer to pass as shared_out (kernel reads it even with NULL gate).
-            let zero_buf = ctx.buffers.expert_gate_out(); // temp buffer, will be zeroed
-            ctx.gpu.memset_async(zero_buf, 0, h as usize * 2, stream)?;
-            zero_buf
+            // Zero a temp buffer to pass as shared_out (kernel reads it even with NULL gate),
+            // or, where the kernel reads a null row as that zero row
+            // (ATLAS_QWEN4EXP_DECODE_FUSE), pass null and skip the memset.
+            if ops::qwen4exp_decode_fuse::null_shared_row(ctx.gpu)? {
+                DevicePtr::NULL
+            } else {
+                let zero_buf = ctx.buffers.expert_gate_out(); // temp buffer, will be zeroed
+                ctx.gpu.memset_async(zero_buf, 0, h as usize * 2, stream)?;
+                zero_buf
+            }
         } else {
             shared_out
         };
@@ -759,18 +780,35 @@ impl MoeLayer {
                     // No gate weight (e.g., Mistral): shared expert always at full strength.
                     ops::residual_add(ctx.gpu, self.residual_add, output, shared_out, h, stream)?;
                 } else {
-                    // Gated shared expert (e.g., Qwen3.5): apply sigmoid gate.
-                    ops::moe_batched_blend(
-                        ctx.gpu,
-                        self.moe_batched_blend,
-                        output,
-                        shared_out,
-                        input,
-                        self.weights.shared_expert_gate.weight,
-                        h,
-                        1,
-                        stream,
-                    )?;
+                    // Gated shared expert (e.g., Qwen3.5): apply sigmoid gate,
+                    // fused with the layer's mHC post when it can be.
+                    posted = match hc_post {
+                        Some(post) => ops::qwen4exp_decode_fuse::moe_blend_hc_post(
+                            ctx.gpu,
+                            post,
+                            output,
+                            shared_out,
+                            input,
+                            self.weights.shared_expert_gate.weight,
+                            h,
+                            1,
+                            stream,
+                        )?,
+                        None => false,
+                    };
+                    if !posted {
+                        ops::moe_batched_blend(
+                            ctx.gpu,
+                            self.moe_batched_blend,
+                            output,
+                            shared_out,
+                            input,
+                            self.weights.shared_expert_gate.weight,
+                            h,
+                            1,
+                            stream,
+                        )?;
+                    }
                 }
             }
         }
@@ -789,6 +827,6 @@ impl MoeLayer {
             tracing::info!("  MoE output: {:?}", vals);
         }
 
-        Ok(output)
+        Ok((output, posted))
     }
 }

@@ -21,6 +21,7 @@
 // 4 outputs per block, 64 threads (2 warps) per output. Cross-warp smem reduction.
 // Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
 
+#include "atlas_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -202,6 +203,7 @@ extern "C" __global__ void w4a16_gemv(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;
@@ -274,6 +276,7 @@ extern "C" __global__ void w4a16_gemv_sw(
     unsigned int N,
     unsigned int K
 ) {
+    atlas_pdl_enter();
     const unsigned int local_out = threadIdx.x / WARP_SIZE;       // 0..7
     const unsigned int lane = threadIdx.x % WARP_SIZE;            // 0..31
     const unsigned int n = blockIdx.x * N_PER_BLOCK_SW + local_out;
@@ -975,6 +978,7 @@ extern "C" __global__ void w4a16_gemv_qg(
     unsigned int num_heads,
     unsigned int head_dim
 ) {
+    atlas_pdl_enter();
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;
     const unsigned int local_out = threadIdx.x / threads_per_out;
     const unsigned int lane = threadIdx.x % threads_per_out;

@@ -43,7 +43,7 @@ use crate::layers::qwen3_attention::HcLowRank;
 /// A prefill is chunked (96 + tail here), so the TAIL chunk is what this gate
 /// decides: at 64 a 118-token prompt ran its 22-token tail on the split path
 /// for 27.7 ms of a 422 ms window.
-const HC_DECODE_MAX_T: u32 = 8;
+pub(super) const HC_DECODE_MAX_T: u32 = 8;
 
 /// `ATLAS_QWEN4EXP_NO_HC_GEMM=1`: revert the large-T collapse to the fused
 /// FP32 kernel (deploy-time kill switch; the GEMM path rounds `normed` to
@@ -122,6 +122,7 @@ pub fn hc_pre_lowrank(
             hc_mult,
             norm_eps,
             /* inject */ true,
+            None,
             stream,
         );
     }
@@ -199,6 +200,7 @@ pub fn hc_head_lowrank(
             hc_mult,
             norm_eps,
             /* inject */ false,
+            None,
             stream,
         );
     }
