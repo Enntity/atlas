@@ -397,6 +397,48 @@ pub(crate) fn stage_ptr() -> DevicePtr {
     DevicePtr(STAGE.with(Cell::get).0)
 }
 
+/// Pair exchanges on the side stream, each issued after everything the main
+/// stream enqueued before it ([`SideExchanges::send`]); [`SideExchanges::join`]
+/// makes the main stream wait for them. Both ranks must send the same sizes
+/// in the same order.
+pub struct SideExchanges<'a> {
+    ctx: &'a ForwardContext<'a>,
+    side: Side,
+}
+
+impl<'a> SideExchanges<'a> {
+    /// `None` without a communicator.
+    pub fn new(ctx: &'a ForwardContext<'a>) -> Result<Option<Self>> {
+        if ctx.comm.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            ctx,
+            side: side(ctx.gpu)?,
+        }))
+    }
+
+    /// Swap `bytes` at `send` for the peer's, landing at `dst` (a copy).
+    pub fn send(&self, send: DevicePtr, dst: DevicePtr, bytes: usize, stream: u64) -> Result<()> {
+        let gpu = self.ctx.gpu;
+        gpu.record_event(self.side.to_side, stream)?;
+        gpu.stream_wait_event(self.side.stream, self.side.to_side)?;
+        let comm = self.ctx.comm.expect("checked in new");
+        ensure!(
+            comm.exchange_async(send.0, dst.0, bytes, false, self.side.stream)?,
+            "qwen4exp side exchange refused ({bytes} bytes)"
+        );
+        Ok(())
+    }
+
+    /// Make `stream` wait for every exchange sent.
+    pub fn join(self, stream: u64) -> Result<()> {
+        let gpu = self.ctx.gpu;
+        gpu.record_event(self.side.to_main, self.side.stream)?;
+        gpu.stream_wait_event(stream, self.side.to_main)
+    }
+}
+
 fn side(gpu: &dyn GpuBackend) -> Result<Side> {
     if let Some(s) = SIDE.with(Cell::get) {
         return Ok(s);
@@ -429,47 +471,5 @@ fn stage(gpu: &dyn GpuBackend, bytes: usize, main: u64, side: u64) -> Result<Dev
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{PIECE, Pieces};
-
-    fn pieces(m: usize, lead: usize, rows: usize) -> Pieces {
-        Pieces {
-            m,
-            lead,
-            rows,
-            sent: 0,
-            done: 0,
-        }
-    }
-
-    /// Walk the slabs: every piece goes out exactly once, in order, and only
-    /// once all the local rows its window part covers are done.
-    #[test]
-    fn pieces_wait_for_their_rows_and_cover_the_window() {
-        for (m, lead, rows) in [
-            (8192, 0, 8192),
-            (8192, 338, 7854),
-            (8192, 0, 7854),
-            (2048, 0, 2048),
-            (7000, 0, 7000),
-            (9000, 1000, 8000),
-        ] {
-            let mut p = pieces(m, lead, rows);
-            let mut covered = 0;
-            let mut t = 0;
-            while t < rows {
-                t = (t + PIECE).min(rows);
-                p.done = t;
-                while let Some((w0, n)) = p.next_ready() {
-                    assert_eq!(w0, covered, "{m}/{lead}/{rows}: in order");
-                    // Window rows [w0, w0 + n) are local rows [w0 - lead, ..).
-                    assert!((w0 + n).saturating_sub(lead).min(rows) <= p.done);
-                    covered += n;
-                    p.sent += 1;
-                }
-            }
-            assert_eq!(covered, m, "{m}/{lead}/{rows}: the whole window");
-            assert_eq!(p.sent, p.count());
-        }
-    }
-}
+#[path = "qwen4exp_sp_pipe_tests.rs"]
+mod tests;
