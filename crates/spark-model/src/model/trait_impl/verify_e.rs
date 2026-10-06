@@ -486,23 +486,16 @@ impl TransformerModel {
             // slot-vector churn can never push the path permanently eager.
             let capture = graphs.is_some();
 
-            // PLE's host half for EVERY sequence's draft window, hoisted
-            // before capture/replay. Sequence i owns rows [off[i], off[i+1]),
-            // and its n-gram history is its own — staging the batch prefix for
-            // all of them would inject one sequence's history into the rest.
-            // Without this the forward falls back to a D2H readback, which
-            // invalidates the recording graph (901). #753 item B.
-            for (i, seq) in seqs.iter_mut().enumerate() {
-                let window = &tokens[off[i]..off[i + 1]];
-                for (li, l) in self.layers.iter().enumerate() {
-                    l.verify_prestage(
-                        window,
-                        seq.layer_states[li].as_mut(),
-                        self.gpu.as_ref(),
-                        stream,
-                    )?;
-                }
-            }
+            // No PLE prestage here: the PLE layer hashes and gathers each
+            // sequence's rows inside its forward (`forward_rows`, the ids
+            // sliced from `host_token_ids`), as the batched decode does. A
+            // prestage parks its slot list in the layer's ONE `slots_dev`
+            // buffer for the next forward to read, so staging every
+            // sequence up front left all of them reading the last one's
+            // n-gram embeddings (and released each sequence's cache pins
+            // before its gather ran). Nothing needs the hoist: a PLE layer
+            // vetoes both the whole-step graph (`layer_veto`) and the
+            // piecewise runs, so its forward always runs eagerly.
 
             let ctx = ForwardContext {
                 ssm_batch: None,
