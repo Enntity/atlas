@@ -32,16 +32,17 @@
 // Build/run (repo root, GB10): scripts/dev/qwen4exp_wide_rows_bench.sh check|time|sweep
 //
 // Measured 2026-10-06 on GB10 (ennspark03): PASS at every M above. us per
-// call [GB/s of weight bytes], old chunks -> one wide launch:
-//                         M=8          16           24           32
-//   GDN qkvz TP2     182 -> 173   398 -> 178   575 -> 258   781 -> 310 [135]
-//   GDN out_proj TP2  68 ->  70   115 ->  72   168 -> 100   213 -> 121 [130]
-//   LM head half    2802 -> 2625 5555 -> 2553 8379 -> 3863 11094 -> 4487
-//   Q+gate 12 heads   83 ->   -   161 -> 130   238 -> 202   324 -> 242
-//   router            14 ->   -    27 ->  22    39 ->  35    51 ->  43 (batch16)
-//   K/V               12 ->   -    25 ->  21    37 ->  34    49 ->  39 (batch16)
-//   o_proj            41 ->   -    80 ->  82   119 -> 129   158 -> 161 (batch16:
-//                                                           no gain, not wired)
+// call [GB/s of weight bytes], old chunks -> one wide launch (the 32-row
+// tiers are the pair tiers; one-output-a-thread rows32 in brackets):
+//                         M=8          16           24                32
+//   GDN qkvz TP2     182 -> 172   397 -> 178   575 -> 244 (259)   764 -> 278 (310)
+//   GDN out_proj TP2  69 ->  69   129 ->  72   195 -> 108 (100)   207 -> 119 (121)
+//   LM head half    2586 -> 2502 5092 -> 2618 7631 -> 3342 (3758) 10169 -> 3851 (4486)
+//   Q+gate 12 heads   83 ->   -   160 -> 130   241 -> 178 (202)   316 -> 208 (243)
+//   router            14 ->   -    27 ->  22    39 ->  35          51 ->  43 (batch16)
+//   K/V               12 ->   -    25 ->  21    37 ->  34          49 ->  39 (batch16)
+//   o_proj            41 ->   -    80 ->  82   119 -> 129         158 -> 161 (batch16:
+//                                                                  no gain, not wired)
 // w4a16_gemv_batch32 loses to two batch16 passes at every shape here.
 #include "qwen4exp_ptx_harness.h"
 
@@ -106,14 +107,26 @@ static void same(const char* what, const std::vector<bf>& ref, const std::vector
 }
 
 // ---- BF16 ------------------------------------------------------------------
-struct Bf16Tier { const char* fn; unsigned rows, npb; };
-static const Bf16Tier BF16_TIERS[] = {{"qwen4exp_bf16_rows16", 16, 4}, {"qwen4exp_bf16_rows32", 32, 8}};
+// A wide tier: kernel, rows, outputs per CTA, threads per CTA.
+struct Tier { const char* fn; unsigned rows, npb, threads; };
+static const std::vector<Tier> BF16_TIERS = {
+    {"qwen4exp_bf16_rows16", 16, 4, 256}, {"qwen4exp_bf16_rows32", 32, 16, 512}};
+// Sweep shapes, checked like the production tiers: the one-output-a-thread
+// rows32 the pair tier replaced, and other pair shapes.
+static const std::vector<Tier> BF16_SWEEP = {
+    {"qw_sweep_bf16_m32_n8_s1", 32, 8, 512}, {"qw_pair_bf16_m32_n8_o2_r16", 32, 8, 256},
+    {"qw_pair_bf16_m32_n8_o2_r8", 32, 8, 256}, {"qw_pair_bf16_m32_n16_o2_r8", 32, 16, 512}};
+static std::vector<Tier> bf16_tiers() {
+    std::vector<Tier> t = BF16_TIERS;
+    t.insert(t.end(), BF16_SWEEP.begin(), BF16_SWEEP.end());
+    return t;
+}
 
-static void bf16_launch(CUfunction f, unsigned npb, const bf* A, const bf* W, bf* C, unsigned m,
+static void bf16_launch(CUfunction f, const Tier& t, const bf* A, const bf* W, bf* C, unsigned m,
                         unsigned N, unsigned K, unsigned stride) {
     Args a;
     a.add(A).add(W).add(C).add(m).add(N).add(K).add(stride);
-    launch(f, dim3((N + npb - 1) / npb), dim3(64 * npb), 0, a);
+    launch(f, dim3((N + t.npb - 1) / t.npb), dim3(t.threads), 0, a);
 }
 
 static void bf16_check() {
@@ -131,13 +144,13 @@ static void bf16_check() {
             launch(g1, dim3((s.N + 3) / 4), dim3(256), 0, a);
         }
         const auto ref = R.get();
-        for (auto& t : BF16_TIERS) {
+        for (auto& t : bf16_tiers()) {
             CUfunction f = mod("qwen4exp_wide_rows").fn(t.fn);
             for (unsigned m = 1; m <= t.rows; m++) {
                 // Rows [32 - m, 32): a window that is not the first rows.
                 const unsigned r0 = 32 - m;
                 G.fill(0x55);
-                bf16_launch(f, t.npb, A.p + (size_t)r0 * s.K, W.p, G.p, m, s.N, s.K, s.N);
+                bf16_launch(f, t, A.p + (size_t)r0 * s.K, W.p, G.p, m, s.N, s.K, s.N);
                 CK(cudaDeviceSynchronize());
                 const auto got = G.get();
                 char what[128];
@@ -162,15 +175,22 @@ static Fp4 make_fp4(unsigned N, unsigned K) {
     return w;
 }
 
-struct QgTier { const char* fn; unsigned rows, npb; };
-static const QgTier QG_TIERS[] = {{"qwen4exp_qg_rows16", 16, 4}, {"qwen4exp_qg_rows32", 32, 8}};
+static const std::vector<Tier> QG_TIERS = {
+    {"qwen4exp_qg_rows16", 16, 4, 256}, {"qwen4exp_qg_rows32", 32, 8, 256}};
+static const std::vector<Tier> QG_SWEEP = {
+    {"qw_sweep_qg_m32_n8_s1", 32, 8, 512}, {"qw_pair_qg_m32_n16_o2_r16", 32, 16, 512}};
+static std::vector<Tier> qg_tiers() {
+    std::vector<Tier> t = QG_TIERS;
+    t.insert(t.end(), QG_SWEEP.begin(), QG_SWEEP.end());
+    return t;
+}
 
-static void qg_launch(CUfunction f, unsigned npb, const bf* A, const Fp4& w, bf* C, unsigned m,
+static void qg_launch(CUfunction f, const Tier& t, const bf* A, const Fp4& w, bf* C, unsigned m,
                       unsigned N, unsigned K, unsigned stride, unsigned heads, unsigned hd) {
     Args a;
     a.add(A).add(w.packed.p).add(w.scale.p).add(w.s2).add(C).add(m).add(N).add(K).add(stride)
         .add(heads).add(hd);
-    launch(f, dim3((N + npb - 1) / npb), dim3(64 * npb), 0, a);
+    launch(f, dim3((N + t.npb - 1) / t.npb), dim3(t.threads), 0, a);
 }
 static void qg1_launch(const bf* A, const Fp4& w, bf* C, unsigned N, unsigned K, unsigned heads,
                        unsigned hd) {
@@ -189,12 +209,12 @@ static void qg_check() {
         A.put(rbf(A.n, 1.0f));
         for (unsigned r = 0; r < 32; r++) qg1_launch(A.p + (size_t)r * K, w, R.p + (size_t)r * N, N, K, heads, hd);
         const auto ref = R.get();
-        for (auto& t : QG_TIERS) {
+        for (auto& t : qg_tiers()) {
             CUfunction f = mod("qwen4exp_wide_rows").fn(t.fn);
             for (unsigned m = 1; m <= t.rows; m++) {
                 const unsigned r0 = 32 - m;
                 G.fill(0x55);
-                qg_launch(f, t.npb, A.p + (size_t)r0 * K, w, G.p, m, N, K, N, heads, hd);
+                qg_launch(f, t, A.p + (size_t)r0 * K, w, G.p, m, N, K, N, heads, hd);
                 CK(cudaDeviceSynchronize());
                 char what[128];
                 snprintf(what, sizeof what, "%s M=%u heads=%u", t.fn, m, heads);
@@ -322,7 +342,7 @@ static void verify_check() {
                 a.add(A.p + (size_t)f * K).add(Wb.p).add(G.p + (size_t)f * NB).add(m).add(NB).add(K).add(NB);
                 launch(bm, dim3((NB + 3) / 4), dim3(256), 0, a);
             } else {
-                bf16_launch(mod("qwen4exp_wide_rows").fn(BF16_TIERS[t].fn), BF16_TIERS[t].npb,
+                bf16_launch(mod("qwen4exp_wide_rows").fn(BF16_TIERS[t].fn), BF16_TIERS[t],
                             A.p + (size_t)f * K, Wb.p, G.p + (size_t)f * NB, m, NB, K, NB);
             }
             f += m;
@@ -336,7 +356,7 @@ static void verify_check() {
             const bf* in = A.p + (size_t)f * K;
             bf* out = G.p + (size_t)f * NQ;
             if (t >= 0) {
-                qg_launch(mod("qwen4exp_wide_rows").fn(QG_TIERS[t].fn), QG_TIERS[t].npb, in, q, out, m, NQ, K, NQ, heads, hd);
+                qg_launch(mod("qwen4exp_wide_rows").fn(QG_TIERS[t].fn), QG_TIERS[t], in, q, out, m, NQ, K, NQ, heads, hd);
             } else if (m == 1) {
                 qg1_launch(in, q, out, NQ, K, heads, hd);
             } else {
@@ -406,11 +426,12 @@ static void bf16_time(bool sweep) {
     struct { const char* n; unsigned N, K; } shapes[] = {
         {"GDN qkvz TP2 8192x2560", 8192, 2560}, {"GDN out_proj TP2 2560x3072", 2560, 3072},
         {"LM head half 124160x2560", 124160, 2560}};
-    std::vector<std::tuple<const char*, unsigned, unsigned>> tiers = {
-        {"qwen4exp_bf16_rows16", 16, 4}, {"qwen4exp_bf16_rows32", 32, 8}};
-    if (sweep)
-        tiers.insert(tiers.end(), {{"qw_sweep_bf16_m16_n8_s2", 16, 8}, {"qw_sweep_bf16_m32_n16_s2", 32, 16},
-                                   {"qw_sweep_bf16_m32_n4_s1", 32, 4}});
+    std::vector<Tier> tiers = BF16_TIERS;
+    if (sweep) {
+        tiers.insert(tiers.end(), {{"qw_sweep_bf16_m16_n8_s2", 16, 8, 512}, {"qw_sweep_bf16_m32_n16_s2", 32, 16, 1024},
+                                   {"qw_sweep_bf16_m32_n4_s1", 32, 4, 256}});
+        tiers.insert(tiers.end(), BF16_SWEEP.begin(), BF16_SWEEP.end());
+    }
     for (auto& s : shapes) {
         const double wb = (double)s.N * s.K * 2;
         const int copies = std::max(2, (int)(160e6 / wb) + 1);
@@ -429,12 +450,10 @@ static void bf16_time(bool sweep) {
             });
         });
         for (auto& tier : tiers) {
-            const char* fn = std::get<0>(tier);
-            const unsigned rows = std::get<1>(tier), npb = std::get<2>(tier);
-            CUfunction f = mod("qwen4exp_wide_rows").fn(fn);
-            time_row(fn, wb, copies, iters, [&](unsigned m, int c) {
-                chunks(m, rows, [&](unsigned fr, unsigned r) {
-                    bf16_launch(f, npb, A.p + (size_t)fr * s.K, W[c].p, C.p + (size_t)fr * s.N, r, s.N, s.K, s.N);
+            CUfunction f = mod("qwen4exp_wide_rows").fn(tier.fn);
+            time_row(tier.fn, wb, copies, iters, [&](unsigned m, int c) {
+                chunks(m, tier.rows, [&](unsigned fr, unsigned r) {
+                    bf16_launch(f, tier, A.p + (size_t)fr * s.K, W[c].p, C.p + (size_t)fr * s.N, r, s.N, s.K, s.N);
                 });
             });
         }
@@ -472,18 +491,17 @@ static void fp4_time(bool sweep) {
                 }
             });
         });
-        std::vector<std::tuple<const char*, unsigned, unsigned>> tiers = {
-            {"qwen4exp_qg_rows16", 16, 4}, {"qwen4exp_qg_rows32", 32, 8}};
-        if (sweep)
-            tiers.insert(tiers.end(), {{"qw_sweep_qg_m16_n8_s2", 16, 8}, {"qw_sweep_qg_m32_n16_s2", 32, 16},
-                                       {"qw_sweep_qg_m8_n4_s2", 8, 4}});
+        std::vector<Tier> tiers = QG_TIERS;
+        if (sweep) {
+            tiers.insert(tiers.end(), {{"qw_sweep_qg_m16_n8_s2", 16, 8, 512}, {"qw_sweep_qg_m32_n16_s2", 32, 16, 1024},
+                                       {"qw_sweep_qg_m8_n4_s2", 8, 4, 256}});
+            tiers.insert(tiers.end(), QG_SWEEP.begin(), QG_SWEEP.end());
+        }
         for (auto& tier : tiers) {
-            const char* fn = std::get<0>(tier);
-            const unsigned rows = std::get<1>(tier), npb = std::get<2>(tier);
-            CUfunction f = mod("qwen4exp_wide_rows").fn(fn);
-            time_row(fn, wb, copies, 20, [&](unsigned m, int c) {
-                chunks(m, rows, [&](unsigned fr, unsigned r) {
-                    qg_launch(f, npb, A.p + (size_t)fr * K, W[c], C.p + (size_t)fr * N, r, N, K, N, heads, hd);
+            CUfunction f = mod("qwen4exp_wide_rows").fn(tier.fn);
+            time_row(tier.fn, wb, copies, 20, [&](unsigned m, int c) {
+                chunks(m, tier.rows, [&](unsigned fr, unsigned r) {
+                    qg_launch(f, tier, A.p + (size_t)fr * K, W[c], C.p + (size_t)fr * N, r, N, K, N, heads, hd);
                 });
             });
         }

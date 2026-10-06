@@ -18,8 +18,8 @@
 //! Chunking, from the bench (GB10, weights streamed from DRAM): at most
 //! [`WIDE_MIN_ROWS`] rows stay on the narrow kernels, which are DRAM-bound
 //! there; past it a chunk takes the narrowest wide tier that covers it, up
-//! to 32 rows. 16 rows of GDN qkvz cost what 8 did (177 us), 32 rows 310 us
-//! against 754 for four 8-row passes; the LM head 4.5 ms against 10.4.
+//! to 32 rows. 16 rows of GDN qkvz cost what 8 did (177 us), 32 rows 278 us
+//! against 764 for four 8-row passes; the LM head 3.85 ms against 10.2.
 //! `w4a16_gemv_batch32` is slower than two `batch16` passes at these shapes
 //! and is not used.
 
@@ -33,8 +33,10 @@ use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 /// Row capacities of the wide tiers, narrowest first (the kernels' MAX_M).
 const WIDE_ROWS: [u32; 2] = [16, 32];
-/// Outputs per CTA of each tier (the kernels' NPB; 64 threads an output).
-const WIDE_NPB: [u32; 2] = [4, 8];
+/// `(outputs, threads)` a CTA of each tier: the kernels' NPB, and 64 threads
+/// an output (the 16-row tiers) or a pair of outputs (the 32-row pair tiers).
+const BF16_CTA: [(u32, u32); 2] = [(4, 256), (16, 512)];
+const QG_CTA: [(u32, u32); 2] = [(4, 256), (8, 256)];
 /// Chunks of at most this many rows keep the narrow kernels.
 const WIDE_MIN_ROWS: u32 = 8;
 
@@ -125,9 +127,10 @@ impl Qwen4ExpWideRows {
                 k.is_multiple_of(8),
                 "qwen4exp_bf16_rows: k={k} not a multiple of 8"
             );
+            let (npb, threads) = BF16_CTA[t];
             KernelLaunch::new(gpu, self.bf16[t])
-                .grid([div_ceil(n, WIDE_NPB[t]), 1, 1])
-                .block([64 * WIDE_NPB[t], 1, 1])
+                .grid([div_ceil(n, npb), 1, 1])
+                .block([threads, 1, 1])
                 .arg_ptr(a)
                 .arg_ptr(weight.weight)
                 .arg_ptr(c)
@@ -169,9 +172,10 @@ impl Qwen4ExpWideRows {
             "qwen4exp_qg_rows{}: {rows} rows, k={k}",
             WIDE_ROWS[t]
         );
+        let (npb, threads) = QG_CTA[t];
         KernelLaunch::new(gpu, self.qg[t])
-            .grid([div_ceil(n, WIDE_NPB[t]), 1, 1])
-            .block([64 * WIDE_NPB[t], 1, 1])
+            .grid([div_ceil(n, npb), 1, 1])
+            .block([threads, 1, 1])
             .arg_ptr(input)
             .arg_ptr(w.weight)
             .arg_ptr(w.weight_scale)
