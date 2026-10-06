@@ -2,7 +2,8 @@
 //! Side-stream helpers of `qwen4exp_sp_pipe` (split for the line cap): pair
 //! swaps issued piece by piece ([`SideExchanges`], the QSA list split) and
 //! reduce-scatter offers between a caller and the site computing its partial
-//! ([`RsOffer`], `ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE`).
+//! ([`RsOffer`], `ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE`), and the SP scratch
+//! preallocation size ([`prealloc_rows`]).
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
@@ -92,4 +93,24 @@ pub fn rs_offered() -> bool {
 /// The offered reduce-scatter ran in the site.
 pub fn rs_took() {
     OFFER.with(|c| c.set(2));
+}
+
+/// `ATLAS_QWEN4EXP_SP_PREALLOC=1`: the SP scratch (this stage, the QSA list
+/// slots, the route buffer) is sized for the largest chunk the arena takes on
+/// its first use, so a later, longer prompt never grows it mid-pass (a stream
+/// drain plus `cuMemFree` / `cuMemAlloc` inside a measured prefill).
+pub fn prealloc_rows(ctx: &ForwardContext<'_>) -> usize {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        matches!(
+            std::env::var("ATLAS_QWEN4EXP_SP_PREALLOC").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    });
+    let row = ctx.config.hidden_size * 2;
+    if on && row > 0 {
+        ctx.buffers.sizes().hidden_states / row
+    } else {
+        0
+    }
 }
