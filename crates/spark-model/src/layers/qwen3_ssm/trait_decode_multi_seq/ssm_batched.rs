@@ -69,6 +69,11 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the caller's per-sequence
+        // `ssm_forward` loop, C1's mixer.
+        if ctx.levers.batch_bisect(ops::BISECT_GDN) {
+            return Ok(false);
+        }
         let use_f32_conv = self.conv1d_l2norm_f32_k.0 != 0;
         let use_f32_gdn = self.gdn_f32_k.0 != 0 && self.gated_rms_norm_f32_k.0 != 0;
         // QKVZ via dense-BF16/cuBLASLt, FP8 w8a16 GEMM, or NVFP4 batchm GEMV

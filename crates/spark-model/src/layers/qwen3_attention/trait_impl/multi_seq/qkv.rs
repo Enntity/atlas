@@ -41,26 +41,12 @@ fn qkv_os_enabled() -> bool {
 
 impl Qwen3AttentionLayer {
     pub(super) fn ms_phase_qkv(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
-        let MultiSeqCtx {
-            fwd,
-            n,
-            stream,
-            h,
-            nq,
-            nkv,
-            hd,
-            eps,
-            bf16,
-            q_dim,
-            q_proj_dim,
-            q_proj_bytes,
-            per_seq_qkv,
-            normed,
-            qkv_buf,
-            ..
-        } = *c;
+        let MultiSeqCtx { fwd, n, eps, .. } = *c;
 
-        if self.ms_qkv_exact4(c)? {
+        // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the sequential per-row arm.
+        if fwd.levers.batch_bisect(ops::BISECT_ATTN_PROJ) {
+            self.ms_qkv_seq_rows(c)?;
+        } else if self.ms_qkv_exact4(c)? {
             // qwen4_exp exact K=4 verify: serial decode's arithmetic per row
             // (`qkv_exact4.rs`).
         } else if n == 3
@@ -114,15 +100,7 @@ impl Qwen3AttentionLayer {
             // Never branch on the unpadded seqs.len() here.
             self.ms_qkv_batchm_bf16(c)?;
         } else {
-            for i in 0..n {
-                let normed_i = normed.offset(i * h * bf16);
-                let q_out_i = qkv_buf.offset(i * per_seq_qkv);
-                let k_out_i = q_out_i.offset(q_proj_bytes);
-                let v_out_i = k_out_i.offset((nkv * hd) as usize * bf16);
-
-                self.ms_qkv_seq_q(fwd, normed_i, q_out_i, q_proj_dim, q_dim, nq, hd, h, stream)?;
-                self.ms_qkv_seq_kv(fwd, normed_i, k_out_i, v_out_i, nkv, hd, h, stream)?;
-            }
+            self.ms_qkv_seq_rows(c)?;
         }
 
         // ── Per-request Q/K/V LoRA delta (batched bgmv), pre-norm. No-op when no
@@ -147,6 +125,36 @@ impl Qwen3AttentionLayer {
     /// True when q/k/v are plain dense BF16 — no NVFP4 and no FP8 sidecar — so
     /// the projection actually reads `self.attn.{q,k,v}_proj`. Laguna ships
     /// attention unquantized in the checkpoint and it stays that way.
+    /// Sequential per-token Q/K/V: each row through the single-row GEMVs.
+    fn ms_qkv_seq_rows(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            h,
+            nq,
+            nkv,
+            hd,
+            bf16,
+            q_dim,
+            q_proj_dim,
+            q_proj_bytes,
+            per_seq_qkv,
+            normed,
+            qkv_buf,
+            ..
+        } = *c;
+        for i in 0..n {
+            let normed_i = normed.offset(i * h * bf16);
+            let q_out_i = qkv_buf.offset(i * per_seq_qkv);
+            let k_out_i = q_out_i.offset(q_proj_bytes);
+            let v_out_i = k_out_i.offset((nkv * hd) as usize * bf16);
+            self.ms_qkv_seq_q(fwd, normed_i, q_out_i, q_proj_dim, q_dim, nq, hd, h, stream)?;
+            self.ms_qkv_seq_kv(fwd, normed_i, k_out_i, v_out_i, nkv, hd, h, stream)?;
+        }
+        Ok(())
+    }
+
     fn qkv_is_dense_bf16(&self) -> bool {
         let dense = |w: &Option<crate::weight_map::QuantWeight>| {
             w.as_ref()

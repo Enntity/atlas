@@ -131,12 +131,12 @@ pub fn hc_pre_site(
 /// row than the decode's.
 pub const HC_SPLIT_MAX_ROWS: u32 = 8;
 
-/// [`hc_pre_site`] for a multi-row decode or verify step. With `exact_rows`
-/// (`ATLAS_QWEN4EXP_BATCH_FAST`) a low-rank collapse of more than
-/// [`HC_SPLIT_MAX_ROWS`] rows runs as split-path chunks of at most that many
-/// rows, each row then the single-row decode collapse's bytes (the split
-/// kernels' per-row arithmetic does not depend on the row count). Anything
-/// else is `hc_pre_site` unchanged.
+/// [`hc_pre_site`] for a multi-row decode or verify step. With `max_rows > 0`
+/// (`ModelLevers::qwen4exp_hc_rows`: [`HC_SPLIT_MAX_ROWS`] under
+/// `ATLAS_QWEN4EXP_BATCH_FAST`) a low-rank collapse of more rows runs as
+/// split-path chunks of at most that many rows, each row then the single-row
+/// decode collapse's bytes (the split kernels' per-row arithmetic does not
+/// depend on the row count). Anything else is `hc_pre_site` unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn hc_pre_site_rows(
     gpu: &dyn GpuBackend,
@@ -151,14 +151,10 @@ pub fn hc_pre_site_rows(
     num_tokens: u32,
     hidden_size: u32,
     norm_eps: f32,
-    exact_rows: bool,
+    max_rows: u32,
     stream: u64,
 ) -> Result<()> {
-    if !(exact_rows
-        && site.lowrank.is_some()
-        && num_tokens > HC_SPLIT_MAX_ROWS
-        && !scratch.is_null())
-    {
+    if !(max_rows > 0 && site.lowrank.is_some() && num_tokens > max_rows && !scratch.is_null()) {
         return hc_pre_site(
             gpu,
             kernel,
@@ -176,7 +172,7 @@ pub fn hc_pre_site_rows(
         );
     }
     let (m, h) = (hc.hc_mult, hidden_size as usize);
-    for t0 in (0..num_tokens).step_by(HC_SPLIT_MAX_ROWS as usize) {
+    for t0 in (0..num_tokens).step_by(max_rows as usize) {
         let t = t0 as usize;
         hc_pre_site(
             gpu,
@@ -188,7 +184,7 @@ pub fn hc_pre_site_rows(
             post_out.offset(t * m * 4),
             comb_out.offset(t * m * m * 4),
             scratch,
-            (num_tokens - t0).min(HC_SPLIT_MAX_ROWS),
+            (num_tokens - t0).min(max_rows),
             hidden_size,
             norm_eps,
             stream,
@@ -346,11 +342,11 @@ pub fn hc_head_site_rows(
     num_tokens: u32,
     hidden_size: u32,
     norm_eps: f32,
-    exact_rows: bool,
+    max_rows: u32,
     stream: u64,
 ) -> Result<()> {
-    let chunk = if exact_rows && head.lowrank.is_some() && !scratch.is_null() {
-        HC_SPLIT_MAX_ROWS
+    let chunk = if max_rows > 0 && head.lowrank.is_some() && !scratch.is_null() {
+        max_rows
     } else {
         num_tokens.max(1)
     };

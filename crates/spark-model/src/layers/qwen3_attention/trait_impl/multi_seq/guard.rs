@@ -142,6 +142,13 @@ pub(super) fn plan_qsa_rows(
     let Some(qsa) = layer.qsa.as_ref() else {
         return Ok(false);
     };
+    // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: every step through the per-row phase.
+    if ctx
+        .levers
+        .batch_bisect(crate::layers::ops::BISECT_ATTN_ROWS)
+    {
+        return Ok(true);
+    }
     // `seq_lens[i]` is row i's 0-based position (`pos + 1` tokens visible).
     let first_active = seq_lens
         .iter()

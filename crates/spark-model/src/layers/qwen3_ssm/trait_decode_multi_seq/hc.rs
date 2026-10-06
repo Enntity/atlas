@@ -141,7 +141,7 @@ impl Qwen3SsmLayer {
             n as u32,
             h as u32,
             eps,
-            ctx.levers.qwen4exp_batch_fast,
+            ctx.levers.qwen4exp_hc_rows(),
             stream,
         )?;
         // Batched-GEMM core (QKVZ/out_proj weights read ONCE for all n rows —
@@ -203,7 +203,7 @@ impl Qwen3SsmLayer {
             n as u32,
             h as u32,
             eps,
-            ctx.levers.qwen4exp_batch_fast,
+            ctx.levers.qwen4exp_hc_rows(),
             stream,
         )?;
         // ATLAS_QWEN4EXP_BATCH_FAST: every live row through `forward`'s own
