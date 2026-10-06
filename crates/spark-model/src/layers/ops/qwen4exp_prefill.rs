@@ -9,6 +9,7 @@
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_LEAN=1`      | TP1 tc2 -> its lean twin (2 CTAs/SM)   | = tc2  |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_GP=1`        | `_g` QSA attention, rescheduled        | = `_g` |
 //! | `ATLAS_QWEN4EXP_PREFILL_BA_ROWS=1`       | GDN BA GEMM + gates, 2 tokens a CTA    | = `dense_gemm_ba_gates_prefill` |
+//! | `ATLAS_QWEN4EXP_PREFILL_FP8_W2=1`        | attention q/k/v FP8 x FP8 GEMM, 2x4 warps | = `fp8_fp8_gemm_t_m128` |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_SCORE=1`     | QSA block scorer, 16-byte loads, 2 rows a thread | = `qsa_score_rows_exact` |
 //! | `ATLAS_QWEN4EXP_PREFILL_GDN=1`           | GDN spine over 2 CTAs a head (TP2); wide `chunk_fwd_o` | = `..._pipe`, = `chunk_fwd_o` |
 //! | `ATLAS_QWEN4EXP_PREFILL_HC=1`            | mHC collapse: seam, down, up+mix fused | = default (`qwen4exp_prefill_hc`) |
@@ -397,6 +398,61 @@ pub fn launch_ba_gates_rows(
         .arg_u32(gate_stride)
         .arg_u32(nv)
         .arg_u32(vpg)
+        .launch(stream)?;
+    Ok(true)
+}
+
+/// `ATLAS_QWEN4EXP_PREFILL_FP8_W2=1`.
+fn fp8_w2_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_FP8_W2"))
+}
+
+/// `QF_BK` / `QF_STAGES` in `qwen4exp_fp8_gemm.cu`.
+const QF_BK: u32 = 128;
+const QF_STAGES: u32 = 2;
+
+/// An attention prefill projection (`fp8_fp8_gemm_t_m128`: E4M3 activations
+/// x E4M3 weight, BF16 out) on `qwen4exp_fp8_gemm_w2`: the same k32 MMA
+/// chain per output on 8 warps in a 2 x 4 grid with 128-wide K steps --
+/// every byte identical (`scripts/dev/qwen4exp_fp8_gemm_bench.cu`; GB10,
+/// TP2 q+gate 16016 x 6144 x 2560: 8.46 -> 5.16 ms; k/v: 0.54 -> 0.30).
+/// `ptrs` = [a_fp8, b_fp8, out], `dims` = [m, n, k]. `Ok(false)` launched
+/// nothing.
+pub fn try_fp8_gemm_w2(
+    gpu: &dyn GpuBackend,
+    ptrs: [DevicePtr; 3],
+    dims: [u32; 3],
+    stream: u64,
+) -> Result<bool> {
+    let [m, n, k] = dims;
+    if !fp8_w2_requested() || !k.is_multiple_of(QF_BK) || m == 0 || n == 0 {
+        return Ok(false);
+    }
+    launch_fp8_gemm_w2(gpu, ptrs, dims, stream)
+}
+
+/// [`try_fp8_gemm_w2`] without the switch.
+pub fn launch_fp8_gemm_w2(
+    gpu: &dyn GpuBackend,
+    [a, b, out]: [DevicePtr; 3],
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<bool> {
+    let kernel = crate::layers::try_kernel(gpu, "qwen4exp_fp8_gemm", "qwen4exp_fp8_gemm_w2");
+    if kernel.0 == 0 || !k.is_multiple_of(QF_BK) {
+        return Ok(false);
+    }
+    KernelLaunch::new(gpu, kernel)
+        .grid([n.div_ceil(128), m.div_ceil(128), 1])
+        .block([256, 1, 1])
+        .shared_mem(QF_STAGES * 256 * (QF_BK + 16))
+        .arg_ptr(a)
+        .arg_ptr(b)
+        .arg_ptr(out)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
         .launch(stream)?;
     Ok(true)
 }
