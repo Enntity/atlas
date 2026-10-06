@@ -149,6 +149,8 @@ impl TransformerModel {
         let dense_gemv_batchm_kernel = gpu
             .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
             .unwrap_or(spark_runtime::gpu::KernelHandle(0));
+        let qwen4exp_wide_rows =
+            crate::layers::ops::Qwen4ExpWideRows::resolve(gpu.as_ref(), &config.model_type);
         let argmax_kernel = gpu.kernel("argmax", "argmax_bf16")?;
         let argmax_batch_kernel = gpu
             .kernel("argmax", "argmax_bf16_batch")
@@ -685,6 +687,7 @@ impl TransformerModel {
             lm_head_dp4a_quant_kernel,
             dense_gemm_kernel,
             dense_gemv_batchm_kernel,
+            qwen4exp_wide_rows,
             argmax_kernel,
             argmax_batch_kernel,
             argmax_logits_kernel,

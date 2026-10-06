@@ -301,17 +301,14 @@ impl TransformerModel {
                         || self.levers.qwen4exp_batch_fast)
                     && !self.levers.batch_bisect(ops::BISECT_HEAD) =>
             {
-                // `DENSE_GEMV_BATCHM_MAX_M` rows a pass over the head.
-                ops::dense_gemv_batchm_chunked(
+                // Up to 32 rows a pass over the head (8 without the lane).
+                self.qwen4exp_wide_rows.dense_rows(
                     gpu,
                     self.dense_gemv_batchm_kernel,
                     input,
                     &weight,
                     out,
-                    rows32,
-                    n32,
-                    h32,
-                    pitch as u32,
+                    (rows32, n32, h32, pitch as u32),
                     stream,
                 )
             }

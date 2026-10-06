@@ -168,6 +168,8 @@ pub struct TransformerModel {
     /// at decode: reads the ~617 MB vocab weight once with coalesced uint4
     /// loads, vs the scalar dense_gemm_bf16 (16x16 FFMA, ~89 GB/s). 0 = absent.
     pub(super) dense_gemv_batchm_kernel: KernelHandle,
+    /// Its 16/32-row twins under `ATLAS_QWEN4EXP_BATCH_FAST` (the exact head).
+    pub(super) qwen4exp_wide_rows: crate::layers::ops::Qwen4ExpWideRows,
     pub(super) argmax_kernel: KernelHandle,
     /// Batched argmax (one block per row). 0 when the kernel set lacks it.
     pub(super) argmax_batch_kernel: KernelHandle,

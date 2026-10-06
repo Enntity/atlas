@@ -124,6 +124,8 @@ pub struct Qwen3SsmLayer {
     /// all verify rows. `KernelHandle(0)` on kernel sets that lack it →
     /// callers keep the per-token `dense_gemv` / tile-GEMM fallback.
     dense_gemv_batchm_k: KernelHandle,
+    /// Its 16/32-row twins under `ATLAS_QWEN4EXP_BATCH_FAST` (`exact_rows.rs`).
+    wide_rows: ops::Qwen4ExpWideRows,
     /// Per-row-FP8 GEMV siblings for `qkvz_fp8_dense`/`out_proj_fp8_dense`:
     /// M=1 `dense_gemv_fp8w` and the M<=8 batched `dense_gemv_fp8w_batchm`.
     /// `KernelHandle(0)` on kernel sets that lack them → BF16 decode path.
