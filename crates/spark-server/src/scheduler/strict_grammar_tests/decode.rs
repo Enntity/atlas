@@ -100,7 +100,6 @@ fn a_strict_refusal_in_serial_decode_ends_the_response_with_an_error() {
         None,
         None,
         None,
-        None,
         false,
         &sched,
     );

@@ -158,47 +158,11 @@ pub(super) fn bootstrap_one(
             return false;
         }
     };
-    // Build the seq's configured penalties (rep/presence/frequency/LZ/DRY)
-    // so the MTP bootstrap token sees the SAME penalties+history the
-    // non-MTP path applies — the root-cause fix for repetition_penalty /
-    // dry_multiplier never reaching MTP-emitted tokens. Cloned before the
-    // mutable `grammar_state` borrow to satisfy the borrow checker.
-    let penalties = crate::scheduler::sample_step::penalty_params_for(
-        a,
-        crate::scheduler::sample_step::PositionKind::Verify,
-        0.0,
-        None,
-        Vec::new(),
-    );
-    // #192: same per-tool-call-segment scoping as the main pipeline
-    // (`penalty_history_scope`) so MTP bootstrap tokens see the identical
-    // penalty landscape.
-    let history = crate::scheduler::sample_step::penalty_history_scope(
-        &a.output_tokens,
-        a.tool_call_end_token,
-    )
-    .to_vec();
-    // P1-4 (2026-07-09): the bootstrap token is one of only two
-    // stochastic sample points under MTP, and its stochastic branch
-    // previously sampled with a hardcoded `min_p: 0.0` deep inside
-    // `sample_token_with_grammar` — bypassing the MODEL.toml
-    // `min_p_floor` (0.05 on this family) that exists precisely to stop
-    // FP8/NVFP4 argmax-flip tail tokens. The sampler now reads
-    // `penalties.min_p`, which `penalty_params_for` copies from
-    // `a.min_p` (request value + floor, resolved in `sampling_setup`) —
-    // SSOT, no new channel. Kill-switch: ATLAS_NO_MTP_MINP=1.
-    let tok = match sample_token_with_grammar(
-        model,
-        logits,
-        a.temperature,
-        a.top_k,
-        a.top_p,
-        &[],
-        a.grammar_state.as_mut(),
-        &penalties,
-        &history,
-        &sched.levers.sampling(),
-    ) {
+    // Picked exactly as plain decode picks this row (`fast_greedy::pick_row`):
+    // the GPU argmax only where the pipeline provably keeps it, otherwise the
+    // full pipeline — inside `<think>` and right after it included, where the
+    // raw argmax used to be taken unmasked.
+    let tok = match crate::scheduler::fast_greedy::pick_row(model, logits, a, verify_ctx, None) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!("bootstrap sample error: {e:#}");

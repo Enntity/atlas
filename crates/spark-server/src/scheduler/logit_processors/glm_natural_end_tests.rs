@@ -60,6 +60,7 @@ fn pick(glm: bool, mid_word: bool, floor: u32, forced_budget: bool) -> u32 {
         tool_call_start_token: Some(903),
         tool_call_end_token: Some(904),
         glm_tool_boundary: sched.limits.glm_tool_boundary,
+        limits: sched.limits,
         mid_word_mask: Some(Arc::from(mid)),
         boundary_mask: Some(Arc::from(boundary)),
         sampling: SamplingLevers::default(),

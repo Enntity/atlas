@@ -46,9 +46,11 @@
 //! masked at position 0's state — a `\n` legal at JSON-value-start
 //! is not legal at JSON-comma-or-closebrace).
 //!
-//! Other state-dependent masks (mid-word lookback, last_token reads)
-//! still see slightly stale `output_tokens` for positions ≥ 1 —
-//! best-effort, mirrors greedy unroll.
+//! Every other piece of state a position reads (`<think>` phase, the
+//! mid-word and sentence-boundary lookbacks, the penalty history, the
+//! pipeline's own counters) is advanced between positions by committing the
+//! previous pick through the commit path's own rule, then restored
+//! (`emit_step::SpanShadow`): position `i` sees what serial decode would.
 
 mod argmax;
 mod fast_masked;
@@ -79,10 +81,6 @@ use spark_model::traits::Model;
 /// `a`: the active sequence; the pipeline mutates seq state in place
 /// (F2 confidence arm, sentence_defer_count, etc.).
 /// `ctx`: tokenizer special-token IDs used by the pipeline.
-/// `verify_pos`: this position's index within the verify span (0..K) —
-/// P1-3 (2026-07-09): used only to derive the per-token seed offset for
-/// the temp>0 sampling branch, matching the `output_tokens.len()`-based
-/// seed the non-MTP path would have used for the same emitted position.
 ///
 /// Mirrors the host-side path of `decode_logits_seq::process_seq_logits`
 /// for byte-identical pipeline semantics.
@@ -92,7 +90,6 @@ pub fn verify_pick_with_pipeline(
     vocab_size: usize,
     a: &mut ActiveSeq,
     ctx: &LogitsContext,
-    verify_pos: usize,
 ) -> u32 {
     use crate::scheduler::mtp_timing::Phase;
     // 1. Dequant per the same scheme as `process_seq_logits`, into a REUSED
@@ -127,9 +124,9 @@ pub fn verify_pick_with_pipeline(
     let mut f32_logits = scratch::ScratchGuard(f32_logits);
 
     // 2. Build this position's penalty/bias params (Verify kind: greedy,
-    //    seed-free, no caller bias — the builder still appends the A4 floor
-    //    and the rep/presence/freq/LZ/DRY gates from `a`). Cloned before the
-    //    `&mut a` borrow in `process_position_logits`.
+    //    seed-free, the request's bias — the builder still appends the A4
+    //    floor and the rep/presence/freq/LZ/DRY gates from `a`). Cloned before
+    //    the `&mut a` borrow in `process_position_logits`.
     //
     //    Without these penalties MTP-VERIFIED tokens were decided by a
     //    penalty-FREE argmax, so the MODEL.toml `repetition_penalty` /
@@ -138,13 +135,7 @@ pub fn verify_pick_with_pipeline(
     //    resulting emission is a penalty-aware ARGMAX (greedy) — an intended
     //    behavioral delta for speculative acceptance. Backward-compatible: a
     //    no-op when the penalties are neutral (rep==1.0, dry==0.0, etc.).
-    let penalties = crate::scheduler::sample_step::penalty_params_for(
-        a,
-        crate::scheduler::sample_step::PositionKind::Verify,
-        0.0,
-        None,
-        Vec::new(),
-    );
+    let penalties = crate::scheduler::sample_step::verify_penalty_params(a);
 
     // 3. Unified per-position post-processing (SSOT shared with the non-MTP
     //    path): force-temp-zero bypass → pipeline (forced-token short
@@ -177,17 +168,15 @@ pub fn verify_pick_with_pipeline(
     //     temperature / top_k / top_p / top_n_sigma / min_p. min_p is the
     //     resolved request+MODEL.toml-floor value, subject to the P1-4
     //     ATLAS_NO_MTP_MINP kill-switch. The seed advances per emitted
-    //     position (`output_tokens.len() + verify_pos`) — the same offset
-    //     FinalDecode would use if this position is accepted and emitted.
+    //     position (`output_tokens.len()`, which the span replay advances) —
+    //     the offset FinalDecode uses for the same emitted position.
     //     Unreachable under ATLAS_FORCE_TEMP_ZERO (the bypass in
     //     `process_position_logits` returns Some(argmax) before this point);
     //     the guard is kept as documentation. Kill-switch:
     //     ATLAS_NO_MTP_VERIFY_SAMPLE=1 reverts to the pinned argmax below.
     if ctx.sampling.mtp_verify_sample && a.temperature > 0.0 && !ctx.sampling.force_temp_zero {
         let t_sample = std::time::Instant::now();
-        let step_seed = a
-            .seed
-            .map(|s| s.wrapping_add((a.output_tokens.len() + verify_pos) as u64));
+        let step_seed = a.seed.map(|s| s.wrapping_add(a.output_tokens.len() as u64));
         let sampler_shape = spark_runtime::sampler::SamplingParams {
             temperature: a.temperature,
             top_k: a.top_k,
