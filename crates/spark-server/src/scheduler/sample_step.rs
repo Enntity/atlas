@@ -373,22 +373,9 @@ pub fn sample_token(
         }
     }
     if temperature == 0.0 {
-        // Greedy argmax over FP32.
-        //
-        // ★ LAST-WINS on exact ties: `max_by` returns the last of several equal
-        // maxima. The verify path's `argmax_*` kernels resolve ties to the
-        // lowest LANE (see review note 1 on the #23 thread), so at an exact tie
-        // a greedy sample here and a greedy verify pick can differ. Kept as-is
-        // because it matches the record tree — the point of this comment is
-        // that the engine is NOT uniformly first-wins, so a future tie
-        // investigation should not assume it is.
-        let best = f32_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
-        return Ok(best);
+        // Greedy argmax over FP32; exact ties go to the lowest index, the
+        // engine-wide rule (`argmax_first_wins_f32`).
+        return Ok(spark_runtime::sampler::argmax_first_wins_f32(&f32_logits));
     }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
@@ -518,16 +505,7 @@ pub fn sample_token_with_grammar(
     // output-token history — identical stage to the non-MTP path.
     apply_penalties_and_bias(&mut f32_logits, penalties, history);
     if temperature == 0.0 {
-        // LAST-WINS on exact ties, same as the suppress-ids branch above —
-        // and same caveat: the verify kernels are lowest-lane-wins, so this is
-        // not a shared tie contract across the engine.
-        let best = f32_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
-        return Ok(best);
+        return Ok(spark_runtime::sampler::argmax_first_wins_f32(&f32_logits));
     }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
