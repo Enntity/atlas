@@ -75,6 +75,8 @@ pub struct Qwen4ExpMtpProposerState {
     pub seq_len: usize,
     /// Drafts produced by the last `propose` (for `after_verify` trimming).
     pub last_num_drafted: usize,
+    /// A propose wrote rows no verdict has settled yet (`qwen4exp_mtp_kv.rs`).
+    pub awaiting_verdict: bool,
     /// Per-layer state for the reused body.
     pub body_state: Box<dyn LayerState>,
 }
@@ -239,6 +241,7 @@ impl Qwen4ExpMtpHead {
             block_table: Vec::new(),
             seq_len: 0,
             last_num_drafted: 0,
+            awaiting_verdict: false,
             body_state: self.module.body.alloc_state(gpu)?,
         })
     }
@@ -291,6 +294,9 @@ mod qwen4exp_mtp_forward;
 #[path = "qwen4exp_mtp_batch.rs"]
 mod qwen4exp_mtp_batch;
 
+#[path = "qwen4exp_mtp_kv.rs"]
+mod qwen4exp_mtp_kv;
+
 impl DraftProposer for Qwen4ExpMtpHead {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         Ok(Box::new(self.alloc_state_inner(gpu)?))
@@ -315,6 +321,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
             .downcast_mut::<Qwen4ExpMtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid qwen4_exp MTP proposer state"))?;
 
+        qwen4exp_mtp_kv::settle_unverified(st);
         let mut drafts = Vec::with_capacity(num_drafts);
         let mut current_token = last_token;
         for i in 0..num_drafts {
@@ -355,6 +362,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
             current_token = draft;
         }
         st.last_num_drafted = drafts.len();
+        st.awaiting_verdict = true;
         Ok(drafts)
     }
 
@@ -417,11 +425,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
             .as_any_mut()
             .downcast_mut::<Qwen4ExpMtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid qwen4_exp MTP proposer state"))?;
-        let num_drafted = st.last_num_drafted.max(1);
-        let num_to_trim = num_drafted.saturating_sub(num_accepted);
-        if num_to_trim > 0 {
-            st.seq_len = st.seq_len.saturating_sub(num_to_trim);
-        }
+        qwen4exp_mtp_kv::after_verdict(st, num_accepted);
         Ok(())
     }
 

@@ -246,6 +246,7 @@ impl Qwen4ExpMtpHead {
         let mut kv_cache = self.kv_cache.lock();
         let bs = kv_cache.block_size();
         for st in sts.iter_mut() {
+            super::qwen4exp_mtp_kv::settle_unverified(st);
             let need = (st.seq_len + num_drafts - 1) / bs + 1;
             while st.block_table.len() < need {
                 st.block_table.push(kv_cache.alloc_block()?);
@@ -307,6 +308,7 @@ impl Qwen4ExpMtpHead {
             drafts[i].truncate(kept);
             st.seq_len = kv_lens[i] + kept;
             st.last_num_drafted = kept;
+            st.awaiting_verdict = true;
         }
         if let Some(c) = out_conf {
             *c = lps
