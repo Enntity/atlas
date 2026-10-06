@@ -108,9 +108,10 @@ pub struct Qwen4ExpMtpHead {
     kv_cache: Mutex<PagedKvCache>,
 
     // Scratch owned by the proposer rather than borrowed from `ctx.buffers`.
-    // 6 small buffers, ~50 KB total at hidden=2560/hc=4: cheap, and it removes
-    // every aliasing question against the trunk's buffers, which the body is
-    // simultaneously using.
+    // 6 small buffers, sized for `PROPOSE_BATCH_MAX` rows (~400 KB at
+    // hidden=2560/hc=4; the per-sequence path uses row 0): cheap, and it
+    // removes every aliasing question against the trunk's buffers, which the
+    // body is simultaneously using.
     embed_buf: DevicePtr,
     normed_e: DevicePtr,
     e_branch: DevicePtr,
@@ -127,6 +128,18 @@ pub struct Qwen4ExpMtpHead {
     hc_expand_k: KernelHandle,
     hc_head_k: KernelHandle,
     argmax_k: KernelHandle,
+
+    // Batched propose (`qwen4exp_mtp_batch.rs`). Optional kernels: a zero
+    // handle keeps every batch on the per-sequence path.
+    dense_gemv_batchm_k: KernelHandle,
+    batched_embed_k: KernelHandle,
+    argmax_batch_k: KernelHandle,
+    argmax_batch_lp_k: KernelHandle,
+    /// Token chain, confidences and attention metadata of one batched propose
+    /// call, uploaded once and read back once (`qwen4exp_mtp_batch::Slab`).
+    batch_slab: DevicePtr,
+    /// Block-table entries per row that `batch_slab` holds.
+    batch_slab_blocks: usize,
 }
 
 impl Qwen4ExpMtpHead {
@@ -161,9 +174,14 @@ impl Qwen4ExpMtpHead {
             config.head_dim,
         );
         let num_blocks = max_seq_len / kv_config.block_size + 1;
+        let block_size = kv_config.block_size;
         let kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
 
-        let bf16 = |n: usize| -> Result<DevicePtr> { gpu.alloc(n * 2) };
+        let rows = qwen4exp_mtp_batch::PROPOSE_BATCH_MAX;
+        let bf16 = |n: usize| -> Result<DevicePtr> { gpu.alloc(rows * n * 2) };
+        // Every block a `max_seq_len` drafter sequence can reference, + 1 for
+        // the row being written (the allocator's `seq_len / bs + 1`).
+        let batch_slab_blocks = max_seq_len / block_size + 1;
         let draft = crate::layers::qwen4exp_draft_head::DraftHead::build(
             &lm_head,
             config.vocab_size,
@@ -200,6 +218,16 @@ impl Qwen4ExpMtpHead {
             hc_expand_k: gpu.kernel("hyper_connection", "hc_expand")?,
             hc_head_k: gpu.kernel("hyper_connection", "hc_head")?,
             argmax_k: gpu.kernel("argmax", "argmax_bf16")?,
+            dense_gemv_batchm_k: super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batchm",
+            ),
+            batched_embed_k: super::try_kernel(gpu, "embed_from_argmax", "batched_embed"),
+            argmax_batch_k: super::try_kernel(gpu, "argmax", "argmax_bf16_batch"),
+            argmax_batch_lp_k: super::try_kernel(gpu, "argmax", "argmax_bf16_batch_lp"),
+            batch_slab: gpu.alloc(qwen4exp_mtp_batch::slab_bytes(batch_slab_blocks))?,
+            batch_slab_blocks,
         })
     }
 
@@ -256,6 +284,9 @@ fn drafter_kv_config(slot: usize, num_kv_heads: usize, head_dim: usize) -> KvCac
 
 #[path = "qwen4exp_mtp_forward.rs"]
 mod qwen4exp_mtp_forward;
+
+#[path = "qwen4exp_mtp_batch.rs"]
+mod qwen4exp_mtp_batch;
 
 impl DraftProposer for Qwen4ExpMtpHead {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
@@ -322,6 +353,54 @@ impl DraftProposer for Qwen4ExpMtpHead {
         }
         st.last_num_drafted = drafts.len();
         Ok(drafts)
+    }
+
+    /// One drafter forward per draft position for all sequences, chained on
+    /// the device (`qwen4exp_mtp_batch.rs`). `Ok(None)` (per-sequence
+    /// fallback) outside its envelope: see [`Self::batch_admits`].
+    fn propose_batch(
+        &self,
+        last_tokens: &[u32],
+        _target_hiddens: &[DevicePtr],
+        positions: &[usize],
+        num_drafts: usize,
+        states: &mut [&mut dyn ProposerState],
+        _expected_owners: Option<&[crate::layers::dflash_head::SequenceGeneration]>,
+        ctx: &ForwardContext,
+        stream: u64,
+        out_conf: Option<&mut Vec<Vec<f32>>>,
+        grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
+    ) -> Result<Option<Vec<Vec<u32>>>> {
+        // Grammar masks are per position and host-applied: per-sequence only.
+        let masked = grammar_bitmasks.is_some_and(|m| m.iter().any(Option::is_some));
+        if masked || !self.batch_admits(last_tokens.len(), num_drafts, ctx) {
+            return Ok(None);
+        }
+        let mut sts = Vec::with_capacity(states.len());
+        for s in states.iter_mut() {
+            match s.as_any_mut().downcast_mut::<Qwen4ExpMtpProposerState>() {
+                Some(st) => sts.push(st),
+                None => return Ok(None),
+            }
+        }
+        self.propose_batch_impl(
+            last_tokens,
+            positions,
+            num_drafts,
+            &mut sts,
+            ctx,
+            stream,
+            out_conf,
+        )
+        .map(Some)
+    }
+
+    fn propose_batch_max(
+        &self,
+        buffers: &spark_runtime::buffers::BufferArena,
+        config: &atlas_core::config::ModelConfig,
+    ) -> usize {
+        self.batch_width(buffers, config)
     }
 
     fn after_verify(
