@@ -112,6 +112,7 @@ mod kda_indexed;
 mod hyper_connection_lowrank_gemm;
 #[path = "ops/hyper_connection_lowrank_prefill.rs"]
 mod hyper_connection_lowrank_prefill;
+pub(crate) use hyper_connection_lowrank_prefill::HC_PREFILL_SLAB;
 #[path = "ops/hyper_connection_lowrank_split.rs"]
 mod hyper_connection_lowrank_split;
 // GPU parity test, so it needs the cuda backend to compile at all. Gated on

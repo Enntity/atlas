@@ -205,20 +205,31 @@ impl TransformerModel {
         // Sequence-parallel chunk: each rank runs the row-local work over half
         // the rows (`layers::glm_sp`); the last layer leaves this rank's rows
         // of the contracted `hidden`, gathered below.
-        let sp = self.glm_prefill_sp_rows(
-            proc_count,
-            passengers.is_some() || use_decode_path || midcap.is_some(),
-            &ctx,
-        );
-        let sp_scope = sp.map(crate::layers::glm_sp::enter);
+        let sp_excluded = passengers.is_some() || use_decode_path || midcap.is_some();
+        let mut sp = self.glm_prefill_sp_rows(proc_count, sp_excluded, &ctx);
+        let mut sp_scope = sp.map(crate::layers::glm_sp::enter);
+        // qwen4_exp (`ATLAS_QWEN4EXP_PREFILL_SP`): the split starts at
+        // `first_layer`, after PLE (`model::qwen4exp_prefill_sp`).
+        let qsp = sp
+            .is_none()
+            .then(|| self.qwen4exp_prefill_sp_plan(proc_count, sp_excluded, &ctx))
+            .flatten();
         // ATLAS_GLM_DET_TRACE: the embeddings, each layer's highway rows, the result.
         let det = crate::det_trace::on_stream(self.gpu.as_ref(), stream);
         det.tap("emb", hidden, (0, proc_count), h * 2);
-        let det_out = sp.map_or((0, proc_count), |sp| (sp.row0, sp.rows));
         let hc_elem = crate::layers::ops::hc_elem_bytes(&self.config.model_type);
         let hc_row = self.config.hc_mult * h * hc_elem;
         for (i, layer) in self.layers.iter().enumerate() {
             crate::det_trace::set_layer(i);
+            if let Some(p) = qsp.filter(|p| p.active && i == p.first_layer) {
+                self.qwen4exp_sp_compact(p.sp, stream)?;
+                sp_scope = Some(crate::layers::glm_sp::enter(p.sp));
+                sp = Some(p.sp);
+            }
+            let _no_defer = qsp
+                .filter(|p| p.active && i + 1 == p.first_layer)
+                .map(|_| crate::layers::ops::qwen4exp_prefill_seam::NoDefer::new());
+            let det_out = sp.map_or((0, proc_count), |sp| (sp.row0, sp.rows));
             let t_pf = host_timing.then(std::time::Instant::now);
             let lt0 = if profile_now {
                 self.gpu.synchronize(stream)?;
@@ -278,6 +289,10 @@ impl TransformerModel {
                 t_in_prefill += t.elapsed();
             }
             det.tap("out", ctx.buffers.hc_streams(), det_out, hc_row);
+            if let Some(p) = qsp.filter(|p| p.check) {
+                let split = sp.is_some();
+                self.qwen4exp_sp_check(p, effective_seq_len_start, Some(i), split, stream);
+            }
             let t_df = host_timing.then(std::time::Instant::now);
             // DFlash chunked-prefill capture. `effective_seq_len_start` (==
             // proc_start) is the ABSOLUTE position of this chunk's first
@@ -419,6 +434,15 @@ impl TransformerModel {
         drop(sp_scope);
         if let Some(sp) = sp {
             sp.all_gather(hidden, self.config.hidden_size, &ctx, stream)?;
+            // qwen4_exp: both ranks' highway row 0 as unsplit (the drafter
+            // reads it).
+            if qsp.is_some() {
+                let streams = ctx.buffers.hc_streams();
+                crate::layers::glm_sp_uneven::share_row0(sp, streams, hc_row, &ctx, stream)?;
+            }
+        }
+        if let Some(p) = qsp.filter(|p| p.check) {
+            self.qwen4exp_sp_check(p, effective_seq_len_start, None, false, stream);
         }
         crate::det_trace::set_layer(self.layers.len());
         det.tap("final", hidden, (0, proc_count), h * 2);

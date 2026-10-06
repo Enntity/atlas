@@ -20,7 +20,7 @@ use crate::layers::qwen3_attention::HcLowRank;
 
 /// Rows per slab: bounds the scratch region (`sizes.rs` sizes it with
 /// `m.min(2048)`).
-pub(super) const HC_PREFILL_SLAB: u32 = 2048;
+pub(crate) const HC_PREFILL_SLAB: u32 = 2048;
 
 /// Everything a slab needs that does not change across the slabs of a call.
 pub(super) struct HcPrefillCall<'a> {

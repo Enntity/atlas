@@ -216,11 +216,13 @@ impl MoeLayer {
         // Sequence-parallel prefill (`layers::glm_sp`): routed experts run every
         // row; the shared expert and its blend run only this rank's rows, and
         // the EP all-reduce becomes a reduce-scatter into them.
-        let sp = crate::layers::glm_sp::current()
-            .filter(|sp| is_ep_prefill && num_tokens == 2 * sp.rows);
+        let sp =
+            crate::layers::glm_sp::current().filter(|sp| is_ep_prefill && num_tokens == sp.total());
+        // `full_shared` (qwen4_exp): every row, as unsplit; only the blend
+        // takes the local rows (`forward_prefill_finish`).
         let (shared_in, shared_n) = match sp {
-            Some(sp) => (sp.local(input, h as usize), sp.rows as u32),
-            None => (input, n),
+            Some(sp) if !sp.full_shared => (sp.local(input, h as usize), sp.rows as u32),
+            _ => (input, n),
         };
         let overlap_shared_reduce = has_shared
             && is_ep_prefill

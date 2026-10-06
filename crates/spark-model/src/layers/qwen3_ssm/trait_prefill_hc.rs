@@ -63,7 +63,14 @@ impl Qwen3SsmLayer {
             .ok_or_else(|| anyhow::anyhow!("prefill_inner_hc without mHC weights"))?;
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
-        let n = num_tokens as u32;
+        // Sequence-parallel prefill (`layers::glm_sp`, qwen4_exp): the mHC
+        // seams run this rank's `n` rows (compacted at row 0 of the highway
+        // and of `post`; the collapses write `hidden` at the local rows,
+        // which are then all-gathered); the GDN block and the MoE keep every
+        // row and reduce-scatter.
+        let sp = crate::layers::glm_sp::current().filter(|sp| sp.total() == num_tokens);
+        let n = sp.map_or(num_tokens, |sp| sp.rows) as u32;
+        let local = |x: DevicePtr| sp.map_or(x, |sp| sp.local(x, h));
 
         // Same counter the non-HC path bumps: one increment per SSM layer per
         // prefill, so `ATLAS_GDN_DUMP` still attributes an intermediate to the
@@ -118,6 +125,13 @@ impl Qwen3SsmLayer {
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
 
+        // The split starts after the layers that seed the highway and inject
+        // PLE (`model::qwen4exp_prefill_sp`): PLE's causal conv runs across
+        // the rows, so it needs every one of them.
+        anyhow::ensure!(
+            sp.is_none() || (!hc.is_first_model_layer && self.ple.is_none()),
+            "qwen4_exp SP prefill reached the hc_expand or PLE layer"
+        );
         if hc.is_first_model_layer {
             ops::qwen4exp_prefill_seam::clear_pending();
             ops::hc_expand(
@@ -172,7 +186,7 @@ impl Qwen3SsmLayer {
             hc,
             &hc.attn,
             streams,
-            hidden,
+            local(hidden),
             post,
             ctx.buffers.hc_lowrank_scratch(),
             n,
@@ -186,7 +200,7 @@ impl Qwen3SsmLayer {
                 streams,
                 &hc.attn,
                 hc,
-                hidden,
+                local(hidden),
                 post,
                 comb,
                 ctx.buffers.hc_lowrank_scratch(),
@@ -195,6 +209,9 @@ impl Qwen3SsmLayer {
                 eps,
                 stream,
             )?;
+        }
+        if let Some(sp) = sp {
+            sp.all_gather(hidden, h, ctx, stream)?;
         }
         stage!("hc_pre_attn");
         let hc_dim = hc.hc_mult * h;
@@ -227,8 +244,10 @@ impl Qwen3SsmLayer {
             num_tokens * hc.hc_mult,
             stream,
         );
+        // Under SP the block's TP reduce is a reduce-scatter
+        // (`ssm_tp_all_reduce`): this rank's rows are at `local(..)`.
         let out_proj_buf =
-            self.prefill_block(hidden, num_tokens, state, ssm_layer_idx, ctx, stream)?;
+            local(self.prefill_block(hidden, num_tokens, state, ssm_layer_idx, ctx, stream)?);
         stage!("gdn_block");
         crate::layers::ple::dump::tap_bf16(
             ctx.gpu,
@@ -247,7 +266,7 @@ impl Qwen3SsmLayer {
             &hc.ffn,
             out_proj_buf,
             streams,
-            hidden,
+            local(hidden),
             post,
             ctx.buffers.hc_lowrank_scratch(),
             n,
@@ -295,7 +314,7 @@ impl Qwen3SsmLayer {
                 streams,
                 &hc.ffn,
                 hc,
-                hidden,
+                local(hidden),
                 post,
                 comb,
                 ctx.buffers.hc_lowrank_scratch(),
@@ -306,21 +325,24 @@ impl Qwen3SsmLayer {
             )?;
         }
         stage!("hc_pre_ffn");
-        self.ffn.forward_prefill(hidden, num_tokens, ctx, stream)?;
+        let moe_out = match sp {
+            Some(sp) => {
+                sp.all_gather(hidden, h, ctx, stream)?;
+                self.ffn.forward_prefill_sp(hidden, sp, ctx, stream)?
+            }
+            None => {
+                self.ffn.forward_prefill(hidden, num_tokens, ctx, stream)?;
+                ctx.buffers.moe_output()
+            }
+        };
         stage!("moe");
         // ATLAS_QWEN4EXP_PREFILL_HC: left to the next layer's collapse.
-        if !ops::qwen4exp_prefill_seam::defer_post(
-            ctx.gpu,
-            hc,
-            ctx.buffers.moe_output(),
-            n,
-            h as u32,
-        ) {
+        if !ops::qwen4exp_prefill_seam::defer_post(ctx.gpu, hc, moe_out, n, h as u32) {
             ops::hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
                 hc,
-                ctx.buffers.moe_output(),
+                moe_out,
                 streams,
                 post,
                 comb,

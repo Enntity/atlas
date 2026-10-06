@@ -346,6 +346,11 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_QSA_TC2R", || {
         Ok(ops::qwen4exp_prefill::qsa_tc2r_requested() as u64)
     }),
+    // The qwen4_exp sequence-parallel prefill: a split rank exchanges rows
+    // the other never sends.
+    ("ATLAS_QWEN4EXP_PREFILL_SP", || {
+        Ok(super::qwen4exp_prefill_sp::requested() as u64)
+    }),
     // The qwen4_exp verify lane (per-row MoE all-reduces in the GDN layers'
     // verify) and the check's serial steps (their collectives).
     ("ATLAS_QWEN4EXP_EXACT_VERIFY", || {

@@ -36,6 +36,11 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // Sequence-parallel prefill (`layers::glm_sp`, qwen4_exp): a
+        // reduce-scatter into this rank's rows, at `sp.local(out_proj_buf)`.
+        if let Some(sp) = crate::layers::glm_sp::current().filter(|sp| sp.total() == num_tokens) {
+            return sp.reduce_scatter(out_proj_buf, ctx.config.hidden_size, ctx, stream);
+        }
         if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {

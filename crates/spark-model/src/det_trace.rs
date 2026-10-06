@@ -274,7 +274,7 @@ fn current(stage: &str) -> Option<At> {
     CURRENT.with(Cell::get)
 }
 
-fn device_hash(
+pub(crate) fn device_hash(
     gpu: &dyn GpuBackend,
     stream: u64,
     ptr: DevicePtr,
