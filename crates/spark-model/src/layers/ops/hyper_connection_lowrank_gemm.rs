@@ -146,5 +146,11 @@ pub(crate) fn hc_gemm(
             }
         }
     }
+    // ATLAS_LT_KCHAIN_PIN: the tile kernel's own in-order k-chain on a faster
+    // cuBLASLt kernel, byte for byte (`cublaslt::kchain_pin`; the mHC down
+    // GEMM of a full 2048-row slab, 2048x320x10240: 0.43 -> 0.31 ms).
+    if spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain(a.0, w.0, out.0, m, n, k, stream)? {
+        return Ok(());
+    }
     gemm_raw(gpu, kernel, a, w, out, m, n, k, stream)
 }

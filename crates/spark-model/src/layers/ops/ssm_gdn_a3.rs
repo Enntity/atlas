@@ -305,10 +305,26 @@ pub fn gdn_prefill_fla(
                 )
             })
             .flatten();
+        // qwen4_exp mid-chunk checkpoint (`layers::qwen4exp_ckpt`): the
+        // spine's `_cap` twin also stores the armed chunk's FP32 entry state.
+        let cap = crate::layers::qwen4exp_ckpt::take_spine()
+            .filter(|_| batch_size == 1 && !h_state_is_table && !is_varlen);
+        let cap_k = |name: &str| crate::layers::try_kernel(gpu, "gated_delta_rule_fla", name);
+        let cap_kernel = cap.and_then(|_| {
+            let k = if pipe_dv.is_some() {
+                cap_k("gated_delta_rule_chunk_delta_h_pipe_dv64_cap")
+            } else if use_fused && pipe {
+                cap_k("gated_delta_rule_chunk_delta_h_pipe_cap")
+            } else {
+                KernelHandle(0)
+            };
+            (k.0 != 0).then_some(k)
+        });
         let (k_cdh, cdh_grid_y, cdh_smem, cdh_block) = if let Some((k, smem)) = pipe_dv {
-            (k, batch_size * 2, smem, 128u32)
+            (cap_kernel.unwrap_or(k), batch_size * 2, smem, 128u32)
         } else if use_fused {
-            (k_chunk_delta_h_fused, batch_size, smem_fused, fused_block)
+            let k = cap_kernel.unwrap_or(k_chunk_delta_h_fused);
+            (k, batch_size, smem_fused, fused_block)
         } else if use_tcvb {
             (
                 k_chunk_delta_h_tc_vblock,
@@ -319,7 +335,7 @@ pub fn gdn_prefill_fla(
         } else {
             (k_chunk_delta_h, batch_size, smem_dh, 256u32)
         };
-        KernelLaunch::new(gpu, k_cdh)
+        let launch = KernelLaunch::new(gpu, k_cdh)
             .grid([num_v_heads, cdh_grid_y, 1])
             .block([cdh_block, 1, 1])
             .shared_mem(cdh_smem)
@@ -343,8 +359,15 @@ pub fn gdn_prefill_fla(
             .arg_u32(h_state_is_table as u32)
             .arg_ptr(cu_seqlens)
             .arg_ptr(cu_chunks)
-            .arg_u32(is_varlen as u32)
-            .launch(stream)?;
+            .arg_u32(is_varlen as u32);
+        let launch = match (cap, cap_kernel) {
+            (Some((chunk, dst)), Some(_)) => {
+                crate::layers::qwen4exp_ckpt::h_captured();
+                launch.arg_ptr(dst).arg_u32(chunk)
+            }
+            _ => launch,
+        };
+        launch.launch(stream)?;
         prof!("gdn_fla_chunk_delta_h", &mut t0);
     }
 

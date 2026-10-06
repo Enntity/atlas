@@ -429,20 +429,7 @@ impl PleLayer {
                 }
                 st.verify_snap_rows = num_tokens;
             } else {
-                ops::ple_conv(
-                    gpu,
-                    self.conv_k,
-                    self.gated_normed,
-                    self.gated,
-                    self.conv1d.weight,
-                    st.conv,
-                    self.out,
-                    n as u32,
-                    c as u32,
-                    self.k_size as u32,
-                    self.dilation as u32,
-                    stream,
-                )?;
+                self.conv_span(st, base, n, gpu, stream)?;
                 st.verify_snap_rows = 0;
             }
             ops::ple_add_highway(gpu, self.add_k, self.out, hspan, (n * c) as u32, stream)?;
@@ -476,6 +463,8 @@ pub struct PleWeights {
 // Child module (not sibling): the aux fns read PleLayer private
 // fields, and only a CHILD module sees them. Same #[path] trick
 // qsa.rs uses for its tests.
+#[path = "ckpt.rs"]
+mod ckpt;
 #[path = "verify.rs"]
 mod verify;
 
