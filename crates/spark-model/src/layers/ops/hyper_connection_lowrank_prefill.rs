@@ -138,7 +138,7 @@ pub(super) fn hc_pre_gemm(
     );
     // The fast arm's fused up+mix reads the `[hc_dim, rank]` copy too. Once
     // per call, not once per slab -- `up_wt` does not depend on `t0`.
-    if !call.lt || fast.is_some() {
+    if !call.lt || fast.as_ref().is_some_and(|k| k.reads_up_wt()) {
         let k_tr = gpu.kernel("hyper_connection", "hc_transpose_bf16")?;
         KernelLaunch::new(gpu, k_tr)
             .grid([(hc_dim as u32).div_ceil(32), rank.div_ceil(32), 1])
@@ -176,29 +176,54 @@ pub(super) fn hc_pre_gemm(
 /// be `None` (the checker runs the fold's `hc_post` itself first).
 pub(super) fn hc_slab_default(c: &HcPrefillCall, io: &HcSlabIo, stream: u64) -> Result<()> {
     debug_assert!(io.fold.is_none());
+    hc_stage(c, io, stream)?;
+    hc_low(c, io.ts, stream)?;
+    hc_slab_tail(c, io, stream)
+}
+
+/// normed = rmsnorm(highway) * norm_w, BF16, over the slab's rows.
+pub(super) fn hc_stage(c: &HcPrefillCall, io: &HcSlabIo, stream: u64) -> Result<()> {
+    KernelLaunch::new(
+        c.gpu,
+        c.gpu.kernel("hyper_connection", "hc_pre_stage_bf16")?,
+    )
+    .grid([io.ts, 1, 1])
+    .block([1024, 1, 1])
+    .arg_ptr(io.streams)
+    .arg_ptr(c.w.norm_w)
+    .arg_ptr(c.normed)
+    .arg_u32(c.hidden)
+    .arg_u32(c.hc_mult)
+    .arg_f32(c.eps)
+    .launch(stream)
+}
+
+/// low = silu(normed x down_w^T / hc)   [ts, rank]: the down projection on
+/// whichever GEMM fills the machine (`hc_gemm`; N=320 is skinny), then silu.
+pub(super) fn hc_low(c: &HcPrefillCall, ts: u32, stream: u64) -> Result<()> {
+    let k_gemm = c.gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?;
+    hc_gemm(
+        c.gpu,
+        k_gemm,
+        c.normed,
+        c.w.down_w,
+        c.low,
+        ts,
+        c.rank(),
+        c.hc_dim(),
+        c.sm_count,
+        stream,
+    )?;
+    hc_silu(c, ts, stream)
+}
+
+/// The default slab after `low`: up projection, injection, mix.
+pub(super) fn hc_slab_tail(c: &HcPrefillCall, io: &HcSlabIo, stream: u64) -> Result<()> {
     let gpu = c.gpu;
     let (ts, hc_dim, rank) = (io.ts, c.hc_dim(), c.rank());
-    let k_stage = gpu.kernel("hyper_connection", "hc_pre_stage_bf16")?;
     let k_mix = gpu.kernel("hyper_connection", "hc_pre_mix")?;
     let k_gemm = gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?;
     let inv_hc = 1.0f32 / c.hc_mult as f32;
-
-    KernelLaunch::new(gpu, k_stage)
-        .grid([ts, 1, 1])
-        .block([1024, 1, 1])
-        .arg_ptr(io.streams)
-        .arg_ptr(c.w.norm_w)
-        .arg_ptr(c.normed)
-        .arg_u32(c.hidden)
-        .arg_u32(c.hc_mult)
-        .arg_f32(c.eps)
-        .launch(stream)?;
-
-    // low_pre = normed x down_w^T   [ts, rank]   (N=320: skinny, split-K)
-    hc_gemm(
-        gpu, k_gemm, c.normed, c.w.down_w, c.low, ts, rank, hc_dim, c.sm_count, stream,
-    )?;
-    hc_silu(c, ts, stream)?;
 
     // up_pre = low x up_w   [ts, hc_dim]. N=10240 is 80 CTAs, so the tile
     // kernel's grid is not the problem here -- the staging transpose it

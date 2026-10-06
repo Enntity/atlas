@@ -5,28 +5,38 @@
 //!
 //! Per 2048-token slab the default runs seven launches over a 40 KB/token
 //! FP32 highway and two 20 KB/token BF16 intermediates (`hc_post`, stage,
-//! down GEMM, silu, up GEMM, injection GEMM, mix). This arm changes three of
+//! down GEMM, silu, up GEMM, injection GEMM, mix). This arm changes two of
 //! them, every output byte unchanged:
 //!
 //! 1. **Seam** (`hc_post_stage_bf16`): a sublayer's `hc_post` and the next
 //!    site's stage in one pass, the post values kept in registers -- one
 //!    highway read fewer (657 MB per seam at 16K tokens). Taken where a
 //!    post is followed at once by a pre (inside every layer).
-//! 2. **Down GEMM** on cuBLASLt for full slabs, where the default's machine
-//!    fill picks the 128x128 tile kernel: 0.40 -> 0.24 ms per slab.
-//! 3. **Up GEMM + mix** (`hc_up_mix_bf16_nt`): the up projection's tiles stay
+//! 2. **Up GEMM + mix** (`hc_up_mix_bf16_nt`): the up projection's tiles stay
 //!    in registers and fold into `y` in the epilogue -- the 42 MB `up_pre`
-//!    write and read and one launch fewer (0.74 -> 0.45 ms per slab).
+//!    write and read and one launch fewer (0.77 -> 0.45 ms per slab).
 //!
-//! Why 2 and 3 are exact: on GB10 a cuBLASLt BF16 GEMM whose heuristic picks
-//! a NON-split-K kernel returns, bit for bit, the plain in-order
-//! `mma.sync.m16n8k16` k-chain that the tile kernel and `hc_up_mix_bf16_nt`
-//! compute (measured over the mHC up/down and the GDN projection shapes, four
-//! cuBLASLt algorithms; only the split-K injection GEMM differs, and it is not
-//! touched). `scripts/dev/qwen4exp_hc_prefill_bench.cu` checks every byte,
-//! and `ATLAS_QWEN4EXP_PREFILL_HC_CHECK=<n>` re-runs the first `n` slabs
-//! (default 16) through the default path in serving and fails on any
-//! differing byte -- the guard against a cuBLASLt whose heuristics differ.
+//! The down and injection GEMMs are the default's own calls.
+//!
+//! Why 2 is exact, and only on the cuBLASLt versions in
+//! `UP_MIX_VERIFIED_LT`: the default's up GEMM is cuBLASLt, and
+//! `hc_up_mix_bf16_nt` computes the plain in-order `mma.sync.m16n8k16`
+//! k-chain. They agree byte for byte exactly when the library's heuristic
+//! picks a non-split kernel that runs that chain -- a property of the library
+//! version, not of the math. It held at every slab height 1..2048 on 13.0.0
+//! (the runtime image) and 13.1.1 (run against each library:
+//! `scripts/dev/qwen4exp_hc_prefill_bench.cu <dir> 2048 32 all`). Elsewhere
+//! the seam still serves and the up GEMM + mix stay the default's.
+//!
+//! The first version of this arm also moved full slabs' down GEMM to
+//! cuBLASLt on the same argument. That held on 13.1.1 (non-split) but not on
+//! 13.0.0, whose heuristic picks split-K 3 for 2048x320x10240: on the pair,
+//! `_HC_CHECK` failed the first slab (677002 of 10485760 `y` bytes). The down
+//! GEMM is the default's again; on 13.0.0 that cuBLASLt kernel was only
+//! 0.32 vs 0.41 ms anyway.
+//!
+//! `ATLAS_QWEN4EXP_PREFILL_HC_CHECK=<n>` re-runs the first `n` slabs (default
+//! 16) through the default path in serving and fails on any differing byte.
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -34,9 +44,9 @@ use spark_runtime::kernel_args::KernelLaunch;
 
 use super::hyper_connection_dispatch::HcVariant;
 use super::hyper_connection_lowrank::{HC_DECODE_MAX_T, hc_gemm_disabled, hc_post_lowrank};
-use super::hyper_connection_lowrank_gemm::hc_gemm;
 use super::hyper_connection_lowrank_prefill::{
-    HC_PREFILL_SLAB, HcPrefillCall, HcSlabIo, hc_inject, hc_pre_gemm, hc_silu, hc_slab_default,
+    HC_PREFILL_SLAB, HcPrefillCall, HcSlabIo, hc_inject, hc_low, hc_pre_gemm, hc_slab_default,
+    hc_slab_tail, hc_stage,
 };
 use super::qwen4exp_decode_fuse::HcPostFold;
 use crate::layers::qwen3_attention::{HcLowRank, HcSiteWeights, HcWeights};
@@ -66,10 +76,45 @@ fn check_left() -> &'static std::sync::atomic::AtomicI64 {
     })
 }
 
-/// The fast arm's two kernels, resolved per call.
+/// cuBLASLt versions ([`spark_runtime::cublaslt::version`]) whose BF16 up GEMM
+/// of the collapse (`[ts, rank] x [rank, hc*H]`, opN) was compared byte for
+/// byte against `hc_up_mix_bf16_nt` at every slab height 1..2048 on GB10:
+/// 13.0.0 (CUDA 13.0, the runtime image) and 13.1.1.
+const UP_MIX_VERIFIED_LT: [usize; 2] = [130000, 130101];
+
+/// The fused up GEMM + mix equals the default's up GEMM + mix: the default
+/// runs the tile kernel (no cuBLASLt), or a verified cuBLASLt.
+fn up_mix_exact() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        if !spark_runtime::cublaslt::available() {
+            return true;
+        }
+        let v = spark_runtime::cublaslt::version();
+        let ok = UP_MIX_VERIFIED_LT.contains(&v);
+        if !ok {
+            tracing::warn!(
+                "ATLAS_QWEN4EXP_PREFILL_HC: cuBLASLt {v} is not one the fused mHC up+mix was \
+                 verified against ({UP_MIX_VERIFIED_LT:?}); the seam serves, the up GEMM and \
+                 mix stay the default's"
+            );
+        }
+        ok
+    })
+}
+
+/// The fast arm's kernels, resolved per call. `up_mix` is `None` where the
+/// fused up+mix would not be exact ([`up_mix_exact`]).
 pub(super) struct HcFastKernels {
     post_stage: KernelHandle,
-    up_mix: KernelHandle,
+    up_mix: Option<KernelHandle>,
+}
+
+impl HcFastKernels {
+    /// Whether the slabs read `up_wt`, the `[hc*H, rank]` copy of `up_w`.
+    pub(super) fn reads_up_wt(&self) -> bool {
+        self.up_mix.is_some()
+    }
 }
 
 /// Rows per `hc_up_mix_bf16_nt` CTA and hidden columns per CTA (`HUM_BM`,
@@ -81,8 +126,10 @@ const HUM_BK: usize = 32;
 /// Shortest prefill the fast arm takes. Below it the per-call `up_w`
 /// transpose (0.04 ms a collapse) outweighs the savings: measured per
 /// layer-shaped round (2 posts, 3 collapses) on GB10, default vs fast,
-/// 0.44 / 0.62 ms at 100 tokens, 1.53 / 1.61 at 512, 3.56 / 3.02 at 1024,
-/// 58.6 / 45.5 at 16046 (`examples/qwen4exp_hc_prefill_check.rs`).
+/// 0.44 / 0.62 ms at 100 tokens, 1.53 / 1.61 at 512 (`examples/
+/// qwen4exp_hc_prefill_check.rs`, the first version of this arm). With the
+/// default's down GEMM, against the runtime image's cuBLASLt 13.0: 3.65 /
+/// 2.89 at 1024, 7.55 / 5.93 at 2048, 59.3 / 44.0 at 16046.
 const HC_FAST_MIN_T: u32 = 1024;
 
 /// The fast arm for this call, when requested and the shape fits the
@@ -106,11 +153,12 @@ pub(super) fn prefill_arm(
     {
         return None;
     }
+    let up_mix = crate::layers::try_kernel(gpu, "hyper_connection", "hc_up_mix_bf16_nt");
     let k = HcFastKernels {
         post_stage: crate::layers::try_kernel(gpu, "hyper_connection", "hc_post_stage_bf16"),
-        up_mix: crate::layers::try_kernel(gpu, "hyper_connection", "hc_up_mix_bf16_nt"),
+        up_mix: up_mix_exact().then_some(up_mix),
     };
-    if k.post_stage.0 == 0 || k.up_mix.0 == 0 {
+    if k.post_stage.0 == 0 || up_mix.0 == 0 {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
             tracing::warn!(
@@ -192,7 +240,7 @@ pub(super) fn hc_slab_fast(
 
 fn slab_fast(c: &HcPrefillCall, k: &HcFastKernels, io: &HcSlabIo, stream: u64) -> Result<()> {
     let gpu = c.gpu;
-    let (ts, hc_dim, rank) = (io.ts, c.hc_dim(), c.rank());
+    let ts = io.ts;
     // 1. normed (and, folded, the previous sublayer's post into the highway).
     match io.fold {
         Some(f) => KernelLaunch::new(gpu, k.post_stage)
@@ -207,41 +255,21 @@ fn slab_fast(c: &HcPrefillCall, k: &HcFastKernels, io: &HcSlabIo, stream: u64) -
             .arg_u32(c.hc_mult)
             .arg_f32(c.eps)
             .launch(stream)?,
-        None => KernelLaunch::new(gpu, gpu.kernel("hyper_connection", "hc_pre_stage_bf16")?)
-            .grid([ts, 1, 1])
-            .block([1024, 1, 1])
-            .arg_ptr(io.streams)
-            .arg_ptr(c.w.norm_w)
-            .arg_ptr(c.normed)
-            .arg_u32(c.hidden)
-            .arg_u32(c.hc_mult)
-            .arg_f32(c.eps)
-            .launch(stream)?,
+        None => hc_stage(c, io, stream)?,
     }
-    // 2. low_pre = normed x down_w^T. Where the default's machine fill picks
-    // the tile kernel, cuBLASLt (non-split-K here: same bits, 1.7x faster);
-    // elsewhere the default's own call.
-    let k_gemm = gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?;
-    let tile_kernel = c.sm_count == 0 || rank.div_ceil(128) * ts.div_ceil(128) >= c.sm_count;
-    if c.lt && tile_kernel {
-        spark_runtime::cublaslt::bf16_gemm_act_weight_t(
-            c.normed.0,
-            c.w.down_w.0,
-            c.low.0,
-            ts,
-            rank,
-            hc_dim,
-            stream,
-        )?;
-    } else {
-        hc_gemm(
-            gpu, k_gemm, c.normed, c.w.down_w, c.low, ts, rank, hc_dim, c.sm_count, stream,
-        )?;
-    }
-    hc_silu(c, ts, stream)?;
-    hc_inject(c, k_gemm, ts, stream)?;
+    // 2. low = silu(normed x down_w^T / hc): the default's calls.
+    hc_low(c, ts, stream)?;
+    let Some(up_mix) = k.up_mix else {
+        return hc_slab_tail(c, io, stream);
+    };
+    hc_inject(
+        c,
+        gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
+        ts,
+        stream,
+    )?;
     // 3. y = mean_s sigmoid(low x up_w) * normed, inj, in one kernel.
-    KernelLaunch::new(gpu, k.up_mix)
+    KernelLaunch::new(gpu, up_mix)
         .grid([c.hidden / HUM_BD, ts.div_ceil(HUM_BM), 1])
         .block([256, 1, 1])
         .arg_ptr(c.low)
@@ -252,7 +280,7 @@ fn slab_fast(c: &HcPrefillCall, k: &HcFastKernels, io: &HcSlabIo, stream: u64) -
         .arg_ptr(io.inj)
         .arg_u32(ts)
         .arg_u32(c.hidden)
-        .arg_u32(rank)
+        .arg_u32(c.rank())
         .arg_f32(1.0f32 / c.hc_mult as f32)
         .launch(stream)
 }

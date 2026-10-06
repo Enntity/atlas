@@ -18,7 +18,12 @@
 //   nvcc $F -o $D/gemm_base.ptx $C/dense_gemm_bf16.cu
 //   nvcc $F -DDM_N_TILE=64 -o $D/gemm_m128_n64.ptx $C/dense_gemm_bf16.cu   # etc.
 //   nvcc -O3 -std=c++17 -o $D/bench scripts/dev/qwen4exp_hc_prefill_bench.cu -lcuda -lcublasLt
-//   $D/bench $D [T=2048]
+//   $D/bench $D [T=2048] [HUM_BD=32] [all]
+// Run it against the cuBLASLt the server links (the runtime image's CUDA
+// 13.0 -- e.g. inside atlas-release-builder, not a newer host CUDA): the
+// default up GEMM IS cuBLASLt, so the fused up+mix is exact only where that
+// library's kernel is the plain in-order k-chain at every slab height
+// (`qwen4exp_prefill_hc::UP_MIX_VERIFIED_LT` lists the versions checked).
 #include "qwen4exp_ptx_harness.h"
 #include <dirent.h>
 #include <cublasLt.h>
@@ -27,6 +32,7 @@
 static const unsigned H = 2560, HC = 4, RANK = 320, HCD = HC * H;
 static const float EPS = 1e-6f;
 static unsigned g_bd = 32;   // HUM_BD the hyper_connection PTX was built with (argv[3])
+static bool g_all = false;   // argv[4] == "all": up+mix at every slab height T..1
 
 // The production cuBLASLt BF16 call (crates/spark-runtime/src/cublaslt.rs
 // gemm_bf16): FP32 compute, heuristic algorithm 0, 64 MiB workspace.
@@ -65,6 +71,8 @@ int main(int argc, char** argv) {
     std::string dir = argv[1];
     const unsigned T = argc > 2 ? atoi(argv[2]) : 2048;
     if (argc > 3) g_bd = atoi(argv[3]);
+    g_all = argc > 4 && std::string(argv[4]) == "all";
+    printf("cuBLASLt version %zu\n", cublasLtGetVersion());
     init_driver();
     PtxModule hc;
     hc.load(dir + "/hyper_connection.ptx");
@@ -188,8 +196,12 @@ int main(int argc, char** argv) {
             launch(k_upmix_nt, dim3(H / g_bd, (m + 127) / 128), dim3(256), 0, a);
         };
         transpose();
-        for (unsigned m : {T, 2047u, 1838u, 1117u, 640u, 129u, 64u, 9u}) {
-            if (m > T) continue;
+        // Every slab height T..1 (`all` as argv[4]), or a spread of them.
+        std::vector<unsigned> ms;
+        if (g_all) { for (unsigned m = T; m >= 1; --m) ms.push_back(m); }
+        else for (unsigned m : {T, 2047u, 1838u, 1117u, 640u, 129u, 64u, 9u}) if (m <= T) ms.push_back(m);
+        size_t bad_m = 0, split_m = 0;
+        for (unsigned m : ms) {
             lt_gemm(d_n0.p, d_injw.p, d_injpre.p, m, HC, HCD, false);
             int sk = lt_gemm(d_lowv.p, d_upw.p, d_up_pre.p, m, HCD, RANK, true);
             d_y.fill(0x11); d_y2.fill(0x22); d_inj.fill(0x33); d_inj2.fill(0x44);
@@ -201,10 +213,14 @@ int main(int argc, char** argv) {
             y1.resize((size_t)m * H); y2.resize((size_t)m * H);
             i1.resize((size_t)m * HC); i2.resize((size_t)m * HC);
             size_t dy = diff_bytes(y1, y2), di = diff_bytes(i1, i2);
-            printf("bitwise up+mix (cuBLASLt splitK=%d + hc_pre_mix vs hc_up_mix_bf16_nt) T=%u: y %zu, inj %zu differing bytes\n",
-                   sk, m, dy, di);
-            ok = ok && dy == 0 && di == 0 && sk == 1;
+            if (!g_all || dy || di || sk != 1)
+                printf("bitwise up+mix (cuBLASLt splitK=%d + hc_pre_mix vs hc_up_mix_bf16_nt) T=%u: y %zu, inj %zu differing bytes\n",
+                       sk, m, dy, di);
+            bad_m += dy || di;
+            split_m += sk != 1;
         }
+        printf("up+mix over %zu slab heights: %zu differ, %zu split-K\n", ms.size(), bad_m, split_m);
+        ok = ok && bad_m == 0;
         float t_lt = time_ms([&] { lt_gemm(d_lowv.p, d_upw.p, d_up_pre.p, T, HCD, RANK, true); });
         float t_m = time_ms([&] { mix_m(T); });
         float t_f = time_ms([&] { upmix_nt(T); });
@@ -266,16 +282,17 @@ int main(int argc, char** argv) {
         }
     }
     if (!base_out.empty()) {
-        // The fast arm runs full slabs' down GEMM on cuBLASLt: it must equal
-        // the tile kernel the default picks there.
+        // Reference only -- the fast arm keeps the default's down GEMM: on
+        // cuBLASLt 13.1.1 the heuristic picks a non-split kernel here, equal
+        // to the tile kernel; on 13.0.0 (the runtime image) split-K 3, which
+        // is not.
         d_low.fill(0x5A);
         int sk = lt_gemm(d_n0.p, d_down.p, d_low.p, T, RANK, HCD, false);
         CK(cudaDeviceSynchronize());
         size_t d = diff_bytes(d_low.get(), base_out);
         float t = time_ms([&] { lt_gemm(d_n0.p, d_down.p, d_low.p, T, RANK, HCD, false); });
-        printf("down GEMM cuBLASLt (splitK=%d)          %.3f ms %6.2f TFLOP/s  bitwise vs base: %zu bytes differ\n",
+        printf("down GEMM cuBLASLt (splitK=%d)          %.3f ms %6.2f TFLOP/s  bitwise vs base: %zu bytes differ (not used)\n",
                sk, t, gflop / t, d);
-        ok = ok && d == 0;
     }
     printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

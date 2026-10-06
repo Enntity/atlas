@@ -61,6 +61,7 @@ const SCALE_MODE_BLK128X128_32F: i32 = 5;
 const PREF_MAX_WORKSPACE_BYTES: u32 = 1;
 
 unsafe extern "C" {
+    fn cublasLtGetVersion() -> usize;
     fn cublasLtCreate(handle: *mut cublasLtHandle_t) -> i32;
     fn cublasLtMatmulDescCreate(
         desc: *mut cublasLtMatmulDesc_t,
@@ -248,6 +249,16 @@ static CUBLASLT_LIVE_LOGGED: std::sync::Once = std::sync::Once::new();
 /// a per-GEMM `Result` cannot express.
 pub fn available() -> bool {
     ctx().is_ok()
+}
+
+/// The linked cuBLASLt's version, `major * 10000 + minor * 100 + patch`
+/// (130000 for CUDA 13.0's); 0 under the stub shims. Which kernel the
+/// heuristic picks for a shape -- and so the exact bits of the result --
+/// changes between versions: a caller whose output must equal another
+/// kernel's bit for bit gates on the versions it was verified against.
+pub fn version() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| unsafe { cublasLtGetVersion() })
 }
 
 /// Row-major `out[M,N] = act[M,K] @ weight[K,N]`, all BF16 — the NON-transposed
