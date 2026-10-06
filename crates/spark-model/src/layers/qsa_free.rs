@@ -25,12 +25,75 @@ use super::{QsaIndexer, QsaSeqState};
 /// Growth granule in positions (a multiple of every pooling ratio in use).
 const QSA_GRANULE: usize = 4096;
 
+/// `ATLAS_QWEN4EXP_QSA_REUSE=1`: a released carry buffer goes to a per-thread
+/// spare list and the next sequence's same-size request takes it, instead of
+/// a `cuMemFree` at the end of one request and a `cuMemAlloc` at the start of
+/// the next (36 of the ~40 allocations before a 16K prompt's first kernel,
+/// ~3 ms of host time on the pair, nsys `sqpf-p3s7-r0`). A fresh allocation's
+/// bytes are undefined anyway, and every reader stays inside what the carry
+/// wrote, so the numerics cannot change; the buffers are only ever used on
+/// the model stream, in order.
+fn reuse_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("ATLAS_QWEN4EXP_QSA_REUSE").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+/// Spare buffers kept per thread (12 layers x 3 buffers x a few sequences).
+const SPARE_MAX: usize = 64;
+
+thread_local! {
+    static SPARE: std::cell::RefCell<Vec<(DevicePtr, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A carry buffer of exactly `bytes`: a spare one, or a new allocation.
+pub(super) fn carry_alloc(gpu: &dyn GpuBackend, bytes: usize) -> Result<DevicePtr> {
+    carry_alloc_via(gpu, bytes, reuse_requested())
+}
+
+/// Release a carry buffer of `bytes` (to the spares, or to the backend).
+pub(super) fn carry_free(gpu: &dyn GpuBackend, p: DevicePtr, bytes: usize) -> Result<()> {
+    carry_free_via(gpu, p, bytes, reuse_requested())
+}
+
+fn carry_alloc_via(gpu: &dyn GpuBackend, bytes: usize, reuse: bool) -> Result<DevicePtr> {
+    let spare = reuse
+        .then(|| {
+            SPARE.with(|s| {
+                let mut s = s.borrow_mut();
+                let at = s.iter().position(|&(_, b)| b == bytes)?;
+                Some(s.swap_remove(at).0)
+            })
+        })
+        .flatten();
+    spare.map_or_else(|| gpu.alloc(bytes), Ok)
+}
+
+fn carry_free_via(gpu: &dyn GpuBackend, p: DevicePtr, bytes: usize, reuse: bool) -> Result<()> {
+    let kept = reuse
+        && SPARE.with(|s| {
+            let mut s = s.borrow_mut();
+            (s.len() < SPARE_MAX).then(|| s.push((p, bytes))).is_some()
+        });
+    if kept { Ok(()) } else { gpu.free(p) }
+}
+
 impl QsaIndexer {
     /// Device bytes one token costs this layer's carry beyond the fixed raw
     /// window: its share of a pooled block key. What the KV budget charges
     /// per token.
     pub fn bytes_per_token(&self) -> usize {
         (self.hd as usize * 2).div_ceil(self.ratio as usize)
+    }
+
+    /// Bytes of a pooled-key buffer for `cap` positions.
+    fn block_bytes(&self, cap: usize) -> usize {
+        (cap / self.ratio as usize).max(1) * self.hd as usize * 2
     }
 
     /// The most positions a carry can hold (the served context).
@@ -42,7 +105,7 @@ impl QsaIndexer {
     /// See `TransformerLayer::free_state`.
     pub fn free_seq_state(&self, st: &mut QsaSeqState, gpu: &dyn GpuBackend) -> Result<()> {
         if st.block_keys.0 != 0 {
-            gpu.free(st.block_keys)?;
+            carry_free(gpu, st.block_keys, self.block_bytes(st.cap))?;
             st.block_keys = DevicePtr(0);
         }
         st.cap = 0;
@@ -94,7 +157,7 @@ impl QsaIndexer {
             .min(self.max_tokens);
         let row = self.hd as usize * 2;
         let ratio = self.ratio as usize;
-        let block = gpu.alloc((cap / ratio).max(1) * row)?;
+        let block = carry_alloc(gpu, self.block_bytes(cap))?;
         if st.cap > 0 {
             let pooled = st.pooled.min(st.cap / ratio);
             if pooled > 0 {
@@ -103,7 +166,7 @@ impl QsaIndexer {
             // The copy (and any reader queued before it) must finish before
             // the old buffer can be released.
             gpu.synchronize(stream)?;
-            gpu.free(st.block_keys)?;
+            carry_free(gpu, st.block_keys, self.block_bytes(st.cap))?;
         }
         st.block_keys = block;
         st.cap = cap;
