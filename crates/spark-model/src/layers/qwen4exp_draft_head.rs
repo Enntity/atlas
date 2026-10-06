@@ -29,6 +29,7 @@ use anyhow::{Context, Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use crate::layers::ops;
+use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
 const BF16: usize = 2;
@@ -42,6 +43,9 @@ pub struct DraftHead {
     bf16: DenseWeight,
     nvfp4: Option<QuantizedWeight>,
     w4a16_gemv_k: KernelHandle,
+    /// The NVFP4 copy's multi-row tiers (`project_rows`): scalar
+    /// `w4a16_gemv_batch{M}`, row `r` byte-identical to `w4a16_gemv`.
+    w4a16_tiers: W4a16BatchmTiers,
 }
 
 impl DraftHead {
@@ -131,6 +135,11 @@ impl DraftHead {
             } else {
                 KernelHandle(0)
             },
+            w4a16_tiers: if want_nvfp4 {
+                W4a16BatchmTiers::resolve(gpu)
+            } else {
+                W4a16BatchmTiers::default()
+            },
         })
     }
 
@@ -168,6 +177,62 @@ impl DraftHead {
                 logits,
                 self.rows,
                 hidden,
+                stream,
+            ),
+        }
+    }
+
+    /// Whether [`Self::project_rows`] can serve `m` rows, and every draft row
+    /// IS its token id, so a device argmax is already the drafted token
+    /// (the batched propose embeds it without a host round trip). A gathered
+    /// id list (`ATLAS_QWEN4EXP_DRAFT_VOCAB`) would need a device remap, so
+    /// it keeps the per-sequence path.
+    pub fn rows_batchable(&self, m: usize, dense_batchm_k: KernelHandle) -> bool {
+        self.ids.is_none()
+            && match self.nvfp4 {
+                Some(_) => self.w4a16_tiers.scalar_kernel(m as u32).0 != 0,
+                None => dense_batchm_k.0 != 0 && m as u32 <= ops::DENSE_GEMV_BATCHM_MAX_M,
+            }
+    }
+
+    /// [`Self::project`] for `m` contiguous `[hidden]` input rows into `m`
+    /// contiguous `[rows]` logit rows, the head read once. Row `r` is
+    /// byte-identical to `project` on that row alone: `dense_gemv_bf16_batchm`
+    /// equals `dense_gemv_bf16` per row, the scalar `w4a16_gemv_batch{M}`
+    /// tiers equal `w4a16_gemv`. Gate on [`Self::rows_batchable`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        dense_batchm_k: KernelHandle,
+        input: DevicePtr,
+        logits: DevicePtr,
+        m: u32,
+        hidden: u32,
+        stream: u64,
+    ) -> Result<()> {
+        match self.nvfp4.as_ref() {
+            Some(q) => ops::w4a16_gemv_batchm(
+                gpu,
+                self.w4a16_tiers.scalar_kernel(m),
+                input,
+                q,
+                logits,
+                m,
+                self.rows,
+                hidden,
+                stream,
+            ),
+            None => ops::dense_gemv_batchm(
+                gpu,
+                dense_batchm_k,
+                input,
+                &self.bf16,
+                logits,
+                m,
+                self.rows,
+                hidden,
+                self.rows,
                 stream,
             ),
         }
