@@ -100,6 +100,12 @@ pub struct ModelLevers {
     /// the exact batching lane forced back to one single-row launch per row
     /// (`model/qwen4exp_batch_fast.rs`, `BISECT_*`). Set with the lane.
     pub qwen4exp_batch_bisect: u32,
+    /// qwen4_exp, under `qwen4exp_batch_fast`: the small per-row kernels of a
+    /// batched step (MoE top-k and weighted-sum blend, the GDN mixer's four
+    /// small kernels per sequence) as one multi-row launch each, every row's
+    /// bytes the single-row kernel's (`ATLAS_QWEN4EXP_BATCH_SMALL=1`; design
+    /// in `model/qwen4exp_batch_fast.rs`). Set with the lane.
+    pub qwen4exp_batch_small: bool,
 
     // ── LoRA ──
     /// Apply LoRA eagerly at load instead of at each forward.
@@ -230,6 +236,7 @@ impl ModelLevers {
             qwen4exp_mtp_depth: None,
             qwen4exp_batch_fast: false,
             qwen4exp_batch_bisect: 0,
+            qwen4exp_batch_small: false,
             lora_eager: opt_in_truthy("ATLAS_LORA_EAGER"),
             lora_rotate: opt_in_truthy("ATLAS_LORA_ROTATE"),
             k4_diag: opt_in("ATLAS_K4_DIAG"),

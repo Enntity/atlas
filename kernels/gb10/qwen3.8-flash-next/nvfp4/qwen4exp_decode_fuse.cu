@@ -98,8 +98,11 @@ __device__ __forceinline__ void qdf_store_window(float* p, const float (&win)[QD
     *reinterpret_cast<float4*>(p) = make_float4(win[0], win[1], win[2], win[3]);
 }
 
-extern "C" __global__ void __cluster_dims__(QDF_REPEAT, 1, 1) __launch_bounds__(QDF_D, 1)
-qwen4exp_gdn_decode_fused(
+// One block (value head blockIdx.x) of the fused step for one token: the
+// body of `qwen4exp_gdn_decode_fused` and, a token per blockIdx.y, of
+// `qwen4exp_gdn_decode_fused_rows`. The caller is a (QDF_REPEAT, 1, 1)
+// cluster of QDF_D-thread blocks.
+__device__ __forceinline__ void qdf_gdn_block(
     float* __restrict__ h_state,               // [nv, 128, 128] FP32
     float* __restrict__ conv_state,            // [conv_dim, 4] FP32
     const __nv_bfloat16* __restrict__ qkv,     // [conv_dim]: Q nk*128 | K nk*128 | V nv*128
@@ -121,7 +124,6 @@ qwen4exp_gdn_decode_fused(
     const float l2_eps,
     const float eps
 ) {
-    atlas_pdl_enter();
     namespace cg = cooperative_groups;
 
     const unsigned int vh = blockIdx.x;
@@ -331,6 +333,87 @@ qwen4exp_gdn_decode_fused(
     for (int j = 0; j < QDF_D; j++) {
         H_global[j * QDF_D + tid] = H_reg[j];
     }
+}
+
+extern "C" __global__ void __cluster_dims__(QDF_REPEAT, 1, 1) __launch_bounds__(QDF_D, 1)
+qwen4exp_gdn_decode_fused(
+    float* __restrict__ h_state,               // [nv, 128, 128] FP32
+    float* __restrict__ conv_state,            // [conv_dim, 4] FP32
+    const __nv_bfloat16* __restrict__ qkv,     // [conv_dim]: Q nk*128 | K nk*128 | V nv*128
+    const __nv_bfloat16* __restrict__ conv_w,  // [conv_dim, 4]
+    const __nv_bfloat16* __restrict__ ba_in,   // [ba_k] (the mixer input row)
+    const __nv_bfloat16* __restrict__ ba_w,    // [2 * nv, ba_k], groups of 2 * vpg rows
+    const float* __restrict__ a_log,           // [nv]
+    const float* __restrict__ dt_bias,         // [nv]
+    float* __restrict__ gate_out,              // [nv]
+    float* __restrict__ beta_out,              // [nv]
+    const __nv_bfloat16* __restrict__ z_gate,  // [nv, 128]
+    const __nv_bfloat16* __restrict__ norm_w,  // [128]
+    __nv_bfloat16* __restrict__ out,           // [nv, 128]
+    const unsigned int num_k_heads,
+    const unsigned int num_v_heads,
+    const unsigned int ba_k,
+    const unsigned int head_dim,               // 128 (host checks); a RUNTIME value
+                                               // on purpose, see below
+    const float l2_eps,
+    const float eps
+) {
+    atlas_pdl_enter();
+    qdf_gdn_block(h_state, conv_state, qkv, conv_w, ba_in, ba_w, a_log, dt_bias, gate_out,
+                  beta_out, z_gate, norm_w, out, num_k_heads, num_v_heads, ba_k, head_dim,
+                  l2_eps, eps);
+}
+
+// ── qwen4exp_gdn_decode_fused_rows (ATLAS_QWEN4EXP_BATCH_SMALL) ──
+//
+// The fused step for up to QDF_ROWS_MAX independent sequences in one launch,
+// one token each (a batched decode step): block (vh, r) is block vh of
+// `qwen4exp_gdn_decode_fused` on sequence r, against that sequence's own
+// recurrence and conv state (`states`, by value: graph-stable, no table to
+// upload). Every byte is what a launch per sequence writes, which is what the
+// four-kernel chain writes per sequence (see the head of this file).
+//
+// Rows: qkvz `qkvz_stride` BF16 apart (Q|K|V then the Z gate at conv_dim),
+// ba_in `ba_k` apart, gates `2 * nv` FP32 apart (gate | beta), out
+// `nv * 128` apart. A cluster is three heads of one sequence, so the conv
+// window handoff is the single-sequence one.
+//
+// Grid: (num_v_heads, rows, 1) with clusters of QDF_REPEAT; block QDF_D.
+#define QDF_ROWS_MAX 8
+
+struct QdfRowStates {
+    float* h[QDF_ROWS_MAX];     // [nv, 128, 128] FP32 per sequence
+    float* conv[QDF_ROWS_MAX];  // [conv_dim, 4] FP32 per sequence
+};
+
+extern "C" __global__ void __cluster_dims__(QDF_REPEAT, 1, 1) __launch_bounds__(QDF_D, 1)
+qwen4exp_gdn_decode_fused_rows(
+    const __grid_constant__ QdfRowStates states,
+    const __nv_bfloat16* __restrict__ qkvz,    // [rows, qkvz_stride]
+    const __nv_bfloat16* __restrict__ conv_w,  // [conv_dim, 4]
+    const __nv_bfloat16* __restrict__ ba_in,   // [rows, ba_k]
+    const __nv_bfloat16* __restrict__ ba_w,    // [2 * nv, ba_k]
+    const float* __restrict__ a_log,           // [nv]
+    const float* __restrict__ dt_bias,         // [nv]
+    float* __restrict__ gates,                 // [rows, 2 * nv]: gate | beta
+    const __nv_bfloat16* __restrict__ norm_w,  // [128]
+    __nv_bfloat16* __restrict__ out,           // [rows, nv * 128]
+    const unsigned int num_k_heads,
+    const unsigned int num_v_heads,
+    const unsigned int ba_k,
+    const unsigned int head_dim,
+    const unsigned int qkvz_stride,
+    const float l2_eps,
+    const float eps
+) {
+    const unsigned int r = blockIdx.y;
+    const unsigned long long conv_dim = (2ull * num_k_heads + num_v_heads) * QDF_D;
+    const __nv_bfloat16* qkv = qkvz + (unsigned long long)r * qkvz_stride;
+    float* g = gates + 2ull * r * num_v_heads;
+    qdf_gdn_block(states.h[r], states.conv[r], qkv, conv_w, ba_in + (unsigned long long)r * ba_k,
+                  ba_w, a_log, dt_bias, g, g + num_v_heads, qkv + conv_dim, norm_w,
+                  out + (unsigned long long)r * num_v_heads * QDF_D, num_k_heads, num_v_heads,
+                  ba_k, head_dim, l2_eps, eps);
 }
 
 // ── moe_blend_hc_post ──
