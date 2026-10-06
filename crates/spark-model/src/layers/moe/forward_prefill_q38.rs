@@ -27,6 +27,10 @@
 //! selected. Remote experts (EP) have null tables and return early, as in the
 //! default kernels, so `prepare_ep_prefill_outputs`' zeroing still stands.
 //!
+//! `ATLAS_QWEN4EXP_PREFILL_MOE_W2=1` runs the GEMMs on their `moe_q38w_*`
+//! twins (2 x 4 warp grid, 16-byte dequant stores), byte-identical; see
+//! [`w2_requested`].
+//!
 //! `ATLAS_QWEN4EXP_PREFILL_MOE_CHECK=<n>`: for the first `n` layer calls, run
 //! the q38 chain, keep its `expert_down_out` on the host, run the default
 //! chain over the same buffers, and fail on any differing byte
@@ -39,6 +43,30 @@ use spark_runtime::kernel_args::KernelLaunch;
 pub(crate) fn q38_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_MOE"))
+}
+
+/// `ATLAS_QWEN4EXP_PREFILL_MOE_W2=1` (with `_MOE`): the routed and shared
+/// GEMMs on the `moe_q38w_*` twins -- the same k32 MMAs per output on a 2 x 4
+/// warp grid with 16-byte dequant stores, every byte identical
+/// (`scripts/dev/qwen4exp_moe_prefill_bench.cu`; GB10, 16000 tokens:
+/// gate_up+silu 10.25 -> 8.65 ms, down 5.91 -> 5.13, shared 3.42 -> 3.18).
+fn w2_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_MOE_W2"))
+}
+
+/// The q38 entry `name`, or its `moe_q38w_*` twin under `_MOE_W2`.
+fn q38_entry(name: &'static str) -> &'static str {
+    if !w2_requested() {
+        return name;
+    }
+    match name {
+        "moe_q38_gate_up_silu" => "moe_q38w_gate_up_silu",
+        "moe_q38_down" => "moe_q38w_down",
+        "moe_q38_dense_gate_up_silu" => "moe_q38w_dense_gate_up_silu",
+        "moe_q38_dense_down" => "moe_q38w_dense_down",
+        other => other,
+    }
 }
 
 /// Layer calls left to cross-check (`1` or `true` means 16).
@@ -188,8 +216,13 @@ impl MoeLayer {
         }
         let gpu = ctx.gpu;
         let k_a8 = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_a_to_e4m3");
-        let k_gu = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_dense_gate_up_silu");
-        let k_dn = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_dense_down");
+        let k_gu = crate::layers::try_kernel(
+            gpu,
+            "moe_prefill_q38",
+            q38_entry("moe_q38_dense_gate_up_silu"),
+        );
+        let k_dn =
+            crate::layers::try_kernel(gpu, "moe_prefill_q38", q38_entry("moe_q38_dense_down"));
         if k_a8.0 == 0 || k_gu.0 == 0 || k_dn.0 == 0 {
             return Ok(false);
         }
@@ -343,8 +376,9 @@ impl MoeLayer {
         }
         let gpu = ctx.gpu;
         let k_a8 = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_a_to_e4m3");
-        let k_gu = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_gate_up_silu");
-        let k_dn = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_down");
+        let k_gu =
+            crate::layers::try_kernel(gpu, "moe_prefill_q38", q38_entry("moe_q38_gate_up_silu"));
+        let k_dn = crate::layers::try_kernel(gpu, "moe_prefill_q38", q38_entry("moe_q38_down"));
         if k_a8.0 == 0 || k_gu.0 == 0 || k_dn.0 == 0 {
             return Ok(false);
         }
