@@ -27,7 +27,7 @@ use anyhow::Result;
 use atlas_core::config::LayerType;
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use super::super::super::types::TransformerModel;
 use super::midchunk_capture::MidCapturePlan;
@@ -139,9 +139,26 @@ impl TransformerModel {
         }))
     }
 
+    /// Before the chunk's own save: finalize a mid-chunk checkpoint pass;
+    /// the returned scope drops any pass-end aux it kept for that save.
+    pub(super) fn qwen4exp_ckpt_saves(
+        &self,
+        tokens: &[u32],
+        seq: &SequenceState,
+        kv_cache: &mut PagedKvCache,
+        plan: &Option<MidCapturePlan>,
+        stream: u64,
+    ) -> Result<PassAuxScope> {
+        let scope = PassAuxScope::new();
+        if let Some(plan) = plan.as_ref().filter(|p| p.ckpt) {
+            self.finalize_qwen4exp_ckpt(tokens, seq, kv_cache, plan, stream)?;
+        }
+        Ok(scope)
+    }
+
     /// After the pass: attach the aux at `cp` and index the checkpoint, or
     /// free the slot when anything was not captured.
-    pub(super) fn finalize_qwen4exp_ckpt(
+    fn finalize_qwen4exp_ckpt(
         &self,
         tokens: &[u32],
         seq: &SequenceState,
@@ -164,18 +181,22 @@ impl TransformerModel {
             self.ssm_snapshots.free(plan.snap_slot);
             return Ok(());
         }
+        // The pass-end aux, rebuilt at `cp`. With ATLAS_QWEN4EXP_CKPT_AUX_SHARE
+        // the pass-end blobs are kept for the final save, which would read
+        // the very same layer state back again (`take_pass_aux`).
         let mut aux = self.ssm_snapshots.take_aux(plan.snap_slot);
         self.collect_aux_states_into(seq, stream, &mut aux)?;
-        for (i, blob) in aux.iter_mut() {
-            let rebuilt = match self.config.layer_type(*i as usize) {
+        let mut rebuilt = Vec::with_capacity(aux.len());
+        for (i, blob) in &aux {
+            let at_cp = match self.config.layer_type(*i as usize) {
                 LayerType::FullAttention | LayerType::SlidingAttention => {
                     let row = self.config.indexer_head_dim * 2;
                     qsa_blob_at(blob, plan.tb, self.config.indexer_compress_ratio, row)
                 }
                 _ => self.ple_blob_at(blob, tokens, plan.tb, stream)?,
             };
-            match rebuilt {
-                Some(b) => *blob = b,
+            match at_cp {
+                Some(b) => rebuilt.push((*i, b)),
                 None => {
                     tracing::warn!(
                         "qwen4_exp mid-chunk checkpoint at token {}: layer {i} aux cannot be \
@@ -187,6 +208,10 @@ impl TransformerModel {
                 }
             }
         }
+        if aux_share_requested() {
+            PASS_AUX.with(|p| *p.borrow_mut() = Some(((seq.slot_idx, seq.seq_len), aux)));
+        }
+        let aux = rebuilt;
         if !aux.is_empty() {
             self.ssm_snapshots.set_aux(plan.snap_slot, aux);
         }
@@ -232,8 +257,7 @@ impl TransformerModel {
         }
         let off = out.len();
         out.resize(off + conv_bytes, 0);
-        self.gpu
-            .copy_d2h_on_stream(DevicePtr(stage), &mut out[off..], stream)?;
+        crate::layers::aux_d2h::copy(self.gpu.as_ref(), DevicePtr(stage), &mut out[off..], stream)?;
         Ok(Some(out))
     }
 
@@ -256,6 +280,57 @@ impl TransformerModel {
         let p = self.gpu.alloc(bytes)?;
         PLE_STAGE.with(|s| s.set((p.0, bytes)));
         Ok(p)
+    }
+}
+
+/// `ATLAS_QWEN4EXP_CKPT_AUX_SHARE=1`.
+fn aux_share_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("ATLAS_QWEN4EXP_CKPT_AUX_SHARE").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+thread_local! {
+    /// The pass-end aux the mid-chunk finalize collected, keyed by
+    /// (sequence slot, seq_len after the pass).
+    static PASS_AUX: RefCell<Option<PassAux>> = const { RefCell::new(None) };
+}
+
+type PassAux = ((usize, usize), Vec<(u32, Vec<u8>)>);
+
+/// Drops any stashed pass-end aux when the chunk's saves are done (or fail),
+/// so no later chunk or request can take it.
+pub(super) struct PassAuxScope(());
+
+impl PassAuxScope {
+    pub(super) fn new() -> Self {
+        PASS_AUX.with(|p| p.borrow_mut().take());
+        Self(())
+    }
+}
+
+impl Drop for PassAuxScope {
+    fn drop(&mut self) {
+        PASS_AUX.with(|p| p.borrow_mut().take());
+    }
+}
+
+/// Move the pass-end aux collected by this pass's mid-chunk finalize into
+/// `out` for a save of the same sequence at the same length: no layer state
+/// moves between the two, so these are the bytes `collect_aux_states_into`
+/// would read again. `false` (nothing taken; any stale entry dropped)
+/// otherwise.
+pub(super) fn take_pass_aux(slot: usize, seq_len: usize, out: &mut Vec<(u32, Vec<u8>)>) -> bool {
+    match PASS_AUX.with(|p| p.borrow_mut().take()) {
+        Some((key, aux)) if key == (slot, seq_len) => {
+            *out = aux;
+            true
+        }
+        _ => false,
     }
 }
 
