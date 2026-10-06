@@ -79,6 +79,9 @@ pub struct Qwen4ExpMtpProposerState {
     pub awaiting_verdict: bool,
     /// Per-layer state for the reused body.
     pub body_state: Box<dyn LayerState>,
+    /// Drafts for positions below it skip the end tokens (the target ban's
+    /// min_tokens floor, `qwen4exp_mtp_ban.rs`; 0 = none).
+    pub end_floor: usize,
 }
 
 impl ProposerState for Qwen4ExpMtpProposerState {
@@ -87,6 +90,10 @@ impl ProposerState for Qwen4ExpMtpProposerState {
     }
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn set_end_floor(&mut self, floor: usize) {
+        let on = crate::traits::EosBan::target_ban_installed();
+        self.end_floor = qwen4exp_mtp_ban::drafter_floor(floor, on);
     }
 }
 
@@ -255,6 +262,7 @@ impl Qwen4ExpMtpHead {
             last_num_drafted: 0,
             awaiting_verdict: false,
             body_state: self.module.body.alloc_state(gpu)?,
+            end_floor: 0,
         })
     }
 
@@ -308,6 +316,9 @@ mod qwen4exp_mtp_batch;
 
 #[path = "qwen4exp_mtp_kv.rs"]
 mod qwen4exp_mtp_kv;
+
+#[path = "qwen4exp_mtp_ban.rs"]
+mod qwen4exp_mtp_ban;
 
 #[path = "qwen4exp_mtp_tp.rs"]
 pub mod draft_tp;
