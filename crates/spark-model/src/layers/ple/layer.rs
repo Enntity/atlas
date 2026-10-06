@@ -205,9 +205,9 @@ impl PleLayer {
     // Marconi aux-state (snapshot_aux / restore_aux) moved to
     // `aux_state.rs` (≤500 LoC split).
 
-    // The public forward entry points (`forward`, `forward_row`,
-    // `forward_rows`) live in `forward.rs` (≤500 LoC split); they all funnel
-    // into `forward_with_ids` below.
+    // The public forward entry points (`forward`, `forward_rows`) live in
+    // `forward.rs` and the multi-sequence `forward_seqs` with the shared
+    // stages in `batch.rs` (≤500 LoC split).
 
     #[allow(clippy::too_many_arguments)]
     fn forward_with_ids(
@@ -303,21 +303,7 @@ impl PleLayer {
                  pageable slot upload would invalidate the recording (901); \
                  the scheduler must call decode_prestage every step"
             );
-            // history ++ tokens, hashed together, then keep the new tokens'
-            // rows — the same slice the reference takes with
-            // `[:, -input_ids.shape[1]:]`.
-            // Same bookkeeping as `prestage` — see `rollback_verify`.
-            st.history_ckpt = st.history.clone();
-            st.verify_tokens = tokens.clone();
-            let mut window = st.history.clone();
-            window.extend_from_slice(&tokens);
-            let all = ple_ngram_ids(&self.dims, &window);
-            let rows = &all[all.len() - num_tokens..];
-            flat = rows.iter().flat_map(|r| r.iter().copied()).collect();
-
-            // Carry the last `context_len` tokens for the next step.
-            let keep = self.dims.context_len();
-            st.history = window[window.len() - keep..].to_vec();
+            flat = self.stage_window(st, &tokens);
         }
 
         // The pipeline runs in `scratch_tokens` spans — the bounded
@@ -328,7 +314,6 @@ impl PleLayer {
         // conv, whose carry lives in `st.conv` and threads across calls —
         // the per-row verify path already relies on that composability.
         // A span's NVMe fault-in also overlaps the previous span's kernels.
-        let cb = self.conv_bytes();
         let mut base = 0;
         while base < num_tokens {
             let n = (num_tokens - base).min(self.scratch_tokens);
@@ -348,104 +333,16 @@ impl PleLayer {
                 }
             }
 
-            // Projections off the concatenated n-gram embedding.
-            //
-            // `dense_gemm_bf16_pipelined`, NOT `dense_gemm`: the ops wrapper and
-            // the kernel are a PAIR. `dense_gemm` launches grid
-            // [ceil(n,16), ceil(m,16)] block 16x16 for the scalar kernel, while
-            // the pipelined one wants [ceil(n,128), ceil(m,128)] block 256.
-            // Handing the pipelined kernel to the scalar launcher reads far out
-            // of bounds and produced NaN through the whole highway.
-            ops::dense_gemm_bf16_pipelined(
+            self.project(n, gpu, stream)?;
+            self.inject(
+                st,
+                highway.offset(base * c * 4),
+                0,
+                n,
+                num_tokens,
                 gpu,
-                self.gemm_k,
-                self.emb,
-                &self.key_proj,
-                self.key,
-                n as u32,
-                c as u32,
-                self.hidden as u32,
-                stream,
-            )
-            .context("PLE key_proj")?;
-            ops::dense_gemm_bf16_pipelined(
-                gpu,
-                self.gemm_k,
-                self.emb,
-                &self.value_proj,
-                self.value,
-                n as u32,
-                self.hidden as u32,
-                self.hidden as u32,
-                stream,
-            )
-            .context("PLE value_proj")?;
-
-            let hspan = highway.offset(base * c * 4);
-            ops::ple_gate(
-                gpu,
-                self.gate_k,
-                hspan,
-                self.key,
-                self.value,
-                self.norm_query.weight,
-                self.norm_key.weight,
-                self.norm_conv.weight,
-                self.gated,
-                self.gated_normed,
-                n as u32,
-                self.hidden as u32,
-                self.hc_mult as u32,
-                self.eps,
                 stream,
             )?;
-            // The conv carry is the one piece of PLE state a speculative verify
-            // has to be able to rewind, so at verify widths the launch is split
-            // per row and each row's resulting carry is parked. At prefill widths
-            // that would be thousands of launches for a carry nothing rolls back,
-            // so the batched form stays and `verify_snap_rows` says "no snapshots".
-            // The check is on the WHOLE forward's width, not the span's: a
-            // verify never spans (scratch >= VERIFY_SNAP_SLOTS) and a spanning
-            // forward snapshots nothing — same as before.
-            if num_tokens < VERIFY_SNAP_SLOTS && verify_snapshots_enabled() {
-                gpu.copy_d2d_async(st.conv, st.verify_snaps, cb, stream)?;
-                for t in 0..n {
-                    let row = t * c * 4; // [T, c] FP32
-                    ops::ple_conv(
-                        gpu,
-                        self.conv_k,
-                        self.gated_normed.offset(row),
-                        self.gated.offset(row),
-                        self.conv1d.weight,
-                        st.conv,
-                        self.out.offset(row),
-                        1,
-                        c as u32,
-                        self.k_size as u32,
-                        self.dilation as u32,
-                        stream,
-                    )?;
-                    gpu.copy_d2d_async(st.conv, st.verify_snaps.offset((t + 1) * cb), cb, stream)?;
-                }
-                st.verify_snap_rows = num_tokens;
-            } else {
-                ops::ple_conv(
-                    gpu,
-                    self.conv_k,
-                    self.gated_normed,
-                    self.gated,
-                    self.conv1d.weight,
-                    st.conv,
-                    self.out,
-                    n as u32,
-                    c as u32,
-                    self.k_size as u32,
-                    self.dilation as u32,
-                    stream,
-                )?;
-                st.verify_snap_rows = 0;
-            }
-            ops::ple_add_highway(gpu, self.add_k, self.out, hspan, (n * c) as u32, stream)?;
             base += n;
         }
 
@@ -478,6 +375,10 @@ pub struct PleWeights {
 // qsa.rs uses for its tests.
 #[path = "verify.rs"]
 mod verify;
+
+#[path = "batch.rs"]
+mod batch;
+pub use batch::PleSeqRows;
 
 #[path = "aux_state.rs"]
 mod aux_state;
