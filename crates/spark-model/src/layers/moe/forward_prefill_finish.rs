@@ -67,19 +67,41 @@ impl MoeLayer {
 
         // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
         let output = ctx.buffers.moe_output();
-        let blended = self.unpermute_ep_prefill(
-            expert_down_out,
-            output,
-            token_to_perm,
-            indices_dev,
-            weights_dev,
-            h,
-            n,
-            top_k,
-            split.then_some(input),
-            ctx,
-            stream,
-        )?;
+        // ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE: under SP, the unpermute of the
+        // rows the peer needs first, their reduce-scatter on the wire while
+        // the rest unpermute (`layers::qwen4exp_sp_pipe`).
+        let rs_done = match sp {
+            Some(sp) if !split && !overlap_shared_reduce && !use_overlap && self.lora.is_none() => {
+                self.q38_unpermute_reduce_scatter(
+                    sp,
+                    [
+                        expert_down_out,
+                        output,
+                        token_to_perm,
+                        indices_dev,
+                        weights_dev,
+                    ],
+                    [h, top_k],
+                    ctx,
+                    stream,
+                )?
+            }
+            _ => false,
+        };
+        let blended = !rs_done
+            && self.unpermute_ep_prefill(
+                expert_down_out,
+                output,
+                token_to_perm,
+                indices_dev,
+                weights_dev,
+                h,
+                n,
+                top_k,
+                split.then_some(input),
+                ctx,
+                stream,
+            )?;
 
         // 8. Blend shared expert: output += sigmoid(dot(input, gate)) * shared
         // Skip when has_shared == false (no shared expert in this model config).
@@ -163,7 +185,9 @@ impl MoeLayer {
             } else {
                 None
             };
-            if let Some(sp) = sp {
+            if rs_done {
+                // Reduce-scattered with the unpermute above.
+            } else if let Some(sp) = sp {
                 sp.reduce_scatter(output, h as usize, ctx, stream)?;
             } else if ctx.graph_capture {
                 comm.all_reduce(output.0, num_tokens * h as usize * 2)?;

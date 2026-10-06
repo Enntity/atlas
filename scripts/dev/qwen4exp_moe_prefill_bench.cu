@@ -451,6 +451,28 @@ int main(int argc, char** argv) {
             size_t d = diff_bytes(d_o1.get(), d_o2.get());
             printf("bitwise unpermute (dense over zeroed remote rows vs local-only over garbage): %zu differing bytes\n", d);
             ok = ok && d == 0;
+            // Row ranges launched apart (ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE):
+            // the window first, in slab pieces, then the rest.
+            {
+                Buf<unsigned short> d_o3;
+                d_o3.alloc((size_t)T * H);
+                d_o3.fill(0x99);
+                const unsigned cut = T / 3 + 7;
+                for (auto [r0, n] : {std::pair<unsigned, unsigned>{cut, T - cut}, {0u, cut}}) {
+                    for (unsigned p0 = 0; p0 < n; p0 += 2048) {
+                        const unsigned m = std::min(2048u, n - p0), a = r0 + p0;
+                        Args x;
+                        x.add(d_eo_g.p).add(d_o3.p + (size_t)a * H).add(d_perm.p + (size_t)a * TOPK)
+                         .add(d_ids.p + (size_t)a * TOPK).add(d_w.p + (size_t)a * TOPK)
+                         .add(H).add(m).add(TOPK).add(0u).add(E);
+                        launch(k_local, dim3(m), dim3(H / 8), 0, x);
+                    }
+                }
+                CK(cudaDeviceSynchronize());
+                const size_t dr = diff_bytes(d_o2.get(), d_o3.get());
+                printf("bitwise unpermute by row ranges vs whole: %zu differing bytes\n", dr);
+                ok = ok && dr == 0;
+            }
             float t1 = time_ms(dense), t2 = time_ms(local);
             printf("unpermute: dense %.3f ms -> local-only %.3f ms (%.2fx); the dense arm also needs "
                    "%.0f MB of memsets a layer\n", t1, t2, t1 / t2,

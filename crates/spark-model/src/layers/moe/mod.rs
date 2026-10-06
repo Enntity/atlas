@@ -166,6 +166,7 @@ mod forward_prefill_finish;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
 mod forward_prefill_q38;
+mod forward_prefill_q38_rs;
 mod forward_prefill_route;
 mod forward_prefill_routed;
 mod forward_prefill_router;
