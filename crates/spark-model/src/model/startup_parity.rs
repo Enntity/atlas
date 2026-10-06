@@ -354,6 +354,11 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_SP", || {
         Ok(super::qwen4exp_prefill_sp::requested() as u64)
     }),
+    // Its slab-pipelined gathers move the same rows in slab-sized pieces: a
+    // rank that sends one payload while the other sends pieces never pairs.
+    ("ATLAS_QWEN4EXP_PREFILL_SP_PIPE", || {
+        Ok(crate::layers::qwen4exp_sp_pipe::requested() as u64)
+    }),
     // The qwen4_exp verify lane (per-row MoE all-reduces in the GDN layers'
     // verify) and the check's serial steps (their collectives).
     ("ATLAS_QWEN4EXP_EXACT_VERIFY", || {

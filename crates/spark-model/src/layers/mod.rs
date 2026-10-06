@@ -25,6 +25,7 @@ pub mod qwen3_attention;
 pub mod qwen3_ssm;
 pub mod qwen4exp_draft_head;
 pub mod qwen4exp_mtp;
+pub mod qwen4exp_sp_pipe;
 pub mod vision_encoder;
 pub mod w4a16_gemv_tiers;
 

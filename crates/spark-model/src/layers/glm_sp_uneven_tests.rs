@@ -104,8 +104,21 @@ impl CommBackend for LoopPair<'_> {
 }
 
 fn with_ctx<R>(gpu: &MockGpuBackend, comm: &LoopPair, f: impl FnOnce(&ForwardContext) -> R) -> R {
+    with_model_ctx(gpu, comm, None, f)
+}
+
+/// [`with_ctx`] with the config's `model_type` replaced.
+fn with_model_ctx<R>(
+    gpu: &MockGpuBackend,
+    comm: &LoopPair,
+    model_type: Option<&str>,
+    f: impl FnOnce(&ForwardContext) -> R,
+) -> R {
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
     config.tp_world_size = 2;
+    if let Some(m) = model_type {
+        config.model_type = m.into();
+    }
     let buffers = BufferArena::new(&config, 1, 256, 16, 1, gpu).unwrap();
     let dispatch = crate::layers::ops::GemmDispatch::defaults();
     let derived = crate::layers::ops::DerivedWeights::new();
@@ -245,6 +258,65 @@ fn windows_carry_the_regions() {
                     assert_eq!(pm.skip, 0);
                 }
             }
+        }
+    }
+}
+
+/// `qwen4exp_sp_pipe` (ATLAS_QWEN4EXP_PREFILL_SP_PIPE): the slab-pipelined
+/// gather leaves both ranks' buffers exactly as `all_gather` does, with the
+/// rows finished slab by slab, set in place or compacted elsewhere.
+#[test]
+fn pipelined_all_gather_rebuilds_the_chunk() {
+    use crate::layers::qwen4exp_sp_pipe::{begin_split, slab_done};
+    let slab = crate::layers::ops::HC_PREFILL_SLAB as usize;
+    for (total, split) in SPLITS {
+        for compacted in [false, true] {
+            let x = tensor(5, total);
+            let wire = Arc::new(Wire::default());
+            let run = |rank: usize| {
+                let gpu = MockGpuBackend::new();
+                let pair = LoopPair {
+                    gpu: &gpu,
+                    rank,
+                    wire: wire.clone(),
+                };
+                let sp = SpRows::split_at(total, split, rank);
+                let r = sp.row0 * W * 2..(sp.row0 + sp.rows) * W * 2;
+                let mut start = vec![0xABu8; total * W * 2];
+                if !compacted {
+                    start[r.clone()].copy_from_slice(&x[r.clone()]);
+                }
+                let buf = gpu.alloc(start.len()).unwrap();
+                gpu.copy_h2d(&start, buf).unwrap();
+                let src = gpu.alloc(r.len()).unwrap();
+                gpu.copy_h2d(&x[r.clone()], src).unwrap();
+                with_model_ctx(&gpu, &pair, Some("qwen4_exp"), |ctx| {
+                    let copy_from = compacted.then_some(src);
+                    let g = begin_split(sp, buf, copy_from, W, ctx, 0).unwrap().unwrap();
+                    g.during(|| {
+                        let mut t = 0;
+                        while t < sp.rows {
+                            t = (t + slab).min(sp.rows);
+                            slab_done(t, 0)?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                    g.finish(0).unwrap();
+                });
+                let mut out = vec![0u8; start.len()];
+                gpu.copy_d2h(buf, &mut out).unwrap();
+                out
+            };
+            let out = std::thread::scope(|s| {
+                let a = s.spawn(|| run(0));
+                let b = s.spawn(|| run(1));
+                [a.join().unwrap(), b.join().unwrap()]
+            });
+            assert!(
+                out[0] == x && out[1] == x,
+                "pipelined all-gather {total}/{split} compacted={compacted}"
+            );
         }
     }
 }

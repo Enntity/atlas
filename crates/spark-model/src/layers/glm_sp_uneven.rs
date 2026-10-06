@@ -24,19 +24,20 @@ use crate::layer::ForwardContext;
 
 /// How one rank runs one uneven exchange, in rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Plan {
+pub(super) struct Plan {
     /// Rows each way.
-    m: usize,
+    pub(super) m: usize,
     /// First row of the window this rank sends.
-    send0: usize,
+    pub(super) send0: usize,
     /// The region the peer's rows are for, and its rows.
-    recv0: usize,
-    recv_n: usize,
+    pub(super) recv0: usize,
+    pub(super) recv_n: usize,
     /// That region's offset inside the peer's window.
-    skip: usize,
+    pub(super) skip: usize,
 }
 
-fn plan(sp: SpRows, add: bool) -> Plan {
+/// The windows of one exchange (an even split's are its regions).
+pub(super) fn plan(sp: SpRows, add: bool) -> Plan {
     let total = sp.total();
     let m = sp.rows.max(sp.peer_rows);
     let window = |r0: usize| if r0 == 0 { 0 } else { total - m };
