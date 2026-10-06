@@ -11,6 +11,12 @@
 //   W4A16          w4a16_gemv_batch16/32 M = 1..16/32 vs w4a16_gemv_sw per row
 //                  (router 512 x 2560, K/V 512 x 2560, o_proj 2560 x 3072)
 //
+//   verify_e       R = sum(ks) rows of ragged seq-major verify batches (2..34
+//                  rows) through the lane's dispatch as the runtime plans it --
+//                  narrow tiers (dense batchm, qg_batch2/3/4, w4a16 batch2..8)
+//                  at <= 8 rows, the wide tiers past -- for GDN qkvz, Q+gate,
+//                  K/V (the router's dispatch) and o_proj
+//
 // Inputs: Gaussian BF16 with +-0, BF16 subnormals and +-1e30 planted, so a
 // row's sums overflow to inf; NVFP4 codes over all 16 nibbles and E4M3
 // scales including zero and subnormal ones. Each row is checked against a
@@ -92,6 +98,9 @@ static void same(const char* what, const std::vector<bf>& ref, const std::vector
     for (size_t i = 0; i < n; i++) d += ref[i] != got[i];
     if (d) {
         printf("  MISMATCH %-56s %zu of %zu\n", what, d, n);
+        if (getenv("QW_DEBUG"))
+            for (size_t i = 0, shown = 0; i < n && shown < 8; i++)
+                if (ref[i] != got[i]) { printf("    [%zu] ref %04x got %04x\n", i, ref[i], got[i]); shown++; }
         g_fail++;
     }
 }
@@ -237,6 +246,134 @@ static void w4_check() {
         }
         A.free_(); R.free_(); G.free_();
     }
+}
+
+// ---- verify_e shapes -------------------------------------------------------
+// A batched verify's R = sum(ks) rows (seq-major, ragged ks) through the
+// lane's dispatch exactly as the runtime plans it (ops::Qwen4ExpWideRows and
+// the narrow tiers below it, attention o_proj's arms), every row against the
+// single-row kernel serial decode runs on it. Mirrors `next_chunk`.
+static std::pair<unsigned, int> next_chunk(unsigned left, bool p16, bool p32, unsigned narrow) {
+    if (left > 8 && (p16 || p32)) {
+        const int widest = p32 ? 1 : 0;
+        const unsigned take = std::min(left, widest ? 32u : 16u);
+        return {take, (p16 && take <= 16) ? 0 : 1};
+    }
+    return {std::min(left, narrow), -1};
+}
+// `W4a16BatchmTiers::scalar_kernel(m)`: the narrowest of 4..8 covering m.
+static const char* narrow_w4(unsigned m) {
+    static const char* T[] = {"w4a16_gemv_batch4", "w4a16_gemv_batch5", "w4a16_gemv_batch6",
+                              "w4a16_gemv_batch7", "w4a16_gemv_batch8"};
+    return T[m <= 4 ? 0 : m - 4];
+}
+static void w4_fixed(const char* fn, const bf* A, const Fp4& w, bf* C, unsigned N, unsigned K) {
+    Args a;  // batch2/3: fixed M, no M argument
+    a.add(A).add(w.packed.p).add(w.scale.p).add(w.s2).add(C).add(N).add(K);
+    launch(mod("w4a16_gemv").fn(fn), dim3((N + 3) / 4), dim3(256), 0, a);
+}
+
+static void verify_check() {
+    const std::vector<std::vector<unsigned>> KS = {
+        {1, 1}, {2, 4}, {4, 3}, {3, 3}, {4, 4}, {1, 4, 2}, {4, 3, 4, 2}, {2, 2, 3, 4}, {4, 4, 4, 4},
+        {3, 4, 1, 4, 2, 4, 4, 4}, {4, 4, 4, 4, 4, 4, 4, 4}, {4, 4, 4, 4, 4, 4, 4, 4, 2}};
+    const unsigned K = 2560, hd = 256, heads = 12, NQ = heads * hd * 2;
+    const unsigned NB = 8192, NO = 2560, KO = 3072, NKV = 256;
+    Buf<bf> Wb, A, AO, R, G;
+    Wb.alloc((size_t)NB * K); Wb.put(rbf(Wb.n, 0.05f));
+    A.alloc((size_t)40 * K); AO.alloc((size_t)40 * KO);
+    R.alloc((size_t)40 * std::max(NQ, NB)); G.alloc((size_t)40 * std::max(NQ, NB));
+    Fp4 q = make_fp4(NQ, K), kv = make_fp4(NKV, K), o = make_fp4(NO, KO);
+    CUfunction g1 = mod("dense_gemv_bf16").fn("dense_gemv_bf16");
+    CUfunction bm = mod("dense_gemv_bf16_batchm").fn("dense_gemv_bf16_batchm");
+    CUfunction sw = mod("w4a16_gemv").fn("w4a16_gemv_sw");
+    int bad0 = g_fail;
+    for (auto& ks : KS) {
+        unsigned rows = 0;
+        for (unsigned k : ks) rows += k;
+        A.put(rbf(A.n, 1.0f)); AO.put(rbf(AO.n, 1.0f));
+        char tag[96];
+        int len = 0;
+        for (unsigned k : ks) len += snprintf(tag + len, sizeof tag - len, "%u", k);
+        auto cmp = [&](const char* what, unsigned N) {
+            CK(cudaDeviceSynchronize());
+            char w[160];
+            snprintf(w, sizeof w, "verify ks=%s R=%u %s", tag, rows, what);
+            same(w, R.get(), G.get(), (size_t)rows * N);
+        };
+        auto sw_ref = [&](const bf* in, const Fp4& w, unsigned N, unsigned Kd) {
+            for (unsigned r = 0; r < rows; r++) {
+                Args a;
+                a.add(in + (size_t)r * Kd).add(w.packed.p).add(w.scale.p).add(w.s2).add(R.p + (size_t)r * N).add(N).add(Kd);
+                launch(sw, dim3((N + 7) / 8), dim3(256), 0, a);
+            }
+        };
+        // GDN qkvz (BF16).
+        for (unsigned r = 0; r < rows; r++) {
+            Args a;
+            a.add(A.p + (size_t)r * K).add(Wb.p).add(R.p + (size_t)r * NB).add(NB).add(K);
+            launch(g1, dim3((NB + 3) / 4), dim3(256), 0, a);
+        }
+        G.fill(0x55);
+        for (unsigned f = 0; f < rows;) {
+            auto [m, t] = next_chunk(rows - f, true, true, 8);
+            if (t < 0) {
+                Args a;
+                a.add(A.p + (size_t)f * K).add(Wb.p).add(G.p + (size_t)f * NB).add(m).add(NB).add(K).add(NB);
+                launch(bm, dim3((NB + 3) / 4), dim3(256), 0, a);
+            } else {
+                bf16_launch(mod("qwen4exp_wide_rows").fn(BF16_TIERS[t].fn), BF16_TIERS[t].npb,
+                            A.p + (size_t)f * K, Wb.p, G.p + (size_t)f * NB, m, NB, K, NB);
+            }
+            f += m;
+        }
+        cmp("GDN qkvz BF16", NB);
+        // Q+gate.
+        for (unsigned r = 0; r < rows; r++) qg1_launch(A.p + (size_t)r * K, q, R.p + (size_t)r * NQ, NQ, K, heads, hd);
+        G.fill(0x55);
+        for (unsigned f = 0; f < rows;) {
+            auto [m, t] = next_chunk(rows - f, true, true, 4);
+            const bf* in = A.p + (size_t)f * K;
+            bf* out = G.p + (size_t)f * NQ;
+            if (t >= 0) {
+                qg_launch(mod("qwen4exp_wide_rows").fn(QG_TIERS[t].fn), QG_TIERS[t].npb, in, q, out, m, NQ, K, NQ, heads, hd);
+            } else if (m == 1) {
+                qg1_launch(in, q, out, NQ, K, heads, hd);
+            } else {
+                static const char* QB[] = {"", "", "w4a16_gemv_qg_batch2", "w4a16_gemv_qg_batch3", "w4a16_gemv_qg_batch4"};
+                Args a;
+                a.add(in).add(q.packed.p).add(q.scale.p).add(q.s2).add(out).add(NQ).add(K).add(heads).add(hd);
+                launch(mod("w4a16_gemv").fn(QB[m]), dim3((NQ + 3) / 4), dim3(256), 0, a);
+            }
+            f += m;
+        }
+        cmp("Q+gate", NQ);
+        // K/V and the router (same dispatch): narrow tiers <= 8, batch16 past.
+        sw_ref(A.p, kv, NKV, K);
+        G.fill(0x55);
+        for (unsigned f = 0; f < rows;) {
+            auto [m, t] = next_chunk(rows - f, true, false, 8);
+            w4_launch(t >= 0 ? "w4a16_gemv_batch16" : narrow_w4(m), A.p + (size_t)f * K, kv,
+                      G.p + (size_t)f * NKV, m, NKV, K);
+            f += m;
+        }
+        cmp("K/V (router dispatch)", NKV);
+        // o_proj: batch2 / batch3 / batch4 / narrow tier / batch16 chunks.
+        sw_ref(AO.p, o, NO, KO);
+        G.fill(0x55);
+        if (rows == 2 || rows == 3) {
+            w4_fixed(rows == 2 ? "w4a16_gemv_batch2" : "w4a16_gemv_batch3", AO.p, o, G.p, NO, KO);
+        } else if (rows <= 8) {
+            w4_launch(narrow_w4(rows), AO.p, o, G.p, rows, NO, KO);
+        } else {
+            for (unsigned f = 0; f < rows; f += 16)
+                w4_launch("w4a16_gemv_batch16", AO.p + (size_t)f * KO, o, G.p + (size_t)f * NO,
+                          std::min(16u, rows - f), NO, KO);
+        }
+        cmp("o_proj", NO);
+    }
+    printf("  %s  verify_e shapes: %zu ragged ks patterns (R = 2..34), every dispatched tier vs its single-row kernel\n",
+           g_fail != bad0 ? "BAD" : "ok ", KS.size());
 }
 
 // ---- timing ----------------------------------------------------------------
@@ -391,6 +528,7 @@ int main(int argc, char** argv) {
         bf16_check();
         qg_check();
         w4_check();
+        verify_check();
         printf("%s\n", g_fail ? "FAIL" : "PASS");
         return g_fail ? 1 : 0;
     }
