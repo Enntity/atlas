@@ -8,7 +8,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::KernelLaunch;
 
 use super::hyper_connection_lowrank_gemm::{
-    hc_fast, hc_finish_block, hc_finish_x4, hc_token_fused,
+    hc_fast, hc_finish_block, hc_finish_x4, hc_token_fused, hc_wide,
 };
 use super::qwen4exp_decode_fuse::{HcPostFold, hc_post_stage};
 use crate::layers::qwen3_attention::HcLowRank;
@@ -22,6 +22,16 @@ const HC_V_TWIN_MIN: u32 = 5;
 /// Tokens the row-grouped `_vec_rows` twins take in one launch (HC_V_ROWS_MAX).
 pub(super) const HC_V_ROWS_MAX: u32 = 32;
 const HC_V_DOWN_CPT: u32 = 2; // chains per thread
+// `hc_pre_down_vec_wide` (ATLAS_QWEN4EXP_HC_WIDE): its HC_V_WIDE_* defines.
+const HC_V_WIDE_G: u32 = 8;
+const HC_V_WIDE_DOWN_CPT: u32 = 4;
+const HC_V_WIDE_DOWN_UNROLL: u32 = 16;
+/// Widths the re-tiled down walk serves: past three 8-token groups, where
+/// the `_rows` grid (41 CTAs a group at 150 registers) no longer fits one wave.
+const HC_V_WIDE_MIN: u32 = 25;
+/// The stage's blocks per token at those widths: 25+ tokens already fill the
+/// part, and every block re-reads its token's 40 KB for the RMS.
+const HC_V_WIDE_STAGE_SPLIT: u32 = 2;
 const HC_V_DOWN_UNROLL: u32 = 32;
 const HC_V_FIN_DPT: u32 = 4; // output dims per thread
 const HC_V_FIN_UNROLL: u32 = 32;
@@ -80,7 +90,12 @@ fn hc_pre_vec(
     // Past HC_V_MAX tokens (the exact batching lane's wide steps): groups of
     // HC_V_MAX tokens on blockIdx.y of one launch, each the `_vec8` body.
     let groups = num_tokens.div_ceil(HC_V_MAX);
+    let wide = num_tokens >= HC_V_WIDE_MIN
+        && hc_wide()
+        && (hc_dim / 32).is_multiple_of(HC_V_WIDE_DOWN_UNROLL)
+        && crate::layers::try_kernel(gpu, "hyper_connection", "hc_pre_down_vec_wide").0 != 0;
     let (down, fin) = match (groups > 1, num_tokens >= HC_V_TWIN_MIN) {
+        (true, _) if wide => ("hc_pre_down_vec_wide", "hc_pre_finish_vec_rows"),
         (true, _) => ("hc_pre_down_vec_rows", "hc_pre_finish_vec_rows"),
         (false, true) => ("hc_pre_down_vec8", "hc_pre_finish_vec8"),
         (false, false) => ("hc_pre_down_vec", "hc_pre_finish_vec"),
@@ -108,8 +123,13 @@ fn hc_pre_vec(
             stream,
         )?;
     } else {
+        let split = if wide {
+            HC_V_WIDE_STAGE_SPLIT
+        } else {
+            HC_V_STAGE_SPLIT
+        };
         KernelLaunch::new(gpu, k_stage)
-            .grid([num_tokens, HC_V_STAGE_SPLIT, 1])
+            .grid([num_tokens, split, 1])
             .block([1024, 1, 1])
             .arg_ptr(streams)
             .arg_ptr(w.norm_w)
@@ -122,9 +142,14 @@ fn hc_pre_vec(
 
     // `inj_out` NULL is the model-level head: no injection rows.
     let rows = rank + if inj_out.is_null() { 0 } else { hc_mult };
-    let down_threads = rows * (32 / HC_V_DOWN_CPT);
+    let (cpt, down_groups) = if wide {
+        (HC_V_WIDE_DOWN_CPT, num_tokens.div_ceil(HC_V_WIDE_G))
+    } else {
+        (HC_V_DOWN_CPT, groups)
+    };
+    let down_threads = rows * (32 / cpt);
     KernelLaunch::new(gpu, k_down)
-        .grid([down_threads.div_ceil(HC_V_DOWN_BLOCK), groups, 1])
+        .grid([down_threads.div_ceil(HC_V_DOWN_BLOCK), down_groups, 1])
         .block([HC_V_DOWN_BLOCK, 1, 1])
         .arg_ptr(normed)
         .arg_ptr(w.down_w)
