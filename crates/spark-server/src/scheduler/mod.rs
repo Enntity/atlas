@@ -1198,6 +1198,15 @@ pub fn run(
             }
         }
 
+        // A speculative step refused for KV (agreed, rolled back on every
+        // rank) preempts a victim here instead of failing its sequences.
+        preempt::requeue_kv_refusals(
+            &*model,
+            &mut active,
+            spill_manager.as_mut(),
+            &mut swapped,
+            &mut preempted,
+        );
         active.extend(rode_seqs);
 
         let t_loop = std::time::Instant::now();
