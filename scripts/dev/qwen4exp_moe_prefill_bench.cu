@@ -371,6 +371,38 @@ int main(int argc, char** argv) {
         ok = ok && dsw == 0;
         const float ts3 = time_ms(shared_w);
         printf("shared expert W2: %.3f ms (%.1f TFLOP/s), %.2fx vs q38\n", ts3, s_tf / ts3 * 1e3, ts2 / ts3);
+
+        // Row split (ATLAS_QWEN4EXP_PREFILL_SP_SHARED): the dense q38 / W2
+        // kernels run every row with the same k-chain whatever M is, so the
+        // two SP halves computed apart must equal the whole chunk.
+        if (T >= 4096) {
+            const unsigned S = ((T / 2 + 1024) / 2048) * 2048;
+            Buf<unsigned short> d_so5;
+            d_so5.alloc((size_t)T * H);
+            d_so5.fill(0x77);
+            for (int w2 = 0; w2 < 2; ++w2) {
+                CUfunction kg = w2 ? k_sgu_w : k_sgu, kd = w2 ? k_sdn_w : k_sdn;
+                for (unsigned half = 0; half < 2; ++half) {
+                    const unsigned r0 = half ? S : 0, m = half ? T - S : S;
+                    Args a;
+                    a.add(d_a.p + (size_t)r0 * H).add(d_sa8.p + (size_t)r0 * H).add(m * H);
+                    launch(k_a8, dim3((m * H / 4 + 255) / 256), dim3(256), 0, a);
+                    Args x;
+                    x.add(d_sa8.p + (size_t)r0 * H).add(sgp.p).add(sgs.p).add(s2g).add(sup.p).add(sus.p).add(s2u)
+                     .add(d_sact8_w.p + (size_t)r0 * I).add(m).add(I).add(H);
+                    launch(kg, dim3(I / 64, (m + 127) / 128), dim3(256), 0, x);
+                    Args y;
+                    y.add(d_sact8_w.p + (size_t)r0 * I).add(sdp.p).add(sds.p).add(s2d).add(d_so5.p + (size_t)r0 * H)
+                     .add(m).add(H).add(I);
+                    launch(kd, dim3(H / 128, (m + 127) / 128), dim3(256), 0, y);
+                }
+                CK(cudaDeviceSynchronize());
+                const size_t dsplit = diff_bytes(d_so2.get(), d_so5.get());
+                printf("bitwise shared expert split at %u of %u (%s) vs whole: %zu differing bytes\n", S, T,
+                       w2 ? "W2" : "q38", dsplit);
+                ok = ok && dsplit == 0;
+            }
+        }
     }
     // ── unpermute: dense (remote rows zeroed) vs local-only (remote rows garbage) ──
     if (have_q38) {
