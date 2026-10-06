@@ -121,6 +121,8 @@ impl TransformerModel {
             conv_dsts_early: &p.conv_dsts_early,
         });
 
+        // ATLAS_QWEN4EXP_PREFILL_HOST_IDS (`embed_chunk::take_staged_ids`).
+        let host_ids = super::embed_chunk::take_staged_ids().filter(|ids| ids.len() >= proc_count);
         let ctx = ForwardContext {
             ssm_batch: None,
             buffers: &self.buffers,
@@ -140,7 +142,7 @@ impl TransformerModel {
             // Hash-MoE: this chunk's token IDs (uploaded in prefill_b_embed_chunk
             // to the stable buffer, in chunk order matching the MoE loop).
             token_ids: Some(self.buffers.token_ids()),
-            host_token_ids: None,
+            host_token_ids: host_ids.as_deref(),
             // #30: request slot pairs (None unless routing to a non-active slot).
             routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
             midchunk_capture,
