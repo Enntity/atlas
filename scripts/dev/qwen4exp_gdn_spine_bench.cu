@@ -8,6 +8,7 @@
 // Build (repo root, GB10):
 //   D=$(mktemp -d)
 //   nvcc --ptx -arch=sm_121f -O3 --fmad=false -o $D/gdn_fla.ptx kernels/gb10/common/gated_delta_rule_fla.cu
+//   (optionally the pre-change file as $D/old_fla.ptx, to pin the default)
 //   nvcc -O3 -std=c++17 -o $D/bench scripts/dev/qwen4exp_gdn_spine_bench.cu -lcuda
 //   $D/bench $D [tokens=16000] [v_heads=24] [k_heads=8]
 #include "qwen4exp_ptx_harness.h"
@@ -87,6 +88,41 @@ int main(int argc, char** argv) {
     float t2 = time_ms([&] { d_h2.put(h0); dv(); }, 3, 3);
     printf("spine: pipe %.3f ms -> pipe_dv64 %.3f ms (%.2fx)  [each includes a %zu KB state upload]\n",
            t1, t2, t1 / t2, h0.size() * 4 / 1024);
-    printf("%s\n", ok ? "PASS" : "FAIL");
-    return ok ? 0 : 1;
+    // ── chunk_fwd_o vs chunk_fwd_o_wide on the spine's S_out / uc_out ──
+    // (`old_fla.ptx`, when present, is the module before the wide twin landed:
+    // its chunk_fwd_o must also equal this build's.)
+    bool ok2 = true;
+    {
+        const unsigned smem_fo = C * KD * 2 + C * KD * 2 + C * C * 4 + C * VD * 2 + KD * VD * 2 + 2 * C * 4;
+        CUfunction k_fo = m.fn("gated_delta_rule_chunk_fwd_o", smem_fo);
+        CUfunction k_fow = m.fn("gated_delta_rule_chunk_fwd_o_wide", smem_fo);
+        PtxModule m_old;
+        CUfunction k_fo_old = nullptr;
+        if (m_old.try_load(dir + "/old_fla.ptx")) k_fo_old = m_old.fn("gated_delta_rule_chunk_fwd_o", smem_fo);
+        Buf<unsigned short> d_o1, d_o2, d_o3;
+        d_o1.alloc((size_t)T * NV * VD); d_o2.alloc((size_t)T * NV * VD); d_o3.alloc((size_t)T * NV * VD);
+        const unsigned short* query = d_qkv.p;
+        auto fo = [&](CUfunction k, unsigned short* out) {
+            Args a;
+            a.add(query).add(key).add(d_gate.p).add(d_gc.p).add(d_s1.p).add(d_uc1.p).add(out)
+             .add(1u).add(T).add(NC).add(NK).add(NV).add(KD).add(VD).add(QK).add(2 * NV)
+             .add((int*)nullptr).add((int*)nullptr).add(0u);
+            launch(k, dim3(NC, NV, 1), dim3(512), smem_fo, a);
+        };
+        d_o1.fill(0x55); d_o2.fill(0x55); d_o3.fill(0x55);
+        fo(k_fo, d_o1.p);
+        fo(k_fow, d_o2.p);
+        if (k_fo_old) fo(k_fo_old, d_o3.p);
+        CK(cudaDeviceSynchronize());
+        size_t dw = diff_bytes(d_o1.get(), d_o2.get());
+        size_t dold = k_fo_old ? diff_bytes(d_o1.get(), d_o3.get()) : 0;
+        printf("bitwise chunk_fwd_o vs chunk_fwd_o_wide: %zu differing bytes%s\n", dw,
+               k_fo_old ? (dold == 0 ? "; this build's chunk_fwd_o == the previous build's" : "; DEFAULT CHANGED") : "");
+        ok2 = dw == 0 && dold == 0;
+        float t1 = time_ms([&] { fo(k_fo, d_o1.p); }, 3, 3);
+        float t2 = time_ms([&] { fo(k_fow, d_o2.p); }, 3, 3);
+        printf("chunk_fwd_o %.3f ms -> chunk_fwd_o_wide %.3f ms (%.2fx)\n", t1, t2, t1 / t2);
+    }
+    printf("%s\n", ok && ok2 ? "PASS" : "FAIL");
+    return ok && ok2 ? 0 : 1;
 }

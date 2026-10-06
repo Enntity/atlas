@@ -8,7 +8,7 @@
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=1`      | TP2 QSA attention on tensor cores      | = TP1 tc2, != `_g` |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_LEAN=1`      | TP1 tc2 -> its lean twin (2 CTAs/SM)   | = tc2  |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_SCORE=1`     | QSA block scorer, 16-byte loads, 2 rows a thread | = `qsa_score_rows_exact` |
-//! | `ATLAS_QWEN4EXP_PREFILL_GDN_DV=1`        | GDN state spine, columns over 2 CTAs a head | = `..._chunk_delta_h_pipe` |
+//! | `ATLAS_QWEN4EXP_PREFILL_GDN=1`           | GDN spine over 2 CTAs a head (TP2); wide `chunk_fwd_o` | = `..._pipe`, = `chunk_fwd_o` |
 //! | `ATLAS_QWEN4EXP_PREFILL_HC=1`            | mHC collapse: seam, down, up+mix fused | = default (`qwen4exp_prefill_hc`) |
 //! | `ATLAS_QWEN4EXP_PREFILL_MOE=1`           | router, shared and routed experts, unpermute | = default (`moe::forward_prefill_q38`) |
 //! | `ATLAS_QWEN4EXP_PREFILL_HC_CHECK=<n>`    | cross-check the first n mHC slabs      | diagnostic |
@@ -178,10 +178,10 @@ pub fn try_qsa_score_v4(
     Ok(true)
 }
 
-/// `ATLAS_QWEN4EXP_PREFILL_GDN_DV=1`.
-pub fn gdn_dv_requested() -> bool {
+/// `ATLAS_QWEN4EXP_PREFILL_GDN=1`.
+pub fn gdn_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_GDN_DV"))
+    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_GDN"))
 }
 
 /// The GDN prefill state spine as `gated_delta_rule_chunk_delta_h_pipe_dv64`
@@ -201,7 +201,7 @@ pub fn gdn_pipe_dv(
     is_varlen: bool,
 ) -> Option<(spark_runtime::gpu::KernelHandle, u32)> {
     const C: u32 = 64;
-    if !gdn_dv_requested() || kd != 128 || vd != 128 || is_varlen {
+    if !gdn_requested() || kd != 128 || vd != 128 || is_varlen {
         return None;
     }
     let sms = gpu.sm_count().unwrap_or(0);
@@ -216,4 +216,35 @@ pub fn gdn_pipe_dv(
     // 2 x {W, K} [C, kd] + 2 x U [C, 64] BF16, then gc [2][C] and decay [2][C + 1].
     let smem = 2 * 2 * C * kd * 2 + 2 * C * 64 * 2 + 2 * C * 4 + 2 * (C + 1) * 4;
     (k.0 != 0).then_some((k, smem))
+}
+
+/// The GDN prefill output pass as `gated_delta_rule_chunk_fwd_o_wide`: the
+/// default `chunk_fwd_o` with its closing per-(row, column) loop on all 512
+/// threads, S_c staged as stored (16-byte copies, fragments read `[k][v]`) and
+/// q / k / uc staged 16 bytes a copy -- every output byte identical
+/// (`scripts/dev/qwen4exp_gdn_spine_bench.cu`; 16000 tokens at the TP2 rank
+/// shape: 7.01 -> 3.57 ms a layer). Same grid, block and shared memory.
+pub fn gdn_fwd_o_wide(
+    gpu: &dyn GpuBackend,
+    kd: u32,
+    vd: u32,
+    qk_stride: u32,
+    q: DevicePtr,
+    k: DevicePtr,
+) -> Option<spark_runtime::gpu::KernelHandle> {
+    if !gdn_requested()
+        || kd != 128
+        || vd != 128
+        || !qk_stride.is_multiple_of(8)
+        || !q.0.is_multiple_of(16)
+        || !k.0.is_multiple_of(16)
+    {
+        return None;
+    }
+    let h = crate::layers::try_kernel(
+        gpu,
+        "gated_delta_rule_fla",
+        "gated_delta_rule_chunk_fwd_o_wide",
+    );
+    (h.0 != 0).then_some(h)
 }

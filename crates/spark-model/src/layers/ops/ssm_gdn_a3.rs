@@ -292,7 +292,7 @@ pub fn gdn_prefill_fla(
     // Kernel 2 (non-TMA). Both paths write s_out/uc_out and fall through to
     // kernel 3, which is identical either way.
     if !tma_ok {
-        // ATLAS_QWEN4EXP_PREFILL_GDN_DV: `..._pipe` with its columns split over
+        // ATLAS_QWEN4EXP_PREFILL_GDN: `..._pipe` with its columns split over
         // two CTAs a head, byte-identical (`qwen4exp_prefill::gdn_pipe_dv`).
         let pipe_dv = (use_fused && pipe)
             .then(|| {
@@ -348,8 +348,11 @@ pub fn gdn_prefill_fla(
         prof!("gdn_fla_chunk_delta_h", &mut t0);
     }
 
-    // Kernel 3: chunk_fwd_o.
-    KernelLaunch::new(gpu, k_chunk_fwd_o)
+    // Kernel 3: chunk_fwd_o (or, under ATLAS_QWEN4EXP_PREFILL_GDN, its
+    // byte-identical wide twin).
+    let k_fwd_o = super::qwen4exp_prefill::gdn_fwd_o_wide(gpu, kd, vd, qk_stride, query, key)
+        .unwrap_or(k_chunk_fwd_o);
+    KernelLaunch::new(gpu, k_fwd_o)
         .grid([num_chunks, num_v_heads, batch_size])
         .block([512, 1, 1])
         .shared_mem(smem_fo)
