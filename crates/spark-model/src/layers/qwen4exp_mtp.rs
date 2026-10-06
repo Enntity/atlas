@@ -97,7 +97,13 @@ pub struct Qwen4ExpMtpHead {
     /// is re-verified by the target's own head, so the draft head can only
     /// affect acceptance, never an emitted token.
     lm_head: DenseWeight,
+    /// `--mtp-vocab`: the grammar-masked draft path's prefix of `lm_head`.
     mtp_vocab_size: u32,
+    /// The unmasked draft path's head (`qwen4exp_draft_head.rs`).
+    draft: crate::layers::qwen4exp_draft_head::DraftHead,
+    /// `ATLAS_QWEN4EXP_MTP_CONFIDENCE`: stop the chain before a draft (after
+    /// the first) whose draft-head probability is below this. 0 = off.
+    conf_stop: f32,
     /// The drafter's own single-layer KV cache.
     kv_cache: Mutex<PagedKvCache>,
 
@@ -163,12 +169,24 @@ impl Qwen4ExpMtpHead {
         let kv_cache = PagedKvCache::new(kv_config, num_blocks, gpu)?;
 
         let bf16 = |n: usize| -> Result<DevicePtr> { gpu.alloc(n * 2) };
+        let draft = crate::layers::qwen4exp_draft_head::DraftHead::build(
+            &lm_head,
+            config.vocab_size,
+            h,
+            mtp_vocab_size,
+            gpu,
+        )?;
+        let conf_stop = crate::layers::qwen4exp_draft_head::conf_stop_from(
+            std::env::var("ATLAS_QWEN4EXP_MTP_CONFIDENCE").ok(),
+        )?;
 
         Ok(Self {
             module,
             embed_tokens,
             lm_head,
             mtp_vocab_size,
+            draft,
+            conf_stop,
             kv_cache: Mutex::new(kv_cache),
             embed_buf: bf16(h)?,
             normed_e: bf16(h)?,
@@ -254,14 +272,30 @@ impl DraftProposer for Qwen4ExpMtpHead {
             // `body.decode` left holding the drafter's own residual — so
             // unlike the collapsed-hidden proposers there is nothing to thread
             // between iterations.
-            let draft = self.forward_one(
+            let want_conf = i > 0 && self.conf_stop > 0.0;
+            let (draft, conf) = self.forward_one(
                 current_token,
                 position + i,
                 st,
                 ctx,
                 stream,
                 grammar_bitmask,
+                want_conf,
             )?;
+            // Confidence stop: the first draft is always kept; a later one
+            // whose draft-head probability is below the threshold ends the
+            // chain, unproposed. Its drafter KV row is dropped as a rejected
+            // draft's is. Proposals only — the verify decides every token.
+            if let Some(p) = conf
+                && p < self.conf_stop
+            {
+                st.seq_len -= 1;
+                tracing::debug!(
+                    "qwen4_exp MTP confidence stop at draft {i}: p={p:.3} < {}",
+                    self.conf_stop
+                );
+                break;
+            }
             tracing::debug!(
                 "qwen4_exp MTP propose[{i}]: token={current_token} pos={} mtp_seq_len={} -> draft={draft}",
                 position + i,
