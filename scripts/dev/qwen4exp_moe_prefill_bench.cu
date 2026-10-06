@@ -9,6 +9,8 @@
 //             moe_w4a16_grouped_gemm_ptrtable_t_k64   (moe_w4a16_grouped_gemm.cu)
 //   fast      moe_q38_gate_up_silu (gate+up+SiLU*mul, one kernel) ->
 //             moe_q38_down                             (moe_prefill_q38.cu)
+//   router    w4a16_gemm  vs  moe_q38_router_dequant + dense_gemm_bf16_pipelined
+//             ([tokens, 2560] x 512 experts; logits must match byte for byte)
 //
 // The `act` (SiLU*up) and down outputs must match byte for byte.
 //
@@ -18,6 +20,8 @@
 //   nvcc $F -o $D/moe_w4a16.ptx $K/moe_w4a16_grouped_gemm.cu
 //   nvcc $F -o $D/moe_silu_mul.ptx $C/moe_silu_mul.cu
 //   nvcc $F -o $D/moe_prefill_q38.ptx $K/moe_prefill_q38.cu
+//   nvcc $F -o $D/w4a16.ptx $K/w4a16_gemm.cu      # router: the default
+//   nvcc $F -o $D/gemm.ptx $C/dense_gemm_bf16.cu  # router: the q38 arm
 //   nvcc -O3 -std=c++17 -o $D/bench scripts/dev/qwen4exp_moe_prefill_bench.cu -lcuda
 //   $D/bench $D [tokens=8192]
 #include "qwen4exp_ptx_harness.h"
@@ -204,6 +208,106 @@ int main(int argc, char** argv) {
                t_a, t, gu_tf / t * 1e3, t2, dn_tf / t2 * 1e3);
         printf("MoE GEMMs: default %.3f ms -> fast %.3f ms (%.2fx)\n", t_gu + t_si + t_dn, t_a + t + t2,
                (t_gu + t_si + t_dn) / (t_a + t + t2));
+    }
+    // ── router: w4a16_gemm vs moe_q38_router_dequant + dense_gemm_bf16_pipelined ──
+    PtxModule m_w4, m_gemm;
+    if (have_q38 && m_w4.try_load(dir + "/w4a16.ptx") && m_gemm.try_load(dir + "/gemm.ptx")) {
+        CUfunction k_w4 = m_w4.fn("w4a16_gemm");
+        CUfunction k_dq = m_q38.fn("moe_q38_router_dequant");
+        CUfunction k_dg = m_gemm.fn("dense_gemm_bf16_pipelined");
+        const unsigned NR = E_ALL;
+        std::vector<unsigned char> rp((size_t)NR * H / 2), rs((size_t)NR * H / 16);
+        for (auto& x : rp) x = (unsigned char)(rng() & 0xFF);
+        std::uniform_real_distribution<float> us(0.004f, 0.06f);
+        for (auto& x : rs) x = e4m3(us(rng));
+        Buf<unsigned char> d_rp, d_rs;
+        Buf<unsigned short> d_rw, d_l1, d_l2;
+        d_rp.alloc(rp.size()); d_rp.put(rp);
+        d_rs.alloc(rs.size()); d_rs.put(rs);
+        d_rw.alloc((size_t)NR * H);
+        d_l1.alloc((size_t)T * NR); d_l2.alloc((size_t)T * NR);
+        const float s2 = 0.73f;
+        auto router_old = [&]() {
+            Args x;
+            x.add(d_a.p).add(d_rp.p).add(d_rs.p).add(s2).add(d_l1.p).add(T).add(NR).add(H);
+            launch(k_w4, dim3(NR / 64, (T + 63) / 64), dim3(128), 0, x);
+        };
+        auto router_new = [&]() {
+            Args x;
+            x.add(d_rp.p).add(d_rs.p).add(s2).add(d_rw.p).add(NR).add(H);
+            launch(k_dq, dim3((NR * H / 2 + 255) / 256), dim3(256), 0, x);
+            Args y;
+            y.add(d_a.p).add(d_rw.p).add(d_l2.p).add(T).add(NR).add(H);
+            launch(k_dg, dim3((NR + 127) / 128, (T + 127) / 128), dim3(256), 0, y);
+        };
+        d_l1.fill(0x12); d_l2.fill(0x34);
+        router_old();
+        router_new();
+        CK(cudaDeviceSynchronize());
+        size_t d = diff_bytes(d_l1.get(), d_l2.get());
+        printf("bitwise router logits (w4a16_gemm vs dequant + dense_gemm_bf16_pipelined): %zu differing bytes\n", d);
+        ok = ok && d == 0;
+        const double r_tf = 2.0 * T * NR * H / 1e12;
+        float t1 = time_ms(router_old), t2 = time_ms(router_new);
+        printf("router: w4a16_gemm %.3f ms (%.1f TFLOP/s) -> dequant + dense_gemm %.3f ms (%.1f TFLOP/s), %.2fx\n",
+               t1, r_tf / t1 * 1e3, t2, r_tf / t2 * 1e3, t1 / t2);
+
+        // ── shared expert: w4a16_gemm_t x3 + moe_silu_mul vs the dense q38 pair ──
+        CUfunction k_wt = m_w4.fn("w4a16_gemm_t");
+        CUfunction k_a8 = m_q38.fn("moe_q38_a_to_e4m3");
+        CUfunction k_sgu = m_q38.fn("moe_q38_dense_gate_up_silu");
+        CUfunction k_sdn = m_q38.fn("moe_q38_dense_down");
+        auto mk = [&](unsigned K, unsigned N, Buf<unsigned char>& p, Buf<unsigned char>& sc) {
+            std::vector<unsigned char> hp((size_t)K / 2 * N), hs((size_t)K / 16 * N);
+            for (auto& x : hp) x = (unsigned char)(rng() & 0xFF);
+            for (auto& x : hs) x = e4m3(us(rng));
+            p.alloc(hp.size()); p.put(hp);
+            sc.alloc(hs.size()); sc.put(hs);
+        };
+        Buf<unsigned char> sgp, sgs, sup, sus, sdp, sds, d_sa8, d_sact8;
+        mk(H, I, sgp, sgs); mk(H, I, sup, sus); mk(I, H, sdp, sds);
+        const float s2g = 0.9f, s2u = 1.1f, s2d = 0.8f;
+        Buf<unsigned short> d_sg, d_su, d_so1, d_so2;
+        d_sg.alloc((size_t)T * I); d_su.alloc((size_t)T * I);
+        d_so1.alloc((size_t)T * H); d_so2.alloc((size_t)T * H);
+        d_sa8.alloc((size_t)T * H); d_sact8.alloc((size_t)T * I);
+        auto wt = [&](const void* a, Buf<unsigned char>& p, Buf<unsigned char>& sc, float s2v,
+                      unsigned short* c, unsigned N, unsigned K) {
+            Args x;
+            x.add(a).add(p.p).add(sc.p).add(s2v).add(c).add(T).add(N).add(K).add(N);
+            launch(k_wt, dim3((N + 127) / 128, (T + 63) / 64), dim3(128), 0, x);
+        };
+        auto shared_old = [&]() {
+            wt(d_a.p, sgp, sgs, s2g, d_sg.p, I, H);
+            wt(d_a.p, sup, sus, s2u, d_su.p, I, H);
+            Args x;
+            x.add(d_sg.p).add(d_su.p).add(d_sg.p).add(T * I);
+            launch(k_silu, dim3((T * I + 255) / 256), dim3(256), 0, x);
+            wt(d_sg.p, sdp, sds, s2d, d_so1.p, H, I);
+        };
+        auto shared_new = [&]() {
+            Args a;
+            a.add(d_a.p).add(d_sa8.p).add(T * H);
+            launch(k_a8, dim3((T * H / 4 + 255) / 256), dim3(256), 0, a);
+            Args x;
+            x.add(d_sa8.p).add(sgp.p).add(sgs.p).add(s2g).add(sup.p).add(sus.p).add(s2u)
+             .add(d_sact8.p).add(T).add(I).add(H);
+            launch(k_sgu, dim3(I / 64, (T + 127) / 128), dim3(256), 0, x);
+            Args y;
+            y.add(d_sact8.p).add(sdp.p).add(sds.p).add(s2d).add(d_so2.p).add(T).add(H).add(I);
+            launch(k_sdn, dim3(H / 128, (T + 127) / 128), dim3(256), 0, y);
+        };
+        d_so1.fill(0x21); d_so2.fill(0x43);
+        shared_old();
+        shared_new();
+        CK(cudaDeviceSynchronize());
+        size_t ds = diff_bytes(d_so1.get(), d_so2.get());
+        printf("bitwise shared expert output (w4a16_gemm_t chain vs q38 dense): %zu differing bytes\n", ds);
+        ok = ok && ds == 0;
+        const double s_tf = 2.0 * T * (2.0 * I * H + (double)I * H) / 1e12;
+        float ts1 = time_ms(shared_old), ts2 = time_ms(shared_new);
+        printf("shared expert: default %.3f ms (%.1f TFLOP/s) -> q38 %.3f ms (%.1f TFLOP/s), %.2fx\n",
+               ts1, s_tf / ts1 * 1e3, ts2, s_tf / ts2 * 1e3, ts1 / ts2);
     }
     printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

@@ -273,9 +273,95 @@ __device__ __forceinline__ void q38_rows(Q38Smem& sm, const int* __restrict__ so
 }
 
 // ── gate + up + SiLU*mul ──
-// act8[row, n] = e4m3(bf16(silu(bf16(A x gate)) * bf16(A x up))), rows in
-// expert-sorted order; A8 is `moe_q38_a_to_e4m3` of the [tokens, K] input.
-// Grid: (N / 64, m-tiles (strided), num_experts), Block 256.
+// act8[row, n] = e4m3(bf16(silu(bf16(A x gate)) * bf16(A x up))) for rows
+// [m_start, m_start + M) of one weight set; A8 rows through
+// `sorted_token_ids` (identity when null). CTAs stride the 128-row tiles.
+__device__ __forceinline__ void q38_gate_up_silu_rows(
+    Q38Smem& sm,
+    const unsigned char* __restrict__ A8,
+    const unsigned char* Bg, const unsigned char* Sg, float s2g,
+    const unsigned char* Bu, const unsigned char* Su, float s2u,
+    unsigned char* __restrict__ act8,
+    const int* __restrict__ sorted_token_ids,
+    unsigned int m_start, unsigned int M_eff,
+    unsigned int N, unsigned int K
+) {
+    const unsigned int n0 = blockIdx.x * 64;
+    if (threadIdx.x == 0) { sm.s2[0] = s2g; sm.s2[1] = s2u; }
+    if (threadIdx.x < 16) sm.lut[threadIdx.x] = Q38_E2M1_LUT[threadIdx.x];
+    const unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const unsigned int g = lane >> 2, t4 = lane & 3u;
+    for (unsigned int cta_m_local = blockIdx.y * Q38_BM; cta_m_local < M_eff;
+         cta_m_local += gridDim.y * Q38_BM) {
+        __syncthreads();   // previous tile's readers of sm.tok / buffers are done
+        q38_rows(sm, sorted_token_ids, m_start, cta_m_local, M_eff);
+        __syncthreads();
+        float acc[16][4];
+        q38_tile(sm, acc, A8, K, cta_m_local, M_eff, Bg, Sg, n0, Bu, Su, n0, N);
+        #pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            const unsigned int c0 = n0 + nt * 8 + t4 * 2;
+            #pragma unroll
+            for (unsigned int half = 0; half < 2; ++half) {
+                const unsigned int lr = warp * 16 + g + half * 8;
+                if (cta_m_local + lr >= M_eff) continue;
+                float o[2];
+                #pragma unroll
+                for (unsigned int j = 0; j < 2; ++j) {
+                    const float gv = __bfloat162float(__float2bfloat16(acc[nt][half * 2 + j]));
+                    const float uv = __bfloat162float(__float2bfloat16(acc[nt + 8][half * 2 + j]));
+                    const float sig = 1.0f / (1.0f + __expf(-gv));
+                    o[j] = __bfloat162float(__float2bfloat16(gv * sig * uv));
+                }
+                const unsigned int row = m_start + cta_m_local + lr;
+                *(unsigned short*)&act8[(size_t)row * N + c0] = q38_e4m3x2(o[0], o[1]);
+            }
+        }
+    }
+}
+
+// ── down ──
+// C[row, n] = bf16(act x down) for rows [m_start, m_start + M) of one weight
+// set (act8 not gathered). CTAs stride the 128-row tiles.
+__device__ __forceinline__ void q38_down_rows(
+    Q38Smem& sm,
+    const unsigned char* __restrict__ act8,
+    const unsigned char* B, const unsigned char* S, float s2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int m_start, unsigned int M_eff,
+    unsigned int N, unsigned int K
+) {
+    const unsigned int n0 = blockIdx.x * 128;
+    if (threadIdx.x == 0) { sm.s2[0] = s2; sm.s2[1] = s2; }
+    if (threadIdx.x < 16) sm.lut[threadIdx.x] = Q38_E2M1_LUT[threadIdx.x];
+    const unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const unsigned int g = lane >> 2, t4 = lane & 3u;
+    for (unsigned int cta_m_local = blockIdx.y * Q38_BM; cta_m_local < M_eff;
+         cta_m_local += gridDim.y * Q38_BM) {
+        __syncthreads();
+        q38_rows(sm, nullptr, m_start, cta_m_local, M_eff);
+        __syncthreads();
+        float acc[16][4];
+        q38_tile(sm, acc, act8, K, cta_m_local, M_eff, B, S, n0, B, S, n0 + 64, N);
+        #pragma unroll
+        for (int nt = 0; nt < 16; ++nt) {
+            const unsigned int c0 = n0 + nt * 8 + t4 * 2;
+            #pragma unroll
+            for (unsigned int half = 0; half < 2; ++half) {
+                const unsigned int lr = warp * 16 + g + half * 8;
+                if (cta_m_local + lr >= M_eff) continue;
+                const unsigned int row = m_start + cta_m_local + lr;
+                *(unsigned int*)&C[(size_t)row * N + c0] =
+                      (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[nt][half * 2]))
+                    | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[nt][half * 2 + 1])) << 16);
+            }
+        }
+    }
+}
+
+// Grouped (routed experts): weights by expert pointer tables, rows by
+// expert_offsets; a null table is a remote (EP) expert and is skipped, as in
+// the default kernels. Grid: (N / 64, m-tiles (strided), num_experts).
 extern "C" __global__ void __launch_bounds__(256, Q38_MINB) moe_q38_gate_up_silu(
     const unsigned char* __restrict__ A8,                // [tokens, K] E4M3
     const unsigned long long* __restrict__ gate_packed_ptrs,
@@ -300,48 +386,12 @@ extern "C" __global__ void __launch_bounds__(256, Q38_MINB) moe_q38_gate_up_silu
     const unsigned char* Bg = (const unsigned char*)gate_packed_ptrs[e];
     const unsigned char* Bu = (const unsigned char*)up_packed_ptrs[e];
     if (Bg == nullptr || Bu == nullptr) return;
-    const unsigned char* Sg = (const unsigned char*)gate_scale_ptrs[e];
-    const unsigned char* Su = (const unsigned char*)up_scale_ptrs[e];
-    const unsigned int n0 = blockIdx.x * 64;
-    if (threadIdx.x == 0) { sm.s2[0] = gate_scale2_vals[e]; sm.s2[1] = up_scale2_vals[e]; }
-    if (threadIdx.x < 16) sm.lut[threadIdx.x] = Q38_E2M1_LUT[threadIdx.x];
-    const unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
-    const unsigned int g = lane >> 2, t4 = lane & 3u;
-    const unsigned int M_eff = (unsigned int)M_expert;
-
-    for (unsigned int cta_m_local = blockIdx.y * Q38_BM; cta_m_local < M_eff;
-         cta_m_local += gridDim.y * Q38_BM) {
-        __syncthreads();   // previous tile's readers of sm.tok / buffers are done
-        q38_rows(sm, sorted_token_ids, (unsigned int)m_start, cta_m_local, M_eff);
-        __syncthreads();
-        float acc[16][4];
-        q38_tile(sm, acc, A8, K, cta_m_local, M_eff, Bg, Sg, n0, Bu, Su, n0, N);
-        #pragma unroll
-        for (int nt = 0; nt < 8; ++nt) {
-            const unsigned int c0 = n0 + nt * 8 + t4 * 2;
-            #pragma unroll
-            for (unsigned int half = 0; half < 2; ++half) {
-                const unsigned int lr = warp * 16 + g + half * 8;
-                if (cta_m_local + lr >= M_eff) continue;
-                float o[2];
-                #pragma unroll
-                for (unsigned int j = 0; j < 2; ++j) {
-                    const float gv = __bfloat162float(__float2bfloat16(acc[nt][half * 2 + j]));
-                    const float uv = __bfloat162float(__float2bfloat16(acc[nt + 8][half * 2 + j]));
-                    const float sig = 1.0f / (1.0f + __expf(-gv));
-                    o[j] = __bfloat162float(__float2bfloat16(gv * sig * uv));
-                }
-                const unsigned int row = (unsigned int)m_start + cta_m_local + lr;
-                *(unsigned short*)&act8[(size_t)row * N + c0] = q38_e4m3x2(o[0], o[1]);
-            }
-        }
-    }
+    q38_gate_up_silu_rows(sm, A8, Bg, (const unsigned char*)gate_scale_ptrs[e], gate_scale2_vals[e],
+                          Bu, (const unsigned char*)up_scale_ptrs[e], up_scale2_vals[e], act8,
+                          sorted_token_ids, (unsigned int)m_start, (unsigned int)M_expert, N, K);
 }
 
-// ── down ──
-// C[row, n] = bf16(act x down), rows in expert-sorted order, act8 the E4M3
-// activation `moe_q38_gate_up_silu` wrote. Grid: (N / 128, m-tiles
-// (strided), num_experts), Block 256.
+// Grid: (N / 128, m-tiles (strided), num_experts).
 extern "C" __global__ void __launch_bounds__(256, Q38_MINB) moe_q38_down(
     const unsigned char* __restrict__ act8,              // [rows, K] E4M3
     const unsigned long long* __restrict__ B_packed_ptrs,
@@ -361,33 +411,75 @@ extern "C" __global__ void __launch_bounds__(256, Q38_MINB) moe_q38_down(
     if (M_expert <= 0) return;
     const unsigned char* B = (const unsigned char*)B_packed_ptrs[e];
     if (B == nullptr) return;
-    const unsigned char* S = (const unsigned char*)B_scale_ptrs[e];
-    const unsigned int n0 = blockIdx.x * 128;
-    if (threadIdx.x == 0) { sm.s2[0] = scale2_vals[e]; sm.s2[1] = scale2_vals[e]; }
-    if (threadIdx.x < 16) sm.lut[threadIdx.x] = Q38_E2M1_LUT[threadIdx.x];
-    const unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
-    const unsigned int g = lane >> 2, t4 = lane & 3u;
-    const unsigned int M_eff = (unsigned int)M_expert;
+    q38_down_rows(sm, act8, B, (const unsigned char*)B_scale_ptrs[e], scale2_vals[e], C,
+                  (unsigned int)m_start, (unsigned int)M_expert, N, K);
+}
 
-    for (unsigned int cta_m_local = blockIdx.y * Q38_BM; cta_m_local < M_eff;
-         cta_m_local += gridDim.y * Q38_BM) {
-        __syncthreads();
-        q38_rows(sm, nullptr, (unsigned int)m_start, cta_m_local, M_eff);
-        __syncthreads();
-        float acc[16][4];
-        q38_tile(sm, acc, act8, K, cta_m_local, M_eff, B, S, n0, B, S, n0 + 64, N);
-        #pragma unroll
-        for (int nt = 0; nt < 16; ++nt) {
-            const unsigned int c0 = n0 + nt * 8 + t4 * 2;
-            #pragma unroll
-            for (unsigned int half = 0; half < 2; ++half) {
-                const unsigned int lr = warp * 16 + g + half * 8;
-                if (cta_m_local + lr >= M_eff) continue;
-                const unsigned int row = (unsigned int)m_start + cta_m_local + lr;
-                *(unsigned int*)&C[(size_t)row * N + c0] =
-                      (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[nt][half * 2]))
-                    | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[nt][half * 2 + 1])) << 16);
-            }
-        }
-    }
+// Dense (the shared expert, `w4a16_gemm_t` x 3 + `moe_silu_mul` in the
+// default): one weight set over rows [0, M), scalar scale2.
+// Grid: (N / 64, ceil(M / 128)).
+extern "C" __global__ void __launch_bounds__(256, Q38_MINB) moe_q38_dense_gate_up_silu(
+    const unsigned char* __restrict__ A8,                // [M, K] E4M3
+    const unsigned char* __restrict__ gate_packed,       // [K/2, N]
+    const unsigned char* __restrict__ gate_scale,        // [K/16, N]
+    const float gate_scale2,
+    const unsigned char* __restrict__ up_packed,
+    const unsigned char* __restrict__ up_scale,
+    const float up_scale2,
+    unsigned char* __restrict__ act8,                    // [M, N] E4M3
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    __shared__ __align__(16) Q38Smem sm;
+    q38_gate_up_silu_rows(sm, A8, gate_packed, gate_scale, gate_scale2, up_packed, up_scale,
+                          up_scale2, act8, nullptr, 0u, M, N, K);
+}
+
+// Grid: (N / 128, ceil(M / 128)).
+extern "C" __global__ void __launch_bounds__(256, Q38_MINB) moe_q38_dense_down(
+    const unsigned char* __restrict__ act8,              // [M, K] E4M3
+    const unsigned char* __restrict__ B_packed,          // [K/2, N]
+    const unsigned char* __restrict__ B_scale,           // [K/16, N]
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,                       // [M, N]
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    __shared__ __align__(16) Q38Smem sm;
+    q38_down_rows(sm, act8, B_packed, B_scale, scale2, C, 0u, M, N, K);
+}
+
+// ── router weight -> BF16 ──
+// The router GEMM ran `w4a16_gemm` (w4a16_gemm.cu: 64x64 tiles, K step 16,
+// no pipelining; 6.7 TFLOP/s at 16K tokens x 512 experts on GB10). Its B
+// values are `bf16((LUT[q] * float(scale)) * scale2)` and its products one
+// FP32 accumulator per output over m16n8k16 MMAs in increasing k -- exactly
+// what `dense_gemm_bf16_pipelined` computes over a BF16 [N, K] weight. This
+// writes that weight from the [N, K/2] packed / [N, K/16] scale planes (the
+// layout w4a16_gemm reads: row per output column `n`, low nibble = even k), so
+// the router logits, and the routing, are byte-identical.
+// Grid: (ceil(N * K / 2 / 256)), Block 256: one packed byte (two k) a thread.
+extern "C" __global__ void moe_q38_router_dequant(
+    const unsigned char* __restrict__ B_packed,   // [N, K/2]
+    const unsigned char* __restrict__ B_scale,    // [N, K/16] FP8 E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ out,              // [N, K]
+    const unsigned int N,
+    const unsigned int K
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;   // packed byte
+    const unsigned int half_k = K / 2;
+    if (i >= N * half_k) return;
+    const unsigned int n = i / half_k;
+    const unsigned int kp = i - n * half_k;
+    const unsigned char packed = B_packed[i];
+    __nv_fp8_e4m3 f;
+    *(unsigned char*)&f = B_scale[(size_t)n * (K / Q38_GROUP) + (2 * kp) / Q38_GROUP];
+    const float lo = Q38_E2M1_LUT[packed & 0xF] * (float)f * scale2;
+    const float hi = Q38_E2M1_LUT[packed >> 4] * (float)f * scale2;
+    *reinterpret_cast<unsigned int*>(out + (size_t)n * K + 2 * kp) =
+          (unsigned int)__bfloat16_as_ushort(__float2bfloat16(lo))
+        | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(hi)) << 16);
 }

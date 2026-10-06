@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_QWEN4EXP_PREFILL_MOE=1`: the routed-expert prefill GEMMs of
-//! Qwen3.8-Flash-Next on `moe_prefill_q38.cu` -- bit-identical to the default
-//! `moe_w4a16_fused_gate_up_t_k64` -> `moe_silu_mul` ->
-//! `moe_w4a16_grouped_gemm_ptrtable_t_k64` chain this target runs, in three
-//! launches:
+//! `ATLAS_QWEN4EXP_PREFILL_MOE=1`: Qwen3.8-Flash-Next's MoE prefill GEMMs on
+//! `moe_prefill_q38.cu`, every output byte unchanged:
+//!
+//! * the router logits ([`MoeLayer::try_q38_router`]): BF16 weight + the
+//!   tile GEMM instead of `w4a16_gemm` (6.44 -> 0.82 ms a layer at 16K);
+//! * the shared expert ([`MoeLayer::try_q38_shared`]): 4.88 -> 3.41 ms;
+//! * the routed experts, below.
+//!
+//! The routed chain replaces the default `moe_w4a16_fused_gate_up_t_k64` ->
+//! `moe_silu_mul` -> `moe_w4a16_grouped_gemm_ptrtable_t_k64` this target runs,
+//! in three launches:
 //!
 //! 1. `moe_q38_a_to_e4m3`: the token-major input to E4M3 once (the default
 //!    converts it inside the K loop of each of its ten column tiles);
@@ -77,6 +83,155 @@ pub(super) fn finish_q38_check(ctx: &ForwardContext, rows: u32, h: u32, stream: 
 }
 
 impl MoeLayer {
+    /// The router logits of a prefill chunk, when the q38 arm serves them:
+    /// `moe_q38_router_dequant` writes the NVFP4 router weight as the BF16
+    /// `[N, K]` values `w4a16_gemm` forms in its loop, and
+    /// `dense_gemm_bf16_pipelined` runs the same in-order m16n8k16 chain over
+    /// them -- byte-identical logits, so identical routing. GB10, 16000
+    /// tokens x 512 experts: 6.44 -> 0.82 ms a layer (2.7x at 300 tokens).
+    /// The BF16 weight (2.6 MB) is staged in `expert_up_out`, which the
+    /// routed GEMMs only fill after the router has run. `Ok(false)` launched
+    /// nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_q38_router(
+        &self,
+        router_in: DevicePtr,
+        w: &QuantizedWeight,
+        logits: DevicePtr,
+        n: u32,
+        n_out: u32,
+        h: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let bytes = n_out as usize * h as usize * 2;
+        if !q38_requested()
+            || ctx.config.model_type != "qwen4_exp"
+            || n < 32
+            || !h.is_multiple_of(16)
+            || ctx.buffers.sizes().expert_up_out < bytes
+        {
+            return Ok(false);
+        }
+        let gpu = ctx.gpu;
+        let k_dq = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_router_dequant");
+        if k_dq.0 == 0 {
+            return Ok(false);
+        }
+        let k_gemm = gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?;
+        let w_bf16 = ctx.buffers.expert_up_out();
+        KernelLaunch::new(gpu, k_dq)
+            .grid([(n_out * h / 2).div_ceil(256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(w.weight)
+            .arg_ptr(w.weight_scale)
+            .arg_f32(w.weight_scale_2)
+            .arg_ptr(w_bf16)
+            .arg_u32(n_out)
+            .arg_u32(h)
+            .launch(stream)?;
+        KernelLaunch::new(gpu, k_gemm)
+            .grid([n_out.div_ceil(128), n.div_ceil(128), 1])
+            .block([256, 1, 1])
+            .arg_ptr(router_in)
+            .arg_ptr(w_bf16)
+            .arg_ptr(logits)
+            .arg_u32(n)
+            .arg_u32(n_out)
+            .arg_u32(h)
+            .launch(stream)?;
+        Ok(true)
+    }
+
+    /// The shared expert of a prefill chunk, when the q38 arm serves it: the
+    /// default's transposed arm (`w4a16_gemm_t` gate, up and down around
+    /// `moe_silu_mul`) as `moe_q38_a_to_e4m3`, `moe_q38_dense_gate_up_silu`
+    /// and `moe_q38_dense_down`, the same arithmetic as the routed pair --
+    /// byte-identical `shared_down_out`. GB10, 16000 tokens: 4.88 -> 3.41
+    /// ms a layer. `out` = [gate scratch, up scratch, down output] (the E4M3
+    /// activation and input are staged in the first two). `Ok(false)`
+    /// launched nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_q38_shared(
+        &self,
+        input: DevicePtr,
+        n: u32,
+        h: u32,
+        inter: u32,
+        out: [DevicePtr; 3],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let (Some(sg), Some(su), Some(sd)) =
+            (&self.shared_gate_t, &self.shared_up_t, &self.shared_down_t)
+        else {
+            return Ok(false);
+        };
+        let sizes = ctx.buffers.sizes();
+        let serves = q38_requested()
+            && ctx.config.model_type == "qwen4_exp"
+            && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && self.shared_gate_fp8.is_none()
+            && self.shared_up_fp8.is_none()
+            && self.shared_down_fp8.is_none()
+            && self.bf16_shared_expert.is_none()
+            && !self.m5_projections.shared.enabled()
+            && !self.gelu_activation
+            && self.lora.is_none()
+            && h.is_multiple_of(128)
+            && inter.is_multiple_of(64)
+            && sizes.ssm_deinterleaved >= n as usize * inter as usize
+            && sizes.ssm_qkvz >= n as usize * h as usize;
+        if !serves || out[0] != ctx.buffers.ssm_deinterleaved() || out[1] != ctx.buffers.ssm_qkvz()
+        {
+            return Ok(false);
+        }
+        let gpu = ctx.gpu;
+        let k_a8 = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_a_to_e4m3");
+        let k_gu = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_dense_gate_up_silu");
+        let k_dn = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_dense_down");
+        if k_a8.0 == 0 || k_gu.0 == 0 || k_dn.0 == 0 {
+            return Ok(false);
+        }
+        let (act8, a8) = (out[0], out[1]);
+        let cells = n * h;
+        KernelLaunch::new(gpu, k_a8)
+            .grid([(cells / 4).div_ceil(256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(input)
+            .arg_ptr(a8)
+            .arg_u32(cells)
+            .launch(stream)?;
+        KernelLaunch::new(gpu, k_gu)
+            .grid([inter / 64, n.div_ceil(128), 1])
+            .block([256, 1, 1])
+            .arg_ptr(a8)
+            .arg_ptr(sg.weight)
+            .arg_ptr(sg.weight_scale)
+            .arg_f32(sg.weight_scale_2)
+            .arg_ptr(su.weight)
+            .arg_ptr(su.weight_scale)
+            .arg_f32(su.weight_scale_2)
+            .arg_ptr(act8)
+            .arg_u32(n)
+            .arg_u32(inter)
+            .arg_u32(h)
+            .launch(stream)?;
+        KernelLaunch::new(gpu, k_dn)
+            .grid([h / 128, n.div_ceil(128), 1])
+            .block([256, 1, 1])
+            .arg_ptr(act8)
+            .arg_ptr(sd.weight)
+            .arg_ptr(sd.weight_scale)
+            .arg_f32(sd.weight_scale_2)
+            .arg_ptr(out[2])
+            .arg_u32(n)
+            .arg_u32(h)
+            .arg_u32(inter)
+            .launch(stream)?;
+        Ok(true)
+    }
+
     /// Run the routed gate/up, SiLU and down of a prefill chunk on the q38
     /// kernels when they serve it; `Ok(false)` launched nothing.
     #[allow(clippy::too_many_arguments)]
