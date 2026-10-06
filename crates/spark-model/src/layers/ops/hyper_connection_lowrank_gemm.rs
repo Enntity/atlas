@@ -60,13 +60,14 @@ pub(crate) fn hc_token_fused() -> bool {
 }
 
 /// `ATLAS_QWEN4EXP_HC_FAST=1`: the vectorized decode collapse
-/// (`hc_pre_stage_vec` + `hc_pre_down_vec` + `hc_pre_finish_vec`, T <= 4)
-/// and `hc_post_vec` (every T). Bit-identical to the default kernels -- each
+/// (`hc_pre_stage_vec` + `hc_pre_down_vec` + `hc_pre_finish_vec`, T <= 4;
+/// their `_vec8` twins at T = 5..8, the multi-sequence batches) and
+/// `hc_post_vec` (every T). Bit-identical to the default kernels -- each
 /// output is the same IEEE operation sequence, only the load shape and grid
 /// change; `scripts/dev/qwen4exp_hc_decode_bench.cu` compares every byte --
 /// and measured 1.6x per mHC site at T=1 on GB10 (stage + down + finish +
-/// post 121 -> 76 us; 1.44x at T=4, 120 -> 83 us). Default off until A/B'd
-/// end to end.
+/// post 124 -> 76 us; 1.48x at T=4, 124 -> 84 us; 1.25x at T=8, 131 ->
+/// 105 us). Default off until A/B'd end to end.
 /// Never on under HIP: the strix-hip twin of `hyper_connection.cu` does not
 /// carry these kernels. Read once per process.
 pub(crate) fn hc_fast() -> bool {
