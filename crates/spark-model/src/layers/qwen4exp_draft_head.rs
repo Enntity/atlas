@@ -299,6 +299,21 @@ impl DraftHead {
     pub fn token(&self, row: u32) -> u32 {
         self.ids.as_ref().map_or(row, |ids| ids[row as usize])
     }
+
+    /// The draft row of full-vocabulary id `id`, if the head projects it
+    /// (the inverse of [`Self::token`]).
+    pub fn row_of(&self, id: u32) -> Option<u32> {
+        row_of(self.ids.as_deref(), self.rows, id)
+    }
+}
+
+/// [`DraftHead::row_of`] over a head's id list (`None` = row `i` is id `i`)
+/// and row count.
+fn row_of(ids: Option<&[u32]>, rows: u32, id: u32) -> Option<u32> {
+    match ids {
+        Some(ids) => ids.binary_search(&id).ok().map(|r| r as u32),
+        None => (id < rows).then_some(id),
+    }
 }
 
 /// `ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4=1`: draft from an NVFP4 copy of the rows.
@@ -413,6 +428,17 @@ mod tests {
         assert!(parse_ids("11", 11).is_err());
         assert!(parse_ids("x", 11).is_err());
         assert!(parse_ids("# nothing\n", 11).is_err());
+    }
+
+    #[test]
+    fn row_of_inverts_the_draft_rows() {
+        // The default 100k prefix holds no Qwen end token (<|im_end|> 248046).
+        assert_eq!(row_of(None, 100_000, 248_046), None);
+        assert_eq!(row_of(None, 100_000, 99_999), Some(99_999));
+        // A list maps an id to its sorted row, or to nothing.
+        let ids = [0u32, 3, 5, 248_044, 248_046];
+        assert_eq!(row_of(Some(&ids), 5, 248_046), Some(4));
+        assert_eq!(row_of(Some(&ids), 5, 248_045), None);
     }
 
     #[test]

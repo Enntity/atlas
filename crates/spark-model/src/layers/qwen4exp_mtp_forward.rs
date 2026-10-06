@@ -232,6 +232,14 @@ impl Qwen4ExpMtpHead {
                 h as u32,
                 stream,
             )?;
+            // Below the min_tokens floor no end token (`qwen4exp_mtp_ban`).
+            let banned;
+            let bitmask = if state.bans_draft_after(position) {
+                banned = qwen4exp_mtp_ban::ban_in_bitmask(bitmask);
+                &banned[..]
+            } else {
+                bitmask
+            };
             let id = crate::layers::argmax_grammar_masked(
                 ctx.gpu, logits, v as usize, bitmask, position,
             )?;
@@ -248,6 +256,9 @@ impl Qwen4ExpMtpHead {
                 h as u32,
                 stream,
             )?;
+            if state.bans_draft_after(position) {
+                self.ban_draft_rows(ctx.gpu, logits, [0], stream)?;
+            }
             ops::argmax_bf16(
                 ctx.gpu,
                 self.argmax_k,

@@ -82,7 +82,7 @@ pub(super) fn slab_bytes(blocks: usize) -> usize {
 }
 
 /// Offset of the log-probability rows for `n` rows and `d` positions.
-fn lp_off(n: usize, d: usize) -> usize {
+pub(super) fn lp_off(n: usize, d: usize) -> usize {
     ((d + 1) * n * 4).next_multiple_of(16)
 }
 
@@ -270,6 +270,11 @@ impl Qwen4ExpMtpHead {
             .copy_h2d_async(&slab.bytes, self.batch_slab, stream)?;
 
         let want_lp = (self.conf_stop > 0.0 || out_conf.is_some()) && self.argmax_batch_lp_k.0 != 0;
+        let banned: Vec<u32> = sts
+            .iter()
+            .zip(positions)
+            .map(|(st, &p)| crate::traits::EosBan::banned_draft_depth(st.end_floor, p, num_drafts))
+            .collect();
         for j in 0..num_drafts {
             let seq_lens: Vec<usize> = kv_lens.iter().map(|&l| l + j).collect();
             self.forward_rows(
@@ -285,6 +290,7 @@ impl Qwen4ExpMtpHead {
                 stream,
                 want_lp,
                 tp,
+                &banned,
             )?;
         }
         drop(kv_cache);
@@ -344,6 +350,7 @@ impl Qwen4ExpMtpHead {
         stream: u64,
         want_lp: bool,
         tp: Option<&draft_tp::TpRun<'_>>,
+        banned: &[u32],
     ) -> Result<()> {
         let gpu = ctx.gpu;
         let h = ctx.config.hidden_size;
@@ -479,48 +486,8 @@ impl Qwen4ExpMtpHead {
             stream,
         )?;
 
-        // ── 6. Draft head + argmax into the next token row ──
-        // Under draft TP the worker projects half of the rows (`draft_tp`).
-        let logits = ctx.buffers.logits();
-        let rows = self.draft.rows();
-        match tp {
-            Some(run) => run.head(&self.draft, self.dense_gemv_batchm_k, self.h_out, logits)?,
-            None => self.draft.project_rows(
-                gpu,
-                self.dense_gemv_batchm_k,
-                self.h_out,
-                logits,
-                n32,
-                h32,
-                stream,
-            )?,
-        }
-        let ids = self.batch_slab.offset((j + 1) * n * 4);
-        if want_lp {
-            let lp = self.batch_slab.offset(lp_off(n, num_drafts) + j * n * 4);
-            ops::argmax_bf16_batch_lp(
-                gpu,
-                self.argmax_batch_lp_k,
-                logits,
-                ids,
-                lp,
-                rows,
-                n32,
-                rows,
-                stream,
-            )
-        } else {
-            ops::argmax_bf16_batch(
-                gpu,
-                self.argmax_batch_k,
-                logits,
-                ids,
-                rows,
-                n32,
-                rows,
-                stream,
-            )
-        }
+        // ── 6. Draft head, end-token ban, argmax (`qwen4exp_mtp_ban.rs`) ──
+        self.draft_argmax_rows(j, n, num_drafts, banned, ctx, stream, want_lp, tp)
     }
 }
 
