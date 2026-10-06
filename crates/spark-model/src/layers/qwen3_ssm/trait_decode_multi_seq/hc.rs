@@ -178,8 +178,11 @@ impl Qwen3SsmLayer {
         // batched expert kernels' input convention. ATLAS_QWEN4EXP_BATCH_SMALL
         // (n <= 8): the mixer's post runs inside the MoE site's stage, the
         // single-token decode's seam (`hc_post_pre_site`), every row's bytes
-        // the two kernels'.
-        if ctx.levers.qwen4exp_batch_small && n as u32 <= ops::HC_SPLIT_MAX_ROWS {
+        // the two kernels' (not under BISECT_HC, which wants a row a launch).
+        if ctx.levers.qwen4exp_batch_small
+            && n as u32 <= ops::HC_SPLIT_MAX_ROWS
+            && !ctx.levers.batch_bisect(ops::BISECT_HC)
+        {
             ops::hc_post_pre_site(
                 ctx.gpu,
                 self.hc_post_k,
