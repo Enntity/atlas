@@ -233,6 +233,7 @@ impl Qwen4ExpMtpHead {
         ctx: &ForwardContext,
         stream: u64,
         out_conf: Option<&mut Vec<Vec<f32>>>,
+        tp: Option<&draft_tp::TpRun<'_>>,
     ) -> Result<Vec<Vec<u32>>> {
         let n = last_tokens.len();
         static LOGGED_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -281,6 +282,7 @@ impl Qwen4ExpMtpHead {
                 ctx,
                 stream,
                 want_lp,
+                tp,
             )?;
         }
         drop(kv_cache);
@@ -339,6 +341,7 @@ impl Qwen4ExpMtpHead {
         ctx: &ForwardContext,
         stream: u64,
         want_lp: bool,
+        tp: Option<&draft_tp::TpRun<'_>>,
     ) -> Result<()> {
         let gpu = ctx.gpu;
         let h = ctx.config.hidden_size;
@@ -490,17 +493,21 @@ impl Qwen4ExpMtpHead {
         )?;
 
         // ── 6. Draft head + argmax into the next token row ──
+        // Under draft TP the worker projects half of the rows (`draft_tp`).
         let logits = ctx.buffers.logits();
         let rows = self.draft.rows();
-        self.draft.project_rows(
-            gpu,
-            self.dense_gemv_batchm_k,
-            self.h_out,
-            logits,
-            n32,
-            h32,
-            stream,
-        )?;
+        match tp {
+            Some(run) => run.head(&self.draft, self.dense_gemv_batchm_k, self.h_out, logits)?,
+            None => self.draft.project_rows(
+                gpu,
+                self.dense_gemv_batchm_k,
+                self.h_out,
+                logits,
+                n32,
+                h32,
+                stream,
+            )?,
+        }
         let ids = self.batch_slab.offset((j + 1) * n * 4);
         if want_lp {
             let lp = self.batch_slab.offset(lp_off(n, num_drafts) + j * n * 4);

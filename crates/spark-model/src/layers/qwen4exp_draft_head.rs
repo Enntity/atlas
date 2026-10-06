@@ -22,8 +22,10 @@
 //! GB10, `scripts/dev/qwen4exp_exact_verify_bench.cu`): 5.21 ms at the full
 //! 248,320 rows, 2.1 ms at the 100k default prefix, 0.99 ms at 47k.
 //!
-//! Rank 0 drafts alone (`weight_loader/qwen4_exp/mtp.rs`), so nothing here is
-//! rank-coupled.
+//! Rank 0 drafts (`weight_loader/qwen4_exp/mtp.rs`). Under
+//! `ATLAS_QWEN4EXP_MTP_DRAFT_TP` the worker builds the same head from its own
+//! copy of the LM head and projects half of its rows
+//! ([`DraftHead::project_rows_range`], `qwen4exp_mtp_tp.rs`).
 
 use anyhow::{Context, Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -57,6 +59,18 @@ impl DraftHead {
         prefix: u32,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
+        Self::build_with(lm_head, vocab, hidden, prefix, nvfp4_requested(), gpu)
+    }
+
+    /// [`Self::build`] with the NVFP4 copy chosen by the caller.
+    pub fn build_with(
+        lm_head: &DenseWeight,
+        vocab: usize,
+        hidden: usize,
+        prefix: u32,
+        want_nvfp4: bool,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
         let list = match std::env::var("ATLAS_QWEN4EXP_DRAFT_VOCAB") {
             Ok(path) if !path.is_empty() => {
                 let text = std::fs::read_to_string(&path)
@@ -66,7 +80,6 @@ impl DraftHead {
             _ => None,
         };
         let stream = gpu.default_stream();
-        let want_nvfp4 = std::env::var("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4").as_deref() == Ok("1");
         let (ids, rows, bf16) = match list {
             Some(ids) => {
                 let rows = ids.len();
@@ -148,6 +161,11 @@ impl DraftHead {
         self.rows
     }
 
+    /// Whether the draft rows are the NVFP4 copy.
+    pub fn is_nvfp4(&self) -> bool {
+        self.nvfp4.is_some()
+    }
+
     /// Project `input` (`[hidden]` BF16) onto the draft rows, into `logits`.
     pub fn project(
         &self,
@@ -211,15 +229,49 @@ impl DraftHead {
         hidden: u32,
         stream: u64,
     ) -> Result<()> {
+        self.project_rows_range(
+            gpu,
+            dense_batchm_k,
+            input,
+            logits,
+            m,
+            (0, self.rows),
+            hidden,
+            stream,
+        )
+    }
+
+    /// [`Self::project_rows`] onto draft rows `first .. first + n` only, into
+    /// `m` output rows `n` apart: output column `c` is column `first + c` of
+    /// `project_rows`, byte for byte (each column is its weight row against
+    /// the input row; the kernels' arithmetic for a column depends on neither
+    /// its position nor the column count). A pointer offset into the rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_rows_range(
+        &self,
+        gpu: &dyn GpuBackend,
+        dense_batchm_k: KernelHandle,
+        input: DevicePtr,
+        out: DevicePtr,
+        m: u32,
+        (first, n): (u32, u32),
+        hidden: u32,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            n > 0 && first.checked_add(n).is_some_and(|end| end <= self.rows),
+            "draft head rows {first}..+{n} outside 0..{}",
+            self.rows
+        );
         match self.nvfp4.as_ref() {
             Some(q) => ops::w4a16_gemv_batchm(
                 gpu,
                 self.w4a16_tiers.scalar_kernel(m),
                 input,
-                q,
-                logits,
+                &q.rows_from(first as usize, hidden as usize),
+                out,
                 m,
-                self.rows,
+                n,
                 hidden,
                 stream,
             ),
@@ -227,12 +279,17 @@ impl DraftHead {
                 gpu,
                 dense_batchm_k,
                 input,
-                &self.bf16,
-                logits,
+                &DenseWeight {
+                    weight: self
+                        .bf16
+                        .weight
+                        .offset(first as usize * hidden as usize * BF16),
+                },
+                out,
                 m,
-                self.rows,
+                n,
                 hidden,
-                self.rows,
+                n,
                 stream,
             ),
         }
@@ -242,6 +299,16 @@ impl DraftHead {
     pub fn token(&self, row: u32) -> u32 {
         self.ids.as_ref().map_or(row, |ids| ids[row as usize])
     }
+}
+
+/// `ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4=1`: draft from an NVFP4 copy of the rows.
+pub fn nvfp4_requested() -> bool {
+    std::env::var("ATLAS_QWEN4EXP_DRAFT_HEAD_NVFP4").as_deref() == Ok("1")
+}
+
+/// `ATLAS_QWEN4EXP_DRAFT_VOCAB`: an explicit draft id list is named.
+pub fn list_requested() -> bool {
+    std::env::var("ATLAS_QWEN4EXP_DRAFT_VOCAB").is_ok_and(|p| !p.is_empty())
 }
 
 /// Parse a draft id list: decimal ids separated by whitespace or commas,

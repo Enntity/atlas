@@ -27,6 +27,7 @@ pub(crate) mod block_mgmt;
 mod block_table_upload;
 pub(crate) mod decode_pieces;
 mod draft_assist;
+pub use draft_assist::DraftAssist;
 pub(crate) mod drafter_context;
 pub(crate) mod drop;
 pub mod glm_c4;

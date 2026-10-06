@@ -304,6 +304,11 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
             rank_split::ctx_requested()?,
         ))
     }),
+    // The draft head a qwen4_exp worker builds and the swaps of each batched
+    // propose it serves (`--mtp-vocab` is agreed by the server).
+    ("ATLAS_QWEN4EXP_MTP_DRAFT_TP", || {
+        layers::qwen4exp_mtp::draft_tp::parity_word()
+    }),
     // Whether a step runs as a CUDA graph: a capturing forward takes other
     // collective paths than an eager one (`graph_flags`).
     ("ATLAS_EP_GRAPHS", || Ok(graph_flags::ep_graphs() as u64)),
