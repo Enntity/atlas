@@ -348,15 +348,23 @@ fn pipelined_reduce_scatter_sums_like_the_all_reduce() {
             gpu.copy_h2d(&vec![0xCDu8; total * W * 2], buf).unwrap();
             let mut seen = vec![false; total];
             with_model_ctx(&gpu, &pair, Some("qwen4_exp"), |ctx| {
-                let taken = compute_and_reduce_scatter(sp, buf, W, ctx, 0, |r0, n, _| {
-                    let r = r0 * W * 2..(r0 + n) * W * 2;
-                    gpu.copy_h2d(&p[rank][r], buf.offset(r0 * W * 2))?;
-                    for s in &mut seen[r0..r0 + n] {
-                        assert!(!*s, "row computed twice");
-                        *s = true;
-                    }
-                    Ok(())
-                })
+                let taken = compute_and_reduce_scatter(
+                    sp,
+                    buf,
+                    W,
+                    ctx,
+                    0,
+                    |r0, n, _| {
+                        let r = r0 * W * 2..(r0 + n) * W * 2;
+                        gpu.copy_h2d(&p[rank][r], buf.offset(r0 * W * 2))?;
+                        for s in &mut seen[r0..r0 + n] {
+                            assert!(!*s, "row computed twice");
+                            *s = true;
+                        }
+                        Ok(())
+                    },
+                    |_| Ok(()),
+                )
                 .unwrap();
                 assert!(taken);
             });
