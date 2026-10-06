@@ -416,6 +416,7 @@ pub struct Qwen3SsmLayer {
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod debug;
+mod exact_rows;
 mod fla_dispatch;
 pub mod gdn_flags;
 mod init;

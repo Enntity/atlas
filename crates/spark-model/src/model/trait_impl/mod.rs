@@ -19,6 +19,7 @@ use crate::weight_map::{DenseWeight, MtpWeights};
 
 mod async_chkpt;
 mod aux_reuse;
+mod batch_fast_check;
 mod decode_a;
 mod decode_a2;
 mod decode_a3;
@@ -30,6 +31,7 @@ mod decode_graph_key;
 pub(super) mod drafter_prefill;
 mod entry;
 mod ep_misc;
+pub(in crate::model) mod ep_verify_batch;
 mod exact_verify_check;
 pub(crate) mod finish_leaf;
 mod graph_borrow;
@@ -450,6 +452,12 @@ impl Model for TransformerModel {
             .min()
     }
     fn verify_context_limit_multi_seq(&self) -> Option<usize> {
+        // ATLAS_QWEN4EXP_BATCH_FAST: rows of several sequences are served per
+        // row past the bound too (`multi_seq/guard.rs`), so a multi-sequence
+        // verify has the single-sequence limit.
+        if self.levers.qwen4exp_batch_fast {
+            return self.verify_context_limit();
+        }
         self.layers
             .iter()
             .filter_map(|l| l.verify_context_limit_multi_seq())
@@ -581,10 +589,15 @@ impl Model for TransformerModel {
             ks.len(),
             seqs.len()
         );
+        // Over a TP pair the worker runs the same forward (`ep_verify_batch`).
+        self.ep_broadcast_verify_batch(tokens, ks, seqs)?;
         for (seq, &k) in seqs.iter_mut().zip(ks) {
             self.mark_gdn_deferred_commit(seq, k);
         }
         self.decode_verify_batched_dispatch(tokens, ks, seqs, _stream)
+    }
+    fn ep_broadcast_verify_verdicts(&self, accepted: &[u32]) -> Result<()> {
+        self.ep_broadcast_verify_verdicts_impl(accepted)
     }
     fn stash_verify_hidden_rows(&self, rows: &[usize], _stream: u64) -> Result<()> {
         self.stash_verify_hidden_rows_dispatch(rows, _stream)

@@ -46,7 +46,8 @@ impl TransformerModel {
     /// rows each (ragged since D-Cut).
     ///
     /// Self-gates to the envelope verify_e was built and audited for:
-    /// non-EP, non-HSS, no LoRA (the uniform seq_slot upload
+    /// non-EP (but see `ep_verify_batch.rs`: qwen4_exp's exact lane runs it
+    /// over a TP pair), non-HSS, no LoRA (the uniform seq_slot upload
     /// carries ONE adapter slot), MTP proposer present (stash allocated,
     /// `VERIFY_WY_TABLE_SEQS` = 32 slots ⇒ n ≤ 32), and R = Σ ks ≤
     /// `VERIFY_ROW_CAP` = 128 (the exact logits-rows / meta-gap / bt-staging
@@ -59,7 +60,7 @@ impl TransformerModel {
         (2..=crate::layer::VERIFY_WY_TABLE_SEQS).contains(&n)
             && self.verify_batch_ks_ok(ks)
             && ks.iter().sum::<usize>() <= super::verify_e2::VERIFY_ROW_CAP
-            && self.comm.is_none()
+            && (self.comm.is_none() || self.batched_verify_under_comm())
             && self.lora.is_none()
             && !self.verify_hidden_stash.is_null()
             // HSS: the paged-decode kernel reads HBM only, missing on-disk
@@ -628,7 +629,10 @@ impl TransformerModel {
             }
 
             // R ≤ VERIFY_ROW_CAP = the 128-row logits buffer cap (sizes.rs).
-            self.lm_head_batched(normed, r_total as u32, self.buffers.logits(), stream)?;
+            // Vocab-split over a TP pair when admitted (both ranks run this
+            // forward in lockstep), single-row arithmetic per row under
+            // ATLAS_QWEN4EXP_BATCH_FAST.
+            self.lm_head_batched_tp(normed, r_total, stream)?;
 
             if k4_diag && let Err(e) = self.gpu.synchronize(stream) {
                 anyhow::bail!("K4_DIAG(batched): CUDA error after lm_head_batched: {e:#}");

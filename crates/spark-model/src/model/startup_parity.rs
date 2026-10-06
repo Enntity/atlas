@@ -56,7 +56,8 @@ use super::trait_impl::finish_leaf;
 use super::trait_impl::prefill_b::pc_policy as pc;
 use super::{
     decode_pieces, glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry,
-    qwen4exp_exact_verify, qwen4exp_lmhead_split, qwen4exp_mtp_depth, verify_pieces,
+    qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_lmhead_split, qwen4exp_mtp_depth,
+    verify_pieces,
 };
 use crate::layer::glm_long_owner;
 use crate::layers::dflash_head::rank_split;
@@ -352,6 +353,15 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // worker mirrors.
     ("ATLAS_QWEN4EXP_MTP_DEPTH", || {
         Ok(qwen4exp_mtp_depth::requested() as u64)
+    }),
+    // The qwen4_exp exact batching lane: the batched MoE all-reduce shape,
+    // the batched QSA-active step (instead of per-sequence decode), the
+    // batched multi-sequence verify under TP, and the check's serial steps.
+    ("ATLAS_QWEN4EXP_BATCH_FAST", || {
+        Ok(qwen4exp_batch_fast::requested() as u64)
+    }),
+    ("ATLAS_QWEN4EXP_BATCH_FAST_CHECK", || {
+        Ok(qwen4exp_batch_fast::check_requested() as u64)
     }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)

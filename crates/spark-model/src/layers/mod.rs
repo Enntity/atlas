@@ -354,6 +354,52 @@ impl FfnComponent {
         }
     }
 
+    /// `rows` rows of `input` -> `moe_output` rows, each byte-identical to
+    /// [`Self::forward`] on that row, with the MoE's per-row collectives
+    /// batched (`MoeLayer::forward_rows`). `None` where that does not hold
+    /// (a dense FFN, or a MoE whose decode takes a grouped prefill arm): the
+    /// caller keeps its per-row `forward` loop.
+    pub fn forward_rows(
+        &self,
+        input: DevicePtr,
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Option<DevicePtr>> {
+        match self {
+            Self::Moe(m) => m.forward_rows(input, rows, ctx, stream),
+            _ => Ok(None),
+        }
+    }
+
+    /// [`Self::forward_rows`] over the first `active` of `rows` rows of a
+    /// padded batch, with the padding rows' outputs zeroed: a padding row
+    /// (zero hidden, dummy state, discarded logits) then injects nothing
+    /// into its highway, where `forward` on its zero input also produced
+    /// zero but cost a full row of expert reads.
+    pub fn forward_rows_padded(
+        &self,
+        input: DevicePtr,
+        rows: usize,
+        active: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Option<DevicePtr>> {
+        let active = active.min(rows);
+        if active == 0 {
+            return Ok(None);
+        }
+        let Some(out) = self.forward_rows(input, active, ctx, stream)? else {
+            return Ok(None);
+        };
+        if active < rows {
+            let row = ctx.config.hidden_size * 2;
+            ctx.gpu
+                .memset_async(out.offset(active * row), 0, (rows - active) * row, stream)?;
+        }
+        Ok(Some(out))
+    }
+
     pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_k2(input, ctx, stream),

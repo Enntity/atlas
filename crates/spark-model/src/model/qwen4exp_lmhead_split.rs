@@ -294,12 +294,14 @@ impl TransformerModel {
             }
             HeadArith::Gemv
                 if rows > 1
-                    && rows32 <= ops::DENSE_GEMV_BATCHM_MAX_M
                     && self.dense_gemv_batchm_kernel.0 != 0
                     && self.config.model_type == "qwen4_exp"
-                    && (batchm_requested() || self.levers.qwen4exp_exact_verify) =>
+                    && (batchm_requested()
+                        || self.levers.qwen4exp_exact_verify
+                        || self.levers.qwen4exp_batch_fast) =>
             {
-                ops::dense_gemv_batchm(
+                // `DENSE_GEMV_BATCHM_MAX_M` rows a pass over the head.
+                ops::dense_gemv_batchm_chunked(
                     gpu,
                     self.dense_gemv_batchm_kernel,
                     input,
@@ -476,15 +478,30 @@ impl TransformerModel {
         rows: usize,
         stream: u64,
     ) -> Result<()> {
-        let arith = HeadArith::batched(rows, self.levers.qwen4exp_exact_verify);
-        if !self.qwen4exp_split_head(normed, rows, arith, stream)? {
-            self.lm_head_batched(normed, rows as u32, self.buffers.logits(), stream)?;
+        // ATLAS_QWEN4EXP_BATCH_FAST: every row the single-row head's bytes.
+        let exact = self.levers.qwen4exp_batch_fast;
+        let arith = if exact {
+            HeadArith::Gemv
+        } else {
+            HeadArith::batched(rows, self.levers.qwen4exp_exact_verify)
+        };
+        if self.qwen4exp_split_head(normed, rows, arith, stream)? {
+            return Ok(());
         }
+        if exact && self.plain_bf16_head() {
+            let (logits, v) = (self.buffers.logits(), self.config.vocab_size);
+            return self.head_project(arith, normed, 0, v, rows, logits, v, stream);
+        }
+        self.lm_head_batched(normed, rows as u32, self.buffers.logits(), stream)?;
         Ok(())
     }
 
     /// `lm_head_project_batched` (the batched decode head: `dense_gemm` on a
     /// BF16 head), split when admitted.
+    ///
+    /// `ATLAS_QWEN4EXP_BATCH_FAST`: the rows take the single-row decode head's
+    /// arithmetic instead (`dense_gemv_bf16` a row, 8 rows a pass over the
+    /// head), split or not, so each row's logits are C1's byte for byte.
     pub(super) fn lm_head_project_batched_tp(
         &self,
         normed: DevicePtr,
@@ -493,10 +510,33 @@ impl TransformerModel {
         bf16: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
-        if self.qwen4exp_split_head(normed, padded_n, HeadArith::Gemm, stream)? {
+        let exact = self.levers.qwen4exp_batch_fast;
+        let arith = if exact {
+            HeadArith::Gemv
+        } else {
+            HeadArith::Gemm
+        };
+        if self.qwen4exp_split_head(normed, padded_n, arith, stream)? {
             return Ok(self.buffers.logits());
         }
+        if exact && self.plain_bf16_head() {
+            let (logits, v) = (self.buffers.logits(), self.config.vocab_size);
+            self.head_project(arith, normed, 0, v, padded_n, logits, v, stream)?;
+            return Ok(logits);
+        }
         self.lm_head_project_batched(normed, padded_n, h, bf16, stream)
+    }
+
+    /// The head is the plain resident BF16 projection `lm_head` runs with
+    /// `dense_gemv_bf16` (no FP8/NVFP4 copy, overlay, softcap or FP32 logits).
+    fn plain_bf16_head(&self) -> bool {
+        self.lm_head_fp8.is_none()
+            && self.lm_head_nvfp4.is_none()
+            && !self.lm_head_weight.weight.is_null()
+            && self.overlays.is_none()
+            && self.logit_softcap_kernel.0 == 0
+            && self.logit_softcap_fp32_kernel.0 == 0
+            && !self.use_fp32_logits
     }
 }
 

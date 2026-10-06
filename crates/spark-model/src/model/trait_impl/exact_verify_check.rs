@@ -60,28 +60,26 @@ impl TransformerModel {
             k <= MAX_ROWS,
             "exact verify check: {k} rows, serves {MAX_ROWS}"
         );
-        let stream = self.gpu.default_stream();
-        let h = self.config.hidden_size;
-        let vocab = self.config.vocab_size;
+        let (logits, hidden) = self.serial_check_rows(seq, MAX_ROWS, "EXACT_VERIFY_CHECK")?;
+        self.serial_decode_restore(tokens, seq, logits, hidden)?;
+        Ok(Some(SerialRows { k, logits, hidden }))
+    }
+
+    /// The check scratch, grown to hold one sequence's GDN states plus `rows`
+    /// logits and final-hidden rows: returns where the rows go.
+    pub(super) fn serial_check_rows(
+        &self,
+        seq: &SequenceState,
+        rows: usize,
+        who: &str,
+    ) -> Result<(DevicePtr, DevicePtr)> {
         ensure!(
             !self.use_fp32_logits,
-            "exact verify check: FP32 decode logits are not the verify's BF16 rows"
+            "{who}: FP32 decode logits are not the checked step's BF16 rows"
         );
-
-        // GDN recurrent state (h + conv per layer) and its scratch home.
-        let h_bytes = self.ssm_pool.h_stored_bytes;
-        let conv_bytes = self.config.ssm_conv_state_bytes();
-        let ssm: Vec<(DevicePtr, DevicePtr)> = seq
-            .layer_states
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| self.config.layer_type(*i) == LayerType::LinearAttention)
-            .filter_map(|(_, s)| s.as_any().downcast_ref::<SsmLayerState>())
-            .map(|s| (s.h_state, s.conv_state))
-            .collect();
-        let state_bytes = ssm.len() * (h_bytes + conv_bytes);
-        let rows_off = state_bytes.next_multiple_of(256);
-        let need = rows_off + MAX_ROWS * (vocab + h) * BF16;
+        let (h, vocab) = (self.config.hidden_size, self.config.vocab_size);
+        let rows_off = self.serial_state_bytes(seq).next_multiple_of(256);
+        let need = rows_off + rows * (vocab + h) * BF16;
         let base = {
             let mut slot = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
             match *slot {
@@ -92,8 +90,8 @@ impl TransformerModel {
                     }
                     let p = self.gpu.alloc(need)?;
                     tracing::warn!(
-                        "EXACT_VERIFY_CHECK armed: {:.1} MiB scratch, every K=2/3/4 verify \
-                         is preceded by K serial decode steps (diagnostic, slow)",
+                        "{who} armed: {:.1} MiB scratch, every checked step is \
+                         preceded by serial decode steps (diagnostic, slow)",
                         need as f64 / 1048576.0
                     );
                     *slot = Some((p, need));
@@ -101,6 +99,52 @@ impl TransformerModel {
                 }
             }
         };
+        let logits = base.offset(rows_off);
+        Ok((logits, logits.offset(rows * vocab * BF16)))
+    }
+
+    /// One sequence's GDN recurrent state (h + conv per layer).
+    fn serial_ssm_states(&self, seq: &SequenceState) -> Vec<(DevicePtr, DevicePtr)> {
+        seq.layer_states
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.config.layer_type(*i) == LayerType::LinearAttention)
+            .filter_map(|(_, s)| s.as_any().downcast_ref::<SsmLayerState>())
+            .map(|s| (s.h_state, s.conv_state))
+            .collect()
+    }
+
+    fn serial_state_bytes(&self, seq: &SequenceState) -> usize {
+        let per = self.ssm_pool.h_stored_bytes + self.config.ssm_conv_state_bytes();
+        self.serial_ssm_states(seq).len() * per
+    }
+
+    /// Decode `tokens` serially on `seq`'s live state, landing step `t`'s
+    /// logits row at `logits + t * vocab` and its final hidden row at
+    /// `hidden + t * h`, then put the sequence back exactly where it was
+    /// (GDN h/conv copied back through the check scratch, PLE carry restored
+    /// from its aux blob, QSA ingest rewound as a rejected draft is). The
+    /// rows must sit past the scratch's state region
+    /// ([`Self::serial_check_rows`] lays them out).
+    pub(super) fn serial_decode_restore(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        logits: DevicePtr,
+        hidden: DevicePtr,
+    ) -> Result<()> {
+        let stream = self.gpu.default_stream();
+        let h = self.config.hidden_size;
+        let vocab = self.config.vocab_size;
+        let k = tokens.len();
+        let h_bytes = self.ssm_pool.h_stored_bytes;
+        let conv_bytes = self.config.ssm_conv_state_bytes();
+        let ssm = self.serial_ssm_states(seq);
+        let base = SCRATCH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|(p, _)| p)
+            .ok_or_else(|| anyhow::anyhow!("serial check: scratch not allocated"))?;
         let save = |i: usize| base.offset(i * (h_bytes + conv_bytes));
         for (i, &(hs, cs)) in ssm.iter().enumerate() {
             self.gpu.copy_d2d_async(hs, save(i), h_bytes, stream)?;
@@ -126,8 +170,6 @@ impl TransformerModel {
         let tokens_len = seq.tokens.len();
         let seq_len = seq.seq_len;
 
-        let logits = base.offset(rows_off);
-        let hidden = logits.offset(MAX_ROWS * vocab * BF16);
         for (t, &tok) in tokens.iter().enumerate() {
             let out = self.decode_dispatch(tok, seq, stream)?;
             self.gpu
@@ -140,7 +182,7 @@ impl TransformerModel {
             )?;
         }
 
-        // Put the sequence back where the verify expects it.
+        // Put the sequence back where the checked step expects it.
         seq.tokens.truncate(tokens_len);
         seq.seq_len = seq_len;
         for (i, &(hs, cs)) in ssm.iter().enumerate() {
@@ -169,7 +211,7 @@ impl TransformerModel {
         }
         // The restores read host blobs; finish them before those drop.
         self.gpu.synchronize(stream)?;
-        Ok(Some(SerialRows { k, logits, hidden }))
+        Ok(())
     }
 
     /// After the verify forward: compare its logits and final hidden rows
@@ -241,7 +283,7 @@ impl TransformerModel {
     }
 }
 
-fn bf16s(bytes: &[u8]) -> Vec<f32> {
+pub(super) fn bf16s(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(2)
         .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
@@ -250,7 +292,7 @@ fn bf16s(bytes: &[u8]) -> Vec<f32> {
 
 /// Lowest index of the maximum, the tie rule of `argmax_bf16` and the host
 /// greedy sampler.
-fn argmax(v: &[f32]) -> usize {
+pub(super) fn argmax(v: &[f32]) -> usize {
     let mut best = 0;
     for (i, &x) in v.iter().enumerate() {
         if x > v[best] {

@@ -323,6 +323,7 @@ impl MoeLayer {
                 "moe_expert_silu_down_shared_batch3_t",
             )?,
             qwen4exp_moe_fast: ops::Qwen4ExpMoeFast::resolve(gpu, config),
+            qwen4exp_moe_rows: ops::Qwen4ExpMoeRows::resolve(gpu, config),
             moe_expert_gate_up_shared_fp8_t_k: gpu.kernel(
                 "moe_shared_expert_fused_fp8_t",
                 "moe_expert_gate_up_shared_fp8_t",

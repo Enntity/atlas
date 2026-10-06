@@ -397,6 +397,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF1: alloc slot (frees any prior occupant first, then re-allocates)
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
     /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
+    /// - 0xFFFFFFE6: batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`)
     /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
     pub(super) fn ep_worker_step_impl(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
@@ -413,6 +414,10 @@ impl TransformerModel {
         // + tokens off the wire and dispatches the matched compute.
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
+        }
+        // Batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`).
+        if cmd == super::trait_impl::ep_verify_batch::EP_CMD_VERIFY_BATCH {
+            return self.ep_worker_verify_batch(slots);
         }
         if let Some(keep) = self.ep_worker_glm_cmd(seq_id, cmd, slots)? {
             return Ok(keep);
@@ -567,47 +572,10 @@ impl TransformerModel {
         let seq_ids = self.ep_broadcast_tokens(&vec![0u32; n])?;
         let tokens = self.ep_broadcast_tokens(&vec![0u32; n])?;
 
-        // Validate up front so we fail before touching slot state.
-        let mut seen = std::collections::HashSet::new();
-        for &id in &seq_ids {
-            let idx = id as usize;
-            if idx >= slots.len() {
-                anyhow::bail!(
-                    "ep_worker_decode_batch: seq_id {} exceeds slot capacity {}",
-                    id,
-                    slots.len(),
-                );
-            }
-            if !seen.insert(id) {
-                anyhow::bail!("ep_worker_decode_batch: duplicate seq_id {} in batch", id);
-            }
-        }
-
-        // Drain populated slots into a (idx, ref) Vec we can index by
-        // position with `swap_remove`. The borrow checker won't let us
-        // index `slots[seq_ids[i]]` in a loop because each `&mut` is
-        // distinct but the indexer can't prove non-overlap.
-        let mut slot_refs: Vec<(usize, &mut SequenceState)> = slots
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(i, opt)| opt.as_mut().map(|s| (i, s)))
-            .collect();
-
-        // Order the refs to match the head's seq_ids order so the
-        // compute path processes tokens in the same batch index as the
-        // head — critical for KV-cache row alignment per slot.
-        let mut refs: Vec<&mut SequenceState> = Vec::with_capacity(n);
-        for &id in &seq_ids {
-            let idx = id as usize;
-            let pos = slot_refs
-                .iter()
-                .position(|(i, _)| *i == idx)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("ep_worker_decode_batch: slot {} not allocated", idx)
-                })?;
-            let (_, seq) = slot_refs.swap_remove(pos);
-            refs.push(seq);
-        }
+        // In the head's seq_ids order, so each row lands on its own slot —
+        // critical for KV-cache row alignment. Validated before any state is
+        // touched.
+        let mut refs = self.ep_worker_slot_refs(&seq_ids, slots)?;
 
         let stream = self.gpu.default_stream();
         self.sync_secondary()?; // as for the single-token decode above

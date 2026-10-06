@@ -523,7 +523,7 @@ impl Qwen3AttentionLayer {
         h: usize,
         stream: u64,
     ) -> Result<()> {
-        if fwd.levers.qwen4exp_exact_verify {
+        if fwd.levers.qwen4exp_exact_verify || fwd.levers.qwen4exp_batch_fast {
             for (w, out) in [(k_nvfp4, k_out), (v_nvfp4, v_out)] {
                 ops::w4a16_gemv_batch2(
                     fwd.gpu,
@@ -566,7 +566,7 @@ impl Qwen3AttentionLayer {
         h: usize,
         stream: u64,
     ) -> Result<()> {
-        if fwd.levers.qwen4exp_exact_verify {
+        if fwd.levers.qwen4exp_exact_verify || fwd.levers.qwen4exp_batch_fast {
             for (w, out) in [(k_nvfp4, k_out), (v_nvfp4, v_out)] {
                 ops::w4a16_gemv_batch3(
                     fwd.gpu,
@@ -712,6 +712,26 @@ impl Qwen3AttentionLayer {
         // same weight-streaming bandwidth, no M>4 cliff). m=9..16 (batched
         // DFlash verify) falls back to `w4a16_gemv_batch16`; the family caps
         // there, so wider verifies (DFlash γ=16, M=17) keep the GEMM.
+        // ATLAS_QWEN4EXP_BATCH_FAST past the widest GEMV tier: 16 rows a
+        // launch of the same exact template rather than the tile GEMM.
+        if c.fwd.levers.qwen4exp_batch_fast && m > 16 && self.w4a16_gemv_batch16_k.0 != 0 {
+            let (in_row, out_row) = (k as usize * 2, n as usize * 2);
+            for first in (0..m).step_by(16) {
+                let rows = (m - first).min(16);
+                ops::w4a16_gemv_batchm(
+                    gpu,
+                    self.w4a16_gemv_batch16_k,
+                    input.offset(first as usize * in_row),
+                    w_base,
+                    output.offset(first as usize * out_row),
+                    rows,
+                    n,
+                    k,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
         let mut batchm = self.w4a16_batchm.kernel(m);
         if batchm.0 == 0 && m <= 16 {
             batchm = self.w4a16_gemv_batch16_k;
@@ -898,16 +918,19 @@ impl Qwen3AttentionLayer {
         // fused GEMM's [n, fused_n] output IS the qkv_buf layout byte for
         // byte. Write straight into it and skip the scatter entirely —
         // that removes 3 GEMMs AND 48 D2D copies per attention layer.
+        // ATLAS_QWEN4EXP_BATCH_FAST: the tile GEMM is not the GEMV's
+        // arithmetic; wide batches keep the exact GEMV tiers instead.
         let use_fused = match self.qkv_nvfp4_t.as_ref() {
-            Some(qkv_t) if fused_qkv_enabled() && n > 8 => self.transposed_verify_gemm(
-                c,
-                normed,
-                qkv_t,
-                qkv_buf,
-                n as u32,
-                fused_n as u32,
-                h as u32,
-            )?,
+            Some(qkv_t) if fused_qkv_enabled() && n > 8 && !fwd.levers.qwen4exp_batch_fast => self
+                .transposed_verify_gemm(
+                    c,
+                    normed,
+                    qkv_t,
+                    qkv_buf,
+                    n as u32,
+                    fused_n as u32,
+                    h as u32,
+                )?,
             _ => false,
         };
 

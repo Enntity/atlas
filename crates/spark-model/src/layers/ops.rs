@@ -198,6 +198,8 @@ pub mod qwen4exp;
 pub mod qwen4exp_decode_fuse;
 #[path = "ops/qwen4exp_moe.rs"]
 mod qwen4exp_moe;
+#[path = "ops/qwen4exp_moe_rows.rs"]
+mod qwen4exp_moe_rows;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
 #[cfg(test)]
 #[path = "ops/grammar_bitmask_tests.rs"]
@@ -316,6 +318,7 @@ pub use qsa_prefill_attn::*;
 pub use qsa_rows::*;
 pub use quant_dispatch::*;
 pub use qwen4exp_moe::*;
+pub use qwen4exp_moe_rows::*;
 pub use sampling::*;
 pub use ssm_gdn_a::*;
 pub use ssm_gdn_a2::*;
