@@ -144,6 +144,9 @@ pub struct Qwen4ExpMtpHead {
     batch_slab: DevicePtr,
     /// Block-table entries per row that `batch_slab` holds.
     batch_slab_blocks: usize,
+    /// `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the worker projects half of the draft
+    /// head of each batched propose the model announces (`draft_tp`).
+    tp: Option<draft_tp::DraftTp>,
 }
 
 impl Qwen4ExpMtpHead {
@@ -233,6 +236,7 @@ impl Qwen4ExpMtpHead {
             argmax_batch_lp_k: super::try_kernel(gpu, "argmax", "argmax_bf16_batch_lp"),
             batch_slab: gpu.alloc(qwen4exp_mtp_batch::slab_bytes(batch_slab_blocks))?,
             batch_slab_blocks,
+            tp: None,
         })
     }
 
@@ -296,6 +300,9 @@ mod qwen4exp_mtp_batch;
 
 #[path = "qwen4exp_mtp_kv.rs"]
 mod qwen4exp_mtp_kv;
+
+#[path = "qwen4exp_mtp_tp.rs"]
+pub mod draft_tp;
 
 impl DraftProposer for Qwen4ExpMtpHead {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
@@ -382,6 +389,13 @@ impl DraftProposer for Qwen4ExpMtpHead {
         out_conf: Option<&mut Vec<Vec<f32>>>,
         grammar_bitmasks: Option<&[Option<Vec<i32>>]>,
     ) -> Result<Option<Vec<Vec<u32>>>> {
+        // An announced draft-TP propose (`draft_tp`): from here on every exit
+        // issues the swaps the worker walks.
+        let plan = draft_tp::Plan {
+            n: last_tokens.len(),
+            drafts: num_drafts,
+        };
+        let tp = self.draft_tp_run(ctx.comm, ctx.gpu, plan, stream)?;
         // Grammar masks are per position and host-applied: per-sequence only.
         let masked = grammar_bitmasks.is_some_and(|m| m.iter().any(Option::is_some));
         if masked || !self.batch_admits(last_tokens.len(), num_drafts, ctx) {
@@ -394,7 +408,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
                 None => return Ok(None),
             }
         }
-        self.propose_batch_impl(
+        let drafts = self.propose_batch_impl(
             last_tokens,
             positions,
             num_drafts,
@@ -402,8 +416,20 @@ impl DraftProposer for Qwen4ExpMtpHead {
             ctx,
             stream,
             out_conf,
-        )
-        .map(Some)
+            tp.as_ref(),
+        )?;
+        tp.map_or(Ok(()), draft_tp::TpRun::finish)?;
+        Ok(Some(drafts))
+    }
+
+    fn draft_tp_word(
+        &self,
+        comm: &dyn spark_comm::CommBackend,
+        n: usize,
+        num_drafts: usize,
+        grammar: bool,
+    ) -> Option<u32> {
+        self.tp_announce_word(comm, n, num_drafts, grammar)
     }
 
     fn propose_batch_max(
@@ -449,29 +475,5 @@ impl DraftProposer for Qwen4ExpMtpHead {
 }
 
 #[cfg(test)]
-mod drafter_kv_tests {
-    use super::*;
-    use spark_runtime::gpu::mock::MockGpuBackend;
-
-    /// The written slot keeps a full layer's strides; the twelve slots in
-    /// front of it cost next to nothing.
-    #[test]
-    fn only_the_written_slot_is_a_full_layer() {
-        let cfg = drafter_kv_config(12, 2, 256);
-        let full = 16 * 2 * 256 * 2;
-        assert_eq!(cfg.k_block_bytes_for_layer(12), full);
-        assert_eq!(cfg.v_block_bytes_for_layer(12), full);
-        assert_eq!(cfg.cache_stride_elements(), 16 * 2 * 256);
-        assert_eq!(cfg.block_bytes_kv_all_layers(), 2 * full + 12 * 2 * 32);
-
-        let gpu = MockGpuBackend::new();
-        let blocks = 64;
-        let kv = PagedKvCache::new(cfg, blocks, &gpu).unwrap();
-        assert_eq!(kv.k_block_stride_bytes_for_layer(12), full);
-        assert_eq!(kv.v_block_stride_bytes_for_layer(12), full);
-        assert_eq!(kv.dtype_for_layer(12), KvCacheDtype::Bf16);
-        let k12 = gpu.read_alloc(kv.k_pool_ptr(12)).unwrap();
-        assert_eq!(k12.len(), blocks * full);
-        assert_eq!(gpu.read_alloc(kv.k_pool_ptr(0)).unwrap().len(), blocks * 32);
-    }
-}
+#[path = "qwen4exp_mtp_kv_tests.rs"]
+mod drafter_kv_tests;

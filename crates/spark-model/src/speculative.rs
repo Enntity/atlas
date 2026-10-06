@@ -322,6 +322,21 @@ pub trait DraftProposer: Send + Sync {
         None
     }
 
+    /// `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the announce word of a
+    /// [`Self::propose_batch`] of `n` sequences and `num_drafts` positions
+    /// handed `comm` (with a grammar mask or not), if the worker serves part
+    /// of it. The model announces such a propose with this word before it
+    /// calls it, and hands it `comm` then and only then.
+    fn draft_tp_word(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _n: usize,
+        _num_drafts: usize,
+        _grammar: bool,
+    ) -> Option<u32> {
+        None
+    }
+
     /// `ATLAS_GLM_DRAFT_TP_CTX`: the context rows the split propose about to
     /// be announced over `comm` appends split, packed for the announce
     /// (`rank_split::announce_word`; 0 = none). `seqs` holds each sequence's
