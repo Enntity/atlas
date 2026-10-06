@@ -21,6 +21,7 @@ pub use fp8::{fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_rowwise};
 pub use grouped::bf16_grouped_gemm_act_weight_t;
 mod tf32;
 pub use tf32::tf32_gemm_act_weight_t;
+mod kchain_pin;
 
 // The BF16 Atlas-kernel fallback (installed when cuBLASLt is a stub) lives in
 // the `bf16_fallback` sibling (≤500 LoC split); re-exported so
@@ -400,9 +401,9 @@ fn gemm_bf16(
             ),
             "PrefWorkspace",
         )?;
-        // cublasLtMatmulHeuristicResult_t = { algo[64B], workspaceSize, state,
-        // wavesCount, reserved[4] } ≈ 96B; algo at offset 0. 128B for margin.
-        let mut result = [0u8; 128];
+        // Heuristic results: 96 B each, algo at offset 0 (+ margin, `kchain_pin`).
+        let pin = kchain_pin::applies(m, n, op_a == CUBLAS_OP_T);
+        let mut result = [0u8; 128 * kchain_pin::CANDIDATES];
         let mut returned: i32 = 0;
         chk(
             cublasLtMatmulAlgoGetHeuristic(
@@ -413,7 +414,7 @@ fn gemm_bf16(
                 ld_,
                 ld_,
                 pref,
-                1,
+                kchain_pin::requested_count(pin),
                 result.as_mut_ptr() as *mut c_void,
                 &mut returned,
             ),
@@ -422,6 +423,7 @@ fn gemm_bf16(
         if returned < 1 {
             bail!("cuBLASLt: no algorithm for {m}x{n}x{k}");
         }
+        let algo_off = kchain_pin::offset(pin, &result, returned);
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
         let status = cublasLtMatmul(
@@ -437,7 +439,7 @@ fn gemm_bf16(
             ld_,
             out as *mut c_void,
             ld_,
-            result.as_ptr() as *const c_void,
+            result[algo_off..].as_ptr() as *const c_void,
             ctx.workspace as *mut c_void,
             ctx.ws_size,
             stream as *mut c_void,
