@@ -18,6 +18,9 @@ pub(super) fn start_new_requests(
     model: &dyn Model,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     new_reqs: Vec<InferenceRequest>,
+    // Per request: the checkpoint its prefill plants for requests that share
+    // its prefix (`shared_prefix`).
+    pc_plants: Vec<Option<usize>>,
     chunked: bool,
     always_mixed: bool,
     max_prefill_tokens: usize,
@@ -39,10 +42,11 @@ pub(super) fn start_new_requests(
     // prefill/decode for an unobservable response. Drop them before any
     // model work (including the vision/beam co-dispatch pre-passes below).
     // Streaming cancellation stays on `cancel_flag` and is untouched.
-    let new_reqs: Vec<InferenceRequest> = new_reqs
+    let (new_reqs, pc_plants): (Vec<InferenceRequest>, Vec<Option<usize>>) = new_reqs
         .into_iter()
-        .filter(|req| !req.caller_gone())
-        .collect();
+        .zip(pc_plants)
+        .filter(|(req, _)| !req.caller_gone())
+        .unzip();
     if new_reqs.is_empty() {
         return;
     }
@@ -246,7 +250,7 @@ pub(super) fn start_new_requests(
         }
     }
 
-    for (req_idx, req) in new_reqs.into_iter().enumerate() {
+    for (req_idx, (req, pc_plant)) in new_reqs.into_iter().zip(pc_plants).enumerate() {
         let precomputed_beam_hyp = beam_hyps[req_idx].take();
         if chunked {
             let defer =
@@ -289,6 +293,7 @@ pub(super) fn start_new_requests(
                 defer,
                 vision_slice,
                 precomputed_beam_hyp,
+                pc_plant,
             ) {
                 Ok(StartPrefillResult::Active(a)) => {
                     tracing::info!(

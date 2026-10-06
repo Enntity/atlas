@@ -75,7 +75,9 @@
 //! collectives and chunk shapes and the pair deadlocks, or pairs a
 //! restore-depth reduction with the peer's KV-admission vote. The ranks
 //! compare them at startup (`model::startup_parity`), with
-//! `ATLAS_EP_PROTOCOL` and the rest of that table.
+//! `ATLAS_EP_PROTOCOL` and the rest of that table. `ATLAS_GLM_PC_INFLIGHT`
+//! is not among them: only the head's scheduler reads it, and the worker
+//! plants what the head sends (`pc_inflight`).
 //!
 //! So are `ATLAS_GLM_PC_WRITE_FLOOR` and `ATLAS_GLM_KV_WRITE_FLOOR_LEGACY`.
 //! A mismatch there does not deadlock (the cache writes they skip are not

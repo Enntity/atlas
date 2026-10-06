@@ -34,6 +34,7 @@ mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;
 mod midchunk_capture;
+pub(in crate::model) mod pc_inflight;
 pub(in crate::model) mod pc_policy;
 mod prefix_lookup;
 mod proc_range;
@@ -218,6 +219,8 @@ impl TransformerModel {
         )?;
         self.warm_trace_sync(stream)?;
         let t_lookup = tp.elapsed() - t_embed;
+        // ATLAS_GLM_PC_INFLIGHT: a checkpoint the head asked for (`pc_inflight`).
+        self.pc_apply_plant(tokens, seq, span.0, kv_cache.block_size());
         // ATLAS_GLM_PC_BRANCH: split at the planned branch checkpoint.
         if let Some(at) = pc_policy::branch_split_at(seq.pc_branch_at, span, passengers.is_some()) {
             drop(kv_cache);

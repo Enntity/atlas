@@ -37,6 +37,10 @@ pub fn start_chunked_prefill(
     // computed (fused with other requests into one batched search by the pre-pass);
     // the beam branch uses it directly. None ⇒ run the search here per-request.
     precomputed_beam_hyp: Option<Vec<u32>>,
+    // Shared-prefix admission: plant a checkpoint at this position for the
+    // requests waiting on this prefill (`shared_prefix`). Sent to the worker
+    // before the chunk-0 command, like the MTP fence.
+    pc_plant: Option<usize>,
 ) -> Result<StartPrefillResult> {
     // This request's end tokens: model EOS + user stop tokens (no model EOS
     // under `ignore_eos`).
@@ -292,6 +296,7 @@ pub fn start_chunked_prefill(
             // step does NOT re-broadcast, so this stays the only broadcast site).
             model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
             model.ep_broadcast_vision_state_for_seq(seq.slot_idx as u32, false, 0, 0, 0, 0)?;
+            plant_chunk0(model, &mut seq, pc_plant)?;
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
             model.ep_broadcast_cmd(chunk_len as u32)?;
             model.ep_broadcast_cmd(0)?; // chunk_start
@@ -370,6 +375,7 @@ pub fn start_chunked_prefill(
         }
 
         dispatch_chunk0_vision(model, &seq, vision_slice, &image_pixels, req_disable_mtp)?;
+        plant_chunk0(model, &mut seq, pc_plant)?;
         // EP: broadcast chunk 0 tokens to worker.
         // Send full prompt length + all tokens so worker can do
         // identical Marconi prefix-cache lookups (bug #33 fix).
@@ -588,4 +594,10 @@ pub fn start_chunked_prefill(
     } else {
         Ok(StartPrefillResult::InProgress(p))
     }
+}
+
+/// Plant the requested shared-prefix checkpoint (`shared_prefix`) in a
+/// prefill about to send its chunk-0 command.
+fn plant_chunk0(model: &dyn Model, seq: &mut SequenceState, at: Option<usize>) -> Result<()> {
+    at.map_or(Ok(()), |at| model.pc_plant(seq, at))
 }
