@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! `ATLAS_QWEN4EXP_BATCH_FAST_CHECK=1`: before a batched multi-sequence
-//! decode step, decode each row's token through single-sequence decode on its
-//! sequence's live state, put the state back, and compare the batched step's
-//! logits and final hidden rows with those byte for byte (design:
-//! `model/qwen4exp_batch_fast.rs`).
+//! decode step or batched multi-sequence verify, decode each sequence's rows
+//! through single-sequence decode on its live state, put the state back, and
+//! compare the batched step's logits and final hidden rows with those byte
+//! for byte (design: `model/qwen4exp_batch_fast.rs`). A verify row is
+//! checked whether or not its draft is then accepted: the serial pass
+//! decodes the drafts too.
 //!
 //! Every rank runs the check inside its own `decode_batch_compute_main`, the
 //! head's and the worker's alike, so the serial steps' collectives pair
@@ -40,12 +42,14 @@ pub(super) struct BatchSerialRows {
 }
 
 impl TransformerModel {
-    /// Before a batched decode of `tokens` (row `i` = `seqs[i]`): decode each
-    /// row serially on its live state and keep its logits and final hidden.
-    /// `None` when the check is off.
+    /// Before a batched step over `seqs` (sequence `i` owns `ks[i]` rows of
+    /// `tokens`, seq-major; `None` = one row each, a decode): decode each
+    /// sequence's rows serially on its live state and keep their logits and
+    /// final hidden rows. `None` when the check is off.
     pub(super) fn batch_fast_serial_rows(
         &self,
         tokens: &[u32],
+        ks: Option<&[usize]>,
         seqs: &mut [&mut SequenceState],
     ) -> Result<Option<BatchSerialRows>> {
         if !check_active(&self.config.model_type, self.levers.qwen4exp_batch_fast)
@@ -57,14 +61,17 @@ impl TransformerModel {
         let (h, vocab) = (self.config.hidden_size, self.config.vocab_size);
         let (logits, hidden) = self.serial_check_rows(&*seqs[0], n, "BATCH_FAST_CHECK")?;
         let mut positions = Vec::with_capacity(n);
+        let mut row = 0usize;
         for (i, seq) in seqs.iter_mut().enumerate() {
-            positions.push(seq.seq_len);
+            let k = ks.map_or(1, |ks| ks[i]);
+            positions.extend((0..k).map(|j| seq.seq_len + j));
             self.serial_decode_restore(
-                &tokens[i..i + 1],
+                &tokens[row..row + k],
                 seq,
-                logits.offset(i * vocab * BF16),
-                hidden.offset(i * h * BF16),
+                logits.offset(row * vocab * BF16),
+                hidden.offset(row * h * BF16),
             )?;
+            row += k;
         }
         Ok(Some(BatchSerialRows {
             logits,
