@@ -216,8 +216,9 @@ impl MoeLayer {
         // Sequence-parallel prefill (`layers::glm_sp`): routed experts run every
         // row; the shared expert and its blend run only this rank's rows, and
         // the EP all-reduce becomes a reduce-scatter into them.
-        let sp =
-            crate::layers::glm_sp::current().filter(|sp| is_ep_prefill && num_tokens == sp.total());
+        let sp = crate::layers::glm_sp::current()
+            .filter(|sp| is_ep_prefill && num_tokens == sp.total())
+            .map(|sp| self.q38_sp_rows(sp, h, shared_inter, ctx));
         // `full_shared` (qwen4_exp): every row, as unsplit; only the blend
         // takes the local rows (`forward_prefill_finish`).
         let (shared_in, shared_n) = match sp {

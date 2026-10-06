@@ -50,9 +50,17 @@ pub(crate) fn q38_requested() -> bool {
 /// warp grid with 16-byte dequant stores, every byte identical
 /// (`scripts/dev/qwen4exp_moe_prefill_bench.cu`; GB10, 16000 tokens:
 /// gate_up+silu 10.25 -> 8.65 ms, down 5.91 -> 5.13, shared 3.42 -> 3.18).
+/// It also takes the router below 32 rows (byte-identical logits at 1..31
+/// rows; a 30-row pass: 0.31 -> 0.13 ms a layer).
 fn w2_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_MOE_W2"))
+}
+
+/// `ATLAS_QWEN4EXP_PREFILL_SP_SHARED=1`; see [`MoeLayer::q38_sp_rows`].
+fn sp_shared_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_SP_SHARED"))
 }
 
 /// The q38 entry `name`, or its `moe_q38w_*` twin under `_MOE_W2`.
@@ -135,7 +143,7 @@ impl MoeLayer {
         let bytes = n_out as usize * h as usize * 2;
         if !q38_requested()
             || ctx.config.model_type != "qwen4_exp"
-            || n < 32
+            || (n < 32 && !w2_requested())
             || !h.is_multiple_of(16)
             || ctx.buffers.sizes().expert_up_out < bytes
         {
@@ -171,6 +179,54 @@ impl MoeLayer {
         Ok(true)
     }
 
+    /// The q38 shared-expert arm takes this layer's shape (row count aside).
+    fn q38_shared_shape_serves(&self, h: u32, inter: u32, ctx: &ForwardContext) -> bool {
+        q38_requested()
+            && ctx.config.model_type == "qwen4_exp"
+            && self.shared_gate_t.is_some()
+            && self.shared_up_t.is_some()
+            && self.shared_down_t.is_some()
+            && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && self.shared_gate_fp8.is_none()
+            && self.shared_up_fp8.is_none()
+            && self.shared_down_fp8.is_none()
+            && self.bf16_shared_expert.is_none()
+            && !self.m5_projections.shared.enabled()
+            && !self.gelu_activation
+            && self.lora.is_none()
+            && h.is_multiple_of(128)
+            && inter.is_multiple_of(64)
+    }
+
+    /// `ATLAS_QWEN4EXP_PREFILL_SP_SHARED=1`: under the qwen4_exp SP split,
+    /// the shared expert runs only this rank's rows instead of every row
+    /// (`SpRows::full_shared` off), when the q38 arm serves it. Its kernels
+    /// give every row the same arithmetic whatever the row count -- 128-row
+    /// tiles, one in-order k32 chain per output, elementwise E4M3 input -- so
+    /// the halves computed apart equal the whole chunk byte for byte
+    /// (`scripts/dev/qwen4exp_moe_prefill_bench.cu`: 16016 split at 8192,
+    /// 12000 at 6144, 5000 at 2048; q38 and W2). GB10, 16000 rows: 3.2 ms a
+    /// layer -> about half on each rank.
+    pub(super) fn q38_sp_rows(
+        &self,
+        sp: crate::layers::glm_sp::SpRows,
+        h: u32,
+        inter: u32,
+        ctx: &ForwardContext,
+    ) -> crate::layers::glm_sp::SpRows {
+        let tiers_skip =
+            |rows: usize| crate::layers::w4a16_gemv_tiers::tc_kernel(rows as u32).0 == 0;
+        let split = sp.full_shared
+            && sp_shared_requested()
+            && self.q38_shared_shape_serves(h, inter, ctx)
+            && tiers_skip(sp.rows)
+            && tiers_skip(sp.total());
+        crate::layers::glm_sp::SpRows {
+            full_shared: sp.full_shared && !split,
+            ..sp
+        }
+    }
+
     /// The shared expert of a prefill chunk, when the q38 arm serves it: the
     /// default's transposed arm (`w4a16_gemm_t` gate, up and down around
     /// `moe_silu_mul`) as `moe_q38_a_to_e4m3`, `moe_q38_dense_gate_up_silu`
@@ -196,18 +252,7 @@ impl MoeLayer {
             return Ok(false);
         };
         let sizes = ctx.buffers.sizes();
-        let serves = q38_requested()
-            && ctx.config.model_type == "qwen4_exp"
-            && self.shared_experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
-            && self.shared_gate_fp8.is_none()
-            && self.shared_up_fp8.is_none()
-            && self.shared_down_fp8.is_none()
-            && self.bf16_shared_expert.is_none()
-            && !self.m5_projections.shared.enabled()
-            && !self.gelu_activation
-            && self.lora.is_none()
-            && h.is_multiple_of(128)
-            && inter.is_multiple_of(64)
+        let serves = self.q38_shared_shape_serves(h, inter, ctx)
             && sizes.ssm_deinterleaved >= n as usize * inter as usize
             && sizes.ssm_qkvz >= n as usize * h as usize;
         if !serves || out[0] != ctx.buffers.ssm_deinterleaved() || out[1] != ctx.buffers.ssm_qkvz()
