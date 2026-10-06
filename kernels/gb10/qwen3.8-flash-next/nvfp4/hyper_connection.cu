@@ -1628,7 +1628,10 @@ __device__ __forceinline__ void qhc_down_vec(
     float* __restrict__ inj_out,
     const unsigned int hc_dim,
     const unsigned int hc,
-    const unsigned int rank
+    const unsigned int rank,
+    // Tokens actually written: `_wide` runs a padded NT over scratch rows
+    // past the batch and drops their outputs. NT everywhere else.
+    const unsigned int nt_live = NT
 ) {
     static_assert(DN >= 1 && DN <= U && U % DN == 0, "normed ring must tile the weight ring");
     constexpr unsigned int LPR = 32u / CPT;    // lanes per row
@@ -1706,7 +1709,7 @@ __device__ __forceinline__ void qhc_down_vec(
                 for (unsigned int j = 0; j < off; ++j) acc[t][j] = acc[t][j] + acc[t][j + off];
             }
         }
-        if (live && p == 0) {
+        if (live && p == 0 && t < nt_live) {
             const float v = acc[t][0];
             if (row < rank) {
                 low_out[(size_t)t * rank + row] = qhc_silu(v * inv_hc);
@@ -2044,6 +2047,53 @@ extern "C" __global__ void hc_pre_finish_vec_rows(
     default: QHC_FIN_ROWS(8); break;
     }
 #undef QHC_FIN_ROWS
+}
+
+// ── T = 25..HC_V_ROWS_MAX down walk, re-tiled (ATLAS_QWEN4EXP_HC_WIDE) ─────
+//
+// `hc_pre_down_vec_rows` at 32 tokens is four 8-token groups of 41 CTAs at
+// 150 registers: more CTAs than one wave holds, so the last group runs alone
+// (~105 us against ~65 at 25..28 tokens). This is the same walk with FOUR
+// chains per thread (the tree replay covers any CPT), which halves the CTAs
+// a group needs and the normed loads per FLOP, so every group fits one wave.
+// Groups of HC_V_WIDE_G tokens on blockIdx.y; the last group is padded, its
+// padding tokens computing on scratch rows past the batch (host checks the
+// scratch holds 64 rows) that are never written (`nt_live`). Every written
+// token's chains are the T = 1 kernel's, in the same order, so the bytes are
+// too (scripts/dev/qwen4exp_hc_wide_bench.cu checks T = 9..32). The finish
+// kernel stays `hc_pre_finish_vec_rows`: no finish tile measured faster.
+#ifndef HC_V_WIDE_G
+#define HC_V_WIDE_G 8u
+#endif
+#ifndef HC_V_WIDE_DOWN_CPT
+#define HC_V_WIDE_DOWN_CPT 4u
+#endif
+#ifndef HC_V_WIDE_DOWN_UNROLL
+#define HC_V_WIDE_DOWN_UNROLL 16u
+#endif
+#ifndef HC_V_WIDE_DOWN_DN
+#define HC_V_WIDE_DOWN_DN 2u
+#endif
+// Grid: (ceil((rank + hc) * 32 / HC_V_WIDE_DOWN_CPT / block),
+//        ceil(num_tokens / HC_V_WIDE_G), 1).
+extern "C" __global__ void hc_pre_down_vec_wide(
+    const float* __restrict__ normed,          // [64, hc*H] scratch, T live rows
+    const __nv_bfloat16* __restrict__ down_w,  // [rank, hc*H]
+    const __nv_bfloat16* __restrict__ inject_w,// [hc, hc*H] or null
+    float* __restrict__ low_out,               // [T, rank]
+    float* __restrict__ inj_out,               // [T, hc]
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const unsigned int rank,
+    const unsigned int num_tokens              // 9..HC_V_ROWS_MAX (host checks)
+) {
+    atlas_pdl_enter();
+    const unsigned int t0 = blockIdx.y * HC_V_WIDE_G;
+    const unsigned int hc_dim = hc * hidden_size;
+    qhc_down_vec<HC_V_WIDE_DOWN_CPT, HC_V_WIDE_DOWN_UNROLL, HC_V_WIDE_DOWN_DN, HC_V_WIDE_G>(
+        normed + (size_t)t0 * hc_dim, down_w, inject_w, low_out + (size_t)t0 * rank,
+        inject_w != nullptr ? inj_out + (size_t)t0 * hc : inj_out, hc_dim, hc, rank,
+        min(HC_V_WIDE_G, num_tokens - t0));
 }
 
 // Stage 1 over a (T, S) grid, block 1024 (host checks: the RMS below is
