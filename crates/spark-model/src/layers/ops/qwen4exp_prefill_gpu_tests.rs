@@ -75,3 +75,50 @@ fn ba_gates_rows_matches_default_bitwise() {
         }
     }
 }
+
+/// `qwen4exp_fp8_gemm_w2` must equal `fp8_fp8_gemm_t_m128` byte for byte at
+/// the attention prefill shapes (TP2 q+gate, k/v), full and partial tiles.
+#[test]
+#[ignore]
+fn fp8_gemm_w2_matches_default_bitwise() {
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+        .expect("build with ATLAS_TARGET_MODEL='*'");
+    let gpu =
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
+    let g: &dyn GpuBackend = &gpu;
+    let stream = g.default_stream();
+    let k_def = g.kernel("w4a16", "fp8_fp8_gemm_t_m128").unwrap();
+    let mut seed = 0xf8_u64;
+    // Finite E4M3 bytes: drop the two NaN encodings.
+    let e4m3 = |x: f32| {
+        let b = ((x + 1.0) * 127.5) as u8;
+        vec![if b & 0x7F == 0x7F { b & 0xF0 } else { b }]
+    };
+    for (m, n, k) in [
+        (16016usize, 6144usize, 2560usize),
+        (16016, 256, 2560),
+        (1001, 6144, 2560),
+        (129, 300, 2560),
+    ] {
+        let a = up(g, &lcg_bytes(&mut seed, m * k, e4m3));
+        let b = up(g, &lcg_bytes(&mut seed, n * k, e4m3));
+        let (o1, o2) = (g.alloc(m * n * 2).unwrap(), g.alloc(m * n * 2).unwrap());
+        super::super::fp8_fp8_gemm_n128_m128(
+            g, k_def, a, b, o1, m as u32, n as u32, k as u32, stream,
+        )
+        .unwrap();
+        assert!(
+            super::launch_fp8_gemm_w2(g, [a, b, o2], [m, n, k].map(|v| v as u32), stream).unwrap()
+        );
+        g.synchronize(stream).unwrap();
+        let (mut v1, mut v2) = (vec![0u8; m * n * 2], vec![0u8; m * n * 2]);
+        g.copy_d2h(o1, &mut v1).unwrap();
+        g.copy_d2h(o2, &mut v2).unwrap();
+        let diff = v1.iter().zip(&v2).filter(|(x, y)| x != y).count();
+        assert_eq!(diff, 0, "{m}x{n}x{k}: {diff} bytes differ");
+        println!("fp8 gemm w2 == default at {m}x{n}x{k}");
+        for p in [a, b, o1, o2] {
+            g.free(p).unwrap();
+        }
+    }
+}
