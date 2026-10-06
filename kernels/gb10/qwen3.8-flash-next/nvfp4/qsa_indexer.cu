@@ -503,6 +503,127 @@ extern "C" __global__ void qsa_score_rows_exact(
     *out = acc * rsqrtf((float)hd);
 }
 
+// `qsa_score_rows_exact` with 16-byte shared loads
+// (ATLAS_QWEN4EXP_PREFILL_QSA_SCORE_V4).
+//
+// The exact scorer issues one 4-byte shared load per q and per k element --
+// 1024 a score at 4 heads x hd 128 -- for ~1100 FP operations, so it is bound
+// by load instructions, not arithmetic (280 ms of a 16K prefill on the pair).
+// Here each 32-element group of q and k arrives as eight float4s, and the
+// k tile's row pitch is hd + 4 floats so a warp's 16-byte loads stay
+// conflict-free. The products, the tree and the folds are the exact
+// scorer's, in its order, on the same values: bit-identical
+// (`scripts/dev/qwen4exp_qsa_score_bench.cu`).
+//
+// Same grid, block and q layout as the exact scorer; hd % 32 == 0, q 16-byte
+// aligned.
+__device__ __forceinline__ float qsa_v4_at(const float4 (&v)[8], int e) {
+    const float4 x = v[e >> 2];
+    switch (e & 3) {
+        case 0: return x.x;
+        case 1: return x.y;
+        case 2: return x.z;
+        default: return x.w;
+    }
+}
+
+#ifndef QSA_V4_RPT
+#define QSA_V4_RPT 2   // rows a thread scores against its block (k reuse)
+#endif
+extern "C" __global__ void qsa_score_rows_exact_v4(
+    const float* __restrict__ q,                // [rows, n_heads, hd]
+    const __nv_bfloat16* __restrict__ block_keys,
+    float* __restrict__ scores,                 // [rows, score_stride]
+    const unsigned int first_pos,
+    const unsigned int score_stride,
+    const unsigned int ratio,
+    const unsigned int n_heads,
+    const unsigned int hd,
+    const unsigned int rows,
+    const unsigned int n_blocks_max
+) {
+    constexpr unsigned int BM = QSA_SE_BM * QSA_V4_RPT;   // rows per CTA
+    const unsigned int r0 = blockIdx.x * BM;
+    const unsigned int b0 = blockIdx.y * QSA_SE_BN;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int ldk = hd + 4u;            // 16-byte rows, conflict-free float4
+
+    extern __shared__ float4 smem_v4[];
+    float* qs = reinterpret_cast<float*>(smem_v4);        // [BM][n_heads][hd]
+    float* ks = qs + (size_t)BM * n_heads * hd;           // [BN][hd + 4]
+
+    const unsigned int qn = BM * n_heads * hd;
+    for (unsigned int i = tid; i < qn; i += blockDim.x) {
+        const unsigned int rr = i / (n_heads * hd);
+        const unsigned int rest = i - rr * n_heads * hd;
+        const unsigned int r = r0 + rr;
+        qs[i] = (r < rows) ? q[(size_t)r * n_heads * hd + rest] : 0.0f;
+    }
+    const unsigned int kn = QSA_SE_BN * hd;
+    for (unsigned int i = tid; i < kn; i += blockDim.x) {
+        const unsigned int bb = i / hd;
+        const unsigned int d = i - bb * hd;
+        const unsigned int b = b0 + bb;
+        ks[bb * ldk + d] =
+            (b < n_blocks_max) ? (float)block_keys[(size_t)b * hd + d] : 0.0f;
+    }
+    __syncthreads();
+
+    const unsigned int ii = tid / QSA_SE_BN;      // 0 .. QSA_SE_BM - 1
+    const unsigned int jj = tid - ii * QSA_SE_BN;
+    const unsigned int b = b0 + jj;
+    if (b >= n_blocks_max) {
+        return;
+    }
+    const float* krow = ks + (size_t)jj * ldk;
+    const unsigned int groups = hd >> 5;
+
+    float acc[QSA_V4_RPT], dot[QSA_V4_RPT];
+    #pragma unroll
+    for (int u = 0; u < QSA_V4_RPT; ++u) acc[u] = 0.0f;
+    for (unsigned int hh = 0; hh < n_heads; ++hh) {
+        #pragma unroll
+        for (int u = 0; u < QSA_V4_RPT; ++u) dot[u] = 0.0f;
+        for (unsigned int g = 0; g < groups; ++g) {
+            const float4* kg4 = reinterpret_cast<const float4*>(krow + g * 32u);
+            float4 kv[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) kv[i] = kg4[i];
+            #pragma unroll
+            for (int u = 0; u < QSA_V4_RPT; ++u) {
+                const float* qh = qs + ((size_t)(ii + u * QSA_SE_BM) * n_heads + hh) * hd;
+                const float4* qg4 = reinterpret_cast<const float4*>(qh + g * 32u);
+                float4 qv[8];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) qv[i] = qg4[i];
+                float t[8];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float x0 = __fmul_rn(qsa_v4_at(qv, i), qsa_v4_at(kv, i));
+                    const float x1 = __fmul_rn(qsa_v4_at(qv, i + 16), qsa_v4_at(kv, i + 16));
+                    const float x2 = __fmul_rn(qsa_v4_at(qv, i + 8), qsa_v4_at(kv, i + 8));
+                    const float x3 = __fmul_rn(qsa_v4_at(qv, i + 24), qsa_v4_at(kv, i + 24));
+                    t[i] = __fadd_rn(__fadd_rn(x0, x1), __fadd_rn(x2, x3));
+                }
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) t[i] = __fadd_rn(t[i], t[i + 4]);
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) t[i] = __fadd_rn(t[i], t[i + 2]);
+                dot[u] = __fadd_rn(dot[u], __fadd_rn(t[0], t[1]));
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < QSA_V4_RPT; ++u) acc[u] = __fadd_rn(acc[u], fmaxf(dot[u], 0.0f));
+    }
+    #pragma unroll
+    for (int u = 0; u < QSA_V4_RPT; ++u) {
+        const unsigned int r = r0 + ii + u * QSA_SE_BM;
+        if (r >= rows) continue;
+        const unsigned int complete = (first_pos + r + 1) / ratio;
+        scores[(size_t)r * score_stride + b] = (b >= complete) ? -1e30f : acc[u] * rsqrtf((float)hd);
+    }
+}
+
 // Block scores as a TILED GEMM — one thread per score, no block reductions.
 //
 // `qsa_score_rows_b` still spends four block-wide reductions per output, and
