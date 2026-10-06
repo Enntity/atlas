@@ -38,6 +38,7 @@ pub(in crate::model) mod pc_policy;
 mod prefix_lookup;
 mod proc_range;
 mod prompt_logprobs;
+mod qwen4exp_ckpt;
 mod save_checkpoint;
 mod stage_batched;
 mod upload_meta;
@@ -154,7 +155,9 @@ impl TransformerModel {
             // it keeps the single-pass numerics, at the cost of the warm-turn tail
             // checkpoint this split exists to create.
             let split_disabled = pc_policy::tail_split_disabled();
-            if !split_disabled && cut > chunk_start && cut < total {
+            // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
+            let in_pass = self.qwen4exp_ckpt_takes_tail();
+            if !split_disabled && !in_pass && cut > chunk_start && cut < total {
                 anyhow::ensure!(
                     passengers.is_none(),
                     "GLM fused chunk cannot take the tail-checkpoint split"
@@ -363,14 +366,14 @@ impl TransformerModel {
         // ── Mid-chunk tail SSM capture (opt-in): plan BEFORE the forward
         // pass so SSM layers split their h/conv kernels at `tb` in-pass.
         // `None` (flag off or pass doesn't span `tb`) => no split. ──
-        let midcap_plan = self.prepare_midchunk_capture(
+        let midcap_plan = self.plan_pass_capture(
             tokens,
             seq,
             &mut kv_cache,
-            proc_start,
-            proc_count,
+            [proc_start, proc_count],
+            is_last_chunk,
             stream,
-        );
+        )?;
         anyhow::ensure!(
             midcap_plan.is_none() || passenger_run.is_none(),
             "GLM fused chunk cannot split the SSM recurrence mid-chunk"
@@ -436,7 +439,7 @@ impl TransformerModel {
 
         // Register the reserved slot as the session tail once the full pass has
         // captured the @tb state into it (no-op when no capture was planned).
-        if let Some(plan) = midcap_plan.as_ref() {
+        if let Some(plan) = midcap_plan.as_ref().filter(|p| !p.ckpt) {
             self.finalize_midchunk_capture(tokens, seq, plan);
         }
 
@@ -464,6 +467,9 @@ impl TransformerModel {
             stream,
         )?;
 
+        if let Some(plan) = midcap_plan.as_ref().filter(|p| p.ckpt) {
+            self.finalize_qwen4exp_ckpt(tokens, seq, &mut kv_cache, plan, stream)?;
+        }
         let out = if is_last_chunk {
             // ── Phase 6+7+8: final norm, lm_head, prefix-cache + snapshot save ──
             self.prefill_b_finalize_last(

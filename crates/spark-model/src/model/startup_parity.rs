@@ -356,10 +356,15 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     }),
     // Its slab-pipelined exchanges (gathers; `_RS_PIPE`: the MoE reduce-scatter)
     // move the same rows in pieces: a piecewise rank never pairs a whole one.
-    ("ATLAS_QWEN4EXP_PREFILL_SP_PIPE/_RS_PIPE", || {
-        use crate::layers::qwen4exp_sp_pipe as p;
-        Ok(p::requested() as u64 | (p::rs_requested() as u64) << 1)
-    }),
+    // `_MIDCHUNK_CKPT` runs a prompt's last chunk as one pass, not two.
+    (
+        "ATLAS_QWEN4EXP_PREFILL_SP_PIPE/_RS_PIPE/_MIDCHUNK_CKPT",
+        || {
+            use crate::layers::{qwen4exp_ckpt as c, qwen4exp_sp_pipe as p};
+            let bits = [p::requested(), p::rs_requested(), c::requested()];
+            Ok(bits.iter().enumerate().map(|(i, &b)| (b as u64) << i).sum())
+        },
+    ),
     // The qwen4_exp verify lane (per-row MoE all-reduces in the GDN layers'
     // verify) and the check's serial steps (their collectives).
     ("ATLAS_QWEN4EXP_EXACT_VERIFY", || {

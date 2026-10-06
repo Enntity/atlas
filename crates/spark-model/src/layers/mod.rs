@@ -23,6 +23,7 @@ pub mod ple;
 pub mod qsa;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
+pub mod qwen4exp_ckpt;
 pub mod qwen4exp_draft_head;
 pub mod qwen4exp_mtp;
 pub mod qwen4exp_sp_pipe;
