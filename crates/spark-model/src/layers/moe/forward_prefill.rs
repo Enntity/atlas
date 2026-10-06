@@ -242,9 +242,14 @@ impl MoeLayer {
             && !overlap_shared_reduce
             && !defer_shared_hc
             && self.shared_split_ready(ctx, n);
+        // Under SP with the reduce-scatter pipe, the shared expert of this
+        // rank's rows runs while that exchange is on the wire
+        // (`forward_prefill_finish`, `defer_shared_to_rs`).
+        let defer_shared =
+            !split && self.defer_shared_to_rs(sp, has_shared, overlap_shared_reduce, h, ctx);
         if split {
             self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
-        } else if has_shared && !overlap_shared_reduce {
+        } else if has_shared && !overlap_shared_reduce && !defer_shared {
             self.run_shared_expert_prefill(
                 shared_in,
                 shared_n,
