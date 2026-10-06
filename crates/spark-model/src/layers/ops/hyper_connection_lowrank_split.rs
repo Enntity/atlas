@@ -19,6 +19,8 @@ use crate::layers::qwen3_attention::HcLowRank;
 // per-output operations; shorter rings for the larger token count).
 const HC_V_MAX: u32 = 8;
 const HC_V_TWIN_MIN: u32 = 5;
+/// Tokens the row-grouped `_vec_rows` twins take in one launch (HC_V_ROWS_MAX).
+pub(super) const HC_V_ROWS_MAX: u32 = 32;
 const HC_V_DOWN_CPT: u32 = 2; // chains per thread
 const HC_V_DOWN_UNROLL: u32 = 32;
 const HC_V_FIN_DPT: u32 = 4; // output dims per thread
@@ -61,7 +63,8 @@ fn hc_pre_vec(
 ) -> Result<bool> {
     let hc_dim = hc_mult * hidden_size;
     let rank = w.rank as u32;
-    let fits = num_tokens <= HC_V_MAX
+    let fits = num_tokens <= HC_V_ROWS_MAX
+        && (num_tokens <= HC_V_MAX || fold.is_none())
         && hc_mult == 4
         && hidden_size.is_multiple_of(HC_V_FIN_DPT)
         && hc_dim.is_multiple_of(4 * HC_V_STAGE_SPLIT)
@@ -74,26 +77,17 @@ fn hc_pre_vec(
     if !fits {
         return Ok(false);
     }
-    let twin = num_tokens >= HC_V_TWIN_MIN;
+    // Past HC_V_MAX tokens (the exact batching lane's wide steps): groups of
+    // HC_V_MAX tokens on blockIdx.y of one launch, each the `_vec8` body.
+    let groups = num_tokens.div_ceil(HC_V_MAX);
+    let (down, fin) = match (groups > 1, num_tokens >= HC_V_TWIN_MIN) {
+        (true, _) => ("hc_pre_down_vec_rows", "hc_pre_finish_vec_rows"),
+        (false, true) => ("hc_pre_down_vec8", "hc_pre_finish_vec8"),
+        (false, false) => ("hc_pre_down_vec", "hc_pre_finish_vec"),
+    };
     let k_stage = crate::layers::try_kernel(gpu, "hyper_connection", "hc_pre_stage_vec");
-    let k_down = crate::layers::try_kernel(
-        gpu,
-        "hyper_connection",
-        if twin {
-            "hc_pre_down_vec8"
-        } else {
-            "hc_pre_down_vec"
-        },
-    );
-    let k_fin = crate::layers::try_kernel(
-        gpu,
-        "hyper_connection",
-        if twin {
-            "hc_pre_finish_vec8"
-        } else {
-            "hc_pre_finish_vec"
-        },
-    );
+    let k_down = crate::layers::try_kernel(gpu, "hyper_connection", down);
+    let k_fin = crate::layers::try_kernel(gpu, "hyper_connection", fin);
     if k_stage.0 == 0 || k_down.0 == 0 || k_fin.0 == 0 {
         return Ok(false);
     }
@@ -130,7 +124,7 @@ fn hc_pre_vec(
     let rows = rank + if inj_out.is_null() { 0 } else { hc_mult };
     let down_threads = rows * (32 / HC_V_DOWN_CPT);
     KernelLaunch::new(gpu, k_down)
-        .grid([down_threads.div_ceil(HC_V_DOWN_BLOCK), 1, 1])
+        .grid([down_threads.div_ceil(HC_V_DOWN_BLOCK), groups, 1])
         .block([HC_V_DOWN_BLOCK, 1, 1])
         .arg_ptr(normed)
         .arg_ptr(w.down_w)
@@ -149,9 +143,9 @@ fn hc_pre_vec(
 
     let fin_threads = hc_dim / HC_V_FIN_DPT;
     KernelLaunch::new(gpu, k_fin)
-        .grid([fin_threads.div_ceil(HC_V_FIN_BLOCK), 1, 1])
+        .grid([fin_threads.div_ceil(HC_V_FIN_BLOCK), groups, 1])
         .block([HC_V_FIN_BLOCK, 1, 1])
-        .shared_mem(num_tokens * rank * 4)
+        .shared_mem(num_tokens.min(HC_V_MAX) * rank * 4)
         .arg_ptr(normed)
         .arg_ptr(low)
         .arg_ptr(w.up_w)
@@ -161,6 +155,48 @@ fn hc_pre_vec(
         .arg_u32(num_tokens)
         .launch(stream)?;
     Ok(true)
+}
+
+/// `ATLAS_QWEN4EXP_BATCH_FAST` with `ATLAS_QWEN4EXP_HC_FAST`: a low-rank
+/// `hc_pre` (`inject`) or head collapse of HC_V_MAX < `num_tokens` <=
+/// [`HC_V_ROWS_MAX`] decode rows as ONE row-grouped vectorized collapse, each
+/// row the single-row decode collapse's bytes. `Ok(false)`, nothing
+/// launched, where it does not apply; the caller then chunks by HC_V_MAX.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hc_pre_rows_wide(
+    gpu: &dyn GpuBackend,
+    streams: DevicePtr,
+    w: &HcLowRank,
+    y_out: DevicePtr,
+    inj_out: DevicePtr,
+    scratch: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    norm_eps: f32,
+    stream: u64,
+) -> Result<bool> {
+    if !hc_fast() || !(HC_V_MAX + 1..=HC_V_ROWS_MAX).contains(&num_tokens) || scratch.is_null() {
+        return Ok(false);
+    }
+    // `hc_pre_split`'s scratch layout.
+    let hc_dim = (hc_mult * hidden_size) as usize;
+    let low = scratch.offset(64 * hc_dim * 4);
+    hc_pre_vec(
+        gpu,
+        streams,
+        w,
+        y_out,
+        inj_out,
+        scratch,
+        low,
+        num_tokens,
+        hidden_size,
+        hc_mult,
+        norm_eps,
+        None,
+        stream,
+    )
 }
 
 /// The three-launch collapse for small T. Same math as the fused kernel;

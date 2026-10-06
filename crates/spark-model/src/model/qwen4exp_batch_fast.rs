@@ -16,7 +16,7 @@
 //!
 //! | op | serial | batched (switch on) | per row |
 //! |---|---|---|---|
-//! | embed, PLE, mHC pre/post/head | per row / T=1 | per row / T=n (`hc_pre_split`, `_vec`; past 8 rows in 8-row split chunks, not the GEMM collapse) | equal |
+//! | embed, PLE, mHC pre/post/head | per row / T=1 | per row / T=n (`hc_pre_split`, `_vec`; past 8 rows in 8-row split chunks, under `ATLAS_QWEN4EXP_HC_FAST` row-grouped launches of up to 32 (`hc_pre_*_vec_rows`), not the GEMM collapse) | equal |
 //! | GDN qkvz, out_proj (BF16) | `dense_gemv_bf16` | `dense_gemv_bf16_batchm` (<= 8 rows a launch; 9..32 `qwen4exp_bf16_rows16/32`, `ops::Qwen4ExpWideRows`) instead of cuBLASLt | equal |
 //! | GDN qkvz, out_proj (FP8 opt-in) | `w8a16_gemv` | `w8a16_gemv_batch4/16` | equal |
 //! | GDN ba+gates, conv, recurrence, norm | per row | the per-sequence loop (the strided batched recurrence is skipped) | equal |
