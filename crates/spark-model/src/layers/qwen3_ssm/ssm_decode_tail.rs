@@ -60,7 +60,7 @@ impl Qwen3SsmLayer {
     /// Whether a decode token's steps 3-7 are the four kernels the fused step
     /// reproduces: FP32 conv output, FP32 recurrence state and output, the
     /// sigmoid gated norm, no fused GDN+norm kernel.
-    fn four_kernel_f32_arm(&self, ctx: &ForwardContext) -> bool {
+    pub(super) fn four_kernel_f32_arm(&self, ctx: &ForwardContext) -> bool {
         let fused_norm = self.gdn_f32_norm_k.0 != 0 && super::gdn_fused_norm_enabled();
         self.conv1d_l2norm_f32_k.0 != 0
             && self.gdn_f32_k.0 != 0
@@ -68,66 +68,6 @@ impl Qwen3SsmLayer {
             && !fused_norm
             && !super::ssm_h_fp16_enabled()
             && ctx.config.output_gate_type == "sigmoid"
-    }
-
-    /// `ATLAS_QWEN4EXP_BATCH_SMALL`: the batched multi-sequence decode's
-    /// per-sequence recurrent inner (BA gates, conv + L2 norm, recurrence,
-    /// sigmoid gated norm, four launches a sequence) as
-    /// `qwen4exp_gdn_decode_fused_rows`, every row's state, gates and normed
-    /// output (`normed_out` rows, `value_dim` apart) the bytes the loop
-    /// writes. Only where the loop's arm is the four-kernel one
-    /// (`decode_ms_ssm_recurrent`'s `ATLAS_GDN_FUSED_CONV` arm is not).
-    /// Returns whether it ran; on `false` nothing was launched.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn gdn_decode_fused_rows<'a, 'b: 'a>(
-        &self,
-        states: &'a mut [&'b mut (dyn LayerState + 'static)],
-        n: usize,
-        normed: DevicePtr,
-        qkvz: DevicePtr,
-        qkvz_size: usize,
-        normed_out: DevicePtr,
-        use_fused_conv: bool,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<bool> {
-        if !ctx.levers.qwen4exp_batch_small || use_fused_conv || !self.four_kernel_f32_arm(ctx) {
-            return Ok(false);
-        }
-        let mut seqs = Vec::with_capacity(n);
-        for (i, state) in states.iter_mut().enumerate().take(n) {
-            let s = state
-                .as_any_mut()
-                .downcast_mut::<SsmLayerState>()
-                .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
-            seqs.push((s.h_state, s.conv_state));
-        }
-        let c = ctx.config;
-        ops::qwen4exp_decode_fuse::gdn_decode_rows(
-            ctx.gpu,
-            &ops::qwen4exp_decode_fuse::GdnDecodeRows {
-                states: &seqs,
-                qkvz,
-                qkvz_stride: qkvz_size as u32,
-                conv_w: self.ssm.conv1d.weight,
-                ba_in: normed,
-                ba_w: self.ssm.in_proj_ba.weight,
-                a_log: self.ssm.a_log.weight,
-                dt_bias: self.ssm.dt_bias.weight,
-                gates: ctx.buffers.ssm_gates(),
-                norm_w: self.ssm.norm.weight,
-                out: normed_out,
-            },
-            c.linear_num_key_heads as u32,
-            c.linear_num_value_heads as u32,
-            c.linear_key_head_dim as u32,
-            c.linear_value_head_dim as u32,
-            c.linear_conv_kernel_dim as u32,
-            c.hidden_size as u32,
-            1e-6,
-            c.rms_norm_eps as f32,
-            stream,
-        )
     }
 
     /// Step 8 of [`Self::ssm_forward`]: the out projection of the gated-norm

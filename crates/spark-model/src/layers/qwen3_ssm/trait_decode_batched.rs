@@ -781,7 +781,20 @@ impl Qwen3SsmLayer {
         let h_bytes = self.h_slot_stride_bytes();
         let conv_bytes = self.conv_state_bytes;
 
+        // ATLAS_QWEN4EXP_BATCH_SMALL: the exact arm below, every sequence and
+        // token, as one launch (`gdn_fused_rows.rs`).
+        let fused_rows = self.gdn_verify_fused_rows(
+            &mut gdn,
+            num_tokens,
+            deinterleaved,
+            qkvz_size,
+            gates_buf,
+            conv_out_buf,
+            ctx,
+            stream,
+        )?;
         match gdn {
+            _ if fused_rows => {}
             GdnStates::Single(state) => {
                 let ssm_state = state
                     .as_any_mut()

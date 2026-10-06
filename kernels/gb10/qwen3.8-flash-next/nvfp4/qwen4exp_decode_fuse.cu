@@ -4,6 +4,9 @@
 // the GDN mixer's small kernels as one launch, and the EP MoE shared-expert
 // blend with the mHC post (`moe_blend_hc_post`, at the end). The mHC seam
 // twin (`hc_post_stage_vec`) lives in hyper_connection.cu with its helpers.
+// The same step over the rows of a batched decode and of an exact MTP verify
+// (`qwen4exp_gdn_decode_fused_rows`, `qwen4exp_gdn_verify_fused_rows`) serves
+// ATLAS_QWEN4EXP_BATCH_SMALL=1.
 //
 // ── qwen4exp_gdn_decode_fused ──
 //
@@ -96,6 +99,145 @@ __device__ __forceinline__ void qdf_load_window(const float* p, float (&old)[QDF
 
 __device__ __forceinline__ void qdf_store_window(float* p, const float (&win)[QDF_DCONV]) {
     *reinterpret_cast<float4*>(p) = make_float4(win[0], win[1], win[2], win[3]);
+}
+
+// One token's conv on windows held in registers: shift in the token's
+// channel inputs, contract and SiLU (`qdf_conv_silu`), L2-normalize q and k
+// over the head into `smem_q` / `smem_k` (`qdf_l2`). Returns v (SiLU only).
+// The windows are left holding what the conv kernel stores.
+__device__ __forceinline__ float qdf_conv_step(float (&wq)[QDF_DCONV], float (&wk)[QDF_DCONV],
+                                               float (&wv)[QDF_DCONV],
+                                               const __nv_bfloat16* __restrict__ qkv,
+                                               const unsigned int cq, const unsigned int ck,
+                                               const unsigned int cv,
+                                               const __nv_bfloat16* __restrict__ conv_w,
+                                               float* smem_q, float* smem_k, const float l2_eps) {
+    wq[0] = wq[1]; wq[1] = wq[2]; wq[2] = wq[3]; wq[3] = (float)qkv[cq];
+    wk[0] = wk[1]; wk[1] = wk[2]; wk[2] = wk[3]; wk[3] = (float)qkv[ck];
+    wv[0] = wv[1]; wv[1] = wv[2]; wv[2] = wv[3]; wv[3] = (float)qkv[cv];
+    const float q_silu = qdf_conv_silu(wq, conv_w + (unsigned long long)cq * QDF_DCONV);
+    const float k_silu = qdf_conv_silu(wk, conv_w + (unsigned long long)ck * QDF_DCONV);
+    const float v_i = qdf_conv_silu(wv, conv_w + (unsigned long long)cv * QDF_DCONV);
+    __shared__ float ws[4];
+    smem_q[threadIdx.x] = qdf_l2(q_silu, ws, l2_eps);
+    smem_k[threadIdx.x] = qdf_l2(k_silu, ws, l2_eps);
+    return v_i;
+}
+
+// `gated_delta_rule_decode_f32`'s step for this block's value head (thread
+// = column of H, held in `H_reg`): the clamped gate, the hk and q dots, the
+// state update. Returns the FP32 output `x` (before the gated norm).
+__device__ __forceinline__ float qdf_recur(float (&H_reg)[QDF_D], const float* smem_k,
+                                           const float* smem_q, const float gate,
+                                           const float bt, const float v_i,
+                                           const unsigned int head_dim) {
+    float g = fminf(fmaxf(gate, 1e-6f), 1.0f - 1e-6f);
+
+    float hk0 = 0.0f, hk1 = 0.0f, hk2 = 0.0f, hk3 = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < QDF_D; j += 4) {
+        hk0 += H_reg[j]     * smem_k[j];
+        hk1 += H_reg[j + 1] * smem_k[j + 1];
+        hk2 += H_reg[j + 2] * smem_k[j + 2];
+        hk3 += H_reg[j + 3] * smem_k[j + 3];
+    }
+    float hk_dot = (hk0 + hk1) + (hk2 + hk3);
+
+    float v_new = (v_i - g * hk_dot) * bt;
+
+    float qd0 = 0.0f, qd1 = 0.0f, qd2 = 0.0f, qd3 = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < QDF_D; j += 4) {
+        float h0 = g * H_reg[j]     + smem_k[j]     * v_new;
+        float h1 = g * H_reg[j + 1] + smem_k[j + 1] * v_new;
+        float h2 = g * H_reg[j + 2] + smem_k[j + 2] * v_new;
+        float h3 = g * H_reg[j + 3] + smem_k[j + 3] * v_new;
+        H_reg[j]     = h0;
+        H_reg[j + 1] = h1;
+        H_reg[j + 2] = h2;
+        H_reg[j + 3] = h3;
+        qd0 += h0 * smem_q[j];
+        qd1 += h1 * smem_q[j + 1];
+        qd2 += h2 * smem_q[j + 2];
+        qd3 += h3 * smem_q[j + 3];
+    }
+    float q_dot = (qd0 + qd1) + (qd2 + qd3);
+
+    // `rsqrtf` of the runtime head dim, as the recurrence kernel computes it:
+    // a compile-time `rsqrtf(128.0f)` folds to the correctly rounded value,
+    // one ulp off the hardware approximation the original issues, which
+    // flips the BF16 rounding of a few outputs per thousand steps.
+    float inv_sqrt_d = rsqrtf((float)head_dim);
+    return q_dot * inv_sqrt_d;
+}
+
+// `gated_rms_norm_f32_input_sigmoid` over one head (block = 128): `x` per
+// thread, the head's Z gate and output rows.
+__device__ __forceinline__ void qdf_gated_norm(const float x,
+                                               const __nv_bfloat16* __restrict__ z_head,
+                                               const __nv_bfloat16* __restrict__ norm_w,
+                                               __nv_bfloat16* __restrict__ out_head,
+                                               const unsigned int head_dim, const float eps) {
+    const unsigned int tid = threadIdx.x;
+    __shared__ float x_cache[QDF_D];
+    x_cache[tid] = x;
+    float sum_sq = 0.0f;
+    sum_sq += x * x;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    __shared__ float warp_sums[32];
+    const unsigned int warp_id = tid / 32;
+    const unsigned int lane_id = tid % 32;
+    if (lane_id == 0) warp_sums[warp_id] = sum_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane_id < (blockDim.x + 31) / 32) ? warp_sums[lane_id] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        }
+        if (lane_id == 0) warp_sums[0] = val;
+    }
+    __syncthreads();
+
+    float rms = rsqrtf(warp_sums[0] / (float)head_dim + eps);
+
+    const unsigned long long* g64 = (const unsigned long long*)z_head;
+    const unsigned long long* w64 = (const unsigned long long*)norm_w;
+    unsigned long long* out64 = (unsigned long long*)out_head;
+    const unsigned int quad_size = QDF_D / 4;
+    for (unsigned int i = tid; i < quad_size; i += blockDim.x) {
+        unsigned int base = i * 4;
+        float f0 = x_cache[base];
+        float f1 = x_cache[base + 1];
+        float f2 = x_cache[base + 2];
+        float f3 = x_cache[base + 3];
+
+        unsigned long long wv64 = w64[i];
+        float w0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(wv64 & 0xFFFF)));
+        float w1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)((wv64 >> 16) & 0xFFFF)));
+        float w2 = __bfloat162float(__ushort_as_bfloat16((unsigned short)((wv64 >> 32) & 0xFFFF)));
+        float w3 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(wv64 >> 48)));
+
+        unsigned long long gv = g64[i];
+        float g0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(gv & 0xFFFF)));
+        float g1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)((gv >> 16) & 0xFFFF)));
+        float g2 = __bfloat162float(__ushort_as_bfloat16((unsigned short)((gv >> 32) & 0xFFFF)));
+        float g3 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(gv >> 48)));
+
+        float s0 = 1.0f / (1.0f + expf(-g0));
+        float s1 = 1.0f / (1.0f + expf(-g1));
+        float s2 = 1.0f / (1.0f + expf(-g2));
+        float s3 = 1.0f / (1.0f + expf(-g3));
+
+        unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(f0 * rms * w0 * s0))
+                        | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(f1 * rms * w1 * s1)) << 16);
+        unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(f2 * rms * w2 * s2))
+                        | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(f3 * rms * w3 * s3)) << 16);
+        out64[i] = ((unsigned long long)hi << 32) | (unsigned long long)lo;
+    }
 }
 
 // One block (value head blockIdx.x) of the fused step for one token: the
@@ -199,24 +341,12 @@ __device__ __forceinline__ void qdf_gdn_block(
     const unsigned int ck = key_dim + kh * QDF_D + tid;
     const unsigned int cv = 2u * key_dim + vh * QDF_D + tid;
     float wq[QDF_DCONV], wk[QDF_DCONV], wv[QDF_DCONV];
-    {
-        float old[QDF_DCONV];
-        qdf_load_window(conv_state + (unsigned long long)cq * QDF_DCONV, old);
-        wq[0] = old[1]; wq[1] = old[2]; wq[2] = old[3]; wq[3] = (float)qkv[cq];
-        qdf_load_window(conv_state + (unsigned long long)ck * QDF_DCONV, old);
-        wk[0] = old[1]; wk[1] = old[2]; wk[2] = old[3]; wk[3] = (float)qkv[ck];
-        qdf_load_window(conv_state + (unsigned long long)cv * QDF_DCONV, old);
-        wv[0] = old[1]; wv[1] = old[2]; wv[2] = old[3]; wv[3] = (float)qkv[cv];
-    }
-    const float q_silu = qdf_conv_silu(wq, conv_w + (unsigned long long)cq * QDF_DCONV);
-    const float k_silu = qdf_conv_silu(wk, conv_w + (unsigned long long)ck * QDF_DCONV);
-    const float v_i = qdf_conv_silu(wv, conv_w + (unsigned long long)cv * QDF_DCONV);
-
-    __shared__ float ws[4];
+    qdf_load_window(conv_state + (unsigned long long)cq * QDF_DCONV, wq);
+    qdf_load_window(conv_state + (unsigned long long)ck * QDF_DCONV, wk);
+    qdf_load_window(conv_state + (unsigned long long)cv * QDF_DCONV, wv);
     __shared__ float smem_k[QDF_D];
     __shared__ float smem_q[QDF_D];
-    smem_q[tid] = qdf_l2(q_silu, ws, l2_eps);
-    smem_k[tid] = qdf_l2(k_silu, ws, l2_eps);
+    const float v_i = qdf_conv_step(wq, wk, wv, qkv, cq, ck, cv, conv_w, smem_q, smem_k, l2_eps);
 
     // Every block of the key head has read the old q/k window (and used it):
     // only now may the cluster's first block overwrite it.
@@ -228,106 +358,10 @@ __device__ __forceinline__ void qdf_gdn_block(
     qdf_store_window(conv_state + (unsigned long long)cv * QDF_DCONV, wv);
 
     // ── Recurrence: gated_delta_rule_decode_f32 ──
-    float g = fminf(fmaxf(smem_gb[0], 1e-6f), 1.0f - 1e-6f);
-    float bt = smem_gb[1];
-
-    float hk0 = 0.0f, hk1 = 0.0f, hk2 = 0.0f, hk3 = 0.0f;
-    #pragma unroll
-    for (int j = 0; j < QDF_D; j += 4) {
-        hk0 += H_reg[j]     * smem_k[j];
-        hk1 += H_reg[j + 1] * smem_k[j + 1];
-        hk2 += H_reg[j + 2] * smem_k[j + 2];
-        hk3 += H_reg[j + 3] * smem_k[j + 3];
-    }
-    float hk_dot = (hk0 + hk1) + (hk2 + hk3);
-
-    float v_new = (v_i - g * hk_dot) * bt;
-
-    float qd0 = 0.0f, qd1 = 0.0f, qd2 = 0.0f, qd3 = 0.0f;
-    #pragma unroll
-    for (int j = 0; j < QDF_D; j += 4) {
-        float h0 = g * H_reg[j]     + smem_k[j]     * v_new;
-        float h1 = g * H_reg[j + 1] + smem_k[j + 1] * v_new;
-        float h2 = g * H_reg[j + 2] + smem_k[j + 2] * v_new;
-        float h3 = g * H_reg[j + 3] + smem_k[j + 3] * v_new;
-        H_reg[j]     = h0;
-        H_reg[j + 1] = h1;
-        H_reg[j + 2] = h2;
-        H_reg[j + 3] = h3;
-        qd0 += h0 * smem_q[j];
-        qd1 += h1 * smem_q[j + 1];
-        qd2 += h2 * smem_q[j + 2];
-        qd3 += h3 * smem_q[j + 3];
-    }
-    float q_dot = (qd0 + qd1) + (qd2 + qd3);
-
-    // `rsqrtf` of the runtime head dim, as the recurrence kernel computes it:
-    // a compile-time `rsqrtf(128.0f)` folds to the correctly rounded value,
-    // one ulp off the hardware approximation the original issues, which
-    // flips the BF16 rounding of a few outputs per thousand steps.
-    float inv_sqrt_d = rsqrtf((float)head_dim);
-    const float x = q_dot * inv_sqrt_d;
+    const float x = qdf_recur(H_reg, smem_k, smem_q, smem_gb[0], smem_gb[1], v_i, head_dim);
 
     // ── gated_rms_norm_f32_input_sigmoid over this head (block = 128) ──
-    __shared__ float x_cache[QDF_D];
-    x_cache[tid] = x;
-    float sum_sq = 0.0f;
-    sum_sq += x * x;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
-    }
-    __shared__ float warp_sums[32];
-    const unsigned int warp_id = tid / 32;
-    const unsigned int lane_id = tid % 32;
-    if (lane_id == 0) warp_sums[warp_id] = sum_sq;
-    __syncthreads();
-    if (warp_id == 0) {
-        float val = (lane_id < (blockDim.x + 31) / 32) ? warp_sums[lane_id] : 0.0f;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-        }
-        if (lane_id == 0) warp_sums[0] = val;
-    }
-    __syncthreads();
-
-    float rms = rsqrtf(warp_sums[0] / (float)head_dim + eps);
-
-    const unsigned long long* g64 = (const unsigned long long*)(z_gate + vh * QDF_D);
-    const unsigned long long* w64 = (const unsigned long long*)norm_w;
-    unsigned long long* out64 = (unsigned long long*)(out + vh * QDF_D);
-    const unsigned int quad_size = QDF_D / 4;
-    for (unsigned int i = tid; i < quad_size; i += blockDim.x) {
-        unsigned int base = i * 4;
-        float f0 = x_cache[base];
-        float f1 = x_cache[base + 1];
-        float f2 = x_cache[base + 2];
-        float f3 = x_cache[base + 3];
-
-        unsigned long long wv64 = w64[i];
-        float w0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(wv64 & 0xFFFF)));
-        float w1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)((wv64 >> 16) & 0xFFFF)));
-        float w2 = __bfloat162float(__ushort_as_bfloat16((unsigned short)((wv64 >> 32) & 0xFFFF)));
-        float w3 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(wv64 >> 48)));
-
-        unsigned long long gv = g64[i];
-        float g0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(gv & 0xFFFF)));
-        float g1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)((gv >> 16) & 0xFFFF)));
-        float g2 = __bfloat162float(__ushort_as_bfloat16((unsigned short)((gv >> 32) & 0xFFFF)));
-        float g3 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(gv >> 48)));
-
-        float s0 = 1.0f / (1.0f + expf(-g0));
-        float s1 = 1.0f / (1.0f + expf(-g1));
-        float s2 = 1.0f / (1.0f + expf(-g2));
-        float s3 = 1.0f / (1.0f + expf(-g3));
-
-        unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(f0 * rms * w0 * s0))
-                        | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(f1 * rms * w1 * s1)) << 16);
-        unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(f2 * rms * w2 * s2))
-                        | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(f3 * rms * w3 * s3)) << 16);
-        out64[i] = ((unsigned long long)hi << 32) | (unsigned long long)lo;
-    }
+    qdf_gated_norm(x, z_gate + vh * QDF_D, norm_w, out + vh * QDF_D, head_dim, eps);
 
     #pragma unroll
     for (int j = 0; j < QDF_D; j++) {
@@ -414,6 +448,119 @@ qwen4exp_gdn_decode_fused_rows(
                   ba_w, a_log, dt_bias, g, g + num_v_heads, qkv + conv_dim, norm_w,
                   out + (unsigned long long)r * num_v_heads * QDF_D, num_k_heads, num_v_heads,
                   ba_k, head_dim, l2_eps, eps);
+}
+
+// ── qwen4exp_gdn_verify_fused_rows (ATLAS_QWEN4EXP_BATCH_SMALL) ──
+//
+// The exact MTP verify's GDN chain for up to QDF_ROWS_MAX sequences, each
+// with its own `k` <= QDF_VERIFY_KMAX consecutive tokens (rows row0..row0+k-1
+// of the step), in one launch. Per token the exact arm
+// (trait_decode_batched_conv_gdn_exact.rs) runs causal_conv1d_update_l2norm_f32,
+// a copy of the conv state to its rollback slot, gated_delta_rule_decode_f32,
+// gated_rms_norm_f32_input_sigmoid and a copy of the recurrence state to its
+// slot (the copies for tokens 0..k-2). Block (vh, s) does all of that for
+// value head vh of sequence s with H and the conv windows in registers across
+// the tokens: each token is the same IEEE operations in the same order (H
+// stored and reloaded in FP32 is the same float), the rollback slots get the
+// bytes the copies give, and the final state is the k-th token's. Gates and
+// betas come from the step's gate rows, as the exact arm reads them.
+//
+// The q/k windows of a key head are evolved redundantly by its three blocks
+// (the same values); the cluster's first block stores them, once every block
+// has loaded the old ones.
+//
+// Grid: (num_v_heads, sequences, 1) with clusters of QDF_REPEAT; block QDF_D.
+#define QDF_VERIFY_KMAX 4
+
+struct QdfVerifySeq {
+    float* h;                                // [nv, 128, 128] FP32
+    float* conv;                             // [conv_dim, 4] FP32
+    float* h_snap[QDF_VERIFY_KMAX - 1];      // after token t, t < k - 1
+    float* conv_snap[QDF_VERIFY_KMAX - 1];
+    unsigned int row0;                       // first row of the step
+    unsigned int k;                          // tokens, 1..QDF_VERIFY_KMAX
+};
+
+struct QdfVerifyRows {
+    QdfVerifySeq seq[QDF_ROWS_MAX];
+};
+
+extern "C" __global__ void __cluster_dims__(QDF_REPEAT, 1, 1) __launch_bounds__(QDF_D, 1)
+qwen4exp_gdn_verify_fused_rows(
+    const __grid_constant__ QdfVerifyRows rows,
+    const __nv_bfloat16* __restrict__ qkvz,    // [rows, qkvz_stride]: Q|K|V|Z
+    const __nv_bfloat16* __restrict__ conv_w,  // [conv_dim, 4]
+    const float* __restrict__ gates,           // [rows, 2 * nv]: gate | beta
+    const __nv_bfloat16* __restrict__ norm_w,  // [128]
+    __nv_bfloat16* __restrict__ out,           // [rows, nv * 128]
+    const unsigned int num_k_heads,
+    const unsigned int num_v_heads,
+    const unsigned int head_dim,
+    const unsigned int qkvz_stride,
+    const float l2_eps,
+    const float eps
+) {
+    namespace cg = cooperative_groups;
+    const QdfVerifySeq& sq = rows.seq[blockIdx.y];
+    const unsigned int vh = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int kh = vh / (num_v_heads / num_k_heads);
+    const unsigned int key_dim = num_k_heads * QDF_D;
+    const unsigned long long conv_dim = 2ull * key_dim + num_v_heads * QDF_D;
+    const unsigned long long head = (unsigned long long)vh * QDF_D * QDF_D;
+    const bool lead = cg::this_cluster().block_rank() == 0;
+
+    float H_reg[QDF_D];
+    #pragma unroll
+    for (int j = 0; j < QDF_D; j++) {
+        H_reg[j] = sq.h[head + j * QDF_D + tid];
+    }
+    const unsigned int cq = kh * QDF_D + tid;
+    const unsigned int ck = key_dim + kh * QDF_D + tid;
+    const unsigned int cv = 2u * key_dim + vh * QDF_D + tid;
+    float wq[QDF_DCONV], wk[QDF_DCONV], wv[QDF_DCONV];
+    qdf_load_window(sq.conv + (unsigned long long)cq * QDF_DCONV, wq);
+    qdf_load_window(sq.conv + (unsigned long long)ck * QDF_DCONV, wk);
+    qdf_load_window(sq.conv + (unsigned long long)cv * QDF_DCONV, wv);
+
+    __shared__ float smem_k[QDF_D];
+    __shared__ float smem_q[QDF_D];
+    for (unsigned int t = 0; t < sq.k; t++) {
+        const unsigned long long row = sq.row0 + t;
+        const __nv_bfloat16* qkv = qkvz + row * qkvz_stride;
+        const float v_i = qdf_conv_step(wq, wk, wv, qkv, cq, ck, cv, conv_w, smem_q, smem_k, l2_eps);
+        __syncthreads();  // every smem_k / smem_q entry before the dots read them
+        const bool snap = t + 1 < sq.k;
+        if (snap) {
+            if (lead) {
+                qdf_store_window(sq.conv_snap[t] + (unsigned long long)cq * QDF_DCONV, wq);
+                qdf_store_window(sq.conv_snap[t] + (unsigned long long)ck * QDF_DCONV, wk);
+            }
+            qdf_store_window(sq.conv_snap[t] + (unsigned long long)cv * QDF_DCONV, wv);
+        }
+        const float* g = gates + row * 2u * num_v_heads;
+        const float x = qdf_recur(H_reg, smem_k, smem_q, g[vh], g[num_v_heads + vh], v_i, head_dim);
+        if (snap) {
+            #pragma unroll
+            for (int j = 0; j < QDF_D; j++) {
+                sq.h_snap[t][head + j * QDF_D + tid] = H_reg[j];
+            }
+        }
+        qdf_gated_norm(x, qkv + conv_dim + vh * QDF_D, norm_w,
+                       out + row * num_v_heads * QDF_D + vh * QDF_D, head_dim, eps);
+    }
+
+    // Every block of the key head has loaded the old q/k windows.
+    cg::this_cluster().sync();
+    if (lead) {
+        qdf_store_window(sq.conv + (unsigned long long)cq * QDF_DCONV, wq);
+        qdf_store_window(sq.conv + (unsigned long long)ck * QDF_DCONV, wk);
+    }
+    qdf_store_window(sq.conv + (unsigned long long)cv * QDF_DCONV, wv);
+    #pragma unroll
+    for (int j = 0; j < QDF_D; j++) {
+        sq.h[head + j * QDF_D + tid] = H_reg[j];
+    }
 }
 
 // ── moe_blend_hc_post ──

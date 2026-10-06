@@ -419,6 +419,7 @@ mod debug;
 mod exact_rows;
 mod fla_dispatch;
 pub mod gdn_flags;
+mod gdn_fused_rows;
 mod init;
 mod init_fp8;
 mod init_q2;

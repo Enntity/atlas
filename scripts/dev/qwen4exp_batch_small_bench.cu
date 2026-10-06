@@ -19,6 +19,12 @@
 //                 recurrent steps, every byte left behind (normed rows, gates,
 //                 betas, conv windows, recurrence states). TP2 (8 key / 24
 //                 value heads) and TP1 (16 / 48).
+//   GDN verify    qwen4exp_gdn_verify_fused_rows (vh, seqs) vs the exact MTP
+//                 verify arm per sequence and token: causal_conv1d_update_
+//                 l2norm_f32, conv state -> rollback slot, gated_delta_rule_
+//                 decode_f32, gated_rms_norm_f32_input_sigmoid, H -> rollback
+//                 slot (slots for tokens 0..k-2); 1..12 sequences, k = 2..4
+//                 and ragged 1..4; normed rows, final states and every slot.
 //
 // R = 1..8, 16, 32 (16 and 32 as 8-row launches for the GDN step, as the
 // runtime chunks them). Then GPU time per layer at R rows, the old launches
@@ -366,6 +372,160 @@ static bool gdn_check(const GdnShape& s, int steps) {
     return bad == 0;
 }
 
+// ══ GDN exact MTP verify ═════════════════════════════════════════════════
+// Sequence s owns rows row0..row0+k-1 of the step (ragged k). The exact arm
+// per token: conv kernel on the live conv state, conv state -> rollback slot
+// t (t < k-1), recurrence on the live H, gated norm, H -> rollback slot t.
+static const u32 KMAX = 4;
+struct VerifySeq {
+    GdnSeq st;
+    Buf<float> h_snap[KMAX - 1], conv_snap[KMAX - 1];
+    u32 row0 = 0, k = 1;
+};
+static void vseq_alloc(const GdnShape& s, VerifySeq& v, bool init) {
+    gdn_seq(s, v.st, init);
+    for (u32 t = 0; t + 1 < KMAX; t++) {
+        v.h_snap[t].alloc((size_t)s.nv * D * D); v.h_snap[t].fill(0x7F);
+        v.conv_snap[t].alloc((size_t)conv_dim(s) * DCONV); v.conv_snap[t].fill(0x7F);
+    }
+}
+static void vseq_free(VerifySeq& v) {
+    v.st.h.free_(); v.st.conv.free_();
+    for (u32 t = 0; t + 1 < KMAX; t++) { v.h_snap[t].free_(); v.conv_snap[t].free_(); }
+}
+static void vseq_copy(VerifySeq& dst, const VerifySeq& src) {
+    CK(cudaMemcpy(dst.st.h.p, src.st.h.p, src.st.h.n * 4, cudaMemcpyDeviceToDevice));
+    CK(cudaMemcpy(dst.st.conv.p, src.st.conv.p, src.st.conv.n * 4, cudaMemcpyDeviceToDevice));
+    dst.row0 = src.row0;
+    dst.k = src.k;
+}
+
+// The exact arm for sequence v (trait_decode_batched_conv_gdn_exact.rs,
+// FP32 conv, no fused verify conv on this target).
+static void verify_chain(const GdnKernels& k, const GdnShape& s, const GdnWeights& w, VerifySeq& v,
+                         GdnIo& io) {
+    const u32 cd = conv_dim(s), key_dim = s.nk * D;
+    const u32 one = 1, dconv = DCONV, qk = 2 * key_dim, d = D;
+    const float l2 = 1e-6f, eps = 1e-6f;
+    for (u32 t = 0; t < v.k; t++) {
+        const size_t row = v.row0 + t;
+        bf* qkv = io.qkvz.p + row * qkvz_dim(s);
+        float* gates = io.gates.p + row * 2 * s.nv;
+        float* conv_out = io.conv_out.p;
+        float* gdn_out = conv_out + cd;
+        { Args a; a.add(v.st.conv.p).add(qkv).add(w.conv_w.p).add((const float*)nullptr).add(conv_out)
+              .add(one).add(cd).add(dconv).add(qk).add(d).add(l2);
+          launch(k.conv, dim3((cd + 255) / 256), dim3(256), 0, a, g_s); }
+        if (t + 1 < v.k)
+            CK(cudaMemcpyAsync(v.conv_snap[t].p, v.st.conv.p, v.st.conv.n * 4, cudaMemcpyDeviceToDevice, g_s));
+        { Args a; a.add(v.st.h.p).add(conv_out).add(conv_out + key_dim).add(conv_out + 2 * key_dim)
+              .add(gates).add(gates + s.nv).add(gdn_out).add(one).add(s.nk).add(s.nv).add(d).add(d);
+          launch(k.rec, dim3(s.nv), dim3(128), 0, a, g_s); }
+        { Args a; a.add(gdn_out).add(qkv + cd).add(w.norm_w.p).add(io.out.p + row * s.nv * D)
+              .add(d).add(eps).add(d).add(d);
+          launch(k.norm, dim3(s.nv), dim3(128), 0, a, g_s); }
+        if (t + 1 < v.k)
+            CK(cudaMemcpyAsync(v.h_snap[t].p, v.st.h.p, v.st.h.n * 4, cudaMemcpyDeviceToDevice, g_s));
+    }
+}
+
+struct VerifyRowsArg {
+    struct {
+        float* h; float* conv; float* h_snap[KMAX - 1]; float* conv_snap[KMAX - 1];
+        u32 row0, k;
+    } seq[ROWS_MAX];
+};
+
+static void verify_rows(CUfunction fn, const GdnShape& s, const GdnWeights& w,
+                        std::vector<VerifySeq>& seqs, GdnIo& io) {
+    const float l2 = 1e-6f, eps = 1e-6f;
+    const u32 d = D, stride = qkvz_dim(s);
+    for (size_t first = 0; first < seqs.size(); first += ROWS_MAX) {
+        const u32 count = (u32)std::min<size_t>(ROWS_MAX, seqs.size() - first);
+        VerifyRowsArg t = {};
+        for (u32 i = 0; i < count; i++) {
+            VerifySeq& v = seqs[first + i];
+            t.seq[i].h = v.st.h.p; t.seq[i].conv = v.st.conv.p;
+            for (u32 j = 0; j + 1 < KMAX; j++) { t.seq[i].h_snap[j] = v.h_snap[j].p; t.seq[i].conv_snap[j] = v.conv_snap[j].p; }
+            t.seq[i].row0 = v.row0; t.seq[i].k = v.k;
+        }
+        Args a;
+        a.add(t).add(io.qkvz.p).add(w.conv_w.p).add(io.gates.p).add(w.norm_w.p).add(io.out.p)
+            .add(s.nk).add(s.nv).add(d).add(stride).add(l2).add(eps);
+        launch(fn, dim3(s.nv, count), dim3(128), 0, a, g_s);
+    }
+}
+
+// Gate / beta rows as the BA kernels leave them: decay in (0, 1], beta in
+// (0, 1), with exact 0 / 1 and out-of-range values mixed in (the recurrence
+// clamps the decay).
+static std::vector<float> gate_rows(size_t n) {
+    std::uniform_real_distribution<float> u(0.0f, 1.0f);
+    std::vector<float> v(n);
+    for (auto& x : v) {
+        const unsigned k = g_rng() % 32;
+        x = k == 0 ? 0.0f : k == 1 ? 1.0f : k == 2 ? 1.5f : u(g_rng);
+    }
+    return v;
+}
+
+static bool verify_check(const GdnShape& s, int steps) {
+    const GdnKernels k = gdn_kernels();
+    CUfunction vk = mod("qwen4exp_decode_fuse").fn("qwen4exp_gdn_verify_fused_rows");
+    GdnWeights w;
+    gdn_weights(s, w);
+    int bad = 0;
+    for (u32 nseq : {1u, 2u, 3u, 5u, 8u, 12u}) {
+        for (int ragged = 0; ragged < 2; ragged++) {
+            std::vector<VerifySeq> a(nseq), b(nseq);
+            u32 rows = 0;
+            for (u32 i = 0; i < nseq; i++) {
+                vseq_alloc(s, a[i], true);
+                vseq_alloc(s, b[i], false);
+                a[i].k = ragged ? 1 + (g_rng() % KMAX) : 2 + (i % (KMAX - 1));
+                a[i].row0 = rows;
+                rows += a[i].k;
+                vseq_copy(b[i], a[i]);
+            }
+            GdnIo ia, ib;
+            gdn_io(s, ia, rows); gdn_io(s, ib, rows);
+            for (int st = 0; st < steps; st++) {
+                auto q = rbf(ia.qkvz.n, st == 0 ? 3.0f : 1.0f);
+                auto g = gate_rows(ia.gates.n);
+                for (GdnIo* io : {&ia, &ib}) { io->qkvz.put(q); io->gates.put(g); io->out.fill(0x7F); }
+                for (auto& v : a) verify_chain(k, s, w, v, ia);
+                verify_rows(vk, s, w, b, ib);
+                CK(cudaDeviceSynchronize());
+                char what[160];
+                snprintf(what, sizeof what, "%s verify n=%u %s step %d: normed rows", s.name, nseq,
+                         ragged ? "ragged" : "k=2..4", st);
+                bad += !same(what, ia.out, ib.out, ia.out.n);
+                for (u32 i = 0; i < nseq; i++) {
+                    snprintf(what, sizeof what, "%s verify n=%u step %d seq %u (k=%u): recurrence", s.name, nseq, st, i, a[i].k);
+                    bad += !same(what, a[i].st.h, b[i].st.h, a[i].st.h.n);
+                    snprintf(what, sizeof what, "%s verify n=%u step %d seq %u (k=%u): conv", s.name, nseq, st, i, a[i].k);
+                    bad += !same(what, a[i].st.conv, b[i].st.conv, a[i].st.conv.n);
+                    for (u32 t = 0; t + 1 < a[i].k; t++) {
+                        snprintf(what, sizeof what, "%s verify n=%u step %d seq %u: h snapshot %u", s.name, nseq, st, i, t);
+                        bad += !same(what, a[i].h_snap[t], b[i].h_snap[t], a[i].h_snap[t].n);
+                        snprintf(what, sizeof what, "%s verify n=%u step %d seq %u: conv snapshot %u", s.name, nseq, st, i, t);
+                        bad += !same(what, a[i].conv_snap[t], b[i].conv_snap[t], a[i].conv_snap[t].n);
+                    }
+                }
+            }
+            for (auto& v : a) vseq_free(v);
+            for (auto& v : b) vseq_free(v);
+            for (GdnIo* io : {&ia, &ib}) {
+                io->ba_in.free_(); io->qkvz.free_(); io->out.free_(); io->gates.free_(); io->conv_out.free_();
+            }
+        }
+    }
+    printf("  %s qwen4exp_gdn_verify_fused_rows %s: n = 1, 2, 3, 5, 8, 12 sequences x k = 2..4 and "
+           "ragged 1..4 x %d steps, every normed row and every recurrence / conv / rollback-slot byte "
+           "equal to the exact arm's per-token chain\n", bad ? "BAD" : "ok ", s.name, steps);
+    return bad == 0;
+}
+
 // ══ timing ═══════════════════════════════════════════════════════════════
 // Median us per layer of `body(layer)` over `layers` distinct layer sets,
 // captured into one CUDA graph (serving replays decode as graphs).
@@ -469,6 +629,40 @@ static void gdn_time(const GdnShape& s) {
     }
 }
 
+static void verify_time(const GdnShape& s) {
+    const GdnKernels k = gdn_kernels();
+    CUfunction vk = mod("qwen4exp_decode_fuse").fn("qwen4exp_gdn_verify_fused_rows");
+    const u32 NMAX = 8;
+    std::vector<GdnWeights> ws(LAYERS);
+    std::vector<std::vector<VerifySeq>> seqs(LAYERS, std::vector<VerifySeq>(NMAX));
+    for (int l = 0; l < LAYERS; l++) {
+        gdn_weights(s, ws[l]);
+        for (auto& v : seqs[l]) vseq_alloc(s, v, true);
+    }
+    GdnIo io;
+    gdn_io(s, io, NMAX * KMAX);
+    io.qkvz.put(rbf(io.qkvz.n, 1.0f));
+    io.gates.put(gate_rows(io.gates.n));
+    printf("\n  GDN exact verify %s, us per layer in a graph (%d layers): per-token chain -> one launch\n",
+           s.name, LAYERS);
+    printf("  %5s", "seqs");
+    for (u32 kk = 2; kk <= KMAX; kk++) printf("  %22s", (std::string("k=") + std::to_string(kk)).c_str());
+    printf("\n");
+    for (u32 n : {1u, 2u, 4u, 8u}) {
+        printf("  %5u", n);
+        for (u32 kk = 2; kk <= KMAX; kk++) {
+            for (auto& L : seqs) for (u32 i = 0; i < NMAX; i++) { L[i].k = kk; L[i].row0 = i * kk; }
+            const double a = graph_us([&](int l) { for (u32 i = 0; i < n; i++) verify_chain(k, s, ws[l], seqs[l][i], io); }, LAYERS);
+            const double b = graph_us([&](int l) {
+                std::vector<VerifySeq> sub(seqs[l].begin(), seqs[l].begin() + n);  // shallow
+                verify_rows(vk, s, ws[l], sub, io);
+            }, LAYERS);
+            printf("  %8.1f -> %6.1f %4.1fx", a, b, a / b);
+        }
+        printf("\n");
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc > 1) g_dir = argv[1];
     const std::string mode = argc > 2 ? argv[2] : "check";
@@ -482,11 +676,14 @@ int main(int argc, char** argv) {
         blend_check();
         gdn_check(tp2, steps);
         gdn_check(tp1, steps);
+        verify_check(tp2, steps);
+        verify_check(tp1, steps);
         printf("%s\n", g_fail ? "FAIL" : "PASS");
         return g_fail ? 1 : 0;
     }
     moe_small_time();
     gdn_time(tp2);
     gdn_time(tp1);
+    verify_time(tp2);
     return 0;
 }
