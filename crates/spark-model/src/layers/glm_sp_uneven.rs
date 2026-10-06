@@ -134,4 +134,4 @@ fn staging(gpu: &dyn GpuBackend, bytes: usize, stream: u64) -> Result<DevicePtr>
 
 #[cfg(test)]
 #[path = "glm_sp_uneven_tests.rs"]
-mod tests;
+pub(crate) mod tests;

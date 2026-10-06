@@ -107,10 +107,11 @@ fn with_ctx<R>(gpu: &MockGpuBackend, comm: &LoopPair, f: impl FnOnce(&ForwardCon
     with_model_ctx(gpu, comm, None, f)
 }
 
-/// [`with_ctx`] with the config's `model_type` replaced.
-fn with_model_ctx<R>(
-    gpu: &MockGpuBackend,
-    comm: &LoopPair,
+/// [`with_ctx`] with the config's `model_type` replaced (any GPU and pair:
+/// the QSA split's GPU test runs it on CUDA).
+pub(crate) fn with_model_ctx<R>(
+    gpu: &dyn GpuBackend,
+    comm: &dyn CommBackend,
     model_type: Option<&str>,
     f: impl FnOnce(&ForwardContext) -> R,
 ) -> R {
@@ -135,7 +136,7 @@ fn with_model_ctx<R>(
         config: &config,
         attn_metadata: None,
         profile: false,
-        comm: Some(comm as &dyn spark_comm::CommBackend),
+        comm: Some(comm),
         graph_capture: false,
         gdn_exact_replay: false,
         token_ids: None,

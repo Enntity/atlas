@@ -356,12 +356,20 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     }),
     // Its slab-pipelined exchanges (gathers; `_RS_PIPE`: the MoE reduce-scatter)
     // move the same rows in pieces: a piecewise rank never pairs a whole one.
-    // `_MIDCHUNK_CKPT` runs a prompt's last chunk as one pass, not two.
+    // `_MIDCHUNK_CKPT` runs a prompt's last chunk as one pass, not two;
+    // `_QSA_SPLIT` swaps QSA block lists the other rank would never send.
     (
-        "ATLAS_QWEN4EXP_PREFILL_SP_PIPE/_RS_PIPE/_MIDCHUNK_CKPT",
+        "ATLAS_QWEN4EXP_PREFILL_SP_PIPE/_RS_PIPE/_MIDCHUNK_CKPT/_QSA_SPLIT",
         || {
-            use crate::layers::{qwen4exp_ckpt as c, qwen4exp_sp_pipe as p};
-            let bits = [p::requested(), p::rs_requested(), c::requested()];
+            use crate::layers::{
+                qsa::qsa_select_sp as q, qwen4exp_ckpt as c, qwen4exp_sp_pipe as p,
+            };
+            let bits = [
+                p::requested(),
+                p::rs_requested(),
+                c::requested(),
+                q::requested(),
+            ];
             Ok(bits.iter().enumerate().map(|(i, &b)| (b as u64) << i).sum())
         },
     ),
