@@ -25,6 +25,9 @@ impl Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<DevicePtr> {
         let o_out = ctx.buffers.norm_output();
+        if self.oproj_reduce_scatter_piped(attn_out, o_out, [n, h, nq * hd], ctx, stream)? {
+            return Ok(o_out);
+        }
         // Keep-packed Q2_0 (Tier-1c): transient-dequant o_proj then dense GEMM.
         if let Some(r) =
             self.try_q2_prefill(ctx, self.o_weight.as_ref(), attn_out, o_out, n, stream)
@@ -402,5 +405,68 @@ impl Qwen3AttentionLayer {
             )?;
         }
         Ok(o_out)
+    }
+}
+
+impl Qwen3AttentionLayer {
+    /// The o_proj by row ranges with the SP reduce-scatter pipelined behind
+    /// it (`ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE`), when the caller offered its
+    /// reduce-scatter (`qwen4exp_sp_pipe::RsOffer`). Only on the `o_fp8` arm
+    /// (`fp8_gemm_t_m128`, row independent at any row ranges:
+    /// `fp8_gemm_m128_rows_are_independent`) and only when the dispatch
+    /// above would take it, so every byte is the unsplit o_proj + reduce-
+    /// scatter's. `Ok(false)`: not taken, nothing launched.
+    fn oproj_reduce_scatter_piped(
+        &self,
+        attn_out: DevicePtr,
+        o_out: DevicePtr,
+        [n, h, kd]: [u32; 3],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        use crate::layers::qwen4exp_sp_pipe as pipe;
+        let Some(sp) = crate::layers::glm_sp::current().filter(|sp| sp.total() == n as usize)
+        else {
+            return Ok(false);
+        };
+        let earlier_arms_skip = self
+            .o_weight
+            .as_ref()
+            .is_none_or(|w| w.as_packed_q2().is_none() && w.as_fp8().is_none())
+            && self.o_fp8w_t.is_none()
+            && !ctx.dispatch.cutlass_nvfp4_attn_o
+            && std::env::var("ATLAS_ATTN_W4A4").is_err();
+        let Some(fp8) = self.o_fp8.filter(|_| n > 128 && earlier_arms_skip) else {
+            return Ok(false);
+        };
+        if !pipe::rs_offered() {
+            return Ok(false);
+        }
+        let (row_in, row_out) = (kd as usize * 2, h as usize * 2);
+        let done = pipe::compute_and_reduce_scatter(
+            sp,
+            o_out,
+            h as usize,
+            ctx,
+            stream,
+            |r0, rows, s| {
+                ops::fp8_gemm_n128_m128(
+                    ctx.gpu,
+                    self.fp8_gemm_t_m128_k,
+                    attn_out.offset(r0 * row_in),
+                    fp8,
+                    o_out.offset(r0 * row_out),
+                    rows as u32,
+                    h,
+                    kd,
+                    s,
+                )
+            },
+            |_| Ok(()),
+        )?;
+        if done {
+            pipe::rs_took();
+        }
+        Ok(done)
     }
 }
