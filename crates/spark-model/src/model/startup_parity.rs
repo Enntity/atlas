@@ -363,6 +363,10 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_BATCH_FAST_CHECK", || {
         Ok(qwen4exp_batch_fast::check_requested() as u64)
     }),
+    // Per-row MoE / GDN arms change the collective count.
+    ("ATLAS_QWEN4EXP_BATCH_FAST_BISECT", || {
+        Ok(qwen4exp_batch_fast::bisect_requested() as u64)
+    }),
     ("ATLAS_SSM_SAVE_DUMP", || {
         Ok(graph_flags::ssm_save_dump() as u64)
     }),

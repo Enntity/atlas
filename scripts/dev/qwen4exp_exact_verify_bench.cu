@@ -307,6 +307,81 @@ static void fp4_gemv(unsigned N, unsigned K, unsigned nh, unsigned hd, const cha
     cudaFree(W.w); cudaFree(W.s);
 }
 
+// The 5..8-row tiers a batched multi-sequence step runs (batch5..8, the
+// strided batch4_os/batch8_os the attention QKV writes with) vs the serial
+// GEMV per row (ATLAS_QWEN4EXP_BATCH_FAST, padded widths 5..8).
+static void fp4_tiers(unsigned N, unsigned K, unsigned nh, unsigned hd, const char* tag) {
+    CUfunction g1 = load("w4a16_gemv", "w4a16_gemv");
+    const char* tiers[] = {"w4a16_gemv_batch5", "w4a16_gemv_batch6", "w4a16_gemv_batch7",
+                           "w4a16_gemv_batch8", "w4a16_gemv_batch16"};
+    Fp4 W = rand_fp4(N, K);
+    for (float sc : SCALES) {
+        auto* A = dput(rand_bf16(8 * (size_t)K, sc));
+        auto* R = (unsigned short*)dzero(8 * (size_t)N * 2);
+        auto* O = (unsigned short*)dzero(16 * (size_t)N * 2 + 4096);
+        for (unsigned r = 0; r < 8; r++) {
+            void* a = A + (size_t)r * K;
+            void* c = R + (size_t)r * N;
+            launch(g1, dim3((N + 3) / 4), dim3(256), {&a, &W.w, &W.s, &W.s2, &c, &N, &K});
+        }
+        auto ref = dget(R, 8 * (size_t)N * 2);
+        char name[160];
+        for (unsigned t = 0; t < 5; t++) {
+            CUfunction f = load("w4a16_gemv", tiers[t]);
+            const unsigned lo = t < 4 ? 5 + t : 5, hi = t < 4 ? 5 + t : 8;
+            for (unsigned M = (t == 3 ? 5 : lo); M <= hi; M++) {
+                CK(cudaMemset(O, 0x55, (size_t)M * N * 2));
+                launch(f, dim3((N + 3) / 4), dim3(256), {&A, &W.w, &W.s, &W.s2, &O, &M, &N, &K});
+                snprintf(name, sizeof name, "%s %s M=%u vs w4a16_gemv x%g", tag, tiers[t], M, sc);
+                report(name, std::vector<unsigned char>(ref.begin(), ref.begin() + M * N * 2),
+                       dget(O, (size_t)M * N * 2), 2);
+            }
+        }
+        // Q+gate: serial decode runs `w4a16_gemv_qg` (one accumulator, the
+        // scale folded into the weight), NOT the scalar template the default
+        // 4+-row QKV arm (`ms_qkv_batchn`) runs then deinterleaves. Shown
+        // here (informational); the exact lanes take `qg_batchN` instead.
+        if (nh) {
+            CUfunction qg = load("w4a16_gemv", "w4a16_gemv_qg");
+            auto* Q = (unsigned short*)dzero(8 * (size_t)N * 2);
+            for (unsigned r = 0; r < 8; r++) {
+                void* a = A + (size_t)r * K;
+                void* c = Q + (size_t)r * N;
+                launch(qg, dim3((N + 3) / 4), dim3(256), {&a, &W.w, &W.s, &W.s2, &c, &N, &K, &nh, &hd});
+            }
+            // Deinterleave the template rows on the host: [Q_h G_h]... -> [Q... | G...].
+            std::vector<unsigned char> de(ref.size());
+            for (unsigned r = 0; r < 8; r++)
+                for (unsigned head = 0; head < nh; head++)
+                    for (unsigned part = 0; part < 2; part++)
+                        memcpy(&de[((size_t)r * N + (size_t)part * nh * hd + (size_t)head * hd) * 2],
+                               &ref[((size_t)r * N + (size_t)(2 * head + part) * hd) * 2], (size_t)hd * 2);
+            snprintf(name, sizeof name, "%s scalar template (batchN/_os) vs w4a16_gemv_qg x%g", tag, sc);
+            report(name, dget(Q, 8 * (size_t)N * 2), de, 2, false);
+            cudaFree(Q);
+        }
+        for (const char* os : {"w4a16_gemv_batch4_os", "w4a16_gemv_batch8_os"}) {
+            const unsigned top = os[16] == '4' ? 4 : 8;
+            CUfunction f = load("w4a16_gemv", os);
+            // Strided rows, as the QKV path writes them (stride > N).
+            const unsigned stride = N + 64;
+            for (unsigned M = (top == 4 ? 2 : 5); M <= top; M++) {
+                CK(cudaMemset(O, 0x55, (size_t)M * stride * 2));
+                launch(f, dim3((N + 3) / 4), dim3(256), {&A, &W.w, &W.s, &W.s2, &O, &M, &N, &K, (void*)&stride});
+                auto got = dget(O, (size_t)M * stride * 2);
+                std::vector<unsigned char> rows;
+                for (unsigned r = 0; r < M; r++)
+                    rows.insert(rows.end(), got.begin() + (size_t)r * stride * 2,
+                                got.begin() + (size_t)r * stride * 2 + (size_t)N * 2);
+                snprintf(name, sizeof name, "%s %s M=%u (strided) vs w4a16_gemv x%g", tag, os, M, sc);
+                report(name, std::vector<unsigned char>(ref.begin(), ref.begin() + M * N * 2), rows, 2);
+            }
+        }
+        cudaFree(A); cudaFree(R); cudaFree(O);
+    }
+    cudaFree(W.w); cudaFree(W.s);
+}
+
 // K/V: serial runs `w4a16_gemv_dual` (one launch, blockIdx.z picks K or V).
 static void fp4_dual(unsigned N, unsigned K, const char* tag) {
     CUfunction d1 = load("w4a16_gemv_fused", "w4a16_gemv_dual");
@@ -497,6 +572,33 @@ static void hc_rows() {
     cudaFree(norm_w); cudaFree(down_w); cudaFree(up_w); cudaFree(inject_w);
 }
 
+// ── mHC: the default chain vs the _vec chain, row by row at T=1 ──
+// A batched step past the _vec kernels' T <= 4 runs the default chain, while
+// single-row decode under ATLAS_QWEN4EXP_HC_FAST runs _vec: the two must be
+// the same bytes for a 5..8-row batch to equal C1.
+static void hc_cross() {
+    void* norm_w = dput(rand_bf16(HCD, 0.3f));
+    void* down_w = dput(rand_bf16((size_t)RANK * HCD, 0.02f));
+    void* up_w = dput(rand_bf16((size_t)RANK * HCD, 0.02f));
+    void* inject_w = dput(rand_bf16((size_t)HC * HCD, 0.02f));
+    for (float sc : SCALES) {
+        float* streams = dput(rand_f32(4 * (size_t)HCD, sc));
+        void* bo = dput(rand_bf16(4 * (size_t)H, sc));
+        for (unsigned r = 0; r < 4; r++) {
+            HcOut d = hc_chain(false, 1, r, streams, norm_w, down_w, up_w, inject_w, bo);
+            HcOut v = hc_chain(true, 1, r, streams, norm_w, down_w, up_w, inject_w, bo);
+            char name[128];
+            snprintf(name, sizeof name, "hc default vs _vec T=1 row %u normed x%g", r, sc); report(name, d.normed, v.normed, 4);
+            snprintf(name, sizeof name, "hc default vs _vec T=1 row %u low x%g", r, sc); report(name, d.low, v.low, 4);
+            snprintf(name, sizeof name, "hc default vs _vec T=1 row %u y x%g", r, sc); report(name, d.y, v.y, 2);
+            snprintf(name, sizeof name, "hc default vs _vec T=1 row %u inj x%g", r, sc); report(name, d.inj, v.inj, 4);
+            snprintf(name, sizeof name, "hc default vs _vec T=1 row %u post x%g", r, sc); report(name, d.post, v.post, 4);
+        }
+        cudaFree(streams); cudaFree(bo);
+    }
+    cudaFree(norm_w); cudaFree(down_w); cudaFree(up_w); cudaFree(inject_w);
+}
+
 // ── BF16 LM head: serial dense_gemv_bf16 rows vs the default K=3/4 head ──
 // `lm_head_batched` on a BF16 head runs the scalar tile GEMM at 3+ rows; the
 // exact verify projects `dense_gemv_bf16_batchm` rows instead (checked in
@@ -610,6 +712,10 @@ int main(int argc, char** argv) {
     fp8_gemv(2560, 3072, "out_proj TP2");
     // Router [512, 2560]; attention Q+gate [24 heads x 256 x 2] and o_proj.
     fp4_gemv(512, 2560, 0, 0, "router");
+    fp4_tiers(512, 2560, 0, 0, "router");
+    fp4_tiers(6144, 2560, 12, 256, "attn q+gate TP2");
+    fp4_tiers(256, 2560, 0, 0, "attn k/v TP2");
+    fp4_tiers(2560, 3072, 0, 0, "attn o_proj TP2");
     fp4_gemv(12288, 2560, 24, 256, "attn q+gate TP1");
     fp4_gemv(6144, 2560, 12, 256, "attn q+gate TP2");
     fp4_gemv(2560, 6144, 0, 0, "attn o_proj TP1");
@@ -618,6 +724,7 @@ int main(int argc, char** argv) {
     bf16_gemm(2560, 2560, "PLE value");
     bf16_gemm(10240, 2560, "PLE key");
     hc_rows();
+    hc_cross();
     head_gemm(4096, 2560);
     printf("%s (%d mismatching comparison%s)\n\nCost:\n", g_fail ? "FAIL" : "PASS", g_fail, g_fail == 1 ? "" : "s");
     // K/V cost is printed inside fp4_dual; GDN here.

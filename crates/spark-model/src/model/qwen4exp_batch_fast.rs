@@ -20,8 +20,8 @@
 //! | GDN qkvz, out_proj (BF16) | `dense_gemv_bf16` | `dense_gemv_bf16_batchm` (<= 8 rows a launch) instead of cuBLASLt | equal |
 //! | GDN qkvz, out_proj (FP8 opt-in) | `w8a16_gemv` | `w8a16_gemv_batch4/16` | equal |
 //! | GDN ba+gates, conv, recurrence, norm | per row | the per-sequence loop (the strided batched recurrence is skipped) | equal |
-//! | attention Q+gate | `w4a16_gemv_qg` | `qg_batch2/3`, `batch4/8_os` | equal |
-//! | attention K/V | `w4a16_gemv_dual` | `w4a16_gemv_batch2/3` per projection (as exact verify), `batch4/8_os` | equal |
+//! | attention Q+gate | `w4a16_gemv_qg` (one accumulator, scale folded in) | `qg_batch2/3/4` in <= 4-row chunks — never the scalar template the default 4+-row arm runs | equal |
+//! | attention K/V | `w4a16_gemv_dual` | `w4a16_gemv_batch2..8` per projection (as exact verify), <= 8 rows a launch | equal |
 //! | QSA select / attention | bs=1 | per row (`qsa_rows.rs`), also for rows of several sequences | equal |
 //! | attention o_proj | `w4a16_gemv_sw` | `w4a16_gemv_batch2..8` | equal |
 //! | MoE router + top-k | `w4a16_gemv_sw`, `moe_topk_softmax` | per row | equal |
@@ -46,6 +46,14 @@
 //! and final hidden rows are kept, the state is put back, and the batched
 //! step's rows are compared byte for byte (`BATCH_FAST_CHECK` lines).
 //!
+//! `ATLAS_QWEN4EXP_BATCH_FAST_BISECT=<mask>` (diagnostic, both ranks) forces
+//! components of a batched step back to one single-row launch per row, as C1
+//! runs them, to find the one a CHECK mismatch comes from: 1 MoE experts per
+//! row, 2 MoE `forward` per row (per-row all-reduce too), 4 mHC collapse one
+//! row a launch, 8 GDN mixer through `ssm_forward` per sequence, 16 attention
+//! Q/K/V and o_proj per row, 32 attention core per row, 64 LM head per row
+//! (`ops::BISECT_*`).
+//!
 //! Refused beside `ATLAS_W4A16_TC=1`: the tensor-core GEMV tiers it selects
 //! are not the scalar GEMV's arithmetic.
 
@@ -57,6 +65,30 @@ use anyhow::{Result, bail};
 pub(crate) fn requested() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_BATCH_FAST").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT=<mask>` (diagnostic, default 0): the
+/// `ops::BISECT_*` components of a batched step forced to one single-row
+/// launch per row, to find which one parts from C1. Read once.
+pub(crate) fn bisect_requested() -> u32 {
+    static MASK: OnceLock<u32> = OnceLock::new();
+    *MASK.get_or_init(|| {
+        parse_mask(
+            std::env::var("ATLAS_QWEN4EXP_BATCH_FAST_BISECT")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// A decimal or `0x` hex mask; anything else (and unset) is 0.
+fn parse_mask(v: Option<&str>) -> u32 {
+    v.map(str::trim)
+        .and_then(|v| {
+            v.strip_prefix("0x")
+                .map_or_else(|| v.parse().ok(), |h| u32::from_str_radix(h, 16).ok())
+        })
+        .unwrap_or(0)
 }
 
 /// `ATLAS_QWEN4EXP_BATCH_FAST_CHECK=1`, read once.
@@ -99,7 +131,15 @@ pub(crate) fn check_active(model_type: &str, lever: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::lever_from;
+    use super::{lever_from, parse_mask};
+
+    #[test]
+    fn bisect_mask_parses_decimal_and_hex() {
+        assert_eq!(parse_mask(None), 0);
+        assert_eq!(parse_mask(Some("16")), 16);
+        assert_eq!(parse_mask(Some(" 0x7f ")), 0x7f);
+        assert_eq!(parse_mask(Some("moe")), 0);
+    }
 
     #[test]
     fn lever_is_qwen4exp_only_and_refuses_tensor_core_gemv_tiers() {

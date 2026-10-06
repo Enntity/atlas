@@ -212,7 +212,7 @@ impl Qwen3SsmLayer {
             n,
             h as u32,
             eps,
-            ctx.levers.qwen4exp_batch_fast,
+            ctx.levers.qwen4exp_hc_rows(),
             stream,
         )?;
         stage!("hc_pre_attn");
@@ -290,7 +290,7 @@ impl Qwen3SsmLayer {
             n,
             h as u32,
             eps,
-            ctx.levers.qwen4exp_batch_fast,
+            ctx.levers.qwen4exp_hc_rows(),
             stream,
         )?;
 

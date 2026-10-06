@@ -49,6 +49,7 @@ impl MoeLayer {
     fn rows_pair_eligible(&self, rows: usize, ctx: &ForwardContext) -> bool {
         let top_k = ctx.config.num_experts_per_tok;
         self.qwen4exp_moe_rows.ready()
+            && !ctx.levers.batch_bisect(ops::BISECT_MOE_ROWS)
             && rows >= 2
             && rows * top_k * 3 * 4 <= 32 * 1024
             && rows * top_k <= ops::QWEN4EXP_MOE_ROWS_MAX_SLOTS
@@ -82,7 +83,10 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<DevicePtr>> {
-        if rows == 0 || !self.forward_rows_eligible(ctx) {
+        if rows == 0
+            || !self.forward_rows_eligible(ctx)
+            || ctx.levers.batch_bisect(ops::BISECT_MOE_FORWARD)
+        {
             return Ok(None);
         }
         let h = ctx.config.hidden_size;

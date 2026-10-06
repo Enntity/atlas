@@ -354,7 +354,7 @@ impl Qwen3AttentionLayer {
                     n as u32,
                     h as u32,
                     eps,
-                    ctx.levers.qwen4exp_batch_fast,
+                    ctx.levers.qwen4exp_hc_rows(),
                     stream,
                 )?;
                 if diag_this {

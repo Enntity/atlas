@@ -287,7 +287,10 @@ pub use kv_cache_glm::*;
 pub use kv_cache_turbok::*;
 pub use marlin_nvfp4::*;
 pub use marlin_nvfp4_pack::marlin_pack_nvfp4;
-pub use model_levers::ModelLevers;
+pub use model_levers::{
+    BISECT_ATTN_PROJ, BISECT_ATTN_ROWS, BISECT_GDN, BISECT_HC, BISECT_HEAD, BISECT_MOE_FORWARD,
+    BISECT_MOE_ROWS, ModelLevers,
+};
 pub use moe_atomic_c4::*;
 pub use moe_expert::*;
 pub use moe_expert_more::*;

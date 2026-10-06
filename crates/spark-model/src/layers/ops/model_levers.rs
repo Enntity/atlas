@@ -96,6 +96,10 @@ pub struct ModelLevers {
     /// `model/qwen4exp_batch_fast.rs`). Set by `TransformerModel::new` for a
     /// qwen4_exp model only.
     pub qwen4exp_batch_fast: bool,
+    /// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` (diagnostic, 0 = off): components of
+    /// the exact batching lane forced back to one single-row launch per row
+    /// (`model/qwen4exp_batch_fast.rs`, `BISECT_*`). Set with the lane.
+    pub qwen4exp_batch_bisect: u32,
 
     // ── LoRA ──
     /// Apply LoRA eagerly at load instead of at each forward.
@@ -140,6 +144,24 @@ pub struct ModelLevers {
     pub drafter: crate::model::drafter_context::DrafterContext,
 }
 
+/// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` bits: each forces one component of a
+/// batched step to single-row launches, one per row, as C1 runs them.
+/// MoE experts per row (`forward_row_local`), the EP reduce still batched.
+pub const BISECT_MOE_ROWS: u32 = 1;
+/// MoE through `forward` per row: per-row experts AND per-row all-reduce.
+pub const BISECT_MOE_FORWARD: u32 = 2;
+/// mHC collapse (`hc_pre`, `hc_head`) one row a launch.
+pub const BISECT_HC: u32 = 4;
+/// GDN mixer through `ssm_forward` per sequence (projections, recurrence,
+/// per-row TP all-reduce), the C1 mixer.
+pub const BISECT_GDN: u32 = 8;
+/// Attention Q/K/V and o_proj: the single-row GEMVs per row.
+pub const BISECT_ATTN_PROJ: u32 = 16;
+/// Attention core: the per-row phase (`qsa_rows.rs`, bs=1 a row).
+pub const BISECT_ATTN_ROWS: u32 = 32;
+/// LM head: `dense_gemv_bf16` per row.
+pub const BISECT_HEAD: u32 = 64;
+
 /// Opt-IN: off unless the variable is exactly `1`.
 fn opt_in(var: &str) -> bool {
     std::env::var(var).ok().as_deref() == Some("1")
@@ -156,6 +178,22 @@ fn opt_in_truthy(var: &str) -> bool {
 }
 
 impl ModelLevers {
+    /// `ATLAS_QWEN4EXP_BATCH_FAST_BISECT` bit `bit` is set (lane on).
+    pub fn batch_bisect(&self, bit: u32) -> bool {
+        self.qwen4exp_batch_fast && self.qwen4exp_batch_bisect & bit != 0
+    }
+
+    /// Rows one launch of a multi-row mHC collapse may take under the exact
+    /// batching lane (0: unchunked, the lane off): the split path's 8, or one
+    /// row a launch under `BISECT_HC`.
+    pub fn qwen4exp_hc_rows(&self) -> u32 {
+        match (self.qwen4exp_batch_fast, self.batch_bisect(BISECT_HC)) {
+            (false, _) => 0,
+            (true, true) => 1,
+            (true, false) => super::HC_SPLIT_MAX_ROWS,
+        }
+    }
+
     /// Resolve from the environment. Called once, when the model is built.
     pub fn from_env() -> Self {
         let lightning_lossless_target = opt_in("ATLAS_LIGHTNING_LOSSLESS_TARGET");
@@ -191,6 +229,7 @@ impl ModelLevers {
             qwen4exp_exact_verify: false,
             qwen4exp_mtp_depth: None,
             qwen4exp_batch_fast: false,
+            qwen4exp_batch_bisect: 0,
             lora_eager: opt_in_truthy("ATLAS_LORA_EAGER"),
             lora_rotate: opt_in_truthy("ATLAS_LORA_ROTATE"),
             k4_diag: opt_in("ATLAS_K4_DIAG"),

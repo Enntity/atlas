@@ -298,7 +298,8 @@ impl TransformerModel {
                     && self.config.model_type == "qwen4_exp"
                     && (batchm_requested()
                         || self.levers.qwen4exp_exact_verify
-                        || self.levers.qwen4exp_batch_fast) =>
+                        || self.levers.qwen4exp_batch_fast)
+                    && !self.levers.batch_bisect(ops::BISECT_HEAD) =>
             {
                 // `DENSE_GEMV_BATCHM_MAX_M` rows a pass over the head.
                 ops::dense_gemv_batchm_chunked(
