@@ -138,7 +138,9 @@ __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0
 
 // C[m][n] = Σ_k A[m][k]·B[n][k], M=64, K=K_DIM, N=NTC*8. A/B row-major bf16 smem;
 // 128 threads = 4 warps (16 M-rows each). NSTRIDE = C row-stride. (SSOT helper.)
-template <int NTC, int NSTRIDE, bool OutBf16>
+// B_KN: B is stored [k][n] (row stride NTC*8) instead of [n][k]; the fragments
+// carry the same values, so C is bit-identical either way.
+template <int NTC, int NSTRIDE, bool OutBf16, bool B_KN = false>
 __device__ __forceinline__ void mma_gram(
     const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B, void* __restrict__ C
 ) {
@@ -164,8 +166,15 @@ __device__ __forceinline__ void mma_gram(
         for (int nt = 0; nt < NTC; nt++) {
             unsigned nc = nt * 8 + grp;
             unsigned k0 = ks + q * 2, k1 = k0 + 8;
-            unsigned b0 = ((unsigned)sB[nc * K_DIM + k0 + 1] << 16) | (unsigned)sB[nc * K_DIM + k0];
-            unsigned b1 = ((unsigned)sB[nc * K_DIM + k1 + 1] << 16) | (unsigned)sB[nc * K_DIM + k1];
+            unsigned b0, b1;
+            if constexpr (B_KN) {
+                constexpr unsigned NB = NTC * 8;
+                b0 = ((unsigned)sB[(k0 + 1) * NB + nc] << 16) | (unsigned)sB[k0 * NB + nc];
+                b1 = ((unsigned)sB[(k1 + 1) * NB + nc] << 16) | (unsigned)sB[k1 * NB + nc];
+            } else {
+                b0 = ((unsigned)sB[nc * K_DIM + k0 + 1] << 16) | (unsigned)sB[nc * K_DIM + k0];
+                b1 = ((unsigned)sB[nc * K_DIM + k1 + 1] << 16) | (unsigned)sB[nc * K_DIM + k1];
+            }
             asm volatile(
                 "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
                 : "=f"(acc[nt][0]), "=f"(acc[nt][1]), "=f"(acc[nt][2]), "=f"(acc[nt][3])
@@ -2211,8 +2220,17 @@ gated_delta_rule_chunk_delta_h_ksplit_vblock8(
 // profile put this kernel at 9.8% of GPU time, the largest single GDN kernel once
 // the vtile spine landed, and it stages 96.5 KB of smem through what used to be
 // only 4 warps. Same grid, same traffic: only the warp count changes.
-extern "C" __global__ void __launch_bounds__(512, 1)
-gated_delta_rule_chunk_fwd_o(
+// WIDE (`gated_delta_rule_chunk_fwd_o_wide`, ATLAS_QWEN4EXP_PREFILL_GDN):
+// * the closing per-(row, column) loop -- ~2,080 serial MACs a column for a
+//   full chunk -- runs on all 512 threads (4 row groups x 128 columns, rows
+//   interleaved for balance) instead of the first 128;
+// * S_c is staged as stored with 16-byte coalesced copies (the default
+//   transposes it element by element, 256 bytes apart across a warp) and
+//   mma_gram reads its fragments [k][v].
+// Every output is the same `t1 + t2`, `t2` summed over l = 0..i in order, on
+// the same MMA results, so the bytes are unchanged.
+template <bool WIDE>
+__device__ __forceinline__ void chunk_fwd_o_body(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ key,
     const float* __restrict__ gate,
@@ -2233,6 +2251,7 @@ gated_delta_rule_chunk_fwd_o(
     const int* __restrict__ cu_chunks,
     unsigned int is_varlen
 ) {
+    (void)gate;
     const unsigned int c = blockIdx.x;
     const unsigned int vh = blockIdx.y;
     const unsigned int b = blockIdx.z;
@@ -2251,8 +2270,8 @@ gated_delta_rule_chunk_fwd_o(
     query += g.tokoff * qk_stride;
     key   += g.tokoff * qk_stride;
 
-    extern __shared__ char smem_raw[];
-    __nv_bfloat16* sq = (__nv_bfloat16*)smem_raw;          // [CHUNK*K_DIM]
+    extern __shared__ char smem_raw_fo[];
+    __nv_bfloat16* sq = (__nv_bfloat16*)smem_raw_fo;          // [CHUNK*K_DIM]
     __nv_bfloat16* sk = sq + CHUNK * K_DIM;                // [CHUNK*K_DIM]
     float* kq = (float*)(sk + CHUNK * K_DIM);              // [CHUNK*CHUNK]
     __nv_bfloat16* ucb = (__nv_bfloat16*)(kq + CHUNK * CHUNK); // [CHUNK*V_DIM]
@@ -2260,25 +2279,56 @@ gated_delta_rule_chunk_fwd_o(
     float* gc = (float*)(Sb + K_DIM * V_DIM);              // [CHUNK]
     float* egc = gc + CHUNK;                               // [CHUNK] exp(gc)
 
-    for (unsigned int idx = tid; idx < CHUNK * k_dim; idx += blockDim.x) {
-        unsigned int i = idx / k_dim, j = idx % k_dim;
-        if (i < ce) {
-            unsigned long long off = (unsigned long long)(cs + i) * qk_stride + kh * k_dim + j;
-            sq[i * K_DIM + j] = query[off];
-            sk[i * K_DIM + j] = key[off];
-        } else {
-            sq[i * K_DIM + j] = __float2bfloat16(0.0f);
-            sk[i * K_DIM + j] = __float2bfloat16(0.0f);
+    if constexpr (WIDE) {
+        // Eight elements a copy (rows are K_DIM / V_DIM wide and 16-byte
+        // aligned: qk_stride, kh * k_dim and the uc rows are multiples of 8).
+        const uint4 zero = make_uint4(0, 0, 0, 0);
+        for (unsigned int idx = tid; idx < CHUNK * K_DIM / 8; idx += blockDim.x) {
+            const unsigned int i = idx / (K_DIM / 8), j = (idx % (K_DIM / 8)) * 8;
+            uint4 qv = zero, kv = zero;
+            if (i < ce) {
+                const unsigned long long off = (unsigned long long)(cs + i) * qk_stride + kh * k_dim + j;
+                qv = *reinterpret_cast<const uint4*>(query + off);
+                kv = *reinterpret_cast<const uint4*>(key + off);
+            }
+            *reinterpret_cast<uint4*>(sq + i * K_DIM + j) = qv;
+            *reinterpret_cast<uint4*>(sk + i * K_DIM + j) = kv;
+        }
+        for (unsigned int idx = tid; idx < CHUNK * V_DIM / 8; idx += blockDim.x) {
+            const unsigned int i = idx / (V_DIM / 8), v = (idx % (V_DIM / 8)) * 8;
+            *reinterpret_cast<uint4*>(ucb + i * V_DIM + v) = (i < ce)
+                ? *reinterpret_cast<const uint4*>(uc_in + base * CHUNK * V_DIM + i * v_dim + v)
+                : zero;
+        }
+    } else {
+        for (unsigned int idx = tid; idx < CHUNK * k_dim; idx += blockDim.x) {
+            unsigned int i = idx / k_dim, j = idx % k_dim;
+            if (i < ce) {
+                unsigned long long off = (unsigned long long)(cs + i) * qk_stride + kh * k_dim + j;
+                sq[i * K_DIM + j] = query[off];
+                sk[i * K_DIM + j] = key[off];
+            } else {
+                sq[i * K_DIM + j] = __float2bfloat16(0.0f);
+                sk[i * K_DIM + j] = __float2bfloat16(0.0f);
+            }
+        }
+        for (unsigned int idx = tid; idx < CHUNK * v_dim; idx += blockDim.x) {
+            unsigned int i = idx / v_dim, v = idx % v_dim;
+            ucb[i * V_DIM + v] = (i < ce) ? uc_in[base * CHUNK * V_DIM + i * v_dim + v] : __float2bfloat16(0.0f);
         }
     }
-    for (unsigned int idx = tid; idx < CHUNK * v_dim; idx += blockDim.x) {
-        unsigned int i = idx / v_dim, v = idx % v_dim;
-        ucb[i * V_DIM + v] = (i < ce) ? uc_in[base * CHUNK * V_DIM + i * v_dim + v] : __float2bfloat16(0.0f);
-    }
     // S_c read TRANSPOSED → Sbᵀ[v][k] = S_c[k][v], so mma_gram(q, Sbᵀ) = <q_i,S_c[:,v]>.
-    for (unsigned int idx = tid; idx < K_DIM * V_DIM; idx += blockDim.x) {
-        unsigned int v = idx / K_DIM, k = idx % K_DIM;
-        Sb[idx] = S_in[base * K_DIM * V_DIM + k * V_DIM + v];
+    // WIDE keeps S_c as stored ([k][v], 16-byte coalesced copies) and has
+    // mma_gram read it [k][n] -- the same fragments, so the same o1.
+    if constexpr (WIDE) {
+        const uint4* src = reinterpret_cast<const uint4*>(S_in + base * K_DIM * V_DIM);
+        uint4* dst = reinterpret_cast<uint4*>(Sb);
+        for (unsigned int idx = tid; idx < K_DIM * V_DIM / 8; idx += blockDim.x) dst[idx] = src[idx];
+    } else {
+        for (unsigned int idx = tid; idx < K_DIM * V_DIM; idx += blockDim.x) {
+            unsigned int v = idx / K_DIM, k = idx % K_DIM;
+            Sb[idx] = S_in[base * K_DIM * V_DIM + k * V_DIM + v];
+        }
     }
     for (unsigned int i = tid; i < ce; i += blockDim.x) {
         float g = gc_in[base * CHUNK + i];
@@ -2300,17 +2350,47 @@ gated_delta_rule_chunk_fwd_o(
 
     // o1[i][v] = <q_i, S_c[:,v]>  on tensor cores (bf16 out → terminal, precision-safe).
     __nv_bfloat16* o1 = sk;                   // [CHUNK*V_DIM] bf16, reuses sk's 16KB
-    if (tid < 128) mma_gram<16, V_DIM, true>(sq, Sb, o1);
+    if (tid < 128) mma_gram<16, V_DIM, true, WIDE>(sq, Sb, o1);
     __syncthreads();
 
-    if (tid < v_dim) {
-        for (unsigned int i = 0; i < ce; i++) {
-            float t1 = egc[i] * (float)o1[i * V_DIM + tid];
+    const unsigned int col = WIDE ? tid % V_DIM : tid;
+    const unsigned int i0 = WIDE ? tid / V_DIM : 0u;
+    const unsigned int istep = WIDE ? blockDim.x / V_DIM : 1u;
+    if (col < v_dim) {
+        for (unsigned int i = i0; i < ce; i += istep) {
+            float t1 = egc[i] * (float)o1[i * V_DIM + col];
             float t2 = 0.0f;
             for (unsigned int l = 0; l <= i; l++)
-                t2 += kq[i * CHUNK + l] * (float)ucb[l * V_DIM + tid];   // pure MAC inner loop
-            output[out_base + (unsigned long long)(cs + i) * num_v_heads * v_dim + tid] =
+                t2 += kq[i * CHUNK + l] * (float)ucb[l * V_DIM + col];   // pure MAC inner loop
+            output[out_base + (unsigned long long)(cs + i) * num_v_heads * v_dim + col] =
                 __float2bfloat16((t1 + t2) * inv_sqrt_d);
         }
     }
+}
+
+#define CHUNK_FWD_O_ARGS                                                              \
+    const __nv_bfloat16* __restrict__ query, const __nv_bfloat16* __restrict__ key,  \
+    const float* __restrict__ gate, const float* __restrict__ gc_in,                 \
+    const __nv_bfloat16* __restrict__ S_in, const __nv_bfloat16* __restrict__ uc_in, \
+    __nv_bfloat16* __restrict__ output, unsigned int batch_size, unsigned int seq_len, \
+    unsigned int num_chunks, unsigned int num_k_heads, unsigned int num_v_heads,     \
+    unsigned int k_dim, unsigned int v_dim, unsigned int qk_stride,                  \
+    unsigned int gb_stride, const int* __restrict__ cu_seqlens,                      \
+    const int* __restrict__ cu_chunks, unsigned int is_varlen
+#define CHUNK_FWD_O_CALL                                                              \
+    (query, key, gate, gc_in, S_in, uc_in, output, batch_size, seq_len, num_chunks,  \
+     num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, gb_stride, cu_seqlens,       \
+     cu_chunks, is_varlen)
+
+extern "C" __global__ void __launch_bounds__(512, 1)
+gated_delta_rule_chunk_fwd_o(CHUNK_FWD_O_ARGS) {
+    chunk_fwd_o_body<false> CHUNK_FWD_O_CALL;
+}
+
+// Same arguments, grid and shared memory; Block: (512) -- every thread works
+// the closing loop (blockDim.x must be a multiple of V_DIM). Requires
+// k_dim == K_DIM, v_dim == V_DIM and qk_stride % 8 == 0 (16-byte copies).
+extern "C" __global__ void __launch_bounds__(512, 1)
+gated_delta_rule_chunk_fwd_o_wide(CHUNK_FWD_O_ARGS) {
+    chunk_fwd_o_body<true> CHUNK_FWD_O_CALL;
 }
