@@ -281,6 +281,110 @@ pub fn gdn_decode_rows(
     Ok(true)
 }
 
+/// Tokens a sequence may bring to `qwen4exp_gdn_verify_fused_rows`
+/// (`QDF_VERIFY_KMAX`).
+pub const GDN_VERIFY_KMAX: usize = 4;
+
+/// One sequence of a verify step: its recurrence and conv state, the rollback
+/// slots for tokens `0..k-1` (`h_snap[t]` / `conv_snap[t]` after token `t`),
+/// and its rows `row0..row0 + k` of the step.
+#[derive(Clone, Copy)]
+pub struct GdnVerifySeq {
+    pub h: DevicePtr,
+    pub conv: DevicePtr,
+    pub h_snap: [DevicePtr; GDN_VERIFY_KMAX - 1],
+    pub conv_snap: [DevicePtr; GDN_VERIFY_KMAX - 1],
+    pub row0: u32,
+    pub k: u32,
+}
+
+/// A verify step's GDN buffers between the projections, rows as in
+/// [`GdnDecodeRows`]; `gates` holds the step's gate rows (the exact arm's
+/// input), `out` receives the normed rows.
+pub struct GdnVerifyRows<'a> {
+    pub seqs: &'a [GdnVerifySeq],
+    pub qkvz: DevicePtr,
+    pub qkvz_stride: u32,
+    pub conv_w: DevicePtr,
+    pub gates: DevicePtr,
+    pub norm_w: DevicePtr,
+    pub out: DevicePtr,
+}
+
+/// `ATLAS_QWEN4EXP_BATCH_SMALL`: the exact MTP verify's per-token GDN chain
+/// (conv, conv rollback copy, recurrence, gated norm, H rollback copy, for
+/// each token of each sequence) as `qwen4exp_gdn_verify_fused_rows` launches
+/// of up to [`GDN_ROWS_MAX`] sequences, every byte the chain writes. Returns
+/// whether it launched; on `false` nothing was launched. The caller checks the
+/// lever and that the exact arm is the four-kernel FP32 one.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_verify_rows(
+    gpu: &dyn GpuBackend,
+    b: &GdnVerifyRows<'_>,
+    nk: u32,
+    nv: u32,
+    kd: u32,
+    vd: u32,
+    d_conv: u32,
+    l2_eps: f32,
+    eps: f32,
+    stream: u64,
+) -> Result<bool> {
+    static K: OnceLock<KernelHandle> = OnceLock::new();
+    let k = *K.get_or_init(|| {
+        crate::layers::try_kernel(
+            gpu,
+            "qwen4exp_decode_fuse",
+            "qwen4exp_gdn_verify_fused_rows",
+        )
+    });
+    let conv_dim = 2 * nk * kd + nv * vd;
+    let fits = k.0 != 0
+        && !b.seqs.is_empty()
+        && gdn_geometry_fits(nk, nv, kd, vd, d_conv, 8)
+        && b.seqs.iter().all(|q| {
+            (1..=GDN_VERIFY_KMAX as u32).contains(&q.k)
+                && aligned(&[q.conv], 16)
+                && aligned(&q.conv_snap[..q.k as usize - 1], 16)
+        })
+        && b.qkvz_stride.is_multiple_of(4)
+        && aligned(&[b.qkvz.offset(conv_dim as usize * 2), b.norm_w, b.out], 8);
+    if !fits {
+        return Ok(false);
+    }
+    // QdfVerifySeq: h, conv, h_snap[3], conv_snap[3], then row0 | k << 32.
+    const WORDS: usize = 3 + 2 * (GDN_VERIFY_KMAX - 1);
+    for seqs in b.seqs.chunks(GDN_ROWS_MAX) {
+        let mut table = [0u64; WORDS * GDN_ROWS_MAX];
+        for (q, w) in seqs.iter().zip(table.chunks_mut(WORDS)) {
+            w[0] = q.h.0;
+            w[1] = q.conv.0;
+            for t in 0..GDN_VERIFY_KMAX - 1 {
+                w[2 + t] = q.h_snap[t].0;
+                w[2 + GDN_VERIFY_KMAX - 1 + t] = q.conv_snap[t].0;
+            }
+            w[WORDS - 1] = u64::from(q.row0) | u64::from(q.k) << 32;
+        }
+        KernelLaunch::new(gpu, k)
+            .grid([nv, seqs.len() as u32, 1])
+            .block([GDN_D, 1, 1])
+            .arg_words(&table)
+            .arg_ptr(b.qkvz)
+            .arg_ptr(b.conv_w)
+            .arg_ptr(b.gates)
+            .arg_ptr(b.norm_w)
+            .arg_ptr(b.out)
+            .arg_u32(nk)
+            .arg_u32(nv)
+            .arg_u32(kd)
+            .arg_u32(b.qkvz_stride)
+            .arg_f32(l2_eps)
+            .arg_f32(eps)
+            .launch(stream)?;
+    }
+    Ok(true)
+}
+
 /// Must match `HC_V_STAGE_SPLIT` and `QHC_MAX_MULT` in hyper_connection.cu.
 const HC_SPLIT: u32 = 8;
 const HC_MAX_MULT: u32 = 8;
