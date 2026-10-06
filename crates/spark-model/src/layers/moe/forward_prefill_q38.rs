@@ -234,6 +234,90 @@ impl MoeLayer {
 
     /// Run the routed gate/up, SiLU and down of a prefill chunk on the q38
     /// kernels when they serve it; `Ok(false)` launched nothing.
+    /// The unpermute + top-k reduce of a q38 chunk: `moe_q38_unpermute_local`
+    /// sums only the routes of this rank's experts (all of them without EP),
+    /// in slot order -- byte-identical to `moe_unpermute_reduce_indexed` over
+    /// zeroed remote rows, without the 1.2 GB of clears a 16K layer needed
+    /// for them (`prepare_ep_prefill_outputs`) and with 16-byte loads (GB10,
+    /// 16000 tokens: 4.19 -> 2.17 ms). `dims` = [hidden, tokens, top_k].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_q38_unpermute(
+        &self,
+        expert_output: DevicePtr,
+        output: DevicePtr,
+        token_to_perm: DevicePtr,
+        topk_ids: DevicePtr,
+        topk_weights: DevicePtr,
+        dims: [u32; 3],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let [hidden, tokens, topk] = dims;
+        let inter = ctx.config.routed_inter_local() as u32;
+        if !hidden.is_multiple_of(8)
+            || hidden / 8 > 1024
+            || topk_ids.is_null()
+            || !self.q38_routed_serves(hidden, inter, ctx)
+        {
+            return Ok(false);
+        }
+        let k = crate::layers::try_kernel(ctx.gpu, "moe_prefill_q38", "moe_q38_unpermute_local");
+        if k.0 == 0 {
+            return Ok(false);
+        }
+        let (start, end) = if ctx.config.ep_world_size > 1 {
+            let (s, e) = ctx.config.local_expert_range();
+            (s as u32, e as u32)
+        } else {
+            (0, ctx.config.num_experts as u32)
+        };
+        KernelLaunch::new(ctx.gpu, k)
+            .grid([tokens, 1, 1])
+            .block([hidden / 8, 1, 1])
+            .arg_ptr(expert_output)
+            .arg_ptr(output)
+            .arg_ptr(token_to_perm)
+            .arg_ptr(topk_ids)
+            .arg_ptr(topk_weights)
+            .arg_u32(hidden)
+            .arg_u32(tokens)
+            .arg_u32(topk)
+            .arg_u32(start)
+            .arg_u32(end)
+            .launch(stream)?;
+        Ok(true)
+    }
+
+    /// Whether the q38 routed chain serves this layer's prefill: the shape the
+    /// default chain it replaces runs (NVFP4 transposed tables, SiLU, no expert
+    /// LoRA, none of the alternative gate/up or down arms). Also read before
+    /// the grid is sized: the q38 kernels stride their row tiles, so they do
+    /// not need the exact per-expert tile count, nor the host round trip
+    /// (`ATLAS_MOE_PREFILL_EXACT_TILES`) that buys it.
+    pub(super) fn q38_routed_serves(&self, h: u32, inter: u32, ctx: &ForwardContext) -> bool {
+        let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref() == Some("1");
+        q38_requested()
+            && ctx.config.model_type == "qwen4_exp"
+            && self.gate_ptrs_t.is_some()
+            && self.up_ptrs_t.is_some()
+            && self.down_ptrs_t.is_some()
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
+            && !self.btile_storage.is_published()
+            && !self.nvfp4_mmq_layout
+            && !self.nvfp4_prequant_moe
+            && !self.gateup_fp4
+            && !self.down_fp4
+            && !self.nvfp4_gate_up_m128
+            && !self.nvfp4_down_m32
+            && !self.gelu_activation
+            && self.lora.is_none()
+            && !fp8_down
+            && !super::forward_prefill_routed::grouped_cutlass_gate_up_enabled()
+            && h.is_multiple_of(128)
+            && inter.is_multiple_of(64)
+            && crate::layers::try_kernel(ctx.gpu, "moe_prefill_q38", "moe_q38_down").0 != 0
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_q38_routed_prefill(
         &self,
@@ -254,26 +338,7 @@ impl MoeLayer {
         else {
             return Ok(false);
         };
-        let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref() == Some("1");
-        let serves = q38_requested()
-            && ctx.config.model_type == "qwen4_exp"
-            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
-            && !self.btile_storage.is_published()
-            && !self.nvfp4_mmq_layout
-            && !self.nvfp4_prequant_moe
-            && !self.gateup_fp4
-            && !self.down_fp4
-            && !self.nvfp4_gate_up_m128
-            && !self.nvfp4_down_m32
-            && !self.gelu_activation
-            && self.lora.is_none()
-            && !fp8_down
-            && !super::forward_prefill_routed::grouped_cutlass_gate_up_enabled()
-            && h.is_multiple_of(128)
-            && inter.is_multiple_of(64)
-            && h.is_multiple_of(32)
-            && inter.is_multiple_of(32);
-        if !serves {
+        if !self.q38_routed_serves(h, inter, ctx) {
             return Ok(false);
         }
         let gpu = ctx.gpu;

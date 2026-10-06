@@ -71,6 +71,11 @@ impl MoeLayer {
         if self.use_sparse_ep_reduce(ctx) && !force_zero {
             return Ok(());
         }
+        // The q38 chain reduces local routes only (`moe_q38_unpermute_local`),
+        // so nothing reads the remote rows these clears exist for.
+        if self.q38_routed_serves(hidden, inter, ctx) && !force_zero {
+            return Ok(());
+        }
         if ctx.comm.is_none() && !force_zero {
             return Ok(());
         }
@@ -106,6 +111,18 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        if self.try_q38_unpermute(
+            expert_output,
+            output,
+            token_to_perm,
+            topk_ids,
+            topk_weights,
+            [hidden, tokens, topk],
+            ctx,
+            stream,
+        )? {
+            return Ok(false);
+        }
         if self.use_sparse_ep_reduce(ctx) {
             let (local_start, local_end) = ctx.config.local_expert_range();
             let (local_start, local_end) = (local_start as u32, local_end as u32);

@@ -87,7 +87,9 @@ impl MoeLayer {
         } && !self.btile_storage.is_published()
             && worst_case_m_tiles > 1
             && !ctx.graph_capture
-            && !self.offsets_unread(n, h, inter);
+            && !self.offsets_unread(n, h, inter)
+            // The q38 chain strides its row tiles: no host round trip needed.
+            && !self.q38_routed_serves(h, inter, ctx);
         // Keep the host copy when exact sizing already paid for it. The
         // CUTLASS grouped path also needs these offsets to build its problem
         // list; copying them again would introduce a second stream-draining

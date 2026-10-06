@@ -483,3 +483,61 @@ extern "C" __global__ void moe_q38_router_dequant(
           (unsigned int)__bfloat16_as_ushort(__float2bfloat16(lo))
         | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(hi)) << 16);
 }
+
+// ── unpermute + top-k weighted reduce, local experts only ──
+// `moe_unpermute_reduce_indexed` (common/moe_permute.cu) sums all top-k routes
+// of a token, `acc += w * float(row[c])` in slot order, and under EP reads
+// the remote experts' rows as zeros -- which is why the default memsets the
+// gate, up and down outputs (1.2 GB a layer at a 16K chunk) before every MoE
+// prefill. This sums only the routes whose expert is in [local_start,
+// local_end), in the same slot order with the same expression. A skipped
+// route would have added `w * +0.0 = +0.0` to an accumulator that is never
+// -0.0 (it starts at +0.0 and a round-to-nearest sum is -0.0 only when both
+// operands are), so the output bytes are identical and the remote rows never
+// need writing. (glm-5.3-flash's `moe_unpermute_reduce_indexed_ep` is the
+// same idea; its 16-byte twin caps top-k at 8, this one takes any top-k.)
+//
+// Eight columns per thread, one 16-byte load per local route.
+// Grid: (num_tokens), Block: (hidden / 8); hidden % 8 == 0.
+extern "C" __global__ void moe_q38_unpermute_local(
+    const __nv_bfloat16* __restrict__ expert_output,  // [rows, hidden]
+    __nv_bfloat16* __restrict__ output,                // [tokens, hidden]
+    const int* __restrict__ token_to_perm,             // [tokens, topk]
+    const int* __restrict__ topk_ids,                  // [tokens, topk]
+    const float* __restrict__ topk_weights,            // [tokens, topk]
+    const unsigned int hidden,
+    const unsigned int num_tokens,
+    const unsigned int topk,
+    const unsigned int local_start,
+    const unsigned int local_end
+) {
+    const unsigned int token = blockIdx.x;
+    const unsigned int c = threadIdx.x * 8u;
+    if (token >= num_tokens || c >= hidden) return;
+    float acc[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = 0.0f;
+    for (unsigned int k = 0; k < topk; ++k) {
+        const unsigned int slot = token * topk + k;
+        const int expert = topk_ids[slot];
+        if (expert < (int)local_start || expert >= (int)local_end) continue;
+        const int perm_row = token_to_perm[slot];
+        const float w = topk_weights[slot];
+        const uint4 raw = *reinterpret_cast<const uint4*>(expert_output + (size_t)perm_row * hidden + c);
+        const unsigned int wd[4] = {raw.x, raw.y, raw.z, raw.w};
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float lo = __bfloat162float(__ushort_as_bfloat16((unsigned short)(wd[j] & 0xFFFFu)));
+            const float hi = __bfloat162float(__ushort_as_bfloat16((unsigned short)(wd[j] >> 16)));
+            acc[2 * j] += w * lo;
+            acc[2 * j + 1] += w * hi;
+        }
+    }
+    uint4 o;
+    unsigned int* ow = reinterpret_cast<unsigned int*>(&o);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+        ow[j] = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[2 * j]))
+              | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc[2 * j + 1])) << 16);
+    *reinterpret_cast<uint4*>(output + (size_t)token * hidden + c) = o;
+}
