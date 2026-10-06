@@ -363,16 +363,13 @@ impl Qwen4ExpMtpHead {
             )?;
         }
         // ── 2. Per-stream projection, every (row, stream) in one weight pass ──
-        ops::dense_gemv_batchm_chunked(
+        self.wide_rows.dense_rows(
             gpu,
             self.dense_gemv_batchm_k,
             self.normed_h,
             &self.module.fc_hidden,
             self.h_streams,
-            rows32,
-            h32,
-            h32,
-            h32,
+            (rows32, h32, h32, h32),
             stream,
         )?;
         // ── 3. Embedding branch from the device token row ──
@@ -397,16 +394,13 @@ impl Qwen4ExpMtpHead {
             eps,
             stream,
         )?;
-        ops::dense_gemv_batchm_chunked(
+        self.wide_rows.dense_rows(
             gpu,
             self.dense_gemv_batchm_k,
             self.normed_e,
             &self.module.fc_embedding,
             self.e_branch,
-            n32,
-            h32,
-            h32,
-            h32,
+            (n32, h32, h32, h32),
             stream,
         )?;
         ops::hc_expand(

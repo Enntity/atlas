@@ -132,6 +132,8 @@ pub struct Qwen4ExpMtpHead {
     // Batched propose (`qwen4exp_mtp_batch.rs`). Optional kernels: a zero
     // handle keeps every batch on the per-sequence path.
     dense_gemv_batchm_k: KernelHandle,
+    /// The lane's 16/32-row tiers for the (row, stream) projections.
+    wide_rows: super::ops::Qwen4ExpWideRows,
     batched_embed_k: KernelHandle,
     argmax_batch_k: KernelHandle,
     argmax_batch_lp_k: KernelHandle,
@@ -223,6 +225,7 @@ impl Qwen4ExpMtpHead {
                 "dense_gemv_bf16_batchm",
                 "dense_gemv_bf16_batchm",
             ),
+            wide_rows: super::ops::Qwen4ExpWideRows::resolve(gpu, "qwen4_exp"),
             batched_embed_k: super::try_kernel(gpu, "embed_from_argmax", "batched_embed"),
             argmax_batch_k: super::try_kernel(gpu, "argmax", "argmax_bf16_batch"),
             argmax_batch_lp_k: super::try_kernel(gpu, "argmax", "argmax_bf16_batch_lp"),
