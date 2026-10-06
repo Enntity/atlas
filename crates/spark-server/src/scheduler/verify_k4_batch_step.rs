@@ -18,6 +18,13 @@
 //! accepted-row hidden stash (Phase 2) MUST complete for every sequence
 //! before ANY sequence's verdict/propose runs (Phase 3).
 //!
+//! A member with `ks[i] == 1` is a DECODE ROW (`mtp_step/one_forward.rs`):
+//! no drafts, its one row is the target token at its position. Its verdict
+//! emits that row's pick (`k4_apply_verdict` with no drafts: nothing to
+//! reject, nothing to trim), and it proposes with the batch in Phase 4 under
+//! the bootstrap's bookkeeping (`adaptive_spec`), so the step carries it
+//! exactly as the bootstrap's own decode forward would have.
+//!
 //! Reachability: only via `step_mtp` Phase B when `ATLAS_MTP_MAX_SEQS > 1`
 //! (default 16 with the ladder) puts >= 2 verify-ready grammarless
 //! sequences holding drafts in one step AND the model says
@@ -36,8 +43,9 @@ pub(super) fn batch_verify_disabled() -> bool {
 }
 
 /// Batched K-row verify for `batch.len() >= 2` sequences. Sequence `i` holds
-/// exactly `ks[i] - 1` pending drafts — RAGGED since D-Cut, uniform without
-/// it. Caller (Phase B in `mtp_step.rs`) guarantees: grammarless, non-DFlash,
+/// exactly `ks[i] - 1` pending drafts — RAGGED since D-Cut and the confidence
+/// stop, uniform without them, none for a decode row (`ks[i] == 1`). Caller
+/// (Phase B in `mtp_step.rs`) guarantees: grammarless, non-DFlash,
 /// `pending_drafts.len() == ks[i]-1`, `Σ ks <= VERIFY_ROW_BUDGET` (128 since
 /// the wave-11 depth-at-width envelope; 64 at the 32:1 rung), batch sorted
 /// deepest-first then by ssm slot (canonical graph key), and
@@ -69,7 +77,7 @@ pub(super) fn step_verify_k4_batched(
     off.push(r_total);
     debug_assert!(
         (2..=32).contains(&n)
-            && ks.iter().all(|k| (2..=4).contains(k))
+            && ks.iter().all(|k| (1..=4).contains(k))
             && r_total <= crate::scheduler::mtp_dcut::VERIFY_ROW_BUDGET
     );
 
@@ -173,7 +181,14 @@ pub(super) fn step_verify_k4_batched(
         // Width-attributed accept telemetry (ATLAS_MTP_ACCEPT_DEBUG). The
         // positional counters above are K=4-shaped and therefore SILENT at
         // the shipped n in [5,8] ladder step (k_drafts == 2); this one is not.
-        crate::scheduler::mtp_accept_debug::record(n, k_drafts, drafts[0] == v[0], num_accepted);
+        if k_drafts > 0 {
+            crate::scheduler::mtp_accept_debug::record(
+                n,
+                k_drafts,
+                drafts[0] == v[0],
+                num_accepted,
+            );
+        }
         let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
             extract_verify_logprobs(model, &v, top_logprobs, off[i])
         } else {
@@ -221,6 +236,9 @@ pub(super) fn step_verify_k4_batched(
     // (greedy accept + rewind arithmetic + emit + trim; propose is DEFERRED
     // so Phase 4 can batch it across sequences — the per-seq drafter forward
     // reads ~850 MB of BF16 drafter weights.)
+    // A decode row whose sequence is adaptively suspended does not propose,
+    // exactly as on the bootstrap path.
+    let mut suspended = vec![false; n];
     for (i, (a, (v, num_accepted, verify_lps))) in
         batch.iter_mut().zip(verdicts.into_iter()).enumerate()
     {
@@ -236,6 +254,12 @@ pub(super) fn step_verify_k4_batched(
             K4Hidden::DeferPropose,
             verify_us,
         );
+        if ks[i] == 1 && !a.finished {
+            // The bootstrap's bookkeeping for its serially decoded token;
+            // `spec_allowed` mutates re-probe state — evaluated exactly once.
+            crate::scheduler::adaptive_spec::tick_serial(a, sched);
+            suspended[i] = !crate::scheduler::adaptive_spec::spec_allowed(a, sched);
+        }
     }
 
     // ── Phase 4: batched cross-sequence propose ──
@@ -253,7 +277,7 @@ pub(super) fn step_verify_k4_batched(
         .record(crate::scheduler::mtp_timing::Phase::Commit, t_verdict);
     let t_propose = Instant::now();
     let pending: Vec<usize> = (0..n)
-        .filter(|&i| !batch[i].finished && batch[i].pending_drafts.is_empty())
+        .filter(|&i| !batch[i].finished && batch[i].pending_drafts.is_empty() && !suspended[i])
         .collect();
     if pending.is_empty() {
         // `_step_timer` records StepTotal on drop — no explicit `step_done`

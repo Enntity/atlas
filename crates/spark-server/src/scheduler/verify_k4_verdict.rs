@@ -143,8 +143,11 @@ pub(super) fn k4_apply_verdict(
         tracing::error!("save_hidden_for_mtp({na}): {e:#}");
         return;
     }
-    if na == nd {
+    if na == nd && nd > 0 {
         // Full-accept branch trims AFTER the hidden save (original order).
+        // A decode row (nd == 0, batched path only) drafted nothing this
+        // step: there is no drafter row to trim, as on the bootstrap path —
+        // the EP worker skips it by the same rule (`ep_worker_apply_verdict`).
         if let Err(e) = model.trim_proposer_state(&mut a.seq, na, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
@@ -183,5 +186,7 @@ pub(super) fn k4_apply_verdict(
             a.seq.seq_len
         );
     }
-    crate::scheduler::verify_k4_step::stats::k4_record_outcome(sched, na, a.seq.seq_len);
+    if nd > 0 {
+        crate::scheduler::verify_k4_step::stats::k4_record_outcome(sched, na, a.seq.seq_len);
+    }
 }
