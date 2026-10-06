@@ -122,3 +122,53 @@ fn fp8_gemm_w2_matches_default_bitwise() {
         }
     }
 }
+
+/// `fp8_gemm_t_m128` (the qwen4_exp attention o_proj, BF16 x FP8) is row
+/// independent: any row ranges, any sizes, give the whole GEMM's bytes --
+/// what `ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE`'s piecewise o_proj relies on.
+#[test]
+#[ignore]
+fn fp8_gemm_m128_rows_are_independent() {
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+        .expect("build with ATLAS_TARGET_MODEL='*'");
+    let gpu =
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
+    let g: &dyn GpuBackend = &gpu;
+    let stream = g.default_stream();
+    let kern = g.kernel("w4a16", "fp8_gemm_t_m128").unwrap();
+    let mut seed = 0x0f_u64;
+    let bf = |x: f32| ((x.to_bits() >> 16) as u16).to_le_bytes().to_vec();
+    let e4m3 = |x: f32| {
+        let b = ((x + 1.0) * 127.5) as u8;
+        vec![if b & 0x7F == 0x7F { b & 0xF0 } else { b }]
+    };
+    let (m, n, k) = (16016usize, 2560usize, 2048usize);
+    let a = up(g, &lcg_bytes(&mut seed, m * k, bf));
+    let b = up(g, &lcg_bytes(&mut seed, n * k, e4m3));
+    let (o1, o2) = (g.alloc(m * n * 2).unwrap(), g.alloc(m * n * 2).unwrap());
+    super::super::fp8_gemm_n128_m128(g, kern, a, b, o1, m as u32, n as u32, k as u32, stream)
+        .unwrap();
+    for (r0, rows) in [(0usize, 77usize), (77, 2048), (2125, 1), (2126, m - 2126)] {
+        super::super::fp8_gemm_n128_m128(
+            g,
+            kern,
+            a.offset(r0 * k * 2),
+            b,
+            o2.offset(r0 * n * 2),
+            rows as u32,
+            n as u32,
+            k as u32,
+            stream,
+        )
+        .unwrap();
+    }
+    g.synchronize(stream).unwrap();
+    let (mut v1, mut v2) = (vec![0u8; m * n * 2], vec![0u8; m * n * 2]);
+    g.copy_d2h(o1, &mut v1).unwrap();
+    g.copy_d2h(o2, &mut v2).unwrap();
+    let diff = v1.iter().zip(&v2).filter(|(x, y)| x != y).count();
+    assert_eq!(
+        diff, 0,
+        "{diff} bytes differ between the row ranges and the whole"
+    );
+}
