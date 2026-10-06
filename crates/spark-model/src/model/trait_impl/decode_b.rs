@@ -186,15 +186,7 @@ impl TransformerModel {
         // 2a. Allocate KV blocks for decode sequences
         for seq in decode_seqs.iter_mut() {
             let blocks_needed = (seq.seq_len / bs) + 1;
-            ensure_blocks_through_decode(
-                seq,
-                blocks_needed - 1,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
         }
 
         // 2b. Allocate KV blocks for prefill sequence

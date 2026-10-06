@@ -30,6 +30,9 @@
 //! re-created empty, exactly like the disk-swap path.
 
 use super::*;
+use spark_model::model::kv_admission::{
+    is_partial_batch_step, is_retryable_refusal_text, kv_admission_refusal,
+};
 
 /// Starvation guard: a resumed victim may not be re-victimized until it has
 /// generated this many NEW tokens. Without it, the freshly resumed (and
@@ -67,7 +70,9 @@ pub(super) fn choose_decode_victim(
     can_spill: bool,
 ) -> Option<usize> {
     let eligible = |a: &ActiveSeq| {
-        a.grammar_state.is_none() && (can_spill || !model.tokens_contain_vision_pad(&a.seq.tokens))
+        !a.finished
+            && a.grammar_state.is_none()
+            && (can_spill || !model.tokens_contain_vision_pad(&a.seq.tokens))
     };
     let pick = |immune_ok: bool| {
         active
@@ -103,7 +108,11 @@ pub(super) fn decode_batch_with_preemption(
             Ok(l) => return Some(l),
             Err(e) => {
                 drop(refs);
-                let victim = if format!("{e:#}").contains("KV cache exhausted") && active.len() > 1
+                // A per-sequence loop that failed after some sequences ran
+                // cannot be retried: they would decode the same token twice.
+                let victim = if format!("{e:#}").contains("KV cache exhausted")
+                    && active.len() > 1
+                    && !is_partial_batch_step(&e)
                 {
                     choose_decode_victim(model, active, spill.is_some())
                 } else {
@@ -115,8 +124,10 @@ pub(super) fn decode_batch_with_preemption(
                     // exits; a head that carried on would block forever in
                     // its next collective while reporting healthy. Exit too,
                     // so clients see the connection drop and a supervisor
-                    // restarts the pair.
-                    if model.is_ep() {
+                    // restarts the pair. An AGREED refusal is the exception:
+                    // every rank rolled the step back and the worker keeps
+                    // serving, so only these requests fail.
+                    if model.is_ep() && kv_admission_refusal(&e).is_none() {
                         eprintln!("EP head step error (peer exits on it too); terminating: {e:#}");
                         crate::ep_peer_lifeline::terminate();
                     }
@@ -140,32 +151,105 @@ pub(super) fn decode_batch_with_preemption(
                 // path a fallback to the eager loop for this step, and the
                 // next step re-sorts. The vacated SSM slot is re-compacted by
                 // `retire_finished_sequences` later this same tick.
-                let v = active.remove(vi);
-                tracing::warn!(
-                    "KV cache exhausted during decode: preempting slot={} \
-                     ({} blocks, {} tokens generated) for later RESUME so the \
-                     other {} sequence(s) can continue",
-                    v.seq.slot_idx,
-                    v.seq.block_table.len(),
-                    v.output_tokens.len(),
-                    active.len(),
-                );
-                match spill.as_deref_mut() {
-                    Some(sp) => match spill_out_sequence(model, v, sp) {
-                        Ok(s) => swapped.push(s),
-                        Err((v, spill_err)) => {
-                            tracing::warn!(
-                                "decode-preempt spill failed ({spill_err:#}); \
-                                 requeuing victim for re-prefill instead"
-                            );
-                            preempted.push(preempt_requeue(model, v));
-                        }
-                    },
-                    None => preempted.push(preempt_requeue(model, v)),
-                }
+                park_victim(model, active, vi, spill.as_deref_mut(), swapped, preempted);
             }
         }
     }
+}
+
+/// Take `active[vi]` out of the batch and park it for a later RESUME:
+/// spilled when a spill pool exists, requeued for re-prefill otherwise.
+fn park_victim(
+    model: &dyn Model,
+    active: &mut Vec<ActiveSeq>,
+    vi: usize,
+    spill: Option<&mut KvSpillManager>,
+    swapped: &mut Vec<SwappedSeq>,
+    preempted: &mut Vec<PreemptedSeq>,
+) {
+    // `remove` (not `swap_remove`) keeps the ascending SSM-slot order the
+    // caller established; see `decode_batch_with_preemption`.
+    let v = active.remove(vi);
+    tracing::warn!(
+        "KV cache exhausted during decode: preempting slot={} \
+         ({} blocks, {} tokens generated) for later RESUME so the \
+         other {} sequence(s) can continue",
+        v.seq.slot_idx,
+        v.seq.block_table.len(),
+        v.output_tokens.len(),
+        active.len(),
+    );
+    match spill {
+        Some(sp) => match spill_out_sequence(model, v, sp) {
+            Ok(s) => swapped.push(s),
+            Err((v, spill_err)) => {
+                tracing::warn!(
+                    "decode-preempt spill failed ({spill_err:#}); \
+                     requeuing victim for re-prefill instead"
+                );
+                preempted.push(preempt_requeue(model, v));
+            }
+        },
+        None => preempted.push(preempt_requeue(model, v)),
+    }
+}
+
+/// The speculative steps (MTP bootstrap, single and batched verify) record a
+/// failed step as an engine error on the sequences it covered. When that
+/// error is an agreed, retryable KV refusal, the step was rolled back on
+/// every rank before its forward pass and the sequences are intact, so
+/// handle it as plain decode does: preempt one victim (resumable) and let
+/// the others retry next tick. A refused sequence is finished, with the
+/// error, only when nothing else can be preempted: a lone sequence that
+/// outgrew the pool. Before agreed refusals the worker exited on its own
+/// allocation failure and took the pair with it.
+pub(super) fn requeue_kv_refusals(
+    model: &dyn Model,
+    active: &mut Vec<ActiveSeq>,
+    spill: Option<&mut KvSpillManager>,
+    swapped: &mut Vec<SwappedSeq>,
+    preempted: &mut Vec<PreemptedSeq>,
+) {
+    let refused: Vec<usize> = active
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| {
+            a.finished
+                && a.engine_error
+                    .as_deref()
+                    .is_some_and(is_retryable_refusal_text)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if refused.is_empty() {
+        return;
+    }
+    for &i in &refused {
+        active[i].finished = false;
+    }
+    let running = active.iter().filter(|a| !a.finished).count();
+    let victim = if running > 1 {
+        choose_decode_victim(model, active, spill.is_some())
+    } else {
+        None
+    };
+    let Some(vi) = victim else {
+        for &i in &refused {
+            let a = &mut active[i];
+            a.finished = true;
+            tracing::warn!(
+                "KV cache exhausted with nothing left to preempt: finishing slot={} \
+                 at {} tokens with an error",
+                a.seq.slot_idx,
+                a.seq.seq_len,
+            );
+        }
+        return;
+    };
+    for &i in &refused {
+        active[i].engine_error = None;
+    }
+    park_victim(model, active, vi, spill, swapped, preempted);
 }
 
 /// Whether to run the `--swap-space` pool. A model that cannot resume a

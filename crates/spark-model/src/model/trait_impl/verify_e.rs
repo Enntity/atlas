@@ -35,7 +35,6 @@ use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
-use super::super::block_mgmt::ensure_blocks_through_decode;
 use super::super::types::TransformerModel;
 use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};
 use crate::layers::ops;
@@ -189,15 +188,7 @@ impl TransformerModel {
         let bs = kv_cache.block_size();
         for (i, seq) in seqs.iter_mut().enumerate() {
             let last_pos = seq.seq_len + ks[i] - 1;
-            ensure_blocks_through_decode(
-                seq,
-                last_pos / bs,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, last_pos / bs, &mut kv_cache, stream)?;
         }
 
         // ATLAS_K4_DIAG=1: stream-sync checkpoint after every layer so an

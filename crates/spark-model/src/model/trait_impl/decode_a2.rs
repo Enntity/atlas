@@ -14,7 +14,7 @@ use anyhow::Result;
 use atlas_core::config::LayerType;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-use super::super::block_mgmt::{ensure_blocks_through_decode, extract_layer_refs};
+use super::super::block_mgmt::extract_layer_refs;
 use super::super::decode_pieces::PieceStep;
 use super::super::types::TransformerModel;
 use crate::layer::{ForwardContext, LayerState, SsmLayerState};
@@ -162,8 +162,12 @@ impl TransformerModel {
                 for i in 0..n {
                     // Under EP each sequence is one single-sequence step on
                     // both ranks (a no-op without a parallel comm).
-                    self.ep_broadcast_cmd_for_seq(seqs[i].slot_idx as u32, tokens[i])?;
-                    self.decode(tokens[i], seqs[i], stream)?;
+                    // Sequences before `i` already ran: an error from here
+                    // on must not be retried as a whole batch.
+                    let partial = |e| crate::model::kv_admission::after_partial_step(e, i, n);
+                    self.ep_broadcast_cmd_for_seq(seqs[i].slot_idx as u32, tokens[i])
+                        .map_err(partial)?;
+                    self.decode(tokens[i], seqs[i], stream).map_err(partial)?;
                     // `decode()` wrote this sequence's logits to row 0.
                     // Pull them to the host before the next `decode()`'s
                     // `zero_all` wipes the buffer. `copy_d2h_on_stream`
@@ -363,15 +367,7 @@ impl TransformerModel {
         let bs = kv_cache.block_size();
         for seq in seqs.iter_mut() {
             let blocks_needed = (seq.seq_len / bs) + 1;
-            ensure_blocks_through_decode(
-                seq,
-                blocks_needed - 1,
-                &mut kv_cache,
-                self.prefix_cache.as_ref(),
-                self.gpu.as_ref(),
-                stream,
-                self.levers.kv_poison,
-            )?;
+            self.reserve_decode_blocks(seq, blocks_needed - 1, &mut kv_cache, stream)?;
         }
 
         // 1d. Upload metadata with fixed stride (active + padding)
