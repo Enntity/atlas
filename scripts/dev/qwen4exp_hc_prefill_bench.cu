@@ -293,6 +293,43 @@ int main(int argc, char** argv) {
         float t = time_ms([&] { lt_gemm(d_n0.p, d_down.p, d_low.p, T, RANK, HCD, false); });
         printf("down GEMM cuBLASLt (splitK=%d)          %.3f ms %6.2f TFLOP/s  bitwise vs base: %zu bytes differ (not used)\n",
                sk, t, gflop / t, d);
+        // Every algorithm the heuristic offers for this shape: the non-split
+        // ones are the candidates a pinned, exact down GEMM could use.
+        cublasLtMatmulDesc_t desc; cublasLtMatrixLayout_t la, lb, ld; cublasLtMatmulPreference_t pref;
+        LT(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+        LT(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof ta));
+        LT(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof tb));
+        LT(cublasLtMatrixLayoutCreate(&la, CUDA_R_16BF, HCD, RANK, HCD));
+        LT(cublasLtMatrixLayoutCreate(&lb, CUDA_R_16BF, HCD, T, HCD));
+        LT(cublasLtMatrixLayoutCreate(&ld, CUDA_R_16BF, RANK, T, RANK));
+        LT(cublasLtMatmulPreferenceCreate(&pref));
+        LT(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &WS, sizeof WS));
+        cublasLtMatmulHeuristicResult_t res[16]; int found = 0;
+        LT(cublasLtMatmulAlgoGetHeuristic(g_lt, desc, la, lb, ld, ld, pref, 16, res, &found));
+        for (int i = 0; i < found; ++i) {
+            int id = 0, tile = 0, splitk = 1, red = 0, stages = 0; size_t sz;
+            cublasLtMatmulAlgoConfigGetAttribute(&res[i].algo, CUBLASLT_ALGO_CONFIG_ID, &id, sizeof id, &sz);
+            cublasLtMatmulAlgoConfigGetAttribute(&res[i].algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof tile, &sz);
+            cublasLtMatmulAlgoConfigGetAttribute(&res[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk, sizeof splitk, &sz);
+            cublasLtMatmulAlgoConfigGetAttribute(&res[i].algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &red, sizeof red, &sz);
+            cublasLtMatmulAlgoConfigGetAttribute(&res[i].algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages, sizeof stages, &sz);
+            const float alpha = 1.f, beta = 0.f;
+            auto go = [&] {
+                LT(cublasLtMatmul(g_lt, desc, &alpha, d_down.p, la, d_n0.p, lb, &beta, d_low.p, ld, d_low.p, ld,
+                                  &res[i].algo, g_ws, WS, 0));
+            };
+            d_low.fill(0x5A);
+            go();
+            CK(cudaDeviceSynchronize());
+            size_t dd = diff_bytes(d_low.get(), base_out);
+            float ta_ms = time_ms(go);
+            printf("  heuristic #%d: algo %d tile %d stages %d splitK %d reduction %d  %.3f ms  bitwise vs base: %zu\n",
+                   i, id, tile, stages, splitk, red, ta_ms, dd);
+        }
+        cublasLtMatmulPreferenceDestroy(pref);
+        cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(ld);
+        cublasLtMatmulDescDestroy(desc);
     }
     printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

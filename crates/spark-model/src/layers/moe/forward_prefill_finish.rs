@@ -182,7 +182,16 @@ impl MoeLayer {
             det.tap("moe_red", reduced, det_rows, row);
             // Add shared expert ONCE after all-reduce (prevents EP doubling)
             if has_shared && !defer_shared_hc && !split {
-                let shared_down_out = ctx.buffers.attn_output();
+                // A `full_shared` split ran the shared expert over every row;
+                // the blend takes this rank's rows of it.
+                let (shared_down_out, shared_in, shared_n) = match sp {
+                    Some(sp) if sp.full_shared => (
+                        sp.local(ctx.buffers.attn_output(), h as usize),
+                        sp.local(input, h as usize),
+                        sp.rows as u32,
+                    ),
+                    _ => (ctx.buffers.attn_output(), shared_in, shared_n),
+                };
                 if use_overlap || overlap_shared_reduce {
                     ctx.gpu.stream_wait_event(stream, self.event_b)?;
                 }

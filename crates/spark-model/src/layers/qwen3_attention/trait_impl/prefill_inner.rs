@@ -549,7 +549,7 @@ impl Qwen3AttentionLayer {
         // Sequence-parallel prefill (`layers::glm_sp`): the seam ops (`n`)
         // run this rank's rows, compacted at row 0 of the highway and
         // `hidden`; attention and the FFN keep every row (`num_tokens`).
-        let sp = crate::layers::glm_sp::current().filter(|sp| num_tokens == 2 * sp.rows);
+        let sp = crate::layers::glm_sp::current().filter(|sp| num_tokens == sp.total());
         let local = |x: DevicePtr| sp.map_or(x, |sp| sp.local(x, ctx.config.hidden_size));
         let n = sp.map_or(num_tokens, |sp| sp.rows) as u32;
         let hc = self.hc.as_ref().unwrap();
@@ -567,8 +567,8 @@ impl Qwen3AttentionLayer {
         let diag_this = diag_all;
 
         anyhow::ensure!(
-            sp.is_none() || !(is_first_layer || is_last_layer),
-            "GLM SP prefill expects KDA first/last layers"
+            sp.is_none() || !(is_first_layer || (is_last_layer && hc.head.is_none())),
+            "SP prefill expects a later first layer and a last layer with an hc_head"
         );
         if is_first_layer {
             ops::qwen4exp_prefill_seam::clear_pending();
@@ -666,7 +666,10 @@ impl Qwen3AttentionLayer {
             // loader's ones-placeholder would NOT make a second RMS an
             // identity. Hand `hc_pre`'s output straight to the block.
             ctx.gpu
-                .copy_d2d_async(hidden, normed, num_tokens * h * 2, stream)?;
+                .copy_d2d_async(hidden, local(normed), n as usize * h * 2, stream)?;
+            if let Some(sp) = sp {
+                sp.all_gather(normed, h, ctx, stream)?;
+            }
         }
 
         // QSA indexer ingest: park this chunk's raw indexer keys (the
@@ -897,7 +900,10 @@ impl Qwen3AttentionLayer {
             // as the attention site's did. There is no
             // `post_attention_layernorm` in the checkpoint.
             ctx.gpu
-                .copy_d2d_async(hidden, normed2, num_tokens * h * 2, stream)?;
+                .copy_d2d_async(hidden, local(normed2), n as usize * h * 2, stream)?;
+            if let Some(sp) = sp {
+                sp.all_gather(normed2, h, ctx, stream)?;
+            }
         }
 
         let dense_out = match sp {
@@ -924,9 +930,10 @@ impl Qwen3AttentionLayer {
         }
 
         // ATLAS_QWEN4EXP_PREFILL_HC: left to the next layer's collapse
-        // (never from the last layer, never under diagnostics or SP).
+        // (never from the last layer, never under diagnostics). Under SP the
+        // pending post holds this rank's rows, which the next layer's
+        // collapse runs on too.
         let deferred = !diag_this
-            && sp.is_none()
             && !is_last_layer
             && ops::qwen4exp_prefill_seam::defer_post(ctx.gpu, hc, dense_out, n, h as u32);
         if !deferred {
@@ -965,13 +972,15 @@ impl Qwen3AttentionLayer {
         }
 
         if is_last_layer && let Some(ref head) = hc.head {
+            // Under SP: this rank's rows of the contracted `hidden`, which
+            // the model all-gathers after the last layer.
             ops::hc_head_site(
                 ctx.gpu,
                 self.hc_head_k,
                 hc_streams,
                 head,
                 hc,
-                hidden,
+                local(hidden),
                 ctx.buffers.hc_lowrank_scratch(),
                 n,
                 h as u32,

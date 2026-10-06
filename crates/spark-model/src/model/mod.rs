@@ -38,6 +38,7 @@ mod glm_long_verify;
 mod glm_prefill_sp;
 mod glm_verify_masks;
 mod glm_vocab_split;
+mod qwen4exp_prefill_sp;
 pub use glm_verify_masks::MASKED_VERIFY;
 pub(crate) use glm_verify_masks::prepare as prepare_glm_verify_masks;
 pub(crate) mod graph_flags;

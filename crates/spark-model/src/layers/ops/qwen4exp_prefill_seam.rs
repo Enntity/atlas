@@ -22,7 +22,11 @@
 //!   part-way is void;
 //! * highway taps (`ATLAS_QWEN4EXP_DUMP`) turn deferral off, so every tap
 //!   still sees the post it always saw;
-//! * only prefill defers; decode never sees a pending post.
+//! * only prefill defers; decode never sees a pending post;
+//! * the layer before a sequence-parallel split never defers ([`NoDefer`]):
+//!   its post covers every row, and the split then keeps only the local
+//!   ones. Inside the split a pending post holds the local rows, which is
+//!   what the next layer's collapse runs on.
 //!
 //! The pending post lives in a thread-local: a forward runs its layers in
 //! order on one thread.
@@ -43,6 +47,31 @@ struct PendingPost {
 
 thread_local! {
     static PENDING: Cell<Option<PendingPost>> = const { Cell::new(None) };
+    static BLOCKED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// While alive, no layer defers its post: the layer before a sequence-
+/// parallel split (`model::qwen4exp_prefill_sp`) posts every row itself,
+/// before the split compacts the highway.
+pub struct NoDefer(());
+
+impl NoDefer {
+    pub fn new() -> Self {
+        BLOCKED.with(|b| b.set(true));
+        Self(())
+    }
+}
+
+impl Default for NoDefer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for NoDefer {
+    fn drop(&mut self) {
+        BLOCKED.with(|b| b.set(false));
+    }
 }
 
 /// Drop any pending post: the first model layer is about to rewrite the
@@ -64,6 +93,7 @@ pub fn defer_post(
         return false;
     };
     if hc.is_last_model_layer
+        || BLOCKED.with(Cell::get)
         || HcVariant::of(hc) != HcVariant::LowRank
         || crate::layers::ple::dump::tapping()
         || prefill_arm(gpu, w, num_tokens, hidden, hc.hc_mult as u32).is_none()

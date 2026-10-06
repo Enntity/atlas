@@ -90,7 +90,7 @@ impl FfnComponent {
         }
     }
 
-    /// Sequence-parallel prefill FFN over a normed `[2 * sp.rows, H]` input
+    /// Sequence-parallel prefill FFN over a normed `[sp.total(), H]` input
     /// (all rows gathered). Returns this rank's `[sp.rows, H]` output rows:
     /// the MoE runs every row and reduce-scatters (`layers::glm_sp`), the
     /// replicated dense FFN runs only the local rows.
@@ -104,7 +104,7 @@ impl FfnComponent {
         let h = ctx.config.hidden_size;
         match self {
             Self::Moe(m) => {
-                m.forward_prefill(normed, 2 * sp.rows, ctx, stream)?;
+                m.forward_prefill(normed, sp.total(), ctx, stream)?;
                 Ok(sp.local(ctx.buffers.moe_output(), h))
             }
             Self::Dense(d) => {
