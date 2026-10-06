@@ -99,6 +99,76 @@ pub struct LogitsContext<'a> {
     pub stats: std::sync::Arc<crate::scheduler::spec_stats::SpecStats>,
 }
 
+/// Everything in a [`LogitsContext`] except the run's scratch, whose
+/// `RefCell`s make the context neither `Send` nor `Sync`. These parts are
+/// `Sync`, so a rayon fan-out can share them and [`bind`](Self::bind) a
+/// worker's own scratch: the same values the serial context carries.
+#[derive(Debug, Clone)]
+pub struct LogitsCtxParts<'a> {
+    pub dumps: &'a crate::scheduler::dumps::RunDumps,
+    pub think_end_token: Option<u32>,
+    pub think_start_token: Option<u32>,
+    pub tool_call_start_token: Option<u32>,
+    pub glm_tool_boundary: Option<u32>,
+    pub limits: crate::scheduler::limits::SchedLimits,
+    pub tool_call_end_token: Option<u32>,
+    pub boundary_mask: Option<std::sync::Arc<[bool]>>,
+    pub mid_word_mask: Option<std::sync::Arc<[bool]>>,
+    pub sampling: SamplingLevers,
+    pub timing: std::sync::Arc<crate::scheduler::mtp_timing::RunTiming>,
+    pub watchdog: crate::scheduler::helpers::WatchdogParams,
+    pub stats: std::sync::Arc<crate::scheduler::spec_stats::SpecStats>,
+}
+
+impl<'a> LogitsContext<'a> {
+    /// This context minus its scratch.
+    pub fn parts(&self) -> LogitsCtxParts<'a> {
+        LogitsCtxParts {
+            dumps: self.dumps,
+            think_end_token: self.think_end_token,
+            think_start_token: self.think_start_token,
+            tool_call_start_token: self.tool_call_start_token,
+            glm_tool_boundary: self.glm_tool_boundary,
+            limits: self.limits,
+            tool_call_end_token: self.tool_call_end_token,
+            boundary_mask: self.boundary_mask.clone(),
+            mid_word_mask: self.mid_word_mask.clone(),
+            sampling: self.sampling,
+            timing: self.timing.clone(),
+            watchdog: self.watchdog,
+            stats: self.stats.clone(),
+        }
+    }
+}
+
+impl<'a> LogitsCtxParts<'a> {
+    /// The context these parts came from, over `scratch`.
+    pub fn bind<'b>(
+        &self,
+        scratch: &'b crate::scheduler::sched_ctx::DecodeScratch,
+    ) -> LogitsContext<'b>
+    where
+        'a: 'b,
+    {
+        LogitsContext {
+            scratch,
+            dumps: self.dumps,
+            think_end_token: self.think_end_token,
+            think_start_token: self.think_start_token,
+            tool_call_start_token: self.tool_call_start_token,
+            glm_tool_boundary: self.glm_tool_boundary,
+            limits: self.limits,
+            tool_call_end_token: self.tool_call_end_token,
+            boundary_mask: self.boundary_mask.clone(),
+            mid_word_mask: self.mid_word_mask.clone(),
+            sampling: self.sampling,
+            timing: self.timing.clone(),
+            watchdog: self.watchdog,
+            stats: self.stats.clone(),
+        }
+    }
+}
+
 /// The subset of `scheduler::levers::SchedLevers` the pre-sample pipeline
 /// reads.
 ///

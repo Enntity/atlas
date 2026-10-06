@@ -12,6 +12,50 @@ pub(super) fn select(
     row_base: usize,
     policy: CopyFailurePolicy,
 ) -> anyhow::Result<Vec<u32>> {
+    if let Some(picks) = fast(model, argmax_ids, a, ctx, row_base, policy)? {
+        return Ok(picks);
+    }
+    let k = argmax_ids.len();
+    let vocab = model.vocab_size();
+    let mut buf = super::HostRows::take(&ctx.scratch.host_bytes, k * vocab * 2);
+    if let Err(error) = copy_rows(model, row_base, ctx, &mut buf) {
+        return match policy {
+            CopyFailurePolicy::LegacyFallback => Ok(argmax_ids.to_vec()),
+            CopyFailurePolicy::Propagate => Err(error),
+        };
+    }
+    Ok(slow(&buf, k, vocab, a, ctx))
+}
+
+/// D2H of a span's `[K, vocab]` BF16 rows starting at `row_base` into `buf`
+/// (sized by the caller), timed as the D2h phase.
+pub(super) fn copy_rows(
+    model: &dyn Model,
+    row_base: usize,
+    ctx: &LogitsContext,
+    buf: &mut [u8],
+) -> anyhow::Result<()> {
+    let vocab = model.vocab_size();
+    let t_d2h = std::time::Instant::now();
+    // BF16 always for verify path: `decode_verify_graphed_*` writes BF16
+    // to `logits_buffer()`. The FP32-lm_head path (Gemma-4 dense) does
+    // not go through verify (no MTP for dense Gemma).
+    model.copy_logits_to_host(model.logits_buffer_ptr().offset(row_base * vocab * 2), buf)?;
+    ctx.timing
+        .record(crate::scheduler::mtp_timing::Phase::D2h, t_d2h);
+    Ok(())
+}
+
+/// The GPU-argmax arms of [`select`]: `Some(picks)` where one serves the
+/// span, `None` where the host pipeline must ([`slow`]).
+pub(super) fn fast(
+    model: &dyn Model,
+    argmax_ids: &[u32],
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+    row_base: usize,
+    policy: CopyFailurePolicy,
+) -> anyhow::Result<Option<Vec<u32>>> {
     anyhow::ensure!(
         policy == CopyFailurePolicy::LegacyFallback || a.grammar_state.is_none(),
         "checked verify selection requires a grammarless request"
@@ -21,7 +65,7 @@ pub(super) fn select(
     crate::scheduler::emit_step::PickEffects::clear(a);
     let k = argmax_ids.len();
     if k == 0 {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     // Both GPU-argmax arms below see the span's starting state only, so they
     // also stand down where the pipeline would act outside `<think>`: the
@@ -45,7 +89,7 @@ pub(super) fn select(
     if let Some(picks) =
         fast_masked::try_chat_fast_path(model, argmax_ids, a, ctx, row_base, policy, masked_verify)?
     {
-        return Ok(picks);
+        return Ok(Some(picks));
     }
 
     // ── FAST PATH (#3, 2026-06-02): on-GPU greedy pick under grammar ──
@@ -172,7 +216,7 @@ pub(super) fn select(
         }
         ctx.timing.record(Phase::FastGreedy, t_fast);
         if all_allowed && fast.len() == k {
-            return Ok(fast); // no D2H, no CPU pipeline — all positions GPU-greedy + grammar-legal
+            return Ok(Some(fast)); // no D2H, no CPU pipeline — all positions GPU-greedy + grammar-legal
         }
         // else: fall through to the slow path (matcher restored above).
     }
@@ -245,32 +289,24 @@ pub(super) fn select(
         }
         ctx.timing.record(Phase::FastGreedy, t_fast);
         if all_immune {
-            return Ok(argmax_ids.to_vec()); // no D2H, no CPU pipeline
+            return Ok(Some(argmax_ids.to_vec())); // no D2H, no CPU pipeline
         }
         // else: some position needs the penalty-aware pipeline — slow path.
     }
 
-    let vocab = model.vocab_size();
-    // BF16 always for verify path: `decode_verify_graphed_*` writes BF16
-    // to `logits_buffer()`. The FP32-lm_head path (Gemma-4 dense) does
-    // not go through verify (no MTP for dense Gemma).
-    let elem_bytes = 2usize;
-    let total = k * vocab * elem_bytes;
-    let t_d2h = std::time::Instant::now();
-    let mut buf = super::HostRows::take(&ctx.scratch.host_bytes, total);
-    if let Err(error) = model.copy_logits_to_host(
-        model
-            .logits_buffer_ptr()
-            .offset(row_base * vocab * elem_bytes),
-        &mut buf,
-    ) {
-        return match policy {
-            CopyFailurePolicy::LegacyFallback => Ok(argmax_ids.to_vec()),
-            CopyFailurePolicy::Propagate => Err(error),
-        };
-    }
-    ctx.timing.record(Phase::D2h, t_d2h);
+    Ok(None)
+}
 
+/// The host pipeline over a span's copied rows (`buf`: `[k, vocab]` BF16).
+/// Reads and writes only `a` (and `ctx`'s shared counters).
+pub(super) fn slow(
+    buf: &[u8],
+    k: usize,
+    vocab: usize,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+) -> Vec<u32> {
+    let elem_bytes = 2usize;
     let mut picks: Vec<u32> = Vec::with_capacity(k);
     // Snapshot the matcher's history depth BEFORE speculative advances so we
     // roll back exactly the ACTUAL advances afterward. BUG#3 (2026-06-02):
@@ -288,9 +324,24 @@ pub(super) fn select(
         a,
         crate::scheduler::emit_step::CommitEnv::of_ctx(ctx),
     );
+    // ATLAS_VERIFY_PICK_PAR: the rows' dequant and F2 sums up front, in
+    // parallel (`prepick`); the loop below is unchanged either way.
+    let mut pre = (super::prepick::enabled() && k > 1).then(|| {
+        let t = std::time::Instant::now();
+        let p =
+            super::prepick::Prepicked::build(buf, k, vocab, super::prepick::f2_may_run(a, ctx, k));
+        ctx.timing
+            .record(crate::scheduler::mtp_timing::Phase::Dequant, t);
+        p
+    });
     for i in 0..k {
-        let slice = &buf[i * vocab * elem_bytes..(i + 1) * vocab * elem_bytes];
-        let pick = verify_pick_with_pipeline(slice, false, vocab, a, ctx);
+        let pick = match pre.as_mut() {
+            Some(p) => p.pick(i, vocab, a, ctx),
+            None => {
+                let slice = &buf[i * vocab * elem_bytes..(i + 1) * vocab * elem_bytes];
+                verify_pick_with_pipeline(slice, false, vocab, a, ctx)
+            }
+        };
         picks.push(pick);
         if !span.pick(a, pick, i + 1 == k) {
             // The pipeline masked with this matcher state, so a refusal means a
@@ -318,5 +369,5 @@ pub(super) fn select(
         }
     }
 
-    Ok(picks)
+    picks
 }
