@@ -8,6 +8,7 @@
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_TC2R=1`      | TP2 QSA attention on tensor cores      | = TP1 tc2, != `_g` |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_LEAN=1`      | TP1 tc2 -> its lean twin (2 CTAs/SM)   | = tc2  |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_GP=1`        | `_g` QSA attention, rescheduled        | = `_g` |
+//! | `ATLAS_QWEN4EXP_PREFILL_BA_ROWS=1`       | GDN BA GEMM + gates, 2 tokens a CTA    | = `dense_gemm_ba_gates_prefill` |
 //! | `ATLAS_QWEN4EXP_PREFILL_QSA_SCORE=1`     | QSA block scorer, 16-byte loads, 2 rows a thread | = `qsa_score_rows_exact` |
 //! | `ATLAS_QWEN4EXP_PREFILL_GDN=1`           | GDN spine over 2 CTAs a head (TP2); wide `chunk_fwd_o` | = `..._pipe`, = `chunk_fwd_o` |
 //! | `ATLAS_QWEN4EXP_PREFILL_HC=1`            | mHC collapse: seam, down, up+mix fused | = default (`qwen4exp_prefill_hc`) |
@@ -330,3 +331,76 @@ pub fn gdn_fwd_o_wide(
     );
     (h.0 != 0).then_some(h)
 }
+
+/// `ATLAS_QWEN4EXP_PREFILL_BA_ROWS=1`.
+fn ba_rows_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_BA_ROWS"))
+}
+
+/// `QBA_TOK` / `QBA_MAX_GROUPS` in `qwen4exp_gdn_prefill.cu`.
+const QBA_TOK: u32 = 2;
+const QBA_MAX_OUTPUTS: u32 = 48;
+
+/// The GDN prefill BA GEMM + gates on `qwen4exp_ba_gates_prefill_rows`: the
+/// default `dense_gemm_ba_gates_prefill`'s lanes, order and transforms for
+/// every output, with two tokens and every output in one CTA (the weight was
+/// re-read from L2 for every token) -- every gate byte identical
+/// (`scripts/dev/qwen4exp_ba_gates_bench.cu`; GB10, 16016 tokens at the TP2
+/// shape: 2.25 -> 0.97 ms). `dims` = [m, n, k, k_stride, gate_stride, nv,
+/// vheads_per_group] as the default takes them; `ptrs` = [input, weight,
+/// a_log, dt_bias, gate_out]. `Ok(false)` launched nothing.
+pub fn try_ba_gates_rows(
+    gpu: &dyn GpuBackend,
+    ptrs: [DevicePtr; 5],
+    dims: [u32; 7],
+    stream: u64,
+) -> Result<bool> {
+    if !ba_rows_requested() {
+        return Ok(false);
+    }
+    launch_ba_gates_rows(gpu, ptrs, dims, stream)
+}
+
+/// [`try_ba_gates_rows`] without the switch.
+pub fn launch_ba_gates_rows(
+    gpu: &dyn GpuBackend,
+    ptrs: [DevicePtr; 5],
+    dims: [u32; 7],
+    stream: u64,
+) -> Result<bool> {
+    let [m, n, k, k_stride, gate_stride, nv, vpg] = dims;
+    if n > QBA_MAX_OUTPUTS || !k.is_multiple_of(8) || m == 0 {
+        return Ok(false);
+    }
+    let kernel = crate::layers::try_kernel(
+        gpu,
+        "qwen4exp_gdn_prefill",
+        "qwen4exp_ba_gates_prefill_rows",
+    );
+    if kernel.0 == 0 {
+        return Ok(false);
+    }
+    let [input, weight, a_log, dt_bias, gate_out] = ptrs;
+    KernelLaunch::new(gpu, kernel)
+        .grid([m.div_ceil(QBA_TOK), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(a_log)
+        .arg_ptr(dt_bias)
+        .arg_ptr(gate_out)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(k_stride)
+        .arg_u32(gate_stride)
+        .arg_u32(nv)
+        .arg_u32(vpg)
+        .launch(stream)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+#[path = "qwen4exp_prefill_gpu_tests.rs"]
+mod gpu_tests;
