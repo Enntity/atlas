@@ -33,7 +33,8 @@ const DRAFT: u32 = 700;
 const DECODED: u32 = 800;
 
 struct Stub {
-    /// Admit decode rows (`ks[i] == 1`), as qwen4_exp's exact lane does.
+    /// Admit decode rows (`ks[i] == 1`), windows of up to 8 rows and a lone
+    /// window past 4 rows, as qwen4_exp's exact lane does.
     decode_rows: bool,
     seen: Mutex<Seen>,
 }
@@ -52,9 +53,11 @@ impl Stub {
 
 impl Model for Stub {
     fn can_batch_verify(&self, ks: &[usize]) -> bool {
-        let min = if self.decode_rows { 1 } else { 2 };
-        (2..=32).contains(&ks.len())
-            && ks.iter().all(|k| (min..=4).contains(k))
+        let (min, max) = if self.decode_rows { (1, 8) } else { (2, 4) };
+        let lone_ok = ks.len() >= 2 || (self.decode_rows && ks.iter().all(|&k| k > 4));
+        (1..=32).contains(&ks.len())
+            && lone_ok
+            && ks.iter().all(|k| (min..=max).contains(k))
             && ks.iter().any(|&k| k >= 2)
     }
     fn decode_verify_batched(
@@ -353,4 +356,91 @@ fn decode_rows_never_make_a_verify_on_their_own() {
     assert!(seen.batched.is_empty());
     assert_eq!(seen.other, vec!["decode_batch"], "the batched bootstrap");
     assert_eq!(active[0].output_tokens, vec![10, DECODED]);
+}
+
+/// A step under `ATLAS_MTP_DYNAMIC_DEPTH` with a 7-draft ceiling.
+fn deep_step(model: &Stub, active: &mut [ActiveSeq]) {
+    let mut levers = crate::scheduler::levers::SchedLevers::defaults();
+    levers.mtp_dynamic_depth = true;
+    let sched = SchedCtx::new(
+        crate::scheduler::vocab_masks::VocabMasks::default(),
+        std::sync::Arc::new(levers),
+        std::sync::Arc::new(crate::scheduler::snapshot::SnapshotCell::default()),
+        crate::scheduler::limits::SchedLimits::NONE,
+        crate::scheduler::helpers::WatchdogParams::default(),
+    );
+    let ctx = sched.verify_logits_ctx(None, None, None, None);
+    step_mtp(model, active, &sched, 7, &ctx, false);
+}
+
+/// Promote a request's dynamic ceiling to `depth` (from the floor 3, +2 a
+/// window at full acceptance).
+fn promote(a: &mut ActiveSeq, windows: usize) {
+    let levers = crate::scheduler::mtp_deep_depth::DepthLevers {
+        adapt: false,
+        deep: true,
+    };
+    for _ in 0..windows {
+        let d = a.mtp_acct.depth_drafts(7, levers);
+        for _ in 0..crate::scheduler::mtp_deep_depth::WINDOW {
+            a.mtp_acct.record_depth_verify(d, d, 7, levers);
+        }
+    }
+}
+
+/// A lone request whose ceiling the controller raised to 5 verifies 6 rows
+/// in ONE batched forward (the only verify serving more than 4 rows), and
+/// refills to its ceiling.
+#[test]
+fn a_lone_deep_window_rides_the_batched_verify() {
+    let model = Stub::new(true);
+    let (mut active, _rx) = seqs(vec![(10, vec![11, 12, 13, 14, 15, 16, 17])]);
+    promote(&mut active[0], 1);
+    deep_step(&model, &mut active);
+    let seen = model.seen.lock().unwrap();
+    assert_eq!(seen.other, Vec::<&str>::new());
+    assert_eq!(
+        seen.batched,
+        vec![(vec![6], vec![10, 11, 12, 13, 14, 15])],
+        "cut to its ceiling of 5 drafts"
+    );
+    assert_eq!(active[0].output_tokens, vec![10, 11, 12, 13, 14, 15, BONUS]);
+    assert_eq!(seen.commits, vec![(6, 6)]);
+}
+
+/// At its floor a lone request keeps the 4-row verify of its own.
+#[test]
+fn a_lone_request_at_the_floor_keeps_its_own_verify() {
+    let model = Stub::new(true);
+    let (mut active, _rx) = seqs(vec![(10, vec![11, 12, 13, 14, 15])]);
+    deep_step(&model, &mut active);
+    let seen = model.seen.lock().unwrap();
+    assert!(seen.batched.is_empty());
+    assert_eq!(seen.other, vec!["verify_k4"]);
+}
+
+/// Each member verifies its own ceiling, and the batch fits the deep row
+/// budget (5 rows a sequence at n=2): 8 + 4 rows trimmed to 6 + 4, which
+/// D-Cut (n <= 8, ratio 0.75) may prune further.
+#[test]
+fn deep_members_verify_their_own_ceiling_within_the_row_budget() {
+    let model = Stub::new(true);
+    let (mut active, _rx) = seqs(vec![
+        (10, vec![11, 12, 13, 14, 15, 16, 17]),
+        (20, vec![21, 22, 23, 24, 25, 26, 27]),
+    ]);
+    promote(&mut active[0], 2); // ceiling 7
+    deep_step(&model, &mut active);
+    let seen = model.seen.lock().unwrap();
+    assert_eq!(seen.other, Vec::<&str>::new());
+    let (ks, _) = &seen.batched[0];
+    assert!(
+        ks.iter().sum::<usize>() <= 10,
+        "the n=2 deep row budget: {ks:?}"
+    );
+    assert!(
+        ks[0] > 4,
+        "the promoted member verifies past 4 rows: {ks:?}"
+    );
+    assert!(ks[1] <= 4, "the floor member stays at its ceiling: {ks:?}");
 }

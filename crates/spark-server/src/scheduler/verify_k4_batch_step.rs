@@ -42,7 +42,9 @@ pub(super) fn batch_verify_disabled() -> bool {
     *CACHED.get_or_init(|| std::env::var("ATLAS_NO_MTP_BATCH_VERIFY").is_ok())
 }
 
-/// Batched K-row verify for `batch.len() >= 2` sequences. Sequence `i` holds
+/// Batched K-row verify for `batch.len() >= 2` sequences, or ONE sequence
+/// verifying more rows than its own 4-row verify serves (the qwen4_exp exact
+/// lane, up to 8 rows). Sequence `i` holds
 /// exactly `ks[i] - 1` pending drafts — RAGGED since D-Cut and the confidence
 /// stop, uniform without them, none for a decode row (`ks[i] == 1`). Caller
 /// (Phase B in `mtp_step.rs`) guarantees: grammarless, non-DFlash,
@@ -55,12 +57,16 @@ pub(super) fn batch_verify_disabled() -> bool {
 /// the pruned one: D-Cut prunes what gets VERIFIED, and must be free to
 /// re-expand a sequence next step, so the drafter always refills to the ladder
 /// depth. The next step's Phase B truncates whatever it does not want.
+/// `ceiling` is the step's configured draft ceiling, the dynamic depth's
+/// bound (`mtp_deep_depth`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn step_verify_k4_batched(
     model: &dyn Model,
     batch: &mut [&mut ActiveSeq],
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     ks: &[usize],
     propose_nd: usize,
+    ceiling: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
 ) {
     let n = batch.len();
@@ -76,8 +82,8 @@ pub(super) fn step_verify_k4_batched(
     let r_total = acc;
     off.push(r_total);
     debug_assert!(
-        (2..=32).contains(&n)
-            && ks.iter().all(|k| (1..=4).contains(k))
+        (1..=32).contains(&n)
+            && ks.iter().all(|k| (1..=8).contains(k))
             && r_total <= crate::scheduler::mtp_dcut::VERIFY_ROW_BUDGET
     );
 
@@ -187,6 +193,17 @@ pub(super) fn step_verify_k4_batched(
                 k_drafts,
                 drafts[0] == v[0],
                 num_accepted,
+            );
+            // Per-position acceptance and the dynamic depth; the n=1 ladders
+            // (`enabled`) keep their single-sequence verifies.
+            a.mtp_acct.record_depth_verify(
+                k_drafts,
+                num_accepted,
+                ceiling,
+                crate::scheduler::mtp_deep_depth::DepthLevers {
+                    adapt: false,
+                    ..sched.levers.depth()
+                },
             );
         }
         let verify_lps = if let Some(top_logprobs) = a.top_logprobs {

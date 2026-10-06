@@ -27,7 +27,8 @@
 //! # v1 scope (deliberate)
 //!
 //! * Every sequence keeps AT LEAST ONE of its drafts. That holds `rows_i` in
-//!   2..=4 for a sequence that drafted — the envelope `can_batch_verify`, the
+//!   2..=4 (2..=8 on qwen4_exp's exact lane under `ATLAS_MTP_DYNAMIC_DEPTH`)
+//!   for a sequence that drafted — the envelope `can_batch_verify`, the
 //!   `gdn_decode_wy{2,3,4}` handles and the SSM intermediates pools were built
 //!   and audited for. D-Cut never prunes a sequence to zero drafts; a
 //!   sequence that arrives WITHOUT drafts (a decode row riding the verify,
@@ -361,8 +362,8 @@ pub(super) fn chunk_ranges(ks: &[usize]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut lo = 0usize;
     while lo < ks.len() {
-        // Derived, not hardcoded: rows <= 4 is ensured by the ladder clamp,
-        // so the division is well-defined and >= 24.
+        // Derived, not hardcoded: rows <= 8 (the exact lane's deep windows,
+        // `mtp_deep_depth`; 4 elsewhere), so the division is >= 16.
         let seq_cap = VERIFY_ROW_BUDGET / ks[lo].max(1);
         let mut hi = lo;
         let mut r = 0usize;
