@@ -153,6 +153,14 @@ pub(super) fn step_verify_k4_batched(
     // Rows for seq i live at row_base = i*rows in the shared logits buffer.
     let mut verdicts: Vec<(Vec<u32>, usize, Vec<crate::api::TokenLogprobs>)> =
         Vec::with_capacity(n);
+    // ATLAS_VERIFY_PICK_PAR: every member's picks first, the host-pipelined
+    // ones in parallel; each is what the per-member call below returns.
+    let mut batch_picks =
+        crate::scheduler::verify_pipeline_helper::pick_batch_applies(verify_ctx, n).then(|| {
+            crate::scheduler::verify_pipeline_helper::verify_pick_batch(
+                model, &results, &off, batch, verify_ctx,
+            )
+        });
     for (i, a) in batch.iter_mut().enumerate() {
         let rows = ks[i];
         let k_drafts = rows - 1;
@@ -160,9 +168,12 @@ pub(super) fn step_verify_k4_batched(
         // Full pre-sample pipeline per verify position, reading this
         // sequence's rows (row_base = i*rows) — same 8-stage semantics as
         // the single-seq MTP path.
-        let processed = crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
-            model, r, a, verify_ctx, off[i],
-        );
+        let processed = match batch_picks.as_mut() {
+            Some(p) => std::mem::take(&mut p[i]),
+            None => crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
+                model, r, a, verify_ctx, off[i],
+            ),
+        };
         let v: Vec<u32> = (0..rows)
             .map(|j| processed.get(j).copied().unwrap_or(r[j]))
             .collect();
