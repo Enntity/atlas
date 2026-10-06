@@ -28,7 +28,8 @@ fn mtp_thinking_eos_waits_for_visible_answer_boundary() {
             "thinking EOS must not end a plain MTP response"
         );
         assert_eq!(a.remaining, 19);
-        assert_eq!(a.output_tokens, vec![10, EOS]);
+        // Discarded as serial decode discards it (`min_tokens_eos_tests`).
+        assert_eq!(a.output_tokens, vec![10]);
         assert!(rx.try_recv().is_err(), "suppressed EOS must not stream");
         emit_token(&mut a, CLOSE, None, &sched);
         assert!(!a.inside_thinking && a.think_ended && !a.finished);

@@ -453,7 +453,9 @@ pub(super) fn emit_token_at_position(
         && ((a.inside_thinking && a.grammar_state.is_some())
             || crate::grammar::grammar_blocks_stop(a.grammar_state.as_mut(), &a.eos_tokens));
     let legacy_suppresses_eos = a.require_tool_call;
-    let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
+    // `tok` is already recorded above; serial decode tests the floor BEFORE
+    // recording (`decode_logits_step`), so count the tokens before this one.
+    let min_tokens_suppresses = a.output_tokens.len().saturating_sub(1) < a.min_tokens;
     let hard_ceiling = hard_ceiling_hit(a.remaining, position, sched.limits.max_seq_len);
     // Native GLM EOS ends the turn, not the reasoning block. The independent
     // grammar-inside-thinking guard above is intentionally unchanged.
@@ -473,6 +475,14 @@ pub(super) fn emit_token_at_position(
     if a.eos_tokens.contains(&tok) && suppress_eos {
         // EOS suppressed: grammar not terminated, legacy tool call not yet seen,
         // or min_tokens not reached. Don't stop — let the model continue generating.
+        // Discarded exactly as serial decode discards it: never in the output,
+        // so it never counts toward the min_tokens floor. Recording it let a
+        // run that keeps predicting its end token fill the floor with end
+        // tokens (depth-3 MTP, min_tokens=384: 184 visible tokens).
+        // `min_tokens_eos_tests`.
+        if a.output_tokens.last() == Some(&tok) {
+            a.output_tokens.pop();
+        }
         return;
     }
     // OPENCODE FIX: see process_decode_logits — same gate. Suppress streaming
