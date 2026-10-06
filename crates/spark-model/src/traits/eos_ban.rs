@@ -23,13 +23,16 @@ impl Default for EosBan {
 }
 
 impl EosBan {
+    /// The ban for a request's `min_tokens` floor. A sequence without end
+    /// tokens (`ignore_eos`) has nothing to ban: no floor, so no verify head
+    /// or drafter excludes the model's end tokens.
     pub fn new(prompt_len: usize, min_tokens: usize, eos_tokens: &[u32]) -> Self {
         let mut ids = [u32::MAX; 4];
         for (slot, &id) in ids.iter_mut().zip(eos_tokens) {
             *slot = id;
         }
         Self {
-            floor: if min_tokens == 0 {
+            floor: if min_tokens == 0 || eos_tokens.is_empty() {
                 0
             } else {
                 prompt_len + min_tokens
@@ -108,6 +111,12 @@ mod eos_ban_tests {
         assert_eq!(ban.row_mask(0, 64), u64::MAX); // all 64 rows below 110
         assert_eq!(EosBan::new(100, 0, &[7]).row_mask(0, 8), 0);
         assert_eq!(EosBan::default().row_mask(0, 8), 0);
+    }
+
+    #[test]
+    fn no_end_tokens_means_no_floor() {
+        // `ignore_eos`: the end tokens are ordinary tokens, min_tokens or not.
+        assert_eq!(EosBan::new(100, 10, &[]), EosBan::default());
     }
 
     #[test]

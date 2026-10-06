@@ -141,6 +141,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             },
             max_tokens,
             min_tokens: req.min_tokens,
+            ignore_eos: req.ignore_eos,
             temperature,
             top_k,
             top_p,

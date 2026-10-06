@@ -316,6 +316,7 @@ pub(super) async fn completions_stream(
         image_pixels: Vec::new(),
         max_tokens: req.max_tokens,
         min_tokens: 0,
+        ignore_eos: req.ignore_eos,
         temperature: p.temperature,
         top_k: p.top_k,
         top_p: p.top_p,

@@ -169,6 +169,7 @@ macro_rules! test_request {
             image_pixels: vec![],
             max_tokens: 600,
             min_tokens: 0,
+            ignore_eos: false,
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,

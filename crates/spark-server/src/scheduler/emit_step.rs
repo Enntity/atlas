@@ -65,8 +65,12 @@ pub(super) fn emit_token_at_position(
     // below and is discarded there, exactly as serial decode discards it
     // (`min_tokens_eos_tests`). Without this the turn ended at the next role
     // header after the answer: depth-3 prose stopped at 182 of 384.
+    //
+    // Only while it is one of this request's end tokens: under `ignore_eos`
+    // it is an ordinary token, as serial decode treats it (`ignore_eos_tests`).
     if let Some(ims) = sched.limits.im_start_hard_stop
         && tok == ims
+        && a.eos_tokens.contains(&tok)
         && a.output_tokens.len() >= a.min_tokens
     {
         // Push the hard-stop token to output_tokens so lifecycle.rs reports
