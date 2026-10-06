@@ -22,6 +22,7 @@
 //   nvcc $F -o $D/moe_prefill_q38.ptx $K/moe_prefill_q38.cu
 //   nvcc $F -o $D/w4a16.ptx $K/w4a16_gemm.cu      # router: the default
 //   nvcc $F -o $D/gemm.ptx $C/dense_gemm_bf16.cu  # router: the q38 arm
+//   nvcc $F -o $D/moe.ptx $C/moe_permute.cu        # unpermute: the default
 //   nvcc -O3 -std=c++17 -o $D/bench scripts/dev/qwen4exp_moe_prefill_bench.cu -lcuda
 //   $D/bench $D [tokens=8192]
 #include "qwen4exp_ptx_harness.h"
@@ -90,6 +91,7 @@ int main(int argc, char** argv) {
     for (auto& p : pop) p = exp(0.8 * nd(rng));
     std::discrete_distribution<int> pick(pop.begin(), pop.end());
     std::vector<std::vector<int>> rows_of(E);
+    std::vector<int> route_ids((size_t)T * TOPK);
     for (unsigned t = 0; t < T; ++t) {
         int chosen[TOPK];
         for (unsigned k = 0; k < TOPK; ++k) {
@@ -98,6 +100,7 @@ int main(int argc, char** argv) {
                 e = pick(rng);
             } while (std::find(chosen, chosen + k, e) != chosen + k);
             chosen[k] = e;
+            route_ids[(size_t)t * TOPK + k] = e;
             if (e < (int)E) rows_of[e].push_back((int)t);
         }
     }
@@ -308,6 +311,59 @@ int main(int argc, char** argv) {
         float ts1 = time_ms(shared_old), ts2 = time_ms(shared_new);
         printf("shared expert: default %.3f ms (%.1f TFLOP/s) -> q38 %.3f ms (%.1f TFLOP/s), %.2fx\n",
                ts1, s_tf / ts1 * 1e3, ts2, s_tf / ts2 * 1e3, ts1 / ts2);
+    }
+    // ── unpermute: dense (remote rows zeroed) vs local-only (remote rows garbage) ──
+    if (have_q38) {
+        PtxModule m_perm;
+        if (m_perm.try_load(dir + "/moe.ptx")) {
+            CUfunction k_dense = m_perm.fn("moe_unpermute_reduce_indexed");
+            CUfunction k_local = m_q38.fn("moe_q38_unpermute_local");
+            const size_t rows = (size_t)T * TOPK;
+            std::vector<unsigned short> eo(rows * H), eo_g(rows * H);
+            std::vector<int> perm(rows);
+            std::vector<float> wts(rows);
+            std::uniform_real_distribution<float> uw(0.01f, 0.3f);
+            for (size_t r = 0; r < rows; ++r) {
+                perm[r] = (int)r;
+                wts[r] = uw(rng);
+                const bool local = route_ids[r] < (int)E;
+                for (unsigned c = 0; c < H; ++c) {
+                    unsigned short v = f2bf(nd(rng));
+                    eo[r * H + c] = local ? v : 0;
+                    eo_g[r * H + c] = local ? v : 0x7F7Fu;   // garbage where unread
+                }
+            }
+            Buf<unsigned short> d_eo, d_eo_g, d_o1, d_o2;
+            Buf<int> d_perm, d_ids;
+            Buf<float> d_w;
+            d_eo.alloc(eo.size()); d_eo.put(eo);
+            d_eo_g.alloc(eo_g.size()); d_eo_g.put(eo_g);
+            d_perm.alloc(rows); d_perm.put(perm);
+            d_ids.alloc(rows); d_ids.put(route_ids);
+            d_w.alloc(rows); d_w.put(wts);
+            d_o1.alloc((size_t)T * H); d_o2.alloc((size_t)T * H);
+            auto dense = [&]() {
+                Args x;
+                x.add(d_eo.p).add(d_o1.p).add(d_perm.p).add(d_w.p).add(H).add(T).add(TOPK);
+                launch(k_dense, dim3(T), dim3(256), 0, x);
+            };
+            auto local = [&]() {
+                Args x;
+                x.add(d_eo_g.p).add(d_o2.p).add(d_perm.p).add(d_ids.p).add(d_w.p)
+                 .add(H).add(T).add(TOPK).add(0u).add(E);
+                launch(k_local, dim3(T), dim3(H / 8), 0, x);
+            };
+            dense();
+            local();
+            CK(cudaDeviceSynchronize());
+            size_t d = diff_bytes(d_o1.get(), d_o2.get());
+            printf("bitwise unpermute (dense over zeroed remote rows vs local-only over garbage): %zu differing bytes\n", d);
+            ok = ok && d == 0;
+            float t1 = time_ms(dense), t2 = time_ms(local);
+            printf("unpermute: dense %.3f ms -> local-only %.3f ms (%.2fx); the dense arm also needs "
+                   "%.0f MB of memsets a layer\n", t1, t2, t1 / t2,
+                   (double)rows * (H + 2 * I) * 2 / 1e6);
+        }
     }
     printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
