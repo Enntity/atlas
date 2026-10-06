@@ -72,6 +72,9 @@ pub struct LogitsContext<'a> {
     pub tool_call_start_token: Option<u32>,
     /// Explicit model/tokenizer-scoped implicit thinking boundary (GLM only).
     pub glm_tool_boundary: Option<u32>,
+    /// The run's hard stops (the verify loop replays the commit rule with
+    /// them between positions).
+    pub limits: crate::scheduler::limits::SchedLimits,
     pub tool_call_end_token: Option<u32>,
     /// `mask[id]` iff token `id` decodes to text ending in a generation
     /// boundary. Vocab-sized and INDEXED BY TOKEN ID, so it is meaningless

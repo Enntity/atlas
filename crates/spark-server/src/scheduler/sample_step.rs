@@ -128,8 +128,7 @@ pub(super) fn effective_min_p(
 ///    per-token `seed` and the base `logit_bias` (`ActiveSeq.logit_bias`,
 ///    cloned) it computed for this step.
 ///  * `Verify` → the MTP verify/bootstrap emission is a penalty-aware
-///    greedy ARGMAX, so callers pass `temperature = 0.0`, `seed = None`,
-///    empty base bias.
+///    greedy ARGMAX: [`verify_penalty_params`].
 pub(super) fn penalty_params_for(
     a: &ActiveSeq,
     kind: PositionKind,
@@ -147,6 +146,13 @@ pub(super) fn penalty_params_for(
     )
 }
 
+/// The params of a verify or bootstrap position: plain decode's at
+/// temperature 0, the request's `logit_bias` included (verify used to drop
+/// it, so a biased request picked differently speculating than decoding).
+pub(super) fn verify_penalty_params(a: &ActiveSeq) -> SamplingParams {
+    penalty_params_for(a, PositionKind::Verify, 0.0, None, a.logit_bias.clone())
+}
+
 /// Shared parameter construction with the already-resolved model floor.
 /// The production wrapper reads its existing boot-installed value; tests can
 /// exercise another model's policy without changing that process-wide value.
@@ -159,13 +165,12 @@ pub(super) fn penalty_params_for_with_floor(
     floor: u32,
 ) -> SamplingParams {
     // `Verify` positions are a penalty-aware greedy ARGMAX, so the contract
-    // is temperature 0.0, no seed, no caller-supplied base bias. Pin it so a
-    // future caller can't silently pass stochastic params on the speculative
-    // path. The A4 floor below is appended for BOTH kinds (intended delta).
+    // is temperature 0.0 and no seed. Pin it so a future caller can't silently
+    // pass stochastic params on the speculative path. The A4 floor below is
+    // appended for BOTH kinds (intended delta).
     debug_assert!(
-        kind != PositionKind::Verify
-            || (temperature == 0.0 && seed.is_none() && base_logit_bias.is_empty()),
-        "Verify positions must pass temperature=0.0, seed=None, empty base bias"
+        kind != PositionKind::Verify || (temperature == 0.0 && seed.is_none()),
+        "Verify positions must pass temperature=0.0, seed=None"
     );
     let in_tool = a.inside_tool_body && !a.inside_thinking;
     let mut logit_bias = base_logit_bias;
