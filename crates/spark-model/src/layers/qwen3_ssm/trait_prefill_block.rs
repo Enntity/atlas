@@ -150,14 +150,7 @@ impl Qwen3SsmLayer {
         let ba_size = ctx.config.ssm_ba_size(); // 64
         let gates_buf = ctx.buffers.ssm_gates();
         let gate_stride = nv * 2; // FP32 elements per token
-        ops::dense_gemm_ba_gates_prefill(
-            ctx.gpu,
-            self.ba_gates_prefill_k,
-            normed,
-            &self.ssm.in_proj_ba,
-            self.ssm.a_log.weight,
-            self.ssm.dt_bias.weight,
-            gates_buf,
+        let dims = [
             k,
             ba_size as u32,
             h as u32,
@@ -165,8 +158,34 @@ impl Qwen3SsmLayer {
             gate_stride as u32,
             nv as u32,
             vpg as u32,
-            stream,
-        )?;
+        ];
+        let ptrs = [
+            normed,
+            self.ssm.in_proj_ba.weight,
+            self.ssm.a_log.weight,
+            self.ssm.dt_bias.weight,
+            gates_buf,
+        ];
+        // ATLAS_QWEN4EXP_PREFILL_BA_ROWS: the same bytes, two tokens a CTA.
+        if !ops::qwen4exp_prefill::try_ba_gates_rows(ctx.gpu, ptrs, dims, stream)? {
+            ops::dense_gemm_ba_gates_prefill(
+                ctx.gpu,
+                self.ba_gates_prefill_k,
+                normed,
+                &self.ssm.in_proj_ba,
+                self.ssm.a_log.weight,
+                self.ssm.dt_bias.weight,
+                gates_buf,
+                k,
+                ba_size as u32,
+                h as u32,
+                h as u32,
+                gate_stride as u32,
+                nv as u32,
+                vpg as u32,
+                stream,
+            )?;
+        }
         // Bisect tap: the gates as the recurrence will read them,
         // [g(nv), beta(nv)] FP32 per token. Everything upstream of the
         // recurrence except these is already verified, so this is the last
