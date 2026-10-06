@@ -180,6 +180,7 @@ sudo install -m 0644 /tmp/libnccl.so "$DEST/libnccl.so"
 # under ATLAS_SKIP_BUILD. Every symbol returns 1 so a real invocation
 # fails-fast; GPU paths are #[ignore]-gated.
 cat > /tmp/libcublaslt_stub.c <<'EOF'
+unsigned long cublasLtGetVersion(void){return 0;}
 int cublasLtCreate(void){return 1;}
 int cublasLtDestroy(void){return 1;}
 int cublasLtMatmul(void){return 1;}
