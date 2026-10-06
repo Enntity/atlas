@@ -133,6 +133,8 @@ impl TransformerModel {
             // `tid2eid[token_id]` per token in this same chunk order.
             self.gpu
                 .copy_h2d_async(token_ids_bytes, self.buffers.token_ids(), stream)?;
+            STAGED_IDS
+                .with(|s| *s.borrow_mut() = host_ids_requested().then(|| chunk_tokens.to_vec()));
             let t_h2d = _tp.elapsed();
             if self.has_ngram_embedding() {
                 // THE chunked-prefill embed. n-gram hashes read behind the
