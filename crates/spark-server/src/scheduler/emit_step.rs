@@ -59,8 +59,15 @@ pub(super) fn emit_token_at_position(
     // (`user` / `assistant` — regular tokens) would stream to the client,
     // poisoning its context and causing the observed multi-turn drift /
     // "file was corrupted" hallucinations in opencode.
+    //
+    // An explicit `min_tokens` floor still wins: below it `<|im_start|>` (an
+    // end token, `tokenizer_runtime`) falls through to the end-token path
+    // below and is discarded there, exactly as serial decode discards it
+    // (`min_tokens_eos_tests`). Without this the turn ended at the next role
+    // header after the answer: depth-3 prose stopped at 182 of 384.
     if let Some(ims) = sched.limits.im_start_hard_stop
         && tok == ims
+        && a.output_tokens.len() >= a.min_tokens
     {
         // Push the hard-stop token to output_tokens so lifecycle.rs reports
         // `finish_reason="stop"` (because `<|im_start|>` is registered in
