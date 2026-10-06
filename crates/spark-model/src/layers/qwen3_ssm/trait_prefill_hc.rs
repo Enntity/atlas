@@ -119,6 +119,7 @@ impl Qwen3SsmLayer {
         let comb = ctx.buffers.hc_comb();
 
         if hc.is_first_model_layer {
+            ops::qwen4exp_prefill_seam::clear_pending();
             ops::hc_expand(
                 ctx.gpu,
                 self.hc_expand_k,
@@ -146,28 +147,55 @@ impl Qwen3SsmLayer {
                 ssm.ple = Some(ple.new_seq_state(ctx.gpu)?);
             }
             let st = ssm.ple.as_mut().expect("just created");
+            // The previous layer's deferred post must land before PLE injects.
+            ops::qwen4exp_prefill_seam::flush_pending(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                streams,
+                post,
+                h as u32,
+                stream,
+            )?;
             ple.forward(st, streams, num_tokens, seq_len_start == 0, ctx, stream)?;
         }
         stage!("ple");
 
         // ── GDN sublayer ──
         // `hidden` is scratch from here on: the highway carries the state
-        // between layers, exactly as on the attention path.
-        ops::hc_pre_site(
+        // between layers, exactly as on the attention path. A post the
+        // previous layer deferred (ATLAS_QWEN4EXP_PREFILL_HC) runs inside
+        // this collapse.
+        if !ops::qwen4exp_prefill_seam::pre_with_pending(
             ctx.gpu,
-            self.hc_pre_k,
-            streams,
-            &hc.attn,
+            self.hc_post_k,
             hc,
+            &hc.attn,
+            streams,
             hidden,
             post,
-            comb,
             ctx.buffers.hc_lowrank_scratch(),
             n,
             h as u32,
             eps,
             stream,
-        )?;
+        )? {
+            ops::hc_pre_site(
+                ctx.gpu,
+                self.hc_pre_k,
+                streams,
+                &hc.attn,
+                hc,
+                hidden,
+                post,
+                comb,
+                ctx.buffers.hc_lowrank_scratch(),
+                n,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
         stage!("hc_pre_attn");
         let hc_dim = hc.hc_mult * h;
         crate::layers::ple::dump::tap_highway(
@@ -280,19 +308,28 @@ impl Qwen3SsmLayer {
         stage!("hc_pre_ffn");
         self.ffn.forward_prefill(hidden, num_tokens, ctx, stream)?;
         stage!("moe");
-        ops::hc_post_site(
+        // ATLAS_QWEN4EXP_PREFILL_HC: left to the next layer's collapse.
+        if !ops::qwen4exp_prefill_seam::defer_post(
             ctx.gpu,
-            self.hc_post_k,
             hc,
             ctx.buffers.moe_output(),
-            streams,
-            post,
-            comb,
-            streams,
             n,
             h as u32,
-            stream,
-        )?;
+        ) {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                ctx.buffers.moe_output(),
+                streams,
+                post,
+                comb,
+                streams,
+                n,
+                h as u32,
+                stream,
+            )?;
+        }
         crate::layers::ple::dump::tap_highway(
             ctx.gpu,
             streams,

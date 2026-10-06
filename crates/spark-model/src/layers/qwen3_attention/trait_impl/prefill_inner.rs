@@ -571,6 +571,7 @@ impl Qwen3AttentionLayer {
             "GLM SP prefill expects KDA first/last layers"
         );
         if is_first_layer {
+            ops::qwen4exp_prefill_seam::clear_pending();
             ops::hc_expand(
                 ctx.gpu,
                 self.hc_expand_k,
@@ -597,8 +598,24 @@ impl Qwen3AttentionLayer {
             stream,
         );
 
-        // ── Attention sublayer ──
-        self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, ctx, stream)?;
+        // ── Attention sublayer ── (with the previous layer's deferred post
+        // fused in, ATLAS_QWEN4EXP_PREFILL_HC)
+        if !ops::qwen4exp_prefill_seam::pre_with_pending(
+            ctx.gpu,
+            self.hc_post_k,
+            hc,
+            &hc.attn,
+            hc_streams,
+            hidden,
+            post,
+            ctx.buffers.hc_lowrank_scratch(),
+            n,
+            h as u32,
+            eps,
+            stream,
+        )? {
+            self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, ctx, stream)?;
+        }
         // ATLAS_GLM_DET_TRACE stages; `det_rows` are the seam (local) rows.
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let det_rows = (sp.map_or(0, |sp| sp.row0), n as usize);
@@ -906,19 +923,27 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
-        ops::hc_post_site(
-            ctx.gpu,
-            self.hc_post_k,
-            hc,
-            dense_out,
-            hc_streams,
-            post,
-            comb,
-            hc_streams,
-            n,
-            h as u32,
-            stream,
-        )?;
+        // ATLAS_QWEN4EXP_PREFILL_HC: left to the next layer's collapse
+        // (never from the last layer, never under diagnostics or SP).
+        let deferred = !diag_this
+            && sp.is_none()
+            && !is_last_layer
+            && ops::qwen4exp_prefill_seam::defer_post(ctx.gpu, hc, dense_out, n, h as u32);
+        if !deferred {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                dense_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                n,
+                h as u32,
+                stream,
+            )?;
+        }
         if diag_this {
             super::diag_norm_f32(
                 ctx.gpu,
