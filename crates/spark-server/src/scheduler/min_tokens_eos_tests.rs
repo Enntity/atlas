@@ -113,3 +113,28 @@ fn repeated_end_tokens_never_fill_the_floor() {
     a = step(a, false, &sched);
     assert!(a.finished, "the floor is met: the end token stops");
 }
+
+#[test]
+fn a_role_boundary_below_the_floor_is_discarded_alike_by_serial_and_mtp() {
+    // `<|im_start|>` is registered as an end token AND as the MTP path's
+    // ChatML hard stop. After the answer's discarded `<|im_end|>` the model
+    // writes the next role header; serial decode discards that `<|im_start|>`
+    // below the floor, and the MTP path used to end the turn on it ("stop"
+    // at 182 of min_tokens=384, depth-3 prose). An explicit floor wins there
+    // too; above it the hard stop is unchanged.
+    let mut sched = SchedCtx::for_test();
+    sched.limits.im_start_hard_stop = Some(END);
+    for (output, floor) in [(3, 5), (4, 5), (5, 5), (3, 0)] {
+        let (s, m) = (
+            step(seq(output, floor), true, &sched),
+            step(seq(output, floor), false, &sched),
+        );
+        let below = output < floor;
+        assert_eq!(m.finished, !below, "mtp at {output}/{floor}");
+        assert_eq!(m.finished, s.finished, "mtp vs serial at {output}/{floor}");
+        if below {
+            assert_eq!(m.output_tokens.len(), output, "discarded, not output");
+            assert_eq!(s.output_tokens.len(), output);
+        }
+    }
+}
