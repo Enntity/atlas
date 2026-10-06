@@ -201,6 +201,9 @@ pub struct RequestAccept {
     depth_k3_accepts: u32,
     shallow_steps_since_probe: u16,
     depth_switches: u16,
+    // Per-request 1..=3-draft controller (`mtp_depth_ladder`), steering a
+    // ceiling of 2 or 3 drafts (qwen4_exp K=2..4).
+    ladder: super::mtp_depth_ladder::DepthLadder,
 }
 
 const SURVIVAL_POSITIONS: usize = 7;
@@ -212,6 +215,7 @@ const DEPTH_REPROBE_STEPS: u16 = 128;
 impl RequestAccept {
     pub fn record_serial(&mut self) {
         self.serial_steps = self.serial_steps.saturating_add(1);
+        self.ladder.note_serial();
     }
 
     /// `emitted` is tokens committed this verify (1 + accepted drafts).
@@ -231,9 +235,15 @@ impl RequestAccept {
     /// Desired proposal depth for a single request.  This controller only
     /// selects the two measured efficient kernels: K=3 (two drafts) and K=5
     /// (four drafts).  Intermediate K=4 was slower than both on GB10.
+    ///
+    /// Under a 2..=3-draft ceiling the same lever arms the 1..=3 ladder
+    /// (`mtp_depth_ladder`: measured per-position survival over measured
+    /// step wall).
     pub fn depth_drafts(&self, max_drafts: usize, enabled: bool) -> usize {
         if enabled && max_drafts >= 4 && self.depth_mode == DEPTH_SHALLOW {
             2
+        } else if enabled && (2..=super::mtp_depth_ladder::MAX_DEPTH).contains(&max_drafts) {
+            self.ladder.drafts(max_drafts)
         } else {
             max_drafts
         }
@@ -255,6 +265,14 @@ impl RequestAccept {
     }
 
     fn record_depth_verify_inner(&mut self, drafts: usize, accepted: usize) {
+        if drafts <= super::mtp_depth_ladder::MAX_DEPTH {
+            self.ladder.record(
+                drafts,
+                accepted,
+                super::mtp_depth_ladder::MAX_DEPTH,
+                std::time::Instant::now(),
+            );
+        }
         if drafts >= 4 {
             self.depth_steps = self.depth_steps.saturating_add(1);
             self.depth_full_accepts = self
@@ -391,7 +409,7 @@ impl RequestAccept {
                 _ if self.depth_mode == DEPTH_SHALLOW => "k3",
                 _ => "k5",
             },
-            self.depth_switches,
+            self.depth_switches.saturating_add(self.ladder.switches),
             survival.join(","),
         )
     }

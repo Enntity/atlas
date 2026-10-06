@@ -158,3 +158,26 @@ fn fixed_two_drafts_report_k3_without_adaptation_or_depth_lift() {
         assert_eq!(a.depth_drafts(2, false), 2);
     }
 }
+
+#[test]
+fn a_two_or_three_draft_ceiling_is_steered_by_the_depth_ladder_only_when_armed() {
+    let mut a = RequestAccept::default();
+    // Unarmed: the ladder is never fed and never consulted.
+    for _ in 0..64 {
+        a.record_depth_verify(3, 0, false);
+    }
+    assert_eq!(a.depth_drafts(3, false), 3);
+    assert_eq!(
+        a.depth_drafts(3, true),
+        3,
+        "an unfed ladder starts at the ceiling"
+    );
+    // Armed at a 2/3-draft ceiling the ladder answers, never above the ceiling;
+    // the GLM K5/K3 controller keeps 4+.
+    for _ in 0..64 {
+        a.record_depth_verify(3, 0, true);
+    }
+    assert!((1..=3).contains(&a.depth_drafts(3, true)));
+    assert!((1..=2).contains(&a.depth_drafts(2, true)));
+    assert_eq!(a.depth_drafts(4, true), 4);
+}

@@ -178,6 +178,18 @@ pub fn step_verify_k2(
         )
     };
     let accepted = drafts[0] == v0;
+    if !dflash_verify_raw_argmax {
+        a.mtp_acct.record_depth_verify(
+            1,
+            usize::from(accepted),
+            sched.levers.mtp_single_depth_adapt,
+        );
+    }
+    // The next propose's depth (`ATLAS_MTP_SINGLE_DEPTH_ADAPT`); `num_drafts`
+    // itself when the lever is off.
+    let next_drafts = a
+        .mtp_acct
+        .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt);
 
     // Extract logprobs from verify logits buffer (K=2 positions) when requested.
     let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
@@ -263,7 +275,7 @@ pub fn step_verify_k2(
         match model.run_mtp_propose_multi(
             v1,
             a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, num_drafts),
+            crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),
@@ -340,7 +352,7 @@ pub fn step_verify_k2(
         match model.run_mtp_propose_multi(
             v0,
             a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, num_drafts),
+            crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),

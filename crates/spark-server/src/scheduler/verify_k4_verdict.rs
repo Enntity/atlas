@@ -37,7 +37,13 @@ pub(super) enum K4Hidden {
 #[inline]
 fn save_hidden(model: &dyn Model, hidden: K4Hidden, na: usize) -> anyhow::Result<()> {
     match hidden {
-        K4Hidden::VerifyRow => model.save_hidden_for_mtp(na, 0),
+        // A drafter reading the PRE-mixer stream highway (qwen4_exp) needs
+        // row `na` staged into row 0 too, as the K=2/3 steppers do, or it
+        // drafts from the first verify row instead of the accepted one. The
+        // stash path restores its stream row in `_from_stash`.
+        K4Hidden::VerifyRow => model
+            .select_mtp_stream_row(na)
+            .and_then(|()| model.save_hidden_for_mtp(na, 0)),
         K4Hidden::Stash(i) => model.save_hidden_for_mtp_from_stash(i, 0),
         // Deferred mode never saves inline (the batched propose reads the
         // stash rows directly; the per-seq fallback re-saves per sequence).
@@ -144,12 +150,20 @@ pub(super) fn k4_apply_verdict(
         }
     }
     if !defer {
+        // Single sequence: the per-request depth controller picks the next
+        // depth (`ATLAS_MTP_SINGLE_DEPTH_ADAPT`); batched rows keep the step's.
+        let next_drafts = if matches!(hidden, K4Hidden::VerifyRow) {
+            a.mtp_acct
+                .depth_drafts(num_drafts, sched.levers.mtp_single_depth_adapt)
+        } else {
+            num_drafts
+        };
         let t_propose = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         match model.run_mtp_propose_multi(
             a.last_token,
             a.seq.seq_len,
-            num_drafts,
+            next_drafts,
             &mut a.seq,
             0,
             _mtp_grammar_mask.as_deref(),
