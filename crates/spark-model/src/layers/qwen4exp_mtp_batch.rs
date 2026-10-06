@@ -13,7 +13,9 @@
 //! Here draft position j runs once for all n rows:
 //!
 //! - the per-stream grouped norm keeps `forward_one`'s launch per (row,
-//!   stream) — it is tiny and per-row identical by construction;
+//!   stream) — it is tiny and per-row identical by construction — or, under
+//!   `ATLAS_QWEN4EXP_MTP_GROUPED_NORM=1`, one `rms_norm_f32_grouped` launch
+//!   whose blocks are those launches' (`stream_norms`);
 //! - `fc_hidden` (n*hc rows), `fc_embedding` and the draft head go through
 //!   `dense_gemv_bf16_batchm` (or the scalar `w4a16_gemv_batch{M}` tiers for
 //!   the NVFP4 head), whose rows are byte-identical to the single-row GEMVs;
@@ -351,22 +353,7 @@ impl Qwen4ExpMtpHead {
         let (h32, rows32, n32) = (h as u32, (n * hc) as u32, n as u32);
 
         // ── 1. Per-stream grouped norm of each row's incoming residual ──
-        for s in 0..n * hc {
-            ops::rms_norm_f32(
-                gpu,
-                self.rms_norm_f32_k,
-                streams.offset(s * h * 4),
-                self.module
-                    .pre_fc_norm_hidden
-                    .weight
-                    .offset((s % hc) * h * 2),
-                self.normed_h.offset(s * h * 2),
-                1,
-                h32,
-                eps,
-                stream,
-            )?;
-        }
+        self.stream_norms(ctx, streams, n * hc, stream)?;
         // ── 2. Per-stream projection, every (row, stream) in one weight pass ──
         self.wide_rows.dense_rows(
             gpu,
