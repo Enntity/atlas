@@ -204,7 +204,18 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
+        // ATLAS_QWEN4EXP_BATCH_FAST: every live row through `forward`'s own
+        // kernels with the EP all-reduce batched (`MoeLayer::forward_rows`),
+        // where `forward_k2/k3` are a different function of the row and the
+        // per-row loop pays an all-reduce per row.
+        let exact_rows = if ctx.levers.qwen4exp_batch_fast {
+            self.ffn
+                .forward_rows_padded(normed, n, active_seqs, ctx, stream)?
+        } else {
+            None
+        };
         let moe_rows = match n {
+            _ if exact_rows.is_some() => moe_out,
             2 => {
                 self.ffn.forward_k2(normed, ctx, stream)?;
                 moe_out

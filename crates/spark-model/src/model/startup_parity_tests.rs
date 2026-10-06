@@ -306,6 +306,8 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_QWEN4EXP_FP8_GDN",
         "ATLAS_QWEN4EXP_BF16_GDN",
         "ATLAS_QWEN4EXP_LMHEAD_SPLIT",
+        "ATLAS_QWEN4EXP_BATCH_FAST",
+        "ATLAS_QWEN4EXP_BATCH_FAST_CHECK",
         "ATLAS_STARTUP_PARITY=warn",
     ] {
         assert_eq!(

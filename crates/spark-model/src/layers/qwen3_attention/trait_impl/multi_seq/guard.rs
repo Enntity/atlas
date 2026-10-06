@@ -137,7 +137,7 @@ pub(super) fn plan_qsa_rows(
     num_seqs: usize,
     row_owner: Option<&[usize]>,
     kv_cache: &PagedKvCache,
-    _ctx: &ForwardContext,
+    ctx: &ForwardContext,
 ) -> Result<bool> {
     let Some(qsa) = layer.qsa.as_ref() else {
         return Ok(false);
@@ -153,10 +153,16 @@ pub(super) fn plan_qsa_rows(
         return Ok(false);
     }
     let (k, v) = layer.kv_dtype.kv_pair();
-    let single_owner = match row_owner {
-        Some(map) => map.len() >= num_seqs && map.iter().take(num_seqs).all(|o| *o == map[0]),
-        None => num_seqs == 1,
-    };
+    // ATLAS_QWEN4EXP_BATCH_FAST: rows of several sequences are served too.
+    // Each row selects against ITS owner's indexer at ITS position and
+    // attends bs=1 over that selection, which is that sequence's serial
+    // decode step whichever other rows share the launch; on TP every rank
+    // runs the same rows (replicated selection, its own heads).
+    let single_owner = ctx.levers.qwen4exp_batch_fast
+        || match row_owner {
+            Some(map) => map.len() >= num_seqs && map.iter().take(num_seqs).all(|o| *o == map[0]),
+            None => num_seqs == 1,
+        };
     let facts = RowsFacts {
         switch_on: verify_active_enabled(),
         highway: layer.hc.is_some(),

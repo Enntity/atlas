@@ -332,6 +332,28 @@ impl Qwen3SsmLayer {
         // gate_up/down kernels split K across lanes differently and do not
         // clamp gate/up to +-10 as the single-row kernels do. `forward` lands
         // every row in `moe_output` row 0, so the post runs per row too.
+        // ATLAS_QWEN4EXP_BATCH_FAST: the same per-row `forward` arithmetic at
+        // any row count (single- or multi-sequence verify), with the EP
+        // all-reduce batched over the rows and ONE elementwise post.
+        if ctx.levers.qwen4exp_batch_fast
+            && let Some(moe_out) = self.ffn.forward_rows(normed2, num_tokens, ctx, stream)?
+        {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                moe_out,
+                streams,
+                post,
+                comb,
+                streams,
+                n,
+                h as u32,
+                stream,
+            )?;
+            stage!("moe+hc_post_ffn (rows)");
+            return Ok(());
+        }
         if ctx.levers.qwen4exp_exact_verify && (2..=4).contains(&num_tokens) {
             for i in 0..num_tokens {
                 let moe_out = self.ffn.forward(normed2.offset(i * h * 2), ctx, stream)?;

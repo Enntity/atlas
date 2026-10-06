@@ -120,8 +120,15 @@ impl TransformerModel {
             let bound = self.config.index_topk + self.config.index_compress_ratio - 1;
             seqs.iter().any(|s| s.seq_len >= bound)
         };
+        // ATLAS_QWEN4EXP_BATCH_FAST: an active row is served per row INSIDE
+        // the batched step (`multi_seq/qsa_rows.rs`, rows of several
+        // sequences allowed by `multi_seq/guard.rs`) wherever every attention
+        // layer's per-row phase applies (`verify_context_limit` is unbounded).
+        let qsa_rows_in_batch =
+            self.levers.qwen4exp_batch_fast && self.verify_context_limit().is_none();
         let hc_perseq = self.config.hc_mult > 0
-            && (qsa_active || std::env::var("ATLAS_HC_PERSEQ_DECODE").as_deref() == Ok("1"));
+            && ((qsa_active && !qsa_rows_in_batch)
+                || std::env::var("ATLAS_HC_PERSEQ_DECODE").as_deref() == Ok("1"));
         // Parallel comm: the batched forward has no per-row QSA hook under EP
         // (`multi_seq/guard.rs` refuses an active row with comm present), so a
         // highway batch with an ACTIVE selection takes the per-seq loop below,
@@ -216,6 +223,9 @@ impl TransformerModel {
         for s in seqs.iter_mut() {
             self.ssm_h_to_f16_dispatch(s)?;
         }
+        // ATLAS_QWEN4EXP_BATCH_FAST_CHECK: serial reference rows first, before
+        // the KV lock below (`batch_fast_check.rs`).
+        let serial_check = self.batch_fast_serial_rows(tokens, seqs)?;
         if std::env::var("ATLAS_DECODE_BATCH_LOG").ok().as_deref() == Some("1") {
             let slots: Vec<i64> = seqs
                 .iter()
@@ -418,6 +428,9 @@ impl TransformerModel {
             for (i, seq) in seqs.iter_mut().enumerate() {
                 seq.tokens.push(tokens[i]);
                 seq.seq_len += 1;
+            }
+            if let Some(rows) = serial_check {
+                self.batch_fast_compare(rows, self.decode_logits_ptr())?;
             }
             return Ok(self.decode_logits_ptr());
         }
@@ -657,6 +670,9 @@ impl TransformerModel {
         for (i, seq) in seqs.iter_mut().enumerate() {
             seq.tokens.push(tokens[i]);
             seq.seq_len += 1;
+        }
+        if let Some(rows) = serial_check {
+            self.batch_fast_compare(rows, self.decode_logits_ptr())?;
         }
 
         Ok(self.decode_logits_ptr())

@@ -197,7 +197,17 @@ impl Qwen3SsmLayer {
         // verify — 2026-07-02 flagship gate). Mirrors the M<=4 dispatch in
         // trait_decode_multi_seq/ssm_batched.rs: one weight pass via
         // `w8a16_gemv_batch4`, per-token `w8a16_gemv` when it isn't linked.
-        if let Some(ref q2) = self.qkvz_q2 {
+        // ATLAS_QWEN4EXP_BATCH_FAST: serial decode's GEMV arithmetic per row
+        // at every row count (`exact_rows.rs`).
+        if self.exact_rows_proj(
+            super::exact_rows::GdnProj::Qkvz,
+            normed,
+            proj_dst,
+            num_tokens,
+            ctx,
+            stream,
+        )? {
+        } else if let Some(ref q2) = self.qkvz_q2 {
             // Tier-1c keep-packed Q2_0: per-token 2-bit fused-qkvz GEMV. Bonsai
             // (dense qwen35) has no MTP, so this batched path is only reached
             // under multi-token verify — a per-token loop is bit-identical to
@@ -1037,7 +1047,15 @@ impl Qwen3SsmLayer {
         // A decode-only FP8 copy (`ATLAS_QWEN4EXP_FP8_GDN=1`) wins over the
         // BF16 one it was quantized from — kept for prefill — so verify reads
         // the weights single-token decode reads, at half the bytes.
-        if let Some(ref dense_out) = self.out_proj_dense
+        if self.exact_rows_proj(
+            super::exact_rows::GdnProj::Out,
+            normed_out_buf,
+            out_proj_buf,
+            num_tokens,
+            ctx,
+            stream,
+        )? {
+        } else if let Some(ref dense_out) = self.out_proj_dense
             && !self.fp8w_decode_only
         {
             if num_tokens <= 8

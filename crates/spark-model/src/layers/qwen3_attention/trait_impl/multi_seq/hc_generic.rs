@@ -24,8 +24,33 @@ impl Qwen3AttentionLayer {
             comb,
             diag_this,
         } = phase;
+        // ATLAS_QWEN4EXP_BATCH_FAST: the live rows through `forward`'s own
+        // kernels with the EP all-reduce batched, then ONE elementwise post.
+        // The host ids are the live rows (`decode_a2` pads past them).
+        let exact_rows = if ctx.levers.qwen4exp_batch_fast {
+            let active = ctx.host_token_ids.map_or(n, |t| t.len().min(n));
+            self.ffn
+                .forward_rows_padded(c.normed, n, active, ctx, stream)?
+        } else {
+            None
+        };
+        if let Some(moe_out) = exact_rows {
+            ops::hc_post_site(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                moe_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                n as u32,
+                h as u32,
+                stream,
+            )?;
+        }
         // Per-token sequential FFN (MLA models always take this path).
-        for i in 0..n {
+        for i in (0..n).filter(|_| exact_rows.is_none()) {
             let normed2_i = c.normed.offset(i * c.h * c.bf16);
             let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
             // hc_streams is the FP32 mHC highway (4 bytes/elem), not BF16.

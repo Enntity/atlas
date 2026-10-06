@@ -90,6 +90,12 @@ pub struct ModelLevers {
     /// `model/qwen4exp_mtp_depth.rs`), overriding the GDN layers' default 1.
     /// Set by `TransformerModel::new` for a qwen4_exp model only.
     pub qwen4exp_mtp_depth: Option<usize>,
+    /// qwen4_exp: every row of a batched multi-sequence step runs the kernels
+    /// single-sequence decode runs, bit for bit, with the per-row collectives
+    /// batched (`ATLAS_QWEN4EXP_BATCH_FAST=1`; design in
+    /// `model/qwen4exp_batch_fast.rs`). Set by `TransformerModel::new` for a
+    /// qwen4_exp model only.
+    pub qwen4exp_batch_fast: bool,
 
     // ── LoRA ──
     /// Apply LoRA eagerly at load instead of at each forward.
@@ -184,6 +190,7 @@ impl ModelLevers {
             // Model-specific: `TransformerModel::new` sets it.
             qwen4exp_exact_verify: false,
             qwen4exp_mtp_depth: None,
+            qwen4exp_batch_fast: false,
             lora_eager: opt_in_truthy("ATLAS_LORA_EAGER"),
             lora_rotate: opt_in_truthy("ATLAS_LORA_ROTATE"),
             k4_diag: opt_in("ATLAS_K4_DIAG"),

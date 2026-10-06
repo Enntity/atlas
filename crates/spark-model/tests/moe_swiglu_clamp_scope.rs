@@ -31,7 +31,11 @@ const DECLARES_A_SWIGLU_LIMIT: &[&str] = &["deepseek-v4-flash", "glm-5.3-flash",
 /// the comment block at the clamp in `moe_shared_expert_fused.cu`: resolving it
 /// moves numbers for DeepSeek-V4, which has no checkpoint on any box, and for
 /// the MoE families behind a separate accuracy gate. Recorded, not fixed.
-const KNOWN_INCONSISTENT: &[&str] = &["moe_shared_expert_fused.cu"];
+///
+/// `qwen4exp_moe_rows.cu` (Qwen3.8-Flash-Next's batched rows) replaces one
+/// launch per row of that kernel bit for bit, so it repeats the same
+/// routed-only clamp; it moves with `moe_shared_expert_fused.cu`, never alone.
+const KNOWN_INCONSISTENT: &[&str] = &["moe_shared_expert_fused.cu", "qwen4exp_moe_rows.cu"];
 
 fn kernels_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

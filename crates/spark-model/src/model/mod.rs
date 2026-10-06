@@ -72,6 +72,7 @@ mod kv_nvme;
 pub(crate) mod mtp_carry;
 pub(crate) mod pinned_pack;
 pub(crate) mod prefix_share;
+pub(crate) mod qwen4exp_batch_fast;
 pub(crate) mod qwen4exp_exact_verify;
 pub(crate) mod qwen4exp_lmhead_split;
 pub(crate) mod qwen4exp_mtp_depth;

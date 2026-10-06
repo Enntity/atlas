@@ -83,7 +83,11 @@ impl Qwen3SsmLayer {
             }
         }
 
+        // ATLAS_QWEN4EXP_BATCH_FAST keeps the per-sequence loop: it is
+        // `ssm_forward`'s kernels a row at a time, where the strided batched
+        // GDN+norm kernels are a different launch shape of the recurrence.
         let batched_recurrent = if crate::layers::qwen3_ssm::ssm_batched_recurrent_enabled()
+            && !ctx.levers.qwen4exp_batch_fast
             && self.gdn_f32_strided_k.0 != 0
             && n > 1
         {

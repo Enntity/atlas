@@ -1290,6 +1290,14 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// EP: after a batched multi-sequence verify (`decode_verify_batched`),
+    /// send the drafts each sequence accepted, in batch order, so the worker
+    /// commits what the head commits. Call once every row has been read and
+    /// before any commit or propose. No-op without a multi-rank protocol.
+    fn ep_broadcast_verify_verdicts(&self, _accepted: &[u32]) -> Result<()> {
+        Ok(())
+    }
+
     /// EP bulk broadcast: send an array of u32 tokens to all worker ranks.
     /// Uses a single NCCL broadcast instead of per-token broadcasts.
     fn ep_broadcast_tokens(&self, _tokens: &[u32]) -> Result<Vec<u32>> {
