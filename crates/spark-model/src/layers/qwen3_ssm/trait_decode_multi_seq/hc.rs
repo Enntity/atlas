@@ -128,7 +128,7 @@ impl Qwen3SsmLayer {
         // ── GDN sublayer ──
         // hc_pre writes the mixed+normed rows straight into norm_output —
         // both the batched-GEMM core and the per-seq fallback read there.
-        ops::hc_pre_site(
+        ops::hc_pre_site_rows(
             ctx.gpu,
             self.hc_pre_k,
             streams,
@@ -141,6 +141,7 @@ impl Qwen3SsmLayer {
             n as u32,
             h as u32,
             eps,
+            ctx.levers.qwen4exp_batch_fast,
             stream,
         )?;
         // Batched-GEMM core (QKVZ/out_proj weights read ONCE for all n rows —
@@ -189,7 +190,7 @@ impl Qwen3SsmLayer {
         // ── MoE sublayer ──
         // hc_pre writes the mixed rows straight into norm_output — the
         // batched expert kernels' input convention.
-        ops::hc_pre_site(
+        ops::hc_pre_site_rows(
             ctx.gpu,
             self.hc_pre_k,
             streams,
@@ -202,6 +203,7 @@ impl Qwen3SsmLayer {
             n as u32,
             h as u32,
             eps,
+            ctx.levers.qwen4exp_batch_fast,
             stream,
         )?;
         // ATLAS_QWEN4EXP_BATCH_FAST: every live row through `forward`'s own
