@@ -6,6 +6,11 @@
 //! output and its time; a run with the switch and one without must print the
 //! SAME hashes.
 //!
+//! With the switch it also checks `cublaslt::bf16_gemm_act_weight_t_kchain`
+//! (a forced k-chain kernel) against the Atlas tile kernel
+//! `dense_gemm_bf16_pipelined` it replaces in the mHC collapse (the down
+//! GEMM of a 1921..2048-row slab, 320 x 10240): every byte must match.
+//!
 //! Run inside atlas-release-builder (the runtime image's cuBLASLt):
 //!   cargo build -p spark-model --release --features cuda,gpu-examples \
 //!     --example lt_kchain_pin_check
@@ -16,6 +21,7 @@
 use anyhow::Result;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::GpuBackend;
+use spark_runtime::kernel_args::KernelLaunch;
 
 fn bf16s(seed: &mut u64, n: usize, scale: f32) -> Vec<u8> {
     (0..n)
@@ -30,7 +36,7 @@ fn bf16s(seed: &mut u64, n: usize, scale: f32) -> Vec<u8> {
 }
 
 fn main() -> Result<()> {
-    let gpu = AtlasCudaBackend::new(0, &[])?;
+    let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &gpu;
     let stream = g.default_stream();
     let mut seed = 0x5eed_u64;
@@ -72,5 +78,49 @@ fn main() -> Result<()> {
         }
         g.free(w)?;
     }
+    if std::env::var("ATLAS_LT_KCHAIN_PIN").as_deref() == Ok("1") {
+        tile_vs_forced(g, stream, &mut seed)?;
+    }
+    Ok(())
+}
+
+/// The mHC down GEMM at the slab heights that run on the tile kernel.
+fn tile_vs_forced(g: &dyn GpuBackend, stream: u64, seed: &mut u64) -> Result<()> {
+    let (n, k) = (320usize, 10240usize);
+    let tile = g.kernel("gemm", "dense_gemm_bf16_pipelined")?;
+    let w = g.alloc(n * k * 2)?;
+    g.copy_h2d(&bf16s(seed, n * k, 0.02), w)?;
+    let mut bad = 0;
+    for m in (1921usize..=2048).step_by(9).chain([2048]) {
+        let a = g.alloc(m * k * 2)?;
+        g.copy_h2d(&bf16s(seed, m * k, 1.0), a)?;
+        let (o1, o2) = (g.alloc(m * n * 2)?, g.alloc(m * n * 2)?);
+        KernelLaunch::new(g, tile)
+            .grid([(n as u32).div_ceil(128), (m as u32).div_ceil(128), 1])
+            .block([256, 1, 1])
+            .arg_ptr(a)
+            .arg_ptr(w)
+            .arg_ptr(o1)
+            .arg_u32(m as u32)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .launch(stream)?;
+        let ran = spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain(
+            a.0, w.0, o2.0, m as u32, n as u32, k as u32, stream,
+        )?;
+        g.synchronize(stream)?;
+        let (mut v1, mut v2) = (vec![0u8; m * n * 2], vec![0u8; m * n * 2]);
+        g.copy_d2h(o1, &mut v1)?;
+        g.copy_d2h(o2, &mut v2)?;
+        let diff = v1.iter().zip(&v2).filter(|(x, y)| x != y).count();
+        bad += usize::from(!ran || diff != 0);
+        println!("forced k-chain vs tile kernel M={m} N={n} K={k}: ran {ran}, {diff} bytes differ");
+        for p in [a, o1, o2] {
+            g.free(p)?;
+        }
+    }
+    g.free(w)?;
+    anyhow::ensure!(bad == 0, "{bad} slab heights differ");
+    println!("forced k-chain == tile kernel at every slab height");
     Ok(())
 }
