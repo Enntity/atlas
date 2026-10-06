@@ -8,7 +8,7 @@
 use anyhow::{Result, bail};
 
 use super::fault::*;
-use super::{AlignedBlock, NgramRowCache};
+use super::{AlignedBlock, NgramRowCache, fault_pool};
 
 impl NgramRowCache {
     /// Resolve `row_ids` to slot indices, faulting misses in from NVMe.
@@ -45,6 +45,9 @@ impl NgramRowCache {
         pin: bool,
     ) -> Result<usize> {
         let mut out_slots = out_slots;
+        if let Some(k) = &self.keepalive {
+            k.touch();
+        }
         if let Some(out) = out_slots.as_deref_mut() {
             out.clear();
             out.reserve(row_ids.len());
@@ -106,6 +109,19 @@ impl NgramRowCache {
             }
         }
 
+        if faults.len() > 1 && self.fault_pool.is_none() && fault_pool::pool_enabled() {
+            // The caller's thread works the batch too, so `fault_threads()`
+            // stays the total depth.
+            let workers = fault_threads().saturating_sub(1).max(1);
+            match fault_pool::FaultPool::new(self, workers) {
+                Ok(p) => self.fault_pool = Some(p),
+                Err(e) => {
+                    self.drop_reservations(&faults);
+                    return Err(e);
+                }
+            }
+        }
+
         // PASS 2 -- FAULT. The misses are independent: distinct slots (every
         // slot handed out above is pinned, and `victim` skips pinned slots), so
         // the arena writes are disjoint, and `read_exact_at` is positional so a
@@ -163,6 +179,11 @@ impl NgramRowCache {
             },
         };
 
+        if let Some(pool) = &self.fault_pool
+            && faults.len() > 1
+        {
+            return pool.run(faults, &ptrs);
+        }
         let want = fault_threads();
         if want <= 1 || faults.len() == 1 {
             let mut bounce = AlignedBlock::new();
