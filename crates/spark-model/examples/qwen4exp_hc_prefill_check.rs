@@ -6,7 +6,8 @@
 //! 320) over several prompt lengths, slab tails included.
 //!
 //! Each length runs one GDN-layer shape: post(attn) + pre(ffn) as one seam,
-//! then post(ffn) + pre(next attn) + head. Prints an FNV-1a hash of every
+//! then post(ffn) + pre(next attn) through the cross-layer deferral
+//! (`ops::qwen4exp_prefill_seam`), then the head. Prints an FNV-1a hash of every
 //! output (highway, `y`, `inj`) and the time per length; two runs, one with
 //! `ATLAS_QWEN4EXP_PREFILL_HC=1` and one without, must print the SAME hashes.
 //! Add `ATLAS_QWEN4EXP_PREFILL_HC_CHECK=100000` to the switched run and every
@@ -138,14 +139,20 @@ fn main() -> Result<()> {
                     g, k_pre, d_streams, &hc.ffn, &hc, d_y, d_inj, comb, scratch, n, h, EPS, 0,
                 )?;
             }
-            // post(ffn out) + pre(next attn) as two calls (the cross-layer
-            // seam), then the model-level head on the result.
-            ops::hc_post_site(
-                g, k_post, &hc, d_bf, d_streams, d_inj, comb, d_streams, n, h, 0,
-            )?;
-            ops::hc_pre_site(
-                g, k_pre, d_streams, &hc.attn, &hc, d_y, d_inj, comb, scratch, n, h, EPS, 0,
-            )?;
+            // post(ffn out) + pre(next attn): the cross-layer seam, deferred
+            // and fused when the switch serves it, else as two calls.
+            if !ops::qwen4exp_prefill_seam::defer_post(g, &hc, d_bf, n, h) {
+                ops::hc_post_site(
+                    g, k_post, &hc, d_bf, d_streams, d_inj, comb, d_streams, n, h, 0,
+                )?;
+            }
+            if !ops::qwen4exp_prefill_seam::pre_with_pending(
+                g, k_post, &hc, &hc.attn, d_streams, d_y, d_inj, scratch, n, h, EPS, 0,
+            )? {
+                ops::hc_pre_site(
+                    g, k_pre, d_streams, &hc.attn, &hc, d_y, d_inj, comb, scratch, n, h, EPS, 0,
+                )?;
+            }
             let head_w = spark_model::layers::qwen3_attention::HcHeadWeights {
                 hc_fn: DevicePtr::NULL,
                 hc_base: DevicePtr::NULL,
