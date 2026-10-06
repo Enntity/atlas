@@ -715,8 +715,10 @@ pub trait Model: Send + Sync {
 
     /// Whether [`Self::decode_verify_batched`] can run for `ks.len()`
     /// sequences at `ks[i]` verify rows each (one more than that sequence's
-    /// draft count; the K-vs-batch ladder passes 2..=4, and D-Cut makes the
-    /// vector RAGGED — uniform is just the special case).
+    /// draft count; the K-vs-batch ladder passes 2..=4, and D-Cut and the
+    /// drafter's confidence stop make the vector RAGGED — uniform is just the
+    /// special case). `ks[i] == 1` is a DECODE ROW, a sequence holding no
+    /// drafts; only a model whose verify row is its decode row admits it.
     ///
     /// Default `false`: the scheduler MUST fall back to the per-sequence
     /// `decode_verify_graphed_k{2,3,4}` loop. There is deliberately NO

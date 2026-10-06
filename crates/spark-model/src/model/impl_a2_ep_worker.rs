@@ -123,7 +123,9 @@ impl TransformerModel {
                 seq.tokens.pop();
             }
         }
-        self.trim_proposer_state(seq, num_accepted, 0)?;
+        if super::trait_impl::verify_rows::verdict_trims_drafter(k) {
+            self.trim_proposer_state(seq, num_accepted, 0)?;
+        }
         self.commit_accepted_prefix(seq, committed, k)?;
         Ok(())
     }
