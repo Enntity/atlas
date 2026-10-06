@@ -553,8 +553,50 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // qwen4_exp piecewise graphs (`model::decode_pieces`): over a
+            // parallel communicator the whole-step graph above is off, so the
+            // GDN runs (and on an all-inert step the attention layers too)
+            // replay per slot/row vector. DFlash's owner-slot captures stay
+            // eager, as for the whole-step graph.
+            let piece_key = if dflash_save_slots.is_none()
+                && self.decode_pieces_admitted(capture, &kv_cache, &ctx)
+            {
+                self.verify_batched_graph_key(&*seqs, ks, wy_tables_base.is_null())
+            } else {
+                None
+            };
+            let wide = piece_key.is_some()
+                && self.decode_pieces_wide(
+                    seqs.iter()
+                        .zip(ks)
+                        .map(|(s, &k)| s.seq_len + k - 1)
+                        .max()
+                        .unwrap_or(0),
+                );
+
             let mut ssm_idx = 0usize;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if let Some(key) = piece_key.as_deref()
+                    && self.verify_batch_piece_run(
+                        layer_idx,
+                        wide,
+                        key,
+                        ks,
+                        &row_owner,
+                        seqs,
+                        &mut kv_cache,
+                        &seq_lens_vec,
+                        &block_tables_vec,
+                        wy_tables_base,
+                        &ctx,
+                        stream,
+                    )?
+                {
+                    if self.config.layer_type(layer_idx) == LayerType::LinearAttention {
+                        ssm_idx += 1;
+                    }
+                    continue;
+                }
                 let layer_type = self.config.layer_type(layer_idx);
 
                 if layer_type == LayerType::FullAttention {
@@ -622,6 +664,17 @@ impl TransformerModel {
                         "K4_DIAG(batched): CUDA error after layer {layer_idx} ({layer_type:?}): {e:#}"
                     );
                 }
+            }
+
+            if wide {
+                let rows: Vec<(usize, usize)> = row_owner
+                    .iter()
+                    .enumerate()
+                    .map(|(r, &i)| (i, seqs[i].seq_len + r - off[i]))
+                    .collect();
+                let mut owners: Vec<&mut Vec<Box<dyn LayerState>>> =
+                    seqs.iter_mut().map(|s| &mut s.layer_states).collect();
+                self.qsa_commit_staged(&rows, &mut owners, stream)?;
             }
 
             // ── Phase 4: final norm [R, H] + lm_head + per-row argmax ──

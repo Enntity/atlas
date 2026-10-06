@@ -274,10 +274,21 @@ impl TransformerModel {
             // qwen4_exp piecewise graphs (`model::decode_pieces`), as in
             // verify_b.
             let pieces = self.decode_pieces_admitted(use_graphs, &kv_cache, &ctx);
+            let wide = self.decode_piece_wide(pieces, seq, k);
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 if pieces
-                    && self.verify_gdn_piece_run(layer_idx, k, seq, &mut kv_cache, &ctx, stream)?
+                    && self.verify_piece_run(
+                        layer_idx,
+                        k,
+                        wide,
+                        seq,
+                        &mut kv_cache,
+                        &seq_lens_vec,
+                        &block_tables_vec,
+                        &ctx,
+                        stream,
+                    )?
                 {
                     continue;
                 }
@@ -347,6 +358,9 @@ impl TransformerModel {
                 // silently. Must be inside the graph capture region.
                 // No-op when DFlash is disabled.
                 self.try_dflash_capture(layer_idx, k - 1, stream)?;
+            }
+            if wide {
+                self.qsa_commit_staged_seq(seq, k, stream)?;
             }
 
             // Final norm [3, H]

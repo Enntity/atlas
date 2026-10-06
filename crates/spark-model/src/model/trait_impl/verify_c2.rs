@@ -263,6 +263,12 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // qwen4_exp piecewise graphs (`model::decode_pieces`), as in
+            // verify_b/verify_c. `ATLAS_K4_DIAG` keeps the step eager
+            // (`levers.k4_diag` in the admission).
+            let pieces = self.decode_pieces_admitted(use_graphs, &kv_cache, &ctx);
+            let wide = self.decode_piece_wide(pieces, seq, k);
+
             // K4_DIAG per-layer timing (eager mode already syncs each layer —
             // this just records it). Only compiled in when the env is set.
             let mut k4_layer_us = k4_diag.then(Vec::new);
@@ -272,6 +278,21 @@ impl TransformerModel {
             let mut kda_layers = 0usize;
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if pieces
+                    && self.verify_piece_run(
+                        layer_idx,
+                        k,
+                        wide,
+                        seq,
+                        &mut kv_cache,
+                        &seq_lens_vec,
+                        &block_tables_vec,
+                        &ctx,
+                        stream,
+                    )?
+                {
+                    continue;
+                }
                 let layer_type = self.config.layer_type(layer_idx);
                 let t_layer = k4_diag.then(std::time::Instant::now);
                 let layer_started = if verify_profile {
@@ -370,6 +391,10 @@ impl TransformerModel {
                         kda_layers += 1;
                     }
                 }
+            }
+
+            if wide {
+                self.qsa_commit_staged_seq(seq, k, stream)?;
             }
 
             if verify_profile {

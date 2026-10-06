@@ -540,15 +540,20 @@ impl TransformerModel {
             } else {
                 None
             };
+            // Wide (attention layers captured, QSA ingest staged): every live
+            // row inside the inert bound. Padding rows never ingest.
+            let wide = piece_slots.is_some()
+                && self.decode_pieces_wide(seq_lens[..n].iter().copied().max().unwrap_or(0));
 
             // Layer loop for padded_n sequences
             let mut ssm_us: u128 = 0;
             let mut attn_us: u128 = 0;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 if let Some(slots) = piece_slots.as_deref()
-                    && self.gdn_piece_run(
+                    && self.piece_run(
                         layer_idx,
                         PieceStep::Batch,
+                        wide,
                         slots,
                         padded_n,
                         &ctx,
@@ -603,6 +608,12 @@ impl TransformerModel {
                 if conc_hsd {
                     let _ = dump_hidden(&format!("after_L{:02}", layer_idx), stream);
                 }
+            }
+            if wide {
+                let rows: Vec<(usize, usize)> = (0..n).map(|i| (i, seq_lens[i])).collect();
+                let mut owners: Vec<&mut Vec<Box<dyn LayerState>>> =
+                    all_layer_states.iter_mut().take(n).collect();
+                self.qsa_commit_staged(&rows, &mut owners, stream)?;
             }
             if ms_profile {
                 self.gpu.synchronize(stream).ok();
