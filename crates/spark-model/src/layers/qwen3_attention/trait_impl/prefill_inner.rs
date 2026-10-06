@@ -914,15 +914,17 @@ impl Qwen3AttentionLayer {
         if block_norm {
             collapse()?;
         } else {
-            crate::layers::qwen4exp_sp_pipe::collapse_and_gather(
+            // ATLAS_QWEN4EXP_PREFILL_SP_ROUTE: this rank's rows route first.
+            let route = |s| sp.map_or(Ok(()), |sp| self.ffn.route_local_rows(normed2, sp, ctx, s));
+            crate::layers::qwen4exp_sp_pipe::collapse_and_gather_then(
                 sp,
                 normed2,
                 Some(hidden),
-                n as usize,
-                h,
+                [n as usize, h],
                 ctx,
                 stream,
                 collapse,
+                route,
             )?;
         }
 

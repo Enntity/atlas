@@ -269,13 +269,14 @@ impl Qwen3SsmLayer {
             stream,
         );
         // ATLAS_QWEN4EXP_PREFILL_SP_PIPE: the MoE input's gather goes out
-        // slab by slab while this collapse runs.
-        crate::layers::qwen4exp_sp_pipe::collapse_and_gather(
+        // slab by slab while this collapse runs; _SP_ROUTE routes this rank's
+        // rows before the join.
+        let route = |s| sp.map_or(Ok(()), |sp| self.ffn.route_local_rows(hidden, sp, ctx, s));
+        crate::layers::qwen4exp_sp_pipe::collapse_and_gather_then(
             sp,
             hidden,
             None,
-            n as usize,
-            h,
+            [n as usize, h],
             ctx,
             stream,
             || {
@@ -348,6 +349,7 @@ impl Qwen3SsmLayer {
                 }
                 Ok(())
             },
+            route,
         )?;
         stage!("hc_pre_ffn");
         let moe_out = match sp {

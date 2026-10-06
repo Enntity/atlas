@@ -268,6 +268,49 @@ impl MoeLayer {
         Ok(routes)
     }
 
+    /// The SP path's routes were gathered into scratch at the gather site
+    /// (`take_local_routes`); sort them and return the same Routes shape.
+    pub(super) fn sort_sp_routes(
+        &self,
+        _input: DevicePtr,
+        [n, _h, _inter]: [u32; 3],
+        det: crate::det_trace::Taps<'_>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Routes> {
+        let num_experts = ctx.config.num_experts as u32;
+        let top_k = ctx.config.num_experts_per_tok as u32;
+        let (te, ne) = ((n * top_k) as usize, num_experts as usize);
+        let rows = (0, n as usize);
+        let gate_logits = ctx.buffers.gate_logits();
+        let scratch = ctx.buffers.scratch();
+        let routes = Routes {
+            indices: scratch,
+            weights: scratch.offset(te * 4),
+            sorted_token_ids: gate_logits,
+            expert_offsets: gate_logits.offset(te * 4 * 2),
+            token_to_perm: gate_logits.offset(te * 4 * 2 + (ne + 1) * 4),
+            prerouted: false,
+        };
+        let sorted_expert_ids = gate_logits.offset(te * 4);
+        ops::moe_sort_by_expert(
+            ctx.gpu,
+            self.moe_sort_by_expert,
+            routes.indices,
+            routes.sorted_token_ids,
+            sorted_expert_ids,
+            routes.expert_offsets,
+            routes.token_to_perm,
+            n * top_k,
+            num_experts,
+            top_k,
+            stream,
+        )?;
+        det.tap("rt_ids", routes.indices, rows, top_k as usize * 4);
+        det.tap("rt_w", routes.weights, rows, top_k as usize * 4);
+        Ok(routes)
+    }
+
     /// Whether `ATLAS_GLM_MOE_ROUTE_FUSE` takes a batch of `n` rows: the
     /// canonical BF16 router, the unadapted sigmoid top-k with correction
     /// bias, and a routed FFN on the M16 stream twins of the prequant path.
