@@ -195,19 +195,22 @@ fn hc_mma_rows_are_invariant_and_accurate() {
                 }
             }
             for d in 0..H {
-                let mut mix = 0f64;
+                let (mut mix, mut scale) = (0f64, 0f64);
                 for s in 0..HC {
                     let u: f64 = (0..RANK)
                         .map(|r| bf16_val(up[r * K + s * H + d]) as f64 * lo[r])
                         .sum();
-                    mix += n[s * H + d] as f64 / (1.0 + (-u).exp());
+                    let p = n[s * H + d] as f64 / (1.0 + (-u).exp());
+                    mix += p;
+                    scale += p.abs();
                 }
                 mix /= HC as f64;
                 let i = (t * H + d) * 2;
                 let got_y = bf16_val(u16::from_le_bytes([y_b[i], y_b[i + 1]])) as f64;
-                // Measured in units of the reference's bf16 ulp.
-                let ulp = (mix.abs().max(1e-30)).log2().floor().exp2() / 128.0;
-                e_y = e_y.max((got_y - mix).abs() / ulp);
+                // In bf16 ulps of the larger of |y| and the mean |term|: where
+                // the stream mean cancels, the error scale is the terms'.
+                let mag = mix.abs().max(scale / HC as f64).max(1e-30);
+                e_y = e_y.max((got_y - mix).abs() / (mag.log2().floor().exp2() / 128.0));
             }
         }
         println!(
@@ -215,7 +218,8 @@ fn hc_mma_rows_are_invariant_and_accurate() {
         );
         assert!(e_low < 5e-5, "low error {e_low:.3e}");
         assert!(e_inj < 5e-5, "inj error {e_inj:.3e}");
-        // The FP32 kernels' worst is ~1.8 ulp on the bench's data.
+        // Rounding to bf16 is 0.5 of these ulps; the FP32 kernels' worst
+        // against the correctly rounded value is ~1.8 on the bench's data.
         assert!(e_y <= 2.0, "y error {e_y:.2} bf16 ulp");
     }
 }
