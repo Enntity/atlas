@@ -85,6 +85,20 @@ impl QsaIndexer {
             "QSA staged ingest: row {row} past the {} staging rows",
             self.max_staged_rows()
         );
+        // ATLAS_QWEN4EXP_QSA_KEY_ONLY: the key rows only, straight into the
+        // staging row, once a probe has shown the bytes equal (`qsa_key_only.rs`).
+        if self.key_only(gpu, stream)? {
+            return ops::cublas_bf16_proj_dense(
+                normed,
+                self.key_proj_w(),
+                self.staged_key(row),
+                1,
+                self.hd,
+                self.hidden,
+                stream,
+            )
+            .context("QSA key projection (staged decode)");
+        }
         let hd = self.hd as usize;
         ops::cublas_bf16_proj_dense(
             normed,
