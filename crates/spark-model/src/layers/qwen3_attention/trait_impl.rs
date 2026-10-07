@@ -106,6 +106,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         state: &mut dyn LayerState,
         row: usize,
         pos: usize,
+        count: usize,
+        pitched: bool,
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
@@ -114,7 +116,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("qsa_commit_staged without an indexer"))?;
         let st = super::helpers::qsa_seq_state(qsa, state, gpu)?;
-        qsa.commit_staged_row(st, row, pos, gpu, stream)
+        qsa.commit_staged_rows(st, row, pos, count, pitched, gpu, stream)
     }
 
     fn has_aux_state(&self) -> bool {

@@ -13,6 +13,7 @@
 //! | switch | loop replaced | per step at C8 x K=4 |
 //! |---|---|---|
 //! | `ATLAS_QWEN4EXP_QKV_ROWS_2D=1` | the exact Q/K/V scatter into the interleaved `qkv_buf` (`multi_seq/qkv_exact4.rs`): 3 copies a row | 96 copies -> 3 a QSA layer (~1,000 -> ~36) |
+//! | `ATLAS_QWEN4EXP_QSA_COMMIT_ROWS=1` | the staged QSA ingest's host-side commit (`decode_pieces.rs` -> `qsa_staged.rs`): a raw-key copy (and a pool launch when a block closes) a row, eagerly after the run | 32 copies -> one a sequence and layer (~370 -> ~96, eager) |
 //!
 //! A pitched copy is one `cudaMemcpy2DAsync`: one memcpy node when the step
 //! is captured, one call when it runs eagerly.
@@ -26,6 +27,12 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 pub(crate) fn qkv_rows_2d() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_QKV_ROWS_2D").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_QWEN4EXP_QSA_COMMIT_ROWS=1`, read once.
+pub(crate) fn qsa_commit_rows() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_QSA_COMMIT_ROWS").as_deref() == Ok("1"))
 }
 
 /// Copy `height` rows of `width` bytes, row `r` from `src + r * src_pitch` to
