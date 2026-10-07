@@ -152,6 +152,71 @@ impl QsaIndexer {
     }
 }
 
+impl QsaIndexer {
+    /// [`Self::commit_staged_row`] over `count` rows of one sequence,
+    /// staging rows `first_row..` at positions `pos..`. With `pitched`
+    /// (`ATLAS_QWEN4EXP_QSA_COMMIT_ROWS`), the raw keys land as ONE pitched
+    /// copy (staging rows `qk_width` apart -> window rows `hd` apart, the
+    /// window holding `pos..pos + count` contiguously after `raw_room`) and
+    /// the blocks they complete pool in ONE launch; otherwise the per-row
+    /// commit, verbatim. The bytes are the same: each raw key is the same
+    /// copy, and `qsa_block_pool` computes each block from its own four raw
+    /// keys whatever the launch's block count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_staged_rows(
+        &self,
+        st: &mut QsaSeqState,
+        first_row: usize,
+        pos: usize,
+        count: usize,
+        pitched: bool,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        if !pitched {
+            for j in 0..count {
+                self.commit_staged_row(st, first_row + j, pos + j, gpu, stream)?;
+            }
+            return Ok(());
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let last = pos + count - 1;
+        anyhow::ensure!(
+            pos == st.ingested,
+            "QSA staged commit at pos {pos} but {} tokens ingested",
+            st.ingested
+        );
+        anyhow::ensure!(
+            !self.is_active_at(last),
+            "QSA staged commit through pos {last}: only inert rows stage (bound {})",
+            self.inert_bound(),
+        );
+        anyhow::ensure!(
+            first_row + count <= self.max_staged_rows(),
+            "QSA staged commit: rows {first_row}..{} past the staging rows",
+            first_row + count
+        );
+        self.reserve(st, pos + count, gpu, stream)?;
+        self.raw_room(st, count, gpu, stream)?;
+        let row = self.hd as usize * 2;
+        crate::model::qwen4exp_step_copies::copy_rows(
+            gpu,
+            self.staged_key(first_row),
+            self.qk_width() * 2,
+            self.raw_slot(st, pos),
+            row,
+            row,
+            count,
+            true,
+            stream,
+        )?;
+        st.ingested = pos + count;
+        self.pool_new_blocks(st, gpu, stream)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{StagedIngest, staged_ingest};
@@ -171,3 +236,7 @@ mod tests {
         assert!(!staged_ingest());
     }
 }
+
+#[cfg(test)]
+#[path = "qsa_staged_rows_tests.rs"]
+mod rows_tests;

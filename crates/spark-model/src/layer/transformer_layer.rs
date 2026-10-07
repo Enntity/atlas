@@ -240,14 +240,18 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
-    /// Finish the staged ingest of `row` at position `pos` into `state` (the
-    /// row's owner) after a staged run. Only layers that
-    /// [`Self::qsa_inert_capturable`] stage anything.
+    /// Finish the staged ingest of rows `row..row + count` at positions
+    /// `pos..pos + count` into `state` (the rows' owner) after a staged run;
+    /// `pitched`: as one pitched copy (`QsaIndexer::commit_staged_rows`).
+    /// Only layers that [`Self::qsa_inert_capturable`] stage anything.
+    #[allow(clippy::too_many_arguments)]
     fn qsa_commit_staged(
         &self,
         _state: &mut dyn LayerState,
         _row: usize,
         _pos: usize,
+        _count: usize,
+        _pitched: bool,
         _gpu: &dyn GpuBackend,
         _stream: u64,
     ) -> Result<()> {
