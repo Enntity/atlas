@@ -37,6 +37,8 @@ mod qsa_aux;
 mod qsa_decode_select;
 #[path = "qsa_free.rs"]
 mod qsa_free;
+#[path = "qsa_key_only.rs"]
+mod qsa_key_only;
 #[path = "qsa_select.rs"]
 mod qsa_select;
 #[path = "qsa_select_sp.rs"]
