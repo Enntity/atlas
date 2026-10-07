@@ -106,7 +106,7 @@ __device__ __forceinline__ void c8_gu_chunk(
     }
 }
 
-template <unsigned RC>
+template <unsigned RC, bool CLAMP>
 __device__ __forceinline__ void c8_gate_up(C8_GU_ARGS) {
     static_assert(RC >= 1 && RC <= 8, "row chunk");
     if (blockDim.x != 256) __trap();
@@ -134,7 +134,7 @@ __device__ __forceinline__ void c8_gate_up(C8_GU_ARGS) {
     }
     __shared__ unsigned short s_gu[2][RC][8];
     const unsigned j1 = 2 * (warp & 3u), n1 = n0 + j1;
-    const bool clamp = !u.shared();
+    const bool clamp = CLAMP && !u.shared();
     float* act_base = act + (u.shared() ? (size_t)slots * C8_I : 0);
 #pragma unroll 1
     for (unsigned c0 = 0; c0 < u.n; c0 += RC) {
@@ -317,9 +317,12 @@ __device__ __forceinline__ void c8_down(C8_SD_ARGS) {
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3) qwen4exp_moe_c8_gate_up(C8_GU_ARGS) {
-    c8_gate_up<4>(A, gate_packed_ptrs, gate_scale_ptrs, gate_scale2_vals, up_packed_ptrs,
-        up_scale_ptrs, up_scale2_vals, sh_gate_packed, sh_gate_scale, sh_gate_s2, sh_up_packed,
-        sh_up_scale, sh_up_s2, ws, gate_out, up_out, sh_gate_out, sh_up_out, act, top_k, rows);
+    c8_gate_up<4, true>(C8_GU_PASS);
+}
+
+// Without the routed SwiGLU clamp (ATLAS_QWEN4EXP_MOE_NO_CLAMP).
+extern "C" __global__ void __launch_bounds__(256, 3) qwen4exp_moe_c8_gate_up_nc(C8_GU_ARGS) {
+    c8_gate_up<4, false>(C8_GU_PASS);
 }
 
 extern "C" __global__ void __launch_bounds__(256, 3) qwen4exp_moe_c8_down(C8_SD_ARGS) {

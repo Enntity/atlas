@@ -149,6 +149,20 @@ pub(crate) fn tc_requested() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_TC").as_deref() == Ok("1"))
 }
 
+/// `ATLAS_QWEN4EXP_MOE_NO_CLAMP=1`, read once: the qwen4_exp decode / verify
+/// MoE kernels drop the routed SwiGLU clamp (+-10) -- the serial-decode
+/// single-row silu/down, the rows pair, the units and the TC units -- which
+/// the checkpoint does not declare (`swiglu_limit` null; the vLLM reference
+/// is plain SiLU) and the prefill, K=2/K=3 and `_t` arms never applied.
+/// Not today's bytes where the clamp bit (it fired on 0.002% of layer 47's
+/// gate/up values in a C8 prose capture, `scripts/dev/qwen4exp_moe_fidelity.cu`);
+/// every decode path switches together, so speculation stays exact.
+pub(crate) fn no_clamp_requested(model_type: &str) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    model_type == "qwen4_exp"
+        && *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_NO_CLAMP").as_deref() == Ok("1"))
+}
+
 /// `ATLAS_QWEN4EXP_MOE_ROUTE_DUMP=<file>` (diagnostic): each rows-pair MoE
 /// launch appends its `[rows, top_k]` expert ids to `<file>` as one line
 /// (synchronizing the stream). `scripts/dev/qwen4exp_moe_c8_bench.cu` replays

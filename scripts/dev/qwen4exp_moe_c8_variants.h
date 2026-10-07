@@ -7,7 +7,8 @@
 // Serial decode's kernels, one launch pair per row (moe_shared_expert_fused.cu).
 static Variant per_row_loop() {
     CUfunction gu = load("moe_shared_expert_fused", "moe_expert_gate_up_shared");
-    CUfunction sd = load("moe_shared_expert_fused", "moe_expert_silu_down_shared");
+    CUfunction sd = load("moe_shared_expert_fused",
+                         nc() ? "moe_expert_silu_down_shared_noclamp" : "moe_expert_silu_down_shared");
     Variant v;
     v.name = "per-row loop (serial)";
     v.plan = [](Pool&, Bufs&, unsigned) {};
@@ -89,7 +90,7 @@ static Variant c8_units(bool fused, bool tc = false) {
     // rows pair's bytes; checked for row invariance by tc-units-check).
     const char* M = tc ? "qwen4exp_moe_c8_tc" : "qwen4exp_moe_c8";
     const std::string p = tc ? "qwen4exp_moe_c8_tc_" : "qwen4exp_moe_c8_";
-    CUfunction pl = load(M, (p + "plan").c_str()), gu = load(M, (p + "gate_up").c_str()),
+    CUfunction pl = load(M, (p + "plan").c_str()), gu = load(M, (p + (nc() ? "gate_up_nc" : "gate_up")).c_str()),
                sd = load(M, (p + "down").c_str());
     Variant v;
     v.name = std::string(tc ? "tc " : "") + (fused ? "units fused" : "units");

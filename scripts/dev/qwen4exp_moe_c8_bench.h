@@ -210,10 +210,13 @@ struct Variant {
     std::function<void(Pool&, Bufs&, unsigned)> plan, gate_up, silu_down;
 };
 
+// NC=1: every kernel's no-clamp entry (ATLAS_QWEN4EXP_MOE_NO_CLAMP).
+static bool nc() { return getenv("NC") && atoi(getenv("NC")); }
+
 static Variant production() {
     const char* M = "qwen4exp_moe_rows";
     CUfunction pl = load(M, "qwen4exp_moe_rows_plan"), gu = load(M, "qwen4exp_moe_rows_gate_up"),
-               sd = load(M, "qwen4exp_moe_rows_silu_down");
+               sd = load(M, nc() ? "qwen4exp_moe_rows_silu_down_nc" : "qwen4exp_moe_rows_silu_down");
     Variant v;
     v.name = "production rows";
     v.plan = [=](Pool&, Bufs& b, unsigned rows) {

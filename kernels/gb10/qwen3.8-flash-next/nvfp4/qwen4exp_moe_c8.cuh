@@ -139,6 +139,11 @@ __device__ __forceinline__ void c8_f32_row(const float* p, unsigned k16, float (
     __nv_bfloat16* __restrict__ sh_gate_out,                                   \
     __nv_bfloat16* __restrict__ sh_up_out, float* __restrict__ act,            \
     unsigned int top_k, unsigned int rows
+#define C8_GU_PASS                                                             \
+    A, gate_packed_ptrs, gate_scale_ptrs, gate_scale2_vals, up_packed_ptrs,    \
+    up_scale_ptrs, up_scale2_vals, sh_gate_packed, sh_gate_scale, sh_gate_s2,  \
+    sh_up_packed, sh_up_scale, sh_up_s2, ws, gate_out, up_out, sh_gate_out,    \
+    sh_up_out, act, top_k, rows
 #define C8_SD_ARGS                                                             \
     const float* __restrict__ act,                                             \
     const unsigned long long* __restrict__ packed_ptrs,                        \
