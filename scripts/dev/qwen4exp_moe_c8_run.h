@@ -20,7 +20,9 @@ static bool same(const std::string& what, const std::vector<unsigned char>& a,
 // ("fused"): only the down outputs are compared.
 static int run_check(Pool& pool) {
     Variant ref = production();
-    std::vector<Variant> vs = variants();
+    std::vector<Variant> vs;
+    for (auto& v : variants())
+        if (v.name.rfind("tc", 0) != 0) vs.push_back(v);  // contract (b): run_tc_check
     Bufs rb = alloc_bufs(), gb = alloc_bufs();
     std::vector<int> bad(vs.size(), 0);
     std::mt19937 rng(5);
@@ -134,4 +136,66 @@ static void run_time(Pool& pool, const std::string& only) {
         }
         for (auto& b : bs) { CK(cudaFree(b.ids)); CK(cudaFree(b.order)); CK(cudaFree(b.ws)); }
     }
+}
+
+// Contract (b) variants ("tc ..."): every row's down / shared-down / act
+// bytes alone (1 row) vs inside waves of 2..64 rows, and the largest
+// deviation from the production rows pair (relative to the row's max |out|).
+static int run_tc_check(Pool& pool) {
+    Variant ref = production();
+    Bufs wb = alloc_bufs(), sb = alloc_bufs(), rb = alloc_bufs();
+    std::mt19937 rng(17);
+    for (auto& v : variants()) {
+        if (v.name.rfind("tc", 0) != 0) continue;
+        int bad = 0, cases = 0;
+        double worst = 0;
+        for (unsigned rows : {2u, 3u, 4u, 8u, 16u, 17u, 32u, 33u, 64u}) {
+            for (double reuse : {0.0, 0.5, 0.9, 1.0}) {
+                auto a = rand_bf16((size_t)rows * H, 1.0f);
+                auto ids = c8_routes(rows, reuse, rng);
+                if (reuse == 1.0)
+                    for (unsigned r = 1; r < rows; r++)
+                        std::copy(ids.begin(), ids.begin() + TOPK, ids.begin() + r * TOPK);
+                for (Bufs* b : {&wb, &rb}) {
+                    CK(cudaMemcpy(b->A, a.data(), a.size() * 2, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(b->ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
+                }
+                v.plan(pool, wb, rows); v.gate_up(pool, wb, rows); v.silu_down(pool, wb, rows);
+                ref.plan(pool, rb, rows); ref.gate_up(pool, rb, rows); ref.silu_down(pool, rb, rows);
+                auto wd = dget(wb.down, (size_t)rows * TOPK * H * 2), ws = dget(wb.shd, (size_t)rows * H * 2);
+                auto rd = dget(rb.down, (size_t)rows * TOPK * H * 2), rs = dget(rb.shd, (size_t)rows * H * 2);
+                auto bf = [](const std::vector<unsigned char>& v, size_t i) {
+                    unsigned u = (unsigned)(v[2 * i] | (v[2 * i + 1] << 8)) << 16;
+                    float f; memcpy(&f, &u, 4); return f;
+                };
+                for (size_t row = 0; row < (size_t)rows * TOPK + rows; row++) {
+                    const bool sh = row >= (size_t)rows * TOPK;
+                    const auto& W = sh ? ws : wd; const auto& R = sh ? rs : rd;
+                    const size_t base = (sh ? row - (size_t)rows * TOPK : row) * H;
+                    double mx = 0, dv = 0;
+                    for (unsigned n = 0; n < H; n++) {
+                        mx = std::max(mx, (double)fabsf(bf(R, base + n)));
+                        dv = std::max(dv, (double)fabsf(bf(W, base + n) - bf(R, base + n)));
+                    }
+                    if (mx > 0) worst = std::max(worst, dv / mx);
+                }
+                for (unsigned r = 0; r < rows; r++) {
+                    std::vector<unsigned> one(ids.begin() + r * TOPK, ids.begin() + (r + 1) * TOPK);
+                    CK(cudaMemcpy(sb.A, a.data() + (size_t)r * H, H * 2, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(sb.ids, one.data(), TOPK * 4, cudaMemcpyHostToDevice));
+                    v.plan(pool, sb, 1); v.gate_up(pool, sb, 1); v.silu_down(pool, sb, 1);
+                    auto od = dget(sb.down, (size_t)TOPK * H * 2), os = dget(sb.shd, H * 2);
+                    bad += memcmp(od.data(), &wd[(size_t)r * TOPK * H * 2], od.size()) != 0;
+                    bad += memcmp(os.data(), &ws[(size_t)r * H * 2], os.size()) != 0;
+                    cases += 2;
+                }
+            }
+        }
+        printf("  %s  %-24s row invariance: %d of %d row outputs (routed top-10 block, shared) differ "
+               "between 1-row and 2..64-row launches; max |out - rows pair| / max|out| = %.3g\n",
+               bad ? "BAD" : "ok ", v.name.c_str(), bad, cases, worst);
+        g_fail += bad;
+    }
+    printf("%s\n", g_fail ? "FAIL" : "PASS");
+    return g_fail ? 1 : 0;
 }
