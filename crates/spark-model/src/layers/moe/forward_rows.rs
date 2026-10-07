@@ -221,7 +221,16 @@ impl MoeLayer {
             )?;
         }
         if let Some(path) = crate::model::qwen4exp_batch_fast::route_dump_path() {
-            super::route_dump::append(ctx.gpu, indices, slots, path, stream)?;
+            let launch = super::route_dump::Launch {
+                indices,
+                weights,
+                input,
+                rows,
+                top_k,
+                hidden: h,
+                layer: self.gate_ptrs.packed_ptrs.0,
+            };
+            super::route_dump::append(ctx.gpu, &launch, path, stream)?;
         }
 
         let expert_gate_out = ctx.buffers.expert_gate_out();
