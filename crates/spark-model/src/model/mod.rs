@@ -78,6 +78,7 @@ pub(crate) mod qwen4exp_batch_fast;
 pub(crate) mod qwen4exp_exact_verify;
 pub(crate) mod qwen4exp_lmhead_split;
 pub(crate) mod qwen4exp_mtp_depth;
+pub(crate) mod qwen4exp_step_copies;
 pub(crate) mod ssm_batched_copy;
 pub(crate) mod ssm_indexed_decode;
 pub(crate) mod ssm_pool;

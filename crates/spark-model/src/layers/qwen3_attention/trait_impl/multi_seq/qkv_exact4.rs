@@ -28,6 +28,7 @@ use anyhow::Result;
 use super::ctx::MultiSeqCtx;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
+use crate::model::qwen4exp_step_copies::{copy_rows, qkv_rows_2d};
 
 impl Qwen3AttentionLayer {
     /// Run the exact projections when they apply (`Ok(true)`), else leave
@@ -65,6 +66,7 @@ impl Qwen3AttentionLayer {
         }
         let kv_dim = nkv * hd;
         let kv_bytes = kv_dim as usize * bf16;
+        let rows_2d = qkv_rows_2d();
         let row = |i: usize| {
             let q = qkv_buf.offset(i * per_seq_qkv);
             let k = q.offset(q_proj_bytes);
@@ -149,14 +151,18 @@ impl Qwen3AttentionLayer {
                     )?,
                 }
             }
-            for i in 0..n {
-                fwd.gpu.copy_d2d_async(
-                    q_scratch.offset(i * q_proj_bytes),
-                    row(i).0,
-                    q_proj_bytes,
-                    stream,
-                )?;
-            }
+            // `ATLAS_QWEN4EXP_QKV_ROWS_2D`: the n row copies as one pitched copy.
+            copy_rows(
+                fwd.gpu,
+                q_scratch,
+                q_proj_bytes,
+                row(0).0,
+                per_seq_qkv,
+                q_proj_bytes,
+                n,
+                rows_2d,
+                stream,
+            )?;
         } else {
             for i in 0..n {
                 let normed_i = normed.offset(i * h * bf16);
@@ -191,12 +197,39 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
-            for i in 0..n {
-                let (_, k_out, v_out) = row(i);
-                fwd.gpu
-                    .copy_d2d_async(k_scratch.offset(i * kv_bytes), k_out, kv_bytes, stream)?;
-                fwd.gpu
-                    .copy_d2d_async(v_scratch.offset(i * kv_bytes), v_out, kv_bytes, stream)?;
+            let (_, k_out, v_out) = row(0);
+            if rows_2d {
+                // K rows then V rows: disjoint destinations, so the order the
+                // per-row loop interleaved them in does not change a byte.
+                for (src, dst) in [(k_scratch, k_out), (v_scratch, v_out)] {
+                    copy_rows(
+                        fwd.gpu,
+                        src,
+                        kv_bytes,
+                        dst,
+                        per_seq_qkv,
+                        kv_bytes,
+                        n,
+                        true,
+                        stream,
+                    )?;
+                }
+            } else {
+                for i in 0..n {
+                    let (_, k_out, v_out) = row(i);
+                    fwd.gpu.copy_d2d_async(
+                        k_scratch.offset(i * kv_bytes),
+                        k_out,
+                        kv_bytes,
+                        stream,
+                    )?;
+                    fwd.gpu.copy_d2d_async(
+                        v_scratch.offset(i * kv_bytes),
+                        v_out,
+                        kv_bytes,
+                        stream,
+                    )?;
+                }
             }
         } else {
             for i in 0..n {
