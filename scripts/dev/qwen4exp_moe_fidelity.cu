@@ -22,7 +22,16 @@
 // routing -- weights still the checkpoint's. LAYERS="0 24 47" (dump layer
 // order = layer order), RECS=<records a layer> (default 4).
 //
+// SUMMARY=1: one line a layer (all 48 cheaply). EMU=1: float64 emulations of
+// prefill's three E4M3 steps alone and with per-row scales.
+//
 // Build/run (repo root, GB10): scripts/dev/qwen4exp_moe_fidelity.sh <model dir>
+//
+// Preliminary (2026-10-06, ennspark03, real decode inputs: sparkDash prose
+// C8 dump, 40 rows a layer, all 48 layers): expert-output rel L2 vs float64
+// -- BF16 floor 1.66e-3, (b) 2.8-3.1e-3, (c) 3.1-3.6e-3, (d) 5.7-8.2e-2;
+// prefill's error is mostly W -> E4M3 (5.4-6.6e-2 alone); the decode clamp
+// fires only in layer 47 (0.002% of values) and costs 1.3e-2 there.
 #include "qwen4exp_moe_c8_bench.h"
 #include <map>
 #include <set>
