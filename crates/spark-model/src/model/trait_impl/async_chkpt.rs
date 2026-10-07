@@ -296,7 +296,8 @@ impl TransformerModel {
                     .is_some_and(|s| s.gdn_commit_pending)
             })
         {
-            return Ok(());
+            // ATLAS_QWEN4EXP_FINISH_LEAF: the leaf at the step's end.
+            return self.qwen4exp_leaf_after_commit(seq, num_accepted);
         }
 
         // `num_accepted == 0` has no representable rewind target here: the
@@ -401,7 +402,7 @@ impl TransformerModel {
         }
         run_ssm_state_copies(self.gpu.as_ref(), &h_plan, &conv_plan, stream)?;
         self.gpu.record_event(self.secondary_event, stream)?;
-        Ok(())
+        self.qwen4exp_leaf_after_commit(seq, num_accepted)
     }
 
     /// Set `gdn_commit_pending` on every GDN layer state of `seq` for a
