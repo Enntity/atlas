@@ -416,6 +416,18 @@ impl MoeLayer {
         if !self.q38_routed_serves(h, inter, ctx) {
             return Ok(false);
         }
+        // ATLAS_QWEN4EXP_PREFILL_MOE_BF16: the same work on the TC numerics.
+        let dims = (h, inter, num_experts, rows_per_expert_grid);
+        if self.try_tcp_routed_prefill(
+            expert_input,
+            expert_offsets,
+            sorted_token_ids,
+            dims,
+            ctx,
+            stream,
+        )? {
+            return Ok(true);
+        }
         let gpu = ctx.gpu;
         let k_a8 = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_a_to_e4m3");
         let k_gu =
