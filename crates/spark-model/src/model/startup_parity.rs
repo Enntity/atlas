@@ -125,7 +125,17 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
         Ok(finish_leaf::enabled() as u64)
     }),
     ("ATLAS_GLM_PC_FINISH_LEAF_BLOCKS", || {
-        while_on(finish_leaf::enabled(), finish_leaf::span_blocks)
+        let on = finish_leaf::enabled() || finish_leaf::qwen4exp_enabled();
+        while_on(on, finish_leaf::span_blocks)
+    }),
+    // Bit 0: where qwen4_exp's in-pass tail checkpoint lands (the switch
+    // alone); bit 1: its decode leaf (with the preconditions above).
+    ("ATLAS_QWEN4EXP_FINISH_LEAF", || {
+        let on = [
+            finish_leaf::qwen4exp_requested(),
+            finish_leaf::qwen4exp_enabled(),
+        ];
+        Ok(on.iter().enumerate().map(|(i, &b)| (b as u64) << i).sum())
     }),
     ("ATLAS_MARCONI_EXACT", || {
         Ok(mtp_carry::marconi_exact() as u64)
