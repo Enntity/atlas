@@ -94,6 +94,9 @@ impl Qwen4ExpMoeRows {
         let m = "qwen4exp_moe_rows";
         let small = crate::model::qwen4exp_batch_fast::small_requested();
         let tc = crate::model::qwen4exp_batch_fast::tc_requested();
+        // ATLAS_QWEN4EXP_MOE_NO_CLAMP: every silu/down and units entry without
+        // the routed SwiGLU clamp, as serial decode's (`moe::init`).
+        let nc = crate::model::qwen4exp_batch_fast::no_clamp_requested(&config.model_type);
         let units = tc || crate::model::qwen4exp_batch_fast::units_requested();
         let off = KernelHandle(0);
         if tc {
@@ -105,13 +108,21 @@ impl Qwen4ExpMoeRows {
         let (units_plan, units_gate_up, units_down) = if tc {
             (
                 try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_plan"),
-                try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_gate_up"),
+                if nc {
+                    try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_gate_up_nc")
+                } else {
+                    try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_gate_up")
+                },
                 try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_down"),
             )
         } else if units {
             (
                 try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_plan"),
-                try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_gate_up"),
+                if nc {
+                    try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_gate_up_nc")
+                } else {
+                    try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_gate_up")
+                },
                 try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_down"),
             )
         } else {
@@ -120,7 +131,11 @@ impl Qwen4ExpMoeRows {
         Self {
             plan: try_kernel(gpu, m, "qwen4exp_moe_rows_plan"),
             gate_up: try_kernel(gpu, m, "qwen4exp_moe_rows_gate_up"),
-            silu_down: try_kernel(gpu, m, "qwen4exp_moe_rows_silu_down"),
+            silu_down: if nc {
+                try_kernel(gpu, m, "qwen4exp_moe_rows_silu_down_nc")
+            } else {
+                try_kernel(gpu, m, "qwen4exp_moe_rows_silu_down")
+            },
             topk: if small {
                 try_kernel(gpu, "moe_topk", "moe_topk_softmax_rows")
             } else {
