@@ -348,6 +348,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
             .ok_or_else(|| anyhow::anyhow!("Invalid qwen4_exp MTP proposer state"))?;
 
         qwen4exp_mtp_kv::settle_unverified(st);
+        crate::layers::qsa::draft_share_set(st.body_state.as_mut(), true); // MTP_INDEX_SHARE
         let mut drafts = Vec::with_capacity(num_drafts);
         let mut current_token = last_token;
         for i in 0..num_drafts {
@@ -387,6 +388,7 @@ impl DraftProposer for Qwen4ExpMtpHead {
             drafts.push(draft);
             current_token = draft;
         }
+        crate::layers::qsa::draft_share_set(st.body_state.as_mut(), false);
         st.last_num_drafted = drafts.len();
         st.awaiting_verdict = true;
         Ok(drafts)

@@ -121,6 +121,7 @@ impl QsaIndexer {
             cap: 0,
             block_keys: DevicePtr(0),
             raw: RawWindow::EMPTY,
+            share: super::qsa_decode_rows::DraftShare::Off,
         })
     }
 
