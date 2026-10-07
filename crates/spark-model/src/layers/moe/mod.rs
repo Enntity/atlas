@@ -180,6 +180,7 @@ mod gate_up_repack_test_gpu;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;
+mod route_dump;
 mod shared_fp8_cache;
 mod shared_fp8_cache_load;
 mod shared_fp8_cache_output;
