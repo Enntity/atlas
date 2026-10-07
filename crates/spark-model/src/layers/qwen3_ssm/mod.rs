@@ -421,6 +421,7 @@ mod ckpt_capture;
 mod debug;
 mod exact_rows;
 mod fla_dispatch;
+mod gdn_defer;
 pub mod gdn_flags;
 mod gdn_fused_rows;
 mod init;

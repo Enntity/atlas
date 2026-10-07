@@ -199,6 +199,8 @@ mod quant_dispatch;
 pub mod qwen4exp;
 #[path = "ops/qwen4exp_decode_fuse.rs"]
 pub mod qwen4exp_decode_fuse;
+#[path = "ops/qwen4exp_gdn_defer.rs"]
+pub mod qwen4exp_gdn_defer;
 #[path = "ops/qwen4exp_gdn_rows.rs"]
 pub mod qwen4exp_gdn_rows;
 #[path = "ops/qwen4exp_moe.rs"]

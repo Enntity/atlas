@@ -328,6 +328,9 @@ impl TransformerModel {
         // (src, dst, bytes) triples, the per-layer loop issued.
         let mut h_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
+        // ATLAS_QWEN4EXP_EXACT_DEFER: replayed from H0, h and conv, one launch.
+        let mut exact_layers = Vec::new();
+        let exact = self.gdn_pending_is_exact();
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) != LayerType::LinearAttention {
                 continue;
@@ -336,6 +339,12 @@ impl TransformerModel {
                 .as_any_mut()
                 .downcast_mut::<SsmLayerState>()
                 .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
+            if exact && ssm.gdn_commit_pending {
+                ssm.gdn_commit_pending = false;
+                exact_layers.push(self.gdn_exact_commit_entry(i, ssm));
+                ssm_layer_idx += 1;
+                continue;
+            }
 
             // Pool h STORAGE width (SSOT: ssm_reserve::ssm_h_stored_bytes).
             let h_bytes = self.ssm_pool.h_stored_bytes;
@@ -387,6 +396,9 @@ impl TransformerModel {
 
             ssm_layer_idx += 1;
         }
+        if !exact_layers.is_empty() {
+            self.commit_gdn_exact(&exact_layers, num_accepted, stream)?;
+        }
         run_ssm_state_copies(self.gpu.as_ref(), &h_plan, &conv_plan, stream)?;
         self.gpu.record_event(self.secondary_event, stream)?;
         Ok(())
@@ -409,9 +421,17 @@ impl TransformerModel {
                 continue;
             }
             let defer = self.layers[i].gdn_deferred_wyn(&self.levers, num_tokens);
+            // ATLAS_QWEN4EXP_EXACT_DEFER rides the same staging pools.
+            let exact = self.layers[i].gdn_exact_defer(
+                self.gpu.as_ref(),
+                &self.levers,
+                &self.config,
+                num_tokens,
+            );
             if let Some(ssm) = state.as_any_mut().downcast_mut::<SsmLayerState>() {
-                ssm.gdn_commit_pending =
-                    defer && ssm.h_inter_pool_layout(num_tokens, self.ssm_pool.h_stored_bytes);
+                ssm.gdn_commit_pending = (defer
+                    && ssm.h_inter_pool_layout(num_tokens, self.ssm_pool.h_stored_bytes))
+                    || (exact && !ssm.gdn_commit_qkv.is_null() && !ssm.gdn_commit_gb.is_null());
             }
         }
     }
@@ -466,4 +486,5 @@ impl TransformerModel {
     }
 }
 
+mod gdn_exact_commit;
 mod kda_commit;

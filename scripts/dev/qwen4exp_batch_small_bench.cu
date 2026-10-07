@@ -821,6 +821,8 @@ static void rec_time(const GdnShape& s) {
     }
 }
 
+// qwen4exp_gdn_defer_bench.cu includes this file for its GDN fixtures.
+#ifndef QB_SMALL_NO_MAIN
 int main(int argc, char** argv) {
     if (argc > 1) g_dir = argv[1];
     const std::string mode = argc > 2 ? argv[2] : "check";
@@ -848,3 +850,4 @@ int main(int argc, char** argv) {
     rec_time(tp2);
     return 0;
 }
+#endif  // QB_SMALL_NO_MAIN
