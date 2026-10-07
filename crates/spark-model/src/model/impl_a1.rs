@@ -754,6 +754,7 @@ impl TransformerModel {
             // Nothing staged yet: the buffer was memset to zero above, and no
             // key describes zero, so the first verify step always uploads.
             verify_wy_cache: Mutex::new(None),
+            verify_bt_stage: Mutex::new(super::pinned_upload::PinnedUpload::EMPTY),
             verify_kgamma_graph: Mutex::new(std::collections::HashMap::new()),
             fused_graph: Mutex::new(std::collections::HashMap::new()),
             verify_pieces: Default::default(),

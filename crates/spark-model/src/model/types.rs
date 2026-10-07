@@ -372,6 +372,10 @@ pub struct TransformerModel {
     /// Kill switch `ATLAS_NO_VERIFY_WY_CACHE` (PRESENCE) restores the
     /// unconditional re-stage.
     pub(super) verify_wy_cache: Mutex<Option<Vec<u64>>>,
+    /// `ATLAS_QWEN4EXP_VERIFY_BT_PINNED=1`: page-locked staging for the
+    /// batched verify's block-table image (`model/pinned_upload.rs`). Empty
+    /// until the first such upload; freed in `Drop`.
+    pub(super) verify_bt_stage: Mutex<super::pinned_upload::PinnedUpload>,
     /// Cached CUDA graphs for DFlash K=γ verification, keyed by
     /// `(seq.slot_idx, K)`. K is `tokens.len()` (γ+1 typically). One graph
     /// per (slot, K) — different γ values coexist via the K dimension.
