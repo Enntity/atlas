@@ -27,6 +27,10 @@
 //!   single-row blend. Under `ATLAS_QWEN4EXP_BATCH_SMALL` the rows' top-k
 //!   and blends are one launch each (`moe_topk_softmax_rows`,
 //!   `moe_weighted_sum_blend_rows`: a block per row of the single-row body).
+//!   Under `ATLAS_QWEN4EXP_MOE_UNITS` gate/up and silu/down are the expert
+//!   units of `qwen4exp_moe_c8.cu` (up to 64 rows): each weight decoded once
+//!   for all the rows that picked its expert, SiLU in the gate/up epilogue,
+//!   the same output bytes.
 //! * **Per-row local** (anything else): each row's local part is
 //!   [`MoeLayer::forward_row_local`], the same calls on the same buffers.
 //!
@@ -216,47 +220,77 @@ impl MoeLayer {
                 stream,
             )?;
         }
-        k.plan(ctx.gpu, indices, order, slots, stream)?;
+        if let Some(path) = crate::model::qwen4exp_batch_fast::route_dump_path() {
+            super::route_dump::append(ctx.gpu, indices, slots, path, stream)?;
+        }
 
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
         let expert_down_out = ctx.buffers.expert_down_out();
-        // The single-row arm's shared gate/up scratch, `rows` deep.
-        let shared_gate_scratch = ctx.buffers.logits();
-        let shared_up_scratch = ctx.buffers.ssm_qkvz();
         let (h32, inter32, top_k32, rows32) = (h as u32, inter as u32, top_k as u32, rows as u32);
         let table = |t: &ExpertPtrTable| (t.packed_ptrs, t.scale_ptrs, t.scale2_vals);
-        k.gate_up(
-            ctx.gpu,
-            input,
-            table(&self.gate_ptrs),
-            expert_gate_out,
-            table(&self.up_ptrs),
-            expert_up_out,
-            indices,
-            order,
-            &self.weights.shared_expert.gate_proj,
-            shared_gate_scratch,
-            &self.weights.shared_expert.up_proj,
-            shared_up_scratch,
-            (inter32, h32, top_k32, rows32),
-            stream,
-        )?;
-        k.silu_down(
-            ctx.gpu,
-            expert_gate_out,
-            expert_up_out,
-            table(&self.down_ptrs),
-            expert_down_out,
-            indices,
-            order,
-            shared_gate_scratch,
-            shared_up_scratch,
-            &self.weights.shared_expert.down_proj,
-            shared_out,
-            (h32, inter32, top_k32, rows32),
-            stream,
-        )?;
+        let shared = &self.weights.shared_expert;
+        if k.units_ready() && rows <= ops::QWEN4EXP_MOE_UNITS_MAX_ROWS {
+            // ATLAS_QWEN4EXP_MOE_UNITS: the expert units, the same bytes. The
+            // gate/up rows are not materialized, so their buffers hold the
+            // FP32 activations and the plan.
+            let sizes = ctx.buffers.sizes();
+            anyhow::ensure!(
+                (slots + rows) * inter * 4 <= sizes.expert_gate_out
+                    && ops::QWEN4EXP_MOE_UNITS_WS_BYTES <= sizes.expert_up_out,
+                "qwen4exp MoE units: {rows} rows overrun the expert gate/up buffers"
+            );
+            k.units(
+                ctx.gpu,
+                input,
+                table(&self.gate_ptrs),
+                table(&self.up_ptrs),
+                table(&self.down_ptrs),
+                indices,
+                (expert_up_out, expert_gate_out),
+                (&shared.gate_proj, &shared.up_proj, &shared.down_proj),
+                expert_down_out,
+                shared_out,
+                (h32, inter32, top_k32, rows32),
+                stream,
+            )?;
+        } else {
+            k.plan(ctx.gpu, indices, order, slots, stream)?;
+            // The single-row arm's shared gate/up scratch, `rows` deep.
+            let shared_gate_scratch = ctx.buffers.logits();
+            let shared_up_scratch = ctx.buffers.ssm_qkvz();
+            k.gate_up(
+                ctx.gpu,
+                input,
+                table(&self.gate_ptrs),
+                expert_gate_out,
+                table(&self.up_ptrs),
+                expert_up_out,
+                indices,
+                order,
+                &shared.gate_proj,
+                shared_gate_scratch,
+                &shared.up_proj,
+                shared_up_scratch,
+                (inter32, h32, top_k32, rows32),
+                stream,
+            )?;
+            k.silu_down(
+                ctx.gpu,
+                expert_gate_out,
+                expert_up_out,
+                table(&self.down_ptrs),
+                expert_down_out,
+                indices,
+                order,
+                shared_gate_scratch,
+                shared_up_scratch,
+                &shared.down_proj,
+                shared_out,
+                (h32, inter32, top_k32, rows32),
+                stream,
+            )?;
+        }
 
         // Each row's blend, as `forward_row_local` runs it: under EP against a
         // zeroed shared row (the EP reduce adds the shared expert once).
