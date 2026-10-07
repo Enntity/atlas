@@ -26,6 +26,7 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use super::{QsaIndexer, QsaSeqState};
+use crate::layers::ops;
 
 /// Positions per window buffer (and the growth granule). Two buffers of
 /// this at hd 128 cost 2 MiB per layer and sequence.
@@ -141,6 +142,35 @@ impl QsaIndexer {
             }
             st.raw.cur = next;
             st.raw.base = keep_from;
+        }
+        Ok(())
+    }
+
+    /// Pool every block the ingested raw keys completed since the last call.
+    pub(super) fn pool_new_blocks(
+        &self,
+        st: &mut QsaSeqState,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        let complete = st.ingested / self.ratio as usize;
+        if complete > st.pooled {
+            ops::qsa_block_pool(
+                gpu,
+                self.k_pool_k,
+                self.raw_origin(st),
+                self.k_norm_w,
+                st.block_keys,
+                st.pooled as u32,
+                (complete - st.pooled) as u32,
+                self.ratio,
+                self.hd,
+                self.rot,
+                self.theta,
+                self.eps,
+                stream,
+            )?;
+            st.pooled = complete;
         }
         Ok(())
     }
