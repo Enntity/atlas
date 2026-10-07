@@ -65,6 +65,9 @@ pub struct Qwen4ExpMoeRows {
     pub units_plan: KernelHandle,
     pub units_gate_up: KernelHandle,
     pub units_down: KernelHandle,
+    /// The units are the tensor-core kernels (`ATLAS_QWEN4EXP_MOE_TC=1`,
+    /// contract (b)): serial decode must take them too.
+    pub units_tc: bool,
 }
 
 impl Qwen4ExpMoeRows {
@@ -77,6 +80,7 @@ impl Qwen4ExpMoeRows {
         units_plan: KernelHandle(0),
         units_gate_up: KernelHandle(0),
         units_down: KernelHandle(0),
+        units_tc: false,
     };
 
     pub fn resolve(gpu: &dyn GpuBackend, config: &ModelConfig) -> Self {
@@ -89,8 +93,30 @@ impl Qwen4ExpMoeRows {
         }
         let m = "qwen4exp_moe_rows";
         let small = crate::model::qwen4exp_batch_fast::small_requested();
-        let units = crate::model::qwen4exp_batch_fast::units_requested();
+        let tc = crate::model::qwen4exp_batch_fast::tc_requested();
+        let units = tc || crate::model::qwen4exp_batch_fast::units_requested();
         let off = KernelHandle(0);
+        if tc {
+            tracing::info!(
+                "qwen4_exp MoE tensor-core units ON (ATLAS_QWEN4EXP_MOE_TC=1): verify rows AND \
+                 serial decode on qwen4exp_moe_c8_tc.cu -- a new numerics baseline (contract (b))"
+            );
+        }
+        let (units_plan, units_gate_up, units_down) = if tc {
+            (
+                try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_plan"),
+                try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_gate_up"),
+                try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_down"),
+            )
+        } else if units {
+            (
+                try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_plan"),
+                try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_gate_up"),
+                try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_down"),
+            )
+        } else {
+            (off, off, off)
+        };
         Self {
             plan: try_kernel(gpu, m, "qwen4exp_moe_rows_plan"),
             gate_up: try_kernel(gpu, m, "qwen4exp_moe_rows_gate_up"),
@@ -98,28 +124,17 @@ impl Qwen4ExpMoeRows {
             topk: if small {
                 try_kernel(gpu, "moe_topk", "moe_topk_softmax_rows")
             } else {
-                KernelHandle(0)
+                off
             },
             blend: if small {
                 try_kernel(gpu, "moe_expert_gemv", "moe_weighted_sum_blend_rows")
             } else {
-                KernelHandle(0)
-            },
-            units_plan: if units {
-                try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_plan")
-            } else {
                 off
             },
-            units_gate_up: if units {
-                try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_gate_up")
-            } else {
-                off
-            },
-            units_down: if units {
-                try_kernel(gpu, "qwen4exp_moe_c8", "qwen4exp_moe_c8_down")
-            } else {
-                off
-            },
+            units_plan,
+            units_gate_up,
+            units_down,
+            units_tc: tc,
         }
     }
 

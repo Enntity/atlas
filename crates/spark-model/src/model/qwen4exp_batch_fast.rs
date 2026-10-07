@@ -136,6 +136,19 @@ pub(crate) fn units_requested() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_UNITS").as_deref() == Ok("1"))
 }
 
+/// `ATLAS_QWEN4EXP_MOE_TC=1`, read once: the expert units on TENSOR CORES
+/// (`qwen4exp_moe_c8_tc.cu`) -- exactness contract (b), a new numerics
+/// baseline: BF16 weights `lut * dec(scale)` (exact), BF16 activations,
+/// FP32 MMA accumulation, scale2 per output. Row-invariant, and serial
+/// decode's single-row MoE switches to the same kernels (`forward_row_local`),
+/// so speculation stays exact against serial decode under the switch; NOT
+/// today's bytes. Takes precedence over `ATLAS_QWEN4EXP_MOE_UNITS`. Both
+/// ranks must agree on it (each rank's routed sums meet in the EP all-reduce).
+pub(crate) fn tc_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_TC").as_deref() == Ok("1"))
+}
+
 /// `ATLAS_QWEN4EXP_MOE_ROUTE_DUMP=<file>` (diagnostic): each rows-pair MoE
 /// launch appends its `[rows, top_k]` expert ids to `<file>` as one line
 /// (synchronizing the stream). `scripts/dev/qwen4exp_moe_c8_bench.cu` replays
