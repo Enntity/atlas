@@ -171,6 +171,7 @@ mod forward_prefill_route;
 pub(crate) mod forward_prefill_route_sp;
 mod forward_prefill_routed;
 mod forward_prefill_router;
+mod forward_prefill_tcp;
 mod forward_rows;
 mod forward_token_major;
 mod gate_up_m16;
