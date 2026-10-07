@@ -10,6 +10,7 @@ use spark_runtime::kernel_args::KernelLaunch;
 use super::hyper_connection_lowrank_gemm::{
     hc_fast, hc_finish_block, hc_finish_x4, hc_token_fused, hc_wide,
 };
+use super::hyper_connection_lowrank_mma::{hc_mma_down_finish, hc_stage_split};
 use super::qwen4exp_decode_fuse::{HcPostFold, hc_post_stage};
 use crate::layers::qwen3_attention::HcLowRank;
 
@@ -123,11 +124,12 @@ fn hc_pre_vec(
             stream,
         )?;
     } else {
-        let split = if wide {
+        let fixed = if wide {
             HC_V_WIDE_STAGE_SPLIT
         } else {
             HC_V_STAGE_SPLIT
         };
+        let split = hc_stage_split(gpu, num_tokens, HC_V_STAGE_SPLIT, fixed);
         KernelLaunch::new(gpu, k_stage)
             .grid([num_tokens, split, 1])
             .block([1024, 1, 1])
@@ -140,6 +142,11 @@ fn hc_pre_vec(
             .launch(stream)?;
     }
 
+    // ATLAS_QWEN4EXP_HC_MMA: down + finish on tensor cores (contract (b)).
+    let mma = [normed, low, y_out, inj_out];
+    if hc_mma_down_finish(gpu, w, mma, [num_tokens, hidden_size, hc_mult], stream)? {
+        return Ok(true);
+    }
     // `inj_out` NULL is the model-level head: no injection rows.
     let rows = rank + if inj_out.is_null() { 0 } else { hc_mult };
     let (cpt, down_groups) = if wide {
