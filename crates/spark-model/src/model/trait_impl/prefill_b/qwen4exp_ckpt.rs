@@ -22,6 +22,23 @@
 //! depth of the next turn is agreed across ranks as before
 //! (`pc_policy::agree_restore`), so a rank that could not capture (no free
 //! slot) only makes the pair restore shallower.
+//!
+//! # Off the block grid (`ATLAS_QWEN4EXP_FINISH_LEAF=1`)
+//!
+//! `cp` is a 64-row chunk boundary of the PASS, so it is a block boundary
+//! only when the pass starts on one. A prompt's last pass starts at a chunk
+//! boundary of the prefill, and an idle prefill's chunk is the arena
+//! (`max_batch_tokens` = the prefill budget plus the decode rows, 16388 for a
+//! 16384 budget at 4 sequences: `initial_chunk_budget`). Every chunk after
+//! the first then starts 4 tokens past a block boundary (65540 for the fifth),
+//! no `cp` of the last pass is a block boundary, and a multi-chunk prompt got
+//! no tail checkpoint at all: its next turn restored the last chunk boundary
+//! and replayed up to a whole chunk. With the switch `cp` only has to be a
+//! QSA pool-block boundary (the indexer blob is rebuilt from whole pooled
+//! blocks, [`qsa_blob_at`]). A checkpoint off the block grid is an ordinary
+//! one: the index and the restore take any length (the chunk-boundary
+//! checkpoints are already such), and a lookup restores it whenever the
+//! whole-block match reaches it.
 
 use anyhow::Result;
 use atlas_core::config::LayerType;
@@ -41,19 +58,67 @@ thread_local! {
 
 /// Where `cp` lands for a pass over `[start, start + count)` and a tail cut
 /// `cut`: the last 64-token chunk boundary of the pass at or below the cut,
-/// when that is a block boundary strictly inside the pass.
-pub(super) fn ckpt_row(start: usize, count: usize, cut: usize, bs: usize) -> Option<usize> {
-    if bs == 0 || !(start < cut && cut < start + count) {
+/// when that is a multiple of `align` (the block size, or with
+/// `ATLAS_QWEN4EXP_FINISH_LEAF` the QSA ratio) strictly inside the pass.
+pub(super) fn ckpt_row(start: usize, count: usize, cut: usize, align: usize) -> Option<usize> {
+    if align == 0 || !(start < cut && cut < start + count) {
         return None;
     }
     let cp = start + (cut - start) / ckpt::CHUNK * ckpt::CHUNK;
-    (cp > start && cp.is_multiple_of(bs)).then_some(cp)
+    (cp > start && cp.is_multiple_of(align)).then_some(cp)
+}
+
+/// [`ckpt_row`] with the alignment the switch picks, for a QSA ratio `ratio`
+/// and blocks of `bs`.
+pub(super) fn tail_ckpt_row(
+    start: usize,
+    count: usize,
+    cut: usize,
+    bs: usize,
+    ratio: usize,
+    off_grid: bool,
+) -> Option<usize> {
+    let ratio = ratio.max(1);
+    let align = if off_grid { ratio } else { bs };
+    ckpt_row(start, count, cut, align).filter(|cp| cp.is_multiple_of(ratio))
 }
 
 impl TransformerModel {
     /// The last chunk runs unsplit: the checkpoint is captured in-pass.
     pub(super) fn qwen4exp_ckpt_takes_tail(&self) -> bool {
         ckpt::requested() && self.config.model_type == "qwen4_exp"
+    }
+
+    /// Where the in-pass checkpoint of a pass over `[start, start + count)`
+    /// lands for the tail cut `cut` ([`tail_ckpt_row`]).
+    fn qwen4exp_ckpt_row(
+        &self,
+        start: usize,
+        count: usize,
+        cut: usize,
+        bs: usize,
+    ) -> Option<usize> {
+        let off_grid = crate::model::trait_impl::finish_leaf::qwen4exp_requested();
+        let ratio = self.config.indexer_compress_ratio;
+        tail_ckpt_row(start, count, cut, bs, ratio, off_grid)
+    }
+
+    /// Whether a prefill of a `total`-token prompt whose last pass starts at
+    /// `start` saves a tail checkpoint of its own: the tail split's when the
+    /// cut lies past `start`, or the in-pass one when its row exists.
+    pub(in crate::model) fn tail_checkpoint_follows(
+        &self,
+        total: usize,
+        start: usize,
+        bs: usize,
+    ) -> bool {
+        let cut = super::pc_policy::tail_cut(total, bs);
+        if self.qwen4exp_ckpt_takes_tail() {
+            let count = total.saturating_sub(start);
+            self.qwen4exp_ckpt_row(start, count, cut, bs).is_some()
+        } else {
+            start < cut
+        }
     }
 
     /// The pass's in-pass capture plan: the qwen4_exp checkpoint, else the
@@ -100,9 +165,7 @@ impl TransformerModel {
         }
         let bs = kv_cache.block_size();
         let cut = super::pc_policy::tail_cut(tokens.len(), bs);
-        let ratio = self.config.indexer_compress_ratio.max(1);
-        let Some(cp) = ckpt_row(proc_start, proc_count, cut, bs).filter(|cp| cp % ratio == 0)
-        else {
+        let Some(cp) = self.qwen4exp_ckpt_row(proc_start, proc_count, cut, bs) else {
             tracing::info!(
                 "qwen4_exp mid-chunk checkpoint: no 64-token boundary in [{proc_start}, {cut}]"
             );
@@ -112,6 +175,9 @@ impl TransformerModel {
             tracing::warn!("qwen4_exp mid-chunk checkpoint: no snapshot slot for token {cp}");
             return Ok(None);
         };
+        // A finish leaf's copy into this slot may still be in flight on
+        // another stream (no-op without a finish-leaf flag).
+        self.finish_leaf_wait_copies(stream)?;
         let n = self.ssm_snapshots.num_ssm_layers();
         let h_dsts = (0..n)
             .map(|l| self.ssm_snapshots.tail_h_dst(l, slot))
@@ -167,6 +233,8 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<()> {
         let (h_done, ple_done) = ckpt::end();
+        // The pass wrote the slot: order the next writer after it.
+        self.finish_leaf_record_copy(stream)?;
         let has_ple = self.config.ple_layer_ids.iter().any(|&id| id > 0);
         let n = self.ssm_snapshots.num_ssm_layers();
         // Never index blocks past the contiguous fully-written KV (as
@@ -357,51 +425,5 @@ pub(super) fn qsa_blob_at(blob: &[u8], cp: usize, ratio: usize, row: usize) -> O
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{ckpt_row, qsa_blob_at};
-
-    #[test]
-    fn the_row_is_the_last_chunk_boundary_at_or_below_the_cut() {
-        // Cold 16046-token prompt: cut 16016 (bs 16) -> 16000.
-        assert_eq!(ckpt_row(0, 16046, 16016, 16), Some(16000));
-        // Last chunk of a 28K prompt starting at 16384.
-        assert_eq!(ckpt_row(16384, 11616, 27984, 16), Some(27968));
-        // A warm pass from a block boundary that is not 64-aligned.
-        assert_eq!(ckpt_row(1008, 900, 1888, 16), Some(1840));
-        // No full chunk below the cut, or the cut outside the pass.
-        assert_eq!(ckpt_row(1000, 100, 1050, 16), None);
-        assert_eq!(ckpt_row(0, 500, 600, 16), None);
-        assert_eq!(ckpt_row(0, 500, 0, 16), None);
-        for start in (0..512).step_by(16) {
-            for cut in start + 1..start + 700 {
-                if let Some(cp) = ckpt_row(start, 1000, cut, 16) {
-                    assert!(cp > start && cp <= cut && cut - cp < 64 && (cp - start) % 64 == 0);
-                    assert_eq!(cp % 16, 0);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_qsa_blob_keeps_the_pooled_prefix() {
-        let (ratio, row) = (4usize, 6usize);
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&(1003u64).to_le_bytes());
-        blob.extend_from_slice(&(250u64).to_le_bytes());
-        let keys: Vec<u8> = (0..250 * row).map(|i| (i % 251) as u8).collect();
-        blob.extend_from_slice(&keys);
-        blob.extend_from_slice(&[9u8; 3 * 6]); // raw tail of 3 rows
-        let got = qsa_blob_at(&blob, 960, ratio, row).unwrap();
-        assert_eq!(u64::from_le_bytes(got[..8].try_into().unwrap()), 960);
-        assert_eq!(u64::from_le_bytes(got[8..16].try_into().unwrap()), 240);
-        assert_eq!(&got[16..], &keys[..240 * row]);
-        assert!(
-            qsa_blob_at(&blob, 962, ratio, row).is_none(),
-            "not a block boundary"
-        );
-        assert!(
-            qsa_blob_at(&blob, 1004, ratio, row).is_none(),
-            "past ingested"
-        );
-    }
-}
+#[path = "qwen4exp_ckpt_tests.rs"]
+mod tests;
