@@ -126,6 +126,30 @@ pub(crate) fn small_lever() -> bool {
     on
 }
 
+/// `ATLAS_QWEN4EXP_MOE_UNITS=1`, read once: under the lane, the rows pair's
+/// routed + shared experts go through `qwen4exp_moe_c8.cu`'s expert units
+/// (each weight decoded once for every row that picked it, SiLU in the
+/// gate/up epilogue, down's lane chains rebalanced) -- the same bytes as the
+/// rows pair, so the ranks need not agree on it.
+pub(crate) fn units_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_UNITS").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_QWEN4EXP_MOE_ROUTE_DUMP=<file>` (diagnostic): each rows-pair MoE
+/// launch appends its `[rows, top_k]` expert ids to `<file>` as one line
+/// (synchronizing the stream). `scripts/dev/qwen4exp_moe_c8_bench.cu` replays
+/// the lines (`ROUTES=<file>`). Read once.
+pub(crate) fn route_dump_path() -> Option<&'static str> {
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var("ATLAS_QWEN4EXP_MOE_ROUTE_DUMP")
+            .ok()
+            .filter(|p| !p.is_empty())
+    })
+    .as_deref()
+}
+
 /// `ATLAS_QWEN4EXP_BATCH_FAST_CHECK=1`, read once.
 pub(crate) fn check_requested() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
