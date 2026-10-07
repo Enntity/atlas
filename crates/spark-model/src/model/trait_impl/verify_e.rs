@@ -421,28 +421,24 @@ impl TransformerModel {
         // Block tables: row r = seq i's table (bt staging sized for
         // VERIFY_ROW_CAP rows, sizes.rs `bt_rows`). Ghost rows read only entry 0 (causal clamp 1)
         // — point it at the dummy KV block, matching decode_a2's pad rows.
-        let needed = r_up * mb;
-        let mut bt_buf = vec![0i32; needed];
-        for (i, seq) in seqs.iter().enumerate() {
-            for j in 0..ks[i] {
-                let row = off[i] + j;
-                for (bi, &block) in seq.block_table.iter().enumerate().take(mb) {
-                    bt_buf[row * mb + bi] = block as i32;
+        // `ATLAS_QWEN4EXP_VERIFY_BT_PINNED`: built in page-locked staging
+        // instead of a fresh pageable `Vec` (`model/pinned_upload.rs`).
+        let fill = |bt_buf: &mut [i32]| {
+            for (i, seq) in seqs.iter().enumerate() {
+                for j in 0..ks[i] {
+                    let row = off[i] + j;
+                    for (bi, &block) in seq.block_table.iter().enumerate().take(mb) {
+                        bt_buf[row * mb + bi] = block as i32;
+                    }
                 }
             }
-        }
-        for row in r_total..r_up {
-            bt_buf[row * mb] = self.dummy_kv_block as i32;
-        }
-        // SAFETY: `bt_buf` is `vec![0i32; needed]` on the line above, so its
-        // LEN is `needed` and `needed * 4 == size_of_val(&bt_buf[..])` — the
-        // read stops at `len`, never in the `Vec`'s spare capacity. Zero-init
-        // at construction covers the rows/columns the fill loop skips when
-        // `block_table.len() < mb`.
-        let bt_bytes =
-            unsafe { std::slice::from_raw_parts(bt_buf.as_ptr() as *const u8, needed * 4) };
-        self.gpu.copy_h2d_async(
-            bt_bytes,
+            for row in r_total..r_up {
+                bt_buf[row * mb] = self.dummy_kv_block as i32;
+            }
+        };
+        self.upload_i32_image(
+            r_up * mb,
+            fill,
             meta_base.offset(super::verify_e2::META_BT_OFF),
             stream,
         )?;
