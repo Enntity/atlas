@@ -105,6 +105,26 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// `ATLAS_QWEN4EXP_EXACT_DEFER`: whether this layer's exact verify at
+    /// `num_tokens` rows a sequence runs deferred
+    /// (`layers/ops/qwen4exp_gdn_defer.rs`). Host-side and pure like
+    /// [`Self::gdn_deferred_wyn`], for the same reason. Default: never.
+    fn gdn_exact_defer(
+        &self,
+        _gpu: &dyn spark_runtime::gpu::GpuBackend,
+        _levers: &crate::layers::ops::ModelLevers,
+        _config: &atlas_core::config::ModelConfig,
+        _num_tokens: usize,
+    ) -> bool {
+        false
+    }
+
+    /// The conv1d weight the exact deferred commit replays with. NULL on
+    /// non-GDN layers.
+    fn gdn_conv_weight(&self) -> spark_runtime::gpu::DevicePtr {
+        spark_runtime::gpu::DevicePtr::NULL
+    }
+
     /// `gated_delta_rule_commit` handle for the deferred-commit accept path
     /// (ATLAS_GDN_DEFERRED_COMMIT). KernelHandle(0) on non-GDN layers; the
     /// accept path only consults it when the layer's `gdn_commit_pending`
