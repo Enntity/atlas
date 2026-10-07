@@ -38,11 +38,7 @@ impl PleLayer {
         stream: u64,
     ) -> Result<()> {
         let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
-        buf.clear();
-        buf.extend_from_slice(&(st.history.len() as u32).to_le_bytes());
-        for t in &st.history {
-            buf.extend_from_slice(&t.to_le_bytes());
-        }
+        write_aux_head(buf, &st.history);
         let off = buf.len();
         buf.resize(off + conv_bytes, 0);
         crate::layers::aux_d2h::copy(gpu, st.conv, &mut buf[off..], stream)?;
@@ -57,26 +53,48 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        anyhow::ensure!(blob.len() >= 4, "PLE aux blob truncated");
-        let n = u32::from_le_bytes(blob[..4].try_into().unwrap()) as usize;
         let conv_bytes = self.state_len * self.hc_mult * self.hidden * 4;
-        anyhow::ensure!(
-            blob.len() == 4 + n * 4 + conv_bytes,
-            "PLE aux blob size mismatch"
-        );
-        st.history = blob[4..4 + n * 4]
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let (history, conv) = parse_aux(blob, conv_bytes)?;
+        st.history = history;
         st.prestaged_va = None;
         st.prestaged_n = 0;
         st.verify_snap_rows = 0;
         st.verify_tokens.clear();
         st.history_ckpt.clear();
-        gpu.copy_h2d_async(&blob[4 + n * 4..], st.conv, stream)?;
+        gpu.copy_h2d_async(conv, st.conv, stream)?;
         Ok(())
     }
 }
+
+/// Start an aux blob in `buf`: `[hist_len u32][history u32s]`; the conv
+/// carry's bytes follow.
+pub(super) fn write_aux_head(buf: &mut Vec<u8>, history: &[u32]) {
+    buf.clear();
+    buf.extend_from_slice(&(history.len() as u32).to_le_bytes());
+    for t in history {
+        buf.extend_from_slice(&t.to_le_bytes());
+    }
+}
+
+/// The token history and conv-carry bytes of an aux blob whose carry is
+/// `conv_bytes` long ([`write_aux_head`] plus the carry).
+pub(super) fn parse_aux(blob: &[u8], conv_bytes: usize) -> Result<(Vec<u32>, &[u8])> {
+    anyhow::ensure!(blob.len() >= 4, "PLE aux blob truncated");
+    let n = u32::from_le_bytes(blob[..4].try_into().unwrap()) as usize;
+    anyhow::ensure!(
+        blob.len() == 4 + n * 4 + conv_bytes,
+        "PLE aux blob size mismatch"
+    );
+    let history = blob[4..4 + n * 4]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    Ok((history, &blob[4 + n * 4..]))
+}
+
+#[cfg(test)]
+#[path = "aux_state_tests.rs"]
+mod tests;
 
 impl PleLayer {
     /// Fresh sequence: EOS-filled history and a zeroed conv state.
