@@ -62,7 +62,45 @@ __global__ void probe_persist(const uint4* const* chunks, unsigned chunk_bytes, 
     if (acc == 0x12345678u) sink[0] = acc;
 }
 
+// Segment probe: each CTA reads `seg` bytes of each of 32 consecutive
+// 1280-byte rows (an expert's [N, K/2] gate rows), seg-window by
+// seg-window across the row, as a K-sliced tile loader does; vs seg = 1280.
+__global__ void probe_seg(const unsigned char* const* tiles, unsigned seg, unsigned n_tiles, unsigned* sink) {
+    const unsigned char* base = tiles[blockIdx.x];
+    unsigned acc = 0;
+    for (unsigned w0 = 0; w0 < 1280; w0 += seg)
+        for (unsigned i = threadIdx.x; i < 32 * seg / 16; i += blockDim.x) {
+            const unsigned r = i / (seg / 16), c = i % (seg / 16);
+            const uint4 v = __ldcs((const uint4*)(base + r * 1280 + w0 + 16 * c));
+            acc ^= v.x ^ v.y ^ v.z ^ v.w;
+        }
+    if (acc == 0x12345678u) sink[0] = acc;
+}
+
+static void probe_segments(Pool& pool) {
+    printf("\nprobe: 32-row gate tiles (40 KB) of 70 experts, read seg bytes a row at a time\n");
+    unsigned* sink = (unsigned*)dzero(64);
+    Timer tm;
+    const int iters = 30;
+    std::vector<const unsigned char**> lists;
+    for (int it = 0; it < iters; it++) {
+        std::vector<const unsigned char*> t;
+        for (unsigned e : pool.draw_distinct(70))
+            for (unsigned r = 0; r < I; r += 32) {
+                t.push_back(pool.gate[e].packed + (size_t)r * 1280);
+                t.push_back(pool.up[e].packed + (size_t)r * 1280);
+            }
+        lists.push_back(dput(t));
+    }
+    const unsigned n = 70 * (I / 32) * 2;
+    for (unsigned seg : {64u, 128u, 256u, 640u, 1280u}) {
+        const double us = tm.run(iters, [&](int i) { probe_seg<<<n, 256>>>(lists[i], seg, n, sink); });
+        printf("  seg %4u B  %8.1f us  %6.1f GB/s\n", seg, us, n * 32.0 * 1280 / us / 1e3);
+    }
+}
+
 static void probe(Pool& pool) {
+    probe_segments(pool);
     printf("\nprobe: DRAM read of the unique expert bytes (us, GB/s); 256-expert pool %.0f MB\n",
            pool.bytes() / 1e6);
     unsigned* sink = (unsigned*)dzero(64);
@@ -121,9 +159,10 @@ int main(int argc, char** argv) {
     CK(cudaFree(0));
     // POOL=n: n physical experts behind the 256 local ids (POOL=3: ~8 MB, L2
 // resident -- the kernels' compute floor at the same routing).
-    Pool pool(mode == "check" ? 24 : getenv("POOL") ? atoi(getenv("POOL")) : 256);
+    Pool pool(mode.find("check") != std::string::npos ? 24 : getenv("POOL") ? atoi(getenv("POOL")) : 256);
     if (mode == "probe") { probe(pool); return 0; }
     if (mode == "check") return run_check(pool);
+    if (mode == "tc-units-check") return run_tc_check(pool);
     run_time(pool, argc > 3 ? argv[3] : "");
     return 0;
 }

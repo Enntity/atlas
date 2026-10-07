@@ -7,6 +7,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -238,10 +239,18 @@ static Variant production() {
 
 std::vector<Variant> variants();  // the candidates (qwen4exp_moe_c8_variants.h)
 
+// REPS=n: each timing the fastest of n passes (03 is shared: another
+// tenant's kernels only ever add time; default 1).
 struct Timer {
     cudaEvent_t e0, e1;
     Timer() { CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1)); }
     template <typename F> double run(int iters, F&& body) {
+        const int reps = getenv("REPS") ? std::max(1, atoi(getenv("REPS"))) : 1;
+        std::vector<double> v;
+        for (int r = 0; r < reps; r++) v.push_back(once(iters, body));
+        return *std::min_element(v.begin(), v.end());
+    }
+    template <typename F> double once(int iters, F&& body) {
         float ms;
         body(0);  // warm (module load, attributes)
         CK(cudaDeviceSynchronize());

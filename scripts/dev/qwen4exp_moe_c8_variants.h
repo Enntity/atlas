@@ -84,12 +84,15 @@ static const struct { const char* tag; unsigned rmax, tile, warps, rc; } ROWS_SH
 // launches it: plan, unit gate/up + SiLU (8 outputs a CTA), unit down (64).
 // `fused`: gate/up BF16 rows not stored, as serving runs it; else stored for
 // the check.
-static Variant c8_units(bool fused) {
-    const char* M = "qwen4exp_moe_c8";
-    CUfunction pl = load(M, "qwen4exp_moe_c8_plan"), gu = load(M, "qwen4exp_moe_c8_gate_up"),
-               sd = load(M, "qwen4exp_moe_c8_down");
+static Variant c8_units(bool fused, bool tc = false) {
+    // tc: qwen4exp_moe_c8_tc.cu (ATLAS_QWEN4EXP_MOE_TC, contract (b): not the
+    // rows pair's bytes; checked for row invariance by tc-units-check).
+    const char* M = tc ? "qwen4exp_moe_c8_tc" : "qwen4exp_moe_c8";
+    const std::string p = tc ? "qwen4exp_moe_c8_tc_" : "qwen4exp_moe_c8_";
+    CUfunction pl = load(M, (p + "plan").c_str()), gu = load(M, (p + "gate_up").c_str()),
+               sd = load(M, (p + "down").c_str());
     Variant v;
-    v.name = fused ? "units fused" : "units";
+    v.name = std::string(tc ? "tc " : "") + (fused ? "units fused" : "units");
     v.plan = [=](Pool&, Bufs& b, unsigned rows) {
         unsigned topk = TOPK, R = rows;
         launch(pl, dim3(1), dim3(1024), {&b.ids, &b.ws, &topk, &R});
@@ -119,5 +122,6 @@ std::vector<Variant> variants() {
         for (auto& s : ROWS_SHAPES) v.push_back(rows_shape(s.tag, s.rmax, s.tile, s.warps, s.rc));
     v.push_back(c8_units(false));
     v.push_back(c8_units(true));
+    v.push_back(c8_units(true, true));
     return v;
 }

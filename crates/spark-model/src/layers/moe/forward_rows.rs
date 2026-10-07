@@ -230,30 +230,14 @@ impl MoeLayer {
         let (h32, inter32, top_k32, rows32) = (h as u32, inter as u32, top_k as u32, rows as u32);
         let table = |t: &ExpertPtrTable| (t.packed_ptrs, t.scale_ptrs, t.scale2_vals);
         let shared = &self.weights.shared_expert;
-        if k.units_ready() && rows <= ops::QWEN4EXP_MOE_UNITS_MAX_ROWS {
-            // ATLAS_QWEN4EXP_MOE_UNITS: the expert units, the same bytes. The
-            // gate/up rows are not materialized, so their buffers hold the
-            // FP32 activations and the plan.
-            let sizes = ctx.buffers.sizes();
-            anyhow::ensure!(
-                (slots + rows) * inter * 4 <= sizes.expert_gate_out
-                    && ops::QWEN4EXP_MOE_UNITS_WS_BYTES <= sizes.expert_up_out,
-                "qwen4exp MoE units: {rows} rows overrun the expert gate/up buffers"
-            );
-            k.units(
-                ctx.gpu,
-                input,
-                table(&self.gate_ptrs),
-                table(&self.up_ptrs),
-                table(&self.down_ptrs),
-                indices,
-                (expert_up_out, expert_gate_out),
-                (&shared.gate_proj, &shared.up_proj, &shared.down_proj),
-                expert_down_out,
-                shared_out,
-                (h32, inter32, top_k32, rows32),
-                stream,
-            )?;
+        if k.units_ready() {
+            // A launch takes up to QWEN4EXP_MOE_UNITS_MAX_ROWS rows; each row's
+            // bytes are the same in any chunk (and under ATLAS_QWEN4EXP_MOE_TC
+            // the kernels are row-invariant).
+            for r0 in (0..rows).step_by(ops::QWEN4EXP_MOE_UNITS_MAX_ROWS) {
+                let n = ops::QWEN4EXP_MOE_UNITS_MAX_ROWS.min(rows - r0);
+                self.units_experts(input, indices, (r0, n), shared_out, ctx, stream)?;
+            }
         } else {
             k.plan(ctx.gpu, indices, order, slots, stream)?;
             // The single-row arm's shared gate/up scratch, `rows` deep.
@@ -339,5 +323,48 @@ impl MoeLayer {
             )?;
         }
         Ok(())
+    }
+
+    /// The expert units (`ATLAS_QWEN4EXP_MOE_UNITS`, or on tensor cores under
+    /// `ATLAS_QWEN4EXP_MOE_TC`) for rows `[r0, r0 + rows)` of `input` routed at
+    /// `indices` (`[*, top_k]`): down into `expert_down_out` (`[*, top_k, h]`),
+    /// the shared expert's into `shared_out` (`[*, h]`), at those rows. The
+    /// gate/up rows are not materialized, so their buffers hold the FP32
+    /// activations and the plan. Serial decode's single row comes here too
+    /// under the tensor-core switch (`forward_row_local`).
+    pub(super) fn units_experts(
+        &self,
+        input: DevicePtr,
+        indices: DevicePtr,
+        (r0, rows): (usize, usize),
+        shared_out: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let (h, inter) = (ctx.config.hidden_size, ctx.config.moe_intermediate_size);
+        let top_k = ctx.config.num_experts_per_tok;
+        let slots = rows * top_k;
+        let sizes = ctx.buffers.sizes();
+        anyhow::ensure!(
+            (slots + rows) * inter * 4 <= sizes.expert_gate_out
+                && ops::QWEN4EXP_MOE_UNITS_WS_BYTES <= sizes.expert_up_out,
+            "qwen4exp MoE units: {rows} rows overrun the expert gate/up buffers"
+        );
+        let table = |t: &ExpertPtrTable| (t.packed_ptrs, t.scale_ptrs, t.scale2_vals);
+        let shared = &self.weights.shared_expert;
+        self.qwen4exp_moe_rows.units(
+            ctx.gpu,
+            input.offset(r0 * h * 2),
+            table(&self.gate_ptrs),
+            table(&self.up_ptrs),
+            table(&self.down_ptrs),
+            indices.offset(r0 * top_k * 4),
+            (ctx.buffers.expert_up_out(), ctx.buffers.expert_gate_out()),
+            (&shared.gate_proj, &shared.up_proj, &shared.down_proj),
+            ctx.buffers.expert_down_out().offset(r0 * top_k * h * 2),
+            shared_out.offset(r0 * h * 2),
+            (h as u32, inter as u32, top_k as u32, rows as u32),
+            stream,
+        )
     }
 }
