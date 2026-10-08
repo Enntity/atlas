@@ -225,6 +225,10 @@ impl Qwen3SsmLayer {
             },
         )?;
         stage!("hc_pre_attn");
+        // ATLAS_GLM_DET_TRACE stages (this rank's seam rows under SP).
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        let det_rows = (sp.map_or(0, |sp| sp.row0), n as usize);
+        det.tap("in", local(hidden), det_rows, h * 2);
         let hc_dim = hc.hc_mult * h;
         crate::layers::ple::dump::tap_highway(
             ctx.gpu,
@@ -260,6 +264,7 @@ impl Qwen3SsmLayer {
         let out_proj_buf =
             local(self.prefill_block(hidden, num_tokens, state, ssm_layer_idx, ctx, stream)?);
         stage!("gdn_block");
+        det.tap("attn_red", out_proj_buf, det_rows, h * 2);
         crate::layers::ple::dump::tap_bf16(
             ctx.gpu,
             out_proj_buf,
