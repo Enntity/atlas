@@ -58,6 +58,15 @@ mod qsa_window;
 #[path = "qsa_tests.rs"]
 mod tests;
 
+/// Kill switch `ATLAS_QSA_NO_PREFILL_SELECT=1` (read once): stage-1 behavior,
+/// dense prefill past the inert bound (decode still selects). It skips the
+/// `ATLAS_QWEN4EXP_PREFILL_QSA_SPLIT` exchanges, so both ranks must agree
+/// (`model::startup_parity`).
+pub fn no_prefill_select() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("ATLAS_QSA_NO_PREFILL_SELECT").as_deref() == Ok("1"))
+}
+
 /// One decode step's selection: contiguous NHD `k/v` scratch + identity table.
 pub struct QsaSelection {
     pub k_scratch: DevicePtr,

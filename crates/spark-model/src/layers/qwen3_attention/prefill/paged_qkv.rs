@@ -51,7 +51,7 @@ impl Qwen3AttentionLayer {
             && self.quantize_nvfp4_k.0 != 0
             && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && ctx.buffers.fp8_act_bytes() >= (n as usize) * (h as usize)
-            && std::env::var("ATLAS_ATTN_W4A4").is_ok();
+            && super::attn_w4a4_requested();
         let a4 = if w4a4 {
             let a4 = ctx.buffers.fp8_act();
             let a4_sf = a4.offset((n as usize) * (h as usize) / 2);

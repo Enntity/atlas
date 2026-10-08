@@ -57,13 +57,13 @@ pub(crate) fn q38_requested() -> bool {
 /// gate_up+silu 10.25 -> 8.65 ms, down 5.91 -> 5.13, shared 3.42 -> 3.18).
 /// It also takes the router below 32 rows (byte-identical logits at 1..31
 /// rows; a 30-row pass: 0.31 -> 0.13 ms a layer).
-fn w2_requested() -> bool {
+pub(crate) fn w2_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_MOE_W2"))
 }
 
 /// `ATLAS_QWEN4EXP_PREFILL_SP_SHARED=1`; see [`MoeLayer::q38_sp_rows`].
-fn sp_shared_requested() -> bool {
+pub(crate) fn sp_shared_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_SP_SHARED"))
 }
