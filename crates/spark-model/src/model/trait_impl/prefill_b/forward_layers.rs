@@ -171,7 +171,12 @@ impl TransformerModel {
         let _rowinv = (!use_decode_path)
             .then(|| {
                 crate::layers::ops::qwen4exp_rowinv::check_pass_start(effective_seq_len_start);
-                crate::layers::ops::qwen4exp_rowinv::enter(self.gpu.as_ref())
+                crate::layers::ops::qwen4exp_rowinv::enter(
+                    self.gpu.as_ref(),
+                    self.buffers.sizes().hc_lowrank_scratch,
+                    self.config.hc_mult * self.config.hidden_size,
+                    self.config.hc_lowrank,
+                )
             })
             .flatten();
         // Marconi warm hit: this pass replays SSM state over [snap_tok,

@@ -486,6 +486,10 @@ pub struct Qwen3AttentionLayer {
     pub(super) k_fp8: Option<DevicePtr>,
     pub(super) v_fp8: Option<DevicePtr>,
     pub(super) o_fp8: Option<DevicePtr>,
+    /// `ATLAS_QWEN4EXP_PREFILL_ROWINV`: q (+gate), k, v, o as BF16, dequantized
+    /// from the NVFP4 weights decode reads (`prefill_weights.rs`), in place of
+    /// the FP8 copies.
+    pub(super) rowinv_bf16: [Option<DevicePtr>; 4],
     pub(super) fp8_gemm_k: KernelHandle,
     // FP8×FP8 GEMM
     pub(super) bf16_to_fp8_k: KernelHandle,

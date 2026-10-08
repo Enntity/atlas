@@ -871,6 +871,7 @@ impl Qwen3AttentionLayer {
             ),
             sigmoid_gate_mul_batched_k: gpu.kernel("residual_add", "sigmoid_gate_mul_batched")?,
             q_fp8: None,
+            rowinv_bf16: [None; 4],
             k_fp8: None,
             v_fp8: None,
             o_fp8: None,
