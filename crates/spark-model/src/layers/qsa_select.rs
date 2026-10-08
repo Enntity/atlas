@@ -47,12 +47,7 @@ impl QsaIndexer {
         if total <= bound {
             return Ok(());
         }
-        // Kill switch: ATLAS_QSA_NO_PREFILL_SELECT=1 keeps stage-1 behavior
-        // (dense prefill past the bound; decode still selects).
-        static S2_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *S2_OFF
-            .get_or_init(|| std::env::var("ATLAS_QSA_NO_PREFILL_SELECT").as_deref() == Ok("1"))
-        {
+        if super::no_prefill_select() {
             return Ok(());
         }
         let diag = {
