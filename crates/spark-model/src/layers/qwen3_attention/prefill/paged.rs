@@ -414,7 +414,12 @@ impl Qwen3AttentionLayer {
                     .unwrap_or(ctx.config.rope_theta as f32),
                 stream,
             )?;
-        } else if self.mrope_interleaved && self.rope_mrope_interleaved_k.0 != 0 {
+        } else if self.mrope_interleaved
+            && self.rope_mrope_interleaved_k.0 != 0
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV: a text-only pass takes plain
+            // `rope`, as the cache-skip first chunk does.
+            && !crate::layers::ops::qwen4exp_rowinv::text_only()
+        {
             ops::rope_mrope_interleaved(
                 ctx.gpu,
                 self.rope_mrope_interleaved_k,

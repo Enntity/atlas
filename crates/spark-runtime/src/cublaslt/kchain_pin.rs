@@ -83,6 +83,18 @@ fn attr(algo: *const c_void, which: u32) -> Option<i32> {
     (st == 0).then_some(v)
 }
 
+/// `id=.. tile=.. splitK=.. reduction=..` of a heuristic result's algorithm.
+pub(super) fn describe(algo: *const c_void) -> String {
+    let a = |w| attr(algo, w).map_or_else(|| "?".to_string(), |v| v.to_string());
+    format!(
+        "id={} tile={} splitK={} reduction={}",
+        a(CONFIG_ID),
+        a(CONFIG_TILE_ID),
+        a(CONFIG_SPLITK_NUM),
+        a(CONFIG_REDUCTION_SCHEME)
+    )
+}
+
 /// Algo 21 without split-K or a reduction: the in-order k-chain.
 fn kchain(algo: *const c_void) -> bool {
     attr(algo, CONFIG_ID) == Some(ALGO_SM80)
@@ -159,9 +171,10 @@ pub fn bf16_gemm_act_weight_t_kchain(
 }
 
 /// [`bf16_gemm_act_weight_t_kchain`] without the `ATLAS_LT_KCHAIN_PIN`
-/// switch: the row-invariant qwen4_exp prefill (`ATLAS_QWEN4EXP_PREFILL_ROWINV`)
-/// runs every BF16 projection on an in-order k-chain, here or (`Ok(false)`)
-/// on the tile kernel.
+/// switch, for the row-invariant qwen4_exp prefill
+/// (`ATLAS_QWEN4EXP_PREFILL_ROWINV`): every k-chain kernel gives the same
+/// bytes at any row count, so a wide projection may take the fastest one
+/// offered for each `m`. `Ok(false)`: none offered, nothing launched.
 pub fn bf16_gemm_act_weight_t_kchain_any(
     act: u64,
     weight: u64,

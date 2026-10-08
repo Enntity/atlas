@@ -176,6 +176,9 @@ impl TransformerModel {
                     self.buffers.sizes().hc_lowrank_scratch,
                     self.config.hc_mult * self.config.hidden_size,
                     self.config.hc_lowrank,
+                    host_ids
+                        .as_deref()
+                        .is_some_and(|ids| !self.tokens_have_vision_pad(&ids[..proc_count])),
                 )
             })
             .flatten();

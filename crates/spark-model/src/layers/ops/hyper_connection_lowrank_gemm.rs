@@ -142,6 +142,10 @@ pub(crate) fn hc_gemm(
     sm_count: u32,
     stream: u64,
 ) -> Result<()> {
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV: one cuBLASLt configuration at any height.
+    if super::qwen4exp_rowinv::try_bf16_gemm(a, w.0, out, [m, n, k], stream)? {
+        return Ok(());
+    }
     if n.div_ceil(128) * m.div_ceil(128) < sm_count {
         match crate::layers::ops::cublas_bf16_proj_dense(a, w, out, m, n, k, stream) {
             Ok(()) => return Ok(()),
