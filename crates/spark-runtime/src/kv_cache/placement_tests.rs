@@ -181,3 +181,40 @@ fn without_a_carveout_nothing_is_placed() {
     let _cache = build(&gpu, 2, 100, KvPlacement::default());
     assert!(gpu.carveout_alloc_sizes().is_empty());
 }
+
+#[test]
+fn a_latent_shard_places_its_local_slot_pools() {
+    // `ATLAS_GLM_KV_SHARD=1`: each rank's K pool holds ceil(101 / 2) = 51
+    // slots, and the placement is planned over exactly those sizes.
+    let (config, index) = glm(3);
+    let local = crate::kv_cache::LatentShard::local_blocks_for(101, 2);
+    let sizes =
+        PagedKvCache::buffer_sizes_with_k_slots(&config, 101, local, true, Some(index), None);
+    assert!(sizes.contains(&(KvBuffer::K(0), 51 * 8448)));
+    for rank in 0..2 {
+        let gpu = MockGpuBackend::with_carveout(64 * MIB);
+        let spec = crate::kv_cache::LatentShardSpec {
+            rank,
+            world: 2,
+            scratch_bytes: 4096,
+            view_blocks: 8,
+            write_rows: 4,
+            lane: false,
+        };
+        let placement = KvPlacement::plan_ordered(&sizes, 64 * MIB, CarveoutOrder::Size);
+        let mut cache =
+            PagedKvCache::new_latent_sharded_placed(glm(3).0, 101, &gpu, spec, placement)
+                .unwrap();
+        cache.attach_sparse_index(index, &gpu).unwrap();
+        let mut listed: Vec<usize> = sizes.iter().map(|&(_, n)| n).filter(|&n| n > 0).collect();
+        let mut allocated = gpu.carveout_alloc_sizes();
+        listed.sort_unstable();
+        allocated.sort_unstable();
+        assert_eq!(allocated, listed, "rank {rank}");
+        // The latent order keeps the index in system memory here too.
+        let latent = KvPlacement::plan_ordered(&sizes, 64 * MIB, CarveoutOrder::Latent);
+        assert_eq!(latent.len(), 3);
+        cache.release(&gpu).unwrap();
+        assert_eq!(gpu.carveout_used(), 0);
+    }
+}
