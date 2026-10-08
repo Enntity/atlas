@@ -212,6 +212,8 @@ pub mod qwen4exp_gdn_rows;
 mod qwen4exp_moe;
 #[path = "ops/qwen4exp_moe_rows.rs"]
 mod qwen4exp_moe_rows;
+#[path = "ops/qwen4exp_moe_tc3.rs"]
+mod qwen4exp_moe_tc3;
 #[path = "ops/qwen4exp_prefill.rs"]
 pub mod qwen4exp_prefill;
 #[path = "ops/qwen4exp_prefill_hc.rs"]

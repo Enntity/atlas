@@ -3,7 +3,8 @@
 # Build the PTX scripts/dev/qwen4exp_moe_c8_bench.cu JIT-loads (production
 # flags, as crates/atlas-kernels compiles the qwen3.8-flash-next target), build
 # the bench, run it from the repository root on a GB10:
-#   scripts/dev/qwen4exp_moe_c8_bench.sh probe|time|check|tc-units-check [variant filter]
+#   scripts/dev/qwen4exp_moe_c8_bench.sh probe|time|check|tc-units-check|tc-ident [variant filter]
+#   (REALBIN=route.bin: real routing; LAYER_PASSES=n: interleaved layer timings, min/median)
 #   scripts/dev/qwen4exp_moe_c8_bench.sh tc-time|tc-check   (qwen4exp_moe_c8_tc_bench.cu)
 set -euo pipefail
 out=${QB_BENCH_DIR:-/tmp/qmc8-bench}
@@ -12,7 +13,7 @@ nvcc=${NVCC:-nvcc}
 flags=(--ptx -arch=sm_121f -O3 --fmad=false -DTQ_PLUS_SIGNS --expt-relaxed-constexpr --Werror all-warnings)
 pids=()
 "$nvcc" "${flags[@]}" kernels/gb10/common/moe_shared_expert_fused.cu -o "$out/moe_shared_expert_fused.ptx" & pids+=($!)
-for stem in qwen4exp_moe_rows qwen4exp_moe_c8 qwen4exp_moe_c8_tc moe_prefill_q38; do
+for stem in qwen4exp_moe_rows qwen4exp_moe_c8 qwen4exp_moe_c8_tc qwen4exp_moe_c8_tc3 moe_prefill_q38; do
   [[ -f kernels/gb10/qwen3.8-flash-next/nvfp4/$stem.cu ]] || continue
   "$nvcc" "${flags[@]}" "kernels/gb10/qwen3.8-flash-next/nvfp4/$stem.cu" -o "$out/$stem.ptx" & pids+=($!)
 done

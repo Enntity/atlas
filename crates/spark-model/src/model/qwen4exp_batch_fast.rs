@@ -157,6 +157,14 @@ pub(crate) fn tc_v1_requested() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_TC_V1").as_deref() == Ok("1"))
 }
 
+/// `ATLAS_QWEN4EXP_MOE_TC_V2=1`, read once: under `ATLAS_QWEN4EXP_MOE_TC`,
+/// the v2 units (separate gate/up and down launches) instead of v3's one
+/// persistent launch (`qwen4exp_moe_c8_tc3.cu`), for A/B: the same bytes.
+pub(crate) fn tc_v2_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_TC_V2").as_deref() == Ok("1"))
+}
+
 /// `ATLAS_QWEN4EXP_MOE_NO_CLAMP=1`, read once: the qwen4_exp decode / verify
 /// MoE kernels drop the routed SwiGLU clamp (+-10) -- the serial-decode
 /// single-row silu/down, the rows pair, the units and the TC units -- which

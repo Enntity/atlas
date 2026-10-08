@@ -129,6 +129,27 @@ static void run_time(Pool& pool, const std::string& only) {
         const double gu_b = (uniq + 1) * gu_e, sd_b = (uniq + 1) * sd_e;
         printf("%-10s rows %u, %.1f unique local experts (+ shared), %.1f + %.1f MB\n", c.name, c.rows,
                uniq, gu_b / 1e6, sd_b / 1e6);
+        // LAYER_PASSES=p: only plan + gate/up + down, the variants interleaved
+        // p times (03 is shared: min and median of the passes).
+        if (const char* lp = getenv("LAYER_PASSES")) {
+            std::vector<std::vector<double>> t(vs.size());
+            for (int pass = 0; pass < atoi(lp); pass++)
+                for (size_t k = 0; k < vs.size(); k++) {
+                    Variant& v = vs[k];
+                    const auto layer = [&](int i) {
+                        v.plan(pool, bs[i], c.rows); v.gate_up(pool, bs[i], c.rows); v.silu_down(pool, bs[i], c.rows);
+                    };
+                    tm.once(n, layer);  // the previous variant's wake (order bias at 1 row ~10%)
+                    t[k].push_back(tm.once(n, layer));
+                }
+            for (size_t k = 0; k < vs.size(); k++) {
+                std::sort(t[k].begin(), t[k].end());
+                printf("%-10s %-24s layer min %7.1f med %7.1f us  (%5.0f GB/s of unique bytes at min)\n", "",
+                       vs[k].name.c_str(), t[k][0], t[k][t[k].size() / 2], (gu_b + sd_b) / t[k][0] / 1e3);
+            }
+            for (auto& b : bs) { CK(cudaFree(b.ids)); CK(cudaFree(b.order)); CK(cudaFree(b.ws)); }
+            continue;
+        }
         for (Variant& v : vs) {
             for (int i = 0; i < n; i++) v.plan(pool, bs[i], c.rows);
             const double pl = tm.run(n, [&](int i) { v.plan(pool, bs[i], c.rows); });

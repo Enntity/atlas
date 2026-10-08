@@ -45,8 +45,9 @@ pub const QWEN4EXP_MOE_ROWS_SD_INTER: u32 = 640;
 /// Rows a units launch takes (C8_ROWS_MAX in qwen4exp_moe_c8.cu).
 pub const QWEN4EXP_MOE_UNITS_MAX_ROWS: usize = 64;
 /// The units plan's workspace, bytes: 16 + 3 * (1024 + 64) unit words, then
-/// 1024 sorted slot ids (C8_WS_ROWS + C8_SLOTS_MAX in qwen4exp_moe_c8.cu).
-pub const QWEN4EXP_MOE_UNITS_WS_BYTES: usize = (16 + 3 * (1024 + 64) + 1024) * 4;
+/// 1024 sorted slot ids (C8_WS_ROWS + C8_SLOTS_MAX in qwen4exp_moe_c8.cu),
+/// then TC v3's 529 unit counters (TC3_UMAX in qwen4exp_moe_c8_tc3.cu).
+pub const QWEN4EXP_MOE_UNITS_WS_BYTES: usize = (16 + 3 * (1024 + 64) + 1024 + 529) * 4;
 /// Units-grid rows of the TC v2 kernels (each CTA strides the units by it):
 /// 80 x 64 gate/up and 40 x 64 down CTAs keep GB10's 48 SMs full; 48-160
 /// measured within 1% at real C8 routing (qwen4exp_moe_c8_bench REALBIN).
@@ -69,6 +70,10 @@ pub struct Qwen4ExpMoeRows {
     pub units_plan: KernelHandle,
     pub units_gate_up: KernelHandle,
     pub units_down: KernelHandle,
+    /// TC v3's fused gate/up + down (`units_gate_up`/`units_down` unused
+    /// then) and its persistent grid width.
+    pub units_fused: KernelHandle,
+    pub units_ctas: u32,
     /// The units are the tensor-core kernels (`ATLAS_QWEN4EXP_MOE_TC=1`,
     /// contract (b)): serial decode must take them too.
     pub units_tc: bool,
@@ -88,6 +93,8 @@ impl Qwen4ExpMoeRows {
         units_plan: KernelHandle(0),
         units_gate_up: KernelHandle(0),
         units_down: KernelHandle(0),
+        units_fused: KernelHandle(0),
+        units_ctas: 0,
         units_tc: false,
         units_y_cap: u32::MAX,
     };
@@ -115,13 +122,23 @@ impl Qwen4ExpMoeRows {
             );
         }
         // ATLAS_QWEN4EXP_MOE_TC_V1=1: the TC kernels as first shipped (O(n^2)
-        // plan, a CTA a unit over the units' bound) for A/B; v2 writes the same
-        // bytes (scripts/dev/qwen4exp_moe_c8_bench.sh tc-ident).
+        // plan, a CTA a unit over the units' bound); ATLAS_QWEN4EXP_MOE_TC_V2=1:
+        // the separate gate/up and down launches; else v3 (one persistent
+        // launch, qwen4exp_moe_tc3.rs). All write the same bytes
+        // (scripts/dev/qwen4exp_moe_c8_bench.sh tc-ident).
         let v1 = crate::model::qwen4exp_batch_fast::tc_v1_requested();
+        let v3 = tc && !v1 && !crate::model::qwen4exp_batch_fast::tc_v2_requested();
+        let (plan3, fused, units_ctas) = if v3 {
+            Self::tc3_kernels(gpu, nc)
+        } else {
+            (off, off, 0)
+        };
         let tck = |v2: &'static str, v1n: &'static str| {
             try_kernel(gpu, "qwen4exp_moe_c8_tc", if v1 { v1n } else { v2 })
         };
-        let (units_plan, units_gate_up, units_down) = if tc {
+        let (units_plan, units_gate_up, units_down) = if v3 {
+            (plan3, off, off)
+        } else if tc {
             (
                 tck("qwen4exp_moe_c8_tc_plan", "qwen4exp_moe_c8_tc_plan_v1"),
                 if nc {
@@ -171,6 +188,8 @@ impl Qwen4ExpMoeRows {
             units_plan,
             units_gate_up,
             units_down,
+            units_fused: fused,
+            units_ctas,
             units_tc: tc,
             units_y_cap: if tc && !v1 { UNITS_TC_Y_CAP } else { u32::MAX },
         }
@@ -179,7 +198,8 @@ impl Qwen4ExpMoeRows {
     /// Whether [`Self::units`] can run (`ATLAS_QWEN4EXP_MOE_UNITS=1` and the
     /// target ships `qwen4exp_moe_c8`).
     pub fn units_ready(&self) -> bool {
-        self.units_plan.0 != 0 && self.units_gate_up.0 != 0 && self.units_down.0 != 0
+        self.units_plan.0 != 0
+            && (self.units_fused.0 != 0 || (self.units_gate_up.0 != 0 && self.units_down.0 != 0))
     }
 
     pub fn ready(&self) -> bool {
@@ -415,6 +435,11 @@ impl Qwen4ExpMoeRows {
                 && h == 2560,
             "qwen4exp MoE units: rows {rows}, top_k {top_k}, inter {inter}, h {h}"
         );
+        if self.units_fused.0 != 0 {
+            let (w, sh) = ((gate_ptrs, up_ptrs, down_ptrs), (sh_gate, sh_up, sh_down));
+            let (ins, outs) = ((input, expert_indices, ws, act), (output, sh_down_out));
+            return self.units_tc3(gpu, ins, w, sh, outs, (top_k, rows), stream);
+        }
         KernelLaunch::new(gpu, self.units_plan)
             .grid([1, 1, 1])
             .block([1024, 1, 1])
