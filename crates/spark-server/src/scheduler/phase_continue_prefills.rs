@@ -208,7 +208,9 @@ pub(super) fn continue_in_progress_prefills(
         model,
         sched,
         prefilling,
+        active,
         &mut completed_indices,
+        max_batch_tokens,
         prefill_stream,
         prefill_event,
     ) {

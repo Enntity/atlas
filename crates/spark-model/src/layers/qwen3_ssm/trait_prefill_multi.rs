@@ -9,7 +9,7 @@
 //! capture, no diagnostics taps.
 
 use super::*;
-use crate::layer::MultiSeg;
+use crate::layer::MultiPass;
 
 impl Qwen3SsmLayer {
     /// Steps 2-10: QKVZ projection, conv1d, gates, the delta-rule recurrence,
@@ -39,14 +39,9 @@ impl Qwen3SsmLayer {
         )
     }
 
-    pub(super) fn prefill_multi_hc(
-        &self,
-        hidden: DevicePtr,
-        total: usize,
-        segs: &mut [MultiSeg<'_, '_>],
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
+    pub(super) fn prefill_multi_hc(&self, pass: &mut MultiPass<'_, '_>) -> Result<()> {
+        let (hidden, total, ctx, stream) = (pass.hidden, pass.total, pass.ctx, pass.stream);
+        let segs = &mut pass.segs;
         let hc = self
             .hc
             .as_ref()

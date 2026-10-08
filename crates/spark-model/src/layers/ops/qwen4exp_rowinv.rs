@@ -84,6 +84,10 @@ pub fn bf16_proj() -> bool {
 /// attention is dense and no selection runs.
 pub const MULTI_MAX_PROMPT: usize = 2048;
 
+/// Most sequences one multi-sequence prefill pass takes (the scheduler caps
+/// its passes at this, both ranks check it).
+pub const MULTI_MAX_SEQS: usize = 64;
+
 /// The GDN chunk every pass start must sit on (see the module docs).
 pub const PASS_GRANULE: usize = 64;
 
