@@ -119,6 +119,38 @@ static Variant c8_units(bool fused, bool tc = false, bool v1 = false) {
     };
     return v;
 }
+// qwen4exp_moe_c8_tc3.cu: the v3 plan + gate/up and down in one persistent
+// launch (TC3_CTAS CTAs, default 2 a SM). Its time shows as gate_up, and only
+// the layer column is real: a gate_up rerun without the plan finds the claim
+// counter spent (LAYER_PASSES times layers only).
+static Variant tc3_units(const std::string& tag = "") {
+    static std::vector<std::string> mods;
+    mods.push_back(tag.empty() ? "qwen4exp_moe_c8_tc3" : "qwen4exp_moe_c8_tc3_" + tag);
+    const char* M = mods.back().c_str();
+    CUfunction pl = load(M, "qwen4exp_moe_c8_tc3_plan"), fu = load(M, nc() ? "qwen4exp_moe_c8_tc3_nc" : "qwen4exp_moe_c8_tc3");
+    int sms = 0;
+    CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    // A tag "x<n>..." launches n CTAs.
+    const unsigned ctas = tag.size() > 1 && tag[0] == 'x' ? atoi(tag.c_str() + 1)
+                          : getenv("TC3_CTAS")         ? atoi(getenv("TC3_CTAS"))
+                                                       : 2 * sms;
+    Variant v;
+    v.name = "tc3 " + (tag.empty() ? std::string("") : tag + " ") + "fused";
+    v.plan = [=](Pool& p, Bufs& b, unsigned rows) {
+        unsigned topk = TOPK, R = rows;
+        launch(pl, dim3(1), dim3(1024), {&b.ids, &p.gp, &b.ws, &topk, &R});
+    };
+    v.gate_up = [=](Pool& p, Bufs& b, unsigned rows) {
+        unsigned topk = TOPK, R = rows;
+        launch(fu, dim3(ctas), dim3(256),
+               {&b.A, &p.gp, &p.gs, &p.g2, &p.upk, &p.us, &p.u2, &p.dp, &p.ds, &p.d2, &p.sg.packed,
+                &p.sg.scale, &p.sg.s2, &p.su.packed, &p.su.scale, &p.su.s2, &p.sd.packed, &p.sd.scale,
+                &p.sd.s2, &b.ws, &b.act, &b.down, &b.shd, &topk, &R});
+    };
+    v.silu_down = [](Pool&, Bufs&, unsigned) {};
+    return v;
+}
+
 std::vector<Variant> variants() {
     std::vector<Variant> v;
     v.push_back(per_row_loop());
@@ -128,5 +160,13 @@ std::vector<Variant> variants() {
     v.push_back(c8_units(true));
     v.push_back(c8_units(true, true, true));
     v.push_back(c8_units(true, true));
+    // NO_TC3=1: without tc3; TC3_TAGS=a,b: extra builds of it, modules
+    // qwen4exp_moe_c8_tc3_<tag>.ptx (a tag "x<n>..." launches n CTAs).
+    if (!getenv("NO_TC3") || !atoi(getenv("NO_TC3"))) v.push_back(tc3_units());
+    if (const char* tags = getenv("TC3_TAGS")) {
+        std::stringstream ss(tags);
+        std::string t;
+        while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(tc3_units(t));
+    }
     return v;
 }
