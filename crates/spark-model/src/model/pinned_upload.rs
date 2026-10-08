@@ -49,6 +49,10 @@ impl PinnedUpload {
     /// buffer has been read. Grows (re-allocates) when `len` exceeds it.
     pub(crate) fn stage(&mut self, gpu: &dyn GpuBackend, len: usize) -> Result<&mut [u8]> {
         self.wait(gpu)?;
+        if len == 0 {
+            // No allocation yet, so no pointer a slice could be built on.
+            return Ok(&mut []);
+        }
         if len > self.bytes {
             self.release(gpu)?;
             self.ptr = gpu.alloc_host_pinned(len)?;
@@ -177,6 +181,16 @@ mod tests {
         up.stage(&gpu, 128).unwrap();
         assert_eq!(gpu.host_pinned_alloc_count(), 2, "grows past its size");
         up.release(&gpu).unwrap();
+        up.release(&gpu).unwrap();
+    }
+
+    #[test]
+    fn an_empty_stage_allocates_nothing() {
+        let gpu = MockGpuBackend::new();
+        let mut up = PinnedUpload::EMPTY;
+        assert!(up.stage(&gpu, 0).unwrap().is_empty());
+        assert_eq!(gpu.host_pinned_alloc_count(), 0);
+        up.send(&gpu, 0, DevicePtr(0), 0).unwrap();
         up.release(&gpu).unwrap();
     }
 
