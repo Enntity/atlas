@@ -21,10 +21,12 @@ pub use fp8::{fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_rowwise};
 pub use grouped::bf16_grouped_gemm_act_weight_t;
 mod tf32;
 pub use tf32::tf32_gemm_act_weight_t;
+mod fixed_algo;
 mod gemm_bf16;
 mod kchain_pin;
+pub use fixed_algo::{bf16_fixed_algo_description, bf16_gemm_act_weight_t_fixed};
 use gemm_bf16::gemm_bf16;
-pub use kchain_pin::bf16_gemm_act_weight_t_kchain;
+pub use kchain_pin::{bf16_gemm_act_weight_t_kchain, bf16_gemm_act_weight_t_kchain_any};
 
 // The BF16 Atlas-kernel fallback (installed when cuBLASLt is a stub) lives in
 // the `bf16_fallback` sibling (≤500 LoC split); re-exported so

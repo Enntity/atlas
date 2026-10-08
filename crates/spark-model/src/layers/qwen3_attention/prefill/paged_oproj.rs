@@ -28,6 +28,14 @@ impl Qwen3AttentionLayer {
         if self.oproj_reduce_scatter_piped(attn_out, o_out, [n, h, nq * hd], ctx, stream)? {
             return Ok(o_out);
         }
+        // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: BF16 at decode's weight values,
+        // on the pass's row-invariant k-chain.
+        if crate::layers::ops::qwen4exp_rowinv::active()
+            && let Some(w) = self.rowinv_bf16[3]
+        {
+            ops::bf16_gemm(attn_out, w.0, o_out, n, h, nq * hd, stream)?;
+            return Ok(o_out);
+        }
         // Keep-packed Q2_0 (Tier-1c): transient-dequant o_proj then dense GEMM.
         if let Some(r) =
             self.try_q2_prefill(ctx, self.o_weight.as_ref(), attn_out, o_out, n, stream)
@@ -224,7 +232,8 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else if let Some(fp8) = self.o_fp8 {
-            if n > 128 {
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV: one arm at every width.
+            if n > 128 || crate::layers::ops::qwen4exp_rowinv::active() {
                 ops::fp8_gemm_n128_m128(
                     ctx.gpu,
                     self.fp8_gemm_t_m128_k,
@@ -436,9 +445,12 @@ impl Qwen3AttentionLayer {
             && self.o_fp8w_t.is_none()
             && !ctx.dispatch.cutlass_nvfp4_attn_o
             && std::env::var("ATLAS_ATTN_W4A4").is_err();
-        let Some(fp8) = self.o_fp8.filter(|_| n > 128 && earlier_arms_skip) else {
+        // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: the BF16 o_proj, row-invariant too.
+        let rowinv = self.rowinv_bf16[3].filter(|_| crate::layers::ops::qwen4exp_rowinv::active());
+        let fp8 = self.o_fp8.filter(|_| n > 128 && earlier_arms_skip);
+        if rowinv.is_none() && fp8.is_none() {
             return Ok(false);
-        };
+        }
         if !pipe::rs_offered() {
             return Ok(false);
         }
@@ -449,8 +461,17 @@ impl Qwen3AttentionLayer {
             h as usize,
             ctx,
             stream,
-            |r0, rows, s| {
-                ops::fp8_gemm_n128_m128(
+            |r0, rows, s| match (rowinv, fp8) {
+                (Some(w), _) => ops::bf16_gemm(
+                    attn_out.offset(r0 * row_in),
+                    w.0,
+                    o_out.offset(r0 * row_out),
+                    rows as u32,
+                    h,
+                    kd,
+                    s,
+                ),
+                (None, Some(fp8)) => ops::fp8_gemm_n128_m128(
                     ctx.gpu,
                     self.fp8_gemm_t_m128_k,
                     attn_out.offset(r0 * row_in),
@@ -460,7 +481,8 @@ impl Qwen3AttentionLayer {
                     h,
                     kd,
                     s,
-                )
+                ),
+                (None, None) => unreachable!("checked above"),
             },
             |_| Ok(()),
         )?;

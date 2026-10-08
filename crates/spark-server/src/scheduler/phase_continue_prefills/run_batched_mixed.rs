@@ -69,8 +69,10 @@ pub(super) fn run_batched_mixed_step(
             chunk_len = tb - p.chunk_offset;
         }
         let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
-        if !is_last && chunk_len >= 4 {
-            chunk_len = (chunk_len / 4) * 4;
+        if !is_last && chunk_len >= spark_runtime::prefill_chunk_granule() {
+            // (ATLAS_QWEN4EXP_PREFILL_ROWINV: 64, the GDN chunk.)
+            let g = spark_runtime::prefill_chunk_granule();
+            chunk_len = (chunk_len / g) * g;
         }
         chunk_lens.push(chunk_len);
         is_last_flags.push(is_last);

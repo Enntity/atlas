@@ -414,7 +414,12 @@ impl Qwen3AttentionLayer {
                     .unwrap_or(ctx.config.rope_theta as f32),
                 stream,
             )?;
-        } else if self.mrope_interleaved && self.rope_mrope_interleaved_k.0 != 0 {
+        } else if self.mrope_interleaved
+            && self.rope_mrope_interleaved_k.0 != 0
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV: a text-only pass takes plain
+            // `rope`, as the cache-skip first chunk does.
+            && !crate::layers::ops::qwen4exp_rowinv::text_only()
+        {
             ops::rope_mrope_interleaved(
                 ctx.gpu,
                 self.rope_mrope_interleaved_k,
@@ -740,6 +745,21 @@ impl Qwen3AttentionLayer {
                     .qsa
                     .as_ref()
                     .is_some_and(|q| seq_len_start >= q.inert_bound());
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV attends the first chunk here too:
+            // like the cache-skip path, a chunk that straddles the bound
+            // computes only its rows below it (QSA overwrites the rest; a
+            // row never reads a key past itself).
+            if let Some(q) = self.qsa.as_ref()
+                && crate::layers::ops::qwen4exp_rowinv::active()
+                && batched_meta.is_none()
+                && !(v_is_turbo && wht_runtime_active)
+                && seq_len_start < q.inert_bound()
+                && seq_len_start + n as usize > q.inert_bound()
+            {
+                let keep = (q.inert_bound() - seq_len_start) as u32;
+                args.n = keep;
+                args.kv_len = seq_len_start as u32 + keep;
+            }
             if !qsa_overwrites_all {
                 match self.prefill_attention_paged_attn(kv_cache, ctx, &mut args)? {
                     super::paged_attn::PagedAttnOutcome::EarlyReturn(out) => return Ok(out),
