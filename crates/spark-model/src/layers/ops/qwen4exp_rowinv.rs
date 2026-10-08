@@ -9,27 +9,36 @@
 //! prompts share one pass exactly.
 //!
 //! What the switch changes, each to an arithmetic that does not look at the
-//! row count:
+//! row count, at each projection's own precision:
 //!
-//! * BF16 projections that went to cuBLASLt's first heuristic pick (whose
-//!   split-K changes with M): the GDN in_proj, the QSA indexer q/k
-//!   projections, every other `ops::bf16_gemm` of the pass. They run on an
-//!   in-order k-chain -- cuBLASLt algo 21 without split-K when offered, else
-//!   the tile kernel `dense_gemm_bf16_pipelined`, the same bytes
-//!   (`cublaslt::kchain_pin`) -- see [`try_bf16_gemm`].
-//! * The mHC collapses (`hc_pre`, `hc_head`): the GEMM formulation (BF16
-//!   `normed`, cuBLASLt down/inject per slab height) and the <= 8-row decode
-//!   split path are replaced by the DECODE collapse's own arithmetic at
-//!   every width -- FP32 `normed`, `qwen4exp_hc_mma.cu`'s tensor-core down
-//!   and finish (row-invariant by construction: a row is its own mma
-//!   column) over row groups ([`hc_collapse`]) -- so a prefill row's
-//!   collapse is byte for byte its `ATLAS_QWEN4EXP_HC_MMA` decode collapse.
-//!   The fused prefill seams (`ATLAS_QWEN4EXP_PREFILL_HC`) are declined.
-//! * Attention runs the paged path from the first chunk on, its FP8
-//!   projections on the m128 arm and the BR64 dense kernel at every width
-//!   (`qwen3_attention::prefill`).
+//! * BF16 projections that went to cuBLASLt's heuristic, which re-picks
+//!   the kernel (and its split-K) per row count: the GDN in_proj, the QSA
+//!   indexer projections and the mHC down / injection (which also switched
+//!   to the k-chain at full slabs). The wide in_proj runs the in-order
+//!   k-chain (the same bytes on every k-chain kernel); each narrow shape
+//!   keeps ONE cuBLASLt configuration at every row count -- the heuristic's
+//!   pick at a reference row count ([`try_bf16_gemm`], `cublaslt::fixed_algo`).
+//! * The mHC collapse no longer takes the decode split path at <= 8 rows.
+//! * Attention runs the paged path from the first chunk on (the BR64 dense
+//!   kernel at every width, dense rows cut at the QSA bound), q/k/v on the
+//!   FP8 x FP8 `qwen4exp_fp8_gemm_w2` at every width (the first chunk's arm)
+//!   and o on the FP8 m128 arm at every width.
 //! * One-row passes stay on the prefill path (no decode-layer fork), and a
 //!   Marconi replay uses the chunked GDN scan, not the token-sequential one.
+//!
+//! `ATLAS_QWEN4EXP_PREFILL_BF16_PROJ=1` ([`bf16_proj`], on top) moves the
+//! prefill to decode precision:
+//!
+//! * attention q(+gate)/k/v/o on BF16 copies of the NVFP4 weights decode
+//!   reads, through the k-chain above, instead of FP8 weights x E4M3
+//!   activations (`qwen3_attention::prefill_weights_rowinv`);
+//! * the shared expert on the routed experts' TC prefill kernels -- decode's
+//!   TC numerics, decode runs it as units of that family -- instead of q38's
+//!   E4M3 activations; the routed experts take that arm too (`_MOE_BF16`);
+//! * the mHC collapse on the DECODE collapse's own kernels at every width --
+//!   FP32 `normed`, `qwen4exp_hc_mma.cu`'s tensor-core down and finish over
+//!   row groups ([`hc_collapse`]) -- byte for byte its `_HC_MMA` decode
+//!   collapse; the fused prefill seams are declined.
 //!
 //! The pass state lives in a thread-local [`Scope`] that `forward_layers`
 //! holds around the prefill layers, so decode and verify -- which share the
@@ -49,6 +58,27 @@ pub fn on() -> bool {
     spark_runtime::qwen4exp_prefill_rowinv()
 }
 
+/// `ATLAS_QWEN4EXP_PREFILL_BF16_PROJ=1` (default off, applies only with
+/// [`on`]): the prefill projections at decode precision -- the FP8 ones
+/// (attention q/k/v/o, the shared expert) on BF16 activations, the mHC
+/// collapse on decode's FP32 kernels. Read once.
+pub fn bf16_proj() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let set = matches!(
+            std::env::var("ATLAS_QWEN4EXP_PREFILL_BF16_PROJ").as_deref(),
+            Ok("1") | Ok("true")
+        );
+        if set && !on() {
+            tracing::warn!(
+                "ATLAS_QWEN4EXP_PREFILL_BF16_PROJ=1 ignored: it applies on top of \
+                 ATLAS_QWEN4EXP_PREFILL_ROWINV=1"
+            );
+        }
+        set && on()
+    })
+}
+
 /// The GDN chunk every pass start must sit on (see the module docs).
 pub const PASS_GRANULE: usize = 64;
 
@@ -58,6 +88,10 @@ struct Pass {
     /// Rows one mHC slab takes in the shared scratch (FP32 `normed` and
     /// `low`), a multiple of the row-kernel groups.
     hc_rows: u32,
+    /// [`bf16_proj`]: decode precision on top of the row invariance.
+    decode: bool,
+    /// The pass's rows are all text (no vision pads): see [`text_only`].
+    text: bool,
 }
 
 thread_local! {
@@ -74,12 +108,14 @@ impl Drop for Scope {
 }
 
 /// Start a row-invariant prefill pass on this thread (`None` when the switch
-/// is off). `hc_scratch_bytes`, `hc_dim` and `rank` size the mHC slab.
+/// is off). `hc_scratch_bytes`, `hc_dim` and `rank` size the mHC slab;
+/// `text` says every row of the pass is a text token.
 pub fn enter(
     gpu: &dyn GpuBackend,
     hc_scratch_bytes: usize,
     hc_dim: usize,
     rank: usize,
+    text: bool,
 ) -> Option<Scope> {
     if !on() {
         return None;
@@ -94,6 +130,8 @@ pub fn enter(
         p.set(Some(Pass {
             gpu: gpu as *const _,
             hc_rows: rows,
+            decode: bf16_proj(),
+            text,
         }))
     });
     Some(Scope(()))
@@ -104,13 +142,50 @@ pub fn active() -> bool {
     PASS.with(|p| p.get().is_some())
 }
 
+/// A row-invariant pass over text rows only is running: their three mRoPE
+/// position streams are equal, so the attention takes plain RoPE (the
+/// cache-skip first chunk's kernel, the same rotation at a quarter of
+/// `rope_mrope_interleaved`'s cost) in every chunk.
+pub fn text_only() -> bool {
+    PASS.with(|p| p.get().is_some_and(|p| p.text))
+}
+
+/// A row-invariant pass at decode precision ([`bf16_proj`]) is running.
+pub fn decode_active() -> bool {
+    PASS.with(|p| p.get().is_some_and(|p| p.decode))
+}
+
 fn pass() -> Option<(&'static dyn GpuBackend, u32)> {
     // SAFETY: see `enter`.
     PASS.with(|p| p.get().map(|p| (unsafe { &*p.gpu }, p.hc_rows)))
 }
 
-/// `out[m, n] = act[m, k] @ weight[n, k]^T` (BF16) on an in-order k-chain,
-/// when a row-invariant pass is running; `Ok(false)` launched nothing.
+/// How a BF16 projection of shape `n x k` stays row-invariant, measured on
+/// GB10 (`examples/qwen4exp_rowinv_probe fixed`):
+///
+/// * wide (`n >= 2048`, the GDN in_proj; up to a chunk of rows): the
+///   in-order k-chain -- the fastest cuBLASLt algo-21 kernel offered for the
+///   row count (what `ATLAS_LT_KCHAIN_PIN` runs at 16K rows), else the tile
+///   kernel; every k-chain kernel gives the same bytes;
+/// * narrow (the QSA projections, the mHC down / injection; slabs of at most
+///   2048 rows): ONE cuBLASLt configuration at every row count, the
+///   heuristic's pick at a reference row count -- 2048 (the QSA slab: the
+///   heuristic's own kernel there), 512 for the mHC down / injection
+///   (split-K with a workspace reduction: within ~30 us of the heuristic at
+///   64 rows, 1.7x the k-chain the default ran at full slabs). The 64-row
+///   picks are not row-invariant: never use them.
+fn reference_rows(n: u32, k: u32) -> Option<u32> {
+    match (n, k) {
+        (2048.., _) => None,
+        (..=512, 8192..) => Some(512),
+        _ => Some(2048),
+    }
+}
+
+/// `out[m, n] = act[m, k] @ weight[n, k]^T` (BF16) row-invariantly
+/// ([`reference_rows`]) when a row-invariant pass is running; `Ok(false)`
+/// launched nothing. An error where the narrow configuration refuses the row
+/// count: any other kernel would break the invariance.
 pub fn try_bf16_gemm(
     act: DevicePtr,
     weight: u64,
@@ -121,17 +196,37 @@ pub fn try_bf16_gemm(
     let Some((gpu, _)) = pass() else {
         return Ok(false);
     };
-    if spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain_any(
-        act.0,
-        weight,
-        out.0,
-        [m, n, k],
-        stream,
-    )? {
+    let Some(ref_m) = reference_rows(n, k) else {
+        // The k-chain kernels group K alike only in whole k16 steps
+        // (`bf16_gemm_matches_pipelined`).
+        anyhow::ensure!(
+            k.is_multiple_of(16),
+            "ATLAS_QWEN4EXP_PREFILL_ROWINV: K = {k} is not a whole number of k16 steps"
+        );
+        if !spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain_any(
+            act.0,
+            weight,
+            out.0,
+            [m, n, k],
+            stream,
+        )? {
+            let kernel = gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?;
+            gemm_raw(gpu, kernel, act, DevicePtr(weight), out, m, n, k, stream)?;
+        }
         return Ok(true);
-    }
-    let kernel = gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?;
-    gemm_raw(gpu, kernel, act, DevicePtr(weight), out, m, n, k, stream)?;
+    };
+    anyhow::ensure!(
+        spark_runtime::cublaslt::bf16_gemm_act_weight_t_fixed(
+            act.0,
+            weight,
+            out.0,
+            [m, n, k],
+            ref_m,
+            stream
+        )?,
+        "ATLAS_QWEN4EXP_PREFILL_ROWINV: cuBLASLt's {ref_m}-row configuration for \
+         {n}x{k} refuses {m} rows"
+    );
     Ok(true)
 }
 
@@ -165,7 +260,7 @@ pub fn hc_collapse(
     norm_eps: f32,
     stream: u64,
 ) -> Result<bool> {
-    let Some((gpu, slab)) = pass() else {
+    let Some((gpu, slab)) = pass().filter(|_| decode_active()) else {
         return Ok(false);
     };
     let hc_dim = hc_mult * hidden_size;

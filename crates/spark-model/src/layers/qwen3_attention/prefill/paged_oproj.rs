@@ -28,8 +28,8 @@ impl Qwen3AttentionLayer {
         if self.oproj_reduce_scatter_piped(attn_out, o_out, [n, h, nq * hd], ctx, stream)? {
             return Ok(o_out);
         }
-        // ATLAS_QWEN4EXP_PREFILL_ROWINV: BF16 at decode's weight values, on
-        // the pass's row-invariant k-chain.
+        // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: BF16 at decode's weight values,
+        // on the pass's row-invariant k-chain.
         if crate::layers::ops::qwen4exp_rowinv::active()
             && let Some(w) = self.rowinv_bf16[3]
         {
@@ -445,7 +445,7 @@ impl Qwen3AttentionLayer {
             && self.o_fp8w_t.is_none()
             && !ctx.dispatch.cutlass_nvfp4_attn_o
             && std::env::var("ATLAS_ATTN_W4A4").is_err();
-        // ATLAS_QWEN4EXP_PREFILL_ROWINV: the BF16 o_proj, row-invariant too.
+        // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: the BF16 o_proj, row-invariant too.
         let rowinv = self.rowinv_bf16[3].filter(|_| crate::layers::ops::qwen4exp_rowinv::active());
         let fp8 = self.o_fp8.filter(|_| n > 128 && earlier_arms_skip);
         if rowinv.is_none() && fp8.is_none() {
