@@ -22,12 +22,12 @@ use super::*;
 use spark_runtime::kernel_args::KernelLaunch;
 
 /// `ATLAS_QWEN4EXP_PREFILL_MOE_BF16=1`, implied by
-/// `ATLAS_QWEN4EXP_PREFILL_ROWINV` (decode precision).
+/// `ATLAS_QWEN4EXP_PREFILL_BF16_PROJ` (decode precision).
 pub(crate) fn tcp_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_MOE_BF16")
-            || crate::layers::ops::qwen4exp_rowinv::on()
+            || crate::layers::ops::qwen4exp_rowinv::bf16_proj()
     })
 }
 
@@ -113,7 +113,7 @@ const TABLE_BYTES: usize = 6 * 8 + 3 * 4 + 4;
 const OFFSETS_AT: usize = 64;
 
 impl MoeLayer {
-    /// `ATLAS_QWEN4EXP_PREFILL_ROWINV`: the shared expert on the routed
+    /// `ATLAS_QWEN4EXP_PREFILL_BF16_PROJ`: the shared expert on the routed
     /// experts' TC prefill kernels (`qwen4exp_moe_tcp.cu`) as one expert over
     /// every row, in place of the q38 arm's E4M3 activations. Decode runs the
     /// shared expert as units of the same TC family (`qwen4exp_moe_c8_tc.cu`
@@ -130,7 +130,7 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<bool> {
         let sh = &self.weights.shared_expert;
-        if !crate::layers::ops::qwen4exp_rowinv::active()
+        if !crate::layers::ops::qwen4exp_rowinv::decode_active()
             || h != 2560
             || inter != 640
             || n == 0

@@ -3,16 +3,20 @@
 //! qwen4_exp TP2 rank shapes, on a GB10 (run inside atlas-release-builder for
 //! the runtime image's cuBLASLt):
 //!
-//! 1. `proj`: the row-invariant BF16 projection (`qwen4exp_rowinv::
-//!    try_bf16_gemm`: cuBLASLt's algo-21 k-chain when offered, else the tile
-//!    kernel `dense_gemm_bf16_pipelined`). A solo pass over `m` rows against
-//!    the same rows inside a 368..2048-row pass, at two offsets, and the
-//!    k-chain against the tile kernel: differing bytes.
-//! 2. `hc`: the prefill mHC collapse (`hc_pre_stage_vec` + `hc_mma_down_rows`
-//!    + `hc_mma_finish_rows` over a 1920-row slab) against the DECODE
-//!    collapse (`hc_mma_down` + `hc_mma_finish`, 1..32 rows) of the same
-//!    rows: differing `y` / `inj` bytes. Zero means a prefill row's collapse
-//!    is its decode collapse, byte for byte.
+//! 1. `fixed`: the BF16 projections ROWINV pins (`qwen4exp_rowinv::
+//!    try_bf16_gemm`: N >= 2048 on the in-order k-chain, narrower shapes on
+//!    one cuBLASLt configuration, the heuristic's pick at a reference row
+//!    count -- 512 for the mHC down / injection, 2048 otherwise;
+//!    `PROBE_REF` forces one reference for every shape). Solo passes over 1..513 rows
+//!    against the same rows inside 368/1920/2048-row passes at two offsets,
+//!    run-to-run repeats, and microseconds a call against the heuristic
+//!    (`PROBE_MS`, `PROBE_SHAPE`).
+//! 2. `hc`: for `ATLAS_QWEN4EXP_PREFILL_BF16_PROJ`, the prefill mHC collapse
+//!    (`hc_pre_stage_vec` + `hc_mma_down_rows` + `hc_mma_finish_rows` over
+//!    a 1920-row slab) against the DECODE collapse (`hc_mma_down` +
+//!    `hc_mma_finish`, 1..32 rows) of the same rows: differing `y` / `inj`
+//!    bytes. Zero means a prefill row's collapse is its decode collapse,
+//!    byte for byte.
 //!
 //!   cargo build -p spark-model --release --features cuda,gpu-examples \
 //!     --example qwen4exp_rowinv_probe
@@ -58,120 +62,6 @@ fn read(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u8>> {
 
 fn diff(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).filter(|(x, y)| x != y).count()
-}
-
-/// `out = a x w^T` on the tile kernel (`tile`) or cuBLASLt's k-chain.
-#[allow(clippy::too_many_arguments)]
-fn proj(
-    g: &dyn GpuBackend,
-    tile: bool,
-    a: DevicePtr,
-    w: DevicePtr,
-    out: DevicePtr,
-    [m, n, k]: [u32; 3],
-    s: u64,
-) -> Result<&'static str> {
-    if !tile
-        && spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain_any(
-            a.0,
-            w.0,
-            out.0,
-            [m, n, k],
-            s,
-        )?
-    {
-        return Ok("kchain");
-    }
-    KernelLaunch::new(g, g.kernel("gemm", "dense_gemm_bf16_pipelined")?)
-        .grid([n.div_ceil(128), m.div_ceil(128), 1])
-        .block([256, 1, 1])
-        .arg_ptr(a)
-        .arg_ptr(w)
-        .arg_ptr(out)
-        .arg_u32(m)
-        .arg_u32(n)
-        .arg_u32(k)
-        .launch(s)?;
-    Ok("tile")
-}
-
-fn check_proj(g: &dyn GpuBackend, seed: &mut u64) -> Result<()> {
-    let s = g.default_stream();
-    // GDN in_proj / out_proj (= attention o_proj), QSA indexer q+k, the
-    // BF16 attention q+gate and k/v, PLE key/value.
-    let shapes = [
-        ("gdn_in_proj", 8192, 2560),
-        ("gdn_out/o_proj", 2560, 3072),
-        ("qsa_qk", 640, 2560),
-        ("attn_q_gate", 6144, 2560),
-        ("attn_k_or_v", 256, 2560),
-        ("ple_key", 10240, 2560),
-        ("ple_value", 2560, 2560),
-    ];
-    let solos = [1usize, 7, 22, 46, 64, 100, 200, 513];
-    for (name, n, k) in shapes {
-        let w = upload(g, &bf16s(seed, n * k, 0.02))?;
-        let mut bad = Vec::new();
-        let mut kinds = std::collections::BTreeSet::new();
-        for big in [368usize, 2048] {
-            let a = upload(g, &bf16s(seed, big * k, 1.0))?;
-            let ob = g.alloc(big * n * 2)?;
-            kinds.insert(proj(
-                g,
-                false,
-                a,
-                w,
-                ob,
-                [big as u32, n as u32, k as u32],
-                s,
-            )?);
-            let ot = g.alloc(big * n * 2)?;
-            proj(g, true, a, w, ot, [big as u32, n as u32, k as u32], s)?;
-            g.synchronize(s)?;
-            let vb = read(g, ob, big * n * 2)?;
-            let d = diff(&vb, &read(g, ot, big * n * 2)?);
-            if d > 0 {
-                bad.push(format!("kchain!=tile at {big}: {d} B"));
-            }
-            for &m in solos.iter().filter(|&&m| m < big) {
-                for off in [0usize, 46.min(big - m)] {
-                    let os = g.alloc(m * n * 2)?;
-                    let a_off = a.offset(off * k * 2);
-                    kinds.insert(proj(
-                        g,
-                        false,
-                        a_off,
-                        w,
-                        os,
-                        [m as u32, n as u32, k as u32],
-                        s,
-                    )?);
-                    g.synchronize(s)?;
-                    let d = diff(
-                        &vb[off * n * 2..(off + m) * n * 2],
-                        &read(g, os, m * n * 2)?,
-                    );
-                    if d > 0 {
-                        bad.push(format!("solo {m}@{off} in {big}: {d} B"));
-                    }
-                    g.free(os)?;
-                }
-            }
-            g.free(a)?;
-            g.free(ob)?;
-            g.free(ot)?;
-        }
-        g.free(w)?;
-        println!(
-            "proj {name:<15} N={n:<5} K={k:<5} kernels {kinds:?}: {}",
-            if bad.is_empty() {
-                "row-invariant, k-chain == tile".to_string()
-            } else {
-                bad.join("; ")
-            }
-        );
-    }
-    Ok(())
 }
 
 const H: usize = 2560;
@@ -302,13 +192,148 @@ fn check_hc(g: &dyn GpuBackend, seed: &mut u64) -> Result<()> {
     Ok(())
 }
 
+/// ROWINV's BF16 projections (see the module docs): row invariance (solo
+/// 1..513 rows inside 368/1920/2048-row passes), run-to-run determinism, and
+/// microseconds a call against the heuristic.
+fn check_fixed(g: &dyn GpuBackend, seed: &mut u64) -> Result<()> {
+    let s = g.default_stream();
+    // `qwen4exp_rowinv::reference_rows`; PROBE_REF forces one for every shape.
+    let ref_of = |n: usize, k: usize| if n <= 512 && k >= 8192 { 512 } else { 2048 };
+    let ref_env: Option<u32> = std::env::var("PROBE_REF").ok().and_then(|v| v.parse().ok());
+    let only = std::env::var("PROBE_SHAPE").ok();
+    let shapes = [
+        ("hc_down", 320, 10240),
+        ("hc_inject", 4, 10240),
+        ("qsa_qk", 640, 2560),
+        ("gdn_in_proj", 8192, 2560),
+        ("gdn_in_proj_tp1", 16384, 2560),
+    ];
+    let shapes = shapes
+        .into_iter()
+        .filter(|s| only.as_deref().is_none_or(|o| o == s.0));
+    // `qwen4exp_rowinv::try_bf16_gemm`: wide shapes on the k-chain (any
+    // offered algo-21 kernel, else the tile kernel), narrow ones on one
+    // configuration.
+    let fixed = |a: DevicePtr, w: DevicePtr, o: DevicePtr, mnk: [u32; 3]| -> Result<()> {
+        if mnk[1] >= 2048 && ref_env.is_none() {
+            let lt =
+                spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain_any(a.0, w.0, o.0, mnk, s)?;
+            if !lt {
+                KernelLaunch::new(g, g.kernel("gemm", "dense_gemm_bf16_pipelined")?)
+                    .grid([mnk[1].div_ceil(128), mnk[0].div_ceil(128), 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(a)
+                    .arg_ptr(w)
+                    .arg_ptr(o)
+                    .arg_u32(mnk[0])
+                    .arg_u32(mnk[1])
+                    .arg_u32(mnk[2])
+                    .launch(s)?;
+            }
+            return Ok(());
+        }
+        let ref_m = ref_env.unwrap_or(ref_of(mnk[1] as usize, mnk[2] as usize));
+        anyhow::ensure!(
+            spark_runtime::cublaslt::bf16_gemm_act_weight_t_fixed(a.0, w.0, o.0, mnk, ref_m, s)?,
+            "fixed config refused {mnk:?}"
+        );
+        Ok(())
+    };
+    for (name, n, k) in shapes {
+        let w = upload(g, &bf16s(seed, n * k, 0.02))?;
+        let mut bad = Vec::new();
+        for big in [368usize, 1920, 2048] {
+            let a = upload(g, &bf16s(seed, big * k, 1.0))?;
+            let (ob, ob2) = (g.alloc(big * n * 2)?, g.alloc(big * n * 2)?);
+            fixed(a, w, ob, [big as u32, n as u32, k as u32])?;
+            fixed(a, w, ob2, [big as u32, n as u32, k as u32])?;
+            g.synchronize(s)?;
+            let vb = read(g, ob, big * n * 2)?;
+            let d = diff(&vb, &read(g, ob2, big * n * 2)?);
+            if d > 0 {
+                bad.push(format!("run-to-run at {big}: {d} B"));
+            }
+            for &m in [1usize, 7, 22, 46, 64, 100, 200, 513]
+                .iter()
+                .filter(|&&m| m < big)
+            {
+                for off in [0usize, 46.min(big - m)] {
+                    let os = g.alloc(m * n * 2)?;
+                    fixed(a.offset(off * k * 2), w, os, [m as u32, n as u32, k as u32])?;
+                    g.synchronize(s)?;
+                    let d = diff(
+                        &vb[off * n * 2..(off + m) * n * 2],
+                        &read(g, os, m * n * 2)?,
+                    );
+                    if d > 0 {
+                        bad.push(format!("solo {m}@{off} in {big}: {d} B"));
+                    }
+                    g.free(os)?;
+                }
+            }
+            g.free(a)?;
+            g.free(ob)?;
+            g.free(ob2)?;
+        }
+        let mut times = Vec::new();
+        // PROBE_MS: the timed row counts (default 64,512,2048,8192).
+        let ms: Vec<u32> = std::env::var("PROBE_MS")
+            .unwrap_or_else(|_| "64,512,2048,8192".into())
+            .split(',')
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        for m in ms {
+            let a = upload(g, &bf16s(seed, m as usize * k, 1.0))?;
+            let o = g.alloc(m as usize * n * 2)?;
+            let mnk = [m, n as u32, k as u32];
+            let us = |f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
+                f()?;
+                g.synchronize(s)?;
+                let t = std::time::Instant::now();
+                for _ in 0..20 {
+                    f()?;
+                }
+                g.synchronize(s)?;
+                Ok(t.elapsed().as_secs_f64() * 1e6 / 20.0)
+            };
+            let th = us(&mut || {
+                spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+                    a.0, w.0, o.0, m, n as u32, k as u32, s,
+                )
+            })?;
+            let tf = us(&mut || fixed(a, w, o, mnk))?;
+            times.push(format!("m={m}: heuristic {th:.0} rowinv {tf:.0} us"));
+            g.free(a)?;
+            g.free(o)?;
+        }
+        g.free(w)?;
+        let ref_m = ref_env.unwrap_or(ref_of(n, k));
+        let algo = if n >= 2048 && ref_env.is_none() {
+            Some("k-chain".to_string())
+        } else {
+            spark_runtime::cublaslt::bf16_fixed_algo_description(n as u32, k as u32, ref_m)
+        };
+        println!(
+            "fixed {name:<12} N={n:<5} K={k:<5} [{}]: {} | {}",
+            algo.unwrap_or_default(),
+            if bad.is_empty() {
+                "row-invariant, deterministic".to_string()
+            } else {
+                bad.join("; ")
+            },
+            times.join("; ")
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &gpu;
     let mut seed = 0x5eed_u64;
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".into());
-    if which == "all" || which == "proj" {
-        check_proj(g, &mut seed)?;
+    if which == "all" || which == "fixed" {
+        check_fixed(g, &mut seed)?;
     }
     if which == "all" || which == "hc" {
         check_hc(g, &mut seed)?;

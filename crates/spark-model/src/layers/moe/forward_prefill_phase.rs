@@ -166,7 +166,7 @@ impl MoeLayer {
             return Ok(());
         }
 
-        // ATLAS_QWEN4EXP_PREFILL_ROWINV: the decode shared expert's TC numerics.
+        // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: the decode shared expert's TC numerics.
         if self.try_tcp_shared(
             input,
             (n, h, shared_inter),

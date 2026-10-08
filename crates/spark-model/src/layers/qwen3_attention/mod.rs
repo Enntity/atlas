@@ -39,6 +39,7 @@ mod op_dump;
 pub mod innerq_driver;
 mod prefill;
 mod prefill_weights;
+mod prefill_weights_rowinv;
 mod trait_impl;
 mod types;
 mod types_weights;

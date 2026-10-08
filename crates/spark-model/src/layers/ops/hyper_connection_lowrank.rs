@@ -110,7 +110,8 @@ pub fn hc_pre_lowrank(
     // rather than introducing a new regime: the GEMM path rounds `normed` to
     // BF16, and every prefill over 64 tokens already took it. A 60- and a
     // 65-token prompt previously ran different arithmetic.
-    // ATLAS_QWEN4EXP_PREFILL_ROWINV: the decode collapse at every width.
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV + _BF16_PROJ: the decode collapse at
+    // every width.
     if super::qwen4exp_rowinv::hc_collapse(
         streams,
         w,
@@ -125,7 +126,9 @@ pub fn hc_pre_lowrank(
     )? {
         return Ok(());
     }
-    if num_tokens <= HC_DECODE_MAX_T && !scratch.is_null() {
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV: the prefill formulation at every width.
+    let split = num_tokens <= HC_DECODE_MAX_T && !super::qwen4exp_rowinv::active();
+    if split && !scratch.is_null() {
         return hc_pre_split(
             gpu,
             streams,
@@ -204,7 +207,8 @@ pub fn hc_head_lowrank(
     norm_eps: f32,
     stream: u64,
 ) -> Result<()> {
-    // ATLAS_QWEN4EXP_PREFILL_ROWINV: the decode collapse at every width.
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV + _BF16_PROJ: the decode collapse at
+    // every width.
     if super::qwen4exp_rowinv::hc_collapse(
         streams,
         w,
@@ -219,7 +223,9 @@ pub fn hc_head_lowrank(
     )? {
         return Ok(());
     }
-    if num_tokens <= HC_DECODE_MAX_T && !scratch.is_null() {
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV: the prefill formulation at every width.
+    let split = num_tokens <= HC_DECODE_MAX_T && !super::qwen4exp_rowinv::active();
+    if split && !scratch.is_null() {
         return hc_pre_split(
             gpu,
             streams,

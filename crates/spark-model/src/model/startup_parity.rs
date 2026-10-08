@@ -141,6 +141,9 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_ROWINV", || {
         Ok(crate::layers::ops::qwen4exp_rowinv::on() as u64)
     }),
+    ("ATLAS_QWEN4EXP_PREFILL_BF16_PROJ", || {
+        Ok(crate::layers::ops::qwen4exp_rowinv::bf16_proj() as u64)
+    }),
     ("ATLAS_MARCONI_EXACT", || {
         Ok(mtp_carry::marconi_exact() as u64)
     }),
