@@ -271,25 +271,23 @@ impl DraftHead {
             self.rows
         );
         match self.nvfp4.as_ref() {
-            Some(q) if self.w4_rows.serves(m, hidden) => self.w4_rows.launch(
-                gpu,
-                input,
-                &q.rows_from(first as usize, hidden as usize),
-                out,
-                (m, n, hidden),
-                stream,
-            ),
-            Some(q) => ops::w4a16_gemv_batchm(
-                gpu,
-                self.w4a16_tiers.scalar_kernel(m),
-                input,
-                &q.rows_from(first as usize, hidden as usize),
-                out,
-                m,
-                n,
-                hidden,
-                stream,
-            ),
+            Some(q) => {
+                let w = q.rows_from(first as usize, hidden as usize);
+                self.w4_rows
+                    .launch_or(gpu, input, &w, out, (m, n, hidden), stream, || {
+                        ops::w4a16_gemv_batchm(
+                            gpu,
+                            self.w4a16_tiers.scalar_kernel(m),
+                            input,
+                            &w,
+                            out,
+                            m,
+                            n,
+                            hidden,
+                            stream,
+                        )
+                    })
+            }
             None => ops::dense_gemv_batchm(
                 gpu,
                 dense_batchm_k,

@@ -31,9 +31,10 @@
 // commutative, so the pairs and the tree are the reference's).
 //
 // Layouts: A [M, K] BF16; B_packed [N, K/2] E2M1; B_scale [N, K/16] E4M3;
-// scale2 FP32; C row t at C + t * N. K a multiple of 16 with K/16 even (the
-// host refuses others). Grid: persistent (`qwen4exp_draft_head.rs`), block
-// 64 x OB, dynamic shared memory M x ceil(K/2048) x 4 KiB.
+// scale2 FP32; C row t at C + t * N. K a multiple of 32, at most 4096 (the
+// host refuses others). Grid: persistent (`ops::Qwen4ExpW4Rows`), block
+// 64 x OB, dynamic shared memory (and no static) of
+//   M x 2 x 4 KiB (the rows) + 2 x M x NPB x 2 x 4 B (reduction) + 64 B (LUT).
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -90,9 +91,13 @@ __device__ __forceinline__ void qw4_rows(const __nv_bfloat16* __restrict__ A,
     constexpr int J = 2;  // ceil(K16 / 128) for K <= 4096
     constexpr unsigned NPB = NT * OB, NTH = QW4_LANES * OB;
     static_assert(OB <= 15, "a named barrier a group (ids 1..15)");
+    // ALL shared memory is dynamic (`qw4_smem_bytes`): the launcher opts in
+    // past 48 KB from the dynamic size alone, so a static remainder on top of
+    // a dynamic size at or just under 48 KB (M = 6: 48 KB of rows) would
+    // overflow the default limit without the opt-in and fail the launch.
     extern __shared__ __align__(16) uint4 s_a[];  // [M][J][c][half][64]
-    __shared__ float s_lut[16];
-    __shared__ float s_red[2][M * NPB * 2];
+    float* s_red_base = (float*)(s_a + M * J * 4 * QW4_LANES);  // [2][M * NPB * 2]
+    float* s_lut = s_red_base + 2 * M * NPB * 2;                 // [16]
     const unsigned lane = threadIdx.x % QW4_LANES, og = threadIdx.x / QW4_LANES;
     const unsigned K8 = K / 8, K16 = K / 16, half_K = K / 2;
     const unsigned tiles = (N + NPB - 1) / NPB;
@@ -192,7 +197,7 @@ __device__ __forceinline__ void qw4_rows(const __nv_bfloat16* __restrict__ A,
         for (int o = 0; o < NT; o++)
 #pragma unroll
             for (int t = 0; t < M; t++) v[o * M + t] = acc[0][o][t] + acc[1][o][t];
-        float* red = s_red[it & 1];
+        float* red = s_red_base + (it & 1) * (M * NPB * 2);
         unsigned idx;
         const float r = qw4_tree<VP>(v, lane % 32, idx);
         // Lanes sharing idx hold the same value; each writes it.
