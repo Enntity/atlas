@@ -172,7 +172,16 @@ impl TransformerModel {
         Ok(())
     }
 
+    /// Order the default stream after the verdict's commit, for a reader of
+    /// the committed SSM state: under `ATLAS_QWEN4EXP_GDN_COMMIT_FUSE` that
+    /// first lands any commit left for a next verify (`gdn_commit_fuse`).
     pub(super) fn sync_secondary_dispatch(&self) -> Result<()> {
+        self.gdn_fuse_flush_all()?;
+        self.wait_secondary_dispatch()
+    }
+
+    /// The wait alone, for the verify that may take a pending commit.
+    pub(super) fn wait_secondary_dispatch(&self) -> Result<()> {
         // GPU-side event sync: make the default stream wait for the secondary
         // event. Zero CPU cost — the GPU scheduler handles the dependency.
         self.gpu
@@ -331,6 +340,7 @@ impl TransformerModel {
         let mut conv_plan = Vec::with_capacity(self.ssm_pool.num_ssm_layers);
         // ATLAS_QWEN4EXP_EXACT_DEFER: replayed from H0, h and conv, one launch.
         let mut exact_layers = Vec::new();
+        let mut exact_idx = Vec::new();
         let exact = self.gdn_pending_is_exact();
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) != LayerType::LinearAttention {
@@ -343,6 +353,7 @@ impl TransformerModel {
             if exact && ssm.gdn_commit_pending {
                 ssm.gdn_commit_pending = false;
                 exact_layers.push(self.gdn_exact_commit_entry(i, ssm));
+                exact_idx.push(i);
                 ssm_layer_idx += 1;
                 continue;
             }
@@ -398,7 +409,8 @@ impl TransformerModel {
             ssm_layer_idx += 1;
         }
         if !exact_layers.is_empty() {
-            self.commit_gdn_exact(&exact_layers, num_accepted, stream)?;
+            // ATLAS_QWEN4EXP_GDN_COMMIT_FUSE: or left for the next verify.
+            self.gdn_commit_or_defer(seq, exact_idx, exact_layers, num_accepted, stream)?;
         }
         run_ssm_state_copies(self.gpu.as_ref(), &h_plan, &conv_plan, stream)?;
         self.gpu.record_event(self.secondary_event, stream)?;
@@ -413,9 +425,13 @@ impl TransformerModel {
     /// kernel (`TransformerLayer::gdn_deferred_wyn`), plus the wyN arm's
     /// per-sequence intermediates-layout precondition, so the flag can
     /// never disagree with the kernel the capture baked.
-    pub(super) fn mark_gdn_deferred_commit(&self, seq: &mut SequenceState, num_tokens: usize) {
+    pub(super) fn mark_gdn_deferred_commit(
+        &self,
+        seq: &mut SequenceState,
+        num_tokens: usize,
+    ) -> Result<()> {
         if !self.levers.gdn_deferred_commit {
-            return;
+            return Ok(());
         }
         for (i, state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) != LayerType::LinearAttention {
@@ -435,6 +451,8 @@ impl TransformerModel {
                     || (exact && !ssm.gdn_commit_qkv.is_null() && !ssm.gdn_commit_gb.is_null());
             }
         }
+        // ATLAS_QWEN4EXP_GDN_COMMIT_FUSE: this verify's pending-commit word.
+        self.gdn_fuse_arm(seq)
     }
 
     /// Deferred-commit accept: replay tokens `0..num_accepted` of this

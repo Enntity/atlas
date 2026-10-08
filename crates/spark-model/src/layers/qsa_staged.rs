@@ -38,6 +38,53 @@ use super::*;
 
 thread_local! {
     static STAGED: Cell<bool> = const { Cell::new(false) };
+    static TABLE: std::cell::RefCell<Option<Vec<CommitEntry>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One staged commit of [`QsaIndexer::commit_staged_rows`] for
+/// `qsa_commit_table` (`ATLAS_QWEN4EXP_QSA_COMMIT_TABLE`): the pitched copy
+/// and the block pool it would have launched, with their arguments.
+#[derive(Clone, Copy, Debug)]
+pub struct CommitEntry {
+    pub kernel: KernelHandle,
+    pub src: DevicePtr,
+    pub dst: DevicePtr,
+    pub raw_origin: DevicePtr,
+    pub k_norm_w: DevicePtr,
+    pub block_keys: DevicePtr,
+    pub src_pitch: u32,
+    pub count: u32,
+    pub first_block: u32,
+    pub n_new: u32,
+    /// `(ratio, hd, rot, theta bits, eps bits)`: one launch needs them equal.
+    pub shape: (u32, u32, u32, u32, u32),
+}
+
+/// Scope in which pitched staged commits are collected, not launched; the
+/// model launches them as one table (`model/qsa_commit_table.rs`).
+pub struct CommitTable;
+
+impl CommitTable {
+    pub fn enter() -> Self {
+        TABLE.with(|t| *t.borrow_mut() = Some(Vec::new()));
+        Self
+    }
+
+    /// The collected entries; collection ends.
+    pub fn take(self) -> Vec<CommitEntry> {
+        TABLE.with(|t| t.borrow_mut().take()).unwrap_or_default()
+    }
+}
+
+impl Drop for CommitTable {
+    fn drop(&mut self) {
+        TABLE.with(|t| *t.borrow_mut() = None);
+    }
+}
+
+fn collecting() -> bool {
+    TABLE.with(|t| t.borrow().is_some())
 }
 
 /// Whether the indexer layers called on this thread stage their ingest.
@@ -200,6 +247,32 @@ impl QsaIndexer {
         );
         self.reserve(st, pos + count, gpu, stream)?;
         self.raw_room(st, count, gpu, stream)?;
+        if collecting() && self.k_commit_table_k.0 != 0 {
+            let complete = (pos + count) / self.ratio as usize;
+            let entry = CommitEntry {
+                kernel: self.k_commit_table_k,
+                src: self.staged_key(first_row),
+                dst: self.raw_slot(st, pos),
+                raw_origin: self.raw_origin(st),
+                k_norm_w: self.k_norm_w,
+                block_keys: st.block_keys,
+                src_pitch: self.qk_width() as u32,
+                count: count as u32,
+                first_block: st.pooled as u32,
+                n_new: complete.saturating_sub(st.pooled) as u32,
+                shape: (
+                    self.ratio,
+                    self.hd,
+                    self.rot,
+                    self.theta.to_bits(),
+                    self.eps.to_bits(),
+                ),
+            };
+            TABLE.with(|t| t.borrow_mut().as_mut().map(|v| v.push(entry)));
+            st.ingested = pos + count;
+            st.pooled = st.pooled.max(complete);
+            return Ok(());
+        }
         let row = self.hd as usize * 2;
         crate::model::qwen4exp_step_copies::copy_rows(
             gpu,

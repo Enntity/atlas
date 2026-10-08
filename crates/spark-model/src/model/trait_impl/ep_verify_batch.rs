@@ -115,10 +115,10 @@ impl TransformerModel {
 
         let mut refs = self.ep_worker_slot_refs(&seq_ids, slots)?;
         let stream = self.gpu.default_stream();
-        self.sync_secondary_dispatch()?;
+        self.wait_secondary_dispatch()?;
         self.ssm_pool.require_verify_rollback_supported()?;
         for (seq, &k) in refs.iter_mut().zip(&ks) {
-            self.mark_gdn_deferred_commit(seq, k);
+            self.mark_gdn_deferred_commit(seq, k)?;
         }
         self.decode_verify_batched_dispatch(&tokens, &ks, &mut refs, stream)?;
 

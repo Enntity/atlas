@@ -99,6 +99,65 @@ extern "C" __global__ void qsa_block_pool(
     qsa_rope_store(stage, block_keys + (size_t)b * hd, d, rot, b * ratio, theta);
 }
 
+// ── qsa_commit_table (ATLAS_QWEN4EXP_QSA_COMMIT_TABLE) ──
+// The host half of a wide step's staged QSA ingest (`layers/qsa_staged.rs`)
+// in ONE launch: entry e (one indexer layer x one sequence) is that
+// commit's pitched copy of `count` staged raw keys into the raw window,
+// then `qsa_block_pool` of the `n_new` blocks they complete, in that order,
+// by one block of hd threads. The pool arithmetic is `qsa_block_pool`'s
+// verbatim (same reduction, same rope); the raw keys it reads back include
+// the rows this block just stored, ordered by the barrier and read through
+// L2 (`__ldcg`). Entries touch disjoint states (the host admits a table only
+// with one entry per layer and sequence). Grid: (entries,1,1) Block: (hd,1,1).
+struct QsaCommitEntry {
+    const __nv_bfloat16* src;        // staging row of the run's first row
+    __nv_bfloat16* dst;              // raw window slot of its first position
+    const __nv_bfloat16* raw_origin; // the window moved back to position 0
+    const __nv_bfloat16* k_norm_w;   // [hd]
+    __nv_bfloat16* block_keys;       // [max_blocks, hd]
+    unsigned int src_pitch;          // elements between staged rows
+    unsigned int count;              // rows
+    unsigned int first_block;        // the sequence's pooled count before
+    unsigned int n_new;              // blocks the rows complete
+};
+
+extern "C" __global__ void qsa_commit_table(
+    const QsaCommitEntry* __restrict__ table,
+    const unsigned int ratio,
+    const unsigned int hd,
+    const unsigned int rot,
+    const float theta,
+    const float eps
+) {
+    const QsaCommitEntry e = table[blockIdx.x];
+    const unsigned int d = threadIdx.x;
+    for (unsigned int r = 0; r < e.count; ++r) {
+        e.dst[(size_t)r * hd + d] = e.src[(size_t)r * e.src_pitch + d];
+    }
+    __syncthreads();
+
+    extern __shared__ float smem[];               // [hd] normed + red
+    float* stage = smem;
+    float* red = smem + hd;
+    const unsigned short* raw = reinterpret_cast<const unsigned short*>(e.raw_origin);
+    for (unsigned int i = 0; i < e.n_new; ++i) {
+        const unsigned int b = e.first_block + i;
+        float v = 0.0f;
+        for (unsigned int r = 0; r < ratio; ++r) {
+            v += (float)__ushort_as_bfloat16(__ldcg(raw + (size_t)(b * ratio + r) * hd + d));
+        }
+        v /= (float)ratio;
+
+        const float sq = qsa_block_reduce_sum(v * v, red);
+        const float rms = rsqrtf(sq / (float)hd + eps);
+        stage[d] = v * rms * (1.0f + (float)e.k_norm_w[d]);
+        __syncthreads();
+
+        qsa_rope_store(stage, e.block_keys + (size_t)b * hd, d, rot, b * ratio, theta);
+        __syncthreads();  // stage and red are reused by the next block
+    }
+}
+
 // ── qsa_qprep ──
 // One decode query: per head, RMSNorm*(1+w) then rope at `pos`.
 // q_in is the head-concatenated slice of the qk projection row.

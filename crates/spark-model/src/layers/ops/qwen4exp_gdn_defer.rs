@@ -66,6 +66,10 @@ pub struct GdnDeferSeq {
     pub stage_gb: DevicePtr,
     pub row0: u32,
     pub k: u32,
+    /// `ATLAS_QWEN4EXP_GDN_COMMIT_FUSE`: the sequence's pending-commit word
+    /// (the previous step's accepted tokens, replayed and stored first;
+    /// `model/.../gdn_commit_fuse.rs`), NULL when off.
+    pub fuse_n: DevicePtr,
 }
 
 /// The step buffers, as [`super::qwen4exp_gdn_rows::GdnVerifyRows`].
@@ -79,17 +83,18 @@ pub struct GdnDeferRows<'a> {
     pub out: DevicePtr,
 }
 
-/// `QdfDeferRows`: five words a sequence (`h, conv, stage_qkv, stage_gb,
-/// row0 | k << 32`), `GDN_ROWS_MAX` sequences, unused ones zero.
-pub(crate) fn defer_table(seqs: &[GdnDeferSeq]) -> [u64; 5 * GDN_ROWS_MAX] {
-    let mut t = [0u64; 5 * GDN_ROWS_MAX];
-    for (q, w) in seqs.iter().zip(t.chunks_mut(5)) {
+/// `QdfDeferRows`: six words a sequence (`h, conv, stage_qkv, stage_gb,
+/// row0 | k << 32, fuse_n`), `GDN_ROWS_MAX` sequences, unused ones zero.
+pub(crate) fn defer_table(seqs: &[GdnDeferSeq]) -> [u64; 6 * GDN_ROWS_MAX] {
+    let mut t = [0u64; 6 * GDN_ROWS_MAX];
+    for (q, w) in seqs.iter().zip(t.chunks_mut(6)) {
         w.copy_from_slice(&[
             q.h.0,
             q.conv.0,
             q.stage_qkv.0,
             q.stage_gb.0,
             u64::from(q.row0) | u64::from(q.k) << 32,
+            q.fuse_n.0,
         ]);
     }
     t

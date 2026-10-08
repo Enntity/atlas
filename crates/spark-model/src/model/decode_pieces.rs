@@ -325,6 +325,13 @@ impl TransformerModel {
         // rows at consecutive positions commits as one pitched copy.
         let pitched = super::qwen4exp_step_copies::qsa_commit_rows();
         let runs = staged_runs(rows, pitched);
+        // ATLAS_QWEN4EXP_QSA_COMMIT_TABLE: the device work as one launch
+        // (`qsa_commit_table.rs`), with one run a sequence.
+        let mut seen: Vec<usize> = runs.iter().map(|r| r.1).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let table = (pitched && super::qsa_commit_table::requested() && seen.len() == runs.len())
+            .then(crate::layers::qsa::CommitTable::enter);
         for li in 0..self.layers.len() {
             if self.config.layer_type(li) != LayerType::FullAttention
                 || !self.piece_capturable(li, true)
@@ -345,6 +352,9 @@ impl TransformerModel {
                     stream,
                 )?;
             }
+        }
+        if let Some(table) = table {
+            super::qsa_commit_table::launch(self.gpu.as_ref(), &table.take(), stream)?;
         }
         Ok(())
     }

@@ -306,6 +306,11 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_DECODE_GRAPH_WIDE", || {
         Ok((decode_pieces::requested() && decode_pieces::wide_requested()) as u64)
     }),
+    // Where a batched verify votes on KV admission (`kv_lookahead`): a split
+    // pair would vote at different steps and mispair the broadcasts.
+    ("ATLAS_QWEN4EXP_KV_LOOKAHEAD", || {
+        Ok(crate::model::kv_lookahead::lookahead_tokens() as u64)
+    }),
     // The share of the qwen4_exp LM head a rank projects, and the exchange
     // of the halves every decode/verify step adds.
     ("ATLAS_QWEN4EXP_LMHEAD_SPLIT", || {

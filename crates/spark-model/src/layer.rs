@@ -98,6 +98,10 @@ pub struct SsmLayerState {
     /// `gated_delta_rule_commit` rather than the intermediates index-select.
     /// Cleared at commit / rollback.
     pub gdn_commit_pending: bool,
+    /// `ATLAS_QWEN4EXP_GDN_COMMIT_FUSE`: this slot's pending-commit word,
+    /// which the deferred verify reads (`qwen4exp_gdn_verify_defer_rows`);
+    /// POOL-STABLE per slot like the staging. NULL when off.
+    pub gdn_fuse_n: DevicePtr,
     /// GLM KDA fold records of a verify (`--ssm-rollback-mode records`): the
     /// verify leaves `h_state` untouched and the commit folds the accepted
     /// rows into it (NULL, with snapshots in `h_state_intermediates`, off).

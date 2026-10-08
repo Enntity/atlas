@@ -287,6 +287,7 @@ impl TransformerModel {
                     gdn_commit_qkv: DevicePtr(0),
                     gdn_commit_gb: DevicePtr(0),
                     gdn_commit_pending: false,
+                    gdn_fuse_n: DevicePtr::NULL,
                     // A freshly allocated slot has just been zeroed, and zero
                     // is zero in both formats. Which format it then HOLDS is
                     // decided by the pool width, not by the phase: under the
