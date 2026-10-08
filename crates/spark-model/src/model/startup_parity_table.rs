@@ -323,6 +323,11 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_LMHEAD_SPLIT", || {
         Ok(qwen4exp_lmhead_split::enabled() as u64)
     }),
+    // The rows the split head serves: a rank staged for the batched verify
+    // exchanges where a narrower one projects the full head.
+    ("ATLAS_QWEN4EXP_LMHEAD_SPLIT_VERIFY", || {
+        Ok((qwen4exp_lmhead_split::enabled() && qwen4exp_lmhead_split::verify_requested()) as u64)
+    }),
     // The qwen4_exp TP2 QSA prefill attention arm: each rank's heads, so a
     // split pair would serve neither arm's numerics.
     ("ATLAS_QWEN4EXP_PREFILL_QSA_TC2R", || {
