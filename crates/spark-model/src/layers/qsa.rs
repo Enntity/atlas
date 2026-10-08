@@ -49,7 +49,7 @@ mod qsa_select;
 pub mod qsa_select_sp;
 #[path = "qsa_staged.rs"]
 mod qsa_staged;
-pub use qsa_staged::{StagedIngest, staged_ingest};
+pub use qsa_staged::{CommitEntry, CommitTable, StagedIngest, staged_ingest};
 #[path = "qsa_select_stages.rs"]
 mod qsa_select_stages;
 #[path = "qsa_window.rs"]
@@ -104,6 +104,8 @@ pub struct QsaIndexer {
     max_tokens: usize,
 
     k_pool_k: KernelHandle,
+    /// `qsa_commit_table` (`qsa_staged.rs`), 0 where the target lacks it.
+    k_commit_table_k: KernelHandle,
     k_qprep_k: KernelHandle,
     k_score_k: KernelHandle,
     k_gather_k: KernelHandle,
@@ -223,6 +225,7 @@ impl QsaIndexer {
             hd_attn: hd_attn as u32,
             max_tokens,
             k_pool_k: gpu.kernel("qsa_indexer", "qsa_block_pool")?,
+            k_commit_table_k: super::try_kernel(gpu, "qsa_indexer", "qsa_commit_table"),
             k_qprep_k: gpu.kernel("qsa_indexer", "qsa_qprep")?,
             k_score_k: gpu.kernel("qsa_indexer", "qsa_score")?,
             k_gather_k: gpu.kernel("qsa_indexer", "qsa_gather")?,

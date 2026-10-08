@@ -199,11 +199,14 @@ impl TransformerModel {
             self.embed(t, hidden.offset(r * h * bf16), stream)?;
         }
 
+        // ATLAS_QWEN4EXP_KV_LOOKAHEAD: one vote tops the batch up (`kv_lookahead`).
+        let last: Vec<usize> = seqs
+            .iter()
+            .zip(ks)
+            .map(|(s, &k)| s.seq_len + k - 1)
+            .collect();
+        self.reserve_verify_blocks(seqs, &last, &mut kv_cache, stream)?;
         let bs = kv_cache.block_size();
-        for (i, seq) in seqs.iter_mut().enumerate() {
-            let last_pos = seq.seq_len + ks[i] - 1;
-            self.reserve_decode_blocks(seq, last_pos / bs, &mut kv_cache, stream)?;
-        }
 
         // ATLAS_K4_DIAG=1: stream-sync checkpoint after every layer so an
         // illegal access is attributed to the exact layer (same hatch as
