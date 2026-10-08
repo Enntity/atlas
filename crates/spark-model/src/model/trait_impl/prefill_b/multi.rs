@@ -28,108 +28,9 @@ use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
 
 use super::super::super::types::TransformerModel;
-use crate::layer::{AttnMetadataDev, ForwardContext, MultiSeg};
-use crate::layers::ops::qwen4exp_rowinv::MULTI_MAX_PROMPT;
-use crate::model::impl_a2_ep_worker::EP_CMD_PREFILL_MULTI;
-use crate::traits::PrefillSlice;
-
-/// `ATLAS_QWEN4EXP_PREFILL_MULTI=1` (with ROWINV). Read once.
-pub fn multi_requested() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let set = matches!(
-            std::env::var("ATLAS_QWEN4EXP_PREFILL_MULTI").as_deref(),
-            Ok("1") | Ok("true")
-        );
-        let rowinv = crate::layers::ops::qwen4exp_rowinv::on();
-        if set && !rowinv {
-            tracing::warn!(
-                "ATLAS_QWEN4EXP_PREFILL_MULTI=1 ignored: it needs ATLAS_QWEN4EXP_PREFILL_ROWINV=1"
-            );
-        }
-        set && rowinv
-    })
-}
+use crate::layer::{AttnMetadataDev, ForwardContext, MultiPass, MultiSeg};
 
 impl TransformerModel {
-    /// Whether this model serves `prefill_multi` at all.
-    pub(in crate::model) fn prefill_multi_supported(&self) -> bool {
-        multi_requested()
-            && self.config.model_type == "qwen4_exp"
-            && self.config.hc_mult > 0
-            && !self.use_fp32_logits
-            && self.lora.is_none()
-    }
-
-    /// Head side of `Model::prefill_multi`: send the prompts to the other
-    /// ranks, then run the pass.
-    pub(in crate::model) fn prefill_multi_head(
-        &self,
-        items: &mut [PrefillSlice<'_>],
-        stream: u64,
-    ) -> Result<Vec<DevicePtr>> {
-        ensure!(
-            self.prefill_multi_supported(),
-            "prefill_multi is not enabled for this model"
-        );
-        for it in items.iter() {
-            ensure!(
-                it.chunk_start == 0
-                    && it.is_last_chunk
-                    && it.chunk_len == it.prompt_tokens.len()
-                    && (1..=MULTI_MAX_PROMPT).contains(&it.chunk_len),
-                "prefill_multi takes whole prompts of 1..={MULTI_MAX_PROMPT} tokens"
-            );
-        }
-        if self.multi_rank_protocol_active() {
-            let slots: Vec<u32> = items.iter().map(|i| i.seq.slot_idx as u32).collect();
-            let lens: Vec<u32> = items.iter().map(|i| i.chunk_len as u32).collect();
-            let all: Vec<u32> = items
-                .iter()
-                .flat_map(|i| i.prompt_tokens.iter().copied())
-                .collect();
-            self.ep_broadcast_seq_and_cmd(0, EP_CMD_PREFILL_MULTI, true)?;
-            self.ep_broadcast_u32(items.len() as u32)?;
-            self.ep_broadcast_tokens(&slots)?;
-            self.ep_broadcast_tokens(&lens)?;
-            self.ep_broadcast_tokens(&all)?;
-        }
-        let mut seqs: Vec<(&[u32], &mut crate::traits::SequenceState)> = items
-            .iter_mut()
-            .map(|i| (i.prompt_tokens, &mut *i.seq))
-            .collect();
-        self.prefill_multi_pass(&mut seqs, stream)
-    }
-
-    /// Worker side of `EP_CMD_PREFILL_MULTI`.
-    pub(in crate::model) fn ep_worker_prefill_multi(
-        &self,
-        slots: &mut [Option<crate::traits::SequenceState>],
-    ) -> Result<bool> {
-        let n = self.ep_broadcast_u32(0)? as usize;
-        ensure!((1..=64).contains(&n), "EP prefill_multi of {n} sequences");
-        let ids = self.ep_broadcast_tokens(&vec![0u32; n])?;
-        let lens = self.ep_broadcast_tokens(&vec![0u32; n])?;
-        let total: usize = lens.iter().map(|&l| l as usize).sum();
-        let all = self.ep_broadcast_tokens(&vec![0u32; total])?;
-        let mut refs = self.ep_worker_slot_refs(&ids, slots)?;
-        let mut at = 0usize;
-        let mut seqs: Vec<(&[u32], &mut crate::traits::SequenceState)> = Vec::with_capacity(n);
-        for (seq, &len) in refs.iter_mut().zip(&lens) {
-            seqs.push((&all[at..at + len as usize], &mut **seq));
-            at += len as usize;
-        }
-        let stream = self.gpu.default_stream();
-        self.prefill_multi_pass(&mut seqs, stream)?;
-        // As after the worker's single prefill chunk (`0xFFFFFFF0`).
-        for (_, seq) in seqs.iter() {
-            if let Err(e) = self.normalize_ssm_states_dispatch(seq, stream) {
-                tracing::warn!("Worker SSM state normalization failed: {e:#}");
-            }
-        }
-        Ok(true)
-    }
-
     /// The pass, on every rank. Returns each sequence's logits row.
     pub(in crate::model) fn prefill_multi_pass(
         &self,
@@ -143,17 +44,11 @@ impl TransformerModel {
         };
         let began = Instant::now();
         let n = seqs.len();
-        for (tokens, seq) in seqs.iter() {
-            ensure!(
-                (1..=MULTI_MAX_PROMPT).contains(&tokens.len())
-                    && !self.tokens_have_vision_pad(tokens)
-                    && seq.collect_prompt_logprobs.is_none()
-                    && seq.tokens.is_empty(),
-                "prefill_multi: a prompt it does not serve"
-            );
-        }
-        // Per sequence: the prefix lookup. A sequence restoring a snapshot
-        // replays from it alone after the pass (`multi[k] == false`).
+        // Per sequence: the prefix lookup. A sequence restoring a snapshot or
+        // sharing cached KV blocks (the ranks agree on the match), and a
+        // prompt carrying vision pad ids (token ids sent without an image),
+        // prefill alone after the pass (`multi[k] == false`): the decision
+        // reads only data every rank shares.
         let mut multi = vec![true; n];
         {
             let mut kv = self.kv_cache.lock();
@@ -169,7 +64,9 @@ impl TransformerModel {
                     None,
                 )?;
                 self.pc_apply_plant(tokens, seq, 0, bs);
-                multi[k] = !skip;
+                multi[k] = !skip
+                    && seq.prefix_ref_tokens.is_empty()
+                    && !self.tokens_have_vision_pad(tokens);
             }
         }
         // Logits rows: the pass's sequences first, then the restored ones.
@@ -218,6 +115,15 @@ impl TransformerModel {
             "prefill_multi: {total} rows exceed the {}-row arena",
             self.buffers.max_batch_tokens()
         );
+        // Every sequence's blocks first: an agreed refusal (out of KV blocks)
+        // leaves only reservations and lookups behind, both of which a retry
+        // of the whole pass replays (`prefix_lookup` re-entry).
+        {
+            let mut kv = self.kv_cache.lock();
+            for &k in &picked {
+                self.reserve_prefill_blocks(seqs[k].1, rows[k], &mut kv, stream)?;
+            }
+        }
         // Zero the arena once; each prompt's embedding at its rows.
         let first = picked[0];
         let pre = self.prefill_b_zero_and_embed(true, seqs[first].0, 0, rows[first], stream)?;
@@ -230,16 +136,21 @@ impl TransformerModel {
 
         // Admission and metadata, a region of the scratch arena each (after
         // the MoE top-k staging the pass's `total` rows need).
+        let lens: Vec<usize> = picked.iter().map(|&k| rows[k]).collect();
         let topk = self.config.num_experts_per_tok;
-        let mut at = (total * topk * 8 + 255) & !255;
+        let mrope = self.config.mrope_interleaved;
+        let (starts, end) = super::multi_ep::multi_scratch_layout(&lens, topk, mrope);
+        ensure!(
+            end <= self.buffers.scratch_bytes(),
+            "prefill_multi: scratch arena full"
+        );
         let scratch = self.buffers.scratch();
         let mut metas: Vec<AttnMetadataDev> = Vec::with_capacity(picked.len());
         {
-            let mut kv = self.kv_cache.lock();
-            for &k in &picked {
+            let kv = self.kv_cache.lock();
+            for (i, &k) in picked.iter().enumerate() {
                 let (tokens, seq) = &mut seqs[k];
-                let len = rows[k];
-                self.reserve_prefill_blocks(seq, len, &mut kv, stream)?;
+                let (len, at) = (rows[k], starts[i]);
                 match self.prefill_b_proc_range(
                     tokens,
                     seq,
@@ -308,11 +219,6 @@ impl TransformerModel {
                     seq_slot: DevicePtr::NULL,
                     moe_row_adapter: DevicePtr::NULL,
                 });
-                at = (at + m.slot_offset + len * 8 + 255) & !255;
-                ensure!(
-                    at <= self.buffers.scratch_bytes(),
-                    "prefill_multi: scratch arena full"
-                );
             }
         }
         // The pass's token ids, host and device, back to back.
@@ -393,8 +299,16 @@ impl TransformerModel {
                     });
                     c += 1;
                 }
+                let mut pass = MultiPass {
+                    hidden,
+                    total,
+                    segs,
+                    kv_cache: &mut kv,
+                    ctx: &pass_ctx,
+                    stream,
+                };
                 layer
-                    .prefill_multi(hidden, total, &mut segs, &mut kv, &pass_ctx, stream)
+                    .prefill_multi(&mut pass)
                     .map_err(|e| anyhow::anyhow!("multi-sequence prefill layer {i}: {e}"))?;
                 det.tap("out", self.buffers.hc_streams(), (0, total), hc_row);
             }

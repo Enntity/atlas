@@ -234,6 +234,9 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         }
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        det.tap("x_qkvz", deinterleaved, (0, num_tokens), qkvz_size * bf16);
+        det.tap("x_conv", conv_out_buf, (0, num_tokens), conv_dim * bf16);
         // Bisect tap. The projection matches (cos 0.999998) and
         // `pre_out_proj` does not (cos 0.801), so the fault is conv / gates /
         // recurrence / gated-norm. The gates are COMPUTED above but not
@@ -377,6 +380,7 @@ impl Qwen3SsmLayer {
         } else {
             None
         };
+        det.tap("x_core", gdn_out_buf, (0, num_tokens), value_dim * bf16);
         // ── 9. Gated RMS norm (batched: all tokens × heads in one launch) ──
         let normed_out_buf = conv_out_buf;
         let z_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
