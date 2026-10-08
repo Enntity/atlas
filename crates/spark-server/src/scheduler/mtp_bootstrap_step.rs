@@ -104,7 +104,10 @@ pub(super) fn dflash_ctx_serializes(sched: &crate::scheduler::sched_ctx::SchedCt
     dflash_ctx_serializes_with(&sched.levers, dflash_ctx_scoped())
 }
 
-fn dflash_ctx_serializes_with(levers: &crate::scheduler::levers::SchedLevers, scoped: bool) -> bool {
+fn dflash_ctx_serializes_with(
+    levers: &crate::scheduler::levers::SchedLevers,
+    scoped: bool,
+) -> bool {
     !scoped && (levers.dflash_unified_ctx || levers.dflash_serial_append)
 }
 
