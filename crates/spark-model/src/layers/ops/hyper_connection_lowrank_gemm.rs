@@ -84,8 +84,9 @@ pub(crate) fn hc_fast() -> bool {
 /// instead of 8 (pure geometry: each block's RMS is the same 1024-thread
 /// reduction). scripts/dev/qwen4exp_hc_wide_bench.cu: byte-identical, site
 /// ~177 -> ~125 us at T = 32 (stage 20.5 -> 11.4, down ~105 -> ~64). The
-/// padded last group reads the scratch rows past the batch, which
-/// `hc_pre_split`'s 64-row scratch always holds.
+/// padded last group reads `normed` rows past the batch (below row 32): in
+/// bounds by `hc_pre_split`'s scratch LAYOUT, whose `normed` spans 64 rows
+/// before `low` (no host check of the buffer's size beyond that layout).
 pub(crate) fn hc_wide() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_HC_WIDE").as_deref() == Ok("1"))

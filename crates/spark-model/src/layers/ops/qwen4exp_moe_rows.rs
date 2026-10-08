@@ -114,6 +114,7 @@ impl Qwen4ExpMoeRows {
         // the routed SwiGLU clamp, as serial decode's (`moe::init`).
         let nc = crate::model::qwen4exp_batch_fast::no_clamp_requested(&config.model_type);
         let units = tc || crate::model::qwen4exp_batch_fast::units_requested();
+        let (tc, units) = Self::units_fit(config, tc, units);
         let off = KernelHandle(0);
         if tc {
             tracing::info!(
@@ -408,8 +409,8 @@ impl Qwen4ExpMoeRows {
 
     /// [`Self::gate_up`] + [`Self::silu_down`] for `rows` rows through the
     /// expert units of `qwen4exp_moe_c8.cu`: the plan into `ws`
-    /// ([`QWEN4EXP_MOE_UNITS_WS_BYTES`]), gate/up + SiLU into the FP32
-    /// activations `act` (`[rows * top_k + rows, inter]`), down into `output`
+    /// ([`QWEN4EXP_MOE_UNITS_WS_BYTES`]), gate/up + SiLU into the (FP32; TC
+    /// v3: BF16) activations `act` (`[rows * top_k + rows, inter]`), down into `output`
     /// (`[rows * top_k, h]`) and `sh_down_out` (`[rows, h]`) -- the bytes the
     /// rows pair writes there. The gate/up BF16 rows are not stored.
     #[allow(clippy::too_many_arguments)]
@@ -432,7 +433,9 @@ impl Qwen4ExpMoeRows {
             (1..=QWEN4EXP_MOE_UNITS_MAX_ROWS as u32).contains(&rows)
                 && rows * top_k <= QWEN4EXP_MOE_ROWS_MAX_SLOTS as u32
                 && inter == QWEN4EXP_MOE_ROWS_SD_INTER
-                && h == 2560,
+                && h == 2560
+                && output.0 != 0
+                && sh_down_out.0 != 0,
             "qwen4exp MoE units: rows {rows}, top_k {top_k}, inter {inter}, h {h}"
         );
         if self.units_fused.0 != 0 {

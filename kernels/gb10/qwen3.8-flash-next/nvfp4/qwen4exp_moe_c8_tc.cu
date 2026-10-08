@@ -136,8 +136,9 @@ __device__ __forceinline__ void tc_down_unit(C8_SD_ARGS, unsigned y) {
     const float s2 = u.shared() ? sh_down_s2 : scale2_vals[u.expert];
     __nv_bfloat16* out = u.shared() ? sh_down_out : C;
     if (B == 0) {
-        for (unsigned i = threadIdx.x; i < u.n * TILE; i += blockDim.x)
-            out[(size_t)c8_slot(ws, u, i / TILE) * C8_H + n0 + i % TILE] = __float2bfloat16(0.0f);
+        if (out)
+            for (unsigned i = threadIdx.x; i < u.n * TILE; i += blockDim.x)
+                out[(size_t)c8_slot(ws, u, i / TILE) * C8_H + n0 + i % TILE] = __float2bfloat16(0.0f);
         return;
     }
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3u;
@@ -185,7 +186,12 @@ __device__ __forceinline__ void tc_gate_up_unit(C8_GU_ARGS, unsigned y) {
         Sc = (const unsigned char*)(proj ? up_scale_ptrs : gate_scale_ptrs)[u.expert];
     }
     __nv_bfloat16* out = u.shared() ? (proj ? sh_up_out : sh_gate_out) : (proj ? up_out : gate_out);
-    if (B == 0) {
+    // CTA-uniform: every warp tests both projections, so no warp leaves
+    // while the others wait at the barriers below.
+    const unsigned char* B_peer = u.shared()
+        ? (proj ? sh_gate_packed : sh_up_packed)
+        : (const unsigned char*)(proj ? gate_packed_ptrs : up_packed_ptrs)[u.expert];
+    if (B == 0 || B_peer == 0) {
         if (out && kq == 0)
             for (unsigned i = lane; i < u.n * 8; i += 32)
                 out[(size_t)c8_slot(ws, u, i / 8) * C8_I + n0 + i % 8] = __float2bfloat16(0.0f);

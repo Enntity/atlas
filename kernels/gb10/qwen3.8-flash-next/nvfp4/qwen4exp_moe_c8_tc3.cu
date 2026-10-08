@@ -47,6 +47,8 @@
 #define TC3_UMAX 529u  // 512 experts + 1 shared + splits of > 64 entries
 #define TC3_G 80u      // G items a unit: 640 / 8
 #define TC3_D 40u      // D items a unit: 2560 / 64
+// The shared unit takes bucket `rows` among the local 1..TC3_RMAX.
+static_assert(C8_ROWS_MAX <= TC3_RMAX, "shared unit bucket");
 
 // v3 plan: v2's counting sort with units of up to TC3_RMAX entries, local
 // units (gate pointer non-null, and the shared unit) before remote ones.
@@ -57,7 +59,8 @@ extern "C" __global__ void __launch_bounds__(1024) qwen4exp_moe_c8_tc3_plan(
     constexpr unsigned NEXP = 512, NB = TC3_RMAX + 2;  // buckets: local 1..64 by n, 65 remote
     __shared__ unsigned s_cnt[NEXP], s_off[NEXP], s_bucket[NB], s_base[NB], s_wsum[16];
     const unsigned slots = rows * top_k;
-    if (slots > C8_SLOTS_MAX || rows > C8_ROWS_MAX || blockDim.x != 1024) __trap();
+    // rows >= 1: bucket 0, where no rows would put the shared unit, has no base.
+    if (rows == 0 || slots > C8_SLOTS_MAX || rows > C8_ROWS_MAX || blockDim.x != 1024) __trap();
     for (unsigned i = threadIdx.x; i < NEXP; i += blockDim.x) s_cnt[i] = 0;
     if (threadIdx.x < NB) s_bucket[threadIdx.x] = 0;
     __syncthreads();
@@ -201,6 +204,8 @@ __device__ __forceinline__ Tc3Item tc3_item(unsigned i, unsigned L, unsigned R) 
 
 template <bool CLAMP>
 __device__ __forceinline__ void tc3_body(TC3_ARGS) {
+    // 8 warps: 4 K quarters x {gate, up}; D's 64 columns as 8 n8 tiles.
+    if (blockDim.x != 256) __trap();
     __shared__ Tc3Smem sm;
     const unsigned slots = rows * top_k;
     const unsigned U = ws[0], L = ws[2], R = U - L;
@@ -247,8 +252,9 @@ __device__ __forceinline__ void tc3_body(TC3_ARGS) {
     // A remote expert's rows: zeros.
     const auto run_z = [&](const Tc3Item& it) {
         const unsigned n = sm.unit[it.u][2];
-        for (unsigned i = threadIdx.x; i < n * (C8_H / 8); i += blockDim.x)
-            *(uint4*)(C + (size_t)slot(it.u, i / (C8_H / 8)) * C8_H + 8 * (i % (C8_H / 8))) = make_uint4(0, 0, 0, 0);
+        if (C)
+            for (unsigned i = threadIdx.x; i < n * (C8_H / 8); i += blockDim.x)
+                *(uint4*)(C + (size_t)slot(it.u, i / (C8_H / 8)) * C8_H + 8 * (i % (C8_H / 8))) = make_uint4(0, 0, 0, 0);
     };
     // gate/up + SiLU of the unit's columns [8x, 8x + 8), m16 tile by tile;
     // then the unit's G count, released after every thread's act stores.
