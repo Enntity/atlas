@@ -24,7 +24,7 @@
 // Activations pass between G and D as BF16 (down rounds them to BF16 first
 // anyway: the same bytes as v2's FP32 + round).
 //
-// MEASURED (preliminary: ennspark03 GB10, shared with other tenants; one
+// MEASURED (preliminary: a GB10 shared with other tenants; one
 // EP2 rank's 256-expert pool, real C8 routing (REALBIN, a layer a wave),
 // us plan + gate/up + down a layer, min of 11 interleaved passes, v2 -> v3):
 // 1 row 72.6 -> 69.2, 16 rows 465.3 -> 410.5, 32 rows 730.9 -> 628.1

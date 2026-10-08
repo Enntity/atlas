@@ -34,7 +34,7 @@
 // against an FP64 reference beside the FP32 kernels' error, and times both.
 // Error vs FP64 at T = 32: low 5.0e-6 (FP32 kernels 4.8e-7), y off the
 // correctly rounded bf16 in 0.054% of outputs (FP32 0.009%), worst 0.90 ulp
-// (FP32 1.84). us per launch, weights cold, GB10 (ennspark03):
+// (FP32 1.84). us per launch, weights cold, a GB10:
 //
 //     T                 1     4     8    16    24    32
 //     down   FP32    31.8  34.3  42.5  49.5  64.1  64.2

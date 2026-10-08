@@ -8,7 +8,7 @@
 //! (`nvme_core.apst_primary_timeout_ms=100`, the default) moves an idle
 //! controller into a non-operational state after 100 ms, and a C8 verify step
 //! is ~120-150 ms, so every step's first read paid the exit latency. Measured
-//! on the pair's drive (SAMSUNG MZALC4T0HBL1, ennspark03, O_DIRECT 4 KiB
+//! on the pair's drive (SAMSUNG MZALC4T0HBL1, O_DIRECT 4 KiB
 //! random reads after an idle gap; first read of a burst, p50):
 //!
 //! ```text
