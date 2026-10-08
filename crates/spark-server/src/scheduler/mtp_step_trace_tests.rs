@@ -3,9 +3,11 @@
 use super::*;
 
 fn rec_with(seqs: &[(usize, u8, usize)]) -> Rec {
-    let mut r = Rec::default();
-    r.stepped = true;
-    r.nd = 3;
+    let mut r = Rec {
+        stepped: true,
+        nd: 3,
+        ..Rec::default()
+    };
     for &(slot, path, drafts) in seqs {
         r.seq(slot, path, drafts);
     }
@@ -65,8 +67,10 @@ fn first_path_record_wins() {
 
 #[test]
 fn kind_override_and_rode_rows() {
-    let mut rec = Rec::default();
-    rec.kind = Some("mixed");
+    let mut rec = Rec {
+        kind: Some("mixed"),
+        ..Rec::default()
+    };
     rec.seq(4, b'r', 0);
     let line = format_line(0, 0, &rec, &[(4, 9, 3), (6, 9, 3)], &[(4, 12), (6, 10)]).unwrap();
     assert!(line.contains("kind=mixed"), "{line}");
