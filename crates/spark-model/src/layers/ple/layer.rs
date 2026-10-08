@@ -165,7 +165,7 @@ impl PleLayer {
             embed_fp8_k: gpu.kernel("embed_from_argmax", "batched_embed_fp8")?,
             table: std::sync::Arc::new(std::sync::Mutex::new(table)),
             embed_k: gpu.kernel("embed_from_argmax", "batched_embed")?,
-            gemm_k: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
+            gemm_k: projection_gemm(gpu)?,
             gate_k: gpu.kernel("ple", "ple_gate")?,
             conv_k: gpu.kernel("ple", "ple_conv")?,
             add_k: gpu.kernel("ple", "ple_add_highway")?,
@@ -400,3 +400,25 @@ mod gather_guard;
 pub(crate) mod ngram_trellis;
 #[cfg(feature = "cuda")]
 use gather_guard::gather_matches_element_size;
+
+/// `ATLAS_QWEN4EXP_PREFILL_GEMM_RASTER=1`: the key/value projections run
+/// `dense_gemm_bf16_pipelined_g8`, the default GEMM with its output tiles
+/// visited in groups of 8 M-tiles. The key projection's weight ([4 x hidden,
+/// hidden], 52 MB) is wider than L2, and the default order re-streams it from
+/// DRAM once per M-tile: 20.6 -> 7.6 ms at an 8192-row PLE pass on GB10
+/// (`scripts/dev/qwen4exp_ple_gemm_bench.cu`). Every tile is the default's
+/// tile body, so every output byte is the default's; rank-local.
+fn projection_gemm(gpu: &dyn GpuBackend) -> Result<KernelHandle> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON
+        .get_or_init(|| std::env::var("ATLAS_QWEN4EXP_PREFILL_GEMM_RASTER").as_deref() == Ok("1"));
+    let g8 = if on {
+        crate::layers::try_kernel(gpu, "gemm", "dense_gemm_bf16_pipelined_g8")
+    } else {
+        KernelHandle(0)
+    };
+    if g8.0 != 0 {
+        return Ok(g8);
+    }
+    gpu.kernel("gemm", "dense_gemm_bf16_pipelined")
+}
