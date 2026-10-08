@@ -189,8 +189,11 @@ impl TransformerModel {
                         proc_start,
                         proc_count,
                         effective_seq_len_start,
-                    } if (proc_start, proc_count, effective_seq_len_start) == (from, count, from) => {}
-                    _ => anyhow::bail!("prefill_multi: a sequence that does not compute from {from}"),
+                    } if (proc_start, proc_count, effective_seq_len_start)
+                        == (from, count, from) => {}
+                    _ => {
+                        anyhow::bail!("prefill_multi: a sequence that does not compute from {from}")
+                    }
                 }
                 self.ple_prefill_warm(tokens, from, seq)?;
                 let region = self.buffers.scratch_bytes().saturating_sub(at);
