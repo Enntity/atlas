@@ -175,6 +175,11 @@ impl PleLayer {
             }
             st.verify_snap_rows = 0;
         }
+        let det = crate::det_trace::on_stream(gpu, stream);
+        let rows = (base.unwrap_or(0), n);
+        det.tap("x_ple_key", self.key.offset(srow * c * 2), rows, c * 2);
+        det.tap("x_ple_gate", gated_normed, rows, c * 4);
+        det.tap("x_ple_out", out, rows, c * 4);
         ops::ple_add_highway(gpu, self.add_k, out, hspan, (n * c) as u32, stream)
     }
 
