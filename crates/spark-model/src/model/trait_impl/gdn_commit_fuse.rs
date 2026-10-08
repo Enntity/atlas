@@ -236,8 +236,14 @@ impl TransformerModel {
         if map.is_empty() {
             return Ok(());
         }
-        for (_, p) in map.drain() {
-            self.gdn_fuse_land(&p)?;
+        // Each entry leaves the map only once landed: a failed land keeps it
+        // and every later one pending (a drain would drop them).
+        let slots: Vec<usize> = map.keys().copied().collect();
+        for slot in slots {
+            if let Some(p) = map.get(&slot) {
+                self.gdn_fuse_land(p)?;
+            }
+            map.remove(&slot);
         }
         self.gpu.synchronize(self.gpu.default_stream())
     }

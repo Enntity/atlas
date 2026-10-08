@@ -72,6 +72,11 @@ pub(crate) fn launch(gpu: &dyn GpuBackend, entries: &[CommitEntry], stream: u64)
     if entries.is_empty() {
         return Ok(());
     }
+    // The upload is a host copy into the table: a capture would replay it.
+    anyhow::ensure!(
+        !gpu.stream_is_capturing(stream),
+        "QSA commit table: launched inside a graph capture"
+    );
     let bytes = table_bytes(entries);
     let mut t = TABLE.lock();
     if t.1 < bytes.len() {
@@ -79,6 +84,9 @@ pub(crate) fn launch(gpu: &dyn GpuBackend, entries: &[CommitEntry], stream: u64)
         gpu.synchronize(stream)?;
         if t.0.0 != 0 {
             gpu.free(t.0)?;
+            // Forget it before the alloc can fail: never upload into freed memory.
+            t.0 = DevicePtr(0);
+            t.1 = 0;
         }
         let cap = bytes.len().next_multiple_of(64 * ENTRY_BYTES);
         t.0 = gpu.alloc(cap)?;

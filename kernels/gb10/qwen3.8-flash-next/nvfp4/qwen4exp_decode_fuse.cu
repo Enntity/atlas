@@ -658,6 +658,7 @@ qwen4exp_gdn_verify_defer_rows(
     __shared__ float smem_k[QDF_D];
     __shared__ float smem_q[QDF_D];
     const unsigned int n_prev = sq.fuse_n ? *sq.fuse_n : 0u;
+    if (n_prev > QDF_VERIFY_KMAX) __trap();  // the host commits at most k <= KMAX
     if (n_prev) {
         // `qwen4exp_gdn_commit_layers`, verbatim, on the previous step's staging.
         for (unsigned int t = 0; t < n_prev; t++) {
