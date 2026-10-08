@@ -671,7 +671,7 @@ impl TransformerModel {
         // head the worker shares, announced with its plan.
         let tp = match split {
             Some(_) => None,
-            None => self.announce_draft_tp(proposer, tokens.len(), num_drafts, grammar)?,
+            None => self.announce_draft_tp(proposer, tokens.len(), num_drafts, grammar, &ctx)?,
         };
         let ctx = ForwardContext {
             comm: split.map(|(comm, _)| comm).or(tp),

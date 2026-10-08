@@ -394,9 +394,8 @@ impl DraftProposer for Qwen4ExpMtpHead {
         Ok(drafts)
     }
 
-    /// One drafter forward per draft position for all sequences, chained on
-    /// the device (`qwen4exp_mtp_batch.rs`). `Ok(None)` (per-sequence
-    /// fallback) outside its envelope: see [`Self::batch_admits`].
+    /// One drafter forward a draft position for all sequences, chained on the
+    /// device (`qwen4exp_mtp_batch.rs`); `Ok(None)` outside [`Self::batch_admits`].
     fn propose_batch(
         &self,
         last_tokens: &[u32],
@@ -449,8 +448,9 @@ impl DraftProposer for Qwen4ExpMtpHead {
         n: usize,
         num_drafts: usize,
         grammar: bool,
+        ctx: &ForwardContext,
     ) -> Option<u32> {
-        self.tp_announce_word(comm, n, num_drafts, grammar)
+        self.tp_announce_word(comm, n, num_drafts, grammar, ctx)
     }
 
     fn propose_batch_max(

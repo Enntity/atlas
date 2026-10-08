@@ -253,16 +253,24 @@ impl Qwen4ExpMtpHead {
     }
 
     /// The announce word of a batched propose of `n` rows and `drafts`
-    /// positions over `comm`, when it splits.
+    /// positions over `comm`, when it splits: only one `propose_batch` will
+    /// run batched (`batch_admits`), or the pair walks every exchange for
+    /// nothing.
     pub(super) fn tp_announce_word(
         &self,
         comm: &dyn CommBackend,
         n: usize,
         drafts: usize,
         grammar: bool,
+        ctx: &crate::layer::ForwardContext,
     ) -> Option<u32> {
         let pair = comm.rank() == 0 && comm.world_size() == 2;
-        (self.tp.is_some() && pair && !grammar && n >= 2 && comm.supports_peer_exchange_async())
+        (self.tp.is_some()
+            && pair
+            && !grammar
+            && n >= 2
+            && comm.supports_peer_exchange_async()
+            && self.batch_admits(n, drafts, ctx))
             .then(|| Plan { n, drafts }.word().ok())
             .flatten()
     }
