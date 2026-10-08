@@ -34,6 +34,12 @@ mod sequence_graphs;
 
 impl TransformerModel {
     pub(super) fn cache_sequence_dispatch(&self, seq: &SequenceState) {
+        // ATLAS_QWEN4EXP_PREFILL_ROWINV: the radix keeps what prefill wrote
+        // (inserted at the prompt's end); generated rows hold decode K/V, not
+        // what a prefill of those tokens computes.
+        if crate::layers::ops::qwen4exp_rowinv::on() {
+            return;
+        }
         self.finish_leaf_mirror_cache(seq);
         let bs = self.kv_cache.lock().block_size();
         // Only cache if the sequence has block-aligned content worth caching.

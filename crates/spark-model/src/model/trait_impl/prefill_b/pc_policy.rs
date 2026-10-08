@@ -294,6 +294,10 @@ impl TransformerModel {
                     .ssm_snapshots
                     .session_matches(snap_id, seq.session_hash))
             && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV: only a restore on the GDN grid
+            // replays what the cold pass computes.
+            && (!crate::layers::ops::qwen4exp_rowinv::on()
+                || snap_tok.is_multiple_of(crate::layers::ops::qwen4exp_rowinv::PASS_GRANULE))
     }
 
     /// Agree on one restore `(snapshot, depth, is_tail)` across ranks (see
