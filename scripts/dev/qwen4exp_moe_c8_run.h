@@ -94,13 +94,19 @@ static void run_time(Pool& pool, const std::string& only) {
                              {"C8 u50", 32, 50}, {"C8 u70", 32, 70}, {"C8 u90", 32, 90},
                              {"C8 indep", 32, 0}};
     if (trace) cfgs = {{"trace", (unsigned)atoi(getenv("ROUTE_ROWS") ? getenv("ROUTE_ROWS") : "32"), 0}};
+    const char* realbin = getenv("REALBIN");
+    if (realbin)
+        cfgs = {{"real 1", 1, 0}, {"real 4", 4, 0}, {"real 16", 16, 0}, {"real 24", 24, 0}, {"real 32", 32, 0},
+                {"real 36", 36, 0}};
     printf("\n%-10s %-24s %8s %16s %16s %8s\n", "routing", "variant", "plan", "gate_up (GB/s)",
            "silu_down (GB/s)", "layer");
     const char* only_cfg = getenv("CFG");
     for (const Cfg& c : cfgs) {
         if (only_cfg && std::string(c.name) != only_cfg) continue;
         std::vector<std::vector<unsigned>> routes;
-        if (trace) {
+        if (realbin) {
+            routes = bin_waves(realbin, c.rows);
+        } else if (trace) {
             routes = trace_routes(trace, c.rows);
             if (routes.empty()) { printf("no %u-row launches in %s\n", c.rows, trace); return; }
         } else {
@@ -198,4 +204,47 @@ static int run_tc_check(Pool& pool) {
     }
     printf("%s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
+}
+
+// tc-ident: every TC variant's routed-down and shared-down bytes against
+// "tc v1" (the kernels before the L2 look-ahead) at every row count 1..64,
+// 4 overlap regimes, 3 activation scales.
+static int run_tc_ident(Pool& pool) {
+    std::vector<Variant> vs;
+    for (auto& v : variants()) if (v.name.rfind("tc", 0) == 0) vs.push_back(v);
+    const Variant* ref = nullptr;
+    for (auto& v : vs) if (v.name.rfind("tc v1", 0) == 0) ref = &v;
+    if (!ref) { printf("no tc v1\n"); return 1; }
+    Bufs rb = alloc_bufs(), gb = alloc_bufs();
+    std::mt19937 rng(23);
+    std::vector<int> bad(vs.size(), 0);
+    int cases = 0;
+    for (unsigned rows = 1; rows <= MAXR; rows++)
+        for (double reuse : {0.0, 0.5, 0.9, 1.0})
+            for (float scale : {0.02f, 1.0f, 30.0f}) {
+                auto a = rand_bf16((size_t)rows * H, scale);
+                auto ids = c8_routes(rows, reuse, rng);
+                if (reuse == 1.0)
+                    for (unsigned r = 1; r < rows; r++) std::copy(ids.begin(), ids.begin() + TOPK, ids.begin() + r * TOPK);
+                for (Bufs* b : {&rb, &gb}) {
+                    CK(cudaMemcpy(b->A, a.data(), a.size() * 2, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(b->ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
+                }
+                ref->plan(pool, rb, rows); ref->gate_up(pool, rb, rows); ref->silu_down(pool, rb, rows);
+                auto rd = dget(rb.down, (size_t)rows * TOPK * H * 2), rs = dget(rb.shd, (size_t)rows * H * 2);
+                cases++;
+                for (size_t i = 0; i < vs.size(); i++) {
+                    CK(cudaMemset(gb.down, 0x55, (size_t)MAXR * TOPK * H * 2));
+                    CK(cudaMemset(gb.shd, 0x55, (size_t)MAXR * H * 2));
+                    vs[i].plan(pool, gb, rows); vs[i].gate_up(pool, gb, rows); vs[i].silu_down(pool, gb, rows);
+                    bad[i] += dget(gb.down, rd.size()) != rd || dget(gb.shd, rs.size()) != rs;
+                }
+            }
+    for (size_t i = 0; i < vs.size(); i++)
+        printf("  %s  %-28s %d of %d launches differ from tc v1 (rows 1..64, 4 routings, 3 scales%s)\n",
+               bad[i] ? "BAD" : "ok ", vs[i].name.c_str(), bad[i], cases, nc() ? ", no clamp" : "");
+    int b = 0;
+    for (int x : bad) b += x;
+    printf("%s\n", b ? "FAIL" : "PASS");
+    return b != 0;
 }

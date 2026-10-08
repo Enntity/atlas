@@ -85,20 +85,23 @@ static const struct { const char* tag; unsigned rmax, tile, warps, rc; } ROWS_SH
 // launches it: plan, unit gate/up + SiLU (8 outputs a CTA), unit down (64).
 // `fused`: gate/up BF16 rows not stored, as serving runs it; else stored for
 // the check.
-static Variant c8_units(bool fused, bool tc = false) {
+static Variant c8_units(bool fused, bool tc = false, bool v1 = false) {
     // tc: qwen4exp_moe_c8_tc.cu (ATLAS_QWEN4EXP_MOE_TC, contract (b): not the
     // rows pair's bytes; checked for row invariance by tc-units-check).
     const char* M = tc ? "qwen4exp_moe_c8_tc" : "qwen4exp_moe_c8";
+    const std::string sfx = v1 ? "_v1" : "";
     const std::string p = tc ? "qwen4exp_moe_c8_tc_" : "qwen4exp_moe_c8_";
-    CUfunction pl = load(M, (p + "plan").c_str()), gu = load(M, (p + (nc() ? "gate_up_nc" : "gate_up")).c_str()),
-               sd = load(M, (p + "down").c_str());
+    CUfunction pl = load(M, (p + "plan" + (tc ? sfx : "")).c_str()), gu = load(M, (p + (nc() ? "gate_up_nc" : "gate_up") + sfx).c_str()),
+               sd = load(M, (p + "down" + sfx).c_str());
     Variant v;
-    v.name = std::string(tc ? "tc " : "") + (fused ? "units fused" : "units");
+    v.name = std::string(tc ? (v1 ? "tc v1 " : "tc ") : "") + (fused ? "units fused" : "units");
     v.plan = [=](Pool&, Bufs& b, unsigned rows) {
         unsigned topk = TOPK, R = rows;
         launch(pl, dim3(1), dim3(1024), {&b.ids, &b.ws, &topk, &R});
     };
-    const auto units = [](unsigned rows) { return rows * TOPK + (rows + 15) / 16; };
+    // TC v2 strides the units: gridDim.y = min(bound, TC_Y) (default 64).
+    const unsigned ycap = tc && !v1 ? (getenv("TC_Y") ? atoi(getenv("TC_Y")) : 64) : 1u << 30;
+    const auto units = [=](unsigned rows) { return std::min(ycap, rows * TOPK + (rows + 15) / 16); };
     v.gate_up = [=](Pool& p, Bufs& b, unsigned rows) {
         unsigned topk = TOPK, R = rows;
         void* null = nullptr;
@@ -123,6 +126,7 @@ std::vector<Variant> variants() {
         for (auto& s : ROWS_SHAPES) v.push_back(rows_shape(s.tag, s.rmax, s.tile, s.warps, s.rc));
     v.push_back(c8_units(false));
     v.push_back(c8_units(true));
+    v.push_back(c8_units(true, true, true));
     v.push_back(c8_units(true, true));
     return v;
 }
