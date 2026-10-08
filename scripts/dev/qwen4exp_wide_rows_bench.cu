@@ -31,7 +31,7 @@
 //
 // Build/run (repo root, GB10): scripts/dev/qwen4exp_wide_rows_bench.sh check|time|sweep
 //
-// Measured 2026-10-06 on GB10 (ennspark03): PASS at every M above. us per
+// Measured 2026-10-06 on a GB10: PASS at every M above. us per
 // call [GB/s of weight bytes], old chunks -> one wide launch (the 32-row
 // tiers are the pair tiers; one-output-a-thread rows32 in brackets):
 //                         M=8          16           24                32
