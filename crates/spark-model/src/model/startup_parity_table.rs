@@ -367,6 +367,11 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_MOE_W2", || {
         Ok((moe::q38_requested() && moe::w2_requested()) as u64)
     }),
+    // Same bytes either way, but not the same memory: a rank without it
+    // keeps the routed K-major copy, and the two KV pools part.
+    ("ATLAS_QWEN4EXP_PREFILL_MOE_NODUP", || {
+        Ok((moe::q38_requested() && moe::nodup_requested()) as u64)
+    }),
     // The routed arm and the shared-reduce overlap (off while profiling)
     // decide whether `_SP_RS_PIPE` pipes the MoE reduce-scatter.
     ("ATLAS_MOE_PREFILL_FP8_DOWN", || {

@@ -167,6 +167,8 @@ mod forward_prefill_fp8;
 mod forward_prefill_phase;
 mod forward_prefill_q38;
 pub(crate) use forward_prefill_q38::{q38_requested, sp_shared_requested, w2_requested};
+mod forward_prefill_q38_nodup;
+pub(crate) use forward_prefill_q38_nodup::{nodup_requested, skips_routed_transpose};
 mod forward_prefill_q38_rs;
 mod forward_prefill_route;
 pub(crate) mod forward_prefill_route_sp;
