@@ -169,7 +169,13 @@ fn a_copy_replaces_only_a_block_that_differs() {
 /// A request over prompt `prompt` that has emitted `reply` (its last token
 /// pending) with DFlash2's `drafts` pending.
 fn seq(prompt: &[u32], reply: &[u32], drafts: &[u32]) -> ActiveSeq {
-    let (mut a, _rx) = crate::scheduler::test_support::test_seq(reply.to_vec(), 8, None, 0);
+    seq_with_caller(prompt, reply, drafts).0
+}
+
+/// [`seq`] with its caller's receiver, which must stay open for the request
+/// to emit (a request whose caller hung up is retired at its next emit).
+fn seq_with_caller(prompt: &[u32], reply: &[u32], drafts: &[u32]) -> (ActiveSeq, impl Sized) {
+    let (mut a, rx) = crate::scheduler::test_support::test_seq(reply.to_vec(), 8, None, 0);
     a.seq.tokens = prompt
         .iter()
         .chain(&reply[..reply.len() - 1])
@@ -177,7 +183,7 @@ fn seq(prompt: &[u32], reply: &[u32], drafts: &[u32]) -> ActiveSeq {
         .collect();
     a.pending_drafts = drafts.to_vec();
     a.pending_draft_conf = vec![-0.5; drafts.len()];
-    a
+    (a, rx)
 }
 
 #[test]
@@ -321,7 +327,7 @@ fn a_copy_round_settles_through_the_verify_tail() {
         ..on()
     };
     let prompt = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
-    let mut a = seq(&prompt, &[12, 13, 14], &[40, 41, 42, 43]);
+    let (mut a, _caller) = seq_with_caller(&prompt, &[12, 13, 14], &[40, 41, 42, 43]);
     a.pending_draft_conf.clear();
     (a.finished, a.min_tokens) = (false, 0);
     offer_with(&mut a, &s);
@@ -351,6 +357,7 @@ fn a_copy_round_settles_through_the_verify_tail() {
         vec![15, 16, 7, 9, 9],
         false,
         0.0,
+        true,
         true,
     );
     assert_eq!(next, Some(4));
