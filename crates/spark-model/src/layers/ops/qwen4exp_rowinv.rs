@@ -79,6 +79,11 @@ pub fn bf16_proj() -> bool {
     })
 }
 
+/// Longest prompt a multi-sequence prefill pass (`ATLAS_QWEN4EXP_PREFILL_MULTI`)
+/// takes: under the QSA inert bound (`budget + ratio - 1` = 2051), so its
+/// attention is dense and no selection runs.
+pub const MULTI_MAX_PROMPT: usize = 2048;
+
 /// The GDN chunk every pass start must sit on (see the module docs).
 pub const PASS_GRANULE: usize = 64;
 

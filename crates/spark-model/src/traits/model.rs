@@ -223,6 +223,24 @@ pub trait Model: Send + Sync {
         })
     }
 
+    /// Whether [`Model::prefill_multi`] is served (`ATLAS_QWEN4EXP_PREFILL_MULTI`).
+    fn supports_prefill_multi(&self) -> bool {
+        false
+    }
+
+    /// Prefill every slice's WHOLE prompt (`chunk_start == 0`, last chunk) in
+    /// one forward over all their rows, each prompt's logits those of its
+    /// single prefill (`ATLAS_QWEN4EXP_PREFILL_MULTI`). On a multi-rank model
+    /// the head sends the other ranks the prompts itself: the caller sends
+    /// no per-request prefill command for them. Returns each slice's logits.
+    fn prefill_multi(
+        &self,
+        _streams: &mut [PrefillSlice<'_>],
+        _stream: u64,
+    ) -> Result<Vec<DevicePtr>> {
+        anyhow::bail!("this model has no multi-sequence prefill")
+    }
+
     /// Process N concurrent prefill chunks in one forward pass (same weight
     /// load amortised across N streams). The default implementation falls
     /// back to a per-stream loop calling `prefill_chunk` — implementors that

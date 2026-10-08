@@ -11,8 +11,14 @@
 //! - 0xFFFFFFE1: distributed GLM MTP propose → token, position, drafts, hidden row
 //! - 0xFFFFFFEB: prefill chunk carrying DFlash verify owners (`glm_fused_chunk`)
 //! - 0xFFFFFFEC: serve this rank's half of a split DFlash propose (`draft_assist`)
+//! - 0xFFFFFFE7: multi-sequence prefill (`prefill_b::multi`)
 
 use anyhow::Result;
+
+/// Head -> worker: a multi-sequence prefill (`ATLAS_QWEN4EXP_PREFILL_MULTI`,
+/// `prefill_b::multi`): n, slots[n], lengths[n], then every prompt's tokens
+/// back to back.
+pub(in crate::model) const EP_CMD_PREFILL_MULTI: u32 = 0xFFFF_FFE7;
 
 use super::types::TransformerModel;
 use crate::traits::{Model, SequenceState};

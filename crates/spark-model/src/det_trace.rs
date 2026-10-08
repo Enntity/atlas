@@ -267,6 +267,14 @@ pub fn set_layer(layer: usize) {
     }
 }
 
+/// The following taps' rows start at sequence position `chunk_start` (a
+/// multi-sequence pass's per-sequence blocks).
+pub fn set_chunk_start(chunk_start: usize) {
+    if on() {
+        CURRENT.with(|c| c.set(c.get().map(|at| At { chunk_start, ..at })));
+    }
+}
+
 fn current(stage: &str) -> Option<At> {
     if !on() || !stage_selected(stage) {
         return None;

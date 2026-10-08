@@ -448,6 +448,7 @@ mod trait_prefill;
 mod trait_prefill_block;
 mod trait_prefill_gdn;
 mod trait_prefill_hc;
+mod trait_prefill_multi;
 mod trait_prefill_helper;
 mod trait_prefill_phase1;
 mod trait_prefill_phase3;
