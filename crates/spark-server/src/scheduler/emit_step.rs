@@ -71,6 +71,17 @@ pub(super) fn emit_token_at_position(
     if retire_if_cancelled(a) {
         return;
     }
+    // A content-loop steer of this pick is counted against the state it was
+    // picked in (`loop_steer`), before the commit changes any of it.
+    if crate::scheduler::loop_steer::note_commit(a) {
+        tracing::warn!(
+            tok,
+            output_len = a.output_tokens.len(),
+            steers = a.loop_steers,
+            max = a.loop_steer_max,
+            "Content-loop steer: the pick skipped the loop's continuation token"
+        );
+    }
 
     let env = CommitEnv::of(sched);
     // The verify pipeline's effects at the position this token was picked
@@ -239,6 +250,8 @@ pub(super) fn emit_token_at_position(
             && watchdog_floor_reached(a.output_tokens.len(), a.min_tokens)
             && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
             && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
+            // The next pick steers this tail off its loop (`loop_steer`).
+            && !crate::scheduler::loop_steer::will_steer(a)
             && (detect_content_token_loop_with(&a.output_tokens, loop_params)
                 || sched.masks.numeric.as_deref().is_some_and(|m| {
                     detect_content_token_loop_normalized_with(

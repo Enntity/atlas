@@ -67,6 +67,11 @@ pub(super) fn fast(
     if k == 0 {
         return Ok(Some(Vec::new()));
     }
+    // A content-loop steer (`loop_steer`) is the host pipeline's to apply,
+    // row by row: a span one could touch takes it.
+    if crate::scheduler::loop_steer::span_may_steer(a, argmax_ids) {
+        return Ok(None);
+    }
     // The min_tokens end-token ban (`min_tokens_ban`): the arms below read
     // each row's masked argmax. A span straddling the floor with a banned raw
     // argmax goes to the host pipeline, which counts the floor row by row.

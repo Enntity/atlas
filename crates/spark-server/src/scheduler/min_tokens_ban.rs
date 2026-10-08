@@ -75,9 +75,10 @@ pub(in crate::scheduler) fn first_token_suppress(
 
 /// Replace every raw GPU argmax in `picks` (the span's rows, `vocab` apart
 /// from `rows`) that is a banned id by its row's argmax with the ids
-/// excluded. `Ok(false)` leaves `picks` alone: the span straddles the floor
-/// and holds a banned id, and only the host pipeline counts the floor row by
-/// row (an in-span discard shifts it), so the caller must take that path.
+/// excluded. `Ok(false)` leaves `picks` alone and the caller must take the
+/// host pipeline: the span straddles the floor and holds a banned id (only
+/// the host pipeline counts the floor row by row; an in-span discard shifts
+/// it), or a content-loop steer could touch it (`loop_steer`).
 pub(in crate::scheduler) fn fix_raw_picks(
     model: &dyn Model,
     a: &ActiveSeq,
@@ -85,6 +86,11 @@ pub(in crate::scheduler) fn fix_raw_picks(
     rows: DevicePtr,
     fp32: bool,
 ) -> anyhow::Result<bool> {
+    // A content-loop steer (`loop_steer`) is applied by the host pipeline,
+    // row by row.
+    if crate::scheduler::loop_steer::span_may_steer(a, picks) {
+        return Ok(false);
+    }
     let Some(ids) = banned_ids(a) else {
         return Ok(true);
     };

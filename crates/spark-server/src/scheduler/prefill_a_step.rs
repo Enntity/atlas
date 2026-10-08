@@ -271,6 +271,8 @@ pub fn start_chunked_prefill(
             content_tokens: 0,
             prose_tokens_since_last_tool: 0,
             think_watchdog_fires: 0,
+            loop_steers: 0,
+            loop_steer_max: crate::scheduler::loop_steer::budget_for_new_seq(),
             rollback_count: 0,
             ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
             tool_call_end_token,

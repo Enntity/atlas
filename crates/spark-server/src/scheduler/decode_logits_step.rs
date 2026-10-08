@@ -364,6 +364,8 @@ pub fn process_decode_logits(
         if retire_if_cancelled(a) {
             continue;
         }
+        // A content-loop steer of this pick, counted as `emit_token` counts it.
+        let steered = crate::scheduler::loop_steer::note_commit(a);
         a.last_token = tok;
         a.last_token_time = now;
 
@@ -405,7 +407,7 @@ pub fn process_decode_logits(
             // `decode_logits_content.rs` to keep this file ≤500 LoC.
             // `model` is threaded through so a watchdog rollback can
             // restore SSM recurrent state on hybrid models (Phase-C).
-            if handle_content_token(a, model, sched) {
+            if handle_content_token(a, model, sched, steered) {
                 // A watchdog rolled back: `tok` came from the discarded
                 // context and `last_token` is the boundary token. Drop `tok`
                 // (no push / emit / EOS bookkeeping for it).
