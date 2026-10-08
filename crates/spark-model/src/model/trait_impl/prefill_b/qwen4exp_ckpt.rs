@@ -177,7 +177,10 @@ impl TransformerModel {
         };
         // A finish leaf's copy into this slot may still be in flight on
         // another stream (no-op without a finish-leaf flag).
-        self.finish_leaf_wait_copies(stream)?;
+        let staged = self
+            .finish_leaf_wait_copies(stream)
+            .and_then(|()| self.ple_stage(stream));
+        let ple_dst = staged.inspect_err(|_| self.ssm_snapshots.free(slot))?;
         let n = self.ssm_snapshots.num_ssm_layers();
         let h_dsts = (0..n)
             .map(|l| self.ssm_snapshots.tail_h_dst(l, slot))
@@ -185,7 +188,6 @@ impl TransformerModel {
         let conv_dsts = (0..n)
             .map(|l| self.ssm_snapshots.tail_conv_dst(l, slot))
             .collect();
-        let ple_dst = self.ple_stage(stream)?;
         ckpt::begin(cp - proc_start, ple_dst);
         Ok(Some(MidCapturePlan {
             cap_local: cp - proc_start,
@@ -223,8 +225,22 @@ impl TransformerModel {
     }
 
     /// After the pass: attach the aux at `cp` and index the checkpoint, or
-    /// free the slot when anything was not captured.
+    /// free the slot when anything was not captured or a step fails.
     fn finalize_qwen4exp_ckpt(
+        &self,
+        tokens: &[u32],
+        seq: &SequenceState,
+        kv_cache: &mut PagedKvCache,
+        plan: &MidCapturePlan,
+        stream: u64,
+    ) -> Result<()> {
+        self.register_qwen4exp_ckpt(tokens, seq, kv_cache, plan, stream)
+            .inspect_err(|_| self.ssm_snapshots.free(plan.snap_slot))
+    }
+
+    /// [`Self::finalize_qwen4exp_ckpt`]'s work; an `Err` leaves the slot
+    /// unregistered (nothing after the registration fails).
+    fn register_qwen4exp_ckpt(
         &self,
         tokens: &[u32],
         seq: &SequenceState,
