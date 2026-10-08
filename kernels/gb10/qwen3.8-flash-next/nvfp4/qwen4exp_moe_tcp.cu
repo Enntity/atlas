@@ -79,8 +79,6 @@ __device__ __forceinline__ void tcp_sb(float (&acc)[TCP_MT][TCP_NT][4], const un
     }
 }
 
-// ── gate/up + SiLU: warp w = projection w & 1, rows 64 (w >> 1) of the
-// 128-row block, outputs n0 .. n0 + 31 ──
 // ── gate/up + SiLU: warp w = projection w & 1, rows WR (w >> 1) of the
 // 2 WR-row block, outputs n0 .. n0 + 31 ──
 template <bool CLAMP>
@@ -94,7 +92,8 @@ __device__ __forceinline__ void tcp_gate_up(
     constexpr unsigned K = C8_H, ROW = K / 2, K16 = K / 16, SB = K / 128, QSB = SB / 4;
     constexpr unsigned TCP_MT = TCP_GU_MT, TCP_NT = TCP_GU_NT, NO = 8 * TCP_NT, WR = 16 * TCP_MT, BR = 2 * WR;  // rows a warp, a block
     const unsigned e = blockIdx.z;
-    if (e >= num_experts || blockDim.x != 128) return;
+    if (blockDim.x != 128) __trap();
+    if (e >= num_experts) return;
     const int m_start = expert_offsets[e], m_rows = expert_offsets[e + 1] - m_start;
     const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, proj = warp & 1u, mh = warp >> 1;
     const unsigned g = lane >> 2, t = lane & 3u, n0 = blockIdx.x * NO;
@@ -183,7 +182,8 @@ extern "C" __global__ void __launch_bounds__(128, 2) qwen4exp_moe_tcp_down(
 ) {
     constexpr unsigned K = C8_I, ROW = K / 2, K16 = K / 16, SB = K / 128, TCP_MT = TCP_DN_MT, TCP_NT = TCP_DN_NT, WR = 16 * TCP_MT, BR = 2 * WR;
     const unsigned e = blockIdx.z;
-    if (e >= num_experts || blockDim.x != 128) return;
+    if (blockDim.x != 128) __trap();
+    if (e >= num_experts) return;
     const int m_start = expert_offsets[e], m_rows = expert_offsets[e + 1] - m_start;
     const unsigned char* B = (const unsigned char*)packed_ptrs[e];
     if (m_rows <= 0 || B == nullptr) return;

@@ -46,6 +46,9 @@
 
 #define QSA_PA_WARPS 8
 #define QSA_PA_G 4
+// The host sizes the ring's dynamic shared memory from its own copy of
+// QSA_GP_DEPTH (`layers/ops/qwen4exp_prefill.rs`): change both, never this
+// one alone through -D (the launch would be under-sized).
 #ifndef QSA_GP_DEPTH
 #define QSA_GP_DEPTH 4             // keys in flight a warp (3: -2%, 5: +0%, 6: -50%)
 #endif

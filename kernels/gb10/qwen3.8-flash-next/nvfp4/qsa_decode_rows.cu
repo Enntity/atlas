@@ -228,6 +228,8 @@ extern "C" __global__ void qsa_sparse_decode_attn(
     if (q_head >= num_q_heads) return;
     const QsaRowGeo g = qsa_row_geo(first_pos + row, ratio, block_topk);
     const unsigned int seq_len = (unsigned int)g.n_sel;   // the gathered length
+    // The host sizes the selection at <= QSD_MAX_SEL (QSA_SPARSE_MAX_SEL).
+    if (seq_len > QSD_MAX_SEL) __trap();
 
     __shared__ int s_sel[QSD_MAX_SEL];
     const int* my_sel = sel + (size_t)row * sel_stride;

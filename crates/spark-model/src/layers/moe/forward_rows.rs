@@ -338,8 +338,8 @@ impl MoeLayer {
     /// `ATLAS_QWEN4EXP_MOE_TC`) for rows `[r0, r0 + rows)` of `input` routed at
     /// `indices` (`[*, top_k]`): down into `expert_down_out` (`[*, top_k, h]`),
     /// the shared expert's into `shared_out` (`[*, h]`), at those rows. The
-    /// gate/up rows are not materialized, so their buffers hold the FP32
-    /// activations and the plan. Serial decode's single row comes here too
+    /// gate/up rows are not materialized, so their buffers hold the
+    /// activations (FP32; BF16 under TC v3) and the plan. Serial decode's single row comes here too
     /// under the tensor-core switch (`forward_row_local`).
     pub(super) fn units_experts(
         &self,
