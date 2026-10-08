@@ -119,6 +119,26 @@ pub(in crate::model) fn glm_pc_write_floor_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_PC_WRITE_FLOOR").as_deref() == Ok("1"))
 }
 
+/// The base KV write floor of a prefill pass over `[start, start + rows)`:
+/// with a Marconi restore (`marconi_skip`) the replay rows under the radix
+/// match `cached`, so the shared blocks keep their bytes; otherwise
+/// `kv_write_start` (the prefix lookup's skip depth, 0 without a restore).
+/// Shared by the single pass (`forward_layers`) and each sequence of a
+/// multi-sequence pass (`multi`), so both write the same rows.
+pub(super) fn replay_floor(
+    marconi_skip: bool,
+    cached: usize,
+    kv_write_start: usize,
+    start: usize,
+    rows: usize,
+) -> usize {
+    if marconi_skip {
+        cached.saturating_sub(start).min(rows)
+    } else {
+        kv_write_start
+    }
+}
+
 /// The KV write floor a prefill pass over rows `[start, start + rows)` hands
 /// its layers. `replay_floor` is the base value: the rows a Marconi replay
 /// spends under the radix match `matched`, and 0 for a prefix hit with
