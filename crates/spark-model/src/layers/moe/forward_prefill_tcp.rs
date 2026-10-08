@@ -174,7 +174,8 @@ impl MoeLayer {
             if ids.1 < n as usize {
                 let len = (n as usize).next_power_of_two().max(4096);
                 if ids.0 != 0 {
-                    gpu.synchronize(stream)?;
+                    // Process-wide: any stream may still read the old one.
+                    gpu.synchronize_device()?;
                     gpu.free(DevicePtr(ids.0))?;
                 }
                 let buf = gpu.alloc(len * 4)?;

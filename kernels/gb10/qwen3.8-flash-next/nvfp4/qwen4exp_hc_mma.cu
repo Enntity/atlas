@@ -71,6 +71,9 @@
 #include <cuda_bf16.h>
 #include "../../common/atlas_pdl.cuh"
 
+// The host mirrors the HCM_DN_* / HCM_FN_* shape (grids, cluster dims,
+// shared memory) in `layers/ops/hyper_connection_lowrank_mma.rs`: change
+// both, never these alone through -D.
 #ifndef HCM_DN_WM
 #define HCM_DN_WM 3u  // m16 weight tiles a CTA (rank + hc = 324 rows = 21 tiles = 7 x 3)
 #endif

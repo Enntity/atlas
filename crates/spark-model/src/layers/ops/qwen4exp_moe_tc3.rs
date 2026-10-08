@@ -37,6 +37,24 @@ impl Qwen4ExpMoeRows {
         (try_kernel(gpu, M, "qwen4exp_moe_c8_tc3_plan"), fused, ctas)
     }
 
+    /// The requested (tc, units) switches, both off with one warning when the
+    /// model has more experts than every units plan takes (NEXP = 512 in the
+    /// .cu files: a larger id traps).
+    pub(super) fn units_fit(
+        config: &atlas_core::config::ModelConfig,
+        tc: bool,
+        units: bool,
+    ) -> (bool, bool) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        let fit = config.num_experts <= 512;
+        if units && !fit {
+            WARNED.call_once(|| {
+                tracing::warn!("qwen4_exp MoE units off: {} experts > 512", config.num_experts)
+            });
+        }
+        (tc && fit, units && fit)
+    }
+
     /// [`Self::units`] on v3: the plan into `ws`, then the fused launch
     /// (BF16 activations in `act`).
     pub(super) fn units_tc3(
@@ -49,6 +67,11 @@ impl Qwen4ExpMoeRows {
         (top_k, rows): (u32, u32),
         stream: u64,
     ) -> Result<()> {
+        // v3 always runs the shared unit (v1/v2 write zeros without one).
+        anyhow::ensure!(
+            [sh_gate, sh_up, sh_down].iter().all(|w| w.weight.0 != 0),
+            "qwen4exp MoE TC v3: no shared expert"
+        );
         KernelLaunch::new(gpu, self.units_plan)
             .grid([1, 1, 1])
             .block([1024, 1, 1])

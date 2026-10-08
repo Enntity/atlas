@@ -126,7 +126,12 @@ __device__ __forceinline__ void c8_gate_up(C8_GU_ARGS) {
         s2 = (proj ? up_scale2_vals : gate_scale2_vals)[u.expert];
     }
     __nv_bfloat16* out = u.shared() ? (proj ? sh_up_out : sh_gate_out) : (proj ? up_out : gate_out);
-    if (B == 0) {  // remote expert (or no shared expert): zeros
+    // CTA-uniform: every warp tests both projections, so no warp leaves
+    // while the others wait at the barriers below.
+    const unsigned char* B_peer = u.shared()
+        ? (proj ? sh_gate_packed : sh_up_packed)
+        : (const unsigned char*)(proj ? gate_packed_ptrs : up_packed_ptrs)[u.expert];
+    if (B == 0 || B_peer == 0) {  // remote expert (or no shared expert): zeros
         if (out)
             for (unsigned i = threadIdx.x & 127u; i < u.n * 8; i += 128)
                 out[(size_t)c8_slot(ws, u, i / 8) * C8_I + n0 + i % 8] = __float2bfloat16(0.0f);
@@ -181,7 +186,7 @@ __device__ __forceinline__ void c8_gate_up(C8_GU_ARGS) {
     }
 }
 
-// ── down: grid (2560 / 32, units max), block 256 ──
+// ── down: grid (2560 / 64, units max) (TILE = 32 x OG, OG = 2), block 256 ──
 // K/16 = 40 steps an output, so the rows kernel's lane chains are uneven
 // (lanes 0-7 two steps, 8-31 one). Here 8 lanes run one output: lane j of
 // the group holds chains j (k16 = j, j + 32), j + 8, j + 16, j + 24 (one
@@ -270,8 +275,9 @@ __device__ __forceinline__ void c8_down(C8_SD_ARGS) {
     const float s2 = u.shared() ? sh_down_s2 : scale2_vals[u.expert];
     __nv_bfloat16* out = u.shared() ? sh_down_out : C;
     if (B == 0) {
-        for (unsigned i = threadIdx.x; i < u.n * TILE; i += blockDim.x)
-            out[(size_t)c8_slot(ws, u, i / TILE) * C8_H + n0 + i % TILE] = __float2bfloat16(0.0f);
+        if (out)
+            for (unsigned i = threadIdx.x; i < u.n * TILE; i += blockDim.x)
+                out[(size_t)c8_slot(ws, u, i / TILE) * C8_H + n0 + i % TILE] = __float2bfloat16(0.0f);
         return;
     }
     // The tile: [TILE][320] packed, then [TILE][40] scales, each contiguous

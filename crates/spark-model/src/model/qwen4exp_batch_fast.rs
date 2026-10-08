@@ -209,11 +209,32 @@ pub(crate) fn check_requested() -> bool {
 
 /// The model's `qwen4exp_batch_fast` lever: the switch, on a qwen4_exp model.
 pub(crate) fn lever(model_type: &str) -> Result<bool> {
+    if model_type == "qwen4_exp" {
+        warn_inert_numerics(requested(), tc_requested(), units_requested());
+    }
     lever_from(
         requested(),
         model_type,
         crate::layers::w4a16_gemv_tiers::tc_requested(),
     )
+}
+
+/// Log the MoE switches that do not do what they say on their own: the
+/// units only exist under the lane, and prefill's BF16 routed experts are
+/// MoE_TC decode's numerics, so without it prefill and decode differ.
+fn warn_inert_numerics(lane: bool, tc: bool, units: bool) {
+    if !lane && (tc || units) {
+        tracing::warn!(
+            "ATLAS_QWEN4EXP_MOE_TC / _MOE_UNITS ignored: they need ATLAS_QWEN4EXP_BATCH_FAST=1"
+        );
+    }
+    if crate::layers::moe::tcp_requested() && !(lane && tc) {
+        tracing::warn!(
+            "ATLAS_QWEN4EXP_PREFILL_MOE_BF16 (or _PREFILL_BF16_PROJ) without \
+             ATLAS_QWEN4EXP_BATCH_FAST=1 + ATLAS_QWEN4EXP_MOE_TC=1: prefill's routed experts \
+             take the TC decode numerics, decode does not"
+        );
+    }
 }
 
 fn lever_from(requested: bool, model_type: &str, w4a16_tc: bool) -> Result<bool> {
