@@ -437,7 +437,8 @@ impl QsaIndexer {
         // selections and masking each row back to its own list is exactly
         // equivalent -- so the only question is how big that union is.
         // union/topk == 1.0 means free; == tile size means no sharing at all.
-        if std::env::var("ATLAS_QSA_UNION_DIAG").as_deref() == Ok("1") {
+        static UNION_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *UNION_DIAG.get_or_init(|| std::env::var("ATLAS_QSA_UNION_DIAG").as_deref() == Ok("1")) {
             let mut host = vec![0u8; rows * topk * 4];
             gpu.synchronize(stream)?;
             gpu.copy_d2h_on_stream(lists, &mut host, stream)?;
