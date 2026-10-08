@@ -22,6 +22,14 @@
 //! against 764 for four 8-row passes; the LM head 3.85 ms against 10.2.
 //! `w4a16_gemv_batch32` is slower than two `batch16` passes at these shapes
 //! and is not used.
+//!
+//! `ATLAS_QWEN4EXP_ROWS32_TILE=1` serves the 32-row BF16 tier with the
+//! register-tiled `qwen4exp_bf16_rows32t` (`qwen4exp_rows32_tile.cu`): same
+//! bytes, 16 rows x 4 outputs a thread and fused multiply-adds where they
+//! are provably exact. GB10, checkpoint weights, M = 32: LM head half 4.0 ->
+//! 2.69 ms, GDN qkvz 278 -> 190 us, out_proj 120 -> 83 us
+//! (`scripts/dev/qwen4exp_rows32_tile_bench.cu`). Rank-local: the bytes do
+//! not change.
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -39,12 +47,24 @@ const BF16_CTA: [(u32, u32); 2] = [(4, 256), (16, 512)];
 const QG_CTA: [(u32, u32); 2] = [(4, 256), (8, 256)];
 /// Chunks of at most this many rows keep the narrow kernels.
 const WIDE_MIN_ROWS: u32 = 8;
+/// `qwen4exp_bf16_rows32t`: outputs and threads a CTA, dynamic shared bytes
+/// (a double-buffered K-step of 32 rows).
+const TILE_CTA: (u32, u32, u32) = (16, 512, 2 * 32 * 64 * 16);
+
+/// `ATLAS_QWEN4EXP_ROWS32_TILE=1`, read once: the 32-row BF16 tier runs the
+/// register-tiled kernel (module docs).
+pub fn rows32_tile_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_ROWS32_TILE").as_deref() == Ok("1"))
+}
 
 /// The kernel handles, all 0 unless the lane is on for a qwen4_exp model and
 /// the target ships them (every caller then chunks exactly as before).
 #[derive(Clone, Copy, Debug)]
 pub struct Qwen4ExpWideRows {
     bf16: [KernelHandle; 2],
+    /// `qwen4exp_bf16_rows32t`, serving the 32-row BF16 tier when resolved.
+    bf16_tile: KernelHandle,
     qg: [KernelHandle; 2],
     w4a16_16: KernelHandle,
 }
@@ -66,6 +86,7 @@ fn next_chunk(remaining: u32, present: [bool; 2], narrow_cap: u32) -> (u32, Opti
 impl Qwen4ExpWideRows {
     pub const OFF: Self = Self {
         bf16: [KernelHandle(0); 2],
+        bf16_tile: KernelHandle(0),
         qg: [KernelHandle(0); 2],
         w4a16_16: KernelHandle(0),
     };
@@ -81,6 +102,11 @@ impl Qwen4ExpWideRows {
                 try_kernel(gpu, "qwen4exp_wide_rows", "qwen4exp_bf16_rows16"),
                 try_kernel(gpu, "qwen4exp_wide_rows", "qwen4exp_bf16_rows32"),
             ],
+            bf16_tile: if rows32_tile_requested() {
+                try_kernel(gpu, "qwen4exp_rows32_tile", "qwen4exp_bf16_rows32t")
+            } else {
+                KernelHandle(0)
+            },
             qg: [
                 try_kernel(gpu, "qwen4exp_wide_rows", "qwen4exp_qg_rows16"),
                 try_kernel(gpu, "qwen4exp_wide_rows", "qwen4exp_qg_rows32"),
@@ -108,7 +134,8 @@ impl Qwen4ExpWideRows {
         (m, n, k, out_stride): (u32, u32, u32, u32),
         stream: u64,
     ) -> Result<()> {
-        let present = Self::present(&self.bf16);
+        let mut present = Self::present(&self.bf16);
+        present[1] |= self.bf16_tile.0 != 0;
         let mut first = 0u32;
         while first < m {
             let (rows, tier) = next_chunk(m - first, present, super::DENSE_GEMV_BATCHM_MAX_M);
@@ -127,10 +154,17 @@ impl Qwen4ExpWideRows {
                 k.is_multiple_of(8),
                 "qwen4exp_bf16_rows: k={k} not a multiple of 8"
             );
-            let (npb, threads) = BF16_CTA[t];
-            KernelLaunch::new(gpu, self.bf16[t])
+            let tile = t == 1 && self.bf16_tile.0 != 0;
+            let ((npb, threads), smem, kernel) = if tile {
+                let (npb, threads, smem) = TILE_CTA;
+                ((npb, threads), smem, self.bf16_tile)
+            } else {
+                (BF16_CTA[t], 0, self.bf16[t])
+            };
+            KernelLaunch::new(gpu, kernel)
                 .grid([div_ceil(n, npb), 1, 1])
                 .block([threads, 1, 1])
+                .shared_mem(smem)
                 .arg_ptr(a)
                 .arg_ptr(weight.weight)
                 .arg_ptr(c)
