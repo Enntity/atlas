@@ -69,7 +69,8 @@ impl BurstConfig {
 /// The tick's state after `start_new_requests`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TickView {
-    /// Requests this tick handed to `start_new_requests`.
+    /// Sequences this tick's `start_new_requests` started (the growth of
+    /// `in_flight`): a request it dropped or failed drains nothing.
     pub admitted: usize,
     /// Requests still in the pending queue.
     pub pending: usize,
