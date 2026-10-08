@@ -326,13 +326,15 @@ pub trait DraftProposer: Send + Sync {
     /// [`Self::propose_batch`] of `n` sequences and `num_drafts` positions
     /// handed `comm` (with a grammar mask or not), if the worker serves part
     /// of it. The model announces such a propose with this word before it
-    /// calls it, and hands it `comm` then and only then.
+    /// calls it, and hands it `comm` then and only then. `ctx` is the
+    /// propose's: no announce for a propose that will not run batched.
     fn draft_tp_word(
         &self,
         _comm: &dyn spark_comm::CommBackend,
         _n: usize,
         _num_drafts: usize,
         _grammar: bool,
+        _ctx: &crate::layer::ForwardContext<'_>,
     ) -> Option<u32> {
         None
     }
