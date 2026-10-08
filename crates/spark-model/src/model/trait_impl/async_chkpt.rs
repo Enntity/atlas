@@ -417,44 +417,6 @@ impl TransformerModel {
         self.qwen4exp_leaf_after_commit(seq, num_accepted)
     }
 
-    /// Set `gdn_commit_pending` on every GDN layer state of `seq` for a
-    /// verify about to run at `num_tokens` rows. MUST be called at the
-    /// `decode_verify*` dispatch entry — outside any `begin_capture` —
-    /// because on graph replay the layer's forward host code never runs.
-    /// The predicate is the same one the layer uses to pick the `_defer`
-    /// kernel (`TransformerLayer::gdn_deferred_wyn`), plus the wyN arm's
-    /// per-sequence intermediates-layout precondition, so the flag can
-    /// never disagree with the kernel the capture baked.
-    pub(super) fn mark_gdn_deferred_commit(
-        &self,
-        seq: &mut SequenceState,
-        num_tokens: usize,
-    ) -> Result<()> {
-        if !self.levers.gdn_deferred_commit {
-            return Ok(());
-        }
-        for (i, state) in seq.layer_states.iter_mut().enumerate() {
-            if self.config.layer_type(i) != LayerType::LinearAttention {
-                continue;
-            }
-            let defer = self.layers[i].gdn_deferred_wyn(&self.levers, num_tokens);
-            // ATLAS_QWEN4EXP_EXACT_DEFER rides the same staging pools.
-            let exact = self.layers[i].gdn_exact_defer(
-                self.gpu.as_ref(),
-                &self.levers,
-                &self.config,
-                num_tokens,
-            );
-            if let Some(ssm) = state.as_any_mut().downcast_mut::<SsmLayerState>() {
-                ssm.gdn_commit_pending = (defer
-                    && ssm.h_inter_pool_layout(num_tokens, self.ssm_pool.h_stored_bytes))
-                    || (exact && !ssm.gdn_commit_qkv.is_null() && !ssm.gdn_commit_gb.is_null());
-            }
-        }
-        // ATLAS_QWEN4EXP_GDN_COMMIT_FUSE: this verify's pending-commit word.
-        self.gdn_fuse_arm(seq)
-    }
-
     /// Deferred-commit accept: replay tokens `0..num_accepted` of this
     /// layer's staged verify inputs from the live H0 in `h_state`
     /// (`gated_delta_rule_commit` — same `gated_delta_rule_wyn_impl`
