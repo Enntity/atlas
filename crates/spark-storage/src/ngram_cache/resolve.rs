@@ -111,15 +111,10 @@ impl NgramRowCache {
 
         if faults.len() > 1 && self.fault_pool.is_none() && fault_pool::pool_enabled() {
             // The caller's thread works the batch too, so `fault_threads()`
-            // stays the total depth.
+            // stays the total depth. A failed build warns once and leaves
+            // this batch and every later one on the scoped path below.
             let workers = fault_threads().saturating_sub(1).max(1);
-            match fault_pool::FaultPool::new(self, workers) {
-                Ok(p) => self.fault_pool = Some(p),
-                Err(e) => {
-                    self.drop_reservations(&faults);
-                    return Err(e);
-                }
-            }
+            self.fault_pool = fault_pool::FaultPool::build(self, workers);
         }
 
         // PASS 2 -- FAULT. The misses are independent: distinct slots (every

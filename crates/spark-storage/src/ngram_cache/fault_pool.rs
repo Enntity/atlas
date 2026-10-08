@@ -20,11 +20,12 @@
 //! issues a read changes.
 
 use std::fs::File;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use super::fault::{ArenaPtrs, Fault, RowSource, fetch_row};
 use super::{AlignedBlock, NgramRowCache, Segments};
@@ -51,6 +52,10 @@ impl OwnedSource {
     }
 }
 
+/// The per-row read: `fetch_row`, swappable so the pool's own mechanics are
+/// testable without an arena or NVMe.
+type FetchFn = fn(&RowSource<'_>, &ArenaPtrs, &mut AlignedBlock, u64, u32) -> Result<()>;
+
 /// One batch in flight. The raw arena pointers are valid for the whole batch:
 /// `run` does not return until every claimed fault has finished.
 struct Batch {
@@ -64,8 +69,9 @@ struct Batch {
 
 impl Batch {
     /// Work faults until none are left to claim. Returns after this thread's
-    /// last claimed fault completed.
-    fn work(&self, src: &RowSource<'_>, bounce: &mut AlignedBlock) {
+    /// last claimed fault completed. A panicking fetch is that row's error:
+    /// every claimed fault must reach `finished`, or `run` waits forever.
+    fn work(&self, fetch: FetchFn, src: &RowSource<'_>, bounce: &mut AlignedBlock) {
         let ptrs = ArenaPtrs {
             rows: self.rows as *mut u8,
             scales: self.scales.map(|p| p as *mut u8),
@@ -75,7 +81,16 @@ impl Batch {
             let Some(f) = self.faults.get(i) else {
                 return;
             };
-            if let Err(e) = fetch_row(src, &ptrs, bounce, f.id, f.slot) {
+            let r = catch_unwind(AssertUnwindSafe(|| fetch(src, &ptrs, bounce, f.id, f.slot)))
+                .unwrap_or_else(|p| {
+                    let msg = p
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("non-string payload");
+                    Err(anyhow!("NgramRowCache: read row {} panicked: {msg}", f.id))
+                });
+            if let Err(e) = r {
                 let mut g = self.error.lock().expect("fault pool error mutex");
                 if g.is_none() {
                     *g = Some(e);
@@ -96,6 +111,7 @@ struct Slot {
 
 struct Shared {
     src: OwnedSource,
+    fetch: FetchFn,
     slot: Mutex<Slot>,
     wake: Condvar,
     /// Signalled by the worker that finishes a batch's last fault.
@@ -107,14 +123,39 @@ pub(super) struct FaultPool {
     workers: Vec<JoinHandle<()>>,
 }
 
-/// `ATLAS_PLE_FAULT_POOL=1` (read once).
+/// Latched by the first failed build: the causes (fd or thread exhaustion)
+/// are process-wide, so later resolves take the scoped path, not a retry.
+static BUILD_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// `ATLAS_PLE_FAULT_POOL=1` (read once), until a build fails.
 pub(super) fn pool_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_PLE_FAULT_POOL").ok().as_deref() == Some("1"))
+        && !BUILD_FAILED.load(Ordering::Relaxed)
+}
+
+fn spawn_worker(i: usize, sh: Arc<Shared>) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("ple-fault-{i}"))
+        .spawn(move || worker(&sh))
 }
 
 impl FaultPool {
-    pub(super) fn new(cache: &NgramRowCache, workers: usize) -> Result<Self> {
+    /// The pool, or `None` with one warning: an unbuildable pool costs the
+    /// scoped path's spawns, never a failed resolve.
+    pub(super) fn build(cache: &NgramRowCache, workers: usize) -> Option<Self> {
+        Self::new(cache, workers)
+            .inspect_err(|e| {
+                if !BUILD_FAILED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "PLE fault pool: build failed ({e:#}); scoped fault threads from now on"
+                    );
+                }
+            })
+            .ok()
+    }
+
+    fn new(cache: &NgramRowCache, workers: usize) -> Result<Self> {
         let segments = match &cache.segments {
             None => None,
             Some(s) => Some(Segments {
@@ -136,35 +177,42 @@ impl FaultPool {
             ),
             None => None,
         };
-        let shared = Arc::new(Shared {
-            src: OwnedSource {
-                file: cache
-                    .file
-                    .try_clone()
-                    .context("NgramRowCache fault pool: dup file")?,
-                base_offset: cache.base_offset,
-                segments,
-                row_stride: cache.row_stride,
-                scale_file,
-            },
-            slot: Mutex::new(Slot::default()),
-            wake: Condvar::new(),
-            done: Condvar::new(),
-        });
-        let mut handles = Vec::with_capacity(workers);
+        let src = OwnedSource {
+            file: cache
+                .file
+                .try_clone()
+                .context("NgramRowCache fault pool: dup file")?,
+            base_offset: cache.base_offset,
+            segments,
+            row_stride: cache.row_stride,
+            scale_file,
+        };
+        Self::start(src, fetch_row, workers, spawn_worker)
+    }
+
+    /// Spawn `workers` threads. The pool owns each handle as it is spawned,
+    /// so a failed spawn drops it and `Drop` stops and joins the rest.
+    fn start(
+        src: OwnedSource,
+        fetch: FetchFn,
+        workers: usize,
+        mut spawn: impl FnMut(usize, Arc<Shared>) -> std::io::Result<JoinHandle<()>>,
+    ) -> Result<Self> {
+        let mut pool = Self {
+            shared: Arc::new(Shared {
+                src,
+                fetch,
+                slot: Mutex::new(Slot::default()),
+                wake: Condvar::new(),
+                done: Condvar::new(),
+            }),
+            workers: Vec::with_capacity(workers),
+        };
         for i in 0..workers {
-            let sh = shared.clone();
-            handles.push(
-                std::thread::Builder::new()
-                    .name(format!("ple-fault-{i}"))
-                    .spawn(move || worker(&sh))
-                    .context("NgramRowCache fault pool: spawn")?,
-            );
+            let h = spawn(i, pool.shared.clone()).context("NgramRowCache fault pool: spawn")?;
+            pool.workers.push(h);
         }
-        Ok(Self {
-            shared,
-            workers: handles,
-        })
+        Ok(pool)
     }
 
     /// Fault every row of `faults` into its slot; the caller's thread works
@@ -193,7 +241,7 @@ impl FaultPool {
         self.shared.wake.notify_all();
         let src = self.shared.src.view();
         let mut bounce = AlignedBlock::new();
-        batch.work(&src, &mut bounce);
+        batch.work(self.shared.fetch, &src, &mut bounce);
         {
             let mut s = self.shared.slot.lock().expect("fault pool mutex");
             while batch.finished.load(Ordering::Acquire) < faults.len() {
@@ -224,7 +272,7 @@ fn worker(sh: &Shared) {
             seen = s.generation;
             s.batch.clone().expect("checked above")
         };
-        batch.work(&src, &mut bounce);
+        batch.work(sh.fetch, &src, &mut bounce);
         if batch.finished.load(Ordering::Acquire) == batch.faults.len() {
             // Taking the lock orders this notify after the caller's check.
             let _g = sh.slot.lock().expect("fault pool mutex");
@@ -242,3 +290,7 @@ impl Drop for FaultPool {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "fault_pool_tests.rs"]
+mod tests;
