@@ -110,11 +110,13 @@ mod kda_indexed;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
 #[path = "ops/hyper_connection_lowrank_gemm.rs"]
 mod hyper_connection_lowrank_gemm;
+pub(crate) use hyper_connection_lowrank_gemm::hc_fast;
 #[path = "ops/hyper_connection_lowrank_prefill.rs"]
 mod hyper_connection_lowrank_prefill;
 pub(crate) use hyper_connection_lowrank_prefill::HC_PREFILL_SLAB;
 #[path = "ops/hyper_connection_lowrank_mma.rs"]
 mod hyper_connection_lowrank_mma;
+pub(crate) use hyper_connection_lowrank_mma::{hc_mma, hc_stage_fit};
 #[cfg(all(test, feature = "cuda"))]
 #[path = "ops/hyper_connection_lowrank_mma_tests.rs"]
 mod hyper_connection_lowrank_mma_tests;

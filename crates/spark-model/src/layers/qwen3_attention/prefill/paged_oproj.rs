@@ -50,7 +50,7 @@ impl Qwen3AttentionLayer {
             && self.w4a4_gemm_k.0 != 0
             && self.quantize_nvfp4_k.0 != 0
             && ctx.buffers.fp8_act_bytes() >= (n as usize) * (nq as usize) * (hd as usize)
-            && std::env::var("ATLAS_ATTN_W4A4").is_ok();
+            && super::attn_w4a4_requested();
         if w4a4 {
             let kd = nq * hd;
             let a4 = ctx.buffers.fp8_act();
@@ -444,7 +444,7 @@ impl Qwen3AttentionLayer {
             .is_none_or(|w| w.as_packed_q2().is_none() && w.as_fp8().is_none())
             && self.o_fp8w_t.is_none()
             && !ctx.dispatch.cutlass_nvfp4_attn_o
-            && std::env::var("ATLAS_ATTN_W4A4").is_err();
+            && !super::attn_w4a4_requested();
         // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: the BF16 o_proj, row-invariant too.
         let rowinv = self.rowinv_bf16[3].filter(|_| crate::layers::ops::qwen4exp_rowinv::active());
         let fp8 = self.o_fp8.filter(|_| n > 128 && earlier_arms_skip);

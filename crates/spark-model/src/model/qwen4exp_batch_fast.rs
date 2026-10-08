@@ -130,7 +130,7 @@ pub(crate) fn small_lever() -> bool {
 /// routed + shared experts go through `qwen4exp_moe_c8.cu`'s expert units
 /// (each weight decoded once for every row that picked it, SiLU in the
 /// gate/up epilogue, down's lane chains rebalanced) -- the same bytes as the
-/// rows pair, so the ranks need not agree on it.
+/// rows pair. `startup_parity` carries it anyway, so an A/B never mixes arms.
 pub(crate) fn units_requested() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_UNITS").as_deref() == Ok("1"))
