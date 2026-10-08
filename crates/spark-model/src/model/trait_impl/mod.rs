@@ -245,6 +245,16 @@ impl Model for TransformerModel {
     ) -> Result<Vec<DevicePtr>> {
         self.prefill_batch_chunk_rows(streams, stream, 0)
     }
+    fn supports_prefill_multi(&self) -> bool {
+        self.prefill_multi_supported()
+    }
+    fn prefill_multi(
+        &self,
+        streams: &mut [PrefillSlice<'_>],
+        stream: u64,
+    ) -> Result<Vec<DevicePtr>> {
+        self.prefill_multi_head(streams, stream)
+    }
     /// Mixed-step variant: shift the finishing streams' logits rows clear of
     /// the decode lanes. See the trait docs for the aliasing this prevents.
     fn prefill_batch_chunk_rows(

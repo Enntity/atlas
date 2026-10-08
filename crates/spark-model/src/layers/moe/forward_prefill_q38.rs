@@ -40,14 +40,9 @@ use super::*;
 use spark_runtime::kernel_args::KernelLaunch;
 
 /// `ATLAS_QWEN4EXP_PREFILL_MOE=1`.
-/// Implied by `ATLAS_QWEN4EXP_PREFILL_BF16_PROJ`, whose routed experts take
-/// its `_MOE_BF16` arm.
 pub(crate) fn q38_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_MOE")
-            || crate::layers::ops::qwen4exp_rowinv::bf16_proj()
-    })
+    *ON.get_or_init(|| super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_MOE"))
 }
 
 /// `ATLAS_QWEN4EXP_PREFILL_MOE_W2=1` (with `_MOE`): the routed and shared

@@ -37,6 +37,7 @@ impl TransformerModel {
             proc_count,
             0,
             0,
+            None,
             stream,
         )
     }
@@ -55,6 +56,9 @@ impl TransformerModel {
         proc_count: usize,
         hidden_stream_offset_tokens: usize,
         logits_row: usize,
+        // The last row's logits, when the caller projected them already
+        // (`multi`: every sequence's row of a multi-sequence pass at once).
+        logits_in: Option<DevicePtr>,
         stream: u64,
     ) -> Result<DevicePtr> {
         let h = self.config.hidden_size;
@@ -194,7 +198,9 @@ impl TransformerModel {
         // streams' first token collapses to one shared buffer (cross-request
         // contamination). Row 0 (single-stream + batched stream 0) keeps the
         // byte-identical `lm_head` GEMV path; rows >0 write to their own offset.
-        let logits_ptr = if logits_row == 0 {
+        let logits_ptr = if let Some(ptr) = logits_in {
+            ptr
+        } else if logits_row == 0 {
             self.lm_head(normed, stream)?;
             self.decode_logits_ptr()
         } else {

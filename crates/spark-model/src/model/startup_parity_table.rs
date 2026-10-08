@@ -89,6 +89,10 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_ROWINV", || {
         Ok(crate::layers::ops::qwen4exp_rowinv::on() as u64)
     }),
+    // Who sends the prefill commands and in what shape.
+    ("ATLAS_QWEN4EXP_PREFILL_MULTI", || {
+        Ok(crate::model::trait_impl::prefill_b::multi_requested() as u64)
+    }),
     ("ATLAS_QWEN4EXP_PREFILL_BF16_PROJ", || {
         Ok(crate::layers::ops::qwen4exp_rowinv::bf16_proj() as u64)
     }),
