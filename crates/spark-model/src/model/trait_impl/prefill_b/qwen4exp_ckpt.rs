@@ -141,8 +141,9 @@ impl TransformerModel {
         Ok(self.prepare_midchunk_capture(tokens, seq, kv_cache, start, count, stream))
     }
 
-    /// Plan the in-pass checkpoint of the last chunk's pass over
-    /// `[proc_start, proc_start + proc_count)`, or `None`.
+    /// Plan the in-pass checkpoints of a pass over
+    /// `[proc_start, proc_start + proc_count)`: the last chunk's tail row,
+    /// and the dense and branch-point rows (`qwen4exp_points`), or `None`.
     pub(super) fn prepare_qwen4exp_ckpt(
         &self,
         tokens: &[u32],
@@ -155,8 +156,7 @@ impl TransformerModel {
         let [proc_start, proc_count] = span;
         // A pass that failed after planning left its hooks armed: disarm.
         let _ = ckpt::end();
-        if !is_last_chunk
-            || !self.qwen4exp_ckpt_takes_tail()
+        if !self.qwen4exp_ckpt_takes_tail()
             || !self.ssm_snapshots.is_enabled()
             || !self.prefix_cache.is_active()
             || self.tokens_have_vision_pad(tokens)
@@ -165,34 +165,62 @@ impl TransformerModel {
         }
         let bs = kv_cache.block_size();
         let cut = super::pc_policy::tail_cut(tokens.len(), bs);
-        let Some(cp) = self.qwen4exp_ckpt_row(proc_start, proc_count, cut, bs) else {
-            tracing::info!(
-                "qwen4_exp mid-chunk checkpoint: no 64-token boundary in [{proc_start}, {cut}]"
-            );
+        let tail = if is_last_chunk {
+            let cp = self.qwen4exp_ckpt_row(proc_start, proc_count, cut, bs);
+            if cp.is_none() {
+                tracing::info!(
+                    "qwen4_exp mid-chunk checkpoint: no 64-token boundary in [{proc_start}, {cut}]"
+                );
+            }
+            cp
+        } else {
+            None
+        };
+        let rows = self.qwen4exp_pass_points(tokens, seq, span, tail, bs);
+        let points = self.qwen4exp_reserve_points(seq, kv_cache, &rows);
+        let Some(&(first, slot, _)) = points.first() else {
             return Ok(None);
         };
-        let Some(slot) = self.reserve_snapshot_slot(seq.session_hash, kv_cache) else {
-            tracing::warn!("qwen4_exp mid-chunk checkpoint: no snapshot slot for token {cp}");
-            return Ok(None);
-        };
-        // A finish leaf's copy into this slot may still be in flight on
+        // A finish leaf's copy into these slots may still be in flight on
         // another stream (no-op without a finish-leaf flag).
         let staged = self
             .finish_leaf_wait_copies(stream)
-            .and_then(|()| self.ple_stage(stream));
-        let ple_dst = staged.inspect_err(|_| self.ssm_snapshots.free(slot))?;
+            .and_then(|()| self.ple_stage(points.len(), stream));
+        let (ple_dst, ple_bytes) = staged.inspect_err(|_| {
+            points.iter().for_each(|p| self.ssm_snapshots.free(p.1));
+        })?;
         let n = self.ssm_snapshots.num_ssm_layers();
-        let h_dsts = (0..n)
-            .map(|l| self.ssm_snapshots.tail_h_dst(l, slot))
+        let dsts = |slot: usize| {
+            let h = (0..n).map(|l| self.ssm_snapshots.tail_h_dst(l, slot));
+            let c = (0..n).map(|l| self.ssm_snapshots.tail_conv_dst(l, slot));
+            (h.collect::<Vec<_>>(), c.collect::<Vec<_>>())
+        };
+        let (h_dsts, conv_dsts) = dsts(slot);
+        let extra = points[1..]
+            .iter()
+            .map(|&(r, slot, _)| {
+                let (h_dsts, conv_dsts) = dsts(slot);
+                ckpt::CapPoint {
+                    cap_local: r - proc_start,
+                    h_dsts,
+                    conv_dsts,
+                }
+            })
             .collect();
-        let conv_dsts = (0..n)
-            .map(|l| self.ssm_snapshots.tail_conv_dst(l, slot))
+        let ple: Vec<_> = (points.iter().enumerate())
+            .map(|(j, p)| (p.0 - proc_start, ple_dst.offset(j * ple_bytes)))
             .collect();
-        ckpt::begin(cp - proc_start, ple_dst);
+        ckpt::begin_many(&ple);
+        if points.len() > 1 || tail.is_none() {
+            tracing::info!(
+                "qwen4_exp in-pass checkpoints planned at {:?} (pass {proc_start}+{proc_count})",
+                points.iter().map(|p| (p.0, p.2)).collect::<Vec<_>>()
+            );
+        }
         Ok(Some(MidCapturePlan {
-            cap_local: cp - proc_start,
+            cap_local: first - proc_start,
             snap_slot: slot,
-            tb: cp,
+            tb: first,
             h_dsts,
             conv_dsts,
             h_bytes: self.ssm_snapshots.h_bytes(),
@@ -204,6 +232,8 @@ impl TransformerModel {
             h_dsts_early: Vec::new(),
             conv_dsts_early: Vec::new(),
             ckpt: true,
+            extra,
+            ckpt_points: points,
         }))
     }
 
@@ -224,8 +254,9 @@ impl TransformerModel {
         Ok(scope)
     }
 
-    /// After the pass: attach the aux at `cp` and index the checkpoint, or
-    /// free the slot when anything was not captured or a step fails.
+    /// After the pass: attach the aux at each point and index its
+    /// checkpoint, or free the slots when anything was not captured or a
+    /// step fails.
     fn finalize_qwen4exp_ckpt(
         &self,
         tokens: &[u32],
@@ -234,95 +265,106 @@ impl TransformerModel {
         plan: &MidCapturePlan,
         stream: u64,
     ) -> Result<()> {
-        self.register_qwen4exp_ckpt(tokens, seq, kv_cache, plan, stream)
-            .inspect_err(|_| self.ssm_snapshots.free(plan.snap_slot))
+        let mut left: Vec<usize> = plan.ckpt_points.iter().map(|p| p.1).collect();
+        let res = self.register_qwen4exp_ckpt(tokens, seq, kv_cache, plan, &mut left, stream);
+        // Whatever was not registered goes back to the pool.
+        left.into_iter()
+            .for_each(|slot| self.ssm_snapshots.free(slot));
+        res
     }
 
-    /// [`Self::finalize_qwen4exp_ckpt`]'s work; an `Err` leaves the slot
-    /// unregistered (nothing after the registration fails).
+    /// [`Self::finalize_qwen4exp_ckpt`]'s work; each slot it registers is
+    /// taken out of `left`.
     fn register_qwen4exp_ckpt(
         &self,
         tokens: &[u32],
         seq: &SequenceState,
         kv_cache: &mut PagedKvCache,
         plan: &MidCapturePlan,
+        left: &mut Vec<usize>,
         stream: u64,
     ) -> Result<()> {
         let (h_done, ple_done) = ckpt::end();
-        // The pass wrote the slot: order the next writer after it.
+        // The pass wrote the slots: order the next writer after it.
         self.finish_leaf_record_copy(stream)?;
         let has_ple = self.config.ple_layer_ids.iter().any(|&id| id > 0);
         let n = self.ssm_snapshots.num_ssm_layers();
-        // Never index blocks past the contiguous fully-written KV (as
-        // `prefill_b_save_checkpoint`).
-        let kv_ok = seq.kv_valid_tokens / plan.bs >= plan.tb / plan.bs;
-        if h_done != n || (has_ple && !ple_done) || !kv_ok {
+        let points = plan.ckpt_points.len();
+        if h_done != n || (has_ple && ple_done != points) {
             tracing::warn!(
-                "qwen4_exp mid-chunk checkpoint at token {}: captured {h_done}/{n} GDN states, \
-                 PLE {ple_done}, KV valid {kv_ok}; not registered",
-                plan.tb
+                "qwen4_exp in-pass checkpoints at {:?}: captured {h_done}/{n} GDN states, \
+                 {ple_done}/{points} PLE carries; not registered",
+                plan.ckpt_points
             );
-            self.ssm_snapshots.free(plan.snap_slot);
             return Ok(());
         }
-        // The pass-end aux, rebuilt at `cp`. With ATLAS_QWEN4EXP_CKPT_AUX_SHARE
-        // the pass-end blobs are kept for the final save, which would read
-        // the very same layer state back again (`take_pass_aux`).
+        // The pass-end aux, rebuilt at each point. With
+        // ATLAS_QWEN4EXP_CKPT_AUX_SHARE the pass-end blobs are kept for the
+        // final save, which would read the very same layer state back again
+        // (`take_pass_aux`).
         let mut aux = self.ssm_snapshots.take_aux(plan.snap_slot);
         self.collect_aux_states_into(seq, stream, &mut aux)?;
-        let mut rebuilt = Vec::with_capacity(aux.len());
-        for (i, blob) in &aux {
-            let at_cp = match self.config.layer_type(*i as usize) {
-                LayerType::FullAttention | LayerType::SlidingAttention => {
-                    let row = self.config.indexer_head_dim * 2;
-                    qsa_blob_at(blob, plan.tb, self.config.indexer_compress_ratio, row)
-                }
-                _ => self.ple_blob_at(blob, tokens, plan.tb, stream)?,
-            };
-            match at_cp {
-                Some(b) => rebuilt.push((*i, b)),
-                None => {
-                    tracing::warn!(
-                        "qwen4_exp mid-chunk checkpoint at token {}: layer {i} aux cannot be \
-                         rebuilt; not registered",
-                        plan.tb
-                    );
-                    self.ssm_snapshots.free(plan.snap_slot);
-                    return Ok(());
+        let (stage, _) = PLE_STAGE.with(Cell::get);
+        let stage_bytes = self.ple_stage_bytes();
+        let mut built = Vec::with_capacity(points);
+        for (j, &(cp, slot, branch)) in plan.ckpt_points.iter().enumerate() {
+            // Never index blocks past the contiguous fully-written KV (as
+            // `prefill_b_save_checkpoint`).
+            if seq.kv_valid_tokens / plan.bs < cp / plan.bs {
+                tracing::warn!("qwen4_exp in-pass checkpoint at token {cp}: KV not valid");
+                continue;
+            }
+            let ple_src = DevicePtr(stage).offset(j * stage_bytes);
+            let mut rebuilt = Vec::with_capacity(aux.len());
+            for (i, blob) in &aux {
+                let at_cp = match self.config.layer_type(*i as usize) {
+                    LayerType::FullAttention | LayerType::SlidingAttention => {
+                        let row = self.config.indexer_head_dim * 2;
+                        qsa_blob_at(blob, cp, self.config.indexer_compress_ratio, row)
+                    }
+                    _ => self.ple_blob_at(blob, tokens, cp, ple_src, stream)?,
+                };
+                match at_cp {
+                    Some(b) => rebuilt.push((*i, b)),
+                    None => break,
                 }
             }
+            if rebuilt.len() != aux.len() {
+                tracing::warn!(
+                    "qwen4_exp in-pass checkpoint at token {cp}: aux cannot be rebuilt; \
+                     not registered"
+                );
+                continue;
+            }
+            built.push((cp, slot, branch, rebuilt));
         }
         if aux_share_requested() {
             PASS_AUX.with(|p| *p.borrow_mut() = Some(((seq.slot_idx, seq.seq_len), aux)));
         }
-        let aux = rebuilt;
-        if !aux.is_empty() {
-            self.ssm_snapshots.set_aux(plan.snap_slot, aux);
-        }
-        if self.register_intermediate_checkpoint(
-            tokens,
-            seq,
-            kv_cache,
-            plan.tb,
-            plan.snap_slot,
-            false,
-        ) {
-            tracing::info!(
-                "qwen4_exp mid-chunk SSM checkpoint saved at token {} (snapshot_id {})",
-                plan.tb,
-                plan.snap_slot
-            );
+        for (cp, slot, branch, rebuilt) in built {
+            if !rebuilt.is_empty() {
+                self.ssm_snapshots.set_aux(slot, rebuilt);
+            }
+            left.retain(|&s| s != slot);
+            // `false`: the checkpoint freed its slot itself.
+            if self.register_intermediate_checkpoint(tokens, seq, kv_cache, cp, slot, branch) {
+                tracing::info!(
+                    "qwen4_exp mid-chunk SSM checkpoint saved at token {cp} (snapshot_id {slot}{})",
+                    if branch { ", branch point" } else { "" }
+                );
+            }
         }
         Ok(())
     }
 
     /// The PLE aux blob `[n u32][history][conv]` at `cp`: the last `n` token
-    /// ids below `cp`, and the conv carry captured at `cp`.
+    /// ids below `cp`, and the conv carry captured at `cp` into `stage`.
     fn ple_blob_at(
         &self,
         blob: &[u8],
         tokens: &[u32],
         cp: usize,
+        stage: DevicePtr,
         stream: u64,
     ) -> Result<Option<Vec<u8>>> {
         if blob.len() < 4 {
@@ -330,8 +372,7 @@ impl TransformerModel {
         }
         let n = u32::from_le_bytes(blob[..4].try_into().expect("4 bytes")) as usize;
         let conv_bytes = blob.len().saturating_sub(4 + n * 4);
-        let (stage, size) = PLE_STAGE.with(Cell::get);
-        if cp < n || conv_bytes == 0 || conv_bytes > size {
+        if cp < n || conv_bytes == 0 || conv_bytes > self.ple_stage_bytes() {
             return Ok(None);
         }
         let mut out = Vec::with_capacity(blob.len());
@@ -341,21 +382,28 @@ impl TransformerModel {
         }
         let off = out.len();
         out.resize(off + conv_bytes, 0);
-        crate::layers::aux_d2h::copy(self.gpu.as_ref(), DevicePtr(stage), &mut out[off..], stream)?;
+        crate::layers::aux_d2h::copy(self.gpu.as_ref(), stage, &mut out[off..], stream)?;
         Ok(Some(out))
     }
 
-    /// The PLE conv-carry staging buffer (grown once to the carry's size).
-    fn ple_stage(&self, stream: u64) -> Result<DevicePtr> {
-        // `[(k - 1) * dilation, hc_mult * hidden]` FP32; the dilation is the
-        // n-gram neighbour count (`weight_loader::qwen4_exp::ple`).
+    /// Bytes of one PLE conv carry: `[(k - 1) * dilation, hc_mult * hidden]`
+    /// FP32; the dilation is the n-gram neighbour count
+    /// (`weight_loader::qwen4_exp::ple`).
+    fn ple_stage_bytes(&self) -> usize {
         let c = self.config.hc_mult * self.config.hidden_size;
         let steps = self.config.ple_conv_kernel_size.saturating_sub(1)
             * self.config.emb_neighbor_num.max(1);
-        let bytes = steps.max(1) * c * 4;
+        steps.max(1) * c * 4
+    }
+
+    /// The PLE conv-carry staging buffer for `points` carries (grown once to
+    /// the largest count): (base, bytes a carry).
+    fn ple_stage(&self, points: usize, stream: u64) -> Result<(DevicePtr, usize)> {
+        let one = self.ple_stage_bytes();
+        let bytes = one * points.max(1);
         let (ptr, size) = PLE_STAGE.with(Cell::get);
         if size >= bytes {
-            return Ok(DevicePtr(ptr));
+            return Ok((DevicePtr(ptr), one));
         }
         if ptr != 0 {
             self.gpu.synchronize(stream)?;
@@ -363,7 +411,7 @@ impl TransformerModel {
         }
         let p = self.gpu.alloc(bytes)?;
         PLE_STAGE.with(|s| s.set((p.0, bytes)));
-        Ok(p)
+        Ok((p, one))
     }
 }
 

@@ -9,9 +9,9 @@ use super::*;
 impl PleLayer {
     /// `ple_conv` over the span's `n` rows starting at forward row `base`
     /// (scratch row `srow`).
-    /// When a checkpoint pass captures the carry at a forward row inside the
-    /// span (or at its end), the conv runs as two launches split there and
-    /// the carry at the split is copied out: the carry chains across launches
+    /// When a checkpoint pass captures the carry at forward rows inside the
+    /// span (or at its end), the conv runs as one launch per piece, split
+    /// there, and the carry at each split is copied out: the carry chains across launches
     /// exactly as across spans and per-row verify launches, so every output
     /// byte is unchanged.
     pub(super) fn conv_span(
@@ -44,15 +44,21 @@ impl PleLayer {
                 stream,
             )
         };
-        let cap = crate::layers::qwen4exp_ckpt::ple_capture()
-            .filter(|&(row, _)| row > base && row <= base + n);
-        let Some((row, dst)) = cap else {
-            return conv(0, n);
-        };
-        let split = row - base;
-        conv(0, split)?;
-        gpu.copy_d2d_async(st.conv, dst, self.conv_bytes(), stream)?;
-        crate::layers::qwen4exp_ckpt::ple_captured();
-        conv(split, n - split)
+        // Every capture row inside the span (or at its end), ascending; the
+        // carry chains across each launch.
+        let mut caps: Vec<(usize, DevicePtr)> = crate::layers::qwen4exp_ckpt::ple_captures()
+            .into_iter()
+            .filter(|&(row, _)| row > base && row <= base + n)
+            .map(|(row, dst)| (row - base, dst))
+            .collect();
+        caps.sort_by_key(|&(split, _)| split);
+        let mut at = 0;
+        for (split, dst) in caps {
+            conv(at, split - at)?;
+            gpu.copy_d2d_async(st.conv, dst, self.conv_bytes(), stream)?;
+            crate::layers::qwen4exp_ckpt::ple_captured();
+            at = split;
+        }
+        conv(at, n - at)
     }
 }

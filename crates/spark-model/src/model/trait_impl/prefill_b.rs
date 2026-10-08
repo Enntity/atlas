@@ -44,6 +44,7 @@ mod prefix_lookup;
 mod proc_range;
 mod prompt_logprobs;
 mod qwen4exp_ckpt;
+pub(in crate::model) mod qwen4exp_points;
 mod save_checkpoint;
 mod stage_batched;
 mod upload_meta;
@@ -228,11 +229,15 @@ impl TransformerModel {
             None,
         )?;
         self.warm_trace_sync(stream)?;
+        // ATLAS_QWEN4EXP_SNAPSHOT_AUX_MB: after the restore read its slot.
+        self.enforce_snapshot_aux_budget(&mut kv_cache);
         let t_lookup = tp.elapsed() - t_embed;
         // ATLAS_GLM_PC_INFLIGHT: a checkpoint the head asked for (`pc_inflight`).
         self.pc_apply_plant(tokens, seq, span.0, kv_cache.block_size());
-        // ATLAS_GLM_PC_BRANCH: split at the planned branch checkpoint.
-        if let Some(at) = pc_policy::branch_split_at(seq.pc_branch_at, span, passengers.is_some()) {
+        // ATLAS_GLM_PC_BRANCH: split at the planned branch checkpoint
+        // (ATLAS_QWEN4EXP_PC_BRANCH captures it in-pass instead).
+        let split_branch = seq.pc_branch_at.filter(|_| !self.qwen4exp_pc_branch());
+        if let Some(at) = pc_policy::branch_split_at(split_branch, span, passengers.is_some()) {
             drop(kv_cache);
             return self.pc_branch_split(tokens, seq, span, at, is_last_chunk, stream);
         }

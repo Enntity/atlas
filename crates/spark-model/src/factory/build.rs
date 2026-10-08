@@ -610,7 +610,14 @@ pub fn build_model(
     // disk budget and the SSM tier's arena are all committed after this point.
     let nvme_record_bytes =
         PagedKvCache::nvme_record_bytes_for(&kv_config, glm_cache_plan.is_some(), sparse_index);
+    // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS / _AUX_MB: the snapshots' host aux
+    // (`ssm_snapshot_budget`), 0 by default.
+    let snapshot_aux = crate::model::ssm_snapshot_budget::install(
+        &ssm_pools.snapshots,
+        layers.iter().map(|l| l.aux_bytes_per_token()).sum(),
+    );
     let reserve_net = reserve_net
+        + snapshot_aux
         + kv_nvme::host_reserve_bytes(nvme_record_bytes, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
