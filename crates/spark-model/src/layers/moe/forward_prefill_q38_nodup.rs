@@ -67,7 +67,11 @@ impl MoeLayer {
     /// N-major kernels load 64-byte packed and 8-byte scale runs of four K
     /// steps, so they need both K (hidden and `inter`) to be multiples of
     /// 128 (the startup pass checked the planes' alignment).
-    pub(super) fn q38_routed_tables(&self, h: u32, inter: u32) -> Option<([&ExpertPtrTable; 3], bool)> {
+    pub(super) fn q38_routed_tables(
+        &self,
+        h: u32,
+        inter: u32,
+    ) -> Option<([&ExpertPtrTable; 3], bool)> {
         match (&self.gate_ptrs_t, &self.up_ptrs_t, &self.down_ptrs_t) {
             (Some(g), Some(u), Some(d)) => Some(([g, u, d], false)),
             (None, None, None)
@@ -112,8 +116,14 @@ mod tests {
     #[test]
     fn routed_entries_map_to_their_n_major_twins() {
         assert_eq!(routed_entry("moe_q38w_down", false), "moe_q38w_down");
-        assert_eq!(routed_entry("moe_q38_gate_up_silu", true), "moe_q38n_gate_up_silu");
-        assert_eq!(routed_entry("moe_q38w_gate_up_silu", true), "moe_q38wn_gate_up_silu");
+        assert_eq!(
+            routed_entry("moe_q38_gate_up_silu", true),
+            "moe_q38n_gate_up_silu"
+        );
+        assert_eq!(
+            routed_entry("moe_q38w_gate_up_silu", true),
+            "moe_q38wn_gate_up_silu"
+        );
         assert_eq!(routed_entry("moe_q38_down", true), "moe_q38n_down");
         assert_eq!(routed_entry("moe_q38w_down", true), "moe_q38wn_down");
     }
