@@ -67,6 +67,7 @@ mod prefill_a_step;
 mod prefill_a_step_params;
 mod prefill_b_step;
 mod prefill_burst;
+mod prefill_multi;
 mod prefill_normalization;
 mod prefill_preempt;
 mod repetition;

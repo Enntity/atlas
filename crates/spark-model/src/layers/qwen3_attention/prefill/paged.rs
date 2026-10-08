@@ -457,6 +457,17 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
+        {
+            let det = crate::det_trace::on_stream(ctx.gpu, stream);
+            det.tap(
+                "x_qr",
+                q_contiguous,
+                (0, num_tokens),
+                nq as usize * hd as usize * bf16,
+            );
+            det.tap("x_kr", k_contiguous, (0, num_tokens), kv_dim * bf16);
+            det.tap("x_v", v_contiguous, (0, num_tokens), kv_dim * bf16);
+        }
         // ATLAS_OP_DUMP: k/q AFTER RoPE — same token-major slice as the
         // cache_skip chunk-0 sites. Every chunk-1+ call overwrites, so the
         // surviving capture is the global last token.
@@ -816,6 +827,12 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
+        crate::det_trace::on_stream(ctx.gpu, stream).tap(
+            "x_att",
+            attn_out,
+            (0, num_tokens),
+            nq as usize * hd as usize * bf16,
+        );
         // ATLAS_OP_DUMP: attn_out BEFORE sigmoid gate (raw attention-kernel output).
         // Compares 1:1 against vLLM's "attn_out" dump in qwen3_next.py:_dump_op.
         // Use last-token slice n_elements = num_heads * head_dim.

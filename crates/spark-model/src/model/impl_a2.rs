@@ -416,6 +416,9 @@ impl TransformerModel {
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
         }
+        if cmd == super::impl_a2_ep_worker::EP_CMD_PREFILL_MULTI {
+            return self.ep_worker_prefill_multi(slots);
+        }
         // Batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`).
         if cmd == super::trait_impl::ep_verify_batch::EP_CMD_VERIFY_BATCH {
             return self.ep_worker_verify_batch(slots);

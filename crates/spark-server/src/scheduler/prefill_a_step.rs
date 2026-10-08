@@ -296,12 +296,24 @@ pub fn start_chunked_prefill(
             image_pixels.is_empty(),
             "vision must be excluded from co-dispatch"
         );
+        // ATLAS_QWEN4EXP_PREFILL_MULTI: the multi pass sends the worker this
+        // prompt (`super::prefill_multi`), so no prefill command here.
+        let multi = super::prefill_multi::eligible(
+            model,
+            prompt_tokens.len(),
+            is_last,
+            req_prompt_logprobs.is_some(),
+            req_adapter_slot,
+        );
         if let Err(e) = (|| -> Result<()> {
             // EP: broadcast chunk 0 to worker (no-op on single-GPU; the batched
             // step does NOT re-broadcast, so this stays the only broadcast site).
             model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
             model.ep_broadcast_vision_state_for_seq(seq.slot_idx as u32, false, 0, 0, 0, 0)?;
             plant_chunk0(model, &mut seq, pc_plant)?;
+            if multi {
+                return Ok(());
+            }
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
             model.ep_broadcast_cmd(chunk_len as u32)?;
             model.ep_broadcast_cmd(0)?; // chunk_start
