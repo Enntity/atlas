@@ -9,13 +9,22 @@
 //! Copies only propose: every row still verifies against the target's own
 //! pick, so an accepted copy is the token the target chose there.
 //!
-//! **Not exact; an experiment only.** A copy changes how many tokens a step
-//! accepts, so every later position is verified in a different window
-//! (width, row and start), and this engine's verify numerics depend on the
+//! **Exact verification, window-dependent numerics; an experiment.** The
+//! accept rule is unchanged, so every emitted token is the target's pick at
+//! its own verify row whatever proposed it. But a copy changes how many
+//! tokens a step accepts, so later positions are verified in a different
+//! window (width and start), and this engine's verify numerics depend on the
 //! window: greedy text can differ from flag-off at near-ties, as it does
-//! under `ATLAS_DFLASH_CONF_WIDTH` (2026-09-30 decode campaign). It must not
-//! be turned on in any serving profile; it exists to measure what copies
-//! would buy. Shipping it needs window-invariant verify numerics first.
+//! under `ATLAS_DFLASH_CONF_WIDTH` (2026-09-30 decode campaign). On the
+//! GLM profile the known width-dependent kernels are the sparse-MLA verify
+//! split count, which follows the owner's rows unless
+//! `ATLAS_GLM_SPARSE_VERIFY_SPLIT_PIN=1` (`glm_sparse_prefill_split`), and
+//! the per-row-count tiers of the cuBLAS / MXFP8 projections. The kernels
+//! documented as per-row (causal attention, the indexer's top-k, MoE
+//! routing, per-row activation scales) keep a rejected row's content out of
+//! the kept rows, so a copy should differ from a drafter's block only
+//! through the window it leaves. Keep it out of serving profiles until a
+//! hardware A/B has measured it.
 //!
 //! - **Index.** Each request keeps an incremental n-gram index of its
 //!   context on the host: the newest end of every `match`-gram, and per
@@ -77,8 +86,9 @@ use super::dflash_width::MAX_DRAFTS;
 const MAX_INDEXED: usize = 1 << 19;
 /// Positions one offer indexes at most, so a long prompt is indexed over
 /// its first steps instead of stalling one: 0.2–0.3 ms a step, the first
-/// (which allocates the index) up to about 1 ms, on an Apple M-series core
-/// (`copy_drafts_timing`; not measured on GB10).
+/// (which allocates the index) up to about 1 ms, on an Apple M-series core;
+/// on a GB10 host core 8.5 ms over the 32 steps of a 512K prompt, the first
+/// 2.5 ms, and 0.1 µs a decode step (`copy_drafts_timing`, 2026-10-08).
 const INDEX_BUDGET: usize = 1 << 14;
 /// Earlier occurrences a proposal checks at most.
 const MAX_HOPS: usize = 32;
