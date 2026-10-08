@@ -134,6 +134,7 @@ impl TransformerModel {
         n: usize,
         num_drafts: usize,
         grammar: bool,
+        ctx: &crate::layer::ForwardContext<'_>,
     ) -> Result<Option<&dyn CommBackend>> {
         let Some(comm) = self.comm_ref() else {
             return Ok(None);
@@ -141,7 +142,7 @@ impl TransformerModel {
         if !(self.multi_rank_protocol_active() && self.ep_protocol_v2) {
             return Ok(None);
         }
-        let Some(word) = proposer.draft_tp_word(comm, n, num_drafts, grammar) else {
+        let Some(word) = proposer.draft_tp_word(comm, n, num_drafts, grammar, ctx) else {
             return Ok(None);
         };
         self.ep_broadcast_seq_and_cmd(word, EP_CMD_DRAFT_ASSIST, true)?;
