@@ -202,6 +202,31 @@ pub(super) fn continue_in_progress_prefills(
 
     let mut completed_indices = Vec::new();
 
+    // ATLAS_QWEN4EXP_PREFILL_MULTI: every waiting short prompt in one forward,
+    // before any other path (on a multi-rank model nothing else may run them).
+    if super::prefill_multi::run(
+        model,
+        sched,
+        prefilling,
+        &mut completed_indices,
+        prefill_stream,
+        prefill_event,
+    ) {
+        promote_completed_prefills(
+            model,
+            prefilling,
+            completed_indices,
+            active,
+            think_end_token,
+            think_start_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            sched.limits.max_seq_len,
+            sched.limits.glm_tool_boundary,
+        );
+        return did_mixed_step;
+    }
+
     // Q12 batched-prefill paths. Two branches fire when 2+ streams are
     // prefilling concurrently (replaces the FIFO `prefilling.first_mut()`
     // advance — see qwen-refactor notes §6 for the asymmetric-TTFT

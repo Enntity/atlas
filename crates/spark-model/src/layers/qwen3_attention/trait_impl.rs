@@ -18,6 +18,7 @@ pub(crate) use multi_seq::{
 };
 mod prefill_inner;
 mod prefill_inner_glm;
+mod prefill_multi;
 pub(super) use diag::diag_norm;
 pub use diag::diag_norm_f32;
 
@@ -306,6 +307,18 @@ impl TransformerLayer for Qwen3AttentionLayer {
             ctx,
             stream,
         )
+    }
+
+    fn prefill_multi(
+        &self,
+        hidden: DevicePtr,
+        total: usize,
+        segs: &mut [crate::layer::MultiSeg<'_, '_>],
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_multi_hc(hidden, total, segs, kv_cache, ctx, stream)
     }
 
     /// Q12 Path B: batched-mode attention prefill via `prefill_inner` with

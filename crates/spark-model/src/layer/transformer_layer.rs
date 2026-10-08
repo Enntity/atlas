@@ -7,7 +7,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::PagedKvCache;
 
-use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState};
+use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState, MultiSeg};
 
 mod default_loops;
 
@@ -446,6 +446,23 @@ pub trait TransformerLayer: Send + Sync {
     /// `kv_write_start`: number of tokens whose KV cache entries are already
     /// populated (prefix caching). Attention layers skip KV writes for
     /// positions `< kv_write_start`. SSM layers ignore this (recurrent).
+    /// One prefill pass over several sequences' rows (`ATLAS_QWEN4EXP_PREFILL_MULTI`):
+    /// `segs` lie back to back in `hidden` (`total` rows). The row-wise work
+    /// runs once over every row, the per-sequence work (recurrences, PLE,
+    /// attention) per segment, each row's bytes those of its own sequence's
+    /// single-sequence row-invariant prefill. Default: unsupported.
+    fn prefill_multi(
+        &self,
+        _hidden: DevicePtr,
+        _total: usize,
+        _segs: &mut [MultiSeg<'_, '_>],
+        _kv_cache: &mut PagedKvCache,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("this layer has no multi-sequence prefill")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,
