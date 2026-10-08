@@ -340,10 +340,12 @@ pub fn step_mtp(
         }
         ladder_truncate(a, &mut drafts, ladder_nd);
         // A window only the batched verify serves (qwen4_exp's exact lane
-        // past 4 rows) that lands here (grammar) takes the 4-row verify.
+        // past 4 rows) that lands here (grammar) takes the 4-row verify; so
+        // does a grammar sequence's deep window (`ladder_truncate` leaves it
+        // whole), whichever widths the model batches.
         if !dflash_verify_raw_argmax
             && drafts.len() > 3
-            && model.can_batch_verify(&[drafts.len() + 1])
+            && ((deep && a.grammar_state.is_some()) || model.can_batch_verify(&[drafts.len() + 1]))
         {
             drafts.truncate(3);
         }

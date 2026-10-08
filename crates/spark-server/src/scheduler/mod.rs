@@ -663,7 +663,7 @@ pub fn run(
         // ── Start new requests ──
         let t_loop = std::time::Instant::now();
         let prefill_queue_was_empty = prefilling.is_empty();
-        let admitted = new_reqs.len();
+        let in_flight_before = active.len() + prefilling.len();
         start_new_requests(
             &*model,
             &sched,
@@ -690,12 +690,13 @@ pub fn run(
         // them before this tick's decode (`prefill_burst`; off by default). ──
         if burst.enabled() {
             let (pending_n, pending_tokens) = prefill_burst::pending_load(&pending);
+            let in_flight = active.len() + prefilling.len();
             let view = prefill_burst::TickView {
-                admitted,
+                admitted: in_flight.saturating_sub(in_flight_before),
                 pending: pending_n,
                 pending_tokens,
                 prefilling: prefilling.len(),
-                in_flight: active.len() + prefilling.len(),
+                in_flight,
                 max_batch: max_batch_size,
             };
             if burst.hold(Instant::now(), &view) {

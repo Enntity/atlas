@@ -39,7 +39,9 @@ impl Default for EosBan {
 impl EosBan {
     /// The ban for a request's `min_tokens` floor. A sequence without end
     /// tokens (`ignore_eos`) has nothing to ban: no floor, so no verify head
-    /// or drafter excludes the model's end tokens.
+    /// or drafter excludes the model's end tokens. `min_tokens` is the
+    /// request's, unvalidated: the floor saturates (a floor past any position
+    /// bans every row, as the request asks).
     pub fn new(prompt_len: usize, min_tokens: usize, eos_tokens: &[u32]) -> Self {
         let mut ids = [u32::MAX; 4];
         for (slot, &id) in ids.iter_mut().zip(eos_tokens) {
@@ -49,7 +51,7 @@ impl EosBan {
             floor: if min_tokens == 0 || eos_tokens.is_empty() {
                 0
             } else {
-                prompt_len + min_tokens
+                prompt_len.saturating_add(min_tokens)
             },
             ids,
             target: false,
@@ -153,14 +155,20 @@ impl EosBan {
     /// Leading draft depths (depth `d` drafts position `anchor_pos + d`) that
     /// may not be an end token: those below `floor` (0 = no min_tokens).
     pub fn banned_draft_depth(floor: usize, anchor_pos: usize, max_depth: usize) -> u32 {
-        floor.saturating_sub(anchor_pos + 1).min(max_depth) as u32
+        floor
+            .saturating_sub(anchor_pos.saturating_add(1))
+            .min(max_depth) as u32
     }
 
     /// Bit `j` is set when verify row `j` of a pass whose first input sits at
     /// `base_pos` predicts a position below the floor (row `j` predicts
     /// `base_pos + j + 1`). `rows` is at most 64.
     pub fn row_mask(&self, base_pos: usize, rows: usize) -> u64 {
-        let banned = self.floor.saturating_sub(base_pos + 1).min(rows).min(64);
+        let banned = self
+            .floor
+            .saturating_sub(base_pos.saturating_add(1))
+            .min(rows)
+            .min(64);
         if banned == 64 {
             u64::MAX
         } else {
@@ -216,6 +224,20 @@ mod eos_ban_tests {
         let none = EosBan::targeted(100, 0, &[7, 9], &[]);
         assert_eq!((none.floor, none.target), (0, false));
         assert!(!EosBan::new(100, 10, &[7]).target);
+    }
+
+    #[test]
+    fn an_unbounded_min_tokens_saturates_the_floor() {
+        // `min_tokens` reaches here unvalidated; `prompt_len + min_tokens`
+        // wrapped in release to a floor below the prompt (no ban at all).
+        let ban = EosBan::new(100, usize::MAX, &[7]);
+        assert_eq!(ban.floor, usize::MAX);
+        assert_eq!(ban.row_mask(usize::MAX - 1, 8), 0);
+        assert_eq!(ban.row_mask(1 << 40, 64), u64::MAX);
+        assert_eq!(EosBan::banned_draft_depth(ban.floor, usize::MAX, 7), 0);
+        assert_eq!(EosBan::banned_draft_depth(ban.floor, 1 << 40, 7), 7);
+        let t = EosBan::targeted(100, usize::MAX, &[7, 9], &[]);
+        assert_eq!((t.floor, t.target), (usize::MAX, true));
     }
 
     #[test]
