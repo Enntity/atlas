@@ -203,8 +203,7 @@ fn a_latent_shard_places_its_local_slot_pools() {
         };
         let placement = KvPlacement::plan_ordered(&sizes, 64 * MIB, CarveoutOrder::Size);
         let mut cache =
-            PagedKvCache::new_latent_sharded_placed(glm(3).0, 101, &gpu, spec, placement)
-                .unwrap();
+            PagedKvCache::new_latent_sharded_placed(glm(3).0, 101, &gpu, spec, placement).unwrap();
         cache.attach_sparse_index(index, &gpu).unwrap();
         let mut listed: Vec<usize> = sizes.iter().map(|&(_, n)| n).filter(|&n| n > 0).collect();
         let mut allocated = gpu.carveout_alloc_sizes();
