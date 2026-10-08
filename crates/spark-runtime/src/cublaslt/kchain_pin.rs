@@ -158,6 +158,31 @@ pub fn bf16_gemm_act_weight_t_kchain(
     )
 }
 
+/// [`bf16_gemm_act_weight_t_kchain`] without the `ATLAS_LT_KCHAIN_PIN`
+/// switch: the row-invariant qwen4_exp prefill (`ATLAS_QWEN4EXP_PREFILL_ROWINV`)
+/// runs every BF16 projection on an in-order k-chain, here or (`Ok(false)`)
+/// on the tile kernel.
+pub fn bf16_gemm_act_weight_t_kchain_any(
+    act: u64,
+    weight: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> anyhow::Result<bool> {
+    if super::version() < 130000 || !super::available() {
+        return Ok(false);
+    }
+    super::gemm_bf16::gemm_bf16_pick(
+        act,
+        weight,
+        out,
+        [m, n, k],
+        super::CUBLAS_OP_T,
+        Pick::Force,
+        stream,
+    )
+}
+
 /// The pin's index among `found` heuristic results packed at `RESULT_BYTES`
 /// in `results`.
 fn pick(results: &[u8], found: usize) -> usize {

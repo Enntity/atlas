@@ -218,6 +218,8 @@ pub mod qwen4exp_prefill;
 pub mod qwen4exp_prefill_hc;
 #[path = "ops/qwen4exp_prefill_seam.rs"]
 pub mod qwen4exp_prefill_seam;
+#[path = "ops/qwen4exp_rowinv.rs"]
+pub mod qwen4exp_rowinv;
 #[path = "ops/qwen4exp_wide_rows.rs"]
 mod qwen4exp_wide_rows;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.

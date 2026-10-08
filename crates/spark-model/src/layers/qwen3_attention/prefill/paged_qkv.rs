@@ -316,7 +316,8 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else if let Some(fp8p) = fp8 {
-            if n > 128 {
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV: one arm at every width.
+            if n > 128 || crate::layers::ops::qwen4exp_rowinv::active() {
                 ops::fp8_gemm_n128_m128(
                     ctx.gpu,
                     self.fp8_gemm_t_m128_k,

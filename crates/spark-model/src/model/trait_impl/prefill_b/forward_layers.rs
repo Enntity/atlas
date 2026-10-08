@@ -148,7 +148,9 @@ impl TransformerModel {
             graph_capture: false,
             // Marconi warm hit: GDN layers replay from a restored SSM state
             // and must use the bit-faithful WY4 recurrence (see layer.rs).
-            gdn_exact_replay: marconi_skip,
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV keeps the chunked scan: a restore
+            // sits on its 64-token grid, so the replay is the cold pass's.
+            gdn_exact_replay: marconi_skip && !crate::layers::ops::qwen4exp_rowinv::on(),
             // Hash-MoE: this chunk's token IDs (uploaded in prefill_b_embed_chunk
             // to the stable buffer, in chunk order matching the MoE loop).
             token_ids: Some(self.buffers.token_ids().offset(skip * 4)),
@@ -163,7 +165,15 @@ impl TransformerModel {
         // instead of the prefill path. Decode uses GEMV kernels optimized for M=1
         // and the decode MoE path, which is ~7x faster per layer than the prefill
         // GEMM path for a single token (0.7ms/layer vs 5ms/layer).
-        let use_decode_path = proc_count == 1 && effective_seq_len_start > 0;
+        // ATLAS_QWEN4EXP_PREFILL_ROWINV: one row is a prefill pass like any other.
+        let rowinv = crate::layers::ops::qwen4exp_rowinv::on();
+        let use_decode_path = proc_count == 1 && effective_seq_len_start > 0 && !rowinv;
+        let _rowinv = (!use_decode_path)
+            .then(|| {
+                crate::layers::ops::qwen4exp_rowinv::check_pass_start(effective_seq_len_start);
+                crate::layers::ops::qwen4exp_rowinv::enter(self.gpu.as_ref())
+            })
+            .flatten();
         // Marconi warm hit: this pass replays SSM state over [snap_tok,
         // matched) — positions whose K/V already live in shared prefix-cache
         // blocks. Pass the per-chunk count of those replay tokens as the

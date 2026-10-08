@@ -705,7 +705,10 @@ impl Qwen3AttentionLayer {
         let glm_paged = self.glm_paged_prefill(ctx);
         // ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE: the o_proj may reduce-scatter.
         let rs_offer = sp.map(|_| crate::layers::qwen4exp_sp_pipe::RsOffer::new());
-        let attn_out = if seq_len_start == 0 && !glm_paged {
+        // ATLAS_QWEN4EXP_PREFILL_ROWINV: the paged path from the first chunk
+        // on, so a row attends through the same kernels in any chunk.
+        let rowinv = crate::layers::ops::qwen4exp_rowinv::active();
+        let attn_out = if seq_len_start == 0 && !glm_paged && !rowinv {
             self.prefill_attention_with_cache_skip(
                 state,
                 normed,
