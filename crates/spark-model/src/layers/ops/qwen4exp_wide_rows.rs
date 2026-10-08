@@ -30,6 +30,10 @@
 //! 2.69 ms, GDN qkvz 278 -> 190 us, out_proj 120 -> 83 us
 //! (`scripts/dev/qwen4exp_rows32_tile_bench.cu`). Rank-local: the bytes do
 //! not change.
+//!
+//! `ATLAS_QWEN4EXP_W4_ROWS_WIDE=1` serves the NVFP4 rows past 8 with one
+//! `qwen4exp_w4_rows_wide` launch (`ops::Qwen4ExpW4Wide`) instead of 16-row
+//! `w4a16_gemv_batch16` chunks: same bytes, 2.7-3.2x at 24..36 rows.
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -67,6 +71,8 @@ pub struct Qwen4ExpWideRows {
     bf16_tile: KernelHandle,
     qg: [KernelHandle; 2],
     w4a16_16: KernelHandle,
+    /// `ATLAS_QWEN4EXP_W4_ROWS_WIDE`: the one-launch NVFP4 tier past 8 rows.
+    w4_wide: super::Qwen4ExpW4Wide,
 }
 
 /// The next launch over `remaining` rows: its row count and the wide tier
@@ -89,6 +95,7 @@ impl Qwen4ExpWideRows {
         bf16_tile: KernelHandle(0),
         qg: [KernelHandle(0); 2],
         w4a16_16: KernelHandle(0),
+        w4_wide: super::Qwen4ExpW4Wide::OFF,
     };
 
     pub fn resolve(gpu: &dyn GpuBackend, model_type: &str) -> Self {
@@ -112,6 +119,7 @@ impl Qwen4ExpWideRows {
                 try_kernel(gpu, "qwen4exp_wide_rows", "qwen4exp_qg_rows32"),
             ],
             w4a16_16: try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
+            w4_wide: super::Qwen4ExpW4Wide::resolve(gpu),
         }
     }
 
@@ -224,10 +232,18 @@ impl Qwen4ExpWideRows {
             .launch(stream)
     }
 
+    /// Whether [`Self::w4a16_rows`] takes `m` rows of a `k`-wide NVFP4
+    /// weight in one `qwen4exp_w4_rows_wide` launch.
+    pub fn w4_wide_serves(&self, m: u32, k: u32) -> bool {
+        self.w4_wide.serves(m, k)
+    }
+
     /// `rows` rows of `input` (`[rows, k]`) through the NVFP4 `w` into
-    /// `output` (`[rows, n]`), each row `w4a16_gemv`'s bytes: 16-row
-    /// `w4a16_gemv_batch16` launches past [`WIDE_MIN_ROWS`] rows, the
-    /// narrow scalar tiers (8, else 4 rows a launch) otherwise.
+    /// `output` (`[rows, n]`), each row `w4a16_gemv`'s bytes: one
+    /// `qwen4exp_w4_rows_wide` launch (up to 64 rows) past [`WIDE_MIN_ROWS`]
+    /// rows when `ATLAS_QWEN4EXP_W4_ROWS_WIDE` is on, else 16-row
+    /// `w4a16_gemv_batch16` launches there; the narrow scalar tiers (8,
+    /// else 4 rows a launch) otherwise.
     #[allow(clippy::too_many_arguments)]
     pub fn w4a16_rows(
         &self,
@@ -244,22 +260,21 @@ impl Qwen4ExpWideRows {
         let present = [self.w4a16_16.0 != 0, false];
         let mut first = 0u32;
         while first < rows {
+            let (a, c) = (
+                input.offset(first as usize * k as usize * 2),
+                output.offset(first as usize * n as usize * 2),
+            );
+            let wide = (rows - first).min(super::W4_WIDE_MAX_ROWS);
+            if wide > WIDE_MIN_ROWS && self.w4_wide.try_launch(gpu, a, w, c, (wide, n, k), stream) {
+                first += wide;
+                continue;
+            }
             let (m, tier) = next_chunk(rows - first, present, narrow_cap);
             let kernel = match tier {
                 Some(_) => self.w4a16_16,
                 None => narrow.scalar_kernel(m),
             };
-            super::w4a16_gemv_batchm(
-                gpu,
-                kernel,
-                input.offset(first as usize * k as usize * 2),
-                w,
-                output.offset(first as usize * n as usize * 2),
-                m,
-                n,
-                k,
-                stream,
-            )?;
+            super::w4a16_gemv_batchm(gpu, kernel, a, w, c, m, n, k, stream)?;
             first += m;
         }
         Ok(())
