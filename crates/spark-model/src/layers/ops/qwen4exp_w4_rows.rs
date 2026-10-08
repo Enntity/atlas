@@ -29,6 +29,19 @@ const MIN_ROWS: u32 = 4;
 const MAX_ROWS: u32 = 8;
 /// Threads a CTA (4 output groups of 64 lanes).
 const THREADS: u32 = 256;
+/// Outputs a tile (4 a thread x 4 output groups).
+const NPB: u32 = 16;
+/// The kernel's lane steps: K/16 <= 2 x 128 chunks.
+const LANE_STEPS: u32 = 2;
+/// GB10's largest dynamic shared memory a CTA may opt into.
+const MAX_SMEM: u32 = 99 * 1024;
+
+/// Dynamic shared memory of `qwen4exp_w4_rows{m}` (all of its shared memory;
+/// the launcher opts in past 48 KB from this size): the m rows staged for
+/// the whole K, the two reduction buffers, the E2M1 LUT.
+pub(crate) fn w4_rows_smem(m: u32) -> u32 {
+    m * LANE_STEPS * 4096 + (2 * m * NPB * 2 + 16) * 4
+}
 
 /// `ATLAS_QWEN4EXP_W4_ROWS=1`, read once.
 pub fn w4_rows_requested() -> bool {
@@ -75,6 +88,13 @@ impl Qwen4ExpW4Rows {
             && self.sms > 0
             && k.is_multiple_of(32)
             && k <= 4096
+            && !self.failed()
+    }
+
+    /// A launch of the tier failed once: every later call takes the narrow
+    /// kernels (the caller's fallback), so a bad launch never fails a step.
+    fn failed(&self) -> bool {
+        FAILED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// `m` rows of `input` (`[m, k]`) through the NVFP4 `w` into `output`
@@ -90,8 +110,11 @@ impl Qwen4ExpW4Rows {
         stream: u64,
     ) -> Result<()> {
         anyhow::ensure!(self.serves(m, k), "qwen4exp_w4_rows: {m} rows, k={k}");
-        // The M rows staged for the whole K: M x lane steps x 4 KiB.
-        let smem = m * div_ceil(k / 16, 128) * 4096;
+        let smem = w4_rows_smem(m);
+        anyhow::ensure!(
+            smem <= MAX_SMEM,
+            "qwen4exp_w4_rows{m}: {smem} B of shared memory"
+        );
         KernelLaunch::new(gpu, self.rows[m as usize])
             .grid([self.sms.min(div_ceil(n, 16)), 1, 1])
             .block([THREADS, 1, 1])
@@ -104,5 +127,61 @@ impl Qwen4ExpW4Rows {
             .arg_u32(n)
             .arg_u32(k)
             .launch(stream)
+    }
+
+    /// [`Self::launch`] when [`Self::serves`], else `fallback`; a failed
+    /// launch logs once, retires the tier for the process and runs
+    /// `fallback` (the narrow kernels: the same bytes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_or(
+        &self,
+        gpu: &dyn GpuBackend,
+        input: DevicePtr,
+        w: &QuantizedWeight,
+        output: DevicePtr,
+        (m, n, k): (u32, u32, u32),
+        stream: u64,
+        fallback: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if !self.serves(m, k) {
+            return fallback();
+        }
+        match self.launch(gpu, input, w, output, (m, n, k), stream) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    "qwen4exp_w4_rows{m} launch failed ({e:#}); ATLAS_QWEN4EXP_W4_ROWS retired, \
+                     the draft head takes w4a16_gemv_batch{{M}} from here (same bytes)"
+                );
+                fallback()
+            }
+        }
+    }
+}
+
+/// Set by the first failed launch ([`Qwen4ExpW4Rows::launch_or`]).
+static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_ROWS, MAX_SMEM, MIN_ROWS, w4_rows_smem};
+
+    /// The 2026-10-08 pair failure: at M = 6 the rows were exactly 48 KB of
+    /// dynamic shared memory with static memory on top, so the launcher (which
+    /// opts in past 48 KB of DYNAMIC memory) did not opt in and the launch
+    /// overflowed the default limit. All of it is dynamic now; every tier must
+    /// fit the opt-in ceiling, and any size the launcher does not opt in for
+    /// is under the default limit by itself.
+    #[test]
+    fn every_tier_fits_shared_memory() {
+        for m in MIN_ROWS..=MAX_ROWS {
+            let smem = w4_rows_smem(m);
+            assert!(smem <= MAX_SMEM, "M={m}: {smem} B");
+            assert!(smem != 48 * 1024, "M={m}: exactly at the opt-in threshold");
+        }
+        assert_eq!(w4_rows_smem(6), 6 * 2 * 4096 + (2 * 6 * 16 * 2 + 16) * 4);
+        assert!(w4_rows_smem(6) > 48 * 1024, "M=6 takes the opt-in");
+        assert!(w4_rows_smem(5) < 48 * 1024);
     }
 }
