@@ -261,7 +261,8 @@ pub fn slab_done(rows_done: usize, stream: u64) -> Result<()> {
         return Ok(());
     };
     // SAFETY: `ACTIVE` points at the `Gather` whose `during` is on this
-    // thread's stack: set on entry to `during`, cleared before it returns.
+    // thread's stack: set on entry to `during`, cleared when it returns or
+    // unwinds (its drop guard).
     // The pointer never leaves the thread, and `progress` takes `&self`.
     let g = unsafe { &*(g as *const Gather<'_>) };
     g.progress(rows_done, stream)
@@ -274,10 +275,16 @@ impl Gather<'_> {
             ACTIVE.with(Cell::get).is_none(),
             "qwen4exp SP pipe: a gather is already running"
         );
+        /// Clears `ACTIVE` when `during` leaves, a panic in `collapse` included.
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                ACTIVE.with(|c| c.set(None));
+            }
+        }
         ACTIVE.with(|c| c.set(Some(self as *const Gather<'_> as *const ())));
-        let out = collapse();
-        ACTIVE.with(|c| c.set(None));
-        out
+        let _clear = Clear;
+        collapse()
     }
 
     /// Local rows `[0, rows_done)` are set on `stream`: copy them in (when
