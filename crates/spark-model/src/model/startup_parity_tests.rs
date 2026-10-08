@@ -310,6 +310,10 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_QWEN4EXP_BATCH_FAST_CHECK",
         "ATLAS_QWEN4EXP_BATCH_FAST_BISECT",
         "ATLAS_STARTUP_PARITY=warn",
+        "ATLAS_MOE_PREFILL_FP8_DOWN",
+        "ATLAS_MOE_GROUPED_CUTLASS/_HOLO_MOE_GROUPED_CUTLASS",
+        "ATLAS_PROFILE_FIRST",
+        "ATLAS_QWEN4EXP_PREFILL_HOST_IDS",
     ] {
         assert_eq!(
             names.iter().filter(|&&n| n == required).count(),

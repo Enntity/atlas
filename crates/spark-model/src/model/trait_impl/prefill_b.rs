@@ -29,7 +29,7 @@ mod batch_kernel;
 #[cfg(test)]
 mod batch_kernel_tests;
 mod batched_layer;
-mod embed_chunk;
+pub(in crate::model) mod embed_chunk;
 mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;

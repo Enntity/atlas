@@ -168,6 +168,7 @@ mod forward_prefill_phase;
 mod forward_prefill_q38;
 mod forward_prefill_route;
 mod forward_prefill_routed;
+pub(crate) use forward_prefill_routed::{grouped_cutlass_gate_up_enabled, prefill_fp8_down};
 mod forward_prefill_router;
 mod forward_rows;
 mod forward_token_major;
