@@ -163,6 +163,7 @@ int main(int argc, char** argv) {
     if (mode == "probe") { probe(pool); return 0; }
     if (mode == "check") return run_check(pool);
     if (mode == "tc-units-check") return run_tc_check(pool);
+    if (mode == "tc-ident") return run_tc_ident(pool);
     run_time(pool, argc > 3 ? argv[3] : "");
     return 0;
 }
