@@ -22,7 +22,9 @@
 use super::*;
 use std::collections::VecDeque;
 
-/// Everything the commit rule and the pick pipeline write, captured whole.
+/// Everything the commit rule and the pick pipeline write, captured whole:
+/// the `<think>` state, and the tool-call state ([`tool_state`]) the pick
+/// stages read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::scheduler) struct ThinkState {
     inside_thinking: bool,
@@ -43,6 +45,12 @@ pub(in crate::scheduler) struct ThinkState {
     guard_stop: Option<&'static str>,
     require_tool_call: bool,
     tool_call_opened: bool,
+    tool_call_completed: bool,
+    inside_tool_body: bool,
+    tool_body_streak_tokens: u32,
+    inside_parameter_body: bool,
+    param_body_chars_emitted: u32,
+    param_close_pending: u8,
 }
 
 impl ThinkState {
@@ -66,6 +74,12 @@ impl ThinkState {
             guard_stop: a.guard_stop,
             require_tool_call: a.require_tool_call,
             tool_call_opened: a.tool_call_opened,
+            tool_call_completed: a.tool_call_completed,
+            inside_tool_body: a.inside_tool_body,
+            tool_body_streak_tokens: a.tool_body_streak_tokens,
+            inside_parameter_body: a.inside_parameter_body,
+            param_body_chars_emitted: a.param_body_chars_emitted,
+            param_close_pending: a.param_close_pending,
         }
     }
 
@@ -99,6 +113,12 @@ impl ThinkState {
         a.guard_stop = self.guard_stop;
         a.require_tool_call = self.require_tool_call;
         a.tool_call_opened = self.tool_call_opened;
+        a.tool_call_completed = self.tool_call_completed;
+        a.inside_tool_body = self.inside_tool_body;
+        a.tool_body_streak_tokens = self.tool_body_streak_tokens;
+        a.inside_parameter_body = self.inside_parameter_body;
+        a.param_body_chars_emitted = self.param_body_chars_emitted;
+        a.param_close_pending = self.param_close_pending;
     }
 }
 
@@ -153,53 +173,52 @@ pub(in crate::scheduler) struct SpanShadow {
     state: ThinkState,
     output_len: usize,
     env: CommitEnv,
+    /// `seq_len` with every row of the span written.
+    span_end: usize,
+    rows: usize,
 }
 
 impl SpanShadow {
-    /// Start a span: capture the sequence and forget any earlier span's picks.
-    pub(in crate::scheduler) fn begin(a: &mut ActiveSeq, env: CommitEnv) -> Self {
+    /// Start a span of `rows` rows (all in the cache): capture the sequence
+    /// and forget any earlier span's picks.
+    pub(in crate::scheduler) fn begin(a: &mut ActiveSeq, env: CommitEnv, rows: usize) -> Self {
         PickEffects::clear(a);
         Self {
             state: ThinkState::of(a),
             output_len: a.output_tokens.len(),
             env: CommitEnv { quiet: true, ..env },
+            span_end: a.seq.seq_len,
+            rows,
         }
     }
 
-    /// Record the pipeline effects of the pick just made, then commit it so
-    /// the next position sees the state serial decode would. Returns false
-    /// when the grammar refused the pick (speculation stops there; the commit
-    /// path decides what the refusal means). The grammar matcher's advances
-    /// are the caller's to roll back.
-    pub(in crate::scheduler) fn pick(&self, a: &mut ActiveSeq, tok: u32, last: bool) -> bool {
+    /// Record the pipeline effects of row `row`'s pick, then commit it so the
+    /// next row sees the state serial decode would, the ceilings checked at
+    /// the row's own position ([`span_row_position`]). Returns false when the
+    /// grammar refused the pick (speculation stops there; the commit path
+    /// decides what the refusal means). The grammar matcher's advances are
+    /// the caller's to roll back.
+    pub(in crate::scheduler) fn pick(&self, a: &mut ActiveSeq, tok: u32, row: usize) -> bool {
         PickEffects::record(a, tok);
-        if last || a.finished {
+        if row + 1 >= self.rows || a.finished {
             return true;
         }
         let env = &self.env;
+        let position = span_row_position(self.span_end, self.rows, row);
         if hard_stop(a, tok, env) {
             return true;
         }
-        crate::scheduler::first_token_thinking::apply_native_tool_boundary(
-            a,
-            tok,
-            env.limits.glm_tool_boundary,
-        );
+        crate::scheduler::first_token_thinking::apply_native_tool_boundary(a, tok, env);
         if think_gate(a, tok, env) {
             return true;
         }
         let thinking = a.inside_thinking;
+        tool_state(a, tok, env);
         if !thinking
             && let Some(gs) = a.grammar_state.as_mut()
             && !gs.accept_token(tok)
         {
             return false;
-        }
-        // The opener satisfies a required call (the end-token hold and the
-        // post-`</think>` pin read it).
-        if !thinking && a.require_tool_call && a.tool_call_start_token == Some(tok) {
-            a.require_tool_call = false;
-            a.tool_call_opened = true;
         }
         let prior = a.output_tokens.len();
         a.output_tokens.push(tok);
@@ -215,15 +234,17 @@ impl SpanShadow {
             a.consume_generation_budget();
             a.think_just_ended = false;
         }
-        match end_token(a, tok, prior, a.seq.seq_len, native_glm_eos, env) {
+        match end_token(a, tok, prior, position, native_glm_eos, env) {
             EndToken::Stop => a.finished = true,
+            // Emission returns here, and never at a ceiling (it always stops).
             EndToken::Suppressed => {
                 a.output_tokens.pop();
             }
-            EndToken::No => {}
-        }
-        if a.remaining == 0 {
-            a.finished = true;
+            EndToken::No => {
+                if hard_ceiling_hit(a.remaining, position, env.limits.max_seq_len) {
+                    a.finished = true;
+                }
+            }
         }
         true
     }

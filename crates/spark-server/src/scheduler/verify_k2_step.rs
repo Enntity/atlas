@@ -229,9 +229,9 @@ pub fn step_verify_k2(
         }
         sched.timing.record(Phase::Commit, t_commit);
 
-        emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
+        emit_span_row(a, drafts[0], verify_lps.first().cloned(), sched, 0, 2);
         if !a.finished {
-            emit_token(a, v1, verify_lps.get(1).cloned(), sched);
+            emit_span_row(a, v1, verify_lps.get(1).cloned(), sched, 1, 2);
         }
         if a.finished {
             return;
