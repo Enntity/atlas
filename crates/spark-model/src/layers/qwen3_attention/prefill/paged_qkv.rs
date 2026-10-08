@@ -14,6 +14,7 @@ use crate::layers::ops;
 
 /// Identifies which projection (Q/K/V) — selects the correct weight bank
 /// from `Qwen3AttentionLayer`.
+#[derive(Clone, Copy)]
 pub(super) enum Proj {
     Q,
     K,
@@ -181,6 +182,13 @@ impl Qwen3AttentionLayer {
             ),
         };
 
+        // ATLAS_QWEN4EXP_PREFILL_ROWINV: BF16 at decode's weight values, on
+        // the pass's row-invariant k-chain.
+        if crate::layers::ops::qwen4exp_rowinv::active()
+            && let Some(w) = self.rowinv_bf16[proj as usize]
+        {
+            return ops::bf16_gemm(normed, w.0, out, n, out_dim, h, stream);
+        }
         // Keep-packed Q2_0 (Tier-1c): transient-dequant to BF16 then dense GEMM.
         if let Some(r) = self.try_q2_prefill(ctx, weight_opt, normed, out, n, stream) {
             return r;

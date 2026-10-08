@@ -153,14 +153,16 @@ __device__ __forceinline__ float2 hcm_ld2(const float* p) {
 }
 
 // ── down + injection rows ────────────────────────────────────────────────
-template <unsigned NT>
+// WM (m16 weight tiles a CTA) and DN (normed ring depth) are launch
+// geometry: a row's chain and the K reduction order do not depend on them.
+template <unsigned NT, unsigned WM = HCM_DN_WM, unsigned DN = HCM_DN_DN>
 __device__ __forceinline__ void hcm_down(
     const float* __restrict__ normed, const __nv_bfloat16* __restrict__ down_w,
     const __nv_bfloat16* __restrict__ inject_w, float* __restrict__ low_out,
     float* __restrict__ inj_out, const unsigned K, const unsigned hc, const unsigned rank,
     const unsigned T, float* s_red, float* s_wk
 ) {
-    constexpr unsigned WM = HCM_DN_WM, WK = HCM_DN_WK, CL = HCM_DN_CL, U = HCM_DN_U, DN = HCM_DN_DN;
+    constexpr unsigned WK = HCM_DN_WK, CL = HCM_DN_CL, U = HCM_DN_U;
     constexpr unsigned E = WM * 16u * NT * 8u;  // CTA partial: [WM*16 rows][NT*8 tokens]
     static_assert(DN >= 1 && U % DN == 0, "normed ring must tile the weight ring");
 
@@ -311,7 +313,11 @@ __launch_bounds__(32 * HCM_DN_WM * HCM_DN_WK) hc_mma_down(
 }
 
 // ── up + gate + stream mean (hc == 4) ─────────────────────────────────────
-template <unsigned NT>
+// DIRECT: each warp builds its `low` B fragments from global memory at each
+// k-step instead of staging them all in shared memory first -- the same
+// values (the same load and split per fragment), so the same bytes; the
+// prefill rows twin takes it so a 64-row group needs no 80 KB of staging.
+template <unsigned NT, bool DIRECT = false>
 __device__ __forceinline__ void hcm_finish(
     const float* __restrict__ normed, const float* __restrict__ low,
     const __nv_bfloat16* __restrict__ up_w, __nv_bfloat16* __restrict__ y_out,
@@ -339,17 +345,21 @@ __device__ __forceinline__ void hcm_finish(
     // hi(r2,r3), lo(r0,r1), lo(r2,r3)} of token nt*8 + lane/4, rank rows
     // r = 16 ks + 4 (lane % 4) + 0..3.
     uint4* s_b = reinterpret_cast<uint4*>(smem);
-    const unsigned nb = (rank / 16u) * NT * 32u;
-    for (unsigned i = threadIdx.x; i < nb; i += blockDim.x) {
-        const unsigned l = i & 31u, nt = (i >> 5) % NT, ks = (i >> 5) / NT;
+    auto frag = [&](unsigned ks, unsigned nt, unsigned l) {
         const unsigned t = min(nt * 8u + (l >> 2), T - 1u);
         const float4 f = hcm_ld4(low + (size_t)t * rank + 16u * ks + 4u * (l & 3u));
         uint4 b;
         hcm_split(f.x, f.y, b.x, b.z);
         hcm_split(f.z, f.w, b.y, b.w);
-        s_b[i] = b;
+        return b;
+    };
+    if constexpr (!DIRECT) {
+        const unsigned nb = (rank / 16u) * NT * 32u;
+        for (unsigned i = threadIdx.x; i < nb; i += blockDim.x) {
+            s_b[i] = frag((i >> 5) / NT, (i >> 5) % NT, i & 31u);
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     float ah[MT][NT][4], al[MT][NT][4];
     #pragma unroll
@@ -373,7 +383,8 @@ __device__ __forceinline__ void hcm_finish(
         }
         uint4 b[NT];
         #pragma unroll
-        for (unsigned nt = 0; nt < NT; ++nt) b[nt] = s_b[((ks0 + k) * NT + nt) * 32u + lane];
+        for (unsigned nt = 0; nt < NT; ++nt)
+            b[nt] = DIRECT ? frag(ks0 + k, nt, lane) : s_b[((ks0 + k) * NT + nt) * 32u + lane];
         #pragma unroll
         for (unsigned j = 0; j < MT; ++j) {
             const unsigned a[4] = {__byte_perm(w[0][j], w[1][j], 0x5410), __byte_perm(w[0][j], w[1][j], 0x7632),
@@ -495,4 +506,81 @@ extern "C" __global__ void __launch_bounds__(128 * HCM_FN_WK) hc_mma_finish(
     case 3: hcm_finish<3>(normed, low, up_w, y_out, hidden_size, rank, T, hcm_smem); break;
     default: hcm_finish<4>(normed, low, up_w, y_out, hidden_size, rank, T, hcm_smem); break;
     }
+}
+
+// ── prefill rows (ATLAS_QWEN4EXP_PREFILL_ROWINV) ──────────────────────────
+// The two kernels above over any number of rows, so a prefill collapse is
+// byte for byte the decode collapse of each of its rows: groups of rows on
+// blockIdx.z, each the same per-row operation sequence (a row is its own mma
+// column; WM, DN and the group size are launch geometry only). Wider CTAs
+// (7 weight tiles: `normed` read by 3 CTAs, not 7) and wider groups (96 rows
+// down, 64 finish) keep the weight re-reads down at prefill widths.
+#define HCM_ROWS_WM 7u
+#define HCM_ROWS_DN_T 96u
+#define HCM_ROWS_FN_T 64u
+
+// Grid (ceil(ceil(rows / 16) / HCM_ROWS_WM), HCM_DN_CL, ceil(T / 96)),
+// block 32 * HCM_ROWS_WM * HCM_DN_WK.
+extern "C" __global__ void __cluster_dims__(1, HCM_DN_CL, 1)
+__launch_bounds__(32 * HCM_ROWS_WM * HCM_DN_WK) hc_mma_down_rows(
+    const float* __restrict__ normed, const __nv_bfloat16* __restrict__ down_w,
+    const __nv_bfloat16* __restrict__ inject_w, float* __restrict__ low_out,
+    float* __restrict__ inj_out, const unsigned hidden_size, const unsigned hc,
+    const unsigned rank, const unsigned T
+) {
+    atlas_pdl_enter();
+    __shared__ float s_red[HCM_ROWS_WM * 16u * HCM_ROWS_DN_T];
+    __shared__ float s_wk[HCM_DN_WK > 1 ? (HCM_DN_WK - 1) * HCM_ROWS_WM * 16u * HCM_ROWS_DN_T : 1];
+    const unsigned K = hc * hidden_size;
+    const unsigned g0 = blockIdx.z * HCM_ROWS_DN_T;
+    const unsigned Tg = min(HCM_ROWS_DN_T, T - g0);
+    normed += (size_t)g0 * K;
+    low_out += (size_t)g0 * rank;
+    if (inj_out != nullptr) inj_out += (size_t)g0 * hc;
+#define HCM_DOWN_R(NT_, DN_) \
+    hcm_down<NT_, HCM_ROWS_WM, DN_>(normed, down_w, inject_w, low_out, inj_out, K, hc, rank, Tg, s_red, s_wk)
+    switch ((Tg + 7u) / 8u) {
+    case 1: HCM_DOWN_R(1, 2); break;
+    case 2: HCM_DOWN_R(2, 2); break;
+    case 3: HCM_DOWN_R(3, 2); break;
+    case 4: HCM_DOWN_R(4, 2); break;
+    case 5: HCM_DOWN_R(5, 2); break;
+    case 6: HCM_DOWN_R(6, 2); break;
+    case 7: HCM_DOWN_R(7, 2); break;
+    case 8: HCM_DOWN_R(8, 2); break;
+    case 9: HCM_DOWN_R(9, 1); break;
+    case 10: HCM_DOWN_R(10, 1); break;
+    case 11: HCM_DOWN_R(11, 1); break;
+    default: HCM_DOWN_R(12, 1); break;
+    }
+#undef HCM_DOWN_R
+}
+
+// Grid (H / HCM_FN_DW, 1, ceil(T / 64)), block 128 * HCM_FN_WK. Dynamic
+// shared: the stream-mean tile, 4 * 8 * ceil(min(T, 64) / 8) * HCM_FN_DW * 4
+// bytes (HCM_FN_WK == 1: no K-split partials).
+extern "C" __global__ void __launch_bounds__(128 * HCM_FN_WK) hc_mma_finish_rows(
+    const float* __restrict__ normed, const float* __restrict__ low,
+    const __nv_bfloat16* __restrict__ up_w, __nv_bfloat16* __restrict__ y_out,
+    const unsigned hidden_size, const unsigned rank, const unsigned T
+) {
+    atlas_pdl_enter();
+    extern __shared__ __align__(16) unsigned char hcm_smem[];
+    const unsigned g0 = blockIdx.z * HCM_ROWS_FN_T;
+    const unsigned Tg = min(HCM_ROWS_FN_T, T - g0);
+    normed += (size_t)g0 * 4u * hidden_size;
+    low += (size_t)g0 * rank;
+    y_out += (size_t)g0 * hidden_size;
+#define HCM_FIN_R(NT_) hcm_finish<NT_, true>(normed, low, up_w, y_out, hidden_size, rank, Tg, hcm_smem)
+    switch ((Tg + 7u) / 8u) {
+    case 1: HCM_FIN_R(1); break;
+    case 2: HCM_FIN_R(2); break;
+    case 3: HCM_FIN_R(3); break;
+    case 4: HCM_FIN_R(4); break;
+    case 5: HCM_FIN_R(5); break;
+    case 6: HCM_FIN_R(6); break;
+    case 7: HCM_FIN_R(7); break;
+    default: HCM_FIN_R(8); break;
+    }
+#undef HCM_FIN_R
 }
