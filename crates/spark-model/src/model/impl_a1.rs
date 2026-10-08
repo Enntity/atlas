@@ -763,6 +763,7 @@ impl TransformerModel {
             warm,
             secondary_stream,
             secondary_event,
+            gdn_fuse: Default::default(),
             snapshot_event,
             comm,
             ep_cmd_buf,

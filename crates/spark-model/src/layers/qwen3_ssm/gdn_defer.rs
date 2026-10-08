@@ -123,6 +123,7 @@ impl Qwen3SsmLayer {
                 stage_gb: s.gdn_commit_gb,
                 row0: row0 as u32,
                 k: k as u32,
+                fuse_n: s.gdn_fuse_n,
             })
             .collect();
         let c = ctx.config;
