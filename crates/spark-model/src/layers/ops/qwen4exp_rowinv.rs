@@ -361,3 +361,21 @@ pub fn check_pass_start(start: usize) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::reference_rows;
+
+    #[test]
+    fn wide_shapes_take_the_k_chain_and_narrow_ones_a_fixed_configuration() {
+        // GDN in_proj at TP2 / TP1: the k-chain.
+        assert_eq!(reference_rows(8192, 2560), None);
+        assert_eq!(reference_rows(16384, 2560), None);
+        // mHC down / injection: the 512-row pick (the 64-row ones are not
+        // row-invariant).
+        assert_eq!(reference_rows(320, 10240), Some(512));
+        assert_eq!(reference_rows(4, 10240), Some(512));
+        // QSA indexer q/k: the slab's own pick.
+        assert_eq!(reference_rows(640, 2560), Some(2048));
+    }
+}
