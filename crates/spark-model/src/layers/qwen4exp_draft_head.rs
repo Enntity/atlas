@@ -48,6 +48,8 @@ pub struct DraftHead {
     /// The NVFP4 copy's multi-row tiers (`project_rows`): scalar
     /// `w4a16_gemv_batch{M}`, row `r` byte-identical to `w4a16_gemv`.
     w4a16_tiers: W4a16BatchmTiers,
+    /// `ATLAS_QWEN4EXP_W4_ROWS`: the persistent 4..8-row tier for the copy.
+    w4_rows: ops::Qwen4ExpW4Rows,
 }
 
 impl DraftHead {
@@ -152,6 +154,11 @@ impl DraftHead {
                 W4a16BatchmTiers::resolve(gpu)
             } else {
                 W4a16BatchmTiers::default()
+            },
+            w4_rows: if want_nvfp4 {
+                ops::Qwen4ExpW4Rows::resolve(gpu)
+            } else {
+                ops::Qwen4ExpW4Rows::OFF
             },
         })
     }
@@ -264,6 +271,14 @@ impl DraftHead {
             self.rows
         );
         match self.nvfp4.as_ref() {
+            Some(q) if self.w4_rows.serves(m, hidden) => self.w4_rows.launch(
+                gpu,
+                input,
+                &q.rows_from(first as usize, hidden as usize),
+                out,
+                (m, n, hidden),
+                stream,
+            ),
             Some(q) => ops::w4a16_gemv_batchm(
                 gpu,
                 self.w4a16_tiers.scalar_kernel(m),
