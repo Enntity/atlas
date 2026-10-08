@@ -11,7 +11,7 @@ pub(super) use cancel::retire_if_cancelled;
 pub(in crate::scheduler) use think_commit::should_suppress_post_think_eos;
 pub(in crate::scheduler) use think_commit::{
     CommitEnv, EndToken, PickEffects, SpanShadow, advance_thinking, end_token, hard_stop,
-    think_gate,
+    think_gate, tool_state,
 };
 
 #[cfg(test)]
@@ -32,6 +32,23 @@ pub fn emit_token(
     sched: &crate::scheduler::sched_ctx::SchedCtx,
 ) {
     emit_token_at_position(a, tok, logprobs, sched, a.seq.seq_len);
+}
+
+/// [`emit_token`] for row `row` of a verify span's committed prefix of `rows`
+/// rows, which ends at the current (post-rewind) `seq_len`: the end-token and
+/// context ceilings are checked at the row's own position
+/// ([`think_commit::span_row_position`], as serial decode and the verify
+/// replay check them), not at the prefix's end for every row.
+pub(super) fn emit_span_row(
+    a: &mut ActiveSeq,
+    tok: u32,
+    logprobs: Option<crate::api::TokenLogprobs>,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    row: usize,
+    rows: usize,
+) {
+    let position = think_commit::span_row_position(a.seq.seq_len, rows, row);
+    emit_token_at_position(a, tok, logprobs, sched, position);
 }
 
 /// Emit one already-verified row after its whole target prefix was committed.
@@ -62,38 +79,15 @@ pub(super) fn emit_token_at_position(
     if hard_stop(a, tok, &env) {
         return;
     }
-    first_token_thinking::apply_native_tool_boundary(a, tok, sched.limits.glm_tool_boundary);
+    first_token_thinking::apply_native_tool_boundary(a, tok, &env);
     if think_gate(a, tok, &env) {
         return;
     }
 
-    // Track <tool_call> token: once seen, legacy tool call requirement is satisfied.
-    // Guard with !inside_thinking — tool calls inside thinking are spurious.
-    if a.require_tool_call && a.tool_call_start_token == Some(tok) && !a.inside_thinking {
-        a.require_tool_call = false;
-        a.tool_call_opened = true;
-    }
-
-    // Tool-body / parameter-body state machine.
-    //
-    // SM1 (2026-05-26): extracted from inline-in-emit_token to the free
-    // function `update_tool_param_state` so the regular non-MTP decode
-    // path (`decode_logits_step.rs`) can call it too. Previously the
-    // state was ONLY updated when `emit_token` ran — which happens from
-    // spec/verify paths but NOT from `process_decode_logits`. With
-    // mtp=false (Qwen3.6 baseline), the state machine never ran and
-    // every dependent gate (A1 rep-penalty toggle, B1 margin detector)
-    // was silently dead code. (The pos-0 close-tag/AM1 logit-bias that
-    // also depended on this state was removed 2026-06-03; the state is
-    // still required for A1/B1 and the adadec_diag dump.)
-    update_tool_param_state(a, tok);
-
-    // Fix A (2026-06-05): mark a tool call complete on `</tool_call>` (outside
-    // thinking) so the EOS-escape gate can lift suppression. Inert unless
-    // `tool_eos_escape_enabled()` (default OFF).
-    if a.tool_call_end_token == Some(tok) && !a.inside_thinking {
-        a.tool_call_completed = true;
-    }
+    // The required-call opener, the tool-body / parameter-body state machine
+    // (SM1, also driven by `process_decode_logits`) and `</tool_call>`'s
+    // completion (Fix A): the commit rule's, which the verify replay runs too.
+    tool_state(a, tok, &env);
 
     // F2 mirror (Iter 46, 2026-06-02): reset the inter-tool prose budget when
     // a tool call opens on the MTP/emit path — parity with the non-MTP reset
@@ -634,7 +628,8 @@ fn advance_envelope_streak(inside_parameter_body: bool, streak: u32) -> (u32, bo
     }
 }
 
-pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
+/// `quiet`: the verify replay's, which must not log a cut the stream never sees.
+pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     if a.inside_thinking {
         return;
     }
@@ -664,10 +659,12 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32) {
         advance_envelope_streak(a.inside_parameter_body, a.tool_body_streak_tokens);
     a.tool_body_streak_tokens = streak;
     if exceeded {
-        tracing::warn!(
-            streak = a.tool_body_streak_tokens,
-            "Stuck in tool-call ENVELOPE for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call> (excludes parameter-value content); ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
-        );
+        if !quiet {
+            tracing::warn!(
+                streak = a.tool_body_streak_tokens,
+                "Stuck in tool-call ENVELOPE for {MAX_TOOL_BODY_TOKENS}+ tokens with no </tool_call> (excludes parameter-value content); ending response (model never closed the envelope — would otherwise burn to max_tokens). Sanitizer will salvage what it can."
+            );
+        }
         a.guard_stop = Some("tool_envelope_stuck");
         a.finished = true;
     }

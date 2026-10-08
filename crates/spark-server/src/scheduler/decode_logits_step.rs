@@ -371,7 +371,7 @@ pub fn process_decode_logits(
         if hard_stop(a, tok, &env) {
             continue;
         }
-        first_token_thinking::apply_native_tool_boundary(a, tok, sched.limits.glm_tool_boundary);
+        first_token_thinking::apply_native_tool_boundary(a, tok, &env);
         if think_gate(a, tok, &env) {
             continue;
         }
@@ -559,7 +559,7 @@ pub fn process_decode_logits(
             // excludes the stop sequence).
             EndToken::Stop => {
                 a.output_tokens.push(tok);
-                crate::scheduler::emit_step::update_tool_param_state(a, tok);
+                crate::scheduler::emit_step::update_tool_param_state(a, tok, false);
                 a.finished = true;
                 continue;
             }
@@ -573,7 +573,7 @@ pub fn process_decode_logits(
         // only spec/verify paths called this (via emit_token),
         // leaving every dependent gate (close-tag mask, AM1, B1,
         // A1) silently dead under `mtp=false`.
-        crate::scheduler::emit_step::update_tool_param_state(a, tok);
+        crate::scheduler::emit_step::update_tool_param_state(a, tok, false);
         // Phase-C: if this committed token is a content-phase
         // boundary token (sentence end / newline) and the model is
         // hybrid (attention + SSM), snapshot the recurrent SSM

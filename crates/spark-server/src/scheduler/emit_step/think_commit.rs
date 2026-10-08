@@ -24,6 +24,8 @@ pub(in crate::scheduler) use shadow::{PickEffects, SpanShadow};
 #[cfg(test)]
 mod exact_tests;
 #[cfg(test)]
+mod span_tests;
+#[cfg(test)]
 mod tests;
 
 /// The run-scoped inputs of the commit rule, read off either carrier.
@@ -123,6 +125,33 @@ pub(in crate::scheduler) fn think_gate(a: &mut ActiveSeq, tok: u32, env: &Commit
         a.think_skip_count = 0;
     }
     false
+}
+
+/// The tool-call bookkeeping of a token past [`think_gate`], outside `<think>`
+/// only (a tool tag inside reasoning is spurious): the opener satisfies a
+/// required call (the end-token hold and the post-`</think>` pin read it), the
+/// tool/parameter body state machine advances (DRY's tool-body zeroing, B1's
+/// margin stage, the opener-bias strip read it), and `</tool_call>` completes
+/// the call (the EOS-escape gate). Before the token is recorded.
+pub(in crate::scheduler) fn tool_state(a: &mut ActiveSeq, tok: u32, env: &CommitEnv) {
+    if a.inside_thinking {
+        return;
+    }
+    if a.require_tool_call && a.tool_call_start_token == Some(tok) {
+        a.require_tool_call = false;
+        a.tool_call_opened = true;
+    }
+    update_tool_param_state(a, tok, env.quiet);
+    if a.tool_call_end_token == Some(tok) {
+        a.tool_call_completed = true;
+    }
+}
+
+/// The KV position serial decode checks row `row` of a verify span at: the
+/// span's `rows` rows end at `span_end` (`seq_len` with all of them written),
+/// and row `row` is picked with its own input, the rows before it, cached.
+pub(in crate::scheduler) fn span_row_position(span_end: usize, rows: usize, row: usize) -> usize {
+    span_end.saturating_sub(rows) + row + 1
 }
 
 /// Close the thinking block: the model's `</think>` (`forced` = whether a

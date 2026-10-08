@@ -323,12 +323,12 @@ pub fn step_verify_k3(
             a.abort_on_engine_error(&e);
             return;
         }
-        emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
+        emit_span_row(a, drafts[0], verify_lps.first().cloned(), sched, 0, 3);
         if !a.finished {
-            emit_token(a, drafts[1], verify_lps.get(1).cloned(), sched);
+            emit_span_row(a, drafts[1], verify_lps.get(1).cloned(), sched, 1, 3);
         }
         if !a.finished {
-            emit_token(a, v2, verify_lps.get(2).cloned(), sched);
+            emit_span_row(a, v2, verify_lps.get(2).cloned(), sched, 2, 3);
         }
         if a.finished {
             return;
@@ -389,9 +389,9 @@ pub fn step_verify_k3(
             a.abort_on_engine_error(&e);
             return;
         }
-        emit_token(a, drafts[0], verify_lps.first().cloned(), sched);
+        emit_span_row(a, drafts[0], verify_lps.first().cloned(), sched, 0, 2);
         if !a.finished {
-            emit_token(a, v1, verify_lps.get(1).cloned(), sched);
+            emit_span_row(a, v1, verify_lps.get(1).cloned(), sched, 1, 2);
         }
         if a.finished {
             return;

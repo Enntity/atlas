@@ -96,12 +96,12 @@ pub(super) fn k4_apply_verdict(
             return;
         }
         for j in 0..nd {
-            emit_token(a, drafts[j], verify_lps.get(j).cloned(), sched);
+            emit_span_row(a, drafts[j], verify_lps.get(j).cloned(), sched, j, k_rows);
             if a.finished {
                 return;
             }
         }
-        emit_token(a, v[nd], verify_lps.get(nd).cloned(), sched);
+        emit_span_row(a, v[nd], verify_lps.get(nd).cloned(), sched, nd, k_rows);
         if a.finished {
             return;
         }
@@ -127,12 +127,12 @@ pub(super) fn k4_apply_verdict(
             return;
         }
         for j in 0..na {
-            emit_token(a, drafts[j], verify_lps.get(j).cloned(), sched);
+            emit_span_row(a, drafts[j], verify_lps.get(j).cloned(), sched, j, na + 1);
             if a.finished {
                 return;
             }
         }
-        emit_token(a, v[na], verify_lps.get(na).cloned(), sched);
+        emit_span_row(a, v[na], verify_lps.get(na).cloned(), sched, na, na + 1);
         if a.finished {
             return;
         }

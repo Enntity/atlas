@@ -346,6 +346,7 @@ pub(super) fn slow(
     let span = crate::scheduler::emit_step::SpanShadow::begin(
         a,
         crate::scheduler::emit_step::CommitEnv::of_ctx(ctx),
+        k,
     );
     // ATLAS_VERIFY_PICK_PAR: the rows' dequant and F2 sums up front, in
     // parallel (`prepick`); the loop below is unchanged either way.
@@ -366,7 +367,7 @@ pub(super) fn slow(
             }
         };
         picks.push(pick);
-        if !span.pick(a, pick, i + 1 == k) {
+        if !span.pick(a, pick, i) {
             // The pipeline masked with this matcher state, so a refusal means a
             // stale bitmask or a forced token that terminated the grammar.
             // Stop speculating; the real `accept_token` decides.
