@@ -651,16 +651,8 @@ impl TransformerLayer for Qwen3SsmLayer {
         )
     }
 
-    fn prefill_multi(
-        &self,
-        hidden: DevicePtr,
-        total: usize,
-        segs: &mut [crate::layer::MultiSeg<'_, '_>],
-        _kv_cache: &mut PagedKvCache,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        self.prefill_multi_hc(hidden, total, segs, ctx, stream)
+    fn prefill_multi(&self, pass: &mut crate::layer::MultiPass<'_, '_>) -> Result<()> {
+        self.prefill_multi_hc(pass)
     }
 
     fn is_ssm_layer(&self) -> bool {

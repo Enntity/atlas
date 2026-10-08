@@ -37,12 +37,14 @@
 //! (synchronizing, ~0.8 GB of host memory at a 16K chunk; diagnostic only).
 
 use super::*;
+use crate::layers::ops::qwen4exp_rowinv::bf16_proj;
 use spark_runtime::kernel_args::KernelLaunch;
 
-/// `ATLAS_QWEN4EXP_PREFILL_MOE=1`.
+/// `ATLAS_QWEN4EXP_PREFILL_MOE=1`, implied by `ATLAS_QWEN4EXP_PREFILL_BF16_PROJ`.
 pub(crate) fn q38_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| super::forward_prefill_routed::env_flag("ATLAS_QWEN4EXP_PREFILL_MOE"))
+    let flag = super::forward_prefill_routed::env_flag;
+    *ON.get_or_init(|| flag("ATLAS_QWEN4EXP_PREFILL_MOE") || bf16_proj())
 }
 
 /// `ATLAS_QWEN4EXP_PREFILL_MOE_W2=1` (with `_MOE`): the routed and shared

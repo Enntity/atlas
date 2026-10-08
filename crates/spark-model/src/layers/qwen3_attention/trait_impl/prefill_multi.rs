@@ -10,23 +10,18 @@
 //! (dense attention), so no QSA selection runs.
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
-use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::Qwen3AttentionLayer;
-use crate::layer::{ForwardContext, MultiSeg};
+use crate::layer::MultiPass;
 use crate::layers::ops;
 
 impl Qwen3AttentionLayer {
-    pub(super) fn prefill_multi_hc(
+    pub(in crate::layers::qwen3_attention) fn prefill_multi_hc(
         &self,
-        hidden: DevicePtr,
-        total: usize,
-        segs: &mut [MultiSeg<'_, '_>],
-        kv_cache: &mut PagedKvCache,
-        ctx: &ForwardContext,
-        stream: u64,
+        pass: &mut MultiPass<'_, '_>,
     ) -> Result<()> {
+        let (hidden, total, ctx, stream) = (pass.hidden, pass.total, pass.ctx, pass.stream);
+        let (segs, kv_cache) = (&mut pass.segs, &mut *pass.kv_cache);
         let hc = self
             .hc
             .as_ref()
@@ -94,7 +89,11 @@ impl Qwen3AttentionLayer {
                     seg.start + seg.rows <= qsa.inert_bound(),
                     "multi-sequence prefill: a sequence past the QSA inert bound"
                 );
-                let st = super::super::helpers::qsa_seq_state(qsa, &mut *seg.state, ctx.gpu)?;
+                let st = crate::layers::qwen3_attention::helpers::qsa_seq_state(
+                    qsa,
+                    &mut *seg.state,
+                    ctx.gpu,
+                )?;
                 qsa.prefill_ingest(st, x, seg.rows, seg.start, ctx.gpu, stream)?;
             }
             let o = self.prefill_attention_paged(
