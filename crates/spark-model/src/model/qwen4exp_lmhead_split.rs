@@ -59,7 +59,7 @@ use crate::weight_map::DenseWeight;
 const BF16: usize = 2;
 /// Staging rows above the batch width: the K=4 graphed verify.
 const MIN_STAGING_ROWS: usize = 4;
-/// Wider batched decodes keep the full head (~0.5 MB of staging a row).
+/// Wider heads keep the full projection (~0.5 MB of staging a row).
 const MAX_STAGING_ROWS: usize = 64;
 
 /// `ATLAS_QWEN4EXP_LMHEAD_SPLIT=1`, read once. Both ranks must agree
@@ -78,6 +78,27 @@ pub(crate) fn enabled() -> bool {
 pub(crate) fn batchm_requested() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_LMHEAD_BATCHM").as_deref() == Ok("1"))
+}
+
+/// `ATLAS_QWEN4EXP_LMHEAD_SPLIT_VERIFY=1`: stage the split for the batched
+/// verify's rows too (`verify_e`: every sequence's K = depth + 1 rows, C8 x
+/// K=4 = 32), not only for `--max-batch-size` rows. Without it a batched
+/// verify wider than the batch declines ("rows") and both ranks project the
+/// whole 1.27 GB head, ~7 ms a C8 step on GB10 at 32 rows. Staging grows to
+/// `max_batch_size x K` rows (<= 64, ~0.5 MB a row). The bytes do not
+/// change (the module docs' exactness); both ranks must agree
+/// (`startup_parity`), since the rows a split serves decide whether a step
+/// exchanges.
+pub(crate) fn verify_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_LMHEAD_SPLIT_VERIFY").as_deref() == Ok("1"))
+}
+
+/// Staging rows: the batch width, or with [`verify_requested`] the batched
+/// verify's `max_batch_size x (depth + 1)`, within the module bounds.
+fn staging_rows(max_batch_size: usize, verify: bool, depth: usize) -> usize {
+    let k = if verify { depth.max(1) + 1 } else { 1 };
+    (max_batch_size * k).clamp(MIN_STAGING_ROWS, MAX_STAGING_ROWS)
 }
 
 /// `ATLAS_QWEN4EXP_LMHEAD_SPLIT_CHECK=1`: compare every eager split head with
@@ -178,7 +199,11 @@ impl HeadSplit {
         }
         let geom = Split::new(vocab)
             .ok_or_else(|| anyhow::anyhow!("qwen4_exp LM-head split: vocabulary {vocab}"))?;
-        let rows = max_batch_size.clamp(MIN_STAGING_ROWS, MAX_STAGING_ROWS);
+        let rows = staging_rows(
+            max_batch_size,
+            verify_requested(),
+            super::qwen4exp_mtp_depth::requested(),
+        );
         let bytes = rows * geom.width() * BF16;
         let send = gpu.alloc(bytes)?;
         let recv = gpu.alloc(bytes)?;
