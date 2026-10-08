@@ -635,20 +635,20 @@ pub fn build_model(
             n
         }
     };
-    // The carveout adds blocks beyond the budget (not to a fixed HSS window or
-    // a latent shard, whose ranks hold different latents).
+    // The carveout adds blocks beyond the budget (not to a fixed HSS window).
+    // Under a latent shard it holds this rank's half-size latent pools.
     let kv_shape = kv_carveout::KvShape {
         config: &kv_config,
         v_aliases_k: glm_cache_plan.is_some(),
         index: sparse_index,
         tail_slots,
+        latent_shard: glm_cache_plan.and_then(|p| p.shard()),
     };
-    let (blocks, kv_placement) =
-        if hss_cache_blocks_per_seq.is_none() && glm_cache_plan.and_then(|p| p.shard()).is_none() {
-            kv_carveout::extend(gpu.as_ref(), kv_shape, num_kv_blocks)
-        } else {
-            (num_kv_blocks, Default::default())
-        };
+    let (blocks, kv_placement) = if hss_cache_blocks_per_seq.is_none() {
+        kv_carveout::extend(gpu.as_ref(), kv_shape, num_kv_blocks)
+    } else {
+        (num_kv_blocks, Default::default())
+    };
     num_kv_blocks = glm::agree_kv_blocks(
         comm.as_deref(),
         gpu.as_ref(),

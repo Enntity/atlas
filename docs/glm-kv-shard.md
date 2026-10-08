@@ -10,7 +10,9 @@ every allocation, kernel and launch is the one the engine ran before.
 Those measurements are from the old base (0965f8d5). The port onto
 integ/next (1b1f8551, branch `integ/exp-kvshard`) passes the unit tests and
 builds, and has not run on the pair: see "On integ/next" for what changed
-around it and what the port relies on.
+around it and what the port relies on. The SparkGLM production engine
+carries it squashed (e3e56f3c) and, since then, sizes and places sharded
+latent pools in the display carveout too: see "With the display carveout".
 
 ## Why
 
@@ -312,6 +314,38 @@ What is left with both tunings: ~30 us per layer of launches that have no
 unsharded counterpart (compaction, the FP32 merge, a second launch's fixed
 cost), and whatever part of the partial swap outlasts the own-head partitions
 it hides behind — roughly 0.4-0.7 ms per 8-row step.
+
+## With the display carveout (SparkGLM production engine)
+
+The fork-only GB10 display carveout (`spark display-carveout`,
+`factory::build::kv_carveout`) lends ~2 GiB of device memory outside the
+system pool and moves whole per-layer KV buffers into it; with
+`ATLAS_KV_CARVEOUT_ORDER=latent` (the default) only latent pools go there,
+because the carveout is not cached in L2 and the latent pools are read only
+at the selected rows. Under the shard each rank's latent pool of layer `l`
+holds `ceil(N / 2)` slots (`PagedKvCache::buffer_sizes_with_k_slots`), and
+the shard's scratch allocation, which grows with the pool through its
+identity table, is counted with the system-memory bytes the plan must not
+exceed (`KvShape::side_bytes`). The plan and the agreement are otherwise the
+same: each rank plans the largest pool whose system-memory share fits what
+its budgeted pool would have used, the ranks agree on the smaller count, and
+`PagedKvCache::new_latent_sharded_placed` allocates the placed pools from
+the carveout. Both ranks size identical buffers (a shard's latents differ
+between ranks, its pool sizes do not), so they plan the same count.
+
+The shard reads its own latent pool only through kernels: the attention
+kernels at the selected rows (as unsharded), the shard's block copies into
+an assembled view (streamed once per view, where the carveout reads at full
+bandwidth), and the cache writes. Exchanges go through the shard's scratch,
+which always stays in system memory, so no RDMA transfer touches a
+carveout buffer.
+
+Arithmetic at 11 fp8_g128 layers (unit test
+`a_latent_shard_grows_by_its_half_size_latent_pools`): a sharded local
+latent pool at 170K blocks is ~685 MiB, so two fit in 2,046 MiB, and the
+pool grows ~17% (170K -> ~199K blocks) at the same system-memory bytes.
+Before this change the factory planned no carveout under the shard (the
+carveout was exported but left unused).
 
 ## On integ/next
 
