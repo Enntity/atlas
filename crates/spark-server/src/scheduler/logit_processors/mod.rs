@@ -293,6 +293,8 @@ pub fn run_pipeline_with_path(
 /// call. Replaces the two divergent inline blocks.
 ///
 /// Stages, in order:
+///  0. **content-loop steer** (`ATLAS_LOOP_STEER`, `loop_steer`): the token
+///     that would continue a detected loop to -inf.
 ///  1. **ATLAS_FORCE_TEMP_ZERO bypass** (eligible on BOTH kinds): when the
 ///     diagnostic flag is set, return the raw-logit argmax with no pipeline,
 ///     no penalties, no bias — matching vLLM at temperature 0 for
@@ -324,6 +326,10 @@ pub fn process_position_logits(
     penalties: &SamplingParams,
     kind: PositionKind,
 ) -> Option<u32> {
+    // 0. The content-loop steer (`loop_steer`): the token that would
+    //    continue a detected loop to -inf, before every stage.
+    crate::scheduler::loop_steer::mask_row(logits, seq);
+
     // 1. ATLAS_FORCE_TEMP_ZERO: pure argmax on raw logits — no pipeline, no
     //    penalties, no bias. Eligible on both kinds (the diagnostic's point
     //    is an identical bypass everywhere).

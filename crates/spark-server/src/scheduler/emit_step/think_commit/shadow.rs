@@ -39,6 +39,7 @@ pub(in crate::scheduler) struct ThinkState {
     in_code_fence: bool,
     think_skip_count: u32,
     think_watchdog_fires: u32,
+    loop_steers: u32,
     post_think_emitted: u32,
     remaining: usize,
     finished: bool,
@@ -68,6 +69,7 @@ impl ThinkState {
             in_code_fence: a.in_code_fence,
             think_skip_count: a.think_skip_count,
             think_watchdog_fires: a.think_watchdog_fires,
+            loop_steers: a.loop_steers,
             post_think_emitted: a.post_think_emitted,
             remaining: a.remaining,
             finished: a.finished,
@@ -107,6 +109,7 @@ impl ThinkState {
         a.in_code_fence = self.in_code_fence;
         a.think_skip_count = self.think_skip_count;
         a.think_watchdog_fires = self.think_watchdog_fires;
+        a.loop_steers = self.loop_steers;
         a.post_think_emitted = self.post_think_emitted;
         a.remaining = self.remaining;
         a.finished = self.finished;
@@ -203,6 +206,8 @@ impl SpanShadow {
         if row + 1 >= self.rows || a.finished {
             return true;
         }
+        // The commit path counts this row's steer first (`emit_token`).
+        crate::scheduler::loop_steer::note_commit(a);
         let env = &self.env;
         let position = span_row_position(self.span_end, self.rows, row);
         if hard_stop(a, tok, env) {

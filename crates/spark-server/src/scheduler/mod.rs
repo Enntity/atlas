@@ -42,6 +42,7 @@ mod lifecycle_tests;
 mod logit_dump;
 mod logit_processors;
 mod logprobs;
+pub mod loop_steer;
 mod mod_helpers;
 pub use mod_helpers::capture_runtime_handle;
 pub mod dumps;

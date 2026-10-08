@@ -67,6 +67,11 @@ pub(super) fn fast(
     if k == 0 {
         return Ok(Some(Vec::new()));
     }
+    // A content-loop steer (`loop_steer`) is the host pipeline's to apply,
+    // row by row: a span one could touch takes it.
+    if crate::scheduler::loop_steer::span_may_steer(a, argmax_ids) {
+        return Ok(None);
+    }
     // Both GPU-argmax arms below see the span's starting state only, so they
     // also stand down where the pipeline would act outside `<think>`: the
     // one-shot tool-call pin, and any argmax the post-close / tool-loop masks
