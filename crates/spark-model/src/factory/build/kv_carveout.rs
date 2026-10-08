@@ -9,10 +9,17 @@
 //! with whole per-layer buffers moved into the carveout. The placement is
 //! planned at that count and kept through the ranks' agreement
 //! (`glm::agree_kv_blocks`), which can only lower it.
+//!
+//! Under a latent shard (`ATLAS_GLM_KV_SHARD=1`) each rank's K pools hold
+//! `ceil(blocks / 2)` slots and the shard's one scratch allocation grows with
+//! the pool (its identity table), so both enter the system-memory account the
+//! same way. Both ranks plan from the same sizes; their latents differ, their
+//! buffer sizes do not.
 
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::{
-    KvBuffer, KvCacheConfig, KvPlacement, PagedKvCache, SparseIndexCacheConfig, TailSlotPlan,
+    KvBuffer, KvCacheConfig, KvPlacement, LatentShard, LatentShardSpec, PagedKvCache,
+    SparseIndexCacheConfig, TailSlotPlan,
 };
 
 /// The cache geometry the factory allocates (`glm::new_kv_cache` and
@@ -23,17 +30,37 @@ pub(super) struct KvShape<'a> {
     pub(super) v_aliases_k: bool,
     pub(super) index: Option<SparseIndexCacheConfig>,
     pub(super) tail_slots: Option<TailSlotPlan>,
+    /// The latent shard the pool is built with (`glm::new_kv_cache`).
+    pub(super) latent_shard: Option<LatentShardSpec>,
 }
 
 impl KvShape<'_> {
     fn buffers(self, blocks: usize) -> Vec<(KvBuffer, usize)> {
-        PagedKvCache::buffer_sizes(
+        let k_slots = self
+            .latent_shard
+            .map_or(blocks, |s| LatentShard::local_blocks_for(blocks, s.world));
+        PagedKvCache::buffer_sizes_with_k_slots(
             self.config,
             blocks,
+            k_slots,
             self.v_aliases_k,
             self.index,
             self.tail_slots,
         )
+    }
+
+    /// System-memory bytes outside the per-layer buffers that depend on
+    /// `blocks`: the latent shard's scratch with its identity table.
+    fn side_bytes(self, blocks: usize) -> usize {
+        self.latent_shard
+            .map_or(0, |s| LatentShard::allocation_bytes(blocks, &s))
+    }
+
+    /// System-memory bytes of a `blocks` pool with `placement`'s buffers in
+    /// the carveout.
+    fn system_bytes(self, blocks: usize, placement: &KvPlacement) -> usize {
+        let buffers = self.buffers(blocks);
+        total(&buffers) - placement.carved_bytes(&buffers) + self.side_bytes(blocks)
     }
 }
 
@@ -47,15 +74,17 @@ pub(super) fn plan(shape: KvShape, blocks: usize, capacity: usize) -> (usize, Kv
     if capacity == 0 || blocks == 0 {
         return (blocks, KvPlacement::default());
     }
-    let system = total(&shape.buffers(blocks));
-    let per_block = total(&shape.buffers(blocks + 1)) - system;
-    // A block's bytes all in the carveout bound the gain; walk down from there
-    // to the first count whose system-memory share fits. `blocks` always does.
-    let ceiling = blocks + capacity / per_block.max(1);
+    let system = shape.system_bytes(blocks, &KvPlacement::default());
+    // Per block over two blocks: a sharded K pool grows by a slot every
+    // second block. Unsharded this is the one-block step.
+    let per_block = (total(&shape.buffers(blocks + 2)) - total(&shape.buffers(blocks))) / 2;
+    // A block's bytes all in the carveout bound the gain (to within the one
+    // block the two-block step can hide); walk down from there to the first
+    // count whose system-memory share fits. `blocks` always does.
+    let ceiling = blocks + capacity / per_block.max(1) + 1;
     for n in (blocks..=ceiling).rev() {
-        let buffers = shape.buffers(n);
-        let placement = KvPlacement::plan(&buffers, capacity);
-        if total(&buffers) - placement.carved_bytes(&buffers) <= system {
+        let placement = KvPlacement::plan(&shape.buffers(n), capacity);
+        if shape.system_bytes(n, &placement) <= system {
             return (n, placement);
         }
     }
