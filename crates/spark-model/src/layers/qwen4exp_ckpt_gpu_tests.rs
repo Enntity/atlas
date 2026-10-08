@@ -174,6 +174,45 @@ fn fla_spine_capture_is_exact() {
     );
 }
 
+/// The spine's `_capn` twin (dense / branch-point checkpoints): three rows
+/// in one pass, each equal to a pass over only the rows below it, with the
+/// outputs and final state unchanged.
+#[test]
+#[ignore]
+fn fla_spine_capture_many_is_exact() {
+    let gpu = backend();
+    let g: &dyn GpuBackend = &gpu;
+    let rows = 1000;
+    let x = gdn_inputs(g, rows);
+    let hb = NV * D * D * 4;
+    let ob = rows * NV * D * 2;
+    let (h1, h2) = (up(g, &x.h0), up(g, &x.h0));
+    let (o1, o2, o3) = (
+        g.alloc(ob).unwrap(),
+        g.alloc(ob).unwrap(),
+        g.alloc(ob).unwrap(),
+    );
+    let chunks = [3u32, 8, 12];
+    let caps: Vec<DevicePtr> = chunks.iter().map(|_| g.alloc(hb).unwrap()).collect();
+    fla(g, &x, h1, o1, rows);
+    ckpt::begin_many(&[]);
+    let arms: Vec<_> = chunks.iter().copied().zip(caps.iter().copied()).collect();
+    ckpt::arm_spines(&arms);
+    fla(g, &x, h2, o2, rows);
+    assert_eq!(ckpt::end().0, 1, "the `_pipe_capn` twin took the list");
+    assert!(get(g, o1, ob) == get(g, o2, ob), "outputs differ");
+    assert!(get(g, h1, hb) == get(g, h2, hb), "final states differ");
+    for (&c, &cap) in chunks.iter().zip(&caps) {
+        let short = up(g, &x.h0);
+        fla(g, &x, short, o3, c as usize * ckpt::CHUNK);
+        assert!(
+            get(g, cap, hb) == get(g, short, hb),
+            "captured at chunk {c} != a {}-row pass",
+            c as usize * ckpt::CHUNK
+        );
+    }
+}
+
 /// The token-sequential warm-replay recurrence split at a row: same outputs
 /// and final state; the state at the split equals a pass over the first rows.
 #[test]

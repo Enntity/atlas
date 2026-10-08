@@ -624,8 +624,15 @@ pub fn build_model(
         sparse_index,
         glm_cache_plan.and_then(|p| p.shard()).is_some(),
     );
-    let reserve_net =
-        reserve_net + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
+    // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS / _AUX_MB: the snapshots' host aux
+    // (`ssm_snapshot_budget`), 0 by default.
+    let snapshot_aux = crate::model::ssm_snapshot_budget::install(
+        &ssm_pools.snapshots,
+        layers.iter().map(|l| l.aux_bytes_per_token()).sum(),
+    );
+    let reserve_net = reserve_net
+        + snapshot_aux
+        + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
         total_mem,
