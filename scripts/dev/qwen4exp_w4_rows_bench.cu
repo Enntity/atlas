@@ -68,11 +68,17 @@ static const char* OLD[] = {"", "w4a16_gemv", "w4a16_gemv_batch2", "w4a16_gemv_b
                             "w4a16_gemv_batch4", "w4a16_gemv_batch5", "w4a16_gemv_batch6",
                             "w4a16_gemv_batch7", "w4a16_gemv_batch8"};
 
+// The launch exactly as `ops::Qwen4ExpW4Rows::launch` makes it: all shared
+// memory dynamic (`w4_rows_smem`), the opt-in attribute set only past 48 KB
+// (what `AtlasRegistry::launch_on_stream` does), grid = SM count. A size the
+// launcher would not opt in for must fit the default limit, or this fails.
+static unsigned smem_bytes(unsigned m, unsigned npb) { return m * 2 * 4096 + (2 * m * npb * 2 + 16) * 4; }
 static void launch_new(const char* fn, unsigned m, unsigned threads, const bf* A, const Fp4& w,
-                       bf* C, unsigned N, unsigned K) {
+                       bf* C, unsigned N, unsigned K, unsigned npb = 16) {
     CUfunction f = mod("qwen4exp_w4_rows").fn(fn);
-    const unsigned smem = m * ((K / 16 + 127) / 128) * 4096;
-    CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 64 * 1024));
+    const unsigned smem = smem_bytes(m, npb);
+    if (smem > 48 * 1024)
+        CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)smem));
     Args a;
     a.add(A).add(w.packed.p).add(w.scale.p).add(w.s2).add(C).add(N).add(K);
     launch(f, dim3(g_sms), dim3(threads), smem, a);
@@ -144,12 +150,12 @@ static void time_all(bool sweep) {
         row("w4a16_gemv[_batchM]", [&](unsigned m, int c) { launch_old(m, A.p, W[c], C.p, s.N, s.K); });
         row("qwen4exp_w4_rowsM", [&](unsigned m, int c) { launch_new(NEW[m], m, 256, A.p, W[c], C.p, s.N, s.K); });
         if (sweep) {
-            struct { const char* fn; unsigned threads; } sw[] = {
-                {"qw4_m8_n1_o8", 512}, {"qw4_m8_n2_o8", 512}, {"qw4_m8_n2_o4", 256}};
+            struct { const char* fn; unsigned threads, npb; } sw[] = {
+                {"qw4_m8_n1_o8", 512, 8}, {"qw4_m8_n2_o8", 512, 16}, {"qw4_m8_n2_o4", 256, 8}};
             for (auto& x : sw) {
                 printf("  %-24s", x.fn);
                 int it = 0;
-                const float ms = time_ms([&] { launch_new(x.fn, 8, x.threads, A.p, W[it++ % copies], C.p, s.N, s.K); }, 10, 5);
+                const float ms = time_ms([&] { launch_new(x.fn, 8, x.threads, A.p, W[it++ % copies], C.p, s.N, s.K, x.npb); }, 10, 5);
                 printf("                                    %7.1f [%3.0f]\n", ms * 1e3, wb / (ms * 1e-3) / 1e9);
             }
         }
