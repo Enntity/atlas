@@ -93,6 +93,7 @@ pub fn step_mtp(
     } else {
         ladder_nd
     };
+    super::mtp_step_trace::note_step(ladder_nd, deep);
     // Tiered verify-pool capacity clamp (2026-08-16): the step's draft
     // count must respect the MINIMUM slot capacity across the active
     // sequences — a sequence in a K=2-sized slot must never receive K=4
@@ -145,12 +146,18 @@ pub fn step_mtp(
     if !spark_model::speculative::glm_repair_policy::enabled()
         && can_batch_bootstrap(model, sched, bootstrap_idxs.len(), dflash_verify_raw_argmax)
     {
+        for &i in &bootstrap_idxs {
+            super::mtp_step_trace::note_seq(&active[i], b'B', 0);
+        }
+        super::mtp_step_trace::note_forward(bootstrap_idxs.len());
         step_mtp_bootstrap_batched(model, active, sched, &bootstrap_idxs, ladder_nd, verify_ctx);
         bootstrap_idxs.clear();
     }
     let mut late_dflash: Vec<usize> = Vec::new();
     let n_active = active.len();
     for &idx in &bootstrap_idxs {
+        super::mtp_step_trace::note_seq(&active[idx], b'b', 0);
+        super::mtp_step_trace::note_forward(1);
         if bootstrap::bootstrap_one(
             model,
             &mut active[idx],
@@ -278,6 +285,11 @@ pub fn step_mtp(
                         .expect("verify_batch_permutation is a permutation")
                 })
                 .collect();
+            for (a, &k) in batch.iter().zip(&sorted_ks) {
+                let path = if k > 1 { b'v' } else { b'd' };
+                super::mtp_step_trace::note_seq(a, path, k - 1);
+            }
+            super::mtp_step_trace::note_forward(sorted_ks.iter().sum());
             if dflash_verify_raw_argmax {
                 step_verify_dflash_batched(
                     model,
@@ -350,6 +362,8 @@ pub fn step_mtp(
             drafts.truncate(3);
         }
         conf.truncate(drafts.len());
+        super::mtp_step_trace::note_seq(a, b's', drafts.len());
+        super::mtp_step_trace::note_forward(drafts.len() + 1);
 
         // DFlash/DSpark verify: route by proposer, not draft count.
         // `--dflash` sets dflash_verify_raw_argmax. The old `drafts.len()>=4`

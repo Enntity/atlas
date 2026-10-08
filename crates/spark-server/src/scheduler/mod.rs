@@ -54,6 +54,7 @@ mod mtp_deep_depth;
 mod mtp_depth_ladder;
 mod mtp_gate;
 mod mtp_step;
+mod mtp_step_trace;
 pub(crate) mod mtp_timing;
 #[cfg(test)]
 mod ngram_accounting_tests;
@@ -707,6 +708,7 @@ pub fn run(
 
         // ── Continue in-progress prefills ──
         let t_loop = std::time::Instant::now();
+        let mut step_trace = mtp_step_trace::begin(&active);
         let mut rode: Vec<usize> = Vec::new();
         let spec_step = SpecStep {
             num_drafts: model
@@ -748,6 +750,10 @@ pub fn run(
                 &mut rode,
             );
         sched.timing.record(mtp_timing::Phase::LoopPrefill, t_loop);
+        if did_mixed_step {
+            mtp_step_trace::note_kind("mixed");
+        }
+        mtp_step_trace::note_rode(&rode);
 
         if active.is_empty() {
             // Every sequence can be parked (decode-preempted/spilled) with
@@ -782,6 +788,7 @@ pub fn run(
         };
 
         // Skip decode when mixed_forward already processed decode logits.
+        mtp_step_trace::mark_decode(&mut step_trace, &active);
         if !did_mixed_step && !active.is_empty() {
             // Ensure any in-flight prefill work on the prefill stream is complete
             // before decode starts on the default stream.
@@ -1069,6 +1076,7 @@ pub fn run(
                     } else {
                         match gate.next_step() {
                             mtp_gate::GateStep::MeasureDecode => {
+                                mtp_step_trace::note_kind("gate");
                                 let t0 = std::time::Instant::now();
                                 step_decode_only(
                                     &*model,
@@ -1242,6 +1250,7 @@ pub fn run(
             &mut preempted,
         );
         active.extend(rode_seqs);
+        mtp_step_trace::finish(step_trace, &active);
 
         let t_loop = std::time::Instant::now();
         // Deadline sweep BEFORE retirement, so a timed-out sequence retires
