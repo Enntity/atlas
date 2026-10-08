@@ -66,6 +66,7 @@ mod preempt_tests;
 mod prefill_a_step;
 mod prefill_a_step_params;
 mod prefill_b_step;
+mod prefill_burst;
 mod prefill_normalization;
 mod prefill_preempt;
 mod repetition;
@@ -364,6 +365,7 @@ pub fn run(
     // `admission` module docs and ATLAS_KV_ADMIT_WATERMARK).
     let admit_watermark = admission::resolve_admit_watermark(sched.limits.max_seq_len);
     let mut prefix_admit = shared_prefix::SharedPrefix::default();
+    let mut burst = prefill_burst::PrefillBurst::new(prefill_burst::BurstConfig::from_env());
 
     let pending = Arc::new((
         Mutex::new(PendingQueue {
@@ -661,6 +663,7 @@ pub fn run(
         // ── Start new requests ──
         let t_loop = std::time::Instant::now();
         let prefill_queue_was_empty = prefilling.is_empty();
+        let admitted = new_reqs.len();
         start_new_requests(
             &*model,
             &sched,
@@ -683,6 +686,22 @@ pub fn run(
             &mut prefilling,
         );
         sched.timing.record(mtp_timing::Phase::LoopAdmit, t_loop);
+        // ── ATLAS_PREFILL_BURST: more short prompts already waiting → drain
+        // them before this tick's decode (`prefill_burst`; off by default). ──
+        if burst.enabled() {
+            let (pending_n, pending_tokens) = prefill_burst::pending_load(&pending);
+            let view = prefill_burst::TickView {
+                admitted,
+                pending: pending_n,
+                pending_tokens,
+                prefilling: prefilling.len(),
+                in_flight: active.len() + prefilling.len(),
+                max_batch: max_batch_size,
+            };
+            if burst.hold(Instant::now(), &view) {
+                continue;
+            }
+        }
 
         // ── Continue in-progress prefills ──
         let t_loop = std::time::Instant::now();

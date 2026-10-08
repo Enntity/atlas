@@ -43,8 +43,26 @@ fn reuse_requested() -> bool {
     })
 }
 
-/// Spare buffers kept per thread (12 layers x 3 buffers x a few sequences).
+/// Spare buffers kept per thread by default (12 layers x 3 buffers, a
+/// sequence and a bit).
 const SPARE_MAX: usize = 64;
+
+/// `ATLAS_QWEN4EXP_QSA_SPARE_MAX=N` (default [`SPARE_MAX`]): how many released
+/// carry buffers a thread keeps. A sequence holds 3 per QSA layer (36 on
+/// qwen4_exp), so 64 keeps under two sequences: a C8 wave frees 288, keeps
+/// 64, and the next wave's admissions after the first two each pay 38
+/// `cuMemAlloc` before their first kernel (~1.7 ms host with the GPU idle,
+/// nsys `sqtp-Wprose-r0`) and the wave's retirements ~220 `cuMemFree`.
+/// `max_batch x 36` keeps a whole wave. Only which allocation backs a
+/// carry changes, never its bytes (see [`reuse_requested`]).
+fn spare_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| parse_spare_max(std::env::var("ATLAS_QWEN4EXP_QSA_SPARE_MAX").ok()))
+}
+
+fn parse_spare_max(v: Option<String>) -> usize {
+    v.and_then(|v| v.parse().ok()).unwrap_or(SPARE_MAX)
+}
 
 thread_local! {
     static SPARE: std::cell::RefCell<Vec<(DevicePtr, usize)>> =
@@ -58,7 +76,7 @@ pub(super) fn carry_alloc(gpu: &dyn GpuBackend, bytes: usize) -> Result<DevicePt
 
 /// Release a carry buffer of `bytes` (to the spares, or to the backend).
 pub(super) fn carry_free(gpu: &dyn GpuBackend, p: DevicePtr, bytes: usize) -> Result<()> {
-    carry_free_via(gpu, p, bytes, reuse_requested())
+    carry_free_via(gpu, p, bytes, reuse_requested(), spare_max())
 }
 
 fn carry_alloc_via(gpu: &dyn GpuBackend, bytes: usize, reuse: bool) -> Result<DevicePtr> {
@@ -74,11 +92,17 @@ fn carry_alloc_via(gpu: &dyn GpuBackend, bytes: usize, reuse: bool) -> Result<De
     spare.map_or_else(|| gpu.alloc(bytes), Ok)
 }
 
-fn carry_free_via(gpu: &dyn GpuBackend, p: DevicePtr, bytes: usize, reuse: bool) -> Result<()> {
+fn carry_free_via(
+    gpu: &dyn GpuBackend,
+    p: DevicePtr,
+    bytes: usize,
+    reuse: bool,
+    keep: usize,
+) -> Result<()> {
     let kept = reuse
         && SPARE.with(|s| {
             let mut s = s.borrow_mut();
-            (s.len() < SPARE_MAX).then(|| s.push((p, bytes))).is_some()
+            (s.len() < keep).then(|| s.push((p, bytes))).is_some()
         });
     if kept { Ok(()) } else { gpu.free(p) }
 }
