@@ -59,8 +59,7 @@ fn sparkglm_gains_about_a_fifth_more_blocks_at_no_system_memory_cost() {
     assert!(n >= budgeted + 18_000, "{n}");
     assert!(n <= budgeted + GB10 / 104_192 + 1, "{n}");
     assert!(
-        shape.system_bytes(n, &placement)
-            <= shape.system_bytes(budgeted, &KvPlacement::default())
+        shape.system_bytes(n, &placement) <= shape.system_bytes(budgeted, &KvPlacement::default())
     );
     assert!(carveout_footprint(shape, n, &placement) <= GB10);
 }
@@ -73,10 +72,7 @@ fn any_agreed_count_up_to_the_planned_one_still_fits() {
     let (n, placement) = plan(shape, budgeted, GB10);
     let system = shape.system_bytes(budgeted, &KvPlacement::default());
     for agreed in [budgeted - 5_000, budgeted, (budgeted + n) / 2, n - 1, n] {
-        assert!(
-            shape.system_bytes(agreed, &placement) <= system,
-            "{agreed}"
-        );
+        assert!(shape.system_bytes(agreed, &placement) <= system, "{agreed}");
         assert!(
             carveout_footprint(shape, agreed, &placement) <= GB10,
             "{agreed}"
@@ -147,7 +143,10 @@ fn a_latent_shard_grows_by_its_half_size_latent_pools() {
     let system = r0.system_bytes(budgeted, &KvPlacement::default());
     for agreed in [budgeted, budgeted + 1, (budgeted + n) / 2, n - 1, n] {
         assert!(r0.system_bytes(agreed, &placement) <= system, "{agreed}");
-        assert!(carveout_footprint(r0, agreed, &placement) <= GB10, "{agreed}");
+        assert!(
+            carveout_footprint(r0, agreed, &placement) <= GB10,
+            "{agreed}"
+        );
     }
     // The planned count is the largest that fits.
     let over = KvPlacement::plan(&r0.buffers(n + 1), GB10);
