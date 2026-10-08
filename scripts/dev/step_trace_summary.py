@@ -45,7 +45,7 @@ def parse(paths):
         fh = sys.stdin if p == "-" else open(p, errors="replace")
         for raw in fh:
             m = LINE.search(ANSI.sub("", raw))
-            if not m:
+            if not m or " n=0 " in m.group(0):
                 continue
             kv = {}
             for tok in m.group(1).split():
@@ -55,8 +55,11 @@ def parse(paths):
             for e in filter(None, kv.get("s", "").split(",")):
                 slot, gen, pd, emitted = e.split(":")
                 seqs.append((int(slot), int(gen), pd[0], int(pd[1:]), int(emitted)))
+            # `dur` covers the whole tick; `pf` (newer builds) is its prefill part
+            # before the decode dispatch, which counts as a gap here.
+            pf = int(kv.get("pf", 0))
             steps.append({
-                "t": int(kv["t"]), "dur": int(kv["dur"]), "kind": kv["kind"], "n": int(kv["n"]),
+                "t": int(kv["t"]) + pf, "dur": int(kv["dur"]) - pf, "pf": pf, "kind": kv["kind"], "n": int(kv["n"]),
                 "rows": int(kv["rows"]), "fwd": int(kv["fwd"]), "nd": int(kv["nd"]),
                 "deep": kv["deep"] == "1", "dl": int(kv["dl"]), "seqs": seqs,
             })

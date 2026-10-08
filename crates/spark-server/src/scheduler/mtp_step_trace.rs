@@ -20,7 +20,8 @@
 //!
 //! * `t`: microseconds since the first traced step's process epoch (monotonic)
 //!   when the tick began; `dur` covers the tick's prefill continuation
-//!   (mixed/rode steps) and its decode dispatch.
+//!   (mixed/rode steps, multi-prompt prefill) and its decode dispatch; the
+//!   trailing `pf=<us>` is the part before the decode dispatch.
 //! * `kind`: `mtp` (`step_mtp` ran), `dec` (plain batch decode), `gate` (the
 //!   MTP gate's serial measurement step), `mixed` (decode rode a prefill
 //!   chunk).
@@ -117,7 +118,13 @@ fn with_rec(f: impl FnOnce(&mut Rec)) {
 /// (slot, seq_len, generated) before it.
 pub(super) struct Trace {
     t0: Instant,
+    /// When the decode dispatch began (after the tick's prefill work).
+    t_dec: Option<Instant>,
     before: Vec<(usize, usize, usize)>,
+}
+
+fn snapshot(a: &ActiveSeq) -> (usize, usize, usize) {
+    (a.seq.slot_idx, a.seq.seq_len, a.output_tokens.len())
 }
 
 /// Open a tick over the decoding sequences `active`. `None` when disarmed.
@@ -130,11 +137,21 @@ pub(super) fn begin(active: &[ActiveSeq]) -> Option<Trace> {
     let _ = *EPOCH;
     Some(Trace {
         t0,
-        before: active
-            .iter()
-            .map(|a| (a.seq.slot_idx, a.seq.seq_len, a.output_tokens.len()))
-            .collect(),
+        t_dec: None,
+        before: active.iter().map(snapshot).collect(),
     })
+}
+
+/// The decode dispatch starts: sequences the tick's prefill work promoted
+/// into `active` since [`begin`] join the snapshot at their current state.
+pub(super) fn mark_decode(trace: &mut Option<Trace>, active: &[ActiveSeq]) {
+    let Some(tr) = trace.as_mut() else { return };
+    tr.t_dec = Some(Instant::now());
+    for a in active {
+        if !tr.before.iter().any(|b| b.0 == a.seq.slot_idx) {
+            tr.before.push(snapshot(a));
+        }
+    }
 }
 
 /// `step_mtp` ran with ladder depth `nd` (`deep`: the dynamic-depth arm).
@@ -178,8 +195,11 @@ pub(super) fn finish(trace: Option<Trace>, active: &[ActiveSeq]) {
         .collect();
     let t = tr.t0.saturating_duration_since(*EPOCH).as_micros();
     let dur = tr.t0.elapsed().as_micros();
+    let pf = tr
+        .t_dec
+        .map_or(0, |d| d.saturating_duration_since(tr.t0).as_micros());
     if let Some(line) = format_line(t, dur, &rec, &tr.before, &after) {
-        tracing::info!("{line}");
+        tracing::info!("{line} pf={pf}");
     }
 }
 
