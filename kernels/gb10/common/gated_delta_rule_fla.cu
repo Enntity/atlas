@@ -1138,7 +1138,19 @@ gated_delta_rule_chunk_delta_h_vfused(
 // store the FP32 entry state of chunk `cap_chunk` -- the state after the
 // pass's first `cap_chunk * CHUNK` tokens -- to `cap_state`, laid out as
 // `h_state`. Every other store and every value is the CAP=false kernel's.
-template <int SPLIT, int VT, bool CAP = false>
+//
+// CAPN (the `_capn` twins, qwen4_exp dense / branch-point checkpoints): the
+// same store for up to CDH_CAP_MAX chunks of one pass, chunk `chunk[j]`'s
+// entry state to `dst[j]`. The list rides by value (`KernelLaunch::arg_words`:
+// 16 pointers, 16 chunk indices two to a word, then `n`).
+#define CDH_CAP_MAX 16
+struct CdhCaps {
+    unsigned long long dst[CDH_CAP_MAX];
+    unsigned int chunk[CDH_CAP_MAX];
+    unsigned int n;
+    unsigned int pad;
+};
+template <int SPLIT, int VT, bool CAP = false, bool CAPN = false>
 __device__ __forceinline__ void cdh_pipe_core(
     float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
     const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
@@ -1149,7 +1161,7 @@ __device__ __forceinline__ void cdh_pipe_core(
     unsigned int qk_stride, unsigned int gb_stride, unsigned int h_state_is_table,
     const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
     unsigned int is_varlen, float* __restrict__ cap_state = nullptr,
-    unsigned int cap_chunk = 0
+    unsigned int cap_chunk = 0, const CdhCaps* __restrict__ caps = nullptr
 ) {
     constexpr int KH = K_DIM / SPLIT;
     const unsigned int vh = blockIdx.x;
@@ -1213,6 +1225,18 @@ __device__ __forceinline__ void cdh_pipe_core(
         if constexpr (CAP) {
             if (c == cap_chunk) {
                 float* Hc = cap_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+                #pragma unroll
+                for (int kk = 0; kk < KH; kk++)
+                    #pragma unroll
+                    for (int vt = 0; vt < VT; vt++) Hc[(k0 + kk) * V_DIM + v0 + vt] = Sold[kk][vt];
+            }
+        }
+        if constexpr (CAPN) {
+            #pragma unroll 1
+            for (unsigned int j = 0; j < caps->n; j++) {
+                if (c != caps->chunk[j]) continue;
+                float* Hc = (float*)caps->dst[j]
+                    + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
                 #pragma unroll
                 for (int kk = 0; kk < KH; kk++)
                     #pragma unroll
@@ -1311,6 +1335,27 @@ gated_delta_rule_chunk_delta_h_pipe_cap(
                               cap_state, cap_chunk);
 }
 
+// `..._pipe` that also stores each listed chunk's FP32 entry state (the CAPN
+// note on `cdh_pipe_core`).
+extern "C" __global__ void __launch_bounds__(256, 1)
+gated_delta_rule_chunk_delta_h_pipe_capn(
+    float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
+    const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
+    const float* __restrict__ gate, const float* __restrict__ gc_in,
+    __nv_bfloat16* __restrict__ S_out, __nv_bfloat16* __restrict__ uc_out,
+    unsigned int batch_size, unsigned int seq_len, unsigned int num_chunks,
+    unsigned int num_k_heads, unsigned int num_v_heads, unsigned int k_dim,
+    unsigned int v_dim, unsigned int qk_stride, unsigned int gb_stride,
+    unsigned int h_state_is_table,
+    const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
+    unsigned int is_varlen, const __grid_constant__ CdhCaps caps
+) {
+    cdh_pipe_core<2, 1, false, true>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out,
+                                     seq_len, num_chunks, num_k_heads, num_v_heads, k_dim,
+                                     v_dim, qk_stride, gb_stride, h_state_is_table, cu_seqlens,
+                                     cu_chunks, is_varlen, nullptr, 0, &caps);
+}
+
 // ── KERNEL 2-PIPE-DV: chunk_delta_h_pipe_dv<DVB> ─────────────────────────────
 // `..._pipe` with its 128 state columns split over 128 / DVB CTAs per head.
 //
@@ -1375,7 +1420,7 @@ __device__ __forceinline__ void cdh_pipe_dv_prefetch(
     cp_commit();
 }
 
-template <int DVB, bool CAP = false>
+template <int DVB, bool CAP = false, bool CAPN = false>
 __device__ __forceinline__ void cdh_pipe_dv_core(
     float* __restrict__ h_state, const __nv_bfloat16* __restrict__ W_in,
     const __nv_bfloat16* __restrict__ U_in, const __nv_bfloat16* __restrict__ key,
@@ -1386,7 +1431,7 @@ __device__ __forceinline__ void cdh_pipe_dv_core(
     unsigned int qk_stride, unsigned int gb_stride, unsigned int h_state_is_table,
     const int* __restrict__ cu_seqlens, const int* __restrict__ cu_chunks,
     unsigned int is_varlen, float* __restrict__ cap_state = nullptr,
-    unsigned int cap_chunk = 0
+    unsigned int cap_chunk = 0, const CdhCaps* __restrict__ caps = nullptr
 ) {
     constexpr int SPLIT = 2;
     constexpr int KH = K_DIM / SPLIT;            // 64: a thread's k half
@@ -1452,6 +1497,16 @@ __device__ __forceinline__ void cdh_pipe_dv_core(
         if constexpr (CAP) {
             if (c == cap_chunk) {
                 float* Hc = cap_state + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
+                #pragma unroll
+                for (int kk = 0; kk < KH; kk++) Hc[(k0 + kk) * V_DIM + v] = Sold[kk];
+            }
+        }
+        if constexpr (CAPN) {
+            #pragma unroll 1
+            for (unsigned int j = 0; j < caps->n; j++) {
+                if (c != caps->chunk[j]) continue;
+                float* Hc = (float*)caps->dst[j]
+                    + ((unsigned long long)(b * num_v_heads + vh) * K_DIM * V_DIM);
                 #pragma unroll
                 for (int kk = 0; kk < KH; kk++) Hc[(k0 + kk) * V_DIM + v] = Sold[kk];
             }
@@ -1539,6 +1594,18 @@ gated_delta_rule_chunk_delta_h_pipe_dv64_cap(CDH_PIPE_DV_ARGS, float* __restrict
                                num_chunks, num_k_heads, num_v_heads, k_dim, v_dim, qk_stride,
                                gb_stride, h_state_is_table, cu_seqlens, cu_chunks, is_varlen,
                                cap_state, cap_chunk);
+}
+
+// `..._pipe_dv64` that also stores each listed chunk's FP32 entry state (the
+// CAPN note on `cdh_pipe_core`).
+extern "C" __global__ void __launch_bounds__(128, 1)
+gated_delta_rule_chunk_delta_h_pipe_dv64_capn(CDH_PIPE_DV_ARGS,
+                                              const __grid_constant__ CdhCaps caps) {
+    (void)batch_size;
+    cdh_pipe_dv_core<64, false, true>(h_state, W_in, U_in, key, gate, gc_in, S_out, uc_out,
+                                      seq_len, num_chunks, num_k_heads, num_v_heads, k_dim,
+                                      v_dim, qk_stride, gb_stride, h_state_is_table, cu_seqlens,
+                                      cu_chunks, is_varlen, nullptr, 0, &caps);
 }
 
 
