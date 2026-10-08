@@ -45,12 +45,20 @@ pub(crate) fn lookahead_tokens() -> usize {
 
 /// Each sequence's block target for a step whose rows end at `last[i]`:
 /// `None` when no sequence needs a new block (no vote), else every
-/// sequence's last block through `last[i] + lookahead`.
-fn plan(last: &[usize], needs: &[bool], lookahead: usize, bs: usize) -> Option<Vec<usize>> {
-    needs
-        .iter()
-        .any(|&n| n)
-        .then(|| last.iter().map(|&p| (p + lookahead) / bs).collect())
+/// sequence's last block through `last[i] + lookahead`, the lookahead held
+/// to block `cap` (past the context it would only ever be refused).
+fn plan(
+    last: &[usize],
+    needs: &[bool],
+    lookahead: usize,
+    bs: usize,
+    cap: usize,
+) -> Option<Vec<usize>> {
+    needs.iter().any(|&n| n).then(|| {
+        last.iter()
+            .map(|&p| ((p + lookahead) / bs).min(cap).max(p / bs))
+            .collect()
+    })
 }
 
 impl TransformerModel {
@@ -71,9 +79,14 @@ impl TransformerModel {
             .map(|(s, &p)| needs_new_block(s, p / bs))
             .collect();
         let hss = kv_cache.config().cache_blocks_per_seq.is_some();
+        // The context's last whole block: its aux reach stays in the indexer.
+        let cap = (self.max_blocks_per_seq as usize).saturating_sub(2);
+        // qwen4_exp only: GLM's tail slots would release the block being
+        // written for a lookahead a refusal then undoes.
         if la > 0
             && !hss
-            && let Some(targets) = plan(last, &needs, la, bs)
+            && self.config.model_type == "qwen4_exp"
+            && let Some(targets) = plan(last, &needs, la, bs, cap)
             && !self.reserve_blocks_one_vote(seqs, &targets, kv_cache, stream)?
         {
             tracing::debug!("KV lookahead refused; per-sequence votes");
@@ -138,9 +151,16 @@ mod tests {
     #[test]
     fn a_vote_tops_every_sequence_up_by_the_lookahead() {
         // No new block anywhere: no vote.
-        assert_eq!(plan(&[10, 40], &[false, false], 64, 16), None);
+        assert_eq!(plan(&[10, 40], &[false, false], 64, 16, 99), None);
         // One sequence crosses: both reserve through last + 64.
-        assert_eq!(plan(&[16, 40], &[true, false], 64, 16), Some(vec![5, 6]));
-        assert_eq!(plan(&[15], &[true], 0, 16), Some(vec![0]));
+        assert_eq!(
+            plan(&[16, 40], &[true, false], 64, 16, 99),
+            Some(vec![5, 6])
+        );
+        assert_eq!(plan(&[15], &[true], 0, 16, 99), Some(vec![0]));
+        // Near the context's end the lookahead stops at the cap, never
+        // below the step's own block.
+        assert_eq!(plan(&[16, 40], &[true, false], 64, 16, 4), Some(vec![4, 4]));
+        assert_eq!(plan(&[90], &[true], 64, 16, 4), Some(vec![5]));
     }
 }
