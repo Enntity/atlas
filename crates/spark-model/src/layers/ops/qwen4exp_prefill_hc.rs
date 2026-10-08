@@ -143,11 +143,11 @@ pub(super) fn prefill_arm(
     hidden: u32,
     hc_mult: u32,
 ) -> Option<HcFastKernels> {
-    // ATLAS_QWEN4EXP_PREFILL_ROWINV: this arm at every width, whatever the
-    // switch (its down is `qwen4exp_rowinv::hc_down`, see `slab_fast`).
-    let rowinv = super::qwen4exp_rowinv::active();
-    if !(hc_requested() || rowinv)
-        || (num_tokens < HC_FAST_MIN_T && !rowinv)
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV: no seam; every collapse is
+    // `qwen4exp_rowinv::hc_collapse` (through `hc_pre_lowrank`).
+    if !hc_requested()
+        || super::qwen4exp_rowinv::active()
+        || num_tokens < HC_FAST_MIN_T
         || hc_mult != 4
         || !hidden.is_multiple_of(HUM_BD)
         || hidden > 4096
@@ -159,7 +159,7 @@ pub(super) fn prefill_arm(
     let up_mix = crate::layers::try_kernel(gpu, "hyper_connection", "hc_up_mix_bf16_nt");
     let k = HcFastKernels {
         post_stage: crate::layers::try_kernel(gpu, "hyper_connection", "hc_post_stage_bf16"),
-        up_mix: (rowinv || up_mix_exact()).then_some(up_mix),
+        up_mix: up_mix_exact().then_some(up_mix),
     };
     if k.post_stage.0 == 0 || up_mix.0 == 0 {
         static WARNED: std::sync::Once = std::sync::Once::new();
@@ -260,26 +260,17 @@ fn slab_fast(c: &HcPrefillCall, k: &HcFastKernels, io: &HcSlabIo, stream: u64) -
             .launch(stream)?,
         None => hc_stage(c, io, stream)?,
     }
-    // 2. low = silu(normed x down_w^T / hc) and inj_pre: the default's
-    // calls, or under ATLAS_QWEN4EXP_PREFILL_ROWINV one row-invariant kernel.
-    let inj_pre = if c.inject { c.inj_pre } else { DevicePtr::NULL };
-    let rowinv = super::qwen4exp_rowinv::hc_down(
-        gpu, c.w, c.normed, c.low, inj_pre, ts, c.hidden, c.hc_mult, stream,
-    )?;
-    if !rowinv {
-        hc_low(c, ts, stream)?;
-    }
+    // 2. low = silu(normed x down_w^T / hc): the default's calls.
+    hc_low(c, ts, stream)?;
     let Some(up_mix) = k.up_mix else {
         return hc_slab_tail(c, io, stream);
     };
-    if !rowinv {
-        hc_inject(
-            c,
-            gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
-            ts,
-            stream,
-        )?;
-    }
+    hc_inject(
+        c,
+        gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
+        ts,
+        stream,
+    )?;
     // 3. y = mean_s sigmoid(low x up_w) * normed, inj, in one kernel.
     KernelLaunch::new(gpu, up_mix)
         .grid([c.hidden / HUM_BD, ts.div_ceil(HUM_BM), 1])
@@ -287,7 +278,7 @@ fn slab_fast(c: &HcPrefillCall, k: &HcFastKernels, io: &HcSlabIo, stream: u64) -
         .arg_ptr(c.low)
         .arg_ptr(c.up_wt)
         .arg_ptr(c.normed)
-        .arg_ptr(inj_pre)
+        .arg_ptr(if c.inject { c.inj_pre } else { DevicePtr::NULL })
         .arg_ptr(io.y)
         .arg_ptr(io.inj)
         .arg_u32(ts)
