@@ -107,8 +107,7 @@ pub(super) fn plan_verify(
     if !plan.batch.is_empty()
         && !dflash_verify_raw_argmax
         && !decode_rows_disabled()
-        && !sched.levers.dflash_unified_ctx
-        && !sched.levers.dflash_serial_append
+        && !crate::scheduler::mtp_bootstrap_step::dflash_ctx_serializes(sched)
         && !model.decode_logits_fp32()
     {
         plan.decode_rows = bootstrap_idxs

@@ -82,6 +82,32 @@ fn boot_argmax_batch_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var_os("ATLAS_NO_MTP_BOOT_ARGMAX").is_none())
 }
 
+/// `ATLAS_MTP_DFLASH_CTX_SCOPED=1` (default off): see [`dflash_ctx_serializes`].
+/// Read once per process.
+fn dflash_ctx_scoped() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("ATLAS_MTP_DFLASH_CTX_SCOPED").as_deref() == Ok("1"))
+}
+
+/// Whether the DFlash drafter-context commit modes keep draftless sequences
+/// on the per-sequence bootstrap (no batched bootstrap, no decode rows).
+///
+/// Those modes order a per-sequence ctx append against a per-sequence decode,
+/// which only the DFlash lane has. `dflash_unified_ctx` is ON unless
+/// `ATLAS_NO_DFLASH_UNIFIED_CTX=1`, with or without DFlash, so on the MTP lane
+/// (where `commit_ctx` is a no-op: no DFlash proposer state) it silently kept
+/// every wave's first step at n serial M=1 forwards plus n proposes (280 ms
+/// at C=8 vs ~95 ms for a step) and the one-forward decode rows dead.
+/// `ATLAS_MTP_DFLASH_CTX_SCOPED=1` scopes the modes to the DFlash lane, which
+/// both callers already exclude (`dflash_verify_raw_argmax`).
+pub(super) fn dflash_ctx_serializes(sched: &crate::scheduler::sched_ctx::SchedCtx) -> bool {
+    dflash_ctx_serializes_with(&sched.levers, dflash_ctx_scoped())
+}
+
+fn dflash_ctx_serializes_with(levers: &crate::scheduler::levers::SchedLevers, scoped: bool) -> bool {
+    !scoped && (levers.dflash_unified_ctx || levers.dflash_serial_append)
+}
+
 /// Whether [`step_mtp_bootstrap_batched`] can run for these sequences.
 pub(super) fn can_batch_bootstrap(
     model: &dyn Model,
@@ -93,8 +119,7 @@ pub(super) fn can_batch_bootstrap(
         && !dflash_verify_raw_argmax
         && !bootstrap_batch_disabled()
         && spark_model::speculative::mtp_multi_seq_mode()
-        && !sched.levers.dflash_unified_ctx
-        && !sched.levers.dflash_serial_append
+        && !dflash_ctx_serializes(sched)
         // FP32-lm_head models (Gemma-4 dense) are excluded: `logits_ptr_is_fp32`
         // is an exact-pointer identity against the FP32 scratch buffer, so a
         // per-ROW offset pointer would dispatch as BF16 and read garbage. The
@@ -395,3 +420,7 @@ pub(super) fn step_mtp_bootstrap_batched(
         );
     });
 }
+
+#[cfg(test)]
+#[path = "mtp_bootstrap_step_tests.rs"]
+mod tests;

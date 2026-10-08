@@ -708,7 +708,7 @@ pub fn run(
 
         // ── Continue in-progress prefills ──
         let t_loop = std::time::Instant::now();
-        let step_trace = mtp_step_trace::begin(&active);
+        let mut step_trace = mtp_step_trace::begin(&active);
         let mut rode: Vec<usize> = Vec::new();
         let spec_step = SpecStep {
             num_drafts: model
@@ -788,6 +788,7 @@ pub fn run(
         };
 
         // Skip decode when mixed_forward already processed decode logits.
+        mtp_step_trace::mark_decode(&mut step_trace, &active);
         if !did_mixed_step && !active.is_empty() {
             // Ensure any in-flight prefill work on the prefill stream is complete
             // before decode starts on the default stream.
