@@ -47,6 +47,10 @@ pub const QWEN4EXP_MOE_UNITS_MAX_ROWS: usize = 64;
 /// The units plan's workspace, bytes: 16 + 3 * (1024 + 64) unit words, then
 /// 1024 sorted slot ids (C8_WS_ROWS + C8_SLOTS_MAX in qwen4exp_moe_c8.cu).
 pub const QWEN4EXP_MOE_UNITS_WS_BYTES: usize = (16 + 3 * (1024 + 64) + 1024) * 4;
+/// Units-grid rows of the TC v2 kernels (each CTA strides the units by it):
+/// 80 x 64 gate/up and 40 x 64 down CTAs keep GB10's 48 SMs full; 48-160
+/// measured within 1% at real C8 routing (qwen4exp_moe_c8_bench REALBIN).
+const UNITS_TC_Y_CAP: u32 = 64;
 /// Down outputs per units CTA (32 * OG in qwen4exp_moe_c8.cu).
 const UNITS_DOWN_TILE: u32 = 64;
 
@@ -68,6 +72,10 @@ pub struct Qwen4ExpMoeRows {
     /// The units are the tensor-core kernels (`ATLAS_QWEN4EXP_MOE_TC=1`,
     /// contract (b)): serial decode must take them too.
     pub units_tc: bool,
+    /// The units launches' grid height cap: the TC v2 kernels stride the
+    /// units, so their grid is sized to the GPU (`UNITS_TC_Y_CAP`), not to
+    /// the units' bound (`u32::MAX`: one unit a CTA).
+    pub units_y_cap: u32,
 }
 
 impl Qwen4ExpMoeRows {
@@ -81,6 +89,7 @@ impl Qwen4ExpMoeRows {
         units_gate_up: KernelHandle(0),
         units_down: KernelHandle(0),
         units_tc: false,
+        units_y_cap: u32::MAX,
     };
 
     pub fn resolve(gpu: &dyn GpuBackend, config: &ModelConfig) -> Self {
@@ -105,15 +114,28 @@ impl Qwen4ExpMoeRows {
                  serial decode on qwen4exp_moe_c8_tc.cu -- a new numerics baseline (contract (b))"
             );
         }
+        // ATLAS_QWEN4EXP_MOE_TC_V1=1: the TC kernels as first shipped (O(n^2)
+        // plan, a CTA a unit over the units' bound) for A/B; v2 writes the same
+        // bytes (scripts/dev/qwen4exp_moe_c8_bench.sh tc-ident).
+        let v1 = crate::model::qwen4exp_batch_fast::tc_v1_requested();
+        let tck = |v2: &'static str, v1n: &'static str| {
+            try_kernel(gpu, "qwen4exp_moe_c8_tc", if v1 { v1n } else { v2 })
+        };
         let (units_plan, units_gate_up, units_down) = if tc {
             (
-                try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_plan"),
+                tck("qwen4exp_moe_c8_tc_plan", "qwen4exp_moe_c8_tc_plan_v1"),
                 if nc {
-                    try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_gate_up_nc")
+                    tck(
+                        "qwen4exp_moe_c8_tc_gate_up_nc",
+                        "qwen4exp_moe_c8_tc_gate_up_nc_v1",
+                    )
                 } else {
-                    try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_gate_up")
+                    tck(
+                        "qwen4exp_moe_c8_tc_gate_up",
+                        "qwen4exp_moe_c8_tc_gate_up_v1",
+                    )
                 },
-                try_kernel(gpu, "qwen4exp_moe_c8_tc", "qwen4exp_moe_c8_tc_down"),
+                tck("qwen4exp_moe_c8_tc_down", "qwen4exp_moe_c8_tc_down_v1"),
             )
         } else if units {
             (
@@ -150,6 +172,7 @@ impl Qwen4ExpMoeRows {
             units_gate_up,
             units_down,
             units_tc: tc,
+            units_y_cap: if tc && !v1 { UNITS_TC_Y_CAP } else { u32::MAX },
         }
     }
 
@@ -401,8 +424,9 @@ impl Qwen4ExpMoeRows {
             .arg_u32(rows)
             .launch(stream)?;
         // A grid row per possible unit: one per entry, one per 16 shared rows
-        // (the plan's count; rows past it exit).
-        let units = rows * top_k + div_ceil(rows, 16);
+        // (the plan's count; rows past it exit) -- or, for kernels that stride
+        // the units, the cap.
+        let units = (rows * top_k + div_ceil(rows, 16)).min(self.units_y_cap);
         KernelLaunch::new(gpu, self.units_gate_up)
             .grid([inter / 8, units, 1])
             .block([256, 1, 1])

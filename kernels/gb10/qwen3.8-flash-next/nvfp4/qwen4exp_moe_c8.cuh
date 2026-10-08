@@ -92,6 +92,12 @@ struct C8Unit {
     unsigned expert, start, n;
     __device__ __forceinline__ bool shared() const { return expert == C8_SHARED; }
 };
+__device__ __forceinline__ C8Unit c8_unit_at(const unsigned* __restrict__ ws, unsigned y) {
+    const unsigned* p = ws + C8_WS_UNITS + 3 * y;
+    C8Unit u;
+    u.expert = p[0]; u.start = p[1]; u.n = p[2];
+    return u;
+}
 __device__ __forceinline__ bool c8_unit(const unsigned* __restrict__ ws, C8Unit& u) {
     if (blockIdx.y >= ws[0]) return false;
     const unsigned* p = ws + C8_WS_UNITS + 3 * blockIdx.y;
@@ -144,6 +150,9 @@ __device__ __forceinline__ void c8_f32_row(const float* p, unsigned k16, float (
     up_scale_ptrs, up_scale2_vals, sh_gate_packed, sh_gate_scale, sh_gate_s2,  \
     sh_up_packed, sh_up_scale, sh_up_s2, ws, gate_out, up_out, sh_gate_out,    \
     sh_up_out, act, top_k, rows
+#define C8_SD_PASS                                                             \
+    act, packed_ptrs, scale_ptrs, scale2_vals, sh_down_packed, sh_down_scale,  \
+    sh_down_s2, ws, C, sh_down_out, top_k, rows
 #define C8_SD_ARGS                                                             \
     const float* __restrict__ act,                                             \
     const unsigned long long* __restrict__ packed_ptrs,                        \

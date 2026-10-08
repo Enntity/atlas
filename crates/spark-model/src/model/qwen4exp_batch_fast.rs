@@ -149,6 +149,14 @@ pub(crate) fn tc_requested() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_TC").as_deref() == Ok("1"))
 }
 
+/// `ATLAS_QWEN4EXP_MOE_TC_V1=1`, read once: under `ATLAS_QWEN4EXP_MOE_TC`,
+/// the tensor-core units as first shipped (for A/B against the current
+/// ones, which write the same bytes).
+pub(crate) fn tc_v1_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_TC_V1").as_deref() == Ok("1"))
+}
+
 /// `ATLAS_QWEN4EXP_MOE_NO_CLAMP=1`, read once: the qwen4_exp decode / verify
 /// MoE kernels drop the routed SwiGLU clamp (+-10) -- the serial-decode
 /// single-row silu/down, the rows pair, the units and the TC units -- which

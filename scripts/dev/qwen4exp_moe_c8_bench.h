@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <random>
 #include <sstream>
 #include <string>
@@ -185,6 +186,35 @@ static std::vector<std::vector<unsigned>> trace_routes(const char* path, unsigne
         }
         if (v.size() == (size_t)rows * TOPK) out.push_back(v);
     }
+    return out;
+}
+
+// REALBIN=<file> (ATLAS_QWEN4EXP_MOE_ROUTE_DUMP's .bin): per layer, its
+// records' ids in order (remapped as trace_routes does). A wave of `rows`
+// rows = the layer's first rows/4 records' rows (4-row records), so a
+// config's launches are one per layer: the step's 48 MoE launches.
+static std::vector<std::vector<unsigned>> bin_waves(const char* path, unsigned rows) {
+    const std::string mode = getenv("ROUTE_LOCAL") ? getenv("ROUTE_LOCAL") : "lo";
+    std::map<unsigned, std::vector<unsigned>> per_layer;
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "no %s\n", path); exit(1); }
+    unsigned hd[5];
+    while (fread(hd, 4, 5, f) == 5) {
+        std::vector<unsigned> ids(hd[2] * hd[3]);
+        if (fread(ids.data(), 4, ids.size(), f) != ids.size()) break;
+        fseek(f, (long)(hd[2] * hd[3] * 4 + (size_t)hd[2] * hd[4] * 2), SEEK_CUR);
+        for (auto& x : ids)
+            if (mode != "even") {
+                const bool local = (x < NE / 2) == (mode == "lo");
+                x = (x % (NE / 2)) * 2 + (local ? 0 : 1);
+            }
+        auto& v = per_layer[hd[1]];
+        v.insert(v.end(), ids.begin(), ids.end());
+    }
+    fclose(f);
+    std::vector<std::vector<unsigned>> out;
+    for (auto& [l, v] : per_layer)
+        if (v.size() >= (size_t)rows * TOPK) out.emplace_back(v.begin(), v.begin() + rows * TOPK);
     return out;
 }
 
