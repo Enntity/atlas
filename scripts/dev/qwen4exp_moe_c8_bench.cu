@@ -24,7 +24,7 @@
 //
 // Build/run: scripts/dev/qwen4exp_moe_c8_bench.sh [probe|time|check] (repo root, GB10).
 //
-// Preliminary (2026-10-06, ennspark03, single runs, synthetic routing):
+// Preliminary (2026-10-06, a GB10, single runs, synthetic routing):
 //   probe: the unique bytes read in 10-64 KB chunks a CTA run at 232-249 GB/s
 //     (vLLM's routed MoE in the C8 prose profile is ~242-248 GB/s of ~70
 //     unique experts' bytes: at this roofline).

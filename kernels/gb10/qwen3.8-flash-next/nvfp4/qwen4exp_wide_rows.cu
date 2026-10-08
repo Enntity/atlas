@@ -45,7 +45,7 @@
 // scoreboard stalls at 16 warps an SM); so was splitting a CTA's rows over
 // more threads (registers spill or occupancy falls).
 //
-// GB10 (ennspark03), us per call, weights streamed from DRAM, against the
+// A GB10, us per call, weights streamed from DRAM, against the
 // chunks the lane ran before (scripts/dev/qwen4exp_wide_rows_bench.cu):
 //
 //   rows                          8      16      24      32

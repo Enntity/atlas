@@ -5,7 +5,7 @@
 //!
 //! `fetch_many` spawns a scoped thread per worker for EVERY fault batch. At
 //! prefill scale that is noise, but a decode step faults 8-64 rows, and the
-//! spawns are then most of the batch: measured on ennspark03 against the
+//! spawns are then most of the batch: measured on a GB10 against the
 //! real PLE file, NVMe kept awake (`keepalive`), 16 misses at 16 spawned
 //! workers resolved in 814 us p50 (one ~250 us read each), and 48 misses at
 //! 48 spawned workers took 2.0 ms against 1.0 ms at 16. These workers are
