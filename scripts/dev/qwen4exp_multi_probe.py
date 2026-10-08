@@ -12,7 +12,12 @@
 3. first-token parity: 8 text prompts one at a time, then all at once; the
    first token and its logprob come from the prefill logits alone, so the
    two runs must agree.
-4. the server still answers.
+4. cache-hit parity (`--cached`, for ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED=1):
+   a warm request caches a shared prefix (64 tokens: a match with no
+   snapshot, recomputed from 0; 320 tokens: a match a restore can serve),
+   then 8 prompts on that prefix arrive at once (the pass, cache hits in it)
+   and again one at a time. Under ROWINV both must equal.
+5. the server still answers.
 
 Exit status 0 when every step passes.
 """
@@ -25,6 +30,7 @@ import urllib.request
 ap = argparse.ArgumentParser()
 ap.add_argument("url", nargs="?", default="http://127.0.0.1:8893")
 ap.add_argument("--burst", type=int, default=70)
+ap.add_argument("--cached", action="store_true", help="run the cache-hit parity step")
 a = ap.parse_args()
 U = a.url.rstrip("/")
 
@@ -82,6 +88,22 @@ with cf.ThreadPoolExecutor(len(P)) as ex:
 same = sum(x == y and x[0] == "ok" for x, y in zip(one, par))
 print(f"first-token parity, one-at-a-time vs burst: {same}/{len(P)} equal")
 ok &= same == len(P)
+
+if a.cached:
+    for plen in (64, 320):
+        prefix = [3000 + (37 * j) % 20000 for j in range(plen)]
+        tails = [[9000 + 101 * i + 7 * j for j in range(10 + i)] for i in range(9)]
+        warm = post(prefix + tails[8], 1, 1)
+        ps = [prefix + t for t in tails[:8]]
+        with cf.ThreadPoolExecutor(len(ps)) as ex:
+            par = list(ex.map(lambda p: post(p, 1, 1), ps))
+        one = [post(p, 1, 1) for p in ps]
+        same = sum(x == y and x[0] == "ok" for x, y in zip(one, par))
+        print(f"cache-hit parity, {plen}-token cached prefix (warm {warm[0]}): "
+              f"burst vs one-at-a-time {same}/{len(ps)} equal")
+        if same != len(ps):
+            print("  burst:", par, "\n  one:  ", one)
+        ok &= same == len(ps)
 
 alive = post([1, 2, 3])[0]
 print("alive after:", alive)
