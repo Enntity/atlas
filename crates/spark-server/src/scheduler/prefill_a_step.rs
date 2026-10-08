@@ -130,7 +130,12 @@ pub fn start_chunked_prefill(
 
     let request_start = Instant::now();
     let total = prompt_tokens.len();
-    let chunk_len = total.min(max_prefill_tokens);
+    let mut chunk_len = total.min(max_prefill_tokens);
+    // ATLAS_QWEN4EXP_PREFILL_ROWINV: the next chunk starts on the GDN grid.
+    let g = spark_runtime::prefill_chunk_granule();
+    if chunk_len < total && g > 4 && chunk_len >= g {
+        chunk_len -= chunk_len % g;
+    }
     let is_last = chunk_len >= total;
 
     tracing::info!(
