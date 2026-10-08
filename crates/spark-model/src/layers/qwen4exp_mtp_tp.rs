@@ -271,8 +271,8 @@ impl Qwen4ExpMtpHead {
             && n >= 2
             && comm.supports_peer_exchange_async()
             && self.batch_admits(n, drafts, ctx))
-            .then(|| Plan { n, drafts }.word().ok())
-            .flatten()
+        .then(|| Plan { n, drafts }.word().ok())
+        .flatten()
     }
 
     /// The run of a propose the model announced (it hands the propose its

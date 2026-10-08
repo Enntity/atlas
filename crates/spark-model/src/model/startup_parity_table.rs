@@ -7,14 +7,6 @@
 use anyhow::Result;
 use spark_runtime::radix_tree::{glm_pc_evict_enabled, snap_evict_alpha, snap_evict_legacy};
 
-use crate::model::glm_long_verify::{oracle_enabled, serial_diagnostic};
-use crate::model::trait_impl::finish_leaf;
-use crate::model::trait_impl::prefill_b::pc_policy as pc;
-use crate::model::{
-    decode_pieces, glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry,
-    qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_lmhead_split, qwen4exp_mtp_depth,
-    verify_pieces,
-};
 use crate::layer::glm_long_owner;
 use crate::layers::dflash_head::rank_split;
 use crate::layers::qwen3_attention::{
@@ -23,6 +15,14 @@ use crate::layers::qwen3_attention::{
     pairwise_moe_decode_enabled, write_floor_legacy,
 };
 use crate::layers::{self, glm_kv_shard, glm_sp, moe, ops, qwen3_ssm, w4a16_gemv_tiers};
+use crate::model::glm_long_verify::{oracle_enabled, serial_diagnostic};
+use crate::model::trait_impl::finish_leaf;
+use crate::model::trait_impl::prefill_b::pc_policy as pc;
+use crate::model::{
+    decode_pieces, glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry,
+    qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_lmhead_split, qwen4exp_mtp_depth,
+    verify_pieces,
+};
 use crate::speculative::glm_repair_policy;
 use crate::weight_loader::qwen4_exp::GdnProjections;
 
@@ -35,7 +35,10 @@ const GLM: &str = "glm5_next";
 /// feature's own parser. One entry per setting.
 pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // A rank that would only warn beside one that fails.
-    ("ATLAS_STARTUP_PARITY=warn", || Ok(super::warn_only() as u64)),
+    (
+        "ATLAS_STARTUP_PARITY=warn",
+        || Ok(super::warn_only() as u64),
+    ),
     // The head's command words.
     ("ATLAS_EP_PROTOCOL=v2", || {
         Ok(crate::model::ep_protocol_v2_requested() as u64)
@@ -354,7 +357,9 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // The q38 prefill MoE arm (`_PREFILL_BF16_PROJ` implies it) routes under
     // `_SP_ROUTE`: a rank without it routes every row and never joins the
     // routes' all-gather. `_MOE_W2` also takes the router below 32 rows.
-    ("ATLAS_QWEN4EXP_PREFILL_MOE", || Ok(moe::q38_requested() as u64)),
+    ("ATLAS_QWEN4EXP_PREFILL_MOE", || {
+        Ok(moe::q38_requested() as u64)
+    }),
     ("ATLAS_QWEN4EXP_PREFILL_MOE_W2", || {
         Ok((moe::q38_requested() && moe::w2_requested()) as u64)
     }),
@@ -365,12 +370,17 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
             moe::prefill_fp8_down() as usize
         })
     }),
-    ("ATLAS_MOE_GROUPED_CUTLASS/_HOLO_MOE_GROUPED_CUTLASS", || {
-        while_on(crate::layers::qwen4exp_sp_pipe::rs_requested(), || {
-            moe::grouped_cutlass_gate_up_enabled() as usize
-        })
+    (
+        "ATLAS_MOE_GROUPED_CUTLASS/_HOLO_MOE_GROUPED_CUTLASS",
+        || {
+            while_on(crate::layers::qwen4exp_sp_pipe::rs_requested(), || {
+                moe::grouped_cutlass_gate_up_enabled() as usize
+            })
+        },
+    ),
+    ("ATLAS_PROFILE_FIRST", || {
+        Ok(graph_flags::profile_first() as u64)
     }),
-    ("ATLAS_PROFILE_FIRST", || Ok(graph_flags::profile_first() as u64)),
     // Under ROWINV, host ids decide the text-only (plain RoPE) attention.
     ("ATLAS_QWEN4EXP_PREFILL_HOST_IDS", || {
         while_on(ops::qwen4exp_rowinv::on(), || {
