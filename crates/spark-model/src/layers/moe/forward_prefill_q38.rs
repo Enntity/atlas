@@ -366,7 +366,8 @@ impl MoeLayer {
     }
 
     /// Whether the q38 routed chain serves this layer's prefill: the shape the
-    /// default chain it replaces runs (NVFP4 transposed tables, SiLU, no expert
+    /// default chain it replaces runs (NVFP4 transposed tables -- or the
+    /// checkpoint's, `forward_prefill_q38_nodup` -- SiLU, no expert
     /// LoRA, none of the alternative gate/up or down arms). Also read before
     /// the grid is sized: the q38 kernels stride their row tiles, so they do
     /// not need the exact per-expert tile count, nor the host round trip
@@ -375,9 +376,7 @@ impl MoeLayer {
         let fp8_down = super::forward_prefill_routed::prefill_fp8_down();
         q38_requested()
             && ctx.config.model_type == "qwen4_exp"
-            && self.gate_ptrs_t.is_some()
-            && self.up_ptrs_t.is_some()
-            && self.down_ptrs_t.is_some()
+            && self.q38_routed_tables(h, inter).is_some()
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
             && !self.btile_storage.is_published()
             && !self.nvfp4_mmq_layout
@@ -410,9 +409,8 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        let (Some(gp), Some(up), Some(dp)) =
-            (&self.gate_ptrs_t, &self.up_ptrs_t, &self.down_ptrs_t)
-        else {
+        // K-major tables, or the checkpoint's under `_MOE_NODUP` (`nm`).
+        let Some(([gp, up, dp], nm)) = self.q38_routed_tables(h, inter) else {
             return Ok(false);
         };
         if !self.q38_routed_serves(h, inter, ctx) {
@@ -432,9 +430,9 @@ impl MoeLayer {
         }
         let gpu = ctx.gpu;
         let k_a8 = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_a_to_e4m3");
-        let k_gu =
-            crate::layers::try_kernel(gpu, "moe_prefill_q38", q38_entry("moe_q38_gate_up_silu"));
-        let k_dn = crate::layers::try_kernel(gpu, "moe_prefill_q38", q38_entry("moe_q38_down"));
+        let entry = |name| super::forward_prefill_q38_nodup::routed_entry(q38_entry(name), nm);
+        let k_gu = crate::layers::try_kernel(gpu, "moe_prefill_q38", entry("moe_q38_gate_up_silu"));
+        let k_dn = crate::layers::try_kernel(gpu, "moe_prefill_q38", entry("moe_q38_down"));
         if k_a8.0 == 0 || k_gu.0 == 0 || k_dn.0 == 0 {
             return Ok(false);
         }
@@ -484,7 +482,7 @@ impl MoeLayer {
             .arg_u32(h)
             .arg_u32(inter)
             .launch(stream)?;
-        if check_left().fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+        if !nm && check_left().fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
             // Keep this result and let the default chain run over the same
             // buffers; `finish_q38_check` compares once it has.
             gpu.synchronize(stream)?;
