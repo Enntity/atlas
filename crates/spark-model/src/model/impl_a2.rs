@@ -408,6 +408,14 @@ impl TransformerModel {
         if cmd == 0xFFFFFFFF {
             return Ok(false);
         }
+        // ATLAS_QWEN4EXP_GDN_COMMIT_FUSE: only the batched verify takes a
+        // pending GDN commit, and the draft-assist walk between two of them
+        // reads no GDN state; every other command lands them first.
+        if cmd != super::trait_impl::ep_verify_batch::EP_CMD_VERIFY_BATCH
+            && cmd != super::draft_assist::EP_CMD_DRAFT_ASSIST
+        {
+            self.gdn_fuse_flush_all()?;
+        }
 
         // Batched-decode (`0xFFFFFFE0`): the preamble seq_id is sentinel-0;
         // the real per-token routing lives in the seq_ids[N] payload that

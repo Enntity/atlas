@@ -400,6 +400,8 @@ pub struct TransformerModel {
     pub(super) secondary_stream: u64,
     /// CUDA event for GPU-side inter-stream synchronization (avoids CPU-blocking sync).
     pub(super) secondary_event: u64,
+    /// `ATLAS_QWEN4EXP_GDN_COMMIT_FUSE`: commits left for the next verify.
+    pub(super) gdn_fuse: super::trait_impl::gdn_commit_fuse::GdnFuse,
     /// CUDA event ordering SSM-snapshot SAVES (on the default stream) before a
     /// later warm Marconi RESTORE (on the prefill stream). Marconi saves
     /// (`decode_marconi_checkpoint`, `finish_leaf_snapshot`, prefill-time

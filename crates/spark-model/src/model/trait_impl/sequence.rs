@@ -123,6 +123,9 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        // A commit left for this sequence's next verify is moot
+        // (`gdn_commit_fuse`); the slot is zeroed below.
+        self.gdn_fuse_drop_slot(seq.slot_idx);
         // The sequence is leaving the prefill path: drop its per-request
         // vision state (pixels, grids, hashes, encode bookkeeping) so a slot
         // reuse cannot observe a previous request's images (`vision_cache`).
@@ -252,6 +255,7 @@ impl TransformerModel {
                 ssm.gdn_commit_qkv = DevicePtr(0);
                 ssm.gdn_commit_gb = DevicePtr(0);
                 ssm.gdn_commit_pending = false;
+                ssm.gdn_fuse_n = DevicePtr(0);
             }
         }
 
@@ -409,6 +413,7 @@ impl TransformerModel {
                     // repoint on rebind like every other pool buffer.
                     ssm.gdn_commit_qkv = self.ssm_pool.commit_qkv(ssm_layer_idx, new_slot);
                     ssm.gdn_commit_gb = self.ssm_pool.commit_gb(ssm_layer_idx, new_slot);
+                    ssm.gdn_fuse_n = self.ssm_pool.fuse_word(new_slot);
                     // Stage-3 f16-SIZED pool: the FP32 prefill staging blob is
                     // per-SLOT, so compaction must repoint it for the same
                     // reason the checkpoint/intermediate families below are

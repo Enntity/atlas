@@ -26,6 +26,7 @@ fn defer_table_is_the_kernels_struct() {
             stage_gb: DevicePtr(4),
             row0: 5,
             k: 4,
+            fuse_n: DevicePtr::NULL,
         },
         GdnDeferSeq {
             h: DevicePtr(11),
@@ -34,14 +35,16 @@ fn defer_table_is_the_kernels_struct() {
             stage_gb: DevicePtr(14),
             row0: 9,
             k: 8,
+            fuse_n: DevicePtr(15),
         },
     ];
     let t = defer_table(&seqs);
-    // QdfDeferSeq is 40 bytes: four pointers, then row0 and k as u32s.
-    assert_eq!(t.len() * 8, 40 * GDN_ROWS_MAX);
-    assert_eq!(&t[..5], &[1, 2, 3, 4, 5 | 4 << 32]);
-    assert_eq!(&t[5..10], &[11, 12, 13, 14, 9 | 8 << 32]);
-    assert!(t[10..].iter().all(|&w| w == 0), "unused sequences are null");
+    // QdfDeferSeq is 48 bytes: four pointers, row0 and k as u32s, then the
+    // pending-commit word (NULL: the unfused kernel).
+    assert_eq!(t.len() * 8, 48 * GDN_ROWS_MAX);
+    assert_eq!(&t[..6], &[1, 2, 3, 4, 5 | 4 << 32, 0]);
+    assert_eq!(&t[6..12], &[11, 12, 13, 14, 9 | 8 << 32, 15]);
+    assert!(t[12..].iter().all(|&w| w == 0), "unused sequences are null");
 }
 
 #[test]
@@ -88,6 +91,7 @@ fn defer_verify_declines_without_staging() {
         stage_gb: DevicePtr(0x4000),
         row0: 0,
         k: 4,
+        fuse_n: DevicePtr::NULL,
     };
     let rows = GdnDeferRows {
         seqs: &[seq],
