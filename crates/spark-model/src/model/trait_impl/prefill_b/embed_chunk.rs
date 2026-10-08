@@ -17,7 +17,7 @@ use crate::layers::ops;
 /// leaves the GPU idle while the host then hashes the n-grams (5.5 ms at 16K
 /// on the pair, nsys `sqpf-p3s7-r0`). The ids are the same bytes: the copy
 /// mirrors the last upload into the stable `token_ids` buffer.
-fn host_ids_requested() -> bool {
+pub(in crate::model) fn host_ids_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         matches!(

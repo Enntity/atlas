@@ -375,7 +375,7 @@ impl MoeLayer {
     /// not need the exact per-expert tile count, nor the host round trip
     /// (`ATLAS_MOE_PREFILL_EXACT_TILES`) that buys it.
     pub(super) fn q38_routed_serves(&self, h: u32, inter: u32, ctx: &ForwardContext) -> bool {
-        let fp8_down = std::env::var("ATLAS_MOE_PREFILL_FP8_DOWN").ok().as_deref() == Some("1");
+        let fp8_down = super::forward_prefill_routed::prefill_fp8_down();
         q38_requested()
             && ctx.config.model_type == "qwen4_exp"
             && self.gate_ptrs_t.is_some()

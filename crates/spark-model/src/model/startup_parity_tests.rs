@@ -328,6 +328,10 @@ fn the_table_carries_each_setting_once() {
         "ATLAS_QWEN4EXP_HC_STAGE_FIT",
         "ATLAS_QWEN4EXP_FINISH_LEAF",
         "ATLAS_MTP_DEEP_MAX_SEQS",
+        "ATLAS_MOE_PREFILL_FP8_DOWN",
+        "ATLAS_MOE_GROUPED_CUTLASS/_HOLO_MOE_GROUPED_CUTLASS",
+        "ATLAS_PROFILE_FIRST",
+        "ATLAS_QWEN4EXP_PREFILL_HOST_IDS",
     ] {
         assert_eq!(
             names.iter().filter(|&&n| n == required).count(),

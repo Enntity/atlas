@@ -159,7 +159,7 @@ impl TransformerModel {
         let batched_embed_kernel = gpu.kernel("embed_from_argmax", "batched_embed")?;
         let fill_slots_kernel = gpu.kernel("metadata_fill", "fill_slots_from_block_table")?;
         let profile = config.profile;
-        let profile_first = std::env::var("ATLAS_PROFILE_FIRST").is_ok();
+        let profile_first = super::graph_flags::profile_first();
         let final_norm_identity = config.final_norm_is_identity();
         super::final_norm::check_final_norm_identity(&config)?;
 

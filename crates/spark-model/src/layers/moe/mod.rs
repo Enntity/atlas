@@ -171,6 +171,7 @@ mod forward_prefill_q38_rs;
 mod forward_prefill_route;
 pub(crate) mod forward_prefill_route_sp;
 mod forward_prefill_routed;
+pub(crate) use forward_prefill_routed::{grouped_cutlass_gate_up_enabled, prefill_fp8_down};
 mod forward_prefill_router;
 mod forward_prefill_tcp;
 pub(crate) use forward_prefill_tcp::tcp_requested;

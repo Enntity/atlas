@@ -353,6 +353,25 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_MOE_W2", || {
         Ok((moe::q38_requested() && moe::w2_requested()) as u64)
     }),
+    // The routed arm and the shared-reduce overlap (off while profiling)
+    // decide whether `_SP_RS_PIPE` pipes the MoE reduce-scatter.
+    ("ATLAS_MOE_PREFILL_FP8_DOWN", || {
+        while_on(crate::layers::qwen4exp_sp_pipe::rs_requested(), || {
+            moe::prefill_fp8_down() as usize
+        })
+    }),
+    ("ATLAS_MOE_GROUPED_CUTLASS/_HOLO_MOE_GROUPED_CUTLASS", || {
+        while_on(crate::layers::qwen4exp_sp_pipe::rs_requested(), || {
+            moe::grouped_cutlass_gate_up_enabled() as usize
+        })
+    }),
+    ("ATLAS_PROFILE_FIRST", || Ok(graph_flags::profile_first() as u64)),
+    // Under ROWINV, host ids decide the text-only (plain RoPE) attention.
+    ("ATLAS_QWEN4EXP_PREFILL_HOST_IDS", || {
+        while_on(ops::qwen4exp_rowinv::on(), || {
+            crate::model::trait_impl::prefill_b::embed_chunk::host_ids_requested() as usize
+        })
+    }),
     // The o_proj arm decides whether `_SP_RS_PIPE` pipes its reduce-scatter.
     ("ATLAS_ATTN_W4A4", || {
         Ok(layers::qwen3_attention::attn_w4a4_requested() as u64)
