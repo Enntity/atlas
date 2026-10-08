@@ -12,9 +12,12 @@
 //! prompts in the same order (the head sends them, `EP_CMD_PREFILL_MULTI`),
 //! so the per-sequence collectives inside (the prefix-match agreement, the
 //! block admission) pair up as for single prefills. Per sequence, in order:
-//! the prefix lookup (a sequence that restores a snapshot leaves the pass and
-//! prefills alone afterwards), the block reservation, the metadata (each
-//! sequence its own region of the scratch arena); then the pass; then, per
+//! the prefix lookup (a sequence that restores a snapshot or shares cached
+//! blocks leaves the pass and prefills alone afterwards; with
+//! `ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED=1` it rides the pass from the depth
+//! its single prefill computes from, `multi_ep::multi_segment_start`), the
+//! block reservation, the metadata (each sequence its own region of the
+//! scratch arena); then the pass; then, per
 //! sequence, the drafter capture, the finish (logits, prefix-cache insert)
 //! and the eager drafter prefill, exactly as a single prefill ends.
 //!
@@ -44,17 +47,19 @@ impl TransformerModel {
         };
         let began = Instant::now();
         let n = seqs.len();
-        // Per sequence: the prefix lookup. A sequence restoring a snapshot or
-        // sharing cached KV blocks (the ranks agree on the match), and a
-        // prompt carrying vision pad ids (token ids sent without an image),
-        // prefill alone after the pass (`multi[k] == false`): the decision
-        // reads only data every rank shares.
+        // Per sequence: the prefix lookup, then where its segment starts
+        // (`multi_segment_start`). A prompt carrying vision pad ids (token ids
+        // sent without an image), and without `_MULTI_CACHED` one restoring a
+        // snapshot or sharing cached KV blocks, prefills alone after the pass
+        // (`multi[k] == false`): the decision reads only data every rank
+        // shares (the agreed match and restore depth, the tokens).
         let mut multi = vec![true; n];
+        let mut start = vec![0usize; n];
         {
             let mut kv = self.kv_cache.lock();
             let bs = kv.block_size();
             for (k, (tokens, seq)) in seqs.iter_mut().enumerate() {
-                let (_, skip) = self.prefill_b_prefix_lookup(
+                let (skip_to, skip) = self.prefill_b_prefix_lookup(
                     tokens,
                     seq,
                     0,
@@ -64,17 +69,31 @@ impl TransformerModel {
                     None,
                 )?;
                 self.pc_apply_plant(tokens, seq, 0, bs);
-                multi[k] = !skip
-                    && seq.prefix_ref_tokens.is_empty()
-                    && !self.tokens_have_vision_pad(tokens);
+                let lookup = super::multi_ep::Lookup {
+                    skip,
+                    skip_to,
+                    shares_blocks: !seq.prefix_ref_tokens.is_empty(),
+                    exact_snap: seq.marconi_exact_snap.is_some(),
+                    vision_pad: self.tokens_have_vision_pad(tokens),
+                };
+                let cached = super::multi_ep::multi_cached();
+                let at = super::multi_ep::multi_segment_start(cached, tokens.len(), &lookup);
+                multi[k] = at.is_some();
+                start[k] = at.unwrap_or(0);
             }
         }
         // Logits rows: the pass's sequences first, then the restored ones.
         let rows_buf = self.prefill_multi_rows(n, stream)?;
         let mut logits = vec![DevicePtr::NULL; n];
-        let rows: Vec<usize> = seqs.iter().map(|s| s.0.len()).collect();
+        // Each segment: the prompt's rows from its start on.
+        let rows: Vec<usize> = seqs
+            .iter()
+            .zip(&start)
+            .map(|(s, &at)| s.0.len() - at)
+            .collect();
         if multi.iter().any(|&m| m) {
-            self.prefill_multi_forward(seqs, &multi, &rows, rows_buf, began, &mut logits, stream)?;
+            let shape = (&multi[..], &start[..], &rows[..]);
+            self.prefill_multi_forward(seqs, shape, rows_buf, began, &mut logits, stream)?;
         }
         // The sequences that restored: their own single prefills.
         let mut at = multi.iter().filter(|&&m| m).count();
@@ -89,13 +108,12 @@ impl TransformerModel {
     }
 
     /// Embed, admit and describe the `multi` sequences, run the layers over
-    /// all their rows, then finish each one.
-    #[allow(clippy::too_many_arguments)]
+    /// all their rows, then finish each one. Sequence `k` computes its
+    /// prompt's positions `[start[k], start[k] + rows[k])`.
     fn prefill_multi_forward(
         &self,
         seqs: &mut [(&[u32], &mut crate::traits::SequenceState)],
-        multi: &[bool],
-        rows: &[usize],
+        (multi, start, rows): (&[bool], &[usize], &[usize]),
         (rows_base, rows_cap): (DevicePtr, usize),
         began: Instant,
         logits: &mut [DevicePtr],
@@ -121,15 +139,19 @@ impl TransformerModel {
         {
             let mut kv = self.kv_cache.lock();
             for &k in &picked {
-                self.reserve_prefill_blocks(seqs[k].1, rows[k], &mut kv, stream)?;
+                let len = seqs[k].0.len();
+                self.reserve_prefill_blocks(seqs[k].1, len, &mut kv, stream)?;
             }
         }
-        // Zero the arena once; each prompt's embedding at its rows.
+        // Zero the arena once (as for a chunk 0); each prompt's embedding at
+        // its rows. A restored segment's rows are embedded again by its
+        // `prefill_b_proc_range` below, as the single path's are.
         let first = picked[0];
-        let pre = self.prefill_b_zero_and_embed(true, seqs[first].0, 0, rows[first], stream)?;
+        let (t0, r0) = (seqs[first].0, rows[first]);
+        let pre = self.prefill_b_zero_and_embed(true, &t0[start[first]..], 0, r0, stream)?;
         for &k in &picked[1..] {
             let dst = hidden.offset(row0[k] * h * 2);
-            self.prefill_b_embed_chunk_at(seqs[k].0, 0, rows[k], dst, stream)?;
+            self.prefill_b_embed_chunk_at(seqs[k].0, start[k], rows[k], dst, stream)?;
         }
         let _ = super::embed_chunk::take_staged_ids();
         self.buffers.note_rows(total);
@@ -150,35 +172,36 @@ impl TransformerModel {
             let kv = self.kv_cache.lock();
             for (i, &k) in picked.iter().enumerate() {
                 let (tokens, seq) = &mut seqs[k];
-                let (len, at) = (rows[k], starts[i]);
+                let (len, at) = (tokens.len(), starts[i]);
+                let (from, count) = (start[k], rows[k]);
                 match self.prefill_b_proc_range(
                     tokens,
                     seq,
                     0,
                     len,
                     true,
-                    0,
-                    false,
+                    from,
+                    from > 0,
                     hidden.offset(row0[k] * h * 2),
                     stream,
                 )? {
                     super::proc_range::ProcRange::Compute {
-                        proc_start: 0,
+                        proc_start,
                         proc_count,
-                        effective_seq_len_start: 0,
-                    } if proc_count == len => {}
-                    _ => anyhow::bail!("prefill_multi: a sequence that does not compute from 0"),
+                        effective_seq_len_start,
+                    } if (proc_start, proc_count, effective_seq_len_start) == (from, count, from) => {}
+                    _ => anyhow::bail!("prefill_multi: a sequence that does not compute from {from}"),
                 }
-                self.ple_prefill_warm(tokens, 0, seq)?;
+                self.ple_prefill_warm(tokens, from, seq)?;
                 let region = self.buffers.scratch_bytes().saturating_sub(at);
                 let m = self.prefill_b_upload_meta_at(
                     tokens,
                     seq,
                     0,
                     len,
-                    0,
-                    len,
-                    0,
+                    from,
+                    count,
+                    from,
                     &kv,
                     scratch.offset(at),
                     region,
@@ -191,8 +214,8 @@ impl TransformerModel {
                 self.prefill_b_upload_paged(
                     seq,
                     len,
-                    0,
-                    len,
+                    from,
+                    count,
                     m.meta_base,
                     m.slot_offset,
                     &kv,
@@ -224,7 +247,7 @@ impl TransformerModel {
         // The pass's token ids, host and device, back to back.
         let ids: Vec<u32> = picked
             .iter()
-            .flat_map(|&k| seqs[k].0.iter().copied())
+            .flat_map(|&k| seqs[k].0[start[k]..].iter().copied())
             .collect();
         // SAFETY: a `&[u32]` viewed as its `len * 4` bytes.
         let id_bytes =
@@ -286,11 +309,22 @@ impl TransformerModel {
                         continue;
                     }
                     let seq = &mut **seq;
+                    // The single pass's write floor over the same rows.
+                    let skip = start[k] > 0;
+                    let base = super::pc_policy::replay_floor(
+                        skip,
+                        seq.cached_prefix_tokens,
+                        start[k],
+                        start[k],
+                        rows[k],
+                    );
+                    let floor =
+                        self.pc_write_floor(base, seq.cached_prefix_tokens, start[k], rows[k]);
                     segs.push(MultiSeg {
                         row0: row0[k],
                         rows: rows[k],
-                        start: 0,
-                        kv_write_start: 0,
+                        start: start[k],
+                        kv_write_start: floor,
                         state: seq.layer_states[i].as_mut(),
                         block_table: &mut seq.block_table,
                         disk_block_ids: &mut seq.disk_block_ids,
@@ -321,8 +355,9 @@ impl TransformerModel {
         // Finish each sequence as its single prefill does.
         for (i, &k) in picked.iter().enumerate() {
             let (tokens, seq) = &mut seqs[k];
-            let len = rows[k];
-            self.try_mtp_prefill_capture_from(seq, 0, len, hidden.offset(row0[k] * h * 2), stream)?;
+            let (len, from, count) = (tokens.len(), start[k], rows[k]);
+            let src = hidden.offset(row0[k] * h * 2);
+            self.try_mtp_prefill_capture_from(seq, from, count, src, stream)?;
             let mut kv = self.kv_cache.lock();
             let bs = kv.block_size();
             seq.tokens.extend_from_slice(tokens);
@@ -335,7 +370,7 @@ impl TransformerModel {
                 &mut kv,
                 0,
                 len,
-                len,
+                count,
                 row0[k],
                 0,
                 batched.then_some(row),
@@ -349,7 +384,7 @@ impl TransformerModel {
                 t_meta,
                 t_fwd,
             ];
-            self.warm_trace_chunk(seq, len, began, (0, len), pre, marks, Some(out), stream)?;
+            self.warm_trace_chunk(seq, len, began, (0, count), pre, marks, Some(out), stream)?;
             if !batched {
                 self.gpu
                     .copy_d2d_async(out, row, self.config.vocab_size * 2, stream)?;

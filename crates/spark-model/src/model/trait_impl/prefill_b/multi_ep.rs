@@ -53,6 +53,58 @@ pub fn multi_requested() -> bool {
     })
 }
 
+/// `ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED=1` (default off, with `_MULTI`): a
+/// prompt that hit the prefix cache rides the multi-sequence pass too (see
+/// [`multi_segment_start`]). Read once.
+pub fn multi_cached() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        multi_requested()
+            && matches!(
+                std::env::var("ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED").as_deref(),
+                Ok("1") | Ok("true")
+            )
+    })
+}
+
+/// What a prompt's prefix lookup left behind, for [`multi_segment_start`].
+pub(super) struct Lookup {
+    /// The lookup restored a snapshot (`marconi_skip`), at `skip_to` tokens.
+    pub skip: bool,
+    pub skip_to: usize,
+    /// The sequence holds cached KV blocks (a radix match).
+    pub shares_blocks: bool,
+    /// The exact full-prompt snapshot shortcut (`marconi_exact_snap`), whose
+    /// fixup only the single path's finish runs.
+    pub exact_snap: bool,
+    pub vision_pad: bool,
+}
+
+/// Where a prompt of `len` tokens starts its segment of the multi-sequence
+/// pass, or `None` when it prefills alone after the pass. Reads only what
+/// every rank agreed on (the match, the restore depth) and the tokens.
+///
+/// Without `cached` (the shipped behaviour) a prompt that restored a snapshot
+/// or shares cached blocks prefills alone. With it, the pass computes what
+/// that prompt's single prefill computes:
+/// * a match with nothing restored recomputes from token 0 (the single
+///   path's full recompute, same write floor);
+/// * a restore starts the segment at the restored depth, its replay rows
+///   under the match not written (`pc_policy::replay_floor`), as the single
+///   path's uncached-portion pass does.
+pub(super) fn multi_segment_start(cached: bool, len: usize, l: &Lookup) -> Option<usize> {
+    if l.vision_pad {
+        return None;
+    }
+    if !cached {
+        return (!l.skip && !l.shares_blocks).then_some(0);
+    }
+    if !l.skip {
+        return Some(0);
+    }
+    (!l.exact_snap && l.skip_to > 0 && l.skip_to < len).then_some(l.skip_to)
+}
+
 impl TransformerModel {
     /// Whether this model serves `prefill_multi` at all.
     /// Everything a pass would refuse mid-pass is refused here, before any
@@ -175,3 +227,7 @@ impl TransformerModel {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+#[path = "multi_ep_tests.rs"]
+mod tests;

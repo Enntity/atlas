@@ -93,6 +93,9 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_MULTI", || {
         Ok(crate::model::trait_impl::prefill_b::multi_requested() as u64)
     }),
+    ("ATLAS_QWEN4EXP_PREFILL_MULTI_CACHED", || {
+        Ok(crate::model::trait_impl::prefill_b::multi_cached() as u64)
+    }),
     ("ATLAS_QWEN4EXP_PREFILL_BF16_PROJ", || {
         Ok(crate::layers::ops::qwen4exp_rowinv::bf16_proj() as u64)
     }),
