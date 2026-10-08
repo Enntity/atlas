@@ -13,6 +13,8 @@ use super::diag_norm;
 use crate::layer::{BatchedAttnMetadata, ForwardContext, LayerState};
 use crate::layers::ops;
 
+#[path = "prefill_multi.rs"]
+mod prefill_multi;
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prefill_inner(

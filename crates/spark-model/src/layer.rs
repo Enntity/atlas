@@ -20,7 +20,7 @@ pub use prefill_pieces::{
     PREFILL_ATTENTION_ROWS, PREFILL_MAX_SUB_CHUNKS, prefill_attention_pieces,
 };
 mod multi_seg;
-pub use multi_seg::MultiSeg;
+pub use multi_seg::{MultiPass, MultiSeg};
 mod transformer_layer;
 pub use transformer_layer::{
     TransformerLayer, VERIFY_WY_LAYER_STRIDE_BYTES, VERIFY_WY_TABLE_SEQS,

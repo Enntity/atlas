@@ -69,6 +69,10 @@ impl ResponseSink {
 
 /// An in-progress chunked prefill (prompt being processed in chunks).
 pub(super) struct PrefillInProgress {
+    /// Deferred to a multi-sequence prefill pass (`ATLAS_QWEN4EXP_PREFILL_MULTI`):
+    /// its worker ranks got no prefill command, so only that pass may run it
+    /// (`prefill_multi`). Set once, by the deferral in `prefill_a_step`.
+    pub multi: bool,
     /// Arc-wrapped so the original request, the per-prefill scheduler
     /// state, and any retry path (Tier 5c) can share the read-only
     /// token slice without copying ~40 KB on every long prompt.

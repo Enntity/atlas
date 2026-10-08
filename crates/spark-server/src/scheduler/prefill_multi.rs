@@ -21,12 +21,14 @@
 
 use std::time::Instant;
 
-use spark_model::layers::ops::qwen4exp_rowinv::MULTI_MAX_PROMPT;
+use spark_model::layers::ops::qwen4exp_rowinv::{MULTI_MAX_PROMPT, MULTI_MAX_SEQS};
+use spark_model::model::kv_admission::kv_admission_refusal;
 use spark_model::traits::{Model, PrefillSlice};
 use spark_runtime::gpu::DevicePtr;
 
+use super::lifecycle::send_error;
 use super::sample_first_token;
-use super::types::PrefillInProgress;
+use super::types::{ActiveSeq, PrefillInProgress};
 
 /// Whether a prompt takes the multi-sequence prefill.
 pub(super) fn eligible(
@@ -43,16 +45,11 @@ pub(super) fn eligible(
         && adapter_slot < 0
 }
 
-/// A waiting prefill this phase takes.
-fn takes(model: &dyn Model, p: &PrefillInProgress) -> bool {
-    p.chunk_offset == 0
-        && eligible(
-            model,
-            p.prompt_tokens.len(),
-            true,
-            p.seq.collect_prompt_logprobs.is_some(),
-            p.seq.adapter_slot,
-        )
+/// A waiting prefill this phase takes: one the admission deferred to it
+/// (`PrefillInProgress::multi`, the single source of truth: its worker got no
+/// prefill command) and that has not run.
+fn takes(p: &PrefillInProgress) -> bool {
+    p.multi && p.chunk_offset == 0
 }
 
 /// Rows one pass takes (`ATLAS_QWEN4EXP_PREFILL_MULTI_MAX_TOKENS`, default
@@ -70,36 +67,41 @@ pub(super) fn max_rows() -> usize {
 
 /// Whether eligible prompts already wait for a pass.
 pub(super) fn pending(model: &dyn Model, prefilling: &[PrefillInProgress]) -> bool {
-    model.supports_prefill_multi() && prefilling.iter().any(|p| takes(model, p))
+    model.supports_prefill_multi() && prefilling.iter().any(takes)
 }
 
-/// Run every waiting eligible prompt, in passes of at most [`max_rows`]
-/// rows. Returns whether anything ran; `completed` gets `(index, first
-/// token)` per prompt (`None`: failed, freed by the promotion).
+/// Run every waiting deferred prompt, in passes of at most [`max_rows`]
+/// rows (and the arena's `max_batch_tokens`) and `MULTI_MAX_SEQS` prompts.
+/// Returns whether anything ran; `completed` gets `(index, first token)` per
+/// prompt that finished (`None`: failed, freed by the promotion). A pass the
+/// KV pool cannot admit preempts the largest active sequence and runs again,
+/// as a single prefill does (`prefill_preempt`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     model: &dyn Model,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     prefilling: &mut [PrefillInProgress],
+    active: &mut Vec<ActiveSeq>,
     completed: &mut Vec<(usize, Option<u32>)>,
+    max_batch_tokens: usize,
     prefill_stream: u64,
     prefill_event: u64,
 ) -> bool {
-    if !model.supports_prefill_multi() {
-        return false;
-    }
     let mut waiting: Vec<usize> = (0..prefilling.len())
-        .filter(|&i| takes(model, &prefilling[i]))
+        .filter(|&i| takes(&prefilling[i]))
         .collect();
     if waiting.is_empty() {
         return false;
     }
+    let cap = max_rows().min(max_batch_tokens);
     while !waiting.is_empty() {
         let mut rows = 0usize;
         let take = waiting
             .iter()
+            .take(MULTI_MAX_SEQS)
             .take_while(|&&i| {
                 rows += prefilling[i].prompt_tokens.len();
-                rows <= max_rows()
+                rows <= cap
             })
             .count()
             .max(1);
@@ -108,6 +110,7 @@ pub(super) fn run(
             model,
             sched,
             prefilling,
+            active,
             &pass,
             completed,
             prefill_stream,
@@ -117,47 +120,60 @@ pub(super) fn run(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_pass(
     model: &dyn Model,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     prefilling: &mut [PrefillInProgress],
+    active: &mut Vec<ActiveSeq>,
     pass: &[usize],
     completed: &mut Vec<(usize, Option<u32>)>,
     prefill_stream: u64,
     prefill_event: u64,
 ) {
     let t0 = Instant::now();
-    let mut in_pass = vec![false; prefilling.len()];
-    pass.iter().for_each(|&i| in_pass[i] = true);
-    let mut slices: Vec<PrefillSlice<'_>> = prefilling
-        .iter_mut()
-        .enumerate()
-        .filter(|(i, _)| in_pass[*i])
-        .map(|(_, p)| PrefillSlice {
-            prompt_tokens: &p.prompt_tokens,
-            seq: &mut p.seq,
-            chunk_start: 0,
-            chunk_len: p.prompt_tokens.len(),
-            is_last_chunk: true,
-        })
-        .collect();
-    let logits = model.prefill_multi(&mut slices, prefill_stream);
-    drop(slices);
-    let logits: Vec<DevicePtr> = match logits {
-        Ok(l) if l.len() == pass.len() => l,
-        Ok(l) => {
-            tracing::error!(
-                "prefill_multi returned {} logits for {} prompts",
-                l.len(),
-                pass.len()
-            );
-            completed.extend(pass.iter().map(|&i| (i, None)));
-            return;
-        }
-        Err(e) => {
-            tracing::error!("prefill_multi of {} prompts failed: {e:#}", pass.len());
-            completed.extend(pass.iter().map(|&i| (i, None)));
-            return;
+    let logits = loop {
+        match prefill_pass(model, prefilling, pass, prefill_stream) {
+            Err(e) if kv_admission_refusal(&e).is_some_and(|r| r.retryable) => {
+                // Every rank refused before the forward and kept only what a
+                // rerun replays: free the largest active sequence, run again.
+                let Some(vi) = active
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| a.grammar_state.is_none())
+                    .max_by_key(|(_, a)| a.seq.block_table.len())
+                    .map(|(i, _)| i)
+                else {
+                    tracing::error!("prefill_multi of {} prompts: {e:#}", pass.len());
+                    completed.extend(pass.iter().map(|&i| (i, None)));
+                    return;
+                };
+                let mut victim = active.remove(vi);
+                tracing::warn!(
+                    "{e:#}: preempting slot={} so a multi-sequence prefill can proceed",
+                    victim.seq.slot_idx
+                );
+                send_error(
+                    model,
+                    &mut victim,
+                    "preempted: KV cache exhausted (a prefill needed its blocks)",
+                );
+            }
+            Ok(l) if l.len() == pass.len() => break l,
+            Ok(l) => {
+                tracing::error!(
+                    "prefill_multi returned {} logits for {} prompts",
+                    l.len(),
+                    pass.len()
+                );
+                completed.extend(pass.iter().map(|&i| (i, None)));
+                return;
+            }
+            Err(e) => {
+                tracing::error!("prefill_multi of {} prompts failed: {e:#}", pass.len());
+                completed.extend(pass.iter().map(|&i| (i, None)));
+                return;
+            }
         }
     };
     let _ = model.record_event(prefill_event, prefill_stream);
@@ -191,4 +207,28 @@ fn run_pass(
             .sum::<usize>(),
         t0.elapsed().as_secs_f64() * 1e3
     );
+}
+
+/// One `Model::prefill_multi` over the prompts `pass` of `prefilling`.
+fn prefill_pass(
+    model: &dyn Model,
+    prefilling: &mut [PrefillInProgress],
+    pass: &[usize],
+    prefill_stream: u64,
+) -> anyhow::Result<Vec<DevicePtr>> {
+    let mut in_pass = vec![false; prefilling.len()];
+    pass.iter().for_each(|&i| in_pass[i] = true);
+    let mut slices: Vec<PrefillSlice<'_>> = prefilling
+        .iter_mut()
+        .enumerate()
+        .filter(|(i, _)| in_pass[*i])
+        .map(|(_, p)| PrefillSlice {
+            prompt_tokens: &p.prompt_tokens,
+            seq: &mut p.seq,
+            chunk_start: 0,
+            chunk_len: p.prompt_tokens.len(),
+            is_last_chunk: true,
+        })
+        .collect();
+    model.prefill_multi(&mut slices, prefill_stream)
 }

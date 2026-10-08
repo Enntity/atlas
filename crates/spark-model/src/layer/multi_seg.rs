@@ -3,6 +3,10 @@
 //! One sequence's rows of a multi-sequence prefill pass
 //! (`ATLAS_QWEN4EXP_PREFILL_MULTI`, `TransformerLayer::prefill_multi`).
 
+use anyhow::Result;
+use spark_runtime::gpu::DevicePtr;
+use spark_runtime::kv_cache::PagedKvCache;
+
 use super::{ForwardContext, LayerState};
 
 /// A sequence's rows `[row0, row0 + rows)` of the pass, at sequence positions
@@ -19,4 +23,20 @@ pub struct MultiSeg<'s, 'c> {
     pub disk_block_ids: &'s mut Vec<u32>,
     pub disk_last_offloaded_per_layer: &'s mut Vec<u32>,
     pub ctx: &'s ForwardContext<'c>,
+}
+
+/// One layer's multi-sequence prefill pass: the sequences' rows `segs`, back
+/// to back in `hidden` (`total` rows), with the pass's own context.
+pub struct MultiPass<'s, 'c> {
+    pub hidden: DevicePtr,
+    pub total: usize,
+    pub segs: Vec<MultiSeg<'s, 'c>>,
+    pub kv_cache: &'s mut PagedKvCache,
+    pub ctx: &'s ForwardContext<'c>,
+    pub stream: u64,
+}
+
+/// The default `TransformerLayer::prefill_multi`.
+pub(crate) fn unsupported(_pass: &mut MultiPass<'_, '_>) -> Result<()> {
+    anyhow::bail!("this layer has no multi-sequence prefill")
 }
