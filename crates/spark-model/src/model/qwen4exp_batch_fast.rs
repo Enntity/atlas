@@ -179,16 +179,24 @@ pub(crate) fn no_clamp_requested(model_type: &str) -> bool {
         && *ON.get_or_init(|| std::env::var("ATLAS_QWEN4EXP_MOE_NO_CLAMP").as_deref() == Ok("1"))
 }
 
-/// `ATLAS_QWEN4EXP_MOE_ROUTE_DUMP=<file>` (diagnostic): each rows-pair MoE
-/// launch appends its `[rows, top_k]` expert ids to `<file>` as one line
-/// (synchronizing the stream). `scripts/dev/qwen4exp_moe_c8_bench.cu` replays
-/// the lines (`ROUTES=<file>`). Read once.
+/// `ATLAS_QWEN4EXP_MOE_ROUTE_DUMP=<file>` (diagnostic, local only: its
+/// `.bin` holds request activations; `layers/moe/route_dump.rs`): each
+/// rows-pair MoE launch appends its `[rows, top_k]` expert ids to `<file>` as
+/// one line (synchronizing the stream). `scripts/dev/qwen4exp_moe_c8_bench.cu`
+/// replays the lines (`ROUTES=<file>`). Read once.
 pub(crate) fn route_dump_path() -> Option<&'static str> {
     static PATH: OnceLock<Option<String>> = OnceLock::new();
     PATH.get_or_init(|| {
-        std::env::var("ATLAS_QWEN4EXP_MOE_ROUTE_DUMP")
+        let path = std::env::var("ATLAS_QWEN4EXP_MOE_ROUTE_DUMP")
             .ok()
-            .filter(|p| !p.is_empty())
+            .filter(|p| !p.is_empty());
+        if let Some(p) = &path {
+            tracing::warn!(
+                "ATLAS_QWEN4EXP_MOE_ROUTE_DUMP={p}: writing MoE routes and input \
+                 activations of every request to disk; local diagnosis only"
+            );
+        }
+        path
     })
     .as_deref()
 }
