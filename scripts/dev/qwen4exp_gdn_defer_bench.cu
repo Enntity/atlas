@@ -34,12 +34,15 @@ static void stage_alloc(const GdnShape& s, DeferStage& st) {
 }
 
 struct DeferRowsArg {
-    struct { const float* h; const float* conv; bf* sq; float* sg; u32 row0, k; } seq[ROWS_MAX];
+    struct { float* h; float* conv; bf* sq; float* sg; u32 row0, k; const u32* fuse_n; } seq[ROWS_MAX];
 };
-static_assert(sizeof(DeferRowsArg) == 40 * ROWS_MAX, "QdfDeferRows layout");
+static_assert(sizeof(DeferRowsArg) == 48 * ROWS_MAX, "QdfDeferRows layout");
 
+// `fuse`: each sequence's pending-commit word (ATLAS_QWEN4EXP_GDN_COMMIT_FUSE),
+// or none (the unfused kernel).
 static void verify_defer(CUfunction fn, const GdnShape& s, const GdnWeights& w,
-                         std::vector<VerifySeq>& seqs, std::vector<DeferStage>& stg, GdnIo& io) {
+                         std::vector<VerifySeq>& seqs, std::vector<DeferStage>& stg, GdnIo& io,
+                         const std::vector<Buf<u32>>* fuse = nullptr) {
     const float l2 = 1e-6f, eps = 1e-6f;
     const u32 d = D, stride = qkvz_dim(s);
     for (size_t first = 0; first < seqs.size(); first += ROWS_MAX) {
@@ -47,7 +50,8 @@ static void verify_defer(CUfunction fn, const GdnShape& s, const GdnWeights& w,
         DeferRowsArg t = {};
         for (u32 i = 0; i < count; i++) {
             VerifySeq& v = seqs[first + i];
-            t.seq[i] = {v.st.h.p, v.st.conv.p, stg[first + i].qkv.p, stg[first + i].gb.p, v.row0, v.k};
+            const u32* fw = fuse ? (*fuse)[first + i].p : nullptr;
+            t.seq[i] = {v.st.h.p, v.st.conv.p, stg[first + i].qkv.p, stg[first + i].gb.p, v.row0, v.k, fw};
         }
         Args a;
         a.add(t).add(io.qkvz.p).add(w.conv_w.p).add(io.gates.p).add(w.norm_w.p).add(io.out.p)
@@ -93,12 +97,16 @@ static bool defer_check(const GdnShape& s, int steps) {
     CUfunction ck = mod("qwen4exp_decode_fuse").fn("qwen4exp_gdn_commit_layers");
     std::vector<GdnWeights> w(NL);
     for (auto& x : w) gdn_weights(s, x);
-    int bad = 0, commits = 0;
+    int bad = 0, commits = 0, fuse_commits = 0;
     for (u32 nseq : {1u, 2u, 3u, 5u, 8u, 12u}) {
         for (int ragged = 0; ragged < 2; ragged++) {
-            // a: storing kernel (reference); b: deferred; c: commit scratch.
-            std::vector<std::vector<VerifySeq>> a(NL, std::vector<VerifySeq>(nseq)), b = a;
-            std::vector<std::vector<DeferStage>> stg(NL, std::vector<DeferStage>(nseq));
+            // a: storing kernel (reference); b: deferred; c: commit scratch;
+            // f: deferred with the commit fused into the next verify (`fw`:
+            // one pending-commit word a sequence, shared by its layers).
+            std::vector<std::vector<VerifySeq>> a(NL, std::vector<VerifySeq>(nseq)), b = a, f = a;
+            std::vector<std::vector<DeferStage>> stg(NL, std::vector<DeferStage>(nseq)), stgf = stg;
+            std::vector<Buf<u32>> fw(nseq);
+            for (auto& x : fw) x.alloc(1);
             std::vector<std::vector<GdnSeq>> c(NL, std::vector<GdnSeq>(nseq));
             u32 rows = 0;
             std::vector<u32> ks(nseq), row0(nseq);
@@ -107,14 +115,17 @@ static bool defer_check(const GdnShape& s, int steps) {
                 row0[i] = rows;
                 rows += ks[i];
             }
-            std::vector<GdnIo> ia(NL), ib(NL);
+            std::vector<GdnIo> ia(NL), ib(NL), iff(NL);
             for (u32 l = 0; l < NL; l++) {
-                gdn_io(s, ia[l], rows); gdn_io(s, ib[l], rows);
+                gdn_io(s, ia[l], rows); gdn_io(s, ib[l], rows); gdn_io(s, iff[l], rows);
                 for (u32 i = 0; i < nseq; i++) {
                     vseq_alloc(s, a[l][i], true);
                     gdn_seq(s, b[l][i].st, false);  // no rollback slots: the arm stores none
                     a[l][i].k = ks[i]; a[l][i].row0 = row0[i];
                     vseq_copy(b[l][i], a[l][i]);
+                    gdn_seq(s, f[l][i].st, false);
+                    vseq_copy(f[l][i], a[l][i]);
+                    stage_alloc(s, stgf[l][i]);
                     stage_alloc(s, stg[l][i]);
                     gdn_seq(s, c[l][i], false);
                 }
@@ -124,9 +135,10 @@ static bool defer_check(const GdnShape& s, int steps) {
                 for (u32 l = 0; l < NL; l++) {
                     auto q = rbf(ia[l].qkvz.n, st == 0 ? 3.0f : 1.0f);
                     auto g = gate_rows(ia[l].gates.n);
-                    for (GdnIo* io : {&ia[l], &ib[l]}) { io->qkvz.put(q); io->gates.put(g); io->out.fill(0x7F); }
+                    for (GdnIo* io : {&ia[l], &ib[l], &iff[l]}) { io->qkvz.put(q); io->gates.put(g); io->out.fill(0x7F); }
                     verify_rows(vk, s, w[l], a[l], ia[l]);
                     verify_defer(dk, s, w[l], b[l], stg[l], ib[l]);
+                    verify_defer(dk, s, w[l], f[l], stgf[l], iff[l], &fw);
                 }
                 CK(cudaDeviceSynchronize());
                 char what[192];
@@ -134,6 +146,17 @@ static bool defer_check(const GdnShape& s, int steps) {
                     snprintf(what, sizeof what, "%s defer n=%u %s step %d layer %u: normed rows", s.name, nseq,
                              ragged ? "ragged" : "k=2..8", st, l);
                     bad += !same(what, ia[l].out, ib[l].out, ia[l].out.n);
+                    snprintf(what, sizeof what, "%s fuse n=%u %s step %d layer %u: normed rows", s.name, nseq,
+                             ragged ? "ragged" : "k=2..8", st, l);
+                    bad += !same(what, ia[l].out, iff[l].out, ia[l].out.n);
+                    // The fused verify stored the previous step's commit: the
+                    // state the deferred arm committed in place last step.
+                    for (u32 i = 0; i < nseq; i++) {
+                        snprintf(what, sizeof what, "%s fuse step %d seq %u layer %u: fused commit", s.name,
+                                 st, i, l);
+                        bad += !same(what, f[l][i].st.h, b[l][i].st.h, b[l][i].st.h.n);
+                        bad += !same(what, f[l][i].st.conv, b[l][i].st.conv, b[l][i].st.conv.n);
+                    }
                 }
                 // Every accepted length of every sequence, from H0.
                 for (u32 i = 0; i < nseq; i++) {
@@ -164,6 +187,8 @@ static bool defer_check(const GdnShape& s, int steps) {
                     for (u32 l = 0; l < NL; l++)
                         e.push_back({b[l][i].st.h.p, b[l][i].st.conv.p, stg[l][i].qkv.p, stg[l][i].gb.p, w[l].conv_w.p});
                     commit(ck, s, e, n);
+                    fw[i].put({n});  // the fused arm commits it in its next verify
+                    fuse_commits++;
                     CK(cudaDeviceSynchronize());
                     for (u32 l = 0; l < NL; l++) {
                         snprintf(what, sizeof what, "%s defer step %d seq %u layer %u n=%u: in-place commit",
@@ -174,12 +199,31 @@ static bool defer_check(const GdnShape& s, int steps) {
                     }
                 }
             }
+            // The last step's commit is still pending on the fused arm: the
+            // standalone commit (a flush) lands it.
+            for (u32 i = 0; i < nseq; i++) {
+                const u32 n = fw[i].get()[0];
+                std::vector<CommitEntry> e;
+                for (u32 l = 0; l < NL; l++)
+                    e.push_back({f[l][i].st.h.p, f[l][i].st.conv.p, stgf[l][i].qkv.p, stgf[l][i].gb.p, w[l].conv_w.p});
+                commit(ck, s, e, n);
+                CK(cudaDeviceSynchronize());
+                char what[192];
+                for (u32 l = 0; l < NL; l++) {
+                    snprintf(what, sizeof what, "%s fuse seq %u layer %u n=%u: flush", s.name, i, l, n);
+                    bad += !same(what, f[l][i].st.h, b[l][i].st.h, b[l][i].st.h.n);
+                    bad += !same(what, f[l][i].st.conv, b[l][i].st.conv, b[l][i].st.conv.n);
+                }
+            }
+            for (auto& x : fw) x.free_();
             for (u32 l = 0; l < NL; l++) {
                 for (auto& v : a[l]) vseq_free(v);
                 for (auto& v : b[l]) vseq_free(v);
+                for (auto& v : f[l]) { v.st.h.free_(); v.st.conv.free_(); }
+                for (auto& x : stgf[l]) { x.qkv.free_(); x.gb.free_(); }
                 for (auto& x : stg[l]) { x.qkv.free_(); x.gb.free_(); }
                 for (auto& x : c[l]) { x.h.free_(); x.conv.free_(); }
-                for (GdnIo* io : {&ia[l], &ib[l]}) {
+                for (GdnIo* io : {&ia[l], &ib[l], &iff[l]}) {
                     io->ba_in.free_(); io->qkvz.free_(); io->out.free_(); io->gates.free_(); io->conv_out.free_();
                 }
             }
@@ -188,8 +232,9 @@ static bool defer_check(const GdnShape& s, int steps) {
     printf("  %s qwen4exp_gdn_verify_defer_rows + qwen4exp_gdn_commit_layers %s: n = 1, 2, 3, 5, 8, 12 "
            "sequences x k = 2..%u and ragged 1..%u x %d steps x %u layers: normed rows equal, and %d "
            "commits (every accepted length 1..k of every sequence, from H0, plus one in place a step) "
-           "land the storing kernel's recurrence and conv bytes\n",
-           bad ? "BAD" : "ok ", s.name, KMAX, KMAX, steps, NL, commits);
+           "land the storing kernel's recurrence and conv bytes; fused into the next verify (%d "
+           "commits + a flush each): normed rows and committed state equal\n",
+           bad ? "BAD" : "ok ", s.name, KMAX, KMAX, steps, NL, commits, fuse_commits);
     for (auto& x : w) { x.conv_w.free_(); x.ba_w.free_(); x.norm_w.free_(); x.a_log.free_(); x.dt_bias.free_(); }
     return bad == 0;
 }
@@ -224,6 +269,19 @@ static void defer_time(const GdnShape& s) {
         printf("  k=%u  %7.1f -> %7.1f us/layer  (x36 layers: %.2f -> %.2f ms/step)\n", kk, a, b,
                36 * a / 1e3, 36 * b / 1e3);
     }
+    // ATLAS_QWEN4EXP_GDN_COMMIT_FUSE: the deferred verify that first lands the
+    // previous step's commit of n tokens (and stores the state once).
+    std::vector<Buf<u32>> fw(NS);
+    for (auto& x : fw) x.alloc(1);
+    for (auto& L : seqs) for (u32 i = 0; i < NS; i++) { L[i].k = 4; L[i].row0 = i * 4; }
+    printf("  fused commit + verify, k=4 (us/layer, x36 ms/step):");
+    for (u32 n : {0u, 1u, 3u, 4u}) {
+        for (auto& x : fw) x.put({n});
+        const double c = graph_us([&](int l) { verify_defer(dk, s, ws[l], seqs[l], stg[l], io, &fw); }, NLT);
+        printf("  n=%u %.1f (%.2f)", n, c, 36 * c / 1e3);
+    }
+    printf("\n");
+    for (auto& x : fw) x.free_();
     // Commit of one sequence over 36 GDN layers: the replay (one launch) vs
     // the pitched copies of the storing path (H then conv, 36 rows each).
     const u32 L36 = 36;

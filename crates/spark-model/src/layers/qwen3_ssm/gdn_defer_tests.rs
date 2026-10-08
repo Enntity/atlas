@@ -16,6 +16,7 @@ fn state(pending: bool) -> SsmLayerState {
         gdn_commit_qkv: DevicePtr(0x3000),
         gdn_commit_gb: DevicePtr(0x4000),
         gdn_commit_pending: pending,
+        gdn_fuse_n: DevicePtr::NULL,
         h_is_f16: false,
         h_prefill_stage: None,
         ple: None,
