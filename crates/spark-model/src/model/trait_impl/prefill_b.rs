@@ -37,7 +37,7 @@ mod midchunk_capture;
 mod multi;
 mod multi_ep;
 mod multi_head;
-pub use multi_ep::multi_requested;
+pub use multi_ep::{multi_cached, multi_requested};
 pub(in crate::model) mod pc_inflight;
 pub(in crate::model) mod pc_policy;
 mod prefix_lookup;
