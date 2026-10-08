@@ -610,11 +610,13 @@ impl Model for TransformerModel {
             ks.len(),
             seqs.len()
         );
-        // Over a TP pair the worker runs the same forward (`ep_verify_batch`).
-        self.ep_broadcast_verify_batch(tokens, ks, seqs)?;
+        // Rank-local, and it can fail: before the broadcast, so a failure
+        // never leaves the worker inside the verify's collectives.
         for (seq, &k) in seqs.iter_mut().zip(ks) {
             self.mark_gdn_deferred_commit(seq, k)?;
         }
+        // Over a TP pair the worker runs the same forward (`ep_verify_batch`).
+        self.ep_broadcast_verify_batch(tokens, ks, seqs)?;
         self.decode_verify_batched_dispatch(tokens, ks, seqs, _stream)
     }
     fn ep_broadcast_verify_verdicts(&self, accepted: &[u32]) -> Result<()> {

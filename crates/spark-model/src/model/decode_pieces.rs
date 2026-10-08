@@ -332,31 +332,41 @@ impl TransformerModel {
         seen.dedup();
         let table = (pitched && super::qsa_commit_table::requested() && seen.len() == runs.len())
             .then(crate::layers::qsa::CommitTable::enter);
-        for li in 0..self.layers.len() {
+        let mut staged = Ok(());
+        'layers: for li in 0..self.layers.len() {
             if self.config.layer_type(li) != LayerType::FullAttention
                 || !self.piece_capturable(li, true)
             {
                 continue;
             }
             for &(row, owner, pos, count) in &runs {
-                let states = owners
+                let r = owners
                     .get_mut(owner)
-                    .ok_or_else(|| anyhow::anyhow!("staged QSA commit: no owner {owner}"))?;
-                self.layers[li].qsa_commit_staged(
-                    states[li].as_mut(),
-                    row,
-                    pos,
-                    count,
-                    pitched,
-                    self.gpu.as_ref(),
-                    stream,
-                )?;
+                    .ok_or_else(|| anyhow::anyhow!("staged QSA commit: no owner {owner}"))
+                    .and_then(|states| {
+                        self.layers[li].qsa_commit_staged(
+                            states[li].as_mut(),
+                            row,
+                            pos,
+                            count,
+                            pitched,
+                            self.gpu.as_ref(),
+                            stream,
+                        )
+                    });
+                if r.is_err() {
+                    staged = r;
+                    break 'layers;
+                }
             }
         }
+        // Every collected entry already advanced its state's counters: launch
+        // them even when a later commit failed, so no state runs ahead of its
+        // keys; then report that failure.
         if let Some(table) = table {
             super::qsa_commit_table::launch(self.gpu.as_ref(), &table.take(), stream)?;
         }
-        Ok(())
+        staged
     }
 }
 

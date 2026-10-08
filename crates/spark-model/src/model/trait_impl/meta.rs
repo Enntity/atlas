@@ -248,6 +248,10 @@ impl TransformerModel {
         let slot = slot_guard
             .idx()
             .expect("claim_guarded returns a guard owning a slot");
+        // A slot released by its guard (abort, panic) skipped `free`: drop any
+        // commit its last sequence left pending, or a flush would land it on
+        // this one (ATLAS_QWEN4EXP_GDN_COMMIT_FUSE).
+        self.gdn_fuse_drop_slot(slot);
         let t_claim = t_alloc.elapsed();
         // NOTE: `reset_slot` below zeroes h_state + conv_state + intermediates +
         // checkpoints — a strict superset of `zero_slot` (h+conv only). The
