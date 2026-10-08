@@ -24,13 +24,14 @@ impl Qwen3SsmLayer {
             && self.gdn_prefill_fla_chunk_fwd_o_k.0 != 0
     }
 
-    /// Capture this layer's recurrent state at the checkpoint row, when a
+    /// Capture this layer's recurrent state at the checkpoint rows, when a
     /// checkpoint pass is running:
     /// * FLA (cold passes): arm the state spine's `_cap` twin when the row is
-    ///   a 64-token chunk boundary; the FLA launch takes it. `Ok(false)`.
+    ///   a 64-token chunk boundary (the `_capn` twin for more than one row);
+    ///   the FLA launch takes it. `Ok(false)`.
     /// * Token-sequential warm-replay recurrence (`gdn_regresident`): run it
-    ///   over `[0, row)`, copy the state out, run `[row, k)` from it -- the
-    ///   state chains across the split token by token, as across chunks.
+    ///   up to each row, copy the state out, run on from it -- the state
+    ///   chains across a split token by token, as across chunks.
     ///   `Ok(true)`: the recurrence ran here.
     ///
     /// Anything else captures nothing and the model does not register the
@@ -48,8 +49,10 @@ impl Qwen3SsmLayer {
         let (Some(cap), Some(idx)) = (ctx.midchunk_capture.as_ref(), midcap_idx) else {
             return Ok(false);
         };
-        let cl = cap.cap_local;
-        if !ckpt::active() || cl == 0 || cl as u32 >= rows {
+        // Every capture point of the pass (the tail row, dense and
+        // branch-point rows), ascending.
+        let points = cap.points(idx, rows as usize);
+        if !ckpt::active() || points.is_empty() {
             return Ok(false);
         }
         // A stale arm (a spine that did not take it) must not reach this
@@ -57,16 +60,15 @@ impl Qwen3SsmLayer {
         let _ = ckpt::take_spine();
         if self.fla_route(ctx, kd, vd) {
             // The opt-in FlashInfer scan runs ahead of FLA and has no twin.
-            if cl.is_multiple_of(ckpt::CHUNK) && !ops::gdn_flashinfer::available() {
-                ckpt::arm_spine((cl / ckpt::CHUNK) as u32, cap.h_dsts[idx]);
+            // All points or none: a partial capture is never registered.
+            let on_grid = points.iter().all(|(cl, _)| cl.is_multiple_of(ckpt::CHUNK));
+            if on_grid && !ops::gdn_flashinfer::available() {
+                let arms: Vec<_> = points
+                    .iter()
+                    .map(|&(cl, (h, _))| ((cl / ckpt::CHUNK) as u32, h))
+                    .collect();
+                ckpt::arm_spines(&arms);
             }
-            return Ok(false);
-        }
-        if !(ctx.levers.gdn_regresident
-            && kd == 128
-            && vd == 128
-            && self.gdn_prefill_regresident_k.0 != 0)
-        {
             return Ok(false);
         }
         let [h_state, q, k, v, gates, out] = ptrs;
@@ -95,11 +97,15 @@ impl Qwen3SsmLayer {
                 stream,
             )
         };
-        seg(0, cl as u32)?;
-        ctx.gpu
-            .copy_d2d_async(h_state, cap.h_dsts[idx], cap.h_bytes, stream)?;
+        let mut start = 0usize;
+        for (cl, (h_dst, _)) in points {
+            seg(start, (cl - start) as u32)?;
+            ctx.gpu
+                .copy_d2d_async(h_state, h_dst, cap.h_bytes, stream)?;
+            start = cl;
+        }
         ckpt::h_captured();
-        seg(cl, rows - cl as u32)?;
+        seg(start, rows - start as u32)?;
         Ok(true)
     }
 }

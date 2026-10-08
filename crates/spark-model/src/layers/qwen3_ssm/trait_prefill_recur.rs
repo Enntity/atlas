@@ -420,12 +420,12 @@ impl Qwen3SsmLayer {
         stream: u64,
     ) -> Result<()> {
         if let (Some(cap), Some(idx)) = (ctx.midchunk_capture.as_ref(), midcap_idx) {
-            let cl = cap.cap_local;
-            if cl > 0 && (cl as u32) < k {
+            let points = cap.points(idx, k as usize);
+            if !points.is_empty() {
                 let bf16 = 2usize;
                 // Run the sliding-window conv over local tokens [start, start+len);
                 // conv_state is chained across calls (the same contract multi-chunk
-                // prefill relies on), so the split is byte-exact.
+                // prefill relies on), so every split is byte-exact.
                 let seg = |start: usize, len: u32| -> Result<()> {
                     ops::conv1d_update_prefill(
                         ctx.gpu,
@@ -444,24 +444,17 @@ impl Qwen3SsmLayer {
                         stream,
                     )
                 };
-                // Optional EARLIER capture at cap_local - bs (token tb - bs).
+                // Each capture point (the earlier `tb - bs` one, the tail
+                // boundary `tb`, qwen4_exp's dense / branch points), then
+                // the trailing tokens.
                 let mut start = 0usize;
-                if let Some(ce) = cap.cap_local_early {
-                    seg(0, ce as u32)?;
-                    ctx.gpu.copy_d2d_async(
-                        conv_state,
-                        cap.conv_dsts_early[idx],
-                        cap.conv_bytes,
-                        stream,
-                    )?;
-                    start = ce;
+                for (cl, (_, conv_dst)) in points {
+                    seg(start, (cl - start) as u32)?;
+                    ctx.gpu
+                        .copy_d2d_async(conv_state, conv_dst, cap.conv_bytes, stream)?;
+                    start = cl;
                 }
-                // Capture conv_state @ the tail boundary tb.
-                seg(start, (cl - start) as u32)?;
-                ctx.gpu
-                    .copy_d2d_async(conv_state, cap.conv_dsts[idx], cap.conv_bytes, stream)?;
-                // Trailing tokens [cap_local, k).
-                seg(cl, k - cl as u32)?;
+                seg(start, k - start as u32)?;
                 return Ok(());
             }
         }

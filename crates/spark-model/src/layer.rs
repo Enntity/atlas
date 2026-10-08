@@ -453,6 +453,8 @@ pub struct MidchunkCapture<'a> {
     pub h_dsts_early: &'a [DevicePtr],
     /// Per-SSM-layer conv_state dst for the `tb - block_size` slot.
     pub conv_dsts_early: &'a [DevicePtr],
+    /// qwen4_exp only: more points of the pass (`layers::qwen4exp_ckpt`).
+    pub extra: &'a [crate::layers::qwen4exp_ckpt::CapPoint],
 }
 
 /// Feature-1 MoE-LoRA fold decision for a single forward pass.

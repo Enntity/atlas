@@ -18,6 +18,7 @@ use crate::layers::{self, glm_kv_shard, glm_sp, moe, ops, qwen3_ssm, w4a16_gemv_
 use crate::model::glm_long_verify::{oracle_enabled, serial_diagnostic};
 use crate::model::trait_impl::finish_leaf;
 use crate::model::trait_impl::prefill_b::pc_policy as pc;
+use crate::model::trait_impl::prefill_b::qwen4exp_points as qp;
 use crate::model::{
     decode_pieces, glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry,
     qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_lmhead_split, qwen4exp_mtp_depth,
@@ -67,6 +68,11 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     }),
     ("ATLAS_GLM_PC_BRANCH_MIN", || {
         while_on(pc::glm_pc_branch_enabled(), pc::glm_pc_branch_min_tokens)
+    }),
+    ("ATLAS_QWEN4EXP_DENSE_CKPT", || Ok(qp::dense_every() as u64)),
+    ("ATLAS_QWEN4EXP_PC_BRANCH", || Ok(qp::branch_on() as u64)),
+    ("ATLAS_QWEN4EXP_PC_BRANCH_MIN", || {
+        while_on(qp::branch_on(), qp::branch_min)
     }),
     // In effect, that is with the preconditions `finish_leaf::flag` checks.
     ("ATLAS_GLM_PC_FINISH_LEAF", || {

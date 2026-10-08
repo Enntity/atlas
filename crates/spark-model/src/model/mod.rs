@@ -87,6 +87,7 @@ pub(crate) mod ssm_indexed_decode;
 pub(crate) mod ssm_pool;
 pub(crate) mod ssm_pools;
 pub(crate) mod ssm_snapshot;
+pub mod ssm_snapshot_budget;
 pub(crate) mod ssm_snapshot_faultin;
 pub(crate) mod ssm_snapshot_spill;
 mod ssm_snapshot_teardown;

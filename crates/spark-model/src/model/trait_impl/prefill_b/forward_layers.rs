@@ -119,6 +119,7 @@ impl TransformerModel {
             cap_local_early: p.cap_local_early,
             h_dsts_early: &p.h_dsts_early,
             conv_dsts_early: &p.conv_dsts_early,
+            extra: &p.extra,
         });
 
         // The chunk's ids were staged from `chunk_start` (host and device

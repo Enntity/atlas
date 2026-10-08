@@ -82,6 +82,12 @@ pub(in crate::model) struct MidCapturePlan {
     /// A qwen4_exp in-pass checkpoint (`qwen4exp_ckpt`): registered by its
     /// own finalize, and compatible with the sequence-parallel split.
     pub ckpt: bool,
+    /// qwen4_exp checkpoint passes: the capture points after the first
+    /// (dense and branch-point checkpoints), for the layers.
+    pub extra: Vec<crate::layers::qwen4exp_ckpt::CapPoint>,
+    /// qwen4_exp checkpoint passes: every point, the first included, as
+    /// (token, snapshot slot, branch point), in PLE staging order.
+    pub ckpt_points: Vec<(usize, usize, bool)>,
 }
 
 impl TransformerModel {
@@ -332,6 +338,8 @@ impl TransformerModel {
             h_dsts_early,
             conv_dsts_early,
             ckpt: false,
+            extra: Vec::new(),
+            ckpt_points: Vec::new(),
         })
     }
 

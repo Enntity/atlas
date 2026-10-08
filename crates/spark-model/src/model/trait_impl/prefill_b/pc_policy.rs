@@ -360,7 +360,10 @@ impl TransformerModel {
         bs: usize,
     ) -> Result<()> {
         seq.pc_branch_at = None;
-        if !glm_pc_branch_enabled()
+        // ATLAS_QWEN4EXP_PC_BRANCH: the same plan, captured in-pass
+        // (`qwen4exp_points`), with its own minimum.
+        let in_pass = self.qwen4exp_pc_branch();
+        if !(glm_pc_branch_enabled() || in_pass)
             || self.config.num_ssm_layers() == 0
             || !self.ssm_snapshots.is_enabled()
             || !self.prefix_cache.is_active()
@@ -368,7 +371,11 @@ impl TransformerModel {
         {
             return Ok(());
         }
-        let min = glm_pc_branch_min_tokens();
+        let min = if in_pass {
+            super::qwen4exp_points::branch_min()
+        } else {
+            glm_pc_branch_min_tokens()
+        };
         let Some(at) = branch_checkpoint_at(matched, skip_to, tokens.len(), bs, min) else {
             return Ok(());
         };
