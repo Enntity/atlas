@@ -515,10 +515,14 @@ pub fn build_model(
     let derived_reserve = crate::layers::ops::lazy_bf16_reserve(&store);
     // NVMe spill tiers (default off → 0): their staging, the index of a full
     // disk budget and the SSM tier's arena are all committed after this point.
-    let nvme_record_bytes =
-        PagedKvCache::nvme_record_bytes_for(&kv_config, glm_cache_plan.is_some(), sparse_index);
+    let nvme_geometry = PagedKvCache::nvme_geometry_for(
+        &kv_config,
+        glm_cache_plan.is_some(),
+        sparse_index,
+        glm_cache_plan.and_then(|p| p.shard()).is_some(),
+    );
     let inference_reserve = inference_reserve
-        + kv_nvme::host_reserve_bytes(nvme_record_bytes, ssm_pools.tier_lazy_host_bytes());
+        + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
         total_mem,
@@ -627,7 +631,7 @@ pub fn build_model(
         gpu.as_ref(),
         num_kv_blocks,
         glm_cache_plan,
-        kv_nvme::rank_word(nvme_record_bytes, ssm_pools.tier_home),
+        kv_nvme::rank_word(nvme_geometry, ssm_pools.tier_home),
     )?;
     let _max_kv_tokens = num_kv_blocks * kv_block_size;
     // Phase 6.1.f / 6.2.c — when --high-speed-swap is on with HBM-shrink, the
