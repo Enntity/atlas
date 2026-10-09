@@ -209,13 +209,6 @@ pub(super) fn shard_plan(
         kv_config.cache_blocks_per_seq.is_none(),
         "ATLAS_GLM_KV_SHARD=1 does not support --high-speed-swap"
     );
-    // The NVMe prefix tier spills and restores whole blocks' latents by
-    // physical id, and a rank stores only its own blocks'.
-    ensure!(
-        super::kv_nvme::config_from_env()?.is_none(),
-        "ATLAS_GLM_KV_SHARD=1 does not support the NVMe prefix tier ({})",
-        super::kv_nvme::DIR_VAR
-    );
     ensure!(
         (0..kv_config.num_layers).all(|l| matches!(
             kv_config.dtype_for_layer(l),
