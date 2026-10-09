@@ -308,7 +308,7 @@ impl ChatTokenizer {
         )
     }
 
-    /// `empty_think_off`: see [`super::chat_render::RenderFlags::empty_think_off`]
+    /// `empty_think_off`: see `chat_render::RenderFlags::empty_think_off`
     /// (OpenAI-variant templates only).
     pub fn apply_chat_template_openai_with_effort(
         &self,
