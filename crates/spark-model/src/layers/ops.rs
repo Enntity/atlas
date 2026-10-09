@@ -105,6 +105,9 @@ mod hyper_connection_dispatch;
 mod hyper_connection_lowrank;
 #[path = "ops/kda.rs"]
 mod kda;
+#[cfg(all(test, feature = "cuda"))]
+#[path = "ops/kda_commit_tests.rs"]
+mod kda_commit_tests;
 #[path = "ops/kda_indexed.rs"]
 mod kda_indexed;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
