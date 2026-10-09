@@ -393,7 +393,7 @@ template <int NT>
 __device__ __forceinline__ void dg_tc_load(
     DgTcChunk<NT>& t, const __nv_bfloat16* w0p, const __nv_bfloat16* w1p,
     const __nv_bfloat16* A, unsigned int g, unsigned int M, unsigned int K,
-    unsigned int kb, bool v0, bool v1
+    unsigned int lda, unsigned int kb, bool v0, bool v1
 ) {
     const uint4 z = make_uint4(0u, 0u, 0u, 0u);
     t.w0 = z; t.w1 = z;
@@ -405,7 +405,7 @@ __device__ __forceinline__ void dg_tc_load(
     #pragma unroll
     for (int i = 0; i < NT; i++) {
         const unsigned int row = 8u * i + g;
-        if (row < M) t.x[i] = *(const uint4*)(A + (unsigned long long)row * K + kb);
+        if (row < M) t.x[i] = *(const uint4*)(A + (unsigned long long)row * lda + kb);
     }
 }
 
@@ -417,7 +417,8 @@ __device__ __forceinline__ void dense_gemv_bf16_tc_impl(
     unsigned int M,
     unsigned int N,
     unsigned int K,
-    unsigned int out_stride
+    unsigned int out_stride,
+    unsigned int lda
 ) {
     __shared__ float s_red[DG_TC_WARPS][WARP_SIZE][NT * 4];
     const unsigned int warp = threadIdx.x / WARP_SIZE;
@@ -434,10 +435,10 @@ __device__ __forceinline__ void dense_gemv_bf16_tc_impl(
     const unsigned int chunks = (K + 31u) / 32u;
     DgTcChunk<NT> cur, nxt;
     unsigned int ch = warp;
-    if (ch < chunks) dg_tc_load<NT>(cur, w0p, w1p, A, g, M, K, ch * 32u + 8u * c, v0, v1);
+    if (ch < chunks) dg_tc_load<NT>(cur, w0p, w1p, A, g, M, K, lda, ch * 32u + 8u * c, v0, v1);
     for (; ch < chunks; ch += DG_TC_WARPS) {
         const unsigned int next = ch + DG_TC_WARPS;
-        if (next < chunks) dg_tc_load<NT>(nxt, w0p, w1p, A, g, M, K, next * 32u + 8u * c, v0, v1);
+        if (next < chunks) dg_tc_load<NT>(nxt, w0p, w1p, A, g, M, K, lda, next * 32u + 8u * c, v0, v1);
         const unsigned int w0w[4] = {cur.w0.x, cur.w0.y, cur.w0.z, cur.w0.w};
         const unsigned int w1w[4] = {cur.w1.x, cur.w1.y, cur.w1.z, cur.w1.w};
         #pragma unroll
@@ -487,7 +488,7 @@ dense_gemv_bf16_tc16(
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
     unsigned int out_stride
 ) {
-    dense_gemv_bf16_tc_impl<2>(A, B, C, M, N, K, out_stride);
+    dense_gemv_bf16_tc_impl<2>(A, B, C, M, N, K, out_stride, K);
 }
 
 extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE)
@@ -496,5 +497,35 @@ dense_gemv_bf16_tc32(
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
     unsigned int out_stride
 ) {
-    dense_gemv_bf16_tc_impl<4>(A, B, C, M, N, K, out_stride);
+    dense_gemv_bf16_tc_impl<4>(A, B, C, M, N, K, out_stride, K);
 }
+
+// NT = 1 instance for 1..8 rows (ATLAS_GLM_CANONICAL_VERIFY: the router, the
+// KDA beta/f/g and the MLA indexer projections at every verify width): the
+// tc16/tc32 body, so a row's bits match theirs whatever the row count.
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE)
+dense_gemv_bf16_tc8(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int out_stride
+) {
+    dense_gemv_bf16_tc_impl<1>(A, B, C, M, N, K, out_stride, K);
+}
+
+// Per-head twins (GLM MLA W_uk absorb / W_uv extract under
+// ATLAS_GLM_CANONICAL_VERIFY): head h = blockIdx.z multiplies the activation
+// columns [h*K, +K) of rows `lda` apart by W[h] ([G, N, K]) into output
+// columns [h*N, +N) of rows `ldc` apart. Same body per head: bit-identical
+// rows to the plain tiers, whatever the row count.
+#define DG_TC_GROUPED(NAME, NT)                                                              \
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) NAME(                 \
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,               \
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,          \
+    unsigned int lda, unsigned int ldc                                                       \
+) {                                                                                          \
+    const unsigned long long h = blockIdx.z;                                                 \
+    dense_gemv_bf16_tc_impl<NT>(A + h * K, B + h * N * K, C + h * N, M, N, K, ldc, lda);     \
+}
+DG_TC_GROUPED(dense_gemv_bf16_tc8_grouped, 1)
+DG_TC_GROUPED(dense_gemv_bf16_tc16_grouped, 2)
+DG_TC_GROUPED(dense_gemv_bf16_tc32_grouped, 4)
