@@ -292,8 +292,9 @@ fn canonical_w4a16_rows_do_not_depend_on_the_width() -> Result<()> {
     let mut failed = 0;
     let mut legacy_varies = 0;
     // KDA q/k/v/o (4096 x 4096), the shared expert's split gate/up
-    // (1024 x 4096) and its down K-slice (4096 x 1024).
-    for (n, k) in [(4096, 4096), (1024, 4096), (4096, 1024)] {
+    // (1024 x 4096) and its down K-slice (4096 x 1024), a dense FFN layer's
+    // gate/up and down (6144 x 4096, 4096 x 6144).
+    for (n, k) in [(4096, 4096), (1024, 4096), (4096, 1024), (6144, 4096), (4096, 6144)] {
         let w = w4(gpu, &mut rng, n, k)?;
         let probe = wide_row(&mut rng, k);
         let canon = probe_bits(&mut rng, &probe, k, &WIDTHS, |rows| {
