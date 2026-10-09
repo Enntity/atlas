@@ -8,8 +8,13 @@
 //! keep no residue), for both ranks' heads: BF16 outputs and merged LSEs must
 //! be bitwise equal, owner after owner on the same scratch. BF16 cases are
 //! also held to a double-precision softmax attention on the CPU.
+//! `canonical_and_shard_are_history_free` holds both forms to the same bits
+//! wherever the latents sit (other tables, production-sized pools) and
+//! whatever the pools' unmapped blocks, the scratch and the output held before
+//! (poison, or an earlier owner's scratch of another shape).
 //!
 //!   cargo test --release -p spark-model --lib canonical_matches_the_shard -- --ignored --nocapture
+//!   cargo test --release -p spark-model --lib canonical_and_shard_are_history_free -- --ignored --nocapture
 
 use super::*;
 use anyhow::{Context, bail};
@@ -105,6 +110,10 @@ enum Selection {
     Sparse { skew: usize, holes: bool },
     /// No selection: row `r` attends to tokens `[0, start + r + 1)`.
     Causal(u32),
+    /// What the indexer selects for row `r` at position `ctx - rows + r`: up
+    /// to 512 random 4-token pools in ascending order, -1 to 2048, then the
+    /// partial pool's tokens and -1 to the width.
+    Indexer,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -162,9 +171,31 @@ fn table(n: usize, half: usize, residues: bool, rng: &mut Rng) -> Vec<u32> {
         .collect()
 }
 
+fn indexer_row(len: usize, rng: &mut Rng) -> Vec<i32> {
+    let pools = len / 4;
+    let mut order: Vec<usize> = (0..pools).collect();
+    rng.shuffle(&mut order);
+    let mut chosen = order[..pools.min(512)].to_vec();
+    chosen.sort_unstable();
+    let mut row: Vec<i32> = chosen
+        .iter()
+        .flat_map(|p| (0..4).map(move |i| (p * 4 + i) as i32))
+        .collect();
+    row.resize(2048, -1);
+    row.extend((pools * 4..len).map(|t| t as i32));
+    row.resize(WIDTH as usize, -1);
+    row
+}
+
 fn selection(case: &Case, rng: &mut Rng) -> Option<Vec<i32>> {
-    let Selection::Sparse { skew, holes } = case.selection else {
-        return None;
+    let (skew, holes) = match case.selection {
+        Selection::Sparse { skew, holes } => (skew, holes),
+        Selection::Causal(_) => return None,
+        Selection::Indexer => {
+            let first = case.ctx - case.rows as usize;
+            let rows = (0..case.rows as usize).flat_map(|r| indexer_row(first + r + 1, rng));
+            return Some(rows.collect());
+        }
     };
     let width = WIDTH as usize;
     let mut out = Vec::with_capacity(case.rows as usize * width);
@@ -188,13 +219,46 @@ fn selection(case: &Case, rng: &mut Rng) -> Option<Vec<i32>> {
     Some(out)
 }
 
-fn upload<T: Copy>(gpu: &dyn GpuBackend, v: &[T]) -> Result<DevicePtr> {
-    let bytes = std::mem::size_of_val(v);
-    // SAFETY: plain-old-data slices (u8, u16, u32, i32) viewed as bytes.
-    let raw = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), bytes) };
-    let p = gpu.alloc(bytes.max(256))?;
-    gpu.copy_h2d(raw, p)?;
-    Ok(p)
+/// One case's device allocations, freed together when it ends.
+struct Allocs<'a> {
+    gpu: &'a dyn GpuBackend,
+    live: Mutex<Vec<DevicePtr>>,
+}
+
+impl<'a> Allocs<'a> {
+    fn new(gpu: &'a dyn GpuBackend) -> Self {
+        Self {
+            gpu,
+            live: Mutex::new(vec![]),
+        }
+    }
+
+    /// `bytes` of device memory, every byte `fill`.
+    fn alloc(&self, bytes: usize, fill: u8) -> Result<DevicePtr> {
+        let bytes = bytes.max(256);
+        let p = self.gpu.alloc(bytes)?;
+        self.live.lock().unwrap().push(p);
+        self.gpu.memset(p, fill, bytes)?;
+        Ok(p)
+    }
+
+    fn upload<T: Copy>(&self, v: &[T]) -> Result<DevicePtr> {
+        let bytes = std::mem::size_of_val(v);
+        // SAFETY: plain-old-data slices (u8, u16, u32, i32) viewed as bytes.
+        let raw = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), bytes) };
+        let p = self.alloc(bytes, 0)?;
+        self.gpu.copy_h2d(raw, p)?;
+        Ok(p)
+    }
+}
+
+impl Drop for Allocs<'_> {
+    fn drop(&mut self) {
+        let _ = self.gpu.synchronize(self.gpu.default_stream());
+        for p in self.live.lock().unwrap().drain(..) {
+            let _ = self.gpu.free(p);
+        }
+    }
 }
 
 fn download(gpu: &dyn GpuBackend, p: DevicePtr, bytes: usize) -> Result<Vec<u8>> {
@@ -252,56 +316,86 @@ fn reference(case: &Case, logical: &[Vec<u8>], query: &[u16], ids: &[Vec<i32>]) 
     out
 }
 
-/// One case: `Ok(differing bytes)` of outputs and LSEs over both ranks and
-/// every owner.
-fn run_case(gpu: &dyn GpuBackend, case: Case, seed: u64) -> Result<usize> {
+/// Where a case's latents sit and what the memory it reads held before; no
+/// placement may change a bit. `seed` draws the block tables, `pool_blocks`
+/// sizes the unsharded pool (the shard's halves follow; at least the
+/// history), and `poison` fills every pool block no table maps, every scratch
+/// and the outputs first. `scratch`: the canonical form's region, kept across
+/// cases, instead of a fresh one.
+#[derive(Clone, Copy, Debug)]
+struct Placement {
+    seed: u64,
+    pool_blocks: usize,
+    poison: u8,
+    scratch: Option<(DevicePtr, usize)>,
+}
+
+impl Placement {
+    /// Tight pools, zeroed memory, fresh scratch.
+    fn fresh() -> Self {
+        Self {
+            seed: 1,
+            pool_blocks: 0,
+            poison: 0,
+            scratch: None,
+        }
+    }
+}
+
+/// One case's results: the canonical form's outputs and LSEs per owner and
+/// rank, then the shard's, and how many of the forms' bytes differ.
+struct CaseOut {
+    differing: usize,
+    bits: Vec<Vec<u8>>,
+}
+
+fn run_case(gpu: &dyn GpuBackend, case: Case, seed: u64, place: Placement) -> Result<CaseOut> {
     let c = config();
+    let mem = Allocs::new(gpu);
+    // Contents and queries from `seed`, tables from the placement alone.
     let mut rng = Rng(seed | 1);
+    let mut placing = Rng(place.seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
     let (rows, bb) = (case.rows, block_bytes(case.dtype));
     let blocks = case.ctx.div_ceil(BS);
-    let half = blocks.div_ceil(2) + 3;
+    let half = blocks.max(place.pool_blocks).div_ceil(2) + 3;
     let logical: Vec<Vec<u8>> = (0..blocks)
         .map(|_| latent_block(case.dtype, &mut rng))
         .collect();
     // Unsharded: the whole history, any ids. Sharded: each rank its own
     // table (the ranks' ids differ, their residues do not) and half pool.
-    let table_u = table(blocks, half + 4, false, &mut rng);
-    let mut pool_u = vec![0u8; 2 * (half + 4) * bb];
+    let table_u = table(blocks, half + 4, false, &mut placing);
+    let pool_u = mem.alloc(2 * (half + 4) * bb, place.poison)?;
     for (l, &b) in table_u.iter().enumerate() {
-        pool_u[b as usize * bb..][..bb].copy_from_slice(&logical[l]);
+        gpu.copy_h2d(&logical[l], pool_u.offset(b as usize * bb))?;
     }
     let mut ranks = vec![];
     for r in 0..2u32 {
-        let t = table(blocks, half, true, &mut rng);
-        let mut pool = vec![0u8; half * bb];
+        let t = table(blocks, half, true, &mut placing);
+        let pool = mem.alloc(half * bb, place.poison)?;
         for (l, &b) in t.iter().enumerate().filter(|(_, b)| **b % 2 == r) {
-            pool[(b / 2) as usize * bb..][..bb].copy_from_slice(&logical[l]);
+            gpu.copy_h2d(&logical[l], pool.offset((b / 2) as usize * bb))?;
         }
         let identity: Vec<u32> = (0..half as u32).collect();
-        ranks.push((
-            upload(gpu, &t)?,
-            upload(gpu, &pool)?,
-            upload(gpu, &identity)?,
-        ));
+        ranks.push((mem.upload(&t)?, pool, mem.upload(&identity)?));
     }
-    let (table_u, pool_u) = (upload(gpu, &table_u)?, upload(gpu, &pool_u)?);
+    let table_u = mem.upload(&table_u)?;
 
     let qn = rows as usize * 32 * 512;
     let mut owners = vec![];
     for _ in 0..case.owners {
         let q: [Vec<u16>; 2] = [0, 1].map(|_| (0..qn).map(|_| bf16(rng.unit() * 0.6)).collect());
         let sel = selection(&case, &mut rng);
-        let dev_sel = sel.as_ref().map(|s| upload(gpu, s)).transpose()?;
+        let dev_sel = sel.as_ref().map(|s| mem.upload(s)).transpose()?;
         owners.push((
             q.clone(),
-            [upload(gpu, &q[0])?, upload(gpu, &q[1])?],
+            [mem.upload(&q[0])?, mem.upload(&q[1])?],
             sel,
             dev_sel,
         ));
     }
     let causal = match case.selection {
         Selection::Causal(start) => start,
-        Selection::Sparse { .. } => 0,
+        Selection::Sparse { .. } | Selection::Indexer => 0,
     };
     let splits = shard::merge_splits(rows);
     let m = MergeLayout::new(rows, splits);
@@ -312,7 +406,8 @@ fn run_case(gpu: &dyn GpuBackend, case: Case, seed: u64) -> Result<usize> {
     let shard_out: Vec<Vec<(Vec<u8>, Vec<u8>)>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..2usize)
             .map(|r| {
-                let (owners, ranks, posts, meet, c) = (&owners, &ranks, &posts, &meet, &c);
+                let (owners, ranks, posts, meet, c, mem) =
+                    (&owners, &ranks, &posts, &meet, &c, &mem);
                 scope.spawn(move || -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
                     gpu.bind_to_thread()?;
                     let stream = gpu.create_stream()?;
@@ -323,7 +418,7 @@ fn run_case(gpu: &dyn GpuBackend, case: Case, seed: u64) -> Result<usize> {
                         meet,
                     };
                     let (table, pool, identity) = ranks[r];
-                    let scratch = gpu.alloc(m.total)?;
+                    let scratch = mem.alloc(m.total, place.poison)?;
                     let merge = ShardMerge {
                         gpu,
                         comm: &comm,
@@ -349,7 +444,7 @@ fn run_case(gpu: &dyn GpuBackend, case: Case, seed: u64) -> Result<usize> {
                         scale: 0.0625,
                         lane: None,
                     };
-                    let output = gpu.alloc(out_bytes)?;
+                    let output = mem.alloc(out_bytes, place.poison)?;
                     let mut got = vec![];
                     for (_, q, _, sel) in owners {
                         let a = ShardRows {
@@ -379,12 +474,18 @@ fn run_case(gpu: &dyn GpuBackend, case: Case, seed: u64) -> Result<usize> {
     })?;
 
     // The canonical form, rank by rank on the main thread.
-    let canonical_bytes = ops::CanonicalLayout::bytes(rows);
-    let scratch = gpu.alloc(canonical_bytes)?;
+    let (scratch, canonical_bytes) = match place.scratch {
+        Some(region) => region,
+        None => {
+            let bytes = ops::CanonicalLayout::bytes(rows);
+            (mem.alloc(bytes, place.poison)?, bytes)
+        }
+    };
     let layout = ops::CanonicalLayout::new(rows, splits);
-    let output = gpu.alloc(out_bytes)?;
+    let output = mem.alloc(out_bytes, place.poison)?;
     let stream = gpu.default_stream();
     let mut differing = 0;
+    let mut bits = vec![];
     for (o, (q_host, q, sel, dev_sel)) in owners.iter().enumerate() {
         for r in 0..2u32 {
             let a = ops::GlmSparsePrefillTc {
@@ -416,6 +517,7 @@ fn run_case(gpu: &dyn GpuBackend, case: Case, seed: u64) -> Result<usize> {
                 println!("  rank {r} owner {o}: {d} bytes differ");
             }
             differing += d;
+            bits.extend([out.clone(), lse]);
             if case.dtype == KvCacheDtype::Bf16 && rows <= 4 {
                 let ids: Vec<Vec<i32>> = (0..rows as usize)
                     .map(|row| match sel {
@@ -443,7 +545,10 @@ fn run_case(gpu: &dyn GpuBackend, case: Case, seed: u64) -> Result<usize> {
             }
         }
     }
-    Ok(differing)
+    for (out, lse) in shard_out.into_iter().flatten() {
+        bits.extend([out, lse]);
+    }
+    Ok(CaseOut { differing, bits })
 }
 
 #[test]
@@ -485,7 +590,8 @@ fn canonical_matches_the_shard_bitwise() -> Result<()> {
     }
     let mut failed = 0;
     for (i, case) in cases.iter().enumerate() {
-        let differing = run_case(gpu, *case, 0x9e37_79b9_7f4a_7c15 ^ i as u64)?;
+        let seed = 0x9e37_79b9_7f4a_7c15 ^ i as u64;
+        let differing = run_case(gpu, *case, seed, Placement::fresh())?.differing;
         println!(
             "{} {case:?} splits={}",
             if differing == 0 { "BITWISE" } else { "DIFFERS" },
@@ -494,5 +600,116 @@ fn canonical_matches_the_shard_bitwise() -> Result<()> {
         failed += (differing != 0) as usize;
     }
     ensure!(failed == 0, "{failed} of {} cases differ", cases.len());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GB10 and a glm-5.3-flash kernel build"]
+fn canonical_and_shard_are_history_free() -> Result<()> {
+    let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+        .context("CUDA backend")?;
+    let gpu: &dyn GpuBackend = &gpu;
+    // One canonical region for every case: each owner finds the previous
+    // owner's partitions, IDs and counts (another row count, another
+    // context), or the first time, poison.
+    let shared_bytes = ops::CanonicalLayout::bytes(shard::MERGE_MAX_ROWS as u32);
+    let shared_base = gpu.alloc(shared_bytes)?;
+    gpu.memset(shared_base, 0x7f, shared_bytes)?;
+    let shared = Some((shared_base, shared_bytes));
+    let sparse = |skew, holes| Selection::Sparse { skew, holes };
+    let mut cases = vec![];
+    for dtype in [KvCacheDtype::Fp8G128, KvCacheDtype::Bf16] {
+        let case = |rows, ctx, selection| Case {
+            dtype,
+            rows,
+            ctx,
+            selection,
+            owners: 2,
+        };
+        for rows in (1..=8).chain([16, 64]) {
+            cases.push(case(rows, 25_947, Selection::Indexer));
+        }
+        cases.extend([
+            case(8, 131_072, Selection::Indexer),
+            case(2, 131_072, sparse(50, true)),
+            case(16, 65_536, sparse(50, false)),
+            case(8, 2048, Selection::Causal(1000)),
+            case(64, 2048, Selection::Causal(500)),
+            case(1, 2048, Selection::Causal(2040)),
+        ]);
+    }
+    let mut failed = 0;
+    for (i, case) in cases.iter().enumerate() {
+        // Production-sized pools: ~58K blocks resident, 7,500 capped.
+        let big = match case.dtype {
+            KvCacheDtype::Fp8G128 => 60_000,
+            _ => 40_000,
+        };
+        let placements = [
+            Placement {
+                seed: 2,
+                pool_blocks: big,
+                poison: 0xff,
+                scratch: None,
+            },
+            Placement {
+                seed: 3,
+                pool_blocks: big,
+                poison: 0x7f,
+                scratch: shared,
+            },
+            Placement {
+                seed: 4,
+                pool_blocks: 7_500,
+                poison: 0xff,
+                scratch: shared,
+            },
+        ];
+        let seed = 0x51ed_270b_27a3_4e8d ^ i as u64;
+        let base = run_case(gpu, *case, seed, Placement::fresh())?;
+        let mut bad = vec![];
+        if base.differing != 0 {
+            bad.push(format!("shard vs canonical {} bytes", base.differing));
+        }
+        for place in placements {
+            let got = run_case(gpu, *case, seed, place)?;
+            let moved: usize = got
+                .bits
+                .iter()
+                .zip(&base.bits)
+                .map(|(x, y)| x.iter().zip(y).filter(|(a, b)| a != b).count())
+                .sum();
+            if moved != 0 || got.differing != 0 {
+                bad.push(format!(
+                    "seed {} pool {} poison {:#x} shared {}: {moved} bytes moved, \
+                     shard vs canonical {}",
+                    place.seed,
+                    place.pool_blocks,
+                    place.poison,
+                    place.scratch.is_some(),
+                    got.differing
+                ));
+            }
+        }
+        let verdict = if bad.is_empty() {
+            "HISTORY-FREE"
+        } else {
+            "DEPENDS"
+        };
+        println!(
+            "{verdict} {case:?} splits={}",
+            shard::merge_splits(case.rows)
+        );
+        for b in &bad {
+            println!("  {b}");
+        }
+        failed += usize::from(!bad.is_empty());
+    }
+    gpu.free(shared_base)?;
+    ensure!(
+        failed == 0,
+        "{failed} of {} cases depend on placement or history",
+        cases.len()
+    );
     Ok(())
 }
