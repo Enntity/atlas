@@ -20,7 +20,7 @@ type Swap = (DevicePtr, DevicePtr, usize);
 /// The query swap of a merge-form owner of `rows` rows: this rank's heads'
 /// absorbed `query` out, the peer's into the merge scratch at `work`.
 fn query_swap(work: DevicePtr, query: DevicePtr, rows: u32) -> Swap {
-    let m = MergeLayout::new(rows, shard::merge_splits(rows));
+    let m = MergeLayout::new(rows, shard::MERGE_SPLITS);
     let bytes = rows as usize * (HEADS * LATENT) as usize * 2;
     (query, work.offset(m.q_peer), bytes)
 }
@@ -64,7 +64,7 @@ impl ShardMerge<'_> {
     /// (`ops::glm_sparse_canonical`), so the bits match it.
     pub(super) fn run(&self, a: ShardRows, output: DevicePtr, stream: u64) -> Result<()> {
         let (gpu, comm, s, lane) = (self.gpu, self.comm, &self.shard, self.lane);
-        let splits = shard::merge_splits(a.rows);
+        let splits = shard::MERGE_SPLITS;
         let m = MergeLayout::new(a.rows, splits);
         ensure!(
             m.total <= self.work_bytes,
@@ -121,14 +121,10 @@ impl ShardMerge<'_> {
             scale: self.scale,
         };
         // 3. Both heads' partitions over this rank's tokens; the peer's heads'
-        //    merged to one FP32 partial + LSE (one partition is sent as is).
+        //    merged to one FP32 partial + LSE.
         let send = at(m.send);
         let own = [at(m.own_o), at(m.own_lse)];
-        let peer = if splits == 1 {
-            [send, send.offset(part)]
-        } else {
-            [at(m.peer_o), at(m.peer_lse)]
-        };
+        let peer = [at(m.peer_o), at(m.peer_lse)];
         let group = |query: DevicePtr, [part_o, part_lse]: [DevicePtr; 2]| ops::PartialGroup {
             query,
             indices: at(m.ids),
@@ -147,10 +143,8 @@ impl ShardMerge<'_> {
         } else {
             partials(queries.1, peer)?;
         }
-        if splits > 1 {
-            let [po, pl] = peer;
-            ops::launch_merge_f32(gpu, po, pl, send, send.offset(part), a.rows, splits, stream)?;
-        }
+        let [po, pl] = peer;
+        ops::launch_merge_f32(gpu, po, pl, send, send.offset(part), a.rows, splits, stream)?;
         // 4. Swap the partials.
         let recv = at(m.recv);
         let swap: Swap = (send, recv, MergeLayout::partial_bytes(a.rows));
