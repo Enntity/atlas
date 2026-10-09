@@ -96,10 +96,9 @@ verify, fused prefill+verify), plus the single-row eager decode
    (`glm_sparse_mla_prefill_{fp8g128,bf16}_head32_tc_kv_pad_split_counted`,
    which walks only each row's packed prefix) for this rank's own heads and
    for the PEER's heads over this rank's tokens, both in one launch
-   (`*_split_counted_pair`), with `merge_splits(rows)` partitions each. Merge
+   (`*_split_counted_pair`), with `MERGE_SPLITS` partitions each. Merge
    the peer's heads' partitions to one FP32 partial + natural LSE
-   (`glm_sparse_decode_split_merge_f32`; a single partition is sent as is)
-   and exchange that partial (`rows x 32 x 513 x 4` bytes) with the peer.
+   (`glm_sparse_decode_split_merge_f32`) and exchange that partial (`rows x 32 x 513 x 4` bytes) with the peer.
 4. Merge this rank's own partitions with the peer's partial, where it landed,
    as the last partition in one exact LSE merge
    (`glm_sparse_decode_split_merge_extra`) into the head-sharded BF16
@@ -130,10 +129,21 @@ CTA reads the same latent rows in the same order and runs the same
 instructions as the shard's CTA for that partition; only where the latents
 sit and the exchanges differ.
 
-Both modes use one split count, `merge_splits(rows)`: the count that best
-fills GB10's 48 SMs with both groups' CTAs (`2 x rows` per partition) over
-half the selection (33 key tiles), capped at 15 partitions and 192 CTAs per
-group. A dense decode row takes its causal ids from the device length
+Both modes use one split count, `MERGE_SPLITS` = 4, for every owner size.
+A row's partition boundaries then depend only on its own selection, so its
+output and LSE are the same whatever rows share the owner. They must be: a
+DFlash verify's width follows the drafter's confidence
+(`ATLAS_DFLASH_ADAPTIVE_WIDTH`), and a count chosen per row count (the
+earlier `merge_splits(rows)`, 3 to 11) made the target's bits follow the
+drafter's state, which differs after an NVMe restore. GPU test
+`a_row_does_not_depend_on_the_rows_beside_it` holds one row to the same bits
+at 1, 2, 3, 5, 8, 16 and 64 rows. Four fills the 48 SMs in one wave up to six
+rows (two groups x rows x 4 CTAs). Canonical-form kernel time per layer on one
+GB10 (`scripts/dev/glm_kv_shard_bench.cu`, 64K context, min us, the per-rows
+count -> 4): 1 row 47 -> 72, 2: 49 -> 74, 3: 56 -> 74, 4: 64 -> 76,
+5: 84 -> 75, 6: 78 -> 76, 7: 86 -> 105, 8: 88 -> 109, 16: 172 -> 197,
+64: 783 -> 856. Five or six partitions are 2-3% faster over 1-8 rows and
+12-21% slower at 16 and 64. A dense decode row takes its causal ids from the device length
 (`glm_index_fill_causal_dev`), so decode graphs stay valid.
 
 The canonical form is on by default and needs nothing from the shard: a GLM

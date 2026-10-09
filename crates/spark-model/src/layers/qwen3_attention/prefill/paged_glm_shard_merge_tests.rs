@@ -137,7 +137,7 @@ fn merge_pairs_both_heads_partitions_and_merges_the_partial_where_it_landed() {
         Op::Launch { stream, .. } | Op::Exchange { stream, .. } => *stream == STREAM,
         _ => true,
     }));
-    let splits = shard::merge_splits(8);
+    let splits = shard::MERGE_SPLITS;
     let m = MergeLayout::new(8, splits);
     let at = |offset: usize| ptr(SCRATCH + (WORK + offset) as u64);
     let counts = at(m.counts(8, splits));
@@ -181,21 +181,6 @@ fn merge_pairs_both_heads_partitions_and_merges_the_partial_where_it_landed() {
         exchanged,
         [(ptr(QUERY), at(m.q_peer)), (at(m.send), at(m.recv))]
     );
-}
-
-#[test]
-fn one_partition_is_sent_unmerged() {
-    let rows = (1..=64u32)
-        .find(|&r| shard::merge_splits(r) == 1)
-        .expect("an owner size of one partition");
-    let gpu = run(rows, tuning(false), false);
-    let order = gpu.order();
-    assert!(!order.iter().any(|s| s.ends_with("merge_f32")), "{order:?}");
-    let m = MergeLayout::new(rows, 1);
-    let send = SCRATCH + (WORK + m.send) as u64;
-    let part = rows as usize * 32 * 512 * 4;
-    let pair = &launch_args(&gpu)[1];
-    assert_eq!(pair[16..18], [ptr(send), ptr(send + part as u64)]);
 }
 
 #[test]
@@ -284,7 +269,7 @@ fn verify_owners_swap_queries_beside_selection_one_owner_at_a_time() {
     let gpu = verify_owners(&[QUERY, QUERY + 0x1000]);
     assert_eq!(gpu.order(), [one_owner.clone(), one_owner].concat());
     let ops = gpu.ops();
-    let q_peer = SCRATCH + (WORK + MergeLayout::new(8, shard::merge_splits(8)).q_peer) as u64;
+    let q_peer = SCRATCH + (WORK + MergeLayout::new(8, shard::MERGE_SPLITS).q_peer) as u64;
     let swaps: Vec<(u64, u64)> = ops
         .iter()
         .filter_map(|op| match op {

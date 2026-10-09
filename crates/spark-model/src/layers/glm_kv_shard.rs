@@ -208,21 +208,17 @@ fn align(bytes: usize) -> usize {
     bytes.next_multiple_of(256)
 }
 
-/// CTAs (rows x partitions) past which more partitions only cost scratch:
-/// four waves of GB10's 48 SMs.
-const MAX_PARTIAL_CTAS: u32 = 192;
-
-/// Sparse partitions of each token group of a merge-form owner of `rows`
-/// rows (the tokens one rank stores, about half the selection): the count
-/// that best fills the GPU with both groups' CTAs at once (`2 x rows` CTAs per
-/// partition over half the selected IDs), as the paired split launches them,
-/// capped so the scratch stays bounded. The shard and the canonical form both
-/// partition with it, which their bitwise equality needs.
-pub fn merge_splits(rows: u32) -> u32 {
-    crate::layers::ops::sparse_split_count(2 * rows, HEADS, WIDTH.div_ceil(2))
-        .min(MAX_SPLITS)
-        .min((MAX_PARTIAL_CTAS / rows.max(1)).max(1))
-}
+/// Sparse partitions of each token group (the tokens one rank stores, about
+/// half a row's selection) of every merge-form owner, whatever its rows. A
+/// row's partition boundaries then follow only its own selection, so its bits
+/// do not depend on the rows beside it: a DFlash verify's width follows the
+/// drafter's confidence, and a count per width made the target's output
+/// follow the drafter's state. Four fills GB10's 48 SMs in one wave up to six
+/// rows (two groups x rows x 4 CTAs); `scripts/dev/glm_kv_shard_bench.cu`
+/// (`MERGE_SPLITS=n`) times other counts. The shard and the canonical form
+/// both partition with it, which their bitwise equality needs.
+pub const MERGE_SPLITS: u32 = 4;
+const _: () = assert!(MERGE_SPLITS > 1 && MERGE_SPLITS <= MAX_SPLITS);
 
 /// Offsets (from the work region) of one merge-form owner's buffers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,14 +313,7 @@ pub struct ScratchLayout {
 impl ScratchLayout {
     pub fn new(view_blocks: usize, write_rows: usize, block_bytes: usize) -> Self {
         let piece_bytes = PIECE_BLOCKS * block_bytes;
-        // Every sharded attention and cache write asks for the layout.
-        static WIDEST_MERGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let merge = *WIDEST_MERGE.get_or_init(|| {
-            (1..=MERGE_MAX_ROWS as u32)
-                .map(|rows| MergeLayout::new(rows, merge_splits(rows)).total)
-                .max()
-                .unwrap_or(0)
-        });
+        let merge = MergeLayout::new(MERGE_MAX_ROWS as u32, MERGE_SPLITS).total;
         let mut at = 0usize;
         let mut take = |bytes: usize| {
             let offset = at;
