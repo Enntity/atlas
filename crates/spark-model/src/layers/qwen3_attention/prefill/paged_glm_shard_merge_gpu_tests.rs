@@ -14,7 +14,12 @@
 //! (poison, or an earlier owner's scratch of another shape).
 //!
 //!   cargo test --release -p spark-model --lib canonical_matches_the_shard -- --ignored --nocapture
+//! `a_row_does_not_depend_on_the_rows_beside_it` holds one row to the same
+//! bits in owners of 1 to 64 rows (a DFlash verify's width follows the
+//! drafter, so it must not reach the target's arithmetic).
+//!
 //!   cargo test --release -p spark-model --lib canonical_and_shard_are_history_free -- --ignored --nocapture
+//!   cargo test --release -p spark-model --lib a_row_does_not_depend_on_the_rows_beside_it -- --ignored --nocapture
 
 use super::*;
 use anyhow::{Context, bail};
@@ -123,6 +128,9 @@ struct Case {
     ctx: usize,
     selection: Selection,
     owners: usize,
+    /// Each owner's row 0 (queries and IDs) is drawn on its own, so it is
+    /// the same row whatever `rows` is.
+    pinned_row: bool,
 }
 
 const BS: usize = 16;
@@ -382,9 +390,22 @@ fn run_case(gpu: &dyn GpuBackend, case: Case, seed: u64, place: Placement) -> Re
 
     let qn = rows as usize * 32 * 512;
     let mut owners = vec![];
-    for _ in 0..case.owners {
-        let q: [Vec<u16>; 2] = [0, 1].map(|_| (0..qn).map(|_| bf16(rng.unit() * 0.6)).collect());
-        let sel = selection(&case, &mut rng);
+    for o in 0..case.owners {
+        let mut q: [Vec<u16>; 2] =
+            [0, 1].map(|_| (0..qn).map(|_| bf16(rng.unit() * 0.6)).collect());
+        let mut sel = selection(&case, &mut rng);
+        if case.pinned_row {
+            let mut pin = Rng(0x5eed_0001 + o as u64);
+            for q in &mut q {
+                q[..32 * 512]
+                    .iter_mut()
+                    .for_each(|x| *x = bf16(pin.unit() * 0.6));
+            }
+            if let Some(s) = sel.as_mut() {
+                let one = selection(&Case { rows: 1, ..case }, &mut pin).context("one row")?;
+                s[..WIDTH as usize].copy_from_slice(&one);
+            }
+        }
         let dev_sel = sel.as_ref().map(|s| mem.upload(s)).transpose()?;
         owners.push((
             q.clone(),
@@ -397,7 +418,7 @@ fn run_case(gpu: &dyn GpuBackend, case: Case, seed: u64, place: Placement) -> Re
         Selection::Causal(start) => start,
         Selection::Sparse { .. } | Selection::Indexer => 0,
     };
-    let splits = shard::merge_splits(rows);
+    let splits = shard::MERGE_SPLITS;
     let m = MergeLayout::new(rows, splits);
     let (out_bytes, lse_bytes) = (qn * 2, rows as usize * 32 * 4);
 
@@ -566,6 +587,7 @@ fn canonical_matches_the_shard_bitwise() -> Result<()> {
             ctx,
             selection,
             owners,
+            pinned_row: false,
         };
         for rows in 1..=8 {
             cases.push(case(rows, 65536, sparse(50, false), 1));
@@ -595,7 +617,7 @@ fn canonical_matches_the_shard_bitwise() -> Result<()> {
         println!(
             "{} {case:?} splits={}",
             if differing == 0 { "BITWISE" } else { "DIFFERS" },
-            shard::merge_splits(case.rows)
+            shard::MERGE_SPLITS
         );
         failed += (differing != 0) as usize;
     }
@@ -625,6 +647,7 @@ fn canonical_and_shard_are_history_free() -> Result<()> {
             ctx,
             selection,
             owners: 2,
+            pinned_row: false,
         };
         for rows in (1..=8).chain([16, 64]) {
             cases.push(case(rows, 25_947, Selection::Indexer));
@@ -696,10 +719,7 @@ fn canonical_and_shard_are_history_free() -> Result<()> {
         } else {
             "DEPENDS"
         };
-        println!(
-            "{verdict} {case:?} splits={}",
-            shard::merge_splits(case.rows)
-        );
+        println!("{verdict} {case:?} splits={}", shard::MERGE_SPLITS);
         for b in &bad {
             println!("  {b}");
         }
@@ -711,5 +731,65 @@ fn canonical_and_shard_are_history_free() -> Result<()> {
         "{failed} of {} cases depend on placement or history",
         cases.len()
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GB10 and a glm-5.3-flash kernel build"]
+fn a_row_does_not_depend_on_the_rows_beside_it() -> Result<()> {
+    let gpu = spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+        .context("CUDA backend")?;
+    let gpu: &dyn GpuBackend = &gpu;
+    let mut failed = 0;
+    for dtype in [KvCacheDtype::Fp8G128, KvCacheDtype::Bf16] {
+        for (ctx, selection) in [
+            (25_947, Selection::Indexer),
+            (
+                65_536,
+                Selection::Sparse {
+                    skew: 50,
+                    holes: true,
+                },
+            ),
+            (2048, Selection::Causal(1000)),
+        ] {
+            let mut first: Option<Vec<Vec<u8>>> = None;
+            for rows in [1, 2, 3, 5, 8, 16, 64] {
+                let case = Case {
+                    dtype,
+                    rows,
+                    ctx,
+                    selection,
+                    owners: 1,
+                    pinned_row: true,
+                };
+                let got = run_case(gpu, case, 0x7e57_c0de, Placement::fresh())?;
+                // Row 0 of every output (32 x 512 BF16) and LSE (32 FP32),
+                // canonical then shard, both ranks' heads.
+                let row0: Vec<Vec<u8>> = got
+                    .bits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| b[..if i % 2 == 0 { 32 * 512 * 2 } else { 32 * 4 }].to_vec())
+                    .collect();
+                let base = first.get_or_insert_with(|| row0.clone());
+                let moved: usize = row0
+                    .iter()
+                    .zip(base.iter())
+                    .map(|(x, y)| x.iter().zip(y).filter(|(a, b)| a != b).count())
+                    .sum();
+                let ok = moved == 0 && got.differing == 0;
+                println!(
+                    "{} {dtype:?} ctx={ctx} {selection:?} rows={rows} splits={}: row 0 {moved} \
+                     bytes from rows=1, shard vs canonical {}",
+                    if ok { "SAME" } else { "MOVED" },
+                    shard::MERGE_SPLITS,
+                    got.differing
+                );
+                failed += usize::from(!ok);
+            }
+        }
+    }
+    ensure!(failed == 0, "{failed} widths change a row's bits");
     Ok(())
 }
