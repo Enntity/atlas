@@ -116,6 +116,19 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if crate::layers::canonical_verify::enabled() {
+            // One tensor-core family for every row count (1..=32).
+            return crate::layers::canonical_verify::w4a16(
+                ctx.gpu,
+                input,
+                &weight.nvfp4,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            );
+        }
         if (2..=8).contains(&m) {
             self.project_hot_multi_decode(input, weight, output, m, n, k, ctx, stream)
         } else if m > 8
@@ -173,6 +186,11 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if crate::layers::canonical_verify::enabled() {
+            return crate::layers::canonical_verify::dense(
+                ctx.gpu, input, weight, output, m, n, k, n, stream,
+            );
+        }
         if m == 1 {
             self.project_dense(input, weight, output, m, n, k, ctx, stream)
         } else if m <= ops::DENSE_GEMV_BATCHM_MAX_M {

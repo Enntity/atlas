@@ -117,6 +117,19 @@ pub(crate) fn tc_requested() -> bool {
 static TC: std::sync::OnceLock<[KernelHandle; 3]> = std::sync::OnceLock::new();
 const TC_ROWS: [u32; 3] = [8, 16, 32];
 
+/// The function name of the tensor-core tier of `rows` (8, 16 or 32) rows,
+/// `suffix` naming a twin (`""`, `"_ld"`, `"_touch"`, `"_pair_touch"`). Under
+/// `ATLAS_GLM_CANONICAL_VERIFY` the 8-row tier is `w4a16_gemv_tc8c`, the
+/// NT = 1 instance of the 16/32-row template (`layers::canonical_verify`),
+/// whose rows are bit-identical to theirs.
+pub fn tc_name(rows: u32, suffix: &str) -> String {
+    let canonical = rows == 8 && super::canonical_verify::requested();
+    format!(
+        "w4a16_gemv_tc{rows}{}{suffix}",
+        if canonical { "c" } else { "" }
+    )
+}
+
 /// The narrowest resolved tensor-core tier covering `m` rows, or a zero handle.
 pub fn tc_kernel(m: u32) -> KernelHandle {
     let Some(handles) = TC.get() else {
@@ -187,14 +200,10 @@ impl W4a16BatchmTiers {
         }
         if tc_requested() {
             TC.get_or_init(|| {
-                TC_ROWS.map(|rows| {
-                    super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}"))
-                })
+                TC_ROWS.map(|rows| super::try_kernel(gpu, "w4a16_gemv", &tc_name(rows, "")))
             });
             TC_LD.get_or_init(|| {
-                TC_ROWS.map(|rows| {
-                    super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_tc{rows}_ld"))
-                })
+                TC_ROWS.map(|rows| super::try_kernel(gpu, "w4a16_gemv", &tc_name(rows, "_ld")))
             });
         }
         Self { handles }
