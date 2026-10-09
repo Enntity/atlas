@@ -132,7 +132,7 @@ impl PagedKvCache {
             sparse_index_config: None,
             tail_slots: None,
             trace: BlockTrace::new(num_blocks),
-            nvme: None,
+            nvme: Vec::new(),
             latent_shard: None,
         })
     }
