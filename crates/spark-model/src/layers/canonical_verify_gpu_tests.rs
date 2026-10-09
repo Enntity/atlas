@@ -307,15 +307,16 @@ fn canonical_w4a16_rows_do_not_depend_on_the_width() -> Result<()> {
             run_rows(gpu, rows, n, |a, c, m| launch_w4(gpu, name, &w, a, c, m))
         })?;
         legacy_varies += differing(&format!("legacy w4a16 {n}x{k}"), &legacy);
-        // The twins run the same body: strided (ld = k/2), touch, pair.
-        let rows: Vec<Vec<u16>> = (0..5).map(|_| random_row(&mut rng, k)).collect();
+        // The twins run the same body: strided (ld = k/2), touch, pair (20
+        // rows: a three-tile sweep).
+        let rows: Vec<Vec<u16>> = (0..20).map(|_| random_row(&mut rng, k)).collect();
         let plain = run_rows(gpu, &rows, n, |a, c, m| {
             w4a16(gpu, a, &w.q, c, m, n, k, gpu.default_stream())
         })?;
         for twin in [
-            "w4a16_gemv_tc8c_ld",
-            "w4a16_gemv_tc8c_touch",
-            "w4a16_gemv_tc8c_pair_touch",
+            "w4a16_gemv_tc8_ld",
+            "w4a16_gemv_tc8_touch",
+            "w4a16_gemv_tc8_pair_touch",
         ] {
             let kernel = gpu.kernel("w4a16_gemv", twin)?;
             let got = run_rows(gpu, &rows, n, |a, c, m| {
@@ -361,7 +362,7 @@ fn canonical_w4a16_rows_do_not_depend_on_the_width() -> Result<()> {
             })?;
             let same = got == plain;
             println!(
-                "{} {twin} {n}x{k} vs tc8c",
+                "{} {twin} {n}x{k} 20 rows vs tc8",
                 if same { "BITWISE" } else { "DIFFERS" }
             );
             failed += !same as usize;
@@ -448,6 +449,54 @@ fn canonical_dense_rows_do_not_depend_on_the_width() -> Result<()> {
             legacy_varies += differing("legacy router 288x4096", &legacy);
         }
     }
+    // KDA beta | f_a | g_a and f_b | g_b planes: each plane as its own launch.
+    let (beta, _) = bf16_weight(gpu, &mut rng, 32, 4096, 0.05)?;
+    let (fa, _) = bf16_weight(gpu, &mut rng, 128, 4096, 0.05)?;
+    let (fb, _) = bf16_weight(gpu, &mut rng, 4096, 128, 0.05)?;
+    for m in WIDTHS {
+        let x = upload(
+            gpu,
+            &rows_bytes(
+                &(0..m)
+                    .map(|_| random_row(&mut rng, 4096))
+                    .collect::<Vec<_>>(),
+            ),
+        )?;
+        let y = upload(
+            gpu,
+            &rows_bytes(
+                &(0..m)
+                    .map(|_| random_row(&mut rng, 128))
+                    .collect::<Vec<_>>(),
+            ),
+        )?;
+        let outs: Vec<DevicePtr> = (0..5)
+            .map(|_| gpu.alloc(m as usize * 4096 * 2))
+            .collect::<Result<_>>()?;
+        let s = gpu.default_stream();
+        let planes3 = [
+            (x, &beta, outs[0], 32, 4096),
+            (x, &fa, outs[1], 128, 4096),
+            (y, &fb, outs[2], 4096, 128),
+        ];
+        dense_planes(gpu, &planes3, m, s)?;
+        dense_planes(gpu, &planes3[2..], m, s)?;
+        gpu.synchronize(s)?;
+        for (i, &(a, w, c, n, k)) in planes3.iter().enumerate() {
+            let fused = download(gpu, c, (m * n) as usize)?;
+            dense(gpu, a, w, outs[3], m, n, k, n, s)?;
+            gpu.synchronize(s)?;
+            let alone = download(gpu, outs[3], (m * n) as usize)?;
+            if fused != alone {
+                println!("DIFFERS planes m={m} plane {i}");
+                failed += 1;
+            }
+        }
+        for p in outs.into_iter().chain([x, y]) {
+            gpu.free(p)?;
+        }
+    }
+    println!("planes vs plain: checked widths {WIDTHS:?}");
     // MLA W_uk absorb (heads x [512, 256]) and W_uv extract (heads x
     // [256, 512]), 8 heads, rows `heads * k` apart.
     let g = 8u32;

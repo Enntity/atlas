@@ -136,14 +136,18 @@ fn settings() -> Option<(u64, u32)> {
     })
 }
 
-/// The function a twin resolves: its `TWINS` name, except that the 8-row
-/// tensor-core twins follow the 8-row tier they stand in for
-/// (`w4a16_gemv_tiers::tc_name`: `tc8c` under `ATLAS_GLM_CANONICAL_VERIFY`).
+/// The function a twin resolves: its `TWINS` name, except that the W4A16
+/// tensor-core twins follow the tier they stand in for
+/// (`w4a16_gemv_tiers::tc_name`: all `tc8` under `ATLAS_GLM_CANONICAL_VERIFY`).
 fn twin_func(func: &str) -> String {
-    let w4_tc = |suffix| crate::layers::w4a16_gemv_tiers::tc_name(8, suffix);
+    let w4_tc = |rows, suffix| crate::layers::w4a16_gemv_tiers::tc_name(rows, suffix);
     match func {
-        "w4a16_gemv_tc8_touch" => w4_tc("_touch"),
-        "w4a16_gemv_tc8_pair_touch" => w4_tc("_pair_touch"),
+        "w4a16_gemv_tc8_touch" => w4_tc(8, "_touch"),
+        "w4a16_gemv_tc16_touch" => w4_tc(16, "_touch"),
+        "w4a16_gemv_tc32_touch" => w4_tc(32, "_touch"),
+        "w4a16_gemv_tc8_pair_touch" => w4_tc(8, "_pair_touch"),
+        "w4a16_gemv_tc16_pair_touch" => w4_tc(16, "_pair_touch"),
+        "w4a16_gemv_tc32_pair_touch" => w4_tc(32, "_pair_touch"),
         _ => func.to_string(),
     }
 }

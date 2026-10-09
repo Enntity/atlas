@@ -6,9 +6,8 @@
 //! microseconds per launch and per layer group:
 //! - KDA projections: q, k, v, o (W4A16 4096 x 4096 each) plus beta (32 x
 //!   4096), f_a / g_a (128 x 4096), f_b / g_b (4096 x 128). Legacy rows: the
-//!   scalar / batch2 / batch3 / tc8 W4A16 tiers and batch-M BF16 below nine
-//!   rows (unfused: production fuses beta|f_a|g_a and f_b|g_b into one
-//!   launch each), tensor cores above.
+//!   scalar / batch2 / batch3 / tc8 W4A16 tiers and the fused batch-M
+//!   triple / dual below nine rows, tensor cores above.
 //! - MoE router (288 x 4096 BF16) and the TP-split shared expert (gate and up
 //!   1024 x 4096, down 4096 x 1024).
 //!
@@ -78,7 +77,7 @@ fn canonical_verify_microbench() -> Result<()> {
     let fb = bf(&mut rng, 4096, 128)?;
     let a = gpu.alloc(32 * 4096 * 2)?;
     gpu.memset(a, 0x3c, 32 * 4096 * 2)?;
-    let c = gpu.alloc(32 * 4096 * 2)?;
+    let c = gpu.alloc(3 * 32 * 4096 * 2)?;
     let s = gpu.default_stream();
     let canon_w4 = |w: &W4, m| w4a16(gpu, a, &w.q, c, m, w.n, w.k, s);
     let old_w4 = |w: &W4, m| launch_w4(gpu, legacy_w4_name(m), w, a, c, m);
@@ -91,17 +90,72 @@ fn canonical_verify_microbench() -> Result<()> {
             time(gpu, |i| old_w4(&qkvo[i], m))?,
             time(gpu, |i| canon_w4(&qkvo[i], m))?,
         ];
-        let small = |w: &[DenseWeight], n, k| -> Result<[f64; 2]> {
-            Ok([
-                time(gpu, |i| old_bf(legacy_dense_name(m), &w[i], m, n, k))?,
-                time(gpu, |i| canon_bf(&w[i], m, n, k))?,
-            ])
-        };
-        let (b, f_a, f_b) = (
-            small(&beta, 32, 4096)?,
-            small(&fa, 128, 4096)?,
-            small(&fb, 4096, 128)?,
-        );
+        // KDA beta | f_a | g_a then f_b | g_b: production fuses each set into
+        // one batch-M launch up to 8 rows (tensor cores per projection above);
+        // canonical runs one planes launch each.
+        let triple = gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm_triple_n")?;
+        let dual = gpu.kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm_dual")?;
+        let (c1, c2) = (c.offset(32 * 4096 * 2), c.offset(2 * 32 * 4096 * 2));
+        let side = [
+            time(gpu, |i| {
+                if m <= 8 {
+                    ops::dense_gemv_batchm_triple_n(
+                        gpu,
+                        triple,
+                        a,
+                        [&beta[i], &fa[i], &fa[(i + 1) % COPIES]],
+                        [c, c1, c2],
+                        m,
+                        [32, 128],
+                        4096,
+                        s,
+                    )?;
+                    ops::dense_gemv_batchm_dual(
+                        gpu,
+                        dual,
+                        [a, a],
+                        [&fb[i], &fb[(i + 1) % COPIES]],
+                        [c1, c2],
+                        m,
+                        4096,
+                        128,
+                        s,
+                    )
+                } else {
+                    for (w, n, k) in [
+                        (&beta[i], 32, 4096),
+                        (&fa[i], 128, 4096),
+                        (&fa[(i + 1) % COPIES], 128, 4096),
+                        (&fb[i], 4096, 128),
+                        (&fb[(i + 1) % COPIES], 4096, 128),
+                    ] {
+                        old_bf(legacy_dense_name(m), w, m, n, k)?;
+                    }
+                    Ok(())
+                }
+            })?,
+            time(gpu, |i| {
+                dense_planes(
+                    gpu,
+                    &[
+                        (a, &beta[i], c, 32, 4096),
+                        (a, &fa[i], c1, 128, 4096),
+                        (a, &fa[(i + 1) % COPIES], c2, 128, 4096),
+                    ],
+                    m,
+                    s,
+                )?;
+                dense_planes(
+                    gpu,
+                    &[
+                        (a, &fb[i], c1, 4096, 128),
+                        (a, &fb[(i + 1) % COPIES], c2, 4096, 128),
+                    ],
+                    m,
+                    s,
+                )
+            })?,
+        ];
         let r = [
             time(gpu, |i| {
                 old_bf(legacy_router_name(m), &router[i], m, 288, 4096)
@@ -116,20 +170,16 @@ fn canonical_verify_microbench() -> Result<()> {
             ]
         };
         let (gu, dn) = (sh(false), sh(true));
-        // Per layer: KDA = 4 W4A16 + beta + 2 f_a + 2 f_b; MoE = router +
+        // Per layer: KDA = 4 W4A16 + the side projections; MoE = router +
         // shared gate + up + down.
-        let kda = |j: usize| 4.0 * q[j] + b[j] + 2.0 * f_a[j] + 2.0 * f_b[j];
+        let kda = |j: usize| 4.0 * q[j] + side[j];
         let moe = |j: usize| r[j] + 2.0 * gu[j] + dn[j];
         println!(
-            "MICROBENCH m={m:<2} w4a16 4096x4096 {:7.1} -> {:7.1} | beta {:5.1} -> {:5.1} | f_a {:5.1} -> {:5.1} | f_b {:5.1} -> {:5.1} | router {:5.1} -> {:5.1} | shared g/u {:5.1} -> {:5.1} down {:5.1} -> {:5.1} | KDA layer {:7.1} -> {:7.1} | MoE layer {:6.1} -> {:6.1}",
+            "MICROBENCH m={m:<2} w4a16 4096x4096 {:7.1} -> {:7.1} | KDA side 5 proj {:5.1} -> {:5.1} | router {:5.1} -> {:5.1} | shared g/u {:5.1} -> {:5.1} down {:5.1} -> {:5.1} | KDA layer {:7.1} -> {:7.1} | MoE layer {:6.1} -> {:6.1}",
             q[0],
             q[1],
-            b[0],
-            b[1],
-            f_a[0],
-            f_a[1],
-            f_b[0],
-            f_b[1],
+            side[0],
+            side[1],
             r[0],
             r[1],
             gu[0],
