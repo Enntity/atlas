@@ -1,6 +1,7 @@
 # GLM-5.3-Flash token-sharded MLA latents (`ATLAS_GLM_KV_SHARD=1`)
 
-Status: implemented behind an opt-in flag. On the pair (2026-09-29, first
+Status: implemented behind an opt-in flag; bitwise identical to flag-off since
+the canonical form (see "The canonical form"). On the pair (2026-09-29, first
 pass of the plan in the last section): retrieval correct at 16K/64K/128K,
 prefix caching correct, pool 1.63M -> 2.84M tokens at the same memory
 setting; decode at long context slower (see "Decode cost of the merge
@@ -88,28 +89,75 @@ verify, fused prefill+verify), plus the single-row eager decode
 
 1. Exchange the owner's absorbed queries (this rank's 32 heads,
    `rows x 32 x 512` BF16) with the peer.
-2. `glm_kv_shard_localize`: rewrite the selected token ids to this rank's
-   local token ids (read through an identity block table over the local pool);
-   tokens stored by the peer become `-1`, which every GLM sparse kernel skips.
-   Dense owners (sequence end <= 2048) generate causal ids instead.
-3. Run the existing tensor-core split kernel
-   (`glm_sparse_mla_prefill_{fp8g128,bf16}_head32_tc_kv_pad_split`) for the
-   PEER's heads over this rank's tokens, merge its partitions to one FP32
-   partial + natural LSE (`glm_sparse_decode_split_merge_f32`, new), and
-   exchange that partial (`rows x 32 x 513 x 4` bytes) with the peer.
-   Every entry point only a shard launches (this merge, the extra-partition
-   merge and the counted split of the compact tuning) is compiled into the
-   `glm_kv_shard` module from the unsharded kernels' bodies, so the modules
-   an unsharded server loads are unchanged.
-4. Run the split kernel for this rank's own heads over its tokens, append the
-   peer's partial as the last partition, and merge everything in one exact LSE
-   merge (the existing `glm_sparse_decode_split_merge`) into the head-sharded
-   BF16 attention output. `W_uv`, `o_proj` and the TP all-reduce are
-   unchanged.
+2. `glm_kv_shard_localize_compact`: rewrite each row's selected token ids
+   to this rank's local token ids (read through an identity block table over
+   the local pool) of the tokens it stores, packed to the row's front in
+   selected order (a stable partition), and count them per row. Dense owners
+   (sequence end <= 2048) generate causal ids instead.
+3. Run the counted tensor-core split kernel
+   (`glm_sparse_mla_prefill_{fp8g128,bf16}_head32_tc_kv_pad_split_counted`,
+   which walks only each row's packed prefix) for this rank's own heads and
+   for the PEER's heads over this rank's tokens, both in one launch
+   (`*_split_counted_pair`), with `merge_splits(rows)` partitions each. Merge
+   the peer's heads' partitions to one FP32 partial + natural LSE
+   (`glm_sparse_decode_split_merge_f32`; a single partition is sent as is)
+   and exchange that partial (`rows x 32 x 513 x 4` bytes) with the peer.
+4. Merge this rank's own partitions with the peer's partial, where it landed,
+   as the last partition in one exact LSE merge
+   (`glm_sparse_decode_split_merge_extra`) into the head-sharded BF16
+   attention output. `W_uv`, `o_proj` and the TP all-reduce are unchanged.
 
 A partition that owns no selected token has `LSE = -inf` and weight 0, so a
 rank owning nothing contributes nothing (the unit tests check this and the
 equivalence with plain softmax attention on a CPU mirror).
+
+### The canonical form: the same bits without the shard
+
+An unsharded TP pair runs exactly this arithmetic for the same owners (every
+GLM MLA owner of at most 64 rows: verify, decode, prefill tails), so a pair
+computes the same bits with the shard on or off
+(`crates/spark-model/src/layers/ops/glm_sparse_canonical.rs`). Rank `r`
+attends its own heads over two token groups, split by the shard's ownership
+rule: `glm_kv_canonical_partition` packs each row's ids whose logical block
+`l` has `l % 2 == r` (the tokens rank `r` would store) and the rest (its
+peer's), global ids in selected order with per-row counts, which is what
+`glm_kv_shard_localize_compact` packs on each rank of a shard (the sharded
+allocator keeps `b % 2 == l % 2`, so the logical residue names the owner
+whatever the unsharded table's ids are). The paired counted split runs both
+groups over the whole pool through the sequence's own table, and
+`glm_sparse_decode_split_merge_pair` merges the peer group's partitions to the
+FP32 partial (the peer's `_f32` merge) and then the own partitions with it as
+the last (the owner's `_extra` merge), per (row, head), in one launch. Each
+CTA reads the same latent rows in the same order and runs the same
+instructions as the shard's CTA for that partition; only where the latents
+sit and the exchanges differ.
+
+Both modes use one split count, `merge_splits(rows)`: the count that best
+fills GB10's 48 SMs with both groups' CTAs (`2 x rows` per partition) over
+half the selection (33 key tiles), capped at 15 partitions and 192 CTAs per
+group. A dense decode row takes its causal ids from the device length
+(`glm_index_fill_causal_dev`), so decode graphs stay valid.
+
+The canonical form is on by default and needs nothing from the shard: a GLM
+pair (`tp_world_size == 2`) with 32 heads per rank. `ATLAS_GLM_KV_CANONICAL=0`
+restores the earlier unsharded kernels (the verify split over the whole
+selection, the unsplit TC kernel, the dense BF16 kernel, the native bridge),
+whose bits differ from the shard's. Its scratch is the MoE expert scratch
+past 64 KiB (the dense decode row's causal ids sit before it); an arena too
+small for an owner (at most ~31 MiB at 64 rows) logs once and keeps the
+earlier kernels for it. The kernels are loaded and run once on zero rows at
+boot (`initialize_glm_kv_canonical`), so a first launch never falls inside a
+CUDA-graph capture.
+
+Proof of the equality: the GPU test `canonical_matches_the_shard_bitwise`
+(`paged_glm_shard_merge_gpu_tests.rs`) runs the shard's `ShardMerge::run` on
+both ranks (two threads, own streams, the exchanges copied in device memory)
+against the canonical form over an unsharded pool whose table keeps no
+residue, for fp8_g128 and BF16, 1-8, 16, 24, 48 and 64 rows, 4K-128K
+contexts, skewed, one-sided and holed selections, causal owners (one where a
+rank owns nothing), and several owners in turn on one scratch: BF16 outputs
+and merged LSEs bitwise equal for both ranks' heads. The microbench
+`scripts/dev/glm_kv_shard_bench.cu` checks the same on its own build.
 
 Why this over fetching the remote selected latents: per row the merge form
 moves 32 KiB of queries + 64 KiB of FP32 partials each way, with fixed shapes
@@ -183,6 +231,15 @@ without), so the shard alone closes most, not all, of the gap: another
   plain decode loses graphs.
 
 ## Decode cost of the merge form, and its two tunings
+
+The history below measured the merge form before the canonical form, when
+it came in an uncompacted and a compacted ("tuning") variant. Since then the
+merge form is always the compacted one with the paired split, and
+`ATLAS_GLM_KV_SHARD_COMPACT` is accepted (0 or 1, refused without the shard,
+held equal across the pair) but changes nothing: the canonical form an
+unsharded pair matches is the compacted arithmetic. The uncompacted pipeline
+(`glm_kv_shard_localize`, copying the partial behind the own partitions) is
+gone.
 
 Measured on the pair (2026-09-29, single stream, greedy text identical to the
 flag-off run): decode 142.8 -> 124.5 tok/s at 61K tokens and 132.3 -> 125.9
@@ -411,13 +468,20 @@ None of it is measured on hardware yet.
 
 ## Numerics
 
-The same softmax (no quantization or approximation is added), but not
-bitwise identical to flag-off: the merge form moves the partition
-boundaries, which changes the kernel's per-partition BF16 probability
-rounding and the FP32 summation order (as the existing split verify already
-does; at most one BF16 ulp of the output measured), and dense <= 2048 owners
-take the tensor-core split kernel over causal ids instead of the BF16 dense
-kernel. The view form runs the same kernels on the same bytes as flag-off.
+Bitwise identical to flag-off. Owners of at most 64 rows run the canonical
+form in both modes (see "The canonical form"); larger owners run the same
+kernels on the same bytes (the view form). Selection is computed on both
+ranks from the replicated index keys with the same kernels in both modes, so
+it is not a source of difference either.
+
+Against the engine before the canonical form, the unsharded bits of those
+few-row owners moved: the canonical form partitions each row's selection by
+owner, so its per-partition BF16 probability rounding and FP32 summation
+order differ from the old verify split (at most one BF16 ulp of the output
+in the microbench, the same class as split vs unsplit), and dense <= 2048
+owners take the tensor-core split kernel over causal ids instead of the BF16
+dense kernel. Prompt-logprob and greedy-text references taken on the older
+unsharded engine change once, to the shard's new values.
 
 ## Supported / not supported
 
@@ -456,19 +520,18 @@ batched bootstrap of several such sequences would hit the fail-closed panic.
      1.7x the flag-off boot at the same `--gpu-memory-utilization`;
    - `KV cache: N blocks x 11 layers = G GB total (V aliases K)` with G about
      half the flag-off value's latent part;
-   - `KV latent shard merge form: compact=.. overlap=.. check=..` naming the
+   - `KV latent shard merge form: compact (always) overlap=.. check=..` naming the
      tunings in effect (a performance arm must show `check=false`).
    `..._CHECK=1` makes every merge-form attention check on the host that
    each table entry's residue matches its logical index and swap that verdict
    and the block count with the peer (both ranks fail if either is wrong);
    drop it for performance runs. The view form does this on every call
    regardless.
-2. Greedy equality: the same prompts at temperature 0 with the flag off and
-   on (short, 16K, 64K prompts; single sequence and 4 concurrent). Expect
-   identical output for most prompts; where the text diverges, compare the
-   per-token logprobs up to the first divergence (differences should be at the
-   FP32-reassociation level, well below the top-1/top-2 margin at the
-   divergence point). A systematic difference in the first tokens means a bug.
+2. Exactness: the prompt-logprob hash (`lp_repeat.py`) of the same prompt set
+   with the flag off and on must be identical, and greedy text at
+   temperature 0 identical (short, 16K, 64K prompts; single sequence and 4
+   concurrent). Any difference is a bug: both modes run the same arithmetic
+   (see "Numerics").
 3. Long-context needle retrieval at 64K, 200K and 400K with the flag on vs
    off, then 4 concurrent 512K contexts (the goal) — the flag-off run cannot
    hold them.

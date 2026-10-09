@@ -234,8 +234,7 @@ pub(super) fn shard_plan(
         lane.unwrap_or_default()
     );
     tracing::info!(
-        "KV latent shard merge form: compact={} overlap={} check={}",
-        tuning.compact,
+        "KV latent shard merge form: compact (always) overlap={} check={}",
         tuning.overlap,
         tuning.check
     );
