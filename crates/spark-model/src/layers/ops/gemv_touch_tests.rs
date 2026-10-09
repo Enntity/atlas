@@ -345,16 +345,16 @@ fn twins_are_neither_resolved_nor_handed_out_with_the_flag_off() {
 }
 
 #[test]
-fn the_eight_row_tc_twins_follow_the_canonical_tier() {
+fn the_tc_twins_follow_the_canonical_tier() {
     // `ATLAS_GLM_CANONICAL_VERIFY` unset: on.
     if std::env::var_os("ATLAS_GLM_CANONICAL_VERIFY").is_some() {
         return;
     }
-    assert_eq!(twin_func("w4a16_gemv_tc8_touch"), "w4a16_gemv_tc8c_touch");
-    assert_eq!(
-        twin_func("w4a16_gemv_tc8_pair_touch"),
-        "w4a16_gemv_tc8c_pair_touch"
-    );
-    assert_eq!(twin_func("w4a16_gemv_tc16_touch"), "w4a16_gemv_tc16_touch");
-    assert_eq!(twin_func("mxfp8_gemv_tc8_touch"), "mxfp8_gemv_tc8_touch");
+    for rows in [8, 16, 32] {
+        let touch = format!("w4a16_gemv_tc{rows}_touch");
+        let pair = format!("w4a16_gemv_tc{rows}_pair_touch");
+        assert_eq!(twin_func(&touch), "w4a16_gemv_tc8_touch");
+        assert_eq!(twin_func(&pair), "w4a16_gemv_tc8_pair_touch");
+    }
+    assert_eq!(twin_func("mxfp8_gemv_tc16_touch"), "mxfp8_gemv_tc16_touch");
 }

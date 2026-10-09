@@ -18,20 +18,23 @@
 //! - The KDA BF16 side projections: `dense_gemv` / batch-M below 9 rows, the
 //!   tensor-core tiers above.
 //!
-//! Canonical mode keeps one family per op, the one the owner-batched (9..32
-//! row) verify already ran:
-//! - W4A16: `w4a16_gemv_tc8c` (the NT = 1 instance of the `tc16`/`tc32`
-//!   template: same 64-wide K chunks, lane runs, MMA order and cross-warp
-//!   sum), `tc16`, `tc32` ([`w4a16`]). Their touch, strided and pair twins run
-//!   the same bodies.
+//! Canonical mode keeps one family per op:
+//! - W4A16: `w4a16_gemv_tc8` for every row count ([`w4a16`]), the 128-wide-K
+//!   tier 4..8-row verify already ran. Above 8 rows its body sweeps the
+//!   weight once for up to four 8-row activation tiles, each tile the exact
+//!   arithmetic of an 8-row launch of its rows (and faster than the 64-wide
+//!   `tc16`/`tc32` it replaces there). Its strided, touch and pair twins run
+//!   the same body.
 //! - BF16 GEMV (router, KDA beta/f/g, MLA indexer projections):
 //!   `dense_gemv_bf16_tc8` (NT = 1 of the tc16/tc32 template), `tc16`,
-//!   `tc32` ([`dense`]); the MLA W_uk / W_uv per-head GEMMs on their grouped
-//!   twins ([`dense_grouped`]).
+//!   `tc32` ([`dense`]); KDA beta | f_a | g_a and f_b | g_b as one launch
+//!   each on their planes twins ([`dense_planes`]); the MLA W_uk / W_uv
+//!   per-head GEMMs on their grouped twins ([`dense_grouped`]).
 //! - Shared expert: the W4A16 family above, whole or TP-split.
 //! - The K=5-only seams (fused QKV, fused dense pairs/triple, fused TP mHC,
 //!   K5 mHC cuBLAS, compact K5 routed MoE, deferred K5 shared blend) are off,
 //!   and a one-row verify takes the MLA prefill lane like a wider block.
+//! - A plain one-row decode is a one-row verify (`trait_impl::decode_canonical`).
 //!
 //! A tensor-core MMA's output column depends only on its own B column, and
 //! these templates fix every other step of a row's sum (warp chunking,
@@ -63,8 +66,8 @@ pub fn enabled() -> bool {
 }
 
 /// `C[m, n] = A[m, k] · W[n, k]ᵀ` (NVFP4 `W`) on the canonical tensor-core
-/// tier for `m` rows, through its PDL touch twin when that is armed
-/// (`ATLAS_GLM_DECODE_GEMV_BATCH`, same body).
+/// tier (`w4a16_gemv_tc8`, 1..=32 rows), through its PDL touch twin when that
+/// is armed (`ATLAS_GLM_DECODE_GEMV_BATCH`, same body).
 #[allow(clippy::too_many_arguments)]
 pub fn w4a16(
     gpu: &dyn GpuBackend,
@@ -91,24 +94,38 @@ pub fn w4a16(
 }
 
 /// The canonical BF16 tensor-core GEMV tier for `m` rows
-/// (`dense_gemv_bf16_tc{8,16,32}`), or a zero handle.
-pub fn dense_kernel(gpu: &dyn GpuBackend, m: u32) -> KernelHandle {
-    static TC: std::sync::OnceLock<[KernelHandle; 3]> = std::sync::OnceLock::new();
+/// (`dense_gemv_bf16_tc{8,16,32}{suffix}`, `suffix` one of [`DENSE_TWINS`]),
+/// or a zero handle.
+fn dense_tier(gpu: &dyn GpuBackend, m: u32, suffix: &str) -> KernelHandle {
+    static TC: std::sync::OnceLock<[[KernelHandle; 3]; 3]> = std::sync::OnceLock::new();
     let tiers = TC.get_or_init(|| {
-        [8, 16, 32].map(|rows| {
-            super::try_kernel(
-                gpu,
-                "dense_gemv_bf16_batchm",
-                &format!("dense_gemv_bf16_tc{rows}"),
-            )
+        DENSE_TWINS.map(|twin| {
+            [8, 16, 32].map(|rows| {
+                super::try_kernel(
+                    gpu,
+                    "dense_gemv_bf16_batchm",
+                    &format!("dense_gemv_bf16_tc{rows}{twin}"),
+                )
+            })
         })
     });
+    let Some(twin) = DENSE_TWINS.iter().position(|&t| t == suffix) else {
+        return KernelHandle(0);
+    };
     match m {
-        1..=8 => tiers[0],
-        9..=16 => tiers[1],
-        17..=MAX_ROWS => tiers[2],
+        1..=8 => tiers[twin][0],
+        9..=16 => tiers[twin][1],
+        17..=MAX_ROWS => tiers[twin][2],
         _ => KernelHandle(0),
     }
+}
+
+/// The BF16 tier families: plain, per-head grouped, up to three planes.
+const DENSE_TWINS: [&str; 3] = ["", "_grouped", "_planes"];
+
+/// The canonical BF16 tensor-core GEMV tier for `m` rows, or a zero handle.
+pub fn dense_kernel(gpu: &dyn GpuBackend, m: u32) -> KernelHandle {
+    dense_tier(gpu, m, "")
 }
 
 /// `C[m, n] = A[m, k] · W[n, k]ᵀ` (BF16 `W`), rows `out_stride` apart, on the
@@ -148,22 +165,7 @@ pub fn dense_grouped(
     [m, g, k, n, a_stride, c_stride]: [u32; 6],
     stream: u64,
 ) -> Result<()> {
-    static TC: std::sync::OnceLock<[KernelHandle; 3]> = std::sync::OnceLock::new();
-    let tiers = TC.get_or_init(|| {
-        [8, 16, 32].map(|rows| {
-            super::try_kernel(
-                gpu,
-                "dense_gemv_bf16_batchm",
-                &format!("dense_gemv_bf16_tc{rows}_grouped"),
-            )
-        })
-    });
-    let tier = match m {
-        1..=8 => tiers[0],
-        9..=16 => tiers[1],
-        17..=MAX_ROWS => tiers[2],
-        _ => KernelHandle(0),
-    };
+    let tier = dense_tier(gpu, m, "_grouped");
     ensure!(
         tier.0 != 0 && k.is_multiple_of(8) && a_stride.is_multiple_of(8),
         "canonical grouped BF16 GEMV: no tier for {m} rows (k={k}, lda={a_stride})"
@@ -182,6 +184,50 @@ pub fn dense_grouped(
         .launch(stream)
 }
 
+/// Up to three BF16 projections `out_z [m, n_z] = in_z [m, k_z] · W_z ᵀ` in
+/// one launch on the canonical tier's planes twin: each plane bit-identical
+/// to its own [`dense`] launch.
+pub fn dense_planes(
+    gpu: &dyn GpuBackend,
+    planes: &[(DevicePtr, &DenseWeight, DevicePtr, u32, u32)],
+    m: u32,
+    stream: u64,
+) -> Result<()> {
+    let tier = dense_tier(gpu, m, "_planes");
+    ensure!(
+        tier.0 != 0
+            && (1..=3).contains(&planes.len())
+            && planes.iter().all(|&(.., k)| k.is_multiple_of(8)),
+        "canonical BF16 planes GEMV: no tier for {m} rows or {} planes",
+        planes.len()
+    );
+    let plane = |i: usize| planes[i.min(planes.len() - 1)];
+    let grid_x = planes
+        .iter()
+        .map(|&(_, _, _, n, _)| n.div_ceil(16))
+        .max()
+        .unwrap_or(0);
+    let mut launch = spark_runtime::kernel_args::KernelLaunch::new(gpu, tier)
+        .grid([grid_x, 1, planes.len() as u32])
+        .block([256, 1, 1]);
+    for i in 0..3 {
+        launch = launch.arg_ptr(plane(i).0);
+    }
+    for i in 0..3 {
+        launch = launch.arg_ptr(plane(i).1.weight);
+    }
+    for i in 0..3 {
+        launch = launch.arg_ptr(plane(i).2);
+    }
+    for i in 0..3 {
+        launch = launch.arg_u32(plane(i).3);
+    }
+    for i in 0..3 {
+        launch = launch.arg_u32(plane(i).4);
+    }
+    launch.arg_u32(m).launch(stream)
+}
+
 #[cfg(test)]
 #[path = "canonical_verify_gpu_tests.rs"]
 mod gpu_tests;
@@ -191,15 +237,15 @@ mod tests {
     use crate::layers::w4a16_gemv_tiers::tc_name;
 
     #[test]
-    fn the_eight_row_tensor_core_tier_is_the_canonical_template_by_default() {
+    fn every_tensor_core_tier_is_the_tc8_body_by_default() {
         // `ATLAS_GLM_CANONICAL_VERIFY` unset: on.
         if std::env::var_os("ATLAS_GLM_CANONICAL_VERIFY").is_some() {
             return;
         }
-        assert_eq!(tc_name(8, ""), "w4a16_gemv_tc8c");
-        assert_eq!(tc_name(8, "_ld"), "w4a16_gemv_tc8c_ld");
-        assert_eq!(tc_name(8, "_pair_touch"), "w4a16_gemv_tc8c_pair_touch");
-        assert_eq!(tc_name(16, "_touch"), "w4a16_gemv_tc16_touch");
-        assert_eq!(tc_name(32, ""), "w4a16_gemv_tc32");
+        for rows in [8, 16, 32] {
+            assert_eq!(tc_name(rows, ""), "w4a16_gemv_tc8");
+            assert_eq!(tc_name(rows, "_ld"), "w4a16_gemv_tc8_ld");
+            assert_eq!(tc_name(rows, "_pair_touch"), "w4a16_gemv_tc8_pair_touch");
+        }
     }
 }

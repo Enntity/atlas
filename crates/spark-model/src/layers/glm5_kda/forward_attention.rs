@@ -108,7 +108,21 @@ impl Glm5KdaLayer {
             && (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(&m)
             && self.dense_gemv_batchm_triple_n_k.0 != 0
             && self.dense_gemv_batchm_dual_k.0 != 0;
-        if batchm_fused && !fused_dense_triple {
+        if canonical && verify_proj {
+            // One canonical launch for the three side projections.
+            let (heads, dim) = (self.heads as u32, self.dim as u32);
+            crate::layers::canonical_verify::dense_planes(
+                ctx.gpu,
+                &[
+                    (normed, &self.weights.b_proj, beta, heads, h),
+                    (normed, &self.weights.f_a_proj, fa, dim, h),
+                    (normed, &self.weights.g_a_proj, ga, dim, h),
+                ],
+                m,
+                stream,
+            )?;
+            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
+        } else if batchm_fused && !fused_dense_triple {
             ops::dense_gemv_batchm_triple_n(
                 ctx.gpu,
                 self.dense_gemv_batchm_triple_n_k,
@@ -259,7 +273,18 @@ impl Glm5KdaLayer {
 
         let g1 = ctx.buffers.ssm_deinterleaved();
         let g2 = g1.offset(plane_bytes);
-        if batchm_fused && !fused_dense_pairs {
+        if canonical && verify_proj {
+            let dim = self.dim as u32;
+            crate::layers::canonical_verify::dense_planes(
+                ctx.gpu,
+                &[
+                    (fa, &self.weights.f_b_proj, g1, p as u32, dim),
+                    (ga, &self.weights.g_b_proj, g2, p as u32, dim),
+                ],
+                m,
+                stream,
+            )?;
+        } else if batchm_fused && !fused_dense_pairs {
             ops::dense_gemv_batchm_dual(
                 ctx.gpu,
                 self.dense_gemv_batchm_dual_k,
