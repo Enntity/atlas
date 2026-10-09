@@ -18,12 +18,14 @@
 //!   whole latent history — its own blocks plus the peer's, exchanged — in a
 //!   scratch view the unchanged kernels read through an identity table.
 //!
-//! Two opt-in refinements of the merge form, both exact:
-//! `ATLAS_GLM_KV_SHARD_COMPACT=1` packs each row's owned IDs to the front so
-//! the attention kernels walk only the tokens this rank stores, and merges
-//! the peer's partial where it landed; `ATLAS_GLM_KV_SHARD_OVERLAP=1` runs
-//! the two exchanges on a side stream beside the compute they do not depend
-//! on ([`overlapped_exchange`]).
+//! The merge form packs each row's owned IDs to the front so the attention
+//! kernels walk only the tokens this rank stores, and merges the peer's
+//! partial where it landed. Its arithmetic is the canonical form's
+//! (`ops::glm_sparse_canonical`), which an unsharded pair runs for the same
+//! owners, so a pair computes the same bits with the shard on or off.
+//! `ATLAS_GLM_KV_SHARD_OVERLAP=1` runs the two exchanges on a side stream
+//! beside the compute they do not depend on ([`overlapped_exchange`]); the
+//! arithmetic is unchanged.
 //!
 //! This module holds the policy, the scratch layout both forms carve from
 //! the shard's one allocation, and the pair exchange.
@@ -92,7 +94,10 @@ pub fn requested() -> Result<bool> {
 /// The merge form's opt-in refinements and the shard's self-check, read once.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MergeTuning {
-    /// `ATLAS_GLM_KV_SHARD_COMPACT=1`.
+    /// `ATLAS_GLM_KV_SHARD_COMPACT=1`: accepted for older profiles. The
+    /// merge form is always compact now (the canonical form an unsharded pair
+    /// matches bit for bit is), so the value changes nothing but is still
+    /// held to 0/1, to the shard, and to its peer's.
     pub compact: bool,
     /// `ATLAS_GLM_KV_SHARD_OVERLAP=1`; off under `..._CHECK=1`, whose own
     /// exchange would run inside an overlap window. Decides at boot whether
@@ -207,10 +212,14 @@ fn align(bytes: usize) -> usize {
 /// four waves of GB10's 48 SMs.
 const MAX_PARTIAL_CTAS: u32 = 192;
 
-/// Local sparse partitions of a merge-form owner of `rows` rows: the
-/// verify split count, capped so the scratch stays bounded.
+/// Sparse partitions of each token group of a merge-form owner of `rows`
+/// rows (the tokens one rank stores, about half the selection): the count
+/// that best fills the GPU with both groups' CTAs at once (`2 x rows` CTAs per
+/// partition over half the selected IDs), as the paired split launches them,
+/// capped so the scratch stays bounded. The shard and the canonical form both
+/// partition with it, which their bitwise equality needs.
 pub fn merge_splits(rows: u32) -> u32 {
-    crate::layers::ops::sparse_split_count(rows, HEADS, WIDTH)
+    crate::layers::ops::sparse_split_count(2 * rows, HEADS, WIDTH.div_ceil(2))
         .min(MAX_SPLITS)
         .min((MAX_PARTIAL_CTAS / rows.max(1)).max(1))
 }
