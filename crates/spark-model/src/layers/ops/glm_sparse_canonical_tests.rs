@@ -52,7 +52,7 @@ fn only_owners_a_shard_merges_take_the_canonical_form() {
 #[test]
 fn layout_regions_are_aligned_disjoint_and_bounded() {
     for rows in 1..=MERGE_MAX_ROWS as u32 {
-        let splits = merge_splits(rows);
+        let splits = MERGE_SPLITS;
         let m = CanonicalLayout::new(rows, splits);
         let (r, s) = (rows as usize, splits as usize);
         let (part, lse) = (r * 32 * 512 * 4, r * 32 * 4);
@@ -129,7 +129,7 @@ fn launch_args(op: &Op) -> (&str, [u32; 3], &Vec<Vec<u8>>) {
 fn partition_paired_split_and_paired_merge_in_three_launches() {
     let rows = 8;
     let ops = run(rows, Some(0x300));
-    let splits = merge_splits(rows);
+    let splits = MERGE_SPLITS;
     let m = CanonicalLayout::new(rows, splits);
     let at = |o: usize| ptr(SCRATCH + o as u64);
     let [partition, pair, merge] = &ops[..] else {
@@ -178,20 +178,10 @@ fn partition_paired_split_and_paired_merge_in_three_launches() {
 }
 
 #[test]
-fn one_partition_lands_as_the_partial_and_causal_rows_select_nothing() {
-    let rows = (1..=64)
-        .find(|&r| merge_splits(r) == 1)
-        .expect("an owner size of one partition");
-    let ops = run(rows, None);
-    let m = CanonicalLayout::new(rows, 1);
-    let extra = SCRATCH + m.extra as u64;
-    let part = rows as u64 * 32 * 512 * 4;
+fn causal_rows_select_nothing() {
+    let ops = run(8, None);
     let (_, _, partition) = launch_args(&ops[0]);
     assert_eq!(partition[0], ptr(0));
-    let (_, _, pair) = launch_args(&ops[1]);
-    assert_eq!(pair[16..18], [ptr(extra), ptr(extra + part)]);
-    let (_, _, merge) = launch_args(&ops[2]);
-    assert_eq!(merge[8..], [ptr(extra), ptr(extra + part), ptr(extra)]);
 }
 
 #[test]

@@ -76,9 +76,11 @@ static unsigned split_count(unsigned rows) {
     }
     return best;
 }
-// merge_splits (crates/spark-model/src/layers/glm_kv_shard.rs).
-static unsigned merge_splits(unsigned rows) {
-    return std::min(std::min(split_count(rows), 15u), std::max(192u / rows, 1u));
+// MERGE_SPLITS (crates/spark-model/src/layers/glm_kv_shard.rs), the same for
+// every row count; the environment's MERGE_SPLITS=n (2..15) times another.
+static unsigned merge_splits(unsigned) {
+    const char* v = getenv("MERGE_SPLITS");
+    return v ? (unsigned)atoi(v) : 4u;
 }
 
 template <class T> static T* dalloc(size_t n) { T* p; CK(cudaMalloc(&p, n * sizeof(T))); return p; }

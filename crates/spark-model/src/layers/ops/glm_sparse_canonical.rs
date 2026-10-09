@@ -5,10 +5,12 @@
 //! exchanges, so that a pair computes the same bits sharded or not.
 //!
 //! A shard stores logical block `l` on rank `l % 2`. Rank `r`'s heads there
-//! attend in two groups: the tokens rank `r` stores, in `merge_splits(rows)`
+//! attend in two groups: the tokens rank `r` stores, in `MERGE_SPLITS`
 //! partitions on rank `r`, and the tokens its peer stores, in as many
 //! partitions on the peer, merged there to one FP32 partial and sent; rank `r`
-//! then merges its own partitions with that partial last. The canonical form
+//! then merges its own partitions with that partial last. The count is the
+//! same for every owner size, so a row's bits never depend on its owner's
+//! rows (a DFlash verify's width). The canonical form
 //! splits each row's selection by the same rule (`glm_kv_canonical_partition`,
 //! with the logical block's residue, which a sharded pool's allocator keeps
 //! equal to the physical block's), runs both groups' counted splits in one
@@ -32,7 +34,7 @@ use spark_runtime::kv_cache::KvCacheDtype;
 
 use super::glm_kv_shard::{MODULE, glm_kv_canonical_partition};
 use super::{GlmSparsePrefillTc, PartialGroup, launch_merge_pair, launch_sparse_partial_pair};
-use crate::layers::glm_kv_shard::{HEADS, LATENT, MERGE_MAX_ROWS, WIDTH, merge_splits};
+use crate::layers::glm_kv_shard::{HEADS, LATENT, MERGE_MAX_ROWS, MERGE_SPLITS, WIDTH};
 
 /// `ATLAS_GLM_KV_CANONICAL`: `0` turns the canonical form off.
 pub const CANONICAL: &str = "ATLAS_GLM_KV_CANONICAL";
@@ -123,7 +125,7 @@ impl CanonicalLayout {
 
     /// Scratch bytes an owner of `rows` rows needs.
     pub fn bytes(rows: u32) -> usize {
-        Self::new(rows, merge_splits(rows)).total
+        Self::new(rows, MERGE_SPLITS).total
     }
 }
 
@@ -153,7 +155,7 @@ pub fn glm_sparse_canonical(
         "GLM canonical attention takes 1..={MERGE_MAX_ROWS} rows of {WIDTH} selected IDs"
     );
     let rows = a.rows as usize;
-    let splits = merge_splits(a.rows);
+    let splits = MERGE_SPLITS;
     let m = CanonicalLayout::new(a.rows, splits);
     let region = (scratch, m.total);
     let latent = rows * (HEADS * LATENT) as usize * 2;
@@ -186,14 +188,8 @@ pub fn glm_sparse_canonical(
         causal_start,
         stream,
     )?;
-    // A shard sends one partition unmerged: it then lands as the partial.
-    let part = rows * (HEADS * LATENT) as usize * 4;
     let extra = at(m.extra);
-    let peer_parts = if splits == 1 {
-        [extra, extra.offset(part)]
-    } else {
-        [at(m.peer_o), at(m.peer_lse)]
-    };
+    let peer_parts = [at(m.peer_o), at(m.peer_lse)];
     let group =
         |[indices, counts]: [DevicePtr; 2], [part_o, part_lse]: [DevicePtr; 2]| PartialGroup {
             query: a.query,
