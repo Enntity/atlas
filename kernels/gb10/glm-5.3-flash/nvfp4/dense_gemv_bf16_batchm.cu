@@ -488,6 +488,7 @@ dense_gemv_bf16_tc16(
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
     unsigned int out_stride
 ) {
+    atlas_pdl_enter();
     dense_gemv_bf16_tc_impl<2>(A, B, C, M, N, K, out_stride, K);
 }
 
@@ -497,6 +498,7 @@ dense_gemv_bf16_tc32(
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
     unsigned int out_stride
 ) {
+    atlas_pdl_enter();
     dense_gemv_bf16_tc_impl<4>(A, B, C, M, N, K, out_stride, K);
 }
 
@@ -509,6 +511,7 @@ dense_gemv_bf16_tc8(
     __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
     unsigned int out_stride
 ) {
+    atlas_pdl_enter();
     dense_gemv_bf16_tc_impl<1>(A, B, C, M, N, K, out_stride, K);
 }
 
@@ -517,15 +520,94 @@ dense_gemv_bf16_tc8(
 // columns [h*K, +K) of rows `lda` apart by W[h] ([G, N, K]) into output
 // columns [h*N, +N) of rows `ldc` apart. Same body per head: bit-identical
 // rows to the plain tiers, whatever the row count.
-#define DG_TC_GROUPED(NAME, NT)                                                              \
-extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) NAME(                 \
-    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,               \
-    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,          \
-    unsigned int lda, unsigned int ldc                                                       \
-) {                                                                                          \
-    const unsigned long long h = blockIdx.z;                                                 \
-    dense_gemv_bf16_tc_impl<NT>(A + h * K, B + h * N * K, C + h * N, M, N, K, ldc, lda);     \
+template <int NT>
+__device__ __forceinline__ void dg_tc_grouped(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int lda, unsigned int ldc
+) {
+    const unsigned long long h = blockIdx.z;
+    dense_gemv_bf16_tc_impl<NT>(A + h * K, B + h * N * K, C + h * N, M, N, K, ldc, lda);
 }
-DG_TC_GROUPED(dense_gemv_bf16_tc8_grouped, 1)
-DG_TC_GROUPED(dense_gemv_bf16_tc16_grouped, 2)
-DG_TC_GROUPED(dense_gemv_bf16_tc32_grouped, 4)
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc8_grouped(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int lda, unsigned int ldc
+) {
+    atlas_pdl_enter();
+    dg_tc_grouped<1>(A, B, C, M, N, K, lda, ldc);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc16_grouped(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int lda, unsigned int ldc
+) {
+    atlas_pdl_enter();
+    dg_tc_grouped<2>(A, B, C, M, N, K, lda, ldc);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc32_grouped(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+    unsigned int lda, unsigned int ldc
+) {
+    atlas_pdl_enter();
+    dg_tc_grouped<4>(A, B, C, M, N, K, lda, ldc);
+}
+
+
+// Up to three independent projections in one launch (grid z = plane, each
+// plane `A_z [M, K_z] · B_z [N_z, K_z]^T -> C_z`, rows N_z apart): the KDA
+// beta | f_a | g_a and f_b | g_b sets under ATLAS_GLM_CANONICAL_VERIFY. Each
+// plane runs the plain tier's body: bit-identical to its own launch.
+// Plane z (`blockIdx.z`) of the planes kernels below.
+template <int NT>
+__device__ __forceinline__ void dg_tc_planes(
+    const __nv_bfloat16* A0, const __nv_bfloat16* A1, const __nv_bfloat16* A2,
+    const __nv_bfloat16* B0, const __nv_bfloat16* B1, const __nv_bfloat16* B2,
+    __nv_bfloat16* C0, __nv_bfloat16* C1, __nv_bfloat16* C2,
+    unsigned int N0, unsigned int N1, unsigned int N2,
+    unsigned int K0, unsigned int K1, unsigned int K2, unsigned int M
+) {
+    const unsigned int z = blockIdx.z;
+    const unsigned int N = z == 0u ? N0 : (z == 1u ? N1 : N2);
+    const unsigned int K = z == 0u ? K0 : (z == 1u ? K1 : K2);
+    if (blockIdx.x * 16u >= N) return;
+    dense_gemv_bf16_tc_impl<NT>(z == 0u ? A0 : (z == 1u ? A1 : A2), z == 0u ? B0 : (z == 1u ? B1 : B2),
+                                z == 0u ? C0 : (z == 1u ? C1 : C2), M, N, K, N, K);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc8_planes(
+    const __nv_bfloat16* A0, const __nv_bfloat16* A1, const __nv_bfloat16* A2,
+    const __nv_bfloat16* B0, const __nv_bfloat16* B1, const __nv_bfloat16* B2,
+    __nv_bfloat16* C0, __nv_bfloat16* C1, __nv_bfloat16* C2,
+    unsigned int N0, unsigned int N1, unsigned int N2,
+    unsigned int K0, unsigned int K1, unsigned int K2, unsigned int M
+) {
+    atlas_pdl_enter();
+    dg_tc_planes<1>(A0, A1, A2, B0, B1, B2, C0, C1, C2, N0, N1, N2, K0, K1, K2, M);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc16_planes(
+    const __nv_bfloat16* A0, const __nv_bfloat16* A1, const __nv_bfloat16* A2,
+    const __nv_bfloat16* B0, const __nv_bfloat16* B1, const __nv_bfloat16* B2,
+    __nv_bfloat16* C0, __nv_bfloat16* C1, __nv_bfloat16* C2,
+    unsigned int N0, unsigned int N1, unsigned int N2,
+    unsigned int K0, unsigned int K1, unsigned int K2, unsigned int M
+) {
+    atlas_pdl_enter();
+    dg_tc_planes<2>(A0, A1, A2, B0, B1, B2, C0, C1, C2, N0, N1, N2, K0, K1, K2, M);
+}
+
+extern "C" __global__ void __launch_bounds__(DG_TC_WARPS * WARP_SIZE) dense_gemv_bf16_tc32_planes(
+    const __nv_bfloat16* A0, const __nv_bfloat16* A1, const __nv_bfloat16* A2,
+    const __nv_bfloat16* B0, const __nv_bfloat16* B1, const __nv_bfloat16* B2,
+    __nv_bfloat16* C0, __nv_bfloat16* C1, __nv_bfloat16* C2,
+    unsigned int N0, unsigned int N1, unsigned int N2,
+    unsigned int K0, unsigned int K1, unsigned int K2, unsigned int M
+) {
+    atlas_pdl_enter();
+    dg_tc_planes<4>(A0, A1, A2, B0, B1, B2, C0, C1, C2, N0, N1, N2, K0, K1, K2, M);
+}

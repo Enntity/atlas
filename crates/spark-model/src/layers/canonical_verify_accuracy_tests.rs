@@ -98,7 +98,7 @@ fn canonical_verify_accuracy() -> Result<()> {
         ("w4a16_gemv_batch2", 2),
         ("w4a16_gemv_batch3", 3),
         ("w4a16_gemv_tc8", 8),
-        ("w4a16_gemv_tc8c", 8),
+        ("w4a16_gemv_tc8", 32),
         ("w4a16_gemv_tc16", 16),
         ("w4a16_gemv_tc32", 32),
     ] {
