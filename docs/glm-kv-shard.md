@@ -424,15 +424,17 @@ kernel. The view form runs the same kernels on the same bytes as flag-off.
 Supported (implemented): prefill chunks (incl. sequence-parallel prefill,
 pieces across the 2048 dense/sparse boundary), DFlash verify (single owner,
 owner-batched, fused prefill+verify), single-sequence eager decode, BF16 and
-fp8_g128 caches, prefix caching (positional sharing keeps each block's owner).
+fp8_g128 caches, prefix caching (positional sharing keeps each block's owner),
+the NVMe prefix tier (`ATLAS_KV_NVME_DIR`, with `ATLAS_GLM_NVME_FAST`,
+`ATLAS_GLM_NVME_KEEP` and the SSM snapshot tier beside it: each rank spills
+and restores its own blocks' latents plus every block's index rows, see
+`glm-nvme-prefix-cache.md` §12).
 
 Refused at startup: a rank whose `[shard, compact, overlap, check]` differ
 from its peer's, a shard variable that is not 0 or 1, a tuning or the check
 without the shard, the environment lanes listed under "Startup refusals"
 (multi-sequence sparse decode, the repaired MTP, C4 and independent decode
-lanes, the long-verify serial diagnostic), `--high-speed-swap`, the NVMe
-prefix tier (`ATLAS_KV_NVME_DIR`: it spills and restores whole blocks'
-latents by physical id), a world
+lanes, the long-verify serial diagnostic), `--high-speed-swap`, a world
 other than a TP2 pair with 32 heads per rank, a latent dtype other than BF16
 or `fp8_g128`.
 
