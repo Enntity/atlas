@@ -1,7 +1,20 @@
-# `glm5_next` — GLM-5.3-Flash on GB10: what is in Atlas, and what is not
+# `glm5_next` — GLM-5.3-Flash on GB10: current status
 
-Status as of 2026-09-28: **port in progress; not yet in-tree.** Tracking issue:
-#59. Target checkpoint:
+**Current (2026-10-10).** GLM-5.3-Flash is released as the Enntity snapshot
+`sparkglm/atlas-20261009-rc2` (`f2b805e7`), tree-equivalent with
+`sparkglm/atlas-20261009-rc2-layered` (`fea1ef6c`), both at tree `513bf0c7`.
+Port notes, recipes, and measured results live in
+[`Enntity/sparkglm`](https://github.com/Enntity/sparkglm); see
+[`docs/PUBLISHED_RELEASES.md`](../PUBLISHED_RELEASES.md) for the release index
+and the tested scope. Everything below the horizontal rule is dated historical
+port notes, kept as written.
+
+---
+
+## Dated historical port notes (2026-09-28)
+
+At the date of these notes the port was in progress and not yet in-tree.
+Tracking issue: #59. Target checkpoint:
 [`nvidia/GLM-5.3-Flash-NVFP4`](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4).
 This file lands with the first GLM PR and is updated in place as each PR in the
 series merges. Every number here is either measured on the tree it names or is
@@ -39,7 +52,7 @@ Tool calls use the existing `poolside_v1` parser.
 
 **Authors**
 - **Reiner Schmidt ([@Mango-kid](https://github.com/Mango-kid))** wrote the original Atlas port: [`Mango-kid/atlas` `feat/glm53-dual-spark`](https://github.com/Mango-kid/atlas/tree/feat/glm53-dual-spark) @ `90b3584a`, AGPL-3.0-only. It includes the `glm5_next` parser, weight loader, KDA layers and kernels, the GLM indexer, and native MTP.
-- **Jason McCartney ([@data-angel](https://github.com/data-angel), Enntity)** extended it in [`Enntity/atlas` `sparkglm/installable-20260924`](https://github.com/Enntity/atlas/tree/sparkglm/installable-20260924), AGPL-3.0-only. The work covers the NVIDIA ModelOpt dense-FFN loader, sparse-MLA decode and prefill kernels, MoE prefill, fp8 latent KV, and DFlash2 integration. Research notes: [`Enntity/sparkglm` `research/atlas`](https://github.com/Enntity/sparkglm/tree/main/research/atlas).
+- **Jason McCartney ([@data-angel](https://github.com/data-angel), Enntity)** extended it in the Enntity GLM work, first published as the now-historical `sparkglm/installable-20260924` snapshot and since released as `sparkglm/atlas-20261009-rc2` (see [`docs/PUBLISHED_RELEASES.md`](../PUBLISHED_RELEASES.md)), AGPL-3.0-only. The work covers the NVIDIA ModelOpt dense-FFN loader, sparse-MLA decode and prefill kernels, MoE prefill, fp8 latent KV, and DFlash2 integration. Current release receipts: [SparkGLM RC2](https://github.com/Enntity/sparkglm/blob/main/results/2026-10-09-rc2/RESULT.md).
 - **AI assistance.** Both branches were written largely by AI coding agents under their authors' direction: Claude and Codex for the Enntity work, and agent-written work in Reiner's branch. The PRs in this series are ported by Claude. Commits that carry Reiner's code credit him with `Co-authored-by`.
 
 **Reference implementations and papers** — ideas and numerics only; no source copied:

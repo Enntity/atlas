@@ -48,6 +48,21 @@ Atlas is a high-performance, pure Rust & CUDA LLM inference engine purpose-built
 
 ---
 
+## Enntity releases
+
+This fork publishes the Atlas engines used by
+[SparkGLM](https://github.com/Enntity/sparkglm) and
+[SparkQwen](https://github.com/Enntity/sparkqwen). The
+[published release index](docs/PUBLISHED_RELEASES.md) records their exact
+commits, source trees, upstream bases and measured scope.
+
+The `enntity/releases` branch carries the released GLM source with updated
+navigation. SparkQwen RC15 uses a different engine commit. Start from each
+product's `install/atlas-source.json` to reproduce its measured build.
+The Atlas project overview below is inherited from upstream.
+
+---
+
 <a id="philosophy"></a>
 
 ## 🧭 Philosophy

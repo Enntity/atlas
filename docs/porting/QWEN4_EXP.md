@@ -1,4 +1,18 @@
-# `qwen4_exp` — Qwen3.8-Flash-Next: what is in Atlas, and what is not
+# `qwen4_exp` — Qwen3.8-Flash-Next: current status
+
+**Current (2026-10-10).** Qwen3.8-Flash-Next is released as the Enntity
+snapshot `sparkqwen/atlas-20261008-rc15` (`de4386b4`, tree `5f06ba8e`). This
+file is not that release's build source: this tree is the docs branch and
+carries the released GLM source, not the Qwen engine. Builders must use the
+Qwen product manifests in [`Enntity/sparkqwen`](https://github.com/Enntity/sparkqwen)
+for the exact measured source; the release index and tested scope are in
+[`docs/PUBLISHED_RELEASES.md`](../PUBLISHED_RELEASES.md). Everything below the
+horizontal rule is dated historical port notes, the architecture and component
+notes kept as written.
+
+---
+
+## Dated historical port notes (2026-08-27)
 
 Status as of 2026-08-27 for the architecture and component notes; the
 **2026-09-15 status of the `nvidia/Qwen3.8-Flash-Next-NVFP4` pack** — loads,
