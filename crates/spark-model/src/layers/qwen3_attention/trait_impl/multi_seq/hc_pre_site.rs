@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! `hc_pre_site` for the multi-sequence path, with the split `hc_pre` fast
-//! path for short Sinkhorn batches.
+//! path for short Sinkhorn batches and the native EXL3 normalized input.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -28,6 +28,36 @@ impl Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<()> {
         let h = ctx.config.hidden_size as u32;
+        if self.has_exl3_mla() {
+            let norm_weight = if std::ptr::eq(site, &hc.attn) {
+                self.input_norm.weight
+            } else if std::ptr::eq(site, &hc.ffn) {
+                self.post_attn_norm.weight
+            } else {
+                anyhow::bail!("native EXL3 mHC requires an owned normalization site");
+            };
+            let native = self
+                .exl3_mla
+                .as_ref()
+                .unwrap()
+                .mhc
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("native EXL3 mHC kernel owner absent"))?;
+            return native.pre_norm(
+                ctx.gpu,
+                site,
+                norm_weight,
+                crate::layers::glm5_exl3_mhc::NativeMhcBuffers {
+                    highway: streams,
+                    normed: y_out,
+                    post,
+                    comb,
+                },
+                n,
+                crate::layers::glm5_exl3_mhc::MhcResidualPrecision::for_fused_rows(n),
+                stream,
+            );
+        }
         if site.lowrank.is_none()
             && ops::try_hc_pre_split(
                 ctx.gpu,

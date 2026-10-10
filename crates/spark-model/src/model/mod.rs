@@ -31,6 +31,9 @@ pub(crate) mod drafter_context;
 pub(crate) mod drop;
 pub mod glm_c4;
 pub(crate) mod glm_cache_plan;
+pub mod glm_exl3_head;
+#[cfg(test)]
+mod glm_exl3_teardown_tests;
 mod glm_fused_chunk;
 pub mod glm_independent;
 pub(crate) mod glm_k3_head;

@@ -18,6 +18,7 @@ impl FfnComponent {
             "independent FFN requires independent rows or a GLM DFlash verify block"
         );
         match self {
+            Self::Exl3(layer) => layer.forward_rows(input, rows, ctx, stream),
             Self::Moe(m) => m.forward_independent(input, rows, ctx, stream),
             Self::Dense(d) if d.can_forward_km(rows as u32) => {
                 d.forward_km(input, rows as u32, ctx, stream)?;
@@ -57,6 +58,7 @@ impl FfnComponent {
             "GLM independent C4 FFN requires its explicit opt-in"
         );
         match self {
+            Self::Exl3(layer) => layer.forward_rows(input, 4, ctx, stream),
             Self::Moe(m) => m.forward_c4(input, ctx, stream),
             Self::Dense(d) if d.can_forward_km(4) => {
                 d.forward_km(input, 4, ctx, stream)?;

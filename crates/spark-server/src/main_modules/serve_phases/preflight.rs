@@ -163,8 +163,11 @@ pub(crate) fn preflight_reserve(
              and self/n-gram speculation are not supported"
         );
         anyhow::ensure!(
-            glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size),
-            "GLM-5 dual-Spark support requires --world-size 2 --ep-size 2 and either --tp-size 1 (EP fallback) or --tp-size 2 (overlapping TP+EP)"
+            super::exl3::parallelism_supported(config, args.world_size, args.tp_size, args.ep_size)
+                .unwrap_or_else(|| {
+                    glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size)
+                }),
+            "GLM-5 EXL3 requires --world-size == --tp-size > 0 and --ep-size 1; legacy dual-Spark support requires --world-size 2 --ep-size 2 and --tp-size 1 or 2"
         );
     }
     let h_state_bytes = config.ssm_h_state_bytes();

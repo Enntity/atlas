@@ -60,6 +60,10 @@ mod verify_fused;
 mod verify_layer_trace;
 
 impl Model for TransformerModel {
+    fn requires_configured_prefill_chunk_budget(&self) -> bool {
+        self.exl3_vocab_head.is_some()
+    }
+
     fn verify_logits_argmax_only(&self) -> bool {
         self.glm_verify_logits_argmax_only()
     }

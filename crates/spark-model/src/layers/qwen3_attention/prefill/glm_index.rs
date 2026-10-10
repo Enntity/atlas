@@ -62,12 +62,26 @@ impl Qwen3AttentionLayer {
         let h = ctx.config.hidden_size as u32;
         let dim = ctx.config.index_head_dim as u32;
         self.mla_prefill_dense(normed, &indexer.wk, keys, n, dim, h, ctx, stream)?;
+        let (norm_kernel, norm_weight, norm_bias) = if let Some(native) = &self.exl3_mla {
+            let params = native.index_f32_params()?;
+            (
+                native.index_exec()?.norm,
+                params.norm_weight,
+                params.norm_bias,
+            )
+        } else {
+            (
+                self.glm_index_layernorm_k,
+                indexer.k_norm_weight.weight,
+                indexer.k_norm_bias.weight,
+            )
+        };
         ops::glm_index_layernorm(
             ctx.gpu,
-            self.glm_index_layernorm_k,
+            norm_kernel,
             keys,
-            indexer.k_norm_weight.weight,
-            indexer.k_norm_bias.weight,
+            norm_weight,
+            norm_bias,
             n,
             dim,
             1e-6,
@@ -105,6 +119,25 @@ impl Qwen3AttentionLayer {
             ctx,
             stream,
         )?;
+        if let Some(native) = &self.exl3_mla {
+            let exec = native.index_exec()?;
+            exec.validate(
+                n as usize,
+                ctx.config.index_n_heads,
+                ctx.config.index_head_dim,
+                ctx.config.hidden_size,
+                ctx.buffers.sizes().ssm_gates,
+                stream,
+            )?;
+            return exec.query_and_weights(
+                ctx.gpu,
+                normed,
+                indexer.weights_proj.weight,
+                index_query,
+                weights,
+                n,
+            );
+        }
         // BF16 is sufficient for the first functional selector. A later
         // measured refinement will retain this projection's FP32 accumulator,
         // matching upstream's near-tie ranking treatment.
@@ -206,12 +239,20 @@ impl Qwen3AttentionLayer {
             kv_cache.sparse_index_tail_block_stride_bytes(self.attn_layer_idx) as u64,
             stream,
         )?;
+        let (finalize_kernel, ape) = if let Some(native) = &self.exl3_mla {
+            (
+                native.index_exec()?.finalize,
+                native.index_f32_params()?.ape,
+            )
+        } else {
+            (self.glm_index_kpool_finalize_k, indexer.kpool_ape.weight)
+        };
         ops::glm_index_kpool_finalize(
             ctx.gpu,
-            self.glm_index_kpool_finalize_k,
+            finalize_kernel,
             kv_cache.sparse_index_tail_pool_ptr(self.attn_layer_idx),
             kv_cache.sparse_index_tail_map_ptr(),
-            indexer.kpool_ape.weight,
+            ape,
             kv_cache.sparse_index_pool_ptr(self.attn_layer_idx),
             slots,
             rows,
@@ -267,8 +308,8 @@ impl Qwen3AttentionLayer {
         let index_heads = ctx.config.index_n_heads as u32;
         let index_dim = ctx.config.index_head_dim as u32;
         let pool_size = ctx.config.index_kpool as u32;
-        let topk = ctx.config.index_topk as u32;
-        let output_width = topk + pool_size - 1;
+        let budget = self.glm_index_budget(ctx.config)?;
+        let output_width = budget.physical_width();
         let sequence_end = seq_len_start + n as usize;
         let logits_stride = sequence_end.div_ceil(pool_size as usize) as u32;
 
@@ -290,7 +331,16 @@ impl Qwen3AttentionLayer {
         )?;
         let selected = ctx.buffers.expert_down_out();
         let query_row_bytes = index_heads as usize * index_dim as usize * 2;
-        let weights_row_bytes = index_heads as usize * 2;
+        let weights_row_bytes = index_heads as usize * self.glm_index_weight_element_bytes();
+        let (logits_kernel, rows_per_cta, pools_per_cta) = if let Some(native) = &self.exl3_mla {
+            (native.index_exec()?.logits, 1, 8)
+        } else {
+            (
+                self.glm_index_logits_k,
+                self.glm_index_logits_rows_per_cta,
+                self.glm_index_logits_pools_per_cta,
+            )
+        };
         let output_row_bytes = output_width as usize * std::mem::size_of::<i32>();
         // `ATLAS_GLM_INDEX_SPLIT=1`: this rank selects half the rows and swaps
         // them with its peer after the tiles.
@@ -323,7 +373,7 @@ impl Qwen3AttentionLayer {
             let rows = rows as u32;
             ops::glm_index_logits(
                 ctx.gpu,
-                self.glm_index_logits_k,
+                logits_kernel,
                 index_query.offset(row_start * query_row_bytes),
                 weights.offset(row_start * weights_row_bytes),
                 kv_cache.sparse_index_pool_ptr(self.attn_layer_idx),
@@ -339,8 +389,8 @@ impl Qwen3AttentionLayer {
                 pool_size,
                 kv_cache.block_size() as u32,
                 kv_cache.sparse_index_block_stride_bytes(self.attn_layer_idx) as u64,
-                self.glm_index_logits_rows_per_cta,
-                self.glm_index_logits_pools_per_cta,
+                rows_per_cta,
+                pools_per_cta,
                 stream,
             )?;
             logits_us += profile_lap(ctx, stream, &mut profile)?;
@@ -358,7 +408,7 @@ impl Qwen3AttentionLayer {
                 rows,
                 (seq_len_start + row_start) as u32,
                 logits_stride,
-                topk,
+                budget.history_tokens(),
                 pool_size,
                 output_width,
                 stream,

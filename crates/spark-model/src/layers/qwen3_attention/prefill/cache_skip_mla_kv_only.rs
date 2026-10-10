@@ -26,6 +26,7 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        self.validate_exl3_mla_forward(num_tokens, ctx, stream)?;
         let Some(mla) = self.mla.as_ref() else {
             return Ok(false);
         };

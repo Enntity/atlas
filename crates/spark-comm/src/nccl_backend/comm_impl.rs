@@ -251,6 +251,16 @@ impl CommBackend for NcclBackend {
     }
 
     fn all_gather(&self, send_ptr: u64, recv_ptr: u64, bytes: usize) -> Result<()> {
+        self.all_gather_on_stream(send_ptr, recv_ptr, bytes, self.legacy_stream)
+    }
+
+    fn all_gather_on_stream(
+        &self,
+        send_ptr: u64,
+        recv_ptr: u64,
+        bytes: usize,
+        stream: u64,
+    ) -> Result<()> {
         let comm = *self.comm.lock();
         let result = unsafe {
             nccl::ncclAllGather(
@@ -259,7 +269,7 @@ impl CommBackend for NcclBackend {
                 bytes,
                 NcclDataType::Uint8,
                 comm,
-                self.legacy_stream,
+                stream,
             )
         };
         nccl::check_nccl(result, "ncclAllGather")?;

@@ -20,10 +20,12 @@ use crate::weight_loader::{
 };
 
 mod dspark_admission;
+mod exl3_preflight;
 #[allow(unused_imports)]
 pub(crate) use dspark_admission::{
     admit_lightning_dspark, admit_lightning_dspark_build, admit_lightning_dspark_product_build,
 };
+pub use exl3_preflight::preflight_glm53_tp2_packed;
 #[cfg(test)]
 mod dspark_admission_tests;
 #[cfg(test)]

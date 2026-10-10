@@ -75,6 +75,7 @@ struct Target {
     arch: String,
     /// Per-model quant dir (for KERNEL.toml and optional override .cu files).
     model_kernel_dir: PathBuf,
+    model_config_path: PathBuf,
     /// Common quant dir (hw_dir/quant/) with shared .cu files.
     common_kernel_dir: Option<PathBuf>,
     /// Sibling quant dir this target composes on, from `[build] base_quant`
@@ -83,6 +84,7 @@ struct Target {
     /// base quant's own build stays free of the overlay's kernels.
     base_kernel_dir: Option<PathBuf>,
     extra_flags: Vec<String>,
+    module_compile_flags: build_module_flags::ModuleFlags,
     module_overrides: HashMap<String, String>,
     /// `(module, kernel)` pairs declared in `[shadow_exempt]` — kernels this
     /// target may drop from `common/` WITHOUT it being drift, each with a
@@ -358,6 +360,25 @@ fn main() {
             target.quant,
         );
 
+        let available_modules: std::collections::HashSet<String> = cu_files
+            .iter()
+            .map(|source| {
+                let stem = source.file_stem().unwrap().to_str().unwrap();
+                target
+                    .module_overrides
+                    .get(stem)
+                    .cloned()
+                    .unwrap_or_else(|| stem.to_owned())
+            })
+            .collect();
+        build_module_flags::validate_modules(&available_modules, &target.module_compile_flags)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{error} for {}/{}/{}",
+                    target.hw, target.model, target.quant
+                )
+            });
+
         // Gather work for this target (no compilation yet — that runs
         // in parallel after the full work plan is built).
         for cu_file in &cu_files {
@@ -376,9 +397,14 @@ fn main() {
 
             // Dedup key: same (source, arch, sorted-flags) → identical
             // binary output. Sort flags so flag-order doesn't bust the cache.
-            let mut sorted_flags = target.extra_flags.clone();
-            sorted_flags.sort();
-            let key = (compile_source.clone(), target.arch.clone(), sorted_flags);
+            let module = target.module_overrides.get(&stem).unwrap_or(&stem);
+            let effective_flags = build_module_flags::effective_flags(
+                &target.extra_flags,
+                module,
+                &target.module_compile_flags,
+            );
+            let key =
+                build_module_flags::compile_key(&compile_source, &target.arch, &effective_flags);
 
             if let Some(existing) = compile_cache.get(&key) {
                 copy_jobs.push((existing.clone(), out_file));
@@ -386,7 +412,7 @@ fn main() {
                 compile_jobs.push(CompileJob {
                     cu_file: compile_source.clone(),
                     arch: target.arch.clone(),
-                    extra_flags: target.extra_flags.clone(),
+                    extra_flags: effective_flags,
                     out_file: out_file.clone(),
                 });
                 compile_cache.insert(key, out_file);
@@ -631,13 +657,17 @@ fn closure_attestation(
         if sources.is_empty() {
             continue;
         }
-        let model_dir = target.model_kernel_dir.parent();
         let configs = [
             workspace_root
                 .join("kernels")
                 .join(&target.hw)
                 .join("HARDWARE.toml"),
-            model_dir.map(|d| d.join("MODEL.toml")).unwrap_or_default(),
+            target.model_config_path.clone(),
+            target
+                .common_kernel_dir
+                .as_ref()
+                .map(|d| d.join("KERNEL.toml"))
+                .unwrap_or_default(),
             target
                 .base_kernel_dir
                 .as_ref()
@@ -673,6 +703,9 @@ fn closure_attestation(
                 "arch": target.arch,
                 "compiler": compiler,
                 "flags": target.extra_flags,
+                "module_flags": target.module_compile_flags.keys().map(|module|
+                    (module.clone(), build_module_flags::effective_flags(&target.extra_flags, module, &target.module_compile_flags)))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
             }),
         );
     }
@@ -1156,6 +1189,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
             // now: common parses first as the base; the model toml appends
             // flags (deduped, model last) and wins per-key on [modules].
             let mut extra_flags: Vec<String> = Vec::new();
+            let mut module_compile_flags = build_module_flags::ModuleFlags::new();
             let mut module_overrides: HashMap<String, String> = HashMap::new();
             // Shadow-drop exemptions merge the same way: common/ declares the
             // repo-wide superseded kernels, a model KERNEL.toml adds the ones
@@ -1163,6 +1197,10 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
             let mut shadow_exempt: Vec<(String, String)> = Vec::new();
             if has_common_dir && common_kernel_dir.join("KERNEL.toml").exists() {
                 let (f, m) = parse_kernel_toml(&common_kernel_dir, &target_vendor);
+                module_compile_flags.extend(parse_module_compile_flags(
+                    &common_kernel_dir.join("KERNEL.toml"),
+                    &target_vendor,
+                ));
                 extra_flags.extend(f);
                 module_overrides.extend(m);
                 shadow_exempt.extend(parse_shadow_exempt(&common_kernel_dir));
@@ -1197,9 +1235,17 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                         extra_flags.push(flag);
                     }
                 }
+                module_compile_flags.extend(parse_module_compile_flags(
+                    &dir.join("KERNEL.toml"),
+                    &target_vendor,
+                ));
                 module_overrides.extend(m);
                 shadow_exempt.extend(parse_shadow_exempt(dir));
             }
+            module_compile_flags.extend(parse_module_compile_flags(
+                &model_dir.join("MODEL.toml"),
+                &target_vendor,
+            ));
             shadow_exempt.sort();
             shadow_exempt.dedup();
 
@@ -1226,6 +1272,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 quant: quant.clone(),
                 arch: arch.clone(),
                 model_kernel_dir,
+                model_config_path: model_dir.join("MODEL.toml"),
                 common_kernel_dir: if has_common_dir {
                     Some(common_kernel_dir)
                 } else {
@@ -1233,6 +1280,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 },
                 base_kernel_dir,
                 extra_flags,
+                module_compile_flags,
                 module_overrides,
                 shadow_exempt,
                 expected_absent,
@@ -1391,6 +1439,9 @@ fn list_subdirs(dir: &std::path::Path) -> Vec<String> {
     dirs
 }
 
+#[path = "build_module_flags.rs"]
+mod build_module_flags;
+use build_module_flags::parse_module_compile_flags;
 #[path = "build_parse.rs"]
 mod build_parse;
 

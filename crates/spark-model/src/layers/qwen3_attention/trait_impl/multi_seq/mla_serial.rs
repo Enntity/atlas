@@ -44,7 +44,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::dense_gemv(
+                self.mla_dense_gemv(
                     gpu,
                     self.dense_gemv_k,
                     normed,
@@ -79,7 +79,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::dense_gemv(
+                self.mla_dense_gemv(
                     gpu,
                     self.dense_gemv_k,
                     q_latent,
@@ -153,7 +153,7 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            ops::dense_gemv(
+            self.mla_dense_gemv(
                 gpu,
                 self.dense_gemv_k,
                 normed,
@@ -181,7 +181,7 @@ impl Qwen3AttentionLayer {
         // `ssm_ba` user) was fully consumed by the `wq_b` GEMV above.
         let k_rope_single = buffers.ssm_ba();
         if d.mla_rope > 0 {
-            ops::dense_gemv(
+            self.mla_dense_gemv(
                 gpu,
                 self.dense_gemv_k,
                 normed,
@@ -343,7 +343,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::dense_gemv(
+                self.mla_dense_gemv(
                     gpu,
                     self.dense_gemv_k,
                     v_extracted,
@@ -366,7 +366,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::dense_gemv(
+                self.mla_dense_gemv(
                     gpu,
                     self.dense_gemv_k,
                     o_latent,
@@ -389,7 +389,7 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            ops::dense_gemv(
+            self.mla_dense_gemv(
                 gpu,
                 self.dense_gemv_k,
                 v_extracted,

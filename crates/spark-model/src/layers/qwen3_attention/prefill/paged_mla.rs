@@ -90,6 +90,7 @@ impl Qwen3AttentionLayer {
             bs,
             stream,
         } = *args;
+        self.validate_exl3_mla_forward(num_tokens, ctx, stream)?;
         let mla = self
             .mla
             .as_ref()
@@ -103,7 +104,7 @@ impl Qwen3AttentionLayer {
 
         // Q: latent → norm → expand → [N, nq*hd] in [nope|rope] per head
         let q_latent = ctx.buffers.ssm_ba();
-        ops::dense_gemm(
+        self.mla_dense_gemm(
             ctx.gpu,
             self.dense_gemm_k,
             normed,
@@ -126,7 +127,7 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
         let qg_out = ctx.buffers.qkv_output();
-        ops::dense_gemm(
+        self.mla_dense_gemm(
             ctx.gpu,
             self.dense_gemm_k,
             q_latent,
@@ -140,7 +141,7 @@ impl Qwen3AttentionLayer {
 
         // KV: latent → norm → expand
         let kv_latent = ctx.buffers.expert_gate_out();
-        ops::dense_gemm(
+        self.mla_dense_gemm(
             ctx.gpu,
             self.dense_gemm_k,
             normed,
@@ -164,7 +165,7 @@ impl Qwen3AttentionLayer {
         )?;
         let kv_expanded_dim = nkv * (mla_nope + mla_v_dim);
         let kv_expanded = ctx.buffers.ssm_deinterleaved();
-        ops::dense_gemm(
+        self.mla_dense_gemm(
             ctx.gpu,
             self.dense_gemm_k,
             kv_latent,
@@ -179,7 +180,7 @@ impl Qwen3AttentionLayer {
         // K_rope: single shared head [N, rope=64] (MQA-style)
         let k_rope_buf = ctx.buffers.ssm_ba();
         if mla_rope > 0 {
-            ops::dense_gemm(
+            self.mla_dense_gemm(
                 ctx.gpu,
                 self.dense_gemm_k,
                 normed,
@@ -331,7 +332,7 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            ops::dense_gemm(
+            self.mla_dense_gemm(
                 ctx.gpu,
                 self.dense_gemm_k,
                 attn_out,

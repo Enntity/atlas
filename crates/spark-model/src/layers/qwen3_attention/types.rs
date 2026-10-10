@@ -114,6 +114,7 @@ pub struct Qwen3AttentionLayer {
     pub(super) o_dense_bf16: Option<DenseWeight>,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,
+    pub(super) exl3_mla: Option<crate::weight_loader::glm5::exl3_mla::Glm5Exl3MlaResources>,
     /// MXFP8 twins of MLA weights keyed by the BF16 weight pointer, with the
     /// `[n, k]` they were quantized as: verify rows and paged prefill chunks
     /// that short (<= 32) read half the bytes; longer chunks keep BF16.

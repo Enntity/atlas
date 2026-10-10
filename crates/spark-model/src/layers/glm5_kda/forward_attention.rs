@@ -19,6 +19,14 @@ impl Glm5KdaLayer {
         stream: u64,
         recurrent: &mut dyn FnMut(DevicePtr, DevicePtr, DevicePtr) -> Result<DevicePtr>,
     ) -> Result<FfnPhase> {
+        self.validate_exl3_forward(tokens, ctx, stream)?;
+        let upstream = self
+            .upstream_trace
+            .as_ref()
+            .map(|trace| trace.begin())
+            .transpose()?
+            .flatten();
+        use spark_runtime::weights::exl3::ffn_io::DiagnosticDtype::Bf16;
         let m = tokens as u32;
         let h = self.hidden_size as u32;
         let p = self.heads * self.dim;
@@ -33,8 +41,24 @@ impl Glm5KdaLayer {
         // rows compacted at row 0 (`layers::glm_sp`); `m_hc` is their count.
         let sp = crate::layers::glm_sp::current()
             .filter(|sp| !decode && !capture_verify_intermediates && tokens == sp.total());
+        ensure!(
+            upstream.is_none() || sp.is_none(),
+            "EXL3 upstream capture requires full-row pure TP; sequence-parallel captures are unsupported"
+        );
         let m_hc = sp.map_or(m, |sp| sp.rows as u32);
         let local = |x: DevicePtr| sp.map_or(x, |sp| sp.local(x, self.hidden_size));
+        self.capture_upstream(
+            upstream,
+            "incoming_hidden",
+            &[(
+                "hidden",
+                Bf16,
+                local(hidden),
+                &[m_hc as usize, self.hidden_size],
+            )],
+            ctx,
+            stream,
+        )?;
 
         if self.layer_idx == 0 {
             ops::hc_expand(
@@ -48,29 +72,51 @@ impl Glm5KdaLayer {
                 stream,
             )?;
         }
-        self.hc_pre(&self.hc.attn, hidden, m_hc, ctx, stream)?;
+        self.capture_upstream(
+            upstream,
+            "incoming_highway",
+            &[(
+                "highway",
+                Bf16,
+                ctx.buffers.hc_streams(),
+                &[m_hc as usize, self.hc.hc_mult, self.hidden_size],
+            )],
+            ctx,
+            stream,
+        )?;
         // ATLAS_GLM_DET_TRACE stages; `det_rows` are the seam (local) rows.
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let (det_rows, row) = (
             (sp.map_or(0, |sp| sp.row0), m_hc as usize),
             h as usize * bf16,
         );
-        det.tap("in", hidden, det_rows, row);
         let normed = ctx.buffers.norm_output();
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            hidden,
-            &self.input_norm,
+        if !self.exl3_hc_norm(
+            &self.hc.attn,
+            self.input_norm.weight,
             local(normed),
             m_hc,
-            h,
-            ctx.config.rms_norm_eps as f32,
+            ctx,
             stream,
-        )?;
+        )? {
+            self.hc_pre(&self.hc.attn, hidden, m_hc, ctx, stream)?;
+            det.tap("in", hidden, det_rows, row);
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                hidden,
+                &self.input_norm,
+                local(normed),
+                m_hc,
+                h,
+                ctx.config.rms_norm_eps as f32,
+                stream,
+            )?;
+        }
         if let Some(sp) = sp {
             sp.all_gather(normed, self.hidden_size, ctx, stream)?;
         }
+        self.capture_upstream_hc(upstream, "attn_mhc_norm", normed, tokens, ctx, stream)?;
         profile::step(ctx, stream, &mut profile_timer, "hc_attn_norm")?;
 
         let projected = ctx.buffers.qkv_output();
@@ -92,271 +138,39 @@ impl Glm5KdaLayer {
         let beta = projected.offset(3 * plane_bytes);
         let fa = beta.offset(tokens * self.heads * bf16);
         let ga = fa.offset(tokens * self.dim * bf16);
-        let fused_dense_pairs = capture_verify_intermediates
-            && !canonical
-            && m == 5
-            && self.dense_gemv_batch5_dual_k.0 != 0
-            && verify_fused_dense_pairs_enabled();
-        let fused_dense_triple = capture_verify_intermediates
-            && !canonical
-            && m == 5
-            && self.dense_gemv_batch5_triple_n_k.0 != 0
-            && verify_fused_dense_triple_enabled();
-        // Verify rows 2..=8 otherwise: the same batchm body per plane, one grid.
-        let batchm_fused = capture_verify_intermediates
-            && !canonical
-            && (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(&m)
-            && self.dense_gemv_batchm_triple_n_k.0 != 0
-            && self.dense_gemv_batchm_dual_k.0 != 0;
-        if canonical && verify_proj {
-            // One canonical launch for the three side projections.
-            let (heads, dim) = (self.heads as u32, self.dim as u32);
-            crate::layers::canonical_verify::dense_planes(
-                ctx.gpu,
-                &[
-                    (normed, &self.weights.b_proj, beta, heads, h),
-                    (normed, &self.weights.f_a_proj, fa, dim, h),
-                    (normed, &self.weights.g_a_proj, ga, dim, h),
-                ],
-                m,
-                stream,
-            )?;
-            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
-        } else if batchm_fused && !fused_dense_triple {
-            ops::dense_gemv_batchm_triple_n(
-                ctx.gpu,
-                self.dense_gemv_batchm_triple_n_k,
-                normed,
-                [
-                    &self.weights.b_proj,
-                    &self.weights.f_a_proj,
-                    &self.weights.g_a_proj,
-                ],
-                [beta, fa, ga],
-                m,
-                [self.heads as u32, self.dim as u32],
-                h,
-                stream,
-            )?;
-            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
-        } else if fused_dense_triple {
-            ops::dense_gemv_batch5_triple_n(
-                ctx.gpu,
-                self.dense_gemv_batch5_triple_n_k,
-                normed,
-                &self.weights.b_proj,
-                &self.weights.f_a_proj,
-                &self.weights.g_a_proj,
-                beta,
-                fa,
-                ga,
-                self.heads as u32,
-                self.dim as u32,
-                h,
-                stream,
-            )?;
-            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
-        } else if !verify_proj
-            && m > 1
-            && self.dense_gemm_pipelined_k.0 != 0
-            && self.dense_gemm_pipelined_triple_n_k.0 != 0
-        {
-            // The three pipelined launches `project_dense` would make, in one grid.
-            ops::dense_gemm_pipelined_triple_n(
-                ctx.gpu,
-                self.dense_gemm_pipelined_triple_n_k,
-                normed,
-                [
-                    &self.weights.b_proj,
-                    &self.weights.f_a_proj,
-                    &self.weights.g_a_proj,
-                ],
-                [beta, fa, ga],
-                m,
-                [self.heads as u32, self.dim as u32],
-                h,
-                stream,
-            )?;
-            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
-        } else {
-            if verify_proj {
-                self.project_dense_verify(
-                    normed,
-                    &self.weights.b_proj,
-                    beta,
-                    m,
-                    self.heads as u32,
-                    h,
-                    ctx,
-                    stream,
-                )?;
-            } else {
-                self.project_dense(
-                    normed,
-                    &self.weights.b_proj,
-                    beta,
-                    m,
-                    self.heads as u32,
-                    h,
-                    ctx,
-                    stream,
-                )?;
-            }
-            profile::step(ctx, stream, &mut profile_timer, "kv_beta_proj")?;
-            if fused_dense_pairs {
-                ops::dense_gemv_batch5_dual(
-                    ctx.gpu,
-                    self.dense_gemv_batch5_dual_k,
-                    normed,
-                    normed,
-                    &self.weights.f_a_proj,
-                    &self.weights.g_a_proj,
-                    fa,
-                    ga,
-                    self.dim as u32,
-                    h,
-                    stream,
-                )?;
-            } else {
-                if verify_proj {
-                    self.project_dense_verify(
-                        normed,
-                        &self.weights.f_a_proj,
-                        fa,
-                        m,
-                        self.dim as u32,
-                        h,
-                        ctx,
-                        stream,
-                    )?;
-                } else {
-                    self.project_dense(
-                        normed,
-                        &self.weights.f_a_proj,
-                        fa,
-                        m,
-                        self.dim as u32,
-                        h,
-                        ctx,
-                        stream,
-                    )?;
-                }
-                profile::step(ctx, stream, &mut profile_timer, "f_a_proj")?;
-                if verify_proj {
-                    self.project_dense_verify(
-                        normed,
-                        &self.weights.g_a_proj,
-                        ga,
-                        m,
-                        self.dim as u32,
-                        h,
-                        ctx,
-                        stream,
-                    )?;
-                } else {
-                    self.project_dense(
-                        normed,
-                        &self.weights.g_a_proj,
-                        ga,
-                        m,
-                        self.dim as u32,
-                        h,
-                        ctx,
-                        stream,
-                    )?;
-                }
-            }
-            if fused_dense_pairs {
-                profile::step(ctx, stream, &mut profile_timer, "f_a_g_a")?;
-            }
-        }
-
-        let g1 = ctx.buffers.ssm_deinterleaved();
-        let g2 = g1.offset(plane_bytes);
-        if canonical && verify_proj {
-            let dim = self.dim as u32;
-            crate::layers::canonical_verify::dense_planes(
-                ctx.gpu,
-                &[
-                    (fa, &self.weights.f_b_proj, g1, p as u32, dim),
-                    (ga, &self.weights.g_b_proj, g2, p as u32, dim),
-                ],
-                m,
-                stream,
-            )?;
-        } else if batchm_fused && !fused_dense_pairs {
-            ops::dense_gemv_batchm_dual(
-                ctx.gpu,
-                self.dense_gemv_batchm_dual_k,
-                [fa, ga],
-                [&self.weights.f_b_proj, &self.weights.g_b_proj],
-                [g1, g2],
-                m,
-                p as u32,
-                self.dim as u32,
-                stream,
-            )?;
-        } else if fused_dense_pairs {
-            ops::dense_gemv_batch5_dual(
-                ctx.gpu,
-                self.dense_gemv_batch5_dual_k,
-                fa,
-                ga,
-                &self.weights.f_b_proj,
-                &self.weights.g_b_proj,
-                g1,
-                g2,
-                p as u32,
-                self.dim as u32,
-                stream,
-            )?;
-        } else if verify_proj {
-            self.project_dense_verify(
-                fa,
-                &self.weights.f_b_proj,
-                g1,
-                m,
-                p as u32,
-                self.dim as u32,
-                ctx,
-                stream,
-            )?;
-            self.project_dense_verify(
-                ga,
-                &self.weights.g_b_proj,
-                g2,
-                m,
-                p as u32,
-                self.dim as u32,
-                ctx,
-                stream,
-            )?;
-        } else {
-            self.project_dense(
-                fa,
-                &self.weights.f_b_proj,
-                g1,
-                m,
-                p as u32,
-                self.dim as u32,
-                ctx,
-                stream,
-            )?;
-            self.project_dense(
-                ga,
-                &self.weights.g_b_proj,
-                g2,
-                m,
-                p as u32,
-                self.dim as u32,
-                ctx,
-                stream,
-            )?;
-        }
-        profile::step(ctx, stream, &mut profile_timer, "g_a_f_b_g_b")?;
+        let (g1, g2) = self.project_attention_aux(
+            normed,
+            projected,
+            [beta, fa, ga],
+            tokens,
+            capture_verify_intermediates,
+            verify_proj,
+            canonical,
+            upstream,
+            &mut profile_timer,
+            ctx,
+            stream,
+        )?;
         det.tap("x_g", g1, (0, tokens), 2 * p * bf16);
+        self.capture_upstream(
+            upstream,
+            "recurrent_inputs",
+            &[
+                ("g1", Bf16, g1, &[tokens, p]),
+                ("g2", Bf16, g2, &[tokens, p]),
+            ],
+            ctx,
+            stream,
+        )?;
 
         let core_out = recurrent(projected, g1, beta)?;
+        self.capture_upstream(
+            upstream,
+            "recurrent_output",
+            &[("core", Bf16, core_out, &[tokens, self.heads, self.dim])],
+            ctx,
+            stream,
+        )?;
         profile::step(ctx, stream, &mut profile_timer, "pack_conv")?;
         profile::step(ctx, stream, &mut profile_timer, "recurrent")?;
         let gated = projected;
@@ -371,6 +185,13 @@ impl Glm5KdaLayer {
             self.heads as u32,
             self.dim as u32,
             ctx.config.rms_norm_eps as f32,
+            stream,
+        )?;
+        self.capture_upstream(
+            upstream,
+            "gated_norm",
+            &[("gated", Bf16, gated, &[tokens, p])],
+            ctx,
             stream,
         )?;
         profile::step(ctx, stream, &mut profile_timer, "gated_norm")?;
@@ -399,9 +220,17 @@ impl Glm5KdaLayer {
                 stream,
             )?;
         }
+        self.capture_upstream(
+            upstream,
+            "attention_local_output",
+            &[("output", Bf16, normed, &[tokens, self.hidden_size])],
+            ctx,
+            stream,
+        )?;
         profile::step(ctx, stream, &mut profile_timer, "o_proj")?;
         det.tap("attn", normed, (0, tokens), row);
-        let fused_tp_hc = capture_verify_intermediates
+        let fused_tp_hc = self.native_mhc.is_none()
+            && capture_verify_intermediates
             && !canonical
             && tokens == 5
             && !ctx.graph_capture
@@ -428,6 +257,13 @@ impl Glm5KdaLayer {
         {
             comm.all_reduce_async(normed.0, tokens * self.hidden_size * 2, stream)?;
         }
+        self.capture_upstream(
+            upstream,
+            "attention_reduced_output",
+            &[("output", Bf16, normed, &[tokens, self.hidden_size])],
+            ctx,
+            stream,
+        )?;
         profile::step(ctx, stream, &mut profile_timer, "tp_reduce")?;
         if !fused_tp_hc {
             det.tap("attn_red", local(normed), det_rows, row);
@@ -449,41 +285,64 @@ impl Glm5KdaLayer {
                 stream,
             )?;
         } else {
-            seam = crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
-                &self.hc.ffn,
-                Some(local(normed)),
-                hidden,
-                m_hc,
-                self.hc.hc_mult as u32,
-                self.hc.sinkhorn_iters as u32,
-                self.hc.hc_eps,
-                ctx,
-                stream,
-            )?;
+            seam = self.native_mhc.is_none()
+                && crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
+                    &self.hc.ffn,
+                    Some(local(normed)),
+                    hidden,
+                    m_hc,
+                    self.hc.hc_mult as u32,
+                    self.hc.sinkhorn_iters as u32,
+                    self.hc.hc_eps,
+                    ctx,
+                    stream,
+                )?;
             if !seam {
                 self.hc_post(local(normed), m_hc, ctx, stream)?;
             }
         }
-        profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
-
-        if !seam {
-            self.hc_pre(&self.hc.ffn, hidden, m_hc, ctx, stream)?;
-        }
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            hidden,
-            &self.post_attn_norm,
-            local(normed),
-            m_hc,
-            h,
-            ctx.config.rms_norm_eps as f32,
+        self.capture_upstream(
+            upstream,
+            "post_attention_highway",
+            &[(
+                "highway",
+                Bf16,
+                ctx.buffers.hc_streams(),
+                &[m_hc as usize, self.hc.hc_mult, self.hidden_size],
+            )],
+            ctx,
             stream,
         )?;
+        profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
+
+        if !self.exl3_hc_norm(
+            &self.hc.ffn,
+            self.post_attn_norm.weight,
+            local(normed),
+            m_hc,
+            ctx,
+            stream,
+        )? {
+            if !seam {
+                self.hc_pre(&self.hc.ffn, hidden, m_hc, ctx, stream)?;
+            }
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                hidden,
+                &self.post_attn_norm,
+                local(normed),
+                m_hc,
+                h,
+                ctx.config.rms_norm_eps as f32,
+                stream,
+            )?;
+        }
         // The routed MoE needs every row; a dense FFN runs only the local ones.
         if let Some(sp) = sp.filter(|_| matches!(self.ffn, crate::layers::FfnComponent::Moe(_))) {
             sp.all_gather(normed, self.hidden_size, ctx, stream)?;
         }
+        self.capture_upstream_hc(upstream, "ffn_mhc_norm", normed, tokens, ctx, stream)?;
         profile::step(ctx, stream, &mut profile_timer, "hc_ffn_norm")?;
         Ok(FfnPhase {
             hidden,

@@ -71,6 +71,9 @@ pub fn build_model(
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn Model>> {
+    if store.exl3_checkpoint().is_some() {
+        super::preflight_glm53_tp2_packed(&config, gpu.as_ref(), max_batch_tokens)?;
+    }
     super::glm_sparse_decode::initialize(
         gpu.as_ref(),
         super::glm_sparse_decode::BuildPolicy {
@@ -144,16 +147,22 @@ pub fn build_model(
     // (`detect_nvfp4_variant` / `WeightFormat::detect` would guess BF16).
     // `ensure_not_exl3` accepts qwen4_exp and refuses the other model types;
     // the materialization below is what makes an accepted EXL3 checkpoint
-    // readable by them.
-    crate::quant_format::ensure_not_exl3(&config, "build_model")?;
+    // readable by them. A store with a native EXL3 checkpoint attached
+    // (GLM-5.3, TP=2) never takes those loaders: its layers and vocab head
+    // load natively below, so neither the guard nor the materialization applies.
+    let native_exl3 = store.exl3_checkpoint().is_some();
+    if !native_exl3 {
+        crate::quant_format::ensure_not_exl3(&config, "build_model")?;
+    }
 
     // EXL3: dense linears become BF16 `.weight` tensors here; routed and shared
     // experts stay packed and are requantized one by one in `quantized_any`.
     let mut store = store;
-    if config
-        .quantization_config
-        .as_ref()
-        .is_some_and(|qc| qc.is_exl3())
+    if !native_exl3
+        && config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|qc| qc.is_exl3())
     {
         crate::weight_map::exl3::exl3_materialize_dense(&mut store, gpu.as_ref())?;
         config.attn_proj_bf16 = true;
@@ -240,7 +249,26 @@ pub fn build_model(
     // explain under a gigabyte. Without these three lines the only way to
     // find the rest is to guess.
     let free_before_layers = gpu.free_memory().unwrap_or(0);
-    let mut layers = loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
+    let mut native_moe_scratch = None;
+    let mut layers = if store.exl3_checkpoint().is_some() {
+        anyhow::ensure!(
+            !use_speculative && !self_speculative && dflash_args.is_none() && lora_args.is_none(),
+            "EXL3 validation requires speculative decoding and LoRA disabled"
+        );
+        let (layers, companions, scratch) = crate::weight_loader::glm5::exl3_layers::load_layers(
+            &store,
+            &config,
+            gpu.as_ref(),
+            &attn_layer_dtypes,
+            max_batch_tokens,
+            gpu.default_stream(),
+        )?;
+        native_moe_scratch = scratch;
+        store.adopt_exl3_companions(companions);
+        layers
+    } else {
+        loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?
+    };
     let free_after_layers = gpu.free_memory().unwrap_or(0);
     tracing::info!(
         "Layer construction: {:.2} GB consumed ({:.2} GB free -> {:.2} GB free) \
@@ -260,7 +288,24 @@ pub fn build_model(
     let ngram_embed =
         loader.load_ngram_embedding(&store, &config, gpu.as_ref(), max_batch_tokens)?;
     let final_norm = loader.load_final_norm(&store, &config, gpu.as_ref())?;
-    let lm_head = loader.load_lm_head(&store, &config, gpu.as_ref())?;
+    let native_head = if let Some(checkpoint) = store.exl3_checkpoint() {
+        Some(crate::model::glm_exl3_head::Glm5Exl3VocabHead::load(
+            checkpoint,
+            &config,
+            gpu.as_ref(),
+            max_batch_tokens,
+            gpu.default_stream(),
+        )?)
+    } else {
+        None
+    };
+    let lm_head = if native_head.is_some() {
+        crate::weight_map::DenseWeight {
+            weight: spark_runtime::gpu::DevicePtr::NULL,
+        }
+    } else {
+        loader.load_lm_head(&store, &config, gpu.as_ref())?
+    };
     let mtp_weights = loader.load_mtp_weights_multi(&store, &config, gpu.as_ref())?;
 
     // DeepSeek-V4 ships an architecturally distinct MTP module (MLA + mHC), not
@@ -343,7 +388,15 @@ pub fn build_model(
              or use a checkpoint that ships an MTP head (e.g. `mtp.safetensors`)."
         );
     }
-    let vision_encoder = loader.load_vision_encoder(&store, &config, gpu.as_ref())?;
+    let vision_encoder = if store.exl3_checkpoint().is_some() {
+        anyhow::ensure!(
+            config.vision.is_none(),
+            "EXL3 validation target requires text-only execution"
+        );
+        None
+    } else {
+        loader.load_vision_encoder(&store, &config, gpu.as_ref())?
+    };
 
     // If the checkpoint's `quantization_config.ignore_modules` lists MTP
     // (e.g. Sehyo/Qwen3.5-35B-A3B-NVFP4 ignores `mtp.*`), the MTP weights
@@ -395,14 +448,18 @@ pub fn build_model(
     // ── Step 3: LM-head quantization (NVFP4 / FP8 / BF16-skip) + the
     // draft-only NVFP4 head for MTP — extracted to lm_head_setup.rs
     // (file-size cap; pure code move).
-    let (lm_head_nvfp4, lm_head_fp8, mtp_lm_head_nvfp4) = super::lm_head_setup::setup_lm_heads(
-        &store,
-        &lm_head,
-        &config,
-        gpu.as_ref(),
-        use_speculative,
-        !mtp_weights.is_empty(),
-    )?;
+    let (lm_head_nvfp4, lm_head_fp8, mtp_lm_head_nvfp4) = if native_head.is_some() {
+        (None, None, None)
+    } else {
+        super::lm_head_setup::setup_lm_heads(
+            &store,
+            &lm_head,
+            &config,
+            gpu.as_ref(),
+            use_speculative,
+            !mtp_weights.is_empty(),
+        )?
+    };
 
     // Capture the shared embed + resolved draft NVFP4 head for the DeepSeek-V4
     // MTP proposer BEFORE `embed` / `lm_head_nvfp4` / `mtp_lm_head_nvfp4` are
@@ -891,6 +948,10 @@ pub fn build_model(
         ssm_pools,
     )?;
 
+    if let Some(scratch) = native_moe_scratch {
+        model.attach_exl3_moe_scratch(scratch)?;
+    }
+
     // ── Step 6b: DeepSeek-V4 MTP proposer (optional, post-construction) ──
     //
     // Built here (not inside `new()`, which only knows the Qwen-shaped
@@ -1083,6 +1144,9 @@ pub fn build_model(
     // so `teardown` can free the weights. Dropping it here — which is what used
     // to happen — orphaned the memory: live, referenced by the layers, with
     // nothing owning the ability to release it.
+    if let Some(head) = native_head {
+        model.attach_exl3_vocab_head(head)?;
+    }
     model.adopt_weight_store(store);
     Ok(Box::new(model))
 }

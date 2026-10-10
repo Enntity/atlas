@@ -90,6 +90,14 @@ pub(crate) fn resolve_model_dir(args: &cli::ServeArgs) -> Result<std::path::Path
 }
 
 pub(crate) fn cap_vocab_size_to_tokenizer(model_dir: &Path, config: &mut ModelConfig) {
+    // EXL3 shards and native head capture use the checkpoint's declared width,
+    // including output rows beyond the tokenizer vocabulary.
+    // Native GLM-5.3 only: qwen4_exp EXL3 keeps the tokenizer cap.
+    if config.model_type == "glm5_next"
+        && crate::main_modules::serve::canonicalize_model_quant(config) == "exl3"
+    {
+        return;
+    }
     let tok_path = model_dir.join("tokenizer.json");
     if tok_path.exists()
         && let Ok(tok) = tokenizers::Tokenizer::from_file(&tok_path)
@@ -212,8 +220,55 @@ pub(crate) fn apply_model_default_dflash_gamma(
 mod tests {
     use clap::Parser;
 
-    use super::{NumDraftsSource, apply_model_default_dflash_gamma, resolve_num_drafts};
+    use super::{
+        NumDraftsSource, apply_model_default_dflash_gamma, cap_vocab_size_to_tokenizer,
+        resolve_num_drafts,
+    };
     use crate::cli::{self, ServeArgs};
+
+    fn tokenizer_fixture() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab((0..154856u32).map(|i| (format!("token_{i}"), i)).collect())
+            .unk_token("token_0".into())
+            .build()
+            .unwrap();
+        tokenizers::Tokenizer::new(model)
+            .save(directory.path().join("tokenizer.json"), false)
+            .unwrap();
+        directory
+    }
+
+    #[test]
+    fn vocab_cap_preserves_exl3_checkpoint_width_beyond_tokenizer_vocabulary() {
+        let directory = tokenizer_fixture();
+        let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "glm5_next".into();
+        config.vocab_size = 154880;
+        config.quantization_config = atlas_core::config::parse_quantization_config(
+            &serde_json::json!({"quantization_config":{"quant_method":"exl3","quant_algo":"NVFP4"}}),
+        );
+        cap_vocab_size_to_tokenizer(directory.path(), &mut config);
+        assert_eq!(config.vocab_size, 154880);
+    }
+
+    #[test]
+    fn vocab_cap_preserves_legacy_tokenizer_cap_for_quantized_and_unquantized_models() {
+        let directory = tokenizer_fixture();
+        for quantized in [false, true] {
+            let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
+            config.vocab_size = 154880;
+            config.quantization_config = if quantized {
+                atlas_core::config::parse_quantization_config(
+                    &serde_json::json!({"quantization_config":{"quant_method":"modelopt","quant_algo":"NVFP4"}}),
+                )
+            } else {
+                None
+            };
+            cap_vocab_size_to_tokenizer(directory.path(), &mut config);
+            assert_eq!(config.vocab_size, 154856);
+        }
+    }
 
     /// The observed dgx2 bug: `--num-drafts 1` on a model with
     /// `default_num_drafts = 3` must serve 1 (K=2), not 3 (K=4).

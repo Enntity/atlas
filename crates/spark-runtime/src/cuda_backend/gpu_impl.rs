@@ -52,6 +52,19 @@ use pdl::pdl_kernel;
 pub use pdl::{configure_pdl, pdl_enabled};
 
 impl GpuBackend for AtlasCudaBackend {
+    fn require_bf16_gemm(&self) -> Result<()> {
+        Ok(())
+    }
+    fn quiesce_bf16_resources(&self) -> Result<()> {
+        self.quiesce_classic_blas()
+    }
+    fn require_bf16_gemm_numerics(&self, numerics: crate::gpu::Bf16GemmNumerics) -> Result<()> {
+        self.require_bf16_numerics(numerics)
+    }
+    fn bf16_gemm_act_weight_t(&self, request: crate::gpu::Bf16Gemm) -> Result<()> {
+        self.dispatch_bf16(request)
+    }
+
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
         let mut dptr: u64 = 0;
         let status = unsafe { cuMemAlloc_v2(&mut dptr, bytes) };

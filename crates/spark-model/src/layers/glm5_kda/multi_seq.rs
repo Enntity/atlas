@@ -31,6 +31,7 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.validate_exl3_forward(num_seqs, ctx, stream)?;
         let independent = crate::model::glm_independent::selected(ctx, num_seqs)?;
         ensure!(
             independent
@@ -166,38 +167,42 @@ impl Glm5KdaLayer {
         )?;
 
         let beta = projected.offset(3 * plane_bytes);
-        self.project_dense_multi_decode(
-            normed,
-            &self.weights.b_proj,
-            beta,
-            m,
-            self.heads as u32,
-            h_u32,
-            ctx,
-            stream,
-        )?;
         let fa = beta.offset(n * self.heads * bf16);
-        self.project_dense_multi_decode(
-            normed,
-            &self.weights.f_a_proj,
-            fa,
-            m,
-            self.dim as u32,
-            h_u32,
-            ctx,
-            stream,
-        )?;
         let ga = fa.offset(n * self.dim * bf16);
-        self.project_dense_multi_decode(
-            normed,
-            &self.weights.g_a_proj,
-            ga,
-            m,
-            self.dim as u32,
-            h_u32,
-            ctx,
-            stream,
-        )?;
+        if let Some(aux) = &self.native_aux {
+            aux.forward(ctx.gpu, normed, [beta, fa, ga], n, stream)?;
+        } else {
+            self.project_dense_multi_decode(
+                normed,
+                &self.weights.b_proj,
+                beta,
+                m,
+                self.heads as u32,
+                h_u32,
+                ctx,
+                stream,
+            )?;
+            self.project_dense_multi_decode(
+                normed,
+                &self.weights.f_a_proj,
+                fa,
+                m,
+                self.dim as u32,
+                h_u32,
+                ctx,
+                stream,
+            )?;
+            self.project_dense_multi_decode(
+                normed,
+                &self.weights.g_a_proj,
+                ga,
+                m,
+                self.dim as u32,
+                h_u32,
+                ctx,
+                stream,
+            )?;
+        }
 
         let g1 = ctx.buffers.ssm_deinterleaved();
         self.project_dense_multi_decode(

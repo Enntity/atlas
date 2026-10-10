@@ -94,6 +94,13 @@ pub fn padded_batch_n(n: usize) -> usize {
 }
 
 pub trait Model: Send + Sync {
+    /// Keep issued prefill chunks within the configured budget. Decode-row
+    /// allocation headroom must not expand a model's selected quantized
+    /// prefill geometry. Ordinary models retain idle arena expansion.
+    fn requires_configured_prefill_chunk_budget(&self) -> bool {
+        false
+    }
+
     /// Release the device memory this model owns, in reverse construction
     /// order.
     ///

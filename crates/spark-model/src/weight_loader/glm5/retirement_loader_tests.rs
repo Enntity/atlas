@@ -90,7 +90,7 @@ fn actual_kda_free_sites_track_exact_sources_with_unchanged_legacy_events() {
                 tracked.then_some(&log),
             )
             .unwrap();
-            assert!(!weights.q_proj.nvfp4.weight.is_null());
+            assert!(!weights.q_proj.as_nvfp4().unwrap().0.weight.is_null());
             traces.push(gpu.frees.lock().iter().map(|p| p.0).collect::<Vec<_>>());
             if tracked {
                 log.finish().rebuild(&mut store, &gpu).unwrap();

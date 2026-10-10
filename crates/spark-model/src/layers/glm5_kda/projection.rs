@@ -4,9 +4,10 @@ use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
 use super::Glm5KdaLayer;
+use super::Glm5Projection;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
-use crate::weight_map::{DenseWeight, QuantizedWeight};
+use crate::weight_map::DenseWeight;
 #[path = "projection_fp8.rs"]
 mod fp8;
 
@@ -27,16 +28,6 @@ fn verify_row_chunks(m: u32) -> impl Iterator<Item = (u32, u32)> {
         let start = c * m / chunks;
         (start, (c + 1) * m / chunks - start)
     })
-}
-
-/// Memory-tight GLM KDA projection.
-///
-/// The checkpoint-native BF16 matrix is quantized once at load time and then
-/// released. Decode uses W4A16 GEMV; prefill uses W4A16 GEMM.
-pub struct Glm5Projection {
-    pub nvfp4: QuantizedWeight,
-    /// Optional `[K/2, N]` twin for Atlas' tensor-core prefill GEMMs.
-    pub prefill_nvfp4_t: Option<QuantizedWeight>,
 }
 
 pub struct Glm5KdaWeights {
@@ -116,12 +107,15 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.project_exl3(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(());
+        }
         if crate::layers::canonical_verify::enabled() {
             // One tensor-core family for every row count (1..=32).
             return crate::layers::canonical_verify::w4a16(
                 ctx.gpu,
                 input,
-                &weight.nvfp4,
+                weight.as_nvfp4()?.0,
                 output,
                 m,
                 n,
@@ -136,19 +130,10 @@ impl Glm5KdaLayer {
             && tc.0 != 0
         {
             // One tensor-core pass reads the weight once for all owner rows.
-            ops::w4a16_verify_touch(ctx.gpu, tc, input, &weight.nvfp4, output, m, n, k, stream)
+            let nvfp4 = weight.as_nvfp4()?.0;
+            ops::w4a16_verify_touch(ctx.gpu, tc, input, nvfp4, output, m, n, k, stream)
                 .unwrap_or_else(|| {
-                    ops::w4a16_gemv_batchm(
-                        ctx.gpu,
-                        tc,
-                        input,
-                        &weight.nvfp4,
-                        output,
-                        m,
-                        n,
-                        k,
-                        stream,
-                    )
+                    ops::w4a16_gemv_batchm(ctx.gpu, tc, input, nvfp4, output, m, n, k, stream)
                 })
         } else if m > 8 {
             // Owner-batched verify: the batch-M GEMV tiers stream the weight
@@ -232,9 +217,12 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.project_exl3(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(());
+        }
+        let (nvfp4, _) = weight.as_nvfp4()?;
         // ATLAS_GLM_DECODE_GEMV_BATCH: the same bodies behind a weight touch.
         let tier = self.w4a16_gemv_batchm.kernel(m);
-        let nvfp4 = &weight.nvfp4;
         if let Some(done) =
             ops::w4a16_verify_touch(ctx.gpu, tier, input, nvfp4, output, m, n, k, stream)
         {
@@ -245,7 +233,7 @@ impl Glm5KdaLayer {
                 ctx.gpu,
                 self.w4a16_gemv_batch2_k,
                 input,
-                &weight.nvfp4,
+                nvfp4,
                 output,
                 n,
                 k,
@@ -255,7 +243,7 @@ impl Glm5KdaLayer {
                 ctx.gpu,
                 self.w4a16_gemv_batch3_k,
                 input,
-                &weight.nvfp4,
+                nvfp4,
                 output,
                 n,
                 k,
@@ -267,17 +255,7 @@ impl Glm5KdaLayer {
                     kernel.0 != 0,
                     "GLM KDA M={m} decode requires a matching w4a16 batch-M tier"
                 );
-                ops::w4a16_gemv_batchm(
-                    ctx.gpu,
-                    kernel,
-                    input,
-                    &weight.nvfp4,
-                    output,
-                    m,
-                    n,
-                    k,
-                    stream,
-                )
+                ops::w4a16_gemv_batchm(ctx.gpu, kernel, input, nvfp4, output, m, n, k, stream)
             }
             _ => anyhow::bail!("GLM KDA multi-decode projection requires M=2..=8, got {m}"),
         }
@@ -341,6 +319,10 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        if self.project_exl3(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(false);
+        }
+        let (nvfp4, prefill_nvfp4_t) = weight.as_nvfp4()?;
         if !decode
             && m >= 2048
             && fp8::try_project(
@@ -363,14 +345,14 @@ impl Glm5KdaLayer {
         {
             return Ok(true);
         }
-        let () = match ProjectionPath::for_forward(decode, weight.prefill_nvfp4_t.is_some(), m) {
+        let () = match ProjectionPath::for_forward(decode, prefill_nvfp4_t.is_some(), m) {
             ProjectionPath::DecodeGemv => ops::w4a16_decode_gemv(
                 ctx.gpu,
                 self.w4a16_gemv_k,
                 self.w4a16_gemv_sw_k,
                 ctx.levers.gemv_sw,
                 input,
-                &weight.nvfp4,
+                nvfp4,
                 output,
                 n,
                 k,
@@ -380,7 +362,7 @@ impl Glm5KdaLayer {
                 ctx.gpu,
                 self.w4a16_gemm_t_m128_k,
                 input,
-                weight.prefill_nvfp4_t.as_ref().unwrap(),
+                prefill_nvfp4_t.unwrap(),
                 output,
                 m,
                 n,
@@ -391,7 +373,7 @@ impl Glm5KdaLayer {
                 ctx.gpu,
                 self.w4a16_gemm_k,
                 input,
-                &weight.nvfp4,
+                nvfp4,
                 output,
                 m,
                 n,

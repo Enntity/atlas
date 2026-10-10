@@ -18,7 +18,10 @@
 
 pub use atlas_core::target::KernelTarget;
 pub mod resolve;
-pub use resolve::{ResolveCandidate, TargetResolveError, ptx_for_config, ptx_for_exact_target};
+pub use resolve::{
+    ResolveCandidate, TargetResolveError, ptx_for_config, ptx_for_config_quant,
+    ptx_for_exact_target,
+};
 
 // Build-time/run-time shared `[behavior]` defaults — also `include!`d by
 // `build_parse_behavior.rs` so the build script's parse defaults cannot

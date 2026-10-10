@@ -275,6 +275,7 @@ pub(super) fn start_new_requests(
                 max_batch_tokens,
                 active.is_empty() && prefilling.is_empty(),
                 glm_c4_sparse,
+                model.requires_configured_prefill_chunk_budget(),
             );
             match start_chunked_prefill(
                 sched,

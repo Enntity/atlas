@@ -494,21 +494,23 @@ impl Qwen3AttentionLayer {
         }
 
         // ── Attention sublayer ──
-        ops::hc_pre_site(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            &hc.attn,
-            hc,
-            hidden,
-            post,
-            comb,
-            ctx.buffers.hc_lowrank_scratch(),
-            1,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if !self.has_exl3_mla() {
+            ops::hc_pre_site(
+                ctx.gpu,
+                self.hc_pre_k,
+                hc_streams,
+                &hc.attn,
+                hc,
+                hidden,
+                post,
+                comb,
+                ctx.buffers.hc_lowrank_scratch(),
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -534,7 +536,9 @@ impl Qwen3AttentionLayer {
         }
 
         let normed = ctx.buffers.norm_output();
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
+        if self.exl3_hc_norm(&hc.attn, self.input_norm.weight, normed, 1, ctx, stream)? {
+            // The native kernel already emitted the normalized BF16 input.
+        } else if ops::HcVariant::of(hc).applies_block_input_norm() {
             ops::rms_norm(
                 ctx.gpu,
                 self.rms_norm_w_k,
@@ -609,7 +613,7 @@ impl Qwen3AttentionLayer {
 
         // Standalone attention (no FFN)
         if self.ffn.is_none() {
-            ops::hc_post_site(
+            self.hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
                 hc,
@@ -637,7 +641,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else if is_last_layer && ctx.config.model_type == "glm5_next" {
-                ops::hc_contract(
+                self.hc_contract(
                     ctx.gpu,
                     self.hc_contract_k,
                     hc_streams,
@@ -653,9 +657,10 @@ impl Qwen3AttentionLayer {
 
         // Expand attention output back into multi-stream state. Without the
         // diagnostics between them, the post runs with the FFN site's pre
-        // (`hc_post_pre_site`, fused under ATLAS_QWEN4EXP_DECODE_FUSE).
-        if diag_this {
-            ops::hc_post_site(
+        // (`hc_post_pre_site`, fused under ATLAS_QWEN4EXP_DECODE_FUSE); the
+        // native EXL3 post runs alone (its pre is fused into `exl3_hc_norm`).
+        if diag_this || self.has_exl3_mla() {
+            self.hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
                 hc,
@@ -668,6 +673,8 @@ impl Qwen3AttentionLayer {
                 h as u32,
                 stream,
             )?;
+        }
+        if diag_this {
             super::diag_norm_f32(
                 ctx.gpu,
                 hc_streams,
@@ -688,7 +695,9 @@ impl Qwen3AttentionLayer {
         }
 
         // ── FFN sublayer ──
-        if diag_this {
+        if self.has_exl3_mla() {
+            // The native EXL3 pre runs fused with the FFN input norm below.
+        } else if diag_this {
             ops::hc_pre_site(
                 ctx.gpu,
                 self.hc_pre_k,
@@ -748,7 +757,9 @@ impl Qwen3AttentionLayer {
         }
 
         let normed2 = ctx.buffers.norm_output();
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
+        if self.exl3_hc_norm(&hc.ffn, self.post_attn_norm.weight, normed2, 1, ctx, stream)? {
+            // The native kernel already emitted the normalized BF16 input.
+        } else if ops::HcVariant::of(hc).applies_block_input_norm() {
             ops::rms_norm(
                 ctx.gpu,
                 self.rms_norm_w_k,
@@ -797,7 +808,7 @@ impl Qwen3AttentionLayer {
         }
 
         if !posted {
-            ops::hc_post_site(
+            self.hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
                 hc,
@@ -852,7 +863,7 @@ impl Qwen3AttentionLayer {
                 );
             }
         } else if is_last_layer && ctx.config.model_type == "glm5_next" {
-            ops::hc_contract(
+            self.hc_contract(
                 ctx.gpu,
                 self.hc_contract_k,
                 hc_streams,

@@ -60,7 +60,7 @@ fn inspect(layer: &mut dyn TransformerLayer) -> Result<(TargetInfo, &mut FfnComp
     };
     let moe = match ffn {
         FfnComponent::Moe(_) => true,
-        FfnComponent::Dense(_) => false,
+        FfnComponent::Dense(_) | FfnComponent::Exl3(_) => false,
         FfnComponent::None => anyhow::bail!("deferred shared FP8 missing FFN at {ordinal}"),
     };
     Ok((TargetInfo { ordinal, kind, moe }, ffn))

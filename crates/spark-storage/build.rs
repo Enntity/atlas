@@ -33,12 +33,11 @@ fn main() {
     // below trips `unexpected_cfgs` (a hard error under `warnings = "deny"`).
     println!("cargo:rustc-check-cfg=cfg(atlas_rdma_verbs)");
 
-    // Apple Silicon hosts have no libcuda and no nvcc. Emit the stub and
-    // skip the linker hint so `cargo check` works under
-    // `--no-default-features --features metal`. Production CUDA builds
-    // still link libcuda below.
+    // Builds without the CUDA feature have no driver FFI modules. Emit the
+    // registry stub and skip CUDA linking/compilation on every host, including
+    // Linux CPU checks. Apple Silicon also has no libcuda or nvcc.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "macos" {
+    if target_os == "macos" || std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
         emit_stub();
         println!("cargo:rerun-if-changed=build.rs");
         return;

@@ -5,7 +5,9 @@
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{GpuBackend, KernelHandle};
 
-use super::{Glm5KdaLayer, Glm5KdaWeights, indexed_core, recurrent};
+use super::{
+    Glm5KdaLayer, Glm5KdaWeights, Glm5Projection, indexed_core, native_aux, recurrent, upstream,
+};
 use crate::layers::FfnComponent;
 use crate::layers::qwen3_attention::HcWeights;
 use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
@@ -66,12 +68,33 @@ impl Glm5KdaLayer {
             |func| super::super::try_kernel_gated(triple_fits, gpu, "dense_gemv_bf16_batchm", func);
         // ATLAS_GLM_DECODE_GEMV_BATCH: the GEMV touch twins live in this target only.
         super::super::ops::gemv_touch_resolve(gpu);
-        let layer = Self {
+        let native_mhc = if weights.q_proj.is_exl3() {
+            Some(crate::layers::glm5_exl3_mhc::NativeExl3Mhc::load(
+                gpu,
+                config.hidden_size,
+                hc.hc_mult,
+                hc.sinkhorn_iters,
+                config.rms_norm_eps as f32,
+                hc.hc_eps,
+                crate::layers::glm5_exl3_mhc::MhcNumericalPolicy::GLM53_TP2_REFERENCE,
+                config.hc_post_multiplier,
+            )?)
+        } else {
+            None
+        };
+        let mut layer = Self {
             input_norm,
             post_attn_norm,
             weights,
             ffn,
             hc,
+            upstream_trace: if native_mhc.is_some() {
+                upstream::UpstreamTrace::from_env(config, layer_idx)?
+            } else {
+                None
+            },
+            native_mhc,
+            native_aux: None,
             layer_idx,
             ssm_ordinal: indexed_core::ordinal(config, layer_idx)?,
             indexed_trace_logged: std::sync::atomic::AtomicBool::new(false),
@@ -208,6 +231,35 @@ impl Glm5KdaLayer {
                 "independent KDA requires both indexed kernels"
             );
         }
+        layer.native_aux = layer.load_native_aux(gpu)?;
         Ok(layer)
+    }
+
+    /// EXL3 only: the loader leaves B/FA/GA as contiguous interior views of
+    /// one merged companion; confirm that before borrowing its base.
+    fn load_native_aux(&self, gpu: &dyn GpuBackend) -> Result<Option<native_aux::NativeKdaAux>> {
+        let Glm5Projection::Exl3(q) = &self.weights.q_proj else {
+            return Ok(None);
+        };
+        let row = self.hidden_size * 2;
+        let (b, fa, ga) = (
+            self.weights.b_proj.weight,
+            self.weights.f_a_proj.weight,
+            self.weights.g_a_proj.weight,
+        );
+        ensure!(
+            !b.is_null() && fa == b.offset(self.heads * row) && ga == fa.offset(self.dim * row),
+            "EXL3 KDA auxiliary weights must be one contiguous merged B/FA/GA base"
+        );
+        native_aux::NativeKdaAux::new(
+            gpu,
+            b,
+            self.hidden_size,
+            self.heads,
+            self.dim,
+            q.capacity(),
+            q.stream(),
+        )
+        .map(Some)
     }
 }

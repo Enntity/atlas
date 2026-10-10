@@ -178,6 +178,7 @@ impl Qwen3AttentionLayer {
             o_weight: None,
             o_dense_bf16: None,
             mla: None,
+            exl3_mla: None,
             mla_mx: Vec::new(),
             mla_q4: Vec::new(),
             // ── DeepSeek-V4 Manifold-Constrained Hyper-Connections (mHC) ──

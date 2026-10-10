@@ -313,7 +313,22 @@ pub fn ptx_for_config(
     model_refs: &[&str],
     pinned_target: Option<&str>,
 ) -> Result<Option<TargetPtxSet>, TargetResolveError> {
-    let targets = crate::all_ptx_sets();
+    ptx_for_config_quant(model_type, hidden_size, model_refs, pinned_target, "")
+}
+
+/// Select the native EXL3 boundary before architecture disambiguation.
+/// Legacy quant compatibility remains enforced by the serving gate.
+pub fn ptx_for_config_quant(
+    model_type: &str,
+    hidden_size: usize,
+    model_refs: &[&str],
+    pinned_target: Option<&str>,
+    checkpoint_quant: &str,
+) -> Result<Option<TargetPtxSet>, TargetResolveError> {
+    let targets: Vec<_> = crate::all_ptx_sets()
+        .into_iter()
+        .filter(|t| (t.target.quant == "exl3") == (checkpoint_quant == "exl3"))
+        .collect();
     let candidates: Vec<ResolveCandidate<'_>> = targets
         .iter()
         .map(|t| ResolveCandidate {

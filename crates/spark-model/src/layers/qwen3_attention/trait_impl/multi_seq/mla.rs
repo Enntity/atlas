@@ -64,6 +64,7 @@ impl Qwen3AttentionLayer {
         kv_cache: &mut PagedKvCache,
         meta: AttnMetadataDev,
     ) -> Result<DevicePtr> {
+        self.validate_exl3_mla_forward(c.n, c.fwd, c.stream)?;
         let mla = self
             .mla
             .as_ref()

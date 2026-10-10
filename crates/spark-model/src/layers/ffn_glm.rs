@@ -18,6 +18,7 @@ impl FfnComponent {
         stream: u64,
     ) -> Result<DevicePtr> {
         match self {
+            Self::Exl3(layer) => layer.forward_rows(input, 4, ctx, stream),
             Self::Moe(m) => m.forward_k4(input, ctx, stream),
             Self::Dense(d) if d.can_forward_km(4) => {
                 d.forward_km(input, 4, ctx, stream)?;
@@ -40,6 +41,7 @@ impl FfnComponent {
         stream: u64,
     ) -> Result<DevicePtr> {
         match self {
+            Self::Exl3(layer) => layer.forward_rows(input, 5, ctx, stream),
             Self::Moe(m) => m.forward_k5(input, ctx, stream),
             Self::Dense(d) if d.can_forward_km(5) => {
                 d.forward_km(input, 5, ctx, stream)?;
@@ -103,6 +105,10 @@ impl FfnComponent {
     ) -> Result<DevicePtr> {
         let h = ctx.config.hidden_size;
         match self {
+            Self::Exl3(layer) => {
+                layer.forward_rows(normed, sp.total(), ctx, stream)?;
+                Ok(sp.local(ctx.buffers.moe_output(), h))
+            }
             Self::Moe(m) => {
                 m.forward_prefill(normed, sp.total(), ctx, stream)?;
                 Ok(sp.local(ctx.buffers.moe_output(), h))

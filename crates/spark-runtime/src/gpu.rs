@@ -80,6 +80,8 @@ pub enum KernelArg<'a> {
 }
 
 pub use crate::gpu_args::pack_kernel_args;
+mod gemm;
+pub use gemm::{Bf16Gemm, Bf16GemmNumerics};
 
 pub use crate::gpu_pitched::{
     HOST_PINNED_ALIGN, HostPitched, Pitched, copy_d2h_pitched_async,
@@ -90,6 +92,27 @@ pub use crate::gpu_pitched::{
 ///
 /// Implementations: `AtlasCudaBackend` (production), `MockGpuBackend` (tests).
 pub trait GpuBackend: Send + Sync {
+    /// Fail before allocation when the backend cannot execute native BF16 GEMM.
+    fn require_bf16_gemm(&self) -> Result<()> {
+        anyhow::bail!("GPU backend does not support native BF16 GEMM")
+    }
+    /// Complete backend-owned BF16 work before model operands or resources are released.
+    fn quiesce_bf16_resources(&self) -> Result<()> {
+        Ok(())
+    }
+    fn require_bf16_gemm_numerics(&self, numerics: Bf16GemmNumerics) -> Result<()> {
+        match numerics {
+            Bf16GemmNumerics::CublasLt => self.require_bf16_gemm(),
+            Bf16GemmNumerics::Glm53Classic | Bf16GemmNumerics::Glm53AuxiliaryClassic => {
+                anyhow::bail!("GPU backend does not support explicit shared classic BF16 GEMM")
+            }
+        }
+    }
+    fn bf16_gemm_act_weight_t(&self, request: Bf16Gemm) -> Result<()> {
+        request.validate()?;
+        anyhow::bail!("GPU backend does not support native BF16 GEMM")
+    }
+
     /// Allocate `bytes` of device memory.
     fn alloc(&self, bytes: usize) -> Result<DevicePtr>;
 

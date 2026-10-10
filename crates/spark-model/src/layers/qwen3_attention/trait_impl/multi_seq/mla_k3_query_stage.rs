@@ -11,6 +11,9 @@ impl Qwen3AttentionLayer {
         mla: &MlaWeights,
         long_verify: bool,
     ) -> Result<Option<QueryPlan>> {
+        if self.has_exl3_mla() {
+            return Ok(None);
+        }
         let batchm = enabled(&c.fwd.config.model_type)?;
         let compare = compare_enabled(&c.fwd.config.model_type, batchm)?;
         if !batchm || !long_verify {

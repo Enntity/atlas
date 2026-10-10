@@ -917,6 +917,10 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0)]
     pub vision_max_pixels: usize,
 
+    /// Serve only the language model, excluding a checkpoint vision tower.
+    #[arg(long, default_value_t = false)]
+    pub language_model_only: bool,
+
     /// Fetch `image_url` parts that carry an http(s) URL, instead of
     /// rejecting them.
     ///

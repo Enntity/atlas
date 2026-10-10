@@ -7,7 +7,7 @@
 //! C++ headers that do not exist on macOS. spark-model names these entry
 //! points unconditionally, so the metal build (`cargo check --features metal`,
 //! cuda off) needs the symbols to resolve even though FP4/FP8 inference never
-//! runs there. The bodies are `unreachable!` — reaching one on metal is a bug.
+//! runs there. Unsupported entry points fail explicitly; legacy stubs panic.
 
 use anyhow::Result;
 
@@ -30,6 +30,40 @@ pub fn rejected_before_launch(error: &anyhow::Error) -> bool {
 
 pub fn launch_failed(_error: &anyhow::Error) -> bool {
     false
+}
+
+/// Preserve the CUDA wrapper ABI while reporting the unavailable backend.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_tuned(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _lda: u32,
+    _ldc: u32,
+    _config: u32,
+    _stream: u64,
+) -> Result<()> {
+    anyhow::bail!("cutlass::bf16_gemm_tuned requires CUDA")
+}
+
+/// Preserve the head-batched GEMM contract on builds without CUDA.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_grouped_gemm_act_weight_t(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _g: u32,
+    _n: u32,
+    _k: u32,
+    _a_stride: u32,
+    _c_stride: u32,
+    _stream: u64,
+) -> Result<()> {
+    anyhow::bail!("cutlass::bf16_grouped_gemm_act_weight_t requires CUDA")
 }
 
 pub fn bf16_gemm_act_weight_t(
@@ -122,4 +156,19 @@ pub fn transpose_nvfp4_packed_kton(
     _stream: u64,
 ) -> Result<()> {
     unreachable!("cutlass::transpose_nvfp4_packed_kton is cuda-only (not built for metal)")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn missing_cuda_gemms_return_backend_errors_without_touching_pointers() {
+        let tuned = super::bf16_gemm_tuned(1, 2, 3, 4, 5, 6, 6, 5, 0, 0).unwrap_err();
+        assert_eq!(tuned.to_string(), "cutlass::bf16_gemm_tuned requires CUDA");
+        let grouped =
+            super::bf16_grouped_gemm_act_weight_t(1, 2, 3, 4, 5, 6, 7, 35, 30, 0).unwrap_err();
+        assert_eq!(
+            grouped.to_string(),
+            "cutlass::bf16_grouped_gemm_act_weight_t requires CUDA"
+        );
+    }
 }

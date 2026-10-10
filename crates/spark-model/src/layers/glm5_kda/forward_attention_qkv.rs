@@ -23,7 +23,8 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let fused_qkv = capture_verify_intermediates
+        let fused_qkv = !self.weights.q_proj.is_exl3()
+            && capture_verify_intermediates
             && m == 5
             && self.w4a16_gemv_batch5_qkv_k.0 != 0
             && verify_fused_qkv_enabled()
@@ -36,9 +37,9 @@ impl Glm5KdaLayer {
                 self.w4a16_gemv_batch5_qkv_k,
                 ops::gemv_touch(ops::Twin::W4Batch5Qkv),
                 normed,
-                &self.weights.q_proj.nvfp4,
-                &self.weights.k_proj.nvfp4,
-                &self.weights.v_proj.nvfp4,
+                self.weights.q_proj.as_nvfp4()?.0,
+                self.weights.k_proj.as_nvfp4()?.0,
+                self.weights.v_proj.as_nvfp4()?.0,
                 projected,
                 m,
                 p as u32,

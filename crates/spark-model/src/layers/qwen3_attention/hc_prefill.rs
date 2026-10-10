@@ -266,6 +266,9 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.has_exl3_mla() {
+            return Ok(());
+        }
         let streams = ctx.buffers.hc_streams();
         let h = ctx.config.hidden_size as u32;
         let hc_mult = hc.hc_mult as u32;

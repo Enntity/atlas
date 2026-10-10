@@ -96,6 +96,7 @@ pub fn glm_index_logits_dynamic(
     seq_len: DevicePtr,
     shape: GlmDynamicShape,
     index_block_stride_bytes: u64,
+    dense_threshold: u32,
     stream: u64,
 ) -> Result<()> {
     ensure!(!seq_len.is_null(), "GLM dynamic scorer needs device length");
@@ -115,7 +116,7 @@ pub fn glm_index_logits_dynamic(
         .arg_u32(4)
         .arg_u32(shape.block_size)
         .arg_u64(index_block_stride_bytes)
-        .arg_u32(GLM_DYNAMIC_TOPK)
+        .arg_u32(dense_threshold)
         .launch(stream)
 }
 
@@ -164,6 +165,7 @@ pub fn glm_sparse_mla_dynamic(
     num_heads: u32,
     shape: GlmDynamicShape,
     inv_sqrt_d: f32,
+    dense_threshold: u32,
     stream: u64,
 ) -> Result<()> {
     ensure!(
@@ -187,7 +189,7 @@ pub fn glm_sparse_mla_dynamic(
         .arg_u32(shape.block_size)
         .arg_f32(inv_sqrt_d)
         .arg_ptr(seq_len)
-        .arg_u32(GLM_DYNAMIC_TOPK)
+        .arg_u32(dense_threshold)
         .launch(stream)
 }
 

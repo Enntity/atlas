@@ -35,6 +35,7 @@ pub mod chat_phases;
 pub mod chat_stream;
 pub mod chat_stream_dispatch;
 pub mod compact;
+mod completion_text;
 pub mod completions;
 pub mod completions_exec;
 pub mod completions_logprobs;

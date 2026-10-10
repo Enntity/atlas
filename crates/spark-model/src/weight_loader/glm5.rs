@@ -4,6 +4,15 @@
 
 mod components;
 mod dense;
+pub mod exl3;
+pub mod exl3_ffn;
+pub mod exl3_index;
+pub mod exl3_index_exec;
+pub mod exl3_kda_loader;
+pub mod exl3_layers;
+pub mod exl3_mla;
+pub mod exl3_numerics;
+pub mod exl3_projection;
 mod expert_tp;
 mod layers;
 mod mla_twins;

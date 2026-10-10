@@ -258,7 +258,7 @@ impl Qwen3AttentionLayer {
                 &format!("V4-msdecode L{} comb-attn", self.attn_layer_idx),
             );
         }
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
+        if !self.has_exl3_mla() && ops::HcVariant::of(hc).applies_block_input_norm() {
             ops::rms_norm(
                 ctx.gpu,
                 self.rms_norm_w_k,
@@ -316,7 +316,7 @@ impl Qwen3AttentionLayer {
         }
 
         // Expand attention output back into multi-stream state.
-        ops::hc_post_site(
+        self.hc_post_site(
             ctx.gpu,
             self.hc_post_k,
             hc,
@@ -411,7 +411,7 @@ impl Qwen3AttentionLayer {
                 &format!("V4-msdecode L{} comb-ffn", self.attn_layer_idx),
             );
         }
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
+        if !self.has_exl3_mla() && ops::HcVariant::of(hc).applies_block_input_norm() {
             ops::rms_norm(
                 ctx.gpu,
                 self.rms_norm_w_k,

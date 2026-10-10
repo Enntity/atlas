@@ -26,11 +26,12 @@ pub(super) fn try_project(
     cast: bool,
     stream: u64,
 ) -> Result<bool> {
+    let (nvfp4, transposed) = weight.as_nvfp4()?;
     run(
         gpu,
         input,
-        &weight.nvfp4,
-        weight.prefill_nvfp4_t.is_some(),
+        nvfp4,
+        transposed.is_some(),
         output,
         m,
         n,

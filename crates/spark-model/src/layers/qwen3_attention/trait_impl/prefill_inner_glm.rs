@@ -84,6 +84,7 @@ impl Qwen3AttentionLayer {
         // GLM: this site's post fused with the FFN site's pre-mix.
         let seam = ctx.config.model_type == "glm5_next"
             && !diag_this
+            && !self.has_exl3_mla()
             && super::super::hc_post_pre_prefill_fused(
                 &hc.ffn,
                 Some(attn_out),
@@ -139,7 +140,7 @@ impl Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<()> {
         let h = ctx.config.hidden_size;
-        ops::hc_contract(
+        self.hc_contract(
             ctx.gpu,
             self.hc_contract_k,
             hc_streams,

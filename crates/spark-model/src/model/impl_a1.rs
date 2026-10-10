@@ -658,6 +658,8 @@ impl TransformerModel {
             final_norm,
             final_norm_identity,
             lm_head_weight,
+            exl3_vocab_head: None,
+            exl3_moe_scratch: None,
             lm_head_nvfp4,
             lm_head_nvfp4_t,
             lm_head_fp8,

@@ -1,4 +1,5 @@
 [model]
+match_names = ["nvfp4"]
 name = "glm-5.3-flash"
 hf_id = "nvidia/GLM-5.3-Flash-NVFP4"
 params = "320B"

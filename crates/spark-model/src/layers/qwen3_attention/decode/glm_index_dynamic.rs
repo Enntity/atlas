@@ -63,6 +63,7 @@ impl Qwen3AttentionLayer {
             num_heads,
             shape,
             inv_sqrt_d,
+            self.glm_index_budget(ctx.config)?.dense_threshold(),
             stream,
         )
     }
@@ -90,7 +91,7 @@ impl Qwen3AttentionLayer {
         let weights = ctx.buffers.ssm_gates();
         // Deliberately unconditional: dense rows pay these two projections,
         // but crossing 2048 never changes the captured graph.
-        ops::dense_gemv(
+        self.mla_dense_gemv(
             ctx.gpu,
             self.dense_gemv_k,
             q_latent,
@@ -100,20 +101,42 @@ impl Qwen3AttentionLayer {
             1536,
             stream,
         )?;
-        ops::dense_gemv(
-            ctx.gpu,
-            self.dense_gemv_k,
-            normed,
-            &indexer.weights_proj,
-            weights,
-            32,
-            4096,
-            stream,
-        )?;
+        let logits_kernel = if let Some(native) = &self.exl3_mla {
+            let exec = native.index_exec()?;
+            exec.validate(
+                1,
+                ctx.config.index_n_heads,
+                ctx.config.index_head_dim,
+                ctx.config.hidden_size,
+                ctx.buffers.sizes().ssm_gates,
+                stream,
+            )?;
+            exec.query_and_weights(
+                ctx.gpu,
+                normed,
+                indexer.weights_proj.weight,
+                query,
+                weights,
+                1,
+            )?;
+            exec.logits_dynamic
+        } else {
+            self.mla_dense_gemv(
+                ctx.gpu,
+                self.dense_gemv_k,
+                normed,
+                &indexer.weights_proj,
+                weights,
+                32,
+                4096,
+                stream,
+            )?;
+            self.glm_index_logits_dynamic_k
+        };
         let logits = ctx.buffers.expert_down_out();
         ops::glm_index_logits_dynamic(
             ctx.gpu,
-            self.glm_index_logits_dynamic_k,
+            logits_kernel,
             query,
             weights,
             kv_cache.sparse_index_pool_ptr(self.attn_layer_idx),
@@ -122,6 +145,7 @@ impl Qwen3AttentionLayer {
             meta.seq_len,
             shape,
             kv_cache.sparse_index_block_stride_bytes(self.attn_layer_idx) as u64,
+            self.glm_index_budget(ctx.config)?.dense_threshold(),
             stream,
         )?;
         let selected = ctx.buffers.qkv_output();

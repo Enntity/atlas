@@ -42,6 +42,19 @@ pub trait CommBackend: Send + Sync {
     /// All-gather: each rank contributes a chunk, all ranks get full buffer.
     fn all_gather(&self, send_ptr: u64, recv_ptr: u64, bytes: usize) -> Result<()>;
 
+    /// Gather on the caller's compute stream so dependent GPU work is ordered.
+    /// Backends must implement this explicitly; a legacy-stream enqueue does
+    /// not establish ordering on a different stream.
+    fn all_gather_on_stream(
+        &self,
+        _send_ptr: u64,
+        _recv_ptr: u64,
+        _bytes: usize,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("communicator does not support stream-ordered all-gather")
+    }
+
     /// Reduce-scatter: reduce + scatter (inverse of all-gather).
     fn reduce_scatter(&self, send_ptr: u64, recv_ptr: u64, bytes: usize) -> Result<()>;
 

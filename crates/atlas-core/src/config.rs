@@ -76,6 +76,11 @@ pub struct ModelConfig {
     /// `lower_bound * sigmoid(exp(A) * (. + dt_bias))` per key channel.
     #[serde(default)]
     pub kda_gate_lower_bound: f32,
+    /// Optional text FFN SwiGLU clamp, distinct from vision activation policy.
+    /// GLM parses an absent declaration as unclamped; a declared limit must
+    /// be positive and finite. No model-specific limit is inferred.
+    #[serde(default)]
+    pub text_swiglu_limit: Option<f32>,
 
     // ── MoE ──
     #[serde(default)]
@@ -90,6 +95,11 @@ pub struct ModelConfig {
     /// active params).
     #[serde(default = "default_one")]
     pub num_experts_per_tok: usize,
+    /// Explicit routed MoE grouping policy, independent of Mamba groups.
+    #[serde(default)]
+    pub moe_expert_groups: Option<usize>,
+    #[serde(default)]
+    pub moe_topk_groups: Option<usize>,
     #[serde(default)]
     pub moe_intermediate_size: usize,
     #[serde(default)]
@@ -331,6 +341,10 @@ pub struct ModelConfig {
     /// DeepSeek-V4 default is 1e-6.
     #[serde(default)]
     pub hc_eps: f32,
+    /// Declared `mhc_post_mult_value` from a GLM checkpoint. Native EXL3
+    /// validates it against its explicitly selected numerical profile.
+    #[serde(default)]
+    pub hc_post_multiplier: Option<f32>,
     /// Rank of the hyper-connection input mixer (`hc_lowrank`).
     ///
     /// Qwen4-Exp mixes the `hc_mult` residual streams through a LOW-RANK

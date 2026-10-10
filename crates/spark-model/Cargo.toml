@@ -80,6 +80,7 @@ path = "examples/metal_qwen35_inference/main.rs"
 required-features = ["metal-example"]
 
 [dev-dependencies]
+safetensors = "0.8"
 # `default-features = false` so a metal-feature build of spark-model doesn't
 # inadvertently pull cudarc back in via the dev-dep chain.
 spark-runtime = { path = "../spark-runtime", default-features = false, features = ["test-utils"] }
@@ -317,4 +318,9 @@ required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "w4a16_qg_batch_bitparity_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "exl3_moe_scratch_check"
+path = "examples/exl3_moe_scratch_check/main.rs"
 required-features = ["cuda", "gpu-examples"]
