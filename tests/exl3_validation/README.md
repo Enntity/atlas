@@ -58,8 +58,9 @@ its local patches and runtime fingerprint before preparing an Atlas image.
 ## Isolated native image
 
 Use `docker/gb10/glm-5.3-flash-exl3/exl3/Dockerfile`. It requires explicit CUDA
-base images, toolchain, CPU affinity, commit and source snapshot hash. Derive the
-CUDA image arguments from the digest-pinned `docker/gb10/Dockerfile`.
+base images, toolchain, CPU affinity and source snapshot hash; the git commit is
+derived from a clean worktree. Derive the CUDA image arguments from the
+digest-pinned `docker/gb10/Dockerfile`.
 Use the installed stable release version explicitly, rather than an unrecorded
 rolling toolchain. Build with `--no-cache`, a unique source-hash validation tag,
 and no GPU-serving processes competing for RAM. The single-CPU affinity also
@@ -67,16 +68,35 @@ bounds the kernel build's internal compiler pool; Cargo's job flag alone does no
 Record the resolved image ID/digest and packaged fingerprint files. The image
 is a validation candidate until model/collective/logit checks pass.
 
-From the extracted, hash-verified source snapshot, invoke:
+From a clean committed worktree, invoke:
 
 ```bash
-bash tests/exl3_validation/build_image.sh \
-  "$SOURCE_SNAPSHOT_SHA256" "$SOURCE_COMMIT" "$RUST_STABLE_VERSION" "$BUILD_CPU_ID"
+BLAS131_PAIR_DIR=/path/to/blas131-pair bash tests/exl3_validation/build_image.sh \
+  "$SOURCE_SNAPSHOT_SHA256" "$RUST_STABLE_VERSION" "$BUILD_CPU_ID"
 ```
 
 `BUILD_CPU_ID` must name one CPU permitted by the build host's affinity mask.
-Preserve the complete build log. This script builds only the isolated validation
-tag and prints the resolved image ID and labels; it never publishes an image.
+`BLAS131_PAIR_DIR` must hold the four nvidia-cublas 13.1.1.3 pair files
+(`libcublas.so.13`, `libcublasLt.so.13`, `package-binding-v1.json`,
+`dist-info/licenses/License.txt`), each verified against
+`docker/gb10/glm-5.3-flash-exl3/exl3/cublas131.sha256` before and after staging
+into `./blas131/`. The image ships the pair at `/opt/atlas/cublas-13.1.1.3`
+first in `LD_LIBRARY_PATH`, both `spark` and `exl3_moe_scratch_check`, and a
+`/usr/local/share/atlas/fingerprint/build-manifest.json` binding git commit,
+source snapshot hash, toolchain, compiler flags, binary SHA256s and embedded
+PTX SHA256s. Preserve the complete build log. This script builds only the
+isolated validation tag and prints the resolved image ID and labels; it never
+publishes an image.
+
+After the container starts, attest the runtime cuBLAS mappings from the host:
+
+```bash
+python3 tests/exl3_validation/attest_runtime_maps.py <pid|container-name>
+```
+
+It reads `/proc/<pid>/maps`, fails if anything other than the pinned pair is
+mapped (including the CUDA-toolkit `libcublasLt.so.13`), and hashes both mapped
+files against the same pins.
 
 ## Teacher-forced collection and comparison
 

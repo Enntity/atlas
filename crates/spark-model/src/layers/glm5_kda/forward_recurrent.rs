@@ -51,6 +51,11 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if let Some(fla) = &self.fla_reference {
+            return self.fla_sequence_rows(
+                fla, packed, convolved, g1, beta, core_out, state, tokens, ctx, stream,
+            );
+        }
         let m = tokens as u32;
         let p = self.heads * self.dim;
         ops::conv1d_update_prefill(
@@ -99,6 +104,7 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.ensure_policy_off("long-owner passenger")?;
         let p = self.heads * self.dim;
         let packed = ctx.buffers.ssm_qkvz();
         ops::kda_pack_qkv(
@@ -142,6 +148,7 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.ensure_policy_off("speculative verify")?;
         let records = !state.kda_records.is_null();
         ensure!(
             tokens >= 1
@@ -351,6 +358,7 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.ensure_policy_off("long-owner")?;
         let p = self.heads * self.dim;
         let packed = ctx.buffers.ssm_qkvz();
         ops::kda_pack_qkv(

@@ -129,7 +129,7 @@ Notes:
 | conv acc | f32, taps j = 0..3 in order; BF16×BF16 products exact in f32 |
 | conv SiLU | GPU `acc/(1+tl.exp(-acc))`; CPU oracle models f64 SiLU with one f32 rounding (numpy f32 SiLU misses one exact tie at M5 rank1) |
 | q/k L2 norm (prefill) | f32 sum-of-squares + `eps=1e-6`; GPU `tl.rsqrt` (approx — open question Q2); CPU oracle: correctly rounded `1/sqrt`; store BF16 |
-| beta | f32 sigmoid of BF16 input (`_cast_sigmoid` = `x.float().sigmoid()`); decode: in-kernel `tl.sigmoid` on f32-loaded value |
+| beta | f32 sigmoid of BF16 input via the model's torch.compile'd `_cast_sigmoid`: `div.full(1, 1 + ex2.approx(-x·log2e))` (§3.6a; eager ATen sigmoid is **wrong**); decode: in-kernel `tl.sigmoid` on the f32-loaded value |
 | gate | f32: `y = -5/(1+exp(-(exp(A_log)*(g1+bias))))`; `tl.exp` on GPU |
 | gate cumsum | **chunk-local** (restarts every 64 rows), sequential f32, then × `RCP_LN2 = 1.4426950408889634`; reference computes it as `tl.dot(tril_mask, gate, allow_tf32=False) * RCP_LN2` (f32 ieee dot); stored f32. `cumsum='f64'` is measurably worse (2016 vs 1728); pairwise equals sequential |
 | A / Aqk diagonal (16×16) | f32 elementwise + f32 `tl.sum` per column; `Aqk *= scale` in-operand; stored f32 |
@@ -228,7 +228,49 @@ behaviour change; fail fast rather than fall back (PCND).
    passing unchanged. The policy only ever makes the *reference* surface
    bit-exact; it does not relax any tolerance anywhere.
 
+### 3.6a GPU oracle and residual closure (2026-10-10)
+
+`tests/exl3_validation/kda_reference_stage_dump.py` replays the pinned
+reference (installed sources hash-identical to
+`reference-kda-kernel-source/`) on GB10 inside the reference image, stage
+by stage, from the captured `raw/` inputs. With the two corrections below it
+reproduces **every captured output byte**: M5 0/0, decode 0/0, M128 0/0, on
+both ranks, for both the staged replay and the model's varlen entry point.
+The per-stage bytes and digests are archived at
+`arithmetic-audit/kda-reference-stage-oracle-20261010/` (`SHA256SUMS`); they
+replace the NumPy emulation as the acceptance oracle for T2–T6.
+
+1. **Conv weights are f32.** The reference builds `q/k/v_conv1d` with
+   `params_dtype=torch.float32`, so `x * w` is exact in f32 (Triton would
+   otherwise round BF16×BF16 products to BF16).
+2. **Beta comes from Inductor, not ATen.** `_cast_sigmoid` runs inside the
+   model's `torch.compile` graph. Its Triton lowering is
+   `div.full.f32(1, add.f32(ex2.approx.f32(mul.f32(-x, log2e)), 1))`. Using
+   eager `sigmoid` instead leaves exactly the recorded residual pattern
+   (rank0: 231 elements, one head cascading from one row; rank1: 10). The
+   NumPy M128 residual (1728/585) is therefore explained by beta and the
+   approximate transcendental ops, not by reference nondeterminism.
+
+The reference is deterministic across repeats and, on the M128 fixture,
+insensitive to every autotune configuration of the gate, KKT, solve, w/u
+and output kernels (`kda_reference_config_sweep.py`). Lowered PTX
+(`sm_121a`, Triton 3.7.1, archived Triton caches in
+`reference-triton-cache-20261010/`) pins the open operations:
+
+| Stage | Instructions |
+|---|---|
+| conv SiLU | `fma.rn.f32` taps, `ex2.approx.f32`, `div.full.f32` |
+| prefill L2 norm | `fma.rn.f32.bf16` sum of squares, `rsqrt.approx.ftz.f32` |
+| gate + chunk cumsum | `ex2.approx.f32`, `div.full.f32`, `fma.rn.f32` cumsum chain |
+| KKT off-diagonal | `mma.sync.m16n8k8.f32.tf32.tf32.f32` (no `cvt.*.tf32`), `ex2.approx.ftz.f32` |
+| KKT diagonal | `fma.rn.f32`, `ex2.approx.ftz.f32` |
+| solve_tril merge | `fma.rn.f32` (ieee dots), `cvt.rn.bf16x2.f32` |
+| recompute w/u, delta h, output | `mma.sync.m16n8k16.f32.bf16.bf16.f32`, `ex2.approx.ftz.f32`, `fma.rn.f32x2` |
+| decode | `div.full.f32`, `ex2.approx.f32`, `sqrt.approx.ftz.f32`, `fma.rn.f32.bf16` |
+
 ### 3.7 (f) Known residual risk (M128) and GPU closure plan
+
+Superseded by §3.6a for the captured fixtures; retained for history.
 
 The emulation reproduces the captured M128 reference with 1728 (rank0) and
 585 (rank1) mismatches of 524288 elements (chunk split 745/983 and 190/395),
@@ -293,21 +335,17 @@ Ordered tasks; each ends with its own acceptance check.
 1. **T1 — Freeze the CPU oracle (done as part of this groundwork).**
    `tests/exl3_validation/test_exl3_kda_reference.py` green on CPU; it is
    the acceptance oracle for every later task.
-2. **T2 — Prefill chunked kernel at M5 (single chunk first).** Implement
-   `kda_fla_chunk_prefill_bf16` for `T < 64` covering stages 1–9 of §3.1
-   with casts 1–6. Acceptance: kernel output vs `raw/` M5 outputs is 0/0 on
-   both ranks (compare bitwise, same as the harness).
-3. **T3 — PTX decisions for exp/div/rsqrt (Q1–Q3 below).** Run the probe
-   harness on GB10 and pin the exact ops before scaling up; a wrong choice
-   here reappears as silent 1-ulp flips at M128.
-4. **T4 — Multi-chunk prefill at M128.** Add chunk loop (BT=64),
-   off-diagonal tf32 KKT dots with truncated operands, per-chunk `h` cast,
-   w/kg/kbg/qg/v_new casts, f32 chunk-local gate cumsum × `RCP_LN2`.
-   Acceptance: exact recorded counts 1728/585, then 0/0 after T5.
-5. **T5 — Close the M128 residual.** Stage-tensor diff vs the Triton
-   reference on GB10 (§3.7 steps 1–2); fix the responsible op; update this
-   document with the measured evidence. Acceptance: 0/0 both ranks; record
-   per-stage digests.
+2. **T2 — Prefill stage kernels.** One CUDA kernel per reference Triton
+   kernel (conv, l2norm, beta, gate cumsum, KKT inter/intra, solve_tril,
+   recompute w/u, delta h, output), each byte-compared against its GPU
+   oracle stage (§3.6a) for every prefill fixture, both ranks.
+3. **T3 — PTX decisions.** Closed by the archived lowered PTX (§3.6a table);
+   kernels use the exact instructions via `kernels/gb10/common/kda_fla_ops.cuh`.
+4. **T4 — Multi-chunk and carried state.** Covered by the oracle `seq*`
+   fixtures (tails, 3 chunks + tail, non-zero initial conv/recurrent state);
+   acceptance is 0 mismatches on every stage.
+5. **T5 — Close the M128 residual.** Closed: beta lowering and f32 conv
+   weights (§3.6a). The replay reproduces the captured bytes exactly.
 6. **T6 — Decode fused_recurrent kernel.** `kda_fla_recurrent_decode_bf16`
    per §3.4 (f32 state, in-kernel f32 l2norm, no BF16 l2norm).
    Acceptance: 0/0 both ranks at inv 000325.

@@ -77,6 +77,12 @@ impl MoeScratchGeometry {
             size(self.capacity, self.experts, 2)?,
         ])
     }
+    pub fn capacity(self) -> usize {
+        self.capacity
+    }
+    pub fn stream(self) -> u64 {
+        self.stream
+    }
     pub fn total_bytes(self) -> Result<usize> {
         self.sizes()?.into_iter().try_fold(0usize, |sum, n| {
             sum.checked_add(n)
@@ -95,12 +101,12 @@ pub struct MoeScratchBorrow {
     enqueue: Arc<Mutex<()>>,
 }
 impl MoeScratchBorrow {
-    pub(super) fn acquire(&self) -> Result<MutexGuard<'_, ()>> {
+    pub(crate) fn acquire(&self) -> Result<MutexGuard<'_, ()>> {
         let lease = self.enqueue.lock();
         self.pointers()?;
         Ok(lease)
     }
-    pub(super) fn geometry(&self) -> MoeScratchGeometry {
+    pub(crate) fn geometry(&self) -> MoeScratchGeometry {
         self.geometry
     }
     pub fn validate(&self, geometry: MoeScratchGeometry, rows: usize, stream: u64) -> Result<()> {

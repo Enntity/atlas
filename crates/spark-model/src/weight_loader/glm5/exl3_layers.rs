@@ -97,7 +97,15 @@ pub fn load_layers(
                     let (weights, dense) = resource.into_weights(gpu)?;
                     companions.extend(dense.into_tensors());
                     layers.push(Box::new(Glm5KdaLayer::new(
-                        input_norm, post_norm, weights, ffn, hc, layer, config, gpu,
+                        input_norm,
+                        post_norm,
+                        weights,
+                        ffn,
+                        hc,
+                        layer,
+                        config,
+                        gpu,
+                        scratch.as_ref().map(MoeScratch::borrow),
                     )?));
                 }
                 LayerType::FullAttention => {

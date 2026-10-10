@@ -23,6 +23,9 @@ MASTER_PORT="${MASTER_PORT:-29721}"
 MODEL_PATH="${MODEL_PATH:-/root/.cache/huggingface/hub/models--MikeRoz--GLM-5.3-Flash-Uncensored-4.05bpw-h6-exl3/snapshots/dda99c7e935920fa6e235ce410e6f806e1c02720}"
 HF_CACHE="${HF_CACHE:-/home/colum/glm53-local}"
 CUDA_CACHE="${CUDA_CACHE:-/home/colum/.cache/atlas-exl3-validation/src-48624a8605de}"
+# KDA arithmetic policy: 0 = Atlas correctly rounded core (default),
+# 1 = EXL3 reference-policy core (requires an image with module kda_fla).
+KDA_FLA_REFERENCE="${KDA_FLA_REFERENCE:-0}"
 
 case "$RANK" in
   0) NIC_ETH=enp1s0f0np0; NIC_IB=rocep1s0f0 ;;
@@ -61,6 +64,7 @@ docker create \
   --env ATLAS_NO_DECODE_GRAPHS=1 \
   --env ATLAS_NO_DECODE_GRAPHS_MULTISEQ=1 \
   --env ATLAS_DEBUG_NO_GRAPH=1 \
+  --env "ATLAS_KDA_FLA_REFERENCE=$KDA_FLA_REFERENCE" \
   --volume "$HF_CACHE:/root/.cache/huggingface:ro" \
   "$IMAGE" \
   serve "$MODEL_PATH" \

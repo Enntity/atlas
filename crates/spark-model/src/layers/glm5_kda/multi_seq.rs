@@ -31,6 +31,7 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.ensure_policy_off("multi-sequence decode")?;
         self.validate_exl3_forward(num_seqs, ctx, stream)?;
         let independent = crate::model::glm_independent::selected(ctx, num_seqs)?;
         ensure!(

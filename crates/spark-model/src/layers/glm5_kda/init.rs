@@ -23,6 +23,7 @@ impl Glm5KdaLayer {
         layer_idx: usize,
         config: &atlas_core::config::ModelConfig,
         gpu: &dyn GpuBackend,
+        routed_scratch: Option<crate::layers::glm5_exl3_ffn::MoeScratchBorrow>,
     ) -> Result<Self> {
         ensure!(
             config.linear_key_head_dim == 128,
@@ -193,6 +194,7 @@ impl Glm5KdaLayer {
             preprocess_regresident_k,
             recurrent_regresident_k,
             register_resident_prefill,
+            fla_reference: None,
             gated_norm_k: gpu.kernel("kda", "kda_sigmoid_gated_rms_norm")?,
             // Highway-storage-specific mHC kernels (FP32, or BF16 twins).
             hc_expand_k: gpu.kernel("hyper_connection", &hc_name("hc_expand"))?,
@@ -231,6 +233,19 @@ impl Glm5KdaLayer {
                 "independent KDA requires both indexed kernels"
             );
         }
+        let policy = super::reference_policy::parse_policy(
+            std::env::var("ATLAS_KDA_FLA_REFERENCE").ok().as_deref(),
+        )?;
+        let requirements = super::reference_policy::PolicyRequirements {
+            exl3_projections: layer.exl3_projections(),
+            heads: layer.heads,
+            dim: layer.dim,
+            conv_width: layer.conv_width,
+            lower_bound: layer.lower_bound,
+            register_resident_prefill: layer.register_resident_prefill,
+        };
+        layer.fla_reference =
+            super::reference_policy::FlaReference::load(gpu, policy, &requirements, routed_scratch)?;
         layer.native_aux = layer.load_native_aux(gpu)?;
         Ok(layer)
     }

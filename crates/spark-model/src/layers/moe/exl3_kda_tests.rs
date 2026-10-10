@@ -157,6 +157,7 @@ fn actual_kda_native_prefill_dispatches_packed_projections_and_sums_once() {
             0,
             &config,
             &gpu,
+            None,
         )
         .unwrap();
         let arena = BufferArena::new(&config, 3, 128, 16, 3, &gpu).unwrap();

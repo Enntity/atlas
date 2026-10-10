@@ -10,6 +10,11 @@ target-*/
 # Local docker build input: release binary copied in before `docker build`.
 # Regenerated from `target/release/spark`; never tracked.
 docker/gb10/spark-fastbin
+# Local docker build input: staged nvidia-cublas 13.1.1.3 pair for the EXL3
+# validation image (tests/exl3_validation/build_image.sh). Large binaries,
+# verified against docker/gb10/glm-5.3-flash-exl3/exl3/cublas131.sha256;
+# never tracked.
+/blas131/
 
 # tool-eval-bench run reports — local benchmark output, not source
 /runs/

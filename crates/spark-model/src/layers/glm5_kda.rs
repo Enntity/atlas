@@ -17,6 +17,7 @@ mod native_aux;
 mod profile;
 mod projection;
 mod recurrent;
+mod reference_policy;
 mod shared_cache;
 mod upstream;
 mod weight_variants;
@@ -154,6 +155,8 @@ pub struct Glm5KdaLayer {
     preprocess_regresident_k: KernelHandle,
     recurrent_regresident_k: KernelHandle,
     register_resident_prefill: bool,
+    /// EXL3-only reference-policy core (`ATLAS_KDA_FLA_REFERENCE=1`).
+    fla_reference: Option<reference_policy::FlaReference>,
     gated_norm_k: KernelHandle,
     hc_expand_k: KernelHandle,
     hc_pre_k: KernelHandle,

@@ -99,6 +99,7 @@ fn with_kda_ffn(
         0,
         &config,
         &gpu,
+        None,
     )
     .unwrap();
     run(&gpu, &config, &layer);
