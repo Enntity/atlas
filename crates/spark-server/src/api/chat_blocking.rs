@@ -166,12 +166,15 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             suppress_tool_call,
             disable_mtp: false,
             grammar_spec: grammar_spec.clone(),
-            seed: req.seed.map(|s| s.wrapping_add(choice_idx as u64)),
+            // Non-overlapping per-choice RNG streams (`choice_seed`).
+            seed: req
+                .seed
+                .map(|s| super::choice_seed::choice_seed(s, choice_idx as u64)),
             top_logprobs,
             prompt_logprobs: None,
             echo: false,
             timeout_at,
-            stop_watch: blocking_stop_watch(&state, &req.stop),
+            stop_watch: blocking_stop_watch(&state, &req.stop, req.min_tokens),
             response_tx: tx,
         };
 
@@ -218,10 +221,26 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         // n>1 we only charge once (same prompt reused).
         total_cached_prompt_tokens = total_cached_prompt_tokens.max(response.cached_prompt_tokens);
 
+        // The terminal stop token is dropped before decoding unless
+        // `include_stop_str_in_output` keeps a client stop's text.
+        let include = req.include_stop_str_in_output;
+        let visible = match super::stop_match::included_stop_token(
+            include,
+            response.stop_token_id,
+            &stop_tokens,
+        ) {
+            Some(_) => &response.output_tokens[..],
+            None => output_tokens_without_stop(&response.output_tokens, response.stop_token_id),
+        };
         let (reasoning_content_i, output_text_i) =
-            decode_response_text(&state, &response, enable_thinking, tools_active);
+            decode_visible_text(&state, visible, enable_thinking, tools_active);
+        let floor = if req.stop.is_empty() {
+            0
+        } else {
+            min_tokens_floor(&state, visible, output_text_i.len(), req.min_tokens)
+        };
         let (output_text_i, text_stop) =
-            super::inference_impl::strip_stop_sequences_matched(output_text_i, &req.stop);
+            super::stop_match::truncate_at_stop(output_text_i, &req.stop, floor, include);
         let matched_stop = super::stop_match::resolve_matched_stop(
             text_stop,
             response.stop_token_id,
@@ -274,6 +293,16 @@ pub(super) fn decode_response_text(
     tools_active: bool,
 ) -> (Option<String>, String) {
     let output_tokens = output_tokens_without_stop(&response.output_tokens, response.stop_token_id);
+    decode_visible_text(state, output_tokens, enable_thinking, tools_active)
+}
+
+/// [`decode_response_text`] over an already-chosen visible token slice.
+fn decode_visible_text(
+    state: &AppState,
+    output_tokens: &[u32],
+    enable_thinking: bool,
+    tools_active: bool,
+) -> (Option<String>, String) {
     // GLM's native tool opener also closes reasoning, but belongs to the tool
     // parser. Prefer the FIRST boundary; a later </think> must not swallow the
     // tool call. This never scans arbitrary reasoning text for call syntax.
@@ -372,22 +401,43 @@ fn split_at_first_think_end(
 /// also "stop" but ends on an ordinary text token — dropping it would cut
 /// the tail of the stop string itself (`"Observation:"` → `"Observation"`),
 /// so the final strip would miss it and leak it into the content.
-fn output_tokens_without_stop(tokens: &[u32], stop_token_id: Option<u32>) -> &[u32] {
+pub(super) fn output_tokens_without_stop(tokens: &[u32], stop_token_id: Option<u32>) -> &[u32] {
     match tokens.split_last() {
         Some((&last, visible)) if Some(last) == stop_token_id => visible,
         _ => tokens,
     }
 }
 
+/// vLLM `min_tokens` for the final stop-string truncation: the byte offset in
+/// the `content_len`-byte decoded content below which no stop string may end
+/// — the text of the first `min_tokens` of the `visible` output tokens
+/// (`stop_match::content_floor`). 0 without `min_tokens`.
+pub(super) fn min_tokens_floor(
+    state: &AppState,
+    visible: &[u32],
+    content_len: usize,
+    min_tokens: usize,
+) -> usize {
+    if min_tokens == 0 {
+        return 0;
+    }
+    let decoded_len = |ids: &[u32]| state.tokenizer.decode(ids).map_or(0, |s| s.len());
+    let below = decoded_len(&visible[..min_tokens.min(visible.len())]);
+    super::stop_match::content_floor(content_len, decoded_len(visible), below)
+}
+
 /// Scheduler-side stop-string watch for one blocking choice: decodes with
-/// the same special-token skipping as `decode_response_text`.
+/// the same special-token skipping as `decode_response_text`, dormant over
+/// the first `min_tokens` output tokens.
 pub(super) fn blocking_stop_watch(
     state: &Arc<AppState>,
     stops: &[String],
+    min_tokens: usize,
 ) -> Option<super::stop_match::StopStringWatch> {
     let state = state.clone();
     super::stop_match::StopStringWatch::new(
         stops,
+        min_tokens,
         Arc::new(move |ids: &[u32]| state.tokenizer.decode(ids).unwrap_or_default()),
     )
 }

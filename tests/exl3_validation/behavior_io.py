@@ -22,7 +22,8 @@ class BehaviorIORouter:
             raise ValueError('base URL must be an explicit HTTP server origin, without /v1')
         if type(timeout) not in (int,float) or not 0<timeout<=1200:raise ValueError('explicit bounded timeout required')
         self.base=base_url.rstrip('/')
-        self.paths={'chat':'/v1/chat/completions','completions':'/v1/completions','messages':'/v1/messages'}
+        self.paths={'chat':'/v1/chat/completions','completions':'/v1/completions','messages':'/v1/messages',
+                    'responses':'/v1/responses'}
         self.urls={key:self.base+path for key,path in self.paths.items()}
         self.parsed=parsed
         self.timeout=timeout;self.out=Path(out);self.out.mkdir(parents=True,exist_ok=False)

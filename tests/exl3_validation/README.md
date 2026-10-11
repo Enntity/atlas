@@ -367,9 +367,12 @@ suite. Interruption cases run last. Run `--help` to list the case names.
 | `completions-basic`, `completions-length` | the same on legacy `/v1/completions` (plain prompt, `.` stop) |
 | `stop-string` | `Observation:` (multi-token) ends output at the match, blocking and SSE: marker and following text absent, text equals the unstopped greedy baseline's prefix, fewer tokens than the baseline |
 | `stop-token-ids` | chooses a content token from a `return_token_ids` baseline; with `stop_token_ids` the content is truncated before it and `completion_tokens == position + 1` (vLLM `check_stop`) |
+| `stop-include` | `include_stop_str_in_output`: blocking and SSE output equals the unstopped greedy baseline through the first `Observation:` (kept, once, nothing after); stream equals blocking |
+| `stop-empty` | an empty stop string (`[""]`, `["Observation:", ""]`, bare `""`; chat and completions) is rejected with HTTP 400 (vLLM `sampling_params.py:763`) |
 | `eos` | natural end: finish `stop` before `max_tokens`, no leaked specials; last token in `--eos-token-id` (otherwise `skipped`) |
 | `messages-*` | raw Messages event order; `end_turn` / `max_tokens` / `stop_sequence` with the matched string echoed on blocking and SSE; usage; stream equals blocking |
 | `seed`, `seed-json-schema` | same seed at temperature 1.0 twice: identical first token (`token_ids[0]`, or the first delta if the server exposes no ids) and identical output, without and with `json_schema`; a different seed must change the joke (rules out a server that ignores temperature) |
+| `responses-seed` | `/v1/responses` with `seed` at temperature 1.0 twice: identical reasoning and `output_text`; a different seed changes it |
 | `structured-*` | strict JSON parse, `behavior_schema` validation, exact values |
 | `tools-*` | single and parallel calls: `tool_calls` finish, call count, distinct ids, strict-JSON schema-valid arguments; dependent follow-up must answer from counter-seasonal tool results |
 | `reasoning-on`, `reasoning-off` | `enable_thinking`: reasoning present and separated (on), exact content, no `<think>` / `<|...|>` markers in either channel, `reasoning_tokens` consistent with the channel |
@@ -378,9 +381,8 @@ suite. Interruption cases run last. Run `--help` to list the case names.
 
 `reasoning-off` does not require an empty reasoning channel because the GLM
 template keeps brief native reasoning (see above). Several gates are expected
-to fail on servers that do not implement the contract. For example, Atlas
-accepts no `stop_token_ids`, and vLLM's Anthropic stream sends
-`stop_sequence: null`. These are findings, not reasons to relax a gate.
+to fail on servers that do not implement the contract. For example, vLLM's
+Anthropic stream sends `stop_sequence: null`. These are findings, not reasons to relax a gate.
 
 CPU self-tests use a local fake server only and are not qualification:
 

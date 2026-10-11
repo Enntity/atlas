@@ -212,10 +212,12 @@ pub fn lower_responses_to_chat(
             }
         },
         stop: Vec::new(),
+        stop_token_ids: None,
+        include_stop_str_in_output: false,
         response_format: None,
         min_tokens: 0,
         ignore_eos: false,
-        seed: None,
+        seed: r.seed,
         logprobs: None,
         top_logprobs: None,
         timeout: None,

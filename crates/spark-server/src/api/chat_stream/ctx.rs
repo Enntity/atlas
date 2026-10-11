@@ -28,6 +28,12 @@ pub(super) struct StreamCtx {
     /// ids end the turn as EOS and are never streamed as text, so the Done
     /// frame's `stop_token_id` is mapped back through this for `matched_stop`.
     pub(super) single_token_stops: Vec<(u32, String)>,
+    /// The request's client stop-token set (single-token stop strings plus
+    /// `stop_token_ids`) — the ids whose text `include_stop_str_in_output`
+    /// returns (`stop_match::included_stop_token`).
+    pub(super) client_stop_tokens: Vec<u32>,
+    /// vLLM `include_stop_str_in_output`.
+    pub(super) include_stop_str: bool,
     /// Now-constant `false`: the tool-call retry/repair stack was removed.
     /// Retained so the streaming chunk buffering helpers in
     /// `tool_handlers.rs` still type-check; the buffering branches are dead.
@@ -48,7 +54,8 @@ pub(super) struct StreamCtx {
     /// bytes of the accumulated text are withheld so a stop string
     /// that lands across two decoded chunks (e.g. `<|im_st` + `art|>`)
     /// is never emitted as a partial leak. Zero when `stop_strings` is
-    /// empty (existing behaviour preserved).
+    /// empty, and under `include_stop_str_in_output` (the stop string is
+    /// returned anyway; `stop_match::holdback_len`).
     pub(super) stop_string_buffer_len: usize,
     pub(super) leak_markers: tool_parser::LeakMarkers,
     /// The model's chat format writes roles as plain text after

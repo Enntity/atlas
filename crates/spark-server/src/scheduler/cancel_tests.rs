@@ -362,6 +362,7 @@ fn blocking_stop_string_watch_retires_at_checkpoint() {
     let watch = || {
         crate::api::stop_match::StopStringWatch::new(
             &["Obs:".to_string()],
+            0,
             Arc::new(|ids: &[u32]| {
                 ids.iter()
                     .map(|&t| match t {
@@ -414,6 +415,7 @@ fn non_spec_blocking_stop_string_hit_commits_no_token() {
         tx: Some(tx),
         stop_watch: crate::api::stop_match::StopStringWatch::new(
             &["STOP".to_string()],
+            0,
             Arc::new(|ids: &[u32]| ids.iter().map(|_| "STOP").collect()),
         ),
     };

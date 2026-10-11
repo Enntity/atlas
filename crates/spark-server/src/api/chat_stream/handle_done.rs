@@ -151,69 +151,24 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
     // bypass the live pipeline.
     if !ctx.stop_strings.is_empty()
         && !state.stop_string_triggered
-        && state.stop_string_emitted_len < state.accumulated_content.len()
+        && state.stop_holdback.emitted < state.stop_holdback.acc.len()
     {
-        let tail = state.accumulated_content[state.stop_string_emitted_len..].to_string();
-        state.stop_string_emitted_len = state.accumulated_content.len();
-        if !tail.is_empty() {
-            if let Some(det) = state.detector.as_mut() {
-                let outputs = det.process(&tail);
-                for output in outputs {
-                    match output {
-                        tool_parser::DetectorOutput::Content(text) => {
-                            let sanitized = sanitize_content_chunk(
-                                &text,
-                                &mut state.tag_scan_buf,
-                                &mut state.suppressing_param_leak,
-                                &mut state.inside_envelope,
-                                &ctx.leak_markers,
-                            );
-                            if !sanitized.is_empty() {
-                                deltas.push(StreamDelta::Content {
-                                    text: sanitized,
-                                    token_ids: Vec::new(),
-                                });
-                            }
-                        }
-                        tool_parser::DetectorOutput::ToolCall(mut tc, tc_idx) => {
-                            handle_complete_tool_call(state, ctx, &mut tc, tc_idx, &mut deltas);
-                        }
-                        tool_parser::DetectorOutput::ToolCallStart {
-                            id: tc_id,
-                            name,
-                            idx,
-                        } => {
-                            handle_tool_call_start(state, ctx, tc_id, name, idx, &mut deltas);
-                        }
-                        tool_parser::DetectorOutput::ToolCallDelta { args, idx } => {
-                            handle_tool_call_delta(state, ctx, args, idx, &mut deltas);
-                        }
-                        tool_parser::DetectorOutput::ToolCallArgsFragment { fragment, idx } => {
-                            handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
-                        }
-                        tool_parser::DetectorOutput::ToolCallEnd { idx } => {
-                            handle_tool_call_end(state, ctx, idx);
-                        }
-                    }
-                }
-            } else {
-                let sanitized = sanitize_content_chunk(
-                    &tail,
-                    &mut state.tag_scan_buf,
-                    &mut state.suppressing_param_leak,
-                    &mut state.inside_envelope,
-                    &ctx.leak_markers,
-                );
-                if !sanitized.is_empty() {
-                    if state.refusal_scan_buf.len() < 16_384 {
-                        state.refusal_scan_buf.push_str(&sanitized);
-                    }
-                    deltas.push(StreamDelta::Content {
-                        text: sanitized,
-                        token_ids: Vec::new(),
-                    });
-                }
-            }
+        let tail = state.stop_holdback.acc[state.stop_holdback.emitted..].to_string();
+        state.stop_holdback.emitted = state.stop_holdback.acc.len();
+        route_flushed_content(state, ctx, &tail, &mut deltas);
+    }
+    // `include_stop_str_in_output`: the client stop token that ended the
+    // turn is never streamed as a Token; its text closes the channel it was
+    // generated in (reasoning when the turn ended inside `<think>`, e.g. at
+    // the hard length ceiling — as the blocking decode places it).
+    if let Some(text) = state.stop_token_text.take() {
+        if state.thinking_done {
+            route_flushed_content(state, ctx, &text, &mut deltas);
+        } else if !text.is_empty() {
+            deltas.push(StreamDelta::Reasoning {
+                text,
+                token_ids: Vec::new(),
+            });
         }
     }
 
@@ -348,6 +303,78 @@ fn resolve_wire_finish_reason<'a>(
         "length"
     } else {
         scheduler_reason
+    }
+}
+
+/// Route text released at stream end (the stop-string hold-back tail, an
+/// included client stop token) through the active detector / sanitizer, so
+/// the same envelope and leak-marker rules apply as to live deltas.
+fn route_flushed_content(
+    state: &mut StreamState,
+    ctx: &StreamCtx,
+    tail: &str,
+    deltas: &mut DeltaVec,
+) {
+    if tail.is_empty() {
+        return;
+    }
+    if let Some(det) = state.detector.as_mut() {
+        let outputs = det.process(tail);
+        for output in outputs {
+            match output {
+                tool_parser::DetectorOutput::Content(text) => {
+                    let sanitized = sanitize_content_chunk(
+                        &text,
+                        &mut state.tag_scan_buf,
+                        &mut state.suppressing_param_leak,
+                        &mut state.inside_envelope,
+                        &ctx.leak_markers,
+                    );
+                    if !sanitized.is_empty() {
+                        deltas.push(StreamDelta::Content {
+                            text: sanitized,
+                            token_ids: Vec::new(),
+                        });
+                    }
+                }
+                tool_parser::DetectorOutput::ToolCall(mut tc, tc_idx) => {
+                    handle_complete_tool_call(state, ctx, &mut tc, tc_idx, deltas);
+                }
+                tool_parser::DetectorOutput::ToolCallStart {
+                    id: tc_id,
+                    name,
+                    idx,
+                } => {
+                    handle_tool_call_start(state, ctx, tc_id, name, idx, deltas);
+                }
+                tool_parser::DetectorOutput::ToolCallDelta { args, idx } => {
+                    handle_tool_call_delta(state, ctx, args, idx, deltas);
+                }
+                tool_parser::DetectorOutput::ToolCallArgsFragment { fragment, idx } => {
+                    handle_tool_call_args_fragment(state, ctx, fragment, idx, deltas);
+                }
+                tool_parser::DetectorOutput::ToolCallEnd { idx } => {
+                    handle_tool_call_end(state, ctx, idx);
+                }
+            }
+        }
+    } else {
+        let sanitized = sanitize_content_chunk(
+            tail,
+            &mut state.tag_scan_buf,
+            &mut state.suppressing_param_leak,
+            &mut state.inside_envelope,
+            &ctx.leak_markers,
+        );
+        if !sanitized.is_empty() {
+            if state.refusal_scan_buf.len() < 16_384 {
+                state.refusal_scan_buf.push_str(&sanitized);
+            }
+            deltas.push(StreamDelta::Content {
+                text: sanitized,
+                token_ids: Vec::new(),
+            });
+        }
     }
 }
 

@@ -38,15 +38,17 @@ pub(super) struct StreamState {
     pub(super) detok_read_offset: usize,
     /// Lazy streaming-decoder over the content phase (post-thinking).
     pub(super) content_decoder: Option<crate::tokenizer::StreamingDecoder<'static>>,
-    /// Buffer used for stop-string matching across delta boundaries.
-    pub(super) accumulated_content: String,
-    /// Number of bytes of `accumulated_content` already forwarded to
-    /// the client. The vLLM-style hold-back (see `handle_token`) keeps
-    /// the last `max(stop_string_len) - 1` bytes back until either a
-    /// match completes or the stream finalises, so the emitted prefix
-    /// can lag behind the accumulator. Used to compute the next delta
-    /// slice without re-emitting bytes.
-    pub(super) stop_string_emitted_len: usize,
+    /// Stop-string hold-back cursor: the content accumulator matched
+    /// across delta boundaries, the prefix already forwarded to the client
+    /// (the vLLM-style hold-back in `handle_token` keeps the last
+    /// `max(stop_string_len) - 1` bytes back until a match completes or the
+    /// stream finalises) and the `min_tokens` floor. Its own `triggered`
+    /// mirrors a client match; `stop_string_triggered` below is the gate.
+    pub(super) stop_holdback: crate::api::stop_match::HoldbackState,
+    /// Text of the client stop token that ended the turn, set from the Done
+    /// frame under `include_stop_str_in_output` and released by the
+    /// finish-time flush (the token itself is never streamed).
+    pub(super) stop_token_text: Option<String>,
     /// Mirror of the post-sanitizer content stream; used by the
     /// post-stream refusal classifier and the `--dump` synthesiser.
     pub(super) refusal_scan_buf: String,
@@ -218,8 +220,8 @@ impl StreamState {
             detok_prefix_offset: 0,
             detok_read_offset: 0,
             content_decoder: None,
-            accumulated_content: String::new(),
-            stop_string_emitted_len: 0,
+            stop_holdback: Default::default(),
+            stop_token_text: None,
             refusal_scan_buf: String::new(),
             stop_string_triggered: false,
             stop_string_matched: false,

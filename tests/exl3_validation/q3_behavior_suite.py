@@ -23,6 +23,11 @@ Wire contracts gated (vLLM reference, 0.1.dev20051+g487ecf187):
   (entrypoints/openai/chat_completion/serving.py:766).
 - stop_token_ids: the stop token is appended and then stops the request, so
   it counts in completion_tokens (v1/core/sched/utils.py:108 check_stop).
+- include_stop_str_in_output: the output ends WITH the matched stop string
+  (v1/engine/detokenizer.py:443 check_stop_strings include_in_output).
+- empty stop string: rejected with HTTP 400 (sampling_params.py:763).
+- Responses API seed: accepted and passed to sampling
+  (entrypoints/openai/responses/protocol.py:283, :445).
 - Anthropic stop_sequence: gated per the Anthropic Messages contract (echo
   the matched string with stop_reason 'stop_sequence'), which vLLM's own
   translator does not do on the stream (entrypoints/anthropic/serving.py:811).
@@ -269,6 +274,46 @@ def stop_cut_problems(text, baseline):
     return problems
 
 
+def include_cut_problems(text, baseline):
+    """include_stop_str_in_output: generation ends AT the match and the
+    matched string is kept: the output is the unstopped greedy baseline up to
+    and including the first stop string, nothing after it."""
+    problems = []
+    if not text.endswith(STOP_MARKER):
+        problems.append('output does not end with the stop string')
+    if text.count(STOP_MARKER) != 1:
+        problems.append('stop string occurs %d times' % text.count(STOP_MARKER))
+    tail = [word for word in REACT_TAIL if word in text]
+    if tail:
+        problems.append('text after the stop string present: ' + repr(tail))
+    if baseline is not None:
+        cut = baseline.find(STOP_MARKER)
+        if cut < 0:
+            problems.append('baseline never produced the stop string (precondition)')
+        elif text != baseline[:cut + len(STOP_MARKER)]:
+            problems.append('output is not the baseline prefix through the stop string')
+    return problems
+
+
+def responses_text(body, kind='output_text'):
+    """Concatenated text of a Responses body: `output_text` parts of message
+    items, or (kind='reasoning') every text part of reasoning items."""
+    items = body.get('output') if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        return ''
+    parts = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if kind == 'reasoning' and item.get('type') == 'reasoning':
+            for key in ('summary', 'content'):
+                parts += [p.get('text') for p in item.get(key) or [] if isinstance(p, dict)]
+        elif kind == 'output_text' and item.get('type') == 'message':
+            parts += [p.get('text') for p in item.get('content') or []
+                      if isinstance(p, dict) and p.get('type') == 'output_text']
+    return ''.join(part for part in parts if isinstance(part, str))
+
+
 def tool_call_problems(calls, expected):
     """Every call: identity, declared name, strict-JSON arguments valid for
     the declared schema; together exactly the expected (name, args) multiset."""
@@ -348,6 +393,16 @@ class Case:
                    {'http_status': receipt.get('http_status'), 'error': clip(receipt.get('error')),
                     'error_body': clip(receipt.get('error_body'))})
         return body, events
+
+    def expect_status(self, tag, payload, status, surface='chat'):
+        """Send one request that must be REJECTED with `status` (e.g. 400)."""
+        rid = self.name + '-' + tag
+        receipt, _ = self.ctx.io.request(rid, payload, surface)
+        self.requests.append({key: receipt.get(key) for key in
+                              ('id', 'http_status', 'raw_file', 'raw_sha256', 'error')})
+        got = receipt.get('http_status')
+        return self.check(tag + ':rejected_%d' % status, got == status,
+                          {'http_status': got, 'error_body': clip(receipt.get('error_body'))})
 
     def receipt(self, family, description, started, error=None):
         failed = [a['assertion'] for a in self.assertions if a['status'] == 'fail']
@@ -460,6 +515,12 @@ class Context:
                  'temperature': 0, 'stream': stream}
         if stream:
             value['stream_options'] = {'include_usage': True}
+        value.update(extra)
+        return value
+
+    def responses(self, prompt, max_tokens=MAX_TOKENS, **extra):
+        value = {'model': self.model, 'input': prompt, 'max_output_tokens': max_tokens,
+                 'temperature': 0, 'stream': False}
         value.update(extra)
         return value
 
@@ -596,6 +657,35 @@ def case_stop_token_ids(case, ctx):
     else:
         case.check('stopped:token_ids_prefix', got_ids in (ids[:position + 1], ids[:position]),
                    {'stopped_ids': got_ids[-4:], 'expected_tail': ids[max(0, position - 3):position + 1]})
+
+
+def case_stop_include(case, ctx):
+    baseline, _ = case.request('baseline', ctx.chat(REACT_PROMPT, thinking=False))
+    base_text = chat_content(baseline) if baseline is not None else None
+    if baseline is not None:
+        case.check('baseline:contains_stop_string', STOP_MARKER in base_text,
+                   {'content': clip(base_text), 'note': 'precondition: without it the cut is untested'})
+    bodies = {}
+    for tag, stream in (('blocking', False), ('stream', True)):
+        payload = ctx.chat(REACT_PROMPT, stream, thinking=False, stop=[STOP_MARKER],
+                           include_stop_str_in_output=True)
+        body, events = case.request(tag, payload)
+        if body is None:
+            continue
+        bodies[tag] = body
+        text = chat_content(body)
+        case.problems(tag + ':stop_string_included', include_cut_problems(text, base_text),
+                      {'content': clip(text)})
+        check_chat(case, tag, body, payload, 'stop', events)
+    identity(case, 'stream_matches_blocking', bodies.get('blocking'), bodies.get('stream'), CHAT_IDENTITY)
+
+
+def case_stop_empty(case, ctx):
+    for stops in ([''], ['Observation:', '']):
+        tag = 'chat-' + str(len(stops))
+        case.expect_status(tag, ctx.chat(TOKYO_PROMPT, stop=stops), 400)
+    case.expect_status('completions', ctx.completion(CMPL_PROMPT, stop=['']), 400, 'completions')
+    case.expect_status('chat-string', ctx.chat(TOKYO_PROMPT, stop=''), 400)
 
 
 def case_eos(case, ctx):
@@ -738,6 +828,26 @@ def case_seed(case, ctx):
     b = chat_reasoning(other) + '\x00' + chat_content(other)
     case.check('seeded:other_seed_differs', a != b, {'seed': SEED, 'other_seed': SEED + 1,
                                                      'other': clip(chat_content(other))})
+
+
+def case_responses_seed(case, ctx):
+    texts = []
+    for tag, seed in (('seeded-a', SEED), ('seeded-b', SEED), ('other-seed', SEED + 1)):
+        payload = ctx.responses(JOKE_PROMPT, 128, temperature=SAMPLE_TEMPERATURE, seed=seed)
+        body, _ = case.request(tag, payload, 'responses')
+        texts.append(None if body is None else
+                     (responses_text(body, 'reasoning'), responses_text(body)))
+    if any(text is None for text in texts):
+        case.check('seeded:identical_output', False, {'error': 'prerequisite response missing'})
+        case.check('seeded:other_seed_differs', False, {'error': 'prerequisite response missing'})
+        return
+    case.check('seeded:non_empty', bool(texts[0][1]), {'output_text': clip(texts[0][1])})
+    case.check('seeded:identical_output', texts[0] == texts[1],
+               {'first_char_divergence': first_divergence(texts[0][1], texts[1][1]),
+                'a': clip(texts[0][1]), 'b': clip(texts[1][1])})
+    # Control: a server that ignores temperature passes identity vacuously.
+    case.check('seeded:other_seed_differs', texts[0] != texts[2],
+               {'seed': SEED, 'other_seed': SEED + 1, 'other': clip(texts[2][1])})
 
 
 def case_seed_json_schema(case, ctx):
@@ -982,6 +1092,10 @@ register('completions-length', 'openai-completions', 'legacy completions finish 
 register('stop-string', 'stop', 'multi-token stop string ends generation at the match (blocking + SSE)',
          case_stop_string)
 register('stop-token-ids', 'stop', 'stop_token_ids ends generation at the chosen token', case_stop_token_ids)
+register('stop-include', 'stop', 'include_stop_str_in_output keeps the matched stop string (blocking + SSE)',
+         case_stop_include)
+register('stop-empty', 'stop', 'an empty stop string is rejected with 400 (chat + completions)',
+         case_stop_empty)
 register('eos', 'stop', 'natural EOS: finish stop before max_tokens, no leaked specials', case_eos)
 register('messages-end-turn', 'anthropic', 'Messages blocking + SSE event order, end_turn, usage',
          case_messages_end_turn)
@@ -989,6 +1103,8 @@ register('messages-max-tokens', 'anthropic', 'Messages stop_reason max_tokens', 
 register('messages-stop-sequence', 'anthropic', 'Messages stop_sequence echoed, text cut at the match',
          case_messages_stop_sequence)
 register('seed', 'seed', 'same seed + temperature twice: identical first token and text', case_seed)
+register('responses-seed', 'seed', 'Responses API: same seed twice identical, other seed differs',
+         case_responses_seed)
 register('seed-json-schema', 'seed', 'seeded repeat under json_schema', case_seed_json_schema)
 register('structured-json-schema', 'structured', 'json_schema output parses, validates, exact values',
          case_structured_json_schema)

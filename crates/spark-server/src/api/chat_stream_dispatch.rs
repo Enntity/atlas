@@ -120,6 +120,7 @@ pub(super) async fn dispatch_streaming(
         top_logprobs,
         timeout_at,
         stop_strings,
+        req.include_stop_str_in_output,
         req_return_token_ids,
         ctx_for_stream,
         dump_seq,

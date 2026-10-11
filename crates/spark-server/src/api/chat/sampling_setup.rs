@@ -333,7 +333,13 @@ pub(super) fn build_sampling(
     // parity: generation continues past a closed call until natural EOS so
     // the model can emit parallel calls; the scheduler's tool watchdogs
     // (post-completion open cap, prose budget, loop detectors) bound run-on.
-    let stop_tokens = tokenize_stop_sequences(&state.tokenizer, &req.stop);
+    // Client `stop_token_ids` join the single-token stop strings: both end
+    // the sequence as an EOS-set token (vLLM `check_stop` stop_token_ids
+    // branch: generated, counted, finish "stop", text not detokenized).
+    let stop_tokens = super::super::stop_match::merge_stop_token_ids(
+        tokenize_stop_sequences(&state.tokenizer, &req.stop),
+        &req.stop_token_ids,
+    );
 
     // Tool-choice + parser-driven required mode.
     let tool_choice_required = tool_choice_required_for_parser(

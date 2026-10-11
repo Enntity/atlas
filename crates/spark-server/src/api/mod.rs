@@ -34,6 +34,7 @@ mod chat_blocking_choice;
 pub mod chat_phases;
 pub mod chat_stream;
 pub mod chat_stream_dispatch;
+mod choice_seed;
 pub mod compact;
 mod completion_text;
 pub mod completions;

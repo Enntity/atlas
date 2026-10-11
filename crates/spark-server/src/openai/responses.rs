@@ -31,6 +31,11 @@ pub struct ResponsesRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// Deterministic-sampling seed (vLLM `ResponsesRequest.seed`,
+    /// `entrypoints/openai/responses/protocol.py:283`, passed to sampling at
+    /// :445). Same type and semantics as the chat `seed`.
+    #[serde(default)]
+    pub seed: Option<u64>,
     #[serde(default)]
     pub stream: bool,
     /// Raw tool list. Parsed lazily in `lower_responses_to_chat` so

@@ -508,14 +508,21 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
     // without spinning up a full `StreamCtx`.
     if !ctx.stop_strings.is_empty() && !state.stop_string_triggered {
         let matched_stop;
+        // vLLM min_tokens: this token's text cannot complete a stop string
+        // while it is within the first `min_tokens` (`generated_tokens`
+        // counts reasoning tokens too, like vLLM's output count).
+        let below_min_tokens = state.generated_tokens <= ctx.min_tokens;
         (delta, matched_stop) = apply_stop_string_holdback(
             &delta,
-            &ctx.stop_strings,
-            ctx.stop_string_buffer_len,
-            &mut state.accumulated_content,
-            &mut state.stop_string_emitted_len,
-            &mut state.stop_string_triggered,
+            below_min_tokens,
+            crate::api::stop_match::HoldbackParams {
+                stops: &ctx.stop_strings,
+                buffer_len: ctx.stop_string_buffer_len,
+                include_stop_str: ctx.include_stop_str,
+            },
+            &mut state.stop_holdback,
         );
+        state.stop_string_triggered = state.stop_holdback.triggered;
         // Entry was gated on `!triggered`, so a flip here is a GENUINE
         // client stop-sequence match (the watchdog paths set the flag
         // elsewhere): record it for the wire finish_reason ("stop", per
@@ -722,168 +729,6 @@ fn detector_content_arm(state: &mut StreamState, ctx: &StreamCtx, text: &str) ->
 // The hold-back algorithm lives with the shared matcher so the legacy
 // `/v1/completions` stream uses the identical implementation.
 pub(super) use crate::api::stop_match::apply_stop_string_holdback;
-
-#[cfg(test)]
-mod stop_string_holdback_tests {
-    use super::apply_stop_string_holdback;
-
-    /// Stop string spanning a chunk boundary must not leak the
-    /// partial prefix in the first delta. When the suffix arrives in
-    /// the next chunk the full output up to (but excluding) the stop
-    /// string is emitted; the stop literal itself is consumed.
-    #[test]
-    fn stop_string_spanning_chunk_boundary_does_not_leak() {
-        let stops = vec!["<|im_start|>".to_string()];
-        let buffer_len = "<|im_start|>".len() - 1; // 11
-        let mut acc = String::new();
-        let mut emitted = 0usize;
-        let mut triggered = false;
-
-        // Delta 1: "hello " — entirely inside the hold-back window
-        // (6 bytes < buffer_len=11). Nothing emitted.
-        let (out, _matched) = apply_stop_string_holdback(
-            "hello ",
-            &stops,
-            buffer_len,
-            &mut acc,
-            &mut emitted,
-            &mut triggered,
-        );
-        assert_eq!(out, "");
-        assert_eq!(acc, "hello ");
-        assert!(!triggered);
-
-        // Delta 2: "<|im_st" — partial stop string. acc="hello <|im_st"
-        // (len=13). raw_emit_end=13-11=2, so we emit "he".
-        // Crucially, "<|im_st" is HELD BACK — never sent to client.
-        let (out, _matched) = apply_stop_string_holdback(
-            "<|im_st",
-            &stops,
-            buffer_len,
-            &mut acc,
-            &mut emitted,
-            &mut triggered,
-        );
-        assert_eq!(out, "he");
-        assert!(!out.contains("<|im_st"), "partial stop leaked to client");
-        assert!(!triggered);
-
-        // Delta 3: "art|>" completes the stop string. We match at
-        // pos=6, truncate acc to "hello ", and emit "llo " (bytes
-        // 2..6 of acc).
-        let (out, _matched) = apply_stop_string_holdback(
-            "art|>",
-            &stops,
-            buffer_len,
-            &mut acc,
-            &mut emitted,
-            &mut triggered,
-        );
-        assert_eq!(out, "llo ");
-        assert_eq!(acc, "hello ");
-        assert!(triggered);
-
-        // Concatenating all emitted deltas yields the pre-stop output
-        // ("hello ") with the stop literal consumed. No partial leak.
-        let total = String::new() + "" + "he" + "llo ";
-        assert_eq!(total, "hello ");
-        assert!(!total.contains("<|im_st"));
-        assert!(!total.contains("<|im_start|>"));
-    }
-
-    /// When no stop strings are configured, `buffer_len=0` and the
-    /// hold-back collapses to a pass-through: every byte of every
-    /// delta is emitted immediately.
-    #[test]
-    fn no_stop_strings_is_zero_behavior_change() {
-        let stops: Vec<String> = Vec::new();
-        let buffer_len = 0usize;
-        let mut acc = String::new();
-        let mut emitted = 0usize;
-        let mut triggered = false;
-
-        let (out, _matched) = apply_stop_string_holdback(
-            "hello ",
-            &stops,
-            buffer_len,
-            &mut acc,
-            &mut emitted,
-            &mut triggered,
-        );
-        assert_eq!(out, "hello ");
-        assert!(!triggered);
-
-        let (out, _matched) = apply_stop_string_holdback(
-            "world",
-            &stops,
-            buffer_len,
-            &mut acc,
-            &mut emitted,
-            &mut triggered,
-        );
-        assert_eq!(out, "world");
-        assert!(!triggered);
-
-        // Even a string that LOOKS like a stop marker is forwarded
-        // verbatim because no stop strings are configured.
-        let (out, _matched) = apply_stop_string_holdback(
-            "<|im_start|>",
-            &stops,
-            buffer_len,
-            &mut acc,
-            &mut emitted,
-            &mut triggered,
-        );
-        assert_eq!(out, "<|im_start|>");
-        assert!(!triggered);
-    }
-
-    /// Two stops in one delta: the one that COMPLETES first wins even if
-    /// another starts earlier (vLLM check_stop_strings). The old
-    /// earliest-START scan picked "abcd" here.
-    #[test]
-    fn earliest_completion_wins_within_one_delta() {
-        let stops = vec!["abcd".to_string(), "bc".to_string()];
-        let mut acc = String::new();
-        let mut emitted = 0usize;
-        let mut triggered = false;
-        let (out, matched) =
-            apply_stop_string_holdback("xabcd", &stops, 3, &mut acc, &mut emitted, &mut triggered);
-        assert!(triggered);
-        assert_eq!(matched.as_deref(), Some("bc"));
-        assert_eq!(out, "xa");
-    }
-
-    /// Multi-byte UTF-8 inside the hold-back window must never be
-    /// sliced mid-codepoint. `floor_char_boundary` snaps the cut to a
-    /// valid boundary so the emitted prefix is always valid `str`.
-    #[test]
-    fn utf8_boundary_safety_in_holdback() {
-        // "é" is 2 bytes (0xC3 0xA9). Build an accumulator whose
-        // raw cut would land inside the codepoint and verify
-        // floor_char_boundary saves us.
-        let stops = vec!["STOP".to_string()];
-        let buffer_len = 3usize; // > 0 to exercise the hold-back
-        let mut acc = String::new();
-        let mut emitted = 0usize;
-        let mut triggered = false;
-
-        // acc becomes "aébc" (5 bytes). raw_emit_end = 5-3 = 2 lands
-        // mid-codepoint of 'é' (1..3). floor_char_boundary snaps to
-        // 1, so we emit "a" only.
-        let (out, _matched) = apply_stop_string_holdback(
-            "aébc",
-            &stops,
-            buffer_len,
-            &mut acc,
-            &mut emitted,
-            &mut triggered,
-        );
-        assert_eq!(out, "a");
-        assert!(out.is_char_boundary(out.len()));
-        assert!(!triggered);
-    }
-}
 
 #[cfg(test)]
 mod role_literal_strip_tests {

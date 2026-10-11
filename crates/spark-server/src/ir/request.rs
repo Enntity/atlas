@@ -31,6 +31,12 @@ pub struct ChatRequest {
     pub ignore_eos: bool,
     /// Stop sequences (generation halts when one is produced).
     pub stop: Vec<String>,
+    /// Client stop token ids (vLLM `stop_token_ids`); empty = none. Merged
+    /// into the scheduler's EOS set at sampling setup.
+    pub stop_token_ids: Vec<u32>,
+    /// vLLM `include_stop_str_in_output`: keep the matched stop string (and
+    /// a client stop token's text) in the output.
+    pub include_stop_str_in_output: bool,
     pub stream: bool,
     /// Number of choices (>1 only reachable from the OpenAI surface;
     /// other adapters pin 1).

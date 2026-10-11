@@ -64,6 +64,18 @@ pub(super) fn validate_input(req: &ChatRequest) -> Result<(), Response> {
             None,
         ));
     }
+    // Every chat surface (OpenAI, Responses, Anthropic `stop_sequences`)
+    // lowers into this envelope, so one check covers them all.
+    if let Err((param, msg)) =
+        super::stop_match::validate_stop_params(&req.stop, req.min_tokens, req.max_tokens)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            msg,
+            Some(param),
+            None,
+        ));
+    }
     // OpenAI spec bounds n to 1-128; an unbounded n would drive both an
     // attacker-controlled allocation (Vec::with_capacity(n)) and an
     // unbounded sequential-inference loop in the blocking path. Fail fast

@@ -109,6 +109,8 @@ class Fake:
 
     def rng(self, payload):
         seed = payload.get('seed')
+        if self.has('responses-drop-seed') and 'input' in payload:
+            seed = None
         with self.lock:
             self.samples += 1
             counter = self.samples
@@ -143,7 +145,10 @@ class Fake:
             hits = [s for s in stops if s in text]
             if kind == 'c' and hits:
                 matched = min(hits, key=text.find)
-                cut, finish = text[:text.find(matched)], 'stop'
+                end = text.find(matched)
+                if payload.get('include_stop_str_in_output') and not self.has('exclude-stop-str'):
+                    end += len(matched)
+                cut, finish = text[:end], 'stop'
                 break
         else:
             if len(out) < max_tokens:
@@ -262,12 +267,35 @@ class Fake:
             parts[-2], parts[-1] = parts[-1], parts[-2]
         return 'text/event-stream', parts
 
+    def responses(self, payload, result):
+        content = [{'type': 'output_text', 'text': ''.join(result['content']), 'annotations': []}]
+        output = [{'type': 'message', 'id': 'msg_fake', 'role': 'assistant', 'status': 'completed',
+                   'content': content}]
+        if result['reasoning']:
+            output.insert(0, {'type': 'reasoning', 'id': 'rs_fake', 'summary': [],
+                              'content': [{'type': 'reasoning_text', 'text': ''.join(result['reasoning'])}]})
+        return 'application/json', [json.dumps({
+            'id': 'resp_fake', 'object': 'response', 'status': 'completed', 'model': payload['model'],
+            'output': output, 'usage': {'input_tokens': 4, 'output_tokens': result['count']}})]
+
     # ---- dispatch --------------------------------------------------------
     def post(self, path, payload):
         """Returns (status, content_type, body parts, per-part delay)."""
         if self.has('wedge') and self.interrupted:
             return 500, 'application/json', [json.dumps({'error': 'scheduler wedged'})], 0
+        stops = payload.get('stop')
+        stops = [stops] if isinstance(stops, str) else stops or []
+        if '' in stops and not self.has('accept-empty-stop'):
+            return 400, 'application/json', [json.dumps({'error': {
+                'message': 'stop cannot contain an empty string.', 'type': 'BadRequestError'}})], 0
         stream = bool(payload.get('stream'))
+        if path == '/v1/responses':
+            spec = self.respond(payload, payload['input'], [], False)
+            if spec is None:
+                return 400, 'application/json', [json.dumps({'error': 'unknown fake prompt'})], 0
+            result = self.run({**payload, 'max_tokens': payload['max_output_tokens']}, *spec, stream)
+            kind, parts = self.responses(payload, result)
+            return 200, kind, parts, 0
         if path == '/v1/completions':
             prompt = payload['prompt']
             text = {q3.CMPL_PROMPT: ' Paris. It is also the largest city',
@@ -410,6 +438,15 @@ FAULTS = [
     ('trim-stop', 'stop-string', 'blocking:fewer_tokens_than_baseline'),
     ('stream-stop-leak', 'stop-string', 'stream:stopped_at_match'),
     ('stream-stop-leak', 'stop-string', 'stream_matches_blocking'),
+    ('exclude-stop-str', 'stop-include', 'blocking:stop_string_included'),
+    ('exclude-stop-str', 'stop-include', 'stream:stop_string_included'),
+    ('stream-stop-leak', 'stop-include', 'stream:stop_string_included'),
+    ('accept-empty-stop', 'stop-empty', 'chat-1:rejected_400'),
+    ('accept-empty-stop', 'stop-empty', 'chat-2:rejected_400'),
+    ('accept-empty-stop', 'stop-empty', 'completions:rejected_400'),
+    ('accept-empty-stop', 'stop-empty', 'chat-string:rejected_400'),
+    ('responses-drop-seed', 'responses-seed', 'seeded:identical_output'),
+    ('greedy-sampling', 'responses-seed', 'seeded:other_seed_differs'),
     ('ignore-stop-ids', 'stop-token-ids', 'stopped:completion_tokens'),
     ('ignore-stop-ids', 'stop-token-ids', 'stopped:content_truncated'),
     ('no-token-ids', 'stop-token-ids', 'baseline:token_ids_exposed'),
@@ -588,6 +625,26 @@ class PureCheckTests(unittest.TestCase):
         self.assertTrue(q3.stop_cut_problems(base, base))
         self.assertTrue(q3.stop_cut_problems('Thought: check', base))
         self.assertTrue(q3.stop_cut_problems('Thought: check the weather\n', 'Thought: no marker'))
+
+    def test_include_cut(self):
+        base = 'Thought: check the weather\nObservation: sunny and 21 C\nFinal: it is sunny'
+        self.assertEqual(q3.include_cut_problems('Thought: check the weather\nObservation:', base), [])
+        self.assertTrue(q3.include_cut_problems('Thought: check the weather\n', base))  # stop cut off
+        self.assertTrue(q3.include_cut_problems(base, base))  # ran past the stop
+        self.assertTrue(q3.include_cut_problems('Thought:  check the weather\nObservation:', base))
+        self.assertTrue(q3.include_cut_problems('Observation: Observation:', None))
+
+    def test_responses_text(self):
+        body = {'output': [
+            {'type': 'reasoning', 'summary': [{'type': 'summary_text', 'text': 's'}],
+             'content': [{'type': 'reasoning_text', 'text': 'r'}]},
+            {'type': 'message', 'content': [{'type': 'output_text', 'text': 'a'},
+                                            {'type': 'refusal', 'refusal': 'x'},
+                                            {'type': 'output_text', 'text': 'b'}]}]}
+        self.assertEqual(q3.responses_text(body), 'ab')
+        self.assertEqual(q3.responses_text(body, 'reasoning'), 'sr')
+        self.assertEqual(q3.responses_text({'output': None}), '')
+        self.assertEqual(q3.responses_text(None), '')
 
     def test_message_event_order(self):
         body = {'id': 'msg_1', 'type': 'message', 'role': 'assistant', 'model': 'm',

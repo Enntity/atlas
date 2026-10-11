@@ -182,7 +182,15 @@ pub async fn completions(
             format!("n must be between 1 and 128, got {}", req.n),
         );
     }
-    let stop_tokens = tokenize_stop_sequences(&state.tokenizer, &req.stop);
+    if let Err((param, msg)) =
+        super::stop_match::validate_stop_params(&req.stop, req.min_tokens, req.max_tokens)
+    {
+        return openai_error_response_with_param(StatusCode::BAD_REQUEST, msg, Some(param), None);
+    }
+    let stop_tokens = super::stop_match::merge_stop_token_ids(
+        tokenize_stop_sequences(&state.tokenizer, &req.stop),
+        req.stop_token_ids.as_deref().unwrap_or_default(),
+    );
     // OpenAI clamps chat top_logprobs to 20; same bound here (spec says
     // 5 for legacy — being more permissive, never less).
     let logprobs_k = req.logprobs.map(|k| k.min(20));
@@ -306,7 +314,13 @@ pub(super) async fn completions_stream(
     // Client stop strings: same hold-back + matcher as the chat stream
     // (`stop_match::apply_stop_string_holdback`). A match flips the cancel
     // flag so the scheduler stops generating at the next checkpoint.
-    let mut stop_holdback = super::stop_match::StopHoldback::new(req.stop.clone());
+    let mut stop_holdback = super::stop_match::StopHoldback::new(
+        req.stop.clone(),
+        req.min_tokens,
+        req.include_stop_str_in_output,
+    );
+    let include_stop_str = req.include_stop_str_in_output;
+    let client_stop_tokens = p.stop_tokens.clone();
     let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stream_cancel = cancel_flag.clone();
 
@@ -322,7 +336,7 @@ pub(super) async fn completions_stream(
         early_stopping: p.early_stopping,
         image_pixels: Vec::new(),
         max_tokens: req.max_tokens,
-        min_tokens: 0,
+        min_tokens: req.min_tokens,
         ignore_eos: req.ignore_eos,
         temperature: p.temperature,
         top_k: p.top_k,
@@ -444,13 +458,26 @@ pub(super) async fn completions_stream(
                 cached_prompt_tokens,
                 accepted_prediction_tokens,
                 guard_stop: _,
-                stop_token_id: _,
+                stop_token_id,
             } => {
+                // `include_stop_str_in_output`: the client stop token that
+                // ended the stream (never sent as a Token) is output text.
+                let mut events = Vec::new();
+                let stop_text = super::stop_match::included_stop_token(
+                    include_stop_str,
+                    stop_token_id,
+                    &client_stop_tokens,
+                )
+                .filter(|_| !stop_holdback.triggered())
+                .map(|id| {
+                    let decode = |ids: &[u32]| state.tokenizer.decode(ids).unwrap_or_default();
+                    stop_holdback.push(&super::stop_match::token_text_after(decode, &all_toks, id))
+                })
+                .unwrap_or_default();
                 // Release the hold-back tail when no stop matched (vLLM
                 // flushes it at finish); a match always reports "stop", even
                 // on the last budgeted token (output_processor.py:657-661).
-                let mut events = Vec::new();
-                let tail = stop_holdback.finish();
+                let tail = stop_text + &stop_holdback.finish();
                 if !tail.is_empty() {
                     let chunk = CompletionChunk::text_chunk(&model, &id, tail);
                     events

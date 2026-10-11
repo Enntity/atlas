@@ -95,6 +95,7 @@ pub(crate) async fn run_chat_stream(
     top_logprobs: Option<u8>,
     timeout_at: Option<std::time::Instant>,
     stop_strings: Vec<String>,
+    include_stop_str: bool,
     req_return_token_ids: bool,
     req_ctx: Option<crate::rate_limiter::RequestContext>,
     dump_seq: Option<u64>,
@@ -126,6 +127,7 @@ pub(crate) async fn run_chat_stream(
     let prompt_tokens = std::sync::Arc::new(prompt_tokens);
     let prompt_tokens_for_retry = prompt_tokens.clone();
     let grammar_spec_for_retry = grammar_spec.clone();
+    let client_stop_tokens = stop_tokens.clone();
     let request = InferenceRequest::Streaming {
         prompt_tokens,
         session_hash,
@@ -204,12 +206,8 @@ pub(crate) async fn run_chat_stream(
     // client before the suffix arrives. Zero when no stop strings are
     // configured (preserves the existing pass-through behaviour for
     // requests without `stop`).
-    let stop_string_buffer_len: usize = stop_strings
-        .iter()
-        .map(|s| s.len())
-        .max()
-        .map(|m| m.saturating_sub(1))
-        .unwrap_or(0);
+    let stop_string_buffer_len =
+        crate::api::stop_match::holdback_len(&stop_strings, include_stop_str);
 
     let prompt_vocab: Arc<std::collections::HashSet<String>> =
         Arc::new(std::collections::HashSet::new());
@@ -227,6 +225,8 @@ pub(crate) async fn run_chat_stream(
             &stop_strings,
         ),
         stop_strings,
+        client_stop_tokens,
+        include_stop_str,
         stop_string_buffer_len,
         leak_markers,
         role_literal_leaks: state
@@ -317,6 +317,22 @@ pub(crate) async fn run_chat_stream(
                 // flags survived, which is the built-in negative control:
                 // only this field was reset.
                 stream_state.guard_stop = stream_state.guard_stop.or(guard_stop);
+                // `include_stop_str_in_output`: a client stop token's text is
+                // output (vLLM detokenizes the stop token); never after a
+                // stop-string cut or a guard already ended the content.
+                if !stream_state.stop_string_triggered
+                    && let Some(id) = crate::api::stop_match::included_stop_token(
+                        ctx.include_stop_str,
+                        stop_token_id,
+                        &ctx.client_stop_tokens,
+                    )
+                {
+                    stream_state.stop_token_text = Some(crate::api::stop_match::token_text_after(
+                        |ids: &[u32]| ctx.state.tokenizer.decode(ids).unwrap_or_default(),
+                        &stream_state.all_toks,
+                        id,
+                    ));
+                }
                 handle_done::handle_done(
                     &mut stream_state,
                     &ctx,

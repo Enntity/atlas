@@ -235,6 +235,8 @@ fn stream_tokens_with_context(
         cwd_for_normalize: None,
         stop_strings: vec![],
         single_token_stops: vec![],
+        client_stop_tokens: vec![],
+        include_stop_str: false,
         tool_retry_enabled: false,
         prompt_tokens: Arc::new(vec![13]),
         prompt_vocab: Arc::default(),
