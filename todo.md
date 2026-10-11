@@ -1,11 +1,16 @@
 # GLM-5.3 EXL3 — remaining high performance inference work
 
-Updated 2026-10-11 05:30 UTC. `cand-fp8decode02` collection complete (short16
-16/16, long 16/16). Q0 final-image smoke passed. First fresh batch died on ref03
-(reference provenance finalizer); fixed, batch 2 (ref04–ref12, held-out ref13,
-cand03, candkda0) running since 06:21 UTC — see
-[continue.md](continue.md) for live process details. Latest code is `4b49a9c4`
-(docs at `88a4332f`); GPU image pinned to `fb4f4b41`.
+Updated 2026-10-11 16:47 UTC. **Q2 statistical gate: candidate FAILS** (9 fresh
+references; held-out reference also fails one row) — see [continue.md](continue.md).
+Merged seed/stop/API code now has a clean rebuilt-image neutrality pass on all
+32 frozen cases (`cand-merged-e333-01`). Its focused Q3 run exposed a genuine
+first-thinking-token grammar bug; fixed in `19551fc6`, with real production
+sampler CPU red/green evidence. Clean image source `ee5eaf0f` has full short16 byte
+neutrality and 6/16 matching long rows. Work stopped at user request; both
+Sparks are stopped. Full corrected-image long neutrality and focused Q3 rerun
+remain pending; preserve the incomplete `cand-grammar-ee5e-01` attempt.
+Q4 and F2/F3 harnesses remain GPU-unvalidated. R2 records remain unmerged on
+`pi/r2records-20261011` (benchmark boundary edits invalidate required records).
 Original roadmap review was against `11671adf`. Native TP=2 / EP=1 boot and generation
 are achieved. Full numerical qualification, a repeated performance baseline,
 and the expanded serving features below remain open. This is the authoritative
@@ -103,10 +108,14 @@ to the source and profile that passed.
   **Candidate run 1 (`cand-fp8decode02`) collection complete** at 05:11 UTC:
   short16 16/16, long 16/16, manifests present. Evidence archived to
   `statistical-gate-20261011/cand-fp8decode02/`.
-  **Batch 2 running since 06:21 UTC:** 9 references (ref04–ref12) +
-  held-out (ref13) + candidate run 2 (cand03) + `ATLAS_KDA_FLA_REFERENCE=0`
-  control (candkda0). The 05:29 batch died on ref03 provenance finalization
-  (see continue.md); ref03 is burned, its evidence in `failed-ref03/`.
+  **Batch 2 completed 08:47 UTC — gate FAILS:** candidate T 7.20 vs refs
+  ≤5.53 (p=0.1) with 3 catastrophic short16 `longer` rows; cand03 byte-identical
+  to cand02; candkda0 (MDE) T 7.68; held-out ref13 fails one row (reference
+  bimodality at short16 `longer` row 0). Reports in
+  `statistical-gate-20261011/final/`. Next: user decision between
+  reference-faithful multi-key MLA FP8 numerics and a re-designed gate. The
+  semantic must-fail knobs now exist (`ATLAS_EXL3_GATE_PERTURBATION`, merged,
+  GPU-untested) and need a rebuilt image to run.
   Both-rank failure logs and raw evidence are preserved in
   `statistical-gate-20261011/resume-diag01/`. The earlier ref01/ref02 enabled
   intermediate tensor captures and are diagnostic only. A collector-only
@@ -127,20 +136,26 @@ to the source and profile that passed.
   missing surfaces. **Done when:** behavior receipts and assertions pass without
   leaked state or protocol drift; fix Atlas failures
   even when the reference also fails its own behavior suite.
-  *Status 2026-10-11:* `4b49a9c4` repairs OpenAI streamed chat usage ordering:
-  finish chunk, then usage-only chunk. The old order fails the regression;
-  all five production encoder tests pass in an isolated CPU harness with exact
-  production wire-type extracts. Server test compilation passes. Full server
-  unit-test linking is unavailable locally without CUDA/NCCL. The current GPU
-  image predates this separate API commit; rebuilt-image live Q3 validation
-  remains owed.
-  Read-only audit also confirmed first-token seed omission: prefill calls
-  `sample_first_token` without the request seed; `sample_step.rs` builds
-  `SamplingParams` with `seed: None`. Thread the explicit seed through all
-  first-token routes and add a deterministic sampler regression before fixing.
-  Greedy gate requests are unaffected. Separately review the later-token RNG
-  being reinitialized from the same seed on every call. Neither seed issue has
-  been changed. Multi-token stop and Anthropic stop-sequence fixes remain open.
+  *Status 2026-10-11 16:47 UTC:* first-token/grammar/n>1/MTP/Responses seed,
+  blocking/multi-token stops, token-ID stops, min_tokens, stop inclusion,
+  Anthropic stop mapping and the live harness are merged. `cand-merged-e333-01`
+  validates 11/15 focused live cases on the exact rebuilt image, including
+  seeded chat/Responses repeats, stop surfaces, streaming chat and Anthropic.
+  Its four preserved failures exposed two harness issues (timing metadata in
+  completion identity and a terminal EOS ID not exposed by design) and the
+  first-token grammar bug. `8334ab33` compares stable usage counters;
+  `ee5eaf0f` skips only unobservable terminal-ID verification, retaining wrong-ID
+  and counter-drift controls. `19551fc6` pauses first-token grammar while
+  reasoning, matching later decode and preserving template-forced thinking.
+  CPU regression reproduces consumed JSON opener before the fix and passes
+  afterward. At the user-requested stop, corrected-image short16 passes;
+  long is intentionally incomplete (6/16 matching rows). Corrected live Q3
+  has not started; resume with a fresh attempt after full neutrality.
+  Evidence: `merged-image-20261011-session2/` under the durable root in
+  continue.md. **Q3 remains open:** the full behavioral surface, tools,
+  reasoning budgets, multi-turn, cancellation/timeout recovery and explicit
+  skipped assertions still need qualification. Repeated-seed identity alone
+  does not validate later-token RNG independence.
 
 - [ ] **Q4 — Protect task quality beyond reference parity.** Freeze a held-out
   corpus with objective checks for arithmetic, executable code, exact tool

@@ -215,7 +215,12 @@ class Fake:
                                                  'function': {'name': call['function']['name'],
                                                               'arguments': arguments[:4]}}]}))
             events.append(chunk({'tool_calls': [{'index': index, 'function': {'arguments': arguments[4:]}}]}))
-        finish = chunk({}, result['finish'], result['tail'])
+        tail = result['tail']
+        if tail == [EOS] and self.has('hidden-eos-id'):
+            tail = []  # counted by the scheduler but not sent as a Token event
+        if tail == [EOS] and self.has('wrong-eos-id'):
+            tail = [EOS + 1]  # complete ID coverage exposes a wrong terminal ID
+        finish = chunk({}, result['finish'], tail)
         usage_chunk = {'id': 'chatcmpl-fake', 'object': 'chat.completion.chunk', 'model': model,
                        'choices': [], 'usage': usage}
         events += [usage_chunk, finish] if self.has('usage-first') else [finish, usage_chunk]
@@ -223,6 +228,12 @@ class Fake:
 
     def completion(self, payload, result):
         model, usage = payload['model'], self.usage(payload['prompt'], result)
+        if self.has('usage-timing'):
+            usage.update({'time_to_first_token_ms': 2.0 if payload.get('stream') else 1.0,
+                          'response_token/s': 4.0 if payload.get('stream') else 3.0})
+        if self.has('usage-prompt-drift') and payload.get('stream'):
+            usage['prompt_tokens'] += 1
+            usage['total_tokens'] += 1
         text = ''.join(result['content'])
         if not payload.get('stream'):
             return 'application/json', [json.dumps({
@@ -434,6 +445,8 @@ FAULTS = [
     ('usage-first', 'completions-basic', 'stream:usage_chunk_last'),
     ('ignore-stop', 'completions-basic', 'blocking:text'),
     ('short-length', 'completions-length', 'stream:max_tokens_consumed'),
+    ('usage-prompt-drift', 'completions-basic', 'stream_matches_blocking'),
+    ('usage-prompt-drift', 'completions-length', 'stream_matches_blocking'),
     ('trim-stop', 'stop-string', 'blocking:stopped_at_match'),
     ('trim-stop', 'stop-string', 'blocking:fewer_tokens_than_baseline'),
     ('stream-stop-leak', 'stop-string', 'stream:stopped_at_match'),
@@ -451,6 +464,7 @@ FAULTS = [
     ('ignore-stop-ids', 'stop-token-ids', 'stopped:content_truncated'),
     ('no-token-ids', 'stop-token-ids', 'baseline:token_ids_exposed'),
     ('eos-leak', 'eos', 'stream:no_special_tokens'),
+    ('wrong-eos-id', 'eos', 'stream:last_token_is_eos'),
     ('wrong-answer', 'messages-end-turn', 'blocking:text'),
     ('msg-order', 'messages-end-turn', 'stream:event_order'),
     ('msg-length-end-turn', 'messages-max-tokens', 'blocking:stop_reason'),
@@ -525,11 +539,22 @@ class SuiteAgainstFakeTests(unittest.TestCase):
         # input_tokens only in message_start, and streamed tool arguments with
         # different whitespace, are both contract-conformant.
         for mode, cases in (('msg-start-usage', ['messages-end-turn', 'messages-stop-sequence']),
-                            ('args-spacing', ['tools-single', 'tools-parallel'])):
+                            ('args-spacing', ['tools-single', 'tools-parallel']),
+                            ('usage-timing', ['completions-basic', 'completions-length'])):
             _, receipts = run(mode, cases)
             for case in cases:
                 with self.subTest(mode=mode, case=case):
                     self.assertTrue(receipts[case]['passed'], receipts[case]['failed_assertions'])
+
+    def test_hidden_terminal_eos_id_is_explicitly_untested(self):
+        _, receipts = run('hidden-eos-id', ['eos'])
+        receipt = receipts['eos']
+        self.assertTrue(receipt['passed'], receipt['failed_assertions'])
+        assertion = next(a for a in receipt['assertions']
+                         if a['assertion'] == 'stream:last_token_is_eos')
+        self.assertEqual(assertion['status'], 'skipped')
+        self.assertIn('terminal sampled ID', str(assertion['evidence']))
+        self.assertIn('stream:last_token_is_eos', receipt['skipped_assertions'])
 
     def test_duplicate_only_names_run_once(self):
         summary, _ = run('ok', ['chat-basic', 'chat-basic'])

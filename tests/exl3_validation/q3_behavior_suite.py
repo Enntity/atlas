@@ -577,7 +577,7 @@ def case_completions_basic(case, ctx):
                    {'expected': CMPL_ANSWER + ' without ' + repr(CMPL_STOP), 'text': clip(text)})
         check_completion(case, tag, body, payload, 'stop', events)
     identity(case, 'stream_matches_blocking', bodies.get('blocking'), bodies.get('stream'),
-             {'text': completion_text, 'finish': chat_finish, 'usage': lambda b: b.get('usage')})
+             {'text': completion_text, 'finish': chat_finish, 'usage': CHAT_IDENTITY['usage']})
 
 
 def case_completions_length(case, ctx):
@@ -595,7 +595,7 @@ def case_completions_length(case, ctx):
                    {'text': clip(completion_text(body))})
         check_completion(case, tag, body, payload, 'length', events)
     identity(case, 'stream_matches_blocking', bodies.get('blocking'), bodies.get('stream'),
-             {'text': completion_text, 'finish': chat_finish, 'usage': lambda b: b.get('usage')})
+             {'text': completion_text, 'finish': chat_finish, 'usage': CHAT_IDENTITY['usage']})
 
 
 def case_stop_string(case, ctx):
@@ -704,9 +704,15 @@ def case_eos(case, ctx):
         case.skip('stream:last_token_is_eos', 'no --eos-token-id given')
     elif ids is None:
         case.skip('stream:last_token_is_eos', 'server exposed no token_ids')
+    elif type(completion) is int and len(ids) < completion:
+        case.skip('stream:last_token_is_eos',
+                  'terminal sampled ID cannot be verified: stream carries %d IDs for %d completion tokens'
+                  % (len(ids), completion))
     else:
-        case.check('stream:last_token_is_eos', bool(ids) and ids[-1] in ctx.eos_token_ids,
-                   {'last_ids': ids[-3:], 'eos_token_ids': list(ctx.eos_token_ids)})
+        case.check('stream:last_token_is_eos',
+                   len(ids) == completion and bool(ids) and ids[-1] in ctx.eos_token_ids,
+                   {'last_ids': ids[-3:], 'eos_token_ids': list(ctx.eos_token_ids),
+                    'exposed_token_ids': len(ids), 'completion_tokens': completion})
 
 
 def case_messages_end_turn(case, ctx):

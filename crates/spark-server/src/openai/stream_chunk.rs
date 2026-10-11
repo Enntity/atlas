@@ -318,9 +318,9 @@ impl ChatCompletionChunk {
 
     /// `return_token_ids`: stamp the exact sampled token IDs onto this
     /// chunk's first choice. No-op when `ids` is empty, so requests that
-    /// did not opt in keep a byte-identical wire format. Summed across a
-    /// stream, the stamped IDs equal `usage.completion_tokens` — a
-    /// benchmark can count them instead of re-tokenizing decoded text.
+    /// did not opt in keep a byte-identical wire format. The IDs cover tokens
+    /// delivered to the stream; terminal EOS is counted in completion usage
+    /// but is not delivered, and rejected output can also omit IDs.
     pub(crate) fn with_token_ids(mut self, ids: Vec<u32>) -> Self {
         if !ids.is_empty()
             && let Some(choice) = self.choices.first_mut()

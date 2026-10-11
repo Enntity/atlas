@@ -90,8 +90,8 @@ fn delta_to_payloads(d: &StreamDelta, model: &str, id: &str, include_usage: bool
                 // OpenAI `stream_options.include_usage=true` framing:
                 // the usage-only chunk (`choices: []`) follows the
                 // `finish_reason` chunk (usage omitted). Residual token
-                // ids ride the finish chunk, keeping
-                // Σ token_ids == completion_tokens.
+                // ids ride the finish chunk. Completion usage also counts
+                // terminal EOS tokens not delivered to the stream.
                 vec![
                     chunk_json(
                         ChatCompletionChunk::final_chunk_no_usage(model, id, reason.as_wire())

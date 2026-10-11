@@ -62,8 +62,8 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream: bool,
     /// Emit exact sampled token IDs on each streamed chunk's
-    /// `choices[0].token_ids` (vLLM-compatible extension) for precise
-    /// `usage.completion_tokens` counting. Defaults false (opt-in).
+    /// `choices[0].token_ids` (vLLM-compatible extension). Terminal EOS
+    /// contributes to completion usage but is not streamed. Defaults false (opt-in).
     #[serde(default)]
     pub return_token_ids: bool,
     /// Enable chain-of-thought reasoning (Qwen3.5 thinking models).

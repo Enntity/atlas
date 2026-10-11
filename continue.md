@@ -1,8 +1,143 @@
 # GLM-5.3 EXL3 on two Sparks — continuation state
 
-Updated 2026-10-11 05:30 UTC. Resume from tag `checkpoint/fp8decode-20261011`
-on branch `sparkglm/installable-20260924`; latest implementation commit is
-`88a4332f` (docs checkpoint; `4b49a9c4` is the latest code change).
+**Stopped at user request 2026-10-11 16:47 UTC — durable restart checkpoint.**
+
+**Host state:** no running containers on either Spark. Production containers
+remain stopped. Validation `gate-cand-0/1` now contain the corrected `ee5eaf0f`
+image and are stopped. The older `e33340d9` engines are preserved as
+`gate-cand-0/1-preserved-before-ee5eaf0f`; the KDA controls remain
+`gate-cand-0/1-preserved-before-6f516e5a`. No image was published.
+
+Completed this session:
+
+- `e33340d9`: fixed the real CUDA production build failure by scoping the
+  test-only `StopDecodeFn` re-export with `cfg(test)`. Production/test compilation
+  and all 32 stop-matcher tests pass.
+- Clean no-cache `e33340d9` image on both ranks:
+  `atlas-exl3-validation:src-176780fd07e0-rust1.97.1` /
+  `sha256:ed8a38adbc2813d9524cca3814be811a19aa0ca8958a3f6552a905b5e49643c0`.
+  `cand-merged-e333-01` completed **short16 16/16 + long 16/16**, perturbations
+  unset. Both complete NPZ archives, every F32 tensor byte and generated texts
+  match `cand-fp8decode02`; profile/checkpoint/collector/provenance checks pass.
+  A valid one-ULP mutation fails the comparator. **Merged-image arithmetic
+  neutrality passed; this is not Q2 qualification.**
+- Initial focused Q3 live run on that image passed **11/15**. The original raw
+  receipts and all four failures are preserved. `8334ab33` fixes completion
+  identity checks that compared variable timing metadata instead of stable
+  usage counters. `19551fc6` fixes a real server bug: first-token grammar
+  masking/advancement ran during template-forced thinking, consuming `{"`
+  in reasoning and omitting it from the final JSON answer. All admission routes
+  now pause grammar during initial thinking, matching later decode; template
+  thinking resolution is preserved. The actual production-sampler regression
+  fails before the fix and passes afterward on both fixture ranks/owners,
+  including a first-token `</think>` boundary.
+- `ee5eaf0f` corrects the EOS harness and stale token-ID comments: the exact
+  terminal EOS ID is **untested** when it is not exposed by the stream. Atlas
+  counts terminal EOS in completion usage without streaming its Token event.
+  Complete-ID wrong-EOS and usage-counter-drift negative controls still fail.
+- CPU verification: sampler fixture suite 5/5; full server **2568 pass / same
+  3 known failures / 12 ignored** in the stub-linked color-capable environment;
+  validation Python **274 pass + 193 subtests**. License headers, changed-file
+  Rust formatting/typos and current CI source-cap/allowlist checks pass.
+  Workspace fmt/clippy/typos fail in unchanged files (plus an existing user-owned
+  untracked plan); see `required-check-limitations.json`. These are CPU/stub
+  checks, not GPU serving proof.
+
+Current corrected image (already built cleanly and loaded on both hosts):
+
+- Source commit: `ee5eaf0f19370f0dc302565d46b834a88630afc8`.
+- Source archive SHA256:
+  `455b0da9f7cd7bab369593f212a13c43fa0ad7bc72bdeed5fbb075eb93f75a15`.
+- Tag: `atlas-exl3-validation:src-455b0da9f7cd-rust1.97.1`.
+- Image: `sha256:7270d7ca16f7896da09e78e4a68cbac56f0aac1749ea9f8c6c671370aa3b94a6`.
+- Server SHA256: `bde219ffbd2922b6cac535448861c8452fa93c388afaf7185cad983c8527005a`.
+- Rust 1.97.1; all 232 PTX hashes, compiler flags and toolchain records match
+  the prior rebuilt image. Both live-rank provenance finalization and cuBLAS
+  runtime-map attestation pass (CUDA runtime 13.0.48 / NCCL 2.32.3).
+
+**Attempt `cand-grammar-ee5e-01` is intentionally incomplete; do not reuse it.**
+Short16 completed **16/16**, with the full NPZ archive and generated text
+byte-identical to `cand-fp8decode02`. Long completed **6/16 rows**, each raw F32
+row matching the baseline. At the user's stop request the collector was
+suspended to prevent new admission, the in-flight request drained, both rank
+containers stopped, then the collector resumed and saved that sixth response.
+Its next request got connection refused because the engines were deliberately
+stopped; `long.log` records this, not a new Atlas regression. The collector
+removed `capture-enabled` in its `finally` block. **No completed long manifest
+or NPZ exists; full corrected-image neutrality and live grammar validation
+remain pending.** The queued corrected Q3 rerun was cancelled before launch.
+
+Durable evidence: `merged-image-20261011-session2/` under the root below.
+Original full-neutrality and Q3 evidence lives there; corrected-image source,
+CPU records and the complete stopped attempt are under `grammar-fix/`.
+`grammar-fix/driver/` contains both-rank attempt tarballs, exact create commands,
+image/build manifests, runtime maps, provenance, short neutrality, partial-long
+reports, build log and `stop-checkpoint.json`. Live copies:
+`/tmp/atlas-resume-20261011-session2/grammar-image/`; remote attempts:
+`~/gate/attempts/cand-grammar-ee5e-01`. Build checkout/log on spark1:
+`~/atlas-build/resume-6f516e5a` (detached `ee5eaf0f`) and
+`~/atlas-build/resume-ee5eaf0f-build.log`.
+
+Next session, in order:
+
+1. Inspect both hosts and image IDs. Reuse the exact corrected image above;
+   documentation-only commits after `ee5eaf0f` do not change it. Do not restart
+   the preserved KDA-control containers as the candidate.
+2. Create **fresh** attempt `cand-grammar-ee5e-02` and capture root, e.g.
+   `/tmp/atlas-ee5eaf0f-neutrality-r2`. Restore/copy `grammar-fix/driver/` into
+   a new local working directory. Update `gate_run.sh`'s capture root and remote
+   staging path, the profile JSON host capture mounts, and its preserved-container
+   rename suffix (the current `preserved-before-ee5eaf0f` names already exist).
+   Stage the matching descriptors remotely; keep every env/serve flag unchanged,
+   including perturbations **unset**. The driver rejects existing capture roots;
+   `run_gate_attempt.sh` rejects reused names. Never delete prior evidence.
+3. Run the preservation wrapper with the fresh `GATE_CAPTURE_ROOT`, collect full
+   short16 + long and use `check_neutrality.py` against `cand-fp8decode02`.
+   Require both complete archives and texts to match before Q3. The stopped
+   partial collection cannot substitute for this full run.
+4. Copy/update `run_q3.sh` to the fresh attempt/output and source-bound remote
+   harness. Rerun the same focused 15-case slice. It must prove the JSON opener
+   fix on GPU and resolve the completion/EOS harness failures. Record skipped
+   exact-EOS-ID verification as untested. Broader Q3/Q4 remain open.
+5. Return to the failed registered Q2 gate without changing its rule. The next
+   arithmetic diagnostic is `q2-diagnostic-plan.json`: prefixes 10–13,
+   FFN/routes layers 0–3, upstream layer 0, MLA layer 3. The frozen reference
+   collector package does not invoke `reference_attn_trace.patch`; create/hash
+   a separate diagnostic overlay before MLA capture. MLA is a hypothesis,
+   not an established numerical root cause. No gate redesign is authorized.
+
+Prior restart checkpoint: tag `checkpoint/fp8decode-20261011` on branch
+`sparkglm/installable-20260924`. Older entries below are historical wherever
+the resume above supersedes their image, source, container, or completion state.
+
+**Q2 statistical gate result 2026-10-11 ~09:00 UTC — candidate FAILS (pre-registered rule, nothing loosened).**
+Reports: `statistical-gate-20261011/final/` under the durable root; runs in `runs/`,
+both-rank attempt trees in `batch2-attempts/`. References ref04–ref12 (9),
+held-out ref13; harness = repo `statistical_gate.py` at `27bf8352`+ (unchanged since `9879d73b`).
+
+| Run | T (refs 5.04–5.53) | catastrophic rows | verdict |
+|---|---|---|---|
+| candidate `cand-fp8decode02` ≡ `cand03` (logits byte-identical) | 7.20, p=0.1 (minimum) | 3 (short16 `longer` rows 0–2, sym_kl) | FAIL: rank + rows; ulp control fails the same way |
+| `candkda0` (`ATLAS_KDA_FLA_REFERENCE=0`, MDE) | 7.68 | 1 + 1 argmax/text | detected (expected) |
+| held-out `ref13` (must pass) | 5.30, p=0.7 | 1 (short16 `longer` row 0: 0.056 vs limit 0.005) | FAILS one row |
+
+- Leave-one-out is verifiable (0 failures for all 9 references); negative controls pass.
+- Both suites put the candidate beyond every reference (short16 7.42 vs ≤5.52;
+  long 6.98 vs ≤5.72), so the candidate is systematically distinguishable, not
+  failing on one noisy row. It is only modestly closer than the known-wrong KDA
+  policy (7.20 vs 7.68). Per-case localization (`final/per_case_breakdown.py`,
+  `final/per-case-cand02.json`): the excess concentrates in short16
+  `arithmetic` (candidate nearest-reference symKL 0.074 vs reference-to-reference
+  0.0018) and `longer` (0.045 vs 0.0004), then `index-boundary-2048` (0.075 vs
+  0.017); the other long cases sit near the references' own spread. Cause is
+  **not localized** — the multi-key sparse MLA FP8 difference is a candidate
+  hypothesis only. Next diagnostic: per-layer captures for short16 `arithmetic`.
+- The held-out reference failing one row means the reference is itself
+  occasionally bimodal at short16 `longer` row 0, where the 9 references agree
+  to < 0.005/3. Per the pre-registration this is a failed must-pass control; the
+  rule is not changed. **Decision for the user:** pursue reference-faithful
+  multi-key MLA FP8 numerics, or revisit the gate design (new pre-registration).
+- Interim 3-reference reports remain in `interim/` (diagnostic only).
 
 **Status 2026-10-11 06:25 UTC:**
 
@@ -24,7 +159,7 @@ on branch `sparkglm/installable-20260924`; latest implementation commit is
   exactly `ATLAS_KDA_FLA_REFERENCE=0`), which the old chain would have rejected.
   Dry runs `ref03-finalizer-dryrun{,2}` passed on both live reference ranks:
   `statistical-gate-20261011/finalizer-dryrun-ref03/`.
-- **Batch 2 running since 06:21 UTC** (`collector-only-profile/gate_batch_fresh2.sh`):
+- **Batch 2 completed 08:47 UTC** (`collector-only-profile/gate_batch_fresh2.sh`):
   refs **ref04–ref12** (9), held-out **ref13**, cand03, candkda0. It never
   deletes evidence; a failed attempt is retried as `NAME-r2`. Logs:
   `statistical-gate-20261011/batch2-driver.log` and `batch2-logs/NAME.log`;
@@ -35,13 +170,37 @@ on branch `sparkglm/installable-20260924`; latest implementation commit is
 - GPU image remains pinned to `fb4f4b41` (image `sha256:e744b81d…`);
   `4b49a9c4`, `7e04679f`, `f7791189` need a rebuilt image for Q3.
 
+**Host state 2026-10-11 ~09:30 UTC:** no containers running on either Spark.
+`gate-cand-0/1` (the **candkda0** control engine, `ATLAS_KDA_FLA_REFERENCE=0`)
+were stopped after archiving; do not restart them as "the candidate". Production
+containers remain stopped. `gate_batch_fresh.sh` is superseded by
+`gate_batch_fresh2.sh` (the old one deleted evidence on retry).
+
+**Merged CPU-side work (2026-10-11, all GPU-unvalidated):** gate perturbation
+knobs (`ATLAS_EXL3_GATE_PERTURBATION`, incl. a `round_accum` flag on
+`exl3_moe_combine_f32`), first-token/grammar/n>1/MTP/Responses seed fixes,
+blocking stop strings, `stop_token_ids`, `min_tokens`,
+`include_stop_str_in_output`, Anthropic stop mapping, Q3 live suite
+(`q3_behavior_suite.py`), Q4 corpus/runner (`tests/exl3_validation/q4/`), F2/F3
+harnesses. Local checks on the merged tree: spark-server 2567 pass / 3 fail
+(same 3 as before the merges, stub-linked harness in
+`~/.cache/claude-q3-review/`), spark-model 1635 / 1 (known dense-cache test),
+validation Python 273 pass. R2 records are on unmerged `pi/r2records-20261011`
+(editing benchmark-gate boundary files invalidates all required gate records).
+
+**First GPU step for the next session:** build a clean image from the merged
+HEAD, then collect short16 + long with `ATLAS_EXL3_GATE_PERTURBATION` unset and
+require `logits.npz` byte-identity with `cand-fp8decode02`. That single check
+covers the kernel `round_accum=0` neutrality claim and the scheduler/seed/stop
+changes before any Q3/Q4 live run; a byte difference is a finding.
+
 [todo.md](todo.md) is the authoritative remaining-work checklist, with task IDs,
 dependencies and completion criteria. This file holds the restart context,
 implementation status and evidence needed to execute it. The design documents
 specify arithmetic; the dated reviews contain hypotheses, not measured Atlas
 speedups.
 
-## Live job — fresh statistical gate batch 2
+## Gate batch 2 (completed 08:47 UTC)
 
 Read-only checks:
 

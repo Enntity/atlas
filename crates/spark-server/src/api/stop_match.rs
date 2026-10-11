@@ -412,6 +412,7 @@ impl StopHoldback {
 }
 
 mod watch;
+#[cfg(test)]
 pub(crate) use watch::StopDecodeFn;
 pub use watch::StopStringWatch;
 
