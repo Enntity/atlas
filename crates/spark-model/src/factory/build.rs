@@ -89,6 +89,9 @@ pub fn build_model(
     crate::layers::ops::initialize_glm_sparse_prefill_pipe(gpu.as_ref(), &config)?;
     crate::layers::ops::initialize_glm_kv_canonical(gpu.as_ref(), &config, kv_dtype)?;
     crate::layers::ops::initialize_glm_mla_fuse(gpu.as_ref(), &config)?;
+    // An fp8_g128 GLM latent cache needs the sparse TC K=V prefill reader; fail
+    // at startup on every rank rather than on the first long prefill.
+    crate::layers::ops::validate_glm_sparse_prefill_startup_env(&config, kv_dtype, &layer_dtypes)?;
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
     // `NllbGpuModel`, which reads its weights from the standard `store` — this

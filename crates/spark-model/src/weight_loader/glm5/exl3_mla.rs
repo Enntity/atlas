@@ -26,6 +26,8 @@ pub struct Glm5Exl3MlaResources {
     derived: Vec<DevicePtr>,
     index_params: Option<super::exl3_index::Glm5Exl3IndexParams>,
     index_exec: Option<super::exl3_index_exec::Glm5Exl3IndexExec>,
+    /// Opt-in reference-comparison capture (`ATLAS_EXL3_MLA_DUMP_*`).
+    pub(crate) trace: Option<crate::layers::qwen3_attention::exl3_mla_trace::MlaTrace>,
 }
 impl Glm5Exl3MlaResources {
     pub fn index_exec(&self) -> Result<&super::exl3_index_exec::Glm5Exl3IndexExec> {
@@ -189,6 +191,9 @@ pub fn load_exl3_mla_layer_with_numerics(
         derived: Vec::new(),
         index_params: None,
         index_exec: None,
+        trace: crate::layers::qwen3_attention::exl3_mla_trace::MlaTrace::from_env(
+            config, layer_idx,
+        )?,
     };
     let result = (|| -> Result<Qwen3AttentionLayer> {
         resources.index_params = Some(super::exl3_index::Glm5Exl3IndexParams::load(

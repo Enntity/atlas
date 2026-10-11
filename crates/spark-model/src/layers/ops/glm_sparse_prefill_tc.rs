@@ -54,6 +54,48 @@ fn enabled(model: &str, name: &str) -> Result<bool> {
     }
 }
 
+/// Assembly-time check: an `fp8_g128` GLM latent cache has no sparse prefill
+/// reader other than the tensor-core K=V kernel, so it requires both opt-ins.
+/// Checking only per request lets the first >2047-token prefill fail on every
+/// rank and terminate the TP group.
+pub fn validate_glm_sparse_prefill_startup(
+    config: &ModelConfig,
+    kv_dtype: KvCacheDtype,
+    layer_dtypes: &[KvCacheDtype],
+    tc: bool,
+    kv_reuse: bool,
+) -> Result<()> {
+    let fp8 = kv_dtype == KvCacheDtype::Fp8G128 || layer_dtypes.contains(&KvCacheDtype::Fp8G128);
+    if config.model_type != "glm5_next" || !fp8 {
+        return Ok(());
+    }
+    ensure!(
+        tc && kv_reuse,
+        "--kv-cache-dtype fp8_g128 on glm5_next requires ATLAS_GLM_SPARSE_PREFILL_TC=1 and \
+         ATLAS_GLM_SPARSE_PREFILL_KV_REUSE=1 (got TC={}, KV_REUSE={})",
+        u8::from(tc),
+        u8::from(kv_reuse)
+    );
+    validate_config(config)
+}
+
+/// [`validate_glm_sparse_prefill_startup`] with the opt-ins read from the
+/// environment; malformed values fail here rather than on the first request.
+pub fn validate_glm_sparse_prefill_startup_env(
+    config: &ModelConfig,
+    kv_dtype: KvCacheDtype,
+    layer_dtypes: &[KvCacheDtype],
+) -> Result<()> {
+    let model = &config.model_type;
+    validate_glm_sparse_prefill_startup(
+        config,
+        kv_dtype,
+        layer_dtypes,
+        enabled(model, "ATLAS_GLM_SPARSE_PREFILL_TC")?,
+        enabled(model, "ATLAS_GLM_SPARSE_PREFILL_KV_REUSE")?,
+    )
+}
+
 /// Opt-in pipelined `fp8_g128` prefill kernel, bit-identical to the kv_pad one.
 const PIPE: &str = "ATLAS_GLM_SPARSE_PREFILL_PIPE";
 /// The pipe kernel's selected-slot capacity (`GLM_PIPE_SLOTS`); it also

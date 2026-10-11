@@ -314,3 +314,23 @@ use tensor-core accumulation and ordered FP16 partials. Fat experts use sequenti
 Preserve the test-only `--experimental-fat-mma-profile 32 128 1 0`
 negative control, which changes the accumulation order. Preserve component failures and require the original full-model
 gates before claiming parity.
+
+## Statistical logit gate
+
+The frozen short16 thresholds are failed by the reference against itself
+(atomic-order nondeterminism in its MoE combine). Qualification uses the
+pre-registered exchangeability gate in
+[docs/design/exl3-statistical-gate.md](../../docs/design/exl3-statistical-gate.md):
+
+```bash
+python3 tests/exl3_validation/statistical_gate.py \
+  --reference R1_SHORT,R1_LONG ... --reference R9_SHORT,R9_LONG \
+  --candidate A1_SHORT,A1_LONG --candidate A2_SHORT,A2_LONG \
+  --ulp-control --out gate-report.json
+# must-pass control: replace --candidate with --held-out-reference R10_SHORT,R10_LONG
+```
+
+Each `--reference`/`--candidate` is one run (comma-joined `collect_logits.py`
+artifact directories, one per suite). The report records the hard-gate,
+catastrophic-row and rank results, T values, p, and the frozen-threshold
+comparison as a secondary record. CPU tests: `test_statistical_gate.py`.

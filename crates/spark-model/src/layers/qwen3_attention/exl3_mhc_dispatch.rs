@@ -29,6 +29,9 @@ impl Qwen3AttentionLayer {
                 hc.hc_mult == 4 && hc.attn.lowrank.is_none() && hc.ffn.lowrank.is_none(),
                 "native EXL3 post requires full four-stream mixing"
             );
+            if let Some(trace) = &native.trace {
+                trace.post(gpu, block_output, rows as usize, stream)?;
+            }
             return native
                 .mhc
                 .as_ref()

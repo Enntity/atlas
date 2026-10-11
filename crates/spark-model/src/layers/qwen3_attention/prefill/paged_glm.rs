@@ -296,7 +296,7 @@ impl Qwen3AttentionLayer {
                 if !accelerated {
                     ensure!(
                         cache_dtype == KvCacheDtype::Bf16,
-                        "fp8_g128 GLM sparse attention requires ATLAS_GLM_SPARSE_PREFILL_TC=1"
+                        "fp8_g128 GLM sparse attention requires ATLAS_GLM_SPARSE_PREFILL_TC=1 and ATLAS_GLM_SPARSE_PREFILL_KV_REUSE=1"
                     );
                     ops::glm_sparse_mla_prefill(
                         ctx.gpu,

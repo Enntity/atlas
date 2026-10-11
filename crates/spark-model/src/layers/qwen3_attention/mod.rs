@@ -20,6 +20,7 @@ mod decode;
 // code paths are unaffected by the wider visibility.
 mod exl3_mhc_dispatch;
 mod exl3_mla;
+pub(crate) mod exl3_mla_trace;
 mod glm_index_budget;
 mod glm_index_capacity;
 pub(crate) use glm_index_budget::GlmIndexBudget;

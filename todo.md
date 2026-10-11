@@ -35,6 +35,10 @@ to the source and profile that passed.
   show only the intended pair, and smoke plus scratch GPU checks pass with archived
   manifests. Current launcher image is a preserved snapshot, not proof of a
   reproducible `11671adf` build.
+  *Status 2026-10-11:* recipe in-tree (`a6f64c46`, `59b0e113`); clean no-cache
+  build `sha256:b6be48ed…` booted both nodes, runtime maps show only the pinned
+  pair on both ranks, smoke 5/5 (`kda-fla-candidate-20261010/`). Still owed:
+  `exl3_moe_scratch_check` GPU run from this image and the full shard re-hash.
 
 - [ ] **Q1 — Implement and validate the EXL3 reference-policy KDA core.** Follow
   [T2–T8](docs/design/exl3-kda-reference-core.md): M5 prefill, exact PTX operation
@@ -47,6 +51,12 @@ to the source and profile that passed.
   byte gates at M5/M128/decode and multi-chunk boundaries, negative controls fail,
   and the rebuilt image passes Q2. The CPU M128 residual counts are evidence,
   not permission for a CUDA mismatch. Diagnose later divergences if they appear.
+  *Status 2026-10-11:* kernels + dispatch done (`72d64e4c`, `069e4351`); every
+  stage, carried state (3 chunks + tail, 4 decodes) and the composed pipeline are
+  0-mismatch vs the GPU oracle on both ranks (`tests/exl3_validation/kda_fla/run.sh`);
+  in situ layer 0–2 byte-exact. Open: the Q2 dependency below, a performance pass
+  (correctness-first kernels, ~12 launches per KDA prefill), and the long-prefix
+  (2047/2048/2051/2053) gate on this image, which was not run.
 
 - [ ] **Q2 — Close full-model numerical and repeatability gates.** Rerun frozen
   short16, long-prefix/chunk-boundary, persistent decode and raw-logit comparisons
@@ -57,6 +67,15 @@ to the source and profile that passed.
   check candidate repeatability. **Done when:** all required candidate gates pass
   on both ranks, with raw tensors/provenance; reference variability is explained
   or explicitly retained as an unresolved constraint, never used to waive failure.
+  *Status 2026-10-11:* the user chose a statistical gate; it is pre-registered
+  (`docs/design/exl3-statistical-gate.md`, `3cf66612`, reviewed by Fable 5.1;
+  candidate-profile addendum `87e4b08b`). Atlas's first own divergence was the
+  layer-3 MLA core output: the reference silently uses an `fp8_ds_mla` latent
+  KV cache. `--kv-cache-dtype fp8_g128` reproduces its single-key rows; the
+  candidate profile now uses it. Layers 0–2 and the layer-3 projections are
+  byte-exact. Collection (9 references + held-out, 2 candidate runs, the
+  `ATLAS_KDA_FLA_REFERENCE=0` control) is the next step; the semantic must-fail
+  perturbations still need Atlas runtime knobs.
 
 - [ ] **Q3 — Qualify usable API behavior.** Extend beyond the launch smoke to
   OpenAI chat/completions and Anthropic, streaming/nonstreaming, reasoning on/off
@@ -107,6 +126,11 @@ to the source and profile that passed.
   timing cross-checks establish a baseline; explicit latency/throughput targets
   and permitted quality/memory tradeoffs are recorded for each intended workload.
   Repeat after Q2 if initial profiling used the unqualified arithmetic path.
+  *Status 2026-10-11:* harness committed on branch `pi/p0-20261010` (not yet
+  merged; its `repeat`/`cold` record fields come out null). Unqualified
+  diagnostic on the production image: decode ~0.45 s/token, 2573-token TTFT
+  ~139 s (`p0-unqualified-baseline-20261010/`). Decode speed is the dominant
+  serving problem; trace it before any other P item.
 
 - [ ] **P1 — Packed decoder and decode occupancy.** Inspect runtime JIT SASS
   and Nsight Compute counters, building on the completed offline LDL/STL audit.

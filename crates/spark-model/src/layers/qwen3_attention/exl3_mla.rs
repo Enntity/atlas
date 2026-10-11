@@ -24,6 +24,10 @@ impl Qwen3AttentionLayer {
             return Ok(false);
         };
         use crate::layers::glm5_exl3_mhc::{MhcResidualPrecision, NativeMhcBuffers};
+        let attn = self
+            .hc
+            .as_ref()
+            .is_some_and(|hc| std::ptr::eq(site, &hc.attn));
         native
             .mhc
             .as_ref()
@@ -39,18 +43,24 @@ impl Qwen3AttentionLayer {
                     comb: ctx.buffers.hc_comb(),
                 },
                 rows as usize,
-                if self.block_idx == 0
-                    && self
-                        .hc
-                        .as_ref()
-                        .is_some_and(|hc| std::ptr::eq(site, &hc.attn))
-                {
+                if self.block_idx == 0 && attn {
                     MhcResidualPrecision::Rounded
                 } else {
                     MhcResidualPrecision::for_fused_rows(rows as usize)
                 },
                 stream,
             )?;
+        if let Some(trace) = &native.trace {
+            trace.pre(
+                ctx.gpu,
+                attn,
+                normed,
+                ctx.buffers.hc_post(),
+                ctx.buffers.hc_comb(),
+                rows as usize,
+                stream,
+            )?;
+        }
         Ok(true)
     }
 
@@ -170,6 +180,25 @@ impl Qwen3AttentionLayer {
         )?;
         // Existing attention callers own O's TP reduction and the mHC seam.
         projection.launch_local_bf16(gpu, input, output, rows as usize)?;
+        if let Some(trace) = &native.trace {
+            const NAMES: [&str; 5] = [
+                "proj_wq_a",
+                "proj_wq_b",
+                "proj_wkv_a",
+                "proj_wo",
+                "proj_index_wq_b",
+            ];
+            trace.projection(
+                gpu,
+                NAMES[slot],
+                input,
+                k as usize,
+                output,
+                n as usize,
+                rows as usize,
+                stream,
+            )?;
+        }
         Ok(true)
     }
 

@@ -228,6 +228,19 @@ behaviour change; fail fast rather than fall back (PCND).
    passing unchanged. The policy only ever makes the *reference* surface
    bit-exact; it does not relax any tolerance anywhere.
 
+### 3.6b As implemented (2026-10-11)
+
+The shipped implementation differs from the proposal above in three ways:
+one CUDA kernel per reference Triton kernel in module `kda_fla`
+(`kernels/gb10/common/kda_fla*.cu(h)`; launch order in `kda_fla.cu`) instead of
+the two proposed kernels; prefill intermediates borrow the model-owned routed
+MoE scratch buffer 7 (idle during attention on the same stream, size checked at
+assembly) instead of a new allocation; and a one-row invocation always takes the
+decode kernels, matching vLLM's `query_len == 1` classification. Rust:
+`crates/spark-model/src/layers/ops/kda_fla.rs` (launches, scratch layout) and
+`crates/spark-model/src/layers/glm5_kda/reference_policy.rs` (policy, gating,
+dispatch). Recurrent state keeps Atlas's `[K, V]` layout.
+
 ### 3.6a GPU oracle and residual closure (2026-10-10)
 
 `tests/exl3_validation/kda_reference_stage_dump.py` replays the pinned

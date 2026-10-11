@@ -18,15 +18,15 @@ superseded by the successful launch below.
 | Area | Status at review |
 |---|---|
 | Native checkpoint loading and two-node generation | Implemented; launch smoke recorded |
-| Full-model frozen numerical gates | **FAIL** on the last candidate; KDA core is the earliest identified divergence |
-| FLA reference-policy KDA | Design and CPU acceptance oracle exist; policy enum, environment switch, CUDA kernels and dispatch are **not implemented** |
+| Full-model frozen numerical gates | **FAIL** (short16, reference-policy candidate `b6be48ed`). Text/argmax 16/16. The reference fails the same gate against its own repeats by the same magnitude; Atlas is byte-deterministic (3 fresh-server runs). First Atlas-own divergence: layer-3 attention (first DSA/MLA layer) — layers 0–2 are byte-exact in situ |
+| FLA reference-policy KDA | **Implemented** (`72d64e4c`, `069e4351`): module `kda_fla`, `ATLAS_KDA_FLA_REFERENCE=1`. Byte-exact vs GPU stage oracle (all stages, carried state, both ranks) and in situ (layer-0 core, gated norm, o_proj after TP, dense FFN; layers 0–2 inputs/outputs) |
 | Shared routed MoE scratch | Implemented; rank-local GPU reuse/guard proof recorded on both hosts |
 | FFN stage timing | Implemented, opt-in and synchronizing; useful for attribution, unsuitable for headline timings |
 | Merged KDA auxiliary projection | Implemented; layer-0 M1 padded to 3, M5 and M128 byte comparisons recorded on both hosts |
 | CUDA graphs, concurrent admission, long context, prefix reuse, FP8 KV | Unqualified for this native EXL3 profile; qualify independently |
 | DFlash/MTP/self-speculation | Explicitly rejected by native EXL3 startup guards; implementation and qualification required |
-| Reproducible deployable image | Successful external image preserved; committed Docker recipe still lacks its required cuBLAS 13.1 pair |
-| Performance baseline | No qualified repeated baseline; launch smoke is preliminary, single-shot evidence only |
+| Reproducible deployable image | Recipe in-tree (`a6f64c46`): no-cache build `atlas-exl3-validation:src-efd023f8f7b9-rust1.97.1` = `sha256:b6be48ed…` from `59b0e113`; runtime maps attest only the pinned pair on both ranks; smoke 5/5. Owed: shard re-hash, `exl3_moe_scratch_check` GPU run |
+| Performance baseline | Unqualified diagnostic only (`p0-unqualified-baseline-20261010/`): decode ~0.45 s/token (~2.2 tok/s), 2573-token prompt TTFT ~139 s on the production image. Not a headline; P0 harness in branch `pi/p0-20261010` |
 
 This review checked source and committed records. It did not inspect live hosts,
 restart services, run a new GPU qualification, or establish a new performance
@@ -106,31 +106,34 @@ rel 0.02, KL 0.005, CE 0.15, top-K 10, exact argmax and HTTP text requirements.
 Long-prefix cases use 2047/2048/2051/2053 tokens and registered continuations.
 Do not relax these gates to accommodate either engine's nondeterminism.
 
-The last short16 comparison **fails** despite exact argmax/text in all 16
-rows. Layer-0 normalized input, QKV, merged beta/FA/GA and FB/GB outputs matched;
-the first identified mismatch is the KDA recurrent core. Captured-case F64
-emulation supports an arithmetic-policy explanation, but does not prove that
-Atlas is universally “correctly rounded,” that the reference is universally
-wrong, or that there are no later Atlas bugs. Reference self-repeat differences
-beginning at layer-3 routed combine are a separate investigation.
+Status 2026-10-11 (candidate image `sha256:b6be48ed…`, `ATLAS_KDA_FLA_REFERENCE=1`):
 
-[Reference-policy design](docs/design/exl3-kda-reference-core.md) specifies
-chunk 64 / subchunk 16, precise BF16 rounding points, TF32 operand handling,
-and F32 state across calls. Its T1 CPU oracle is present. T2–T8 (CUDA prefill,
-PTX probes, M128 closure, decode and dispatch/GPU validation) remain open.
-`KdaArithmeticPolicy`, `ATLAS_KDA_FLA_REFERENCE`, `kda_fla_chunk_prefill_bf16`
-and `kda_fla_recurrent_decode_bf16` are **proposed names**, absent from production
-source at `11671adf`; setting the proposed environment variable does not enable
-this policy today. The existing `KdaRecurrentPath::Reference` is a different path.
-
-The recorded CPU emulation matches M5 and its following decode on both ranks;
-M128 retains 1728/585 mismatches out of 524288 elements. Those counts document
-the residual, not an acceptable CUDA tolerance. The GPU target is byte equality.
-Resolve exp/div/rsqrt and dot/reduction lowering from actual reference PTX and
-stage captures. Add fixtures for at least three chunks and repeated decode:
-inter-chunk carry and pinned autotune choices are not fully established.
-The CPU test can skip when its external scripts/fixtures are missing; a skip
-is not a passing qualification.
+- **KDA closed.** The M128 "residual" was the reference's Inductor-compiled beta
+  sigmoid plus f32 conv weights (design doc §3.6a), not GPU transcendental
+  behaviour. The `kda_fla` kernels are byte-exact against the GPU stage oracle
+  and, in the live two-rank server, layer-0 KDA core, gated norm, o_proj after
+  TP and the dense FFN match the reference bytes; layers 0–2 FFN inputs and
+  outputs match for the capital M5 request on both ranks.
+- **short16 still fails** (abs 0.63/2.66/1.85/2.38, KL ≤ 0.054, CE ≤ 0.085,
+  text and argmax 16/16, negative controls detected). Atlas is byte-
+  deterministic across three fresh-server runs. The *reference* fails the same
+  frozen gate against its own repeats by the same magnitude (abs ≤ 2.75,
+  KL ≤ 0.057, CE ≤ 0.21; `reference-three-run-diagnosis.json`), so no
+  deterministic engine can pass the gate as written. This is a retained
+  constraint, not a waiver: see todo.md Q2 for the decision required.
+- **Update:** the layer-3 divergence is the reference's silent `fp8_ds_mla`
+  latent KV (log: `FLASHINFER_MLA_SPARSE_SM120`, "top-k MQA path only").
+  With `--kv-cache-dtype fp8_g128` Atlas reproduces single-key rows; multi-key
+  rows differ at implementation level. The Q2 decision was a pre-registered
+  statistical gate (`docs/design/exl3-statistical-gate.md`).
+- **First Atlas-own divergence (superseded above):** layer-3 FFN input (16147/20480 elements,
+  max 0.021) although layer-2 output is exact, i.e. inside layer 3's attention
+  block — the first `deepseek_sparse_attention` (MLA + indexer) layer, or its
+  mHC pre/post. A fresh canonical reference repeat matched the original byte
+  for byte through layer-3 output for this request, so this one is Atlas's.
+- The CPU oracle test (`test_exl3_kda_reference.py`) is historical; the GPU
+  oracle supersedes it. `KdaRecurrentPath::Reference` is unrelated to the
+  policy.
 
 ## What the commit already implements
 
@@ -187,6 +190,10 @@ different scopes.
 | `arithmetic-audit/index-scale-boundary-controls/` | Latest GPU retry failed frozen-source guard before Torch; no numerical result; restore exact source overlay |
 | `arithmetic-audit/exl3-ptxas-spill-audit/` | Offline embedded-PTX audit: local accumulator LDL/STL despite zero reported register spills; not runtime JIT evidence or a speedup |
 | `reference-upstream-context-v4/` | Frozen short/long/persistent reference captures, repeats and behavior diagnostics; behavior failures are not Atlas verdicts |
+| `arithmetic-audit/kda-reference-stage-oracle-20261010/` | GPU replay of the pinned reference (Inductor beta, f32 conv weights, varlen, original Triton caches): reproduces every captured KDA output byte; per-stage bytes + carried-state `seq*` fixtures; acceptance oracle for `tests/exl3_validation/kda_fla/run.sh` |
+| `arithmetic-audit/kda-reference-ptx-spec-20261010/`, `reference-triton-cache-20261010/` | Exactly-used compiled reference variants (PTX/TTGIR/autotune) and both nodes' original Triton caches |
+| `kda-fla-candidate-20261010/` | Reference-policy candidate: build log/manifest, create commands, short16 comparison + 2 determinism repeats, attestation, smoke, in-situ layer captures (L0 upstream, L0–4 FFN) and the matching canonical reference L0–3 capture |
+| `p0-unqualified-baseline-20261010/` | 6 streaming requests on the production image; harness stopped early (rate too low for the full matrix) |
 | `checkpoint-full-sha/` | Earlier full shard hashes; latest build only has stat/index guard, full re-hash still owed |
 | `local-ci-baseline-blockers/`, `fmt-baseline-review/`, `unchanged-dense-cache-baseline/` | Earlier baseline failures; reproduce before calling any current failure pre-existing |
 
@@ -210,19 +217,23 @@ were superseded by later evidence in the table.
 1. Read [AGENTS.md](AGENTS.md), [CONTRIBUTING.md](CONTRIBUTING.md), the
    [measurement discipline](.claude/skills/measurement-discipline/SKILL.md), and
    [validation harness contract](tests/exl3_validation/README.md).
-2. Start Q0 (reproducibility) and Q1 (KDA closure). Preserve the working service
-   and all frozen artifacts. Rebuild from scratch for runtime/kernel changes.
-3. P0 may collect an explicitly unqualified diagnostic baseline in parallel with
-   correctness work. Use it to choose hot spots; any changed arithmetic must pass
-   its component and end-to-end gates before adoption or a qualified speed claim.
-4. Complete Q2–Q4 (numerical, API and held-out task quality), then pursue P1–P6
-   according to measured cost. In particular,
-   optimize both C1 decode and grouped prefill; define latency and throughput
-   acceptance targets from the baseline instead of importing another engine's.
-5. Qualify F1–F4 as separate serving profiles and finish R1/R2, including
-   automated EXL3 performance regression records. Do not turn on graphs,
-   FP8 KV, concurrency, caching or speculation merely because Atlas supports them
-   on another format. Record actual dispatch engagement and resource limits.
+2. Get the user's Q2 decision (todo.md Q2: pin reference nondeterminism,
+   approve a statistical gate, or retain the constraint). Do not relax the
+   frozen thresholds without it.
+3. Find Atlas's first own divergence: layer-3 attention (first DSA/MLA layer)
+   for the capital M5 request. Layers 0–2 are byte-exact on both ranks
+   (`kda-fla-candidate-20261010/cand-l04-capital` vs `ref-l03-capture`); add
+   MLA/indexer/mHC stage captures for layer 3 on both engines.
+4. Run the long-prefix gate (2047/2048/2051/2053) on image `b6be48ed` with
+   `ATLAS_KDA_FLA_REFERENCE=1`; finish Q0 (scratch-check GPU run, shard re-hash).
+5. P0: trace C1 decode (≈0.45 s/token unqualified) with Nsight on both ranks
+   before any optimization; merge the `pi/p0-20261010` harness after fixing
+   its null `repeat`/`cold` fields.
+6. Then Q3/Q4, P1–P6, F1–F4, R1/R2 as in todo.md.
+
+Operational: production runs the original image on port 8000; the candidate
+image `atlas-exl3-validation:src-efd023f8f7b9-rust1.97.1` is loaded on both
+nodes; candidate create commands are in `kda-fla-candidate-20261010/`.
 
 The dated [code review](CODE_REVIEW_2026-10-10.md),
 [kernel review](GB10_KERNEL_OPTIMIZATION_REVIEW_2026-10-10.md) and
