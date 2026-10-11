@@ -52,6 +52,7 @@ pub mod responses_stream_finalize;
 pub mod responses_translate;
 pub mod sanitizer;
 pub mod scrub;
+pub mod stop_match;
 pub mod stored;
 pub mod stream_guards;
 pub mod strip;

@@ -148,6 +148,7 @@ fn response(tokens: Vec<u32>) -> crate::api::inference_types::InferenceResponse 
     crate::api::inference_types::InferenceResponse {
         output_tokens: tokens,
         finish_reason: "length".into(),
+        stop_token_id: None,
         time_to_first_token_ms: 0.0,
         decode_time_ms: 0.0,
         logprobs: vec![],
@@ -233,6 +234,7 @@ fn stream_tokens_with_context(
         tool_defs_for_backfill: defs.clone(),
         cwd_for_normalize: None,
         stop_strings: vec![],
+        single_token_stops: vec![],
         tool_retry_enabled: false,
         prompt_tokens: Arc::new(vec![13]),
         prompt_vocab: Arc::default(),

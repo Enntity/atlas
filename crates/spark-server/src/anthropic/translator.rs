@@ -322,12 +322,7 @@ impl AnthropicTranslator {
                 }
                 // A client stop sequence gets its dedicated reason + echo,
                 // matching the non-streaming path (translate.rs).
-                let (stop_reason, stop_sequence) = match (&reason, &matched_stop) {
-                    (crate::ir::FinishReason::Stop, Some(s)) => {
-                        ("stop_sequence", serde_json::Value::String(s.clone()))
-                    }
-                    _ => (convert_stop_reason(reason.as_wire()), serde_json::Value::Null),
-                };
+                let (stop_reason, stop_sequence) = anthropic_stop(reason, matched_stop.clone());
                 out.push(Self::make_event(
                     "message_delta",
                     serde_json::json!({

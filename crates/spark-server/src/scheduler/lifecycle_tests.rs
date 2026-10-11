@@ -393,7 +393,10 @@ pub(super) fn test_seq(
         engine_error: None,
         guard_stop,
         param_close_pending: 0,
-        sink: ResponseSink::Blocking(Some(tx)),
+        sink: ResponseSink::Blocking {
+            tx: Some(tx),
+            stop_watch: None,
+        },
         cancel_flag: None,
         temperature: 0.0,
         top_k: 0,

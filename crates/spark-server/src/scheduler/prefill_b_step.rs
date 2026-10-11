@@ -82,12 +82,16 @@ pub fn prefill_request(
             max_tokens,
             temperature,
             response_tx,
+            stop_watch,
             image_pixels,
             ..
         } => (
             prompt_tokens,
             max_tokens,
-            ResponseSink::Blocking(Some(response_tx)),
+            ResponseSink::Blocking {
+                tx: Some(response_tx),
+                stop_watch,
+            },
             image_pixels,
             temperature,
             None,

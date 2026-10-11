@@ -24,6 +24,10 @@ pub(super) struct StreamCtx {
     pub(super) tool_defs_for_backfill: Vec<tool_parser::ToolDefinition>,
     pub(super) cwd_for_normalize: Option<String>,
     pub(super) stop_strings: Vec<String>,
+    /// `(id, stop string)` for client stops that encode to one token. Those
+    /// ids end the turn as EOS and are never streamed as text, so the Done
+    /// frame's `stop_token_id` is mapped back through this for `matched_stop`.
+    pub(super) single_token_stops: Vec<(u32, String)>,
     /// Now-constant `false`: the tool-call retry/repair stack was removed.
     /// Retained so the streaming chunk buffering helpers in
     /// `tool_handlers.rs` still type-check; the buffering branches are dead.

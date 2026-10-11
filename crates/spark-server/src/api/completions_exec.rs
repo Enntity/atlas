@@ -14,7 +14,7 @@ use crate::openai::{CompletionChoice, CompletionRequest, CompletionResponse, Usa
 
 use super::compact::openai_error_response;
 use super::completions_logprobs::build_completion_logprobs;
-use super::inference_impl::strip_stop_sequences;
+use super::inference_impl::strip_stop_sequences_matched;
 use super::inference_types::{InferenceRequest, RepetitionDetectionParams};
 use super::strip::strip_thinking_tags;
 
@@ -121,6 +121,7 @@ pub(super) async fn run_blocking(
                 prompt_logprobs: if req.echo { p.logprobs_k } else { None },
                 echo: req.echo,
                 timeout_at: state.request_deadline(req.timeout),
+                stop_watch: super::chat_blocking::blocking_stop_watch(&state, &req.stop),
                 response_tx: tx,
             };
 
@@ -157,7 +158,8 @@ pub(super) async fn run_blocking(
             };
             // Strips apply to the COMPLETION only; echoed prompt text is
             // returned verbatim per the legacy spec.
-            let completion_text = strip_stop_sequences(completion_text, &req.stop);
+            let (completion_text, stop_matched) =
+                strip_stop_sequences_matched(completion_text, &req.stop);
             let completion_text = strip_thinking_tags(&completion_text);
             let text = if req.echo {
                 let prompt_text = state.tokenizer.decode(prompt_tokens).unwrap_or_default();
@@ -194,7 +196,12 @@ pub(super) async fn run_blocking(
             choices.push(CompletionChoice {
                 index: prompt_i * n + n_i,
                 text,
-                finish_reason: response.finish_reason,
+                // A stop string completed on the last budgeted token is
+                // still a stop (vLLM output_processor.py:657-661).
+                finish_reason: stop_corrected_finish(
+                    response.finish_reason,
+                    stop_matched.is_some(),
+                ),
                 logprobs,
             });
         }
@@ -224,4 +231,27 @@ pub(super) async fn run_blocking(
         usage,
     ))
     .into_response()
+}
+
+/// `"length"` → `"stop"` when a client stop string was found in the
+/// completion (twin of `chat_blocking::stop_match_corrected`, on the
+/// legacy string finish reason).
+fn stop_corrected_finish(finish_reason: String, stop_matched: bool) -> String {
+    if stop_matched && finish_reason == "length" {
+        "stop".to_string()
+    } else {
+        finish_reason
+    }
+}
+
+#[cfg(test)]
+mod stop_corrected_finish_tests {
+    use super::stop_corrected_finish;
+
+    #[test]
+    fn stop_match_on_last_budgeted_token_reports_stop() {
+        assert_eq!(stop_corrected_finish("length".into(), true), "stop");
+        assert_eq!(stop_corrected_finish("length".into(), false), "length");
+        assert_eq!(stop_corrected_finish("timeout".into(), true), "timeout");
+    }
 }

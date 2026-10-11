@@ -71,12 +71,11 @@ pub(super) async fn dispatch_streaming(
         ));
     }
     let tool_defs: Vec<tool_parser::ToolDefinition> = req.tools.clone();
-    // Sort by length descending so the streaming stop-string scan
-    // matches the longest overlapping prefix first (e.g. when the
-    // caller provides ["</answer", "</answer>"], `find` would
-    // otherwise truncate at the shorter, wrong boundary).
-    let mut stop_strings = req.stop.clone();
-    stop_strings.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    // Request order is kept: `stop_match::find_stop_string` breaks
+    // equal-end ties by stop-list order, as vLLM does. (Both of
+    // ["</answer", "</answer>"] start at the same byte, so the
+    // truncation point is the same whichever one is reported.)
+    let stop_strings = req.stop.clone();
     let req_return_token_ids = req.return_token_ids;
     let ctx_for_stream = req_ctx.as_ref().map(|e| e.0.clone());
     let repetition_detection = req.repetition_detection;

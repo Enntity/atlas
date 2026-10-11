@@ -139,7 +139,7 @@ fn watermark_zero_reserves_prompt_only_legacy() {
 #[test]
 fn ep_oversized_blocking_request_gets_error_before_allocation() {
     let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
-    let request = test_request!(Blocking, response_tx,);
+    let request = test_request!(Blocking, response_tx, stop_watch: None,);
     assert!(reject_oversized(vec![request], 16, 262144, 262144, 16).is_empty());
     let error = response_rx
         .try_recv()
@@ -167,7 +167,7 @@ fn ep_oversized_stream_gets_error_before_allocation() {
 #[test]
 fn ep_zero_capacity_rejects_even_a_single_request() {
     let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
-    let request = test_request!(Blocking, response_tx,);
+    let request = test_request!(Blocking, response_tx, stop_watch: None,);
     assert!(reject_oversized(vec![request], 0, 262144, 262144, 16).is_empty());
     assert!(response_rx.try_recv().unwrap().is_err());
 }

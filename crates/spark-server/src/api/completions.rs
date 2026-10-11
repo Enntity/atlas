@@ -303,6 +303,13 @@ pub(super) async fn completions_stream(
         None
     };
 
+    // Client stop strings: same hold-back + matcher as the chat stream
+    // (`stop_match::apply_stop_string_holdback`). A match flips the cancel
+    // flag so the scheduler stops generating at the next checkpoint.
+    let mut stop_holdback = super::stop_match::StopHoldback::new(req.stop.clone());
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stream_cancel = cancel_flag.clone();
+
     let session_hash = crate::session_manager::compute_session_hash(&prompt_tokens);
     let request = InferenceRequest::Streaming {
         prompt_tokens: std::sync::Arc::new(prompt_tokens),
@@ -347,10 +354,8 @@ pub(super) async fn completions_stream(
         echo,
         timeout_at: state.request_deadline(req.timeout),
         token_tx,
-        // /v1/completions has no guard pipeline yet — the flag is
-        // created so the scheduler's emit_step type-checks cleanly,
-        // but never flipped.
-        cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Flipped only by a client stop-string match (no guard pipeline).
+        cancel_flag,
     };
 
     state.request_tx.send(request).await.map_err(|_| {
@@ -394,6 +399,12 @@ pub(super) async fn completions_stream(
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                 )]
             }
+            // Tokens already queued when a stop string matched are dropped.
+            StreamEvent::Token(_) | StreamEvent::TokenWithLogprobs(..)
+                if stop_holdback.triggered() =>
+            {
+                Vec::new()
+            }
             StreamEvent::Token(tok) | StreamEvent::TokenWithLogprobs(tok, _) => {
                 all_toks.push(tok);
                 content_decoded.push_str(&state.tokenizer.incremental_decode(
@@ -409,6 +420,15 @@ pub(super) async fn completions_stream(
                     emitted = stable_end;
                     d
                 };
+                let raw_empty = delta.is_empty();
+                let delta = stop_holdback.push(&delta);
+                if stop_holdback.triggered() {
+                    stream_cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if delta.is_empty() && !raw_empty {
+                    // Held back (or cut to nothing by the match).
+                    return futures::stream::iter(Vec::new());
+                }
                 let chunk = CompletionChunk::text_chunk(&model, &id, delta);
                 vec![Ok(
                     Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
@@ -424,7 +444,24 @@ pub(super) async fn completions_stream(
                 cached_prompt_tokens,
                 accepted_prediction_tokens,
                 guard_stop: _,
+                stop_token_id: _,
             } => {
+                // Release the hold-back tail when no stop matched (vLLM
+                // flushes it at finish); a match always reports "stop", even
+                // on the last budgeted token (output_processor.py:657-661).
+                let mut events = Vec::new();
+                let tail = stop_holdback.finish();
+                if !tail.is_empty() {
+                    let chunk = CompletionChunk::text_chunk(&model, &id, tail);
+                    events
+                        .push(Ok(Event::default()
+                            .data(serde_json::to_string(&chunk).unwrap_or_default())));
+                }
+                let finish_reason = if stop_holdback.triggered() {
+                    "stop".to_string()
+                } else {
+                    finish_reason
+                };
                 let tps = if decode_time_ms > 0.0 {
                     completion_tokens.saturating_sub(1) as f64 / (decode_time_ms / 1000.0)
                 } else {
@@ -452,17 +489,18 @@ pub(super) async fn completions_stream(
                     // choices:[] usage-only chunk.
                     let fin = CompletionChunk::finish_chunk_no_usage(&model, &id, &finish_reason);
                     let usage_chunk = CompletionChunk::usage_only_chunk(&model, &id, usage);
-                    vec![
-                        Ok(Event::default().data(serde_json::to_string(&fin).unwrap_or_default())),
-                        Ok(Event::default()
-                            .data(serde_json::to_string(&usage_chunk).unwrap_or_default())),
-                    ]
+                    events.push(Ok(
+                        Event::default().data(serde_json::to_string(&fin).unwrap_or_default())
+                    ));
+                    events.push(Ok(Event::default()
+                        .data(serde_json::to_string(&usage_chunk).unwrap_or_default())));
                 } else {
                     let chunk = CompletionChunk::done_chunk(&model, &id, &finish_reason, usage);
-                    vec![Ok(
-                        Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
-                    )]
+                    events
+                        .push(Ok(Event::default()
+                            .data(serde_json::to_string(&chunk).unwrap_or_default())));
                 }
+                events
             }
             StreamEvent::Error(msg) => {
                 vec![Ok(Event::default().data(format!(r#"{{"error":"{msg}"}}"#)))]

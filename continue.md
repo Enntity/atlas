@@ -431,6 +431,16 @@ before live Q3 validation:
    returns the matched string) through `StreamState` into the translator.
    Now emits `stop_reason: "stop_sequence"` + echoes the matched string.
 
-Multi-token stops were already handled correctly via string matching
-(`apply_stop_string_holdback` with `stop_string_buffer_len` holdback);
-investigated and confirmed no defect.
+Correction: multi-token stops were handled correctly only on the STREAMING
+chat path (`apply_stop_string_holdback` with `stop_string_buffer_len`
+holdback). Non-streaming chat/completions/Anthropic only sent single-token
+stops to the scheduler and stripped an exact suffix, so generation ran past a
+multi-token stop and returned it plus everything after; legacy completions
+streaming had no stop-string handling at all. Fixed on branch
+`pi/q3stop-20261011` (commits `6f25cb8c`, `c4644ca5`, `264667b9`,
+`e39790e0`): shared vLLM matcher (`api/stop_match.rs`, earliest completion
+wins, ties by request order), a scheduler-side `StopStringWatch` on blocking
+sinks that retires the sequence at the cancellation checkpoint, single-token
+stops reported as `stop_sequence` via `stop_token_id`, and Anthropic
+non-streaming no longer echoes `stop_sequence` on non-Stop finishes. Not yet
+validated live (no GPU image built from it).

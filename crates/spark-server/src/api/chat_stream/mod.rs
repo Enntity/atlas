@@ -222,6 +222,10 @@ pub(crate) async fn run_chat_stream(
         enable_thinking,
         tool_defs_for_backfill: tool_defs,
         cwd_for_normalize: cwd_hint,
+        single_token_stops: crate::api::inference_impl::single_token_stop_map(
+            &state.tokenizer,
+            &stop_strings,
+        ),
         stop_strings,
         stop_string_buffer_len,
         leak_markers,
@@ -289,7 +293,16 @@ pub(crate) async fn run_chat_stream(
                 cached_prompt_tokens,
                 accepted_prediction_tokens,
                 guard_stop,
+                stop_token_id,
             } => {
+                // A single-token client stop ended the turn as EOS (never
+                // streamed as text, so the hold-back could not see it):
+                // recover which stop string it was for `stop_sequence`.
+                stream_state.matched_stop_string = crate::api::stop_match::resolve_matched_stop(
+                    stream_state.matched_stop_string.take(),
+                    stop_token_id,
+                    &ctx.single_token_stops,
+                );
                 // ★ `.or()`, NOT `=`. This field began life as a scheduler-owned
                 // diagnostic (see state.rs) and the Done frame legitimately
                 // carries the scheduler's `ActiveSeq::guard_stop`. But the

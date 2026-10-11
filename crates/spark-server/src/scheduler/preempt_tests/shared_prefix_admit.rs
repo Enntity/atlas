@@ -31,7 +31,7 @@ fn convo(id: u32, suffix: usize) -> Vec<u32> {
 fn request(tokens: Vec<u32>) -> InferenceRequest {
     let (response_tx, rx) = tokio::sync::oneshot::channel();
     std::mem::forget(rx); // keep the caller "connected"
-    let mut req = test_request!(Blocking, response_tx,);
+    let mut req = test_request!(Blocking, response_tx, stop_watch: None,);
     if let InferenceRequest::Blocking { prompt_tokens, .. } = &mut req {
         *prompt_tokens = Arc::new(tokens);
     }
@@ -51,7 +51,10 @@ fn in_flight(tokens: Vec<u32>, done: usize) -> PrefillInProgress {
         16,
         0,
         vec![2],
-        ResponseSink::Blocking(Some(tx)),
+        ResponseSink::Blocking {
+            tx: Some(tx),
+            stop_watch: None,
+        },
         None,
         Instant::now(),
         0.0,

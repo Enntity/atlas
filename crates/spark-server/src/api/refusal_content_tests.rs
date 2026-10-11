@@ -107,6 +107,7 @@ fn response(finish_reason: &str) -> crate::api::inference_types::InferenceRespon
     crate::api::inference_types::InferenceResponse {
         output_tokens: vec![],
         finish_reason: finish_reason.into(),
+        stop_token_id: None,
         time_to_first_token_ms: 0.0,
         decode_time_ms: 0.0,
         logprobs: vec![],

@@ -26,7 +26,7 @@ const STOP: u32 = 7;
 /// The end tokens a request gets from the model's `[END]`.
 fn end_tokens(ignore_eos: bool, stop: &[u32]) -> Vec<u32> {
     let (response_tx, _rx) = tokio::sync::oneshot::channel();
-    let mut req = test_request!(Blocking, response_tx,);
+    let mut req = test_request!(Blocking, response_tx, stop_watch: None,);
     if let InferenceRequest::Blocking {
         ignore_eos: i,
         stop_tokens,
@@ -139,7 +139,10 @@ fn a_grammar_passes_the_end_token_through() {
         &Some(GrammarSpec::JsonObject),
         &[GRAMMAR_EOS],
         false,
-        &mut ResponseSink::Blocking(None),
+        &mut ResponseSink::Blocking {
+            tx: None,
+            stop_watch: None,
+        },
     )
     .unwrap();
     for t in [b'{', b'}'] {

@@ -719,86 +719,9 @@ fn detector_content_arm(state: &mut StreamState, ctx: &StreamCtx, text: &str) ->
     process_detector_content(state, ctx, &sanitized)
 }
 
-/// Pure stop-string accumulator + hold-back algorithm. Returns the
-/// bytes that should be forwarded to the client this delta; the
-/// remainder (≤ `buffer_len` bytes) stays withheld inside
-/// `accumulated_content` until the next call or until `handle_done`
-/// flushes the tail at stream close.
-///
-/// Mirrors vLLM's `IncrementalDetokenizer.update`
-/// (`vllm/v1/engine/detokenizer.py`):
-/// 1. Append `new_chars` to the accumulator.
-/// 2. Search the accumulator for any stop string.
-/// 3a. On hit, truncate the accumulator AND the emittable delta at
-///     the match position (Atlas never echoes the stop literal).
-/// 3b. On miss, hold back the last `buffer_len` bytes; emit
-///     everything between the previously emitted offset and the
-///     hold-back boundary, snapped to a valid UTF-8 char boundary.
-///
-/// Pre/postconditions:
-/// - `*triggered` must be `false` on entry (callers gate on this).
-/// - On match, `*triggered` is flipped to `true` and the accumulator
-///   is truncated to the prefix that precedes the stop string.
-/// - On miss, `*triggered` stays `false`.
-/// Returns `(emitted_text, matched_stop_string)`. When a stop string
-/// matches, `matched_stop_string` is `Some(that string)` so the caller
-/// can record it for the Anthropic `stop_sequence` echo.
-pub(super) fn apply_stop_string_holdback(
-    new_chars: &str,
-    stop_strings: &[String],
-    buffer_len: usize,
-    accumulated_content: &mut String,
-    emitted_len: &mut usize,
-    triggered: &mut bool,
-) -> (String, Option<String>) {
-    debug_assert!(!*triggered, "caller must gate on !triggered");
-    accumulated_content.push_str(new_chars);
-
-    // Bounded search window: only the suffix that could contain a stop
-    // string straddling the newly appended chars can hold a *new* match —
-    // every prior call already full-scanned (and found nothing in) the
-    // content before this window. A match can begin at earliest
-    // `max_stop_len - 1` bytes before the new chars; we also back up over
-    // the held-back `buffer_len` bytes for margin. This keeps per-token
-    // cost O(new + buffer + max_stop) instead of O(total), turning the
-    // whole-response scan from O(n²) into O(n).
-    let max_stop_len = stop_strings.iter().map(String::len).max().unwrap_or(0);
-    let search_start = {
-        let raw = accumulated_content
-            .len()
-            .saturating_sub(new_chars.len() + buffer_len + max_stop_len);
-        accumulated_content.floor_char_boundary(raw)
-    };
-    // Find the earliest-matching stop string (and which one it was).
-    let matched = stop_strings
-        .iter()
-        .filter_map(|s| {
-            accumulated_content[search_start..]
-                .find(s.as_str())
-                .map(|rel| (rel + search_start, s.clone()))
-        })
-        .min_by_key(|(pos, _)| *pos);
-
-    if let Some((pos, stop_str)) = matched {
-        accumulated_content.truncate(pos);
-        let emit_start = (*emitted_len).min(pos);
-        let out = accumulated_content[emit_start..pos].to_string();
-        *emitted_len = pos;
-        *triggered = true;
-        return (out, Some(stop_str));
-    }
-
-    // No match: hold back the last `buffer_len` bytes. Snap to a UTF-8
-    // boundary so the emitted prefix is always valid Rust `str` and
-    // the held-back tail never contains a partial codepoint.
-    let acc_len = accumulated_content.len();
-    let raw_emit_end = acc_len.saturating_sub(buffer_len);
-    let emit_end = accumulated_content.floor_char_boundary(raw_emit_end);
-    let emit_start = (*emitted_len).min(emit_end);
-    let out = accumulated_content[emit_start..emit_end].to_string();
-    *emitted_len = emit_end;
-    (out, None)
-}
+// The hold-back algorithm lives with the shared matcher so the legacy
+// `/v1/completions` stream uses the identical implementation.
+pub(super) use crate::api::stop_match::apply_stop_string_holdback;
 
 #[cfg(test)]
 mod stop_string_holdback_tests {
@@ -913,6 +836,22 @@ mod stop_string_holdback_tests {
         );
         assert_eq!(out, "<|im_start|>");
         assert!(!triggered);
+    }
+
+    /// Two stops in one delta: the one that COMPLETES first wins even if
+    /// another starts earlier (vLLM check_stop_strings). The old
+    /// earliest-START scan picked "abcd" here.
+    #[test]
+    fn earliest_completion_wins_within_one_delta() {
+        let stops = vec!["abcd".to_string(), "bc".to_string()];
+        let mut acc = String::new();
+        let mut emitted = 0usize;
+        let mut triggered = false;
+        let (out, matched) =
+            apply_stop_string_holdback("xabcd", &stops, 3, &mut acc, &mut emitted, &mut triggered);
+        assert!(triggered);
+        assert_eq!(matched.as_deref(), Some("bc"));
+        assert_eq!(out, "xa");
     }
 
     /// Multi-byte UTF-8 inside the hold-back window must never be

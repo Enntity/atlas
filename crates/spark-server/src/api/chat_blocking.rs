@@ -122,6 +122,8 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
     // and the Tier 5c retry path all share the same Arc — no Vec<u32>
     // deep clones (~40 KB on a typical long-context opencode prompt).
     let prompt_tokens = std::sync::Arc::new(prompt_tokens);
+    let single_token_stops =
+        super::inference_impl::single_token_stop_map(&state.tokenizer, &req.stop);
 
     for choice_idx in 0..n {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -169,6 +171,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             prompt_logprobs: None,
             echo: false,
             timeout_at,
+            stop_watch: blocking_stop_watch(&state, &req.stop),
             response_tx: tx,
         };
 
@@ -217,8 +220,13 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
 
         let (reasoning_content_i, output_text_i) =
             decode_response_text(&state, &response, enable_thinking, tools_active);
-        let (output_text_i, matched_stop) =
+        let (output_text_i, text_stop) =
             super::inference_impl::strip_stop_sequences_matched(output_text_i, &req.stop);
+        let matched_stop = super::stop_match::resolve_matched_stop(
+            text_stop,
+            response.stop_token_id,
+            &single_token_stops,
+        );
 
         let mut choice = build_choice_message(
             &state,
@@ -265,8 +273,7 @@ pub(super) fn decode_response_text(
     enable_thinking: bool,
     tools_active: bool,
 ) -> (Option<String>, String) {
-    let output_tokens =
-        output_tokens_without_stop(&response.output_tokens, response.finish_reason.as_str());
+    let output_tokens = output_tokens_without_stop(&response.output_tokens, response.stop_token_id);
     // GLM's native tool opener also closes reasoning, but belongs to the tool
     // parser. Prefer the FIRST boundary; a later </think> must not swallow the
     // tool call. This never scans arbitrary reasoning text for call syntax.
@@ -358,12 +365,31 @@ fn split_at_first_think_end(
 /// The scheduler retains a terminal stop token in blocking output for usage
 /// accounting. Do not expose its decoded text when a tokenizer does not mark
 /// that EOS token as special (Laguna's `</assistant>` is one such token).
-fn output_tokens_without_stop<'a>(tokens: &'a [u32], finish_reason: &str) -> &'a [u32] {
-    if finish_reason == "stop" {
-        tokens.split_last().map_or(tokens, |(_, visible)| visible)
-    } else {
-        tokens
+///
+/// Drop the terminal EOS-set token (model EOS / single-token client stop)
+/// before decoding. Keyed on the scheduler's `stop_token_id`, NOT on
+/// `finish_reason == "stop"`: a client stop-STRING finish (and a cancel) is
+/// also "stop" but ends on an ordinary text token — dropping it would cut
+/// the tail of the stop string itself (`"Observation:"` → `"Observation"`),
+/// so the final strip would miss it and leak it into the content.
+fn output_tokens_without_stop(tokens: &[u32], stop_token_id: Option<u32>) -> &[u32] {
+    match tokens.split_last() {
+        Some((&last, visible)) if Some(last) == stop_token_id => visible,
+        _ => tokens,
     }
+}
+
+/// Scheduler-side stop-string watch for one blocking choice: decodes with
+/// the same special-token skipping as `decode_response_text`.
+pub(super) fn blocking_stop_watch(
+    state: &Arc<AppState>,
+    stops: &[String],
+) -> Option<super::stop_match::StopStringWatch> {
+    let state = state.clone();
+    super::stop_match::StopStringWatch::new(
+        stops,
+        Arc::new(move |ids: &[u32]| state.tokenizer.decode(ids).unwrap_or_default()),
+    )
 }
 
 /// Recover tool calls from reasoning for legacy parsers that depend on F7.
@@ -550,8 +576,19 @@ mod tests {
     fn blocking_decode_excludes_terminal_stop_token() {
         let tokens = [10, 11, 24];
 
-        assert_eq!(output_tokens_without_stop(&tokens, "stop"), &[10, 11]);
-        assert_eq!(output_tokens_without_stop(&tokens, "length"), &tokens);
+        assert_eq!(output_tokens_without_stop(&tokens, Some(24)), &[10, 11]);
+        assert_eq!(output_tokens_without_stop(&tokens, None), &tokens);
+    }
+
+    /// A stop-STRING finish reports "stop" but its last token is the text
+    /// that completed the stop string; the old `finish_reason == "stop"`
+    /// rule dropped it, so "Observation:" decoded as "Observation" and the
+    /// final strip missed the stop.
+    #[test]
+    fn blocking_decode_keeps_last_token_of_stop_string_finish() {
+        let tokens = [10, 11, 24];
+        assert_eq!(output_tokens_without_stop(&tokens, None), &tokens);
+        assert_eq!(output_tokens_without_stop(&tokens, Some(99)), &tokens);
     }
 
     #[test]

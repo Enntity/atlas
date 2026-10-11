@@ -60,8 +60,14 @@ fn dead_blocking_prefill_retires_and_live_one_survives() {
     drop(dead_rx);
     let (live_tx, mut live_rx) = tokio::sync::oneshot::channel();
     let mut prefilling = vec![
-        prefill(ResponseSink::Blocking(Some(dead_tx))),
-        prefill(ResponseSink::Blocking(Some(live_tx))),
+        prefill(ResponseSink::Blocking {
+            tx: Some(dead_tx),
+            stop_watch: None,
+        }),
+        prefill(ResponseSink::Blocking {
+            tx: Some(live_tx),
+            stop_watch: None,
+        }),
     ];
     assert_eq!(retire_disconnected_prefills(&model, &mut prefilling), 1);
     assert_eq!(prefilling.len(), 1, "only the dead prefill is dropped");

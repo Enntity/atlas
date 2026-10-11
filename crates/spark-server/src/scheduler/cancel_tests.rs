@@ -352,3 +352,85 @@ fn streaming_cancel_semantics_unchanged_for_blocking_helper() {
     assert!(retire_if_cancelled(&mut a));
     let _ = rx.try_recv();
 }
+
+/// Blocking requests have no stream-side matcher: the sink's stop-string
+/// watch is consulted at the same cancellation checkpoint and must retire
+/// the sequence once a multi-token stop appears in the content. Before the
+/// watch existed the blocking row kept generating to EOS / max_tokens.
+#[test]
+fn blocking_stop_string_watch_retires_at_checkpoint() {
+    let watch = || {
+        crate::api::stop_match::StopStringWatch::new(
+            &["Obs:".to_string()],
+            Arc::new(|ids: &[u32]| {
+                ids.iter()
+                    .map(|&t| match t {
+                        1 => "Ob",
+                        2 => "s:",
+                        _ => "x",
+                    })
+                    .collect()
+            }),
+        )
+    };
+    // The live receiver is returned so a dropped oneshot (buffered
+    // disconnect) does not retire the row for the wrong reason.
+    let blocking = |tokens: Vec<u32>| {
+        let (mut a, _rx) = test_seq(tokens, 20, None, 12);
+        a.finished = false;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        a.sink = ResponseSink::Blocking {
+            tx: Some(tx),
+            stop_watch: watch(),
+        };
+        (a, rx)
+    };
+
+    let (mut a, _live) = blocking(vec![9, 1]);
+    assert!(!retire_if_cancelled(&mut a), "partial stop must not retire");
+    assert!(!a.finished);
+    a.output_tokens.push(2); // "Ob" + "s:" completes the stop across tokens
+    assert!(retire_if_cancelled(&mut a));
+    assert!(a.finished);
+
+    // Stop text inside the reasoning block does not end generation.
+    let (mut a, _live) = blocking(vec![1, 2]);
+    a.inside_thinking = true;
+    assert!(!retire_if_cancelled(&mut a));
+    assert!(!a.finished);
+}
+
+/// The non-spec decode path checks retirement before sampling AND again
+/// before commit. A blocking stop-string hit at the first check must also
+/// hold at the second, or the row's placeholder `last_token` is committed
+/// as a new output token (mirror of the preset-cancel test above).
+#[test]
+fn non_spec_blocking_stop_string_hit_commits_no_token() {
+    let (mut a, _rx) = test_seq(vec![10], 20, None, 12);
+    a.finished = false;
+    a.min_tokens = 0;
+    let (tx, _rx2) = tokio::sync::oneshot::channel();
+    a.sink = ResponseSink::Blocking {
+        tx: Some(tx),
+        stop_watch: crate::api::stop_match::StopStringWatch::new(
+            &["STOP".to_string()],
+            Arc::new(|ids: &[u32]| ids.iter().map(|_| "STOP").collect()),
+        ),
+    };
+    let mut rows = vec![a];
+    decode(
+        &TestModel {
+            tokens: vec![101],
+            host_logits: false,
+            cancel_after_sampling: None,
+            cancel_after_row_commit: None,
+            verify: None,
+        },
+        &mut rows,
+        &SchedCtx::for_test(),
+    );
+    let a = &rows[0];
+    assert!(a.finished, "stop-string hit must retire the blocking row");
+    assert_eq!(a.output_tokens, vec![10], "no token may be committed");
+    assert_eq!(a.remaining, 20);
+}

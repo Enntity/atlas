@@ -71,6 +71,69 @@ pub(super) fn convert_stop_reason(finish_reason: &str) -> &'static str {
         // COMPLETE, which is the exact silent-truncation bug this reason
         // exists to prevent.
         crate::ir::FINISH_REASON_TIMEOUT => "max_tokens",
+        // Not an Anthropic stop reason on purpose: an engine abort
+        // must not read as end_turn (the truncation this exists for).
+        "error" => "error",
         _ => "end_turn",
+    }
+}
+
+/// Anthropic `(stop_reason, stop_sequence)` for a finished choice — the one
+/// mapping shared by the non-streaming response (`translate.rs`) and the
+/// streaming `message_delta` (`translator.rs`). A client stop sequence gets
+/// the dedicated `"stop_sequence"` reason and is echoed ONLY on a `Stop`
+/// finish; every other finish (tool_use, max_tokens, timeout, refusal)
+/// reports `stop_sequence: null` even if a stop string was recorded.
+pub(super) fn anthropic_stop(
+    reason: &crate::ir::FinishReason,
+    matched_stop: Option<String>,
+) -> (&'static str, Option<String>) {
+    match (reason, matched_stop) {
+        (crate::ir::FinishReason::Stop, Some(s)) => ("stop_sequence", Some(s)),
+        (r, _) => (convert_stop_reason(r.as_wire()), None),
+    }
+}
+
+#[cfg(test)]
+mod anthropic_stop_tests {
+    use super::anthropic_stop;
+    use crate::ir::{FINISH_REASON_TIMEOUT, FinishReason};
+
+    #[test]
+    fn maps_every_finish_reason() {
+        let m = || Some("END".to_string());
+        assert_eq!(
+            anthropic_stop(&FinishReason::Stop, m()),
+            ("stop_sequence", m())
+        );
+        assert_eq!(
+            anthropic_stop(&FinishReason::Stop, None),
+            ("end_turn", None)
+        );
+        // Old non-streaming path echoed the stop here (translate.rs).
+        assert_eq!(
+            anthropic_stop(&FinishReason::ToolCalls, m()),
+            ("tool_use", None)
+        );
+        assert_eq!(
+            anthropic_stop(&FinishReason::Length, m()),
+            ("max_tokens", None)
+        );
+        assert_eq!(
+            anthropic_stop(&FinishReason::ContentFilter, None),
+            ("refusal", None)
+        );
+        // Old non-streaming path mapped every `Other` to end_turn, telling the
+        // client a deadline-truncated turn was complete.
+        assert_eq!(
+            anthropic_stop(&FinishReason::Other(FINISH_REASON_TIMEOUT.into()), m()),
+            ("max_tokens", None)
+        );
+        // Engine abort: never end_turn, never echoes a stop.
+        assert_eq!(anthropic_stop(&FinishReason::Error, m()), ("error", None));
+        assert_eq!(
+            anthropic_stop(&FinishReason::Other("x".into()), None),
+            ("end_turn", None)
+        );
     }
 }

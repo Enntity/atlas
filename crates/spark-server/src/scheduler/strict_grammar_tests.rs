@@ -23,7 +23,10 @@ fn engine() -> Option<GrammarEngine> {
 }
 
 fn compile(spec: GrammarSpec, opens_in_thinking: bool) -> Option<GrammarState> {
-    let mut sink = ResponseSink::Blocking(None);
+    let mut sink = ResponseSink::Blocking {
+        tx: None,
+        stop_watch: None,
+    };
     compile_grammar_state(
         &mut engine(),
         &Some(spec),
@@ -76,7 +79,10 @@ fn response_format_grammars_are_strict_and_defer_past_an_open_think() {
 #[test]
 fn an_unarmable_response_format_is_reported_not_decoded_unconstrained() {
     let (tx, mut rx) = tokio::sync::oneshot::channel();
-    let mut sink = ResponseSink::Blocking(Some(tx));
+    let mut sink = ResponseSink::Blocking {
+        tx: Some(tx),
+        stop_watch: None,
+    };
     let err = compile_grammar_state(
         &mut None,
         &Some(GrammarSpec::JsonObject),
@@ -94,7 +100,10 @@ fn an_unarmable_response_format_is_reported_not_decoded_unconstrained() {
         "a blocking client gets HTTP 400, which SDKs do not retry"
     );
     // No grammar requested: nothing to arm, nothing reported.
-    let mut sink = ResponseSink::Blocking(None);
+    let mut sink = ResponseSink::Blocking {
+        tx: None,
+        stop_watch: None,
+    };
     assert!(
         compile_grammar_state(&mut None, &None, &[EOS], false, &mut sink)
             .unwrap()
@@ -180,7 +189,10 @@ fn a_strict_grammar_never_dispatches_speculation() {
 #[test]
 fn a_schema_too_large_to_compile_is_a_400_not_a_crash() {
     let (tx, mut rx) = tokio::sync::oneshot::channel();
-    let mut sink = ResponseSink::Blocking(Some(tx));
+    let mut sink = ResponseSink::Blocking {
+        tx: Some(tx),
+        stop_watch: None,
+    };
     let schema = crate::grammar::tests::schema_limits::too_many_rules_schema();
     let err = compile_grammar_state(
         &mut engine(),

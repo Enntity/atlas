@@ -154,6 +154,11 @@ to the source and profile that passed.
   **Done when:** each promoted profile passes the agreed task-quality thresholds
   and Q2's frozen numerical gates; a matching reference error cannot count as
   a correct task answer. Keep tuning cases separate from this regression corpus.
+  *Status 2026-10-11:* corpus (81 held-out + 10 tuning), checkers, runner with
+  Wilson intervals/`--compare` and provisional thresholds are in
+  `tests/exl3_validation/q4/` with CPU tests (`test_q4.py`). No live run yet:
+  the serial-profile measurement, final thresholds and per-profile results
+  remain open.
 
 ## P — measure and optimize the actual native EXL3 path
 

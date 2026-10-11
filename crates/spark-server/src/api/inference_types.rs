@@ -199,6 +199,10 @@ pub enum InferenceRequest {
         echo: bool,
         /// Request timeout as absolute deadline. None = no timeout.
         timeout_at: Option<std::time::Instant>,
+        /// Client stop STRINGS watched scheduler-side so a blocking request
+        /// stops generating once one appears (streaming requests do this in
+        /// the API layer via `cancel_flag`). `None` = no stop strings.
+        stop_watch: Option<crate::api::stop_match::StopStringWatch>,
         response_tx: tokio::sync::oneshot::Sender<anyhow::Result<InferenceResponse>>,
     },
     /// Streaming: sends tokens as they're generated.
@@ -329,6 +333,12 @@ pub struct TokenLogprobs {
 pub struct InferenceResponse {
     pub output_tokens: Vec<u32>,
     pub finish_reason: String,
+    /// The EOS-set token that ended the sequence (model EOS or a
+    /// single-token client stop), which is then the LAST entry of
+    /// `output_tokens` and not visible text. `None` when the sequence
+    /// ended any other way — notably a client stop-STRING finish, whose
+    /// last token is ordinary text that must not be dropped.
+    pub stop_token_id: Option<u32>,
     pub time_to_first_token_ms: f64,
     pub decode_time_ms: f64,
     /// Per-token logprobs (populated when top_logprobs is requested).
@@ -379,6 +389,10 @@ pub enum StreamEvent {
         /// "fuzzy_repetition"), if any — dump/observability only, never
         /// part of the OpenAI wire format.
         guard_stop: Option<&'static str>,
+        /// See [`InferenceResponse::stop_token_id`]. Streaming never sends
+        /// this token as a `Token` event, so it is the only way the API
+        /// layer learns WHICH single-token client stop ended the turn.
+        stop_token_id: Option<u32>,
     },
     Error(String),
 }

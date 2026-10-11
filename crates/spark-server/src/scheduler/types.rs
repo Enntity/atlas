@@ -47,7 +47,13 @@ pub(super) struct VisionSlice {
 
 /// How to deliver results for an active sequence.
 pub(super) enum ResponseSink {
-    Blocking(Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>),
+    Blocking {
+        tx: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
+        /// Client stop-string watch (see `emit_step::retire_if_cancelled`).
+        /// Rides on the sink so it follows the sequence through prefill
+        /// promotion, preemption and swap without extra plumbing.
+        stop_watch: Option<crate::api::stop_match::StopStringWatch>,
+    },
     Streaming(tokio::sync::mpsc::Sender<StreamEvent>),
 }
 
@@ -61,8 +67,8 @@ impl ResponseSink {
         match self {
             // `None` means the sender was already taken by lifecycle teardown;
             // that path owns cleanup, so do not treat it as live.
-            ResponseSink::Blocking(Some(tx)) => tx.is_closed(),
-            ResponseSink::Blocking(None) | ResponseSink::Streaming(_) => false,
+            ResponseSink::Blocking { tx: Some(tx), .. } => tx.is_closed(),
+            ResponseSink::Blocking { tx: None, .. } | ResponseSink::Streaming(_) => false,
         }
     }
 }

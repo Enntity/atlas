@@ -177,4 +177,9 @@ extend-exclude = [
     # benchmark/model fragments. They are checksummed data, not prose; changing
     # those bytes to satisfy a spell checker would corrupt the evidence record.
     "evidence/**/SERVER-SANITIZED.log",
+    # Q4 multilingual corpus: French/German/Spanish prompts and language
+    # marker words (`ein`, `ist`, `frase`) are intentional, not English typos.
+    "tests/exl3_validation/q4/*.jsonl",
+    "tests/exl3_validation/q4/build_corpus.py",
+    "tests/exl3_validation/q4/checkers.py",
 ]

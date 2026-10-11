@@ -38,7 +38,7 @@ fn drafter_floor(seq: &SequenceState) -> usize {
 /// The 3-token test prompt with `min_tokens` set.
 fn request(min_tokens: usize) -> InferenceRequest {
     let (response_tx, _rx) = tokio::sync::oneshot::channel();
-    let mut req = test_request!(Blocking, response_tx,);
+    let mut req = test_request!(Blocking, response_tx, stop_watch: None,);
     if let InferenceRequest::Blocking { min_tokens: m, .. } = &mut req {
         *m = min_tokens;
     }
