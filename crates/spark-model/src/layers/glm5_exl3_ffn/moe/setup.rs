@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
+use crate::exl3_gate_perturbation::Exl3GatePerturbation;
 impl NativeMoeFfn {
     pub(in crate::layers::glm5_exl3_ffn) fn new(
         gpu: &dyn GpuBackend,
@@ -142,6 +143,8 @@ impl NativeMoeFfn {
                 capacity,
                 stream,
                 active: true,
+                drop_shared: false,
+                round_routed_accum: false,
             }),
             Err(error) => {
                 let mut cleanup = None;
@@ -161,5 +164,37 @@ impl NativeMoeFfn {
                 })
             }
         }
+    }
+}
+impl NativeMoeFfn {
+    /// Apply a validated statistical-gate control to this routed layer.
+    /// Layer-conditional controls only touch the named layer.
+    pub(in crate::layers::glm5_exl3_ffn) fn apply_perturbation(
+        &mut self,
+        layer: usize,
+        perturbation: Option<Exl3GatePerturbation>,
+    ) -> Result<()> {
+        use crate::exl3_gate_perturbation as gate;
+        let topk = gate::layer_topk(self.topk, layer, perturbation);
+        // Every routed kernel takes top-k as a runtime argument and indexes
+        // compact [rows, topk] slots; scratch is sized for the configured
+        // top-k, so only a reduction is admissible.
+        ensure!(
+            topk > 0 && topk <= self.topk,
+            "EXL3 gate perturbation may only reduce routed top-k"
+        );
+        self.topk = topk;
+        self.scale = gate::routed_scale(self.scale, perturbation);
+        self.drop_shared = gate::drop_shared(layer, perturbation);
+        self.round_routed_accum = gate::bf16_routed_accum(perturbation);
+        Ok(())
+    }
+    /// `exl3_moe_combine_f32` (has_shared, round_accum). A dropped shared
+    /// expert leaves buffers[6] stale, so it must never be added.
+    pub(super) fn combine_flags(&self) -> [u32; 2] {
+        [
+            u32::from(!self.drop_shared),
+            u32::from(self.round_routed_accum),
+        ]
     }
 }

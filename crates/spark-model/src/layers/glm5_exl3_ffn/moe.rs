@@ -35,6 +35,10 @@ pub struct NativeMoeFfn {
     capacity: usize,
     stream: u64,
     active: bool,
+    /// Gate control: skip the shared expert (combine gets has_shared=0).
+    drop_shared: bool,
+    /// Gate control: BF16-round the running routed sum per expert.
+    round_routed_accum: bool,
 }
 impl NativeMoeFfn {
     pub fn validate(&self, rows: usize, stream: u64, rank: usize, world: usize) -> Result<()> {

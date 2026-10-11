@@ -271,6 +271,15 @@ pub fn build_model(
         store.adopt_exl3_companions(companions);
         layers
     } else {
+        // Gate controls exist only on the native EXL3 path; a set value here
+        // would silently do nothing, so refuse it.
+        anyhow::ensure!(
+            crate::exl3_gate_perturbation::Exl3GatePerturbation::parse_env()
+                .map_err(anyhow::Error::msg)?
+                .is_none(),
+            "{} is only honoured by the native EXL3 GLM-5.3 loader",
+            crate::exl3_gate_perturbation::ENV
+        );
         loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?
     };
     let free_after_layers = gpu.free_memory().unwrap_or(0);

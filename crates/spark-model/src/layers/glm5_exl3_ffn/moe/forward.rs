@@ -167,17 +167,20 @@ impl NativeMoeFfn {
         timer.measure("weighted_down_hadamard", || {
             self.output_hadamard(gpu, 2, self.buffers[5], rows)
         })?;
-        self.shared
-            .forward_local_profiled(gpu, input, self.buffers[6], rows, enabled)?;
+        if !self.drop_shared {
+            self.shared
+                .forward_local_profiled(gpu, input, self.buffers[6], rows, enabled)?;
+        }
         diagnostics::capture(
             &self.capture,
             invocation,
             gpu,
             "down_shared",
+            // A dropped shared expert leaves buffers[6] stale: do not record it.
             &[
-                ("down_weighted", F32, self.buffers[5], &downshape),
-                ("shared", Bf16, self.buffers[6], &hshape),
-            ],
+                ("down_weighted", F32, self.buffers[5], &downshape[..]),
+                ("shared", Bf16, self.buffers[6], &hshape[..]),
+            ][..if self.drop_shared { 1 } else { 2 }],
             self.stream,
         )?;
         let count = rows
@@ -197,7 +200,8 @@ impl NativeMoeFfn {
                 .arg_u32(n)
                 .arg_u32(h)
                 .arg_u32(topk)
-                .arg_u32(1)
+                .arg_u32(self.combine_flags()[0])
+                .arg_u32(self.combine_flags()[1])
                 .launch(self.stream)?;
             Ok(())
         })?;

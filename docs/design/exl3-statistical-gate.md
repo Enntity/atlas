@@ -122,6 +122,30 @@ gate reports the rule **unverifiable** and fails; the rule is never loosened.
 - **Measured, not assumed:** Atlas with `ATLAS_KDA_FLA_REFERENCE=0`, reported
   as the empirical minimum detectable effect.
 
+### Semantic perturbation switches
+
+Each must-fail perturbation is one value of `ATLAS_EXL3_GATE_PERTURBATION`
+(at most one per run), honoured only by the native EXL3 GLM-5.3 loader
+(`weight_loader/glm5/exl3_layers.rs`). It is parsed and validated once at
+model load; an unknown value, a malformed layer, or a layer that is not a
+routed MoE layer of the loaded model is a startup error. An active control
+logs one `WARN` banner. Unset or empty means no perturbation. Each TP rank reads its own
+environment, so every rank must be launched with the same value. Any set
+value on a non-EXL3 model is refused at startup.
+
+| Value | Effect |
+|---|---|
+| `mhc_post_1p9` | mHC post multiplier 2.0 → 1.9 at every native mHC site (MLA and KDA layers) |
+| `router_scale_2p4` | routed scaling factor 2.5 → 2.4 on every routed MoE layer (requires configured 2.5) |
+| `topk7_layer=<L>` | router top-k 8 → 7 on routed layer `L` only (requires configured top-8) |
+| `drop_shared_layer=<L>` | shared expert skipped (not added) on routed layer `L` only |
+| `bf16_routed_accum` | running routed-expert sum rounded to BF16 after each expert in `exl3_moe_combine_f32` |
+
+`<L>` is a 0-indexed layer that is routed in the loaded config (for the
+45-layer GLM-5.3 with three dense layers, 3..=44). `bf16_routed_accum` uses a
+kernel flag that is zero on the reference path; at registration it had not
+yet been exercised on a GPU.
+
 ## Secondary record
 
 The frozen-threshold `compare_logits.py` report against each reference,

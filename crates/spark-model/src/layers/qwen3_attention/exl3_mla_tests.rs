@@ -188,6 +188,7 @@ fn actual_mla_loader_owns_rank_local_weights_and_dispatches_every_native_field()
             3,
             77,
             fixture_numerics,
+            None,
         )
         .unwrap();
         assert_eq!(

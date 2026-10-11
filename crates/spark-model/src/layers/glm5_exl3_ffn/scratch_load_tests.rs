@@ -19,6 +19,7 @@ fn two_native_layers_borrow_one_scratch_and_release_only_their_weights() {
         77,
         fixture_numerics,
         Some(owner.borrow()),
+        None,
     )
     .unwrap();
     let one = gpu.alloc_count() - baseline;
@@ -31,6 +32,7 @@ fn two_native_layers_borrow_one_scratch_and_release_only_their_weights() {
         77,
         fixture_numerics,
         Some(owner.borrow()),
+        None,
     )
     .unwrap();
     assert_eq!(gpu.alloc_count() - baseline, one * 2);

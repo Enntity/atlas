@@ -37,7 +37,7 @@ pub fn load_glm5_exl3_ffn_with_numerics(
     select: crate::weight_loader::glm5::exl3_numerics::Exl3NumericsSelector,
 ) -> Result<FfnComponent> {
     load_glm5_exl3_ffn_with_scratch(
-        checkpoint, config, layer, gpu, capacity, stream, select, None,
+        checkpoint, config, layer, gpu, capacity, stream, select, None, None,
     )
 }
 
@@ -51,6 +51,7 @@ pub fn load_glm5_exl3_ffn_with_scratch(
     stream: u64,
     select: crate::weight_loader::glm5::exl3_numerics::Exl3NumericsSelector,
     scratch: Option<MoeScratchBorrow>,
+    perturbation: Option<crate::exl3_gate_perturbation::Exl3GatePerturbation>,
 ) -> Result<FfnComponent> {
     ensure!(
         capacity > 0 && u32::try_from(capacity).is_ok(),
@@ -210,6 +211,13 @@ pub fn load_glm5_exl3_ffn_with_scratch(
     moe.layer = Some(layer);
     moe.shared.layer = Some(layer);
     moe.capture = capture;
+    if let Err(error) = moe.apply_perturbation(layer, perturbation) {
+        let cleanup = moe.release(gpu);
+        return Err(match cleanup {
+            Ok(()) => error,
+            Err(e) => error.context(format!("EXL3 MoE rollback failed: {e:#}")),
+        });
+    }
     Ok(FfnComponent::Exl3(Box::new(Glm5Exl3FfnLayer::Moe(
         Box::new(moe),
     ))))

@@ -7,6 +7,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
 use super::qwen3_attention::HcSiteWeights;
+use crate::exl3_gate_perturbation::Exl3GatePerturbation;
 
 /// Explicit native serving policy, bound to the installed GLM-5.3 TP=2
 /// reference. The pinned checkpoint omits mhc_post_mult_value; the selected
@@ -16,12 +17,24 @@ use super::qwen3_attention::HcSiteWeights;
 pub(crate) struct MhcNumericalPolicy {
     post_multiplier: f32,
     rounded_sms: u32,
+    /// Statistical-gate control replacing the consumed post multiplier.
+    /// Declared checkpoint values still validate against the reference.
+    perturbed_post_multiplier: Option<f32>,
 }
 impl MhcNumericalPolicy {
     pub(crate) const GLM53_TP2_REFERENCE: Self = Self {
         post_multiplier: 2.0,
         rounded_sms: 48,
+        perturbed_post_multiplier: None,
     };
+
+    /// Apply the `mhc_post_1p9` gate control; every other value is a no-op.
+    pub(crate) fn with_perturbation(mut self, p: Option<Exl3GatePerturbation>) -> Self {
+        if p == Some(Exl3GatePerturbation::MhcPost19) {
+            self.perturbed_post_multiplier = Some(1.9);
+        }
+        self
+    }
 
     /// The installed GB10 reference partitions whole K64 blocks and selects
     /// splits from its explicit 48-SM profile and ceil(rows/64) launch grid.
@@ -48,7 +61,9 @@ impl MhcNumericalPolicy {
                 "checkpoint mhc_post_mult_value conflicts with explicit GLM53 TP2 reference policy"
             );
         }
-        Ok(self.post_multiplier)
+        Ok(self
+            .perturbed_post_multiplier
+            .unwrap_or(self.post_multiplier))
     }
 }
 
@@ -283,6 +298,29 @@ impl NativeExl3Mhc {
 mod tests {
     use super::*;
     use spark_runtime::gpu::mock::MockGpuBackend;
+
+    #[test]
+    fn mhc_post_perturbation_replaces_consumed_multiplier_only() {
+        let reference = MhcNumericalPolicy::GLM53_TP2_REFERENCE;
+        let perturbed = reference.with_perturbation(Some(Exl3GatePerturbation::MhcPost19));
+        assert_eq!(perturbed.post_multiplier(None).unwrap(), 1.9);
+        // A checkpoint declaring the reference 2.0 must not reject the control.
+        assert_eq!(perturbed.post_multiplier(Some(2.0)).unwrap(), 1.9);
+        assert!(perturbed.post_multiplier(Some(1.9)).is_err());
+        for other in [None, Some(Exl3GatePerturbation::RouterScale24)] {
+            let policy = reference.with_perturbation(other);
+            assert_eq!(policy.post_multiplier(Some(2.0)).unwrap(), 2.0);
+        }
+    }
+
+    #[test]
+    fn perturbed_mhc_load_stores_the_perturbed_multiplier() {
+        let gpu = MockGpuBackend::new();
+        let policy = MhcNumericalPolicy::GLM53_TP2_REFERENCE
+            .with_perturbation(Some(Exl3GatePerturbation::MhcPost19));
+        let mhc = NativeExl3Mhc::load(&gpu, 4096, 4, 20, 1e-6, 1e-6, policy, Some(2.0)).unwrap();
+        assert_eq!(mhc.post_multiplier, 1.9);
+    }
 
     #[test]
     fn named_reference_policy_validates_declared_checkpoint_values() {

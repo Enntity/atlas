@@ -24,6 +24,7 @@ impl Glm5KdaLayer {
         config: &atlas_core::config::ModelConfig,
         gpu: &dyn GpuBackend,
         routed_scratch: Option<crate::layers::glm5_exl3_ffn::MoeScratchBorrow>,
+        perturbation: Option<crate::exl3_gate_perturbation::Exl3GatePerturbation>,
     ) -> Result<Self> {
         ensure!(
             config.linear_key_head_dim == 128,
@@ -77,7 +78,8 @@ impl Glm5KdaLayer {
                 hc.sinkhorn_iters,
                 config.rms_norm_eps as f32,
                 hc.hc_eps,
-                crate::layers::glm5_exl3_mhc::MhcNumericalPolicy::GLM53_TP2_REFERENCE,
+                crate::layers::glm5_exl3_mhc::MhcNumericalPolicy::GLM53_TP2_REFERENCE
+                    .with_perturbation(perturbation),
                 config.hc_post_multiplier,
             )?)
         } else {

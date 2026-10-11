@@ -45,6 +45,8 @@ pub fn load_layers(
                 .count(),
         "EXL3 requires an explicit KV dtype for every MLA layer"
     );
+    // The single parse site for statistical-gate controls: native EXL3 only.
+    let perturbation = crate::exl3_gate_perturbation::Exl3GatePerturbation::load_for_model(config)?;
     let routed_layers = (0..config.num_hidden_layers)
         .filter(|l| !config.mlp_only_layers.contains(l))
         .count();
@@ -88,6 +90,7 @@ pub fn load_layers(
                 stream,
                 crate::weight_loader::glm53_tp2_packed_numerics,
                 scratch.as_ref().map(MoeScratch::borrow),
+                perturbation,
             )?;
             match config.layer_type(layer) {
                 LayerType::LinearAttention => {
@@ -106,6 +109,7 @@ pub fn load_layers(
                         config,
                         gpu,
                         scratch.as_ref().map(MoeScratch::borrow),
+                        perturbation,
                     )?));
                 }
                 LayerType::FullAttention => {
@@ -122,6 +126,7 @@ pub fn load_layers(
                         kv_dtypes[attention],
                         capacity,
                         stream,
+                        perturbation,
                     )?);
                     attention += 1;
                 }

@@ -90,6 +90,7 @@ fn run_mode(
                 stream,
                 spark_model::weight_loader::glm53_tp2_packed_numerics,
                 scratch.as_ref().map(MoeScratch::borrow),
+                None,
             )?);
         }
         let mut values = BTreeMap::new();

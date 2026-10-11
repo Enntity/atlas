@@ -88,7 +88,7 @@ def run_expert(module, dx, parts, weight, thin_cap, limit, mma_module=None, mma_
         for has_shared in (0, 1):
             functions['combine_f32']((2,), (256,),
                 (cp.from_dlpack(boundary), cp.from_dlpack(shared_control.view(torch.uint16)),
-                 guard_output[1:-1], *map(np.uint32, (3, 128, 2, has_shared))))
+                 guard_output[1:-1], *map(np.uint32, (3, 128, 2, has_shared, 0))))
             reference_control = boundary.sum(1).bfloat16()
             if has_shared:
                 reference_control = reference_control + shared_control
@@ -101,6 +101,14 @@ def run_expert(module, dx, parts, weight, thin_cap, limit, mma_module=None, mma_
         result['combine_boundary_shared'] = shared_control.float().cpu().numpy()
         result['combine_boundary_reference'] = reference_control.float().cpu().numpy()
         result['combine_boundary_native'] = (cp.asnumpy(guard_output[1:-1]).astype(np.uint32) << 16).view(np.float32).reshape(3, 128)
+        # bf16_routed_accum gate control: running routed sum rounded per slot.
+        functions['combine_f32']((2,), (256,),
+            (cp.from_dlpack(boundary), cp.from_dlpack(shared_control.view(torch.uint16)),
+             guard_output[1:-1], *map(np.uint32, (3, 128, 2, 1, 1))))
+        rounded_accum = boundary[:, 0].bfloat16()
+        rounded_accum = (rounded_accum.float() + boundary[:, 1]).bfloat16() + shared_control
+        np.testing.assert_array_equal(cp.asnumpy(guard_output[1:-1]).reshape(3, 128), rounded_accum.view(torch.uint16).cpu().numpy())
+        np.testing.assert_array_equal(cp.asnumpy(guard_output)[[0, -1]], [0x42f6, 0x42f6])
         functions['route_counts']((1,), (128,),
             (ids, counts, np.uint32(rows), np.uint32(1)))
         cinput = cp.from_dlpack(dx.view(torch.uint16))
@@ -131,7 +139,7 @@ def run_expert(module, dx, parts, weight, thin_cap, limit, mma_module=None, mma_
              *map(np.uint32, (rows, hidden, 1, 1, thin_cap))))
         combined = cp.empty((rows, hidden), cp.uint16)
         functions['combine_f32'](((rows * hidden + 255) // 256,), (256,),
-            (weighted, np.uint64(0), combined, *map(np.uint32, (rows, hidden, 1, 0))))
+            (weighted, np.uint64(0), combined, *map(np.uint32, (rows, hidden, 1, 0, 0))))
         result['down_xh'], result['down_yh'] = cp.asnumpy(down_xh), cp.asnumpy(down_yh)
         result['weighted_f32'] = cp.asnumpy(weighted)
         check_guard(down_storage)

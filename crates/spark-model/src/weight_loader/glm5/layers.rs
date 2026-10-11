@@ -56,6 +56,7 @@ pub(super) fn load_all(
                     config,
                     gpu,
                     None,
+                    None,
                 )?));
             }
             LayerType::FullAttention => {

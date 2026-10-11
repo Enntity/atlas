@@ -153,17 +153,23 @@ extern "C" __global__ void exl3_moe_down_weighted_output(
 
 // Grid(ceil(rows*hidden/256),1,1), block(256,1,1). Routed sum rounds BF16
 // before shared BF16 addition, then local combined BF16 gets one TP sum.
+// round_accum=1 is the bf16_routed_accum statistical-gate control: the
+// running routed sum is rounded to BF16 after every slot addition. With
+// round_accum=0 the arithmetic is identical to the reference policy.
 extern "C" __global__ void exl3_moe_combine_f32(
     const float* __restrict__ weighted_output, const __nv_bfloat16* __restrict__ shared,
     __nv_bfloat16* __restrict__ output,
-    unsigned int rows, unsigned int hidden, unsigned int topk, unsigned int has_shared) {
+    unsigned int rows, unsigned int hidden, unsigned int topk, unsigned int has_shared,
+    unsigned int round_accum) {
     const unsigned long long index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= static_cast<unsigned long long>(rows) * hidden) return;
     const unsigned long long row = index / hidden;
     const unsigned int feature = index % hidden;
     float sum = 0.0f;
-    for (unsigned int slot = 0; slot < topk; ++slot)
+    for (unsigned int slot = 0; slot < topk; ++slot) {
         sum = __fadd_rn(sum, weighted_output[(row * topk + slot) * hidden + feature]);
+        if (round_accum) sum = __bfloat162float(__float2bfloat16_rn(sum));
+    }
     sum = __bfloat162float(__float2bfloat16_rn(sum));
     if (has_shared) sum = __fadd_rn(sum, __bfloat162float(shared[index]));
     output[index] = __float2bfloat16_rn(sum);

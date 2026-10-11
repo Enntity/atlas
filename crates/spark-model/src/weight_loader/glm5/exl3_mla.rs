@@ -101,6 +101,7 @@ pub fn load_exl3_mla_layer(
     kv_dtype: KvCacheDtype,
     capacity: usize,
     stream: u64,
+    perturbation: Option<crate::exl3_gate_perturbation::Exl3GatePerturbation>,
 ) -> Result<Box<dyn TransformerLayer>> {
     load_exl3_mla_layer_with_numerics(
         store,
@@ -116,6 +117,7 @@ pub fn load_exl3_mla_layer(
         capacity,
         stream,
         super::exl3_numerics::glm53_tp2_packed_numerics,
+        perturbation,
     )
 }
 
@@ -134,6 +136,7 @@ pub fn load_exl3_mla_layer_with_numerics(
     capacity: usize,
     stream: u64,
     select: super::exl3_numerics::Exl3NumericsSelector,
+    perturbation: Option<crate::exl3_gate_perturbation::Exl3GatePerturbation>,
 ) -> Result<Box<dyn TransformerLayer>> {
     ensure!(
         config.model_type == "glm5_next" && config.qk_rope_head_dim == 0,
@@ -182,7 +185,8 @@ pub fn load_exl3_mla_layer_with_numerics(
                     hc.sinkhorn_iters,
                     config.rms_norm_eps as f32,
                     hc.hc_eps,
-                    crate::layers::glm5_exl3_mhc::MhcNumericalPolicy::GLM53_TP2_REFERENCE,
+                    crate::layers::glm5_exl3_mhc::MhcNumericalPolicy::GLM53_TP2_REFERENCE
+                        .with_perturbation(perturbation),
                     config.hc_post_multiplier,
                 )
             })
