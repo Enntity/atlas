@@ -106,6 +106,17 @@ class GateTests(unittest.TestCase):
             validate_runs(self.refs[:2], [cand])
         with self.assertRaisesRegex(ValueError, "mix serve"):
             validate_runs(self.refs + [run(self.rng, serve="other")], [cand])
+        mixed_references = copy.deepcopy(self.refs)
+        mixed_references[-1]["manifests"][0]["provenance"]["environment"]["TRACE_HOOK"] = "enabled"
+        with self.assertRaisesRegex(ValueError, "mix runtime environments"):
+            validate_runs(mixed_references, [cand])
+        second_candidate = copy.deepcopy(cand)
+        second_candidate["manifests"][0]["provenance"]["environment"]["CANDIDATE_CAPTURE"] = "enabled"
+        with self.assertRaisesRegex(ValueError, "mix runtime environments"):
+            validate_runs(self.refs, [cand, second_candidate])
+        separate_engine_profile = copy.deepcopy(cand)
+        separate_engine_profile["manifests"][0]["provenance"]["environment"] = {"CAPTURE": "candidate-only"}
+        validate_runs(self.refs, [separate_engine_profile, copy.deepcopy(separate_engine_profile)])
         with self.assertRaisesRegex(ValueError, "byte-identical"):
             validate_runs(self.refs, [cand, run(self.rng, engine="atlas")])
         other = copy.deepcopy(cand)
@@ -118,6 +129,26 @@ class GateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonfinite"):
             validate_runs(self.refs, [bad])
         validate_runs(self.refs, [cand, copy.deepcopy(cand)])
+
+    def test_build_and_capture_hook_hashes_are_pinned_per_engine(self):
+        mixed_build = copy.deepcopy(self.refs)
+        mixed_build[-1]["manifests"][0]["provenance"]["engine_build"]["source_sha256"] = "different-source"
+        with self.assertRaisesRegex(ValueError, "mix engine builds"):
+            validate_runs(mixed_build, [run(self.rng, engine="atlas")])
+
+        candidate = run(self.rng, engine="atlas")
+        mixed_candidate_build = copy.deepcopy(candidate)
+        mixed_candidate_build["manifests"][0]["provenance"]["engine_build"]["binary_sha256"] = "different-binary"
+        with self.assertRaisesRegex(ValueError, "mix engine builds"):
+            validate_runs(self.refs, [candidate, mixed_candidate_build])
+
+        mixed_hooks = copy.deepcopy(self.refs)
+        mixed_hooks[-1]["manifests"][0]["provenance"]["capture_hooks_sha256"] = {"sitecustomize.py": "different-hook"}
+        with self.assertRaisesRegex(ValueError, "mix capture hook hashes"):
+            validate_runs(mixed_hooks, [candidate])
+
+        candidate["manifests"][0]["provenance"]["capture_hooks_sha256"] = {"collector.py": "candidate-hook"}
+        validate_runs(self.refs, [candidate, copy.deepcopy(candidate)])
 
 
 if __name__ == "__main__":

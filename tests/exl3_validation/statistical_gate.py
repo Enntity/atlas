@@ -53,12 +53,18 @@ def validate_runs(references, candidates):
                 if manifest["provenance"][field] != base["provenance"][field]:
                     raise ValueError(f"runs differ in provenance {field}")
     for group, label in ((references, "reference"), (candidates, "candidate")):
+        profile = group[0]["manifests"][0]["provenance"]
         for run in group:
-            for base, manifest in zip(group[0]["manifests"], run["manifests"]):
-                if manifest["provenance"]["serve_flags"] != base["provenance"]["serve_flags"]:
+            for manifest in run["manifests"]:
+                provenance = manifest["provenance"]
+                if provenance["environment"] != profile["environment"]:
+                    raise ValueError(f"{label} runs mix runtime environments")
+                if provenance["serve_flags"] != profile["serve_flags"]:
                     raise ValueError(f"{label} runs mix serve configurations")
-                if manifest["provenance"]["engine_build"]["image"] != base["provenance"]["engine_build"]["image"]:
-                    raise ValueError(f"{label} runs mix images")
+                if provenance["engine_build"] != profile["engine_build"]:
+                    raise ValueError(f"{label} runs mix engine builds")
+                if provenance.get("capture_hooks_sha256") != profile.get("capture_hooks_sha256"):
+                    raise ValueError(f"{label} runs mix capture hook hashes")
     for run in references + candidates:
         if any(not np.isfinite(a).all() for a in run["rows"].values()):
             raise ValueError("nonfinite logits")

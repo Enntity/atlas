@@ -7,6 +7,10 @@ from pathlib import Path
 import threading
 from behavior_io import BehaviorIORouter
 from behavior_protocol import validate_body,validate_tool
+from behavior_messages import collect_messages
+from behavior_robustness import collect_robustness
+from behavior_surfaces import (SAMPLE_TEMPERATURE,STOP_MARKER,collect_surfaces)
+from behavior_tools import collect_tools
 from parity_protocol import validate_provenance
 
 MODEL_PROMPT='What is the capital of Japan? Reply with only Tokyo and no punctuation.'
@@ -37,6 +41,11 @@ def collect(base_url,model,provenance,out,context_limit,concurrency,timeout):
                           ('--max-batch-size','1'),('--max-num-seqs','1')]:
         if flag_value(provenance['serve_flags'],name)!=expected:
             raise ValueError('behavior profile requires '+name+' '+expected)
+    # A server-side chat-template default is an explicit thinking directive
+    # (api/chat/prepare.rs) and would void the thinking_in_tools=false and
+    # thinking-default expectations the cases assert.
+    if any(flag.split('=',1)[0]=='--default-chat-template-kwargs' for flag in provenance['serve_flags']):
+        raise ValueError('behavior profile requires no --default-chat-template-kwargs')
     io=BehaviorIORouter(base_url,out,timeout)
     scope='simultaneous HTTP; serial C1 GPU admission'
     graph={'status':'SKIP_UNQUALIFIED','reason':'This profile explicitly runs eager. TP2 graph opt-in is not qualified; configured FFN diagnostics reject graph capture. No graph execution or equivalence is claimed.'}
@@ -44,7 +53,8 @@ def collect(base_url,model,provenance,out,context_limit,concurrency,timeout):
               'concurrency_scope':scope,'graph':graph,'source_sha256':io.sources(),'requests':[],
               'scope':'Bounded HTTP behavior, not throughput, model quality certification, or vLLM parity.'}
     io.write('plan.json',{**manifest,'request_policy':{'temperature':0,'seed':42,'max_tokens':256,
-             'thinking_budget':32,'no_external_tools':True},'thinking_off_contract':
+             'thinking_budget':32,'sample_temperature':SAMPLE_TEMPERATURE,
+             'stop':[STOP_MARKER],'no_external_tools':True},'thinking_off_contract':
              'GLM template intentionally retains native low-effort reasoning without tools; no empty-think override or requirement that off suppress all internal reasoning.'})
 
     def payload(prompt,thinking):
@@ -117,6 +127,11 @@ def collect(base_url,model,provenance,out,context_limit,concurrency,timeout):
         return run('queued-'+str(index),payload(MATH_PROMPTS[index],True),MATH_ANSWERS[index],barrier=barrier)[0]
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
         manifest['requests'].extend(pool.map(queued,range(concurrency)))
+    manifest['requests'].extend(collect_surfaces(io,model,context_limit))
+    manifest['requests'].extend(collect_tools(io,model,context_limit))
+    manifest['requests'].extend(collect_messages(io,model,context_limit))
+    # Last: deliberately interrupts requests, then proves recovery.
+    manifest['requests'].extend(collect_robustness(io,model,context_limit))
     manifest['passed']=all(row['passed'] for row in manifest['requests'])
     io.write('manifest.json',manifest)
     return manifest

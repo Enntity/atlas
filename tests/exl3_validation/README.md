@@ -58,9 +58,8 @@ its local patches and runtime fingerprint before preparing an Atlas image.
 ## Isolated native image
 
 Use `docker/gb10/glm-5.3-flash-exl3/exl3/Dockerfile`. It requires explicit CUDA
-base images, toolchain, CPU affinity and source snapshot hash; the git commit is
-derived from a clean worktree. Derive the CUDA image arguments from the
-digest-pinned `docker/gb10/Dockerfile`.
+base images, toolchain, CPU affinity, commit and source snapshot hash. Derive the
+CUDA image arguments from the digest-pinned `docker/gb10/Dockerfile`.
 Use the installed stable release version explicitly, rather than an unrecorded
 rolling toolchain. Build with `--no-cache`, a unique source-hash validation tag,
 and no GPU-serving processes competing for RAM. The single-CPU affinity also
@@ -68,35 +67,16 @@ bounds the kernel build's internal compiler pool; Cargo's job flag alone does no
 Record the resolved image ID/digest and packaged fingerprint files. The image
 is a validation candidate until model/collective/logit checks pass.
 
-From a clean committed worktree, invoke:
+From the extracted, hash-verified source snapshot, invoke:
 
 ```bash
-BLAS131_PAIR_DIR=/path/to/blas131-pair bash tests/exl3_validation/build_image.sh \
-  "$SOURCE_SNAPSHOT_SHA256" "$RUST_STABLE_VERSION" "$BUILD_CPU_ID"
+bash tests/exl3_validation/build_image.sh \
+  "$SOURCE_SNAPSHOT_SHA256" "$SOURCE_COMMIT" "$RUST_STABLE_VERSION" "$BUILD_CPU_ID"
 ```
 
 `BUILD_CPU_ID` must name one CPU permitted by the build host's affinity mask.
-`BLAS131_PAIR_DIR` must hold the four nvidia-cublas 13.1.1.3 pair files
-(`libcublas.so.13`, `libcublasLt.so.13`, `package-binding-v1.json`,
-`dist-info/licenses/License.txt`), each verified against
-`docker/gb10/glm-5.3-flash-exl3/exl3/cublas131.sha256` before and after staging
-into `./blas131/`. The image ships the pair at `/opt/atlas/cublas-13.1.1.3`
-first in `LD_LIBRARY_PATH`, both `spark` and `exl3_moe_scratch_check`, and a
-`/usr/local/share/atlas/fingerprint/build-manifest.json` binding git commit,
-source snapshot hash, toolchain, compiler flags, binary SHA256s and embedded
-PTX SHA256s. Preserve the complete build log. This script builds only the
-isolated validation tag and prints the resolved image ID and labels; it never
-publishes an image.
-
-After the container starts, attest the runtime cuBLAS mappings from the host:
-
-```bash
-python3 tests/exl3_validation/attest_runtime_maps.py <pid|container-name>
-```
-
-It reads `/proc/<pid>/maps`, fails if anything other than the pinned pair is
-mapped (including the CUDA-toolkit `libcublasLt.so.13`), and hashes both mapped
-files against the same pins.
+Preserve the complete build log. This script builds only the isolated validation
+tag and prints the resolved image ID and labels; it never publishes an image.
 
 ## Teacher-forced collection and comparison
 
@@ -171,6 +151,17 @@ require investigation; increasing a threshold requires a justified new run.
 The collector creates an exclusive `capture-enabled` marker immediately before
 requests and removes it on success or failure. Both engine capture hooks must
 require that marker so startup dummy forwards do not contaminate captures.
+
+When running a multi-rank gate driver, wrap one run at a time so failed output,
+raw captures, and both rank logs survive retries:
+
+```bash
+tests/exl3_validation/run_gate_attempt.sh ref ref01 /path/to/gate_run.sh
+```
+
+The wrapper refuses reused run/attempt names. It archives under
+`~/gate/attempts/<name>/` on both hosts and returns failure if evidence
+preservation fails.
 
 Choose tolerances explicitly before examining the comparison. The pass gate
 requires full-shape finite logits, per-element absolute/relative tolerance,
@@ -315,22 +306,48 @@ Preserve the test-only `--experimental-fat-mma-profile 32 128 1 0`
 negative control, which changes the accumulation order. Preserve component failures and require the original full-model
 gates before claiming parity.
 
-## Statistical logit gate
+## API behavior (Q3)
 
-The frozen short16 thresholds are failed by the reference against itself
-(atomic-order nondeterminism in its MoE combine). Qualification uses the
-pre-registered exchangeability gate in
-[docs/design/exl3-statistical-gate.md](../../docs/design/exl3-statistical-gate.md):
+`collect_behavior.py` runs every bounded HTTP behavior case against a live
+Atlas server and writes one receipt set (`*.request.json`,
+`*.response.raw`, `*.events.json`, `manifest.json`); it exits nonzero unless
+every receipt passes. Profile flags are enforced from the provenance file
+(context 4096, prefill 128, batch 1, one sequence).
 
 ```bash
-python3 tests/exl3_validation/statistical_gate.py \
-  --reference R1_SHORT,R1_LONG ... --reference R9_SHORT,R9_LONG \
-  --candidate A1_SHORT,A1_LONG --candidate A2_SHORT,A2_LONG \
-  --ulp-control --out gate-report.json
-# must-pass control: replace --candidate with --held-out-reference R10_SHORT,R10_LONG
+python3 tests/exl3_validation/collect_behavior.py --base-url "$ATLAS_URL" \
+  --model "$MODEL" --provenance "$PROVENANCE" --out "$BEHAVIOR_DIR" \
+  --context-limit 4096 --concurrency 4 --timeout 600
 ```
 
-Each `--reference`/`--candidate` is one run (comma-joined `collect_logits.py`
-artifact directories, one per suite). The report records the hard-gate,
-catastrophic-row and rank results, T values, p, and the frozen-threshold
-comparison as a secondary record. CPU tests: `test_statistical_gate.py`.
+| Module | Surfaces |
+|---|---|
+| `collect_behavior.py` | thinking on/off/budget, blocking vs SSE identity, named/auto/streamed tool call + result follow-up, queued requests |
+| `behavior_surfaces.py` | `/v1/chat/completions` and legacy `/v1/completions`, blocking and SSE: finish `stop` vs `length`, stop sequences, stream/blocking usage identity, `include_usage` chunk order, multi-turn recall, seeded sampling repeat, reasoning separation, special-token leaks |
+| `behavior_tools.py` | `tool_choice` required / named / none / auto / invalid (400), parallel calls, streamed delta assembly, dependent follow-up from tool results, `response_format` `json_schema` and `json_object` |
+| `behavior_messages.py` | `/v1/messages` blocking and SSE: event order, content blocks, thinking enabled/disabled, `stop_reason` / `stop_sequence`, usage, `tool_use` to `tool_result` round trip, parity with the OpenAI path |
+| `behavior_robustness.py` | client cancel mid-stream and client timeout (chat and messages), then `/health`, an identical repeat of the baseline request, and `atlas_requests_active 0` |
+
+Assertions are exact: expected answers, schema conformance
+(`behavior_schema.py`, a stdlib subset that rejects unknown keywords), token
+accounting identities and protocol order, never mere non-emptiness. The
+legacy prompts embed the GLM-5.3 chat frame because `/v1/completions` applies
+no template. Thinking-off without tools still yields brief native reasoning
+(`glm5_next.jinja`), so only tool turns without a thinking directive must
+report zero reasoning (`thinking_in_tools = false`).
+
+Some gates encode the OpenAI/Anthropic contract where the current server code
+differs, and are expected to fail until Atlas is fixed. Examples are
+multi-token stop strings on blocking and legacy-streaming paths, the chat
+`include_usage` order, streamed Anthropic `stop_sequence`, and seeded
+sampling repeatability. Do not relax a gate to match the server.
+
+CPU self-tests use a local fake server only and are not qualification:
+
+```bash
+uv run --no-project --with pytest python -m pytest -q \
+  tests/exl3_validation/test_behavior.py tests/exl3_validation/test_behavior_schema.py \
+  tests/exl3_validation/test_behavior_anthropic_protocol.py \
+  tests/exl3_validation/test_behavior_surfaces.py tests/exl3_validation/test_behavior_q3.py \
+  tests/exl3_validation/test_collect_behavior.py
+```

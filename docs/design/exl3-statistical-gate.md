@@ -154,3 +154,42 @@ Second pre-collection note (2026-10-11): with `fp8_g128`, Atlas's sparse
 A trial candidate run without them returned HTTP 500 on the first 2048-token
 prefix and the TP group terminated; that run is discarded and recorded as a
 robustness defect (one request error stops the server).
+
+## Collection restart (2026-10-11): instrumentation and single-row reader
+
+The resumed diagnostic reproduced a separate failure with **both** prefill
+flags present: short16 and the 2047/2048-token prefixes completed, then the
+2049-token prefix failed at layer 3. Its one-token final chunk enters MLA
+decode, whose required FP8 reader was incorrectly gated by the experimental
+`ATLAS_GLM_SPARSE_DECODE_TC` flag. Both TP ranks exited. The durable record is
+`statistical-gate-20261011/resume-diag01/diagnosis.json`, with both container
+logs, identities, HTTP receipts and raw captures. This is diagnostic data.
+The replacement candidate must initialize and select the existing FP8 reader
+for ordinary serial inference; register its exact image/build identity before
+collecting any new candidate samples. The serving flags remain unchanged.
+
+The saved `ref01` and `ref02` runs are **diagnostic, not qualification samples**.
+Their registered context-v4 command also enabled intermediate FFN/KDA/mHC and
+head-input tensor captures. These copy GPU tensors to the CPU during forward
+and do not meet the instrumentation restriction above. Identical returned
+values do not establish that the hooks preserve atomic execution order.
+
+For the fresh reference set, the only permitted observers are the existing
+marker-gated **output logits collector** and the `serial128` **CPU chunk-position
+observer** needed by the long-suite capture contract. Remove the environment
+entries `ATLAS_EXL3_FFN_DUMP_DIR`, `ATLAS_EXL3_FFN_DUMP_LAYERS`,
+`ATLAS_EXL3_UPSTREAM_DUMP_LAYERS`, `ATLAS_EXL3_MHC_DUMP_LAYERS`, and
+`ATLAS_EXL3_CAPTURE_HEAD_INPUT`; setting a layer-list variable to `0` selects
+layer zero and does not disable it. Bind the exact hook files and the effective
+container environment in the fresh provenance before collection. Retain the
+reference image, checkpoint, request order, serving flags and numerical rule.
+“No hooked or instrumented builds” above therefore excludes stage tracing and
+arithmetic modifications; these two explicitly registered collection observers
+are required exceptions. Qualification applies to that observed profile, with
+no assertion of equivalence to an unobserved reference process.
+
+Start all nine reference samples and the held-out reference afresh. Never mix
+the old instrumented runs into this set. Within each engine, every suite and
+repeat must use the same effective environment and build identity. Neither
+this collection correction nor the runtime repair changes the statistic,
+catastrophic-row rule, sample count, or required controls.

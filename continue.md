@@ -1,6 +1,6 @@
 # GLM-5.3 EXL3 on two Sparks — continuation state
 
-Reviewed against `11671adf3247d32291e0a7cbcf3a0920786a138f` on 2026-10-10.
+Updated 2026-10-11 at checkpoint `checkpoint/stat-gate-20261011` (originally reviewed against `11671adf`).
 The model boots and generates on TP=2 / EP=1. The next objective is qualified,
 high performance inference: correct outputs, interactive latency, prompt
 processing, concurrent throughput, and reliable operation on both nodes.
@@ -18,15 +18,17 @@ superseded by the successful launch below.
 | Area | Status at review |
 |---|---|
 | Native checkpoint loading and two-node generation | Implemented; launch smoke recorded |
-| Full-model frozen numerical gates | **FAIL** (short16, reference-policy candidate `b6be48ed`). Text/argmax 16/16. The reference fails the same gate against its own repeats by the same magnitude; Atlas is byte-deterministic (3 fresh-server runs). First Atlas-own divergence: layer-3 attention (first DSA/MLA layer) — layers 0–2 are byte-exact in situ |
+| Full-model numerical gate | Frozen absolute gate retired by user decision (reference fails it against itself). Replaced by the **pre-registered statistical gate** `docs/design/exl3-statistical-gate.md` (`3cf66612`; addenda `87e4b08b`, `0e6bafb9`). Collection **in progress**: references ref01–ref02 of 9+1 collected (`statistical-gate-20261011/`); candidate long suite **blocked** by an HTTP 500 + TP-group exit (cause not yet captured). No gate verdict yet |
 | FLA reference-policy KDA | **Implemented** (`72d64e4c`, `069e4351`): module `kda_fla`, `ATLAS_KDA_FLA_REFERENCE=1`. Byte-exact vs GPU stage oracle (all stages, carried state, both ranks) and in situ (layer-0 core, gated norm, o_proj after TP, dense FFN; layers 0–2 inputs/outputs) |
 | Shared routed MoE scratch | Implemented; rank-local GPU reuse/guard proof recorded on both hosts |
 | FFN stage timing | Implemented, opt-in and synchronizing; useful for attribution, unsuitable for headline timings |
 | Merged KDA auxiliary projection | Implemented; layer-0 M1 padded to 3, M5 and M128 byte comparisons recorded on both hosts |
-| CUDA graphs, concurrent admission, long context, prefix reuse, FP8 KV | Unqualified for this native EXL3 profile; qualify independently |
+| MLA latent KV | Reference silently uses `fp8_ds_mla`; Atlas `--kv-cache-dtype fp8_g128` is the same format and is the candidate profile (needs `ATLAS_GLM_SPARSE_PREFILL_TC=1` + `ATLAS_GLM_SPARSE_PREFILL_KV_REUSE=1`, now enforced at startup by `c64b8c6e`). Layer-3 single-key rows match to 1 ulp; multi-key rows differ at implementation level |
+| API behavior (Q3) | Suite merged (`7a56d108`, 50 CPU tests); **not yet run live**; predicts defects: multi-token stop strings, chat include_usage order, streamed Anthropic stop_sequence, seeded first-token sampling |
+| CUDA graphs, concurrent admission, long context, prefix reuse | Unqualified for this native EXL3 profile; qualify independently |
 | DFlash/MTP/self-speculation | Explicitly rejected by native EXL3 startup guards; implementation and qualification required |
 | Reproducible deployable image | Recipe in-tree (`a6f64c46`): no-cache build `atlas-exl3-validation:src-efd023f8f7b9-rust1.97.1` = `sha256:b6be48ed…` from `59b0e113`; runtime maps attest only the pinned pair on both ranks; smoke 5/5. Owed: shard re-hash, `exl3_moe_scratch_check` GPU run |
-| Performance baseline | Unqualified diagnostic only (`p0-unqualified-baseline-20261010/`): decode ~0.45 s/token (~2.2 tok/s), 2573-token prompt TTFT ~139 s on the production image. Not a headline; P0 harness in branch `pi/p0-20261010` |
+| Performance baseline | Unqualified diagnostic only (`p0-unqualified-baseline-20261010/`): decode ~0.45 s/token (~2.2 tok/s) vs user-reported vLLM ~0.10 s/token; 2573-token TTFT ~139 s; candidate long prefill ~111 s per 2050-token prompt. No trace yet; P0 harness on branch `pi/p0-20261010` (unmerged, null `repeat`/`cold` fields) |
 
 This review checked source and committed records. It did not inspect live hosts,
 restart services, run a new GPU qualification, or establish a new performance
@@ -194,6 +196,8 @@ different scopes.
 | `arithmetic-audit/kda-reference-ptx-spec-20261010/`, `reference-triton-cache-20261010/` | Exactly-used compiled reference variants (PTX/TTGIR/autotune) and both nodes' original Triton caches |
 | `kda-fla-candidate-20261010/` | Reference-policy candidate: build log/manifest, create commands, short16 comparison + 2 determinism repeats, attestation, smoke, in-situ layer captures (L0 upstream, L0–4 FFN) and the matching canonical reference L0–3 capture |
 | `p0-unqualified-baseline-20261010/` | 6 streaming requests on the production image; harness stopped early (rate too low for the full matrix) |
+| `kda-fla-candidate-20261010/{ref-attn3-capture,mla3b-capture,fp8-mla,qdq-*,ref-mhc3-capture,mla3-capture}` | Layer-3 MLA/mHC captures on both engines: inputs/projections exact, core attention diverges; fp8_g128/QDQ reproduces single-key rows |
+| `statistical-gate-20261011/` | Pre-registered gate collection: ref01–ref02 (short16 + long, 16 rows each), candidate/reference provenance, create commands, `gate_run.sh`/`gate_batch.sh` drivers and batch log (failed cand01 attempts) |
 | `checkpoint-full-sha/` | Earlier full shard hashes; latest build only has stat/index guard, full re-hash still owed |
 | `local-ci-baseline-blockers/`, `fmt-baseline-review/`, `unchanged-dense-cache-baseline/` | Earlier baseline failures; reproduce before calling any current failure pre-existing |
 
@@ -214,26 +218,46 @@ were superseded by later evidence in the table.
 
 ## Next execution sequence
 
-1. Read [AGENTS.md](AGENTS.md), [CONTRIBUTING.md](CONTRIBUTING.md), the
-   [measurement discipline](.claude/skills/measurement-discipline/SKILL.md), and
-   [validation harness contract](tests/exl3_validation/README.md).
-2. Get the user's Q2 decision (todo.md Q2: pin reference nondeterminism,
-   approve a statistical gate, or retain the constraint). Do not relax the
-   frozen thresholds without it.
-3. Find Atlas's first own divergence: layer-3 attention (first DSA/MLA layer)
-   for the capital M5 request. Layers 0–2 are byte-exact on both ranks
-   (`kda-fla-candidate-20261010/cand-l04-capital` vs `ref-l03-capture`); add
-   MLA/indexer/mHC stage captures for layer 3 on both engines.
-4. Run the long-prefix gate (2047/2048/2051/2053) on image `b6be48ed` with
-   `ATLAS_KDA_FLA_REFERENCE=1`; finish Q0 (scratch-check GPU run, shard re-hash).
-5. P0: trace C1 decode (≈0.45 s/token unqualified) with Nsight on both ranks
-   before any optimization; merge the `pi/p0-20261010` harness after fixing
-   its null `repeat`/`cold` fields.
-6. Then Q3/Q4, P1–P6, F1–F4, R1/R2 as in todo.md.
+Checkpoint 2026-10-11: tag `checkpoint/stat-gate-20261011` (production restored,
+nodes idle, no GPU job running).
 
-Operational: production runs the original image on port 8000; the candidate
-image `atlas-exl3-validation:src-efd023f8f7b9-rust1.97.1` is loaded on both
-nodes; candidate create commands are in `kda-fla-candidate-20261010/`.
+1. Read [AGENTS.md](AGENTS.md), [CONTRIBUTING.md](CONTRIBUTING.md), the
+   [measurement discipline](.claude/skills/measurement-discipline/SKILL.md),
+   [validation harness contract](tests/exl3_validation/README.md) and the
+   [statistical gate](docs/design/exl3-statistical-gate.md).
+2. **Unblock the candidate long suite.** With the registered profile
+   (`statistical-gate-20261011/cand-rank*-create-command.json`: image
+   `atlas-exl3-validation:src-00ffffa17646-rust1.97.1` = `sha256:eb972c10…`,
+   `fp8_g128`, `ATLAS_KDA_FLA_REFERENCE=1`, both sparse-prefill flags) a fresh
+   server answered 2047/2053/2056-token prompts, but in the scripted run
+   (short16 first, then long via `collect_phase_logits.py` on the same server)
+   a long request returned HTTP 500 and the TP pair exited; the retry deleted
+   the logs. Reproduce by sending the 16 long requests one at a time after
+   short16 and save `docker logs` on both ranks before removing containers
+   (fix `gate_batch.sh` to keep failed run directories and logs). Suspects:
+   the exact 2048 boundary, prefix/SSM snapshot reuse after short16, chunk
+   tails. Any profile change must be registered in the gate doc before
+   candidate data is collected.
+3. Rebuild the image from HEAD if code changes (HEAD also adds the startup
+   check `c64b8c6e`); re-register the image identity in the gate doc.
+4. Finish collection: ref03–ref10 (ref10 held out), cand01, cand02
+   (byte-identical), candkda0 (policy-off minimum-detectable effect). Then run
+   `tests/exl3_validation/statistical_gate.py` with the controls; the
+   semantic must-fail perturbations still need runtime knobs (not built).
+5. Run the Q3 behavior suite live against the candidate; fix the predicted
+   API defects (Atlas bug-first).
+6. P0: trace C1 decode with Nsight on both ranks before optimizing; merge the
+   P0 harness after fixing its null fields. Target: user-reported vLLM
+   ~100 ms/token.
+7. Q0 leftovers: `exl3_moe_scratch_check` GPU run from the image, shard
+   re-hash. Then Q4, P1–P6, F1–F4, R1/R2 as in todo.md.
+
+Operational: production runs the original image on port 8000. Candidate
+images `src-efd023f8f7b9`/`src-d6e5d51121b3`/`src-00ffffa17646` are loaded on
+both nodes. Reference capture variants (`/tmp/kdafla-ref-*-rank*.json`,
+`/tmp/kdafla-ref-patch-attn`) live in `/tmp` on the nodes and are not durable;
+the attention hook source is `tests/exl3_validation/reference_attn_trace.py`.
+Subagents: use standard Opus subagents, not Pi/mimo (user instruction).
 
 The dated [code review](CODE_REVIEW_2026-10-10.md),
 [kernel review](GB10_KERNEL_OPTIMIZATION_REVIEW_2026-10-10.md) and
