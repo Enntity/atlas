@@ -105,7 +105,7 @@ pub fn process_seq_logits(
     // pipeline.
     let sampling_temp = if greedy_gate { 0.0 } else { effective_temp };
     // Advance seed per token for deterministic but varying randomness.
-    let step_seed = a.seed.map(|s| s.wrapping_add(a.output_tokens.len() as u64));
+    let step_seed = crate::scheduler::sample_step::rng_step_seed(a.seed, a.output_tokens.len());
 
     // ── SSOT post-processing (STEP 4 unification) ──
     // Build this position's penalty/bias params via the single

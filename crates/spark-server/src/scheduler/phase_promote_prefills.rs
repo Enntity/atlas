@@ -154,15 +154,20 @@ pub(super) fn build_active_seq_from_prefill(
     let mut seq = p.seq;
     // The min_tokens end-token ban, for every chunked prompt (one chunk or more).
     spark_model::traits::EosBan::new(seq.prompt_len, p.min_tokens, &p.eos_tokens).arm(&mut seq);
+    let output_tokens = if (!immediate_finish && spontaneous_think) || p.max_tokens == 0 {
+        vec![]
+    } else {
+        vec![first]
+    };
+    // Q3: the first token was draw 0; offset the RNG base when it is not in
+    // `output_tokens` so the next draw does not reuse `seed + 0`.
+    let decode_seed =
+        crate::scheduler::sample_step::decode_rng_base(p.seed, !output_tokens.is_empty());
     ActiveSeq {
         seq,
         session_hash: p.session_hash,
         last_token: first,
-        output_tokens: if (!immediate_finish && spontaneous_think) || p.max_tokens == 0 {
-            vec![]
-        } else {
-            vec![first]
-        },
+        output_tokens,
         remaining: if immediate_finish {
             0
         } else {
@@ -244,7 +249,7 @@ pub(super) fn build_active_seq_from_prefill(
         last_token_time: now,
         request_start: p.request_start,
         decode_start: now,
-        seed: p.seed,
+        seed: decode_seed,
         top_logprobs: p.top_logprobs,
         logprobs_data: Vec::new(),
         timeout_at: p.timeout_at,

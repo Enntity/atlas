@@ -426,7 +426,12 @@ pub(super) struct ActiveSeq {
     pub request_start: Instant,
     /// Decode start time (set after prefill completes, for decode throughput).
     pub decode_start: Instant,
-    /// Seed for deterministic sampling.
+    /// Seed for deterministic sampling: the RNG base for decode draws
+    /// (`sample_step::rng_step_seed(seed, output_tokens.len())`). Equals the
+    /// request seed, or request seed + 1 when a sequence admitted to decode
+    /// did not record its sampled first token in `output_tokens` (see
+    /// `sample_step::decode_rng_base`; finished-at-admission sequences never
+    /// draw again and keep the raw seed).
     pub seed: Option<u64>,
     /// Number of top logprobs to return per token. None = disabled.
     pub top_logprobs: Option<u8>,

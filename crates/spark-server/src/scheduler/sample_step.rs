@@ -385,29 +385,16 @@ pub fn sample_token(
     }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
+    // P1-4 (2026-07-09): caller's resolved min_p, not a 0.0 literal.
     Ok(sample_with_params(
         f32_bytes,
-        &SamplingParams {
+        &neutral_sampling_params(
             temperature,
             top_k,
             top_p,
-            top_n_sigma: 0.0,
-            // P1-4 (2026-07-09): caller's resolved min_p, not a 0.0 literal.
-            min_p: effective_min_p(min_p, levers),
-            logit_bias: Vec::new(),
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            repetition_penalty_window: 0,
-            lz_penalty: DEFAULT_LZ_PENALTY,
-            dry_multiplier: DEFAULT_DRY_MULTIPLIER,
-            dry_base: DEFAULT_DRY_BASE,
-            dry_allowed_length: DEFAULT_DRY_ALLOWED_LENGTH,
-            dry_sequence_breakers: Vec::new(),
-            max_tokens: 0,
-            stop_token_ids: Vec::new(),
+            effective_min_p(min_p, levers),
             seed,
-        },
+        ),
     ))
 }
 
@@ -518,37 +505,111 @@ pub fn sample_token_with_grammar(
     // Penalties already applied in place above; pass neutral penalty params
     // to `sample_with_params` (which re-runs the helper with empty history,
     // a guaranteed no-op) so the stochastic top-k/top-p/min-p pipeline runs.
+    //
+    // P1-4 (2026-07-09): thread the sequence's resolved min_p from the SSOT
+    // `penalties` struct (built by `penalty_params_for`, which copies
+    // `a.min_p` — request value + MODEL.toml `min_p_floor` applied in
+    // `sampling_setup`). This was a hardcoded 0.0, so the MTP BOOTSTRAP
+    // token — one of only two stochastic sample points under MTP — bypassed
+    // the FP8 argmax-flip safety net the floor documents. Kill-switch:
+    // ATLAS_NO_MTP_MINP=1 restores the 0.0 literal.
+    //
+    // Q3: the request seed rides on `penalties` too ([`grammar_sample_params`]).
     Ok(sample_with_params(
         f32_bytes,
-        &SamplingParams {
-            temperature,
-            top_k,
-            top_p,
-            top_n_sigma: 0.0,
-            // P1-4 (2026-07-09): thread the sequence's resolved min_p from
-            // the SSOT `penalties` struct (built by `penalty_params_for`,
-            // which copies `a.min_p` — request value + MODEL.toml
-            // `min_p_floor` applied in `sampling_setup`). This was a
-            // hardcoded 0.0, so the MTP BOOTSTRAP token — one of only two
-            // stochastic sample points under MTP — bypassed the FP8
-            // argmax-flip safety net the floor documents. Kill-switch:
-            // ATLAS_NO_MTP_MINP=1 restores the 0.0 literal.
-            min_p: effective_min_p(penalties.min_p, levers),
-            logit_bias: Vec::new(),
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            repetition_penalty_window: 0,
-            lz_penalty: DEFAULT_LZ_PENALTY,
-            dry_multiplier: DEFAULT_DRY_MULTIPLIER,
-            dry_base: DEFAULT_DRY_BASE,
-            dry_allowed_length: DEFAULT_DRY_ALLOWED_LENGTH,
-            dry_sequence_breakers: Vec::new(),
-            max_tokens: 0,
-            stop_token_ids: Vec::new(),
-            seed: None,
-        },
+        &grammar_sample_params(temperature, top_k, top_p, penalties, levers),
     ))
+}
+
+/// The penalty-neutral [`SamplingParams`] every scalar first-token /
+/// bootstrap sample feeds to `sample_with_params` ([`sample_token`],
+/// [`sample_first_token`], [`sample_token_with_grammar`]): only the shape knobs and
+/// the RNG seed are live; every penalty is neutral (empty history on the
+/// first token, or already applied in place on the grammar path).
+///
+/// Q3: one construction site so the seed cannot be dropped again — the
+/// grammar path previously hardcoded `seed: None` here while the
+/// non-grammar path carried it. Callers apply [`effective_min_p`] themselves.
+pub(super) fn neutral_sampling_params(
+    temperature: f32,
+    top_k: u32,
+    top_p: f32,
+    min_p: f32,
+    seed: Option<u64>,
+) -> SamplingParams {
+    SamplingParams {
+        temperature,
+        top_k,
+        top_p,
+        top_n_sigma: 0.0,
+        min_p,
+        logit_bias: Vec::new(),
+        repetition_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        repetition_penalty_window: 0,
+        lz_penalty: DEFAULT_LZ_PENALTY,
+        dry_multiplier: DEFAULT_DRY_MULTIPLIER,
+        dry_base: DEFAULT_DRY_BASE,
+        dry_allowed_length: DEFAULT_DRY_ALLOWED_LENGTH,
+        dry_sequence_breakers: Vec::new(),
+        max_tokens: 0,
+        stop_token_ids: Vec::new(),
+        seed,
+    }
+}
+
+/// The stochastic-tail params for [`sample_token_with_grammar`]: neutral
+/// penalties (already applied in place) plus the shape knobs, the floored
+/// min_p and the RNG seed taken from `penalties`. `sample_first_token` fills
+/// `penalties.seed` with the request seed; verify/bootstrap callers build
+/// `penalties` via [`verify_penalty_params`], whose debug_assert pins
+/// `seed == None`, so they stay unseeded.
+///
+/// Q3: this was a hardcoded `seed: None`, so a seeded request with an
+/// active grammar (json_schema, tool-call grammar) drew its first token
+/// unseeded.
+pub(super) fn grammar_sample_params(
+    temperature: f32,
+    top_k: u32,
+    top_p: f32,
+    penalties: &SamplingParams,
+    levers: &crate::scheduler::logit_processors::SamplingLevers,
+) -> SamplingParams {
+    neutral_sampling_params(
+        temperature,
+        top_k,
+        top_p,
+        effective_min_p(penalties.min_p, levers),
+        penalties.seed,
+    )
+}
+
+/// RNG seed for one decode-time draw: `ActiveSeq.seed` (the per-sequence
+/// RNG base, see [`decode_rng_base`]) advanced by `draws`, the number of
+/// output tokens already recorded (plus the verify offset on the MTP path).
+pub(super) fn rng_step_seed(base: Option<u64>, draws: usize) -> Option<u64> {
+    base.map(|s| s.wrapping_add(draws as u64))
+}
+
+/// The `ActiveSeq.seed` RNG base for a sequence promoted out of prefill.
+///
+/// Atlas emulates vLLM's per-request generator (seeded once in
+/// `v1/worker/gpu_model_runner.py:1328` `_update_states`, advanced by every
+/// draw in `v1/sample/ops/topk_topp_sampler.py:210` `random_sample`) by
+/// reseeding each draw with `seed + draw_index`. The first token is draw 0
+/// (`sample_first_token` gets the raw request seed); decode draws use
+/// `rng_step_seed(base, output_tokens.len())`. When the sampled first token
+/// IS recorded in `output_tokens`, `len` already counts it and the base is
+/// the request seed. When it is NOT (spontaneous `<think>` opener,
+/// `max_tokens == 0`), `len` lags the draw count by one, so the base is
+/// advanced by one — otherwise the second draw reused the first token's
+/// `seed + 0`. Either way decode draw index == tokens sampled so far.
+pub(super) fn decode_rng_base(
+    request_seed: Option<u64>,
+    first_token_in_output: bool,
+) -> Option<u64> {
+    rng_step_seed(request_seed, usize::from(!first_token_in_output))
 }
 
 /// Sample the FIRST generated token after prefill, applying the grammar
@@ -609,28 +670,10 @@ pub fn sample_first_token(
             levers,
         );
     };
-    let neutral = SamplingParams {
-        temperature,
-        top_k,
-        top_p,
-        top_n_sigma: 0.0,
-        // P1-4 (2026-07-09): resolved min_p, consumed via `penalties.min_p`
-        // inside `sample_token_with_grammar` (kill-switch applied there).
-        min_p,
-        logit_bias: Vec::new(),
-        repetition_penalty: 1.0,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-        repetition_penalty_window: 0,
-        lz_penalty: 0.0,
-        dry_multiplier: 0.0,
-        dry_base: DEFAULT_DRY_BASE,
-        dry_allowed_length: DEFAULT_DRY_ALLOWED_LENGTH,
-        dry_sequence_breakers: Vec::new(),
-        max_tokens: 0,
-        stop_token_ids: Vec::new(),
-        seed,
-    };
+    // P1-4 (2026-07-09): resolved min_p, consumed via `penalties.min_p`
+    // inside `sample_token_with_grammar` (kill-switch applied there). Q3: the
+    // request seed likewise rides on `penalties.seed`.
+    let neutral = neutral_sampling_params(temperature, top_k, top_p, min_p, seed);
     let tok = sample_token_with_grammar(
         model,
         logits,
@@ -778,99 +821,5 @@ mod penalty_scope_tests {
 }
 
 #[cfg(test)]
-mod seed_tests {
-    //! Q3: first-token routes must thread the request seed into the sampler.
-    //! Without it, `sample_first_token` / `sample_token` hardcode `seed: None`,
-    //! making seeded first-token sampling non-deterministic (continue.md audit).
-    use spark_runtime::sampler::{SamplingParams, sample_with_params};
-
-    fn make_params(seed: Option<u64>) -> SamplingParams {
-        SamplingParams {
-            temperature: 1.0,
-            top_k: 0,
-            top_p: 1.0,
-            top_n_sigma: 0.0,
-            min_p: 0.0,
-            logit_bias: Vec::new(),
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            repetition_penalty_window: 0,
-            lz_penalty: 0.0,
-            dry_multiplier: 0.0,
-            dry_base: 1.75,
-            dry_allowed_length: 2,
-            dry_sequence_breakers: Vec::new(),
-            max_tokens: 0,
-            stop_token_ids: Vec::new(),
-            seed,
-        }
-    }
-
-    /// Same seed + same logits → same token. This is the contract that
-    /// `sample_first_token` and `sample_token` must uphold when the caller
-    /// passes the request seed through.
-    #[test]
-    fn same_seed_produces_same_token() {
-        // Logits with a near-uniform distribution so sampling is stochastic.
-        let logits: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.01).sin()).collect();
-        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let params_a = make_params(Some(42));
-        let params_b = make_params(Some(42));
-        let tok_a = sample_with_params(&bytes, &params_a);
-        let tok_b = sample_with_params(&bytes, &params_b);
-        assert_eq!(tok_a, tok_b, "same seed must produce same token");
-    }
-
-    /// Different seeds should (almost always) produce different tokens
-    /// on a stochastic distribution. Not a hard guarantee (collision is
-    /// possible), but with 1000 tokens and different seeds it's a
-    /// strong signal that the seed actually reaches the RNG.
-    #[test]
-    fn different_seeds_produce_different_tokens() {
-        let logits: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.01).sin()).collect();
-        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let params_a = make_params(Some(42));
-        let params_b = make_params(Some(12345));
-        let tok_a = sample_with_params(&bytes, &params_a);
-        let tok_b = sample_with_params(&bytes, &params_b);
-        assert_ne!(tok_a, tok_b, "different seeds should produce different tokens");
-    }
-
-    /// None seed (non-deterministic) must not panic and must return a
-    /// valid token id. This is the legacy behavior when no seed is set.
-    #[test]
-    fn none_seed_returns_valid_token() {
-        let logits: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.01).sin()).collect();
-        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let params = make_params(None);
-        let tok = sample_with_params(&bytes, &params);
-        assert!((tok as usize) < 1000, "token must be within vocab");
-    }
-
-    /// Greedy (temperature=0) ignores the seed — argmax is deterministic
-    /// regardless. This pins the contract that seed only affects stochastic
-    /// sampling, not greedy paths.
-    #[test]
-    fn greedy_ignores_seed() {
-        let mut logits = vec![0.0f32; 100];
-        logits[42] = 10.0; // clear argmax
-        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let params_a = SamplingParams {
-            temperature: 0.0,
-            seed: Some(42),
-            ..make_params(None)
-        };
-        let params_b = SamplingParams {
-            temperature: 0.0,
-            seed: Some(99999),
-            ..make_params(None)
-        };
-        assert_eq!(sample_with_params(&bytes, &params_a), 42);
-        assert_eq!(sample_with_params(&bytes, &params_b), 42);
-    }
-}
+#[path = "sample_step_seed_tests.rs"]
+mod seed_tests;

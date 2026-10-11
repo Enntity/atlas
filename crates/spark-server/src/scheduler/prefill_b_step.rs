@@ -474,6 +474,10 @@ pub fn prefill_request(
 
     // The min_tokens end-token ban, as on the chunked paths.
     spark_model::traits::EosBan::new(seq.prompt_len, req_min_tokens, eos_tokens).arm(&mut seq);
+    // Q3: the first token was draw 0; offset the RNG base when it is not in
+    // `output_tokens` so the next draw does not reuse `seed + 0`.
+    let decode_seed =
+        crate::scheduler::sample_step::decode_rng_base(req_seed, !output_tokens.is_empty());
     Ok(Some(ActiveSeq {
         seq,
         session_hash: req_session_hash,
@@ -556,7 +560,7 @@ pub fn prefill_request(
         last_token_time: now,
         request_start,
         decode_start: now,
-        seed: req_seed,
+        seed: decode_seed,
         top_logprobs: req_top_logprobs,
         logprobs_data: Vec::new(),
         timeout_at: req_timeout_at,
