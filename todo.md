@@ -1,8 +1,9 @@
 # GLM-5.3 EXL3 — remaining high performance inference work
 
 Updated 2026-10-11 05:30 UTC. `cand-fp8decode02` collection complete (short16
-16/16, long 16/16). Q0 final-image smoke passed. Fresh statistical gate batch
-(9 refs + held-out + cand03 + candkda0) running since 05:29 UTC — see
+16/16, long 16/16). Q0 final-image smoke passed. First fresh batch died on ref03
+(reference provenance finalizer); fixed, batch 2 (ref04–ref12, held-out ref13,
+cand03, candkda0) running since 06:21 UTC — see
 [continue.md](continue.md) for live process details. Latest code is `4b49a9c4`
 (docs at `88a4332f`); GPU image pinned to `fb4f4b41`.
 Original roadmap review was against `11671adf`. Native TP=2 / EP=1 boot and generation
@@ -102,9 +103,10 @@ to the source and profile that passed.
   **Candidate run 1 (`cand-fp8decode02`) collection complete** at 05:11 UTC:
   short16 16/16, long 16/16, manifests present. Evidence archived to
   `statistical-gate-20261011/cand-fp8decode02/`.
-  **Fresh batch running since 05:29 UTC:** 9 references (ref03–ref11) +
-  held-out (ref12) + candidate run 2 (cand03) + `ATLAS_KDA_FLA_REFERENCE=0`
-  control (candkda0). Monitor: process `gate-batch-fresh` (proc_9b71).
+  **Batch 2 running since 06:21 UTC:** 9 references (ref04–ref12) +
+  held-out (ref13) + candidate run 2 (cand03) + `ATLAS_KDA_FLA_REFERENCE=0`
+  control (candkda0). The 05:29 batch died on ref03 provenance finalization
+  (see continue.md); ref03 is burned, its evidence in `failed-ref03/`.
   Both-rank failure logs and raw evidence are preserved in
   `statistical-gate-20261011/resume-diag01/`. The earlier ref01/ref02 enabled
   intermediate tensor captures and are diagnostic only. A collector-only

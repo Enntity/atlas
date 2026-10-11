@@ -83,6 +83,7 @@ fn delta_to_payloads(d: &StreamDelta, model: &str, id: &str, include_usage: bool
             reason,
             usage,
             token_ids,
+            ..
         } => {
             let wire_usage = wire_usage(usage);
             if include_usage {
@@ -292,6 +293,7 @@ mod tests {
             reason: FinishReason::Stop,
             usage,
             token_ids: vec![7],
+            matched_stop: None,
         };
 
         // include_usage=true: finish chunk first, then the final usage-only

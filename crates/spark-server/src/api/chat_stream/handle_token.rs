@@ -507,7 +507,8 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
     // `apply_stop_string_holdback` so the algorithm can be unit-tested
     // without spinning up a full `StreamCtx`.
     if !ctx.stop_strings.is_empty() && !state.stop_string_triggered {
-        delta = apply_stop_string_holdback(
+        let matched_stop;
+        (delta, matched_stop) = apply_stop_string_holdback(
             &delta,
             &ctx.stop_strings,
             ctx.stop_string_buffer_len,
@@ -518,9 +519,10 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
         // Entry was gated on `!triggered`, so a flip here is a GENUINE
         // client stop-sequence match (the watchdog paths set the flag
         // elsewhere): record it for the wire finish_reason ("stop", per
-        // OpenAI) and cancel generation.
+        // OpenAI) and cancel generation. The matched string is carried
+        // for the Anthropic `stop_sequence` echo.
         if state.stop_string_triggered {
-            state.note_stop_string_match();
+            state.note_stop_string_match(matched_stop);
         }
         if delta.is_empty() {
             // Either everything is sitting in the hold-back window
@@ -738,6 +740,9 @@ fn detector_content_arm(state: &mut StreamState, ctx: &StreamCtx, text: &str) ->
 /// - On match, `*triggered` is flipped to `true` and the accumulator
 ///   is truncated to the prefix that precedes the stop string.
 /// - On miss, `*triggered` stays `false`.
+/// Returns `(emitted_text, matched_stop_string)`. When a stop string
+/// matches, `matched_stop_string` is `Some(that string)` so the caller
+/// can record it for the Anthropic `stop_sequence` echo.
 pub(super) fn apply_stop_string_holdback(
     new_chars: &str,
     stop_strings: &[String],
@@ -745,7 +750,7 @@ pub(super) fn apply_stop_string_holdback(
     accumulated_content: &mut String,
     emitted_len: &mut usize,
     triggered: &mut bool,
-) -> String {
+) -> (String, Option<String>) {
     debug_assert!(!*triggered, "caller must gate on !triggered");
     accumulated_content.push_str(new_chars);
 
@@ -764,19 +769,23 @@ pub(super) fn apply_stop_string_holdback(
             .saturating_sub(new_chars.len() + buffer_len + max_stop_len);
         accumulated_content.floor_char_boundary(raw)
     };
-    let matched_pos = stop_strings
+    // Find the earliest-matching stop string (and which one it was).
+    let matched = stop_strings
         .iter()
-        .filter_map(|s| accumulated_content[search_start..].find(s.as_str()))
-        .min()
-        .map(|rel| rel + search_start);
+        .filter_map(|s| {
+            accumulated_content[search_start..]
+                .find(s.as_str())
+                .map(|rel| (rel + search_start, s.clone()))
+        })
+        .min_by_key(|(pos, _)| *pos);
 
-    if let Some(pos) = matched_pos {
+    if let Some((pos, stop_str)) = matched {
         accumulated_content.truncate(pos);
         let emit_start = (*emitted_len).min(pos);
         let out = accumulated_content[emit_start..pos].to_string();
         *emitted_len = pos;
         *triggered = true;
-        return out;
+        return (out, Some(stop_str));
     }
 
     // No match: hold back the last `buffer_len` bytes. Snap to a UTF-8
@@ -788,7 +797,7 @@ pub(super) fn apply_stop_string_holdback(
     let emit_start = (*emitted_len).min(emit_end);
     let out = accumulated_content[emit_start..emit_end].to_string();
     *emitted_len = emit_end;
-    out
+    (out, None)
 }
 
 #[cfg(test)]
@@ -809,7 +818,7 @@ mod stop_string_holdback_tests {
 
         // Delta 1: "hello " — entirely inside the hold-back window
         // (6 bytes < buffer_len=11). Nothing emitted.
-        let out = apply_stop_string_holdback(
+        let (out, _matched) = apply_stop_string_holdback(
             "hello ",
             &stops,
             buffer_len,
@@ -824,7 +833,7 @@ mod stop_string_holdback_tests {
         // Delta 2: "<|im_st" — partial stop string. acc="hello <|im_st"
         // (len=13). raw_emit_end=13-11=2, so we emit "he".
         // Crucially, "<|im_st" is HELD BACK — never sent to client.
-        let out = apply_stop_string_holdback(
+        let (out, _matched) = apply_stop_string_holdback(
             "<|im_st",
             &stops,
             buffer_len,
@@ -839,7 +848,7 @@ mod stop_string_holdback_tests {
         // Delta 3: "art|>" completes the stop string. We match at
         // pos=6, truncate acc to "hello ", and emit "llo " (bytes
         // 2..6 of acc).
-        let out = apply_stop_string_holdback(
+        let (out, _matched) = apply_stop_string_holdback(
             "art|>",
             &stops,
             buffer_len,
@@ -870,7 +879,7 @@ mod stop_string_holdback_tests {
         let mut emitted = 0usize;
         let mut triggered = false;
 
-        let out = apply_stop_string_holdback(
+        let (out, _matched) = apply_stop_string_holdback(
             "hello ",
             &stops,
             buffer_len,
@@ -881,7 +890,7 @@ mod stop_string_holdback_tests {
         assert_eq!(out, "hello ");
         assert!(!triggered);
 
-        let out = apply_stop_string_holdback(
+        let (out, _matched) = apply_stop_string_holdback(
             "world",
             &stops,
             buffer_len,
@@ -894,7 +903,7 @@ mod stop_string_holdback_tests {
 
         // Even a string that LOOKS like a stop marker is forwarded
         // verbatim because no stop strings are configured.
-        let out = apply_stop_string_holdback(
+        let (out, _matched) = apply_stop_string_holdback(
             "<|im_start|>",
             &stops,
             buffer_len,
@@ -923,7 +932,7 @@ mod stop_string_holdback_tests {
         // acc becomes "aébc" (5 bytes). raw_emit_end = 5-3 = 2 lands
         // mid-codepoint of 'é' (1..3). floor_char_boundary snaps to
         // 1, so we emit "a" only.
-        let out = apply_stop_string_holdback(
+        let (out, _matched) = apply_stop_string_holdback(
             "aébc",
             &stops,
             buffer_len,

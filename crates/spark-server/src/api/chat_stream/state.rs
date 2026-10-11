@@ -62,6 +62,9 @@ pub(super) struct StreamState {
     /// "length" when the cancel landed a step late and the budget ran
     /// out first). Set via [`StreamState::note_stop_string_match`].
     pub(super) stop_string_matched: bool,
+    /// The actual matched stop string (for Anthropic `stop_sequence`
+    /// echo in streaming). None when no client stop matched.
+    pub(super) matched_stop_string: Option<String>,
     /// Sanitiser state: suppressing content while waiting for a
     /// matching `</parameter>` close after an orphan `<parameter=`.
     pub(super) suppressing_param_leak: bool,
@@ -220,6 +223,7 @@ impl StreamState {
             refusal_scan_buf: String::new(),
             stop_string_triggered: false,
             stop_string_matched: false,
+            matched_stop_string: None,
             suppressing_param_leak: false,
             suppress_streak_tokens: 0,
             inside_envelope: false,
@@ -267,8 +271,9 @@ impl StreamState {
     /// burning suppressed tokens until natural EOS / max_tokens (the
     /// exact hazard the `cancel_flag` doc in `inference_types.rs`
     /// describes).
-    pub(super) fn note_stop_string_match(&mut self) {
+    pub(super) fn note_stop_string_match(&mut self, matched: Option<String>) {
         self.stop_string_matched = true;
+        self.matched_stop_string = matched;
         self.cancel_flag
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -286,11 +291,12 @@ mod stop_string_match_tests {
         let mut s = StreamState::new(false, false, flag.clone(), Vec::new());
         assert!(!s.stop_string_matched, "fresh stream: no match yet");
         assert!(!flag.load(Ordering::Acquire));
-        s.note_stop_string_match();
+        s.note_stop_string_match(Some("END".to_string()));
         assert!(
             s.stop_string_matched,
             "match must be recorded for handle_done"
         );
+        assert_eq!(s.matched_stop_string.as_deref(), Some("END"));
         assert!(
             flag.load(Ordering::Acquire),
             "scheduler cancel flag must flip so generation stops"

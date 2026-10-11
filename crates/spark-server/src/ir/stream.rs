@@ -34,11 +34,14 @@ pub enum StreamDelta {
     /// (tokens whose decoded text was buffered or suppressed, tool-call
     /// body tokens); carrying them on the terminal event keeps
     /// Σ token_ids == `usage.completion_tokens` for clients that opted
-    /// into `return_token_ids`.
+    /// into `return_token_ids`. `matched_stop` carries the client stop
+    /// string that triggered termination (Anthropic `stop_sequence` echo;
+    /// None when the stop was an EOS token or max_tokens).
     Finish {
         reason: super::response::FinishReason,
         usage: super::response::Usage,
         token_ids: Vec<u32>,
+        matched_stop: Option<String>,
     },
     /// Stream-level error payload, sent verbatim as SSE data.
     Error { message: String },

@@ -47,6 +47,7 @@ fn text_stream_framing() {
             reason: FinishReason::Stop,
             usage: usage(3, 1),
             token_ids: Vec::new(),
+            matched_stop: None,
         },
     ]);
     assert_eq!(
@@ -91,6 +92,7 @@ fn thinking_then_text_framing() {
             reason: FinishReason::Stop,
             usage: usage(0, 0),
             token_ids: Vec::new(),
+            matched_stop: None,
         },
     ]);
     assert_eq!(
@@ -131,6 +133,7 @@ fn tool_call_stream_framing() {
             reason: FinishReason::ToolCalls,
             usage: usage(0, 0),
             token_ids: Vec::new(),
+            matched_stop: None,
         },
     ]);
     assert_eq!(
@@ -182,6 +185,7 @@ fn multi_tool_calls_close_and_reopen_blocks() {
             reason: FinishReason::ToolCalls,
             usage: usage(0, 2),
             token_ids: Vec::new(),
+            matched_stop: None,
         },
     ]);
     assert_eq!(
@@ -230,4 +234,51 @@ fn finalize_without_finish_emits_end_turn() {
         ]
     );
     assert_eq!(out[4].data["delta"]["stop_reason"], "end_turn");
+}
+
+/// Q3: a matched client stop sequence must produce Anthropic
+/// `stop_reason="stop_sequence"` with the matched string echoed in
+/// `stop_sequence` — matching the non-streaming path (translate.rs).
+/// Previously the streaming translator always emitted
+/// `stop_sequence: null` and `stop_reason: "end_turn"`.
+#[test]
+fn stop_sequence_match_echoes_string_and_reason() {
+    let evs = drive(vec![
+        StreamDelta::Content {
+            text: "Hello".into(),
+            token_ids: Vec::new(),
+        },
+        StreamDelta::Finish {
+            reason: FinishReason::Stop,
+            usage: usage(5, 1),
+            token_ids: Vec::new(),
+            matched_stop: Some("END".to_string()),
+        },
+    ]);
+    // The message_delta (index 4) must carry stop_sequence reason + echo.
+    let delta = &evs[4];
+    assert_eq!(delta.event, "message_delta");
+    assert_eq!(delta.data["delta"]["stop_reason"], "stop_sequence");
+    assert_eq!(delta.data["delta"]["stop_sequence"], "END");
+}
+
+/// Without a matched stop, the reason stays "end_turn" and stop_sequence
+/// is null (the EOS / natural-stop case).
+#[test]
+fn eos_stop_keeps_end_turn_and_null_sequence() {
+    let evs = drive(vec![
+        StreamDelta::Content {
+            text: "Done".into(),
+            token_ids: Vec::new(),
+        },
+        StreamDelta::Finish {
+            reason: FinishReason::Stop,
+            usage: usage(4, 1),
+            token_ids: Vec::new(),
+            matched_stop: None,
+        },
+    ]);
+    let delta = &evs[4];
+    assert_eq!(delta.data["delta"]["stop_reason"], "end_turn");
+    assert!(delta.data["delta"]["stop_sequence"].is_null());
 }

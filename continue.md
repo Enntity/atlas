@@ -4,23 +4,36 @@ Updated 2026-10-11 05:30 UTC. Resume from tag `checkpoint/fp8decode-20261011`
 on branch `sparkglm/installable-20260924`; latest implementation commit is
 `88a4332f` (docs checkpoint; `4b49a9c4` is the latest code change).
 
-**Status 2026-10-11 05:30 UTC:**
+**Status 2026-10-11 06:25 UTC:**
 
-- `cand-fp8decode02` collection **completed** at 05:11 UTC: short16 16/16,
-  long 16/16, manifests present. Evidence archived to
-  `statistical-gate-20261011/cand-fp8decode02/` under the durable root.
-- **Q0 final-image smoke passed** at 05:28 UTC: 5/5 requests OK (short-greedy,
-  long-generation 630 tokens, multi-turn recall, sampled). Receipt:
-  `fp8decode-candidate-20261011/final-image-smoke/smoke.json`.
-- **Fresh statistical gate batch launched** at 05:29 UTC: 9 references
-  (ref03–ref11) + 1 held-out (ref12) + candidate run 2 (cand03) + candkda0
-  control. Batch log: process `gate-batch-fresh` (proc_9b71). Expected
-  duration ~7–8 hours. Uses `run_gate_attempt.sh` wrapping `gate_run.sh`
-  from `collector-only-profile/`.
-- After batch: run `statistical_gate.py` with `--reference` (9), `--candidate`
-  (cand-fp8decode02, cand03), `--held-out-reference` (ref12), `--ulp-control`.
+- The 05:29 batch (`gate_batch_fresh.sh`) **died**: both ref03 attempts failed
+  reference provenance finalization, then `|| exit 1` ended the driver. Cause:
+  the reference image maps wheel runtimes by soname only (`libnccl.so.2`,
+  `libcudart.so.13`), so no version could be derived from the path. The
+  finalizer had never completed for `ref` before (ref01/ref02 predate it).
+  The old driver's retry cleanup also `rm -rf`'d attempt 1's evidence; attempt
+  2's both-rank logs/inspect/captures are archived in
+  `statistical-gate-20261011/failed-ref03/`. `ref03` is burned.
+- Finalizer fixed (live copy `/tmp/atlas-resume-20261011/provenance/`, durable
+  copy in `collector-only-profile/provenance-tools/`, original kept as
+  `finalize_provenance.pre-ref-version-fix.py`): when the path has no version,
+  NCCL uses the mapped binary's own `NCCL version X+cuda` banner (cross-checked
+  with the owning wheel), cudart uses the owning `*.dist-info/RECORD` entry
+  whose sha256 must match the mapped bytes. Reference attests NCCL 2.30.7 /
+  CUDA runtime 13.0.96. It also accepts `candkda0` (candidate descriptors plus
+  exactly `ATLAS_KDA_FLA_REFERENCE=0`), which the old chain would have rejected.
+  Dry runs `ref03-finalizer-dryrun{,2}` passed on both live reference ranks:
+  `statistical-gate-20261011/finalizer-dryrun-ref03/`.
+- **Batch 2 running since 06:21 UTC** (`collector-only-profile/gate_batch_fresh2.sh`):
+  refs **ref04–ref12** (9), held-out **ref13**, cand03, candkda0. It never
+  deletes evidence; a failed attempt is retried as `NAME-r2`. Logs:
+  `statistical-gate-20261011/batch2-driver.log` and `batch2-logs/NAME.log`;
+  completed runs append to `batch2-logs/completed.txt`.
+- After batch: `statistical_gate.py` with `--reference` (ref04–ref12),
+  `--candidate` (cand-fp8decode02, cand03), `--held-out-reference` ref13,
+  `--ulp-control`.
 - GPU image remains pinned to `fb4f4b41` (image `sha256:e744b81d…`);
-  `4b49a9c4` (streaming usage order fix) needs a rebuilt image for Q3.
+  `4b49a9c4`, `7e04679f`, `f7791189` need a rebuilt image for Q3.
 
 [todo.md](todo.md) is the authoritative remaining-work checklist, with task IDs,
 dependencies and completion criteria. This file holds the restart context,
@@ -28,26 +41,22 @@ implementation status and evidence needed to execute it. The design documents
 specify arithmetic; the dated reviews contain hypotheses, not measured Atlas
 speedups.
 
-## Live job — fresh statistical gate batch
-
-Batch started 2026-10-11 05:29 UTC via `gate_batch_fresh.sh`. Runs sequentially:
-ref03→ref11 (9 refs), ref12 (held-out), cand03 (candidate 2), candkda0 (control).
-Each run: fresh two-rank containers, short16 + long suites, evidence preserved
-via `run_gate_attempt.sh`. Monitor: `process output proc_9b71` or
-`tail /tmp/pi-processes-*/proc_9b71-stdout.log`.
+## Live job — fresh statistical gate batch 2
 
 Read-only checks:
 
 ```bash
-tail -n 30 /tmp/pi-processes-*/proc_9b71-stdout.log
-spark0 'docker ps; ls ~/gate/ | grep -E "^(ref|cand)"'
+cat /home/colum/Workspace/atlas-exl3-validation-20261010/statistical-gate-20261011/batch2-driver.log
+cat /home/colum/Workspace/atlas-exl3-validation-20261010/statistical-gate-20261011/batch2-logs/completed.txt
+spark0 'docker ps; ls ~/gate ~/gate/attempts'
 ```
 
 Durable local evidence root:
 `/home/colum/Workspace/atlas-exl3-validation-20261010`.
 Fresh create commands and drivers are under
 `statistical-gate-20261011/collector-only-profile/`; finalized provenance tools
-are in `/tmp/atlas-resume-20261011/provenance/`.
+are in `/tmp/atlas-resume-20261011/provenance/` (restore from
+`provenance-tools/` if missing).
 
 ## Completed since last checkpoint
 
@@ -403,3 +412,25 @@ the head transport finding is open. Local-accumulator specialization, ordered
 split-K, mHC parallelization and expert grouping are candidates whose priority
 must follow an Atlas trace. Legacy NVFP4 router advice and prior-engine rates
 must not be treated as native EXL3 results.
+
+## Q3 code fixes (2026-10-11, not yet in GPU image)
+
+Two Q3 defects fixed in source (commits `7e04679f`, `f7791189`); the GPU
+image remains pinned to `fb4f4b41` and needs a rebuild + preregistration
+before live Q3 validation:
+
+1. **First-token seed threading** (`7e04679f`): `sample_first_token` and
+   `sample_token` hardcoded `seed: None`, ignoring the request seed for the
+   first sampled token. Added `seed: Option<u64>` parameter threaded from all
+   9 callers. 4 deterministic sampler regression tests added.
+
+2. **Anthropic streamed stop_sequence** (`f7791189`): The streaming translator
+   always emitted `stop_sequence: null` + `stop_reason: "end_turn"`, even when
+   a client stop matched. Added `matched_stop: Option<String>` to
+   `StreamDelta::Finish`, threaded from `apply_stop_string_holdback` (now
+   returns the matched string) through `StreamState` into the translator.
+   Now emits `stop_reason: "stop_sequence"` + echoes the matched string.
+
+Multi-token stops were already handled correctly via string matching
+(`apply_stop_string_holdback` with `stop_string_buffer_len` holdback);
+investigated and confirmed no defect.

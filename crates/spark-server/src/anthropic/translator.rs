@@ -309,7 +309,7 @@ impl AnthropicTranslator {
                     }),
                 ));
             }
-            StreamDelta::Finish { reason, usage, .. } => {
+            StreamDelta::Finish { reason, usage, matched_stop, .. } => {
                 if self.finished {
                     return;
                 }
@@ -320,13 +320,21 @@ impl AnthropicTranslator {
                 if let Some(stop) = self.close_open_block() {
                     out.push(stop);
                 }
+                // A client stop sequence gets its dedicated reason + echo,
+                // matching the non-streaming path (translate.rs).
+                let (stop_reason, stop_sequence) = match (&reason, &matched_stop) {
+                    (crate::ir::FinishReason::Stop, Some(s)) => {
+                        ("stop_sequence", serde_json::Value::String(s.clone()))
+                    }
+                    _ => (convert_stop_reason(reason.as_wire()), serde_json::Value::Null),
+                };
                 out.push(Self::make_event(
                     "message_delta",
                     serde_json::json!({
                         "type": "message_delta",
                         "delta": {
-                            "stop_reason": convert_stop_reason(reason.as_wire()),
-                            "stop_sequence": serde_json::Value::Null,
+                            "stop_reason": stop_reason,
+                            "stop_sequence": stop_sequence,
                         },
                         "usage": self.final_usage(),
                     }),

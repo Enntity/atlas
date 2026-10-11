@@ -527,6 +527,7 @@ pub fn start_chunked_prefill(
             top_p,
             min_p,
             eos_tokens,
+            req_seed,
             p.grammar_state.as_mut(),
             &sched.levers.sampling(),
         ) {

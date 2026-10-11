@@ -296,6 +296,7 @@ pub fn prefill_request(
             top_p,
             min_p,
             eos_tokens,
+            req_seed,
             grammar_state.as_mut(),
             &sched.levers.sampling(),
         )

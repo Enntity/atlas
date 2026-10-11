@@ -79,7 +79,7 @@ mod tests {
     fn explicit_stop_preserves_same_event_prefix_but_not_following_tokens() {
         let mut s = state();
         let prefix = while_open(&mut s, |s| {
-            let text = super::super::apply_stop_string_holdback(
+            let (text, matched) = super::super::apply_stop_string_holdback(
                 "hello STOP trailing",
                 &["STOP".into()],
                 3,
@@ -88,7 +88,8 @@ mod tests {
                 &mut s.stop_string_triggered,
             );
             assert!(s.stop_string_triggered);
-            s.note_stop_string_match();
+            assert_eq!(matched.as_deref(), Some("STOP"));
+            s.note_stop_string_match(matched);
             vec![StreamDelta::Content {
                 text,
                 token_ids: vec![1],

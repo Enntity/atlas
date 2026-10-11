@@ -323,6 +323,7 @@ pub fn sample_token(
     top_p: f32,
     min_p: f32,
     suppress_ids: &[u32],
+    seed: Option<u64>,
     levers: &crate::scheduler::logit_processors::SamplingLevers,
 ) -> Result<u32> {
     if temperature == 0.0 && suppress_ids.is_empty() {
@@ -405,7 +406,7 @@ pub fn sample_token(
             dry_sequence_breakers: Vec::new(),
             max_tokens: 0,
             stop_token_ids: Vec::new(),
-            seed: None,
+            seed,
         },
     ))
 }
@@ -589,6 +590,7 @@ pub fn sample_first_token(
     top_p: f32,
     min_p: f32,
     suppress_ids: &[u32],
+    seed: Option<u64>,
     grammar_state: Option<&mut GrammarState>,
     levers: &crate::scheduler::logit_processors::SamplingLevers,
 ) -> Result<u32> {
@@ -603,6 +605,7 @@ pub fn sample_first_token(
             top_p,
             min_p,
             suppress_ids,
+            seed,
             levers,
         );
     };
@@ -626,7 +629,7 @@ pub fn sample_first_token(
         dry_sequence_breakers: Vec::new(),
         max_tokens: 0,
         stop_token_ids: Vec::new(),
-        seed: None,
+        seed,
     };
     let tok = sample_token_with_grammar(
         model,
@@ -771,5 +774,103 @@ mod penalty_scope_tests {
         let mut bias = vec![(OPEN, 3.0f32)];
         strip_in_tool_opener_bias(&mut bias, true, None);
         assert_eq!(bias, vec![(OPEN, 3.0f32)]);
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    //! Q3: first-token routes must thread the request seed into the sampler.
+    //! Without it, `sample_first_token` / `sample_token` hardcode `seed: None`,
+    //! making seeded first-token sampling non-deterministic (continue.md audit).
+    use spark_runtime::sampler::{SamplingParams, sample_with_params};
+
+    fn make_params(seed: Option<u64>) -> SamplingParams {
+        SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            top_n_sigma: 0.0,
+            min_p: 0.0,
+            logit_bias: Vec::new(),
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repetition_penalty_window: 0,
+            lz_penalty: 0.0,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_sequence_breakers: Vec::new(),
+            max_tokens: 0,
+            stop_token_ids: Vec::new(),
+            seed,
+        }
+    }
+
+    /// Same seed + same logits → same token. This is the contract that
+    /// `sample_first_token` and `sample_token` must uphold when the caller
+    /// passes the request seed through.
+    #[test]
+    fn same_seed_produces_same_token() {
+        // Logits with a near-uniform distribution so sampling is stochastic.
+        let logits: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.01).sin()).collect();
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let params_a = make_params(Some(42));
+        let params_b = make_params(Some(42));
+        let tok_a = sample_with_params(&bytes, &params_a);
+        let tok_b = sample_with_params(&bytes, &params_b);
+        assert_eq!(tok_a, tok_b, "same seed must produce same token");
+    }
+
+    /// Different seeds should (almost always) produce different tokens
+    /// on a stochastic distribution. Not a hard guarantee (collision is
+    /// possible), but with 1000 tokens and different seeds it's a
+    /// strong signal that the seed actually reaches the RNG.
+    #[test]
+    fn different_seeds_produce_different_tokens() {
+        let logits: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.01).sin()).collect();
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let params_a = make_params(Some(42));
+        let params_b = make_params(Some(12345));
+        let tok_a = sample_with_params(&bytes, &params_a);
+        let tok_b = sample_with_params(&bytes, &params_b);
+        assert_ne!(tok_a, tok_b, "different seeds should produce different tokens");
+    }
+
+    /// None seed (non-deterministic) must not panic and must return a
+    /// valid token id. This is the legacy behavior when no seed is set.
+    #[test]
+    fn none_seed_returns_valid_token() {
+        let logits: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.01).sin()).collect();
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let params = make_params(None);
+        let tok = sample_with_params(&bytes, &params);
+        assert!((tok as usize) < 1000, "token must be within vocab");
+    }
+
+    /// Greedy (temperature=0) ignores the seed — argmax is deterministic
+    /// regardless. This pins the contract that seed only affects stochastic
+    /// sampling, not greedy paths.
+    #[test]
+    fn greedy_ignores_seed() {
+        let mut logits = vec![0.0f32; 100];
+        logits[42] = 10.0; // clear argmax
+        let bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let params_a = SamplingParams {
+            temperature: 0.0,
+            seed: Some(42),
+            ..make_params(None)
+        };
+        let params_b = SamplingParams {
+            temperature: 0.0,
+            seed: Some(99999),
+            ..make_params(None)
+        };
+        assert_eq!(sample_with_params(&bytes, &params_a), 42);
+        assert_eq!(sample_with_params(&bytes, &params_b), 42);
     }
 }
