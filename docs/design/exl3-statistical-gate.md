@@ -193,3 +193,42 @@ the old instrumented runs into this set. Within each engine, every suite and
 repeat must use the same effective environment and build identity. Neither
 this collection correction nor the runtime repair changes the statistic,
 catastrophic-row rule, sample count, or required controls.
+
+The immutable collector-only command inputs are archived under
+`statistical-gate-20261011/collector-only-profile/` (attempt names and host
+capture directories are substituted at launch):
+
+| Input | SHA256 |
+|---|---|
+| `ref-rank0-create-command.json` | `8afc990ca451dfc1ce45b26b7f45e017f138a7cdb15e39a5a933f04df01b3bcb` |
+| `ref-rank1-create-command.json` | `a9a2e88325262de7f3ff73ce6aeb7b5140e2cd6731854edd05bdccde496e6eb3` |
+| `sitecustomize.py` | `81771af5085bcd268576c49e911eed34d89616de9ac561196826e1ea8eadd53d` |
+| `reference_chunk_trace.py` | `a92c2e642508595e21880725d9dcafe4481ca76e1639ac949f598d79c01ab081` |
+| `ATLAS_EXL3_CHUNK_RUNNER_SHA256` | `f84255d75435e84f44972d3fd25e53447f9d4d2edd8bff4f8c19dfb793448415` |
+
+Retain `PYTHONPATH=/opt/atlas-logits-patch` and the runner hash above. The
+complete mounted-source audit, including both ranks' copies, is
+`statistical-gate-20261011/reference-profile-audit/audit.json`, SHA256
+`31363ff2ef1b4b400edcf63bdc5765d1a76b2ebfed574c9052298d28f9d6b7ec`.
+
+### Replacement candidate identity (registered before requests)
+
+The single-row FP8 reader repair is commit
+`fb4f4b41de19a19badf155836cd8036b54e70280`. Its clean, no-cache build uses
+Rust 1.97.1 and the pinned cuBLAS pair, with these immutable identities:
+
+| Artifact | Identity |
+|---|---|
+| Source archive SHA256 | `8b6b47f14d5b7cefa354b970f24f95619576255d34b8ced063ee30a0eec48b13` |
+| Image tag | `atlas-exl3-validation:src-8b6b47f14d5b-rust1.97.1` |
+| Image ID | `sha256:e744b81d972b394cef6e6ec4a68f82c983b38b52747be6eab9dbc7498bc84b72` |
+| Server binary SHA256 | `95b2a1d68c9127825d6a97e635d2c98e1f9606c245e3ae07560361a5664b9287` |
+| Scratch checker SHA256 | `a8c6c5251321c902d50f35d3249692bf7cdc14089dfc5912181d8253e217f626` |
+
+The full build manifest, source archive and build log are preserved in
+`fp8decode-candidate-20261011/` under the validation evidence root. The serving
+profile remains TP2/EP1/C1, context 4096, chunk 128, `fp8_g128`, KDA FLA reference
+enabled, both sparse-prefill flags enabled, graphs disabled, no speculation.
+The repair selects the existing FP8 decode reader without requiring the
+experimental decode flag. It does not change CUDA arithmetic. No numerical
+verdict follows from the build or this registration.

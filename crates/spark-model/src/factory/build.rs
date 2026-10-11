@@ -78,6 +78,7 @@ pub fn build_model(
         gpu.as_ref(),
         super::glm_sparse_decode::BuildPolicy {
             config: &config,
+            speculative: use_speculative,
             self_speculative,
             context: super::glm_sparse_decode::repair_context(max_seq_len),
             block_size: kv_block_size,

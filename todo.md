@@ -1,6 +1,11 @@
 # GLM-5.3 EXL3 — remaining high performance inference work
 
-Reviewed against `11671adf` on 2026-10-10. Native TP=2 / EP=1 boot and generation
+Updated 2026-10-11 05:30 UTC. `cand-fp8decode02` collection complete (short16
+16/16, long 16/16). Q0 final-image smoke passed. Fresh statistical gate batch
+(9 refs + held-out + cand03 + candkda0) running since 05:29 UTC — see
+[continue.md](continue.md) for live process details. Latest code is `4b49a9c4`
+(docs at `88a4332f`); GPU image pinned to `fb4f4b41`.
+Original roadmap review was against `11671adf`. Native TP=2 / EP=1 boot and generation
 are achieved. Full numerical qualification, a repeated performance baseline,
 and the expanded serving features below remain open. This is the authoritative
 work checklist; [continue.md](continue.md) holds the launch profile and evidence.
@@ -20,25 +25,41 @@ to the source and profile that passed.
   A→B→A reuse proof on both hosts. This does not qualify overlapping streams.
 - [x] Opt-in FFN stage profiling; coherent cuBLAS 13.1 classic/Lt profiles;
   merged KDA auxiliary with recorded in-situ M1/M5/M128 comparisons.
-- [x] KDA reference-policy design and CPU oracle groundwork. **No production
-  enum, flag, reference CUDA kernels or dispatch yet.**
+- [x] KDA reference-policy kernels and dispatch (`72d64e4c`, `069e4351`),
+  both-rank GPU stage/state oracle and layer 0–2 in-situ byte comparisons.
+  Q1 remains open until its full-model Q2 dependency passes.
+- [x] Reproduce the 2049-token FP8 chunk-tail crash, repair reader selection
+  (`fb4f4b41`), clean-build the candidate and complete that failing request
+  on the real TP pair. Full Q2 qualification remains open.
+- [x] Full 23-shard rehash on both hosts, final-image scratch replay/guards and
+  both-rank serving-process cuBLAS-map attestation.
+- [x] Final-image launch smoke (2026-10-11 05:28 UTC): 5/5 requests passed.
+  Receipt: `fp8decode-candidate-20261011/final-image-smoke/smoke.json`.
+- [x] `cand-fp8decode02` full collection complete (short16 16/16, long 16/16).
+  Evidence: `statistical-gate-20261011/cand-fp8decode02/`.
+- [x] Correct OpenAI chat stream usage order (`4b49a9c4`) with CPU red/green
+  encoder evidence. Rebuild and live behavior validation remain part of Q3.
 
 ## Q — qualification and reproducibility
 
-- [ ] **Q0 — Reproduce the working image from committed inputs.** Bring the
+- [x] **Q0 — Reproduce the working image from committed inputs.** Bring the
   external coherent-13.1 build recipe into the EXL3 Docker/build path. Package
   the pinned pair with hashes/licenses and explicit provider resolution; build
   the server and `exl3_moe_scratch_check` from one source snapshot. Bind source,
   Git commit, compiler flags, binaries, embedded PTX, image digest and checkpoint
-  revision/shard hashes on both ranks. Complete the outstanding shard re-hash.
+  revision/shard hashes on both ranks. Preserve the completed shard re-hash.
   **Done when:** a clean no-cache build boots both nodes, actual runtime mappings
   show only the intended pair, and smoke plus scratch GPU checks pass with archived
   manifests. Current launcher image is a preserved snapshot, not proof of a
   reproducible `11671adf` build.
-  *Status 2026-10-11:* recipe in-tree (`a6f64c46`, `59b0e113`); clean no-cache
-  build `sha256:b6be48ed…` booted both nodes, runtime maps show only the pinned
-  pair on both ranks, smoke 5/5 (`kda-fla-candidate-20261010/`). Still owed:
-  `exl3_moe_scratch_check` GPU run from this image and the full shard re-hash.
+  *Status 2026-10-11:* **Q0 COMPLETE.** Recipe in-tree (`a6f64c46`, `59b0e113`);
+  clean no-cache replacement `src-8b6b47f14d5b-rust1.97.1` / `sha256:e744b81d…`
+  built from `fb4f4b41` and loaded on both nodes. Final-image scratch replay,
+  guards and input preservation pass on both ranks; serving-process runtime maps
+  show only the pinned pair. Final-image smoke passed 5/5 requests.
+  Evidence: `fp8decode-candidate-20261011/`. Full re-hash complete: all 23 shards
+  on both hosts match each other and the archived hashes
+  (`checkpoint-rehash-20261011/comparison.json`).
 
 - [ ] **Q1 — Implement and validate the EXL3 reference-policy KDA core.** Follow
   [T2–T8](docs/design/exl3-kda-reference-core.md): M5 prefill, exact PTX operation
@@ -60,21 +81,36 @@ to the source and profile that passed.
 
 - [ ] **Q2 — Close full-model numerical and repeatability gates.** Rerun frozen
   short16, long-prefix/chunk-boundary, persistent decode and raw-logit comparisons
-  on the exact candidate image. Keep abs/rel/KL/CE/top-K/argmax/text requirements
-  and negative controls. Retry the indexer scale-boundary oracle with the exact
+  on the exact candidate image. Apply the pre-registered statistical gate below;
+  retain frozen abs/rel/KL/CE/top-K reports as diagnostics and keep the required
+  negative controls. Retry the indexer scale-boundary oracle with the exact
   frozen reference source overlay; its latest attempt failed before GPU execution.
   Investigate reference repeat variation at routed combine independently and
   check candidate repeatability. **Done when:** all required candidate gates pass
   on both ranks, with raw tensors/provenance; reference variability is explained
   or explicitly retained as an unresolved constraint, never used to waive failure.
-  *Status 2026-10-11:* the user chose a statistical gate; it is pre-registered
-  (`docs/design/exl3-statistical-gate.md`, `3cf66612`, reviewed by Fable 5.1;
-  candidate-profile addendum `87e4b08b`). Atlas's first own divergence was the
-  layer-3 MLA core output: the reference silently uses an `fp8_ds_mla` latent
-  KV cache. `--kv-cache-dtype fp8_g128` reproduces its single-key rows; the
-  candidate profile now uses it. Layers 0–2 and the layer-3 projections are
-  byte-exact. Collection (9 references + held-out, 2 candidate runs, the
-  `ATLAS_KDA_FLA_REFERENCE=0` control) is the next step; the semantic must-fail
+  *Status 2026-10-11 05:30 UTC:* the user chose a statistical gate; it is
+  pre-registered (`docs/design/exl3-statistical-gate.md`, `3cf66612`, reviewed
+  by Fable 5.1; candidate-profile addendum `87e4b08b`). Atlas's first own
+  divergence was the layer-3 MLA core output: the reference silently uses an
+  `fp8_ds_mla` latent KV cache. `--kv-cache-dtype fp8_g128` reproduces its
+  single-key rows; the candidate profile now uses it. Layers 0–2 and the
+  layer-3 projections are byte-exact. The resumed run reproduced the candidate's
+  2049-token crash: its one-token tail entered MLA decode without an enabled
+  FP8 reader. `fb4f4b41` selects and initializes that existing reader for
+  serial TP2/EP1. The repaired final image completed that request.
+  **Candidate run 1 (`cand-fp8decode02`) collection complete** at 05:11 UTC:
+  short16 16/16, long 16/16, manifests present. Evidence archived to
+  `statistical-gate-20261011/cand-fp8decode02/`.
+  **Fresh batch running since 05:29 UTC:** 9 references (ref03–ref11) +
+  held-out (ref12) + candidate run 2 (cand03) + `ATLAS_KDA_FLA_REFERENCE=0`
+  control (candkda0). Monitor: process `gate-batch-fresh` (proc_9b71).
+  Both-rank failure logs and raw evidence are preserved in
+  `statistical-gate-20261011/resume-diag01/`. The earlier ref01/ref02 enabled
+  intermediate tensor captures and are diagnostic only. A collector-only
+  reference profile is pinned before fresh collection; the gate also
+  checks environment/build/hook identity within each engine.
+  After batch: run `statistical_gate.py` with controls. The semantic must-fail
   perturbations still need Atlas runtime knobs.
 
 - [ ] **Q3 — Qualify usable API behavior.** Extend beyond the launch smoke to
@@ -89,6 +125,20 @@ to the source and profile that passed.
   missing surfaces. **Done when:** behavior receipts and assertions pass without
   leaked state or protocol drift; fix Atlas failures
   even when the reference also fails its own behavior suite.
+  *Status 2026-10-11:* `4b49a9c4` repairs OpenAI streamed chat usage ordering:
+  finish chunk, then usage-only chunk. The old order fails the regression;
+  all five production encoder tests pass in an isolated CPU harness with exact
+  production wire-type extracts. Server test compilation passes. Full server
+  unit-test linking is unavailable locally without CUDA/NCCL. The current GPU
+  image predates this separate API commit; rebuilt-image live Q3 validation
+  remains owed.
+  Read-only audit also confirmed first-token seed omission: prefill calls
+  `sample_first_token` without the request seed; `sample_step.rs` builds
+  `SamplingParams` with `seed: None`. Thread the explicit seed through all
+  first-token routes and add a deterministic sampler regression before fixing.
+  Greedy gate requests are unaffected. Separately review the later-token RNG
+  being reinitialized from the same seed on every call. Neither seed issue has
+  been changed. Multi-token stop and Anthropic stop-sequence fixes remain open.
 
 - [ ] **Q4 — Protect task quality beyond reference parity.** Freeze a held-out
   corpus with objective checks for arithmetic, executable code, exact tool
@@ -126,11 +176,23 @@ to the source and profile that passed.
   timing cross-checks establish a baseline; explicit latency/throughput targets
   and permitted quality/memory tradeoffs are recorded for each intended workload.
   Repeat after Q2 if initial profiling used the unqualified arithmetic path.
-  *Status 2026-10-11:* harness committed on branch `pi/p0-20261010` (not yet
-  merged; its `repeat`/`cold` record fields come out null). Unqualified
+  *Status 2026-10-11:* harness integrated in `72e4e1a3`, with 22 CPU tests.
+  It requires explicit initial-state metadata, refuses output overwrite and
+  rejects malformed/truncated streams. The saved six-request diagnostic has
+  populated `repeat_index`/`cold_start` fields; the earlier null-field claim
+  names absent fields (`repeat`/`cold`) and is unsupported by the raw records.
+  No saved query establishes how that claim was produced. Unqualified
   diagnostic on the production image: decode ~0.45 s/token, 2573-token TTFT
   ~139 s (`p0-unqualified-baseline-20261010/`). Decode speed is the dominant
   serving problem; trace it before any other P item.
+  A paired named-session Nsight driver is prepared in durable
+  `p0-trace-prep-20261011/` (11 CPU tests). It uses `nsys launch`, starts
+  collection after health, preserves reports before statistics processing and
+  removes the logits observer in its explicitly recorded attribution profile.
+  **No live profiler execution yet.** Review the generated remote commands,
+  choose explicit workload/output paths, archive the active gate attempt and
+  stop its containers before using the same port/GPU pair. Timing from the
+  instrumented request is attribution only; uninstrumented repeats remain owed.
 
 - [ ] **P1 — Packed decoder and decode occupancy.** Inspect runtime JIT SASS
   and Nsight Compute counters, building on the completed offline LDL/STL audit.

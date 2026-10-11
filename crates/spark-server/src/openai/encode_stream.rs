@@ -16,7 +16,7 @@ use super::{ChatCompletionChunk, CompletionTokensDetails, PromptTokensDetails, U
 ///
 /// `include_usage` is the request's `stream_options.include_usage`
 /// echo: the terminal framing decision (separate usage-only chunk
-/// before a usage-less finish chunk vs a single finish chunk carrying
+/// after a usage-less finish chunk vs a single finish chunk carrying
 /// usage) belongs to this wire format, not to the generation core.
 pub(crate) fn delta_to_chunk_events(
     d: &StreamDelta,
@@ -87,16 +87,16 @@ fn delta_to_payloads(d: &StreamDelta, model: &str, id: &str, include_usage: bool
             let wire_usage = wire_usage(usage);
             if include_usage {
                 // OpenAI `stream_options.include_usage=true` framing:
-                // the usage-only chunk (`choices: []`) precedes the
-                // final `finish_reason` chunk (usage omitted). Residual
-                // token ids ride the final chunk, keeping
+                // the usage-only chunk (`choices: []`) follows the
+                // `finish_reason` chunk (usage omitted). Residual token
+                // ids ride the finish chunk, keeping
                 // Σ token_ids == completion_tokens.
                 vec![
-                    chunk_json(ChatCompletionChunk::usage_only_chunk(model, id, wire_usage)),
                     chunk_json(
                         ChatCompletionChunk::final_chunk_no_usage(model, id, reason.as_wire())
                             .with_token_ids(token_ids.clone()),
                     ),
+                    chunk_json(ChatCompletionChunk::usage_only_chunk(model, id, wire_usage)),
                 ]
             } else {
                 vec![chunk_json(
@@ -294,54 +294,53 @@ mod tests {
             token_ids: vec![7],
         };
 
-        // include_usage=true: usage-only chunk (`choices:[]`) FIRST,
-        // then the finish chunk with usage omitted; residual ids ride
-        // the final chunk.
+        // include_usage=true: finish chunk first, then the final usage-only
+        // chunk (`choices:[]`). Residual ids ride the finish chunk.
         let p = delta_to_payloads(&d, "m", "id-1", true);
         assert_eq!(p.len(), 2);
-        assert!(p[0].contains("\"choices\":[]"), "payload: {}", p[0]);
-        assert!(p[0].contains("\"prompt_tokens\":10"), "payload: {}", p[0]);
         assert!(
-            p[0].contains("\"completion_tokens\":5"),
+            p[0].contains("\"finish_reason\":\"stop\""),
             "payload: {}",
             p[0]
         );
-        assert!(p[0].contains("\"total_tokens\":15"), "payload: {}", p[0]);
-        assert!(p[0].contains("\"cached_tokens\":2"), "payload: {}", p[0]);
-        assert!(p[0].contains("\"reasoning_tokens\":3"), "payload: {}", p[0]);
+        assert!(p[1].contains("\"choices\":[]"), "payload: {}", p[1]);
+        assert!(p[1].contains("\"prompt_tokens\":10"), "payload: {}", p[1]);
+        assert!(
+            p[1].contains("\"completion_tokens\":5"),
+            "payload: {}",
+            p[1]
+        );
+        assert!(p[1].contains("\"total_tokens\":15"), "payload: {}", p[1]);
+        assert!(p[1].contains("\"cached_tokens\":2"), "payload: {}", p[1]);
+        assert!(p[1].contains("\"reasoning_tokens\":3"), "payload: {}", p[1]);
         // The accept count survives IR -> wire: this was hardcoded 0 at every
         // emit site before the accept-stats instrumentation.
         assert!(
-            p[0].contains("\"accepted_prediction_tokens\":4"),
-            "payload: {}",
-            p[0]
-        );
-        assert!(
-            p[0].contains("\"rejected_prediction_tokens\":0"),
-            "payload: {}",
-            p[0]
-        );
-        assert!(
-            p[0].contains("\"time_to_first_token_ms\":12.5"),
-            "payload: {}",
-            p[0]
-        );
-        assert!(
-            p[0].contains("\"response_token/s\":40.0"),
-            "payload: {}",
-            p[0]
-        );
-        assert!(
-            p[1].contains("\"finish_reason\":\"stop\""),
+            p[1].contains("\"accepted_prediction_tokens\":4"),
             "payload: {}",
             p[1]
         );
         assert!(
-            !p[1].contains("\"usage\""),
-            "final chunk must omit usage when include_usage=true: {}",
+            p[1].contains("\"rejected_prediction_tokens\":0"),
+            "payload: {}",
             p[1]
         );
-        assert!(p[1].contains("\"token_ids\":[7]"), "payload: {}", p[1]);
+        assert!(
+            p[1].contains("\"time_to_first_token_ms\":12.5"),
+            "payload: {}",
+            p[1]
+        );
+        assert!(
+            p[1].contains("\"response_token/s\":40.0"),
+            "payload: {}",
+            p[1]
+        );
+        assert!(
+            !p[0].contains("\"usage\""),
+            "finish chunk must omit usage when include_usage=true: {}",
+            p[0]
+        );
+        assert!(p[0].contains("\"token_ids\":[7]"), "payload: {}", p[0]);
 
         // include_usage=false: one done chunk carrying finish_reason
         // AND usage, with the residual ids stamped on it.

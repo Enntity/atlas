@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Startup admission for the GLM sparse-decode tensor-core / split kernels on
-//! the DFlash long-context lane.
+//! Startup admission for GLM's required FP8 serial reader and the sparse-decode
+//! tensor-core / split kernels on the DFlash long-context lane.
 use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
 use spark_runtime::{gpu::GpuBackend, kv_cache::KvCacheDtype};
 
 pub(super) struct BuildPolicy<'a> {
     pub config: &'a ModelConfig,
+    /// Any target-side speculation (`--speculative`).
+    pub speculative: bool,
     pub self_speculative: bool,
     pub context: usize,
     pub block_size: usize,
@@ -25,6 +27,27 @@ pub(super) fn repair_context(context: usize) -> usize {
 }
 
 impl BuildPolicy<'_> {
+    fn validate_fp8_serial_reader(&self) -> Result<()> {
+        ensure!(
+            self.config.model_type == "glm5_next"
+                && self.config.tp_world_size == 2
+                && self.config.ep_world_size == 1
+                && self.config.num_attention_heads == 32
+                && !self.speculative
+                && !self.self_speculative
+                && !self.dflash
+                && self.block_size == 16
+                && self.kv_dtype == KvCacheDtype::Fp8G128
+                // An empty list means the explicit `kv_dtype` applies uniformly.
+                && self
+                    .layer_dtypes
+                    .iter()
+                    .all(|d| *d == KvCacheDtype::Fp8G128),
+            "GLM fp8_g128 decode reader requires serial TP2/EP1 inference and uniform FP8 block16 caches"
+        );
+        Ok(())
+    }
+
     fn validate(&self, dflash_lane_enabled: bool, long_context: bool) -> Result<()> {
         let dflash_lane = self.dflash && !self.self_speculative && dflash_lane_enabled;
         ensure!(
@@ -49,17 +72,38 @@ impl BuildPolicy<'_> {
 pub(super) fn initialize(gpu: &dyn GpuBackend, policy: BuildPolicy<'_>) -> Result<()> {
     let split = crate::layers::ops::glm_sparse_decode_split_enabled(&policy.config.model_type)?;
     let tc = crate::layers::ops::glm_sparse_decode_tc_enabled(&policy.config.model_type)?;
+    initialize_with(gpu, policy, tc, split)
+}
+
+fn initialize_with(
+    gpu: &dyn GpuBackend,
+    policy: BuildPolicy<'_>,
+    tc: bool,
+    split: bool,
+) -> Result<()> {
     ensure!(
         !split || tc,
         "GLM split requires ATLAS_GLM_SPARSE_DECODE_TC=1"
     );
+    let fp8 = policy.config.model_type == "glm5_next"
+        && (policy.kv_dtype == KvCacheDtype::Fp8G128
+            || policy.layer_dtypes.contains(&KvCacheDtype::Fp8G128));
+    if fp8 && !tc {
+        policy.validate_fp8_serial_reader()?;
+    }
+    if tc {
+        policy.validate(
+            crate::speculative::glm_repair_policy::dflash_enabled(),
+            crate::speculative::glm_repair_policy::long_context_enabled(),
+        )?;
+    }
+    if fp8 {
+        crate::layers::ops::initialize_glm_sparse_fp8_decode_tc(gpu, policy.config)?;
+        tracing::info!("GLM fp8_g128 serial decode reader initialized before KV sizing");
+    }
     if !tc {
         return Ok(());
     }
-    policy.validate(
-        crate::speculative::glm_repair_policy::dflash_enabled(),
-        crate::speculative::glm_repair_policy::long_context_enabled(),
-    )?;
     crate::layers::ops::initialize_glm_sparse_decode_tc(gpu, policy.config)?;
     tracing::info!(
         "GLM sparse decode TC initialized before KV sizing; repaired K3 rows1, BF16 identical K/V"

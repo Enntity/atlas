@@ -195,7 +195,7 @@ impl Qwen3AttentionLayer {
             } else {
                 anyhow::ensure!(
                     !fp8,
-                    "fp8_g128 GLM decode requires ATLAS_GLM_SPARSE_DECODE_TC=1"
+                    "fp8_g128 GLM decode has no available sparse attention reader"
                 );
                 ops::glm_sparse_mla_prefill(
                     ctx.gpu,
@@ -262,7 +262,11 @@ impl Qwen3AttentionLayer {
         const GROUP: u32 = 32;
         // ops::glm_sparse_decode_split's partial O + LSE + merge scratch.
         const SPLIT_SCRATCH_BYTES: usize = 8 * 32 * 512 * 4 + 8 * 32 * 4 + 32 * 4;
-        if !ops::glm_sparse_decode_tc_enabled(&ctx.config.model_type)?
+        // fp8_g128 has no non-TC sparse reader, so GLM selects it without the
+        // experimental flag; BF16 stays behind ATLAS_GLM_SPARSE_DECODE_TC.
+        let required_fp8_reader = ctx.config.model_type == "glm5_next"
+            && self.kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8G128;
+        if (!ops::glm_sparse_decode_tc_enabled(&ctx.config.model_type)? && !required_fp8_reader)
             || heads == 0
             || !heads.is_multiple_of(GROUP)
             || head_dim != 512

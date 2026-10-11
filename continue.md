@@ -1,40 +1,169 @@
 # GLM-5.3 EXL3 on two Sparks — continuation state
 
-Updated 2026-10-11 at checkpoint `checkpoint/stat-gate-20261011` (originally reviewed against `11671adf`).
-The model boots and generates on TP=2 / EP=1. The next objective is qualified,
-high performance inference: correct outputs, interactive latency, prompt
-processing, concurrent throughput, and reliable operation on both nodes.
+Updated 2026-10-11 05:30 UTC. Resume from tag `checkpoint/fp8decode-20261011`
+on branch `sparkglm/installable-20260924`; latest implementation commit is
+`88a4332f` (docs checkpoint; `4b49a9c4` is the latest code change).
+
+**Status 2026-10-11 05:30 UTC:**
+
+- `cand-fp8decode02` collection **completed** at 05:11 UTC: short16 16/16,
+  long 16/16, manifests present. Evidence archived to
+  `statistical-gate-20261011/cand-fp8decode02/` under the durable root.
+- **Q0 final-image smoke passed** at 05:28 UTC: 5/5 requests OK (short-greedy,
+  long-generation 630 tokens, multi-turn recall, sampled). Receipt:
+  `fp8decode-candidate-20261011/final-image-smoke/smoke.json`.
+- **Fresh statistical gate batch launched** at 05:29 UTC: 9 references
+  (ref03–ref11) + 1 held-out (ref12) + candidate run 2 (cand03) + candkda0
+  control. Batch log: process `gate-batch-fresh` (proc_9b71). Expected
+  duration ~7–8 hours. Uses `run_gate_attempt.sh` wrapping `gate_run.sh`
+  from `collector-only-profile/`.
+- After batch: run `statistical_gate.py` with `--reference` (9), `--candidate`
+  (cand-fp8decode02, cand03), `--held-out-reference` (ref12), `--ulp-control`.
+- GPU image remains pinned to `fb4f4b41` (image `sha256:e744b81d…`);
+  `4b49a9c4` (streaming usage order fix) needs a rebuilt image for Q3.
 
 [todo.md](todo.md) is the authoritative remaining-work checklist, with task IDs,
 dependencies and completion criteria. This file holds the restart context,
 implementation status and evidence needed to execute it. The design documents
 specify arithmetic; the dated reviews contain hypotheses, not measured Atlas
-speedups. Earlier pause handoffs remain in the Git version of this file at
-`11671adf`; their idle-host, uncommitted-work and restoration instructions are
-superseded by the successful launch below.
+speedups.
+
+## Live job — fresh statistical gate batch
+
+Batch started 2026-10-11 05:29 UTC via `gate_batch_fresh.sh`. Runs sequentially:
+ref03→ref11 (9 refs), ref12 (held-out), cand03 (candidate 2), candkda0 (control).
+Each run: fresh two-rank containers, short16 + long suites, evidence preserved
+via `run_gate_attempt.sh`. Monitor: `process output proc_9b71` or
+`tail /tmp/pi-processes-*/proc_9b71-stdout.log`.
+
+Read-only checks:
+
+```bash
+tail -n 30 /tmp/pi-processes-*/proc_9b71-stdout.log
+spark0 'docker ps; ls ~/gate/ | grep -E "^(ref|cand)"'
+```
+
+Durable local evidence root:
+`/home/colum/Workspace/atlas-exl3-validation-20261010`.
+Fresh create commands and drivers are under
+`statistical-gate-20261011/collector-only-profile/`; finalized provenance tools
+are in `/tmp/atlas-resume-20261011/provenance/`.
+
+## Completed since last checkpoint
+
+| Item | Status |
+|---|---|
+| `cand-fp8decode02` collection | Complete: short16 16/16, long 16/16 |
+| Evidence archive (both hosts) | Archived to `statistical-gate-20261011/cand-fp8decode02/` |
+| Q0 final-image smoke | Passed: 5/5 requests, receipt archived |
+| Fresh batch (9 refs + held-out + cand03 + candkda0) | Running since 05:29 UTC |
+
+Read-only resume checks:
+
+```bash
+tail -n 30 /tmp/atlas-resume-20261011/cand-fp8decode02.log
+spark0 'docker ps; ls ~/gate/cand-fp8decode02/long; tail -n 10 ~/gate/cand-fp8decode02/long.log'
+spark0 'docker logs --tail 20 gate-cand-0'
+spark1 'docker logs --tail 20 gate-cand-1'
+```
+
+Durable local evidence root:
+`/home/colum/Workspace/atlas-exl3-validation-20261010`.
+Fresh create commands and drivers are under
+`statistical-gate-20261011/collector-only-profile/`; finalized provenance tools
+are archived in its `provenance-tools/` subdirectory. The driver currently
+invokes `/tmp/atlas-resume-20261011/provenance/finalize_provenance.py`; restore
+that directory from the archived tools before a future run if it is missing.
+The current run already passed this preflight. Its effective environment,
+commands, process maps and library hashes were verified on both ranks.
+Actual mappings are CUDA runtime 13.0.48 and NCCL 2.32.3, despite the image's
+older NCCL package environment label.
+
+## Commits and verification from this resume
+
+| Commit | Change |
+|---|---|
+| `92735661` | Preserve failed gate attempts and both ranks' evidence |
+| `72e4e1a3` | Integrate strict streaming performance diagnostics |
+| `c2774c49` | Reject mixed gate environments |
+| `9879d73b` / `7e0bc8d3` | Register fresh collector-only references and pin observers |
+| `fb4f4b41` | Initialize/select the required FP8 MLA reader for serial TP2/EP1 |
+| `d22672d1` | Register the rebuilt candidate before collection |
+| `4b49a9c4` | Emit OpenAI streamed usage after the finish chunk; CPU verified only |
+
+Current CPU evidence is in `fp8decode-candidate-20261011/cpu-checks/`: 185
+validation Python tests pass; focused Rust filters pass (reader 6, FP8 85,
+decode-TC 5). License headers and changed-file typos pass. Full workspace checks
+are not green: the pinned Rust 1.93.1 cargo component is missing; installed
+stable 1.97.1 finds formatting differences in 65 unchanged paths, existing
+clippy findings and full-tree typos. Logs distinguish these failures from the
+focused changes; no unrelated cleanup was made.
+
+The separate API fix has five passing production encoder tests in a temporary
+CPU harness, with an old-order red regression, exact extracted wire types,
+source hashes and server test compile evidence in `q3-usage-order-20261011/`.
+Full server unit-test linking requires CUDA/NCCL unavailable on the local host.
+The fix has not been included in a rebuilt image or validated live.
+
+## Resume findings (supersede the earlier collection handoff)
+
+- With the registered image and both sparse-prefill flags, short16 and the
+  2047/2048-token prefixes pass collection. The 2049-token prefix fails at
+  layer 3: its one-token chunk tail enters MLA decode, whose FP8 reader was
+  gated by an absent experimental flag. Both TP ranks exit. Evidence:
+  `statistical-gate-20261011/resume-diag01/diagnosis.json`, both-rank logs,
+  container identities and raw captures.
+- `fb4f4b41` initializes and selects the existing FP8 reader for ordinary serial
+  TP2/EP1 inference. Focused CPU tests pass. A clean image was built and loaded
+  on both nodes from source archive SHA256
+  `8b6b47f14d5b7cefa354b970f24f95619576255d34b8ced063ee30a0eec48b13`.
+  Both production containers are stopped during this validation ownership.
+- `cand-fp8decode02` completed short16 and the 2047/2048/2049-token requests;
+  the repaired one-token tail returns a token and both ranks continue to the
+  next request. Full long-suite collection is still running, with no numerical
+  verdict. `cand-fp8decode01` failed preflight before any generation request
+  because a library-map check falsely rejected `/dev/zero (deleted)`; its
+  evidence is preserved and the check now only considers runtime libraries.
+- Ref01/ref02 enabled mid-forward FFN/KDA/mHC and head-input tensor captures;
+  they are diagnostic data, not qualification samples. The gate document now
+  pins a collector-only reference profile before fresh collection. Start all
+  nine references plus held-out afresh. No thresholds or controls were relaxed.
+- `92735661` adds the tested `run_gate_attempt.sh` wrapper: reserve a new name,
+  preserve both ranks' logs/inspection/raw captures and request artifacts, and
+  fail if preservation fails. Use it for every subsequent external gate run.
+- Both hosts' 23 checkpoint shards match the archived hashes and each other:
+  `checkpoint-rehash-20261011/comparison.json`. Final-image scratch GPU checks
+  pass on both ranks, including A→B→A reuse, guards and unchanged inputs;
+  reports and raw bytes are in `fp8decode-candidate-20261011/scratch/`.
+  Serving-process runtime maps on both ranks attest only the pinned cuBLAS pair.
+- P0 harness integration is `72e4e1a3`. The saved raw diagnostic has populated
+  `repeat_index` and `cold_start`; the old null-field claim does not describe
+  those fields. Initial state is now explicit and failed streams are excluded.
+- The current user requests **Luna subagents** and grants exclusive use of both
+  Sparks, including sudo as needed. This supersedes the old Opus-only handoff.
 
 ## Current status and scope of proof
 
 | Area | Status at review |
 |---|---|
 | Native checkpoint loading and two-node generation | Implemented; launch smoke recorded |
-| Full-model numerical gate | Frozen absolute gate retired by user decision (reference fails it against itself). Replaced by the **pre-registered statistical gate** `docs/design/exl3-statistical-gate.md` (`3cf66612`; addenda `87e4b08b`, `0e6bafb9`). Collection **in progress**: references ref01–ref02 of 9+1 collected (`statistical-gate-20261011/`); candidate long suite **blocked** by an HTTP 500 + TP-group exit (cause not yet captured). No gate verdict yet |
+| Full-model numerical gate | Pre-registered statistical rule remains authoritative. The repaired image passed the reproduced 2049-token crash case in `cand-fp8decode02`; full collection is underway. Old ref01/ref02 are diagnostic only; all 9+1 references must be collected afresh with the pinned collector-only profile. No numerical verdict yet |
 | FLA reference-policy KDA | **Implemented** (`72d64e4c`, `069e4351`): module `kda_fla`, `ATLAS_KDA_FLA_REFERENCE=1`. Byte-exact vs GPU stage oracle (all stages, carried state, both ranks) and in situ (layer-0 core, gated norm, o_proj after TP, dense FFN; layers 0–2 inputs/outputs) |
 | Shared routed MoE scratch | Implemented; rank-local GPU reuse/guard proof recorded on both hosts |
 | FFN stage timing | Implemented, opt-in and synchronizing; useful for attribution, unsuitable for headline timings |
 | Merged KDA auxiliary projection | Implemented; layer-0 M1 padded to 3, M5 and M128 byte comparisons recorded on both hosts |
 | MLA latent KV | Reference silently uses `fp8_ds_mla`; Atlas `--kv-cache-dtype fp8_g128` is the same format and is the candidate profile (needs `ATLAS_GLM_SPARSE_PREFILL_TC=1` + `ATLAS_GLM_SPARSE_PREFILL_KV_REUSE=1`, now enforced at startup by `c64b8c6e`). Layer-3 single-key rows match to 1 ulp; multi-key rows differ at implementation level |
-| API behavior (Q3) | Suite merged (`7a56d108`, 50 CPU tests); **not yet run live**; predicts defects: multi-token stop strings, chat include_usage order, streamed Anthropic stop_sequence, seeded first-token sampling |
+| API behavior (Q3) | Live suite still owed. `4b49a9c4` fixes chat include_usage order with CPU red/green encoder tests; absent from the current GPU image. Remaining predicted defects: multi-token stops, streamed Anthropic stop_sequence and seeded first-token sampling |
 | CUDA graphs, concurrent admission, long context, prefix reuse | Unqualified for this native EXL3 profile; qualify independently |
 | DFlash/MTP/self-speculation | Explicitly rejected by native EXL3 startup guards; implementation and qualification required |
-| Reproducible deployable image | Recipe in-tree (`a6f64c46`): no-cache build `atlas-exl3-validation:src-efd023f8f7b9-rust1.97.1` = `sha256:b6be48ed…` from `59b0e113`; runtime maps attest only the pinned pair on both ranks; smoke 5/5. Owed: shard re-hash, `exl3_moe_scratch_check` GPU run |
-| Performance baseline | Unqualified diagnostic only (`p0-unqualified-baseline-20261010/`): decode ~0.45 s/token (~2.2 tok/s) vs user-reported vLLM ~0.10 s/token; 2573-token TTFT ~139 s; candidate long prefill ~111 s per 2050-token prompt. No trace yet; P0 harness on branch `pi/p0-20261010` (unmerged, null `repeat`/`cold` fields) |
+| Reproducible deployable image | Clean replacement `src-8b6b47f14d5b-rust1.97.1`, image `sha256:e744b81d…`, source `fb4f4b41`, built and loaded on both nodes. Full 23-shard rehash, final-image scratch and serving-process cuBLAS maps pass on both hosts. Final-image smoke remains owed |
+| Performance baseline | No qualified baseline or trace yet. P0 harness integrated in `72e4e1a3`; explicit initial state and strict streaming completion checks. Historical raw diagnostic fields `repeat_index` and `cold_start` are populated; the prior null-field claim was unsupported |
 
-This review checked source and committed records. It did not inspect live hosts,
-restart services, run a new GPU qualification, or establish a new performance
-result. “Recorded” below refers to the earlier evidence, not a rerun today.
+The resumed work inspected both hosts, reproduced the failure, rebuilt the image
+and started fresh GPU validation. Older evidence below is historical unless
+explicitly dated as resumed; no new performance result has been established.
 
-## Launch profile and operational handoff
+## Preserved production profile (currently stopped)
 
 - Repository: `/home/colum/Workspace/RustroverProjects/atlas`.
 - Branch at review: `sparkglm/installable-20260924`; reviewed HEAD: `11671adf`.
@@ -102,11 +231,12 @@ expert. Physical vocabulary is 154880; tokenizer size is 154856. Absent
 `mhc_post_mult_value` is handled by the explicit named reference policy (2.0),
 with conflicting values rejected.
 
-The frozen comparison uses TP=2 / EP=1, BF16 KV, eager execution, context 4096,
-chunk 128, C1 admission, no prefix caching or speculation. Preserve abs 0.15,
-rel 0.02, KL 0.005, CE 0.15, top-K 10, exact argmax and HTTP text requirements.
-Long-prefix cases use 2047/2048/2051/2053 tokens and registered continuations.
-Do not relax these gates to accommodate either engine's nondeterminism.
+The original frozen comparison used TP=2 / EP=1, BF16 KV, eager execution,
+context 4096, chunk 128, C1 admission, no prefix caching or speculation. Its
+absolute-threshold reports remain diagnostic records. The user-approved
+statistical gate and registered effective FP8 KV profile now decide numerical
+qualification; use `docs/design/exl3-statistical-gate.md` for the current rule.
+Long-prefix cases retain 2047/2048/2051/2053 tokens and registered continuations.
 
 Status 2026-10-11 (candidate image `sha256:b6be48ed…`, `ATLAS_KDA_FLA_REFERENCE=1`):
 
@@ -197,8 +327,9 @@ different scopes.
 | `kda-fla-candidate-20261010/` | Reference-policy candidate: build log/manifest, create commands, short16 comparison + 2 determinism repeats, attestation, smoke, in-situ layer captures (L0 upstream, L0–4 FFN) and the matching canonical reference L0–3 capture |
 | `p0-unqualified-baseline-20261010/` | 6 streaming requests on the production image; harness stopped early (rate too low for the full matrix) |
 | `kda-fla-candidate-20261010/{ref-attn3-capture,mla3b-capture,fp8-mla,qdq-*,ref-mhc3-capture,mla3-capture}` | Layer-3 MLA/mHC captures on both engines: inputs/projections exact, core attention diverges; fp8_g128/QDQ reproduces single-key rows |
-| `statistical-gate-20261011/` | Pre-registered gate collection: ref01–ref02 (short16 + long, 16 rows each), candidate/reference provenance, create commands, `gate_run.sh`/`gate_batch.sh` drivers and batch log (failed cand01 attempts) |
-| `checkpoint-full-sha/` | Earlier full shard hashes; latest build only has stat/index guard, full re-hash still owed |
+| `statistical-gate-20261011/` | Old ref01/ref02 diagnostic captures; preserved `resume-diag01` failure; collector-only command descriptors and full mounted-source audit for fresh collection |
+| `checkpoint-full-sha/` | Earlier full shard hashes, confirmed by both-host full rehash in `checkpoint-rehash-20261011/` |
+| `fp8decode-candidate-20261011/` | Replacement source archive, successful no-cache build log/manifest, focused CPU checks and final-image GPU evidence |
 | `local-ci-baseline-blockers/`, `fmt-baseline-review/`, `unchanged-dense-cache-baseline/` | Earlier baseline failures; reproduce before calling any current failure pre-existing |
 
 Required pair from `nvidia-cublas` 13.1.1.3:
@@ -218,46 +349,51 @@ were superseded by later evidence in the table.
 
 ## Next execution sequence
 
-Checkpoint 2026-10-11: tag `checkpoint/stat-gate-20261011` (production restored,
-nodes idle, no GPU job running).
+The old tag `checkpoint/stat-gate-20261011` is the starting checkpoint, not the
+current host state. Both production containers are stopped during validation.
 
 1. Read [AGENTS.md](AGENTS.md), [CONTRIBUTING.md](CONTRIBUTING.md), the
    [measurement discipline](.claude/skills/measurement-discipline/SKILL.md),
    [validation harness contract](tests/exl3_validation/README.md) and the
    [statistical gate](docs/design/exl3-statistical-gate.md).
-2. **Unblock the candidate long suite.** With the registered profile
-   (`statistical-gate-20261011/cand-rank*-create-command.json`: image
-   `atlas-exl3-validation:src-00ffffa17646-rust1.97.1` = `sha256:eb972c10…`,
-   `fp8_g128`, `ATLAS_KDA_FLA_REFERENCE=1`, both sparse-prefill flags) a fresh
-   server answered 2047/2053/2056-token prompts, but in the scripted run
-   (short16 first, then long via `collect_phase_logits.py` on the same server)
-   a long request returned HTTP 500 and the TP pair exited; the retry deleted
-   the logs. Reproduce by sending the 16 long requests one at a time after
-   short16 and save `docker logs` on both ranks before removing containers
-   (fix `gate_batch.sh` to keep failed run directories and logs). Suspects:
-   the exact 2048 boundary, prefix/SSM snapshot reuse after short16, chunk
-   tails. Any profile change must be registered in the gate doc before
-   candidate data is collected.
-3. Rebuild the image from HEAD if code changes (HEAD also adds the startup
-   check `c64b8c6e`); re-register the image identity in the gate doc.
-4. Finish collection: ref03–ref10 (ref10 held out), cand01, cand02
-   (byte-identical), candkda0 (policy-off minimum-detectable effect). Then run
+2. Inspect the existing `cand-fp8decode02` process and artifacts first. Finish
+   or diagnose its collection and archive both hosts' preserved attempt trees.
+   Scratch, shard rehash and runtime library attestation already pass; do not
+   rerun them without a new change or failed evidence check. Run final-image
+   launch smoke only after collection finishes and its capture marker is gone.
+   Use `run_gate_attempt.sh` for every new gate attempt; never delete evidence
+   before archiving it.
+3. Any further runtime change requires another clean build and preregistered
+   image identity before collecting candidate samples.
+4. Collect nine fresh collector-only references and a held-out tenth, two
+   candidate runs (byte-identical), and candkda0 (minimum-detectable effect). Run
    `tests/exl3_validation/statistical_gate.py` with the controls; the
    semantic must-fail perturbations still need runtime knobs (not built).
 5. Run the Q3 behavior suite live against the candidate; fix the predicted
-   API defects (Atlas bug-first).
-6. P0: trace C1 decode with Nsight on both ranks before optimizing; merge the
-   P0 harness after fixing its null fields. Target: user-reported vLLM
-   ~100 ms/token.
-7. Q0 leftovers: `exl3_moe_scratch_check` GPU run from the image, shard
-   re-hash. Then Q4, P1–P6, F1–F4, R1/R2 as in todo.md.
+   API defects (Atlas bug-first). `4b49a9c4` needs a rebuilt image and live
+   usage-order verification. The seed omission is confirmed by source audit:
+   first-token routes do not pass request seed into `sample_first_token` /
+   `sample_token`, while later decode passes it. Add a deterministic unit
+   regression and thread the seed through every first-token route. No seed
+   fix was implemented; greedy numerical collection is unaffected.
+6. P0: trace C1 decode with Nsight on both ranks before optimizing; the harness
+   is integrated. A named `nsys launch` session followed by `nsys start` after
+   model load is documented, but has not yet been exercised on Atlas.
+   Prepared driver/tests/README are archived in `p0-trace-prep-20261011/`
+   under the evidence root (11 tests pass). The inner Python heredoc escaping
+   was corrected and tested with a mocked remote call; all actual remote
+   profiler behavior remains untested. Preserve the gate run before freeing
+   its port and GPU memory. Use explicit workload limits and unique outputs;
+   the trace profile removes the logits observer and cannot supply headline
+   performance figures.
+7. Close Q0 only with final-image scratch, smoke and both-rank library maps.
+   Then Q4, P1–P6, F1–F4, R1/R2 as in todo.md.
 
-Operational: production runs the original image on port 8000. Candidate
-images `src-efd023f8f7b9`/`src-d6e5d51121b3`/`src-00ffffa17646` are loaded on
-both nodes. Reference capture variants (`/tmp/kdafla-ref-*-rank*.json`,
-`/tmp/kdafla-ref-patch-attn`) live in `/tmp` on the nodes and are not durable;
-the attention hook source is `tests/exl3_validation/reference_attn_trace.py`.
-Subagents: use standard Opus subagents, not Pi/mimo (user instruction).
+Operational: original production containers on port 8000 are preserved and
+stopped. The replacement validation image is loaded on both nodes. Fresh
+commands are staged in `/home/colum/gate2-profile/`; their durable copies and
+all mounted reference hook sources are archived under `statistical-gate-20261011/`.
+Subagents: use Luna where possible (current user instruction).
 
 The dated [code review](CODE_REVIEW_2026-10-10.md),
 [kernel review](GB10_KERNEL_OPTIMIZATION_REVIEW_2026-10-10.md) and
