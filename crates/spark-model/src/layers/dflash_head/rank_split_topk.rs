@@ -28,7 +28,10 @@ pub(crate) struct TopkSelect {
 impl TopkSelect {
     pub(crate) fn new(gamma: usize, draft_conf: bool, gpu: &dyn GpuBackend) -> Result<Self> {
         let (module, walk) = if draft_conf {
-            ("glm_dflash2_selector_conf", "dflash2_selector_walk_conf")
+            (
+                crate::layers::dflash_head::draft_conf::conf_module(),
+                "dflash2_selector_walk_conf",
+            )
         } else {
             ("dflash2_candidate_selector", "dflash2_selector_walk")
         };
