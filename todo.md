@@ -1,14 +1,69 @@
 # GLM-5.3 EXL3 — remaining high performance inference work
 
-Updated 2026-10-11 16:47 UTC. **Q2 statistical gate: candidate FAILS** (9 fresh
+## Next batch (staged 2026-10-12)
+
+Ordered execution; sequencing SSOT:
+[docs/plans/q2-norm-causality-plan.md](docs/plans/q2-norm-causality-plan.md).
+The ref13 held-out diagnostic COMPLETED (verdict: reference-internal bimodal
+chaos; both Sparks idle again with post-stop receipts) and the
+neighboring-types matrix is instantiated (`q2-neighbor-matrix-20261012/`,
+49 rows). C1 preparation is in flight locally.
+
+1. **C1** — local `o_proj` replay before TP (original vs reference-exact vs
+   v24-corrected norm output; each engine vs its own captured projection
+   first). **Sparks free since ref13 finished 2026-10-12; C1-prep running.**
+2. **C2** — layer-0 norm-output intervention on both ranks (o_proj → routing →
+   MoE → final logits against the failing rows).
+3. **L1 escalation** — for `longer`, trace complete mHC residual streams and
+   L1 KDA between matching L0 outputs and differing L1 FFN inputs, before
+   broad late-layer bisection.
+4. **G2–G7 fallbacks** — G8/G9 runtime + binary binding precedes each
+   affected replay.
+5. **Neighboring-types matrix + repeat Rust/vLLM/source review** — HARD
+   PREREQUISITE before any shared-code fix (matrix instantiated:
+   `q2-neighbor-matrix-20261012/`; the repeat Rust/vLLM/source review on
+   actual candidate artifacts remains open).
+6. **Production v24 gated-norm fix** — only behind causality evidence, the
+   plan's step-5 qualification obligations, and a fresh frozen Q2 run.
+
+**Operator decision required (from the ref13 investigation):** the
+pre-registered must-pass held-out control fails for the reference engine
+itself (3/5 pure reference draws: 2 catastrophic-row at `longer`/r0, 1
+rank-only) — the rule is structurally unpassable as written whenever a draw
+lands in the failing mode. Options: (a) pursue reference-faithful numerics
+and keep the gate as registered; (b) author a NEW pre-registration (any
+redesign is an operator act, never unilateral). Evidence:
+`q2-ref13-investigation-20261012/`.
+
+**Current Q2 review after `614a2e24`:** norm correction is proven only on
+the 16 captured fixtures; downstream causality and qualification remain open.
+Use the revised [causality plan](docs/plans/q2-norm-causality-plan.md) and the
+active follow-ups at the end of this file. The dated checkpoint below is
+historical: later binding/replay commits and stopped-host receipts supersede
+its documentation-only HEAD and unverified-host statements. This offline
+review did not inspect live hosts.
+
+Reviewed 2026-10-11 against HEAD `f0ba28fd` (documentation-only changes after
+tested source `ee5eaf0f`). **Q2 statistical gate: candidate FAILS** (9 fresh
 references; held-out reference also fails one row) — see [continue.md](continue.md).
-Merged seed/stop/API code now has a clean rebuilt-image neutrality pass on all
-32 frozen cases (`cand-merged-e333-01`). Its focused Q3 run exposed a genuine
-first-thinking-token grammar bug; fixed in `19551fc6`, with real production
-sampler CPU red/green evidence. Clean image source `ee5eaf0f` has full short16 byte
-neutrality and 6/16 matching long rows. Work stopped at user request; both
-Sparks are stopped. Full corrected-image long neutrality and focused Q3 rerun
-remain pending; preserve the incomplete `cand-grammar-ee5e-01` attempt.
+Merged seed/stop/API code has a clean rebuilt-image neutrality pass on all 32
+frozen cases (`cand-merged-e333-01`); its focused Q3 run exposed the
+documented first-thinking-token grammar bug. Image `ee5eaf0f` now has **full
+short16+long byte neutrality** (`cand-grammar-ee5e-02` vs `cand-fp8decode02`,
+both archives byte-identical) and a **15/15 focused Q3 pass on GPU** proving
+the `19551fc6` JSON-opener fix and the `8334ab33` completion-identity fix;
+exact terminal-EOS-ID verification is recorded untested (harness skip).
+Host state 2026-10-12: `gate-ref-0/1` are the **IN-FLIGHT ref13 diagnostic
+reference engines — do not stop them**; coordinate with the ref13 track
+(`q2-ref13-investigation-20261012/`) before any other GPU work. The incomplete
+`cand-grammar-ee5e-01` attempt is preserved
+and unreused. Q2 investigation report (read-only, local):
+`q2-investigation-20261011/report.md` under the durable root — candidate
+excess dominates; MLA multi-key causal link still unproven. Reviewed localization
+finds layer-0 gated-normalization differences and layer-3 routing membership
+changes; original same-input GEMM and dominant MoE-amplification claims were
+invalid. See the corrected report and `analysis/review-validation.json` under
+`q2-diagnostic-20261011/`.
 Q4 and F2/F3 harnesses remain GPU-unvalidated. R2 records remain unmerged on
 `pi/r2records-20261011` (benchmark boundary edits invalidate required records).
 Original roadmap review was against `11671adf`. Native TP=2 / EP=1 boot and generation
@@ -23,49 +78,86 @@ costs. Each item should be a focused change with its own acceptance evidence;
 this roadmap spans multiple PRs. Check an item only with a run/artifact ID tied
 to the source and profile that passed.
 
-## Already delivered — preserve and use
+## Completed — evidence pointers
 
-- [x] Native EXL3 mul1 loading, packed kernels, TP=2 / EP=1 KDA/MLA/MoE/mHC
-  integration and launcher; five sequential nonstreaming chat smoke receipts.
-- [x] Shared routed MoE workspace and ordered teardown; rank-local GPU guard and
-  A→B→A reuse proof on both hosts. This does not qualify overlapping streams.
-- [x] Opt-in FFN stage profiling; coherent cuBLAS 13.1 classic/Lt profiles;
-  merged KDA auxiliary with recorded in-situ M1/M5/M128 comparisons.
-- [x] KDA reference-policy kernels and dispatch (`72d64e4c`, `069e4351`),
-  both-rank GPU stage/state oracle and layer 0–2 in-situ byte comparisons.
-  Q1 remains open until its full-model Q2 dependency passes.
-- [x] Reproduce the 2049-token FP8 chunk-tail crash, repair reader selection
-  (`fb4f4b41`), clean-build the candidate and complete that failing request
-  on the real TP pair. Full Q2 qualification remains open.
-- [x] Full 23-shard rehash on both hosts, final-image scratch replay/guards and
-  both-rank serving-process cuBLAS-map attestation.
-- [x] Final-image launch smoke (2026-10-11 05:28 UTC): 5/5 requests passed.
-  Receipt: `fp8decode-candidate-20261011/final-image-smoke/smoke.json`.
-- [x] `cand-fp8decode02` full collection complete (short16 16/16, long 16/16).
-  Evidence: `statistical-gate-20261011/cand-fp8decode02/`.
-- [x] Correct OpenAI chat stream usage order (`4b49a9c4`) with CPU red/green
-  encoder evidence. Rebuild and live behavior validation remain part of Q3.
+One line per completed item, pointer only; receipts and full detail live in
+git history and under the durable evidence root
+`/home/colum/Workspace/atlas-exl3-validation-20261010` (row index in
+[continue.md](continue.md) §Evidence index). Do not delete these paths.
+
+- Native EXL3 mul1 loading, packed kernels, TP=2 / EP=1 KDA/MLA/MoE/mHC
+  integration and launcher; five sequential nonstreaming chat smoke receipts
+  (`atlas-launch-smoke-20261010/smoke.json`).
+- Shared routed MoE workspace and ordered teardown; rank-local GPU guard and
+  A→B→A reuse proof on both hosts — does not qualify overlapping streams
+  (`arithmetic-audit/native-aux-scratch-gpu-20261010/`).
+- Opt-in FFN stage profiling; coherent cuBLAS 13.1 classic/Lt profiles; merged
+  KDA auxiliary with recorded in-situ M1/M5/M128 comparisons
+  (`native-aux-insitu-20261010/`).
+- KDA reference-policy kernels and dispatch (`72d64e4c`, `069e4351`),
+  both-rank GPU stage/state oracle and layer 0–2 in-situ byte comparisons
+  (`arithmetic-audit/kda-reference-stage-oracle-20261010/`,
+  `kda-fla-candidate-20261010/`); Q1 stays open until its full-model Q2
+  dependency passes.
+- 2049-token FP8 chunk-tail crash reproduced, reader selection repaired
+  (`fb4f4b41`), clean-built candidate completed that failing request on the
+  real TP pair (`statistical-gate-20261011/resume-diag01/`).
+- Full 23-shard rehash on both hosts, final-image scratch replay/guards and
+  both-rank serving-process cuBLAS-map attestation
+  (`checkpoint-rehash-20261011/comparison.json`,
+  `fp8decode-candidate-20261011/scratch/`).
+- Final-image launch smoke (2026-10-11 05:28 UTC), 5/5 requests
+  (`fp8decode-candidate-20261011/final-image-smoke/smoke.json`).
+- `cand-fp8decode02` full collection complete, short16 16/16 + long 16/16
+  (`statistical-gate-20261011/cand-fp8decode02/`).
+- Correct OpenAI chat stream usage order (`4b49a9c4`) with CPU red/green
+  encoder evidence; rebuild and live validation remain part of Q3.
+- **Q0 COMPLETE** — reproducible coherent-13.1 recipe in-tree (`a6f64c46`,
+  `59b0e113`); clean no-cache image `src-8b6b47f14d5b-rust1.97.1` /
+  `sha256:e744b81d…` built from `fb4f4b41` and loaded on both nodes; final-image
+  smoke 5/5; all 23 shards rehashed on both hosts
+  (`fp8decode-candidate-20261011/`, `checkpoint-rehash-20261011/comparison.json`).
+- Ablation summary validity repaired — `build_summary` / `enforce_summary_gate`
+  in `tests/exl3_validation/gated_norm_ablation.py` retain all engagement
+  controls, set `interpretation_blocked=true` on any absent/failing control and
+  fail the command on a blocked summary (commit `9ff39728`). Attribution: the
+  summary/exit logic is in `gated_norm_ablation.py`, **not**
+  `gated_norm_variants.py` (variant derivation only).
+- Ablation fixture validation repaired — `validate_fixture` in
+  `tests/exl3_validation/gated_norm_ablation.py` enforces schema/rank/
+  invocation, recorded + actual file hashes, cross-engine operand equality and
+  effective epsilon bits, with failure-asserting negative tests (commit
+  `c71bb557`).
+- D4 — installed head padding resolved: plugin explicitly uses `pad=false`;
+  prior head-M1 component receipts confirm actual rows=1
+  (`linear-head-m1-production13-rank{0,1}-results/`); current worker dispatch
+  and failing-input parity remain G2 work.
+- G8 checkpoint evidence — exact config bytes recovered from
+  `vllm-reference.json`; SHA256 matches all 24 registered suite manifests; layer
+  map, index_topk=2048, NoPE, clamp=10 and router dtype are available.
+- Gated-norm ablation attribution + minimal fix (2026-10-12): `v24-minimal`
+  (rsqrt -> sqrt.approx.ftz+div.full; divide -> reciprocal multiply) reproduces
+  the reference byte-exactly on all 16 fixtures
+  (`q2-norm-ablation-20261012/analysis-20261012.md`); the production kernel
+  carry-over is staged as Next batch item 6.
+
+## Deferred hardening (harness repair review)
+
+Minor, non-blocking findings from the independent repair review
+(`q2-norm-ablation-20261012/harness-repair-20261012/review-summary.md`):
+
+1. No test drives `main()` wiring of `validate_fixture` /
+   `enforce_summary_gate`; both calls are assured by inspection only.
+2. `red-defect1.txt` failure line numbers are not byte-identical to the final
+   tests (red ran against a slightly earlier draft; constructs match
+   semantically).
+3. Finding-3 attribution gap: helper-module hashing is present in
+   `gated_norm_ablation.py` but undeclared alongside findings 1–2 in the repair
+   report.
+4. Untested validator branches: manifest key-set, file-identity/dtype,
+   shape-record and `_f32_bits` rejection paths.
 
 ## Q — qualification and reproducibility
-
-- [x] **Q0 — Reproduce the working image from committed inputs.** Bring the
-  external coherent-13.1 build recipe into the EXL3 Docker/build path. Package
-  the pinned pair with hashes/licenses and explicit provider resolution; build
-  the server and `exl3_moe_scratch_check` from one source snapshot. Bind source,
-  Git commit, compiler flags, binaries, embedded PTX, image digest and checkpoint
-  revision/shard hashes on both ranks. Preserve the completed shard re-hash.
-  **Done when:** a clean no-cache build boots both nodes, actual runtime mappings
-  show only the intended pair, and smoke plus scratch GPU checks pass with archived
-  manifests. Current launcher image is a preserved snapshot, not proof of a
-  reproducible `11671adf` build.
-  *Status 2026-10-11:* **Q0 COMPLETE.** Recipe in-tree (`a6f64c46`, `59b0e113`);
-  clean no-cache replacement `src-8b6b47f14d5b-rust1.97.1` / `sha256:e744b81d…`
-  built from `fb4f4b41` and loaded on both nodes. Final-image scratch replay,
-  guards and input preservation pass on both ranks; serving-process runtime maps
-  show only the pinned pair. Final-image smoke passed 5/5 requests.
-  Evidence: `fp8decode-candidate-20261011/`. Full re-hash complete: all 23 shards
-  on both hosts match each other and the archived hashes
-  (`checkpoint-rehash-20261011/comparison.json`).
 
 - [ ] **Q1 — Implement and validate the EXL3 reference-policy KDA core.** Follow
   [T2–T8](docs/design/exl3-kda-reference-core.md): M5 prefill, exact PTX operation
@@ -81,9 +173,12 @@ to the source and profile that passed.
   *Status 2026-10-11:* kernels + dispatch done (`72d64e4c`, `069e4351`); every
   stage, carried state (3 chunks + tail, 4 decodes) and the composed pipeline are
   0-mismatch vs the GPU oracle on both ranks (`tests/exl3_validation/kda_fla/run.sh`);
-  in situ layer 0–2 byte-exact. Open: the Q2 dependency below, a performance pass
-  (correctness-first kernels, ~12 launches per KDA prefill), and the long-prefix
-  (2047/2048/2051/2053) gate on this image, which was not run.
+  historical in-situ layer 0–2 byte equality is scoped to the earlier M5 request.
+  Reviewed M10–13/M36–39 captures have matching KDA core/g1/g2 but one-ULP
+  gated-normalization differences; bind constants/weights and isolate that stage.
+  Open: failed Q2 dependency, a performance pass (correctness-first kernels,
+  ~12 launches per KDA prefill), and qualification across long-prefix boundaries.
+  Full short16+long collection now exists; its registered gate fails.
 
 - [ ] **Q2 — Close full-model numerical and repeatability gates.** Rerun frozen
   short16, long-prefix/chunk-boundary, persistent decode and raw-logit comparisons
@@ -97,11 +192,11 @@ to the source and profile that passed.
   or explicitly retained as an unresolved constraint, never used to waive failure.
   *Status 2026-10-11 05:30 UTC:* the user chose a statistical gate; it is
   pre-registered (`docs/design/exl3-statistical-gate.md`, `3cf66612`, reviewed
-  by Fable 5.1; candidate-profile addendum `87e4b08b`). Atlas's first own
-  divergence was the layer-3 MLA core output: the reference silently uses an
+  by Fable 5.1; candidate-profile addendum `87e4b08b`). Historical M5
+  localization found a layer-3 MLA core-output divergence: the reference silently uses an
   `fp8_ds_mla` latent KV cache. `--kv-cache-dtype fp8_g128` reproduces its
-  single-key rows; the candidate profile now uses it. Layers 0–2 and the
-  layer-3 projections are byte-exact. The resumed run reproduced the candidate's
+  single-key rows; the candidate profile now uses it. Layers 0–2 and
+  layer-3 projections matched in that earlier M5 capture, not all gate rows. The resumed run reproduced the candidate's
   2049-token crash: its one-token tail entered MLA decode without an enabled
   FP8 reader. `fb4f4b41` selects and initializes that existing reader for
   serial TP2/EP1. The repaired final image completed that request.
@@ -112,17 +207,49 @@ to the source and profile that passed.
   ≤5.53 (p=0.1) with 3 catastrophic short16 `longer` rows; cand03 byte-identical
   to cand02; candkda0 (MDE) T 7.68; held-out ref13 fails one row (reference
   bimodality at short16 `longer` row 0). Reports in
-  `statistical-gate-20261011/final/`. Next: user decision between
-  reference-faithful multi-key MLA FP8 numerics and a re-designed gate. The
-  semantic must-fail knobs now exist (`ATLAS_EXL3_GATE_PERTURBATION`, merged,
-  GPU-untested) and need a rebuilt image to run.
+  `statistical-gate-20261011/final/`. The earlier MLA-port versus gate-redesign
+  choice is not supported by a localized dominant cause; isolate the newly
+  reviewed KDA/routing differences first. Keep the registered gate unchanged.
+  Read-only investigation (`q2-investigation-20261011/report.md` under the
+  durable root) recomputed T=7.20 from raw artifacts: candidate excess
+  dominates (29× the worst reference on short16 `arithmetic`, 3.6× `longer`,
+  2.1–2.2× on 2047/2048) and the FAIL is robust to the ref13 row-0 anomaly;
+  MLA multi-key ulp claims verify from raw bytes, causal link unproven.
+  Diagnostic-plan review: add `longer` prefixes 36–39, one long-suite case,
+  a layer escalation path, and a build-identity prerequisite before GPU runs.
+  *User authorization 2026-10-11 18:30 UTC (`extended-plan.json`):*
+  extended diagnostic authorized
+  (`+longer`, escalation path, build prerequisite — platform = neutrality-proven
+  `ee5eaf0f` image) plus offline stage-2 propagation analysis; the
+  reference-faithful-MLA vs gate-re-design decision remains open.
+  *Extended diagnostic executed (session 3b):* attempts `cand-q2diag-ee5eaf0f-02`
+  + `ref-q2diag-ctxv4diag-03`, dumps archived under `q2-diagnostic-20261011/`.
+  **Reviewed localization** (`q2-diagnostic-20261011/analysis/localization-report.md`):
+  KDA core/g1/g2 match all 16 rank/prefix pairs. Gated normalization differs
+  by max 1 BF16 ULP: 1 element per arithmetic prefix on rank 1; 6 per longer
+  prefix on rank 0. Longer sampled L0 outputs match, but internals do not.
+  Arithmetic FFN inputs already differ, so dense gate_up is not same-input;
+  reduced o_proj includes a rank with differing direct input. Correct i32
+  routing shows expert-membership changes at L3. Correct post-TP MoE pairing
+  gives p99 64–71 ULP; the reported 1507 used incompatible boundaries.
+  **Next:** fix analyzer dtypes/signed-ULP/mappings with controls, bind/replay
+  gated-normalization constants and dynamic inputs, then isolate local o_proj
+  and dense projections with identical inputs. Measure effects on routing and
+  full-model logits before assigning a dominant cause. Extend L1 KDA/later
+  bisection for residual divergence; the 2048 long-suite case was excluded
+  from this diagnostic and remains unlocalized. Original analyzer/results
+  remain preserved; `analysis/review_localization.py` reproduces corrections.
+  Semantic must-fail knobs exist (`ATLAS_EXL3_GATE_PERTURBATION`, merged), but
+  GPU controls are still owed. Rebuild/register only when changing runtime;
+  current HEAD after `ee5eaf0f` changes documentation only.
   Both-rank failure logs and raw evidence are preserved in
   `statistical-gate-20261011/resume-diag01/`. The earlier ref01/ref02 enabled
   intermediate tensor captures and are diagnostic only. A collector-only
   reference profile is pinned before fresh collection; the gate also
   checks environment/build/hook identity within each engine.
-  After batch: run `statistical_gate.py` with controls. The semantic must-fail
-  perturbations still need Atlas runtime knobs.
+  The completed batch already ran `statistical_gate.py`. Rerun registered
+  candidate/control collection after a justified arithmetic change; do not
+  recollect unchanged references simply to seek a passing verdict.
 
 - [ ] **Q3 — Qualify usable API behavior.** Extend beyond the launch smoke to
   OpenAI chat/completions and Anthropic, streaming/nonstreaming, reasoning on/off
@@ -148,11 +275,13 @@ to the source and profile that passed.
   and counter-drift controls. `19551fc6` pauses first-token grammar while
   reasoning, matching later decode and preserving template-forced thinking.
   CPU regression reproduces consumed JSON opener before the fix and passes
-  afterward. At the user-requested stop, corrected-image short16 passes;
-  long is intentionally incomplete (6/16 matching rows). Corrected live Q3
-  has not started; resume with a fresh attempt after full neutrality.
-  Evidence: `merged-image-20261011-session2/` under the durable root in
-  continue.md. **Q3 remains open:** the full behavioral surface, tools,
+  afterward. *Session 3 (2026-10-11 18:02 UTC):* fresh attempt
+  `cand-grammar-ee5e-02` completed **full short16+long byte neutrality** and
+  the focused live slice **15/15 on GPU** — `seed-json-schema`
+  parses/schema-valid (JSON-opener fix proven under template-forced thinking),
+  both `stream_matches_blocking` cases pass, `stream:last_token_is_eos`
+  recorded untested. Evidence: `merged-image-20261011-session2/grammar-r2/`
+  under the durable root in continue.md. **Q3 remains open:** the full behavioral surface, tools,
   reasoning budgets, multi-turn, cancellation/timeout recovery and explicit
   skipped assertions still need qualification. Repeated-seed identity alone
   does not validate later-token RNG independence.
@@ -364,3 +493,65 @@ independent timing confirmation, same quality gates, and a rollbackable change.
 No current smoke rate, offline SASS audit or prior-engine benchmark proves an
 Atlas speedup. The goal is met only when the chosen serving profiles satisfy
 both their correctness and measured performance contract.
+
+## Q2 code-path gap follow-ups (2026-10-12)
+
+Short summaries only; sequencing authority and fallback-suspect ordering in
+[docs/plans/q2-norm-causality-plan.md](docs/plans/q2-norm-causality-plan.md)
+(folded from the audit gap list); evidence and rationale in
+`/home/colum/Workspace/atlas-exl3-validation-20261010/q2-codepath-audit-20261012/comparison-report.md` §5,
+as corrected by the appended vLLM reconciliation in `q2-diagnostic.md`.
+
+- [ ] Before a shared-code fix, instantiate the causality plan's neighboring
+  types/configurations matrix from current callers, enums, loaders and kernel
+  dispatch. Record supported, implemented-but-unqualified and rejected paths;
+  cover changed branches, admission checks, shape boundaries and coupled axes.
+  Include reachable norm/gate, weight/cache dtype, routing, attention/state,
+  topology and serving-mode neighbors. Attach regression evidence per row;
+  mark missing hardware or reference coverage untested, not passed.
+- [ ] Repeat the plan's Rust/vLLM/source/log review on the actual candidate
+  artifacts. Reuse its prompt and record source/runtime binding, harness
+  validity, earliest divergence and complete state before causal conclusions.
+- [ ] Evaluate performance under the plan's explicit workload/objective and
+  measurement protocol after correctness is qualified. Compare named eligible
+  alternatives; report best observed scope and unresolved evidence rather than
+  declare global optimality from source parity or a single timing result.
+
+- [ ] C1/C2 — execute the revised layer-0 projection/intervention plan;
+  explicit layer scope and full-vocabulary ensemble metrics are now specified.
+- [ ] L1 escalation — for `longer`, trace complete mHC residual streams and
+  L1 KDA between matching L0 attention/FFN outputs and differing L1 FFN inputs
+  on both ranks; do this before broad late-layer bisection.
+- [ ] G2 — bind final RMSNorm and reuse/rebind the existing head-M1 replay
+  (`linear-head-m1-production13-rank{0,1}-results/`) to current failing inputs,
+  resident workers and embedded PTX; older NVRTC component proof is scoped.
+- [ ] G3 — router binding + same-input router-logit comparison + tie-rule
+  evidence for the failing rows. Reuse coherent131 M1/M5/M10/M128 receipts;
+  checkpoint specifies float32, but actual GEMM/cast/sigmoid dtype needs binding.
+- [ ] G4 — reuse/rebind prior thin/fat expert replays and 32/33 occupancy
+  controls. Capture FP16 route-weight casts, local IDs, token permutation,
+  per-expert counts and routed FP32 sums. Archived L3 longer counts stay below
+  cap32 on both engines/ranks; other layers/long contexts need their own counts.
+  Thin half2/post-SiLU arithmetic and atomics-order probes remain relevant.
+- [ ] G1 — layers 4–44 hidden-state bisection captures on both engines
+  (operator scope extension granted 2026-10-12; see decisions.md).
+- [ ] G5 — effective cache/attention-path equivalence: reference auto resolves
+  to fp8_ds_mla, which candidate fp8_g128 was selected to match. Bind QDQ
+  placement and actual read/write paths on short prompts too: the bound SM120
+  backend uses cached MQA even for fresh short prefill. Long-suite tracing
+  operator scope extension was granted 2026-10-12 (see decisions.md).
+- [ ] G6/G7 — mHC ≤16-row path-branch capture at a representative layer;
+  bind deferred `(x,residual,post,comb)`, local rows and provider/splits.
+  MLA/indexer replay must compare actual selected keys: installed reference
+  truncates one pool only in ranked selection beyond the short-prefill cutoff.
+  Evaluate actual continuation prefix/chunk lengths, not suite case names.
+- [ ] G8 runtime evidence — bind effective config overrides and selected
+  providers; do not reuse the archived JSON's historical serving environment.
+- [ ] G9 — compiled-binary ↔ source binding (EXL3 extension, `_C.*`,
+  FlashInfer, cuBLAS algorithms).
+- [ ] Minor: confirm preserved gate request payloads carry no masks/penalties
+  (both audits note processor absence is unattested from "greedy" alone).
+- [ ] Deferred review nits (harness review 2026-10-12, non-blocking): failure
+  receipt on mid-row crashes; ULP one-liner dedup vs `metrics`; shared compile
+  options constant; `name` shadowing; v1 loop `i < dim` comment. Reference:
+  `q2-norm-ablation-20261012/harness-review-20261012.md` findings 4-8.

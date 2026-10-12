@@ -71,6 +71,33 @@ fn capture_preserves_typed_bytes_marker_gate_and_exclusive_identity() {
             .capture(&gpu, invocation, "../unsafe", &[], 17)
             .is_err()
     );
+    assert!(
+        router
+            .capture_with_metadata(&gpu, 1, "binding", &[], 17, &serde_json::json!(["invalid"]))
+            .is_err()
+    );
+    router
+        .capture_with_metadata(
+            &gpu,
+            1,
+            "binding",
+            &[DiagnosticTensor {
+                name: "weights",
+                dtype: DiagnosticDtype::F32,
+                shape: vec![1, 2],
+                ptr,
+            }],
+            17,
+            &serde_json::json!({"eps_f32_bits": 0x3727c5acu32}),
+        )
+        .unwrap();
+    let bound: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("ffn-L3-rank1-000001-binding.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bound["binding"]["eps_f32_bits"], 0x3727c5acu32);
+    assert_eq!(bound["invocation"], 1);
+    assert!(metadata.get("binding").is_none());
     gpu.free(ptr).unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

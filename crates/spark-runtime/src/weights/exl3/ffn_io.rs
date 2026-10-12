@@ -120,6 +120,34 @@ impl Exl3FfnRouter {
         tensors: &[DiagnosticTensor],
         stream: u64,
     ) -> Result<()> {
+        self.capture_record(gpu, invocation, stage, tensors, stream, None)
+    }
+    /// Bind explicit host-side launch constants alongside resident tensors.
+    pub fn capture_with_metadata(
+        &self,
+        gpu: &dyn GpuBackend,
+        invocation: usize,
+        stage: &str,
+        tensors: &[DiagnosticTensor],
+        stream: u64,
+        binding: &serde_json::Value,
+    ) -> Result<()> {
+        ensure!(
+            binding.is_object(),
+            "FFN diagnostic binding must be an object"
+        );
+        self.capture_record(gpu, invocation, stage, tensors, stream, Some(binding))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn capture_record(
+        &self,
+        gpu: &dyn GpuBackend,
+        invocation: usize,
+        stage: &str,
+        tensors: &[DiagnosticTensor],
+        stream: u64,
+        binding: Option<&serde_json::Value>,
+    ) -> Result<()> {
         let safe = |name: &str| {
             !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         };
@@ -166,12 +194,13 @@ impl Exl3FfnRouter {
             .write(true)
             .create_new(true)
             .open(self.directory.join(format!("{stem}.json")))?;
-        serde_json::to_writer(
-            metadata,
-            &serde_json::json!({"schema":"atlas-exl3-ffn-v1",
+        let mut record = serde_json::json!({"schema":"atlas-exl3-ffn-v1",
             "layer":self.layer,"tp_rank":self.rank,"tp_world":self.world,
-            "invocation":invocation,"stage":stage,"stream":stream,"tensors":records}),
-        )?;
+            "invocation":invocation,"stage":stage,"stream":stream,"tensors":records});
+        if let Some(binding) = binding {
+            record["binding"] = binding.clone();
+        }
+        serde_json::to_writer(metadata, &record)?;
         Ok(())
     }
 }

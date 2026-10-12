@@ -174,6 +174,20 @@ impl Glm5KdaLayer {
         profile::step(ctx, stream, &mut profile_timer, "pack_conv")?;
         profile::step(ctx, stream, &mut profile_timer, "recurrent")?;
         let gated = projected;
+        let norm_eps = ctx.config.rms_norm_eps as f32;
+        if let Some(trace) = &self.upstream_trace {
+            trace.capture_gated_norm_binding(
+                upstream,
+                ctx.gpu,
+                self.weights.o_norm.weight,
+                self.gated_norm_k,
+                m,
+                self.heads as u32,
+                self.dim as u32,
+                norm_eps,
+                stream,
+            )?;
+        }
         ops::kda_sigmoid_gated_norm(
             ctx.gpu,
             self.gated_norm_k,
@@ -184,7 +198,7 @@ impl Glm5KdaLayer {
             m,
             self.heads as u32,
             self.dim as u32,
-            ctx.config.rms_norm_eps as f32,
+            norm_eps,
             stream,
         )?;
         self.capture_upstream(
