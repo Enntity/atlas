@@ -200,7 +200,6 @@ impl Qwen3AttentionLayer {
             })?;
             // Few rows merge per-rank attention under a shard (`ATLAS_GLM_KV_SHARD=1`),
             // the canonical form's bits unsharded; larger sharded owners read a view.
-            let sharded = kv_cache.latent_shard().is_some();
             let latents = self.glm_owner_latents(kv_cache, &octx, o, sequence_end, stream)?;
             let merge_form = latents.is_none();
             let canonical = self.glm_canonical_rank(kv_cache, ctx, nq, o.rows)?;
