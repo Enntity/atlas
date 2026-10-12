@@ -268,7 +268,11 @@ impl BlockDiffusionDraftHead {
             k,
             gpu.default_stream(),
         )?;
-        Ok(Mxfp8Weight { data, scales })
+        Ok(Mxfp8Weight {
+            data,
+            scales,
+            tiled: false,
+        })
     }
 
     /// `out[m, n] = input[m, k] · Wᵀ` from an NVFP4 twin on the tensor-core
