@@ -11,7 +11,11 @@ neighboring-types matrix is instantiated (`q2-neighbor-matrix-20261012/`,
 
 1. **C1** — local `o_proj` replay before TP (original vs reference-exact vs
    v24-corrected norm output; each engine vs its own captured projection
-   first). **Sparks free since ref13 finished 2026-10-12; C1-prep running.**
+   first). **C1 executed 2026-10-12; BLOCKED at the fail-closed self-anchor
+   (the f32-GEMM/RNE contract byte-reproduces neither engine's native GEMM).
+   Remedy approved: engine-matching GEMM algorithm receipts + engine-native
+   replay backend, then re-run anchors + variants.** Evidence:
+   `q2-c1-execution-20261012/`.
 2. **C2** — layer-0 norm-output intervention on both ranks (o_proj → routing →
    MoE → final logits against the failing rows).
 3. **L1 escalation** — for `longer`, trace complete mHC residual streams and

@@ -118,3 +118,29 @@ this file references them, it does not duplicate them.
   `ref13` row.
 - Why: pre-registered thresholds and controls are the qualification contract;
   redesign would invalidate comparability with the registered evidence.
+
+## 2026-10-12 — C1 local o_proj binding: load-time BF16 common space + resident sub-record (minor, Q2 C1)
+
+- Reference: `docs/plans/q2-norm-causality-plan.md` §"Experiment C1";
+  `q2-c1-prep-20261012/binding-status.md` (`atlas-local-o-proj-binding-v1`);
+  supervisor decision A+ of the C1 capture stage (2026-10-12).
+- Decision: the candidate capture is load-time first — with
+  `ATLAS_LOCAL_O_PROJ_BINDING_DIR` + `ATLAS_LOCAL_O_PROJ_BINDING_LAYERS=0`
+  (unset = zero behavioral difference) the layer-0 o_proj shard is written
+  once as the BF16 common comparison space (`reference_reconstruct` →
+  RNE-BF16, mirroring vLLM's load-time dequant) together with the verbatim
+  resident quantized bytes and recipe identity in the additive `resident`
+  sub-record; the forward hot path only stamps the per-invocation
+  `atlas-local-o-proj-binding-v1` JSON plus GEMM receipt (no tensor copies,
+  no synchronizing work). The reference overlay mirrors this symmetrically
+  behind `ATLAS_LOCAL_O_PROJ_BINDING=1`.
+- Why: every candidate o_proj loader path is quantized (no BF16 device copy
+  exists), the frozen replay harness requires BF16 weight bytes, and
+  reconstruction must not run in the forward path; the BF16 bytes are the
+  comparison space, NOT a claim about the native GEMM's exact bits — that
+  claim is tested fail-closed by the C1 self-anchor, with the algorithm
+  receipt as the diagnostic if it fails.
+- Code: `weight_loader/glm5/o_proj_binding.rs`,
+  `layers/glm5_kda/{upstream,upstream_tests,o_proj_receipt}.rs`,
+  `spark-runtime weights/exl3/ffn_io.rs`,
+  `tests/exl3_validation/local_o_proj_capture.py`.

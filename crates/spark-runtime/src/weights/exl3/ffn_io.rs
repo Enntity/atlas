@@ -138,6 +138,36 @@ impl Exl3FfnRouter {
         );
         self.capture_record(gpu, invocation, stage, tensors, stream, Some(binding))
     }
+    /// Persist a binding record plus its capture receipt for stages that
+    /// dump no tensors (the C1 local o_proj binding record references a
+    /// load-time weight file instead of recapturing resident bytes).
+    pub fn write_binding_with_receipt(
+        &self,
+        invocation: usize,
+        stage: &str,
+        binding: &serde_json::Value,
+        receipt: &serde_json::Value,
+    ) -> Result<()> {
+        ensure!(
+            binding.is_object() && receipt.is_object(),
+            "FFN diagnostic binding/receipt must be objects"
+        );
+        ensure!(safe_name(stage), "FFN diagnostic stage invalid");
+        let stem = format!(
+            "ffn-L{}-rank{}-{invocation:06}-{stage}",
+            self.layer, self.rank
+        );
+        let metadata = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.directory.join(format!("{stem}.json")))?;
+        let record = serde_json::json!({"schema":"atlas-exl3-ffn-v1",
+            "layer":self.layer,"tp_rank":self.rank,"tp_world":self.world,
+            "invocation":invocation,"stage":stage,"tensors":[],
+            "binding":binding,"receipt":receipt});
+        serde_json::to_writer(metadata, &record)?;
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     fn capture_record(
         &self,
@@ -148,9 +178,7 @@ impl Exl3FfnRouter {
         stream: u64,
         binding: Option<&serde_json::Value>,
     ) -> Result<()> {
-        let safe = |name: &str| {
-            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        };
+        let safe = safe_name;
         ensure!(
             safe(stage) && !tensors.is_empty(),
             "FFN diagnostic stage invalid"
@@ -203,6 +231,10 @@ impl Exl3FfnRouter {
         serde_json::to_writer(metadata, &record)?;
         Ok(())
     }
+}
+
+fn safe_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn parse_layers(value: &str, layers: usize) -> Result<BTreeSet<usize>> {

@@ -46,6 +46,21 @@ append-only experiment log: latest entries in [q2-diagnostic.md](q2-diagnostic.m
   by all 30 targets; fused twins embedding the same arithmetic must be
   enumerated affected-or-out-of-scope by any shared-code fix. Evidence:
   `q2-neighbor-matrix-20261012/`.
+- **C1 executed; answers blocked at a fail-closed self-anchor.** Neutrality
+  precondition PASSED byte-identically (final-logit archive `28b7b3a8…` ==
+  frozen baseline; 48/48 L0 tensors byte-identical vs both frozen baselines);
+  captures X/Y complete with pre-reduce placement attested (local outputs
+  rank-divergent 8/8); 32/32 binding rows assembled (`q2-c1-binding-2026013/`).
+  CPU preflight: neither engine's `o_proj` is byte-reproducible by the
+  f32-GEMM/RNE replay contract (40–47% of outputs unequal, median 1 ULP;
+  replay≈f64 to 6/40960 ⇒ binding sound, gap is native kernel vs contract).
+  Gate NOT relaxed; variant replay not run. Approved remedy (plan-prescribed
+  checkpoint): engine-matching GEMM algorithm receipts + engine-native replay
+  backend. Neutral facts (recorded, not interpreted): native local outputs
+  byte-identical across engines on 8/8 rows with identical inputs; bound
+  weights differ 6.3% of elements (dequant-recipe delta); v24 ≡
+  reference-exact 32/32. Evidence:
+  `q2-c1-execution-20261012/{capture-report.md,summary.md}`.
 - No production numerical fix is qualified; no image was published; production
   containers remain stopped.
 - The KV flag-name difference (candidate `fp8_g128` vs reference `auto`) is
@@ -55,9 +70,12 @@ append-only experiment log: latest entries in [q2-diagnostic.md](q2-diagnostic.m
 
 ## In flight (2026-10-12) — check before touching hosts
 
-- **C1 preparation** (binding-prerequisite check + TDD replay harness) running
-  locally; evidence dir
-  `/home/colum/Workspace/atlas-exl3-validation-20261010/q2-c1-prep-20261012/`.
+- **C1 remediation** in flight: engine-matching GEMM algorithm receipts +
+  engine-native replay backend (the approved anchor remedy), then re-run the
+  self-anchors and the three input variants. Prior C1 steps (build, neutrality,
+  captures, bindings) are complete — do not redo them; evidence dir:
+  `q2-c1-execution-20261012/`. C1-prep harness: `5412f043`,
+  `q2-c1-prep-20261012/`.
 - Completed earlier today: ref13 held-out diagnostic (both Sparks idle again,
   all engines stopped with post-stop receipts) and the neighboring-types
   matrix. Evidence dirs — do not touch:

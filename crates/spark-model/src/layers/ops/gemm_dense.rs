@@ -228,6 +228,10 @@ pub fn dense_gemm_prefill(
 /// Also the launcher for `w4a16_gemm_t_k64_n64_p3` — the deep-K twin carries
 /// the same 64-wide N tile and the identical argument list, so the two share
 /// this grid rather than duplicating it.
+pub fn w4a16_gemm_launch_dims(m: u32, n: u32) -> ([u32; 3], [u32; 3]) {
+    ([div_ceil(n, 64), div_ceil(m, 64), 1], [128, 1, 1])
+}
+
 pub fn w4a16_gemm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -240,9 +244,10 @@ pub fn w4a16_gemm(
     stream: u64,
 ) -> Result<()> {
     log_gemm_shape(gpu, "w4a16_gemm", m, n, k);
+    let (grid, block) = w4a16_gemm_launch_dims(m, n);
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
-        .block([128, 1, 1])
+        .grid(grid)
+        .block(block)
         .arg_ptr(input)
         .arg_ptr(weight.weight)
         .arg_ptr(weight.weight_scale)

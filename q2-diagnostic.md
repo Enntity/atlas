@@ -1237,3 +1237,58 @@ open checklist items.
   fix; `norm::gated_rms_norm` resolves to three different semantics
   (whole-row common/Qwen, per-group `__expf` minimax fork, Nemotron). Evidence:
   `q2-neighbor-matrix-20261012/{matrix.md,reachability.md}`.
+
+### 2026-10-12 — C1 execution: neutrality PASS, captures complete, anchor FAIL-CLOSED
+
+- **Build + neutrality:** fresh no-cache diagnostic image
+  `atlas-exl3-validation:src-1687661e73e0-rust1.97.1` (`sha256:f4e47beb…faa81b`,
+  commit `e5e18056`, PTX closure `92b03bf9…` byte-identical to the frozen
+  norm-bind build; identity preregistered before collection). Neutrality
+  precondition PASSED byte-identically: attempt `cand-c1neutr-e5e1-02`
+  final-logit archive `28b7b3a8…d0df95` == frozen `cand-q2diag-ee5eaf0f-02`;
+  48/48 L0 stage tensors byte-identical vs BOTH frozen baselines; capture
+  attempt logits byte-identical too.
+- **Captures + bindings (diagnostic runs only):** candidate X (load-time bf16
+  common-space weight + resident shard + load record) and reference X+Y
+  (hashed overlay; pre-all-reduce local o_proj outputs) complete across 7
+  fresh attempts (3 failed tooling attempts preserved: descriptor typo,
+  overlay `get_current_vllm_config()` context bug fixed at `install()` origin
+  and hashed into `c1-overlay-binding.json`, driver heredoc bug). Placement
+  attestation PASS: local outputs rank-divergent 8/8 (pre-reduce proof vs the
+  archived rank-identical post-reduce `kda-o-proj`). Operand identity 16/16 vs
+  fixtures on both engines. 32/32 rows assembled fail-closed,
+  `$BIND=q2-c1-binding-2026013/` (inventory `e05fba33…b163`).
+- **CPU preflight: self-anchor FAILED closed, both ranks, both engines**
+  (exit 1). The f32-GEMM/RNE replay contract byte-reproduces neither engine's
+  native projection GEMM: 40–47% of projection outputs unequal, median 1 ULP,
+  max signed ULP ≈28k concentrated at near-zero/cancellation outputs; the
+  numpy replay matches f64 truth to 6/40960 elements ⇒ binding and inputs are
+  sound, the gap is native kernel vs replay contract. Per the fail-closed
+  checkpoint: gate NOT relaxed, no variant replay ran, GPU `--backend cupy`
+  skipped as backend-independent, interpretation blocked, propagation
+  matrices empty (`rows: []`). C1's two questions remain unanswered by design.
+- **Neutral facts (recorded, not interpreted):** (a) engines' native captured
+  local outputs are byte-identical on all 8 rows with byte-identical inputs
+  and differ on the 8 rows whose inputs differ; (b) bound cross-engine weights
+  are NOT byte-identical (6.3% of elements, mostly 1 ULP, max |Δ| 9.8e-4) —
+  a dequant-recipe delta, so literal "identical weights" is unattainable for
+  this EXL3/bf16 pair (trellis cannot represent the reference matrix);
+  (c) v24 ≡ reference-exact inputs byte-identical 32/32.
+- **Approved remedy (parent, 2026-10-12; plan-prescribed checkpoint, not a
+  gate redesign):** extend the binding with engine-matching GEMM algorithm
+  receipts (candidate `launch_local_bf16` function-level identity — receipt
+  kernel identity is function-level only by recorded scope of the `exl3-native`
+  arm; reference real `quant_method`/cuBLAS algorithm behind
+  `Glm53PackedLinearMethod.apply`) and add an engine-native replay backend
+  (each anchor runs the engine's own GEMM code path), then re-run anchors and
+  the three input variants. The f32-GEMM/RNE backend remains for common-space
+  cross-engine comparisons with its own named semantics. Q2's achievable
+  scope must be documented as dequant-recipe delta + GEMM-arith delta at
+  bound weights.
+- Execution-time fix `6568110b` (capture validator accepts the candidate's
+  dispatch-nested receipt provider; 34+22 tests green) and the overlay
+  amendment are recorded. Teardown receipts: 0 running containers on both
+  hosts, GPUs idle, production `glm53-exl3-atlas-0/1` untouched.
+  Note: the executing subagent was terminated by a provider content_filter
+  AFTER writing all deliverables (`capture-report.md`, `summary.md`,
+  matrices, receipts); no evidence was lost.
