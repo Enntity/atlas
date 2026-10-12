@@ -56,7 +56,7 @@ use super::trait_impl::finish_leaf;
 use super::trait_impl::prefill_b::pc_policy as pc;
 use super::{glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry, verify_pieces};
 use crate::layer::glm_long_owner;
-use crate::layers::dflash_head::rank_split;
+use crate::layers::dflash_head::{ConvTwinKind, rank_split};
 use crate::layers::qwen3_attention::{
     glm_mla_multi_seq_enabled, glm_multi_seq_sparse_enabled, glm_multi_seq_sparse_graphs_enabled,
     grouped_routed_decode_enabled, grouped_routed_decode_min, index_split_words,
@@ -308,6 +308,11 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
             rank_split::ctx_requested()?,
             rank_split::topk_requested()?,
         ))
+    }),
+    // Changes drafts only (the convs run on the head of a split propose);
+    // agreed so a pair never drafts from a twin it was not measured with.
+    ("ATLAS_DFLASH_CONV_TWIN", || {
+        Ok(ConvTwinKind::word(ConvTwinKind::requested()?))
     }),
     // Whether a step runs as a CUDA graph: a capturing forward takes other
     // collective paths than an eager one (`graph_flags`).
