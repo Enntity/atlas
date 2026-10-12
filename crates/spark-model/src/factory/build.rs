@@ -1011,7 +1011,8 @@ pub fn build_model(
                 if let Some(parts) = split {
                     let batch = crate::layers::dflash_head::rank_split::batch_requested()?;
                     let ctx = crate::layers::dflash_head::rank_split::ctx_requested()?;
-                    head.enable_rank_split(parts, batch, ctx, model.gpu_backend())?;
+                    let topk = crate::layers::dflash_head::rank_split::topk_requested()?;
+                    head.enable_rank_split(parts, batch, ctx, topk, model.gpu_backend())?;
                 }
                 if rank != 0 {
                     anyhow::ensure!(

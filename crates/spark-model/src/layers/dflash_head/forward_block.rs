@@ -882,7 +882,12 @@ impl BlockDiffusionDraftHead {
         if let Some((split, comm)) = rank_split {
             let args =
                 |layer_idx: usize| make_paged_args(layer_idx).expect("option_b args available");
+            let plan = split.plan();
             let select = || {
+                if plan.topk {
+                    return self
+                        .select_split_lists(split, last_token, ban_depth, gpu, stream, scratch);
+                }
                 self.argmax_block_logits(
                     last_token,
                     ban_depth,
@@ -906,7 +911,7 @@ impl BlockDiffusionDraftHead {
                 select: &select,
             };
             let graph_key = graph_eligible.then(graph_identity).transpose()?;
-            self.walk_split(&split.geometry.layer_steps(0), &walker, graph_key)?;
+            self.walk_split(&plan.layer_steps(0), &walker, graph_key)?;
         } else if graph_eligible && option_b_on {
             // Subgraph slot layout: [pre_0, post_0, ..., pre_{N-1}, post_{N-1}, tail].
             // 2 × num_layers + 1 slots total.
