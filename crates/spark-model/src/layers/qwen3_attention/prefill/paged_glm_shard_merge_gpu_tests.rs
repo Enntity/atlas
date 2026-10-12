@@ -476,6 +476,7 @@ fn run_case(gpu: &dyn GpuBackend, case: Case, seed: u64, place: Placement) -> Re
                             rows,
                             end: None,
                             queries_swapped: false,
+                            localized: false,
                         };
                         merge.run(a, output, stream)?;
                         gpu.synchronize(stream)?;

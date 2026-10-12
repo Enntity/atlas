@@ -34,7 +34,8 @@ pub fn pdl_enabled() -> bool {
 }
 
 /// Kernels whose every copy starts with `atlas_pdl_enter()`
-/// (kernels/gb10/common/atlas_pdl.cuh), or with `atlas_pdl_enter_touch(..)`,
+/// (kernels/gb10/common/atlas_pdl.cuh), or with `atlas_pdl_enter_touch(..)`
+/// (or its `_pair` / `_tri` forms),
 /// which before its wait reads only two of the kernel's immutable weight
 /// parameters (kernels/gb10/glm-5.3-flash/nvfp4/atlas_pdl_touch.cuh). A kernel
 /// launched with PDL must not read its predecessor's output before that wait,
@@ -74,6 +75,10 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "dense_gemv_bf16_tc8_planes",
     "dense_gemv_bf16_tc16_planes",
     "dense_gemv_bf16_tc32_planes",
+    "glm_mla_down_fuse_tc8",
+    "glm_mla_down_fuse_tc16",
+    "glm_mla_down_fuse_tc32",
+    "glm_mla_mid_fuse",
     "rms_norm_vanilla",
     "rms_norm_vanilla_regs",
     "bf16_add_inplace",

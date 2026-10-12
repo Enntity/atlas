@@ -187,6 +187,9 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_KDA_COMMIT_CTAS", || {
         Ok(ops::kda_commit_ctas()? as u64)
     }),
+    ("ATLAS_GLM_MLA_FUSE", || {
+        Ok(ops::glm_mla_fuse_requested()? as u64)
+    }),
     ("ATLAS_MOE_SHARED_REDUCE_OVERLAP", || {
         Ok(moe::shared_reduce_overlap_requested() as u64)
     }),
