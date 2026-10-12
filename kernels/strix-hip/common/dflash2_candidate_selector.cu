@@ -585,7 +585,13 @@ __device__ __forceinline__ void df2_sel_walk(
             if (lane == 0) {
                 const bool banned = r <= banned_to
                     && (cand == end0 || cand == end1 || cand == end2 || cand == end3);
+#ifdef DF2_SEL_EDGE
+                // Edge-weight twin (`glm_dflash2_selector_conf_e*`): the
+                // transition term scaled by DF2_SEL_EDGE.
+                w.score[warp_id] = valid && !banned ? s_list_v[warp_id] + DF2_SEL_EDGE * dot : -INFINITY;
+#else
                 w.score[warp_id] = valid && !banned ? s_list_v[warp_id] + dot : -INFINITY;
+#endif
             }
         }
         __syncthreads();
