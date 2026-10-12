@@ -2,7 +2,9 @@
 """CPU-only tests for the gated-normalization arithmetic ablation harness."""
 import json
 import struct
+import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -452,3 +454,218 @@ def test_validate_fixture_rejects_reordered_or_mismatched_rows(tmp_path):
     _rewrite_manifest(row_dir, manifest)
     with pytest.raises(ValueError, match='token identity mismatch'):
         gated_norm_ablation.validate_fixture(row_dir, 2, 1)
+
+
+# --- main() wiring, driven end to end with GPU-dependent pieces stubbed ---
+
+def _stub_main(monkeypatch, tmp_path):
+    """Drive main() on one valid synthetic fixture row with every GPU-, PTX-
+    and frozen-source-dependent call stubbed. Returns (out_dir, fixture_dir,
+    calls) where calls records replay/enforce invocations."""
+    fixtures = tmp_path / 'fixtures'
+    _write_fixture_row(fixtures / 'rank1-row0', rank=1, row=0, tokens=2)
+    ptx_dir = tmp_path / 'ptx'
+    ptx_dir.mkdir()
+    (ptx_dir / 'kda.ptx').write_text(
+        '.entry ' + KERNEL_ENTRY + '( .param .u64 a, .param .u64 b, .param .u64 c, '
+        '.param .u64 d, .param .u32 e, .param .u32 f, .param .f32 g )')
+    (tmp_path / 'binding.json').write_text('{}')
+    out = tmp_path / 'out'
+    calls = {'replay': 0, 'enforce': None}
+    cupy = MagicMock()
+    cupy.cuda.runtime.runtimeGetVersion.return_value = 13000
+    cupy.cuda.runtime.driverGetVersion.return_value = 13000
+    monkeypatch.setitem(sys.modules, 'cupy', cupy)
+    monkeypatch.setattr(gated_norm_ablation, 'validate_binding', lambda *a: {
+        'image': 'img@sha256:' + '0' * 64, 'modules': {'kda': {'file': 'kda.ptx'}}})
+    real_sha = gated_norm_ablation.sha
+    frozen_kda = tmp_path / 'kda.cu'
+    monkeypatch.setattr(gated_norm_ablation, 'sha', lambda path: (
+        FROZEN_KDA_SHA256 if Path(path) == frozen_kda else real_sha(path)))
+    monkeypatch.setattr(gated_norm_ablation, 'frozen_body', lambda path: 'body')
+    monkeypatch.setattr(gated_norm_ablation, 'derive',
+                        lambda name, path: ('code', 'diff', 'source-sha'))
+    monkeypatch.setattr(gated_norm_ablation, 'load_module', lambda *a: MagicMock())
+    monkeypatch.setattr(gated_norm_ablation, 'validate_operands',
+                        lambda core, gate, weight, eps: ((1, 1, 1), (128, 1, 1), eps))
+    monkeypatch.setattr(gated_norm_ablation, 'device_properties', lambda props: {})
+    monkeypatch.setattr(gated_norm_ablation, 'perturbations', lambda c, g, w: {})
+
+    def replay(cp, kernel, core, gate, weight, eps):
+        calls['replay'] += 1
+        return np.load(fixtures / 'rank1-row0' / 'expected.npy')
+    monkeypatch.setattr(gated_norm_ablation, 'replay', replay)
+
+    def enforce(summary, failures):
+        calls['enforce'] = (summary, list(failures))
+    monkeypatch.setattr(gated_norm_ablation, 'enforce_summary_gate', enforce)
+    monkeypatch.setattr(sys, 'argv', [
+        'gated_norm_ablation.py', '--fixtures', str(fixtures), '--rank', '1',
+        '--common', str(tmp_path), '--ptx-dir', str(ptx_dir),
+        '--ptx-binding', str(tmp_path / 'binding.json'), '--out', str(out)])
+    return out, fixtures, calls
+
+
+def test_main_validates_fixture_before_any_replay(monkeypatch, tmp_path):
+    out, _, calls = _stub_main(monkeypatch, tmp_path)
+
+    def reject(row_dir, row, rank):
+        raise ValueError('fixture rejected by validator')
+    monkeypatch.setattr(gated_norm_ablation, 'validate_fixture', reject)
+    with pytest.raises(ValueError, match='fixture rejected by validator'):
+        gated_norm_ablation.main()
+    assert calls['replay'] == 0
+    assert calls['enforce'] is None
+
+
+def test_main_passes_saved_summary_to_enforce_summary_gate(monkeypatch, tmp_path):
+    out, _, calls = _stub_main(monkeypatch, tmp_path)
+    gated_norm_ablation.main()
+    assert calls['replay'] == 1 + len(VARIANTS)
+    summary, failures = calls['enforce']
+    saved = json.loads((out / 'ablation-summary.json').read_text())
+    assert summary == saved
+    # Perturbations are stubbed to none, so control runs carry no engaged
+    # controls and the summary must block interpretation.
+    assert saved['interpretation_blocked'] is True
+
+
+def test_main_writes_failure_receipt_and_reraises_on_crash(monkeypatch, tmp_path):
+    out, _, calls = _stub_main(monkeypatch, tmp_path)
+
+    def crash(*args):
+        raise RuntimeError('simulated replay crash')
+    monkeypatch.setattr(gated_norm_ablation, 'replay', crash)
+    with pytest.raises(RuntimeError, match='simulated replay crash'):
+        gated_norm_ablation.main()
+    failure = json.loads((out / 'rank1-row0' / 'failure.json').read_text())
+    assert failure['exception_type'] == 'RuntimeError'
+    assert failure['message'] == 'simulated replay crash'
+    assert failure['row'] == 0
+    assert failure['utc_time'].endswith('Z')
+    assert calls['enforce'] is None
+
+
+# --- Item 2: negative validator branch tests ---
+
+def _synthetic_fixture_dir(tmp_path, rank=0, row=0, bad_key=None, bad_file=None,
+                           bad_dtype=False, bad_shape=False, bad_hash=False,
+                           bad_epsilon_bits=False, bad_epsilon_underflow=False):
+    d = tmp_path / ('row_' + str(bad_key) if bad_key else 'row'); d.mkdir()
+    # build minimal arrays
+    core = np.zeros((2, 32, 128), dtype=np.uint16)
+    gate = np.zeros((2, 4096), dtype=np.uint16)
+    weight = np.zeros((128,), dtype=np.uint16)
+    exp = np.zeros((2, 32, 128), dtype=np.uint16)
+    ref_c = core.copy(); ref_g = gate.copy(); ref_w = weight.copy(); ref_e = exp.copy()
+    for name, arr in (('core', core), ('gate', gate), ('weight', weight),
+                      ('expected', exp), ('reference-core', ref_c),
+                      ('reference-gate', ref_g), ('reference-weight', ref_w),
+                      ('reference-expected', ref_e)):
+        path = d / (name + '.npy')
+        np.save(path, arr)
+    fixture = {
+        'schema': 'norm-replay-fixtures-v1', 'rank': rank, 'invocation': row,
+        'tokens': 2, 'candidate_epsilon_f32': 1e-3, 'reference_epsilon': 1e-3,
+        'epsilon_f32_equal': True,
+        'candidate_epsilon_f32_bits': 0x3c23d70a,
+        'reference_epsilon_f32_bits': 0x3c23d70a,
+        'equal_operands': {'core': True, 'gate': True, 'weight': True},
+        'fixtures': {}
+    }
+    for name in ('core', 'gate', 'weight', 'expected',
+                 'reference-core', 'reference-gate', 'reference-weight', 'reference-expected'):
+        fixture['fixtures'][name] = {
+            'file': name + '.npy', 'dtype': 'bf16-le',
+            'sha256': gated_norm_ablation.sha(d / (name + '.npy')),
+            'shape': list(np.load(d / (name + '.npy')).shape)}
+    if bad_key == 'keyset':
+        fixture['fixtures']['extra'] = fixture['fixtures']['core'].copy()
+        del fixture['fixtures']['expected']
+    elif bad_key == 'file_identity':
+        fixture['fixtures']['core']['file'] = 'wrong.npy'
+    elif bad_key == 'dtype':
+        fixture['fixtures']['core']['dtype'] = 'f32-le'
+    elif bad_key == 'hash':
+        fixture['fixtures']['core']['sha256'] = '0'*64
+    elif bad_key == 'shape':
+        fixture['fixtures']['core']['shape'] = [99, 32, 128]
+    elif bad_key == 'operands_unequal':
+        fixture['equal_operands']['core'] = False
+    elif bad_key == 'epsilon_bits':
+        fixture['candidate_epsilon_f32_bits'] = 0
+    elif bad_key == 'epsilon_underflow':
+        fixture['candidate_epsilon_f32'] = 0.0
+    return d, fixture
+
+
+def test_validate_fixture_manifest_keyset_mismatch(tmp_path):
+    d, fixture = _synthetic_fixture_dir(tmp_path, bad_key='keyset')
+    (d / 'fixture.json').write_text(json.dumps(fixture))
+    with pytest.raises(ValueError, match='fixture file manifest mismatch'):
+        gated_norm_ablation.validate_fixture(d, 0, 0)
+
+
+def test_validate_fixture_file_identity_dtype_mismatch(tmp_path):
+    for bad in ('file_identity', 'dtype'):
+        d, fixture = _synthetic_fixture_dir(tmp_path, bad_key=bad)
+        (d / 'fixture.json').write_text(json.dumps(fixture))
+        with pytest.raises(ValueError, match='fixture file identity mismatch'):
+            gated_norm_ablation.validate_fixture(d, 0, 0)
+
+
+def test_validate_fixture_shape_record_mismatch(tmp_path):
+    d, fixture = _synthetic_fixture_dir(tmp_path, bad_key='shape')
+    (d / 'fixture.json').write_text(json.dumps(fixture))
+    with pytest.raises(ValueError, match='fixture file geometry mismatch'):
+        gated_norm_ablation.validate_fixture(d, 0, 0)
+
+
+def test_f32_bits_rejects_non_numeric():
+    with pytest.raises(ValueError, match='fixture epsilon must be numeric'):
+        gated_norm_ablation._f32_bits('hello')
+
+
+def test_f32_bits_rejects_non_positive():
+    with pytest.raises(ValueError, match='fixture epsilon must be finite and positive'):
+        gated_norm_ablation._f32_bits(-1.0)
+    with pytest.raises(ValueError, match='fixture epsilon must be finite and positive'):
+        gated_norm_ablation._f32_bits(0.0)
+
+
+def test_f32_bits_rejects_underflow_to_zero():
+    # Smallest positive subnormal that packs to bits==0 after f32 rounding
+    with pytest.raises(ValueError, match='fixture epsilon underflows f32'):
+        gated_norm_ablation._f32_bits(1e-46)
+
+
+def test_f32_bits_rejects_overflow():
+    with pytest.raises(ValueError, match='fixture epsilon overflows f32'):
+        gated_norm_ablation._f32_bits(1e40)
+
+def test_summary_controls_engaged_is_per_variant():
+    summary = build_summary(0, _synthetic_rows(), {})
+    for row in summary['rows']:
+        for name, record in row['runs'].items():
+            assert record['controls_engaged'] is (name in ('attested', 'v0-copy', 'v-all'))
+    rows = _synthetic_rows()
+    rows[0]['runs']['v-all']['controls']['gate']['engaged'] = False
+    summary = build_summary(0, rows, {})
+    assert summary['rows'][0]['runs']['v-all']['controls_engaged'] is False
+    assert summary['rows'][0]['runs']['attested']['controls_engaged'] is True
+
+
+def test_compare_bf16_matches_analyzer_metrics_on_edge_values():
+    a = np.array([0x0000, 0x8000, 0x3c00, 0xbc00, 0x0001, 0x8001], dtype='<u2').reshape(1, 1, 6)
+    b = np.array([0x8000, 0x0000, 0xbc00, 0x3c00, 0x8001, 0x0001], dtype='<u2').reshape(1, 1, 6)
+    # compare_bf16 locates the max with its own distance line and reports the
+    # magnitude from analyze_localization.metrics; the two must agree.
+    for pair in ((a, b), (b, a), (a[..., :2], b[..., :2]), (a[..., 4:], b[..., 4:])):
+        ours = compare_bf16(*pair)
+        assert abs(ours['signed_ulp_at_max']) == ours['max_ulp']
+        assert ours['max_ulp'] == gated_norm_ablation.metrics(*pair)['max']
+
+
+def test_nvrtc_options_unchanged():
+    from native_ptx import NVRTC_OPTIONS
+    assert NVRTC_OPTIONS == ('--std=c++17', '--fmad=false')

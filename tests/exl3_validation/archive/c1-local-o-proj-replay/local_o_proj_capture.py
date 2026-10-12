@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
+# ARCHIVED 2026-10-12 — DO NOT USE. The C1 BF16 common-space replay premise
+# is invalid (see README.md in this directory). Importing or running this
+# module fails unless ATLAS_ALLOW_ARCHIVED_C1=1 is set for forensic reading.
+import os as _os
+if _os.environ.get("ATLAS_ALLOW_ARCHIVED_C1") != "1":
+    raise ImportError("archived C1 o_proj replay harness: premise invalid; see README.md")
 """Experiment C1: validate engine capture records and assemble binding rows.
 
 Both engines emit an `atlas-local-o-proj-binding-v1` capture record for the

@@ -35,6 +35,8 @@ def _verbatim(body):
     return body
 
 
+# v1's `i < dim` loop equals the frozen 128-slot tree only because
+# validate_operands enforces dim == 128.
 # v1-reduction-order: shared-memory halving tree -> serial sum-of-squares.
 _REDUCTION_OLD = """    red[d] = x * x;
     __syncthreads();

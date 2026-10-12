@@ -138,36 +138,6 @@ impl Exl3FfnRouter {
         );
         self.capture_record(gpu, invocation, stage, tensors, stream, Some(binding))
     }
-    /// Persist a binding record plus its capture receipt for stages that
-    /// dump no tensors (the C1 local o_proj binding record references a
-    /// load-time weight file instead of recapturing resident bytes).
-    pub fn write_binding_with_receipt(
-        &self,
-        invocation: usize,
-        stage: &str,
-        binding: &serde_json::Value,
-        receipt: &serde_json::Value,
-    ) -> Result<()> {
-        ensure!(
-            binding.is_object() && receipt.is_object(),
-            "FFN diagnostic binding/receipt must be objects"
-        );
-        ensure!(safe_name(stage), "FFN diagnostic stage invalid");
-        let stem = format!(
-            "ffn-L{}-rank{}-{invocation:06}-{stage}",
-            self.layer, self.rank
-        );
-        let metadata = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(self.directory.join(format!("{stem}.json")))?;
-        let record = serde_json::json!({"schema":"atlas-exl3-ffn-v1",
-            "layer":self.layer,"tp_rank":self.rank,"tp_world":self.world,
-            "invocation":invocation,"stage":stage,"tensors":[],
-            "binding":binding,"receipt":receipt});
-        serde_json::to_writer(metadata, &record)?;
-        Ok(())
-    }
     #[allow(clippy::too_many_arguments)]
     fn capture_record(
         &self,
@@ -178,7 +148,9 @@ impl Exl3FfnRouter {
         stream: u64,
         binding: Option<&serde_json::Value>,
     ) -> Result<()> {
-        let safe = safe_name;
+        let safe = |name: &str| {
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        };
         ensure!(
             safe(stage) && !tensors.is_empty(),
             "FFN diagnostic stage invalid"
@@ -187,6 +159,13 @@ impl Exl3FfnRouter {
         let stem = format!(
             "ffn-L{}-rank{}-{invocation:06}-{stage}",
             self.layer, self.rank
+        );
+        let final_path = self.directory.join(format!("{stem}.json"));
+        let temp_path = self.directory.join(format!("{stem}.json.partial"));
+        ensure!(
+            !final_path.exists(),
+            "FFN diagnostic record exists: {}",
+            final_path.display()
         );
         let mut records = Vec::new();
         for tensor in tensors {
@@ -218,23 +197,27 @@ impl Exl3FfnRouter {
                 "shape":tensor.shape,"bytes":bytes,"file":filename}),
             );
         }
-        let metadata = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(self.directory.join(format!("{stem}.json")))?;
         let mut record = serde_json::json!({"schema":"atlas-exl3-ffn-v1",
             "layer":self.layer,"tp_rank":self.rank,"tp_world":self.world,
             "invocation":invocation,"stage":stage,"stream":stream,"tensors":records});
         if let Some(binding) = binding {
             record["binding"] = binding.clone();
         }
-        serde_json::to_writer(metadata, &record)?;
+        // The metadata JSON is the record's commit marker: write it to a
+        // temporary name and rename only after a complete flush, so a crash
+        // never leaves a truncated record that readers would accept.
+        let mut metadata = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("FFN diagnostic record {}", temp_path.display()))?;
+        serde_json::to_writer(&mut metadata, &record)?;
+        metadata.sync_all()?;
+        drop(metadata);
+        std::fs::rename(&temp_path, &final_path)
+            .with_context(|| format!("FFN diagnostic record {}", final_path.display()))?;
         Ok(())
     }
-}
-
-fn safe_name(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn parse_layers(value: &str, layers: usize) -> Result<BTreeSet<usize>> {

@@ -14,7 +14,6 @@ mod indexed_core;
 mod init;
 mod multi_seq;
 mod native_aux;
-mod o_proj_receipt;
 mod profile;
 mod projection;
 mod recurrent;

@@ -10,6 +10,7 @@ directories, anchors and engagement controls evaluated after all evidence is
 written.
 """
 import argparse
+import datetime
 import hashlib
 import json
 import re
@@ -26,7 +27,7 @@ from analyze_localization import bf16_key, metrics
 from gated_norm_variants import KERNEL_ENTRY, VARIANTS, derive, frozen_body
 from native_gated_norm_replay import (KDA_CONTRACT, device_properties,
                                       perturbations, replay, validate_operands)
-from native_ptx import load_module, sha, validate_binding
+from native_ptx import load_module, sha, validate_binding, NVRTC_OPTIONS
 
 FROZEN_KDA_SHA256 = 'bf2149c381d6c4283930d2bc69f6c5ddb4d53f7755de954de9f9762d179af9bd'
 CONTROL_RUNS = ('attested', 'v0-copy', 'v-all')
@@ -98,11 +99,14 @@ def build_summary(rank, rows, harness_sha256):
             if name in CONTROL_RUNS:
                 controls = record.get('controls')
                 summary_record['controls'] = controls
-                controls_engaged = controls_engaged and all(
-                    isinstance(controls, dict)
-                    and isinstance(controls.get(control), dict)
-                    and controls[control].get('engaged') is True
-                    for control in REQUIRED_CONTROLS)
+                run_controls_engaged = (isinstance(controls, dict)
+                    and all(isinstance(controls.get(control), dict)
+                            and controls[control].get('engaged') is True
+                            for control in REQUIRED_CONTROLS))
+                summary_record['controls_engaged'] = run_controls_engaged
+                controls_engaged = controls_engaged and run_controls_engaged
+            else:
+                summary_record['controls_engaged'] = False
             run_records[name] = summary_record
         summary_rows.append({'row': row['row'], 'tokens': row['tokens'],
                              'runs': run_records})
@@ -250,77 +254,87 @@ def main():
     import cupy as cp
     kernels = {'attested': load_module(cp, args.common, 'kda', args.ptx_dir, binding).get_function(
         KERNEL_ENTRY)}
-    options = ('--std=c++17', '--fmad=false', '-I' + str(args.common))
+    options = NVRTC_OPTIONS + ('-I' + str(args.common),)
     for name in VARIANTS:
         kernels[name] = cp.RawModule(code=derived[name][0], options=options).get_function(
             KERNEL_ENTRY)
     run_order = ('attested',) + tuple(VARIANTS)
     row_records, failures = [], []
     for row, row_dir in rows:
-        fixture, arrays = validate_fixture(row_dir, row, args.rank)
-        core, gate, weight = arrays['core'], arrays['gate'], arrays['weight']
-        expected, reference = arrays['expected'], arrays['reference-expected']
-        grid, block, epsilon = validate_operands(
-            core, gate, weight, fixture['candidate_epsilon_f32'])
-        for name, target in (('expected', expected), ('reference-expected', reference)):
-            if target.shape != core.shape or target.dtype.str != '<u2':
-                raise ValueError('captured BF16 target must match core geometry: ' + name)
-        out_dir = args.out / ('rank' + str(args.rank) + '-row' + str(row))
-        out_dir.mkdir()
-        run_records = []
-        for run in run_order:
-            output = replay(cp, kernels[run], core, gate, weight, epsilon)
-            np.save(out_dir / (run + '.npy'), output)
-            record = {'run': run,
-                      'kind': 'attested' if run == 'attested' else 'variant',
-                      'output_file': run + '.npy',
-                      'self_reproduction': output.tobytes() == expected.tobytes(),
-                      'vs_candidate': compare_bf16(output, expected),
-                      'vs_reference': compare_bf16(output, reference)}
-            if run == 'attested':
-                record['ptx_sha256'] = sha(ptx_path)
-            else:
-                record['variant_source_sha256'] = derived[run][2]
-                record['variant_unified_diff'] = derived[run][1]
-            if run in CONTROL_RUNS:
-                record['controls'] = {}
-                for name, operands in perturbations(core, gate, weight).items():
-                    perturbed = replay(cp, kernels[run], *operands, epsilon)
-                    engaged = bool(np.any(perturbed != output))
-                    record['controls'][name] = {
-                        'engaged': engaged,
-                        'unequal_elements': int(np.count_nonzero(perturbed != output))}
-                    if not engaged:
-                        failures.append(out_dir.name + ': ' + run + ' control ' + name
-                                        + ' did not engage')
-            if run in ANCHOR_RUNS and not record['self_reproduction']:
-                failures.append(out_dir.name + ': ' + run + ' self-reproduction anchor failed')
-            run_records.append(record)
-        receipt = {
-            'schema': 'atlas-gated-norm-ablation-v1',
-            'rank': args.rank, 'row': row, 'tokens': int(core.shape[0]),
-            'epsilon_f32': float(epsilon),
-            'epsilon_f32_bits': struct.unpack('<I', struct.pack('<f', float(epsilon)))[0],
-            'grid': list(grid), 'block': list(block),
-            'frozen_kda_sha256': sha(frozen_path),
-            'frozen_body_sha256': hashlib.sha256(frozen.encode('utf-8')).hexdigest(),
-            'inputs': {name: {'file': str(path), 'sha256': sha(path)} for name, path in
-                       zip(('fixture.json', 'core.npy', 'gate.npy', 'weight.npy',
-                            'expected.npy', 'reference-expected.npy'),
-                           (row_dir / 'fixture.json', row_dir / 'core.npy', row_dir / 'gate.npy',
-                            row_dir / 'weight.npy', row_dir / 'expected.npy',
-                            row_dir / 'reference-expected.npy'))},
-            'ptx_binding_sha256': sha(args.ptx_binding),
-            'binding': binding,
-            'runs': run_records,
-            'device': device_properties(
-                cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)),
-            'runtime_version': cp.cuda.runtime.runtimeGetVersion(),
-            'driver_version': cp.cuda.runtime.driverGetVersion(),
-            'harness_sha256': harness}
-        (out_dir / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
-        row_records.append({'row': row, 'tokens': int(core.shape[0]),
-                            'runs': {record['run']: record for record in run_records}})
+        try:
+            fixture, arrays = validate_fixture(row_dir, row, args.rank)
+            core, gate, weight = arrays['core'], arrays['gate'], arrays['weight']
+            expected, reference = arrays['expected'], arrays['reference-expected']
+            grid, block, epsilon = validate_operands(
+                core, gate, weight, fixture['candidate_epsilon_f32'])
+            for name, target in (('expected', expected), ('reference-expected', reference)):
+                if target.shape != core.shape or target.dtype.str != '<u2':
+                    raise ValueError('captured BF16 target must match core geometry: ' + name)
+            out_dir = args.out / ('rank' + str(args.rank) + '-row' + str(row))
+            out_dir.mkdir()
+            run_records = []
+            for run in run_order:
+                output = replay(cp, kernels[run], core, gate, weight, epsilon)
+                np.save(out_dir / (run + '.npy'), output)
+                record = {'run': run,
+                          'kind': 'attested' if run == 'attested' else 'variant',
+                          'output_file': run + '.npy',
+                          'self_reproduction': output.tobytes() == expected.tobytes(),
+                          'vs_candidate': compare_bf16(output, expected),
+                          'vs_reference': compare_bf16(output, reference)}
+                if run == 'attested':
+                    record['ptx_sha256'] = sha(ptx_path)
+                else:
+                    record['variant_source_sha256'] = derived[run][2]
+                    record['variant_unified_diff'] = derived[run][1]
+                if run in CONTROL_RUNS:
+                    record['controls'] = {}
+                    for control_name, operands in perturbations(core, gate, weight).items():
+                        perturbed = replay(cp, kernels[run], *operands, epsilon)
+                        engaged = bool(np.any(perturbed != output))
+                        record['controls'][control_name] = {
+                            'engaged': engaged,
+                            'unequal_elements': int(np.count_nonzero(perturbed != output))}
+                        if not engaged:
+                            failures.append(out_dir.name + ': ' + run + ' control ' + control_name
+                                            + ' did not engage')
+                if run in ANCHOR_RUNS and not record['self_reproduction']:
+                    failures.append(out_dir.name + ': ' + run + ' self-reproduction anchor failed')
+                run_records.append(record)
+            receipt = {
+                'schema': 'atlas-gated-norm-ablation-v1',
+                'rank': args.rank, 'row': row, 'tokens': int(core.shape[0]),
+                'epsilon_f32': float(epsilon),
+                'epsilon_f32_bits': struct.unpack('<I', struct.pack('<f', float(epsilon)))[0],
+                'grid': list(grid), 'block': list(block),
+                'frozen_kda_sha256': sha(frozen_path),
+                'frozen_body_sha256': hashlib.sha256(frozen.encode('utf-8')).hexdigest(),
+                'inputs': {name: {'file': str(path), 'sha256': sha(path)} for name, path in
+                           zip(('fixture.json', 'core.npy', 'gate.npy', 'weight.npy',
+                                'expected.npy', 'reference-expected.npy'),
+                               (row_dir / 'fixture.json', row_dir / 'core.npy', row_dir / 'gate.npy',
+                                row_dir / 'weight.npy', row_dir / 'expected.npy',
+                                row_dir / 'reference-expected.npy'))},
+                'ptx_binding_sha256': sha(args.ptx_binding),
+                'binding': binding,
+                'runs': run_records,
+                'device': device_properties(
+                    cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)),
+                'runtime_version': cp.cuda.runtime.runtimeGetVersion(),
+                'driver_version': cp.cuda.runtime.driverGetVersion(),
+                'harness_sha256': harness}
+            (out_dir / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+            row_records.append({'row': row, 'tokens': int(core.shape[0]),
+                                'runs': {record['run']: record for record in run_records}})
+        except Exception as exc:
+            failure_dir = args.out / ('rank' + str(args.rank) + '-row' + str(row))
+            if not failure_dir.exists():
+                failure_dir = args.out
+            failure_dir.mkdir(parents=True, exist_ok=True)
+            failure = {'exception_type': type(exc).__name__, 'message': str(exc),
+                       'row': int(row), 'utc_time': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}
+            (failure_dir / 'failure.json').write_text(json.dumps(failure) + '\n')
+            raise
     summary = build_summary(args.rank, row_records, harness)
     (args.out / 'ablation-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     enforce_summary_gate(summary, failures)

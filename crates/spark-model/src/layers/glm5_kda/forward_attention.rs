@@ -210,14 +210,6 @@ impl Glm5KdaLayer {
         )?;
         profile::step(ctx, stream, &mut profile_timer, "gated_norm")?;
         det.tap("x_gated", gated, (0, tokens), p * bf16);
-        // C1 diagnostic (off by default): bind the local o_proj weight and
-        // GEMM receipt before the projection runs. JSON only.
-        self.capture_o_proj_binding(
-            upstream,
-            tokens as u32,
-            decode,
-            capture_verify_intermediates,
-        )?;
         if verify_proj {
             self.project_hot_verify(
                 gated,

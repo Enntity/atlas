@@ -16,7 +16,6 @@ pub mod exl3_projection;
 mod expert_tp;
 mod layers;
 mod mla_twins;
-pub(crate) mod o_proj_binding;
 pub(crate) mod retirement;
 mod tp;
 mod vision;

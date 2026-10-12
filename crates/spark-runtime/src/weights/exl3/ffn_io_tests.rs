@@ -98,48 +98,34 @@ fn capture_preserves_typed_bytes_marker_gate_and_exclusive_identity() {
     assert_eq!(bound["binding"]["eps_f32_bits"], 0x3727c5acu32);
     assert_eq!(bound["invocation"], 1);
     assert!(metadata.get("binding").is_none());
-    gpu.free(ptr).unwrap();
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn binding_receipt_writes_tensorless_envelope_and_is_exclusive() {
-    let root = std::env::temp_dir().join(format!(
-        "atlas-ffn-receipt-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+    // Records commit by rename: no partial file survives, and an existing
+    // record is never overwritten.
+    assert!(
+        std::fs::read_dir(&root)
             .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&root).unwrap();
-    let router = Exl3FfnRouter::new(root.clone(), 0, 1, 2).unwrap();
-    let binding = serde_json::json!({"schema": "atlas-local-o-proj-binding-v1", "rank": 1});
-    let receipt = serde_json::json!({"provider": "exl3-native"});
+            .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".partial"))
+    );
+    std::fs::write(root.join("ffn-L3-rank1-000002-stale.json"), b"{}").unwrap();
     assert!(
         router
-            .write_binding_with_receipt(0, "o_proj_binding", &["not"].into(), &receipt)
+            .capture(
+                &gpu,
+                2,
+                "stale",
+                &[DiagnosticTensor {
+                    name: "weights",
+                    dtype: DiagnosticDtype::F32,
+                    shape: vec![1, 2],
+                    ptr
+                }],
+                17
+            )
             .is_err()
     );
-    router
-        .write_binding_with_receipt(0, "o_proj_binding", &binding, &receipt)
-        .unwrap();
-    let record: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(root.join("ffn-L0-rank1-000000-o_proj_binding.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(record["schema"], "atlas-exl3-ffn-v1");
-    assert_eq!(record["stage"], "o_proj_binding");
-    assert_eq!(record["tp_rank"], 1);
-    assert_eq!(record["tp_world"], 2);
-    assert_eq!(record["tensors"], serde_json::json!([]));
-    assert_eq!(record["binding"], binding);
-    assert_eq!(record["receipt"]["provider"], "exl3-native");
-    // The record is immutable evidence: the same stage/invocation cannot be overwritten.
-    assert!(
-        router
-            .write_binding_with_receipt(0, "o_proj_binding", &binding, &receipt)
-            .is_err()
+    assert_eq!(
+        std::fs::read(root.join("ffn-L3-rank1-000002-stale.json")).unwrap(),
+        b"{}"
     );
+    gpu.free(ptr).unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }

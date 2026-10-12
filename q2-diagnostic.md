@@ -7,21 +7,32 @@ skill before running experiments or publishing numerical conclusions.
 
 ## Objective and current verdict
 
-Repair the GLM-5.3 EXL3 candidate's numerical divergence so it passes the
-**unchanged, registered Q2 gate**, with its required controls passing too.
-Q2 currently **FAILS**. The dominant final-logit cause remains unproven.
-No runtime fix has resulted from the latest analyzer repair.
+*Rewritten 2026-10-12 after the independent review (`CODE_REVIEW_2026-10-12.md`);
+the original objective text is in git history.*
 
-There are two unresolved issues:
+Find the dominant cause of the candidate's numerical divergence and repair it,
+so the candidate passes the registered qualification gate with all controls.
 
-1. The candidate fails the exchangeability rank and catastrophic-row checks.
-2. Held-out reference `ref13` fails one `longer` row. A candidate improvement
-   does not establish qualification while this must-pass control is failing.
+- **v1 gate (historical record):** candidate FAIL (rank-dominated, plus 3
+  catastrophic `longer` rows). The held-out `ref13` control also fails,
+  diagnosed as reference-internal bimodality at `longer`/r0. v1 was
+  underpowered at N = 9 under a bimodal row, with session drift not
+  excluded; it was not structurally unpassable.
+- **Qualification rule going forward:** gate v2
+  (`docs/design/exl3-statistical-gate-v2.md`, with Amendment 1), pending
+  operator sign-off. No v2 data collected.
+- **Norm attribution:** `v24-minimal` reproduces the reference gated-norm
+  output on 7/7 differing elements in 2 independent fixture groups
+  (fixture-local; NVRTC `--fmad=false`; v24 has no engagement controls of
+  its own).
+- **C1:** closed from native captures. There is no same-input o_proj error,
+  and the natural norm delta is absorbed or confined locally. **Flag:** the
+  corrected-input answer is inferred, and the o_proj input precision is
+  unattested.
+- **The dominant final-logit cause is unproven.** C2 (layer-0 norm-output
+  intervention traced to final logits) is next. No runtime fix is qualified.
 
-The frozen gate, cases, thresholds and reference evidence must remain intact.
-Gate redesign would be a separate decision with a new pre-registration; it is
-not part of this repair. Do not discard the failing reference row or select
-favorable reruns to obtain a pass.
+Do not discard failing reference rows or select favorable reruns.
 
 ## Evidence and source locations
 
@@ -122,104 +133,34 @@ python3 tests/exl3_validation/analyze_localization.py \
 
 Original external analyzer, outputs and dumps remain preserved.
 
-## Required experiments, in order
+## Required experiments — status (2026-10-12)
 
-### 1. Bind actual normalization constants and dispatch
+Sequencing authority: `docs/plans/q2-norm-causality-plan.md`. The original
+five-step text is in git history.
 
-Use a fresh diagnostic overlay and attempt. Capture on both ranks:
-
-- Actual resident `o_norm.weight` bytes, dtype, shape and hash.
-- Effective epsilon at invocation, activation, affine/bias flags, residual and
-  prenorm settings, and any relevant dtype conversions.
-- Reference CustomOp's selected forward method, installed class/kernel source
-  hashes, compilation/launch settings and relevant arithmetic policy.
-- Candidate effective config epsilon and loaded BF16 weight provenance.
-- Exact core/g2 inputs and gated outputs, bound to request, layer, rank and
-  invocation.
-
-Candidate source uses FP32 normalization followed by weight multiplication and
-division by `1 + expf(-g)`, with a BF16 output conversion. It receives epsilon
-from config and a replicated checkpoint weight of shape `[128]`.
-
-The extracted reference KDA source constructs `FusedRMSNormGated` with sigmoid
-activation and no explicit epsilon. The separately extracted norm class has
-constructor epsilon `1e-5`, with native and CUDA methods using different
-arithmetic. These source observations do not establish effective runtime
-configuration or the selected implementation. Bind them before attribution.
-
-Deliverable: hashed capture manifest establishing which dynamic inputs,
-resident constants and actual implementations are being compared.
-
-### 2. Replay identical inputs and constants
-
-Start with all preserved arithmetic/longer rank-prefix pairs. Require each
-implementation's replay to reproduce its own captured output before interpreting
-cross-implementation comparisons. If self-reproduction fails, diagnose missing
-configuration, mutation or arithmetic binding first.
-
-**Clone core before every trial and control.** The extracted reference CUDA
-norm can alias output to its input; reusing the mutated tensor invalidates an A/B.
-
-Replay both implementations with identical core, g2, weight bytes and epsilon.
-Use controlled trials to separate reduction order, reciprocal-square-root
-calculation, sigmoid calculation, and multiplication/division order. Preserve
-input, weight and gate perturbation controls that prove the replay responds to
-the intended operands.
-
-Deliverable: self-reproduction receipts and controlled evidence identifying
-whether normalization introduces divergence at identical operands/constants.
-
-### 3. Measure downstream causality and isolate residuals
-
-If a justified norm correction emerges, test it through fresh controlled
-captures. Compare immediate norm output, local projection, reduced attention,
-FFN inputs, routing membership and final logits. Record whether it reduces,
-eliminates or leaves the registered failures unchanged.
-
-For remaining projection differences, capture/replay **local o_proj before TP**
-using identical immediate inputs and bound weights/config. For a reduced output,
-bind both ranks' producer inputs. Replay dense gate/up from identical FFN inputs;
-later FFN attribution also needs its actual activation/expert producer inputs.
-
-Extend KDA capture to layer 1 if residual divergence requires it. Investigate MLA
-and later-layer contributions through controlled replay/intervention when
-needed. Arithmetic-versus-longer comparisons change prompt content and row
-count together, so they cannot isolate an M-dependent GEMM dispatch choice.
-
-The 2048-token long-suite failure needs a separate diagnostic extension;
-the existing eight-row captures cannot localize it. State and obtain any scope
-extension required by the existing authorization before running that slice.
-
-Deliverable: an evidenced minimal production fix plus a documented account of
-remaining failing cases, without promoting correlations to causal conclusions.
-
-### 4. Resolve the held-out reference control
-
-Investigate `ref13`'s failed longer row using preserved raw evidence, exact
-fingerprints and fresh controlled repeats as appropriate. Determine whether
-the cause is reference execution nondeterminism, collection/alignment error,
-or another demonstrated mechanism. Keep all failing runs and the frozen rule.
-
-Within-process probes cannot replace the fresh reference ensemble. Do not call
-the failure an artifact without reproducing a specific faulty measurement
-mechanism and independently checking the corrected result.
-
-Deliverable: explained reference-control behavior and passing required
-must-pass controls under a valid, unchanged qualification procedure. If the
-frozen control remains unsatisfied, report Q2 as unresolved.
-
-### 5. Rebuild and run the registered qualification
-
-For a runtime fix, follow repository requirements: regression tests, clean
-image rebuild, source/image/binary/PTX fingerprints and live provenance on both
-ranks. Prove neutrality of diagnostic instrumentation and arithmetic paths
-intended to remain unaffected. Use fresh attempt names and capture roots.
-
-Evaluate complete registered short16 and long suites with the existing Q2
-rule. Require candidate rank/row checks, verifiable leave-one-out references,
-held-out reference and one-ULP must-pass controls, and applicable must-fail
-controls to meet their registered expectations. Semantic perturbation knobs
-exist in source; their GPU controls are still owed.
+1. **Bind normalization constants and dispatch: DONE**
+   (`q2-norm-replay-20261011/`; runtime-bound fixtures, epsilon bits agree).
+2. **Replay identical inputs and constants: DONE, fixture-local.**
+   - Self-replay passes for both engines.
+   - The ablation attributes the difference to the rsqrt and divide forms;
+     `v24-minimal` matches 7/7 differing elements (2 groups).
+   - Open items: a GPU rerun under the repaired harness with v24's own
+     controls, and v24 under the production toolchain flags.
+3. **Downstream causality:**
+   - C1 (local o_proj) is CLOSED from native captures (flagged; see the
+     post-review entry).
+   - **C2 (layer-0 norm-output intervention → final logits) is NEXT.**
+   - Then the L1 escalation for `longer`, then G1–G9.
+   - Never replay o_proj over a BF16 reconstruction. Both engines run EXL3
+     trellis kernels; bind the trellis bytes and the input-precision branch.
+4. **Held-out reference control: DONE.** Reference-internal bimodality at
+   `longer`/r0, mechanism unidentified. This led to gate v2 (pending
+   sign-off). A probe of the discrete runtime choice is recommended before
+   v2 collection.
+5. **Rebuild and qualify:** only after a causally justified fix. Requires
+   regression tests, a clean image, fingerprints and neutrality proofs, then
+   a fresh run under gate v2 (once signed off) with all controls. The
+   semantic perturbation GPU controls are still owed.
 
 Diagnostic self-reproduction, internal exactness, neutrality and focused Q3
 passes each prove their own scope. None substitutes for the final Q2 result.
@@ -1216,7 +1157,10 @@ open checklist items.
   a batch-script scp path bug — the fixed finalizer ran per repeat and every
   receipt exists in 3 byte-identical copies (report.md §3). Evidence:
   `q2-ref13-investigation-20261012/{report.md,analysis/,provenance/}`.
-- **Gate-design consequence (operator decision required, not taken here):**
+- **Gate-design consequence** *(follow-up: operator decided full v2
+  pre-registration, 2026-10-12; "structurally unpassable" was later
+  corrected to "underpowered at N=9" — see the 2026-10-12 post-review
+  correction entry at the end of this log)*:
   the pre-registered must-pass held-out control fails for the reference engine
   itself at ~3/5 rate when a draw lands in the failing mode, so the rule is
   structurally unpassable as written. Options (a) keep the registered gate and
@@ -1239,6 +1183,14 @@ open checklist items.
   `q2-neighbor-matrix-20261012/{matrix.md,reachability.md}`.
 
 ### 2026-10-12 — C1 execution: neutrality PASS, captures complete, anchor FAIL-CLOSED
+
+> **CORRECTED 2026-10-12 (post-review):**
+> - "binding/inputs are sound, gap is native kernel vs contract" and the
+>   "approved remedy" below are wrong. Both engines multiply EXL3 trellis
+>   weights, not the bound BF16 reconstruction.
+> - C1 was closed from native captures by operator decision.
+>
+> See the post-review correction entry at the end of this log.
 
 - **Build + neutrality:** fresh no-cache diagnostic image
   `atlas-exl3-validation:src-1687661e73e0-rust1.97.1` (`sha256:f4e47beb…faa81b`,
@@ -1292,3 +1244,119 @@ open checklist items.
   Note: the executing subagent was terminated by a provider content_filter
   AFTER writing all deliverables (`capture-report.md`, `summary.md`,
   matrices, receipts); no evidence was lost.
+
+### 2026-10-12 — statistical gate v2 pre-registration authored (reference-only)
+
+> Duplicate of the next entry's v2 record. Superseded in part by gate v2
+> Amendment 1 (post-review correction entry at the end of this log).
+
+- Full v2 pre-registration written per the operator decision: 
+  `docs/design/exl3-statistical-gate-v2.md` (status: pre-registered rule;
+  no qualification data collected under it). v1 doc untouched.
+- Authored strictly from reference-side data (15 archived draws ref04–ref13
+  + ref13rep1–5 and the reference-side held-out reports); no candidate file
+  was opened. All 15 draws are v2 tuning data, not qualification samples.
+- Rule in brief: all-row chaos envelopes E_i = max(3·max-pairwise,
+  floor {0.005, 0.15}) replace the catastrophic-row rule; demonstrated-
+  bimodal rows add a mode-membership gate (gap G≥4 + exactly-two-components
+  + separation ≥20; membership within 2× the measured within-mode radius of
+  a mode center; byte/ULP class evidence; mode frequencies reported);
+  v1's T rank statistic kept; N=15 references + 3 held-out references
+  (all must pass as candidate) + 2 byte-identical candidate runs.
+- Calibration (`q2-gate-v2-20261012/`, reference-only): harness reproduces
+  all 6 archived v1 held-out evaluations bit-exactly; LOO full-rule
+  false-fail 1/15 (rank argmax only, nominal 1/(N+1)); membership LOO 0/15;
+  held-out splits (455×12+3) all-pass 77.4 %, rank fail 7.62 % ≈ nominal;
+  v2 on the archived N=9 structure still fails 4/6 held-outs → the repair
+  comes from N=15, not the statistic; pseudo-candidates with amplified
+  reference deviations fail the envelope 15/15 at α≥4 (excess beyond the
+  envelope fails). Residual risk: ensemble-composition (lone/missed mode)
+  fail-closed probability 0.167 at the observed mode rate 3/15.
+- Committed as "docs: pre-register statistical gate v2 from reference chaos
+  data". No v2 collection has run; comparability with the v1 FAIL verdict
+  remains surrendered per decisions.md.
+
+### 2026-10-12 — gate v2 pre-registered; C1 remediation boundary; overnight drive stopped
+
+- **Gate v2 pre-registration (`f8061ad8`, `docs/design/exl3-statistical-gate-v2.md`)**
+  authored from REFERENCE-ONLY data (15 draws: ref04–ref13 + ref13rep1–5, and
+  archived reference-side held-out reports; no candidate file opened —
+  independently verified by the review). Rule: all-row chaos envelope
+  (E_i = max(3·max pairwise reference distance, floor_m); floors carried from
+  v1), new mode-membership rule for demonstrated-bimodal rows (detection:
+  gap ratio G_MIN=4, two single-linkage components, separation K_MIN=20;
+  membership within C_RHO=2.0 × measured within-mode radius; byte/ULP class
+  evidence), exchangeability rank kept (v1 T), N=15 references + H=3 held-out
+  all-must-pass, 2 byte-identical candidate runs, all v1 must-fail controls
+  retained. Calibration (reference draws only): leave-one-out false-fail
+  1/15 = 1/(N+1) exactly (rank component only; envelope/membership/discrete
+  0); mode detection fires on exactly 1/32 rows (short16/longer/r0) with
+  1928/1941 subset stability and zero non-mode false positives; membership
+  LOO 0/15; held-out pass rule validated over all 455 split emulations.
+  Review verdict: OK with notes — rule-shopping check CLEAN (calibration
+  inputs, constants and doc numbers all traced to reference-side archives,
+  spot numbers hand-recomputed), 6 P2 wording/evidence-precision fixes staged
+  as the FIRST pre-collection task (no rule/threshold impact). All 15 draws
+  are v2 tuning data; v2 collection (N=15+3+2) awaits operator sign-off on
+  the doc. The redesign repairs the control, not the candidate.
+- **C1 remediation boundary (operator stop):** the implement stage timed out
+  mid-harness-integration (its own recovery summary: no tracked files
+  changed); the partial engine-native backend module is committed as WIP
+  `bbd2d267` (unintegrated, untested — continuation in todo.md next-batch
+  item 1). Its dependent GPU stage was stopped before any host activity.
+  No remediation cycle was started; the approved anchor remedy stands.
+- **Overnight drive ended at operator request** after this checkpoint: all
+  work committed; continue.md/todo.md cleaned and the next batch staged;
+  both Sparks verified idle (0 running containers).
+
+### 2026-10-12 — post-review corrections (independent review `CODE_REVIEW_2026-10-12.md`)
+
+Supersedes the claims named below. The original entries above are preserved.
+
+- **C1 (supersedes "binding sound", "gap is native kernel vs contract" and
+  "approved remedy: engine-native replay").**
+  - *Verified:* the reference `Glm53PackedLinearMethod.apply`
+    (`arithmetic-audit/atlas-reference-active-exl3_mul1.py:3087-3110`) uses
+    `F.linear(x, layer.weight)` only for `rows > 144`. Otherwise it casts the
+    input to FP16 and runs exllamav3 `h.forward` on the trellis. The C1
+    rows (10–39 tokens) took the trellis path. The overlay receipt
+    "torch linear (cuBLAS)" was hard-coded. The capture log confirms
+    `prefill=bf16, min_rows=3`.
+  - Neither engine multiplies its bound BF16 weight, so the 6.3% weight
+    delta is between two BF16 reconstructions.
+  - Native local outputs are byte-identical across engines on all 8
+    identical-input rows. They are also byte-identical on rank0 rows 4–7,
+    whose inputs differ at 6 elements. Rank1 rows 0–3 differ on one token
+    only (109 elements, max |Δ| 6.1e-5).
+  - Operator decision: C1 closed from these native captures, with the
+    corrected-input answer flagged as inferred (8 rows, 2 prompts) and the
+    o_proj input precision as unattested.
+  - The replay harness, the engine-native WIP and the Rust capture hooks
+    are archived (`651ff083`; tag `archive/c1-bf16-o-proj-replay-20261012`).
+    Evidence erratum: `q2-c1-execution-20261012/ERRATUM-20261012.md`.
+- **v24 attribution (supersedes "byte-exact 16/16" as stated).**
+  - *Verified on raw arrays:* the 16 fixtures are nested prefixes of 2
+    prompts × 2 ranks.
+  - Candidate vs reference differ at 7 distinct elements: rank0 `longer`
+    (6) and rank1 `arithmetic` (1). The other two groups do not differ.
+  - v24 fixes all 7 and adds no new differences.
+  - v24 was selected after these fixtures were seen, and the other variant
+    pairs were not run. "v1/v3 are not sources" should read "inert on these
+    fixtures".
+  - The replay is NVRTC `--fmad=false`, and production flags are
+    unverified. `v24-minimal` carried no engagement controls. Both GPU
+    ablation runs used the pre-repair harness.
+- **Gate v2.**
+  - "Structurally unpassable" (v1) is corrected to "underpowered at N=9
+    under a bimodal row, session drift not excluded". The 3 fresh ref13
+    repeats with T above the archived range point to drift.
+  - The six P2 review fixes and Amendment 1 are applied (`fd7b530b`):
+    randomised interleaved run order; a reference-only composition
+    VOID + capped top-up; H3 = v1 rule unchanged; H4 stricter than the
+    floor; residual risks; calibration-script errata.
+  - Operator sign-off is still required before collection.
+- **Code.** The production default path is clean. `Exl3FfnRouter::capture_record`
+  now refuses existing records before writing and commits its metadata
+  atomically. The grammar-pause change (`19551fc6`) is correct; its tests
+  are CUDA-gated and still owed on a Spark.
+

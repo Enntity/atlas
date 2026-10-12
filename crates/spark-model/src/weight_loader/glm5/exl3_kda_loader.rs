@@ -223,32 +223,6 @@ impl Glm5Exl3KdaResources {
             }
             let ospec = Exl3ProjectionSpec::from_rank_local_config(config, &format!("{p}.o_proj"))?;
             projections.push(ospec.load_projection(checkpoint, gpu, capacity, stream, select)?);
-            // C1 diagnostic capture (off by default): bind the layer-0 local
-            // o_proj weight, resident shard bytes and projection config for
-            // `atlas-local-o-proj-binding-v1`. Capture-only; never changes
-            // the uploaded shard or any later forward arithmetic.
-            if let Some(dir) = super::o_proj_binding::gate_dir(layer)? {
-                let module = format!("{p}.o_proj");
-                let oview =
-                    checkpoint.linear_view(&module, ospec.in_features(), ospec.out_features())?;
-                let oplan = ospec.shard_plan(&oview)?;
-                let oshard = projections
-                    .last()
-                    .context("EXL3 KDA o_proj projection missing")?
-                    .shard();
-                super::o_proj_binding::capture_exl3(
-                    gpu,
-                    &dir,
-                    layer,
-                    config.tp_rank,
-                    config.tp_world_size,
-                    &module,
-                    &oview,
-                    &oplan,
-                    oshard,
-                    stream,
-                )?;
-            }
             let key = segments[0];
             let kd = config.linear_key_head_dim;
             let h = config.hidden_size;

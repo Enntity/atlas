@@ -1,27 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Opt-in typed upstream capture; all I/O stays in the diagnostic router.
 use super::*;
-use crate::weight_loader::glm5::o_proj_binding;
-use anyhow::Context;
 use atlas_core::config::ModelConfig;
 use spark_runtime::weights::exl3::ffn_io::{DiagnosticDtype, DiagnosticTensor, Exl3FfnRouter};
-use std::path::PathBuf;
 
 type TensorSpec<'a> = (&'static str, DiagnosticDtype, DevicePtr, &'a [usize]);
-
-/// Load-time C1 binding facts (weight file, resident shard, projection
-/// config) staged by `o_proj_binding` and stamped per invocation here. The
-/// small load record is re-read per captured invocation: one ~1 KiB read
-/// avoids a process-wide cache without adding synchronizing work.
-struct OProjBinding {
-    dir: PathBuf,
-}
-
-pub(super) struct UpstreamTrace {
-    router: Exl3FfnRouter,
-    rank: usize,
-    o_proj: Option<OProjBinding>,
-}
+pub(super) struct UpstreamTrace(Exl3FfnRouter);
 impl UpstreamTrace {
     pub(super) fn from_env(config: &ModelConfig, layer: usize) -> Result<Option<Self>> {
         let router = Exl3FfnRouter::from_env_named(
@@ -31,69 +15,16 @@ impl UpstreamTrace {
             config.tp_world_size,
             "ATLAS_EXL3_UPSTREAM_DUMP_DIR",
             "ATLAS_EXL3_UPSTREAM_DUMP_LAYERS",
-        )?;
+        )?
+        .map(Self);
         ensure!(
             router.is_none() || layer == 0,
             "EXL3 upstream capture supports explicit layer0 only"
         );
-        let Some(router) = router else {
-            return Ok(None);
-        };
-        // The C1 o_proj binding record is another explicit opt-in on top of
-        // the upstream dump; unset = no record and no load-record reads.
-        let o_proj = o_proj_binding::gate_dir(layer)?.map(|dir| OProjBinding { dir });
-        Ok(Some(Self {
-            router,
-            rank: config.tp_rank,
-            o_proj,
-        }))
+        Ok(router)
     }
     pub(super) fn begin(&self) -> Result<Option<usize>> {
-        self.router.begin()
-    }
-    pub(super) fn o_proj_enabled(&self) -> bool {
-        self.o_proj.is_some()
-    }
-    /// Record the invocation-stamped `atlas-local-o-proj-binding-v1` row for
-    /// the candidate engine. JSON only: the weight/resident bytes were
-    /// written once at load time, so the hot path copies no tensors.
-    pub(super) fn capture_o_proj_binding(
-        &self,
-        invocation: Option<usize>,
-        tokens: u32,
-        receipt: &serde_json::Value,
-    ) -> Result<()> {
-        let (Some(invocation), Some(binding)) = (invocation, self.o_proj.as_ref()) else {
-            return Ok(());
-        };
-        let path = binding.dir.join(o_proj_binding::load_file(self.rank));
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("local o_proj load record {}", path.display()))?;
-        let load: serde_json::Value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("local o_proj load record {}", path.display()))?;
-        o_proj_binding::validate_load_record(&load, self.rank)?;
-        let record = serde_json::json!({
-            "schema": o_proj_binding::BINDING_SCHEMA,
-            "engine": "candidate",
-            "rank": self.rank,
-            "layer": 0,
-            "invocation": invocation,
-            "tokens": tokens,
-            "projection": load["projection"],
-            "files": {"weight": load["files"]["weight"]},
-            "resident": load["resident"],
-        });
-        let mut receipt = receipt.clone();
-        if let Some(map) = receipt.as_object_mut() {
-            map.insert(
-                "weight_basis".to_string(),
-                load.pointer("/resident/recipe/name")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            );
-        }
-        self.router
-            .write_binding_with_receipt(invocation, "o_proj_binding", &record, &receipt)
+        self.0.begin()
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn capture_gated_norm_binding(
@@ -124,7 +55,7 @@ impl UpstreamTrace {
             "gated norm binding grid overflow"
         );
         let (grid, block) = ops::kda_sigmoid_gated_norm_launch_dims(tokens, heads);
-        self.router.capture_with_metadata(
+        self.0.capture_with_metadata(
             gpu,
             invocation,
             "gated_norm_binding",
@@ -167,8 +98,7 @@ impl UpstreamTrace {
                 shape: shape.to_vec(),
             })
             .collect();
-        self.router
-            .capture(gpu, invocation, stage, &tensors, stream)
+        self.0.capture(gpu, invocation, stage, &tensors, stream)
     }
 }
 impl Glm5KdaLayer {
@@ -184,46 +114,6 @@ impl Glm5KdaLayer {
             trace.capture(invocation, ctx.gpu, stage, tensors, stream)?;
         }
         Ok(())
-    }
-    /// Diagnostic-only C1 local o_proj binding record (off unless both the
-    /// upstream dump and `ATLAS_LOCAL_O_PROJ_BINDING_DIR` are configured).
-    /// JSON-only: no tensor copies, no synchronizing work, no effect on the
-    /// projection that follows.
-    pub(super) fn capture_o_proj_binding(
-        &self,
-        invocation: Option<usize>,
-        tokens: u32,
-        decode: bool,
-        capture_verify_intermediates: bool,
-    ) -> Result<()> {
-        let Some(trace) = self.upstream_trace.as_ref() else {
-            return Ok(());
-        };
-        if !trace.o_proj_enabled() {
-            return Ok(());
-        }
-        let (exl3, has_transposed) = match &self.weights.o_proj {
-            Glm5Projection::Exl3(_) => (true, false),
-            Glm5Projection::Nvfp4 {
-                prefill_nvfp4_t, ..
-            } => (false, prefill_nvfp4_t.is_some()),
-        };
-        let receipt = super::o_proj_receipt::o_proj_gemm_receipt(
-            capture_verify_intermediates,
-            decode,
-            tokens,
-            exl3,
-            has_transposed,
-            !decode
-                && tokens >= 2048
-                && std::env::var("ATLAS_GLM_KDA_PREFILL_LT_FP8").as_deref() == Ok("1"),
-            self.w4a16_gemm_k,
-            self.w4a16_gemv_k,
-            self.w4a16_gemm_t_m128_k,
-            self.hidden_size as u32,
-            (self.heads * self.dim) as u32,
-        );
-        trace.capture_o_proj_binding(invocation, tokens, &receipt)
     }
     pub(super) fn capture_upstream_hc(
         &self,
@@ -268,7 +158,128 @@ impl Glm5KdaLayer {
         )
     }
 }
-
 #[cfg(test)]
-#[path = "upstream_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+    use spark_runtime::gpu::mock::MockGpuBackend;
+    #[test]
+    fn gated_norm_binding_captures_resident_weight_and_effective_epsilon() {
+        let gpu = MockGpuBackend::new();
+        let root = std::env::temp_dir().join(format!("atlas-norm-binding-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let trace = UpstreamTrace(Exl3FfnRouter::new(root.clone(), 0, 1, 2).unwrap());
+        let ptr = gpu.alloc(4).unwrap();
+        let weight = [0, 0x3f, 0, 0x40];
+        gpu.copy_h2d(&weight, ptr).unwrap();
+        let eps = 0.00003125f32;
+        // Disabled capture returns before validation, GPU access or filesystem writes.
+        trace
+            .capture_gated_norm_binding(
+                None,
+                &gpu,
+                DevicePtr::NULL,
+                KernelHandle(0),
+                0,
+                0,
+                0,
+                f32::NAN,
+                8,
+            )
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert_eq!(gpu.d2h_blocking_count() + gpu.d2h_async_count(), 0);
+        std::fs::write(root.join("capture-enabled"), b"").unwrap();
+        let invocation = trace.begin().unwrap();
+        trace
+            .capture_gated_norm_binding(invocation, &gpu, ptr, KernelHandle(123), 3, 4, 2, eps, 8)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("ffn-L0-rank1-000000-gated_norm_binding-weight.bin")).unwrap(),
+            weight
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("ffn-L0-rank1-000000-gated_norm_binding.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["binding"]["eps_f32_bits"], eps.to_bits());
+        assert_eq!(metadata["binding"]["kernel_handle"], 123);
+        assert_eq!(metadata["binding"]["grid"], serde_json::json!([12, 1, 1]));
+        assert_eq!(metadata["binding"]["block"], serde_json::json!([128, 1, 1]));
+        // Exercise the real launch wrapper and require its dispatched geometry to
+        // match the captured binding, rather than trusting copied constants.
+        ops::kda_sigmoid_gated_norm(&gpu, KernelHandle(123), ptr, ptr, ptr, ptr, 3, 4, 2, eps, 8)
+            .unwrap();
+        let launches = gpu.launches_snapshot();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(metadata["binding"]["kernel_handle"], launches[0].func);
+        assert_eq!(
+            metadata["binding"]["grid"],
+            serde_json::json!(launches[0].grid)
+        );
+        assert_eq!(
+            metadata["binding"]["block"],
+            serde_json::json!(launches[0].block)
+        );
+        assert_eq!(metadata["binding"]["activation"], "sigmoid");
+        assert_eq!(metadata["tensors"][0]["shape"], serde_json::json!([2]));
+        assert_eq!(metadata["tensors"][0]["dtype"], "bf16-le");
+        for invalid in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            assert!(
+                trace
+                    .capture_gated_norm_binding(
+                        Some(1),
+                        &gpu,
+                        ptr,
+                        KernelHandle(123),
+                        3,
+                        4,
+                        2,
+                        invalid,
+                        8
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 3);
+        gpu.free(ptr).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn disabled_trace_performs_no_io_and_preserves_marker_identity() {
+        let gpu = MockGpuBackend::new();
+        let root = std::env::temp_dir().join(format!("atlas-upstream-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let trace = UpstreamTrace(Exl3FfnRouter::new(root.clone(), 0, 1, 2).unwrap());
+        let ptr = gpu.alloc(4).unwrap();
+        gpu.copy_h2d(&[0, 0x3f, 0, 0x40], ptr).unwrap();
+        assert_eq!(trace.begin().unwrap(), None);
+        trace
+            .capture(
+                None,
+                &gpu,
+                "embedding",
+                &[("hidden", DiagnosticDtype::Bf16, ptr, &[1, 2])],
+                8,
+            )
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::write(root.join("capture-enabled"), b"").unwrap();
+        let invocation = trace.begin().unwrap();
+        trace
+            .capture(
+                invocation,
+                &gpu,
+                "embedding",
+                &[("hidden", DiagnosticDtype::Bf16, ptr, &[1, 2])],
+                8,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("ffn-L0-rank1-000000-embedding-hidden.bin")).unwrap(),
+            [0, 0x3f, 0, 0x40]
+        );
+        assert_eq!(trace.begin().unwrap(), Some(1));
+        gpu.free(ptr).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

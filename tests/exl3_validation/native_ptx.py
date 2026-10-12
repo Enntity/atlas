@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import re
 
+NVRTC_OPTIONS = ('--std=c++17', '--fmad=false')
+
 REQUIRED = {
     'exl3': {'entries': ('exl3_input_hadamard_f16','exl3_input_hadamard',
                         'exl3_mul1_matmul','exl3_output_hadamard','exl3_output_hadamard_f32'),
@@ -57,4 +59,4 @@ def load_module(cp,common,module,ptx_dir=None,binding=None):
     if ptx_dir is not None:
         return cp.RawModule(path=str(Path(ptx_dir)/binding['modules'][module]['file']))
     return cp.RawModule(code=(Path(common)/(module+'.cu')).read_text(),
-                        options=('--std=c++17','--fmad=false','-I'+str(common)))
+                        options=NVRTC_OPTIONS + ('-I'+str(common),))

@@ -1,122 +1,119 @@
 # GLM-5.3 EXL3 on two Sparks — continuation state
 
-*Superseded historical narrative (the 2026-10-11 resume/analyzer/reviewed-checkpoint blocks, sessions 2/3/3b, gate-batch and status tables, "Resume findings", "Merged CPU-side work", "Gate batch 2", the historical execution sequence and historical Q3 fix detail) was removed on 2026-10-12; it is preserved in git history and under the durable evidence root below.*
-
 [todo.md](todo.md) is the authoritative remaining-work checklist; this file
 holds the restart context, current verdict, and the evidence/profile/host
 pointers. Sequencing SSOT:
 [docs/plans/q2-norm-causality-plan.md](docs/plans/q2-norm-causality-plan.md);
-append-only experiment log: latest entries in [q2-diagnostic.md](q2-diagnostic.md).
+decisions: [decisions.md](decisions.md); append-only experiment log:
+[q2-diagnostic.md](q2-diagnostic.md) (its latest entry, "post-review
+corrections", supersedes earlier C1/v24/gate-v2 claims). Latest review:
+[CODE_REVIEW_2026-10-12.md](CODE_REVIEW_2026-10-12.md). Superseded narrative
+is in git history.
 
-## Current verdict (2026-10-12)
+## Current verdict (2026-10-12, post-review)
 
-- **Q2 statistical gate: candidate FAIL — unchanged** (pre-registered rule,
-  nothing loosened). `cand-fp8decode02` fails on rank (T 7.20 vs refs
-  5.04–5.53) plus 3 catastrophic short16 `longer` rows; the ulp control fails
-  the same way; held-out `ref13` fails short16 `longer` row 0 — now
-  investigated: the row is reference-internal bimodal chaos (see below).
-  Per-case concentration: short16 `arithmetic`, then
-  `longer`, then `index-boundary-2048`; the other long cases sit near the
-  references' own spread. Full reports: `statistical-gate-20261011/final/`
-  under the durable root.
-- **v24 attribution proven on the 16 fixtures — stage-local only.**
-  `v24-minimal` reproduces the reference gated-norm output byte-exactly 16/16
-  (attested-PTX and `v0-copy` anchors also byte-exact; reduction-order and
-  exp-construction variants are output-inert, not sources). Downstream
-  causality is unmeasured — do not infer this explains the gate failure.
-  Evidence: `q2-norm-ablation-20261012/` (analysis-20261012.md) and
-  `q2-codepath-audit-20261012/`.
-- **Ablation harness defects repaired** (commits `9ff39728`, `c71bb557`);
-  independent review verdict "OK with notes, no blockers"
-  (`q2-norm-ablation-20261012/harness-repair-20261012/review-summary.md`).
-  The harness is cleared for new attribution work; deferred minor findings are
-  listed in todo.md.
-- **ref13 held-out failure explained (verdict: reference-internal chaos).**
-  The failing `longer`/r0 row recurred byte-identically in 2/5 fresh
-  fingerprint-identical reference repeats (3/15 draws overall, exact CP95
-  [0.043, 0.481]); held-out-control emulation fails 3/5 for pure reference
-  draws (2 catastrophic-row, 1 rank-only). No environment/config anomaly
-  (all 15 runs' audits hash `3723c602aab8fa7d`). Consequence: the must-pass
-  control can fail for the reference itself — **operator decision required**
-  (todo.md); the frozen gate was not changed. Evidence:
-  `q2-ref13-investigation-20261012/`.
-- **Neighboring-types matrix instantiated (49 rows; none "passed").** The v24
-  change reaches exactly one kernel entry (`kernels/gb10/common/kda.cu:565
-  kda_sigmoid_gated_rms_norm`, GLM-KDA-only at runtime) but is build-reachable
-  by all 30 targets; fused twins embedding the same arithmetic must be
-  enumerated affected-or-out-of-scope by any shared-code fix. Evidence:
-  `q2-neighbor-matrix-20261012/`.
-- **C1 executed; answers blocked at a fail-closed self-anchor.** Neutrality
-  precondition PASSED byte-identically (final-logit archive `28b7b3a8…` ==
-  frozen baseline; 48/48 L0 tensors byte-identical vs both frozen baselines);
-  captures X/Y complete with pre-reduce placement attested (local outputs
-  rank-divergent 8/8); 32/32 binding rows assembled (`q2-c1-binding-2026013/`).
-  CPU preflight: neither engine's `o_proj` is byte-reproducible by the
-  f32-GEMM/RNE replay contract (40–47% of outputs unequal, median 1 ULP;
-  replay≈f64 to 6/40960 ⇒ binding sound, gap is native kernel vs contract).
-  Gate NOT relaxed; variant replay not run. Approved remedy (plan-prescribed
-  checkpoint): engine-matching GEMM algorithm receipts + engine-native replay
-  backend. Neutral facts (recorded, not interpreted): native local outputs
-  byte-identical across engines on 8/8 rows with identical inputs; bound
-  weights differ 6.3% of elements (dequant-recipe delta); v24 ≡
-  reference-exact 32/32. Evidence:
-  `q2-c1-execution-20261012/{capture-report.md,summary.md}`.
-- No production numerical fix is qualified; no image was published; production
-  containers remain stopped.
-- The KV flag-name difference (candidate `fp8_g128` vs reference `auto`) is
-  **not** evidence of effective dtype asymmetry: `auto` resolves to
-  `fp8_ds_mla`, the format `fp8_g128` was selected to match. G5 concerns
-  effective cache/attention-path equivalence across chunk boundaries.
+- **Q2: candidate not qualified.** Under the frozen v1 gate (historical
+  record) the candidate `cand-fp8decode02` FAILS on rank (T 7.20 vs refs
+  5.04–5.53) plus 3 catastrophic short16 `longer` rows; the ulp control
+  fails the same way. Reports: `statistical-gate-20261011/final/`.
+- **Held-out `ref13` failure explained:** reference-internal bimodality at
+  short16 `longer`/r0.
+  - Recurring byte-identical mode in 3/15 draws (CP95 [0.043, 0.481]; 2/14
+    if the triggering draw is excluded); 15 draws fall into 6 byte classes.
+  - The mechanism (likely a discrete runtime choice) is unidentified, and
+    "fingerprint-identical" covers configuration only.
+  - Diagnosis: v1 was **underpowered at N = 9 under a bimodal row, with
+    session drift not excluded**. Three fresh repeats scored T above the
+    archived range. Evidence: `q2-ref13-investigation-20261012/`.
+- **Gate v2** (`docs/design/exl3-statistical-gate-v2.md`, `f8061ad8` + P2
+  fixes and **Amendment 1**, `fd7b530b`) is the qualification rule going
+  forward. It was authored from reference-only data. Amendment 1 adds:
+  - randomised interleaved run order;
+  - a reference-only composition VOID + capped top-up;
+  - disclosures that H3 is v1's rule unchanged and H4 is stricter.
 
-## In flight (2026-10-12) — check before touching hosts
+  **Not signed off; no v2 data collected.**
+- **Gated-norm attribution is fixture-local.** `v24-minimal` reproduces the
+  reference on **7/7 differing elements across 2 independent (rank × prompt)
+  groups**. The 16 fixtures are nested prefixes, and two groups never
+  differed. v24 introduced no new differences.
+  - Limits: v24 was chosen after seeing these fixtures, and other variant
+    pairs were never run.
+  - The replay used NVRTC `--fmad=false`; production flags are unverified.
+  - `v24-minimal` carried no engagement controls of its own, and the
+    repaired harness has never run on a GPU.
+  - Evidence: `q2-norm-ablation-20261012/`.
+- **C1 (layer-0 local o_proj) CLOSED from native captures** (operator
+  decision 2026-10-12):
+  - No same-input projection difference: byte-identical outputs on 8/8
+    identical-input rows.
+  - The natural ≤1-ULP norm delta is absorbed on rank0 (6 input elements
+    differ, 0 output elements) and confined to one token on rank1 (109
+    elements, max |Δ| 6.1e-5).
+  - **FLAG:** "corrected input ⇒ reference output" is inferred from 8 rows
+    of 2 prompts, and the candidate o_proj input precision is unattested.
+  - The BF16 replay harness was built on an invalid premise (both engines
+    multiply EXL3 trellis weights) and is archived (`651ff083`, tag
+    `archive/c1-bf16-o-proj-replay-20261012`). Evidence + erratum:
+    `q2-c1-execution-20261012/ERRATUM-20261012.md`.
+- **Dominant final-logit cause: unproven.** Per-case excess concentrates in
+  short16 `arithmetic`, then `longer`, then `index-boundary-2048`. Known
+  internal differences: the layer-0 gated-norm ≤1 ULP and layer-3 expert
+  membership changes. Downstream causality is unmeasured; C2 measures it.
+- **Neighboring-types matrix instantiated** (49 rows; none passed). v24 reaches
+  exactly `kernels/gb10/common/kda.cu:565` at runtime (GLM-KDA only) but is
+  build-reachable by all 30 targets; fused twins must be classified by any
+  shared-code fix. Evidence: `q2-neighbor-matrix-20261012/`.
+- The KV flag-name difference (candidate `fp8_g128` vs reference `auto` →
+  `fp8_ds_mla`) is not evidence of dtype asymmetry; G5 concerns effective
+  cache/attention-path equivalence.
+- No production numerical fix is qualified. No image was published, and
+  the production containers remain stopped.
 
-- **C1 remediation** in flight: engine-matching GEMM algorithm receipts +
-  engine-native replay backend (the approved anchor remedy), then re-run the
-  self-anchors and the three input variants. Prior C1 steps (build, neutrality,
-  captures, bindings) are complete — do not redo them; evidence dir:
-  `q2-c1-execution-20261012/`. C1-prep harness: `5412f043`,
-  `q2-c1-prep-20261012/`.
-- Completed earlier today: ref13 held-out diagnostic (both Sparks idle again,
-  all engines stopped with post-stop receipts) and the neighboring-types
-  matrix. Evidence dirs — do not touch:
-  `q2-ref13-investigation-20261012/`, `q2-neighbor-matrix-20261012/`.
-- Operator decisions in `decisions.md`: the 2048-token / deep-layer scope
-  extension is GRANTED; ref13 runs in parallel with the causality chain;
-  implementation and execution are delegated to subagents with independent
-  review. Coordinate one experiment owner across both ranks before any other
-  GPU work.
+## Host state
+
+Nothing is in flight. At the last checkpoint (2026-10-12, end of the
+overnight drive) both Sparks had 0 running containers. This was not
+re-verified since; inspect both hosts before any GPU work.
 
 ## Next actions (ordered; details in todo.md "Next batch")
 
-1. **C1** — local `o_proj` replay before TP (original vs reference-exact vs
-   v24-corrected norm output; each engine vs its own captured projection
-   first). Sparks free since ref13 finished 2026-10-12 (C1-prep running); the harness repair that gated
-   C1 is done.
-2. **C2** — controlled layer-0 norm-output intervention on both ranks, tracing
-   o_proj → routing → MoE → final logits against the failing rows.
-3. **L1 escalation** — for `longer`, trace complete mHC residual streams and
-   L1 KDA between matching L0 outputs and differing L1 FFN inputs, before broad
-   late-layer bisection.
-4. **G2–G7 fallbacks** — G8/G9 runtime + binary binding precedes each affected
-   replay; reuse the recovered checkpoint config, head/router/expert component
-   receipts and prior replays noted in todo.md instead of re-collecting.
-5. **Neighboring-types matrix + repeat Rust/vLLM/source review** — HARD
-   PREREQUISITE before any shared-code fix.
-6. **Production v24 gated-norm fix** — only behind causality evidence, the
-   plan's step-5 qualification obligations, and a fresh frozen Q2 run.
+1. **Gate v2 sign-off.** The operator reviews the amended
+   `exl3-statistical-gate-v2.md`. Recommended first: a cheap probe of the
+   ref13 discrete mechanism (autotune/plan, NCCL algorithm, routing tie
+   pinning). v2 collection only after sign-off.
+2. **C2.** Layer-0 norm-output substitution (reference-exact; v24 is
+   byte-identical to it) on both ranks, traced through o_proj → routing →
+   MoE → final logits against the failing rows. Needs a new off-by-default
+   knob with a neutrality proof. Captures use `Exl3FfnRouter`.
+3. **L1 escalation** for `longer`: complete mHC residual streams + L1 KDA
+   between matching L0 outputs and differing L1 FFN inputs.
+4. **G-fallbacks** (G2–G7 with G8/G9 binding first), reusing archived receipts.
+5. **Repeat Rust/vLLM/source review** on actual candidate artifacts. This
+   and the neighbor matrix are a hard prerequisite for any shared-code fix.
+6. **Production v24 gated-norm fix**, only behind:
+   - C2 causality evidence;
+   - a GPU rerun with v24's own controls under the repaired harness;
+   - proof under production compile flags;
+   - neighbor coverage;
+   - a fresh v2 qualification run.
 
 ## Preserved production profile (currently stopped)
 
 - Repository: `/home/colum/Workspace/RustroverProjects/atlas`.
-- Branch at review: `sparkglm/installable-20260924`; reviewed HEAD: `11671adf`.
+- Branch: `sparkglm/installable-20260924` (original roadmap review was
+  against `11671adf`; current HEAD moves — use `git log`).
 - Model: `MikeRoz/GLM-5.3-Flash-Uncensored-4.05bpw-h6-exl3`.
 - Checkpoint revision: `dda99c7e935920fa6e235ce410e6f806e1c02720`.
 - Last recorded serving containers: `glm53-exl3-atlas-0` on spark0 and
   `glm53-exl3-atlas-1` on spark1, port 8000, restart policy `unless-stopped`.
-- Image: `atlas-exl3-validation:src-48624a8605de-rust1.97.1`.
-- Image ID: `sha256:82b23cd19e595cae5e96616e726a64f2f4b964416d31268210bf24f3e686c737`.
-  `48624a8605de` is a source snapshot identifier, **not the reviewed Git commit**.
-  Do not assume the running image contains every change in `11671adf`.
+- Last recorded production image: `atlas-exl3-validation:src-48624a8605de-rust1.97.1`
+  (`sha256:82b23cd19e595cae5e96616e726a64f2f4b964416d31268210bf24f3e686c737`).
+  The Q0 clean image `src-8b6b47f14d5b-rust1.97.1` (`sha256:e744b81d…`, from
+  `fb4f4b41`) was later loaded on both nodes. **Which image the stopped
+  `glm53-exl3-atlas-*` containers reference is unverified:** run
+  `docker inspect` on both hosts before any restart. Source snapshot IDs are
+  not Git commits.
 - Launcher: [scripts/start-glm53-exl3-tp2.sh](scripts/start-glm53-exl3-tp2.sh).
   On the corresponding host: `RANK=0 bash scripts/start-glm53-exl3-tp2.sh` or
   `RANK=1 bash scripts/start-glm53-exl3-tp2.sh`. It removes/recreates the named
@@ -180,7 +177,10 @@ The frozen comparison profile is TP=2 / EP=1, BF16 KV, eager execution,
 context 4096, chunk 128, C1 admission, no prefix caching or speculation. Its
 absolute-threshold reports remain diagnostic records; the user-approved
 statistical gate and registered effective FP8 KV profile decide numerical
-qualification (`docs/design/exl3-statistical-gate.md` is the current rule).
+qualification. The v1 rule (`docs/design/exl3-statistical-gate.md`) is the
+historical record. `docs/design/exl3-statistical-gate-v2.md` (with
+Amendment 1) is the rule going forward once signed off. "C1 admission" here
+means one-sequence admission, not experiment C1.
 Long-prefix cases retain 2047/2048/2051/2053 tokens and registered
 continuations.
 
@@ -219,9 +219,14 @@ different scopes.
 | `q2-investigation-20261011/` | Read-only Q2 investigation: `report.md`, `report-stage2-propagation.md`, `report-mla-implementation-delta.md`; candidate excess dominates, MLA causal link unproven |
 | `q2-diagnostic-20261011/` | Extended diagnostic dumps (1.1 GB), repaired analyzer + reviewed localization report (`analysis/`), resume-analyzer receipts |
 | `q2-norm-replay-20261011/` | Runtime-bound gated-norm replay: 16 fixtures, reference self-replay 11/11 per rank, candidate PTX self-replay 8/8 per rank, epsilon bits agree |
-| `q2-norm-ablation-20261012/` | 16-fixture arithmetic attribution, `v24-minimal` byte-exact 16/16 (`analysis-20261012.md`), ablation harness, harness repair + independent review (`harness-repair-20261012/`) |
+| `q2-norm-ablation-20261012/` | Arithmetic attribution: `v24-minimal` matches 7/7 differing elements across 2 independent fixture groups (16 nested fixtures); `analysis-20261012.md` + `ERRATUM-20261012.md`; pre-repair harness runs; repair + review in `harness-repair-20261012/` |
 | `q2-codepath-audit-20261012/` | Merged vLLM step inventory + gap report G1–G9 (`comparison-report.md` §4–§5) |
-| `q2-ref13-investigation-20261012/` | ref13 held-out diagnostic — IN FLIGHT, do not touch |
+| `q2-ref13-investigation-20261012/` | ref13 held-out investigation — verdict: reference-internal bimodality (3/15, 6 byte classes), mechanism unidentified (`report.md`, `analysis/`) |
+| `q2-neighbor-matrix-20261012/` | 49-row neighboring-types matrix (`matrix.md`, `reachability.md`); none passed |
+| `q2-c1-prep-20261012/` | C1 preparation (binding spec); superseded by the C1 re-scope |
+| `q2-c1-execution-20261012/` | C1 build/neutrality (PASS, byte-identical)/native pre-reduce captures; **read `ERRATUM-20261012.md` first** — the replay-anchor conclusions are wrong |
+| `q2-c1-binding-2026013/` (sic — missing digit, created 2026-10-12; do not rename) | 32 assembled C1 rows: fixture inputs, native own-outputs (valid); BF16 weights are reconstructions, not what either engine multiplies |
+| `q2-gate-v2-20261012/` | v2 calibration (reference-only): `calibrate_v2.py`, `calibration.json`, `review-summary.md` (P2 fixes now applied) |
 | `merged-image-20261011-session2/` | Corrected-image neutrality (`grammar-r2/`) and focused Q3 receipts, attempt tarballs, provenance; attempt `cand-grammar-ee5e-01` preserved and unreused |
 | `p0-trace-prep-20261011/` | Prepared paired named-session Nsight driver/tests/README (11 CPU tests); no live profiler execution yet |
 

@@ -1,17 +1,18 @@
 # Q2 norm-causality experiment plan (next-repair #2–3)
 
-Status: plan only, nothing executed. 2026-10-12. Sequencing authority for the
-post-attribution diagnostic work; follow-ups in `todo.md` reference this plan.
-Revised after review of `614a2e24`; C1/C2 have still not been executed.
-Expanded to include neighboring model/configuration coverage and a repeatable
-Rust/vLLM implementation review. Those additions are planned work, not new
-qualification or an expansion of the current GPU experiment authorization.
+Status (2026-10-12, after the independent review `CODE_REVIEW_2026-10-12.md`):
+**C1 closed from native captures** (operator decision; flagged, see below).
+**C2 is the next experiment.** Sequencing authority for the post-attribution
+diagnostic work; follow-ups in `todo.md` reference this plan. The plan also
+covers neighboring model/configuration coverage and a repeatable Rust/vLLM
+implementation review. Those sections are planned work, not new
+qualification or an expansion of GPU experiment authorization.
 
 ## Objective
 
-Determine whether the attributed gated-norm arithmetic difference — and the
-proven minimal correction (`v24-minimal`, two changes) — is causally
-responsible for any part of the registered Q2 failures. If it is not, proceed
+Determine whether the attributed gated-norm arithmetic difference, and the
+fixture-local correction `v24-minimal`, is causally responsible for any part
+of the Q2 failures. If it is not, proceed
 through the observed L0→L1 boundary and the revised code-path audit gap list
 (G1–G9) to locate the dominant divergence.
 For any shared-code correction, establish which neighboring types and model
@@ -21,13 +22,23 @@ numerical policy for every model.
 
 ## Frozen state and proven inputs (fingerprints)
 
-- Registered failure state (frozen, unchanged): Q2 FAILS — exchangeability
-  rank + 3 catastrophic `longer` rows (0–2), `ulp_control` FAILs, held-out
-  `ref13` FAILs `longer`/r0, long-suite 2048-token failure unlocalized.
-  Evidence: `statistical-gate-20261011/final/`.
-- Attributed gated-norm difference + minimal correction:
-  `q2-norm-ablation-20261012/analysis-20261012.md` (v24 = rsqrt form +
-  reciprocal-multiply combine; byte-exact on all 16 fixtures).
+- Registered v1 failure state (historical record): Q2 FAILS on the
+  exchangeability rank plus 3 catastrophic `longer` rows (0–2). The
+  `ulp_control` also fails, and held-out `ref13` fails `longer`/r0
+  (reference-internal bimodality). The long-suite 2048-token failure is
+  unlocalized. Evidence: `statistical-gate-20261011/final/`.
+- Qualification rule going forward: gate v2
+  (`docs/design/exl3-statistical-gate-v2.md`, with Amendment 1), pending
+  operator sign-off and not yet collected. Diagnostic scoring in this plan
+  still uses the frozen v1 ensemble/metrics as fixed diagnostics.
+- Attributed gated-norm difference and correction:
+  `q2-norm-ablation-20261012/analysis-20261012.md`. v24 = rsqrt form +
+  reciprocal-multiply combine. It reproduces the reference on **7/7
+  differing elements across 2 independent (rank × prompt) groups**; the 16
+  fixtures are nested prefixes, and 2 of the 4 groups do not differ at all.
+  v24 introduced no new differences elsewhere. v24 was selected after seeing
+  these fixtures; other variant pairs were not run. The replay used NVRTC
+  `--fmad=false`, and production flags are unverified. Fixture-local only.
 - Runtime-bound fixtures and bindings: `q2-norm-replay-20261011/`
   (`fixtures/`, `common/`, `replay-ptx/`).
 - Code-path audit gap list G1–G9 and discrepancies D1–D5:
@@ -40,14 +51,12 @@ numerical policy for every model.
 
 ## Preconditions from the offline review
 
-- Repair the ablation runner before new attribution: verify each fixture's
-  schema/rank/invocation, recorded file hashes, actual reference/candidate
-  operands and effective epsilon bits. Fail closed on any mismatch. Include
-  engagement controls in the saved summary and block interpretation when a
-  required control is absent or fails, even if replay anchors pass.
-- Existing results remain valid: independent review verified all 16 fixtures
-  and raw v24 outputs, and the archived controls passed. The two runner
-  defects are open tooling work, not a retraction of those measurements.
+- Ablation runner repaired (`9ff39728`, `c71bb557`; review OK-with-notes).
+  The repaired harness has **not yet run on a GPU**. Both archived ablation
+  runs used the pre-repair harness. Engagement controls exist for
+  `attested`, `v0-copy` and `v-all` only; **`v24-minimal` has none**. Any
+  new v24 claim needs a GPU rerun under the repaired harness with v24's own
+  controls.
 - Reproduce the baseline final-logit fingerprint under the diagnostic build
   before interpreting an intervention. Record disagreement with the frozen
   candidate separately; stage tracing does not establish qualification.
@@ -58,25 +67,32 @@ numerical policy for every model.
   EXL3 layer map and constants; do not import the enclosing historical serve
   environment. Runtime overrides/provider dispatch still require binding.
 
-## Experiment C1 — local o_proj replay before TP (next-repair #2)
+## Experiment C1 — local o_proj before TP: CLOSED from native captures
 
-- Capture/replay the local `o_proj` **before TP** on both engines using
-  identical immediate inputs and bound resident projection weights/config.
-  Input variants: (a) each engine's original gated-norm output, (b)
-  reference-exact norm output, (c) v24-corrected norm output.
-- Each engine is first tested against **its own** captured local projection
-  (self-reproduction anchor), then cross-compared at identical operands.
-- Questions answered: does a ≤1-ULP norm delta survive or amplify through the
-  projection GEMM; does the candidate projection itself differ at identical
-  inputs/weights (same-input GEMM error)? The historical M5 comparison does
-  not settle this question for arithmetic 10–13 or longer 36–39.
-- Deliverable: per-element propagation matrix (input delta → output delta,
-  coordinates and ULP) plus self-reproduction and binding receipts.
-- Prerequisite check: if resident o_proj weights/config are not bound in the
-  existing dumps, produce a binding record first (mirror the
-  `atlas-kda-gated-norm-binding-v1` pattern).
+Operator decision 2026-10-12 (decisions.md "C1 re-scoped"). Answers come
+from the native pre-reduce captures under `q2-c1-execution-20261012/` and
+`q2-c1-binding-2026013/` (sic). See `ERRATUM-20261012.md` there.
 
-## Experiment C2 — downstream intervention on both ranks (next-repair #3)
+- **Same-input projection error:** none. Native local outputs are
+  byte-identical across engines on all 8 identical-input rows.
+- **Propagation of the natural ≤1-ULP norm delta:**
+  - Rank0 rows 4–7: 6 differing inputs, 0 differing outputs.
+  - Rank1 rows 0–3: 1 differing input element, 109 differing outputs on
+    that token only, max |Δ| 6.1e-5.
+- **v24 / reference-exact input:** byte-identical to each other 32/32. The
+  candidate would reproduce the reference local output (inferred).
+- **FLAG:** the last answer is inferred from 8 identical-input rows of 2
+  prompts, not measured. The candidate o_proj input precision is unattested.
+  These answers are local to layer-0 o_proj and say nothing about downstream
+  effect.
+- Do not replay o_proj over a BF16 reconstruction. Both engines multiply
+  EXL3 trellis weights: the reference uses an FP16-input `h.forward` for
+  `rows <= 144`. The earlier replay harness is archived
+  (`tests/exl3_validation/archive/c1-local-o-proj-replay/`). Any future
+  o_proj replay must bind the trellis bytes and the runtime input-precision
+  branch.
+
+## Experiment C2 — downstream intervention on both ranks (NEXT)
 
 - Fresh two-node controlled captures with a **norm-output substitution knob**
   (diagnostic-only, off by default; production-path neutrality proven per
@@ -111,10 +127,21 @@ numerical policy for every model.
 - The 2048-token long-suite slice required an explicit operator scope
   extension; **granted 2026-10-12** (see decisions.md). It is authorized here
   subject to every other constraint in this plan.
+- Because C1 found zero same-input o_proj error, a nonzero B−A at reduced
+  attention or later is attributable to the substituted norm values
+  propagating, not to o_proj arithmetic. That attribution still needs B's
+  baseline determinism to be shown.
+- Implementation notes:
+  - The substitution knob is new diagnostic code: off by default, and
+    neutral when off (final-logit archive byte-identical to the frozen
+    baseline, as in the C1 neutrality check).
+  - Captures reuse `Exl3FfnRouter` records (atomic metadata commit,
+    `651ff083`).
+  - Do not reuse the archived C1 o_proj binding/receipt code.
 
 ## Fallback-suspect ordering (folded from the audit gap list)
 
-If C1/C2 leave residual failure, first inspect the **longer L0→L1 boundary**:
+If C2 leaves residual failure, first inspect the **longer L0→L1 boundary**:
 all four longer prefixes on both ranks have matching L0 reduced-attention and
 FFN outputs, then differing L1 FFN inputs (464-pair analyzer rerun). Capture
 the complete mHC residual streams and L1 attention input before attributing
@@ -179,13 +206,15 @@ for each affected replay, not work deferred until all numerical experiments:
    extension, `_C.*`, FlashInfer, cuBLAS). Reuse prior hashes and algorithm
    receipts, then establish identity with the current workers.
 
-The ref13 held-out investigation (required experiment 4) proceeds
-independently and in parallel; a candidate improvement never establishes
-qualification while the must-pass control fails.
+The ref13 held-out investigation is complete. Verdict: reference-internal
+bimodality at `longer`/r0 (3/15 draws, 6 byte classes), with the mechanism
+unidentified. It led to gate v2. A probe of the discrete runtime choice
+(autotune/plan, NCCL algorithm, routing tie) is recommended before v2
+collection (gate v2 Amendment 1, A1.5).
 
 ## Neighboring types and model/configuration coverage
 
-This section governs regression scope for C1/C2 and G1–G9 repairs. Derive the
+This section governs regression scope for C2 and G1–G9 repairs. Derive the
 current inventory from Rust enums, loader/dispatch predicates, kernel exports,
 `kernels/gb10/*/MODEL.toml` and the model × quant matrix in
 [`../GB10_DEPLOYMENT_GUIDE.md`](../GB10_DEPLOYMENT_GUIDE.md). An enum variant or
@@ -315,7 +344,7 @@ checklist and this plan, preserving failed runs and superseded conclusions.
    intervene downstream with explicit site, rows and metrics. Retain null,
    mixed and adverse results. Check reference variation independently; do not
    blame the model, dismiss a failure as noise or move a gate without proof.
-   For this campaign execute C1/C2 and the revised fallbacks above.
+   For this campaign execute C2 and the revised fallbacks above.
 6. **Verify correctness at the claimed scope.** Run relevant existing CPU
    tests and review negative controls/admission errors. Proposed fixes need a
    reproducing regression before implementation and a passing regression
@@ -423,20 +452,30 @@ Do not mark planned work complete or alter historical evidence.
 
 ## Constraints (inherited, not renegotiated)
 
-Frozen gate/cases/thresholds/reference evidence; no gate redesign; no rerun
-selection; preserve all failing runs and burned names; fresh attempt names
-and capture roots per the runbook; every production change carries regression
-tests, clean image rebuild, fingerprints and a fresh frozen Q2 qualification
-run with all controls.
+The v1 gate and its evidence stay frozen as the historical record.
+Qualification uses gate v2 (with Amendment 1) only after operator sign-off.
+No rerun selection. Preserve all failing runs and burned names. Use fresh
+attempt names and capture roots per the runbook. Every production change
+carries regression tests, a clean image rebuild, fingerprints and a fresh
+registered Q2 qualification run with all controls. A production v24 change
+must additionally:
+- prove v24 under the production toolchain/flags (the ablation used NVRTC
+  `--fmad=false`);
+- carry v24's own engagement controls;
+- cover the neighboring-types matrix.
 
 ## References (external to this repo)
 
 - Evidence root: `/home/colum/Workspace/atlas-exl3-validation-20261010/`
   (`statistical-gate-20261011/`, `q2-diagnostic-20261011/`,
   `q2-norm-replay-20261011/`, `q2-norm-ablation-20261012/`,
-  `q2-codepath-audit-20261012/`).
+  `q2-codepath-audit-20261012/`, `q2-c1-execution-20261012/`,
+  `q2-ref13-investigation-20261012/`, `q2-neighbor-matrix-20261012/`,
+  `q2-gate-v2-20261012/`).
 - Reference engine source (hash-pinned): `/home/colum/Workspace/vllm-reference-src/`
   + `/home/colum/Workspace/atlas-exl3-validation-20261010/arithmetic-audit/`.
 - In-repo: `q2-diagnostic.md` (experiment log), `todo.md` (G1–G9 follow-ups),
   `decisions.md`, `tests/exl3_validation/` (harnesses),
-  `docs/design/exl3-statistical-gate.md` (frozen gate design).
+  `docs/design/exl3-statistical-gate.md` (frozen v1 gate),
+  `docs/design/exl3-statistical-gate-v2.md` (v2 + Amendment 1, pending
+  sign-off).
