@@ -122,6 +122,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "causal_conv1d_update_prefill_tp_snap",
     "kda_recurrent_bf16_verify_rec_owners",
     "kda_commit_records",
+    "kda_commit_records_stride",
     "kda_sigmoid_gated_rms_norm",
 ];
 
