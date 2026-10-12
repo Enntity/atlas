@@ -53,6 +53,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "w4a16_gemv_tc16_pair_touch",
     "w4a16_gemv_tc32_pair_touch",
     "mxfp8_gemv_tc8",
+    "mxfp8_gemv_tc8_tiled",
     "mxfp8_gemv_tc8_touch",
     "mxfp8_gemv_tc16_touch",
     "mxfp8_gemv_tc32_touch",

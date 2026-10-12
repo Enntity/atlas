@@ -222,11 +222,14 @@ impl Qwen3AttentionLayer {
         let (q_latent, kv_latent) = (ctx.buffers.ssm_ba(), ctx.buffers.expert_gate_out());
         let keys = ctx.buffers.ssm_qkvz();
         let gates = keys.offset(n as usize * index_dim as usize * 2);
-        let proj = |w: crate::weight_map::Mxfp8Weight, out, rows: usize| ops::MxProj {
-            data: w.data,
-            scales: w.scales,
-            out,
-            n: rows as u32,
+        let proj = |w: crate::weight_map::Mxfp8Weight, out, rows: usize| {
+            debug_assert!(!w.tiled, "the fused front reads row-major q_a / kv_a twins");
+            ops::MxProj {
+                data: w.data,
+                scales: w.scales,
+                out,
+                n: rows as u32,
+            }
         };
         // The q_a / kv_a touch twins' geometry, where they ran (<= 16 rows).
         let touch = (n <= 16)
