@@ -348,6 +348,7 @@ pub(crate) async fn chat_completions_inner(
         prompt_tokens,
         enable_thinking,
         thinking_budget,
+        repeat_run,
     } = match prepared {
         Ok(p) => p,
         Err(resp) => return ChatOutcome::Http(resp),
@@ -359,7 +360,7 @@ pub(crate) async fn chat_completions_inner(
     let loop_detect::LoopDetectOut {
         suppress_tool_call,
         tool_call_repeat_count,
-    } = loop_detect::check_loops(&req.messages, tools_active);
+    } = loop_detect::check_loops(&req.messages, tools_active, repeat_run);
     let us_loop_detect = _t_seg.elapsed().as_micros() - us_prepare;
 
     let session_hash = crate::session_manager::compute_session_hash(&prompt_tokens);
