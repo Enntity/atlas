@@ -100,8 +100,11 @@ __device__ __forceinline__ __nv_bfloat162 mx_scale(unsigned int s) {
     return __halves2bfloat162(v, v);
 }
 
+// The body for weight-row tile `cta` (rows 16 * cta ..): the plain tiers'
+// CTA `blockIdx.x`, or a CTA of a launch that runs other work beside it
+// (glm_mla_fuse.cu).
 template <int NT>
-__device__ __forceinline__ void mxfp8_gemv_tc_impl(
+__device__ __forceinline__ void mxfp8_gemv_tc_cta(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ W,
     const unsigned char* __restrict__ S,
@@ -110,7 +113,8 @@ __device__ __forceinline__ void mxfp8_gemv_tc_impl(
     unsigned int N,
     unsigned int K,
     unsigned int lda,
-    unsigned int out_stride
+    unsigned int out_stride,
+    unsigned int cta
 ) {
     // E4M3 byte -> BF16 bits (exact).
     __shared__ unsigned short s_e4m3[256];
@@ -125,7 +129,7 @@ __device__ __forceinline__ void mxfp8_gemv_tc_impl(
     const unsigned int warp = threadIdx.x / MX_WARP;
     const unsigned int lane = threadIdx.x % MX_WARP;
     const unsigned int g = lane >> 2, c = lane & 3u;
-    const unsigned int r0 = blockIdx.x * 16u + g, r1 = r0 + 8u;
+    const unsigned int r0 = cta * 16u + g, r1 = r0 + 8u;
     const bool v0 = r0 < N, v1 = r1 < N;
     const unsigned long long blocks = K / MX_BLOCK;
     const unsigned char* w0p = W + (unsigned long long)(v0 ? r0 : 0u) * K;
@@ -200,6 +204,14 @@ __device__ __forceinline__ void mxfp8_gemv_tc_impl(
             if (n < N && m < M) C[(unsigned long long)m * out_stride + n] = __float2bfloat16(v);
         }
     }
+}
+
+template <int NT>
+__device__ __forceinline__ void mxfp8_gemv_tc_impl(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C, unsigned int M,
+    unsigned int N, unsigned int K, unsigned int lda, unsigned int out_stride) {
+    mxfp8_gemv_tc_cta<NT>(A, W, S, C, M, N, K, lda, out_stride, blockIdx.x);
 }
 
 extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8(
