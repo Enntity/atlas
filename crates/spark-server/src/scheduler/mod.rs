@@ -100,6 +100,7 @@ use decode_logits_content::*;
 use decode_logits_seq::*;
 use decode_logits_step::*;
 use decode_step::*;
+pub(crate) use emit_step::set_tool_value_markers;
 use emit_step::*;
 pub use helpers::WatchdogParams;
 pub(crate) use helpers::parse_disable_watchdogs;
