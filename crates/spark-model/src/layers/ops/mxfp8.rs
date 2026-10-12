@@ -90,7 +90,7 @@ fn parse_tiled(value: Option<&str>) -> Result<bool> {
 }
 
 /// `ATLAS_GLM_MXFP8_TILED` as set (read once): the GLM MLA q_b and o twins
-/// and the split verify head's shard take [`mxfp8_tile16`]'s layout at load
+/// and the split verify head's shard take the `mxfp8_tile16` kernel's layout at load
 /// and the `mxfp8_gemv_tc{8,16,32}_tiled` tiers. Every output bit is the
 /// row-major tiers' (the same values into the same MMAs in the same order);
 /// each warp's 64-value chunk of 16 rows is one contiguous KiB instead of
