@@ -93,6 +93,8 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "moe_build_tile_worklist",
     "moe_build_tile_worklist_scan",
     "quantize_bf16_to_nvfp4",
+    "glm_moe_router_quant",
+    "glm_moe_route_select",
     "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale_compact_gate_up",
     "silu_mul_quant_nvfp4",
     "moe_w4a4_grouped_gemm_prequant_t_k128",
