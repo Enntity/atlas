@@ -176,6 +176,9 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_SHARED_TP_SPLIT", || {
         Ok(moe::shared_tp_split_requested() as u64)
     }),
+    ("ATLAS_GLM_DENSE_TP_SPLIT", || {
+        Ok(layers::dense_ffn::dense_tp_split_requested()? as u64)
+    }),
     // Same bytes either way; agreed so a pair never mixes the routing
     // chains it was measured with.
     ("ATLAS_GLM_MOE_ROUTE_FUSE", || {
