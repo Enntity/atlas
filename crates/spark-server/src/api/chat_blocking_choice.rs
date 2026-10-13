@@ -159,15 +159,16 @@ pub(super) fn build_choice_message(
         msg_content = msg_content.map(|c| super::strip::strip_orphan_tool_markup(&c));
     }
 
-    // Refusal classifier: when the model's assistant text opens with
-    // a known refusal pattern AND no tool call fired, populate
-    // `refusal` and null out `content` per the OpenAI spec.
+    // Refusal classifier: when the model's assistant text opens with a
+    // known refusal pattern AND no tool call fired, populate `refusal`.
+    // The full assistant text stays in `content` alongside it — streaming
+    // emits the whole text plus a `Refusal` delta, and nulling `content`
+    // here would drop every sentence after the first.
     if msg_tool_calls.is_none()
         && let Some(content_text) = msg_content.as_deref()
         && let Some(refusal_sentence) = crate::refusal::detect(content_text)
     {
         msg_refusal = Some(refusal_sentence);
-        msg_content = None;
     }
 
     // Validated wire tool calls → IR (arguments are serde-normalized
