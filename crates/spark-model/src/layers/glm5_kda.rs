@@ -107,6 +107,12 @@ pub struct Glm5KdaLayer {
     native_mhc: Option<super::glm5_exl3_mhc::NativeExl3Mhc>,
     native_aux: Option<native_aux::NativeKdaAux>,
     upstream_trace: Option<upstream::UpstreamTrace>,
+    /// C2 norm-substitution knob (spec D1): parsed and validated once per
+    /// model load, shared by every KDA layer. Engages at the layer-0 `gated`
+    /// output (`forward_attention.rs`); `Some` also fail-fasts the
+    /// multi-sequence path (`multi_seq.rs`, assumption A9).
+    norm_substitution:
+        Option<std::sync::Arc<spark_runtime::weights::exl3::norm_substitution::NormSubstitution>>,
     layer_idx: usize,
     ssm_ordinal: usize,
     indexed_trace_logged: std::sync::atomic::AtomicBool,

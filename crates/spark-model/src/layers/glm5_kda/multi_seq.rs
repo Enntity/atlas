@@ -32,6 +32,11 @@ impl Glm5KdaLayer {
         stream: u64,
     ) -> Result<()> {
         self.ensure_policy_off("multi-sequence decode")?;
+        if let Some(substitution) = &self.norm_substitution {
+            // Assumption A9: the frozen comparison profile admits one
+            // sequence — error here, never substitute on this path.
+            substitution.reject_multi_seq()?;
+        }
         self.validate_exl3_forward(num_seqs, ctx, stream)?;
         let independent = crate::model::glm_independent::selected(ctx, num_seqs)?;
         ensure!(

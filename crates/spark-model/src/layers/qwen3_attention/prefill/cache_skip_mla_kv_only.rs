@@ -112,6 +112,7 @@ impl Qwen3AttentionLayer {
             // The KV-only caller owns explicit slots but intentionally has no
             // attention metadata. Index population consumes only slot + rows.
             let index_ctx = ForwardContext {
+                request_id: ctx.request_id.clone(),
                 attn_metadata: Some(crate::layer::AttnMetadataDev {
                     positions: DevicePtr::NULL,
                     positions_h: DevicePtr::NULL,

@@ -268,3 +268,13 @@ Operator decision: C1 → Option 1 (close from native captures, flagged).
 | Ablation harness test gaps / review nits | Pi agent branch `pi/ablation-hardening-20261012` (see todo "Deferred hardening"). |
 | C1–C11 doc staleness | Fixed in continue.md, todo.md, decisions.md, q2-diagnostic.md and the causality plan. Append-only logs keep history with SUPERSEDED/CORRECTED markers. |
 | Orphaned untracked files | Left untouched pending the operator's decision. |
+
+### Gate follow-up — Amendment 2 (2026-10-12)
+
+The A3 disposition above records Amendment 1 at that time. The operator's
+subsequent requested review/correction produced
+[Amendment 2](docs/design/exl3-statistical-gate-v2.md) and the
+[pinned vLLM source contract](docs/design/exl3-vllm-reference-contract.md).
+A1.2 top-ups are withdrawn; N is fixed, H4 edge cases are explicit, and
+collection awaits final sign-off plus evaluator verification. No new
+qualification evidence was collected.

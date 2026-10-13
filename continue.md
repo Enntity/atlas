@@ -1,104 +1,129 @@
 # GLM-5.3 EXL3 on two Sparks — continuation state
 
-[todo.md](todo.md) is the authoritative remaining-work checklist; this file
-holds the restart context, current verdict, and the evidence/profile/host
-pointers. Sequencing SSOT:
-[docs/plans/q2-norm-causality-plan.md](docs/plans/q2-norm-causality-plan.md);
-decisions: [decisions.md](decisions.md); append-only experiment log:
-[q2-diagnostic.md](q2-diagnostic.md) (its latest entry, "post-review
-corrections", supersedes earlier C1/v24/gate-v2 claims). Latest review:
+Restart context for the GLM-5.3 EXL3 serving effort: where things stand, how
+to resume safely, and where the evidence is. The work itself (roadmap,
+active batch, backlog) is in **[todo.md](todo.md)**. This file does not
+duplicate it.
+
+**Read order on restart:**
+1. This file, sections 1–3.
+2. [todo.md](todo.md) "Roadmap" and "Now".
+3. [docs/plans/q2-norm-causality-plan.md](docs/plans/q2-norm-causality-plan.md)
+   for the active experiment.
+4. The last entries of [q2-diagnostic.md](q2-diagnostic.md) and
+   [decisions.md](decisions.md).
+5. The `AGENTS.md`/`CONTRIBUTING.md` rules and the measurement-discipline
+   skill before any numerical claim.
+
+The latest review and its disposition table are in
 [CODE_REVIEW_2026-10-12.md](CODE_REVIEW_2026-10-12.md). Superseded narrative
 is in git history.
 
-## Current verdict (2026-10-12, post-review)
+## 1. Status at a glance (2026-10-12)
 
-- **Q2: candidate not qualified.** Under the frozen v1 gate (historical
-  record) the candidate `cand-fp8decode02` FAILS on rank (T 7.20 vs refs
-  5.04–5.53) plus 3 catastrophic short16 `longer` rows; the ulp control
-  fails the same way. Reports: `statistical-gate-20261011/final/`.
-- **Held-out `ref13` failure explained:** reference-internal bimodality at
-  short16 `longer`/r0.
-  - Recurring byte-identical mode in 3/15 draws (CP95 [0.043, 0.481]; 2/14
-    if the triggering draw is excluded); 15 draws fall into 6 byte classes.
-  - The mechanism (likely a discrete runtime choice) is unidentified, and
-    "fingerprint-identical" covers configuration only.
-  - Diagnosis: v1 was **underpowered at N = 9 under a bimodal row, with
-    session drift not excluded**. Three fresh repeats scored T above the
-    archived range. Evidence: `q2-ref13-investigation-20261012/`.
-- **Gate v2** (`docs/design/exl3-statistical-gate-v2.md`, `f8061ad8` + P2
-  fixes and **Amendment 1**, `fd7b530b`) is the qualification rule going
-  forward. It was authored from reference-only data. Amendment 1 adds:
-  - randomised interleaved run order;
-  - a reference-only composition VOID + capped top-up;
-  - disclosures that H3 is v1's rule unchanged and H4 is stricter.
+| Area | Status | Pointer |
+|---|---|---|
+| Boot and generation (TP=2/EP=1, native EXL3) | Works; 5/5 launch smoke; production containers **stopped** | §4 |
+| Numerical qualification (Q2) | **Not qualified.** v1 gate FAIL (historical); gate v2 + Amendments 1–2 implemented/CPU-verified; collection authorised; Luna owns preflight and campaign | §2, todo M1 |
+| Dominant cause of divergence | **Unproven.** C2 (layer-0 intervention) is next | todo "Now" #3 |
+| API behavior (Q3) | Partial: focused live slice 15/15 on `ee5eaf0f` | todo Q3 |
+| Task quality (Q4) | Harness only; no live run | todo Q4 |
+| Performance (P0) | Unqualified diagnostic only (decode ~0.45 s/token); Nsight driver prepared, not run | todo P0 |
+| Serving features (F1–F4), release (R1/R2) | Not started | todo |
+| In flight | **Luna `collect_gate_v2`: qualification preflight and campaign authorised.** Prior checkpoint: Hosts inspected idle 2026-10-12T22:04Z (`$EV/host-inspection-20261012T2204Z/`); the CPU C2 tooling batch landed (todo “Now” #3 first sub-item, commits `f8e9859f`/`3f9e5ee4`) | §3 |
 
-  **Not signed off; no v2 data collected.**
-- **Gated-norm attribution is fixture-local.** `v24-minimal` reproduces the
-  reference on **7/7 differing elements across 2 independent (rank × prompt)
-  groups**. The 16 fixtures are nested prefixes, and two groups never
-  differed. v24 introduced no new differences.
-  - Limits: v24 was chosen after seeing these fixtures, and other variant
-    pairs were never run.
-  - The replay used NVRTC `--fmad=false`; production flags are unverified.
-  - `v24-minimal` carried no engagement controls of its own, and the
-    repaired harness has never run on a GPU.
-  - Evidence: `q2-norm-ablation-20261012/`.
-- **C1 (layer-0 local o_proj) CLOSED from native captures** (operator
-  decision 2026-10-12):
-  - No same-input projection difference: byte-identical outputs on 8/8
-    identical-input rows.
-  - The natural ≤1-ULP norm delta is absorbed on rank0 (6 input elements
-    differ, 0 output elements) and confined to one token on rank1 (109
-    elements, max |Δ| 6.1e-5).
-  - **FLAG:** "corrected input ⇒ reference output" is inferred from 8 rows
-    of 2 prompts, and the candidate o_proj input precision is unattested.
-  - The BF16 replay harness was built on an invalid premise (both engines
-    multiply EXL3 trellis weights) and is archived (`651ff083`, tag
-    `archive/c1-bf16-o-proj-replay-20261012`). Evidence + erratum:
-    `q2-c1-execution-20261012/ERRATUM-20261012.md`.
-- **Dominant final-logit cause: unproven.** Per-case excess concentrates in
-  short16 `arithmetic`, then `longer`, then `index-boundary-2048`. Known
-  internal differences: the layer-0 gated-norm ≤1 ULP and layer-3 expert
-  membership changes. Downstream causality is unmeasured; C2 measures it.
-- **Neighboring-types matrix instantiated** (49 rows; none passed). v24 reaches
-  exactly `kernels/gb10/common/kda.cu:565` at runtime (GLM-KDA only) but is
-  build-reachable by all 30 targets; fused twins must be classified by any
-  shared-code fix. Evidence: `q2-neighbor-matrix-20261012/`.
-- The KV flag-name difference (candidate `fp8_g128` vs reference `auto` →
-  `fp8_ds_mla`) is not evidence of dtype asymmetry; G5 concerns effective
-  cache/attention-path equivalence.
-- No production numerical fix is qualified. No image was published, and
-  the production containers remain stopped.
+## 2. Established findings (what a restart must not re-derive)
 
-## Host state
+- **v1 gate verdict (historical record).** Candidate `cand-fp8decode02`
+  FAILS: rank T 7.20 vs refs 5.04–5.53, plus 3 catastrophic short16
+  `longer` rows; the ulp control fails the same way
+  (`statistical-gate-20261011/final/`). Candidate excess concentrates in
+  short16 `arithmetic` (29× the worst reference), then `longer`, then
+  `index-boundary-2048`.
+- **The reference is bimodal at `longer`/r0.**
+  - A byte-identical recurring mode appears in 3/15 draws (CP95
+    [0.043, 0.481]; 2/14 excluding the triggering ref13); 15 draws fall
+    into 6 byte classes.
+  - The mechanism is unidentified (likely a discrete runtime choice).
+    "Fingerprint-identical" covers configuration only.
+  - v1 was **underpowered at N=9 under a bimodal row, with session drift
+    not excluded**. It was not structurally unpassable.
+- **Gate v2** ([registered rule](docs/design/exl3-statistical-gate-v2.md),
+  original `f8061ad8`; P2 fixes + Amendment 1 `fd7b530b`; Amendment 2
+  follows the operator-requested Luna source review) uses reference-only calibration.
+  - It uses fixed N=15 references + H=3 held-outs, the v1 rank statistic T, v1's
+    envelope rule on every row, and a mode-membership rule.
+  - Randomised interleaving remains. Amendment 2 withdraws Amendment 1's
+    composition VOID/top-ups: an unverifiable reference set blocks qualification
+    at fixed N. H4 explicitly handles zero-distance/zero-radius cases.
+  - H3 constants stay fixed, but measured envelopes can widen with N. H4
+    can be stricter. The rank-only bound is not a whole-campaign guarantee.
+  - Evaluator checks completed (23 tests; six exact archived H5 replays).
+    Operator authorised collection; Luna `collect_gate_v2` owns final review/
+    freeze, host/image preflight and the campaign. No v2 qualification verdict
+    exists. See the evaluator verification report for durable replay receipts.
+- **Localized internal differences** (reviewed,
+  `q2-diagnostic-20261011/analysis/`):
+  - KDA core/g1/g2 match.
+  - Layer-0 gated norm differs by ≤1 BF16 ULP.
+  - L3 expert membership changes.
+  - Post-TP MoE p99 is 64–71 ULP.
+  - The earlier 1507-ULP and same-input-GEMM claims are retracted.
+- **Gated-norm attribution is fixture-local.** `v24-minimal` (rsqrt →
+  sqrt.approx.ftz + div.full; divide → reciprocal multiply) reproduces the
+  reference on **7/7 differing elements across 2 independent groups** (the
+  16 fixtures are nested prefixes).
+  - v24 was chosen after seeing the fixtures.
+  - The replay used NVRTC `--fmad=false`.
+  - `v24-minimal` has no engagement controls of its own.
+  - The repaired harness has never run on a GPU.
+- **C1 (layer-0 local o_proj) is closed** from native captures by operator
+  decision:
+  - zero same-input projection difference on 8/8 identical-input rows;
+  - the natural norm delta is absorbed on rank0 and confined to one token
+    on rank1.
 
-Nothing is in flight. At the last checkpoint (2026-10-12, end of the
-overnight drive) both Sparks had 0 running containers. This was not
-re-verified since; inspect both hosts before any GPU work.
+  **Flag:** "corrected input ⇒ reference output" is inferred, and the
+  o_proj input precision is unattested; C2's first measurement discharges
+  this. Both engines multiply EXL3 trellis weights (the reference uses an
+  FP16 input for ≤144 rows), so never replay o_proj over a BF16
+  reconstruction. The old harness is archived (tag
+  `archive/c1-bf16-o-proj-replay-20261012`).
+- **Neighbor matrix:** 49 rows, none passed. v24 reaches only
+  `kernels/gb10/common/kda.cu:565` at runtime (GLM-KDA) but is
+  build-reachable by all 30 targets.
+- **KV dtype:** candidate `fp8_g128` matches the reference's `auto` →
+  `fp8_ds_mla` format. The flag names differ, but that is not a dtype
+  asymmetry. G5 concerns effective path equivalence.
+- **Pinned vLLM is authoritative for reference behavior.** The
+  [source contract](docs/design/exl3-vllm-reference-contract.md) records the
+  Luna review and parent source checks: the bound SM120 short-prefill path
+  reads packed cache too; logits are captured after the head/TP gather and
+  before sampling. Seed 42/fresh processes do not guarantee deterministic
+  forward logits. The recurring mode's cause remains unidentified.
+- **Source has changed since the tested `ee5eaf0f` image** (gated-norm
+  capture `1def024c`, atomic FFN records `651ff083`, and the 2026-10-12 C2
+  tooling batch `f8e9859f`/`3f9e5ee4` — diagnostic knob + request-ID
+  threading). Any new collection needs a fresh image plus a neutrality
+  proof.
+- No production numerical fix is qualified, and no image was published.
 
-## Next actions (ordered; details in todo.md "Next batch")
+## 3. Before any GPU work
 
-1. **Gate v2 sign-off.** The operator reviews the amended
-   `exl3-statistical-gate-v2.md`. Recommended first: a cheap probe of the
-   ref13 discrete mechanism (autotune/plan, NCCL algorithm, routing tie
-   pinning). v2 collection only after sign-off.
-2. **C2.** Layer-0 norm-output substitution (reference-exact; v24 is
-   byte-identical to it) on both ranks, traced through o_proj → routing →
-   MoE → final logits against the failing rows. Needs a new off-by-default
-   knob with a neutrality proof. Captures use `Exl3FfnRouter`.
-3. **L1 escalation** for `longer`: complete mHC residual streams + L1 KDA
-   between matching L0 outputs and differing L1 FFN inputs.
-4. **G-fallbacks** (G2–G7 with G8/G9 binding first), reusing archived receipts.
-5. **Repeat Rust/vLLM/source review** on actual candidate artifacts. This
-   and the neighbor matrix are a hard prerequisite for any shared-code fix.
-6. **Production v24 gated-norm fix**, only behind:
-   - C2 causality evidence;
-   - a GPU rerun with v24's own controls under the repaired harness;
-   - proof under production compile flags;
-   - neighbor coverage;
-   - a fresh v2 qualification run.
+1. Inspect both hosts: containers (`docker ps -a`), GPU processes, image
+   IDs, flags and health. Confirm nothing else owns the GPUs, and
+   coordinate one experiment owner across both ranks.
+2. Record which image the stopped `glm53-exl3-atlas-*` containers reference
+   (§4). This is unverified.
+3. Use fresh attempt names and capture roots. Never reuse burned names or
+   delete failed attempts. `/tmp` logs are not durable evidence; archive
+   to the evidence root (§6).
+4. For any new image: no-cache build, source/image/PTX fingerprints on both
+   ranks, a neutrality proof against the frozen baseline, and
+   cuBLAS classic **and** Lt runtime mappings verified (§6).
+5. Append a shutdown/teardown receipt when releasing the hosts.
 
-## Preserved production profile (currently stopped)
+## 4. Production profile (preserved, currently stopped)
 
 - Repository: `/home/colum/Workspace/RustroverProjects/atlas`.
 - Branch: `sparkglm/installable-20260924` (original roadmap review was
@@ -109,10 +134,12 @@ re-verified since; inspect both hosts before any GPU work.
   `glm53-exl3-atlas-1` on spark1, port 8000, restart policy `unless-stopped`.
 - Last recorded production image: `atlas-exl3-validation:src-48624a8605de-rust1.97.1`
   (`sha256:82b23cd19e595cae5e96616e726a64f2f4b964416d31268210bf24f3e686c737`).
-  The Q0 clean image `src-8b6b47f14d5b-rust1.97.1` (`sha256:e744b81d…`, from
-  `fb4f4b41`) was later loaded on both nodes. **Which image the stopped
-  `glm53-exl3-atlas-*` containers reference is unverified:** run
-  `docker inspect` on both hosts before any restart. Source snapshot IDs are
+  **Verified 2026-10-12:** the stopped `glm53-exl3-atlas-0/-1` containers
+  reference exactly this image on both hosts (receipt:
+  `$EV/host-inspection-20261012T2204Z/`; tool:
+  [scripts/inspect-sparks.sh](scripts/inspect-sparks.sh)). The Q0 clean
+  image `src-8b6b47f14d5b-rust1.97.1` (`sha256:e744b81d…`, from
+  `fb4f4b41`) was later loaded on both nodes. Source snapshot IDs are
   not Git commits.
 - Launcher: [scripts/start-glm53-exl3-tp2.sh](scripts/start-glm53-exl3-tp2.sh).
   On the corresponding host: `RANK=0 bash scripts/start-glm53-exl3-tp2.sh` or
@@ -139,7 +166,7 @@ The previous smoke-derived rate must not become a decode baseline: its wall
 interval includes request/prefill time, and the receipt lacks a complete run
 fingerprint. Preserve the raw receipt rather than promote its rate to a target.
 
-### Hosts and evidence locations
+## 5. Hosts and access
 
 Inventory/configuration: `~/Workspace/homelab-ansible`.
 
@@ -148,51 +175,46 @@ ssh -o BatchMode=yes -o ConnectTimeout=15 -J colum@192.168.1.50 colum@10.50.0.10
 ssh -o BatchMode=yes -o ConnectTimeout=15 -J colum@192.168.1.50 colum@10.50.0.11
 ```
 
-If the numeric jump route times out, use the user-corrected jump hostname
-`ai-node` (observed Tailscale address `100.121.137.95`) instead of the old
-numeric LAN route.
+If the numeric jump route times out, use the jump hostname `ai-node`
+(observed Tailscale address `100.121.137.95`). The `~/.local/bin/spark0` /
+`spark1` wrappers ssh via the jump host. The Sparks have no SSH trust
+between each other.
 
-spark0 is `gx10-eb0e`; spark1 is `gx10-235f`. Recorded hardware: GB10, 48 SMs,
-approximately 121 GiB unified memory each, driver 580.159.03, host CUDA 13.0 /
-nvcc 13.0.88. Fabric addresses are `192.168.100.1` / `.2`. Launcher interfaces:
-spark0 `enp1s0f0np0` / `rocep1s0f0`; spark1 `enp1s0f1np1` / `rocep1s0f1`.
-It currently selects one HCA per rank and `NCCL_CROSS_NIC=0`.
+- spark0 is `gx10-eb0e`; spark1 is `gx10-235f`.
+- Hardware: GB10, 48 SMs, ~121 GiB unified memory each, driver 580.159.03,
+  host CUDA 13.0 / nvcc 13.0.88.
+- Fabric addresses: `192.168.100.1` / `.2`.
+- Launcher interfaces: spark0 `enp1s0f0np0` / `rocep1s0f0`; spark1
+  `enp1s0f1np1` / `rocep1s0f1`. The launcher uses one HCA per rank and
+  `NCCL_CROSS_NIC=0`.
 
-Durable evidence root: `/home/colum/Workspace/atlas-exl3-validation-20261010`.
-Paths in the evidence table below are relative to it. Some large reference
-arrays remain on the hosts; `/tmp` logs alone are not durable evidence. Before
-GPU work, inspect both hosts' containers, GPU processes, image IDs, flags and
-health. Coordinate one experiment owner across both ranks.
+## 6. Numerical contract and evidence
 
-## Numerical contract (essentials)
+**Checkpoint:**
+- hidden size 4096; 45 layers (34 KDA, 11 MLA);
+- 42 routed MoE layers from layer 3; 288 experts, sigmoid top-8,
+  normalization 2.5, groups 1/1;
+- expert intermediate 2048 globally / 1024 locally; one shared expert;
+- physical vocabulary 154880, tokenizer 154856;
+- absent `mhc_post_mult_value` takes the named reference policy (2.0);
+  conflicting values are rejected.
 
-The checkpoint has hidden size 4096, 45 layers (34 KDA, 11 MLA), 42 routed MoE
-layers beginning at layer 3, 288 experts, sigmoid top-8, normalization 2.5,
-groups 1/1, expert intermediate 2048 globally / 1024 locally, and one shared
-expert. Physical vocabulary is 154880; tokenizer size is 154856. Absent
-`mhc_post_mult_value` is handled by the explicit named reference policy (2.0),
-with conflicting values rejected.
+**Frozen comparison profile:** TP=2/EP=1, reference requested KV `auto`
+(effective MLA `fp8_ds_mla`), candidate `fp8_g128`, eager, context 4096,
+chunk 128, one-sequence admission, no prefix caching or speculation. These
+are qualification settings, distinct from the preserved serving launch in §4. The
+long-prefix cases keep 2047/2048/2051/2053 tokens and registered
+continuations. Absolute-threshold reports are diagnostics. The registered
+statistical gate decides qualification: v1
+(`docs/design/exl3-statistical-gate.md`) is the historical record, and v2
+(with Amendments 1–2) applies once signed off and implemented/verified.
 
-The frozen comparison profile is TP=2 / EP=1, BF16 KV, eager execution,
-context 4096, chunk 128, C1 admission, no prefix caching or speculation. Its
-absolute-threshold reports remain diagnostic records; the user-approved
-statistical gate and registered effective FP8 KV profile decide numerical
-qualification. The v1 rule (`docs/design/exl3-statistical-gate.md`) is the
-historical record. `docs/design/exl3-statistical-gate-v2.md` (with
-Amendment 1) is the rule going forward once signed off. "C1 admission" here
-means one-sequence admission, not experiment C1.
-Long-prefix cases retain 2047/2048/2051/2053 tokens and registered
-continuations.
+### Evidence index
 
-Earlier stage-level status bullets (KDA closure records, layer-3 `fp8_ds_mla`
-identification, absolute-threshold short16 records, first-divergence notes)
-are superseded narrative — see Current verdict above and Evidence index below.
-
-## Evidence index
-
-These records preserve prior results; restore and verify their hashes before
-reusing them. A build, CPU test, component oracle and full-model gate prove
-different scopes.
+Durable evidence root: `/home/colum/Workspace/atlas-exl3-validation-20261010`
+(paths below are relative to it). Some large reference arrays remain on the
+hosts. Restore and verify hashes before reusing a record. A build, CPU test,
+component oracle and full-model gate each prove a different scope.
 
 | Evidence under the durable root | Recorded result / limitation |
 |---|---|
@@ -239,15 +261,15 @@ Required pair from `nvidia-cublas` 13.1.1.3:
   in the loader path. Verify actual classic **and** Lt mappings after runtime
   dlopen on both ranks; on-disk presence alone is insufficient.
 
-## Historical fold (preserved elsewhere)
+## 7. Background references
 
-- Q3 source fixes (`7e04679f` first-token seed threading, `f7791189` Anthropic
-  streamed stop_sequence; multi-token stop branch
-  `6f25cb8c`/`c4644ca5`/`264667b9`/`e39790e0` on `pi/q3stop-20261011`) are
-  included in the tested `ee5eaf0f` image; detail removed from this file on
-  2026-10-12 — see git history.
-- Dated background reviews remain useful: [code review](CODE_REVIEW_2026-10-10.md),
-  [kernel review](GB10_KERNEL_OPTIMIZATION_REVIEW_2026-10-10.md),
-  [prior-art corrections](GB10_PRIOR_ART_CROSSREF_2026-10-10.md) — head
-  transport finding open; legacy NVFP4 advice and prior-engine rates are not
-  native EXL3 results.
+- Q3 source fixes (`7e04679f` first-token seed threading, `f7791189`
+  Anthropic streamed stop_sequence, multi-token stop branch on
+  `pi/q3stop-20261011`) are in the tested `ee5eaf0f` image.
+- Dated reviews:
+  - [code review 2026-10-10](CODE_REVIEW_2026-10-10.md);
+  - [code review 2026-10-12](CODE_REVIEW_2026-10-12.md);
+  - [kernel review](GB10_KERNEL_OPTIMIZATION_REVIEW_2026-10-10.md);
+  - [prior-art corrections](GB10_PRIOR_ART_CROSSREF_2026-10-10.md). The
+    head transport finding is still open. Legacy NVFP4 advice and
+    prior-engine rates are not native EXL3 results.

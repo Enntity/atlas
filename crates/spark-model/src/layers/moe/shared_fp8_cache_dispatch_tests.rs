@@ -75,6 +75,7 @@ fn fixture_capacity(
         routed_lora_layers: None,
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+        request_id: None,
     };
     run(&mut layer, &mut ctx, &gpu);
 }

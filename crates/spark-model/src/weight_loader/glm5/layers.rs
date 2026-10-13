@@ -26,6 +26,15 @@ pub(super) fn load_all(
         config.max_position_embeddings >= 2048 && config.index_topk == 2048,
         "GLM-5 Atlas bring-up expects index_topk=2048"
     );
+    // C2 norm-substitution knob (spec D1): parsed and validated ONCE per model
+    // load (fail fast), shared by every KDA layer for the layer-0 engagement
+    // and the multi-sequence fail-fast.
+    let norm_substitution =
+        spark_runtime::weights::exl3::norm_substitution::NormSubstitution::from_env(
+            config.tp_rank,
+            config.tp_world_size,
+        )?
+        .map(std::sync::Arc::new);
     let variant = detect_nvfp4_variant(store, config);
     let qctx = QuantizeCtx {
         absmax_k: gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
@@ -57,6 +66,7 @@ pub(super) fn load_all(
                     gpu,
                     None,
                     None,
+                    norm_substitution.clone(),
                 )?));
             }
             LayerType::FullAttention => {

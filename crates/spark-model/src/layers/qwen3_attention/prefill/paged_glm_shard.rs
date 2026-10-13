@@ -194,6 +194,7 @@ impl Qwen3AttentionLayer {
             during(&ForwardContext {
                 comm: Some(fenced),
                 midchunk_capture: None, // as in every owner's context
+                request_id: ctx.request_id.clone(),
                 ..*ctx
             })
         })?;

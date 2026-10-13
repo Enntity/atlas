@@ -1,9 +1,12 @@
 # EXL3 statistical logit gate v2 — pre-registration
 
 Status: **pre-registered rule; no qualification data collected under it.
-Amendment 1 (2026-10-12, pre-collection) applied — see the "Amendment 1"
-section; operator sign-off on the amended rule is still required before any
-v2 collection.**
+Amendments 1 and 2 (2026-10-12, pre-collection) applied. Amendment 2
+supersedes adaptive top-ups with fixed N = 15 and defines H4 edge cases.
+A separate v2 evaluator and production-path fixtures are implemented;
+archived-reference verification is recorded in
+[the verification report](exl3-statistical-gate-v2-verification-20261012.md).
+Evaluator review/freeze and rule sign-off remain prerequisites to collection.**
 Authored 2026-10-12 from reference-side data only, before any collection it
 governs. Operator decision: `decisions.md` 2026-10-12 ("full v2
 pre-registration authorized"). The v1 rule
@@ -31,7 +34,7 @@ so its measured envelope (3 × 0.00132 → floor 0.005) could not admit a
 draw that landed in it. Separately, the exchangeability-rank bar (max of 9
 near-tied T values) missed three fresh held-outs by 0.034–0.057.
 
-v2's operative repair is **N ≥ 15** (with H = 3 held-outs and an explicit
+v2's operative repair is **fixed N = 15** (with H = 3 held-outs and an explicit
 leave-one-out rank exemption), so that the ensemble fills the bar and covers
 demonstrated modes. The per-row envelope (H3) is v1's catastrophic-row
 formula unchanged (c = 3, same floors, same leave-one-out check), stated for
@@ -58,12 +61,14 @@ requires the fresh collection specified below.
 
 H0: the candidate's teacher-forced logits are exchangeable with one more
 fresh reference run, at the resolution of the measured per-row chaos
-envelope and the measured reference modes. Under H0 the rank condition's
-false-fail probability is at most 1/(N+1) = 1/16. The remaining conditions
-are deterministic rules, leave-one-out verified on the references; whether
-they pass under H0 still depends on the random ensemble composition
-(probabilistic, controlled by the held-out rule and Amendment 1's void
-rule).
+envelope and the measured reference modes. For the fixed, pre-designated
+N = 15 ensemble, exchangeability of all N+1 runs and symmetric scoring imply
+a marginal rank-only false-fail bound of 1/(N+1) = 1/16. This is not a bound
+on the whole gate or conditional on passing reference-composition/held-out
+checks. H1–H4 can reject additional runs. Three held-outs are operational
+controls; passing does not prove exchangeability or establish a campaign
+false-reject rate. Amendment 2 keeps N fixed rather than selecting it from
+reference outcomes.
 
 ## Metrics (unchanged from v1)
 
@@ -115,10 +120,24 @@ among the N references at row r:
 2. G ≥ G_MIN = 4.0 (calibrated: the largest gap ratio any non-mode row
    reaches is 18.89 (`short16/code/r3`), and every non-mode row reaching
    G_MIN fails step 3 — see below);
-3. single-linkage at t = sqrt(d_lo · d_hi) must yield **exactly two**
+3. single-linkage at t = sqrt(d_lo · d_hi), joining distances ≤ t, must yield **exactly two**
    components M_1, M_2, and the separation
    sep = min cross distance / max within-component distance must satisfy
    sep ≥ K_MIN = 20.
+
+**Zero-distance and tie semantics (Amendment 2; apply before the gap scan).**
+Byte classes use the recorded canonical FP32 row bytes. One byte class is
+not multimodal. Exactly two byte classes with positive cross-class sym-KL
+and zero within-class distances demonstrate two modes directly: the classes
+are the components, sep = +infinity, and rho_r = 0. This avoids dropping
+all within-mode evidence when step 1 excludes zero distances. Distinct byte
+classes with zero sym-KL do not demonstrate separated modes by this exception.
+For the ordinary scan, fewer than two positive distances means no
+demonstration; tied largest ratios select the first pair in ascending sorted
+order. Define a singleton's within-component spread as zero. Positive cross
+distance divided by zero within-component spread means +infinity; zero over
+zero does not demonstrate separation. No NaN/undefined division is accepted.
+These semantics apply unchanged to candidate and leave-one-out evaluations.
 
 Calibration: genuine-mode separation is 25.6–42.4 in **every** subset of
 size 11..15 of the 15 draws, and no non-mode row demonstrates in any of the
@@ -140,7 +159,8 @@ values are byte-identical share a class):
   size the rule is exercised on — 11 through 15, candidate-outside and
   member-inside checks — is 1.652, always at `short16/longer/r0`,
   draw ref13rep5; C_RHO = 2 keeps ≥ 20 % headroom and keeps the radius ≥
-  20× tighter than the 0.056 mode gap);
+  20× tighter than the 0.056 mode gap); when rho_r = 0, membership requires
+  byte identity with a component center (no implicit epsilon or ULP allowance);
 - **byte/ULP class evidence** (reported for every gated row): whether the
   evaluated row is byte-identical to a reference byte-class, which class,
   else the max |Δlogit| and max f32-ULP distance to the nearest class;
@@ -153,6 +173,11 @@ multi-modality in the 15-draw set — short16 `longer` row 0, modes
 {12 draws} / {ref13, ref13rep2, ref13rep3}, sep 25.6, rho_r = 0.001395.
 Leave-one-out membership: **0 failures in 15 checks** (and 0 in the
 12-member and 11-member emulation subsets).
+
+The zero-radius rule is intentionally strict: an ULP-perturbed candidate can
+fail the must-pass ULP control in this case, blocking qualification. Do not
+add a tolerance after seeing such a result. Archived calibration predates
+these edge-case definitions; evaluator fixtures must cover them before use.
 
 **Mode-frequency report (diagnostic, not a gate condition).** At every
 demonstrated row the report must state the reference mode frequencies
@@ -205,7 +230,8 @@ reportable p-value is 1/(N+1) = 1/16.
 archived ensemble (ref04–ref12) missed 3 of 5 fresh held-outs, by margins
 +0.0341, +0.0398, +0.0568 (`H_n9_vs_n14`). Re-evaluating the **same draws**
 under the N=14 structure: exactly **1/15** fails — the single global-max
-draw (ref13rep3); the excess misses were the 9-draw bar. Running the full
+draw (ref13rep3). This comparison changes ensemble size/composition and pools
+sessions, so it does not isolate sample size from drift. Running the full
 v2 rule on the archived N=9 structure still fails 4 of 6 held-outs
 (`H2_v2_rule_at_N9`): the redesign does **not** substitute for N — the
 9-draw ensemble misses the H-mode, its envelope cannot contain it, and the
@@ -224,11 +250,12 @@ runs, pre-designated by attempt name before evaluation, each evaluated as
 the candidate under the entire v2 rule (H1–H5, including verifiability)
 against the N=15 ensemble. **Pass rule: all three pass.** Bounds under
 exchangeability, no independence assumed: family-wise rank false-alarm
-≤ H/(N+1) = 3/16 = 0.1875 (the independence value 0.176 is an upper bound
-here; the three events share the ensemble, and the shared-ensemble exact
-value under the scalar-order model is 1/6 ≈ 0.167). Ensemble-composition events
-(lone-mode unverifiable, missed-mode) are shared across the three and are
-measured by the same control: any control failure blocks qualification.
+≤ H/(N+1) = 3/16 = 0.1875, marginally under exchangeability at fixed N.
+The candidate-dependent scores are recomputed separately for each held-out;
+no independence or fixed scalar-order exact value is claimed for this gate.
+Ensemble-composition events (lone-mode unverifiable, missed-mode) can affect
+all three. Any control failure blocks qualification; three passes do not
+establish exchangeability or guarantee coverage of unseen modes.
 
 **Validated on the 15 draws** (`I_heldout_splits`): all 455 splits of
 12-ensemble + 3-held-out were evaluated under the full v2 rule — the
@@ -279,20 +306,22 @@ reference mean (α = 2, 4, 6) are detected 15/15 by rank already at α = 2,
 
 ## Collection protocol (fresh; nothing archived may be reused)
 
-- **Profile:** the registered collector-only profile of v1 — unmodified
+- **Profile:** the registered collector-only profile of v1 — unchanged pinned
   reference image `glm53-flash-mikeroz:dt-carry20`, the pinned create
   commands and observers (hashes in the v1 doc: `ref-rank0/1-create-
   command.json`, `sitecustomize.py`, `reference_chunk_trace.py`,
   `ATLAS_EXL3_CHUNK_RUNNER_SHA256`), registered context-v4 serve flags
-  (4096 context, 128 prefill chunk, TP2/EP1, BF16 KV→fp8_ds_mla, eager, no
+  (4096 context, 128 prefill chunk, TP2/EP1, reference requested KV `auto`
+  with effective MLA `fp8_ds_mla`; candidate `fp8_g128`; eager, no
   speculation, no prefix caching), marker-gated logits collector and the
-  serial128 CPU chunk-position observer only, all dump/capture envs
-  absent, `collect_logits.py` then `collect_phase_logits.py`, serial
+  serial128 CPU chunk-position observer only. Intermediate-stage dump and
+  head-input capture envs are absent; registered logits/chunk envs remain.
+  Run `collect_logits.py` then `collect_phase_logits.py`, serial
   requests, temperature 0 / seed 42 / max_tokens 1, suites short16 + long
   in fixed order. **Never mix configurations, images, or instrumented
   builds in one set.** Candidate runs use the registered candidate profile
   (image identity recorded before any request, as in the v1 addendum).
-- **Runs (all fresh containers, one serve process each, ~8 min each):**
+- **Runs (all fresh containers, one serve process each):**
   1. `v2ref01..v2ref15` — the N = 15 reference ensemble;
   2. `v2refho01..v2refho03` — the H = 3 held-out references,
      pre-designated by attempt name before evaluation;
@@ -301,10 +330,29 @@ reference mean (α = 2, 4, 6) are detected 15/15 by rank already at α = 2,
   4. `v2pert-*` — five candidate runs, one semantic perturbation each;
   5. `v2mde` — candidate profile with `ATLAS_KDA_FLA_REFERENCE=0`
      (measured, not gated).
-- **Evaluation:** each of the 18 reference runs is evaluated as the
-  candidate against the 15-run ensemble under H1–H5; all 3 held-outs must
-  pass. The candidate pair, ulp-control, negative controls, perturbations
-  and MDE follow. Provenance, manifests, captures, reports and the frozen
+- **Order and state:** freeze the 20-run seeded permutation before the first
+  request (Amendment 1 A1.1). Within each attempt, preserve serial short16
+  then long collection. Fresh processes control process-local state; mounted
+  compilation/autotune caches can persist and must be recorded, not silently
+  reset. See the [pinned vLLM source contract](exl3-vllm-reference-contract.md).
+- **Cache-state receipt:** before startup and after shutdown on both ranks,
+  archive a manifest for each registered vLLM, Triton, TileLang, CUDA compute
+  and EXL3 tune-cache mount: host/container path, whether shared across
+  attempts, and sorted relative file paths with size and SHA256 (including
+  an explicit empty/missing state). Record pre/post changes; do not copy,
+  purge or reseed caches during the campaign. A changed cache is reported
+  process-external state, not proof of a mode's cause. Missing receipts make
+  provenance incomplete. Apply the same accounting to candidate cache mounts
+  where present; explicitly record absence otherwise.
+- **Evaluation:** check H3/H4 verifiability on the 15 references with each
+  evaluated reference excluded from its comparison set. LOO H5 scores are
+  diagnostic, not required to pass. Evaluate each of the three held-outs
+  against the fixed 15-reference ensemble; all three must pass applicable
+  H1 provenance/finite checks and H2–H5. Candidate-pair byte identity and
+  negative controls are campaign checks, not a requirement that distinct
+  reference draws match each other. The candidate pair, ulp-control, negative
+  controls, perturbations and MDE follow. No sample compares against itself.
+  Provenance, manifests, captures, reports and the frozen
   `compare_logits.py` secondary record are archived per attempt.
 - **Verdict semantics:** v2 produces its own verdict; it is not
   comparable to the v1 verdict (historical notes below).
@@ -336,11 +384,15 @@ range from the 0.15 floor to 5.73 (long/2053/r0).
 
 ## What this rule does and does not claim (explicit)
 
-This redesign **repairs the control; it does not excuse the candidate.**
-It removes false-fails caused by the reference's own measured chaos — a
-multi-valued row, an envelope below the reference's cross-mode distance, a
-bar too low to be stable at N=9. It does **not** widen any tolerance
-beyond what reference data measures: a candidate whose deviation exceeds
+This redesign **addresses reference-control failures; it does not excuse
+the candidate.** Fresh collection must establish whether the amended control
+passes. Finite-sample composition, discrete rules and session effects can
+still reject a reference-identical engine. Constants are unchanged, but the
+measured H3 envelope can widen with N; this is not equivalent strictness to v1.
+A PASS means this image meets H1–H5 and the controls on the registered
+fixtures and observed profile. It does not establish identical output
+distributions, mode frequencies, task quality or release readiness.
+A candidate whose deviation exceeds
 the measured chaos envelope at any row, whose T exceeds every reference's,
 or that lands **between** the measured modes at a demonstrated-bimodal row
 fails. Sub-chaos-floor arithmetic correctness remains the domain of the
@@ -350,11 +402,11 @@ stage-level byte oracles (v1 scope note, unchanged).
 
 - **Mode-rate uncertainty.** The H-mode rate is bracketed 3/15, CP95
   [0.043, 0.481]. P(a fresh 15-draw ensemble has ≤ 1 mode draw) is 0.167
-  at the point estimate and 0.86 at the CP lower bound; such an ensemble
-  is unverifiable (lone far draw) and the gate fails closed. P(0 mode
+  at the point estimate and 0.86 at the CP lower bound. Exactly one isolated
+  mode draw can make verifiability fail; zero mode draws can pass it. P(0 mode
   draws) = 0.035 at p̂; a candidate landing in an unseen mode then fails
-  the envelope (false-fail, fail-closed). The held-out controls measure
-  exactly these events.
+  the envelope (false-fail, fail-closed). Held-outs can reveal a missing mode
+  but are not guaranteed to sample it.
 - **Discrete sensitivity.** In the N=12 emulation, held-out argmax/text at
   long/index-boundary-2053/r1 produced 26/1365 discrete fails (0/15 at
   N=14 LOO). The rule is unchanged; qualification at N=15 re-measures it.
@@ -367,10 +419,15 @@ stage-level byte oracles (v1 scope note, unchanged).
 
 ## Amendment 1 (2026-10-12, pre-collection)
 
+**Historical amendment, partially superseded by Amendment 2 below.** A1.1
+randomisation and A1.3/A1.4/A1.6 remain applicable. A1.2 is withdrawn; the
+A1.5 composition-risk statement is corrected below.
+
 Source: independent review `CODE_REVIEW_2026-10-12.md` (finding A3), applied
 before any v2 collection. Authored from reference-side reasoning only, with
-no candidate numbers. It changes collection order and adds a void rule for
-reference-ensemble composition. It loosens no threshold.
+no candidate numbers. The then-current amendment changed collection order
+and added the now-withdrawn void rule for reference-ensemble composition.
+Its numeric constants were unchanged.
 
 **A1.1 Interleaved, randomised run order.** The 20 runs `v2ref01..15`,
 `v2refho01..03`, `v2cand01`, `v2cand02` are executed in a random
@@ -383,19 +440,11 @@ ensemble's range (5.80/5.84/5.94 against a maximum of 5.76–5.89), while the
 same-session ref13 sat well inside. Sequential reference → held-out →
 candidate collection would load any drift onto the candidate.
 
-**A1.2 Reference-composition void + top-up.** Before any held-out or
-candidate is evaluated, check the H3/H4 leave-one-out verifiability on the
-reference ensemble alone. If it fails, the campaign is **VOID, not FAIL**:
-- Collect 5 more fresh references under the same profile, in random
-  position relative to any not-yet-run candidate/held-out runs.
-- Add them to the ensemble, retaining every draw (no draw may be discarded
-  or selected), and re-check.
-- At most 2 top-ups (N ≤ 25). If the ensemble is still unverifiable after
-  the cap, the gate fails closed.
-
-The check uses reference data only, so no candidate information can
-influence it. Held-out, candidate, rank and envelope failures are never
-voidable. Rank arithmetic uses the final N (bound 1/(N+1)).
+**A1.2 Reference-composition void + top-up — SUPERSEDED.** The original
+amendment allowed two reference-only top-ups to N ≤ 25 and claimed a
+final-N rank bound. Amendment 2 withdraws both the top-ups and that bound:
+reference-only adaptive stopping does not establish the exchangeability
+needed by the fixed-N rank argument. Original text: commit `fd7b530b`.
 
 **A1.3 Disclosures.**
 - H3 is v1's catastrophic-row rule (same c, floors and leave-one-out
@@ -419,7 +468,8 @@ withdrawn. v2 remains justified by N, the explicit leave-one-out rank
 exemption (v1's every-LOO-must-pass text is incoherent) and H4.
 
 **A1.5 Additional residual risks.**
-- *Session non-exchangeability* (A1.1 mitigates; the held-outs measure it).
+- *Session non-exchangeability* (A1.1 mitigates temporal confounding; held-out
+  failures can expose a problem, but passing does not prove exchangeability).
 - *Mode-rate selection.* The 3/15 rate includes ref13, the draw that
   triggered the investigation. Excluding it gives 2/14; fresh draws alone
   give 2/5.
@@ -436,8 +486,10 @@ exemption (v1's every-LOO-must-pass text is incoherent) and H4.
   fresh held-outs are out-of-sample.
 - *Single-campaign false reject.* For a reference-identical engine, before
   A1.2, the combined probability is roughly 0.35 at p̂ = 0.2 and worse at
-  the CP lower bound. A1.2 removes the composition component; the rank
-  components remain.
+  the CP lower bound. The withdrawn A1.2 could not eliminate composition risk:
+  its cap could be reached, and a wholly absent mode need not trigger its
+  check. Amendment 2 retains fixed-N composition risk explicitly. The rough
+  estimate is not a validated false-reject rate for the amended campaign.
 
 **A1.6 Errata in `calibrate_v2.py`** (evidence script left unchanged; the
 results are unaffected):
@@ -447,6 +499,52 @@ results are unaffected):
   strictest.
 - Definition selection (lines 366–373) is data-driven ("first with 0 LOO
   failures"), as A1.5 discloses.
+
+## Amendment 2 (2026-10-12, pre-collection): fixed design and source contract
+
+Operator request: apply the review recommendations after a Luna subagent
+reviews the exact vLLM process; use pinned vLLM source as authoritative for
+engine behavior. Source report and parent reconciliation:
+[exl3-vllm-reference-contract.md](exl3-vllm-reference-contract.md).
+No qualification data was collected or candidate result used for this revision.
+
+**A2.1 Fixed collection and verdicts.** N = 15, H = 3, two candidate runs;
+all attempt names, engine identities, the random seed/permutation and exact
+perturbation layers are recorded before collection. There are no composition
+top-ups, replacement draws or outcome-driven sample-count changes. Every draw
+is retained. H3/H4 reference verifiability failure terminates the campaign as
+`UNVERIFIABLE` (qualification blocked), not a numerical verdict on the candidate.
+A held-out/control failure blocks qualification; a candidate rule failure is
+FAIL. Missing/corrupt artifacts or interrupted runs are INCOMPLETE and cannot
+PASS. All reasons and attempts remain archived. Any retry requires a separately
+registered campaign retaining this campaign's outcome; never silently repeat
+until PASS or present a successful retry as the only result.
+
+The `1/16` H5 bound is marginal, rank-only, conditional on the exchangeability
+assumption, and applies to the fixed experiment rather than campaigns selected
+for passing other checks. Whole-campaign error rates are not established here.
+
+**A2.2 H4 completeness.** The operative H4 section now defines exact two-class
+zero-spread modes, zero radius, singleton spread, zero denominators and gap
+ties. Do not introduce a tolerance or fallback clustering rule at runtime.
+
+**A2.3 Source-bound interpretation.** Preserve registered observer mounts,
+request/suite order and effective KV formats. The selected reference SM120
+path reads cache even for short prefill. Seed 42 and a fresh process do not
+promise deterministic forward logits. The recurring mode's mechanism is still
+unidentified. A probe changing runtime policy is separate diagnostic work;
+using that policy for qualification requires another pre-collection amendment.
+
+**A2.4 Implementation readiness.** This is a documentation revision, not a
+claim that the v1 evaluator implements v2. Before collection, freeze and review
+an evaluator with fixtures for H3/H4 LOO exclusion, two exact byte classes,
+zero cross-distance, zero radius/ULP control failure, singletons, tied gaps,
+fixed attempt order/counts, blocked/incomplete campaigns and held-out isolation.
+Verify unchanged T against the archived reference-only calibration. Recheck
+H4 calibration with the edge-case definitions and archive any differences;
+the old calibration alone does not validate the amended implementation.
+These checks and evaluator review/freeze precede qualification collection.
+Operator collection authorisation is recorded in `decisions.md` (2026-10-12).
 
 ## Historical notes
 

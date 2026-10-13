@@ -40,6 +40,12 @@ impl ModelWeightLoader for Glm5WeightLoader {
         true
     }
 
+    /// `load_all` calls `NormSubstitution::from_env` (spec D1) — this load
+    /// path engages the C2 substitution knob.
+    fn engages_norm_substitution(&self) -> bool {
+        true
+    }
+
     fn load_layers(
         &self,
         store: &WeightStore,

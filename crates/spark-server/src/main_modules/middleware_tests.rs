@@ -83,3 +83,38 @@ fn health_endpoints_still_answer_while_faulted() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// request-id resolution (assumption A8): one id per request, shared by the
+// response header and the admission binding.
+// ---------------------------------------------------------------------------
+
+/// A client-supplied `x-request-id` wins; an absent id is minted fresh in the
+/// `req_<uuid v4>` form, never reused.
+#[test]
+fn client_request_id_wins_over_the_generated_one() {
+    assert_eq!(super::resolve_request_id(Some("req-client")), "req-client");
+    let first = super::resolve_request_id(None);
+    let second = super::resolve_request_id(None);
+    assert!(first.starts_with("req_") && second.starts_with("req_"));
+    assert_ne!(first, second, "generated ids are fresh UUID v4 mints");
+}
+
+/// `take_request_id` returns exactly what the middleware resolved — the same
+/// value the response header carries.
+#[test]
+fn take_request_id_returns_the_middleware_resolved_binding() {
+    let bound = super::take_request_id(Some(axum::extract::Extension(super::RequestId(
+        "req-bound".to_string(),
+    ))));
+    assert_eq!(bound, "req-bound");
+}
+
+/// NEGATIVE (n2 review fix): outside the middleware there is no id to take.
+/// A silent fallback mint could diverge from the response-header id and
+/// unbind the C2 request-id contract, so this must fail hard instead.
+#[test]
+#[should_panic(expected = "openai_observability_middleware")]
+fn take_request_id_refuses_to_mint_outside_the_middleware() {
+    let _ = super::take_request_id(None);
+}

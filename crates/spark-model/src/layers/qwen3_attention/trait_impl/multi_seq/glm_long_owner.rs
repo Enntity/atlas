@@ -52,6 +52,7 @@ impl Qwen3AttentionLayer {
             let first = owner * rows;
             stage.copy(ctx.gpu, &ffn_spans[..1], 0, first, rows, false, stream)?;
             let owner_ctx = ForwardContext {
+                request_id: ctx.request_id.clone(),
                 attn_metadata: Some(input.meta),
                 midchunk_capture: None,
                 ..*ctx

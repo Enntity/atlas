@@ -560,6 +560,9 @@ impl TransformerModel {
             // adapter here REFUSES loudly rather than fold one adapter onto every
             // packed row. Inert when no MoE adapter is installed (hook no-ops).
             moe_lora_route: crate::layer::MoeLoraRoute::Refuse,
+            // Codispatch packs multiple requests: no single request binding
+            // exists (the C2 knob errors on this pass rather than guess).
+            request_id: None,
         };
 
         // h_state_ptrs scratch slot offset (used JIT per SSM layer).

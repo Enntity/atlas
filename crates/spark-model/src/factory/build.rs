@@ -71,6 +71,11 @@ pub fn build_model(
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn Model>> {
+    // Review finding m3: a set C2 norm-substitution knob on a model whose
+    // load path does not engage it would be silently ignored — refuse before
+    // ANY other work so every model type pays the check (including the NLLB
+    // early return below).
+    super::refuse_unengaged_norm_substitution(&config, &store)?;
     if store.exl3_checkpoint().is_some() {
         super::preflight_glm53_tp2_packed(&config, gpu.as_ref(), max_batch_tokens)?;
     }

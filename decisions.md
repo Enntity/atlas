@@ -7,6 +7,78 @@ this file references them, it does not duplicate them. Newest first.
 Superseded entries are kept as one-line stubs marked **SUPERSEDED**, so the
 audit trail survives; their full text is in git history.
 
+## 2026-10-12 — v2 qualification collection authorised (major)
+
+- Operator instruction: finish the replay and verification reports, then launch
+  a Luna subagent to perform the required qualification collection runs.
+- Final replay completed: all six archived H5 comparisons exact; parent reran
+  the 23 v1/v2 CPU tests. Durable receipts and corrected final H5 receipt hash
+  are in `docs/design/exl3-statistical-gate-v2-verification-20261012.md`.
+- This authorises the amended fixed-N campaign and necessary build/preflight
+  work. Do not ask again for collection sign-off. Review/freeze the evaluator,
+  inspect both hosts and ownership, pin a fresh candidate image and prove
+  neutrality/provider identity before qualification requests. If a concrete
+  prerequisite fails, report it and preserve the attempt; do not relax rules.
+- Luna owns both ranks for this campaign. No publication or numerical PASS is
+  implied by this authorisation; the full evaluator and controls decide.
+
+## 2026-10-12 — gate v2 Amendment 2 and pinned vLLM source review (major)
+
+- Operator request: make the review corrections after launching a Luna
+  subagent to review vLLM source, compare its report with the plan, and use
+  vLLM as the source of truth for reference behavior. This authorises the
+  documentation revision, not a new qualification run or numerical verdict.
+- Implemented recommendation: retain fixed N=15 and H=3, remove adaptive
+  composition top-ups and their unproved final-N rank bound. Preserve all
+  attempts; unverifiable reference composition blocks qualification. Explicit
+  H4 zero-distance/zero-radius semantics and evaluator checks are now required.
+- Source review reconciled in `docs/design/exl3-vllm-reference-contract.md`:
+  pinned installed plugin/observer paths override generic checkout assumptions;
+  SM120 short prefill reads packed FP8 cache; capture precedes sampling;
+  seed/fresh process is not a forward-determinism guarantee. Mode cause remains
+  unproven. Statistical qualification policy is Atlas's responsibility.
+- Amendment 2 in `docs/design/exl3-statistical-gate-v2.md` supersedes A1.2.
+  Randomisation remains. PASS is scoped to fixtures/profile, not distributional
+  identity, task quality or release. Final rule sign-off and evaluator
+  verification remain prerequisites for collection; no data collected here.
+- Lesson: inspect the exact installed vLLM path and existing reconciliation
+  before using a generic source branch or archived audit narrative as authority.
+
+## 2026-10-12 — C2 batch: full execution tooling, in-engine request binding (major)
+
+- Operator decisions 2026-10-12 (batch kickoff questionnaire).
+- Scope: (a) Rust knob only; (b) knob + fixture tooling; (c) full C2
+  execution tooling. **Decision: (c)** — knob, fixture assembly, A/B run
+  driver and the plan-fixed scoring, all CPU-side. Contract:
+  `docs/plans/c2-tooling-spec.md`.
+- Request binding: (a) invocation manifest + out-of-band receipt;
+  (b) thread request ID into `ForwardContext`; (c) one request per
+  process. **Decision: (b).** Strictest in-engine enforcement
+  (`request_id` mismatch errors the run); accepted the production-path
+  edit and its owed GPU neutrality proof. Why not (a): the plan demands
+  binding to exact request IDs, and an out-of-band receipt cannot reject
+  in-engine. Why not (c): 8 requests × 2 ranks × A/B × repeats of
+  container restarts is operationally worse than one added field.
+- Tensor-hash semantics: (a) payload integrity + recorded pre-substitution
+  hash; (b) strict A/B pre-hash binding; (c) payload integrity only.
+  **Decision: (a).** Reject now on missing/mismatched fixture; record the
+  candidate's pre-substitution `gated` sha256 so A/B alignment and byte
+  determinism are checked post-hoc. Why not (b): a run-B abort on any
+  benign upstream change destroys the treatment run for no gain — the
+  alignment evidence is identical, only the enforcement point moves.
+- Effect: implementation delegated per root AGENTS.md (medium/large task),
+  independent review subagent on the diff.
+
+## 2026-10-12 — Host inspection command in `scripts/`, not a Justfile (minor)
+
+- Contraindication raised: root AGENTS.md routes remote-host manual ops to
+  the project's Justfile; this repo has no Justfile and its pattern is
+  `scripts/*.sh` (`scripts/start-glm53-exl3-tp2.sh`).
+- Operator decision 2026-10-12: **`scripts/inspect-sparks.sh`.** Repo
+  consistency wins for this repo; the Justfile rule is explicitly
+  overridden here. Revisit if Atlas adopts `just`. Logged as A13 in
+  `docs/plans/c2-tooling-spec.md` §Constraints and assumptions.
+
 ## 2026-10-12 — C1 re-scoped: close from native captures (major)
 
 - Operator decision 2026-10-12, after the independent review
@@ -40,6 +112,9 @@ audit trail survives; their full text is in git history.
   superseded by the C1 re-scope above.
 
 ## 2026-10-12 — gate v2 Amendment 1 (major, pending sign-off)
+
+**Partially superseded by Amendment 2 above:** the composition VOID/top-up
+rule is withdrawn. This entry records the earlier proposal, not current policy.
 
 - Source: independent review finding A3. Applied pre-collection to
   `docs/design/exl3-statistical-gate-v2.md` (`fd7b530b`), together with the
@@ -122,6 +197,20 @@ audit trail survives; their full text is in git history.
   superseded claims.
 - Limits: documentation/review only. (The "no gate redesign" limit is
   superseded by the v2 decision.)
+
+## 2026-10-12 — assumption log folded back: logging-convention entry stands (minor)
+
+- Contraindication surfaced by the independent review (m4): this batch
+  created root `assumptions.md` per global AGENTS.md, contradicting the
+  standing "validation-campaign logging convention" entry below (option
+  (c): no `assumptions.md`, SSOT rationale).
+- Operator decision 2026-10-12: **honor the standing entry.** The file
+  existed only within this batch and is deleted; its A1–A13 content is
+  folded into `docs/plans/c2-tooling-spec.md` §"Constraints and
+  assumptions" with IDs stable, so tooling citations keep resolving.
+- Why: the entry's SSOT rationale holds; the global rule is overridden
+  for this project by that operator choice. Lesson: read `decisions.md`
+  in full before creating new project-level artifacts.
 
 ## 2026-10-12 — validation-campaign logging convention (minor)
 

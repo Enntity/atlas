@@ -201,6 +201,19 @@ impl Glm5KdaLayer {
             norm_eps,
             stream,
         )?;
+        // C2 norm-substitution knob (spec D1 order): kernel → D2H pre-image →
+        // sha256 → H2D fixture bytes into `gated` → the `gated_norm` capture
+        // below (post-substitution) → the substitution record.
+        let substitution = spark_runtime::weights::exl3::norm_substitution::engage(
+            ctx.gpu,
+            self.norm_substitution.as_deref(),
+            self.layer_idx,
+            gated,
+            Bf16,
+            &[tokens, p],
+            ctx.request_id.as_deref(),
+            stream,
+        )?;
         self.capture_upstream(
             upstream,
             "gated_norm",
@@ -208,6 +221,9 @@ impl Glm5KdaLayer {
             ctx,
             stream,
         )?;
+        if let Some(pending) = substitution {
+            pending.record(ctx.gpu, gated, stream)?;
+        }
         profile::step(ctx, stream, &mut profile_timer, "gated_norm")?;
         det.tap("x_gated", gated, (0, tokens), p * bf16);
         if verify_proj {

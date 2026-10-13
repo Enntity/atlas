@@ -145,6 +145,7 @@ impl TransformerModel {
             routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
             midchunk_capture,
             moe_lora_route: self.moe_lora_route(seq.adapter_slot),
+            request_id: seq.request_id.clone(),
         };
 
         // When proc_count == 1 (warm prefix cache hit), use the decode layer path

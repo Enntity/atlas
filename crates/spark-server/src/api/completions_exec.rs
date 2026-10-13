@@ -55,6 +55,7 @@ pub(super) async fn run_blocking(
     req: &CompletionRequest,
     prompts: Vec<Vec<u32>>,
     p: CompletionParams,
+    request_id: String,
 ) -> Response {
     // n is validated to 1..=128 at the handler entry. The capacity is a
     // HINT clamped independently of user input (the vec grows amortized
@@ -77,6 +78,7 @@ pub(super) async fn run_blocking(
             let request = InferenceRequest::Blocking {
                 prompt_tokens: Arc::new(prompt_tokens.clone()),
                 session_hash,
+                request_id: request_id.clone(),
                 adapter_slot: p.adapter_slot,
                 src_lang_id: p.src_lang_id,
                 tgt_lang_id: p.tgt_lang_id,

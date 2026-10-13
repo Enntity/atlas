@@ -98,6 +98,7 @@ pub async fn chat_completions(
         std::sync::Arc<crate::main_modules::model_host::ModelHost>,
     >,
     req_ctx: Option<axum::extract::Extension<crate::rate_limiter::RequestContext>>,
+    request_id: Option<axum::extract::Extension<crate::main_modules::middleware::RequestId>>,
     body: axum::body::Bytes,
 ) -> Response {
     // Parse the body ourselves (instead of using axum's `Json`
@@ -195,7 +196,15 @@ pub async fn chat_completions(
     // Wire → IR at the edge: echo-only fields peel off beside the
     // envelope; everything downstream reads only the IR.
     let echo = ResponseEcho::from(&req);
-    match chat_completions_inner(state.clone(), req_ctx, req.into(), dump_seq).await {
+    match chat_completions_inner(
+        state.clone(),
+        req_ctx,
+        req.into(),
+        dump_seq,
+        crate::main_modules::middleware::take_request_id(request_id),
+    )
+    .await
+    {
         ChatOutcome::Blocking(ir) => {
             crate::openai::encode_chat_response(&state, *ir, &echo, dump_seq)
         }
@@ -216,6 +225,7 @@ pub(crate) async fn chat_completions_inner(
     req_ctx: Option<axum::extract::Extension<crate::rate_limiter::RequestContext>>,
     mut req: crate::ir::ChatRequest,
     dump_seq: Option<u64>,
+    request_id: String,
 ) -> ChatOutcome {
     crate::metrics::REQUESTS_TOTAL.inc();
     // RAII: decrements on EVERY exit path, including this future being dropped
@@ -442,6 +452,7 @@ pub(crate) async fn chat_completions_inner(
             dump_seq,
             prompt_tokens,
             session_hash,
+            request_id,
             adapter_slot,
             src_lang_id,
             tgt_lang_id,
@@ -484,6 +495,7 @@ pub(crate) async fn chat_completions_inner(
         req_ctx,
         prompt_tokens,
         session_hash,
+        request_id,
         adapter_slot,
         src_lang_id,
         tgt_lang_id,

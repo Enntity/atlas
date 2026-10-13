@@ -308,6 +308,7 @@ pub(super) fn spill_out_sequence(
     Ok(SwappedSeq {
         tokens,
         session_hash: a.session_hash,
+        request_id: a.seq.request_id.clone(),
         adapter_slot: a.seq.adapter_slot,
         adapter_id: a.seq.adapter_id,
         seq_len,
@@ -422,6 +423,7 @@ pub(super) fn resume_preempted_seq(model: &dyn Model, p: PreemptedSeq) -> Result
         }
     };
     seq.session_hash = a.session_hash;
+    seq.request_id = a.seq.request_id.clone();
     seq.disable_mtp = a.disable_mtp;
     seq.adapter_slot = a.seq.adapter_slot;
     // Task #24/#25 parity with the swap-in path: keep the STABLE adapter_id

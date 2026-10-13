@@ -173,6 +173,7 @@ impl Qwen4ExpMtpHead {
             routed_lora_layers: None,
             midchunk_capture: None,
             moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+            request_id: ctx.request_id.clone(),
         };
 
         // `decode_inner_hc` reads the persistent stream state from

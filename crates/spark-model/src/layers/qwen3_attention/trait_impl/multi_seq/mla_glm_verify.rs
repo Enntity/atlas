@@ -172,6 +172,7 @@ impl Qwen3AttentionLayer {
             return Ok(false);
         }
         let row_ctx = ForwardContext {
+            request_id: c.fwd.request_id.clone(),
             attn_metadata: Some(meta),
             midchunk_capture: None,
             ..*c.fwd

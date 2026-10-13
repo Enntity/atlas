@@ -232,6 +232,7 @@ impl TransformerModel {
             // rejected before the fold on these multi-seq/speculative paths
             // (reject_decode_lora), so Fold is inert here.
             moe_lora_route: self.decode_moe_route(),
+            request_id: seq.request_id.clone(),
             derived: &self.derived,
             levers: &self.levers,
             stats: &self.stats,

@@ -297,11 +297,12 @@ impl TransformerModel {
         let key = (step, wide, slots.to_vec(), rows, layer_idx);
         self.decode_pieces
             .run_with(key, self.gpu.as_ref(), ctx.comm, stream, |comm| {
-                // The decode contexts carry no mid-chunk capture (the one
-                // field that is not `Copy`).
+                // The decode contexts carry no mid-chunk capture and clone the request
+                // id (the two fields that are not `Copy`).
                 let ctx = ForwardContext {
                     comm,
                     midchunk_capture: None,
+                    request_id: ctx.request_id.clone(),
                     ..*ctx
                 };
                 let _staged = crate::layers::qsa::StagedIngest::enter(wide);

@@ -78,6 +78,7 @@ impl TransformerModel {
             let owner_ctx = ForwardContext {
                 attn_metadata: Some(metas[o]),
                 midchunk_capture: None,
+                request_id: ctx.request_id.clone(),
                 ..*ctx
             };
             if attention {

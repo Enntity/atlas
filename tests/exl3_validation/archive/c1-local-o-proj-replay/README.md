@@ -24,10 +24,11 @@ The Python modules raise `ImportError` unless `ATLAS_ALLOW_ARCHIVED_C1=1`
   (10–39 tokens) took the exllamav3 trellis path with an FP16 input cast.
   The overlay's receipt string `"torch linear (cuBLAS)"` was hard-coded,
   not observed.
-- The candidate's KDA projections run the EXL3 trellis kernels (FP16-input
-  numerics family). The BF16 "common comparison space" weight that the
-  binding recorded is a host-side reconstruction from the checkpoint. It was
-  never checked against the resident bytes.
+- The candidate's o_proj runs EXL3 trellis kernels. Its input precision
+  is **not attested** by any receipt; the KDA QKV projections use the
+  FP16-input numerics family. The BF16 "common comparison space" weight
+  that the binding recorded is a host-side reconstruction from the
+  checkpoint, never checked against the resident bytes.
 - So neither engine multiplies the bound BF16 weight. No f32/RNE replay over
   it can pass the self-anchor, and the WIP reference backend replays the same
   wrong (`rows > 144`) branch. The 6.3% cross-engine weight delta compares

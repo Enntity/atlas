@@ -552,6 +552,9 @@ pub(super) fn consume_budget(remaining: &mut usize) -> bool {
 pub(super) struct SwappedSeq {
     pub tokens: Vec<u32>,
     pub session_hash: u64,
+    /// Server request id preserved across spill/restore (assumption A8): a
+    /// swapped-then-resumed sequence must keep its `ForwardContext` binding.
+    pub request_id: Option<std::sync::Arc<str>>,
     /// M2 per-request LoRA routing: preserved across spill/restore so a
     /// swapped-then-resumed sequence keeps its adapter (unlike `cancel_flag`,
     /// which is intentionally dropped). CPU metadata, restored like `tokens`.

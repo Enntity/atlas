@@ -385,6 +385,7 @@ pub fn resume_swapped_seq(
     // Restore CPU-side metadata.
     seq.tokens = s.tokens;
     seq.seq_len = s.seq_len;
+    seq.request_id = s.request_id;
     seq.adapter_slot = s.adapter_slot;
     seq.adapter_id = s.adapter_id;
     // Task #25: swap-out released this seq's slot ref (via free_sequence); a

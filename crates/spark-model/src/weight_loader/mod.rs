@@ -212,6 +212,18 @@ pub trait ModelWeightLoader {
     /// See `weight_loader/minimax.rs` for the reference implementation.
     fn supports_tp(&self) -> bool;
 
+    /// Whether this loader's [`Self::load_layers`] engages the C2
+    /// norm-substitution knob (calls `NormSubstitution::from_env` — today only
+    /// `weight_loader/glm5/{exl3_layers,layers}.rs` do). Consulted by
+    /// `factory::refuse_unengaged_norm_substitution` so a model load that
+    /// cannot honour `ATLAS_EXL3_NORM_SUBSTITUTE_DIR` aborts loudly instead
+    /// of silently ignoring it. Default `false`; a loader that engages the
+    /// knob must override or the factory refuses its load while the knob is
+    /// set.
+    fn engages_norm_substitution(&self) -> bool {
+        false
+    }
+
     /// Load all transformer layers from the weight store.
     ///
     /// `layer_kv_dtypes` is indexed by attention layer index (0-based sequential

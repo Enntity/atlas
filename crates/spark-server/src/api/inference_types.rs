@@ -94,6 +94,11 @@ pub enum InferenceRequest {
         prompt_tokens: std::sync::Arc<Vec<u32>>,
         /// Session hash for SSM snapshot isolation (hash of first 64 prompt tokens).
         session_hash: u64,
+        /// Server request id (`x-request-id`, `main_modules/middleware.rs`;
+        /// client-supplied or generated) resolved at request admission. Carried
+        /// onto `SequenceState.request_id` and every `ForwardContext` of the
+        /// request (assumption A8).
+        request_id: String,
         /// M2 per-request LoRA routing: adapter pool SLOT this request applies
         /// (`-1` = defer to installed active; byte-identical to today). Set from
         /// the resolved `adapter` field; carried onto `SequenceState.adapter_slot`.
@@ -214,6 +219,8 @@ pub enum InferenceRequest {
         prompt_tokens: std::sync::Arc<Vec<u32>>,
         /// Session hash for SSM snapshot isolation (hash of first 64 prompt tokens).
         session_hash: u64,
+        /// Server request id resolved at admission. See the Blocking variant.
+        request_id: String,
         /// M2 per-request LoRA routing: adapter pool SLOT (`-1` = defer to
         /// installed active). See the Blocking variant.
         adapter_slot: i32,

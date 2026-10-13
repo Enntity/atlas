@@ -28,6 +28,8 @@ pub(super) struct BlockingPathArgs {
     pub req_ctx: Option<axum::extract::Extension<crate::rate_limiter::RequestContext>>,
     pub prompt_tokens: Vec<u32>,
     pub session_hash: u64,
+    /// Server request id resolved at admission (assumption A8).
+    pub request_id: String,
     /// M2 per-request LoRA routing: resolved adapter slot (`-1` = defer to active).
     pub adapter_slot: i32,
     /// Resolved source-language token id (0 = deployment default).
@@ -75,6 +77,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         req_ctx,
         prompt_tokens,
         session_hash,
+        request_id,
         adapter_slot,
         src_lang_id,
         tgt_lang_id,
@@ -130,6 +133,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         let request = InferenceRequest::Blocking {
             prompt_tokens: prompt_tokens.clone(),
             session_hash,
+            request_id: request_id.clone(),
             adapter_slot,
             src_lang_id,
             tgt_lang_id,

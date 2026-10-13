@@ -28,8 +28,9 @@ numerical policy for every model.
   (reference-internal bimodality). The long-suite 2048-token failure is
   unlocalized. Evidence: `statistical-gate-20261011/final/`.
 - Qualification rule going forward: gate v2
-  (`docs/design/exl3-statistical-gate-v2.md`, with Amendment 1), pending
-  operator sign-off and not yet collected. Diagnostic scoring in this plan
+  (`docs/design/exl3-statistical-gate-v2.md`, with Amendments 1–2), pending
+  final operator sign-off and evaluator verification; not yet collected.
+  Fixed N=15; no adaptive top-ups. Diagnostic scoring in this plan
   still uses the frozen v1 ensemble/metrics as fixed diagnostics.
 - Attributed gated-norm difference and correction:
   `q2-norm-ablation-20261012/analysis-20261012.md`. v24 = rsqrt form +
@@ -46,6 +47,11 @@ numerical policy for every model.
   `q2-diagnostic.md` "vLLM report reconciliation after independent review".
   The archived report is preserved; its missing-config, disputed-head-padding,
   never-replayed and short-live-latent claims are superseded there.
+  The operator-requested Luna source review and parent reconciliation are in
+  [the pinned vLLM reference contract](../design/exl3-vllm-reference-contract.md).
+  Use installed reference source/overlays and bound receipts as authoritative
+  for engine behavior; short-prefill cache effects remain in scope. Seed 42
+  and fresh processes do not establish deterministic forward arithmetic.
 - Frozen harness: `tests/exl3_validation/` (statistical gate +
   compare/parity protocol + the norm replay/ablation tooling).
 
@@ -127,6 +133,11 @@ from the native pre-reduce captures under `q2-c1-execution-20261012/` and
 - The 2048-token long-suite slice required an explicit operator scope
   extension; **granted 2026-10-12** (see decisions.md). It is authorized here
   subject to every other constraint in this plan.
+- **First C2 measurement (discharges the C1 flag):** B's layer-0 local
+  (pre-reduce) o_proj output must be byte-identical to the reference's
+  captured local output on the same rows. That directly measures the
+  corrected-input answer C1 only inferred. If it is not identical, record
+  the difference and re-open C1 before interpreting downstream deltas.
 - Because C1 found zero same-input o_proj error, a nonzero B−A at reduced
   attention or later is attributable to the substituted norm values
   propagating, not to o_proj arithmetic. That attribution still needs B's

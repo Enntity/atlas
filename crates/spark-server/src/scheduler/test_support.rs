@@ -165,6 +165,7 @@ macro_rules! test_request {
         InferenceRequest::$variant {
             prompt_tokens: std::sync::Arc::new(vec![1, 2, 3]),
             session_hash: 0,
+            request_id: "req-test".into(),
             adapter_slot: -1,
             src_lang_id: 0,
             tgt_lang_id: 0,

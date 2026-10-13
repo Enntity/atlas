@@ -47,6 +47,15 @@ pub fn load_layers(
     );
     // The single parse site for statistical-gate controls: native EXL3 only.
     let perturbation = crate::exl3_gate_perturbation::Exl3GatePerturbation::load_for_model(config)?;
+    // C2 norm-substitution knob (spec D1): parsed and validated ONCE per model
+    // load (fail fast), shared by every KDA layer for the layer-0 engagement
+    // and the multi-sequence fail-fast.
+    let norm_substitution =
+        spark_runtime::weights::exl3::norm_substitution::NormSubstitution::from_env(
+            config.tp_rank,
+            config.tp_world_size,
+        )?
+        .map(std::sync::Arc::new);
     let routed_layers = (0..config.num_hidden_layers)
         .filter(|l| !config.mlp_only_layers.contains(l))
         .count();
@@ -110,6 +119,7 @@ pub fn load_layers(
                         gpu,
                         scratch.as_ref().map(MoeScratch::borrow),
                         perturbation,
+                        norm_substitution.clone(),
                     )?));
                 }
                 LayerType::FullAttention => {

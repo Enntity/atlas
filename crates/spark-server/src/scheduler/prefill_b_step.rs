@@ -40,6 +40,7 @@ pub fn prefill_request(
     let logit_bias = req.logit_bias().to_vec();
     let req_min_tokens = req.min_tokens();
     let req_session_hash = req.session_hash();
+    let req_request_id: std::sync::Arc<str> = std::sync::Arc::from(req.request_id());
     let req_adapter_slot = req.adapter_slot(); // M2 per-request LoRA routing
     let req_src_lang = req.src_lang_id();
     let req_tgt_lang = req.tgt_lang_id();
@@ -131,6 +132,7 @@ pub fn prefill_request(
     // prefill hooks cannot touch shared MTP capture/eager-drafter state.
     seq.disable_mtp = req_disable_mtp;
     seq.session_hash = req_session_hash;
+    seq.request_id = Some(req_request_id);
     seq.adapter_slot = req_adapter_slot;
     seq.src_lang_id = req_src_lang;
     seq.tgt_lang_id = req_tgt_lang;

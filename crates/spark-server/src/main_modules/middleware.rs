@@ -6,6 +6,36 @@ use std::sync::Arc;
 
 use crate::rate_limiter;
 
+/// Resolved per-request id (assumption A8): the client's `x-request-id` or a
+/// minted UUID v4. Resolved ONCE per request in
+/// [`openai_observability_middleware`] and stored in the request extensions,
+/// so the admission binding (`InferenceRequest.request_id` →
+/// `SequenceState.request_id` → `ForwardContext.request_id`) and the response
+/// header share one value.
+#[derive(Clone, Debug)]
+pub(crate) struct RequestId(pub String);
+
+/// Client-supplied `x-request-id` wins; otherwise mint the same `req_<uuid
+/// v4>` form the response header uses.
+pub(crate) fn resolve_request_id(incoming: Option<&str>) -> String {
+    incoming
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("req_{}", crate::ids::uuid_v4()))
+}
+
+/// Handler-side extraction of the [`RequestId`] the middleware resolved.
+///
+/// Hard error on absence (n2 review fix): every call site is a route handler
+/// on the single router (`main_modules/serve_router.rs`), which layers
+/// [`openai_observability_middleware`] over every route and always inserts
+/// the extension — so a missing id is a wiring bug. The old fallback mint
+/// could diverge from the response-header id resolved by the middleware,
+/// silently unbinding the C2 request-id contract (assumption A8).
+pub(crate) fn take_request_id(ext: Option<axum::extract::Extension<RequestId>>) -> String {
+    ext.map(|axum::extract::Extension(id)| id.0)
+        .expect("request id must be resolved by openai_observability_middleware")
+}
+
 /// OpenAI-compatible observability headers. Injects on every `/v1/*`
 /// response:
 /// - `x-request-id`: UUID v4 generated per-request (re-used if client
@@ -17,7 +47,7 @@ use crate::rate_limiter;
 /// - `openai-organization`, `openai-version`: static stubs for
 ///   parity with `api.openai.com` — several wrappers log these.
 pub(crate) async fn openai_observability_middleware(
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::http::{HeaderName, HeaderValue};
@@ -28,12 +58,13 @@ pub(crate) async fn openai_observability_middleware(
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let rid = resolve_request_id(incoming_req_id.as_deref());
+    req.extensions_mut().insert(RequestId(rid.clone()));
     let mut resp = next.run(req).await;
     if !is_v1 {
         return resp;
     }
     let headers = resp.headers_mut();
-    let rid = incoming_req_id.unwrap_or_else(|| format!("req_{}", crate::ids::uuid_v4()));
     if let Ok(v) = HeaderValue::from_str(&rid) {
         headers.insert(HeaderName::from_static("x-request-id"), v);
     }

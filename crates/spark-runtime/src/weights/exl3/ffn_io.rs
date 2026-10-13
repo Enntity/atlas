@@ -18,13 +18,13 @@ pub enum DiagnosticDtype {
     I32,
 }
 impl DiagnosticDtype {
-    fn width(self) -> usize {
+    pub fn width(self) -> usize {
         match self {
             Self::Bf16 => 2,
             Self::F32 | Self::I32 => 4,
         }
     }
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Bf16 => "bf16-le",
             Self::F32 => "f32-le",

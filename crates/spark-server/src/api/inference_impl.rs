@@ -235,6 +235,15 @@ impl InferenceRequest {
         }
     }
 
+    /// Server request id (`x-request-id`) resolved at request admission.
+    /// Copied onto `SequenceState.request_id` at prefill (assumption A8).
+    pub fn request_id(&self) -> &str {
+        match self {
+            InferenceRequest::Blocking { request_id, .. } => request_id,
+            InferenceRequest::Streaming { request_id, .. } => request_id,
+        }
+    }
+
     /// M2 per-request LoRA routing: the adapter pool slot this request selects
     /// (`-1` = defer to installed active). Copied onto `SequenceState.adapter_slot`
     /// by the scheduler at prefill; the batched decode routes the bgmv on it.

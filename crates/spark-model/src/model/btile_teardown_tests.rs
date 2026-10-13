@@ -31,6 +31,7 @@ fn actual_model_teardown_invalidates_published_readers_and_frees_originals_once(
         routed_lora_layers: None,
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+        request_id: None,
     };
     let attention = model.layers[0]
         .as_any_mut()

@@ -25,6 +25,9 @@ impl Glm5KdaLayer {
         gpu: &dyn GpuBackend,
         routed_scratch: Option<crate::layers::glm5_exl3_ffn::MoeScratchBorrow>,
         perturbation: Option<crate::exl3_gate_perturbation::Exl3GatePerturbation>,
+        norm_substitution: Option<
+            std::sync::Arc<spark_runtime::weights::exl3::norm_substitution::NormSubstitution>,
+        >,
     ) -> Result<Self> {
         ensure!(
             config.linear_key_head_dim == 128,
@@ -96,6 +99,7 @@ impl Glm5KdaLayer {
             } else {
                 None
             },
+            norm_substitution,
             native_mhc,
             native_aux: None,
             layer_idx,

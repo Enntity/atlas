@@ -110,6 +110,7 @@ fn actual_prompt_index_and_causal_verify_dispatch() {
             routed_lora_layers: None,
             midchunk_capture: None,
             moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+            request_id: None,
         };
         let mut cache = PagedKvCache::new(
             KvCacheConfig {
@@ -164,6 +165,7 @@ fn actual_prompt_index_and_causal_verify_dispatch() {
             );
         }
         let graph_ctx = ForwardContext {
+            request_id: ctx.request_id.clone(),
             graph_capture: true,
             midchunk_capture: None,
             ..ctx

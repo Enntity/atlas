@@ -890,6 +890,7 @@ impl BlockDiffusionDraftHead {
         let ctx = &crate::layer::ForwardContext {
             comm: None,
             midchunk_capture: None,
+            request_id: ctx.request_id.clone(),
             ..*ctx
         };
         let n = last_tokens.len();
@@ -1002,6 +1003,7 @@ impl BlockDiffusionDraftHead {
             let prepare_ctx = &crate::layer::ForwardContext {
                 comm: batch_split.map(|(_, comm)| comm),
                 midchunk_capture: None,
+                request_id: ctx.request_id.clone(),
                 ..*ctx
             };
             let mut prepared = 0usize;

@@ -419,6 +419,7 @@ impl TransformerModel {
             routed_lora_layers: None,
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
+            request_id: crate::traits::single_request_id(decode_seqs),
         };
 
         let prefill_ctx = ForwardContext {
@@ -442,6 +443,7 @@ impl TransformerModel {
             routed_lora_layers: self.routed_slot_layers(prefill_seq.adapter_slot),
             midchunk_capture: None,
             moe_lora_route: self.moe_lora_route(prefill_seq.adapter_slot),
+            request_id: prefill_seq.request_id.clone(),
         };
 
         // Refuse a non-active-adapter decode row host-side (mirrors

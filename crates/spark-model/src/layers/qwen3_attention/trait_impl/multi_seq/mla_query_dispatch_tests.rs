@@ -86,6 +86,7 @@ fn query_batch_dispatch_boundary_fallback_and_guards() {
             routed_lora_layers: None,
             midchunk_capture: None,
             moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+            request_id: None,
         };
         let mut cache = PagedKvCache::new(
             KvCacheConfig {

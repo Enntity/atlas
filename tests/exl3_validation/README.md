@@ -475,3 +475,50 @@ CPU self-tests use a local fake server only and are not qualification:
 ```bash
 python3 -m pytest -q tests/exl3_validation/test_f2_f3_harness.py
 ```
+
+## EXL3 statistical gate v2
+
+`statistical_gate_v2.py` is a CPU evaluator for the pre-registered v2 rule in
+`docs/design/exl3-statistical-gate-v2.md`. It imports the unchanged v1 artifact
+loader, metric, discrete-rule and rank primitives. The v1 CLI and its historical
+results remain unchanged.
+
+Validate a frozen plan with:
+
+```bash
+PYTHONPATH=tests/exl3_validation python3 tests/exl3_validation/statistical_gate_v2.py \
+  --validate-plan campaign-plan.json --out plan-validation.json
+```
+
+The plan JSON uses schema `atlas-exl3-gate-v2-plan-v1`. It records `campaign_id`,
+integer `seed`, `attempt_order` (the 20 registered reference/held-out/candidate
+names shuffled with Python `random.Random(seed).shuffle`), the fixed
+`post_attempt_order`, the two selected routed layer indices, and exact engine
+identities (each has `engine` and a `build` object containing `commit`,
+`binary_sha256`, `source_sha256`, `image`). Validation does not start collection.
+
+The campaign JSON uses schema `atlas-exl3-gate-v2-campaign-v1` and contains
+`plan`, an `attempts` mapping from all 26 registered attempt names to comma-
+joined short16/long artifact directories, and a `cache_receipts` mapping. Each
+receipt has `pre_start` and `post_shutdown` entries with an attempt name,
+UTC capture time, and the ordered cache categories `vllm`, `triton`, `tilelang`,
+`cuda_compute`, `exl3_tune`. Every mount records host/container paths, sharing
+across attempts, explicit `present`/`empty`/`missing` state, and sorted
+relative-file size/SHA256 manifests. Receipts also prove attempts ran in the
+frozen order without overlap. Missing artifacts or receipts produce
+`INCOMPLETE`; failed reference LOO checks produce `UNVERIFIABLE`; complete
+campaigns report `PASS` or `FAIL`.
+
+Evaluate a recorded campaign with:
+
+```bash
+PYTHONPATH=tests/exl3_validation python3 tests/exl3_validation/statistical_gate_v2.py \
+  --campaign campaign.json --out gate-report.json
+```
+
+The evaluator only reads artifacts and receipts. It does not collect, retry,
+replace or top up attempts. Run the production-path fixtures with:
+
+```bash
+PYTHONPATH=tests/exl3_validation python3 -m unittest test_statistical_gate_v2
+```

@@ -96,8 +96,10 @@ fn validate_token_ids(state: &AppState, ids: &[u32]) -> Result<(), (StatusCode, 
 
 pub async fn completions(
     CurrentModel(state): CurrentModel,
+    request_id: Option<axum::extract::Extension<crate::main_modules::middleware::RequestId>>,
     req: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
+    let request_id = crate::main_modules::middleware::take_request_id(request_id);
     let Json(req) = match req {
         Ok(r) => r,
         Err(e) => {
@@ -272,13 +274,13 @@ pub async fn completions(
             );
         }
         let prompt_tokens = prompts.into_iter().next().expect("checked non-empty");
-        return match completions_stream(state, prompt_tokens, req, params).await {
+        return match completions_stream(state, prompt_tokens, req, params, request_id).await {
             Ok(r) => r,
             Err((status, msg)) => openai_error_response(status, msg),
         };
     }
 
-    super::completions_exec::run_blocking(state, &req, prompts, params).await
+    super::completions_exec::run_blocking(state, &req, prompts, params, request_id).await
 }
 
 /// SSE streaming path for legacy completions (single prompt, n=1, handler-
@@ -289,6 +291,7 @@ pub(super) async fn completions_stream(
     prompt_tokens: Vec<u32>,
     req: CompletionRequest,
     p: super::completions_exec::CompletionParams,
+    request_id: String,
 ) -> Result<Response, (StatusCode, String)> {
     // Match chat_stream/mod.rs sizing; see comment there.
     let (token_tx, token_rx) = tokio::sync::mpsc::channel::<StreamEvent>(1024);
@@ -328,6 +331,7 @@ pub(super) async fn completions_stream(
     let request = InferenceRequest::Streaming {
         prompt_tokens: std::sync::Arc::new(prompt_tokens),
         session_hash,
+        request_id,
         adapter_slot: p.adapter_slot,
         src_lang_id: p.src_lang_id,
         tgt_lang_id: p.tgt_lang_id,

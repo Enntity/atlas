@@ -25,6 +25,8 @@ pub(super) async fn dispatch_streaming(
     dump_seq: Option<u64>,
     prompt_tokens: Vec<u32>,
     session_hash: u64,
+    // Server request id resolved at admission (assumption A8).
+    request_id: String,
     // M2 per-request LoRA routing: resolved adapter slot (-1 = defer to active).
     adapter_slot: i32,
     // Resolved source-language token id (0 = deployment default).
@@ -83,6 +85,7 @@ pub(super) async fn dispatch_streaming(
         state,
         prompt_tokens,
         session_hash,
+        request_id,
         adapter_slot,
         src_lang_id,
         tgt_lang_id,

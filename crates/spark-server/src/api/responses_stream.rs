@@ -50,6 +50,7 @@ pub(super) async fn responses_endpoint_stream(
     metadata: Option<std::collections::HashMap<String, String>>,
     store_flag: bool,
     conversation_id: Option<String>,
+    request_id: String,
 ) -> Response {
     use axum::response::sse::Event;
     use tokio::sync::mpsc;
@@ -89,7 +90,8 @@ pub(super) async fn responses_endpoint_stream(
 
     // Run the chat-completions streaming handler (re-using the full
     // pipeline: scheduler, tool detection, thinking, logprobs, ...).
-    let deltas = match chat_completions_inner(state, None, chat_req.into(), None).await {
+    let deltas = match chat_completions_inner(state, None, chat_req.into(), None, request_id).await
+    {
         super::chat::ChatOutcome::Streaming(d) => d,
         // Error envelope — forward unchanged.
         super::chat::ChatOutcome::Http(r) => return r,

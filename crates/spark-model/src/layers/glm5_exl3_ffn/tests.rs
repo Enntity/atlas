@@ -209,6 +209,7 @@ fn actual_component_prefill_has_one_tp_sum_and_preflight_rejects_missing_comm() 
             routed_lora_layers: None,
             midchunk_capture: None,
             moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+            request_id: None,
         };
         let before = gpu.launch_count();
         let before_sync = gpu.sync_count();

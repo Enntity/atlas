@@ -466,6 +466,7 @@ impl TransformerModel {
                 routed_lora_layers: ctx.routed_lora_layers,
                 midchunk_capture: None,
                 moe_lora_route: ctx.moe_lora_route,
+                request_id: ctx.request_id.clone(),
             }
         };
 
@@ -656,6 +657,7 @@ impl TransformerModel {
             routed_lora_layers: None, // #30: offline single-seq decode; no prefill route.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) skips fold, adapter folds (single-seq reject lifted)
+            request_id: seq.request_id.clone(),
         };
 
         // Eager layer loop: skip SSM layers, run attention layers only

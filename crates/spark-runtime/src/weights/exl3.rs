@@ -10,6 +10,7 @@ pub mod dense;
 pub mod ffn_io;
 pub mod logits_io;
 pub mod native;
+pub mod norm_substitution;
 mod reference;
 mod store;
 

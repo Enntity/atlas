@@ -160,6 +160,7 @@ impl Qwen3AttentionLayer {
         for o in owners {
             let on = o.rows as u32;
             let octx = ForwardContext {
+                request_id: ctx.request_id.clone(),
                 attn_metadata: Some(o.meta),
                 midchunk_capture: None,
                 ..*ctx

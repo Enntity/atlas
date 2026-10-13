@@ -1360,3 +1360,29 @@ Supersedes the claims named below. The original entries above are preserved.
   atomically. The grammar-pause change (`19551fc6`) is correct; its tests
   are CUDA-gated and still owed on a Spark.
 
+
+### 2026-10-12 — Gate v2 Amendment 2 after Luna source review
+
+Operator requested documentation corrections after a Luna vLLM source review.
+No GPU work, new image, qualification collection or numerical result.
+
+- Supersedes the Amendment 1 composition VOID/top-up description above:
+  `docs/design/exl3-statistical-gate-v2.md` now fixes N=15 before collection.
+  Reference-only adaptive stopping did not establish the claimed final-N
+  exchangeability bound. Reference unverifiability blocks qualification; all
+  draws and failed/incomplete campaigns remain archived.
+- H4 now defines two exact byte classes, zero distances/radius, singleton
+  spread and tied gaps. Zero-radius membership is byte-exact; an ULP control
+  can fail and must not cause an after-the-fact tolerance change.
+- The rank bound is marginal and rank-only under exchangeability. Held-out
+  passes do not prove exchangeability; a PASS is scoped to registered
+  fixtures/profile, not distributional identity or release readiness.
+- Source report: `docs/design/exl3-vllm-reference-contract.md`. Luna reviewed
+  the exported reference source and registered observers; parent checked the
+  selected SM120 cache path, V2 sampler, capture hook and installed EXL3
+  plugin and rehashed the backend/wrapper/plugin. Pinned source plus bound
+  receipts is authoritative for reference behavior. The older live-latent
+  bypass description remains superseded; the recurring mode's cause is open.
+- Revision authorised; final rule sign-off and verified v2 evaluator still
+  precede collection. Existing calibration is not a test of the new edge
+  semantics. Required verification is listed in Amendment 2 A2.4.
