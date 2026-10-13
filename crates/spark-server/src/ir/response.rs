@@ -30,7 +30,7 @@ pub struct ChatResponse {
 pub struct Choice {
     pub index: usize,
     /// Assistant text (`None` mirrors the wire's `content: null`, e.g.
-    /// after a refusal strip).
+    /// for a tool-only response).
     pub content: Option<String>,
     /// Reasoning/thinking trace, when the model produced one.
     pub reasoning: Option<String>,
