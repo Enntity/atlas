@@ -279,6 +279,7 @@ pub fn prefill_request(
             0,
             0,
         )?;
+        model.ep_broadcast_request_id_for_seq(seq.slot_idx as u32, seq.request_id.as_deref())?;
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?;
         model.ep_broadcast_cmd(0)?; // chunk_start = 0 (non-chunked)

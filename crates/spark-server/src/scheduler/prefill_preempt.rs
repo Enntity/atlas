@@ -112,6 +112,7 @@ fn send_and_run(
     let slot = seq.slot_idx as u32;
     // EP: the worker mirrors this exact command (bulk tokens, one NCCL op).
     model.ep_broadcast_disable_mtp_for_seq(slot, disable_mtp)?;
+    model.ep_broadcast_request_id_for_seq(slot, seq.request_id.as_deref())?;
     model.ep_broadcast_cmd_for_seq(slot, 0xFFFFFFF0)?;
     model.ep_broadcast_cmd((end - start) as u32)?;
     model.ep_broadcast_cmd(start as u32)?;

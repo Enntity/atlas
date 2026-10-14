@@ -437,6 +437,7 @@ pub(super) fn resume_preempted_seq(model: &dyn Model, p: PreemptedSeq) -> Result
     // re-prefill (no-ops on non-EP models).
     let prefill_result = (|| -> Result<()> {
         model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, a.disable_mtp)?;
+        model.ep_broadcast_request_id_for_seq(seq.slot_idx as u32, seq.request_id.as_deref())?;
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(tokens.len() as u32)?;
         model.ep_broadcast_cmd(0)?;

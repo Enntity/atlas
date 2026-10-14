@@ -1118,6 +1118,9 @@ impl Model for TransformerModel {
         // ep_protocol_v2 field set at construction from ATLAS_EP_PROTOCOL.
         self.ep_broadcast_seq_and_cmd(seq_id, cmd, self.ep_protocol_v2)
     }
+    fn ep_broadcast_request_id_for_seq(&self, seq_id: u32, request_id: Option<&str>) -> Result<()> {
+        self.send_request_id(seq_id, request_id)
+    }
     fn ep_protocol_v2(&self) -> bool {
         self.ep_protocol_v2
     }

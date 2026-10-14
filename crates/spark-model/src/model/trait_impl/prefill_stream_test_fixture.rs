@@ -40,6 +40,7 @@ struct Recorder {
     events: Mutex<Vec<Event>>,
     order: Mutex<Vec<Order>>,
     created_events: AtomicU64,
+    request_ids: Mutex<Vec<Option<Arc<str>>>>,
     capture: AtomicU64,
     target_failure: AtomicBool,
     capture_failure: AtomicBool,
@@ -181,10 +182,11 @@ impl TransformerLayer for Layer {
         _: &mut Vec<u32>,
         _: &mut Vec<u32>,
         _: usize,
-        _: &ForwardContext,
+        ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
         self.0.events.lock().push(Event::Target(n, stream));
+        self.0.request_ids.lock().push(ctx.request_id.clone());
         anyhow::ensure!(
             !self.0.target_failure.load(Ordering::Relaxed),
             "injected target failure"
@@ -446,6 +448,9 @@ impl Fixture {
         seq.proposer_state = Some(Box::new(State(0)));
         record.events.lock().clear();
         Self { model, seq, record }
+    }
+    pub fn request_ids(&self) -> Vec<Option<Arc<str>>> {
+        self.record.request_ids.lock().clone()
     }
     pub fn events(&self) -> Vec<Event> {
         self.record.events.lock().clone()

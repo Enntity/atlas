@@ -388,6 +388,7 @@ impl TransformerModel {
             "GLM fused chunk is not available"
         );
         let slots: Vec<u32> = owners.iter().map(|s| s.slot_idx as u32).collect();
+        self.send_request_id(seq.slot_idx as u32, seq.request_id.as_deref())?;
         self.ep_broadcast_seq_and_cmd(seq.slot_idx as u32, EP_CMD_GLM_FUSED_CHUNK, true)?;
         for word in [chunk_len, chunk_start, prompt.len()] {
             self.ep_broadcast_u32(word as u32)?;

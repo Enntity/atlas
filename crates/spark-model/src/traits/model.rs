@@ -1322,6 +1322,17 @@ pub trait Model: Send + Sync {
         Ok(()) // no-op for non-EP models
     }
 
+    /// Bind the admitted request identity on the addressed worker sequence.
+    /// `None` explicitly clears an earlier binding, including slot reuse.
+    /// Both peers must run the same wire protocol implementation.
+    fn ep_broadcast_request_id_for_seq(
+        &self,
+        _seq_id: u32,
+        _request_id: Option<&str>,
+    ) -> Result<()> {
+        Ok(()) // no transport for models without a worker implementation
+    }
+
     /// Set the request-local native-decode fence on the worker's matching
     /// sequence before a prefill or resumed decode. The command is emitted
     /// only for the native-only case so the established MTP wire transcript

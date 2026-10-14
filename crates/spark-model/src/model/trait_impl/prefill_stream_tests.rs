@@ -3,6 +3,8 @@
 
 #[path = "prefill_stream_commit_order_tests.rs"]
 mod commit_order;
+#[path = "prefill_stream_identity_tests.rs"]
+mod identity;
 #[path = "prefill_stream_test_fixture.rs"]
 mod fixture;
 use crate::model::kv_admission::kv_admission_refusal;

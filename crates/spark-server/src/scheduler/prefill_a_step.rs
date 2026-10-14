@@ -313,6 +313,8 @@ pub fn start_chunked_prefill(
                 0,
             )?;
             plant_chunk0(model, &mut seq, pc_plant)?;
+            model
+                .ep_broadcast_request_id_for_seq(seq.slot_idx as u32, seq.request_id.as_deref())?;
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
             model.ep_broadcast_cmd(chunk_len as u32)?;
             model.ep_broadcast_cmd(0)?; // chunk_start
@@ -412,6 +414,7 @@ pub fn start_chunked_prefill(
             req_disable_mtp,
         )?;
         plant_chunk0(model, &mut seq, pc_plant)?;
+        model.ep_broadcast_request_id_for_seq(seq.slot_idx as u32, seq.request_id.as_deref())?;
         // EP: broadcast chunk 0 tokens to worker.
         // Send full prompt length + all tokens so worker can do
         // identical Marconi prefix-cache lookups (bug #33 fix).
