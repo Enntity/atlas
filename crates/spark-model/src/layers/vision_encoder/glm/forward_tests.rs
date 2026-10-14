@@ -107,10 +107,8 @@ const TEMPORAL: usize = 2;
 const PATCH_DIM: usize = 3 * TEMPORAL * PATCH * PATCH;
 const HEADS: usize = 2;
 
-/// A two-block tower with the checkpoint's head width and patch geometry but
-/// tiny hidden sizes, capped at 16x16 input patches.
-fn encoder(gpu: &NamedGpu) -> GlmVisionEncoder {
-    let config = VisionConfig {
+fn config() -> VisionConfig {
+    VisionConfig {
         is_glm5_next: true,
         in_channels: 3,
         depth: 2,
@@ -132,7 +130,13 @@ fn encoder(gpu: &NamedGpu) -> GlmVisionEncoder {
         video_start_token_id: 0,
         video_end_token_id: 0,
         max_pixels: Some(256 * TEMPORAL * PATCH * PATCH),
-    };
+    }
+}
+
+/// A two-block tower with the checkpoint's head width and patch geometry but
+/// tiny hidden sizes, capped at 16x16 input patches.
+fn encoder(gpu: &NamedGpu) -> GlmVisionEncoder {
+    let config = config();
     let w = DevicePtr(0x1000);
     let block = GlmVisionBlockWeights {
         norm1_w: w,
@@ -163,7 +167,7 @@ fn encoder(gpu: &NamedGpu) -> GlmVisionEncoder {
             down_w: w,
         },
     };
-    let encoder = GlmVisionEncoder::new(weights, &config, gpu).unwrap();
+    let encoder = GlmVisionEncoder::new(Some(weights), &config, gpu).unwrap();
     assert_eq!(encoder.p_max, 256);
     encoder
 }
@@ -223,4 +227,18 @@ fn over_capacity_request_fails_before_queuing_any_work() {
         launched,
         "a rejected request must not leave earlier items encoding"
     );
+}
+
+#[test]
+fn a_receive_only_tower_holds_just_the_row_buffer_and_never_encodes() {
+    // A multi-rank worker receives every row from rank 0, so it needs the
+    // packed output buffer and nothing else: no weights, no ViT scratch.
+    let gpu = NamedGpu::default();
+    let enc = GlmVisionEncoder::new(None, &config(), &gpu).unwrap();
+    assert_eq!(gpu.inner.alloc_count(), 1, "only buf_out is allocated");
+    assert!(!enc.buf_out.is_null());
+    assert_eq!(enc.out_rows, GLM_MAX_OUTPUT_ROWS);
+    let err = enc.forward_items(&[&image(8)], &gpu, 0).unwrap_err();
+    assert!(err.to_string().contains("receives"), "{err:#}");
+    assert_eq!(gpu.inner.launch_count(), 0);
 }

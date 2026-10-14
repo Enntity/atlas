@@ -15,6 +15,12 @@ pub(crate) fn split_trailing_index(name: &str) -> (String, u64) {
     (name.to_string(), u64::MAX)
 }
 
+/// A tensor of the vision tower (`model.visual.*`, top-level or nested under
+/// `model.language_model`).
+pub fn is_vision_tower_tensor(name: &str) -> bool {
+    name.starts_with("model.visual.") || name.starts_with("model.language_model.visual.")
+}
+
 /// Whether a tensor is an n-gram embedding TABLE — the huge blobs that are
 /// served off NVMe instead of being uploaded with the rest of the checkpoint.
 ///

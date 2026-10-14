@@ -239,7 +239,7 @@ impl VisionEncoder {
     /// Construct the distinct GLM-5.3 visual tower while retaining the
     /// historical `VisionEncoder` wrapper used by model prefill/splicing.
     pub(crate) fn new_glm(
-        weights: GlmVisionWeights,
+        weights: Option<GlmVisionWeights>,
         config: &atlas_core::config::VisionConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {

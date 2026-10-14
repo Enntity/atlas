@@ -71,6 +71,10 @@ impl GlmVisionEncoder {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<Vec<(usize, usize, usize)>> {
+        ensure!(
+            self.encodes,
+            "this rank receives vision rows from rank 0 and holds no vision weights"
+        );
         let mut sequences = Vec::new();
         for item in items {
             ensure!(
