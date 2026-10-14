@@ -17,6 +17,9 @@ impl SafetensorsLoader {
         {
             return true;
         }
+        if self.skip_vision && super::is_vision_tower_tensor(name) {
+            return true;
+        }
         // MTP head weights for a model whose loader does not build one.
         if self.skip_mtp && name.starts_with("mtp.") {
             return true;

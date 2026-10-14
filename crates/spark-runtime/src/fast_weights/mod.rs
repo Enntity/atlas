@@ -88,6 +88,9 @@ pub struct FastSafetensorsLoader {
     pub skip_mtp: bool,
     /// Exact tensor prefix of an unused appended predictor layer; default retains it.
     pub skip_layer_prefix: Option<String>,
+    /// Vision tower tensors on a rank that never encodes (a GLM-5 multi-rank
+    /// worker receives the encoded rows from rank 0). Opt-in.
+    pub skip_vision: bool,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
     pub try_direct_io: bool,
@@ -153,6 +156,7 @@ impl FastSafetensorsLoader {
             skip_activation_scales: false,
             skip_mtp: false,
             skip_layer_prefix: None,
+            skip_vision: false,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
@@ -172,6 +176,7 @@ impl FastSafetensorsLoader {
             skip_activation_scales: false,
             skip_mtp: false,
             skip_layer_prefix: None,
+            skip_vision: false,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
@@ -353,6 +358,17 @@ mod expert_filter_tests {
         loader.replicated_expert_prefix = Some(".layers.45.".into());
         assert!(!loader.should_skip_tensor(appended));
         assert!(loader.should_skip_tensor(target));
+    }
+
+    #[test]
+    fn skip_vision_drops_only_the_vision_tower() {
+        let mut loader = FastSafetensorsLoader::with_ep(1, 2, 288);
+        let tower = "model.visual.blocks.0.attn.qkv.weight";
+        let kept = "model.language_model.layers.3.self_attn.q_proj.weight";
+        assert!(!loader.should_skip_tensor(tower), "off by default");
+        loader.skip_vision = true;
+        assert!(loader.should_skip_tensor(tower));
+        assert!(!loader.should_skip_tensor(kept));
     }
 
     #[test]

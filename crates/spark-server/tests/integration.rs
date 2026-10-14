@@ -78,6 +78,7 @@ fn setup_model(
         skip_activation_scales: false,
         skip_mtp: false,
         skip_layer_prefix: None,
+        skip_vision: false,
     };
     use spark_runtime::weights::WeightLoader;
     let store = loader.load(model_dir, gpu.as_ref(), 1024 * 1024 * 1024)?;
