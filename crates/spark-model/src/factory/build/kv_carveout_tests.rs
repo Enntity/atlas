@@ -53,9 +53,9 @@ fn sparkglm_gains_about_a_fifth_more_blocks_at_no_system_memory_cost() {
     let budgeted = 95_535;
     let (n, placement) = plan(shape, budgeted, GB10);
     // 2046 MiB over ~104 KB per block is ~20.6K blocks. The default order
-    // places latent pools only (`ATLAS_KV_CARVEOUT_ORDER=latent`, the
-    // carveout is L2-uncached), so whole ~0.9 GB K pools strand up to one
-    // pool's worth: ~18.5K blocks (+19.4%, as on the pair).
+    // places latent pools only (`ATLAS_KV_CARVEOUT_ORDER=latent`), so whole
+    // ~0.9 GB K pools strand up to one pool's worth: ~18.5K blocks (+19.4%,
+    // as on the pair before the KV shard).
     assert!(n >= budgeted + 18_000, "{n}");
     assert!(n <= budgeted + GB10 / 104_192 + 1, "{n}");
     assert!(
