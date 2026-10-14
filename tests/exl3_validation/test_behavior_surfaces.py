@@ -21,7 +21,7 @@ from behavior_surfaces import (ANSWER, CALC_ANSWER, CODEWORD, LENGTH_TOKENS,
 JOKE = 'Why did the scarecrow win? He was outstanding in his field.'
 COUNT_TEXT = ' '.join(str(i) for i in range(1, 31))
 MATH = {'37 * 14': '432', '91 - 38': '53', '12 * 13': '156', '144 / 12': '12'}
-CHAT_COUNT = 18
+CHAT_COUNT = 20
 CMPL_COUNT = 12
 TOTAL = CHAT_COUNT + CMPL_COUNT
 SAFE_LEAK = '[gMASK]'
@@ -234,6 +234,10 @@ class SurfaceMatrixTests(unittest.TestCase):
         self.assertIn(CODEWORD, rows['chat-multiturn-recall']['summary']['content'])
         self.assertIn(CODEWORD, rows['chat-stream-multiturn-recall']['summary']['content'])
         self.assertIn(CODEWORD, rows['cmpl-multiturn-recall']['summary']['text'])
+        # per-turn thinking toggle: reasoning isolated to the thinking-on turn
+        self.assertTrue(rows['chat-multiturn-toggle-on']['summary']['reasoning'])
+        self.assertEqual(rows['chat-multiturn-toggle-off']['summary']['reasoning'], '')
+        self.assertIn(CODEWORD, rows['chat-multiturn-toggle-off']['summary']['content'])
         # reasoning on/off separation (reasoning_content != content)
         self.assertEqual(rows['chat-reason-on']['summary']['content'].strip(), CALC_ANSWER)
         self.assertTrue(rows['chat-reason-on']['summary']['reasoning'])

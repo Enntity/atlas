@@ -3,7 +3,8 @@
 
 Covers finish_reason stop vs length, stop sequences, max_tokens/length
 accounting, stream(include_usage)/blocking token-accounting consistency for
-one seeded greedy request, multi-turn recall, seeded sampling, and reasoning
+one seeded greedy request, multi-turn recall (including a per-turn thinking
+on/off toggle inside one conversation), seeded sampling, and reasoning
 on/off (chat_template_kwargs / reasoning fields) with reasoning_content
 separation. The legacy surface exposes no thinking fields, so reasoning
 coverage is chat-only; the special-token leak gate runs on every text channel
@@ -201,6 +202,26 @@ def collect_surfaces(io, model, context_limit):
                       first.get('summary', {}).get('content', ''))),
                   'chat', 'stop')
     demand(receipt, answered(CODEWORD), 'multi-turn code word not recalled')
+
+    # Per-turn thinking toggle inside ONE conversation: turn 1 arms the
+    # budget and owns the reasoning channel, turn 2 (same transcript, thinking
+    # off) must not inherit that channel and must still recall the codeword.
+    # Guards per-turn template re-render and thinking-state isolation — the
+    # template-mismatch bug class; multi-turn recall above never toggles.
+    toggle_first = run('chat-multiturn-toggle-on',
+                       chat_payload(RECALL_PROMPT, thinking=True, budget=THINKING_BUDGET),
+                       'chat', 'stop', THINKING_BUDGET)
+    demand(toggle_first, answered('OK'), 'turn-1 acknowledgement missing')
+    demand(toggle_first, reasoning_present, 'thinking-on turn produced no reasoning channel')
+    toggle_second = run('chat-multiturn-toggle-off',
+                        chat_payload(RECALL_QUESTION, thinking=False,
+                                     messages=recall_messages(
+                                         toggle_first.get('summary', {}).get('content', ''))),
+                        'chat', 'stop')
+    demand(toggle_second, answered(CODEWORD), 'recall across a thinking toggle failed')
+    demand(toggle_second,
+           lambda summary: not summary['reasoning'],
+           'thinking-off turn leaked the prior turn reasoning channel')
 
     seeded_a = run('chat-seeded-a', chat_payload(JOKE_PROMPT, temperature=SAMPLE_TEMPERATURE),
                    'chat', 'stop')

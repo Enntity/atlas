@@ -193,3 +193,97 @@ fn glm_tool_boundary_actual_first_token_builder() {
         }
     }
 }
+
+/// The known behavior change (todo Q3): with thinking on, tools present and
+/// a JSON grammar attached, the first sampled token may be the native tool
+/// opener. Through the real first-token builder the grammar keeps the
+/// sticky tool request on every path, the opener closes thinking WITHOUT
+/// forcing a second think-end token, and a non-opener first token keeps
+/// thinking open under the same grammar. No sampling here — the builder
+/// consumes the token the caller already drew (the CUDA-gated grammar
+/// sampling paths stay in `sample_step_checked_scalar_tests`).
+#[test]
+fn glm_tool_boundary_first_token_builder_json_grammar() {
+    let vocabulary = ["{", "}", " ", "\"", "a", ":", ",", "0"].map(str::to_owned);
+    let mut engine = crate::grammar::GrammarEngine::new(&vocabulary, &[]).unwrap();
+    let grammar = engine.compile_json_grammar().unwrap();
+    for (first, closed) in [(OPEN, true), (OPEN + 1, false)] {
+        for max_tokens in [1, 20] {
+            let (a, _) = test_seq(vec![], max_tokens, None, 28);
+            let now = Instant::now();
+            let p = build_prefill_in_progress(
+                std::sync::Arc::new(vec![7; 28]),
+                0,
+                a.seq,
+                28,
+                max_tokens,
+                0,
+                vec![999],
+                a.sink,
+                None,
+                now,
+                0.0,
+                0,
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0,
+                vec![],
+                true,
+                Some(16),
+                None,
+                64,
+                false, // require_tool_call: the grammar forces, not the legacy flag
+                true,  // tools_present
+                false,
+                false,
+                Some(crate::grammar::GrammarState::new(&grammar, vocabulary.len()).unwrap()),
+                None,
+                None,
+                None,
+            );
+            let a = build_active_seq_from_prefill(
+                p,
+                first,
+                false,
+                false,
+                0,
+                max_tokens == 1,
+                now,
+                Some(END),
+                Some(START),
+                Some(OPEN),
+                None,
+                0,
+                Some(OPEN),
+            );
+            assert_eq!(a.output_tokens, [first]);
+            assert!(
+                a.tool_request,
+                "an attached grammar is the sticky tool request on every path"
+            );
+            assert_eq!(a.tool_call_opened, closed);
+            assert_eq!(a.inside_tool_body, closed);
+            assert!(
+                !a.require_tool_call,
+                "grammar-forced calls never fall back to the legacy flag"
+            );
+            assert_eq!(
+                !a.inside_thinking, closed,
+                "only the native opener ends thinking at the first token"
+            );
+            assert_eq!(a.think_ended, closed);
+            assert!(
+                !a.think_just_ended,
+                "an emitted opener must never force a second think-end token"
+            );
+            assert_eq!(a.thinking_tokens, 0);
+        }
+    }
+}

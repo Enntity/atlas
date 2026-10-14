@@ -19,8 +19,9 @@
 use crate::gpu::{DevicePtr, GpuBackend};
 use crate::weights::exl3::ffn_io::{DiagnosticDtype, DiagnosticTensor, Exl3FfnRouter};
 use anyhow::{Context, Result, ensure};
+use manifest::{EntryKey, FixtureEntry};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -51,16 +52,6 @@ const GRAPH_FLAGS: [&str; 3] = [
 
 /// Fixture `variant` values (spec D1); recorded in every substitution record.
 const VARIANTS: [&str; 2] = ["reference-exact", "v24-corrected"];
-
-/// One validated manifest entry: declaration plus staged payload bytes.
-struct FixtureEntry {
-    request_id: String,
-    dtype: String,
-    shape: Vec<usize>,
-    file: String,
-    sha256: String,
-    bytes: Vec<u8>,
-}
 
 /// An engaged substitution awaiting its record. The pre-image hash is taken
 /// before the fixture bytes replace `gated`; the record is committed after
@@ -128,7 +119,7 @@ pub struct NormSubstitution {
     variant: String,
     /// Keyed by the spec's uniqueness tuple `(layer, tp_rank, invocation,
     /// tensor)`; `layer` is validated to 0 at load (assumption A12).
-    entries: BTreeMap<(usize, usize, usize, String), FixtureEntry>,
+    entries: BTreeMap<EntryKey, FixtureEntry>,
     rank: usize,
     records: Exl3FfnRouter,
     sequence: AtomicUsize,
@@ -155,13 +146,13 @@ impl NormSubstitution {
         Self::load(&dir, &record_dir, rank, world).map(Some)
     }
 
-    /// Parse and validate `$dir/manifest.json`, verify every payload's
-    /// sha256 and size, and stage the payload bytes in host memory. The
-    /// fixture directory is read-only to this module; records are rooted at
-    /// `record_dir` (which must already exist and must be neither `dir`
-    /// itself nor nested under it — `Path::starts_with` compares whole path
-    /// components, so a shared name prefix like `/x/foo` vs `/x/foobar`
-    /// stays legal).
+    /// Topology and record-directory wiring around [`manifest::load`], which
+    /// parses and validates `$dir/manifest.json` and stages the payload
+    /// bytes. The fixture directory is read-only to this module; records are
+    /// rooted at `record_dir` (which must already exist and must be neither
+    /// `dir` itself nor nested under it — `Path::starts_with` compares whole
+    /// path components, so a shared name prefix like `/x/foo` vs
+    /// `/x/foobar` stays legal).
     pub fn load(dir: &Path, record_dir: &Path, rank: usize, world: usize) -> Result<Self> {
         ensure!(
             world > 0 && rank < world,
@@ -181,113 +172,10 @@ impl NormSubstitution {
             "norm substitution record directory must not be the fixture directory \
              or nested under it"
         );
-        let manifest_path = fixture_root.join(MANIFEST_NAME);
-        let raw = std::fs::read(&manifest_path)
-            .with_context(|| format!("norm substitution manifest {}", manifest_path.display()))?;
-        let manifest: Manifest = serde_json::from_slice(&raw)
-            .context("norm substitution manifest is not valid JSON for its schema")?;
-        ensure!(
-            manifest.schema == MANIFEST_SCHEMA,
-            "norm substitution manifest schema mismatch: {:?}",
-            manifest.schema
-        );
-        ensure!(
-            VARIANTS.contains(&manifest.variant.as_str()),
-            "norm substitution manifest variant invalid: {:?}",
-            manifest.variant
-        );
-        ensure!(
-            !manifest.source.capture_root.is_empty()
-                && !manifest.source.engine.is_empty()
-                && is_sha256_hex(&manifest.source.schedule_sha256),
-            "norm substitution manifest source invalid"
-        );
-        let mut entries = BTreeMap::new();
-        let mut keys = BTreeSet::new();
-        for entry in &manifest.entries {
-            ensure!(
-                entry.layer == 0,
-                "norm substitution entry layer must be 0 (assumption A12), got {}",
-                entry.layer
-            );
-            ensure!(
-                entry.tp_world == world && entry.tp_rank < world,
-                "norm substitution entry topology mismatch: tp_rank {} tp_world {} (runtime world {})",
-                entry.tp_rank,
-                entry.tp_world,
-                world
-            );
-            ensure!(
-                !entry.request_id.is_empty(),
-                "norm substitution entry request_id empty"
-            );
-            ensure!(
-                safe_identifier(&entry.stage) && safe_identifier(&entry.tensor),
-                "norm substitution entry stage/tensor invalid"
-            );
-            let width = dtype_width(&entry.dtype).with_context(|| {
-                format!("norm substitution entry dtype invalid: {:?}", entry.dtype)
-            })?;
-            ensure!(
-                entry.shape.len() == 2 && entry.shape.iter().all(|n| *n > 0),
-                "norm substitution entry shape invalid: {:?}",
-                entry.shape
-            );
-            ensure!(
-                safe_filename(&entry.file),
-                "norm substitution entry file invalid: {:?}",
-                entry.file
-            );
-            ensure!(
-                is_sha256_hex(&entry.sha256),
-                "norm substitution entry sha256 invalid: {:?}",
-                entry.sha256
-            );
-            let key = (
-                entry.layer,
-                entry.tp_rank,
-                entry.invocation,
-                entry.tensor.clone(),
-            );
-            ensure!(
-                keys.insert(key.clone()),
-                "norm substitution duplicate entry: {key:?}"
-            );
-            let payload_path = fixture_root.join(&entry.file);
-            let bytes = std::fs::read(&payload_path)
-                .with_context(|| format!("norm substitution payload {}", payload_path.display()))?;
-            let expected = entry
-                .shape
-                .iter()
-                .try_fold(width, |size, n| size.checked_mul(*n))
-                .context("norm substitution entry bytes overflow")?;
-            ensure!(
-                bytes.len() == expected,
-                "norm substitution payload size mismatch for {:?}: {} bytes, declared {}",
-                entry.file,
-                bytes.len(),
-                expected
-            );
-            ensure!(
-                hex_sha256(&bytes) == entry.sha256,
-                "norm substitution payload sha256 mismatch for {:?}",
-                entry.file
-            );
-            entries.insert(
-                key,
-                FixtureEntry {
-                    request_id: entry.request_id.clone(),
-                    dtype: entry.dtype.clone(),
-                    shape: entry.shape.clone(),
-                    file: entry.file.clone(),
-                    sha256: entry.sha256.clone(),
-                    bytes,
-                },
-            );
-        }
+        let (variant, entries) = manifest::load(&fixture_root, world)?;
         let records = Exl3FfnRouter::new(record_dir.to_path_buf(), 0, rank, world)?;
         Ok(Self {
-            variant: manifest.variant,
+            variant,
             entries,
             rank,
             records,
@@ -390,36 +278,6 @@ pub fn engage<'a>(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct Manifest {
-    schema: String,
-    variant: String,
-    source: Source,
-    entries: Vec<Entry>,
-}
-
-#[derive(serde::Deserialize)]
-struct Source {
-    capture_root: String,
-    engine: String,
-    schedule_sha256: String,
-}
-
-#[derive(serde::Deserialize)]
-struct Entry {
-    request_id: String,
-    layer: usize,
-    tp_rank: usize,
-    tp_world: usize,
-    invocation: usize,
-    stage: String,
-    tensor: String,
-    dtype: String,
-    shape: Vec<usize>,
-    file: String,
-    sha256: String,
-}
-
 fn nonempty_var(key: &str) -> Option<PathBuf> {
     std::env::var_os(key)
         .filter(|v| !v.is_empty())
@@ -436,31 +294,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
     hex
 }
 
-fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn safe_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-}
-
-fn safe_filename(value: &str) -> bool {
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && Path::new(value).file_name() == Some(std::ffi::OsStr::new(value))
-}
-
-fn dtype_width(label: &str) -> Option<usize> {
-    match label {
-        "bf16-le" => Some(2),
-        "f32-le" | "i32-le" => Some(4),
-        _ => None,
-    }
-}
+mod manifest;
 
 #[cfg(test)]
 #[path = "norm_substitution_tests.rs"]

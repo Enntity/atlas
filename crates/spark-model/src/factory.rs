@@ -339,6 +339,73 @@ mod tests {
         }
     }
 
+    /// The `exl3_checkpoint()` term of the engagement predicate (review
+    /// finding m3, previously inspection-only): an EXL3 checkpoint store
+    /// engages the knob for ANY model type, because the native EXL3 branch
+    /// of `build_model` runs `exl3_layers::load_layers` (which honours the
+    /// knob) whatever the loader selection says. A real router is opened
+    /// over a minimal on-disk EXL3 fixture and attached via
+    /// `WeightStore::from_exl3` with no companions, so the store carries a
+    /// live checkpoint while the GPU stays the test mock.
+    #[test]
+    fn substitute_dir_set_allows_exl3_checkpoint_store_any_model_type() {
+        struct Fixture(std::path::PathBuf);
+        impl Fixture {
+            fn new() -> Self {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "atlas-factory-exl3-store-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::write(
+                    dir.join("config.json"),
+                    r#"{"quantization_config":{"quant_method":"exl3","codebook":"mul1"}}"#,
+                )
+                .unwrap();
+                let tensor = 0u16.to_le_bytes();
+                safetensors::serialize_to_file(
+                    vec![(
+                        "linear.trellis".to_string(),
+                        safetensors::tensor::TensorView::new(
+                            safetensors::Dtype::U16,
+                            vec![1],
+                            &tensor,
+                        )
+                        .unwrap(),
+                    )],
+                    None,
+                    &dir.join("model.safetensors"),
+                )
+                .unwrap();
+                std::fs::write(
+                    dir.join("model.safetensors.index.json"),
+                    r#"{"weight_map":{"linear.trellis":"model.safetensors"}}"#,
+                )
+                .unwrap();
+                Self(dir)
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let _env_guard = set_substitute_dir(Some("/nonexistent-fixtures"));
+        let fixture = Fixture::new();
+        let checkpoint =
+            spark_runtime::weights::exl3::Exl3CheckpointRouter::open(&fixture.0).unwrap();
+        let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+        let store = WeightStore::from_exl3(checkpoint, &[], &gpu, 0).unwrap();
+        assert!(store.exl3_checkpoint().is_some());
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "qwen3_next".to_string(); // deliberately not a KDA loader
+        refuse_unengaged_norm_substitution(&config, &store)
+            .expect("an EXL3 checkpoint store engages the substitution knob");
+    }
+
     #[test]
     fn test_unsupported_model_type() {
         // `build_model` now reads ATLAS_EXL3_NORM_SUBSTITUTE_DIR (review

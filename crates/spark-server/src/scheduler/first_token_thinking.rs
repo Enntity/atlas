@@ -86,6 +86,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_token_thinking_native_opener_ends_thinking_without_forcing_a_second() {
+        // Thinking on and the first token IS the native tool opener: the
+        // opener already closed thinking, so `think_just_ended` must stay
+        // false (the scheduler never forces a second think-end token). This holds
+        // whatever the configured close token says — the emitted opener is
+        // authoritative for the first-token transition.
+        for end in [Some(10), Some(20), None] {
+            for start in [Some(10), Some(30), None] {
+                assert_eq!(
+                    FirstTokenThinking::resolve_with_tool_boundary(true, 10, start, end, Some(10)),
+                    FirstTokenThinking {
+                        inside_thinking: false,
+                        think_ended: true,
+                        think_just_ended: false,
+                    },
+                    "end={end:?}, start={start:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_token_thinking_without_native_match_delegates_to_resolve() {
+        // No boundary policy, or a first token that is not the configured
+        // opener: the ordinary transition is untouched. (The tools-present
+        // filter on the boundary lives at the three prefill call sites and
+        // is covered by the first-token-builder tests.)
+        for (enabled, first, boundary) in [
+            (true, 30, Some(10)),
+            (false, 10, Some(10)),
+            (true, 10, None),
+            (false, 30, None),
+        ] {
+            assert_eq!(
+                FirstTokenThinking::resolve_with_tool_boundary(
+                    enabled,
+                    first,
+                    Some(10),
+                    Some(20),
+                    boundary
+                ),
+                FirstTokenThinking::resolve(enabled, first, Some(10), Some(20)),
+                "enabled={enabled}, first={first}, boundary={boundary:?}"
+            );
+        }
+    }
+
+    #[test]
     fn first_token_thinking_requested_close_matches_decode_transition() {
         // The configured close is authoritative; no inference from the start
         // ID, even when absent or equal, is needed to consume this close.

@@ -116,7 +116,16 @@ impl Glm5KdaLayer {
         if let Some(sp) = sp {
             sp.all_gather(normed, self.hidden_size, ctx, stream)?;
         }
-        self.capture_upstream_hc(upstream, "attn_mhc_norm", normed, tokens, ctx, stream)?;
+        self.capture_upstream_hc(
+            upstream,
+            "attn_mhc_norm",
+            &self.hc.attn,
+            normed,
+            tokens,
+            m_hc,
+            ctx,
+            stream,
+        )?;
         profile::step(ctx, stream, &mut profile_timer, "hc_attn_norm")?;
 
         let projected = ctx.buffers.qkv_output();
@@ -372,7 +381,16 @@ impl Glm5KdaLayer {
         if let Some(sp) = sp.filter(|_| matches!(self.ffn, crate::layers::FfnComponent::Moe(_))) {
             sp.all_gather(normed, self.hidden_size, ctx, stream)?;
         }
-        self.capture_upstream_hc(upstream, "ffn_mhc_norm", normed, tokens, ctx, stream)?;
+        self.capture_upstream_hc(
+            upstream,
+            "ffn_mhc_norm",
+            &self.hc.ffn,
+            normed,
+            tokens,
+            m_hc,
+            ctx,
+            stream,
+        )?;
         profile::step(ctx, stream, &mut profile_timer, "hc_ffn_norm")?;
         Ok(FfnPhase {
             hidden,

@@ -1,10 +1,69 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Opt-in typed upstream capture; all I/O stays in the diagnostic router.
 use super::*;
+use crate::layers::glm5_exl3_mhc::MhcResidualPrecision;
+use crate::layers::qwen3_attention::HcSiteWeights;
 use atlas_core::config::ModelConfig;
 use spark_runtime::weights::exl3::ffn_io::{DiagnosticDtype, DiagnosticTensor, Exl3FfnRouter};
 
 type TensorSpec<'a> = (&'static str, DiagnosticDtype, DevicePtr, &'a [usize]);
+
+/// Only the L0→L1 boundary is qualified for upstream capture
+/// (docs/plans/l1-escalation-tooling-spec.md D1); G1's wider layer set is a
+/// separate reviewed change. The stage calls themselves are layer-generic.
+fn ensure_supported_layer(layer: usize) -> Result<()> {
+    ensure!(
+        layer <= 1,
+        "EXL3 upstream capture supports the L0->L1 boundary (layers 0..=1)"
+    );
+    Ok(())
+}
+
+/// mHC boundary facts recorded beside the captured (x, residual, post, comb)
+/// tensors so an L1 bisection binds rows and the residual-precision path
+/// instead of inferring them (D1). `rows` is the actual local token count
+/// (spec D1); the precision value comes from
+/// `Glm5KdaLayer::mhc_residual_precision`, the same selection `pre_norm`
+/// receives.
+pub(super) struct HcBoundaryFacts {
+    rows: usize,
+    hc_mult: usize,
+    sinkhorn_iters: u32,
+    hc_eps: f32,
+    rms_eps: f32,
+    residual_precision: MhcResidualPrecision,
+    request_id: Option<String>,
+}
+
+fn hc_boundary_binding(facts: &HcBoundaryFacts) -> Result<serde_json::Value> {
+    ensure!(facts.rows > 0, "mHC boundary binding rows invalid");
+    ensure!(facts.hc_mult > 0, "mHC boundary binding hc_mult invalid");
+    ensure!(
+        facts.sinkhorn_iters > 0,
+        "mHC boundary binding sinkhorn iterations invalid"
+    );
+    ensure!(
+        facts.hc_eps.is_finite()
+            && facts.hc_eps > 0.0
+            && facts.rms_eps.is_finite()
+            && facts.rms_eps > 0.0,
+        "mHC boundary binding epsilon invalid"
+    );
+    let mut value = serde_json::json!({
+        "schema": "atlas-mhc-boundary-binding-v1",
+        "rows": facts.rows,
+        "hc_mult": facts.hc_mult,
+        "sinkhorn_iters": facts.sinkhorn_iters,
+        "hc_eps_bits": facts.hc_eps.to_bits(),
+        "rms_eps_bits": facts.rms_eps.to_bits(),
+        "residual_precision": format!("{:?}", facts.residual_precision),
+        "sequence_parallel": false,
+    });
+    if let Some(request_id) = facts.request_id.as_deref() {
+        value["request_id"] = serde_json::Value::String(request_id.to_string());
+    }
+    Ok(value)
+}
 pub(super) struct UpstreamTrace(Exl3FfnRouter);
 impl UpstreamTrace {
     pub(super) fn from_env(config: &ModelConfig, layer: usize) -> Result<Option<Self>> {
@@ -17,10 +76,9 @@ impl UpstreamTrace {
             "ATLAS_EXL3_UPSTREAM_DUMP_LAYERS",
         )?
         .map(Self);
-        ensure!(
-            router.is_none() || layer == 0,
-            "EXL3 upstream capture supports explicit layer0 only"
-        );
+        if router.is_some() {
+            ensure_supported_layer(layer)?;
+        }
         Ok(router)
     }
     pub(super) fn begin(&self) -> Result<Option<usize>> {
@@ -78,6 +136,17 @@ impl UpstreamTrace {
             }),
         )
     }
+    fn specs(tensors: &[TensorSpec<'_>]) -> Vec<DiagnosticTensor> {
+        tensors
+            .iter()
+            .map(|(name, dtype, ptr, shape)| DiagnosticTensor {
+                name,
+                dtype: *dtype,
+                ptr: *ptr,
+                shape: shape.to_vec(),
+            })
+            .collect()
+    }
     pub(super) fn capture(
         &self,
         invocation: Option<usize>,
@@ -89,16 +158,33 @@ impl UpstreamTrace {
         let Some(invocation) = invocation else {
             return Ok(());
         };
-        let tensors: Vec<_> = tensors
-            .iter()
-            .map(|(name, dtype, ptr, shape)| DiagnosticTensor {
-                name,
-                dtype: *dtype,
-                ptr: *ptr,
-                shape: shape.to_vec(),
-            })
-            .collect();
-        self.0.capture(gpu, invocation, stage, &tensors, stream)
+        self.0
+            .capture(gpu, invocation, stage, &Self::specs(tensors), stream)
+    }
+    /// Capture the mHC boundary tensors with their binding facts (D1).
+    /// Disabled capture returns before any validation, GPU access or
+    /// filesystem write (the module invariant).
+    pub(super) fn capture_boundary(
+        &self,
+        invocation: Option<usize>,
+        gpu: &dyn GpuBackend,
+        stage: &str,
+        tensors: &[TensorSpec<'_>],
+        stream: u64,
+        facts: &HcBoundaryFacts,
+    ) -> Result<()> {
+        let Some(invocation) = invocation else {
+            return Ok(());
+        };
+        let binding = hc_boundary_binding(facts)?;
+        self.0.capture_with_metadata(
+            gpu,
+            invocation,
+            stage,
+            &Self::specs(tensors),
+            stream,
+            &binding,
+        )
     }
 }
 impl Glm5KdaLayer {
@@ -115,17 +201,33 @@ impl Glm5KdaLayer {
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn capture_upstream_hc(
         &self,
         invocation: Option<usize>,
         stage: &str,
+        site: &HcSiteWeights,
         normed: DevicePtr,
         rows: usize,
+        local_rows: u32,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        self.capture_upstream(
+        let Some(trace) = &self.upstream_trace else {
+            return Ok(());
+        };
+        let facts = HcBoundaryFacts {
+            rows: local_rows as usize,
+            hc_mult: self.hc.hc_mult,
+            sinkhorn_iters: self.hc.sinkhorn_iters as u32,
+            hc_eps: self.hc.hc_eps,
+            rms_eps: ctx.config.rms_norm_eps as f32,
+            residual_precision: self.mhc_residual_precision(site, local_rows),
+            request_id: ctx.request_id.as_deref().map(String::from),
+        };
+        trace.capture_boundary(
             invocation,
+            ctx.gpu,
             stage,
             &[
                 (
@@ -153,8 +255,8 @@ impl Glm5KdaLayer {
                     &[rows, self.hc.hc_mult, self.hc.hc_mult],
                 ),
             ],
-            ctx,
             stream,
+            &facts,
         )
     }
 }
@@ -280,6 +382,144 @@ mod tests {
         );
         assert_eq!(trace.begin().unwrap(), Some(1));
         gpu.free(ptr).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn upstream_capture_supports_only_the_l0_l1_boundary() {
+        for layer in 0..=1 {
+            ensure_supported_layer(layer).unwrap();
+        }
+        for layer in 2..64 {
+            assert!(ensure_supported_layer(layer).is_err());
+        }
+    }
+    #[test]
+    fn hc_boundary_binding_binds_rows_precision_and_request() {
+        use crate::layers::glm5_exl3_mhc::MhcResidualPrecision;
+        let make = |rows: usize,
+                    hc_mult: usize,
+                    sinkhorn_iters: u32,
+                    hc_eps: f32,
+                    rms_eps: f32,
+                    request_id: Option<String>| {
+            HcBoundaryFacts {
+                rows,
+                hc_mult,
+                sinkhorn_iters,
+                hc_eps,
+                rms_eps,
+                residual_precision: MhcResidualPrecision::for_fused_rows(rows),
+                request_id,
+            }
+        };
+        let bound = hc_boundary_binding(&make(16, 4, 20, 1e-6, 1e-5, None)).unwrap();
+        assert_eq!(bound["rows"], 16);
+        assert!(bound.get("local_rows").is_none());
+        assert_eq!(bound["hc_mult"], 4);
+        assert_eq!(bound["sinkhorn_iters"], 20);
+        assert_eq!(bound["hc_eps_bits"], 1e-6f32.to_bits());
+        assert_eq!(bound["rms_eps_bits"], 1e-5f32.to_bits());
+        assert_eq!(bound["residual_precision"], "UnroundedPost");
+        assert_eq!(bound["sequence_parallel"], false);
+        assert!(bound.get("request_id").is_none());
+        let bound =
+            hc_boundary_binding(&make(39, 4, 20, 1e-6, 1e-5, Some("req-1".to_string()))).unwrap();
+        assert_eq!(bound["residual_precision"], "Rounded");
+        assert_eq!(bound["request_id"], "req-1");
+        for (rows, hc_mult, iters, hc_eps, rms_eps) in [
+            (0usize, 4usize, 20u32, 1e-6f32, 1e-5f32),
+            (1, 0, 20, 1e-6, 1e-5),
+            (1, 4, 0, 1e-6, 1e-5),
+            (1, 4, 20, f32::NAN, 1e-5),
+            (1, 4, 20, 1e-6, 0.0),
+        ] {
+            assert!(
+                hc_boundary_binding(&make(rows, hc_mult, iters, hc_eps, rms_eps, None)).is_err()
+            );
+        }
+    }
+    #[test]
+    fn layer1_boundary_capture_records_mhc_binding() {
+        use crate::layers::glm5_exl3_mhc::MhcResidualPrecision;
+        let gpu = MockGpuBackend::new();
+        let root = std::env::temp_dir().join(format!("atlas-upstream-l1-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let trace = UpstreamTrace(Exl3FfnRouter::new(root.clone(), 1, 0, 2).unwrap());
+        let ptr = gpu.alloc(4096).unwrap();
+        gpu.copy_h2d(&[0u8; 4096], ptr).unwrap();
+        std::fs::write(root.join("capture-enabled"), b"").unwrap();
+        let facts = HcBoundaryFacts {
+            rows: 39,
+            hc_mult: 4,
+            sinkhorn_iters: 20,
+            hc_eps: 1e-6,
+            rms_eps: 1e-5,
+            residual_precision: MhcResidualPrecision::for_fused_rows(39),
+            request_id: Some("req-1".to_string()),
+        };
+        let invocation = trace.begin().unwrap();
+        trace
+            .capture_boundary(
+                invocation,
+                &gpu,
+                "attn_mhc_norm",
+                &[
+                    ("normed", DiagnosticDtype::Bf16, ptr, &[39, 2]),
+                    ("highway", DiagnosticDtype::Bf16, ptr, &[39, 4, 2]),
+                    ("post", DiagnosticDtype::F32, ptr, &[39, 4]),
+                    ("comb", DiagnosticDtype::F32, ptr, &[39, 4, 4]),
+                ],
+                8,
+                &facts,
+            )
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("ffn-L1-rank0-000000-attn_mhc_norm.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata["binding"]["schema"],
+            "atlas-mhc-boundary-binding-v1"
+        );
+        assert_eq!(metadata["binding"]["rows"], 39);
+        assert_eq!(metadata["binding"]["request_id"], "req-1");
+        assert_eq!(metadata["tensors"][0]["name"], "normed");
+        assert_eq!(metadata["tensors"][0]["shape"], serde_json::json!([39, 2]));
+        gpu.free(ptr).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn disabled_boundary_capture_returns_before_binding_validation() {
+        use crate::layers::glm5_exl3_mhc::MhcResidualPrecision;
+        let gpu = MockGpuBackend::new();
+        let root =
+            std::env::temp_dir().join(format!("atlas-upstream-disabled-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let trace = UpstreamTrace(Exl3FfnRouter::new(root.clone(), 1, 1, 2).unwrap());
+        // Invalid facts on purpose: disabled capture must return before any
+        // validation, GPU access or filesystem write (module invariant).
+        let facts = HcBoundaryFacts {
+            rows: 0,
+            hc_mult: 0,
+            sinkhorn_iters: 0,
+            hc_eps: f32::NAN,
+            rms_eps: 0.0,
+            residual_precision: MhcResidualPrecision::Rounded,
+            request_id: None,
+        };
+        assert_eq!(trace.begin().unwrap(), None);
+        trace
+            .capture_boundary(None, &gpu, "attn_mhc_norm", &[], 8, &facts)
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        // Enabled: the same facts fail fast.
+        std::fs::write(root.join("capture-enabled"), b"").unwrap();
+        let invocation = trace.begin().unwrap();
+        assert!(
+            trace
+                .capture_boundary(invocation, &gpu, "attn_mhc_norm", &[], 8, &facts)
+                .is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """CPU-only tests for the gated-normalization arithmetic ablation harness."""
+import hashlib
 import json
 import struct
 import sys
@@ -15,8 +16,13 @@ from gated_norm_ablation import (FROZEN_KDA_SHA256, build_summary, compare_bf16,
 from gated_norm_variants import (KERNEL_ENTRY, VARIANTS, derive, frozen_body,
                                  render_variant)
 from native_ptx import sha
+from test_variant_compile import COMPILER, _fake_nvcc, _manifest
 
 KDA_CU = Path(__file__).resolve().parents[2] / 'kernels' / 'gb10' / 'common' / 'kda.cu'
+
+_COMPILE = {'schema': 'atlas-variant-compile-nvrtc-v1', 'lane': 'nvrtc',
+            'toolchain': 'NVRTC', 'options': ['--std=c++17', '--fmad=false'],
+            'variants': {}}
 
 
 def _changed_lines(diff):
@@ -180,7 +186,7 @@ def test_compare_bf16_caps_coordinates():
 def _run_record(self_reproduction=True, exact_reference=True, unequal_reference=0,
                 max_ulp_reference=0):
     # Engagement controls as written by the runner's control loop for the
-    # attested/v0-copy/v-all runs (native_gated_norm_replay.perturbations).
+    # attested/v0-copy/v-all/v24-minimal runs (native_gated_norm_replay.perturbations).
     return {
         'self_reproduction': self_reproduction,
         'vs_candidate': {'exact': True, 'unequal_elements': 0, 'max_ulp': 0,
@@ -206,8 +212,8 @@ def _synthetic_rows(v0_copy_ok=True, attested_ok=True):
 
 def test_summary_aggregates_and_interpretation_blocked():
     harness = {'gated_norm_ablation.py': 'a', 'gated_norm_variants.py': 'b'}
-    summary = build_summary(0, _synthetic_rows(), harness)
-    assert summary['schema'] == 'atlas-gated-norm-ablation-summary-v1'
+    summary = build_summary(0, _synthetic_rows(), harness, _COMPILE)
+    assert summary['schema'] == 'atlas-gated-norm-ablation-summary-v2'
     assert summary['runs']['attested'] == {
         'rows_exact_vs_candidate': 2, 'rows_exact_vs_reference': 2,
         'total_unequal_vs_reference': 0, 'max_ulp_vs_reference': 0}
@@ -219,22 +225,23 @@ def test_summary_aggregates_and_interpretation_blocked():
     assert summary['anchors'] == {'attested': True, 'v0-copy': True}
     assert summary['harness_sha256'] == harness
 
-    blocked = build_summary(1, _synthetic_rows(v0_copy_ok=False), harness)
+    blocked = build_summary(1, _synthetic_rows(v0_copy_ok=False), harness, _COMPILE)
     assert blocked['interpretation_blocked'] is True
     assert blocked['anchors'] == {'attested': True, 'v0-copy': False}
     assert blocked['runs']['v-all']['rows_exact_vs_candidate'] == 2  # runs not skipped
 
-    attested_blocked = build_summary(1, _synthetic_rows(attested_ok=False), harness)
+    attested_blocked = build_summary(1, _synthetic_rows(attested_ok=False), harness, _COMPILE)
     assert attested_blocked['interpretation_blocked'] is True
     assert attested_blocked['anchors'] == {'attested': False, 'v0-copy': True}
 
 
 def test_summary_retains_engagement_controls():
-    summary = build_summary(0, _synthetic_rows(), {'gated_norm_ablation.py': 'a'})
-    for name in ('attested', 'v0-copy', 'v-all'):
+    summary = build_summary(0, _synthetic_rows(), {'gated_norm_ablation.py': 'a'}, _COMPILE)
+    for name in ('attested', 'v0-copy', 'v-all', 'v24-minimal'):
         controls = summary['rows'][0]['runs'][name]['controls']
         assert set(controls) == {'input', 'gate', 'weight'}
         assert all(record['engaged'] for record in controls.values())
+        assert summary['rows'][0]['runs'][name]['controls_engaged'] is True
     assert 'controls' not in summary['rows'][0]['runs']['v1-reduction-order']
 
 
@@ -242,7 +249,7 @@ def test_summary_blocks_on_one_failed_control_with_passing_anchors():
     harness = {'gated_norm_ablation.py': 'a'}
     rows = _synthetic_rows()
     rows[1]['runs']['v-all']['controls']['gate']['engaged'] = False
-    summary = build_summary(0, rows, harness)
+    summary = build_summary(0, rows, harness, _COMPILE)
     assert all(summary['anchors'].values())  # every replay anchor passes
     assert summary['interpretation_blocked'] is True  # one failed control blocks
     assert summary['rows'][1]['runs']['v-all']['controls']['gate'] == {
@@ -254,14 +261,14 @@ def test_summary_blocks_on_absent_required_control():
     harness = {}
     rows = _synthetic_rows()
     del rows[0]['runs']['attested']['controls']['weight']
-    summary = build_summary(0, rows, harness)
+    summary = build_summary(0, rows, harness, _COMPILE)
     assert all(summary['anchors'].values())
     assert summary['interpretation_blocked'] is True
     assert 'weight' not in summary['rows'][0]['runs']['attested']['controls']
 
     rows = _synthetic_rows()
     del rows[1]['runs']['v0-copy']['controls']
-    summary = build_summary(0, rows, harness)
+    summary = build_summary(0, rows, harness, _COMPILE)
     assert summary['interpretation_blocked'] is True
     assert summary['rows'][1]['runs']['v0-copy']['controls'] is None
 
@@ -269,10 +276,10 @@ def test_summary_blocks_on_absent_required_control():
 def test_summary_gate_fails_command_when_blocked():
     harness = {}
     gated_norm_ablation.enforce_summary_gate(
-        build_summary(0, _synthetic_rows(), harness), [])  # clean run exits 0
+        build_summary(0, _synthetic_rows(), harness, _COMPILE), [])  # clean run exits 0
     rows = _synthetic_rows()
     rows[1]['runs']['v-all']['controls']['gate']['engaged'] = False
-    blocked = build_summary(0, rows, harness)
+    blocked = build_summary(0, rows, harness, _COMPILE)
     with pytest.raises(RuntimeError):
         gated_norm_ablation.enforce_summary_gate(blocked, [])
     with pytest.raises(RuntimeError):
@@ -284,9 +291,31 @@ def test_summary_requires_complete_run_records():
     rows = _synthetic_rows()
     del rows[0]['runs']['v-all']
     with pytest.raises(ValueError):
-        build_summary(0, rows, {})
+        build_summary(0, rows, {}, _COMPILE)
     with pytest.raises(ValueError):
-        build_summary(0, [], {})
+        build_summary(0, [], {}, _COMPILE)
+
+
+def test_summary_requires_explicit_variant_compile_record():
+    for record in ({}, None, {'lane': ''}):
+        with pytest.raises(ValueError, match='variant compile record'):
+            build_summary(0, _synthetic_rows(), {}, record)
+
+
+def test_summary_blocks_when_v24_minimal_controls_do_not_engage():
+    rows = _synthetic_rows()
+    rows[0]['runs']['v24-minimal']['controls']['gate']['engaged'] = False
+    summary = build_summary(0, rows, {}, _COMPILE)
+    assert all(summary['anchors'].values())  # replay anchors still pass
+    assert summary['interpretation_blocked'] is True
+    assert summary['rows'][0]['runs']['v24-minimal']['controls_engaged'] is False
+
+    rows = _synthetic_rows()
+    del rows[1]['runs']['v24-minimal']['controls']
+    summary = build_summary(0, rows, {}, _COMPILE)
+    assert summary['interpretation_blocked'] is True
+    with pytest.raises(RuntimeError):
+        gated_norm_ablation.enforce_summary_gate(summary, [])
 
 
 def test_validate_cli_rejects_bad_rank_and_existing_out(tmp_path):
@@ -458,7 +487,7 @@ def test_validate_fixture_rejects_reordered_or_mismatched_rows(tmp_path):
 
 # --- main() wiring, driven end to end with GPU-dependent pieces stubbed ---
 
-def _stub_main(monkeypatch, tmp_path):
+def _stub_main(monkeypatch, tmp_path, production=False):
     """Drive main() on one valid synthetic fixture row with every GPU-, PTX-
     and frozen-source-dependent call stubbed. Returns (out_dir, fixture_dir,
     calls) where calls records replay/enforce invocations."""
@@ -467,8 +496,8 @@ def _stub_main(monkeypatch, tmp_path):
     ptx_dir = tmp_path / 'ptx'
     ptx_dir.mkdir()
     (ptx_dir / 'kda.ptx').write_text(
-        '.entry ' + KERNEL_ENTRY + '( .param .u64 a, .param .u64 b, .param .u64 c, '
-        '.param .u64 d, .param .u32 e, .param .u32 f, .param .f32 g )')
+        '.target sm_121f\n.entry ' + KERNEL_ENTRY + '( .param .u64 a, .param .u64 b, '
+        '.param .u64 c, .param .u64 d, .param .u32 e, .param .u32 f, .param .f32 g )')
     (tmp_path / 'binding.json').write_text('{}')
     out = tmp_path / 'out'
     calls = {'replay': 0, 'enforce': None}
@@ -477,7 +506,8 @@ def _stub_main(monkeypatch, tmp_path):
     cupy.cuda.runtime.driverGetVersion.return_value = 13000
     monkeypatch.setitem(sys.modules, 'cupy', cupy)
     monkeypatch.setattr(gated_norm_ablation, 'validate_binding', lambda *a: {
-        'image': 'img@sha256:' + '0' * 64, 'modules': {'kda': {'file': 'kda.ptx'}}})
+        'image': 'img@sha256:' + '0' * 64,
+        'modules': {'kda': {'file': 'kda.ptx', 'sha256': 'a' * 64}}})
     real_sha = gated_norm_ablation.sha
     frozen_kda = tmp_path / 'kda.cu'
     monkeypatch.setattr(gated_norm_ablation, 'sha', lambda path: (
@@ -499,10 +529,17 @@ def _stub_main(monkeypatch, tmp_path):
     def enforce(summary, failures):
         calls['enforce'] = (summary, list(failures))
     monkeypatch.setattr(gated_norm_ablation, 'enforce_summary_gate', enforce)
-    monkeypatch.setattr(sys, 'argv', [
-        'gated_norm_ablation.py', '--fixtures', str(fixtures), '--rank', '1',
-        '--common', str(tmp_path), '--ptx-dir', str(ptx_dir),
-        '--ptx-binding', str(tmp_path / 'binding.json'), '--out', str(out)])
+    argv = ['gated_norm_ablation.py', '--fixtures', str(fixtures), '--rank', '1',
+            '--common', str(tmp_path), '--ptx-dir', str(ptx_dir),
+            '--ptx-binding', str(tmp_path / 'binding.json'), '--out', str(out)]
+    if production:
+        script, _ = _fake_nvcc(tmp_path)
+        argv += ['--variant-compile', 'nvcc-production',
+                 '--build-manifest', str(_manifest(tmp_path)),
+                 '--nvcc', str(script)]
+    else:
+        argv += ['--variant-compile', 'nvrtc']
+    monkeypatch.setattr(sys, 'argv', argv)
     return out, fixtures, calls
 
 
@@ -525,6 +562,7 @@ def test_main_passes_saved_summary_to_enforce_summary_gate(monkeypatch, tmp_path
     summary, failures = calls['enforce']
     saved = json.loads((out / 'ablation-summary.json').read_text())
     assert summary == saved
+    assert saved['variant_compile']['lane'] == 'nvrtc'
     # Perturbations are stubbed to none, so control runs carry no engaged
     # controls and the summary must block interpretation.
     assert saved['interpretation_blocked'] is True
@@ -544,6 +582,29 @@ def test_main_writes_failure_receipt_and_reraises_on_crash(monkeypatch, tmp_path
     assert failure['row'] == 0
     assert failure['utc_time'].endswith('Z')
     assert calls['enforce'] is None
+
+
+def test_main_nvcc_production_lane_compiles_and_records(monkeypatch, tmp_path):
+    out, _, calls = _stub_main(monkeypatch, tmp_path, production=True)
+    gated_norm_ablation.main()
+    summary, _ = calls['enforce']
+    record = summary['variant_compile']
+    assert record['lane'] == 'nvcc-production'
+    assert record['arch'] == 'sm_121f'
+    assert record['compiler'] == COMPILER
+    assert record['effective_flags'] == [
+        '--fmad=false', '-DTQ_PLUS_SIGNS', '--expt-relaxed-constexpr']
+    for name in VARIANTS:
+        ptx = out / 'variant-ptx' / (name + '.ptx')
+        assert ptx.is_file()
+        assert (out / 'variant-src' / (name + '.cu')).read_text() == 'code'
+        assert record['variants'][name]['ptx_sha256'] == hashlib.sha256(
+            ptx.read_bytes()).hexdigest()
+    receipt = json.loads((out / 'rank1-row0' / 'receipt.json').read_text())
+    assert receipt['variant_compile'] == record
+    assert receipt['runs'][1]['variant_compile'] == 'nvcc-production'
+    assert (tmp_path / 'nvcc-args.txt').read_text().splitlines()[:3] == [
+        '--ptx', '-arch=sm_121f', '-O3']
 
 
 # --- Item 2: negative validator branch tests ---
@@ -644,13 +705,14 @@ def test_f32_bits_rejects_overflow():
         gated_norm_ablation._f32_bits(1e40)
 
 def test_summary_controls_engaged_is_per_variant():
-    summary = build_summary(0, _synthetic_rows(), {})
+    summary = build_summary(0, _synthetic_rows(), {}, _COMPILE)
     for row in summary['rows']:
         for name, record in row['runs'].items():
-            assert record['controls_engaged'] is (name in ('attested', 'v0-copy', 'v-all'))
+            assert record['controls_engaged'] is (
+                name in ('attested', 'v0-copy', 'v-all', 'v24-minimal'))
     rows = _synthetic_rows()
     rows[0]['runs']['v-all']['controls']['gate']['engaged'] = False
-    summary = build_summary(0, rows, {})
+    summary = build_summary(0, rows, {}, _COMPILE)
     assert summary['rows'][0]['runs']['v-all']['controls_engaged'] is False
     assert summary['rows'][0]['runs']['attested']['controls_engaged'] is True
 

@@ -23,6 +23,7 @@ import analyze_localization
 import gated_norm_variants
 import native_gated_norm_replay
 import native_ptx
+import variant_compile
 from analyze_localization import bf16_key, metrics
 from gated_norm_variants import KERNEL_ENTRY, VARIANTS, derive, frozen_body
 from native_gated_norm_replay import (KDA_CONTRACT, device_properties,
@@ -30,7 +31,9 @@ from native_gated_norm_replay import (KDA_CONTRACT, device_properties,
 from native_ptx import load_module, sha, validate_binding, NVRTC_OPTIONS
 
 FROZEN_KDA_SHA256 = 'bf2149c381d6c4283930d2bc69f6c5ddb4d53f7755de954de9f9762d179af9bd'
-CONTROL_RUNS = ('attested', 'v0-copy', 'v-all')
+# v24-minimal carries engagement controls like the attested/composition runs:
+# a v24 claim without them is interpretation-blocked (plan D4).
+CONTROL_RUNS = ('attested', 'v0-copy', 'v-all', 'v24-minimal')
 ANCHOR_RUNS = ('attested', 'v0-copy')
 # Engagement-control names written by native_gated_norm_replay.perturbations().
 REQUIRED_CONTROLS = ('input', 'gate', 'weight')
@@ -65,12 +68,15 @@ def compare_bf16(output, target):
     return result
 
 
-def build_summary(rank, rows, harness_sha256):
+def build_summary(rank, rows, harness_sha256, variant_compile_record):
     """Aggregate per-row run records across rows; interpretation is blocked
     unless every replay anchor passes and every required engagement control
-    is present and engaged on every control run."""
+    is present and engaged on every control run. The variant compile lane
+    travels with the summary so a v24 claim can never be read across lanes."""
     if not rows:
         raise ValueError('at least one row record required')
+    if not isinstance(variant_compile_record, dict) or not variant_compile_record.get('lane'):
+        raise ValueError('explicit variant compile record required')
     run_order = ('attested',) + tuple(VARIANTS)
     aggregates = {}
     for name in run_order:
@@ -111,10 +117,11 @@ def build_summary(rank, rows, harness_sha256):
         summary_rows.append({'row': row['row'], 'tokens': row['tokens'],
                              'runs': run_records})
     return {
-        'schema': 'atlas-gated-norm-ablation-summary-v1',
+        'schema': 'atlas-gated-norm-ablation-summary-v2',
         'rank': rank,
         'runs': aggregates,
         'rows': summary_rows,
+        'variant_compile': variant_compile_record,
         'interpretation_blocked': not (all(anchors.values()) and controls_engaged),
         'anchors': anchors,
         'harness_sha256': harness_sha256}
@@ -228,6 +235,11 @@ def main():
     parser.add_argument('--rank', type=int, required=True)
     for name in ('common', 'ptx-dir', 'ptx-binding', 'out'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--variant-compile', required=True,
+                        choices=variant_compile.LANES)
+    parser.add_argument('--build-manifest', type=Path)
+    parser.add_argument('--nvcc', default='nvcc',
+                        help='nvcc executable for the nvcc-production lane')
     args = parser.parse_args()
     validate_cli(args.fixtures, args.rank, args.out)
     rows = row_dirs(args.fixtures, args.rank)
@@ -248,16 +260,38 @@ def main():
                'gated_norm_variants.py': sha(Path(gated_norm_variants.__file__)),
                'native_gated_norm_replay.py': sha(Path(native_gated_norm_replay.__file__)),
                'native_ptx.py': sha(Path(native_ptx.__file__)),
+               'variant_compile.py': sha(Path(variant_compile.__file__)),
                'analyze_localization.py': sha(Path(analyze_localization.__file__))}
+    lane = variant_compile.parse_lane(args.variant_compile, args.build_manifest)
+    production = (variant_compile.production_binding(args.build_manifest, binding, ptx_path)
+                  if lane == 'nvcc-production' else None)
     # Immutable output directories preserve failures as well as successes.
     args.out.mkdir(parents=True, exist_ok=False)
     import cupy as cp
     kernels = {'attested': load_module(cp, args.common, 'kda', args.ptx_dir, binding).get_function(
         KERNEL_ENTRY)}
-    options = NVRTC_OPTIONS + ('-I' + str(args.common),)
-    for name in VARIANTS:
-        kernels[name] = cp.RawModule(code=derived[name][0], options=options).get_function(
-            KERNEL_ENTRY)
+    if lane == 'nvcc-production':
+        source_dir, compiled_dir = args.out / 'variant-src', args.out / 'variant-ptx'
+        source_dir.mkdir()
+        compiled_dir.mkdir()
+        compile_record = dict(production)
+        compile_record['nvcc'] = args.nvcc
+        compile_record['variants'] = {}
+        for name in VARIANTS:
+            source = source_dir / (name + '.cu')
+            source.write_text(derived[name][0])
+            out_ptx = compiled_dir / (name + '.ptx')
+            record = variant_compile.compile_variant(
+                args.nvcc, source, out_ptx, args.common, production, KERNEL_ENTRY)
+            record['variant_unified_diff'] = derived[name][1]
+            compile_record['variants'][name] = record
+            kernels[name] = cp.RawModule(path=str(out_ptx)).get_function(KERNEL_ENTRY)
+    else:
+        options = NVRTC_OPTIONS + ('-I' + str(args.common),)
+        compile_record = variant_compile.nvrtc_record(options, derived)
+        for name in VARIANTS:
+            kernels[name] = cp.RawModule(code=derived[name][0], options=options).get_function(
+                KERNEL_ENTRY)
     run_order = ('attested',) + tuple(VARIANTS)
     row_records, failures = [], []
     for row, row_dir in rows:
@@ -287,6 +321,7 @@ def main():
                 else:
                     record['variant_source_sha256'] = derived[run][2]
                     record['variant_unified_diff'] = derived[run][1]
+                    record['variant_compile'] = compile_record['lane']
                 if run in CONTROL_RUNS:
                     record['controls'] = {}
                     for control_name, operands in perturbations(core, gate, weight).items():
@@ -302,8 +337,9 @@ def main():
                     failures.append(out_dir.name + ': ' + run + ' self-reproduction anchor failed')
                 run_records.append(record)
             receipt = {
-                'schema': 'atlas-gated-norm-ablation-v1',
+                'schema': 'atlas-gated-norm-ablation-v2',
                 'rank': args.rank, 'row': row, 'tokens': int(core.shape[0]),
+                'variant_compile': compile_record,
                 'epsilon_f32': float(epsilon),
                 'epsilon_f32_bits': struct.unpack('<I', struct.pack('<f', float(epsilon)))[0],
                 'grid': list(grid), 'block': list(block),
@@ -335,7 +371,7 @@ def main():
                        'row': int(row), 'utc_time': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}
             (failure_dir / 'failure.json').write_text(json.dumps(failure) + '\n')
             raise
-    summary = build_summary(args.rank, row_records, harness)
+    summary = build_summary(args.rank, row_records, harness, compile_record)
     (args.out / 'ablation-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     enforce_summary_gate(summary, failures)
 

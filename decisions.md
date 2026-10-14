@@ -7,6 +7,128 @@ this file references them, it does not duplicate them. Newest first.
 Superseded entries are kept as one-line stubs marked **SUPERSEDED**, so the
 audit trail survives; their full text is in git history.
 
+## 2026-10-14 — L1 escalation + v24-prerequisite tooling batch (major)
+
+- Choices: (a) wait for GPU windows and implement per-item then, (b)
+  pre-stage every CPU-only piece now so windows execute runs instead of
+  growing code. Operator choice 2026-10-14: **(b)** for the L1 tooling
+  (todo.md "Now" #4) and the v24 prerequisites (todo.md "Next").
+- Decision: implement D1–D5 per
+  [docs/plans/l1-escalation-tooling-spec.md](docs/plans/l1-escalation-tooling-spec.md)
+  — candidate L0→L1 capture + mHC boundary binding (`upstream.rs`,
+  `hc.rs::mhc_residual_precision` SSOT), reference overlay extension
+  (`$EV/q2-l1-tooling-20261013/`), `l1_bisect.py` driver, v24 engagement
+  controls, and the `nvcc-production` ablation compile lane. Batch commit
+  of 2026-10-14 (this entry lives inside it; hash is self-referential).
+- Why: the Sparks are the scarce resource; a free window must run tests,
+  not host implementation work. All GPU obligations stay recorded as owed
+  (spec per-deliverable sections; no GPU evidence claimed).
+- Test recipe note: Rust tests DO run on this host via the C1-era link
+  stubs (`LD_LIBRARY_PATH=/tmp/c1-cuda-stubs RUSTFLAGS="-L
+  /tmp/c1-cuda-stubs"` + `ATLAS_SKIP_BUILD=1`), contradicting the
+  2026-10-13 entry's "cannot link on this host" — 1654 spark-model tests
+  pass. The stubs are link-only; no CUDA numerics are exercised.
+
+## 2026-10-14 — ablation variant compile flags: recorded build manifest is the SSOT (minor)
+
+- Choices: (a) hand-supplied flag lists, (b) re-derive from KERNEL.toml/
+  MODEL.toml in Python, (c) replay the flags recorded by the build.
+- Decision: **(c)** — `variant_compile.py` reads
+  `atlas-exl3-build-manifest-v1` `compiler_flags` (`module_flags.kda` else
+  `flags`), tied to the attested embedded PTX (sha) + its `.target` arch +
+  the local nvcc compiler identity, with argv parity to
+  `atlas-kernels/build_target.rs` (`--ptx -arch=… -O3 [win32 -std=c++17]
+  <flags> --Werror all-warnings <src> -o <out>`).
+- Why: (a) is drift-by-hand; (b) duplicates build.rs merge semantics in a
+  second language. (c) replays exactly what built the binary being
+  attributed. Both lanes (`nvrtc` historical, `nvcc-production`) are
+  required-explicit and recorded per run so a v24 claim can never be read
+  across lanes. The `--Werror` strict default is mirrored deliberately; a
+  future nonempty warning-suppress list would surface as a compile failure
+  here, not silent drift.
+
+## 2026-10-14 — L1 bisection boundary decisions (minor)
+
+- Local o_proj is **not bisectable cross-engine** (assumption B13): the
+  reference `o_proj` is a `RowParallelLinear` (reduce inside `forward`),
+  so its hook output `kda-o-proj` is post-reduce. Decision: the spine uses
+  the reduced-o_proj step, `kda-o-proj-input0` stays a diagnostic pair,
+  and a pre-reduce reference capture is an owed overlay extension. Why:
+  capturing it requires wrapping the reference's internal reduce — deferred
+  rather than guessed; C1 already closed the local projection question.
+- L1 capture layers are the explicit {0,1} boundary on both engines (why:
+  narrowest scope of the granted escalation; G1's layers 4–44 widen it in
+  their own reviewed change). The driver fails on incomplete bisection
+  AFTER writing the report (why: a partial pair table is evidence; the
+  analyze_localization refusal pattern already does this).
+
+## 2026-10-14 — independent review of the tooling batch: BLOCK fixed (major)
+
+- Reviewer verdict BLOCK on three D3 majors: layout mapping not reused
+  (real reference core/gated shapes would error every mapped pair); pair 5
+  silently dropped with a wrong spec citation; report lost on failure.
+  Minors: disabled capture validated the binding; binding schema drifted
+  (`local_rows`); harness hash omitted `variant_compile.py`; tautological
+  win32 assertion; D2 recorded unexposed facts as `absent`/null.
+- Decision: all fixed in this batch — `kda_layout` mapping + tests,
+  spec/assumption amendment (B13) + citation fix, report-before-fail,
+  binding built only when armed (pinned by test), spec-conformant `rows`
+  schema, harness hash complete, real win32 argv test, `unknown`+reason
+  records. Re-tested: 62 in-repo Python, 19 overlay, 1654 spark-model.
+- Why: GPU windows must not carry a driver that cannot parse the captures
+  it was built for. Accepted notes (no change): strict-flag fork risk
+  (recorded in code + above), `--layer` constrained to {0,1} (done).
+
+## 2026-10-14 — repo-health drift stays out of the tooling batch (minor)
+
+- Operator choice 2026-10-14: fmt (~207 files) / clippy (~70 findings
+  across spark-runtime+spark-model, incl. the C2 batch's `factory.rs:180`)
+  / typos (56 findings) drift is verified "pre-existing, none in changed
+  files" and stays for its own cleanup PR (todo.md housekeeping).
+- Why: bundling ~200 files of mechanical cleanup into tooling would bury
+  the reviewable change; the batch ships with the measured no-new-findings
+  bar instead of a green gate.
+
+## 2026-10-13 — M1-parallel CPU batch landed; first pass ready for review/testing (minor)
+
+- Landed the CPU-only items todo.md authorises alongside M1 GPU work:
+  Q3 native-opener tests (`44da2486`), Q3 per-turn thinking-toggle cases
+  (`918369ab`), norm-substitution module split (`05dcaca8`), dense-prefill
+  flag test triage (`a2d36244`), exl3_checkpoint engagement test
+  (`2fc58662`), P0 trace-driver command review
+  (`p0-trace-prep-20261011/REVIEW-20261013.md`), KV plan-doc triage
+  (`2a3b995b` — decided commit, not delete; cross-referenced from todo.md).
+- Scope discipline: no frozen-profile surface touched, no GPU window
+  consumed. Rust tests compile clean but cannot link on this host (no CUDA
+  libs) — execution is owed on a Spark / CUDA CI. The exl3_checkpoint test
+  was deliberately built mock-GPU so it runs on CPU CI, exceeding the
+  "GPU-side test" ask.
+- P0 review verdict: driver/interfaces PASS; two decisions owed before
+  `--execute` (image pin choice; three-run schedule with decode-heavy
+  capped ≤600 output tokens for the ~5-min nsys limit). `--execute` stays
+  unscheduled per the README contract and the M1 GPU-window rule.
+- Discovered, recorded in todo.md housekeeping, NOT fixed here: repo-wide
+  fmt drift (~180 files under both local rustfmts) and three pre-existing
+  current-stable clippy errors. Fixing them is its own PR (one logical
+  change per commit).
+
+## 2026-10-13 — KV column-codec experiment scoped and planned (minor)
+
+- Operator request: plan (plan only, no implementation) for ClickHouse-like
+  column codecs applied to KV cache compression, staged implementation and
+  test plan required.
+- Scope chosen by operator: all tiers incl. GPU-resident (contraindicated vs
+  TQ+ kernel work — staged last with kill criteria); all serialized state
+  incl. SSM; Gorilla-TSDB core + T64 + per-block adaptive selection; success
+  gate is end-to-end tok/s under spill pressure with bit-exact roundtrip.
+- Plan lives at `docs/plans/atlas-kv-column-codecs-plan.md` (DMAIC, Stages
+  0–3 with entry/exit/kill criteria). Codecs compose after the existing lossy
+  quantizers; host tiers (`kv_spill`, high-speed-swap, prefix-cache) are the
+  primary target. Stage 3 (GPU-resident) is killable without failing the
+  experiment.
+- Why: host-tier KV is uncompressed today; ClickHouse-style prep+compressor
+  pipelines are the cheapest falsifiable hypothesis (Stage 0 is offline).
+
 ## 2026-10-12 — v2 qualification collection authorised (major)
 
 - Operator instruction: finish the replay and verification reports, then launch

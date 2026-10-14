@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+use super::manifest::dtype_width;
 use super::*;
 use crate::gpu::mock::MockGpuBackend;
 
