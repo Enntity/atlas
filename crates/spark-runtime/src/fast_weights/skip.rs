@@ -14,8 +14,9 @@
 //!   4. **`skip_mtp`** — `mtp.*` for a loader that builds no MTP head, opt-in.
 //!
 //!   5. **`skip_layer_prefix`** — an unused appended predictor layer, opt-in.
+//!   6. **`skip_vision`** — the vision tower on a rank that never encodes, opt-in.
 //!
-//! Rules 3, 4, and 5 default OFF and are allow-listed per model, because
+//! Rules 3 to 6 default OFF and are allow-listed per model, because
 //! withholding a tensor a loader DOES read is invisible until the output is
 //! subtly wrong. Rule 2 is structural and always active under EP, and rule 1
 //! is only ever populated by a loader that has its own row reader.
@@ -69,6 +70,9 @@ impl FastSafetensorsLoader {
             .iter()
             .any(|pattern| name.contains(pattern.as_str()))
         {
+            return true;
+        }
+        if self.skip_vision && crate::weights::is_vision_tower_tensor(name) {
             return true;
         }
         // MTP head weights for a model whose loader does not build one.
