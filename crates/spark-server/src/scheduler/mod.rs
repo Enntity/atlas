@@ -490,6 +490,13 @@ pub fn run(
             sched.limits.max_seq_len,
             block_size,
         );
+        let new_reqs = admission::hold_concurrent_vision(
+            &*model,
+            &pending,
+            new_reqs,
+            &prefilling,
+            max_prefill_tokens,
+        );
         sched.timing.record(mtp_timing::Phase::LoopDrain, t_loop);
 
         // ── Publish the observability snapshot (one uncontended lock + a

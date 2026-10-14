@@ -171,3 +171,31 @@ fn ep_zero_capacity_rejects_even_a_single_request() {
     assert!(reject_oversized(vec![request], 0, 262144, 262144, 16).is_empty());
     assert!(response_rx.try_recv().unwrap().is_err());
 }
+
+// The model holds ONE vision state (encoder rows, grids, item hashes) that
+// every chunk of an image prompt reads. These pin when a second image request
+// must wait so it cannot overwrite the state of one still chunking.
+const TEXT: (bool, bool) = (false, true);
+const IMAGE_ONE_CHUNK: (bool, bool) = (true, false);
+const IMAGE_CHUNKED: (bool, bool) = (true, true);
+
+#[test]
+fn an_image_request_waits_while_an_image_prefill_is_chunking() {
+    let reqs = [IMAGE_ONE_CHUNK, TEXT, IMAGE_CHUNKED];
+    assert_eq!(vision_holds(true, &reqs), vec![0, 2], "text never waits");
+    assert!(vision_holds(false, &reqs).is_empty());
+}
+
+#[test]
+fn a_chunked_image_admitted_this_tick_holds_later_images() {
+    assert_eq!(
+        vision_holds(
+            false,
+            &[IMAGE_CHUNKED, TEXT, IMAGE_ONE_CHUNK, IMAGE_CHUNKED]
+        ),
+        vec![2, 3]
+    );
+    // Single-chunk images finish inside their own call, so any number of them,
+    // and one chunked image after them, share a tick.
+    assert!(vision_holds(false, &[IMAGE_ONE_CHUNK, IMAGE_ONE_CHUNK, IMAGE_CHUNKED]).is_empty());
+}

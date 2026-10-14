@@ -290,6 +290,80 @@ pub(super) fn gate_admissions(
     admitted
 }
 
+/// Indices of this tick's requests that must wait so that at most one image
+/// prompt is ever part-way through its prefill.
+///
+/// The model holds ONE vision state: the encoder rows, the item grids MRoPE
+/// positions from, and the item hashes the cache keys from. Every chunk of an
+/// image prompt reads it, and a long prompt's chunks run across scheduler
+/// ticks. A second image request whose chunk 0 ran in between would overwrite
+/// it, and the first prompt's remaining chunks would splice the second
+/// request's image (or position against its grids).
+///
+/// `busy`: an image prefill is already in progress. `reqs[i]`: (has images,
+/// may take more than one chunk). A one-chunk image finishes inside its own
+/// call, so it only waits behind a chunking one.
+pub(super) fn vision_holds(mut busy: bool, reqs: &[(bool, bool)]) -> Vec<usize> {
+    let mut held = Vec::new();
+    for (i, &(image, chunked)) in reqs.iter().enumerate() {
+        if !image {
+            continue;
+        }
+        if busy {
+            held.push(i);
+        } else {
+            busy = chunked;
+        }
+    }
+    held
+}
+
+/// Apply [`vision_holds`]: the held requests go back to the front of the
+/// pending queue, in order, and are offered again next tick.
+pub(super) fn hold_concurrent_vision(
+    model: &dyn Model,
+    pending: &std::sync::Arc<(Mutex<PendingQueue>, Condvar)>,
+    new_reqs: Vec<InferenceRequest>,
+    prefilling: &[PrefillInProgress],
+    max_prefill_tokens: usize,
+) -> Vec<InferenceRequest> {
+    if !new_reqs.iter().any(|r| r.has_image_pixels()) {
+        return new_reqs;
+    }
+    let busy = prefilling
+        .iter()
+        .any(|p| model.tokens_contain_vision_pad(&p.prompt_tokens));
+    let shape: Vec<(bool, bool)> = new_reqs
+        .iter()
+        // `max_prefill_tokens == 0`: unchunked, every prefill is one call.
+        .map(|r| {
+            let chunked = max_prefill_tokens > 0 && r.prompt_len() > max_prefill_tokens;
+            (r.has_image_pixels(), chunked)
+        })
+        .collect();
+    let held = vision_holds(busy, &shape);
+    if held.is_empty() {
+        return new_reqs;
+    }
+    tracing::info!(
+        "vision admission: {} image request(s) wait for the image prefill in progress",
+        held.len()
+    );
+    let (mut admitted, mut waiting) = (Vec::new(), Vec::new());
+    for (i, req) in new_reqs.into_iter().enumerate() {
+        if held.contains(&i) {
+            waiting.push(req);
+        } else {
+            admitted.push(req);
+        }
+    }
+    let mut g = pending.0.lock();
+    for (i, req) in waiting.into_iter().enumerate() {
+        g.requests.insert(i, req);
+    }
+    admitted
+}
+
 #[cfg(test)]
 #[path = "admission_tests.rs"]
 mod tests;
