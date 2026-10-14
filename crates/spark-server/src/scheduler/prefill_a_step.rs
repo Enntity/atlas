@@ -288,7 +288,15 @@ pub fn start_chunked_prefill(
             // EP: broadcast chunk 0 to worker (no-op on single-GPU; the batched
             // step does NOT re-broadcast, so this stays the only broadcast site).
             model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
-            model.ep_broadcast_vision_state_for_seq(seq.slot_idx as u32, false, 0, 0, 0, 0)?;
+            model.ep_broadcast_vision_state_for_seq(
+                &seq,
+                seq.slot_idx as u32,
+                false,
+                0,
+                0,
+                0,
+                0,
+            )?;
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
             model.ep_broadcast_cmd(chunk_len as u32)?;
             model.ep_broadcast_cmd(0)?; // chunk_start
@@ -354,7 +362,9 @@ pub fn start_chunked_prefill(
         if vision_slice.is_none() && !image_pixels.is_empty() {
             // A model that caches vision prompts encodes inside the chunk-0
             // prefix lookup instead, and only the items it does not cover.
-            model.prepare_vision_embed_for_chunked(&image_pixels)?;
+            // The images move onto `seq` (per-sequence vision state): two
+            // image prompts can now interleave prefill chunks.
+            model.prepare_vision_embed_for_chunked(&mut seq, &image_pixels)?;
             // prepare_vision_embed() runs the vision encoder asynchronously on
             // the default stream, writing this request's patch embeddings into
             // the encoder's buf_out. The chunk-0 embedding injection inside
@@ -368,7 +378,23 @@ pub fn start_chunked_prefill(
             model.stream_wait_event(prefill_stream, prefill_event)?;
         }
 
-        dispatch_chunk0_vision(model, &seq, vision_slice, &image_pixels, req_disable_mtp)?;
+        // Co-dispatch: the batched encode wrote this request's rows into its
+        // slice of the shared buf_out, but the grids/hashes live per-sequence
+        // now — stamp them so MRoPE, the cache key and the worker's wire
+        // state read this request's own items.
+        if let Some(s) = vision_slice {
+            model.stage_vision_grids(&mut seq, &image_pixels);
+            seq.vision_rows_encoded = s.patch_row_count;
+            seq.vision_rows_base = 0;
+        }
+
+        dispatch_chunk0_vision(
+            model,
+            &mut seq,
+            vision_slice,
+            &image_pixels,
+            req_disable_mtp,
+        )?;
         // EP: broadcast chunk 0 tokens to worker.
         // Send full prompt length + all tokens so worker can do
         // identical Marconi prefix-cache lookups (bug #33 fix).
@@ -399,7 +425,7 @@ pub fn start_chunked_prefill(
             );
         }
         if vision_slice.is_some() {
-            model.set_vision_slice_base(0, 0, 0, 0);
+            model.set_vision_slice_base(&mut seq, 0, 0, 0, 0);
         }
         let logits = chunk_res?;
         super::prefill_normalization::initial(model, &seq)?;
