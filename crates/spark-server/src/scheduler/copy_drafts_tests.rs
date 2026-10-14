@@ -55,6 +55,24 @@ fn settings_are_off_unless_asked_and_fall_back_on_bad_values() {
 }
 
 #[test]
+fn long_copies_follow_the_models_parse() {
+    // `spark_model::speculative::long_copy` sized the verify pools from the
+    // same knobs; off by default and without the confidence width.
+    assert_eq!(on().long_max, 0);
+    let with = |conf: &'static str| {
+        Settings::parse(move |name| match name {
+            "ATLAS_DFLASH_COPY_DRAFTS" => Some("1".into()),
+            "ATLAS_DFLASH_CONF_WIDTH" => Some(conf.into()),
+            "ATLAS_DFLASH_COPY_LONG_MAX" => Some("15".into()),
+            _ => None,
+        })
+        .unwrap()
+        .long_max
+    };
+    assert_eq!((with("1"), with("0")), (15, 0));
+}
+
+#[test]
 fn a_quoted_span_proposes_what_followed_it() {
     // Prompt 10..=19; the reply has quoted 12, 13, 14 and is pending on 14.
     let tokens = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 1, 12, 13, 14];
@@ -413,3 +431,6 @@ fn copy_drafts_timing() {
         table.next_power_of_two() as f64 * 9.0 / (1 << 20) as f64
     );
 }
+
+#[path = "copy_drafts_long_tests.rs"]
+mod long;

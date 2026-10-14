@@ -7,6 +7,7 @@
 
 pub mod glm_repair_policy;
 pub mod ladder;
+pub mod long_copy;
 pub mod tree_shape;
 pub mod verify_key;
 

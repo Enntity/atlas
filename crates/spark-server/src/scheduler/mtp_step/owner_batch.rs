@@ -31,7 +31,7 @@ pub(super) fn verify_owner_batch(
         // Widest width every owner holds that the batch's row budget admits.
         let fits = (1..=owners
             .iter()
-            .map(|&i| active[i].pending_drafts.len())
+            .map(|&i| super::copy_drafts::ride_len(&active[i]))
             .min()
             .unwrap_or(0))
             .rev()
@@ -61,7 +61,7 @@ pub(super) fn verify_owner_batch(
         let lens: Vec<usize> = serial_idxs
             .iter()
             .filter(|&&i| active[i].grammar_state.is_none())
-            .map(|&i| active[i].pending_drafts.len())
+            .map(|&i| super::copy_drafts::ride_len(&active[i]))
             .filter(|&len| len > 0)
             .collect();
         let owners_at = |w: usize| lens.iter().filter(|&&len| len >= w).count();

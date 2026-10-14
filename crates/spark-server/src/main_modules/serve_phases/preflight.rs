@@ -174,7 +174,9 @@ pub(crate) fn preflight_reserve(
     let spec_on_pool =
         args.speculative || args.dflash || args.self_speculative || args.ngram_speculative;
     let pool_drafts = if args.dflash {
+        // A long copy's verify rows (`speculative::long_copy`), as the pools.
         super::build::checked_dflash_num_drafts(args.resolved_dflash_gamma())?
+            .max(spark_model::speculative::long_copy::drafts())
     } else {
         args.resolved_num_drafts()
     };

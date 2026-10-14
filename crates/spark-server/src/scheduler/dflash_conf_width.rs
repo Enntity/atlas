@@ -30,7 +30,11 @@
 //! `ATLAS_DFLASH_CONF_PROBE`-th step (default 64, 0 = never) verifies the
 //! full width, which observes the positions the rule had cut. Copied drafts
 //! (`copy_drafts`) are a kind of their own: their verifies decay and probe
-//! only the copy bins, and the drafter's only the drafter's.
+//! only the copy bins, and the drafter's only the drafter's. A copy may be
+//! longer than any drafter block (`ATLAS_DFLASH_COPY_LONG_MAX`, up to
+//! [`MAX_COPY_DRAFTS`]): the table keeps a cell per depth to there, and a
+//! verify whose owners all hold copies is priced over the copies' length;
+//! the drafter's bins never see a depth past [`MAX_DRAFTS`].
 //!
 //! `ATLAS_DFLASH_CONF_LOG=1` logs each verify's confidences beside its
 //! outcome (with or without the width rule) for offline fitting.
@@ -65,6 +69,9 @@ const EDGES: [f32; 10] = [
 pub(crate) const COPY_CONF: f32 = 1.0;
 pub(crate) const COPY_REPLY_CONF: f32 = 2.0;
 const COPY_BIN: usize = EDGES.len() + 1;
+/// The longest copy a verify prices (`copy_drafts`'s long copies): a lone
+/// copy verifies at most 32 rows, the one-owner row budget of [`step_ms`].
+pub(crate) const MAX_COPY_DRAFTS: usize = spark_model::speculative::long_copy::MAX_LONG_COPY_DRAFTS;
 const COPY_REPLY_BIN: usize = COPY_BIN + 1;
 const BINS: usize = COPY_REPLY_BIN + 1;
 /// Acceptance per bin before any verify: a drafter's top-1 probability
@@ -110,15 +117,15 @@ pub(crate) fn is_copy(conf: &[f32]) -> bool {
 /// Decayed acceptance counts per draft position and confidence bin.
 #[derive(Clone, Debug)]
 pub(crate) struct Calibration {
-    verified: [[f32; BINS]; MAX_DRAFTS],
-    accepted: [[f32; BINS]; MAX_DRAFTS],
+    verified: [[f32; BINS]; MAX_COPY_DRAFTS],
+    accepted: [[f32; BINS]; MAX_COPY_DRAFTS],
 }
 
 impl Default for Calibration {
     fn default() -> Self {
         Self {
-            verified: [[0.0; BINS]; MAX_DRAFTS],
-            accepted: [[0.0; BINS]; MAX_DRAFTS],
+            verified: [[0.0; BINS]; MAX_COPY_DRAFTS],
+            accepted: [[0.0; BINS]; MAX_COPY_DRAFTS],
         }
     }
 }
@@ -128,7 +135,7 @@ impl Calibration {
     /// it accepted every draft before it.
     fn rate(&self, depth: usize, b: usize) -> f32 {
         let column =
-            |counts: &[[f32; BINS]; MAX_DRAFTS]| counts.iter().map(|row| row[b]).sum::<f32>();
+            |counts: &[[f32; BINS]; MAX_COPY_DRAFTS]| counts.iter().map(|row| row[b]).sum::<f32>();
         let pooled = (column(&self.accepted) + PRIOR_WEIGHT * PRIOR[b])
             / (column(&self.verified) + PRIOR_WEIGHT);
         (self.accepted[depth][b] + POOL_WEIGHT * pooled) / (self.verified[depth][b] + POOL_WEIGHT)
@@ -136,10 +143,10 @@ impl Calibration {
 
     /// Survival of each draft: the chance it and every draft before it are
     /// accepted. Non-increasing, so a cut keeps a prefix.
-    pub(crate) fn survival(&self, conf: &[f32]) -> [f32; MAX_DRAFTS] {
-        let mut out = [0.0; MAX_DRAFTS];
+    pub(crate) fn survival(&self, conf: &[f32]) -> [f32; MAX_COPY_DRAFTS] {
+        let mut out = [0.0; MAX_COPY_DRAFTS];
         let mut alive = 1.0;
-        for (depth, &c) in conf.iter().take(MAX_DRAFTS).enumerate() {
+        for (depth, &c) in conf.iter().take(MAX_COPY_DRAFTS).enumerate() {
             alive *= self.rate(depth, bin(c));
             out[depth] = alive;
         }
@@ -164,7 +171,7 @@ impl Calibration {
                     .for_each(|cell| *cell *= DECAY);
             }
         }
-        let observed = drafted.min(accepted + 1).min(MAX_DRAFTS);
+        let observed = drafted.min(accepted + 1).min(MAX_COPY_DRAFTS);
         for (depth, &c) in conf.iter().take(observed).enumerate() {
             if c.is_finite() {
                 self.verified[depth][bin(c)] += 1.0;
@@ -232,20 +239,26 @@ pub(crate) struct Policy {
 impl Policy {
     /// Drafts per owner (1..=`max`) for owners with these confidences
     /// verifying together; `None` when any owner's drafts are not measured
-    /// (the caller's policy stands).
+    /// (the caller's policy stands). `max` is capped at [`MAX_DRAFTS`] unless
+    /// every owner holds copies (then at [`MAX_COPY_DRAFTS`]).
     pub(crate) fn choose<'a>(
         &mut self,
         owners: impl ExactSizeIterator<Item = &'a [f32]> + Clone,
         max: usize,
         params: Params,
     ) -> Option<usize> {
-        let max = max.min(MAX_DRAFTS);
+        let all_copies = owners.clone().all(is_copy);
+        let max = max.min(if all_copies {
+            MAX_COPY_DRAFTS
+        } else {
+            MAX_DRAFTS
+        });
         let measured =
             |conf: &[f32]| conf.len() >= max && conf[..max].iter().all(|c| c.is_finite());
         if max == 0 || owners.len() == 0 || !owners.clone().all(measured) {
             return None;
         }
-        let steps = if owners.clone().all(is_copy) {
+        let steps = if all_copies {
             &mut self.copy_steps
         } else {
             &mut self.steps

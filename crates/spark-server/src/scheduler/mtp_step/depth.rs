@@ -47,12 +47,75 @@ pub(super) fn lone_dflash_width(
     }
 }
 
-/// Cap a grammarless serial verify at the step's ladder depth.
-pub(super) fn ladder_truncate(a: &ActiveSeq, drafts: &mut Vec<u32>, ladder_nd: usize) {
+/// Cap a grammarless serial verify (drafts with confidences `conf`) at the
+/// step's ladder depth, or a long copy at [`lone_copy_cap`].
+pub(super) fn ladder_truncate(
+    model: &dyn Model,
+    a: &ActiveSeq,
+    drafts: &mut Vec<u32>,
+    conf: &[f32],
+    ladder_nd: usize,
+    max_seq_len: usize,
+) {
     // The n=1 path does not pass through the batched partition's depth
     // truncation above.  Honor the same ladder decision here so a K5
     // proposal can immediately step down to the cheaper K3 verifier.
-    if a.grammar_state.is_none() && drafts.len() > ladder_nd {
-        drafts.truncate(ladder_nd);
+    let cap = lone_copy_cap(
+        ladder_nd,
+        spark_model::speculative::long_copy::drafts(),
+        model.mtp_slot_draft_capacity(a.seq.slot_idx),
+        super::super::dflash_conf_width::is_copy(conf),
+        a.seq.seq_len,
+        max_seq_len,
+    );
+    if a.grammar_state.is_none() && drafts.len() > cap {
+        drafts.truncate(cap);
+    }
+}
+
+/// Drafts a lone owner verifies at most: the ladder's `ladder_nd`, or for a
+/// copy (`copy_drafts`) up to `long` (0 = long copies off) within the
+/// drafts its verify slot holds (`slot_cap`) and below the context ceiling
+/// (`mtp_gate::ceiling`, which gated the step at `ladder_nd` only).
+pub(super) fn lone_copy_cap(
+    ladder_nd: usize,
+    long: usize,
+    slot_cap: usize,
+    copy: bool,
+    seq_len: usize,
+    max_seq_len: usize,
+) -> usize {
+    let long = long.min(slot_cap);
+    if copy
+        && long > ladder_nd
+        && super::super::mtp_gate::ceiling::verify_rows_fit(seq_len, long, max_seq_len)
+    {
+        long
+    } else {
+        ladder_nd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lone_copy_cap;
+
+    #[test]
+    fn only_a_long_copy_verifies_past_the_ladder_within_its_slot_and_the_ceiling() {
+        // (ladder, long, slot capacity, copy, seq_len, max_seq_len) -> cap
+        let cap = |long, slot, copy, seq_len| lone_copy_cap(7, long, slot, copy, seq_len, 1000);
+        // Long copies off, or DFlash2's block: the ladder, as shipped.
+        assert_eq!(cap(0, 31, true, 10), 7);
+        assert_eq!(cap(31, 31, false, 10), 7);
+        // A copy: the long maximum, within the slot's verify pools.
+        assert_eq!(cap(31, 31, true, 10), 31);
+        assert_eq!(cap(31, 15, true, 10), 15);
+        assert_eq!(cap(15, usize::MAX, true, 10), 15);
+        // Never below the ladder, and not where its rows would reach the
+        // context ceiling (the step was gated at the ladder's width).
+        assert_eq!(cap(31, 5, true, 10), 7);
+        assert_eq!(cap(31, 31, true, 1000 - 32), 31);
+        assert_eq!(cap(31, 31, true, 1000 - 31), 7);
+        assert_eq!(lone_copy_cap(7, 31, 31, true, 10, 0), 31);
     }
 }

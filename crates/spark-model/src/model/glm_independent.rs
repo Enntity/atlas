@@ -163,7 +163,8 @@ pub fn validate_projection_handles(nvfp4: [u64; 7], bf16: u64) -> Result<()> {
     Ok(())
 }
 /// Rows whose FFN may take the exact independent 2..8-row MoE: the actual
-/// independent decode lane, or one GLM DFlash verify block.
+/// independent decode lane, or one GLM DFlash verify block (up to a long
+/// copy's rows, `speculative::long_copy`, where those are on).
 pub fn ffn_rows_selected(ctx: &ForwardContext, rows: usize) -> Result<bool> {
     if selected(ctx, rows)? {
         return Ok(true);
@@ -172,7 +173,9 @@ pub fn ffn_rows_selected(ctx: &ForwardContext, rows: usize) -> Result<bool> {
         && ctx.config.model_type == "glm5_next"
         && ctx.config.tp_world_size == 2
         && ctx.config.ep_world_size == 2
-        && (2..=crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS).contains(&rows))
+        && (2..=crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS
+            .max(crate::speculative::long_copy::drafts() + 1))
+            .contains(&rows))
 }
 
 /// The indexed view is produced only by the actual independent model path.

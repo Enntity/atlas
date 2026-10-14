@@ -173,10 +173,20 @@ fn fixed() -> Option<usize> {
 /// holding at least `max` drafts: its acceptance history and the drafter's
 /// confidence in its drafts (`ActiveSeq::draft_conf`). `None` leaves the
 /// caller's policy in place.
+///
+/// Past [`MAX_DRAFTS`] (a long copy, `copy_drafts`) only the confidence
+/// width prices rows, from the copy bins; any other policy, or the rule off,
+/// verifies at most [`MAX_DRAFTS`].
 pub(crate) fn choose<'a>(
     owners: impl ExactSizeIterator<Item = (&'a DraftSurvival, &'a [f32])> + Clone,
     max: usize,
 ) -> Option<usize> {
+    if max > MAX_DRAFTS
+        && fixed().is_none()
+        && let Some(w) = super::dflash_conf_width::choose(owners.clone().map(|(_, conf)| conf), max)
+    {
+        return Some(w);
+    }
     let max = max.min(MAX_DRAFTS);
     if max == 0 {
         return None;

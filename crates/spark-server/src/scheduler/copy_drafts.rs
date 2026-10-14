@@ -41,9 +41,10 @@
 //!   collision only costs a candidate, and the walk is capped at
 //!   [`MAX_HOPS`].
 //! - **Merge.** A copy that differs from DFlash2's block replaces it; one
-//!   DFlash2 already agrees with leaves it alone. `k` never exceeds the
-//!   drafts DFlash2 proposed, so a verify stays within the widths DFlash2
-//!   uses (and the M16/M32 verify kernels it runs on). Copies carry
+//!   DFlash2 already agrees with leaves it alone. `k` (but a long copy's,
+//!   below) never exceeds the drafts DFlash2 proposed, so a verify stays
+//!   within the widths DFlash2 uses (and the M16/M32 verify kernels it runs
+//!   on). Copies carry
 //!   [`COPY_CONF`] (of the prompt) or [`COPY_REPLY_CONF`] (of the reply) for
 //!   confidences, so `ATLAS_DFLASH_CONF_WIDTH` prices them by the copies'
 //!   own measured acceptance and never by DFlash2's.
@@ -55,6 +56,25 @@
 //! reply must match (code replies repeat short boilerplate whose
 //! continuations differ); `ATLAS_DFLASH_COPY_MISS_MAX` (0 = off) drafts a
 //! copy after a copy that was not kept whole, until one is.
+//!
+//! **Long copies** (`ATLAS_DFLASH_COPY_LONG_MAX`, default 0 = off, else
+//! `8..=31`; needs `ATLAS_DFLASH_CONF_WIDTH=1`, parsed by
+//! `spark_model::speculative::long_copy`, which sizes the verify pools for
+//! the wider rows): a reply that re-emits its prompt (a file edited and
+//! written back whole) keeps nearly every copy, and at most [`MAX_DRAFTS`]
+//! drafts a step it pays a verify every eight tokens. After a copy round kept whole, a copy of the
+//! prompt proposes up to the long maximum instead, past DFlash2's block, and
+//! the confidence width prices its rows by the prompt-copy bin's measured
+//! acceptance at each depth (`dflash_conf_width`), so it goes wide only
+//! while copies are being kept. Copies of the reply never go long. Only a
+//! lone owner verifies past [`MAX_DRAFTS`] (`ladder_truncate`, within the
+//! drafts its verify slot holds and below the context ceiling); an owner
+//! batch, the batched verify and a prefill ride cut a long copy to their
+//! common width (`ride_len`) as before.
+//! Offline estimate (sparkglm-research
+//! `experiments/suffix-probe-20261014/LONG-COPY.md`): +34–37% decode on
+//! whole-file edits at 31, +8% on partial edits, flat elsewhere, with rows
+//! priced at a linear 6.1 ms.
 //!
 //! Each request's `Done:` line is followed by a `COPY DRAFTS` line with its
 //! copy rounds, drafts and accepted drafts, of the prompt and of the reply.
@@ -101,6 +121,8 @@ struct Settings {
     max: usize,
     reply_match: usize,
     miss_max: usize,
+    /// Drafts a long copy proposes at most; 0 = off.
+    long_max: usize,
 }
 
 impl Settings {
@@ -127,6 +149,8 @@ impl Settings {
                 v > match_len && v <= 64
             }),
             miss_max: num("ATLAS_DFLASH_COPY_MISS_MAX", 0, &|v| v <= max),
+            // The model sized its verify pools from the same parse.
+            long_max: spark_model::speculative::long_copy::parse_drafts(&var),
         })
     }
 }
@@ -339,6 +363,11 @@ pub(crate) struct CopyState {
 }
 
 impl CopyState {
+    /// The last settled copy round kept every draft it verified.
+    fn kept(&self) -> bool {
+        !self.missed && self.rounds.iter().any(|&r| r > 0)
+    }
+
     /// The state a preempted request resumes with: the index and counters are
     /// host-side and its context is unchanged, so only the offer is renewed.
     pub(super) fn resumed(self) -> Self {
@@ -371,10 +400,26 @@ fn offer_with(a: &mut ActiveSeq, s: &Settings) {
     if state.missed && s.miss_max > 0 {
         k = k.min(s.miss_max);
     }
+    let long = s.long_max > 0 && state.kept();
     let prompt = ctx.len().saturating_sub(a.output_tokens.len());
     let index = state
         .index
         .get_or_insert_with(|| Index::new(s.match_len, prompt));
+    // A long copy: of the prompt, after a copy round kept whole.
+    if long
+        && let Some(at) = index
+            .find(ctx, s.long_max, s.reply_match)
+            .filter(|&at| !index.in_reply(at))
+    {
+        let copy = copy_after(ctx, at, s.long_max);
+        merge(
+            &copy,
+            COPY_CONF,
+            &mut a.pending_drafts,
+            &mut a.pending_draft_conf,
+        );
+        return;
+    }
     if let Some(at) = index.find(ctx, k, s.reply_match) {
         let copy_conf = if index.in_reply(at) {
             COPY_REPLY_CONF
@@ -388,6 +433,17 @@ fn offer_with(a: &mut ActiveSeq, s: &Settings) {
             &mut a.pending_drafts,
             &mut a.pending_draft_conf,
         );
+    }
+}
+
+/// The drafts `a` brings to a verify shared with other owners: a long copy
+/// counts as DFlash2's block (only a lone owner verifies it whole).
+pub(super) fn ride_len(a: &ActiveSeq) -> usize {
+    let len = a.pending_drafts.len();
+    if is_copy(a.draft_conf()) {
+        len.min(MAX_DRAFTS)
+    } else {
+        len
     }
 }
 

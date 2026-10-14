@@ -161,7 +161,21 @@ pub fn step_mtp(
                         continue;
                     }
                     crate::scheduler::copy_drafts::offer(a);
-                    let (init, conf) = a.take_drafts();
+                    let (mut init, mut conf) = a.take_drafts();
+                    // A long copy (`copy_drafts`) is priced and capped as
+                    // in Phase B; DFlash2's own block verifies whole here.
+                    if init.len() > ladder_nd {
+                        lone_dflash_width(a, &conf, &mut init, dflash_verify_raw_argmax);
+                        ladder_truncate(
+                            model,
+                            a,
+                            &mut init,
+                            &conf,
+                            ladder_nd,
+                            sched.limits.max_seq_len,
+                        );
+                        conf.truncate(init.len());
+                    }
                     if dflash_verify_raw_argmax || glm_repaired_narrow {
                         step_verify_dflash(
                             model,
@@ -633,7 +647,14 @@ pub fn step_mtp(
                 continue;
             }
         }
-        ladder_truncate(a, &mut drafts, ladder_nd);
+        ladder_truncate(
+            model,
+            a,
+            &mut drafts,
+            &conf,
+            ladder_nd,
+            sched.limits.max_seq_len,
+        );
         conf.truncate(drafts.len());
 
         // DFlash/DSpark verify: route by proposer, not draft count.

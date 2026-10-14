@@ -321,3 +321,86 @@ fn confidences_travel_with_the_drafts() {
     assert!(a.pending_draft_conf.is_empty());
     assert_eq!(a.take_drafts(), (vec![8, 9], Vec::new()));
 }
+
+/// A long copy (`ATLAS_DFLASH_COPY_LONG_MAX`) is priced over its whole
+/// length by the copy bins; anything else stays within DFlash2's block.
+#[test]
+fn only_copies_are_priced_past_the_drafters_block() {
+    let long = [COPY_CONF; MAX_COPY_DRAFTS];
+    // The prompt-copy prior (0.90 a draft) is worth a row while its
+    // survival stays above `tau`: 0.90^11 = 0.31, 0.90^12 = 0.28.
+    assert_eq!(lone(&long), 11);
+    // A drafter's block, or a batch with a drafter owner, keeps its cap.
+    let sure = [SURE; MAX_COPY_DRAFTS];
+    assert_eq!(lone(&sure), MAX_DRAFTS);
+    let mixed = choose(
+        &mut Policy::default(),
+        &[&long[..], &sure[..]],
+        31,
+        NO_PROBE,
+    );
+    assert!(mixed.unwrap() <= MAX_DRAFTS);
+    // Two copy owners at 16 rows each would pass the 32-row budget, which
+    // `step_ms` prices out of reach.
+    let pair = choose(
+        &mut Policy::default(),
+        &[&long[..], &long[..]],
+        31,
+        NO_PROBE,
+    );
+    assert!(pair.unwrap() <= 15);
+    // Reply copies stay narrow, long or not.
+    assert_eq!(lone(&[COPY_REPLY_CONF; MAX_COPY_DRAFTS]), 2);
+}
+
+#[test]
+fn long_copies_calibrate_the_deep_cells_and_the_probe_verifies_them_whole() {
+    let mut policy = Policy::default();
+    let long = [COPY_CONF; MAX_COPY_DRAFTS];
+    // Copies kept whole at every depth: the bin's rate rises, so does the
+    // width, up to the copy.
+    for _ in 0..100 {
+        policy
+            .calibration
+            .record(&long, MAX_COPY_DRAFTS, MAX_COPY_DRAFTS);
+    }
+    let s = policy.calibration.survival(&long);
+    assert!(s[MAX_COPY_DRAFTS - 1] > 0.9, "{s:?}");
+    assert_eq!(
+        choose(&mut policy, &[&long[..]], MAX_COPY_DRAFTS, NO_PROBE),
+        Some(MAX_COPY_DRAFTS)
+    );
+    // Copies that break at depth 10 every time: the cells past it learn so
+    // (each verify observes up to the first rejected draft), and the width
+    // stops near the break.
+    let mut policy = Policy::default();
+    for _ in 0..200 {
+        policy.calibration.record(&long, MAX_COPY_DRAFTS, 10);
+    }
+    let w = choose(&mut policy, &[&long[..]], MAX_COPY_DRAFTS, NO_PROBE).unwrap();
+    assert!((8..=11).contains(&w), "width {w}");
+    // The periodic probe verifies a long copy's full length.
+    let probe = Params {
+        tau: DEFAULT_PARAMS.tau,
+        probe: 1,
+    };
+    assert_eq!(
+        choose(&mut policy, &[&long[..]], MAX_COPY_DRAFTS, probe),
+        Some(MAX_COPY_DRAFTS)
+    );
+}
+
+#[test]
+fn a_drafters_block_calibrates_as_before_long_copies() {
+    // The table's extra depth is the copies' alone: a drafter verify of
+    // seven drafts observes the same cells and survival as before.
+    let mut policy = Policy::default();
+    policy.calibration.record(&[SURE; 7], 7, 7);
+    policy.calibration.record(&[SURE; 7], 7, 3);
+    let s = policy.calibration.survival(&[SURE; 7]);
+    assert!(s[MAX_DRAFTS..].iter().all(|&x| x == 0.0));
+    let deep: f32 = (MAX_DRAFTS..MAX_COPY_DRAFTS)
+        .map(|d| policy.calibration.verified[d].iter().sum::<f32>())
+        .sum();
+    assert_eq!(deep, 0.0);
+}

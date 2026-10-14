@@ -54,7 +54,8 @@ pub(super) fn try_fused_chunk(
     let lens: Vec<usize> = active
         .iter()
         .filter(|a| eligible(a))
-        .map(|a| a.pending_drafts.len())
+        // A long copy (`copy_drafts`) rides at most DFlash2's block.
+        .map(|a| crate::scheduler::copy_drafts::ride_len(a))
         .filter(|&len| len > 0)
         .collect();
     let Some(width) = lens
