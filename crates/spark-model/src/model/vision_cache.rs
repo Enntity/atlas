@@ -164,13 +164,16 @@ impl TransformerModel {
     /// Head, chunked path: stage `images` into `seq` for the encode the
     /// chunk-0 lookup resolves. The grids and hashes are set now (the key,
     /// MRoPE and the worker's command need them); `buf_out` holds nothing
-    /// yet. Encodes at once when vision prompts are not cached.
+    /// yet. GLM-5 encodes per chunk whether or not the prompt is cached:
+    /// that, not the cache, is what keeps interleaved image prompts from
+    /// reading each other's rows. Other towers encode at once.
     pub(in crate::model) fn prepare_vision_embed_deferred_dispatch(
         &self,
         seq: &mut SequenceState,
         images: &[VisionItem],
     ) -> Result<()> {
-        if !self.vision_prefix_cache_ok() {
+        let glm = self.config.vision.as_ref().is_some_and(|v| v.is_glm5_next);
+        if !glm || self.vision_encoder.is_none() {
             return self.prepare_vision_embed_dispatch(seq, images);
         }
         let sms = self

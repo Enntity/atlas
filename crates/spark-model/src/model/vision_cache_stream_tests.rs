@@ -91,3 +91,22 @@ fn the_pixels_are_released_once_the_last_prompt_chunk_succeeds() {
         .unwrap();
     assert!(f.seq.vision.items.is_empty());
 }
+
+#[test]
+fn a_glm_prefill_encodes_per_chunk_even_with_the_prefix_cache_off() {
+    // Per-chunk encoding is what keeps two image prompts from sharing
+    // `buf_out` across ticks; it must not depend on caching (this fixture's
+    // prefix cache is `NoPrefixCaching`). An eager encode here would put
+    // every row in `buf_out` at chunk 0 for later chunks to read.
+    let (mut f, _) = staged();
+    f.model.config.vision = Some(test_tower::config());
+    f.seq.vision = Default::default();
+    let image = test_tower::image(16);
+    f.order();
+    f.model
+        .prepare_vision_embed_deferred_dispatch(&mut f.seq, &[image])
+        .unwrap();
+    assert!(f.seq.vision.deferred);
+    assert_eq!(f.seq.vision.rows_encoded, 0, "nothing encoded yet");
+    assert_eq!(f.seq.vision.grids, vec![(1, 8, 8)]);
+}
