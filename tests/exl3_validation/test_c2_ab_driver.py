@@ -92,7 +92,7 @@ class FakeCollector:
         (destination / 'manifest.json').write_text(json.dumps(manifest))
         record_dir = provenance.get('environment', {}).get(RECORD_ENV)
         if record_dir:
-            self._write_records(Path(record_dir))
+            self._write_records(Path(record_dir), Path(provenance["environment"][KNOB_ENV]))
         upstream = provenance.get('environment', {}).get(UPSTREAM_ENV)
         if upstream:
             self._write_gated_captures(Path(upstream))
@@ -108,7 +108,7 @@ class FakeCollector:
                     '-gated_norm-gated.bin')
             (upstream / name).write_bytes(payload.encode())
 
-    def _write_records(self, record_dir):
+    def _write_records(self, record_dir, fixture_dir):
         for index, entry in enumerate(self.entries):
             if self.record_mode == 'none':
                 continue
@@ -120,7 +120,10 @@ class FakeCollector:
                     '-norm_substitution')
             payload_file = stem + '-gated.bin'
             size = math.prod(entry['shape']) * 2
-            (record_dir / payload_file).write_bytes(b'\x00' * size)
+            payload = (fixture_dir / entry['file']).read_bytes()
+            if self.record_mode == 'bad-payload':
+                payload = bytes([payload[0] ^ 1]) + payload[1:]
+            (record_dir / payload_file).write_bytes(payload)
             record = {
                 'schema': 'atlas-exl3-ffn-v1', 'layer': 0, 'tp_rank': entry['tp_rank'],
                 'tp_world': 2, 'invocation': entry['invocation'],
@@ -403,7 +406,8 @@ def test_driver_default_collector_is_the_existing_collector():
     import c2_ab_driver
     assert c2_ab_driver.run_ab.__defaults__ == (collect_logits.collect,)
     signature = inspect.signature(collect_logits.collect)
-    assert set(signature.parameters) == COLLECT_KEYS
+    assert set(signature.parameters) == COLLECT_KEYS | {'request_ids'}
+    assert signature.parameters['request_ids'].default is None
 
 
 def test_main_cli_wiring_runs_the_attempt(tmp_path, monkeypatch):
@@ -422,3 +426,30 @@ def test_main_cli_wiring_runs_the_attempt(tmp_path, monkeypatch):
     collector = FakeCollector(make_norm_fixtures.validate_manifest(fixture_dir)['entries'])
     c2_ab_driver.main(collector)
     assert (evidence / 'cli-attempt' / 'receipt.json').is_file()
+
+
+def test_treatment_payload_hash_must_match_bound_fixture(tmp_path):
+    plan = _plan(tmp_path)
+    with pytest.raises(ValueError, match='payload hash'):
+        run_ab(plan, FakeCollector(_entries(plan), record_mode='bad-payload'))
+    attempt = plan['evidence_root'] / plan['attempt']
+    assert (attempt / 'failure.json').is_file()
+    assert (attempt / 'records' / 'arm-b-repeat-00').is_dir()
+
+
+def test_collection_provenance_keeps_rank_specific_environments(tmp_path):
+    plan = _plan(tmp_path)
+    for arm in plan['arm_configs']:
+        for rank in ('0', '1'):
+            descriptor = arm['descriptors'][rank]
+            path = Path(descriptor['file'])
+            args = json.loads(path.read_text())
+            i = args.index('serve') - 1
+            args[i:i] = ['--env', 'NCCL_IB_HCA=rank-' + rank]
+            path.write_text(json.dumps(args))
+            descriptor.update(parse_serve_descriptor(path))
+    collector = FakeCollector(_entries(plan))
+    run_ab(plan, collector)
+    prov = collector.calls[0]['provenance']
+    assert prov['environment']['NCCL_IB_HCA'] == 'rank-0'
+    assert prov['rank_environments']['1']['NCCL_IB_HCA'] == 'rank-1'

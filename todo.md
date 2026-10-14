@@ -36,7 +36,7 @@ Rules that apply throughout:
 
 | Milestone | Scope | Exit criterion | State |
 |---|---|---|---|
-| **M1 — Numerical qualification** (critical path) | Q2, closing Q1 | Fresh image passes gate v2 with all controls on both ranks | **Active** |
+| **M1 — Numerical qualification** (critical path) | Q2, closing Q1 | Fresh image passes gate v2 with all controls on both ranks | **Blocked at reference verifiability; diagnostics remain** |
 | M2 — Behavior and quality | Q3, Q4 | Behavior receipts pass; Q4 thresholds met on the qualified profile | Q3 partial; Q4 harness only |
 | M3 — Performance | P0 → P1–P6 | Baseline + targets recorded; optimizations meet them without regressing M1/M2 | P0 prepared, not run |
 | M4 — Serving features | F1–F4 | Each feature qualified independently | Not started |
@@ -68,18 +68,42 @@ Rules that apply throughout:
      candidates + perturbations + MDE);
    - verdict.
 
-## Now — active batch (M1 phases 2–3)
+## Now — reference-verifiability follow-up and M1 causality
 
-No GPU campaign is active. The v2 campaign has completed and blocks
-qualification at reference verifiability; inspect both hosts before any new
-GPU work (continue.md "Before any GPU work").
+No GPU campaign is active. The C2 treatment attempt stopped because the TP
+worker lacks the request-ID binding; both hosts were released. The worker
+transport repair and image rebuild are next. The completed v2 campaign still
+blocks qualification at reference verifiability. Inspect both hosts before
+new GPU work (continue.md "Before any GPU work").
 
-1. **Reference-set failure analysis and numerical cause.** Continue C2
-   layer-0 norm-output intervention, then the L1 escalation and registered
-   G-fallbacks (G8/G9 binding first). Preserve the current campaign unchanged;
-   any revised profile requires a fresh registered collection.
+1. **Resolve reference-verifiability failures before further qualification.**
+   - [x] Complete the fixed 26-attempt collection (832 receipts), archive all
+     artifacts and teardown both hosts. Campaign:
+     `gate-v2-qualification-20261013-luna1/`.
+   - [x] Correct the independent-held-out byte-identity bug with regression
+     coverage; 24 focused tests pass. Preserve the frozen INCOMPLETE report
+     and corrected UNVERIFIABLE report; thresholds/metrics unchanged.
+   - [x] Review and commit the evaluator correction and qualification records.
+     **Done:** `757e7da4`; independent review, 24 focused tests and 319
+     EXL3 unittest cases pass; archived evaluator/report hashes reverified.
+   - [x] Diagnose H3 index 13 / `v2ref14` (`short16/longer/r3`) and
+     H4 index 14 / `v2ref15` (`short16/code/r1`) from existing reference-only evidence. Separate these
+     failures from candidate C2 causality and historical ref13 mode discovery.
+     Reference-only replay reproduces both failures; no recorded profile/cache
+     difference explains them. [Diagnosis](docs/design/exl3-reference-verifiability-diagnosis-20261014.md).
+   - [x] Decide whether reference runtime pinning or a protocol amendment is
+     justified by that diagnosis. Preserve this campaign; no top-ups,
+     replacement draws or unchanged retries to seek PASS. Any new campaign
+     must be separately registered before collection. **Decision 2026-10-14:**
+     investigate runtime pinning in a separate reference-only diagnostic;
+     no concrete qualification amendment is justified without causal evidence.
+   - [ ] Register and execute the reference-only runtime-mechanism diagnostic
+     with selected-plan/collective/routing telemetry and engagement controls.
+     CPU design source-reviewed and committed in `2e130a4e`: [plan](docs/plans/exl3-reference-runtime-mechanism-plan.md).
+   See the [qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md).
 2. **ref13 mode-mechanism probe** (separate diagnostic, not qualification).
-   - [ ] The 15 reference draws fall into 6 byte classes, with a recurring
+   - [ ] The historical tuning set of 15 reference draws falls into 6 byte
+     classes, with a recurring
      mode at `longer`/r0 in 3/15. Look for a discrete runtime choice:
      autotune/plan selection, NCCL algorithm, routing tie.
    - [ ] Keep probes in separate diagnostic attempts. If a runtime policy
@@ -98,8 +122,17 @@ GPU work (continue.md "Before any GPU work").
      `95204789` (host inspection); contract + A1–A13 in
      [docs/plans/c2-tooling-spec.md](docs/plans/c2-tooling-spec.md).
      Independent review: OK with notes; M1/m1/m2/m3/n2 dispositioned.
-   - [ ] Fresh image build and neutrality proof: with the knob off, the
-     final-logit archive is byte-identical to the frozen baseline.
+   - [x] The collected `2fbb787c` image has knob-off short16/long byte-neutrality
+     against the C1 baseline (`gate-v2-qualification-20261013-luna1/neutrality-proof.json`).
+   - [x] Bind collected source `2fbb787c` and diagnostic profile for the first
+     C2 attempt. Baseline repeats pass eight-row observer neutrality and all
+     rank-local norm archive checks; treatment stops on its first request
+     because rank 1 has no request ID. [Receipt](docs/design/c2-execution-20261014.md).
+   - [ ] Repair worker request-ID delivery, with production-path CPU coverage.
+   - [ ] Bind a fresh no-cache image after the worker repair, including
+     renewed short16/long neutrality. Later runtime or
+     capture changes require a fresh build/neutrality proof; the collected
+     image does not qualify newer L1/v24 tooling or the C2 treatment.
    - [ ] **First measurement (discharges the C1 flag):** the treatment's
      local o_proj output is byte-identical to the reference's captured
      local output. If not, record it and re-open C1.
@@ -149,15 +182,20 @@ GPU work (continue.md "Before any GPU work").
     under both lanes is owed;
   - [ ] optionally, the untested variant pairs, to support "minimal";
   - [ ] the neighbor coverage above.
-- [ ] **Owed GPU controls** for qualification:
-  - [ ] the `ATLAS_EXL3_GATE_PERTURBATION` must-fail runs;
+- [ ] **Control qualification remains open:**
+  - [x] Collect all five `ATLAS_EXL3_GATE_PERTURBATION` runs and the MDE run
+    in the completed campaign.
+  - [ ] Establish required control outcomes under a verifiable reference
+    ensemble. Current campaign scoring stopped before these checks; collection
+    alone is not a control PASS.
   - [ ] the indexer scale-boundary oracle retry with the exact frozen
     reference source overlay;
   - [ ] confirmation that gate request payloads carry no masks or
     penalties.
-- [ ] **Qualification run** under gate v2 on a fresh image (randomised,
-  interleaved order; composition VOID + top-up rule). Do not recollect
-  unchanged references to seek a pass.
+- [ ] **Achieve numerical qualification** after the reference-verifiability
+  follow-up and any required candidate fix. The first v2 campaign is complete
+  but UNVERIFIABLE. Retain fixed N and no top-ups unless a new rule is explicitly
+  registered before collection; do not recollect unchanged references to seek PASS.
 
 ## Work items
 
@@ -178,16 +216,19 @@ GPU work (continue.md "Before any GPU work").
 - [ ] **Q2 — Full-model numerical and repeatability gates.** Short16,
   long-prefix/chunk-boundary, persistent decode and raw-logit comparisons
   on the exact candidate image, under the registered statistical gate
-  (v2 once signed off), with abs/rel/KL/CE/top-K as diagnostics and all
+  (v2 with Amendments 1–2), with abs/rel/KL/CE/top-K as diagnostics and all
   required controls.
   - **Done when:** all required candidate gates and controls pass on both
     ranks with raw tensors/provenance. Reference variability is explained
     or retained as a constraint, never used to waive failure.
   - *State:* v1 FAIL (historical; candidate T 7.20 vs refs ≤5.53, 3
-    catastrophic `longer` rows). Gate v2 awaits sign-off. Work is
+    catastrophic `longer` rows). The complete v2 campaign is UNVERIFIABLE:
+    one H3 and one H4 reference LOO failure. Candidate repeats are byte-identical,
+    but candidate/held-out/control numerical scoring was not reached. Work is
     sequenced in M1 above; current facts are in continue.md.
-  - Any new collection needs a fresh image plus a neutrality proof, because
-    source changed after the tested `ee5eaf0f` image.
+  - No-cache build/neutrality evidence exists for collected source `2fbb787c`.
+    New runtime/capture changes require renewed image/profile binding and
+    neutrality proof; that evidence does not cover the current tip automatically.
 
 - [ ] **Q3 — Usable API behavior.** OpenAI chat/completions and Anthropic,
   streaming and nonstreaming, reasoning on/off and budgets, stop/EOS and
@@ -490,8 +531,9 @@ continue.md). Do not delete these paths.
   `archive/c1-bf16-o-proj-replay-20261012`).
 - Gate v2 pre-registration + P2 fixes + Amendment 1 (`f8061ad8`,
   `fd7b530b`), then Amendment 2/source contract after Luna review:
-  fixed N, no top-ups, explicit H4 edge cases; evaluator checks completed,
-  collection authorised, final review/freeze and operational preflight next.
+  fixed N, no top-ups, explicit H4 edge cases. Collection completed (26 attempts,
+  832 receipts); corrected evaluator returns UNVERIFIABLE at reference H3/H4 LOO.
+  See the qualification report; Q2 remains open.
 - Atomic `Exl3FfnRouter` diagnostic records (`651ff083`).
 
 **Q3**

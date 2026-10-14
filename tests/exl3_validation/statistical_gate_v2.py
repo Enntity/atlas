@@ -560,7 +560,9 @@ def evaluate_campaign(plan, attempts, cache_receipts):
                for run in candidates):
             raise ValueError("candidate engine build differs from frozen plan")
         v1.validate_runs(references, candidates)
-        v1.validate_runs(references, heldouts)
+        # Held-outs are independent reference draws. Reuse v1 identity,
+        # provenance and finiteness checks without its candidate-repeat rule.
+        v1.validate_runs(references, heldouts, require_identical_candidates=False)
         validate_campaign_provenance(references + heldouts, "reference engine")
         validate_campaign_provenance(candidates, "candidate engine")
         verifiability = reference_verifiability(references)

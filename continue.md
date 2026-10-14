@@ -7,7 +7,8 @@ duplicate it.
 
 **Read order on restart:**
 1. This file, sections 1–3.
-2. [todo.md](todo.md) "Roadmap" and "Now".
+2. [todo.md](todo.md) "Roadmap" and "Now", then the
+   [completed v2 qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md).
 3. [docs/plans/q2-norm-causality-plan.md](docs/plans/q2-norm-causality-plan.md)
    for the active experiment.
 4. The last entries of [q2-diagnostic.md](q2-diagnostic.md) and
@@ -19,18 +20,18 @@ The latest review and its disposition table are in
 [CODE_REVIEW_2026-10-12.md](CODE_REVIEW_2026-10-12.md). Superseded narrative
 is in git history.
 
-## 1. Status at a glance (2026-10-12)
+## 1. Status at a glance (2026-10-14)
 
 | Area | Status | Pointer |
 |---|---|---|
 | Boot and generation (TP=2/EP=1, native EXL3) | Works; 5/5 launch smoke; production containers **stopped** | §4 |
-| Numerical qualification (Q2) | **Not qualified.** v1 gate FAIL (historical); gate v2 + Amendments 1–2 implemented/CPU-verified; collection authorised; Luna owns preflight and campaign | §2, todo M1 |
+| Numerical qualification (Q2) | **Not qualified.** v1 gate FAIL (historical); complete v2 campaign is **UNVERIFIABLE**: reference ensemble fails H3 and H4 LOO | §2, [qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md) |
 | Dominant cause of divergence | **Unproven.** C2 (layer-0 intervention) is next | todo "Now" #3 |
 | API behavior (Q3) | Partial: focused live slice 15/15 on `ee5eaf0f` | todo Q3 |
 | Task quality (Q4) | Harness only; no live run | todo Q4 |
 | Performance (P0) | Unqualified diagnostic only (decode ~0.45 s/token); Nsight driver prepared, not run | todo P0 |
 | Serving features (F1–F4), release (R1/R2) | Not started | todo |
-| In flight | **Luna `collect_gate_v2`: qualification preflight and campaign authorised.** Prior checkpoint: Hosts inspected idle 2026-10-12T22:04Z (`$EV/host-inspection-20261012T2204Z/`); the CPU C2 tooling batch landed (todo “Now” #3 first sub-item, commits `f8e9859f`/`3f9e5ee4`) | §3 |
+| In flight | CPU worker request-ID repair and rebuild preparation. First C2 treatment stopped; both Sparks released at post-failure inspection. Reinspect before new GPU work | [C2 report](docs/design/c2-execution-20261014.md), todo M1 |
 
 ## 2. Established findings (what a restart must not re-derive)
 
@@ -58,10 +59,29 @@ is in git history.
     at fixed N. H4 explicitly handles zero-distance/zero-radius cases.
   - H3 constants stay fixed, but measured envelopes can widen with N. H4
     can be stricter. The rank-only bound is not a whole-campaign guarantee.
-  - Evaluator checks completed (23 tests; six exact archived H5 replays).
-    Operator authorised collection; Luna `collect_gate_v2` owns final review/
-    freeze, host/image preflight and the campaign. No v2 qualification verdict
-    exists. See the evaluator verification report for durable replay receipts.
+  - The fixed 26-attempt campaign completed (832 request receipts); corrected
+    evaluation is **UNVERIFIABLE**, with one H3 and one H4 reference LOO
+    failure. No candidate/control gate verdict was reached. The initial frozen
+    evaluator report remains preserved; a post-collection correction fixed its
+    heldout byte-identity check without changing thresholds. See the
+    [qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md).
+  - H3 failure: index 13 (`v2ref14`), short16 `longer` row 3. H4 failure:
+    index 14 (`v2ref15`), short16 `code` row 1. Reference-only diagnosis
+    reproduced both failures and found no recorded
+    profile/cache difference explaining them ([report](docs/design/exl3-reference-verifiability-diagnosis-20261014.md)).
+    Runtime pinning probes are justified; no concrete protocol amendment is
+    supported yet. Investigate these fresh reference-set failures separately
+    from the historical `longer`/r0 mode and C2 candidate
+    causality work. Do not top up, replace draws or retry unchanged to seek PASS.
+  - Both candidate repeats pass byte identity; this is not numerical
+    qualification. All five perturbations and MDE were collected, but their
+    gate scoring, the held-out scoring and candidate numerical scoring were
+    skipped after reference verifiability failed.
+  - Frozen evaluator INCOMPLETE and corrected UNVERIFIABLE reports are both
+    preserved. The narrow held-out identity fix passed 24 focused tests;
+    the correction/report changes were independently reviewed and archived
+    hashes reverified on 2026-10-14 before commit. Freeze a future evaluator
+    separately. The original thresholds and metrics are unchanged.
 - **Localized internal differences** (reviewed,
   `q2-diagnostic-20261011/analysis/`):
   - KDA core/g1/g2 match.
@@ -75,7 +95,9 @@ is in git history.
   16 fixtures are nested prefixes).
   - v24 was chosen after seeing the fixtures.
   - The replay used NVRTC `--fmad=false`.
-  - `v24-minimal` has no engagement controls of its own.
+  - The historical replay had no `v24-minimal` engagement controls. Those
+    controls and the production-compile lane are now implemented; the GPU
+    reruns remain owed (todo "Next").
   - The repaired harness has never run on a GPU.
 - **C1 (layer-0 local o_proj) is closed** from native captures by operator
   decision:
@@ -101,11 +123,23 @@ is in git history.
   reads packed cache too; logits are captured after the head/TP gather and
   before sampling. Seed 42/fresh processes do not guarantee deterministic
   forward logits. The recurring mode's cause remains unidentified.
-- **Source has changed since the tested `ee5eaf0f` image** (gated-norm
-  capture `1def024c`, atomic FFN records `651ff083`, and the 2026-10-12 C2
-  tooling batch `f8e9859f`/`3f9e5ee4` — diagnostic knob + request-ID
-  threading). Any new collection needs a fresh image plus a neutrality
-  proof.
+- **Latest collected candidate:** runtime source `2fbb787c`, image
+  `atlas-exl3-validation:src-40efa67de6d9-rust1.97.1`, image ID
+  `sha256:011423015fc1da354e07fbe5ee1b49751efb4e3a886159f2a23f458744cbcff0`.
+  A no-cache build and short16/long byte-neutrality proof against the C1
+  baseline preceded collection; both cuBLAS providers were attested. Evidence:
+  `gate-v2-qualification-20261013-luna1/neutrality-proof.json`.
+  This image includes the C2 knob off, not a qualified v24 numerical fix.
+  Later source/tooling changes are outside this image's evidence: bind the
+  current source and rebuild/reprove neutrality where required before new GPU work.
+- **C2 live attempt stopped** (`c2-refexact-02`): both baseline repeats
+  match all eight prior-image logit rows and 16 archived norm captures per
+  repeat. The first treatment request fails on rank 1 because its
+  `ForwardContext` has no request ID. Rank 0 emits one substitution receipt;
+  no treatment request completes. Causality remains unresolved and C1's
+  first measurement remains undischarged. Both hosts were released; worker
+  transport repair, a fresh image and neutrality proof precede a fresh C2
+  attempt. [Report](docs/design/c2-execution-20261014.md).
 - No production numerical fix is qualified, and no image was published.
 
 ## 3. Before any GPU work
@@ -114,7 +148,8 @@ is in git history.
    IDs, flags and health. Confirm nothing else owns the GPUs, and
    coordinate one experiment owner across both ranks.
 2. Record which image the stopped `glm53-exl3-atlas-*` containers reference
-   (§4). This is unverified.
+   (§4). The last verification was 2026-10-12; recheck current ownership
+   and image identity rather than relying on that historical receipt.
 3. Use fresh attempt names and capture roots. Never reuse burned names or
    delete failed attempts. `/tmp` logs are not durable evidence; archive
    to the evidence root (§6).
@@ -207,7 +242,9 @@ long-prefix cases keep 2047/2048/2051/2053 tokens and registered
 continuations. Absolute-threshold reports are diagnostics. The registered
 statistical gate decides qualification: v1
 (`docs/design/exl3-statistical-gate.md`) is the historical record, and v2
-(with Amendments 1–2) applies once signed off and implemented/verified.
+(with Amendments 1–2) governed the completed campaign. Its corrected result
+is UNVERIFIABLE; qualification remains blocked. Prefix caching stays off and
+chunk size stays 128 for this registered profile.
 
 ### Evidence index
 
@@ -248,6 +285,7 @@ component oracle and full-model gate each prove a different scope.
 | `q2-c1-prep-20261012/` | C1 preparation (binding spec); superseded by the C1 re-scope |
 | `q2-c1-execution-20261012/` | C1 build/neutrality (PASS, byte-identical)/native pre-reduce captures; **read `ERRATUM-20261012.md` first** — the replay-anchor conclusions are wrong |
 | `q2-c1-binding-2026013/` (sic — missing digit, created 2026-10-12; do not rename) | 32 assembled C1 rows: fixture inputs, native own-outputs (valid); BF16 weights are reconstructions, not what either engine multiplies |
+| `gate-v2-qualification-20261013-luna1/` | Completed fixed 26-attempt campaign; 832 request receipts, neutrality proof, original INCOMPLETE and corrected UNVERIFIABLE evaluations, raw artifacts/cache receipts and final teardown. In-repo [report and evidence index](docs/design/exl3-statistical-gate-v2-qualification-20261014.md) bind the evaluator correction and H3/H4 failures. |
 | `q2-gate-v2-20261012/` | v2 calibration (reference-only): `calibrate_v2.py`, `calibration.json`, `review-summary.md` (P2 fixes now applied) |
 | `merged-image-20261011-session2/` | Corrected-image neutrality (`grammar-r2/`) and focused Q3 receipts, attempt tarballs, provenance; attempt `cand-grammar-ee5e-01` preserved and unreused |
 | `p0-trace-prep-20261011/` | Prepared paired named-session Nsight driver/tests/README (11 CPU tests); no live profiler execution yet |

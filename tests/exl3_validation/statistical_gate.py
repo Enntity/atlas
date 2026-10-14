@@ -36,7 +36,7 @@ def merge_run(artifacts):
     return run
 
 
-def validate_runs(references, candidates):
+def validate_runs(references, candidates, require_identical_candidates=True):
     if len(references) < 3:
         raise ValueError("gate requires at least 3 reference runs (leave-one-out needs 2)")
     if not candidates:
@@ -68,10 +68,11 @@ def validate_runs(references, candidates):
     for run in references + candidates:
         if any(not np.isfinite(a).all() for a in run["rows"].values()):
             raise ValueError("nonfinite logits")
-    base = candidates[0]
-    for run in candidates[1:]:
-        if any(not np.array_equal(run["rows"][k], base["rows"][k]) for k in base["rows"]) or run["text"] != base["text"]:
-            raise ValueError("candidate runs are not byte-identical")
+    if require_identical_candidates:
+        base = candidates[0]
+        for run in candidates[1:]:
+            if any(not np.array_equal(run["rows"][k], base["rows"][k]) for k in base["rows"]) or run["text"] != base["text"]:
+                raise ValueError("candidate runs are not byte-identical")
 
 
 # ---------------------------------------------------------------- metrics

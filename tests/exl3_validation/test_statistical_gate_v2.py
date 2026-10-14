@@ -2,7 +2,11 @@
 """Production-path fixtures for the registered v2 EXL3 gate semantics."""
 import copy
 import random
+import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -172,6 +176,86 @@ class H3AndCampaignFixtures(unittest.TestCase):
         self.assertEqual(len(result["heldouts"]), 3)
         self.assertTrue(all(row["reference_count"] == 15 for row in result["heldouts"]))
         self.assertTrue(all(row["heldout_in_fit"] is False for row in result["heldouts"]))
+
+    def test_full_campaign_accepts_distinct_heldouts_and_keeps_candidate_repeat_check(self):
+        plan = campaign_plan()
+        builds = plan["engine_identities"]
+        runs = {}
+
+        def profile_run(engine, seed, environment=None, native_policy=None):
+            run = make_run(seed)
+            for item in run["manifests"]:
+                provenance = item["provenance"]
+                provenance["engine"] = engine
+                provenance["engine_build"] = copy.deepcopy(builds["reference" if engine == "vllm" else "candidate"]["build"])
+                provenance["environment"] = dict(environment or {})
+                if native_policy is not None:
+                    provenance["native_numerical_policy"] = dict(native_policy)
+                item.update({"schema": "atlas-exl3-teacher-forced-v1", "thresholds": {"fixture": True},
+                             "pre_registration_sha256": "a" * 64, "endpoint": "http://127.0.0.1:8000",
+                             "model": "fixture-model", "timeout_seconds": 30,
+                             "harness_sha256": {"collector.py": "b" * 64}, "collector_sha256": "c" * 64})
+            return run
+
+        for index, name in enumerate(gate.REFERENCE_ATTEMPTS):
+            runs[name] = profile_run("vllm", index)
+        for index, name in enumerate(gate.HELDOUT_ATTEMPTS):
+            runs[name] = profile_run("vllm", 40 + index)
+        candidate = profile_run("atlas", 80, {"ATLAS_KDA_FLA_REFERENCE": "1"},
+                                 {"kda_core": "ATLAS_KDA_FLA_REFERENCE=1"})
+        runs["v2cand01"] = candidate
+        runs["v2cand02"] = copy.deepcopy(candidate)
+        perturbations = {
+            "v2pert-mhc_post_1p9": "mhc_post_1p9",
+            "v2pert-router_scale_2p4": "router_scale_2p4",
+            "v2pert-topk7_layer": "topk7_layer=3",
+            "v2pert-drop_shared_layer": "drop_shared_layer=4",
+            "v2pert-bf16_routed_accum": "bf16_routed_accum",
+        }
+        for index, (name, value) in enumerate(perturbations.items()):
+            runs[name] = profile_run("atlas", 90 + index,
+                                     {"ATLAS_KDA_FLA_REFERENCE": "1", "ATLAS_EXL3_GATE_PERTURBATION": value},
+                                     {"kda_core": "ATLAS_KDA_FLA_REFERENCE=1"})
+        runs["v2mde"] = profile_run("atlas", 100, {"ATLAS_KDA_FLA_REFERENCE": "0"},
+                                    {"kda_core": "ATLAS_KDA_FLA_REFERENCE=0"})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            attempts = {}
+            for name in gate.PRIMARY_ATTEMPTS + gate.POST_ATTEMPTS:
+                manifest_path = root / name / "manifest.json"
+                manifest_path.parent.mkdir()
+                manifest_path.write_text("{}")
+                attempts[name] = str(manifest_path.parent)
+            order = plan["attempt_order"] + plan["post_attempt_order"]
+            receipts = {}
+            for index, name in enumerate(order):
+                start = datetime(2026, 10, 12, tzinfo=timezone.utc) + timedelta(minutes=2 * index)
+                before = start.isoformat()
+                after = (start + timedelta(minutes=1)).isoformat()
+                receipts[name] = {"pre_start": gate.empty_cache_receipt(name, before),
+                                  "post_shutdown": gate.empty_cache_receipt(name, after)}
+            def fixture_gate_result(_references, candidate, _candidate_runs=None):
+                environment = candidate["manifests"][0]["provenance"]["environment"]
+                return {"passed": not environment.get("ATLAS_EXL3_GATE_PERTURBATION")}
+
+            with mock.patch.object(gate, "load_run", side_effect=lambda spec: runs[Path(spec).name]), \
+                    mock.patch.object(gate, "reference_verifiability", return_value={"verifiable": True}), \
+                    mock.patch.object(gate, "evaluate_heldouts", return_value={"passed": True, "heldouts": []}), \
+                    mock.patch.object(gate, "evaluate_one", side_effect=fixture_gate_result), \
+                    mock.patch.object(gate, "negative_controls_v2", return_value={"passed": True}):
+                report = gate.evaluate_campaign(plan, attempts, receipts)
+                different_candidate = copy.deepcopy(candidate)
+                different_candidate["rows"][(0, "a")][0, 0] += 1.0
+                runs["v2cand02"] = different_candidate
+                mismatched_repeat = gate.evaluate_campaign(plan, attempts, receipts)
+
+        self.assertTrue(any(not np.array_equal(runs["v2refho01"]["rows"][key],
+                                               runs["v2refho02"]["rows"][key])
+                            for key in runs["v2refho01"]["rows"]))
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(mismatched_repeat["status"], "INCOMPLETE")
+        self.assertIn("candidate runs are not byte-identical", mismatched_repeat["reason"])
 
     def test_candidate_rank_and_negative_control_use_unchanged_v1_T(self):
         refs = [make_run(i) for i in range(15)]

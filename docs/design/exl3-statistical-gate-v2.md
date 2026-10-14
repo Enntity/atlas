@@ -1,12 +1,13 @@
 # EXL3 statistical logit gate v2 — pre-registration
 
-Status: **pre-registered rule; no qualification data collected under it.
-Amendments 1 and 2 (2026-10-12, pre-collection) applied. Amendment 2
-supersedes adaptive top-ups with fixed N = 15 and defines H4 edge cases.
-A separate v2 evaluator and production-path fixtures are implemented;
-archived-reference verification is recorded in
-[the verification report](exl3-statistical-gate-v2-verification-20261012.md).
-Evaluator review/freeze and rule sign-off remain prerequisites to collection.**
+Status: **Pre-registration and Amendments 1–2 remain the governing rule.
+Qualification collection completed 2026-10-14; corrected offline evaluation
+is UNVERIFIABLE because the reference set fails H3/H4 leave-one-out checks.
+No threshold or metric changed. The initial frozen evaluator returned
+INCOMPLETE due to a held-out identity-validation bug; the correction and
+outcome are recorded in the
+[qualification report](exl3-statistical-gate-v2-qualification-20261014.md)
+and [verification report](exl3-statistical-gate-v2-verification-20261012.md).**
 Authored 2026-10-12 from reference-side data only, before any collection it
 governs. Operator decision: `decisions.md` 2026-10-12 ("full v2
 pre-registration authorized"). The v1 rule

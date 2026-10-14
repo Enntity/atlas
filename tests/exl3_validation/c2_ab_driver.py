@@ -6,8 +6,8 @@ A2): arm A = knob off, arm B = knob on (--variant), both ranks, identical
 serve flags and requests, >=2 repeats per arm with a byte-determinism check.
 It wraps the existing collector (tests/exl3_validation/collect_logits.py) and
 the registered collector-only command descriptors; it never re-implements
-logit collection. GPU execution is out of scope: the collector is an injected
-seam so the whole orchestration is CPU-testable.
+logit collection. The injected lifecycle/collector seams keep orchestration
+CPU-testable; c2_remote_adapter.py supplies the explicit live lifecycle.
 
 Contract (docs/plans/c2-tooling-spec.md "D3" + Lifecycle): per run the driver
 creates a fresh records directory under the attempt root and exports
@@ -33,6 +33,7 @@ knob is the one variable between them).
 """
 import argparse
 import copy
+from contextlib import nullcontext
 import datetime
 import hashlib
 import json
@@ -226,6 +227,8 @@ def locate_substitution_records(records_dir, entries, variant):
         _require(isinstance(binding['pre_substitution_sha256'], str)
                  and HEX.fullmatch(binding['pre_substitution_sha256']),
                  f'substitution record pre-substitution sha256 missing: {path}')
+        _require(_sha(payload) == entry['sha256'],
+                 f'substitution record payload hash differs from fixture: {payload}')
         matched.add(key)
         records.append({'file': path.name, 'sha256': _sha(path),
                         'payload_file': tensors[0]['file'], 'payload_sha256': _sha(payload),
@@ -251,6 +254,14 @@ def _render_create_commands(arm, run_root, injected_env):
         source = Path(arm['descriptors'][rank]['file'])
         args = json.loads(source.read_text())
         if injected_env:
+            filtered, index = [], 0
+            while index < len(args):
+                if args[index] == '--env' and args[index + 1].split('=', 1)[0] in injected_env:
+                    index += 2
+                else:
+                    filtered.append(args[index])
+                    index += 1
+            args = filtered
             serve_index = args.index('serve')
             image_index = serve_index - 1
             injected = []
@@ -267,28 +278,43 @@ def _render_create_commands(arm, run_root, injected_env):
     return rendered
 
 
-def _execute_run(collector, arm, run_root, records_dir, gated_norm_dir):
+def _execute_run(collector, arm, run_root, records_dir, gated_norm_dir, lifecycle):
     """One collector invocation with full fingerprints; collection itself is
     entirely the wrapped collector's job (collect_logits.py)."""
+    logits_dir = run_root / 'logits'
+    logits_dir.mkdir()
+    arm = dict(arm, capture_dir=str(logits_dir))
     knob_env = _knob_env(arm['knob']['engaged'], arm['knob']['substitute_dir'], records_dir)
     run_env = dict(knob_env)
     run_env[UPSTREAM_ENV] = str(gated_norm_dir)
+    run_env['ATLAS_EXL3_LOGITS_DIR'] = str(logits_dir)
     run_env[UPSTREAM_LAYERS_ENV] = '0'
+    ffn_dir = run_root / 'ffn'
+    ffn_dir.mkdir()
+    (ffn_dir / 'capture-enabled').write_text('')
+    run_env['ATLAS_EXL3_FFN_DUMP_DIR'] = str(ffn_dir)
+    run_env['ATLAS_EXL3_FFN_DUMP_LAYERS'] = '0,3'
     create_commands = _render_create_commands(arm, run_root, run_env)
     provenance = copy.deepcopy(arm['provenance'])
     environment = provenance.setdefault('environment', {})
     for key in (*KNOB_ENV_KEYS, UPSTREAM_ENV, UPSTREAM_LAYERS_ENV):
         environment.pop(key, None)
-    for rank in sorted(arm['descriptors']):
-        environment.update(arm['descriptors'][rank]['env'])
+    environment.update(arm['descriptors']['0']['env'])
     environment.update(run_env)
+    provenance['rank_environments'] = {
+        rank: dict(arm['descriptors'][rank]['env'], **run_env)
+        for rank in sorted(arm['descriptors'])}
     provenance_file = run_root / 'provenance.json'
     provenance_file.write_text(json.dumps(provenance, indent=2) + '\n')
     destination = run_root / 'collection'
-    collected = collector(endpoint=arm['endpoint'], model=arm['model'], cases=arm['cases'],
-                          capture_dir=arm['capture_dir'], destination=destination,
-                          provenance=provenance, timeout=arm['timeout_seconds'],
-                          thresholds=arm['thresholds'])
+    context = (nullcontext() if lifecycle is None else lifecycle(
+        arm=arm, run_root=run_root, records_dir=records_dir,
+        gated_norm_dir=gated_norm_dir, create_commands=create_commands))
+    with context:
+        collected = collector(endpoint=arm['endpoint'], model=arm['model'], cases=arm['cases'],
+                              capture_dir=arm['capture_dir'], destination=destination,
+                              provenance=provenance, timeout=arm['timeout_seconds'],
+                              thresholds=arm['thresholds'])
     _require(isinstance(collected, dict) and isinstance(collected.get('logits_sha256'), str)
              and isinstance(collected.get('captures'), list),
              'collector must return the collect_logits manifest shape')
@@ -415,7 +441,7 @@ def validate_plan(plan):
     return fixture
 
 
-def run_ab(plan, collector=collect_logits.collect):
+def run_ab(plan, collector=collect_logits.collect, *, lifecycle=None):
     """Execute one A/B attempt; every run is preserved, failures included."""
     fixture = validate_plan(plan)
     attempt_root = plan['evidence_root'] / plan['attempt']
@@ -443,7 +469,7 @@ def run_ab(plan, collector=collect_logits.collect):
                 arm_run = dict(arm, provenance=plan['provenance'],
                                cases=plan['cases'], thresholds=plan['thresholds'])
                 collection = _execute_run(collector, arm_run, run_root, records_dir,
-                                          gated_norm_dir)
+                                          gated_norm_dir, lifecycle)
                 receipt = {'run': run_name, 'arm': arm['arm'], 'repeat': repeat,
                            'gated_norm_capture_dir': str(gated_norm_dir),
                            'fingerprints': {
@@ -491,6 +517,8 @@ def run_ab(plan, collector=collect_logits.collect):
 
 
 def main(collector=collect_logits.collect):
+    _require(collector is not collect_logits.collect,
+             'live execution requires c2_remote_adapter.py and an explicit remote config')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--evidence-root', type=Path, required=True)
     parser.add_argument('--attempt', required=True)

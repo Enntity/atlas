@@ -1,0 +1,54 @@
+{
+  "schema": "atlas-exl3-reference-diagnosis-summary-v1",
+  "campaign_id": "gate-v2-qualification-20261013-luna1",
+  "collection_executed": false,
+  "candidate_arrays_read": false,
+  "verdict_unchanged": "UNVERIFIABLE",
+  "excluded_reference_mapping": {
+    "H3": {
+      "index": 13,
+      "attempt": "v2ref14"
+    },
+    "H4": {
+      "index": 14,
+      "attempt": "v2ref15"
+    }
+  },
+  "verification": {
+    "offline_replay_byte_identical": true,
+    "registered_failure_records_exact_match": true,
+    "pair_count_per_target": 105,
+    "gate_unit_tests": {
+      "command": "python3 -m unittest discover -s tests/exl3_validation -p 'test_statistical_gate*.py'",
+      "passed": 24,
+      "failed": 0
+    }
+  },
+  "function_sha256": {
+    "evaluate_h3": "e4036ac49d68ccd8ee9ea5110ad1c64311cffe4ad9c0742738f64ee004ba5131",
+    "evaluate_h4": "3b07cb9ed3eb0be6a2b98c8ee07be33a7eb393a5ef3f411d6661cf072b4ff1b1",
+    "analyze_modes": "fd2e20099383d6f0e9a69e707f616a30755b5bb1f821bacc98418a03c566ae9e",
+    "mode_membership": "1dffe406848c01c6dce56cfa02ca8c2e989649fd9a0ed43409e4f39f688d0725",
+    "mode_leave_one_out": "4e455e10415dfeddf98c196003c5b9cce2ed456f9eacb85ac864941be6a719f2"
+  },
+  "evaluator_sha256": {
+    "statistical_gate_v2.py": "96423dbb11555f064423f90e3f8782bfb634d641ed0b2df23b4f8fcb37a535fd",
+    "statistical_gate.py": "5e799d4ad29573c6da8f260ec36de7d70cf975ad869c6d40fe56880e87a81ba7",
+    "parity_protocol.py": "545f62af427c1ca24b299f58f916fff6c663c25fedf331d1c7492930e8648a22",
+    "compare_logits.py": "6d20158c0a1b0f4a478b33d746bb751669f85f9583c4490f095193efa3a2540c"
+  },
+  "artifact_sha256": {
+    "docs/design/evidence/gate-v2-reference-diagnosis-20261014/analyze.py": "2a981c4de512bf8c944c35c0cb8eb95a68939a55abbdc468c48f89b31b2921b5",
+    "docs/design/evidence/gate-v2-reference-diagnosis-20261014/diagnosis.json": "61e6ef5b4e91bd187b7ed15173e3a463a0ca3e5d98e42c0520addc8a087208d3",
+    "docs/design/exl3-reference-verifiability-diagnosis-20261014.md": "8d704bfb5b8640bc424c8151699b4ba113394207392d0f4a22c3b6933c328344",
+    "docs/design/exl3-statistical-gate-v2.md": "ce391718baad2026259d1a7e689df7e8ebd3769dd4e35a4c228d022c4030010e",
+    "/home/colum/Workspace/atlas-exl3-validation-20261010/gate-v2-qualification-20261013-luna1/frozen-plan.json": "ab224d15f268ca873f7fa5b0ce7e8e157f3e905237b7f9ecb48c4c992d7be9e8",
+    "/home/colum/Workspace/atlas-exl3-validation-20261010/gate-v2-qualification-20261013-luna1/campaign-manifest.json": "29187de9eb8c80739c6d95fb655c075788ca1f7821621b2be3c38c25e640e555",
+    "/home/colum/Workspace/atlas-exl3-validation-20261010/gate-v2-qualification-20261013-luna1/qualification-report-corrected.json": "531e9d0077e735c5294b32c4ed86ada7af74b66c098f3d3e68a295f90dff551f"
+  },
+  "reference_config_sha256": {
+    "config.json": "00e4a3aad5a2348d5a0ef8c6a1d8e8a945e77e2a1fddc1d7ddd6560f29e07066"
+  },
+  "reference_profile_sha256": "913424662e2024a03b1c7f1a6450bfa141abff4972af32aab54ba94c2f9af376",
+  "next_action": "separately register reference-only runtime-choice diagnostics; defer concrete qualification policy amendment pending causal evidence"
+}

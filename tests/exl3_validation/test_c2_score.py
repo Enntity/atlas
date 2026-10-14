@@ -253,3 +253,73 @@ def test_validate_arm_identity_accepts_knob_only_difference():
     configuration = validate_arm_identity(a, b)
     assert configuration["arm_b_environment"]["ATLAS_EXL3_NORM_SUBSTITUTE_DIR"] == "/fixtures"
     assert "ATLAS_EXL3_NORM_SUBSTITUTE_DIR" not in configuration["arm_a_environment"]
+
+
+OUTPUT_KEYS = ("ATLAS_EXL3_LOGITS_DIR", "ATLAS_EXL3_UPSTREAM_DUMP_DIR", "ATLAS_EXL3_FFN_DUMP_DIR")
+
+
+def _diagnostic_arm(arm):
+    run_name = f"arm-{arm}-repeat-00"
+    root = f"/evidence/c2/runs/{run_name}"
+    environment = dict(zip(OUTPUT_KEYS, [root + "/logits", "/evidence/c2/gated_norm/" + run_name,
+                                        root + "/ffn"]))
+    if arm == "b":
+        environment.update({"ATLAS_EXL3_NORM_SUBSTITUTE_DIR": "/fixtures",
+                            "ATLAS_EXL3_NORM_SUBSTITUTE_RECORD_DIR": "/records"})
+    run = _run(BASE, environment)
+    run["manifests"][0]["captures"] = [{"capture": root + f"/logits/logits-{i:06d}.json"}
+                                         for i in range(ROWS)]
+    return run
+
+
+def test_fresh_diagnostic_outputs_are_bound_and_reported_without_changing_metrics():
+    refs = _refs(np.random.default_rng(12))
+    a, b = _diagnostic_arm("a"), _diagnostic_arm("b")
+    report = score([f"ref{i}" for i in range(3)], refs, a, b)
+    outputs = report["arm_configuration"]["diagnostic_outputs"]
+    assert outputs["arm_a"] == {key: a["manifests"][0]["provenance"]["environment"][key]
+                                for key in OUTPUT_KEYS}
+    assert outputs["arm_b"] == {key: b["manifests"][0]["provenance"]["environment"][key]
+                                for key in OUTPUT_KEYS}
+    assert report["raw_logit_byte_equality"]["all_rows_equal"]
+
+
+@pytest.mark.parametrize("damage", ["relative", "missing", "wrong-role", "foreign-capture",
+                                    "no-captures", "non-string", "dotdot", "wrong-arm", "foreign-attempt"])
+def test_unbound_diagnostic_outputs_refused(damage):
+    a, b = _diagnostic_arm("a"), _diagnostic_arm("b")
+    manifest = b["manifests"][0]
+    env = manifest["provenance"]["environment"]
+    if damage == "relative":
+        env[OUTPUT_KEYS[0]] = "relative/logits"
+    elif damage == "missing":
+        del env[OUTPUT_KEYS[1]]
+    elif damage == "wrong-role":
+        env[OUTPUT_KEYS[2]] = env[OUTPUT_KEYS[0]]
+    elif damage == "foreign-capture":
+        manifest["captures"][0]["capture"] = "/foreign/logits-000000.json"
+    elif damage == "no-captures":
+        manifest["captures"] = []
+    elif damage == "non-string":
+        env[OUTPUT_KEYS[0]] = 3
+    elif damage == "dotdot":
+        env[OUTPUT_KEYS[2]] += "/../ffn"
+    elif damage == "foreign-attempt":
+        for key in OUTPUT_KEYS:
+            env[key] = env[key].replace("/evidence/c2/", "/different/attempt/")
+        for capture in manifest["captures"]:
+            capture["capture"] = capture["capture"].replace("/evidence/c2/", "/different/attempt/")
+    elif damage == "wrong-arm":
+        env.update(a["manifests"][0]["provenance"]["environment"])
+        manifest["captures"] = a["manifests"][0]["captures"]
+    with pytest.raises(ValueError, match="diagnostic output"):
+        validate_arm_identity(a, b)
+
+
+@pytest.mark.parametrize("key", ["ATLAS_KDA_FLA_REFERENCE", "ATLAS_EXL3_UPSTREAM_DUMP_LAYERS",
+                                 "ATLAS_EXL3_FFN_DUMP_LAYERS", "ATLAS_EXL3_VERIFY_IO_DIR"])
+def test_diagnostic_path_normalization_never_exempts_other_environment(key):
+    a, b = _diagnostic_arm("a"), _diagnostic_arm("b")
+    b["manifests"][0]["provenance"]["environment"][key] = "different"
+    with pytest.raises(ValueError, match="beyond the knob"):
+        validate_arm_identity(a, b)

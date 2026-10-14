@@ -96,7 +96,7 @@ class ComparisonTests(unittest.TestCase):
 
 
 class CollectorTests(unittest.TestCase):
-    def serve(self, directory, extra=0, missing=False):
+    def serve(self, directory, extra=0, missing=False, observed_headers=None):
         requests = []
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_):
@@ -106,6 +106,8 @@ class CollectorTests(unittest.TestCase):
                 if not (directory / "capture-enabled").is_file():
                     raise RuntimeError("collector did not enable capture")
                 requests.append(request)
+                if observed_headers is not None:
+                    observed_headers.append(self.headers.get("x-request-id"))
                 sequence = len(list(directory.glob("logits-*.json")))
                 for offset in range(0 if missing else 1 + extra):
                     filename = f"logits-{sequence + offset:06d}"
@@ -143,6 +145,51 @@ class CollectorTests(unittest.TestCase):
             (root / "out" / "manifest.json").write_text(json.dumps(damaged))
             with self.assertRaises(ValueError):
                 load_artifact(root / "out")
+
+    def test_explicit_request_ids_reach_http_and_preserved_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / "capture"
+            capture.mkdir()
+            headers = []
+            endpoint, _ = self.serve(capture, observed_headers=headers)
+            request_ids = ["c2-arithmetic-r0", "c2-arithmetic-r1"]
+            result = collect(endpoint, "model", manifest("atlas")["cases"], capture,
+                             root / "out", provenance("atlas"), 1, thresholds(),
+                             request_ids=request_ids)
+            self.assertEqual(headers, request_ids)
+            self.assertEqual(result["request_ids"], request_ids)
+            self.assertEqual([record["request_id"] for record in result["captures"]], request_ids)
+            registered = json.loads((root / "out" / "pre_registration.json").read_text())
+            self.assertEqual(registered["request_ids"], request_ids)
+            loaded, _ = load_artifact(root / "out")
+            self.assertEqual(loaded["request_ids"], request_ids)
+
+    def test_default_collection_does_not_add_request_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capture = root / "capture"
+            capture.mkdir()
+            headers = []
+            endpoint, _ = self.serve(capture, observed_headers=headers)
+            result = collect(endpoint, "model", manifest("atlas")["cases"], capture,
+                             root / "out", provenance("atlas"), 1, thresholds())
+            self.assertEqual(headers, [None, None])
+            self.assertNotIn("request_ids", result)
+            self.assertTrue(all("request_id" not in item for item in result["captures"]))
+
+    def test_request_ids_refuse_invalid_schedule_before_io(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            invalid = [[], ["one"], ["one", "one"], "ab", ["one", 2],
+                       ["one", ""], ["one", "bad\r\nheader"], ["one", "white space"],
+                       ["one", "caf\u00e9"]]
+            for request_ids in invalid:
+                with self.subTest(request_ids=request_ids), self.assertRaisesRegex(ValueError, "request IDs"):
+                    collect("http://unused", "model", manifest("atlas")["cases"],
+                            root / "missing-capture", root / "out", provenance("atlas"),
+                            1, thresholds(), request_ids=request_ids)
+                self.assertEqual(list(root.iterdir()), [])
 
     def test_comparator_cli_preserves_report_and_runs_negative_controls(self):
         with tempfile.TemporaryDirectory() as root:

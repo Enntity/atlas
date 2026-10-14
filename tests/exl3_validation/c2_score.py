@@ -14,6 +14,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,42 @@ KNOB_ENV = 'ATLAS_EXL3_NORM_SUBSTITUTE_DIR'
 RECORD_ENV = 'ATLAS_EXL3_NORM_SUBSTITUTE_RECORD_DIR'
 IDENTITY = ('cases', 'tokens_sha256', 'vocab', 'request_policy')
 SIGNS = ('closer', 'farther', 'no-metric-change')
+OUTPUT_ENV = ('ATLAS_EXL3_LOGITS_DIR', 'ATLAS_EXL3_UPSTREAM_DUMP_DIR',
+              'ATLAS_EXL3_FFN_DUMP_DIR')
+
+
+def _diagnostic_outputs(manifest, arm):
+    """Bind fresh observer destinations to driver roles and recorded captures.
+
+    This exempts only the three output destinations, not capture selectors or
+    numerical policy. Paths are checked lexically without filesystem I/O.
+    """
+    environment = manifest['provenance']['environment']
+    if not any(key in environment for key in OUTPUT_ENV):
+        return {}
+    paths = {}
+    for key in OUTPUT_ENV:
+        value = environment.get(key)
+        if (not isinstance(value, str) or not value or not Path(value).is_absolute()
+                or '..' in Path(value).parts or str(Path(value)) != value):
+            raise ValueError('diagnostic output paths must be explicit canonical absolute strings')
+        paths[key] = Path(value)
+    logits, upstream, ffn = (paths[key] for key in OUTPUT_ENV)
+    run_root = logits.parent
+    if (logits.name != 'logits' or run_root.parent.name != 'runs'
+            or not re.fullmatch(r'arm-' + arm + r'-repeat-[0-9]{2,}', run_root.name)
+            or ffn != run_root / 'ffn'
+            or upstream != run_root.parent.parent / 'gated_norm' / run_root.name):
+        raise ValueError('diagnostic output paths do not match their driver roles')
+    captures = manifest.get('captures')
+    expected = sum(len(case['continuation_ids']) + 1 for case in manifest['cases'])
+    if not isinstance(captures, list) or len(captures) != expected:
+        raise ValueError('diagnostic output requires every recorded logits capture')
+    for index, capture in enumerate(captures):
+        if (not isinstance(capture, dict)
+                or capture.get('capture') != str(logits / f'logits-{index:06d}.json')):
+            raise ValueError('diagnostic output does not bind recorded logits captures')
+    return {key: str(path) for key, path in paths.items()}
 
 
 def _sha(path):
@@ -48,12 +85,20 @@ def validate_arm_identity(arm_a, arm_b):
     env_a, env_b = a['provenance']['environment'], b['provenance']['environment']
     if not isinstance(env_a, dict) or not isinstance(env_b, dict):
         raise ValueError('arm provenance environments must be explicit mappings')
-    knob_keys = {KNOB_ENV, RECORD_ENV}
+    outputs_a = _diagnostic_outputs(a, 'a')
+    outputs_b = _diagnostic_outputs(b, 'b')
+    if bool(outputs_a) != bool(outputs_b):
+        raise ValueError('diagnostic output paths must be bound on both arms')
+    if outputs_a and (Path(outputs_a[OUTPUT_ENV[0]]).parents[2]
+                      != Path(outputs_b[OUTPUT_ENV[0]]).parents[2]):
+        raise ValueError('diagnostic output paths must belong to the same A/B attempt')
+    knob_keys = {KNOB_ENV, RECORD_ENV, *outputs_a}
     stripped_a = {key: value for key, value in env_a.items() if key not in knob_keys}
     stripped_b = {key: value for key, value in env_b.items() if key not in knob_keys}
     if stripped_a != stripped_b:
         raise ValueError('mixed configurations between arms: environments differ beyond the knob')
-    return {'arm_a_environment': env_a, 'arm_b_environment': env_b}
+    return {'arm_a_environment': env_a, 'arm_b_environment': env_b,
+            'diagnostic_outputs': {'arm_a': outputs_a, 'arm_b': outputs_b}}
 
 
 def _knob_state(environment):
@@ -185,6 +230,7 @@ def score(reference_specs, reference_runs, arm_a, arm_b,
             'missing_tokens': [token for token in FINGERPRINT_TOKENS if token >= vocab],
             'rows': fingerprint_rows},
         'arm_configuration': {
+            'diagnostic_outputs': configuration['diagnostic_outputs'],
             'knob': {'arm_a': _knob_state(configuration['arm_a_environment']),
                      'arm_b': _knob_state(configuration['arm_b_environment'])}},
         'harness_sha256': {'c2_score.py': _sha(__file__),

@@ -1,5 +1,9 @@
 # Gate v2 evaluator verification — 2026-10-12
 
+This report's original A2.4 verification is historical. The 2026-10-14
+post-collection erratum and qualification outcome are appended below; the
+pre-collection findings and their receipts remain unchanged.
+
 ## Result
 
 **The v2 evaluator and requested implementation checks are complete; the operator has authorised qualification collection after these checks.** The evaluator is separate from the frozen v1 path and has production-path fixtures for the Amendment 2 semantics, campaign plan/order and receipt contract, and held-out isolation. The archived reference-only H5 replay is bit-exact for all six held-outs, and the amended H4 recheck reproduces the single registered mode row with no LOO failures. The operator authorised collection in the follow-up request to finish replay/reporting and launch Luna for qualification. Evaluator review/freeze and host/image preflight must finish before the first qualification sample. No qualification verdict is made here.
@@ -43,4 +47,43 @@ The archived H4 comparison matches the prior calibration's full-set detection, s
 
 ## Evidence identity and limits
 
-The calibration inputs are under `/home/colum/Workspace/atlas-exl3-validation-20261010` and were read only. Replay receipts were initially written under `/tmp` and are now archived under `docs/design/evidence/gate-v2-verification-20261012/`. The corrected H5 receipt hash above binds the final replay; the earlier report quoted a previous receipt hash. This was CPU-only: no GPU was used, no new collection was run, no candidate results were read for calibration, and no remote mutation, publish, commit or PR action occurred. Archived tuning draws are not eligible v2 qualification samples. Collection is now operator-authorised; evaluator review/freeze and operational preflight remain prerequisites before sampling. Parent verification reran all 23 tests and checked the current evaluator/fixture hashes and both archived receipts.
+The calibration inputs are under `/home/colum/Workspace/atlas-exl3-validation-20261010` and were read only. Replay receipts were initially written under `/tmp` and are now archived under `docs/design/evidence/gate-v2-verification-20261012/`. The corrected H5 receipt hash above binds the final replay; the earlier report quoted a previous receipt hash. This was CPU-only: no GPU was used, no new collection was run, no candidate results were read for calibration, and no remote mutation, publish, commit or PR action occurred. Archived tuning draws are not eligible v2 qualification samples. Collection was subsequently authorized and completed; see the erratum below.
+
+## Post-collection evaluator erratum — 2026-10-14
+
+The original frozen evaluator (`statistical_gate_v2.py` SHA256
+`426701ccc0f717ea782116354188b24f421862a676afbdf76f14f6c84f7465dc`)
+incorrectly called the v1 `validate_runs` candidate-pair validator on the
+three independent held-out reference attempts. That validator enforces
+byte-identical logits across its second argument; the v2 registration
+requires byte identity only for `v2cand01` and `v2cand02`, and explicitly
+says distinct reference draws must not be required to match. The first
+campaign evaluation therefore returned `INCOMPLETE` before statistical
+evaluation. Its report and evaluator snapshot remain preserved in the
+campaign evidence root.
+
+The correction adds an optional `require_identical_candidates` parameter to
+the v1 validator, defaulting to `true`, and disables only that check when v2
+validates held-outs. Shared identity, provenance, and finite-logit checks
+remain active; candidate byte identity remains enforced. A new end-to-end
+campaign regression supplies distinct held-out logits and still routes the
+candidate pair through its byte-identity check. The focused v1/v2 gate tests
+pass 24/24. No threshold, metric, or collection artifact changed.
+
+The corrected evaluator (SHA256
+`96423dbb11555f064423f90e3f8782bfb634d641ed0b2df23b4f8fcb37a535fd`)
+evaluated the complete 26-attempt campaign and returned **UNVERIFIABLE**:
+H3 and H4 reference leave-one-out checks failed. H3 has one failed exclusion:
+index 13 (`v2ref14`), item `0/longer/r3/sym_kl` (nearest `0.0508702476`, spread
+`0.0017906041`, allowed limit `0.0053718123`). H4 has one failed membership
+exclusion: index 14 (`v2ref15`), `short16/code` row 1 (distances `0.0002733329` and
+`0.0001366067`, limit `0.0000238237`). Under Amendment 2, an unverifiable
+reference set blocks qualification; the evaluator correctly stopped before
+candidate, held-out, perturbation, and MDE gate results. The candidate is
+therefore **not qualified**; this is not a candidate FAIL verdict.
+
+The campaign contains 26 completed attempts and 832 request receipts,
+including 16 short and 16 long MDE requests. Full report, inputs, and archive
+hashes are indexed at
+[`evidence/gate-v2-qualification-20261014/summary.json`](evidence/gate-v2-qualification-20261014/summary.json)
+and under `/home/colum/Workspace/atlas-exl3-validation-20261010/gate-v2-qualification-20261013-luna1/`.
