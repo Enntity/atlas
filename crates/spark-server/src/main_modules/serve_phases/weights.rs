@@ -146,6 +146,7 @@ pub(crate) fn load_weight_store(
             }
             loader.skip_activation_scales = skip_activation_scales(config);
             loader.skip_mtp = skip_mtp(config, args);
+            loader.skip_vision = spark_model::layers::vision_encoder::vision_receive_only(config);
             loader.skip_layer_prefix = unused_mtp_prefix.clone();
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
@@ -183,6 +184,7 @@ pub(crate) fn load_weight_store(
         loader.peak_memory_multiplier = mult;
         loader.skip_activation_scales = skip_activation_scales(config);
         loader.skip_mtp = skip_mtp(config, args);
+        loader.skip_vision = spark_model::layers::vision_encoder::vision_receive_only(config);
         loader.skip_layer_prefix = unused_mtp_prefix;
         loader
             .load(model_dir, gpu, oom_reserve_bytes)

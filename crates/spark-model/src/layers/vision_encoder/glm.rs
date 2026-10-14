@@ -65,8 +65,32 @@ pub(crate) struct GlmVisionWeights {
     pub merger: GlmVisionMergerWeights,
 }
 
+impl GlmVisionWeights {
+    /// The weights of a tower that never encodes (see [`GlmVisionEncoder::new`]).
+    fn absent() -> Self {
+        let n = DevicePtr::NULL;
+        Self {
+            patch_embed_w: n,
+            patch_embed_b: n,
+            blocks: Vec::new(),
+            post_layernorm_w: n,
+            downsample_w: n,
+            downsample_b: n,
+            merger: GlmVisionMergerWeights {
+                proj_w: n,
+                post_norm_w: n,
+                post_norm_b: n,
+                gate_up_w: n,
+                down_w: n,
+            },
+        }
+    }
+}
+
 pub(crate) struct GlmVisionEncoder {
     pub buf_out: DevicePtr,
+    /// False on a rank that only receives rows (built without weights).
+    encodes: bool,
     pub out_hidden_size: usize,
     pub p_max: usize,
     /// Row capacity of `buf_out`; see [`GLM_MAX_OUTPUT_ROWS`].
@@ -111,11 +135,23 @@ pub(crate) struct GlmVisionEncoder {
 }
 
 impl GlmVisionEncoder {
+    /// The tower with `weights`, or without (`None`): a multi-rank worker
+    /// receives every encoded row from rank 0 into `buf_out`, so it holds that
+    /// buffer and no weights or ViT scratch, and refuses to encode.
     pub(crate) fn new(
-        weights: GlmVisionWeights,
+        weights: Option<GlmVisionWeights>,
         config: &VisionConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
+        let encodes = weights.is_some();
+        let weights = weights.unwrap_or_else(GlmVisionWeights::absent);
+        let alloc = |bytes: usize| {
+            if encodes {
+                gpu.alloc(bytes)
+            } else {
+                Ok(DevicePtr::NULL)
+            }
+        };
         ensure!(
             config.is_glm5_next,
             "GLM vision constructor received a non-GLM config"
@@ -125,7 +161,7 @@ impl GlmVisionEncoder {
             "GLM vision hidden_size must divide num_heads"
         );
         ensure!(
-            weights.blocks.len() == config.depth,
+            !encodes || weights.blocks.len() == config.depth,
             "GLM vision block count mismatch"
         );
         let (p_max, asked_for) = derive_glm_max_patches(
@@ -148,26 +184,27 @@ impl GlmVisionEncoder {
         let wide = (config.hidden_size * 3)
             .max(config.intermediate_size * 2)
             .max(config.projection_intermediate_size * 2);
-        let buf_f32 = gpu.alloc(p_max * patch_dim * 4)?;
-        let buf_pixels = gpu.alloc(p_max * patch_dim * 2)?;
-        let buf_h1 = gpu.alloc(p_max * config.hidden_size * 2)?;
-        let buf_norm = gpu.alloc(p_max * config.hidden_size * 2)?;
-        let buf_attn = gpu.alloc(p_max * config.hidden_size * 2)?;
-        let buf_wide = gpu.alloc(p_max * wide * 2)?;
-        let buf_act = gpu.alloc(
+        let buf_f32 = alloc(p_max * patch_dim * 4)?;
+        let buf_pixels = alloc(p_max * patch_dim * 2)?;
+        let buf_h1 = alloc(p_max * config.hidden_size * 2)?;
+        let buf_norm = alloc(p_max * config.hidden_size * 2)?;
+        let buf_attn = alloc(p_max * config.hidden_size * 2)?;
+        let buf_wide = alloc(p_max * wide * 2)?;
+        let buf_act = alloc(
             p_max
                 * config
                     .intermediate_size
                     .max(config.projection_intermediate_size)
                 * 2,
         )?;
-        let buf_conv = gpu.alloc(p_max * config.out_hidden_size * 2)?;
-        let buf_merger = gpu.alloc(p_max * config.out_hidden_size * 2)?;
+        let buf_conv = alloc(p_max * config.out_hidden_size * 2)?;
+        let buf_merger = alloc(p_max * config.out_hidden_size * 2)?;
         let buf_out = gpu.alloc(GLM_MAX_OUTPUT_ROWS * config.out_hidden_size * 2)?;
-        let buf_rope_cos = gpu.alloc(p_max * head_dim * 2)?;
-        let buf_rope_sin = gpu.alloc(p_max * head_dim * 2)?;
+        let buf_rope_cos = alloc(p_max * head_dim * 2)?;
+        let buf_rope_sin = alloc(p_max * head_dim * 2)?;
         Ok(Self {
             buf_out,
+            encodes,
             out_hidden_size: config.out_hidden_size,
             p_max,
             out_rows: GLM_MAX_OUTPUT_ROWS,

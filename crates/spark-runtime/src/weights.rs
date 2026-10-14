@@ -414,6 +414,9 @@ pub struct SafetensorsLoader {
     pub skip_mtp: bool,
     /// Exact tensor prefix of an unused appended predictor layer; default retains it.
     pub skip_layer_prefix: Option<String>,
+    /// Vision tower tensors on a rank that never encodes (a GLM-5 multi-rank
+    /// worker receives the encoded rows from rank 0). Opt-in.
+    pub skip_vision: bool,
 }
 
 impl Default for SafetensorsLoader {
@@ -435,6 +438,7 @@ impl SafetensorsLoader {
             skip_activation_scales: false,
             skip_mtp: false,
             skip_layer_prefix: None,
+            skip_vision: false,
         }
     }
 
@@ -450,6 +454,7 @@ impl SafetensorsLoader {
             skip_activation_scales: false,
             skip_mtp: false,
             skip_layer_prefix: None,
+            skip_vision: false,
         }
     }
 }
@@ -486,7 +491,7 @@ mod side_files;
 mod store_edit;
 pub(crate) use name_utils::keeps_raw_f16;
 pub(crate) use name_utils::split_trailing_index;
-pub use name_utils::{is_ngram_table, parse_expert_index};
+pub use name_utils::{is_ngram_table, is_vision_tower_tensor, parse_expert_index};
 pub(crate) use side_files::merge_exl3_side_files;
 
 #[cfg(test)]

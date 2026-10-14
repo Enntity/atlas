@@ -24,6 +24,12 @@ pub(crate) fn keeps_raw_f16(name: &str) -> bool {
     name.ends_with(".suh") || name.ends_with(".svh") || name.ends_with(".ngram_embedding.head_bias")
 }
 
+/// A tensor of the vision tower (`model.visual.*`, top-level or nested under
+/// `model.language_model`).
+pub fn is_vision_tower_tensor(name: &str) -> bool {
+    name.starts_with("model.visual.") || name.starts_with("model.language_model.visual.")
+}
+
 /// Whether a tensor is an n-gram embedding TABLE — the huge blobs that are
 /// served off NVMe instead of being uploaded with the rest of the checkpoint.
 ///
