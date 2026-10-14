@@ -66,14 +66,14 @@ impl TransformerModel {
         let total_merged: usize = per_image.iter().map(|(_, _, mp)| *mp).sum();
         // The whole prompt is encoded in one pass: every row is resident from
         // physical 0, nothing is cached or deferred.
-        seq.vision_items = images.to_vec();
-        seq.vision_grids = post_merge_grids;
-        seq.vision_hashes = images.iter().map(|it| it.content_hash).collect();
-        seq.vision_rows_encoded = total_merged;
-        seq.vision_rows_base = 0;
-        seq.vision_skip_rows = 0;
-        seq.vision_computed_from = 0;
-        seq.vision_deferred = false;
+        seq.vision.items = images.to_vec();
+        seq.vision.grids = post_merge_grids;
+        seq.vision.hashes = images.iter().map(|it| it.content_hash).collect();
+        seq.vision.rows_encoded = total_merged;
+        seq.vision.rows_base = 0;
+        seq.vision.skip_rows = 0;
+        seq.vision.computed_from = 0;
+        seq.vision.deferred = false;
         tracing::info!(
             "Vision encoder (batched): {} images, {} merged patches encoded",
             images.len(),

@@ -284,7 +284,7 @@ impl TransformerModel {
                 // Chunks after the first encode their own vision items right
                 // here, before the embed (chunk 0's encode ran inside the
                 // chunk-0 lookup, `vision_cache`).
-                self.vision_encode_chunk_items(seq, tokens, chunk_start, chunk_start + cl)?;
+                self.vision_encode_chunk_items(seq, tokens, chunk_start, chunk_start + cl, stream)?;
                 self.prefill_b_embed_chunk_at(
                     seq,
                     tokens,

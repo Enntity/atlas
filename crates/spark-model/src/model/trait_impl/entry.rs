@@ -23,10 +23,10 @@ impl TransformerModel {
         owned_images: usize,
         slice_rows: usize,
     ) {
-        seq.vision_row_base = row_base;
-        seq.vision_grid_base = grid_base;
-        seq.vision_owned_images = owned_images;
-        seq.vision_slice_rows = slice_rows;
+        seq.vision.row_base = row_base;
+        seq.vision.grid_base = grid_base;
+        seq.vision.owned_images = owned_images;
+        seq.vision.slice_rows = slice_rows;
     }
 
     pub(super) fn prefill_entry(
@@ -78,6 +78,10 @@ impl TransformerModel {
                 stream,
             )?;
             self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
+            // The prompt is in: its pixels are done (`SeqVision::items`).
+            if is_last_chunk {
+                seq.vision.items = Vec::new();
+            }
             Ok(logits)
         })()
     }

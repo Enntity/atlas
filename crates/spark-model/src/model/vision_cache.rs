@@ -30,13 +30,15 @@
 //! encoding them ([`TransformerModel::prepare_vision_embed_deferred_dispatch`])
 //! and the command carries only the grids and hashes. Once the chunk-0 lookup
 //! has the match every rank agreed on, [`TransformerModel::vision_resolve_deferred`]
-//! encodes only the items whose first computed placeholder falls inside chunk
-//! 0's computed range, and on a multi-rank world broadcasts those rows. Every
-//! later chunk encodes its own items the same way, right before its embed.
-//! Leading items wholly inside the cached prefix skip the ViT; their grids
-//! stay for MRoPE. The splice offsets its rows by the rows it skipped
-//! (`skip_rows`) and indexes the rows still resident in `buf_out`
-//! (`rows_encoded`/`rows_base`).
+//! encodes the items with a computed placeholder inside chunk 0, and on a
+//! multi-rank world broadcasts those rows. Every later chunk encodes its own
+//! items the same way, right before its embed; an item straddling a chunk
+//! boundary is re-encoded at each chunk it reaches. Leading items wholly
+//! inside the cached prefix skip the ViT; their grids stay for MRoPE. The
+//! splice offsets its rows by the rows it skipped (`skip_rows`) and by the
+//! last encode's window (`rows_base`/`rows_encoded`). `buf_out` is shared
+//! scratch: an encode first drains the prefill stream, whose queued splice
+//! may still be reading the previous chunk's rows.
 
 use std::borrow::Cow;
 use std::sync::OnceLock;
@@ -55,123 +57,9 @@ fn switch_on() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_VISION_PREFIX_CACHE").as_deref() != Ok("0"))
 }
 
-/// Leading items whose every placeholder sits before `computed_from`, and
-/// their placeholder (= encoder row) count. `counts` holds each item's
-/// placeholders in prompt order.
-pub(crate) fn cached_items(
-    tokens: &[u32],
-    is_pad: impl Fn(u32) -> bool,
-    counts: &[usize],
-    computed_from: usize,
-) -> (usize, usize) {
-    let (mut item, mut rows, mut seen) = (0usize, 0usize, 0usize);
-    for (pos, &t) in tokens.iter().enumerate() {
-        if item == counts.len() || pos >= computed_from {
-            break;
-        }
-        if is_pad(t) {
-            seen += 1;
-            if seen == counts[item] {
-                rows += seen;
-                item += 1;
-                seen = 0;
-            }
-        }
-    }
-    (item, rows)
-}
-
-/// The items a chunk must encode: those with a placeholder AT OR AFTER
-/// `computed_from` inside `[from, to)` (the chunk's computed range), as
-/// indices into the item list. An item straddling a chunk boundary is
-/// RE-encoded at every chunk holding one of its placeholders: the encoder
-/// writes its packed output at `buf_out` row 0, so a later chunk could not
-/// index the earlier chunk's resident tail under one window base — and the
-/// re-encode makes the resident window exactly this chunk's splice range.
-/// The re-encoded head rows were already spliced; only the pads this chunk
-/// computes are read. An item straddling `computed_from` (its cached head is
-/// skipped) is encoded at the chunk that first computes one of its
-/// placeholders.
-///
-/// `first_pad[i]`/`last_pad[i]` are item i's first/last placeholder positions
-/// in the prompt; `computed_from` is the first prompt position the prefill
-/// computes.
-pub(crate) fn items_in_range(
-    first_pad: &[usize],
-    last_pad: &[usize],
-    computed_from: usize,
-    from: usize,
-    to: usize,
-) -> Vec<usize> {
-    first_pad
-        .iter()
-        .zip(last_pad)
-        .enumerate()
-        .filter(|&(_, (&first, &last))| {
-            let first = first.max(computed_from);
-            first < to && last >= from
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// First placeholder position of every item, in prompt order. Items' pad runs
-/// may be split by text (a GLM video's timestamp tokens), so the first pad
-/// after the previous item's last one is the item's own first — the same walk
-/// [`cached_items`] uses to attribute pads to items. An item with no pad in
-/// `tokens` gets `usize::MAX` (never inside any chunk range).
-pub(crate) fn first_pad_positions(
-    tokens: &[u32],
-    is_pad: impl Fn(u32) -> bool,
-    counts: &[usize],
-) -> Vec<usize> {
-    let mut out = Vec::with_capacity(counts.len());
-    let (mut item, mut seen) = (0usize, 0usize);
-    for (pos, &t) in tokens.iter().enumerate() {
-        if item == counts.len() {
-            break;
-        }
-        if is_pad(t) {
-            if seen == 0 {
-                out.push(pos);
-            }
-            seen += 1;
-            if seen == counts[item] {
-                item += 1;
-                seen = 0;
-            }
-        }
-    }
-    out.resize(counts.len(), usize::MAX);
-    out
-}
-
-/// Last placeholder position of every item, in prompt order — the same walk
-/// [`first_pad_positions`] uses, recording the position each item's run ends
-/// on. An item with no pad in `tokens` gets 0 (never passes a `>= from` test
-/// against a real chunk start).
-pub(crate) fn last_pad_positions(
-    tokens: &[u32],
-    is_pad: impl Fn(u32) -> bool,
-    counts: &[usize],
-) -> Vec<usize> {
-    let mut out = vec![0; counts.len()];
-    let (mut item, mut seen) = (0usize, 0usize);
-    for (pos, &t) in tokens.iter().enumerate() {
-        if item == counts.len() {
-            break;
-        }
-        if is_pad(t) {
-            seen += 1;
-            if seen == counts[item] {
-                out[item] = pos;
-                item += 1;
-                seen = 0;
-            }
-        }
-    }
-    out
-}
+#[path = "vision_cache_items.rs"]
+mod items;
+pub(crate) use items::{cached_items, first_pad_positions, items_in_range, last_pad_positions};
 
 impl TransformerModel {
     /// Whether vision prompts are keyed for the prefix cache (module docs).
@@ -191,8 +79,8 @@ impl TransformerModel {
         if !self.vision_prefix_cache_ok() || !self.tokens_have_vision_pad(tokens) {
             return;
         }
-        let grids = &seq.vision_grids;
-        let hashes = &seq.vision_hashes;
+        let grids = &seq.vision.grids;
+        let hashes = &seq.vision.hashes;
         if grids.len() != hashes.len() {
             return;
         }
@@ -238,35 +126,24 @@ impl TransformerModel {
 
     /// Whether the current request's encode waits for its chunk-0 lookup.
     pub(in crate::model) fn vision_encode_deferred(seq: &SequenceState) -> bool {
-        seq.vision_deferred
+        seq.vision.deferred
     }
 
     /// Clear a sequence's per-request vision state (the sequence is leaving
     /// the prefill path).
     pub(in crate::model) fn clear_seq_vision_state(seq: &mut SequenceState) {
-        seq.vision_items.clear();
-        seq.vision_grids.clear();
-        seq.vision_hashes.clear();
-        seq.vision_skip_rows = 0;
-        seq.vision_computed_from = 0;
-        seq.vision_deferred = false;
-        seq.vision_rows_encoded = 0;
-        seq.vision_rows_base = 0;
-        seq.vision_row_base = 0;
-        seq.vision_grid_base = 0;
-        seq.vision_owned_images = 0;
-        seq.vision_slice_rows = 0;
+        seq.vision = Default::default();
     }
 
     /// Derive the per-item post-merge grids and hashes of `images` into `seq`.
     /// Shared by every staging path: the key, MRoPE and the worker's command
     /// need them before any encode runs.
     fn stage_vision_grids(seq: &mut SequenceState, images: &[VisionItem], sms: usize) {
-        seq.vision_grids = images
+        seq.vision.grids = images
             .iter()
             .map(|it| (it.t_len(), it.grid_h / sms, it.grid_w / sms))
             .collect();
-        seq.vision_hashes = images.iter().map(|it| it.content_hash).collect();
+        seq.vision.hashes = images.iter().map(|it| it.content_hash).collect();
     }
 
     /// Trait entry for [`Self::stage_vision_grids`] (the co-dispatch path's
@@ -301,13 +178,13 @@ impl TransformerModel {
             .vision
             .as_ref()
             .map_or(1, |v| v.spatial_merge_size.max(1));
-        seq.vision_rows_encoded = 0;
-        seq.vision_rows_base = 0;
-        seq.vision_skip_rows = 0;
-        seq.vision_computed_from = 0;
+        seq.vision.rows_encoded = 0;
+        seq.vision.rows_base = 0;
+        seq.vision.skip_rows = 0;
+        seq.vision.computed_from = 0;
         Self::stage_vision_grids(seq, images, sms);
-        seq.vision_items = images.to_vec();
-        seq.vision_deferred = true;
+        seq.vision.items = images.to_vec();
+        seq.vision.deferred = true;
         Ok(())
     }
 
@@ -326,8 +203,9 @@ impl TransformerModel {
         tokens: &[u32],
         computed_from: usize,
         chunk_end: usize,
+        stream: u64,
     ) -> Result<()> {
-        if !seq.vision_deferred {
+        if !seq.vision.deferred {
             return Ok(());
         }
         // `vision_deferred` stays set: it now means "this prefill encodes
@@ -340,7 +218,8 @@ impl TransformerModel {
             computed_from
         };
         let counts: Vec<usize> = seq
-            .vision_grids
+            .vision
+            .grids
             .iter()
             .map(|&(t, h, w)| t * h * w)
             .collect();
@@ -349,8 +228,8 @@ impl TransformerModel {
         // Before the encode: `vision_encode_items` subtracts `skip_rows` when
         // it places the run's window (`rows_base`), so the cached leading rows
         // must already be recorded here.
-        seq.vision_skip_rows = skip_rows;
-        seq.vision_computed_from = computed_from;
+        seq.vision.skip_rows = skip_rows;
+        seq.vision.computed_from = computed_from;
         let items: Vec<usize> = items_in_range(
             &first_pad_positions(tokens, |t| self.is_vision_pad(t), &counts),
             &last_pad_positions(tokens, |t| self.is_vision_pad(t), &counts),
@@ -358,7 +237,7 @@ impl TransformerModel {
             computed_from,
             chunk_end,
         );
-        let rows = self.vision_encode_items(seq, &items)?;
+        let rows = self.vision_encode_items(seq, &items, stream)?;
         tracing::info!(
             "Vision prefix cache: {skip} of {} items cached ({skip_rows} rows), encoded {rows} rows \
              for positions from {computed_from}",
@@ -380,25 +259,29 @@ impl TransformerModel {
         tokens: &[u32],
         chunk_start: usize,
         chunk_end: usize,
+        stream: u64,
     ) -> Result<()> {
         // Grids, not items: a worker holds no pixels but must reach the
         // encode's broadcast (its rows arrive by receive, `vision_encode_items`).
-        if !seq.vision_deferred || seq.vision_grids.is_empty() {
+        // Chunk 0's items belong to its lookup, which alone knows the cached
+        // prefix: a path that embeds before its lookup must not encode early.
+        if !seq.vision.deferred || seq.vision.grids.is_empty() || !seq.prefix_lookup_applied {
             return Ok(());
         }
         let counts: Vec<usize> = seq
-            .vision_grids
+            .vision
+            .grids
             .iter()
             .map(|&(t, h, w)| t * h * w)
             .collect();
         let items: Vec<usize> = items_in_range(
             &first_pad_positions(tokens, |t| self.is_vision_pad(t), &counts),
             &last_pad_positions(tokens, |t| self.is_vision_pad(t), &counts),
-            seq.vision_computed_from,
+            seq.vision.computed_from,
             chunk_start,
             chunk_end,
         );
-        self.vision_encode_items(seq, &items)?;
+        self.vision_encode_items(seq, &items, stream)?;
         Ok(())
     }
 
@@ -410,12 +293,17 @@ impl TransformerModel {
     /// A worker (receive-only for vision) holds no pixels: it skips the
     /// encode and receives the head's broadcast into its own `buf_out`
     /// instead, so both ranks end with the same resident rows.
-    fn vision_encode_items(&self, seq: &mut SequenceState, items: &[usize]) -> Result<usize> {
+    fn vision_encode_items(
+        &self,
+        seq: &mut SequenceState,
+        items: &[usize],
+        stream: u64,
+    ) -> Result<usize> {
         let ve = self
             .vision_encoder
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("vision encode without an encoder"))?;
-        let grids = &seq.vision_grids;
+        let grids = &seq.vision.grids;
         // The encoded run's place in the prompt-order packed non-cached
         // output: every item before the first encoded one contributes its
         // rows (cached items' rows are skipped by the splice, not packed).
@@ -423,7 +311,7 @@ impl TransformerModel {
         // its window identically), so it cannot depend on the items alone.
         let a: usize = items
             .first()
-            .map_or(seq.vision_rows_base, |&first| {
+            .map_or(seq.vision.rows_base, |&first| {
                 (0..first)
                     .map(|i| {
                         let (t, h, w) = grids[i];
@@ -431,7 +319,7 @@ impl TransformerModel {
                     })
                     .sum()
             })
-            .saturating_sub(seq.vision_skip_rows);
+            .saturating_sub(seq.vision.skip_rows);
         let rows: usize = items
             .iter()
             .map(|&i| {
@@ -439,21 +327,28 @@ impl TransformerModel {
                 t * h * w
             })
             .sum();
-        if !items.is_empty() && rows > 0 && !seq.vision_items.is_empty() {
+        // `buf_out` is shared: the previous chunk's splice (this or another
+        // sequence's) copies out of it on the prefill `stream`, while the
+        // encoder and the broadcast write it on the default stream.
+        let default = self.gpu.default_stream();
+        if rows > 0 && stream != default {
+            self.gpu.synchronize(stream)?;
+        }
+        if !items.is_empty() && rows > 0 && !seq.vision.items.is_empty() {
             // The head alone holds pixels: a worker (receive-only for vision)
             // skips the encode and takes the rows from the broadcast below.
             ensure!(
-                grids.len() == seq.vision_items.len(),
+                grids.len() == seq.vision.items.len(),
                 "vision items and grids disagree"
             );
-            let refs: Vec<&VisionItem> = items.iter().map(|&i| &seq.vision_items[i]).collect();
+            let refs: Vec<&VisionItem> = items.iter().map(|&i| &seq.vision.items[i]).collect();
             let per_group =
                 ve.forward_items(&refs, self.gpu.as_ref(), self.gpu.default_stream())?;
             // The grids were derived before the encode (the key and the
             // worker needed them); the encoder's own geometry must agree.
             let mut group = 0usize;
             for (&i, (t_len, h, w)) in items.iter().zip(items.iter().map(|&i| grids[i])) {
-                let item = &seq.vision_items[i];
+                let item = &seq.vision.items[i];
                 let (eh, ew, _) = per_group[group];
                 ensure!(
                     (item.t_len(), eh, ew) == (t_len, h, w),
@@ -477,8 +372,8 @@ impl TransformerModel {
         // window is obsolete. An empty selection encodes nothing and leaves
         // the window alone (the chunk splices no pads).
         if rows > 0 {
-            seq.vision_rows_base = a;
-            seq.vision_rows_encoded = rows;
+            seq.vision.rows_base = a;
+            seq.vision.rows_encoded = rows;
         }
         self.gpu.synchronize(self.gpu.default_stream())?;
         if rows > 0 && self.multi_rank_protocol_active() {
@@ -497,102 +392,8 @@ impl TransformerModel {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{cached_items, first_pad_positions, items_in_range, last_pad_positions};
-
-    const PAD: u32 = 9;
-
-    #[test]
-    fn only_items_wholly_before_the_computed_position_are_cached() {
-        // text, item 0 (2 rows) at 1..3, text, item 1 (3 rows) at 4..7, text.
-        let t = [1, PAD, PAD, 2, PAD, PAD, PAD, 3];
-        let pad = |x| x == PAD;
-        assert_eq!(cached_items(&t, pad, &[2, 3], 0), (0, 0));
-        assert_eq!(
-            cached_items(&t, pad, &[2, 3], 2),
-            (0, 0),
-            "item 0 is half computed"
-        );
-        assert_eq!(cached_items(&t, pad, &[2, 3], 3), (1, 2));
-        assert_eq!(
-            cached_items(&t, pad, &[2, 3], 6),
-            (1, 2),
-            "item 1 is partly computed"
-        );
-        assert_eq!(cached_items(&t, pad, &[2, 3], 7), (2, 5));
-        assert_eq!(cached_items(&t, pad, &[2, 3], 99), (2, 5));
-    }
-
-    #[test]
-    fn split_video_runs_count_by_item() {
-        // One item of 3 placeholders split by timestamp text.
-        let t = [PAD, 5, PAD, PAD, 6];
-        assert_eq!(cached_items(&t, |x| x == PAD, &[3], 3), (0, 0));
-        assert_eq!(cached_items(&t, |x| x == PAD, &[3], 4), (1, 3));
-    }
-
-    fn walks(t: &[u32], counts: &[usize]) -> (Vec<usize>, Vec<usize>) {
-        let pad = |x: u32| x == PAD;
-        (
-            first_pad_positions(t, pad, counts),
-            last_pad_positions(t, pad, counts),
-        )
-    }
-
-    #[test]
-    fn a_straddling_item_is_re_encoded_at_every_chunk_it_spans() {
-        // item 0 (4 rows) pads at 2..6, item 1 (2 rows) pads at 7..9. Chunks
-        // [0,5) and [5,10): item 0 straddles (pads 2,3,4 in chunk 0; pad 5 in
-        // chunk 1), so chunk 1 re-encodes it together with item 1.
-        let t = [1, 2, PAD, PAD, PAD, PAD, 3, PAD, PAD, 4];
-        let (first, last) = walks(&t, &[4, 2]);
-        assert_eq!(first, vec![2, 7]);
-        assert_eq!(last, vec![5, 8]);
-        assert_eq!(items_in_range(&first, &last, 0, 0, 5), vec![0]);
-        assert_eq!(
-            items_in_range(&first, &last, 0, 5, 10),
-            vec![0, 1],
-            "item 0's tail pad sits in chunk 1 — re-encode it there"
-        );
-        // A chunk past every pad encodes nothing.
-        assert!(items_in_range(&first, &last, 0, 10, 99).is_empty());
-    }
-
-    #[test]
-    fn cached_leading_items_are_never_selected() {
-        // item 0 (2 rows) wholly cached (computed_from 3), item 1 (2 rows) at
-        // 4..6, item 2 (2 rows) at 7..9. Chunk [3,6) selects item 1 only.
-        let t = [1, PAD, PAD, 2, PAD, PAD, 3, PAD, PAD, 4];
-        let (first, last) = walks(&t, &[2, 2, 2]);
-        assert_eq!(items_in_range(&first, &last, 3, 3, 6), vec![1]);
-        assert_eq!(
-            items_in_range(&first, &last, 3, 6, 9),
-            vec![2],
-            "item 1's pads all sit before 6 — chunk [6,9) encodes only item 2"
-        );
-        assert!(items_in_range(&first, &last, 3, 9, 99).is_empty());
-    }
-
-    #[test]
-    fn a_video_run_split_by_timestamp_text_is_one_item() {
-        // One item of 4 placeholders split by timestamp text: [PAD, 5, PAD,
-        // 6, PAD, 7, PAD]. Its pads span chunks [0,3) and [3,7) — the item is
-        // re-encoded at both.
-        let t = [PAD, 5, PAD, 6, PAD, 7, PAD];
-        let (first, last) = walks(&t, &[4]);
-        assert_eq!(first, vec![0]);
-        assert_eq!(last, vec![6]);
-        assert_eq!(items_in_range(&first, &last, 0, 0, 3), vec![0]);
-        assert_eq!(items_in_range(&first, &last, 0, 3, 7), vec![0]);
-        assert!(items_in_range(&first, &last, 0, 7, 99).is_empty());
-    }
-
-    #[test]
-    fn an_item_without_pads_is_never_selected() {
-        let t = [1, 2, 3];
-        let (first, last) = walks(&t, &[2]);
-        assert_eq!(first, vec![usize::MAX]);
-        assert_eq!(last, vec![0]);
-        assert!(items_in_range(&first, &last, 0, 0, 3).is_empty());
-    }
-}
+#[path = "vision_cache_stream_tests.rs"]
+mod stream_tests;
+#[cfg(test)]
+#[path = "vision_cache_tests.rs"]
+mod tests;

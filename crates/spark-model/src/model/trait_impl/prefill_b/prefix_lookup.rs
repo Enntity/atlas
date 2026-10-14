@@ -381,6 +381,7 @@ impl TransformerModel {
                 tokens,
                 skip_tokens.min(total.saturating_sub(1)),
                 chunk_start + chunk_len,
+                stream,
             )?;
             seq.marconi_skip_to = skip_tokens;
             seq.prefix_lookup_skip = skip;

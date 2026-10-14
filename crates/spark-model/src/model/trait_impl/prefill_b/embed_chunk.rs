@@ -229,9 +229,9 @@ impl TransformerModel {
         let h = self.config.hidden_size;
         // BF16 residual is the shipping config (2 bytes/element).
         let elem_bytes = 2usize;
-        let pending = seq.vision_rows_encoded;
-        let skip_rows = seq.vision_skip_rows;
-        let computed_from = seq.vision_computed_from;
+        let pending = seq.vision.rows_encoded;
+        let skip_rows = seq.vision.skip_rows;
+        let computed_from = seq.vision.computed_from;
         let Some(ve) = &self.vision_encoder else {
             return Ok(());
         };
@@ -257,9 +257,9 @@ impl TransformerModel {
         );
         // Co-dispatch: this request's slice starts at vision_row_base in the
         // shared packed buf_out (0 for the legacy single encode).
-        let row_base = seq.vision_row_base;
-        let owned_images = seq.vision_owned_images;
-        let slice_rows = seq.vision_slice_rows;
+        let row_base = seq.vision.row_base;
+        let owned_images = seq.vision.owned_images;
+        let slice_rows = seq.vision.slice_rows;
         if owned_images > 0 {
             ensure!(
                 slice_rows > 0
@@ -278,7 +278,7 @@ impl TransformerModel {
         // by a later per-chunk encode). Co-dispatch reads a slice of the
         // shared packed output with the base at 0 (the batched encode wrote
         // every request's rows; nothing has been re-encoded since).
-        let rows_base = seq.vision_rows_base;
+        let rows_base = seq.vision.rows_base;
         let (mut row_idx, _) = vision_pad_row_range(
             tokens,
             start,

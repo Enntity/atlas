@@ -394,8 +394,8 @@ pub fn start_chunked_prefill(
         // state read this request's own items.
         if let Some(s) = vision_slice {
             model.stage_vision_grids(&mut seq, &image_pixels);
-            seq.vision_rows_encoded = s.patch_row_count;
-            seq.vision_rows_base = 0;
+            seq.vision.rows_encoded = s.patch_row_count;
+            seq.vision.rows_base = 0;
         }
 
         dispatch_chunk0_vision(

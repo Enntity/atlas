@@ -195,13 +195,9 @@ impl TransformerModel {
             stream
         };
 
-        // Chunks after the first encode their own vision items right here,
-        // before the embed (chunk 0's encode runs inside the prefix lookup,
-        // `vision_cache`). Every rank runs this at the same point, so the
-        // rows broadcast is symmetric.
-        if chunk_start > 0 {
-            self.vision_encode_chunk_items(seq, tokens, chunk_start, chunk_start + chunk_len)?;
-        }
+        // A later chunk encodes its vision items before its embed, on every
+        // rank alike (chunk 0's run in its lookup, `vision_cache`).
+        self.vision_encode_chunk_items(seq, tokens, chunk_start, chunk_start + chunk_len, stream)?;
         // Zero the arena and embed the chunk (phases 1+1b, `warm`): here, or
         // with ATLAS_GLM_WARM_SKIP_CACHED after the prefix lookup and only
         // for a chunk that computes.

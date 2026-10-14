@@ -47,14 +47,14 @@ impl TransformerModel {
 
         let (state, grids, hashes, payload) = if enabled {
             let ve = self.vision_encoder.as_ref().expect("checked above");
-            let grids = seq.vision_grids.clone();
-            let hashes = seq.vision_hashes.clone();
+            let grids = seq.vision.grids.clone();
+            let hashes = seq.vision.hashes.clone();
             // A deferred encode has no rows yet: the header carries the rows
             // its grids describe, and the payload follows from the lookup.
-            let rows = if seq.vision_deferred {
+            let rows = if seq.vision.deferred {
                 grids.iter().map(|&(t, h, w)| t * h * w).sum()
             } else {
-                seq.vision_rows_encoded
+                seq.vision.rows_encoded
             };
             let state = VisionWireState {
                 rows,
@@ -63,10 +63,10 @@ impl TransformerModel {
                 grid_base,
                 owned_images,
                 slice_rows: if owned_images == 0 { rows } else { slice_rows },
-                deferred: seq.vision_deferred,
+                deferred: seq.vision.deferred,
             };
             let state = validate_state(&state, ve.output_rows())?;
-            let payload = if seq.vision_deferred {
+            let payload = if seq.vision.deferred {
                 0
             } else {
                 let payload = payload_bytes(&state, ve.out_hidden_size, ve.output_rows())?;
@@ -174,20 +174,20 @@ impl TransformerModel {
                 .expect("validated vision payload without communicator")
                 .broadcast(ve.buf_out.0, payload, 0)?;
         }
-        seq.vision_grids = grids;
-        seq.vision_hashes = hashes;
+        seq.vision.grids = grids;
+        seq.vision.hashes = hashes;
         // The worker's per-chunk encode (`vision_encode_chunk_items`) and the
         // chunk-0 resolve (`vision_resolve_deferred`, which min-reduces
         // `computed_from` with the head) both gate on this flag: it must
         // mirror the head's, or the ranks leave the collective at different
         // points.
-        seq.vision_deferred = state.deferred;
-        seq.vision_rows_encoded = if state.deferred { 0 } else { state.rows };
-        seq.vision_rows_base = 0;
-        seq.vision_row_base = state.row_base;
-        seq.vision_grid_base = state.grid_base;
-        seq.vision_owned_images = state.owned_images;
-        seq.vision_slice_rows = state.slice_rows;
+        seq.vision.deferred = state.deferred;
+        seq.vision.rows_encoded = if state.deferred { 0 } else { state.rows };
+        seq.vision.rows_base = 0;
+        seq.vision.row_base = state.row_base;
+        seq.vision.grid_base = state.grid_base;
+        seq.vision.owned_images = state.owned_images;
+        seq.vision.slice_rows = state.slice_rows;
         Ok(())
     }
 }
