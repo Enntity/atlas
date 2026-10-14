@@ -5,6 +5,7 @@
 
 mod adapter;
 mod basic;
+mod evict_scan;
 mod nvme;
 mod nvme_lru;
 mod snapshot;
