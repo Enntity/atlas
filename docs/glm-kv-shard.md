@@ -387,15 +387,17 @@ it hides behind — roughly 0.4-0.7 ms per 8-row step.
 The fork-only GB10 display carveout (`spark display-carveout`,
 `factory::build::kv_carveout`) lends ~2 GiB of device memory outside the
 system pool and moves whole per-layer KV buffers into it; with
-`ATLAS_KV_CARVEOUT_ORDER=latent` (the default) only latent pools go there,
-because the carveout is not cached in L2 and the latent pools are read only
-at the selected rows. Under the shard each rank's latent pool of layer `l`
-holds `ceil(N / 2)` slots (`PagedKvCache::buffer_sizes_with_k_slots`), and
-the shard's scratch allocation, which grows with the pool through its
-identity table, is counted with the system-memory bytes the plan must not
-exceed (`KvShape::side_bytes`). The plan and the agreement are otherwise the
-same: each rank plans the largest pool whose system-memory share fits what
-its budgeted pool would have used, the ranks agree on the smaller count, and
+`ATLAS_KV_CARVEOUT_ORDER=latent` (the default) only latent pools go there.
+(That order dates from the L2-uncached memory-list export; the carveout is
+now allocated GPU-cacheable from the driver's scanout heap, and under the
+shard the latent pools fill it anyway.) Under the shard each rank's latent
+pool of layer `l` holds `ceil(N / 2)` slots
+(`PagedKvCache::buffer_sizes_with_k_slots`), and the shard's scratch
+allocation, which grows with the pool through its identity table, is counted
+with the system-memory bytes the plan must not exceed
+(`KvShape::side_bytes`). The plan and the agreement are otherwise the same:
+each rank plans the largest pool whose system-memory share fits what its
+budgeted pool would have used, the ranks agree on the smaller count, and
 `PagedKvCache::new_latent_sharded_placed` allocates the placed pools from
 the carveout. Both ranks size identical buffers (a shard's latents differ
 between ranks, its pool sizes do not), so they plan the same count.
