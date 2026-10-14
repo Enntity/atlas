@@ -117,6 +117,10 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        // The sequence is leaving the prefill path: drop its per-request
+        // vision state (pixels, grids, hashes, encode bookkeeping) so a slot
+        // reuse cannot observe a previous request's images (`vision_cache`).
+        Self::clear_seq_vision_state(seq);
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
         // CRITICAL: release SSM slot FIRST to prevent slot leak if later

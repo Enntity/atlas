@@ -17,16 +17,16 @@ mod prefill_stream_tests;
 
 impl TransformerModel {
     pub(super) fn set_vision_slice_base_entry(
-        &self,
+        seq: &mut SequenceState,
         row_base: usize,
         grid_base: usize,
         owned_images: usize,
         slice_rows: usize,
     ) {
-        *self.vision_row_base.lock() = row_base;
-        *self.vision_grid_base.lock() = grid_base;
-        *self.vision_owned_images.lock() = owned_images;
-        *self.vision_slice_rows.lock() = slice_rows;
+        seq.vision_row_base = row_base;
+        seq.vision_grid_base = grid_base;
+        seq.vision_owned_images = owned_images;
+        seq.vision_slice_rows = slice_rows;
     }
 
     pub(super) fn prefill_entry(

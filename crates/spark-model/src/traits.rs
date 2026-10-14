@@ -162,6 +162,61 @@ pub struct SequenceState {
     /// whose tokens are their own key, and for a vision prompt that cannot be
     /// keyed, which then neither looks up nor inserts.
     pub vision_cache_key: Vec<u32>,
+    /// Per-sequence vision state — the model's former globals, moved here so
+    /// two image prompts can interleave prefill chunks without overwriting
+    /// each other's encoder rows, grids or hashes (`model::vision_cache`).
+    /// All empty/zero for a text prompt.
+    ///
+    /// The request's images (host pixels), moved in at admission instead of
+    /// staged on the model. Consumed by the encode; kept until the prefill
+    /// ends so a retried chunk 0 can re-encode.
+    pub vision_items: Vec<crate::VisionItem>,
+    /// Per-item `(t_len, grid_h_post_merge, grid_w_post_merge)`, parallel to
+    /// `vision_items` once the model derives them. MRoPE positions from these;
+    /// `t_len` is TEMPORAL GROUPS (1 for a still), not encoder rows — a video
+    /// feeds `t_len` rows to the ViT but occupies ONE contiguous pad run.
+    pub vision_grids: Vec<(usize, usize, usize)>,
+    /// Per-item content hash, parallel to `vision_grids`. Keys the prefix
+    /// cache (`vision_cache_key`).
+    pub vision_hashes: Vec<u128>,
+    /// Leading encoder rows `buf_out` does not hold: the cached items'. Their
+    /// placeholders all sit at positions this prefill does not compute, so
+    /// their rows are left as the raw token embedding no layer reads.
+    pub vision_skip_rows: usize,
+    /// First prompt position the prefill computes. Every skipped row's
+    /// placeholder sits before it.
+    pub vision_computed_from: usize,
+    /// This prefill encodes per chunk: the chunk-0 staging set it on the
+    /// head (the worker's rows arrive by broadcast instead), and every chunk
+    /// encodes the items its splice reads right before its embed. Cleared
+    /// only when the sequence leaves the prefill path.
+    pub vision_deferred: bool,
+    /// Encoder rows currently resident in `buf_out` for THIS prefill: written
+    /// by an encode of this prefill and not yet overwritten by a later one.
+    /// `buf_out` is the single shared scratch row buffer, so a chunk's splice
+    /// may read rows an earlier chunk encoded (an item straddling a chunk
+    /// boundary is encoded once, at the chunk where its first computed
+    /// placeholder falls) but must never index past what is resident.
+    pub vision_rows_encoded: usize,
+    /// Virtual row — the index in the prompt-order packed non-cached output —
+    /// of `buf_out` physical row 0. Each per-chunk encode re-writes physical
+    /// row 0 with the items this chunk splices (a straddling item is
+    /// re-encoded at every chunk holding one of its placeholders), so the
+    /// splice maps a pad's packed row `v` to physical `v - vision_rows_base`;
+    /// rows below the base belong to earlier chunks and are gone.
+    pub vision_rows_base: usize,
+    /// Co-dispatched batched-ViT slice base for THIS sequence's chunk-0
+    /// splice/MRoPE. When a tick batches >=2 image requests into one
+    /// `buf_out`, each request reads its OWN slice: `vision_row_base` = first
+    /// `buf_out` row, `vision_grid_base` = first `vision_grids` index, and
+    /// `vision_owned_images` bounds the grid scan. All 0 ⇒ legacy (read from
+    /// row 0 / grid 0). Set by the scheduler before the chunk.
+    pub vision_row_base: usize,
+    pub vision_grid_base: usize,
+    pub vision_owned_images: usize,
+    /// Encoded rows owned by this sequence's co-dispatched slice. Zero means
+    /// the legacy single-request range (or no pending vision).
+    pub vision_slice_rows: usize,
     /// Whether the chunk-0 prefix-cache lookup already ran for this sequence.
     ///
     /// The lookup is NOT idempotent: it bumps radix refs, `inc_ref`s each
@@ -314,6 +369,18 @@ impl SequenceState {
             cached_prefix_blocks: 0,
             prefix_ref_tokens: Vec::new(),
             vision_cache_key: Vec::new(),
+            vision_items: Vec::new(),
+            vision_grids: Vec::new(),
+            vision_hashes: Vec::new(),
+            vision_skip_rows: 0,
+            vision_computed_from: 0,
+            vision_deferred: false,
+            vision_rows_encoded: 0,
+            vision_rows_base: 0,
+            vision_row_base: 0,
+            vision_grid_base: 0,
+            vision_owned_images: 0,
+            vision_slice_rows: 0,
             prefix_lookup_applied: false,
             prefix_lookup_skip: false,
             pc_branch_at: None,

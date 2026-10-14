@@ -172,30 +172,21 @@ fn ep_zero_capacity_rejects_even_a_single_request() {
     assert!(response_rx.try_recv().unwrap().is_err());
 }
 
-// The model holds ONE vision state (encoder rows, grids, item hashes) that
-// every chunk of an image prompt reads. These pin when a second image request
-// must wait so it cannot overwrite the state of one still chunking.
-const TEXT: (bool, bool) = (false, true);
-const IMAGE_ONE_CHUNK: (bool, bool) = (true, false);
-const IMAGE_CHUNKED: (bool, bool) = (true, true);
-
+// Vision state is per-sequence (`model::vision_cache`), so admission no
+// longer serializes image prefills: the gate's only concern is KV. Two image
+// prompts — each long enough to chunk over several ticks — are admitted in
+// the same tick whenever their KV fits, and their prefill chunks interleave.
 #[test]
-fn an_image_request_waits_while_an_image_prefill_is_chunking() {
-    let reqs = [IMAGE_ONE_CHUNK, TEXT, IMAGE_CHUNKED];
-    assert_eq!(vision_holds(true, &reqs), vec![0, 2], "text never waits");
-    assert!(vision_holds(false, &reqs).is_empty());
-}
-
-#[test]
-fn a_chunked_image_admitted_this_tick_holds_later_images() {
-    assert_eq!(
-        vision_holds(
-            false,
-            &[IMAGE_CHUNKED, TEXT, IMAGE_ONE_CHUNK, IMAGE_CHUNKED]
-        ),
-        vec![2, 3]
-    );
-    // Single-chunk images finish inside their own call, so any number of them,
-    // and one chunked image after them, share a tick.
-    assert!(vision_holds(false, &[IMAGE_ONE_CHUNK, IMAGE_ONE_CHUNK, IMAGE_CHUNKED]).is_empty());
+fn two_chunked_image_requests_are_admitted_in_the_same_tick() {
+    // Two 47K-token image prompts (the race repro shape) against a pool that
+    // holds both: both admitted, neither queued behind the other.
+    let image_prompt = 47_000;
+    let reqs = vec![(image_prompt, MAX_TOK), (image_prompt, MAX_TOK)];
+    let (n, forced) = admit_count(POOL_BLOCKS, 0, &reqs, MAX_SEQ_LEN, MAX_SEQ_LEN, BS);
+    assert_eq!(n, 2, "both image requests fit — no vision hold");
+    assert!(!forced);
+    // And a third arrives behind them only on KV grounds, the same as text.
+    let reqs = vec![(image_prompt, MAX_TOK); 3];
+    let (n, _) = admit_count(POOL_BLOCKS, 0, &reqs, MAX_SEQ_LEN, MAX_SEQ_LEN, BS);
+    assert_eq!(n, 2, "the third waits for pool capacity, not for vision");
 }
