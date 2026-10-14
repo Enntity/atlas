@@ -10,7 +10,7 @@ impl TransformerModel {
     /// (GLM-5) keep the residual in the FP32 highway and `hidden_states` holds
     /// only the next sublayer's mixed input, so they contract the highway by
     /// stream mean — the reference DFlash target hidden — instead.
-    fn dflash_capture_rows(
+    pub(super) fn dflash_capture_rows(
         &self,
         row0: usize,
         rows: usize,

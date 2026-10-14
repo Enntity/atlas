@@ -396,6 +396,15 @@ impl TransformerModel {
             passengers.as_deref_mut().zip(passenger_run.as_ref()),
             stream,
         )?;
+        // Drafter-distillation capture: the contracted final hidden of this
+        // chunk (`tokens` holds the whole prompt; `seq.tokens` is not filled yet).
+        self.hidden_capture_final(
+            tokens,
+            self.buffers.hidden_states(),
+            effective_seq_len_start,
+            proc_count,
+            stream,
+        )?;
         let t_fwd = tp.elapsed();
         self.warm_trace_sync(stream)?;
         let marks = [t_lookup, t_prefix, t_blocks, t_meta, tp.elapsed()];

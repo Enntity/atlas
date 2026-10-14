@@ -287,6 +287,8 @@ impl TransformerModel {
                 proc_count,
                 stream,
             )?;
+            // Drafter-distillation capture (ATLAS_HIDDEN_CAPTURE_DIR).
+            self.hidden_capture_layer(i, effective_seq_len_start, proc_count, stream)?;
             // Riding owners' rows land in their stable hidden-save slots, as
             // after an owner-batched verify.
             if let Some((p, run)) = passengers.as_ref()
