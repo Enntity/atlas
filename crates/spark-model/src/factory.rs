@@ -177,7 +177,7 @@ fn ensure_norm_substitution_engaged(
     model_type: &str,
     engages: bool,
 ) -> Result<()> {
-    if engages || !dir.is_some_and(|dir| !dir.is_empty()) {
+    if engages || dir.is_none_or(|dir| dir.is_empty()) {
         return Ok(());
     }
     bail!(

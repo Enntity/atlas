@@ -135,9 +135,9 @@ new GPU work (continue.md "Before any GPU work").
      2026-10-15:** [result](docs/design/exl3-indexer-localization-result-20261015.md).
      `top_k_per_row_prefill` returns the correct pool set in a run-dependent
      order, and sparse MLA attention accumulates in that order.
-   - [ ] Implement the reference-determinism fix (scope pending user
-     choice): a fixed order for both accumulations, i.e. the fused-MoE
-     combine and the indexer top-k order.
+   - [x] Reference-determinism fix scope. **Decision 2026-10-15:** the
+     reference kit is not modified; Atlas-side determinism only. The Atlas
+     audit and its follow-ups are tracked as Q5 below.
    See the [qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md).
 2. **ref13 mode-mechanism probe** (separate diagnostic, not qualification).
    - [ ] The historical tuning set of 15 reference draws falls into 6 byte
@@ -341,6 +341,37 @@ new GPU work (continue.md "Before any GPU work").
   - *State:* corpus (81 held-out + 10 tuning), checkers, a runner with
     Wilson intervals/`--compare` and provisional thresholds are in
     `tests/exl3_validation/q4/` with CPU tests. There has been no live run.
+
+- [ ] **Q5 — Atlas run-to-run determinism hardening.** A 2026-10-15
+  read-only audit of the GLM-5.3 EXL3 path found neither reference hazard
+  in Atlas:
+  - the routed-MoE combine is a fixed slot-order FP32 sum with no atomics
+    (`exl3_moe_precision.cu:159-176`);
+  - the indexer pool top-k emits ascending pool order with a lowest-index
+    tie-break (`glm_indexer.cu:358-450`), so sparse MLA accumulates in a
+    defined order;
+  - the TP=2 sum is a single commutative `__hadd`;
+  - argmax ties break the same way everywhere.
+
+  Two follow-ups remain:
+  - [ ] **Pin the cuBLASLt router GEMM.** `crates/spark-runtime/src/cublaslt.rs:216-338`
+    calls `cublasLtMatmulAlgoGetHeuristic` on every call, takes the top
+    result, and sets no reduction-scheme mask or pinned algorithm. Its output
+    (M ∈ {1..5, 128} × N=288 × K=4096; `glm5_exl3_ffn/moe/forward.rs:79`) feeds
+    expert top-k, so a 1-ulp change flips routing. Restrict the preference to
+    a deterministic reduction scheme (no atomic split-K), cache the chosen
+    algorithm per shape, log its ID/split-K/reduction scheme at first use,
+    and add a repeat-bitwise test. The shared mHC TF32 Lt callers
+    (`hc_prefill.rs:81`, `glm_hc_prewarm.rs:209`) share the global
+    workspace; confirm they use the same stream.
+  - [ ] **Fail closed on the TP all-reduce fallback.** `model/impl_a1.rs:616-620`
+    only warns when the `bf16_add_inplace` lookup fails, then routes TP sums
+    to `ncclAllReduce` (`comm_impl.rs:23,50`) with an unpinned NCCL tuner.
+    Make startup assert which path is live (hard error for GLM-5.3 EXL3).
+  - Note, not a hazard: the classic-cuBLAS shared/dense FFN profile is
+    pinned (`gpu/gemm.rs:20-26`). Batch-composition variance (thin/fat
+    MoE threshold, EXL3 row buckets, mHC split policy) is deterministic for
+    a fixed batch and matters only under concurrency.
 
 ### P — measure and optimize the native EXL3 path
 

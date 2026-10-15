@@ -118,10 +118,10 @@ impl Glm5Exl3KdaResources {
             };
         Ok((
             Glm5KdaWeights {
-                q_proj: Glm5Projection::Exl3(self.q_proj),
-                k_proj: Glm5Projection::Exl3(self.k_proj),
-                v_proj: Glm5Projection::Exl3(self.v_proj),
-                o_proj: Glm5Projection::Exl3(self.o_proj),
+                q_proj: Glm5Projection::Exl3(Box::new(self.q_proj)),
+                k_proj: Glm5Projection::Exl3(Box::new(self.k_proj)),
+                v_proj: Glm5Projection::Exl3(Box::new(self.v_proj)),
+                o_proj: Glm5Projection::Exl3(Box::new(self.o_proj)),
                 b_proj,
                 f_a_proj,
                 f_b_proj,

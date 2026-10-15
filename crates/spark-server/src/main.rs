@@ -30,6 +30,7 @@ mod citation_structured;
 mod cli;
 mod conversation_store;
 mod disk_guard;
+mod dsflash_f4_stub;
 mod ep_peer_lifeline;
 mod error_hints;
 mod glm_tool_boundary;

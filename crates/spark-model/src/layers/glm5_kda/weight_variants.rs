@@ -11,7 +11,7 @@ pub enum Glm5Projection {
         nvfp4: QuantizedWeight,
         prefill_nvfp4_t: Option<QuantizedWeight>,
     },
-    Exl3(Glm5Exl3Projection),
+    Exl3(Box<Glm5Exl3Projection>),
 }
 
 impl Glm5Projection {

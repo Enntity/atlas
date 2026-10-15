@@ -78,7 +78,9 @@ fn projection(gpu: &Gpu, rank: usize, axis: ShardAxis) -> Glm5Projection {
     .unwrap();
     let plan = TpShardPlan::new(&view, axis, rank, 2).unwrap();
     let shard = Exl3DeviceShard::upload(gpu, &view, &plan).unwrap();
-    Glm5Projection::Exl3(Glm5Exl3Projection::new(gpu, shard, 3, 77).unwrap())
+    Glm5Projection::Exl3(Box::new(
+        Glm5Exl3Projection::new(gpu, shard, 3, 77).unwrap(),
+    ))
 }
 
 #[test]

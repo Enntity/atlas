@@ -151,6 +151,7 @@ fn actual_component_prefill_has_one_tp_sum_and_preflight_rejects_missing_comm() 
                     let view =
                         TensorView::new(if router { Dtype::F16 } else { Dtype::F32 }, shape, &data)
                             .unwrap();
+                    #[allow(clippy::single_range_in_vec_init)]
                     Exl3DenseDeviceTensor::upload(
                         &gpu,
                         &view,
