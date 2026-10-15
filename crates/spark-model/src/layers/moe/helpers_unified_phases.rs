@@ -126,7 +126,7 @@ impl MoeLayer {
             .collect();
         // Owned checkpoint transforms keep their release callback; the normal
         // unified path retains upstream's in-place allocation ownership.
-        let inplace = !keep_originals && release.is_none();
+        let inplace = !keep_originals && release.is_none() && super::inplace_transpose::enabled();
         let mut scratch = super::inplace_transpose::TransposeScratch::new();
         let down_t = if inplace {
             self.transpose_experts_inplace(gpu, &down_src, h, inter, routed_group, &mut scratch)?

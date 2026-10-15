@@ -279,7 +279,8 @@ impl MoeLayer {
             })
             .collect();
         let mut scratch = TransposeScratch::new();
-        let (gate_t, up_t) = if keep_originals {
+        let inplace = !keep_originals && super::inplace_transpose::enabled();
+        let (gate_t, up_t) = if !inplace {
             (
                 self.transpose_experts_gpu(gpu, &gate_src, inter, h, routed_gs)?,
                 self.transpose_experts_gpu(gpu, &up_src, inter, h, routed_gs)?,
@@ -302,13 +303,22 @@ impl MoeLayer {
             // contain stale addresses, but the unified dispatch never reads
             // them (gated by `use_t_layout_for_decode()`).
             for expert in &mut self.weights.experts {
-                // The original allocations now hold the transposed data;
-                // NULL the fields so no untransposed path can read them.
+                // In place, the original allocations now hold the transposed
+                // data; consolidated, they are freed. Either way NULL the
+                // fields so no untransposed path can read them.
                 if !expert.gate_proj.weight.is_null() {
+                    if !inplace {
+                        free_original(gpu, &mut freed, expert.gate_proj.weight)?;
+                        free_original(gpu, &mut freed, expert.gate_proj.weight_scale)?;
+                    }
                     expert.gate_proj.weight = DevicePtr::NULL;
                     expert.gate_proj.weight_scale = DevicePtr::NULL;
                 }
                 if !expert.up_proj.weight.is_null() {
+                    if !inplace {
+                        free_original(gpu, &mut freed, expert.up_proj.weight)?;
+                        free_original(gpu, &mut freed, expert.up_proj.weight_scale)?;
+                    }
                     expert.up_proj.weight = DevicePtr::NULL;
                     expert.up_proj.weight_scale = DevicePtr::NULL;
                 }
