@@ -47,14 +47,17 @@ Append-only; mark retracted entries instead of deleting them.
 
 ### Assumptions (inferred — confirm before relying)
 
-- **B7 — L1 is a KDA layer** and the failing `longer` rows cross the
+- **B7 — RETRACTED 2026-10-14: standalone `hc_pre` at ordinary L1.**
+  The original assumption was that L1 is a KDA layer and failing `longer` rows cross the
   L0→L1 boundary at mHC `hc_pre` (parent plan wording "before attributing
   this to L1 KDA"). The reference hook `hc_pre(x,...)` receives the
   complete multi-stream residual as `x` and returns `(post, comb,
   layer-input)`, so the streams at the boundary and the L1 attention input
   are `mhc-pre-input-x` and `mhc-pre-layer-input`
-  (`vllm-reference-src/vllm/models/glm5next/nvidia/model.py:515`). (inferred
-  from installed source; bind at capture time, do not trust this line.)
+  (`vllm-reference-src/vllm/models/glm5next/nvidia/model.py:515`). Source review
+  now establishes that ordinary L1 consumes deferred L0 post/comb and calls
+  `hc_fused_post_pre` twice per request (attention, then FFN), not `hc_pre`.
+  The corrected mapping and source hashes are recorded in D3 below.
 - **B8 — Reference KDA stages at L1** are produced by
   `reference_kda_trace.patch_kda` once its `layers != {0}` guard and
   sitecustomize's `_UPSTREAM != '0'` contract widen; stage names are
@@ -154,18 +157,24 @@ owed at GPU time.
 
 `tests/exl3_validation/l1_bisect.py` + `test_l1_bisect.py`.
 
-- CLI: `--candidate <capture-dir> --reference <capture-dir> --rank
-  --layer --rows … --out`; `--layer` is constrained to the qualified
+- CLI: `--candidate <capture-dir> --reference <capture-dir>
+  --candidate-artifact <collection-dir> --reference-artifact <collection-dir>
+  --binding <frozen-input-binding.json> --rank --layer --rows … --out`;
+  `--layer` is constrained to the qualified
   {0, 1} boundary (normally 1); capture dirs are the `ffn-capture/` sidecar
   layout both engines already write. Reuse `analyze_localization`'s sidecar
   scan, `metrics`, `bf16_key` and layout mapping (`kda_layout`) by import
   (B3); do not re-implement.
 - Pair order (the parent plan's bisection), per row and rank:
-  1. **boundary streams** — candidate `incoming_highway.highway` +
-     `attn_mhc_norm.highway/post/comb` vs reference `mhc-pre-input-x` /
-     `mhc-pre-post` / `mhc-pre-comb` (B7);
+  1. **boundary streams** — candidate `incoming_highway.highway` and
+     `attn_mhc_norm.highway` vs reference `mhc-fused-residual-output` at
+     attention-phase invocation `2r`; `attn_mhc_norm.post/comb` vs
+     `mhc-fused-post/comb` at the same invocation. The incoming Atlas highway
+     is already materialized after L0 hc_post; the reference fused inputs
+     are deferred `(x,residual,post,comb)`, so `mhc-fused-input-x` and
+     `mhc-fused-input-residual` are not its semantic counterparts;
   2. **L1 attention input** — `attn_mhc_norm.normed` vs
-     `mhc-pre-layer-input`;
+     `mhc-fused-layer-input` at attention invocation `2r`;
   3. **L1 core** — `recurrent_output.core` vs `kda-core-output`;
   4. **gated norm** — `gated_norm.gated` vs `kda-gated-norm`;
   5. **local o_proj** — NOT bisectable cross-engine (B13): the reference
@@ -173,15 +182,108 @@ owed at GPU time.
      is kept as a diagnostic pair against `gated_norm.gated`; a pre-reduce
      reference capture is an owed overlay extension;
   6. **reduced o_proj** — `attention_reduced_output.output` vs `kda-o-proj`;
-  7. **FFN mHC input** — `ffn_mhc_norm.normed` vs `mhc-fused-layer-input`.
+  7. **FFN mHC input** — `ffn_mhc_norm.normed` vs `mhc-fused-layer-input`
+     at FFN invocation `2r+1`. KDA stages use invocation `r`. For the supported
+     L0 diagnostic, attention uses `mhc-pre-*` at `r` and FFN uses
+     `mhc-fused-*` at `r` (only one fused call per request at L0).
 - Output: per-row ordered stage table (exact/unequal/max_ulp per tensor),
   `earliest_divergent_stage`, explicit `missing` entries for absent
-  captures, and the reference-policy binding (`mhc-pre-policy`) beside each
-  row. The report states "diagnostic localization only; no gate claim".
+  captures, and the phase-specific reference-policy bindings beside each
+  row (both attention/FFN policy records, `mhc-fused-policy` for ordinary L1).
+  The report states "diagnostic localization only; no gate claim".
 - A missing required stage is recorded (`incomplete_pairs`, per-pair
   `missing`/`error` entries) and fails the command AFTER the report is
   written (mirrors `analyze_localization`'s end-of-run refusal), so a GPU
   window keeps the pair table even when the bisection is partial.
+- A missing/errored earlier required pair blocks attribution to a later
+  divergent pair; later metrics remain evidence without an earliest-stage
+  claim. Missing/mismatched mHC policy or request binding blocks attribution.
+- Accept the actual Atlas `tp_rank`/`tp_world` sidecar schema and the reference
+  `rank` schema, rejecting conflicting identities. Validate both phase policy
+  records against candidate mHC binding (rows, streams, epsilon bits,
+  iterations, request ID, pure TP and recorded residual-precision label).
+  Unknown dispatch/geometry facts require nonempty reason strings.
+- Require collection manifests pinned by SHA256 in
+  `atlas-l1-bisect-inputs-v1`; recompute prescribed prefix SHA256 from their
+  cases, validate case/step/order/request IDs and the recorded HTTP envelope
+  `{"request": ..., "response": ...}` against exact prefix/model/policy.
+  Candidate mHC binding carries the submitted `x-request-id`. Reference GPU
+  IDs are different from HTTP response IDs: bind each row to a hash-pinned
+  `head-position-NNNNNN.json` and matching raw logits sidecar/data, then require
+  every compared `chunk_position.request_id` to equal that exact observed GPU ID.
+  Cold terminal single-chunk prefill and the bound runner source hash must
+  match for every compared reference sidecar. The report hashes the used
+  sidecars/payloads and records unmatched files; it reads no checkpoint weights.
+
+Source-bound correction (2026-10-14):
+`vllm/models/glm5next/nvidia/model.py` SHA256
+`a12142897fc5bdc5cff693d4d63c88a782f9ef7f35879963f45e1682d7faaed8`,
+lines 445–471 and 486–497, carries deferred state into attention and then FFN.
+The frozen v5 overlay's `reference_mhc_trace.py` SHA256
+`aca6cd83c786027f637a4a3afeffaa194cb3748b54a269ae45a91c93eeeb603b`
+increments `(layer,rank,kind)` counters once per call, producing `2r/2r+1`.
+Its tensor sink `reference_ffn_trace.py` SHA256
+`4774dc6932e6185fef4360619fcc9eec27a0dfd1fb5553fd5aa68d4c976b191d`
+records runner context; the runner SHA256 is
+`f84255d75435e84f44972d3fd25e53447f9d4d2edd8bff4f8c19dfb793448415`.
+The installed model's `hook-source-*` receipt must match the registered model
+and FFN sink hashes and layer set `[0,1]`. This does not replace the owner's
+full overlay/image/source provenance checks before collection.
+
+The explicit binding JSON has `schema: atlas-l1-bisect-inputs-v1`,
+`candidate_manifest_sha256`, `reference_manifest_sha256`, and
+`reference_source` with `model_sha256`, `ffn_hook_sha256`, `runner_sha256`.
+It also requires `reference_head_provenance`, one entry per flattened
+collection request, with `head_position_file`, `head_position_sha256`,
+`raw_sidecar_file`, `raw_sidecar_sha256`, and `response_sha256`. Files are
+archived absolute local paths; the raw sidecar stem and head's `head_capture` must match
+the collector manifest's original capture stem. Verify one exported row,
+vocabulary/metadata, raw-file and row hashes against that manifest through
+`parity_protocol.read_raw`. The head runner context must match the registered
+prefix length/source. These head/raw/response files are included in report hashes.
+
+Reference GPU-ID correction (2026-10-14, after independent archived-data check):
+pinned `entrypoints/openai/completion/serving.py:188` appends prompt index 0
+to the HTTP response ID, then `v1/engine/input_processor.py:242` appends eight
+random hexadecimal characters. Source SHA256s are respectively
+`b60e42e7a23e4d03aefc40d51cd51306159d69bbee58c30a18b9ef6d540c2b8f`
+and `d468edd32fd32a2d1e1c094695462f525028e097ca8c9a8e4e1c56f32c6a43a0`;
+`utils/__init__.py:11` (`random_uuid`) SHA256 is
+`c58b3f45deeb98bccca22c945526fd15d483a2f5eb8a3c62cf7df218b081885f`.
+Accept only the full escaped response ID followed by `-0-` and exactly eight
+lowercase hexadecimal characters, **and** the exact ID observed in the
+hash-bound head context. Never use prefix matching or strip a suffix.
+Profiles disabling randomization or batching multiple prompts require their
+own reviewed mapping contract; this driver fails closed for them.
+
+This difference is observed in archived `v2ref14` `longer/r0`: HTTP ID
+`cmpl-a1d5209eb257bc58`, GPU ID `cmpl-a1d5209eb257bc58-0-b70f2acc`.
+Its `capture-files/head-position-000012.json` SHA256 is
+`b0bb12648ce457258683907820ac95be89a59b4f211e3b3e1695cde4f2ba4a9b`,
+and matching `logits-000012.json` SHA256 is
+`235a3811fe60af69aa5a03c59e4dd03c860c0aa41a516b361f50d80b25a9e3f4`
+under `gate-v2-qualification-20261013-luna1/attempts/v2ref14/` in the evidence
+root. The corrected helper also validates that row's actual raw data hashes.
+These receipts diagnose ID transport only; they do not qualify a model.
+
+Freeze it against the archived collection inputs before analysis; do not
+silently repin modified evidence. After owner-run L1 collection of the frozen
+eight arithmetic/longer requests, longer corresponds to rows `4,5,6,7`:
+
+```bash
+python3 tests/exl3_validation/l1_bisect.py \
+  --candidate <fresh-attempt>/candidate/rank0/ffn-capture \
+  --reference <fresh-attempt>/reference/rank0/ffn-capture \
+  --candidate-artifact <fresh-attempt>/candidate/collection \
+  --reference-artifact <fresh-attempt>/reference/collection \
+  --binding <fresh-attempt>/l1-input-binding.json \
+  --rank 0 --layer 1 --rows 4,5,6,7 --out <new-rank0-report.json>
+```
+
+Repeat with rank-1 capture roots and `--rank 1`; never put both ranks in one
+capture root. The L1 experiment remains capture-only; no new candidate image
+is needed for this Python driver/spec correction. Installing/rebinding the
+v5 reference overlay and proving observer engagement/neutrality remain owed.
 
 Acceptance D3: pytest green on synthetic capture trees (real sidecar
 schema, hand-computed ULP checks, missing-stage refusal with the report
@@ -235,6 +337,82 @@ the file nears the readability limit).
 Acceptance D5: pytest green with a fake `nvcc` (argv capture + canned PTX)
 and a synthetic manifest/binding pair; negative tests for each fail-closed
 condition. A real GPU replay under both lanes is owed (todo.md "Next").
+
+## Source-bound L1 collection helper
+
+`tests/exl3_validation/l1_prepare.py` prepares a fresh immutable plan from an
+explicit JSON configuration. It requires a completed analyzed C2 campaign,
+the selected candidate policy (`baseline` or `selected-treatment`), variant,
+fixture, image/profile/source hashes, and the analyzer's first-control allow
+field. It recomputes the completed C2 analysis; only the two scorer
+`repeat_pair_scores[*].evaluated_utc` fields may differ. A fixture directory
+alone does not authorize collection.
+
+`l1_collect.py` executes four serial windows: candidate control, candidate
+observed, reference control, reference observed. Each window starts fresh
+containers on both hosts and preserves command receipts, failure evidence,
+and teardown/retrieval results. The diagnostic marker stays absent in controls;
+observed windows arm it only after both ranks pass image, executable/source,
+and actual mapped classic/Lt provider checks. Reference uses the complete
+hash-bound v5 overlay, layers `0,1`, and cold `serial128`. The separate
+`l1_reference_attest.py` identifies one actual mapped GPU worker by registered
+process title, Docker process inventory, ancestry, and cgroup; its receipt
+binds the full container ID, PID, command line, maps, libraries, and pins.
+
+Controls must match all eight actual logits rows, generated text, thresholds,
+and numerical/source profiles. The earlier full32 logits-only proof does not
+discharge these L1 observer controls. A mismatch stops binding/interpretation;
+there is no implicit tolerance or selective retry policy.
+
+Shutdown is explicitly configured. Candidate containers and the reference
+leader require exit zero. A registered headless reference worker may instead
+be labelled `controlled-timeout-stop137`, distinct from `clean-stop0`, only
+after exact8 durable raw/head/request/source validation and both-rank
+attestation. Its exact owned CID must be running and non-OOM before a
+successful explicit timeout stop, stopped and non-OOM afterwards, with wait
+137 and bounded container events proving SIGTERM15 then SIGKILL9 after at
+least the registered timeout, then stop/die137. Missing events, spontaneous
+death, OOM, incomplete collection, or any other nonzero exit fail the attempt.
+The original attempt01 remains failed; fresh registration binds its receipts.
+
+The concrete offline configuration and audited inputs are under
+`q2-c2-worker-binding-20261014/l1-reference-exact-shutdown-config.json` and
+`l1-reference-exact-shutdown-registration.json` in the external evidence root.
+After reviewing those inputs, the explicit CLI contract is:
+
+```bash
+REP=/home/colum/Workspace/atlas-exl3-validation-20261010/q2-c2-worker-binding-20261014
+python3 tests/exl3_validation/l1_prepare.py --config "$REP/l1-reference-exact-shutdown-config.json"
+L1_PLAN="$REP/l1-reference-exact-shutdown-v2/plan.json"
+sha256sum "$L1_PLAN"
+# L1_PLAN_SHA256 must contain the reviewed, prepared plan's exact SHA256.
+python3 tests/exl3_validation/l1_collect.py --plan "$L1_PLAN" --plan-sha256 "${L1_PLAN_SHA256:?reviewed plan SHA256 required}"
+```
+
+Collection artifacts live at each window's `collection/` and rank-0 head
+witnesses at `logits/`. Diagnostic and substitution records remain separated
+under `rank0/diagnostic`, `rank1/diagnostic`, and each rank's `records/`.
+`binding.json` binds exact observed opaque reference GPU IDs through the
+head-position, raw sidecar/payload, and HTTP response hashes; it never infers
+IDs by removing suffixes. The collection receipt leaves attribution disabled
+until the unchanged bisect driver verifies complete stage and policy bindings:
+
+```bash
+L1_ATTEMPT="$REP/l1-reference-exact-shutdown-v2/l1-refexact-f099-02"
+python3 tests/exl3_validation/l1_bisect.py \
+  --candidate "$L1_ATTEMPT/candidate-observed/rank0/diagnostic" \
+  --reference "$L1_ATTEMPT/reference-observed/rank0/diagnostic" \
+  --candidate-artifact "$L1_ATTEMPT/candidate-observed/collection" \
+  --reference-artifact "$L1_ATTEMPT/reference-observed/collection" \
+  --binding "$L1_ATTEMPT/binding.json" --rank 0 --layer 1 --rows 4,5,6,7 \
+  --out "$REP/l1-reference-exact-longer-rank0-layer1.json"
+```
+
+Repeat with rank-1 diagnostic roots, `--rank 1`, and a fresh output file.
+The longer rows use attention invocation `2r` and FFN invocation `2r+1`;
+local pre-reduce projection still lacks a cross-engine reference counterpart.
+These commands document the registered workflow; collection remains separate
+from a qualification verdict.
 
 ## Out of scope (record, do not build)
 

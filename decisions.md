@@ -7,6 +7,75 @@ this file references them, it does not duplicate them. Newest first.
 Superseded entries are kept as one-line stubs marked **SUPERSEDED**, so the
 audit trail survives; their full text is in git history.
 
+## 2026-10-14 — GPU-iteration tooling: image cycle, G8/G9 binding, probe pre-Spark package (major)
+
+- Choices: (a) keep re-deriving the build→transfer→fingerprint→neutrality
+  chain, the G8/G9 provenance bundle and the probe packaging by hand each
+  time (the status quo that dominated iteration time between GPU windows),
+  (b) one config-driven, hash-bound CLI per workstream, CPU-tested with
+  injected runners and no host access.
+- Decision: **(b)** —
+  - `tests/exl3_validation/image_cycle.py`: preflight → build → transfer →
+    fingerprint → neutrality → receipt. It writes the neutrality
+    preparation config itself from the verified fingerprint (image id /
+    build-manifest path cannot be known before the build) plus operator
+    campaign inputs, and binds every stage receipt by SHA256; the transfer
+    stage enforces both transport exit codes. 17 CPU tests.
+  - `tests/exl3_validation/g8g9_binding.py`: `collect` (explicit-path
+    in-image sha256sum over one ssh) and `bind` (checkpoint-config G8
+    fields, reference-manifest `config_sha256` cross-check, per-rank
+    descriptor env/argv for both engines, pins + provider reports,
+    inventories, candidate build manifest, plan source-contract anchor
+    verification). 15 tests.
+  - Probe: `probe_wiring.py` + `probe_sitecustomize.py` implement the
+    registration's overlay-author obligations in full (side-effect-free
+    4-tuple contexts, byte-clone + buffered writes, flush at request
+    transition/exit/SIGTERM/violation, engagement counters, install
+    receipts, fail-closed discovery/coverage/source-preflight);
+    `probe_package.py` assembles the evidence-root overlay against the
+    registration's frozen trio; `probe_records.py` produces the attempt
+    attestation, profiler binding and NCCL prior/live records. 66 tests.
+  - Records: package `9068c0972f0995095b5aa5f8734f3a6a75ae0be7ee7b2e686a4679a45a07ece9`
+    at `$EV/probe-runtime-mechanism-20261014/probe-overlay/` (21 files,
+    re-verified after assembly; v1 superseded for copied lineage
+    `.pytest_cache` junk, preserved untouched), `nccl-prior-binding.json`,
+    `attempt-attestation.json`, profiler invocation SHA256
+    `fdb01a69956577795cbbed79e41b9ae49987446deb9c3d350b71aa07ef4f3fe2`;
+    the registration's owed section records these and what remains
+    pre-attempt (profiler version/availability, NCCL live re-bind, stamping).
+- Why: operator-approved scope 2026-10-14 (full observer glue; tools +
+  prior NCCL evidence only, no host ssh while experiments may run).
+  Independent subagent review: OK-with-notes; findings 1–8 dispositioned
+  in this batch (transfer exit-code enforcement, pytest_cache exclusion,
+  unpinned-report KeyError, G8 symmetry requires, dead-fallback cleanup,
+  absent-backend emit-once, fixture dead branch → live coverage).
+  Full CPU suite green (695 tests + 280 subtests), license gate clean,
+  all new files ≤500 LoC. Commit refs: see git log for this batch.
+
+## 2026-10-14 — runtime-mechanism probe: CPU-first harness frozen (major)
+
+- Choices: (a) write the decoder/observer harness inside the GPU window,
+  (b) finish and freeze it locally first, as the probe plan requires
+  before either Spark is obtained.
+- Decision: **(b)** — implement now: `cache_manifest()` in
+  `tests/exl3_validation/linear_launch.py` (EX3ATUNE final record map +
+  raw/canonical SHA256s), `reference_router_capture.py` (supported
+  `set_capture_fn` hook + `_compute_routing` wrap),
+  `reference_collective_trace.py` (dispatch/backend wiring with the
+  zero-backend coverage contract), plus 63 CPU fixtures covering the
+  plan's five required fixture classes. Independent review: GO-with-notes;
+  all P2 notes dispositioned (SSOT dedup, `group_reason`, setattr
+  rollback, capture-callback zombie cleanup); full CPU suite and license
+  gate green.
+- Registration: attempt order `off01,on01,on02,off02,off03,on03`, profile,
+  engagement rules and harness SHA freeze in
+  [the probe registration](docs/design/exl3-runtime-mechanism-probe-registration.md).
+  Overlay wiring, profiler/CUPTI binding and NCCL hashes remain owed
+  before Sparks access.
+- Why: every GPU window was paying harness-writing overhead; the plan
+  forbids Sparks access before a local freeze, so this work removes that
+  cost from the critical path.
+
 ## 2026-10-14 — L1 escalation + v24-prerequisite tooling batch (major)
 
 - Choices: (a) wait for GPU windows and implement per-item then, (b)
@@ -404,3 +473,18 @@ git history (tag `archive/c1-bf16-o-proj-replay-20261012`).
 Superseded by "Q2 gate: full v2 pre-registration authorized" (2026-10-12).
 The v1 rule and its FAIL run remain the historical record. No rerun
 selection and no discarding of reference rows: these still hold under v2.
+
+## 2026-10-13 — KV column-codec experiment: first-pass stage (major, new)
+
+- Decision: First pass implements Stage 0 crate (`crates/atlas-codecs/`) + minimal Stage-1 spill header plumbing (`kv_spill.rs` block header with explicit `codec_id`). Full ALP/FPC/ZXC/GCD left as config stubs (enum variants, `unimplemented!`) — user selected full catalog but KISS/core-first demands working pipeline before catalog expansion.
+- Reason: Plan §5 stages; plan §2 C4 (KISS); H1 testable with core set (§4 matrix); full catalog deferred (§8).
+- Reference: `docs/plans/atlas-kv-column-codecs-plan.md`; new crate `crates/atlas-codecs/`; `crates/spark-runtime/src/kv_spill.rs`.
+- Status: in-progress.
+
+
+## 2026-10-13 — Plan external repo additions (minor, new)
+
+- Decision: Added 13 repos to `docs/plans/atlas-kv-column-codecs-plan.md` §7 (external references / repos to test and evaluate). Each tagged by category (GPU kernel, codec library, KV-cache framework, lossless compression, non-codec scope-clarity note for `openzl`).
+- Reason: Plan §7 is the SSOT for external comparison; measurement discipline §3 requires bit-extract roundtrip + ratio + encode/decode GB/s for any repo claimed; no repo provides implicit codec-id default — PCND preserved.
+- Note: `facebook/openzl` is not a compression codec (zero-knowledge proofs); included at user's instruction for evaluation scope clarity, with explicit non-codec tag.
+- Status: added; evaluations deferred until Stage-0 exit criteria pass (no code changes from this edit).

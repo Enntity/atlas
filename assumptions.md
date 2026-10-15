@@ -4,6 +4,61 @@ Assumptions, constraints, and requirements inferred or provided for the
 project. Reference these from source documentation when explaining why
 something is done a specific way. Keep entries short; newest section first.
 
+## GPU-iteration tooling (2026-10-14)
+
+References: `decisions.md` 2026-10-14 GPU-iteration entry,
+`docs/design/exl3-runtime-mechanism-probe-registration.md` (owed section),
+`docs/plans/exl3-reference-runtime-mechanism-plan.md`.
+
+Assumptions (inferred; disconfirmed by live evidence is a finding):
+
+- T1. The registered diagnostic profile prepares at most one unpadded
+  serial request per `prepare_inputs` (batch-1, no speculation); the probe
+  fails closed on concurrency and treats an empty prepare as a request
+  boundary (flush + unmark).
+- T2. MoE layer identity comes from the `layers.<n>.mlp` construction
+  prefix (the registered FFN overlay precedent). Instances with other
+  prefixes stay uninstrumented; per-request engagement counters must catch
+  a total miss rather than construction failing on auxiliary instances.
+- T3. `ATLAS_PROBE_CONFIG.source_targets` entries are
+  `module:attribute` references: the frozen harnesses bind
+  `__module__`/`__qualname__`, so bare modules cannot bind.
+- T4. nsys availability/version on either Spark is unknown until a host
+  check; the registered invocation flags and their SHA256 stand
+  regardless of availability.
+- T5. The prior loaded-NCCL evidence (spark0/spark1 loaded-sha files and
+  the reference runtime-evidence JSON) reflects the reference image the
+  probe will run; a live re-bind from running processes is owed
+  pre-attempt and is stated as a limitation inside the binding.
+- T6. `q2-l1-tooling-20261013/ref-overlay` is the lineage SSOT for the
+  probe package (v5 binding recorded in its `package-binding.json`).
+- T7. The image-cycle driver authors the neutrality preparation config
+  from verified fingerprint outputs plus operator campaign inputs;
+  `image_id`, `runtime_source` and the build-manifest path cannot be
+  known before the build completes.
+
+## Runtime-mechanism probe harness (2026-10-14)
+
+Reference: `docs/design/exl3-runtime-mechanism-probe-registration.md`
+(registered) and `docs/plans/exl3-reference-runtime-mechanism-plan.md`
+(design SSOT).
+
+Assumptions (inferred; disconfirmed by live evidence is a finding):
+
+- R1. `context()` is side-effect-free and bound per router/communicator
+  instance; the bindings cannot cross-check the layer index against the
+  resident object, so a mislabeled closure silently misattributes records
+  (overlay-author obligation).
+- R2. `capture_callback_calls` counts unmarked calls; engagement must be
+  judged from per-request counters, or an inert hook could pass.
+- R3. Logical IDs equal physical IDs whenever the recorded EPLB status is
+  'disabled'/'absent'; the `apply_exl3_experts` boundary stays unwrapped
+  unless a live run records EPLB enabled.
+- R4. One-forward-per-process TP execution; the collective frame stack is
+  not thread-safe.
+- R5. Recording every collective dispatch is acceptable only with
+  buffered overlay writers (flush boundary defined by the overlay).
+
 ## KV column-codec experiment (2026-10-13)
 
 Reference: `docs/plans/atlas-kv-column-codecs-plan.md`.
@@ -45,3 +100,13 @@ Constraints (provided):
   `ATLAS_SKIP_BUILD=1` gates are for fmt/clippy on the host only.
 - Rust source files ≤500 LoC (CI-enforced file-size cap).
 - Model×quant support matrix SSOT: `docs/GB10_DEPLOYMENT_GUIDE.md` §2.
+
+## 2026-10-13 — KV column-codec first pass
+
+- Codec layer is lossless and composes strictly after existing lossy `KvCacheDtype` quantizers (§2 C2); bit-exact roundtrip is mandatory regardless of ratio outcome.
+- `zstd` and `lz4_flex` licenses (BSD-family) are compatible with `deny.toml` (C3); verified by allow-list inspection (MIT/BSD/Apache permitted); no FFI to system libs.
+- Block header carries explicit `codec_id` (PCND — no implicit default); `codec=NONE` is the safe default so no regression on unconfigured tiers.
+- Captured corpus source is `data/corpus/` binary dumps from `paged_impl.rs` blocks (synthetic + captured); live serve integration deferred until Stage-1 exit criteria pass (§5).
+- File-size cap ≤500 LoC/file enforced by `.github/workflows/file-size-cap.yml`; crate split into lib/codec/block/bench modules accordingly.
+
+- External repo evaluation (13 repos, §7 of plan) is planned, not executed; each must supply explicit codec-id / pipeline declaration (PCND); no repo's default pipeline will be adopted implicitly.

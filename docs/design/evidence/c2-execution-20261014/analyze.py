@@ -239,16 +239,46 @@ def validate_live_registration(prep, binding):
             'adapter': {'commit': '473aa8bc', 'sha256': adapter_hash}}
 
 
+def validate_preserved_failure_bindings(root, binding):
+    """Keep failed historical attempts in their original roots and identities."""
+    from prepare import preserved_failures
+    entries = preserved_failures(Path(root), binding['preserved_failures'])
+    return [dict(entry, failure=read_json(Path(entry['attempt']) / 'failure.json')) for entry in entries]
+
+
+def validate_fresh_neutrality_binding(root, prep, binding, registration):
+    from run_neutrality import verify_proof
+    proof_path = Path(binding['runtime_neutrality_receipt'])
+    require(proof_path.is_absolute() and proof_path.resolve().is_relative_to(Path(root).resolve())
+            and sha(proof_path) == binding['runtime_neutrality_sha256'], 'registered full neutrality proof fingerprint/path mismatch')
+    plan_path = proof_path.parent.parent / 'neutrality-plan.json'
+    plan = read_json(plan_path)
+    proof = read_json(proof_path)
+    require(proof['runtime'] == registration['provenance']['engine_build']
+            and binding['neutrality_runner_bindings'] == plan['runner_bindings'],
+            'full neutrality runtime/runner differs from live C2 registration')
+    modules = {'prepare.py': Path(__file__).with_name('prepare.py'),
+               'run_neutrality.py': Path(__file__).with_name('run_neutrality.py')}
+    require(set(binding['preparation_module_bindings']) == set(modules), 'explicit fresh C2 preparation module bindings required')
+    for name, path in modules.items():
+        require(binding['preparation_module_bindings'][name] == sha(path), 'fresh C2 preparation module changed: ' + name)
+    verify_proof(proof, plan, plan_path)
+    return {'path': str(proof_path), 'sha256': sha(proof_path), 'rows': proof['rows_total'], 'runtime': proof['runtime']}
+
+
 def analyze(root, attempt):
     root, attempt = Path(root).resolve(), Path(attempt).resolve()
     prep = attempt.parent
-    require(prep == root / 'q2-c2-execution-20261014', 'attempt must belong to explicit registered prep root')
     binding = read_json(prep / 'execution-plan.json')
+    require(binding['preparation_root'] == str(prep) and prep.is_relative_to(root),
+            'attempt must belong to its explicit registered preparation root')
     require(binding['reference_members'] == [f'ref{x:02d}' for x in range(4, 13)],
             'all nine frozen reference members required')
     require(binding['file_sha256']['cases.json'] == sha(prep / 'cases.json'),
             'registered diagnostic case fingerprint mismatch')
     registration = validate_live_registration(prep, binding)
+    full_neutrality_binding = validate_fresh_neutrality_binding(root, prep, binding, registration)
+    preserved_failures = validate_preserved_failure_bindings(root, binding)
     selected = validate_cases(read_json(prep / 'cases.json'))
     request_ids = read_json(prep / 'request-ids.json')
     require(binding['file_sha256']['request-ids.json'] == sha(prep / 'request-ids.json'),
@@ -389,21 +419,12 @@ def analyze(root, attempt):
     interpretation = ('diagnostic-intervention-bound' if baseline_ok and first_ok and observer_ok else
                       'STOP-reopen-C1' if not first_ok else
                       'STOP-observer-neutrality-mismatch' if not observer_ok else 'STOP-baseline-archive-mismatch')
-    failed_first = prep / 'c2-refexact-01'
-    failed_lifecycle = failed_first / 'runs/arm-a-repeat-00/lifecycle.json'
-    failure = read_json(failed_first / 'failure.json')
-    lifecycle = read_json(failed_lifecycle)
-    require(not lifecycle['containers'] and not lifecycle['owned_names'] and not lifecycle['started'],
-            'first attempt failure was not before create')
-    preserved_failure = {'attempt': str(failed_first), 'phase': 'failed-before-create', 'failure': failure,
-                         'failure_sha256': sha(failed_first / 'failure.json'),
-                         'lifecycle_sha256': sha(failed_lifecycle)}
     return {'schema': 'atlas-c2-execution-analysis-v1', 'scope': 'diagnostic-only; no Q2 gate or performance claim',
             'interpretation': {'status': interpretation, 'causal_interpretation_allowed': baseline_ok and first_ok and observer_ok,
                                'authority': 'outer measurement guards govern interpretation of nested SSOT score reports'},
             'attempt': str(attempt), 'receipt_sha256': sha(attempt / 'receipt.json'),
             'execution_binding': binding, 'execution_binding_sha256': sha(prep / 'execution-plan.json'),
-            'live_registration': registration, 'preserved_first_attempt_failure': preserved_failure,
+            'live_registration': registration, 'preserved_failures': preserved_failures, 'full_neutrality_binding': full_neutrality_binding,
             'analyzer_sha256': sha(__file__), 'reference_projections': ref_bindings,
             'baseline_archive_checks': baseline,
             'observer_neutrality': {'scope': 'only the eight selected rows; historical image proof remains separate',

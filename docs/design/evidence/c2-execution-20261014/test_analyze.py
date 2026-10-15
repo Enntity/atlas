@@ -148,3 +148,19 @@ def test_registered_runtime_image_cannot_be_replaced_by_same_image_on_both_arms(
     (tmp_path / 'run-config.json').write_text('corrupted')
     with pytest.raises(ValueError, match='registered file fingerprint mismatch'):
         analyze.validate_live_registration(tmp_path, binding)
+
+
+def test_prior_failures_can_be_bound_from_old_prep_but_changed_evidence_refuses(tmp_path):
+    old = tmp_path / 'old-prep' / 'failed-attempt'
+    old.mkdir(parents=True)
+    failure = old / 'failure.json'
+    failure.write_text(json.dumps({'message': 'before create'}))
+    lifecycle = old / 'lifecycle.json'
+    lifecycle.write_text(json.dumps({'containers': {}, 'started': {}, 'owned_names': {}, 'teardown_errors': []}))
+    entry = {'attempt': str(old), 'phase': 'failed-before-create', 'failure_sha256': analyze.sha(failure),
+             'lifecycles': [{'path': str(lifecycle), 'sha256': analyze.sha(lifecycle)}]}
+    bound = analyze.validate_preserved_failure_bindings(tmp_path, {'preserved_failures': [entry]})
+    assert bound[0]['phase'] == 'failed-before-create' and bound[0]['failure']['message'] == 'before create'
+    failure.write_text(json.dumps({'message': 'changed'}))
+    with pytest.raises(ValueError, match='fingerprint mismatch'):
+        analyze.validate_preserved_failure_bindings(tmp_path, {'preserved_failures': [entry]})

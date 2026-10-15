@@ -20,18 +20,19 @@ The latest review and its disposition table are in
 [CODE_REVIEW_2026-10-12.md](CODE_REVIEW_2026-10-12.md). Superseded narrative
 is in git history.
 
-## 1. Status at a glance (2026-10-14)
+## 1. Status at a glance (2026-10-15)
 
 | Area | Status | Pointer |
 |---|---|---|
 | Boot and generation (TP=2/EP=1, native EXL3) | Works; 5/5 launch smoke; production containers **stopped** | §4 |
 | Numerical qualification (Q2) | **Not qualified.** v1 gate FAIL (historical); complete v2 campaign is **UNVERIFIABLE**: reference ensemble fails H3 and H4 LOO | §2, [qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md) |
-| Dominant cause of divergence | **Unproven.** C2 (layer-0 intervention) is next | todo "Now" #3 |
+| Dominant cause of divergence | **Unproven.** C2 mixed; L1 collected, attribution withheld by reference observer mismatch | todo "Now" #3 |
 | API behavior (Q3) | Partial: focused live slice 15/15 on `ee5eaf0f` | todo Q3 |
 | Task quality (Q4) | Harness only; no live run | todo Q4 |
 | Performance (P0) | Unqualified diagnostic only (decode ~0.45 s/token); Nsight driver prepared, not run | todo P0 |
 | Serving features (F1–F4), release (R1/R2) | Not started | todo |
-| In flight | CPU worker request-ID repair and rebuild preparation. First C2 treatment stopped; both Sparks released at post-failure inspection. Reinspect before new GPU work | [C2 report](docs/design/c2-execution-20261014.md), todo M1 |
+| Reference runtime mechanism | Probe executed 2026-10-15 (5/6 complete, on01 failed and retained). No recurrence of either singleton, all draws inside the campaign H3 envelope; gate inputs diverge first at layers 8–33, routing follows, collective dispatch identical. Mechanism unresolved; EXL3 plans unobservable (nsys misses forked workers) | [probe result](docs/design/exl3-runtime-mechanism-probe-result-20261015.md) |
+| In flight | Nothing. C2 complete with mixed scores; L1 attribution withheld (reference observer 1/8). Both hosts released 2026-10-15 00:26Z | [L1 report](docs/design/l1-execution-20261014.md), todo M1 |
 
 ## 2. Established findings (what a restart must not re-derive)
 
@@ -105,9 +106,10 @@ is in git history.
   - the natural norm delta is absorbed on rank0 and confined to one token
     on rank1.
 
-  **Flag:** "corrected input ⇒ reference output" is inferred, and the
-  o_proj input precision is unattested; C2's first measurement discharges
-  this. Both engines multiply EXL3 trellis weights (the reference uses an
+  **C2 first measurement passed:** each registered fixture variant matches
+  all 32 rank/row/repeat native local outputs to the reference captures.
+  This discharges the corrected-input/reference-output flag for the bound
+  prefixes; input dtype itself remains unattested. Both engines multiply EXL3 trellis weights (the reference uses an
   FP16 input for ≤144 rows), so never replay o_proj over a BF16
   reconstruction. The old harness is archived (tag
   `archive/c1-bf16-o-proj-replay-20261012`).
@@ -141,6 +143,42 @@ is in git history.
   transport repair, a fresh image and neutrality proof precede a fresh C2
   attempt. [Report](docs/design/c2-execution-20261014.md).
 - No production numerical fix is qualified, and no image was published.
+- **Worker binding repair:** `f099ac58` delivers bounded request-ID metadata
+  to the addressed distributed worker sequence before prefill. Both peers
+  require the same image. The full model suite at that commit passed
+  (1660 tests, 17 ignored); focused sender/worker regressions also passed.
+  The fresh no-cache image `atlas-exl3-validation:src-4ee96c12b44c-rust1.97.1`
+  is loaded on both ranks as
+  `sha256:82173ea631a8c78e4fb565f0e23bc6d55f94a43090dbfb27c850f8cc1e6b41d9`.
+  Both packaged binaries and their 232 embedded PTX modules were verified;
+  toolchain, compiler closure, PTX and runtime dependency fingerprints match
+  the prior collected image. Live provider mapping and full logit neutrality
+  remain tied to each lifecycle. The completed full-suite collection is
+  `neutrality-bounded03/worker-binding-neutral03`: all 32 logit rows and text
+  match the frozen baseline, both containers exit 0, and the frozen verifier
+  independently passes. Proof SHA256:
+  `52b8f2de1fc300d7b2e194c273afaf5817d505adbbe127c5a20f5f3d5e64284f`.
+  Fresh C2 preparation revalidated this proof. `c2-refexact-f099-01`
+  completed: all 32 native o_proj comparisons match; both arms are byte
+  deterministic; arithmetic has two closer and two farther rows, while all
+  four `longer` rows are unchanged and three retain catastrophic KL. The
+  separate `c2-v24-f099-01` repeats completed with identical scores and all
+  controls passing. Source-bound `l1-refexact-f099-01` stopped after both candidate windows
+  and all eight reference-control requests completed. The reference worker
+  received Docker stop SIGTERM then timeout SIGKILL (exit 137, non-OOM),
+  which the strict exit-zero guard rejected. The candidate observer matches
+  all eight rows/text. Correction `1204a210` registers bounded non-OOM
+  worker timeout-stop proof while retaining exit zero for candidate/leader.
+  Full CPU harness: 612 tests and 278 subtests passed. Fresh
+  `l1-reference-exact-shutdown-v2/l1-refexact-f099-02` completed all four
+  eight-request windows, each with both ranks exiting zero. Candidate observer
+  matches 8/8; reference observer matches 1/8, with unchanged text/thresholds.
+  Attribution is withheld and no L1 bisect ran. Both hosts are released.
+  [L1 result](docs/design/l1-execution-20261014.md).
+  [Repaired C2 report](docs/design/c2-repaired-worker-execution-20261014.md).
+  No Q2 qualification claim. The earlier administrative abort preserved
+  16 matching short rows and seven matching long rows without a full proof.
+  Evidence: `q2-c2-worker-binding-20261014/`; [validation record](docs/design/c2-worker-binding-validation-20261014.md).
 
 ## 3. Before any GPU work
 
@@ -289,6 +327,7 @@ component oracle and full-model gate each prove a different scope.
 | `q2-gate-v2-20261012/` | v2 calibration (reference-only): `calibrate_v2.py`, `calibration.json`, `review-summary.md` (P2 fixes now applied) |
 | `merged-image-20261011-session2/` | Corrected-image neutrality (`grammar-r2/`) and focused Q3 receipts, attempt tarballs, provenance; attempt `cand-grammar-ee5e-01` preserved and unreused |
 | `p0-trace-prep-20261011/` | Prepared paired named-session Nsight driver/tests/README (11 CPU tests); no live profiler execution yet |
+| `probe-runtime-mechanism-20261014/` | Reference runtime-mechanism probe: package/records, cache and mount freezes, nsys tooling checks (forked workers untraced), engagement smoke, six attempts (on01 failed), byte classes, descriptive H3, router diffs. [Result](docs/design/exl3-runtime-mechanism-probe-result-20261015.md). Per-attempt cache copies + telemetry also retained on the Sparks at `/home/colum/probe-rm-20261014/` |
 
 Required pair from `nvidia-cublas` 13.1.1.3:
 

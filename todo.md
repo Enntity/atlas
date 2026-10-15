@@ -70,9 +70,21 @@ Rules that apply throughout:
 
 ## Now — reference-verifiability follow-up and M1 causality
 
-No GPU campaign is active. The C2 treatment attempt stopped because the TP
-worker lacks the request-ID binding; both hosts were released. The worker
-transport repair and image rebuild are next. The completed v2 campaign still
+The worker transport repair, fresh no-cache image and full 32-request
+short16/long neutrality proof are complete. The earlier C2 treatment stopped
+because the TP worker lacked the request-ID binding; its evidence is preserved.
+Fresh reference-exact C2 completed as `c2-refexact-f099-01`: controls pass,
+with mixed arithmetic scores and unchanged `longer` rows. Separate v24 repeats
+also completed with identical scores and passing controls. Source-bound
+`l1-refexact-f099-01` stopped on reference-worker shutdown after collecting
+both candidate windows and eight reference-control rows. Candidate observer
+neutrality passes; controlled stop SIGKILL/exit137 was rejected. Lifecycle
+correction `1204a210` passed independent review and full CPU validation
+(612 tests, 278 subtests). Fresh `l1-refexact-f099-02` completed all 32
+requests with every container exiting zero. Candidate observer matches 8/8;
+reference observer matches 1/8, with text/thresholds unchanged. Attribution
+is withheld. Next establish reference observer verifiability before L1
+bisection; [L1 record](docs/design/l1-execution-20261014.md). The completed v2 campaign still
 blocks qualification at reference verifiability. Inspect both hosts before
 new GPU work (continue.md "Before any GPU work").
 
@@ -97,15 +109,33 @@ new GPU work (continue.md "Before any GPU work").
      must be separately registered before collection. **Decision 2026-10-14:**
      investigate runtime pinning in a separate reference-only diagnostic;
      no concrete qualification amendment is justified without causal evidence.
-   - [ ] Register and execute the reference-only runtime-mechanism diagnostic
-     with selected-plan/collective/routing telemetry and engagement controls.
-     CPU design source-reviewed and committed in `2e130a4e`: [plan](docs/plans/exl3-reference-runtime-mechanism-plan.md).
+   - [x] Register and execute the reference-only runtime-mechanism diagnostic
+     with routing/collective telemetry and engagement controls.
+     **Done 2026-10-15:** [result](docs/design/exl3-runtime-mechanism-probe-result-20261015.md),
+     [registration](docs/design/exl3-runtime-mechanism-probe-registration.md)
+     (pre-collection corrections 1–6, on01 record). Five of six attempts
+     complete; on01 failed on a probe wiring defect and is retained. Executed
+     EXL3 launch plans were unobservable because nsys does not trace forked
+     workers. No draw recurred either singleton or left the campaign H3
+     envelope (worst 0.155 of the limit). Router gate inputs diverge first,
+     at a row-dependent layer 8–33, and expert flips follow; the collective
+     dispatch is identical across draws. Mechanism unresolved.
+   - [ ] Next mechanism step, separately registered: observe the varying
+     choice inside the layer stack. Options: a CACHEDEBUG `exllamav3_ext`
+     observer build with neutrality checks, or per-layer hidden-state capture
+     around the first differing layer of a differing pair. An EXL3
+     plan-freeze intervention is still untested; routing-switch and
+     collective-backend interventions are not supported by the result.
    See the [qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md).
 2. **ref13 mode-mechanism probe** (separate diagnostic, not qualification).
    - [ ] The historical tuning set of 15 reference draws falls into 6 byte
      classes, with a recurring
      mode at `longer`/r0 in 3/15. Look for a discrete runtime choice:
-     autotune/plan selection, NCCL algorithm, routing tie.
+     autotune/plan selection, NCCL algorithm, routing tie. *Partly
+     answered by the 2026-10-15 probe:* routing ties follow gate-input
+     divergence rather than causing it, and the vLLM collective dispatch is
+     identical across draws. Plan selection and NCCL algorithm remain
+     unobserved.
    - [ ] Keep probes in separate diagnostic attempts. If a runtime policy
      can be pinned, propose an amendment before changing qualification
      (H4 may become unnecessary); do not mix profiles. Evidence:
@@ -128,18 +158,31 @@ new GPU work (continue.md "Before any GPU work").
      C2 attempt. Baseline repeats pass eight-row observer neutrality and all
      rank-local norm archive checks; treatment stops on its first request
      because rank 1 has no request ID. [Receipt](docs/design/c2-execution-20261014.md).
-   - [ ] Repair worker request-ID delivery, with production-path CPU coverage.
-   - [ ] Bind a fresh no-cache image after the worker repair, including
-     renewed short16/long neutrality. Later runtime or
+   - [x] Repair worker request-ID delivery, with production-path CPU coverage.
+     **Done:** `f099ac58`; bounded F8 metadata preserves absent/empty/UTF-8
+     IDs and clears stale worker bindings, without changing the F0 prefill
+     payload. Full model suite at the commit: 1660 passed, 17 ignored;
+     focused worker and scheduler sender regressions pass.
+   - [x] Bind a fresh no-cache image after the worker repair, including
+     renewed short16/long neutrality. Build and both-rank load completed:
+     `src-4ee96c12b44c-rust1.97.1`, image ID `sha256:82173ea631a8…`;
+     binaries/PTX and runtime dependency fingerprints verified in
+     `q2-c2-worker-binding-20261014/`. Full32 neutrality passed with both
+     wait receipts successful and independent frozen-verifier review. Later runtime or
      capture changes require a fresh build/neutrality proof; the collected
      image does not qualify newer L1/v24 tooling or the C2 treatment.
-   - [ ] **First measurement (discharges the C1 flag):** the treatment's
+   - [x] **First measurement (discharges the C1 flag):** the treatment's
      local o_proj output is byte-identical to the reference's captured
-     local output. If not, record it and re-open C1.
-   - [ ] Baseline and treatment each repeated for byte-determinism.
-   - [ ] Score per the plan against every ref04–ref12 member. Report mixed
+     local output. `c2-refexact-f099-01` passes all 32 rank/row/repeat
+     comparisons. If a later variant fails, record it and re-open C1.
+   - [x] Both variants: baseline and treatment each repeated for
+     byte-determinism. Reference-exact and v24-corrected controls pass.
+   - [x] Score per the plan against every ref04–ref12 member. Report mixed
      results as mixed. (Scorer ready — `tests/exl3_validation/c2_score.py`;
-     the collection itself is GPU-phase.)
+     the collection itself is GPU-phase.) Reference-exact is complete against
+     all nine members: arithmetic two closer/two farther; `longer` four
+     byte-unchanged, three still catastrophic in KL. v24 scores match exactly.
+     [Repaired C2 report](docs/design/c2-repaired-worker-execution-20261014.md).
 4. **L1 escalation** (if C2 leaves residual failure): for `longer`, capture
    the complete mHC residual streams and the L1 attention input, then
    bisect L1 core → gated norm → o_proj → FFN mHC input.
@@ -151,10 +194,25 @@ new GPU work (continue.md "Before any GPU work").
      contract + DeepGEMM/TileLang dispatch and split-geometry binding);
      `tests/exl3_validation/l1_bisect.py` earliest-divergence driver.
      **Reviewed 2026-10-14 (independent review: BLOCK on 3 driver majors);
-     all findings fixed and re-tested — ready for testing.** Local o_proj is
+     all findings fixed and CPU-verified.** Local o_proj is
      not bisectable cross-engine (spec B13); the reduced-o_proj step stands.
-   - [ ] GPU: L1 capture collection on both engines (fresh candidate image;
-     overlay install + hook identity re-binding) and the bisection run.
+     A further source review corrected L1's fused phase pairing: attention
+     uses `2r`, FFN uses `2r+1`, and materialized highway pairs with reference
+     residual output. The CPU driver now binds actual collection envelopes,
+     request prefixes, sources and both phase policies, and refuses later
+     attribution across missing earlier evidence. Independent review: GO;
+     Reference GPU IDs are bound to hash-pinned raw head/response witnesses;
+     the reference's prompt-index/UUID suffix is preserved, while candidate
+     header matching stays exact. 61 focused L1/localization tests pass;
+     two actual archived heads also pass mapping/integrity checks. Runtime/image unchanged.
+   - [x] GPU: source-bound L1 capture collection on both engines. Fresh
+     `l1-refexact-f099-02` completed all four eight-request windows using
+     the repaired image and v5 overlay; every container exited zero.
+     Candidate observer matches 8/8; reference matches only 1/8.
+   - [ ] Establish reference observer verifiability, then perform guarded
+     L1 bisection. The current receipt withholds attribution; no final
+     paired binding or L1 bisect was produced. Do not relax the observer
+     guard or retry unchanged for a byte match. See the [L1 record](docs/design/l1-execution-20261014.md).
 5. **G-fallbacks**, in the plan's order (G2, G3, G4, G1, G5, G6/G7), each
    preceded by its G8/G9 binding. See "M1 diagnostic backlog" below.
 
