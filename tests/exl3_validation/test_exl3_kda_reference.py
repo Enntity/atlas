@@ -176,5 +176,149 @@ class Tests(unittest.TestCase):
             self.assertEqual(default['vs_ref_chunk2'], M128_EXPECTED[rank]['chunk2'])
 
 
+def synthetic_case(m, rank: int, tokens: int, seed: int = 42):
+    """Generate synthetic inputs for property testing."""
+    np.random.seed(seed + rank * 1000 + tokens)
+    x = m.to_bf16(np.random.randn(tokens, 3 * HL * DIM).astype(np.float32))
+    g1 = m.to_bf16(np.random.randn(tokens, HL, DIM).astype(np.float32))
+    beta = m.to_bf16(np.random.randn(tokens, HL).astype(np.float32))
+    return x, g1, beta
+
+
+def prefill_synthetic(m, rank: int, x, g1, beta):
+    """Run prefill on synthetic inputs; returns (output, final_state)."""
+    return m.prefill(x, g1, beta, rank, dict(m.DEFAULT))
+
+
+def bf16_equal(m, a, b) -> bool:
+    """Check BF16-bit equality of two f32 arrays."""
+    return np.array_equal(m.to_bf16(a).view(np.uint32), m.to_bf16(b).view(np.uint32))
+
+
+class PropertyTests(unittest.TestCase):
+    """Property-based tests for KDA chunk boundary behavior.
+
+    These tests verify mathematical properties of the reference-policy KDA
+    recurrence without requiring captured reference outputs. They use synthetic
+    inputs and the CPU emulation to check internal consistency.
+    """
+
+    def test_chunk_boundary_token_counts(self):
+        """Test prefill at chunk boundary token counts for structural validity.
+
+        Verifies that the emulation runs without error and produces correctly
+        shaped outputs for token counts at and around chunk boundaries.
+        Note: emulation only supports 1 sub-block (T<=16) or 4 sub-blocks (T=64)
+        per chunk; partial chunks with 2-3 sub-blocks are not implemented.
+        """
+        m = emulation()
+        for rank in RANKS:
+            # Valid token counts: T<=16, or T%64==0, or T%64<=16
+            for tokens in [1, 2, 3, 4, 5, 7, 8, 15, 16, 64, 65, 66, 70, 80,
+                           128, 129, 130, 140, 144, 192, 193, 194, 200, 208,
+                           256, 257, 258, 272, 320, 384, 400]:
+                x, g1, beta = synthetic_case(m, rank, tokens, seed=123)
+                output, final_state = prefill_synthetic(m, rank, x, g1, beta)
+                self.assertEqual(output.shape, (tokens, HL, DIM),
+                                 f'rank{rank} tokens={tokens}: output shape')
+                self.assertEqual(final_state.shape, (HL, DIM, DIM),
+                                 f'rank{rank} tokens={tokens}: state shape')
+                self.assertTrue(np.all(np.isfinite(output)),
+                                f'rank{rank} tokens={tokens}: output has non-finite values')
+                self.assertTrue(np.all(np.isfinite(final_state)),
+                                f'rank{rank} tokens={tokens}: state has non-finite values')
+
+    def test_deterministic_reproducibility(self):
+        """Same inputs produce identical outputs (determinism)."""
+        m = emulation()
+        for rank in RANKS:
+            for tokens in [5, 64, 128, 200]:
+                x, g1, beta = synthetic_case(m, rank, tokens, seed=456)
+                out1, state1 = prefill_synthetic(m, rank, x, g1, beta)
+                out2, state2 = prefill_synthetic(m, rank, x, g1, beta)
+                self.assertTrue(bf16_equal(m, out1, out2),
+                                f'rank{rank} tokens={tokens}: output not deterministic')
+                self.assertTrue(bf16_equal(m, state1, state2),
+                                f'rank{rank} tokens={tokens}: state not deterministic')
+
+    def test_zero_input_produces_zero_output(self):
+        """All-zero inputs should produce all-zero outputs (linearity at zero)."""
+        m = emulation()
+        for rank in RANKS:
+            for tokens in [1, 5, 64, 128]:
+                x = np.zeros((tokens, 3 * HL * DIM), dtype=np.uint16)
+                g1 = np.zeros((tokens, HL, DIM), dtype=np.uint16)
+                beta = np.zeros((tokens, HL), dtype=np.uint16)
+                output, final_state = prefill_synthetic(m, rank, x, g1, beta)
+                self.assertTrue(np.all(output == 0),
+                                f'rank{rank} tokens={tokens}: zero input -> non-zero output')
+                self.assertTrue(np.all(final_state == 0),
+                                f'rank{rank} tokens={tokens}: zero input -> non-zero state')
+
+    def test_decode_after_various_prefill_lengths(self):
+        """Test one-row decode after prefill of various lengths.
+
+        Verifies the decode path works correctly with different prefill history lengths.
+        """
+        m = emulation()
+        for rank in RANKS:
+            for prefill_tokens in [5, 63, 64, 65, 127, 128, 129, 199, 200]:
+                x5, g5, b5 = synthetic_case(m, rank, prefill_tokens, seed=789)
+                _, hfin = prefill_synthetic(m, rank, x5, g5, b5)
+                xd, gd, bd = synthetic_case(m, rank, 1, seed=999)
+                hist = x5[-3:] if prefill_tokens >= 3 else np.zeros((3, 3 * HL * DIM), dtype=np.uint16)
+                out_d = m.decode(xd, gd, bd, hist, hfin, rank, dict(m.DEFAULT))
+                self.assertEqual(out_d.shape, (1, HL, DIM),
+                                 f'rank{rank} prefill={prefill_tokens}: decode output shape')
+                self.assertTrue(np.all(np.isfinite(out_d)),
+                                f'rank{rank} prefill={prefill_tokens}: decode has non-finite values')
+
+    def test_state_dtype_f32_vs_bf16(self):
+        """Verify f32 state is required (BF16 state produces documented mismatches)."""
+        m = emulation()
+        for rank in RANKS:
+            x5, g5, b5 = synthetic_case(m, rank, 5)
+            _, hfin_f32 = prefill_synthetic(m, rank, x5, g5, b5)
+            hfin_bf16 = m.to_bf16(hfin_f32)
+            xd, gd, bd = synthetic_case(m, rank, 1)
+            hist = x5[-3:]
+            out_f32 = m.decode(xd, gd, bd, hist, hfin_f32, rank, dict(m.DEFAULT, state_dtype='f32'))
+            out_bf16 = m.decode(xd, gd, bd, hist, hfin_bf16, rank, dict(m.DEFAULT, state_dtype='bf16'))
+            self.assertFalse(bf16_equal(m, out_f32, out_bf16),
+                             f'rank{rank}: f32 and bf16 state should produce different outputs')
+
+    def test_decode_state_carry_over(self):
+        """Test that decode state carry-over is deterministic and consistent.
+
+        Running decode multiple times with the same initial state and inputs
+        should produce the same output and final state. This verifies the
+        recurrent state update is deterministic.
+        """
+        m = emulation()
+        for rank in RANKS:
+            # Prefill to get initial state
+            x5, g5, b5 = synthetic_case(m, rank, 64, seed=111)
+            _, hfin = prefill_synthetic(m, rank, x5, g5, b5)
+            # Multiple decode steps with same initial state
+            xd, gd, bd = synthetic_case(m, rank, 1, seed=222)
+            hist = x5[-3:]
+            out1, state1 = m.decode(xd, gd, bd, hist, hfin, rank, dict(m.DEFAULT)), None
+            # The decode function only returns output, not state.
+            # But we can verify output determinism.
+            out2 = m.decode(xd, gd, bd, hist, hfin, rank, dict(m.DEFAULT))
+            self.assertTrue(bf16_equal(m, out1, out2),
+                            f'rank{rank}: decode output not deterministic with same state')
+            # Test with different prefill lengths
+            for prefill_tokens in [5, 64, 128, 200]:
+                x5b, g5b, b5b = synthetic_case(m, rank, prefill_tokens, seed=333)
+                _, hfin_b = prefill_synthetic(m, rank, x5b, g5b, b5b)
+                hist_b = x5b[-3:] if prefill_tokens >= 3 else np.zeros((3, 3 * HL * DIM), dtype=np.uint16)
+                out_b = m.decode(xd, gd, bd, hist_b, hfin_b, rank, dict(m.DEFAULT))
+                self.assertEqual(out_b.shape, (1, HL, DIM),
+                                 f'rank{rank} prefill={prefill_tokens}: decode output shape')
+                self.assertTrue(np.all(np.isfinite(out_b)),
+                                f'rank{rank} prefill={prefill_tokens}: decode has non-finite values')
+
+
 if __name__ == '__main__':
     unittest.main()

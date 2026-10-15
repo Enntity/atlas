@@ -64,6 +64,13 @@ impl ModelConfig {
             dspark_noise_token_id: 0,
             dspark_target_layer_ids: Vec::new(),
             dspark_markov_rank: 0,
+            // ── F4 DFlash / speculative-decoding stub (first pass) ──
+            f4_dspark_enabled: false,
+            f4_mtp_enabled: false,
+            f4_gamma: 4,
+            f4_verify_k: 3,
+            f4_draft_pool_max_seqs: 4,
+            f4_shared_kv_pool: false,
             weight_prefix: String::new(),
             ep_rank: 0,
             ep_world_size: 1,

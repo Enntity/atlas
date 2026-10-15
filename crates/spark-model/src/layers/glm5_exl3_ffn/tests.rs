@@ -7,6 +7,7 @@ use spark_runtime::{
     weights::exl3::{Exl3LinearView, tp::TpShardPlan},
 };
 use std::sync::Mutex;
+#[allow(clippy::duplicate_mod)]
 #[path = "../moe/exl3_kda_test_gpu.rs"]
 mod backend;
 use backend::Gpu;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::AtlasCudaBackend;
 use crate::gpu::Bf16GemmNumerics;
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 impl AtlasCudaBackend {
     pub(super) fn dispatch_bf16(&self, request: crate::gpu::Bf16Gemm) -> Result<()> {
         request.validate()?;

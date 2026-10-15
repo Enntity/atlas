@@ -4,6 +4,7 @@ members = [
     "crates/atlas-core",
     "crates/atlas-kernels",
     "crates/atlas-plugin",
+    "crates/atlas-kv-cache-server",
     "crates/atlas-tier",
     "crates/atlas-rdma",
     "crates/spark-runtime",

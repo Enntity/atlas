@@ -49,17 +49,16 @@ impl<'a> ModelResource<dyn GpuBackend + 'a> for Glm5Exl3MlaResources {
     }
     fn release(&mut self, gpu: &(dyn GpuBackend + 'a)) -> Result<()> {
         let mut first = None;
-        if let Some(exec) = &mut self.index_exec {
-            if let Err(error) = exec.release(gpu) {
-                first = Some(error);
-            }
+        if let Some(exec) = &mut self.index_exec
+            && let Err(error) = exec.release(gpu)
+        {
+            first = Some(error);
         }
-        if let Some(params) = &mut self.index_params {
-            if let Err(error) = params.release(gpu)
-                && first.is_none()
-            {
-                first = Some(error);
-            }
+        if let Some(params) = &mut self.index_params
+            && let Err(error) = params.release(gpu)
+            && first.is_none()
+        {
+            first = Some(error);
         }
         for projection in &mut self.projections {
             if let Err(error) = projection.release(gpu)

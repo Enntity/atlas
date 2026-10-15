@@ -309,7 +309,12 @@ impl AnthropicTranslator {
                     }),
                 ));
             }
-            StreamDelta::Finish { reason, usage, matched_stop, .. } => {
+            StreamDelta::Finish {
+                reason,
+                usage,
+                matched_stop,
+                ..
+            } => {
                 if self.finished {
                     return;
                 }

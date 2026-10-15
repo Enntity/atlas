@@ -9,8 +9,8 @@ use spark_runtime::weights::exl3::native::Exl3LinearWorkspace;
 
 enum DenseProjections {
     Packed {
-        weights: [Exl3DeviceShard; 3],
-        workspaces: [Exl3LinearWorkspace; 2],
+        weights: Box<[Exl3DeviceShard; 3]>,
+        workspaces: Box<[Exl3LinearWorkspace; 2]>,
     },
     Reconstructed(super::shared::SharedBf16Weights),
 }
@@ -177,7 +177,7 @@ impl NativeDenseFfn {
         );
         match &self.projections {
             DenseProjections::Packed { weights, .. } => {
-                for w in weights {
+                for w in weights.iter() {
                     w.buffers()?;
                 }
             }
@@ -328,10 +328,10 @@ impl<'a> ModelResource<dyn GpuBackend + 'a> for NativeDenseFfn {
                 weights,
                 workspaces,
             } => {
-                for w in weights {
+                for w in weights.iter_mut() {
                     retain_error(&mut error, w.release(gpu));
                 }
-                for w in workspaces {
+                for w in workspaces.iter_mut() {
                     retain_error(&mut error, w.release(gpu));
                 }
             }

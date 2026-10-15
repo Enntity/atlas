@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Backend-owned classic BLAS resources. Every stream has an independent workspace.
 use crate::gpu::{Bf16Gemm, Bf16GemmNumerics};
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use parking_lot::Mutex;
 use std::{collections::HashMap, sync::Arc};
 #[cfg(feature = "cuda")]

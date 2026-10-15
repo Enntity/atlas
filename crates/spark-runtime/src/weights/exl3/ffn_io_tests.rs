@@ -100,11 +100,12 @@ fn capture_preserves_typed_bytes_marker_gate_and_exclusive_identity() {
     assert!(metadata.get("binding").is_none());
     // Records commit by rename: no partial file survives, and an existing
     // record is never overwritten.
-    assert!(
-        std::fs::read_dir(&root)
-            .unwrap()
-            .all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".partial"))
-    );
+    assert!(std::fs::read_dir(&root).unwrap().all(|e| {
+        !e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".partial")
+    }));
     std::fs::write(root.join("ffn-L3-rank1-000002-stale.json"), b"{}").unwrap();
     assert!(
         router

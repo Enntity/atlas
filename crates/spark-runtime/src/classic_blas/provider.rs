@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use crate::gpu::Bf16GemmNumerics;
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use std::path::Path;
 /// Validate actual dladdr providers before exposing a classic numerical capability.
 pub(super) fn validate_provider_pair(
@@ -13,8 +13,10 @@ pub(super) fn validate_provider_pair(
     let required = numerics
         .provider_version()
         .ok_or_else(|| anyhow::anyhow!("classic provider requires explicit classic profile"))?;
-    ensure!(classic_version == required && lt_version == required,
-        "classic/Lt profile requires coherent version{required}; got {classic_version}/{lt_version}");
+    ensure!(
+        classic_version == required && lt_version == required,
+        "classic/Lt profile requires coherent version{required}; got {classic_version}/{lt_version}"
+    );
     ensure!(
         classic.is_absolute()
             && lt.is_absolute()

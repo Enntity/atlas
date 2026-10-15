@@ -178,10 +178,10 @@ pub fn load_layers(
                 cleanup = Some(e);
             }
         }
-        if let Some(owner) = &mut scratch {
-            if let Err(e) = owner.release(gpu) {
-                cleanup = Some(e);
-            }
+        if let Some(owner) = &mut scratch
+            && let Err(e) = owner.release(gpu)
+        {
+            cleanup = Some(e);
         }
         return Err(match cleanup {
             None => error,

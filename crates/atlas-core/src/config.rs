@@ -26,6 +26,16 @@ pub enum LayerType {
 
 /// Model configuration parsed from HuggingFace config.json.
 ///
+fn default_f4_gamma() -> usize {
+    4
+}
+fn default_f4_k() -> usize {
+    3
+}
+fn default_f4_pool() -> usize {
+    4
+}
+
 /// Single source of truth for model dimensions. All kernel launch
 /// parameters and buffer sizes derive from this struct.
 #[derive(Debug, Clone, Deserialize)]
@@ -217,6 +227,20 @@ pub struct ModelConfig {
     /// Width of the low-rank Markov token transition head.
     #[serde(default)]
     pub dspark_markov_rank: usize,
+
+    // ── F4 DFlash / speculative-decoding stub (first pass; deferred full loop) ──
+    #[serde(default)]
+    pub f4_dspark_enabled: bool,
+    #[serde(default)]
+    pub f4_mtp_enabled: bool,
+    #[serde(default = "default_f4_gamma")]
+    pub f4_gamma: usize,
+    #[serde(default = "default_f4_k")]
+    pub f4_verify_k: usize,
+    #[serde(default = "default_f4_pool")]
+    pub f4_draft_pool_max_seqs: usize,
+    #[serde(default)]
+    pub f4_shared_kv_pool: bool,
 
     // ── Nemotron-H / Mamba-2 ──
     #[serde(default)]
@@ -684,6 +708,25 @@ pub struct ModelConfig {
     pub ngram_seed: u64,
 }
 
+impl ModelConfig {
+    /// F4 stub validity (CPU-only, before any GPU work).
+    pub fn check_f4_contract(&self) -> anyhow::Result<()> {
+        use dsflash_f4::DsflashF4Contract;
+        if self.f4_dspark_enabled || self.f4_mtp_enabled {
+            DsflashF4Contract {
+                dspark_enabled: self.f4_dspark_enabled,
+                mtp_enabled: self.f4_mtp_enabled,
+                gamma: self.f4_gamma,
+                verify_k: self.f4_verify_k,
+                draft_pool_max_seqs: self.f4_draft_pool_max_seqs,
+                shared_kv_pool: self.f4_shared_kv_pool,
+            }
+            .check(self.vocab_size)?;
+        }
+        Ok(())
+    }
+}
+
 /// HF `Qwen4ExpTextConfig.seed` default. See [`ModelConfig::ngram_seed`].
 fn default_ngram_seed() -> u64 {
     1234
@@ -792,6 +835,7 @@ pub(crate) fn default_conv_kernel() -> usize {
 }
 
 mod dispatch;
+mod dsflash_f4;
 mod factory;
 mod gguf;
 mod methods;

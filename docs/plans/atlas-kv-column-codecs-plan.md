@@ -315,6 +315,21 @@ uncompressed path.
   [`docs/plans/atlas-kv-cache-server-plan.md`](atlas-kv-cache-server-plan.md),
   [TurboQuant paper](https://arxiv.org/abs/2504.19874)
 
+- Repos to test / evaluate (first-pass external comparison; bit-exact roundtrip + ratio + encode/decode GB/s per measurement discipline §3; no implicit defaults — each repo's pipeline must declare codec id explicitly):
+  - `https://github.com/facebookresearch/dietgpu` — GPU memory / compression for DL training (lossless/checkpoint-related)
+  - `https://github.com/facebook/openzl` — zero-knowledge / proof frameworks (not codec — listed for evaluation scope clarity)
+  - `https://github.com/pcodec/pcodec` — lossy/lossless codec library (direct pipeline comparison)
+  - `https://github.com/mohit1997/DeepZip` — deep-learning-based lossless compression
+  - `https://github.com/zipnn/zipnn` — neural compression / codec (lossless path)
+  - `https://github.com/dingwentao/GPU-lossless-compression` — GPU lossless kernels (Stage-3 contraindication check)
+  - `https://github.com/cloudflareresearch/unweight-kernels` — GPU kernel compression / decompression primitives
+  - `https://github.com/hpdps-group/ICS23-GPULZ` — GPU LZ / lossless compression (benchmark baseline B1 comparison)
+  - `https://github.com/lihy0529/lossless_homomorphic_compression` — homomorphic lossless (codec composition test)
+  - `https://github.com/timethink/zipserv_kvcache_framework` — KV-cache-specific zip/serve framework (spill-tier integration analog)
+  - `https://github.com/parda21/NWC` — neural/weighted compression (codec pipeline comparison)
+  - `https://github.com/Destroyertubu/L3` — lossless compression (pipeline comparison)
+  - `https://github.com/OrakulStudio/SAEP-SVD-Beyond-Eckart-Young` — SVD / low-rank compression (related to KV quant vs codec layering — see §2 C2)
+
 ---
 
 ## 8. Follow-ups (recorded in todo.md)

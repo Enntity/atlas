@@ -1,0 +1,43 @@
+[package]
+name = "atlas-kv-cache-server"
+version = "0.1.0-alpha"
+edition = "2024"
+license.workspace = true
+description = "Atlas: remote KV cache server (gRPC + optional RDMA) — reuse kv_cache / kv_paging / cache_peer"
+
+[features]
+default = ["cuda"]
+cuda = ["dep:spark-runtime", "dep:spark-storage", "spark-runtime/cuda", "spark-storage/cuda"]
+atlas_rdma_verbs = ["cuda"]
+
+[dependencies]
+spark-runtime = { path = "../spark-runtime", default-features = false, optional = true }
+spark-storage = { path = "../spark-storage", default-features = false, optional = true }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+# Protocol (reserved — tonic/prost; first pass uses manual structs with proto file)
+tonic = { version = "0.12", features = ["transport", "server", "codegen"] }
+prost = "0.13"
+
+# Compression / dedup (plan §2.5 / §5.6)
+zstd = "0.13"
+sha2 = "0.10"
+
+lz4 = "1.28"
+
+# Concurrent mapping (plan §5.2)
+dashmap = "6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+
+[build-dependencies]
+prost-build = "0.13"
+tonic-build = "0.12"
+
+# Crate-local; parent workspace already defines members. (No [workspace] here.)

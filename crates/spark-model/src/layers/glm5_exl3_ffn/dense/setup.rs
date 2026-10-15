@@ -12,7 +12,15 @@ impl NativeDenseFfn {
         activation: NativeDenseActivation,
         role: NativeDenseFfnRole,
     ) -> Result<Self> {
-        Self::setup(gpu, weights, capacity, stream, activation, role, None)
+        Self::setup(
+            gpu,
+            Box::new(weights),
+            capacity,
+            stream,
+            activation,
+            role,
+            None,
+        )
     }
 
     pub fn new_with_numerics(
@@ -25,7 +33,7 @@ impl NativeDenseFfn {
     ) -> Result<Self> {
         Self::setup(
             gpu,
-            weights,
+            Box::new(weights),
             capacity,
             stream,
             activation,
@@ -37,7 +45,7 @@ impl NativeDenseFfn {
     #[allow(clippy::too_many_arguments)]
     fn setup(
         gpu: &dyn GpuBackend,
-        mut weights: [Exl3DeviceShard; 3],
+        mut weights: Box<[Exl3DeviceShard; 3]>,
         capacity: usize,
         stream: u64,
         activation: NativeDenseActivation,
@@ -49,7 +57,7 @@ impl NativeDenseFfn {
                 role == NativeDenseFfnRole::DensePacked,
                 "shared FFN requires global BF16 reconstruction before TP"
             );
-            let [g, u, d] = weights.each_ref().map(|w| w.plan());
+            let [g, u, d] = (*weights).each_ref().map(|w| w.plan());
             ensure!(
                 g.axis() == ShardAxis::Output
                     && u.axis() == ShardAxis::Output
@@ -152,7 +160,7 @@ impl NativeDenseFfn {
                 capture: None,
                 projections: DenseProjections::Packed {
                     weights,
-                    workspaces: [gate, down],
+                    workspaces: Box::new([gate, down]),
                 },
                 activations,
                 merged_activation: DevicePtr::NULL,
@@ -169,7 +177,7 @@ impl NativeDenseFfn {
             }),
             Err(error) => {
                 let mut cleanup = None;
-                for w in &mut weights {
+                for w in weights.iter_mut() {
                     retain_error(&mut cleanup, w.release(gpu));
                 }
                 Err(match cleanup {

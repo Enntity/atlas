@@ -11,6 +11,7 @@ fn concat_owned_bf16_rows_preserves_sources_and_retries_release() {
         let data = value.to_le_bytes().repeat(4);
         let view = TensorView::new(Dtype::BF16, vec![1, 4], &data).unwrap();
         parts.push(
+            #[allow(clippy::single_range_in_vec_init)]
             Exl3DenseDeviceTensor::upload(&gpu, &view, Exl3DenseDtype::Bf16, &[0..1]).unwrap(),
         );
     }
@@ -42,6 +43,7 @@ fn concat_rejects_empty_and_released_parts_before_allocating() {
     assert!(Exl3DenseDeviceTensor::concat_rows(&gpu, &[]).is_err());
     let bytes = vec![0; 8];
     let view = TensorView::new(Dtype::BF16, vec![1, 4], &bytes).unwrap();
+    #[allow(clippy::single_range_in_vec_init)]
     let mut part =
         Exl3DenseDeviceTensor::upload(&gpu, &view, Exl3DenseDtype::Bf16, &[0..1]).unwrap();
     part.release(&gpu).unwrap();

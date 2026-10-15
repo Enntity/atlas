@@ -120,12 +120,24 @@ new GPU work (continue.md "Before any GPU work").
      envelope (worst 0.155 of the limit). Router gate inputs diverge first,
      at a row-dependent layer 8–33, and expert flips follow; the collective
      dispatch is identical across draws. Mechanism unresolved.
-   - [ ] Next mechanism step, separately registered: observe the varying
-     choice inside the layer stack. Options: a CACHEDEBUG `exllamav3_ext`
-     observer build with neutrality checks, or per-layer hidden-state capture
-     around the first differing layer of a differing pair. An EXL3
-     plan-freeze intervention is still untested; routing-switch and
-     collective-backend interventions are not supported by the result.
+   - [x] Next mechanism step: per-layer hidden-state capture.
+     **Done 2026-10-15:** [result](docs/design/exl3-hidden-state-localization-result-20261015.md).
+     In 96/96 comparisons the first differing tensor is the EXL3 fused-MoE
+     FP32 output (atomic accumulation of top-8 experts), from layer 3, with
+     byte-identical inputs and routing. Rounding absorbs the last-bit noise
+     until a row-dependent layer.
+   - [x] One-variable `EXL3_FUSED_MOE=0` determinism test. **Done
+     2026-10-15:** [result](docs/design/exl3-fused-moe-determinism-result-20261015.md).
+     25/32 rows identical (primary FAIL as registered). Every row below 2052
+     tokens is deterministic; a second source starts exactly at the indexer
+     pool-selection threshold (2052). The loop profile is not a neutral pin.
+   - [x] Localize the indexer non-determinism beyond 2051 tokens. **Done
+     2026-10-15:** [result](docs/design/exl3-indexer-localization-result-20261015.md).
+     `top_k_per_row_prefill` returns the correct pool set in a run-dependent
+     order, and sparse MLA attention accumulates in that order.
+   - [ ] Implement the reference-determinism fix (scope pending user
+     choice): a fixed order for both accumulations, i.e. the fused-MoE
+     combine and the indexer top-k order.
    See the [qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md).
 2. **ref13 mode-mechanism probe** (separate diagnostic, not qualification).
    - [ ] The historical tuning set of 15 reference draws falls into 6 byte
@@ -541,6 +553,14 @@ in `q2-codepath-audit-20261012/comparison-report.md` §5, as corrected in
   out of the L1/v24 tooling batch (verified there by "no new findings in
   changed files"); `typos` carries the same pre-existing drift class (56
   findings outside changed files).
+- [x] GPU-iteration tooling (new 2026-10-14; CPU-only, full suite green):
+  one-command image lifecycle
+  (`tests/exl3_validation/image_cycle.py`), G8/G9 provenance receipt
+  (`g8g9_binding.py`), and the probe pre-Spark package/records
+  (`probe_wiring.py`, `probe_sitecustomize.py`, `probe_package.py`,
+  `probe_records.py`). Records: `$EV/probe-runtime-mechanism-20261014/`;
+  decisions/assumptions entries 2026-10-14. Follow-up lives in the probe
+  registration's owed section (profiler bind, NCCL live, per-attempt stamp).
 
 ## Completed — evidence pointers
 
@@ -612,3 +632,9 @@ Stage 0 of that plan passes.
 - ZXC asymmetric codec for compress-once/decompress-many reload paths.
 - Cross-replica compressed KV transfer format — link
   [docs/plans/atlas-kv-coord-plan.md](docs/plans/atlas-kv-coord-plan.md).
+
+- DoubleDelta bit-exact verification (preliminary single-shot, not serious claim).
+- Full ClickHouse catalog (ALP, FPC, ZXC, GCD) — enum variants exist, implementations stub; implement when H1 supported.
+- Stage-1 integration test: live spill → reload under --high-speed-swap with codec=DeltaZstd; bit-exact with dequant.
+- Measurement: n≥3 repeat on captured real-block corpora; fingerprint sidecars; block-header codec histogram.
+- Stage-3 GPU-resident (contraindicated) — only if Stages 1–2 pass and roofline arithmetic predicts win.

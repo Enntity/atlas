@@ -11,7 +11,23 @@ use std::fs;
 use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 
+// First-pass codec integration (plan §5). Block-level encode/decode uses
+// atlas-codecs; full spill-tier routing staged after Stage-0 exit.
+use atlas_codecs::{CodecId, Pipeline};
+
 /// Manages swap file creation, opening, deletion, and space limits.
+/// Codec-compressed spill block helper — first pass (Stage 0/1).
+/// Writes header (codec id + lengths) + compressed payload.
+/// Bit-exact roundtrip required; default codec=NONE (no regression).
+pub fn encode_spill_block(pipe: Pipeline, raw: &[u8]) -> Vec<u8> {
+    let (compressed, cid) = pipe.encode(raw);
+    atlas_codecs::block::encode_with_header(cid, raw.len(), &compressed)
+}
+
+pub fn decode_spill_block(buf: &[u8]) -> Option<(Vec<u8>, CodecId)> {
+    atlas_codecs::Pipeline::decode(buf)
+}
+
 pub struct KvSpillManager {
     spill_dir: PathBuf,
     next_id: u64,

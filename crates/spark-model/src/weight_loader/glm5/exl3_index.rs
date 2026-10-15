@@ -26,6 +26,7 @@ pub struct Glm5Exl3IndexParams {
 }
 
 impl Glm5Exl3IndexParams {
+    #[allow(clippy::single_range_in_vec_init)]
     pub fn load(
         store: &WeightStore,
         prefix: &str,

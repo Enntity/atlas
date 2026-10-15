@@ -118,3 +118,29 @@ def test_observer_text_or_threshold_changes_cannot_pass_with_equal_logits(tmp_pa
     io,plan=configured(tmp_path);setattr(CPUCollection,field,'candidate-observed')
     with pytest.raises(ValueError,match='observer control'):run(plan,io,CPUCollection)
     assert not (Path(plan['output'])/plan['attempt']/'binding.json').exists()
+
+
+def test_real_completed_reference_prerequisite_binds_all8_heads_and_both_sources(tmp_path):
+    import io as bytesio
+    import shlex,subprocess,tarfile
+    from l1_lifecycle import L1Lifecycle
+    io,plan=configured(tmp_path);run(plan,io,CPUCollection)
+    root=Path(plan['output'])/plan['attempt']/'reference-observed'
+    manifest=io.json(root/'collection'/'manifest.json')
+    plan['engines']['reference']['endpoint']=manifest['endpoint']  # ephemeral CPU transport target
+    def remote(args,**kwargs):
+        rank=args[0][-1];command=shlex.split(args[-1])
+        assert command[:2]==['tar','-cf']
+        path=Path(command[command.index('-C')+1])
+        if path.name=='diagnostic':path=root/('rank'+rank)/'diagnostic'
+        buffer=bytesio.BytesIO()
+        with tarfile.open(fileobj=buffer,mode='w') as archive:
+            for child in path.iterdir():archive.add(child,arcname=child.name)
+        return subprocess.CompletedProcess(args,0,buffer.getvalue(),b'')
+    adapter=L1Lifecycle(plan,'reference',io,remote);adapter.collection_proof=None
+    adapter.validate_completed_reference(root)
+    assert adapter.collection_proof['rows']==8
+    assert any(key.startswith('pre-stop-rank1/') for key in adapter.collection_proof['file_sha256'])
+    assert (root/'pre-stop-binding.json').exists()
+    manifest['captures']=manifest['captures'][:7];io.write(root/'collection'/'manifest.json',manifest)
+    with pytest.raises(ValueError):adapter.validate_completed_reference(root)

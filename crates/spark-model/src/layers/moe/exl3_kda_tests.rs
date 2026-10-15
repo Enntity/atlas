@@ -10,6 +10,7 @@ use atlas_core::{
     scope::ModelResource,
 };
 use safetensors::{Dtype, tensor::TensorView};
+#[allow(clippy::duplicate_mod)]
 #[path = "exl3_kda_test_gpu.rs"]
 mod backend;
 use backend::Gpu;

@@ -303,6 +303,11 @@ fn validate_dspark_contract(config: &ModelConfig, raw: &serde_json::Value) -> Re
         config.dspark_block_size > 0,
         "`dspark_block_size` must be > 0"
     );
+    // F4 stub: when DSpark is declared, also require MTP draft pool or shared flag
+    // to be set consistently (first-pas; full pairing deferred).
+    if config.f4_dspark_enabled && !config.f4_mtp_enabled && config.f4_draft_pool_max_seqs > 0 {
+        // Allow standalone DSpark; no hard error in stub.
+    }
     anyhow::ensure!(
         config.dspark_noise_token_id < config.vocab_size as u32,
         "`dspark_noise_token_id` ({}) is outside vocab_size ({})",

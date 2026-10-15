@@ -215,14 +215,16 @@ fn coherent_provider_profile_rejects_mixed_version_or_directory() {
     super::validate_provider_pair(shared, 130101, 130101, classic, lt).unwrap();
     assert!(super::validate_provider_pair(shared, 130000, 130101, classic, lt).is_err());
     assert!(super::validate_provider_pair(shared, 130101, 130000, classic, lt).is_err());
-    assert!(super::validate_provider_pair(
-        shared,
-        130101,
-        130101,
-        classic,
-        std::path::Path::new("/other/libcublasLt.so.13")
-    )
-    .is_err());
+    assert!(
+        super::validate_provider_pair(
+            shared,
+            130101,
+            130101,
+            classic,
+            std::path::Path::new("/other/libcublasLt.so.13")
+        )
+        .is_err()
+    );
     assert!(
         super::validate_provider_pair(Bf16GemmNumerics::CublasLt, 130101, 130101, classic, lt)
             .is_err()

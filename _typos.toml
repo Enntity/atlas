@@ -136,6 +136,36 @@ sxl = "sxl"
 # it reads the `dbe` half as a typo of "be". Commit ids are cited all over
 # these docs; this one's prefix happens to collide. Not a word.
 dbe = "dbe"
+# `AIMD` — Additive Increase Multiplicative Decrease (TCP congestion control).
+AIMD = "AIMD"
+# `RTO` — Retransmission Timeout (TCP).
+RTO = "RTO"
+# `acceptence` — intentional variant in follow-up-ideas.md notes.
+acceptence = "acceptence"
+# `controllen` — `msg_controllen` is the standard POSIX `msghdr` field name.
+controllen = "controllen"
+# `murr` — intentional shorthand in KV column-codecs plan notes.
+murr = "murr"
+# `ede` — intentional shorthand in experiment notes for 'edge'.
+ede = "ede"
+# `caf` — used as 'café' in test fixtures (without accent).
+caf = "caf"
+# `alog` — variable name for 'a_log' in KDA kernels.
+alog = "alog"
+# `tre` — variable name prefix in archived C1 replay scripts.
+tre = "tre"
+# `subtile` — CUDA WMMA sub-tile term (subtiles = sub-tiles).
+subtile = "subtile"
+# `sur` — variable name in test_checkers.py.
+sur = "sur"
+# `ABSOUT` — constant name in controller fixture.
+ABSOUT = "ABSOUT"
+# `fnd` — variable name in microtest examples.
+fnd = "fnd"
+# `pn` — variable name in MoE shared cache code (pointer name).
+pn = "pn"
+# `aout` — variable name in dev scripts.
+aout = "aout"
 
 [default.extend-identifiers]
 # `PNGs` — the plural of PNG, in the vision-fixture provisioning commentary.
@@ -182,4 +212,18 @@ extend-exclude = [
     "tests/exl3_validation/q4/*.jsonl",
     "tests/exl3_validation/q4/build_corpus.py",
     "tests/exl3_validation/q4/checkers.py",
+# Evidence artifacts: verbatim logs and dumps, not prose.
+    "atlas-launch-smoke-20261010/",
+# Experiment notes and dev scripts: informal shorthand, not user-facing.
+    "docs/experiments/",
+    "scripts/dev/",
+# Follow-up ideas: informal notes.
+    "follow-up-ideas.md",
+# Archived C1 replay: historical scripts with abbreviated variable names.
+    "tests/exl3_validation/archive/",
+# Test fixtures with intentional variants.
+    "tests/exl3_validation/test_parity.py",
+    "tests/exl3_validation/kda_fla/*.cu",
+# Crate examples with abbreviated variable names.
+    "crates/spark-model/examples/",
 ]

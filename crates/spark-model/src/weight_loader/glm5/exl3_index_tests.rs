@@ -110,11 +110,11 @@ fn loads_f32_norms_from_original_f16_and_borrows_exact_f32_ape() {
     let bias = gpu.read_alloc(exact.norm_bias).unwrap();
     assert_eq!(
         f32::from_le_bytes(weight[..4].try_into().unwrap()),
-        1.0009765625
+        1.000_976_6
     );
     assert_eq!(
         f32::from_le_bytes(bias[..4].try_into().unwrap()),
-        0.50048828125
+        0.500_488_3
     );
     assert_eq!(
         &gpu.read_alloc(ape).unwrap()[..4],

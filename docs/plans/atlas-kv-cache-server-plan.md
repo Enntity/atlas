@@ -1,6 +1,21 @@
 # Plan: Remote KV Cache Server Crate (`atlas-kv-cache-server`)
 
-Status: DESIGN — not implemented. Search performed (`lib.rs` + `crates.io`); reuse targets identified; no custom cache code written.
+Status: PARTIAL / IMPLEMENTED — 2026-05-29 revision (review+fixes applied). T1-T2 done; T3-T8 partially done with bugs B1-B9 annotated; T9-T10 open; Req A-H partial; F1-F5 deferred.
+
+--- PLAN REVISION LOG ---
+| Date | Section / Item | State | Notes / Bug ID |
+|---|---|---|---|
+| 2026-05-29 | §6 T1-T2 | DONE | Search + reuse documented; proto/kv_cache.proto present; SPDX present; crate builds (`cargo check` passes). |
+| 2026-05-29 | §6 T3 (CachePool) | PARTIAL / B1 FIXED-COMMENTED | `cache_pool.rs`: real `inner` allocation deferred (GPU `PagedKvCache` needs device context); `get()` Memory returns `vec![]` documented as B1; `used_bytes` decay and spill-evict deferred. |
+| 2026-05-29 | §6 T4 (NvmeSpill) | PARTIAL / B5 OPEN | `nvme_spill.rs`: raw `fs::write`; compression (`zstd`) and dedup (`sha2`) not wired; filename uses raw key (path-traversal risk). |
+| 2026-05-29 | §6 T5 (Config) | DONE / B4 FIXED | `config.rs`: `validate()` now checks `block_size > 0` and writable metadata (§5.1). |
+| 2026-05-29 | §6 T6 (Server) | PARTIAL / B2 PARTIAL | `server.rs`: `serve()` stub preserved with build-note; `tonic` server feature + `build.rs` + proto build required to start listener; `get()` error mapping fixed (PoolFull → RESOURCE_EXHAUSTED). |
+| 2026-05-29 | §6 T7 (RDMA) | OPEN / B8 OPEN | `rdma_serve.rs`: feature gate OK; never delegates to `spark-storage::cache_peer::ServerImpl`. |
+| 2026-05-29 | §6 T8 (Lib/Cargo) | PARTIAL / B6-B7 OPEN | `lib.rs`: `server` wrongly gated on `cuda`; `proto` module empty; `edition = "2024"`; `lz4` missing for `CompressionMode::Lz4`; `tonic` missing `"server"`; no `build.rs`. |
+| 2026-05-29 | §7 tests | OPEN | `tests/pool_size_tests.rs`: stubs only; missing `nvme_offload_tests.rs`, `server_integration_tests.rs`, `rdma_feature_tests.rs`, §7.4 compression/dedup. |
+| 2026-05-29 | §8 Req A-H | PARTIAL | A (reuse) — not met (custom CachePool ignores `kv_cache`); B (SPDX/deny) met; C (fail-fast / PCND) partially met (config fixed); D (`nvme_path` optional) met; E (proto versioned) meta; F (RDMA feature-gated) meta; H (compression/dedup) open. |
+
+--- Search performed (`lib.rs` + `crates.io`); reuse targets identified; no custom cache code written.
 
 ---
 
