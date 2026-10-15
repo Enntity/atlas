@@ -7,6 +7,7 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 mod glm5_vision;
+mod vision_markup;
 
 use super::{
     ChatEncoding, ChatTokenizer, StreamingDecoder, autoclose_assistant_think,
@@ -284,7 +285,7 @@ impl ChatTokenizer {
             );
         }
 
-        self.encode(&rendered)
+        self.encode_rendered(&rendered)
     }
 
     /// Apply the OpenAI-variant template (if available), falling back to the default.
@@ -348,7 +349,7 @@ impl ChatTokenizer {
                 },
             )
             .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;
-            self.encode(&rendered)
+            self.encode_rendered(&rendered)
         } else {
             self.apply_chat_template_jinja_with_effort(
                 messages,

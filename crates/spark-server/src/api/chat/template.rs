@@ -46,7 +46,7 @@ pub(super) fn render_template(
     let template_thinking = enable_thinking;
 
     // Build JSON messages with structured tool_calls for Jinja.
-    let json_messages =
+    let mut json_messages =
         build_json_messages_for(messages, state.tokenizer.uses_deepseek_v4_encoding());
     // When TSCG is enabled the parser's `system_prompt()` has already
     // placed the compact tool signatures into messages[0]; passing
@@ -54,7 +54,7 @@ pub(super) fn render_template(
     // defeat the compaction. Pass `None` so the template's `{% if tools
     // %}` branch falls through — the tool-call format instructions
     // still come from `system_prompt()`.
-    let jinja_tools: Option<Vec<serde_json::Value>> = if tools_active
+    let mut jinja_tools: Option<Vec<serde_json::Value>> = if tools_active
         && (state.tokenizer.uses_deepseek_v4_encoding() || !state.chat.prompt.tscg)
     {
         Some(
@@ -66,6 +66,20 @@ pub(super) fn render_template(
     } else {
         None
     };
+
+    // In a request with media only the template's own vision markers may
+    // become placeholders: markers written in message text encode as text
+    // (`tokenizer::vision_markup`).
+    if !image_pad_counts.is_empty() || !vision_placeholders.is_empty() {
+        let escaped = state.tokenizer.escape_vision_markup(
+            json_messages
+                .iter_mut()
+                .chain(jinja_tools.iter_mut().flatten()),
+        );
+        if escaped > 0 {
+            tracing::info!("{escaped} vision markers in message text encoded as text");
+        }
+    }
 
     // Progressive auto-compact (DISABLED BY DEFAULT 2026-04-25 —
     // see project_no_auto_compaction memory feedback).
