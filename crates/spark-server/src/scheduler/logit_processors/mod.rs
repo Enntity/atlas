@@ -328,9 +328,8 @@ pub fn process_position_logits(
     penalties: &SamplingParams,
     kind: PositionKind,
 ) -> Option<u32> {
-    // 0. The qwen4_exp min_tokens end-token ban (`min_tokens_ban`), then the
-    //    content-loop steer (`loop_steer`): before every stage, so no stage,
-    //    bypass or sampler can pick a banned id or a loop's continuation.
+    // 0. The qwen4_exp min_tokens end-token ban (`min_tokens_ban`): before
+    //    every stage, so no stage, bypass or sampler can pick a banned id.
     crate::scheduler::min_tokens_ban::mask_row(logits, seq);
     crate::scheduler::loop_steer::mask_row(logits, seq);
 

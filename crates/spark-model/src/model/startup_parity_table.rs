@@ -7,6 +7,14 @@
 use anyhow::Result;
 use spark_runtime::radix_tree::{glm_pc_evict_enabled, snap_evict_alpha, snap_evict_legacy};
 
+use crate::layer::glm_long_owner;
+use crate::layers::dflash_head::{ConvTwinKind, rank_split};
+use crate::layers::qwen3_attention::{
+    glm_mla_multi_seq_enabled, glm_multi_seq_sparse_enabled, glm_multi_seq_sparse_graphs_enabled,
+    grouped_routed_decode_enabled, grouped_routed_decode_min, index_split_words,
+    pairwise_moe_decode_enabled, write_floor_legacy,
+};
+use crate::layers::{self, glm_kv_shard, glm_sp, moe, ops, qwen3_ssm, w4a16_gemv_tiers};
 use crate::model::glm_long_verify::{oracle_enabled, serial_diagnostic};
 use crate::model::trait_impl::finish_leaf;
 use crate::model::trait_impl::prefill_b::pc_policy as pc;
@@ -16,14 +24,6 @@ use crate::model::{
     qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_lmhead_split, qwen4exp_mtp_depth,
     verify_pieces,
 };
-use crate::layer::glm_long_owner;
-use crate::layers::dflash_head::{ConvTwinKind, rank_split};
-use crate::layers::qwen3_attention::{
-    glm_mla_multi_seq_enabled, glm_multi_seq_sparse_enabled, glm_multi_seq_sparse_graphs_enabled,
-    grouped_routed_decode_enabled, grouped_routed_decode_min, index_split_words,
-    pairwise_moe_decode_enabled, write_floor_legacy,
-};
-use crate::layers::{self, glm_kv_shard, glm_sp, moe, ops, qwen3_ssm, w4a16_gemv_tiers};
 use crate::speculative::glm_repair_policy;
 use crate::weight_loader::qwen4_exp::GdnProjections;
 
@@ -36,7 +36,10 @@ const GLM: &str = "glm5_next";
 /// feature's own parser. One entry per setting.
 pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // A rank that would only warn beside one that fails.
-    ("ATLAS_STARTUP_PARITY=warn", || Ok(super::warn_only() as u64)),
+    (
+        "ATLAS_STARTUP_PARITY=warn",
+        || Ok(super::warn_only() as u64),
+    ),
     // The head's command words.
     ("ATLAS_EP_PROTOCOL=v2", || {
         Ok(crate::model::ep_protocol_v2_requested() as u64)
@@ -268,14 +271,14 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_W4A16_TC", || {
         Ok(w4a16_gemv_tiers::tc_requested() as u64)
     }),
-    // Whether a verify can roll back the PLE carry every rank replicates
-    // (qwen4_exp): without its snapshots `commit_accepted_prefix` refuses a
-    // partial accept, on that rank alone.
     // Whether the shared expert's TP split and every verify op take the
     // canonical row-invariant kernels (`layers::canonical_verify`).
     ("ATLAS_GLM_CANONICAL_VERIFY", || {
         Ok(layers::canonical_verify::enabled() as u64)
     }),
+    // Whether a verify can roll back the PLE carry every rank replicates
+    // (qwen4_exp): without its snapshots `commit_accepted_prefix` refuses a
+    // partial accept, on that rank alone.
     ("ATLAS_PLE_VERIFY_SNAPSHOTS", || {
         Ok(layers::ple::verify_snapshots_enabled() as u64)
     }),
@@ -302,13 +305,13 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
             rank_split::topk_requested()?,
         ))
     }),
-    // The draft head a qwen4_exp worker builds and the swaps of each batched
-    // propose it serves (`--mtp-vocab` is agreed by the server).
     // Changes drafts only (the convs run on the head of a split propose);
     // agreed so a pair never drafts from a twin it was not measured with.
     ("ATLAS_DFLASH_CONV_TWIN", || {
         Ok(ConvTwinKind::word(ConvTwinKind::requested()?))
     }),
+    // The draft head a qwen4_exp worker builds and the swaps of each batched
+    // propose it serves (`--mtp-vocab` is agreed by the server).
     ("ATLAS_QWEN4EXP_MTP_DRAFT_TP", || {
         layers::qwen4exp_mtp::draft_tp::parity_word()
     }),
@@ -346,6 +349,11 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     }),
     ("ATLAS_QWEN4EXP_DECODE_GRAPH_WIDE", || {
         Ok((decode_pieces::requested() && decode_pieces::wide_requested()) as u64)
+    }),
+    // Where a batched verify votes on KV admission (`kv_lookahead`): a split
+    // pair would vote at different steps and mispair the broadcasts.
+    ("ATLAS_QWEN4EXP_KV_LOOKAHEAD", || {
+        Ok(crate::model::kv_lookahead::lookahead_tokens() as u64)
     }),
     // The share of the qwen4_exp LM head a rank projects, and the exchange
     // of the halves every decode/verify step adds.
@@ -395,7 +403,9 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // The q38 prefill MoE arm (`_PREFILL_BF16_PROJ` implies it) routes under
     // `_SP_ROUTE`: a rank without it routes every row and never joins the
     // routes' all-gather. `_MOE_W2` also takes the router below 32 rows.
-    ("ATLAS_QWEN4EXP_PREFILL_MOE", || Ok(moe::q38_requested() as u64)),
+    ("ATLAS_QWEN4EXP_PREFILL_MOE", || {
+        Ok(moe::q38_requested() as u64)
+    }),
     ("ATLAS_QWEN4EXP_PREFILL_MOE_W2", || {
         Ok((moe::q38_requested() && moe::w2_requested()) as u64)
     }),
