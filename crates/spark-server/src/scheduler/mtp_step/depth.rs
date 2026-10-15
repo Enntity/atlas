@@ -63,7 +63,7 @@ pub(super) fn ladder_truncate(
     let cap = lone_copy_cap(
         ladder_nd,
         spark_model::speculative::long_copy::drafts(),
-        model.mtp_slot_draft_capacity(a.seq.slot_idx),
+        model.lone_verify_draft_capacity(a.seq.slot_idx),
         super::super::dflash_conf_width::is_copy(conf),
         a.seq.seq_len,
         max_seq_len,
@@ -75,8 +75,10 @@ pub(super) fn ladder_truncate(
 
 /// Drafts a lone owner verifies at most: the ladder's `ladder_nd`, or for a
 /// copy (`copy_drafts`) up to `long` (0 = long copies off) within the
-/// drafts its verify slot holds (`slot_cap`) and below the context ceiling
-/// (`mtp_gate::ceiling`, which gated the step at `ladder_nd` only).
+/// drafts its lone verify may hold now (`slot_cap`,
+/// `Model::lone_verify_draft_capacity`: rows lent by idle slots, so a
+/// request admitted since the proposal cuts it back) and below the context
+/// ceiling (`mtp_gate::ceiling`, which gated the step at `ladder_nd` only).
 pub(super) fn lone_copy_cap(
     ladder_nd: usize,
     long: usize,

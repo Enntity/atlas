@@ -58,23 +58,21 @@
 //! copy after a copy that was not kept whole, until one is.
 //!
 //! **Long copies** (`ATLAS_DFLASH_COPY_LONG_MAX`, default 0 = off, else
-//! `8..=31`; needs `ATLAS_DFLASH_CONF_WIDTH=1`, parsed by
-//! `spark_model::speculative::long_copy`, which sizes the verify pools for
-//! the wider rows): a reply that re-emits its prompt (a file edited and
-//! written back whole) keeps nearly every copy, and at most [`MAX_DRAFTS`]
-//! drafts a step it pays a verify every eight tokens. After a copy round kept whole, a copy of the
-//! prompt proposes up to the long maximum instead, past DFlash2's block, and
-//! the confidence width prices its rows by the prompt-copy bin's measured
-//! acceptance at each depth (`dflash_conf_width`), so it goes wide only
-//! while copies are being kept. Copies of the reply never go long. Only a
-//! lone owner verifies past [`MAX_DRAFTS`] (`ladder_truncate`, within the
-//! drafts its verify slot holds and below the context ceiling); an owner
-//! batch, the batched verify and a prefill ride cut a long copy to their
-//! common width (`ride_len`) as before.
-//! Offline estimate (sparkglm-research
-//! `experiments/suffix-probe-20261014/LONG-COPY.md`): +34–37% decode on
-//! whole-file edits at 31, +8% on partial edits, flat elsewhere, with rows
-//! priced at a linear 6.1 ms.
+//! `8..=31`; needs `ATLAS_DFLASH_CONF_WIDTH=1`; parsed by
+//! `spark_model::speculative::long_copy`): a reply that re-emits its prompt
+//! (a whole file written back) keeps nearly every copy, yet at most
+//! [`MAX_DRAFTS`] drafts a step pays a verify every eight tokens. After a
+//! copy round kept whole, a prompt copy proposes up to the long maximum, and
+//! the confidence width prices its rows by the prompt-copy bin's acceptance
+//! at each depth (`dflash_conf_width`). Reply copies never go long. Only a
+//! lone owner verifies past [`MAX_DRAFTS`], on verify rows the model lends
+//! from idle slots while it is the only sequence (`model::ssm_borrow`):
+//! [`offer`] and `ladder_truncate` cap it at `Model::lone_verify_draft_capacity`
+//! (and the context ceiling), so an admission stops long copies until the
+//! rows are free again. Owner batches, the batched verify and prefill rides
+//! cut a long copy to their common width (`ride_len`). Hardware (03/04,
+//! `experiments/suffix-probe-20261014/ab-03-04`): exact, +51-58% decode on
+//! whole-file edits at 31.
 //!
 //! Each request's `Done:` line is followed by a `COPY DRAFTS` line with its
 //! copy rounds, drafts and accepted drafts, of the prompt and of the reply.
@@ -149,9 +147,21 @@ impl Settings {
                 v > match_len && v <= 64
             }),
             miss_max: num("ATLAS_DFLASH_COPY_MISS_MAX", 0, &|v| v <= max),
-            // The model sized its verify pools from the same parse.
+            // The model lends its verify rows from the same parse.
             long_max: spark_model::speculative::long_copy::parse_drafts(&var),
         })
+    }
+
+    /// These settings for a sequence whose lone verify may hold `lone_cap`
+    /// drafts now (`Model::lone_verify_draft_capacity`): no long copy where
+    /// that is DFlash2's block or less (another sequence holds the rows a
+    /// long verify borrows), else at most `lone_cap`.
+    fn lone(self, lone_cap: usize) -> Self {
+        let long_max = self.long_max.min(lone_cap);
+        Self {
+            long_max: if long_max > MAX_DRAFTS { long_max } else { 0 },
+            ..self
+        }
     }
 }
 
@@ -376,10 +386,11 @@ impl CopyState {
 }
 
 /// Offer a copy in place of `a`'s pending DFlash2 drafts (no-op with copy
-/// drafts off).
-pub(super) fn offer(a: &mut ActiveSeq) {
+/// drafts off); a long one only as far as its lone verify may hold
+/// `lone_cap` drafts now.
+pub(super) fn offer(a: &mut ActiveSeq, lone_cap: usize) {
     if let Some(s) = settings() {
-        offer_with(a, s);
+        offer_with(a, &s.lone(lone_cap));
     }
 }
 

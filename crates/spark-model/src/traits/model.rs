@@ -519,6 +519,15 @@ pub trait Model: Send + Sync {
         usize::MAX
     }
 
+    /// Drafts a LONE verify (one sequence's, not batched) by the sequence in
+    /// slot `slot_idx` may hold right now. Past its own slot's capacity only
+    /// with long copies on (`speculative::long_copy`), while the rows it
+    /// borrows from idle slots are free (`model::ssm_borrow`); a claim since
+    /// shrinks it back. Default: the slot's own capacity.
+    fn lone_verify_draft_capacity(&self, slot_idx: usize) -> usize {
+        self.mtp_slot_draft_capacity(slot_idx)
+    }
+
     /// Number of decode-rollback SSM snapshot slots reserved **per
     /// active sequence** (Phase-C). The scheduler's per-sequence
     /// snapshot ring is sized from this. `0` (the default) means the

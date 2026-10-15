@@ -302,10 +302,10 @@ impl TransformerModel {
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let ctx_slot_bytes = self.dflash_capture_layers.len() * h * bf16;
-        let kmax = self.dflash_hidden_save_rows;
+        let kmax = self.dflash_front_rows;
         debug_assert!(
             k <= kmax,
-            "try_dflash_capture_all: k={k} exceeds dflash_hidden_save_rows={kmax}"
+            "try_dflash_capture_all: k={k} exceeds dflash_front_rows={kmax}"
         );
         self.dflash_capture_rows(
             0,

@@ -324,6 +324,9 @@ pub struct TransformerModel {
     pub(super) dflash_hidden_save_rows: usize,
     /// How many sequences the capture buffer is strided for (1 = C=1 layout).
     pub(super) dflash_hidden_save_nseq: usize,
+    /// Rows a lone (C=1) verify may capture at the buffer's front: one
+    /// region, or a long copy's rows (`speculative::long_copy::front_rows`).
+    pub(super) dflash_front_rows: usize,
     /// Cached CUDA graphs for K=2 verification, **keyed by `seq.slot_idx`**.
     /// Same rationale as `decode_graph`: the captured graph has SSM
     /// h_state/conv_state pointers baked in as kernel arguments, so replay for

@@ -374,6 +374,11 @@ impl TransformerModel {
         } else {
             max_batch_size.max(1)
         };
+        let dflash_front_rows = crate::speculative::long_copy::front_rows(
+            crate::speculative::long_copy::drafts(),
+            dflash_hidden_save_rows,
+            dflash_hidden_save_nseq,
+        );
         let dflash_hidden_save = if dflash_capture_layers.is_empty() {
             None
         } else {
@@ -716,6 +721,7 @@ impl TransformerModel {
             dflash_hidden_save,
             dflash_hidden_save_rows,
             dflash_hidden_save_nseq,
+            dflash_front_rows,
             dflash_capture_layers,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),

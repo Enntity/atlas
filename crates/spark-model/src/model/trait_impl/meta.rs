@@ -313,6 +313,7 @@ impl TransformerModel {
         // Zero SSM states for the new sequence.
         // Synchronous reset: memset + stream sync ensures zero is visible
         // before any subsequent kernel reads the state.
+        self.fence_lent_rows()?;
         self.ssm_pool.reset_slot(slot, self.gpu.as_ref())?;
         // Double-check: explicit sync to guarantee zero is complete
         self.gpu.synchronize(self.gpu.default_stream())?;
@@ -336,7 +337,7 @@ impl TransformerModel {
                 dspark_owner,
                 0,
                 0,
-                self.dflash_hidden_save_rows,
+                self.dflash_front_rows,
                 dstate.ctx_slot_bytes,
             )?);
         }

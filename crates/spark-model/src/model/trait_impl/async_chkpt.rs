@@ -283,6 +283,7 @@ impl TransformerModel {
             );
             let stream = self.secondary_stream;
             self.commit_kda_records_with_leaf(seq, num_accepted, k, stream)?;
+            self.release_verify_rows(seq)?;
             self.gpu.record_event(self.secondary_event, stream)?;
             return Ok(());
         }
@@ -386,7 +387,6 @@ impl TransformerModel {
         // Pointer pairs only (src = records, dst = h_state): `bytes: 1`
         // lets the strided-run check see addresses, not blob widths.
         let mut commits = Vec::new();
-        let mut ssm_layer_idx = 0usize;
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) != LayerType::LinearAttention {
                 continue;
@@ -395,8 +395,10 @@ impl TransformerModel {
                 .as_any_mut()
                 .downcast_mut::<SsmLayerState>()
                 .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {i}"))?;
+            // The verify's own rows: its slot's, or a long verify's borrowed
+            // window (`ssm_borrow`), whose conv snapshots `rows` must reach.
             anyhow::ensure!(
-                !ssm.kda_records.is_null() && rows.end <= self.ssm_pool.num_intermediates,
+                !ssm.kda_records.is_null() && rows.end <= ssm.conv_state_intermediates.len(),
                 "KDA records commit: layer {i} has no records for {} rows",
                 rows.end
             );
@@ -409,14 +411,11 @@ impl TransformerModel {
             });
             if rewind_conv {
                 conv_plan.push(StateCopy {
-                    src: self
-                        .ssm_pool
-                        .conv_intermediate(ssm_layer_idx, seq.slot_idx, rows.end - 1),
+                    src: ssm.conv_state_intermediates[rows.end - 1],
                     dst: ssm.conv_state,
                     bytes: conv_bytes,
                 });
             }
-            ssm_layer_idx += 1;
         }
         let launch = |c: &StateCopy, state_pitch: usize, records_pitch: usize, layers: usize| {
             anyhow::ensure!(

@@ -161,3 +161,23 @@ fn a_long_copy_kept_in_part_rolls_back_to_the_accepted_prefix() {
         ([2, 0], [15, 0], [9, 0], true)
     );
 }
+
+#[test]
+fn a_long_copy_needs_the_rows_its_lone_verify_may_hold_now() {
+    // `Model::lone_verify_draft_capacity`: 31 alone, DFlash2's 7 once another
+    // sequence holds the rows a long verify borrows.
+    let s = long_on(31);
+    assert_eq!(s.lone(31), s);
+    assert_eq!(s.lone(15).long_max, 15);
+    assert_eq!(s.lone(MAX_DRAFTS).long_max, 0);
+    assert_eq!(long_on(0).lone(31).long_max, 0);
+    let (prompt, reply) = reemit(5);
+    let offered = |cap| {
+        let mut a = seq(&prompt, &reply, &[1; 7]);
+        a.spec_adapt.copy.rounds = [1, 0];
+        offer_with(&mut a, &s.lone(cap));
+        a.pending_drafts
+    };
+    assert_eq!(offered(31), (105..136).collect::<Vec<_>>());
+    assert_eq!(offered(MAX_DRAFTS), (105..112).collect::<Vec<_>>());
+}

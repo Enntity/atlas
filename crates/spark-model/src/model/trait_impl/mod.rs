@@ -384,6 +384,9 @@ impl Model for TransformerModel {
     fn mtp_slot_draft_capacity(&self, slot_idx: usize) -> usize {
         self.ssm_pool.verify_draft_capacity(slot_idx)
     }
+    fn lone_verify_draft_capacity(&self, slot_idx: usize) -> usize {
+        self.lone_verify_draft_capacity_dispatch(slot_idx)
+    }
     fn decode_rollback_ring_slots(&self) -> usize {
         if self.ssm_snapshots.decode_rollback_enabled() {
             self.ssm_snapshots.decode_ring_slots
@@ -633,6 +636,7 @@ impl Model for TransformerModel {
         // were staged for (`glm_verify_masks`).
         let allow = self.take_verify_row_masks(tokens.len())?;
         self.ssm_pool.require_verify_rollback_supported()?;
+        self.prepare_verify_rows(seq, tokens.len())?;
         self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)
     }
     fn decode_and_verify_fused(

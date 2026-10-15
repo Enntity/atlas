@@ -46,16 +46,17 @@ pub(super) fn try_fused_chunk(
     if !enabled() || !spec.dflash_verify_raw_argmax {
         return false;
     }
-    active
-        .iter_mut()
-        .for_each(crate::scheduler::copy_drafts::offer);
+    for a in active.iter_mut() {
+        let cap = model.lone_verify_draft_capacity(a.seq.slot_idx);
+        crate::scheduler::copy_drafts::offer(a, cap);
+    }
     // `mtp_step`'s owner-batched width rule over the owners holding drafts.
     let eligible = |a: &ActiveSeq| a.grammar_state.is_none() && !a.finished;
     let lens: Vec<usize> = active
         .iter()
         .filter(|a| eligible(a))
         // A long copy (`copy_drafts`) rides at most DFlash2's block.
-        .map(|a| crate::scheduler::copy_drafts::ride_len(a))
+        .map(crate::scheduler::copy_drafts::ride_len)
         .filter(|&len| len > 0)
         .collect();
     let Some(width) = lens

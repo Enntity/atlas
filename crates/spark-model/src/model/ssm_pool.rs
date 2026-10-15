@@ -110,6 +110,10 @@ pub(crate) struct SsmStatePool {
     pub(super) kda_record_pools: Vec<DevicePtr>,
     pub(super) kda_record_row_bytes: usize,
     pub(super) free_slots: Mutex<Vec<usize>>,
+    /// A verify borrowed other slots' rows (`ssm_borrow`) and its commit may
+    /// still be in flight on the secondary stream; the next slot reset waits
+    /// for it first.
+    pub(super) rows_lent: std::sync::atomic::AtomicBool,
 }
 
 /// Prefix-sum layout for tiered per-slot H intermediates: returns
@@ -387,6 +391,7 @@ impl SsmStatePool {
             kda_record_pools,
             kda_record_row_bytes,
             free_slots: Mutex::new(free_slots),
+            rows_lent: Default::default(),
         })
     }
 
@@ -1237,6 +1242,7 @@ mod slot_guard_tests {
             kda_record_pools: Vec::new(),
             kda_record_row_bytes: 0,
             free_slots: Mutex::new((0..max_slots).rev().collect()),
+            rows_lent: Default::default(),
         })
     }
 

@@ -160,7 +160,8 @@ pub fn step_mtp(
                         late_dflash.push(idx);
                         continue;
                     }
-                    crate::scheduler::copy_drafts::offer(a);
+                    let cap = model.lone_verify_draft_capacity(a.seq.slot_idx);
+                    crate::scheduler::copy_drafts::offer(a, cap);
                     let (mut init, mut conf) = a.take_drafts();
                     // A long copy (`copy_drafts`) is priced and capped as
                     // in Phase B; DFlash2's own block verifies whole here.
@@ -438,7 +439,8 @@ pub fn step_mtp(
     // Copy drafts (`ATLAS_DFLASH_COPY_DRAFTS`) before any width is chosen.
     if dflash_verify_raw_argmax {
         for &idx in &verify_idxs {
-            crate::scheduler::copy_drafts::offer(&mut active[idx]);
+            let cap = model.lone_verify_draft_capacity(active[idx].seq.slot_idx);
+            crate::scheduler::copy_drafts::offer(&mut active[idx], cap);
         }
     }
 

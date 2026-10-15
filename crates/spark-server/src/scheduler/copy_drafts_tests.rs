@@ -288,7 +288,7 @@ fn offer_is_a_no_op_with_copy_drafts_off() {
     }
     let prompt = [10, 11, 12, 13, 14, 15];
     let mut a = seq(&prompt, &[12, 13, 14], &[40, 41]);
-    offer(&mut a);
+    offer(&mut a, usize::MAX);
     assert_eq!(a.pending_drafts, [40, 41]);
     assert_eq!(a.draft_conf(), [-0.5; 2]);
     assert!(a.spec_adapt.copy.index.is_none());

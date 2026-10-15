@@ -4,14 +4,15 @@
 //! `ATLAS_DFLASH_COPY_LONG_MAX`).
 //!
 //! A copy of the prompt may propose more drafts than the DFlash drafter's
-//! block (γ − 1). Off (the default) nothing here changes a size. On, every
-//! pool a lone DFlash verify writes per row is sized for `long + 1` rows
-//! instead of γ: the SSM verify intermediates and the preflight reserve
-//! (`dspark_pool::dflash_verify_rows`, `ssm_reserve`), the DFlash hidden-save
-//! rows and the proposer's capture lifecycle (both from the same row count),
-//! and the GLM KDA layers' FFN takes the exact grouped prefill MoE for the
-//! wider block (`glm_independent::ffn_rows_selected`) instead of the per-token
-//! loop. The drafter's own block stays γ.
+//! block (γ − 1). Off (the default) nothing here changes a size or a
+//! decision. On, no pool grows either: only a lone owner verifies a long
+//! copy, so its rows past γ are borrowed from the idle slots' verify rows
+//! (`model::ssm_borrow`, KDA records) and the DFlash hidden-save regions
+//! ([`front_rows`]), and the scheduler verifies past γ only as far as those
+//! hold right now (`Model::lone_verify_draft_capacity`). The GLM KDA layers'
+//! FFN takes the exact grouped prefill MoE for the wider block
+//! (`glm_independent::ffn_rows_selected`) instead of the per-token loop. The
+//! drafter's own block stays γ.
 
 use std::sync::OnceLock;
 
@@ -33,6 +34,20 @@ pub fn parse_drafts(var: impl Fn(&str) -> Option<String>) -> usize {
         .and_then(|v| v.trim().parse().ok())
         .filter(|v| (8..=MAX_LONG_COPY_DRAFTS).contains(v))
         .unwrap_or(0)
+}
+
+/// Rows a lone verify's DFlash capture may hold at the front of the
+/// hidden-save buffer: one sequence region of `region_rows` (γ), or with
+/// long copies on (`long` drafts) up to `long + 1` rows running on into the
+/// next of the `regions` sequence regions, which hold only scratch while
+/// one sequence is live. Never past them into the preserve region.
+pub fn front_rows(long: usize, region_rows: usize, regions: usize) -> usize {
+    if long == 0 {
+        return region_rows;
+    }
+    (long + 1)
+        .min(region_rows.saturating_mul(regions))
+        .max(region_rows)
 }
 
 /// [`parse_drafts`] of the process environment, read once.
@@ -73,5 +88,17 @@ mod tests {
         for bad in ["7", "32", "x", ""] {
             assert_eq!(env(&[copies, conf, ("ATLAS_DFLASH_COPY_LONG_MAX", bad)]), 0);
         }
+    }
+
+    #[test]
+    fn the_front_borrows_sequence_regions_only_with_long_copies_on() {
+        // Off: one region, as shipped (γ = 8 rows, 4 sequences).
+        assert_eq!(front_rows(0, 8, 4), 8);
+        // On: the long verify's rows, within the four sequence regions.
+        assert_eq!(front_rows(15, 8, 4), 16);
+        assert_eq!(front_rows(31, 8, 4), 32);
+        // One sequence region only (C=1): no rows to borrow.
+        assert_eq!(front_rows(31, 8, 1), 8);
+        assert_eq!(front_rows(31, 8, 2), 16);
     }
 }
