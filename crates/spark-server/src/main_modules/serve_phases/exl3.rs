@@ -23,7 +23,7 @@ pub(super) fn parallelism_supported(
     ep: usize,
 ) -> Option<bool> {
     (crate::main_modules::serve::canonicalize_model_quant(config) == "exl3")
-        .then_some(tp > 0 && world == tp && ep == 1)
+        .then_some(tp == 2 && world == tp && ep == 1)
 }
 
 pub(super) fn load(
@@ -97,11 +97,12 @@ mod tests {
         );
         for (world, tp, ep, expected) in [
             (2, 2, 1, true),
-            (1, 1, 1, true),
+            (1, 1, 1, false),
             (2, 1, 1, false),
             (1, 2, 1, false),
             (2, 2, 2, false),
             (0, 0, 1, false),
+            (4, 4, 1, false),
         ] {
             assert_eq!(
                 parallelism_supported(&config, world, tp, ep),

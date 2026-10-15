@@ -37,10 +37,13 @@ pub(super) fn load(
     world: usize,
 ) -> Result<(String, BTreeMap<EntryKey, FixtureEntry>)> {
     let manifest_path = fixture_root.join(MANIFEST_NAME);
+    tracing::info!(target: "norm_sub", "loading manifest from {}", manifest_path.display());
     let raw = std::fs::read(&manifest_path)
         .with_context(|| format!("norm substitution manifest {}", manifest_path.display()))?;
+    tracing::trace!(target: "norm_sub", "manifest raw size: {} bytes", raw.len());
     let manifest: Manifest = serde_json::from_slice(&raw)
         .context("norm substitution manifest is not valid JSON for its schema")?;
+    tracing::debug!(target: "norm_sub", "manifest schema={} variant={} entries={}", manifest.schema, manifest.variant, manifest.entries.len());
     ensure!(
         manifest.schema == MANIFEST_SCHEMA,
         "norm substitution manifest schema mismatch: {:?}",
@@ -57,9 +60,11 @@ pub(super) fn load(
             && is_sha256_hex(&manifest.source.schedule_sha256),
         "norm substitution manifest source invalid"
     );
+    tracing::debug!(target: "norm_sub", "source capture_root={} engine={} schedule_sha256={}", manifest.source.capture_root, manifest.source.engine, manifest.source.schedule_sha256);
     let mut entries = BTreeMap::new();
     let mut keys = BTreeSet::new();
     for entry in &manifest.entries {
+        tracing::trace!(target: "norm_sub", "validating entry: layer={} tp_rank={} tp_world={} invocation={} stage={} tensor={} dtype={} shape={:?} file={} sha256={}", entry.layer, entry.tp_rank, entry.tp_world, entry.invocation, entry.stage, entry.tensor, entry.dtype, entry.shape, entry.file, entry.sha256);
         ensure!(
             entry.layer == 0,
             "norm substitution entry layer must be 0 (assumption A12), got {}",
@@ -110,6 +115,7 @@ pub(super) fn load(
         let payload_path = fixture_root.join(&entry.file);
         let bytes = std::fs::read(&payload_path)
             .with_context(|| format!("norm substitution payload {}", payload_path.display()))?;
+        tracing::trace!(target: "norm_sub", "read payload {}: {} bytes", entry.file, bytes.len());
         let expected = entry
             .shape
             .iter()
@@ -139,6 +145,7 @@ pub(super) fn load(
             },
         );
     }
+    tracing::info!(target: "norm_sub", "manifest loaded: variant={} entries={}", manifest.variant, entries.len());
     Ok((manifest.variant, entries))
 }
 

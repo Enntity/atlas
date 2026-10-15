@@ -67,6 +67,7 @@ fn hc_boundary_binding(facts: &HcBoundaryFacts) -> Result<serde_json::Value> {
 pub(super) struct UpstreamTrace(Exl3FfnRouter);
 impl UpstreamTrace {
     pub(super) fn from_env(config: &ModelConfig, layer: usize) -> Result<Option<Self>> {
+        tracing::trace!(target: "upstream", "from_env: layer={} tp_rank={} tp_world_size={}", layer, config.tp_rank, config.tp_world_size);
         let router = Exl3FfnRouter::from_env_named(
             layer,
             config.num_hidden_layers,
@@ -77,12 +78,17 @@ impl UpstreamTrace {
         )?
         .map(Self);
         if router.is_some() {
+            tracing::info!(target: "upstream", "from_env: upstream capture enabled for layer={}", layer);
             ensure_supported_layer(layer)?;
+        } else {
+            tracing::debug!(target: "upstream", "from_env: upstream capture disabled for layer={}", layer);
         }
         Ok(router)
     }
     pub(super) fn begin(&self) -> Result<Option<usize>> {
-        self.0.begin()
+        let result = self.0.begin();
+        tracing::trace!(target: "upstream", "begin: invocation={:?}", result);
+        result
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn capture_gated_norm_binding(
@@ -98,8 +104,10 @@ impl UpstreamTrace {
         stream: u64,
     ) -> Result<()> {
         let Some(invocation) = invocation else {
+            tracing::trace!(target: "upstream", "capture_gated_norm_binding: no invocation, skipping");
             return Ok(());
         };
+        tracing::debug!(target: "upstream", "capture_gated_norm_binding: invocation={} tokens={} heads={} dim={} eps={} kernel={}", invocation, tokens, heads, dim, eps, kernel.0);
         ensure!(
             eps.is_finite() && eps > 0.0,
             "gated norm binding epsilon invalid"
@@ -113,6 +121,7 @@ impl UpstreamTrace {
             "gated norm binding grid overflow"
         );
         let (grid, block) = ops::kda_sigmoid_gated_norm_launch_dims(tokens, heads);
+        tracing::trace!(target: "upstream", "capture_gated_norm_binding: grid={:?} block={:?}", grid, block);
         self.0.capture_with_metadata(
             gpu,
             invocation,
@@ -156,8 +165,10 @@ impl UpstreamTrace {
         stream: u64,
     ) -> Result<()> {
         let Some(invocation) = invocation else {
+            tracing::trace!(target: "upstream", "capture: no invocation, skipping stage={}", stage);
             return Ok(());
         };
+        tracing::trace!(target: "upstream", "capture: invocation={} stage={} tensors={}", invocation, stage, tensors.len());
         self.0
             .capture(gpu, invocation, stage, &Self::specs(tensors), stream)
     }
@@ -174,9 +185,12 @@ impl UpstreamTrace {
         facts: &HcBoundaryFacts,
     ) -> Result<()> {
         let Some(invocation) = invocation else {
+            tracing::trace!(target: "upstream", "capture_boundary: no invocation, skipping stage={}", stage);
             return Ok(());
         };
+        tracing::debug!(target: "upstream", "capture_boundary: invocation={} stage={} rows={} hc_mult={} sinkhorn_iters={} hc_eps={} rms_eps={} residual_precision={:?} request_id={:?}", invocation, stage, facts.rows, facts.hc_mult, facts.sinkhorn_iters, facts.hc_eps, facts.rms_eps, facts.residual_precision, facts.request_id);
         let binding = hc_boundary_binding(facts)?;
+        tracing::trace!(target: "upstream", "capture_boundary: tensors={}", tensors.len());
         self.0.capture_with_metadata(
             gpu,
             invocation,
@@ -196,6 +210,7 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        tracing::trace!(target: "upstream", "capture_upstream: layer={} invocation={:?} stage={} tensors={} upstream_trace={}", self.layer_idx, invocation, stage, tensors.len(), self.upstream_trace.is_some());
         if let Some(trace) = &self.upstream_trace {
             trace.capture(invocation, ctx.gpu, stage, tensors, stream)?;
         }
@@ -214,8 +229,10 @@ impl Glm5KdaLayer {
         stream: u64,
     ) -> Result<()> {
         let Some(trace) = &self.upstream_trace else {
+            tracing::trace!(target: "upstream", "capture_upstream_hc: no upstream trace for layer={}", self.layer_idx);
             return Ok(());
         };
+        tracing::debug!(target: "upstream", "capture_upstream_hc: layer={} invocation={:?} stage={} rows={} local_rows={} hidden_size={} hc_mult={} request_id={:?}", self.layer_idx, invocation, stage, rows, local_rows, self.hidden_size, self.hc.hc_mult, ctx.request_id);
         let facts = HcBoundaryFacts {
             rows: local_rows as usize,
             hc_mult: self.hc.hc_mult,

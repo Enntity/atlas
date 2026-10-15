@@ -132,17 +132,19 @@ impl NormSubstitution {
     /// the load.
     pub fn from_env(rank: usize, world: usize) -> Result<Option<Self>> {
         let Some(dir) = nonempty_var(ENV_SUBSTITUTE_DIR) else {
-            // Off: the record directory is never read.
+            tracing::debug!(target: "norm_sub", "from_env: {ENV_SUBSTITUTE_DIR} not set, knob off");
             return Ok(None);
         };
+        tracing::info!(target: "norm_sub", "from_env: {ENV_SUBSTITUTE_DIR}={:?} world={} rank={}", dir, world, rank);
         for flag in GRAPH_FLAGS {
-            ensure!(
-                std::env::var(flag).as_deref() == Ok("1"),
-                "{ENV_SUBSTITUTE_DIR} requires {flag}=1"
-            );
+            let var = std::env::var(flag);
+            let val = var.as_deref().unwrap_or("");
+            tracing::trace!(target: "norm_sub", "checking graph interlock: {flag}={:?}", val);
+            ensure!(val == "1", "{ENV_SUBSTITUTE_DIR} requires {flag}=1");
         }
         let record_dir = nonempty_var(ENV_RECORD_DIR)
             .with_context(|| format!("{ENV_SUBSTITUTE_DIR} requires explicit {ENV_RECORD_DIR}"))?;
+        tracing::info!(target: "norm_sub", "record_dir={:?}", record_dir);
         Self::load(&dir, &record_dir, rank, world).map(Some)
     }
 
@@ -154,6 +156,7 @@ impl NormSubstitution {
     /// path components, so a shared name prefix like `/x/foo` vs
     /// `/x/foobar` stays legal).
     pub fn load(dir: &Path, record_dir: &Path, rank: usize, world: usize) -> Result<Self> {
+        tracing::debug!(target: "norm_sub", "load: dir={:?} record_dir={:?} rank={} world={}", dir, record_dir, rank, world);
         ensure!(
             world > 0 && rank < world,
             "norm substitution topology invalid"
@@ -161,12 +164,14 @@ impl NormSubstitution {
         let fixture_root = dir
             .canonicalize()
             .with_context(|| format!("norm substitution fixture directory {}", dir.display()))?;
+        tracing::trace!(target: "norm_sub", "fixture_root canonicalized: {:?}", fixture_root);
         let records_root = record_dir.canonicalize().with_context(|| {
             format!(
                 "norm substitution record directory {} (must already exist)",
                 record_dir.display()
             )
         })?;
+        tracing::trace!(target: "norm_sub", "records_root canonicalized: {:?}", records_root);
         ensure!(
             !records_root.starts_with(&fixture_root),
             "norm substitution record directory must not be the fixture directory \
@@ -174,6 +179,7 @@ impl NormSubstitution {
         );
         let (variant, entries) = manifest::load(&fixture_root, world)?;
         let records = Exl3FfnRouter::new(record_dir.to_path_buf(), 0, rank, world)?;
+        tracing::info!(target: "norm_sub", "load complete: variant={} entries={} rank={}", variant, entries.len(), rank);
         Ok(Self {
             variant,
             entries,
@@ -200,11 +206,13 @@ impl NormSubstitution {
         request_id: Option<&str>,
         stream: u64,
     ) -> Result<Option<PendingSubstitution<'_>>> {
+        tracing::trace!(target: "norm_sub", "substitute: layer={} rank={} shape={:?} dtype={:?} request_id={:?}", layer, self.rank, shape, dtype, request_id);
         if layer != 0 {
-            // A12: later layers are unchanged by this experiment.
+            tracing::trace!(target: "norm_sub", "substitute: layer != 0, skipping (A12)");
             return Ok(None);
         }
         let invocation = self.sequence.fetch_add(1, Ordering::SeqCst);
+        tracing::debug!(target: "norm_sub", "substitute: invocation={} rank={}", invocation, self.rank);
         let key = (0usize, self.rank, invocation, TENSOR.to_string());
         let entry = self.entries.get(&key).with_context(|| {
             format!(
@@ -212,8 +220,10 @@ impl NormSubstitution {
                 self.rank
             )
         })?;
+        tracing::trace!(target: "norm_sub", "substitute: entry request_id={:?} shape={:?} dtype={} file={} sha256={}", entry.request_id, entry.shape, entry.dtype, entry.file, entry.sha256);
         let bound = request_id
             .context("norm substitution requires the ForwardContext request-id binding")?;
+        tracing::trace!(target: "norm_sub", "substitute: bound request_id={:?}", bound);
         ensure!(
             bound == entry.request_id,
             "norm substitution request-id mismatch: live {bound:?}, fixture {:?}",
@@ -231,11 +241,15 @@ impl NormSubstitution {
             entry.dtype
         );
         let mut pre = vec![0u8; entry.bytes.len()];
+        tracing::trace!(target: "norm_sub", "substitute: D2H pre-image readback {} bytes", entry.bytes.len());
         gpu.copy_d2h_on_stream(gated, &mut pre, stream)
             .context("norm substitution pre-image readback")?;
         let pre_sha256 = hex_sha256(&pre);
+        tracing::trace!(target: "norm_sub", "substitute: pre_sha256={}", pre_sha256);
+        tracing::trace!(target: "norm_sub", "substitute: H2D fixture upload {} bytes", entry.bytes.len());
         gpu.copy_h2d_async(&entry.bytes, gated, stream)
             .context("norm substitution fixture upload")?;
+        tracing::debug!(target: "norm_sub", "substitute: completed invocation={} pre_sha256={}", invocation, pre_sha256);
         Ok(Some(PendingSubstitution {
             records: &self.records,
             invocation,
@@ -272,16 +286,22 @@ pub fn engage<'a>(
     request_id: Option<&str>,
     stream: u64,
 ) -> Result<Option<PendingSubstitution<'a>>> {
+    tracing::trace!(target: "norm_sub", "engage: layer={} shape={:?} dtype={:?} request_id={:?} substitution={}", layer, shape, dtype, request_id, substitution.is_some());
     match substitution {
         Some(s) => s.substitute(gpu, layer, gated, dtype, shape, request_id, stream),
-        None => Ok(None),
+        None => {
+            tracing::trace!(target: "norm_sub", "engage: substitution disabled");
+            Ok(None)
+        }
     }
 }
 
 fn nonempty_var(key: &str) -> Option<PathBuf> {
-    std::env::var_os(key)
+    let val = std::env::var_os(key)
         .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+        .map(PathBuf::from);
+    tracing::trace!(target: "norm_sub", "nonempty_var: {key}={:?}", val);
+    val
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {

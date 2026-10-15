@@ -167,7 +167,7 @@ pub(crate) fn preflight_reserve(
                 .unwrap_or_else(|| {
                     glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size)
                 }),
-            "GLM-5 EXL3 requires --world-size == --tp-size > 0 and --ep-size 1; legacy dual-Spark support requires --world-size 2 --ep-size 2 and --tp-size 1 or 2"
+            "GLM-5 EXL3 requires --world-size == --tp-size == 2 and --ep-size 1; legacy dual-Spark support requires --world-size 2 --ep-size 2 and --tp-size 1 or 2"
         );
     }
     let h_state_bytes = config.ssm_h_state_bytes();

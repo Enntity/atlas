@@ -61,7 +61,12 @@ impl StopStringWatch {
         decode: Arc<StopDecodeFn>,
     ) -> Option<Self> {
         let stops: Vec<String> = stops.iter().filter(|s| !s.is_empty()).cloned().collect();
+        if stops.is_empty() {
+            tracing::trace!(target: "stop_match", "StopStringWatch: no non-empty stop strings, returning None");
+            return None;
+        }
         let max_len = stops.iter().map(String::len).max()?;
+        tracing::debug!(target: "stop_match", "StopStringWatch: new stops={:?} min_tokens={} max_len={} lookback_tokens={}", stops, min_tokens, max_len, max_len + WATCH_LOOKBACK_MARGIN);
         Some(Self {
             stops,
             decode,
@@ -82,21 +87,26 @@ impl StopStringWatch {
     /// `output_tokens` (rollback re-steer) is tolerated.
     pub(crate) fn observe(&mut self, output_tokens: &[u32], inside_thinking: bool) -> bool {
         if self.hit {
+            tracing::trace!(target: "stop_match", "observe: already hit, returning true");
             return true;
         }
         let len = output_tokens.len();
+        tracing::trace!(target: "stop_match", "observe: len={} scanned={} content_start={} inside_thinking={} min_tokens={}", len, self.scanned, self.content_start, inside_thinking, self.min_tokens);
         self.scanned = self.scanned.min(len);
         self.content_start = self.content_start.min(len);
         if inside_thinking {
+            tracing::trace!(target: "stop_match", "observe: inside_thinking=true, skipping content");
             self.scanned = len;
             self.content_start = len;
             return false;
         }
         if len == self.scanned {
+            tracing::trace!(target: "stop_match", "observe: no new tokens");
             return false;
         }
         if len <= self.min_tokens {
             // Every token so far is within `min_tokens`: nothing can match.
+            tracing::trace!(target: "stop_match", "observe: len <= min_tokens, skipping");
             self.scanned = len;
             return false;
         }
@@ -111,7 +121,9 @@ impl StopStringWatch {
         } else {
             0
         };
-        self.hit = find_stop_hit(&text, 0, floor, &self.stops).is_some();
+        let hit = find_stop_hit(&text, 0, floor, &self.stops).is_some();
+        self.hit = hit;
+        tracing::debug!(target: "stop_match", "observe: start={} text_len={} floor={} hit={} text={:?}", start, text.len(), floor, hit, text);
         self.hit
     }
 }

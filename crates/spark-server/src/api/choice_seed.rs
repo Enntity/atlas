@@ -34,10 +34,15 @@ fn splitmix64_mix(mut z: u64) -> u64 {
 /// seeded with `seed`: distinct for distinct `i` (the mix is a bijection) and
 /// far from `seed` and from each other.
 pub(crate) fn choice_seed(seed: u64, index: u64) -> u64 {
+    tracing::trace!(target: "choice_seed", "choice_seed: seed={} index={}", seed, index);
     if index == 0 {
+        tracing::trace!(target: "choice_seed", "choice_seed: index=0, returning seed={}", seed);
         return seed;
     }
-    splitmix64_mix(seed.wrapping_add(index.wrapping_mul(GOLDEN_GAMMA)))
+    let mixed = seed.wrapping_add(index.wrapping_mul(GOLDEN_GAMMA));
+    let result = splitmix64_mix(mixed);
+    tracing::trace!(target: "choice_seed", "choice_seed: index={} mixed={:#x} result={:#x}", index, mixed, result);
+    result
 }
 
 #[cfg(test)]

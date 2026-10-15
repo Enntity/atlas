@@ -1,1 +1,77 @@
-../../deepseek-v4-flash/nvfp4/KERNEL.toml
+# EXL3 native kernel target for GLM-5.3-Flash-EXL3
+[build]
+extra_nvcc_flags = ["--fmad=false"]
+
+# Module name overrides — file stem → module name
+# Unlisted .cu files use their file stem as the module name.
+[modules]
+exl3_linear_mma = "exl3_linear_mma"
+exl3_mhc = "exl3_mhc"
+exl3_moe = "exl3_moe"
+exl3_moe_mma = "exl3_moe_mma"
+exl3_moe_precision = "exl3_moe_precision"
+exl3_shared = "exl3_shared"
+
+# Native mHC sigmoid libdevice arithmetic requires contraction.
+# Other EXL3 modules preserve the common --fmad=false policy.
+[build.module_nvcc_flags]
+exl3_mhc = ["--fmad=true"]
+
+# Shadow-exempt kernels: these are optional entry points that may be
+# dropped by a model shadow without being a build warning.
+# EXL3 currently has no optional entry points — all kernels are required
+# for the GLM-5.3 EXL3 execution path.
+[shadow_exempt]
+
+# Expected-absent kernels: lookups the model's dispatch may issue and fail
+# to resolve WITHOUT that being a boot-time error. Each entry requires a
+# stated reason. EXL3 does not inherit DeepSeek NVFP4 kernels — it has its
+# own kernel set. These are the legacy NVFP4/quant families that are NOT
+# part of EXL3 and should not be looked up.
+[expected_absent.nvfp4_mmq]
+atlas_nvfp4_mmq128_nc = "NVFP4 MMQ family — not part of EXL3 kernel set"
+atlas_nvfp4_mmq128_wc = "NVFP4 MMQ family — not part of EXL3 kernel set"
+atlas_nvfp4_mmq16_nc = "NVFP4 MMQ family — not part of EXL3 kernel set"
+atlas_nvfp4_mmq16_wc = "NVFP4 MMQ family — not part of EXL3 kernel set"
+atlas_nvfp4_mmq32_nc = "NVFP4 MMQ family — not part of EXL3 kernel set"
+atlas_nvfp4_mmq32_wc = "NVFP4 MMQ family — not part of EXL3 kernel set"
+atlas_nvfp4_mmq64_nc = "NVFP4 MMQ family — not part of EXL3 kernel set"
+atlas_nvfp4_mmq64_wc = "NVFP4 MMQ family — not part of EXL3 kernel set"
+atlas_nvfp4_quantize_bf16 = "NVFP4 MMQ helper — not part of EXL3 kernel set"
+atlas_nvfp4_repack = "NVFP4 MMQ helper — not part of EXL3 kernel set"
+atlas_nvfp4_scale_bf16 = "NVFP4 MMQ helper — not part of EXL3 kernel set"
+atlas_nvfp4_silu_mul_quant = "NVFP4 MMQ helper — not part of EXL3 kernel set"
+atlas_nvfp4_silu_mul_scaled = "NVFP4 MMQ helper — not part of EXL3 kernel set"
+
+[expected_absent.q4k_mmq]
+atlas_q4k_mmq128_nc = "Q4_K MMQ family — not part of EXL3 kernel set"
+atlas_q4k_mmq128_wc = "Q4_K MMQ family — not part of EXL3 kernel set"
+atlas_q8_1_quantize_ds4_bf16 = "Q4_K helper — not part of EXL3 kernel set"
+
+[expected_absent.q4k_quantize]
+q4k_quantize = "Q4_K helper — not part of EXL3 kernel set"
+
+[expected_absent.w4a16]
+int8_gemm_faith2 = "W4A16 INT8 arm — not part of EXL3 kernel set"
+int8_gemm_i32acc = "W4A16 INT8 arm — not part of EXL3 kernel set"
+requant_a_bf16_int8 = "W4A16 INT8 helper — not part of EXL3 kernel set"
+requant_w_nvfp4_int8 = "W4A16 INT8 helper — not part of EXL3 kernel set"
+w4a16_gemm_t_k64_n64_p3 = "W4A16 arm — not part of EXL3 kernel set"
+w4a16_gemm_t_k64_p3 = "W4A16 arm — not part of EXL3 kernel set"
+w4a16_gemm_t_m128_bf16 = "W4A16 arm — not part of EXL3 kernel set"
+w4a16_gemm_t_m128_bf16_v2 = "W4A16 arm — not part of EXL3 kernel set"
+w4a16_gemm_t_p3 = "W4A16 arm — not part of EXL3 kernel set"
+
+[expected_absent.w4a4]
+w4a4_gemm = "W4A4 arm — not part of EXL3 kernel set"
+
+[expected_absent.inferspark_prefill_512tc]
+inferspark_prefill_512tc = "DeepSeek MLA helper — not part of EXL3 kernel set"
+
+[expected_absent.moe_silu_mul]
+silu_mul_quant_fp8 = "FP8 fused MoE helper — not part of EXL3 kernel set"
+
+[expected_absent.moe_w4a16]
+moe_w4a16_fused_gate_up_t_k64_fp4 = "FP4 fused MoE arm — not part of EXL3 kernel set"
+moe_w4a16_fused_gate_up_t_k64_m128 = "FP4 fused MoE arm — not part of EXL3 kernel set"
+moe_w4a16_down_t_k64_fp4 = "FP4 fused MoE arm — not part of EXL3 kernel set"
