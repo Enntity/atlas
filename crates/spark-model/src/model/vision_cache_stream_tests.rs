@@ -131,3 +131,22 @@ fn every_tower_encodes_per_chunk_not_at_admission() {
     assert_eq!(f.seq.vision.rows_encoded, 0, "nothing encoded at admission");
     assert!(f.order().is_empty(), "no encoder launch at admission");
 }
+
+#[test]
+fn every_tower_keys_its_vision_prompts_for_the_prefix_cache() {
+    // The key is content hashes over the placeholder runs, and both MRoPE
+    // walkers position a prefill that starts after a cached image from the
+    // whole prompt: nothing about it is GLM's. A Qwen image prompt was
+    // uncached (every turn of a 75K-token conversation re-prefilled ~22 s).
+    let (mut f, tokens) = staged();
+    let mut qwen = test_tower::config();
+    qwen.is_glm5_next = false;
+    f.model.config.vision = Some(qwen);
+    f.model.prefix_cache = Box::new(spark_runtime::radix_tree::RadixTree::new());
+    f.model.stamp_vision_cache_key(&tokens, &mut f.seq);
+    assert_eq!(f.seq.vision_cache_key.len(), tokens.len());
+    assert!(
+        f.model.pc_key(&f.seq, &tokens).is_some(),
+        "the prompt is cacheable"
+    );
+}
