@@ -113,6 +113,14 @@ fn read_control(dir: &Path) -> Result<Option<Control>> {
     Ok(Some(Control { tag, from }))
 }
 
+/// While a capture is armed, the longest prompt prefix the prefix cache may
+/// reuse: the capture's `from`. Rows before it are not kept, rows after it
+/// must be computed by this request. `None` when capture is off or disarmed.
+pub(crate) fn prefix_cap() -> Option<usize> {
+    let cfg = config()?;
+    read_control(&cfg.dir).ok().flatten().map(|c| c.from)
+}
+
 /// A page-locked host buffer, owned by exactly one of: the pool, the active
 /// chunk, or a writer job.
 struct Pinned {

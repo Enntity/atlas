@@ -58,8 +58,14 @@ impl TransformerModel {
                 // NVMe spill tier: page the on-disk continuation back in so
                 // the resident-only lookup below sees it (no-op when off).
                 self.nvme_restore_prefix(tokens, seq, kv_cache, stream);
+                // Hidden capture keeps rows from `from` on: never reuse past
+                // it, so those rows are computed (research capture only).
+                let lookup = match crate::model::hidden_capture::prefix_cap() {
+                    Some(cap) => &tokens[..cap.min(tokens.len())],
+                    None => tokens,
+                };
                 self.prefix_cache
-                    .lookup_whole_blocks(tokens, bs, seq.session_hash, seq.adapter_id)
+                    .lookup_whole_blocks(lookup, bs, seq.session_hash, seq.adapter_id)
             };
             // F83 (2026-04-30): on EP>1, head and worker have
             // independent local prefix caches whose match counts can
