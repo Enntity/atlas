@@ -16,6 +16,7 @@ use crate::main_modules::middleware::{
     gpu_fault_middleware, openai_observability_middleware, rate_limit_middleware,
     require_auth_middleware,
 };
+use crate::main_modules::otel::otel_request_span_middleware;
 
 pub(crate) async fn build_and_serve(
     host: Arc<crate::main_modules::model_host::ModelHost>,
@@ -127,6 +128,9 @@ pub(crate) async fn build_and_serve(
         // same for every caller, authenticated or not, and there is no reason
         // to spend a rate-limit reservation on a request that cannot run.
         .layer(axum::middleware::from_fn(gpu_fault_middleware))
+        // OpenTelemetry request span middleware — creates a span for each
+        // request with standard HTTP attributes and propagates trace context.
+        .layer(axum::middleware::from_fn(otel_request_span_middleware))
         .layer(axum::middleware::from_fn_with_state(
             host.clone(),
             rate_limit_middleware,

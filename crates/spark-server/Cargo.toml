@@ -98,6 +98,11 @@ prometheus = { version = "0.14", default-features = false }
 lazy_static = "1"
 tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
 base64 = "0.22"
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-http = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

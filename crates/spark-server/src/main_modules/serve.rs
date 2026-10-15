@@ -136,6 +136,10 @@ fn startup(
     // as a key event (raw mode) and calls the same request().
     crate::tui::shutdown::install_signal_listeners();
 
+    // Initialize OpenTelemetry tracing (if configured via env vars).
+    // Must be done early so all subsequent operations are traced.
+    let _otel_guard = crate::main_modules::otel::init_otel().ok().flatten();
+
     // Publishes each run's levers to the dashboard (see `tui::start`). `None`
     // in plain mode / on a worker rank, where nothing consumes them.
     let mut tui_handles_tx: Option<std::sync::mpsc::Sender<crate::tui::RunHandles>> = None;
