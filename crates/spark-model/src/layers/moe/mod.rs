@@ -170,10 +170,10 @@ pub(crate) use forward_prefill_q38::{q38_requested, sp_shared_requested, w2_requ
 mod forward_prefill_q38_nodup;
 pub(crate) use forward_prefill_q38_nodup::{nodup_requested, skips_routed_transpose};
 mod forward_prefill_q38_rs;
-pub(crate) use forward_prefill_routed::{grouped_cutlass_gate_up_enabled, prefill_fp8_down};
 mod forward_prefill_route;
 pub(crate) mod forward_prefill_route_sp;
 mod forward_prefill_routed;
+pub(crate) use forward_prefill_routed::{grouped_cutlass_gate_up_enabled, prefill_fp8_down};
 mod forward_prefill_router;
 mod forward_prefill_tcp;
 pub(crate) use forward_prefill_tcp::tcp_requested;
