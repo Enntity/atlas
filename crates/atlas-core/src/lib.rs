@@ -31,6 +31,7 @@ pub mod cuda_host;
 #[cfg(feature = "cuda")]
 pub mod kernel;
 #[cfg(feature = "cuda")]
+pub mod load_progress;
 pub mod registry;
 #[cfg(feature = "cuda")]
 pub mod stream;

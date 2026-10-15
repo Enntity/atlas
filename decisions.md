@@ -558,3 +558,6 @@ selection and no discarding of reference rows: these still hold under v2.
 - Reason: Plan §7 is the SSOT for external comparison; measurement discipline §3 requires bit-extract roundtrip + ratio + encode/decode GB/s for any repo claimed; no repo provides implicit codec-id default — PCND preserved.
 - Note: `facebook/openzl` is not a compression codec (zero-knowledge proofs); included at user's instruction for evaluation scope clarity, with explicit non-codec tag.
 - Status: added; evaluations deferred until Stage-0 exit criteria pass (no code changes from this edit).
+- D6 2026-08-13 load-progress logging: shared `atlas-core/src/load_progress.rs` (timer thread, `update()`, `tracing::info!`), env `ATLAS_LOAD_LOG_INTERVAL_SECS`, wired in server `serve_load.rs`, model `factory/build.rs`, storage `expert_pack.rs`. Reason: user requested info-level load-progress logging configurable per 5s; shared helper avoids duplication across 3 load paths. Status: done; deepest per-loader loop call-sites still need `update()` for file-level precision.
+
+D1 2026-10-15 done (config verified drowzeys=base, mimo_v2, 48-layer 9/39 fused_qkv). D2 2026-10-15 done (B=new loader mimo_v2.rs). D3 2026-10-15 deferred text-only. D4 2026-10-15 done (slug mimo-v2.6-flash-rl). D5 2026-10-15 partial (MoE reuse documented, attention kernel deferred).

@@ -747,6 +747,25 @@ pub(crate) fn load_model(
     } else {
         None
     };
+    // Start load-progress logging: scan model dir for weight-file bytes.
+    let model_dir_path = model_dir.as_path();
+    let total_weight_bytes: u64 = std::fs::read_dir(model_dir_path)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.ends_with(".safetensors") || n.ends_with(".bin") || n.ends_with(".pth") || n.ends_with(".ckpt")
+        })
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum();
+    let load_interval: u64 = std::env::var("ATLAS_LOAD_LOG_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let progress = atlas_core::load_progress::LoadProgress::new(total_weight_bytes, load_interval);
+
     let model = serve_phases::build_model(
         &args,
         &config,
@@ -766,6 +785,8 @@ pub(crate) fn load_model(
         nllb_lang,
         nllb_lora_dir,
     )?;
+    progress.update(total_weight_bytes, "build_model_done");
+    drop(progress);
 
     // Kernel load audit + the fail-closed boot gate. Every lookup is eager, so
     // by here the audit holds this model's COMPLETE lookup set — see
