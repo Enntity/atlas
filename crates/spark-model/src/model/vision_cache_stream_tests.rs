@@ -110,3 +110,24 @@ fn a_glm_prefill_encodes_per_chunk_even_with_the_prefix_cache_off() {
     assert_eq!(f.seq.vision.rows_encoded, 0, "nothing encoded yet");
     assert_eq!(f.seq.vision.grids, vec![(1, 8, 8)]);
 }
+
+#[test]
+fn every_tower_encodes_per_chunk_not_at_admission() {
+    // A Qwen tower encoded at admission into the shared `buf_out`: a long
+    // prompt's rows then waited there for its last chunk, and an image prompt
+    // admitted meanwhile overwrote them (the long prompt answered about the
+    // other image). The tower type must not matter.
+    let (mut f, _) = staged();
+    let mut qwen = test_tower::config();
+    qwen.is_glm5_next = false;
+    f.model.config.vision = Some(qwen);
+    f.seq.vision = Default::default();
+    let image = test_tower::image(16);
+    f.order();
+    f.model
+        .prepare_vision_embed_deferred_dispatch(&mut f.seq, &[image])
+        .unwrap();
+    assert!(f.seq.vision.deferred);
+    assert_eq!(f.seq.vision.rows_encoded, 0, "nothing encoded at admission");
+    assert!(f.order().is_empty(), "no encoder launch at admission");
+}

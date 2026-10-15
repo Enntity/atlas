@@ -15,9 +15,10 @@
 //! (`EP_CMD_VISION_STATE`), so a worker rebuilds the same key and its radix
 //! walk agrees with the head's before the EP min-sync.
 //!
-//! Only GLM-5 prompts are keyed. Its MRoPE walker rebuilds positions from the
+//! Only GLM-5 prompts are keyed. Both MRoPE walkers rebuild positions from the
 //! complete prompt, so a prefill that starts after a cached image positions
-//! the rest exactly as a full one would; the generic walker is chunk-local.
+//! the rest exactly as a full one would; keying another family also needs its
+//! own cache paths (qwen4_exp's checkpoints) to take vision prompts.
 //!
 //! The generated tokens of a vision sequence are not cached: decode writes
 //! them at linear positions while a prefill of the same text writes the
@@ -165,16 +166,18 @@ impl TransformerModel {
     /// Head, chunked path: stage `images` into `seq` for the encode the
     /// chunk-0 lookup resolves. The grids and hashes are set now (the key,
     /// MRoPE and the worker's command need them); `buf_out` holds nothing
-    /// yet. GLM-5 encodes per chunk whether or not the prompt is cached:
-    /// that, not the cache, is what keeps interleaved image prompts from
-    /// reading each other's rows. Other towers encode at once.
+    /// yet. Every tower encodes per chunk whether or not the prompt is
+    /// cached: that, not the cache, is what keeps interleaved image prompts
+    /// from reading each other's rows. An encode at admission left a long
+    /// prompt's rows in the shared `buf_out` until its last chunk, and an
+    /// image prompt admitted in between overwrote them (the long prompt then
+    /// described the other prompt's image).
     pub(in crate::model) fn prepare_vision_embed_deferred_dispatch(
         &self,
         seq: &mut SequenceState,
         images: &[VisionItem],
     ) -> Result<()> {
-        let glm = self.config.vision.as_ref().is_some_and(|v| v.is_glm5_next);
-        if !glm || self.vision_encoder.is_none() {
+        if self.vision_encoder.is_none() {
             return self.prepare_vision_embed_dispatch(seq, images);
         }
         let sms = self
