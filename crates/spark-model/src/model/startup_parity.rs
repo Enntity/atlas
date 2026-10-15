@@ -50,6 +50,24 @@ use anyhow::{Result, anyhow, ensure};
 use spark_comm::CommBackend;
 use spark_runtime::gpu::GpuBackend;
 
+use super::glm_long_verify::{oracle_enabled, serial_diagnostic};
+use super::trait_impl::finish_leaf;
+use super::trait_impl::prefill_b::pc_policy as pc;
+use super::{
+    decode_pieces, glm_c4, glm_independent, glm_vocab_split, graph_flags, mtp_carry,
+    qwen4exp_batch_fast, qwen4exp_exact_verify, qwen4exp_lmhead_split, qwen4exp_mtp_depth,
+    verify_pieces,
+};
+use crate::layer::glm_long_owner;
+use crate::layers::dflash_head::{ConvTwinKind, rank_split};
+use crate::layers::qwen3_attention::{
+    glm_mla_multi_seq_enabled, glm_multi_seq_sparse_enabled, glm_multi_seq_sparse_graphs_enabled,
+    grouped_routed_decode_enabled, grouped_routed_decode_min, index_split_words,
+    pairwise_moe_decode_enabled, write_floor_legacy,
+};
+use crate::layers::{self, glm_kv_shard, glm_sp, moe, ops, qwen3_ssm, w4a16_gemv_tiers};
+use crate::speculative::glm_repair_policy;
+use crate::weight_loader::qwen4_exp::GdnProjections;
 #[path = "startup_parity_table.rs"]
 mod table;
 use table::SETTINGS;
@@ -66,6 +84,12 @@ fn while_on(on: bool, value: fn() -> usize) -> Result<u64> {
 fn warn_only() -> bool {
     std::env::var("ATLAS_STARTUP_PARITY").as_deref() == Ok("warn")
 }
+
+/// The model type the GLM parsers are asked about.
+const GLM: &str = "glm5_next";
+
+/// The settings read in this crate: name, and this process's value from the
+/// feature's own parser. One entry per setting.
 
 /// This process's settings: [`SETTINGS`], then the `caller`'s.
 fn settings(caller: &[Setting]) -> Result<Vec<Setting>> {
